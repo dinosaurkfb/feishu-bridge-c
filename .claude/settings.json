@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Bash(node scripts/*)",
+      "Bash(node /Users/dk/claude-projects/feishu-bridge-cc/scripts/*)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(wc *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(git status)",
+      "Bash(git diff *)",
+      "Bash(git log *)"
+    ],
+    "deny": [
+      "Edit(//Users/dk/claude-projects/feishu-bridge-cc/.runtime-data/**)",
+      "Write(//Users/dk/claude-projects/feishu-bridge-cc/.runtime-data/**)"
+    ],
+    "defaultMode": "acceptEdits"
+  }
+}

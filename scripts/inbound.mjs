@@ -10,6 +10,7 @@
  * 顺序不可调换：先校验、再 claim、再投递。任何一步失败都不进入下一步。
  */
 
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -170,6 +171,17 @@ try {
 
 // 把 run 信息盖进锁：锁要活到 run 结束，靠这份信息做陈旧回收。
 stampSessionLock(LOCK, { pid: run.pid, logPath: run.logPath });
+
+// 起一次性守望者：run 跑完就发布结果并放锁。需求③「完成触发下一轮出站」靠它闭环。
+if (config.auto_publish_on_completion !== false) {
+  const w = spawn(process.execPath, [path.join(ROOT, "scripts", "watch-and-publish.mjs"), claim.key], {
+    cwd: ROOT, detached: true,
+    stdio: ["ignore",
+      fs.openSync(path.join(RUNS, claim.key + ".watch.log"), "a"),
+      fs.openSync(path.join(RUNS, claim.key + ".watch.log"), "a")],
+  });
+  w.unref();
+}
 
 // 投递成功。注意 handed_off ≠ 完成，出站流程稍后独立判定完成。
 recordClaimState({

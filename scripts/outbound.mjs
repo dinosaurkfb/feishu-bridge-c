@@ -10,6 +10,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { execFileSync } from "node:child_process";
+
 import { readRunOutcome } from "./handoff.mjs";
 
 const PUBLISHED_MARK = ".published.json";
@@ -109,27 +111,61 @@ function truncate(s, n) {
   return s.length <= n ? s : s.slice(0, n) + "\n…（已截断）";
 }
 
-// ---------- CLI：只读扫描，不发送任何东西 ----------
+/**
+ * 经 COO助理CC 把草稿发布到绑定的根话题。
+ *
+ * 身份边界：出站只用 COO助理CC（lark-cli profile `claude`），绝不借用 M5Claude 的身份 ——
+ * M5Claude 是入站运输层，让它发布进展会把两个方向的职责搅在一起。
+ */
+export function publishDraft({ profile, rootMessageId, text }) {
+  const out = execFileSync(
+    "lark-cli",
+    ["im", "+messages-reply", "--message-id", rootMessageId, "--as", "bot",
+     "--reply-in-thread", "--text", text, "--json"],
+    { encoding: "utf-8", env: { ...process.env, LARKSUITE_CLI_PROFILE: profile },
+      timeout: 30_000, maxBuffer: 4 * 1024 * 1024 },
+  );
+  const parsed = JSON.parse(out);
+  if (!parsed?.ok) throw new Error("发布失败: " + JSON.stringify(parsed?.error ?? parsed).slice(0, 300));
+  return parsed.data?.message_id ?? null;
+}
+
+// ---------- CLI ----------
 
 if (import.meta.url === "file://" + process.argv[1]) {
   const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
-  const runsDir = path.join(ROOT, ".runtime-data", "inbound", "runs");
-  const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, ".runtime-data", "inbound", "chain-config.json"), "utf-8"));
-  const runs = scanRuns({ runsDir });
+  const RT = path.join(ROOT, ".runtime-data", "inbound");
+  const runsDir = path.join(RT, "runs");
+  const cfg = JSON.parse(fs.readFileSync(path.join(RT, "chain-config.json"), "utf-8"));
+  const mapping = JSON.parse(fs.readFileSync(path.join(RT, "active-mapping.json"), "utf-8"));
+  const doPublish = process.argv.includes("--publish");
+  const only = (process.argv.find((a) => a.startsWith("--key=")) ?? "").slice(6);
+
+  const runs = scanRuns({ runsDir }).filter((r) => !only || r.key.startsWith(only));
 
   for (const r of runs) {
-    console.log([
-      r.key.slice(0, 8),
-      r.state.padEnd(9),
+    console.log([r.key.slice(0, 8), r.state.padEnd(9),
       r.shouldPublish ? "待发布" : r.alreadyPublished ? "已发布" : "不发布",
-      "| " + r.truthful,
-    ].join(" "));
+      "| " + r.truthful].join(" "));
   }
 
   const pending = runs.filter((r) => r.shouldPublish);
-  console.log("\n待发布 " + pending.length + " 条");
-  for (const r of pending) {
-    console.log("\n--- 草稿 " + r.key.slice(0, 8) + " ---");
-    console.log(buildDraft(r, { taskName: cfg.task_display_name }));
+  if (!doPublish) {
+    console.log("\n待发布 " + pending.length + " 条（加 --publish 才真的发送）");
+    for (const r of pending) {
+      console.log("\n--- 草稿 " + r.key.slice(0, 8) + " ---");
+      console.log(buildDraft(r, { taskName: cfg.task_display_name }));
+    }
+  } else {
+    const root = mapping.feishu_root_message_id_reference;
+    if (!root) throw new Error("mapping 里没有根话题消息 ID，无法发布");
+    for (const r of pending) {
+      const text = buildDraft(r, { taskName: cfg.task_display_name });
+      if (!text) continue;
+      const mid = publishDraft({ profile: cfg.lark_cli_profile, rootMessageId: root, text });
+      markPublished({ runsDir, key: r.key, messageId: mid });
+      console.log("已发布 " + r.key.slice(0, 8) + " -> " + mid);
+    }
+    if (pending.length === 0) console.log("没有待发布内容");
   }
 }

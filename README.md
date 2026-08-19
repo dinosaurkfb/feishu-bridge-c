@@ -22,16 +22,21 @@ Claude 侧飞书双向桥试点。**本项目的长期任务就是这座桥本�
 
 出站不再依赖某个 `CLAUDE.md` 里的手写约定 —— 换目录、换会话都还在。
 
-## 装出站
+## 安装
+
+两个方向各有一个安装器，都是 dry-run 默认、幂等、可 `--uninstall`：
 
 ```bash
-node scripts/install-outbound.mjs          # dry-run，看看会改什么
-node scripts/install-outbound.mjs --apply
+node scripts/install-outbound.mjs --apply   # Stop 钩子 + 登记表 + 全局技能 + launchd 兜底
+node scripts/install-inbound.mjs  --apply   # 入站技能装到 ~/skills/
 ```
 
-它做三件事：往 `~/.claude/settings.json` 的 Stop 数组**追加**一条（先备份，
-不动 .orca 那套）、把本项目写进 `~/.claude/feishu-bridge/registry.json`、
-把进展技能拷进 `~/.claude/skills/`。幂等，可 `--uninstall`。
+出站那个往 `~/.claude/settings.json` 的 Stop 数组**追加**一条（先备份，不动 .orca 那套）。
+
+入站那个装完会自检文件一致性、目标是真实目录（软链会让 aily 扫不到）、
+以及 `SKILL.md` 里引用的脚本路径确实存在。但它**不保证技能已被发现**——
+`aily-cli skill scan-local` 扫的是宿主 agent 目录（`~/.claude/skills`、`~/.codex/skills`），
+看不到 `~/skills/` 这一个。**唯一的验证是从飞书真发一条 `→Claude` 指令看回执。**
 
 ## 目录
 

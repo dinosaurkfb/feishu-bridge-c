@@ -81,11 +81,23 @@ async function main() {
   if (attributed.length === 0) process.exit(0);
 
   const { drainProject, watcherActive, outboxDirOf } = await import("./drain-outbox.mjs");
-  const { listPending } = await import("./outbox.mjs");
+  const { appendEvent, listPending } = await import("./outbox.mjs");
+  const { checkBinding, bindingWarning } = await import("./binding-health.mjs");
 
   const notes = [];
 
   for (const project of attributed) {
+    // 体检要在「outbox 空不空」之前做 —— 它有可能自己往 outbox 里加一条。
+    // 同一档预警只会成功追加一次：outbox 按内容指纹判重，文案里也刻意没有天数。
+    const warning = bindingWarning(checkBinding({ root: project.root }));
+    if (warning) {
+      const r = appendEvent({
+        outboxDir: outboxDirOf(project.root),
+        kind: warning.kind, text: warning.text, source: "binding-health",
+      });
+      if (r.ok) log(project.id + " binding warning recorded: " + warning.kind);
+    }
+
     // 空 outbox 的项目连守望者都不用问 —— 这是最常见的情况，越早返回越好。
     if (listPending({ outboxDir: outboxDirOf(project.root) }).length === 0) continue;
 

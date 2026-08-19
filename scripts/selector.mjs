@@ -11,6 +11,9 @@
  * 纯函数，无 IO。fail-closed：任何字段缺失或不匹配一律 reject，绝不猜测。
  */
 
+/** 关掉次数闸的唯一写法。字面量比对，不做大小写或别名兼容 —— 见下面配额那段的理由。 */
+export const UNLIMITED = "unlimited";
+
 export const REJECT = {
   MAPPING_MISSING: "mapping_missing",
   MAPPING_NOT_ACTIVE: "mapping_not_active",
@@ -116,13 +119,30 @@ export function evaluateInbound({ event, mapping, config, now }) {
 
   // 配额和时效都必须真的配了才算数。缺字段时旧版会跳过检查（fail-open），
   // 那等于「配置写错就没有上限、没有时效」—— 与本文件的 fail-closed 原则相悖。
-  const max = Number(mapping.max_inbound_messages);
-  if (!Number.isFinite(max) || max <= 0) return reject(REJECT.MALFORMED_EVENT);
-  if (consumed.length >= max) return reject(REJECT.QUOTA_EXHAUSTED);
+  //
+  // 配额可以显式关掉（2026-08-19 Frank 决定）：次数闸和有效期闸守的是同一件事 ——
+  // 一条绑定最多能造成多少次自动执行 —— 留时间那道就够，两道是冗余。
+  // 但「无限」必须是明写出来的字面量，绝不能是字段漏了、写错了的副作用：
+  // 前者是一个决定，后者是一次事故，它们不该导致同一个结果。
+  //
+  // 这里刻意不做 Number() 强制转换。旧版转过，于是 `true` 被转成 1，配额悄悄变成「1 条」
+  // 而不是被判成配错 —— 一个布尔值笔误就能改掉准入条件，还改得没人看得见。
+  // fail-closed 要求类型也 fail-closed：不是数字就是配错，不猜它想表达什么。
+  if (mapping.max_inbound_messages !== UNLIMITED) {
+    const max = mapping.max_inbound_messages;
+    if (typeof max !== "number" || !Number.isInteger(max) || max <= 0) {
+      return reject(REJECT.MALFORMED_EVENT);
+    }
+    if (consumed.length >= max) return reject(REJECT.QUOTA_EXHAUSTED);
+  }
 
-  const freshnessMs = Number(mapping.freshness_ms ?? config.default_freshness_ms);
+  // 同上：时效窗口也只认真正的数字。这道闸转错方向是 fail-closed（`true` → 1ms → 全拒），
+  // 不像配额那样危险，但同一个笔误在两个字段上给出两种结局才是真的难查。
+  const freshnessMs = mapping.freshness_ms ?? config.default_freshness_ms;
   const createdMs = Number(event.created_at_ms);
-  if (!Number.isFinite(freshnessMs) || freshnessMs <= 0) return reject(REJECT.MALFORMED_EVENT);
+  if (typeof freshnessMs !== "number" || !Number.isFinite(freshnessMs) || freshnessMs <= 0) {
+    return reject(REJECT.MALFORMED_EVENT);
+  }
   if (!Number.isFinite(createdMs)) return reject(REJECT.MALFORMED_EVENT);
   if (nowMs - createdMs > freshnessMs) return reject(REJECT.STALE_MESSAGE);
 

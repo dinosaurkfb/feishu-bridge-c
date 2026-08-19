@@ -21,6 +21,7 @@ import {
 } from "./registry.mjs";
 import { appendEvent, composeDigest, listPending, markSent } from "./outbox.mjs";
 import { drainProject, watcherActive } from "./drain-outbox.mjs";
+import { bindingWarning, checkBinding } from "./binding-health.mjs";
 
 let passed = 0;
 let failed = 0;
@@ -169,6 +170,42 @@ test("mapping 缺 freshness 且 config 也没有 → 拒绝，不 fail-open", ()
 
 test("配额为 0 或负数 → 拒绝", () => {
   assert.equal(evalWith({}, { max_inbound_messages: 0 }).reason, REJECT.MALFORMED_EVENT);
+});
+
+// ---------- 配额闸退役：无限必须是明写的，不能是配错的副作用 ----------
+
+test("max_inbound_messages: \"unlimited\" → 放行，且不受已消费条数影响", () => {
+  const many = Array.from({ length: 9999 }, (_, i) => "msg_old_" + i);
+  const r = evalWith({}, { max_inbound_messages: "unlimited", consumed_message_ids: many });
+  assert.equal(r.decision, "accept", "显式无限时次数闸应当整个不参与判断");
+});
+
+test("无限配额不影响其他闸：过期照样拒", () => {
+  const r = evalWith({}, { max_inbound_messages: "unlimited", expires_at: "2026-08-19T09:00:00Z" });
+  assert.equal(r.reason, REJECT.MAPPING_EXPIRED, "关掉次数闸不等于关掉有效期闸");
+});
+
+test("无限配额不影响幂等：重复消息照样拒", () => {
+  const r = evalWith({}, { max_inbound_messages: "unlimited", consumed_message_ids: ["msg_1"] });
+  assert.equal(r.reason, REJECT.DUPLICATE_MESSAGE);
+});
+
+for (const bad of ["Unlimited", "UNLIMITED", "infinite", "none", "", true, null, -1, 2.5, "20"]) {
+  test("配额写成 " + JSON.stringify(bad) + " → 判配错，不放行", () => {
+    const r = evalWith({}, { max_inbound_messages: bad });
+    assert.equal(r.decision, "reject", "只认字面量 unlimited 或正整数；写错必须是事故");
+    assert.equal(r.reason, REJECT.MALFORMED_EVENT);
+  });
+}
+
+test("配额 true 不得被强制转成 1（回归：布尔笔误悄悄改掉准入条件）", () => {
+  const r = evalWith({}, { max_inbound_messages: true, consumed_message_ids: [] });
+  assert.equal(r.reason, REJECT.MALFORMED_EVENT, "Number(true)===1 会让它变成「配额 1 条」而不是配错");
+});
+
+test("时效窗口写成非数字 → 判配错", () => {
+  assert.equal(evalWith({}, { freshness_ms: "900000" }).reason, REJECT.MALFORMED_EVENT);
+  assert.equal(evalWith({}, { freshness_ms: true }).reason, REJECT.MALFORMED_EVENT);
 });
 
 // ---------- claim：原子性与幂等 ----------
@@ -519,6 +556,74 @@ test("守望者的 run 已收场 → 锁是陈旧的，不该再让路", () => {
   stampSessionLock(sl, { pid: process.pid, logPath: done });
   assert.equal(watcherActive(proj), false, "陈旧的会话锁不该让进展卡住");
   releaseSessionLock(sl);
+});
+
+// ---------- 绑定到期预警（配额闸退役后，有效期是唯一的闸） ----------
+
+const bh = path.join(tmp, "bh");
+fs.mkdirSync(path.join(bh, ".runtime-data", "inbound"), { recursive: true });
+const setExpiry = (v) => fs.writeFileSync(
+  path.join(bh, ".runtime-data", "inbound", "active-mapping.json"),
+  JSON.stringify({ status: "active", expires_at: v }));
+const daysOut = (n) => new Date(NOW + n * 24 * 60 * 60 * 1000).toISOString();
+
+test("离到期还早 → 不打扰", () => {
+  setExpiry(daysOut(200));
+  const h = checkBinding({ root: bh, now: NOW });
+  assert.equal(h.state, "ok");
+  assert.equal(bindingWarning(h), null);
+});
+
+test("进 30 天窗口 → 记一条待拍板", () => {
+  setExpiry(daysOut(20));
+  const h = checkBinding({ root: bh, now: NOW });
+  assert.equal(h.state, "expiring");
+  assert.equal(h.window, 30);
+  assert.equal(bindingWarning(h).kind, "pending");
+});
+
+test("进 7 天窗口 → 报 7 天那档，不再报 30 天", () => {
+  setExpiry(daysOut(3));
+  assert.equal(checkBinding({ root: bh, now: NOW }).window, 7, "应当取命中的最小窗口");
+});
+
+test("预警文案不含天数 —— 否则每天一条新指纹，一周刷七次", () => {
+  setExpiry(daysOut(20));
+  const t = bindingWarning(checkBinding({ root: bh, now: NOW })).text;
+  const dayAfter = bindingWarning(checkBinding({ root: bh, now: NOW + 24 * 60 * 60 * 1000 })).text;
+  assert.equal(t, dayAfter, "同一档在不同日子必须产出完全相同的文案才能被判重挡住");
+});
+
+test("已过期 → 升级成风险，并说清「我能说、你不能回」", () => {
+  setExpiry(daysOut(-1));
+  const h = checkBinding({ root: bh, now: NOW });
+  assert.equal(h.state, "expired");
+  const w = bindingWarning(h);
+  assert.equal(w.kind, "risk");
+  assert.ok(w.text.includes("出站不受影响"), "必须点明出站还活着，否则他会以为整条桥断了");
+});
+
+test("expires_at 解析不出日期 → 报风险，不当成没事", () => {
+  setExpiry("下周");
+  const h = checkBinding({ root: bh, now: NOW });
+  assert.equal(h.state, "malformed");
+  assert.equal(bindingWarning(h).kind, "risk");
+});
+
+test("没有 mapping 的项目 → 不预警（没接入站是常态，不是故障）", () => {
+  const h = checkBinding({ root: path.join(tmp, "no-mapping"), now: NOW });
+  assert.equal(h.state, "absent");
+  assert.equal(bindingWarning(h), null);
+});
+
+test("同一档预警只会进 outbox 一次（含已发出的那条）", () => {
+  const dir = path.join(tmp, "warn-once", "outbox");
+  setExpiry(daysOut(20));
+  const w = bindingWarning(checkBinding({ root: bh, now: NOW }));
+  assert.equal(appendEvent({ outboxDir: dir, ...w, source: "binding-health" }).ok, true);
+  const [rec] = listPending({ outboxDir: dir });
+  markSent(rec, "om_test"); // 发出去之后再来一次，指纹仍在，不该重复打扰
+  assert.equal(appendEvent({ outboxDir: dir, ...w, source: "binding-health" }).ok, false);
 });
 
 fs.rmSync(tmp, { recursive: true, force: true });

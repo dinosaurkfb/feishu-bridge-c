@@ -66,8 +66,13 @@ Frank 在绑定话题 @M5Claude + →Claude 前缀
 | 绑定话题 session | `session_4kvgs2vuq4j5z` |
 | 飞书根消息 | `om_x100b677afd1884a8c389b5d1da41563` |
 | M5Claude agent uid | `agent_4ks11dv8f0mxwbd` |
-| mapping 有效期 | **2026-08-20T23:31:31Z —— 到期后入站全拒，需重签** |
-| mapping 配额 | 已用 2 / 20 |
+| mapping 有效期 | 见 `active-mapping.json`；**这是入站唯一的闸** |
+| mapping 配额 | 已退役（`max_inbound_messages: "unlimited"`） |
+
+有效期到期后：入站一律拒（回执「绑定关系已过期」），**出站不受影响**——
+`drainProject` 只看 `status === "active"`。会变成"任务能说、Frank 不能回"。
+到期前 30 天 / 7 天各自动往 outbox 记一条预警（`scripts/binding-health.mjs`），
+文案不含天数，靠 outbox 指纹判重保证每档只发一次。
 
 ## 需求基线
 

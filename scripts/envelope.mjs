@@ -31,6 +31,28 @@ function runAily(args) {
 }
 
 /**
+ * 事件存储是最终一致的：run 已经跑起来了，触发它的那条 message.create 却可能还查不到。
+ *
+ * 2026-08-19 实测三次真实失败：报 no_user_message_in_session，但事后按同一个 runID
+ * 去查，那条消息**都在**。同一句话重发一次就成功了 —— 差别只有时间。
+ * 查一次就放弃，等于把一个几百毫秒的读延迟变成一条「系统错误」摆在 Frank 面前。
+ *
+ * 重试预算必须压在秒级回执的契约之内：最坏 2.4 秒，之后仍然如实报错，不无限等。
+ */
+export const FETCH_BACKOFF_MS = [0, 400, 800, 1200];
+
+/** 只有可能因为时间而改变的原因才重试。配置类错误重试一百次也是同一个结果。 */
+const RETRYABLE = new Set([
+  "no_user_message_in_session",
+  "session_events_failed",
+  "session_events_unparsable",
+]);
+
+function sleepSync(ms) {
+  if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
  * `--page-size` 的单位是**对话轮次**，不是 envelope 条数，而且从最新一轮往回数
  * （2026-08-19 实测：--page-size 3 精确返回最后 3 轮共 45 个 envelope 并带 nextPageToken；
  * --page-size 1 返回 13 个，就是最新那轮）。
@@ -52,7 +74,7 @@ export function buildEventsArgs({ sessionId, agentId, runId }) {
 /**
  * @returns {{ok:true, event:object} | {ok:false, reason:string, detail?:string}}
  */
-export function fetchTriggerEvent(env = process.env) {
+export function fetchTriggerEvent(env = process.env, { runner = runAily, sleep = sleepSync } = {}) {
   const sessionId = env[ENV.SESSION];
   const runId = env[ENV.RUN];
   const agentId = env[ENV.AGENT];
@@ -63,9 +85,28 @@ export function fetchTriggerEvent(env = process.env) {
 
   const args = buildEventsArgs({ sessionId, agentId, runId });
 
+  let last = null;
+  for (let attempt = 0; attempt < FETCH_BACKOFF_MS.length; attempt += 1) {
+    sleep(FETCH_BACKOFF_MS[attempt]);
+    last = attemptFetch(args, sessionId, runner);
+    if (last.ok) return { ...last, attempts: attempt + 1 };
+    if (!RETRYABLE.has(last.reason)) break;
+  }
+
+  // 重试到底还是没有。如实报错，并带上诊断字段 —— 上一版只报一个原因字符串，
+  // 事后连「当时查的是哪个 run、看到了几个 envelope」都无从得知。
+  return {
+    ...last,
+    attempts: RETRYABLE.has(last.reason) ? FETCH_BACKOFF_MS.length : 1,
+    session_id: sessionId,
+    run_id: runId ?? null,
+  };
+}
+
+function attemptFetch(args, sessionId, runner) {
   let raw;
   try {
-    raw = runAily(args);
+    raw = runner(args);
   } catch (err) {
     return { ok: false, reason: "session_events_failed", detail: String(err.message).slice(0, 200) };
   }
@@ -104,6 +145,8 @@ export function fetchTriggerEvent(env = process.env) {
     }
   }
 
-  if (latest === null) return { ok: false, reason: "no_user_message_in_session" };
+  if (latest === null) {
+    return { ok: false, reason: "no_user_message_in_session", envelopes_seen: envelopes.length };
+  }
   return { ok: true, event: latest.event };
 }

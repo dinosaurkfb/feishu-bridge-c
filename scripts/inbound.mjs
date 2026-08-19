@@ -85,6 +85,13 @@ if (!fetched.ok) {
   writeReceipt("envelope-" + fetched.reason + "-" + Date.now(), {
     status: "error", reason: fetched.reason,
     claim_acquired: false, handed_off: false,
+    // 诊断字段：没有它们，事后只能看到一个原因字符串，查不出当时查的是哪个 run、
+    // 重试了几次、看到了几个 envelope。这三次真实失败就是这么难查的。
+    attempts: fetched.attempts ?? 1,
+    session_id: fetched.session_id ?? null,
+    run_id: fetched.run_id ?? null,
+    envelopes_seen: fetched.envelopes_seen ?? null,
+    detail: fetched.detail ?? null,
   });
   finish("error", { detail: "取不到本次消息信封（" + fetched.reason + "）" }, { reason: fetched.reason });
 }

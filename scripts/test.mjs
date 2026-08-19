@@ -14,7 +14,7 @@ import path from "node:path";
 
 import { REJECT, evaluateInbound, extractMentionIds, isValidQuota, normalizeBody } from "./selector.mjs";
 import { NOTE_MAX, resolveUntil, validateNote } from "./binding.mjs";
-import { RECENT_TURNS, buildEventsArgs } from "./envelope.mjs";
+import { FETCH_BACKOFF_MS, RECENT_TURNS, buildEventsArgs, fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, claimKey, recordClaimState } from "./claim.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
@@ -886,6 +886,81 @@ test("reply 是合法 kind，能被 appendEvent 收下", () => {
   const dir = path.join(tmp, "reply-kind");
   assert.equal(appendEvent({ outboxDir: dir, kind: "reply", text: "答复正文", source: "t" }).ok, true);
   assert.equal(listPending({ outboxDir: dir })[0].kind, "reply");
+});
+
+// ---------- 取信封：最终一致的事件存储要重试 ----------
+
+const ENVELOPE_ENV = {
+  AILY_CLI_SESSION_ID: "session_x", AILY_CLI_RUN_ID: "run_x", AILY_CLI_CALLER_AGENT_UID: "agent_x",
+};
+const userEnvelope = (id) => JSON.stringify({ envelopes: [{
+  type: "message.create",
+  payload: { message: { id, role: "user", sessionID: "session_x", createdBy: "u1", createdAtMs: 1, content: "hi" } },
+}] });
+const emptyEnvelope = JSON.stringify({ envelopes: [{ type: "run.queued" }] });
+
+const fetchWith = (responses) => {
+  let n = 0;
+  const calls = [];
+  const r = fetchTriggerEvent(ENVELOPE_ENV, {
+    runner: () => {
+      const v = responses[Math.min(n, responses.length - 1)];
+      n += 1;
+      if (v instanceof Error) throw v;
+      return v;
+    },
+    sleep: (ms) => calls.push(ms),
+  });
+  return { result: r, tries: n, sleeps: calls };
+};
+
+test("第一次就查到 → 不重试", () => {
+  const { result, tries } = fetchWith([userEnvelope("msg_a")]);
+  assert.equal(result.ok, true);
+  assert.equal(result.event.message_id, "msg_a");
+  assert.equal(tries, 1, "查到了还重试是白白拖慢回执");
+});
+
+test("前两次查不到、第三次查到 → 成功（回归 2026-08-19 三次真实失败）", () => {
+  const { result, tries } = fetchWith([emptyEnvelope, emptyEnvelope, userEnvelope("msg_b")]);
+  assert.equal(result.ok, true, "读延迟不该变成摆在 Frank 面前的系统错误");
+  assert.equal(result.event.message_id, "msg_b");
+  assert.equal(result.attempts, 3);
+  assert.equal(tries, 3);
+});
+
+test("一直查不到 → 如实报错，并带上诊断字段", () => {
+  const { result } = fetchWith([emptyEnvelope]);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "no_user_message_in_session");
+  assert.equal(result.attempts, FETCH_BACKOFF_MS.length);
+  assert.equal(result.session_id, "session_x");
+  assert.equal(result.run_id, "run_x");
+  assert.equal(result.envelopes_seen, 1, "看到几个 envelope 必须留痕，否则事后查不出是空还是没匹配上");
+});
+
+test("重试预算压在秒级回执之内", () => {
+  const total = FETCH_BACKOFF_MS.reduce((a, b) => a + b, 0);
+  assert.ok(total <= 3000, "最坏等待 " + total + "ms，超过秒级回执的契约");
+});
+
+test("aily-cli 调用失败也重试（可能是瞬时的）", () => {
+  const { result, tries } = fetchWith([new Error("boom"), new Error("boom"), userEnvelope("msg_c")]);
+  assert.equal(result.ok, true);
+  assert.equal(tries, 3);
+});
+
+test("配置类错误不重试 —— 重试一百次也是同一个结果", () => {
+  const r1 = fetchTriggerEvent({ AILY_CLI_CALLER_AGENT_UID: "a" }, { runner: () => { throw new Error("不该被调用"); } });
+  assert.equal(r1.reason, "missing_session_env");
+  const r2 = fetchTriggerEvent({ AILY_CLI_SESSION_ID: "s" }, { runner: () => { throw new Error("不该被调用"); } });
+  assert.equal(r2.reason, "missing_agent_env");
+});
+
+test("返回的不是 JSON → 也重试，最终如实报错", () => {
+  const { result, tries } = fetchWith(["这不是 json"]);
+  assert.equal(result.reason, "session_events_unparsable");
+  assert.equal(tries, FETCH_BACKOFF_MS.length);
 });
 
 // ---------- 汇总 ----------

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * 把出站装成机制：Stop 钩子 + 项目登记表 + 全局技能。
+ * 把出站装成机制：Stop 钩子 + 项目登记表 + 全局技能 + launchd 兜底定时器。
  *
  * 出站原来只是本项目 CLAUDE.md 里手写的一段约定 —— 只有读到那段文字的会话才守。
- * 这三样各管一半：技能让任何会话都知道该怎么记，钩子让任何会话结束时都会发，
- * 登记表决定这两件事对哪些项目生效。
+ * 这四样各管一段：技能让任何会话都知道该怎么记，钩子让任何会话结束时都会发，
+ * 登记表决定这两件事对哪些项目生效，launchd 定时器兜住所有发失败的情况。
  *
  * 为什么要专门写个安装器而不是手改 JSON：那份 settings 里已经有 .orca 的一整套钩子
  * （Stop / UserPromptSubmit / PostToolUse …）。手改一次覆盖掉，Frank 的另一套工具就哑了，
@@ -17,6 +17,7 @@
  *   node scripts/install-outbound.mjs --uninstall --apply
  */
 
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -133,12 +134,63 @@ if (uninstall) {
   if (dst !== src) skillAction = dst === null ? "will-install" : "will-update";
 }
 
+// ---------- launchd 兜底定时器 ----------
+
+/**
+ * 这一段原来是缺的，而且缺得很难发现：drain-outbox / stop-hook / watch-and-publish
+ * 三处失败分支的注释都写着「留在 outbox，兜底定时器会重试」，但安装器从不创建那个定时器。
+ * 这台机器上它存在，是更早某次手工装的 —— 换台机器就只有事件驱动那条路，
+ * 一次发布失败等于进展永久卡在本地，而注释还在向读代码的人承诺有人会重试。
+ *
+ * 注释承诺了什么，安装器就得装出什么。
+ */
+const LAUNCH_LABEL = "com.frank.feishu-bridge-cc.drain";
+const PLIST = path.join(os.homedir(), "Library", "LaunchAgents", LAUNCH_LABEL + ".plist");
+const DRAIN_LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "drain.log");
+const DRAIN_SCRIPT = path.join(ROOT, "scripts", "drain-outbox.mjs");
+
+// --all：兜底要覆盖登记表里所有项目。只排本仓库的话，后接进来的项目就没有兜底了。
+const plistBody = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${LAUNCH_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${NODE_BIN}</string>
+    <string>${DRAIN_SCRIPT}</string>
+    <string>--all</string>
+  </array>
+  <key>WorkingDirectory</key><string>${ROOT}</string>
+  <key>StartInterval</key><integer>1800</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>${DRAIN_LOG}</string>
+  <key>StandardErrorPath</key><string>${DRAIN_LOG}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>${os.homedir()}</string>
+  </dict>
+</dict>
+</plist>
+`;
+
+let plistAction = "unchanged";
+if (uninstall) {
+  if (fs.existsSync(PLIST)) plistAction = "will-remove";
+} else {
+  let current = null;
+  try { current = fs.readFileSync(PLIST, "utf-8"); } catch { /* 还没装 */ }
+  if (current !== plistBody) plistAction = current === null ? "will-install" : "will-update";
+}
+
 // ---------- 落盘 ----------
 
 console.log("settings : " + SETTINGS + "  → " + action);
 console.log("Stop 钩子 : " + stop.length + " 条（.orca 的那条必须还在）");
 console.log("登记表   : " + REGISTRY + "  → " + registry.projects.length + " 个项目");
 console.log("技能     : " + SKILL_DST + "  → " + skillAction);
+console.log("兜底定时 : " + PLIST + "  → " + plistAction + "（每 30 分钟排空全部登记项目）");
 
 if (skillAction === "source-missing") {
   console.error("\n技能源文件不在：" + SKILL_SRC);
@@ -176,5 +228,33 @@ if (uninstall) {
   fs.copyFileSync(SKILL_SRC, SKILL_DST);
 }
 
+// launchd：先 bootout 再 bootstrap。改了 plist 不重新加载的话，跑的还是旧的那份，
+// 而且看不出来 —— 文件是新的，行为是旧的，是最难查的那种不一致。
+const launchctl = (args, { tolerate = false } = {}) => {
+  try {
+    execFileSync("/bin/launchctl", args, { stdio: "pipe", timeout: 15_000 });
+    return { ok: true };
+  } catch (err) {
+    if (!tolerate) console.error("  launchctl " + args.join(" ") + " 失败：" + String(err.message).split("\n")[0]);
+    return { ok: false };
+  }
+};
+
+const domain = "gui/" + process.getuid();
+let launchNote;
+if (uninstall) {
+  launchctl(["bootout", domain + "/" + LAUNCH_LABEL], { tolerate: true });
+  fs.rmSync(PLIST, { force: true });
+  launchNote = "已卸载";
+} else {
+  fs.mkdirSync(path.dirname(PLIST), { recursive: true });
+  fs.writeFileSync(PLIST, plistBody);
+  launchctl(["bootout", domain + "/" + LAUNCH_LABEL], { tolerate: true }); // 没装过时必然失败，正常
+  launchNote = launchctl(["bootstrap", domain, PLIST]).ok
+    ? "已加载"
+    : "**plist 已写入但 launchctl 加载失败 —— 兜底重试目前不生效**";
+}
+
 console.log("\n" + (backup ? "settings 已改，备份：" + backup : "settings 无改动，未重写"));
+console.log("兜底定时器：" + launchNote);
 console.log("钩子和技能都立即生效，不需要重启会话。");

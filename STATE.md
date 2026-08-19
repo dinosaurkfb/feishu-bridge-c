@@ -36,10 +36,17 @@ Frank 在绑定话题 @M5Claude + →Claude 前缀
   `...router2` 之后，系统跟着新名字照常加载。所以「改名后还能通」**不能**用来
   证明那份文件没用 —— 这是一次设计错了的实验，我据此下过一个错误结论。
   真正的判决实验是**把目录整个移出技能根目录**。
-- **仍未确定：materialize 的源到底是本地 `~/skills/` 还是平台侧的副本。**
-  `skill-inject.js` 声明的三个源（`bundledSkillsRoot` / `~/.aily-cli/skills` /
-  `~/.claude`）都不含 `~/skills/`，而 `aily-cli skill sync` 会把本地技能上报 AgentHub。
-  两种可能都还站得住，别当成已知。
+- **已判决（2026-08-19）：技能源就是本地 `~/skills/<技能名>/`。**把目录整个移出
+  `~/skills/` 之后再发指令，M5Claude 的工具序列里**没有 `Skill` 调用**，只有裸 `Bash`，
+  而且它自己在回复里写明「本轮技能未注册（你把技能目录挪走了），这条是我沿用
+  会话里已知的命令跑」。
+- **警告：这个链路的「还能通」极不可靠。**M5Claude 是一个被反复 resume 的持久会话
+  （`~/.claude/projects/-Users-dk-aily-workspaces-agent-<uid>/`），它的记录里
+  `inbound.mjs` 出现过 18 次，技能没了它照样能凭记忆把命令背出来。
+  **判断入站健康不能只看回执，必须看会话记录里有没有 `Skill{aily-cli-invocation:…}`。**
+  换一个没有历史的新会话，技能一丢就真的断。
+- `skill-inject.js` 声明的三个源里不含 `~/skills/`，但事实证明它是源 —— 说明还有
+  一条我没读到的装配路径。**不影响结论，但别拿那三个源当完整清单。**
 - 两条分支**必须互斥**：都走 `--continue` 会有两个进程写同一份 transcript
 - `.runtime-data/longtask-session-id.txt` **已废弃，没有代码再读它**。
   钉一个会话 UUID 是错的抽象 —— 会话是记录，每开一个终端就是新的一份，

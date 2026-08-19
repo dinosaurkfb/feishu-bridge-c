@@ -40,6 +40,9 @@ export function acquireClaim({ claimsDir, messageId, logicalTaskKey, meta }) {
   const dir = path.join(claimsDir, key + ".claim");
 
   try {
+    // 父目录按需创建：全新部署时它不存在，旧版会让第一条消息必然失败。
+    fs.mkdirSync(claimsDir, { recursive: true, mode: 0o700 });
+    // claim 目录本身必须 recursive:false —— EEXIST 正是幂等赖以成立的原子信号。
     fs.mkdirSync(dir, { recursive: false, mode: 0o700 });
   } catch (err) {
     if (err.code === "EEXIST") return { ok: false, reason: "duplicate", key, dir };

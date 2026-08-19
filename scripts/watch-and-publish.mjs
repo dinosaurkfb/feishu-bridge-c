@@ -60,6 +60,8 @@ while (true) {
             profile: cfg.lark_cli_profile,
             rootMessageId: mapping.feishu_root_message_id_reference,
             text,
+            larkBin: cfg.lark_cli_bin,
+            larkHome: cfg.lark_cli_home,
           });
           markPublished({ runsDir: RUNS, key, messageId: mid });
           console.log("published " + key.slice(0, 8) + " -> " + mid);

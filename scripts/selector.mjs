@@ -114,15 +114,17 @@ export function evaluateInbound({ event, mapping, config, now }) {
     : [];
   if (consumed.includes(event.message_id)) return reject(REJECT.DUPLICATE_MESSAGE);
 
-  const max = mapping.max_inbound_messages;
-  if (Number.isFinite(max) && consumed.length >= max) return reject(REJECT.QUOTA_EXHAUSTED);
+  // 配额和时效都必须真的配了才算数。缺字段时旧版会跳过检查（fail-open），
+  // 那等于「配置写错就没有上限、没有时效」—— 与本文件的 fail-closed 原则相悖。
+  const max = Number(mapping.max_inbound_messages);
+  if (!Number.isFinite(max) || max <= 0) return reject(REJECT.MALFORMED_EVENT);
+  if (consumed.length >= max) return reject(REJECT.QUOTA_EXHAUSTED);
 
-  const freshnessMs = mapping.freshness_ms ?? config.default_freshness_ms;
+  const freshnessMs = Number(mapping.freshness_ms ?? config.default_freshness_ms);
   const createdMs = Number(event.created_at_ms);
-  if (Number.isFinite(freshnessMs)) {
-    if (!Number.isFinite(createdMs)) return reject(REJECT.MALFORMED_EVENT);
-    if (nowMs - createdMs > freshnessMs) return reject(REJECT.STALE_MESSAGE);
-  }
+  if (!Number.isFinite(freshnessMs) || freshnessMs <= 0) return reject(REJECT.MALFORMED_EVENT);
+  if (!Number.isFinite(createdMs)) return reject(REJECT.MALFORMED_EVENT);
+  if (nowMs - createdMs > freshnessMs) return reject(REJECT.STALE_MESSAGE);
 
   const instruction = body.slice(prefix.length).trim();
   if (!isNonEmptyString(instruction)) return reject(REJECT.PREFIX_MISMATCH);

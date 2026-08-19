@@ -117,12 +117,17 @@ function truncate(s, n) {
  * 身份边界：出站只用 COO助理CC（lark-cli profile `claude`），绝不借用 M5Claude 的身份 ——
  * M5Claude 是入站运输层，让它发布进展会把两个方向的职责搅在一起。
  */
-export function publishDraft({ profile, rootMessageId, text }) {
+export function publishDraft({ profile, rootMessageId, text, larkBin, larkHome }) {
+  // 必须显式指定二进制和配置源：守望者是在 M5Claude 的清洗环境里被拉起的，
+  // 那里 lark-cli 被重定向到按 agent 隔离的配置目录（只有 platform-bot），
+  // 靠环境里“恰好是什么”会拿到错误的身份，实测就是这么发布失败的。
   const out = execFileSync(
-    "lark-cli",
+    larkBin ?? "lark-cli",
     ["im", "+messages-reply", "--message-id", rootMessageId, "--as", "bot",
      "--reply-in-thread", "--text", text, "--json"],
-    { encoding: "utf-8", env: { ...process.env, LARKSUITE_CLI_PROFILE: profile },
+    { encoding: "utf-8",
+      env: { ...process.env, LARKSUITE_CLI_PROFILE: profile,
+             ...(larkHome ? { LARKSUITE_CLI_HOME: larkHome } : {}) },
       timeout: 30_000, maxBuffer: 4 * 1024 * 1024 },
   );
   const parsed = JSON.parse(out);
@@ -162,7 +167,8 @@ if (import.meta.url === "file://" + process.argv[1]) {
     for (const r of pending) {
       const text = buildDraft(r, { taskName: cfg.task_display_name });
       if (!text) continue;
-      const mid = publishDraft({ profile: cfg.lark_cli_profile, rootMessageId: root, text });
+      const mid = publishDraft({ profile: cfg.lark_cli_profile, rootMessageId: root, text,
+        larkBin: cfg.lark_cli_bin, larkHome: cfg.lark_cli_home });
       markPublished({ runsDir, key: r.key, messageId: mid });
       console.log("已发布 " + r.key.slice(0, 8) + " -> " + mid);
     }

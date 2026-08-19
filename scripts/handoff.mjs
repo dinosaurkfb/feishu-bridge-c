@@ -7,7 +7,7 @@
  * 完成与否由出站流程独立观察 run 日志得出。
  */
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -81,7 +81,21 @@ export function releaseSessionLock(lockDir) {
 /**
  * 非阻塞投递。返回时子进程刚起来，任务远未完成 —— 这是预期行为，不是缺陷。
  */
+/**
+ * spawn 对「二进制不存在」是异步报错的 —— 它不抛，只在事件循环里 emit error。
+ * 投递又是 detached + 立即返回，于是 claude 不在 PATH 时旧版会照样回「已受理」，
+ * 而实际上什么都没启动。受理回执必须以真实存在的可执行文件为前提。
+ */
+function assertClaudeAvailable() {
+  try {
+    execFileSync("command", ["-v", "claude"], { shell: "/bin/sh", stdio: "ignore", timeout: 5000 });
+  } catch {
+    throw new Error("claude 不在 PATH 上，无法投递");
+  }
+}
+
 export function handOff({ projectDir, sessionId, instruction, runsDir, key }) {
+  assertClaudeAvailable();
   fs.mkdirSync(runsDir, { recursive: true });
   const logPath = path.join(runsDir, key + ".jsonl");
   const errPath = path.join(runsDir, key + ".stderr.log");

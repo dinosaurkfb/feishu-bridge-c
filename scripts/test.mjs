@@ -146,11 +146,36 @@ test("引用块里出现前缀不能顶替正文前缀", () => {
   assert.equal(r.reason, REJECT.PREFIX_MISMATCH);
 });
 
+test("mapping 缺 max_inbound_messages → 拒绝，不 fail-open", () => {
+  const r = evalWith({}, { max_inbound_messages: undefined });
+  assert.equal(r.decision, "reject");
+  assert.equal(r.reason, REJECT.MALFORMED_EVENT, "缺配额上限必须拒绝，不能当成无上限");
+});
+
+test("mapping 缺 freshness 且 config 也没有 → 拒绝，不 fail-open", () => {
+  const r = evaluateInbound({
+    event: baseEvent, mapping: { ...baseMapping, freshness_ms: undefined },
+    config: { transport_open_id: M5CLAUDE }, now: NOW,
+  });
+  assert.equal(r.decision, "reject");
+  assert.equal(r.reason, REJECT.MALFORMED_EVENT, "缺时效窗口必须拒绝，不能当成无限期有效");
+});
+
+test("配额为 0 或负数 → 拒绝", () => {
+  assert.equal(evalWith({}, { max_inbound_messages: 0 }).reason, REJECT.MALFORMED_EVENT);
+});
+
 // ---------- claim：原子性与幂等 ----------
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-test-"));
 const claimsDir = path.join(tmp, "delivery-claims");
 fs.mkdirSync(claimsDir, { recursive: true });
+
+test("claims 父目录不存在时自动创建（全新部署首条不该失败）", () => {
+  const fresh = path.join(tmp, "brand-new", "delivery-claims");
+  const r = acquireClaim({ claimsDir: fresh, messageId: "msg_first", logicalTaskKey: "k", meta: {} });
+  assert.equal(r.ok, true, "全新部署的第一条消息必须能拿到 claim");
+});
 
 test("首次 claim 成功", () => {
   const r = acquireClaim({ claimsDir, messageId: "msg_a", logicalTaskKey: "k", meta: {} });

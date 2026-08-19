@@ -62,6 +62,30 @@ node scripts/binding.mjs --renew 1y --apply # 续（也收 6m / 90d / 2027-08-19
 
 到期前 30 天和 7 天会各自动往飞书报一次，不用记着。预警文案里带续期命令。
 
+## 代理（这台机器上的两个坑）
+
+**daemon 重启后会丢代理。**`aily-cli daemon start` 用硬编码白名单构造环境，
+代理变量不在其中，所以 `HTTP_PROXY=... aily-cli daemon restart` 无效。
+症状伪装成「Claude Code 鉴权失败，请检查 ANTHROPIC_AUTH_TOKEN」——**查凭据是白查**。
+每次重启（升级、开机自启、崩溃拉起）都会复发。用：
+
+```bash
+sh scripts/aily-daemon-restart.sh
+```
+
+它先探代理端口（不通就拒绝重启，不白折腾），带 `AILY_CLI_FORWARD_ENV` 重启，
+再验代理变量真的进到 daemon 里、以及网关认不认这台机器在线。
+
+**git 走 https，只认 `HTTPS_PROXY`。**只设 `HTTP_PROXY` 时 `git push` 会走直连、
+时通时不通（表现为 75 秒超时）。已在 `~/.zshrc` 里补齐两个变量，并给 github.com
+配了不依赖环境变量的 git 代理：
+
+```bash
+git config --global http.https://github.com.proxy http://127.0.0.1:10808
+```
+
+`~/.zshrc` 那段只在代理**真的在监听**时才导出——指向死端口比没有代理更糟。
+
 ## 自检
 
 ```bash

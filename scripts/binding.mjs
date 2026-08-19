@@ -16,6 +16,7 @@
  *   node scripts/binding.mjs --renew 2027-08-19 --apply
  *   node scripts/binding.mjs --quota unlimited --apply
  *   node scripts/binding.mjs --quota 500 --apply
+ *   node scripts/binding.mjs --note "长期绑定（非测试期）" --apply
  */
 
 import fs from "node:fs";
@@ -49,6 +50,22 @@ export function resolveUntil(spec, now = Date.now()) {
   // 往回续等于当场把桥关掉。这种事必须是明确的操作，不能是手滑打错一个年份。
   if (parsed <= now) return { ok: false, reason: "新的到期时间必须在将来" };
   return { ok: true, iso: new Date(parsed).toISOString() };
+}
+
+export const NOTE_MAX = 300;
+
+/**
+ * note 是给人看的字段，没有代码读它 —— 但正因为没人校验，它最容易变成过期的谎话。
+ * 只挡两种明显的手滑：空串（等于删掉说明）和以 `--` 开头
+ * （`--note --apply` 会把下一个参数当成值，于是 note 变成 "--apply" 而 --apply 消失，
+ * 结果是"改了个奇怪的备注，而且没落盘"）。
+ */
+export function validateNote(v) {
+  const s = String(v ?? "");
+  if (s.trim().length === 0) return { ok: false, reason: "备注不能是空的" };
+  if (s.startsWith("--")) return { ok: false, reason: "备注不像备注（「" + s + "」）——是不是漏了引号？" };
+  if (s.length > NOTE_MAX) return { ok: false, reason: "备注最长 " + NOTE_MAX + " 字，收到 " + s.length + " 字" };
+  return { ok: true, note: s.trim() };
 }
 
 // ---------- CLI ----------
@@ -100,6 +117,16 @@ if (quotaSpec !== undefined) {
   changes.push(["max_inbound_messages", mapping.max_inbound_messages, value]);
 }
 
+const noteSpec = arg("note");
+if (noteSpec !== undefined) {
+  const r = validateNote(noteSpec);
+  if (!r.ok) {
+    console.error("备注没改：" + r.reason);
+    process.exit(1);
+  }
+  changes.push(["note", mapping.note, r.note]);
+}
+
 // ---------- 报告现状 ----------
 
 const consumed = Array.isArray(mapping.consumed_message_ids) ? mapping.consumed_message_ids.length : 0;
@@ -121,6 +148,7 @@ console.log("有效期  " + (mapping.expires_at ?? "(缺)") +
 console.log("配额    " + (quotaNow === UNLIMITED ? "不限" : quotaNow) + "   已用 " + consumed + " 条");
 console.log("话题    " + (mapping.session_id ?? "?"));
 console.log("根消息  " + (mapping.feishu_root_message_id_reference ?? "?"));
+console.log("备注    " + (mapping.note ?? "(无)"));
 
 if (changes.length === 0) {
   console.log("\n没有要改的。续期：--renew 1y --apply（也收 6m / 90d / 2027-08-19）");

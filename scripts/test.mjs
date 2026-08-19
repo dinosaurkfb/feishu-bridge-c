@@ -13,7 +13,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { REJECT, evaluateInbound, extractMentionIds, isValidQuota, normalizeBody } from "./selector.mjs";
-import { resolveUntil } from "./binding.mjs";
+import { NOTE_MAX, resolveUntil, validateNote } from "./binding.mjs";
 import { acquireClaim, claimKey, recordClaimState } from "./claim.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
@@ -675,6 +675,19 @@ test("看不懂的写法 → 拒绝，并说清能用什么", () => {
 
 test("0y / 负数 → 拒绝", () => {
   assert.equal(until("0d").ok, false);
+});
+
+test("备注：空的、太长的都拒", () => {
+  assert.equal(validateNote("").ok, false);
+  assert.equal(validateNote("   ").ok, false);
+  assert.equal(validateNote("x".repeat(NOTE_MAX + 1)).ok, false);
+  assert.equal(validateNote("长期绑定（非测试期）").ok, true);
+});
+
+test("--note --apply 这种手滑被挡下（否则备注变成 --apply 且没落盘）", () => {
+  const r = validateNote("--apply");
+  assert.equal(r.ok, false);
+  assert.ok(r.reason.includes("引号"), "报错要指向真正的原因");
 });
 
 test("续期工具写得出的值，入站一定认（同一条规则）", () => {

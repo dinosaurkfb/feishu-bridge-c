@@ -117,7 +117,7 @@ function truncate(s, n) {
  * 身份边界：出站只用 COO助理CC（lark-cli profile `claude`），绝不借用 M5Claude 的身份 ——
  * M5Claude 是入站运输层，让它发布进展会把两个方向的职责搅在一起。
  */
-export function publishDraft({ profile, rootMessageId, text, larkBin, larkHome }) {
+export function publishDraft({ profile, rootMessageId, text, larkBin, larkHome, timeoutMs }) {
   // 必须显式指定二进制和配置源：守望者是在 M5Claude 的清洗环境里被拉起的，
   // 那里 lark-cli 被重定向到按 agent 隔离的配置目录（只有 platform-bot），
   // 靠环境里“恰好是什么”会拿到错误的身份，实测就是这么发布失败的。
@@ -126,9 +126,15 @@ export function publishDraft({ profile, rootMessageId, text, larkBin, larkHome }
     ["im", "+messages-reply", "--message-id", rootMessageId, "--as", "bot",
      "--reply-in-thread", "--text", text, "--json"],
     { encoding: "utf-8",
+      // stderr 要捕获而不是继承。默认继承时 lark-cli 的报错 JSON 会直接喷进
+      // 调用方的 stderr —— 出站发布器现在跑在会话结束钩子里，那等于喷到 Frank 的终端上。
+      // 失败信息不会丢：execFileSync 抛出的 error 上带着 stdout/stderr。
+      stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, LARKSUITE_CLI_PROFILE: profile,
              ...(larkHome ? { LARKSUITE_CLI_HOME: larkHome } : {}) },
-      timeout: 30_000, maxBuffer: 4 * 1024 * 1024 },
+      // 会话结束钩子会传一个更短的超时：那条路径卡住的是 Frank 的终端，
+      // 不能为了发一条进展让他的会话吊在那里。发不出去就留在 outbox 等兜底定时器。
+      timeout: timeoutMs ?? 30_000, maxBuffer: 4 * 1024 * 1024 },
   );
   const parsed = JSON.parse(out);
   if (!parsed?.ok) throw new Error("发布失败: " + JSON.stringify(parsed?.error ?? parsed).slice(0, 300));

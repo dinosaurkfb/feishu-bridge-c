@@ -41,7 +41,14 @@ export function acquireSessionLock(lockDir) {
   return first;
 }
 
-function isLockStale(lockDir) {
+/**
+ * 锁是否已经没人真的持有。
+ *
+ * 导出是因为出站也要问同一个问题：会话结束钩子必须知道「有没有守望者正在盯这次 run」，
+ * 有就让给它发（它会把结果和进展合成一条），没有才自己排空。判定标准必须是同一套，
+ * 两边各写一套迟早会出现「都以为对方会发」或者「两边都发」。
+ */
+export function isLockStale(lockDir) {
   let owner;
   try {
     owner = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf-8"));

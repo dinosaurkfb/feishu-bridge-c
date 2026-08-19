@@ -101,16 +101,24 @@ export function composeDigest(records, { taskName }) {
 // ---------- CLI ----------
 
 if (import.meta.url === "file://" + process.argv[1]) {
-  const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
-  const outboxDir = path.join(ROOT, ".runtime-data", "outbound", "outbox");
+  const SELF_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
   const arg = (n) => {
     const i = process.argv.indexOf("--" + n);
     return i >= 0 ? process.argv[i + 1] : undefined;
   };
 
+  // 会话不一定起在项目里，命令也不一定从项目里发。落点按这个顺序定：
+  // 显式 --project > 登记表里包含 cwd 的项目 > 本仓库自己。
+  // 定错落点比记不上更糟 —— 进展会掉进一个没人排空的目录里。
+  const { loadRegistry, isUnder } = await import("./registry.mjs");
+  const explicit = arg("project");
+  const owning = loadRegistry().projects.find((p) => isUnder(process.cwd(), p.root));
+  const ROOT = explicit ?? owning?.root ?? SELF_ROOT;
+  const outboxDir = path.join(ROOT, ".runtime-data", "outbound", "outbox");
+
   if (process.argv.includes("--list")) {
     const pending = listPending({ outboxDir });
-    console.log("待发布 " + pending.length + " 条");
+    console.log(path.basename(ROOT) + " 待发布 " + pending.length + " 条");
     for (const r of pending) console.log("  [" + KIND_LABEL[r.kind] + "] " + r.text.slice(0, 70));
     process.exit(0);
   }
@@ -122,5 +130,5 @@ if (import.meta.url === "file://" + process.argv[1]) {
     console.error("未记录：" + r.reason + (r.allowed ? "（可用：" + r.allowed.join("/") + "）" : ""));
     process.exit(r.reason === "duplicate" ? 0 : 1);
   }
-  console.log("已记录 " + r.id);
+  console.log("已记录 " + r.id + " → " + path.basename(ROOT));
 }

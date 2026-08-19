@@ -15,6 +15,12 @@ import path from "node:path";
 import { REJECT, evaluateInbound, extractMentionIds, normalizeBody } from "./selector.mjs";
 import { acquireClaim, claimKey, recordClaimState } from "./claim.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
+import {
+  acquirePublishLock, attributeSession, fileContainsAny, isUnder,
+  loadRegistry, releasePublishLock,
+} from "./registry.mjs";
+import { appendEvent, composeDigest, listPending, markSent } from "./outbox.mjs";
+import { drainProject, watcherActive } from "./drain-outbox.mjs";
 
 let passed = 0;
 let failed = 0;
@@ -300,6 +306,219 @@ test("没有 denials 的正常完成仍判 completed", () => {
 
 test("日志文件不存在 → missing，不崩", () => {
   assert.equal(readRunOutcome(path.join(tmp, "nothing.jsonl")).state, "missing");
+});
+
+// ---------- 登记表 ----------
+
+const regDir = path.join(tmp, "registry");
+fs.mkdirSync(regDir, { recursive: true });
+const writeRegistry = (name, obj) => {
+  const f = path.join(regDir, name);
+  fs.writeFileSync(f, typeof obj === "string" ? obj : JSON.stringify(obj, null, 2));
+  return f;
+};
+
+test("登记表不存在 → 空表，且不算错误（本机没接桥是常态）", () => {
+  const r = loadRegistry(path.join(regDir, "absent.json"));
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.projects, []);
+});
+
+test("登记表是坏 JSON → 报错，不当成空表", () => {
+  const r = loadRegistry(writeRegistry("broken.json", "{ not json"));
+  assert.equal(r.ok, false, "坏掉的表必须说出来，静默当空表会让出站无声消失");
+  assert.equal(r.reason, "bad_json");
+});
+
+test("enabled:false 的项目被排除", () => {
+  const r = loadRegistry(writeRegistry("mixed.json", {
+    projects: [{ id: "on", root: "/a/on" }, { id: "off", root: "/a/off", enabled: false }],
+  }));
+  assert.deepEqual(r.projects.map((p) => p.id), ["on"]);
+});
+
+test("root 尾斜杠被归一化，缺 root 的条目被丢弃", () => {
+  const r = loadRegistry(writeRegistry("slash.json", {
+    projects: [{ id: "a", root: "/a/proj/" }, { id: "bad" }],
+  }));
+  assert.deepEqual(r.projects.map((p) => p.root), ["/a/proj"]);
+});
+
+test("isUnder 不把同前缀的兄弟目录算进来", () => {
+  assert.equal(isUnder("/a/proj", "/a/proj"), true);
+  assert.equal(isUnder("/a/proj/sub", "/a/proj"), true);
+  assert.equal(isUnder("/a/project-other", "/a/proj"), false, "同前缀不等于在目录下");
+  assert.equal(isUnder(undefined, "/a/proj"), false);
+});
+
+// ---------- 归属判定 ----------
+
+const P1 = { id: "p1", root: path.join(tmp, "p1") };
+const P2 = { id: "p2", root: path.join(tmp, "p2") };
+
+test("cwd 在项目里 → 归属该项目", () => {
+  const r = attributeSession({ projects: [P1, P2], cwd: path.join(P1.root, "scripts"), transcriptPath: null });
+  assert.deepEqual(r.map((x) => x.id), ["p1"]);
+  assert.deepEqual(r[0].via, ["cwd"]);
+});
+
+test("cwd 在别处但会话记录里出现过项目路径 → 仍归属（会话可能起在任何地方）", () => {
+  const t = path.join(tmp, "transcript.jsonl");
+  fs.writeFileSync(t, JSON.stringify({ type: "user", text: "cd " + P2.root + " && node scripts/x.mjs" }) + "\n");
+  const r = attributeSession({ projects: [P1, P2], cwd: "/somewhere/else", transcriptPath: t });
+  assert.deepEqual(r.map((x) => x.id), ["p2"]);
+  assert.deepEqual(r[0].via, ["transcript"]);
+});
+
+test("会话既没在项目里也没提过它 → 不归属", () => {
+  const t = path.join(tmp, "unrelated.jsonl");
+  fs.writeFileSync(t, "完全无关的内容\n");
+  assert.deepEqual(attributeSession({ projects: [P1, P2], cwd: "/tmp", transcriptPath: t }), []);
+});
+
+test("会话记录不存在 → 不崩，只是判不出归属", () => {
+  const r = attributeSession({ projects: [P1], cwd: "/tmp", transcriptPath: path.join(tmp, "nope.jsonl") });
+  assert.deepEqual(r, []);
+});
+
+test("路径正好跨在分块边界上也能命中（回归：分块读漏匹配）", () => {
+  const t = path.join(tmp, "big.jsonl");
+  const pad = "x".repeat(1000);
+  fs.writeFileSync(t, pad + P1.root + pad);
+  const hits = fileContainsAny(t, [P1.root], { chunkSize: 1000 + 5 });
+  assert.deepEqual(hits, [P1.root], "重叠窗口必须覆盖被切断的路径");
+});
+
+// ---------- 发布锁 ----------
+
+const pubLock = path.join(tmp, "publish.lock");
+
+test("首次取发布锁成功", () => {
+  assert.equal(acquirePublishLock(pubLock).ok, true);
+});
+
+test("活着的发布者挡住第二次取锁（防重复打扰）", () => {
+  const r = acquirePublishLock(pubLock);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "publisher_busy");
+});
+
+test("持有者进程已死 → 发布锁被判陈旧并回收", () => {
+  fs.writeFileSync(path.join(pubLock, "owner.json"),
+    JSON.stringify({ pid: 999999, at: new Date().toISOString() }));
+  let alive = true;
+  try { process.kill(999999, 0); } catch { alive = false; }
+  if (!alive) assert.equal(acquirePublishLock(pubLock).ok, true);
+});
+
+test("持有者还活着但锁太老 → 也判陈旧，不永久堵住出站", () => {
+  releasePublishLock(pubLock);
+  assert.equal(acquirePublishLock(pubLock).ok, true);
+  const old = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  fs.writeFileSync(path.join(pubLock, "owner.json"), JSON.stringify({ pid: process.pid, at: old }));
+  assert.equal(acquirePublishLock(pubLock).ok, true);
+});
+
+releasePublishLock(pubLock);
+
+// ---------- outbox 记录纪律 ----------
+
+const obDir = path.join(tmp, "ob", ".runtime-data", "outbound", "outbox");
+
+test("五类之外的 kind 一律不收", () => {
+  const r = appendEvent({ outboxDir: obDir, kind: "note", text: "随便说说", source: "t" });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "unknown_kind");
+});
+
+test("同一条进展重复记录被判重，不重复打扰", () => {
+  assert.equal(appendEvent({ outboxDir: obDir, kind: "risk", text: "同一件事", source: "t" }).ok, true);
+  const again = appendEvent({ outboxDir: obDir, kind: "risk", text: "同一件事", source: "t" });
+  assert.equal(again.ok, false);
+  assert.equal(again.reason, "duplicate");
+});
+
+test("摘要按五类分组，已发的不再出现在 pending 里", () => {
+  appendEvent({ outboxDir: obDir, kind: "milestone", text: "做完了一件", source: "t" });
+  const pending = listPending({ outboxDir: obDir });
+  assert.equal(pending.length, 2);
+  const text = composeDigest(pending, { taskName: "T" });
+  assert.ok(text.includes("【里程碑】") && text.includes("【风险】"));
+  for (const r of pending) markSent(r, "om_test");
+  assert.equal(listPending({ outboxDir: obDir }).length, 0);
+});
+
+// ---------- 排空：所有不该发的路径 ----------
+
+const proj = path.join(tmp, "proj");
+const projOutbox = path.join(proj, ".runtime-data", "outbound", "outbox");
+const projInbound = path.join(proj, ".runtime-data", "inbound");
+
+test("outbox 为空 → empty，且不去读配置（配置根本不存在也不该报错）", () => {
+  const r = drainProject({ root: proj });
+  assert.equal(r.status, "empty");
+});
+
+test("有待发内容但配置读不了 → error，绝不静默丢弃", () => {
+  appendEvent({ outboxDir: projOutbox, kind: "next", text: "待发一条", source: "t" });
+  const r = drainProject({ root: proj });
+  assert.equal(r.status, "error");
+  assert.equal(r.reason, "config_unreadable");
+});
+
+test("绑定不是 active → skipped，进展留在本地", () => {
+  fs.mkdirSync(projInbound, { recursive: true });
+  fs.writeFileSync(path.join(projInbound, "chain-config.json"),
+    JSON.stringify({ task_display_name: "T", lark_cli_profile: "claude" }));
+  fs.writeFileSync(path.join(projInbound, "active-mapping.json"),
+    JSON.stringify({ status: "closed", feishu_root_message_id_reference: "om_x" }));
+  const r = drainProject({ root: proj });
+  assert.equal(r.status, "skipped");
+  assert.equal(r.reason, "mapping_not_active");
+  assert.equal(r.count, 1, "被跳过的条目必须仍然待发");
+  assert.equal(listPending({ outboxDir: projOutbox }).length, 1);
+});
+
+test("dry-run 出摘要但不标记已发", () => {
+  fs.writeFileSync(path.join(projInbound, "active-mapping.json"),
+    JSON.stringify({ status: "active", feishu_root_message_id_reference: "om_x" }));
+  const r = drainProject({ root: proj, dryRun: true });
+  assert.equal(r.status, "dry_run");
+  assert.ok(r.text.includes("待发一条"));
+  assert.equal(listPending({ outboxDir: projOutbox }).length, 1, "dry-run 不得标记已发");
+});
+
+test("已有发布者在排空 → 让路，不并发发送", () => {
+  const lock = path.join(proj, ".runtime-data", "outbound", "publish.lock");
+  assert.equal(acquirePublishLock(lock).ok, true);
+  const r = drainProject({ root: proj });
+  assert.equal(r.status, "skipped");
+  assert.equal(r.reason, "publisher_busy");
+  releasePublishLock(lock);
+});
+
+// ---------- 让给守望者 ----------
+
+test("没有守望者 → 会话结束钩子自己排空", () => {
+  assert.equal(watcherActive(proj), false);
+});
+
+test("守望者活着 → 让给它发（否则一次指令会收到三条消息）", () => {
+  const sl = path.join(projInbound, "session.lock");
+  assert.equal(acquireSessionLock(sl).ok, true);
+  stampSessionLock(sl, { pid: process.pid, logPath: path.join(tmp, "never.jsonl") });
+  assert.equal(watcherActive(proj), true);
+  releaseSessionLock(sl);
+});
+
+test("守望者的 run 已收场 → 锁是陈旧的，不该再让路", () => {
+  const sl = path.join(projInbound, "session.lock");
+  const done = path.join(tmp, "watch-done.jsonl");
+  fs.writeFileSync(done, JSON.stringify({ type: "result", is_error: false, result: "ok" }) + "\n");
+  assert.equal(acquireSessionLock(sl).ok, true);
+  stampSessionLock(sl, { pid: process.pid, logPath: done });
+  assert.equal(watcherActive(proj), false, "陈旧的会话锁不该让进展卡住");
+  releaseSessionLock(sl);
 });
 
 fs.rmSync(tmp, { recursive: true, force: true });

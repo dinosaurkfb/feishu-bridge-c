@@ -1,10 +1,11 @@
-# 当前状态（2026-08-19 交接给本项目目录下的新会话）
+# 当前状态（2026-08-19，出站已成机制）
 
-前一段工作在 `~/.ssh` 的会话里做的，对话本身不会跟过来。关键结论已写入本项目的
-`~/.claude/projects/-Users-dk-claude-projects-feishu-bridge-cc/memory/`（6 条），
+记忆在 `~/.claude/projects/-Users-dk-claude-projects-feishu-bridge-cc/memory/`，
 本文补充记忆里放不下的现场状态。
 
 ## 已经通的
+
+### 入站（技能，对所有 aily agent 生效）
 
 ```
 Frank 在绑定话题 @M5Claude + →Claude 前缀
@@ -17,41 +18,46 @@ Frank 在绑定话题 @M5Claude + →Claude 前缀
   守望者合并「结果 + 进展」→ COO助理CC 发一条到话题
 ```
 
-- 入站技能部署在 `/Users/dk/skills/m5claude-inbound-router/`（aily 捆绑技能目录，
+- 技能部署在 `/Users/dk/skills/m5claude-inbound-router/`（aily 捆绑技能目录，
   带 `aily-cli-skill.json` 才会被发现；`readdir withFileTypes` 不跟随符号链接，必须是真实目录）
 - 长期任务会话 ID 钉死在 `.runtime-data/longtask-session-id.txt`
-- 本地合成测试 47 项，`node scripts/test.mjs`，零外部副作用
-- launchd `com.frank.feishu-bridge-cc.drain` 每 30 分钟兜底排空 outbox
+
+### 出站（Stop 钩子 + 登记表 + 全局技能，对本机所有 Claude 会话生效）
+
+```
+任何会话在登记项目里干活 → node scripts/outbox.mjs --kind ... 写一条
+       ↓ 会话结束
+~/.claude/settings.json 的 Stop 钩子 → scripts/stop-hook.mjs
+       ↓ 归属判定：cwd 在项目里 OR 会话记录原文里出现项目路径
+  有守望者在盯 → 让路（它会把结果和进展合成一条）
+  没有         → drainProject 合成摘要 → COO助理CC 发到绑定话题
+```
+
+- 装/卸：`node scripts/install-outbound.mjs [--apply|--uninstall --apply]`，幂等，先备份
+- 登记表 `~/.claude/feishu-bridge/registry.json`，技能 `~/.claude/skills/claude-longtask-progress/`
+- 钩子日志 `~/.claude/feishu-bridge/stop-hook.log`
+- launchd `com.frank.feishu-bridge-cc.drain` 每 30 分钟兜底（plist 里可加 `--all` 排空全部登记项目）
+- 本地合成测试 72 项，`node scripts/test.mjs`，零外部副作用
+
+**实测过的**（2026-08-19）：
+
+| 路径 | 结果 |
+|---|---|
+| 真实无头会话结束 → 钩子发布 | ✅ `om_x100b67601a83bca0ddca45aa2edc3d1`，4 条进展一次发出 |
+| 守望者活着 → 让路不发 | ✅ 日志 `deferred to watcher`，outbox 原封不动 |
+| 发布失败 → 如实报告 + 留在 outbox | ✅ 不伪造已送达，报错 JSON 不喷终端 |
+| 未接桥的会话 | ✅ 约 45ms 退出，无输出 |
+| 登记表坏/缺、空 stdin、node 缺失 | ✅ 都不崩，缺 node 会往日志留 `hook-unavailable` |
 
 ## 没做完的
 
-1. **出站还不是机制。**入站是技能（所有 aily agent 自动可见），出站只是本项目
-   `CLAUDE.md` 里手写的一段。Frank 明确要求做成对称的「出站技能/钩子」，
-   让所有 Claude 长期任务都受其影响。**这是下一件事。**
-2. **事件筛选很粗。**只有「五类」这一层，长期任务记什么就发什么，噪音水平未验证。
-3. **判定「本次会话给哪个项目干了活」还没实现。**cwd 不够用（可能在别处起的会话
-   做本项目的事）；靠 Write/Edit 工具记录也不行（auto 模式下文件操作走 Bash heredoc，
-   没有结构化 `file_path`）。**可行解是读 `transcript_path` 原文 grep 注册路径。**
-
-## Stop 钩子探针结果（建出站钩子的直接输入）
-
-`~/.claude/settings.json` 加一条 Stop 钩子即可，改动**立即生效，无需重载**。
-它收到的 stdin 字段：
-
-```
-session_id, transcript_path, cwd, prompt_id, permission_mode,
-effort, hook_event_name, stop_hook_active, last_assistant_message,
-background_tasks, session_crons
-```
-
-`transcript_path` 是关键——钩子拿得到完整会话记录，可以 grep Bash 命令文本判断
-动过哪些项目，不依赖结构化工具调用。
-
-Stop 钩子支持 `decision: "block"` + `reason`（reason 回灌给模型、本轮不结束），
-理论上可以做到「没记进展就不许收工」。**此项据 schema 推断，尚未实测。**
-
-注意 `~/.claude/settings.json` 已有 `.orca` 的钩子（Stop / UserPromptSubmit /
-PostToolUse），加的时候要合并不要覆盖。
+1. **事件筛选仍然很粗。**只有「五类」这一层，长期任务记什么就发什么，
+   噪音水平还是没验证过 —— 需要跑几天真实使用才知道 Frank 会不会被刷。
+2. **「没记进展就不许收工」没做。**Stop 钩子的 `decision: "block"` + `reason`
+   （reason 回灌给模型、本轮不结束）**仍未实测**，只是 schema 上看得到。
+   要做的话，判据得是「这次会话在登记项目里动过文件却一条 outbox 都没记」。
+3. **多项目还没真跑过。**登记表结构支持 N 个项目，但只有本项目配了
+   chain-config / active-mapping，第二个项目接进来时的绑定怎么发是空白。
 
 ## 现场值
 
@@ -60,7 +66,8 @@ PostToolUse），加的时候要合并不要覆盖。
 | 绑定话题 session | `session_4kvgs2vuq4j5z` |
 | 飞书根消息 | `om_x100b677afd1884a8c389b5d1da41563` |
 | M5Claude agent uid | `agent_4ks11dv8f0mxwbd` |
-| mapping 有效期 | 2026-08-20（会过期，到期需重签） |
+| mapping 有效期 | **2026-08-20T23:31:31Z —— 到期后入站全拒，需重签** |
+| mapping 配额 | 已用 2 / 20 |
 
 ## 需求基线
 

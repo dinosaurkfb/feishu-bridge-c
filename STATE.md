@@ -19,8 +19,10 @@ Frank 在绑定话题 @M5Claude + →Claude 前缀
          守望者合并「结果 + 进展」→ COO助理CC 发一条到话题
 ```
 
-- **入站技能的部署位置存疑（2026-08-19 复查）。**原记载「部署在 `/Users/dk/skills/`，
-  带 `aily-cli-skill.json` 才会被发现」**两句都没有证据支持**：
+- **入站没有本地技能。已判决（2026-08-19）**：把 `~/skills/m5claude-inbound-router/`
+  改名后从飞书发指令，**照常受理**（`msg_4kvn227q33txt`，重试 0 次）。
+  那个位置从未被读取。原记载「部署在 `/Users/dk/skills/`，带 `aily-cli-skill.json`
+  才会被发现」**两句都是错的**。旁证：
   - claude-code-local adapter 的技能注入只从三处取：`bundledSkillsRoot`、
     `~/.aily-cli/skills`（本机不存在）、`~/.claude`。**`~/skills/` 不在其中。**
   - 真正在工作的 Codex 链路把技能放在 `~/aily_workspaces/<agent_uid>/.agents/skills/`，
@@ -29,9 +31,11 @@ Frank 在绑定话题 @M5Claude + →Claude 前缀
     而 `resolveAndPinInvokeWorkspacePath` 把它钉成 M5Claude 的 workspace。
   - adapter 明确避开 project 级 `.claude/skills`，改用每次调用私有的 plugin 目录，
     内容由平台侧的 `skillRefs` 决定。
-  合理推断：让 M5Claude 去跑 `inbound.mjs` 的指令**来自 Aily 平台侧的 agent 配置**，
-  `~/skills/` 那份是文档，不是载荷。**唯一的判决实验**：把该目录改名，
-  从飞书发一条，看还通不通（会让入站断几十秒）。
+  所以：让 M5Claude 去跑 `inbound.mjs` 的指令**来自 Aily 平台侧的 agent 配置**。
+  仓库里 `skills/m5claude-inbound-router/SKILL.md` 现在的定位是**平台指令的底稿**，
+  改它不会生效，必须同步改平台。
+- **入站的真实配置不在版本管理里，也无法被本地安装器复现。**这是目前最大的
+  可重建性缺口：换台机器，出站四样能一条命令装回来，入站要人去 Aily 平台重配。
 - 两条分支**必须互斥**：都走 `--continue` 会有两个进程写同一份 transcript
 - `.runtime-data/longtask-session-id.txt` **已废弃，没有代码再读它**。
   钉一个会话 UUID 是错的抽象 —— 会话是记录，每开一个终端就是新的一份，

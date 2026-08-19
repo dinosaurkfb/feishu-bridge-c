@@ -1,7 +1,0 @@
-{
-  "schemaVersion": 1,
-  "surfaces": ["agent-lite"],
-  "agentLite": {
-    "entry": "SKILL.md"
-  }
-}

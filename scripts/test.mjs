@@ -14,6 +14,7 @@ import path from "node:path";
 
 import { REJECT, evaluateInbound, extractMentionIds, isValidQuota, normalizeBody } from "./selector.mjs";
 import { NOTE_MAX, resolveUntil, validateNote } from "./binding.mjs";
+import { RECENT_TURNS, buildEventsArgs } from "./envelope.mjs";
 import { acquireClaim, claimKey, recordClaimState } from "./claim.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
@@ -695,6 +696,24 @@ test("续期工具写得出的值，入站一定认（同一条规则）", () =>
   for (const v of ["Unlimited", 0, -1, 2.5, "20", true, null, undefined]) {
     assert.equal(isValidQuota(v), false, JSON.stringify(v) + " 不该被判合法");
   }
+});
+
+// ---------- 只取最近轮次，不拉全量话题 ----------
+
+test("没有 runId 时按轮次收窄，不拉整个话题", () => {
+  const a = buildEventsArgs({ sessionId: "s", agentId: "a", runId: undefined });
+  assert.ok(a.includes("--page-size"), "缺了收窄，开销会随话题寿命一直涨");
+  assert.equal(a[a.indexOf("--page-size") + 1], String(RECENT_TURNS));
+});
+
+test("有 runId 时用 --run，不叠加 --page-size", () => {
+  const a = buildEventsArgs({ sessionId: "s", agentId: "a", runId: "run_1" });
+  assert.ok(a.includes("--run"));
+  assert.ok(!a.includes("--page-size"), "--run 已经更准，两个一起用只会互相干扰");
+});
+
+test("收窄的余量至少留一轮（别卡在轮次边界上漏消息）", () => {
+  assert.ok(RECENT_TURNS >= 2, "取 1 会在查询正好落到轮次边界时漏掉目标消息");
 });
 
 // ---------- 汇总 ----------

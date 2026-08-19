@@ -1,0 +1,46 @@
+{
+  "_README": "复制到 .runtime-data/inbound/chain-config.json 并逐项替换。带 ← 的是必须改的。这份文件不进版本管理（.runtime-data/ 已被 gitignore）。",
+
+  "schema_version": "1.0",
+  "chain": "claude",
+
+  "_1_入站运输身份": "飞书里那个负责把消息转进本机的智能体。它只做运输，不发布任何东西。",
+  "transport_agent_name": "M5Claude",
+  "transport_app_id": "cli_xxxxxxxxxxxxxxxx",
+  "transport_open_id": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "transport_open_id_note": "← 必须是「这个 app 自己视角下」的 open_id。open_id 按 app 隔离，从别的 app 查到的那个不能用。用 lark-cli 以该身份查自己。",
+
+  "_2_出站发布身份": "结果和进展用这个身份发回话题。刻意与运输身份分开：让运输方也能发布，等于把两个方向的职责搅在一起。",
+  "outbound_agent_name": "COO助理CC",
+  "outbound_app_id": "cli_xxxxxxxxxxxxxxxx",
+  "outbound_open_id": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "lark_cli_profile": "claude",
+  "lark_cli_profile_note": "← lark-cli 的 profile 名。多条链路共存时必须各用各的 profile，否则会串身份。",
+  "lark_cli_bin": "/opt/homebrew/bin/lark-cli",
+  "lark_cli_home": "/Users/你/.lark-cli",
+  "lark_cli_home_note": "← 两个都必须写绝对路径。发布器是在 aily agent 的清洗环境里被拉起的，那里 lark-cli 被重定向到按 agent 隔离的配置目录，靠环境里「恰好是什么」会拿到错误的身份 —— 实测就是这么发布失败的。",
+
+  "_3_授权发送者": "只有这个人的消息会被受理。",
+  "frank_sender_id": "0000000000000000000",
+  "frank_sender_id_note": "← 是 Aily 平台的 user id，**不是**飞书的 ou_ open_id。两者不通用。",
+
+  "_4_话题与前缀": "",
+  "chat_name": "你的群名",
+  "inbound_prefix": "→Claude",
+  "inbound_prefix_note": "← 同一个群里跑多条链路时，这是互斥的一半（另一半是 mention 对象和根话题）。两条链路的前缀必须不同。",
+
+  "_5_本机": "",
+  "project_dir": "/Users/你/path/to/feishu-bridge-cc",
+  "logical_task_key": "feishu_bridge_cc",
+  "project_display_name": "项目显示名",
+  "task_display_name": "长期任务显示名（会出现在发回飞书的消息开头）",
+
+  "_6_行为开关": "",
+  "default_freshness_ms": 900000,
+  "default_freshness_ms_note": "消息超过这个时长未被处理就判过期拒绝，防止重放旧消息。",
+  "auto_publish_on_completion": true,
+  "auto_publish_note": "一次性守望者，非持续监听：由已授权投递触发，跑完即退出。设为 false 可退回手动发布。",
+
+  "agent_uid": "agent_xxxxxxxxxxxxxxx",
+  "agent_uid_note": "← 入站运输智能体的 Aily agent uid。脚本用它向平台取消息信封。"
+}

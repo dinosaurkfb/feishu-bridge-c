@@ -1,96 +1,99 @@
 # feishu-bridge-cc
 
-Claude 侧飞书双向桥试点。**本项目的长期任务就是这座桥本身。**
+把一个飞书话题和本机的 Claude Code 长期任务接起来，双向。
 
-- 出站身份：COO助理CC (`cli_aa09017d17395bd8`)，经 lark-cli profile `claude`
-- 入站运输：M5Claude (`cli_aaf8bee78ab89bc1`)，Aily agent → claude-code-local adapter
-- 入站前缀：`→Claude`
-- 需求基线：`codex-projects/agents-arch/pilots/project-management/handoffs/claude-requirements-alignment-20260819.md`
+```
+飞书话题里发指令  ──→  本机 Claude 会话收到并执行
+终端里干的活      ──→  每轮回答原样发回那个话题
+```
 
-## 核心时间契约
+**实际效果**：合上电脑走开，用手机继续下指令、看结果。不需要先问它「进展怎么样」——
+它会自己说。
 
-入站秒级回执，**不阻塞**；最终结果走下一轮出站。
+> 搭建步骤看 **[SETUP.md](SETUP.md)**。现场状态、已知未解和踩过的坑看 **[STATE.md](STATE.md)**。
+
+---
 
 ## 两个方向都是机制，不是约定
 
 | | 入站 | 出站 |
 |---|---|---|
-| 载体 | aily 捆绑技能 `m5claude-inbound-router` | 用户级 Stop 钩子 + 全局技能 `claude-longtask-progress` |
-| 生效范围 | 所有 aily agent | 本机所有 Claude 会话 |
-| 触发 | Frank 在绑定话题 @M5Claude + `→Claude` 前缀 | 会话结束（兜底：launchd 每 30 分钟） |
-| 判定对象 | 六项确定性校验 + 原子 claim | 登记表里的项目 + 会话归属判定 |
+| 触发 | 飞书话题里 mention + 前缀 | 每轮回答结束（兜底：每 30 分钟） |
+| 载体 | 飞书智能体 + `scripts/inbound.mjs` | 用户级 Stop 钩子 + 全局技能 |
+| 生效范围 | 绑定的那个话题 | 本机**所有** Claude 会话 |
+| 判定 | 六项确定性校验 + 原子 claim | 登记表里的项目 + 会话归属判定 |
 
-出站不再依赖某个 `CLAUDE.md` 里的手写约定 —— 换目录、换会话都还在。
+出站不依赖任何 `CLAUDE.md` 里的手写约定 —— 换目录、换会话都还在。
 
-## 安装
+## 入站怎么走
 
-两个方向各有一个安装器，都是 dry-run 默认、幂等、可 `--uninstall`：
-
-```bash
-node scripts/install-outbound.mjs --apply   # Stop 钩子 + 登记表 + 全局技能 + launchd 兜底
-node scripts/install-inbound.mjs  --apply   # 入站技能装到 ~/skills/
+```
+话题里 mention 入站智能体 + →Claude 前缀
+  → scripts/inbound.mjs：六项校验 → 原子 claim → 路由 → 秒级「已受理」
+       ├ 这个项目有活着的交互会话？ → SendMessage 投进去
+       └ 没有                       → claude --continue 后台起一轮 + 守望者
 ```
 
-出站那个往 `~/.claude/settings.json` 的 Stop 数组**追加**一条（先备份，不动 .orca 那套）。
+两条分支互斥。都走 `--continue` 会有两个进程写同一份会话记录。
 
-入站那个装完会自检文件一致性、目标是真实目录（软链会让扫描不跟随）、
-以及 `SKILL.md` 里引用的脚本路径确实存在。但它**不保证技能已被发现**——
-`aily-cli skill scan-local` 扫的是宿主 agent 目录（`~/.claude/skills`、`~/.codex/skills`），
-看不到 `~/skills/` 这一个。**唯一的验证是从飞书真发一条 `→Claude` 指令看回执。**
+## 出站怎么走
 
-技能实际是被 materialize 进一次性的 plugin 目录再调用的
-（`aily-cli-invocation:<技能名>`，用完即删），所以事后在磁盘上翻不到痕迹。
-要确认它有没有真被调用，看 M5Claude 自己的会话记录：
-`~/.claude/projects/-Users-dk-aily-workspaces-agent-<uid>/`。
+每轮回答结束时，Stop 钩子取 `last_assistant_message`，**原样**写进 outbox，
+发布器排空后发到话题。不经模型判断。
 
-## 目录
+为什么不筛：多发一条你已读过的是噪音（代价≈0），漏发一条是信息丢失（你走开了，
+结果躺在看不见的终端里）。**用会出错的判断决定发不发，是拿便宜的错误换昂贵的错误。**
 
-- `scripts/` 确定性脚本（selector / claim / handoff / outbox / drain / stop-hook）
-- `skills/m5claude-inbound-router/` 部署到 M5Claude 工作区的入站技能
-- `skills/claude-longtask-progress/` 部署到 `~/.claude/skills/` 的出站进展技能
-- `.runtime-data/` 敏感 locator、mapping、claim、回执。**禁止提交**
-
-## 绑定续期
-
-绑定有个到期日，那是入站**唯一**的闸（配额闸已退役）。到期后入站一律拒，
-但出站照发——会变成"任务能说、你不能回"。
+## 常用命令
 
 ```bash
-node scripts/binding.mjs                    # 看：到期日、还剩几天、配额、话题
-node scripts/binding.mjs --renew 1y --apply # 续（也收 6m / 90d / 2027-08-19）
+node scripts/binding.mjs                     # 看绑定：有效期、剩余天数、话题
+node scripts/binding.mjs --renew 1y --apply  # 续期
+node scripts/outbox.mjs --list               # 还有多少进展没发出去
+node scripts/test.mjs                        # 142 项本地回归，零外部副作用
+tail ~/.claude/feishu-bridge/stop-hook.log   # 出站钩子每次干了什么
 ```
 
-到期前 30 天和 7 天会各自动往飞书报一次，不用记着。预警文案里带续期命令。
+## 装 / 卸
+
+```bash
+node scripts/install-outbound.mjs --apply              # Stop 钩子 + 登记表 + 技能 + launchd
+node scripts/install-outbound.mjs --uninstall --apply
+```
+
+dry-run 默认，幂等。往 `~/.claude/settings.json` 的 Stop 数组**追加**（先备份，不动已有的）。
 
 ## 代理（这台机器上的两个坑）
 
 **daemon 重启后会丢代理。**`aily-cli daemon start` 用硬编码白名单构造环境，
-代理变量不在其中，所以 `HTTP_PROXY=... aily-cli daemon restart` 无效。
-症状伪装成「Claude Code 鉴权失败，请检查 ANTHROPIC_AUTH_TOKEN」——**查凭据是白查**。
-每次重启（升级、开机自启、崩溃拉起）都会复发。用：
+代理变量不在其中。症状伪装成「Claude Code 鉴权失败，请检查 ANTHROPIC_AUTH_TOKEN」
+—— **查凭据是白查**。每次重启（升级、开机自启、崩溃拉起）都会复发。
 
 ```bash
 sh scripts/aily-daemon-restart.sh
 ```
 
-它先探代理端口（不通就拒绝重启，不白折腾），带 `AILY_CLI_FORWARD_ENV` 重启，
-再验代理变量真的进到 daemon 里、以及网关认不认这台机器在线。
+先探代理端口（不通就拒绝重启，不白中断会话），带 `AILY_CLI_FORWARD_ENV` 重启，
+再验代理真的进到 daemon 里、网关认不认这台机器在线。
 
-**git 走 https，只认 `HTTPS_PROXY`。**只设 `HTTP_PROXY` 时 `git push` 会走直连、
-时通时不通（表现为 75 秒超时）。已在 `~/.zshrc` 里补齐两个变量，并给 github.com
-配了不依赖环境变量的 git 代理：
+**git 走 https，只认 `HTTPS_PROXY`。**只设 `HTTP_PROXY` 时 `git push` 走直连、
+时通时不通（75 秒超时）。已在 `~/.zshrc` 补齐，并给 github.com 配了不依赖环境变量的
+git 代理。`.zshrc` 那段只在代理**真的在监听**时才导出 —— 指向死端口比没有代理更糟。
 
-```bash
-git config --global http.https://github.com.proxy http://127.0.0.1:10808
+## 目录
+
+```
+scripts/       确定性脚本。selector/claim/handoff 是入站，outbox/drain/stop-hook 是出站
+skills/        两个方向各一份技能源
+references/    配置模板（chain-config / active-mapping）
+.runtime-data/ 身份、绑定、claim、回执、outbox 队列。禁止提交
 ```
 
-`~/.zshrc` 那段只在代理**真的在监听**时才导出——指向死端口比没有代理更糟。
+## 设计上不肯让步的几条
 
-## 自检
-
-```bash
-node scripts/test.mjs                       # 本地合成回归，零外部副作用
-node scripts/outbox.mjs --list              # 还有多少进展没发出去
-node scripts/drain-outbox.mjs --all --dry-run
-tail ~/.claude/feishu-bridge/stop-hook.log  # 出站钩子每次干了什么
-```
+- **伪造进展比不报告进展糟得多。**权限被拦、跑失败、只做了一半，一律如实说。
+  `readRunOutcome` 会把「被权限拦下」判成 `blocked` 而不是 `completed`。
+- **fail-closed。**配置缺失或写错一律拒绝入站，绝不当成「没有限制」。
+- **发送成功才标记已发。**宁可重发也不能标记了却没发出去 —— 那会让进展静默丢失。
+- **长期任务不能延长自己的授权。**续期是人工命令，`.runtime-data/` 对它写权限被显式拒绝。
+- **一个只会报成功的自检，比没有自检更糟。**

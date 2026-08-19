@@ -173,4 +173,4 @@ console.log("  · aily 是否已发现本技能：" +
     : scanned === false ? "scan-local 报不到（已知如此 —— 它扫的是宿主 agent 目录，不扫这里）"
       : "查不了（aily-cli 没跑起来）"));
 
-console.log("\n**装好 ≠ 能用。**唯一的验证是从飞书发一条 →Claude 指令，看回执。");
+console.log("\n**装好 ≠ 能用。**唯一的验证是从飞书发一条指令（@ 运输智能体），看回执。");

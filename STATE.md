@@ -8,9 +8,10 @@
 ### 入站（技能，对所有 aily agent 生效）
 
 ```
-Frank 在绑定话题 @M5Claude + →Claude 前缀
+Frank 在绑定话题 @M5Claude（前缀已退役，2026-08-19）
   → M5Claude 执行 scripts/inbound.mjs（无参，字段由脚本自己向 Aily 取）
-  → 六项确定性校验 → 原子 claim → 路由 → 秒级「已受理」（实测 77ms）
+  → 确定性校验（绑定/话题/发送者/mention/幂等/配额/时效）→ 原子 claim → 路由
+  → 秒级「已受理」（实测 77ms）
        ↓
   ┌ 现场有活着的交互会话？
   ├ 有 → 起一个极小无头会话，用 SendMessage 把指令投进去
@@ -78,7 +79,7 @@ Frank 在绑定话题 @M5Claude + →Claude 前缀
 - 登记表 `~/.claude/feishu-bridge/registry.json`，技能 `~/.claude/skills/claude-longtask-progress/`
 - 钩子日志 `~/.claude/feishu-bridge/stop-hook.log`
 - launchd `com.frank.feishu-bridge-cc.drain` 每 30 分钟兜底（plist 里可加 `--all` 排空全部登记项目）
-- 本地合成测试 72 项，`node scripts/test.mjs`，零外部副作用
+- 本地合成测试 156 项，`node scripts/test.mjs`，零外部副作用
 
 **实测过的**（2026-08-19）：
 
@@ -114,6 +115,7 @@ Frank 在绑定话题 @M5Claude + →Claude 前缀
 | M5Claude agent uid | `agent_4ks11dv8f0mxwbd` |
 | mapping 有效期 | 见 `active-mapping.json`；**这是入站唯一的闸** |
 | mapping 配额 | 已退役（`max_inbound_messages: "unlimited"`） |
+| 正文前缀 | 已退役（`inbound_prefix: null`）。@ 一下即可，不必再打 `→Claude` |
 
 有效期到期后：入站一律拒（回执「绑定关系已过期」），**出站不受影响**——
 `drainProject` 只看 `status === "active"`。会变成"任务能说、Frank 不能回"。

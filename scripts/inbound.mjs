@@ -2,8 +2,8 @@
 /**
  * 入站主流程 —— M5Claude 唯一被允许调用的入口。
  *
- * 从 stdin 读一条飞书消息事件，输出一段给 Frank 的回执文本（stdout 最后一段）
- * 和一份机器可读结果（stderr 上的 JSON）。
+ * 不接受任何入参：事件字段一律由脚本自己向 Aily 取（见 envelope.mjs），
+ * 模型不参与构造。输出一段给 Frank 的回执文本（stdout）和一份机器可读结果（stderr）。
  *
  * 时间契约：这个脚本必须秒级返回。它**不等待**长期任务完成 —— 完成由出站流程负责。
  *
@@ -14,6 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { evaluateInbound } from "./selector.mjs";
+import { fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, recordClaimState } from "./claim.mjs";
 import { handOff, acquireSessionLock, releaseSessionLock, stampSessionLock } from "./handoff.mjs";
 
@@ -71,13 +72,15 @@ function finish(kind, detail, result) {
 
 // ---------- 主流程 ----------
 
-const raw = fs.readFileSync(0, "utf-8");
-let event;
-try {
-  event = JSON.parse(raw);
-} catch (err) {
-  finish("error", { detail: "事件不是合法 JSON" }, { error: err.message });
+const fetched = fetchTriggerEvent();
+if (!fetched.ok) {
+  writeReceipt("envelope-" + fetched.reason + "-" + Date.now(), {
+    status: "error", reason: fetched.reason,
+    claim_acquired: false, handed_off: false,
+  });
+  finish("error", { detail: "取不到本次消息信封（" + fetched.reason + "）" }, { reason: fetched.reason });
 }
+const event = fetched.event;
 
 const config = readJson(path.join(RT, "chain-config.json"));
 
@@ -90,6 +93,15 @@ try {
 }
 
 const verdict = evaluateInbound({ event, mapping, config, now: Date.now() });
+
+// --dry-run：只跑校验，不 claim、不投递、不写 mapping。用于诊断和联调，
+// 免得一次排查就把真实指令送进长期任务。
+if (process.argv.includes("--dry-run")) {
+  process.stdout.write("[dry-run] " + verdict.decision +
+    (verdict.reason ? " · " + verdict.reasonText : " · " + String(verdict.instruction).slice(0, 60)) + "\n");
+  process.stderr.write(JSON.stringify({ dryRun: true, ...verdict }) + "\n");
+  process.exit(0);
+}
 
 if (verdict.decision === "reject") {
   writeReceipt("reject-" + (event?.message_id ?? "unknown") + "-" + Date.now(), {
@@ -108,7 +120,7 @@ const claim = acquireClaim({
   claimsDir: CLAIMS,
   messageId: verdict.messageId,
   logicalTaskKey: verdict.logicalTaskKey,
-  meta: { chat_id: event.chat_id, binding_id: mapping.binding_id },
+  meta: { session_id: event.session_id, binding_id: mapping.binding_id },
 });
 
 if (!claim.ok) {

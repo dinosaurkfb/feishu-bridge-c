@@ -1,19 +1,21 @@
 /**
- * 确定性入站 selector。
+ * 确定性入站 selector（v2 / Aily 命名空间）。
  *
- * 纯函数，无 IO、无网络、无副作用 —— 因此可以被完整合成测试覆盖。
- * 唯一职责：判断一条飞书消息是否是「Frank 在本链路根话题里给目标长期任务的显式指令」。
+ * v1 假设能拿到飞书 locator（om_/oc_/ou_），2026-08-19 实测证伪：Aily 投递给 M5Claude 的
+ * 是平台归一化后的消息，不含任何飞书 locator。v2 改用 Aily 自己的标识符，六项校验一项不少：
  *
- * 设计原则：fail-closed。任何字段缺失、类型不符、无法判定的情况一律 reject，
- * 绝不因为「看起来像」而放行，也绝不猜测消息属于哪条链路。
+ *   飞书 message_id  → 平台 message.id (msg_)
+ *   飞书 sender ou_  → 平台 createdBy (user id)
+ *   chat_id+root_id  → sessionID（实测：话题群里一个话题对应一个 session）
+ *
+ * 纯函数，无 IO。fail-closed：任何字段缺失或不匹配一律 reject，绝不猜测。
  */
 
 export const REJECT = {
   MAPPING_MISSING: "mapping_missing",
   MAPPING_NOT_ACTIVE: "mapping_not_active",
   MAPPING_EXPIRED: "mapping_expired",
-  CHAT_MISMATCH: "chat_mismatch",
-  ROOT_MISMATCH: "root_mismatch",
+  SESSION_MISMATCH: "session_mismatch",
   SENDER_NOT_FRANK: "sender_not_frank",
   TRANSPORT_NOT_MENTIONED: "transport_not_mentioned",
   PREFIX_MISMATCH: "prefix_mismatch",
@@ -23,13 +25,11 @@ export const REJECT = {
   MALFORMED_EVENT: "malformed_event",
 };
 
-/** 人类可读的拒绝原因 —— 直接用于回给 Frank 的「已拒绝」回执。 */
 export const REJECT_TEXT = {
   [REJECT.MAPPING_MISSING]: "没有找到有效的绑定关系",
   [REJECT.MAPPING_NOT_ACTIVE]: "绑定关系不在 active 状态",
   [REJECT.MAPPING_EXPIRED]: "绑定关系已过期",
-  [REJECT.CHAT_MISMATCH]: "不是绑定的群",
-  [REJECT.ROOT_MISMATCH]: "不在绑定的根话题里",
+  [REJECT.SESSION_MISMATCH]: "不在绑定的话题里",
   [REJECT.SENDER_NOT_FRANK]: "发送者不是授权用户",
   [REJECT.TRANSPORT_NOT_MENTIONED]: "没有真实 @ 本链路的运输 agent",
   [REJECT.PREFIX_MISMATCH]: "正文没有以约定前缀开头",
@@ -41,24 +41,28 @@ export const REJECT_TEXT = {
 
 const isNonEmptyString = (v) => typeof v === "string" && v.length > 0;
 
-/**
- * 去掉飞书 mention 占位符，得到用于前缀判定的正文。
- *
- * 飞书把 @ 渲染成 `@_user_N` 占位符，真实身份在 mentions[] 里。只删占位符，
- * 不做任何其他归一化 —— 大小写、全半角箭头都必须精确匹配，避免「差不多就放行」。
- */
-export function stripMentions(text, mentions) {
-  let out = typeof text === "string" ? text : "";
-  for (const m of Array.isArray(mentions) ? mentions : []) {
-    if (isNonEmptyString(m?.key)) out = out.split(m.key).join("");
-  }
-  return out.replace(/^[\s ]+/, "");
+const AT_TAG = /<at\s+id="([^"]*)"[^>]*>.*?<\/at>/gs;
+
+/** 提取正文里所有 <at> 的 id。这是本链路唯一可验证的「真实 mention」信号。 */
+export function extractMentionIds(content) {
+  const ids = [];
+  for (const m of String(content ?? "").matchAll(AT_TAG)) ids.push(m[1]);
+  return ids;
 }
 
 /**
- * @returns {{decision:'accept'|'reject', reason?:string, reasonText?:string,
- *            instruction?:string, messageId?:string, logicalTaskKey?:string}}
+ * 去掉 <at> 标签和飞书追加的引用块，得到 Frank 真正写的那句话。
+ *
+ * 引用块是平台在被回复的消息下自动附加的，不是 Frank 的输入，
+ * 必须在前缀判定之前切掉，否则指令正文会混入根消息全文。
  */
+export function normalizeBody(content) {
+  let s = String(content ?? "").replace(AT_TAG, "");
+  const quoteAt = s.search(/\n\s*>?\s*\*\*\[引用\]\*\*/);
+  if (quoteAt >= 0) s = s.slice(0, quoteAt);
+  return s.replace(/^[\s ]+/, "").replace(/[\s ]+$/, "");
+}
+
 export function evaluateInbound({ event, mapping, config, now }) {
   const nowMs = typeof now === "number" ? now : Date.now();
   const reject = (reason) => ({
@@ -67,11 +71,10 @@ export function evaluateInbound({ event, mapping, config, now }) {
     reasonText: REJECT_TEXT[reason] ?? reason,
   });
 
-  // 事件本身必须结构完整。缺任何一项都无法安全判定归属。
   if (
     !event ||
     !isNonEmptyString(event.message_id) ||
-    !isNonEmptyString(event.chat_id) ||
+    !isNonEmptyString(event.session_id) ||
     !isNonEmptyString(event.sender_id)
   ) {
     return reject(REJECT.MALFORMED_EVENT);
@@ -85,25 +88,22 @@ export function evaluateInbound({ event, mapping, config, now }) {
     return reject(REJECT.MAPPING_EXPIRED);
   }
 
-  if (event.chat_id !== mapping.chat_id) return reject(REJECT.CHAT_MISMATCH);
-
-  // 根话题必须精确匹配：两条链路共用一个群，root 是它们唯一的物理隔离。
-  const eventRoot = event.root_message_id ?? event.parent_id;
-  if (!isNonEmptyString(eventRoot) || eventRoot !== mapping.root_message_id) {
-    return reject(REJECT.ROOT_MISMATCH);
+  // session 即话题。两条链路共用一个飞书群，这是它们唯一的物理隔离。
+  if (event.session_id !== mapping.session_id) {
+    return reject(REJECT.SESSION_MISMATCH);
   }
 
   if (event.sender_id !== mapping.frank_sender_id) {
     return reject(REJECT.SENDER_NOT_FRANK);
   }
 
-  // 必须是真实 mention，不接受正文里手打的「@M5Claude」字样。
-  const mentioned = (Array.isArray(event.mentions) ? event.mentions : []).some(
-    (m) => m?.id?.open_id === config.transport_open_id,
-  );
-  if (!mentioned) return reject(REJECT.TRANSPORT_NOT_MENTIONED);
+  // 必须是真实 <at> 标签，不接受正文里手打的「@M5Claude」字样。
+  // 注意 open_id 按 app 隔离：这里比的是 M5Claude 自己 app 视角下的 id。
+  if (!extractMentionIds(event.content).includes(config.transport_open_id)) {
+    return reject(REJECT.TRANSPORT_NOT_MENTIONED);
+  }
 
-  const body = stripMentions(event.text, event.mentions);
+  const body = normalizeBody(event.content);
   const prefix = mapping.inbound_prefix;
   if (!isNonEmptyString(prefix) || !body.startsWith(prefix)) {
     return reject(REJECT.PREFIX_MISMATCH);
@@ -112,18 +112,13 @@ export function evaluateInbound({ event, mapping, config, now }) {
   const consumed = Array.isArray(mapping.consumed_message_ids)
     ? mapping.consumed_message_ids
     : [];
-  if (consumed.includes(event.message_id)) {
-    return reject(REJECT.DUPLICATE_MESSAGE);
-  }
+  if (consumed.includes(event.message_id)) return reject(REJECT.DUPLICATE_MESSAGE);
 
   const max = mapping.max_inbound_messages;
-  if (Number.isFinite(max) && consumed.length >= max) {
-    return reject(REJECT.QUOTA_EXHAUSTED);
-  }
+  if (Number.isFinite(max) && consumed.length >= max) return reject(REJECT.QUOTA_EXHAUSTED);
 
-  // 时效窗口挡住重启后重放的历史消息。
   const freshnessMs = mapping.freshness_ms ?? config.default_freshness_ms;
-  const createdMs = Number(event.create_time);
+  const createdMs = Number(event.created_at_ms);
   if (Number.isFinite(freshnessMs)) {
     if (!Number.isFinite(createdMs)) return reject(REJECT.MALFORMED_EVENT);
     if (nowMs - createdMs > freshnessMs) return reject(REJECT.STALE_MESSAGE);

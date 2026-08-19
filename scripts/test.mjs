@@ -3,6 +3,8 @@
  *
  * 覆盖重点是**拒绝路径**，不是接受路径 —— 接受路径错了会立刻被发现，
  * 拒绝路径错了会静默地把不该放行的消息放行。
+ *
+ * v2：标识符全部换到 Aily 命名空间（见 selector.mjs 顶部说明）。
  */
 
 import assert from "node:assert/strict";
@@ -10,7 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { REJECT, evaluateInbound, stripMentions } from "./selector.mjs";
+import { REJECT, evaluateInbound, extractMentionIds, normalizeBody } from "./selector.mjs";
 import { acquireClaim, claimKey, recordClaimState } from "./claim.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 
@@ -28,22 +30,20 @@ function test(name, fn) {
   }
 }
 
-// ---------- 固定装置 ----------
+// ---------- 固定装置（取自 2026-08-19 真实信封） ----------
 
 const NOW = Date.parse("2026-08-19T10:00:00Z");
-const TRANSPORT_OPEN_ID = "ou_transport_m5claude";
-const FRANK = "ou_frank";
+const M5CLAUDE = "ou_07d4554816d5c05f306ef01ff7d229bb";
+const M5CODEX = "ou_0272dfb0e04bfcd5a232bd34c94cb1c0";
+const FRANK = "7621020633916345545";
+const BOUND_SESSION = "session_bound";
 
-const config = {
-  transport_open_id: TRANSPORT_OPEN_ID,
-  default_freshness_ms: 10 * 60 * 1000,
-};
+const config = { transport_open_id: M5CLAUDE, default_freshness_ms: 10 * 60 * 1000 };
 
 const baseMapping = {
   status: "active",
   expires_at: "2026-08-19T12:00:00Z",
-  chat_id: "oc_bound",
-  root_message_id: "om_root",
+  session_id: BOUND_SESSION,
   frank_sender_id: FRANK,
   inbound_prefix: "→Claude",
   logical_task_key: "feishu_bridge_cc",
@@ -52,14 +52,15 @@ const baseMapping = {
   freshness_ms: 10 * 60 * 1000,
 };
 
+const at = (id) => `<at id="${id}" type="employee">M5Claude</at>`;
+const QUOTE = "\n\n**[引用]**\nClaude 侧飞书桥试点\nfeishu-bridge-cc 长期任务\n这是根话题正文";
+
 const baseEvent = {
-  message_id: "om_msg_1",
-  chat_id: "oc_bound",
-  root_message_id: "om_root",
+  message_id: "msg_1",
+  session_id: BOUND_SESSION,
   sender_id: FRANK,
-  create_time: NOW - 5000,
-  text: "@_user_1 →Claude 把出站发布器的草稿写完",
-  mentions: [{ key: "@_user_1", id: { open_id: TRANSPORT_OPEN_ID } }],
+  created_at_ms: NOW - 5000,
+  content: at(M5CLAUDE) + " →Claude 把出站发布器的草稿写完" + QUOTE,
 };
 
 const evalWith = (eventPatch = {}, mappingPatch = {}) =>
@@ -70,19 +71,36 @@ const evalWith = (eventPatch = {}, mappingPatch = {}) =>
     now: NOW,
   });
 
+// ---------- 报文解析（真实格式） ----------
+
+test("从真实 <at> 标签提取 mention id", () => {
+  assert.deepEqual(extractMentionIds(baseEvent.content), [M5CLAUDE]);
+});
+
+test("引用块被切掉，不混入指令正文", () => {
+  const body = normalizeBody(baseEvent.content);
+  assert.equal(body, "→Claude 把出站发布器的草稿写完");
+  assert.ok(!body.includes("引用"), "引用块必须被切掉");
+});
+
+test("平台把引用渲染成 > 前缀时同样切掉", () => {
+  const c = at(M5CLAUDE) + " →Claude 干活\n\n> **[引用]**\n> 根消息";
+  assert.equal(normalizeBody(c), "→Claude 干活");
+});
+
 // ---------- selector：接受路径 ----------
 
-test("合格消息被接受，并正确剥离 mention 与前缀", () => {
+test("合格消息被接受", () => {
   const r = evalWith();
   assert.equal(r.decision, "accept");
   assert.equal(r.instruction, "把出站发布器的草稿写完");
-  assert.equal(r.logicalTaskKey, "feishu_bridge_cc");
+  assert.equal(r.messageId, "msg_1");
 });
 
-test("前缀与指令之间没有空格也能接受", () => {
-  const r = evalWith({ text: "@_user_1 →Claude把草稿写完" });
+test("前缀后多个空格也能接受", () => {
+  const r = evalWith({ content: at(M5CLAUDE) + " →Claude  桥接长期任务" + QUOTE });
   assert.equal(r.decision, "accept");
-  assert.equal(r.instruction, "把草稿写完");
+  assert.equal(r.instruction, "桥接长期任务");
 });
 
 // ---------- selector：拒绝路径（安全关键） ----------
@@ -92,21 +110,20 @@ const rejects = [
   ["mapping 非 active", () => evalWith({}, { status: "closed" }), REJECT.MAPPING_NOT_ACTIVE],
   ["mapping 已过期", () => evalWith({}, { expires_at: "2026-08-19T09:00:00Z" }), REJECT.MAPPING_EXPIRED],
   ["mapping 缺 expires_at", () => evalWith({}, { expires_at: undefined }), REJECT.MAPPING_EXPIRED],
-  ["群不匹配", () => evalWith({ chat_id: "oc_other" }), REJECT.CHAT_MISMATCH],
-  ["根话题不匹配", () => evalWith({ root_message_id: "om_other_root" }), REJECT.ROOT_MISMATCH],
-  ["缺根话题（群里直接发，不在话题内）", () => evalWith({ root_message_id: undefined }), REJECT.ROOT_MISMATCH],
-  ["发送者不是 Frank", () => evalWith({ sender_id: "ou_someone_else" }), REJECT.SENDER_NOT_FRANK],
-  ["没有 mention", () => evalWith({ mentions: [] }), REJECT.TRANSPORT_NOT_MENTIONED],
-  ["mention 的是另一条链路的 agent", () => evalWith({ mentions: [{ key: "@_user_1", id: { open_id: "ou_transport_m5codex" } }] }), REJECT.TRANSPORT_NOT_MENTIONED],
-  ["前缀不符", () => evalWith({ text: "@_user_1 帮我看一下" }), REJECT.PREFIX_MISMATCH],
-  ["前缀是另一条链路的", () => evalWith({ text: "@_user_1 →Codex 帮我看一下" }), REJECT.PREFIX_MISMATCH],
-  ["前缀后没有正文", () => evalWith({ text: "@_user_1 →Claude   " }), REJECT.PREFIX_MISMATCH],
-  ["重复消息", () => evalWith({}, { consumed_message_ids: ["om_msg_1"] }), REJECT.DUPLICATE_MESSAGE],
-  ["配额用尽", () => evalWith({}, { consumed_message_ids: ["a", "b", "c", "d", "e"] }), REJECT.QUOTA_EXHAUSTED],
-  ["超出时效窗口", () => evalWith({ create_time: NOW - 20 * 60 * 1000 }), REJECT.STALE_MESSAGE],
-  ["事件缺 message_id", () => evalWith({ message_id: undefined }), REJECT.MALFORMED_EVENT],
-  ["事件缺 sender_id", () => evalWith({ sender_id: undefined }), REJECT.MALFORMED_EVENT],
-  ["create_time 不是数字", () => evalWith({ create_time: "not-a-number" }), REJECT.MALFORMED_EVENT],
+  ["不在绑定话题（别的 session）", () => evalWith({ session_id: "session_other" }), REJECT.SESSION_MISMATCH],
+  ["发送者不是 Frank", () => evalWith({ sender_id: "9999999999" }), REJECT.SENDER_NOT_FRANK],
+  ["没有 mention", () => evalWith({ content: "→Claude 干活" }), REJECT.TRANSPORT_NOT_MENTIONED],
+  ["@ 的是另一条链路的 M5Codex", () => evalWith({ content: at(M5CODEX) + " →Claude 干活" }), REJECT.TRANSPORT_NOT_MENTIONED],
+  ["前缀不符", () => evalWith({ content: at(M5CLAUDE) + " 帮我看一下" }), REJECT.PREFIX_MISMATCH],
+  ["用了 →Codex 前缀", () => evalWith({ content: at(M5CLAUDE) + " →Codex 干活" }), REJECT.PREFIX_MISMATCH],
+  ["前缀后没有正文", () => evalWith({ content: at(M5CLAUDE) + " →Claude   " }), REJECT.PREFIX_MISMATCH],
+  ["重复消息", () => evalWith({}, { consumed_message_ids: ["msg_1"] }), REJECT.DUPLICATE_MESSAGE],
+  ["配额用尽", () => evalWith({}, { consumed_message_ids: ["a","b","c","d","e"] }), REJECT.QUOTA_EXHAUSTED],
+  ["超出时效窗口", () => evalWith({ created_at_ms: NOW - 20 * 60 * 1000 }), REJECT.STALE_MESSAGE],
+  ["缺 message_id", () => evalWith({ message_id: undefined }), REJECT.MALFORMED_EVENT],
+  ["缺 session_id", () => evalWith({ session_id: undefined }), REJECT.MALFORMED_EVENT],
+  ["缺 sender_id", () => evalWith({ sender_id: undefined }), REJECT.MALFORMED_EVENT],
+  ["created_at_ms 不是数字", () => evalWith({ created_at_ms: "nope" }), REJECT.MALFORMED_EVENT],
 ];
 
 for (const [name, fn, expected] of rejects) {
@@ -119,22 +136,14 @@ for (const [name, fn, expected] of rejects) {
 }
 
 test("手打的 @M5Claude 文本不构成 mention", () => {
-  const r = evalWith({ text: "@M5Claude →Claude 干活", mentions: [] });
-  assert.equal(r.decision, "reject");
+  const r = evalWith({ content: "@M5Claude →Claude 干活" });
   assert.equal(r.reason, REJECT.TRANSPORT_NOT_MENTIONED);
 });
 
-test("全角箭头不被当作合法前缀", () => {
-  const r = evalWith({ text: "@_user_1 ->Claude 干活" });
+test("引用块里出现前缀不能顶替正文前缀", () => {
+  const r = evalWith({ content: at(M5CLAUDE) + " 随便说说\n\n**[引用]**\n→Claude 这是引用里的" });
   assert.equal(r.decision, "reject");
   assert.equal(r.reason, REJECT.PREFIX_MISMATCH);
-});
-
-test("stripMentions 只删占位符，不动其他内容", () => {
-  assert.equal(
-    stripMentions("@_user_1 →Claude 保留 @_user_1 这个词", [{ key: "@_user_1" }]),
-    "→Claude 保留  这个词",
-  );
 });
 
 // ---------- claim：原子性与幂等 ----------
@@ -144,36 +153,34 @@ const claimsDir = path.join(tmp, "delivery-claims");
 fs.mkdirSync(claimsDir, { recursive: true });
 
 test("首次 claim 成功", () => {
-  const r = acquireClaim({ claimsDir, messageId: "om_a", logicalTaskKey: "k", meta: {} });
+  const r = acquireClaim({ claimsDir, messageId: "msg_a", logicalTaskKey: "k", meta: {} });
   assert.equal(r.ok, true);
   assert.ok(fs.existsSync(path.join(r.dir, "claim.json")));
 });
 
 test("同一消息二次 claim 被拒为 duplicate", () => {
-  const r = acquireClaim({ claimsDir, messageId: "om_a", logicalTaskKey: "k", meta: {} });
+  const r = acquireClaim({ claimsDir, messageId: "msg_a", logicalTaskKey: "k", meta: {} });
   assert.equal(r.ok, false);
   assert.equal(r.reason, "duplicate");
 });
 
 test("不同 logical_task_key 视为不同 claim", () => {
-  const r = acquireClaim({ claimsDir, messageId: "om_a", logicalTaskKey: "k2", meta: {} });
-  assert.equal(r.ok, true);
+  assert.equal(acquireClaim({ claimsDir, messageId: "msg_a", logicalTaskKey: "k2", meta: {} }).ok, true);
 });
 
 test("claim key 对同一组输入稳定", () => {
-  assert.equal(claimKey("om_x", "k"), claimKey("om_x", "k"));
-  assert.notEqual(claimKey("om_x", "k"), claimKey("om_y", "k"));
+  assert.equal(claimKey("msg_x", "k"), claimKey("msg_x", "k"));
+  assert.notEqual(claimKey("msg_x", "k"), claimKey("msg_y", "k"));
 });
 
 test("被拒消息不留下半成品 claim", () => {
   const before = fs.readdirSync(claimsDir).length;
-  const r = evalWith({ text: "@_user_1 普通回复" });
-  assert.equal(r.decision, "reject");
+  assert.equal(evalWith({ content: at(M5CLAUDE) + " 普通回复" }).decision, "reject");
   assert.equal(fs.readdirSync(claimsDir).length, before, "拒绝路径不得创建 claim");
 });
 
 test("handed_off 是终态记录，不代表任务完成", () => {
-  const k = claimKey("om_a", "k");
+  const k = claimKey("msg_a", "k");
   const f = recordClaimState({ claimsDir, key: k, state: "handed_off", detail: { target: "t" } });
   const rec = JSON.parse(fs.readFileSync(f, "utf-8"));
   assert.equal(rec.state, "handed_off");

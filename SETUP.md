@@ -48,8 +48,12 @@
 
 入站那个必须是 **claude-code-local adapter** 类型的智能体（它要在本机拉起 Claude 会话）。
 
-**如果同一个群里要跑多条链路**（比如同时接 Claude 和 Codex），互斥靠三重精确匹配：
-**mention 对象、正文前缀、根话题**。三者任一不同就不会串。三个都要规划好再建。
+**如果同一个群里要跑多条链路**（比如同时接 Claude 和 Codex），互斥靠 **mention 对象**
+和**根话题**两者精确匹配 —— 各用各的智能体、各占一个话题，就不会串。
+
+正文前缀（如 `→Claude`）是**可选的第三重**。对路由而言它是冗余的：能走到前缀这一步，
+消息已经过了绑定有效、话题正确、发送者正确、真实 mention 四道闸，而路由靠的是话题。
+**默认建议关掉**（`inbound_prefix: null`），少打字。
 
 ---
 
@@ -79,7 +83,8 @@ lark-cli im +messages-list --chat-id <群id> --json | head
 > ⚠️ 这一步的机制我们**没有完全查清**（详见 STATE.md）。技能既可能来自
 > `~/skills/<技能名>/`，也可能来自平台侧配置。实践上：两处保持一致就不会出问题。
 
-**验证**：在话题里发一条 `<mention> <前缀> 测试`，应当秒级收到「已受理」或明确的拒绝原因。
+**验证**：在话题里发一条 `<mention> 测试`（若保留了前缀则加上），应当秒级收到
+「已受理」或明确的拒绝原因。
 **收不到任何回复**说明这一步没通 —— 不要往下走。
 
 ### 3. 装本机的出站机制
@@ -160,7 +165,8 @@ cat .runtime-data/inbound/receipts/accepted-*.json # 入站回执
 
 ## 四、日常使用
 
-**从飞书**：在绑定话题里 `<mention 入站智能体> <前缀> 你的指令`。
+**从飞书**：在绑定话题里 `<mention 入站智能体> 你的指令`。
+（若保留了前缀，正文要以它开头；关掉前缀用 `node scripts/binding.mjs --prefix none --apply`。）
 
 **在终端**：正常用 Claude Code。**每轮回答会自动原样发回话题**，你不用做任何事。
 
@@ -196,7 +202,7 @@ node scripts/binding.mjs --renew 1y --apply
 4. `cat .runtime-data/inbound/receipts/*.json` —— 每条消息的受理/拒绝记录，带原因
 5. `node scripts/binding.mjs` —— 绑定是不是过期了
 6. `tail ~/.claude/feishu-bridge/stop-hook.log` —— 出站钩子每次的结果
-7. `node scripts/test.mjs` —— 142 项本地回归，零外部副作用
+7. `node scripts/test.mjs` —— 156 项本地回归，零外部副作用
 
 **一条经验**：判断入站是否健康，不能只看「发消息有没有回复」。
 入站智能体是个被反复 resume 的持久会话，技能坏了它也可能凭记忆把命令跑出来。

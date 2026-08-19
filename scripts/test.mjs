@@ -12,7 +12,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { REJECT, evaluateInbound, extractMentionIds, isValidQuota, normalizeBody } from "./selector.mjs";
+import {
+  REJECT, evaluateInbound, extractMentionIds, isValidPrefix, isValidQuota, normalizeBody,
+} from "./selector.mjs";
 import { NOTE_MAX, resolveUntil, validateNote } from "./binding.mjs";
 import { FETCH_BACKOFF_MS, RECENT_TURNS, buildEventsArgs, fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, claimKey, recordClaimState } from "./claim.mjs";
@@ -130,7 +132,7 @@ const rejects = [
   ["@ 的是另一条链路的 M5Codex", () => evalWith({ content: at(M5CODEX) + " →Claude 干活" }), REJECT.TRANSPORT_NOT_MENTIONED],
   ["前缀不符", () => evalWith({ content: at(M5CLAUDE) + " 帮我看一下" }), REJECT.PREFIX_MISMATCH],
   ["用了 →Codex 前缀", () => evalWith({ content: at(M5CLAUDE) + " →Codex 干活" }), REJECT.PREFIX_MISMATCH],
-  ["前缀后没有正文", () => evalWith({ content: at(M5CLAUDE) + " →Claude   " }), REJECT.PREFIX_MISMATCH],
+  ["前缀后没有正文", () => evalWith({ content: at(M5CLAUDE) + " →Claude   " }), REJECT.EMPTY_INSTRUCTION],
   ["重复消息", () => evalWith({}, { consumed_message_ids: ["msg_1"] }), REJECT.DUPLICATE_MESSAGE],
   ["配额用尽", () => evalWith({}, { consumed_message_ids: ["a","b","c","d","e"] }), REJECT.QUOTA_EXHAUSTED],
   ["超出时效窗口", () => evalWith({ created_at_ms: NOW - 20 * 60 * 1000 }), REJECT.STALE_MESSAGE],
@@ -213,6 +215,51 @@ test("配额 true 不得被强制转成 1（回归：布尔笔误悄悄改掉准
 test("时效窗口写成非数字 → 判配错", () => {
   assert.equal(evalWith({}, { freshness_ms: "900000" }).reason, REJECT.MALFORMED_EVENT);
   assert.equal(evalWith({}, { freshness_ms: true }).reason, REJECT.MALFORMED_EVENT);
+});
+
+// ---------- 前缀闸退役：关掉必须是明写的 ----------
+
+test("inbound_prefix: null → 不要前缀，整段正文都是指令", () => {
+  const r = evalWith({ content: at(M5CLAUDE) + " 把出站发布器的草稿写完" }, { inbound_prefix: null });
+  assert.equal(r.decision, "accept", "明写 null 时前缀闸应当整个不参与判断");
+  assert.equal(r.instruction, "把出站发布器的草稿写完");
+});
+
+test("关掉前缀后，带着旧前缀发也照样能用（不会把前缀当指令切掉）", () => {
+  const r = evalWith({}, { inbound_prefix: null });
+  assert.equal(r.decision, "accept");
+  assert.equal(r.instruction, "→Claude 把出站发布器的草稿写完", "整段正文都是指令，不猜哪段是前缀");
+});
+
+test("关掉前缀不影响其他闸：不是 Frank 照样拒", () => {
+  assert.equal(evalWith({ sender_id: "9999" }, { inbound_prefix: null }).reason, REJECT.SENDER_NOT_FRANK);
+});
+
+test("关掉前缀不影响 mention 闸 —— 这是替代前缀的那道闸，绝不能一起松", () => {
+  const r = evalWith({ content: at(M5CODEX) + " 干活" }, { inbound_prefix: null });
+  assert.equal(r.reason, REJECT.TRANSPORT_NOT_MENTIONED);
+});
+
+test("关掉前缀后，只 @ 不说话 → 空指令，不投递", () => {
+  const r = evalWith({ content: at(M5CLAUDE) + "   " }, { inbound_prefix: null });
+  assert.equal(r.reason, REJECT.EMPTY_INSTRUCTION);
+});
+
+for (const bad of [undefined, "", "   ", 0, false, 123, [], {}]) {
+  test("前缀写成 " + JSON.stringify(bad) + " → 判配错，不当成「关掉了」", () => {
+    const r = evalWith({}, { inbound_prefix: bad });
+    assert.equal(r.decision, "reject");
+    assert.equal(r.reason, REJECT.MALFORMED_EVENT,
+      "只有明写 null 才算关；配漏了不能等同于关掉");
+  });
+}
+
+test("写配置的一方和读配置的一方共用同一条前缀规则", () => {
+  assert.equal(isValidPrefix(null), true);
+  assert.equal(isValidPrefix("→Claude"), true);
+  for (const v of [undefined, "", "  ", 0, false, 123, [], {}]) {
+    assert.equal(isValidPrefix(v), false, JSON.stringify(v) + " 不该被判合法");
+  }
 });
 
 // ---------- claim：原子性与幂等 ----------

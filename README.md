@@ -18,18 +18,18 @@
 
 | | 入站 | 出站 |
 |---|---|---|
-| 触发 | 飞书话题里 mention + 前缀 | 每轮回答结束（兜底：每 30 分钟） |
+| 触发 | 飞书话题里 mention（前缀可选） | 每轮回答结束（兜底：每 30 分钟） |
 | 载体 | 飞书智能体 + `scripts/inbound.mjs` | 用户级 Stop 钩子 + 全局技能 |
 | 生效范围 | 绑定的那个话题 | 本机**所有** Claude 会话 |
-| 判定 | 六项确定性校验 + 原子 claim | 登记表里的项目 + 会话归属判定 |
+| 判定 | 绑定 / 话题 / 发送者 / mention 四道闸 + 原子 claim | 登记表里的项目 + 会话归属判定 |
 
 出站不依赖任何 `CLAUDE.md` 里的手写约定 —— 换目录、换会话都还在。
 
 ## 入站怎么走
 
 ```
-话题里 mention 入站智能体 + →Claude 前缀
-  → scripts/inbound.mjs：六项校验 → 原子 claim → 路由 → 秒级「已受理」
+话题里 mention 入站智能体（前缀可选）
+  → scripts/inbound.mjs：确定性校验 → 原子 claim → 路由 → 秒级「已受理」
        ├ 这个项目有活着的交互会话？ → SendMessage 投进去
        └ 没有                       → claude --continue 后台起一轮 + 守望者
 ```
@@ -49,8 +49,9 @@
 ```bash
 node scripts/binding.mjs                     # 看绑定：有效期、剩余天数、话题
 node scripts/binding.mjs --renew 1y --apply  # 续期
+node scripts/binding.mjs --prefix none --apply # 关掉前缀，@ 一下就够
 node scripts/outbox.mjs --list               # 还有多少进展没发出去
-node scripts/test.mjs                        # 142 项本地回归，零外部副作用
+node scripts/test.mjs                        # 156 项本地回归，零外部副作用
 tail ~/.claude/feishu-bridge/stop-hook.log   # 出站钩子每次干了什么
 ```
 

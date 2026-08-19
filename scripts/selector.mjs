@@ -23,6 +23,27 @@ export function isValidQuota(v) {
   return v === UNLIMITED || (typeof v === "number" && Number.isInteger(v) && v > 0);
 }
 
+/**
+ * 关掉前缀闸的唯一写法。
+ *
+ * 2026-08-19 Frank 的判断：对**路由**而言前缀是纯冗余的。能走到这一步，消息已经过了
+ * 绑定有效、话题正确、发送者正确、真实 mention 四道闸，而路由到哪个项目靠的是
+ * session_id（话题），前缀不参与。同群多链路的互斥，mention 对象 + 根话题已经够了。
+ *
+ * 它理论上还是「意图闸」（区分「对它下指令」和「在群里提到它」），但实测没起这个作用 ——
+ * 17 条消息里从没触发过一次 prefix_mismatch，而 Frank 给确认类消息也照样加前缀。
+ * 一道从不改变结果的闸就是纯成本，而成本是他在手机上每条都要多打几个字符。
+ *
+ * 和配额闸同样的处理：**关掉必须是一个决定，不能是配置漏了的副作用。**
+ * 只有明写 null 才算关；字段缺失、空串、非字符串一律判配错并拒绝。
+ */
+export const NO_PREFIX = null;
+
+/** 前缀值合不合法。导出理由同 isValidQuota：写配置的一方和读配置的一方共用一条规则。 */
+export function isValidPrefix(v) {
+  return v === NO_PREFIX || (typeof v === "string" && v.trim().length > 0);
+}
+
 export const REJECT = {
   MAPPING_MISSING: "mapping_missing",
   MAPPING_NOT_ACTIVE: "mapping_not_active",
@@ -31,6 +52,7 @@ export const REJECT = {
   SENDER_NOT_FRANK: "sender_not_frank",
   TRANSPORT_NOT_MENTIONED: "transport_not_mentioned",
   PREFIX_MISMATCH: "prefix_mismatch",
+  EMPTY_INSTRUCTION: "empty_instruction",
   DUPLICATE_MESSAGE: "duplicate_message",
   STALE_MESSAGE: "stale_message",
   QUOTA_EXHAUSTED: "quota_exhausted",
@@ -45,6 +67,7 @@ export const REJECT_TEXT = {
   [REJECT.SENDER_NOT_FRANK]: "发送者不是授权用户",
   [REJECT.TRANSPORT_NOT_MENTIONED]: "没有真实 @ 本链路的运输 agent",
   [REJECT.PREFIX_MISMATCH]: "正文没有以约定前缀开头",
+  [REJECT.EMPTY_INSTRUCTION]: "消息里没有指令正文",
   [REJECT.DUPLICATE_MESSAGE]: "这条消息已经处理过（幂等命中）",
   [REJECT.STALE_MESSAGE]: "消息超出时效窗口",
   [REJECT.QUOTA_EXHAUSTED]: "该绑定的消息配额已用尽",
@@ -116,8 +139,12 @@ export function evaluateInbound({ event, mapping, config, now }) {
   }
 
   const body = normalizeBody(event.content);
+
+  // 配错和「明写关掉」必须导致不同结果，所以先判合法性、再判匹配。
+  // 缺字段 / 空串 / 非字符串 = 配错（MALFORMED_EVENT），不是「没有前缀」。
   const prefix = mapping.inbound_prefix;
-  if (!isNonEmptyString(prefix) || !body.startsWith(prefix)) {
+  if (!isValidPrefix(prefix)) return reject(REJECT.MALFORMED_EVENT);
+  if (prefix !== NO_PREFIX && !body.startsWith(prefix)) {
     return reject(REJECT.PREFIX_MISMATCH);
   }
 
@@ -151,8 +178,10 @@ export function evaluateInbound({ event, mapping, config, now }) {
   if (!Number.isFinite(createdMs)) return reject(REJECT.MALFORMED_EVENT);
   if (nowMs - createdMs > freshnessMs) return reject(REJECT.STALE_MESSAGE);
 
-  const instruction = body.slice(prefix.length).trim();
-  if (!isNonEmptyString(instruction)) return reject(REJECT.PREFIX_MISMATCH);
+  // 关了前缀就整段正文都是指令；开着就切掉前缀。
+  const instruction = (prefix === NO_PREFIX ? body : body.slice(prefix.length)).trim();
+  // 空正文单独一个原因：以前复用 PREFIX_MISMATCH，那在关掉前缀之后就是句谎话了。
+  if (!isNonEmptyString(instruction)) return reject(REJECT.EMPTY_INSTRUCTION);
 
   return {
     decision: "accept",

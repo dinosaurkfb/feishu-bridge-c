@@ -11,7 +11,8 @@
   "session_note": "← Aily 的 session id。实测：话题群里一个话题对应一个 Aily session，所以绑 session 等价于绑话题。从入站脚本的调试输出或 aily-cli session events 里取。",
 
   "frank_sender_id": "0000000000000000000",
-  "inbound_prefix": "→Claude",
+  "inbound_prefix": null,
+  "inbound_prefix_note": "← null = 不需要前缀，@ 运输智能体就够（推荐）。对路由而言前缀是冗余的：绑定/话题/发送者/mention 四道闸已经唯一确定了去向。想保留就写一段非空文本。字段缺失、空串、非字符串一律判配错拒绝 —— 关掉必须是一个决定，不能是配漏了的副作用。改用 node scripts/binding.mjs --prefix none|<文本> --apply。",
   "logical_task_key": "feishu_bridge_cc",
 
   "feishu_root_message_id_reference": "om_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",

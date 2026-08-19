@@ -17,12 +17,14 @@
  *   node scripts/binding.mjs --quota unlimited --apply
  *   node scripts/binding.mjs --quota 500 --apply
  *   node scripts/binding.mjs --note "长期绑定（非测试期）" --apply
+ *   node scripts/binding.mjs --prefix none --apply      # 关掉前缀，@ 一下就够
+ *   node scripts/binding.mjs --prefix "→Claude" --apply
  */
 
 import fs from "node:fs";
 import path from "node:path";
 
-import { UNLIMITED, isValidQuota } from "./selector.mjs";
+import { NO_PREFIX, UNLIMITED, isValidPrefix, isValidQuota } from "./selector.mjs";
 import { checkBinding, WARN_DAYS } from "./binding-health.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
@@ -117,6 +119,18 @@ if (quotaSpec !== undefined) {
   changes.push(["max_inbound_messages", mapping.max_inbound_messages, value]);
 }
 
+// CLI 上没法直接打 JSON 的 null，用 none 表示「关掉」。同样只认这一个字面量：
+// 关掉前缀是个决定，不该因为参数写歪了而发生。
+const prefixSpec = arg("prefix");
+if (prefixSpec !== undefined) {
+  const value = prefixSpec === "none" ? NO_PREFIX : prefixSpec;
+  if (!isValidPrefix(value)) {
+    console.error("前缀只能是一段非空文本，或 none（表示不要前缀），收到「" + prefixSpec + "」");
+    process.exit(1);
+  }
+  changes.push(["inbound_prefix", mapping.inbound_prefix, value]);
+}
+
 const noteSpec = arg("note");
 if (noteSpec !== undefined) {
   const r = validateNote(noteSpec);
@@ -148,6 +162,7 @@ console.log("有效期  " + (mapping.expires_at ?? "(缺)") +
 console.log("配额    " + (quotaNow === UNLIMITED ? "不限" : quotaNow) + "   已用 " + consumed + " 条");
 console.log("话题    " + (mapping.session_id ?? "?"));
 console.log("根消息  " + (mapping.feishu_root_message_id_reference ?? "?"));
+console.log("前缀    " + (mapping.inbound_prefix === null ? "不需要（@ 一下即可）" : JSON.stringify(mapping.inbound_prefix)));
 console.log("备注    " + (mapping.note ?? "(无)"));
 
 if (changes.length === 0) {

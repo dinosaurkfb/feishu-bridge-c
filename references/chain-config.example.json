@@ -26,8 +26,7 @@
 
   "_4_话题与前缀": "",
   "chat_name": "你的群名",
-  "inbound_prefix": "→Claude",
-  "inbound_prefix_note": "← 同一个群里跑多条链路时，这是互斥的一半（另一半是 mention 对象和根话题）。两条链路的前缀必须不同。",
+  "inbound_prefix_note": "← 前缀在 active-mapping.json 里配（可设 null 表示不需要）。同群多链路的互斥靠 mention 对象 + 根话题就够，前缀是可选的第三重。",
 
   "_5_本机": "",
   "project_dir": "/Users/你/path/to/feishu-bridge-cc",

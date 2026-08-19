@@ -12,8 +12,23 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-export const KINDS = ["milestone", "decision", "risk", "pending", "next"];
+/**
+ * `reply` 是一轮对话的**原文答复**，由 Stop 钩子从 last_assistant_message 直接取，
+ * 不经任何模型判断。它和下面五类的区别是根本性的：
+ *
+ *   五类   = 我判断「这件事值不值得报告」，然后压成一句话
+ *   reply  = 我说了什么就发什么，没有判断，也就没有判断错的可能
+ *
+ * 之所以要有 reply：漏发的代价（Frank 走开了，结果只躺在他看不见的终端里）
+ * 远大于多发的代价（一条他已经读过的消息）。用一个会出错的判断去决定发不发，
+ * 是拿便宜的错误换昂贵的错误。
+ *
+ * 五类随之退居二线，只服务**没有对话轮次可依附**的东西 —— 比如绑定到期体检，
+ * 那是钩子生成的，不属于任何一轮回答。我不再手写它们。
+ */
+export const KINDS = ["reply", "milestone", "decision", "risk", "pending", "next"];
 
+/** reply 没有标签：它不是某一类进展，它就是答复本身。 */
 export const KIND_LABEL = {
   milestone: "里程碑",
   decision: "决定",
@@ -21,6 +36,9 @@ export const KIND_LABEL = {
   pending: "待你拍板",
   next: "下一步",
 };
+
+/** 单条消息的字数上限。截断会丢信息，但整条发不出去丢得更多。 */
+export const MAX_REPLY_CHARS = 4000;
 
 /** 一条进展一个文件：追加是原子的（写临时文件再 rename），排空时逐条标记。 */
 export function appendEvent({ outboxDir, kind, text, source }) {
@@ -81,21 +99,37 @@ export function markSent(rec, messageId) {
   fs.renameSync(tmp, rec._file);
 }
 
-/** 把若干条进展合成一条飞书消息 —— 一条进展发一条会把话题刷爆。 */
+/**
+ * 把若干条待发内容合成一条飞书消息 —— 一条发一条会把话题刷爆。
+ *
+ * reply 必须原样渲染：给一段两千字的答复加上「· 」前缀和【】分组，
+ * 等于把它揉烂。它不是一条进展，它就是正文。
+ */
 export function composeDigest(records, { taskName }) {
-  const byKind = new Map();
-  for (const r of records) {
-    if (!byKind.has(r.kind)) byKind.set(r.kind, []);
-    byKind.get(r.kind).push(r);
+  const replies = records.filter((r) => r.kind === "reply");
+  const rest = records.filter((r) => r.kind !== "reply");
+
+  const parts = [];
+
+  for (const r of replies) parts.push(r.text);
+
+  if (rest.length > 0) {
+    const byKind = new Map();
+    for (const r of rest) {
+      if (!byKind.has(r.kind)) byKind.set(r.kind, []);
+      byKind.get(r.kind).push(r);
+    }
+    const lines = [taskName + " · 进展"];
+    for (const kind of KINDS) {
+      const items = byKind.get(kind);
+      if (!items || items.length === 0) continue;
+      lines.push("", "【" + KIND_LABEL[kind] + "】");
+      for (const it of items) lines.push("· " + it.text);
+    }
+    parts.push(lines.join("\n"));
   }
-  const lines = [taskName + " · 进展"];
-  for (const kind of KINDS) {
-    const items = byKind.get(kind);
-    if (!items || items.length === 0) continue;
-    lines.push("", "【" + KIND_LABEL[kind] + "】");
-    for (const it of items) lines.push("· " + it.text);
-  }
-  return lines.join("\n");
+
+  return parts.join("\n\n———\n\n");
 }
 
 // ---------- CLI ----------

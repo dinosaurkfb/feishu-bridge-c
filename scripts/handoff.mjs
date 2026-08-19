@@ -117,7 +117,12 @@ export function handOff({ projectDir, instruction, runsDir, key }) {
   const child = spawn(
     "claude",
     ["--continue", "-p", instruction, "--output-format", "stream-json", "--verbose"],
-    { cwd: projectDir, detached: true, stdio: ["ignore", out, err] },
+    {
+      cwd: projectDir, detached: true, stdio: ["ignore", out, err],
+      // 标记成桥自己起的：这一轮的结果由守望者发布（它能分辨 completed/blocked/failed），
+      // Stop 钩子不要再把同一段话当答复发一遍。
+      env: { ...process.env, FEISHU_BRIDGE_ROLE: "run" },
+    },
   );
   // unref 之后父进程可以立刻退出，子进程继续跑 —— 这正是「秒级回执」的实现基础。
   child.unref();

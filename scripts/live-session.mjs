@@ -88,6 +88,22 @@ export function hasPriorSession({ projectRoot, projectsDir }) {
 }
 
 /**
+ * 标记「这个会话是桥自己起的」。
+ *
+ * 桥会起两种一次性会话：转发用的（只调 SendMessage）和 --continue 跑活的。
+ * 它们的 Stop 钩子照样会触发，如果不认出来，转发那个会把「sent」当成答复发给 Frank，
+ * 跑活那个会和守望者各发一遍同一段结果。
+ *
+ * 用环境变量而不是别的：钩子是 Claude Code 从会话进程派生的，环境能传下去；
+ * 而靠「答复内容长得像什么」去猜，是把正确性押在措辞上。
+ */
+export const ROLE_ENV = "FEISHU_BRIDGE_ROLE";
+
+export function isBridgeOwnedSession(env = process.env) {
+  return typeof env[ROLE_ENV] === "string" && env[ROLE_ENV].length > 0;
+}
+
+/**
  * 给指令盖上来源戳。
  *
  * 没有它的话，Frank 下次在终端里打开会话，会看到一串凭空出现的指令 —— 看不出哪条来自
@@ -148,7 +164,10 @@ export function deliverToLiveSession({ target, instruction, messageId, createdAt
   const child = spawn(
     "claude",
     ["-p", prompt, "--output-format", "stream-json", "--verbose"],
-    { cwd: projectRoot, detached: true, stdio: ["ignore", out, err] },
+    {
+      cwd: projectRoot, detached: true, stdio: ["ignore", out, err],
+      env: { ...process.env, [ROLE_ENV]: "forwarder" },
+    },
   );
   child.unref();
 

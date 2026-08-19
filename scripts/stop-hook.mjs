@@ -43,6 +43,37 @@ function log(line) {
   }
 }
 
+/**
+ * 从钩子的 stdin 里取出这一轮的答复正文。
+ *
+ * `last_assistant_message` 的形状不保证：可能是字符串，也可能是带 content 块的对象。
+ * 两种都收，取不出来就返回 null —— 宁可这一轮不发，也不要把一个 "[object Object]"
+ * 发到 Frank 的话题里。
+ */
+export function extractReply(payload, { maxChars }) {
+  const raw = payload?.last_assistant_message;
+  let text = null;
+
+  if (typeof raw === "string") {
+    text = raw;
+  } else if (raw && typeof raw === "object") {
+    const content = Array.isArray(raw.content) ? raw.content : raw.message?.content;
+    if (Array.isArray(content)) {
+      text = content.filter((b) => b?.type === "text" && typeof b.text === "string")
+        .map((b) => b.text).join("\n");
+    } else if (typeof raw.text === "string") {
+      text = raw.text;
+    }
+  }
+
+  if (typeof text !== "string") return null;
+  text = text.trim();
+  if (text.length === 0) return null;
+
+  // 截断会丢信息，但一条超长消息发不出去丢得更多。截了就明说。
+  return text.length <= maxChars ? text : text.slice(0, maxChars) + "\n…（本条已截断，全文在终端）";
+}
+
 function readStdinJson() {
   try {
     const raw = fs.readFileSync(0, "utf-8");
@@ -81,12 +112,28 @@ async function main() {
   if (attributed.length === 0) process.exit(0);
 
   const { drainProject, watcherActive, outboxDirOf } = await import("./drain-outbox.mjs");
-  const { appendEvent, listPending } = await import("./outbox.mjs");
+  const { appendEvent, listPending, MAX_REPLY_CHARS } = await import("./outbox.mjs");
   const { checkBinding, bindingWarning } = await import("./binding-health.mjs");
+  const { isBridgeOwnedSession } = await import("./live-session.mjs");
+
+  // 桥自己起的会话不产生答复：转发那个只会说「sent」，跑活那个的结果归守望者发
+  //（它能分辨 completed / blocked / failed，Stop 钩子看不出这些）。
+  const ownedByBridge = isBridgeOwnedSession();
+  const reply = ownedByBridge ? null : extractReply(payload, { maxChars: MAX_REPLY_CHARS });
 
   const notes = [];
 
   for (const project of attributed) {
+    // 答复只发给 **cwd 归属**的项目，不发给「会话记录里提到过路径」的那些。
+    // 弱信号用来触发排空是安全的（那些内容本来就要发），但用它决定
+    // 「把整段对话原文发到谁的话题里」不行 —— 一次误判就是把无关对话发给了 Frank。
+    if (reply && project.via.includes("cwd")) {
+      const r = appendEvent({
+        outboxDir: outboxDirOf(project.root), kind: "reply", text: reply, source: "session-reply",
+      });
+      if (r.ok) log(project.id + " reply queued (" + reply.length + " 字符)");
+    }
+
     // 体检要在「outbox 空不空」之前做 —— 它有可能自己往 outbox 里加一条。
     // 同一档预警只会成功追加一次：outbox 按内容指纹判重，文案里也刻意没有天数。
     const warning = bindingWarning(checkBinding({ root: project.root }));
@@ -123,7 +170,12 @@ async function main() {
   finish(notes.join(" "));
 }
 
-main().catch((err) => {
-  log("hook crashed: " + String(err?.stack ?? err).slice(0, 500));
-  process.exit(0); // 桥的故障绝不外溢到别人的会话
-});
+// 只有被直接执行时才真的跑。被 import（测试要 extractReply）时绝不能执行 ——
+// main() 是 async 且没人 await，测试同步跑完之后它才继续，然后一个 process.exit(0)
+// 会把失败的退出码抹成成功。测试报绿而实际红，是最坏的一种坏。
+if (import.meta.url === "file://" + process.argv[1]) {
+  main().catch((err) => {
+    log("hook crashed: " + String(err?.stack ?? err).slice(0, 500));
+    process.exit(0); // 桥的故障绝不外溢到别人的会话
+  });
+}

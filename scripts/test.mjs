@@ -25,8 +25,10 @@ import { appendEvent, composeDigest, listPending, markSent } from "./outbox.mjs"
 import { drainProject, watcherActive } from "./drain-outbox.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
 import {
-  findLiveSessions, forwardPrompt, hasPriorSession, stampInstruction, transcriptDirFor,
+  findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession,
+  stampInstruction, transcriptDirFor,
 } from "./live-session.mjs";
+import { extractReply } from "./stop-hook.mjs";
 
 let passed = 0;
 let failed = 0;
@@ -805,6 +807,85 @@ test("转发提示词把「不要执行」放在最前面并重复", () => {
   assert.ok(p.indexOf("不要执行") < p.indexOf("SendMessage"), "禁止执行必须先于任务说明出现");
   assert.ok(p.lastIndexOf("不负责完成") > p.indexOf("===END==="), "分隔符之后要再挡一次");
   assert.ok(p.includes('"sess-1"'), "目标名要带引号，防止名字里有空格时被截断");
+});
+
+// ---------- 答复原样转发（不经判断） ----------
+
+const ex = (payload) => extractReply(payload, { maxChars: 4000 });
+
+test("答复是字符串时直接取", () => {
+  assert.equal(ex({ last_assistant_message: "  改完了  " }), "改完了");
+});
+
+test("答复是带 content 块的对象时也取得出", () => {
+  const p = { last_assistant_message: { content: [
+    { type: "thinking", thinking: "内心戏不该外发" },
+    { type: "text", text: "第一段" }, { type: "text", text: "第二段" },
+  ] } };
+  assert.equal(ex(p), "第一段\n第二段");
+});
+
+test("思考过程不进答复", () => {
+  assert.ok(!ex({ last_assistant_message: { content: [
+    { type: "thinking", thinking: "秘密" }, { type: "text", text: "结论" },
+  ] } }).includes("秘密"));
+});
+
+test("嵌一层 message.content 也认", () => {
+  assert.equal(ex({ last_assistant_message: { message: { content: [{ type: "text", text: "嵌套" }] } } }), "嵌套");
+});
+
+test("取不出文本 → null，绝不发 [object Object]", () => {
+  for (const bad of [{}, { last_assistant_message: null }, { last_assistant_message: 42 },
+                     { last_assistant_message: {} }, { last_assistant_message: "   " },
+                     { last_assistant_message: { content: [{ type: "thinking", thinking: "只有思考" }] } }]) {
+    assert.equal(ex(bad), null, JSON.stringify(bad) + " 应当取不出答复");
+  }
+});
+
+test("超长答复截断并明说，不静默丢尾巴", () => {
+  const r = extractReply({ last_assistant_message: "x".repeat(500) }, { maxChars: 100 });
+  assert.ok(r.length < 500 && r.includes("已截断"), "截断必须留下痕迹");
+});
+
+test("桥自己起的会话不产生答复（转发的只会说 sent，跑活的归守望者发）", () => {
+  assert.equal(isBridgeOwnedSession({ FEISHU_BRIDGE_ROLE: "forwarder" }), true);
+  assert.equal(isBridgeOwnedSession({ FEISHU_BRIDGE_ROLE: "run" }), true);
+  assert.equal(isBridgeOwnedSession({}), false, "人开的交互会话必须产生答复");
+  assert.equal(isBridgeOwnedSession({ FEISHU_BRIDGE_ROLE: "" }), false);
+});
+
+// ---------- 摘要渲染 ----------
+
+const rec = (kind, text) => ({ kind, text });
+
+test("reply 原样渲染，不加「· 」不加【】", () => {
+  const long = "第一行\n\n| 表 | 格 |\n|---|---|\n| a | b |";
+  const out = composeDigest([rec("reply", long)], { taskName: "T" });
+  assert.equal(out, long, "答复是正文，任何前缀或分组都会把它揉烂");
+});
+
+test("只有进展时渲染不变（老行为不能回归）", () => {
+  const out = composeDigest([rec("milestone", "做完了")], { taskName: "T" });
+  assert.ok(out.startsWith("T · 进展") && out.includes("【里程碑】") && out.includes("· 做完了"));
+});
+
+test("答复和进展同时待发 → 答复在前，用分隔线隔开", () => {
+  const out = composeDigest([rec("milestone", "做完了"), rec("reply", "这是答复")], { taskName: "T" });
+  assert.ok(out.indexOf("这是答复") < out.indexOf("T · 进展"), "答复应当排在进展前面");
+  assert.ok(out.includes("———"));
+  assert.ok(!out.includes("· 这是答复"), "答复绝不能被加上进展的项目符号");
+});
+
+test("多条答复各自成段", () => {
+  const out = composeDigest([rec("reply", "甲"), rec("reply", "乙")], { taskName: "T" });
+  assert.ok(out.includes("甲") && out.includes("乙") && !out.includes("· 甲"));
+});
+
+test("reply 是合法 kind，能被 appendEvent 收下", () => {
+  const dir = path.join(tmp, "reply-kind");
+  assert.equal(appendEvent({ outboxDir: dir, kind: "reply", text: "答复正文", source: "t" }).ok, true);
+  assert.equal(listPending({ outboxDir: dir })[0].kind, "reply");
 });
 
 // ---------- 汇总 ----------

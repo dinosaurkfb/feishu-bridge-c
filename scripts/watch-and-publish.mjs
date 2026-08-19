@@ -15,11 +15,13 @@ import path from "node:path";
 
 import { readRunOutcome } from "./handoff.mjs";
 import { scanRuns, buildDraft, markPublished, publishDraft } from "./outbound.mjs";
+import { listPending, markSent, composeDigest } from "./outbox.mjs";
 import { recordClaimState } from "./claim.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const RT = path.join(ROOT, ".runtime-data", "inbound");
 const RUNS = path.join(RT, "runs");
+const OUTBOX = path.join(ROOT, ".runtime-data", "outbound", "outbox");
 const CLAIMS = path.join(RT, "delivery-claims");
 const LOCK = path.join(RT, "session.lock");
 
@@ -49,28 +51,43 @@ while (true) {
       detail: { run_state: outcome.state, observed_by: "watch-and-publish" },
     });
 
+    const cfg = JSON.parse(fs.readFileSync(path.join(RT, "chain-config.json"), "utf-8"));
+    const mapping = JSON.parse(fs.readFileSync(path.join(RT, "active-mapping.json"), "utf-8"));
     const run = scanRuns({ runsDir: RUNS }).find((r) => r.key === key);
+
+    // 本次 run 期间任务记下的进展，和这次的执行结果合并成一条发。
+    // 分两条发意味着 Frank 一次指令要收三条消息（已受理 + 结果 + 进展），太吵。
+    const pendingOutbox = listPending({ outboxDir: OUTBOX });
+
+    const parts = [];
     if (run?.shouldPublish) {
-      const cfg = JSON.parse(fs.readFileSync(path.join(RT, "chain-config.json"), "utf-8"));
-      const mapping = JSON.parse(fs.readFileSync(path.join(RT, "active-mapping.json"), "utf-8"));
-      const text = buildDraft(run, { taskName: cfg.task_display_name });
-      if (text) {
-        try {
-          const mid = publishDraft({
-            profile: cfg.lark_cli_profile,
-            rootMessageId: mapping.feishu_root_message_id_reference,
-            text,
-            larkBin: cfg.lark_cli_bin,
-            larkHome: cfg.lark_cli_home,
-          });
-          markPublished({ runsDir: RUNS, key, messageId: mid });
-          console.log("published " + key.slice(0, 8) + " -> " + mid);
-        } catch (err) {
-          // 发布失败不能静默：留痕给人工，不重试、不伪造已送达。
-          fs.writeFileSync(path.join(RUNS, key + ".publish-failed.json"),
-            JSON.stringify({ at: new Date().toISOString(), error: String(err.message).slice(0, 500) }, null, 2));
-          console.error("publish failed: " + err.message);
-        }
+      const d = buildDraft(run, { taskName: cfg.task_display_name });
+      if (d) parts.push(d);
+    }
+    if (pendingOutbox.length > 0) {
+      parts.push(composeDigest(pendingOutbox, { taskName: cfg.task_display_name }));
+    }
+
+    if (parts.length > 0) {
+      try {
+        const mid = publishDraft({
+          profile: cfg.lark_cli_profile,
+          rootMessageId: mapping.feishu_root_message_id_reference,
+          text: parts.join("\n\n———\n\n"),
+          larkBin: cfg.lark_cli_bin,
+          larkHome: cfg.lark_cli_home,
+        });
+        // 只有真的发出去了才标记。顺序无所谓，但两者都必须在成功之后。
+        if (run?.shouldPublish) markPublished({ runsDir: RUNS, key, messageId: mid });
+        for (const r of pendingOutbox) markSent(r, mid);
+        console.log("published " + key.slice(0, 8) + " -> " + mid +
+          " (run=" + (run?.shouldPublish ? "yes" : "no") + ", outbox=" + pendingOutbox.length + ")");
+      } catch (err) {
+        // 不标记任何一方：outbox 留着下轮重试，run 也还是待发布。
+        // 留痕给人工，但绝不伪造已送达。
+        fs.writeFileSync(path.join(RUNS, key + ".publish-failed.json"),
+          JSON.stringify({ at: new Date().toISOString(), error: String(err.message).slice(0, 500) }, null, 2));
+        console.error("publish failed (outbox 保留待重试): " + err.message);
       }
     }
     finishUp();

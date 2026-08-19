@@ -71,8 +71,12 @@ Frank 在绑定话题 @M5Claude + →Claude 前缀
 
 有效期到期后：入站一律拒（回执「绑定关系已过期」），**出站不受影响**——
 `drainProject` 只看 `status === "active"`。会变成"任务能说、Frank 不能回"。
-到期前 30 天 / 7 天各自动往 outbox 记一条预警（`scripts/binding-health.mjs`），
-文案不含天数，靠 outbox 指纹判重保证每档只发一次。
+
+- 看和续：`node scripts/binding.mjs [--renew 1y --apply]`，dry-run 默认，写前留 `.prev`
+- 预警：到期前 30 天 / 7 天各往 outbox 记一条（`scripts/binding-health.mjs`）。
+  文案不含天数、自带续期命令——靠 outbox 指纹判重保证每档只发一次
+- 续期是**人工命令**，不自动。长期任务不该有单方面延长自己授权的能力，
+  这也是 `.runtime-data/` 对它写权限被显式拒绝的原因
 
 ## 需求基线
 

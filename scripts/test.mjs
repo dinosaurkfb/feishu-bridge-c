@@ -12,7 +12,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { REJECT, evaluateInbound, extractMentionIds, normalizeBody } from "./selector.mjs";
+import { REJECT, evaluateInbound, extractMentionIds, isValidQuota, normalizeBody } from "./selector.mjs";
+import { resolveUntil } from "./binding.mjs";
 import { acquireClaim, claimKey, recordClaimState } from "./claim.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
@@ -610,6 +611,14 @@ test("expires_at 解析不出日期 → 报风险，不当成没事", () => {
   assert.equal(bindingWarning(h).kind, "risk");
 });
 
+test("每条预警都自带续期命令 —— 一年后没人记得字段在哪", () => {
+  for (const spec of [daysOut(3), daysOut(-1), "下周"]) {
+    setExpiry(spec);
+    const w = bindingWarning(checkBinding({ root: bh, now: NOW }));
+    assert.ok(w.text.includes("scripts/binding.mjs"), "提醒不给解法只完成了一半");
+  }
+});
+
 test("没有 mapping 的项目 → 不预警（没接入站是常态，不是故障）", () => {
   const h = checkBinding({ root: path.join(tmp, "no-mapping"), now: NOW });
   assert.equal(h.state, "absent");
@@ -627,6 +636,53 @@ test("同一档预警只会进 outbox 一次（含已发出的那条）", () => 
 });
 
 fs.rmSync(tmp, { recursive: true, force: true });
+
+// ---------- 续期的日期解析 ----------
+
+const YEAR_NOW = Date.parse("2026-08-19T10:00:00.000Z");
+const until = (spec) => resolveUntil(spec, YEAR_NOW);
+
+test("1y 从现在起算一年", () => {
+  assert.equal(until("1y").iso, "2027-08-19T10:00:00.000Z");
+});
+
+test("6m / 90d 也收", () => {
+  assert.equal(until("6m").iso, "2027-02-19T10:00:00.000Z");
+  assert.equal(until("90d").iso, "2026-11-17T10:00:00.000Z");
+});
+
+test("闰年 2 月 29 日往后一年不会滚成无效日期", () => {
+  const r = resolveUntil("1y", Date.parse("2028-02-29T00:00:00.000Z"));
+  assert.ok(r.ok);
+  assert.ok(!Number.isNaN(Date.parse(r.iso)), "不能产出 Invalid Date");
+});
+
+test("绝对日期照收", () => {
+  assert.equal(until("2027-08-19").iso, "2027-08-19T00:00:00.000Z");
+});
+
+test("往回续 → 拒绝（打错年份等于当场关桥）", () => {
+  const r = until("2020-01-01");
+  assert.equal(r.ok, false);
+  assert.ok(r.reason.includes("将来"));
+});
+
+test("看不懂的写法 → 拒绝，并说清能用什么", () => {
+  const r = until("下周");
+  assert.equal(r.ok, false);
+  assert.ok(r.reason.includes("1y"), "报错要带可用写法，不能只说不认识");
+});
+
+test("0y / 负数 → 拒绝", () => {
+  assert.equal(until("0d").ok, false);
+});
+
+test("续期工具写得出的值，入站一定认（同一条规则）", () => {
+  for (const v of ["unlimited", 1, 20, 500]) assert.equal(isValidQuota(v), true);
+  for (const v of ["Unlimited", 0, -1, 2.5, "20", true, null, undefined]) {
+    assert.equal(isValidQuota(v), false, JSON.stringify(v) + " 不该被判合法");
+  }
+});
 
 // ---------- 汇总 ----------
 

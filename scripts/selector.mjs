@@ -14,6 +14,15 @@
 /** 关掉次数闸的唯一写法。字面量比对，不做大小写或别名兼容 —— 见下面配额那段的理由。 */
 export const UNLIMITED = "unlimited";
 
+/**
+ * 配额值合不合法。导出是为了让**写 mapping 的一方和读 mapping 的一方共用同一条规则** ——
+ * 续期工具写进去的值，绝不能是这里会判成配错的值。两边各写一套，迟早写出一个
+ * 「工具说配好了、入站说你配错了」的状态，而那种状态查起来最费劲。
+ */
+export function isValidQuota(v) {
+  return v === UNLIMITED || (typeof v === "number" && Number.isInteger(v) && v > 0);
+}
+
 export const REJECT = {
   MAPPING_MISSING: "mapping_missing",
   MAPPING_NOT_ACTIVE: "mapping_not_active",
@@ -128,13 +137,9 @@ export function evaluateInbound({ event, mapping, config, now }) {
   // 这里刻意不做 Number() 强制转换。旧版转过，于是 `true` 被转成 1，配额悄悄变成「1 条」
   // 而不是被判成配错 —— 一个布尔值笔误就能改掉准入条件，还改得没人看得见。
   // fail-closed 要求类型也 fail-closed：不是数字就是配错，不猜它想表达什么。
-  if (mapping.max_inbound_messages !== UNLIMITED) {
-    const max = mapping.max_inbound_messages;
-    if (typeof max !== "number" || !Number.isInteger(max) || max <= 0) {
-      return reject(REJECT.MALFORMED_EVENT);
-    }
-    if (consumed.length >= max) return reject(REJECT.QUOTA_EXHAUSTED);
-  }
+  const max = mapping.max_inbound_messages;
+  if (!isValidQuota(max)) return reject(REJECT.MALFORMED_EVENT);
+  if (max !== UNLIMITED && consumed.length >= max) return reject(REJECT.QUOTA_EXHAUSTED);
 
   // 同上：时效窗口也只认真正的数字。这道闸转错方向是 fail-closed（`true` → 1ms → 全拒），
   // 不像配额那样危险，但同一个笔误在两个字段上给出两种结局才是真的难查。

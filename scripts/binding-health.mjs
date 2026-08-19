@@ -44,6 +44,10 @@ export function checkBinding({ root, now = Date.now() }) {
   return { state: "expiring", expiresAt, day, window };
 }
 
+// 预警必须自带解法。一年后收到「快到期了」的人不会记得字段叫什么、文件在哪个目录，
+// 那时候要是还得回来问一句「在哪儿改」，这条提醒就只完成了一半。
+const RENEW = "在 feishu-bridge-cc 里跑 `node scripts/binding.mjs --renew 1y --apply`";
+
 /** 把体检结果翻成一条 outbox 事件；没什么要说的就返回 null。 */
 export function bindingWarning(health) {
   if (health.state === "expiring") {
@@ -52,7 +56,7 @@ export function bindingWarning(health) {
       text:
         "话题绑定 " + health.day + " 到期（剩不到 " + health.window + " 天）。" +
         "到期后你在话题里发的指令会被全部拒绝，但出站还会继续发进展 —— 会变成我能说、你不能回。" +
-        "续期就是改 active-mapping.json 的 expires_at。",
+        "续期：" + RENEW + "。",
     };
   }
   if (health.state === "expired") {
@@ -60,14 +64,14 @@ export function bindingWarning(health) {
       kind: "risk",
       text:
         "话题绑定已于 " + health.day + " 过期，入站指令现在一律被拒（回执写「绑定关系已过期」）。" +
-        "出站不受影响，所以你还能收到进展，但回话回不进来。",
+        "出站不受影响，所以你还能收到进展，但回话回不进来。恢复：" + RENEW + "。",
     };
   }
   if (health.state === "malformed") {
     return {
       kind: "risk",
       text: "话题绑定的 expires_at 读不出日期（当前值：" + JSON.stringify(health.expiresAtRaw) +
-        "），入站会一律判过期拒绝。",
+        "），入站会一律判过期拒绝。修：" + RENEW + "。",
     };
   }
   return null;

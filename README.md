@@ -40,6 +40,18 @@ node scripts/install-outbound.mjs --apply
 - `skills/claude-longtask-progress/` 部署到 `~/.claude/skills/` 的出站进展技能
 - `.runtime-data/` 敏感 locator、mapping、claim、回执。**禁止提交**
 
+## 绑定续期
+
+绑定有个到期日，那是入站**唯一**的闸（配额闸已退役）。到期后入站一律拒，
+但出站照发——会变成"任务能说、你不能回"。
+
+```bash
+node scripts/binding.mjs                    # 看：到期日、还剩几天、配额、话题
+node scripts/binding.mjs --renew 1y --apply # 续（也收 6m / 90d / 2027-08-19）
+```
+
+到期前 30 天和 7 天会各自动往飞书报一次，不用记着。预警文案里带续期命令。
+
 ## 自检
 
 ```bash

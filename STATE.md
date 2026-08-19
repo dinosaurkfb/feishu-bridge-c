@@ -19,23 +19,27 @@ Frank 在绑定话题 @M5Claude + →Claude 前缀
          守望者合并「结果 + 进展」→ COO助理CC 发一条到话题
 ```
 
-- **入站没有本地技能。已判决（2026-08-19）**：把 `~/skills/m5claude-inbound-router/`
-  改名后从飞书发指令，**照常受理**（`msg_4kvn227q33txt`，重试 0 次）。
-  那个位置从未被读取。原记载「部署在 `/Users/dk/skills/`，带 `aily-cli-skill.json`
-  才会被发现」**两句都是错的**。旁证：
-  - claude-code-local adapter 的技能注入只从三处取：`bundledSkillsRoot`、
-    `~/.aily-cli/skills`（本机不存在）、`~/.claude`。**`~/skills/` 不在其中。**
-  - 真正在工作的 Codex 链路把技能放在 `~/aily_workspaces/<agent_uid>/.agents/skills/`，
-    而且**只有 `SKILL.md`，没有 `aily-cli-skill.json`**。
-  - M5Claude 的 `~/aily_workspaces/agent_4ks11dv8f0mxwbd/` **整个目录是空的**，
-    而 `resolveAndPinInvokeWorkspacePath` 把它钉成 M5Claude 的 workspace。
-  - adapter 明确避开 project 级 `.claude/skills`，改用每次调用私有的 plugin 目录，
-    内容由平台侧的 `skillRefs` 决定。
-  所以：让 M5Claude 去跑 `inbound.mjs` 的指令**来自 Aily 平台侧的 agent 配置**。
-  仓库里 `skills/m5claude-inbound-router/SKILL.md` 现在的定位是**平台指令的底稿**，
-  改它不会生效，必须同步改平台。
-- **入站的真实配置不在版本管理里，也无法被本地安装器复现。**这是目前最大的
-  可重建性缺口：换台机器，出站四样能一条命令装回来，入站要人去 Aily 平台重配。
+- **入站技能确实在被调用（2026-08-19 由会话记录证实）。**别再靠推断，直接读
+  M5Claude 自己的会话记录：`~/.claude/projects/-Users-dk-aily-workspaces-agent-4ks11dv8f0mxwbd/`
+  （M5Claude 的 cwd 就是 `~/aily_workspaces/<agent_uid>`）。最后一轮里写着：
+
+  ```
+  TOOL: Skill {"skill":"aily-cli-invocation:m5claude-inbound-router2"}
+  Base directory for this skill:
+    ~/.aily-cli/session/<sid>/workdir/.aily-cli/claude/aily-hook-plugin-<uuid>/skills/m5claude-inbound-router2
+  TOOL: Bash  node …/scripts/inbound.mjs
+  ```
+
+  技能被 materialize 进一个**每次调用私有的 plugin 目录**，用完即 cleanup ——
+  所以事后去 workspace 或 session workdir 里翻是翻不到的，那不是它的存放处。
+- **注意技能是按目录名枚举的，不是按固定名引用的。**Frank 把目录改名成
+  `...router2` 之后，系统跟着新名字照常加载。所以「改名后还能通」**不能**用来
+  证明那份文件没用 —— 这是一次设计错了的实验，我据此下过一个错误结论。
+  真正的判决实验是**把目录整个移出技能根目录**。
+- **仍未确定：materialize 的源到底是本地 `~/skills/` 还是平台侧的副本。**
+  `skill-inject.js` 声明的三个源（`bundledSkillsRoot` / `~/.aily-cli/skills` /
+  `~/.claude`）都不含 `~/skills/`，而 `aily-cli skill sync` 会把本地技能上报 AgentHub。
+  两种可能都还站得住，别当成已知。
 - 两条分支**必须互斥**：都走 `--continue` 会有两个进程写同一份 transcript
 - `.runtime-data/longtask-session-id.txt` **已废弃，没有代码再读它**。
   钉一个会话 UUID 是错的抽象 —— 会话是记录，每开一个终端就是新的一份，

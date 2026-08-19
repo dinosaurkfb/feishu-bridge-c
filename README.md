@@ -28,18 +28,20 @@ Claude 侧飞书双向桥试点。**本项目的长期任务就是这座桥本�
 
 ```bash
 node scripts/install-outbound.mjs --apply   # Stop 钩子 + 登记表 + 全局技能 + launchd 兜底
+node scripts/install-inbound.mjs  --apply   # 入站技能装到 ~/skills/
 ```
 
-dry-run 默认、幂等、可 `--uninstall`。它往 `~/.claude/settings.json` 的 Stop 数组
-**追加**一条（先备份，不动 .orca 那套）。
+出站那个往 `~/.claude/settings.json` 的 Stop 数组**追加**一条（先备份，不动 .orca 那套）。
 
-**入站没有安装器，因为没有可装的东西。**2026-08-19 判决实验确认：入站的配置在
-Aily 平台侧 M5Claude 的 agent 指令里，不在这台机器上。仓库里
-`skills/m5claude-inbound-router/SKILL.md` 只是那份平台指令的底稿——
-改它不会生效，必须同步改平台。
+入站那个装完会自检文件一致性、目标是真实目录（软链会让扫描不跟随）、
+以及 `SKILL.md` 里引用的脚本路径确实存在。但它**不保证技能已被发现**——
+`aily-cli skill scan-local` 扫的是宿主 agent 目录（`~/.claude/skills`、`~/.codex/skills`），
+看不到 `~/skills/` 这一个。**唯一的验证是从飞书真发一条 `→Claude` 指令看回执。**
 
-**换台机器重建时**：出站一条命令装回来，入站要人去 Aily 平台重配。这是目前
-最大的可重建性缺口，无法用代码消除。
+技能实际是被 materialize 进一次性的 plugin 目录再调用的
+（`aily-cli-invocation:<技能名>`，用完即删），所以事后在磁盘上翻不到痕迹。
+要确认它有没有真被调用，看 M5Claude 自己的会话记录：
+`~/.claude/projects/-Users-dk-aily-workspaces-agent-<uid>/`。
 
 ## 目录
 

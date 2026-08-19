@@ -261,6 +261,11 @@ writeReceipt("accepted-" + verdict.messageId, {
   claim_acquired: true, handed_off: true, completion_observed: false,
   completion_owner: "outbound_publisher",
   run_log: run.logPath, pid: run.pid,
+  // 成功路径也记重试次数。事件存储的读延迟只在真实消息上暴露 —— 手机发的比电脑发的
+  // 慢（2026-08-19 实测：修复前手机 0/2、Mac 1/1），而重试预算只有 4 次。
+  // 不在每条成功回执上记下用了几次，就永远不知道余量还剩多少，
+  // 只能等它再次不够用、再从零查一遍。
+  envelope_attempts: fetched.attempts ?? 1,
   // 落到哪条线上必须留痕：两条路径的结果发布者不同（现场靠它自己的 Stop 钩子，
   // --continue 靠一次性守望者），出问题时第一件事就是问「这条走的哪边」。
   delivery_mode: run.mode,

@@ -18,6 +18,9 @@ import { evaluateInbound } from "./selector.mjs";
 import { fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, recordClaimState } from "./claim.mjs";
 import { handOff, acquireSessionLock, releaseSessionLock, stampSessionLock } from "./handoff.mjs";
+import {
+  deliverToLiveSession, findLiveSessions, hasPriorSession, stampInstruction,
+} from "./live-session.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const RT = path.join(ROOT, ".runtime-data", "inbound");
@@ -47,9 +50,13 @@ function writeReceipt(name, payload) {
 /** 三种结局的回执文案。拒绝必须带原因 —— 静默丢弃是不可接受的失败模式。 */
 function ackText(kind, detail) {
   if (kind === "accepted") {
+    // 说清楚落到哪条线上：他在终端里看不看得到这条指令，取决于这个。
+    const where = detail.mode === "live_session"
+      ? "已送进你正开着的会话（" + detail.targetName + "）"
+      : "已起一轮后台执行（沿用本项目最近的对话）";
     return [
       "已受理 · " + detail.taskName,
-      "指令已投递，正在执行。完成后结果会通过 COO助理CC 发布到本话题。",
+      where + "。完成后结果会通过 COO助理CC 发布到本话题。",
       "消息 " + detail.messageId.slice(-8) + " | claim " + detail.key.slice(0, 8),
     ].join("\n");
   }
@@ -139,48 +146,96 @@ if (!claim.ok) {
   finish("error", { detail: "无法取得投递权：" + claim.error }, { reason: claim.reason });
 }
 
-// 同一会话不能并发 resume。拿不到锁就明确告知，不排队、不静默丢弃。
-const lock = acquireSessionLock(LOCK);
-if (!lock.ok) {
-  recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { reason: lock.reason } });
-  writeReceipt("busy-" + verdict.messageId, {
-    status: "error", reason: lock.reason, message_id: verdict.messageId,
-    claim_acquired: true, handed_off: false,
-  });
-  finish("error", { detail: "长期任务正忙，上一条指令还没跑完" }, { reason: lock.reason });
-}
+// 路由：现场有人就投给现场，没人才自己起一轮。
+//
+// 这两条分支必须互斥。都走 --continue 的话会有两个进程写同一份 transcript ——
+// 现在没撞上纯粹是因为旧设计钉的是另一份记录，那是运气不是设计。
+const liveTargets = findLiveSessions({ projectRoot: config.project_dir });
+const target = liveTargets[0] ?? null;
 
 let run;
-try {
-  run = handOff({
-    projectDir: config.project_dir,
-    sessionId: fs.readFileSync(path.join(ROOT, ".runtime-data", "longtask-session-id.txt"), "utf-8").trim(),
-    instruction: verdict.instruction,
-    runsDir: RUNS,
-    key: claim.key,
-  });
-} catch (err) {
-  releaseSessionLock(LOCK);
-  recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { error: err.message } });
-  writeReceipt("handoff-failed-" + verdict.messageId, {
-    status: "error", reason: "handoff_failed", message_id: verdict.messageId,
-    claim_acquired: true, handed_off: false,
-  });
-  finish("error", { detail: "投递失败：" + err.message }, { reason: "handoff_failed" });
-}
 
-// 把 run 信息盖进锁：锁要活到 run 结束，靠这份信息做陈旧回收。
-stampSessionLock(LOCK, { pid: run.pid, logPath: run.logPath });
+if (target) {
+  // 现场路径不需要会话锁：消息进的是一个活着的会话，它自己会把先后顺序排好。
+  // 也不需要守望者 —— 那个会话结束时它自己的 Stop 钩子会把进展发出去。
+  try {
+    run = deliverToLiveSession({
+      target,
+      instruction: verdict.instruction,
+      messageId: verdict.messageId,
+      createdAtMs: event.created_at_ms,
+      projectRoot: config.project_dir,
+      runsDir: RUNS,
+      key: claim.key,
+    });
+  } catch (err) {
+    recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { error: err.message } });
+    writeReceipt("forward-failed-" + verdict.messageId, {
+      status: "error", reason: "forward_failed", message_id: verdict.messageId,
+      claim_acquired: true, handed_off: false,
+    });
+    finish("error", { detail: "投递给现场会话失败：" + err.message }, { reason: "forward_failed" });
+  }
+} else {
+  // 没有可续的对话就明确拒绝，不假装受理。
+  // 这不该在运行时兜底 —— 「起这个长期任务」本来就是建绑定的一个步骤，
+  // 跟建话题、写 mapping、装钩子并列。缺了就该退回去补，而不是让代码猜。
+  if (!hasPriorSession({ projectRoot: config.project_dir })) {
+    recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { reason: "no_prior_session" } });
+    writeReceipt("no-session-" + verdict.messageId, {
+      status: "error", reason: "no_prior_session", message_id: verdict.messageId,
+      claim_acquired: true, handed_off: false,
+    });
+    finish("error", {
+      detail: "这个项目还没有长期任务会话，--continue 无从续起。先在项目目录起一个会话再发指令",
+    }, { reason: "no_prior_session" });
+  }
 
-// 起一次性守望者：run 跑完就发布结果并放锁。需求③「完成触发下一轮出站」靠它闭环。
-if (config.auto_publish_on_completion !== false) {
-  const w = spawn(process.execPath, [path.join(ROOT, "scripts", "watch-and-publish.mjs"), claim.key], {
-    cwd: ROOT, detached: true,
-    stdio: ["ignore",
-      fs.openSync(path.join(RUNS, claim.key + ".watch.log"), "a"),
-      fs.openSync(path.join(RUNS, claim.key + ".watch.log"), "a")],
-  });
-  w.unref();
+  // 同一目录不能并发 --continue，否则两轮会互相踩。用目录锁串行化。
+  const lock = acquireSessionLock(LOCK);
+  if (!lock.ok) {
+    recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { reason: lock.reason } });
+    writeReceipt("busy-" + verdict.messageId, {
+      status: "error", reason: lock.reason, message_id: verdict.messageId,
+      claim_acquired: true, handed_off: false,
+    });
+    finish("error", { detail: "长期任务正忙，上一条指令还没跑完" }, { reason: lock.reason });
+  }
+
+  try {
+    run = handOff({
+      projectDir: config.project_dir,
+      instruction: stampInstruction({
+        instruction: verdict.instruction,
+        messageId: verdict.messageId,
+        createdAtMs: event.created_at_ms,
+      }),
+      runsDir: RUNS,
+      key: claim.key,
+    });
+  } catch (err) {
+    releaseSessionLock(LOCK);
+    recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { error: err.message } });
+    writeReceipt("handoff-failed-" + verdict.messageId, {
+      status: "error", reason: "handoff_failed", message_id: verdict.messageId,
+      claim_acquired: true, handed_off: false,
+    });
+    finish("error", { detail: "投递失败：" + err.message }, { reason: "handoff_failed" });
+  }
+
+  // 把 run 信息盖进锁：锁要活到 run 结束，靠这份信息做陈旧回收。
+  stampSessionLock(LOCK, { pid: run.pid, logPath: run.logPath });
+
+  // 起一次性守望者：run 跑完就发布结果并放锁。
+  if (config.auto_publish_on_completion !== false) {
+    const w = spawn(process.execPath, [path.join(ROOT, "scripts", "watch-and-publish.mjs"), claim.key], {
+      cwd: ROOT, detached: true,
+      stdio: ["ignore",
+        fs.openSync(path.join(RUNS, claim.key + ".watch.log"), "a"),
+        fs.openSync(path.join(RUNS, claim.key + ".watch.log"), "a")],
+    });
+    w.unref();
+  }
 }
 
 // 投递成功。注意 handed_off ≠ 完成，出站流程稍后独立判定完成。
@@ -199,8 +254,14 @@ writeReceipt("accepted-" + verdict.messageId, {
   claim_acquired: true, handed_off: true, completion_observed: false,
   completion_owner: "outbound_publisher",
   run_log: run.logPath, pid: run.pid,
+  // 落到哪条线上必须留痕：两条路径的结果发布者不同（现场靠它自己的 Stop 钩子，
+  // --continue 靠一次性守望者），出问题时第一件事就是问「这条走的哪边」。
+  delivery_mode: run.mode,
+  target_session_id: run.targetSessionId ?? null,
+  target_session_name: run.targetName ?? null,
 });
 
 finish("accepted", {
   taskName: config.task_display_name, messageId: verdict.messageId, key: claim.key,
-}, { claim_key: claim.key, run_log: run.logPath });
+  mode: run.mode, targetName: run.targetName,
+}, { claim_key: claim.key, run_log: run.logPath, delivery_mode: run.mode });

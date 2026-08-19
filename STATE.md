@@ -10,17 +10,25 @@
 ```
 Frank 在绑定话题 @M5Claude + →Claude 前缀
   → M5Claude 执行 scripts/inbound.mjs（无参，字段由脚本自己向 Aily 取）
-  → 六项确定性校验 → 原子 claim → 非阻塞投递（实测 77ms 返回）
-  → 秒级「已受理」
-       ↓ 后台
-  长期任务干活，边干边记 outbox
-       ↓ run 结束
-  守望者合并「结果 + 进展」→ COO助理CC 发一条到话题
+  → 六项确定性校验 → 原子 claim → 路由 → 秒级「已受理」（实测 77ms）
+       ↓
+  ┌ 现场有活着的交互会话？
+  ├ 有 → 起一个极小无头会话，用 SendMessage 把指令投进去
+  │      结果由那个会话自己的 Stop 钩子发布（不用守望者、不用会话锁）
+  └ 无 → claude --continue 后台起一轮 + 一次性守望者
+         守望者合并「结果 + 进展」→ COO助理CC 发一条到话题
 ```
 
 - 技能部署在 `/Users/dk/skills/m5claude-inbound-router/`（aily 捆绑技能目录，
   带 `aily-cli-skill.json` 才会被发现；`readdir withFileTypes` 不跟随符号链接，必须是真实目录）
-- 长期任务会话 ID 钉死在 `.runtime-data/longtask-session-id.txt`
+- 两条分支**必须互斥**：都走 `--continue` 会有两个进程写同一份 transcript
+- `.runtime-data/longtask-session-id.txt` **已废弃，没有代码再读它**。
+  钉一个会话 UUID 是错的抽象 —— 会话是记录，每开一个终端就是新的一份，
+  钉住的那份很快就不再是工作发生的地方（实测钉住的是一堆联调残渣，
+  11 条指令里 9 条是「数到 3」「写个 HELLO-BRIDGE.txt」）
+- 投递给 `--continue` 的指令会盖上 `[飞书 · msg_xxx · 时间]` 来源戳，
+  否则在终端里看不出哪条来自飞书
+- 事件只取最近 2 轮（`--page-size`，单位是对话轮次），不再每次搬整个话题史
 
 ### 出站（Stop 钩子 + 登记表 + 全局技能，对本机所有 Claude 会话生效）
 
@@ -58,6 +66,11 @@ Frank 在绑定话题 @M5Claude + →Claude 前缀
    要做的话，判据得是「这次会话在登记项目里动过文件却一条 outbox 都没记」。
 3. **多项目还没真跑过。**登记表结构支持 N 个项目，但只有本项目配了
    chain-config / active-mapping，第二个项目接进来时的绑定怎么发是空白。
+4. **投进现场会话的权限边界没定。**指令进了交互会话就按**那个会话的权限**跑
+   （本项目是 `acceptEdits` + 一串 allowlist），而不是长期任务那份更窄的。
+   回执里已记 `delivery_mode` / `target_session_id` 留痕，但要不要限制、怎么限制没定。
+5. **「起长期任务会话」还不是建绑定的正式步骤。**没有它 `--continue` 无从续起，
+   代码现在如实拒绝（`no_prior_session`）而不兜底 —— 但流程文档里还没写这一步。
 
 ## 现场值
 

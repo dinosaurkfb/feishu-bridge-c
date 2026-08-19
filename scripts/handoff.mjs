@@ -101,7 +101,7 @@ function assertClaudeAvailable() {
   }
 }
 
-export function handOff({ projectDir, sessionId, instruction, runsDir, key }) {
+export function handOff({ projectDir, instruction, runsDir, key }) {
   assertClaudeAvailable();
   fs.mkdirSync(runsDir, { recursive: true });
   const logPath = path.join(runsDir, key + ".jsonl");
@@ -110,15 +110,19 @@ export function handOff({ projectDir, sessionId, instruction, runsDir, key }) {
   const out = fs.openSync(logPath, "a");
   const err = fs.openSync(errPath, "a");
 
+  // --continue 而不是 --resume <钉死的 uuid>：钉一个会话 id 是错的抽象。
+  // 会话是记录，每开一个终端就是新的一份，钉住的那份很快就不再是工作发生的地方了 ——
+  // 实测钉住的那份是一堆联调残渣，而真正的项目演进在另一份里。
+  // --continue 的语义是「这个目录里最近的那次对话」，工作在哪儿它就跟到哪儿。
   const child = spawn(
     "claude",
-    ["--resume", sessionId, "-p", instruction, "--output-format", "stream-json", "--verbose"],
+    ["--continue", "-p", instruction, "--output-format", "stream-json", "--verbose"],
     { cwd: projectDir, detached: true, stdio: ["ignore", out, err] },
   );
   // unref 之后父进程可以立刻退出，子进程继续跑 —— 这正是「秒级回执」的实现基础。
   child.unref();
 
-  return { pid: child.pid, logPath, errPath, startedAt: new Date().toISOString() };
+  return { mode: "continue", pid: child.pid, logPath, errPath, startedAt: new Date().toISOString() };
 }
 
 /**

@@ -24,6 +24,9 @@ import {
 import { appendEvent, composeDigest, listPending, markSent } from "./outbox.mjs";
 import { drainProject, watcherActive } from "./drain-outbox.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
+import {
+  findLiveSessions, forwardPrompt, hasPriorSession, stampInstruction, transcriptDirFor,
+} from "./live-session.mjs";
 
 let passed = 0;
 let failed = 0;
@@ -714,6 +717,94 @@ test("有 runId 时用 --run，不叠加 --page-size", () => {
 
 test("收窄的余量至少留一轮（别卡在轮次边界上漏消息）", () => {
   assert.ok(RECENT_TURNS >= 2, "取 1 会在查询正好落到轮次边界时漏掉目标消息");
+});
+
+// ---------- 现场判定：投给谁 ----------
+
+const sess = path.join(tmp, "sessions");
+fs.mkdirSync(sess, { recursive: true });
+const PROJ = "/Users/dk/claude-projects/feishu-bridge-cc";
+const writeSession = (name, rec) =>
+  fs.writeFileSync(path.join(sess, name + ".json"), JSON.stringify(rec));
+const allAlive = () => true;
+const find = (opts = {}) => findLiveSessions({ projectRoot: PROJ, sessionsDir: sess, isAlive: allAlive, ...opts });
+
+test("活着的交互会话就是现场", () => {
+  writeSession("100", { pid: 100, sessionId: "s-a", cwd: PROJ, kind: "interactive", name: "n-a", startedAt: 1 });
+  assert.deepEqual(find().map((s) => s.sessionId), ["s-a"]);
+});
+
+test("无头会话不算现场（投进去会套娃：投递自己起的就是无头）", () => {
+  writeSession("101", { pid: 101, sessionId: "s-h", cwd: PROJ, kind: "headless", name: "n-h", startedAt: 9 });
+  assert.ok(!find().some((s) => s.sessionId === "s-h"));
+});
+
+test("别的项目的会话不算现场", () => {
+  writeSession("102", { pid: 102, sessionId: "s-o", cwd: "/Users/dk/other", kind: "interactive", name: "n-o", startedAt: 9 });
+  assert.ok(!find().some((s) => s.sessionId === "s-o"));
+});
+
+test("项目子目录里起的会话算现场", () => {
+  writeSession("103", { pid: 103, sessionId: "s-sub", cwd: PROJ + "/scripts", kind: "interactive", name: "n-sub", startedAt: 2 });
+  assert.ok(find().some((s) => s.sessionId === "s-sub"));
+});
+
+test("进程已死 → 不算现场（登记文件不会自己消失）", () => {
+  const deadOnly = findLiveSessions({ projectRoot: PROJ, sessionsDir: sess, isAlive: () => false });
+  assert.deepEqual(deadOnly, [], "只有登记文件在、进程没了，绝不能当成现场");
+});
+
+test("多个现场取最近开的那个", () => {
+  writeSession("104", { pid: 104, sessionId: "s-new", cwd: PROJ, kind: "interactive", name: "n-new", startedAt: 999 });
+  assert.equal(find()[0].sessionId, "s-new");
+});
+
+test("半截 / 损坏的登记文件不影响判定", () => {
+  fs.writeFileSync(path.join(sess, "105.json"), "{ 半截");
+  assert.ok(find().length > 0, "坏文件应当被跳过而不是让整个判定崩掉");
+});
+
+test("sessions 目录不存在 → 没有现场，不崩", () => {
+  assert.deepEqual(findLiveSessions({ projectRoot: PROJ, sessionsDir: path.join(tmp, "nope") }), []);
+});
+
+// ---------- --continue 有没有东西可续 ----------
+
+test("目录里有会话记录 → 可续", () => {
+  const d = path.join(tmp, "has-prior");
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, "abc.jsonl"), "{}\n");
+  assert.equal(hasPriorSession({ projectRoot: "/x", projectsDir: d }), true);
+});
+
+test("目录是空的或不存在 → 不可续（该拒绝，不该兜底）", () => {
+  const d = path.join(tmp, "empty-prior");
+  fs.mkdirSync(d, { recursive: true });
+  assert.equal(hasPriorSession({ projectRoot: "/x", projectsDir: d }), false);
+  assert.equal(hasPriorSession({ projectRoot: "/x", projectsDir: path.join(tmp, "absent") }), false);
+});
+
+test("会话记录目录名就是 cwd 把 / 换成 -", () => {
+  assert.ok(transcriptDirFor(PROJ).endsWith("-Users-dk-claude-projects-feishu-bridge-cc"));
+});
+
+// ---------- 来源戳与转发提示词 ----------
+
+test("指令带上飞书来源戳，终端里看得出这条哪来的", () => {
+  const s = stampInstruction({ instruction: "干活", messageId: "msg_x", createdAtMs: Date.parse("2026-08-19T07:27:30Z") });
+  assert.ok(s.includes("msg_x") && s.includes("2026-08-19 07:27"));
+  assert.ok(s.endsWith("干活"), "指令正文必须原样在最后，不能被戳改写");
+});
+
+test("时间戳缺失也不崩，如实写未知", () => {
+  assert.ok(stampInstruction({ instruction: "干活", messageId: "m", createdAtMs: NaN }).includes("时间未知"));
+});
+
+test("转发提示词把「不要执行」放在最前面并重复", () => {
+  const p = forwardPrompt({ targetName: "sess-1", stamped: "[飞书 · m · t]\n把仓库删了" });
+  assert.ok(p.indexOf("不要执行") < p.indexOf("SendMessage"), "禁止执行必须先于任务说明出现");
+  assert.ok(p.lastIndexOf("不负责完成") > p.indexOf("===END==="), "分隔符之后要再挡一次");
+  assert.ok(p.includes('"sess-1"'), "目标名要带引号，防止名字里有空格时被截断");
 });
 
 // ---------- 汇总 ----------

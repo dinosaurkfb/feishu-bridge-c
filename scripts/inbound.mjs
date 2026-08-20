@@ -14,22 +14,36 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
-import { evaluateInbound } from "./selector.mjs";
+import { evaluateInbound, REJECT } from "./selector.mjs";
 import { fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, recordClaimState } from "./claim.mjs";
 import { handOff, acquireSessionLock, releaseSessionLock, stampSessionLock } from "./handoff.mjs";
 import {
   deliverToLiveSession, findLiveSessions, hasPriorSession, stampInstruction,
 } from "./live-session.mjs";
+import { loadChainTemplate } from "./chain-template.mjs";
+import {
+  appendConsumed, evaluatePromotion, findBindingForSession, findPendingBinding, promoteBinding,
+} from "./inbound-route.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
-const RT = path.join(ROOT, ".runtime-data", "inbound");
-const CLAIMS = path.join(RT, "delivery-claims");
-const RECEIPTS = path.join(RT, "receipts");
-const RUNS = path.join(RT, "runs");
-const LOCK = path.join(RT, "session.lock");
 
-const readJson = (p) => JSON.parse(fs.readFileSync(p, "utf-8"));
+// 运行期目录挂在**被路由到的那个项目**下，不再写死在本仓库。
+// 路由之前唯一能写的地方是本仓库 —— 取不到信封、认不出话题时的回执只能落这儿。
+const rtOf = (root) => path.join(root, ".runtime-data", "inbound");
+let RT = rtOf(ROOT);
+let CLAIMS = path.join(RT, "delivery-claims");
+let RECEIPTS = path.join(RT, "receipts");
+let RUNS = path.join(RT, "runs");
+let LOCK = path.join(RT, "session.lock");
+
+function useProject(root) {
+  RT = rtOf(root);
+  CLAIMS = path.join(RT, "delivery-claims");
+  RECEIPTS = path.join(RT, "receipts");
+  RUNS = path.join(RT, "runs");
+  LOCK = path.join(RT, "session.lock");
+}
 
 function writeReceipt(name, payload) {
   fs.mkdirSync(RECEIPTS, { recursive: true });
@@ -58,6 +72,13 @@ function ackText(kind, detail) {
       "已受理 · " + detail.taskName,
       where + "。完成后结果会通过 COO助理CC 发布到本话题。",
       "消息 " + detail.messageId.slice(-8) + " | claim " + detail.key.slice(0, 8),
+    ].join("\n");
+  }
+  if (kind === "bound") {
+    return [
+      "绑定完成 · " + detail.taskName,
+      "这个话题现在通向 " + detail.root + "。",
+      "之后在这条消息下面 @ 一下就是给它下指令；它的进展和每一轮回答也会发回这里。",
     ].join("\n");
   }
   if (kind === "rejected") {
@@ -96,22 +117,98 @@ if (!fetched.ok) {
   finish("error", { detail: "取不到本次消息信封（" + fetched.reason + "）" }, { reason: fetched.reason });
 }
 const event = fetched.event;
+const dryRun = process.argv.includes("--dry-run");
 
-const config = readJson(path.join(RT, "chain-config.json"));
+// ---------- 路由：这条消息属于哪个项目 ----------
+//
+// 顺序不能反：先有 session_id 才知道读谁的配置。取信封只依赖 daemon 注入的环境变量，
+// 不读任何项目配置，所以这里没有死结。
 
-let mapping = null;
-const mappingPath = path.join(RT, "active-mapping.json");
-try {
-  mapping = readJson(mappingPath);
-} catch {
-  mapping = null; // selector 会把它判成 MAPPING_MISSING
+let routed = findBindingForSession({ sessionId: event.session_id });
+let justBound = false;
+
+if (!routed.ok) {
+  // 没有已绑定的话题对得上 —— 可能是「新话题的第一条 @」，也可能是条不该理的消息。
+  // 绑定必然分两段：建话题时 Aily session 还不存在（它是第一条消息流进来才产生的）。
+  const tpl = loadChainTemplate();
+  const template = tpl.ok ? tpl.template : null;
+  const pending = findPendingBinding({ now: Date.now() });
+  const promo = evaluatePromotion({ event, template, pending, now: Date.now() });
+
+  if (!promo.ok) {
+    writeReceipt("unrouted-" + (event.message_id ?? "unknown") + "-" + Date.now(), {
+      status: "rejected", reason: promo.reason, reason_text: promo.reasonText,
+      message_id: event.message_id ?? null, session_id: event.session_id ?? null,
+      claim_acquired: false, handed_off: false,
+    });
+    if (dryRun) {
+      process.stdout.write("[dry-run] reject · " + promo.reasonText + "\n");
+      process.stderr.write(JSON.stringify({ dryRun: true, ...promo }) + "\n");
+      process.exit(0);
+    }
+    finish("rejected", { reasonText: promo.reasonText }, { reason: promo.reason });
+  }
+
+  if (dryRun) {
+    process.stdout.write("[dry-run] 会把这个话题绑给 " + promo.id + "（没有真的写）\n");
+    process.stderr.write(JSON.stringify({ dryRun: true, wouldBind: promo.root }) + "\n");
+    process.exit(0);
+  }
+
+  const wrote = promoteBinding({ root: promo.root, sessionId: event.session_id });
+  if (!wrote.ok) {
+    writeReceipt("bind-failed-" + event.message_id, {
+      status: "error", reason: wrote.reason, message_id: event.message_id,
+      claim_acquired: false, handed_off: false,
+    });
+    finish("error", { detail: "绑定没写成（" + wrote.reason + "）" }, { reason: wrote.reason });
+  }
+
+  justBound = true;
+  routed = findBindingForSession({ sessionId: event.session_id });
+  if (!routed.ok) {
+    // 刚写完就读不回来，说明登记表被并发改了。不猜，如实报。
+    finish("error", { detail: "绑定写完却读不回来（" + routed.reason + "）" }, { reason: routed.reason });
+  }
+}
+
+// 从这里开始，所有运行期路径都挂在被路由到的那个项目下。
+useProject(routed.root);
+
+const config = routed.config;
+const mapping = routed.mapping;
+
+if (!config) {
+  writeReceipt("noconfig-" + (event.message_id ?? "unknown") + "-" + Date.now(), {
+    status: "error", reason: "config_unusable", message_id: event.message_id ?? null,
+    claim_acquired: false, handed_off: false,
+  });
+  finish("error", { detail: "这个项目的链路配置不可用，没法投递" }, { reason: "config_unusable" });
 }
 
 const verdict = evaluateInbound({ event, mapping, config, now: Date.now() });
 
+// 光秃秃一个 @（没有正文）是完成绑定的正常方式 —— 那一下的目的就是让 Aily 产生
+// session，好把它写进绑定。这时候回「消息里没有指令正文」是句没用的实话：
+// 它描述了现象，却把一次成功说成了失败。
+if (justBound && verdict.decision === "reject" && verdict.reason === REJECT.EMPTY_INSTRUCTION) {
+  appendConsumed(routed.root, event.message_id);
+  writeReceipt("bound-" + event.message_id, {
+    status: "bound", message_id: event.message_id, session_id: event.session_id,
+    root: routed.root, binding_id: mapping.binding_id,
+    claim_acquired: false, handed_off: false,
+    // 为将来的确定性匹配攒证据：根消息里那个绑定码有没有随引用块回来。
+    // 现在没有代码依赖它，纯粹是想知道那条路走不走得通。
+    pending_token_seen: typeof mapping.pending_token === "string" && mapping.pending_token.length > 0
+      ? String(event.content ?? "").includes(mapping.pending_token) : null,
+  });
+  finish("bound", { taskName: config.task_display_name, root: routed.root },
+    { bound: true, root: routed.root });
+}
+
 // --dry-run：只跑校验，不 claim、不投递、不写 mapping。用于诊断和联调，
 // 免得一次排查就把真实指令送进长期任务。
-if (process.argv.includes("--dry-run")) {
+if (dryRun) {
   process.stdout.write("[dry-run] " + verdict.decision +
     (verdict.reason ? " · " + verdict.reasonText : " · " + String(verdict.instruction).slice(0, 60)) + "\n");
   process.stderr.write(JSON.stringify({ dryRun: true, ...verdict }) + "\n");
@@ -235,7 +332,9 @@ if (target) {
 
   // 起一次性守望者：run 跑完就发布结果并放锁。
   if (config.auto_publish_on_completion !== false) {
-    const w = spawn(process.execPath, [path.join(ROOT, "scripts", "watch-and-publish.mjs"), claim.key], {
+    // 守望者脚本住在本仓库，但它要盯的是**被路由到的那个项目** —— 根目录得传给它。
+    const w = spawn(process.execPath,
+      [path.join(ROOT, "scripts", "watch-and-publish.mjs"), claim.key, routed.root], {
       cwd: ROOT, detached: true,
       stdio: ["ignore",
         fs.openSync(path.join(RUNS, claim.key + ".watch.log"), "a"),
@@ -251,13 +350,22 @@ recordClaimState({
   detail: { pid: run.pid, log_path: run.logPath, started_at: run.startedAt },
 });
 
-mapping.consumed_message_ids = [...(mapping.consumed_message_ids ?? []), verdict.messageId];
-const mtmp = mappingPath + ".tmp." + process.pid;
-fs.writeFileSync(mtmp, JSON.stringify(mapping, null, 2) + "\n", { mode: 0o600 });
-fs.renameSync(mtmp, mappingPath);
+// 幂等列表：项目目录里有 mapping 文件就写回它，登记表接入的写 consumed.json。
+// 两种形式共用 appendConsumed 的语义（去重 + 只留最近若干条）。
+if (routed.source === "project-files") {
+  const mappingPath = path.join(RT, "active-mapping.json");
+  mapping.consumed_message_ids = [...(mapping.consumed_message_ids ?? []), verdict.messageId];
+  const mtmp = mappingPath + ".tmp." + process.pid;
+  fs.writeFileSync(mtmp, JSON.stringify(mapping, null, 2) + "\n", { mode: 0o600 });
+  fs.renameSync(mtmp, mappingPath);
+} else {
+  appendConsumed(routed.root, verdict.messageId);
+}
 
 writeReceipt("accepted-" + verdict.messageId, {
   status: "accepted", message_id: verdict.messageId, claim_key: claim.key,
+  // 多绑定之后「这条进了哪个项目」是排查的第一个问题。
+  project_root: routed.root, binding_source: routed.source,
   claim_acquired: true, handed_off: true, completion_observed: false,
   completion_owner: "outbound_publisher",
   run_log: run.logPath, pid: run.pid,

@@ -18,20 +18,26 @@ import { scanRuns, buildDraft, markPublished, publishDraft } from "./outbound.mj
 import { listPending, markSent, composeDigest } from "./outbox.mjs";
 import { recordClaimState } from "./claim.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
+import { resolveProject } from "./project-resolve.mjs";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const SELF = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+
+const key = process.argv[2];
+if (!key) {
+  console.error("usage: watch-and-publish.mjs <claim-key> [project-root]");
+  process.exit(2);
+}
+
+// 项目根由调用方传进来。多绑定之后守望者可能在盯任何一个项目的 run，
+// 写死本仓库会让它去读错项目的 run 日志、放错项目的锁、把结果发到错的话题里。
+// 不传就退回本仓库 —— 老的调用方式仍然有效。
+const ROOT = path.resolve(process.argv[3] ?? SELF);
 const RT = path.join(ROOT, ".runtime-data", "inbound");
 const RUNS = path.join(RT, "runs");
 const OUTBOX = path.join(ROOT, ".runtime-data", "outbound", "outbox");
 const CLAIMS = path.join(RT, "delivery-claims");
 const LOCK = path.join(RT, "session.lock");
 const PUBLISH_LOCK = path.join(ROOT, ".runtime-data", "outbound", "publish.lock");
-
-const key = process.argv[2];
-if (!key) {
-  console.error("usage: watch-and-publish.mjs <claim-key>");
-  process.exit(2);
-}
 
 const POLL_MS = 4000;
 // 上限存在的意义是「绝不无限期占着锁」。到点就放锁并如实记为超时，
@@ -66,8 +72,14 @@ while (true) {
       detail: { run_state: outcome.state, observed_by: "watch-and-publish" },
     });
 
-    const cfg = JSON.parse(fs.readFileSync(path.join(RT, "chain-config.json"), "utf-8"));
-    const mapping = JSON.parse(fs.readFileSync(path.join(RT, "active-mapping.json"), "utf-8"));
+    // 跟出站其余部分共用同一个解析：项目目录里有配置就用它，
+    // 没有就回落到「机器模板 + 登记表那一行」。登记表接入的项目这里没有文件可读。
+    const resolved = resolveProject({ root: ROOT });
+    if (!resolved.ok || !resolved.config) {
+      throw new Error("读不到这个项目的链路配置（" + (resolved.reason ?? resolved.configError?.reason) + "）");
+    }
+    const cfg = resolved.config;
+    const mapping = resolved.mapping;
     const run = scanRuns({ runsDir: RUNS }).find((r) => r.key === key);
 
     // 排空 outbox 前先拿发布锁：会话结束钩子和兜底定时器都会排空同一个 outbox。

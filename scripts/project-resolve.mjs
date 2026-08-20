@@ -30,21 +30,54 @@ export const projectConfigPath = (root) => path.join(root, ".runtime-data", "inb
 export const projectMappingPath = (root) => path.join(root, ".runtime-data", "inbound", "active-mapping.json");
 
 /**
+ * 已消费的消息 id 存哪。
+ *
+ * 登记表接入的项目没有 mapping 文件，而幂等（DUPLICATE_MESSAGE 那道闸）需要一份
+ * 已处理列表。刻意不放进登记表：登记表在每一次会话结束时都会被读，往里面塞一个
+ * 会无限增长的数组，是给一条热路径加负担。
+ */
+export const consumedPath = (root) => path.join(root, ".runtime-data", "inbound", "consumed.json");
+
+export const CONSUMED_MAX = 500;
+
+export function loadConsumed(root) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(consumedPath(root), "utf-8"));
+    return Array.isArray(parsed?.ids) ? parsed.ids.filter((v) => typeof v === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** 只留最近 CONSUMED_MAX 条：幂等只需覆盖时效窗口，无限增长的列表迟早自己变成问题。 */
+export function appendConsumed(root, messageId, { max = CONSUMED_MAX } = {}) {
+  const ids = loadConsumed(root);
+  if (ids.includes(messageId)) return ids;
+  const next = [...ids, messageId].slice(-max);
+  const file = consumedPath(root);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = file + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify({ ids: next }, null, 2) + "\n", { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  return next;
+}
+
+/**
  * 由登记表那一行合成一份 mapping。
  *
  * 字段名和形状跟磁盘上那份**完全一致** —— 读取方拿到哪一种都不用分辨。
- * session_id 恒为 null：入站的多绑定路由还没做，而 evaluateInbound 比的就是这个字段，
- * null 跟任何真实 session 都不相等，所以登记表接进来的项目在入站侧天然是关着的。
- * 这不是遗漏，是这一步刻意只做出站。
+ * 这条是这次能少写两个配置文件的全部原因：读取方看不出区别，就不必为两种存放方式各写一遍。
  */
-export function mappingFromRegistryEntry(entry) {
+export function mappingFromRegistryEntry(entry, { consumed = [] } = {}) {
   return {
     schema_version: "1.0",
     binding_id: entry.id + "@registry",
     status: entry.status ?? "active",
     binding_mode: "aily_session_binding",
 
-    session_id: null,
+    // 绑定完成前是 null —— 跟任何真实 session 都不相等，入站天然关着。
+    // 第二段绑定（Frank 在新话题里 @ 的那一下）把它写进登记表，见 inbound-route.mjs。
+    session_id: entry.session_id ?? null,
     inbound_state: entry.inbound_state ?? "pending",
     pending_token: entry.pending_token ?? null,
 
@@ -54,7 +87,8 @@ export function mappingFromRegistryEntry(entry) {
 
     expires_at: entry.expires_at,
     max_inbound_messages: "unlimited",
-    consumed_message_ids: [],
+    freshness_ms: entry.freshness_ms ?? null,
+    consumed_message_ids: consumed,
 
     created_at: entry.bound_at ?? null,
     _source: "registry",
@@ -94,7 +128,7 @@ export function resolveProject({ root, registryFile, templateFile } = {}) {
     const entry = reg.projects.find((p) => p.root === root);
     // 没有 root_message_id 就等于没接：出站没有话题可回。这是最常见的分支，必须便宜且安静。
     if (!entry || !entry.root_message_id) return { ok: false, reason: "not_bound", root };
-    mapping = mappingFromRegistryEntry(entry);
+    mapping = mappingFromRegistryEntry(entry, { consumed: loadConsumed(root) });
     source = "registry";
     registryEntry = entry; // 显示名留给下面合成 config 用
   }
@@ -121,6 +155,13 @@ export function resolveProject({ root, registryFile, templateFile } = {}) {
         missing: tpl.missing, malformed: tpl.malformed, error: tpl.error,
       };
     }
+  }
+
+  // 授权发送者是**链路级**的，登记表那一行里没有它。evaluateInbound 读的是
+  // mapping.frank_sender_id —— 不补上，登记表接进来的项目会把每一条消息都判成
+  // 「发送者不是授权用户」，而且理由听起来像是真的，最难查的那种。
+  if (mapping && mapping.frank_sender_id === undefined && config?.frank_sender_id !== undefined) {
+    mapping.frank_sender_id = config.frank_sender_id;
   }
 
   return { ok: true, source, root, mapping, config, configError };

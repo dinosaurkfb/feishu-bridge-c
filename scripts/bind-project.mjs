@@ -93,9 +93,9 @@ const token = bindingToken(root);
 const idemKey = idempotencyKeyFor(root);
 const rootText = composeRootMessage({ name, purpose, root, token });
 
-// 入站多绑定路由还没做，这里如实反映。做完之后改成 true，根消息不用动 ——
-// 状态本来就不在根消息里。
-const INBOUND_READY = false;
+// 入站多绑定路由已经做完（inbound-route.mjs），所以这里是 true。
+// 根消息一个字都不用改 —— 状态本来就不在根消息里，这正是当初把它拆出来的理由。
+const INBOUND_READY = true;
 const statusText = composeStatusMessage({ name, inboundReady: INBOUND_READY });
 
 console.log("项目    " + name + "  " + root);

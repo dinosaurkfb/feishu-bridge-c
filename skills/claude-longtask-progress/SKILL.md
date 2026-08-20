@@ -14,10 +14,11 @@ description: 说明在接了飞书桥的项目里干活时，你的回答会被�
 但在登记表里查不到这个目录，就静默退出。想知道接没接：
 
 ```bash
-node /Users/dk/claude-projects/feishu-bridge-cc/scripts/bind-project.mjs
+node /Users/dk/claude-projects/feishu-bridge-cc/scripts/bind-preview.mjs
 ```
 
-已接入会告诉你话题在哪；没接入会打印接入方案（dry-run，不发不写）。
+这条**已经在权限白名单里**，不会弹确认 —— 它只打印，代码层面就发不了任何东西
+（依赖图里没有发送模块，有测试盯着）。已接入的项目会告诉你话题在哪。
 
 ## 把一个新项目接进飞书
 
@@ -26,11 +27,16 @@ node /Users/dk/claude-projects/feishu-bridge-cc/scripts/bind-project.mjs
 而话题是撤不干净的。
 
 ```bash
-node /Users/dk/claude-projects/feishu-bridge-cc/scripts/bind-project.mjs           # 先看
-node /Users/dk/claude-projects/feishu-bridge-cc/scripts/bind-project.mjs --apply   # 再做
+node /Users/dk/claude-projects/feishu-bridge-cc/scripts/bind-preview.mjs           # 先看（免确认）
+node /Users/dk/claude-projects/feishu-bridge-cc/scripts/bind-project.mjs --apply   # 再做（弹确认）
 ```
 
-**先跑 dry-run，把根消息正文给 Frank 看过再 `--apply`。**那条消息发出去就改不了了。
+**先跑预览，把根消息正文给 Frank 看过再 `--apply`。**那条消息发出去就改不了了。
+第二条会弹权限确认，**那是应该的** —— 别把它当故障去绕。
+
+预览要是也跑不了，就把命令交给 Frank 让他自己敲 `! node …`，
+**不要去读源码把根消息「逐字还原」**给他看：还原出来的东西看着像脚本输出，
+其实是你算的，差一个字他就是照着一份假预览点的头。
 
 它做两件事：在群里建一条根话题，往登记表加一行。**项目目录里一个文件都不写** ——
 群、身份、profile 这些是机器级的，装的时候配一次；项目叫什么、干什么从 CLAUDE.md 取
@@ -39,8 +45,10 @@ node /Users/dk/claude-projects/feishu-bridge-cc/scripts/bind-project.mjs --apply
 每个项目一辈子一次；重复跑是安全的（平台侧幂等键挡住重建），会直接告诉你已经接过了。
 
 接完之后**出站立刻可用**，下一轮回答就会发到新话题。
-**入站（在话题里 @M5Claude 给这个项目下指令）还没接通** —— 入站路由目前只认一个项目，
-多绑定改造完成前，在新话题里 @ 是不会有反应的。别跟 Frank 说它通了。
+
+**入站还差最后一下**：让 Frank 去那个新话题里 @ 一下运输 agent（空消息也行），
+绑定才算完成 —— 建话题的那一刻 Aily 的 session 还不存在，它是第一条消息流进来才产生的，
+所以绑定必然分两段。**在他真的 @ 过之前，别说入站通了。**
 
 ## 为什么是原样转发
 

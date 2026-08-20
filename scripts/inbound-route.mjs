@@ -1,0 +1,179 @@
+/**
+ * 入站路由：这条消息属于哪个项目。
+ *
+ * 在这之前 inbound.mjs 是**单绑定写死**的 —— claims、回执、runs、锁、mapping 全挂在
+ * 本仓库的固定路径上，技能里那条命令没有参数。能选对绑定，是因为 mention + session
+ * 两道闸恰好只有一种可能。第二个项目一接进来就会撞。
+ *
+ * 顺序上没有死结：取信封只依赖 daemon 注入的环境变量（envelope.mjs），不读任何项目配置。
+ * 所以可以先拿到 session_id，再决定读谁的配置、投给哪个项目。
+ *
+ * 两件事：
+ *   1. 已绑定的 —— session_id 对上哪个项目的 mapping，就是哪个。
+ *   2. 还没绑的 —— 建话题时 Aily session 还不存在（它是第一条消息流进来才产生的），
+ *      所以绑定必然分两段。第二段就是 Frank 在新话题里 @ 的那一下。
+ */
+
+import fs from "node:fs";
+
+import { loadRegistry, registryPath } from "./registry.mjs";
+import { appendConsumed, loadConsumed, resolveProject } from "./project-resolve.mjs";
+import { extractMentionIds } from "./selector.mjs";
+
+// 幂等列表住在 project-resolve（它是更低层的那个模块），从这里转出去，
+// 免得 inbound.mjs 为了一件事 import 两个模块。
+export { appendConsumed, loadConsumed };
+
+/**
+ * 待绑定的有效期。
+ *
+ * 认领靠「全机同时只有一份待绑定」，这个前提只在窗口有限时才安全 —— 一份忘在那儿
+ * 一个月的待绑定，会把你下一次在**任何没绑定的地方** @ 运输 agent 都算成它的。
+ * 给 24 小时：显式触发下你敲完命令就会去 @，24 小时足够覆盖「明天再说」，
+ * 又不至于让它无限期埋着。过期了重跑一次接入命令即可（话题已在，幂等键保证不会重建）。
+ */
+export const PENDING_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+export const PROMOTE_REJECT = {
+  NO_PENDING: "no_pending_binding",
+  MULTIPLE_PENDING: "multiple_pending_bindings",
+  PENDING_EXPIRED: "pending_binding_expired",
+  SENDER_NOT_FRANK: "sender_not_frank",
+  TRANSPORT_NOT_MENTIONED: "transport_not_mentioned",
+  STALE_MESSAGE: "stale_message",
+  MALFORMED_TEMPLATE: "malformed_template",
+};
+
+export const PROMOTE_REJECT_TEXT = {
+  [PROMOTE_REJECT.NO_PENDING]: "这个话题没有绑定任何项目，也没有等待绑定的项目",
+  [PROMOTE_REJECT.MULTIPLE_PENDING]: "同时有多个项目在等待绑定，认不出该绑哪个",
+  [PROMOTE_REJECT.PENDING_EXPIRED]: "等待绑定已超过 24 小时，需要重新接入",
+  [PROMOTE_REJECT.SENDER_NOT_FRANK]: "发送者不是授权用户",
+  [PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED]: "没有真实 @ 本链路的运输 agent",
+  [PROMOTE_REJECT.STALE_MESSAGE]: "消息超出时效窗口",
+  [PROMOTE_REJECT.MALFORMED_TEMPLATE]: "机器级链路配置不完整",
+};
+
+/** 登记表里每个项目解析一遍。解析不出来的静默跳过 —— 一个项目配坏了不该让别的项目也收不到消息。 */
+export function listBindings({ registryFile, templateFile } = {}) {
+  const reg = loadRegistry(registryFile);
+  if (!reg.ok) return { ok: false, reason: "registry_unreadable", error: reg.error ?? reg.reason, bindings: [] };
+
+  const bindings = [];
+  for (const p of reg.projects) {
+    const r = resolveProject({ root: p.root, registryFile, templateFile });
+    if (!r.ok) continue;
+    bindings.push({ root: p.root, id: p.id, entry: p, config: r.config, mapping: r.mapping, source: r.source });
+  }
+  return { ok: true, bindings };
+}
+
+/**
+ * session_id → 绑定。
+ *
+ * 只认 status === "active" 且 session_id 严格相等。null 跟任何真实 session 都不相等，
+ * 所以还没绑的项目永远不会在这里被选中 —— 它们只能走 promotion 那条路。
+ */
+export function findBindingForSession({ sessionId, registryFile, templateFile } = {}) {
+  if (typeof sessionId !== "string" || !sessionId) return { ok: false, reason: "no_session_id" };
+  const listed = listBindings({ registryFile, templateFile });
+  if (!listed.ok) return { ok: false, reason: listed.reason, error: listed.error };
+
+  const hit = listed.bindings.find(
+    (b) => b.mapping?.status === "active" && b.mapping?.session_id === sessionId,
+  );
+  if (!hit) return { ok: false, reason: "no_binding_for_session", candidates: listed.bindings.length };
+  return { ok: true, ...hit };
+}
+
+const pendingDeadline = (entry) => {
+  const explicit = Date.parse(entry?.pending_expires_at ?? "");
+  if (Number.isFinite(explicit)) return explicit;
+  // 老的登记行没写这个字段，从接入时间推。推不出来就当它已经过期 —— fail-closed：
+  // 一份不知道什么时候建的待绑定，正是不该拿来认领陌生话题的那种。
+  const bound = Date.parse(entry?.bound_at ?? "");
+  return Number.isFinite(bound) ? bound + PENDING_WINDOW_MS : 0;
+};
+
+/** 全机唯一那份待绑定。多于一份就拒 —— 认领靠的就是「只有一份」这个前提。 */
+export function findPendingBinding({ registryFile, templateFile, now = Date.now() } = {}) {
+  const listed = listBindings({ registryFile, templateFile });
+  if (!listed.ok) return { ok: false, reason: listed.reason };
+
+  const pending = listed.bindings.filter(
+    (b) => b.mapping?.inbound_state === "pending" && !b.mapping?.session_id,
+  );
+  if (pending.length === 0) return { ok: false, reason: PROMOTE_REJECT.NO_PENDING };
+  if (pending.length > 1) {
+    return { ok: false, reason: PROMOTE_REJECT.MULTIPLE_PENDING, ids: pending.map((b) => b.id) };
+  }
+
+  const one = pending[0];
+  if (now >= pendingDeadline(one.entry)) {
+    return { ok: false, reason: PROMOTE_REJECT.PENDING_EXPIRED, id: one.id, root: one.root };
+  }
+  return { ok: true, ...one, deadline: pendingDeadline(one.entry) };
+}
+
+/**
+ * 还不知道是哪个项目时能守住的闸，一个不少。
+ *
+ * 三道都来自机器级配置，所以在绑定之前就能判：发送者是不是 Frank、有没有真实 @
+ * 运输 agent、消息新不新。加上「全机只有一份待绑定 + 窗口没过」，fail-closed 成立。
+ */
+export function evaluatePromotion({ event, template, pending, now = Date.now() }) {
+  const reject = (reason, extra = {}) => ({
+    ok: false, reason, reasonText: PROMOTE_REJECT_TEXT[reason] ?? reason, ...extra,
+  });
+
+  const frank = template?.frank_sender_id;
+  const transport = template?.transport_open_id;
+  const freshness = template?.default_freshness_ms;
+  if (typeof frank !== "string" || typeof transport !== "string" ||
+      typeof freshness !== "number" || !Number.isFinite(freshness) || freshness <= 0) {
+    return reject(PROMOTE_REJECT.MALFORMED_TEMPLATE);
+  }
+
+  if (event?.sender_id !== frank) return reject(PROMOTE_REJECT.SENDER_NOT_FRANK);
+  if (!extractMentionIds(event?.content).includes(transport)) {
+    return reject(PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
+  }
+
+  const createdMs = Number(event?.created_at_ms);
+  if (!Number.isFinite(createdMs)) return reject(PROMOTE_REJECT.MALFORMED_TEMPLATE);
+  if (now - createdMs > freshness) return reject(PROMOTE_REJECT.STALE_MESSAGE);
+
+  if (!pending?.ok) return reject(pending?.reason ?? PROMOTE_REJECT.NO_PENDING, { ids: pending?.ids });
+
+  return { ok: true, root: pending.root, id: pending.id };
+}
+
+/**
+ * 把 session_id 写进登记表那一行 —— 绑定的第二段完成。
+ *
+ * 只改这两个字段，其余原样留着。写前留 .prev，和别处一致。
+ */
+export function promoteBinding({ root, sessionId, registryFile = registryPath(), now = Date.now() }) {
+  let reg;
+  try {
+    reg = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
+  } catch (err) {
+    return { ok: false, reason: "registry_unreadable", error: String(err.message).slice(0, 200) };
+  }
+  const entry = (reg.projects ?? []).find((p) => p?.root === root);
+  if (!entry) return { ok: false, reason: "entry_gone" };
+
+  entry.session_id = sessionId;
+  entry.inbound_state = "bound";
+  entry.inbound_bound_at = new Date(now).toISOString();
+
+  try {
+    fs.copyFileSync(registryFile, registryFile + ".prev");
+    const tmp = registryFile + ".tmp." + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, registryFile);
+  } catch (err) {
+    return { ok: false, reason: "registry_unwritable", error: String(err.message).slice(0, 200) };
+  }
+  return { ok: true, root, sessionId };
+}

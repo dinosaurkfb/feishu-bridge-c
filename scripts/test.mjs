@@ -40,6 +40,10 @@ import {
 } from "./bind-compose.mjs";
 import { mappingFromRegistryEntry, resolveProject } from "./project-resolve.mjs";
 import { composeAsk, isInitPrompt } from "./init-hook.mjs";
+import {
+  PENDING_WINDOW_MS, PROMOTE_REJECT, appendConsumed, evaluatePromotion,
+  findBindingForSession, findPendingBinding, loadConsumed, promoteBinding,
+} from "./inbound-route.mjs";
 
 let passed = 0;
 let failed = 0;
@@ -1343,10 +1347,10 @@ test("默认「是」，但答否就不许再问", () => {
   assert.ok(ask.includes("不要再问第二次"));
 });
 
-test("注入的话必须说清入站没通 —— 模型最容易顺口说成「接好了」", () => {
+test("注入的话必须说清入站还差 @ 那一下 —— 模型最容易顺口说成「全接好了」", () => {
   const ask = composeAsk({ cwd: "/tmp/p", bridgeRoot: "/b", chatName: "群" });
-  assert.ok(ask.includes("还没接通"));
-  assert.ok(ask.includes("别说它通了"));
+  assert.ok(ask.includes("@ 一下"));
+  assert.ok(ask.includes("别说入站通了"));
 });
 
 test("拦下了要交出命令，而不是自己还原根消息文案", () => {
@@ -1414,6 +1418,209 @@ test("bind-preview 的代码里不出现任何执行外部命令的手段", () =
 test("对照：bind-project 确实依赖 outbound（否则上面那条测试是空的）", () => {
   const g = [...importGraph("bind-project.mjs")].map((f) => path.basename(f));
   assert.ok(g.includes("outbound.mjs"), "真发那条路径本来就该依赖 outbound");
+});
+
+// ---------- 入站多绑定路由 ----------
+
+function routeFixture(projects) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-route-"));
+  const regFile = path.join(home, "registry.json");
+  const tplFile = path.join(home, "chain-config.json");
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  const entries = projects.map((p) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-p-"));
+    return { id: p.id, root, root_message_id: "om_" + p.id,
+      expires_at: "2099-01-01T00:00:00Z", ...p.extra };
+  });
+  fs.writeFileSync(regFile, JSON.stringify({ projects: entries }));
+  return { regFile, tplFile, entries };
+}
+
+const files = (f) => ({ registryFile: f.regFile, templateFile: f.tplFile });
+
+test("session_id 对上哪个项目就路由到哪个", () => {
+  const f = routeFixture([
+    { id: "a", extra: { session_id: "session_a", inbound_state: "bound" } },
+    { id: "b", extra: { session_id: "session_b", inbound_state: "bound" } },
+  ]);
+  const r = findBindingForSession({ sessionId: "session_b", ...files(f) });
+  assert.equal(r.ok, true);
+  assert.equal(r.id, "b");
+  assert.equal(r.root, f.entries[1].root);
+});
+
+test("认不出的 session → 不路由（绝不退回默认项目）", () => {
+  const f = routeFixture([{ id: "a", extra: { session_id: "session_a", inbound_state: "bound" } }]);
+  const r = findBindingForSession({ sessionId: "session_unknown", ...files(f) });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "no_binding_for_session");
+});
+
+test("还没绑的项目（session_id 为 null）永远不会被 session 路由选中", () => {
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  for (const sid of ["session_x", "null", ""]) {
+    assert.equal(findBindingForSession({ sessionId: sid, ...files(f) }).ok, false, sid);
+  }
+});
+
+test("绑定被停用（status 非 active）→ 不路由", () => {
+  const f = routeFixture([
+    { id: "a", extra: { session_id: "session_a", inbound_state: "bound", status: "closed" } },
+  ]);
+  assert.equal(findBindingForSession({ sessionId: "session_a", ...files(f) }).ok, false);
+});
+
+// ---------- 第二段绑定：@ 一下就完成 ----------
+
+const NOW2 = Date.parse("2026-08-20T12:00:00Z");
+const okEvent = {
+  message_id: "msg_new", session_id: "session_fresh", sender_id: TPL.frank_sender_id,
+  created_at_ms: NOW2 - 3000, content: '<at id="ou_t">T</at>',
+};
+
+const pendingOf = (f, extra = {}) => {
+  const reg = JSON.parse(fs.readFileSync(f.regFile, "utf-8"));
+  reg.projects[0] = { ...reg.projects[0], inbound_state: "pending",
+    bound_at: new Date(NOW2 - 60_000).toISOString(), ...extra };
+  fs.writeFileSync(f.regFile, JSON.stringify(reg));
+  return findPendingBinding({ ...files(f), now: NOW2 });
+};
+
+test("全机唯一那份待绑定 + 授权发送者 + 真实 mention → 放行", () => {
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  const r = evaluatePromotion({ event: okEvent, template: TPL, pending: pendingOf(f), now: NOW2 });
+  assert.equal(r.ok, true);
+  assert.equal(r.id, "a");
+});
+
+test("不是 Frank 发的 → 拒（绑定前这道闸就在）", () => {
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  const r = evaluatePromotion({
+    event: { ...okEvent, sender_id: "9999" }, template: TPL, pending: pendingOf(f), now: NOW2 });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, PROMOTE_REJECT.SENDER_NOT_FRANK);
+});
+
+test("没有真实 <at> → 拒；手打的 @名字 不算", () => {
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  for (const content of ["随便说说", "@T 干活", '<at id="ou_other">别人</at>']) {
+    const r = evaluatePromotion({
+      event: { ...okEvent, content }, template: TPL, pending: pendingOf(f), now: NOW2 });
+    assert.equal(r.reason, PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED, content);
+  }
+});
+
+test("消息太旧 → 拒，防重放", () => {
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  const r = evaluatePromotion({
+    event: { ...okEvent, created_at_ms: NOW2 - 60 * 60 * 1000 },
+    template: TPL, pending: pendingOf(f), now: NOW2 });
+  assert.equal(r.reason, PROMOTE_REJECT.STALE_MESSAGE);
+});
+
+test("没有待绑定 → 拒，不去乱认一个项目", () => {
+  const f = routeFixture([{ id: "a", extra: { session_id: "session_a", inbound_state: "bound" } }]);
+  const r = evaluatePromotion({
+    event: okEvent, template: TPL, pending: findPendingBinding({ ...files(f), now: NOW2 }), now: NOW2 });
+  assert.equal(r.reason, PROMOTE_REJECT.NO_PENDING);
+});
+
+test("同时有两份待绑定 → 拒。认领靠的就是「只有一份」这个前提", () => {
+  const f = routeFixture([{ id: "a", extra: {} }, { id: "b", extra: {} }]);
+  const reg = JSON.parse(fs.readFileSync(f.regFile, "utf-8"));
+  for (const p of reg.projects) { p.inbound_state = "pending"; p.bound_at = new Date(NOW2 - 60_000).toISOString(); }
+  fs.writeFileSync(f.regFile, JSON.stringify(reg));
+  const pending = findPendingBinding({ ...files(f), now: NOW2 });
+  assert.equal(pending.reason, PROMOTE_REJECT.MULTIPLE_PENDING);
+  const r = evaluatePromotion({ event: okEvent, template: TPL, pending, now: NOW2 });
+  assert.equal(r.reason, PROMOTE_REJECT.MULTIPLE_PENDING);
+});
+
+test("待绑定超过 24 小时 → 过期，重新接入", () => {
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  const pending = pendingOf(f, { bound_at: new Date(NOW2 - PENDING_WINDOW_MS - 1000).toISOString() });
+  assert.equal(pending.reason, PROMOTE_REJECT.PENDING_EXPIRED);
+});
+
+test("待绑定连接入时间都没有 → 当成已过期（fail-closed）", () => {
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  const pending = pendingOf(f, { bound_at: undefined });
+  assert.equal(pending.reason, PROMOTE_REJECT.PENDING_EXPIRED);
+});
+
+test("机器级配置不全 → 拒，绝不因为「反正是 Frank」放行", () => {
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  const pending = pendingOf(f);
+  for (const bad of [{ frank_sender_id: undefined }, { transport_open_id: undefined },
+                     { default_freshness_ms: "900000" }, { default_freshness_ms: true }]) {
+    const r = evaluatePromotion({ event: okEvent, template: { ...TPL, ...bad }, pending, now: NOW2 });
+    assert.equal(r.reason, PROMOTE_REJECT.MALFORMED_TEMPLATE, JSON.stringify(bad));
+  }
+  assert.equal(evaluatePromotion({ event: okEvent, template: null, pending, now: NOW2 }).reason,
+    PROMOTE_REJECT.MALFORMED_TEMPLATE);
+});
+
+test("绑定写回登记表之后，同一个 session 就能被路由到了", () => {
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  pendingOf(f);
+  assert.equal(findBindingForSession({ sessionId: "session_fresh", ...files(f) }).ok, false);
+
+  const w = promoteBinding({ root: f.entries[0].root, sessionId: "session_fresh", registryFile: f.regFile });
+  assert.equal(w.ok, true);
+
+  const r = findBindingForSession({ sessionId: "session_fresh", ...files(f) });
+  assert.equal(r.ok, true);
+  assert.equal(r.id, "a");
+  assert.equal(r.mapping.inbound_state, "bound");
+  // 绑完就不再是待绑定，下一个新项目才认得出自己是唯一那份
+  assert.equal(findPendingBinding({ ...files(f), now: NOW2 }).reason, PROMOTE_REJECT.NO_PENDING);
+});
+
+test("绑定写回不会碰到别的字段", () => {
+  const f = routeFixture([{ id: "a", extra: { name: "我的项目", purpose: "干这个的" } }]);
+  promoteBinding({ root: f.entries[0].root, sessionId: "session_fresh", registryFile: f.regFile });
+  const reg = JSON.parse(fs.readFileSync(f.regFile, "utf-8"));
+  assert.equal(reg.projects[0].name, "我的项目");
+  assert.equal(reg.projects[0].purpose, "干这个的");
+  assert.equal(reg.projects[0].root_message_id, "om_a");
+});
+
+// ---------- 幂等：登记表接入的项目也得有已消费列表 ----------
+
+test("已消费列表：去重、有上限、读得回来", () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-consumed-"));
+  assert.deepEqual(loadConsumed(d), []);
+  appendConsumed(d, "msg_1");
+  appendConsumed(d, "msg_1");
+  appendConsumed(d, "msg_2");
+  assert.deepEqual(loadConsumed(d), ["msg_1", "msg_2"]);
+  for (let i = 0; i < 12; i += 1) appendConsumed(d, "m" + i, { max: 5 });
+  assert.equal(loadConsumed(d).length, 5);
+  assert.ok(loadConsumed(d).includes("m11"), "留下的该是最近的");
+});
+
+test("登记表接入的 mapping 必须带上授权发送者 —— 否则每条消息都被判成发错人", () => {
+  const f = routeFixture([{ id: "a", extra: { session_id: "session_a", inbound_state: "bound" } }]);
+  const r = findBindingForSession({ sessionId: "session_a", ...files(f) });
+  assert.equal(r.mapping.frank_sender_id, TPL.frank_sender_id);
+  const v = evaluateInbound({
+    event: { message_id: "msg_ok", session_id: "session_a", sender_id: TPL.frank_sender_id,
+             created_at_ms: Date.now(), content: '<at id="ou_t">T</at> 干活' },
+    mapping: r.mapping, config: r.config, now: Date.now() });
+  assert.equal(v.decision, "accept", "理由：" + (v.reasonText ?? ""));
+  assert.equal(v.instruction, "干活");
+});
+
+test("已消费列表会进 mapping —— 幂等那道闸才拦得住重复消息", () => {
+  const f = routeFixture([{ id: "a", extra: { session_id: "session_a", inbound_state: "bound" } }]);
+  appendConsumed(f.entries[0].root, "msg_seen");
+  const r = findBindingForSession({ sessionId: "session_a", ...files(f) });
+  assert.deepEqual(r.mapping.consumed_message_ids, ["msg_seen"]);
+  const v = evaluateInbound({
+    event: { message_id: "msg_seen", session_id: "session_a", sender_id: TPL.frank_sender_id,
+             created_at_ms: Date.now(), content: '<at id="ou_t">T</at> 再来一次' },
+    mapping: r.mapping, config: r.config, now: Date.now() });
+  assert.equal(v.reason, REJECT.DUPLICATE_MESSAGE);
 });
 
 // ---------- 汇总 ----------

@@ -72,7 +72,8 @@ Codex 适配具备本地合成与隔离安装证据；具体机器是否已经�
 
 ```
 话题里 mention 入站智能体（前缀可选）
-  → scripts/inbound.mjs 取信封（只靠环境变量，不读项目配置）
+  → scripts/inbound.mjs 先校验「调用我的是不是配置里那个运输 agent」
+  → 取信封（只靠 daemon 注入的环境变量，不读项目配置）
   → session_id 去所有登记项目里找绑定
        ├ 对上了 → 那个项目
        └ 没对上 → 待绑定认领（新话题的第一次 @ 就是在走这条）
@@ -110,11 +111,16 @@ tail ~/.claude/feishu-bridge/stop-hook.log   # 出站钩子每次干了什么
 ## 装 / 卸
 
 ```bash
-node scripts/install-outbound.mjs --apply              # Stop 钩子 + 登记表 + 技能 + launchd
+node scripts/install-outbound.mjs --apply              # 装五样，见下
 node scripts/install-outbound.mjs --uninstall --apply
 ```
 
-dry-run 默认，幂等。往 `~/.claude/settings.json` 的 Stop 数组**追加**（先备份，不动已有的）。
+装五样：**Stop 钩子**（每轮回答自动发回话题）、**UserPromptSubmit 钩子**（`/init` 时
+问一句要不要接飞书）、**`bind-preview` 的权限白名单**、**项目登记表 + 全局技能**、
+**launchd 兜底定时器**。
+
+dry-run 默认，幂等。往 `~/.claude/settings.json` 的两个钩子数组**分别追加**
+（先备份，不动已有的 —— 认脚本路径做幂等，装两遍也只有一条）。
 
 ## 代理（这台机器上的两个坑）
 
@@ -143,11 +149,11 @@ scripts/
   共用   project-resolve（从哪读配置）/ registry / binding / binding-health
   codex/ 精确 thread 状态、绑定、hooks、handoff、watcher、自动发布与人工恢复
 skills/        Claude / Codex 的入站与长期任务技能源
-references/    配置模板（chain-config / active-mapping）
+references/    机器级链路模板的样例（唯一需要手填的那份配置）
 .runtime-data/ 身份、绑定、claim、回执、outbox 队列。禁止提交
 
 ~/.claude/feishu-bridge/
-  chain-config.json   机器级链路模板（群、两个身份、profile、授权发送者）
+  chain-config.json   机器级链路模板（群、智能体身份、profile、授权发送者）
   registry.json       项目登记表 —— 接入产生的那一行就写在这里
 
 ~/.codex/feishu-bridge/

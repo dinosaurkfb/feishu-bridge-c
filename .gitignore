@@ -1,3 +1,6 @@
 .runtime-data/
 node_modules/
 *.log
+
+# 个人草稿，不进版本管理
+drafts/

@@ -1,4 +1,49 @@
-# feishu-bridge-cc
+# feishu-bridge
+
+把飞书话题和本机长期 AI 任务接起来。Claude Code 与 Codex 共用 envelope、selector、
+claim、outbox 和飞书发布器；各自只保留运行时相关的会话发现、hooks 和续接逻辑。
+
+| 你使用的运行时 | 从这里开始 |
+|---|---|
+| Codex Desktop/CLI | **[CODEX_SETUP.md](CODEX_SETUP.md)** |
+| Claude Code | **[SETUP.md](SETUP.md)** |
+
+两套 runtime 共仓维护，但安装入口、状态目录和技能互相独立。新用户只安装自己使用的那一套，
+不要同时照着两份搭建文档执行。
+
+## Codex adapter
+
+Codex 与 Claude 的关键差异已经隔离在 `scripts/codex/`：
+
+- 单一 M5Codex 同时负责入站运输和出站发布，模板校验拒绝双身份配置；
+- selector 只要求绑定话题中的真实 `@M5Codex`，mention 后正文直接作为指令；
+- 一个飞书话题绑定一个精确 `codex_thread_id`，同一仓库允许多个 task；
+- 禁止 `--last`，运行中的 Desktop turn 通过 hook lease fail-closed 为 busy；
+- 入站用 detached `codex exec resume <精确 UUID> --json` 秒级返回；
+- 后台回合会持久化到原 task；已经打开的 Desktop 页面可能要切换 task 或重新打开后才刷新；
+- Stop 以 `thread + turn/claim` 事件键原样入队，相同正文的不同轮次不会互相去重；
+- Codex locator、claim、receipt 和 outbox 全在 `~/.codex/feishu-bridge/`，不进入工作树；
+- 已绑定 task 每轮自动发布：本地回合由 Stop 发送，飞书入站回合须等严格 watcher 确认终局；
+- 发送失败留在 outbox 后续重试，升级前历史积压不会被自动补发，人工 drain 仍逐次授权；
+- Codex 官方 `/init` 仍只负责生成 `AGENTS.md`；hook 仅要求初始化成功后询问是否接入，
+  不在 `/init` 本轮自动建飞书话题；
+- 安装后提供 `$feishu-bind`、`$feishu-unbind`、`$feishu-status` 三项技能命令，
+  它们也会出现在斜杠菜单中，且均只作用于当前精确 task。
+
+新用户先运行：
+
+```bash
+npm test                         # Claude + Codex 全套本地回归
+npm run doctor:codex             # Codex 机器级只读自检
+npm run install:codex:preview    # Codex 安装预览；默认不写
+```
+
+具体机器是否已经安装不能从仓库推断。doctor 全绿只证明本机组件齐全；首次接入仍需用一条
+新的飞书 mention 验证精确 task、严格终局和原话题回写。
+
+---
+
+## Claude Code 基线
 
 把飞书话题和本机的 Claude Code 长期任务接起来，双向，**一个群里可以接多个项目**。
 
@@ -13,7 +58,7 @@
 **接一个新项目**：在项目目录里敲 `/init`，它会问你要不要建话题（默认「是」），
 你答应后再去新话题 @ 一下就完事 —— 不用建话题、不用写配置。
 
-> 搭建步骤看 **[SETUP.md](SETUP.md)**。现场状态、已知未解和踩过的坑看 **[STATE.md](STATE.md)**。
+> 搭建步骤看 **[SETUP.md](SETUP.md)**。Claude 现场状态、已知未解和踩过的坑看 **[STATE.md](STATE.md)**。
 
 ---
 
@@ -108,13 +153,19 @@ scripts/
   出站   outbox / drain-outbox / outbound / stop-hook / watch-and-publish
   接入   init-hook / bind-preview / bind-project / bind-compose / chain-template
   共用   project-resolve（从哪读配置）/ registry / binding / binding-health
-skills/        两个方向各一份技能源
+  codex/ 精确 thread 状态、绑定、hooks、handoff、watcher、自动发布与人工恢复
+skills/        Claude / Codex 的入站与长期任务技能源
 references/    机器级链路模板的样例（唯一需要手填的那份配置）
 .runtime-data/ 身份、绑定、claim、回执、outbox 队列。禁止提交
 
 ~/.claude/feishu-bridge/
   chain-config.json   机器级链路模板（群、智能体身份、profile、授权发送者）
   registry.json       项目登记表 —— 接入产生的那一行就写在这里
+
+~/.codex/feishu-bridge/
+  chain-config.json   Codex 单 M5Codex 机器级模板
+  registry.json       task 登记表；同一 root 可有多个精确 thread
+  tasks/              task 级 claim、receipt、run 和 outbox（全部在 Git 外）
 ```
 
 ## 设计上不肯让步的几条

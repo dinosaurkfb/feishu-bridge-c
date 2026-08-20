@@ -40,8 +40,8 @@ export const KIND_LABEL = {
 /** 单条消息的字数上限。截断会丢信息，但整条发不出去丢得更多。 */
 export const MAX_REPLY_CHARS = 4000;
 
-/** 一条进展一个文件：追加是原子的（写临时文件再 rename），排空时逐条标记。 */
-export function appendEvent({ outboxDir, kind, text, source }) {
+/** 一条进展一个文件：先完整写临时文件，再原子提交最终目录项；排空时逐条标记。 */
+export function appendEvent({ outboxDir, kind, text, source, eventKey, publishEligible = false }) {
   if (!KINDS.includes(kind)) {
     return { ok: false, reason: "unknown_kind", allowed: KINDS };
   }
@@ -50,25 +50,54 @@ export function appendEvent({ outboxDir, kind, text, source }) {
 
   fs.mkdirSync(outboxDir, { recursive: true, mode: 0o700 });
 
-  // 内容指纹做去重：同一条进展被重复记录不应重复打扰 Frank。
-  const fingerprint = createHash("sha256").update(kind + "\n" + body).digest("hex").slice(0, 16);
+  // 有稳定事件键时按事件去重。Stop 钩子的正确身份是「哪条 thread 的哪一轮」，
+  // 不是「正文刚好写了什么」：两轮合法答复完全相同，第二轮仍然必须发；同一轮钩子
+  // 重入，则绝不能发两遍。没有事件键的旧调用方继续按内容判重，保持原行为。
+  const normalizedEventKey = typeof eventKey === "string" && eventKey.trim()
+    ? eventKey.trim()
+    : null;
+  const fingerprintInput = normalizedEventKey === null
+    // 保持升级前的算法，已有 outbox 文件名继续参与去重，不制造一次性重复。
+    ? kind + "\n" + body
+    : "event\n" + normalizedEventKey;
+  const fingerprint = createHash("sha256").update(fingerprintInput).digest("hex").slice(0, 16);
   const existing = fs.readdirSync(outboxDir).filter((f) => f.includes(fingerprint));
   if (existing.length > 0) return { ok: false, reason: "duplicate", fingerprint };
 
-  const id = Date.now() + "-" + fingerprint;
+  // 稳定事件键使用确定性文件名，并通过 hard-link 的 EEXIST 取得原子写入权。
+  // Stop hook 与 watcher 可能并发到达；单纯 readdir 后 rename 是 check-then-act，两个进程
+  // 都可能判定“不重复”。旧调用方继续使用时间前缀，避免改变 Claude 现有文件布局。
+  const id = normalizedEventKey === null ? Date.now() + "-" + fingerprint : "event-" + fingerprint;
   const file = path.join(outboxDir, id + ".json");
   const tmp = file + ".tmp." + randomUUID();
+  const createdAt = new Date().toISOString();
   fs.writeFileSync(tmp, JSON.stringify({
     schema_version: "1.0",
     artifact_type: "codex_feishu_bridge_event",
     zone: "work",
     classification: "internal",
     id, kind, text: body,
+    event_key: normalizedEventKey,
     source: source ?? "unknown",
-    created_at: new Date().toISOString(),
+    created_at: createdAt,
+    // Codex 自动发布只消费显式取得发布资格的事件。升级前积压的 outbox、以及尚未经过
+    // 严格终局确认的入站答复都没有这个标记，不能因为下一轮 Stop 就被顺带发出去。
+    publish_eligible_at: publishEligible === true ? createdAt : null,
     published_at: null,
   }, null, 2) + "\n", { mode: 0o600 });
-  fs.renameSync(tmp, file);
+  if (normalizedEventKey === null) {
+    fs.renameSync(tmp, file);
+  } else {
+    try {
+      // tmp 已完整落盘；link 要么原子创建最终目录项，要么以 EEXIST 明确输掉竞态。
+      fs.linkSync(tmp, file);
+    } catch (err) {
+      fs.rmSync(tmp, { force: true });
+      if (err.code === "EEXIST") return { ok: false, reason: "duplicate", fingerprint };
+      throw err;
+    }
+    fs.rmSync(tmp, { force: true });
+  }
   return { ok: true, id, file };
 }
 
@@ -83,7 +112,9 @@ export function listPending({ outboxDir }) {
   for (const f of files.sort()) {
     try {
       const rec = JSON.parse(fs.readFileSync(path.join(outboxDir, f), "utf-8"));
-      if (rec.published_at === null) out.push({ ...rec, _file: path.join(outboxDir, f) });
+      if (rec.published_at === null && !rec.publish_suppressed_at) {
+        out.push({ ...rec, _file: path.join(outboxDir, f) });
+      }
     } catch {
       /* 半截文件：下轮再说，不当失败 */
     }
@@ -97,6 +128,69 @@ export function markSent(rec, messageId) {
   const tmp = rec._file + ".tmp." + randomUUID();
   fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
   fs.renameSync(tmp, rec._file);
+}
+
+/**
+ * 在严格终局确认后，把一个既有事件提升为自动发布候选。
+ *
+ * Codex 入站回合的 Stop 可能先于 watcher 到达；Stop 只负责保存原文，只有 watcher 同时
+ * 观察到目标 thread、turn.completed、exit 0 和非空最终输出后才调用这里。按 event key
+ * 找而不是按文件名猜，重复调用幂等，已发布事件也不会被复活。
+ */
+export function markPublishEligibleByEventKey({ outboxDir, eventKey }) {
+  if (typeof eventKey !== "string" || !eventKey.trim()) return { ok: false, reason: "no_event_key" };
+  let files;
+  try {
+    files = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json"));
+  } catch {
+    return { ok: false, reason: "event_not_found" };
+  }
+  for (const name of files) {
+    const file = path.join(outboxDir, name);
+    let rec;
+    try { rec = JSON.parse(fs.readFileSync(file, "utf-8")); } catch { continue; }
+    if (rec.event_key !== eventKey) continue;
+    if (rec.published_at !== null) return { ok: true, changed: false, reason: "already_published", record: rec };
+    if (typeof rec.publish_eligible_at === "string" && rec.publish_eligible_at) {
+      return { ok: true, changed: false, reason: "already_eligible", record: { ...rec, _file: file } };
+    }
+    const next = { ...rec, publish_eligible_at: new Date().toISOString() };
+    const tmp = file + ".tmp." + randomUUID();
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return { ok: true, changed: true, record: { ...next, _file: file } };
+  }
+  return { ok: false, reason: "event_not_found" };
+}
+
+/** 保留原始事件作审计，但把严格终局失败对应的半成品答复移出所有发布队列。 */
+export function suppressPublishByEventKey({ outboxDir, eventKey, reason }) {
+  if (typeof eventKey !== "string" || !eventKey.trim()) return { ok: false, reason: "no_event_key" };
+  let files;
+  try {
+    files = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json"));
+  } catch {
+    return { ok: false, reason: "event_not_found" };
+  }
+  for (const name of files) {
+    const file = path.join(outboxDir, name);
+    let rec;
+    try { rec = JSON.parse(fs.readFileSync(file, "utf-8")); } catch { continue; }
+    if (rec.event_key !== eventKey) continue;
+    if (rec.published_at !== null) return { ok: false, reason: "already_published" };
+    if (rec.publish_suppressed_at) return { ok: true, changed: false, reason: "already_suppressed" };
+    const next = {
+      ...rec,
+      publish_eligible_at: null,
+      publish_suppressed_at: new Date().toISOString(),
+      publish_suppressed_reason: String(reason ?? "strict_terminal_failure").slice(0, 200),
+    };
+    const tmp = file + ".tmp." + randomUUID();
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return { ok: true, changed: true };
+  }
+  return { ok: false, reason: "event_not_found" };
 }
 
 /**

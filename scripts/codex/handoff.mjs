@@ -76,7 +76,17 @@ export function handOffCodex({
   };
 }
 
-export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, expectedThreadId }) {
+export function classifyRunnerDiagnostic(stderr) {
+  const text = String(stderr ?? "").toLowerCase();
+  if (text.includes("not inside a trusted directory") && text.includes("skip-git-repo-check")) {
+    return "git_repository_required";
+  }
+  if (text.includes("session") && text.includes("not found")) return "session_not_found";
+  if (text.includes("hook") && text.includes("trust")) return "hook_trust_required";
+  return null;
+}
+
+export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, errPath, expectedThreadId }) {
   let raw = "";
   try { raw = fs.readFileSync(logPath, "utf-8"); } catch { /* runner 可能刚启动 */ }
 
@@ -106,11 +116,26 @@ export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, expect
   if (!exit) return { state: "running", observedThreadId, turnStarted, turnCompleted };
 
   if (invalidJsonLines > 0) return { state: "failed", reason: "invalid_jsonl", invalidJsonLines };
-  if (threadMismatch || observedThreadId !== expectedThreadId) {
+  // 只有真实观察到另一个 thread 才叫 mismatch。CLI 在前置检查阶段退出时根本没有
+  // thread.started；把 null 当成另一个 thread 会掩盖真正的启动错误。
+  if (threadMismatch || (observedThreadId !== null && observedThreadId !== expectedThreadId)) {
     return { state: "failed", reason: "thread_mismatch", observedThreadId, expectedThreadId };
   }
+  if (exit.status === "spawn_failed") {
+    return { state: "failed", reason: "runner_spawn_failed" };
+  }
   if (turnFailed) return { state: "failed", reason: "turn_failed" };
-  if (exit.exit_code !== 0) return { state: "failed", reason: "nonzero_exit", exitCode: exit.exit_code };
+  if (exit.exit_code !== 0) {
+    let stderr = "";
+    try { stderr = fs.readFileSync(errPath, "utf-8").slice(-4000); } catch { /* 没有 stderr */ }
+    return {
+      state: "failed",
+      reason: observedThreadId === null ? "runner_preflight_failed" : "nonzero_exit",
+      exitCode: exit.exit_code,
+      diagnostic: classifyRunnerDiagnostic(stderr),
+    };
+  }
+  if (observedThreadId === null) return { state: "failed", reason: "thread_started_missing" };
   if (!turnStarted) return { state: "failed", reason: "turn_started_missing" };
   if (!turnCompleted) return { state: "failed", reason: "turn_completed_missing" };
 

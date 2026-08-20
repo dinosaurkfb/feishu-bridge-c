@@ -50,7 +50,7 @@ const REASON_TEXT = {
 function ackText(kind, detail) {
   if (kind === "accepted") return [
     "已受理 · " + detail.taskName,
-    "已投递到绑定的 Codex task。完成后答复会进入本地待发布队列。",
+    "已投递到绑定的 Codex task。严格确认完成后会自动回复到本话题；失败会发送风险回执。",
     "消息 " + detail.messageId.slice(-8) + " | claim " + detail.key.slice(0, 8),
   ].join("\n");
   if (kind === "bound") return [

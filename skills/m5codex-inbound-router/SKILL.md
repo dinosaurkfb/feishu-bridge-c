@@ -22,6 +22,6 @@ claim 和精确 Codex thread 校验。它秒级返回“受理 / 拒绝 / 系统
 - Aily 的 Codex 运行时会使用隔离 `CODEX_HOME`，不得删除命令里的 `FEISHU_CODEX_BRIDGE_HOME`。
 - 脚本判拒后不得重试、找补或改成手工投递。
 - 不得构造事件 JSON，不得使用 `codex exec resume --last`，不得改 registry、claim 或 receipt。
-- “已受理”不等于“已完成”。最终答复由目标 Codex Stop hook 进入本地 outbox。
+- “已受理”不等于“已完成”。本地 Stop 只保存入站答复；严格 watcher 确认终局后才自动回写。
 - 不得主动扫描、轮询飞书或建立持续监听。
 - 只有 Frank 明确要求诊断时才能加 `--dry-run`；正常消息不得使用。

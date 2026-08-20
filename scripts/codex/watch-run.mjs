@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/** 一次性本地 watcher：确认 Codex run 终局、兜底入队、释放 task 锁；不发送飞书。 */
+/** 一次性 watcher：确认 Codex run 终局、兜底入队、按发布合同处理并释放 task 锁。 */
 
 import { recordClaimState } from "../claim.mjs";
 import { releaseSessionLock } from "../handoff.mjs";
@@ -32,6 +32,7 @@ const paths = taskPaths(task, home);
 const run = {
   logPath: paths.runs + "/" + key + ".jsonl",
   exitPath: paths.runs + "/" + key + ".exit.json",
+  errPath: paths.runs + "/" + key + ".stderr.log",
   lastMessagePath: paths.runs + "/" + key + ".last-message.txt",
 };
 const eventKey = "codex:" + task.codex_thread_id + ":claim:" + key + ":reply";
@@ -39,6 +40,15 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const started = Date.now();
 const MAX_WAIT_MS = 4 * 60 * 60 * 1000;
 let releaseLock = true;
+
+const failureLabel = (outcome) => {
+  const diagnostic = {
+    git_repository_required: "工作目录未通过 Codex Git 仓库检查",
+    session_not_found: "Codex 找不到绑定的 session",
+    hook_trust_required: "Codex hook 尚未取得信任",
+  }[outcome.diagnostic];
+  return diagnostic ? outcome.reason + "：" + diagnostic : outcome.reason;
+};
 
 try {
   while (Date.now() - started <= MAX_WAIT_MS) {
@@ -77,16 +87,22 @@ try {
 
     // Stop 可能已经保存了一段未通过严格终局校验的答复；保留证据但永久移出发布队列。
     suppressPublishByEventKey({ outboxDir: paths.outbox, eventKey, reason: outcome.reason });
+    const reasonText = failureLabel(outcome);
     appendEvent({
       outboxDir: paths.outbox,
       kind: "risk",
-      text: task.task_display_name + " 的飞书指令执行失败（" + outcome.reason + "），任务没有完成。",
+      text: task.task_display_name + " 的飞书指令执行失败（" + reasonText + "），任务没有完成。",
       source: "codex-run-watcher",
       eventKey: "codex:" + task.codex_thread_id + ":claim:" + key + ":failure",
       publishEligible: task.auto_publish_on_completion === true,
     });
     publishEligibleTaskEvents({ task, home });
-    recordClaimState({ claimsDir: paths.claims, key, state: "failed", detail: { run_state: outcome.state, reason: outcome.reason } });
+    recordClaimState({
+      claimsDir: paths.claims,
+      key,
+      state: "failed",
+      detail: { run_state: outcome.state, reason: outcome.reason, diagnostic: outcome.diagnostic ?? null },
+    });
     process.exitCode = 1;
     break;
   }

@@ -42,7 +42,10 @@ const err = fs.openSync(errPath, "a");
 const prompt = fs.readFileSync(instructionFile);
 
 const child = spawn(codexBin, [
-  "exec", "resume", "--json", "--output-last-message", lastMessagePath, threadId, "-",
+  // task.root 来自用户明确确认后写入的精确绑定，可能是包含多个仓库的 Codex workspace，
+  // 不一定自身带 .git。这里只跳过 Git 仓库前置检查，不改变 sandbox 或 approval 权限。
+  "exec", "resume", "--skip-git-repo-check", "--json",
+  "--output-last-message", lastMessagePath, threadId, "-",
 ], {
   cwd: projectDir,
   env: process.env,

@@ -12,7 +12,7 @@ import {
 } from "../outbox.mjs";
 import { evaluateInbound, REJECT } from "../selector.mjs";
 import { composeCodexBinding, validThreadId } from "./bind-compose.mjs";
-import { readCodexRunOutcome } from "./handoff.mjs";
+import { classifyRunnerDiagnostic, readCodexRunOutcome } from "./handoff.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
 import {
   classifyFeishuPrompt, composeAilyInboundContext, composeBindingContext, composeInitContext,
@@ -473,10 +473,31 @@ test("Codex runner 观察到不同 thread 时严格失败", () => {
     "thread_mismatch");
 });
 
+test("Codex 启动前 Git 预检失败不会误报 thread_mismatch", () => {
+  const dir = temp();
+  const logPath = path.join(dir, "run.jsonl");
+  const exitPath = path.join(dir, "exit.json");
+  const errPath = path.join(dir, "stderr.log");
+  const lastMessagePath = path.join(dir, "last.txt");
+  fs.writeFileSync(logPath, "");
+  fs.writeFileSync(exitPath, JSON.stringify({ status: "failed", exit_code: 1 }));
+  fs.writeFileSync(errPath,
+    "Not inside a trusted directory and --skip-git-repo-check was not specified.\n");
+  const result = readCodexRunOutcome({
+    logPath, exitPath, errPath, lastMessagePath, expectedThreadId: THREAD_A,
+  });
+  assert.equal(result.state, "failed");
+  assert.equal(result.reason, "runner_preflight_failed");
+  assert.equal(result.diagnostic, "git_repository_required");
+  assert.equal(classifyRunnerDiagnostic("secret token abc"), null,
+    "未知 stderr 不应进入飞书风险回执");
+});
+
 test("run-resume 用精确 UUID、stdin prompt 和 last-message 形成可观察终局", () => {
   const dir = temp();
   const fake = path.join(dir, "fake-codex.sh");
   fs.writeFileSync(fake, `#!/bin/sh
+printf '%s\\n' "$@" > "$ARGS_OUT"
 last=""
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--output-last-message" ]; then last="$2"; shift 2; else shift; fi
@@ -492,13 +513,19 @@ printf '%s' "$prompt" > "$last"
   const stderr = path.join(dir, "stderr.log");
   const last = path.join(dir, "last.txt");
   const exit = path.join(dir, "exit.json");
+  const argsOut = path.join(dir, "args.txt");
   fs.writeFileSync(instruction, "精确投递");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "run-resume.mjs"),
     "--thread-id", THREAD_A, "--project", dir, "--instruction-file", instruction,
     "--log", log, "--stderr", stderr, "--last-message", last, "--exit-receipt", exit,
     "--codex-bin", fake,
-  ], { encoding: "utf-8", env: { ...process.env, EXPECTED_THREAD: THREAD_A } });
+  ], { encoding: "utf-8", env: { ...process.env, EXPECTED_THREAD: THREAD_A, ARGS_OUT: argsOut } });
   assert.equal(r.status, 0, r.stderr);
+  const args = fs.readFileSync(argsOut, "utf-8").trim().split("\n");
+  assert.deepEqual(args.slice(0, 5), ["exec", "resume", "--skip-git-repo-check", "--json",
+    "--output-last-message"]);
+  assert.equal(args.includes(THREAD_A), true);
+  assert.equal(args.at(-1), "-");
   assert.equal(fs.readFileSync(last, "utf-8"), "精确投递");
   assert.equal(JSON.parse(fs.readFileSync(exit, "utf-8")).exit_code, 0);
   assert.equal(readCodexRunOutcome({ logPath: log, exitPath: exit, lastMessagePath: last,
@@ -570,6 +597,34 @@ test("关闭自动发布时 watcher 只把严格完成的最终答复兜底入�
   ], { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(listPending({ outboxDir: paths.outbox }).length, 1);
+  assert.equal(fs.existsSync(paths.sessionLock), false);
+});
+
+test("watcher 对启动前 Git 预检失败给出真实且脱敏的风险回执", () => {
+  const home = temp();
+  const root = path.join(home, "workspace");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = false;
+  writeRegistry([task], path.join(home, "registry.json"));
+  const paths = taskPaths(task, home);
+  fs.mkdirSync(paths.runs, { recursive: true });
+  fs.mkdirSync(paths.claims, { recursive: true });
+  fs.mkdirSync(paths.sessionLock, { recursive: true });
+  const key = "b".repeat(64);
+  fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), "");
+  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"),
+    JSON.stringify({ status: "failed", exit_code: 1 }));
+  fs.writeFileSync(path.join(paths.runs, key + ".stderr.log"),
+    "Not inside a trusted directory and --skip-git-repo-check was not specified. secret-token\n");
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
+    "--claim-key", key, "--task-key", task.logical_task_key,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.equal(r.status, 1, r.stderr);
+  const pending = listPending({ outboxDir: paths.outbox });
+  assert.equal(pending.length, 1);
+  assert.match(pending[0].text, /runner_preflight_failed：工作目录未通过 Codex Git 仓库检查/u);
+  assert.equal(pending[0].text.includes("secret-token"), false);
   assert.equal(fs.existsSync(paths.sessionLock), false);
 });
 

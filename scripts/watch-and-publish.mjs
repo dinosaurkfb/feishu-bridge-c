@@ -19,6 +19,7 @@ import { listPending, markSent, composeDigest } from "./outbox.mjs";
 import { recordClaimState } from "./claim.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
+import { resolveLarkIdentity } from "./chain-template.mjs";
 
 const SELF = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 
@@ -104,12 +105,15 @@ while (true) {
 
       if (parts.length > 0) {
         try {
+          // 身份从配置推，跟主出站路径走同一个解析；发之前 publishDraft 会校验凭据归属。
+          const ident = resolveLarkIdentity(cfg);
           const mid = publishDraft({
-            profile: cfg.lark_cli_profile,
+            profile: ident.profile,
             rootMessageId: mapping.feishu_root_message_id_reference,
             text: parts.join("\n\n———\n\n"),
-            larkBin: cfg.lark_cli_bin,
-            larkHome: cfg.lark_cli_home,
+            larkBin: ident.bin,
+            larkHome: ident.configDir,
+            expectedAppId: ident.expectedAppId,
           });
           // 只有真的发出去了才标记。顺序无所谓，但两者都必须在成功之后。
           if (run?.shouldPublish) markPublished({ runsDir: RUNS, key, messageId: mid });

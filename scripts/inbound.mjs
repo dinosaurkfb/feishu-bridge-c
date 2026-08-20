@@ -105,6 +105,42 @@ function finish(kind, detail, result) {
 
 // ---------- 主流程 ----------
 
+// 第 0 道闸：调用我的这个 agent，是不是配置里那个运输 agent。
+//
+// 入站技能装在 ~/.claude/skills/，本机每一个 Claude 会话都看得见它 —— 包括另外十几个
+// aily agent。任何一个跑了这个脚本，它会去取**那个 agent 自己的**事件，然后拿本机的
+// 绑定来判。挡住它的一直是 mention 那道闸（别的 agent 收到的消息 @ 的是它自己），
+// 但那是巧合性的安全，不是设计出来的 —— open_id 按 app 隔离得很微妙，
+// 把安全建在「碰巧不相等」上，迟早会碰上相等的那天。
+//
+// 这道闸必须在取信封**之前**，而且只能用**机器级模板**：项目配置要等路由之后才知道读哪份，
+// 而路由要靠信封。用项目配置就成了循环。
+const bootTpl = loadChainTemplate();
+if (!bootTpl.ok) {
+  writeReceipt("no-template-" + Date.now(), {
+    status: "error", reason: "chain_template_unusable", template_reason: bootTpl.reason,
+    missing: bootTpl.missing ?? null, malformed: bootTpl.malformed ?? null,
+    claim_acquired: false, handed_off: false,
+  });
+  finish("error", {
+    detail: "这台机器的链路模板不可用（" + bootTpl.reason + "）—— 先跑 init-chain-template.mjs",
+  }, { reason: "chain_template_unusable" });
+}
+
+const callerAgent = process.env.AILY_CLI_CALLER_AGENT_UID;
+if (callerAgent !== bootTpl.template.agent_uid) {
+  writeReceipt("wrong-agent-" + Date.now(), {
+    status: "rejected", reason: "caller_agent_mismatch",
+    caller_agent_uid: callerAgent ?? null,
+    expected_agent_uid: bootTpl.template.agent_uid,
+    claim_acquired: false, handed_off: false,
+  });
+  finish("rejected", {
+    reasonText: "调用方不是本链路的运输 agent（收到 " + (callerAgent ?? "空") + "）",
+    taskName: null,
+  }, { reason: "caller_agent_mismatch" });
+}
+
 const fetched = fetchTriggerEvent();
 if (!fetched.ok) {
   writeReceipt("envelope-" + fetched.reason + "-" + Date.now(), {

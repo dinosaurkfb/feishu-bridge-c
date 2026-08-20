@@ -18,6 +18,7 @@ import { listPending, markSent, composeDigest } from "./outbox.mjs";
 import { publishDraft } from "./outbound.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
+import { resolveLarkIdentity } from "./chain-template.mjs";
 import { isLockStale } from "./handoff.mjs";
 
 export const outboxDirOf = (root) => path.join(root, ".runtime-data", "outbound", "outbox");
@@ -85,12 +86,15 @@ export function drainProject({ root, dryRun = false, timeoutMs } = {}) {
     const text = composeDigest(pending, { taskName: cfg.task_display_name });
     if (dryRun) return { status: "dry_run", root, count: pending.length, text };
 
+    // 身份从配置推，不在这里认死任何一个 agent；发之前 publishDraft 会校验凭据归属。
+    const id = resolveLarkIdentity(cfg);
     const messageId = publishDraft({
-      profile: cfg.lark_cli_profile,
+      profile: id.profile,
       rootMessageId: mapping.feishu_root_message_id_reference,
       text,
-      larkBin: cfg.lark_cli_bin,
-      larkHome: cfg.lark_cli_home,
+      larkBin: id.bin,
+      larkHome: id.configDir,
+      expectedAppId: id.expectedAppId,
       timeoutMs,
     });
     for (const r of pending) markSent(r, messageId);

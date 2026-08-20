@@ -32,7 +32,8 @@ import {
 } from "./live-session.mjs";
 import { extractReply } from "./stop-hook.mjs";
 import {
-  CHAIN_FIELDS, materializeProjectConfig, validateChainTemplate,
+  CHAIN_FIELDS, assertPublishIdentity, materializeProjectConfig,
+  resolveLarkIdentity, validateChainTemplate,
 } from "./chain-template.mjs";
 import {
   PURPOSE_MAX, bindingToken, composeRootMessage, composeStatusMessage,
@@ -1636,6 +1637,139 @@ test("出站传的是 LARKSUITE_CLI_CONFIG_DIR，不是那个不存在的 LARKSU
   // 两个发送入口都得钉住身份：只钉一个，另一个就会在 agent 的清洗环境里拿错身份。
   assert.equal((code.match(/LARKSUITE_CLI_CONFIG_DIR/g) ?? []).length, 2);
   assert.equal((code.match(/LARKSUITE_CLI_PROFILE/g) ?? []).length, 2);
+});
+
+// ---------- 身份解析与凭据归属校验 ----------
+
+const TPL2 = { ...TPL, agent_uid: "agent_x1", lark_cli_config_base: "/base",
+  transport_app_id: "cli_transport", outbound_app_id: "cli_outbound" };
+
+test("双智能体：凭据目录用 lark_cli_home，不去碰 agent 私有目录", () => {
+  const id = resolveLarkIdentity(TPL2);
+  assert.equal(id.singleAgent, false);
+  assert.equal(id.configDir, TPL2.lark_cli_home);
+  assert.equal(id.expectedAppId, "cli_outbound");
+});
+
+test("单智能体：凭据目录 = 基路径 + agent_uid，从配置推不另加开关", () => {
+  const id = resolveLarkIdentity({ ...TPL2, outbound_app_id: "cli_transport" });
+  assert.equal(id.singleAgent, true);
+  assert.equal(id.configDir, path.join("/base", "agent_x1"));
+});
+
+test("基路径没配时用默认，不至于算出一个以 undefined 结尾的路径", () => {
+  const { lark_cli_config_base, ...noBase } = TPL2;
+  const id = resolveLarkIdentity({ ...noBase, outbound_app_id: "cli_transport" });
+  assert.ok(id.configDir.endsWith("agent_x1"));
+  assert.ok(!id.configDir.includes("undefined"));
+});
+
+function credDir(apps) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-cred-"));
+  fs.writeFileSync(path.join(d, "config.json"), JSON.stringify({ apps }));
+  return d;
+}
+
+test("凭据目录里就是配置说的那个应用 → 放行", () => {
+  const d = credDir([{ name: "platform-bot", appId: "cli_me" }]);
+  const r = assertPublishIdentity({ configDir: d, profile: "platform-bot", expectedAppId: "cli_me" });
+  assert.equal(r.ok, true);
+});
+
+test("凭据目录属于另一个应用 → 拒绝，一个字都不发", () => {
+  const d = credDir([{ name: "platform-bot", appId: "cli_someone_else" }]);
+  const r = assertPublishIdentity({ configDir: d, profile: "platform-bot", expectedAppId: "cli_me" });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "app_id_mismatch");
+});
+
+test("目录不存在（aily 被卸载/清理）→ 拒绝，且原因要说得让人看懂", () => {
+  const r = assertPublishIdentity({ configDir: "/nope/nope", profile: "p", expectedAppId: "cli_me" });
+  assert.equal(r.reason, "config_dir_unreadable");
+});
+
+test("目录里没有那个 profile → 拒绝，并列出它到底有哪些", () => {
+  const d = credDir([{ name: "别的", appId: "cli_x" }, { name: "还有别的", appId: "cli_y" }]);
+  const r = assertPublishIdentity({ configDir: d, profile: "platform-bot", expectedAppId: "cli_me" });
+  assert.equal(r.reason, "profile_not_found");
+  assert.deepEqual(r.have, ["别的", "还有别的"]);
+});
+
+test("只有一个无名 app 时按它算 —— 普通 lark-cli home 第一个就是这样", () => {
+  const d = credDir([{ appId: "cli_me" }]);
+  assert.equal(assertPublishIdentity({ configDir: d, profile: "任意", expectedAppId: "cli_me" }).ok, true);
+});
+
+// ---------- 形状与前后一致 ----------
+
+test("app id 不是 cli_ 开头 → 判配错（交叉校验要靠它当依据）", () => {
+  assert.ok(validateChainTemplate({ ...TPL, transport_app_id: "aaf8be" }).malformed
+    .includes("transport_app_id"));
+  assert.ok(validateChainTemplate({ ...TPL, outbound_app_id: "notcli_x" }).malformed
+    .includes("outbound_app_id"));
+});
+
+test("agent_uid 不是 agent_ 开头 → 判配错（它现在是凭据目录的推导依据）", () => {
+  const v = validateChainTemplate({ ...TPL, agent_uid: "4ks11dv8f0mxwbd" });
+  assert.ok(v.malformed.includes("agent_uid"));
+});
+
+test("frank_sender_id 必须是纯数字 —— 抄成飞书 ou_ 会被当场挡下", () => {
+  assert.ok(validateChainTemplate({ ...TPL, frank_sender_id: "ou_1f48a7f7fcb9" }).malformed.includes("frank_sender_id"));
+  assert.ok(validateChainTemplate({ ...TPL, frank_sender_id: 762102 }).malformed.includes("frank_sender_id"));
+  assert.ok(validateChainTemplate({ ...TPL, frank_sender_id: "7621020633916345545" }).ok);
+});
+
+test("单智能体但两个 open_id 不一致 → 判前后矛盾，不让它变成装饰字段", () => {
+  const v = validateChainTemplate({
+    ...TPL, transport_app_id: "cli_same", outbound_app_id: "cli_same",
+    transport_open_id: "ou_a", outbound_open_id: "ou_b",
+  });
+  assert.equal(v.ok, false);
+  assert.equal(v.inconsistent.length, 1);
+});
+
+test("可选字段缺了不算错，填了就得填对", () => {
+  assert.ok(validateChainTemplate(TPL).ok, "没有 lark_cli_config_base 也该通过");
+  assert.ok(validateChainTemplate({ ...TPL, lark_cli_config_base: "相对路径" }).malformed
+    .includes("lark_cli_config_base"));
+});
+
+// ---------- 入站第 0 道闸 ----------
+
+test("入站脚本在取信封之前就校验调用方 agent", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "inbound.mjs"), "utf-8");
+  const gate = src.indexOf("caller_agent_mismatch");
+  const fetch = src.indexOf("fetchTriggerEvent()");
+  assert.ok(gate > 0 && fetch > 0);
+  assert.ok(gate < fetch, "调用方校验必须排在取信封之前，否则已经替别的 agent 取过事件了");
+});
+
+test("这道闸只能用机器级模板 —— 用项目配置会变成循环", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "inbound.mjs"), "utf-8");
+  const gate = src.indexOf("callerAgent !== bootTpl.template.agent_uid");
+  assert.ok(gate > 0, "比对的必须是模板里的 agent_uid");
+  // 找**调用点**，不是 import 那一行 —— import 永远排在最前面，拿它比等于没比。
+  const route = src.indexOf("findBindingForSession({ sessionId");
+  assert.ok(route > 0 && gate < route, "必须在路由之前");
+});
+
+// ---------- 链路级字段以模板为准 ----------
+
+test("项目文件里的链路级字段被模板压过去 —— 免得同机两个身份并存", () => {
+  const { proj, regFile, tplFile } = bindFixture();
+  const rt = path.join(proj, ".runtime-data", "inbound");
+  fs.mkdirSync(rt, { recursive: true });
+  fs.writeFileSync(path.join(rt, "active-mapping.json"),
+    JSON.stringify({ status: "active", expires_at: "2099-01-01T00:00:00Z", feishu_root_message_id_reference: "om_x" }));
+  fs.writeFileSync(path.join(rt, "chain-config.json"), JSON.stringify({
+    lark_cli_profile: "老身份", outbound_agent_name: "老名字",
+    task_display_name: "项目自己的显示名",
+  }));
+  const r = resolveProject({ root: proj, registryFile: regFile, templateFile: tplFile });
+  assert.equal(r.source, "project-files");
+  assert.equal(r.config.lark_cli_profile, TPL.lark_cli_profile, "链路级字段该来自模板");
+  assert.equal(r.config.task_display_name, "项目自己的显示名", "项目级字段该保留");
 });
 
 // ---------- 汇总 ----------

@@ -4,8 +4,9 @@
 
 **读之前先知道两件事：**
 
-1. **有些步骤代码替代不了。**飞书侧的两个智能体、话题、绑定授权，都得人工建。
-   安装器只能装本机那部分。全文用 🔧 标出「必须人工做」的步骤。
+1. **有些步骤代码替代不了。**飞书侧那个智能体、群，得人工建；机器级模板得人工填。
+   其余（话题、项目配置、绑定）全部自动。全文用 🔧 标出「必须人工做」的步骤 ——
+   一共只有三步。
 2. **每一步都有验证方法。**这条链路的失败大多是安静的 —— 装错了不会报错，
    只会在某天你发消息时没反应。所以每步做完都验一下，别攒到最后。
 
@@ -37,77 +38,110 @@
 | lark-cli | 有一个专属 profile 且已授权 | `lark-cli auth status` |
 | 网络 | 国内需要能到 `api.anthropic.com` 的代理 | 见 README 的「代理」一节 |
 
-### 🔧 飞书侧：两个智能体，职责必须分开
+### 🔧 飞书侧：一个智能体就够（推荐）
 
-这是最容易搞错的地方 —— **不能用同一个身份既收又发**。
+**入站**必须是一个 **claude-code-local adapter** 类型的 Aily 智能体 —— 它要在本机拉起
+Claude 会话。这一个是硬性的。
 
-| | 干什么 | 为什么必须独立 |
-|---|---|---|
-| **入站运输**（例：M5Claude） | 把话题里的消息转进本机。它**只做运输**，不判断、不发布 | 它是唯一能触发本机执行的入口，权限面要尽量小 |
-| **出站发布**（例：COO助理CC） | 把结果和进展发回话题 | 让运输方也能发布，等于把两个方向的职责搅在一起；出问题时分不清是谁说的 |
+**出站**只需要「一个能往群里发消息的飞书应用」，**不必是 Aily 智能体**。而最省事的
+选择就是：**用入站那个智能体自己**。
 
-入站那个必须是 **claude-code-local adapter** 类型的智能体（它要在本机拉起 Claude 会话）。
+它的凭据在 `~/.aily-cli/lark-cli/<agent_uid>/`（appId 在配置文件里，密钥在 macOS
+钥匙串里），普通进程读得到，所以本机的出站发布器可以直接借用。这样：
 
-**如果同一个群里要跑多条链路**（比如同时接 Claude 和 Codex），互斥靠 **mention 对象**
-和**根话题**两者精确匹配 —— 各用各的智能体、各占一个话题，就不会串。
+- **飞书侧只用建一个智能体**，接入门槛少一半
+- **话题里只有一个头像** —— 你 @ 谁、谁回你、谁给你结果，是同一个
 
-正文前缀（如 `→Claude`）是**可选的第三重**。对路由而言它是冗余的：能走到前缀这一步，
-消息已经过了绑定有效、话题正确、发送者正确、真实 mention 四道闸，而路由靠的是话题。
-**默认建议关掉**（`inbound_prefix: null`），少打字。
+**为什么以前是两个**：只是当初图省事，借了一个现成的应用来发消息。从「谁在说话」
+的角度看，那两个身份背后本来就是同一个本地 Claude，分成两个反而拧。
+
+**要用两个也支持**（比如你想让发布方权限更小、或者出站要复用一个已有的应用）：
+第 3 步把出站三项填成另一个应用即可，代码一行不用改。
+
+**同一个群里跑多条链路**（比如同时接 Claude 和 Codex）：互斥靠 **mention 对象**
+和**根话题**两者精确匹配 —— 各用各的智能体、各占各的话题，不会串。
+
+正文前缀（如 `→Claude`）是**可选的第三重**，对路由而言冗余。**默认建议关掉**
+（`inbound_prefix: null`），少打字。
 
 ---
 
 ## 三、搭建步骤
 
-分两段：**装一次机器**，然后**每个项目两下**。
+分两段：**装一次机器**（下面五步），然后**每个项目两下**（见第四节）。
 
-第一次装完之后，接一个新项目不需要再碰这一节里的任何东西 —— 直接跳到「四、接一个新项目」。
+顺序不能打乱，而且这一版才排对。上一版把机器级模板放在第 5 步、从一个已配好的项目
+里派生，结果是个死循环 —— 入站要用模板里的 `agent_uid` 校验调用方，而模板要等项目
+配置写完才有，可项目配置又排在「验证入站能通」之后。**机器级的东西不该由任何一个
+项目产生。**
 
 ---
 
-### 1. 🔧 建第一个话题
+### 1. 🔧 建群，拿 chat_id
 
-在群里发一条消息作为**根话题**，说明这个话题是干什么的。之后所有指令都回复在它下面。
-
-记下它的 `message_id`（形如 `om_...`）：
+在飞书建一个群（或用现成的），把两边的智能体拉进去。
 
 ```bash
-lark-cli im +chat-search --query "你的群名" --as bot --json   # 拿 chat_id
-lark-cli im +chat-messages-list --chat-id <oc_...> --json | head
+lark-cli im +chat-search --query "你的群名" --as bot --json
 ```
 
-> 只有**第一个**项目要手动建话题。之后每个新项目的话题由 `bind-project.mjs` 自动建。
+记下 `chat_id`（`oc_...`）。
 
-**验证**：话题能正常回复。
+> **不用手建话题。**每个项目的根话题由 `bind-project.mjs` 自动建 —— 包括第一个。
 
-### 2. 🔧 配置入站智能体
+### 2. 🔧 建入站智能体，拿三个 id
 
-在飞书 Aily 平台上给入站智能体写指令，告诉它：收到消息时执行本仓库的
-`scripts/inbound.mjs`，并把输出原样回复。
+在飞书 Aily 平台上建一个 **claude-code-local adapter** 类型的智能体（它要在本机拉起
+Claude 会话）。记下三样：
 
-本仓库 `skills/m5claude-inbound-router/SKILL.md` 是这段指令的底稿，可以直接照抄，
-**但要把里面的绝对路径改成你的仓库位置**。
+- `agent_uid`（`agent_...`）—— Aily 的 agent 标识
+- `transport_app_id`（`cli_...`）—— 它背后的飞书应用
+- `transport_open_id`（`ou_...`）—— **必须是「这个 app 自己视角下」的 open_id**。
+  open_id 按 app 隔离，从别的 app 查到的那个不能用（同一个机器人在不同 app 眼里
+  是不同的 `ou_`，这里错了入站会全线不通）。
 
-同一份技能也要放进本机的 `~/.claude/skills/m5claude-inbound-router/` ——
-`aily-cli skill scan-local` 应当能把它列为 `[claude-code-local]`。
+给它写指令：收到消息时执行本仓库的 `scripts/inbound.mjs`，把输出原样回复。
+`skills/m5claude-inbound-router/SKILL.md` 是底稿，**把里面的绝对路径改成你的仓库位置**。
+同一份也放进本机 `~/.claude/skills/m5claude-inbound-router/`。
 
-**验证**：在话题里 `<mention 入站智能体> 测试`，应当秒级收到「已受理」或明确的拒绝原因。
-**收不到任何回复**说明这一步没通 —— 不要往下走。
+### 3. 写机器级链路模板
 
-### 3. 装本机的机制
+**这是本机第一件要配的事**，后面所有东西都从它来。
+
+```bash
+node scripts/init-chain-template.mjs \
+  --agent-uid agent_xxx \
+  --transport-app-id cli_xxx --transport-open-id ou_xxx \
+  --outbound-agent-name 你的智能体名 \
+  --outbound-app-id cli_xxx --outbound-open-id ou_xxx \
+  --frank-sender-id 7621... \
+  --chat-id oc_xxx --chat-name "群名" \
+  --transport-agent-name 你的智能体名 --chain claude --apply
+```
+
+**单智能体（推荐）**：出站三项填成跟运输那三项一样的值。校验会确认它们真的一致，
+凭据从 `<lark_cli_config_base>/<agent_uid>/` 取，话题里只出现一个头像。
+
+**双智能体**：出站填另一个飞书应用，`--lark-cli-profile` 指向它在 `~/.lark-cli` 里的
+profile 名。
+
+不带 `--apply` 先跑一次，15 个字段应当全是 ✓。
+
+> ⚠️ **`frank_sender_id` 是整条链上唯一一个「填错了会静默扩大授权」的字段。**
+> 它是 **Aily 平台的 user id**，不是飞书的 `ou_`。填成 `ou_` 会被形状校验挡下（全拒，
+> 你立刻发现）；但**填成另一个人的 Aily user id，形状完全合法，而后果是那个人从此
+> 能驱动你机器上的长期任务，且没有任何提示**。这一条只能靠抄对，代码救不了。
+
+### 4. 装本机的机制
 
 ```bash
 node scripts/install-outbound.mjs          # dry-run，先看会改什么
 node scripts/install-outbound.mjs --apply
 ```
 
-它装五样，**都只追加、改前备份**：
-
-- `~/.claude/settings.json` 的 **Stop 钩子** —— 每轮回答自动发回话题
-- 同一份 settings 的 **UserPromptSubmit 钩子** —— `/init` 时问一句要不要接飞书
-- **权限白名单**一条：放行 `bind-preview.mjs`（它只打印，依赖图里没有发送代码）
-- **项目登记表** `~/.claude/feishu-bridge/registry.json`
-- **全局技能** + **launchd 兜底定时器**（每 30 分钟排空全部登记项目）
+它装五样，**都只追加、改前备份**：Stop 钩子（每轮回答自动发回话题）、
+UserPromptSubmit 钩子（`/init` 时问一句要不要接飞书）、`bind-preview` 的权限白名单、
+项目登记表 + 全局技能、launchd 兜底定时器。
 
 **验证**：
 
@@ -117,57 +151,28 @@ node -e 'const s=require(require("os").homedir()+"/.claude/settings.json");
 launchctl list | grep feishu
 ```
 
-两个钩子数组里都应当**既有你原来的钩子，也有新加的那条**。
+两个数组里都应当**既有你原来的钩子，也有新加的那条**。
 
-### 4. 🔧 写第一个项目的身份配置
+### 5. 接第一个项目
 
-```bash
-mkdir -p .runtime-data/inbound
-cp references/chain-config.example.json .runtime-data/inbound/chain-config.json
-cp references/active-mapping.example.json .runtime-data/inbound/active-mapping.json
-```
-
-按注释逐项替换。最容易错的两项：
-
-- **`transport_open_id`** 必须是「那个 app 自己视角下」的 open_id。open_id 按 app 隔离，
-  从别的 app 查到的不能用。
-- **`lark_cli_bin` / `lark_cli_home`** 必须写绝对路径。发布器是在 aily agent 的清洗环境里
-  被拉起的，那里 lark-cli 被重定向到按 agent 隔离的配置目录 —— 靠环境里「恰好是什么」
-  会拿到错误的身份。
-
-`session_id` 从入站的调试输出里取：`node scripts/inbound.mjs --dry-run`。
-
-**验证**：`node scripts/binding.mjs` 应当打印出绑定 id、有效期、剩余天数、话题、根消息。
-
-### 5. 生成机器级链路模板
-
-**这一步是「装一次机器」和「每个项目两下」的分界线。**
-
-上一步那份配置里，绝大多数字段是**链路级**的 —— 运输身份、发布身份、profile、
-授权发送者、群 id、时效窗口，每个项目都一样。把它们提取到机器级模板，
-以后新项目就不必再写一遍：
+第一个项目**和后面每个项目走完全一样的路** —— 不用手写配置，不用手建话题：
 
 ```bash
-node scripts/init-chain-template.mjs --chat-id <oc_...> --apply
+cd 你的项目目录
+node <本仓库>/scripts/bind-preview.mjs    # 看文案
+node <本仓库>/scripts/bind-project.mjs --apply
 ```
 
-它只挑白名单里的 15 个字段，屏显一律打码。
+然后去新建的那个话题里 @ 一下入站智能体（空消息也行），入站绑定完成。
 
-**验证**：不带 `--apply` 再跑一次，15 个字段应当全是 ✓。
+**这一步之前要先在项目目录起一个 Claude 会话**并跟它说清楚它是这个项目的长期任务 ——
+入站在没有可续对话时会明确拒绝（`no_prior_session`）而不是兜底。走 `/init` 的话
+天然满足（`/init` 本身就是一轮对话）。
 
-### 6. 🔧 起长期任务会话
+### 6. 端到端验证
 
-**这一步不能省。**入站在没有可续对话时会明确拒绝（`no_prior_session`）而不是兜底。
-
-在项目目录里开一个 Claude 会话，跟它说清楚它是这个项目的长期任务。
-之后这个目录就有「最近一次对话」可续了。
-
-### 7. 端到端验证
-
-从飞书发一条真实指令。预期：
-
-1. **秒级**收到「已受理」，并说明落到哪条线（现场会话 / 后台起一轮）
-2. 活干完后，回答**原样**发回话题
+从飞书发一条真实指令。预期：**秒级**收到「已受理」并说明落到哪条线；活干完后回答
+**原样**发回话题。
 
 ```bash
 node scripts/outbox.mjs --list                     # 还有多少没发出去
@@ -242,11 +247,10 @@ node scripts/binding.mjs --project ~/x --renew 1y --apply
 
 | 位置 | 改什么 |
 |---|---|
-| `~/.claude/feishu-bridge/chain-config.json` | 机器级链路模板：两个智能体、profile、群 id、授权发送者 |
-| `.runtime-data/inbound/*.json` | 第一个项目的身份和绑定（不在版本管理里，必须自己建） |
+| `~/.claude/feishu-bridge/chain-config.json` | 机器级链路模板：智能体、profile、群 id、授权发送者。**唯一必须手配的东西** |
 | `skills/*/SKILL.md` | 里面写死了本仓库的绝对路径 |
-| 飞书平台侧 | 两个智能体、话题 |
-| 出站 profile | `lark_cli_profile` 要与别人的链路区分开 |
+| 飞书平台侧 | 一个 claude-code-local 智能体（话题由 bind-project 自动建） |
+| 出站 profile | 单智能体下是 `platform-bot`；双智能体下要与别人的链路区分开 |
 
 `scripts/` 下的代码本身是可移植的（用 `os.homedir()` 和脚本自身位置解析）。
 
@@ -264,7 +268,10 @@ node scripts/binding.mjs --project ~/x --renew 1y --apply
 5. `node scripts/binding.mjs` —— 绑定是不是过期了
 6. `tail ~/.claude/feishu-bridge/stop-hook.log` —— 出站钩子每次的结果
 7. `node scripts/bind-preview.mjs --project ~/x` —— 这个项目接没接、话题在哪
-8. `node scripts/test.mjs` —— 217 项本地回归，零外部副作用
+8. 出站报「凭据目录属于另一个应用」→ `agent_uid` 指错了 agent，**没有发出任何消息**
+9. 出站报「读不到出站凭据目录」→ aily-cli 被卸载或清理过。注意**这不影响入站**，
+   所以症状会是「它突然不说话了」，而你发指令还有回应
+10. `node scripts/test.mjs` —— 234 项本地回归，零外部副作用
 
 **一条经验**：判断入站是否健康，不能只看「发消息有没有回复」。
 入站智能体是个被反复 resume 的持久会话，技能坏了它也可能凭记忆把命令跑出来。

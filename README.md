@@ -64,7 +64,7 @@ node scripts/bind-project.mjs --project ~/x --apply  # 接进来（建话题 + �
 node scripts/binding.mjs [--project ~/x]     # 看绑定：有效期、剩余天数、话题
 node scripts/binding.mjs --renew 1y --apply  # 续期
 node scripts/outbox.mjs --list               # 还有多少进展没发出去
-node scripts/test.mjs                        # 217 项本地回归，零外部副作用
+node scripts/test.mjs                        # 234 项本地回归，零外部副作用
 tail ~/.claude/feishu-bridge/stop-hook.log   # 出站钩子每次干了什么
 ```
 

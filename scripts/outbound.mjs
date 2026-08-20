@@ -10,6 +10,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
+
 import { execFileSync } from "node:child_process";
 
 import { readRunOutcome } from "./handoff.mjs";
@@ -112,12 +114,28 @@ function truncate(s, n) {
 }
 
 /**
- * 经 COO助理CC 把草稿发布到绑定的根话题。
+ * 两个发送入口共用的前置校验。**发之前**确认凭据属于配置说的那个应用。
  *
- * 身份边界：出站只用 COO助理CC（lark-cli profile `claude`），绝不借用 M5Claude 的身份 ——
- * M5Claude 是入站运输层，让它发布进展会把两个方向的职责搅在一起。
+ * 放在这里而不是各写一遍：只钉一个入口，另一个照样会用错的身份发出去，
+ * 而已经发出去的消息是撤不干净的。
  */
-export function publishDraft({ profile, rootMessageId, text, larkBin, larkHome, timeoutMs }) {
+function preflight({ configDir, profile, expectedAppId }) {
+  // 没给 expectedAppId 就是调用方没打算校验（老配置、测试）—— 不强求；但给了就必须过。
+  if (!expectedAppId) return;
+  const r = assertPublishIdentity({ configDir, profile, expectedAppId });
+  if (!r.ok) throw new Error(identityErrorText(r));
+}
+
+/**
+ * 把草稿发布到绑定的根话题。
+ *
+ * 用谁的身份由配置决定（见 chain-template 的 resolveLarkIdentity），代码不认死任何一个：
+ * 单智能体方案下就是运输那个 agent 自己，双智能体方案下是一个独立的发布身份。
+ * 无论哪种，发之前都会校验「手上这份凭据确实属于配置说的那个应用」。
+ */
+export function publishDraft({ profile, rootMessageId, text, larkBin, larkHome, expectedAppId, timeoutMs }) {
+  preflight({ configDir: larkHome, profile, expectedAppId });
+
   // 必须显式指定二进制和配置目录：守望者是在 M5Claude 的清洗环境里被拉起的，
   // 那里 lark-cli 被重定向到按 agent 隔离的配置目录（只有 platform-bot），
   // 靠环境里“恰好是什么”会拿到错误的身份，实测就是这么发布失败的。
@@ -156,7 +174,9 @@ export function publishDraft({ profile, rootMessageId, text, larkBin, larkHome, 
  * idempotencyKey 由调用方按项目绝对路径算，去重发生在**平台侧**：
  * 本地锁挡不住「消息发出去了、配置没写成」这种崩溃，平台侧幂等挡得住。
  */
-export function sendToChat({ profile, chatId, text, idempotencyKey, larkBin, larkHome, timeoutMs }) {
+export function sendToChat({ profile, chatId, text, idempotencyKey, larkBin, larkHome, expectedAppId, timeoutMs }) {
+  preflight({ configDir: larkHome, profile, expectedAppId });
+
   const args = ["im", "+messages-send", "--chat-id", chatId, "--as", "bot", "--text", text, "--json"];
   if (idempotencyKey) args.push("--idempotency-key", idempotencyKey);
 

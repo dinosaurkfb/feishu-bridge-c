@@ -20,7 +20,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { loadChainTemplate } from "./chain-template.mjs";
+import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { registryPath } from "./registry.mjs";
 import { publishDraft, sendToChat } from "./outbound.mjs";
 import {
@@ -111,9 +111,11 @@ if (!apply) {
 // 1. 建话题。失败就什么都不写 —— 干净重来，不留半个状态。
 let rootMessageId;
 try {
+  const id = resolveLarkIdentity(template);
   rootMessageId = sendToChat({
-    profile: template.lark_cli_profile, chatId: template.chat_id, text: rootText,
-    idempotencyKey: idemKey, larkBin: template.lark_cli_bin, larkHome: template.lark_cli_home,
+    profile: id.profile, chatId: template.chat_id, text: rootText,
+    idempotencyKey: idemKey, larkBin: id.bin, larkHome: id.configDir,
+    expectedAppId: id.expectedAppId,
   });
 } catch (err) {
   die("建话题失败，没有写任何文件：" + err.message);
@@ -141,9 +143,10 @@ console.log("已登记        " + regFile + "  （现在 " + registry.projects.l
 // 3. 发状态回复。走 publishDraft，也就是出站平时走的那条路径 —— 它到了话题里，
 //    出站就是真的通了，不是我说通了。
 try {
+  const id2 = resolveLarkIdentity(template);
   const statusId = publishDraft({
-    profile: template.lark_cli_profile, rootMessageId, text: statusText,
-    larkBin: template.lark_cli_bin, larkHome: template.lark_cli_home,
+    profile: id2.profile, rootMessageId, text: statusText,
+    larkBin: id2.bin, larkHome: id2.configDir, expectedAppId: id2.expectedAppId,
   });
   console.log("状态已发布    " + statusId);
 } catch (err) {

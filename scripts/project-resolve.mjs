@@ -20,9 +20,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { loadChainTemplate } from "./chain-template.mjs";
+import { CHAIN_FIELDS, OPTIONAL_CHAIN_FIELDS, loadChainTemplate, materializeProjectConfig } from "./chain-template.mjs";
 import { loadRegistry } from "./registry.mjs";
-import { materializeProjectConfig } from "./chain-template.mjs";
 
 const readJson = (p) => JSON.parse(fs.readFileSync(p, "utf-8"));
 
@@ -140,6 +139,19 @@ export function resolveProject({ root, registryFile, templateFile } = {}) {
   if (fs.existsSync(cfgPath)) {
     try {
       config = readJson(cfgPath);
+      // **链路级字段一律以机器模板为准**，哪怕项目文件里也有一份。
+      //
+      // 那些字段（运输/发布身份、profile、群 id、授权发送者）本来就是整条链路共用的，
+      // 项目文件里的只是历史留下的副本。不让模板压过去，就会出现「新接的项目用新身份、
+      // 老项目还用旧身份」这种同机不一致 —— 而且它不会报错，只会让话题里出现两个头像。
+      // 没有模板时（老装法）项目文件仍然独自够用。
+      const tpl = loadChainTemplate(templateFile);
+      if (tpl.ok) {
+        for (const f of CHAIN_FIELDS) config[f] = tpl.template[f];
+        for (const f of OPTIONAL_CHAIN_FIELDS) {
+          if (tpl.template[f] !== undefined) config[f] = tpl.template[f];
+        }
+      }
     } catch (err) {
       configError = { reason: "config_unreadable", error: String(err.message).slice(0, 200) };
     }

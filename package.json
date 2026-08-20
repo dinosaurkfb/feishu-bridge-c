@@ -1,0 +1,16 @@
+{
+  "name": "feishu-bridge",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Connect Feishu topics to long-running Claude Code and Codex tasks.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node scripts/test.mjs && node scripts/codex/test.mjs",
+    "test:claude": "node scripts/test.mjs",
+    "test:codex": "node scripts/codex/test.mjs",
+    "doctor:codex": "node scripts/codex/doctor.mjs",
+    "install:codex:preview": "node scripts/codex/install.mjs"
+  }
+}

@@ -817,5 +817,52 @@ test("绑定预览为同一 thread 生成稳定逻辑键与平台幂等键", () 
   assert.equal(a.statusText.includes("运输 agent"), false);
 });
 
+test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
+  const dir = temp();
+  const bin = path.join(dir, "bin");
+  const home = path.join(dir, "bridge-home");
+  const codexHome = path.join(dir, "codex-home");
+  fs.mkdirSync(bin, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(path.join(codexHome, "skills"), { recursive: true });
+  for (const name of ["codex", "aily-cli", "lark-cli"]) {
+    fs.writeFileSync(path.join(bin, name), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  }
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({
+    ...TEMPLATE,
+    lark_cli_bin: path.join(bin, "lark-cli"),
+  }));
+  writeRegistry([], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(codexHome, "hooks.json"), JSON.stringify({
+    hooks: {
+      UserPromptSubmit: [{ hooks: [{ command: "node " + path.join(ROOT, "scripts", "codex", "prompt-hook.mjs") }] }],
+      Stop: [{ hooks: [{ command: "node " + path.join(ROOT, "scripts", "codex", "stop-hook.mjs") }] }],
+    },
+  }));
+  for (const name of ["m5codex-inbound-router", "codex-longtask-feishu", "feishu-bind", "feishu-unbind", "feishu-status"]) {
+    const skillDir = path.join(codexHome, "skills", name);
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(path.join(skillDir, "SKILL.md"), "---\nname: " + name + "\n---\n");
+  }
+
+  const run = () => spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "doctor.mjs"), "--json"], {
+    encoding: "utf-8",
+    env: {
+      ...process.env,
+      PATH: bin + path.delimiter + (process.env.PATH ?? ""),
+      CODEX_HOME: codexHome,
+      FEISHU_CODEX_BRIDGE_HOME: home,
+    },
+  });
+  const healthy = run();
+  assert.equal(healthy.status, 0, healthy.stderr);
+  assert.equal(JSON.parse(healthy.stdout).ready, true);
+
+  fs.rmSync(path.join(codexHome, "skills", "feishu-status"), { recursive: true });
+  const broken = run();
+  assert.equal(broken.status, 1);
+  assert.equal(JSON.parse(broken.stdout).ready, false);
+});
+
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (failed > 0) process.exit(1);

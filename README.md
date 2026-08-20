@@ -1,10 +1,15 @@
 # feishu-bridge
 
-把飞书话题和本机长期 AI 任务接起来。Claude Code v2 是已完成基线；Codex adapter
-复用同一套 envelope、selector、claim、outbox 和飞书发布器，但按 Codex thread 绑定。
+把飞书话题和本机长期 AI 任务接起来。Claude Code 与 Codex 共用 envelope、selector、
+claim、outbox 和飞书发布器；各自只保留运行时相关的会话发现、hooks 和续接逻辑。
 
-> Claude 搭建看 **[SETUP.md](SETUP.md)**；Codex 候选适配看
-> **[CODEX_SETUP.md](CODEX_SETUP.md)**。两套 runtime 共仓维护，不靠长期分支复制核心修复。
+| 你使用的运行时 | 从这里开始 |
+|---|---|
+| Codex Desktop/CLI | **[CODEX_SETUP.md](CODEX_SETUP.md)** |
+| Claude Code | **[SETUP.md](SETUP.md)** |
+
+两套 runtime 共仓维护，但安装入口、状态目录和技能互相独立。新用户只安装自己使用的那一套，
+不要同时照着两份搭建文档执行。
 
 ## Codex adapter
 
@@ -15,6 +20,7 @@ Codex 与 Claude 的关键差异已经隔离在 `scripts/codex/`：
 - 一个飞书话题绑定一个精确 `codex_thread_id`，同一仓库允许多个 task；
 - 禁止 `--last`，运行中的 Desktop turn 通过 hook lease fail-closed 为 busy；
 - 入站用 detached `codex exec resume <精确 UUID> --json` 秒级返回；
+- 后台回合会持久化到原 task；已经打开的 Desktop 页面可能要切换 task 或重新打开后才刷新；
 - Stop 以 `thread + turn/claim` 事件键原样入队，相同正文的不同轮次不会互相去重；
 - Codex locator、claim、receipt 和 outbox 全在 `~/.codex/feishu-bridge/`，不进入工作树；
 - 已绑定 task 每轮自动发布：本地回合由 Stop 发送，飞书入站回合须等严格 watcher 确认终局；
@@ -24,16 +30,16 @@ Codex 与 Claude 的关键差异已经隔离在 `scripts/codex/`：
 - 安装后提供 `$feishu-bind`、`$feishu-unbind`、`$feishu-status` 三项技能命令，
   它们也会出现在斜杠菜单中，且均只作用于当前精确 task。
 
-本地回归：
+新用户先运行：
 
 ```bash
-node scripts/test.mjs          # Claude 基线 234 项
-node scripts/codex/test.mjs    # Codex adapter 合成回归
-node scripts/codex/install.mjs # 安装预览；默认不写
+npm test                         # Claude + Codex 全套本地回归
+npm run doctor:codex             # Codex 机器级只读自检
+npm run install:codex:preview    # Codex 安装预览；默认不写
 ```
 
-Codex 适配具备本地合成与隔离安装证据；具体机器是否已经安装不能从仓库推断，必须运行
-安装预览并检查 `~/.codex`。真实飞书端到端验证仍需逐动作授权。
+具体机器是否已经安装不能从仓库推断。doctor 全绿只证明本机组件齐全；首次接入仍需用一条
+新的飞书 mention 验证精确 task、严格终局和原话题回写。
 
 ---
 

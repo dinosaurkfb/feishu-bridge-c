@@ -82,10 +82,14 @@ function ackText(kind, detail) {
     ].join("\n");
   }
   if (kind === "rejected") {
-    return [
-      "已拒绝 · " + detail.reasonText,
-      "本条指令没有被投递给任何任务。",
-    ].join("\n");
+    const lines = ["已拒绝 · " + detail.reasonText];
+    // 说清楚这个话题通向谁。同一个群里有多个项目话题之后，最容易犯的错是
+    // 「@ 错了话题」—— 而单看「消息里没有指令正文」，人完全看不出自己站错了地方
+    //（2026-08-20 实测：一条本该给 cc2cd 的空 @ 落在了 feishu-bridge-cc 的话题里，
+    // 回执如实、正确、且毫无用处）。
+    if (detail.taskName) lines.push("本话题通向：" + detail.taskName + "。");
+    lines.push("本条指令没有被投递给任何任务。");
+    return lines.join("\n");
   }
   return [
     "系统错误 · " + detail.detail,
@@ -146,7 +150,7 @@ if (!routed.ok) {
       process.stderr.write(JSON.stringify({ dryRun: true, ...promo }) + "\n");
       process.exit(0);
     }
-    finish("rejected", { reasonText: promo.reasonText }, { reason: promo.reason });
+    finish("rejected", { reasonText: promo.reasonText, taskName: null }, { reason: promo.reason });
   }
 
   if (dryRun) {
@@ -221,10 +225,13 @@ if (verdict.decision === "reject") {
     reason: verdict.reason,
     reason_text: verdict.reasonText,
     message_id: event?.message_id ?? null,
+    project_root: routed.root,
+    binding_source: routed.source,
     claim_acquired: false,
     handed_off: false,
   });
-  finish("rejected", verdict, { reason: verdict.reason });
+  finish("rejected", { ...verdict, taskName: config.task_display_name },
+    { reason: verdict.reason, project_root: routed.root });
 }
 
 // 校验通过才允许 claim。claim 是幂等的唯一保证。

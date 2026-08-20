@@ -27,6 +27,7 @@ const SETTINGS = path.join(os.homedir(), ".claude", "settings.json");
 const REGISTRY = path.join(os.homedir(), ".claude", "feishu-bridge", "registry.json");
 
 const HOOK_SCRIPT = path.join(ROOT, "scripts", "stop-hook.mjs");
+const INIT_HOOK_SCRIPT = path.join(ROOT, "scripts", "init-hook.mjs");
 const LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "stop-hook.log");
 
 /**
@@ -59,6 +60,14 @@ const COMMAND =
 
 const MARKER = HOOK_SCRIPT; // 认脚本路径做幂等，命令别处怎么变都不会装两遍
 
+// /init 钩子跑在本机**每一次提交 prompt** 上，比 Stop 更热。
+// 跟 Stop 那条的区别：这里的 else 分支不往日志里写。UserPromptSubmit 的 stdout 会被
+// 当成上下文注入，每敲一句话就往日志追一行也没有意义 —— 缺 node 时它该彻底闭嘴。
+const INIT_COMMAND =
+  `if [ -x '${NODE_BIN}' ] && [ -r '${INIT_HOOK_SCRIPT}' ]; then '${NODE_BIN}' '${INIT_HOOK_SCRIPT}'; ` +
+  `else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1 || :; fi`;
+const INIT_MARKER = INIT_HOOK_SCRIPT;
+
 const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
 
@@ -86,6 +95,27 @@ if (uninstall) {
 } else {
   stop.push({ hooks: [{ type: "command", command: COMMAND, timeout: 20 }] });
   action = "installed";
+}
+
+// ---------- UserPromptSubmit：/init 时问一句要不要接飞书 ----------
+//
+// 跟 Stop 用同一套做法：只认脚本路径做幂等、只动自己那一条、绝不重排别人的。
+// .orca 的 UserPromptSubmit 钩子就在这个数组里，覆盖掉它 Frank 的另一套工具会静默失灵。
+
+const prompts = (settings.hooks.UserPromptSubmit ??= []);
+const initAt = prompts.findIndex((entry) =>
+  (entry?.hooks ?? []).some((h) => typeof h?.command === "string" && h.command.includes(INIT_MARKER)));
+
+let initAction;
+if (uninstall) {
+  if (initAt < 0) initAction = "already-absent";
+  else { prompts.splice(initAt, 1); initAction = "removed"; }
+} else if (initAt >= 0) {
+  prompts[initAt] = { hooks: [{ type: "command", command: INIT_COMMAND, timeout: 10 }] };
+  initAction = "updated";
+} else {
+  prompts.push({ hooks: [{ type: "command", command: INIT_COMMAND, timeout: 10 }] });
+  initAction = "installed";
 }
 
 // ---------- 登记表 ----------
@@ -187,7 +217,8 @@ if (uninstall) {
 // ---------- 落盘 ----------
 
 console.log("settings : " + SETTINGS + "  → " + action);
-console.log("Stop 钩子 : " + stop.length + " 条（.orca 的那条必须还在）");
+console.log("Stop 钩子 : " + stop.length + " 条（.orca 的那条必须还在）  → " + action);
+console.log("/init 钩子: " + prompts.length + " 条 UserPromptSubmit（.orca 的那条必须还在）  → " + initAction);
 console.log("登记表   : " + REGISTRY + "  → " + registry.projects.length + " 个项目");
 console.log("技能     : " + SKILL_DST + "  → " + skillAction);
 console.log("兜底定时 : " + PLIST + "  → " + plistAction + "（每 30 分钟排空全部登记项目）");

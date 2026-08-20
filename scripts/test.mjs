@@ -39,6 +39,7 @@ import {
   firstSentence, idempotencyKeyFor, newRegistryEntry, readProjectIdentity,
 } from "./bind-project.mjs";
 import { mappingFromRegistryEntry, resolveProject } from "./project-resolve.mjs";
+import { composeAsk, isInitPrompt } from "./init-hook.mjs";
 
 let passed = 0;
 let failed = 0;
@@ -1310,6 +1311,48 @@ test("用途进了根消息；没有用途时根消息也成立", () => {
   const noP = composeRootMessage({ name: "n", purpose: null, root: "/tmp/x", token: "t0k3n1" });
   assert.ok(noP.includes("t0k3n1") && noP.includes("/tmp/x"));
   assert.ok(!noP.includes("null"), "用途缺失不能把 null 打进消息里");
+});
+
+// ---------- /init 钩子：什么算 /init，问什么 ----------
+
+test("只认 /init 本身和 /init 带参数", () => {
+  for (const y of ["/init", "  /init  ", "/init 顺便跑测试"]) {
+    assert.equal(isInitPrompt(y), true, JSON.stringify(y));
+  }
+  for (const n of ["/initialize", "/init-thing", "init", "/compact", "帮我 /init", "", null, undefined, 42, {}]) {
+    assert.equal(isInitPrompt(n), false, JSON.stringify(n));
+  }
+});
+
+test("注入的话里写死了「等 CLAUDE.md 写完再问」——/init 之前问，名字和用途还不存在", () => {
+  const ask = composeAsk({ cwd: "/tmp/p", bridgeRoot: "/b", chatName: "群" });
+  assert.ok(ask.includes("CLAUDE.md 写完"));
+  assert.ok(ask.includes("不是现在"));
+});
+
+test("注入的话带上可直接执行的命令和项目路径", () => {
+  const ask = composeAsk({ cwd: "/tmp/p", bridgeRoot: "/b", chatName: "群" });
+  assert.ok(ask.includes("/b/scripts/bind-project.mjs"));
+  assert.ok(ask.includes("--project /tmp/p"));
+  assert.ok(ask.includes("--apply"));
+});
+
+test("默认「是」，但答否就不许再问", () => {
+  const ask = composeAsk({ cwd: "/tmp/p", bridgeRoot: "/b", chatName: "群" });
+  assert.ok(ask.includes("默认「是」"));
+  assert.ok(ask.includes("不要再问第二次"));
+});
+
+test("注入的话必须说清入站没通 —— 模型最容易顺口说成「接好了」", () => {
+  const ask = composeAsk({ cwd: "/tmp/p", bridgeRoot: "/b", chatName: "群" });
+  assert.ok(ask.includes("还没接通"));
+  assert.ok(ask.includes("别说它通了"));
+});
+
+test("群名缺失时也拼得出话，不把 undefined 打进去", () => {
+  const ask = composeAsk({ cwd: "/tmp/p", bridgeRoot: "/b" });
+  assert.ok(!ask.includes("undefined"));
+  assert.ok(!ask.includes("null"));
 });
 
 // ---------- 汇总 ----------

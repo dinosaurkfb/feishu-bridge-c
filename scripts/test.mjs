@@ -37,7 +37,7 @@ import {
 import {
   PURPOSE_MAX, bindingToken, composeRootMessage, composeStatusMessage,
   firstSentence, idempotencyKeyFor, newRegistryEntry, readProjectIdentity,
-} from "./bind-project.mjs";
+} from "./bind-compose.mjs";
 import { mappingFromRegistryEntry, resolveProject } from "./project-resolve.mjs";
 import { composeAsk, isInitPrompt } from "./init-hook.mjs";
 
@@ -1352,13 +1352,68 @@ test("注入的话必须说清入站没通 —— 模型最容易顺口说成「
 test("拦下了要交出命令，而不是自己还原根消息文案", () => {
   const ask = composeAsk({ cwd: "/tmp/p", bridgeRoot: "/b", chatName: "群" });
   assert.ok(ask.includes("不要自己还原文案"));
-  assert.ok(ask.includes("! node /b/scripts/bind-project.mjs"), "要给出可直接粘的 ! 形式");
+  assert.ok(ask.includes("逐字还原"), "要点名这个具体的错误做法");
+});
+
+test("先跑预览再问 —— 文案必须是脚本打印的，不是模型算的", () => {
+  const ask = composeAsk({ cwd: "/tmp/p", bridgeRoot: "/b", chatName: "群" });
+  assert.ok(ask.includes("/b/scripts/bind-preview.mjs --project /tmp/p"));
+  assert.ok(ask.indexOf("bind-preview.mjs") < ask.indexOf("默认「是」"), "预览要排在提问前面");
+  assert.ok(ask.indexOf("bind-preview.mjs") < ask.indexOf("--apply"), "预览要排在真发前面");
+});
+
+test("明说真发那条会弹权限，且那是应该的", () => {
+  const ask = composeAsk({ cwd: "/tmp/p", bridgeRoot: "/b", chatName: "群" });
+  assert.ok(ask.includes("弹权限"));
+  assert.ok(ask.includes("那是应该的"), "别让模型把正常的确认当成故障去绕");
 });
 
 test("群名缺失时也拼得出话，不把 undefined 打进去", () => {
   const ask = composeAsk({ cwd: "/tmp/p", bridgeRoot: "/b" });
   assert.ok(!ask.includes("undefined"));
   assert.ok(!ask.includes("null"));
+});
+
+// ---------- 预览入口进白名单的前提：它碰不到发送代码 ----------
+
+/** 顺着 import 走一遍，返回这个模块传递依赖到的全部本地脚本。 */
+function importGraph(entry, seen = new Set()) {
+  const abs = path.resolve("scripts", entry);
+  if (seen.has(abs)) return seen;
+  seen.add(abs);
+  let src;
+  try { src = fs.readFileSync(abs, "utf-8"); } catch { return seen; }
+  for (const m of src.matchAll(/^\s*import[^"']*["'](\.\/[^"']+)["']/gm)) {
+    importGraph(m[1].replace("./", ""), seen);
+  }
+  for (const m of src.matchAll(/await import\(\s*["'](\.\/[^"']+)["']/g)) {
+    importGraph(m[1].replace("./", ""), seen);
+  }
+  return seen;
+}
+
+test("bind-preview 的依赖图里没有 outbound —— 白名单条目必须名副其实", () => {
+  const g = [...importGraph("bind-preview.mjs")].map((f) => path.basename(f));
+  assert.ok(!g.includes("outbound.mjs"),
+    "预览入口不能传递依赖到能发消息的代码，实际依赖：" + g.join(", "));
+  assert.ok(!g.includes("drain-outbox.mjs"), "也不能间接拉进发布器：" + g.join(", "));
+  assert.ok(g.includes("bind-compose.mjs") && g.includes("chain-template.mjs"), "该有的还得有");
+});
+
+test("bind-preview 的代码里不出现任何执行外部命令的手段", () => {
+  // 先剥注释：文件头那段说明本来就要提 outbound 依赖 execFileSync 这件事，
+  // 提到它和用它是两回事，检查用的必须是代码。
+  const code = fs.readFileSync(path.resolve("scripts", "bind-preview.mjs"), "utf-8")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
+  for (const bad of ["child_process", "execFile", "execSync", "spawn", "lark-cli"]) {
+    assert.ok(!code.includes(bad), "预览入口的代码里不该出现 " + bad);
+  }
+});
+
+test("对照：bind-project 确实依赖 outbound（否则上面那条测试是空的）", () => {
+  const g = [...importGraph("bind-project.mjs")].map((f) => path.basename(f));
+  assert.ok(g.includes("outbound.mjs"), "真发那条路径本来就该依赖 outbound");
 });
 
 // ---------- 汇总 ----------

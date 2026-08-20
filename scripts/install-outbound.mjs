@@ -28,6 +28,7 @@ const REGISTRY = path.join(os.homedir(), ".claude", "feishu-bridge", "registry.j
 
 const HOOK_SCRIPT = path.join(ROOT, "scripts", "stop-hook.mjs");
 const INIT_HOOK_SCRIPT = path.join(ROOT, "scripts", "init-hook.mjs");
+const PREVIEW_SCRIPT = path.join(ROOT, "scripts", "bind-preview.mjs");
 const LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "stop-hook.log");
 
 /**
@@ -116,6 +117,33 @@ if (uninstall) {
 } else {
   prompts.push({ hooks: [{ type: "command", command: INIT_COMMAND, timeout: 10 }] });
   initAction = "installed";
+}
+
+// ---------- 权限：只放行预览，真发仍逐次确认 ----------
+//
+// /init 之后那句「要不要建话题」必须附一份**脚本自己打印的**文案。拿不到它，模型会去读
+// 源码「还原」一份 —— 那东西看着像预览，其实是算出来的，差一个字就是照着假预览点头，
+// 而根消息发出去改不了。（2026-08-20 实测：dry-run 被 auto 模式分类器拦下，
+// cc2cd 那个会话就是这么还原的。）
+//
+// 放行的是 bind-preview.mjs，**不是** bind-project.mjs：前者的依赖图里没有 outbound，
+// 它做不到发消息这件事是代码事实，不是一个自觉遵守的 --dry-run 开关（有测试盯着）。
+// 真正建话题的那条仍然每次弹权限 —— 往群里发一条撤不掉的消息，本来就该有人点头。
+
+const PREVIEW_RULE = "Bash(node " + PREVIEW_SCRIPT + ":*)";
+const permissions = (settings.permissions ??= {});
+const allow = (permissions.allow ??= []);
+
+let permAction;
+const permAt = allow.indexOf(PREVIEW_RULE);
+if (uninstall) {
+  if (permAt < 0) permAction = "already-absent";
+  else { allow.splice(permAt, 1); permAction = "removed"; }
+} else if (permAt >= 0) {
+  permAction = "already-present";
+} else {
+  allow.push(PREVIEW_RULE);
+  permAction = "installed";
 }
 
 // ---------- 登记表 ----------
@@ -219,6 +247,7 @@ if (uninstall) {
 console.log("settings : " + SETTINGS + "  → " + action);
 console.log("Stop 钩子 : " + stop.length + " 条（.orca 的那条必须还在）  → " + action);
 console.log("/init 钩子: " + prompts.length + " 条 UserPromptSubmit（.orca 的那条必须还在）  → " + initAction);
+console.log("预览放行 : allow " + allow.length + " 条  → " + permAction);
 console.log("登记表   : " + REGISTRY + "  → " + registry.projects.length + " 个项目");
 console.log("技能     : " + SKILL_DST + "  → " + skillAction);
 console.log("兜底定时 : " + PLIST + "  → " + plistAction + "（每 30 分钟排空全部登记项目）");

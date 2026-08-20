@@ -31,6 +31,14 @@ import {
   stampInstruction, transcriptDirFor,
 } from "./live-session.mjs";
 import { extractReply } from "./stop-hook.mjs";
+import {
+  CHAIN_FIELDS, materializeProjectConfig, validateChainTemplate,
+} from "./chain-template.mjs";
+import {
+  PURPOSE_MAX, bindingToken, composeRootMessage, composeStatusMessage,
+  firstSentence, idempotencyKeyFor, newRegistryEntry, readProjectIdentity,
+} from "./bind-project.mjs";
+import { mappingFromRegistryEntry, resolveProject } from "./project-resolve.mjs";
 
 let passed = 0;
 let failed = 0;
@@ -550,11 +558,22 @@ test("outbox 为空 → empty，且不去读配置（配置根本不存在也不
   assert.equal(r.status, "empty");
 });
 
-test("有待发内容但配置读不了 → error，绝不静默丢弃", () => {
+test("有待发内容但根本没接桥 → error not_bound，绝不静默丢弃", () => {
   appendEvent({ outboxDir: projOutbox, kind: "next", text: "待发一条", source: "t" });
   const r = drainProject({ root: proj });
   assert.equal(r.status, "error");
+  // 「哪儿都没有绑定」和「绑定在但读不出来」必须是两个原因：
+  // 前者是没接，后者是接了但坏了，排查方向完全不同。
+  assert.equal(r.reason, "not_bound");
+});
+
+test("绑定文件在但是坏 JSON → config_unreadable，跟没接桥区分开", () => {
+  fs.mkdirSync(projInbound, { recursive: true });
+  fs.writeFileSync(path.join(projInbound, "active-mapping.json"), "{ 这不是 json");
+  const r = drainProject({ root: proj });
+  assert.equal(r.status, "error");
   assert.equal(r.reason, "config_unreadable");
+  fs.rmSync(path.join(projInbound, "active-mapping.json"));
 });
 
 test("绑定不是 active → skipped，进展留在本地", () => {
@@ -1008,6 +1027,267 @@ test("返回的不是 JSON → 也重试，最终如实报错", () => {
   const { result, tries } = fetchWith(["这不是 json"]);
   assert.equal(result.reason, "session_events_unparsable");
   assert.equal(tries, FETCH_BACKOFF_MS.length);
+});
+
+// ---------- 接入新项目（bind-project / chain-template） ----------
+
+const TPL = {
+  chain: "claude",
+  transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t",
+  outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o",
+  lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark",
+  frank_sender_id: "12345",
+  chat_name: "群", chat_id: "oc_abc",
+  default_freshness_ms: 900000,
+  agent_uid: "agent_x",
+};
+
+test("模板缺字段 → 报出缺哪些，不放行", () => {
+  const { chat_id, agent_uid, ...rest } = TPL;
+  const v = validateChainTemplate(rest);
+  assert.equal(v.ok, false);
+  assert.deepEqual(v.missing.sort(), ["agent_uid", "chat_id"]);
+});
+
+test("群 id 形状不对 → 判 malformed，不是 missing", () => {
+  const v = validateChainTemplate({ ...TPL, chat_id: "oc" });
+  assert.equal(v.ok, false);
+  assert.deepEqual(v.missing, []);
+  assert.deepEqual(v.malformed, ["chat_id"]);
+});
+
+test("群 id 写成飞书群链接那种非 oc_ 值 → 拒，绝不拿去建话题", () => {
+  for (const bad of ["https://feishu.cn/chat/x", "ou_looks_like_user", "7620345068927929309"]) {
+    assert.equal(validateChainTemplate({ ...TPL, chat_id: bad }).ok, false, bad);
+  }
+});
+
+test("时效窗口是布尔或字符串数字 → 判配错（跟 selector 同一条 fail-closed 原则）", () => {
+  for (const bad of [true, "900000", 0, -1]) {
+    assert.equal(validateChainTemplate({ ...TPL, default_freshness_ms: bad }).ok, false, String(bad));
+  }
+});
+
+test("合成的项目配置带齐全部链路字段 —— 现有读取方一行都不用改", () => {
+  const cfg = materializeProjectConfig({ template: TPL, projectRoot: "/tmp/demo" });
+  for (const f of CHAIN_FIELDS) assert.equal(cfg[f], TPL[f], f);
+  assert.equal(cfg.project_dir, "/tmp/demo");
+  assert.equal(cfg.task_display_name, "demo");
+});
+
+test("逻辑键剔掉文件名不安全的字符 —— 它要进 claim 和回执的文件名", () => {
+  const cfg = materializeProjectConfig({ template: TPL, projectRoot: "/tmp/a b.c/d e" });
+  assert.equal(cfg.logical_task_key, "d_e");
+  assert.match(cfg.logical_task_key, /^[A-Za-z0-9_-]+$/);
+});
+
+test("显示名可覆盖，但空白覆盖不生效（话题里不能出现没有主语的消息）", () => {
+  assert.equal(materializeProjectConfig({ template: TPL, projectRoot: "/tmp/x", displayName: "我的项目" }).task_display_name, "我的项目");
+  assert.equal(materializeProjectConfig({ template: TPL, projectRoot: "/tmp/x", displayName: "   " }).task_display_name, "x");
+});
+
+test("幂等键：同路径恒定、不同路径不同、不超过平台 50 字符上限", () => {
+  assert.equal(idempotencyKeyFor("/tmp/a"), idempotencyKeyFor("/tmp/a"));
+  assert.notEqual(idempotencyKeyFor("/tmp/a"), idempotencyKeyFor("/tmp/b"));
+  assert.ok(idempotencyKeyFor("/very/long/".repeat(40)).length <= 50);
+});
+
+test("绑定码进了根消息正文 —— 将来靠引用块做确定性匹配全指望它", () => {
+  const token = bindingToken("/tmp/a");
+  const msg = composeRootMessage({ name: "a", root: "/tmp/a", token });
+  assert.ok(msg.includes(token));
+  assert.ok(msg.includes("/tmp/a"));
+});
+
+test("根消息里不含任何当前进度字样 —— 它发出去就改不了", () => {
+  const msg = composeRootMessage({ name: "a", root: "/tmp/a", token: "abc123" });
+  for (const banned of ["已接通", "还没接通", "待绑定", "改造"]) {
+    assert.ok(!msg.includes(banned), "根消息不该出现「" + banned + "」");
+  }
+});
+
+test("入站没通时状态消息必须明说不通 —— 没做成就不能说做成了", () => {
+  const off = composeStatusMessage({ name: "a", inboundReady: false });
+  assert.ok(off.includes("还没接通"));
+  assert.ok(!off.includes("绑定就完成了"));
+  const on = composeStatusMessage({ name: "a", inboundReady: true });
+  assert.ok(on.includes("绑定就完成了"));
+  assert.ok(!on.includes("还没接通"));
+});
+
+test("登记表接入：session_id 恒为 null → 入站被 evaluateInbound 一律拒（fail-closed 免费得到）", () => {
+  const entry = newRegistryEntry({
+    root: "/tmp/demo", name: "demo", purpose: null, token: "abc123", rootMessageId: "om_root",
+  });
+  const mapping = mappingFromRegistryEntry(entry);
+  const event = {
+    message_id: "msg_1", session_id: "session_real", sender_id: TPL.frank_sender_id,
+    content: '<at id="ou_t">T</at> 干活', created_at_ms: Date.now(),
+  };
+  const v = evaluateInbound({ event, mapping, config: { transport_open_id: "ou_t" }, now: Date.now() });
+  assert.equal(v.decision, "reject");
+  assert.equal(v.reason, REJECT.SESSION_MISMATCH);
+});
+
+test("登记表那一行 status=active → 出站立刻可用（不等入站）", () => {
+  const m = mappingFromRegistryEntry(newRegistryEntry({
+    root: "/tmp/demo", name: "demo", token: "t", rootMessageId: "om_root",
+  }));
+  assert.equal(m.status, "active");            // drainProject 只看这个
+  assert.equal(m.inbound_state, "pending");
+  assert.equal(m.session_id, null);
+  assert.equal(m.feishu_root_message_id_reference, "om_root");
+});
+
+test("接入产生的新状态只有一行登记，有效期一年、配额无限", () => {
+  const now = Date.parse("2026-08-20T00:00:00.000Z");
+  const e = newRegistryEntry({ root: "/tmp/d", name: "d", token: "t", rootMessageId: "om_r", now });
+  assert.ok(Date.parse(e.expires_at) - now > 300 * 24 * 3600 * 1000);
+  assert.equal(e.root_message_id, "om_r");
+  assert.equal(mappingFromRegistryEntry(e).max_inbound_messages, "unlimited");
+});
+
+// ---------- 解析：项目文件优先，回落登记表 ----------
+
+function bindFixture() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-home-"));
+  const proj = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-proj-"));
+  const regFile = path.join(home, "registry.json");
+  const tplFile = path.join(home, "chain-config.json");
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  return { home, proj, regFile, tplFile };
+}
+
+test("项目目录里有 mapping → 走项目文件，登记表和模板完全不参与", () => {
+  const { proj, regFile, tplFile } = bindFixture();
+  const rt = path.join(proj, ".runtime-data", "inbound");
+  fs.mkdirSync(rt, { recursive: true });
+  fs.writeFileSync(path.join(rt, "active-mapping.json"),
+    JSON.stringify({ status: "active", expires_at: "2099-01-01T00:00:00Z", feishu_root_message_id_reference: "om_old" }));
+  const r = resolveProject({ root: proj, registryFile: regFile, templateFile: tplFile });
+  assert.equal(r.ok, true);
+  assert.equal(r.source, "project-files");
+  assert.equal(r.mapping.feishu_root_message_id_reference, "om_old");
+});
+
+test("项目目录里什么都没有 → 回落到登记表那一行", () => {
+  const { proj, regFile, tplFile } = bindFixture();
+  fs.writeFileSync(regFile, JSON.stringify({ projects: [
+    { id: "p", root: proj, name: "我的项目", root_message_id: "om_new", expires_at: "2099-01-01T00:00:00Z" },
+  ] }));
+  const r = resolveProject({ root: proj, registryFile: regFile, templateFile: tplFile });
+  assert.equal(r.ok, true);
+  assert.equal(r.source, "registry");
+  assert.equal(r.mapping.feishu_root_message_id_reference, "om_new");
+  assert.equal(r.config.task_display_name, "我的项目");            // 显示名来自登记表
+  assert.equal(r.config.lark_cli_profile, TPL.lark_cli_profile);  // 身份来自机器模板
+});
+
+test("登记表有这个项目但没有 root_message_id → not_bound，不是配错", () => {
+  const { proj, regFile, tplFile } = bindFixture();
+  fs.writeFileSync(regFile, JSON.stringify({ projects: [{ id: "p", root: proj }] }));
+  const r = resolveProject({ root: proj, registryFile: regFile, templateFile: tplFile });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "not_bound");
+});
+
+test("到期预警不依赖 chain-config —— 只有 mapping 也照常体检", () => {
+  const { proj } = bindFixture();
+  const rt = path.join(proj, ".runtime-data", "inbound");
+  fs.mkdirSync(rt, { recursive: true });
+  // 刻意不写 chain-config.json：预警根本不读它。让它去依赖一个自己用不到的文件，
+  // 会让「配置缺一半」的项目静默停止预警 —— 这一版差点就是这样。
+  fs.writeFileSync(path.join(rt, "active-mapping.json"),
+    JSON.stringify({ status: "active", expires_at: new Date(Date.now() + 3 * 24 * 3600 * 1000).toISOString() }));
+  const health = checkBinding({ root: proj });
+  assert.equal(health.state, "expiring");
+  assert.ok(bindingWarning(health).text.includes("续期"));
+});
+
+test("登记表接入的项目也进得了到期体检", () => {
+  const { proj, regFile, tplFile } = bindFixture();
+  fs.writeFileSync(regFile, JSON.stringify({ projects: [
+    { id: "p", root: proj, root_message_id: "om_x",
+      expires_at: new Date(Date.now() + 3 * 24 * 3600 * 1000).toISOString() },
+  ] }));
+  const r = resolveProject({ root: proj, registryFile: regFile, templateFile: tplFile });
+  assert.equal(r.mapping.status, "active");
+  assert.ok(Date.parse(r.mapping.expires_at) > Date.now());
+});
+
+test("登记表整条带过去，不再只留 id 和 root", () => {
+  const { proj, regFile } = bindFixture();
+  fs.writeFileSync(regFile, JSON.stringify({ projects: [
+    { id: "p", root: proj + "/", root_message_id: "om_x", name: "N" },
+  ] }));
+  const reg = loadRegistry(regFile);
+  assert.equal(reg.projects[0].root_message_id, "om_x");
+  assert.equal(reg.projects[0].name, "N");
+  assert.equal(reg.projects[0].root, proj, "结尾斜杠仍然要归一化");
+});
+
+// ---------- 项目名字和用途：从 CLAUDE.md 取，取不到用目录名 ----------
+
+function projWith(files) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-id-"));
+  for (const [n, c] of Object.entries(files)) fs.writeFileSync(path.join(d, n), c);
+  return d;
+}
+
+test("CLAUDE.md 的一级标题当名字，第一段第一句当用途", () => {
+  const d = projWith({ "CLAUDE.md": "# cc2cd\n\n让 Claude 和 Codex 在飞书的一个话题里互相对话。背景、两种模式、\n已定与未定，都在 `README.md`。\n\n## 别的\n" });
+  const id = readProjectIdentity({ root: d });
+  assert.equal(id.name, "cc2cd");
+  assert.equal(id.purpose, "让 Claude 和 Codex 在飞书的一个话题里互相对话。");
+  assert.equal(id.source, "CLAUDE.md");
+});
+
+test("断句：中文句号不需要后跟空格，英文点号需要", () => {
+  assert.equal(firstSentence("第一句。第二句。"), "第一句。");
+  assert.equal(firstSentence("详见 README.md 里的说明。后面还有"), "详见 README.md 里的说明。");
+  assert.equal(firstSentence("First one. Second one."), "First one.");
+  assert.equal(firstSentence("版本 v1.2 是稳定版"), "版本 v1.2 是稳定版", "小数点不该断句");
+  assert.equal(firstSentence("没有终止符的一段"), "没有终止符的一段");
+});
+
+test("没有 CLAUDE.md 就看 README.md", () => {
+  const d = projWith({ "README.md": "# 备用名\n\n一句用途。\n" });
+  assert.equal(readProjectIdentity({ root: d }).name, "备用名");
+});
+
+test("两个文件都没有 → 用目录名，绝不失败", () => {
+  const d = projWith({});
+  const id = readProjectIdentity({ root: d });
+  assert.equal(id.name, path.basename(d));
+  assert.equal(id.purpose, null);
+  assert.equal(id.source, "dirname");
+});
+
+test("有标题但正文是代码块或直接下一个标题 → 用途为 null，名字照常", () => {
+  const a = projWith({ "CLAUDE.md": "# 名字\n\n```bash\nls\n```\n" });
+  assert.equal(readProjectIdentity({ root: a }).purpose, null);
+  assert.equal(readProjectIdentity({ root: a }).name, "名字");
+  const b = projWith({ "CLAUDE.md": "# 名字\n\n## 小节\n正文\n" });
+  assert.equal(readProjectIdentity({ root: b }).purpose, null);
+});
+
+test("超长的第一句会被截断，不会把整篇 CLAUDE.md 发进话题", () => {
+  const d = projWith({ "CLAUDE.md": "# 名字\n\n" + "很长".repeat(500) + "。\n" });
+  const id = readProjectIdentity({ root: d });
+  assert.ok(id.purpose.length <= PURPOSE_MAX, "用途长度 " + id.purpose.length);
+});
+
+test("没有一级标题的 CLAUDE.md 不算数 —— 退到目录名而不是拿正文当名字", () => {
+  const d = projWith({ "CLAUDE.md": "随便一段话，没有标题\n" });
+  assert.equal(readProjectIdentity({ root: d }).source, "dirname");
+});
+
+test("用途进了根消息；没有用途时根消息也成立", () => {
+  const withP = composeRootMessage({ name: "n", purpose: "干这个的。", root: "/tmp/x", token: "t0k3n1" });
+  assert.ok(withP.includes("干这个的。"));
+  const noP = composeRootMessage({ name: "n", purpose: null, root: "/tmp/x", token: "t0k3n1" });
+  assert.ok(noP.includes("t0k3n1") && noP.includes("/tmp/x"));
+  assert.ok(!noP.includes("null"), "用途缺失不能把 null 打进消息里");
 });
 
 // ---------- 汇总 ----------

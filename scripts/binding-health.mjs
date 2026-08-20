@@ -13,22 +13,17 @@
  * 一周能刷七次。写死到期日，同一档只会发一次。
  */
 
-import fs from "node:fs";
-import path from "node:path";
+import { resolveProject } from "./project-resolve.mjs";
 
 export const WARN_DAYS = [30, 7];
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export function checkBinding({ root, now = Date.now() }) {
-  let mapping;
-  try {
-    mapping = JSON.parse(
-      fs.readFileSync(path.join(root, ".runtime-data", "inbound", "active-mapping.json"), "utf-8"),
-    );
-  } catch {
-    // 读不到不预警：没接入站的项目、还没绑定的项目都会走到这里，不是异常。
-    return { state: "absent" };
-  }
+  // 走统一解析：项目目录里有配置就用它，没有就看登记表那一行。
+  // 两处都没有不算异常 —— 没接桥的项目、刚建目录的项目都会走到这里。
+  const resolved = resolveProject({ root });
+  if (!resolved.ok) return { state: "absent", reason: resolved.reason };
+  const mapping = resolved.mapping;
 
   const expiresAt = Date.parse(mapping.expires_at ?? "");
   if (!Number.isFinite(expiresAt)) return { state: "malformed", expiresAtRaw: mapping.expires_at ?? null };

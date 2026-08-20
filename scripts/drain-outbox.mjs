@@ -17,9 +17,8 @@ import path from "node:path";
 import { listPending, markSent, composeDigest } from "./outbox.mjs";
 import { publishDraft } from "./outbound.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
+import { resolveProject } from "./project-resolve.mjs";
 import { isLockStale } from "./handoff.mjs";
-
-const readJson = (p) => JSON.parse(fs.readFileSync(p, "utf-8"));
 
 export const outboxDirOf = (root) => path.join(root, ".runtime-data", "outbound", "outbox");
 const publishLockOf = (root) => path.join(root, ".runtime-data", "outbound", "publish.lock");
@@ -47,14 +46,27 @@ export function drainProject({ root, dryRun = false, timeoutMs } = {}) {
   // 先看有没有东西可发。绝大多数会话在这一行就返回了 —— 不读配置、不碰锁。
   if (listPending({ outboxDir }).length === 0) return { status: "empty", root };
 
-  let cfg;
-  let mapping;
-  try {
-    cfg = readJson(path.join(root, ".runtime-data", "inbound", "chain-config.json"));
-    mapping = readJson(path.join(root, ".runtime-data", "inbound", "active-mapping.json"));
-  } catch (err) {
-    return { status: "error", root, reason: "config_unreadable", error: String(err.message).slice(0, 200) };
+  // 项目文件优先，没有就回落到「机器模板 + 登记表那一行」。
+  // 已接好的项目走前一条，行为不变；新接的项目目录里一个配置文件都没有。
+  const resolved = resolveProject({ root });
+  if (!resolved.ok) {
+    // not_bound 是「有 outbox 但没接桥」—— 会被 CLI 和钩子分别报出来，不静默。
+    return { status: "error", root, reason: resolved.reason, error: resolved.error ?? null };
   }
+  // 发布真的需要 config（身份、profile、二进制路径），所以到这一步 configError 就是硬错。
+  // 到期预警不需要 config，所以那条路径拿到 configError 也照常工作 —— 见 project-resolve.mjs。
+  if (!resolved.config) {
+    const ce = resolved.configError ?? {};
+    const parts = [ce.error];
+    if (ce.missing?.length) parts.push("缺字段：" + ce.missing.join(", "));
+    if (ce.malformed?.length) parts.push("形状不对：" + ce.malformed.join(", "));
+    return {
+      status: "error", root,
+      reason: ce.reason ?? "config_unreadable",
+      error: parts.filter(Boolean).join("；") || null,
+    };
+  }
+  const { config: cfg, mapping } = resolved;
 
   // 绑定失效时不发：话题可能已经不再是 Frank 认可的那个。
   if (mapping.status !== "active") {

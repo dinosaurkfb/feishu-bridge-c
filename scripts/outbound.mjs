@@ -141,6 +141,38 @@ export function publishDraft({ profile, rootMessageId, text, larkBin, larkHome, 
   return parsed.data?.message_id ?? null;
 }
 
+/**
+ * 往群里发一条**新**消息，用来建立一个项目的根话题。
+ *
+ * 跟 publishDraft 分开而不是加个开关：那个函数只往已知话题里回复，是每天跑几十次的
+ * 常规路径；这个是每个项目一辈子一次的建话题动作，而且失败方式完全不同 ——
+ * 发重了会在群里留下一个撤不干净的孤儿话题。所以这里必须带幂等键，那个不需要。
+ *
+ * idempotencyKey 由调用方按项目绝对路径算，去重发生在**平台侧**：
+ * 本地锁挡不住「消息发出去了、配置没写成」这种崩溃，平台侧幂等挡得住。
+ */
+export function sendToChat({ profile, chatId, text, idempotencyKey, larkBin, larkHome, timeoutMs }) {
+  const args = ["im", "+messages-send", "--chat-id", chatId, "--as", "bot", "--text", text, "--json"];
+  if (idempotencyKey) args.push("--idempotency-key", idempotencyKey);
+
+  const out = execFileSync(larkBin ?? "lark-cli", args, {
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, LARKSUITE_CLI_PROFILE: profile,
+           ...(larkHome ? { LARKSUITE_CLI_HOME: larkHome } : {}) },
+    timeout: timeoutMs ?? 30_000, maxBuffer: 4 * 1024 * 1024,
+  });
+  const parsed = JSON.parse(out);
+  if (!parsed?.ok) throw new Error("建话题失败: " + JSON.stringify(parsed?.error ?? parsed).slice(0, 300));
+  const id = parsed.data?.message_id;
+  // 拿不到 message_id 就等于没有根话题，后面所有出站都发不出去。
+  // 这里 fail-closed：宁可报错让人重来，也不要写一份指向 null 的绑定。
+  if (typeof id !== "string" || !id.startsWith("om_")) {
+    throw new Error("建话题成功但没拿到 om_ 消息 id：" + JSON.stringify(parsed.data ?? {}).slice(0, 200));
+  }
+  return id;
+}
+
 // ---------- CLI ----------
 
 if (import.meta.url === "file://" + process.argv[1]) {

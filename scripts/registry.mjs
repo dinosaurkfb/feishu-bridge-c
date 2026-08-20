@@ -45,7 +45,10 @@ export function loadRegistry(file = registryPath()) {
     if (!p || typeof p.root !== "string" || p.root.length === 0) continue;
     if (p.enabled === false) continue;
     const root = stripTrailingSlash(p.root);
-    projects.push({ id: p.id ?? path.basename(root), root });
+    // 整条带过去，不再只挑 id / root。绑定信息（root_message_id / expires_at / name）
+    // 现在就住在这一行里 —— 见 project-resolve.mjs。id 和 root 仍然由这里归一化，
+    // 免得每个调用方各自去处理「没写 id」和「结尾多个斜杠」。
+    projects.push({ ...p, id: p.id ?? path.basename(root), root });
   }
   return { ok: true, file, projects };
 }

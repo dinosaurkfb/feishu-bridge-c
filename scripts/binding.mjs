@@ -26,9 +26,10 @@ import path from "node:path";
 
 import { NO_PREFIX, UNLIMITED, isValidPrefix, isValidQuota } from "./selector.mjs";
 import { checkBinding, WARN_DAYS } from "./binding-health.mjs";
+import { projectMappingPath, resolveProject } from "./project-resolve.mjs";
+import { registryPath } from "./registry.mjs";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
-const MAPPING = path.join(ROOT, ".runtime-data", "inbound", "active-mapping.json");
+const SELF = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** 相对写法（1y / 6m / 90d）和绝对日期都收。相对量一律从**现在**起算，不是从原到期日续。 */
@@ -82,14 +83,18 @@ const arg = (n) => {
 };
 const apply = process.argv.includes("--apply");
 
-let mapping;
-try {
-  mapping = JSON.parse(fs.readFileSync(MAPPING, "utf-8"));
-} catch (err) {
-  console.error("读不了绑定文件：" + MAPPING);
-  console.error(err.message);
+// 绑定现在有两种住处：老项目在自己目录里，新接入的只在登记表里占一行。
+// 两边都要能看、能续 —— 到期预警的文案指向的就是这条命令，它必须对两种都有效。
+const ROOT = path.resolve(arg("project") ?? SELF);
+const resolved = resolveProject({ root: ROOT });
+if (!resolved.ok) {
+  console.error("这个项目没有绑定：" + ROOT + "（" + resolved.reason + "）");
+  if (resolved.reason === "not_bound") console.error("接入：node scripts/bind-project.mjs --project " + ROOT + " --apply");
   process.exit(1);
 }
+const mapping = resolved.mapping;
+const FROM_REGISTRY = resolved.source === "registry";
+const STORE = FROM_REGISTRY ? registryPath() : projectMappingPath(ROOT);
 
 const now = Date.now();
 const health = checkBinding({ root: ROOT, now });
@@ -155,7 +160,8 @@ const STATE_TEXT = {
   absent: "没有绑定文件",
 };
 
-console.log("绑定    " + (mapping.binding_id ?? "(无 id)"));
+console.log("项目    " + ROOT);
+console.log("绑定    " + (mapping.binding_id ?? "(无 id)") + "   存放在 " + (FROM_REGISTRY ? "登记表" : "项目目录"));
 console.log("状态    " + (mapping.status ?? "?") + " / " + (STATE_TEXT[health.state] ?? health.state));
 console.log("有效期  " + (mapping.expires_at ?? "(缺)") +
   (daysLeft === null ? "" : "   还有 " + daysLeft + " 天"));
@@ -187,18 +193,43 @@ if (!apply) {
 
 // ---------- 写 ----------
 
-for (const [field, , after] of changes) mapping[field] = after;
-
 // 留一份上一版：改错了能立刻退回去，不用去翻别的地方。
-fs.copyFileSync(MAPPING, MAPPING + ".prev");
+fs.copyFileSync(STORE, STORE + ".prev");
 
-const tmp = MAPPING + ".tmp." + process.pid;
-fs.writeFileSync(tmp, JSON.stringify(mapping, null, 2) + "\n", { mode: 0o600 });
-fs.renameSync(tmp, MAPPING);
+const writeAtomic = (file, obj) => {
+  const tmp = file + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n", { mode: 0o600 });
+  fs.renameSync(tmp, file);
+};
+
+if (FROM_REGISTRY) {
+  // 登记表里那一行只存少数几个字段，改动要按名字映射回去 ——
+  // 这里刻意只认显式列出的几个，别的字段（比如 inbound_prefix）在登记表形式下没有落脚处，
+  // 与其悄悄写进一个没人读的键，不如明说不支持。
+  const TO_ENTRY = { expires_at: "expires_at", status: "status", note: "note" };
+  const unsupported = changes.filter(([f]) => !TO_ENTRY[f]).map(([f]) => f);
+  if (unsupported.length) {
+    console.error("登记表形式的绑定不支持改这些字段：" + unsupported.join(", "));
+    console.error("（它们只在项目目录形式的 mapping 里有落脚处）");
+    process.exit(1);
+  }
+  const reg = JSON.parse(fs.readFileSync(STORE, "utf-8"));
+  const entry = (reg.projects ?? []).find((p) => p?.root === ROOT);
+  if (!entry) {
+    console.error("登记表里找不到 " + ROOT + " —— 它可能刚被别的进程改过，重跑一次看看。");
+    process.exit(1);
+  }
+  for (const [field, , after] of changes) entry[TO_ENTRY[field]] = after;
+  writeAtomic(STORE, reg);
+} else {
+  for (const [field, , after] of changes) mapping[field] = after;
+  writeAtomic(STORE, mapping);
+}
 
 const after = checkBinding({ root: ROOT, now });
-console.log("\n已写入。现在状态：" + (STATE_TEXT[after.state] ?? after.state));
-console.log("上一版留在 " + path.basename(MAPPING) + ".prev");
-console.log("入站立即生效 —— 每条消息都是现读 mapping，不缓存。");
+console.log("\n已写入 " + STORE);
+console.log("现在状态：" + (STATE_TEXT[after.state] ?? after.state));
+console.log("上一版留在 " + path.basename(STORE) + ".prev");
+console.log("入站立即生效 —— 每条消息都是现读，不缓存。");
 
 }

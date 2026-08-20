@@ -1349,6 +1349,12 @@ test("注入的话必须说清入站没通 —— 模型最容易顺口说成「
   assert.ok(ask.includes("别说它通了"));
 });
 
+test("拦下了要交出命令，而不是自己还原根消息文案", () => {
+  const ask = composeAsk({ cwd: "/tmp/p", bridgeRoot: "/b", chatName: "群" });
+  assert.ok(ask.includes("不要自己还原文案"));
+  assert.ok(ask.includes("! node /b/scripts/bind-project.mjs"), "要给出可直接粘的 ! 形式");
+});
+
 test("群名缺失时也拼得出话，不把 undefined 打进去", () => {
   const ask = composeAsk({ cwd: "/tmp/p", bridgeRoot: "/b" });
   assert.ok(!ask.includes("undefined"));

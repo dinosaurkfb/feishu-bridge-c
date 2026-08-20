@@ -35,5 +35,7 @@ console.log("当前 Codex task：" + (active ? "已接入飞书" : "已暂停飞
 console.log("飞书入站：" + (active
   ? (task.inbound_state === "bound" ? "已绑定" : "等待首次真实 @M5Codex")
   : "已暂停"));
-console.log("答复入队：" + (active ? "启用" : "已暂停"));
+console.log("答复发布：" + (active
+  ? (task.auto_publish_on_completion === true ? "每轮自动发布（失败时留队）" : "仅入队，自动发布尚未启用")
+  : "已暂停"));
 console.log("待发布答复：" + pending + " 条" + (active ? "" : "（已保留）"));

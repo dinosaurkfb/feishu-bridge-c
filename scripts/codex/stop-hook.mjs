@@ -1,9 +1,7 @@
 #!/usr/bin/env node
 /**
- * Codex Stop：按精确 thread 找 task，把 last_assistant_message 原样入队。
- *
- * 当前合同不允许 Stop 自动发送飞书，所以这里没有 drain/publish 依赖。真实发布只能由
- * scripts/codex/drain-outbox.mjs --apply 在该次明确授权下执行。
+ * Codex Stop：按精确 thread 找 task，把 last_assistant_message 原样入队并自动发布。
+ * 飞书入站回合只入队；严格 watcher 确认终局后才授予发布资格并发送。
  */
 
 import fs from "node:fs";
@@ -11,6 +9,7 @@ import path from "node:path";
 
 import { appendEvent, MAX_REPLY_CHARS } from "../outbox.mjs";
 import { extractReply } from "../stop-hook.mjs";
+import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
 import {
   bridgeHome, findTaskForCodexThread, hookLogFile, readThreadActivity, recordThreadActivity, taskPaths,
 } from "./state.mjs";
@@ -68,14 +67,26 @@ async function main() {
     text: reply,
     source: claimKey ? "codex-inbound-reply" : "codex-stop-reply",
     eventKey,
+    publishEligible: found.task.auto_publish_on_completion === true && !claimKey,
   });
   log(found.task.logical_task_key + " " + (r.ok ? "queued" : r.reason) + " event=" + eventKey);
 
-  // 只告诉本地用户「已入队」，绝不冒充已送达飞书。
-  if (r.ok) process.stdout.write(JSON.stringify({
-    systemMessage: "飞书桥：本轮答复已进入本地待发布队列（尚未发送）。",
-    suppressOutput: true,
-  }) + "\n");
+  // 入站 run 的完成权属于 watcher；Stop 不能抢在 exit code 和 turn.completed 之前发布。
+  if (claimKey) process.exit(0);
+
+  const published = publishEligibleTaskEvents({ task: found.task, home: bridgeHome() });
+  log(found.task.logical_task_key + " auto-publish -> " + JSON.stringify(published));
+  let systemMessage = null;
+  if (published.status === "published") {
+    systemMessage = "飞书桥：本轮答复已自动发布到绑定话题。";
+  } else if (published.status === "error") {
+    systemMessage = "飞书桥：自动发布失败，本轮答复已保留在待发队列。";
+  } else if (published.status === "deferred") {
+    systemMessage = "飞书桥：发布器正忙，本轮答复已保留并将在后续回合重试。";
+  } else if (published.status === "disabled" && r.ok) {
+    systemMessage = "飞书桥：本轮答复已进入本地待发布队列（自动发布尚未启用）。";
+  }
+  if (systemMessage) process.stdout.write(JSON.stringify({ systemMessage, suppressOutput: true }) + "\n");
 }
 
 if (import.meta.url === "file://" + process.argv[1]) {

@@ -3,8 +3,11 @@
 
 import { recordClaimState } from "../claim.mjs";
 import { releaseSessionLock } from "../handoff.mjs";
-import { appendEvent, MAX_REPLY_CHARS } from "../outbox.mjs";
+import {
+  appendEvent, markPublishEligibleByEventKey, MAX_REPLY_CHARS, suppressPublishByEventKey,
+} from "../outbox.mjs";
 import { readCodexRunOutcome } from "./handoff.mjs";
+import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
 import { bridgeHome, loadRegistry, taskPaths } from "./state.mjs";
 
 const arg = (name) => {
@@ -59,6 +62,9 @@ try {
         source: "codex-run-watcher-fallback",
         eventKey,
       });
+      // Stop 只保存入站答复；四项终局证据齐全后，watcher 才允许它自动发布。
+      markPublishEligibleByEventKey({ outboxDir: paths.outbox, eventKey });
+      publishEligibleTaskEvents({ task, home });
       recordClaimState({
         claimsDir: paths.claims,
         key,
@@ -69,13 +75,17 @@ try {
       break;
     }
 
+    // Stop 可能已经保存了一段未通过严格终局校验的答复；保留证据但永久移出发布队列。
+    suppressPublishByEventKey({ outboxDir: paths.outbox, eventKey, reason: outcome.reason });
     appendEvent({
       outboxDir: paths.outbox,
       kind: "risk",
       text: task.task_display_name + " 的飞书指令执行失败（" + outcome.reason + "），任务没有完成。",
       source: "codex-run-watcher",
       eventKey: "codex:" + task.codex_thread_id + ":claim:" + key + ":failure",
+      publishEligible: task.auto_publish_on_completion === true,
     });
+    publishEligibleTaskEvents({ task, home });
     recordClaimState({ claimsDir: paths.claims, key, state: "failed", detail: { run_state: outcome.state, reason: outcome.reason } });
     process.exitCode = 1;
     break;
@@ -85,13 +95,16 @@ try {
     // watcher 自己超时不等于 Codex runner 已退出。此时保留 session lock，让下一条入站通过
     // owner pid 探活继续 fail-closed；直接放锁会允许两个 resume 并发踩同一 thread。
     releaseLock = false;
+    suppressPublishByEventKey({ outboxDir: paths.outbox, eventKey, reason: "watch_timeout" });
     appendEvent({
       outboxDir: paths.outbox,
       kind: "risk",
       text: task.task_display_name + " 的飞书指令超过本地 watcher 四小时观察窗口；runner 可能仍在执行，目标 task 继续保持锁定。",
       source: "codex-run-watcher",
       eventKey: "codex:" + task.codex_thread_id + ":claim:" + key + ":watch-timeout",
+      publishEligible: task.auto_publish_on_completion === true,
     });
+    publishEligibleTaskEvents({ task, home });
     recordClaimState({
       claimsDir: paths.claims,
       key,

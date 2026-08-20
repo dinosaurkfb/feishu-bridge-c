@@ -1,6 +1,6 @@
 ---
 name: codex-longtask-feishu
-description: 仅供用户直接操作本机 Codex Desktop/CLI task 时，接入、恢复、暂停或只读检查该 task 与飞书话题的受控连接，并查看或授权发布待发答复。若当前是 Aily/M5Codex 响应飞书 mention（存在 AILY_CLI_* 运行上下文），严禁使用本技能，必须改用 m5codex-inbound-router；不得因普通项目工作自动接入或发送。
+description: 仅供用户直接操作本机 Codex Desktop/CLI task 时，接入、恢复、暂停或只读检查该 task 与飞书话题的受控连接，并处理自动发布失败后保留的待发答复。若当前是 Aily/M5Codex 响应飞书 mention（存在 AILY_CLI_* 运行上下文），严禁使用本技能，必须改用 m5codex-inbound-router；不得因普通项目工作自动接入。
 ---
 
 # Codex task 飞书桥
@@ -63,15 +63,22 @@ node {{BRIDGE_ROOT}}/scripts/codex/feishu-status.mjs --thread-id <当前thread-i
 
 ## 答复与发布
 
-绑定 task 的 Stop hook 会把每轮 `last_assistant_message` 原样写入本地 outbox。入队不代表
-已发送。查看某个 task 的待发布正文：
+绑定 task 的本地回合结束后，Stop hook 会把 `last_assistant_message` 原样写入 task outbox，
+随后自动发布到原飞书话题；发布成功才标记事件，失败保持 eligible 并在后续回合重试。
+
+飞书入站回合不得由 Stop 抢先发送。只有 watcher 同时确认目标 thread、`turn.completed`、
+exit code 0 和非空最终输出后，才能为答复授予发布资格；失败或超时必须发布如实的风险回执，
+不能把半成品答复当作完成。
+
+升级前已有的历史待发项没有自动发布资格，不会因安装或下一轮 Stop 被补发。只读查看仍可用：
 
 ```bash
 node {{BRIDGE_ROOT}}/scripts/codex/drain-outbox.mjs --task-key <logical-task-key>
 ```
 
-只有用户明确授权本次真实发布后，才在同一命令后加 `--apply`。发布使用 M5Codex 自己的
-凭据，发送成功后才标记事件；失败保持 pending。不得安装定时排空、不得自动重放。
+该命令的 `--apply` 只用于人工处理历史积压或异常待发项，仍需用户针对这批内容明确授权。
+正常的新回合不再逐次询问发送授权。发布统一使用 M5Codex 自己的凭据；不得未经确认人工
+重放历史项，也不得把失败事件标成已发送。
 
 ## 边界
 

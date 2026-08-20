@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 /**
- * 安装 Codex adapter：只追加 hooks、复制五项技能（含三条控制命令）、初始化空 registry。
- * 默认 dry-run；不安装定时发布器，不修改 hook trust，不发送飞书。
+ * 安装 Codex adapter：追加 hooks、复制五项技能、初始化 registry，并为已登记 task 启用
+ * 每轮自动发布。默认 dry-run；不修改 hook trust，安装本身不发送飞书。
  */
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { bridgeHome, registryFile } from "./state.mjs";
+import {
+  bridgeHome, enableAutoPublishForAllTasks, loadRegistry, registryFile,
+} from "./state.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
@@ -28,6 +30,10 @@ const home = bridgeHome();
 const promptScript = path.join(ROOT, "scripts", "codex", "prompt-hook.mjs");
 const stopScript = path.join(ROOT, "scripts", "codex", "stop-hook.mjs");
 const log = path.join(home, "hook.log");
+const currentRegistry = loadRegistry(registryFile(home));
+const autoPublishMigrationCount = currentRegistry.ok
+  ? currentRegistry.tasks.filter((task) => task.auto_publish_on_completion !== true).length
+  : null;
 
 const hookCommand = (script) =>
   "if [ -x " + shellQuote(node) + " ] && [ -r " + shellQuote(script) + " ]; then " +
@@ -84,7 +90,8 @@ for (const skill of skills) {
 }
 console.log("commands    $feishu-bind  $feishu-unbind  $feishu-status（也出现在斜杠菜单）");
 console.log("state       " + home + "（Git 外）");
-console.log("publish     不安装定时器；真实发送仍逐次授权");
+console.log("publish     绑定 task 每轮自动发布；失败留队，历史积压不自动补发" +
+  (autoPublishMigrationCount === null ? "" : "（待迁移 " + autoPublishMigrationCount + " 个 task）"));
 console.log("hook trust  不自动写信任；安装后由用户审阅并确认");
 
 if (!apply) {
@@ -122,5 +129,13 @@ for (const skill of skills) {
 
 if (!uninstall && !fs.existsSync(registryFile(home))) {
   writeAtomic(registryFile(home), JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks: [] }, null, 2) + "\n");
+}
+if (!uninstall) {
+  const migrated = enableAutoPublishForAllTasks({ home });
+  if (!migrated.ok) {
+    console.error("自动发布合同迁移失败：" + migrated.reason + (migrated.error ? "（" + migrated.error + "）" : ""));
+    process.exit(1);
+  }
+  console.log("自动发布  已为 " + migrated.tasks + " 个已登记 task 启用（本次更新 " + migrated.changed + " 个）");
 }
 console.log("\n已完成本地安装。下一次 Codex 载入 hook 时会要求信任；请核对命令后再确认。");

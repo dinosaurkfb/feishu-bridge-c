@@ -214,7 +214,8 @@ export function resolveTask(task, { home = bridgeHome(), templatePath = template
   });
   config.logical_task_key = task.logical_task_key;
   config.runtime = "codex";
-  // Codex 当前合同是 Stop 只入队，真实发送逐次授权。这个字段不能从 Claude 默认值继承。
+  // 已安装的新合同按轮自动发布；旧登记在安装器显式迁移前保持 false，避免代码更新本身
+  // 立刻把历史 outbox 发出去。
   config.auto_publish_on_completion = task.auto_publish_on_completion === true;
   return { ok: true, task, mapping, config, template: tpl.template };
 }
@@ -275,6 +276,26 @@ export function setTaskConnectionStatus({
     }
     writeRegistry(reg.tasks, file);
     return { ok: true, changed: true, task };
+  } catch (err) {
+    return { ok: false, reason: "registry_unwritable", error: err.message };
+  } finally {
+    releasePublishLock(lockDir);
+  }
+}
+
+/** 安装新发布合同时一次性迁移所有既有 task；暂停项恢复后也应沿用同一合同。 */
+export function enableAutoPublishForAllTasks({ home = bridgeHome() } = {}) {
+  const lockDir = path.join(home, "registry.lock");
+  const lock = acquirePublishLock(lockDir);
+  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  try {
+    const file = registryFile(home);
+    const reg = loadRegistry(file);
+    if (!reg.ok) return reg;
+    const changed = reg.tasks.filter((task) => task.auto_publish_on_completion !== true).length;
+    if (changed === 0) return { ok: true, changed: 0, tasks: reg.tasks.length };
+    writeRegistry(reg.tasks.map((task) => ({ ...task, auto_publish_on_completion: true })), file);
+    return { ok: true, changed, tasks: reg.tasks.length };
   } catch (err) {
     return { ok: false, reason: "registry_unwritable", error: err.message };
   } finally {
@@ -363,7 +384,7 @@ export function makeTaskEntry({
     inbound_state: "pending",
     pending_token: token,
     inbound_prefix: inboundPrefix,
-    auto_publish_on_completion: false,
+    auto_publish_on_completion: true,
     bound_at: new Date(now).toISOString(),
     expires_at: new Date(now + 365 * 24 * 60 * 60 * 1000).toISOString(),
   };

@@ -7,16 +7,19 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { appendEvent, listPending } from "../outbox.mjs";
+import {
+  appendEvent, listPending, markPublishEligibleByEventKey, suppressPublishByEventKey,
+} from "../outbox.mjs";
 import { evaluateInbound, REJECT } from "../selector.mjs";
 import { composeCodexBinding, validThreadId } from "./bind-compose.mjs";
 import { readCodexRunOutcome } from "./handoff.mjs";
+import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
 import {
   classifyFeishuPrompt, composeAilyInboundContext, composeBindingContext, composeInitContext,
   composeStatusContext, composeUnbindContext, isAilyInvocation, isBindingPrompt,
 } from "./prompt-hook.mjs";
 import {
-  findRegisteredTaskForCodexThread, findTaskForCodexThread, findTaskForFeishuSession,
+  enableAutoPublishForAllTasks, findRegisteredTaskForCodexThread, findTaskForCodexThread, findTaskForFeishuSession,
   isThreadBusy, loadRegistry, makeTaskEntry, mappingForTask, recordThreadActivity,
   setTaskConnectionStatus, taskPaths, validateCodexTemplate, validateRegistryTasks, writeRegistry,
 } from "./state.mjs";
@@ -40,6 +43,29 @@ const test = (name, fn) => {
   catch (err) { failed += 1; console.error("FAIL " + name + "\n" + (err.stack ?? err)); }
 };
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), "feishu-codex-adapter-test-"));
+
+function autoPublishFixture({ enabled = true, workingPublisher = true } = {}) {
+  const home = temp();
+  const root = path.join(home, "project");
+  const bin = path.join(home, "fake-lark.sh");
+  const configBase = path.join(home, "agents");
+  const credentialDir = path.join(configBase, TEMPLATE.agent_uid);
+  fs.mkdirSync(root);
+  fs.mkdirSync(credentialDir, { recursive: true });
+  fs.writeFileSync(path.join(credentialDir, "config.json"), JSON.stringify({
+    apps: [{ name: TEMPLATE.lark_cli_profile, appId: TEMPLATE.transport_app_id }],
+  }));
+  fs.writeFileSync(bin, workingPublisher
+    ? "#!/bin/sh\nprintf '%s' '{\"ok\":true,\"data\":{\"message_id\":\"om_sent\"}}'\n"
+    : "#!/bin/sh\nexit 1\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({
+    ...TEMPLATE, lark_cli_bin: bin, lark_cli_config_base: configBase,
+  }));
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = enabled;
+  writeRegistry([task], path.join(home, "registry.json"));
+  return { home, root, task };
+}
 
 test("thread id 只接受精确 UUID，不接受 --last 或名字", () => {
   assert.equal(validThreadId(THREAD_A), true);
@@ -233,6 +259,7 @@ test("Codex task 的 claim/outbox 全部在 ~/.codex 桥状态下，不落项目
   assert.equal(paths.root.startsWith(path.join(home, "tasks") + path.sep), true);
   assert.equal(paths.root.startsWith(root + path.sep), false);
   assert.equal(mappingForTask(task, { home }).codex_thread_id, THREAD_A);
+  assert.equal(task.auto_publish_on_completion, true);
 });
 
 test("outbox 按事件键而非正文去重", () => {
@@ -243,6 +270,49 @@ test("outbox 按事件键而非正文去重", () => {
   assert.equal(appendEvent({ outboxDir, kind: "reply", text: "相同答复", eventKey: "turn-2" }).ok, true);
   assert.equal(appendEvent({ outboxDir, kind: "reply", text: "被改写也不应重入", eventKey: "turn-1" }).reason, "duplicate");
   assert.equal(listPending({ outboxDir }).length, 2);
+});
+
+test("自动发布只消费显式 eligible 事件，不补发升级前的历史 outbox", () => {
+  const { home, task } = autoPublishFixture();
+  const outboxDir = taskPaths(task, home).outbox;
+  appendEvent({ outboxDir, kind: "reply", text: "历史积压", eventKey: "old" });
+  appendEvent({ outboxDir, kind: "reply", text: "本轮答复", eventKey: "new", publishEligible: true });
+  const published = publishEligibleTaskEvents({ task, home });
+  assert.equal(published.status, "published");
+  assert.equal(published.count, 1);
+  assert.deepEqual(listPending({ outboxDir }).map((event) => event.text), ["历史积压"]);
+});
+
+test("入站 Stop 的答复只有经 watcher 提升资格后才能自动发布", () => {
+  const { home, task } = autoPublishFixture();
+  const outboxDir = taskPaths(task, home).outbox;
+  appendEvent({ outboxDir, kind: "reply", text: "严格终局答复", eventKey: "claim-reply" });
+  assert.equal(publishEligibleTaskEvents({ task, home }).status, "empty");
+  assert.equal(markPublishEligibleByEventKey({ outboxDir, eventKey: "claim-reply" }).ok, true);
+  assert.equal(publishEligibleTaskEvents({ task, home }).status, "published");
+  assert.equal(listPending({ outboxDir }).length, 0);
+});
+
+test("严格终局失败的半成品答复保留证据但退出发布队列", () => {
+  const outboxDir = path.join(temp(), "outbox");
+  const first = appendEvent({ outboxDir, kind: "reply", text: "半成品", eventKey: "failed-claim" });
+  assert.equal(first.ok, true);
+  assert.equal(suppressPublishByEventKey({ outboxDir, eventKey: "failed-claim", reason: "nonzero_exit" }).ok, true);
+  assert.equal(listPending({ outboxDir }).length, 0);
+  const saved = JSON.parse(fs.readFileSync(first.file, "utf-8"));
+  assert.equal(saved.text, "半成品");
+  assert.equal(saved.publish_suppressed_reason, "nonzero_exit");
+  assert.equal(saved.published_at, null);
+});
+
+test("自动发布失败保留 eligible 事件，后续回合可以重试", () => {
+  const { home, task } = autoPublishFixture({ workingPublisher: false });
+  const outboxDir = taskPaths(task, home).outbox;
+  appendEvent({ outboxDir, kind: "reply", text: "暂时发不出", eventKey: "retry", publishEligible: true });
+  const published = publishEligibleTaskEvents({ task, home });
+  assert.equal(published.status, "error");
+  assert.equal(listPending({ outboxDir }).length, 1);
+  assert.equal(typeof listPending({ outboxDir })[0].publish_eligible_at, "string");
 });
 
 test("Stop 与 watcher 并发写同一事件键时只留下一个文件", () => {
@@ -440,6 +510,7 @@ test("Codex Stop hook：相同正文的两个 turn 各入队一次，同一 turn
   const root = path.join(home, "project");
   fs.mkdirSync(root);
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = false;
   writeRegistry([task], path.join(home, "registry.json"));
   const hook = path.join(ROOT, "scripts", "codex", "stop-hook.mjs");
   const run = (turn) => spawnSync(process.execPath, [hook], {
@@ -453,6 +524,23 @@ test("Codex Stop hook：相同正文的两个 turn 各入队一次，同一 turn
   assert.equal(listPending({ outboxDir: taskPaths(task, home).outbox }).length, 2);
 });
 
+test("Codex Stop hook 自动发布本地回合，并保留旧的非 eligible 积压", () => {
+  const { home, root, task } = autoPublishFixture();
+  const outboxDir = taskPaths(task, home).outbox;
+  appendEvent({ outboxDir, kind: "reply", text: "旧答复", eventKey: "legacy" });
+  const hook = path.join(ROOT, "scripts", "codex", "stop-hook.mjs");
+  const r = spawnSync(process.execPath, [hook], {
+    input: JSON.stringify({
+      session_id: THREAD_A, turn_id: "turn-auto", cwd: root, last_assistant_message: "新答复",
+    }),
+    encoding: "utf-8",
+    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /已自动发布到绑定话题/u);
+  assert.deepEqual(listPending({ outboxDir }).map((event) => event.text), ["旧答复"]);
+});
+
 test("Codex bind-preview 的传递依赖碰不到 outbound", () => {
   const preview = fs.readFileSync(path.join(ROOT, "scripts", "codex", "bind-preview.mjs"), "utf-8");
   const compose = fs.readFileSync(path.join(ROOT, "scripts", "codex", "bind-compose.mjs"), "utf-8");
@@ -460,11 +548,12 @@ test("Codex bind-preview 的传递依赖碰不到 outbound", () => {
   assert.equal(compose.includes("outbound.mjs"), false);
 });
 
-test("watcher 不发飞书，只把严格完成的最终答复兜底入队并放锁", () => {
+test("关闭自动发布时 watcher 只把严格完成的最终答复兜底入队并放锁", () => {
   const home = temp();
   const root = path.join(home, "project");
   fs.mkdirSync(root);
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = false;
   writeRegistry([task], path.join(home, "registry.json"));
   const paths = taskPaths(task, home);
   fs.mkdirSync(paths.runs, { recursive: true });
@@ -503,8 +592,14 @@ test("安装器在隔离 HOME 只追加 hooks、渲染技能路径且保留已�
   const codexHome = path.join(dir, "codex-home");
   const home = path.join(dir, "bridge-home");
   fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
   const old = { hooks: { Stop: [{ hooks: [{ type: "command", command: "existing-orca", timeout: 1 }] }] } };
   fs.writeFileSync(path.join(codexHome, "hooks.json"), JSON.stringify(old));
+  const root = path.join(dir, "project");
+  fs.mkdirSync(root);
+  const legacyTask = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  legacyTask.auto_publish_on_completion = false;
+  writeRegistry([legacyTask], path.join(home, "registry.json"));
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
     encoding: "utf-8",
     env: { ...process.env, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
@@ -529,6 +624,23 @@ test("安装器在隔离 HOME 只追加 hooks、渲染技能路径且保留已�
     assert.equal(commandSkill.includes("name: " + name), true);
   }
   assert.equal(fs.existsSync(path.join(home, "registry.json")), true);
+  assert.equal(loadRegistry(path.join(home, "registry.json")).tasks[0].auto_publish_on_completion, true);
+});
+
+test("自动发布登记迁移幂等，暂停 task 也保留恢复后的发布合同", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const active = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  const paused = makeTaskEntry({ root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "b" });
+  active.auto_publish_on_completion = false;
+  paused.auto_publish_on_completion = false;
+  paused.status = "paused";
+  writeRegistry([active, paused], path.join(home, "registry.json"));
+  assert.equal(enableAutoPublishForAllTasks({ home }).changed, 2);
+  assert.equal(enableAutoPublishForAllTasks({ home }).changed, 0);
+  assert.deepEqual(loadRegistry(path.join(home, "registry.json")).tasks.map((task) => task.auto_publish_on_completion),
+    [true, true]);
 });
 
 test("绑定预览为同一 thread 生成稳定逻辑键与平台幂等键", () => {

@@ -17,7 +17,8 @@ Codex 与 Claude 的关键差异已经隔离在 `scripts/codex/`：
 - 入站用 detached `codex exec resume <精确 UUID> --json` 秒级返回；
 - Stop 以 `thread + turn/claim` 事件键原样入队，相同正文的不同轮次不会互相去重；
 - Codex locator、claim、receipt 和 outbox 全在 `~/.codex/feishu-bridge/`，不进入工作树；
-- 当前 Stop 只入队，真实飞书发布仍由 `drain-outbox.mjs --apply` 逐次授权。
+- 已绑定 task 每轮自动发布：本地回合由 Stop 发送，飞书入站回合须等严格 watcher 确认终局；
+- 发送失败留在 outbox 后续重试，升级前历史积压不会被自动补发，人工 drain 仍逐次授权；
 - Codex 官方 `/init` 仍只负责生成 `AGENTS.md`；hook 仅要求初始化成功后询问是否接入，
   不在 `/init` 本轮自动建飞书话题；
 - 安装后提供 `$feishu-bind`、`$feishu-unbind`、`$feishu-status` 三项技能命令，
@@ -140,7 +141,7 @@ scripts/
   出站   outbox / drain-outbox / outbound / stop-hook / watch-and-publish
   接入   init-hook / bind-preview / bind-project / bind-compose / chain-template
   共用   project-resolve（从哪读配置）/ registry / binding / binding-health
-  codex/ 精确 thread 状态、绑定、hooks、handoff、watcher、逐次授权发布
+  codex/ 精确 thread 状态、绑定、hooks、handoff、watcher、自动发布与人工恢复
 skills/        Claude / Codex 的入站与长期任务技能源
 references/    配置模板（chain-config / active-mapping）
 .runtime-data/ 身份、绑定、claim、回执、outbox 队列。禁止提交

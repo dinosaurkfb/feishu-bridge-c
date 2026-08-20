@@ -11,7 +11,8 @@
 - 绑定单位是 Codex task/thread，不是项目路径。同一仓库的两个 task 必须建立两条独立话题。
 - Aily `session_id` 只负责飞书话题路由；`codex_thread_id` 只负责本机 Codex 续接，两者不能混用。
 - 所有运行 locator 放在 `~/.codex/feishu-bridge/`，不得提交或复制到项目文档。
-- Stop 自动入队但不自动发送；每次真实 drain 都需要该次明确授权。
+- 已绑定 task 的每轮最终答复自动发布；发送失败留队，升级前历史积压不自动补发。
+- 飞书入站回合必须由 watcher 严格确认目标 thread、`turn.completed`、exit 0 和非空输出后发布。
 - 入站 selector 只要求绑定话题中的真实 `@M5Codex`；mention 后正文直接作为指令。
 
 ## 1. 本地回归
@@ -50,12 +51,13 @@ node scripts/codex/install.mjs --apply
 ```
 
 安装器只向现有 `UserPromptSubmit` 和 `Stop` 数组追加自己的命令，保留其他 hook，并在改前
-备份。它不会替用户写 hook trust；首次载入时应核对命令路径后由用户确认信任。
+备份。它同时为既有 task 启用每轮自动发布，但安装动作本身不发送历史 outbox。它不会替用户
+写 hook trust；首次载入时应核对命令路径后由用户确认信任。
 
 它安装两项技能：
 
 - `m5codex-inbound-router`：M5Codex 收到真实 mention 时执行确定性入站脚本；
-- `codex-longtask-feishu`：当前 task 的接入预览、一次性建话题和逐次授权发布。
+- `codex-longtask-feishu`：当前 task 的接入预览、一次性建话题、自动发布与异常积压处理。
 
 同时安装三项命令型技能到 `$CODEX_HOME/skills/`（也会出现在斜杠菜单）：
 
@@ -97,13 +99,16 @@ node scripts/codex/bind-task.mjs --project /absolute/project --thread-id <uuid> 
 
 ## 6. 答复发布
 
-Stop hook 使用精确 thread 匹配，把答复放入 task outbox。查看正文不会发送：
+Stop hook 使用精确 thread 匹配，把本地回合答复放入 task outbox 并立即自动发布。飞书入站
+回合先只入队，待 watcher 严格确认终局后自动发布。失败事件保持待发资格，后续回合会重试。
+
+升级前遗留的 outbox 不会自动补发。查看这些历史或异常待发正文不会发送：
 
 ```bash
 node scripts/codex/drain-outbox.mjs --task-key <logical-task-key>
 ```
 
-针对屏幕显示的这批内容取得本次发布授权后，才运行：
+针对屏幕显示的历史积压取得本次发布授权后，才运行：
 
 ```bash
 node scripts/codex/drain-outbox.mjs --task-key <logical-task-key> --apply
@@ -118,8 +123,8 @@ node scripts/codex/drain-outbox.mjs --task-key <logical-task-key> --apply
 1. 安装 hooks/skills 并确认 trust；
 2. 建一个测试 task 绑定；
 3. 用一条全新 mention 验证秒级 accepted、唯一 claim 和精确 thread；
-4. 验证目标 task 产生非空最终答复、Stop/watcher 只入队一条；
-5. 单独授权 drain，核对 M5Codex sender 和原话题 readback。
+4. 验证目标 task 产生非空最终答复、Stop/watcher 只形成一条事件；
+5. 核对自动发布的 sender 确为 M5Codex、目标为原话题并完成 readback。
 
 ## 已知边界
 

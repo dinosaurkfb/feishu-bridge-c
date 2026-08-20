@@ -1250,9 +1250,31 @@ test("断句：中文句号不需要后跟空格，英文点号需要", () => {
   assert.equal(firstSentence("没有终止符的一段"), "没有终止符的一段");
 });
 
-test("没有 CLAUDE.md 就看 README.md", () => {
-  const d = projWith({ "README.md": "# 备用名\n\n一句用途。\n" });
-  assert.equal(readProjectIdentity({ root: d }).name, "备用名");
+test("/init 生成的 CLAUDE.md 不能当项目身份用 —— 标题就是文件名、首段是样板话", () => {
+  const boiler = "# CLAUDE.md\n\nThis file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.\n\n## 别的\n";
+  const only = projWith({ "CLAUDE.md": boiler });
+  const id = readProjectIdentity({ root: only });
+  assert.equal(id.source, "dirname", "只有样板 CLAUDE.md 时必须退到目录名");
+  assert.equal(id.name, path.basename(only));
+
+  // 有 README 就该用 README —— 这是 /init 之后的常态。
+  const both = projWith({ "CLAUDE.md": boiler, "README.md": "# cc2cd\n\n让 Claude 和 Codex 对话。\n" });
+  const id2 = readProjectIdentity({ root: both });
+  assert.equal(id2.name, "cc2cd");
+  assert.equal(id2.source, "README.md");
+});
+
+test("README 优先于 CLAUDE.md", () => {
+  const d = projWith({ "README.md": "# 真名\n\n真用途。\n", "CLAUDE.md": "# 假名\n\n假用途。\n" });
+  assert.equal(readProjectIdentity({ root: d }).name, "真名");
+});
+
+test("行内 markdown 被剥掉 —— 飞书文本消息不渲染，留着就是一堆星号", () => {
+  const d = projWith({ "README.md": "# `cc2cd`\n\n让两个模型**互相**对话，详见 [基线](./x.md)。\n" });
+  const id = readProjectIdentity({ root: d });
+  assert.equal(id.name, "cc2cd");
+  assert.equal(id.purpose, "让两个模型互相对话，详见 基线。");
+  assert.ok(!id.purpose.includes("*") && !id.purpose.includes("`") && !id.purpose.includes("]("));
 });
 
 test("两个文件都没有 → 用目录名，绝不失败", () => {

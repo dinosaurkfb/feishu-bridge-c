@@ -65,7 +65,38 @@ export function firstSentence(s) {
  * 用途取第一段的第一句：整段常常带着「详见 README」这类对话题头没用的尾巴，
  * 而第一句几乎总是那句「这个项目是干什么的」。
  */
-export function readProjectIdentity({ root, files = ["CLAUDE.md", "README.md"] }) {
+/**
+ * README 排在 CLAUDE.md 前面，是被 `/init` 教育的结果。
+ *
+ * `/init` 生成的 CLAUDE.md 头两行是固定模板：
+ *   # CLAUDE.md
+ *   This file provides guidance to Claude Code (claude.ai/code) when working with code…
+ * 照着取就得到 name="CLAUDE.md"、用途是那句样板话 —— 两个都没用。
+ * README 是写给人看的，它的一级标题几乎总是项目名。
+ */
+export const IDENTITY_FILES = ["README.md", "CLAUDE.md"];
+
+/** 标题就是文件名本身（`# CLAUDE.md`）时它不是项目名，跳过这个文件去看下一个。 */
+const isFilenameHeading = (name, file) =>
+  name.toLowerCase() === file.toLowerCase() || /^(claude|readme|agents)\.md$/i.test(name);
+
+/** `/init` 的样板首段。它出现在本机每一个 /init 过的仓库里，不是项目用途。 */
+const isBoilerplate = (s) => /claude\.ai\/code|^This file provides guidance/i.test(s);
+
+/**
+ * 去掉行内 markdown。飞书的文本消息**不渲染 markdown** —— 留着 `**` 和反引号
+ * 就是把一堆星号发进话题标题。
+ */
+function stripInlineMarkdown(s) {
+  return s
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")   // 链接只留字面
+    .replace(/(\*\*|__)(.*?)\1/g, "$2")
+    .replace(/(^|[\s(（])[*_](\S(?:.*?\S)?)[*_](?=[\s)）.,，。!！?？]|$)/g, "$1$2")
+    .replace(/`([^`]*)`/g, "$1")
+    .trim();
+}
+
+export function readProjectIdentity({ root, files = IDENTITY_FILES }) {
   const fallback = { name: path.basename(root), purpose: null, source: "dirname" };
 
   for (const f of files) {
@@ -80,7 +111,8 @@ export function readProjectIdentity({ root, files = ["CLAUDE.md", "README.md"] }
     const headingAt = lines.findIndex((l) => /^#\s+\S/.test(l));
     if (headingAt < 0) continue;
 
-    const name = lines[headingAt].replace(/^#\s+/, "").trim();
+    const name = stripInlineMarkdown(lines[headingAt].replace(/^#\s+/, "").trim());
+    if (!name || isFilenameHeading(name, f)) continue;
 
     // 标题之后第一个非空段落，折行拼回一行。
     const para = [];
@@ -94,9 +126,11 @@ export function readProjectIdentity({ root, files = ["CLAUDE.md", "README.md"] }
     const joined = para.join(" ").replace(/\s+/g, " ").trim();
 
     let purpose = null;
-    if (joined) purpose = firstSentence(joined).slice(0, PURPOSE_MAX).trim();
+    if (joined && !isBoilerplate(joined)) {
+      purpose = stripInlineMarkdown(firstSentence(joined)).slice(0, PURPOSE_MAX).trim();
+    }
 
-    if (name) return { name, purpose: purpose || null, source: f };
+    return { name, purpose: purpose || null, source: f };
   }
 
   return fallback;

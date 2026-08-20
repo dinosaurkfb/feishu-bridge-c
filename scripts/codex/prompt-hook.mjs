@@ -12,9 +12,10 @@ export function classifyFeishuPrompt(prompt) {
   if (typeof prompt !== "string") return "none";
   const p = prompt.trim();
   if (p === "/init") return "init";
-  if (/(?:^|\s)\$feishu-unbind(?:\s|$)/u.test(p)) return "unbind";
-  if (/(?:^|\s)\$feishu-status(?:\s|$)/u.test(p)) return "status";
-  if (/(?:^|\s)\$feishu-bind(?:\s|$)/u.test(p)) return "bind";
+  // Desktop 会把显式技能调用序列化成 `[$skill](/absolute/SKILL.md)`；CLI 则可能保留裸 `$skill`。
+  if (/\$feishu-unbind\b/u.test(p)) return "unbind";
+  if (/\$feishu-status\b/u.test(p)) return "status";
+  if (/\$feishu-bind\b/u.test(p)) return "bind";
   if (/(?:是否|是不是|能否|能不能|可不可以|可以).{0,20}(?:加|新增|提供|支持).{0,8}(?:命令|功能)/u.test(p)) {
     return "none";
   }

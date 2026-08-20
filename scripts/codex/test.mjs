@@ -274,6 +274,9 @@ test("Prompt hook 的接桥意图窄匹配，并注入精确 thread 命令", () 
   assert.equal(classifyFeishuPrompt("$feishu-bind"), "bind");
   assert.equal(classifyFeishuPrompt("$feishu-unbind"), "unbind");
   assert.equal(classifyFeishuPrompt("$feishu-status"), "status");
+  assert.equal(classifyFeishuPrompt("[$feishu-bind](/Users/test/.codex/skills/feishu-bind/SKILL.md)"), "bind");
+  assert.equal(classifyFeishuPrompt("[$feishu-unbind](/Users/test/.codex/skills/feishu-unbind/SKILL.md)"), "unbind");
+  assert.equal(classifyFeishuPrompt("[$feishu-status](/Users/test/.codex/skills/feishu-status/SKILL.md)"), "status");
   assert.equal(classifyFeishuPrompt("把当前 task 撤销飞书接入"), "unbind");
   assert.equal(classifyFeishuPrompt("查看当前 task 的飞书接入状态"), "status");
   assert.equal(classifyFeishuPrompt("是不是也可以加个命令来实现接入飞书和撤销接入？"), "none");

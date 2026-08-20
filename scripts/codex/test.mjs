@@ -358,8 +358,33 @@ test("Prompt hook 的接桥意图窄匹配，并注入精确 thread 命令", () 
   const c = composeBindingContext({ bridgeRoot: "/bridge", cwd: "/work", threadId: THREAD_A, chatName: "群" });
   assert.match(c, new RegExp(THREAD_A));
   assert.equal(c.includes("resume --last"), false);
+  assert.match(c, /bind-task\.mjs.*--apply/u);
+  assert.equal(c.includes("bind-preview.mjs"), false);
+  assert.match(c, /无需再次预览或确认/u);
   assert.match(composeUnbindContext({ bridgeRoot: "/bridge", threadId: THREAD_A }), /feishu-unbind\.mjs/);
   assert.match(composeStatusContext({ bridgeRoot: "/bridge", threadId: THREAD_A }), /feishu-status\.mjs/);
+});
+
+test("$feishu-bind 直接注入幂等绑定命令，不再产生二次确认回合", () => {
+  const home = temp();
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const hook = path.join(ROOT, "scripts", "codex", "prompt-hook.mjs");
+  const r = spawnSync(process.execPath, [hook], {
+    input: JSON.stringify({
+      session_id: THREAD_A,
+      turn_id: "turn_bind",
+      cwd: "/work",
+      prompt: "$feishu-bind",
+    }),
+    encoding: "utf-8",
+    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const injected = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+  assert.match(injected, /bind-task\.mjs.*--apply/u);
+  assert.equal(injected.includes("bind-preview.mjs"), false);
+  assert.match(injected, /无需再次预览或确认/u);
+  assert.equal(injected.includes("回复“确认”"), false);
 });
 
 test("/init 只追加初始化成功后的询问，不触发绑定或飞书写入", () => {
@@ -367,6 +392,7 @@ test("/init 只追加初始化成功后的询问，不触发绑定或飞书写�
   assert.match(c, /先完整执行 \/init 原本的 AGENTS\.md 初始化/);
   assert.match(c, /是否将当前 Codex task 接入飞书/);
   assert.match(c, /请回复“接入飞书”/);
+  assert.match(c, /不再要求第二次确认/);
   assert.equal(c.includes("bind-task.mjs"), false);
 
   const home = temp();
@@ -769,6 +795,9 @@ test("安装器在隔离 HOME 只追加 hooks、渲染技能路径且保留已�
   for (const name of ["feishu-bind", "feishu-unbind", "feishu-status"]) {
     const commandSkill = fs.readFileSync(path.join(codexHome, "skills", name, "SKILL.md"), "utf-8");
     assert.equal(commandSkill.includes("name: " + name), true);
+    if (name === "feishu-bind") {
+      assert.equal(commandSkill.includes("不先运行只读预览，也不再次要求用户"), true);
+    }
   }
   assert.equal(fs.existsSync(path.join(home, "registry.json")), true);
   assert.equal(fs.statSync(path.join(home, "receipts")).isDirectory(), true);

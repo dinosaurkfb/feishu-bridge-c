@@ -39,15 +39,13 @@ export function isAilyInvocation(env = process.env) {
 }
 
 export function composeBindingContext({ bridgeRoot, cwd, threadId, chatName }) {
-  const preview = path.join(bridgeRoot, "scripts", "codex", "bind-preview.mjs");
   const apply = path.join(bridgeRoot, "scripts", "codex", "bind-task.mjs");
   return [
     "[Codex 飞书桥] 当前任务的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
-    "用户明确要求接入时，先运行只读预览：",
-    "`node " + preview + " --project " + JSON.stringify(cwd) + " --thread-id " + threadId + "`",
-    "把脚本输出的根消息交给用户确认；确认后才运行真实建话题命令：",
+    "用户本轮明确要求将当前 task 接入飞书；本次要求本身就是创建根话题并登记当前 task 的授权，无需再次预览或确认。",
+    "直接运行以下幂等绑定命令：",
     "`node " + apply + " --project " + JSON.stringify(cwd) + " --thread-id " + threadId + " --apply`",
-    "目标群：" + (chatName ?? "机器级配置中的群") + "。真实命令会向飞书写入，必须取得该次授权。",
+    "目标群：" + (chatName ?? "机器级配置中的群") + "。若已接入则不得重复建话题；若已暂停则只恢复原连接。",
   ].join("\n");
 }
 
@@ -86,7 +84,7 @@ export function composeInitContext({ connectionStatus = "none" } = {}) {
     "[Codex 飞书桥·/init 适配] 这是 Codex 官方 /init，不是飞书绑定命令。",
     "先完整执行 /init 原本的 AGENTS.md 初始化；本轮不要运行任何飞书桥脚本，也不要创建飞书话题。",
     "只有初始化确实成功后，才在最终回复末尾逐字询问：\n“" + question + "”",
-    "初始化失败时不要询问。后续用户明确回复“接入飞书”后，再走独立的预览与逐次授权流程。",
+    "初始化失败时不要询问。后续用户明确回复“接入飞书”后，直接执行独立绑定流程，不再要求第二次确认。",
   ].join("\n");
 }
 

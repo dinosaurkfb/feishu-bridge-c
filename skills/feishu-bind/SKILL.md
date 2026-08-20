@@ -8,5 +8,6 @@ description: 将当前精确 Codex task 接入飞书，或恢复该 task 已暂�
 这是 `$feishu-bind` 控制命令。使用 UserPromptSubmit hook 注入的精确 thread id；若没有注入，
 报告 hook 未生效并停止，不得使用 `--last`、按标题猜测或操作其他 task。
 
-按 `codex-longtask-feishu` 的接入合同执行只读预览。新接入只有在用户针对预览明确确认后
-才能真实创建飞书话题；恢复已暂停的连接只复用原话题，不创建或发送飞书消息。
+`$feishu-bind` 本身就是用户对“将当前精确 task 接入飞书”的明确授权。按
+`codex-longtask-feishu` 的接入合同直接执行真实绑定，不先运行只读预览，也不再次要求用户
+回复“确认”。若当前 task 已接入则幂等返回；若接入已暂停则只复用原话题恢复，不新建话题。

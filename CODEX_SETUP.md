@@ -113,8 +113,8 @@ npm run doctor:codex
 $feishu-bind
 ```
 
-技能会先展示根消息预览。你明确确认后，它才会用 M5Codex 在目标群创建话题并登记当前精确
-thread。不要从另一个 task 按标题代绑，也不要使用 `--last`。
+`$feishu-bind` 本身就是本次绑定授权：技能会直接用 M5Codex 在目标群创建话题并登记当前
+精确 thread，不再要求回复第二次“确认”。不要从另一个 task 按标题代绑，也不要使用 `--last`。
 
 新话题建立后，在该话题中真实 `@M5Codex` 一次；空正文即可完成首次 Aily session 绑定。
 之后 mention 后的正文直接作为指令，不需要 `→Codex` 等关键字。

@@ -161,8 +161,8 @@ Codex task 中运行：
 $feishu-bind
 ```
 
-确认预览后，bridge 会自动创建话题并登记**当前精确 task**。去新话题真实 `@M5Codex` 一次
-完成首次 Aily session 绑定。日常还可以使用：
+`$feishu-bind` 本身就是本次绑定授权，bridge 会直接创建话题并登记**当前精确 task**，不再
+要求回复第二次“确认”。去新话题真实 `@M5Codex` 一次完成首次 Aily session 绑定。日常还可以使用：
 
 | 命令 | 作用 |
 |---|---|

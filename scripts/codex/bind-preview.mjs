@@ -26,7 +26,7 @@ if (existing.ok) {
   if ((existing.task.status ?? "active") === "paused") {
     console.log("这个 Codex task 的飞书接入已暂停：" + existing.task.task_display_name);
     console.log("恢复后会继续使用原飞书话题，不会创建新话题，也不会向飞书发送消息。");
-    console.log("确认后运行 bind-task.mjs --apply 恢复接入。");
+    console.log("运行 bind-task.mjs --apply 可恢复接入。");
   } else {
     console.log("这个 Codex task 已接入：" + existing.task.task_display_name);
     console.log("入站    " + (existing.task.inbound_state === "bound" ? "已绑定" : "待绑定"));
@@ -47,4 +47,4 @@ console.log("唯一身份  " + tpl.template.transport_agent_name);
 console.log("入站关键字  无（只需真实 @M5Codex）");
 console.log("\n--- 根消息（发出去就改不了）---\n" + d.rootText);
 console.log("\n--- 底下第一条 ---\n" + d.statusText);
-console.log("\n这条命令没有写文件、没有联网、没有发送。确认后才运行 bind-task.mjs --apply。");
+console.log("\n这条命令没有写文件、没有联网、没有发送。运行 bind-task.mjs --apply 可执行绑定。");

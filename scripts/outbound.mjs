@@ -118,9 +118,14 @@ function truncate(s, n) {
  * M5Claude 是入站运输层，让它发布进展会把两个方向的职责搅在一起。
  */
 export function publishDraft({ profile, rootMessageId, text, larkBin, larkHome, timeoutMs }) {
-  // 必须显式指定二进制和配置源：守望者是在 M5Claude 的清洗环境里被拉起的，
+  // 必须显式指定二进制和配置目录：守望者是在 M5Claude 的清洗环境里被拉起的，
   // 那里 lark-cli 被重定向到按 agent 隔离的配置目录（只有 platform-bot），
   // 靠环境里“恰好是什么”会拿到错误的身份，实测就是这么发布失败的。
+  //
+  // 变量名是 LARKSUITE_CLI_CONFIG_DIR。**曾经写的是 LARKSUITE_CLI_HOME，那个变量
+  // 在 lark-cli 里根本不存在**（2026-08-20 在二进制里数过：0 次），所以这道保护
+  // 一直在空转 —— 出站之所以没出事，只是因为终端里的默认配置目录恰好就是对的。
+  // 一个不存在的环境变量不会报错，只会安静地什么都不做。
   const out = execFileSync(
     larkBin ?? "lark-cli",
     ["im", "+messages-reply", "--message-id", rootMessageId, "--as", "bot",
@@ -131,7 +136,7 @@ export function publishDraft({ profile, rootMessageId, text, larkBin, larkHome, 
       // 失败信息不会丢：execFileSync 抛出的 error 上带着 stdout/stderr。
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, LARKSUITE_CLI_PROFILE: profile,
-             ...(larkHome ? { LARKSUITE_CLI_HOME: larkHome } : {}) },
+             ...(larkHome ? { LARKSUITE_CLI_CONFIG_DIR: larkHome } : {}) },
       // 会话结束钩子会传一个更短的超时：那条路径卡住的是 Frank 的终端，
       // 不能为了发一条进展让他的会话吊在那里。发不出去就留在 outbox 等兜底定时器。
       timeout: timeoutMs ?? 30_000, maxBuffer: 4 * 1024 * 1024 },
@@ -159,7 +164,7 @@ export function sendToChat({ profile, chatId, text, idempotencyKey, larkBin, lar
     encoding: "utf-8",
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, LARKSUITE_CLI_PROFILE: profile,
-           ...(larkHome ? { LARKSUITE_CLI_HOME: larkHome } : {}) },
+           ...(larkHome ? { LARKSUITE_CLI_CONFIG_DIR: larkHome } : {}) },
     timeout: timeoutMs ?? 30_000, maxBuffer: 4 * 1024 * 1024,
   });
   const parsed = JSON.parse(out);

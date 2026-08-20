@@ -1625,6 +1625,19 @@ test("已消费列表会进 mapping —— 幂等那道闸才拦得住重复消�
   assert.equal(v.reason, REJECT.DUPLICATE_MESSAGE);
 });
 
+// ---------- lark-cli 的环境变量名（写错了不会报错，只会安静地不生效） ----------
+
+test("出站传的是 LARKSUITE_CLI_CONFIG_DIR，不是那个不存在的 LARKSUITE_CLI_HOME", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "outbound.mjs"), "utf-8");
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  assert.ok(code.includes("LARKSUITE_CLI_CONFIG_DIR"), "必须用真实存在的那个变量名");
+  assert.ok(!code.includes("LARKSUITE_CLI_HOME"),
+    "LARKSUITE_CLI_HOME 在 lark-cli 二进制里出现 0 次 —— 设了等于没设，而且不会报错");
+  // 两个发送入口都得钉住身份：只钉一个，另一个就会在 agent 的清洗环境里拿错身份。
+  assert.equal((code.match(/LARKSUITE_CLI_CONFIG_DIR/g) ?? []).length, 2);
+  assert.equal((code.match(/LARKSUITE_CLI_PROFILE/g) ?? []).length, 2);
+});
+
 // ---------- 汇总 ----------
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

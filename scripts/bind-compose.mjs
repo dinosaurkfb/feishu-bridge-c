@@ -155,19 +155,22 @@ export function composeRootMessage({ name, purpose, root, token }) {
  *
  * 它本身就是一次真实的出站验证：走的是 publishDraft，也就是出站平时走的那条代码路径。
  * 换一条路径去验证，验证的就不是真正会被用到的那条。
+ *
+ * 这里说的是**当前状态**，所以它必须待在根消息之外 —— 根消息发出去改不了，
+ * 而状态会变（入站从「差一个 @」变成「已绑定」）。后来的回复能盖掉这一条。
+ *
+ * 曾经有个 inboundReady 开关，false 分支写着「多绑定改造没做完」。改造做完之后
+ * 那个分支就成了不可达的死代码，里面还留着一句关于本系统的假话 ——
+ * **没有代码走到的文案最容易变成过期的谎言**，所以直接删掉，不留开关。
  */
-export function composeStatusMessage({ name, inboundReady }) {
-  const lines = ["✅ 出站已接通 —— 你能看到这条，就说明它真的通了。"];
-  if (inboundReady) {
-    lines.push("", "入站还差一步：在这条消息下面 @M5Claude 发一条（空的也行），绑定就完成了。");
-  } else {
-    lines.push(
-      "",
-      "⚠️ 入站（在这里 @M5Claude 给 " + name + " 下指令）还没接通。",
-      "入站路由目前只认一个项目，多绑定改造没做完之前，在这个话题里 @ 是不会有反应的。",
-    );
-  }
-  return lines.join("\n");
+export function composeStatusMessage({ name }) {
+  return [
+    "✅ 出站已接通 —— 你能看到这条，就说明它真的通了。",
+    "",
+    "入站还差最后一下：**在这条消息下面 @ 一下运输 agent**（空消息也行），绑定就完成了。",
+    "建话题的这一刻平台侧的会话还不存在，它是第一条消息流进来才产生的 —— 所以绑定分两段。",
+    "绑完之后，在这个话题里说话就是给 " + name + " 下指令。",
+  ].join("\n");
 }
 
 /**

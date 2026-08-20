@@ -60,7 +60,7 @@ console.log("身份      " + template.outbound_agent_name + "（profile " + temp
 console.log("\n--- 根消息（发出去就改不了）---\n" +
   composeRootMessage({ name, purpose: identity.purpose, root, token }));
 console.log("\n--- 底下第一条（之后的回复可以盖掉它）---\n" +
-  composeStatusMessage({ name, inboundReady: false }));
+  composeStatusMessage({ name }));
 
 console.log("\n这条命令什么都没做。真的建话题要跑：");
 console.log("  node " + path.join(path.dirname(new URL(import.meta.url).pathname)) +

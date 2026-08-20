@@ -1111,13 +1111,15 @@ test("根消息里不含任何当前进度字样 —— 它发出去就改不了
   }
 });
 
-test("入站没通时状态消息必须明说不通 —— 没做成就不能说做成了", () => {
-  const off = composeStatusMessage({ name: "a", inboundReady: false });
-  assert.ok(off.includes("还没接通"));
-  assert.ok(!off.includes("绑定就完成了"));
-  const on = composeStatusMessage({ name: "a", inboundReady: true });
-  assert.ok(on.includes("绑定就完成了"));
-  assert.ok(!on.includes("还没接通"));
+test("状态消息说清入站还差 @ 那一下，且不含任何过期说法", () => {
+  const m = composeStatusMessage({ name: "a" });
+  assert.ok(m.includes("出站已接通"));
+  assert.ok(m.includes("@ 一下"));
+  assert.ok(m.includes("绑定就完成了"));
+  // 这几句在多绑定路由做完之后就是假话了。文案里不许再出现。
+  for (const stale of ["多绑定", "还没接通", "只认一个项目"]) {
+    assert.ok(!m.includes(stale), "状态消息不该出现「" + stale + "」");
+  }
 });
 
 test("登记表接入：session_id 恒为 null → 入站被 evaluateInbound 一律拒（fail-closed 免费得到）", () => {

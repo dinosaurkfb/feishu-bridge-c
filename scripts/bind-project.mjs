@@ -93,10 +93,7 @@ const token = bindingToken(root);
 const idemKey = idempotencyKeyFor(root);
 const rootText = composeRootMessage({ name, purpose, root, token });
 
-// 入站多绑定路由已经做完（inbound-route.mjs），所以这里是 true。
-// 根消息一个字都不用改 —— 状态本来就不在根消息里，这正是当初把它拆出来的理由。
-const INBOUND_READY = true;
-const statusText = composeStatusMessage({ name, inboundReady: INBOUND_READY });
+const statusText = composeStatusMessage({ name });
 
 console.log("项目    " + name + "  " + root);
 console.log("名字来源" + "  " + (arg("name") ? "命令行 --name" : identity.source === "dirname" ? "目录名（没找到 CLAUDE.md 标题）" : identity.source));
@@ -155,5 +152,5 @@ try {
 }
 
 console.log("\n" + name + " 已接入。项目里下一轮会话结束时，回答会自动发到这个话题。");
-if (!INBOUND_READY) console.log("入站（在话题里 @M5Claude 下指令）还没接通 —— 多绑定路由改造完成后才可用。");
+console.log("入站还差最后一下：去那个话题里 @ 一下运输 agent（空消息也行），绑定就完成了。");
 }

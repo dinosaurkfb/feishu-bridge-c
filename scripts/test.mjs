@@ -1772,6 +1772,76 @@ test("项目文件里的链路级字段被模板压过去 —— 免得同机两
   assert.equal(r.config.task_display_name, "项目自己的显示名", "项目级字段该保留");
 });
 
+// ---------- 与 Codex 链路的共用边界（scripts/outbox.mjs 是两边唯一的接触面） ----------
+//
+// Codex 适配层从这个仓库 import 了十个共用模块，其中 outbox.mjs 已经被它改过一次
+// （加了 eventKey / publishEligible / publish_suppressed_at）。改得很克制，
+// 但「克制」不是一个能被回归测试保证的性质 —— 下面这几条把 Claude 侧依赖的行为钉死，
+// 免得下一次共用改动悄悄改掉 Claude 的语义。
+
+function freshOutbox() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-shared-"));
+}
+
+test("Claude 的调用方式（不传 eventKey）仍按内容指纹判重", () => {
+  const d = freshOutbox();
+  const a = appendEvent({ outboxDir: d, kind: "risk", text: "同一句话", source: "t" });
+  const b = appendEvent({ outboxDir: d, kind: "risk", text: "同一句话", source: "t" });
+  assert.equal(a.ok, true);
+  assert.equal(b.ok, false);
+  assert.equal(b.reason, "duplicate");
+  // 换 kind 就是另一条：指纹算的是 kind + 正文
+  assert.equal(appendEvent({ outboxDir: d, kind: "next", text: "同一句话", source: "t" }).ok, true);
+});
+
+test("Claude 的文件名仍是「时间戳-指纹」，没有被换成事件键那种确定性命名", () => {
+  const d = freshOutbox();
+  const r = appendEvent({ outboxDir: d, kind: "milestone", text: "x", source: "t" });
+  assert.match(path.basename(r.file), /^\d{13}-[0-9a-f]{16}\.json$/,
+    "文件名格式变了会影响 listPending 的排序（它按文件名排，时间前缀就是时序）");
+  assert.ok(!path.basename(r.file).startsWith("event-"));
+});
+
+test("Claude 写的事件没有发布资格标记，但照样能被 Claude 排空", () => {
+  const d = freshOutbox();
+  appendEvent({ outboxDir: d, kind: "risk", text: "要发出去的", source: "t" });
+  const [rec] = listPending({ outboxDir: d });
+  // Codex 的自动发布只消费 publish_eligible_at 非空的事件；Claude 不用这套，
+  // 所以这里是 null —— 但它绝不能因此被 Claude 自己的 listPending 漏掉。
+  assert.equal(rec.publish_eligible_at, null);
+  assert.equal(rec.published_at, null);
+  assert.equal(rec.text, "要发出去的");
+});
+
+test("listPending 的新过滤条件不会误伤 Claude 的老记录", () => {
+  const d = freshOutbox();
+  const r = appendEvent({ outboxDir: d, kind: "next", text: "老记录", source: "t" });
+  // 模拟升级前写下的记录：没有 publish_eligible_at / publish_suppressed_at 这两个键
+  const old = JSON.parse(fs.readFileSync(r.file, "utf-8"));
+  delete old.publish_eligible_at;
+  delete old.event_key;
+  fs.writeFileSync(r.file, JSON.stringify(old));
+  assert.equal(listPending({ outboxDir: d }).length, 1, "缺新字段的老记录必须照样待发");
+});
+
+test("被标记 suppressed 的事件不再待发 —— Claude 不写它，但要认它", () => {
+  const d = freshOutbox();
+  const r = appendEvent({ outboxDir: d, kind: "risk", text: "半成品", source: "t" });
+  const rec = JSON.parse(fs.readFileSync(r.file, "utf-8"));
+  fs.writeFileSync(r.file, JSON.stringify({ ...rec, publish_suppressed_at: new Date().toISOString() }));
+  assert.equal(listPending({ outboxDir: d }).length, 0);
+});
+
+test("Claude 不依赖 scripts/codex/ 里的任何东西", () => {
+  const dir = path.resolve("scripts");
+  for (const f of fs.readdirSync(dir).filter((n) => n.endsWith(".mjs"))) {
+    const src = fs.readFileSync(path.join(dir, f), "utf-8")
+      .replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    assert.ok(!/from\s+["'][^"']*codex\//.test(src),
+      f + " 不该 import codex 目录 —— 依赖必须是单向的（codex 依赖共用代码，不能反过来）");
+  }
+});
+
 // ---------- 汇总 ----------
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

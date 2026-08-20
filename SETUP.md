@@ -102,7 +102,15 @@ Claude 会话）。记下三样：
 
 给它写指令：收到消息时执行本仓库的 `scripts/inbound.mjs`，把输出原样回复。
 `skills/m5claude-inbound-router/SKILL.md` 是底稿，**把里面的绝对路径改成你的仓库位置**。
-同一份也放进本机 `~/.claude/skills/m5claude-inbound-router/`。
+同一份也要装进本机的技能目录 —— 有安装器，别手拷：
+
+```bash
+node scripts/install-inbound.mjs           # dry-run
+node scripts/install-inbound.mjs --apply
+```
+
+装到 `~/.claude/skills/`，那是 `aily-cli skill scan-local` 真正会扫的位置
+（装完应当被列为 `[claude-code-local]`）。
 
 ### 3. 写机器级链路模板
 
@@ -249,6 +257,7 @@ node scripts/binding.mjs --project ~/x --renew 1y --apply
 |---|---|
 | `~/.claude/feishu-bridge/chain-config.json` | 机器级链路模板：智能体、profile、群 id、授权发送者。**唯一必须手配的东西** |
 | `skills/*/SKILL.md` | 里面写死了本仓库的绝对路径 |
+| `.claude/settings.json` | `allow` 里有两条写死 `/Users/dk/...` 的便利规则，换机器要改（改不改都不影响安全）。`deny` 那两条**不要动** —— 它们挡住长期任务改写自己的回执和绑定 |
 | 飞书平台侧 | 一个 claude-code-local 智能体（话题由 bind-project 自动建） |
 | 出站 profile | 单智能体下是 `platform-bot`；双智能体下要与别人的链路区分开 |
 

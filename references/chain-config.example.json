@@ -1,45 +1,43 @@
 {
-  "_README": "复制到 .runtime-data/inbound/chain-config.json 并逐项替换。带 ← 的是必须改的。这份文件不进版本管理（.runtime-data/ 已被 gitignore）。",
+  "_README": "这是**机器级链路模板**的样子，最终落在 ~/.claude/feishu-bridge/chain-config.json。别手抄这个文件——用 scripts/init-chain-template.mjs 生成，它会逐项校验形状。这里只是让你知道每个字段是什么、错了会怎样。",
 
   "schema_version": "1.0",
   "chain": "claude",
 
-  "_1_入站运输身份": "飞书里那个负责把消息转进本机的智能体。它只做运输，不发布任何东西。",
+  "_1_入站运输身份": "飞书 Aily 上那个把消息转进本机的智能体。必须是 claude-code-local adapter 类型——它要在本机拉起 Claude 会话。",
   "transport_agent_name": "M5Claude",
   "transport_app_id": "cli_xxxxxxxxxxxxxxxx",
   "transport_open_id": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-  "transport_open_id_note": "← 必须是「这个 app 自己视角下」的 open_id。open_id 按 app 隔离，从别的 app 查到的那个不能用。用 lark-cli 以该身份查自己。",
+  "transport_open_id_note": "← 必须是「这个 app 自己视角下」的 open_id。open_id 按 app 隔离，同一个机器人在不同 app 眼里是不同的 ou_，从别的 app 查到的那个不能用。这里错了入站会全线不通。",
+  "agent_uid": "agent_xxxxxxxxxxxxxxx",
+  "agent_uid_note": "← Aily 的 agent 标识。两处载荷：入站校验「调用我的是不是这个 agent」；单智能体方案下出站凭据目录 = lark_cli_config_base + 它。指错了会去用另一个 agent 的凭据（本机通常有十几个），所以有交叉校验兜着。",
 
-  "_2_出站发布身份": "结果和进展用这个身份发回话题。刻意与运输身份分开：让运输方也能发布，等于把两个方向的职责搅在一起。",
-  "outbound_agent_name": "COO助理CC",
+  "_2_出站发布身份": "填成跟运输那三项**一模一样**就是单智能体方案（推荐）：话题里只有一个头像，飞书侧只用建一个智能体。要用独立的发布身份就填另一个应用。",
+  "outbound_agent_name": "M5Claude",
   "outbound_app_id": "cli_xxxxxxxxxxxxxxxx",
   "outbound_open_id": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-  "lark_cli_profile": "claude",
-  "lark_cli_profile_note": "← lark-cli 的 profile 名。多条链路共存时必须各用各的 profile，否则会串身份。",
+  "outbound_open_id_note": "← 单智能体时必须等于 transport_open_id，校验会拦住不一致的写法——不然它就是个填了也没人管的装饰字段。",
+
+  "_3_lark-cli": "",
+  "lark_cli_profile": "platform-bot",
+  "lark_cli_profile_note": "← 单智能体时是 agent 私有配置目录里那个 profile（通常叫 platform-bot）；双智能体时是 ~/.lark-cli 里你自己那个 profile 名。",
   "lark_cli_bin": "/opt/homebrew/bin/lark-cli",
   "lark_cli_home": "/Users/你/.lark-cli",
-  "lark_cli_home_note": "← 两个都必须写绝对路径。发布器是在 aily agent 的清洗环境里被拉起的，那里 lark-cli 被重定向到按 agent 隔离的配置目录，靠环境里「恰好是什么」会拿到错误的身份 —— 实测就是这么发布失败的。",
+  "lark_cli_home_note": "← 双智能体方案下的凭据目录。单智能体方案不读它（目录由 lark_cli_config_base + agent_uid 推出）。两个都必须是绝对路径：发布器可能在 aily agent 的清洗环境里被拉起，那里 PATH 和默认配置目录都不是你以为的那个。",
+  "lark_cli_config_base": "/Users/你/.aily-cli/lark-cli",
+  "lark_cli_config_base_note": "← 可选。aily 放各 agent 私有 lark-cli 配置的地方，单智能体方案的凭据从这儿来。这是 aily-cli 的内部布局、不是它承诺的接口——哪天它变了，改这一个字段即可，不用动代码。",
 
-  "_3_授权发送者": "只有这个人的消息会被受理。",
+  "_4_授权发送者": "只有这个人的消息会被受理。",
   "frank_sender_id": "0000000000000000000",
-  "frank_sender_id_note": "← 是 Aily 平台的 user id，**不是**飞书的 ou_ open_id。两者不通用。",
+  "frank_sender_id_note": "← ⚠️ 整条链上唯一一个「填错会静默扩大授权」的字段。它是 **Aily 平台的 user id**，不是飞书的 ou_。填成 ou_ 会被形状校验挡下（全拒，你立刻发现）；但填成**另一个人的 Aily user id** 形状完全合法，后果是那个人从此能驱动你机器上的长期任务，且没有任何提示。这一条只能靠抄对。",
 
-  "_4_话题与前缀": "",
+  "_5_群": "话题不用手建——每个项目的根话题由 scripts/bind-project.mjs 自动建。",
   "chat_name": "你的群名",
-  "inbound_prefix_note": "← 前缀在 active-mapping.json 里配（可设 null 表示不需要）。同群多链路的互斥靠 mention 对象 + 根话题就够，前缀是可选的第三重。",
+  "chat_id": "oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
 
-  "_5_本机": "",
-  "project_dir": "/Users/你/path/to/feishu-bridge-cc",
-  "logical_task_key": "feishu_bridge_cc",
-  "project_display_name": "项目显示名",
-  "task_display_name": "长期任务显示名（会出现在发回飞书的消息开头）",
-
-  "_6_行为开关": "",
+  "_6_其他": "",
   "default_freshness_ms": 900000,
   "default_freshness_ms_note": "消息超过这个时长未被处理就判过期拒绝，防止重放旧消息。",
-  "auto_publish_on_completion": true,
-  "auto_publish_note": "一次性守望者，非持续监听：由已授权投递触发，跑完即退出。设为 false 可退回手动发布。",
-
-  "agent_uid": "agent_xxxxxxxxxxxxxxx",
-  "agent_uid_note": "← 入站运输智能体的 Aily agent uid。脚本用它向平台取消息信封。"
+  "bridge_root": "/Users/你/path/to/feishu-bridge-cc",
+  "bridge_root_note": "← 由 init-chain-template 自动填。/init 钩子和接入命令靠它找到 scripts/。"
 }

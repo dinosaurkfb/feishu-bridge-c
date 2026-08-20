@@ -95,7 +95,7 @@ node /Users/dk/claude-projects/feishu-bridge-cc/scripts/outbox.mjs \
 
 ## 边界
 
-- 你**不发飞书消息**。发布由出站发布器用 COO助理CC 的身份做。
+- 你**不发飞书消息**。发布由出站发布器做，用哪个身份由机器级配置决定。
 - 你**不碰 `.runtime-data/`**。那里是映射、claim、回执和 outbox 队列，
   由入站路由器和发布器维护 —— 干活的一方不该能伪造自己的回执。
 - 发不出去时进展留在队列里，兜底定时器每 30 分钟重试。

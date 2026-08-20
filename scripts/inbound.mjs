@@ -70,7 +70,7 @@ function ackText(kind, detail) {
       : "已起一轮后台执行（沿用本项目最近的对话）";
     return [
       "已受理 · " + detail.taskName,
-      where + "。完成后结果会通过 COO助理CC 发布到本话题。",
+      where + "。完成后结果会自动发布到本话题。",
       "消息 " + detail.messageId.slice(-8) + " | claim " + detail.key.slice(0, 8),
     ].join("\n");
   }

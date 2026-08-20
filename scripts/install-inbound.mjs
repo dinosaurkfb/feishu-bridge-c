@@ -1,20 +1,21 @@
 #!/usr/bin/env node
 /**
- * 把入站技能装到 aily 的捆绑技能目录。
+ * 把入站技能装到宿主 agent 的技能目录。
  *
  * 出站早就有安装器了，入站一直靠手工拷贝 —— 这个不对称的代价是：换台机器照仓库重建，
  * 你会得到一个「文件都在、内容都对、就是不工作」的状态，而这类失败最难查。
  *
- * 关于「装完了它就能被发现吗」这件事，本安装器**不做保证，也不假装做保证**：
+ * **装到哪：`~/.claude/skills/<技能名>/`。**这是 `aily-cli skill scan-local` 真正会扫的
+ * 位置 —— 装进去之后它会被列为 `[claude-code-local]`，跟 Codex 那条链路的
+ * `~/.codex/skills/` 完全对称。
  *
- *   已知（2026-08-19 实测）：/Users/dk/skills/m5claude-inbound-router/ 下那两个文件
- *                            确实能工作，M5Claude 当天成功执行过十余次。
- *   未知：M5Claude 究竟经由什么路径发现它。`aily-cli skill scan-local` 扫的是宿主 agent
- *         的技能目录（~/.claude/skills、~/.codex/skills），**看不到这一个**；
- *         它也不在 ~/.claude/skills 里；agent 工作目录里没有指向它的软链。
+ * 这个默认值是**改过一次**的。原来默认装到 `~/skills/`，那是 2026-08-19 联调时
+ * 「碰巧能用」的一个位置，而不是被扫描的位置 —— 当时在「技能到底从哪加载」这个问题上
+ * 一天内下过三次结论、三次被推翻。后来实测确认：`~/skills/` 不在扫描范围内，
+ * `~/.claude/skills/` 在。留着旧默认值等于把一个安装器变成新用户的坑。
  *
- * 于是安装器只做两件诚实的事：复现那个已知可用的状态，以及把每一项能验的都验掉。
- * 验不了的那项会在输出里明说，不会被含糊成一句「安装成功」。
+ * 一条经验（值得留着）：**判断入站是否健康，不能只看「发消息有没有回复」。**
+ * 入站智能体是个被反复 resume 的持久会话，技能坏了它也可能凭上下文把命令跑出来。
  *
  * 用法：
  *   node scripts/install-inbound.mjs                    # 看看会改什么，不落盘
@@ -31,7 +32,7 @@ import path from "node:path";
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const SKILL_NAME = "m5claude-inbound-router";
 const SRC = path.join(ROOT, "skills", SKILL_NAME);
-const DEFAULT_SKILLS_ROOT = path.join(os.homedir(), "skills");
+const DEFAULT_SKILLS_ROOT = path.join(os.homedir(), ".claude", "skills");
 
 const arg = (n) => {
   const i = process.argv.indexOf("--" + n);

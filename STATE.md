@@ -19,7 +19,7 @@
 **接入只产生一条新事实**：登记表里的一行（`root_message_id` / `session_id` /
 `name` / `purpose` / `expires_at`）。项目目录里**不写任何配置文件**。
 
-- 群、两个身份、profile、授权发送者、时效 —— 全在机器级模板
+- 群、身份、profile、授权发送者、时效 —— 全在机器级模板
   `~/.claude/feishu-bridge/chain-config.json`，装机器时配一次（`init-chain-template.mjs`）
 - 项目叫什么、干什么 —— 从 README.md / CLAUDE.md 取（一级标题 + 第一段第一句），
   取不到就用目录名，**绝不为取名字失败**
@@ -66,14 +66,14 @@ Frank 在某个项目的话题里 @M5Claude（前缀已退役）
 ~/.claude/settings.json 的 Stop 钩子 → scripts/stop-hook.mjs
        ↓ 归属判定：cwd 在项目里 OR 会话记录原文里出现项目路径
   有守望者在盯 → 让路（它会把结果和进展合成一条）
-  没有         → drainProject 合成摘要 → COO助理CC 发到那个项目的话题
+  没有         → drainProject 合成摘要 → 发布身份发到那个项目的话题
 ```
 
 - 装/卸：`node scripts/install-outbound.mjs [--apply|--uninstall --apply]`，幂等，先备份
 - 它装五样：Stop 钩子、UserPromptSubmit 钩子、`bind-preview` 的权限白名单、
   登记表 + 全局技能、launchd 兜底定时器
 - 钩子日志 `~/.claude/feishu-bridge/stop-hook.log`
-- 本地合成测试 **217 项**，`node scripts/test.mjs`，零外部副作用
+- 本地合成测试 **234 项**，`node scripts/test.mjs`，零外部副作用
 
 ### 实测过的（2026-08-20）
 
@@ -85,7 +85,11 @@ Frank 在某个项目的话题里 @M5Claude（前缀已退役）
 | cc2cd 出站 | ✅ 钩子日志 `cc2cd via=cwd -> published` |
 | cc2cd 入站绑定 | ✅ `绑定完成 · cc2cd`，`session_4kvtmps7bytcr` |
 | 两个项目并行、各发各的话题 | ✅ 同一份钩子日志里两条互不干扰 |
-| @ 错话题 | ✅ 正确路由到老项目并如实拒绝（回执现在会说「本话题通向：X」） |
+| @ 错话题 | ✅ 正确路由到老项目并如实拒绝（回执会说「本话题通向：X」） |
+| 单智能体出站 | ✅ 话题里 sender 是 M5Claude `cli_aaf8bee78ab89bc1`，不再有第二个头像 |
+| 凭据目录指错 agent | ✅ 被 `assertPublishIdentity` 拒绝并说清原因，**一个字都没发** |
+| daemon 停掉时出站 | ✅ 照发（实测停掉 daemon 后两种身份都能发）；入站同时死掉 |
+| 写 `.runtime-data/` | ✅ 被项目权限规则显式拒绝，文件未创建（2026-08-19 实测） |
 
 ## 重要发现：绑定码能靠引用块回来
 
@@ -117,7 +121,8 @@ Frank 在某个项目的话题里 @M5Claude（前缀已退役）
 | 项 | 值 |
 |---|---|
 | 群 | `Frank智能体们` `oc_7ce1dfcf36a34232eab1e0cdc0484333` |
-| 机器级模板 | `~/.claude/feishu-bridge/chain-config.json`（15 个链路级字段） |
+| 机器级模板 | `~/.claude/feishu-bridge/chain-config.json`（15 个必填 + 2 个可选） |
+| 出站身份 | **单智能体**：就是 M5Claude 自己，凭据在 `~/.aily-cli/lark-cli/<agent_uid>/` |
 | 登记表 | `~/.claude/feishu-bridge/registry.json` |
 | M5Claude agent uid | `agent_4ks11dv8f0mxwbd` |
 | feishu-bridge-cc | 话题 `om_x100b677afd1884a8c389b5d1da41563`，session `session_4kvgs2vuq4j5z`，配置在项目目录 |

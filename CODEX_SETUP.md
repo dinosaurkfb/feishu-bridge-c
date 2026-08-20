@@ -12,6 +12,8 @@
 - Aily `session_id` 只负责飞书话题路由；`codex_thread_id` 只负责本机 Codex 续接，两者不能混用。
 - 用户明确绑定的 task 根目录可能是包含多个仓库的 workspace；runner 只跳过 Codex 的 Git
   仓库前置检查，不改变 sandbox 或 approval 权限，终局证据要求保持不变。
+- 目标 Codex run 必须剥离 `AILY_CLI_*` 入站身份；hook 中 `codex-run` 角色优先于 Aily
+  判断，目标 task 严禁再次调用 M5Codex 入站路由。
 - 所有运行 locator 放在 `~/.codex/feishu-bridge/`，不得提交或复制到项目文档。
 - 已绑定 task 的每轮最终答复自动发布；发送失败留队，升级前历史积压不自动补发。
 - 飞书入站回合必须由 watcher 严格确认目标 thread、`turn.completed`、exit 0 和非空输出后发布。

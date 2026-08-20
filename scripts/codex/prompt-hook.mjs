@@ -103,6 +103,14 @@ export function composeAilyInboundContext({ bridgeRoot, home }) {
   ].join("\n");
 }
 
+export function composeRoutedCodexContext() {
+  return [
+    "[Codex 飞书桥·已路由指令] 当前回合已经由 M5Codex 完成信封校验、claim 和精确 task 路由。",
+    "你现在是目标 Codex task，不是 M5Codex 入站运输进程。",
+    "禁止调用 m5codex-inbound-router 或再次获取 Aily 消息信封；直接执行用户交付的项目指令。",
+  ].join("\n");
+}
+
 function readPayload() {
   try {
     const raw = fs.readFileSync(0, "utf-8");
@@ -112,10 +120,12 @@ function readPayload() {
 
 async function main() {
   const payload = readPayload() ?? {};
+  const isRoutedCodexRun = process.env.FEISHU_BRIDGE_ROLE === "codex-run";
   // M5Codex 的飞书回合也是 codex-local，会继承本机 hooks；它属于入站数据面，必须用
   // developer 级上下文盖过历史回合里可能残留的控制面指令。只给配置中的唯一 agent 注入，
   // 其他 Aily agent fail-closed。确定性 sender/session/mention 校验仍全部留在 inbound.mjs。
-  if (isAilyInvocation()) {
+  // codex-run 必须优先：即使上游误把 AILY_CLI_* 传进来，也不能递归进入入站路由。
+  if (!isRoutedCodexRun && isAilyInvocation()) {
     const tpl = loadCodexTemplate();
     if (!tpl.ok || process.env.AILY_CLI_CALLER_AGENT_UID !== tpl.template.agent_uid ||
         typeof tpl.template.bridge_root !== "string") process.exit(0);
@@ -137,16 +147,6 @@ async function main() {
   const bindingIntent = action === "bind";
   const registered = findRegisteredTaskForCodexThread({ threadId });
 
-  if (action === "init") {
-    const connectionStatus = registered.ok ? (registered.task.status ?? "active") : "none";
-    process.stdout.write(JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: "UserPromptSubmit",
-        additionalContext: composeInitContext({ connectionStatus }),
-      },
-    }) + "\n");
-    return;
-  }
   // 普通未绑定 Codex task 不应被桥收集 locator。只有已绑定 task，或用户正在明确接桥时，
   // 才需要这份 lease。
   if (registered.ok || bindingIntent) {
@@ -159,7 +159,25 @@ async function main() {
     });
   }
 
-  if (process.env.FEISHU_BRIDGE_ROLE === "codex-run") process.exit(0);
+  if (isRoutedCodexRun) {
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "UserPromptSubmit",
+        additionalContext: composeRoutedCodexContext(),
+      },
+    }) + "\n");
+    return;
+  }
+  if (action === "init") {
+    const connectionStatus = registered.ok ? (registered.task.status ?? "active") : "none";
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "UserPromptSubmit",
+        additionalContext: composeInitContext({ connectionStatus }),
+      },
+    }) + "\n");
+    return;
+  }
   if (action === "none") process.exit(0);
   if (typeof cwd !== "string" || !path.isAbsolute(cwd)) process.exit(0);
 

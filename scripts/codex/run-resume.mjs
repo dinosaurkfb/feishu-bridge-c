@@ -4,6 +4,8 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 
+import { sanitizeCodexRunEnv } from "./handoff.mjs";
+
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
   return at >= 0 ? process.argv[at + 1] : undefined;
@@ -48,7 +50,8 @@ const child = spawn(codexBin, [
   "--output-last-message", lastMessagePath, threadId, "-",
 ], {
   cwd: projectDir,
-  env: process.env,
+  // 双保险：即使 runner 被其他入口直接调用，也不把 M5Codex/Aily 入站身份传进目标 task。
+  env: sanitizeCodexRunEnv(process.env),
   stdio: ["pipe", out, err],
 });
 

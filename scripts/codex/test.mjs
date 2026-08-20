@@ -12,11 +12,11 @@ import {
 } from "../outbox.mjs";
 import { evaluateInbound, REJECT } from "../selector.mjs";
 import { composeCodexBinding, validThreadId } from "./bind-compose.mjs";
-import { classifyRunnerDiagnostic, readCodexRunOutcome } from "./handoff.mjs";
+import { classifyRunnerDiagnostic, readCodexRunOutcome, sanitizeCodexRunEnv } from "./handoff.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
 import {
   classifyFeishuPrompt, composeAilyInboundContext, composeBindingContext, composeInitContext,
-  composeStatusContext, composeUnbindContext, isAilyInvocation, isBindingPrompt,
+  composeRoutedCodexContext, composeStatusContext, composeUnbindContext, isAilyInvocation, isBindingPrompt,
 } from "./prompt-hook.mjs";
 import {
   enableAutoPublishForAllTasks, findRegisteredTaskForCodexThread, findTaskForCodexThread, findTaskForFeishuSession,
@@ -433,6 +433,30 @@ test("Aily 入站上下文不包含建话题命令或 --last", () => {
   assert.equal(c.includes("--last"), false);
 });
 
+test("目标 codex-run 优先于残留 Aily 环境，明确禁止再次路由", () => {
+  const c = composeRoutedCodexContext();
+  assert.match(c, /你现在是目标 Codex task/u);
+  assert.match(c, /禁止调用 m5codex-inbound-router/u);
+  const home = temp();
+  const hook = path.join(ROOT, "scripts", "codex", "prompt-hook.mjs");
+  const r = spawnSync(process.execPath, [hook], {
+    input: JSON.stringify({ session_id: THREAD_A, turn_id: "turn_routed", cwd: "/work", prompt: "/init" }),
+    encoding: "utf-8",
+    env: {
+      ...process.env,
+      FEISHU_CODEX_BRIDGE_HOME: home,
+      FEISHU_BRIDGE_ROLE: "codex-run",
+      AILY_CLI_SESSION_ID: "should_not_route",
+      AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid,
+    },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const injected = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+  assert.match(injected, /已路由指令/u);
+  assert.equal(injected.includes("只执行以下命令"), false);
+  assert.equal(injected.includes("scripts/codex/inbound.mjs"), false);
+});
+
 test("活跃租约让正在运行的 Desktop turn fail-closed", () => {
   const home = temp();
   recordThreadActivity({ threadId: THREAD_A, turnId: "turn_a", cwd: "/work", active: true, home, now: 1000 });
@@ -473,6 +497,26 @@ test("Codex runner 观察到不同 thread 时严格失败", () => {
     "thread_mismatch");
 });
 
+test("目标 Codex 再次执行入站路由时严格判为 bridge_recursion", () => {
+  const dir = temp();
+  const logPath = path.join(dir, "run.jsonl");
+  const exitPath = path.join(dir, "exit.json");
+  const lastMessagePath = path.join(dir, "last.txt");
+  fs.writeFileSync(logPath, [
+    { type: "thread.started", thread_id: THREAD_A },
+    { type: "turn.started" },
+    { type: "item.completed", item: {
+      type: "command_execution", command: "node /bridge/scripts/codex/inbound.mjs", status: "failed",
+    } },
+    { type: "turn.completed" },
+  ].map(JSON.stringify).join("\n") + "\n");
+  fs.writeFileSync(exitPath, JSON.stringify({ status: "exited", exit_code: 0 }));
+  fs.writeFileSync(lastMessagePath, "不应发布的递归错误栈");
+  const result = readCodexRunOutcome({ logPath, exitPath, lastMessagePath, expectedThreadId: THREAD_A });
+  assert.equal(result.state, "failed");
+  assert.equal(result.reason, "bridge_recursion");
+});
+
 test("Codex 启动前 Git 预检失败不会误报 thread_mismatch", () => {
   const dir = temp();
   const logPath = path.join(dir, "run.jsonl");
@@ -498,6 +542,7 @@ test("run-resume 用精确 UUID、stdin prompt 和 last-message 形成可观察�
   const fake = path.join(dir, "fake-codex.sh");
   fs.writeFileSync(fake, `#!/bin/sh
 printf '%s\\n' "$@" > "$ARGS_OUT"
+printf '%s|%s|%s' "\${AILY_CLI_SESSION_ID-unset}" "\${AILY_CLI_CALLER_AGENT_UID-unset}" "\${FEISHU_BRIDGE_ROLE-unset}" > "$ENV_OUT"
 last=""
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--output-last-message" ]; then last="$2"; shift 2; else shift; fi
@@ -514,18 +559,29 @@ printf '%s' "$prompt" > "$last"
   const last = path.join(dir, "last.txt");
   const exit = path.join(dir, "exit.json");
   const argsOut = path.join(dir, "args.txt");
+  const envOut = path.join(dir, "env.txt");
   fs.writeFileSync(instruction, "精确投递");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "run-resume.mjs"),
     "--thread-id", THREAD_A, "--project", dir, "--instruction-file", instruction,
     "--log", log, "--stderr", stderr, "--last-message", last, "--exit-receipt", exit,
     "--codex-bin", fake,
-  ], { encoding: "utf-8", env: { ...process.env, EXPECTED_THREAD: THREAD_A, ARGS_OUT: argsOut } });
+  ], { encoding: "utf-8", env: {
+    ...process.env,
+    EXPECTED_THREAD: THREAD_A,
+    ARGS_OUT: argsOut,
+    ENV_OUT: envOut,
+    FEISHU_BRIDGE_ROLE: "codex-run",
+    AILY_CLI_SESSION_ID: "must_be_removed",
+    AILY_CLI_CALLER_AGENT_UID: "must_be_removed",
+  } });
   assert.equal(r.status, 0, r.stderr);
   const args = fs.readFileSync(argsOut, "utf-8").trim().split("\n");
   assert.deepEqual(args.slice(0, 5), ["exec", "resume", "--skip-git-repo-check", "--json",
     "--output-last-message"]);
   assert.equal(args.includes(THREAD_A), true);
   assert.equal(args.at(-1), "-");
+  assert.equal(fs.readFileSync(envOut, "utf-8"), "unset|unset|codex-run");
+  assert.deepEqual(sanitizeCodexRunEnv({ KEEP: "yes", AILY_CLI_RUN_ID: "remove" }), { KEEP: "yes" });
   assert.equal(fs.readFileSync(last, "utf-8"), "精确投递");
   assert.equal(JSON.parse(fs.readFileSync(exit, "utf-8")).exit_code, 0);
   assert.equal(readCodexRunOutcome({ logPath: log, exitPath: exit, lastMessagePath: last,
@@ -598,6 +654,42 @@ test("关闭自动发布时 watcher 只把严格完成的最终答复兜底入�
   assert.equal(r.status, 0, r.stderr);
   assert.equal(listPending({ outboxDir: paths.outbox }).length, 1);
   assert.equal(fs.existsSync(paths.sessionLock), false);
+});
+
+test("watcher 抑制递归产生的错误答复，只保留风险回执", () => {
+  const home = temp();
+  const root = path.join(home, "workspace");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = false;
+  writeRegistry([task], path.join(home, "registry.json"));
+  const paths = taskPaths(task, home);
+  fs.mkdirSync(paths.runs, { recursive: true });
+  fs.mkdirSync(paths.claims, { recursive: true });
+  fs.mkdirSync(paths.sessionLock, { recursive: true });
+  const key = "c".repeat(64);
+  const eventKey = "codex:" + THREAD_A + ":claim:" + key + ":reply";
+  appendEvent({ outboxDir: paths.outbox, kind: "reply", text: "EPERM stack", eventKey });
+  fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), [
+    { type: "thread.started", thread_id: THREAD_A },
+    { type: "turn.started" },
+    { type: "item.completed", item: {
+      type: "command_execution", command: "node /bridge/scripts/codex/inbound.mjs", status: "failed",
+    } },
+    { type: "turn.completed" },
+  ].map(JSON.stringify).join("\n") + "\n");
+  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"),
+    JSON.stringify({ status: "exited", exit_code: 0 }));
+  fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "EPERM stack");
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
+    "--claim-key", key, "--task-key", task.logical_task_key,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.equal(r.status, 1, r.stderr);
+  const pending = listPending({ outboxDir: paths.outbox });
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].kind, "risk");
+  assert.match(pending[0].text, /bridge_recursion/u);
+  assert.equal(pending[0].text.includes("EPERM stack"), false);
 });
 
 test("watcher 对启动前 Git 预检失败给出真实且脱敏的风险回执", () => {
@@ -679,7 +771,21 @@ test("安装器在隔离 HOME 只追加 hooks、渲染技能路径且保留已�
     assert.equal(commandSkill.includes("name: " + name), true);
   }
   assert.equal(fs.existsSync(path.join(home, "registry.json")), true);
+  assert.equal(fs.statSync(path.join(home, "receipts")).isDirectory(), true);
   assert.equal(loadRegistry(path.join(home, "registry.json")).tasks[0].auto_publish_on_completion, true);
+});
+
+test("入站前置回执目录不可写时只返回脱敏错误，不泄露 Node 堆栈", () => {
+  const dir = temp();
+  const blockedHome = path.join(dir, "not-a-directory");
+  fs.writeFileSync(blockedHome, "blocked");
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "inbound.mjs")], {
+    encoding: "utf-8",
+    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: blockedHome },
+  });
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /系统错误/u);
+  assert.equal(/node:fs|EPERM|EISDIR|\n\s+at /u.test(r.stdout + r.stderr), false);
 });
 
 test("自动发布登记迁移幂等，暂停 task 也保留恢复后的发布合同", () => {

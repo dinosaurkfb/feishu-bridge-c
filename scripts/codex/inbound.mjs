@@ -22,19 +22,25 @@ const HOME = bridgeHome();
 let receiptDir = path.join(HOME, "receipts");
 
 function writeReceipt(name, payload) {
-  fs.mkdirSync(receiptDir, { recursive: true, mode: 0o700 });
-  const file = path.join(receiptDir, name + ".json");
-  const tmp = file + ".tmp." + process.pid;
-  fs.writeFileSync(tmp, JSON.stringify({
-    schema_version: "1.0",
-    artifact_type: "codex_feishu_bridge_inbound_receipt",
-    zone: "work",
-    classification: "internal",
-    recorded_at: new Date().toISOString(),
-    ...payload,
-  }, null, 2) + "\n", { mode: 0o600 });
-  fs.renameSync(tmp, file);
-  return file;
+  try {
+    fs.mkdirSync(receiptDir, { recursive: true, mode: 0o700 });
+    const file = path.join(receiptDir, name + ".json");
+    const tmp = file + ".tmp." + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify({
+      schema_version: "1.0",
+      artifact_type: "codex_feishu_bridge_inbound_receipt",
+      zone: "work",
+      classification: "internal",
+      recorded_at: new Date().toISOString(),
+      ...payload,
+    }, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return file;
+  } catch {
+    // 回执是审计证据，不是继续执行的授权闸。前置失败时若沙箱连诊断目录也不允许写，
+    // 仍只向 stdout 返回脱敏错误，绝不能把 Node 堆栈原样泄露到飞书。
+    return null;
+  }
 }
 
 const REASON_TEXT = {

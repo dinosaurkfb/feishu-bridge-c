@@ -47,6 +47,7 @@ const failureLabel = (outcome) => {
     session_not_found: "Codex 找不到绑定的 session",
     hook_trust_required: "Codex hook 尚未取得信任",
   }[outcome.diagnostic];
+  if (outcome.reason === "bridge_recursion") return "bridge_recursion：目标 task 错误地再次进入飞书入站路由";
   return diagnostic ? outcome.reason + "：" + diagnostic : outcome.reason;
 };
 

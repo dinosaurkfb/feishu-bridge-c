@@ -131,6 +131,8 @@ if (!uninstall && !fs.existsSync(registryFile(home))) {
   writeAtomic(registryFile(home), JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks: [] }, null, 2) + "\n");
 }
 if (!uninstall) {
+  // task 尚未路由成功时的脱敏错误回执使用这个目录；提前创建，避免首个错误路径才 mkdir。
+  fs.mkdirSync(path.join(home, "receipts"), { recursive: true, mode: 0o700 });
   const migrated = enableAutoPublishForAllTasks({ home });
   if (!migrated.ok) {
     console.error("自动发布合同迁移失败：" + migrated.reason + (migrated.error ? "（" + migrated.error + "）" : ""));

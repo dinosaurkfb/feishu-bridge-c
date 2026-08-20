@@ -7,6 +7,15 @@ import path from "node:path";
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const RUNNER = path.join(HERE, "run-resume.mjs");
 
+/** 目标 Codex task 不能继承 M5Codex/Aily 入站身份，否则 hook 会把它再次路由。 */
+export function sanitizeCodexRunEnv(env = process.env, overrides = {}) {
+  const clean = {};
+  for (const [name, value] of Object.entries(env)) {
+    if (!name.startsWith("AILY_CLI_")) clean[name] = value;
+  }
+  return { ...clean, ...overrides };
+}
+
 export function assertCodexAvailable(codexBin = "codex") {
   if (codexBin.includes("/")) {
     fs.accessSync(codexBin, fs.constants.X_OK);
@@ -53,13 +62,12 @@ export function handOffCodex({
     cwd: projectDir,
     detached: true,
     stdio: ["ignore", fs.openSync(runnerLog, "a"), fs.openSync(runnerLog, "a")],
-    env: {
-      ...process.env,
+    env: sanitizeCodexRunEnv(process.env, {
       FEISHU_BRIDGE_ROLE: "codex-run",
       FEISHU_BRIDGE_CLAIM_KEY: key,
       FEISHU_BRIDGE_TASK_KEY: taskKey,
       ...(bridgeHome ? { FEISHU_CODEX_BRIDGE_HOME: bridgeHome } : {}),
-    },
+    }),
   });
   child.unref();
 
@@ -97,6 +105,7 @@ export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, errPat
   let recoverableErrors = 0;
   let invalidJsonLines = 0;
   let threadMismatch = false;
+  let bridgeRecursion = false;
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
     let event;
@@ -109,6 +118,10 @@ export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, errPat
     if (event.type === "turn.completed") turnCompleted = true;
     if (event.type === "turn.failed") turnFailed = true;
     if (event.type === "error") recoverableErrors += 1;
+    if (event.item?.type === "command_execution" &&
+        typeof event.item.command === "string" &&
+        (event.item.command.includes("scripts/codex/inbound.mjs") ||
+         event.item.command.includes("m5codex-inbound-router"))) bridgeRecursion = true;
   }
 
   let exit = null;
@@ -121,6 +134,7 @@ export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, errPat
   if (threadMismatch || (observedThreadId !== null && observedThreadId !== expectedThreadId)) {
     return { state: "failed", reason: "thread_mismatch", observedThreadId, expectedThreadId };
   }
+  if (bridgeRecursion) return { state: "failed", reason: "bridge_recursion" };
   if (exit.status === "spawn_failed") {
     return { state: "failed", reason: "runner_spawn_failed" };
   }

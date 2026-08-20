@@ -1,0 +1,126 @@
+#!/usr/bin/env node
+/**
+ * 安装 Codex adapter：只追加 hooks、复制五项技能（含三条控制命令）、初始化空 registry。
+ * 默认 dry-run；不安装定时发布器，不修改 hook trust，不发送飞书。
+ */
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+import { bridgeHome, registryFile } from "./state.mjs";
+
+const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
+const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+const HOOKS = path.join(CODEX_HOME, "hooks.json");
+const apply = process.argv.includes("--apply");
+const uninstall = process.argv.includes("--uninstall");
+
+const pickNode = () => {
+  for (const file of ["/opt/homebrew/bin/node", "/usr/local/bin/node", process.execPath]) {
+    try { fs.accessSync(file, fs.constants.X_OK); return file; } catch { /* next */ }
+  }
+  return process.execPath;
+};
+const shellQuote = (value) => "'" + String(value).replace(/'/g, "'\\''") + "'";
+const node = pickNode();
+const home = bridgeHome();
+const promptScript = path.join(ROOT, "scripts", "codex", "prompt-hook.mjs");
+const stopScript = path.join(ROOT, "scripts", "codex", "stop-hook.mjs");
+const log = path.join(home, "hook.log");
+
+const hookCommand = (script) =>
+  "if [ -x " + shellQuote(node) + " ] && [ -r " + shellQuote(script) + " ]; then " +
+  "FEISHU_CODEX_BRIDGE_HOME=" + shellQuote(home) + " " + shellQuote(node) + " " + shellQuote(script) + "; " +
+  "else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1; " +
+  "printf '%s hook-unavailable\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> " + shellQuote(log) + " 2>/dev/null || :; fi";
+
+let before = "";
+let hooks = { hooks: {} };
+try {
+  before = fs.readFileSync(HOOKS, "utf-8");
+  hooks = JSON.parse(before);
+} catch (err) {
+  if (err.code !== "ENOENT") {
+    console.error("hooks.json 读不了：" + err.message);
+    process.exit(1);
+  }
+}
+hooks.hooks ??= {};
+
+function updateHook(event, script, timeout) {
+  const entries = (hooks.hooks[event] ??= []);
+  const at = entries.findIndex((entry) =>
+    (entry?.hooks ?? []).some((h) => typeof h.command === "string" && h.command.includes(script)));
+  if (uninstall) {
+    if (at >= 0) entries.splice(at, 1);
+    return at >= 0 ? "removed" : "already-absent";
+  }
+  const value = { hooks: [{ type: "command", command: hookCommand(script), timeout }] };
+  if (at >= 0) entries[at] = value;
+  else entries.push(value);
+  return at >= 0 ? "updated" : "installed";
+}
+
+const promptAction = updateHook("UserPromptSubmit", promptScript, 10);
+const stopAction = updateHook("Stop", stopScript, 20);
+
+const skills = [
+  { name: "m5codex-inbound-router", files: ["SKILL.md", "aily-cli-skill.json"] },
+  { name: "codex-longtask-feishu", files: ["SKILL.md"] },
+  { name: "feishu-bind", files: ["SKILL.md"] },
+  { name: "feishu-unbind", files: ["SKILL.md"] },
+  { name: "feishu-status", files: ["SKILL.md"] },
+];
+const renderedSkill = (file) => fs.readFileSync(file, "utf-8")
+  .replaceAll("{{BRIDGE_ROOT}}", ROOT)
+  .replaceAll("{{CODEX_BRIDGE_HOME_SHELL}}", shellQuote(home));
+
+console.log("hooks       " + HOOKS);
+console.log("  UserPromptSubmit → " + promptAction);
+console.log("  Stop             → " + stopAction);
+for (const skill of skills) {
+  console.log("skill       " + path.join(CODEX_HOME, "skills", skill.name));
+}
+console.log("commands    $feishu-bind  $feishu-unbind  $feishu-status（也出现在斜杠菜单）");
+console.log("state       " + home + "（Git 外）");
+console.log("publish     不安装定时器；真实发送仍逐次授权");
+console.log("hook trust  不自动写信任；安装后由用户审阅并确认");
+
+if (!apply) {
+  console.log("\n[dry-run] 什么都没写。加 --apply 才安装。");
+  process.exit(0);
+}
+
+const writeAtomic = (file, text) => {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = file + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, text, { mode: 0o600 });
+  fs.renameSync(tmp, file);
+};
+
+const after = JSON.stringify(hooks, null, 2) + "\n";
+if (after !== before) {
+  if (fs.existsSync(HOOKS)) fs.copyFileSync(HOOKS, HOOKS + ".bak." + Date.now());
+  writeAtomic(HOOKS, after);
+}
+
+for (const skill of skills) {
+  const src = path.join(ROOT, "skills", skill.name);
+  const dst = path.join(CODEX_HOME, "skills", skill.name);
+  if (uninstall) {
+    fs.rmSync(dst, { recursive: true, force: true });
+    continue;
+  }
+  fs.mkdirSync(dst, { recursive: true, mode: 0o700 });
+  for (const name of skill.files) {
+    const source = path.join(src, name);
+    const content = name === "SKILL.md" ? renderedSkill(source) : fs.readFileSync(source);
+    fs.writeFileSync(path.join(dst, name), content, { mode: 0o600 });
+  }
+}
+
+if (!uninstall && !fs.existsSync(registryFile(home))) {
+  writeAtomic(registryFile(home), JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks: [] }, null, 2) + "\n");
+}
+console.log("\n已完成本地安装。下一次 Codex 载入 hook 时会要求信任；请核对命令后再确认。");

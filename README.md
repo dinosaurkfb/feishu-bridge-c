@@ -1,4 +1,42 @@
-# feishu-bridge-cc
+# feishu-bridge
+
+把飞书话题和本机长期 AI 任务接起来。Claude Code v2 是已完成基线；Codex adapter
+复用同一套 envelope、selector、claim、outbox 和飞书发布器，但按 Codex thread 绑定。
+
+> Claude 搭建看 **[SETUP.md](SETUP.md)**；Codex 候选适配看
+> **[CODEX_SETUP.md](CODEX_SETUP.md)**。两套 runtime 共仓维护，不靠长期分支复制核心修复。
+
+## Codex adapter
+
+Codex 与 Claude 的关键差异已经隔离在 `scripts/codex/`：
+
+- 单一 M5Codex 同时负责入站运输和出站发布，模板校验拒绝双身份配置；
+- selector 只要求绑定话题中的真实 `@M5Codex`，mention 后正文直接作为指令；
+- 一个飞书话题绑定一个精确 `codex_thread_id`，同一仓库允许多个 task；
+- 禁止 `--last`，运行中的 Desktop turn 通过 hook lease fail-closed 为 busy；
+- 入站用 detached `codex exec resume <精确 UUID> --json` 秒级返回；
+- Stop 以 `thread + turn/claim` 事件键原样入队，相同正文的不同轮次不会互相去重；
+- Codex locator、claim、receipt 和 outbox 全在 `~/.codex/feishu-bridge/`，不进入工作树；
+- 当前 Stop 只入队，真实飞书发布仍由 `drain-outbox.mjs --apply` 逐次授权。
+- Codex 官方 `/init` 仍只负责生成 `AGENTS.md`；hook 仅要求初始化成功后询问是否接入，
+  不在 `/init` 本轮自动建飞书话题；
+- 安装后提供 `$feishu-bind`、`$feishu-unbind`、`$feishu-status` 三项技能命令，
+  它们也会出现在斜杠菜单中，且均只作用于当前精确 task。
+
+本地回归：
+
+```bash
+node scripts/test.mjs          # Claude 基线 234 项
+node scripts/codex/test.mjs    # Codex adapter 合成回归
+node scripts/codex/install.mjs # 安装预览；默认不写
+```
+
+Codex 适配具备本地合成与隔离安装证据；具体机器是否已经安装不能从仓库推断，必须运行
+安装预览并检查 `~/.codex`。真实飞书端到端验证仍需逐动作授权。
+
+---
+
+## Claude Code 基线
 
 把飞书话题和本机的 Claude Code 长期任务接起来，双向，**一个群里可以接多个项目**。
 
@@ -13,7 +51,7 @@
 **接一个新项目**：在项目目录里敲 `/init`，它会问你要不要建话题（默认「是」），
 你答应后再去新话题 @ 一下就完事 —— 不用建话题、不用写配置。
 
-> 搭建步骤看 **[SETUP.md](SETUP.md)**。现场状态、已知未解和踩过的坑看 **[STATE.md](STATE.md)**。
+> 搭建步骤看 **[SETUP.md](SETUP.md)**。Claude 现场状态、已知未解和踩过的坑看 **[STATE.md](STATE.md)**。
 
 ---
 
@@ -102,13 +140,19 @@ scripts/
   出站   outbox / drain-outbox / outbound / stop-hook / watch-and-publish
   接入   init-hook / bind-preview / bind-project / bind-compose / chain-template
   共用   project-resolve（从哪读配置）/ registry / binding / binding-health
-skills/        两个方向各一份技能源
+  codex/ 精确 thread 状态、绑定、hooks、handoff、watcher、逐次授权发布
+skills/        Claude / Codex 的入站与长期任务技能源
 references/    配置模板（chain-config / active-mapping）
 .runtime-data/ 身份、绑定、claim、回执、outbox 队列。禁止提交
 
 ~/.claude/feishu-bridge/
   chain-config.json   机器级链路模板（群、两个身份、profile、授权发送者）
   registry.json       项目登记表 —— 接入产生的那一行就写在这里
+
+~/.codex/feishu-bridge/
+  chain-config.json   Codex 单 M5Codex 机器级模板
+  registry.json       task 登记表；同一 root 可有多个精确 thread
+  tasks/              task 级 claim、receipt、run 和 outbox（全部在 Git 外）
 ```
 
 ## 设计上不肯让步的几条

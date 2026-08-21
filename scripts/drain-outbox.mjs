@@ -15,6 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { listPending, markSent, composeDigest } from "./outbox.mjs";
+import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { publishDraft } from "./outbound.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
@@ -96,22 +97,44 @@ export function drainProject({ root, claudeSessionId, dryRun = false, timeoutMs 
     const pending = listPending({ outboxDir });
     if (pending.length === 0) return { status: "empty", root };
 
-    const text = composeDigest(pending, { taskName: cfg.task_display_name });
-    if (dryRun) return { status: "dry_run", root, count: pending.length, text };
+    const batches = outboundCardBatches(pending);
+    const cards = batches.map((batch) => composeOutboundCard(batch, {
+      taskName: cfg.task_display_name,
+      runtime: "claude",
+    }));
+    if (dryRun) {
+      return {
+        status: "dry_run",
+        root,
+        count: pending.length,
+        cards,
+        text: composeDigest(pending, { taskName: cfg.task_display_name }),
+      };
+    }
 
     // 身份从配置推，不在这里认死任何一个 agent；发之前 publishDraft 会校验凭据归属。
     const id = resolveLarkIdentity(cfg);
-    const messageId = publishDraft({
-      profile: id.profile,
-      rootMessageId: mapping.feishu_root_message_id_reference,
-      text,
-      larkBin: id.bin,
-      larkHome: id.configDir,
-      expectedAppId: id.expectedAppId,
-      timeoutMs,
-    });
-    for (const r of pending) markSent(r, messageId);
-    return { status: "published", root, count: pending.length, messageId };
+    const messageIds = [];
+    for (let index = 0; index < batches.length; index += 1) {
+      const messageId = publishDraft({
+        profile: id.profile,
+        rootMessageId: mapping.feishu_root_message_id_reference,
+        card: cards[index],
+        larkBin: id.bin,
+        larkHome: id.configDir,
+        expectedAppId: id.expectedAppId,
+        timeoutMs,
+      });
+      for (const record of batches[index]) markSent(record, messageId);
+      messageIds.push(messageId);
+    }
+    return {
+      status: "published",
+      root,
+      count: pending.length,
+      messageId: messageIds.at(-1) ?? null,
+      messageIds,
+    };
   } catch (err) {
     // 不标记、不吞掉：留在 outbox，下一个排空者重试。
     // 截断放宽到 400：飞书的报错 JSON 前 200 字还没到 code 和 message，截短了等于没留痕。

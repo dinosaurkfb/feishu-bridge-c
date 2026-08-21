@@ -75,6 +75,7 @@ export const taskPaths = (task, home = bridgeHome()) => {
     runs: path.join(root, "inbound", "runs"),
     sessionLock: path.join(root, "inbound", "session.lock"),
     outbox: path.join(root, "outbound", "outbox"),
+    turnInputs: path.join(root, "outbound", "turn-inputs"),
     publishLock: path.join(root, "outbound", "publish.lock"),
     consumed: path.join(root, "inbound", "consumed.json"),
   };

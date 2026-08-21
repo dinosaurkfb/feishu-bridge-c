@@ -9,6 +9,7 @@ import path from "node:path";
 
 import { appendEvent, MAX_REPLY_CHARS } from "../outbox.mjs";
 import { extractReply } from "../stop-hook.mjs";
+import { clearTurnInput, readTurnInput } from "../turn-input.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
 import {
   bridgeHome, findTaskForCodexThread, hookLogFile, readThreadActivity, recordThreadActivity, taskPaths,
@@ -47,8 +48,13 @@ async function main() {
   }
   if (payload.stop_hook_active === true) process.exit(0);
   if (!found.ok) process.exit(0);
+  const paths = taskPaths(found.task, bridgeHome());
+  const turnKey = typeof payload.turn_id === "string" ? payload.turn_id : null;
   const reply = extractReply(payload, { maxChars: MAX_REPLY_CHARS });
   if (!reply) {
+    if (!process.env.FEISHU_BRIDGE_CLAIM_KEY && turnKey) {
+      clearTurnInput({ dir: paths.turnInputs, key: turnKey });
+    }
     log(found.task.logical_task_key + " empty reply");
     process.exit(0);
   }
@@ -61,14 +67,22 @@ async function main() {
   const eventKey = typeof claimKey === "string" && claimKey
     ? "codex:" + threadId + ":claim:" + claimKey + ":reply"
     : "codex:" + threadId + ":turn:" + (payload.turn_id ?? "unknown") + ":reply";
+  const input = !claimKey && turnKey
+    ? readTurnInput({ dir: paths.turnInputs, key: turnKey })
+    : { ok: false };
   const r = appendEvent({
-    outboxDir: taskPaths(found.task, bridgeHome()).outbox,
+    outboxDir: paths.outbox,
     kind: "reply",
     text: reply,
     source: claimKey ? "codex-inbound-reply" : "codex-stop-reply",
     eventKey,
     publishEligible: found.task.auto_publish_on_completion === true && !claimKey,
+    inputText: input.ok ? input.text : undefined,
+    inputOrigin: input.ok ? input.inputOrigin : undefined,
   });
+  if (!claimKey && turnKey && (r.ok || r.reason === "duplicate")) {
+    clearTurnInput({ dir: paths.turnInputs, key: turnKey });
+  }
   log(found.task.logical_task_key + " " + (r.ok ? "queued" : r.reason) + " event=" + eventKey);
 
   // 入站 run 的完成权属于 watcher；Stop 不能抢在 exit code 和 turn.completed 之前发布。

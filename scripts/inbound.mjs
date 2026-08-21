@@ -78,7 +78,7 @@ function ackText(kind, detail) {
     return [
       "绑定完成 · " + detail.taskName,
       "这个话题现在通向 " + detail.root + "。",
-      "之后在这条消息下面 @ 一下就是给它下指令；它的进展和每一轮回答也会发回这里。",
+      "之后在这条消息下面 @ 一下就是给它下指令；它的进展和每一轮回答也会以卡片发回这里。",
     ].join("\n");
   }
   if (kind === "rejected") {

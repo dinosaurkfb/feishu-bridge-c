@@ -12,11 +12,15 @@
  * 而问漏了的代价是零 —— Frank 补一条命令就是了。
  *
  * 硬约束，跟 Stop 钩子同一条：**永远 exit 0，永远不抛**。
- * 这个钩子比 Stop 更热 —— 它跑在本机每一次**提交 prompt** 上。所以第一件事是
- * 字符串比对，不是文件 IO；不是 /init 就立刻退，连模块都不加载。
+ * 这个钩子比 Stop 更热 —— 它跑在本机每一次**提交 prompt** 上。已绑定项目会在这里
+ * 缓存本地人类输入，供 Stop 与回复配成同一张卡；未绑定项目仍只在 /init 时继续处理。
  */
 
 import fs from "node:fs";
+
+import {
+  claudeTurnInputDir, clearTurnInput, isFeishuStampedInput, storeTurnInput,
+} from "./turn-input.mjs";
 
 /** 只认 `/init` 本身和带参数的 `/init xxx`。别的斜杠命令一概不管。 */
 export function isInitPrompt(prompt) {
@@ -52,7 +56,7 @@ export function composeAsk({ cwd, bridgeRoot, chatName }) {
     "根消息「逐字还原」一遍是错的：还原出来的东西看着像脚本输出，其实是你算的，",
     "差一个字他就是照着一份假预览点的头。拦下了就直说，让他自己敲 `! node …`。",
     "",
-    "接入之后：出站立刻可用（这个项目里每一轮回答都会自动发到那个话题）。",
+    "接入之后：出站立刻可用（本机输入与每轮回答会合成卡片自动发到那个话题）。",
     "入站还差最后一下 —— 让 Frank 去那个新话题里 @ 一下运输 agent（空消息也行），",
     "绑定就完成了。**在他真的 @ 过之前，别说入站通了。**",
   ].join("\n");
@@ -69,12 +73,9 @@ function readStdinJson() {
 
 async function main() {
   const payload = readStdinJson() ?? {};
-
-  // 最热的一条路径：绝大多数 prompt 不是 /init，在这里就退，一个模块都不加载。
-  if (!isInitPrompt(payload.prompt)) process.exit(0);
-
+  const prompt = payload.prompt;
   const cwd = payload.cwd;
-  if (typeof cwd !== "string" || !cwd) process.exit(0);
+  if (typeof prompt !== "string" || !prompt.trim() || typeof cwd !== "string" || !cwd) process.exit(0);
   // 目录得真的在。resolveProject 对一个不存在的路径同样返回 not_bound
   // （没文件、登记表里也没有），单靠它会去给一个根本不存在的目录提议建话题。
   try {
@@ -83,7 +84,34 @@ async function main() {
     process.exit(0);
   }
 
+  const { loadRegistry, isUnder } = await import("./registry.mjs");
   const { resolveProject } = await import("./project-resolve.mjs");
+  const speakingSession = typeof payload.session_id === "string" && payload.session_id
+    ? payload.session_id
+    : null;
+
+  // 桥自己起的 forwarder / run 不属于人类本机输入；活跃会话里的飞书指令没有这个环境
+  // 标记，但有确定性来源戳。两者都不缓存，后者还会清掉同会话可能遗留的旧输入，避免
+  // 下一次 Stop 把一条过期本地 prompt 错配给飞书回复。
+  if (!process.env.FEISHU_BRIDGE_ROLE && speakingSession) {
+    const registry = loadRegistry();
+    if (registry.ok) {
+      for (const project of registry.projects.filter((item) => isUnder(cwd, item.root))) {
+        const bound = resolveProject({ root: project.root, claudeSessionId: speakingSession });
+        if (!bound.ok || bound.mapping?.status !== "active") continue;
+        const dir = claudeTurnInputDir(project.root, bound.claudeSessionId);
+        if (isFeishuStampedInput(prompt)) {
+          clearTurnInput({ dir, key: speakingSession });
+        } else {
+          storeTurnInput({ dir, key: speakingSession, text: prompt });
+        }
+      }
+    }
+  }
+
+  // 常规输入只写本地回合缓存，不向模型注入桥接说明。
+  if (!isInitPrompt(prompt)) process.exit(0);
+
   // 已经接过就闭嘴。重复问一个已经有话题的项目，比不问更烦人。
   const resolved = resolveProject({ root: cwd });
   if (resolved.ok) process.exit(0);

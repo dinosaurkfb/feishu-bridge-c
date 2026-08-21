@@ -239,10 +239,17 @@ if (import.meta.url === "file://" + process.argv[1]) {
   } else {
     const root = mapping.feishu_root_message_id_reference;
     if (!root) throw new Error("mapping 里没有根话题消息 ID，无法发布");
+    const { composeOutboundCard } = await import("./outbound-card.mjs");
     for (const r of pending) {
       const text = buildDraft(r, { taskName: cfg.task_display_name });
       if (!text) continue;
-      const mid = publishDraft({ profile: cfg.lark_cli_profile, rootMessageId: root, text,
+      const mid = publishDraft({
+        profile: cfg.lark_cli_profile,
+        rootMessageId: root,
+        card: composeOutboundCard([{
+          kind: r.state === "completed" ? "reply" : "risk",
+          text,
+        }], { taskName: cfg.task_display_name, runtime: "claude" }),
         larkBin: cfg.lark_cli_bin, larkHome: cfg.lark_cli_home });
       markPublished({ runsDir, key: r.key, messageId: mid });
       console.log("已发布 " + r.key.slice(0, 8) + " -> " + mid);

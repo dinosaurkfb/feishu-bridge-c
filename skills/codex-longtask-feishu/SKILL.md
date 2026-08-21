@@ -66,12 +66,15 @@ node {{BRIDGE_ROOT}}/scripts/codex/feishu-status.mjs --thread-id <当前thread-i
 
 ## 答复与发布
 
-绑定 task 的本地回合结束后，Stop hook 会把 `last_assistant_message` 原样写入 task outbox，
-随后自动发布到原飞书话题；发布成功才标记事件，失败保持 eligible 并在后续回合重试。
+绑定 task 的本地回合由 UserPromptSubmit hook 按精确 `turn_id` 缓存文本输入，Stop hook 再把
+同一回合的输入与 `last_assistant_message` 写成一条 task outbox 事件。发布时两者位于同一张
+Card 2.0 的“你的输入”和“Codex 回复”区块；发布成功才标记事件，失败保持 eligible 并在后续
+回合重试。附件本体不进入输入缓存。
 
 飞书入站回合不得由 Stop 抢先发送。只有 watcher 同时确认目标 thread、`turn.completed`、
 exit code 0 和非空最终输出后，才能为答复授予发布资格；失败或超时必须发布如实的风险回执，
-不能把半成品答复当作完成。
+不能把半成品答复当作完成。飞书输入原文已经存在于话题中，因此入站结果卡片只显示回复，
+不得再附带或复读该输入。
 
 升级前已有的历史待发项没有自动发布资格，不会因安装或下一轮 Stop 被补发。只读查看仍可用：
 

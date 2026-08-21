@@ -11,6 +11,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { normalizeLocalInput } from "./turn-input.mjs";
 
 /**
  * `reply` 是一轮对话的**原文答复**，由 Stop 钩子从 last_assistant_message 直接取，
@@ -41,7 +42,10 @@ export const KIND_LABEL = {
 export const MAX_REPLY_CHARS = 4000;
 
 /** 一条进展一个文件：先完整写临时文件，再原子提交最终目录项；排空时逐条标记。 */
-export function appendEvent({ outboxDir, kind, text, source, eventKey, publishEligible = false }) {
+export function appendEvent({
+  outboxDir, kind, text, source, eventKey, publishEligible = false,
+  inputText, inputOrigin,
+}) {
   if (!KINDS.includes(kind)) {
     return { ok: false, reason: "unknown_kind", allowed: KINDS };
   }
@@ -71,6 +75,9 @@ export function appendEvent({ outboxDir, kind, text, source, eventKey, publishEl
   const file = path.join(outboxDir, id + ".json");
   const tmp = file + ".tmp." + randomUUID();
   const createdAt = new Date().toISOString();
+  const localInput = kind === "reply" && inputOrigin === "local"
+    ? normalizeLocalInput(inputText)
+    : "";
   fs.writeFileSync(tmp, JSON.stringify({
     schema_version: "1.0",
     artifact_type: "codex_feishu_bridge_event",
@@ -79,6 +86,10 @@ export function appendEvent({ outboxDir, kind, text, source, eventKey, publishEl
     id, kind, text: body,
     event_key: normalizedEventKey,
     source: source ?? "unknown",
+    // 只允许把本机 Desktop/CLI 的人类输入和 reply 绑在一起。飞书入站原文已经存在于
+    // 目标话题，不能再写进这里让机器人复读；非 reply 进展也没有可配对的人类输入。
+    input_origin: localInput ? "local" : null,
+    input_text: localInput || null,
     created_at: createdAt,
     // Codex 自动发布只消费显式取得发布资格的事件。升级前积压的 outbox、以及尚未经过
     // 严格终局确认的入站答复都没有这个标记，不能因为下一轮 Stop 就被顺带发出去。

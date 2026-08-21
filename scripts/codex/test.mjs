@@ -16,10 +16,13 @@ import { readCodexThreadTitle, sanitizeThreadTitle } from "./thread-title.mjs";
 import { updateTextMessage } from "./lark-message.mjs";
 import { classifyRunnerDiagnostic, readCodexRunOutcome, sanitizeCodexRunEnv } from "./handoff.mjs";
 import {
-  composeCodexOutboundCard, neutralizeCardMentions, validateCodexOutboundCard,
+  composeCodexOutboundCard, neutralizeCardMentions, outboundCardBatches, validateCodexOutboundCard,
 } from "./outbound-card.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
 import { publishDraft } from "../outbound.mjs";
+import {
+  clearTurnInput, readTurnInput, storeTurnInput,
+} from "../turn-input.mjs";
 import {
   classifyFeishuPrompt, composeAilyInboundContext, composeBindingContext, composeInitContext,
   composeRoutedCodexContext, composeStatusContext, composeUnbindContext, isAilyInvocation, isBindingPrompt,
@@ -430,8 +433,8 @@ test("Codex 出站使用确定性 Card 2.0，并按事件语义选择颜色", ()
   assert.equal(reply.header.template, "blue");
   assert.equal(reply.header.text_tag_list[0].text.content, "本轮答复");
   assert.equal(reply.body.elements[0].tag, "column_set");
-  assert.equal(reply.body.elements[1].tag, "markdown");
-  assert.match(reply.body.elements[1].content, /这是最终答复/u);
+  assert.equal(reply.body.elements[1].tag, "column_set");
+  assert.match(JSON.stringify(reply.body.elements[1]), /这是最终答复/u);
   assert.equal(JSON.stringify(reply).includes("behaviors"), false);
 
   const risk = composeCodexOutboundCard([
@@ -440,6 +443,52 @@ test("Codex 出站使用确定性 Card 2.0，并按事件语义选择颜色", ()
   assert.equal(risk.header.template, "red");
   assert.equal(risk.header.text_tag_list[0].text.content, "风险");
   assert.equal(risk.body.elements[0].columns[0].background_style, "red-50");
+});
+
+test("本地 Codex 输入与回复进入同一张卡，飞书入站回复不复读原消息", () => {
+  const local = composeCodexOutboundCard([{
+    kind: "reply",
+    text: "我已经完成修改",
+    input_origin: "local",
+    input_text: "请把输入和回复放在一张卡里",
+  }], { taskName: "配对测试" });
+  assert.equal(local.body.elements.length, 3);
+  assert.match(JSON.stringify(local.body.elements[1]), /你的输入/u);
+  assert.match(JSON.stringify(local.body.elements[1]), /请把输入和回复放在一张卡里/u);
+  assert.match(JSON.stringify(local.body.elements[2]), /Codex 回复/u);
+  assert.match(JSON.stringify(local.body.elements[2]), /我已经完成修改/u);
+
+  const inbound = composeCodexOutboundCard([{
+    kind: "reply",
+    text: "这是飞书指令的执行结果",
+    input_origin: null,
+    input_text: null,
+  }], { taskName: "去重测试" });
+  assert.equal(inbound.body.elements.length, 2);
+  assert.equal(JSON.stringify(inbound).includes("你的输入"), false);
+  assert.match(JSON.stringify(inbound), /这是飞书指令的执行结果/u);
+});
+
+test("reply 一轮一张卡，非 reply 进展继续合批", () => {
+  const batches = outboundCardBatches([
+    { kind: "milestone", text: "M1" },
+    { kind: "risk", text: "R1" },
+    { kind: "reply", text: "A1", input_origin: "local", input_text: "Q1" },
+    { kind: "reply", text: "A2", input_origin: "local", input_text: "Q2" },
+    { kind: "next", text: "N1" },
+  ]);
+  assert.deepEqual(batches.map((batch) => batch.map((record) => record.kind)), [
+    ["milestone", "risk"], ["reply"], ["reply"], ["next"],
+  ]);
+});
+
+test("本地输入缓存按精确回合读取并可恢复清理", () => {
+  const dir = path.join(temp(), "turn-inputs");
+  assert.equal(storeTurnInput({ dir, key: "turn-a", text: "  本地输入  " }).ok, true);
+  assert.equal(readTurnInput({ dir, key: "turn-a" }).text, "本地输入");
+  assert.equal(readTurnInput({ dir, key: "turn-b" }).reason, "not_found");
+  assert.equal(clearTurnInput({ dir, key: "turn-a" }).ok, true);
+  assert.equal(readTurnInput({ dir, key: "turn-a" }).reason, "not_found");
 });
 
 test("卡片长正文折叠，并中和模型正文里的原生卡片 mention", () => {
@@ -834,6 +883,55 @@ test("Codex Stop hook：相同正文的两个 turn 各入队一次，同一 turn
   assert.equal(run("turn-2").status, 0);
   assert.equal(run("turn-1").status, 0);
   assert.equal(listPending({ outboxDir: taskPaths(task, home).outbox }).length, 2);
+});
+
+test("Codex UserPromptSubmit 与 Stop 按 turn_id 配对本地输入，入站 runner 不缓存", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = false;
+  writeRegistry([task], path.join(home, "registry.json"));
+  const promptHook = path.join(ROOT, "scripts", "codex", "prompt-hook.mjs");
+  const stopHook = path.join(ROOT, "scripts", "codex", "stop-hook.mjs");
+  const env = { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home };
+
+  const submitted = spawnSync(process.execPath, [promptHook], {
+    input: JSON.stringify({
+      session_id: THREAD_A, turn_id: "turn-paired", cwd: root, prompt: "请实现一轮一卡",
+    }),
+    encoding: "utf-8",
+    env,
+  });
+  assert.equal(submitted.status, 0, submitted.stderr);
+  assert.equal(readTurnInput({ dir: taskPaths(task, home).turnInputs, key: "turn-paired" }).text,
+    "请实现一轮一卡");
+
+  const stopped = spawnSync(process.execPath, [stopHook], {
+    input: JSON.stringify({
+      session_id: THREAD_A, turn_id: "turn-paired", cwd: root, last_assistant_message: "已经完成",
+    }),
+    encoding: "utf-8",
+    env,
+  });
+  assert.equal(stopped.status, 0, stopped.stderr);
+  const record = listPending({ outboxDir: taskPaths(task, home).outbox })[0];
+  assert.equal(record.input_origin, "local");
+  assert.equal(record.input_text, "请实现一轮一卡");
+  assert.equal(record.text, "已经完成");
+  assert.equal(readTurnInput({ dir: taskPaths(task, home).turnInputs, key: "turn-paired" }).reason,
+    "not_found");
+
+  const routed = spawnSync(process.execPath, [promptHook], {
+    input: JSON.stringify({
+      session_id: THREAD_A, turn_id: "turn-feishu", cwd: root, prompt: "来自飞书的指令",
+    }),
+    encoding: "utf-8",
+    env: { ...env, FEISHU_BRIDGE_ROLE: "codex-run" },
+  });
+  assert.equal(routed.status, 0, routed.stderr);
+  assert.equal(readTurnInput({ dir: taskPaths(task, home).turnInputs, key: "turn-feishu" }).reason,
+    "not_found");
 });
 
 test("Codex Stop hook 自动发布本地回合，并保留旧的非 eligible 积压", () => {

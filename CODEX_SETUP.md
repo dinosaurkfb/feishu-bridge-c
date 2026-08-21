@@ -18,7 +18,8 @@ Codex adapter 把一个飞书话题绑定到一个**精确 Codex task/thread**�
 ## 先理解两个行为
 
 1. **绑定的是 task，不是目录。**同一个仓库里的两个 Codex task 可以分别接到两个飞书话题；
-   桥不使用标题或 `--last` 猜目标。
+   桥不使用标题或 `--last` 猜目标。标题只负责给人看：新话题首行是
+   “项目名｜Codex task 标题 · 稳定短码”，因此同仓库的长期 task 也能一眼区分。
 2. **后台续接会持久化，但 Desktop 不一定实时刷新。**入站通过
    [`codex exec resume`](https://learn.chatgpt.com/docs/non-interactive-mode) 把完整用户回合写进
    原 task。若该 task 已在 Codex Desktop 中打开，页面可能不会实时显示另一个 CLI 进程的
@@ -123,6 +124,14 @@ $feishu-bind
 `$feishu-bind` 本身就是本次绑定授权：技能会直接用 M5Codex 在目标群创建话题并登记当前
 精确 thread，不再要求回复第二次“确认”。不要从另一个 task 按标题代绑，也不要使用 `--last`。
 
+bridge 会精确读取当前 thread 在 Codex Desktop 中的用户可见标题，并把它与项目名、六位稳定
+短码一起放进话题首行；完整 thread locator 不会发到飞书。如果本机没有对应标题，则使用
+“项目名｜任务 短码”回退，仍然保证同一仓库的两个话题不同。`--name` 仅作为显式人工覆盖。
+
+升级前已经绑定、根消息中只有项目名的 task，可在**该 task 自己**再次运行 `$feishu-bind`。
+bridge 会编辑原根消息并同步本地显示名，不会建立第二个话题；若飞书管理员设定的消息编辑
+时限已经过期，操作会明确失败且不改本地 registry。
+
 新话题建立后，在该话题中真实 `@M5Codex` 一次；空正文即可完成首次 Aily session 绑定。
 之后 mention 后的正文直接作为指令，不需要 `→Codex` 等关键字。
 
@@ -193,6 +202,7 @@ node scripts/codex/install.mjs   # 再看一遍安装预览
 - `hook/skill 缺失`：重新安装，并重新加载 Codex、确认 hook trust；
 - `等待首次真实 @M5Codex`：去新话题真实 mention 一次；
 - `target_busy`：上一轮尚未结束，等它完成后发送一条**新消息**，不要重放旧 message id；
+- 同仓库话题标题相同：分别进入对应 Codex task 再运行一次 `$feishu-bind`，原话题会就地改名；
 - 飞书有答复、Desktop 没画面：切换 task 或重新打开，读取已持久化历史；
 - 自动发布失败：答复留在 task outbox，不会被标记为已发送。
 

@@ -129,7 +129,7 @@ export function readProjectIdentity({ root, files = IDENTITY_FILES }) {
 /**
  * 根消息 —— 刻意写成**不随时间失效**的。
  *
- * 它发出去就改不了，所以里面一个字都不能是「当前进度」。出站通没通、入站通没通都是状态，
+ * 正常运行不依赖后续编辑，所以里面一个字都不能是「当前进度」。出站通没通、入站通没通都是状态，
  * 状态放在它底下的回复里（后来的回复能盖掉前面的）；根消息只说这个话题是什么。
  *
  * 绑定码现在没有代码读它。留着是因为：入站事件里没有任何飞书 locator（selector.mjs 开头
@@ -137,8 +137,8 @@ export function readProjectIdentity({ root, files = IDENTITY_FILES }) {
  * 唯一可用的信号就是回复时飞书自动附带的引用块 —— 那里面会带上这行字。
  * 从第一天写进去，将来升级不用迁移已经建好的话题。
  */
-export function composeRootMessage({ name, purpose, root, token }) {
-  const lines = ["🌉 " + name];
+export function composeRootMessage({ name, heading = name, purpose, root, token }) {
+  const lines = ["🌉 " + heading];
   if (purpose) lines.push("", purpose);
   lines.push(
     "",

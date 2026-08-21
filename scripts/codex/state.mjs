@@ -283,6 +283,28 @@ export function setTaskConnectionStatus({
   }
 }
 
+export function setTaskDisplayName({ threadId, name, home = bridgeHome() } = {}) {
+  if (typeof threadId !== "string" || !threadId) return { ok: false, reason: "no_thread_id" };
+  if (typeof name !== "string" || !name.trim()) return { ok: false, reason: "invalid_name" };
+  const lockDir = path.join(home, "registry.lock");
+  const lock = acquirePublishLock(lockDir);
+  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  try {
+    const file = registryFile(home);
+    const reg = loadRegistry(file);
+    if (!reg.ok) return reg;
+    const task = reg.tasks.find((t) => t.codex_thread_id === threadId);
+    if (!task) return { ok: false, reason: "thread_not_registered" };
+    task.task_display_name = name.trim();
+    writeRegistry(reg.tasks, file);
+    return { ok: true, task };
+  } catch (err) {
+    return { ok: false, reason: "registry_unwritable", error: err.message };
+  } finally {
+    releasePublishLock(lockDir);
+  }
+}
+
 /** 安装新发布合同时一次性迁移所有既有 task；暂停项恢复后也应沿用同一合同。 */
 export function enableAutoPublishForAllTasks({ home = bridgeHome() } = {}) {
   const lockDir = path.join(home, "registry.lock");

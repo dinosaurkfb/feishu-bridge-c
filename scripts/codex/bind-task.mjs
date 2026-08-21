@@ -7,9 +7,10 @@ import path from "node:path";
 import { resolveLarkIdentity } from "../chain-template.mjs";
 import { publishDraft, sendToChat } from "../outbound.mjs";
 import { composeCodexBinding, displayThread, resolveThreadId } from "./bind-compose.mjs";
+import { updateTextMessage } from "./lark-message.mjs";
 import {
   addTask, findRegisteredTaskForCodexThread, loadCodexTemplate, makeTaskEntry,
-  setTaskConnectionStatus,
+  setTaskConnectionStatus, setTaskDisplayName,
 } from "./state.mjs";
 
 const arg = (name) => {
@@ -26,7 +27,42 @@ if (!thread.ok) die("无法确定当前 Codex thread（" + thread.reason + "）�
 const existing = findRegisteredTaskForCodexThread({ threadId: thread.threadId });
 if (existing.ok) {
   if ((existing.task.status ?? "active") === "active") {
-    console.log("这个 Codex task 已接入，没有重复建话题：" + existing.task.task_display_name);
+    const d = composeCodexBinding({
+      root: existing.task.root, threadId: thread.threadId, nameOverride: arg("name"),
+    });
+    if (existing.task.task_display_name === d.name) {
+      console.log("这个 Codex task 已接入，没有重复建话题：" + existing.task.task_display_name);
+      process.exit(0);
+    }
+    console.log("这个 Codex task 已接入；检测到旧话题名需要升级。");
+    console.log("旧名称    " + existing.task.task_display_name);
+    console.log("新名称    " + d.name);
+    console.log("新首行    " + d.rootText.split("\n")[0]);
+    if (!apply) {
+      console.log("[dry-run] 没有编辑飞书消息，也没有修改登记表。加 --apply 才执行。");
+      process.exit(0);
+    }
+    const tpl = loadCodexTemplate();
+    if (!tpl.ok) die("Codex 单智能体模板不可用（" + tpl.reason + "）");
+    const identity = resolveLarkIdentity(tpl.template);
+    try {
+      updateTextMessage({
+        profile: identity.profile,
+        messageId: existing.task.root_message_id,
+        text: d.rootText,
+        larkBin: identity.bin,
+        larkHome: identity.configDir,
+        expectedAppId: identity.expectedAppId,
+      });
+    } catch (err) {
+      die("旧话题改名失败，登记表没有修改：" + err.message);
+    }
+    const renamed = setTaskDisplayName({ threadId: thread.threadId, name: d.name });
+    if (!renamed.ok) {
+      die("飞书话题已改名，但本地登记更新失败：" + renamed.reason +
+        (renamed.error ? "（" + renamed.error + "）" : "") + "。可安全重跑本命令修复登记。");
+    }
+    console.log("已更新原飞书话题名称，没有创建第二个话题。");
     process.exit(0);
   }
   console.log("这个 Codex task 的飞书接入已暂停；恢复会复用原话题，不会向飞书发送消息。");

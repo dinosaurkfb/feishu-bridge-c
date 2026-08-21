@@ -12,6 +12,8 @@ import {
 } from "../outbox.mjs";
 import { evaluateInbound, REJECT } from "../selector.mjs";
 import { composeCodexBinding, validThreadId } from "./bind-compose.mjs";
+import { readCodexThreadTitle, sanitizeThreadTitle } from "./thread-title.mjs";
+import { updateTextMessage } from "./lark-message.mjs";
 import { classifyRunnerDiagnostic, readCodexRunOutcome, sanitizeCodexRunEnv } from "./handoff.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
 import {
@@ -21,7 +23,7 @@ import {
 import {
   enableAutoPublishForAllTasks, findRegisteredTaskForCodexThread, findTaskForCodexThread, findTaskForFeishuSession,
   isThreadBusy, loadRegistry, makeTaskEntry, mappingForTask, recordThreadActivity,
-  setTaskConnectionStatus, taskPaths, validateCodexTemplate, validateRegistryTasks, writeRegistry,
+  setTaskConnectionStatus, setTaskDisplayName, taskPaths, validateCodexTemplate, validateRegistryTasks, writeRegistry,
 } from "./state.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
@@ -844,6 +846,100 @@ test("绑定预览为同一 thread 生成稳定逻辑键与平台幂等键", () 
   assert.equal(a.statusText.includes("真实 @M5Codex"), true);
   assert.equal(a.statusText.includes("不需要额外关键字"), true);
   assert.equal(a.statusText.includes("运输 agent"), false);
+});
+
+test("同一项目的两个 Codex task 用 Desktop 标题和短码形成不同的可见话题名", () => {
+  const dir = temp();
+  fs.writeFileSync(path.join(dir, "README.md"), "# hv-meeting\n\n会议项目。\n");
+  const descriptions = {
+    [THREAD_A]: "运行实例接管检查：shadow / charter_pending",
+    [THREAD_B]: "高价值会议｜产品与架构：P1/P2/P3 原子需求",
+  };
+  const a = composeCodexBinding({ root: dir, threadId: THREAD_A, threadDescriptions: descriptions });
+  const b = composeCodexBinding({ root: dir, threadId: THREAD_B, threadDescriptions: descriptions });
+
+  assert.equal(a.name, "hv-meeting｜运行实例接管检查：shadow / charter_pending");
+  assert.equal(b.name, "hv-meeting｜高价值会议｜产品与架构：P1/P2/P3 原子需求");
+  assert.notEqual(a.rootText.split("\n")[0], b.rootText.split("\n")[0]);
+  assert.match(a.rootText.split("\n")[0], new RegExp(a.token + "$"));
+  assert.match(b.rootText.split("\n")[0], new RegExp(b.token + "$"));
+  assert.equal(a.rootText.includes(THREAD_A), false);
+  assert.equal(b.rootText.includes(THREAD_B), false);
+});
+
+test("Codex task 标题不可用时仍用稳定短码区分同项目话题", () => {
+  const dir = temp();
+  fs.writeFileSync(path.join(dir, "README.md"), "# hv-meeting\n\n会议项目。\n");
+  const a = composeCodexBinding({ root: dir, threadId: THREAD_A, threadDescriptions: {} });
+  const b = composeCodexBinding({ root: dir, threadId: THREAD_B, threadDescriptions: {} });
+
+  assert.equal(a.name, "hv-meeting｜任务 " + a.token);
+  assert.equal(b.name, "hv-meeting｜任务 " + b.token);
+  assert.notEqual(a.name, b.name);
+  assert.equal(a.rootText.split("\n")[0], "🌉 " + a.name);
+});
+
+test("Codex task 标题读取只做精确匹配，并清理换行、locator 与超长文本", () => {
+  const descriptions = {
+    [THREAD_A]: "  **标题一**\n" + THREAD_A + "  " + "很长".repeat(40),
+    other: "不该命中",
+  };
+  const exact = readCodexThreadTitle({ threadId: THREAD_A, descriptions });
+  const missing = readCodexThreadTitle({ threadId: THREAD_B, descriptions });
+  assert.equal(exact.source, "codex-desktop-title");
+  assert.equal(exact.title.includes("\n"), false);
+  assert.equal(exact.title.includes(THREAD_A), false);
+  assert.equal(Array.from(exact.title).length <= 48, true);
+  assert.deepEqual(missing, { title: null, source: "missing" });
+  assert.equal(sanitizeThreadTitle(" \n\t "), null);
+});
+
+test("旧 Codex 绑定可原地更新显示名，不改变根消息与 thread locator", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({
+    root, threadId: THREAD_A, name: "hv-meeting", rootMessageId: "om_existing", token: "abc123",
+  });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const renamed = setTaskDisplayName({ threadId: THREAD_A, name: "hv-meeting｜任务一", home });
+  assert.equal(renamed.ok, true);
+  const after = loadRegistry(path.join(home, "registry.json")).tasks[0];
+  assert.equal(after.task_display_name, "hv-meeting｜任务一");
+  assert.equal(after.root_message_id, "om_existing");
+  assert.equal(after.codex_thread_id, THREAD_A);
+});
+
+test("编辑旧根消息使用官方 PUT API、bot 身份和 JSON 信封合同", () => {
+  const dir = temp();
+  const bin = path.join(dir, "fake-lark.sh");
+  const argsFile = path.join(dir, "args.json");
+  const bodyFile = path.join(dir, "body.json");
+  fs.writeFileSync(bin, [
+    "#!/bin/sh",
+    "printf '%s\\n' \"$@\" > \"$FAKE_ARGS_FILE\"",
+    "cat > \"$FAKE_BODY_FILE\"",
+    "printf '%s' '{\"ok\":true,\"identity\":\"bot\",\"data\":{\"message_id\":\"om_existing\"}}'",
+  ].join("\n") + "\n", { mode: 0o700 });
+  const oldArgs = process.env.FAKE_ARGS_FILE;
+  const oldBody = process.env.FAKE_BODY_FILE;
+  process.env.FAKE_ARGS_FILE = argsFile;
+  process.env.FAKE_BODY_FILE = bodyFile;
+  try {
+    assert.equal(updateTextMessage({
+      profile: "bot-profile", messageId: "om_existing", text: "新标题", larkBin: bin,
+    }), "om_existing");
+  } finally {
+    if (oldArgs === undefined) delete process.env.FAKE_ARGS_FILE; else process.env.FAKE_ARGS_FILE = oldArgs;
+    if (oldBody === undefined) delete process.env.FAKE_BODY_FILE; else process.env.FAKE_BODY_FILE = oldBody;
+  }
+  const args = fs.readFileSync(argsFile, "utf-8").trim().split("\n");
+  assert.deepEqual(args, [
+    "api", "PUT", "/open-apis/im/v1/messages/om_existing", "--as", "bot", "--data", "-", "--json",
+  ]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(bodyFile, "utf-8")), {
+    msg_type: "text", content: JSON.stringify({ text: "新标题" }),
+  });
 });
 
 test("Codex doctor 只读汇总依赖、安装和登记状态", () => {

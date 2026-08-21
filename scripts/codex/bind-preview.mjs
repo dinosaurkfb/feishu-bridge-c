@@ -45,6 +45,6 @@ console.log("Codex     " + displayThread(thread.threadId) + "（来源 " + threa
 console.log("群        " + tpl.template.chat_name);
 console.log("唯一身份  " + tpl.template.transport_agent_name);
 console.log("入站关键字  无（只需真实 @M5Codex）");
-console.log("\n--- 根消息（发出去就改不了）---\n" + d.rootText);
+console.log("\n--- 根消息（长期稳定）---\n" + d.rootText);
 console.log("\n--- 底下第一条 ---\n" + d.statusText);
 console.log("\n这条命令没有写文件、没有联网、没有发送。运行 bind-task.mjs --apply 可执行绑定。");

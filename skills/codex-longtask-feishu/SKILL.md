@@ -26,11 +26,17 @@ node {{BRIDGE_ROOT}}/scripts/codex/bind-task.mjs --project <当前项目绝对�
 `bind-preview.mjs`，并在预览后停止，不自动继续真实绑定。
 
 真实命令会用同一个 M5Codex 身份建根话题并写机器级 registry。它不向项目目录写 locator。
+根话题首行必须优先使用 Codex Desktop 的用户可见 task 标题，并带稳定绑定短码；取不到标题
+时使用项目名与短码回退。同一仓库的多个 task 在飞书中必须可见地区分，完整 thread id 不得
+进入标题或正文。
 建完后还需用户在新话题中真实 @M5Codex 一次，入站绑定才完成；在此之前不得说入站已通。
 后续只需在绑定话题里真实 `@M5Codex`；mention 后正文直接作为指令，不需要关键字前缀。
 
 若当前 task 的接入已暂停，`bind-task.mjs --apply` 只把原登记恢复为 active，复用
 原话题且不调用飞书 API；不得新建第二个话题。
+
+若 task 已处于 active，但登记仍是旧版项目级名称，`$feishu-bind` 可编辑机器人自己发送的原根
+消息并同步 `task_display_name`。远端编辑成功前不得更新 registry；失败时保留旧登记并如实报告。
 
 ## 初始化后的询问
 

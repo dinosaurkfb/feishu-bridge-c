@@ -1642,7 +1642,7 @@ test("出站传的是 LARKSUITE_CLI_CONFIG_DIR，不是那个不存在的 LARKSU
   assert.ok(code.includes("LARKSUITE_CLI_CONFIG_DIR"), "必须用真实存在的那个变量名");
   assert.ok(!code.includes("LARKSUITE_CLI_HOME"),
     "LARKSUITE_CLI_HOME 在 lark-cli 二进制里出现 0 次 —— 设了等于没设，而且不会报错");
-  // 两个发送入口都得钉住身份：只钉一个，另一个就会在 agent 的清洗环境里拿错身份。
+  // 两个共用发送入口都得钉住身份：只钉一个，另一个就会在 agent 的清洗环境里拿错身份。
   assert.equal((code.match(/LARKSUITE_CLI_CONFIG_DIR/g) ?? []).length, 2);
   assert.equal((code.match(/LARKSUITE_CLI_PROFILE/g) ?? []).length, 2);
 });

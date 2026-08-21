@@ -55,6 +55,13 @@ import {
 } from "./feishu-control.mjs";
 import { composeAsk, isInitPrompt } from "./init-hook.mjs";
 import {
+  composeTransportRule, isAilyTransportTurn, isBridgeOwnedTurn,
+} from "./inbound-hook.mjs";
+import {
+  ROUTE_REJECT, loadRoutes, registerSession, selectRoute,
+} from "./inbound-routes.mjs";
+import { ENVELOPE_ENV as ENV_PASS, inheritedEvent } from "./envelope.mjs";
+import {
   MAX_LOCAL_INPUT_CHARS, claudeTurnInputDir, clearTurnInput, isFeishuStampedInput,
   readTurnInput, storeTurnInput,
 } from "./turn-input.mjs";
@@ -2454,6 +2461,147 @@ test("两个待接入撞了同一个码，或引用里多个码 → 都 fail-clo
   const f = pendingFixture([{ id: "a", token: "aaaaaa" }]);
   const c2 = '<at id="ou_t">M</at>\n\n**[引用]**\n绑定码    aaaaaa\n绑定码    bbbbbb';
   assert.equal(findPendingBinding({ content: c2, ...f }).reason, PROMOTE_REJECT.TOKEN_AMBIGUOUS);
+});
+
+// ---------- 入站分发：一个入口、一次取信封、确定性选路 ----------
+//
+// 本机不止一个消费者（本仓库、cc2cd……）。原来的做法是外层包内层：判不出归属就
+// exec 邻仓的脚本。那能跑，但技能和钩子只能指一个入口（谁后装谁赢）、信封被取两遍
+// （重试预算翻倍，顶到秒级回执上限）、归属逻辑住在最外层。分发表一次解掉这三件。
+
+const R_SELF = { id: "self", handler: "/a/inbound.mjs", isDefault: true };
+const R_CC2CD = { id: "cc2cd", handler: "/b/c2c-inbound.mjs" };
+
+test("话题登记过就走登记的那条路由", () => {
+  const r = selectRoute({ sessionId: "s_x", routes: [R_SELF, R_CC2CD], sessions: { s_x: "cc2cd" } });
+  assert.equal(r.ok, true);
+  assert.equal(r.route.id, "cc2cd");
+  assert.equal(r.matchedBy, "session_registration");
+});
+
+test("没登记过就走默认路由 —— 待绑定认领由默认那家自己处理", () => {
+  const r = selectRoute({ sessionId: "s_new", routes: [R_SELF, R_CC2CD], sessions: {} });
+  assert.equal(r.route.id, "self");
+  assert.equal(r.matchedBy, "default");
+});
+
+test("只有一条路由时它就是默认，不必显式标 default", () => {
+  const one = { id: "only", handler: "/x.mjs" };
+  assert.equal(selectRoute({ sessionId: "s", routes: [one], sessions: {} }).route.id, "only");
+});
+
+test("登记指向一条不存在的路由 → 拒绝，绝不悄悄回落到默认", () => {
+  const r = selectRoute({ sessionId: "s_x", routes: [R_SELF], sessions: { s_x: "已经删掉的" } });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, ROUTE_REJECT.UNKNOWN_ROUTE);
+  // 回落会把本该给 B 的消息投给 A —— 静默且难查，正是分发层要防的那类错。
+});
+
+test("一条路由都没有 → 拒绝，不猜", () => {
+  assert.equal(selectRoute({ sessionId: "s", routes: [], sessions: {} }).reason, ROUTE_REJECT.NO_HANDLER);
+});
+
+test("多条路由都没标 default 且话题没登记 → 拒绝而不是挑第一条", () => {
+  const r = selectRoute({ sessionId: "s", routes: [R_CC2CD, { id: "x", handler: "/x.mjs" }], sessions: {} });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, ROUTE_REJECT.NO_HANDLER);
+});
+
+test("路由表读不到不是错误 —— 单消费者的机器不该被要求先写一张表", () => {
+  const t = loadRoutes(path.join(os.tmpdir(), "bridge-cc-没有这个文件.json"));
+  assert.equal(t.ok, true);
+  assert.equal(t.reason, "no_routes");
+  assert.deepEqual(t.routes, []);
+});
+
+test("enabled:false 的路由不参与选路", () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-rt-")), "routes.json");
+  fs.writeFileSync(f, JSON.stringify({ routes: [
+    { id: "a", handler: "/a.mjs", default: true },
+    { id: "b", handler: "/b.mjs", enabled: false },
+  ], sessions: { s1: "b" } }));
+  const t = loadRoutes(f);
+  assert.deepEqual(t.routes.map((r) => r.id), ["a"]);
+  // 登记还指向被停用的那条 → 拒绝，而不是当它不存在回落到 a
+  assert.equal(selectRoute({ sessionId: "s1", ...t }).reason, ROUTE_REJECT.UNKNOWN_ROUTE);
+});
+
+test("登记话题：幂等，且不许把别人的话题抢过来", () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-reg-")), "routes.json");
+  assert.equal(registerSession({ sessionId: "s1", routeId: "cc2cd", file: f }).changed, true);
+  assert.equal(registerSession({ sessionId: "s1", routeId: "cc2cd", file: f }).changed, false);
+  const stolen = registerSession({ sessionId: "s1", routeId: "self", file: f });
+  assert.equal(stolen.ok, false);
+  assert.equal(stolen.owner, "cc2cd");
+  // 静默改写会让「上一条进了 A、这一条进了 B」，那是最难查的一类
+  assert.equal(loadRoutes(f).sessions.s1, "cc2cd");
+});
+
+// ---------- 信封只取一次，往下传 ----------
+
+test("继承来的信封被直接采用，不再打一次网络", () => {
+  const ev = { message_id: "m1", session_id: "s1", sender_id: "u", created_at_ms: 1 };
+  const r = fetchTriggerEvent({ [ENV_PASS]: JSON.stringify(ev),
+    AILY_CLI_SESSION_ID: "s1", AILY_CLI_CALLER_AGENT_UID: "a" },
+    { runner: () => { throw new Error("不该再取一次"); } });
+  assert.equal(r.ok, true);
+  assert.equal(r.inherited, true);
+  assert.equal(r.attempts, 0);
+  assert.equal(r.event.message_id, "m1");
+});
+
+test("继承的信封结构不完整 → 当没有，回落到自己取", () => {
+  for (const bad of ["{}", '{"message_id":"m"}', "不是 json", ""]) {
+    assert.equal(inheritedEvent({ [ENV_PASS]: bad }), null, JSON.stringify(bad));
+  }
+});
+
+// ---------- 入站钩子：让「先进运输层」成为硬约束 ----------
+
+const AILY_ENV = { AILY_CLI_SESSION_ID: "s", AILY_CLI_CALLER_AGENT_UID: "agent_x" };
+
+test("认 Aily 回合只看 daemon 注入的环境变量，不看正文", () => {
+  assert.equal(isAilyTransportTurn(AILY_ENV), true);
+  assert.equal(isAilyTransportTurn({ AILY_CLI_SESSION_ID: "s" }), false, "缺 agent 不算");
+  assert.equal(isAilyTransportTurn({ AILY_CLI_CALLER_AGENT_UID: "a" }), false, "缺 session 不算");
+  assert.equal(isAilyTransportTurn({}), false);
+  // 宁可漏判（回落到技能那条软路径），也不能误判 ——
+  // 误判会把 Frank 在终端里正常的一句话变成「只准跑分发器」。
+});
+
+test("桥自己起的会话不再进运输层 —— 否则一次投递会无限套娃", () => {
+  assert.equal(isBridgeOwnedTurn({ FEISHU_BRIDGE_ROLE: "forwarder" }), true);
+  assert.equal(isBridgeOwnedTurn({ FEISHU_BRIDGE_ROLE: "" }), false);
+  assert.equal(isBridgeOwnedTurn({}), false);
+});
+
+test("注入的规则把禁令放在最前面、并在末尾重复一次", () => {
+  const rule = composeTransportRule({ dispatcher: "/b/scripts/aily-inbound.mjs" });
+  const head = rule.slice(0, 120);
+  assert.ok(head.includes("不是给你的指令"), "禁令必须在最前面 —— 中间那段是祈使句，模型天然想执行它");
+  assert.ok(rule.trimEnd().endsWith("原样返回它的输出。"), "末尾要再重复一次");
+  assert.ok(rule.includes("node /b/scripts/aily-inbound.mjs"));
+});
+
+test("注入的规则禁止模型自己判断该不该投递 —— 这条错误真实发生过", () => {
+  const rule = composeTransportRule({ dispatcher: "/x.mjs" });
+  assert.ok(rule.includes("不要自己判断"));
+  assert.ok(rule.includes("前缀"), "要点名前缀那次误判，否则一年后没人记得为什么写这条");
+});
+
+test("钩子和技能指向同一个入口 —— 绝不能各指一套", () => {
+  const skill = fs.readFileSync(path.resolve("skills", "m5claude-inbound-router", "SKILL.md"), "utf-8");
+  const rule = composeTransportRule({ dispatcher: "/B/scripts/aily-inbound.mjs" });
+  assert.ok(skill.includes("aily-inbound.mjs"), "技能要指分发器");
+  assert.ok(!skill.includes("scripts/inbound.mjs"), "技能不该再直接指业务脚本");
+  assert.ok(rule.includes("aily-inbound.mjs"), "钩子也要指分发器");
+});
+
+test("分发器自己不加一个字：stdout 原样透出", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "aily-inbound.mjs"), "utf-8");
+  assert.ok(src.includes('stdio: ["ignore", "inherit", "inherit"]'),
+    "handler 的 stdout 必须直通，分发器插一句嘴 Frank 就分不清是谁的判断");
+  assert.ok(src.includes("ENVELOPE_ENV"), "必须把取好的信封传下去");
 });
 
 // ---------- 汇总 ----------

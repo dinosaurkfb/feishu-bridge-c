@@ -74,7 +74,37 @@ export function buildEventsArgs({ sessionId, agentId, runId }) {
 /**
  * @returns {{ok:true, event:object} | {ok:false, reason:string, detail?:string}}
  */
+/**
+ * 分发器把已经取好的信封通过这个环境变量传给 handler，handler 就不必再取一遍。
+ *
+ * 为什么值得专门做这件事：Aily 的事件存储是最终一致的，取信封本身带 4 次重试
+ * （≤2.4s，见 FETCH_BACKOFF_MS）。分发器取一次、handler 再取一次，重试预算就翻倍，
+ * 顶到「秒级回执」那条契约的上限。而且两次取到的**可能不是同一条** ——
+ * 那会让分发和执行基于不同的事实，是最难查的一类不一致。
+ *
+ * 只接受**本进程祖先**放进来的值：它由分发器在 spawn 时显式注入，
+ * 不是从网络或消息正文来的，所以它和自己去取一样可信。
+ */
+export const ENVELOPE_ENV = "FEISHU_BRIDGE_ENVELOPE";
+
+/** 有人已经取好并传下来了吗。取不出合法结构就当没有，回落到自己取。 */
+export function inheritedEvent(env = process.env) {
+  const raw = env[ENVELOPE_ENV];
+  if (typeof raw !== "string" || !raw) return null;
+  try {
+    const e = JSON.parse(raw);
+    if (!e || typeof e.message_id !== "string" || typeof e.session_id !== "string") return null;
+    return e;
+  } catch {
+    return null;
+  }
+}
+
 export function fetchTriggerEvent(env = process.env, { runner = runAily, sleep = sleepSync } = {}) {
+  // 分发器已经取好就直接用，不再打一次网络。见 ENVELOPE_ENV 的说明。
+  const inherited = inheritedEvent(env);
+  if (inherited) return { ok: true, event: inherited, attempts: 0, inherited: true };
+
   const sessionId = env[ENV.SESSION];
   const runId = env[ENV.RUN];
   const agentId = env[ENV.AGENT];

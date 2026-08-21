@@ -29,6 +29,7 @@ const REGISTRY = path.join(os.homedir(), ".claude", "feishu-bridge", "registry.j
 const HOOK_SCRIPT = path.join(ROOT, "scripts", "stop-hook.mjs");
 const INIT_HOOK_SCRIPT = path.join(ROOT, "scripts", "init-hook.mjs");
 const PREVIEW_SCRIPT = path.join(ROOT, "scripts", "bind-preview.mjs");
+const INBOUND_HOOK_SCRIPT = path.join(ROOT, "scripts", "inbound-hook.mjs");
 const LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "stop-hook.log");
 
 /**
@@ -69,6 +70,14 @@ const INIT_COMMAND =
   `else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1 || :; fi`;
 const INIT_MARKER = INIT_HOOK_SCRIPT;
 
+// 入站钩子：让「任何 Aily 回合先进入运输层」成为硬约束，而不是靠模型记得调技能。
+// 跟 /init 钩子同一个事件（UserPromptSubmit），但判据完全不同、互不干扰：
+// 那个认 prompt 是不是 /init，这个认环境里有没有 daemon 注入的 AILY_CLI_*。
+const INBOUND_HOOK_COMMAND =
+  `if [ -x '${NODE_BIN}' ] && [ -r '${INBOUND_HOOK_SCRIPT}' ]; then '${NODE_BIN}' '${INBOUND_HOOK_SCRIPT}'; ` +
+  `else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1 || :; fi`;
+const INBOUND_HOOK_MARKER = INBOUND_HOOK_SCRIPT;
+
 const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
 
@@ -106,6 +115,22 @@ if (uninstall) {
 const prompts = (settings.hooks.UserPromptSubmit ??= []);
 const initAt = prompts.findIndex((entry) =>
   (entry?.hooks ?? []).some((h) => typeof h?.command === "string" && h.command.includes(INIT_MARKER)));
+
+// 两个 UserPromptSubmit 钩子各自按脚本路径幂等，互不覆盖。
+const inboundAt = prompts.findIndex((entry) =>
+  (entry?.hooks ?? []).some((h) => typeof h?.command === "string" && h.command.includes(INBOUND_HOOK_MARKER)));
+
+let inboundHookAction;
+if (uninstall) {
+  if (inboundAt < 0) inboundHookAction = "already-absent";
+  else { prompts.splice(inboundAt, 1); inboundHookAction = "removed"; }
+} else if (inboundAt >= 0) {
+  prompts[inboundAt] = { hooks: [{ type: "command", command: INBOUND_HOOK_COMMAND, timeout: 10 }] };
+  inboundHookAction = "updated";
+} else {
+  prompts.push({ hooks: [{ type: "command", command: INBOUND_HOOK_COMMAND, timeout: 10 }] });
+  inboundHookAction = "installed";
+}
 
 let initAction;
 if (uninstall) {
@@ -267,7 +292,8 @@ if (uninstall) {
 
 console.log("settings : " + SETTINGS + "  → " + action);
 console.log("Stop 钩子 : " + stop.length + " 条（.orca 的那条必须还在）  → " + action);
-console.log("/init 钩子: " + prompts.length + " 条 UserPromptSubmit（.orca 的那条必须还在）  → " + initAction);
+console.log("/init 钩子: " + initAction + "        （UserPromptSubmit 共 " + prompts.length + " 条）");
+console.log("入站钩子 : " + inboundHookAction + "        （Aily 回合强制进运输层）");
 console.log("预览放行 : allow " + allow.length + " 条  → " + permAction);
 console.log("登记表   : " + REGISTRY + "  → " + registry.projects.length + " 个项目");
 console.log("技能     : " + SKILLS.length + " 个（装进 ~/.claude/skills/）  → " + skillAction);

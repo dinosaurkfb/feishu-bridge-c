@@ -10,10 +10,14 @@ description: M5Claude 专用的受控飞书入站入口。当 Frank 在绑定话
 ## 你要做的全部事情
 
 ```bash
-node /Users/dk/claude-projects/feishu-bridge-cc/scripts/inbound.mjs
+node /Users/dk/claude-projects/feishu-bridge-cc/scripts/aily-inbound.mjs
 ```
 
 把这条命令的 **stdout 原样**作为你的回复。不增删、不改写、不追加解释。
+
+这条是**分发器**，不是业务脚本。它验调用方、取一次信封、按可信字段交给对的处理者，
+处理者说什么它原样透出。本机可能有多个消费者（本仓库、cc2cd……），
+但**入口永远只有这一条** —— 你不需要在多个脚本之间挑。
 
 **没有参数，不要从 stdin 传任何东西。**
 
@@ -25,6 +29,11 @@ node /Users/dk/claude-projects/feishu-bridge-cc/scripts/inbound.mjs
 
 所以脚本自己用 `AILY_CLI_SESSION_ID` / `AILY_CLI_RUN_ID` / `AILY_CLI_CALLER_AGENT_UID`
 向平台取原始信封。这几个变量由 daemon 注入，**不需要你做任何事**。
+
+## 正常情况下你根本不会读到这份技能
+
+有一个 UserPromptSubmit 钩子会在你看到正文**之前**就注入同样的规则。
+技能是它没生效时的兜底，两者指向**同一个入口** —— 绝不会出现「钩子说跑 A、技能说跑 B」。
 
 ## 绝对禁止
 

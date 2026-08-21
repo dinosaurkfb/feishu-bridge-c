@@ -22,6 +22,38 @@
  */
 
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "inbound-hook.log");
+const LOG_MAX = 1 << 19;
+
+/**
+ * **进来就记，记完再判闸。**
+ *
+ * 这行日志的存在理由很具体：2026-08-21 新钩子做完、五道闸用合成 payload 全验绿，
+ * 但真实飞书消息进来时一点反应都没有 —— 而当时无法分辨是「没触发」「触发了但被某道闸
+ * 挡了」还是「触发了但环境变量名跟我以为的不一样」。三种可能对应三种完全不同的修法。
+ *
+ * 合成 payload 验的是我自己造的环境；只有无条件日志能告诉我 daemon 真实注入了什么。
+ * 刻意**不记 prompt 正文** —— 诊断需要的是环境形状，不是消息内容。
+ */
+function log(line) {
+  try {
+    fs.mkdirSync(path.dirname(LOG), { recursive: true, mode: 0o700 });
+    try { if (fs.statSync(LOG).size > LOG_MAX) fs.rmSync(LOG, { force: true }); } catch { /* 首次 */ }
+    fs.appendFileSync(LOG, new Date().toISOString() + " " +
+      String(line).replace(/\s+/g, " ").slice(0, 500) + "\n", { mode: 0o600 });
+  } catch { /* 日志写不了不该影响会话 */ }
+}
+
+/** 环境的形状，不含任何内容。用于回答「daemon 到底注入了什么」。 */
+function envShape(env = process.env) {
+  const ailyKeys = Object.keys(env).filter((k) => k.startsWith("AILY_CLI_")).sort();
+  return "aily=[" + ailyKeys.join(",") + "]" +
+    " caller=" + (env.AILY_CLI_CALLER_AGENT_UID ?? "-") +
+    " role=" + (env.FEISHU_BRIDGE_ROLE ?? "-");
+}
 
 /**
  * 这是不是一个 Aily 运输回合。
@@ -88,25 +120,31 @@ function readStdinJson() {
 async function main() {
   const payload = readStdinJson() ?? {};
 
+  log("enter cwd=" + (payload.cwd ?? "-") + " " + envShape());
+
   // 最热的一条路径：本机绝大多数 prompt 不是 Aily 回合，在这里就退。
-  if (!isAilyTransportTurn()) process.exit(0);
-  if (isBridgeOwnedTurn()) process.exit(0);
+  if (!isAilyTransportTurn()) { log("skip not_aily_turn"); process.exit(0); }
+  if (isBridgeOwnedTurn()) { log("skip bridge_owned"); process.exit(0); }
 
   const { loadChainTemplate } = await import("./chain-template.mjs");
   const tpl = loadChainTemplate();
   // 没有机器级模板 = 这台机器没装桥。不该在这里教人怎么装，静默退出。
-  if (!tpl.ok) process.exit(0);
+  if (!tpl.ok) { log("skip template_unusable " + tpl.reason); process.exit(0); }
 
   // 不是本链路的运输 agent 就别管 —— 本机可能有别的 aily agent，
   // 给它们注入我们的规则是越界。真正的拒绝由分发器做，回执才说得清楚。
-  if (process.env.AILY_CLI_CALLER_AGENT_UID !== tpl.template.agent_uid) process.exit(0);
+  if (process.env.AILY_CLI_CALLER_AGENT_UID !== tpl.template.agent_uid) {
+    log("skip other_agent expected=" + tpl.template.agent_uid);
+    process.exit(0);
+  }
 
   const bridgeRoot = tpl.template.bridge_root;
-  if (typeof bridgeRoot !== "string" || !bridgeRoot) process.exit(0);
+  if (typeof bridgeRoot !== "string" || !bridgeRoot) { log("skip no_bridge_root"); process.exit(0); }
 
   const context = composeTransportRule({
     dispatcher: bridgeRoot + "/scripts/aily-inbound.mjs",
   });
+  log("INJECT " + context.length + " 字符 → " + bridgeRoot + "/scripts/aily-inbound.mjs");
   process.stdout.write(JSON.stringify({
     hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: context },
   }) + "\n");
@@ -122,5 +160,5 @@ if (import.meta.url === "file://" + process.argv[1]) {
     }));
     process.exit(0);
   }
-  main().catch(() => process.exit(0)); // 桥的故障绝不外溢到别人的会话
+  main().catch((err) => { log("crashed " + String(err?.message ?? err).slice(0,200)); process.exit(0); });
 }

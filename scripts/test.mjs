@@ -2604,6 +2604,25 @@ test("分发器自己不加一个字：stdout 原样透出", () => {
   assert.ok(src.includes("ENVELOPE_ENV"), "必须把取好的信封传下去");
 });
 
+test("入站钩子进来就记日志，记完再判闸", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "inbound-hook.mjs"), "utf-8");
+  const enter = src.indexOf('log("enter');
+  const firstGate = src.indexOf("isAilyTransportTurn()");
+  assert.ok(enter > 0, "必须有无条件的入口日志");
+  assert.ok(enter < firstGate,
+    "日志要排在第一道闸之前 —— 否则「没触发」和「触发了但被挡」分不开，" +
+    "而这两种情况的修法完全不同（2026-08-21 就卡在这个分不开上）");
+  assert.ok(!src.includes("payload.prompt"), "诊断需要的是环境形状，不是消息内容");
+});
+
+test("每条退出路径都留下可分辨的原因", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "inbound-hook.mjs"), "utf-8");
+  for (const reason of ["not_aily_turn", "bridge_owned", "template_unusable",
+                        "other_agent", "no_bridge_root", "INJECT", "crashed"]) {
+    assert.ok(src.includes(reason), "缺少 " + reason + " 的日志出口");
+  }
+});
+
 // ---------- 汇总 ----------
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

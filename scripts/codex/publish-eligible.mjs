@@ -5,10 +5,11 @@
  * 授予。这样升级前的历史积压、失败 run 的半成品答复都不会被下一轮顺带发出。
  */
 
-import { composeDigest, listPending, markSent } from "../outbox.mjs";
+import { listPending, markSent } from "../outbox.mjs";
 import { publishDraft } from "../outbound.mjs";
 import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
 import { resolveLarkIdentity } from "../chain-template.mjs";
+import { composeCodexOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { bridgeHome, resolveTask, taskPaths } from "./state.mjs";
 
 export function publishEligibleTaskEvents({ task, home = bridgeHome(), timeoutMs = 12_000 } = {}) {
@@ -33,17 +34,28 @@ export function publishEligibleTaskEvents({ task, home = bridgeHome(), timeoutMs
     const current = eligible();
     if (current.length === 0) return { status: "empty" };
     const identity = resolveLarkIdentity(resolved.template);
-    const messageId = publishDraft({
-      profile: identity.profile,
-      rootMessageId: resolved.mapping.feishu_root_message_id_reference,
-      text: composeDigest(current, { taskName: task.task_display_name }),
-      larkBin: identity.bin,
-      larkHome: identity.configDir,
-      expectedAppId: identity.expectedAppId,
-      timeoutMs,
-    });
-    for (const event of current) markSent(event, messageId);
-    return { status: "published", count: current.length, messageId };
+    const messageIds = [];
+    // reply 一轮一张卡，才能让本地输入与对应答复保持精确配对。没有回合可依附的进展
+    // 继续合批，避免同类通知把话题刷屏。每张成功后立即标记，后续失败不会重发前一张。
+    for (const batch of outboundCardBatches(current)) {
+      const messageId = publishDraft({
+        profile: identity.profile,
+        rootMessageId: resolved.mapping.feishu_root_message_id_reference,
+        card: composeCodexOutboundCard(batch, { taskName: task.task_display_name }),
+        larkBin: identity.bin,
+        larkHome: identity.configDir,
+        expectedAppId: identity.expectedAppId,
+        timeoutMs,
+      });
+      for (const event of batch) markSent(event, messageId);
+      messageIds.push(messageId);
+    }
+    return {
+      status: "published",
+      count: current.length,
+      messageId: messageIds.at(-1) ?? null,
+      messageIds,
+    };
   } catch (err) {
     // 不标记、不吞掉；后续 Stop/watcher 会再次尝试所有 eligible 事件。
     return { status: "error", reason: "publish_failed", error: String(err?.message ?? err).slice(0, 400) };

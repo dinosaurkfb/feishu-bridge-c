@@ -20,6 +20,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import {
+  claudeTurnInputDir, clearTurnInput, readTurnInput,
+} from "./turn-input.mjs";
+
 // 会话结束是同步阻塞点：Frank 的终端在等它返回。发不出去就留在 outbox，
 // 兜底定时器 30 分钟内会重试 —— 宁可晚发，不可吊住会话。
 const PUBLISH_TIMEOUT_MS = 12_000;
@@ -135,14 +139,28 @@ async function main() {
     const bound = resolveProject({ root: project.root, claudeSessionId: speakingSession });
     const boundSession = bound.ok ? bound.claudeSessionId : null;
     const outboxDir = outboxDirOf(project.root, boundSession);
+    const inputDir = claudeTurnInputDir(project.root, boundSession);
     // 答复只发给 **cwd 归属**的项目，不发给「会话记录里提到过路径」的那些。
     // 弱信号用来触发排空是安全的（那些内容本来就要发），但用它决定
     // 「把整段对话原文发到谁的话题里」不行 —— 一次误判就是把无关对话发给了 Frank。
     if (reply && project.via.includes("cwd")) {
+      const input = speakingSession
+        ? readTurnInput({ dir: inputDir, key: speakingSession })
+        : { ok: false };
       const r = appendEvent({
         outboxDir, kind: "reply", text: reply, source: "session-reply",
+        eventKey: input.ok && input.captureId
+          ? "claude:" + speakingSession + ":capture:" + input.captureId + ":reply"
+          : undefined,
+        inputText: input.ok ? input.text : undefined,
+        inputOrigin: input.ok ? input.inputOrigin : undefined,
       });
+      // 成功后保留本轮单文件缓存，直到下一次 UserPromptSubmit 原子覆写。这样 Stop hook
+      // 若在同一回合重入，仍会拿到相同 capture_id 并命中事件级幂等；立即删除反而会让
+      // 第二次 Stop 退回正文指纹，制造一条没有输入块的重复答复。
       if (r.ok) log(project.id + " reply queued (" + reply.length + " 字符)");
+    } else if (!reply && speakingSession && project.via.includes("cwd")) {
+      clearTurnInput({ dir: inputDir, key: speakingSession });
     }
 
     // 体检要在「outbox 空不空」之前做 —— 它有可能自己往 outbox 里加一条。

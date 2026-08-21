@@ -133,8 +133,20 @@ function preflight({ configDir, profile, expectedAppId }) {
  * 单智能体方案下就是运输那个 agent 自己，双智能体方案下是一个独立的发布身份。
  * 无论哪种，发之前都会校验「手上这份凭据确实属于配置说的那个应用」。
  */
-export function publishDraft({ profile, rootMessageId, text, larkBin, larkHome, expectedAppId, timeoutMs }) {
+export function publishDraft({
+  profile, rootMessageId, text, card, larkBin, larkHome, expectedAppId, timeoutMs,
+}) {
   preflight({ configDir: larkHome, profile, expectedAppId });
+
+  const hasText = typeof text === "string" && text.length > 0;
+  const hasCard = card !== null && typeof card === "object" && !Array.isArray(card);
+  if (hasText === hasCard) {
+    throw new Error("发布内容必须且只能提供 text 或 card 其中一个");
+  }
+
+  const contentArgs = hasCard
+    ? ["--msg-type", "interactive", "--content", JSON.stringify(card)]
+    : ["--text", text];
 
   // 必须显式指定二进制和配置目录：守望者是在 M5Claude 的清洗环境里被拉起的，
   // 那里 lark-cli 被重定向到按 agent 隔离的配置目录（只有 platform-bot），
@@ -147,7 +159,7 @@ export function publishDraft({ profile, rootMessageId, text, larkBin, larkHome, 
   const out = execFileSync(
     larkBin ?? "lark-cli",
     ["im", "+messages-reply", "--message-id", rootMessageId, "--as", "bot",
-     "--reply-in-thread", "--text", text, "--json"],
+     "--reply-in-thread", ...contentArgs, "--json"],
     { encoding: "utf-8",
       // stderr 要捕获而不是继承。默认继承时 lark-cli 的报错 JSON 会直接喷进
       // 调用方的 stderr —— 出站发布器现在跑在会话结束钩子里，那等于喷到 Frank 的终端上。
@@ -227,10 +239,17 @@ if (import.meta.url === "file://" + process.argv[1]) {
   } else {
     const root = mapping.feishu_root_message_id_reference;
     if (!root) throw new Error("mapping 里没有根话题消息 ID，无法发布");
+    const { composeOutboundCard } = await import("./outbound-card.mjs");
     for (const r of pending) {
       const text = buildDraft(r, { taskName: cfg.task_display_name });
       if (!text) continue;
-      const mid = publishDraft({ profile: cfg.lark_cli_profile, rootMessageId: root, text,
+      const mid = publishDraft({
+        profile: cfg.lark_cli_profile,
+        rootMessageId: root,
+        card: composeOutboundCard([{
+          kind: r.state === "completed" ? "reply" : "risk",
+          text,
+        }], { taskName: cfg.task_display_name, runtime: "claude" }),
         larkBin: cfg.lark_cli_bin, larkHome: cfg.lark_cli_home });
       markPublished({ runsDir, key: r.key, messageId: mid });
       console.log("已发布 " + r.key.slice(0, 8) + " -> " + mid);

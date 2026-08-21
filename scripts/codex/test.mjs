@@ -11,11 +11,18 @@ import {
   appendEvent, listPending, markPublishEligibleByEventKey, suppressPublishByEventKey,
 } from "../outbox.mjs";
 import { evaluateInbound, REJECT } from "../selector.mjs";
-import { composeCodexBinding, validThreadId } from "./bind-compose.mjs";
+import { composeCodexBinding, resolveBindingTarget, validThreadId } from "./bind-compose.mjs";
 import { readCodexThreadTitle, sanitizeThreadTitle } from "./thread-title.mjs";
 import { updateTextMessage } from "./lark-message.mjs";
 import { classifyRunnerDiagnostic, readCodexRunOutcome, sanitizeCodexRunEnv } from "./handoff.mjs";
+import {
+  composeCodexOutboundCard, neutralizeCardMentions, outboundCardBatches, validateCodexOutboundCard,
+} from "./outbound-card.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
+import { publishDraft } from "../outbound.mjs";
+import {
+  clearTurnInput, readTurnInput, storeTurnInput,
+} from "../turn-input.mjs";
 import {
   classifyFeishuPrompt, composeAilyInboundContext, composeBindingContext, composeInitContext,
   composeRoutedCodexContext, composeStatusContext, composeUnbindContext, isAilyInvocation, isBindingPrompt,
@@ -23,7 +30,7 @@ import {
 import {
   enableAutoPublishForAllTasks, extractQuotedBindingTokens, findPendingTask,
   findRegisteredTaskForCodexThread, findTaskForCodexThread, findTaskForFeishuSession,
-  isThreadBusy, loadRegistry, makeTaskEntry, mappingForTask, recordThreadActivity,
+  isThreadBusy, loadCodexTemplate, loadRegistry, makeTaskEntry, mappingForTask, recordThreadActivity, resolveTask,
   setTaskConnectionStatus, setTaskDisplayName, taskPaths, validateCodexTemplate, validateRegistryTasks, writeRegistry,
 } from "./state.mjs";
 
@@ -51,6 +58,7 @@ function autoPublishFixture({ enabled = true, workingPublisher = true } = {}) {
   const home = temp();
   const root = path.join(home, "project");
   const bin = path.join(home, "fake-lark.sh");
+  const argsFile = path.join(home, "lark-args.json");
   const configBase = path.join(home, "agents");
   const credentialDir = path.join(configBase, TEMPLATE.agent_uid);
   fs.mkdirSync(root);
@@ -59,7 +67,10 @@ function autoPublishFixture({ enabled = true, workingPublisher = true } = {}) {
     apps: [{ name: TEMPLATE.lark_cli_profile, appId: TEMPLATE.transport_app_id }],
   }));
   fs.writeFileSync(bin, workingPublisher
-    ? "#!/bin/sh\nprintf '%s' '{\"ok\":true,\"data\":{\"message_id\":\"om_sent\"}}'\n"
+    ? "#!" + process.execPath + "\n" +
+      "const fs = require('node:fs');\n" +
+      "fs.writeFileSync(" + JSON.stringify(argsFile) + ", JSON.stringify(process.argv.slice(2)));\n" +
+      "process.stdout.write('{\"ok\":true,\"data\":{\"message_id\":\"om_sent\"}}');\n"
     : "#!/bin/sh\nexit 1\n", { mode: 0o700 });
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({
     ...TEMPLATE, lark_cli_bin: bin, lark_cli_config_base: configBase,
@@ -67,7 +78,7 @@ function autoPublishFixture({ enabled = true, workingPublisher = true } = {}) {
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
   task.auto_publish_on_completion = enabled;
   writeRegistry([task], path.join(home, "registry.json"));
-  return { home, root, task };
+  return { home, root, task, bin, argsFile };
 }
 
 test("thread id 只接受精确 UUID，不接受 --last 或名字", () => {
@@ -409,6 +420,145 @@ test("outbox 按事件键而非正文去重", () => {
   assert.equal(appendEvent({ outboxDir, kind: "reply", text: "相同答复", eventKey: "turn-2" }).ok, true);
   assert.equal(appendEvent({ outboxDir, kind: "reply", text: "被改写也不应重入", eventKey: "turn-1" }).reason, "duplicate");
   assert.equal(listPending({ outboxDir }).length, 2);
+});
+
+test("Codex 出站使用无顶底栏的轻量 Card 2.0，并保留语义摘要", () => {
+  const reply = composeCodexOutboundCard([
+    { kind: "reply", text: "这是最终答复", created_at: "2026-08-21T00:00:00Z" },
+  ], { taskName: "高价值会议｜项目推进" });
+  assert.equal(validateCodexOutboundCard(reply).ok, true);
+  assert.equal(reply.schema, "2.0");
+  assert.equal(reply.config.width_mode, "default");
+  assert.equal(reply.header, undefined);
+  assert.equal(reply.body.elements.length, 1);
+  assert.equal(reply.body.elements[0].tag, "markdown");
+  assert.equal(reply.body.elements[0].element_id, "agent_reply");
+  assert.match(JSON.stringify(reply.body.elements[0]), /这是最终答复/u);
+  assert.equal(JSON.stringify(reply).includes("column_set"), false);
+  assert.equal(JSON.stringify(reply).includes("background_style"), false);
+  assert.equal(reply.config.summary.content, "这是最终答复");
+  assert.equal(JSON.stringify(reply).includes("behaviors"), false);
+
+  const risk = composeCodexOutboundCard([
+    { kind: "risk", text: "任务没有完成" },
+  ], { taskName: "风险测试" });
+  assert.equal(risk.header, undefined);
+  assert.equal(risk.body.elements[0].tag, "markdown");
+  assert.equal(risk.config.summary.content, "风险：任务没有完成");
+});
+
+test("本地 Codex 输入与回复进入同一张卡，飞书入站回复不复读原消息", () => {
+  const local = composeCodexOutboundCard([{
+    kind: "reply",
+    text: "我已经完成修改",
+    input_origin: "local",
+    input_text: "请把输入和回复放在一张卡里",
+  }], { taskName: "配对测试" });
+  assert.equal(local.body.elements.length, 2);
+  assert.equal(local.body.elements[0].element_id, "user_quote");
+  assert.equal(local.body.elements[0].text_size, "notation");
+  assert.match(local.body.elements[0].content, /^> <font color='grey'>/u);
+  assert.match(JSON.stringify(local.body.elements[0]), /请把输入和回复放在一张卡里/u);
+  assert.equal(local.body.elements[1].element_id, "agent_reply");
+  assert.match(JSON.stringify(local.body.elements[1]), /我已经完成修改/u);
+  assert.equal(JSON.stringify(local).includes("你的输入"), false);
+  assert.equal(JSON.stringify(local).includes("Codex 回复"), false);
+  assert.equal(local.config.summary.content, "请把输入和回复放在一张卡里");
+
+  const inbound = composeCodexOutboundCard([{
+    kind: "reply",
+    text: "这是飞书指令的执行结果",
+    input_origin: null,
+    input_text: null,
+  }], { taskName: "去重测试" });
+  assert.equal(inbound.body.elements.length, 1);
+  assert.equal(inbound.body.elements[0].element_id, "agent_reply");
+  assert.equal(JSON.stringify(inbound).includes("user_quote"), false);
+  assert.match(JSON.stringify(inbound), /这是飞书指令的执行结果/u);
+  assert.equal(inbound.config.summary.content, "这是飞书指令的执行结果");
+});
+
+test("会话列表摘要取首条有效纯文本，并清理 Markdown 与 mention", () => {
+  const local = composeCodexOutboundCard([{
+    kind: "reply", text: "回复", input_origin: "local",
+    input_text: "# Files mentioned by the user:\n截图.png\n\n## My request:\n" +
+      "<at id=ou_someone></at> **修复侧栏摘要**\n第二行不应进入摘要",
+  }], { taskName: "摘要测试" });
+  assert.equal(local.config.summary.content, "修复侧栏摘要");
+  assert.match(local.body.elements[0].content, /修复侧栏摘要.*<br>第二行不应进入摘要/u);
+
+  const progress = composeCodexOutboundCard([
+    { kind: "milestone", text: "- 已经完成第一阶段\n更多说明" },
+  ], { taskName: "摘要测试" });
+  assert.equal(progress.config.summary.content, "里程碑：已经完成第一阶段");
+});
+
+test("进展正文把动态任务名收敛为单行普通文本", () => {
+  const card = composeCodexOutboundCard([
+    { kind: "milestone", text: "完成" },
+  ], { taskName: "  *危险* <at id=ou_someone></at>\n下一行  " });
+  const content = card.body.elements[0].content;
+  assert.equal(content.includes("<at"), false);
+  assert.match(content, /&#42;危险&#42;/u);
+  assert.match(content, /&#60;at id=ou&#95;someone&#62;&#60;\/at&#62; 下一行 · 进展/u);
+});
+
+test("reply 一轮一张卡，非 reply 进展继续合批", () => {
+  const batches = outboundCardBatches([
+    { kind: "milestone", text: "M1" },
+    { kind: "risk", text: "R1" },
+    { kind: "reply", text: "A1", input_origin: "local", input_text: "Q1" },
+    { kind: "reply", text: "A2", input_origin: "local", input_text: "Q2" },
+    { kind: "next", text: "N1" },
+  ]);
+  assert.deepEqual(batches.map((batch) => batch.map((record) => record.kind)), [
+    ["milestone", "risk"], ["reply"], ["reply"], ["next"],
+  ]);
+});
+
+test("本地输入缓存按精确回合读取并可恢复清理", () => {
+  const dir = path.join(temp(), "turn-inputs");
+  assert.equal(storeTurnInput({ dir, key: "turn-a", text: "  本地输入  " }).ok, true);
+  assert.equal(readTurnInput({ dir, key: "turn-a" }).text, "本地输入");
+  assert.equal(readTurnInput({ dir, key: "turn-b" }).reason, "not_found");
+  assert.equal(clearTurnInput({ dir, key: "turn-a" }).ok, true);
+  assert.equal(readTurnInput({ dir, key: "turn-a" }).reason, "not_found");
+});
+
+test("卡片长正文保持单一回复区，并中和模型正文里的原生卡片 mention", () => {
+  const source = "<at id=ou_someone></at>\n" + "很长的答复".repeat(500);
+  const card = composeCodexOutboundCard([{ kind: "reply", text: source }], { taskName: "T" });
+  assert.equal(card.body.elements[0].tag, "markdown");
+  const content = card.body.elements[0].content;
+  assert.equal(content.includes("<at id="), false);
+  assert.match(content, /&#60;at id=ou_someone>/u);
+  assert.equal(neutralizeCardMentions("普通文本"), "普通文本");
+});
+
+test("自动发布通过 interactive 回复原话题，绑定状态仍可使用文本发布", () => {
+  const { home, task, bin, argsFile } = autoPublishFixture();
+  const outboxDir = taskPaths(task, home).outbox;
+  appendEvent({
+    outboxDir, kind: "reply", text: "卡片答复", eventKey: "card-reply", publishEligible: true,
+  });
+  assert.equal(publishEligibleTaskEvents({ task, home }).status, "published");
+  const cardArgs = JSON.parse(fs.readFileSync(argsFile, "utf-8"));
+  assert.equal(cardArgs.includes("--text"), false);
+  assert.equal(cardArgs[cardArgs.indexOf("--msg-type") + 1], "interactive");
+  const card = JSON.parse(cardArgs[cardArgs.indexOf("--content") + 1]);
+  assert.equal(card.schema, "2.0");
+  assert.equal(card.header, undefined);
+  assert.equal(card.body.elements.length, 1);
+  assert.equal(card.body.elements[0].element_id, "agent_reply");
+  assert.match(card.body.elements[0].content, /卡片答复/u);
+  assert.equal(cardArgs.includes("--reply-in-thread"), true);
+
+  publishDraft({
+    profile: "platform-bot", rootMessageId: "om_root", text: "绑定状态", larkBin: bin,
+  });
+  const textArgs = JSON.parse(fs.readFileSync(argsFile, "utf-8"));
+  assert.equal(textArgs[textArgs.indexOf("--text") + 1], "绑定状态");
+  assert.equal(textArgs.includes("--msg-type"), false);
 });
 
 test("自动发布只消费显式 eligible 事件，不补发升级前的历史 outbox", () => {
@@ -772,6 +922,55 @@ test("Codex Stop hook：相同正文的两个 turn 各入队一次，同一 turn
   assert.equal(listPending({ outboxDir: taskPaths(task, home).outbox }).length, 2);
 });
 
+test("Codex UserPromptSubmit 与 Stop 按 turn_id 配对本地输入，入站 runner 不缓存", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = false;
+  writeRegistry([task], path.join(home, "registry.json"));
+  const promptHook = path.join(ROOT, "scripts", "codex", "prompt-hook.mjs");
+  const stopHook = path.join(ROOT, "scripts", "codex", "stop-hook.mjs");
+  const env = { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home };
+
+  const submitted = spawnSync(process.execPath, [promptHook], {
+    input: JSON.stringify({
+      session_id: THREAD_A, turn_id: "turn-paired", cwd: root, prompt: "请实现一轮一卡",
+    }),
+    encoding: "utf-8",
+    env,
+  });
+  assert.equal(submitted.status, 0, submitted.stderr);
+  assert.equal(readTurnInput({ dir: taskPaths(task, home).turnInputs, key: "turn-paired" }).text,
+    "请实现一轮一卡");
+
+  const stopped = spawnSync(process.execPath, [stopHook], {
+    input: JSON.stringify({
+      session_id: THREAD_A, turn_id: "turn-paired", cwd: root, last_assistant_message: "已经完成",
+    }),
+    encoding: "utf-8",
+    env,
+  });
+  assert.equal(stopped.status, 0, stopped.stderr);
+  const record = listPending({ outboxDir: taskPaths(task, home).outbox })[0];
+  assert.equal(record.input_origin, "local");
+  assert.equal(record.input_text, "请实现一轮一卡");
+  assert.equal(record.text, "已经完成");
+  assert.equal(readTurnInput({ dir: taskPaths(task, home).turnInputs, key: "turn-paired" }).reason,
+    "not_found");
+
+  const routed = spawnSync(process.execPath, [promptHook], {
+    input: JSON.stringify({
+      session_id: THREAD_A, turn_id: "turn-feishu", cwd: root, prompt: "来自飞书的指令",
+    }),
+    encoding: "utf-8",
+    env: { ...env, FEISHU_BRIDGE_ROLE: "codex-run" },
+  });
+  assert.equal(routed.status, 0, routed.stderr);
+  assert.equal(readTurnInput({ dir: taskPaths(task, home).turnInputs, key: "turn-feishu" }).reason,
+    "not_found");
+});
+
 test("Codex Stop hook 自动发布本地回合，并保留旧的非 eligible 积压", () => {
   const { home, root, task } = autoPublishFixture();
   const outboxDir = taskPaths(task, home).outbox;
@@ -983,6 +1182,99 @@ test("绑定预览为同一 thread 生成稳定逻辑键与平台幂等键", () 
   assert.equal(a.statusText.includes("真实 @M5Codex"), true);
   assert.equal(a.statusText.includes("不需要额外关键字"), true);
   assert.equal(a.statusText.includes("运输 agent"), false);
+});
+
+test("绑定目标默认沿用机器群，显式跨群时要求 chat-id 并隔离平台幂等域", () => {
+  const defaultTarget = resolveBindingTarget({ template: TEMPLATE });
+  const override = resolveBindingTarget({
+    template: TEMPLATE, chatId: "oc_lab", chatName: "智能体进化",
+  });
+  assert.deepEqual(defaultTarget, {
+    ok: true, chatId: TEMPLATE.chat_id, chatName: TEMPLATE.chat_name, overridden: false,
+  });
+  assert.deepEqual(override, {
+    ok: true, chatId: "oc_lab", chatName: "智能体进化", overridden: true,
+  });
+  assert.equal(resolveBindingTarget({ template: TEMPLATE, chatName: "智能体进化" }).reason,
+    "chat_name_without_chat_id");
+  assert.equal(resolveBindingTarget({ template: TEMPLATE, chatId: "wrong" }).reason, "invalid_chat_id");
+
+  const dir = temp();
+  const legacy = composeCodexBinding({ root: dir, threadId: THREAD_A });
+  const lab = composeCodexBinding({ root: dir, threadId: THREAD_A, idempotencyScope: "oc_lab" });
+  const another = composeCodexBinding({ root: dir, threadId: THREAD_A, idempotencyScope: "oc_other" });
+  assert.equal(legacy.token, lab.token);
+  assert.notEqual(legacy.idempotencyKey, lab.idempotencyKey);
+  assert.notEqual(lab.idempotencyKey, another.idempotencyKey);
+});
+
+test("task 级目标群覆盖只进入 Git 外运行映射，不改变机器模板", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const task = makeTaskEntry({
+    root, threadId: THREAD_A, name: "实验主管", rootMessageId: "om_lab", token: "lab",
+    chatId: "oc_lab", chatName: "智能体进化",
+  });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const resolved = findTaskForCodexThread({ threadId: THREAD_A, home });
+  assert.equal(resolved.ok, true);
+  const mapped = mappingForTask(task, { home });
+  assert.equal(mapped.codex_thread_id, THREAD_A);
+  const registered = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home });
+  assert.equal(registered.task.chat_id, "oc_lab");
+  assert.equal(registered.task.chat_name, "智能体进化");
+  const runtime = resolveTask(task, { home });
+  assert.equal(runtime.config.chat_id, "oc_lab");
+  assert.equal(runtime.config.chat_name, "智能体进化");
+  assert.equal(loadCodexTemplate(path.join(home, "chain-config.json")).template.chat_id, TEMPLATE.chat_id);
+});
+
+test("bind-task 显式跨群 apply 把根消息发到目标群并登记该 task 的群", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  const bin = path.join(home, "fake-lark.sh");
+  const calls = path.join(home, "calls.txt");
+  const configBase = path.join(home, "agents");
+  const credentialDir = path.join(configBase, TEMPLATE.agent_uid);
+  fs.mkdirSync(root);
+  fs.mkdirSync(credentialDir, { recursive: true });
+  fs.writeFileSync(path.join(root, "README.md"), "# Lab\n");
+  fs.writeFileSync(path.join(credentialDir, "config.json"), JSON.stringify({
+    apps: [{ name: TEMPLATE.lark_cli_profile, appId: TEMPLATE.transport_app_id }],
+  }));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({
+    ...TEMPLATE, lark_cli_bin: bin, lark_cli_config_base: configBase,
+  }));
+  fs.writeFileSync(bin, [
+    "#!/bin/sh",
+    "printf '%s\\n' \"$*\" >> \"$FAKE_CALLS_FILE\"",
+    "case \"$*\" in",
+    "  *+messages-send*) printf '%s' '{\"ok\":true,\"data\":{\"message_id\":\"om_lab_root\"}}' ;;",
+    "  *) printf '%s' '{\"ok\":true,\"data\":{\"message_id\":\"om_lab_reply\"}}' ;;",
+    "esac",
+  ].join("\n") + "\n", { mode: 0o700 });
+
+  const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
+    "--project", root,
+    "--thread-id", THREAD_A,
+    "--name", "智能体进化｜Aily主动求助验收",
+    "--chat-id", "oc_lab",
+    "--chat-name", "智能体进化",
+    "--apply"], {
+    encoding: "utf-8",
+    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home, FAKE_CALLS_FILE: calls },
+  });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /群\s+智能体进化/u);
+  assert.equal(run.stdout.includes("oc_lab"), false, "stdout 不暴露群 locator");
+  const sent = fs.readFileSync(calls, "utf-8");
+  assert.match(sent, /\+messages-send --chat-id oc_lab/u);
+  const task = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
+  assert.equal(task.root_message_id, "om_lab_root");
+  assert.equal(task.chat_id, "oc_lab");
+  assert.equal(task.chat_name, "智能体进化");
 });
 
 test("同一项目的两个 Codex task 用 Desktop 标题和短码形成不同的可见话题名", () => {

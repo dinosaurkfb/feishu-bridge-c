@@ -144,7 +144,7 @@ export function composeRootMessage({ name, heading = name, purpose, root, token 
     "本机项目  " + root,
     "绑定码    " + token,
     "",
-    "项目里的进展和每一轮回答都会回复到本条消息下面。",
+    "本机输入与每轮回答会合成卡片回复到本话题；从本话题发出的输入不会重复显示。",
   );
   return lines.join("\n");
 }

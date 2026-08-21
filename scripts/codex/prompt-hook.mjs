@@ -5,8 +5,9 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
-  bridgeHome, findRegisteredTaskForCodexThread, loadCodexTemplate, recordThreadActivity,
+  bridgeHome, findRegisteredTaskForCodexThread, loadCodexTemplate, recordThreadActivity, taskPaths,
 } from "./state.mjs";
+import { storeTurnInput } from "../turn-input.mjs";
 
 export function classifyFeishuPrompt(prompt) {
   if (typeof prompt !== "string") return "none";
@@ -165,6 +166,19 @@ async function main() {
       },
     }) + "\n");
     return;
+  }
+
+  // 只有人类直接在 Codex Desktop/CLI 提交的输入才进入配对缓存。飞书入站 runner、
+  // Shadow 和企业智能体求助都在上面按 bridgeRole 返回，因此不会把话题原文再抄一遍。
+  // unbind 会在本轮关闭连接，既不会发布答复，也不应留下一个等待未来误配的输入缓存。
+  if (registered.ok && (registered.task.status ?? "active") === "active" && action !== "unbind" &&
+      typeof payload.turn_id === "string" && payload.turn_id &&
+      typeof payload.prompt === "string" && payload.prompt.trim()) {
+    storeTurnInput({
+      dir: taskPaths(registered.task, bridgeHome()).turnInputs,
+      key: payload.turn_id,
+      text: payload.prompt,
+    });
   }
   if (action === "init") {
     const connectionStatus = registered.ok ? (registered.task.status ?? "active") : "none";

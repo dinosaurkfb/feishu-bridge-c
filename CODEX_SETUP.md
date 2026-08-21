@@ -2,6 +2,10 @@
 
 Codex adapter 把一个飞书话题绑定到一个**精确 Codex task/thread**：在话题里真实
 `@M5Codex` 后，正文作为用户指令进入该 task；Codex 的最终答复自动回到原话题。
+自动回写使用只读 Card 2.0 卡片：Desktop/CLI 本地发起的回合先显示“你的输入”，再显示
+回复：输入以顶部小号灰色引用呈现，下面是单一回复正文，没有顶栏、彩色色块、分栏或底栏；
+从飞书发起的回合只显示回复，避免重复原话题里已有的输入。飞书会话列表预览本地输入或回复的
+第一条有效内容。卡片没有按钮或回调，不改变既有入站和授权边界。
 
 仓库代码不代表某台机器已经配置完成。新机器必须依次完成：准备飞书身份、写机器级模板、
 安装 hooks/skills、接入一个 task、跑一次真实端到端验证。
@@ -103,7 +107,8 @@ node scripts/codex/install.mjs --apply
 
 安装器会：
 
-- 向现有 `UserPromptSubmit` 和 `Stop` 数组追加本桥命令，保留其他 hooks；
+- 向现有 `UserPromptSubmit` 和 `Stop` 数组追加本桥命令，保留其他 hooks；前者在 Git 外暂存
+  本地文本输入，后者把同一 `turn_id` 的输入与最终答复确定性配对；
 - 安装 `m5codex-inbound-router` 和 `codex-longtask-feishu`；
 - 安装 `$feishu-bind`、`$feishu-unbind`、`$feishu-status` 三个 task 命令；
 - 创建 Git 外的空 registry，并为已登记 task 启用每轮自动发布；
@@ -153,7 +158,10 @@ $feishu-status
 
 ## 5. 做一次真实验证
 
-在绑定话题里发送一条全新的、可安全核验的命令，例如：
+先在当前 Codex task 的 Desktop/CLI 输入一条全新的、可安全核验的本地命令。飞书应收到一张
+顶部灰色引用你的输入、随后直接显示 Codex 回复的 Card 2.0，两段内容来自同一个 `turn_id`。
+
+再在绑定话题里发送一条命令，例如：
 
 ```text
 @M5Codex 只读查看当前分支名称，并告诉我工作树是否干净
@@ -164,7 +172,10 @@ $feishu-status
 1. 飞书先收到“已受理”，且没有重复 claim；
 2. 目标 Codex task 的持久化历史出现带 `[飞书 · …]` 来源戳的用户回合；
 3. runner 观察到目标 thread、`turn.completed`、exit code 0 和非空最终输出；
-4. 最终答复只回到原话题一次，发送者仍是 M5Codex。
+4. 最终答复只回到原话题一次，发送者仍是 M5Codex；结果卡片不再重复展示“你的输入”。
+
+本地回合与第 4 项在飞书里都应显示为 Card 2.0 卡片。首次绑定根消息和接入状态仍是文本，这是正常设计：
+根消息引用中的六位短码承担首次 Aily session 的确定性绑定证据，不能改成卡片结构。
 
 若 Desktop 当时正打开该 task 而未立即显示第 2 项，先切换到其他 task 再返回；这属于客户端
 实时刷新差异，不等于投递失败。最终仍应以 task 历史、严格 runner 终局和飞书回读三层证据验收。
@@ -182,13 +193,18 @@ $feishu-status
 ## 工作原理
 
 ```text
+本机 Desktop/CLI 输入
+  → UserPromptSubmit 按精确 turn_id 暂存文本输入
+  → Stop 将同一回合的输入与最终答复写成一条 outbox 事件
+  → 同一张 Card 2.0 以灰色引用显示输入，随后直接显示 Codex 回复
+
 飞书真实 @M5Codex
   → Aily 调用 m5codex-inbound-router
   → sender / 群 / root / session / freshness / 幂等 / claim 校验
   → 精确 codex_thread_id + codex exec resume
   → 秒级受理；一次性 watcher 等待严格终局
   → Stop 保存原始答复，watcher 授予发布资格
-  → 同一个 M5Codex 把最终答复发布到原话题
+  → 同一个 M5Codex 发布只含回复的 Card 2.0，不复读飞书输入
 ```
 
 Codex locator、claim、receipt、run 和 outbox 全部放在
@@ -235,4 +251,5 @@ node scripts/codex/install.mjs --uninstall --apply
 - Desktop 对后台 CLI 追加回合不保证实时刷新，但回合会持久化到同一 task；
 - Aily 外层仍可能有首语义事件计时器；本仓库无法保证模型一定在其超时前调用入站技能；
 - App Server 原生 live steering 尚未纳入当前稳定路径；
+- 本地输入同步的是 `UserPromptSubmit` hook 收到的文本；附件、图片和其他二进制内容本体不会复制到卡片；
 - 本地测试不能替代每台机器自己的真实 M5Codex/飞书端到端验证。

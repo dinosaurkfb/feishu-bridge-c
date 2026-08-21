@@ -15,7 +15,8 @@ import path from "node:path";
 
 import { readRunOutcome } from "./handoff.mjs";
 import { scanRuns, buildDraft, markPublished, publishDraft } from "./outbound.mjs";
-import { listPending, markSent, composeDigest } from "./outbox.mjs";
+import { listPending, markSent } from "./outbox.mjs";
+import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { recordClaimState } from "./claim.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
@@ -94,34 +95,44 @@ while (true) {
       // 代价是 Frank 收到两条而不是一条，而扣着执行结果不发的代价大得多。
       const pendingOutbox = publishLock.ok ? listPending({ outboxDir: OUTBOX }) : [];
 
-      const parts = [];
+      const records = [];
       if (run?.shouldPublish) {
         const d = buildDraft(run, { taskName: cfg.task_display_name });
-        if (d) parts.push(d);
+        if (d) records.push({
+          kind: run.state === "completed" ? "reply" : "risk",
+          text: d,
+          source: "claude-run-watcher",
+          _run: true,
+        });
       }
-      if (pendingOutbox.length > 0) {
-        parts.push(composeDigest(pendingOutbox, { taskName: cfg.task_display_name }));
-      }
+      records.push(...pendingOutbox);
 
-      if (parts.length > 0) {
+      if (records.length > 0) {
         try {
           // 身份从配置推，跟主出站路径走同一个解析；发之前 publishDraft 会校验凭据归属。
           const ident = resolveLarkIdentity(cfg);
-          const mid = publishDraft({
-            profile: ident.profile,
-            rootMessageId: mapping.feishu_root_message_id_reference,
-            text: parts.join("\n\n———\n\n"),
-            larkBin: ident.bin,
-            larkHome: ident.configDir,
-            expectedAppId: ident.expectedAppId,
-          });
-          // 只有真的发出去了才标记。顺序无所谓，但两者都必须在成功之后。
-          if (run?.shouldPublish) markPublished({ runsDir: RUNS, key, messageId: mid });
-          for (const r of pendingOutbox) markSent(r, mid);
-          console.log("published " + key.slice(0, 8) + " -> " + mid +
-            " (run=" + (run?.shouldPublish ? "yes" : "no") + ", outbox=" + pendingOutbox.length + ")");
+          const mids = [];
+          for (const batch of outboundCardBatches(records)) {
+            const mid = publishDraft({
+              profile: ident.profile,
+              rootMessageId: mapping.feishu_root_message_id_reference,
+              card: composeOutboundCard(batch, { taskName: cfg.task_display_name, runtime: "claude" }),
+              larkBin: ident.bin,
+              larkHome: ident.configDir,
+              expectedAppId: ident.expectedAppId,
+            });
+            // 每张成功后立刻标记。后续卡片失败时，已送达的回合不会在重试中重复发送。
+            if (batch.some((record) => record._run === true)) {
+              markPublished({ runsDir: RUNS, key, messageId: mid });
+            }
+            for (const record of batch.filter((item) => item._file)) markSent(record, mid);
+            mids.push(mid);
+          }
+          console.log("published " + key.slice(0, 8) + " -> " + (mids.at(-1) ?? "none") +
+            " (cards=" + mids.length + ", run=" + (run?.shouldPublish ? "yes" : "no") +
+            ", outbox=" + pendingOutbox.length + ")");
         } catch (err) {
-          // 不标记任何一方：outbox 留着下轮重试，run 也还是待发布。
+          // 当前失败批次不标记；此前已经成功并逐批落标的卡片不会被下一轮重复发送。
           // 留痕给人工，但绝不伪造已送达。
           fs.writeFileSync(path.join(RUNS, key + ".publish-failed.json"),
             JSON.stringify({ at: new Date().toISOString(), error: String(err.message).slice(0, 500) }, null, 2));

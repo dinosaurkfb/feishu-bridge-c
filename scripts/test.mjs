@@ -8,6 +8,7 @@
  */
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -25,6 +26,9 @@ import {
   loadRegistry, releasePublishLock,
 } from "./registry.mjs";
 import { appendEvent, composeDigest, listPending, markSent } from "./outbox.mjs";
+import {
+  composeOutboundCard, outboundCardBatches, validateOutboundCard,
+} from "./outbound-card.mjs";
 import { drainProject, watcherActive } from "./drain-outbox.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
 import {
@@ -50,6 +54,10 @@ import {
   SUSPENDED, bindingsForRoot, currentBinding, describeStatus, setBindingStatus,
 } from "./feishu-control.mjs";
 import { composeAsk, isInitPrompt } from "./init-hook.mjs";
+import {
+  MAX_LOCAL_INPUT_CHARS, claudeTurnInputDir, clearTurnInput, isFeishuStampedInput,
+  readTurnInput, storeTurnInput,
+} from "./turn-input.mjs";
 import {
   currentSurface, diffSurface, loadSnapshot, sharedModules,
 } from "./shared-surface.mjs";
@@ -977,6 +985,73 @@ test("reply 是合法 kind，能被 appendEvent 收下", () => {
   assert.equal(listPending({ outboxDir: dir })[0].kind, "reply");
 });
 
+test("outbox 只接收本地 reply 的输入并在边界截断", () => {
+  const dir = path.join(tmp, "reply-input-boundary");
+  appendEvent({
+    outboxDir: dir, kind: "reply", text: "答复", source: "t",
+    inputOrigin: "local", inputText: "x".repeat(MAX_LOCAL_INPUT_CHARS + 50),
+  });
+  const local = listPending({ outboxDir: dir })[0];
+  assert.equal(local.input_origin, "local");
+  assert.match(local.input_text, /本地输入已截断/u);
+
+  appendEvent({
+    outboxDir: dir, kind: "milestone", text: "进展", source: "t",
+    inputOrigin: "local", inputText: "不应进入进展事件",
+  });
+  const progress = listPending({ outboxDir: dir }).find((record) => record.kind === "milestone");
+  assert.equal(progress.input_origin, null);
+  assert.equal(progress.input_text, null);
+});
+
+test("Claude 本地输入与回复进入同一张 Card 2.0，入站回复不显示输入块", () => {
+  const paired = composeOutboundCard([{
+    kind: "reply",
+    text: "Claude 已完成",
+    input_origin: "local",
+    input_text: "请继续开发",
+  }], { taskName: "Claude 项目", runtime: "claude" });
+  assert.equal(validateOutboundCard(paired).ok, true);
+  assert.equal(paired.header, undefined);
+  assert.equal(paired.body.elements.length, 2);
+  assert.equal(paired.body.elements[0].element_id, "user_quote");
+  assert.equal(paired.body.elements[0].text_size, "notation");
+  assert.match(JSON.stringify(paired.body.elements[0]), /请继续开发/u);
+  assert.equal(paired.body.elements[1].element_id, "agent_reply");
+  assert.match(JSON.stringify(paired.body.elements[1]), /Claude 已完成/u);
+  assert.equal(JSON.stringify(paired).includes("Claude 回复"), false);
+  assert.equal(paired.config.summary.content, "请继续开发");
+
+  const inbound = composeOutboundCard([{
+    kind: "reply", text: "飞书消息执行完成",
+  }], { taskName: "Claude 项目", runtime: "claude" });
+  assert.equal(inbound.body.elements.length, 1);
+  assert.equal(JSON.stringify(inbound).includes("user_quote"), false);
+  assert.equal(inbound.body.elements[0].element_id, "agent_reply");
+  assert.equal(inbound.config.summary.content, "飞书消息执行完成");
+});
+
+test("Claude 回合缓存识别飞书来源戳，并按会话隔离", () => {
+  const root = path.join(tmp, "turn-input-project");
+  const dir = claudeTurnInputDir(root, "session-a");
+  assert.equal(storeTurnInput({ dir, key: "session-a", text: "本地问题" }).ok, true);
+  assert.equal(readTurnInput({ dir, key: "session-a" }).text, "本地问题");
+  assert.equal(typeof readTurnInput({ dir, key: "session-a" }).captureId, "string");
+  assert.equal(readTurnInput({ dir, key: "session-b" }).reason, "not_found");
+  assert.equal(isFeishuStampedInput("[飞书 · msg_abc · 2026-08-21 10:00Z]\n继续"), true);
+  assert.equal(isFeishuStampedInput("正文里引用 [飞书 · msg_abc · t] 不算来源戳"), false);
+  clearTurnInput({ dir, key: "session-a" });
+  assert.equal(readTurnInput({ dir, key: "session-a" }).reason, "not_found");
+});
+
+test("Claude reply 一轮一张卡，普通进展保持合批", () => {
+  assert.deepEqual(outboundCardBatches([
+    rec("milestone", "m"), rec("reply", "a"), rec("reply", "b"), rec("next", "n"),
+  ]).map((batch) => batch.map((record) => record.kind)), [
+    ["milestone"], ["reply"], ["reply"], ["next"],
+  ]);
+});
+
 // ---------- 取信封：最终一致的事件存储要重试 ----------
 
 const ENVELOPE_ENV = {
@@ -1065,6 +1140,110 @@ const TPL = {
   agent_uid: "agent_x",
 };
 
+test("Claude UserPromptSubmit 与 Stop 配对本地输入，飞书来源戳只回写回复", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-turn-"));
+  const project = path.join(home, "project");
+  fs.mkdirSync(project);
+  const registryFile = path.join(home, "registry.json");
+  const templateFile = path.join(home, "chain-config.json");
+  fs.writeFileSync(registryFile, JSON.stringify({ projects: [{
+    id: "paired", root: project, name: "配对项目", root_message_id: "om_root",
+    expires_at: "2099-01-01T00:00:00Z",
+  }] }));
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  const lock = path.join(project, ".runtime-data", "inbound", "session.lock");
+  fs.mkdirSync(lock, { recursive: true });
+  fs.writeFileSync(path.join(lock, "owner.json"), JSON.stringify({
+    pid: process.pid, log_path: path.join(home, "running.jsonl"), at: new Date().toISOString(),
+  }));
+  const env = {
+    ...process.env,
+    FEISHU_BRIDGE_REGISTRY: registryFile,
+    FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+  };
+  const initHook = path.join(path.resolve("scripts"), "init-hook.mjs");
+  const stopHook = path.join(path.resolve("scripts"), "stop-hook.mjs");
+  const session = "claude-local-session";
+  const inputDir = claudeTurnInputDir(project, null);
+
+  const localPrompt = spawnSync(process.execPath, [initHook], {
+    input: JSON.stringify({ session_id: session, cwd: project, prompt: "请把这一轮同步过去" }),
+    encoding: "utf-8",
+    env,
+  });
+  assert.equal(localPrompt.status, 0, localPrompt.stderr);
+  assert.equal(readTurnInput({ dir: inputDir, key: session }).text, "请把这一轮同步过去");
+
+  const localStop = spawnSync(process.execPath, [stopHook], {
+    input: JSON.stringify({
+      session_id: session, cwd: project, last_assistant_message: "这一轮已经完成",
+    }),
+    encoding: "utf-8",
+    env,
+  });
+  assert.equal(localStop.status, 0, localStop.stderr);
+  let replies = listPending({ outboxDir: outboxDirOf(project) }).filter((record) => record.kind === "reply");
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].input_origin, "local");
+  assert.equal(replies[0].input_text, "请把这一轮同步过去");
+  assert.equal(typeof readTurnInput({ dir: inputDir, key: session }).captureId, "string");
+
+  const duplicateStop = spawnSync(process.execPath, [stopHook], {
+    input: JSON.stringify({
+      session_id: session, cwd: project, last_assistant_message: "这一轮已经完成",
+    }),
+    encoding: "utf-8",
+    env,
+  });
+  assert.equal(duplicateStop.status, 0, duplicateStop.stderr);
+  replies = listPending({ outboxDir: outboxDirOf(project) }).filter((record) => record.kind === "reply");
+  assert.equal(replies.length, 1, "同一 Claude 回合的 Stop 重入不得重复入队");
+
+  const nextPrompt = spawnSync(process.execPath, [initHook], {
+    input: JSON.stringify({ session_id: session, cwd: project, prompt: "换一个问题但得到相同回复" }),
+    encoding: "utf-8",
+    env,
+  });
+  assert.equal(nextPrompt.status, 0, nextPrompt.stderr);
+  const nextStop = spawnSync(process.execPath, [stopHook], {
+    input: JSON.stringify({
+      session_id: session, cwd: project, last_assistant_message: "这一轮已经完成",
+    }),
+    encoding: "utf-8",
+    env,
+  });
+  assert.equal(nextStop.status, 0, nextStop.stderr);
+  replies = listPending({ outboxDir: outboxDirOf(project) }).filter((record) => record.kind === "reply");
+  assert.equal(replies.length, 2, "不同 Claude 回合即使回复正文相同也必须分别入队");
+
+  storeTurnInput({ dir: inputDir, key: session, text: "不应误配的旧输入" });
+  const inboundPrompt = spawnSync(process.execPath, [initHook], {
+    input: JSON.stringify({
+      session_id: session,
+      cwd: project,
+      prompt: "[飞书 · msg_inbound · 2026-08-21 10:00Z]\n请继续",
+    }),
+    encoding: "utf-8",
+    env,
+  });
+  assert.equal(inboundPrompt.status, 0, inboundPrompt.stderr);
+  assert.equal(readTurnInput({ dir: inputDir, key: session }).reason, "not_found");
+
+  const inboundStop = spawnSync(process.execPath, [stopHook], {
+    input: JSON.stringify({
+      session_id: session, cwd: project, last_assistant_message: "飞书指令已经完成",
+    }),
+    encoding: "utf-8",
+    env,
+  });
+  assert.equal(inboundStop.status, 0, inboundStop.stderr);
+  replies = listPending({ outboxDir: outboxDirOf(project) }).filter((record) => record.kind === "reply");
+  assert.equal(replies.length, 3);
+  const inboundRecord = replies.find((record) => record.text === "飞书指令已经完成");
+  assert.equal(inboundRecord.input_origin, null);
+  assert.equal(inboundRecord.input_text, null);
+});
+
 test("模板缺字段 → 报出缺哪些，不放行", () => {
   const { chat_id, agent_uid, ...rest } = TPL;
   const v = validateChainTemplate(rest);
@@ -1120,6 +1299,8 @@ test("绑定码进了根消息正文 —— 将来靠引用块做确定性匹配
   const msg = composeRootMessage({ name: "a", root: "/tmp/a", token });
   assert.ok(msg.includes(token));
   assert.ok(msg.includes("/tmp/a"));
+  assert.ok(msg.includes("本机输入与每轮回答会合成卡片"));
+  assert.ok(msg.includes("从本话题发出的输入不会重复显示"));
 });
 
 test("根消息里不含任何当前进度字样 —— 它发出去就改不了", () => {
@@ -1294,7 +1475,7 @@ test("README 优先于 CLAUDE.md", () => {
   assert.equal(readProjectIdentity({ root: d }).name, "真名");
 });
 
-test("行内 markdown 被剥掉 —— 飞书文本消息不渲染，留着就是一堆星号", () => {
+test("项目身份中的行内 markdown 被剥掉 —— 根消息仍是飞书文本", () => {
   const d = projWith({ "README.md": "# `cc2cd`\n\n让两个模型**互相**对话，详见 [基线](./x.md)。\n" });
   const id = readProjectIdentity({ root: d });
   assert.equal(id.name, "cc2cd");

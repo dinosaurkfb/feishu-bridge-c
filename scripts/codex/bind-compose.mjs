@@ -13,6 +13,30 @@ export function validThreadId(value) {
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
 
+export function resolveBindingTarget({ template, chatId, chatName }) {
+  const hasChatId = typeof chatId === "string" && chatId.trim().length > 0;
+  const hasChatName = typeof chatName === "string" && chatName.trim().length > 0;
+  if (chatName !== undefined && !hasChatName) return { ok: false, reason: "invalid_chat_name" };
+  if (hasChatName && !hasChatId) return { ok: false, reason: "chat_name_without_chat_id" };
+
+  const resolvedId = hasChatId ? chatId.trim() : template?.chat_id;
+  if (typeof resolvedId !== "string" || !resolvedId.startsWith("oc_")) {
+    return { ok: false, reason: "invalid_chat_id" };
+  }
+  const resolvedName = hasChatId
+    ? (hasChatName ? chatName.trim() : "已明确指定的群")
+    : template?.chat_name;
+  if (typeof resolvedName !== "string" || !resolvedName.trim()) {
+    return { ok: false, reason: "invalid_chat_name" };
+  }
+  return {
+    ok: true,
+    chatId: resolvedId,
+    chatName: resolvedName.trim(),
+    overridden: hasChatId,
+  };
+}
+
 export function resolveThreadId({ explicit, root }) {
   if (explicit !== undefined) {
     return validThreadId(explicit)
@@ -25,7 +49,9 @@ export function resolveThreadId({ explicit, root }) {
   return { ok: true, threadId: active[0].thread_id, source: "current-hook-lease" };
 }
 
-export function composeCodexBinding({ root, threadId, nameOverride, threadDescriptions, globalStateFile }) {
+export function composeCodexBinding({
+  root, threadId, nameOverride, threadDescriptions, globalStateFile, idempotencyScope,
+}) {
   const identity = readProjectIdentity({ root });
   const bindingIdentity = root + "\n" + threadId;
   const token = bindingToken(bindingIdentity);
@@ -52,7 +78,11 @@ export function composeCodexBinding({ root, threadId, nameOverride, threadDescri
     purpose: identity.purpose,
     identitySource: nameOverride ? "--name" : identity.source + "+" + resolvedTitle.source,
     token,
-    idempotencyKey: idempotencyKeyFor(bindingIdentity),
+    // 默认群沿用旧幂等键；显式跨群绑定把目标群纳入幂等域，避免一次失败后改正群时
+    // 被平台幂等机制错误地指回先前群里的根消息。
+    idempotencyKey: idempotencyKeyFor(
+      idempotencyScope ? bindingIdentity + "\n" + idempotencyScope : bindingIdentity,
+    ),
     rootText: composeRootMessage({ name, heading, purpose: identity.purpose, root, token }),
     statusText: composeStatusMessage({ name })
       .replace("在这条消息下面 @ 一下运输 agent", "在这条消息下面真实 @M5Codex")

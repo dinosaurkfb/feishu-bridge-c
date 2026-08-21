@@ -101,7 +101,7 @@ function assertClaudeAvailable() {
   }
 }
 
-export function handOff({ projectDir, instruction, runsDir, key }) {
+export function handOff({ projectDir, instruction, runsDir, key, resumeSessionId }) {
   assertClaudeAvailable();
   fs.mkdirSync(runsDir, { recursive: true });
   const logPath = path.join(runsDir, key + ".jsonl");
@@ -110,13 +110,22 @@ export function handOff({ projectDir, instruction, runsDir, key }) {
   const out = fs.openSync(logPath, "a");
   const err = fs.openSync(errPath, "a");
 
-  // --continue 而不是 --resume <钉死的 uuid>：钉一个会话 id 是错的抽象。
+  // 默认 --continue：「这个目录里最近的那次对话」，工作在哪儿它就跟到哪儿。
+  //
+  // 但**会话级绑定**要的恰恰是「那一条线」，所以那种情况会传 resumeSessionId 进来，
+  // 走 --resume <uuid>。这跟当年被废掉的做法不一样：当年是**推断**出一个 uuid 钉死，
+  // 过期了没人知道；现在这个 uuid 是 Frank 在那个会话里亲手绑的，
+  // 而且找不到时是明确拒绝，不会悄悄投给另一条线。
+  //
+  // 下面这段原注释保留，它解释了为什么默认不钉 uuid：
   // 会话是记录，每开一个终端就是新的一份，钉住的那份很快就不再是工作发生的地方了 ——
   // 实测钉住的那份是一堆联调残渣，而真正的项目演进在另一份里。
   // --continue 的语义是「这个目录里最近的那次对话」，工作在哪儿它就跟到哪儿。
   const child = spawn(
     "claude",
-    ["--continue", "-p", instruction, "--output-format", "stream-json", "--verbose"],
+    (typeof resumeSessionId === "string" && resumeSessionId
+      ? ["--resume", resumeSessionId, "-p", instruction, "--output-format", "stream-json", "--verbose"]
+      : ["--continue", "-p", instruction, "--output-format", "stream-json", "--verbose"]),
     {
       cwd: projectDir, detached: true, stdio: ["ignore", out, err],
       // 标记成桥自己起的：这一轮的结果由守望者发布（它能分辨 completed/blocked/failed），
@@ -127,7 +136,11 @@ export function handOff({ projectDir, instruction, runsDir, key }) {
   // unref 之后父进程可以立刻退出，子进程继续跑 —— 这正是「秒级回执」的实现基础。
   child.unref();
 
-  return { mode: "continue", pid: child.pid, logPath, errPath, startedAt: new Date().toISOString() };
+  return {
+    mode: (typeof resumeSessionId === "string" && resumeSessionId) ? "resume" : "continue",
+    resumedSessionId: resumeSessionId ?? null,
+    pid: child.pid, logPath, errPath, startedAt: new Date().toISOString(),
+  };
 }
 
 /**

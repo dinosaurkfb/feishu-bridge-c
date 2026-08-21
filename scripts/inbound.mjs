@@ -19,7 +19,7 @@ import { fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, recordClaimState } from "./claim.mjs";
 import { handOff, acquireSessionLock, releaseSessionLock, stampSessionLock } from "./handoff.mjs";
 import {
-  deliverToLiveSession, findLiveSessions, hasPriorSession, stampInstruction,
+  deliverToLiveSession, findLiveSessionById, findLiveSessions, hasPriorSession, stampInstruction,
 } from "./live-session.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
 import {
@@ -297,8 +297,11 @@ if (!claim.ok) {
 //
 // 这两条分支必须互斥。都走 --continue 的话会有两个进程写同一份 transcript ——
 // 现在没撞上纯粹是因为旧设计钉的是另一份记录，那是运气不是设计。
-const liveTargets = findLiveSessions({ projectRoot: config.project_dir });
-const target = liveTargets[0] ?? null;
+// 会话级绑定要投给**它绑的那条线**；项目级绑定沿用「现场最近开的那个」。
+const boundSession = routed.mapping?.claude_session_id ?? null;
+const target = boundSession
+  ? findLiveSessionById({ projectRoot: config.project_dir, claudeSessionId: boundSession })
+  : (findLiveSessions({ projectRoot: config.project_dir })[0] ?? null);
 
 let run;
 
@@ -327,6 +330,22 @@ if (target) {
   // 没有可续的对话就明确拒绝，不假装受理。
   // 这不该在运行时兜底 —— 「起这个长期任务」本来就是建绑定的一个步骤，
   // 跟建话题、写 mapping、装钩子并列。缺了就该退回去补，而不是让代码猜。
+  // 会话级绑定的会话已经关了：**不回落到项目行为**。
+  // 回落会把指令投进一条 Frank 没指定的线 —— 那正是当年那个失败方案的形态。
+  // 先试 --resume 精确续起原会话（Claude 的 resume 是精确的，不像 --continue 靠猜）；
+  // 连记录都没有才如实拒绝。
+  if (boundSession && !hasPriorSession({ projectRoot: config.project_dir })) {
+    recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { reason: "bound_session_gone" } });
+    writeReceipt("bound-session-gone-" + verdict.messageId, {
+      status: "error", reason: "bound_session_gone", message_id: verdict.messageId,
+      bound_claude_session_id: boundSession,
+      claim_acquired: true, handed_off: false,
+    });
+    finish("error", {
+      detail: "这个话题绑的那个会话已经关了，本机也没有可续的记录。去项目里重开一个会话，或改绑",
+    }, { reason: "bound_session_gone" });
+  }
+
   if (!hasPriorSession({ projectRoot: config.project_dir })) {
     recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { reason: "no_prior_session" } });
     writeReceipt("no-session-" + verdict.messageId, {
@@ -352,6 +371,7 @@ if (target) {
   try {
     run = handOff({
       projectDir: config.project_dir,
+      resumeSessionId: boundSession ?? undefined,
       instruction: stampInstruction({
         instruction: verdict.instruction,
         messageId: verdict.messageId,
@@ -409,6 +429,8 @@ writeReceipt("accepted-" + verdict.messageId, {
   status: "accepted", message_id: verdict.messageId, claim_key: claim.key,
   // 多绑定之后「这条进了哪个项目」是排查的第一个问题。
   project_root: routed.root, binding_source: routed.source,
+  binding_level: boundSession ? "session" : "project",
+  bound_claude_session_id: boundSession,
   claim_acquired: true, handed_off: true, completion_observed: false,
   completion_owner: "outbound_publisher",
   run_log: run.logPath, pid: run.pid,

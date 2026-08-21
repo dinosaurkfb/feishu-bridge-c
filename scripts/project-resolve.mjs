@@ -35,13 +35,15 @@ export const projectMappingPath = (root) => path.join(root, ".runtime-data", "in
  * 已处理列表。刻意不放进登记表：登记表在每一次会话结束时都会被读，往里面塞一个
  * 会无限增长的数组，是给一条热路径加负担。
  */
-export const consumedPath = (root) => path.join(root, ".runtime-data", "inbound", "consumed.json");
+export const consumedPath = (root, claudeSessionId) =>
+  path.join(root, ".runtime-data", "inbound",
+    claudeSessionId ? "consumed-" + claudeSessionId + ".json" : "consumed.json");
 
 export const CONSUMED_MAX = 500;
 
-export function loadConsumed(root) {
+export function loadConsumed(root, claudeSessionId) {
   try {
-    const parsed = JSON.parse(fs.readFileSync(consumedPath(root), "utf-8"));
+    const parsed = JSON.parse(fs.readFileSync(consumedPath(root, claudeSessionId), "utf-8"));
     return Array.isArray(parsed?.ids) ? parsed.ids.filter((v) => typeof v === "string") : [];
   } catch {
     return [];
@@ -49,16 +51,43 @@ export function loadConsumed(root) {
 }
 
 /** 只留最近 CONSUMED_MAX 条：幂等只需覆盖时效窗口，无限增长的列表迟早自己变成问题。 */
-export function appendConsumed(root, messageId, { max = CONSUMED_MAX } = {}) {
-  const ids = loadConsumed(root);
+export function appendConsumed(root, messageId, { max = CONSUMED_MAX, claudeSessionId } = {}) {
+  const ids = loadConsumed(root, claudeSessionId);
   if (ids.includes(messageId)) return ids;
   const next = [...ids, messageId].slice(-max);
-  const file = consumedPath(root);
+  const file = consumedPath(root, claudeSessionId);
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const tmp = file + ".tmp." + process.pid;
   fs.writeFileSync(tmp, JSON.stringify({ ids: next }, null, 2) + "\n", { mode: 0o600 });
   fs.renameSync(tmp, file);
   return next;
+}
+
+/**
+ * 同一个项目可能有多条绑定：一条项目级的（兜底），外加若干条**会话级**的。
+ *
+ * 为什么需要会话级：「项目 = 目录」这个假设是从写代码来的。写代码时目录确实等于工作范围，
+ * 但做研究、写东西的人可能一个文件夹里同时开五条互不相干的线，目录代表不了「在忙哪件事」。
+ * Claude 这边最接近「一条工作线」的东西就是会话。
+ *
+ * 选择规则刻意做成**严格超集**，只用一个会话的人行为一字不差：
+ *
+ *   1. 有会话级绑定且 session 对得上 → 用它
+ *   2. 否则用项目级那条（没有 claude_session_id 的）
+ *   3. 都没有 → 没接桥
+ *
+ * 项目级必须留作默认和兜底：它天然扛得住终端重启，而这正是当年钉死会话 UUID
+ * 那个失败方案缺的东西（见 STATE.md）。会话级是加法，不是替换。
+ */
+export function selectBindingEntry(entries, claudeSessionId) {
+  const list = Array.isArray(entries) ? entries : [];
+  if (typeof claudeSessionId === "string" && claudeSessionId) {
+    const exact = list.find((e) => e?.claude_session_id === claudeSessionId);
+    if (exact) return { entry: exact, level: "session" };
+  }
+  const project = list.find((e) => !e?.claude_session_id);
+  if (project) return { entry: project, level: "project" };
+  return { entry: null, level: null };
 }
 
 /**
@@ -81,6 +110,8 @@ export function mappingFromRegistryEntry(entry, { consumed = [] } = {}) {
     pending_token: entry.pending_token ?? null,
 
     inbound_prefix: null,
+    // 会话级绑定把 Claude 会话 id 带进 mapping，入站据此投给指定的那条线。
+    claude_session_id: entry.claude_session_id ?? null,
     logical_task_key: entry.id,
     feishu_root_message_id_reference: entry.root_message_id,
 
@@ -102,7 +133,7 @@ export function mappingFromRegistryEntry(entry, { consumed = [] } = {}) {
  *   not_bound             —— 这个项目根本没接桥（最常见，必须便宜且安静）
  *   config_unreadable / template_unusable —— 接了但配错了，要说出来
  */
-export function resolveProject({ root, registryFile, templateFile } = {}) {
+export function resolveProject({ root, claudeSessionId, registryFile, templateFile } = {}) {
   // mapping 和 config 各自独立解析，不要求成对出现。
   // 上一版要求两个文件都在才走项目路径，结果是「有 mapping、没 chain-config」的项目
   // 会被判成完全没接桥 —— 到期预警从此静默消失。到期预警根本不读 config，
@@ -113,6 +144,7 @@ export function resolveProject({ root, registryFile, templateFile } = {}) {
   let mapping = null;
   let source = null;
   let registryEntry = null;
+  let bindingLevel = null;
   if (fs.existsSync(mapPath)) {
     try {
       mapping = readJson(mapPath);
@@ -124,11 +156,15 @@ export function resolveProject({ root, registryFile, templateFile } = {}) {
   } else {
     const reg = loadRegistry(registryFile);
     if (!reg.ok) return { ok: false, reason: "registry_unreadable", root, error: reg.error ?? reg.reason };
-    const entry = reg.projects.find((p) => p.root === root);
+    // 同一个 root 可能有多条：一条项目级 + 若干条会话级。选哪条见 selectBindingEntry。
+    const bound = reg.projects.filter((p) => p.root === root && p.root_message_id);
+    const picked = selectBindingEntry(bound, claudeSessionId);
+    const entry = picked.entry;
     // 没有 root_message_id 就等于没接：出站没有话题可回。这是最常见的分支，必须便宜且安静。
-    if (!entry || !entry.root_message_id) return { ok: false, reason: "not_bound", root };
-    mapping = mappingFromRegistryEntry(entry, { consumed: loadConsumed(root) });
+    if (!entry) return { ok: false, reason: "not_bound", root };
+    mapping = mappingFromRegistryEntry(entry, { consumed: loadConsumed(root, entry.claude_session_id) });
     source = "registry";
+    bindingLevel = picked.level;
     registryEntry = entry; // 显示名留给下面合成 config 用
   }
 
@@ -176,5 +212,7 @@ export function resolveProject({ root, registryFile, templateFile } = {}) {
     mapping.frank_sender_id = config.frank_sender_id;
   }
 
-  return { ok: true, source, root, mapping, config, configError };
+  return { ok: true, source, root, mapping, config, configError,
+    bindingLevel: bindingLevel ?? (source === "project-files" ? "project" : null),
+    claudeSessionId: registryEntry?.claude_session_id ?? null };
 }

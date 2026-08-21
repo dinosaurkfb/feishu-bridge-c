@@ -112,6 +112,7 @@ async function main() {
   if (attributed.length === 0) process.exit(0);
 
   const { drainProject, watcherActive, outboxDirOf } = await import("./drain-outbox.mjs");
+  const { resolveProject } = await import("./project-resolve.mjs");
   const { appendEvent, listPending, MAX_REPLY_CHARS } = await import("./outbox.mjs");
   const { checkBinding, bindingWarning } = await import("./binding-health.mjs");
   const { isBridgeOwnedSession } = await import("./live-session.mjs");
@@ -119,17 +120,27 @@ async function main() {
   // 桥自己起的会话不产生答复：转发那个只会说「sent」，跑活那个的结果归守望者发
   //（它能分辨 completed / blocked / failed，Stop 钩子看不出这些）。
   const ownedByBridge = isBridgeOwnedSession();
+
+  // 这一轮是哪个 Claude 会话说的。有会话级绑定时靠它选对话题；
+  // 没有会话级绑定时它不起作用，行为跟以前一样。
+  const speakingSession = typeof payload.session_id === "string" ? payload.session_id : undefined;
   const reply = ownedByBridge ? null : extractReply(payload, { maxChars: MAX_REPLY_CHARS });
 
   const notes = [];
 
   for (const project of attributed) {
+    // 先解析出**这一轮该用哪条绑定**：有会话级绑定且对得上就用它，否则回落到项目级。
+    // outbox 目录必须跟着绑定走，不能跟着「说话的那个会话」走 ——
+    // 只有项目级绑定时，所有会话都该写进原来那个 outbox。
+    const bound = resolveProject({ root: project.root, claudeSessionId: speakingSession });
+    const boundSession = bound.ok ? bound.claudeSessionId : null;
+    const outboxDir = outboxDirOf(project.root, boundSession);
     // 答复只发给 **cwd 归属**的项目，不发给「会话记录里提到过路径」的那些。
     // 弱信号用来触发排空是安全的（那些内容本来就要发），但用它决定
     // 「把整段对话原文发到谁的话题里」不行 —— 一次误判就是把无关对话发给了 Frank。
     if (reply && project.via.includes("cwd")) {
       const r = appendEvent({
-        outboxDir: outboxDirOf(project.root), kind: "reply", text: reply, source: "session-reply",
+        outboxDir, kind: "reply", text: reply, source: "session-reply",
       });
       if (r.ok) log(project.id + " reply queued (" + reply.length + " 字符)");
     }
@@ -139,14 +150,14 @@ async function main() {
     const warning = bindingWarning(checkBinding({ root: project.root }));
     if (warning) {
       const r = appendEvent({
-        outboxDir: outboxDirOf(project.root),
+        outboxDir,
         kind: warning.kind, text: warning.text, source: "binding-health",
       });
       if (r.ok) log(project.id + " binding warning recorded: " + warning.kind);
     }
 
     // 空 outbox 的项目连守望者都不用问 —— 这是最常见的情况，越早返回越好。
-    if (listPending({ outboxDir: outboxDirOf(project.root) }).length === 0) continue;
+    if (listPending({ outboxDir }).length === 0) continue;
 
     if (watcherActive(project.root)) {
       // 守望者会把执行结果和这批进展合成一条发。抢在它前面发就是把一次指令拆成三条消息。
@@ -154,7 +165,7 @@ async function main() {
       continue;
     }
 
-    const r = drainProject({ root: project.root, timeoutMs: PUBLISH_TIMEOUT_MS });
+    const r = drainProject({ root: project.root, claudeSessionId: speakingSession, timeoutMs: PUBLISH_TIMEOUT_MS });
     log(project.id + " via=" + project.via.join("+") + " -> " + JSON.stringify(r));
 
     if (r.status === "published") {

@@ -44,6 +44,23 @@ node /Users/dk/claude-projects/feishu-bridge-cc/scripts/bind-project.mjs --apply
 
 每个项目一辈子一次；重复跑是安全的（平台侧幂等键挡住重建），会直接告诉你已经接过了。
 
+### 同一个项目里有多条工作线
+
+默认是**一个项目一个话题** —— 项目里所有会话的回答都发到同一个地方。
+
+如果这个项目里同时有几条互不相干的线（常见于非纯代码的工作：一条查资料、一条写稿、
+一条整理数据），可以让**某一条线单独占一个话题**。在那条线自己的会话里跑：
+
+```bash
+node /Users/dk/claude-projects/feishu-bridge-cc/scripts/bind-session.mjs           # 先看
+node /Users/dk/claude-projects/feishu-bridge-cc/scripts/bind-session.mjs --apply   # 再做
+```
+
+**必须在要绑的那个会话里跑** —— 它从环境变量认自己，再拿会话登记文件交叉核对，
+对不上就拒绝（免得在派生进程里绑错线）。
+
+项目级绑定不受影响：没单独绑过的会话照旧发到项目那个话题。**会话级是加法，不是替换。**
+
 接完之后**出站立刻可用**，下一轮回答就会发到新话题。
 
 **入站还差最后一下**：让 Frank 去那个新话题里 @ 一下运输 agent（空消息也行），

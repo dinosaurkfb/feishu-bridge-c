@@ -155,7 +155,7 @@ Claude Code 与 Codex 共用 envelope、selector、claim、outbox 和飞书发�
 | 运行时 | 飞书智能体 | 绑定单位 | 新用户入口 |
 |---|---|---|---|
 | Codex Desktop/CLI | Aily `codex-local` 第三方智能体，本文示例名 M5Codex | 精确 Codex task/thread | **[CODEX_SETUP.md](CODEX_SETUP.md)** |
-| Claude Code | Aily `claude-code-local` 第三方智能体，本文示例名 M5Claude | 项目及其可续接 Claude 会话 | **[SETUP.md](SETUP.md)** |
+| Claude Code | Aily `claude-code-local` 第三方智能体，本文示例名 M5Claude | 项目（默认），或项目里的某一条会话 | **[SETUP.md](SETUP.md)** |
 
 ### Codex 快速路线
 
@@ -200,6 +200,14 @@ Claude 机器级环境安装完成后，在目标项目目录运行 `/init`。ho
 node scripts/bind-preview.mjs --project ~/your-project
 node scripts/bind-project.mjs --project ~/your-project --apply
 ```
+
+**同一个项目里的多条工作线**：默认一个项目一个话题，项目里所有会话共用。若某条线要
+单独占一个话题（非纯代码的工作里很常见：一条查资料、一条写稿、一条整理数据），
+在**那条线自己的会话里**跑 `node scripts/bind-session.mjs --apply`。
+
+项目级绑定是默认和兜底，会话级是加法 —— 没单独绑过的会话行为一字不变。绑定的会话
+关掉之后，入站会用 `claude --resume` 精确续起那条线；连记录都没有才如实拒绝，
+**绝不把指令投给另一条你没指定的线**。
 
 完整的飞书/Aily 准备、机器模板、安装、验证和排障步骤见 [SETUP.md](SETUP.md)，当前运行状态
 与历史问题见 [STATE.md](STATE.md)。

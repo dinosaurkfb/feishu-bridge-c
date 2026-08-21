@@ -40,6 +40,16 @@ const alive = (pid) => {
  * 只认 interactive：无头会话是投递自己起的临时工，往它里面投会套娃。
  * 只认活着的：登记文件按 pid 命名，进程没了文件还在，必须探活。
  */
+/**
+ * 在活着的现场里找**指定的那一个**。会话级绑定要投给它绑的那条线，不是最近开的那条。
+ * 找不到返回 null —— 调用方据此决定是 --resume 续起来还是如实拒绝。
+ */
+export function findLiveSessionById({ projectRoot, claudeSessionId, sessionsDir = SESSIONS_DIR, isAlive = alive }) {
+  if (typeof claudeSessionId !== "string" || !claudeSessionId) return null;
+  return findLiveSessions({ projectRoot, sessionsDir, isAlive })
+    .find((s) => s.sessionId === claudeSessionId) ?? null;
+}
+
 export function findLiveSessions({ projectRoot, sessionsDir = SESSIONS_DIR, isAlive = alive }) {
   let files;
   try {

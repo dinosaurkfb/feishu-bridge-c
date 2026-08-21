@@ -39,7 +39,12 @@ import {
   PURPOSE_MAX, bindingToken, composeRootMessage, composeStatusMessage,
   firstSentence, idempotencyKeyFor, newRegistryEntry, readProjectIdentity,
 } from "./bind-compose.mjs";
-import { mappingFromRegistryEntry, resolveProject } from "./project-resolve.mjs";
+import {
+  consumedPath, mappingFromRegistryEntry, resolveProject, selectBindingEntry,
+} from "./project-resolve.mjs";
+import { outboxDirOf } from "./drain-outbox.mjs";
+import { identifySelf, newSessionEntry } from "./bind-session.mjs";
+import { findLiveSessionById } from "./live-session.mjs";
 import { composeAsk, isInitPrompt } from "./init-hook.mjs";
 import {
   currentSurface, diffSurface, loadSnapshot, sharedModules,
@@ -1881,6 +1886,154 @@ test("导出变多会被抓到 —— 这是最值得停下来看的一种", () 
 test("导出变少、以及新增一个此前没有契约保护的共用模块，都会被抓到", () => {
   assert.equal(diffSurface({ "a.mjs": ["x", "y"] }, { "a.mjs": ["x"] })[0].kind, "export_removed");
   assert.equal(diffSurface({}, { "new.mjs": ["x"] })[0].kind, "new_shared_module");
+});
+
+// ---------- 一个项目多条工作线：会话级绑定 ----------
+//
+// 整组的验收标准只有一条：**只用一个会话的人，行为一字不差。**
+// 会话级是加法，项目级永远是默认和兜底 —— 它天然扛得住终端重启，
+// 而那正是当年钉死会话 UUID 那个失败方案缺的东西。
+
+const PROJ_ENTRY = { id: "p", root: "/r", root_message_id: "om_project" };
+const SESS_A = { id: "p@aaa", root: "/r", root_message_id: "om_a", claude_session_id: "aaa-111" };
+const SESS_B = { id: "p@bbb", root: "/r", root_message_id: "om_b", claude_session_id: "bbb-222" };
+
+test("只有项目级绑定时，任何会话都选中它 —— 行为跟以前一样", () => {
+  for (const sid of ["aaa-111", "随便", undefined, null, ""]) {
+    const r = selectBindingEntry([PROJ_ENTRY], sid);
+    assert.equal(r.entry, PROJ_ENTRY, String(sid));
+    assert.equal(r.level, "project");
+  }
+});
+
+test("会话对得上就走会话级，对不上回落项目级", () => {
+  const all = [PROJ_ENTRY, SESS_A, SESS_B];
+  assert.equal(selectBindingEntry(all, "aaa-111").entry, SESS_A);
+  assert.equal(selectBindingEntry(all, "bbb-222").entry, SESS_B);
+  assert.equal(selectBindingEntry(all, "无人认领").entry, PROJ_ENTRY);
+  assert.equal(selectBindingEntry(all, "无人认领").level, "project");
+});
+
+test("只有会话级、没有项目级时，不匹配的会话算没接桥（绝不乱认一条）", () => {
+  const r = selectBindingEntry([SESS_A, SESS_B], "ccc-333");
+  assert.equal(r.entry, null);
+  assert.equal(r.level, null);
+});
+
+test("outbox 目录跟着绑定走：项目级的路径一个字节没变", () => {
+  assert.equal(outboxDirOf("/r"), path.join("/r", ".runtime-data", "outbound", "outbox"));
+  assert.equal(outboxDirOf("/r", null), path.join("/r", ".runtime-data", "outbound", "outbox"));
+  assert.equal(outboxDirOf("/r", "aaa-111"),
+    path.join("/r", ".runtime-data", "outbound", "outbox-aaa-111"));
+});
+
+test("两条线的 outbox 必须分开 —— 共用会把 A 的进展发到 B 的话题里", () => {
+  assert.notEqual(outboxDirOf("/r", "aaa-111"), outboxDirOf("/r", "bbb-222"));
+  assert.notEqual(outboxDirOf("/r", "aaa-111"), outboxDirOf("/r"));
+});
+
+test("幂等列表也按绑定分，项目级路径不变", () => {
+  assert.match(consumedPath("/r"), /consumed\.json$/);
+  assert.match(consumedPath("/r", "aaa-111"), /consumed-aaa-111\.json$/);
+});
+
+test("resolveProject 按会话选中对的那条绑定", () => {
+  const { proj, regFile, tplFile } = bindFixture();
+  fs.writeFileSync(regFile, JSON.stringify({ projects: [
+    { id: "p", root: proj, root_message_id: "om_project", expires_at: "2099-01-01T00:00:00Z" },
+    { id: "p@aaa", root: proj, root_message_id: "om_a", claude_session_id: "aaa-111",
+      expires_at: "2099-01-01T00:00:00Z" },
+  ] }));
+  const f = { registryFile: regFile, templateFile: tplFile };
+  const bySession = resolveProject({ root: proj, claudeSessionId: "aaa-111", ...f });
+  assert.equal(bySession.mapping.feishu_root_message_id_reference, "om_a");
+  assert.equal(bySession.bindingLevel, "session");
+  assert.equal(bySession.claudeSessionId, "aaa-111");
+
+  const fallback = resolveProject({ root: proj, claudeSessionId: "没绑过的", ...f });
+  assert.equal(fallback.mapping.feishu_root_message_id_reference, "om_project");
+  assert.equal(fallback.bindingLevel, "project");
+  assert.equal(fallback.claudeSessionId, null, "项目级绑定不该带出会话 id，否则 outbox 会走错目录");
+
+  // 不传会话（老调用方）也必须落到项目级
+  assert.equal(resolveProject({ root: proj, ...f }).mapping.feishu_root_message_id_reference, "om_project");
+});
+
+test("会话级 mapping 把会话 id 带给入站，项目级带 null", () => {
+  assert.equal(mappingFromRegistryEntry(SESS_A).claude_session_id, "aaa-111");
+  assert.equal(mappingFromRegistryEntry(PROJ_ENTRY).claude_session_id, null);
+});
+
+// ---------- 认自己：两个来源交叉核对 ----------
+
+function sessionsFixture(records) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-sess-"));
+  for (const [pid, rec] of Object.entries(records)) {
+    fs.writeFileSync(path.join(d, pid + ".json"), JSON.stringify(rec));
+  }
+  return d;
+}
+
+test("环境变量和登记文件都指向同一个会话 → 认出自己", () => {
+  const d = sessionsFixture({ "999": { sessionId: "aaa-111", name: "线A", cwd: "/r", kind: "interactive" } });
+  const r = identifySelf({ env: { CLAUDE_CODE_SESSION_ID: "aaa-111", CLAUDE_PID: "999" }, sessionsDir: d });
+  assert.equal(r.ok, true);
+  assert.equal(r.sessionId, "aaa-111");
+  assert.equal(r.name, "线A");
+  assert.equal(r.cwd, "/r");
+});
+
+test("两个来源对不上 → 拒绝。只信环境变量会在派生进程里绑错线", () => {
+  const d = sessionsFixture({ "999": { sessionId: "别人", name: "线B", cwd: "/r", kind: "interactive" } });
+  const r = identifySelf({ env: { CLAUDE_CODE_SESSION_ID: "aaa-111", CLAUDE_PID: "999" }, sessionsDir: d });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "session_mismatch");
+});
+
+test("无头会话不能绑 —— 它跑完就没了", () => {
+  const d = sessionsFixture({ "999": { sessionId: "aaa-111", name: "临时工", cwd: "/r", kind: "headless" } });
+  assert.equal(identifySelf({ env: { CLAUDE_CODE_SESSION_ID: "aaa-111", CLAUDE_PID: "999" }, sessionsDir: d }).reason,
+    "not_interactive");
+});
+
+test("不在 Claude 会话里跑 → 说清楚为什么，而不是绑出一条假的", () => {
+  const d = sessionsFixture({});
+  assert.equal(identifySelf({ env: {}, sessionsDir: d }).reason, "no_session_env");
+  assert.equal(identifySelf({ env: { CLAUDE_CODE_SESSION_ID: "x" }, sessionsDir: d }).reason, "no_pid_env");
+  assert.equal(identifySelf({ env: { CLAUDE_CODE_SESSION_ID: "x", CLAUDE_PID: "1" }, sessionsDir: d }).reason,
+    "no_session_record");
+});
+
+test("会话级登记行带齐会话标识，且 id 能区分同项目的多条", () => {
+  const e = newSessionEntry({ root: "/r", name: "n", token: "t", rootMessageId: "om_a",
+    claudeSessionId: "aaa-111-long-uuid", sessionName: "线A" });
+  assert.equal(e.claude_session_id, "aaa-111-long-uuid");
+  assert.equal(e.claude_session_name, "线A");
+  assert.equal(e.id, "r@aaa-111-");
+  assert.equal(e.root_message_id, "om_a");
+});
+
+// ---------- 投递：找指定的那条线 ----------
+
+test("findLiveSessionById 只认指定的那个，不退而求其次", () => {
+  const d = sessionsFixture({
+    "111": { sessionId: "aaa-111", name: "线A", cwd: "/r", kind: "interactive", startedAt: 1 },
+    "222": { sessionId: "bbb-222", name: "线B", cwd: "/r", kind: "interactive", startedAt: 9 },
+  });
+  const opts = { projectRoot: "/r", sessionsDir: d, isAlive: () => true };
+  assert.equal(findLiveSessionById({ ...opts, claudeSessionId: "aaa-111" }).name, "线A",
+    "即使线B更晚开，指定了线A就必须是线A");
+  assert.equal(findLiveSessionById({ ...opts, claudeSessionId: "不存在" }), null,
+    "找不到要返回 null，让调用方去 --resume 或如实拒绝，而不是投给别人");
+});
+
+test("入站在绑定会话不在时不回落到别的线", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "inbound.mjs"), "utf-8");
+  assert.ok(src.includes("bound_session_gone"), "要有专门的拒绝原因");
+  const gone = src.indexOf("bound_session_gone");
+  const cont = src.indexOf("hasPriorSession({ projectRoot: config.project_dir })");
+  assert.ok(gone < src.lastIndexOf("hasPriorSession"), "会话级的判断要排在项目级兜底之前");
+  assert.ok(cont > 0);
 });
 
 // ---------- 汇总 ----------

@@ -21,7 +21,20 @@ import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
 import { isLockStale } from "./handoff.mjs";
 
-export const outboxDirOf = (root) => path.join(root, ".runtime-data", "outbound", "outbox");
+/**
+ * outbox 按**绑定**分目录，不是按项目。
+ *
+ * 同一个项目里两个会话可以各绑一个话题；共用一个 outbox 的话，A 会话写的进展会被
+ * B 会话的排空拿去发到 B 的话题里 —— 而且不报错，只是发错了地方。
+ *
+ * 项目级绑定继续用原来的 `outbox` 路径，一个字节不变。
+ */
+export const outboxDirOf = (root, claudeSessionId) =>
+  path.join(root, ".runtime-data", "outbound",
+    claudeSessionId ? "outbox-" + claudeSessionId : "outbox");
+
+// 发布锁仍然按项目：它要挡的是「同一时刻两个排空者」，按项目串行化足够，
+// 而且更保险 —— 两条线同时发布对飞书是两次独立调用，没必要并行。
 const publishLockOf = (root) => path.join(root, ".runtime-data", "outbound", "publish.lock");
 const sessionLockOf = (root) => path.join(root, ".runtime-data", "inbound", "session.lock");
 
@@ -41,15 +54,15 @@ export function watcherActive(root) {
  * 排空一个项目的 outbox。返回结构化结果，自己不打印、不退出 ——
  * 它跑在会话结束钩子里，任何 throw 或 process.exit 都会砸到别人的会话上。
  */
-export function drainProject({ root, dryRun = false, timeoutMs } = {}) {
-  const outboxDir = outboxDirOf(root);
+export function drainProject({ root, claudeSessionId, dryRun = false, timeoutMs } = {}) {
+  const outboxDir = outboxDirOf(root, claudeSessionId);
 
   // 先看有没有东西可发。绝大多数会话在这一行就返回了 —— 不读配置、不碰锁。
   if (listPending({ outboxDir }).length === 0) return { status: "empty", root };
 
   // 项目文件优先，没有就回落到「机器模板 + 登记表那一行」。
   // 已接好的项目走前一条，行为不变；新接的项目目录里一个配置文件都没有。
-  const resolved = resolveProject({ root });
+  const resolved = resolveProject({ root, claudeSessionId });
   if (!resolved.ok) {
     // not_bound 是「有 outbox 但没接桥」—— 会被 CLI 和钩子分别报出来，不静默。
     return { status: "error", root, reason: resolved.reason, error: resolved.error ?? null };

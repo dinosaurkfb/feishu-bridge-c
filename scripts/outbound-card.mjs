@@ -8,33 +8,34 @@
 import { composeDigest } from "./outbox.mjs";
 
 const MAX_TITLE_CHARS = 80;
+const MAX_SUMMARY_CHARS = 120;
 const MAX_BODY_CHARS = 8_000;
 const COLLAPSE_REPLY_AFTER_CHARS = 1_800;
 const COLLAPSE_INPUT_AFTER_CHARS = 900;
 
 const RUNTIME = {
-  codex: { label: "Codex", source: "Codex 长期任务 · 自动回写" },
-  claude: { label: "Claude", source: "Claude 长期任务 · 自动回写" },
+  codex: { label: "Codex" },
+  claude: { label: "Claude" },
 };
 
 const PRESENTATION = {
   reply: {
-    label: "本轮答复", tagColor: "blue", background: "blue-50", accent: "blue",
+    label: "本轮答复", background: "blue-50", accent: "blue",
   },
   milestone: {
-    label: "里程碑", tagColor: "green", background: "green-50", accent: "green",
+    label: "里程碑", background: "green-50", accent: "green",
   },
   decision: {
-    label: "决定", tagColor: "blue", background: "blue-50", accent: "blue",
+    label: "决定", background: "blue-50", accent: "blue",
   },
   risk: {
-    label: "风险", tagColor: "red", background: "red-50", accent: "red",
+    label: "风险", background: "red-50", accent: "red",
   },
   pending: {
-    label: "待你拍板", tagColor: "orange", background: "orange-50", accent: "orange",
+    label: "待你拍板", background: "orange-50", accent: "orange",
   },
   next: {
-    label: "下一步", tagColor: "blue", background: "blue-50", accent: "blue",
+    label: "下一步", background: "blue-50", accent: "blue",
   },
 };
 
@@ -48,7 +49,7 @@ function truncate(value, max, suffix = "…") {
 function presentationFor(records) {
   const kinds = new Set(records.map((record) => record?.kind));
   const kind = PRIORITY.find((candidate) => kinds.has(candidate)) ?? "reply";
-  return PRESENTATION[kind];
+  return { ...PRESENTATION[kind], kind };
 }
 
 /** Card markdown 中的原生 <at> 会真的通知用户；自动回写正文只展示它，不产生新 mention。 */
@@ -63,7 +64,42 @@ function localInputOf(records) {
   const record = records[0];
   if (record?.kind !== "reply" || record?.input_origin !== "local" ||
       typeof record?.input_text !== "string" || !record.input_text.trim()) return null;
-  return neutralizeCardMentions(record.input_text.trim());
+  return record.input_text.trim();
+}
+
+/** 飞书会话列表不解析卡片正文；summary 必须自行提供一条可读的纯文本预览。 */
+function firstPlainLine(value) {
+  const lines = String(value ?? "").split(/\r?\n/gu);
+  const requestAt = lines.findIndex((line) =>
+    /^\s*#{1,6}\s*(?:my request|我的请求)\s*:?\s*$/iu.test(line));
+  const candidates = requestAt >= 0 ? lines.slice(requestAt + 1) : lines;
+  for (const rawLine of candidates) {
+    const line = rawLine
+      .replace(/<\s*at\b[^>]*>.*?<\s*\/\s*at\s*>/giu, "")
+      .replace(/!\[([^\]]*)\]\([^)]*\)/gu, "$1")
+      .replace(/\[([^\]]+)\]\([^)]*\)/gu, "$1")
+      .replace(/<[^>]+>/gu, "")
+      .replace(/^\s*(?:#{1,6}|>|[-+*]|\d+[.)])\s*/u, "")
+      .replace(/[*_~`]+/gu, "")
+      .replace(/\s+/gu, " ")
+      .trim();
+    if (line) return line;
+  }
+  return "";
+}
+
+function conversationSummary(records, { input, status, title }) {
+  if (input) {
+    const local = firstPlainLine(input);
+    if (local) return truncate(local, MAX_SUMMARY_CHARS);
+  }
+  const primary = records.find((record) => record?.kind === status.kind) ?? records[0];
+  const detail = firstPlainLine(primary?.text);
+  if (detail) {
+    const summary = status.kind === "reply" ? detail : status.label + "：" + detail;
+    return truncate(summary, MAX_SUMMARY_CHARS);
+  }
+  return truncate(title + " · " + status.label, MAX_SUMMARY_CHARS);
 }
 
 /** 动态任务名进入 metadata markdown 前先降为单行普通文本，不能获得 Markdown 语义。 */
@@ -131,9 +167,8 @@ function contentBlock({ title, content, background, accent, collapseAfter, eleme
   };
 }
 
-/** 任务、状态和运行时来源合成一个次要信息栏，固定放在卡片最底部。 */
-function metadataBlock({ title, status, runtime, count }) {
-  const countText = count > 1 ? " · " + count + " 条" : "";
+/** 精确任务名和运行时保留在最底部，不与会话列表摘要争夺注意力。 */
+function metadataBlock({ title, runtime }) {
   return {
     tag: "column_set",
     element_id: "bridge_meta",
@@ -151,8 +186,7 @@ function metadataBlock({ title, status, runtime, count }) {
         tag: "markdown",
         icon: { tag: "standard_icon", token: "ai-common_colorful" },
         content: "**" + escapeMetadataText(title) + "** · " +
-          "<text_tag color='" + status.tagColor + "'>" + status.label + "</text_tag> · " +
-          "<font color='grey'>" + runtime.source + countText + "</font>",
+          "<font color='grey'>" + runtime.label + "</font>",
         text_size: "notation",
         margin: "0px",
       }],
@@ -184,6 +218,7 @@ export function validateOutboundCard(card) {
   const problems = [];
   if (card?.schema !== "2.0") problems.push("schema_not_2_0");
   if (card?.config?.width_mode !== "default") problems.push("width_not_default");
+  if (!card?.config?.summary?.content) problems.push("missing_conversation_summary");
   if (card?.header !== undefined) problems.push("unexpected_top_header");
   const elements = card?.body?.elements;
   if (!Array.isArray(elements) || elements.length < 2 || elements.length > 5) {
@@ -215,7 +250,7 @@ export function composeOutboundCard(records, { taskName, runtime = "codex" } = {
   if (input) {
     elements.push(contentBlock({
       title: "你的输入",
-      content: input,
+      content: neutralizeCardMentions(input),
       background: "grey-50",
       accent: "grey",
       collapseAfter: COLLAPSE_INPUT_AFTER_CHARS,
@@ -232,9 +267,7 @@ export function composeOutboundCard(records, { taskName, runtime = "codex" } = {
   }));
   elements.push(metadataBlock({
     title,
-    status,
     runtime: runtimeInfo,
-    count: records.length,
   }));
 
   const card = {
@@ -243,7 +276,7 @@ export function composeOutboundCard(records, { taskName, runtime = "codex" } = {
       update_multi: true,
       width_mode: "default",
       enable_forward: true,
-      summary: { content: truncate(title + " · " + status.label, 120) },
+      summary: { content: conversationSummary(records, { input, status, title }) },
     },
     body: {
       direction: "vertical",

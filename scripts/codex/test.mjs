@@ -436,7 +436,9 @@ test("Codex 出站使用确定性 Card 2.0，并按事件语义选择颜色", ()
   assert.match(JSON.stringify(reply.body.elements[0]), /这是最终答复/u);
   assert.equal(reply.body.elements[1].element_id, "bridge_meta");
   assert.match(JSON.stringify(reply.body.elements[1]), /高价值会议｜项目推进/u);
-  assert.match(JSON.stringify(reply.body.elements[1]), /本轮答复/u);
+  assert.match(JSON.stringify(reply.body.elements[1]), /Codex/u);
+  assert.equal(JSON.stringify(reply.body.elements[1]).includes("本轮答复"), false);
+  assert.equal(reply.config.summary.content, "这是最终答复");
   assert.equal(JSON.stringify(reply).includes("behaviors"), false);
 
   const risk = composeCodexOutboundCard([
@@ -444,7 +446,7 @@ test("Codex 出站使用确定性 Card 2.0，并按事件语义选择颜色", ()
   ], { taskName: "风险测试" });
   assert.equal(risk.header, undefined);
   assert.equal(risk.body.elements[0].columns[0].background_style, "red-50");
-  assert.match(JSON.stringify(risk.body.elements.at(-1)), /text_tag color='red'>风险/u);
+  assert.equal(risk.config.summary.content, "风险：任务没有完成");
 });
 
 test("本地 Codex 输入与回复进入同一张卡，飞书入站回复不复读原消息", () => {
@@ -462,6 +464,7 @@ test("本地 Codex 输入与回复进入同一张卡，飞书入站回复不复�
   assert.match(JSON.stringify(local.body.elements[1]), /Codex 回复/u);
   assert.match(JSON.stringify(local.body.elements[1]), /我已经完成修改/u);
   assert.equal(local.body.elements[2].element_id, "bridge_meta");
+  assert.equal(local.config.summary.content, "请把输入和回复放在一张卡里");
 
   const inbound = composeCodexOutboundCard([{
     kind: "reply",
@@ -472,6 +475,21 @@ test("本地 Codex 输入与回复进入同一张卡，飞书入站回复不复�
   assert.equal(inbound.body.elements.length, 2);
   assert.equal(JSON.stringify(inbound).includes("你的输入"), false);
   assert.match(JSON.stringify(inbound), /这是飞书指令的执行结果/u);
+  assert.equal(inbound.config.summary.content, "这是飞书指令的执行结果");
+});
+
+test("会话列表摘要取首条有效纯文本，并清理 Markdown 与 mention", () => {
+  const local = composeCodexOutboundCard([{
+    kind: "reply", text: "回复", input_origin: "local",
+    input_text: "# Files mentioned by the user:\n截图.png\n\n## My request:\n" +
+      "<at id=ou_someone></at> **修复侧栏摘要**\n第二行不应进入摘要",
+  }], { taskName: "摘要测试" });
+  assert.equal(local.config.summary.content, "修复侧栏摘要");
+
+  const progress = composeCodexOutboundCard([
+    { kind: "milestone", text: "- 已经完成第一阶段\n更多说明" },
+  ], { taskName: "摘要测试" });
+  assert.equal(progress.config.summary.content, "里程碑：已经完成第一阶段");
 });
 
 test("卡片底栏把动态任务名收敛为单行普通文本", () => {

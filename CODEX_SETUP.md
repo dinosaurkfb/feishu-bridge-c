@@ -29,12 +29,16 @@ Codex adapter 把一个飞书话题绑定到一个**精确 Codex task/thread**�
 
 | 依赖 | 要求 | 验证方式 |
 |---|---|---|
-| macOS | 当前安装器写入用户级 Codex hooks | — |
+| 宿主系统 | 当前脚本要求 POSIX 环境；完整链路已在 macOS 实机验证，Linux 可在依赖齐全后部署，原生 Windows 尚未完成本项目的端到端验证 | — |
 | Node.js | 22 或更高 | `node -v` |
 | Codex Desktop/CLI | CLI 在 `PATH` 中，Desktop 能加载用户 hooks | `codex --version` |
 | aily-cli | 已登录，daemon 在线，M5Codex 能在本机调用 Codex | `aily-cli doctor` |
-| lark-cli | 已安装 | `lark-cli --version` |
+| lark-cli | 必须安装；bridge 用它创建/编辑根话题和发布最终答复，`aily-cli` 不替代这些 OpenAPI 写入 | `lark-cli --version` |
 | 飞书群 | M5Codex 已在群中 | 在群成员列表确认 |
+
+宿主机不必安装飞书桌面客户端。你可以从手机、网页或另一台电脑上的飞书操作；真正需要常驻
+在宿主机上的，是 `aily-cli` daemon、Codex CLI、`lark-cli` 和 bridge。Codex CLI 本身提供
+macOS、Linux 与 Windows 安装方式，但这不等于本项目的整条桥接脚本已在三个平台完成验证。
 
 克隆后先跑零外部副作用的回归：
 

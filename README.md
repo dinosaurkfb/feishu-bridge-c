@@ -65,6 +65,7 @@ Claude/Codex 长期任务，不会另开一个缺少上下文的临时聊天。
 | 第三方智能体 | 群成员中的 M5Codex 或 M5Claude（见下方命名说明） | 接收真实 @mention、返回秒级受理消息，并以同一身份发布最终答复 |
 | Aily（现也称「豆包工作伙伴」） | 智能体平台及本机 `aily-cli` runtime/daemon | 把飞书事件和可信事件信封交给本机 adapter；维持第三方智能体与本机的在线连接 |
 | 本机 adapter | Aily 的 `codex-local` 或 `claude-code-local` 类型运行环境 | 调起对应的 Codex/Claude 能力和入站技能 |
+| lark-cli | 本机上的飞书 OpenAPI 命令行客户端 | 由 bridge 调用，创建或编辑根话题，并把最终答复精确发布回原话题；当前不能由 `aily-cli` 替代 |
 | feishu-bridge | 本仓库安装的脚本、hooks、skills 和 registry | 做确定性校验、话题映射、精确续接、终局判断和答复发布 |
 | 长期任务 | Codex task/thread，或 Claude 项目会话 | 保留项目上下文，实际读取代码、调用工具并完成工作 |
 
@@ -90,14 +91,20 @@ Claude/Codex 长期任务，不会另开一个缺少上下文的临时聊天。
 
 ### 最小部署条件
 
-- 一台保持在线且不会在任务中途休眠的 macOS 电脑；
+- 一台保持在线且不会在任务中途休眠的本地宿主机；当前完整链路已在 macOS 实机验证，脚本要求
+  POSIX 环境，Linux 可在依赖齐全后部署，原生 Windows 尚未完成本项目的端到端验证；
 - Node.js 22 或更高；
 - Codex Desktop/CLI 或 Claude Code，选择其中一套运行时；
 - 已登录且 daemon 在线的 `aily-cli`；
-- 已安装的 `lark-cli`；
+- 已安装且可使用第三方智能体飞书应用凭据的 `lark-cli`；它负责话题创建、消息编辑和最终答复
+  发布，当前是完整双向链路的必需组件；
 - 一个飞书话题群，以及群内一个对应运行时的 Aily 第三方智能体；
 - 第三方智能体背后的飞书应用具备接收 mention、创建话题和发送消息所需权限；
 - 能访问所选 AI 运行时、Aily 和飞书服务的网络环境。
+
+宿主机不要求安装飞书桌面客户端。人可以在手机、另一台电脑或网页飞书里操作；宿主机只需
+保持 `aily-cli`、所选 AI 运行时、`lark-cli` 和 bridge 在线。`aily-cli` 负责把 mention 事件送入
+本机，`lark-cli` 负责 bridge 对飞书 OpenAPI 的确定性写入，两者职责不同。
 
 本机离线、休眠或 Aily daemon 不在线时，飞书无法推进本机任务。本仓库不会把整份代码仓库
 上传到飞书，但你发送的指令、受理状态和最终答复会经过飞书/Aily 链路。

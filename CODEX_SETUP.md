@@ -2,6 +2,8 @@
 
 Codex adapter 把一个飞书话题绑定到一个**精确 Codex task/thread**：在话题里真实
 `@M5Codex` 后，正文作为用户指令进入该 task；Codex 的最终答复自动回到原话题。
+自动回写使用只读 Card 2.0 卡片：标题显示精确 task 名称，颜色区分普通答复、里程碑、待拍板和
+风险。卡片当前没有按钮或回调，不改变既有入站和授权边界。
 
 仓库代码不代表某台机器已经配置完成。新机器必须依次完成：准备飞书身份、写机器级模板、
 安装 hooks/skills、接入一个 task、跑一次真实端到端验证。
@@ -166,6 +168,9 @@ $feishu-status
 3. runner 观察到目标 thread、`turn.completed`、exit code 0 和非空最终输出；
 4. 最终答复只回到原话题一次，发送者仍是 M5Codex。
 
+第 4 项在飞书里应显示为 Card 2.0 卡片。首次绑定根消息和接入状态仍是文本，这是正常设计：
+根消息引用中的六位短码承担首次 Aily session 的确定性绑定证据，不能改成卡片结构。
+
 若 Desktop 当时正打开该 task 而未立即显示第 2 项，先切换到其他 task 再返回；这属于客户端
 实时刷新差异，不等于投递失败。最终仍应以 task 历史、严格 runner 终局和飞书回读三层证据验收。
 
@@ -188,7 +193,7 @@ $feishu-status
   → 精确 codex_thread_id + codex exec resume
   → 秒级受理；一次性 watcher 等待严格终局
   → Stop 保存原始答复，watcher 授予发布资格
-  → 同一个 M5Codex 把最终答复发布到原话题
+  → 同一个 M5Codex 把最终答复作为只读 Card 2.0 卡片发布到原话题
 ```
 
 Codex locator、claim、receipt、run 和 outbox 全部放在

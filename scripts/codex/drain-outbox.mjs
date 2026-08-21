@@ -5,6 +5,7 @@ import { composeDigest, listPending, markSent } from "../outbox.mjs";
 import { publishDraft } from "../outbound.mjs";
 import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
 import { resolveLarkIdentity } from "../chain-template.mjs";
+import { composeCodexOutboundCard } from "./outbound-card.mjs";
 import {
   bridgeHome, findTaskForCodexThread, loadRegistry, resolveTask, taskPaths,
 } from "./state.mjs";
@@ -69,7 +70,7 @@ try {
     const messageId = publishDraft({
       profile: identity.profile,
       rootMessageId: resolved.mapping.feishu_root_message_id_reference,
-      text: composeDigest(current, { taskName: task.task_display_name }),
+      card: composeCodexOutboundCard(current, { taskName: task.task_display_name }),
       larkBin: identity.bin,
       larkHome: identity.configDir,
       expectedAppId: identity.expectedAppId,

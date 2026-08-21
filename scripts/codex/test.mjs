@@ -15,7 +15,11 @@ import { composeCodexBinding, resolveBindingTarget, validThreadId } from "./bind
 import { readCodexThreadTitle, sanitizeThreadTitle } from "./thread-title.mjs";
 import { updateTextMessage } from "./lark-message.mjs";
 import { classifyRunnerDiagnostic, readCodexRunOutcome, sanitizeCodexRunEnv } from "./handoff.mjs";
+import {
+  composeCodexOutboundCard, neutralizeCardMentions, validateCodexOutboundCard,
+} from "./outbound-card.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
+import { publishDraft } from "../outbound.mjs";
 import {
   classifyFeishuPrompt, composeAilyInboundContext, composeBindingContext, composeInitContext,
   composeRoutedCodexContext, composeStatusContext, composeUnbindContext, isAilyInvocation, isBindingPrompt,
@@ -51,6 +55,7 @@ function autoPublishFixture({ enabled = true, workingPublisher = true } = {}) {
   const home = temp();
   const root = path.join(home, "project");
   const bin = path.join(home, "fake-lark.sh");
+  const argsFile = path.join(home, "lark-args.json");
   const configBase = path.join(home, "agents");
   const credentialDir = path.join(configBase, TEMPLATE.agent_uid);
   fs.mkdirSync(root);
@@ -59,7 +64,10 @@ function autoPublishFixture({ enabled = true, workingPublisher = true } = {}) {
     apps: [{ name: TEMPLATE.lark_cli_profile, appId: TEMPLATE.transport_app_id }],
   }));
   fs.writeFileSync(bin, workingPublisher
-    ? "#!/bin/sh\nprintf '%s' '{\"ok\":true,\"data\":{\"message_id\":\"om_sent\"}}'\n"
+    ? "#!" + process.execPath + "\n" +
+      "const fs = require('node:fs');\n" +
+      "fs.writeFileSync(" + JSON.stringify(argsFile) + ", JSON.stringify(process.argv.slice(2)));\n" +
+      "process.stdout.write('{\"ok\":true,\"data\":{\"message_id\":\"om_sent\"}}');\n"
     : "#!/bin/sh\nexit 1\n", { mode: 0o700 });
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({
     ...TEMPLATE, lark_cli_bin: bin, lark_cli_config_base: configBase,
@@ -67,7 +75,7 @@ function autoPublishFixture({ enabled = true, workingPublisher = true } = {}) {
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
   task.auto_publish_on_completion = enabled;
   writeRegistry([task], path.join(home, "registry.json"));
-  return { home, root, task };
+  return { home, root, task, bin, argsFile };
 }
 
 test("thread id 只接受精确 UUID，不接受 --last 或名字", () => {
@@ -409,6 +417,62 @@ test("outbox 按事件键而非正文去重", () => {
   assert.equal(appendEvent({ outboxDir, kind: "reply", text: "相同答复", eventKey: "turn-2" }).ok, true);
   assert.equal(appendEvent({ outboxDir, kind: "reply", text: "被改写也不应重入", eventKey: "turn-1" }).reason, "duplicate");
   assert.equal(listPending({ outboxDir }).length, 2);
+});
+
+test("Codex 出站使用确定性 Card 2.0，并按事件语义选择颜色", () => {
+  const reply = composeCodexOutboundCard([
+    { kind: "reply", text: "这是最终答复", created_at: "2026-08-21T00:00:00Z" },
+  ], { taskName: "高价值会议｜项目推进" });
+  assert.equal(validateCodexOutboundCard(reply).ok, true);
+  assert.equal(reply.schema, "2.0");
+  assert.equal(reply.config.width_mode, "default");
+  assert.equal(reply.header.title.content, "高价值会议｜项目推进");
+  assert.equal(reply.header.template, "blue");
+  assert.equal(reply.header.text_tag_list[0].text.content, "本轮答复");
+  assert.equal(reply.body.elements[0].tag, "column_set");
+  assert.equal(reply.body.elements[1].tag, "markdown");
+  assert.match(reply.body.elements[1].content, /这是最终答复/u);
+  assert.equal(JSON.stringify(reply).includes("behaviors"), false);
+
+  const risk = composeCodexOutboundCard([
+    { kind: "risk", text: "任务没有完成" },
+  ], { taskName: "风险测试" });
+  assert.equal(risk.header.template, "red");
+  assert.equal(risk.header.text_tag_list[0].text.content, "风险");
+  assert.equal(risk.body.elements[0].columns[0].background_style, "red-50");
+});
+
+test("卡片长正文折叠，并中和模型正文里的原生卡片 mention", () => {
+  const source = "<at id=ou_someone></at>\n" + "很长的答复".repeat(500);
+  const card = composeCodexOutboundCard([{ kind: "reply", text: source }], { taskName: "T" });
+  assert.equal(card.body.elements[1].tag, "collapsible_panel");
+  const content = card.body.elements[1].elements[0].content;
+  assert.equal(content.includes("<at id="), false);
+  assert.match(content, /&#60;at id=ou_someone>/u);
+  assert.equal(neutralizeCardMentions("普通文本"), "普通文本");
+});
+
+test("自动发布通过 interactive 回复原话题，绑定状态仍可使用文本发布", () => {
+  const { home, task, bin, argsFile } = autoPublishFixture();
+  const outboxDir = taskPaths(task, home).outbox;
+  appendEvent({
+    outboxDir, kind: "reply", text: "卡片答复", eventKey: "card-reply", publishEligible: true,
+  });
+  assert.equal(publishEligibleTaskEvents({ task, home }).status, "published");
+  const cardArgs = JSON.parse(fs.readFileSync(argsFile, "utf-8"));
+  assert.equal(cardArgs.includes("--text"), false);
+  assert.equal(cardArgs[cardArgs.indexOf("--msg-type") + 1], "interactive");
+  const card = JSON.parse(cardArgs[cardArgs.indexOf("--content") + 1]);
+  assert.equal(card.schema, "2.0");
+  assert.equal(card.header.title.content, task.task_display_name);
+  assert.equal(cardArgs.includes("--reply-in-thread"), true);
+
+  publishDraft({
+    profile: "platform-bot", rootMessageId: "om_root", text: "绑定状态", larkBin: bin,
+  });
+  const textArgs = JSON.parse(fs.readFileSync(argsFile, "utf-8"));
+  assert.equal(textArgs[textArgs.indexOf("--text") + 1], "绑定状态");
+  assert.equal(textArgs.includes("--msg-type"), false);
 });
 
 test("自动发布只消费显式 eligible 事件，不补发升级前的历史 outbox", () => {

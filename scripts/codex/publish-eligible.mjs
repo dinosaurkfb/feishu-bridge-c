@@ -5,10 +5,11 @@
  * 授予。这样升级前的历史积压、失败 run 的半成品答复都不会被下一轮顺带发出。
  */
 
-import { composeDigest, listPending, markSent } from "../outbox.mjs";
+import { listPending, markSent } from "../outbox.mjs";
 import { publishDraft } from "../outbound.mjs";
 import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
 import { resolveLarkIdentity } from "../chain-template.mjs";
+import { composeCodexOutboundCard } from "./outbound-card.mjs";
 import { bridgeHome, resolveTask, taskPaths } from "./state.mjs";
 
 export function publishEligibleTaskEvents({ task, home = bridgeHome(), timeoutMs = 12_000 } = {}) {
@@ -36,7 +37,7 @@ export function publishEligibleTaskEvents({ task, home = bridgeHome(), timeoutMs
     const messageId = publishDraft({
       profile: identity.profile,
       rootMessageId: resolved.mapping.feishu_root_message_id_reference,
-      text: composeDigest(current, { taskName: task.task_display_name }),
+      card: composeCodexOutboundCard(current, { taskName: task.task_display_name }),
       larkBin: identity.bin,
       larkHome: identity.configDir,
       expectedAppId: identity.expectedAppId,

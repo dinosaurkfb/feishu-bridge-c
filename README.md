@@ -61,18 +61,26 @@ Claude/Codex 长期任务，不会另开一个缺少上下文的临时聊天。
 | 角色 | 用户看到的东西 | 在链路中的职责 |
 |---|---|---|
 | 飞书话题群 | 一个开启话题能力的群组 | 承载多个项目话题；每个根话题是独立的路由和沟通边界 |
-| 第三方智能体 | 群成员中的 M5Codex 或 M5Claude | 接收真实 @mention、返回秒级受理消息，并以同一身份发布最终答复 |
-| Aily | 智能体平台及本机 `aily-cli` runtime/daemon | 把飞书事件和可信事件信封交给本机 adapter；维持第三方智能体与本机的在线连接 |
+| 第三方智能体 | 群成员中的 M5Codex 或 M5Claude（见下方命名说明） | 接收真实 @mention、返回秒级受理消息，并以同一身份发布最终答复 |
+| Aily（现也称「豆包工作伙伴」） | 智能体平台及本机 `aily-cli` runtime/daemon | 把飞书事件和可信事件信封交给本机 adapter；维持第三方智能体与本机的在线连接 |
 | 本机 adapter | Aily 的 `codex-local` 或 `claude-code-local` 类型运行环境 | 调起对应的 Codex/Claude 能力和入站技能 |
 | feishu-bridge | 本仓库安装的脚本、hooks、skills 和 registry | 做确定性校验、话题映射、精确续接、终局判断和答复发布 |
 | 长期任务 | Codex task/thread，或 Claude 项目会话 | 保留项目上下文，实际读取代码、调用工具并完成工作 |
+
+> **关于名字**
+>
+> - **M5Codex / M5Claude 是本项目初始开发者给自己那两个第三方 Aily 智能体起的名字**，
+>   不是平台内置的东西。你自己建智能体时叫什么都可以，全文出现这两个名字的地方，
+>   换成你自己那个即可 —— 代码不认名字，只认配置里的 app id、agent uid 和 open id。
+> - **Aily 现在也叫「豆包工作伙伴」。**本文沿用 Aily，因为命令行工具和各处标识仍是
+>   `aily-cli`、`AILY_CLI_*`、`agent_...`。看到「豆包工作伙伴」时，指的是同一个平台。
 
 “第三方智能体”不是远端替你重新做一遍工作的聊天机器人。它主要承担**运输与展示**：真正的
 项目执行仍发生在你自己的电脑上，由已经绑定的 Claude/Codex 长期任务完成。
 
 ```text
 手机/桌面飞书
-  └─ 话题群中的 M5Codex 或 M5Claude（第三方智能体）
+  └─ 话题群中的第三方智能体（示例名 M5Codex / M5Claude，你自己命名）
        └─ Aily 平台与本机 aily-cli daemon
             └─ codex-local / claude-code-local adapter
                  └─ feishu-bridge
@@ -141,8 +149,8 @@ Claude Code 与 Codex 共用 envelope、selector、claim、outbox 和飞书发�
 
 | 运行时 | 飞书智能体 | 绑定单位 | 新用户入口 |
 |---|---|---|---|
-| Codex Desktop/CLI | Aily `codex-local` 第三方智能体，文档中称 M5Codex | 精确 Codex task/thread | **[CODEX_SETUP.md](CODEX_SETUP.md)** |
-| Claude Code | Aily `claude-code-local` 第三方智能体，文档中称 M5Claude | 项目及其可续接 Claude 会话 | **[SETUP.md](SETUP.md)** |
+| Codex Desktop/CLI | Aily `codex-local` 第三方智能体，本文示例名 M5Codex | 精确 Codex task/thread | **[CODEX_SETUP.md](CODEX_SETUP.md)** |
+| Claude Code | Aily `claude-code-local` 第三方智能体，本文示例名 M5Claude | 项目及其可续接 Claude 会话 | **[SETUP.md](SETUP.md)** |
 
 ### Codex 快速路线
 

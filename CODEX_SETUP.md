@@ -8,6 +8,13 @@ Codex adapter 把一个飞书话题绑定到一个**精确 Codex task/thread**�
 
 > Claude Code 用户请看 [SETUP.md](SETUP.md)。本页只讲 Codex，不需要安装 Claude 侧 hooks。
 
+> **M5Codex 只是示例名。**它是本项目初始开发者给自己那个第三方 Aily 智能体起的名字，
+> 不是平台内置的东西 —— 你自己建的叫什么都行，把本页出现 `M5Codex` 的地方换成你自己那个即可。
+> 代码不认名字，只认配置里的 `agent_...`、`cli_...` 和 `ou_...`。
+>
+> **Aily 现在也叫「豆包工作伙伴」**，是同一个平台。本文沿用 Aily，因为命令行工具和
+> 各处标识仍是 `aily-cli` / `AILY_CLI_*`。
+
 ## 先理解两个行为
 
 1. **绑定的是 task，不是目录。**同一个仓库里的两个 Codex task 可以分别接到两个飞书话题；

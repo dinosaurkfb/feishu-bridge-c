@@ -98,6 +98,40 @@ export function normalizeBody(content) {
   return s.replace(/^[\s ]+/, "").replace(/[\s ]+$/, "");
 }
 
+/**
+ * 取出飞书自动附加的引用块正文（不含标记行本身）。
+ *
+ * 这段是**平台加的，不是 Frank 打的** —— 他在话题里说话时，飞书会把被回复的那条消息
+ * 全文捎上。2026-08-20 统计 M5Claude 收到的全部带 mention 的消息：8/8 条都有引用块，
+ * 所以它不是「回复根消息那一下才有」的特例，是这个话题里每条消息都带。
+ *
+ * 这一点很值钱：入站事件里没有任何飞书 locator（见本文件开头的 v2 说明），
+ * 而引用块是**唯一**能把「这条消息属于哪个话题」的信息带进来的通道。
+ */
+export function extractQuotedBlock(content) {
+  const s = String(content ?? "");
+  const at = s.search(/\n\s*>?\s*\*\*\[引用\]\*\*/);
+  if (at < 0) return null;
+  return s.slice(at).replace(/^\s*>?\s*\*\*\[引用\]\*\*\s*/m, "").trim() || null;
+}
+
+/** 绑定码的字面形状：根消息里那行「绑定码    d85488」。 */
+export const BINDING_TOKEN_RE = /绑定码\s+([0-9a-f]{6})\b/g;
+
+/**
+ * 从**引用块里**找绑定码 —— 刻意不看正文。
+ *
+ * 正文是 Frank 打的，引用块是平台加的。只认引用块，意味着「手打一个绑定码」不能用来
+ * 指定目标；能指定目标的只有「你真的在那个话题里说话」这件事本身。
+ *
+ * 返回去重后的全部命中：出现多个是**歧义**，调用方必须拒绝而不是挑一个。
+ */
+export function bindingTokensInQuote(content) {
+  const quoted = extractQuotedBlock(content);
+  if (!quoted) return [];
+  return [...new Set([...quoted.matchAll(BINDING_TOKEN_RE)].map((m) => m[1]))];
+}
+
 export function evaluateInbound({ event, mapping, config, now }) {
   const nowMs = typeof now === "number" ? now : Date.now();
   const reject = (reason) => ({

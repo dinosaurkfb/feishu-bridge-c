@@ -166,13 +166,15 @@ const dryRun = process.argv.includes("--dry-run");
 
 let routed = findBindingForSession({ sessionId: event.session_id });
 let justBound = false;
+let pendingMatchedBy = null;
 
 if (!routed.ok) {
   // 没有已绑定的话题对得上 —— 可能是「新话题的第一条 @」，也可能是条不该理的消息。
   // 绑定必然分两段：建话题时 Aily session 还不存在（它是第一条消息流进来才产生的）。
   const tpl = loadChainTemplate();
   const template = tpl.ok ? tpl.template : null;
-  const pending = findPendingBinding({ now: Date.now() });
+  // 把正文传进去：绑定码就藏在飞书自动附加的引用块里，Frank 不用打任何东西。
+  const pending = findPendingBinding({ content: event.content, now: Date.now() });
   const promo = evaluatePromotion({ event, template, pending, now: Date.now() });
 
   if (!promo.ok) {
@@ -190,7 +192,8 @@ if (!routed.ok) {
   }
 
   if (dryRun) {
-    process.stdout.write("[dry-run] 会把这个话题绑给 " + promo.id + "（没有真的写）\n");
+    process.stdout.write("[dry-run] 会把这个话题绑给 " + promo.id +
+      "（依据：" + (pending.matchedBy === "quoted_binding_token" ? "根消息引用里的绑定码" : "全机唯一一份待绑定") + "，没有真的写）\n");
     process.stderr.write(JSON.stringify({ dryRun: true, wouldBind: promo.root }) + "\n");
     process.exit(0);
   }
@@ -205,6 +208,7 @@ if (!routed.ok) {
   }
 
   justBound = true;
+  pendingMatchedBy = pending.matchedBy ?? null;
   routed = findBindingForSession({ sessionId: event.session_id });
   if (!routed.ok) {
     // 刚写完就读不回来，说明登记表被并发改了。不猜，如实报。
@@ -236,6 +240,7 @@ if (justBound && verdict.decision === "reject" && verdict.reason === REJECT.EMPT
   writeReceipt("bound-" + event.message_id, {
     status: "bound", message_id: event.message_id, session_id: event.session_id,
     root: routed.root, binding_id: mapping.binding_id,
+    matched_by: pendingMatchedBy,
     claim_acquired: false, handed_off: false,
     // 为将来的确定性匹配攒证据：根消息里那个绑定码有没有随引用块回来。
     // 现在没有代码依赖它，纯粹是想知道那条路走不走得通。

@@ -18,7 +18,7 @@ import fs from "node:fs";
 
 import { loadRegistry, registryPath } from "./registry.mjs";
 import { appendConsumed, loadConsumed, resolveProject } from "./project-resolve.mjs";
-import { extractMentionIds } from "./selector.mjs";
+import { bindingTokensInQuote, extractMentionIds } from "./selector.mjs";
 
 // 幂等列表住在 project-resolve（它是更低层的那个模块），从这里转出去，
 // 免得 inbound.mjs 为了一件事 import 两个模块。
@@ -37,6 +37,9 @@ export const PENDING_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const PROMOTE_REJECT = {
   NO_PENDING: "no_pending_binding",
   MULTIPLE_PENDING: "multiple_pending_bindings",
+  TOKEN_UNKNOWN: "binding_token_unknown",
+  TOKEN_AMBIGUOUS: "multiple_binding_tokens",
+  TOKEN_DUPLICATED: "duplicate_pending_binding_token",
   PENDING_EXPIRED: "pending_binding_expired",
   SENDER_NOT_FRANK: "sender_not_frank",
   TRANSPORT_NOT_MENTIONED: "transport_not_mentioned",
@@ -46,7 +49,10 @@ export const PROMOTE_REJECT = {
 
 export const PROMOTE_REJECT_TEXT = {
   [PROMOTE_REJECT.NO_PENDING]: "这个话题没有绑定任何项目，也没有等待绑定的项目",
-  [PROMOTE_REJECT.MULTIPLE_PENDING]: "同时有多个项目在等待绑定，认不出该绑哪个",
+  [PROMOTE_REJECT.MULTIPLE_PENDING]: "同时有多个项目在等待绑定，而这条消息里没带上绑定码，认不出该绑哪个",
+  [PROMOTE_REJECT.TOKEN_UNKNOWN]: "根消息引用里的绑定码不对应任何等待绑定的项目",
+  [PROMOTE_REJECT.TOKEN_AMBIGUOUS]: "根消息引用里出现了多个绑定码，无法确定目标",
+  [PROMOTE_REJECT.TOKEN_DUPLICATED]: "多个等待绑定的项目用了同一个绑定码，无法确定目标",
   [PROMOTE_REJECT.PENDING_EXPIRED]: "等待绑定已超过 24 小时，需要重新接入",
   [PROMOTE_REJECT.SENDER_NOT_FRANK]: "发送者不是授权用户",
   [PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED]: "没有真实 @ 本链路的运输 agent",
@@ -95,8 +101,21 @@ const pendingDeadline = (entry) => {
   return Number.isFinite(bound) ? bound + PENDING_WINDOW_MS : 0;
 };
 
-/** 全机唯一那份待绑定。多于一份就拒 —— 认领靠的就是「只有一份」这个前提。 */
-export function findPendingBinding({ registryFile, templateFile, now = Date.now() } = {}) {
+/**
+ * 认领哪一份待绑定。
+ *
+ * 两条路，优先用确定性那条：
+ *
+ *   1. **引用块里带着绑定码** → 精确选中。飞书会把根消息全文自动捎在每条消息后面
+ *      （2026-08-20 实测 8/8 条都有），所以 Frank **什么都不用打** —— 他只要在那个话题里
+ *      说话，绑定码就跟过来了。这条路对「同时有多个项目等待接入」也成立。
+ *   2. 没有绑定码 → 回落到「全机只有一份待绑定」。单项目的人走的一直是这条，行为不变；
+ *      多于一份就拒绝，绝不挑一个。
+ *
+ * 绑定码只从**引用块**里认，不看正文：正文是 Frank 打的，引用块是平台加的。
+ * 手打一个码不能用来指定目标 —— 能指定目标的只有「你真的在那个话题里说话」这件事本身。
+ */
+export function findPendingBinding({ content, registryFile, templateFile, now = Date.now() } = {}) {
   const listed = listBindings({ registryFile, templateFile });
   if (!listed.ok) return { ok: false, reason: listed.reason };
 
@@ -104,15 +123,40 @@ export function findPendingBinding({ registryFile, templateFile, now = Date.now(
     (b) => b.mapping?.inbound_state === "pending" && !b.mapping?.session_id,
   );
   if (pending.length === 0) return { ok: false, reason: PROMOTE_REJECT.NO_PENDING };
-  if (pending.length > 1) {
-    return { ok: false, reason: PROMOTE_REJECT.MULTIPLE_PENDING, ids: pending.map((b) => b.id) };
+
+  const tokens = bindingTokensInQuote(content);
+  if (tokens.length > 1) {
+    return { ok: false, reason: PROMOTE_REJECT.TOKEN_AMBIGUOUS, tokens };
   }
 
-  const one = pending[0];
+  let one;
+  if (tokens.length === 1) {
+    const hits = pending.filter((b) => b.mapping?.pending_token === tokens[0]);
+    // 认得出码但没人认领：与其回落到「只有一份」猜一个，不如明说 —— 回落会在
+    // 「Frank 在 A 话题说话、而待绑定的是 B」时把 B 绑给 A，静默且难查。
+    if (hits.length === 0) {
+      return { ok: false, reason: PROMOTE_REJECT.TOKEN_UNKNOWN, token: tokens[0] };
+    }
+    if (hits.length > 1) {
+      return { ok: false, reason: PROMOTE_REJECT.TOKEN_DUPLICATED, token: tokens[0],
+        ids: hits.map((b) => b.id) };
+    }
+    one = hits[0];
+  } else {
+    if (pending.length > 1) {
+      return { ok: false, reason: PROMOTE_REJECT.MULTIPLE_PENDING, ids: pending.map((b) => b.id) };
+    }
+    one = pending[0];
+  }
+
   if (now >= pendingDeadline(one.entry)) {
     return { ok: false, reason: PROMOTE_REJECT.PENDING_EXPIRED, id: one.id, root: one.root };
   }
-  return { ok: true, ...one, deadline: pendingDeadline(one.entry) };
+  return {
+    ok: true, ...one,
+    matchedBy: tokens.length === 1 ? "quoted_binding_token" : "only_pending",
+    deadline: pendingDeadline(one.entry),
+  };
 }
 
 /**

@@ -13,7 +13,8 @@ import os from "node:os";
 import path from "node:path";
 
 import {
-  REJECT, evaluateInbound, extractMentionIds, isValidPrefix, isValidQuota, normalizeBody,
+  REJECT, bindingTokensInQuote, evaluateInbound, extractMentionIds, extractQuotedBlock,
+  isValidPrefix, isValidQuota, normalizeBody,
 } from "./selector.mjs";
 import { NOTE_MAX, resolveUntil, validateNote } from "./binding.mjs";
 import { FETCH_BACKOFF_MS, RECENT_TURNS, buildEventsArgs, fetchTriggerEvent } from "./envelope.mjs";
@@ -2168,6 +2169,110 @@ test("三条控制技能都装成跟 Codex 同名的斜杠命令", () => {
     assert.ok(skill.includes("name: " + installed),
       repo + " 的 frontmatter name 必须是 " + installed + "，否则命令名对不上");
   }
+});
+
+// ---------- 绑定码从引用块里认（Frank 什么都不用打） ----------
+//
+// 飞书会把被回复的那条消息全文自动捎在正文后面。2026-08-20 统计 M5Claude 收到的
+// 全部 18 条带 mention 的消息：**18/18 都有引用块，且 18/18 都不带 `>` 前缀**。
+// 两种渲染都要能吃 —— 只认一种的话，另一种会静默回落到「只有一份待绑定」，
+// 而那在单项目时看起来完全正常，多项目时才暴露。
+
+const REAL_QUOTE = '<at id="ou_t">M</at>\n\n**[引用]**\n🌉 cc2cd\n\n让两个模型对话。\n\n' +
+  "本机项目  /Users/dk/x\n绑定码    d85488\n\n项目里的进展会回复到本条下面。";
+const GT_QUOTE = '<at id="ou_t">M</at> 干活\n\n> **[引用]**\n> 🌉 demo\n> 绑定码    a1b2c3\n';
+
+test("真实报文（引用块不带 > ）里取得到绑定码", () => {
+  assert.deepEqual(bindingTokensInQuote(REAL_QUOTE), ["d85488"]);
+});
+
+test("平台渲染成 > 引用时同样取得到 —— 两种格式都见过", () => {
+  assert.deepEqual(bindingTokensInQuote(GT_QUOTE), ["a1b2c3"]);
+});
+
+test("正文里手打的绑定码不算 —— 能指定目标的只有「你真的在那个话题里说话」", () => {
+  assert.deepEqual(bindingTokensInQuote('<at id="ou_t">M</at> 绑定码 aaaaaa'), []);
+  // 正文有一个、引用块里是另一个：只认引用块那个
+  const mixed = '<at id="ou_t">M</at> 绑定码 aaaaaa\n\n**[引用]**\n绑定码    d85488';
+  assert.deepEqual(bindingTokensInQuote(mixed), ["d85488"]);
+});
+
+test("没有引用块 / 引用块里没有码 → 空数组，回落到「只有一份」那条路", () => {
+  assert.deepEqual(bindingTokensInQuote('<at id="ou_t">M</at> 干活'), []);
+  assert.deepEqual(bindingTokensInQuote('<at id="ou_t">M</at>\n\n**[引用]**\n老话题，没有绑定码'), []);
+  assert.equal(extractQuotedBlock('<at id="ou_t">M</at> 干活'), null);
+});
+
+test("引用块里出现多个绑定码 → 歧义，必须拒绝而不是挑一个", () => {
+  const two = '<at id="ou_t">M</at>\n\n**[引用]**\n绑定码    d85488\n绑定码    a1b2c3';
+  assert.deepEqual(bindingTokensInQuote(two).sort(), ["a1b2c3", "d85488"]);
+});
+
+// ---------- 认领：确定性优先，回落不变 ----------
+
+function pendingFixture(specs) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-pend-"));
+  const regFile = path.join(home, "registry.json");
+  const tplFile = path.join(home, "chain-config.json");
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  const projects = specs.map((sp) => ({
+    id: sp.id, root: fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-pp-")),
+    root_message_id: "om_" + sp.id, expires_at: "2099-01-01T00:00:00Z",
+    inbound_state: "pending", pending_token: sp.token,
+    bound_at: new Date(Date.now() - 60_000).toISOString(),
+  }));
+  fs.writeFileSync(regFile, JSON.stringify({ projects }));
+  return { registryFile: regFile, templateFile: tplFile };
+}
+
+test("多个项目同时待接入时，靠引用块里的绑定码精确选中", () => {
+  const f = pendingFixture([{ id: "a", token: "aaaaaa" }, { id: "b", token: "bbbbbb" }]);
+  const content = '<at id="ou_t">M</at>\n\n**[引用]**\n🌉 b\n绑定码    bbbbbb';
+  const r = findPendingBinding({ content, ...f });
+  assert.equal(r.ok, true);
+  assert.equal(r.id, "b");
+  assert.equal(r.matchedBy, "quoted_binding_token");
+});
+
+test("只有一个待接入且没带码 → 走老路，单项目用户行为不变", () => {
+  const f = pendingFixture([{ id: "a", token: "aaaaaa" }]);
+  const r = findPendingBinding({ content: '<at id="ou_t">M</at> 干活', ...f });
+  assert.equal(r.ok, true);
+  assert.equal(r.matchedBy, "only_pending");
+});
+
+test("多个待接入且没带码 → 拒绝，绝不挑一个", () => {
+  const f = pendingFixture([{ id: "a", token: "aaaaaa" }, { id: "b", token: "bbbbbb" }]);
+  const r = findPendingBinding({ content: '<at id="ou_t">M</at> 干活', ...f });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, PROMOTE_REJECT.MULTIPLE_PENDING);
+});
+
+test("码认得出但没人认领 → 明说，不回落去猜", () => {
+  const f = pendingFixture([{ id: "a", token: "aaaaaa" }]);
+  const content = '<at id="ou_t">M</at>\n\n**[引用]**\n绑定码    ffffff';
+  const r = findPendingBinding({ content, ...f });
+  assert.equal(r.reason, PROMOTE_REJECT.TOKEN_UNKNOWN);
+  // 关键：即使只有一份待绑定，认得出码却对不上时也不能回落 ——
+  // 那会在「Frank 在 A 话题说话、待绑定的是 B」时把 B 绑给 A。
+});
+
+test("引用里那串不是十六进制就不算绑定码 —— 安静回落到「只有一份」", () => {
+  const f = pendingFixture([{ id: "a", token: "aaaaaa" }]);
+  const bad = '<at id="ou_t">M</at>\n\n**[引用]**\n绑定码    zzzzzz';
+  assert.deepEqual(bindingTokensInQuote(bad), [], "非 hex 不该被当成码");
+  const r = findPendingBinding({ content: bad, ...f });
+  assert.equal(r.matchedBy, "only_pending", "认不出码就走老路，而不是报一个假的「码不认识」");
+});
+
+test("两个待接入撞了同一个码，或引用里多个码 → 都 fail-closed", () => {
+  const dup = pendingFixture([{ id: "a", token: "abc123" }, { id: "b", token: "abc123" }]);
+  const c1 = '<at id="ou_t">M</at>\n\n**[引用]**\n绑定码    abc123';
+  assert.equal(findPendingBinding({ content: c1, ...dup }).reason, PROMOTE_REJECT.TOKEN_DUPLICATED);
+
+  const f = pendingFixture([{ id: "a", token: "aaaaaa" }]);
+  const c2 = '<at id="ou_t">M</at>\n\n**[引用]**\n绑定码    aaaaaa\n绑定码    bbbbbb';
+  assert.equal(findPendingBinding({ content: c2, ...f }).reason, PROMOTE_REJECT.TOKEN_AMBIGUOUS);
 });
 
 // ---------- 汇总 ----------

@@ -1013,25 +1013,21 @@ test("Claude 本地输入与回复进入同一张 Card 2.0，入站回复不显�
   }], { taskName: "Claude 项目", runtime: "claude" });
   assert.equal(validateOutboundCard(paired).ok, true);
   assert.equal(paired.header, undefined);
-  assert.equal(paired.body.elements.length, 3);
-  assert.equal(paired.body.elements[0].element_id, "user_input");
-  assert.match(JSON.stringify(paired.body.elements[0]), /你的输入/u);
+  assert.equal(paired.body.elements.length, 2);
+  assert.equal(paired.body.elements[0].element_id, "user_quote");
+  assert.equal(paired.body.elements[0].text_size, "notation");
   assert.match(JSON.stringify(paired.body.elements[0]), /请继续开发/u);
   assert.equal(paired.body.elements[1].element_id, "agent_reply");
-  assert.match(JSON.stringify(paired.body.elements[1]), /Claude 回复/u);
-  assert.equal(paired.body.elements[2].element_id, "bridge_meta");
-  assert.match(JSON.stringify(paired.body.elements[2]), /Claude 项目/u);
-  assert.match(JSON.stringify(paired.body.elements[2]), /Claude/u);
-  assert.equal(JSON.stringify(paired.body.elements[2]).includes("自动回写"), false);
+  assert.match(JSON.stringify(paired.body.elements[1]), /Claude 已完成/u);
+  assert.equal(JSON.stringify(paired).includes("Claude 回复"), false);
   assert.equal(paired.config.summary.content, "请继续开发");
 
   const inbound = composeOutboundCard([{
     kind: "reply", text: "飞书消息执行完成",
   }], { taskName: "Claude 项目", runtime: "claude" });
-  assert.equal(inbound.body.elements.length, 2);
-  assert.equal(JSON.stringify(inbound).includes("你的输入"), false);
+  assert.equal(inbound.body.elements.length, 1);
+  assert.equal(JSON.stringify(inbound).includes("user_quote"), false);
   assert.equal(inbound.body.elements[0].element_id, "agent_reply");
-  assert.equal(inbound.body.elements[1].element_id, "bridge_meta");
   assert.equal(inbound.config.summary.content, "飞书消息执行完成");
 });
 

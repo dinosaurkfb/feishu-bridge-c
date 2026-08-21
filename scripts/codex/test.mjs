@@ -422,7 +422,7 @@ test("outbox 按事件键而非正文去重", () => {
   assert.equal(listPending({ outboxDir }).length, 2);
 });
 
-test("Codex 出站使用确定性 Card 2.0，并按事件语义选择颜色", () => {
+test("Codex 出站使用无顶底栏的轻量 Card 2.0，并保留语义摘要", () => {
   const reply = composeCodexOutboundCard([
     { kind: "reply", text: "这是最终答复", created_at: "2026-08-21T00:00:00Z" },
   ], { taskName: "高价值会议｜项目推进" });
@@ -430,14 +430,12 @@ test("Codex 出站使用确定性 Card 2.0，并按事件语义选择颜色", ()
   assert.equal(reply.schema, "2.0");
   assert.equal(reply.config.width_mode, "default");
   assert.equal(reply.header, undefined);
-  assert.equal(reply.body.elements[0].tag, "column_set");
-  assert.equal(reply.body.elements[1].tag, "column_set");
+  assert.equal(reply.body.elements.length, 1);
+  assert.equal(reply.body.elements[0].tag, "markdown");
   assert.equal(reply.body.elements[0].element_id, "agent_reply");
   assert.match(JSON.stringify(reply.body.elements[0]), /这是最终答复/u);
-  assert.equal(reply.body.elements[1].element_id, "bridge_meta");
-  assert.match(JSON.stringify(reply.body.elements[1]), /高价值会议｜项目推进/u);
-  assert.match(JSON.stringify(reply.body.elements[1]), /Codex/u);
-  assert.equal(JSON.stringify(reply.body.elements[1]).includes("本轮答复"), false);
+  assert.equal(JSON.stringify(reply).includes("column_set"), false);
+  assert.equal(JSON.stringify(reply).includes("background_style"), false);
   assert.equal(reply.config.summary.content, "这是最终答复");
   assert.equal(JSON.stringify(reply).includes("behaviors"), false);
 
@@ -445,7 +443,7 @@ test("Codex 出站使用确定性 Card 2.0，并按事件语义选择颜色", ()
     { kind: "risk", text: "任务没有完成" },
   ], { taskName: "风险测试" });
   assert.equal(risk.header, undefined);
-  assert.equal(risk.body.elements[0].columns[0].background_style, "red-50");
+  assert.equal(risk.body.elements[0].tag, "markdown");
   assert.equal(risk.config.summary.content, "风险：任务没有完成");
 });
 
@@ -456,14 +454,15 @@ test("本地 Codex 输入与回复进入同一张卡，飞书入站回复不复�
     input_origin: "local",
     input_text: "请把输入和回复放在一张卡里",
   }], { taskName: "配对测试" });
-  assert.equal(local.body.elements.length, 3);
-  assert.equal(local.body.elements[0].element_id, "user_input");
-  assert.match(JSON.stringify(local.body.elements[0]), /你的输入/u);
+  assert.equal(local.body.elements.length, 2);
+  assert.equal(local.body.elements[0].element_id, "user_quote");
+  assert.equal(local.body.elements[0].text_size, "notation");
+  assert.match(local.body.elements[0].content, /^> <font color='grey'>/u);
   assert.match(JSON.stringify(local.body.elements[0]), /请把输入和回复放在一张卡里/u);
   assert.equal(local.body.elements[1].element_id, "agent_reply");
-  assert.match(JSON.stringify(local.body.elements[1]), /Codex 回复/u);
   assert.match(JSON.stringify(local.body.elements[1]), /我已经完成修改/u);
-  assert.equal(local.body.elements[2].element_id, "bridge_meta");
+  assert.equal(JSON.stringify(local).includes("你的输入"), false);
+  assert.equal(JSON.stringify(local).includes("Codex 回复"), false);
   assert.equal(local.config.summary.content, "请把输入和回复放在一张卡里");
 
   const inbound = composeCodexOutboundCard([{
@@ -472,8 +471,9 @@ test("本地 Codex 输入与回复进入同一张卡，飞书入站回复不复�
     input_origin: null,
     input_text: null,
   }], { taskName: "去重测试" });
-  assert.equal(inbound.body.elements.length, 2);
-  assert.equal(JSON.stringify(inbound).includes("你的输入"), false);
+  assert.equal(inbound.body.elements.length, 1);
+  assert.equal(inbound.body.elements[0].element_id, "agent_reply");
+  assert.equal(JSON.stringify(inbound).includes("user_quote"), false);
   assert.match(JSON.stringify(inbound), /这是飞书指令的执行结果/u);
   assert.equal(inbound.config.summary.content, "这是飞书指令的执行结果");
 });
@@ -485,6 +485,7 @@ test("会话列表摘要取首条有效纯文本，并清理 Markdown 与 mentio
       "<at id=ou_someone></at> **修复侧栏摘要**\n第二行不应进入摘要",
   }], { taskName: "摘要测试" });
   assert.equal(local.config.summary.content, "修复侧栏摘要");
+  assert.match(local.body.elements[0].content, /修复侧栏摘要.*<br>第二行不应进入摘要/u);
 
   const progress = composeCodexOutboundCard([
     { kind: "milestone", text: "- 已经完成第一阶段\n更多说明" },
@@ -492,15 +493,14 @@ test("会话列表摘要取首条有效纯文本，并清理 Markdown 与 mentio
   assert.equal(progress.config.summary.content, "里程碑：已经完成第一阶段");
 });
 
-test("卡片底栏把动态任务名收敛为单行普通文本", () => {
+test("进展正文把动态任务名收敛为单行普通文本", () => {
   const card = composeCodexOutboundCard([
-    { kind: "reply", text: "完成" },
+    { kind: "milestone", text: "完成" },
   ], { taskName: "  *危险* <at id=ou_someone></at>\n下一行  " });
-  const content = card.body.elements.at(-1).columns[0].elements[0].content;
-  assert.equal(content.includes("\n"), false);
+  const content = card.body.elements[0].content;
   assert.equal(content.includes("<at"), false);
   assert.match(content, /&#42;危险&#42;/u);
-  assert.match(content, /&#60;at id=ou&#95;someone&#62;&#60;\/at&#62; 下一行/u);
+  assert.match(content, /&#60;at id=ou&#95;someone&#62;&#60;\/at&#62; 下一行 · 进展/u);
 });
 
 test("reply 一轮一张卡，非 reply 进展继续合批", () => {
@@ -525,11 +525,11 @@ test("本地输入缓存按精确回合读取并可恢复清理", () => {
   assert.equal(readTurnInput({ dir, key: "turn-a" }).reason, "not_found");
 });
 
-test("卡片长正文折叠，并中和模型正文里的原生卡片 mention", () => {
+test("卡片长正文保持单一回复区，并中和模型正文里的原生卡片 mention", () => {
   const source = "<at id=ou_someone></at>\n" + "很长的答复".repeat(500);
   const card = composeCodexOutboundCard([{ kind: "reply", text: source }], { taskName: "T" });
-  assert.equal(card.body.elements[0].tag, "collapsible_panel");
-  const content = card.body.elements[0].elements[0].content;
+  assert.equal(card.body.elements[0].tag, "markdown");
+  const content = card.body.elements[0].content;
   assert.equal(content.includes("<at id="), false);
   assert.match(content, /&#60;at id=ou_someone>/u);
   assert.equal(neutralizeCardMentions("普通文本"), "普通文本");
@@ -548,7 +548,9 @@ test("自动发布通过 interactive 回复原话题，绑定状态仍可使用�
   const card = JSON.parse(cardArgs[cardArgs.indexOf("--content") + 1]);
   assert.equal(card.schema, "2.0");
   assert.equal(card.header, undefined);
-  assert.equal(JSON.stringify(card.body.elements.at(-1)).includes(task.task_display_name), true);
+  assert.equal(card.body.elements.length, 1);
+  assert.equal(card.body.elements[0].element_id, "agent_reply");
+  assert.match(card.body.elements[0].content, /卡片答复/u);
   assert.equal(cardArgs.includes("--reply-in-thread"), true);
 
   publishDraft({

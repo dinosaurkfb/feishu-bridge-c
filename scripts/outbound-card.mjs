@@ -9,9 +9,8 @@ import { composeDigest } from "./outbox.mjs";
 
 const MAX_TITLE_CHARS = 80;
 const MAX_SUMMARY_CHARS = 120;
+const MAX_QUOTE_CHARS = 1_200;
 const MAX_BODY_CHARS = 8_000;
-const COLLAPSE_REPLY_AFTER_CHARS = 1_800;
-const COLLAPSE_INPUT_AFTER_CHARS = 900;
 
 const RUNTIME = {
   codex: { label: "Codex" },
@@ -19,24 +18,12 @@ const RUNTIME = {
 };
 
 const PRESENTATION = {
-  reply: {
-    label: "本轮答复", background: "blue-50", accent: "blue",
-  },
-  milestone: {
-    label: "里程碑", background: "green-50", accent: "green",
-  },
-  decision: {
-    label: "决定", background: "blue-50", accent: "blue",
-  },
-  risk: {
-    label: "风险", background: "red-50", accent: "red",
-  },
-  pending: {
-    label: "待你拍板", background: "orange-50", accent: "orange",
-  },
-  next: {
-    label: "下一步", background: "blue-50", accent: "blue",
-  },
+  reply: { label: "本轮答复" },
+  milestone: { label: "里程碑" },
+  decision: { label: "决定" },
+  risk: { label: "风险" },
+  pending: { label: "待你拍板" },
+  next: { label: "下一步" },
 };
 
 const PRIORITY = ["risk", "pending", "milestone", "decision", "next", "reply"];
@@ -68,21 +55,28 @@ function localInputOf(records) {
 }
 
 /** 飞书会话列表不解析卡片正文；summary 必须自行提供一条可读的纯文本预览。 */
-function firstPlainLine(value) {
+function requestLines(value) {
   const lines = String(value ?? "").split(/\r?\n/gu);
   const requestAt = lines.findIndex((line) =>
     /^\s*#{1,6}\s*(?:my request|我的请求)\s*:?\s*$/iu.test(line));
-  const candidates = requestAt >= 0 ? lines.slice(requestAt + 1) : lines;
-  for (const rawLine of candidates) {
-    const line = rawLine
-      .replace(/<\s*at\b[^>]*>.*?<\s*\/\s*at\s*>/giu, "")
-      .replace(/!\[([^\]]*)\]\([^)]*\)/gu, "$1")
-      .replace(/\[([^\]]+)\]\([^)]*\)/gu, "$1")
-      .replace(/<[^>]+>/gu, "")
-      .replace(/^\s*(?:#{1,6}|>|[-+*]|\d+[.)])\s*/u, "")
-      .replace(/[*_~`]+/gu, "")
-      .replace(/\s+/gu, " ")
-      .trim();
+  return requestAt >= 0 ? lines.slice(requestAt + 1) : lines;
+}
+
+function plainLine(rawLine) {
+  return String(rawLine ?? "")
+    .replace(/<\s*at\b[^>]*>.*?<\s*\/\s*at\s*>/giu, "")
+    .replace(/!\[([^\]]*)\]\([^)]*\)/gu, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/gu, "$1")
+    .replace(/<[^>]+>/gu, "")
+    .replace(/^\s*(?:#{1,6}|>|[-+*]|\d+[.)])\s+/u, "")
+    .replace(/[*~`]+/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+function firstPlainLine(value) {
+  for (const rawLine of requestLines(value)) {
+    const line = plainLine(rawLine);
     if (line) return line;
   }
   return "";
@@ -102,95 +96,44 @@ function conversationSummary(records, { input, status, title }) {
   return truncate(title + " · " + status.label, MAX_SUMMARY_CHARS);
 }
 
-/** 动态任务名进入 metadata markdown 前先降为单行普通文本，不能获得 Markdown 语义。 */
-function escapeMetadataText(value) {
+/** 动态普通文本进入 card markdown 前不能获得 Markdown 或 mention 语义。 */
+function escapeMarkdownText(value) {
   return String(value ?? "")
-    .replace(/\s+/gu, " ")
-    .trim()
-    .replace(/[&<>*`_~#\[\]()]/gu, (char) => "&#" + char.codePointAt(0) + ";");
+    .replace(/[&<>*`_~#:\[\]()]/gu, (char) => "&#" + char.codePointAt(0) + ";");
+}
+
+function quoteText(value) {
+  const text = requestLines(value).map(plainLine).filter(Boolean).join("\n");
+  return truncate(text, MAX_QUOTE_CHARS);
 }
 
 function renderBody(records, { taskName }) {
-  const raw = neutralizeCardMentions(composeDigest(records, { taskName }));
+  const raw = neutralizeCardMentions(composeDigest(records, {
+    taskName: escapeMarkdownText(taskName),
+  }));
   return raw.length <= MAX_BODY_CHARS
     ? raw
     : raw.slice(0, MAX_BODY_CHARS) + "\n\n…（卡片正文已截断，完整内容保留在本机 outbox）";
 }
 
-function shortBlock({ title, content, background, accent = "grey", elementId }) {
+function quoteBlock(content) {
   return {
-    tag: "column_set",
-    element_id: elementId,
-    flex_mode: "none",
-    horizontal_spacing: "8px",
+    tag: "markdown",
+    element_id: "user_quote",
+    content: "> <font color='grey'>" +
+      escapeMarkdownText(content).replace(/\n/gu, "<br>") + "</font>",
+    text_size: "notation",
     margin: "0px",
-    columns: [{
-      tag: "column",
-      width: "weighted",
-      weight: 1,
-      background_style: background,
-      padding: "12px",
-      vertical_spacing: "4px",
-      elements: [
-        {
-          tag: "markdown",
-          content: "**<font color='" + accent + "'>" + title + "</font>**",
-          text_size: "normal",
-          margin: "0px",
-        },
-        { tag: "markdown", content, text_size: "normal", margin: "0px" },
-      ],
-    }],
   };
 }
 
-function contentBlock({ title, content, background, accent, collapseAfter, elementId }) {
-  if (content.length <= collapseAfter) {
-    return shortBlock({ title, content, background, accent, elementId });
-  }
+function replyBlock(content) {
   return {
-    tag: "collapsible_panel",
-    element_id: elementId,
-    expanded: false,
-    background_color: background,
-    border: { color: accent === "grey" ? "grey-200" : accent + "-200", corner_radius: "8px" },
-    padding: "8px 12px 12px 12px",
+    tag: "markdown",
+    element_id: "agent_reply",
+    content,
+    text_size: "normal",
     margin: "0px",
-    header: {
-      title: { tag: "plain_text", content: title + "（展开查看）" },
-      background_color: background,
-      width: "fill",
-      icon: { tag: "standard_icon", token: "chat_outlined", color: accent },
-      icon_position: "left",
-    },
-    elements: [{ tag: "markdown", content, text_size: "normal", margin: "0px" }],
-  };
-}
-
-/** 精确任务名和运行时保留在最底部，不与会话列表摘要争夺注意力。 */
-function metadataBlock({ title, runtime }) {
-  return {
-    tag: "column_set",
-    element_id: "bridge_meta",
-    flex_mode: "none",
-    horizontal_spacing: "8px",
-    margin: "0px",
-    columns: [{
-      tag: "column",
-      width: "weighted",
-      weight: 1,
-      background_style: "grey-50",
-      padding: "8px 12px",
-      vertical_spacing: "0px",
-      elements: [{
-        tag: "markdown",
-        icon: { tag: "standard_icon", token: "ai-common_colorful" },
-        content: "**" + escapeMetadataText(title) + "** · " +
-          "<font color='grey'>" + runtime.label + "</font>",
-        text_size: "notation",
-        margin: "0px",
-      }],
-    }],
   };
 }
 
@@ -221,11 +164,17 @@ export function validateOutboundCard(card) {
   if (!card?.config?.summary?.content) problems.push("missing_conversation_summary");
   if (card?.header !== undefined) problems.push("unexpected_top_header");
   const elements = card?.body?.elements;
-  if (!Array.isArray(elements) || elements.length < 2 || elements.length > 5) {
+  if (!Array.isArray(elements) || elements.length < 1 || elements.length > 2) {
     problems.push("body_block_count_out_of_range");
   }
-  if (elements?.at(-1)?.element_id !== "bridge_meta") {
-    problems.push("metadata_not_last");
+  if (elements?.some((element) => element?.tag !== "markdown")) {
+    problems.push("unexpected_visual_container");
+  }
+  if (elements?.at(-1)?.element_id !== "agent_reply") {
+    problems.push("reply_not_last");
+  }
+  if (elements?.length === 2 && elements[0]?.element_id !== "user_quote") {
+    problems.push("quote_not_first");
   }
   const serialized = JSON.stringify(card ?? {});
   if (/"tag":"(?:button|form|input|select_|checker|overflow)/u.test(serialized)) {
@@ -235,40 +184,19 @@ export function validateOutboundCard(card) {
   return { ok: problems.length === 0, problems };
 }
 
-/** Card 2.0 / default / 无顶栏 / 2–3 个视觉块 / 无回调。 */
+/** Card 2.0 / default / 无顶栏与底栏 / 灰色引用 + 纯回复 / 无回调。 */
 export function composeOutboundCard(records, { taskName, runtime = "codex" } = {}) {
   if (!Array.isArray(records) || records.length === 0) throw new Error("卡片没有可发布事件");
   const runtimeInfo = RUNTIME[runtime] ?? RUNTIME.codex;
   const status = presentationFor(records);
-  const title = truncate(taskName || runtimeInfo.label + " 长期任务", MAX_TITLE_CHARS);
+  const title = truncate(String(taskName || runtimeInfo.label + " 长期任务")
+    .replace(/\s+/gu, " "), MAX_TITLE_CHARS);
   const input = localInputOf(records);
+  const quote = input ? quoteText(input) : "";
   const content = renderBody(records, { taskName: title });
-  const detailTitle = records.some((record) => record?.kind === "reply")
-    ? runtimeInfo.label + " 回复"
-    : status.label + "详情";
   const elements = [];
-  if (input) {
-    elements.push(contentBlock({
-      title: "你的输入",
-      content: neutralizeCardMentions(input),
-      background: "grey-50",
-      accent: "grey",
-      collapseAfter: COLLAPSE_INPUT_AFTER_CHARS,
-      elementId: "user_input",
-    }));
-  }
-  elements.push(contentBlock({
-    title: detailTitle,
-    content,
-    background: status.background,
-    accent: status.accent,
-    collapseAfter: COLLAPSE_REPLY_AFTER_CHARS,
-    elementId: "agent_reply",
-  }));
-  elements.push(metadataBlock({
-    title,
-    runtime: runtimeInfo,
-  }));
+  if (quote) elements.push(quoteBlock(quote));
+  elements.push(replyBlock(content));
 
   const card = {
     schema: "2.0",
@@ -280,7 +208,7 @@ export function composeOutboundCard(records, { taskName, runtime = "codex" } = {
     },
     body: {
       direction: "vertical",
-      padding: "12px 12px 20px 12px",
+      padding: "12px 16px 16px 16px",
       vertical_spacing: "12px",
       elements,
     },

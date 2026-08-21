@@ -429,20 +429,22 @@ test("Codex 出站使用确定性 Card 2.0，并按事件语义选择颜色", ()
   assert.equal(validateCodexOutboundCard(reply).ok, true);
   assert.equal(reply.schema, "2.0");
   assert.equal(reply.config.width_mode, "default");
-  assert.equal(reply.header.title.content, "高价值会议｜项目推进");
-  assert.equal(reply.header.template, "blue");
-  assert.equal(reply.header.text_tag_list[0].text.content, "本轮答复");
+  assert.equal(reply.header, undefined);
   assert.equal(reply.body.elements[0].tag, "column_set");
   assert.equal(reply.body.elements[1].tag, "column_set");
-  assert.match(JSON.stringify(reply.body.elements[1]), /这是最终答复/u);
+  assert.equal(reply.body.elements[0].element_id, "agent_reply");
+  assert.match(JSON.stringify(reply.body.elements[0]), /这是最终答复/u);
+  assert.equal(reply.body.elements[1].element_id, "bridge_meta");
+  assert.match(JSON.stringify(reply.body.elements[1]), /高价值会议｜项目推进/u);
+  assert.match(JSON.stringify(reply.body.elements[1]), /本轮答复/u);
   assert.equal(JSON.stringify(reply).includes("behaviors"), false);
 
   const risk = composeCodexOutboundCard([
     { kind: "risk", text: "任务没有完成" },
   ], { taskName: "风险测试" });
-  assert.equal(risk.header.template, "red");
-  assert.equal(risk.header.text_tag_list[0].text.content, "风险");
+  assert.equal(risk.header, undefined);
   assert.equal(risk.body.elements[0].columns[0].background_style, "red-50");
+  assert.match(JSON.stringify(risk.body.elements.at(-1)), /text_tag color='red'>风险/u);
 });
 
 test("本地 Codex 输入与回复进入同一张卡，飞书入站回复不复读原消息", () => {
@@ -453,10 +455,13 @@ test("本地 Codex 输入与回复进入同一张卡，飞书入站回复不复�
     input_text: "请把输入和回复放在一张卡里",
   }], { taskName: "配对测试" });
   assert.equal(local.body.elements.length, 3);
-  assert.match(JSON.stringify(local.body.elements[1]), /你的输入/u);
-  assert.match(JSON.stringify(local.body.elements[1]), /请把输入和回复放在一张卡里/u);
-  assert.match(JSON.stringify(local.body.elements[2]), /Codex 回复/u);
-  assert.match(JSON.stringify(local.body.elements[2]), /我已经完成修改/u);
+  assert.equal(local.body.elements[0].element_id, "user_input");
+  assert.match(JSON.stringify(local.body.elements[0]), /你的输入/u);
+  assert.match(JSON.stringify(local.body.elements[0]), /请把输入和回复放在一张卡里/u);
+  assert.equal(local.body.elements[1].element_id, "agent_reply");
+  assert.match(JSON.stringify(local.body.elements[1]), /Codex 回复/u);
+  assert.match(JSON.stringify(local.body.elements[1]), /我已经完成修改/u);
+  assert.equal(local.body.elements[2].element_id, "bridge_meta");
 
   const inbound = composeCodexOutboundCard([{
     kind: "reply",
@@ -467,6 +472,17 @@ test("本地 Codex 输入与回复进入同一张卡，飞书入站回复不复�
   assert.equal(inbound.body.elements.length, 2);
   assert.equal(JSON.stringify(inbound).includes("你的输入"), false);
   assert.match(JSON.stringify(inbound), /这是飞书指令的执行结果/u);
+});
+
+test("卡片底栏把动态任务名收敛为单行普通文本", () => {
+  const card = composeCodexOutboundCard([
+    { kind: "reply", text: "完成" },
+  ], { taskName: "  *危险* <at id=ou_someone></at>\n下一行  " });
+  const content = card.body.elements.at(-1).columns[0].elements[0].content;
+  assert.equal(content.includes("\n"), false);
+  assert.equal(content.includes("<at"), false);
+  assert.match(content, /&#42;危险&#42;/u);
+  assert.match(content, /&#60;at id=ou&#95;someone&#62;&#60;\/at&#62; 下一行/u);
 });
 
 test("reply 一轮一张卡，非 reply 进展继续合批", () => {
@@ -494,8 +510,8 @@ test("本地输入缓存按精确回合读取并可恢复清理", () => {
 test("卡片长正文折叠，并中和模型正文里的原生卡片 mention", () => {
   const source = "<at id=ou_someone></at>\n" + "很长的答复".repeat(500);
   const card = composeCodexOutboundCard([{ kind: "reply", text: source }], { taskName: "T" });
-  assert.equal(card.body.elements[1].tag, "collapsible_panel");
-  const content = card.body.elements[1].elements[0].content;
+  assert.equal(card.body.elements[0].tag, "collapsible_panel");
+  const content = card.body.elements[0].elements[0].content;
   assert.equal(content.includes("<at id="), false);
   assert.match(content, /&#60;at id=ou_someone>/u);
   assert.equal(neutralizeCardMentions("普通文本"), "普通文本");
@@ -513,7 +529,8 @@ test("自动发布通过 interactive 回复原话题，绑定状态仍可使用�
   assert.equal(cardArgs[cardArgs.indexOf("--msg-type") + 1], "interactive");
   const card = JSON.parse(cardArgs[cardArgs.indexOf("--content") + 1]);
   assert.equal(card.schema, "2.0");
-  assert.equal(card.header.title.content, task.task_display_name);
+  assert.equal(card.header, undefined);
+  assert.equal(JSON.stringify(card.body.elements.at(-1)).includes(task.task_display_name), true);
   assert.equal(cardArgs.includes("--reply-in-thread"), true);
 
   publishDraft({

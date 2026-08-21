@@ -309,3 +309,9 @@ import 十个模块，底座不反向依赖它（有测试守着方向）。
 | 从零安装 Claude Code 飞书桥 | [SETUP.md](SETUP.md) |
 | 查看 Claude 当前运行状态与历史问题 | [STATE.md](STATE.md) |
 | 理解机器级配置字段 | [references/chain-config.example.json](references/chain-config.example.json) |
+
+## TODO
+
+1. **支持多个人类员工与多个 Agent 协作。**允许多个经过授权的人类员工在同一个飞书话题群中，
+   共同管理同一个 Agent，或分别管理不同 Agent。实现时需要补齐人员级身份绑定、用户—Agent—话题
+   授权矩阵、并发指令冲突处理、操作审计归属和权限撤销机制，不能继续沿用当前单一授权发送者模型。

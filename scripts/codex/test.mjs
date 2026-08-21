@@ -11,7 +11,7 @@ import {
   appendEvent, listPending, markPublishEligibleByEventKey, suppressPublishByEventKey,
 } from "../outbox.mjs";
 import { evaluateInbound, REJECT } from "../selector.mjs";
-import { composeCodexBinding, validThreadId } from "./bind-compose.mjs";
+import { composeCodexBinding, resolveBindingTarget, validThreadId } from "./bind-compose.mjs";
 import { readCodexThreadTitle, sanitizeThreadTitle } from "./thread-title.mjs";
 import { updateTextMessage } from "./lark-message.mjs";
 import { classifyRunnerDiagnostic, readCodexRunOutcome, sanitizeCodexRunEnv } from "./handoff.mjs";
@@ -23,7 +23,7 @@ import {
 import {
   enableAutoPublishForAllTasks, extractQuotedBindingTokens, findPendingTask,
   findRegisteredTaskForCodexThread, findTaskForCodexThread, findTaskForFeishuSession,
-  isThreadBusy, loadRegistry, makeTaskEntry, mappingForTask, recordThreadActivity,
+  isThreadBusy, loadCodexTemplate, loadRegistry, makeTaskEntry, mappingForTask, recordThreadActivity, resolveTask,
   setTaskConnectionStatus, setTaskDisplayName, taskPaths, validateCodexTemplate, validateRegistryTasks, writeRegistry,
 } from "./state.mjs";
 
@@ -983,6 +983,99 @@ test("绑定预览为同一 thread 生成稳定逻辑键与平台幂等键", () 
   assert.equal(a.statusText.includes("真实 @M5Codex"), true);
   assert.equal(a.statusText.includes("不需要额外关键字"), true);
   assert.equal(a.statusText.includes("运输 agent"), false);
+});
+
+test("绑定目标默认沿用机器群，显式跨群时要求 chat-id 并隔离平台幂等域", () => {
+  const defaultTarget = resolveBindingTarget({ template: TEMPLATE });
+  const override = resolveBindingTarget({
+    template: TEMPLATE, chatId: "oc_lab", chatName: "智能体进化",
+  });
+  assert.deepEqual(defaultTarget, {
+    ok: true, chatId: TEMPLATE.chat_id, chatName: TEMPLATE.chat_name, overridden: false,
+  });
+  assert.deepEqual(override, {
+    ok: true, chatId: "oc_lab", chatName: "智能体进化", overridden: true,
+  });
+  assert.equal(resolveBindingTarget({ template: TEMPLATE, chatName: "智能体进化" }).reason,
+    "chat_name_without_chat_id");
+  assert.equal(resolveBindingTarget({ template: TEMPLATE, chatId: "wrong" }).reason, "invalid_chat_id");
+
+  const dir = temp();
+  const legacy = composeCodexBinding({ root: dir, threadId: THREAD_A });
+  const lab = composeCodexBinding({ root: dir, threadId: THREAD_A, idempotencyScope: "oc_lab" });
+  const another = composeCodexBinding({ root: dir, threadId: THREAD_A, idempotencyScope: "oc_other" });
+  assert.equal(legacy.token, lab.token);
+  assert.notEqual(legacy.idempotencyKey, lab.idempotencyKey);
+  assert.notEqual(lab.idempotencyKey, another.idempotencyKey);
+});
+
+test("task 级目标群覆盖只进入 Git 外运行映射，不改变机器模板", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const task = makeTaskEntry({
+    root, threadId: THREAD_A, name: "实验主管", rootMessageId: "om_lab", token: "lab",
+    chatId: "oc_lab", chatName: "智能体进化",
+  });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const resolved = findTaskForCodexThread({ threadId: THREAD_A, home });
+  assert.equal(resolved.ok, true);
+  const mapped = mappingForTask(task, { home });
+  assert.equal(mapped.codex_thread_id, THREAD_A);
+  const registered = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home });
+  assert.equal(registered.task.chat_id, "oc_lab");
+  assert.equal(registered.task.chat_name, "智能体进化");
+  const runtime = resolveTask(task, { home });
+  assert.equal(runtime.config.chat_id, "oc_lab");
+  assert.equal(runtime.config.chat_name, "智能体进化");
+  assert.equal(loadCodexTemplate(path.join(home, "chain-config.json")).template.chat_id, TEMPLATE.chat_id);
+});
+
+test("bind-task 显式跨群 apply 把根消息发到目标群并登记该 task 的群", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  const bin = path.join(home, "fake-lark.sh");
+  const calls = path.join(home, "calls.txt");
+  const configBase = path.join(home, "agents");
+  const credentialDir = path.join(configBase, TEMPLATE.agent_uid);
+  fs.mkdirSync(root);
+  fs.mkdirSync(credentialDir, { recursive: true });
+  fs.writeFileSync(path.join(root, "README.md"), "# Lab\n");
+  fs.writeFileSync(path.join(credentialDir, "config.json"), JSON.stringify({
+    apps: [{ name: TEMPLATE.lark_cli_profile, appId: TEMPLATE.transport_app_id }],
+  }));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({
+    ...TEMPLATE, lark_cli_bin: bin, lark_cli_config_base: configBase,
+  }));
+  fs.writeFileSync(bin, [
+    "#!/bin/sh",
+    "printf '%s\\n' \"$*\" >> \"$FAKE_CALLS_FILE\"",
+    "case \"$*\" in",
+    "  *+messages-send*) printf '%s' '{\"ok\":true,\"data\":{\"message_id\":\"om_lab_root\"}}' ;;",
+    "  *) printf '%s' '{\"ok\":true,\"data\":{\"message_id\":\"om_lab_reply\"}}' ;;",
+    "esac",
+  ].join("\n") + "\n", { mode: 0o700 });
+
+  const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
+    "--project", root,
+    "--thread-id", THREAD_A,
+    "--name", "智能体进化｜Aily主动求助验收",
+    "--chat-id", "oc_lab",
+    "--chat-name", "智能体进化",
+    "--apply"], {
+    encoding: "utf-8",
+    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home, FAKE_CALLS_FILE: calls },
+  });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /群\s+智能体进化/u);
+  assert.equal(run.stdout.includes("oc_lab"), false, "stdout 不暴露群 locator");
+  const sent = fs.readFileSync(calls, "utf-8");
+  assert.match(sent, /\+messages-send --chat-id oc_lab/u);
+  const task = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
+  assert.equal(task.root_message_id, "om_lab_root");
+  assert.equal(task.chat_id, "oc_lab");
+  assert.equal(task.chat_name, "智能体进化");
 });
 
 test("同一项目的两个 Codex task 用 Desktop 标题和短码形成不同的可见话题名", () => {

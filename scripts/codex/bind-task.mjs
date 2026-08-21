@@ -6,7 +6,9 @@ import path from "node:path";
 
 import { resolveLarkIdentity } from "../chain-template.mjs";
 import { publishDraft, sendToChat } from "../outbound.mjs";
-import { composeCodexBinding, displayThread, resolveThreadId } from "./bind-compose.mjs";
+import {
+  composeCodexBinding, displayThread, resolveBindingTarget, resolveThreadId,
+} from "./bind-compose.mjs";
 import { updateTextMessage } from "./lark-message.mjs";
 import {
   addTask, findRegisteredTaskForCodexThread, loadCodexTemplate, makeTaskEntry,
@@ -77,11 +79,22 @@ if (existing.ok) {
 }
 const tpl = loadCodexTemplate();
 if (!tpl.ok) die("Codex 单智能体模板不可用（" + tpl.reason + "）");
-const d = composeCodexBinding({ root, threadId: thread.threadId, nameOverride: arg("name") });
+const target = resolveBindingTarget({
+  template: tpl.template,
+  chatId: arg("chat-id"),
+  chatName: arg("chat-name"),
+});
+if (!target.ok) die("无法确定绑定目标群（" + target.reason + "）");
+const d = composeCodexBinding({
+  root,
+  threadId: thread.threadId,
+  nameOverride: arg("name"),
+  idempotencyScope: target.overridden ? target.chatId : undefined,
+});
 
 console.log("任务      " + d.name + "  " + d.logicalTaskKey);
 console.log("Codex     " + displayThread(thread.threadId));
-console.log("群        " + tpl.template.chat_name);
+console.log("群        " + target.chatName);
 console.log("唯一身份  " + tpl.template.transport_agent_name);
 console.log("\n--- 根消息 ---\n" + d.rootText);
 console.log("\n--- 底下第一条 ---\n" + d.statusText);
@@ -95,7 +108,7 @@ let rootMessageId;
 try {
   rootMessageId = sendToChat({
     profile: identity.profile,
-    chatId: tpl.template.chat_id,
+    chatId: target.chatId,
     text: d.rootText,
     idempotencyKey: d.idempotencyKey,
     larkBin: identity.bin,
@@ -114,6 +127,8 @@ const task = makeTaskEntry({
   rootMessageId,
   token: d.token,
   inboundPrefix: tpl.template.inbound_prefix,
+  chatId: target.chatId,
+  chatName: target.chatName,
 });
 const added = addTask(task);
 if (!added.ok) die("话题已建，但登记表没写成：" + added.reason +

@@ -212,6 +212,8 @@ export function resolveTask(task, { home = bridgeHome(), templatePath = template
     projectRoot: task.root,
     displayName: task.task_display_name ?? task.name,
   });
+  if (typeof task.chat_id === "string" && task.chat_id) config.chat_id = task.chat_id;
+  if (typeof task.chat_name === "string" && task.chat_name) config.chat_name = task.chat_name;
   config.logical_task_key = task.logical_task_key;
   config.runtime = "codex";
   // 已安装的新合同按轮自动发布；旧登记在安装器显式迁移前保持 false，避免代码更新本身
@@ -422,7 +424,7 @@ export function logicalTaskKeyFor(root, threadId) {
 
 export function makeTaskEntry({
   root, threadId, name, purpose, rootMessageId, token,
-  inboundPrefix = DEFAULT_INBOUND_PREFIX, now = Date.now(),
+  inboundPrefix = DEFAULT_INBOUND_PREFIX, chatId, chatName, now = Date.now(),
 }) {
   const logicalTaskKey = logicalTaskKeyFor(root, threadId);
   return {
@@ -434,6 +436,8 @@ export function makeTaskEntry({
     purpose: purpose ?? null,
     codex_thread_id: threadId,
     root_message_id: rootMessageId,
+    ...(typeof chatId === "string" && chatId ? { chat_id: chatId } : {}),
+    ...(typeof chatName === "string" && chatName ? { chat_name: chatName } : {}),
     status: "active",
     inbound_state: "pending",
     pending_token: token,

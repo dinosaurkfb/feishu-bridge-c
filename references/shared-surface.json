@@ -1,0 +1,97 @@
+{
+  "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
+  "generated_at": "2026-08-21T00:01:53.387Z",
+  "modules": {
+    "bind-compose.mjs": [
+      "DEFAULT_TERM_MS",
+      "IDENTITY_FILES",
+      "PURPOSE_MAX",
+      "bindingToken",
+      "composeRootMessage",
+      "composeStatusMessage",
+      "firstSentence",
+      "idempotencyKeyFor",
+      "newRegistryEntry",
+      "readProjectIdentity"
+    ],
+    "chain-template.mjs": [
+      "CHAIN_FIELDS",
+      "DEFAULT_CONFIG_BASE",
+      "DEFAULT_TEMPLATE",
+      "OPTIONAL_CHAIN_FIELDS",
+      "PROJECT_FIELDS",
+      "assertPublishIdentity",
+      "identityErrorText",
+      "loadChainTemplate",
+      "materializeProjectConfig",
+      "resolveLarkIdentity",
+      "templatePath",
+      "validateChainTemplate"
+    ],
+    "claim.mjs": [
+      "CLAIM_STATE",
+      "acquireClaim",
+      "claimKey",
+      "readClaim",
+      "recordClaimState"
+    ],
+    "envelope.mjs": [
+      "ENV",
+      "FETCH_BACKOFF_MS",
+      "RECENT_TURNS",
+      "buildEventsArgs",
+      "fetchTriggerEvent"
+    ],
+    "handoff.mjs": [
+      "acquireSessionLock",
+      "handOff",
+      "isLockStale",
+      "readRunOutcome",
+      "releaseSessionLock",
+      "stampSessionLock"
+    ],
+    "outbound.mjs": [
+      "buildDraft",
+      "markPublished",
+      "publishDraft",
+      "scanRuns",
+      "sendToChat"
+    ],
+    "outbox.mjs": [
+      "KINDS",
+      "KIND_LABEL",
+      "MAX_REPLY_CHARS",
+      "appendEvent",
+      "composeDigest",
+      "listPending",
+      "markPublishEligibleByEventKey",
+      "markSent",
+      "suppressPublishByEventKey"
+    ],
+    "registry.mjs": [
+      "DEFAULT_REGISTRY",
+      "acquirePublishLock",
+      "attributeSession",
+      "fileContainsAny",
+      "isPublishLockStale",
+      "isUnder",
+      "loadRegistry",
+      "registryPath",
+      "releasePublishLock"
+    ],
+    "selector.mjs": [
+      "NO_PREFIX",
+      "REJECT",
+      "REJECT_TEXT",
+      "UNLIMITED",
+      "evaluateInbound",
+      "extractMentionIds",
+      "isValidPrefix",
+      "isValidQuota",
+      "normalizeBody"
+    ],
+    "stop-hook.mjs": [
+      "extractReply"
+    ]
+  }
+}

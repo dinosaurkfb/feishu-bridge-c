@@ -42,6 +42,14 @@ import {
 import { mappingFromRegistryEntry, resolveProject } from "./project-resolve.mjs";
 import { composeAsk, isInitPrompt } from "./init-hook.mjs";
 import {
+  currentSurface, diffSurface, loadSnapshot, sharedModules,
+} from "./shared-surface.mjs";
+
+// 顶层 await 先把导出面读出来，让下面那条测试保持**同步**。
+// test() 跑器是同步的：给它一个 async 函数，fn() 只会返回一个 promise 而不会抛，
+// 于是断言失败也会被记成通过 —— 这个仓库已经栽过一次「报绿而实际红」，不能再来一次。
+const LIVE_SURFACE = await currentSurface();
+import {
   PENDING_WINDOW_MS, PROMOTE_REJECT, appendConsumed, evaluatePromotion,
   findBindingForSession, findPendingBinding, loadConsumed, promoteBinding,
 } from "./inbound-route.mjs";
@@ -1840,6 +1848,39 @@ test("Claude 不依赖 scripts/codex/ 里的任何东西", () => {
     assert.ok(!/from\s+["'][^"']*codex\//.test(src),
       f + " 不该 import codex 目录 —— 依赖必须是单向的（codex 依赖共用代码，不能反过来）");
   }
+});
+
+// ---------- 共用面快照：让「共用代码被悄悄扩大」变成一次必须过目的评审 ----------
+
+test("共用模块清单是从代码数出来的，不是手写的", () => {
+  const mods = sharedModules();
+  assert.ok(mods.length > 0, "适配层存在时应当数得出共用模块");
+  assert.ok(mods.includes("outbox.mjs"), "outbox 是已知的接触面");
+  // 手写清单会漏：适配层哪天多 import 一个模块，清单不会自己长出来，
+  // 而那个新进来的模块正好是没人守着的那个。
+  assert.deepEqual(mods, [...mods].sort(), "清单要稳定排序，否则快照会有假差异");
+});
+
+test("共用模块的导出面与快照一致", () => {
+  const snapshot = loadSnapshot();
+  assert.ok(snapshot, "缺快照：跑 node scripts/shared-surface.mjs --update");
+  const problems = diffSurface(snapshot, LIVE_SURFACE);
+  assert.deepEqual(problems, [],
+    "共用面变了。这不一定是错，但必须是有人点头的决定 —— 确认后跑 --update 认下来");
+});
+
+test("导出变多会被抓到 —— 这是最值得停下来看的一种", () => {
+  const before = { "outbox.mjs": ["appendEvent", "listPending"] };
+  const after = { "outbox.mjs": ["appendEvent", "listPending", "markPublishEligibleByEventKey"] };
+  const p = diffSurface(before, after);
+  assert.equal(p.length, 1);
+  assert.equal(p[0].kind, "export_added");
+  assert.deepEqual(p[0].names, ["markPublishEligibleByEventKey"]);
+});
+
+test("导出变少、以及新增一个此前没有契约保护的共用模块，都会被抓到", () => {
+  assert.equal(diffSurface({ "a.mjs": ["x", "y"] }, { "a.mjs": ["x"] })[0].kind, "export_removed");
+  assert.equal(diffSurface({}, { "new.mjs": ["x"] })[0].kind, "new_shared_module");
 });
 
 // ---------- 汇总 ----------

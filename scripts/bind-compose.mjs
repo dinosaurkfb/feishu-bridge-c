@@ -22,7 +22,7 @@ export const DEFAULT_TERM_MS = 365 * DAY_MS;
 
 const sha = (s) => crypto.createHash("sha256").update(s).digest("hex");
 
-/** 给人看的短码，进根消息正文。将来靠它做确定性匹配（见 composeRootMessage 的注释）。 */
+/** 给人看的短码，进根消息正文；Codex 首次绑定会从 Aily 附带的根消息引用中精确匹配它。 */
 export const bindingToken = (root) => sha(root).slice(0, 6);
 
 /** 平台侧幂等键。同一个项目路径永远算出同一个键，所以重跑不会多建一个话题。上限 50 字符。 */
@@ -132,10 +132,9 @@ export function readProjectIdentity({ root, files = IDENTITY_FILES }) {
  * 正常运行不依赖后续编辑，所以里面一个字都不能是「当前进度」。出站通没通、入站通没通都是状态，
  * 状态放在它底下的回复里（后来的回复能盖掉前面的）；根消息只说这个话题是什么。
  *
- * 绑定码现在没有代码读它。留着是因为：入站事件里没有任何飞书 locator（selector.mjs 开头
- * 记着的实测结论），将来要把「第一次 @ 认领哪个待绑定」从「全机只有一份」升级成确定性匹配，
- * 唯一可用的信号就是回复时飞书自动附带的引用块 —— 那里面会带上这行字。
- * 从第一天写进去，将来升级不用迁移已经建好的话题。
+ * 入站事件里没有任何飞书 locator（selector.mjs 开头记着的实测结论）。Codex 首次绑定会从
+ * Aily 自动附带的根消息引用中读取这行短码，在同时存在多个 pending task 时确定性选中目标；
+ * 绑定完成后仍回到 sessionID 路由。Claude 根消息也保留同一信号，不影响其既有行为。
  */
 export function composeRootMessage({ name, heading = name, purpose, root, token }) {
   const lines = ["🌉 " + heading];

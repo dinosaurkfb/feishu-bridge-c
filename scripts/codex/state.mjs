@@ -332,15 +332,47 @@ const pendingDeadline = (task) => {
   return Number.isFinite(bound) ? bound + PENDING_WINDOW_MS : 0;
 };
 
-export function findPendingTask({ home = bridgeHome(), now = Date.now() } = {}) {
+/**
+ * Aily 不透传飞书 root_id，但回复话题根消息时会把根消息作为 Markdown 引用附在正文后。
+ * 只认引用行里的六位绑定码，正文里手打一个相同字符串不算根消息证据。
+ */
+export function extractQuotedBindingTokens(content) {
+  if (typeof content !== "string") return [];
+  const found = [];
+  for (const line of content.split(/\r?\n/u)) {
+    const match = line.match(/^\s*>\s*绑定码\s*[:：]?\s*([0-9a-f]{6})\s*$/iu);
+    if (match) found.push(match[1].toLowerCase());
+  }
+  return [...new Set(found)];
+}
+
+export function findPendingTask({ home = bridgeHome(), now = Date.now(), content } = {}) {
   const reg = loadRegistry(registryFile(home));
   if (!reg.ok) return reg;
   const pending = reg.tasks.filter((t) =>
     (t.status ?? "active") === "active" && t.inbound_state === "pending" && !t.session_id);
   if (pending.length === 0) return { ok: false, reason: "no_pending_binding" };
-  if (pending.length > 1) return { ok: false, reason: "multiple_pending_bindings", ids: pending.map((t) => t.id) };
-  if (now >= pendingDeadline(pending[0])) return { ok: false, reason: "pending_binding_expired" };
-  return { ok: true, task: pending[0] };
+
+  const tokens = extractQuotedBindingTokens(content);
+  if (tokens.length > 1) return { ok: false, reason: "multiple_binding_tokens" };
+
+  let selected;
+  if (tokens.length === 1) {
+    const matches = pending.filter((task) =>
+      typeof task.pending_token === "string" && task.pending_token.toLowerCase() === tokens[0]);
+    if (matches.length === 0) return { ok: false, reason: "pending_binding_token_unknown" };
+    if (matches.length > 1) return { ok: false, reason: "duplicate_pending_binding_token" };
+    selected = matches[0];
+  } else {
+    // 兼容旧根消息或非话题表面：没有引用码时仍只允许全机唯一 pending，绝不按目录或标题猜。
+    if (pending.length > 1) {
+      return { ok: false, reason: "multiple_pending_bindings", ids: pending.map((t) => t.id) };
+    }
+    selected = pending[0];
+  }
+
+  if (now >= pendingDeadline(selected)) return { ok: false, reason: "pending_binding_expired" };
+  return { ok: true, task: selected, source: tokens.length === 1 ? "quoted_binding_token" : "sole_pending" };
 }
 
 export function evaluatePromotion({ event, template, pending, now = Date.now() }) {

@@ -46,6 +46,9 @@ function writeReceipt(name, payload) {
 const REASON_TEXT = {
   no_pending_binding: "这个话题没有绑定任务，也没有等待绑定的 Codex task",
   multiple_pending_bindings: "同时有多个 Codex task 等待绑定，无法确定目标",
+  multiple_binding_tokens: "根消息引用中出现多个绑定码，无法确定目标",
+  pending_binding_token_unknown: "根消息引用中的绑定码不对应任何待绑定 Codex task",
+  duplicate_pending_binding_token: "多个待绑定 Codex task 使用同一绑定码，无法确定目标",
   pending_binding_expired: "等待绑定已过期，需要重新执行接入",
   sender_not_frank: "发送者不是授权用户",
   transport_not_mentioned: "没有真实 @ M5Codex",
@@ -113,8 +116,11 @@ if (!routed.ok) {
   if (routed.reason !== "no_binding_for_session") {
     finish("error", { detail: "Codex task registry 无法路由（" + routed.reason + "）" }, { reason: routed.reason });
   }
-  const pending = findPendingTask({ home: HOME });
-  if (!pending.ok && !["no_pending_binding", "multiple_pending_bindings", "pending_binding_expired"].includes(pending.reason)) {
+  const pending = findPendingTask({ home: HOME, content: event.content });
+  if (!pending.ok && ![
+    "no_pending_binding", "multiple_pending_bindings", "multiple_binding_tokens",
+    "pending_binding_token_unknown", "duplicate_pending_binding_token", "pending_binding_expired",
+  ].includes(pending.reason)) {
     finish("error", { detail: "Codex task registry 无法读取（" + pending.reason + "）" }, { reason: pending.reason });
   }
   const promotion = evaluatePromotion({ event, template: template.template, pending });

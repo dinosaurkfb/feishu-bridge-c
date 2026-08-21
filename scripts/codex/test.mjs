@@ -21,7 +21,8 @@ import {
   composeRoutedCodexContext, composeStatusContext, composeUnbindContext, isAilyInvocation, isBindingPrompt,
 } from "./prompt-hook.mjs";
 import {
-  enableAutoPublishForAllTasks, findRegisteredTaskForCodexThread, findTaskForCodexThread, findTaskForFeishuSession,
+  enableAutoPublishForAllTasks, extractQuotedBindingTokens, findPendingTask,
+  findRegisteredTaskForCodexThread, findTaskForCodexThread, findTaskForFeishuSession,
   isThreadBusy, loadRegistry, makeTaskEntry, mappingForTask, recordThreadActivity,
   setTaskConnectionStatus, setTaskDisplayName, taskPaths, validateCodexTemplate, validateRegistryTasks, writeRegistry,
 } from "./state.mjs";
@@ -153,6 +154,142 @@ test("同一项目可登记两个 Codex task，路由不按项目猜", () => {
   assert.equal(findTaskForCodexThread({ threadId: THREAD_B, home }).task.task_display_name, "B");
   // 没有模板时 Feishu 路由必须失败关闭，而不是仅凭同 cwd 选一个。
   assert.equal(findTaskForFeishuSession({ sessionId: "session_b", home }).ok, false);
+});
+
+test("多个待绑定 Codex task 由根消息引用中的绑定码精确选择", () => {
+  const home = temp();
+  const root = path.join(home, "same-project");
+  fs.mkdirSync(root);
+  const a = makeTaskEntry({
+    root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30",
+  });
+  const b = makeTaskEntry({
+    root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "62ca4f",
+  });
+  writeRegistry([a, b], path.join(home, "registry.json"));
+  const content = [
+    '<at id="ou_same" type="employee">M5Codex</at> 继续处理',
+    "",
+    "> **[引用]**",
+    "> 🌉 hv-meeting",
+    ">",
+    "> 本机项目  /tmp/hv-meeting",
+    "> 绑定码    5fba30",
+  ].join("\n");
+
+  assert.deepEqual(extractQuotedBindingTokens(content), ["5fba30"]);
+  const selected = findPendingTask({ home, content });
+  assert.equal(selected.ok, true);
+  assert.equal(selected.source, "quoted_binding_token");
+  assert.equal(selected.task.task_display_name, "A");
+});
+
+test("绑定码必须来自引用行，正文手打不能在多个 pending 中选目标", () => {
+  const home = temp();
+  const root = path.join(home, "same-project");
+  fs.mkdirSync(root);
+  writeRegistry([
+    makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30" }),
+    makeTaskEntry({ root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "62ca4f" }),
+  ], path.join(home, "registry.json"));
+
+  assert.deepEqual(extractQuotedBindingTokens("请处理绑定码 5fba30"), []);
+  assert.equal(findPendingTask({ home, content: "请处理绑定码 5fba30" }).reason,
+    "multiple_pending_bindings");
+});
+
+test("未知、重复或多个引用绑定码全部 fail-closed", () => {
+  const home = temp();
+  const root = path.join(home, "same-project");
+  fs.mkdirSync(root);
+  const a = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30" });
+  const b = makeTaskEntry({ root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "62ca4f" });
+  writeRegistry([a, b], path.join(home, "registry.json"));
+
+  assert.equal(findPendingTask({ home, content: "> 绑定码  abc123" }).reason,
+    "pending_binding_token_unknown");
+  assert.equal(findPendingTask({ home, content: "> 绑定码  5fba30\n> 绑定码  62ca4f" }).reason,
+    "multiple_binding_tokens");
+
+  b.pending_token = "5fba30";
+  writeRegistry([a, b], path.join(home, "registry.json"));
+  assert.equal(findPendingTask({ home, content: "> 绑定码  5fba30" }).reason,
+    "duplicate_pending_binding_token");
+});
+
+test("没有引用码时保留唯一 pending 的兼容路径", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({
+    root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30",
+  });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const selected = findPendingTask({ home, content: "<at>M5Codex</at>" });
+  assert.equal(selected.ok, true);
+  assert.equal(selected.source, "sole_pending");
+});
+
+test("完整入站链路用引用绑定码在多个 pending 中只绑定目标 task", () => {
+  const home = temp();
+  const root = path.join(home, "same-project");
+  const bin = path.join(home, "bin");
+  fs.mkdirSync(root);
+  fs.mkdirSync(bin);
+  const a = makeTaskEntry({
+    root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30",
+  });
+  const b = makeTaskEntry({
+    root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "62ca4f",
+  });
+  writeRegistry([a, b], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  const fakeAily = path.join(bin, "aily-cli");
+  fs.writeFileSync(fakeAily, [
+    "#!/usr/bin/env node",
+    "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);",
+  ].join("\n") + "\n", { mode: 0o700 });
+  const content = [
+    '<at id="ou_same" type="employee">M5Codex</at>',
+    "",
+    "> **[引用]**",
+    "> 🌉 hv-meeting",
+    ">",
+    "> 绑定码    62ca4f",
+  ].join("\n");
+  const envelope = JSON.stringify({
+    envelopes: [{
+      type: "message.create",
+      payload: JSON.stringify({
+        message: {
+          id: "msg_token_handshake", sessionID: "session_token_b", role: "user",
+          createdBy: TEMPLATE.frank_sender_id, createdAtMs: Date.now(), content,
+        },
+      }),
+    }],
+  });
+  const result = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "inbound.mjs")], {
+    encoding: "utf-8",
+    env: {
+      ...process.env,
+      PATH: bin + path.delimiter + process.env.PATH,
+      FEISHU_CODEX_BRIDGE_HOME: home,
+      AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid,
+      AILY_CLI_SESSION_ID: "session_token_b",
+      AILY_CLI_RUN_ID: "run_token_b",
+      FAKE_AILY_ENVELOPE: envelope,
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /绑定完成 · B/u);
+  const tasks = loadRegistry(path.join(home, "registry.json")).tasks;
+  const afterA = tasks.find((task) => task.codex_thread_id === THREAD_A);
+  const afterB = tasks.find((task) => task.codex_thread_id === THREAD_B);
+  assert.equal(afterA.inbound_state, "pending");
+  assert.equal(afterA.session_id, undefined);
+  assert.equal(afterB.inbound_state, "bound");
+  assert.equal(afterB.session_id, "session_token_b");
 });
 
 test("Feishu session 与 Codex thread 是两把独立且精确的键", () => {

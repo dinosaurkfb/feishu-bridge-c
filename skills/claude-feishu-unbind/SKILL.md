@@ -1,0 +1,28 @@
+---
+name: feishu-unbind
+description: 可恢复地暂停当前项目（或当前这条工作线）的飞书接入。仅在 Frank 明确调用或明确要求撤销接入时使用；不删话题、不删历史、不发消息。
+---
+
+# 暂停飞书接入
+
+**Frank 调用这条命令本身就是这次暂停的授权**，不必再问一遍"确认吗"。
+
+```bash
+node /Users/dk/claude-projects/feishu-bridge-cc/scripts/feishu-unbind.mjs            # 先看会暂停什么
+node /Users/dk/claude-projects/feishu-bridge-cc/scripts/feishu-unbind.mjs --apply    # 再执行
+```
+
+先跑不带 `--apply` 的那条，把「会暂停哪一条绑定、有多少待发内容」给他看，再执行。
+
+## 暂停做什么、不做什么
+
+**做**：把绑定的 status 翻成 suspended。出站停发（进展留在本地），入站一律拒绝。
+
+**不做**：不删话题、不删登记、不删待发内容、不删回执、**不往飞书发任何消息**。
+暂停要能后悔 —— 话题里已经有历史对话，删掉登记会让那段历史变成孤儿。
+
+## 绝对禁止
+
+- **不要**直接编辑登记表或 mapping 文件。只跑上面那条命令。
+- **不要**因为"看起来该清理一下"就去删话题或历史。
+- 恢复用 `/feishu-bind`（复用原话题，不新建）。

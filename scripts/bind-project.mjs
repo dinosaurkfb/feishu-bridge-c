@@ -21,6 +21,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
+import { bindingsForRoot, currentBinding, describeStatus, setBindingStatus } from "./feishu-control.mjs";
 import { registryPath } from "./registry.mjs";
 import { publishDraft, sendToChat } from "./outbound.mjs";
 import {
@@ -73,6 +74,26 @@ try {
 const at = registry.projects.findIndex((p) => p?.root === root);
 const already = at >= 0 ? registry.projects[at] : null;
 const legacyMapping = path.join(root, ".runtime-data", "inbound", "active-mapping.json");
+
+// 暂停过的绑定：**复用原话题恢复**，绝不新建。
+// 新建等于把话题里已有的历史对话变成孤儿，而且群里会多出一个长得一样的话题。
+const suspended = currentBinding({ root });
+if (suspended.ok && suspended.suspended) {
+  console.log(path.basename(root) + " 的接入此前被暂停，将**恢复原话题**（不新建）。");
+  console.log("  待发 " + suspended.pending + " 条，恢复后会一并发出。");
+  if (!apply) {
+    console.log("\n[dry-run] 什么都没做。加 --apply 才真的恢复。");
+    process.exit(0);
+  }
+  const r = setBindingStatus({ root, status: "active" });
+  if (!r.ok) {
+    console.error("恢复失败（" + r.reason + "）" + (r.error ? "：" + r.error : ""));
+    process.exit(1);
+  }
+  console.log("\n已恢复。改动写在 " + r.store);
+  console.log(describeStatus(currentBinding({ root }), bindingsForRoot({ root })));
+  process.exit(0);
+}
 
 if (already?.root_message_id || fs.existsSync(legacyMapping)) {
   console.log(path.basename(root) + " 已经接入过了，没有重复建话题。");

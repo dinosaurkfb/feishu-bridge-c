@@ -45,6 +45,9 @@ import {
 import { outboxDirOf } from "./drain-outbox.mjs";
 import { identifySelf, newSessionEntry } from "./bind-session.mjs";
 import { findLiveSessionById } from "./live-session.mjs";
+import {
+  SUSPENDED, bindingsForRoot, currentBinding, describeStatus, setBindingStatus,
+} from "./feishu-control.mjs";
 import { composeAsk, isInitPrompt } from "./init-hook.mjs";
 import {
   currentSurface, diffSurface, loadSnapshot, sharedModules,
@@ -2034,6 +2037,137 @@ test("入站在绑定会话不在时不回落到别的线", () => {
   const cont = src.indexOf("hasPriorSession({ projectRoot: config.project_dir })");
   assert.ok(gone < src.lastIndexOf("hasPriorSession"), "会话级的判断要排在项目级兜底之前");
   assert.ok(cont > 0);
+});
+
+// ---------- 三条控制命令：status / unbind / bind（恢复） ----------
+//
+// 语义跟 Codex 侧对齐：暂停是**可恢复**的，绝不删话题、登记、待发内容或历史。
+// 实现上只翻绑定自己的 status —— 出站只发 active 的，入站见到非 active 直接拒，
+// 一个已有的闸两个方向同时生效，不需要新机制。
+
+function controlFixture({ suspended = false, sessions = [] } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-ctl-"));
+  const proj = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-ctlp-"));
+  const regFile = path.join(home, "registry.json");
+  const tplFile = path.join(home, "chain-config.json");
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  const projects = [{
+    id: "demo", root: proj, name: "演示", root_message_id: "om_demo",
+    expires_at: "2099-01-01T00:00:00Z", session_id: "session_x", inbound_state: "bound",
+    ...(suspended ? { status: SUSPENDED } : {}),
+  }, ...sessions];
+  fs.writeFileSync(regFile, JSON.stringify({ projects }));
+  return { proj, regFile, tplFile, f: { registryFile: regFile, templateFile: tplFile } };
+}
+
+test("status 只读，且不把话题 id 之类的 locator 打进人类可读输出", () => {
+  const { proj, f } = controlFixture();
+  const st = currentBinding({ root: proj, ...f });
+  const text = describeStatus(st, bindingsForRoot({ root: proj, registryFile: f.registryFile }));
+  assert.ok(text.includes("已接入"));
+  assert.ok(!text.includes("om_demo"), "话题 id 是 locator，不该出现在状态输出里");
+  assert.ok(!text.includes("session_x"), "Aily session 同理");
+});
+
+test("暂停把出站和入站同时关掉 —— 靠的是两边本来就在看的那个字段", () => {
+  const { proj, f } = controlFixture();
+  const r = setBindingStatus({ root: proj, status: SUSPENDED, registryFile: f.registryFile });
+  assert.equal(r.ok, true);
+  assert.equal(r.changed, true);
+
+  const st = currentBinding({ root: proj, ...f });
+  assert.equal(st.suspended, true);
+
+  // 出站：drainProject 只发 active 的
+  assert.notEqual(st.status, "active");
+  // 入站：evaluateInbound 见到非 active 直接拒
+  const mapping = resolveProject({ root: proj, ...f }).mapping;
+  const v = evaluateInbound({
+    event: { message_id: "m", session_id: "session_x", sender_id: TPL.frank_sender_id,
+             created_at_ms: Date.now(), content: '<at id="ou_t">T</at> 干活' },
+    mapping, config: { transport_open_id: "ou_t", default_freshness_ms: 900000 }, now: Date.now(),
+  });
+  assert.equal(v.reason, REJECT.MAPPING_NOT_ACTIVE);
+});
+
+test("暂停不删任何东西：话题、登记、待发内容原样还在", () => {
+  const { proj, f } = controlFixture();
+  const outbox = outboxDirOf(proj);
+  appendEvent({ outboxDir: outbox, kind: "next", text: "暂停前写的", source: "t" });
+
+  setBindingStatus({ root: proj, status: SUSPENDED, registryFile: f.registryFile });
+
+  const reg = JSON.parse(fs.readFileSync(f.registryFile, "utf-8"));
+  assert.equal(reg.projects.length, 1, "登记行不能被删");
+  assert.equal(reg.projects[0].root_message_id, "om_demo", "话题引用必须保留");
+  assert.equal(listPending({ outboxDir: outbox }).length, 1, "待发内容必须留着，恢复后要发出去");
+});
+
+test("恢复之后一切照旧，且待发内容还在", () => {
+  const { proj, f } = controlFixture({ suspended: true });
+  const outbox = outboxDirOf(proj);
+  appendEvent({ outboxDir: outbox, kind: "next", text: "暂停期间攒的", source: "t" });
+
+  const r = setBindingStatus({ root: proj, status: "active", registryFile: f.registryFile });
+  assert.equal(r.changed, true);
+  const st = currentBinding({ root: proj, ...f });
+  assert.equal(st.suspended, false);
+  assert.equal(st.pending, 1, "暂停期间攒下的要还在");
+});
+
+test("重复暂停是幂等的，不报错也不重复写", () => {
+  const { proj, f } = controlFixture({ suspended: true });
+  const r = setBindingStatus({ root: proj, status: SUSPENDED, registryFile: f.registryFile });
+  assert.equal(r.ok, true);
+  assert.equal(r.changed, false);
+});
+
+test("会话级绑定可以单独暂停，不影响项目级", () => {
+  const { proj, f } = controlFixture({ sessions: [{
+    id: "demo@aaa", root: "__ROOT__", root_message_id: "om_a", claude_session_id: "aaa-111",
+    expires_at: "2099-01-01T00:00:00Z",
+  }] });
+  // fixture 里 root 要现填
+  const reg = JSON.parse(fs.readFileSync(f.registryFile, "utf-8"));
+  reg.projects[1].root = proj;
+  fs.writeFileSync(f.registryFile, JSON.stringify(reg));
+
+  setBindingStatus({ root: proj, claudeSessionId: "aaa-111", status: SUSPENDED, registryFile: f.registryFile });
+
+  assert.equal(currentBinding({ root: proj, claudeSessionId: "aaa-111", ...f }).suspended, true,
+    "被暂停的那条线该停");
+  assert.equal(currentBinding({ root: proj, ...f }).suspended, false,
+    "项目级不该被连累");
+});
+
+test("没接桥时 status 给的是怎么接入，不是一句报错", () => {
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-none-"));
+  const text = describeStatus(currentBinding({ root: empty }));
+  assert.ok(text.includes("还没有接入"));
+  assert.ok(text.includes("bind-project") && text.includes("bind-session"), "要给出两种接入方式");
+});
+
+test("状态命令和出站用的是同一条绑定选择规则", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "feishu-control.mjs"), "utf-8");
+  assert.ok(src.includes("resolveProject"),
+    "status 必须走 resolveProject —— 另写一套规则会出现「status 说 A、实际发到 B」");
+  assert.ok(src.includes("selectBindingEntry"));
+});
+
+test("三条控制技能都装成跟 Codex 同名的斜杠命令", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  for (const [repo, installed] of [
+    ["claude-feishu-bind", "feishu-bind"],
+    ["claude-feishu-status", "feishu-status"],
+    ["claude-feishu-unbind", "feishu-unbind"],
+  ]) {
+    assert.ok(src.includes(repo), "安装器要认得仓库里的 " + repo);
+    assert.ok(src.includes('"' + installed + '"'), "要装成 /" + installed);
+    // 装出去的目录名就是斜杠命令名，必须跟技能自己声明的 name 一致
+    const skill = fs.readFileSync(path.resolve("skills", repo, "SKILL.md"), "utf-8");
+    assert.ok(skill.includes("name: " + installed),
+      repo + " 的 frontmatter name 必须是 " + installed + "，否则命令名对不上");
+  }
 });
 
 // ---------- 汇总 ----------

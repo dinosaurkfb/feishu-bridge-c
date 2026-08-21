@@ -174,23 +174,44 @@ if (uninstall) {
 
 // 技能是出站的另一半：钩子保证「发」，技能保证「记」。
 // 装到用户级技能目录，任何目录起的会话都看得见 —— 这正是与入站技能对称的地方。
-const SKILL_SRC = path.join(ROOT, "skills", "claude-longtask-progress", "SKILL.md");
-const SKILL_DST = path.join(os.homedir(), ".claude", "skills", "claude-longtask-progress", "SKILL.md");
+/**
+ * 装哪些技能，以及装成什么名字。
+ *
+ * 三条控制命令在仓库里叫 claude-feishu-*，装出去要去掉前缀 —— 因为**装出去的目录名
+ * 就是斜杠命令名**，而 Codex 那边用的是 $feishu-bind / $feishu-status / $feishu-unbind。
+ * 两边同名，用户不用记两套。仓库里之所以要加前缀，是因为 skills/feishu-bind/
+ * 已经被 Codex 那份占了 —— 它们装到不同的家目录（~/.codex vs ~/.claude），
+ * 运行时不冲突，只有仓库目录会撞。
+ */
+const SKILLS = [
+  { src: "claude-longtask-progress", dst: "claude-longtask-progress" },
+  { src: "claude-feishu-bind",       dst: "feishu-bind" },
+  { src: "claude-feishu-status",     dst: "feishu-status" },
+  { src: "claude-feishu-unbind",     dst: "feishu-unbind" },
+];
+
+const skillSrcOf = (n) => path.join(ROOT, "skills", n, "SKILL.md");
+const skillDstOf = (n) => path.join(os.homedir(), ".claude", "skills", n, "SKILL.md");
 
 // 拷贝而不是软链：软链一旦仓库被移动或删除就变成悬空文件，而且各家扫描器
 // 对 readdir 是否跟随软链的处理并不一致（入站技能就在这上面栽过）。
-let skillAction = "unchanged";
-const skillReadable = fs.existsSync(SKILL_SRC);
-if (uninstall) {
-  if (fs.existsSync(SKILL_DST)) skillAction = "will-remove";
-} else if (!skillReadable) {
-  skillAction = "source-missing";
-} else {
-  const src = fs.readFileSync(SKILL_SRC, "utf-8");
+const skillPlan = SKILLS.map((sk) => {
+  const srcFile = skillSrcOf(sk.src);
+  const dstFile = skillDstOf(sk.dst);
+  if (uninstall) {
+    return { ...sk, srcFile, dstFile, action: fs.existsSync(dstFile) ? "will-remove" : "already-absent" };
+  }
+  if (!fs.existsSync(srcFile)) return { ...sk, srcFile, dstFile, action: "source-missing" };
+  const src = fs.readFileSync(srcFile, "utf-8");
   let dst = null;
-  try { dst = fs.readFileSync(SKILL_DST, "utf-8"); } catch { /* 还没装 */ }
-  if (dst !== src) skillAction = dst === null ? "will-install" : "will-update";
-}
+  try { dst = fs.readFileSync(dstFile, "utf-8"); } catch { /* 还没装 */ }
+  return { ...sk, srcFile, dstFile,
+    action: dst === src ? "unchanged" : dst === null ? "will-install" : "will-update" };
+});
+
+const skillAction = skillPlan.some((s) => s.action === "source-missing") ? "source-missing"
+  : skillPlan.every((s) => s.action === "unchanged") ? "unchanged"
+  : skillPlan.map((s) => s.dst + ":" + s.action).filter((t) => !t.endsWith(":unchanged")).join(" ");
 
 // ---------- launchd 兜底定时器 ----------
 
@@ -249,11 +270,14 @@ console.log("Stop 钩子 : " + stop.length + " 条（.orca 的那条必须还在
 console.log("/init 钩子: " + prompts.length + " 条 UserPromptSubmit（.orca 的那条必须还在）  → " + initAction);
 console.log("预览放行 : allow " + allow.length + " 条  → " + permAction);
 console.log("登记表   : " + REGISTRY + "  → " + registry.projects.length + " 个项目");
-console.log("技能     : " + SKILL_DST + "  → " + skillAction);
+console.log("技能     : " + SKILLS.length + " 个（装进 ~/.claude/skills/）  → " + skillAction);
+for (const sk of skillPlan) console.log("           /" + sk.dst.padEnd(26) + sk.action);
 console.log("兜底定时 : " + PLIST + "  → " + plistAction + "（每 30 分钟排空全部登记项目）");
 
 if (skillAction === "source-missing") {
-  console.error("\n技能源文件不在：" + SKILL_SRC);
+  for (const sk of skillPlan.filter((x) => x.action === "source-missing")) {
+    console.error("\n技能源文件不在：" + sk.srcFile);
+  }
   process.exit(1);
 }
 
@@ -281,11 +305,13 @@ if (settingsAfter !== settingsBefore) {
 
 writeJsonAtomic(REGISTRY, registry);
 
-if (uninstall) {
-  fs.rmSync(path.dirname(SKILL_DST), { recursive: true, force: true });
-} else {
-  fs.mkdirSync(path.dirname(SKILL_DST), { recursive: true });
-  fs.copyFileSync(SKILL_SRC, SKILL_DST);
+for (const sk of skillPlan) {
+  if (uninstall) {
+    fs.rmSync(path.dirname(sk.dstFile), { recursive: true, force: true });
+  } else {
+    fs.mkdirSync(path.dirname(sk.dstFile), { recursive: true });
+    fs.copyFileSync(sk.srcFile, sk.dstFile);
+  }
 }
 
 // launchd：先 bootout 再 bootstrap。改了 plist 不重新加载的话，跑的还是旧的那份，

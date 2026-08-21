@@ -179,11 +179,14 @@ $feishu-bind
 里的多个长期 task 不会再显示成同一个标题。去新话题真实 `@M5Codex` 一次完成首次 Aily
 session 绑定。日常还可以使用：
 
-| 命令 | 作用 |
-|---|---|
-| `$feishu-status` | 只读查看当前 task 的接入、入站绑定和待发布状态 |
-| `$feishu-unbind` | 可恢复地暂停当前 task，不删除话题、映射或历史 |
-| `$feishu-bind` | 首次接入，或恢复已经暂停的原话题连接 |
+| 命令 | Codex | Claude | 作用 |
+|---|---|---|---|
+| status | `$feishu-status` | `/feishu-status` | 只读查看接入、入站绑定和待发状态 |
+| unbind | `$feishu-unbind` | `/feishu-unbind` | 可恢复地暂停，不删话题、映射或历史 |
+| bind | `$feishu-bind` | `/feishu-bind` | 首次接入，或恢复已暂停的原话题连接 |
+
+两边命令同名。差别只在绑定单位：Codex 绑一个精确 task，Claude 默认绑项目、
+也可以用 `bind-session` 让某一条会话单独占一个话题。
 
 Codex 入站通过 `codex exec resume <精确 thread>` 向原 task 追加完整用户回合。回合会持久化，
 但已经打开的 Codex Desktop 页面不保证实时绘制另一个 CLI 进程追加的事件；切换 task 再返回

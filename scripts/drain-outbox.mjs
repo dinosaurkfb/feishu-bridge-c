@@ -21,6 +21,17 @@ import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
 import { isLockStale } from "./handoff.mjs";
+import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
+
+const groupByTargetGeneration = (records) => {
+  const groups = new Map();
+  for (const record of records) {
+    const key = record.target_channel_generation_id ?? "__legacy_active__";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(record);
+  }
+  return [...groups.entries()];
+};
 
 /**
  * outbox 按**绑定**分目录，不是按项目。
@@ -97,11 +108,22 @@ export function drainProject({ root, claudeSessionId, dryRun = false, timeoutMs 
     const pending = listPending({ outboxDir });
     if (pending.length === 0) return { status: "empty", root };
 
-    const batches = outboundCardBatches(pending);
-    const cards = batches.map((batch) => composeOutboundCard(batch, {
-      taskName: cfg.task_display_name,
-      runtime: "claude",
-    }));
+    const targetBatches = groupByTargetGeneration(pending).flatMap(([targetKey, records]) => {
+      const target = resolveMappingOutboundGeneration(
+        mapping,
+        targetKey === "__legacy_active__" ? null : targetKey,
+      );
+      if (!target.ok) throw new Error("冻结的出站话题代际不可用（" + target.reason + "）");
+      return outboundCardBatches(records).map((batch) => ({
+        batch,
+        target,
+        card: composeOutboundCard(batch, {
+          taskName: cfg.task_display_name,
+          runtime: "claude",
+        }),
+      }));
+    });
+    const cards = targetBatches.map((item) => item.card);
     if (dryRun) {
       return {
         status: "dry_run",
@@ -115,17 +137,17 @@ export function drainProject({ root, claudeSessionId, dryRun = false, timeoutMs 
     // 身份从配置推，不在这里认死任何一个 agent；发之前 publishDraft 会校验凭据归属。
     const id = resolveLarkIdentity(cfg);
     const messageIds = [];
-    for (let index = 0; index < batches.length; index += 1) {
+    for (const item of targetBatches) {
       const messageId = publishDraft({
         profile: id.profile,
-        rootMessageId: mapping.feishu_root_message_id_reference,
-        card: cards[index],
+        rootMessageId: item.target.rootMessageId,
+        card: item.card,
         larkBin: id.bin,
         larkHome: id.configDir,
         expectedAppId: id.expectedAppId,
         timeoutMs,
       });
-      for (const record of batches[index]) markSent(record, messageId);
+      for (const record of item.batch) markSent(record, messageId);
       messageIds.push(messageId);
     }
     return {

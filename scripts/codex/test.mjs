@@ -28,7 +28,8 @@ import {
 } from "../turn-input.mjs";
 import {
   classifyFeishuPrompt, composeAilyInboundContext, composeBindingContext, composeInitContext,
-  composeInvalidControlContext, composeRoutedCodexContext, composeStatusContext, composeUnbindContext,
+  composeInvalidControlContext, composeRotateContext, composeRoutedCodexContext,
+  composeStatusContext, composeUnbindContext,
   isAilyInvocation, isBindingPrompt,
 } from "./prompt-hook.mjs";
 import {
@@ -36,9 +37,12 @@ import {
   extractQuotedBindingTokens, findPendingTask,
   findRegisteredTaskForCodexThread, findTaskForCodexThread, findTaskForFeishuSession,
   isThreadBusy, loadCodexTemplate, loadRegistry, makeTaskEntry, mappingForTask, recordThreadActivity, resolveTask,
-  refreshPendingTaskBinding, setTaskConnectionStatus, setTaskDisplayName, shadowCodexFirstClaim, taskPaths,
+  closeTaskTopicRotation, prepareTaskTopicRotation, promoteTask, refreshPendingTaskBinding,
+  registerTaskTopicRotation, resolveTaskOutboundGeneration, setTaskConnectionStatus,
+  setTaskDisplayName, shadowCodexFirstClaim, taskPaths, topicStateForTask,
   validateCodexTemplate, validateRegistryTasks, writeRegistry,
 } from "./state.mjs";
+import { ROTATION_STATUS, activeGeneration, pendingGeneration } from "../topic-generation.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
 const THREAD_A = "01911111-2222-7333-8444-555555555555";
@@ -195,6 +199,8 @@ test("同一项目可登记两个 Codex task，路由不按项目猜", () => {
   const b = makeTaskEntry({ root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "b" });
   a.session_id = "session_a"; a.inbound_state = "bound";
   b.session_id = "session_b"; b.inbound_state = "bound";
+  delete a.topic_generation_state; delete a.channel_generation_id;
+  delete b.topic_generation_state; delete b.channel_generation_id;
   writeRegistry([a, b], path.join(home, "registry.json"));
   const reg = loadRegistry(path.join(home, "registry.json"));
   assert.equal(reg.tasks.length, 2);
@@ -260,6 +266,8 @@ test("未知、重复或多个引用绑定码全部 fail-closed", () => {
     "multiple_binding_tokens");
 
   b.pending_token = "5fba30";
+  delete b.topic_generation_state;
+  delete b.channel_generation_id;
   writeRegistry([a, b], path.join(home, "registry.json"));
   assert.equal(findPendingTask({ home, content: "> 绑定码  5fba30" }).reason,
     "duplicate_pending_binding_token");
@@ -392,7 +400,7 @@ test("完整入站链路用引用绑定码在多个 pending 中只绑定目标 t
   const afterA = tasks.find((task) => task.codex_thread_id === THREAD_A);
   const afterB = tasks.find((task) => task.codex_thread_id === THREAD_B);
   assert.equal(afterA.inbound_state, "pending");
-  assert.equal(afterA.session_id, undefined);
+  assert.equal(afterA.session_id, null);
   assert.equal(afterB.inbound_state, "bound");
   assert.equal(afterB.session_id, "session_token_b");
   const receipts = fs.readdirSync(taskPaths(afterB, home).receipts).filter((name) => name.startsWith("bound-"));
@@ -409,6 +417,8 @@ test("Feishu session 与 Codex thread 是两把独立且精确的键", () => {
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
   task.session_id = "aily_session_a";
   task.inbound_state = "bound";
+  delete task.topic_generation_state;
+  delete task.channel_generation_id;
   writeRegistry([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   const routed = findTaskForFeishuSession({ sessionId: "aily_session_a", home });
@@ -427,6 +437,8 @@ test("暂停连接会同时关闭入站、Stop 入队和发布资格，恢复时
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
   task.session_id = "aily_session_a";
   task.inbound_state = "bound";
+  delete task.topic_generation_state;
+  delete task.channel_generation_id;
   writeRegistry([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
 
@@ -462,6 +474,8 @@ test("active 但首次 mention 已过期的 task 可只刷新原话题握手窗�
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
   task.bound_at = "2026-01-01T00:00:00.000Z";
   delete task.pending_expires_at;
+  delete task.topic_generation_state;
+  delete task.channel_generation_id;
   writeRegistry([task], path.join(home, "registry.json"));
 
   const now = Date.parse("2026-08-22T05:00:00.000Z");
@@ -474,6 +488,194 @@ test("active 但首次 mention 已过期的 task 可只刷新原话题握手窗�
   assert.equal(findPendingTask({ home, now }).ok, true);
 });
 
+test("Codex adapter 轮转期间旧 session 继续路由，认领后新旧代际原子切换", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({
+    root, threadId: THREAD_A, name: "A", rootMessageId: "om_old", token: "aaa111", now: 1000,
+  });
+  writeRegistry([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const first = promoteTask({
+    logicalTaskKey: task.logical_task_key,
+    generationId: task.channel_generation_id,
+    sessionId: "session_old",
+    home,
+    now: 1100,
+  });
+  assert.equal(first.ok, true);
+  assert.equal(findTaskForFeishuSession({ sessionId: "session_old", home }).ok, true);
+
+  const prepared = prepareTaskTopicRotation({
+    threadId: THREAD_A, operationId: "op_codex", home, now: 1200,
+  });
+  assert.equal(prepared.ok, true);
+  const registered = registerTaskTopicRotation({
+    threadId: THREAD_A, operationId: "op_codex", rootMessageId: "om_new",
+    pendingToken: "bbb222", home, now: 1300,
+  });
+  assert.equal(registered.ok, true);
+  assert.equal(findTaskForFeishuSession({ sessionId: "session_old", home }).ok, true,
+    "等待新话题 mention 时旧代际必须继续接收入站");
+  const waiting = findPendingTask({ home, content: "> 绑定码  bbb222", now: 1400 });
+  assert.equal(waiting.ok, true);
+  assert.equal(waiting.generationId, registered.generation.channel_generation_id);
+
+  const switched = promoteTask({
+    logicalTaskKey: task.logical_task_key,
+    generationId: registered.generation.channel_generation_id,
+    sessionId: "session_new",
+    home,
+    now: 1500,
+  });
+  assert.equal(switched.ok, true);
+  assert.equal(findTaskForFeishuSession({ sessionId: "session_old", home }).ok, false);
+  assert.equal(findTaskForFeishuSession({ sessionId: "session_new", home }).ok, true);
+  const stored = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
+  const state = topicStateForTask(stored).state;
+  assert.equal(activeGeneration(state).root_message_id, "om_new");
+  assert.equal(state.generations.find((generation) => generation.root_message_id === "om_old").status,
+    "read-only");
+  assert.equal(resolveTaskOutboundGeneration(stored, switched.previousGeneration.channel_generation_id)
+    .rootMessageId, "om_old", "轮转前冻结的结果仍回原话题");
+});
+
+test("Codex 轮转取消只退休 pending generation，不影响旧 active", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({
+    root, threadId: THREAD_A, name: "A", rootMessageId: "om_old", token: "aaa111", now: 1000,
+  });
+  writeRegistry([task], path.join(home, "registry.json"));
+  promoteTask({
+    logicalTaskKey: task.logical_task_key, generationId: task.channel_generation_id,
+    sessionId: "session_old", home, now: 1100,
+  });
+  prepareTaskTopicRotation({ threadId: THREAD_A, operationId: "op_cancel", home, now: 1200 });
+  registerTaskTopicRotation({
+    threadId: THREAD_A, operationId: "op_cancel", rootMessageId: "om_new",
+    pendingToken: "bbb222", home, now: 1300,
+  });
+  const cancelled = closeTaskTopicRotation({
+    threadId: THREAD_A, operationId: "op_cancel",
+    reason: ROTATION_STATUS.CANCELLED, home, now: 1400,
+  });
+  assert.equal(cancelled.ok, true);
+  const state = topicStateForTask(cancelled.task).state;
+  assert.equal(activeGeneration(state).root_message_id, "om_old");
+  assert.equal(pendingGeneration(state), null);
+});
+
+test("Codex 轮转 CLI 可显式取消 pending，且完全不调用飞书", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({
+    root, threadId: THREAD_A, name: "A", rootMessageId: "om_old", token: "aaa111", now: 1000,
+  });
+  writeRegistry([task], path.join(home, "registry.json"));
+  promoteTask({
+    logicalTaskKey: task.logical_task_key, generationId: task.channel_generation_id,
+    sessionId: "session_old", home, now: 1100,
+  });
+  prepareTaskTopicRotation({ threadId: THREAD_A, operationId: "op_cli_cancel", home, now: 1200 });
+  registerTaskTopicRotation({
+    threadId: THREAD_A, operationId: "op_cli_cancel", rootMessageId: "om_new",
+    pendingToken: "bbb222", home, now: 1300,
+  });
+  const cancelled = spawnSync(process.execPath, [
+    path.join(ROOT, "scripts", "codex", "feishu-rotate.mjs"),
+    "--project", root,
+    "--thread-id", THREAD_A,
+    "--cancel",
+    "--apply",
+  ], {
+    encoding: "utf-8",
+    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+  });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.match(cancelled.stdout, /旧话题仍是唯一 active/u);
+  const stored = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
+  assert.equal(pendingGeneration(topicStateForTask(stored).state), null);
+});
+
+test("过期的轮转候选携带精确 operation，可在一次原子写中退休", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({
+    root, threadId: THREAD_A, name: "A", rootMessageId: "om_old", token: "aaa111", now: 1000,
+  });
+  writeRegistry([task], path.join(home, "registry.json"));
+  promoteTask({
+    logicalTaskKey: task.logical_task_key, generationId: task.channel_generation_id,
+    sessionId: "session_old", home, now: 1100,
+  });
+  prepareTaskTopicRotation({ threadId: THREAD_A, operationId: "op_expire", home, now: 1200 });
+  registerTaskTopicRotation({
+    threadId: THREAD_A, operationId: "op_expire", rootMessageId: "om_new",
+    pendingToken: "bbb222", claimExpiresAt: new Date(1400).toISOString(), home, now: 1300,
+  });
+  const expired = findPendingTask({ home, content: "> 绑定码  bbb222", now: 1500 });
+  assert.equal(expired.reason, "pending_binding_expired");
+  assert.equal(expired.operationId, "op_expire");
+  const closed = closeTaskTopicRotation({
+    threadId: THREAD_A, operationId: expired.operationId,
+    reason: ROTATION_STATUS.EXPIRED, home, now: 1500,
+  });
+  assert.equal(closed.ok, true);
+  assert.equal(activeGeneration(topicStateForTask(closed.task).state).root_message_id, "om_old");
+  assert.equal(pendingGeneration(topicStateForTask(closed.task).state), null);
+});
+
+test("轮转前后已冻结的两个 outbox 目标分别发布到旧话题和新话题", () => {
+  const { home, task, bin, argsFile } = autoPublishFixture();
+  const first = promoteTask({
+    logicalTaskKey: task.logical_task_key, generationId: task.channel_generation_id,
+    sessionId: "session_old", home, now: 1100,
+  });
+  prepareTaskTopicRotation({ threadId: THREAD_A, operationId: "op_publish", home, now: 1200 });
+  const registered = registerTaskTopicRotation({
+    threadId: THREAD_A, operationId: "op_publish", rootMessageId: "om_new",
+    pendingToken: "bbb222", home, now: 1300,
+  });
+  const switched = promoteTask({
+    logicalTaskKey: task.logical_task_key,
+    generationId: registered.generation.channel_generation_id,
+    sessionId: "session_new", home, now: 1400,
+  });
+  assert.equal(switched.ok, true);
+  fs.writeFileSync(bin,
+    "#!" + process.execPath + "\n" +
+    "const fs = require('node:fs');\n" +
+    "fs.appendFileSync(" + JSON.stringify(argsFile) + ", JSON.stringify(process.argv.slice(2)) + '\\n');\n" +
+    "process.stdout.write('{\"ok\":true,\"data\":{\"message_id\":\"om_sent\"}}');\n",
+    { mode: 0o700 });
+  fs.rmSync(argsFile, { force: true });
+  const current = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
+  const outboxDir = taskPaths(current, home).outbox;
+  appendEvent({
+    outboxDir, kind: "reply", text: "旧请求迟到结果", eventKey: "old-result",
+    publishEligible: true,
+    targetGenerationId: switched.previousGeneration.channel_generation_id,
+  });
+  appendEvent({
+    outboxDir, kind: "reply", text: "新请求结果", eventKey: "new-result",
+    publishEligible: true,
+    targetGenerationId: switched.generation.channel_generation_id,
+  });
+  const published = publishEligibleTaskEvents({ task: current, home });
+  assert.equal(published.status, "published");
+  assert.equal(published.count, 2);
+  const invocations = fs.readFileSync(argsFile, "utf-8").trim().split("\n").map(JSON.parse);
+  const roots = invocations.map((args) => args[args.indexOf("--message-id") + 1]).sort();
+  assert.deepEqual(roots, ["om_new", "om_a"].sort());
+  assert.equal(listPending({ outboxDir }).length, 0);
+  assert.equal(first.generation.root_message_id, "om_a");
+});
+
 test("bind-task 重跑只续期 active pending，不创建或回复第二个话题", () => {
   const home = temp();
   const root = path.join(home, "project");
@@ -482,6 +684,10 @@ test("bind-task 重跑只续期 active pending，不创建或回复第二个话�
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
   task.bound_at = "2026-01-01T00:00:00.000Z";
   delete task.pending_expires_at;
+  delete task.topic_generation_state;
+  delete task.channel_generation_id;
+  delete task.topic_generation_state;
+  delete task.channel_generation_id;
   writeRegistry([task], path.join(home, "registry.json"));
 
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
@@ -533,13 +739,15 @@ test("pending 续期不被超过编辑时限的旧话题标题阻断", () => {
   assert.equal(Number.isFinite(Date.parse(after.pending_expires_at)), true);
 });
 
-test("三条 task 控制脚本不猜 thread，暂停和恢复都不调用飞书", () => {
+test("task 控制脚本不猜 thread，暂停和恢复都不调用飞书", () => {
   const home = temp();
   const root = path.join(home, "project");
   fs.mkdirSync(root);
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
   task.session_id = "aily_session_a";
   task.inbound_state = "bound";
+  delete task.topic_generation_state;
+  delete task.channel_generation_id;
   writeRegistry([task], path.join(home, "registry.json"));
   const env = { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home };
 
@@ -547,6 +755,7 @@ test("三条 task 控制脚本不猜 thread，暂停和恢复都不调用飞书"
     "--thread-id", THREAD_A], { encoding: "utf-8", env });
   assert.equal(status.status, 0, status.stderr);
   assert.match(status.stdout, /已接入飞书/);
+  assert.match(status.stdout, /当前话题代际/u);
   assert.equal(status.stdout.includes(THREAD_A), false);
   assert.equal(status.stdout.includes("om_a"), false);
 
@@ -810,9 +1019,11 @@ test("Prompt hook 只接受占据整条输入的显式控制命令", () => {
   assert.equal(classifyFeishuPrompt("$feishu-bind"), "bind");
   assert.equal(classifyFeishuPrompt("$feishu-unbind"), "unbind");
   assert.equal(classifyFeishuPrompt("$feishu-status"), "status");
+  assert.equal(classifyFeishuPrompt("$feishu-rotate"), "rotate");
   assert.equal(classifyFeishuPrompt("[$feishu-bind](/Users/test/.codex/skills/feishu-bind/SKILL.md)"), "bind");
   assert.equal(classifyFeishuPrompt("[$feishu-unbind](/Users/test/.codex/skills/feishu-unbind/SKILL.md)"), "unbind");
   assert.equal(classifyFeishuPrompt("[$feishu-status](/Users/test/.codex/skills/feishu-status/SKILL.md)"), "status");
+  assert.equal(classifyFeishuPrompt("[$feishu-rotate](/Users/test/.codex/skills/feishu-rotate/SKILL.md)"), "rotate");
   assert.equal(classifyFeishuPrompt(
     "[$feishu-bind](/Users/test/.codex/skills/feishu-bind/SKILL.md)&#x20;"), "bind");
   assert.equal(classifyFeishuPrompt("把当前 task 撤销飞书接入"), "none");
@@ -825,6 +1036,7 @@ test("Prompt hook 只接受占据整条输入的显式控制命令", () => {
     "[$feishu-bind](/Users/test/.codex/skills/other/SKILL.md)"), "invalid-bind");
   assert.equal(classifyFeishuPrompt("$feishu-bind 然后继续"), "invalid-bind");
   assert.equal(classifyFeishuPrompt("$feishu-unbind 暂停一下"), "invalid-unbind");
+  assert.equal(classifyFeishuPrompt("$feishu-rotate 现在"), "invalid-rotate");
   assert.equal(classifyFeishuPrompt(
     "[$feishu-status](/Users/test/.codex/skills/feishu-status/SKILL.md) 看看"), "invalid-status");
   assert.equal(isBindingPrompt("继续写代码"), false);
@@ -840,6 +1052,8 @@ test("Prompt hook 只接受占据整条输入的显式控制命令", () => {
   assert.match(c, /无需再次预览或确认/u);
   assert.match(composeUnbindContext({ bridgeRoot: "/bridge", threadId: THREAD_A }), /feishu-unbind\.mjs/);
   assert.match(composeStatusContext({ bridgeRoot: "/bridge", threadId: THREAD_A }), /feishu-status\.mjs/);
+  assert.match(composeRotateContext({ bridgeRoot: "/bridge", threadId: THREAD_A }),
+    /feishu-rotate\.mjs.*--apply/u);
 });
 
 test("像控制命令但附带正文时明确提示格式，绝不执行或登记未绑定 task", () => {
@@ -1350,7 +1564,7 @@ test("安装器在隔离 HOME 只追加 hooks、渲染技能路径且保留已�
   assert.equal(controlSkill.includes("AILY_CLI_*"), true);
   assert.equal(controlSkill.includes("m5codex-inbound-router"), true);
   assert.equal(controlSkill.includes("$feishu-unbind"), true);
-  for (const name of ["feishu-bind", "feishu-unbind", "feishu-status"]) {
+  for (const name of ["feishu-bind", "feishu-unbind", "feishu-status", "feishu-rotate"]) {
     const commandSkill = fs.readFileSync(path.join(codexHome, "skills", name, "SKILL.md"), "utf-8");
     assert.equal(commandSkill.includes("name: " + name), true);
     if (name === "feishu-bind") {
@@ -1613,7 +1827,7 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
       Stop: [{ hooks: [{ command: "node " + path.join(ROOT, "scripts", "codex", "stop-hook.mjs") }] }],
     },
   }));
-  for (const name of ["m5codex-inbound-router", "codex-longtask-feishu", "feishu-bind", "feishu-unbind", "feishu-status"]) {
+  for (const name of ["m5codex-inbound-router", "codex-longtask-feishu", "feishu-bind", "feishu-unbind", "feishu-status", "feishu-rotate"]) {
     const skillDir = path.join(codexHome, "skills", name);
     fs.mkdirSync(skillDir, { recursive: true });
     fs.writeFileSync(path.join(skillDir, "SKILL.md"), "---\nname: " + name + "\n---\n");

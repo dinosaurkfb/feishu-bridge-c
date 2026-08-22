@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /** 一次性 watcher：确认 Codex run 终局、兜底入队、按发布合同处理并释放 task 锁。 */
 
-import { recordClaimState } from "../claim.mjs";
+import { readClaim, recordClaimState } from "../claim.mjs";
 import { releaseSessionLock } from "../handoff.mjs";
 import {
   appendEvent, markPublishEligibleByEventKey, MAX_REPLY_CHARS, suppressPublishByEventKey,
@@ -36,6 +36,8 @@ const run = {
   lastMessagePath: paths.runs + "/" + key + ".last-message.txt",
 };
 const eventKey = "codex:" + task.codex_thread_id + ":claim:" + key + ":reply";
+const acceptedClaim = readClaim({ claimsDir: paths.claims, key });
+const targetGenerationId = acceptedClaim?.origin_channel_generation_id ?? null;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const started = Date.now();
 const MAX_WAIT_MS = 4 * 60 * 60 * 1000;
@@ -72,6 +74,8 @@ try {
           : outcome.finalText.slice(0, MAX_REPLY_CHARS) + "\n…（本条已截断，全文保留在本机 run 记录）",
         source: "codex-run-watcher-fallback",
         eventKey,
+        targetGenerationId,
+        runId: key,
       });
       // Stop 只保存入站答复；四项终局证据齐全后，watcher 才允许它自动发布。
       markPublishEligibleByEventKey({ outboxDir: paths.outbox, eventKey });
@@ -96,6 +100,8 @@ try {
       source: "codex-run-watcher",
       eventKey: "codex:" + task.codex_thread_id + ":claim:" + key + ":failure",
       publishEligible: task.auto_publish_on_completion === true,
+      targetGenerationId,
+      runId: key,
     });
     publishEligibleTaskEvents({ task, home });
     recordClaimState({
@@ -120,6 +126,8 @@ try {
       source: "codex-run-watcher",
       eventKey: "codex:" + task.codex_thread_id + ":claim:" + key + ":watch-timeout",
       publishEligible: task.auto_publish_on_completion === true,
+      targetGenerationId,
+      runId: key,
     });
     publishEligibleTaskEvents({ task, home });
     recordClaimState({

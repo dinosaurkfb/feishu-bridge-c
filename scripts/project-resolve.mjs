@@ -22,6 +22,7 @@ import path from "node:path";
 
 import { CHAIN_FIELDS, OPTIONAL_CHAIN_FIELDS, loadChainTemplate, materializeProjectConfig } from "./chain-template.mjs";
 import { loadRegistry } from "./registry.mjs";
+import { applyTopicGenerationToMapping } from "./topic-generation.mjs";
 
 const readJson = (p) => JSON.parse(fs.readFileSync(p, "utf-8"));
 
@@ -97,7 +98,7 @@ export function selectBindingEntry(entries, claudeSessionId) {
  * 这条是这次能少写两个配置文件的全部原因：读取方看不出区别，就不必为两种存放方式各写一遍。
  */
 export function mappingFromRegistryEntry(entry, { consumed = [] } = {}) {
-  return {
+  const mapping = {
     schema_version: "1.0",
     binding_id: entry.id + "@registry",
     status: entry.status ?? "active",
@@ -108,6 +109,9 @@ export function mappingFromRegistryEntry(entry, { consumed = [] } = {}) {
     session_id: entry.session_id ?? null,
     inbound_state: entry.inbound_state ?? "pending",
     pending_token: entry.pending_token ?? null,
+    pending_expires_at: entry.pending_expires_at ?? null,
+    channel_generation_id: entry.channel_generation_id ?? null,
+    topic_generation_state: entry.topic_generation_state ?? null,
 
     inbound_prefix: null,
     // 会话级绑定把 Claude 会话 id 带进 mapping，入站据此投给指定的那条线。
@@ -122,6 +126,15 @@ export function mappingFromRegistryEntry(entry, { consumed = [] } = {}) {
 
     created_at: entry.bound_at ?? null,
     _source: "registry",
+  };
+  const evolved = applyTopicGenerationToMapping(mapping, {
+    runtime: "claude",
+    bindingId: mapping.binding_id,
+  });
+  return evolved.ok ? evolved.mapping : {
+    ...mapping,
+    status: "invalid",
+    topic_generation_error: evolved.reason,
   };
 }
 
@@ -210,6 +223,16 @@ export function resolveProject({ root, claudeSessionId, registryFile, templateFi
   // 「发送者不是授权用户」，而且理由听起来像是真的，最难查的那种。
   if (mapping && mapping.frank_sender_id === undefined && config?.frank_sender_id !== undefined) {
     mapping.frank_sender_id = config.frank_sender_id;
+  }
+
+  // 项目文件形式也只做内存投影；真正轮转时 adapter 才在生命周期锁内持久化。
+  if (mapping && source === "project-files") {
+    const evolved = applyTopicGenerationToMapping(mapping, {
+      runtime: "claude",
+      bindingId: mapping.binding_id ?? (path.basename(root) + "@project-files"),
+    });
+    if (evolved.ok) mapping = evolved.mapping;
+    else mapping = { ...mapping, status: "invalid", topic_generation_error: evolved.reason };
   }
 
   return { ok: true, source, root, mapping, config, configError,

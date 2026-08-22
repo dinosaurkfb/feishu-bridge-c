@@ -29,6 +29,7 @@ import {
   appendConsumed, evaluatePromotion, findBindingForSession, findPendingBinding, promoteBinding,
   shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
+import { closeClaudeTopicRotation } from "./topic-generation-store.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 
@@ -182,6 +183,15 @@ if (!routed.ok) {
   const promotionNow = Date.now();
   const pending = findPendingBinding({ content: event.content, now: promotionNow });
   const promo = evaluatePromotion({ event, template, pending, now: promotionNow });
+  if (!pending.ok && pending.reason === "pending_binding_expired" && pending.operationId) {
+    closeClaudeTopicRotation({
+      root: pending.root,
+      claudeSessionId: pending.claudeSessionId,
+      operationId: pending.operationId,
+      reason: "expired",
+      now: promotionNow,
+    });
+  }
   subscriptionClaimShadow = shadowClaudeFirstClaim({
     event,
     template,
@@ -213,7 +223,14 @@ if (!routed.ok) {
     process.exit(0);
   }
 
-  const wrote = promoteBinding({ root: promo.root, sessionId: event.session_id });
+  const wrote = promoteBinding({
+    root: promo.root,
+    id: promo.id,
+    source: promo.source,
+    generationId: promo.generationId,
+    operationId: pending.operationId,
+    sessionId: event.session_id,
+  });
   if (!wrote.ok) {
     writeReceipt("bind-failed-" + event.message_id, {
       status: "error", reason: wrote.reason, message_id: event.message_id,

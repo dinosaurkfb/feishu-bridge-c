@@ -44,7 +44,7 @@ export const MAX_REPLY_CHARS = 4000;
 /** 一条进展一个文件：先完整写临时文件，再原子提交最终目录项；排空时逐条标记。 */
 export function appendEvent({
   outboxDir, kind, text, source, eventKey, publishEligible = false,
-  inputText, inputOrigin,
+  inputText, inputOrigin, targetGenerationId, runId,
 }) {
   if (!KINDS.includes(kind)) {
     return { ok: false, reason: "unknown_kind", allowed: KINDS };
@@ -90,6 +90,12 @@ export function appendEvent({
     // 目标话题，不能再写进这里让机器人复读；非 reply 进展也没有可配对的人类输入。
     input_origin: localInput ? "local" : null,
     input_text: localInput || null,
+    // INV-9：目标在 outbox 形成时冻结。飞书来源取受理 claim 的 origin generation；
+    // 本地来源取此刻 active generation。旧事件没有该字段，发布器才回落到当前 active。
+    target_channel_generation_id: typeof targetGenerationId === "string" && targetGenerationId
+      ? targetGenerationId
+      : null,
+    run_id: typeof runId === "string" && runId ? runId : null,
     created_at: createdAt,
     // Codex 自动发布只消费显式取得发布资格的事件。升级前积压的 outbox、以及尚未经过
     // 严格终局确认的入站答复都没有这个标记，不能因为下一轮 Stop 就被顺带发出去。

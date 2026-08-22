@@ -15,15 +15,24 @@
  */
 
 import fs from "node:fs";
+import path from "node:path";
 
 import { loadChainTemplate } from "./chain-template.mjs";
-import { loadRegistry, registryPath } from "./registry.mjs";
-import { appendConsumed, loadConsumed, resolveProject } from "./project-resolve.mjs";
+import {
+  acquirePublishLock, loadRegistry, registryPath, releasePublishLock,
+} from "./registry.mjs";
+import {
+  appendConsumed, loadConsumed, projectMappingPath, resolveProject,
+} from "./project-resolve.mjs";
 import { bindingTokensInQuote, extractMentionIds } from "./selector.mjs";
 import {
   MESSAGE_RECEIVE_EVENT, buildLegacySubscriptionReadModel, compareFirstClaimShadow,
   legacyEndpointId, selectPendingSubscriptionClaim, stableControlId,
 } from "./subscription.mjs";
+import {
+  activatePendingTopicGeneration, materializeLegacyTopicFields, pendingGeneration,
+  topicGenerationStateForLegacy,
+} from "./topic-generation.mjs";
 
 // 幂等列表住在 project-resolve（它是更低层的那个模块），从这里转出去，
 // 免得 inbound.mjs 为了一件事 import 两个模块。
@@ -72,9 +81,22 @@ export function listBindings({ registryFile, templateFile } = {}) {
 
   const bindings = [];
   for (const p of reg.projects) {
-    const r = resolveProject({ root: p.root, registryFile, templateFile });
+    const r = resolveProject({
+      root: p.root,
+      claudeSessionId: p.claude_session_id,
+      registryFile,
+      templateFile,
+    });
     if (!r.ok) continue;
-    bindings.push({ root: p.root, id: p.id, entry: p, config: r.config, mapping: r.mapping, source: r.source });
+    bindings.push({
+      root: p.root,
+      id: p.id,
+      entry: p,
+      config: r.config,
+      mapping: r.mapping,
+      source: r.source,
+      claudeSessionId: r.claudeSessionId ?? p.claude_session_id ?? null,
+    });
   }
   return { ok: true, bindings };
 }
@@ -124,9 +146,10 @@ export function findPendingBinding({ content, registryFile, templateFile, now = 
   const listed = listBindings({ registryFile, templateFile });
   if (!listed.ok) return { ok: false, reason: listed.reason };
 
-  const pending = listed.bindings.filter(
-    (b) => b.mapping?.inbound_state === "pending" && !b.mapping?.session_id,
-  );
+  const pending = listed.bindings.flatMap((binding) => {
+    const generation = pendingGeneration(binding.mapping?.topic_generation_state);
+    return generation ? [{ ...binding, generation }] : [];
+  });
   if (pending.length === 0) return { ok: false, reason: PROMOTE_REJECT.NO_PENDING };
 
   const tokens = bindingTokensInQuote(content);
@@ -136,7 +159,7 @@ export function findPendingBinding({ content, registryFile, templateFile, now = 
 
   let one;
   if (tokens.length === 1) {
-    const hits = pending.filter((b) => b.mapping?.pending_token === tokens[0]);
+    const hits = pending.filter((b) => b.generation?.pending_token === tokens[0]);
     // 认得出码但没人认领：与其回落到「只有一份」猜一个，不如明说 —— 回落会在
     // 「Frank 在 A 话题说话、而待绑定的是 B」时把 B 绑给 A，静默且难查。
     if (hits.length === 0) {
@@ -154,13 +177,28 @@ export function findPendingBinding({ content, registryFile, templateFile, now = 
     one = pending[0];
   }
 
-  if (now >= pendingDeadline(one.entry)) {
-    return { ok: false, reason: PROMOTE_REJECT.PENDING_EXPIRED, id: one.id, root: one.root };
+  const generationDeadline = Date.parse(one.generation?.claim_expires_at ?? "");
+  const deadline = Number.isFinite(generationDeadline)
+    ? generationDeadline
+    : pendingDeadline(one.entry);
+  if (now >= deadline) {
+    return {
+      ok: false,
+      reason: PROMOTE_REJECT.PENDING_EXPIRED,
+      id: one.id,
+      root: one.root,
+      source: one.source,
+      claudeSessionId: one.claudeSessionId,
+      generationId: one.generation.channel_generation_id,
+      operationId: one.mapping?.topic_generation_state?.rotation?.operation_id ?? null,
+    };
   }
   return {
     ok: true, ...one,
     matchedBy: tokens.length === 1 ? "quoted_binding_token" : "only_pending",
-    deadline: pendingDeadline(one.entry),
+    deadline,
+    generationId: one.generation.channel_generation_id,
+    operationId: one.mapping?.topic_generation_state?.rotation?.operation_id ?? null,
   };
 }
 
@@ -189,6 +227,16 @@ export function buildClaudeSubscriptionProjection({ registryFile, templateFile }
     const mapping = resolved?.mapping ?? null;
     const config = resolved?.config ?? null;
     const targetIsSession = Boolean(entry.claude_session_id ?? mapping?.claude_session_id);
+    const projectedState = entry.root_message_id
+      ? topicGenerationStateForLegacy(entry, {
+        runtime: "claude",
+        bindingId: (entry.id ?? "project") + "@registry",
+      })
+      : null;
+    const state = mapping?.topic_generation_state ?? (projectedState?.ok ? projectedState.state : null);
+    const pending = pendingGeneration(state);
+    const active = state?.generations?.find((generation) =>
+      generation.channel_generation_id === state.active_generation_id);
     records.push({
       legacy_key: entry.id,
       domain_key: entry.root,
@@ -196,11 +244,11 @@ export function buildClaudeSubscriptionProjection({ registryFile, templateFile }
         "target", "claude", entry.id, targetIsSession ? "session" : "project",
       ),
       status: entry.status ?? mapping?.status ?? "active",
-      inbound_state: entry.inbound_state ?? mapping?.inbound_state ?? "pending",
-      session_id: entry.session_id ?? mapping?.session_id ?? null,
-      pending_token: entry.pending_token ?? mapping?.pending_token ?? null,
-      pending_expires_at: entry.pending_expires_at,
-      bound_at: entry.bound_at ?? mapping?.created_at,
+      inbound_state: pending ? "pending" : (entry.inbound_state ?? mapping?.inbound_state ?? "bound"),
+      session_id: pending ? null : (active?.session_id ?? entry.session_id ?? mapping?.session_id ?? null),
+      pending_token: pending?.pending_token ?? entry.pending_token ?? mapping?.pending_token ?? null,
+      pending_expires_at: pending?.claim_expires_at ?? entry.pending_expires_at ?? null,
+      bound_at: pending?.created_at ?? entry.bound_at ?? mapping?.created_at,
       chat_id: entry.chat_id ?? config?.chat_id ?? template.chat_id,
     });
   }
@@ -270,7 +318,13 @@ export function evaluatePromotion({ event, template, pending, now = Date.now() }
 
   if (!pending?.ok) return reject(pending?.reason ?? PROMOTE_REJECT.NO_PENDING, { ids: pending?.ids });
 
-  return { ok: true, root: pending.root, id: pending.id };
+  return {
+    ok: true,
+    root: pending.root,
+    id: pending.id,
+    source: pending.source,
+    generationId: pending.generationId,
+  };
 }
 
 /**
@@ -278,27 +332,88 @@ export function evaluatePromotion({ event, template, pending, now = Date.now() }
  *
  * 只改这两个字段，其余原样留着。写前留 .prev，和别处一致。
  */
-export function promoteBinding({ root, sessionId, registryFile = registryPath(), now = Date.now() }) {
-  let reg;
+export function promoteBinding({
+  root, id, source, generationId, operationId, sessionId,
+  registryFile = registryPath(), now = Date.now(),
+}) {
+  const projectFile = projectMappingPath(root);
+  const useProjectFile = source === "project-files" ||
+    (source === undefined && fs.existsSync(projectFile) && !id);
+  const lockDir = useProjectFile
+    ? path.join(path.dirname(projectFile), "topic-generation.lock")
+    : path.join(path.dirname(registryFile), "registry.lock");
+  const lock = acquirePublishLock(lockDir);
+  if (!lock.ok) return { ok: false, reason: "binding_busy" };
   try {
-    reg = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
-  } catch (err) {
-    return { ok: false, reason: "registry_unreadable", error: String(err.message).slice(0, 200) };
-  }
-  const entry = (reg.projects ?? []).find((p) => p?.root === root);
-  if (!entry) return { ok: false, reason: "entry_gone" };
+    if (useProjectFile) {
+      let mapping;
+      try { mapping = JSON.parse(fs.readFileSync(projectFile, "utf-8")); }
+      catch (err) {
+        return { ok: false, reason: "mapping_unreadable", error: String(err.message).slice(0, 200) };
+      }
+      const bindingId = mapping.binding_id ?? (path.basename(root) + "@project-files");
+      const loaded = topicGenerationStateForLegacy(mapping, { runtime: "claude", bindingId, now });
+      if (!loaded.ok) return loaded;
+      const activated = activatePendingTopicGeneration(loaded.state, {
+        generationId, operationId, sessionId, now,
+      });
+      if (!activated.ok) return activated;
+      const materialized = materializeLegacyTopicFields(mapping, activated.state);
+      if (!materialized.ok) return materialized;
+      const { root_message_id: selectedRootMessageId, ...legacyCompatible } = materialized.record;
+      const next = {
+        ...legacyCompatible,
+        feishu_root_message_id_reference: selectedRootMessageId,
+        inbound_bound_at: new Date(now).toISOString(),
+      };
+      const tmp = projectFile + ".tmp." + process.pid;
+      fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+      fs.renameSync(tmp, projectFile);
+      return { ok: true, root, sessionId, generation: activated.active };
+    }
 
-  entry.session_id = sessionId;
-  entry.inbound_state = "bound";
-  entry.inbound_bound_at = new Date(now).toISOString();
-
-  try {
+    let reg;
+    try { reg = JSON.parse(fs.readFileSync(registryFile, "utf-8")); }
+    catch (err) {
+      return { ok: false, reason: "registry_unreadable", error: String(err.message).slice(0, 200) };
+    }
+    const entry = (reg.projects ?? []).find((project) =>
+      id ? project?.id === id : project?.root === root);
+    if (!entry) return { ok: false, reason: "entry_gone" };
+    const loaded = topicGenerationStateForLegacy(entry, {
+      runtime: "claude",
+      bindingId: (entry.id ?? path.basename(root)) + "@registry",
+      now,
+    });
+    if (!loaded.ok) return loaded;
+    const sessionUsed = (reg.projects ?? []).some((project) => {
+      if (project === entry) return false;
+      const state = topicGenerationStateForLegacy(project, {
+        runtime: "claude",
+        bindingId: (project.id ?? path.basename(project.root ?? "project")) + "@registry",
+        now,
+      });
+      return state.ok && state.state.generations.some((generation) =>
+        generation.session_id === sessionId && generation.status !== "retired");
+    });
+    if (sessionUsed) return { ok: false, reason: "session_already_bound" };
+    const activated = activatePendingTopicGeneration(loaded.state, {
+      generationId, operationId, sessionId, now,
+    });
+    if (!activated.ok) return activated;
+    const materialized = materializeLegacyTopicFields(entry, activated.state);
+    if (!materialized.ok) return materialized;
+    Object.assign(entry, materialized.record, {
+      inbound_bound_at: new Date(now).toISOString(),
+    });
     fs.copyFileSync(registryFile, registryFile + ".prev");
     const tmp = registryFile + ".tmp." + process.pid;
     fs.writeFileSync(tmp, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
     fs.renameSync(tmp, registryFile);
+    return { ok: true, root, sessionId, generation: activated.active };
   } catch (err) {
     return { ok: false, reason: "registry_unwritable", error: String(err.message).slice(0, 200) };
+  } finally {
+    releasePublishLock(lockDir);
   }
-  return { ok: true, root, sessionId };
 }

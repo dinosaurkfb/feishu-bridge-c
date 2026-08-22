@@ -91,6 +91,15 @@ import {
   SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION,
   compareFirstClaimShadow, validateSubscription,
 } from "./subscription.mjs";
+import {
+  ROTATION_STATUS, activatePendingTopicGeneration, activeGeneration,
+  closePendingTopicGeneration, materializeLegacyTopicFields, pendingGeneration,
+  prepareTopicRotation, projectLegacyTopicGeneration, registerPendingTopicGeneration,
+  resolveOutboundGeneration, validateTopicGenerationState,
+} from "./topic-generation.mjs";
+import {
+  prepareClaudeTopicRotation, registerClaudeTopicRotation,
+} from "./topic-generation-store.mjs";
 
 let passed = 0;
 let failed = 0;
@@ -171,6 +180,150 @@ test("合格消息被接受", () => {
   assert.equal(r.decision, "accept");
   assert.equal(r.instruction, "把出站发布器的草稿写完");
   assert.equal(r.messageId, "msg_1");
+});
+
+// ---------- Topic Generation：同一 binding 的轮转、冻结与超时 ----------
+
+test("Topic Generation v1 schema 与运行时常量一致", () => {
+  const schema = JSON.parse(fs.readFileSync(
+    path.resolve("references", "topic-generation-v1.schema.json"), "utf-8"));
+  assert.equal(schema.properties.schema_version.const, "1.0");
+  assert.equal(schema.properties.artifact_type.const, "feishu_bridge_topic_generations");
+  assert.deepEqual(schema.$defs.generation.properties.status.enum,
+    ["pending", "active", "read-only", "retired"]);
+});
+
+test("旧 mapping 投影出的 generation id 与既有 Mapping Policy 完全一致", () => {
+  const bindingId = "legacy@registry";
+  const projected = projectLegacyTopicGeneration({
+    runtime: "claude",
+    bindingId,
+    rootMessageId: "om_old",
+    sessionId: BOUND_SESSION,
+    inboundState: "bound",
+    createdAt: "2026-08-19T08:00:00.000Z",
+  });
+  assert.equal(projected.ok, true);
+  const context = buildLegacyMappingContext({
+    runtime: "claude",
+    mapping: {
+      binding_id: bindingId,
+      logical_task_key: "legacy",
+      session_id: BOUND_SESSION,
+    },
+    event: { session_id: BOUND_SESSION },
+  });
+  assert.equal(activeGeneration(projected.state).channel_generation_id,
+    context.originChannelGenerationId);
+});
+
+test("轮转等待 mention 时旧代际仍 active，认领后一次状态替换完成新旧切换", () => {
+  const legacy = projectLegacyTopicGeneration({
+    runtime: "claude", bindingId: "binding_a", rootMessageId: "om_old",
+    sessionId: "session_old", inboundState: "bound", now: NOW,
+  });
+  const prepared = prepareTopicRotation(legacy.state, { operationId: "op_a", now: NOW });
+  assert.equal(prepared.ok, true);
+  const registered = registerPendingTopicGeneration(prepared.state, {
+    operationId: "op_a", rootMessageId: "om_new", pendingToken: "abc123", now: NOW,
+  });
+  assert.equal(registered.ok, true);
+  assert.equal(activeGeneration(registered.state).root_message_id, "om_old");
+  assert.equal(pendingGeneration(registered.state).root_message_id, "om_new");
+  assert.equal(validateTopicGenerationState(registered.state).ok, true);
+
+  const activated = activatePendingTopicGeneration(registered.state, {
+    generationId: registered.generation.channel_generation_id,
+    sessionId: "session_new",
+    operationId: "op_a",
+    now: NOW + 1000,
+  });
+  assert.equal(activated.ok, true);
+  assert.equal(activeGeneration(activated.state).root_message_id, "om_new");
+  assert.equal(activated.previous.status, "read-only");
+  assert.equal(activated.state.rotation.status, ROTATION_STATUS.COMPLETED);
+  assert.equal(validateTopicGenerationState(activated.state).ok, true);
+
+  const oldTarget = resolveOutboundGeneration(
+    activated.state,
+    activated.previous.channel_generation_id,
+  );
+  assert.equal(oldTarget.ok, true, "轮转前冻结的迟到结果仍必须能回旧话题");
+  assert.equal(oldTarget.rootMessageId, "om_old");
+  const projected = materializeLegacyTopicFields({}, activated.state);
+  assert.equal(projected.record.root_message_id, "om_new");
+  assert.equal(projected.record.session_id, "session_new");
+});
+
+test("pending generation 超过 24 小时后 fail-closed，旧代际保持 active", () => {
+  const legacy = projectLegacyTopicGeneration({
+    runtime: "claude", bindingId: "binding_b", rootMessageId: "om_old",
+    sessionId: "session_old", inboundState: "bound", now: NOW,
+  });
+  const prepared = prepareTopicRotation(legacy.state, { operationId: "op_b", now: NOW });
+  const registered = registerPendingTopicGeneration(prepared.state, {
+    operationId: "op_b", rootMessageId: "om_new", pendingToken: "def456", now: NOW,
+  });
+  const tooLate = activatePendingTopicGeneration(registered.state, {
+    sessionId: "session_new", now: NOW + PENDING_WINDOW_MS + 1,
+  });
+  assert.equal(tooLate.reason, "pending_generation_expired");
+  const expired = closePendingTopicGeneration(registered.state, {
+    operationId: "op_b", reason: ROTATION_STATUS.EXPIRED,
+    now: NOW + PENDING_WINDOW_MS + 1,
+  });
+  assert.equal(expired.ok, true);
+  assert.equal(activeGeneration(expired.state).root_message_id, "om_old");
+  assert.equal(pendingGeneration(expired.state), null);
+  assert.equal(expired.generation.status, "retired");
+});
+
+test("Claude registry adapter 在同一份 binding 文档中持久化轮转并原子激活", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "topic-generation-claude-"));
+  const root = path.join(local, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const regFile = path.join(local, "registry.json");
+  const entry = newRegistryEntry({
+    root, name: "Claude Generation", purpose: null, token: "aaa111",
+    rootMessageId: "om_old", now: NOW,
+  });
+  // 先完成初始 generation 认领，再开始轮转。
+  fs.writeFileSync(regFile, JSON.stringify({
+    schema_version: "1.0",
+    registry_extension: { must_survive: true },
+    projects: [entry],
+  }, null, 2));
+  const first = promoteBinding({
+    root, id: entry.id, source: "registry", generationId: entry.channel_generation_id,
+    sessionId: "session_old", registryFile: regFile, now: NOW + 1,
+  });
+  assert.equal(first.ok, true);
+  const prepared = prepareClaudeTopicRotation({
+    root, operationId: "op_store", registryFile: regFile, now: NOW + 2,
+  });
+  assert.equal(prepared.ok, true);
+  const registered = registerClaudeTopicRotation({
+    root, operationId: "op_store", rootMessageId: "om_new", pendingToken: "bbb222",
+    registryFile: regFile, now: NOW + 3,
+  });
+  assert.equal(registered.ok, true);
+  const beforeClaim = JSON.parse(fs.readFileSync(regFile, "utf-8")).projects[0];
+  assert.equal(beforeClaim.root_message_id, "om_old", "pending 阶段旧代际仍是旧字段权威值");
+  assert.equal(activeGeneration(beforeClaim.topic_generation_state).root_message_id, "om_old");
+
+  const second = promoteBinding({
+    root, id: entry.id, source: "registry",
+    generationId: registered.generation.channel_generation_id,
+    sessionId: "session_new", registryFile: regFile, now: NOW + 4,
+  });
+  assert.equal(second.ok, true);
+  const afterClaim = JSON.parse(fs.readFileSync(regFile, "utf-8")).projects[0];
+  assert.equal(afterClaim.root_message_id, "om_new");
+  assert.equal(afterClaim.session_id, "session_new");
+  assert.equal(afterClaim.topic_generation_state.generations.find((generation) =>
+    generation.root_message_id === "om_old").status, "read-only");
+  assert.deepEqual(JSON.parse(fs.readFileSync(regFile, "utf-8")).registry_extension,
+    { must_survive: true }, "轮转原子替换不得丢掉未知的 registry 顶层字段");
 });
 
 // ---------- Mapping Policy：公共准入、处置与 runtime-neutral runRequest ----------
@@ -2408,7 +2561,7 @@ test("入站在绑定会话不在时不回落到别的线", () => {
   assert.ok(cont > 0);
 });
 
-// ---------- 三条控制命令：status / unbind / bind（恢复） ----------
+// ---------- 控制命令共用状态：status / unbind / bind（恢复） ----------
 //
 // 语义跟 Codex 侧对齐：暂停是**可恢复**的，绝不删话题、登记、待发内容或历史。
 // 实现上只翻绑定自己的 status —— 出站只发 active 的，入站见到非 active 直接拒，
@@ -2523,12 +2676,13 @@ test("状态命令和出站用的是同一条绑定选择规则", () => {
   assert.ok(src.includes("selectBindingEntry"));
 });
 
-test("三条控制技能都装成跟 Codex 同名的斜杠命令", () => {
+test("四条控制技能都装成跟 Codex 同名的斜杠命令", () => {
   const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
   for (const [repo, installed] of [
     ["claude-feishu-bind", "feishu-bind"],
     ["claude-feishu-status", "feishu-status"],
     ["claude-feishu-unbind", "feishu-unbind"],
+    ["claude-feishu-rotate", "feishu-rotate"],
   ]) {
     assert.ok(src.includes(repo), "安装器要认得仓库里的 " + repo);
     assert.ok(src.includes('"' + installed + '"'), "要装成 /" + installed);

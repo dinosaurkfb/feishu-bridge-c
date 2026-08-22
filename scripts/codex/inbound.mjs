@@ -16,8 +16,9 @@ import {
 } from "../mapping-policy.mjs";
 import { handOffCodex } from "./handoff.mjs";
 import {
-  appendConsumed, bridgeHome, evaluatePromotion, findPendingTask, findTaskForFeishuSession,
-  isThreadBusy, loadCodexTemplate, promoteTask, shadowCodexFirstClaim, taskPaths,
+  appendConsumed, bridgeHome, closeTaskTopicRotation, evaluatePromotion, findPendingTask,
+  findTaskForFeishuSession, isThreadBusy, loadCodexTemplate, promoteTask,
+  shadowCodexFirstClaim, taskPaths,
 } from "./state.mjs";
 
 const BRIDGE_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
@@ -122,6 +123,16 @@ if (!routed.ok) {
   }
   const promotionNow = Date.now();
   const pending = findPendingTask({ home: HOME, content: event.content, now: promotionNow });
+  if (!pending.ok && pending.reason === "pending_binding_expired" && pending.operationId &&
+      pending.task?.codex_thread_id) {
+    closeTaskTopicRotation({
+      threadId: pending.task.codex_thread_id,
+      operationId: pending.operationId,
+      reason: "expired",
+      home: HOME,
+      now: promotionNow,
+    });
+  }
   if (!pending.ok && ![
     "no_pending_binding", "multiple_pending_bindings", "multiple_binding_tokens",
     "pending_binding_token_unknown", "duplicate_pending_binding_token", "pending_binding_expired",
@@ -157,6 +168,8 @@ if (!routed.ok) {
   const promoted = promoteTask({
     logicalTaskKey: promotion.task.logical_task_key,
     sessionId: event.session_id,
+    generationId: pending.generationId,
+    operationId: pending.operationId,
     home: HOME,
   });
   if (!promoted.ok) {

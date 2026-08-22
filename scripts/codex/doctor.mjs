@@ -18,6 +18,7 @@ const REQUIRED_SKILLS = [
   "feishu-bind",
   "feishu-unbind",
   "feishu-status",
+  "feishu-rotate",
 ];
 
 function commandPath(name, extra = []) {

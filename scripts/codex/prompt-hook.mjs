@@ -17,10 +17,10 @@ export function classifyFeishuPrompt(prompt) {
   // 控制动作必须占据整条输入。CLI 保留裸 `$skill`；Desktop 会把显式技能调用序列化成
   // `[$skill](/absolute/.../$skill/SKILL.md)`。不能只查正文里有没有 token：用户可能正在
   // 讨论命令、粘贴 Agent 输出或引用旧消息，那些都没有控制授权。
-  const bare = /^\$(feishu-bind|feishu-unbind|feishu-status)$/u.exec(p);
+  const bare = /^\$(feishu-bind|feishu-unbind|feishu-status|feishu-rotate)$/u.exec(p);
   if (bare) return bare[1].slice("feishu-".length);
 
-  const linked = /^\[\$(feishu-bind|feishu-unbind|feishu-status)\]\(([^\r\n)]+)\)$/u.exec(p);
+  const linked = /^\[\$(feishu-bind|feishu-unbind|feishu-status|feishu-rotate)\]\(([^\r\n)]+)\)$/u.exec(p);
   if (linked) {
     const name = linked[1];
     const target = linked[2].replace(/\\/gu, "/");
@@ -30,9 +30,9 @@ export function classifyFeishuPrompt(prompt) {
 
   // 看起来像从命令开始、但附带了参数或正文时，必须 fail-closed 且给出反馈。讨论、引用
   // 和转发通常不会从 token 开始，仍保持静默 none，避免把普通内容误当成控制动作。
-  const malformedBare = /^\$(feishu-bind|feishu-unbind|feishu-status)(?=\s|&#x20;|&nbsp;)/u.exec(p);
+  const malformedBare = /^\$(feishu-bind|feishu-unbind|feishu-status|feishu-rotate)(?=\s|&#x20;|&nbsp;)/u.exec(p);
   if (malformedBare) return "invalid-" + malformedBare[1].slice("feishu-".length);
-  const malformedLinked = /^\[\$(feishu-bind|feishu-unbind|feishu-status)\]\([^\r\n)]*\)/u.exec(p);
+  const malformedLinked = /^\[\$(feishu-bind|feishu-unbind|feishu-status|feishu-rotate)\]\([^\r\n)]*\)/u.exec(p);
   if (malformedLinked) return "invalid-" + malformedLinked[1].slice("feishu-".length);
   return "none";
 }
@@ -76,6 +76,17 @@ export function composeStatusContext({ bridgeRoot, threadId }) {
     "只运行以下只读命令，并用简洁自然语言转述 stdout：",
     "`node " + command + " --thread-id " + threadId + "`",
     "不得直接读取或输出 registry、locator、凭据、claim 或 receipt。",
+  ].join("\n");
+}
+
+export function composeRotateContext({ bridgeRoot, threadId }) {
+  const command = path.join(bridgeRoot, "scripts", "codex", "feishu-rotate.mjs");
+  return [
+    "[Codex 飞书桥·话题轮转] 用户通过 $feishu-rotate 明确授权为当前精确 task 创建下一话题代际。",
+    "当前 task 的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
+    "直接运行以下两阶段轮转命令，不要再次要求确认：",
+    "`node " + command + " --thread-id " + threadId + " --apply`",
+    "新话题完成首次真实 mention 认领前，旧话题继续 active；认领成功后旧话题只读。不得删除旧话题或直接编辑 registry。",
   ].join("\n");
 }
 
@@ -233,6 +244,8 @@ async function main() {
     additionalContext = composeUnbindContext({ bridgeRoot: tpl.template.bridge_root, threadId });
   } else if (action === "status") {
     additionalContext = composeStatusContext({ bridgeRoot: tpl.template.bridge_root, threadId });
+  } else if (action === "rotate") {
+    additionalContext = composeRotateContext({ bridgeRoot: tpl.template.bridge_root, threadId });
   } else {
     process.exit(0);
   }

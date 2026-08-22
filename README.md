@@ -222,14 +222,23 @@ session 绑定。日常还可以使用：
 | status | `$feishu-status` | `/feishu-status` | 只读查看接入、入站绑定和待发状态 |
 | unbind | `$feishu-unbind` | `/feishu-unbind` | 可恢复地暂停，不删话题、映射或历史 |
 | bind | `$feishu-bind` | `/feishu-bind` | 首次接入，或恢复已暂停的原话题连接 |
+| rotate | `$feishu-rotate` | `/feishu-rotate` | 为同一 binding 创建下一话题代际；旧话题保留为只读历史 |
 
 两边命令同名。差别只在绑定单位：Codex 绑一个精确 task，Claude 默认绑项目、
 也可以用 `bind-session` 让某一条会话单独占一个话题。
 
-当前发行版实际安装的用户命令只有上表三项。架构路线图另定义了 `$feishu-connect`、
-`$feishu-subscribe`、`$feishu-mode` 和 `$feishu-rotate`；它们分别用于 endpoint、独立订阅、交互策略和
-话题代际管理，尚未实现，不能把需求文档里的建议命令误认为当前可用能力。详见
+当前发行版实际安装上表四项。`bind` 仍是把当前精确本地 target 接入一个话题的兼容入口：首次
+接入时，它同时物化现有单群配置下的订阅授权快照，但不等同于未来可独立管理的 Subscription。
+架构路线图中的 `$feishu-connect`、`$feishu-subscribe` 和 `$feishu-mode` 分别用于 endpoint、独立订阅
+和交互策略，尚未开放，不能把需求文档里的建议命令误认为当前可用能力。详见
 [Agent 增强需求](docs/requirements/agent-enhancement-requirements.md#fr-7-显式控制面)。
+
+运行 `rotate` 后，bridge 先创建一个 `pending` 新话题。首次真实 mention 完成认领前，旧话题仍是
+唯一 active；认领成功时，新旧状态在同一份 Git 外 binding 文档的一次原子替换中切换，新话题
+成为 active，旧话题成为 read-only。轮转前已经受理的飞书请求仍回复原话题；本地回合在形成
+outbox 时冻结当时的 active 代际。待认领默认 24 小时过期，也可用对应 rotate CLI 的
+`--cancel --apply` 显式取消；两者都不会删除话题历史。实现契约见
+[Topic Generation 生命周期](docs/implementation/topic-generation-lifecycle.md)。
 
 Codex 入站通过 `codex exec resume <精确 thread>` 向原 task 追加完整用户回合。回合会持久化，
 但已经打开的 Codex Desktop 页面不保证实时绘制另一个 CLI 进程追加的事件；切换 task 再返回
@@ -330,7 +339,7 @@ references/
 ## 开发与验证
 
 ```bash
-npm test                         # Claude 313 项 + Codex adapter 69 项回归
+npm test                         # Claude 318 项 + Codex adapter 74 项回归
 npm run test:claude              # 只运行 Claude 基线
 npm run test:codex               # 只运行 Codex adapter
 npm run doctor:codex             # Codex 机器级只读自检；不写配置、不联网

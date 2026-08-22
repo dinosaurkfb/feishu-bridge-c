@@ -154,6 +154,8 @@ async function main() {
           : undefined,
         inputText: input.ok ? input.text : undefined,
         inputOrigin: input.ok ? input.inputOrigin : undefined,
+        targetGenerationId: bound.ok ? bound.mapping?.channel_generation_id : undefined,
+        runId: input.ok ? input.captureId : undefined,
       });
       // 成功后保留本轮单文件缓存，直到下一次 UserPromptSubmit 原子覆写。这样 Stop hook
       // 若在同一回合重入，仍会拿到相同 capture_id 并命中事件级幂等；立即删除反而会让
@@ -170,6 +172,7 @@ async function main() {
       const r = appendEvent({
         outboxDir,
         kind: warning.kind, text: warning.text, source: "binding-health",
+        targetGenerationId: bound.ok ? bound.mapping?.channel_generation_id : undefined,
       });
       if (r.ok) log(project.id + " binding warning recorded: " + warning.kind);
     }

@@ -8,11 +8,13 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { appendEvent, MAX_REPLY_CHARS } from "../outbox.mjs";
+import { readClaim } from "../claim.mjs";
 import { extractReply } from "../stop-hook.mjs";
 import { clearTurnInput, readTurnInput } from "../turn-input.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
 import {
-  bridgeHome, findTaskForCodexThread, hookLogFile, readThreadActivity, recordThreadActivity, taskPaths,
+  bridgeHome, findTaskForCodexThread, hookLogFile, mappingForTask,
+  readThreadActivity, recordThreadActivity, taskPaths,
 } from "./state.mjs";
 
 function log(line) {
@@ -70,6 +72,11 @@ async function main() {
   const input = !claimKey && turnKey
     ? readTurnInput({ dir: paths.turnInputs, key: turnKey })
     : { ok: false };
+  const mapping = mappingForTask(found.task, { home: bridgeHome() });
+  const claim = claimKey ? readClaim({ claimsDir: paths.claims, key: claimKey }) : null;
+  const targetGenerationId = claimKey
+    ? claim?.origin_channel_generation_id
+    : mapping.channel_generation_id;
   const r = appendEvent({
     outboxDir: paths.outbox,
     kind: "reply",
@@ -79,6 +86,8 @@ async function main() {
     publishEligible: found.task.auto_publish_on_completion === true && !claimKey,
     inputText: input.ok ? input.text : undefined,
     inputOrigin: input.ok ? input.inputOrigin : undefined,
+    targetGenerationId,
+    runId: claimKey ?? payload.turn_id,
   });
   if (!claimKey && turnKey && (r.ok || r.reason === "duplicate")) {
     clearTurnInput({ dir: paths.turnInputs, key: turnKey });

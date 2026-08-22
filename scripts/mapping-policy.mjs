@@ -116,11 +116,13 @@ export function buildLegacyMappingContext({ runtime, mapping, canonicalEvent, ev
   const bindingSeed = nonEmpty(mapping?.binding_id) ? mapping.binding_id : logicalTaskKey;
   return {
     ok: true,
-    projection: "legacy_mapping_v1",
+    projection: nonEmpty(mapping?.channel_generation_id)
+      ? "topic_generation_v1"
+      : "legacy_mapping_v1",
     localTargetId: stableControlId("local_target", runtime, logicalTaskKey),
-    originChannelGenerationId: stableControlId(
-      "channel_generation", runtime, bindingSeed, sessionId,
-    ),
+    originChannelGenerationId: nonEmpty(mapping?.channel_generation_id)
+      ? mapping.channel_generation_id
+      : stableControlId("channel_generation", runtime, bindingSeed, sessionId),
   };
 }
 

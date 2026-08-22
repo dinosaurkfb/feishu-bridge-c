@@ -46,6 +46,11 @@ import {
 } from "./state.mjs";
 import { ROTATION_STATUS, activeGeneration, pendingGeneration } from "../topic-generation.mjs";
 import { DIALOGUE_TURN_STATUS } from "../interaction-policy.mjs";
+import {
+  RELAY_DISPOSITION, RELAY_STEP_STATUS, advanceRelayPlan, createParticipantAuthorizationSnapshot,
+  createRelayPlanState, deriveDialogueBindingRef, deriveDialogueOutputRef,
+  deriveDialogueParticipantRef, startRelayCycle,
+} from "../dialogue-participant-planner.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
 const THREAD_A = "01911111-2222-7333-8444-555555555555";
@@ -66,6 +71,66 @@ const test = (name, fn) => {
   catch (err) { failed += 1; console.error("FAIL " + name + "\n" + (err.stack ?? err)); }
 };
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), "feishu-codex-adapter-test-"));
+
+const codexRelaySnapshot = () => {
+  const coordinator = deriveDialogueBindingRef({
+    runtimeNamespace: "codex", endpointId: "endpoint_codex", privateBindingKey: THREAD_A,
+  }).bindingRef;
+  const peerBinding = deriveDialogueBindingRef({
+    runtimeNamespace: "claude", endpointId: "endpoint_claude", privateBindingKey: "private_peer",
+  }).bindingRef;
+  const participant = (kind, runtime, endpoint, privateKey) => deriveDialogueParticipantRef({
+    kind, runtimeNamespace: runtime, endpointId: endpoint, privateIdentityKey: privateKey,
+  }).participantId;
+  return createParticipantAuthorizationSnapshot({
+    authorizationRevision: 1, capturedAt: 1_800_000_000_000,
+    coordinatorBindingRef: coordinator,
+    participants: [
+      { participant_id: participant("human", "feishu", "endpoint_codex", "sender"),
+        kind: "human", roles: ["requester"], subscription_id: null, binding_ref: null,
+        local_target_id: null, allowed_origins: ["human_event"],
+        limits: { max_agent_runs: 1, resource_units_per_run: 1 } },
+      { participant_id: participant("agent", "codex", "endpoint_codex", THREAD_A),
+        kind: "agent", roles: ["host", "finalizer"],
+        subscription_id: "subscription_aaaaaaaaaaaaaaaaaaaaaaaa",
+        binding_ref: coordinator, local_target_id: "target_aaaaaaaaaaaaaaaaaaaaaaaa",
+        allowed_origins: ["human_event", "planner_relay"],
+        limits: { max_agent_runs: 8, resource_units_per_run: 1 } },
+      { participant_id: participant("agent", "claude", "endpoint_claude", "peer"),
+        kind: "agent", roles: ["peer"],
+        subscription_id: "subscription_bbbbbbbbbbbbbbbbbbbbbbbb",
+        binding_ref: peerBinding, local_target_id: "target_bbbbbbbbbbbbbbbbbbbbbbbb",
+        allowed_origins: ["planner_relay"],
+        limits: { max_agent_runs: 4, resource_units_per_run: 1 } },
+    ],
+  }).snapshot;
+};
+
+test("Codex 与 Claude 共用 Participant foundation，planner 不暴露 thread locator", () => {
+  const snapshot = codexRelaySnapshot();
+  assert.equal(JSON.stringify(snapshot).includes(THREAD_A), false);
+  const state = createRelayPlanState({
+    dialogueId: "dialogue_codex_shared", snapshot, startedAt: 1_800_000_000_000,
+  }).state;
+  const started = startRelayCycle(state, {
+    snapshot, humanEventId: "human_codex", parentHumanClaimId: "a".repeat(64),
+    originChannelGenerationId: "channel_generation_aaaaaaaaaaaaaaaaaaaaaaaa",
+    now: 1_800_000_000_001,
+  });
+  assert.equal(started.disposition, RELAY_DISPOSITION.DISPATCH_ONE);
+  assert.equal(started.runRequest.local_target_id, "target_aaaaaaaaaaaaaaaaaaaaaaaa");
+  assert.equal(JSON.stringify(started.runRequest).includes(THREAD_A), false);
+  const outputRef = deriveDialogueOutputRef({
+    dialogueId: state.dialogue_id, runId: started.runRequest.run_id,
+    terminalEventId: "terminal_codex_host",
+  }).outputRef;
+  const peer = advanceRelayPlan(started.state, {
+    snapshot, runId: started.runRequest.run_id, terminalEventId: "terminal_codex_host",
+    status: RELAY_STEP_STATUS.COMPLETED, outputRef, now: 1_800_000_000_002,
+  });
+  assert.equal(peer.runRequest.role, "peer");
+  assert.equal(peer.runRequest.local_target_id, "target_bbbbbbbbbbbbbbbbbbbbbbbb");
+});
 
 function autoPublishFixture({ enabled = true, workingPublisher = true } = {}) {
   const home = temp();

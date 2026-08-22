@@ -624,10 +624,10 @@ test("Stop 与 watcher 并发写同一事件键时只留下一个文件", () => 
   assert.equal(listPending({ outboxDir }).length, 1);
 });
 
-test("Prompt hook 的接桥意图窄匹配，并注入精确 thread 命令", () => {
-  assert.equal(isBindingPrompt("把这个任务接到飞书"), true);
-  assert.equal(isBindingPrompt("飞书接入当前任务"), true);
-  assert.equal(isBindingPrompt("新建一个飞书话题"), true);
+test("Prompt hook 只接受占据整条输入的显式控制命令", () => {
+  assert.equal(isBindingPrompt("把这个任务接到飞书"), false);
+  assert.equal(isBindingPrompt("飞书接入当前任务"), false);
+  assert.equal(isBindingPrompt("新建一个飞书话题"), false);
   assert.equal(isBindingPrompt("/init"), false, "/init 是 AGENTS.md 初始化，不是绑定命令");
   assert.equal(classifyFeishuPrompt("/init"), "init");
   assert.equal(classifyFeishuPrompt("$feishu-bind"), "bind");
@@ -636,9 +636,17 @@ test("Prompt hook 的接桥意图窄匹配，并注入精确 thread 命令", () 
   assert.equal(classifyFeishuPrompt("[$feishu-bind](/Users/test/.codex/skills/feishu-bind/SKILL.md)"), "bind");
   assert.equal(classifyFeishuPrompt("[$feishu-unbind](/Users/test/.codex/skills/feishu-unbind/SKILL.md)"), "unbind");
   assert.equal(classifyFeishuPrompt("[$feishu-status](/Users/test/.codex/skills/feishu-status/SKILL.md)"), "status");
-  assert.equal(classifyFeishuPrompt("把当前 task 撤销飞书接入"), "unbind");
-  assert.equal(classifyFeishuPrompt("查看当前 task 的飞书接入状态"), "status");
+  assert.equal(classifyFeishuPrompt(
+    "[$feishu-bind](/Users/test/.codex/skills/feishu-bind/SKILL.md)&#x20;"), "bind");
+  assert.equal(classifyFeishuPrompt("把当前 task 撤销飞书接入"), "none");
+  assert.equal(classifyFeishuPrompt("查看当前 task 的飞书接入状态"), "none");
   assert.equal(classifyFeishuPrompt("是不是也可以加个命令来实现接入飞书和撤销接入？"), "none");
+  assert.equal(classifyFeishuPrompt("请评审 `$feishu-bind` 的设计"), "none");
+  assert.equal(classifyFeishuPrompt("Agent 建议：$feishu-bind"), "none");
+  assert.equal(classifyFeishuPrompt("> [$feishu-bind](/Users/test/.codex/skills/feishu-bind/SKILL.md)"), "none");
+  assert.equal(classifyFeishuPrompt(
+    "[$feishu-bind](/Users/test/.codex/skills/other/SKILL.md)"), "none");
+  assert.equal(classifyFeishuPrompt("$feishu-bind 然后继续"), "none");
   assert.equal(isBindingPrompt("继续写代码"), false);
   assert.equal(isBindingPrompt([
     '<at id="ou_m5">M5Codex</at>', "", "**[引用]**", "🌉 Codex-Lark", "",
@@ -679,9 +687,9 @@ test("$feishu-bind 直接注入幂等绑定命令，不再产生二次确认回�
 test("/init 只追加初始化成功后的询问，不触发绑定或飞书写入", () => {
   const c = composeInitContext({ connectionStatus: "none" });
   assert.match(c, /先完整执行 \/init 原本的 AGENTS\.md 初始化/);
-  assert.match(c, /是否将当前 Codex task 接入飞书/);
-  assert.match(c, /请回复“接入飞书”/);
-  assert.match(c, /不再要求第二次确认/);
+  assert.match(c, /如需将当前 Codex task 接入飞书，请运行 `\$feishu-bind`/);
+  assert.match(c, /普通自然语言回复不构成控制授权/);
+  assert.equal(c.includes("请回复“接入飞书”"), false);
   assert.equal(c.includes("bind-task.mjs"), false);
 
   const home = temp();
@@ -709,7 +717,7 @@ test("Prompt hook 在 Aily/M5Codex 回合只注入数据面命令，不记录 le
       session_id: THREAD_B,
       turn_id: "turn_aily",
       cwd: "/Users/test/aily_workspaces/m5codex",
-      prompt: "把这个任务接到飞书",
+      prompt: "$feishu-bind",
     }),
     encoding: "utf-8",
     env: {
@@ -727,7 +735,7 @@ test("Prompt hook 在 Aily/M5Codex 回合只注入数据面命令，不记录 le
   assert.equal(fs.existsSync(path.join(home, "active-threads")), false);
 
   const wrongCaller = spawnSync(process.execPath, [hook], {
-    input: JSON.stringify({ session_id: THREAD_B, prompt: "把这个任务接到飞书" }),
+    input: JSON.stringify({ session_id: THREAD_B, prompt: "$feishu-bind" }),
     encoding: "utf-8",
     env: {
       ...process.env,

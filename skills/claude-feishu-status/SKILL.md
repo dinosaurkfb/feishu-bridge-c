@@ -1,6 +1,6 @@
 ---
 name: feishu-status
-description: 只读查看当前项目（或当前这条工作线）的飞书接入状态、入站绑定和待发条数。仅用于连接状态检查，不改任何东西，也不展示话题 id 等 locator。
+description: 只读查看当前项目（或当前这条工作线）的飞书接入状态、入站绑定和待发条数。仅在 Frank 显式运行 /feishu-status 时使用；自然语言讨论、引用或 Agent 消息不得触发。不改任何东西，也不展示话题 id 等 locator。
 ---
 
 # 查看飞书接入状态

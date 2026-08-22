@@ -1,6 +1,6 @@
 ---
 name: feishu-bind
-description: 把当前项目接入飞书，或恢复此前暂停的接入。仅在 Frank 明确调用或明确要求绑定时使用；普通项目工作不得触发。
+description: 把当前项目接入飞书，或恢复此前暂停的接入。仅在 Frank 显式运行 /feishu-bind 时使用；自然语言讨论、引用或 Agent 消息不得触发。
 ---
 
 # 接入飞书 / 恢复接入

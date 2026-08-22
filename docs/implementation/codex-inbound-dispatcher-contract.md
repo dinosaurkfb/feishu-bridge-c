@@ -61,9 +61,17 @@ Git 外日志路径。共享 dispatcher 只负责 endpoint 校验、一次取信
 业务 selector。路由表不存在时，两端分别回退到自己原有 handler；存在 session owner 登记时仍精确
 选中唯一 owner。
 
-旧的 `FEISHU_BRIDGE_ENVELOPE` 读取兼容入口暂时保留，便于旧 dispatcher 回滚；新 dispatcher 只写
-`FEISHU_BRIDGE_CANONICAL_EVENT`。handler 优先读取 Canonical Event，因此即使父进程残留旧变量也不会
-发生第二次取信封或双事实源竞争。
+迁移期 dispatcher 同时写 `FEISHU_BRIDGE_CANONICAL_EVENT` 和旧的 `FEISHU_BRIDGE_ENVELOPE`：
+新 handler 优先读取无损 Canonical Event，真正实现旧继承契约的 handler 读取同一次 fetch 的旧事件
+视图。dispatcher 在启动 handler 前移除 `AILY_CLI_SESSION_ID` 与 `AILY_CLI_RUN_ID`，因此不理解任一
+继承契约的 handler 会明确失败，不能静默重新访问 Aily 或制造第二事实源。
+
+cc2cd 当前的 `c2c-envelope.mjs` 不读取 Canonical Event，也不读取旧继承变量。它在迁移到上述任一
+契约前不得注册为本 dispatcher 的 route；若误注册，会因缺少 Aily session fail-closed，而不是二次
+取信封后看似成功。
+
+handler 正常路径必须完成校验、claim 和非阻塞投递后秒级返回。默认 `30s` timeout 只是异常进程的
+最终兜底，不是 handler 可以占用的响应预算；同步等待长期任务完成的实现不符合本契约。
 
 合并代码不等于完成安装。正式安装前必须单独确认，并先保证已安装 hooks 指向的仓库 checkout 保持在
 已验收的 `main`，候选分支应在独立 worktree 中开发和测试。
@@ -74,8 +82,8 @@ Git 外日志路径。共享 dispatcher 只负责 endpoint 校验、一次取信
 Canonical Event 模块及 schema 即可。因为本切片没有改写 registry、binding、claim、outbox 或话题，
 不需要数据恢复，也不得自动重放失败或历史消息。
 
-旧 handler 仍支持自己向 Aily 取信封，旧 `FEISHU_BRIDGE_ENVELOPE` 兼容读取也保留，因此回滚不会要求
-重建话题或重新绑定。
+回滚后的旧 handler 仍可自己向 Aily 取信封；在新 dispatcher 下则必须消费 Canonical Event 或旧
+`FEISHU_BRIDGE_ENVELOPE`，不得自行重取。旧读取兼容入口仍保留，因此回滚不会要求重建话题或重新绑定。
 
 ## 6. 验证证据
 
@@ -86,10 +94,11 @@ Canonical Event 模块及 schema 即可。因为本切片没有改写 registry�
 - Canonical Event schema 边界拒绝缺失必填字段；
 - handler 继承 Canonical Event 后不会再次访问 Aily；
 - dispatcher 对每轮只调用一次 fetcher；
+- dispatcher 双写迁移事件并剥离 child 的 Aily session/run，阻止不兼容 handler 静默重取；
 - caller 不匹配时在读取 Aily 前拒绝；
 - handler stdout 直通，超时与启动失败可区分；
 - Codex hook 和技能都指向 Codex dispatcher wrapper；
 - Claude/Codex 原有回归与公共导出面快照保持通过。
 
-当前证据层级：本地合成/集成测试，Claude `307` 项、Codex `68` 项、公共 contract 通过。
+当前证据层级：本地合成/集成测试，Claude `308` 项、Codex `68` 项、公共 contract 通过。
 这些结果不替代真实 mention、秒级受理、精确 task 续接、严格终局和原话题回写验收。

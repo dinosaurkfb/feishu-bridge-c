@@ -6,11 +6,12 @@
  */
 
 import { spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
 import { CANONICAL_EVENT_ENV, buildCanonicalEvent } from "./canonical-event.mjs";
-import { fetchTriggerEvent } from "./envelope.mjs";
+import { ENVELOPE_ENV, fetchTriggerEvent } from "./envelope.mjs";
 import { ROUTE_REJECT_TEXT, loadRoutes, selectRoute } from "./inbound-routes.mjs";
 
 const appendLog = (file, line) => {
@@ -23,6 +24,9 @@ const appendLog = (file, line) => {
 };
 
 const write = (stream, text) => stream?.write?.(text);
+const diagnosticId = (value) => typeof value === "string" && value
+  ? "sha256:" + crypto.createHash("sha256").update(value).digest("hex").slice(0, 12)
+  : "none";
 
 /**
  * 返回 exitCode，由薄 CLI wrapper 决定 process.exit。测试可注入 fetch/spawn/stream，
@@ -58,7 +62,7 @@ export function runInboundDispatcher({
 
   const callerAgent = env.AILY_CLI_CALLER_AGENT_UID;
   if (callerAgent !== expectedCallerAgentUid) {
-    log("caller mismatch");
+    log("caller mismatch: got=" + diagnosticId(callerAgent));
     write(stdout, "已拒绝 · 调用方不是本链路的运输 agent\n本条指令没有被投递给任何任务。\n");
     write(stderr, JSON.stringify({ kind: "rejected", stage: "dispatch",
       reason: "caller_agent_mismatch" }) + "\n");
@@ -98,7 +102,8 @@ export function runInboundDispatcher({
     sessions: table.sessions,
   });
   if (!picked.ok) {
-    log("route selection failed: " + picked.reason);
+    log("route selection failed: " + picked.reason +
+      " session=" + diagnosticId(canonical.event.source.session_id));
     return fail(ROUTE_REJECT_TEXT[picked.reason] ?? picked.reason, picked.reason);
   }
 
@@ -117,14 +122,26 @@ export function runInboundDispatcher({
 
   log("dispatch -> " + picked.route.id + " (" + picked.matchedBy + ")");
   let serialized;
+  let legacySerialized;
   try {
     serialized = JSON.stringify(canonical.event);
+    legacySerialized = JSON.stringify(fetched.event);
   } catch {
     return fail("规范化消息无法交给处理器", "canonical_event_unserializable");
   }
+  const childEnv = {
+    ...env,
+    [CANONICAL_EVENT_ENV]: serialized,
+    // 迁移期兼容真正实现了旧继承契约的 handler。Canonical Event 仍是新 handler 的唯一完整事实源。
+    [ENVELOPE_ENV]: legacySerialized,
+  };
+  // dispatcher 已经取得本轮信封。去掉可再次查询 Aily 的 session/run 能力，保证“不理解继承契约”
+  // 的旧 handler 明确失败，而不是静默进行第二次 fetch、让分发与执行基于两份不同事实。
+  delete childEnv.AILY_CLI_SESSION_ID;
+  delete childEnv.AILY_CLI_RUN_ID;
   const child = spawnHandler(process.execPath, [handler, ...handlerArgs], {
     stdio: ["ignore", "inherit", "inherit"],
-    env: { ...env, [CANONICAL_EVENT_ENV]: serialized },
+    env: childEnv,
     timeout: handlerTimeoutMs,
     killSignal: "SIGTERM",
   });

@@ -2717,7 +2717,11 @@ test("共享 dispatcher 只取一次信封并把 Canonical Event 原样交给 ha
     expectedCallerAgentUid: "agent_expected",
     defaultRoute: { id: "codex", handler },
     routesFile: path.join(dir, "missing-routes.json"),
-    env: { AILY_CLI_CALLER_AGENT_UID: "agent_expected" },
+    env: {
+      AILY_CLI_CALLER_AGENT_UID: "agent_expected",
+      AILY_CLI_SESSION_ID: "must-not-reach-handler",
+      AILY_CLI_RUN_ID: "must-not-reach-handler",
+    },
     stdout: { write: (s) => out.push(s) }, stderr: { write: (s) => err.push(s) },
     fetcher: () => {
       fetches += 1;
@@ -2734,8 +2738,16 @@ test("共享 dispatcher 只取一次信封并把 Canonical Event 原样交给 ha
   assert.deepEqual(spawned[1], [handler]);
   assert.deepEqual(spawned[2].stdio, ["ignore", "inherit", "inherit"]);
   assert.equal(spawned[2].timeout, 30_000);
-  assert.equal(Object.hasOwn(spawned[2].env, ENV_PASS), false,
-    "新 dispatcher 不该同时维护第二份有损事件环境变量");
+  assert.deepEqual(JSON.parse(spawned[2].env[ENV_PASS]), {
+    message_id: "m-dispatch", session_id: "s-dispatch", sender_id: "frank",
+    created_at_ms: NOW, content: "执行",
+  }, "真正实现旧继承契约的 handler 在迁移期也只能读取同一份已取事件");
+  assert.equal(Object.hasOwn(spawned[2].env, "AILY_CLI_SESSION_ID"), false,
+    "handler 不得保留再次按 session 查询 Aily 的能力");
+  assert.equal(Object.hasOwn(spawned[2].env, "AILY_CLI_RUN_ID"), false,
+    "handler 不得保留再次按 run 查询 Aily 的能力");
+  assert.equal(spawned[2].env.AILY_CLI_CALLER_AGENT_UID, "agent_expected",
+    "handler 仍需独立校验 endpoint caller");
   const passed = JSON.parse(spawned[2].env[CANONICAL_PASS]);
   assert.equal(passed.event_id, "m-dispatch");
   assert.deepEqual(passed.raw_envelope.payload, raw);
@@ -2746,15 +2758,41 @@ test("共享 dispatcher 只取一次信封并把 Canonical Event 原样交给 ha
 
 test("dispatcher 在调用方不匹配时连 Aily 都不读取", () => {
   let fetches = 0;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-dispatcher-log-"));
+  const logFile = path.join(dir, "dispatcher.log");
   const result = runInboundDispatcher({
     endpointId: "m5codex", expectedCallerAgentUid: "expected",
     defaultRoute: { id: "codex", handler: "/not-used" },
-    env: { AILY_CLI_CALLER_AGENT_UID: "other" },
+    logFile,
+    env: {},
     stdout: { write() {} }, stderr: { write() {} },
     fetcher: () => { fetches += 1; return { ok: false }; },
   });
   assert.equal(result.kind, "rejected");
   assert.equal(fetches, 0);
+  assert.ok(fs.readFileSync(logFile, "utf-8").includes("got=none"),
+    "缺 caller 与 caller 错误必须在私有日志中可区分");
+});
+
+test("dispatcher 选路失败日志保留可关联 session 指纹但不泄露 locator", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-dispatcher-route-log-"));
+  const logFile = path.join(dir, "dispatcher.log");
+  const routesFile = path.join(dir, "routes.json");
+  fs.writeFileSync(routesFile, JSON.stringify({ routes: [
+    { id: "one", handler: "/one.mjs" }, { id: "two", handler: "/two.mjs" },
+  ] }));
+  const result = runInboundDispatcher({
+    endpointId: "m5codex", expectedCallerAgentUid: "expected", routesFile, logFile,
+    env: { AILY_CLI_CALLER_AGENT_UID: "expected" },
+    stdout: { write() {} }, stderr: { write() {} },
+    fetcher: () => ({ ok: true, event: { message_id: "m", session_id: "secret-session-locator",
+      sender_id: "u", created_at_ms: NOW, content: "x" },
+    raw_envelope: { type: "message.create", payload: {} } }),
+  });
+  assert.equal(result.reason, ROUTE_REJECT.NO_HANDLER);
+  const log = fs.readFileSync(logFile, "utf-8");
+  assert.ok(log.includes("session=sha256:"));
+  assert.equal(log.includes("secret-session-locator"), false);
 });
 
 test("dispatcher 把 handler 超时与启动失败区分开", () => {

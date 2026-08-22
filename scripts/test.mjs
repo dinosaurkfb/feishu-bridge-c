@@ -61,6 +61,7 @@ import {
   ROUTE_REJECT, loadRoutes, registerSession, selectRoute,
 } from "./inbound-routes.mjs";
 import { ENVELOPE_ENV as ENV_PASS, inheritedEvent } from "./envelope.mjs";
+import { CANONICAL_EVENT_ENV } from "./canonical-event.mjs";
 import {
   CANONICAL_EVENT_ENV as CANONICAL_PASS, buildCanonicalEvent, inheritedCanonicalEvent,
   legacyEventFromCanonical, validateCanonicalEvent,
@@ -2875,6 +2876,39 @@ test("dispatcher 在调用方不匹配时连 Aily 都不读取", () => {
   assert.equal(fetches, 0);
   assert.ok(fs.readFileSync(logFile, "utf-8").includes("got=none"),
     "缺 caller 与 caller 错误必须在私有日志中可区分");
+});
+
+test("dispatcher 必须同时传新旧两个信封变量 —— 只传一个会让外部消费者静默重取", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-dispatcher-env-"));
+  const handler = path.join(dir, "handler.mjs");
+  fs.writeFileSync(handler, "// 存在即可，不会真的被跑\n");
+  let seenEnv = null;
+  const result = runInboundDispatcher({
+    endpointId: "ep", expectedCallerAgentUid: "expected",
+    defaultRoute: { id: "self", handler },
+    routesFile: path.join(dir, "routes.json"),
+    logFile: path.join(dir, "d.log"),
+    env: { AILY_CLI_CALLER_AGENT_UID: "expected" },
+    stdout: { write() {} }, stderr: { write() {} },
+    fetcher: () => ({ ok: true, event: { message_id: "m", session_id: "s",
+      sender_id: "u", created_at_ms: NOW, content: "x" },
+    raw_envelope: { type: "message.create", payload: {} } }),
+    spawnHandler: (_bin, _args, opts) => { seenEnv = opts.env; return { status: 0 }; },
+  });
+  assert.equal(result.kind, "dispatched");
+
+  // 新契约：handler 拿 Canonical Event。
+  assert.ok(seenEnv.CANONICAL_EVENT ?? seenEnv[CANONICAL_EVENT_ENV],
+    "必须传 Canonical Event");
+  // 旧契约：迁移期必须**同时**保留。cc2cd 这类外部消费者用的是自己那份取信封实现，
+  // 它只认旧变量；只传新变量的话它不会报错，而是安静地自己再取一次 ——
+  // 「每条消息只取一次信封」这条不变量被破坏了却没有任何东西作声。
+  // PR#6 初版就只传了新变量，这条测试是为了它不再被重构丢掉。
+  assert.ok(seenEnv[ENV_PASS], "迁移期必须同时传旧的 " + ENV_PASS);
+
+  const legacy = JSON.parse(seenEnv[ENV_PASS]);
+  assert.equal(legacy.message_id, "m", "旧视图要能被旧消费者直接使用");
+  assert.equal(legacy.session_id, "s");
 });
 
 test("dispatcher 选路失败日志保留可关联 session 指纹但不泄露 locator", () => {

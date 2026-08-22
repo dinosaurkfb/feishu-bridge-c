@@ -25,6 +25,8 @@ import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import {
   businessActivitiesForPublishedBatch, recordClaudeActivityAndMaybeRotate,
 } from "./automatic-topic-rotation.mjs";
+import { finalizeClaudeDialogueTurn } from "./interaction-policy-store.mjs";
+import { DIALOGUE_POLICY_ID, DIALOGUE_TURN_STATUS } from "./interaction-policy.mjs";
 
 const SELF = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 
@@ -91,6 +93,17 @@ while (true) {
       claimsDir: CLAIMS, key, state: outcome.state === "completed" ? "handed_off" : "failed",
       detail: { run_state: outcome.state, observed_by: "watch-and-publish" },
     });
+    if (acceptedClaim?.policy_id === DIALOGUE_POLICY_ID) {
+      finalizeClaudeDialogueTurn({
+        root: ROOT,
+        claudeSessionId,
+        runId: key,
+        status: outcome.state === "completed"
+          ? DIALOGUE_TURN_STATUS.COMPLETED
+          : DIALOGUE_TURN_STATUS.FAILED,
+        reason: outcome.state === "completed" ? null : (outcome.reason ?? outcome.state),
+      });
+    }
 
     // 跟出站其余部分共用同一个解析：项目目录里有配置就用它，
     // 没有就回落到「机器模板 + 登记表那一行」。登记表接入的项目这里没有文件可读。
@@ -127,7 +140,7 @@ while (true) {
       }
       records.push(...pendingOutbox);
 
-      if (records.length > 0) {
+      if (records.length > 0 && cfg.auto_publish_on_completion !== false) {
         try {
           // 身份从配置推，跟主出站路径走同一个解析；发之前 publishDraft 会校验凭据归属。
           const ident = resolveLarkIdentity(cfg);
@@ -186,6 +199,15 @@ while (true) {
   if (Date.now() - startedAt > MAX_WAIT_MS) {
     recordClaimState({ claimsDir: CLAIMS, key, state: "failed",
       detail: { reason: "watch_timeout", waited_ms: Date.now() - startedAt } });
+    if (acceptedClaim?.policy_id === DIALOGUE_POLICY_ID) {
+      finalizeClaudeDialogueTurn({
+        root: ROOT,
+        claudeSessionId,
+        runId: key,
+        status: DIALOGUE_TURN_STATUS.FAILED,
+        reason: "watch_timeout",
+      });
+    }
     finishUp();
     console.error("watch timeout for " + key);
     process.exit(1);

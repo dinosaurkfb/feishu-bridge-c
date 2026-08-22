@@ -20,6 +20,13 @@ import { acquireClaim, recordClaimState } from "./claim.mjs";
 import {
   MAPPING_DISPOSITION, buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
 } from "./mapping-policy.mjs";
+import {
+  DIALOGUE_POLICY_ID, DIALOGUE_REASON, DIALOGUE_TURN_STATUS,
+  applyInteractionPolicyToAdmission, handleDialoguePolicy,
+} from "./interaction-policy.mjs";
+import {
+  finalizeClaudeDialogueTurn, loadClaudeInteractionPolicy, reserveClaudeDialogueTurn,
+} from "./interaction-policy-store.mjs";
 import { handOff, acquireSessionLock, releaseSessionLock, stampSessionLock } from "./handoff.mjs";
 import {
   deliverToLiveSession, findLiveSessionById, findLiveSessions, hasPriorSession, stampInstruction,
@@ -271,6 +278,23 @@ const verdict = evaluateMappingAdmission({
   config,
   now: Date.now(),
 });
+const interaction = loadClaudeInteractionPolicy({
+  root: routed.root,
+  claudeSessionId: routed.mapping?.claude_session_id ?? null,
+});
+if (!interaction.ok) {
+  writeReceipt("policy-state-" + (event.message_id ?? "unknown") + "-" + Date.now(), {
+    status: "error", reason: interaction.reason, message_id: event.message_id ?? null,
+    claim_acquired: false, handed_off: false,
+  });
+  finish("error", { detail: "交互策略状态不可用（" + interaction.reason + "）" },
+    { reason: interaction.reason });
+}
+const policyEvaluation = applyInteractionPolicyToAdmission(verdict, interaction.state);
+const dialogueMode = policyEvaluation.policy_id === DIALOGUE_POLICY_ID;
+const handlePolicy = (args = {}) => dialogueMode
+  ? handleDialoguePolicy({ evaluation: policyEvaluation, ...args })
+  : handleMappingPolicy({ evaluation: policyEvaluation, ...args });
 
 // 光秃秃一个 @（没有正文）是完成绑定的正常方式 —— 那一下的目的就是让 Aily 产生
 // session，好把它写进绑定。这时候回「消息里没有指令正文」是句没用的实话：
@@ -304,7 +328,7 @@ if (dryRun) {
 }
 
 if (verdict.decision === "reject") {
-  const policyOutcome = handleMappingPolicy({ evaluation: verdict });
+  const policyOutcome = handlePolicy();
   writeReceipt("reject-" + (event?.message_id ?? "unknown") + "-" + Date.now(), {
     status: "rejected",
     reason: verdict.reason,
@@ -346,8 +370,8 @@ const claim = acquireClaim({
   meta: {
     session_id: event.session_id,
     binding_id: mapping.binding_id,
-    policy_id: verdict.policy_id,
-    policy_version: verdict.policy_version,
+    policy_id: policyEvaluation.policy_id,
+    policy_version: policyEvaluation.policy_version,
     local_target_id: mappingContext.localTargetId,
     origin_channel_generation_id: mappingContext.originChannelGenerationId,
     claude_session_id: mapping.claude_session_id ?? null,
@@ -357,9 +381,7 @@ const claim = acquireClaim({
 
 if (!claim.ok) {
   const isDup = claim.reason === "duplicate";
-  const policyOutcome = handleMappingPolicy({
-    evaluation: verdict, claim, resolvedContext: mappingContext,
-  });
+  const policyOutcome = handlePolicy({ claim, resolvedContext: mappingContext });
   writeReceipt("claim-" + claim.reason + "-" + verdict.messageId, {
     status: isDup ? "rejected" : "error",
     reason: claim.reason,
@@ -377,16 +399,13 @@ if (!claim.ok) {
   finish("error", { detail: "无法取得投递权：" + claim.error }, { reason: claim.reason });
 }
 
-const mappingRun = handleMappingPolicy({
-  evaluation: verdict,
-  claim,
-  resolvedContext: mappingContext,
-});
-if (mappingRun.disposition !== MAPPING_DISPOSITION.ACCEPTED || !mappingRun.runRequest) {
+let policyRun = dialogueMode ? null : handlePolicy({ claim, resolvedContext: mappingContext });
+if (!dialogueMode &&
+    (policyRun.disposition !== MAPPING_DISPOSITION.ACCEPTED || !policyRun.runRequest)) {
   recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed",
-    detail: { reason: mappingRun.reason ?? "mapping_policy_rejected" } });
+    detail: { reason: policyRun.reason ?? "mapping_policy_rejected" } });
   finish("error", { detail: "映射策略没有生成可执行请求" },
-    { reason: mappingRun.reason ?? "mapping_policy_rejected" });
+    { reason: policyRun.reason ?? "mapping_policy_rejected" });
 }
 
 // 路由：现场有人就投给现场，没人才自己起一轮。
@@ -399,22 +418,66 @@ const target = boundSession
   ? findLiveSessionById({ projectRoot: config.project_dir, claudeSessionId: boundSession })
   : (findLiveSessions({ projectRoot: config.project_dir })[0] ?? null);
 
+const reserveDialogue = (runtimeTargetId, { beforeReject = null } = {}) => {
+  const reservation = reserveClaudeDialogueTurn({
+    root: routed.root,
+    claudeSessionId: boundSession,
+    eventId: verdict.messageId,
+    runId: claim.key,
+    localTargetId: mappingContext.localTargetId,
+    originChannelGenerationId: mappingContext.originChannelGenerationId,
+    runtimeTargetId,
+  });
+  if (!reservation.ok) {
+    if (typeof beforeReject === "function") beforeReject();
+    recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed",
+      detail: { reason: reservation.reason } });
+    const busy = reservation.reason === DIALOGUE_REASON.TURN_ACTIVE;
+    finish(busy ? "error" : "rejected", {
+      detail: busy ? "Dialogue 当前仍有活动回合，请等待它完成" : undefined,
+      reasonText: busy ? undefined : "Dialogue 无法开始新回合（" + reservation.reason + "）",
+      taskName: config.task_display_name,
+    }, { reason: reservation.reason });
+  }
+  const outcome = handlePolicy({ claim, resolvedContext: mappingContext, reservation });
+  if (outcome.disposition !== "accepted" || !outcome.runRequest) {
+    if (typeof beforeReject === "function") beforeReject();
+    recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed",
+      detail: { reason: outcome.reason ?? "dialogue_policy_rejected" } });
+    finish("rejected", {
+      reasonText: "Dialogue 已达到停止条件（" + (outcome.reason ?? "unknown") + "）",
+      taskName: config.task_display_name,
+    }, { reason: outcome.reason ?? "dialogue_policy_rejected" });
+  }
+  return outcome;
+};
+
 let run;
 
 if (target) {
   // 现场路径不需要会话锁：消息进的是一个活着的会话，它自己会把先后顺序排好。
   // 也不需要守望者 —— 那个会话结束时它自己的 Stop 钩子会把进展发出去。
   try {
+    if (dialogueMode) policyRun = reserveDialogue(target.sessionId);
     run = deliverToLiveSession({
       target,
-      instruction: mappingRun.runRequest.userInput,
+      instruction: dialogueMode
+        ? "[Dialogue · " + policyRun.runRequest.policy.dialogue_id + " · turn " +
+          policyRun.runRequest.policy.turn_index + "]\n" + policyRun.runRequest.userInput
+        : policyRun.runRequest.userInput,
       messageId: verdict.messageId,
       createdAtMs: event.created_at_ms,
       projectRoot: config.project_dir,
       runsDir: RUNS,
-      key: mappingRun.runRequest.runId,
+      key: policyRun.runRequest.runId,
     });
   } catch (err) {
+    if (dialogueMode) {
+      finalizeClaudeDialogueTurn({
+        root: routed.root, claudeSessionId: boundSession, runId: claim.key,
+        status: DIALOGUE_TURN_STATUS.FAILED, reason: "forward_failed",
+      });
+    }
     recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { error: err.message } });
     writeReceipt("forward-failed-" + verdict.messageId, {
       status: "error", reason: "forward_failed", message_id: verdict.messageId,
@@ -456,9 +519,7 @@ if (target) {
   // 同一目录不能并发 --continue，否则两轮会互相踩。用目录锁串行化。
   const lock = acquireSessionLock(LOCK);
   if (!lock.ok) {
-    const busyOutcome = handleMappingPolicy({
-      evaluation: verdict, claim, resolvedContext: mappingContext, targetState: "busy",
-    });
+    const busyOutcome = handlePolicy({ claim, resolvedContext: mappingContext, targetState: "busy" });
     recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { reason: lock.reason } });
     writeReceipt("busy-" + verdict.messageId, {
       status: "error", reason: lock.reason, message_id: verdict.messageId,
@@ -472,19 +533,33 @@ if (target) {
   }
 
   try {
+    if (dialogueMode) {
+      policyRun = reserveDialogue(boundSession ?? null, {
+        beforeReject: () => releaseSessionLock(LOCK),
+      });
+    }
     run = handOff({
       projectDir: config.project_dir,
       resumeSessionId: boundSession ?? undefined,
       instruction: stampInstruction({
-        instruction: mappingRun.runRequest.userInput,
+        instruction: dialogueMode
+          ? "[Dialogue · " + policyRun.runRequest.policy.dialogue_id + " · turn " +
+            policyRun.runRequest.policy.turn_index + "]\n" + policyRun.runRequest.userInput
+          : policyRun.runRequest.userInput,
         messageId: verdict.messageId,
         createdAtMs: event.created_at_ms,
       }),
       runsDir: RUNS,
-      key: mappingRun.runRequest.runId,
+      key: policyRun.runRequest.runId,
     });
   } catch (err) {
     releaseSessionLock(LOCK);
+    if (dialogueMode) {
+      finalizeClaudeDialogueTurn({
+        root: routed.root, claudeSessionId: boundSession, runId: claim.key,
+        status: DIALOGUE_TURN_STATUS.FAILED, reason: "handoff_failed",
+      });
+    }
     recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { error: err.message } });
     writeReceipt("handoff-failed-" + verdict.messageId, {
       status: "error", reason: "handoff_failed", message_id: verdict.messageId,
@@ -497,7 +572,7 @@ if (target) {
   stampSessionLock(LOCK, { pid: run.pid, logPath: run.logPath });
 
   // 起一次性守望者：run 跑完就发布结果并放锁。
-  if (config.auto_publish_on_completion !== false) {
+  if (dialogueMode || config.auto_publish_on_completion !== false) {
     // 守望者脚本住在本仓库，但它要盯的是**被路由到的那个项目** —— 根目录得传给它。
     const w = spawn(process.execPath,
       [path.join(ROOT, "scripts", "watch-and-publish.mjs"), claim.key, routed.root], {
@@ -516,38 +591,35 @@ recordClaimState({
   detail: { pid: run.pid, log_path: run.logPath, started_at: run.startedAt },
 });
 
-// 幂等列表：项目目录里有 mapping 文件就写回它，登记表接入的写 consumed.json。
-// 两种形式共用 appendConsumed 的语义（去重 + 只留最近若干条）。
-if (routed.source === "project-files") {
-  const mappingPath = path.join(RT, "active-mapping.json");
-  mapping.consumed_message_ids = [...(mapping.consumed_message_ids ?? []), verdict.messageId];
-  const mtmp = mappingPath + ".tmp." + process.pid;
-  fs.writeFileSync(mtmp, JSON.stringify(mapping, null, 2) + "\n", { mode: 0o600 });
-  fs.renameSync(mtmp, mappingPath);
-} else {
-  appendConsumed(routed.root, verdict.messageId, {
-    claudeSessionId: routed.mapping?.claude_session_id ?? null,
-  });
-}
+// 幂等列表独立放 sidecar。不能再拿路由时读到的旧 mapping 整份覆盖回去：Dialogue 回合预留
+// 和 Topic Generation 可能刚原子更新了同一 binding，旧快照回写会把新状态悄悄抹掉。
+appendConsumed(routed.root, verdict.messageId, {
+  claudeSessionId: routed.mapping?.claude_session_id ?? null,
+  seed: mapping.consumed_message_ids ?? [],
+});
 
 // 只有通过全部入站闸门并已经 handoff 的真实人类指令才计入当前话题代际。
 // 计数/自动轮转失败不回滚已成功投递的业务指令；结果会留在 accepted receipt 里供诊断。
 const topicActivity = recordClaudeActivityAndMaybeRotate({
   root: routed.root,
   claudeSessionId: routed.mapping?.claude_session_id ?? null,
-  generationId: mappingRun.runRequest.origin.channelGenerationId,
+  generationId: policyRun.runRequest.origin.channelGenerationId,
   eventKey: "inbound:claude:" + verdict.messageId,
   messageDelta: 1,
 });
 
 writeReceipt("accepted-" + verdict.messageId, {
   status: "accepted", message_id: verdict.messageId, claim_key: claim.key,
-  run_id: mappingRun.runRequest.runId,
-  local_target_id: mappingRun.runRequest.localTargetId,
-  origin_channel_generation_id: mappingRun.runRequest.origin.channelGenerationId,
-  policy_id: mappingRun.policy_id,
-  policy_version: mappingRun.policy_version,
-  policy_disposition: mappingRun.disposition,
+  run_id: policyRun.runRequest.runId,
+  local_target_id: policyRun.runRequest.localTargetId,
+  origin_channel_generation_id: policyRun.runRequest.origin.channelGenerationId,
+  policy_id: policyRun.policy_id,
+  policy_version: policyRun.policy_version,
+  policy_disposition: policyRun.disposition,
+  ...(dialogueMode ? {
+    dialogue_id: policyRun.runRequest.policy.dialogue_id,
+    dialogue_turn_index: policyRun.runRequest.policy.turn_index,
+  } : {}),
   ...(verdict.admission_shadow ? { mapping_admission_shadow: verdict.admission_shadow } : {}),
   // 多绑定之后「这条进了哪个项目」是排查的第一个问题。
   project_root: routed.root, binding_source: routed.source,

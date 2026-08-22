@@ -72,6 +72,12 @@ import {
   buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
 } from "./mapping-policy.mjs";
 import {
+  DEFAULT_DIALOGUE_BUDGET, DIALOGUE_POLICY_ID, DIALOGUE_REASON, DIALOGUE_STATUS,
+  DIALOGUE_TURN_STATUS, applyInteractionPolicyToAdmission, finalizeDialogueTurn,
+  handleDialoguePolicy, interactionPolicyStateForLegacy, interactionPolicySummary,
+  materializeInteractionPolicy, reserveDialogueTurn, setInteractionPolicyMode,
+} from "./interaction-policy.mjs";
+import {
   MAX_LOCAL_INPUT_CHARS, claudeTurnInputDir, clearTurnInput, isFeishuStampedInput,
   readTurnInput, storeTurnInput,
 } from "./turn-input.mjs";
@@ -101,6 +107,10 @@ import {
 import {
   prepareClaudeTopicRotation, recordClaudeTopicActivity, registerClaudeTopicRotation,
 } from "./topic-generation-store.mjs";
+import {
+  finalizeClaudeDialogueTurn, loadClaudeInteractionPolicy, reserveClaudeDialogueTurn,
+  setClaudeInteractionMode,
+} from "./interaction-policy-store.mjs";
 import {
   businessActivitiesForPublishedBatch, launchAutomaticTopicRotation,
 } from "./automatic-topic-rotation.mjs";
@@ -556,6 +566,260 @@ test("Mapping Policy 明确区分 rejected、duplicate 与 busy，非 accepted �
   });
   assert.equal(busy.disposition, MAPPING_DISPOSITION.BUSY);
   assert.equal("runRequest" in busy, false);
+});
+
+// ---------- Dialogue Policy：单主持者串行回合、预算与硬停止 ----------
+
+test("旧 binding 默认保持 Mapping；显式切到 Dialogue 才创建有界状态", () => {
+  const loaded = interactionPolicyStateForLegacy({ binding_id: "binding_a" }, {
+    bindingId: "binding_a", now: NOW,
+  });
+  assert.equal(loaded.ok, true);
+  assert.equal(loaded.state.policy_id, "mapping");
+  assert.equal(loaded.state.dialogue, null);
+
+  const enabled = setInteractionPolicyMode(loaded.state, { mode: "dialogue", now: NOW + 1 });
+  assert.equal(enabled.ok, true);
+  assert.equal(enabled.state.policy_id, DIALOGUE_POLICY_ID);
+  assert.equal(enabled.dialogue.status, DIALOGUE_STATUS.ACTIVE);
+  assert.equal(enabled.dialogue.turn_order, "human_then_host_serial");
+  assert.equal(enabled.dialogue.allow_agent_output_as_input, false);
+  assert.equal(enabled.dialogue.concurrency.max_active_turns, 1);
+  assert.equal(enabled.dialogue.concurrency.mention_loop, "disabled");
+  assert.equal(enabled.dialogue.concurrency.agent_output_relay, "disabled");
+  assert.equal(enabled.dialogue.finalization.summarizer_participant_id, "bound_local_target");
+  assert.equal(enabled.dialogue.finalization.publish_target, "origin_channel_generation");
+  assert.deepEqual(enabled.dialogue.stop_conditions, [
+    "round_budget", "time_budget", "resource_budget", "runtime_failure", "human_interrupt",
+  ]);
+  assert.deepEqual(enabled.dialogue.budget, DEFAULT_DIALOGUE_BUDGET);
+  assert.equal(enabled.dialogue.participants.length, 2);
+  assert.equal(interactionPolicySummary(enabled.state).maxRounds, 12);
+  const same = setInteractionPolicyMode(enabled.state, { mode: "dialogue", now: NOW + 2 });
+  assert.equal(same.changed, false);
+  assert.equal(same.dialogue.dialogue_id, enabled.dialogue.dialogue_id);
+});
+
+test("Dialogue 每轮生成稳定 dialogue_id/turn_index，重复 event 不增加预算", () => {
+  const base = interactionPolicyStateForLegacy({ binding_id: "binding_b" }, {
+    bindingId: "binding_b", now: NOW,
+  }).state;
+  const enabled = setInteractionPolicyMode(base, { mode: "dialogue", now: NOW }).state;
+  const first = reserveDialogueTurn(enabled, {
+    eventId: "om_turn_1", runId: "claim_1", localTargetId: "local_opaque",
+    originChannelGenerationId: "generation_opaque", runtimeTargetId: "runtime_private",
+    now: NOW + 1,
+  });
+  assert.equal(first.accepted, true);
+  assert.equal(first.reservation.turn_index, 1);
+  assert.equal(first.state.dialogue.usage.rounds_started, 1);
+  assert.equal(first.state.dialogue.usage.resource_units_used, 1);
+
+  const duplicate = reserveDialogueTurn(first.state, {
+    eventId: "om_turn_1", runId: "claim_1", localTargetId: "local_opaque",
+    originChannelGenerationId: "generation_opaque", now: NOW + 2,
+  });
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(duplicate.changed, false);
+  assert.equal(duplicate.state.dialogue.usage.rounds_started, 1);
+});
+
+test("Dialogue 在活动回合结束前拒绝并发；完成后才开放下一串行回合", () => {
+  const base = interactionPolicyStateForLegacy({ binding_id: "binding_c" }, {
+    bindingId: "binding_c", now: NOW,
+  }).state;
+  const enabled = setInteractionPolicyMode(base, { mode: "dialogue", now: NOW }).state;
+  const first = reserveDialogueTurn(enabled, {
+    eventId: "om_1", runId: "run_1", localTargetId: "local",
+    originChannelGenerationId: "generation", now: NOW + 1,
+  });
+  const concurrent = reserveDialogueTurn(first.state, {
+    eventId: "om_2", runId: "run_2", localTargetId: "local",
+    originChannelGenerationId: "generation", now: NOW + 2,
+  });
+  assert.equal(concurrent.ok, false);
+  assert.equal(concurrent.reason, DIALOGUE_REASON.TURN_ACTIVE);
+
+  const finalized = finalizeDialogueTurn(first.state, {
+    runId: "run_1", status: DIALOGUE_TURN_STATUS.COMPLETED, now: NOW + 3,
+  });
+  assert.equal(finalized.ok, true);
+  assert.equal(finalized.state.dialogue.active_turn, null);
+  const second = reserveDialogueTurn(finalized.state, {
+    eventId: "om_2", runId: "run_2", localTargetId: "local",
+    originChannelGenerationId: "generation", now: NOW + 4,
+  });
+  assert.equal(second.accepted, true);
+  assert.equal(second.reservation.turn_index, 2);
+});
+
+test("Dialogue 达到任一预算硬停止，运行失败也终止整个 dialogue", () => {
+  const base = interactionPolicyStateForLegacy({ binding_id: "binding_d" }, {
+    bindingId: "binding_d", now: NOW,
+  }).state;
+  const enabled = setInteractionPolicyMode(base, {
+    mode: "dialogue", now: NOW,
+    budget: { max_rounds: 1, max_duration_ms: 60_000, max_resource_units: 1 },
+  }).state;
+  const first = reserveDialogueTurn(enabled, {
+    eventId: "om_1", runId: "run_1", localTargetId: "local",
+    originChannelGenerationId: "generation", now: NOW + 1,
+  });
+  const completed = finalizeDialogueTurn(first.state, {
+    runId: "run_1", status: DIALOGUE_TURN_STATUS.COMPLETED, now: NOW + 2,
+  });
+  assert.equal(completed.state.dialogue.status, DIALOGUE_STATUS.COMPLETED);
+  assert.equal(completed.state.dialogue.stop_reason, DIALOGUE_REASON.ROUND_BUDGET);
+
+  const enabledAgain = setInteractionPolicyMode(completed.state, {
+    mode: "dialogue", now: NOW + 10,
+  }).state;
+  const next = reserveDialogueTurn(enabledAgain, {
+    eventId: "om_fail", runId: "run_fail", localTargetId: "local",
+    originChannelGenerationId: "generation", now: NOW + 11,
+  });
+  const failed = finalizeDialogueTurn(next.state, {
+    runId: "run_fail", status: DIALOGUE_TURN_STATUS.FAILED,
+    reason: "runtime_failed", now: NOW + 12,
+  });
+  assert.equal(failed.state.dialogue.status, DIALOGUE_STATUS.FAILED);
+  assert.equal(failed.state.dialogue.stop_reason, "runtime_failed");
+});
+
+test("Dialogue 时间预算与资源预算分别在 dispatch 前硬停止", () => {
+  const base = interactionPolicyStateForLegacy({ binding_id: "binding_budget" }, {
+    bindingId: "binding_budget", now: NOW,
+  }).state;
+  const timed = setInteractionPolicyMode(base, {
+    mode: "dialogue", now: NOW,
+    budget: { max_rounds: 3, max_duration_ms: 10, max_resource_units: 3 },
+  }).state;
+  const tooLate = reserveDialogueTurn(timed, {
+    eventId: "om_late", runId: "run_late", localTargetId: "local",
+    originChannelGenerationId: "generation", now: NOW + 10,
+  });
+  assert.equal(tooLate.accepted, false);
+  assert.equal(tooLate.reason, DIALOGUE_REASON.TIME_BUDGET);
+  assert.equal(tooLate.state.dialogue.usage.rounds_started, 0);
+
+  const resourceLimited = setInteractionPolicyMode(tooLate.state, {
+    mode: "dialogue", now: NOW + 20,
+    budget: { max_rounds: 3, max_duration_ms: 60_000, max_resource_units: 1 },
+  }).state;
+  const tooExpensive = reserveDialogueTurn(resourceLimited, {
+    eventId: "om_expensive", runId: "run_expensive", localTargetId: "local",
+    originChannelGenerationId: "generation", resourceUnits: 2, now: NOW + 21,
+  });
+  assert.equal(tooExpensive.accepted, false);
+  assert.equal(tooExpensive.reason, DIALOGUE_REASON.RESOURCE_BUDGET);
+  assert.equal(tooExpensive.state.dialogue.usage.resource_units_used, 0);
+});
+
+test("切回 Mapping 是人工中止；Dialogue runRequest 不携带 runtime locator", () => {
+  const base = interactionPolicyStateForLegacy({ binding_id: "binding_e" }, {
+    bindingId: "binding_e", now: NOW,
+  }).state;
+  const enabled = setInteractionPolicyMode(base, { mode: "dialogue", now: NOW }).state;
+  const evaluation = applyInteractionPolicyToAdmission(
+    evaluateMappingAdmission({ event: baseEvent, mapping: baseMapping, config, now: NOW }), enabled,
+  );
+  const reservation = reserveDialogueTurn(enabled, {
+    eventId: evaluation.messageId, runId: "claim_dialogue", localTargetId: "local_opaque",
+    originChannelGenerationId: "generation_opaque", runtimeTargetId: BOUND_SESSION, now: NOW + 1,
+  });
+  const outcome = handleDialoguePolicy({
+    evaluation,
+    claim: { ok: true, key: "claim_dialogue" },
+    resolvedContext: { localTargetId: "local_opaque", originChannelGenerationId: "generation_opaque" },
+    reservation,
+  });
+  assert.equal(outcome.disposition, "accepted");
+  assert.equal(outcome.runRequest.policy.dialogue_id, reservation.reservation.dialogue_id);
+  assert.equal(outcome.runRequest.policy.turn_index, 1);
+  assert.equal(JSON.stringify(outcome.runRequest).includes(BOUND_SESSION), false);
+
+  const stopped = setInteractionPolicyMode(reservation.state, { mode: "mapping", now: NOW + 2 });
+  assert.equal(stopped.state.policy_id, "mapping");
+  assert.equal(stopped.state.dialogue.status, DIALOGUE_STATUS.CANCELLED);
+  assert.equal(stopped.state.dialogue.stop_reason, DIALOGUE_REASON.HUMAN_INTERRUPT);
+  assert.equal(materializeInteractionPolicy({ binding_id: "binding_e" }, stopped.state).ok, true);
+});
+
+test("Dialogue 终局只能关闭匹配的 run/runtime target，损坏契约一律失败关闭", () => {
+  const base = interactionPolicyStateForLegacy({ binding_id: "binding_guard" }, {
+    bindingId: "binding_guard", now: NOW,
+  }).state;
+  const enabled = setInteractionPolicyMode(base, { mode: "dialogue", now: NOW }).state;
+  const reserved = reserveDialogueTurn(enabled, {
+    eventId: "om_guard", runId: "run_guard", localTargetId: "local",
+    originChannelGenerationId: "generation", runtimeTargetId: "runtime_guard", now: NOW + 1,
+  });
+  const mismatch = finalizeDialogueTurn(reserved.state, {
+    runId: "other_run", runtimeTargetId: "other_runtime",
+    status: DIALOGUE_TURN_STATUS.COMPLETED, now: NOW + 2,
+  });
+  assert.equal(mismatch.ok, false);
+  assert.equal(mismatch.reason, "dialogue_turn_mismatch");
+  assert.equal(reserved.state.dialogue.active_turn.run_id, "run_guard");
+
+  const damaged = structuredClone(reserved.state);
+  damaged.dialogue.concurrency.max_active_turns = 2;
+  assert.equal(interactionPolicySummary(damaged).reason, DIALOGUE_REASON.POLICY_INVALID);
+});
+
+test("Claude registry binding 原子保存 Dialogue 模式、回合与终局", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-policy-claude-"));
+  const root = path.join(local, "project");
+  fs.mkdirSync(root);
+  const regFile = path.join(local, "registry.json");
+  fs.writeFileSync(regFile, JSON.stringify({ schema_version: "1.0", projects: [{
+    id: "dialogue-claude", root, root_message_id: "om_root", session_id: "session_feishu",
+    status: "active", expires_at: "2027-01-01T00:00:00.000Z",
+  }] }));
+  const enabled = setClaudeInteractionMode({
+    root, mode: "dialogue", registryFile: regFile, now: NOW,
+  });
+  assert.equal(enabled.ok, true);
+  const reserved = reserveClaudeDialogueTurn({
+    root, eventId: "om_dialogue", runId: "claim_dialogue", localTargetId: "local_target",
+    originChannelGenerationId: "generation", runtimeTargetId: "claude_session_private",
+    registryFile: regFile, now: NOW + 1,
+  });
+  assert.equal(reserved.accepted, true);
+  const finished = finalizeClaudeDialogueTurn({
+    root, runId: "claim_dialogue", status: DIALOGUE_TURN_STATUS.COMPLETED,
+    registryFile: regFile, now: NOW + 2,
+  });
+  assert.equal(finished.ok, true);
+  const loaded = loadClaudeInteractionPolicy({ root, registryFile: regFile, now: NOW + 3 });
+  assert.equal(loaded.state.policy_id, "dialogue");
+  assert.equal(loaded.state.dialogue.active_turn, null);
+  assert.equal(loaded.state.dialogue.usage.rounds_started, 1);
+  assert.equal(JSON.parse(fs.readFileSync(regFile, "utf-8"))
+    .projects[0].interaction_policy_state.dialogue.last_turn.status, "completed");
+});
+
+test("Claude feishu-mode 默认只读，只有 --apply 才切换当前 binding", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-mode-claude-"));
+  const root = path.join(fs.realpathSync(local), "project");
+  fs.mkdirSync(root);
+  const regFile = path.join(local, "registry.json");
+  fs.writeFileSync(regFile, JSON.stringify({ schema_version: "1.0", projects: [{
+    id: "dialogue-mode", root, root_message_id: "om_root", session_id: "session_feishu",
+    status: "active", expires_at: "2027-01-01T00:00:00.000Z",
+  }] }));
+  const cli = path.resolve("scripts", "feishu-mode.mjs");
+  const run = (...args) => spawnSync(process.execPath, [cli, ...args], {
+    cwd: root, encoding: "utf-8",
+    env: { ...process.env, FEISHU_BRIDGE_REGISTRY: regFile },
+  });
+  assert.match(run().stdout, /Mapping/u);
+  assert.match(run("--mode", "dialogue").stdout, /dry-run/u);
+  assert.equal(JSON.parse(fs.readFileSync(regFile, "utf-8")).projects[0].interaction_policy_state, undefined);
+  const applied = run("--mode", "dialogue", "--apply");
+  assert.equal(applied.status, 0, applied.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(regFile, "utf-8")).projects[0]
+    .interaction_policy_state.policy_id, "dialogue");
 });
 
 test("损坏的 Canonical Event 只记 shadow，无权否决合法的旧 selector 结果", () => {
@@ -1796,6 +2060,39 @@ test("项目目录里有 mapping → 走项目文件，登记表和模板完全�
   assert.equal(r.mapping.feishu_root_message_id_reference, "om_old");
 });
 
+test("项目文件 binding 的 consumed sidecar 不覆盖 Dialogue/Topic 状态", () => {
+  const { proj, regFile, tplFile } = bindFixture();
+  const rt = path.join(proj, ".runtime-data", "inbound");
+  fs.mkdirSync(rt, { recursive: true });
+  const base = {
+    schema_version: "1.0",
+    binding_id: "project-files-dialogue",
+    status: "active",
+    logical_task_key: "project-files-dialogue",
+    session_id: "session_project",
+    inbound_state: "bound",
+    feishu_root_message_id_reference: "om_project",
+    expires_at: "2099-01-01T00:00:00.000Z",
+    consumed_message_ids: ["legacy_event"],
+  };
+  const mappingPolicy = interactionPolicyStateForLegacy(base, {
+    bindingId: base.binding_id, now: NOW,
+  }).state;
+  base.interaction_policy_state = setInteractionPolicyMode(mappingPolicy, {
+    mode: "dialogue", now: NOW,
+  }).state;
+  const mappingFile = path.join(rt, "active-mapping.json");
+  fs.writeFileSync(mappingFile, JSON.stringify(base, null, 2));
+
+  appendConsumed(proj, "new_event", { seed: base.consumed_message_ids });
+  const disk = JSON.parse(fs.readFileSync(mappingFile, "utf-8"));
+  assert.deepEqual(disk.interaction_policy_state, base.interaction_policy_state);
+  assert.deepEqual(disk.consumed_message_ids, ["legacy_event"]);
+  const resolved = resolveProject({ root: proj, registryFile: regFile, templateFile: tplFile });
+  assert.deepEqual(resolved.mapping.consumed_message_ids, ["legacy_event", "new_event"]);
+  assert.equal(resolved.mapping.interaction_policy_state.policy_id, "dialogue");
+});
+
 test("项目目录里什么都没有 → 回落到登记表那一行", () => {
   const { proj, regFile, tplFile } = bindFixture();
   fs.writeFileSync(regFile, JSON.stringify({ projects: [
@@ -2841,13 +3138,14 @@ test("状态命令和出站用的是同一条绑定选择规则", () => {
   assert.ok(src.includes("selectBindingEntry"));
 });
 
-test("四条控制技能都装成跟 Codex 同名的斜杠命令", () => {
+test("五条控制技能都装成跟 Codex 同名的斜杠命令", () => {
   const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
   for (const [repo, installed] of [
     ["claude-feishu-bind", "feishu-bind"],
     ["claude-feishu-status", "feishu-status"],
     ["claude-feishu-unbind", "feishu-unbind"],
     ["claude-feishu-rotate", "feishu-rotate"],
+    ["claude-feishu-mode", "feishu-mode"],
   ]) {
     assert.ok(src.includes(repo), "安装器要认得仓库里的 " + repo);
     assert.ok(src.includes('"' + installed + '"'), "要装成 /" + installed);

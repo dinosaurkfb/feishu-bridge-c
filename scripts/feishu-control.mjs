@@ -26,6 +26,7 @@ import { outboxDirOf } from "./drain-outbox.mjs";
 import { listPending } from "./outbox.mjs";
 import { setClaudeTopicBindingStatus } from "./topic-generation-store.mjs";
 import { activeGeneration, pendingGeneration } from "./topic-generation.mjs";
+import { interactionPolicyStateForLegacy, interactionPolicySummary } from "./interaction-policy.mjs";
 
 export const SUSPENDED = "suspended";
 
@@ -47,6 +48,8 @@ export function currentBinding({ root, claudeSessionId, registryFile, templateFi
   const topicState = m.topic_generation_state ?? null;
   const activeTopic = activeGeneration(topicState);
   const pendingTopic = pendingGeneration(topicState);
+  const interaction = interactionPolicyStateForLegacy(m, { bindingId: m.binding_id });
+  const policy = interaction.ok ? interactionPolicySummary(interaction.state) : interaction;
   return {
     ok: true,
     root,
@@ -66,6 +69,7 @@ export function currentBinding({ root, claudeSessionId, registryFile, templateFi
     pendingGenerationExpiresAt: pendingTopic?.claim_expires_at ?? null,
     readOnlyGenerations: topicState?.generations?.filter((generation) =>
       generation.status === "read-only").length ?? 0,
+    policy,
     // 话题 id 是 locator，只在需要时由调用方决定要不要显示；默认不进人类可读输出。
     _rootMessageId: m.feishu_root_message_id_reference ?? null,
   };
@@ -166,6 +170,12 @@ export function describeStatus(st, others = []) {
     ? "这条工作线单独绑定（会话 " + String(st.claudeSessionId).slice(0, 8) + "）"
     : "整个项目共用一个话题"));
   lines.push("当前代际  " + (st.activeGeneration === null ? "尚未完成首次认领" : "第 " + st.activeGeneration + " 代"));
+  lines.push("交互模式  " + (st.policy?.ok ? st.policy.label + " · v" + st.policy.policyVersion : "状态不可用"));
+  if (st.policy?.policyId === "dialogue") {
+    lines.push("对话预算  " + st.policy.roundsStarted + " / " + st.policy.maxRounds + " 轮；" +
+      st.policy.resourceUnitsUsed + " / " + st.policy.maxResourceUnits + " 资源单位");
+    lines.push("对话状态  " + st.policy.status + (st.policy.turnActive ? "（有活动回合）" : ""));
+  }
   if (st.activeGeneration !== null) {
     const messages = Number.isInteger(st.activeGenerationMessages) ? st.activeGenerationMessages : 0;
     const threshold = Number.isInteger(st.activeGenerationThreshold) ? st.activeGenerationThreshold : 30;

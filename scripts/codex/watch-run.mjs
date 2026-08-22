@@ -8,7 +8,8 @@ import {
 } from "../outbox.mjs";
 import { readCodexRunOutcome } from "./handoff.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
-import { bridgeHome, loadRegistry, taskPaths } from "./state.mjs";
+import { bridgeHome, finalizeTaskDialogueTurn, loadRegistry, taskPaths } from "./state.mjs";
+import { DIALOGUE_POLICY_ID, DIALOGUE_TURN_STATUS } from "../interaction-policy.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -86,6 +87,14 @@ try {
         state: "completed",
         detail: { run_state: "completed", recoverable_error_events: outcome.recoverableErrors ?? 0 },
       });
+      if (acceptedClaim?.policy_id === DIALOGUE_POLICY_ID) {
+        finalizeTaskDialogueTurn({
+          threadId: task.codex_thread_id,
+          runId: key,
+          status: DIALOGUE_TURN_STATUS.COMPLETED,
+          home,
+        });
+      }
       process.exitCode = 0;
       break;
     }
@@ -110,6 +119,15 @@ try {
       state: "failed",
       detail: { run_state: outcome.state, reason: outcome.reason, diagnostic: outcome.diagnostic ?? null },
     });
+    if (acceptedClaim?.policy_id === DIALOGUE_POLICY_ID) {
+      finalizeTaskDialogueTurn({
+        threadId: task.codex_thread_id,
+        runId: key,
+        status: DIALOGUE_TURN_STATUS.FAILED,
+        reason: outcome.reason,
+        home,
+      });
+    }
     process.exitCode = 1;
     break;
   }
@@ -136,6 +154,15 @@ try {
       state: "handed_off",
       detail: { observation_state: "watch_timeout", runner_may_be_active: true },
     });
+    if (acceptedClaim?.policy_id === DIALOGUE_POLICY_ID) {
+      finalizeTaskDialogueTurn({
+        threadId: task.codex_thread_id,
+        runId: key,
+        status: DIALOGUE_TURN_STATUS.FAILED,
+        reason: "watch_timeout",
+        home,
+      });
+    }
     process.exitCode = 1;
   }
 } finally {

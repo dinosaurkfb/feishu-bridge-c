@@ -170,6 +170,12 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 
 系统不得仅靠 Agent 在正文中互相 mention 形成无限循环。
 
+首个可交付纵切（Dialogue v1）确定为：**一个主持本地 target + 一名既有 binding 授权人类 + 串行
+轮次**。主持 target 同时承担最终汇总；每轮必须由人类新事件启动，Agent 输出不得自动成为下一轮
+输入；默认预算为 12 轮、2 小时和 12 资源单位。该纵切用于先验证 policy 生命周期、预算、终局和
+人工中断，不代表 FR-5 的多 Agent/子 Agent 协作已经完成。多 Agent 自动接力、并行发言和多人授权
+必须在后续版本增加独立的参与者权限、turn planner、循环检测与失败策略后才可开放。
+
 ### FR-6 管理模式
 
 管理模式用于长期监督与增强，至少包含三种策略档案：
@@ -280,11 +286,11 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 | 项目—群订阅 | Subscription v1、首次认领消费者和 claim 纵切已由 PR #5 合并；尚未开放多订阅写入口 | 开放受控多订阅管理，不改变现有单订阅默认行为 |
 | 精确话题—会话绑定 | 稳定 binding 与 Topic Generation 兼容投影已进入 `main`，Claude/Codex 保留各自 runtime locator | 继续统一生命周期与对外状态语义 |
 | 映射模式 | Mapping Policy Handler 已由 PR #7 合并并安装；旧 selector 仍唯一承重，新候选只做 shadow comparison | 真实样本一致后再灰度切换权威读取路径 |
-| 话题轮转 | Topic Generation 生命周期与显式 rotate 命令已由 PR #8 合并并安装；Codex 第 2 代话题的创建、真实 mention 认领与 binding 切换已完成首次真实验收；自动轮转 v1 候选按每代际 30 条有效业务消息创建 pending，新代际仍需真实 mention | 合并候选后单独安装并验收自动创建、失败重试与不重复轮转，再评估多订阅 |
-| 对话模式 | 未实现 | 受控编排、预算、停止与中断 |
+| 话题轮转 | Topic Generation 生命周期与显式 rotate 命令已由 PR #8 合并并安装；Codex 第 2 代话题的创建、真实 mention 认领与 binding 切换已完成首次真实验收；自动轮转 v1 已合并 `main`，按每代际 30 条有效业务消息创建 pending，新代际仍需真实 mention，但正式安装与真实自动触发验收后置 | 单独安装并验收自动创建、失败重试与不重复轮转，再评估多订阅 |
+| 对话模式 | `feat/dialogue-policy-v1` 已形成单主持者、单授权人、串行轮次候选：公共状态、默认预算、硬停止、人工中断、Claude/Codex adapter 与 mode 命令均有本地回归；尚未合并、安装或真实验收 | 先评审/合并 v1 并单独真实验收，再扩展多 Agent turn planner |
 | 项目推进/专家/带教 | 原型仅在未合并的 `feat/agent-supervisor-shadow-mvp` 实验分支，`main` 不含相关实现 | 纳入管理策略和分级权限 |
 | 多人授权 | 未实现 | 身份授权矩阵与审计归属 |
-| 显式控制面 | bind/status/unbind/rotate 均为显式命令；普通讨论不会触发写操作 | 后续新模式继续沿用结构化 intent 与逐次授权 |
+| 显式控制面 | bind/status/unbind/rotate 均为显式命令；Dialogue 候选新增只读/显式写入的 mode 命令；普通讨论不会触发写操作 | mode 合并后单独安装，后续模式继续沿用结构化 intent 与逐次授权 |
 
 ## 10. 验收标准
 
@@ -331,7 +337,8 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 - 自动轮转 v1 已确定默认阈值为每代际 30 条有效业务消息，并自动创建 pending 话题；是否允许用户
   按 binding 改阈值或关闭自动轮转留待后续控制面设计。候选话题等待首次真实 mention 的认领期限
   仍默认 24 小时；
-- 对话模式首个版本是否只支持一个主持者和串行轮次；
+- 对话模式首个版本已确定只支持一个主持者、一名授权人类和串行轮次；多 Agent 自动接力留给后续
+  版本；
 - 管理模式中哪些 execute 动作可以预授权，哪些始终逐次授权；
 - 多人场景的角色模型与飞书组织身份如何映射。
 - 重新验证 Aily daemon 注入的 `AILY_CLI_CHANNEL_THREAD_ID` 与真实飞书 topic/root/session locator 的

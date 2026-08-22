@@ -93,8 +93,12 @@ mention 与 content 字段计算候选结果。候选的真实 mention 证据来
 出站目标；完成正式安装后的真实样本验收后，后续灰度切片才能切换权威读取路径。
 
 直接运行旧 handler 的诊断路径没有 Canonical Event 时，仍可使用现有 Aily 事件视图；该结果会明确
-标记 `evaluation_path: legacy_event_v2`。如果调用方显式提供了非法 Canonical Event，policy 会
-fail-closed，绝不静默回落到另一份事件事实。
+标记 `evaluation_path: legacy_event_v2`。如果候选 Canonical Event 因版本偏斜或结构损坏而无效，
+旧 selector 仍独立计算并继续承重；候选只记为 `canonical_invalid` 的 shadow 分歧，无权否决原本
+合法的消息。
+
+dispatcher 的 `30s` handler timeout 只是异常进程的最终兜底，不是响应预算。handler 正常路径仍
+必须在完成校验、claim 和非阻塞投递后秒级返回；长期运行的完成由 hooks/watcher 独立观察。
 
 ## 5. 数据与用户行为兼容
 
@@ -128,7 +132,7 @@ outbox。已写入 claim/receipt 的新审计字段可被旧版安全忽略。
 
 - Canonical Event 候选与旧 selector 同轮比较，一致样本被明确记录；
 - 候选不一致只留审计证据，旧 selector 继续承重且不会投递第二次；
-- 显式非法 Canonical Event fail-closed；
+- 损坏的 Canonical Event 只记录 `canonical_invalid`，不改变旧 selector 的权威结果；
 - accepted 产生统一 `runRequest`；
 - rejected、duplicate、busy 不产生 `runRequest`；
 - Claude/Codex 的 `runRequest` 均不携带 Aily session、logical task key 或 Codex thread locator；

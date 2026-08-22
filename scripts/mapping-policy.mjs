@@ -7,7 +7,7 @@
 
 import { validateCanonicalEvent } from "./canonical-event.mjs";
 import {
-  REJECT, REJECT_TEXT, evaluateInbound, evaluateInboundEvidence,
+  REJECT, evaluateInbound, evaluateInboundEvidence,
 } from "./selector.mjs";
 import { stableControlId } from "./subscription.mjs";
 
@@ -22,6 +22,7 @@ export const MAPPING_DISPOSITION = Object.freeze({
 });
 
 export const MAPPING_POLICY_REASON = Object.freeze({
+  CANONICAL_INVALID: "canonical_invalid",
   CONTEXT_INVALID: "mapping_policy_context_invalid",
   CLAIM_REQUIRED: "mapping_policy_claim_required",
   TARGET_BUSY: "target_busy",
@@ -31,14 +32,6 @@ const nonEmpty = (value) => typeof value === "string" && value.length > 0;
 const baseResult = () => ({
   policy_id: MAPPING_POLICY_ID,
   policy_version: MAPPING_POLICY_VERSION,
-});
-
-const rejectedAdmission = (reason = REJECT.MALFORMED_EVENT) => ({
-  ...baseResult(),
-  decision: "reject",
-  reason,
-  reasonText: REJECT_TEXT[reason] ?? reason,
-  evaluation_path: "canonical_event_v1",
 });
 
 const compareAdmission = (legacy, candidate) => {
@@ -70,7 +63,20 @@ const compareAdmission = (legacy, candidate) => {
  */
 export function evaluateMappingAdmission({ canonicalEvent, event, mapping, config, now } = {}) {
   if (canonicalEvent !== undefined && canonicalEvent !== null) {
-    if (!validateCanonicalEvent(canonicalEvent).ok) return rejectedAdmission();
+    const legacy = evaluateInbound({ event, mapping, config, now });
+    if (!validateCanonicalEvent(canonicalEvent).ok) {
+      const candidate = {
+        decision: "invalid",
+        reason: MAPPING_POLICY_REASON.CANONICAL_INVALID,
+      };
+      return {
+        ...baseResult(),
+        ...legacy,
+        evaluation_path: "legacy_event_v2",
+        candidate_evaluation_path: "canonical_event_v1",
+        admission_shadow: compareAdmission(legacy, candidate),
+      };
+    }
     const candidate = evaluateInboundEvidence({
       event: {
         event_id: canonicalEvent.event_id,
@@ -84,7 +90,6 @@ export function evaluateMappingAdmission({ canonicalEvent, event, mapping, confi
       config,
       now,
     });
-    const legacy = evaluateInbound({ event, mapping, config, now });
     // INV-12：候选结果先影子比较，旧 selector 在真实样本验收前仍是唯一权威。
     return {
       ...baseResult(),

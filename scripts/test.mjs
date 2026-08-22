@@ -260,13 +260,16 @@ test("Mapping Policy 明确区分 rejected、duplicate 与 busy，非 accepted �
   assert.equal("runRequest" in busy, false);
 });
 
-test("显式传入坏 Canonical Event 时 Mapping Policy fail-closed，不回落旧事件", () => {
+test("损坏的 Canonical Event 只记 shadow，无权否决合法的旧 selector 结果", () => {
   const evaluation = evaluateMappingAdmission({
     canonicalEvent: {}, event: baseEvent, mapping: baseMapping, config, now: NOW,
   });
-  assert.equal(evaluation.decision, "reject");
-  assert.equal(evaluation.reason, REJECT.MALFORMED_EVENT);
-  assert.equal(evaluation.evaluation_path, "canonical_event_v1");
+  assert.equal(evaluation.decision, "accept");
+  assert.equal(evaluation.instruction, "把出站发布器的草稿写完");
+  assert.equal(evaluation.evaluation_path, "legacy_event_v2");
+  assert.equal(evaluation.admission_shadow.match, false);
+  assert.equal(evaluation.admission_shadow.candidate_decision, "invalid");
+  assert.equal(evaluation.admission_shadow.candidate_reason, "canonical_invalid");
 });
 
 test("前缀后多个空格也能接受", () => {

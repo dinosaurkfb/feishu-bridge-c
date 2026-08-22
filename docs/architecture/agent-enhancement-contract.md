@@ -560,6 +560,7 @@ bridge-home/
 | `refactor/mapping-policy-handler` | 现有映射模式迁移 | 对话/管理功能 |
 | `feat/topic-generation-lifecycle` | 轮转与生命周期 | 多人授权 |
 | `feat/dialogue-policy-v1` | 单主持者/单授权人串行 Dialogue、预算、终局、人工中断与 mode 命令 | 多 Agent 自动接力、管理模式、多人授权 |
+| `feat/dialogue-participant-routing` | 多 Agent 参与者授权快照、可消费的多订阅路由与确定性串行 turn planner | 并行发言、多人授权、无上限 Agent 自动循环 |
 | `feat/management-policies` | 推进、专家、带教 | 多人授权 |
 | `feat/multi-operator-authorization` | 人员授权矩阵与审计 | 其他模式重写 |
 

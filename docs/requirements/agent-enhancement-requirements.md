@@ -287,10 +287,10 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 | 精确话题—会话绑定 | 稳定 binding 与 Topic Generation 兼容投影已进入 `main`，Claude/Codex 保留各自 runtime locator | 继续统一生命周期与对外状态语义 |
 | 映射模式 | Mapping Policy Handler 已由 PR #7 合并并安装；旧 selector 仍唯一承重，新候选只做 shadow comparison | 真实样本一致后再灰度切换权威读取路径 |
 | 话题轮转 | Topic Generation 生命周期与显式 rotate 命令已由 PR #8 合并并安装；Codex 第 2 代话题的创建、真实 mention 认领与 binding 切换已完成首次真实验收；自动轮转 v1 已合并 `main`，按每代际 30 条有效业务消息创建 pending，新代际仍需真实 mention，但正式安装与真实自动触发验收后置 | 单独安装并验收自动创建、失败重试与不重复轮转，再评估多订阅 |
-| 对话模式 | `feat/dialogue-policy-v1` 已形成单主持者、单授权人、串行轮次候选：公共状态、默认预算、硬停止、人工中断、Claude/Codex adapter 与 mode 命令均有本地回归；尚未合并、安装或真实验收 | 先评审/合并 v1 并单独真实验收，再扩展多 Agent turn planner |
+| 对话模式 | Dialogue v1 已由 PR #11 合并 `main`，完成 Claude/Codex 双端安装，并在 Codex 精确 task 上完成真实 3 回合串行、预算计账、终局释放和切回 Mapping 验收 | 先补齐多 Agent 参与者授权与可消费的多订阅路由，再实现确定性 turn planner；不直接开启 Agent 输出自动接力 |
 | 项目推进/专家/带教 | 原型仅在未合并的 `feat/agent-supervisor-shadow-mvp` 实验分支，`main` 不含相关实现 | 纳入管理策略和分级权限 |
 | 多人授权 | 未实现 | 身份授权矩阵与审计归属 |
-| 显式控制面 | bind/status/unbind/rotate 均为显式命令；Dialogue 候选新增只读/显式写入的 mode 命令；普通讨论不会触发写操作 | mode 合并后单独安装，后续模式继续沿用结构化 intent 与逐次授权 |
+| 显式控制面 | bind/status/unbind/rotate/mode 均已作为显式命令安装；无参 mode 只读，只有整条输入中的 `dialogue` / `mapping` 才写状态，真实验收已验证异常格式不触发 | 后续模式继续沿用结构化 intent 与逐次授权 |
 
 ## 10. 验收标准
 

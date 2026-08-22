@@ -1,7 +1,7 @@
 # Dialogue Policy v1：单主持者串行对话
 
-状态：`feat/dialogue-policy-v1` 候选实现；仅有本地合成与 adapter 集成测试证据，尚未合并、正式安装
-或完成真实飞书链路验收。
+状态：已由 PR #11 合并到 `main`（merge `0e6082c`），已正式安装到本机 Claude/Codex
+两套 adapter，并完成 Codex 精确 task 的真实飞书多回合验收。
 
 本切片实现需求 FR-5 和架构契约 9.2 的第一个可运行纵切：一名已授权人类通过一个已绑定飞书
 话题，与一条精确 Claude/Codex 长期任务进行有界、串行的多轮对话。它建立 Dialogue 的公共状态、
@@ -112,10 +112,21 @@ Claude project-file binding 与 Topic Generation 共用生命周期锁；registr
 - Mapping 的既有准入、卡片、来源 generation 和自动 Topic Generation 计数语义保持不变；
 - 回滚代码前应先用 mode 命令切回 Mapping。已写入的未知 `interaction_policy_state` 由旧代码原样保留，
   但旧代码不会执行 Dialogue 预算；
-- 当前证据仅覆盖公共状态机、Claude/Codex Git 外持久化、控制命令、严格 watcher、精确终局匹配、
-  consumed sidecar 与两套全量回归；不等同于真实 mention/发布验收；
-- 正式安装、真实飞书写入和真实链路验收必须单独授权。自动 Topic Generation v1 的真实验收也与
-  本切片分开，不以 Dialogue 测试代替。
+- 合成证据覆盖公共状态机、Claude/Codex Git 外持久化、控制命令、严格 watcher、精确终局匹配、
+  consumed sidecar 与两套全量回归：Claude 336/336、Codex 79/79，18 个共享模块契约一致；
+- 真实链路证据覆盖显式进入 Dialogue、同一飞书话题的 3 个人类→Codex 串行回合、每轮自动回写、
+  `3 / 12` 轮次与 `3 / 12` 资源计账、无悬挂活动回合，以及显式切回 Mapping；
+- 真实验收不代表多 Agent 自动接力、并行发言、多人授权或自动 Topic Generation v1 已验收；
+  这些能力仍需独立契约、授权和真实证据。
+
+## 8. 2026-08-22 真实验收记录
+
+1. 在已绑定的 Codex 精确 task 上显式执行 `$feishu-mode dialogue`；
+2. 从原绑定飞书话题连续发起多条真实人类指令，完成 3 个串行回合并逐轮收到回写；
+3. `$feishu-status` 回读为 Dialogue active、`3 / 12` 轮、`3 / 12` 资源单位，且没有活动回合；
+4. 显式执行 `$feishu-mode mapping`，状态成功恢复 Mapping 1.0，历史话题和回合证据保留。
+
+本记录只保留脱敏行为证据，不写入 thread、topic、claim、run 或凭据 locator。
 
 后续 Dialogue 子版本如要加入多个 Agent，必须另行增加参与者授权、确定性 turn planner、每个 Agent
 的独立预算/失败语义和循环检测；不能把 v1 的 `allow_agent_output_as_input=false` 直接改成 true。

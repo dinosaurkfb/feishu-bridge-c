@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dinosaurkfb/feishu-bridge-c/references/dialogue-chat-scope-attestation-v1.schema.json",
+  "title": "Feishu Bridge Dialogue Chat Scope Attestation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "artifact_type", "attestation_version", "generated_at", "binding_ref",
+    "authorization_snapshot_id", "status", "reason", "sample_count", "first_observed_at",
+    "last_observed_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "artifact_type": { "const": "feishu_bridge_dialogue_chat_scope_attestation" },
+    "attestation_version": { "const": "1.0" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "binding_ref": { "type": "string", "pattern": "^binding_ref_[0-9a-f]{24}$" },
+    "authorization_snapshot_id": {
+      "type": "string",
+      "pattern": "^binding_authorization_[0-9a-f]{24}$"
+    },
+    "status": { "enum": ["unverified", "attested_candidate"] },
+    "reason": {
+      "enum": [
+        null,
+        "chat_scope_attestation_evidence_invalid",
+        "chat_scope_attestation_insufficient_evidence",
+        "chat_scope_attestation_binding_mismatch",
+        "chat_scope_attestation_snapshot_mismatch",
+        "chat_scope_attestation_stale_evidence",
+        "chat_scope_attestation_locator_missing",
+        "chat_scope_attestation_scope_mismatch"
+      ]
+    },
+    "sample_count": { "type": "integer", "minimum": 0 },
+    "first_observed_at": { "type": ["string", "null"], "format": "date-time" },
+    "last_observed_at": { "type": ["string", "null"], "format": "date-time" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "attested_candidate" } } },
+      "then": { "properties": { "reason": { "const": null }, "sample_count": { "minimum": 3 } } }
+    },
+    {
+      "if": { "properties": { "sample_count": { "const": 0 } } },
+      "then": {
+        "properties": { "first_observed_at": { "const": null }, "last_observed_at": { "const": null } }
+      }
+    }
+  ]
+}

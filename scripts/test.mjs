@@ -89,7 +89,7 @@ import {
   BINDING_AUTHORIZATION_ARTIFACT_TYPE, BINDING_AUTHORIZATION_REASON,
   BOUND_AUTHORIZATION_SHADOW_ARTIFACT_TYPE,
   buildLegacyDialogueBoundAuthorizationContext, createDialogueBoundAuthorizationShadow,
-  evaluateDialogueBoundAuthorization,
+  evaluateDialogueBoundAuthorization, materializeDialogueBindingAuthorization,
   validateDialogueBindingAuthorizationSnapshot, validateDialogueBoundAuthorizationShadow,
 } from "./dialogue-binding-authorization.mjs";
 import {
@@ -108,6 +108,11 @@ import {
   renderDialogueShadowReadinessReport, validateDialogueShadowReadinessReport,
 } from "./dialogue-shadow-readiness.mjs";
 import { CANONICAL_TIME_PATTERN } from "./canonical-time.mjs";
+import {
+  CHAT_SCOPE_ATTESTATION_ARTIFACT_TYPE, CHAT_SCOPE_ATTESTATION_REASON,
+  CHAT_SCOPE_ATTESTATION_STATUS, MIN_ATTESTATION_SAMPLES,
+  evaluateDialogueChatScopeAttestation, validateDialogueChatScopeAttestation,
+} from "./dialogue-chat-scope-attestation.mjs";
 import {
   MAX_LOCAL_INPUT_CHARS, claudeTurnInputDir, clearTurnInput, isFeishuStampedInput,
   readTurnInput, storeTurnInput,
@@ -1236,6 +1241,230 @@ test("Dialogue shadow readiness schema 与运行时 artifact 固化一致", () =
   ])].sort();
   assert.deepEqual([...reasonNames].sort(), runtimeReasonNames,
     "JSON Schema 与运行时必须维护完全相同的受控 reason bucket 集合");
+});
+
+// ---------- Dialogue Chat Scope Attestation（Slice B2c）：候选证据聚合，仍不提升 canonical trust ----------
+
+const chatScopeAttestationFixture = () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-scope-attestation-"));
+  const synced = syncDialogueAuthorizationShadowSnapshot({
+    shadowDir, authorizationInput: fixture.context.authorizationInput, capturedAt: NOW,
+  });
+  assert.equal(synced.ok, true);
+  const buildProbe = ({
+    suffix, observedAt = NOW, chatId = fixture.template.chat_id, locatorPresent = true,
+    snapshot = synced.snapshot,
+  }) => {
+    const event = { ...baseEvent, message_id: "msg_attest_" + suffix };
+    const built = buildCanonicalEvent({
+      event, rawEnvelope: { type: "message.create", payload: { opaque: true } },
+      endpointId: fixture.endpointId, callerAgentUid: fixture.template.agent_uid,
+    });
+    assert.equal(built.ok, true);
+    const canonicalEvent = structuredClone(built.event);
+    if (locatorPresent) {
+      canonicalEvent.extensions.aily_channel.chat_id = chatId;
+      canonicalEvent.extensions.aily_channel.thread_id = "opaque-runtime-thread";
+    }
+    const created = createDialogueChatScopeProbe({ snapshot, canonicalEvent, observedAt });
+    assert.equal(created.ok, true);
+    return created.probe;
+  };
+  return { fixture, snapshot: synced.snapshot, buildProbe };
+};
+
+test("Chat scope attestation 证据缺失或独立样本不足时保持 unverified", () => {
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  const empty = evaluateDialogueChatScopeAttestation({ snapshot, probes: [], now: NOW });
+  assert.equal(empty.ok, true);
+  assert.equal(empty.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(empty.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.INSUFFICIENT_EVIDENCE);
+  assert.equal(empty.attestation.sample_count, 0);
+  assert.equal(empty.attestation.first_observed_at, null);
+  assert.equal(validateDialogueChatScopeAttestation(empty.attestation).ok, true);
+
+  const two = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: [buildProbe({ suffix: "1" }), buildProbe({ suffix: "2" })], now: NOW,
+  });
+  assert.equal(two.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(two.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.INSUFFICIENT_EVIDENCE);
+  assert.equal(two.attestation.sample_count, 2);
+
+  const duplicated = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: [buildProbe({ suffix: "same" }), buildProbe({ suffix: "same" })], now: NOW,
+  });
+  assert.equal(duplicated.attestation.sample_count, 1,
+    "同一 event 的重复观测不能凑成两条独立样本");
+  assert.equal(duplicated.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.INSUFFICIENT_EVIDENCE);
+});
+
+test("Chat scope attestation 对任何一条损坏或互相矛盾的证据整体 fail-closed", () => {
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  const probes = [buildProbe({ suffix: "a" }), buildProbe({ suffix: "b" }), buildProbe({ suffix: "c" })];
+  const corrupted = structuredClone(probes[1]);
+  corrupted.chat_scope_match = false;
+  const withCorrupted = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: [probes[0], corrupted, probes[2]], now: NOW,
+  });
+  assert.equal(withCorrupted.ok, true);
+  assert.equal(withCorrupted.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(withCorrupted.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.EVIDENCE_INVALID);
+  assert.equal(withCorrupted.attestation.sample_count, 0, "损坏证据不能保留部分计数凑数");
+
+  const conflictingOne = buildProbe({ suffix: "z" });
+  const conflictingTwo = buildProbe({ suffix: "z", chatId: "oc_other_private" });
+  assert.equal(conflictingOne.probe_id, conflictingTwo.probe_id,
+    "同一 snapshot/event 的观测必须落在同一冲突域");
+  assert.notEqual(conflictingOne.evidence_hash, conflictingTwo.evidence_hash);
+  const withConflict = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: [probes[0], probes[2], conflictingOne, conflictingTwo], now: NOW,
+  });
+  assert.equal(withConflict.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(withConflict.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.EVIDENCE_INVALID);
+});
+
+test("Chat scope attestation 拒绝跨 binding 或跨授权 revision 混入的证据", () => {
+  const { fixture, snapshot, buildProbe } = chatScopeAttestationFixture();
+  const validProbes = [buildProbe({ suffix: "1" }), buildProbe({ suffix: "2" })];
+
+  const otherInput = {
+    ...fixture.context.authorizationInput,
+    binding: {
+      ...fixture.context.authorizationInput.binding,
+      private_binding_key: "private-binding-other-line",
+    },
+  };
+  const otherMaterialized = materializeDialogueBindingAuthorization({ ...otherInput, capturedAt: NOW });
+  assert.equal(otherMaterialized.ok, true);
+  assert.notEqual(otherMaterialized.snapshot.binding_ref, snapshot.binding_ref);
+  const foreignProbe = buildProbe({ suffix: "foreign", snapshot: otherMaterialized.snapshot });
+  const crossBinding = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: [...validProbes, foreignProbe], now: NOW,
+  });
+  assert.equal(crossBinding.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(crossBinding.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.BINDING_MISMATCH);
+
+  const revisedSubscription = structuredClone(fixture.context.authorizationInput.subscription);
+  revisedSubscription.constraints = {
+    ...revisedSubscription.constraints,
+    freshness_ms: revisedSubscription.constraints.freshness_ms + 1000,
+  };
+  const revisedInput = { ...fixture.context.authorizationInput, subscription: revisedSubscription };
+  const revisedMaterialized = materializeDialogueBindingAuthorization({ ...revisedInput, capturedAt: NOW });
+  assert.equal(revisedMaterialized.ok, true);
+  assert.equal(revisedMaterialized.snapshot.binding_ref, snapshot.binding_ref);
+  assert.notEqual(revisedMaterialized.snapshot.snapshot_id, snapshot.snapshot_id);
+  const revisedProbe = buildProbe({ suffix: "revised", snapshot: revisedMaterialized.snapshot });
+  const crossSnapshot = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: [...validProbes, revisedProbe], now: NOW,
+  });
+  assert.equal(crossSnapshot.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(crossSnapshot.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.SNAPSHOT_MISMATCH);
+});
+
+test("Chat scope attestation 拒绝任何一条过期或未来时间戳的证据", () => {
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  const fresh = [buildProbe({ suffix: "1" }), buildProbe({ suffix: "2" })];
+  const stale = buildProbe({ suffix: "3", observedAt: NOW - snapshot.freshness_ms - 1 });
+  const staleResult = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: [...fresh, stale], now: NOW,
+  });
+  assert.equal(staleResult.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(staleResult.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.STALE_EVIDENCE);
+
+  const future = buildProbe({ suffix: "4", observedAt: NOW + 60_000 });
+  const futureResult = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: [...fresh, future], now: NOW,
+  });
+  assert.equal(futureResult.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(futureResult.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.EVIDENCE_INVALID,
+    "未来时间戳只能是损坏或篡改，不能算作过期之外的正常样本");
+});
+
+test("Chat scope attestation 要求全部样本 locator 存在且 chat scope 一致", () => {
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  const missing = evaluateDialogueChatScopeAttestation({
+    snapshot,
+    probes: [buildProbe({ suffix: "1" }), buildProbe({ suffix: "2" }),
+      buildProbe({ suffix: "3", locatorPresent: false })],
+    now: NOW,
+  });
+  assert.equal(missing.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(missing.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.LOCATOR_MISSING);
+
+  const mismatch = evaluateDialogueChatScopeAttestation({
+    snapshot,
+    probes: [buildProbe({ suffix: "4" }), buildProbe({ suffix: "5" }),
+      buildProbe({ suffix: "6", chatId: "oc_other_private" })],
+    now: NOW,
+  });
+  assert.equal(mismatch.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(mismatch.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.SCOPE_MISMATCH);
+});
+
+test("Chat scope attestation 在足够、独立、新鲜且一致的真实观测后才产生 shadow candidate", () => {
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  const probes = [
+    buildProbe({ suffix: "1", observedAt: NOW - 3000 }),
+    buildProbe({ suffix: "2", observedAt: NOW - 2000 }),
+    buildProbe({ suffix: "3", observedAt: NOW - 1000 }),
+  ];
+  const result = evaluateDialogueChatScopeAttestation({ snapshot, probes, now: NOW });
+  assert.equal(result.ok, true);
+  assert.equal(result.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.ATTESTED_CANDIDATE);
+  assert.equal(result.attestation.reason, null);
+  assert.equal(result.attestation.sample_count, MIN_ATTESTATION_SAMPLES);
+  assert.equal(result.attestation.first_observed_at, new Date(NOW - 3000).toISOString());
+  assert.equal(result.attestation.last_observed_at, new Date(NOW - 1000).toISOString());
+  assert.equal(validateDialogueChatScopeAttestation(result.attestation).ok, true);
+
+  const serialized = JSON.stringify(result.attestation);
+  assert.equal(serialized.includes("oc_private_dialogue"), false,
+    "attestation 不得包含原始 chat_id");
+  assert.equal(serialized.includes("opaque-runtime-thread"), false,
+    "attestation 不得包含原始 thread locator");
+});
+
+test("Chat scope attestation 校验器拒绝 status/reason/sample_count 不自洽的记录", () => {
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  const probes = [buildProbe({ suffix: "1" }), buildProbe({ suffix: "2" }), buildProbe({ suffix: "3" })];
+  const ok = evaluateDialogueChatScopeAttestation({ snapshot, probes, now: NOW });
+  assert.equal(ok.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.ATTESTED_CANDIDATE);
+
+  const brokenReason = structuredClone(ok.attestation);
+  brokenReason.reason = CHAT_SCOPE_ATTESTATION_REASON.STALE_EVIDENCE;
+  assert.equal(validateDialogueChatScopeAttestation(brokenReason).ok, false);
+
+  const brokenCount = structuredClone(ok.attestation);
+  brokenCount.sample_count = 1;
+  assert.equal(validateDialogueChatScopeAttestation(brokenCount).ok, false,
+    "attested_candidate 不能低于固定最小样本数");
+
+  const brokenRange = structuredClone(ok.attestation);
+  brokenRange.first_observed_at = null;
+  assert.equal(validateDialogueChatScopeAttestation(brokenRange).ok, false);
+});
+
+test("Chat scope attestation 对调用方传入的畸形 snapshot/probes 返回 input_invalid", () => {
+  const bad = evaluateDialogueChatScopeAttestation({ snapshot: {}, probes: [], now: NOW });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.reason, CHAT_SCOPE_ATTESTATION_REASON.INPUT_INVALID);
+
+  const { snapshot } = chatScopeAttestationFixture();
+  const badProbes = evaluateDialogueChatScopeAttestation({ snapshot, probes: "not-array", now: NOW });
+  assert.equal(badProbes.ok, false);
+  assert.equal(badProbes.reason, CHAT_SCOPE_ATTESTATION_REASON.INPUT_INVALID);
+});
+
+test("Dialogue Chat Scope Attestation schema 与运行时常量一致", () => {
+  const schema = JSON.parse(fs.readFileSync(path.resolve("references",
+    "dialogue-chat-scope-attestation-v1.schema.json"), "utf-8"));
+  assert.equal(schema.properties.artifact_type.const, CHAT_SCOPE_ATTESTATION_ARTIFACT_TYPE);
+  assert.deepEqual(schema.properties.status.enum, Object.values(CHAT_SCOPE_ATTESTATION_STATUS));
+  assert.deepEqual(schema.properties.reason.enum,
+    [null, ...Object.values(CHAT_SCOPE_ATTESTATION_REASON).filter((reason) =>
+      reason !== CHAT_SCOPE_ATTESTATION_REASON.INPUT_INVALID)]);
 });
 
 // ---------- Mapping Policy：公共准入、处置与 runtime-neutral runRequest ----------

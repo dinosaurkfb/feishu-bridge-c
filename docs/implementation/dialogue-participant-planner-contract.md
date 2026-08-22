@@ -209,5 +209,13 @@ subscription 歧义、chat scope、binding 授权快照同步、代际轮转与�
   原始 locator 不落盘，探针失败不阻断 B1 或 legacy 路由；
 - Slice B2b 新增只读 readiness audit，把 authorization、event comparison 与 scope probe 关联为脱敏
   计数；即使自动检查全部通过也只返回 `manual_review_required`，不能据此切流；
-- Claude 361/361、Codex 82/82 通过；共享导出面扩展为 23 个模块、208 个导出并更新快照；
-- 证据层级仍是本地合成/契约测试，不等于 Slice B 权威路由或 Slice C Agent Relay 已实现、安装或验收。
+- Slice B2c 新增 `scripts/dialogue-chat-scope-attestation.mjs` 与
+  `references/dialogue-chat-scope-attestation-v1.schema.json`，把同一 binding 的多条独立真实 B2a
+  证据聚合为 `unverified`/`attested_candidate` 两态；任何缺失、损坏、冲突、过期、未来时间戳或跨
+  binding/授权 revision 不一致都使整批判定 fail-closed，不筛掉坏样本凑数；不写文件、不改动
+  Canonical Event、hook 或 dispatcher；详见
+  [`dialogue-chat-scope-attestation-shadow.md`](dialogue-chat-scope-attestation-shadow.md)；
+- Claude 373/373、Codex 82/82 通过；共享导出面维持 23 个模块（B2c 未被 `scripts/codex/` 消费，
+  不改变快照）；
+- 证据层级仍是本地合成/契约测试，不等于 Slice B 权威路由或 Slice C Agent Relay 已实现、安装或验收；
+  Slice B2c 的 `attested_candidate` 同样只是 shadow candidate，不等于 Canonical Event `verified=true`。

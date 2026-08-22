@@ -66,4 +66,10 @@ Codex:  <bridge-home>/tasks/<logical-task>/inbound/dialogue-planner-shadow/scope
 4. 明确 Aily runtime 的字段注入来源，或用本地受控 session→scope attestation 进行独立交叉验证；
 5. promotion 代码使用新的显式开关和回滚路径，不能复用探针开关直接切权威路由。
 
+候选 `feat/dialogue-chat-scope-attestation-shadow`（见
+[`dialogue-chat-scope-attestation-shadow.md`](dialogue-chat-scope-attestation-shadow.md)）在纯 shadow
+计算范围内加强了第 2 项：把同一 binding 的多条独立真实观测聚合成 `attested_candidate` 候选状态，
+任何缺失、损坏、过期或跨 binding/授权 revision 不一致都 fail-closed。它不修改 Canonical Event，
+不产生新的持久化写入，也不满足第 1、3、4、5 项——尤其是第 4 项仍未解决。
+
 本地测试只证明 artifact、脱敏、幂等和旁路隔离，不替代上述真实链路证据。

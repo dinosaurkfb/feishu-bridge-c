@@ -242,8 +242,10 @@ v1 只支持一名授权人类和当前精确本地 task 这个主持者，严�
 [Dialogue Policy v1](docs/implementation/dialogue-policy-v1.md)。
 
 下一阶段的多 Agent Dialogue 仍处于未安装候选：Slice A 提供确定性串行 planner，Slice B1 仅在显式
-开关下旁路比较现有 binding 授权并写 Git 外证据，不接管路由、不会启动第二个 Agent。实现与门禁见
-[Dialogue Binding Authorization Shadow](docs/implementation/dialogue-binding-authorization-shadow.md)。
+开关下旁路比较现有 binding 授权并写 Git 外证据，Slice B2a 只收集 Aily channel locator 的脱敏一致性
+探针；在可信 chat locator、自动轮转与授权同步验收前不会切流或启动第二个 Agent。实现与门禁见
+[Dialogue Binding Authorization Shadow](docs/implementation/dialogue-binding-authorization-shadow.md) ·
+[Chat Scope Probe](docs/implementation/dialogue-chat-scope-probe.md)。
 
 运行 `rotate` 后，bridge 先创建一个 `pending` 新话题。首次真实 mention 完成认领前，旧话题仍是
 唯一 active；认领成功时，新旧状态在同一份 Git 外 binding 文档的一次原子替换中切换，新话题

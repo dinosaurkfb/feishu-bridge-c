@@ -1,8 +1,7 @@
 # Dialogue Binding Authorization Shadow（Slice B1）
 
-状态：候选实现位于 `feat/dialogue-multi-subscription-shadow`，叠加在 Slice A 的
-`feat/dialogue-participant-foundation` 之上。默认关闭、未安装、未切换权威路由，也不会 dispatch
-第二个 Agent。
+状态：已由 PR #15 合并 `main`，默认关闭、未安装、未切换权威路由，也不会 dispatch 第二个 Agent。
+后续 Slice B2a 在同一 Git 外 sidecar 增加脱敏 chat scope probe，但不会提升 canonical trust。
 
 ## 1. 目标与边界
 
@@ -80,6 +79,7 @@ Codex:  <bridge-home>/tasks/<logical-task>/inbound/dialogue-planner-shadow/
 
 authorizations/<binding_ref>.json
 events/<authorization_shadow_id>.json
+scope-probes/<chat_scope_probe_id>.json
 ```
 
 Sidecar 不取得 binding 生命周期锁，不参与 claim 或路由。目录不可写、快照损坏、投影歧义、写入竞争或
@@ -95,6 +95,9 @@ Sidecar 不取得 binding 生命周期锁，不参与 claim 或路由。目录�
 3. subscription 生命周期与 authorization snapshot 的权威原子同步；
 4. legacy/candidate 在已绑定真实样本上持续一致；
 5. 单 endpoint/domain 灰度与回滚演练。
+
+其中第 2 项先通过 [Dialogue Chat Scope Probe](dialogue-chat-scope-probe.md) 收集脱敏真实证据；probe
+一致不能单独等价于可信来源验证，也不能据此设置 `verified=true`。
 
 回滚 B1 只需关闭环境开关，或移除两条 adapter 的旁路调用；旧 binding、claim、run、outbox、话题和
 历史都未被迁移或替换。Git 外 sidecar 可作为审计证据保留，不能重放为真实消息。

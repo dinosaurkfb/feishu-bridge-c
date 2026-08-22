@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dinosaurkfb/feishu-bridge-c/references/dialogue-chat-scope-probe-v1.schema.json",
+  "title": "Feishu Bridge Dialogue Chat Scope Probe v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "artifact_type", "probe_version", "probe_id", "evidence_hash", "observed_at",
+    "event_ref", "binding_ref", "authorization_snapshot_id", "canonical_verified",
+    "chat_locator_present", "chat_scope_match", "thread_locator_present"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "artifact_type": { "const": "feishu_bridge_dialogue_chat_scope_probe" },
+    "probe_version": { "const": "1.0" },
+    "probe_id": { "type": "string", "pattern": "^chat_scope_probe_[0-9a-f]{24}$" },
+    "evidence_hash": { "type": "string", "pattern": "^probe_evidence_[0-9a-f]{24}$" },
+    "observed_at": { "type": "string", "format": "date-time" },
+    "event_ref": { "type": "string", "pattern": "^event_ref_[0-9a-f]{24}$" },
+    "binding_ref": { "type": "string", "pattern": "^binding_ref_[0-9a-f]{24}$" },
+    "authorization_snapshot_id": {
+      "type": "string",
+      "pattern": "^binding_authorization_[0-9a-f]{24}$"
+    },
+    "canonical_verified": { "type": "boolean" },
+    "chat_locator_present": { "type": "boolean" },
+    "chat_scope_match": { "type": ["boolean", "null"] },
+    "thread_locator_present": { "type": "boolean" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "chat_locator_present": { "const": false } } },
+      "then": { "properties": { "chat_scope_match": { "const": null } } }
+    },
+    {
+      "if": { "properties": { "chat_locator_present": { "const": true } } },
+      "then": { "properties": { "chat_scope_match": { "type": "boolean" } } }
+    }
+  ]
+}

@@ -97,6 +97,11 @@ import {
   syncDialogueAuthorizationShadowSnapshot,
 } from "./dialogue-authorization-shadow-store.mjs";
 import {
+  CHAT_SCOPE_PROBE_ARTIFACT_TYPE, createDialogueChatScopeProbe,
+  sameDialogueChatScopeProbeObservation,
+  validateDialogueChatScopeProbe,
+} from "./dialogue-chat-scope-probe.mjs";
+import {
   MAX_LOCAL_INPUT_CHARS, claudeTurnInputDir, clearTurnInput, isFeishuStampedInput,
   readTurnInput, storeTurnInput,
 } from "./turn-input.mjs";
@@ -649,6 +654,62 @@ test("bound authorization 候选在 chat 未核验时 fail-closed，可信同 sc
   assert.equal(forgedBinding.reason, BINDING_AUTHORIZATION_REASON.BINDING_MISMATCH);
 });
 
+test("chat scope probe 只记录脱敏 presence 与一致性，不提升 canonical trust", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-scope-probe-"));
+  const synced = syncDialogueAuthorizationShadowSnapshot({
+    shadowDir, authorizationInput: fixture.context.authorizationInput, capturedAt: NOW,
+  });
+  const matching = structuredClone(fixture.unverifiedEvent);
+  matching.extensions.aily_channel.chat_id = fixture.template.chat_id;
+  matching.extensions.aily_channel.thread_id = "opaque-runtime-thread";
+  const created = createDialogueChatScopeProbe({
+    snapshot: synced.snapshot, canonicalEvent: matching, observedAt: NOW,
+  });
+  assert.equal(created.ok, true);
+  assert.equal(created.probe.artifact_type, CHAT_SCOPE_PROBE_ARTIFACT_TYPE);
+  assert.equal(created.probe.canonical_verified, false,
+    "一致性观测不能自行把 canonical event 提升为可信");
+  assert.equal(created.probe.chat_locator_present, true);
+  assert.equal(created.probe.chat_scope_match, true);
+  assert.equal(created.probe.thread_locator_present, true);
+  assert.equal(validateDialogueChatScopeProbe(created.probe).ok, true);
+
+  const absent = createDialogueChatScopeProbe({
+    snapshot: synced.snapshot, canonicalEvent: fixture.unverifiedEvent, observedAt: NOW,
+  });
+  assert.equal(absent.probe.chat_locator_present, false);
+  assert.equal(absent.probe.chat_scope_match, null);
+
+  const mismatch = structuredClone(matching);
+  mismatch.extensions.aily_channel.chat_id = "oc_other_private";
+  const mismatched = createDialogueChatScopeProbe({
+    snapshot: synced.snapshot, canonicalEvent: mismatch, observedAt: NOW,
+  });
+  assert.equal(mismatched.probe.chat_scope_match, false);
+  assert.equal(mismatched.probe.probe_id, created.probe.probe_id,
+    "同一 snapshot/event 必须落到同一冲突域，而不是悄悄生成第二份独立证据");
+  assert.equal(sameDialogueChatScopeProbeObservation(created.probe, mismatched.probe), false);
+
+  const serialized = JSON.stringify([created.probe, absent.probe, mismatched.probe]);
+  for (const secret of [fixture.template.chat_id, "opaque-runtime-thread", "oc_other_private",
+    fixture.template.frank_sender_id, fixture.privateBindingKey]) {
+    assert.equal(serialized.includes(secret), false, "scope probe 泄露私有输入：" + secret);
+  }
+  const tampered = structuredClone(created.probe);
+  tampered.chat_scope_match = false;
+  assert.equal(validateDialogueChatScopeProbe(tampered).ok, false,
+    "probe 内容被改写后必须由内容寻址 ID 检出");
+  const retargeted = structuredClone(created.probe);
+  retargeted.binding_ref = "binding_ref_ffffffffffffffffffffffff";
+  assert.equal(validateDialogueChatScopeProbe(retargeted).ok, false,
+    "binding_ref 也必须由 evidence hash 覆盖");
+  const redated = structuredClone(created.probe);
+  redated.observed_at = new Date(NOW + 1).toISOString();
+  assert.equal(validateDialogueChatScopeProbe(redated).ok, false,
+    "observed_at 也必须由 evidence hash 覆盖");
+});
+
 test("bound authorization shadow 独立写证据、重复幂等，且不写原始身份", () => {
   const fixture = dialogueAuthorizationFixture();
   const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-auth-sidecar-"));
@@ -677,10 +738,13 @@ test("bound authorization shadow 独立写证据、重复幂等，且不写原�
   assert.equal(duplicate.ok, true);
   assert.equal(duplicate.duplicate, true);
   assert.equal(duplicate.evidence.shadow_id, first.evidence.shadow_id);
-  assert.deepEqual(fs.readdirSync(shadowDir).sort(), ["authorizations", "events"]);
+  assert.equal(first.scopeProbe.ok, true);
+  assert.equal(first.scopeProbe.probe.chat_locator_present, false);
+  assert.equal(duplicate.scopeProbe.duplicate, true);
+  assert.deepEqual(fs.readdirSync(shadowDir).sort(), ["authorizations", "events", "scope-probes"]);
 
   const allFiles = [first.file, path.join(shadowDir, "authorizations",
-    first.snapshot.binding_ref + ".json")];
+    first.snapshot.binding_ref + ".json"), first.scopeProbe.file];
   const serialized = allFiles.map((file) => fs.readFileSync(file, "utf-8")).join("\n");
   for (const secret of [fixture.privateBindingKey, fixture.template.chat_id,
     fixture.template.frank_sender_id, fixture.template.transport_open_id]) {
@@ -742,17 +806,82 @@ test("shadow artifact 畸形输入与 sidecar I/O 失败都只返回诊断", () 
   assert.match(failed.reason, /^shadow_/u);
 });
 
+test("chat scope probe 损坏不能阻断既有 authorization shadow", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-probe-isolation-"));
+  const first = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.unverifiedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  assert.equal(first.ok, true);
+  fs.writeFileSync(first.scopeProbe.file, "{}\n");
+  const second = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.unverifiedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW + 1000,
+  });
+  assert.equal(second.ok, true, "诊断探针永远不能成为 legacy/shadow 主证据的承重依赖");
+  assert.equal(second.duplicate, true);
+  assert.equal(second.scopeProbe.ok, false);
+  assert.equal(second.scopeProbe.reason, "chat_scope_probe_invalid");
+});
+
+test("同一 event 的 chat scope 观测冲突会显式诊断且不阻断 B1", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-probe-conflict-"));
+  const first = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.unverifiedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  const changedObservation = structuredClone(fixture.unverifiedEvent);
+  changedObservation.extensions.aily_channel.chat_id = fixture.template.chat_id;
+  const second = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: changedObservation,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW + 1000,
+  });
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true, "探针冲突不能改变原 authorization shadow");
+  assert.equal(second.duplicate, true);
+  assert.equal(second.scopeProbe.ok, false);
+  assert.equal(second.scopeProbe.reason, "chat_scope_probe_conflict");
+  assert.equal(second.scopeProbe.probe_id, first.scopeProbe.probe.probe_id);
+});
+
 test("Dialogue Slice B1 schema 固化授权快照与 shadow artifact", () => {
   const snapshotSchema = JSON.parse(fs.readFileSync(path.resolve("references",
     "dialogue-binding-authorization-v1.schema.json"), "utf-8"));
   const shadowSchema = JSON.parse(fs.readFileSync(path.resolve("references",
     "dialogue-bound-authorization-shadow-v1.schema.json"), "utf-8"));
+  const scopeProbeSchema = JSON.parse(fs.readFileSync(path.resolve("references",
+    "dialogue-chat-scope-probe-v1.schema.json"), "utf-8"));
   assert.equal(snapshotSchema.properties.artifact_type.const,
     BINDING_AUTHORIZATION_ARTIFACT_TYPE);
   assert.equal(snapshotSchema.properties.authorized_human_participant_ids.uniqueItems, true);
   assert.equal(shadowSchema.properties.artifact_type.const,
     BOUND_AUTHORIZATION_SHADOW_ARTIFACT_TYPE);
   assert.equal(shadowSchema.properties.evaluator_version.const, "1.0");
+  assert.equal(scopeProbeSchema.properties.artifact_type.const,
+    CHAT_SCOPE_PROBE_ARTIFACT_TYPE);
+  assert.equal(scopeProbeSchema.properties.chat_scope_match.type.includes("null"), true);
 });
 
 // ---------- Mapping Policy：公共准入、处置与 runtime-neutral runRequest ----------

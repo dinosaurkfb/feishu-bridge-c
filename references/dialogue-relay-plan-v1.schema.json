@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dinosaurkfb/feishu-bridge-c/references/dialogue-relay-plan-v1.schema.json",
+  "title": "Feishu Bridge Dialogue Relay Plan State v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_type",
+    "policy_id",
+    "policy_version",
+    "dialogue_id",
+    "participant_snapshot_id",
+    "status",
+    "budget",
+    "usage",
+    "next_cycle_index",
+    "active_cycle",
+    "last_cycle",
+    "processed_human_events",
+    "processed_terminal_events",
+    "started_at",
+    "deadline_at",
+    "updated_at",
+    "ended_at",
+    "stop_reason"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "artifact_type": { "const": "feishu_bridge_dialogue_relay_plan_state" },
+    "policy_id": { "const": "dialogue" },
+    "policy_version": { "const": "2.0" },
+    "dialogue_id": { "type": "string", "minLength": 1 },
+    "participant_snapshot_id": {
+      "type": "string",
+      "pattern": "^participant_snapshot_[0-9a-f]{24}$"
+    },
+    "status": { "enum": ["active", "completed", "failed", "cancelled"] },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_cycles", "max_agent_runs", "max_duration_ms", "max_resource_units"],
+      "properties": {
+        "max_cycles": { "type": "integer", "minimum": 1 },
+        "max_agent_runs": { "type": "integer", "minimum": 1 },
+        "max_duration_ms": { "type": "integer", "minimum": 1 },
+        "max_resource_units": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cycles_started",
+        "agent_runs_started",
+        "resource_units_used",
+        "participant_agent_runs"
+      ],
+      "properties": {
+        "cycles_started": { "type": "integer", "minimum": 0 },
+        "agent_runs_started": { "type": "integer", "minimum": 0 },
+        "resource_units_used": { "type": "integer", "minimum": 0 },
+        "participant_agent_runs": {
+          "type": "object",
+          "propertyNames": { "pattern": "^participant_ref_[0-9a-f]{24}$" },
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "next_cycle_index": { "type": "integer", "minimum": 1 },
+    "active_cycle": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/cycle" }] },
+    "last_cycle": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/cycle" }] },
+    "processed_human_events": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["event_id", "cycle_index", "parent_human_claim_id"],
+        "properties": {
+          "event_id": { "type": "string", "minLength": 1 },
+          "cycle_index": { "type": "integer", "minimum": 1 },
+          "parent_human_claim_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    },
+    "processed_terminal_events": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["terminal_event_id", "run_id", "cycle_index", "step_index"],
+        "properties": {
+          "terminal_event_id": { "type": "string", "minLength": 1 },
+          "run_id": { "type": "string", "pattern": "^relay_run_[0-9a-f]{24}$" },
+          "cycle_index": { "type": "integer", "minimum": 1 },
+          "step_index": { "type": "integer", "minimum": 1, "maximum": 3 }
+        }
+      }
+    },
+    "started_at": { "type": "string", "format": "date-time" },
+    "deadline_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "ended_at": { "type": ["string", "null"], "format": "date-time" },
+    "stop_reason": { "type": ["string", "null"] }
+  },
+  "$defs": {
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "step_index",
+        "role",
+        "participant_id",
+        "run_id",
+        "input_ref",
+        "source_participant_id",
+        "resource_units",
+        "status",
+        "dispatched_at",
+        "finalized_at",
+        "output_ref",
+        "reason"
+      ],
+      "properties": {
+        "step_index": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "role": { "enum": ["host", "peer", "finalizer"] },
+        "participant_id": { "type": "string", "pattern": "^participant_ref_[0-9a-f]{24}$" },
+        "run_id": { "type": "string", "pattern": "^relay_run_[0-9a-f]{24}$" },
+        "input_ref": { "type": "string", "minLength": 1 },
+        "source_participant_id": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "pattern": "^participant_ref_[0-9a-f]{24}$" }
+          ]
+        },
+        "resource_units": { "type": "integer", "minimum": 1 },
+        "status": { "enum": ["dispatched", "completed", "failed", "cancelled"] },
+        "dispatched_at": { "type": "string", "format": "date-time" },
+        "finalized_at": { "type": ["string", "null"], "format": "date-time" },
+        "output_ref": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "pattern": "^output_ref_[0-9a-f]{24}$" }
+          ]
+        },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "cycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cycle_index",
+        "human_event_id",
+        "parent_human_claim_id",
+        "origin_channel_generation_id",
+        "steps",
+        "active_step_index",
+        "started_at",
+        "completed_at"
+      ],
+      "properties": {
+        "cycle_index": { "type": "integer", "minimum": 1 },
+        "human_event_id": { "type": "string", "minLength": 1 },
+        "parent_human_claim_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "origin_channel_generation_id": {
+          "type": "string",
+          "pattern": "^channel_generation_[0-9a-f]{24}$"
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "items": { "$ref": "#/$defs/step" }
+        },
+        "active_step_index": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "started_at": { "type": "string", "format": "date-time" },
+        "completed_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    }
+  }
+}

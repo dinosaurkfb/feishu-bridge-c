@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-08-22T10:19:37.355Z",
+  "generated_at": "2026-08-22T11:55:51.807Z",
   "modules": {
     "automatic-topic-rotation.mjs": [
       "businessActivitiesForPublishedBatch",
@@ -39,6 +39,29 @@
       "claimKey",
       "readClaim",
       "recordClaimState"
+    ],
+    "dialogue-participant-planner.mjs": [
+      "DEFAULT_RELAY_BUDGET",
+      "PARTICIPANT_SNAPSHOT_ARTIFACT_TYPE",
+      "PARTICIPANT_SNAPSHOT_SCHEMA_VERSION",
+      "RELAY_DISPOSITION",
+      "RELAY_PLAN_ARTIFACT_TYPE",
+      "RELAY_PLAN_SCHEMA_VERSION",
+      "RELAY_PLAN_STATUS",
+      "RELAY_POLICY_ID",
+      "RELAY_POLICY_VERSION",
+      "RELAY_REASON",
+      "RELAY_STEP_STATUS",
+      "advanceRelayPlan",
+      "cancelRelayPlan",
+      "createParticipantAuthorizationSnapshot",
+      "createRelayPlanState",
+      "deriveDialogueBindingRef",
+      "deriveDialogueOutputRef",
+      "deriveDialogueParticipantRef",
+      "startRelayCycle",
+      "validateParticipantAuthorizationSnapshot",
+      "validateRelayPlanState"
     ],
     "envelope.mjs": [
       "ENV",

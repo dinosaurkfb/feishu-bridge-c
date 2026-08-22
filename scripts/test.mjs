@@ -78,6 +78,14 @@ import {
   materializeInteractionPolicy, reserveDialogueTurn, setInteractionPolicyMode,
 } from "./interaction-policy.mjs";
 import {
+  DEFAULT_RELAY_BUDGET, PARTICIPANT_SNAPSHOT_ARTIFACT_TYPE, RELAY_DISPOSITION,
+  RELAY_PLAN_STATUS, RELAY_REASON, RELAY_STEP_STATUS, advanceRelayPlan, cancelRelayPlan,
+  createParticipantAuthorizationSnapshot, createRelayPlanState, deriveDialogueBindingRef,
+  deriveDialogueOutputRef, deriveDialogueParticipantRef, startRelayCycle,
+  validateParticipantAuthorizationSnapshot,
+  validateRelayPlanState,
+} from "./dialogue-participant-planner.mjs";
+import {
   MAX_LOCAL_INPUT_CHARS, claudeTurnInputDir, clearTurnInput, isFeishuStampedInput,
   readTurnInput, storeTurnInput,
 } from "./turn-input.mjs";
@@ -803,6 +811,331 @@ test("Dialogue 终局只能关闭匹配的 run/runtime target，损坏契约一�
   const damaged = structuredClone(reserved.state);
   damaged.dialogue.concurrency.max_active_turns = 2;
   assert.equal(interactionPolicySummary(damaged).reason, DIALOGUE_REASON.POLICY_INVALID);
+});
+
+// ---------- Dialogue Participant & Planner Foundation：只计算、不接 adapter ----------
+
+const relaySnapshotFixture = ({ capturedAt = NOW, hostRuns = 8, peerRuns = 4 } = {}) => {
+  const hostBinding = deriveDialogueBindingRef({
+    runtimeNamespace: "claude", endpointId: "endpoint_host",
+    privateBindingKey: "/private/projects/host-project@registry",
+  }).bindingRef;
+  const peerBinding = deriveDialogueBindingRef({
+    runtimeNamespace: "codex", endpointId: "endpoint_peer",
+    privateBindingKey: "/private/projects/peer-project@registry",
+  }).bindingRef;
+  const human = deriveDialogueParticipantRef({
+    kind: "human", runtimeNamespace: "feishu", endpointId: "endpoint_host",
+    privateIdentityKey: "private_sender",
+  }).participantId;
+  const host = deriveDialogueParticipantRef({
+    kind: "agent", runtimeNamespace: "claude", endpointId: "endpoint_host",
+    privateIdentityKey: "private_host_target",
+  }).participantId;
+  const peer = deriveDialogueParticipantRef({
+    kind: "agent", runtimeNamespace: "codex", endpointId: "endpoint_peer",
+    privateIdentityKey: "private_peer_target",
+  }).participantId;
+  return createParticipantAuthorizationSnapshot({
+    authorizationRevision: 1, capturedAt, coordinatorBindingRef: hostBinding,
+    participants: [
+      { participant_id: human, kind: "human", roles: ["requester"],
+        subscription_id: null, binding_ref: null, local_target_id: null,
+        allowed_origins: ["human_event"], limits: { max_agent_runs: 1, resource_units_per_run: 1 } },
+      { participant_id: host, kind: "agent", roles: ["host", "finalizer"],
+        subscription_id: "subscription_aaaaaaaaaaaaaaaaaaaaaaaa", binding_ref: hostBinding,
+        local_target_id: "target_aaaaaaaaaaaaaaaaaaaaaaaa",
+        allowed_origins: ["human_event", "planner_relay"],
+        limits: { max_agent_runs: hostRuns, resource_units_per_run: 1 } },
+      { participant_id: peer, kind: "agent", roles: ["peer"],
+        subscription_id: "subscription_bbbbbbbbbbbbbbbbbbbbbbbb", binding_ref: peerBinding,
+        local_target_id: "target_bbbbbbbbbbbbbbbbbbbbbbbb", allowed_origins: ["planner_relay"],
+        limits: { max_agent_runs: peerRuns, resource_units_per_run: 1 } },
+    ],
+  });
+};
+
+const finishRelayCycle = ({ state, snapshot, suffix, now }) => {
+  const claimId = claimKey("human_" + suffix, "dialogue_relay");
+  const generationId = "channel_generation_aaaaaaaaaaaaaaaaaaaaaaaa";
+  const started = startRelayCycle(state, {
+    snapshot, humanEventId: "human_" + suffix, parentHumanClaimId: claimId,
+    originChannelGenerationId: generationId, now,
+  });
+  const hostTerminal = "terminal_host_" + suffix;
+  const hostOutput = deriveDialogueOutputRef({
+    dialogueId: state.dialogue_id, runId: started.runRequest.run_id,
+    terminalEventId: hostTerminal,
+  }).outputRef;
+  const host = advanceRelayPlan(started.state, {
+    snapshot, runId: started.runRequest.run_id, terminalEventId: hostTerminal,
+    status: RELAY_STEP_STATUS.COMPLETED, outputRef: hostOutput, now: now + 1,
+  });
+  const peerTerminal = "terminal_peer_" + suffix;
+  const peerOutput = deriveDialogueOutputRef({
+    dialogueId: state.dialogue_id, runId: host.runRequest.run_id,
+    terminalEventId: peerTerminal,
+  }).outputRef;
+  const peer = advanceRelayPlan(host.state, {
+    snapshot, runId: host.runRequest.run_id, terminalEventId: peerTerminal,
+    status: RELAY_STEP_STATUS.COMPLETED, outputRef: peerOutput, now: now + 2,
+  });
+  const finalTerminal = "terminal_final_" + suffix;
+  const finalOutput = deriveDialogueOutputRef({
+    dialogueId: state.dialogue_id, runId: peer.runRequest.run_id,
+    terminalEventId: finalTerminal,
+  }).outputRef;
+  const final = advanceRelayPlan(peer.state, {
+    snapshot, runId: peer.runRequest.run_id, terminalEventId: finalTerminal,
+    status: RELAY_STEP_STATUS.COMPLETED, outputRef: finalOutput, now: now + 3,
+  });
+  return { started, host, peer, final, finalOutput };
+};
+
+test("Participant snapshot 使用跨 adapter 固定 opaque ref，不泄露私有 binding key", () => {
+  const one = deriveDialogueBindingRef({
+    runtimeNamespace: "claude", endpointId: "endpoint_a", privateBindingKey: "/secret/alpha@registry",
+  });
+  const same = deriveDialogueBindingRef({
+    runtimeNamespace: "claude", endpointId: "endpoint_a", privateBindingKey: "/secret/alpha@registry",
+  });
+  const otherRuntime = deriveDialogueBindingRef({
+    runtimeNamespace: "codex", endpointId: "endpoint_a", privateBindingKey: "/secret/alpha@registry",
+  });
+  assert.equal(one.ok, true);
+  assert.equal(one.bindingRef, same.bindingRef);
+  assert.notEqual(one.bindingRef, otherRuntime.bindingRef);
+  assert.match(one.bindingRef, /^binding_ref_[0-9a-f]{24}$/u);
+  assert.equal(one.bindingRef.includes("alpha"), false);
+
+  const fixture = relaySnapshotFixture();
+  assert.equal(fixture.ok, true);
+  assert.equal(fixture.snapshot.artifact_type, PARTICIPANT_SNAPSHOT_ARTIFACT_TYPE);
+  assert.equal(validateParticipantAuthorizationSnapshot(fixture.snapshot).ok, true);
+  assert.equal(JSON.stringify(fixture.snapshot).includes("/private/projects"), false);
+});
+
+test("Relay planner 固定 host→peer→host finalizer，只有 finalizer 后等待人类", () => {
+  const snapshot = relaySnapshotFixture().snapshot;
+  const created = createRelayPlanState({ dialogueId: "dialogue_relay", snapshot, startedAt: NOW });
+  assert.equal(created.ok, true);
+  assert.deepEqual(created.state.budget, DEFAULT_RELAY_BUDGET);
+  const cycle = finishRelayCycle({ state: created.state, snapshot, suffix: "one", now: NOW + 1 });
+  assert.equal(cycle.started.disposition, RELAY_DISPOSITION.DISPATCH_ONE);
+  assert.equal(cycle.started.runRequest.role, "host");
+  assert.equal(cycle.host.runRequest.role, "peer");
+  assert.equal(cycle.peer.runRequest.role, "finalizer");
+  assert.equal(cycle.final.disposition, RELAY_DISPOSITION.WAIT_HUMAN);
+  assert.equal(cycle.final.finalOutputRef, cycle.finalOutput);
+  assert.equal(cycle.final.state.active_cycle, null);
+  assert.equal(cycle.final.state.usage.cycles_started, 1);
+  assert.equal(cycle.final.state.usage.agent_runs_started, 3);
+  assert.equal(cycle.final.state.usage.resource_units_used, 3);
+  assert.equal(validateRelayPlanState(cycle.final.state, { snapshot }).ok, true);
+  assert.equal("binding_ref" in cycle.started.runRequest, false);
+  assert.equal("claim_id" in cycle.host.runRequest, false);
+  assert.equal(cycle.host.runRequest.parent_human_claim_id,
+    claimKey("human_one", "dialogue_relay"));
+});
+
+test("Relay 人类事件和 terminal event 分别幂等，不重复 dispatch 或扣预算", () => {
+  const snapshot = relaySnapshotFixture().snapshot;
+  const state = createRelayPlanState({ dialogueId: "dialogue_idempotent", snapshot, startedAt: NOW }).state;
+  const started = startRelayCycle(state, {
+    snapshot, humanEventId: "human_same", parentHumanClaimId: claimKey("human_same", "dialogue"),
+    originChannelGenerationId: "channel_generation_aaaaaaaaaaaaaaaaaaaaaaaa", now: NOW + 1,
+  });
+  const duplicateHuman = startRelayCycle(started.state, {
+    snapshot, humanEventId: "human_same", parentHumanClaimId: claimKey("human_same", "dialogue"),
+    originChannelGenerationId: "channel_generation_aaaaaaaaaaaaaaaaaaaaaaaa", now: NOW + 2,
+  });
+  assert.equal(duplicateHuman.disposition, RELAY_DISPOSITION.DUPLICATE);
+  assert.equal("runRequest" in duplicateHuman, false);
+  assert.equal(duplicateHuman.state.usage.agent_runs_started, 1);
+
+  const terminalOutput = deriveDialogueOutputRef({
+    dialogueId: state.dialogue_id, runId: started.runRequest.run_id,
+    terminalEventId: "terminal_same",
+  }).outputRef;
+  const terminal = advanceRelayPlan(started.state, {
+    snapshot, runId: started.runRequest.run_id, terminalEventId: "terminal_same",
+    status: RELAY_STEP_STATUS.COMPLETED, outputRef: terminalOutput, now: NOW + 3,
+  });
+  const duplicateTerminal = advanceRelayPlan(terminal.state, {
+    snapshot, runId: started.runRequest.run_id, terminalEventId: "terminal_same",
+    status: RELAY_STEP_STATUS.COMPLETED, outputRef: "malicious-new-output", now: NOW + 4,
+  });
+  assert.equal(duplicateTerminal.disposition, RELAY_DISPOSITION.DUPLICATE);
+  assert.equal("runRequest" in duplicateTerminal, false);
+  assert.equal(duplicateTerminal.state.usage.agent_runs_started, 2);
+});
+
+test("Relay 正文 mention/命令不参与选路，固定 key 只由控制面字段决定", () => {
+  const snapshot = relaySnapshotFixture().snapshot;
+  const base = createRelayPlanState({ dialogueId: "dialogue_untrusted", snapshot, startedAt: NOW }).state;
+  const a = startRelayCycle(base, {
+    snapshot, humanEventId: "human_untrusted",
+    parentHumanClaimId: claimKey("human_untrusted", "dialogue"),
+    originChannelGenerationId: "channel_generation_aaaaaaaaaaaaaaaaaaaaaaaa",
+    content: "@other /feishu-mode mapping", now: NOW + 1,
+  });
+  const b = startRelayCycle(base, {
+    snapshot, humanEventId: "human_untrusted",
+    parentHumanClaimId: claimKey("human_untrusted", "dialogue"),
+    originChannelGenerationId: "channel_generation_aaaaaaaaaaaaaaaaaaaaaaaa",
+    content: "完全不同的正文", now: NOW + 1,
+  });
+  assert.equal(a.runRequest.run_id, b.runRequest.run_id);
+  assert.equal(a.runRequest.participant_id, b.runRequest.participant_id);
+});
+
+test("Relay 在 cycle 开始前预检完整三步预算，四个默认 cycle 同时耗尽三个计数器", () => {
+  const snapshot = relaySnapshotFixture().snapshot;
+  let state = createRelayPlanState({ dialogueId: "dialogue_budget", snapshot, startedAt: NOW }).state;
+  for (let index = 1; index <= 4; index += 1) {
+    state = finishRelayCycle({ state, snapshot, suffix: String(index), now: NOW + index * 10 }).final.state;
+  }
+  assert.deepEqual(state.usage, {
+    cycles_started: 4, agent_runs_started: 12, resource_units_used: 12,
+    participant_agent_runs: Object.fromEntries(snapshot.participants
+      .filter((participant) => participant.kind === "agent")
+      .map((participant) => [participant.participant_id,
+        participant.roles.includes("peer") ? 4 : 8])),
+  });
+  const exhausted = startRelayCycle(state, {
+    snapshot, humanEventId: "human_five", parentHumanClaimId: claimKey("human_five", "dialogue"),
+    originChannelGenerationId: "channel_generation_aaaaaaaaaaaaaaaaaaaaaaaa", now: NOW + 100,
+  });
+  assert.equal(exhausted.disposition, RELAY_DISPOSITION.STOP);
+  assert.equal(exhausted.reason, RELAY_REASON.CYCLE_BUDGET);
+  assert.equal(exhausted.state.status, RELAY_PLAN_STATUS.COMPLETED);
+  assert.equal(exhausted.state.usage.agent_runs_started, 12);
+});
+
+test("Relay deadline 的迟到终局只关闭当前 run，不再 dispatch peer", () => {
+  const snapshot = relaySnapshotFixture().snapshot;
+  const state = createRelayPlanState({
+    dialogueId: "dialogue_deadline", snapshot, startedAt: NOW,
+    budget: { max_cycles: 1, max_agent_runs: 3, max_duration_ms: 10, max_resource_units: 3 },
+  }).state;
+  const started = startRelayCycle(state, {
+    snapshot, humanEventId: "human_deadline",
+    parentHumanClaimId: claimKey("human_deadline", "dialogue"),
+    originChannelGenerationId: "channel_generation_aaaaaaaaaaaaaaaaaaaaaaaa", now: NOW + 1,
+  });
+  const lateOutput = deriveDialogueOutputRef({
+    dialogueId: state.dialogue_id, runId: started.runRequest.run_id,
+    terminalEventId: "terminal_deadline",
+  }).outputRef;
+  const late = advanceRelayPlan(started.state, {
+    snapshot, runId: started.runRequest.run_id, terminalEventId: "terminal_deadline",
+    status: RELAY_STEP_STATUS.COMPLETED, outputRef: lateOutput, now: NOW + 10,
+  });
+  assert.equal(late.disposition, RELAY_DISPOSITION.STOP);
+  assert.equal(late.reason, RELAY_REASON.TIME_BUDGET);
+  assert.equal(late.state.status, RELAY_PLAN_STATUS.COMPLETED);
+  assert.equal(late.state.usage.agent_runs_started, 1);
+  assert.equal("runRequest" in late, false);
+});
+
+test("Relay runtime/空终局硬失败，授权撤销则是 cancelled", () => {
+  const snapshot = relaySnapshotFixture().snapshot;
+  const base = createRelayPlanState({ dialogueId: "dialogue_failure", snapshot, startedAt: NOW }).state;
+  const started = startRelayCycle(base, {
+    snapshot, humanEventId: "human_failure",
+    parentHumanClaimId: claimKey("human_failure", "dialogue"),
+    originChannelGenerationId: "channel_generation_aaaaaaaaaaaaaaaaaaaaaaaa", now: NOW + 1,
+  });
+  const empty = advanceRelayPlan(started.state, {
+    snapshot, runId: started.runRequest.run_id, terminalEventId: "terminal_empty",
+    status: RELAY_STEP_STATUS.COMPLETED, outputRef: "", now: NOW + 2,
+  });
+  assert.equal(empty.state.status, RELAY_PLAN_STATUS.FAILED);
+  assert.equal(empty.reason, RELAY_REASON.EMPTY_OUTPUT);
+
+  const active = startRelayCycle(createRelayPlanState({
+    dialogueId: "dialogue_revoke", snapshot, startedAt: NOW,
+  }).state, {
+    snapshot, humanEventId: "human_revoke",
+    parentHumanClaimId: claimKey("human_revoke", "dialogue"),
+    originChannelGenerationId: "channel_generation_aaaaaaaaaaaaaaaaaaaaaaaa", now: NOW + 1,
+  });
+  const revoked = cancelRelayPlan(active.state, {
+    snapshot, reason: RELAY_REASON.AUTHORIZATION_REVOKED, now: NOW + 2,
+  });
+  assert.equal(revoked.state.status, RELAY_PLAN_STATUS.CANCELLED);
+  assert.equal(revoked.state.stop_reason, RELAY_REASON.AUTHORIZATION_REVOKED);
+  assert.equal(revoked.state.last_cycle.steps[0].status, RELAY_STEP_STATUS.CANCELLED);
+
+  const runtimeCancelled = advanceRelayPlan(active.state, {
+    snapshot, runId: active.runRequest.run_id, terminalEventId: "terminal_cancelled",
+    status: RELAY_STEP_STATUS.CANCELLED, now: NOW + 2,
+  });
+  assert.equal(runtimeCancelled.state.status, RELAY_PLAN_STATUS.CANCELLED);
+  assert.equal(runtimeCancelled.state.stop_reason, RELAY_REASON.HUMAN_INTERRUPT);
+  assert.equal(runtimeCancelled.state.last_cycle.steps[0].reason, RELAY_REASON.HUMAN_INTERRUPT);
+  assert.equal(validateRelayPlanState(runtimeCancelled.state, { snapshot }).ok, true);
+});
+
+test("Relay state 中 target、步骤顺序或 deterministic run key 被篡改时 fail-closed", () => {
+  const snapshot = relaySnapshotFixture().snapshot;
+  const base = createRelayPlanState({ dialogueId: "dialogue_tamper", snapshot, startedAt: NOW }).state;
+  const started = startRelayCycle(base, {
+    snapshot, humanEventId: "human_tamper",
+    parentHumanClaimId: claimKey("human_tamper", "dialogue"),
+    originChannelGenerationId: "channel_generation_aaaaaaaaaaaaaaaaaaaaaaaa", now: NOW + 1,
+  });
+  const runTampered = structuredClone(started.state);
+  runTampered.active_cycle.steps[0].run_id = "relay_run_ffffffffffffffffffffffff";
+  assert.equal(validateRelayPlanState(runTampered, { snapshot }).reason, RELAY_REASON.INVALID_STATE);
+
+  const claimTampered = structuredClone(started.state);
+  claimTampered.processed_human_events[0].parent_human_claim_id = "not-a-claim";
+  assert.equal(validateRelayPlanState(claimTampered, { snapshot }).reason,
+    RELAY_REASON.INVALID_STATE);
+
+  const targetTampered = structuredClone(snapshot);
+  targetTampered.participants.find((item) => item.roles.includes("host")).local_target_id =
+    "target_ffffffffffffffffffffffff";
+  assert.equal(validateRelayPlanState(started.state, { snapshot: targetTampered }).reason,
+    RELAY_REASON.INVALID_STATE);
+});
+
+test("Participant schema 与离线 simulator 可复现三步计划且不产生控制面文件", () => {
+  const schema = JSON.parse(fs.readFileSync(path.resolve("references",
+    "dialogue-participant-snapshot-v1.schema.json"), "utf-8"));
+  const planSchema = JSON.parse(fs.readFileSync(path.resolve("references",
+    "dialogue-relay-plan-v1.schema.json"), "utf-8"));
+  assert.equal(schema.properties.artifact_type.const, PARTICIPANT_SNAPSHOT_ARTIFACT_TYPE);
+  assert.ok(schema.required.includes("coordinator_binding_ref"));
+  assert.equal(planSchema.properties.policy_version.const, "2.0");
+  assert.equal(planSchema.properties.processed_terminal_events.maxItems, 256);
+
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-planner-simulator-"));
+  const input = path.join(local, "fixture.json");
+  fs.writeFileSync(input, JSON.stringify({
+    snapshot: relaySnapshotFixture().snapshot,
+    dialogue_id: "dialogue_simulator",
+    started_at: NOW,
+    events: [
+      { type: "human", event_id: "human_sim", claim_id: "a".repeat(64),
+        origin_channel_generation_id: "channel_generation_aaaaaaaaaaaaaaaaaaaaaaaa", now: NOW + 1 },
+      { type: "terminal", run_id: "$active", terminal_event_id: "terminal_sim_1",
+        output_ref: "output_ref_aaaaaaaaaaaaaaaaaaaaaaaa", now: NOW + 2 },
+      { type: "terminal", run_id: "$active", terminal_event_id: "terminal_sim_2",
+        output_ref: "output_ref_bbbbbbbbbbbbbbbbbbbbbbbb", now: NOW + 3 },
+      { type: "terminal", run_id: "$active", terminal_event_id: "terminal_sim_3",
+        output_ref: "output_ref_cccccccccccccccccccccccc", now: NOW + 4 },
+    ],
+  }));
+  const run = spawnSync(process.execPath, [path.resolve("scripts", "simulate-dialogue-planner.mjs"),
+    "--input", input], { encoding: "utf-8" });
+  assert.equal(run.status, 0, run.stderr);
+  const result = JSON.parse(run.stdout);
+  assert.equal(result.ok, true);
+  assert.equal(result.state.usage.agent_runs_started, 3);
+  assert.equal(result.results.at(-1).disposition, RELAY_DISPOSITION.WAIT_HUMAN);
+  assert.deepEqual(fs.readdirSync(local), ["fixture.json"]);
 });
 
 test("Claude registry binding 原子保存 Dialogue 模式、回合与终局", () => {

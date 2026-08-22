@@ -1,7 +1,8 @@
 # Dialogue Participant & Planner：下一纵切契约
 
-状态：`design only`。本文定义 Dialogue v1 之后的参与者授权与确定性串行规划前置；不改变当前
-生产路由，不安装技能，不发送飞书消息，也不把 Agent 输出自动接力打开。
+状态：Slice A 候选实现已位于 `feat/dialogue-participant-foundation`：公共纯函数、两份 versioned
+schema、离线 simulator 与 Claude/Codex 回归已完成；没有接入 adapter 热路径、安装技能、发送飞书
+消息或打开 Agent 输出自动接力。
 
 ## 1. 为什么不能直接打开 Agent 自动接力
 
@@ -186,3 +187,15 @@ subscription 歧义、chat scope、binding 授权快照同步、代际轮转与�
 运行、失败时停止且不串线。
 
 本地与 shadow 证据不能替代 Slice B/C 的真实链路验收。
+
+## 9. Slice A 候选实现证据
+
+- `scripts/dialogue-participant-planner.mjs` 实现 opaque binding/participant/output ref、不可变快照校验、
+  固定 `host -> peer -> host finalizer` 纯函数 planner、完整 cycle 预算预检、重复事件幂等、deadline、
+  runtime hard failure 与授权撤销 cancellation；
+- `references/dialogue-participant-snapshot-v1.schema.json` 与
+  `references/dialogue-relay-plan-v1.schema.json` 固化公共 artifact；
+- `scripts/simulate-dialogue-planner.mjs` 只读 fixture 并把候选状态写到 stdout，不访问网络或控制面；
+- 生产脚本没有 import foundation 模块；当前只有两套测试和离线 simulator 引用它；
+- Claude 345/345、Codex 80/80 通过；共享导出面扩展为 19 个模块并更新快照；
+- 证据层级仍是本地合成/契约测试，不等于 Slice B 路由或 Slice C Agent Relay 已实现、安装或验收。

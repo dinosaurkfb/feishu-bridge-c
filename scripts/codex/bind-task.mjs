@@ -12,7 +12,7 @@ import {
 import { updateTextMessage } from "./lark-message.mjs";
 import {
   addTask, findRegisteredTaskForCodexThread, loadCodexTemplate, makeTaskEntry,
-  setTaskConnectionStatus, setTaskDisplayName,
+  refreshPendingTaskBinding, setTaskConnectionStatus, setTaskDisplayName,
 } from "./state.mjs";
 
 const arg = (name) => {
@@ -29,11 +29,25 @@ if (!thread.ok) die("无法确定当前 Codex thread（" + thread.reason + "）�
 const existing = findRegisteredTaskForCodexThread({ threadId: thread.threadId });
 if (existing.ok) {
   if ((existing.task.status ?? "active") === "active") {
+    const awaitingFirstMention = existing.task.inbound_state === "pending" && !existing.task.session_id;
     const d = composeCodexBinding({
       root: existing.task.root, threadId: thread.threadId, nameOverride: arg("name"),
     });
+    if (awaitingFirstMention && !apply) {
+      console.log("这个 Codex task 已建好原话题，但首次 mention 的握手窗口需要刷新。");
+      console.log("[dry-run] 没有修改登记表，也没有发送或编辑飞书消息。加 --apply 才续期。");
+      process.exit(0);
+    }
+    if (awaitingFirstMention) {
+      const refreshed = refreshPendingTaskBinding({ threadId: thread.threadId });
+      if (!refreshed.ok) die("刷新首次绑定窗口失败：" + refreshed.reason +
+        (refreshed.error ? "（" + refreshed.error + "）" : ""));
+      console.log("已复用原话题并刷新首次绑定窗口；请在该话题真实 @ M5Codex 完成绑定。");
+    }
     if (existing.task.task_display_name === d.name) {
-      console.log("这个 Codex task 已接入，没有重复建话题：" + existing.task.task_display_name);
+      if (!awaitingFirstMention) {
+        console.log("这个 Codex task 已接入，没有重复建话题：" + existing.task.task_display_name);
+      }
       process.exit(0);
     }
     console.log("这个 Codex task 已接入；检测到旧话题名需要升级。");
@@ -57,6 +71,11 @@ if (existing.ok) {
         expectedAppId: identity.expectedAppId,
       });
     } catch (err) {
+      if (awaitingFirstMention) {
+        console.error("首次绑定窗口已刷新，但旧话题标题无法同步：" + err.message);
+        console.error("这不影响在原话题完成首次 @M5Codex 握手。");
+        process.exit(0);
+      }
       die("旧话题改名失败，登记表没有修改：" + err.message);
     }
     const renamed = setTaskDisplayName({ threadId: thread.threadId, name: d.name });

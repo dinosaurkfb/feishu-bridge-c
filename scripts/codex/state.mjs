@@ -290,6 +290,41 @@ export function setTaskConnectionStatus({
   }
 }
 
+/**
+ * 给已经建好话题、但尚未完成首次 mention 的 task 重新开放握手窗口。
+ *
+ * 这和“恢复暂停连接”是两种不同状态迁移：task 可以一直处于 active，却因为用户隔天才
+ * 去飞书完成首次 mention 而让 pending 窗口过期。重跑 $feishu-bind 时只应续期原登记，
+ * 不能因为 task 已 active 就直接返回，更不能创建第二个话题。
+ */
+export function refreshPendingTaskBinding({
+  threadId, home = bridgeHome(), now = Date.now(),
+} = {}) {
+  if (typeof threadId !== "string" || !threadId) return { ok: false, reason: "no_thread_id" };
+  const lockDir = path.join(home, "registry.lock");
+  const lock = acquirePublishLock(lockDir);
+  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  try {
+    const file = registryFile(home);
+    const reg = loadRegistry(file);
+    if (!reg.ok) return reg;
+    const task = reg.tasks.find((t) => t.codex_thread_id === threadId);
+    if (!task) return { ok: false, reason: "thread_not_registered" };
+    if ((task.status ?? "active") !== "active") return { ok: false, reason: "task_not_active" };
+    if (task.inbound_state !== "pending" || task.session_id) {
+      return { ok: false, reason: "task_not_pending" };
+    }
+    task.pending_expires_at = new Date(now + PENDING_WINDOW_MS).toISOString();
+    task.pending_refreshed_at = new Date(now).toISOString();
+    writeRegistry(reg.tasks, file);
+    return { ok: true, task };
+  } catch (err) {
+    return { ok: false, reason: "registry_unwritable", error: err.message };
+  } finally {
+    releasePublishLock(lockDir);
+  }
+}
+
 export function setTaskDisplayName({ threadId, name, home = bridgeHome() } = {}) {
   if (typeof threadId !== "string" || !threadId) return { ok: false, reason: "no_thread_id" };
   if (typeof name !== "string" || !name.trim()) return { ok: false, reason: "invalid_name" };

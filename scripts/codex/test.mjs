@@ -33,7 +33,7 @@ import {
   extractQuotedBindingTokens, findPendingTask,
   findRegisteredTaskForCodexThread, findTaskForCodexThread, findTaskForFeishuSession,
   isThreadBusy, loadCodexTemplate, loadRegistry, makeTaskEntry, mappingForTask, recordThreadActivity, resolveTask,
-  setTaskConnectionStatus, setTaskDisplayName, shadowCodexFirstClaim, taskPaths,
+  refreshPendingTaskBinding, setTaskConnectionStatus, setTaskDisplayName, shadowCodexFirstClaim, taskPaths,
   validateCodexTemplate, validateRegistryTasks, writeRegistry,
 } from "./state.mjs";
 
@@ -419,6 +419,84 @@ test("暂停连接会同时关闭入站、Stop 入队和发布资格，恢复时
   assert.equal(findTaskForCodexThread({ threadId: THREAD_A, home }).ok, true);
   assert.equal(findTaskForFeishuSession({ sessionId: "aily_session_a", home }).ok, true);
   assert.equal(resumed.task.root_message_id, "om_a");
+});
+
+test("active 但首次 mention 已过期的 task 可只刷新原话题握手窗口", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  task.bound_at = "2026-01-01T00:00:00.000Z";
+  delete task.pending_expires_at;
+  writeRegistry([task], path.join(home, "registry.json"));
+
+  const now = Date.parse("2026-08-22T05:00:00.000Z");
+  assert.equal(findPendingTask({ home, now }).reason, "pending_binding_expired");
+  const refreshed = refreshPendingTaskBinding({ threadId: THREAD_A, home, now });
+  assert.equal(refreshed.ok, true);
+  assert.equal(refreshed.task.root_message_id, "om_a");
+  assert.equal(refreshed.task.inbound_state, "pending");
+  assert.equal(refreshed.task.session_id ?? null, null);
+  assert.equal(findPendingTask({ home, now }).ok, true);
+});
+
+test("bind-task 重跑只续期 active pending，不创建或回复第二个话题", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  fs.writeFileSync(path.join(root, "README.md"), "# A\n");
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  task.bound_at = "2026-01-01T00:00:00.000Z";
+  delete task.pending_expires_at;
+  writeRegistry([task], path.join(home, "registry.json"));
+
+  const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
+    "--project", root, "--thread-id", THREAD_A, "--name", "A", "--apply"], {
+    encoding: "utf-8",
+    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+  });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /刷新首次绑定窗口/u);
+  const after = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
+  assert.equal(after.root_message_id, "om_a");
+  assert.equal(after.inbound_state, "pending");
+  assert.equal(Number.isFinite(Date.parse(after.pending_expires_at)), true);
+});
+
+test("pending 续期不被超过编辑时限的旧话题标题阻断", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  const bin = path.join(home, "fake-lark.sh");
+  const configBase = path.join(home, "agents");
+  const credentialDir = path.join(configBase, TEMPLATE.agent_uid);
+  fs.mkdirSync(root);
+  fs.mkdirSync(credentialDir, { recursive: true });
+  fs.writeFileSync(path.join(root, "README.md"), "# New\n");
+  fs.writeFileSync(path.join(credentialDir, "config.json"), JSON.stringify({
+    apps: [{ name: TEMPLATE.lark_cli_profile, appId: TEMPLATE.transport_app_id }],
+  }));
+  fs.writeFileSync(bin, "#!/bin/sh\nexit 1\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({
+    ...TEMPLATE, lark_cli_bin: bin, lark_cli_config_base: configBase,
+  }));
+  const task = makeTaskEntry({
+    root, threadId: THREAD_A, name: "Old", rootMessageId: "om_a", token: "a",
+  });
+  task.bound_at = "2026-01-01T00:00:00.000Z";
+  delete task.pending_expires_at;
+  writeRegistry([task], path.join(home, "registry.json"));
+
+  const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
+    "--project", root, "--thread-id", THREAD_A, "--name", "New", "--apply"], {
+    encoding: "utf-8",
+    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+  });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /刷新首次绑定窗口/u);
+  assert.match(run.stderr, /不影响.*首次.*握手/u);
+  const after = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
+  assert.equal(after.task_display_name, "Old");
+  assert.equal(Number.isFinite(Date.parse(after.pending_expires_at)), true);
 });
 
 test("三条 task 控制脚本不猜 thread，暂停和恢复都不调用飞书", () => {

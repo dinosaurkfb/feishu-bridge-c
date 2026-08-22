@@ -6,8 +6,8 @@
   "additionalProperties": false,
   "required": [
     "schema_version", "artifact_type", "attestation_version", "generated_at", "binding_ref",
-    "authorization_snapshot_id", "status", "reason", "sample_count", "first_observed_at",
-    "last_observed_at"
+    "authorization_snapshot_id", "status", "reason", "evidence_max_age_ms", "sample_count",
+    "first_observed_at", "last_observed_at"
   ],
   "properties": {
     "schema_version": { "const": "1.0" },
@@ -31,6 +31,12 @@
         "chat_scope_attestation_locator_missing",
         "chat_scope_attestation_scope_mismatch"
       ]
+    },
+    "evidence_max_age_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 604800000,
+      "description": "判定这批证据是否过期所用的保留窗口（毫秒）。独立策略：与 subscription/chain config 里 freshness_ms 的消息处理新鲜度、防重放期限无关，不得互相复用。"
     },
     "sample_count": { "type": "integer", "minimum": 0 },
     "first_observed_at": { "type": ["string", "null"], "format": "date-time" },

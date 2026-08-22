@@ -156,18 +156,23 @@ export function analyzeDialogueShadowEvidence({
   let orphanEvents = 0;
   let orphanProbes = 0;
   let missingAuthorizations = 0;
+  const correlationKeys = new Set([...eventIndex.keys(), ...probeIndex.keys()]);
+  for (const key of correlationKeys) {
+    const matchingEvents = eventIndex.get(key) ?? [];
+    const matchingProbes = probeIndex.get(key) ?? [];
+    if (matchingEvents.length === 1 && matchingProbes.length === 1) completePairs += 1;
+    else {
+      orphanEvents += matchingEvents.length;
+      orphanProbes += matchingProbes.length;
+    }
+  }
   for (const event of validEvents) {
-    const matches = probeIndex.get(correlationKey(event)) ?? [];
-    if (matches.length === 1) completePairs += 1;
-    else orphanEvents += 1;
     const snapshots = authIndex.index.get(event.authorization_snapshot_id) ?? [];
     if (snapshots.length !== 1 || snapshots[0].binding_ref !== event.binding_ref) {
       missingAuthorizations += 1;
     }
   }
   for (const probe of validProbes) {
-    const matches = eventIndex.get(correlationKey(probe)) ?? [];
-    if (matches.length !== 1) orphanProbes += 1;
     const snapshots = authIndex.index.get(probe.authorization_snapshot_id) ?? [];
     if (snapshots.length !== 1 || snapshots[0].binding_ref !== probe.binding_ref) {
       missingAuthorizations += 1;
@@ -178,6 +183,7 @@ export function analyzeDialogueShadowEvidence({
     (events.length - validEvents.length) + (probes.length - validProbes.length);
   const duplicateIds = authIndex.duplicateIds + eventIds.duplicateIds + probeIds.duplicateIds;
   const sampleCount = Math.min(validEvents.length, validProbes.length);
+  const hasInteractionEvidence = validEvents.length > 0 || validProbes.length > 0;
   const all = (values, predicate) => values.length > 0 && values.every(predicate);
   const artifactIntegrity = invalidArtifacts === 0 && readErrors === 0;
   const correlationComplete = sampleCount > 0 &&
@@ -190,9 +196,10 @@ export function analyzeDialogueShadowEvidence({
   const fullComparisonMatch = all(validEvents, (event) => event.comparison.match === true);
 
   const automatedChecks = [
-    check("samples_present", sampleCount > 0 ? "pass" : "insufficient"),
+    check("samples_present", sampleCount > 0 ? "pass" :
+      hasInteractionEvidence ? "fail" : "insufficient"),
     check("artifact_integrity", artifactIntegrity ? "pass" : "fail"),
-    check("correlation_complete", sampleCount === 0 ? "insufficient" :
+    check("correlation_complete", sampleCount === 0 && !hasInteractionEvidence ? "insufficient" :
       correlationComplete ? "pass" : "fail"),
     check("chat_locator_present", validProbes.length === 0 ? "insufficient" :
       locatorPresent ? "pass" : "fail"),
@@ -208,8 +215,9 @@ export function analyzeDialogueShadowEvidence({
 
   let decision;
   if (!artifactIntegrity) decision = DIALOGUE_SHADOW_READINESS_DECISION.INVALID_EVIDENCE;
-  else if (sampleCount === 0) decision = DIALOGUE_SHADOW_READINESS_DECISION.INSUFFICIENT_EVIDENCE;
-  else if (automatedChecks.some((item) => item.status !== "pass")) {
+  else if (!hasInteractionEvidence) {
+    decision = DIALOGUE_SHADOW_READINESS_DECISION.INSUFFICIENT_EVIDENCE;
+  } else if (automatedChecks.some((item) => item.status !== "pass")) {
     decision = DIALOGUE_SHADOW_READINESS_DECISION.NOT_READY;
   } else decision = DIALOGUE_SHADOW_READINESS_DECISION.MANUAL_REVIEW_REQUIRED;
 

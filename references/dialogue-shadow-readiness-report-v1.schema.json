@@ -105,6 +105,41 @@
         "full_match": { "type": "integer", "minimum": 0 },
         "candidate_reason_counts": {
           "type": "object",
+          "propertyNames": {
+            "enum": [
+              "accepted",
+              "binding_authorization_binding_ambiguous",
+              "binding_authorization_binding_not_found",
+              "binding_authorization_input_invalid",
+              "binding_authorization_projection_invalid",
+              "binding_authorization_snapshot_invalid",
+              "binding_authorization_subscription_ambiguous",
+              "binding_authorization_subscription_not_found",
+              "binding_paused",
+              "binding_ref_mismatch",
+              "canonical_event_invalid",
+              "chat_scope_mismatch",
+              "chat_scope_unverified",
+              "duplicate_message",
+              "empty_instruction",
+              "endpoint_mismatch",
+              "event_type_mismatch",
+              "malformed_event",
+              "mapping_expired",
+              "mapping_missing",
+              "mapping_not_active",
+              "other",
+              "prefix_mismatch",
+              "quota_exhausted",
+              "sender_not_allowed",
+              "sender_not_frank",
+              "session_mismatch",
+              "stale_event",
+              "stale_message",
+              "subscription_paused",
+              "transport_not_mentioned"
+            ]
+          },
           "additionalProperties": { "type": "integer", "minimum": 0 }
         }
       }

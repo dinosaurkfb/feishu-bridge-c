@@ -969,6 +969,96 @@ test("Dialogue shadow readiness 自动检查全过也只要求人工评审", () 
     /本报告不授权切换权威路由/u);
 });
 
+test("Dialogue shadow readiness 在授权修订覆盖旧快照后拒绝旧 event/probe", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-revision-"));
+  const wrote = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.trustedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  assert.equal(wrote.ok, true);
+  const pausedInput = structuredClone(fixture.context.authorizationInput);
+  pausedInput.binding.status = "paused";
+  const revised = syncDialogueAuthorizationShadowSnapshot({
+    shadowDir, authorizationInput: pausedInput, capturedAt: NOW + 1000,
+  });
+  assert.equal(revised.ok, true);
+  assert.equal(revised.snapshot.authorization_revision, 2);
+  assert.notEqual(revised.snapshot.snapshot_id, wrote.snapshot.snapshot_id);
+
+  const analyzed = analyzeShadowDir(shadowDir);
+  assert.equal(analyzed.report.decision, DIALOGUE_SHADOW_READINESS_DECISION.NOT_READY);
+  assert.equal(analyzed.report.correlation.missing_authorizations, 2,
+    "event 与 probe 引用的旧授权快照都必须显式失配");
+  assert.equal(analyzed.report.automated_checks.find((item) =>
+    item.id === "correlation_complete").status, "fail");
+});
+
+test("Dialogue shadow readiness 将只有 probe 的样本判为孤立且不放行", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-orphan-probe-"));
+  const wrote = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.trustedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  assert.equal(wrote.ok, true);
+  fs.rmSync(wrote.file);
+
+  const analyzed = analyzeShadowDir(shadowDir);
+  assert.equal(analyzed.report.decision, DIALOGUE_SHADOW_READINESS_DECISION.NOT_READY);
+  assert.equal(analyzed.report.correlation.complete_pairs, 0);
+  assert.equal(analyzed.report.correlation.orphan_events, 0);
+  assert.equal(analyzed.report.correlation.orphan_probes, 1);
+});
+
+test("Dialogue shadow readiness 合并多目录时检测跨目录重复且不重复计完整配对", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const firstDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-multi-a-"));
+  const secondDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-multi-b-"));
+  const wrote = recordDialogueBoundAuthorizationShadow({
+    shadowDir: firstDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.trustedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  assert.equal(wrote.ok, true);
+  for (const subdir of ["authorizations", "events", "scope-probes"]) {
+    fs.cpSync(path.join(firstDir, subdir), path.join(secondDir, subdir), { recursive: true });
+  }
+  const loaded = readDialogueShadowEvidence({ shadowDirs: [firstDir, secondDir] });
+  assert.equal(loaded.ok, true);
+  assert.equal(loaded.evidence.source_count, 2);
+  const analyzed = analyzeDialogueShadowEvidence({
+    sourceCount: loaded.evidence.source_count,
+    missingSourceDirs: loaded.evidence.missing_source_dirs,
+    readErrors: loaded.evidence.read_errors,
+    authorizations: loaded.evidence.authorizations,
+    events: loaded.evidence.events,
+    probes: loaded.evidence.probes,
+    generatedAt: NOW,
+  });
+  assert.equal(analyzed.ok, true);
+  assert.equal(analyzed.report.decision, DIALOGUE_SHADOW_READINESS_DECISION.NOT_READY);
+  assert.equal(analyzed.report.correlation.duplicate_ids, 3);
+  assert.equal(analyzed.report.correlation.complete_pairs, 0,
+    "同一 correlation key 的重复 artifact 不能被多算为完整配对");
+  assert.equal(analyzed.report.correlation.orphan_events, 2);
+  assert.equal(analyzed.report.correlation.orphan_probes, 2);
+});
+
 test("Dialogue shadow readiness 把损坏、孤立和 CLI 路径统一收敛为脱敏诊断", () => {
   const fixture = dialogueAuthorizationFixture();
   const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-corrupt-"));
@@ -1007,6 +1097,12 @@ test("Dialogue shadow readiness schema 与运行时 artifact 固化一致", () =
     "trusted_locator_source", "both_runtime_coverage", "generation_rotation_coverage",
     "rollback_rehearsal",
   ]);
+  const reasonNames = schema.$defs.eventMetrics.properties.candidate_reason_counts
+    .propertyNames.enum;
+  assert.equal(reasonNames.includes("accepted"), true);
+  assert.equal(reasonNames.includes("other"), true);
+  assert.equal(reasonNames.includes("private-uncontrolled-reason"), false,
+    "JSON Schema 与运行时都只能接受受控 reason bucket");
 });
 
 // ---------- Mapping Policy：公共准入、处置与 runtime-neutral runRequest ----------

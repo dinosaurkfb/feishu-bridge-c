@@ -1,8 +1,9 @@
 # Codex 入站 Dispatcher 契约接入
 
-状态：候选实现完成，尚未正式安装或进行真实飞书链路验收。
+状态：已由 PR #6 合并到 `main`，并随 `main@61c4a8b` 正式安装。安装后本地契约和机器级自检通过；
+仍需用新的真实飞书 mention 扩大 dispatcher 路径的端到端验收样本。
 
-对应分支：`feat/codex-inbound-dispatcher-contract`。
+历史交付分支：`feat/codex-inbound-dispatcher-contract`。
 
 ## 1. 交付范围
 
@@ -73,8 +74,8 @@ cc2cd 当前的 `c2c-envelope.mjs` 不读取 Canonical Event，也不读取旧�
 handler 正常路径必须完成校验、claim 和非阻塞投递后秒级返回。默认 `30s` timeout 只是异常进程的
 最终兜底，不是 handler 可以占用的响应预算；同步等待长期任务完成的实现不符合本契约。
 
-合并代码不等于完成安装。正式安装前必须单独确认，并先保证已安装 hooks 指向的仓库 checkout 保持在
-已验收的 `main`，候选分支应在独立 worktree 中开发和测试。
+该切片已经完成合并和正式安装。后续修改仍必须先在独立短期分支中开发和测试，并在单独授权后更新
+机器级 hooks；安装状态不能替代真实飞书链路验收。
 
 ## 5. 回滚
 
@@ -100,5 +101,6 @@ Canonical Event 模块及 schema 即可。因为本切片没有改写 registry�
 - Codex hook 和技能都指向 Codex dispatcher wrapper；
 - Claude/Codex 原有回归与公共导出面快照保持通过。
 
-当前证据层级：本地合成/集成测试，Claude `308` 项、Codex `68` 项、公共 contract 通过。
-这些结果不替代真实 mention、秒级受理、精确 task 续接、严格终局和原话题回写验收。
+当前证据层级：切片合并前的本地合成/集成测试，以及 `main@61c4a8b` 安装后的机器级自检。
+当前全仓基线为 Claude `320` 项、Codex `74` 项、公共 contract 通过。这些结果不替代新的真实
+mention、秒级受理、精确 task 续接、严格终局和原话题回写验收。

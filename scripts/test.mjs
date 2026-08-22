@@ -75,8 +75,13 @@ import {
 const LIVE_SURFACE = await currentSurface();
 import {
   PENDING_WINDOW_MS, PROMOTE_REJECT, appendConsumed, evaluatePromotion,
-  findBindingForSession, findPendingBinding, loadConsumed, promoteBinding,
+  buildClaudeSubscriptionProjection, findBindingForSession, findPendingBinding, loadConsumed,
+  promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
+import {
+  SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION,
+  compareFirstClaimShadow, validateSubscription,
+} from "./subscription.mjs";
 
 let passed = 0;
 let failed = 0;
@@ -1728,6 +1733,109 @@ test("机器级配置不全 → 拒，绝不因为「反正是 Frank」放行", 
   }
   assert.equal(evaluatePromotion({ event: okEvent, template: null, pending, now: NOW2 }).reason,
     PROMOTE_REJECT.MALFORMED_TEMPLATE);
+});
+
+test("Claude 旧登记只读投影成 Subscription v1，不泄露项目与会话 locator", () => {
+  const schema = JSON.parse(fs.readFileSync(
+    path.resolve("references", "subscription-v1.schema.json"), "utf-8",
+  ));
+  assert.equal(schema.properties.schema_version.const, SUBSCRIPTION_SCHEMA_VERSION);
+  assert.equal(schema.properties.artifact_type.const, SUBSCRIPTION_ARTIFACT_TYPE);
+  assert.equal(schema.properties.scope.properties.event_types.items.const, "im.message.receive");
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-subscription-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-domain-"));
+  const regFile = path.join(home, "registry.json");
+  const tplFile = path.join(home, "chain-config.json");
+  const projects = [
+    {
+      id: "project-line", root,
+    },
+    {
+      id: "session-line", root, claude_session_id: "claude-secret-session",
+      root_message_id: "om_session", status: "suspended", inbound_state: "pending",
+      pending_token: "bbbbbb",
+      bound_at: new Date(NOW2 - 60_000).toISOString(),
+    },
+  ];
+  fs.writeFileSync(regFile, JSON.stringify({ projects }));
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  const runtimeDir = path.join(root, ".runtime-data", "inbound");
+  fs.mkdirSync(runtimeDir, { recursive: true });
+  fs.writeFileSync(path.join(runtimeDir, "active-mapping.json"), JSON.stringify({
+    status: "active", inbound_state: "pending", session_id: null,
+    pending_token: "aaaaaa", created_at: new Date(NOW2 - 60_000).toISOString(),
+    feishu_root_message_id_reference: "om_project",
+  }));
+  const before = fs.readFileSync(regFile, "utf-8");
+
+  const model = buildClaudeSubscriptionProjection({ registryFile: regFile, templateFile: tplFile });
+  assert.equal(model.ok, true);
+  assert.equal(model.schema_version, SUBSCRIPTION_SCHEMA_VERSION);
+  assert.equal(model.subscriptions.length, 1, "同 endpoint/domain/chat 只产生一份订阅");
+  assert.equal(model.pending_bindings.length, 2, "两条本地工作线仍各自保留待认领目标");
+  assert.equal(model.subscriptions[0].status, "active", "旧 project-file active 绑定不能被漏投影");
+  assert.equal(model.subscriptions[0].artifact_type, SUBSCRIPTION_ARTIFACT_TYPE);
+  assert.equal(validateSubscription(model.subscriptions[0]).ok, true);
+  const serialized = JSON.stringify(model);
+  assert.equal(serialized.includes(root), false);
+  assert.equal(serialized.includes("claude-secret-session"), false);
+  assert.equal(fs.readFileSync(regFile, "utf-8"), before, "只读迁移不能改旧登记");
+  assert.equal(fs.existsSync(path.join(home, "subscriptions")), false);
+});
+
+test("Claude 首次认领 shadow 与现行绑定码选择一致，但不会假装已核验 chat", () => {
+  const f = pendingFixture([{ id: "a", token: "aaaaaa" }, { id: "b", token: "bbbbbb" }]);
+  const event = {
+    ...okEvent,
+    content: '<at id="ou_t">T</at>\n\n**[引用]**\n绑定码    bbbbbb',
+  };
+  const pending = findPendingBinding({ content: event.content, ...f, now: NOW2 });
+  const legacy = evaluatePromotion({ event, template: TPL, pending, now: NOW2 });
+  const registryBefore = fs.readFileSync(f.registryFile, "utf-8");
+  const shadow = shadowClaudeFirstClaim({
+    event, template: TPL, callerAgentUid: TPL.agent_uid,
+    legacyPending: pending, legacyPromotion: legacy,
+    registryFile: f.registryFile, templateFile: f.templateFile, now: NOW2,
+  });
+  assert.equal(shadow.match, true);
+  assert.deepEqual(shadow.scope_unverified, ["chat_id"]);
+  assert.equal(fs.readFileSync(f.registryFile, "utf-8"), registryBefore);
+});
+
+test("Claude shadow 能记录旧逻辑与新订阅授权的差异，而不改变旧结果", () => {
+  const f = routeFixture([{
+    id: "paused", extra: {
+      status: "paused", inbound_state: "pending", pending_token: "aaaaaa",
+      bound_at: new Date(NOW2 - 60_000).toISOString(),
+    },
+  }]);
+  const event = {
+    ...okEvent,
+    content: '<at id="ou_t">T</at>\n\n**[引用]**\n绑定码    aaaaaa',
+  };
+  const pending = findPendingBinding({ content: event.content, ...files(f), now: NOW2 });
+  const legacy = evaluatePromotion({ event, template: TPL, pending, now: NOW2 });
+  assert.equal(legacy.ok, true, "现行 Claude 路径仍保持原行为");
+  const shadow = shadowClaudeFirstClaim({
+    event, template: TPL, callerAgentUid: TPL.agent_uid,
+    legacyPending: pending, legacyPromotion: legacy,
+    ...files(f), now: NOW2,
+  });
+  assert.equal(shadow.match, false);
+  assert.equal(shadow.legacy_disposition, "accepted");
+  assert.equal(shadow.candidate_disposition, "rejected");
+  assert.equal(shadow.candidate_reason, SUBSCRIPTION_REJECT.NO_ACTIVE_SUBSCRIPTION);
+});
+
+test("shadow 总 match 不掩盖同为拒绝但 reason 不同", () => {
+  const shadow = compareFirstClaimShadow({
+    legacy: { ok: false, reason: "no_pending_binding" },
+    candidate: { ok: false, reason: "no_active_subscription" },
+  });
+  assert.equal(shadow.route_match, true);
+  assert.equal(shadow.reason_match, false);
+  assert.equal(shadow.match, false);
 });
 
 test("绑定写回登记表之后，同一个 session 就能被路由到了", () => {

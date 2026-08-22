@@ -24,6 +24,7 @@ import {
 import { loadChainTemplate } from "./chain-template.mjs";
 import {
   appendConsumed, evaluatePromotion, findBindingForSession, findPendingBinding, promoteBinding,
+  shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
@@ -167,6 +168,7 @@ const dryRun = process.argv.includes("--dry-run");
 let routed = findBindingForSession({ sessionId: event.session_id });
 let justBound = false;
 let pendingMatchedBy = null;
+let subscriptionClaimShadow = null;
 
 if (!routed.ok) {
   // 没有已绑定的话题对得上 —— 可能是「新话题的第一条 @」，也可能是条不该理的消息。
@@ -174,14 +176,24 @@ if (!routed.ok) {
   const tpl = loadChainTemplate();
   const template = tpl.ok ? tpl.template : null;
   // 把正文传进去：绑定码就藏在飞书自动附加的引用块里，Frank 不用打任何东西。
-  const pending = findPendingBinding({ content: event.content, now: Date.now() });
-  const promo = evaluatePromotion({ event, template, pending, now: Date.now() });
+  const promotionNow = Date.now();
+  const pending = findPendingBinding({ content: event.content, now: promotionNow });
+  const promo = evaluatePromotion({ event, template, pending, now: promotionNow });
+  subscriptionClaimShadow = shadowClaudeFirstClaim({
+    event,
+    template,
+    callerAgentUid: callerAgent,
+    legacyPending: pending,
+    legacyPromotion: promo,
+    now: promotionNow,
+  });
 
   if (!promo.ok) {
     writeReceipt("unrouted-" + (event.message_id ?? "unknown") + "-" + Date.now(), {
       status: "rejected", reason: promo.reason, reason_text: promo.reasonText,
       message_id: event.message_id ?? null, session_id: event.session_id ?? null,
       claim_acquired: false, handed_off: false,
+      subscription_claim_shadow: subscriptionClaimShadow,
     });
     if (dryRun) {
       process.stdout.write("[dry-run] reject · " + promo.reasonText + "\n");
@@ -203,6 +215,7 @@ if (!routed.ok) {
     writeReceipt("bind-failed-" + event.message_id, {
       status: "error", reason: wrote.reason, message_id: event.message_id,
       claim_acquired: false, handed_off: false,
+      subscription_claim_shadow: subscriptionClaimShadow,
     });
     finish("error", { detail: "绑定没写成（" + wrote.reason + "）" }, { reason: wrote.reason });
   }
@@ -242,6 +255,7 @@ if (justBound && verdict.decision === "reject" && verdict.reason === REJECT.EMPT
     root: routed.root, binding_id: mapping.binding_id,
     matched_by: pendingMatchedBy,
     claim_acquired: false, handed_off: false,
+    subscription_claim_shadow: subscriptionClaimShadow,
     // 为将来的确定性匹配攒证据：根消息里那个绑定码有没有随引用块回来。
     // 现在没有代码依赖它，纯粹是想知道那条路走不走得通。
     pending_token_seen: typeof mapping.pending_token === "string" && mapping.pending_token.length > 0
@@ -270,6 +284,7 @@ if (verdict.decision === "reject") {
     binding_source: routed.source,
     claim_acquired: false,
     handed_off: false,
+    ...(subscriptionClaimShadow ? { subscription_claim_shadow: subscriptionClaimShadow } : {}),
   });
   finish("rejected", { ...verdict, taskName: config.task_display_name },
     { reason: verdict.reason, project_root: routed.root });
@@ -449,6 +464,7 @@ writeReceipt("accepted-" + verdict.messageId, {
   delivery_mode: run.mode,
   target_session_id: run.targetSessionId ?? null,
   target_session_name: run.targetName ?? null,
+  ...(subscriptionClaimShadow ? { subscription_claim_shadow: subscriptionClaimShadow } : {}),
 });
 
 finish("accepted", {

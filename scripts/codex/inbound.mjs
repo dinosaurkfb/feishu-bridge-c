@@ -14,7 +14,7 @@ import { evaluateInbound, REJECT } from "../selector.mjs";
 import { handOffCodex } from "./handoff.mjs";
 import {
   appendConsumed, bridgeHome, evaluatePromotion, findPendingTask, findTaskForFeishuSession,
-  isThreadBusy, loadCodexTemplate, promoteTask, taskPaths,
+  isThreadBusy, loadCodexTemplate, promoteTask, shadowCodexFirstClaim, taskPaths,
 } from "./state.mjs";
 
 const BRIDGE_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
@@ -112,22 +112,36 @@ const event = fetched.event;
 
 let routed = findTaskForFeishuSession({ sessionId: event.session_id, home: HOME });
 let justBound = false;
+let subscriptionClaimShadow = null;
 if (!routed.ok) {
   if (routed.reason !== "no_binding_for_session") {
     finish("error", { detail: "Codex task registry 无法路由（" + routed.reason + "）" }, { reason: routed.reason });
   }
-  const pending = findPendingTask({ home: HOME, content: event.content });
+  const promotionNow = Date.now();
+  const pending = findPendingTask({ home: HOME, content: event.content, now: promotionNow });
   if (!pending.ok && ![
     "no_pending_binding", "multiple_pending_bindings", "multiple_binding_tokens",
     "pending_binding_token_unknown", "duplicate_pending_binding_token", "pending_binding_expired",
   ].includes(pending.reason)) {
     finish("error", { detail: "Codex task registry 无法读取（" + pending.reason + "）" }, { reason: pending.reason });
   }
-  const promotion = evaluatePromotion({ event, template: template.template, pending });
+  const promotion = evaluatePromotion({
+    event, template: template.template, pending, now: promotionNow,
+  });
+  subscriptionClaimShadow = shadowCodexFirstClaim({
+    event,
+    template: template.template,
+    callerAgentUid: callerAgent,
+    legacyPending: pending,
+    legacyPromotion: promotion,
+    home: HOME,
+    now: promotionNow,
+  });
   if (!promotion.ok) {
     const reasonText = REASON_TEXT[promotion.reason] ?? promotion.reason;
     writeReceipt("unrouted-" + (event.message_id ?? Date.now()), {
       status: "rejected", reason: promotion.reason, claim_acquired: false, handed_off: false,
+      subscription_claim_shadow: subscriptionClaimShadow,
     });
     if (dryRun) finish("rejected", { reasonText: "[dry-run] " + reasonText, taskName: null },
       { dry_run: true, reason: promotion.reason });
@@ -142,7 +156,14 @@ if (!routed.ok) {
     sessionId: event.session_id,
     home: HOME,
   });
-  if (!promoted.ok) finish("error", { detail: "绑定没写成（" + promoted.reason + "）" }, { reason: promoted.reason });
+  if (!promoted.ok) {
+    writeReceipt("bind-failed-" + (event.message_id ?? Date.now()), {
+      status: "error", reason: promoted.reason, message_id: event.message_id ?? null,
+      claim_acquired: false, handed_off: false,
+      subscription_claim_shadow: subscriptionClaimShadow,
+    });
+    finish("error", { detail: "绑定没写成（" + promoted.reason + "）" }, { reason: promoted.reason });
+  }
   justBound = true;
   routed = findTaskForFeishuSession({ sessionId: event.session_id, home: HOME });
   if (!routed.ok) finish("error", { detail: "绑定写完却读不回来" }, { reason: routed.reason });
@@ -158,6 +179,7 @@ if (justBound && verdict.decision === "reject" && verdict.reason === REJECT.EMPT
   writeReceipt("bound-" + event.message_id, {
     status: "bound", message_id: event.message_id, logical_task_key: task.logical_task_key,
     claim_acquired: false, handed_off: false,
+    subscription_claim_shadow: subscriptionClaimShadow,
   });
   finish("bound", { taskName: task.task_display_name }, { bound: true, logical_task_key: task.logical_task_key });
 }
@@ -172,6 +194,7 @@ if (verdict.decision === "reject") {
   writeReceipt("reject-" + (event.message_id ?? Date.now()), {
     status: "rejected", reason: verdict.reason, message_id: event.message_id,
     logical_task_key: task.logical_task_key, claim_acquired: false, handed_off: false,
+    ...(subscriptionClaimShadow ? { subscription_claim_shadow: subscriptionClaimShadow } : {}),
   });
   finish("rejected", { reasonText: verdict.reasonText, taskName: task.task_display_name }, { reason: verdict.reason });
 }
@@ -258,6 +281,7 @@ writeReceipt("accepted-" + verdict.messageId, {
   logical_task_key: task.logical_task_key, claim_acquired: true, handed_off: true,
   completion_observed: false, completion_owner: "codex_stop_hook_and_local_watcher",
   delivery_mode: run.mode, envelope_attempts: fetched.attempts ?? 1,
+  ...(subscriptionClaimShadow ? { subscription_claim_shadow: subscriptionClaimShadow } : {}),
 });
 
 finish("accepted", {

@@ -14,6 +14,10 @@ import path from "node:path";
 import { loadChainTemplate, materializeProjectConfig } from "../chain-template.mjs";
 import { extractMentionIds } from "../selector.mjs";
 import { acquirePublishLock, isUnder, releasePublishLock } from "../registry.mjs";
+import {
+  MESSAGE_RECEIVE_EVENT, buildLegacySubscriptionReadModel, compareFirstClaimShadow,
+  legacyEndpointId, selectPendingSubscriptionClaim, stableControlId,
+} from "../subscription.mjs";
 
 export const PENDING_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const ACTIVE_LEASE_MAX_MS = 12 * 60 * 60 * 1000;
@@ -376,6 +380,65 @@ export function findPendingTask({ home = bridgeHome(), now = Date.now(), content
 
   if (now >= pendingDeadline(selected)) return { ok: false, reason: "pending_binding_expired" };
   return { ok: true, task: selected, source: tokens.length === 1 ? "quoted_binding_token" : "sole_pending" };
+}
+
+/** 现有 Codex task registry → Subscription v1；不写控制面状态，不改变现有 task。 */
+export function buildCodexSubscriptionProjection({ home = bridgeHome(), template } = {}) {
+  const reg = loadRegistry(registryFile(home));
+  if (!reg.ok) return reg;
+  const loadedTemplate = template
+    ? { ok: true, template }
+    : loadCodexTemplate(templateFile(home));
+  if (!loadedTemplate.ok) return { ok: false, reason: "template_unusable" };
+  const resolvedTemplate = loadedTemplate.template;
+  const endpointId = legacyEndpointId({ runtime: "codex", agentUid: resolvedTemplate.agent_uid });
+  const records = reg.tasks.map((task) => ({
+    legacy_key: task.logical_task_key,
+    domain_key: task.root,
+    local_target_id: stableControlId("target", "codex", task.logical_task_key),
+    status: task.status ?? "active",
+    inbound_state: task.inbound_state ?? "pending",
+    session_id: task.session_id ?? null,
+    pending_token: task.pending_token ?? null,
+    pending_expires_at: task.pending_expires_at,
+    bound_at: task.bound_at,
+    chat_id: task.chat_id ?? resolvedTemplate.chat_id,
+  }));
+  return buildLegacySubscriptionReadModel({
+    runtime: "codex", endpointId, template: resolvedTemplate, records,
+    pendingWindowMs: PENDING_WINDOW_MS,
+  });
+}
+
+/** 首次认领的新旧 shadow 对照；不 claim、不写 registry、不启动 Codex。 */
+export function shadowCodexFirstClaim({
+  event, template, callerAgentUid, legacyPending, legacyPromotion,
+  home = bridgeHome(), now = Date.now(),
+} = {}) {
+  const model = buildCodexSubscriptionProjection({ home, template });
+  const endpointId = legacyEndpointId({ runtime: "codex", agentUid: template?.agent_uid });
+  const candidate = selectPendingSubscriptionClaim({
+    model,
+    evidence: {
+      endpoint_id: endpointId,
+      caller_agent_uid: callerAgentUid,
+      sender_id: event?.sender_id,
+      mention_ids: extractMentionIds(event?.content),
+      event_type: MESSAGE_RECEIVE_EVENT,
+      chat_id: null,
+      created_at_ms: event?.created_at_ms,
+    },
+    bindingTokens: extractQuotedBindingTokens(event?.content),
+    now,
+  });
+  return compareFirstClaimShadow({
+    legacy: {
+      ok: legacyPromotion?.ok === true,
+      target_key: legacyPromotion?.ok ? legacyPromotion.task?.logical_task_key : null,
+      reason: legacyPromotion?.reason ?? legacyPending?.reason,
+    },
+    candidate,
+  });
 }
 
 export function evaluatePromotion({ event, template, pending, now = Date.now() }) {

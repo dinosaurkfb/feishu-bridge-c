@@ -16,9 +16,14 @@
 
 import fs from "node:fs";
 
+import { loadChainTemplate } from "./chain-template.mjs";
 import { loadRegistry, registryPath } from "./registry.mjs";
 import { appendConsumed, loadConsumed, resolveProject } from "./project-resolve.mjs";
 import { bindingTokensInQuote, extractMentionIds } from "./selector.mjs";
+import {
+  MESSAGE_RECEIVE_EVENT, buildLegacySubscriptionReadModel, compareFirstClaimShadow,
+  legacyEndpointId, selectPendingSubscriptionClaim, stableControlId,
+} from "./subscription.mjs";
 
 // 幂等列表住在 project-resolve（它是更低层的那个模块），从这里转出去，
 // 免得 inbound.mjs 为了一件事 import 两个模块。
@@ -157,6 +162,82 @@ export function findPendingBinding({ content, registryFile, templateFile, now = 
     matchedBy: tokens.length === 1 ? "quoted_binding_token" : "only_pending",
     deadline: pendingDeadline(one.entry),
   };
+}
+
+/** 现有 Claude registry → Subscription v1；纯投影，不写 registry 或新控制面目录。 */
+export function buildClaudeSubscriptionProjection({ registryFile, templateFile } = {}) {
+  const registry = loadRegistry(registryFile);
+  if (!registry.ok) return { ok: false, reason: "registry_unreadable" };
+  const loaded = loadChainTemplate(templateFile);
+  if (!loaded.ok) return { ok: false, reason: "template_unusable" };
+  const template = loaded.template;
+  const endpointId = legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid });
+  const records = [];
+  for (const entry of registry.projects) {
+    // 旧安装把根消息和绑定放在项目内 active-mapping.json，registry 只登记 root。
+    // 这些行没有 root_message_id，但仍是现行数据面的真实绑定，投影不能把它们漏掉。
+    const resolved = entry.root_message_id
+      ? null
+      : resolveProject({
+        root: entry.root,
+        claudeSessionId: entry.claude_session_id,
+        registryFile,
+        templateFile,
+      });
+    if (!entry.root_message_id && (!resolved?.ok ||
+        !resolved.mapping?.feishu_root_message_id_reference)) continue;
+    const mapping = resolved?.mapping ?? null;
+    const config = resolved?.config ?? null;
+    const targetIsSession = Boolean(entry.claude_session_id ?? mapping?.claude_session_id);
+    records.push({
+      legacy_key: entry.id,
+      domain_key: entry.root,
+      local_target_id: stableControlId(
+        "target", "claude", entry.id, targetIsSession ? "session" : "project",
+      ),
+      status: entry.status ?? mapping?.status ?? "active",
+      inbound_state: entry.inbound_state ?? mapping?.inbound_state ?? "pending",
+      session_id: entry.session_id ?? mapping?.session_id ?? null,
+      pending_token: entry.pending_token ?? mapping?.pending_token ?? null,
+      pending_expires_at: entry.pending_expires_at,
+      bound_at: entry.bound_at ?? mapping?.created_at,
+      chat_id: entry.chat_id ?? config?.chat_id ?? template.chat_id,
+    });
+  }
+  return buildLegacySubscriptionReadModel({
+    runtime: "claude", endpointId, template, records, pendingWindowMs: PENDING_WINDOW_MS,
+  });
+}
+
+/** 首次认领的新旧结果对照；返回值只供审计，旧结果仍是唯一执行依据。 */
+export function shadowClaudeFirstClaim({
+  event, template, callerAgentUid, legacyPending, legacyPromotion,
+  registryFile, templateFile, now = Date.now(),
+} = {}) {
+  const model = buildClaudeSubscriptionProjection({ registryFile, templateFile });
+  const endpointId = legacyEndpointId({ runtime: "claude", agentUid: template?.agent_uid });
+  const candidate = selectPendingSubscriptionClaim({
+    model,
+    evidence: {
+      endpoint_id: endpointId,
+      caller_agent_uid: callerAgentUid,
+      sender_id: event?.sender_id,
+      mention_ids: extractMentionIds(event?.content),
+      event_type: MESSAGE_RECEIVE_EVENT,
+      chat_id: null, // 现有 envelope 尚未验证稳定 chat locator；只在 shadow 中显式记为未核验。
+      created_at_ms: event?.created_at_ms,
+    },
+    bindingTokens: bindingTokensInQuote(event?.content),
+    now,
+  });
+  return compareFirstClaimShadow({
+    legacy: {
+      ok: legacyPromotion?.ok === true,
+      target_key: legacyPromotion?.ok ? legacyPromotion.id : null,
+      reason: legacyPromotion?.reason ?? legacyPending?.reason,
+    },
+    candidate,
+  });
 }
 
 /**

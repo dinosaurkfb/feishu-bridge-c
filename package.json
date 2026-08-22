@@ -11,6 +11,7 @@
     "test:claude": "node scripts/test.mjs",
     "test:codex": "node scripts/codex/test.mjs",
     "doctor:codex": "node scripts/codex/doctor.mjs",
+    "audit:dialogue-shadow": "node scripts/dialogue-shadow-audit.mjs",
     "install:codex:preview": "node scripts/codex/install.mjs",
     "contract": "node scripts/shared-surface.mjs",
     "contract:accept": "node scripts/shared-surface.mjs --update"

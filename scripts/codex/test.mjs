@@ -11,6 +11,9 @@ import {
   appendEvent, listPending, markPublishEligibleByEventKey, suppressPublishByEventKey,
 } from "../outbox.mjs";
 import { evaluateInbound, REJECT } from "../selector.mjs";
+import {
+  MAPPING_DISPOSITION, buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
+} from "../mapping-policy.mjs";
 import { composeCodexBinding, resolveBindingTarget, validThreadId } from "./bind-compose.mjs";
 import { readCodexThreadTitle, sanitizeThreadTitle } from "./thread-title.mjs";
 import { updateTextMessage } from "./lark-message.mjs";
@@ -134,6 +137,37 @@ test("Codex selector 只需真实 mention，mention 后正文直接成为指令"
     now,
   });
   assert.equal(empty.reason, REJECT.EMPTY_INSTRUCTION);
+});
+
+test("Codex adapter 消费公共 Mapping Policy，runRequest 不携带 thread locator", () => {
+  const now = Date.now();
+  const event = {
+    message_id: "msg_policy_codex",
+    session_id: "session_policy_codex",
+    sender_id: TEMPLATE.frank_sender_id,
+    created_at_ms: now,
+    content: '<at id="ou_same">M5Codex</at> 继续推进公共策略迁移',
+  };
+  const mapping = {
+    status: "active",
+    expires_at: new Date(now + 60_000).toISOString(),
+    session_id: event.session_id,
+    frank_sender_id: TEMPLATE.frank_sender_id,
+    inbound_prefix: null,
+    max_inbound_messages: "unlimited",
+    freshness_ms: 60_000,
+    consumed_message_ids: [],
+    logical_task_key: "codex-policy-target",
+    codex_thread_id: THREAD_A,
+  };
+  const evaluation = evaluateMappingAdmission({ event, mapping, config: TEMPLATE, now });
+  const context = buildLegacyMappingContext({ runtime: "codex", mapping, event });
+  const outcome = handleMappingPolicy({
+    evaluation, claim: { ok: true, key: "claim_codex" }, resolvedContext: context,
+  });
+  assert.equal(outcome.disposition, MAPPING_DISPOSITION.ACCEPTED);
+  assert.equal(outcome.runRequest.userInput, "继续推进公共策略迁移");
+  assert.equal(JSON.stringify(outcome.runRequest).includes(THREAD_A), false);
 });
 
 test("Codex inbound 进程通道不把结构化诊断或 locator 泄露到 Aily 回复", () => {

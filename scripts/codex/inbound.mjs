@@ -10,7 +10,10 @@ import { fetchTriggerEvent } from "../envelope.mjs";
 import {
   acquireSessionLock, releaseSessionLock, stampSessionLock,
 } from "../handoff.mjs";
-import { evaluateInbound, REJECT } from "../selector.mjs";
+import { REJECT } from "../selector.mjs";
+import {
+  MAPPING_DISPOSITION, buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
+} from "../mapping-policy.mjs";
 import { handOffCodex } from "./handoff.mjs";
 import {
   appendConsumed, bridgeHome, evaluatePromotion, findPendingTask, findTaskForFeishuSession,
@@ -172,7 +175,13 @@ if (!routed.ok) {
 const task = routed.task;
 const paths = taskPaths(task, HOME);
 receiptDir = paths.receipts;
-const verdict = evaluateInbound({ event, mapping: routed.mapping, config: routed.config, now: Date.now() });
+const verdict = evaluateMappingAdmission({
+  canonicalEvent: fetched.canonical_event,
+  event,
+  mapping: routed.mapping,
+  config: routed.config,
+  now: Date.now(),
+});
 
 if (justBound && verdict.decision === "reject" && verdict.reason === REJECT.EMPTY_INSTRUCTION) {
   appendConsumed(task, event.message_id, { home: HOME });
@@ -191,22 +200,63 @@ if (dryRun) {
 }
 
 if (verdict.decision === "reject") {
+  const policyOutcome = handleMappingPolicy({ evaluation: verdict });
   writeReceipt("reject-" + (event.message_id ?? Date.now()), {
     status: "rejected", reason: verdict.reason, message_id: event.message_id,
     logical_task_key: task.logical_task_key, claim_acquired: false, handed_off: false,
+    policy_id: policyOutcome.policy_id,
+    policy_version: policyOutcome.policy_version,
+    policy_disposition: policyOutcome.disposition,
+    ...(verdict.admission_shadow ? { mapping_admission_shadow: verdict.admission_shadow } : {}),
     ...(subscriptionClaimShadow ? { subscription_claim_shadow: subscriptionClaimShadow } : {}),
   });
   finish("rejected", { reasonText: verdict.reasonText, taskName: task.task_display_name }, { reason: verdict.reason });
+}
+
+const mappingContext = buildLegacyMappingContext({
+  runtime: "codex",
+  mapping: routed.mapping,
+  canonicalEvent: fetched.canonical_event,
+  event,
+});
+if (!mappingContext.ok) {
+  writeReceipt("policy-context-" + verdict.messageId, {
+    status: "error", reason: mappingContext.reason, message_id: verdict.messageId,
+    claim_acquired: false, handed_off: false,
+  });
+  finish("error", { detail: "映射策略上下文不完整" }, { reason: mappingContext.reason });
 }
 
 const claim = acquireClaim({
   claimsDir: paths.claims,
   messageId: verdict.messageId,
   logicalTaskKey: task.logical_task_key,
-  meta: { session_id: event.session_id, codex_thread_id: task.codex_thread_id },
+  meta: {
+    session_id: event.session_id,
+    codex_thread_id: task.codex_thread_id,
+    policy_id: verdict.policy_id,
+    policy_version: verdict.policy_version,
+    local_target_id: mappingContext.localTargetId,
+    origin_channel_generation_id: mappingContext.originChannelGenerationId,
+    mapping_admission_shadow_match: verdict.admission_shadow?.match ?? null,
+  },
 });
 if (!claim.ok) {
   const duplicate = claim.reason === "duplicate";
+  const policyOutcome = handleMappingPolicy({
+    evaluation: verdict, claim, resolvedContext: mappingContext,
+  });
+  writeReceipt("claim-" + claim.reason + "-" + verdict.messageId, {
+    status: duplicate ? "rejected" : "error",
+    reason: claim.reason,
+    message_id: verdict.messageId,
+    claim_acquired: false,
+    handed_off: false,
+    policy_id: policyOutcome.policy_id,
+    policy_version: policyOutcome.policy_version,
+    policy_disposition: policyOutcome.disposition,
+    ...(verdict.admission_shadow ? { mapping_admission_shadow: verdict.admission_shadow } : {}),
+  });
   finish(duplicate ? "rejected" : "error", {
     reasonText: duplicate ? "这条消息已经处理过（幂等命中）" : undefined,
     detail: duplicate ? undefined : "无法取得投递权（" + claim.reason + "）",
@@ -214,24 +264,54 @@ if (!claim.ok) {
   }, { reason: claim.reason });
 }
 
+const mappingRun = handleMappingPolicy({
+  evaluation: verdict,
+  claim,
+  resolvedContext: mappingContext,
+});
+if (mappingRun.disposition !== MAPPING_DISPOSITION.ACCEPTED || !mappingRun.runRequest) {
+  recordClaimState({ claimsDir: paths.claims, key: claim.key, state: "failed",
+    detail: { reason: mappingRun.reason ?? "mapping_policy_rejected" } });
+  finish("error", { detail: "映射策略没有生成可执行请求" },
+    { reason: mappingRun.reason ?? "mapping_policy_rejected" });
+}
+
 if (isThreadBusy(task.codex_thread_id, { home: HOME })) {
+  const busyOutcome = handleMappingPolicy({
+    evaluation: verdict, claim, resolvedContext: mappingContext, targetState: "busy",
+  });
   recordClaimState({ claimsDir: paths.claims, key: claim.key, state: "failed", detail: { reason: "target_busy" } });
   writeReceipt("busy-" + verdict.messageId, {
     status: "error", reason: "target_busy", message_id: verdict.messageId,
     claim_acquired: true, handed_off: false,
+    policy_id: busyOutcome.policy_id,
+    policy_version: busyOutcome.policy_version,
+    policy_disposition: busyOutcome.disposition,
+    ...(verdict.admission_shadow ? { mapping_admission_shadow: verdict.admission_shadow } : {}),
   });
   finish("error", { detail: "目标 Codex task 当前正在执行另一轮，请稍后发送一条新消息" }, { reason: "target_busy" });
 }
 
 const lock = acquireSessionLock(paths.sessionLock);
 if (!lock.ok) {
+  const busyOutcome = handleMappingPolicy({
+    evaluation: verdict, claim, resolvedContext: mappingContext, targetState: "busy",
+  });
   recordClaimState({ claimsDir: paths.claims, key: claim.key, state: "failed", detail: { reason: lock.reason } });
+  writeReceipt("busy-lock-" + verdict.messageId, {
+    status: "error", reason: lock.reason, message_id: verdict.messageId,
+    claim_acquired: true, handed_off: false,
+    policy_id: busyOutcome.policy_id,
+    policy_version: busyOutcome.policy_version,
+    policy_disposition: busyOutcome.disposition,
+    ...(verdict.admission_shadow ? { mapping_admission_shadow: verdict.admission_shadow } : {}),
+  });
   finish("error", { detail: "目标 Codex task 正忙，上一条飞书指令还没结束" }, { reason: lock.reason });
 }
 
 const stamped = [
   "[飞书 · " + verdict.messageId + " · " + new Date(Number(event.created_at_ms)).toISOString() + "]",
-  verdict.instruction,
+  mappingRun.runRequest.userInput,
 ].join("\n");
 let run;
 try {
@@ -240,7 +320,7 @@ try {
     threadId: task.codex_thread_id,
     instruction: stamped,
     runsDir: paths.runs,
-    key: claim.key,
+    key: mappingRun.runRequest.runId,
     taskKey: task.logical_task_key,
     bridgeHome: HOME,
     codexBin: process.env.FEISHU_CODEX_BIN ?? "codex",
@@ -278,6 +358,13 @@ recordClaimState({
 appendConsumed(task, verdict.messageId, { home: HOME });
 writeReceipt("accepted-" + verdict.messageId, {
   status: "accepted", message_id: verdict.messageId, claim_key: claim.key,
+  run_id: mappingRun.runRequest.runId,
+  local_target_id: mappingRun.runRequest.localTargetId,
+  origin_channel_generation_id: mappingRun.runRequest.origin.channelGenerationId,
+  policy_id: mappingRun.policy_id,
+  policy_version: mappingRun.policy_version,
+  policy_disposition: mappingRun.disposition,
+  ...(verdict.admission_shadow ? { mapping_admission_shadow: verdict.admission_shadow } : {}),
   logical_task_key: task.logical_task_key, claim_acquired: true, handed_off: true,
   completion_observed: false, completion_owner: "codex_stop_hook_and_local_watcher",
   delivery_mode: run.mode, envelope_attempts: fetched.attempts ?? 1,

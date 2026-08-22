@@ -14,9 +14,12 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
-import { evaluateInbound, REJECT } from "./selector.mjs";
+import { REJECT } from "./selector.mjs";
 import { fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, recordClaimState } from "./claim.mjs";
+import {
+  MAPPING_DISPOSITION, buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
+} from "./mapping-policy.mjs";
 import { handOff, acquireSessionLock, releaseSessionLock, stampSessionLock } from "./handoff.mjs";
 import {
   deliverToLiveSession, findLiveSessionById, findLiveSessions, hasPriorSession, stampInstruction,
@@ -243,7 +246,13 @@ if (!config) {
   finish("error", { detail: "这个项目的链路配置不可用，没法投递" }, { reason: "config_unusable" });
 }
 
-const verdict = evaluateInbound({ event, mapping, config, now: Date.now() });
+const verdict = evaluateMappingAdmission({
+  canonicalEvent: fetched.canonical_event,
+  event,
+  mapping,
+  config,
+  now: Date.now(),
+});
 
 // 光秃秃一个 @（没有正文）是完成绑定的正常方式 —— 那一下的目的就是让 Aily 产生
 // session，好把它写进绑定。这时候回「消息里没有指令正文」是句没用的实话：
@@ -275,6 +284,7 @@ if (dryRun) {
 }
 
 if (verdict.decision === "reject") {
+  const policyOutcome = handleMappingPolicy({ evaluation: verdict });
   writeReceipt("reject-" + (event?.message_id ?? "unknown") + "-" + Date.now(), {
     status: "rejected",
     reason: verdict.reason,
@@ -284,10 +294,28 @@ if (verdict.decision === "reject") {
     binding_source: routed.source,
     claim_acquired: false,
     handed_off: false,
+    policy_id: policyOutcome.policy_id,
+    policy_version: policyOutcome.policy_version,
+    policy_disposition: policyOutcome.disposition,
+    ...(verdict.admission_shadow ? { mapping_admission_shadow: verdict.admission_shadow } : {}),
     ...(subscriptionClaimShadow ? { subscription_claim_shadow: subscriptionClaimShadow } : {}),
   });
   finish("rejected", { ...verdict, taskName: config.task_display_name },
     { reason: verdict.reason, project_root: routed.root });
+}
+
+const mappingContext = buildLegacyMappingContext({
+  runtime: "claude",
+  mapping,
+  canonicalEvent: fetched.canonical_event,
+  event,
+});
+if (!mappingContext.ok) {
+  writeReceipt("policy-context-" + verdict.messageId, {
+    status: "error", reason: mappingContext.reason, message_id: verdict.messageId,
+    claim_acquired: false, handed_off: false,
+  });
+  finish("error", { detail: "映射策略上下文不完整" }, { reason: mappingContext.reason });
 }
 
 // 校验通过才允许 claim。claim 是幂等的唯一保证。
@@ -295,22 +323,49 @@ const claim = acquireClaim({
   claimsDir: CLAIMS,
   messageId: verdict.messageId,
   logicalTaskKey: verdict.logicalTaskKey,
-  meta: { session_id: event.session_id, binding_id: mapping.binding_id },
+  meta: {
+    session_id: event.session_id,
+    binding_id: mapping.binding_id,
+    policy_id: verdict.policy_id,
+    policy_version: verdict.policy_version,
+    local_target_id: mappingContext.localTargetId,
+    origin_channel_generation_id: mappingContext.originChannelGenerationId,
+    mapping_admission_shadow_match: verdict.admission_shadow?.match ?? null,
+  },
 });
 
 if (!claim.ok) {
   const isDup = claim.reason === "duplicate";
+  const policyOutcome = handleMappingPolicy({
+    evaluation: verdict, claim, resolvedContext: mappingContext,
+  });
   writeReceipt("claim-" + claim.reason + "-" + verdict.messageId, {
     status: isDup ? "rejected" : "error",
     reason: claim.reason,
     message_id: verdict.messageId,
     claim_acquired: false,
     handed_off: false,
+    policy_id: policyOutcome.policy_id,
+    policy_version: policyOutcome.policy_version,
+    policy_disposition: policyOutcome.disposition,
+    ...(verdict.admission_shadow ? { mapping_admission_shadow: verdict.admission_shadow } : {}),
   });
   if (isDup) {
     finish("rejected", { reasonText: "这条消息已经处理过（幂等命中）" }, { reason: "duplicate" });
   }
   finish("error", { detail: "无法取得投递权：" + claim.error }, { reason: claim.reason });
+}
+
+const mappingRun = handleMappingPolicy({
+  evaluation: verdict,
+  claim,
+  resolvedContext: mappingContext,
+});
+if (mappingRun.disposition !== MAPPING_DISPOSITION.ACCEPTED || !mappingRun.runRequest) {
+  recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed",
+    detail: { reason: mappingRun.reason ?? "mapping_policy_rejected" } });
+  finish("error", { detail: "映射策略没有生成可执行请求" },
+    { reason: mappingRun.reason ?? "mapping_policy_rejected" });
 }
 
 // 路由：现场有人就投给现场，没人才自己起一轮。
@@ -331,12 +386,12 @@ if (target) {
   try {
     run = deliverToLiveSession({
       target,
-      instruction: verdict.instruction,
+      instruction: mappingRun.runRequest.userInput,
       messageId: verdict.messageId,
       createdAtMs: event.created_at_ms,
       projectRoot: config.project_dir,
       runsDir: RUNS,
-      key: claim.key,
+      key: mappingRun.runRequest.runId,
     });
   } catch (err) {
     recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { error: err.message } });
@@ -380,10 +435,17 @@ if (target) {
   // 同一目录不能并发 --continue，否则两轮会互相踩。用目录锁串行化。
   const lock = acquireSessionLock(LOCK);
   if (!lock.ok) {
+    const busyOutcome = handleMappingPolicy({
+      evaluation: verdict, claim, resolvedContext: mappingContext, targetState: "busy",
+    });
     recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { reason: lock.reason } });
     writeReceipt("busy-" + verdict.messageId, {
       status: "error", reason: lock.reason, message_id: verdict.messageId,
       claim_acquired: true, handed_off: false,
+      policy_id: busyOutcome.policy_id,
+      policy_version: busyOutcome.policy_version,
+      policy_disposition: busyOutcome.disposition,
+      ...(verdict.admission_shadow ? { mapping_admission_shadow: verdict.admission_shadow } : {}),
     });
     finish("error", { detail: "长期任务正忙，上一条指令还没跑完" }, { reason: lock.reason });
   }
@@ -393,12 +455,12 @@ if (target) {
       projectDir: config.project_dir,
       resumeSessionId: boundSession ?? undefined,
       instruction: stampInstruction({
-        instruction: verdict.instruction,
+        instruction: mappingRun.runRequest.userInput,
         messageId: verdict.messageId,
         createdAtMs: event.created_at_ms,
       }),
       runsDir: RUNS,
-      key: claim.key,
+      key: mappingRun.runRequest.runId,
     });
   } catch (err) {
     releaseSessionLock(LOCK);
@@ -447,6 +509,13 @@ if (routed.source === "project-files") {
 
 writeReceipt("accepted-" + verdict.messageId, {
   status: "accepted", message_id: verdict.messageId, claim_key: claim.key,
+  run_id: mappingRun.runRequest.runId,
+  local_target_id: mappingRun.runRequest.localTargetId,
+  origin_channel_generation_id: mappingRun.runRequest.origin.channelGenerationId,
+  policy_id: mappingRun.policy_id,
+  policy_version: mappingRun.policy_version,
+  policy_disposition: mappingRun.disposition,
+  ...(verdict.admission_shadow ? { mapping_admission_shadow: verdict.admission_shadow } : {}),
   // 多绑定之后「这条进了哪个项目」是排查的第一个问题。
   project_root: routed.root, binding_source: routed.source,
   binding_level: boundSession ? "session" : "project",

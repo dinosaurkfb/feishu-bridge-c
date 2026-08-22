@@ -174,11 +174,12 @@ claim、长期任务续接与最终答复发布都由 bridge 管理。新接一�
 2. Aily 在本机启动第三方智能体回合，并提供事件信封
 3. UserPromptSubmit hook 在模型看到正文**之前**注入「本回合只准跑分发器」
 4. 分发器验调用方 agent、**只取一次**信封、构造无损 Canonical Event，再按可信字段选路
-5. handler 校验身份、发送者、群、话题、session、时效和幂等 claim
-6. 飞书先收到“已受理”或明确拒绝原因（分发器**一个字都不加**，原样透出 handler 的话）
-7. bridge 续接精确长期任务，任务使用原上下文执行指令
-8. hooks/watcher 确认真实终局并把最终答复写入 outbox
-7. 同一个第三方智能体把答复发布回原话题；Claude/Codex 结果以只读 Card 2.0 卡片呈现
+5. 公共入站核心校验身份、发送者、群、话题、session、时效并取得幂等 claim
+6. Mapping Policy 返回明确处置；受理时生成不含 session/thread locator 的统一 `runRequest`
+7. 飞书先收到“已受理”或明确拒绝原因（分发器**一个字都不加**，原样透出 handler 的话）
+8. runtime adapter 续接精确长期任务，任务使用原上下文执行指令
+9. hooks/watcher 确认真实终局并把最终答复写入 outbox
+10. 同一个第三方智能体把答复发布回原话题；Claude/Codex 结果以只读 Card 2.0 卡片呈现
 ```
 
 “已受理”只表示指令已经通过路由并交给目标任务，不等于工作已经完成。只有观察到运行时的
@@ -301,6 +302,7 @@ node scripts/bind-project.mjs --project ~/your-project --apply
 ```text
 scripts/
   envelope / selector / claim   Aily 信封、确定性选择器与原子认领
+  mapping-policy               公共 Mapping Policy 与 runtime-neutral runRequest
   inbound / inbound-route       Claude 入站与项目路由
   outbox / outbound             可靠答复队列与飞书发布
   bind-* / registry / binding   话题创建、登记和生命周期
@@ -328,7 +330,7 @@ references/
 ## 开发与验证
 
 ```bash
-npm test                         # Claude 234 项 + Codex adapter 回归
+npm test                         # Claude 313 项 + Codex adapter 69 项回归
 npm run test:claude              # 只运行 Claude 基线
 npm run test:codex               # 只运行 Codex adapter
 npm run doctor:codex             # Codex 机器级只读自检；不写配置、不联网
@@ -341,9 +343,9 @@ npm run install:codex:preview    # 预览 Codex 安装会修改什么
 ## 两条链路的共用边界
 
 `scripts/` 是底座，`scripts/codex/` 是 Codex 适配层。依赖是**单向**的：适配层从底座
-import 十个模块，底座不反向依赖它（有测试守着方向）。
+import 十五个模块，底座不反向依赖它（有测试守着方向）。
 
-这意味着那十个模块是真正的接触面 —— 任何一方改它，都可能悄悄改掉另一方依赖的东西。
+这意味着那十五个模块是真正的接触面 —— 任何一方改它，都可能悄悄改掉另一方依赖的东西。
 所以有三层护栏，从便宜到贵：
 
 | 护栏 | 抓什么 | 成本 |
@@ -369,6 +371,7 @@ import 十个模块，底座不反向依赖它（有测试守着方向）。
 |---|---|
 | 理解下一阶段的产品目标、模式和验收标准 | [第三方智能体增强：产品需求文档](docs/requirements/agent-enhancement-requirements.md) |
 | 评审重构边界、实体模型、路由和生命周期 | [第三方智能体增强：架构契约](docs/architecture/agent-enhancement-contract.md) |
+| 评审现有映射模式如何迁移到公共 Policy Handler | [Mapping Policy Handler 迁移](docs/implementation/mapping-policy-handler.md) |
 | 从零安装 Codex 飞书桥 | [CODEX_SETUP.md](CODEX_SETUP.md) |
 | 从零安装 Claude Code 飞书桥 | [SETUP.md](SETUP.md) |
 | 查看 Claude 当前运行状态与历史问题 | [STATE.md](STATE.md) |

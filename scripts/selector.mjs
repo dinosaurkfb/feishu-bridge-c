@@ -132,7 +132,13 @@ export function bindingTokensInQuote(content) {
   return [...new Set([...quoted.matchAll(BINDING_TOKEN_RE)].map((m) => m[1]))];
 }
 
-export function evaluateInbound({ event, mapping, config, now }) {
+/**
+ * 对已经规范化的入站证据做现有 mapping 准入判断。
+ *
+ * mention_ids 必须由可信运输层构造，不能由 policy handler 再从不可信正文猜。旧入口
+ * evaluateInbound() 仍会从 Aily 兼容事件生成这份证据，供尚未经过 dispatcher 的诊断路径使用。
+ */
+export function evaluateInboundEvidence({ event, mapping, config, now }) {
   const nowMs = typeof now === "number" ? now : Date.now();
   const reject = (reason) => ({
     decision: "reject",
@@ -142,9 +148,10 @@ export function evaluateInbound({ event, mapping, config, now }) {
 
   if (
     !event ||
-    !isNonEmptyString(event.message_id) ||
+    !isNonEmptyString(event.event_id) ||
     !isNonEmptyString(event.session_id) ||
-    !isNonEmptyString(event.sender_id)
+    !isNonEmptyString(event.sender_id) ||
+    !Array.isArray(event.mention_ids)
   ) {
     return reject(REJECT.MALFORMED_EVENT);
   }
@@ -168,11 +175,11 @@ export function evaluateInbound({ event, mapping, config, now }) {
 
   // 必须是真实 <at> 标签，不接受正文里手打的「@M5Claude」字样。
   // 注意 open_id 按 app 隔离：这里比的是 M5Claude 自己 app 视角下的 id。
-  if (!extractMentionIds(event.content).includes(config.transport_open_id)) {
+  if (!event.mention_ids.includes(config.transport_open_id)) {
     return reject(REJECT.TRANSPORT_NOT_MENTIONED);
   }
 
-  const body = normalizeBody(event.content);
+  const body = normalizeBody(event.content_text);
 
   // 配错和「明写关掉」必须导致不同结果，所以先判合法性、再判匹配。
   // 缺字段 / 空串 / 非字符串 = 配错（MALFORMED_EVENT），不是「没有前缀」。
@@ -185,7 +192,7 @@ export function evaluateInbound({ event, mapping, config, now }) {
   const consumed = Array.isArray(mapping.consumed_message_ids)
     ? mapping.consumed_message_ids
     : [];
-  if (consumed.includes(event.message_id)) return reject(REJECT.DUPLICATE_MESSAGE);
+  if (consumed.includes(event.event_id)) return reject(REJECT.DUPLICATE_MESSAGE);
 
   // 配额和时效都必须真的配了才算数。缺字段时旧版会跳过检查（fail-open），
   // 那等于「配置写错就没有上限、没有时效」—— 与本文件的 fail-closed 原则相悖。
@@ -220,7 +227,24 @@ export function evaluateInbound({ event, mapping, config, now }) {
   return {
     decision: "accept",
     instruction,
-    messageId: event.message_id,
+    messageId: event.event_id,
     logicalTaskKey: mapping.logical_task_key,
   };
+}
+
+/** 旧 Aily 事件视图的兼容入口；新 mapping policy 在 dispatcher 路径直接消费 Canonical Event。 */
+export function evaluateInbound({ event, mapping, config, now }) {
+  return evaluateInboundEvidence({
+    event: event && {
+      event_id: event.message_id,
+      session_id: event.session_id,
+      sender_id: event.sender_id,
+      created_at_ms: event.created_at_ms,
+      mention_ids: extractMentionIds(event.content),
+      content_text: event.content,
+    },
+    mapping,
+    config,
+    now,
+  });
 }

@@ -67,6 +67,10 @@ import {
 } from "./canonical-event.mjs";
 import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
 import {
+  MAPPING_DISPOSITION, MAPPING_POLICY_ID, MAPPING_POLICY_VERSION,
+  buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
+} from "./mapping-policy.mjs";
+import {
   MAX_LOCAL_INPUT_CHARS, claudeTurnInputDir, clearTurnInput, isFeishuStampedInput,
   readTurnInput, storeTurnInput,
 } from "./turn-input.mjs";
@@ -167,6 +171,105 @@ test("合格消息被接受", () => {
   assert.equal(r.decision, "accept");
   assert.equal(r.instruction, "把出站发布器的草稿写完");
   assert.equal(r.messageId, "msg_1");
+});
+
+// ---------- Mapping Policy：公共准入、处置与 runtime-neutral runRequest ----------
+
+test("Mapping Policy 同轮计算 Canonical Event 候选并与旧 selector 影子比较", () => {
+  const built = buildCanonicalEvent({
+    event: baseEvent,
+    rawEnvelope: { type: "message.create", payload: { opaque: true } },
+    endpointId: "endpoint_claude",
+    callerAgentUid: "agent_m5claude",
+  });
+  assert.equal(built.ok, true);
+  const evaluation = evaluateMappingAdmission({
+    canonicalEvent: built.event, event: baseEvent,
+    mapping: baseMapping, config, now: NOW,
+  });
+  assert.equal(evaluation.decision, "accept");
+  assert.equal(evaluation.instruction, "把出站发布器的草稿写完");
+  assert.equal(evaluation.evaluation_path, "legacy_event_v2");
+  assert.equal(evaluation.candidate_evaluation_path, "canonical_event_v1");
+  assert.equal(evaluation.admission_shadow.match, true);
+  assert.equal(evaluation.policy_id, MAPPING_POLICY_ID);
+  assert.equal(evaluation.policy_version, MAPPING_POLICY_VERSION);
+});
+
+test("Mapping Policy 影子不一致只留证据，旧 selector 在真实验收前仍是唯一权威", () => {
+  const built = buildCanonicalEvent({
+    event: baseEvent,
+    rawEnvelope: { type: "message.create", payload: { opaque: true } },
+    endpointId: "endpoint_claude",
+    callerAgentUid: "agent_m5claude",
+  });
+  const evaluation = evaluateMappingAdmission({
+    canonicalEvent: built.event,
+    event: { ...baseEvent, content: "被篡改的兼容正文" },
+    mapping: baseMapping,
+    config,
+    now: NOW,
+  });
+  assert.equal(evaluation.decision, "reject", "旧 selector 结果仍然承重");
+  assert.equal(evaluation.admission_shadow.match, false);
+  assert.equal(evaluation.admission_shadow.legacy_decision, "reject");
+  assert.equal(evaluation.admission_shadow.candidate_decision, "accept");
+});
+
+test("Mapping Policy 的 accepted 结果只给 runtime-neutral runRequest，不泄露 session/任务键", () => {
+  const evaluation = evaluateMappingAdmission({ event: baseEvent, mapping: baseMapping, config, now: NOW });
+  const context = buildLegacyMappingContext({
+    runtime: "claude", mapping: baseMapping, event: baseEvent,
+  });
+  assert.equal(context.ok, true);
+  assert.equal(context.projection, "legacy_mapping_v1");
+  const outcome = handleMappingPolicy({
+    evaluation, claim: { ok: true, key: "claim_opaque" }, resolvedContext: context,
+  });
+  assert.equal(outcome.disposition, MAPPING_DISPOSITION.ACCEPTED);
+  assert.equal(outcome.claimId, "claim_opaque");
+  assert.equal(outcome.runRequest.runId, "claim_opaque");
+  assert.equal(outcome.runRequest.userInput, "把出站发布器的草稿写完");
+  assert.equal(outcome.runRequest.origin.kind, "feishu");
+  assert.equal(outcome.runRequest.policy.policy_id, MAPPING_POLICY_ID);
+  const serialized = JSON.stringify(outcome.runRequest);
+  assert.equal(serialized.includes(BOUND_SESSION), false, "runRequest 不得携带 Aily session locator");
+  assert.equal(serialized.includes(baseMapping.logical_task_key), false,
+    "runRequest 不得携带旧 logical task locator");
+});
+
+test("Mapping Policy 明确区分 rejected、duplicate 与 busy，非 accepted 不生成 runRequest", () => {
+  const rejectedEvaluation = evaluateMappingAdmission({
+    event: { ...baseEvent, sender_id: "unauthorized" }, mapping: baseMapping, config, now: NOW,
+  });
+  const rejected = handleMappingPolicy({ evaluation: rejectedEvaluation });
+  assert.equal(rejected.disposition, MAPPING_DISPOSITION.REJECTED);
+  assert.equal("runRequest" in rejected, false);
+
+  const evaluation = evaluateMappingAdmission({ event: baseEvent, mapping: baseMapping, config, now: NOW });
+  const duplicate = handleMappingPolicy({
+    evaluation, claim: { ok: false, reason: "duplicate", key: "claim_duplicate" },
+  });
+  assert.equal(duplicate.disposition, MAPPING_DISPOSITION.DUPLICATE);
+  assert.equal("runRequest" in duplicate, false);
+
+  const busy = handleMappingPolicy({
+    evaluation, claim: { ok: true, key: "claim_busy" }, targetState: "busy",
+  });
+  assert.equal(busy.disposition, MAPPING_DISPOSITION.BUSY);
+  assert.equal("runRequest" in busy, false);
+});
+
+test("损坏的 Canonical Event 只记 shadow，无权否决合法的旧 selector 结果", () => {
+  const evaluation = evaluateMappingAdmission({
+    canonicalEvent: {}, event: baseEvent, mapping: baseMapping, config, now: NOW,
+  });
+  assert.equal(evaluation.decision, "accept");
+  assert.equal(evaluation.instruction, "把出站发布器的草稿写完");
+  assert.equal(evaluation.evaluation_path, "legacy_event_v2");
+  assert.equal(evaluation.admission_shadow.match, false);
+  assert.equal(evaluation.admission_shadow.candidate_decision, "invalid");
+  assert.equal(evaluation.admission_shadow.candidate_reason, "canonical_invalid");
 });
 
 test("前缀后多个空格也能接受", () => {

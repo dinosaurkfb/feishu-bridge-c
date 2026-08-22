@@ -453,7 +453,8 @@ const budgetStop = (state, reason, now) => ({
   changed: true,
   disposition: RELAY_DISPOSITION.STOP,
   reason,
-  state: stopState(state, RELAY_PLAN_STATUS.COMPLETED, reason, now),
+  state: stopState(state, RELAY_PLAN_STATUS.COMPLETED, reason, now,
+    { closeStepStatus: RELAY_STEP_STATUS.CANCELLED }),
 });
 
 const remainingCycleBudget = (state, snapshot) => {
@@ -597,7 +598,10 @@ export function advanceRelayPlan(state, {
   const next = clone(state);
   const nextCycle = next.active_cycle;
   const nextStep = nextCycle.steps[nextCycle.active_step_index - 1];
-  const finalStatus = status === RELAY_STEP_STATUS.COMPLETED && !OUTPUT_REF_PATTERN.test(outputRef ?? "")
+  const expectedOutputRef = deriveDialogueOutputRef({
+    dialogueId: state.dialogue_id, runId, terminalEventId,
+  }).outputRef;
+  const finalStatus = status === RELAY_STEP_STATUS.COMPLETED && outputRef !== expectedOutputRef
     ? RELAY_STEP_STATUS.FAILED
     : status;
   const finalReason = finalStatus === RELAY_STEP_STATUS.FAILED
@@ -609,7 +613,7 @@ export function advanceRelayPlan(state, {
       : null;
   nextStep.status = finalStatus;
   nextStep.finalized_at = iso(now);
-  nextStep.output_ref = OUTPUT_REF_PATTERN.test(outputRef ?? "") ? outputRef : null;
+  nextStep.output_ref = finalStatus === RELAY_STEP_STATUS.COMPLETED ? outputRef : null;
   nextStep.reason = finalReason;
   next.processed_terminal_events.push({ terminal_event_id: terminalEventId, run_id: runId,
     cycle_index: nextCycle.cycle_index, step_index: nextStep.step_index });

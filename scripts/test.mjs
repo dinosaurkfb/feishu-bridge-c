@@ -1036,6 +1036,39 @@ test("Relay deadline 的迟到终局只关闭当前 run，不再 dispatch peer",
   assert.equal(late.state.status, RELAY_PLAN_STATUS.COMPLETED);
   assert.equal(late.state.usage.agent_runs_started, 1);
   assert.equal("runRequest" in late, false);
+  assert.equal(validateRelayPlanState(late.state, { snapshot }).ok, true);
+
+  const expiredWhileActive = startRelayCycle(started.state, {
+    snapshot, humanEventId: "human_after_deadline",
+    parentHumanClaimId: claimKey("human_after_deadline", "dialogue"),
+    originChannelGenerationId: "channel_generation_aaaaaaaaaaaaaaaaaaaaaaaa", now: NOW + 10,
+  });
+  assert.equal(expiredWhileActive.disposition, RELAY_DISPOSITION.STOP);
+  assert.equal(expiredWhileActive.reason, RELAY_REASON.TIME_BUDGET);
+  assert.equal(expiredWhileActive.state.last_cycle.steps[0].status,
+    RELAY_STEP_STATUS.CANCELLED);
+  assert.equal(validateRelayPlanState(expiredWhileActive.state, { snapshot }).ok, true);
+});
+
+test("Relay output ref 必须绑定当前 dialogue、run 与 terminal event", () => {
+  const snapshot = relaySnapshotFixture().snapshot;
+  const state = createRelayPlanState({
+    dialogueId: "dialogue_output_authenticity", snapshot, startedAt: NOW,
+  }).state;
+  const started = startRelayCycle(state, {
+    snapshot, humanEventId: "human_output_authenticity",
+    parentHumanClaimId: claimKey("human_output_authenticity", "dialogue"),
+    originChannelGenerationId: "channel_generation_aaaaaaaaaaaaaaaaaaaaaaaa", now: NOW + 1,
+  });
+  const forged = advanceRelayPlan(started.state, {
+    snapshot, runId: started.runRequest.run_id, terminalEventId: "terminal_authenticity",
+    status: RELAY_STEP_STATUS.COMPLETED,
+    outputRef: "output_ref_ffffffffffffffffffffffff", now: NOW + 2,
+  });
+  assert.equal(forged.state.status, RELAY_PLAN_STATUS.FAILED);
+  assert.equal(forged.reason, RELAY_REASON.OUTPUT_REF_INVALID);
+  assert.equal(forged.state.last_cycle.steps[0].output_ref, null);
+  assert.equal(validateRelayPlanState(forged.state, { snapshot }).ok, true);
 });
 
 test("Relay runtime/空终局硬失败，授权撤销则是 cancelled", () => {
@@ -1121,11 +1154,11 @@ test("Participant schema 与离线 simulator 可复现三步计划且不产生�
       { type: "human", event_id: "human_sim", claim_id: "a".repeat(64),
         origin_channel_generation_id: "channel_generation_aaaaaaaaaaaaaaaaaaaaaaaa", now: NOW + 1 },
       { type: "terminal", run_id: "$active", terminal_event_id: "terminal_sim_1",
-        output_ref: "output_ref_aaaaaaaaaaaaaaaaaaaaaaaa", now: NOW + 2 },
+        derive_output_ref: true, now: NOW + 2 },
       { type: "terminal", run_id: "$active", terminal_event_id: "terminal_sim_2",
-        output_ref: "output_ref_bbbbbbbbbbbbbbbbbbbbbbbb", now: NOW + 3 },
+        derive_output_ref: true, now: NOW + 3 },
       { type: "terminal", run_id: "$active", terminal_event_id: "terminal_sim_3",
-        output_ref: "output_ref_cccccccccccccccccccccccc", now: NOW + 4 },
+        derive_output_ref: true, now: NOW + 4 },
     ],
   }));
   const run = spawnSync(process.execPath, [path.resolve("scripts", "simulate-dialogue-planner.mjs"),

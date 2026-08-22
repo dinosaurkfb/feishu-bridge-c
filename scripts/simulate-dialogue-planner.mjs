@@ -6,7 +6,7 @@ import path from "node:path";
 
 import {
   RELAY_STEP_STATUS, advanceRelayPlan, cancelRelayPlan, createRelayPlanState, startRelayCycle,
-  validateParticipantAuthorizationSnapshot,
+  deriveDialogueOutputRef, validateParticipantAuthorizationSnapshot,
 } from "./dialogue-participant-planner.mjs";
 
 const arg = (name) => {
@@ -54,12 +54,17 @@ for (const event of fixture.events ?? []) {
     });
   } else if (event.type === "terminal") {
     const active = state.active_cycle?.steps?.[state.active_cycle.active_step_index - 1];
+    const outputRef = event.derive_output_ref === true ? deriveDialogueOutputRef({
+      dialogueId: state.dialogue_id,
+      runId: event.run_id === "$active" || !event.run_id ? active?.run_id : event.run_id,
+      terminalEventId: event.terminal_event_id,
+    }).outputRef : event.output_ref;
     result = advanceRelayPlan(state, {
       snapshot: fixture.snapshot,
       runId: event.run_id === "$active" || !event.run_id ? active?.run_id : event.run_id,
       terminalEventId: event.terminal_event_id,
       status: event.status ?? RELAY_STEP_STATUS.COMPLETED,
-      outputRef: event.output_ref,
+      outputRef,
       reason: event.reason,
       now: event.now,
     });

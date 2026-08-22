@@ -17,7 +17,9 @@ import {
 import { composeCodexBinding, resolveBindingTarget, validThreadId } from "./bind-compose.mjs";
 import { readCodexThreadTitle, sanitizeThreadTitle } from "./thread-title.mjs";
 import { updateTextMessage } from "./lark-message.mjs";
-import { classifyRunnerDiagnostic, readCodexRunOutcome, sanitizeCodexRunEnv } from "./handoff.mjs";
+import {
+  classifyRunnerDiagnostic, isCodexInboundExecution, readCodexRunOutcome, sanitizeCodexRunEnv,
+} from "./handoff.mjs";
 import {
   composeCodexOutboundCard, neutralizeCardMentions, outboundCardBatches, validateCodexOutboundCard,
 } from "./outbound-card.mjs";
@@ -1486,6 +1488,45 @@ test("目标 Codex 再次执行入站路由时严格判为 bridge_recursion", ()
   const result = readCodexRunOutcome({ logPath, exitPath, lastMessagePath, expectedThreadId: THREAD_A });
   assert.equal(result.state, "failed");
   assert.equal(result.reason, "bridge_recursion");
+});
+
+test("bridge_recursion 只识别真实入口执行，不把源码引用和排障命令当递归", () => {
+  assert.equal(isCodexInboundExecution("node /bridge/scripts/codex/inbound.mjs"), true);
+  assert.equal(isCodexInboundExecution(
+    "/bin/zsh -lc \"node /bridge/scripts/codex/aily-inbound.mjs\""), true);
+  assert.equal(isCodexInboundExecution(
+    "cd /bridge && FEISHU_BRIDGE_ROLE=test node scripts/codex/inbound.mjs"), true);
+
+  const benignCommands = [
+    "sed -n '1,220p' scripts/codex/inbound.mjs",
+    "rg -n 'bridge_recursion|m5codex-inbound-router|scripts/codex/inbound.mjs' scripts",
+    "git add scripts/codex/inbound.mjs skills/m5codex-inbound-router/SKILL.md",
+    "/bin/zsh -lc \"git diff -- scripts/codex/inbound.mjs && rg -n 'm5codex-inbound-router' .\"",
+    "node --input-type=module <<'NODE'\nconst marker = 'scripts/codex/inbound.mjs';\nNODE",
+    "node --input-type=module <<'NODE'\nconst fixture = `\nnode /bridge/scripts/codex/inbound.mjs\n`;\nNODE",
+  ];
+  for (const command of benignCommands) assert.equal(isCodexInboundExecution(command), false, command);
+
+  const dir = temp();
+  const logPath = path.join(dir, "run.jsonl");
+  const exitPath = path.join(dir, "exit.json");
+  const lastMessagePath = path.join(dir, "last.txt");
+  fs.writeFileSync(logPath, [
+    { type: "thread.started", thread_id: THREAD_A },
+    { type: "turn.started" },
+    ...benignCommands.map((command, index) => ({
+      type: "item.completed",
+      item: { type: "command_execution", command, status: index === 1 ? "failed" : "completed" },
+    })),
+    { type: "turn.completed" },
+  ].map(JSON.stringify).join("\n") + "\n");
+  fs.writeFileSync(exitPath, JSON.stringify({ status: "exited", exit_code: 0 }));
+  fs.writeFileSync(lastMessagePath, "真实任务已完成");
+  const result = readCodexRunOutcome({
+    logPath, exitPath, lastMessagePath, expectedThreadId: THREAD_A,
+  });
+  assert.equal(result.state, "completed");
+  assert.equal(result.finalText, "真实任务已完成");
 });
 
 test("Codex 启动前 Git 预检失败不会误报 thread_mismatch", () => {

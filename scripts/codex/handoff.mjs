@@ -94,6 +94,25 @@ export function classifyRunnerDiagnostic(stderr) {
   return null;
 }
 
+const DIRECT_INBOUND_EXECUTION = /^(?:exec\s+)?(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*(?:[^\s"';&|]*\/)?node(?:js)?(?:\s+--[^\s"';&|]+)*\s+["']?(?:[^\s"';&|]*\/)?scripts\/codex\/(?:aily-)?inbound\.mjs["']?(?:\s|$)/u;
+
+/**
+ * 只把真正执行 Codex 入站入口的 shell segment 认作递归。
+ *
+ * 读取、搜索、diff、git add 或测试代码中引用同一路径都不是执行；旧的 contains 判定会把
+ * 正常开发和故障排查误报为 bridge_recursion。这里只支持桥自己会生成的直接 node 形态，
+ * 未知复杂 shell 形态保持 fail-safe：不会用一个任意字符串命中覆盖真实 turn.completed。
+ */
+export function isCodexInboundExecution(command) {
+  if (typeof command !== "string" || command.trim().length === 0) return false;
+  const text = command.trim();
+  const wrapped = text.match(/^(?:[^\s"']*\/)?(?:zsh|bash|sh)\s+-lc\s+(["'])([\s\S]*)\1$/u);
+  const executableText = wrapped ? wrapped[2] : text;
+  // 不按换行拆分：换行后的文本可能是 heredoc/测试夹具，不代表新的 shell command。
+  return executableText.split(/&&|\|\||[;|]/u).some((segment) =>
+    DIRECT_INBOUND_EXECUTION.test(segment.trim().replace(/^[('"\s]+/u, "")));
+}
+
 export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, errPath, expectedThreadId }) {
   let raw = "";
   try { raw = fs.readFileSync(logPath, "utf-8"); } catch { /* runner 可能刚启动 */ }
@@ -119,9 +138,7 @@ export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, errPat
     if (event.type === "turn.failed") turnFailed = true;
     if (event.type === "error") recoverableErrors += 1;
     if (event.item?.type === "command_execution" &&
-        typeof event.item.command === "string" &&
-        (event.item.command.includes("scripts/codex/inbound.mjs") ||
-         event.item.command.includes("m5codex-inbound-router"))) bridgeRecursion = true;
+        isCodexInboundExecution(event.item.command)) bridgeRecursion = true;
   }
 
   let exit = null;

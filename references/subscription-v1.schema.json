@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dinosaurkfb/feishu-bridge-c/references/subscription-v1.schema.json",
+  "title": "Feishu Bridge Subscription v1",
+  "description": "A versioned control-plane subscription. Runtime-specific task/session locators are deliberately excluded.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_type",
+    "subscription_id",
+    "version",
+    "endpoint_id",
+    "domain_id",
+    "status",
+    "scope",
+    "constraints"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "artifact_type": { "const": "feishu_bridge_subscription" },
+    "subscription_id": { "type": "string", "minLength": 1 },
+    "version": { "type": "integer", "minimum": 1 },
+    "endpoint_id": { "type": "string", "minLength": 1 },
+    "domain_id": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["active", "paused"] },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_uid", "transport_open_id", "chat_id", "sender_ids", "event_types"],
+      "properties": {
+        "agent_uid": { "type": "string", "minLength": 1 },
+        "transport_open_id": { "type": "string", "minLength": 1 },
+        "chat_id": { "type": "string", "minLength": 1 },
+        "sender_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "event_types": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "const": "im.message.receive" }
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["freshness_ms"],
+      "properties": {
+        "freshness_ms": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    }
+  }
+}

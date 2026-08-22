@@ -29,10 +29,12 @@ import {
   isAilyInvocation, isBindingPrompt,
 } from "./prompt-hook.mjs";
 import {
-  enableAutoPublishForAllTasks, extractQuotedBindingTokens, findPendingTask,
+  buildCodexSubscriptionProjection, enableAutoPublishForAllTasks, evaluatePromotion,
+  extractQuotedBindingTokens, findPendingTask,
   findRegisteredTaskForCodexThread, findTaskForCodexThread, findTaskForFeishuSession,
   isThreadBusy, loadCodexTemplate, loadRegistry, makeTaskEntry, mappingForTask, recordThreadActivity, resolveTask,
-  setTaskConnectionStatus, setTaskDisplayName, taskPaths, validateCodexTemplate, validateRegistryTasks, writeRegistry,
+  setTaskConnectionStatus, setTaskDisplayName, shadowCodexFirstClaim, taskPaths,
+  validateCodexTemplate, validateRegistryTasks, writeRegistry,
 } from "./state.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
@@ -242,6 +244,63 @@ test("没有引用码时保留唯一 pending 的兼容路径", () => {
   assert.equal(selected.source, "sole_pending");
 });
 
+test("Codex 旧 task 登记只读投影成一份订阅和两个本地目标", () => {
+  const home = temp();
+  const root = path.join(home, "same-project");
+  fs.mkdirSync(root);
+  const now = Date.parse("2026-08-22T08:00:00Z");
+  const a = makeTaskEntry({
+    root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30", now,
+  });
+  const b = makeTaskEntry({
+    root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "62ca4f", now,
+  });
+  writeRegistry([a, b], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const before = fs.readFileSync(path.join(home, "registry.json"), "utf-8");
+
+  const model = buildCodexSubscriptionProjection({ home });
+  assert.equal(model.ok, true);
+  assert.equal(model.subscriptions.length, 1);
+  assert.equal(model.pending_bindings.length, 2);
+  const serialized = JSON.stringify(model);
+  assert.equal(serialized.includes(root), false);
+  assert.equal(serialized.includes(THREAD_A), false);
+  assert.equal(serialized.includes(THREAD_B), false);
+  assert.equal(fs.readFileSync(path.join(home, "registry.json"), "utf-8"), before);
+  assert.equal(fs.existsSync(path.join(home, "subscriptions")), false);
+});
+
+test("Codex 首次认领 shadow 与现行绑定码选择一致且不写 task registry", () => {
+  const home = temp();
+  const root = path.join(home, "same-project");
+  fs.mkdirSync(root);
+  const now = Date.parse("2026-08-22T08:00:00Z");
+  const a = makeTaskEntry({
+    root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30", now,
+  });
+  const b = makeTaskEntry({
+    root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "62ca4f", now,
+  });
+  writeRegistry([a, b], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const event = {
+    message_id: "msg_shadow", session_id: "session_shadow",
+    sender_id: TEMPLATE.frank_sender_id, created_at_ms: now - 1000,
+    content: '<at id="ou_same">M5Codex</at>\n> 绑定码  62ca4f',
+  };
+  const pending = findPendingTask({ home, content: event.content, now });
+  const legacy = evaluatePromotion({ event, template: TEMPLATE, pending, now });
+  const before = fs.readFileSync(path.join(home, "registry.json"), "utf-8");
+  const shadow = shadowCodexFirstClaim({
+    event, template: TEMPLATE, callerAgentUid: TEMPLATE.agent_uid,
+    legacyPending: pending, legacyPromotion: legacy, home, now,
+  });
+  assert.equal(shadow.match, true);
+  assert.deepEqual(shadow.scope_unverified, ["chat_id"]);
+  assert.equal(fs.readFileSync(path.join(home, "registry.json"), "utf-8"), before);
+});
+
 test("完整入站链路用引用绑定码在多个 pending 中只绑定目标 task", () => {
   const home = temp();
   const root = path.join(home, "same-project");
@@ -302,6 +361,11 @@ test("完整入站链路用引用绑定码在多个 pending 中只绑定目标 t
   assert.equal(afterA.session_id, undefined);
   assert.equal(afterB.inbound_state, "bound");
   assert.equal(afterB.session_id, "session_token_b");
+  const receipts = fs.readdirSync(taskPaths(afterB, home).receipts).filter((name) => name.startsWith("bound-"));
+  assert.equal(receipts.length, 1);
+  const receipt = JSON.parse(fs.readFileSync(path.join(taskPaths(afterB, home).receipts, receipts[0]), "utf-8"));
+  assert.equal(receipt.subscription_claim_shadow.match, true);
+  assert.deepEqual(receipt.subscription_claim_shadow.scope_unverified, ["chat_id"]);
 });
 
 test("Feishu session 与 Codex thread 是两把独立且精确的键", () => {

@@ -191,7 +191,7 @@ subscription 歧义、chat scope、binding 授权快照同步、代际轮转与�
 
 本地与 shadow 证据不能替代 Slice B/C 的真实链路验收。
 
-## 9. Slice A / B1 / B2a 候选实现证据
+## 9. Slice A / B1 / B2a / B2b 候选实现证据
 
 - `scripts/dialogue-participant-planner.mjs` 实现 opaque binding/participant/output ref、不可变快照校验、
   固定 `host -> peer -> host finalizer` 纯函数 planner、完整 cycle 预算预检、重复事件幂等、deadline、
@@ -207,5 +207,7 @@ subscription 歧义、chat scope、binding 授权快照同步、代际轮转与�
 - Slice B2a 新增 `scripts/dialogue-chat-scope-probe.mjs` 与
   `references/dialogue-chat-scope-probe-v1.schema.json`，只把 locator presence/一致性写成布尔证据；
   原始 locator 不落盘，探针失败不阻断 B1 或 legacy 路由；
-- Claude 357/357、Codex 81/81 通过；共享导出面扩展为 22 个模块并更新快照；
+- Slice B2b 新增只读 readiness audit，把 authorization、event comparison 与 scope probe 关联为脱敏
+  计数；即使自动检查全部通过也只返回 `manual_review_required`，不能据此切流；
+- Claude 361/361、Codex 82/82 通过；共享导出面扩展为 23 个模块、208 个导出并更新快照；
 - 证据层级仍是本地合成/契约测试，不等于 Slice B 权威路由或 Slice C Agent Relay 已实现、安装或验收。

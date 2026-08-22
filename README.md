@@ -372,14 +372,14 @@ npm run install:codex:preview    # 预览 Codex 安装会修改什么
 ## 两条链路的共用边界
 
 `scripts/` 是底座，`scripts/codex/` 是 Codex 适配层。依赖是**单向**的：适配层从底座
-import 二十一个模块，底座不反向依赖它（有测试守着方向）。
+import 当前快照列出的共用模块，底座不反向依赖它（有测试守着方向）。
 
-这意味着那二十一个模块是真正的接触面 —— 任何一方改它，都可能悄悄改掉另一方依赖的东西。
+这意味着快照里的模块是真正的接触面 —— 任何一方改它，都可能悄悄改掉另一方依赖的东西。
 所以有三层护栏，从便宜到贵：
 
 | 护栏 | 抓什么 | 成本 |
 |---|---|---|
-| `npm run contract` | 共用模块的**导出面**变了（多了、少了、改名） | 机械，覆盖全部二十一个 |
+| `npm run contract` | 共用模块的**导出面**变了（多了、少了、改名） | 机械，覆盖快照中的全部模块 |
 | 行为契约测试 | 共用模块的**语义**变了（判重算法、文件命名、字段默认值） | 人工，只覆盖想得到的 |
 | `npm test` 同时跑两套 | 一方真的弄坏了另一方 | 已经是默认行为 |
 
@@ -404,6 +404,7 @@ import 二十一个模块，底座不反向依赖它（有测试守着方向）�
 | 理解话题轮转、代际切换与 24 小时认领期限 | [Topic Generation 生命周期](docs/implementation/topic-generation-lifecycle.md) |
 | 理解 Dialogue v1 的串行轮次、预算与停止契约 | [Dialogue Policy v1](docs/implementation/dialogue-policy-v1.md) |
 | 理解多 Agent Dialogue 的参与者授权、串行 planner 与切流门禁 | [Dialogue Participant & Planner 契约](docs/implementation/dialogue-participant-planner-contract.md) |
+| 只读汇总 Dialogue shadow 真实证据与未满足门禁 | [Dialogue Shadow Readiness Audit](docs/implementation/dialogue-shadow-readiness-audit.md) |
 | 从零安装 Codex 飞书桥 | [CODEX_SETUP.md](CODEX_SETUP.md) |
 | 从零安装 Claude Code 飞书桥 | [SETUP.md](SETUP.md) |
 | 查看 Claude 当前运行状态与历史问题 | [STATE.md](STATE.md) |

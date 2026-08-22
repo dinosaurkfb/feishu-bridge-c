@@ -52,6 +52,10 @@ import {
   deriveDialogueParticipantRef, startRelayCycle,
 } from "../dialogue-participant-planner.mjs";
 import { CHAT_SCOPE_PROBE_ARTIFACT_TYPE } from "../dialogue-chat-scope-probe.mjs";
+import {
+  DIALOGUE_SHADOW_READINESS_ARTIFACT_TYPE, DIALOGUE_SHADOW_READINESS_DECISION,
+  analyzeDialogueShadowEvidence,
+} from "../dialogue-shadow-readiness.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
 const THREAD_A = "01911111-2222-7333-8444-555555555555";
@@ -75,6 +79,14 @@ const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), "feishu-codex-adapter-t
 
 test("Codex 将 chat scope probe 纳入受保护共用面", () => {
   assert.equal(CHAT_SCOPE_PROBE_ARTIFACT_TYPE, "feishu_bridge_dialogue_chat_scope_probe");
+});
+
+test("Codex 与 Claude 共用 shadow readiness，空证据不能被解释为可切流", () => {
+  const analyzed = analyzeDialogueShadowEvidence({ generatedAt: 0 });
+  assert.equal(analyzed.ok, true);
+  assert.equal(analyzed.report.artifact_type, DIALOGUE_SHADOW_READINESS_ARTIFACT_TYPE);
+  assert.equal(analyzed.report.decision,
+    DIALOGUE_SHADOW_READINESS_DECISION.INSUFFICIENT_EVIDENCE);
 });
 
 const codexRelaySnapshot = () => {

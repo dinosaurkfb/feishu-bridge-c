@@ -102,6 +102,11 @@ import {
   validateDialogueChatScopeProbe,
 } from "./dialogue-chat-scope-probe.mjs";
 import {
+  DIALOGUE_SHADOW_READINESS_ARTIFACT_TYPE, DIALOGUE_SHADOW_READINESS_DECISION,
+  analyzeDialogueShadowEvidence, readDialogueShadowEvidence,
+  renderDialogueShadowReadinessReport, validateDialogueShadowReadinessReport,
+} from "./dialogue-shadow-readiness.mjs";
+import {
   MAX_LOCAL_INPUT_CHARS, claudeTurnInputDir, clearTurnInput, isFeishuStampedInput,
   readTurnInput, storeTurnInput,
 } from "./turn-input.mjs";
@@ -882,6 +887,126 @@ test("Dialogue Slice B1 schema 固化授权快照与 shadow artifact", () => {
   assert.equal(scopeProbeSchema.properties.artifact_type.const,
     CHAT_SCOPE_PROBE_ARTIFACT_TYPE);
   assert.equal(scopeProbeSchema.properties.chat_scope_match.type.includes("null"), true);
+});
+
+const analyzeShadowDir = (shadowDir, generatedAt = NOW) => {
+  const loaded = readDialogueShadowEvidence({ shadowDirs: [shadowDir] });
+  assert.equal(loaded.ok, true);
+  return analyzeDialogueShadowEvidence({
+    sourceCount: loaded.evidence.source_count,
+    missingSourceDirs: loaded.evidence.missing_source_dirs,
+    readErrors: loaded.evidence.read_errors,
+    authorizations: loaded.evidence.authorizations,
+    events: loaded.evidence.events,
+    probes: loaded.evidence.probes,
+    generatedAt,
+  });
+};
+
+test("Dialogue shadow readiness 对无样本和未核验 chat scope 保持 fail-closed", () => {
+  const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-empty-"));
+  const empty = analyzeShadowDir(emptyDir);
+  assert.equal(empty.ok, true);
+  assert.equal(empty.report.decision, DIALOGUE_SHADOW_READINESS_DECISION.INSUFFICIENT_EVIDENCE);
+
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-shadow-"));
+  const observed = structuredClone(fixture.unverifiedEvent);
+  observed.extensions.aily_channel.chat_id = fixture.template.chat_id;
+  observed.extensions.aily_channel.thread_id = "private-thread-locator";
+  const wrote = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: observed,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  assert.equal(wrote.ok, true);
+  const analyzed = analyzeShadowDir(shadowDir);
+  assert.equal(analyzed.ok, true);
+  assert.equal(analyzed.report.decision, DIALOGUE_SHADOW_READINESS_DECISION.NOT_READY);
+  assert.equal(analyzed.report.correlation.complete_pairs, 1);
+  assert.equal(analyzed.report.artifacts.probes.chat_locator_present, 1);
+  assert.equal(analyzed.report.artifacts.probes.chat_scope_match, 1);
+  assert.equal(analyzed.report.artifacts.probes.canonical_verified, 0,
+    "runtime 字段存在且匹配也不能自行提升 canonical trust");
+  assert.equal(analyzed.report.artifacts.events.route_match, 0);
+  assert.equal(analyzed.report.artifacts.events.candidate_reason_counts.chat_scope_unverified, 1);
+  assert.equal(validateDialogueShadowReadinessReport(analyzed.report).ok, true);
+
+  const serialized = JSON.stringify(analyzed.report) + "\n" +
+    renderDialogueShadowReadinessReport(analyzed.report);
+  for (const secret of [shadowDir, fixture.template.chat_id, "private-thread-locator",
+    fixture.privateBindingKey, wrote.snapshot.binding_ref, wrote.evidence.event_ref]) {
+    assert.equal(serialized.includes(secret), false, "readiness 报告泄露私有证据：" + secret);
+  }
+});
+
+test("Dialogue shadow readiness 自动检查全过也只要求人工评审", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-trusted-"));
+  const wrote = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.trustedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  assert.equal(wrote.ok, true);
+  const analyzed = analyzeShadowDir(shadowDir);
+  assert.equal(analyzed.report.automated_checks.every((item) => item.status === "pass"), true);
+  assert.equal(analyzed.report.decision,
+    DIALOGUE_SHADOW_READINESS_DECISION.MANUAL_REVIEW_REQUIRED);
+  assert.deepEqual(analyzed.report.manual_gates_unverified, [
+    "trusted_locator_source", "both_runtime_coverage", "generation_rotation_coverage",
+    "rollback_rehearsal",
+  ]);
+  assert.match(renderDialogueShadowReadinessReport(analyzed.report),
+    /本报告不授权切换权威路由/u);
+});
+
+test("Dialogue shadow readiness 把损坏、孤立和 CLI 路径统一收敛为脱敏诊断", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-corrupt-"));
+  const wrote = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.unverifiedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  assert.equal(wrote.ok, true);
+  fs.writeFileSync(path.join(shadowDir, "events", "corrupt.json"), "{not-json\n");
+  fs.rmSync(wrote.scopeProbe.file);
+  const analyzed = analyzeShadowDir(shadowDir);
+  assert.equal(analyzed.report.decision, DIALOGUE_SHADOW_READINESS_DECISION.INVALID_EVIDENCE);
+  assert.equal(analyzed.report.read_errors, 1);
+  assert.equal(analyzed.report.correlation.orphan_events, 1);
+
+  const cli = spawnSync(process.execPath, [path.resolve("scripts", "dialogue-shadow-audit.mjs"),
+    "--shadow-dir", shadowDir, "--json"], { encoding: "utf-8" });
+  assert.equal(cli.status, 0, cli.stderr);
+  const report = JSON.parse(cli.stdout);
+  assert.equal(report.decision, DIALOGUE_SHADOW_READINESS_DECISION.INVALID_EVIDENCE);
+  assert.equal(cli.stdout.includes(shadowDir), false, "CLI 不得回显私有 sidecar 路径");
+  assert.equal(cli.stdout.includes(wrote.evidence.event_ref), false, "CLI 不得输出 opaque ref");
+});
+
+test("Dialogue shadow readiness schema 与运行时 artifact 固化一致", () => {
+  const schema = JSON.parse(fs.readFileSync(path.resolve("references",
+    "dialogue-shadow-readiness-report-v1.schema.json"), "utf-8"));
+  assert.equal(schema.properties.artifact_type.const,
+    DIALOGUE_SHADOW_READINESS_ARTIFACT_TYPE);
+  assert.deepEqual(schema.properties.manual_gates_unverified.const, [
+    "trusted_locator_source", "both_runtime_coverage", "generation_rotation_coverage",
+    "rollback_rehearsal",
+  ]);
 });
 
 // ---------- Mapping Policy：公共准入、处置与 runtime-neutral runRequest ----------

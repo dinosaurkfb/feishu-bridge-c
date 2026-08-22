@@ -22,6 +22,9 @@ import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
 import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
+import {
+  businessActivitiesForPublishedBatch, recordClaudeActivityAndMaybeRotate,
+} from "./automatic-topic-rotation.mjs";
 
 const SELF = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 
@@ -37,7 +40,6 @@ if (!key) {
 const ROOT = path.resolve(process.argv[3] ?? SELF);
 const RT = path.join(ROOT, ".runtime-data", "inbound");
 const RUNS = path.join(RT, "runs");
-const OUTBOX = path.join(ROOT, ".runtime-data", "outbound", "outbox");
 const CLAIMS = path.join(RT, "delivery-claims");
 const LOCK = path.join(RT, "session.lock");
 const PUBLISH_LOCK = path.join(ROOT, ".runtime-data", "outbound", "publish.lock");
@@ -54,6 +56,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const finishUp = () => fs.rmSync(LOCK, { recursive: true, force: true });
 const acceptedClaim = readClaim({ claimsDir: CLAIMS, key });
 const originGenerationId = acceptedClaim?.origin_channel_generation_id ?? null;
+const claudeSessionId = acceptedClaim?.claude_session_id ?? null;
+const OUTBOX = path.join(ROOT, ".runtime-data", "outbound",
+  claudeSessionId ? "outbox-" + claudeSessionId : "outbox");
 
 const groupByTargetGeneration = (records) => {
   const groups = new Map();
@@ -89,7 +94,7 @@ while (true) {
 
     // 跟出站其余部分共用同一个解析：项目目录里有配置就用它，
     // 没有就回落到「机器模板 + 登记表那一行」。登记表接入的项目这里没有文件可读。
-    const resolved = resolveProject({ root: ROOT });
+    const resolved = resolveProject({ root: ROOT, claudeSessionId });
     if (!resolved.ok || !resolved.config) {
       throw new Error("读不到这个项目的链路配置（" + (resolved.reason ?? resolved.configError?.reason) + "）");
     }
@@ -142,6 +147,16 @@ while (true) {
                 larkHome: ident.configDir,
                 expectedAppId: ident.expectedAppId,
               });
+              for (const activity of businessActivitiesForPublishedBatch(batch, {
+                messageId: mid, runtime: "claude",
+              })) {
+                recordClaudeActivityAndMaybeRotate({
+                  root: ROOT,
+                  claudeSessionId: resolved.claudeSessionId ?? mapping.claude_session_id ?? claudeSessionId,
+                  generationId: target.channelGenerationId,
+                  ...activity,
+                });
+              }
               // 每张成功后立刻标记。后续卡片失败时，已送达的回合不会在重试中重复发送。
               if (batch.some((record) => record._run === true)) {
                 markPublished({ runsDir: RUNS, key, messageId: mid });

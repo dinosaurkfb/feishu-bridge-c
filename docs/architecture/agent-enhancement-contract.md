@@ -290,6 +290,10 @@ pending --activate--> active --pause--> paused --resume--> active
 - `retired`：不再恢复，但保留审计索引；
 - 删除飞书话题不是正常解绑操作。
 
+每个 generation 还维护独立 `activity`：`message_count`、阈值、幂等事件键与最近自动轮转尝试。
+旧状态缺少该对象时必须从 0 惰性初始化，禁止通过扫描飞书或 outbox 回填历史。只有 active generation
+能增加计数；read-only 的迟到结果只能按 INV-9 回原来源话题，不能污染新代际计数。
+
 ### 8.3 轮转事务
 
 轮转 MUST 采用两阶段事务，不能在等待人类 mention 的数小时内一直持有文件锁：
@@ -305,6 +309,11 @@ pending --activate--> active --pause--> paused --resume--> active
    同时把新 generation 设为 active、旧 generation 设为 read-only；
 7. 释放锁并记录审计事件。若到期或用户取消，则用一次原子替换把 pending generation 标为
    retired/cancelled，旧 generation 继续 active。
+
+自动发起轮转时，阈值判断、事件去重和“取得本次尝试权”必须与计数在同一次 binding 原子写中完成；
+真正的飞书根消息创建在锁外复用上述 phase 1/2。默认 v1 阈值为 30 条有效业务消息：已受理的人类
+指令和已送达的 Agent 最终回复各计 1，本地输入/回复配对卡计 2，控制消息与普通进展计 0。自动
+发起只建立 pending，不自动 claim。失败后旧 active 不变；重试须有冷却并由新的业务事件驱动。
 
 文件系统实现必须先在同目录写完整临时文件，再以原子 `rename` 替换 binding 文档；所有决定当前
 active generation 的字段必须位于这同一份文档。等价的事务型存储可以替代，但分两次独立写新旧
@@ -492,6 +501,7 @@ bridge-home/
 - claim 幂等与并发竞争；
 - topic 改名不影响路由；
 - topic 轮转的 24 小时超时、单文档原子切换、来源回复和本地回合目标冻结；
+- topic 自动轮转的 30 条阈值、事件幂等、旧状态零起点、失败冷却、pending 抑制与旧代际不计数；
 - 本地输入/回复配对及飞书输入不重复；
 - control intent 不被普通讨论误触发；
 - policy permission fail-closed；

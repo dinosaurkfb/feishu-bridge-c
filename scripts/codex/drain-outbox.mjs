@@ -7,6 +7,10 @@ import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
 import { resolveLarkIdentity } from "../chain-template.mjs";
 import { composeCodexOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import {
+  businessActivitiesForPublishedBatch,
+} from "../automatic-topic-rotation.mjs";
+import { recordCodexActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
+import {
   bridgeHome, findTaskForCodexThread, loadRegistry, resolveTask,
   resolveTaskOutboundGeneration, taskPaths,
 } from "./state.mjs";
@@ -93,6 +97,17 @@ try {
           larkHome: identity.configDir,
           expectedAppId: identity.expectedAppId,
         });
+        for (const activity of businessActivitiesForPublishedBatch(batch, {
+          messageId, runtime: "codex",
+        })) {
+          recordCodexActivityAndMaybeRotate({
+            root: task.root,
+            threadId: task.codex_thread_id,
+            home,
+            generationId: target.channelGenerationId,
+            ...activity,
+          });
+        }
         for (const event of batch) markSent(event, messageId);
       }
     }

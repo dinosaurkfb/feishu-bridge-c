@@ -61,7 +61,40 @@
         "created_at": { "type": "string", "format": "date-time" },
         "activated_at": { "type": ["string", "null"], "format": "date-time" },
         "read_only_at": { "type": ["string", "null"], "format": "date-time" },
-        "retired_at": { "type": ["string", "null"], "format": "date-time" }
+        "retired_at": { "type": ["string", "null"], "format": "date-time" },
+        "activity": { "$ref": "#/$defs/activity" }
+      }
+    },
+    "activity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "count_mode",
+        "auto_rotate_enabled",
+        "auto_rotate_threshold",
+        "message_count",
+        "counted_event_keys",
+        "started_at",
+        "threshold_reached_at",
+        "last_auto_rotation_attempt_at",
+        "auto_rotation_attempts"
+      ],
+      "properties": {
+        "schema_version": { "const": "1.0" },
+        "count_mode": { "const": "business_message_v1" },
+        "auto_rotate_enabled": { "type": "boolean" },
+        "auto_rotate_threshold": { "type": "integer", "minimum": 1 },
+        "message_count": { "type": "integer", "minimum": 0 },
+        "counted_event_keys": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "started_at": { "type": "string", "format": "date-time" },
+        "threshold_reached_at": { "type": ["string", "null"], "format": "date-time" },
+        "last_auto_rotation_attempt_at": { "type": ["string", "null"], "format": "date-time" },
+        "auto_rotation_attempts": { "type": "integer", "minimum": 0 }
       }
     },
     "rotation": {

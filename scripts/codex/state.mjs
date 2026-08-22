@@ -22,7 +22,7 @@ import {
   ROTATION_STATUS, activatePendingTopicGeneration, activeGeneration,
   activeGenerationForSession, applyTopicGenerationToMapping, closePendingTopicGeneration,
   failTopicRotation, materializeLegacyTopicFields, pendingGeneration, prepareTopicRotation,
-  registerPendingTopicGeneration, topicGenerationStateForLegacy,
+  recordTopicGenerationActivity, registerPendingTopicGeneration, topicGenerationStateForLegacy,
 } from "../topic-generation.mjs";
 
 export const PENDING_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -687,6 +687,19 @@ export function closeTaskTopicRotation({
   return mutateTaskTopicState({
     threadId, home, now,
     mutate: (state) => closePendingTopicGeneration(state, { operationId, reason, now }),
+  });
+}
+
+/** 原子记录 Codex task 当前话题代际的一条有效业务消息。 */
+export function recordTaskTopicActivity({
+  threadId, generationId, eventKey, messageDelta = 1,
+  home = bridgeHome(), now = Date.now(), retryMs,
+} = {}) {
+  return mutateTaskTopicState({
+    threadId, home, now,
+    mutate: (state) => recordTopicGenerationActivity(state, {
+      generationId, eventKey, messageDelta, now, retryMs,
+    }),
   });
 }
 

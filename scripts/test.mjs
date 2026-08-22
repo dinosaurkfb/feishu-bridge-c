@@ -96,11 +96,14 @@ import {
   ROTATION_STATUS, activatePendingTopicGeneration, activeGeneration,
   closePendingTopicGeneration, materializeLegacyTopicFields, pendingGeneration,
   prepareTopicRotation, projectLegacyTopicGeneration, registerPendingTopicGeneration,
-  resolveOutboundGeneration, validateTopicGenerationState,
+  recordTopicGenerationActivity, resolveOutboundGeneration, validateTopicGenerationState,
 } from "./topic-generation.mjs";
 import {
-  prepareClaudeTopicRotation, registerClaudeTopicRotation,
+  prepareClaudeTopicRotation, recordClaudeTopicActivity, registerClaudeTopicRotation,
 } from "./topic-generation-store.mjs";
+import {
+  businessActivitiesForPublishedBatch, launchAutomaticTopicRotation,
+} from "./automatic-topic-rotation.mjs";
 
 let passed = 0;
 let failed = 0;
@@ -192,6 +195,119 @@ test("Topic Generation v1 schema 与运行时常量一致", () => {
   assert.equal(schema.properties.artifact_type.const, "feishu_bridge_topic_generations");
   assert.deepEqual(schema.$defs.generation.properties.status.enum,
     ["pending", "active", "read-only", "retired"]);
+  assert.equal(schema.$defs.activity.properties.auto_rotate_threshold.minimum, 1);
+  assert.equal(schema.$defs.activity.properties.count_mode.const, "business_message_v1");
+});
+
+test("自动轮转按有效消息幂等计数，恰好 30 条时只取得一次尝试权", () => {
+  const projected = projectLegacyTopicGeneration({
+    runtime: "claude", bindingId: "activity-a", rootMessageId: "om_old",
+    sessionId: "session_old", inboundState: "bound", now: NOW,
+  });
+  let state = projected.state;
+  const generationId = state.active_generation_id;
+  for (let index = 1; index <= 29; index += 1) {
+    const counted = recordTopicGenerationActivity(state, {
+      generationId, eventKey: "message-" + index, now: NOW + index,
+    });
+    assert.equal(counted.ok, true);
+    assert.equal(counted.shouldAutoRotate, false);
+    state = counted.state;
+  }
+  const duplicate = recordTopicGenerationActivity(state, {
+    generationId, eventKey: "message-29", now: NOW + 30,
+  });
+  assert.equal(duplicate.counted, false);
+  assert.equal(duplicate.messageCount, 29);
+
+  const threshold = recordTopicGenerationActivity(state, {
+    generationId, eventKey: "message-30", now: NOW + 31,
+  });
+  assert.equal(threshold.messageCount, 30);
+  assert.equal(threshold.shouldAutoRotate, true);
+  assert.equal(threshold.generation.activity.auto_rotation_attempts, 1);
+
+  const cooldown = recordTopicGenerationActivity(threshold.state, {
+    generationId, eventKey: "message-31", now: NOW + 32,
+  });
+  assert.equal(cooldown.messageCount, 31);
+  assert.equal(cooldown.shouldAutoRotate, false, "同一轮失败后不能靠紧邻事件狂建话题");
+  const retry = recordTopicGenerationActivity(cooldown.state, {
+    generationId, eventKey: "message-32", now: NOW + 10 * 60 * 1000,
+  });
+  assert.equal(retry.shouldAutoRotate, true, "冷却后下一条新业务消息可重新申请轮转");
+});
+
+test("pending 阶段不重复触发，轮转后的旧代际迟到结果也不计入新代际", () => {
+  const projected = projectLegacyTopicGeneration({
+    runtime: "claude", bindingId: "activity-b", rootMessageId: "om_old",
+    sessionId: "session_old", inboundState: "bound", now: NOW,
+  });
+  let state = projected.state;
+  const oldId = state.active_generation_id;
+  const counted = recordTopicGenerationActivity(state, {
+    generationId: oldId, eventKey: "local-pair", messageDelta: 2, now: NOW + 1,
+  });
+  assert.equal(counted.messageCount, 2);
+  const prepared = prepareTopicRotation(counted.state, { operationId: "op_activity", now: NOW + 2 });
+  const registered = registerPendingTopicGeneration(prepared.state, {
+    operationId: "op_activity", rootMessageId: "om_new", pendingToken: "abc123", now: NOW + 3,
+  });
+  const whilePending = recordTopicGenerationActivity(registered.state, {
+    generationId: oldId, eventKey: "old-still-active", now: NOW + 4,
+  });
+  assert.equal(whilePending.counted, true);
+  assert.equal(whilePending.shouldAutoRotate, false);
+  const activated = activatePendingTopicGeneration(whilePending.state, {
+    generationId: registered.generation.channel_generation_id,
+    sessionId: "session_new", operationId: "op_activity", now: NOW + 5,
+  });
+  const late = recordTopicGenerationActivity(activated.state, {
+    generationId: oldId, eventKey: "late-old-result", now: NOW + 6,
+  });
+  assert.equal(late.counted, false);
+  assert.equal(late.reason, "generation_not_active");
+  assert.equal(activeGeneration(late.state).activity.message_count, 0);
+});
+
+test("只有最终业务卡片计数；本地输入与回复合并卡计 2，纯进展计 0", () => {
+  assert.deepEqual(businessActivitiesForPublishedBatch([
+    { kind: "milestone", id: "progress" },
+  ], { messageId: "om_progress", runtime: "claude" }), []);
+  const local = businessActivitiesForPublishedBatch([{
+    kind: "reply", event_key: "turn-1", input_origin: "local", input_text: "用户输入",
+  }], { messageId: "om_reply", runtime: "codex" });
+  assert.equal(local.length, 1);
+  assert.equal(local[0].messageDelta, 2);
+  assert.equal(local[0].eventKey, "outbound:codex:turn-1");
+  const inboundReply = businessActivitiesForPublishedBatch([{
+    kind: "reply", run_id: "run-1",
+  }], { messageId: "om_reply_2", runtime: "claude" });
+  assert.equal(inboundReply[0].messageDelta, 1);
+});
+
+test("自动轮转启动器只启动既有两阶段 CLI，不等待、不继承 Aily 入站身份", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "auto-rotation-launch-"));
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  let observed;
+  const result = launchAutomaticTopicRotation({
+    runtime: "codex", root, threadId: "thread-a", home,
+    env: { SAFE_VALUE: "yes", AILY_CLI_AGENT_UID: "must-strip" },
+    spawnImpl: (bin, args, options) => {
+      observed = { bin, args, options };
+      return { pid: 123, unref() { observed.unref = true; } };
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(observed.bin, process.execPath);
+  assert.ok(observed.args.includes("--automatic"));
+  assert.ok(observed.args.includes("--apply"));
+  assert.ok(observed.args.includes("--thread-id"));
+  assert.equal(observed.options.detached, true);
+  assert.equal(observed.options.env.AILY_CLI_AGENT_UID, undefined);
+  assert.equal(observed.options.env.SAFE_VALUE, "yes");
+  assert.equal(observed.unref, true);
 });
 
 test("旧 mapping 投影出的 generation id 与既有 Mapping Policy 完全一致", () => {
@@ -325,6 +441,34 @@ test("Claude registry adapter 在同一份 binding 文档中持久化轮转并�
     generation.root_message_id === "om_old").status, "read-only");
   assert.deepEqual(JSON.parse(fs.readFileSync(regFile, "utf-8")).registry_extension,
     { must_survive: true }, "轮转原子替换不得丢掉未知的 registry 顶层字段");
+});
+
+test("Claude registry adapter 原子持久化代际计数，重复事件不增量", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "topic-activity-claude-"));
+  const root = path.join(local, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const regFile = path.join(local, "registry.json");
+  const entry = newRegistryEntry({
+    root, name: "Claude Activity", purpose: null, token: "aaa111",
+    rootMessageId: "om_old", now: NOW,
+  });
+  fs.writeFileSync(regFile, JSON.stringify({ schema_version: "1.0", projects: [entry] }));
+  promoteBinding({
+    root, id: entry.id, source: "registry", generationId: entry.channel_generation_id,
+    sessionId: "session_old", registryFile: regFile, now: NOW + 1,
+  });
+  const first = recordClaudeTopicActivity({
+    root, generationId: entry.channel_generation_id, eventKey: "msg-one",
+    registryFile: regFile, now: NOW + 2,
+  });
+  const duplicate = recordClaudeTopicActivity({
+    root, generationId: entry.channel_generation_id, eventKey: "msg-one",
+    registryFile: regFile, now: NOW + 3,
+  });
+  assert.equal(first.messageCount, 1);
+  assert.equal(duplicate.counted, false);
+  assert.equal(JSON.parse(fs.readFileSync(regFile, "utf-8"))
+    .projects[0].topic_generation_state.generations[0].activity.message_count, 1);
 });
 
 // ---------- Mapping Policy：公共准入、处置与 runtime-neutral runRequest ----------
@@ -2588,6 +2732,7 @@ test("status 只读，且不把话题 id 之类的 locator 打进人类可读输
   const st = currentBinding({ root: proj, ...f });
   const text = describeStatus(st, bindingsForRoot({ root: proj, registryFile: f.registryFile }));
   assert.ok(text.includes("已接入"));
+  assert.match(text, /自动轮转\s+0 \/ 30 条有效业务消息/u);
   assert.ok(!text.includes("om_demo"), "话题 id 是 locator，不该出现在状态输出里");
   assert.ok(!text.includes("session_x"), "Aily session 同理");
 });
@@ -2608,6 +2753,7 @@ test("status 明确说明只读旧话题仍会接收轮转前受理的迟到结�
     pending: 0,
   });
   assert.match(text, /只读历史.*轮转前受理的结果仍会发回原话题/u);
+  assert.match(text, /自动轮转\s+0 \/ 30 条有效业务消息/u);
 });
 
 test("暂停把出站和入站同时关掉 —— 靠的是两边本来就在看的那个字段", () => {

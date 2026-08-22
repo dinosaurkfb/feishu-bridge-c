@@ -60,6 +60,8 @@ export function currentBinding({ root, claudeSessionId, registryFile, templateFi
     displayName: resolved.config?.task_display_name ?? path.basename(root),
     pending,
     activeGeneration: activeTopic?.generation ?? null,
+    activeGenerationMessages: activeTopic?.activity?.message_count ?? 0,
+    activeGenerationThreshold: activeTopic?.activity?.auto_rotate_threshold ?? 30,
     pendingGeneration: pendingTopic?.generation ?? null,
     pendingGenerationExpiresAt: pendingTopic?.claim_expires_at ?? null,
     readOnlyGenerations: topicState?.generations?.filter((generation) =>
@@ -164,6 +166,12 @@ export function describeStatus(st, others = []) {
     ? "这条工作线单独绑定（会话 " + String(st.claudeSessionId).slice(0, 8) + "）"
     : "整个项目共用一个话题"));
   lines.push("当前代际  " + (st.activeGeneration === null ? "尚未完成首次认领" : "第 " + st.activeGeneration + " 代"));
+  if (st.activeGeneration !== null) {
+    const messages = Number.isInteger(st.activeGenerationMessages) ? st.activeGenerationMessages : 0;
+    const threshold = Number.isInteger(st.activeGenerationThreshold) ? st.activeGenerationThreshold : 30;
+    lines.push("自动轮转  " + messages + " / " + threshold +
+      " 条有效业务消息");
+  }
   if (st.pendingGeneration !== null) {
     lines.push("待认领    第 " + st.pendingGeneration + " 代" +
       (st.pendingGenerationExpiresAt ? "（截止 " + st.pendingGenerationExpiresAt + "）" : ""));

@@ -30,6 +30,7 @@ import {
   shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
 import { closeClaudeTopicRotation } from "./topic-generation-store.mjs";
+import { recordClaudeActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 
@@ -275,7 +276,9 @@ const verdict = evaluateMappingAdmission({
 // session，好把它写进绑定。这时候回「消息里没有指令正文」是句没用的实话：
 // 它描述了现象，却把一次成功说成了失败。
 if (justBound && verdict.decision === "reject" && verdict.reason === REJECT.EMPTY_INSTRUCTION) {
-  appendConsumed(routed.root, event.message_id);
+  appendConsumed(routed.root, event.message_id, {
+    claudeSessionId: routed.mapping?.claude_session_id ?? null,
+  });
   writeReceipt("bound-" + event.message_id, {
     status: "bound", message_id: event.message_id, session_id: event.session_id,
     root: routed.root, binding_id: mapping.binding_id,
@@ -347,6 +350,7 @@ const claim = acquireClaim({
     policy_version: verdict.policy_version,
     local_target_id: mappingContext.localTargetId,
     origin_channel_generation_id: mappingContext.originChannelGenerationId,
+    claude_session_id: mapping.claude_session_id ?? null,
     mapping_admission_shadow_match: verdict.admission_shadow?.match ?? null,
   },
 });
@@ -521,8 +525,20 @@ if (routed.source === "project-files") {
   fs.writeFileSync(mtmp, JSON.stringify(mapping, null, 2) + "\n", { mode: 0o600 });
   fs.renameSync(mtmp, mappingPath);
 } else {
-  appendConsumed(routed.root, verdict.messageId);
+  appendConsumed(routed.root, verdict.messageId, {
+    claudeSessionId: routed.mapping?.claude_session_id ?? null,
+  });
 }
+
+// 只有通过全部入站闸门并已经 handoff 的真实人类指令才计入当前话题代际。
+// 计数/自动轮转失败不回滚已成功投递的业务指令；结果会留在 accepted receipt 里供诊断。
+const topicActivity = recordClaudeActivityAndMaybeRotate({
+  root: routed.root,
+  claudeSessionId: routed.mapping?.claude_session_id ?? null,
+  generationId: mappingRun.runRequest.origin.channelGenerationId,
+  eventKey: "inbound:claude:" + verdict.messageId,
+  messageDelta: 1,
+});
 
 writeReceipt("accepted-" + verdict.messageId, {
   status: "accepted", message_id: verdict.messageId, claim_key: claim.key,
@@ -550,6 +566,12 @@ writeReceipt("accepted-" + verdict.messageId, {
   delivery_mode: run.mode,
   target_session_id: run.targetSessionId ?? null,
   target_session_name: run.targetName ?? null,
+  topic_activity: topicActivity.ok ? {
+    counted: topicActivity.counted === true,
+    message_count: topicActivity.messageCount ?? null,
+    auto_rotation_requested: topicActivity.shouldAutoRotate === true,
+    auto_rotation_launched: topicActivity.rotationLaunch?.ok ?? null,
+  } : { counted: false, reason: topicActivity.reason },
   ...(subscriptionClaimShadow ? { subscription_claim_shadow: subscriptionClaimShadow } : {}),
 });
 

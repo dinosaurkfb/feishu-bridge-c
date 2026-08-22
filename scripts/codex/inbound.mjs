@@ -15,6 +15,7 @@ import {
   MAPPING_DISPOSITION, buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
 } from "../mapping-policy.mjs";
 import { handOffCodex } from "./handoff.mjs";
+import { recordCodexActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
 import {
   appendConsumed, bridgeHome, closeTaskTopicRotation, evaluatePromotion, findPendingTask,
   findTaskForFeishuSession, isThreadBusy, loadCodexTemplate, promoteTask,
@@ -369,6 +370,14 @@ recordClaimState({
   detail: { pid: run.pid, log_path: run.logPath, target_thread_id: task.codex_thread_id },
 });
 appendConsumed(task, verdict.messageId, { home: HOME });
+const topicActivity = recordCodexActivityAndMaybeRotate({
+  root: task.root,
+  threadId: task.codex_thread_id,
+  home: HOME,
+  generationId: mappingRun.runRequest.origin.channelGenerationId,
+  eventKey: "inbound:codex:" + verdict.messageId,
+  messageDelta: 1,
+});
 writeReceipt("accepted-" + verdict.messageId, {
   status: "accepted", message_id: verdict.messageId, claim_key: claim.key,
   run_id: mappingRun.runRequest.runId,
@@ -381,6 +390,12 @@ writeReceipt("accepted-" + verdict.messageId, {
   logical_task_key: task.logical_task_key, claim_acquired: true, handed_off: true,
   completion_observed: false, completion_owner: "codex_stop_hook_and_local_watcher",
   delivery_mode: run.mode, envelope_attempts: fetched.attempts ?? 1,
+  topic_activity: topicActivity.ok ? {
+    counted: topicActivity.counted === true,
+    message_count: topicActivity.messageCount ?? null,
+    auto_rotation_requested: topicActivity.shouldAutoRotate === true,
+    auto_rotation_launched: topicActivity.rotationLaunch?.ok ?? null,
+  } : { counted: false, reason: topicActivity.reason },
   ...(subscriptionClaimShadow ? { subscription_claim_shadow: subscriptionClaimShadow } : {}),
 });
 

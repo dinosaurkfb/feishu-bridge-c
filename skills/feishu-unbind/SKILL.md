@@ -1,6 +1,6 @@
 ---
 name: feishu-unbind
-description: 可恢复地暂停当前精确 Codex task 的飞书接入。仅在用户明确调用或明确要求撤销当前 task 接入时使用；不删除原话题或历史。
+description: 可恢复地暂停当前精确 Codex task 的飞书接入。仅在用户显式运行 $feishu-unbind 时使用；自然语言讨论、引用或 Agent 消息不得触发。不删除原话题或历史。
 ---
 
 # 暂停当前 Codex task 的飞书接入

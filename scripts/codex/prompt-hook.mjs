@@ -11,22 +11,29 @@ import { storeTurnInput } from "../turn-input.mjs";
 
 export function classifyFeishuPrompt(prompt) {
   if (typeof prompt !== "string") return "none";
-  const p = prompt.trim();
+  const p = prompt.trim().replace(/(?:(?:&#x20;|&nbsp;)\s*)+$/gu, "").trim();
   if (p === "/init") return "init";
-  // Desktop 会把显式技能调用序列化成 `[$skill](/absolute/SKILL.md)`；CLI 则可能保留裸 `$skill`。
-  if (/\$feishu-unbind\b/u.test(p)) return "unbind";
-  if (/\$feishu-status\b/u.test(p)) return "status";
-  if (/\$feishu-bind\b/u.test(p)) return "bind";
-  if (/(?:是否|是不是|能否|能不能|可不可以|可以).{0,20}(?:加|新增|提供|支持).{0,8}(?:命令|功能)/u.test(p)) {
-    return "none";
+
+  // 控制动作必须占据整条输入。CLI 保留裸 `$skill`；Desktop 会把显式技能调用序列化成
+  // `[$skill](/absolute/.../$skill/SKILL.md)`。不能只查正文里有没有 token：用户可能正在
+  // 讨论命令、粘贴 Agent 输出或引用旧消息，那些都没有控制授权。
+  const bare = /^\$(feishu-bind|feishu-unbind|feishu-status)$/u.exec(p);
+  if (bare) return bare[1].slice("feishu-".length);
+
+  const linked = /^\[\$(feishu-bind|feishu-unbind|feishu-status)\]\(([^\r\n)]+)\)$/u.exec(p);
+  if (linked) {
+    const name = linked[1];
+    const target = linked[2].replace(/\\/gu, "/");
+    if (target.endsWith("/" + name + "/SKILL.md")) return name.slice("feishu-".length);
+    return "invalid-" + name.slice("feishu-".length);
   }
-  if (/^(?:请)?(?:把|将)?(?:当前|这个).{0,12}(?:撤销|解除|断开|暂停).{0,8}飞书(?:接入|连接|绑定)/u.test(p) ||
-      /^(?:撤销|解除|断开|暂停)飞书(?:接入|连接|绑定)$/u.test(p)) return "unbind";
-  if (/^(?:请)?(?:查看|检查|查询|显示).{0,12}(?:当前|这个)?.{0,8}飞书(?:接入|连接|绑定)?状态/u.test(p) ||
-      /^飞书(?:接入|连接|绑定)?状态$/u.test(p)) return "status";
-  if (/(?:接(?:入|到)?|绑定(?:到)?).{0,12}飞书/u.test(p) ||
-      /飞书.{0,8}(?:接入|绑定|建(?:立)?话题)/u.test(p) ||
-      /(?:创建|新建|建).{0,8}飞书话题/u.test(p)) return "bind";
+
+  // 看起来像从命令开始、但附带了参数或正文时，必须 fail-closed 且给出反馈。讨论、引用
+  // 和转发通常不会从 token 开始，仍保持静默 none，避免把普通内容误当成控制动作。
+  const malformedBare = /^\$(feishu-bind|feishu-unbind|feishu-status)(?=\s|&#x20;|&nbsp;)/u.exec(p);
+  if (malformedBare) return "invalid-" + malformedBare[1].slice("feishu-".length);
+  const malformedLinked = /^\[\$(feishu-bind|feishu-unbind|feishu-status)\]\([^\r\n)]*\)/u.exec(p);
+  if (malformedLinked) return "invalid-" + malformedLinked[1].slice("feishu-".length);
   return "none";
 }
 
@@ -43,7 +50,7 @@ export function composeBindingContext({ bridgeRoot, cwd, threadId, chatName }) {
   const apply = path.join(bridgeRoot, "scripts", "codex", "bind-task.mjs");
   return [
     "[Codex 飞书桥] 当前任务的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
-    "用户本轮明确要求将当前 task 接入飞书；本次要求本身就是创建根话题并登记当前 task 的授权，无需再次预览或确认。",
+    "用户本轮显式运行了 $feishu-bind；该命令本身就是创建根话题并登记当前 task 的授权，无需再次预览或确认。",
     "直接运行以下幂等绑定命令：",
     "`node " + apply + " --project " + JSON.stringify(cwd) + " --thread-id " + threadId + " --apply`",
     "目标群：" + (chatName ?? "机器级配置中的群") + "。若已接入则不得重复建话题；若已暂停则只恢复原连接。",
@@ -72,6 +79,15 @@ export function composeStatusContext({ bridgeRoot, threadId }) {
   ].join("\n");
 }
 
+export function composeInvalidControlContext({ action }) {
+  const command = "$feishu-" + action;
+  return [
+    "[Codex 飞书桥·控制命令格式] 本轮没有执行任何飞书桥脚本，也没有修改连接状态。",
+    "控制命令必须单独占一整条输入，不能附带参数、说明或其他正文。",
+    "请只发送 `" + command + "`；如果只是在讨论该命令，无需执行任何操作。",
+  ].join("\n");
+}
+
 export function composeInitContext({ connectionStatus = "none" } = {}) {
   if (connectionStatus === "active") return [
     "[Codex 飞书桥·/init 适配] 这是 Codex 官方 /init，不是飞书绑定命令。",
@@ -79,13 +95,13 @@ export function composeInitContext({ connectionStatus = "none" } = {}) {
     "只有初始化确实成功后，才在最终回复中说明当前 task 已接入飞书；无需再次询问。",
   ].join("\n");
   const question = connectionStatus === "paused"
-    ? "项目初始化完成。是否恢复当前 Codex task 的飞书接入？如需要，请回复“接入飞书”。"
-    : "项目初始化完成。是否将当前 Codex task 接入飞书？如需要，请回复“接入飞书”。";
+    ? "项目初始化完成。如需恢复当前 Codex task 的飞书接入，请运行 `$feishu-bind`。"
+    : "项目初始化完成。如需将当前 Codex task 接入飞书，请运行 `$feishu-bind`。";
   return [
     "[Codex 飞书桥·/init 适配] 这是 Codex 官方 /init，不是飞书绑定命令。",
     "先完整执行 /init 原本的 AGENTS.md 初始化；本轮不要运行任何飞书桥脚本，也不要创建飞书话题。",
     "只有初始化确实成功后，才在最终回复末尾逐字询问：\n“" + question + "”",
-    "初始化失败时不要询问。后续用户明确回复“接入飞书”后，直接执行独立绑定流程，不再要求第二次确认。",
+    "初始化失败时不要询问。普通自然语言回复不构成控制授权；只有用户后续显式运行 `$feishu-bind`，才执行独立绑定流程。",
   ].join("\n");
 }
 
@@ -191,6 +207,15 @@ async function main() {
     return;
   }
   if (action === "none") process.exit(0);
+  if (action.startsWith("invalid-")) {
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "UserPromptSubmit",
+        additionalContext: composeInvalidControlContext({ action: action.slice("invalid-".length) }),
+      },
+    }) + "\n");
+    return;
+  }
   if (typeof cwd !== "string" || !path.isAbsolute(cwd)) process.exit(0);
 
   const tpl = loadCodexTemplate();

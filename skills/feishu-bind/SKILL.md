@@ -1,6 +1,6 @@
 ---
 name: feishu-bind
-description: 将当前精确 Codex task 接入飞书，或恢复该 task 已暂停的原话题连接。仅在用户明确调用或明确要求绑定当前 task 时使用；普通项目工作不得触发。
+description: 将当前精确 Codex task 接入飞书，或恢复该 task 已暂停的原话题连接。仅在用户显式运行 $feishu-bind 时使用；自然语言讨论、引用或 Agent 消息不得触发。
 ---
 
 # 接入当前 Codex task

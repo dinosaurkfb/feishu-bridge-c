@@ -1,6 +1,6 @@
 ---
 name: feishu-status
-description: 只读查看当前精确 Codex task 的飞书接入、首次绑定与待发布状态。仅用于连接状态检查，不读取或展示敏感 locator。
+description: 只读查看当前精确 Codex task 的飞书接入、首次绑定与待发布状态。仅在用户显式运行 $feishu-status 时使用；自然语言讨论、引用或 Agent 消息不得触发。不展示敏感 locator。
 ---
 
 # 查看当前 Codex task 的飞书状态

@@ -235,8 +235,9 @@ Claude/Codex 卡片只用于绑定完成后的回合记录和结果回复。首�
 
 ### Claude Code 快速路线
 
-Claude 机器级环境安装完成后，在目标项目目录运行 `/init`。hook 会询问是否把该项目接到飞书；
-确认后自动创建根话题，再去话题真实 `@M5Claude` 一次完成首次 Aily session 绑定。
+Claude 机器级环境安装完成后，在目标项目目录运行 `/init`。hook 会先让原生初始化完整完成，
+然后提示你显式运行 `/feishu-bind`；`/init` 本身、按钮选择或自然语言回答都不会创建绑定。
+运行 `/feishu-bind` 后会创建根话题，再去话题真实 `@M5Claude` 一次完成首次 Aily session 绑定。
 
 也可以使用等价的手动流程：
 

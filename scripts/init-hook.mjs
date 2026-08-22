@@ -1,15 +1,13 @@
 #!/usr/bin/env node
 /**
- * `/init` 时问一句：要不要给这个项目在飞书群里建个根话题？
+ * `/init` 完成后提示显式运行 `/feishu-bind`，但本轮绝不创建绑定。
  *
  * 为什么挂在 /init 上：接入需要一个「这是个正经项目」的声明。用环境去猜（有没有
  * CLAUDE.md、在不在某个父目录下）一定会误判 —— CLAUDE.md 在本机太多目录里都有，
  * 每个都建话题就是刷屏。而 `/init` 不是检测，**它就是 Frank 亲口说的那句声明**。
  *
- * 为什么钩子不自己建、而是让模型去问：钩子只有 stdin/stdout 的 JSON，弹不出选择框。
- * 但它能往这一轮里注入一段上下文，而模型手上有真正的提问工具，能渲染带默认值的选项。
- * 分工是：**该确定的地方（触发）由钩子保证**，不靠模型记得；只有「问」交给模型，
- * 而问漏了的代价是零 —— Frank 补一条命令就是了。
+ * `/init` 不是控制授权。即使模型能渲染结构化选择框，也不能借一次「是」绕开独立的
+ * `/feishu-bind` 控制命令；这样 Claude 与 Codex 的控制面语义完全一致。
  *
  * 硬约束，跟 Stop 钩子同一条：**永远 exit 0，永远不抛**。
  * 这个钩子比 Stop 更热 —— 它跑在本机每一次**提交 prompt** 上。已绑定项目会在这里
@@ -30,35 +28,18 @@ export function isInitPrompt(prompt) {
 }
 
 /**
- * 注入给模型的那段话。
- *
- * 刻意写死三件事：**等 CLAUDE.md 写完再问**（`/init` 之前问，项目叫什么、干什么
- * 都还不存在，建出来的话题只有一个路径）；**答否就别再问**；
- * **在 Frank 真的去新话题 @ 过之前别说入站通了**。最后一条是这个项目的老纪律，
- * 模型很容易把「接入命令跑完了」顺口说成「整条链路都好了」。
+ * 注入给模型的控制边界。只允许在原生初始化成功后提示下一条显式命令；不预览、
+ * 不提问、不执行脚本，也不把自然语言回复升级成写入授权。
  */
-export function composeAsk({ cwd, bridgeRoot, chatName }) {
+export function composeAsk() {
   return [
-    "[飞书桥] 这个目录还没有接飞书话题。",
+    "[飞书桥·/init 适配] 这是 Claude Code 官方 /init，不是飞书绑定命令。",
     "",
-    "**等你把 CLAUDE.md 写完之后**（不是现在），做两件事：",
-    "",
-    "1. 先跑这条看文案（已放行，不会弹权限；它只打印，发不了任何东西）：",
-    "   `node " + bridgeRoot + "/scripts/bind-preview.mjs --project " + cwd + "`",
-    "2. 把它打印的根消息原样给 Frank 看，然后问一句：",
-    "   要不要在飞书群「" + (chatName ?? "（机器级配置里的那个群）") + "」里给这个项目建一个根话题？**默认「是」。**",
-    "",
-    "- 答是 → 跑 `node " + bridgeRoot + "/scripts/bind-project.mjs --project " + cwd + " --apply`",
-    "  这条会弹权限确认 —— **那是应该的**，往群里发一条撤不掉的消息本来就该有人点头。",
-    "- 答否 → 什么都不做，这一轮里也不要再问第二次。",
-    "",
-    "**任何一条跑不了，就把命令交给他，不要自己还原文案。**读 bind-project.mjs 的源码把",
-    "根消息「逐字还原」一遍是错的：还原出来的东西看着像脚本输出，其实是你算的，",
-    "差一个字他就是照着一份假预览点的头。拦下了就直说，让他自己敲 `! node …`。",
-    "",
-    "接入之后：出站立刻可用（本机输入与每轮回答会合成卡片自动发到那个话题）。",
-    "入站还差最后一下 —— 让 Frank 去那个新话题里 @ 一下运输 agent（空消息也行），",
-    "绑定就完成了。**在他真的 @ 过之前，别说入站通了。**",
+    "先完整执行 /init 原本的 CLAUDE.md 初始化；本轮不要运行任何飞书桥脚本，也不要创建或修改绑定。",
+    "不要调用 AskUserQuestion 询问是否绑定，也不要把按钮、自然语言答复或默认选项解释成控制授权。",
+    "只有初始化确实成功后，才在最终回复末尾逐字提示：",
+    "“项目初始化完成。如需将当前项目接入飞书，请显式运行 `/feishu-bind`。”",
+    "初始化失败时不要提示。只有用户后续单独运行 `/feishu-bind`，才进入独立绑定流程。",
   ].join("\n");
 }
 
@@ -122,10 +103,9 @@ async function main() {
   // 没有机器级模板就等于这台机器没装桥 —— 不该在这里教人怎么装，静默退出。
   if (!tpl.ok) process.exit(0);
 
-  const bridgeRoot = tpl.template.bridge_root;
-  if (typeof bridgeRoot !== "string" || !bridgeRoot) process.exit(0);
+  if (typeof tpl.template.bridge_root !== "string" || !tpl.template.bridge_root) process.exit(0);
 
-  const context = composeAsk({ cwd, bridgeRoot, chatName: tpl.template.chat_name });
+  const context = composeAsk();
   process.stdout.write(JSON.stringify({
     hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: context },
   }) + "\n");
@@ -135,13 +115,7 @@ async function main() {
 if (import.meta.url === "file://" + process.argv[1]) {
   // --self-test：喂一条合成 payload，把会注入的内容打出来。不读 stdin、不碰会话。
   if (process.argv.includes("--self-test")) {
-    const { loadChainTemplate } = await import("./chain-template.mjs");
-    const tpl = loadChainTemplate();
-    console.log(composeAsk({
-      cwd: process.argv[process.argv.indexOf("--self-test") + 1] ?? process.cwd(),
-      bridgeRoot: tpl.ok ? tpl.template.bridge_root : "<机器级模板还没生成>",
-      chatName: tpl.ok ? tpl.template.chat_name : null,
-    }));
+    console.log(composeAsk());
     process.exit(0);
   }
   main().catch(() => process.exit(0)); // 桥的故障绝不外溢到别人的会话

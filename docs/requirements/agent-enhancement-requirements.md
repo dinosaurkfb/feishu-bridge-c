@@ -273,7 +273,7 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 | 能力 | 当前 main | 本次目标 |
 |---|---|---|
 | Aily → 本机 endpoint | Claude/Codex 均可用 | 统一 endpoint 状态模型 |
-| hook 强制进入运输层 | Claude 在 `c81a6c2` 接入 hook + dispatcher，仅完成 1 条真实消息验证；Codex 有强制 hook，尚未接入同一 dispatcher 契约 | 两端统一 dispatcher/handler 契约并扩大真实验证样本 |
+| hook 强制进入运输层 | Claude 在 `c81a6c2` 接入 hook + dispatcher；Codex 的统一 dispatcher/无损 Canonical Event 候选已在 `feat/codex-inbound-dispatcher-contract` 完成本地回归，尚未正式安装和真实验收 | 评审候选、单独安装并扩大两端真实验证样本 |
 | 项目—群订阅 | 隐含在模板和 binding 中 | 独立 subscription 实体与命令 |
 | 精确话题—会话绑定 | 已支持，Codex/Claude 语义略有差异 | 统一生命周期与 ID 模型 |
 | 映射模式 | 核心链路已实现 | 形成正式 policy handler |

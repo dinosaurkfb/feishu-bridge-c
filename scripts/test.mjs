@@ -62,6 +62,11 @@ import {
 } from "./inbound-routes.mjs";
 import { ENVELOPE_ENV as ENV_PASS, inheritedEvent } from "./envelope.mjs";
 import {
+  CANONICAL_EVENT_ENV as CANONICAL_PASS, buildCanonicalEvent, inheritedCanonicalEvent,
+  legacyEventFromCanonical, validateCanonicalEvent,
+} from "./canonical-event.mjs";
+import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
+import {
   MAX_LOCAL_INPUT_CHARS, claudeTurnInputDir, clearTurnInput, isFeishuStampedInput,
   readTurnInput, storeTurnInput,
 } from "./turn-input.mjs";
@@ -1094,6 +1099,8 @@ test("第一次就查到 → 不重试", () => {
   const { result, tries } = fetchWith([userEnvelope("msg_a")]);
   assert.equal(result.ok, true);
   assert.equal(result.event.message_id, "msg_a");
+  assert.deepEqual(result.raw_envelope, JSON.parse(userEnvelope("msg_a")).envelopes[0],
+    "取信封时必须把被选中的 Aily envelope 原样带给 dispatcher");
   assert.equal(tries, 1, "查到了还重试是白白拖慢回执");
 });
 
@@ -2634,6 +2641,140 @@ test("继承的信封结构不完整 → 当没有，回落到自己取", () => 
   }
 });
 
+test("Canonical Event 同时保留规范字段和无损 Aily envelope", () => {
+  const raw = {
+    type: "message.create",
+    payload: JSON.stringify({ message: { id: "m-canonical" }, future_field: { nested: true } }),
+    transport_extension: ["future", 1],
+  };
+  const built = buildCanonicalEvent({
+    event: {
+      message_id: "m-canonical", session_id: "s-canonical", sender_id: "frank",
+      created_at_ms: NOW, content: at(M5CODEX) + " 继续开发",
+    },
+    rawEnvelope: raw,
+    endpointId: "m5codex",
+    callerAgentUid: "agent_m5codex",
+    fetchAttempts: 3,
+    env: { AILY_CLI_CHANNEL_CHAT_ID: "unverified-chat", AILY_CLI_CHANNEL_THREAD_ID: "unverified-thread" },
+  });
+  assert.equal(built.ok, true);
+  assert.equal(built.event.source.session_id, "s-canonical");
+  assert.equal(built.event.source.chat_id, null,
+    "未验证的 Aily channel 变量不得升级成 selector 可用的 locator");
+  assert.equal(built.event.extensions.aily_channel.chat_id, "unverified-chat");
+  assert.equal(built.event.extensions.aily_channel.verified, false);
+  assert.deepEqual(built.event.raw_envelope.payload, raw, "未知字段和 payload 原始形状都不能丢");
+  assert.deepEqual(built.event.mention.target_open_ids, [M5CODEX]);
+  assert.equal(built.event.extensions.dispatcher.fetch_attempts, 3);
+  assert.deepEqual(legacyEventFromCanonical(built.event), {
+    message_id: "m-canonical", session_id: "s-canonical", sender_id: "frank",
+    created_at_ms: NOW, content: at(M5CODEX) + " 继续开发",
+  });
+});
+
+test("Canonical Event 继承路径不重新访问 Aily", () => {
+  const built = buildCanonicalEvent({
+    event: { message_id: "m-inherited", session_id: "s-inherited", sender_id: "frank",
+      created_at_ms: NOW, content: "hi" },
+    rawEnvelope: { type: "message.create", payload: "opaque" },
+    endpointId: "m5codex", callerAgentUid: "agent_m5codex", fetchAttempts: 2,
+  });
+  assert.equal(built.ok, true);
+  const env = { [CANONICAL_PASS]: JSON.stringify(built.event) };
+  assert.deepEqual(inheritedCanonicalEvent(env), built.event);
+  const fetched = fetchTriggerEvent(env, { runner: () => { throw new Error("不该重新取 Aily"); } });
+  assert.equal(fetched.ok, true);
+  assert.equal(fetched.inherited, true);
+  assert.equal(fetched.attempts, 2);
+  assert.equal(fetched.event.message_id, "m-inherited");
+  assert.deepEqual(fetched.raw_envelope, built.event.raw_envelope.payload);
+});
+
+test("Canonical Event 缺必填字段时必须在 dispatcher 边界拒绝", () => {
+  const invalid = {
+    schema_version: "1.0", event_id: "m", event_type: "im.message.receive",
+    occurred_at: new Date(NOW).toISOString(), endpoint_id: "m5codex",
+    source: { session_id: "s" }, actor: {}, content: { text: "x", origin: "feishu" },
+    raw_envelope: { format: "aily-trigger-event/v1", payload: {} },
+  };
+  assert.equal(validateCanonicalEvent(invalid).ok, false);
+  assert.ok(validateCanonicalEvent(invalid).problems.includes("actor.sender_id"));
+  assert.equal(inheritedCanonicalEvent({ [CANONICAL_PASS]: JSON.stringify(invalid) }), null);
+});
+
+test("共享 dispatcher 只取一次信封并把 Canonical Event 原样交给 handler", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-dispatcher-"));
+  const handler = path.join(dir, "handler.mjs");
+  fs.writeFileSync(handler, "// fixture\n");
+  let fetches = 0;
+  let spawned = null;
+  const out = [];
+  const err = [];
+  const raw = { type: "message.create", payload: "{\"unknown\":true}" };
+  const result = runInboundDispatcher({
+    endpointId: "m5codex",
+    expectedCallerAgentUid: "agent_expected",
+    defaultRoute: { id: "codex", handler },
+    routesFile: path.join(dir, "missing-routes.json"),
+    env: { AILY_CLI_CALLER_AGENT_UID: "agent_expected" },
+    stdout: { write: (s) => out.push(s) }, stderr: { write: (s) => err.push(s) },
+    fetcher: () => {
+      fetches += 1;
+      return { ok: true, attempts: 4, raw_envelope: raw, event: {
+        message_id: "m-dispatch", session_id: "s-dispatch", sender_id: "frank",
+        created_at_ms: NOW, content: "执行",
+      } };
+    },
+    spawnHandler: (...args) => { spawned = args; return { status: 0 }; },
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(fetches, 1);
+  assert.equal(spawned[0], process.execPath);
+  assert.deepEqual(spawned[1], [handler]);
+  assert.deepEqual(spawned[2].stdio, ["ignore", "inherit", "inherit"]);
+  assert.equal(spawned[2].timeout, 30_000);
+  assert.equal(Object.hasOwn(spawned[2].env, ENV_PASS), false,
+    "新 dispatcher 不该同时维护第二份有损事件环境变量");
+  const passed = JSON.parse(spawned[2].env[CANONICAL_PASS]);
+  assert.equal(passed.event_id, "m-dispatch");
+  assert.deepEqual(passed.raw_envelope.payload, raw);
+  assert.equal(passed.extensions.dispatcher.fetch_attempts, 4);
+  assert.deepEqual(out, []);
+  assert.deepEqual(err, []);
+});
+
+test("dispatcher 在调用方不匹配时连 Aily 都不读取", () => {
+  let fetches = 0;
+  const result = runInboundDispatcher({
+    endpointId: "m5codex", expectedCallerAgentUid: "expected",
+    defaultRoute: { id: "codex", handler: "/not-used" },
+    env: { AILY_CLI_CALLER_AGENT_UID: "other" },
+    stdout: { write() {} }, stderr: { write() {} },
+    fetcher: () => { fetches += 1; return { ok: false }; },
+  });
+  assert.equal(result.kind, "rejected");
+  assert.equal(fetches, 0);
+});
+
+test("dispatcher 把 handler 超时与启动失败区分开", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-dispatcher-timeout-"));
+  const handler = path.join(dir, "handler.mjs");
+  fs.writeFileSync(handler, "// fixture\n");
+  const outputs = [];
+  const result = runInboundDispatcher({
+    endpointId: "m5codex", expectedCallerAgentUid: "expected",
+    defaultRoute: { id: "codex", handler }, routesFile: path.join(dir, "none.json"),
+    env: { AILY_CLI_CALLER_AGENT_UID: "expected" },
+    stdout: { write: (s) => outputs.push(s) }, stderr: { write() {} },
+    fetcher: () => ({ ok: true, event: { message_id: "m", session_id: "s", sender_id: "u",
+      created_at_ms: NOW, content: "x" }, raw_envelope: { type: "message.create", payload: {} } }),
+    spawnHandler: () => ({ error: Object.assign(new Error("timeout"), { code: "ETIMEDOUT" }) }),
+  });
+  assert.equal(result.reason, "handler_timeout");
+  assert.ok(outputs.join("").includes("响应超时"));
+});
+
 // ---------- 入站钩子：让「先进运输层」成为硬约束 ----------
 
 const AILY_ENV = { AILY_CLI_SESSION_ID: "s", AILY_CLI_CALLER_AGENT_UID: "agent_x" };
@@ -2676,10 +2817,12 @@ test("钩子和技能指向同一个入口 —— 绝不能各指一套", () => 
 });
 
 test("分发器自己不加一个字：stdout 原样透出", () => {
-  const src = fs.readFileSync(path.resolve("scripts", "aily-inbound.mjs"), "utf-8");
+  const src = fs.readFileSync(path.resolve("scripts", "inbound-dispatcher.mjs"), "utf-8");
   assert.ok(src.includes('stdio: ["ignore", "inherit", "inherit"]'),
     "handler 的 stdout 必须直通，分发器插一句嘴 Frank 就分不清是谁的判断");
-  assert.ok(src.includes("ENVELOPE_ENV"), "必须把取好的信封传下去");
+  assert.ok(src.includes("CANONICAL_EVENT_ENV"), "必须把取好的无损 Canonical Event 传下去");
+  const claude = fs.readFileSync(path.resolve("scripts", "aily-inbound.mjs"), "utf-8");
+  assert.ok(claude.includes("runInboundDispatcher"), "Claude 薄入口也必须复用同一个 dispatcher 核心");
 });
 
 test("入站钩子进来就记日志，记完再判闸", () => {

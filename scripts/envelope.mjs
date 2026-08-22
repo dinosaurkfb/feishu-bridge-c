@@ -15,6 +15,8 @@
 
 import { execFileSync } from "node:child_process";
 
+import { inheritedCanonicalEvent, legacyEventFromCanonical } from "./canonical-event.mjs";
+
 export const ENV = {
   SESSION: "AILY_CLI_SESSION_ID",
   RUN: "AILY_CLI_RUN_ID",
@@ -101,6 +103,18 @@ export function inheritedEvent(env = process.env) {
 }
 
 export function fetchTriggerEvent(env = process.env, { runner = runAily, sleep = sleepSync } = {}) {
+  // 新 dispatcher 传的是无损 Canonical Event。handler 仍可消费旧事件视图，但不得重新取信封。
+  const canonical = inheritedCanonicalEvent(env);
+  if (canonical) {
+    return {
+      ok: true,
+      event: legacyEventFromCanonical(canonical),
+      canonical_event: canonical,
+      raw_envelope: canonical.raw_envelope.payload,
+      attempts: canonical.extensions?.dispatcher?.fetch_attempts ?? 0,
+      inherited: true,
+    };
+  }
   // 分发器已经取好就直接用，不再打一次网络。见 ENVELOPE_ENV 的说明。
   const inherited = inheritedEvent(env);
   if (inherited) return { ok: true, event: inherited, attempts: 0, inherited: true };
@@ -171,6 +185,9 @@ function attemptFetch(args, sessionId, runner) {
           created_at_ms: at,
           content: msg.content ?? "",
         },
+        // 只保留被选中的那一份原始 Aily envelope，避免把整页历史带进子进程。
+        // payload 若原来是字符串就继续是字符串；无损不等于重新序列化成另一种形状。
+        raw_envelope: e,
       };
     }
   }
@@ -178,5 +195,5 @@ function attemptFetch(args, sessionId, runner) {
   if (latest === null) {
     return { ok: false, reason: "no_user_message_in_session", envelopes_seen: envelopes.length };
   }
-  return { ok: true, event: latest.event };
+  return { ok: true, event: latest.event, raw_envelope: latest.raw_envelope };
 }

@@ -156,14 +156,16 @@ claim、长期任务续接与最终答复发布都由 bridge 管理。新接一�
 **hook 保证进运输层。**技能是软约束，实测会被绕过：M5Claude 最近一份会话记录里，
 三次入站有两次没走技能，模型凭上下文直接把命令跑出来；还有一次它自己判了正文前缀、
 拒绝了一条合法消息，而那个前缀早已退役。hook 是 Claude Code 必然执行的，模型没有
-不执行的余地。**hook 和技能指向同一个入口**，绝不各指一套。
+不执行的余地。Codex 使用同语义的 UserPromptSubmit hook。**每个 runtime 的 hook 和技能都指向
+自己的薄 dispatcher 入口**，绝不各指一套。
 
 **分发器保证选对路。**本机可能有多个消费者（本仓库、cc2cd……）。靠外层包内层也能跑，
 但入口只能有一个（谁后装谁赢）、信封被取两遍（取信封带 4 次重试 ≤2.4s，翻倍就顶到
 秒级回执的上限，且两次可能取到不同的事件）、归属逻辑住在最外层。
 
-改成路由表之后：加一个消费者 = 在 `~/.claude/feishu-bridge/routes.json` 里加一行
-`session → route`。选路只看原始信封的可信字段，模型和正文都不参与。
+改成路由表之后：加一个消费者 = 在对应 runtime 的 Git 外 bridge home 路由表中加一行
+`session → route`。选路只看 Canonical Event 的可信字段，模型和正文都不参与。Claude 与 Codex
+共用 dispatcher 核心；各自的薄入口只提供 endpoint identity、默认 handler 和状态目录。
 
 ### 一条消息的完整生命周期
 
@@ -171,7 +173,7 @@ claim、长期任务续接与最终答复发布都由 bridge 管理。新接一�
 1. 用户在已绑定话题真实 @M5Codex / @M5Claude
 2. Aily 在本机启动第三方智能体回合，并提供事件信封
 3. UserPromptSubmit hook 在模型看到正文**之前**注入「本回合只准跑分发器」
-4. 分发器验调用方 agent、**只取一次**信封、按可信字段选路，交给对应 handler
+4. 分发器验调用方 agent、**只取一次**信封、构造无损 Canonical Event，再按可信字段选路
 5. handler 校验身份、发送者、群、话题、session、时效和幂等 claim
 6. 飞书先收到“已受理”或明确拒绝原因（分发器**一个字都不加**，原样透出 handler 的话）
 7. bridge 续接精确长期任务，任务使用原上下文执行指令
@@ -222,6 +224,11 @@ session 绑定。日常还可以使用：
 
 两边命令同名。差别只在绑定单位：Codex 绑一个精确 task，Claude 默认绑项目、
 也可以用 `bind-session` 让某一条会话单独占一个话题。
+
+当前发行版实际安装的用户命令只有上表三项。架构路线图另定义了 `$feishu-connect`、
+`$feishu-subscribe`、`$feishu-mode` 和 `$feishu-rotate`；它们分别用于 endpoint、独立订阅、交互策略和
+话题代际管理，尚未实现，不能把需求文档里的建议命令误认为当前可用能力。详见
+[Agent 增强需求](docs/requirements/agent-enhancement-requirements.md#fr-7-显式控制面)。
 
 Codex 入站通过 `codex exec resume <精确 thread>` 向原 task 追加完整用户回合。回合会持久化，
 但已经打开的 Codex Desktop 页面不保证实时绘制另一个 CLI 进程追加的事件；切换 task 再返回

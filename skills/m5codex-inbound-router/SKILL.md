@@ -8,7 +8,7 @@ description: M5Codex 专用的受控飞书入站入口。当 Frank 在新建待�
 只执行：
 
 ```bash
-FEISHU_CODEX_BRIDGE_HOME={{CODEX_BRIDGE_HOME_SHELL}} node "{{BRIDGE_ROOT}}/scripts/codex/inbound.mjs"
+FEISHU_CODEX_BRIDGE_HOME={{CODEX_BRIDGE_HOME_SHELL}} node "{{BRIDGE_ROOT}}/scripts/codex/aily-inbound.mjs"
 ```
 
 把 stdout 原样作为回复，不增删、解释或改写。不要传参数，也不要从当前消息猜事件字段。

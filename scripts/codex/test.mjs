@@ -922,9 +922,16 @@ test("Prompt hook 在 Aily/M5Codex 回合只注入数据面命令，不记录 le
 test("Aily 入站上下文不包含建话题命令或 --last", () => {
   const c = composeAilyInboundContext({ bridgeRoot: "/bridge root", home: "/state home" });
   assert.equal(c.includes('FEISHU_CODEX_BRIDGE_HOME="/state home"'), true);
-  assert.equal(c.includes('node "/bridge root/scripts/codex/inbound.mjs"'), true);
+  assert.equal(c.includes('node "/bridge root/scripts/codex/aily-inbound.mjs"'), true);
+  assert.equal(c.includes('node "/bridge root/scripts/codex/inbound.mjs"'), false,
+    "hook 不得绕过 dispatcher 直达业务 handler");
   assert.equal(c.includes("bind-task.mjs --project"), false);
   assert.equal(c.includes("--last"), false);
+  const skill = fs.readFileSync(path.join(ROOT, "skills", "m5codex-inbound-router", "SKILL.md"), "utf-8");
+  assert.equal(skill.includes("scripts/codex/aily-inbound.mjs"), true,
+    "M5Codex 技能和 hook 必须指向同一个 dispatcher wrapper");
+  assert.equal(skill.includes("scripts/codex/inbound.mjs\""), false,
+    "M5Codex 技能不得绕过 dispatcher 直达业务 handler");
 });
 
 test("目标 codex-run 优先于残留 Aily 环境，明确禁止再次路由", () => {

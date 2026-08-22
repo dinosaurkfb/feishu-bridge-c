@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dinosaurkfb/feishu-bridge-c/references/dialogue-bound-authorization-shadow-v1.schema.json",
+  "title": "Feishu Bridge Dialogue Bound Authorization Shadow v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "artifact_type", "evaluator_version", "shadow_id", "recorded_at",
+    "event_ref", "binding_ref", "authorization_snapshot_id", "comparison"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "artifact_type": { "const": "feishu_bridge_dialogue_bound_authorization_shadow" },
+    "evaluator_version": { "const": "1.0" },
+    "shadow_id": { "type": "string", "pattern": "^authorization_shadow_[0-9a-f]{24}$" },
+    "recorded_at": { "type": "string", "format": "date-time" },
+    "event_ref": { "type": "string", "pattern": "^event_ref_[0-9a-f]{24}$" },
+    "binding_ref": { "type": "string", "pattern": "^binding_ref_[0-9a-f]{24}$" },
+    "authorization_snapshot_id": {
+      "type": "string",
+      "pattern": "^binding_authorization_[0-9a-f]{24}$"
+    },
+    "comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode", "match", "route_match", "disposition_match", "target_match",
+        "reason_match", "legacy_disposition", "candidate_disposition",
+        "legacy_reason", "candidate_reason", "scope_unverified"
+      ],
+      "properties": {
+        "mode": { "const": "shadow" },
+        "match": { "type": "boolean" },
+        "route_match": { "type": "boolean" },
+        "disposition_match": { "type": "boolean" },
+        "target_match": { "type": "boolean" },
+        "reason_match": { "type": "boolean" },
+        "legacy_disposition": { "enum": ["accepted", "rejected"] },
+        "candidate_disposition": { "enum": ["accepted", "rejected"] },
+        "legacy_reason": { "type": ["string", "null"] },
+        "candidate_reason": { "type": ["string", "null"] },
+        "scope_unverified": {
+          "type": "array",
+          "maxItems": 1,
+          "uniqueItems": true,
+          "items": { "const": "chat_id" }
+        }
+      }
+    }
+  }
+}

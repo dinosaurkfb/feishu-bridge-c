@@ -504,7 +504,7 @@ test("完整入站链路用引用绑定码在多个 pending 中只绑定目标 t
       }),
     }],
   });
-  const result = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "inbound.mjs")], {
+  const result = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], {
     encoding: "utf-8",
     env: {
       ...process.env,
@@ -514,6 +514,7 @@ test("完整入站链路用引用绑定码在多个 pending 中只绑定目标 t
       AILY_CLI_SESSION_ID: "session_token_b",
       AILY_CLI_RUN_ID: "run_token_b",
       FAKE_AILY_ENVELOPE: envelope,
+      FEISHU_DIALOGUE_AUTHORIZATION_SHADOW: "1",
     },
   });
   assert.equal(result.status, 0, result.stderr);
@@ -530,6 +531,18 @@ test("完整入站链路用引用绑定码在多个 pending 中只绑定目标 t
   const receipt = JSON.parse(fs.readFileSync(path.join(taskPaths(afterB, home).receipts, receipts[0]), "utf-8"));
   assert.equal(receipt.subscription_claim_shadow.match, true);
   assert.deepEqual(receipt.subscription_claim_shadow.scope_unverified, ["chat_id"]);
+  const shadowPaths = taskPaths(afterB, home);
+  assert.equal(fs.readdirSync(path.join(shadowPaths.dialoguePlannerShadow, "authorizations")).length,
+    1);
+  assert.equal(fs.readdirSync(path.join(shadowPaths.dialoguePlannerShadow, "events")).length, 1);
+  const shadowEvidence = JSON.parse(fs.readFileSync(path.join(
+    shadowPaths.dialoguePlannerShadow,
+    "events",
+    fs.readdirSync(path.join(shadowPaths.dialoguePlannerShadow, "events"))[0],
+  ), "utf-8"));
+  assert.equal(shadowEvidence.comparison.legacy_disposition, "accepted",
+    "空 mention 只是内容为空，binding 授权本身已通过");
+  assert.equal(shadowEvidence.comparison.candidate_reason, "chat_scope_unverified");
 });
 
 test("Feishu session 与 Codex thread 是两把独立且精确的键", () => {

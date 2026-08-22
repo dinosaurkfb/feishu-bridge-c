@@ -33,11 +33,17 @@ import {
 } from "./live-session.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
 import {
-  appendConsumed, evaluatePromotion, findBindingForSession, findPendingBinding, promoteBinding,
-  shadowClaudeFirstClaim,
+  appendConsumed, buildClaudeSubscriptionProjection, evaluatePromotion, findBindingForSession,
+  findPendingBinding, promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
 import { closeClaudeTopicRotation } from "./topic-generation-store.mjs";
 import { recordClaudeActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
+import {
+  buildLegacyDialogueBoundAuthorizationContext,
+} from "./dialogue-binding-authorization.mjs";
+import {
+  dialogueAuthorizationShadowEnabled, recordDialogueBoundAuthorizationShadow,
+} from "./dialogue-authorization-shadow-store.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 
@@ -278,6 +284,30 @@ const verdict = evaluateMappingAdmission({
   config,
   now: Date.now(),
 });
+// Slice B1：只读旁路。它使用与 legacy 精确路由相同的 binding，写独立 Git 外 sidecar；
+// 任意投影/校验/I/O 失败都不得改变本轮 verdict、claim 或 dispatch。
+if (!dryRun && dialogueAuthorizationShadowEnabled()) {
+  try {
+    const context = buildLegacyDialogueBoundAuthorizationContext({
+      runtimeNamespace: "claude",
+      model: buildClaudeSubscriptionProjection(),
+      legacyKey: routed.id,
+      privateBindingKey: mapping.binding_id,
+      bindingStatus: mapping.status,
+      verdict,
+    });
+    if (context.ok) {
+      recordDialogueBoundAuthorizationShadow({
+        shadowDir: path.join(RT, "dialogue-planner-shadow"),
+        authorizationInput: context.authorizationInput,
+        canonicalEvent: fetched.canonical_event,
+        runtimeNamespace: "claude",
+        expectedBindingRef: context.expectedBindingRef,
+        legacy: context.legacy,
+      });
+    }
+  } catch { /* shadow 永不承重 */ }
+}
 const interaction = loadClaudeInteractionPolicy({
   root: routed.root,
   claudeSessionId: routed.mapping?.claude_session_id ?? null,

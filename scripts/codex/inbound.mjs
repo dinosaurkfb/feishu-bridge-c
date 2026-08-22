@@ -21,7 +21,14 @@ import {
 import { handOffCodex } from "./handoff.mjs";
 import { recordCodexActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
 import {
-  appendConsumed, bridgeHome, closeTaskTopicRotation, evaluatePromotion, findPendingTask,
+  buildLegacyDialogueBoundAuthorizationContext,
+} from "../dialogue-binding-authorization.mjs";
+import {
+  dialogueAuthorizationShadowEnabled, recordDialogueBoundAuthorizationShadow,
+} from "../dialogue-authorization-shadow-store.mjs";
+import {
+  appendConsumed, bridgeHome, buildCodexSubscriptionProjection, closeTaskTopicRotation,
+  evaluatePromotion, findPendingTask,
   finalizeTaskDialogueTurn, findTaskForFeishuSession, interactionPolicyForTask,
   isThreadBusy, loadCodexTemplate, promoteTask, reserveTaskDialogueTurn,
   shadowCodexFirstClaim, taskPaths,
@@ -201,6 +208,29 @@ const verdict = evaluateMappingAdmission({
   config: routed.config,
   now: Date.now(),
 });
+// 与 Claude adapter 相同的 B1 旁路：默认关闭，只留独立 shadow 证据，不参与真实路由。
+if (!dryRun && dialogueAuthorizationShadowEnabled()) {
+  try {
+    const context = buildLegacyDialogueBoundAuthorizationContext({
+      runtimeNamespace: "codex",
+      model: buildCodexSubscriptionProjection({ home: HOME, template: template.template }),
+      legacyKey: task.logical_task_key,
+      privateBindingKey: routed.mapping.binding_id,
+      bindingStatus: routed.mapping.status,
+      verdict,
+    });
+    if (context.ok) {
+      recordDialogueBoundAuthorizationShadow({
+        shadowDir: paths.dialoguePlannerShadow,
+        authorizationInput: context.authorizationInput,
+        canonicalEvent: fetched.canonical_event,
+        runtimeNamespace: "codex",
+        expectedBindingRef: context.expectedBindingRef,
+        legacy: context.legacy,
+      });
+    }
+  } catch { /* shadow 永不承重 */ }
+}
 const interaction = interactionPolicyForTask(task);
 if (!interaction.ok) {
   writeReceipt("policy-state-" + (event.message_id ?? Date.now()), {

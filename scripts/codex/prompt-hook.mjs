@@ -25,7 +25,15 @@ export function classifyFeishuPrompt(prompt) {
     const name = linked[1];
     const target = linked[2].replace(/\\/gu, "/");
     if (target.endsWith("/" + name + "/SKILL.md")) return name.slice("feishu-".length);
+    return "invalid-" + name.slice("feishu-".length);
   }
+
+  // 看起来像从命令开始、但附带了参数或正文时，必须 fail-closed 且给出反馈。讨论、引用
+  // 和转发通常不会从 token 开始，仍保持静默 none，避免把普通内容误当成控制动作。
+  const malformedBare = /^\$(feishu-bind|feishu-unbind|feishu-status)(?=\s|&#x20;|&nbsp;)/u.exec(p);
+  if (malformedBare) return "invalid-" + malformedBare[1].slice("feishu-".length);
+  const malformedLinked = /^\[\$(feishu-bind|feishu-unbind|feishu-status)\]\([^\r\n)]*\)/u.exec(p);
+  if (malformedLinked) return "invalid-" + malformedLinked[1].slice("feishu-".length);
   return "none";
 }
 
@@ -68,6 +76,15 @@ export function composeStatusContext({ bridgeRoot, threadId }) {
     "只运行以下只读命令，并用简洁自然语言转述 stdout：",
     "`node " + command + " --thread-id " + threadId + "`",
     "不得直接读取或输出 registry、locator、凭据、claim 或 receipt。",
+  ].join("\n");
+}
+
+export function composeInvalidControlContext({ action }) {
+  const command = "$feishu-" + action;
+  return [
+    "[Codex 飞书桥·控制命令格式] 本轮没有执行任何飞书桥脚本，也没有修改连接状态。",
+    "控制命令必须单独占一整条输入，不能附带参数、说明或其他正文。",
+    "请只发送 `" + command + "`；如果只是在讨论该命令，无需执行任何操作。",
   ].join("\n");
 }
 
@@ -190,6 +207,15 @@ async function main() {
     return;
   }
   if (action === "none") process.exit(0);
+  if (action.startsWith("invalid-")) {
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "UserPromptSubmit",
+        additionalContext: composeInvalidControlContext({ action: action.slice("invalid-".length) }),
+      },
+    }) + "\n");
+    return;
+  }
   if (typeof cwd !== "string" || !path.isAbsolute(cwd)) process.exit(0);
 
   const tpl = loadCodexTemplate();

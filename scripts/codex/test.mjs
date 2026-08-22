@@ -25,7 +25,8 @@ import {
 } from "../turn-input.mjs";
 import {
   classifyFeishuPrompt, composeAilyInboundContext, composeBindingContext, composeInitContext,
-  composeRoutedCodexContext, composeStatusContext, composeUnbindContext, isAilyInvocation, isBindingPrompt,
+  composeInvalidControlContext, composeRoutedCodexContext, composeStatusContext, composeUnbindContext,
+  isAilyInvocation, isBindingPrompt,
 } from "./prompt-hook.mjs";
 import {
   enableAutoPublishForAllTasks, extractQuotedBindingTokens, findPendingTask,
@@ -645,8 +646,11 @@ test("Prompt hook 只接受占据整条输入的显式控制命令", () => {
   assert.equal(classifyFeishuPrompt("Agent 建议：$feishu-bind"), "none");
   assert.equal(classifyFeishuPrompt("> [$feishu-bind](/Users/test/.codex/skills/feishu-bind/SKILL.md)"), "none");
   assert.equal(classifyFeishuPrompt(
-    "[$feishu-bind](/Users/test/.codex/skills/other/SKILL.md)"), "none");
-  assert.equal(classifyFeishuPrompt("$feishu-bind 然后继续"), "none");
+    "[$feishu-bind](/Users/test/.codex/skills/other/SKILL.md)"), "invalid-bind");
+  assert.equal(classifyFeishuPrompt("$feishu-bind 然后继续"), "invalid-bind");
+  assert.equal(classifyFeishuPrompt("$feishu-unbind 暂停一下"), "invalid-unbind");
+  assert.equal(classifyFeishuPrompt(
+    "[$feishu-status](/Users/test/.codex/skills/feishu-status/SKILL.md) 看看"), "invalid-status");
   assert.equal(isBindingPrompt("继续写代码"), false);
   assert.equal(isBindingPrompt([
     '<at id="ou_m5">M5Codex</at>', "", "**[引用]**", "🌉 Codex-Lark", "",
@@ -660,6 +664,31 @@ test("Prompt hook 只接受占据整条输入的显式控制命令", () => {
   assert.match(c, /无需再次预览或确认/u);
   assert.match(composeUnbindContext({ bridgeRoot: "/bridge", threadId: THREAD_A }), /feishu-unbind\.mjs/);
   assert.match(composeStatusContext({ bridgeRoot: "/bridge", threadId: THREAD_A }), /feishu-status\.mjs/);
+});
+
+test("像控制命令但附带正文时明确提示格式，绝不执行或登记未绑定 task", () => {
+  const c = composeInvalidControlContext({ action: "bind" });
+  assert.match(c, /没有执行任何飞书桥脚本/);
+  assert.match(c, /必须单独占一整条输入/);
+  assert.match(c, /请只发送 `\$feishu-bind`/);
+
+  const home = temp();
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const hook = path.join(ROOT, "scripts", "codex", "prompt-hook.mjs");
+  const r = spawnSync(process.execPath, [hook], {
+    input: JSON.stringify({
+      session_id: THREAD_A, turn_id: "turn_invalid_bind", cwd: "/work",
+      prompt: "$feishu-bind 绑到测试群",
+    }),
+    encoding: "utf-8",
+    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const injected = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+  assert.match(injected, /请只发送 `\$feishu-bind`/);
+  assert.equal(injected.includes("bind-task.mjs"), false);
+  assert.equal(fs.existsSync(path.join(home, "registry.json")), false);
+  assert.equal(fs.existsSync(path.join(home, "active-threads")), false);
 });
 
 test("$feishu-bind 直接注入幂等绑定命令，不再产生二次确认回合", () => {

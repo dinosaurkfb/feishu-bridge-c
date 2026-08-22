@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-08-22T12:49:00.026Z",
+  "generated_at": "2026-08-22T13:49:58.807Z",
   "modules": {
     "automatic-topic-rotation.mjs": [
       "businessActivitiesForPublishedBatch",
@@ -63,6 +63,14 @@
       "materializeDialogueBindingAuthorization",
       "validateDialogueBindingAuthorizationSnapshot",
       "validateDialogueBoundAuthorizationShadow"
+    ],
+    "dialogue-chat-scope-probe.mjs": [
+      "CHAT_SCOPE_PROBE_ARTIFACT_TYPE",
+      "CHAT_SCOPE_PROBE_SCHEMA_VERSION",
+      "CHAT_SCOPE_PROBE_VERSION",
+      "createDialogueChatScopeProbe",
+      "sameDialogueChatScopeProbeObservation",
+      "validateDialogueChatScopeProbe"
     ],
     "dialogue-participant-planner.mjs": [
       "DEFAULT_RELAY_BUDGET",

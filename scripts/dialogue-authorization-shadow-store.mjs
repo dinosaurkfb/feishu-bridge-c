@@ -16,7 +16,8 @@ import {
   validateDialogueBoundAuthorizationShadow,
 } from "./dialogue-binding-authorization.mjs";
 import {
-  createDialogueChatScopeProbe, validateDialogueChatScopeProbe,
+  createDialogueChatScopeProbe, sameDialogueChatScopeProbeObservation,
+  validateDialogueChatScopeProbe,
 } from "./dialogue-chat-scope-probe.mjs";
 
 export function dialogueAuthorizationShadowEnabled(env = process.env) {
@@ -51,9 +52,13 @@ const recordChatScopeProbe = ({ shadowDir, snapshot, canonicalEvent, observedAt 
   const existing = readJson(file);
   if (!existing.ok) return existing;
   if (existing.value !== null) {
-    return validateDialogueChatScopeProbe(existing.value).ok
+    if (!validateDialogueChatScopeProbe(existing.value).ok) {
+      return { ok: false, reason: "chat_scope_probe_invalid" };
+    }
+    return sameDialogueChatScopeProbeObservation(existing.value, composed.probe)
       ? { ok: true, changed: false, duplicate: true, probe: existing.value, file }
-      : { ok: false, reason: "chat_scope_probe_invalid" };
+      : { ok: false, reason: "chat_scope_probe_conflict",
+        probe_id: composed.probe.probe_id };
   }
   try { atomicWriteJson(file, composed.probe); }
   catch (err) {

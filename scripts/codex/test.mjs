@@ -51,6 +51,7 @@ import {
   createRelayPlanState, deriveDialogueBindingRef, deriveDialogueOutputRef,
   deriveDialogueParticipantRef, startRelayCycle,
 } from "../dialogue-participant-planner.mjs";
+import { CHAT_SCOPE_PROBE_ARTIFACT_TYPE } from "../dialogue-chat-scope-probe.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
 const THREAD_A = "01911111-2222-7333-8444-555555555555";
@@ -71,6 +72,10 @@ const test = (name, fn) => {
   catch (err) { failed += 1; console.error("FAIL " + name + "\n" + (err.stack ?? err)); }
 };
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), "feishu-codex-adapter-test-"));
+
+test("Codex 将 chat scope probe 纳入受保护共用面", () => {
+  assert.equal(CHAT_SCOPE_PROBE_ARTIFACT_TYPE, "feishu_bridge_dialogue_chat_scope_probe");
+});
 
 const codexRelaySnapshot = () => {
   const coordinator = deriveDialogueBindingRef({

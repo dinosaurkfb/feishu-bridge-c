@@ -19,14 +19,15 @@ canonical chat scope promotion。
 
 每条 probe 只包含：
 
-- opaque `probe_id`、`event_ref`、`binding_ref` 与 authorization snapshot id；
+- opaque `probe_id`、`evidence_hash`、`event_ref`、`binding_ref` 与 authorization snapshot id；
 - `canonical_verified`；
 - `chat_locator_present`；
 - `chat_scope_match`（locator 缺失时为 `null`）；
 - `thread_locator_present`。
 
 原始 chat/thread locator、sender、transport open id、binding key、Claude session、Codex thread 和项目路径
-均不进入 artifact 或文件名。`probe_id` 对上述布尔内容寻址，证据被改写后校验失败。
+均不进入 artifact 或文件名。`probe_id` 固定同一 snapshot/event 的冲突域；`evidence_hash` 覆盖时间、
+全部 opaque ref 与布尔内容，任一证据字段被改写后校验失败。
 
 ## 3. 写入与隔离
 
@@ -43,8 +44,10 @@ Claude: <project>/.runtime-data/inbound/dialogue-planner-shadow/scope-probes/
 Codex:  <bridge-home>/tasks/<logical-task>/inbound/dialogue-planner-shadow/scope-probes/
 ```
 
-同一 snapshot/event/布尔结果幂等写入同一个文件。探针构造、读取、校验或写入失败只在 B1 返回值中保留
-诊断；authorization shadow 仍继续，legacy verdict、claim、dispatch 和用户回执不变。
+同一 snapshot/event 固定写入同一个文件；布尔结果相同的重复观测幂等返回，结果变化则显式返回
+`chat_scope_probe_conflict`，不能悄悄生成第二份互不关联的证据。探针构造、读取、校验、冲突或写入失败
+只在 B1 返回值中保留诊断；authorization shadow 仍继续，legacy verdict、claim、dispatch 和用户回执
+不变。
 
 ## 4. 明确不代表什么
 

@@ -5,7 +5,7 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema_version", "artifact_type", "probe_version", "probe_id", "observed_at",
+    "schema_version", "artifact_type", "probe_version", "probe_id", "evidence_hash", "observed_at",
     "event_ref", "binding_ref", "authorization_snapshot_id", "canonical_verified",
     "chat_locator_present", "chat_scope_match", "thread_locator_present"
   ],
@@ -14,6 +14,7 @@
     "artifact_type": { "const": "feishu_bridge_dialogue_chat_scope_probe" },
     "probe_version": { "const": "1.0" },
     "probe_id": { "type": "string", "pattern": "^chat_scope_probe_[0-9a-f]{24}$" },
+    "evidence_hash": { "type": "string", "pattern": "^probe_evidence_[0-9a-f]{24}$" },
     "observed_at": { "type": "string", "format": "date-time" },
     "event_ref": { "type": "string", "pattern": "^event_ref_[0-9a-f]{24}$" },
     "binding_ref": { "type": "string", "pattern": "^binding_ref_[0-9a-f]{24}$" },

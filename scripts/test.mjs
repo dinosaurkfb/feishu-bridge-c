@@ -98,6 +98,7 @@ import {
 } from "./dialogue-authorization-shadow-store.mjs";
 import {
   CHAT_SCOPE_PROBE_ARTIFACT_TYPE, createDialogueChatScopeProbe,
+  sameDialogueChatScopeProbeObservation,
   validateDialogueChatScopeProbe,
 } from "./dialogue-chat-scope-probe.mjs";
 import {
@@ -686,6 +687,9 @@ test("chat scope probe 只记录脱敏 presence 与一致性，不提升 canonic
     snapshot: synced.snapshot, canonicalEvent: mismatch, observedAt: NOW,
   });
   assert.equal(mismatched.probe.chat_scope_match, false);
+  assert.equal(mismatched.probe.probe_id, created.probe.probe_id,
+    "同一 snapshot/event 必须落到同一冲突域，而不是悄悄生成第二份独立证据");
+  assert.equal(sameDialogueChatScopeProbeObservation(created.probe, mismatched.probe), false);
 
   const serialized = JSON.stringify([created.probe, absent.probe, mismatched.probe]);
   for (const secret of [fixture.template.chat_id, "opaque-runtime-thread", "oc_other_private",
@@ -696,6 +700,14 @@ test("chat scope probe 只记录脱敏 presence 与一致性，不提升 canonic
   tampered.chat_scope_match = false;
   assert.equal(validateDialogueChatScopeProbe(tampered).ok, false,
     "probe 内容被改写后必须由内容寻址 ID 检出");
+  const retargeted = structuredClone(created.probe);
+  retargeted.binding_ref = "binding_ref_ffffffffffffffffffffffff";
+  assert.equal(validateDialogueChatScopeProbe(retargeted).ok, false,
+    "binding_ref 也必须由 evidence hash 覆盖");
+  const redated = structuredClone(created.probe);
+  redated.observed_at = new Date(NOW + 1).toISOString();
+  assert.equal(validateDialogueChatScopeProbe(redated).ok, false,
+    "observed_at 也必须由 evidence hash 覆盖");
 });
 
 test("bound authorization shadow 独立写证据、重复幂等，且不写原始身份", () => {
@@ -821,6 +833,37 @@ test("chat scope probe 损坏不能阻断既有 authorization shadow", () => {
   assert.equal(second.duplicate, true);
   assert.equal(second.scopeProbe.ok, false);
   assert.equal(second.scopeProbe.reason, "chat_scope_probe_invalid");
+});
+
+test("同一 event 的 chat scope 观测冲突会显式诊断且不阻断 B1", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-probe-conflict-"));
+  const first = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.unverifiedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  const changedObservation = structuredClone(fixture.unverifiedEvent);
+  changedObservation.extensions.aily_channel.chat_id = fixture.template.chat_id;
+  const second = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: changedObservation,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW + 1000,
+  });
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true, "探针冲突不能改变原 authorization shadow");
+  assert.equal(second.duplicate, true);
+  assert.equal(second.scopeProbe.ok, false);
+  assert.equal(second.scopeProbe.reason, "chat_scope_probe_conflict");
+  assert.equal(second.scopeProbe.probe_id, first.scopeProbe.probe.probe_id);
 });
 
 test("Dialogue Slice B1 schema 固化授权快照与 shadow artifact", () => {

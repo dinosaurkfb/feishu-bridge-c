@@ -18,6 +18,7 @@ export const CHAT_SCOPE_PROBE_ARTIFACT_TYPE = "feishu_bridge_dialogue_chat_scope
 export const CHAT_SCOPE_PROBE_VERSION = "1.0";
 
 const PROBE_ID_PATTERN = /^chat_scope_probe_[0-9a-f]{24}$/u;
+const EVIDENCE_HASH_PATTERN = /^probe_evidence_[0-9a-f]{24}$/u;
 const EVENT_REF_PATTERN = /^event_ref_[0-9a-f]{24}$/u;
 const BINDING_REF_PATTERN = /^binding_ref_[0-9a-f]{24}$/u;
 const SNAPSHOT_ID_PATTERN = /^binding_authorization_[0-9a-f]{24}$/u;
@@ -31,6 +32,10 @@ const digestRef = (prefix, parts) => prefix + crypto.createHash("sha256")
 const iso = (value) => new Date(value).toISOString();
 
 const probeContent = (probe) => ({
+  observed_at: probe.observed_at,
+  event_ref: probe.event_ref,
+  binding_ref: probe.binding_ref,
+  authorization_snapshot_id: probe.authorization_snapshot_id,
   canonical_verified: probe.canonical_verified,
   chat_locator_present: probe.chat_locator_present,
   chat_scope_match: probe.chat_scope_match,
@@ -39,6 +44,7 @@ const probeContent = (probe) => ({
 
 export function validateDialogueChatScopeProbe(probe) {
   if (!onlyKeys(probe, ["schema_version", "artifact_type", "probe_version", "probe_id",
+    "evidence_hash",
     "observed_at", "event_ref", "binding_ref", "authorization_snapshot_id",
     "canonical_verified", "chat_locator_present", "chat_scope_match",
     "thread_locator_present"]) ||
@@ -46,6 +52,7 @@ export function validateDialogueChatScopeProbe(probe) {
       probe?.artifact_type !== CHAT_SCOPE_PROBE_ARTIFACT_TYPE ||
       probe?.probe_version !== CHAT_SCOPE_PROBE_VERSION ||
       !PROBE_ID_PATTERN.test(probe?.probe_id ?? "") ||
+      !EVIDENCE_HASH_PATTERN.test(probe?.evidence_hash ?? "") ||
       !Number.isFinite(Date.parse(probe?.observed_at ?? "")) ||
       !EVENT_REF_PATTERN.test(probe?.event_ref ?? "") ||
       !BINDING_REF_PATTERN.test(probe?.binding_ref ?? "") ||
@@ -58,13 +65,32 @@ export function validateDialogueChatScopeProbe(probe) {
         probe.chat_scope_match !== null)) {
     return { ok: false, reason: "chat_scope_probe_invalid" };
   }
-  const expected = digestRef("chat_scope_probe_", [
-    "dialogue-chat-scope-probe/v1", probe.probe_version,
-    probe.authorization_snapshot_id, probe.event_ref, JSON.stringify(probeContent(probe)),
+  const expectedProbeId = digestRef("chat_scope_probe_", [
+    "dialogue-chat-scope-probe-id/v1", probe.probe_version,
+    probe.authorization_snapshot_id, probe.event_ref,
   ]);
-  return expected === probe.probe_id
+  const expectedEvidenceHash = digestRef("probe_evidence_", [
+    "dialogue-chat-scope-probe-evidence/v1", probe.probe_version,
+    probe.probe_id, JSON.stringify(probeContent(probe)),
+  ]);
+  return expectedProbeId === probe.probe_id && expectedEvidenceHash === probe.evidence_hash
     ? { ok: true }
     : { ok: false, reason: "chat_scope_probe_invalid" };
+}
+
+/** 同一 snapshot/event 的重复观测忽略记录时间；布尔事实变化必须报告 conflict。 */
+export function sameDialogueChatScopeProbeObservation(left, right) {
+  if (!validateDialogueChatScopeProbe(left).ok || !validateDialogueChatScopeProbe(right).ok) {
+    return false;
+  }
+  return left.probe_id === right.probe_id &&
+    left.event_ref === right.event_ref &&
+    left.binding_ref === right.binding_ref &&
+    left.authorization_snapshot_id === right.authorization_snapshot_id &&
+    left.canonical_verified === right.canonical_verified &&
+    left.chat_locator_present === right.chat_locator_present &&
+    left.chat_scope_match === right.chat_scope_match &&
+    left.thread_locator_present === right.thread_locator_present;
 }
 
 export function createDialogueChatScopeProbe({
@@ -94,6 +120,7 @@ export function createDialogueChatScopeProbe({
     artifact_type: CHAT_SCOPE_PROBE_ARTIFACT_TYPE,
     probe_version: CHAT_SCOPE_PROBE_VERSION,
     probe_id: "",
+    evidence_hash: "",
     observed_at: observed,
     event_ref: eventRef,
     binding_ref: snapshot.binding_ref,
@@ -106,8 +133,12 @@ export function createDialogueChatScopeProbe({
     thread_locator_present: nonEmpty(canonicalEvent.extensions.aily_channel.thread_id),
   };
   probe.probe_id = digestRef("chat_scope_probe_", [
-    "dialogue-chat-scope-probe/v1", probe.probe_version,
-    probe.authorization_snapshot_id, probe.event_ref, JSON.stringify(probeContent(probe)),
+    "dialogue-chat-scope-probe-id/v1", probe.probe_version,
+    probe.authorization_snapshot_id, probe.event_ref,
+  ]);
+  probe.evidence_hash = digestRef("probe_evidence_", [
+    "dialogue-chat-scope-probe-evidence/v1", probe.probe_version,
+    probe.probe_id, JSON.stringify(probeContent(probe)),
   ]);
   return validateDialogueChatScopeProbe(probe).ok
     ? { ok: true, probe }

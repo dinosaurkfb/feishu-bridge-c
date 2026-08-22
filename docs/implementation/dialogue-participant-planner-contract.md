@@ -207,5 +207,5 @@ subscription 歧义、chat scope、binding 授权快照同步、代际轮转与�
 - Slice B2a 新增 `scripts/dialogue-chat-scope-probe.mjs` 与
   `references/dialogue-chat-scope-probe-v1.schema.json`，只把 locator presence/一致性写成布尔证据；
   原始 locator 不落盘，探针失败不阻断 B1 或 legacy 路由；
-- Claude 356/356、Codex 80/80 通过；共享导出面保持 21 个模块、195 个导出；
+- Claude 357/357、Codex 81/81 通过；共享导出面扩展为 22 个模块并更新快照；
 - 证据层级仍是本地合成/契约测试，不等于 Slice B 权威路由或 Slice C Agent Relay 已实现、安装或验收。

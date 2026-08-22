@@ -176,6 +176,12 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 人工中断，不代表 FR-5 的多 Agent/子 Agent 协作已经完成。多 Agent 自动接力、并行发言和多人授权
 必须在后续版本增加独立的参与者权限、turn planner、循环检测与失败策略后才可开放。
 
+Dialogue 下一纵切按三阶段交付：先建立不可变参与者授权快照与只计算、不 dispatch 的确定性串行
+planner；再在自动 Topic Generation 真实验收、可信 chat scope 和 binding 授权快照同步均通过后，
+把多 subscription 路由按 endpoint/domain 灰度切流；最后才允许一个 host、一个 peer 和 host
+finalizer 的固定串行接力。任何阶段都不得从 Agent 正文 mention 动态新增参与者或选择下一目标，
+也不得让同一人类事件被多个 binding 重复 claim。
+
 ### FR-6 管理模式
 
 管理模式用于长期监督与增强，至少包含三种策略档案：
@@ -287,7 +293,7 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 | 精确话题—会话绑定 | 稳定 binding 与 Topic Generation 兼容投影已进入 `main`，Claude/Codex 保留各自 runtime locator | 继续统一生命周期与对外状态语义 |
 | 映射模式 | Mapping Policy Handler 已由 PR #7 合并并安装；旧 selector 仍唯一承重，新候选只做 shadow comparison | 真实样本一致后再灰度切换权威读取路径 |
 | 话题轮转 | Topic Generation 生命周期与显式 rotate 命令已由 PR #8 合并并安装；Codex 第 2 代话题的创建、真实 mention 认领与 binding 切换已完成首次真实验收；自动轮转 v1 已合并 `main`，按每代际 30 条有效业务消息创建 pending，新代际仍需真实 mention，但正式安装与真实自动触发验收后置 | 单独安装并验收自动创建、失败重试与不重复轮转，再评估多订阅 |
-| 对话模式 | Dialogue v1 已由 PR #11 合并 `main`，完成 Claude/Codex 双端安装，并在 Codex 精确 task 上完成真实 3 回合串行、预算计账、终局释放和切回 Mapping 验收；Claude 两条终局路径仍只有合成证据 | 先补齐多 Agent 参与者授权；多订阅路由必须等自动轮转 v1 完成真实验收后再灰度切流，随后实现确定性 turn planner；不直接开启 Agent 输出自动接力 |
+| 对话模式 | Dialogue v1 已由 PR #11 合并 `main`，完成 Claude/Codex 双端安装，并在 Codex 精确 task 上完成真实 3 回合串行、预算计账、终局释放和切回 Mapping 验收；Claude 两条终局路径仍只有合成证据 | 先交付参与者授权快照与 shadow planner；多订阅路由必须等自动轮转 v1、可信 chat scope 和授权快照同步完成真实验收后再灰度切流，最后才开启固定串行 Agent Relay |
 | 项目推进/专家/带教 | 原型仅在未合并的 `feat/agent-supervisor-shadow-mvp` 实验分支，`main` 不含相关实现 | 纳入管理策略和分级权限 |
 | 多人授权 | 未实现 | 身份授权矩阵与审计归属 |
 | 显式控制面 | bind/status/unbind/rotate/mode 均已作为显式命令安装；无参 mode 只读，只有整条输入中的 `dialogue` / `mapping` 才写状态，真实验收已验证异常格式不触发 | 后续模式继续沿用结构化 intent 与逐次授权 |

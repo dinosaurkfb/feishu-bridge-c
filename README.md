@@ -397,6 +397,7 @@ import 十八个模块，底座不反向依赖它（有测试守着方向）。
 | 评审现有映射模式如何迁移到公共 Policy Handler | [Mapping Policy Handler 迁移](docs/implementation/mapping-policy-handler.md) |
 | 理解话题轮转、代际切换与 24 小时认领期限 | [Topic Generation 生命周期](docs/implementation/topic-generation-lifecycle.md) |
 | 理解 Dialogue v1 的串行轮次、预算与停止契约 | [Dialogue Policy v1](docs/implementation/dialogue-policy-v1.md) |
+| 理解多 Agent Dialogue 的参与者授权、串行 planner 与切流门禁 | [Dialogue Participant & Planner 契约](docs/implementation/dialogue-participant-planner-contract.md) |
 | 从零安装 Codex 飞书桥 | [CODEX_SETUP.md](CODEX_SETUP.md) |
 | 从零安装 Claude Code 飞书桥 | [SETUP.md](SETUP.md) |
 | 查看 Claude 当前运行状态与历史问题 | [STATE.md](STATE.md) |

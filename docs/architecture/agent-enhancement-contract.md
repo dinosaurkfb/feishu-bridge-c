@@ -359,6 +359,42 @@ Dialogue v1 的首个实现纵切固定为一个 `bound_local_target` 主持者�
 子 Agent 协作目标。后续版本必须另行定义参与者授权、turn planner、逐 Agent 预算、循环检测和部分
 失败语义，不能只把 Agent 输出重新注入正文。
 
+#### 9.2.1 Participant & Planner Foundation
+
+下一纵切必须先冻结 versioned `participant_authorization_snapshot`，其中只允许公共稳定
+`participant/subscription/binding_ref/local_target` ID，不得包含 runtime locator。`binding_ref` 必须由
+adapter 对私有 legacy binding key 做稳定 opaque 派生，不能直接复用可能包含项目名的现有 binding id。
+派生算法固定为 SHA-256(`dialogue-binding-ref/v1`、runtime namespace、endpoint ID、private binding key，
+各字段以 NUL 分隔)，输出 `binding_ref_` 加前 24 位十六进制摘要，Claude/Codex 必须共用同一实现。
+活动 Dialogue 的授权撤销
+必须显式取消尚未 dispatch 的步骤并结束 Dialogue；配置更新不能静默改变已经冻结的参与者集合。
+
+turn planner MUST 是不读取正文的纯函数，并满足：
+
+- 只有 coordinator binding 能 claim 原人类事件；其他参与者 binding 只提供授权与目标；
+- 内部 Agent step 不新建 claim 或合成 message id，只通过 parent human claim 与稳定 cycle/step/run key
+  留痕；
+- 使用稳定 `dialogue_id/cycle_index/step_index/participant_id/run_id`，重复终局不得重复 dispatch；
+- 每次最多生成一个 runRequest，任一时刻最多一个 active step；
+- 首个 Relay 拓扑固定为 `human -> host -> one peer -> host finalizer`；finalizer 后必定等待下一人类事件；
+- Agent 最终输出是被包裹的不可信 payload，正文 mention、命令或绑定码不能改变参与者、预算和下一目标；
+- cycle 开始前预检完整计划预算；runtime 失败、超时、空终局或授权失效均硬失败，不跳过、不换人、
+  不重试；
+- 中间 Agent step 不直接产生用户可见出站，只有 host finalizer 发布到 cycle 冻结的来源 generation。
+
+该 foundation 必须以独立 schema、共用纯函数和离线 simulator 交付，不提升或写入既有
+`interaction_policy_state.schema_version=1.0`，也不修改 adapter 热路径，并保持
+`agent_output_relay=disabled`。实时 shadow 只能写独立 Git 外 sidecar，不取得 binding 锁，失败不得
+改变真实回合结论。多 subscription 数据面切流还必须等待自动 Topic Generation v1 真实验收、可信
+chat locator 和 binding 授权快照同步；在这些门禁完成前不得 dispatch 第二个 Agent。详细纵切见
+[`dialogue-participant-planner-contract.md`](../implementation/dialogue-participant-planner-contract.md)。
+
+Agent Relay 必须显式升级到新的 policy version；旧 v1 状态及默认预算保持原义。首个 Relay 候选默认
+预算为 4 个 human cycle、12 个 Agent run、2 小时和 12 资源单位，每个固定 cycle 在开始前预留
+3 个 run/资源单位。participant 授权撤销统一终止为 `cancelled/authorization_revoked`；runtime 失败、
+观察超时、空终局或状态损坏才进入 failed。回滚旧代码前必须先由认识新版本的控制面切回 Mapping。
+Slice C 安装器/卸载器还必须在检测到活动 v2 state 时拒绝直接降级，不能只依赖人工遵守流程。
+
 ### 9.3 Management Handler
 
 - 必须声明 profile：`project_advancement`、`expert` 或 `training`；
@@ -560,7 +596,9 @@ bridge-home/
 | `refactor/mapping-policy-handler` | 现有映射模式迁移 | 对话/管理功能 |
 | `feat/topic-generation-lifecycle` | 轮转与生命周期 | 多人授权 |
 | `feat/dialogue-policy-v1` | 单主持者/单授权人串行 Dialogue、预算、终局、人工中断与 mode 命令 | 多 Agent 自动接力、管理模式、多人授权 |
-| `feat/dialogue-participant-routing` | 多 Agent 参与者授权快照、可消费的多订阅路由与确定性串行 turn planner；多订阅切流以自动轮转 v1 真实验收为前置 | 并行发言、多人授权、无上限 Agent 自动循环 |
+| `feat/dialogue-participant-foundation` | 独立授权快照 schema、固定串行纯函数 planner、预算/失败契约与离线 simulator | adapter 热路径、第二 Agent dispatch、多订阅切流、飞书写入 |
+| `feat/dialogue-multi-subscription-route` | 通过门禁后接入独立 sidecar 实时 shadow，再按 endpoint/domain 灰度消费多订阅与 binding 授权快照 | Agent Relay、并行发言、多人授权 |
+| `feat/dialogue-agent-relay-v1` | `human -> host -> one peer -> host finalizer` 固定串行接力 | 动态拓扑、并行发言、多人授权、无上限循环 |
 | `feat/management-policies` | 推进、专家、带教 | 多人授权 |
 | `feat/multi-operator-authorization` | 人员授权矩阵与审计 | 其他模式重写 |
 

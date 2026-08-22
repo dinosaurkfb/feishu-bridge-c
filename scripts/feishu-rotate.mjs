@@ -25,6 +25,7 @@ const arg = (name) => {
 const die = (message) => { console.error(message); process.exit(1); };
 const apply = process.argv.includes("--apply");
 const cancel = process.argv.includes("--cancel");
+const automatic = process.argv.includes("--automatic");
 const root = path.resolve(arg("project") ?? process.cwd());
 const claudeSessionId = arg("claude-session-id") ??
   process.env.CLAUDE_CODE_SESSION_ID ?? process.env.CLAUDE_SESSION_ID;
@@ -58,10 +59,13 @@ if (pending) die("已有等待认领的话题代际；请先完成认领或显�
 const nextNumber = Math.max(...current.state.generations.map((generation) => generation.generation)) + 1;
 const token = bindingToken(current.state.binding_id + "\n" + nextNumber);
 const name = current.config.task_display_name ?? path.basename(root);
+const automaticThreshold = active.activity?.auto_rotate_threshold ?? 30;
 const rootText = composeRootMessage({
   name,
   heading: name + " · 第 " + nextNumber + " 代",
-  purpose: "同一长期任务的新话题代际；旧话题保留为只读历史。",
+  purpose: automatic
+    ? "当前代际已达到 " + automaticThreshold + " 条有效业务消息；这是同一长期任务的下一话题代际，旧话题保留为只读历史。"
+    : "同一长期任务的新话题代际；旧话题保留为只读历史。",
   root,
   token,
 });
@@ -69,7 +73,8 @@ const statusText = composeStatusMessage({ name });
 
 console.log("绑定      " + name);
 console.log("当前代际  " + active.generation);
-console.log("新代际    " + nextNumber + "（等待首次真实 mention 后才切换）");
+console.log("新代际    " + nextNumber + "（" +
+  (automatic ? "自动阈值触发；" : "") + "等待首次真实 mention 后才切换）");
 console.log("\n--- 新根消息 ---\n" + rootText);
 if (!apply) {
   console.log("\n[dry-run] 没有创建话题或修改状态。加 --apply 才执行两阶段轮转。");

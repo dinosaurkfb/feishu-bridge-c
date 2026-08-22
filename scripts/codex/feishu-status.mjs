@@ -42,6 +42,10 @@ const pendingTopic = pendingGeneration(topic.state);
 const readOnlyCount = topic.state.generations.filter((generation) => generation.status === "read-only").length;
 console.log("当前 Codex task：" + (active ? "已接入飞书" : "已暂停飞书接入"));
 console.log("当前话题代际：" + (activeTopic ? "第 " + activeTopic.generation + " 代" : "尚未完成首次认领"));
+if (activeTopic) {
+  console.log("自动轮转：" + (activeTopic.activity?.message_count ?? 0) + " / " +
+    (activeTopic.activity?.auto_rotate_threshold ?? 30) + " 条有效业务消息");
+}
 if (pendingTopic) {
   console.log("待认领话题代际：第 " + pendingTopic.generation + " 代" +
     (pendingTopic.claim_expires_at ? "（截止 " + pendingTopic.claim_expires_at + "）" : ""));

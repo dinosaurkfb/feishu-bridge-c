@@ -22,6 +22,9 @@ import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
 import { isLockStale } from "./handoff.mjs";
 import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
+import {
+  businessActivitiesForPublishedBatch, recordClaudeActivityAndMaybeRotate,
+} from "./automatic-topic-rotation.mjs";
 
 const groupByTargetGeneration = (records) => {
   const groups = new Map();
@@ -147,6 +150,16 @@ export function drainProject({ root, claudeSessionId, dryRun = false, timeoutMs 
         expectedAppId: id.expectedAppId,
         timeoutMs,
       });
+      for (const activity of businessActivitiesForPublishedBatch(item.batch, {
+        messageId, runtime: "claude",
+      })) {
+        recordClaudeActivityAndMaybeRotate({
+          root,
+          claudeSessionId: resolved.claudeSessionId ?? mapping.claude_session_id ?? claudeSessionId,
+          generationId: item.target.channelGenerationId,
+          ...activity,
+        });
+      }
       for (const record of item.batch) markSent(record, messageId);
       messageIds.push(messageId);
     }

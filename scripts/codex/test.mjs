@@ -37,7 +37,8 @@ import {
   extractQuotedBindingTokens, findPendingTask,
   findRegisteredTaskForCodexThread, findTaskForCodexThread, findTaskForFeishuSession,
   isThreadBusy, loadCodexTemplate, loadRegistry, makeTaskEntry, mappingForTask, recordThreadActivity, resolveTask,
-  closeTaskTopicRotation, prepareTaskTopicRotation, promoteTask, refreshPendingTaskBinding,
+  closeTaskTopicRotation, prepareTaskTopicRotation, promoteTask, recordTaskTopicActivity,
+  refreshPendingTaskBinding,
   registerTaskTopicRotation, resolveTaskOutboundGeneration, setTaskConnectionStatus,
   setTaskDisplayName, shadowCodexFirstClaim, taskPaths, topicStateForTask,
   validateCodexTemplate, validateRegistryTasks, writeRegistry,
@@ -547,6 +548,32 @@ test("Codex adapter 轮转期间旧 session 继续路由，认领后新旧代际
   assert.match(status.stdout, /只读历史代际：1 个.*轮转前受理的结果仍会发回原话题/u);
 });
 
+test("Codex registry adapter 原子持久化代际计数，旧登记不会回扫历史", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({
+    root, threadId: THREAD_A, name: "A", rootMessageId: "om_old", token: "aaa111", now: 1000,
+  });
+  writeRegistry([task], path.join(home, "registry.json"));
+  promoteTask({
+    logicalTaskKey: task.logical_task_key, generationId: task.channel_generation_id,
+    sessionId: "session_old", home, now: 1100,
+  });
+  const first = recordTaskTopicActivity({
+    threadId: THREAD_A, generationId: task.channel_generation_id,
+    eventKey: "inbound-one", home, now: 1200,
+  });
+  const duplicate = recordTaskTopicActivity({
+    threadId: THREAD_A, generationId: task.channel_generation_id,
+    eventKey: "inbound-one", home, now: 1300,
+  });
+  assert.equal(first.messageCount, 1);
+  assert.equal(duplicate.counted, false);
+  const stored = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
+  assert.equal(activeGeneration(topicStateForTask(stored).state).activity.message_count, 1);
+});
+
 test("Codex 轮转取消只退休 pending generation，不影响旧 active", () => {
   const home = temp();
   const root = path.join(home, "project");
@@ -762,6 +789,7 @@ test("task 控制脚本不猜 thread，暂停和恢复都不调用飞书", () =>
   assert.equal(status.status, 0, status.stderr);
   assert.match(status.stdout, /已接入飞书/);
   assert.match(status.stdout, /当前话题代际/u);
+  assert.match(status.stdout, /自动轮转：0 \/ 30 条有效业务消息/u);
   assert.equal(status.stdout.includes(THREAD_A), false);
   assert.equal(status.stdout.includes("om_a"), false);
 
@@ -953,6 +981,34 @@ test("自动发布通过 interactive 回复原话题，绑定状态仍可使用�
   assert.equal(textArgs.includes("--msg-type"), false);
 });
 
+test("只有成功送达的业务卡片才计入代际，本地输入与回复合计 2", () => {
+  const { home, root, task } = autoPublishFixture();
+  promoteTask({
+    logicalTaskKey: task.logical_task_key,
+    generationId: task.channel_generation_id,
+    sessionId: "session_active",
+    home,
+    now: 1100,
+  });
+  const current = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
+  const outboxDir = taskPaths(current, home).outbox;
+  appendEvent({
+    outboxDir,
+    kind: "reply",
+    text: "本地答复",
+    eventKey: "local-pair-published",
+    publishEligible: true,
+    inputOrigin: "local",
+    inputText: "本地输入",
+    targetGenerationId: current.channel_generation_id,
+  });
+  assert.equal(publishEligibleTaskEvents({ task: current, home }).status, "published");
+  const stored = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
+  assert.equal(activeGeneration(topicStateForTask(stored).state).activity.message_count, 2);
+  assert.equal(fs.existsSync(path.join(root, ".runtime-data")), false,
+    "Codex 代际计数仍必须留在 Git 外 bridge home");
+});
+
 test("自动发布只消费显式 eligible 事件，不补发升级前的历史 outbox", () => {
   const { home, task } = autoPublishFixture();
   const outboxDir = taskPaths(task, home).outbox;
@@ -988,12 +1044,23 @@ test("严格终局失败的半成品答复保留证据但退出发布队列", ()
 
 test("自动发布失败保留 eligible 事件，后续回合可以重试", () => {
   const { home, task } = autoPublishFixture({ workingPublisher: false });
-  const outboxDir = taskPaths(task, home).outbox;
+  promoteTask({
+    logicalTaskKey: task.logical_task_key,
+    generationId: task.channel_generation_id,
+    sessionId: "session_active",
+    home,
+    now: 1100,
+  });
+  const current = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
+  const outboxDir = taskPaths(current, home).outbox;
   appendEvent({ outboxDir, kind: "reply", text: "暂时发不出", eventKey: "retry", publishEligible: true });
-  const published = publishEligibleTaskEvents({ task, home });
+  const published = publishEligibleTaskEvents({ task: current, home });
   assert.equal(published.status, "error");
   assert.equal(listPending({ outboxDir }).length, 1);
   assert.equal(typeof listPending({ outboxDir })[0].publish_eligible_at, "string");
+  assert.equal(activeGeneration(topicStateForTask(
+    findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task,
+  ).state).activity.message_count, 0, "发布失败不得提前计数");
 });
 
 test("Stop 与 watcher 并发写同一事件键时只留下一个文件", () => {

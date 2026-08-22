@@ -227,7 +227,10 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 - 新旧 generation 的 active/read-only 切换必须在同一份 binding 状态的单次原子写入中完成；
 - 本地发起且没有飞书来源的回合，在形成 outbox 项时解析并冻结当时的 active generation；若运行
   期间已经完成轮转，则发布到新 generation；
-- 轮转可以手动触发，也可以按消息数、年龄或累计内容量建议触发；
+- 轮转可以手动触发；自动轮转 v1 按当前 active generation 的有效业务消息数触发，默认阈值为
+  30。人类指令与 Agent 最终回复分别计 1，本地配对回合计 2，绑定握手、系统回执与普通进展不计；
+- 自动阈值只创建 pending generation，不绕过新话题的真实 mention 认领，也不回扫升级前历史；
+- 后续可以扩展按年龄或累计内容量触发，但必须作为显式、版本化策略，不能靠正文正则猜测；
 - 不应直接把本地上下文压缩事件等同于飞书话题轮转，两者可以关联提示，但生命周期独立。
 
 ### FR-9 出站与可见记录
@@ -277,7 +280,7 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 | 项目—群订阅 | Subscription v1、首次认领消费者和 claim 纵切已由 PR #5 合并；尚未开放多订阅写入口 | 开放受控多订阅管理，不改变现有单订阅默认行为 |
 | 精确话题—会话绑定 | 稳定 binding 与 Topic Generation 兼容投影已进入 `main`，Claude/Codex 保留各自 runtime locator | 继续统一生命周期与对外状态语义 |
 | 映射模式 | Mapping Policy Handler 已由 PR #7 合并并安装；旧 selector 仍唯一承重，新候选只做 shadow comparison | 真实样本一致后再灰度切换权威读取路径 |
-| 话题轮转 | Topic Generation 生命周期与显式 rotate 命令已由 PR #8 合并并安装；Codex 第 2 代话题的创建、真实 mention 认领与 binding 切换已完成首次真实验收；没有自动消息数阈值 | 继续验收旧话题只读、迟到结果来源回复、取消/过期和不串线，再评估多订阅 |
+| 话题轮转 | Topic Generation 生命周期与显式 rotate 命令已由 PR #8 合并并安装；Codex 第 2 代话题的创建、真实 mention 认领与 binding 切换已完成首次真实验收；自动轮转 v1 候选按每代际 30 条有效业务消息创建 pending，新代际仍需真实 mention | 合并候选后单独安装并验收自动创建、失败重试与不重复轮转，再评估多订阅 |
 | 对话模式 | 未实现 | 受控编排、预算、停止与中断 |
 | 项目推进/专家/带教 | 原型仅在未合并的 `feat/agent-supervisor-shadow-mvp` 实验分支，`main` 不含相关实现 | 纳入管理策略和分级权限 |
 | 多人授权 | 未实现 | 身份授权矩阵与审计归属 |
@@ -325,8 +328,9 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 
 - subscription 的管理单位是“项目根目录”还是更抽象的业务域 ID；
 - 一个本地 target 是否允许多个活动出站目标，若允许，默认内容级别是什么；
-- 自动轮转的默认阈值及是否只提示、不自动执行；当前实现**不按消息数自动轮转**，只接受显式
-  `$feishu-rotate` / `/feishu-rotate`；候选话题等待首次真实 mention 的认领期限默认 24 小时；
+- 自动轮转 v1 已确定默认阈值为每代际 30 条有效业务消息，并自动创建 pending 话题；是否允许用户
+  按 binding 改阈值或关闭自动轮转留待后续控制面设计。候选话题等待首次真实 mention 的认领期限
+  仍默认 24 小时；
 - 对话模式首个版本是否只支持一个主持者和串行轮次；
 - 管理模式中哪些 execute 动作可以预授权，哪些始终逐次授权；
 - 多人场景的角色模型与飞书组织身份如何映射。

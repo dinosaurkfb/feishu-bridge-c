@@ -5,6 +5,9 @@
 切为 read-only、新代际成为 active 并保持原 binding。本切片实现需求 FR-8 与架构契约 8.2、8.3、
 INV-9；不开放多订阅、多人授权或新的 Dialogue/Management policy。
 
+自动轮转 v1 在后续候选中加入“每代际 30 条有效业务消息”的确定性阈值；代码与合成回归通过后
+可以先合并，真实链路验收和正式安装单独进行，不能把单元测试写成已经在生产生效。
+
 ## 1. 目标与边界
 
 “换一个新话题继续”不是删除旧话题，也不是创建另一条无关 binding。稳定对象仍是原
@@ -33,6 +36,7 @@ binding
 | `active_generation_id` | 当前唯一 active 代际；首次认领前可为空 |
 | `generations[]` | 单调序号、状态、topic/session locator 与生命周期时间 |
 | `rotation` | 唯一轮转 operation、阶段与 pending generation 引用 |
+| `generations[].activity` | 本代际有效业务消息数、幂等事件键、阈值与自动轮转尝试时间 |
 
 代际状态为 `pending -> active -> read-only -> retired`；轮转 operation 为
 `preparing -> awaiting_claim -> completed`，失败、取消和过期分别落到 `failed`、`cancelled`、
@@ -50,8 +54,20 @@ binding
 6. 在同一 binding 文档的一次临时文件 + `rename` 替换中，将新代际设 active、旧代际设 read-only；
 7. 超时后的下一次认领尝试或显式 `--cancel --apply` 会原子退休 pending，旧 active 不变。
 
-当前没有按消息数量、话题回复数量或时间自动发起轮转的策略。只有用户显式运行 rotate 命令才会
-创建 pending generation；24 小时是新话题等待首次真实 mention 的认领期限，不是旧话题的消息上限。
+自动轮转 v1 与显式 rotate 命令复用同一套两阶段事务。每个 active generation 从 0 开始独立计数：
+
+- 通过全部入站闸门并成功 handoff 的人类指令计 1；
+- 成功发布到飞书的 Agent 最终回复计 1；
+- 一张“本地输入 + Agent 回复”配对卡计 2；
+- 根消息、首次绑定空 mention、受理/完成回执和没有最终答复的普通进展卡不计；
+- 只有 active generation 计数；轮转前冻结到 read-only 旧代际的迟到结果不增加新代际计数；
+- 事件键在写入状态前转为 opaque id，重复 hook 或 publisher 重试不重复计数。
+
+第 30 条有效业务消息落账时，取得一次自动轮转尝试权，并在生命周期锁外启动既有 rotate CLI 创建
+pending generation。**自动创建不等于自动切换**：首次真实 mention 前旧话题仍 active；认领成功后
+才原子切换。创建失败不会影响旧 active，至少冷却 5 分钟后由下一条新业务消息取得重试机会。
+已有 binding 不回扫历史消息，安装或升级本身不会创建新话题。24 小时仍只是新话题等待首次真实
+mention 的认领期限，不是旧话题的消息上限。
 
 话题创建成功但本地 phase 2 写入失败时，不猜测或自动重建：旧代际继续 active，外部新话题作为
 可对账的孤立证据保留，由人工检查后重试或关闭。
@@ -68,6 +84,7 @@ opaque generation id，保证升级前 run 冻结的 `origin_channel_generation_
 - 认领完成后旧字段一次切换到新 active；
 - project-file 继续使用既有 `feishu_root_message_id_reference`；
 - registry 原文中的未知顶层字段原样保留，不用规范化对象覆盖整份文档；
+- 没有 `activity` 的旧 generation 在首次新业务事件到来时从 0 初始化，不回填历史；
 - 早期 Claude“出站已接通、入站尚无 Aily session”的 active 记录继续可读，不能因迁移关掉出站；
 - 旧 `suspended` 读取为正式 `paused`。
 
@@ -96,6 +113,7 @@ opaque generation id，保证升级前 run 冻结的 `origin_channel_generation_
 |---|---|---|
 | Git 外状态适配 | `topic-generation-store.mjs` | `codex/state.mjs` |
 | 创建/取消轮转 | `feishu-rotate.mjs` | `codex/feishu-rotate.mjs` |
+| 自动阈值适配 | `automatic-topic-rotation.mjs` | `codex/automatic-topic-rotation.mjs` |
 | 用户命令 | `/feishu-rotate` | `$feishu-rotate` |
 | 首次认领切换 | `inbound-route.mjs` | `codex/state.mjs` |
 | 状态展示 | `/feishu-status` | `$feishu-status` |
@@ -108,6 +126,7 @@ session locator、凭据、claim 或 receipt。
 候选必须通过：
 
 - 公共状态机、24 小时过期、取消和旧映射投影测试；
+- 30 条阈值、重复事件、2 条配对卡、冷却重试、pending 抑制和 read-only 迟到结果测试；
 - Claude registry/project-file 原子持久化与未知字段保留测试；
 - Codex 精确 task 轮转、取消 CLI 与状态输出测试；
 - 新旧 outbox 目标分别发布到正确根话题的合成测试；
@@ -117,7 +136,8 @@ session locator、凭据、claim 或 receipt。
 主路径。旧话题对新指令的只读拒绝、轮转前已受理结果回旧话题、显式取消和 24 小时过期仍只有
 合成测试证据；完成这些测试前不得把它们记为真实链路已验收。Claude 侧真实轮转也应单独验证。
 
-安装与真实话题轮转是独立授权动作。当前版本已完成安装，但安装本身没有创建、修改或轮转任何飞书
-话题；首次真实轮转仍需在目标 task/session 中显式运行 rotate 命令。
+安装与真实链路验收是独立动作。自动轮转候选的代码合并不会修改本机已安装 hooks/skills，也不会
+补数或创建话题；正式安装后，达到阈值属于已经启用的 Topic Generation 数据面策略，但新话题仍需
+真实 mention 才能成为 active。首次自动轮转及失败重试仍应单独保留真实证据。
 回滚代码时保留 Git 外 registry 和话题历史；旧读取方继续使用已物化的唯一 active 字段。若已经完成
 轮转，不应通过改代码把 read-only 旧话题重新冒充 active，应使用后续受控迁移完成反向轮转。

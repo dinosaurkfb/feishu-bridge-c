@@ -11,6 +11,10 @@ import { stableControlId } from "./subscription.mjs";
 export const TOPIC_GENERATION_SCHEMA_VERSION = "1.0";
 export const TOPIC_GENERATION_ARTIFACT_TYPE = "feishu_bridge_topic_generations";
 export const TOPIC_GENERATION_PENDING_MS = 24 * 60 * 60 * 1000;
+export const TOPIC_GENERATION_ACTIVITY_SCHEMA_VERSION = "1.0";
+export const TOPIC_GENERATION_ACTIVITY_MODE = "business_message_v1";
+export const TOPIC_GENERATION_AUTO_ROTATE_MESSAGES = 30;
+export const TOPIC_GENERATION_AUTO_ROTATE_RETRY_MS = 5 * 60 * 1000;
 
 export const GENERATION_STATUS = Object.freeze({
   PENDING: "pending",
@@ -31,6 +35,33 @@ export const ROTATION_STATUS = Object.freeze({
 const nonEmpty = (value) => typeof value === "string" && value.length > 0;
 const iso = (now) => new Date(now).toISOString();
 const clone = (value) => JSON.parse(JSON.stringify(value));
+
+const newGenerationActivity = ({ now = Date.now(), threshold = TOPIC_GENERATION_AUTO_ROTATE_MESSAGES } = {}) => ({
+  schema_version: TOPIC_GENERATION_ACTIVITY_SCHEMA_VERSION,
+  count_mode: TOPIC_GENERATION_ACTIVITY_MODE,
+  auto_rotate_enabled: true,
+  auto_rotate_threshold: threshold,
+  message_count: 0,
+  counted_event_keys: [],
+  started_at: iso(now),
+  threshold_reached_at: null,
+  last_auto_rotation_attempt_at: null,
+  auto_rotation_attempts: 0,
+});
+
+const generationActivity = (generation, { now = Date.now() } = {}) => {
+  const activity = generation?.activity;
+  if (!activity || activity.schema_version !== TOPIC_GENERATION_ACTIVITY_SCHEMA_VERSION) {
+    return newGenerationActivity({ now });
+  }
+  return {
+    ...newGenerationActivity({ now, threshold: activity.auto_rotate_threshold }),
+    ...clone(activity),
+    counted_event_keys: Array.isArray(activity.counted_event_keys)
+      ? [...activity.counted_event_keys]
+      : [],
+  };
+};
 
 export function channelGenerationId(bindingId, generation) {
   return stableControlId("channel_generation", bindingId, generation);
@@ -82,6 +113,7 @@ export function projectLegacyTopicGeneration({
     activated_at: bound ? (createdAt ?? created) : null,
     read_only_at: null,
     retired_at: null,
+    activity: newGenerationActivity({ now }),
   };
   return {
     ok: true,
@@ -126,6 +158,19 @@ export function validateTopicGenerationState(state) {
       problems.push("generations.status");
     }
     if (!nonEmpty(generation?.root_message_id)) problems.push("generations.root_message_id");
+    if (generation?.activity !== undefined) {
+      const activity = generation.activity;
+      if (activity?.schema_version !== TOPIC_GENERATION_ACTIVITY_SCHEMA_VERSION ||
+          activity?.count_mode !== TOPIC_GENERATION_ACTIVITY_MODE ||
+          typeof activity?.auto_rotate_enabled !== "boolean" ||
+          !Number.isInteger(activity?.auto_rotate_threshold) || activity.auto_rotate_threshold <= 0 ||
+          !Number.isInteger(activity?.message_count) || activity.message_count < 0 ||
+          !Array.isArray(activity?.counted_event_keys) ||
+          activity.counted_event_keys.some((key) => !nonEmpty(key)) ||
+          !Number.isInteger(activity?.auto_rotation_attempts) || activity.auto_rotation_attempts < 0) {
+        problems.push("generations.activity");
+      }
+    }
     if (generation?.status === GENERATION_STATUS.ACTIVE) {
       active += 1;
       // 早期 Claude 项目绑定允许“出站已接通、入站尚无 Aily session”的 active 记录。
@@ -226,6 +271,76 @@ export function activeGenerationForSession(state, sessionId) {
   return generation?.session_id === sessionId ? generation : null;
 }
 
+/**
+ * 记录一条已经通过业务闸门、或已经成功发布到飞书的有效消息。
+ *
+ * eventKey 会先哈希成 opaque key 再落 Git 外状态；重复 hook、publisher 重试或相同消息的二次观察
+ * 不会重复计数。只有 active generation 计数，read-only 的迟到结果不会再触发另一轮轮转。
+ * 达到阈值只取得一次“可以尝试自动轮转”的本地权利；真正创建话题由 runtime adapter 在锁外完成。
+ */
+export function recordTopicGenerationActivity(state, {
+  generationId,
+  eventKey,
+  messageDelta = 1,
+  now = Date.now(),
+  retryMs = TOPIC_GENERATION_AUTO_ROTATE_RETRY_MS,
+} = {}) {
+  const valid = validateTopicGenerationState(state);
+  if (!valid.ok) return { ok: false, reason: "topic_generation_state_invalid", problems: valid.problems };
+  if (!nonEmpty(eventKey)) return { ok: false, reason: "activity_event_key_required" };
+  if (!Number.isInteger(messageDelta) || messageDelta <= 0 || messageDelta > 2) {
+    return { ok: false, reason: "activity_message_delta_invalid" };
+  }
+  const selectedId = nonEmpty(generationId) ? generationId : state.active_generation_id;
+  const current = generationById(state, selectedId);
+  if (!current || current.status !== GENERATION_STATUS.ACTIVE ||
+      current.channel_generation_id !== state.active_generation_id) {
+    return { ok: true, changed: false, counted: false, reason: "generation_not_active", state: clone(state) };
+  }
+
+  const next = clone(state);
+  const generation = generationById(next, selectedId);
+  const activity = generationActivity(generation, { now });
+  const opaqueKey = stableControlId(
+    "generation_activity", next.binding_id, generation.channel_generation_id, eventKey,
+  );
+  if (activity.counted_event_keys.includes(opaqueKey)) {
+    generation.activity = activity;
+    return {
+      ok: true, changed: false, counted: false, reason: "activity_duplicate", state: next,
+      generation, messageCount: activity.message_count, threshold: activity.auto_rotate_threshold,
+      shouldAutoRotate: false,
+    };
+  }
+
+  activity.counted_event_keys.push(opaqueKey);
+  activity.message_count += messageDelta;
+  if (activity.message_count >= activity.auto_rotate_threshold && !activity.threshold_reached_at) {
+    activity.threshold_reached_at = iso(now);
+  }
+
+  const rotationOpen = [ROTATION_STATUS.PREPARING, ROTATION_STATUS.AWAITING_CLAIM]
+    .includes(next.rotation?.status);
+  const lastAttempt = Date.parse(activity.last_auto_rotation_attempt_at ?? "");
+  const retryReady = !Number.isFinite(lastAttempt) || now - lastAttempt >= retryMs;
+  const shouldAutoRotate = next.binding_status === "active" &&
+    activity.auto_rotate_enabled === true &&
+    activity.message_count >= activity.auto_rotate_threshold &&
+    !pendingGeneration(next) && !rotationOpen && retryReady;
+  if (shouldAutoRotate) {
+    activity.last_auto_rotation_attempt_at = iso(now);
+    activity.auto_rotation_attempts += 1;
+  }
+  generation.activity = activity;
+  next.updated_at = iso(now);
+  return {
+    ok: true, changed: true, counted: true, state: next, generation,
+    messageCount: activity.message_count,
+    threshold: activity.auto_rotate_threshold,
+    shouldAutoRotate,
+  };
+}
+
 export function prepareTopicRotation(state, {
   operationId,
   now = Date.now(),
@@ -287,6 +402,7 @@ export function registerPendingTopicGeneration(state, {
     activated_at: null,
     read_only_at: null,
     retired_at: null,
+    activity: newGenerationActivity({ now }),
   };
   next.generations.push(generation);
   next.rotation = {
@@ -331,6 +447,7 @@ export function activatePendingTopicGeneration(state, {
   selected.pending_token = null;
   selected.claim_expires_at = null;
   selected.activated_at = iso(now);
+  selected.activity = generationActivity(selected, { now });
   next.active_generation_id = selected.channel_generation_id;
   if (next.rotation) {
     next.rotation = {

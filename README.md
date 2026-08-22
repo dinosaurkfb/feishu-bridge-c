@@ -240,6 +240,11 @@ outbox 时冻结当时的 active 代际。待认领默认 24 小时过期，也�
 `--cancel --apply` 显式取消；两者都不会删除话题历史。实现契约见
 [Topic Generation 生命周期](docs/implementation/topic-generation-lifecycle.md)。
 
+每个 active 代际还独立统计有效业务消息：已受理的人类指令和已送达的 Agent 最终回复各计 1，
+本地“输入 + 回复”配对卡计 2；绑定握手、系统回执和普通进展不计。默认累计到 30 条时自动创建
+下一代 pending 话题，但不会自动切换；仍需在新话题真实 mention 一次，旧话题才变为 read-only。
+旧 binding 从升级后的首次新业务事件起计，不回扫历史，安装本身不会触发轮转。
+
 Codex 入站通过 `codex exec resume <精确 thread>` 向原 task 追加完整用户回合。回合会持久化，
 但已经打开的 Codex Desktop 页面不保证实时绘制另一个 CLI 进程追加的事件；切换 task 再返回
 或重新打开后，会从持久历史中显示。这是客户端刷新边界，不是投递到了另一条任务。

@@ -10,7 +10,7 @@ import {
 import {
   ROTATION_STATUS, closePendingTopicGeneration, failTopicRotation,
   materializeLegacyTopicFields, prepareTopicRotation, registerPendingTopicGeneration,
-  resolveMappingOutboundGeneration, topicGenerationStateForLegacy,
+  recordTopicGenerationActivity, resolveMappingOutboundGeneration, topicGenerationStateForLegacy,
 } from "./topic-generation.mjs";
 
 const writeJsonAtomic = (file, value) => {
@@ -165,6 +165,19 @@ export function setClaudeTopicBindingStatus({
       next.updated_at = new Date(now).toISOString();
       return { ok: true, changed: true, state: next };
     },
+  });
+}
+
+/** 原子记录 Claude binding 当前话题代际的一条有效业务消息。 */
+export function recordClaudeTopicActivity({
+  root, claudeSessionId, generationId, eventKey, messageDelta = 1,
+  registryFile, now = Date.now(), retryMs,
+} = {}) {
+  return mutateClaudeTopicBinding({
+    root, claudeSessionId, registryFile, now,
+    mutate: (state) => recordTopicGenerationActivity(state, {
+      generationId, eventKey, messageDelta, now, retryMs,
+    }),
   });
 }
 

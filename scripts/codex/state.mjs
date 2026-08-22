@@ -92,6 +92,7 @@ export const taskPaths = (task, home = bridgeHome()) => {
     turnInputs: path.join(root, "outbound", "turn-inputs"),
     publishLock: path.join(root, "outbound", "publish.lock"),
     consumed: path.join(root, "inbound", "consumed.json"),
+    dialoguePlannerShadow: path.join(root, "inbound", "dialogue-planner-shadow"),
   };
 };
 

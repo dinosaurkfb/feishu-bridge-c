@@ -86,6 +86,16 @@ import {
   validateRelayPlanState,
 } from "./dialogue-participant-planner.mjs";
 import {
+  BINDING_AUTHORIZATION_ARTIFACT_TYPE, BINDING_AUTHORIZATION_REASON,
+  BOUND_AUTHORIZATION_SHADOW_ARTIFACT_TYPE,
+  buildLegacyDialogueBoundAuthorizationContext, evaluateDialogueBoundAuthorization,
+  validateDialogueBindingAuthorizationSnapshot, validateDialogueBoundAuthorizationShadow,
+} from "./dialogue-binding-authorization.mjs";
+import {
+  dialogueAuthorizationShadowEnabled, recordDialogueBoundAuthorizationShadow,
+  syncDialogueAuthorizationShadowSnapshot,
+} from "./dialogue-authorization-shadow-store.mjs";
+import {
   MAX_LOCAL_INPUT_CHARS, claudeTurnInputDir, clearTurnInput, isFeishuStampedInput,
   readTurnInput, storeTurnInput,
 } from "./turn-input.mjs";
@@ -104,7 +114,8 @@ import {
 } from "./inbound-route.mjs";
 import {
   SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION,
-  compareFirstClaimShadow, validateSubscription,
+  buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId,
+  stableControlId, validateSubscription,
 } from "./subscription.mjs";
 import {
   ROTATION_STATUS, activatePendingTopicGeneration, activeGeneration,
@@ -177,6 +188,63 @@ const evalWith = (eventPatch = {}, mappingPatch = {}) =>
     config,
     now: NOW,
   });
+
+const dialogueAuthorizationFixture = () => {
+  const runtimeNamespace = "claude";
+  const endpointId = legacyEndpointId({ runtime: runtimeNamespace, agentUid: "agent_m5claude" });
+  const template = {
+    agent_uid: "agent_m5claude",
+    transport_open_id: M5CLAUDE,
+    frank_sender_id: FRANK,
+    chat_id: "oc_private_dialogue",
+    default_freshness_ms: 10 * 60 * 1000,
+  };
+  const model = buildLegacySubscriptionReadModel({
+    runtime: runtimeNamespace,
+    endpointId,
+    template,
+    pendingWindowMs: 24 * 60 * 60 * 1000,
+    records: [{
+      legacy_key: "dialogue-line",
+      domain_key: "/private/project/path",
+      local_target_id: stableControlId("target", runtimeNamespace, "dialogue-line"),
+      status: "active",
+      inbound_state: "bound",
+      session_id: BOUND_SESSION,
+      pending_token: null,
+      bound_at: new Date(NOW - 60_000).toISOString(),
+      chat_id: template.chat_id,
+    }],
+  });
+  assert.equal(model.ok, true);
+  const privateBindingKey = "private-binding-dialogue-line";
+  const context = buildLegacyDialogueBoundAuthorizationContext({
+    runtimeNamespace,
+    model,
+    legacyKey: "dialogue-line",
+    privateBindingKey,
+    bindingStatus: "active",
+    verdict: { decision: "accept" },
+  });
+  assert.equal(context.ok, true);
+  const built = buildCanonicalEvent({
+    event: baseEvent,
+    rawEnvelope: { type: "message.create", payload: { private: true } },
+    endpointId,
+    callerAgentUid: template.agent_uid,
+  });
+  assert.equal(built.ok, true);
+  const trustedEvent = structuredClone(built.event);
+  trustedEvent.source.chat_id = template.chat_id;
+  trustedEvent.extensions.aily_channel = {
+    verified: true,
+    chat_id: template.chat_id,
+    thread_id: null,
+  };
+  assert.equal(validateCanonicalEvent(trustedEvent).ok, true);
+  return { runtimeNamespace, endpointId, template, model, privateBindingKey, context,
+    unverifiedEvent: built.event, trustedEvent };
+};
 
 // ---------- 报文解析（真实格式） ----------
 
@@ -487,6 +555,169 @@ test("Claude registry adapter 原子持久化代际计数，重复事件不增�
   assert.equal(duplicate.counted, false);
   assert.equal(JSON.parse(fs.readFileSync(regFile, "utf-8"))
     .projects[0].topic_generation_state.generations[0].activity.message_count, 1);
+});
+
+// ---------- Dialogue Slice B1：已绑定授权快照与独立 shadow sidecar ----------
+
+test("Canonical Event 只有双字段一致时才接受 verified chat scope", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const forged = structuredClone(fixture.trustedEvent);
+  forged.extensions.aily_channel.chat_id = "oc_other";
+  assert.equal(validateCanonicalEvent(forged).ok, false);
+  assert.ok(validateCanonicalEvent(forged).problems.includes("extensions.aily_channel.chat_scope"));
+
+  const missing = structuredClone(fixture.trustedEvent);
+  missing.source.chat_id = null;
+  assert.equal(validateCanonicalEvent(missing).ok, false);
+  assert.equal(validateCanonicalEvent(fixture.unverifiedEvent).ok, true,
+    "现行 dispatcher 的 unverified 事件仍保持兼容");
+});
+
+test("binding authorization snapshot 只含 opaque ref，授权内容不变时 revision 幂等", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-auth-snapshot-"));
+  const first = syncDialogueAuthorizationShadowSnapshot({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    capturedAt: NOW,
+  });
+  const same = syncDialogueAuthorizationShadowSnapshot({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    capturedAt: NOW + 1000,
+  });
+  assert.equal(first.ok, true);
+  assert.equal(first.changed, true);
+  assert.equal(same.changed, false);
+  assert.equal(same.snapshot.authorization_revision, 1);
+  assert.equal(validateDialogueBindingAuthorizationSnapshot(same.snapshot).ok, true);
+  assert.equal(same.snapshot.artifact_type, BINDING_AUTHORIZATION_ARTIFACT_TYPE);
+
+  const serialized = JSON.stringify(same.snapshot);
+  for (const secret of [fixture.privateBindingKey, fixture.template.chat_id,
+    fixture.template.frank_sender_id, fixture.template.transport_open_id,
+    "/private/project/path"]) {
+    assert.equal(serialized.includes(secret), false, "快照泄露私有输入：" + secret);
+  }
+
+  const pausedInput = structuredClone(fixture.context.authorizationInput);
+  pausedInput.subscription.status = "paused";
+  const paused = syncDialogueAuthorizationShadowSnapshot({
+    shadowDir, authorizationInput: pausedInput, capturedAt: NOW + 2000,
+  });
+  assert.equal(paused.ok, true);
+  assert.equal(paused.changed, true);
+  assert.equal(paused.snapshot.authorization_revision, 2);
+  assert.equal(paused.snapshot.status, "paused");
+  assert.equal(paused.snapshot.reason, BINDING_AUTHORIZATION_REASON.SUBSCRIPTION_PAUSED);
+});
+
+test("bound authorization 候选在 chat 未核验时 fail-closed，可信同 scope 才接受", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-auth-evaluate-"));
+  const synced = syncDialogueAuthorizationShadowSnapshot({
+    shadowDir, authorizationInput: fixture.context.authorizationInput, capturedAt: NOW,
+  });
+  const unverified = evaluateDialogueBoundAuthorization({
+    snapshot: synced.snapshot,
+    canonicalEvent: fixture.unverifiedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    now: NOW,
+  });
+  assert.equal(unverified.reason, BINDING_AUTHORIZATION_REASON.CHAT_SCOPE_UNVERIFIED);
+  assert.deepEqual(unverified.scope_unverified, ["chat_id"]);
+
+  const accepted = evaluateDialogueBoundAuthorization({
+    snapshot: synced.snapshot,
+    canonicalEvent: fixture.trustedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    now: NOW,
+  });
+  assert.equal(accepted.ok, true);
+  assert.equal(accepted.local_target_id, fixture.context.legacy.local_target_id);
+
+  const forgedBinding = evaluateDialogueBoundAuthorization({
+    snapshot: synced.snapshot,
+    canonicalEvent: fixture.trustedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: "binding_ref_ffffffffffffffffffffffff",
+    now: NOW,
+  });
+  assert.equal(forgedBinding.reason, BINDING_AUTHORIZATION_REASON.BINDING_MISMATCH);
+});
+
+test("bound authorization shadow 独立写证据、重复幂等，且不写原始身份", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-auth-sidecar-"));
+  const first = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.unverifiedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  const duplicate = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.unverifiedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW + 1000,
+  });
+  assert.equal(first.ok, true);
+  assert.equal(first.comparison.match, false);
+  assert.equal(first.evidence.artifact_type, BOUND_AUTHORIZATION_SHADOW_ARTIFACT_TYPE);
+  assert.equal(validateDialogueBoundAuthorizationShadow(first.evidence).ok, true);
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(duplicate.evidence.shadow_id, first.evidence.shadow_id);
+  assert.deepEqual(fs.readdirSync(shadowDir).sort(), ["authorizations", "events"]);
+
+  const allFiles = [first.file, path.join(shadowDir, "authorizations",
+    first.snapshot.binding_ref + ".json")];
+  const serialized = allFiles.map((file) => fs.readFileSync(file, "utf-8")).join("\n");
+  for (const secret of [fixture.privateBindingKey, fixture.template.chat_id,
+    fixture.template.frank_sender_id, fixture.template.transport_open_id]) {
+    assert.equal(serialized.includes(secret), false, "sidecar 泄露私有输入：" + secret);
+  }
+});
+
+test("bound authorization 投影歧义 fail-closed，shadow 开关默认关闭", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const ambiguous = structuredClone(fixture.model);
+  ambiguous.pending_bindings.push(structuredClone(ambiguous.pending_bindings[0]));
+  const context = buildLegacyDialogueBoundAuthorizationContext({
+    runtimeNamespace: fixture.runtimeNamespace,
+    model: ambiguous,
+    legacyKey: "dialogue-line",
+    privateBindingKey: fixture.privateBindingKey,
+    bindingStatus: "active",
+    verdict: { decision: "accept" },
+  });
+  assert.equal(context.reason, BINDING_AUTHORIZATION_REASON.BINDING_AMBIGUOUS);
+  assert.equal(dialogueAuthorizationShadowEnabled({}), false);
+  assert.equal(dialogueAuthorizationShadowEnabled({ FEISHU_DIALOGUE_AUTHORIZATION_SHADOW: "true" }),
+    false);
+  assert.equal(dialogueAuthorizationShadowEnabled({ FEISHU_DIALOGUE_AUTHORIZATION_SHADOW: "1" }),
+    true);
+});
+
+test("Dialogue Slice B1 schema 固化授权快照与 shadow artifact", () => {
+  const snapshotSchema = JSON.parse(fs.readFileSync(path.resolve("references",
+    "dialogue-binding-authorization-v1.schema.json"), "utf-8"));
+  const shadowSchema = JSON.parse(fs.readFileSync(path.resolve("references",
+    "dialogue-bound-authorization-shadow-v1.schema.json"), "utf-8"));
+  assert.equal(snapshotSchema.properties.artifact_type.const,
+    BINDING_AUTHORIZATION_ARTIFACT_TYPE);
+  assert.equal(snapshotSchema.properties.authorized_human_participant_ids.uniqueItems, true);
+  assert.equal(shadowSchema.properties.artifact_type.const,
+    BOUND_AUTHORIZATION_SHADOW_ARTIFACT_TYPE);
+  assert.equal(shadowSchema.properties.evaluator_version.const, "1.0");
 });
 
 // ---------- Mapping Policy：公共准入、处置与 runtime-neutral runRequest ----------
@@ -3137,6 +3368,18 @@ test("入站脚本在取信封之前就校验调用方 agent", () => {
   const fetch = src.indexOf("fetchTriggerEvent()");
   assert.ok(gate > 0 && fetch > 0);
   assert.ok(gate < fetch, "调用方校验必须排在取信封之前，否则已经替别的 agent 取过事件了");
+});
+
+test("Claude/Codex 已绑定授权 shadow 都在 verdict 后旁路，且默认不开启", () => {
+  for (const file of ["scripts/inbound.mjs", "scripts/codex/inbound.mjs"]) {
+    const src = fs.readFileSync(path.resolve(file), "utf-8");
+    const verdict = src.indexOf("const verdict = evaluateMappingAdmission");
+    const enabled = src.indexOf("dialogueAuthorizationShadowEnabled()", verdict);
+    const record = src.indexOf("recordDialogueBoundAuthorizationShadow({", enabled);
+    const claim = src.indexOf("acquireClaim({", record);
+    assert.ok(verdict >= 0 && enabled > verdict && record > enabled && claim > record, file);
+    assert.ok(src.includes("catch { /* shadow 永不承重 */ }"), file);
+  }
 });
 
 test("这道闸只能用机器级模板 —— 用项目配置会变成循环", () => {

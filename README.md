@@ -241,6 +241,10 @@ v1 只支持一名授权人类和当前精确本地 task 这个主持者，严�
 人工中止尚未结束的 Dialogue，但保留历史。详见
 [Dialogue Policy v1](docs/implementation/dialogue-policy-v1.md)。
 
+下一阶段的多 Agent Dialogue 仍处于未安装候选：Slice A 提供确定性串行 planner，Slice B1 仅在显式
+开关下旁路比较现有 binding 授权并写 Git 外证据，不接管路由、不会启动第二个 Agent。实现与门禁见
+[Dialogue Binding Authorization Shadow](docs/implementation/dialogue-binding-authorization-shadow.md)。
+
 运行 `rotate` 后，bridge 先创建一个 `pending` 新话题。首次真实 mention 完成认领前，旧话题仍是
 唯一 active；认领成功时，新旧状态在同一份 Git 外 binding 文档的一次原子替换中切换，新话题
 成为 active，旧话题成为 read-only。轮转前已经受理的飞书请求仍回复原话题；本地回合在形成
@@ -366,14 +370,14 @@ npm run install:codex:preview    # 预览 Codex 安装会修改什么
 ## 两条链路的共用边界
 
 `scripts/` 是底座，`scripts/codex/` 是 Codex 适配层。依赖是**单向**的：适配层从底座
-import 十九个模块，底座不反向依赖它（有测试守着方向）。
+import 二十一个模块，底座不反向依赖它（有测试守着方向）。
 
-这意味着那十九个模块是真正的接触面 —— 任何一方改它，都可能悄悄改掉另一方依赖的东西。
+这意味着那二十一个模块是真正的接触面 —— 任何一方改它，都可能悄悄改掉另一方依赖的东西。
 所以有三层护栏，从便宜到贵：
 
 | 护栏 | 抓什么 | 成本 |
 |---|---|---|
-| `npm run contract` | 共用模块的**导出面**变了（多了、少了、改名） | 机械，覆盖全部十九个 |
+| `npm run contract` | 共用模块的**导出面**变了（多了、少了、改名） | 机械，覆盖全部二十一个 |
 | 行为契约测试 | 共用模块的**语义**变了（判重算法、文件命名、字段默认值） | 人工，只覆盖想得到的 |
 | `npm test` 同时跑两套 | 一方真的弄坏了另一方 | 已经是默认行为 |
 

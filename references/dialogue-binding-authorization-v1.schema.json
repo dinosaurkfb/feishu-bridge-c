@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dinosaurkfb/feishu-bridge-c/references/dialogue-binding-authorization-v1.schema.json",
+  "title": "Feishu Bridge Dialogue Binding Authorization Snapshot v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "artifact_type", "snapshot_id", "authorization_revision",
+    "captured_at", "binding_ref", "subscription_id", "subscription_version",
+    "endpoint_id", "domain_id", "status", "reason", "local_target_id",
+    "agent_participant_id", "authorized_human_participant_ids", "chat_scope_ref",
+    "event_types", "freshness_ms"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "artifact_type": { "const": "feishu_bridge_dialogue_binding_authorization_snapshot" },
+    "snapshot_id": { "type": "string", "pattern": "^binding_authorization_[0-9a-f]{24}$" },
+    "authorization_revision": { "type": "integer", "minimum": 1 },
+    "captured_at": { "type": "string", "format": "date-time" },
+    "binding_ref": { "type": "string", "pattern": "^binding_ref_[0-9a-f]{24}$" },
+    "subscription_id": { "type": "string", "pattern": "^subscription_[0-9a-f]{24}$" },
+    "subscription_version": { "type": "integer", "minimum": 1 },
+    "endpoint_id": { "type": "string", "pattern": "^endpoint_[0-9a-f]{24}$" },
+    "domain_id": { "type": "string", "pattern": "^domain_[0-9a-f]{24}$" },
+    "status": { "enum": ["active", "paused"] },
+    "reason": {
+      "type": ["string", "null"],
+      "enum": [null, "subscription_paused", "binding_paused"]
+    },
+    "local_target_id": {
+      "type": "string",
+      "pattern": "^(target|local_target)_[0-9a-f]{24}$"
+    },
+    "agent_participant_id": {
+      "type": "string",
+      "pattern": "^participant_ref_[0-9a-f]{24}$"
+    },
+    "authorized_human_participant_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^participant_ref_[0-9a-f]{24}$" }
+    },
+    "chat_scope_ref": { "type": "string", "pattern": "^chat_scope_ref_[0-9a-f]{24}$" },
+    "event_types": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "freshness_ms": { "type": "number", "exclusiveMinimum": 0 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "active" } }, "required": ["status"] },
+      "then": { "properties": { "reason": { "const": null } } },
+      "else": {
+        "properties": {
+          "reason": { "enum": ["subscription_paused", "binding_paused"] }
+        }
+      }
+    }
+  ]
+}

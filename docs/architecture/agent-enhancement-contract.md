@@ -597,7 +597,8 @@ bridge-home/
 | `feat/topic-generation-lifecycle` | 轮转与生命周期 | 多人授权 |
 | `feat/dialogue-policy-v1` | 单主持者/单授权人串行 Dialogue、预算、终局、人工中断与 mode 命令 | 多 Agent 自动接力、管理模式、多人授权 |
 | `feat/dialogue-participant-foundation` | 独立授权快照 schema、固定串行纯函数 planner、预算/失败契约与离线 simulator | adapter 热路径、第二 Agent dispatch、多订阅切流、飞书写入 |
-| `feat/dialogue-multi-subscription-route` | 通过门禁后接入独立 sidecar 实时 shadow，再按 endpoint/domain 灰度消费多订阅与 binding 授权快照 | Agent Relay、并行发言、多人授权 |
+| `feat/dialogue-multi-subscription-shadow` | 默认关闭的已绑定授权快照与独立 sidecar 实时 shadow；只做 B1 旁路，不切权威路由 | Agent Relay、权威多订阅切流、并行发言、多人授权 |
+| `feat/dialogue-multi-subscription-route` | 通过自动轮转、可信 chat scope、授权同步与 shadow 一致性门禁后，按 endpoint/domain 灰度消费多订阅 | Agent Relay、并行发言、多人授权 |
 | `feat/dialogue-agent-relay-v1` | `human -> host -> one peer -> host finalizer` 固定串行接力 | 动态拓扑、并行发言、多人授权、无上限循环 |
 | `feat/management-policies` | 推进、专家、带教 | 多人授权 |
 | `feat/multi-operator-authorization` | 人员授权矩阵与审计 | 其他模式重写 |

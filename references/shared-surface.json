@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-08-22T11:55:51.807Z",
+  "generated_at": "2026-08-22T12:49:00.026Z",
   "modules": {
     "automatic-topic-rotation.mjs": [
       "businessActivitiesForPublishedBatch",
@@ -39,6 +39,30 @@
       "claimKey",
       "readClaim",
       "recordClaimState"
+    ],
+    "dialogue-authorization-shadow-store.mjs": [
+      "dialogueAuthorizationShadowEnabled",
+      "recordDialogueBoundAuthorizationShadow",
+      "syncDialogueAuthorizationShadowSnapshot"
+    ],
+    "dialogue-binding-authorization.mjs": [
+      "BINDING_AUTHORIZATION_ARTIFACT_TYPE",
+      "BINDING_AUTHORIZATION_REASON",
+      "BINDING_AUTHORIZATION_SCHEMA_VERSION",
+      "BINDING_AUTHORIZATION_STATUS",
+      "BOUND_AUTHORIZATION_EVALUATOR_VERSION",
+      "BOUND_AUTHORIZATION_SHADOW_ARTIFACT_TYPE",
+      "BOUND_AUTHORIZATION_SHADOW_SCHEMA_VERSION",
+      "buildLegacyDialogueBoundAuthorizationContext",
+      "compareDialogueBoundAuthorizationShadow",
+      "createDialogueBoundAuthorizationShadow",
+      "deriveDialogueChatScopeRef",
+      "evaluateDialogueBoundAuthorization",
+      "legacyBindingAuthorizationInput",
+      "legacyDialogueBoundAuthorization",
+      "materializeDialogueBindingAuthorization",
+      "validateDialogueBindingAuthorizationSnapshot",
+      "validateDialogueBoundAuthorizationShadow"
     ],
     "dialogue-participant-planner.mjs": [
       "DEFAULT_RELAY_BUDGET",

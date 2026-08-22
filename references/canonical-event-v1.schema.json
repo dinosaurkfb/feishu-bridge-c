@@ -77,12 +77,44 @@
           "type": "object",
           "required": ["verified", "chat_id", "thread_id"],
           "properties": {
-            "verified": { "const": false },
+            "verified": { "type": "boolean" },
             "chat_id": { "type": ["string", "null"] },
             "thread_id": { "type": ["string", "null"] }
           }
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "extensions": {
+            "properties": {
+              "aily_channel": {
+                "properties": { "verified": { "const": true } },
+                "required": ["verified"]
+              }
+            },
+            "required": ["aily_channel"]
+          }
+        },
+        "required": ["extensions"]
+      },
+      "then": {
+        "properties": {
+          "source": {
+            "properties": { "chat_id": { "type": "string", "minLength": 1 } }
+          },
+          "extensions": {
+            "properties": {
+              "aily_channel": {
+                "properties": { "chat_id": { "type": "string", "minLength": 1 } }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

@@ -43,11 +43,20 @@ export function validateCanonicalEvent(event) {
   if (!Object.hasOwn(event?.raw_envelope ?? {}, "payload")) problems.push("raw_envelope.payload");
   if (!Number.isInteger(event?.extensions?.dispatcher?.fetch_attempts) ||
       event.extensions.dispatcher.fetch_attempts < 0) problems.push("extensions.dispatcher.fetch_attempts");
-  if (event?.extensions?.aily_channel?.verified !== false) problems.push("extensions.aily_channel.verified");
+  if (typeof event?.extensions?.aily_channel?.verified !== "boolean") {
+    problems.push("extensions.aily_channel.verified");
+  }
   for (const field of ["chat_id", "thread_id"]) {
     if (!nullableString(event?.extensions?.aily_channel?.[field])) {
       problems.push("extensions.aily_channel." + field);
     }
+  }
+  // `verified: true` 只接受 dispatcher 已把同一 chat locator 同时提升到 canonical source
+  // 与诊断 extension 的事件。跨字段相等无法只靠 JSON Schema 表达，必须在运行时再守一遍。
+  if (event?.extensions?.aily_channel?.verified === true &&
+      (!nonEmpty(event?.source?.chat_id) ||
+       event.extensions.aily_channel.chat_id !== event.source.chat_id)) {
+    problems.push("extensions.aily_channel.chat_scope");
   }
   return { ok: problems.length === 0, problems };
 }

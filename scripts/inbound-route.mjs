@@ -172,21 +172,38 @@ export function buildClaudeSubscriptionProjection({ registryFile, templateFile }
   if (!loaded.ok) return { ok: false, reason: "template_unusable" };
   const template = loaded.template;
   const endpointId = legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid });
-  const records = registry.projects.filter((entry) => entry.root_message_id).map((entry) => ({
-    legacy_key: entry.id,
-    domain_key: entry.root,
-    local_target_id: stableControlId(
-      "target", "claude", entry.id,
-      entry.claude_session_id ? "session" : "project",
-    ),
-    status: entry.status ?? "active",
-    inbound_state: entry.inbound_state ?? "pending",
-    session_id: entry.session_id ?? null,
-    pending_token: entry.pending_token ?? null,
-    pending_expires_at: entry.pending_expires_at,
-    bound_at: entry.bound_at,
-    chat_id: entry.chat_id ?? template.chat_id,
-  }));
+  const records = [];
+  for (const entry of registry.projects) {
+    // 旧安装把根消息和绑定放在项目内 active-mapping.json，registry 只登记 root。
+    // 这些行没有 root_message_id，但仍是现行数据面的真实绑定，投影不能把它们漏掉。
+    const resolved = entry.root_message_id
+      ? null
+      : resolveProject({
+        root: entry.root,
+        claudeSessionId: entry.claude_session_id,
+        registryFile,
+        templateFile,
+      });
+    if (!entry.root_message_id && (!resolved?.ok ||
+        !resolved.mapping?.feishu_root_message_id_reference)) continue;
+    const mapping = resolved?.mapping ?? null;
+    const config = resolved?.config ?? null;
+    const targetIsSession = Boolean(entry.claude_session_id ?? mapping?.claude_session_id);
+    records.push({
+      legacy_key: entry.id,
+      domain_key: entry.root,
+      local_target_id: stableControlId(
+        "target", "claude", entry.id, targetIsSession ? "session" : "project",
+      ),
+      status: entry.status ?? mapping?.status ?? "active",
+      inbound_state: entry.inbound_state ?? mapping?.inbound_state ?? "pending",
+      session_id: entry.session_id ?? mapping?.session_id ?? null,
+      pending_token: entry.pending_token ?? mapping?.pending_token ?? null,
+      pending_expires_at: entry.pending_expires_at,
+      bound_at: entry.bound_at ?? mapping?.created_at,
+      chat_id: entry.chat_id ?? config?.chat_id ?? template.chat_id,
+    });
+  }
   return buildLegacySubscriptionReadModel({
     runtime: "claude", endpointId, template, records, pendingWindowMs: PENDING_WINDOW_MS,
   });

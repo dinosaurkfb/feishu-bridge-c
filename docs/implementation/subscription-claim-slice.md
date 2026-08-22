@@ -40,12 +40,14 @@ fail-closed，模型不参与选路。
 当前 Aily envelope 尚未把可验证的 chat locator 纳入 canonical event。为避免把未知当成已验证，候选
 结果显式记录 `scope_unverified: ["chat_id"]`。这不影响 shadow 对照，但在该证据补齐前禁止切流。
 
-对照只把以下情况算作数据面不一致：
+`route_match` 只比较以下数据面结果：
 
 - 一边接受、另一边拒绝；
 - 两边都接受但选择了不同本地目标。
 
-拒绝原因名称不同会单独记录为 `reason_match`，不会产生第二次业务动作。
+拒绝原因名称由 `reason_match` 比较。总字段 `match` 必须同时满足 `route_match` 和
+`reason_match`，因此只看 `match` 不会掩盖“同为拒绝但诊断理由不同”的分歧。任何分歧都不会产生
+第二次业务动作。
 
 ## 4. 迁移与回滚
 

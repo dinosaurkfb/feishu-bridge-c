@@ -15,11 +15,13 @@ export const MESSAGE_RECEIVE_EVENT = "im.message.receive";
 export const SUBSCRIPTION_REJECT = Object.freeze({
   PROJECTION_INVALID: "subscription_projection_invalid",
   ENDPOINT_MISMATCH: "endpoint_mismatch",
+  NO_ACTIVE_SUBSCRIPTION: "no_active_subscription",
   AGENT_MISMATCH: "agent_mismatch",
   SENDER_NOT_ALLOWED: "sender_not_allowed",
   MENTION_REQUIRED: "transport_not_mentioned",
   SOURCE_SCOPE_MISMATCH: "source_scope_mismatch",
   STALE_EVENT: "stale_event",
+  NO_PENDING_BINDING: "no_pending_binding",
   NOT_FOUND: "subscription_not_found",
   AMBIGUOUS: "subscription_ambiguous",
   TOKEN_UNKNOWN: "binding_token_unknown",
@@ -201,9 +203,12 @@ export function selectPendingSubscriptionClaim({ model, evidence, bindingTokens 
     return reject(SUBSCRIPTION_REJECT.MALFORMED_EVENT);
   }
 
-  let candidates = model.subscriptions.filter((subscription) => subscription.status === "active");
-  candidates = candidates.filter((subscription) => subscription.endpoint_id === evidence.endpoint_id);
+  let candidates = model.subscriptions.filter(
+    (subscription) => subscription.endpoint_id === evidence.endpoint_id,
+  );
   if (!candidates.length) return reject(SUBSCRIPTION_REJECT.ENDPOINT_MISMATCH);
+  candidates = candidates.filter((subscription) => subscription.status === "active");
+  if (!candidates.length) return reject(SUBSCRIPTION_REJECT.NO_ACTIVE_SUBSCRIPTION);
   candidates = candidates.filter((subscription) => subscription.scope.agent_uid === evidence.caller_agent_uid);
   if (!candidates.length) return reject(SUBSCRIPTION_REJECT.AGENT_MISMATCH);
   candidates = candidates.filter((subscription) => subscription.scope.sender_ids.includes(evidence.sender_id));
@@ -241,7 +246,7 @@ export function selectPendingSubscriptionClaim({ model, evidence, bindingTokens 
     if (hits.length > 1) return reject(SUBSCRIPTION_REJECT.TOKEN_DUPLICATED);
     selected = hits[0];
   } else {
-    if (!pending.length) return reject(SUBSCRIPTION_REJECT.NOT_FOUND);
+    if (!pending.length) return reject(SUBSCRIPTION_REJECT.NO_PENDING_BINDING);
     if (pending.length > 1) return reject(SUBSCRIPTION_REJECT.AMBIGUOUS);
     selected = pending[0];
   }
@@ -264,19 +269,22 @@ export function compareFirstClaimShadow({ legacy, candidate } = {}) {
   const candidateAccepted = candidate?.ok === true;
   const dispositionMatch = legacyAccepted === candidateAccepted;
   const targetMatch = !legacyAccepted || !candidateAccepted || legacy.target_key === candidate.legacy_key;
+  const reasonMatch = legacyAccepted && candidateAccepted
+    ? true
+    : (legacy?.reason ?? "unknown") === (candidate?.reason ?? "unknown");
+  const routeMatch = dispositionMatch && targetMatch;
   return {
     schema_version: SUBSCRIPTION_SCHEMA_VERSION,
     mode: "shadow",
-    match: dispositionMatch && targetMatch,
+    match: routeMatch && reasonMatch,
+    route_match: routeMatch,
     disposition_match: dispositionMatch,
     target_match: targetMatch,
     legacy_disposition: legacyAccepted ? "accepted" : "rejected",
     candidate_disposition: candidateAccepted ? "accepted" : "rejected",
     legacy_reason: legacyAccepted ? null : (legacy?.reason ?? "unknown"),
     candidate_reason: candidateAccepted ? null : (candidate?.reason ?? "unknown"),
-    reason_match: legacyAccepted && candidateAccepted
-      ? true
-      : (legacy?.reason ?? "unknown") === (candidate?.reason ?? "unknown"),
+    reason_match: reasonMatch,
     candidate_subscription_id: candidateAccepted ? candidate.subscription_id : null,
     scope_unverified: candidate?.scope_unverified ?? [],
   };

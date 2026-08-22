@@ -79,7 +79,8 @@ import {
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
 import {
-  SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_SCHEMA_VERSION, validateSubscription,
+  SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION,
+  compareFirstClaimShadow, validateSubscription,
 } from "./subscription.mjs";
 
 let passed = 0;
@@ -1748,17 +1749,24 @@ test("Claude 旧登记只读投影成 Subscription v1，不泄露项目与会话
   const tplFile = path.join(home, "chain-config.json");
   const projects = [
     {
-      id: "project-line", root, root_message_id: "om_project", inbound_state: "pending",
-      pending_token: "aaaaaa", bound_at: new Date(NOW2 - 60_000).toISOString(),
+      id: "project-line", root,
     },
     {
       id: "session-line", root, claude_session_id: "claude-secret-session",
-      root_message_id: "om_session", inbound_state: "pending", pending_token: "bbbbbb",
+      root_message_id: "om_session", status: "suspended", inbound_state: "pending",
+      pending_token: "bbbbbb",
       bound_at: new Date(NOW2 - 60_000).toISOString(),
     },
   ];
   fs.writeFileSync(regFile, JSON.stringify({ projects }));
   fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  const runtimeDir = path.join(root, ".runtime-data", "inbound");
+  fs.mkdirSync(runtimeDir, { recursive: true });
+  fs.writeFileSync(path.join(runtimeDir, "active-mapping.json"), JSON.stringify({
+    status: "active", inbound_state: "pending", session_id: null,
+    pending_token: "aaaaaa", created_at: new Date(NOW2 - 60_000).toISOString(),
+    feishu_root_message_id_reference: "om_project",
+  }));
   const before = fs.readFileSync(regFile, "utf-8");
 
   const model = buildClaudeSubscriptionProjection({ registryFile: regFile, templateFile: tplFile });
@@ -1766,6 +1774,7 @@ test("Claude 旧登记只读投影成 Subscription v1，不泄露项目与会话
   assert.equal(model.schema_version, SUBSCRIPTION_SCHEMA_VERSION);
   assert.equal(model.subscriptions.length, 1, "同 endpoint/domain/chat 只产生一份订阅");
   assert.equal(model.pending_bindings.length, 2, "两条本地工作线仍各自保留待认领目标");
+  assert.equal(model.subscriptions[0].status, "active", "旧 project-file active 绑定不能被漏投影");
   assert.equal(model.subscriptions[0].artifact_type, SUBSCRIPTION_ARTIFACT_TYPE);
   assert.equal(validateSubscription(model.subscriptions[0]).ok, true);
   const serialized = JSON.stringify(model);
@@ -1816,6 +1825,17 @@ test("Claude shadow 能记录旧逻辑与新订阅授权的差异，而不改变
   assert.equal(shadow.match, false);
   assert.equal(shadow.legacy_disposition, "accepted");
   assert.equal(shadow.candidate_disposition, "rejected");
+  assert.equal(shadow.candidate_reason, SUBSCRIPTION_REJECT.NO_ACTIVE_SUBSCRIPTION);
+});
+
+test("shadow 总 match 不掩盖同为拒绝但 reason 不同", () => {
+  const shadow = compareFirstClaimShadow({
+    legacy: { ok: false, reason: "no_pending_binding" },
+    candidate: { ok: false, reason: "no_active_subscription" },
+  });
+  assert.equal(shadow.route_match, true);
+  assert.equal(shadow.reason_match, false);
+  assert.equal(shadow.match, false);
 });
 
 test("绑定写回登记表之后，同一个 session 就能被路由到了", () => {

@@ -74,7 +74,9 @@ Turn:     dispatched -> completed | failed | cancelled
   回合标为 completed；其他严格终态和观察超时标为 failed。
 - Claude 后台运行：一次性 watcher 读取 run 终态并结束回合；即使关闭自动发布，观察者仍会运行。
 - Claude 活跃会话投递：只有 `active_turn.runtime_target_id` 与触发 Stop 的精确 session 相同，Stop
-  hook 才能结束该回合；其他会话的 Stop 无权修改它。
+  hook 才能结束该回合；其他会话的 Stop 无权修改它。这条现场路径不额外启动 watcher；若会话一直
+  没有 Stop，下一条通过准入的人类事件会在预留前检查 deadline，原子取消悬挂回合并以时间预算终止
+  Dialogue。bridge 不会强杀仍在运行的交互会话进程。
 - 发布失败只影响 outbox/egress，不把已经真实完成的 runtime 回合倒写成失败。
 
 切回 Mapping 是显式人工中断：尚未结束的 Dialogue/turn 记为 cancelled，历史 claim、run、回执、

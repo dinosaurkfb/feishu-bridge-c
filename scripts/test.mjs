@@ -684,6 +684,19 @@ test("Dialogue 达到任一预算硬停止，运行失败也终止整个 dialogu
   });
   assert.equal(failed.state.dialogue.status, DIALOGUE_STATUS.FAILED);
   assert.equal(failed.state.dialogue.stop_reason, "runtime_failed");
+
+  const genericEnabled = setInteractionPolicyMode(failed.state, {
+    mode: "dialogue", now: NOW + 20,
+  }).state;
+  const genericTurn = reserveDialogueTurn(genericEnabled, {
+    eventId: "om_generic_fail", runId: "run_generic_fail", localTargetId: "local",
+    originChannelGenerationId: "generation", now: NOW + 21,
+  });
+  const genericFailure = finalizeDialogueTurn(genericTurn.state, {
+    runId: "run_generic_fail", status: DIALOGUE_TURN_STATUS.FAILED, now: NOW + 22,
+  });
+  assert.equal(genericFailure.state.dialogue.status, DIALOGUE_STATUS.FAILED);
+  assert.equal(genericFailure.state.dialogue.stop_reason, DIALOGUE_REASON.RUN_FAILED);
 });
 
 test("Dialogue 时间预算与资源预算分别在 dispatch 前硬停止", () => {
@@ -713,6 +726,31 @@ test("Dialogue 时间预算与资源预算分别在 dispatch 前硬停止", () =
   assert.equal(tooExpensive.accepted, false);
   assert.equal(tooExpensive.reason, DIALOGUE_REASON.RESOURCE_BUDGET);
   assert.equal(tooExpensive.state.dialogue.usage.resource_units_used, 0);
+});
+
+test("Dialogue 悬挂活动回合在截止时间后由下一人类事件收口", () => {
+  const base = interactionPolicyStateForLegacy({ binding_id: "binding_hung" }, {
+    bindingId: "binding_hung", now: NOW,
+  }).state;
+  const enabled = setInteractionPolicyMode(base, {
+    mode: "dialogue", now: NOW,
+    budget: { max_rounds: 3, max_duration_ms: 10, max_resource_units: 3 },
+  }).state;
+  const hanging = reserveDialogueTurn(enabled, {
+    eventId: "om_hanging", runId: "run_hanging", localTargetId: "local",
+    originChannelGenerationId: "generation", runtimeTargetId: "live_session", now: NOW + 1,
+  });
+  const expired = reserveDialogueTurn(hanging.state, {
+    eventId: "om_after_deadline", runId: "run_after_deadline", localTargetId: "local",
+    originChannelGenerationId: "generation", now: NOW + 10,
+  });
+  assert.equal(expired.ok, true);
+  assert.equal(expired.accepted, false);
+  assert.equal(expired.reason, DIALOGUE_REASON.TIME_BUDGET);
+  assert.equal(expired.state.dialogue.status, DIALOGUE_STATUS.COMPLETED);
+  assert.equal(expired.state.dialogue.active_turn, null);
+  assert.equal(expired.state.dialogue.last_turn.status, DIALOGUE_TURN_STATUS.CANCELLED);
+  assert.equal(expired.state.dialogue.last_turn.reason, DIALOGUE_REASON.TIME_BUDGET);
 });
 
 test("切回 Mapping 是人工中止；Dialogue runRequest 不携带 runtime locator", () => {

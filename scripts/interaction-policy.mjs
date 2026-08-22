@@ -253,6 +253,15 @@ export function setInteractionPolicyMode(state, {
 
 const stopDialogue = (state, reason, now) => {
   const next = clone(state);
+  if (next.dialogue.active_turn) {
+    next.dialogue.last_turn = {
+      ...next.dialogue.active_turn,
+      status: DIALOGUE_TURN_STATUS.CANCELLED,
+      finalized_at: iso(now),
+      reason,
+    };
+    next.dialogue.active_turn = null;
+  }
   next.dialogue.status = DIALOGUE_STATUS.COMPLETED;
   next.dialogue.stop_reason = reason;
   next.dialogue.ended_at = iso(now);
@@ -285,14 +294,14 @@ export function reserveDialogueTurn(state, {
     return { ok: true, changed: false, duplicate: true, reason: DIALOGUE_REASON.DUPLICATE,
       state: clone(state), reservation: clone(prior) };
   }
-  if (state.dialogue.active_turn) {
-    return { ok: false, reason: DIALOGUE_REASON.TURN_ACTIVE };
-  }
 
   const deadline = Date.parse(state.dialogue.deadline_at);
   if (!Number.isFinite(deadline) || now >= deadline) {
     return { ok: true, changed: true, accepted: false, reason: DIALOGUE_REASON.TIME_BUDGET,
       state: stopDialogue(state, DIALOGUE_REASON.TIME_BUDGET, now) };
+  }
+  if (state.dialogue.active_turn) {
+    return { ok: false, reason: DIALOGUE_REASON.TURN_ACTIVE };
   }
   if (state.dialogue.usage.rounds_started >= state.dialogue.budget.max_rounds) {
     return { ok: true, changed: true, accepted: false, reason: DIALOGUE_REASON.ROUND_BUDGET,

@@ -359,6 +359,8 @@ import 十个模块，底座不反向依赖它（有测试守着方向）。
 
 | 你想做什么 | 文档 |
 |---|---|
+| 理解下一阶段的产品目标、模式和验收标准 | [第三方智能体增强：产品需求文档](docs/requirements/agent-enhancement-requirements.md) |
+| 评审重构边界、实体模型、路由和生命周期 | [第三方智能体增强：架构契约](docs/architecture/agent-enhancement-contract.md) |
 | 从零安装 Codex 飞书桥 | [CODEX_SETUP.md](CODEX_SETUP.md) |
 | 从零安装 Claude Code 飞书桥 | [SETUP.md](SETUP.md) |
 | 查看 Claude 当前运行状态与历史问题 | [STATE.md](STATE.md) |

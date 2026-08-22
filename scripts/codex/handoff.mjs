@@ -94,7 +94,7 @@ export function classifyRunnerDiagnostic(stderr) {
   return null;
 }
 
-const DIRECT_INBOUND_EXECUTION = /^(?:exec\s+)?(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*(?:[^\s"';&|]*\/)?node(?:js)?(?:\s+--[^\s"';&|]+)*\s+["']?(?:[^\s"';&|]*\/)?scripts\/codex\/(?:aily-)?inbound\.mjs["']?(?:\s|$)/u;
+const DIRECT_INBOUND_EXECUTION = /^(?:exec\s+)?(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*(?:[^\s"';&|]*\/)?node(?:js)?(?:\s+(?:-r|--require)\s+[^\s"';&|]+|\s+--[^\s"';&|]+|\s+-[A-Za-z]+)*\s+["']?(?:[^\s"';&|]*\/)?scripts\/codex\/(?:aily-)?inbound\.mjs["']?(?:\s|$)/u;
 
 /**
  * 只把真正执行 Codex 入站入口的 shell segment 认作递归。
@@ -106,7 +106,7 @@ const DIRECT_INBOUND_EXECUTION = /^(?:exec\s+)?(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9
 export function isCodexInboundExecution(command) {
   if (typeof command !== "string" || command.trim().length === 0) return false;
   const text = command.trim();
-  const wrapped = text.match(/^(?:[^\s"']*\/)?(?:zsh|bash|sh)\s+-lc\s+(["'])([\s\S]*)\1$/u);
+  const wrapped = text.match(/^(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*(?:[^\s"']*\/)?(?:zsh|bash|sh)\s+-l?c\s+(["'])([\s\S]*)\1$/u);
   const executableText = wrapped ? wrapped[2] : text;
   // 不按换行拆分：换行后的文本可能是 heredoc/测试夹具，不代表新的 shell command。
   return executableText.split(/&&|\|\||[;|]/u).some((segment) =>

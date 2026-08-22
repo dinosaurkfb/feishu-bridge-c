@@ -1496,6 +1496,11 @@ test("bridge_recursion 只识别真实入口执行，不把源码引用和排障
     "/bin/zsh -lc \"node /bridge/scripts/codex/aily-inbound.mjs\""), true);
   assert.equal(isCodexInboundExecution(
     "cd /bridge && FEISHU_BRIDGE_ROLE=test node scripts/codex/inbound.mjs"), true);
+  assert.equal(isCodexInboundExecution(
+    "node -r ts-node/register /bridge/scripts/codex/inbound.mjs"), true);
+  assert.equal(isCodexInboundExecution(
+    "env bash -c 'FEISHU_CODEX_BRIDGE_HOME=/tmp node /bridge/scripts/codex/aily-inbound.mjs --dry-run'"),
+    true);
 
   const benignCommands = [
     "sed -n '1,220p' scripts/codex/inbound.mjs",
@@ -1504,6 +1509,7 @@ test("bridge_recursion 只识别真实入口执行，不把源码引用和排障
     "/bin/zsh -lc \"git diff -- scripts/codex/inbound.mjs && rg -n 'm5codex-inbound-router' .\"",
     "node --input-type=module <<'NODE'\nconst marker = 'scripts/codex/inbound.mjs';\nNODE",
     "node --input-type=module <<'NODE'\nconst fixture = `\nnode /bridge/scripts/codex/inbound.mjs\n`;\nNODE",
+    "node -e \"console.log('scripts/codex/inbound.mjs')\"",
   ];
   for (const command of benignCommands) assert.equal(isCodexInboundExecution(command), false, command);
 

@@ -202,5 +202,5 @@ subscription 歧义、chat scope、binding 授权快照同步、代际轮转与�
 - `references/dialogue-binding-authorization-v1.schema.json`、
   `references/dialogue-bound-authorization-shadow-v1.schema.json` 与
   [`dialogue-binding-authorization-shadow.md`](dialogue-binding-authorization-shadow.md) 固化旁路契约；
-- Claude 353/353、Codex 80/80 通过；共享导出面扩展为 21 个模块、195 个导出并更新快照；
+- Claude 354/354、Codex 80/80 通过；共享导出面扩展为 21 个模块、195 个导出并更新快照；
 - 证据层级仍是本地合成/契约测试，不等于 Slice B 权威路由或 Slice C Agent Relay 已实现、安装或验收。

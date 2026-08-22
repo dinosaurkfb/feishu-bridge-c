@@ -88,7 +88,8 @@ import {
 import {
   BINDING_AUTHORIZATION_ARTIFACT_TYPE, BINDING_AUTHORIZATION_REASON,
   BOUND_AUTHORIZATION_SHADOW_ARTIFACT_TYPE,
-  buildLegacyDialogueBoundAuthorizationContext, evaluateDialogueBoundAuthorization,
+  buildLegacyDialogueBoundAuthorizationContext, createDialogueBoundAuthorizationShadow,
+  evaluateDialogueBoundAuthorization,
   validateDialogueBindingAuthorizationSnapshot, validateDialogueBoundAuthorizationShadow,
 } from "./dialogue-binding-authorization.mjs";
 import {
@@ -705,6 +706,40 @@ test("bound authorization 投影歧义 fail-closed，shadow 开关默认关闭",
     false);
   assert.equal(dialogueAuthorizationShadowEnabled({ FEISHU_DIALOGUE_AUTHORIZATION_SHADOW: "1" }),
     true);
+});
+
+test("shadow artifact 畸形输入与 sidecar I/O 失败都只返回诊断", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-auth-failure-"));
+  const synced = syncDialogueAuthorizationShadowSnapshot({
+    shadowDir, authorizationInput: fixture.context.authorizationInput, capturedAt: NOW,
+  });
+  assert.doesNotThrow(() => createDialogueBoundAuthorizationShadow({
+    snapshot: synced.snapshot,
+    canonicalEvent: fixture.unverifiedEvent,
+    comparison: { mode: "shadow", scope_unverified: {} },
+    recordedAt: NOW,
+  }));
+  assert.equal(createDialogueBoundAuthorizationShadow({
+    snapshot: synced.snapshot,
+    canonicalEvent: fixture.unverifiedEvent,
+    comparison: { mode: "shadow", scope_unverified: {} },
+    recordedAt: NOW,
+  }).ok, false);
+
+  const blockedPath = path.join(shadowDir, "blocked");
+  fs.writeFileSync(blockedPath, "not-a-directory");
+  const failed = recordDialogueBoundAuthorizationShadow({
+    shadowDir: blockedPath,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.unverifiedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  assert.equal(failed.ok, false);
+  assert.match(failed.reason, /^shadow_/u);
 });
 
 test("Dialogue Slice B1 schema 固化授权快照与 shadow artifact", () => {

@@ -101,11 +101,11 @@ Sidecar 不取得 binding 生命周期锁，不参与 claim 或路由。目录�
 
 ## 7. 本地证据
 
-- Claude 公共测试 353/353；
+- Claude 公共测试 354/354；
 - Codex adapter 测试 80/80；
 - 共用面 21 个模块、195 个导出，与快照一致；
 - 覆盖 opaque 化、revision 幂等/暂停、chat 未核验拒绝、可信 scope 接受、binding ref 防伪、投影
-  歧义 fail-closed、sidecar 重复幂等、Codex dispatcher 完整握手旁路和默认关闭；
+  歧义 fail-closed、sidecar 重复幂等/I/O 失败隔离、Codex dispatcher 完整握手旁路和默认关闭；
 - 未做安装、真实飞书写入、权威切流或第二 Agent dispatch。
 
 这些是本地合成与契约证据，不替代上述真实链路门禁。

@@ -1,8 +1,9 @@
 # Mapping Policy Handler 迁移
 
-状态：候选实现完成，尚未正式安装或进行真实飞书链路验收。
+状态：已由 PR #7 合并到 `main`，并随 `main@61c4a8b` 正式安装。当前保持 shadow、非权威模式；
+尚未用安装后的真实样本完成一致性验收，也尚未切换权威读取路径。
 
-对应分支：`refactor/mapping-policy-handler`。
+历史交付分支：`refactor/mapping-policy-handler`。
 
 ## 1. 交付范围
 
@@ -140,5 +141,6 @@ outbox。已写入 claim/receipt 的新审计字段可被旧版安全忽略。
 - 两端现有 selector、claim、绑定、投递、outbox 与卡片回归保持通过；
 - 公共导出面快照明确纳入 `mapping-policy.mjs`。
 
-当前证据层级：本地合成/集成测试，Claude `313` 项、Codex `69` 项、公共 contract 通过。
-这不能替代正式安装后的真实 mention、秒级受理、精确目标运行、严格终局和原话题回写验收。
+当前证据层级：切片合并前的本地合成/集成测试，以及 `main@61c4a8b` 安装后的机器级自检。
+当前全仓基线为 Claude `320` 项、Codex `74` 项、公共 contract 通过。这不能替代安装后的真实
+mention、秒级受理、精确目标运行、严格终局和原话题回写验收；真实样本通过前旧 selector 继续承重。

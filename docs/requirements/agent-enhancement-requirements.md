@@ -272,16 +272,16 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 
 | 能力 | 当前 main | 本次目标 |
 |---|---|---|
-| Aily → 本机 endpoint | Claude/Codex 均可用 | 统一 endpoint 状态模型 |
-| hook 强制进入运输层 | Claude 在 `c81a6c2` 接入 hook + dispatcher；Codex 的统一 dispatcher/无损 Canonical Event 候选已在 `feat/codex-inbound-dispatcher-contract` 完成本地回归，尚未正式安装和真实验收 | 评审候选、单独安装并扩大两端真实验证样本 |
-| 项目—群订阅 | 隐含在模板和 binding 中 | 独立 subscription 实体与命令 |
-| 精确话题—会话绑定 | 已支持，Codex/Claude 语义略有差异 | 统一生命周期与 ID 模型 |
-| 映射模式 | 核心链路已实现 | 形成正式 policy handler |
-| 话题轮转 | 未实现 | 稳定 binding + generation |
+| Aily → 本机 endpoint | Claude/Codex 均可用，共享 dispatcher 与 Canonical Event v1 已进入 `main` | 扩大真实样本并统一 endpoint 状态展示 |
+| hook 强制进入运输层 | Claude/Codex hooks 均已正式安装；dispatcher 契约已由 PR #6 合并 | 用新的真实 mention 验收秒级受理、精确续接与原话题回写 |
+| 项目—群订阅 | Subscription v1、首次认领消费者和 claim 纵切已由 PR #5 合并；尚未开放多订阅写入口 | 开放受控多订阅管理，不改变现有单订阅默认行为 |
+| 精确话题—会话绑定 | 稳定 binding 与 Topic Generation 兼容投影已进入 `main`，Claude/Codex 保留各自 runtime locator | 继续统一生命周期与对外状态语义 |
+| 映射模式 | Mapping Policy Handler 已由 PR #7 合并并安装；旧 selector 仍唯一承重，新候选只做 shadow comparison | 真实样本一致后再灰度切换权威读取路径 |
+| 话题轮转 | Topic Generation 生命周期与显式 rotate 命令已由 PR #8 合并并安装；尚未进行首次真实轮转验收，也没有自动消息数阈值 | 验收新旧代际、来源回复、取消/过期和不串线，再评估多订阅 |
 | 对话模式 | 未实现 | 受控编排、预算、停止与中断 |
 | 项目推进/专家/带教 | 原型仅在未合并的 `feat/agent-supervisor-shadow-mvp` 实验分支，`main` 不含相关实现 | 纳入管理策略和分级权限 |
 | 多人授权 | 未实现 | 身份授权矩阵与审计归属 |
-| 显式控制面 | bind/status/unbind 已有，部分自然语言分类过宽 | 结构化 intent；普通讨论零副作用 |
+| 显式控制面 | bind/status/unbind/rotate 均为显式命令；普通讨论不会触发写操作 | 后续新模式继续沿用结构化 intent 与逐次授权 |
 
 ## 10. 验收标准
 
@@ -325,7 +325,8 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 
 - subscription 的管理单位是“项目根目录”还是更抽象的业务域 ID；
 - 一个本地 target 是否允许多个活动出站目标，若允许，默认内容级别是什么；
-- 自动轮转的默认阈值及是否只提示、不自动执行；
+- 自动轮转的默认阈值及是否只提示、不自动执行；当前实现**不按消息数自动轮转**，只接受显式
+  `$feishu-rotate` / `/feishu-rotate`；候选话题等待首次真实 mention 的认领期限默认 24 小时；
 - 对话模式首个版本是否只支持一个主持者和串行轮次；
 - 管理模式中哪些 execute 动作可以预授权，哪些始终逐次授权；
 - 多人场景的角色模型与飞书组织身份如何映射。

@@ -339,7 +339,7 @@ references/
 ## 开发与验证
 
 ```bash
-npm test                         # Claude 319 项 + Codex adapter 74 项回归
+npm test                         # Claude 320 项 + Codex adapter 74 项回归
 npm run test:claude              # 只运行 Claude 基线
 npm run test:codex               # 只运行 Codex adapter
 npm run doctor:codex             # Codex 机器级只读自检；不写配置、不联网
@@ -352,14 +352,14 @@ npm run install:codex:preview    # 预览 Codex 安装会修改什么
 ## 两条链路的共用边界
 
 `scripts/` 是底座，`scripts/codex/` 是 Codex 适配层。依赖是**单向**的：适配层从底座
-import 十五个模块，底座不反向依赖它（有测试守着方向）。
+import 十六个模块，底座不反向依赖它（有测试守着方向）。
 
-这意味着那十五个模块是真正的接触面 —— 任何一方改它，都可能悄悄改掉另一方依赖的东西。
+这意味着那十六个模块是真正的接触面 —— 任何一方改它，都可能悄悄改掉另一方依赖的东西。
 所以有三层护栏，从便宜到贵：
 
 | 护栏 | 抓什么 | 成本 |
 |---|---|---|
-| `npm run contract` | 共用模块的**导出面**变了（多了、少了、改名） | 机械，覆盖全部十个 |
+| `npm run contract` | 共用模块的**导出面**变了（多了、少了、改名） | 机械，覆盖全部十六个 |
 | 行为契约测试 | 共用模块的**语义**变了（判重算法、文件命名、字段默认值） | 人工，只覆盖想得到的 |
 | `npm test` 同时跑两套 | 一方真的弄坏了另一方 | 已经是默认行为 |
 
@@ -381,6 +381,7 @@ import 十五个模块，底座不反向依赖它（有测试守着方向）。
 | 理解下一阶段的产品目标、模式和验收标准 | [第三方智能体增强：产品需求文档](docs/requirements/agent-enhancement-requirements.md) |
 | 评审重构边界、实体模型、路由和生命周期 | [第三方智能体增强：架构契约](docs/architecture/agent-enhancement-contract.md) |
 | 评审现有映射模式如何迁移到公共 Policy Handler | [Mapping Policy Handler 迁移](docs/implementation/mapping-policy-handler.md) |
+| 理解话题轮转、代际切换与 24 小时认领期限 | [Topic Generation 生命周期](docs/implementation/topic-generation-lifecycle.md) |
 | 从零安装 Codex 飞书桥 | [CODEX_SETUP.md](CODEX_SETUP.md) |
 | 从零安装 Claude Code 飞书桥 | [SETUP.md](SETUP.md) |
 | 查看 Claude 当前运行状态与历史问题 | [STATE.md](STATE.md) |

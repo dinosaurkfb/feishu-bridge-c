@@ -1,7 +1,8 @@
 # Topic Generation 生命周期实现
 
-状态：候选实现，分支 `feat/topic-generation-lifecycle`。本切片实现需求 FR-8 与架构契约 8.2、8.3、
-INV-9；不开放多订阅、多人授权或新的 Dialogue/Management policy。
+状态：已由 PR #8 合并到 `main`，merge commit `61c4a8b`，并已正式安装到本机 Claude/Codex 链路；
+等待首次真实 Topic Generation 轮转验收。本切片实现需求 FR-8 与架构契约 8.2、8.3、INV-9；
+不开放多订阅、多人授权或新的 Dialogue/Management policy。
 
 ## 1. 目标与边界
 
@@ -47,6 +48,9 @@ binding
 5. 认领时重新加锁并校验 generation、operation、期限和 session 唯一性；
 6. 在同一 binding 文档的一次临时文件 + `rename` 替换中，将新代际设 active、旧代际设 read-only；
 7. 超时后的下一次认领尝试或显式 `--cancel --apply` 会原子退休 pending，旧 active 不变。
+
+当前没有按消息数量、话题回复数量或时间自动发起轮转的策略。只有用户显式运行 rotate 命令才会
+创建 pending generation；24 小时是新话题等待首次真实 mention 的认领期限，不是旧话题的消息上限。
 
 话题创建成功但本地 phase 2 写入失败时，不猜测或自动重建：旧代际继续 active，外部新话题作为
 可对账的孤立证据保留，由人工检查后重试或关闭。
@@ -108,6 +112,7 @@ session locator、凭据、claim 或 receipt。
 - 新旧 outbox 目标分别发布到正确根话题的合成测试；
 - 全量 `npm test`、共享导出面 `npm run contract` 与 `git diff --check`。
 
-安装与真实话题轮转是独立授权动作。本分支合并本身不改 `~/.claude`、`~/.codex` 或飞书状态。
+安装与真实话题轮转是独立授权动作。当前版本已完成安装，但安装本身没有创建、修改或轮转任何飞书
+话题；首次真实轮转仍需在目标 task/session 中显式运行 rotate 命令。
 回滚代码时保留 Git 外 registry 和话题历史；旧读取方继续使用已物化的唯一 active 字段。若已经完成
 轮转，不应通过改代码把 read-only 旧话题重新冒充 active，应使用后续受控迁移完成反向轮转。

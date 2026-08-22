@@ -15,6 +15,9 @@ import {
   materializeDialogueBindingAuthorization, validateDialogueBindingAuthorizationSnapshot,
   validateDialogueBoundAuthorizationShadow,
 } from "./dialogue-binding-authorization.mjs";
+import {
+  createDialogueChatScopeProbe, validateDialogueChatScopeProbe,
+} from "./dialogue-chat-scope-probe.mjs";
 
 export function dialogueAuthorizationShadowEnabled(env = process.env) {
   return env.FEISHU_DIALOGUE_AUTHORIZATION_SHADOW === "1";
@@ -39,6 +42,25 @@ const atomicWriteJson = (file, value) => {
   } finally {
     try { fs.unlinkSync(tmp); } catch { /* rename 已完成或写入前失败 */ }
   }
+};
+
+const recordChatScopeProbe = ({ shadowDir, snapshot, canonicalEvent, observedAt }) => {
+  const composed = createDialogueChatScopeProbe({ snapshot, canonicalEvent, observedAt });
+  if (!composed.ok) return composed;
+  const file = path.join(shadowDir, "scope-probes", composed.probe.probe_id + ".json");
+  const existing = readJson(file);
+  if (!existing.ok) return existing;
+  if (existing.value !== null) {
+    return validateDialogueChatScopeProbe(existing.value).ok
+      ? { ok: true, changed: false, duplicate: true, probe: existing.value, file }
+      : { ok: false, reason: "chat_scope_probe_invalid" };
+  }
+  try { atomicWriteJson(file, composed.probe); }
+  catch (err) {
+    return { ok: false, reason: "chat_scope_probe_write_failed",
+      error: String(err.message).slice(0, 200) };
+  }
+  return { ok: true, changed: true, duplicate: false, probe: composed.probe, file };
 };
 
 export function syncDialogueAuthorizationShadowSnapshot({
@@ -79,6 +101,11 @@ export function recordDialogueBoundAuthorizationShadow({
       shadowDir, authorizationInput, capturedAt: now,
     });
     if (!synced.ok) return synced;
+    // B2 探针只收集不可逆一致性证据。即使它写入失败，B1 的 authorization shadow 仍继续；
+    // 两者都不允许改变 legacy verdict、claim 或 dispatch。
+    const scopeProbe = recordChatScopeProbe({
+      shadowDir, snapshot: synced.snapshot, canonicalEvent, observedAt: now,
+    });
     const candidate = evaluateDialogueBoundAuthorization({
       snapshot: synced.snapshot, canonicalEvent, runtimeNamespace, expectedBindingRef, now,
     });
@@ -93,12 +120,12 @@ export function recordDialogueBoundAuthorizationShadow({
     if (existing.value !== null) {
       return validateDialogueBoundAuthorizationShadow(existing.value).ok
         ? { ok: true, changed: false, duplicate: true, snapshot: synced.snapshot,
-          candidate, comparison, evidence: existing.value, file }
+          candidate, comparison, evidence: existing.value, scopeProbe, file }
         : { ok: false, reason: "shadow_evidence_invalid" };
     }
     atomicWriteJson(file, composed.evidence);
     return { ok: true, changed: true, duplicate: false, snapshot: synced.snapshot,
-      candidate, comparison, evidence: composed.evidence, file };
+      candidate, comparison, evidence: composed.evidence, scopeProbe, file };
   } catch (err) {
     return { ok: false, reason: "shadow_unavailable", error: String(err.message).slice(0, 200) };
   }

@@ -1,9 +1,8 @@
 # Dialogue Participant & Planner：下一纵切契约
 
-状态：Slice A 候选实现已位于 `feat/dialogue-participant-foundation`：公共纯函数、两份 versioned
-schema、离线 simulator 与 Claude/Codex 回归已完成。叠加分支
-`feat/dialogue-multi-subscription-shadow` 已把 opaque binding authorization snapshot 作为默认关闭的
-只读旁路接入双 adapter；仍未安装、未切换权威路由、未发送飞书消息，也未打开 Agent 输出自动接力。
+状态：Slice A 与 B1 已由 PR #14/#15 合并 `main`，但默认关闭、未安装、未切生产权威路由。
+Slice B2a `feat/dialogue-chat-scope-probe` 只收集 Aily channel locator 的脱敏 presence/一致性证据；
+canonical event 仍保持 `scope_unverified`，也未打开 Agent 输出自动接力。
 
 ## 1. 为什么不能直接打开 Agent 自动接力
 
@@ -43,6 +42,9 @@ Dialogue v1 只有一名已授权人类和当前 binding 的主持 target。当�
 3. subscription 变更能原子更新或暂停依赖 binding 的 materialized authorization snapshot；
 4. 同一事件的 legacy route 与 candidate route 在真实样本中持续一致，歧义时 fail-closed；
 5. 回滚可恢复到现有精确 binding 热路径，且不会重放 run/outbox。
+
+可信 chat locator 的调查先由 Slice B2a 完成。它只记录脱敏布尔证据，不设置 `verified=true`；详细契约
+见 [`dialogue-chat-scope-probe.md`](dialogue-chat-scope-probe.md)。
 
 ### Slice C：Agent Relay v1
 
@@ -189,7 +191,7 @@ subscription 歧义、chat scope、binding 授权快照同步、代际轮转与�
 
 本地与 shadow 证据不能替代 Slice B/C 的真实链路验收。
 
-## 9. Slice A / B1 候选实现证据
+## 9. Slice A / B1 / B2a 候选实现证据
 
 - `scripts/dialogue-participant-planner.mjs` 实现 opaque binding/participant/output ref、不可变快照校验、
   固定 `host -> peer -> host finalizer` 纯函数 planner、完整 cycle 预算预检、重复事件幂等、deadline、
@@ -202,5 +204,8 @@ subscription 歧义、chat scope、binding 授权快照同步、代际轮转与�
 - `references/dialogue-binding-authorization-v1.schema.json`、
   `references/dialogue-bound-authorization-shadow-v1.schema.json` 与
   [`dialogue-binding-authorization-shadow.md`](dialogue-binding-authorization-shadow.md) 固化旁路契约；
-- Claude 354/354、Codex 80/80 通过；共享导出面扩展为 21 个模块、195 个导出并更新快照；
+- Slice B2a 新增 `scripts/dialogue-chat-scope-probe.mjs` 与
+  `references/dialogue-chat-scope-probe-v1.schema.json`，只把 locator presence/一致性写成布尔证据；
+  原始 locator 不落盘，探针失败不阻断 B1 或 legacy 路由；
+- Claude 356/356、Codex 80/80 通过；共享导出面保持 21 个模块、195 个导出；
 - 证据层级仍是本地合成/契约测试，不等于 Slice B 权威路由或 Slice C Agent Relay 已实现、安装或验收。

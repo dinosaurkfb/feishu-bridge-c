@@ -297,7 +297,7 @@ Relay 必须显式使用新的 policy version；其预算分别统计 human cycl
 | 精确话题—会话绑定 | 稳定 binding 与 Topic Generation 兼容投影已进入 `main`，Claude/Codex 保留各自 runtime locator | 继续统一生命周期与对外状态语义 |
 | 映射模式 | Mapping Policy Handler 已由 PR #7 合并并安装；旧 selector 仍唯一承重，新候选只做 shadow comparison | 真实样本一致后再灰度切换权威读取路径 |
 | 话题轮转 | Topic Generation 生命周期与显式 rotate 命令已由 PR #8 合并并安装；Codex 第 2 代话题的创建、真实 mention 认领与 binding 切换已完成首次真实验收；自动轮转 v1 已合并 `main`，按每代际 30 条有效业务消息创建 pending，新代际仍需真实 mention，但正式安装与真实自动触发验收后置 | 单独安装并验收自动创建、失败重试与不重复轮转，再评估多订阅 |
-| 对话模式 | Dialogue v1 已由 PR #11 合并 `main` 并完成 Codex 真实 3 回合验收；Slice A foundation 已形成公共 schema、纯函数 planner 与 simulator；Slice B1 已形成默认关闭的双 adapter binding authorization shadow 候选，但均未安装或切权威路由 | 评审/合并 Slice A/B1；多订阅权威路由必须等自动轮转 v1、可信 chat scope、授权快照同步和真实 shadow 一致性完成验收后再灰度切流，最后才开启固定串行 Agent Relay |
+| 对话模式 | Dialogue v1 已由 PR #11 合并 `main` 并完成 Codex 真实 3 回合验收；Slice A/B1 已由 PR #14/#15 合并 `main`，默认关闭且未安装；Slice B2a 正在增加不提升 trust 的脱敏 chat scope probe | 先用真实样本验证 Aily locator；多订阅权威路由必须等自动轮转 v1、可信 chat scope、授权快照同步和真实 shadow 一致性完成验收后再灰度切流，最后才开启固定串行 Agent Relay |
 | 项目推进/专家/带教 | 原型仅在未合并的 `feat/agent-supervisor-shadow-mvp` 实验分支，`main` 不含相关实现 | 纳入管理策略和分级权限 |
 | 多人授权 | 未实现 | 身份授权矩阵与审计归属 |
 | 显式控制面 | bind/status/unbind/rotate/mode 均已作为显式命令安装；无参 mode 只读，只有整条输入中的 `dialogue` / `mapping` 才写状态，真实验收已验证异常格式不触发 | 后续模式继续沿用结构化 intent 与逐次授权 |

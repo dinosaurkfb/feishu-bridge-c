@@ -1057,6 +1057,16 @@ test("Dialogue shadow readiness 合并多目录时检测跨目录重复且不重
     "同一 correlation key 的重复 artifact 不能被多算为完整配对");
   assert.equal(analyzed.report.correlation.orphan_events, 2);
   assert.equal(analyzed.report.correlation.orphan_probes, 2);
+
+  const cli = spawnSync(process.execPath, [path.resolve("scripts", "dialogue-shadow-audit.mjs"),
+    "--shadow-dir", firstDir, "--shadow-dir", secondDir, "--json"], { encoding: "utf-8" });
+  assert.equal(cli.status, 0, cli.stderr);
+  const cliReport = JSON.parse(cli.stdout);
+  assert.equal(cliReport.decision, DIALOGUE_SHADOW_READINESS_DECISION.NOT_READY);
+  for (const secret of [firstDir, secondDir, wrote.evidence.event_ref, wrote.snapshot.binding_ref]) {
+    assert.equal(cli.stdout.includes(secret), false,
+      "多目录 CLI 汇总不得回显私有路径或 opaque ref");
+  }
 });
 
 test("Dialogue shadow readiness 把损坏、孤立和 CLI 路径统一收敛为脱敏诊断", () => {
@@ -1099,10 +1109,11 @@ test("Dialogue shadow readiness schema 与运行时 artifact 固化一致", () =
   ]);
   const reasonNames = schema.$defs.eventMetrics.properties.candidate_reason_counts
     .propertyNames.enum;
-  assert.equal(reasonNames.includes("accepted"), true);
-  assert.equal(reasonNames.includes("other"), true);
-  assert.equal(reasonNames.includes("private-uncontrolled-reason"), false,
-    "JSON Schema 与运行时都只能接受受控 reason bucket");
+  const runtimeReasonNames = ["accepted", "other", ...new Set([
+    ...Object.values(BINDING_AUTHORIZATION_REASON), ...Object.values(REJECT),
+  ])].sort();
+  assert.deepEqual([...reasonNames].sort(), runtimeReasonNames,
+    "JSON Schema 与运行时必须维护完全相同的受控 reason bucket 集合");
 });
 
 // ---------- Mapping Policy：公共准入、处置与 runtime-neutral runRequest ----------

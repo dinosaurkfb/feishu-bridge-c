@@ -539,6 +539,12 @@ test("Codex adapter 轮转期间旧 session 继续路由，认领后新旧代际
     "read-only");
   assert.equal(resolveTaskOutboundGeneration(stored, switched.previousGeneration.channel_generation_id)
     .rootMessageId, "om_old", "轮转前冻结的结果仍回原话题");
+  const status = spawnSync(process.execPath, [
+    path.join(ROOT, "scripts", "codex", "feishu-status.mjs"),
+    "--thread-id", THREAD_A,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /只读历史代际：1 个.*轮转前受理的结果仍会发回原话题/u);
 });
 
 test("Codex 轮转取消只退休 pending generation，不影响旧 active", () => {

@@ -79,6 +79,12 @@ opaque generation id，保证升级前 run 冻结的 `origin_channel_generation_
 
 这保证轮转前受理的请求仍回旧话题，轮转完成后形成的新本地结果进入新话题。
 
+旧 outbox 没有 `target_channel_generation_id`，publisher 会用内部组键 `__legacy_active__` 把它们
+归为一组，并在**发布时**解析当前 active。由于历史记录没有足够证据反推出形成时的话题，这个
+兼容回落无法承诺原代际：如果升级时仍有旧 pending outbox，随后又先完成一次轮转，这些旧条目
+会进入新 active，而不是升级前的话题。安装不会自动补发历史积压；首次轮转前应先用 status 检查
+待发数量，并按既有逐次授权流程处理或保留。新版本形成的每条 outbox 都带冻结字段，不再有此歧义。
+
 ## 6. Runtime adapter 与命令
 
 | 能力 | Claude | Codex |

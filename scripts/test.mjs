@@ -2591,6 +2591,24 @@ test("status 只读，且不把话题 id 之类的 locator 打进人类可读输
   assert.ok(!text.includes("session_x"), "Aily session 同理");
 });
 
+test("status 明确说明只读旧话题仍会接收轮转前受理的迟到结果", () => {
+  const text = describeStatus({
+    ok: true,
+    displayName: "演示",
+    suspended: false,
+    level: "project",
+    claudeSessionId: null,
+    activeGeneration: 2,
+    pendingGeneration: null,
+    pendingGenerationExpiresAt: null,
+    readOnlyGenerations: 1,
+    inboundBound: true,
+    expiresAt: null,
+    pending: 0,
+  });
+  assert.match(text, /只读历史.*轮转前受理的结果仍会发回原话题/u);
+});
+
 test("暂停把出站和入站同时关掉 —— 靠的是两边本来就在看的那个字段", () => {
   const { proj, f } = controlFixture();
   const r = setBindingStatus({ root: proj, status: SUSPENDED, registryFile: f.registryFile });

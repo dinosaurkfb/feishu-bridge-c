@@ -168,7 +168,10 @@ export function describeStatus(st, others = []) {
     lines.push("待认领    第 " + st.pendingGeneration + " 代" +
       (st.pendingGenerationExpiresAt ? "（截止 " + st.pendingGenerationExpiresAt + "）" : ""));
   }
-  if (st.readOnlyGenerations > 0) lines.push("只读历史  " + st.readOnlyGenerations + " 个代际");
+  if (st.readOnlyGenerations > 0) {
+    lines.push("只读历史  " + st.readOnlyGenerations +
+      " 个代际（不再接收新指令；轮转前受理的结果仍会发回原话题）");
+  }
   lines.push("出站      " + (st.suspended ? "暂停中，进展留在本地不发出" : "正常"));
   lines.push("入站      " + (st.suspended ? "暂停中，话题里的指令一律被拒"
     : st.inboundBound ? "已绑定" : "还差一步：去话题里 @ 一下运输 agent"));

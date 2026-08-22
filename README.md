@@ -339,7 +339,7 @@ references/
 ## 开发与验证
 
 ```bash
-npm test                         # Claude 318 项 + Codex adapter 74 项回归
+npm test                         # Claude 319 项 + Codex adapter 74 项回归
 npm run test:claude              # 只运行 Claude 基线
 npm run test:codex               # 只运行 Codex adapter
 npm run doctor:codex             # Codex 机器级只读自检；不写配置、不联网

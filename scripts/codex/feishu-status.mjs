@@ -46,7 +46,10 @@ if (pendingTopic) {
   console.log("待认领话题代际：第 " + pendingTopic.generation + " 代" +
     (pendingTopic.claim_expires_at ? "（截止 " + pendingTopic.claim_expires_at + "）" : ""));
 }
-if (readOnlyCount > 0) console.log("只读历史代际：" + readOnlyCount + " 个");
+if (readOnlyCount > 0) {
+  console.log("只读历史代际：" + readOnlyCount +
+    " 个（不再接收新指令；轮转前受理的结果仍会发回原话题）");
+}
 console.log("飞书入站：" + (active
   ? (task.inbound_state === "bound" ? "已绑定" : "等待首次真实 @M5Codex")
   : "已暂停"));

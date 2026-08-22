@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://feishu-bridge.local/schemas/canonical-event-v1.schema.json",
+  "title": "Feishu Bridge Canonical Event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "event_id", "event_type", "occurred_at", "endpoint_id",
+    "source", "actor", "mention", "content", "raw_envelope", "extensions"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "event_id": { "type": "string", "minLength": 1 },
+    "event_type": { "const": "im.message.receive" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "endpoint_id": { "type": "string", "minLength": 1 },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "tenant_id", "chat_id", "root_id", "topic_id"],
+      "properties": {
+        "session_id": { "type": "string", "minLength": 1 },
+        "tenant_id": { "type": ["string", "null"] },
+        "chat_id": { "type": ["string", "null"] },
+        "root_id": { "type": ["string", "null"] },
+        "topic_id": { "type": ["string", "null"] }
+      }
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sender_id", "caller_agent_uid"],
+      "properties": {
+        "sender_id": { "type": "string", "minLength": 1 },
+        "caller_agent_uid": { "type": "string", "minLength": 1 }
+      }
+    },
+    "mention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_open_id", "target_open_ids", "is_real"],
+      "properties": {
+        "target_open_id": { "type": ["string", "null"] },
+        "target_open_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "is_real": { "type": "boolean" }
+      }
+    },
+    "content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text", "origin"],
+      "properties": {
+        "text": { "type": "string" },
+        "origin": { "const": "feishu" }
+      }
+    },
+    "raw_envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "payload"],
+      "properties": {
+        "format": { "const": "aily-trigger-event/v1" },
+        "payload": {}
+      }
+    },
+    "extensions": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["dispatcher", "aily_channel"],
+      "properties": {
+        "dispatcher": {
+          "type": "object",
+          "required": ["fetch_attempts"],
+          "properties": { "fetch_attempts": { "type": "integer", "minimum": 0 } }
+        },
+        "aily_channel": {
+          "type": "object",
+          "required": ["verified", "chat_id", "thread_id"],
+          "properties": {
+            "verified": { "const": false },
+            "chat_id": { "type": ["string", "null"] },
+            "thread_id": { "type": ["string", "null"] }
+          }
+        }
+      }
+    }
+  }
+}

@@ -106,15 +106,16 @@ export function composeInitContext({ connectionStatus = "none" } = {}) {
 }
 
 export function composeAilyInboundContext({ bridgeRoot, home }) {
-  const inbound = path.join(bridgeRoot, "scripts", "codex", "inbound.mjs");
+  const dispatcher = path.join(bridgeRoot, "scripts", "codex", "aily-inbound.mjs");
   const command = "FEISHU_CODEX_BRIDGE_HOME=" + JSON.stringify(home) +
-    " node " + JSON.stringify(inbound);
+    " node " + JSON.stringify(dispatcher);
   return [
     "[Codex 飞书桥·M5Codex 入站] 当前回合来自 Aily 的 M5Codex 飞书调用。",
     "不得运行 bind-preview.mjs、bind-task.mjs 或 codex-longtask-feishu；不得把 M5Codex 自己的 Aily task 接到飞书。",
     "只执行以下命令，不加参数：",
     "`" + command + "`",
-    "把命令的 stdout 原样作为回复，不增删、解释或改写。脚本会自行判断首次绑定、拒绝或投递。",
+    "把命令的 stdout 原样作为回复，不增删、解释或改写。dispatcher 只取一次信封并确定 handler；",
+    "下游脚本会自行判断首次绑定、拒绝或投递。",
   ].join("\n");
 }
 

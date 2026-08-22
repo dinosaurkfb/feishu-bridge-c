@@ -913,6 +913,16 @@ test("Participant snapshot 使用跨 adapter 固定 opaque ref，不泄露私有
   assert.equal(fixture.snapshot.artifact_type, PARTICIPANT_SNAPSHOT_ARTIFACT_TYPE);
   assert.equal(validateParticipantAuthorizationSnapshot(fixture.snapshot).ok, true);
   assert.equal(JSON.stringify(fixture.snapshot).includes("/private/projects"), false);
+
+  const reordered = structuredClone(fixture.snapshot);
+  reordered.participants = reordered.participants.map((participant) => ({
+    limits: { resource_units_per_run: participant.limits.resource_units_per_run,
+      max_agent_runs: participant.limits.max_agent_runs },
+    allowed_origins: participant.allowed_origins, local_target_id: participant.local_target_id,
+    binding_ref: participant.binding_ref, subscription_id: participant.subscription_id,
+    roles: participant.roles, kind: participant.kind, participant_id: participant.participant_id,
+  }));
+  assert.equal(validateParticipantAuthorizationSnapshot(reordered).ok, true);
 });
 
 test("Relay planner 固定 host→peer→host finalizer，只有 finalizer 后等待人类", () => {

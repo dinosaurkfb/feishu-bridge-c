@@ -162,11 +162,21 @@ const validParticipant = (participant) => {
     participant.allowed_origins.includes(ORIGIN.RELAY);
 };
 
-const normalizedSnapshotParticipants = (participants) => clone(participants ?? []).map((participant) => ({
-  ...participant,
-  roles: [...(participant.roles ?? [])].sort(),
-  allowed_origins: [...(participant.allowed_origins ?? [])].sort(),
-})).sort((a, b) => String(a.participant_id).localeCompare(String(b.participant_id)));
+const normalizedSnapshotParticipants = (participants) => clone(participants ?? []).map(
+  (participant) => ({
+    participant_id: participant?.participant_id,
+    kind: participant?.kind,
+    roles: [...(participant?.roles ?? [])].sort(),
+    subscription_id: participant?.subscription_id,
+    binding_ref: participant?.binding_ref,
+    local_target_id: participant?.local_target_id,
+    allowed_origins: [...(participant?.allowed_origins ?? [])].sort(),
+    limits: {
+      max_agent_runs: participant?.limits?.max_agent_runs,
+      resource_units_per_run: participant?.limits?.resource_units_per_run,
+    },
+  }),
+).sort((a, b) => String(a.participant_id).localeCompare(String(b.participant_id)));
 
 const participantSnapshotId = ({ authorizationRevision, capturedAt, coordinatorBindingRef,
   participants }) => digestRef("participant_snapshot_", [
@@ -479,7 +489,7 @@ const dispatchStep = (state, snapshot, {
   role, inputRef, sourceParticipantId = null, now,
 }) => {
   const next = clone(state);
-  const participant = participantForRole(snapshot, role === ROLE.FINALIZER ? ROLE.FINALIZER : role);
+  const participant = participantForRole(snapshot, role);
   const cycle = next.active_cycle;
   const stepIndex = cycle.steps.length + 1;
   const runId = relayRunId({

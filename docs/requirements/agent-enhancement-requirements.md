@@ -277,7 +277,7 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 | 项目—群订阅 | Subscription v1、首次认领消费者和 claim 纵切已由 PR #5 合并；尚未开放多订阅写入口 | 开放受控多订阅管理，不改变现有单订阅默认行为 |
 | 精确话题—会话绑定 | 稳定 binding 与 Topic Generation 兼容投影已进入 `main`，Claude/Codex 保留各自 runtime locator | 继续统一生命周期与对外状态语义 |
 | 映射模式 | Mapping Policy Handler 已由 PR #7 合并并安装；旧 selector 仍唯一承重，新候选只做 shadow comparison | 真实样本一致后再灰度切换权威读取路径 |
-| 话题轮转 | Topic Generation 生命周期与显式 rotate 命令已由 PR #8 合并并安装；尚未进行首次真实轮转验收，也没有自动消息数阈值 | 验收新旧代际、来源回复、取消/过期和不串线，再评估多订阅 |
+| 话题轮转 | Topic Generation 生命周期与显式 rotate 命令已由 PR #8 合并并安装；Codex 第 2 代话题的创建、真实 mention 认领与 binding 切换已完成首次真实验收；没有自动消息数阈值 | 继续验收旧话题只读、迟到结果来源回复、取消/过期和不串线，再评估多订阅 |
 | 对话模式 | 未实现 | 受控编排、预算、停止与中断 |
 | 项目推进/专家/带教 | 原型仅在未合并的 `feat/agent-supervisor-shadow-mvp` 实验分支，`main` 不含相关实现 | 纳入管理策略和分级权限 |
 | 多人授权 | 未实现 | 身份授权矩阵与审计归属 |

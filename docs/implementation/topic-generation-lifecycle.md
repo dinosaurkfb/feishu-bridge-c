@@ -1,8 +1,9 @@
 # Topic Generation 生命周期实现
 
-状态：已由 PR #8 合并到 `main`，merge commit `61c4a8b`，并已正式安装到本机 Claude/Codex 链路；
-等待首次真实 Topic Generation 轮转验收。本切片实现需求 FR-8 与架构契约 8.2、8.3、INV-9；
-不开放多订阅、多人授权或新的 Dialogue/Management policy。
+状态：已由 PR #8 合并到 `main`，merge commit `61c4a8b`，并已正式安装到本机 Claude/Codex 链路。
+2026-08-22 已完成 Codex 首次真实 happy-path 验收：创建第 2 代话题、真实 mention 认领、旧 active
+切为 read-only、新代际成为 active 并保持原 binding。本切片实现需求 FR-8 与架构契约 8.2、8.3、
+INV-9；不开放多订阅、多人授权或新的 Dialogue/Management policy。
 
 ## 1. 目标与边界
 
@@ -111,6 +112,10 @@ session locator、凭据、claim 或 receipt。
 - Codex 精确 task 轮转、取消 CLI 与状态输出测试；
 - 新旧 outbox 目标分别发布到正确根话题的合成测试；
 - 全量 `npm test`、共享导出面 `npm run contract` 与 `git diff --check`。
+
+真实证据当前覆盖 Codex 的“显式 rotate → 创建 generation 2 → 新话题真实 mention → binding 切换”
+主路径。旧话题对新指令的只读拒绝、轮转前已受理结果回旧话题、显式取消和 24 小时过期仍只有
+合成测试证据；完成这些测试前不得把它们记为真实链路已验收。Claude 侧真实轮转也应单独验证。
 
 安装与真实话题轮转是独立授权动作。当前版本已完成安装，但安装本身没有创建、修改或轮转任何飞书
 话题；首次真实轮转仍需在目标 task/session 中显式运行 rotate 命令。

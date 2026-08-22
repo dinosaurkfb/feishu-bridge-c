@@ -117,9 +117,16 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 1. Owner 可以把一个项目订阅到一个或多个飞书群；
 2. subscription 必须声明允许的 Agent、群/租户、发送者集合和事件类型；
 3. 同一群中的不同 Agent 可以订阅不同项目或业务域；
-4. subscription 只能定义“哪些事件有资格进入该域”，不能替代精确 task/thread 绑定；
-5. 未命中唯一 subscription 时必须拒绝，不得询问模型选择；
-6. 订阅的创建、修改、暂停和删除必须留下审计记录。
+4. subscription 的热路径职责是**未绑定话题的首次认领**：判断该事件有资格进入哪个域、认领哪个
+   pending binding；完成认领后，日常路由直接使用 `topic/session → binding → local target`，不再
+   为每条消息重复匹配 subscription；
+5. subscription 变更由控制面同步到依赖它的 binding 授权快照；暂停或撤销 subscription 时，相关
+   binding 必须被明确暂停或迁移，不能依靠日常热路径重新解释配置；
+6. subscription 不能替代精确 task/thread 绑定；首次认领未命中唯一 subscription 时必须拒绝，
+   不得询问模型选择；
+7. 每个 subscription 字段必须有明确消费者和契约测试；没有任何运行代码读取的字段不得进入稳定
+   schema；
+8. 订阅的创建、修改、暂停和删除必须留下审计记录。
 
 ### FR-3 精确通道绑定
 
@@ -201,6 +208,8 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 - 只有显式命令、显式技能调用、受信按钮事件或等价结构化动作才能修改配置；
 - 普通业务消息中讨论“绑定、订阅、改名、连接”等概念时不得产生控制副作用；
 - 不得用宽泛自然语言正则直接把普通输入升级为写操作；
+- 控制授权只来自已认证的人类 Owner/Operator 控制通道；Agent、子 Agent 或转发内容即使包含完全
+  相同的 `$feishu-bind` 等 token，也不得继承控制权；
 - 控制动作应先解析为结构化 intent，再校验当前精确 target、权限、影响范围和幂等键；
 - 一次明确的 `$feishu-bind` 可以作为该次绑定授权，无需机械地二次确认；扩大范围、迁移或高风险修改仍需独立授权。
 
@@ -213,6 +222,11 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 - 旧 generation 保留为只读历史；
 - 轮转前已经受理的请求仍回复到其来源话题；
 - 轮转后新请求只进入新话题；
+- 新话题等待首次真实 mention 认领时，旧 generation 继续保持 active；pending generation 默认在
+  24 小时后过期并 fail-closed，用户也可以显式取消；
+- 新旧 generation 的 active/read-only 切换必须在同一份 binding 状态的单次原子写入中完成；
+- 本地发起且没有飞书来源的回合，在形成 outbox 项时解析并冻结当时的 active generation；若运行
+  期间已经完成轮转，则发布到新 generation；
 - 轮转可以手动触发，也可以按消息数、年龄或累计内容量建议触发；
 - 不应直接把本地上下文压缩事件等同于飞书话题轮转，两者可以关联提示，但生命周期独立。
 
@@ -259,13 +273,13 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 | 能力 | 当前 main | 本次目标 |
 |---|---|---|
 | Aily → 本机 endpoint | Claude/Codex 均可用 | 统一 endpoint 状态模型 |
-| hook 强制进入运输层 | Claude 已采用 hook + dispatcher；Codex 有强制 hook | 两端统一 dispatcher/handler 契约 |
+| hook 强制进入运输层 | Claude 在 `c81a6c2` 接入 hook + dispatcher，仅完成 1 条真实消息验证；Codex 有强制 hook，尚未接入同一 dispatcher 契约 | 两端统一 dispatcher/handler 契约并扩大真实验证样本 |
 | 项目—群订阅 | 隐含在模板和 binding 中 | 独立 subscription 实体与命令 |
 | 精确话题—会话绑定 | 已支持，Codex/Claude 语义略有差异 | 统一生命周期与 ID 模型 |
 | 映射模式 | 核心链路已实现 | 形成正式 policy handler |
 | 话题轮转 | 未实现 | 稳定 binding + generation |
 | 对话模式 | 未实现 | 受控编排、预算、停止与中断 |
-| 项目推进/专家/带教 | 有实验性 Shadow/Supervisor/Escalation 原型 | 纳入管理策略和分级权限 |
+| 项目推进/专家/带教 | 原型仅在未合并的 `feat/agent-supervisor-shadow-mvp` 实验分支，`main` 不含相关实现 | 纳入管理策略和分级权限 |
 | 多人授权 | 未实现 | 身份授权矩阵与审计归属 |
 | 显式控制面 | bind/status/unbind 已有，部分自然语言分类过宽 | 结构化 intent；普通讨论零副作用 |
 
@@ -294,13 +308,16 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 ## 11. 建议实施阶段
 
 1. **文档基线**：合并本需求和架构契约；
-2. **状态模型与控制面**：只增加 schema、只读迁移和显式命令，不改变稳定数据面；
-3. **统一 dispatcher**：Claude/Codex 接入同一入口契约，保留各自 runtime adapter；
-4. **映射模式 handler 化**：迁移现有双向桥，建立兼容回归基线；
-5. **话题轮转与多订阅**：先处理生命周期，再扩大基数；
-6. **对话模式**：以单独策略插件实现；
-7. **管理模式**：按项目推进、专家、带教分别交付；
-8. **多人授权**：最后开放，并以授权矩阵和审计为前置条件。
+2. **显式控制意图**：收紧写操作入口，先消除普通讨论误触发；
+3. **订阅认领纵切**：subscription schema、只读迁移和首次认领消费者一起交付，并用 shadow
+   comparison 对照旧路由；不合入没有消费者的稳定 schema；
+4. **Codex dispatcher 契约接入**：复用 Claude 已有 dispatcher 设计，接入 Codex，并让两端迁移到
+   无损 canonical event；保留各自 runtime adapter；
+5. **映射模式 handler 化**：迁移现有双向桥，建立兼容回归基线；
+6. **话题轮转与多订阅**：先处理生命周期，再扩大基数；
+7. **对话模式**：以单独策略插件实现；
+8. **管理模式**：按项目推进、专家、带教分别交付；
+9. **多人授权**：最后开放，并以授权矩阵和审计为前置条件。
 
 每个阶段应使用独立、短生命周期分支和 PR。不要把全部重构放进一个长期巨型分支。
 
@@ -312,3 +329,5 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 - 对话模式首个版本是否只支持一个主持者和串行轮次；
 - 管理模式中哪些 execute 动作可以预授权，哪些始终逐次授权；
 - 多人场景的角色模型与飞书组织身份如何映射。
+- 重新验证 Aily daemon 注入的 `AILY_CLI_CHANNEL_THREAD_ID` 与真实飞书 topic/root/session locator 的
+  对应关系、稳定性和安全性；验证完成前继续保留绑定短码，不把一次观测固化为契约。

@@ -25,10 +25,12 @@ Dialogue v1 只有一名已授权人类和当前 binding 的主持 target。当�
 - versioned 参与者授权快照；
 - 不读取正文的纯函数串行 planner；
 - 稳定 cycle/step/run key、逐参与者预算和失败语义；
-- Claude/Codex 共用 schema、fixture 和 shadow comparison；
-- adapter 只记录候选计划，不 dispatch 第二个 Agent。
+- Claude/Codex 共用 schema、fixture 和离线 shadow simulator；
+- 不修改 adapter 热路径，不写 `interaction_policy_state`，不 dispatch 第二个 Agent。
 
-该切片的生产行为仍与 Dialogue v1 完全相同，`agent_output_relay=disabled`。
+该切片使用独立的 foundation schema，不提升既有 `interaction_policy_state.schema_version=1.0`，也不向
+现有 v1 state 附加 planner 状态。生产行为因此与 Dialogue v1 完全相同，
+`agent_output_relay=disabled`。实时 shadow 接入属于 Slice B 的切流前准备。
 
 ### Slice B：Multi-subscription Route
 
@@ -63,14 +65,14 @@ Dialogue 启动时必须冻结一个不可变 `participant_authorization_snapsho
   "snapshot_id": "opaque",
   "authorization_revision": 1,
   "captured_at": "ISO-8601",
-  "coordinator_binding_id": "opaque",
+  "coordinator_binding_ref": "opaque",
   "participants": [
     {
       "participant_id": "opaque",
       "kind": "human | agent",
       "roles": ["requester | host | peer | finalizer"],
       "subscription_id": "opaque-or-null",
-      "binding_id": "opaque-or-null",
+      "binding_ref": "opaque-or-null",
       "local_target_id": "opaque-or-null",
       "allowed_origins": ["human_event | planner_relay"],
       "limits": { "max_agent_runs": 1, "resource_units_per_run": 1 }
@@ -87,6 +89,9 @@ Dialogue 启动时必须冻结一个不可变 `participant_authorization_snapsho
 - host 与 finalizer 可以是同一参与者；peer 必须与 host 不同；
 - 对活动 Dialogue 的授权撤销不得静默改写快照，必须原子取消尚未 dispatch 的步骤并把 Dialogue
   标记 cancelled/authorization_revoked；
+- `binding_ref` 必须由 adapter 使用稳定哈希从私有 legacy binding key 派生；现有可能包含项目名的
+  `binding_id` 不得直接写入公共快照。`binding_ref -> private binding locator` 的反向解析只保存在
+  Git 外 adapter 控制面；
 - 配置更新只影响下一次 Dialogue，除非显式中断并重建；
 - 快照及审计只能进入 Git 外控制面，Git 只保存 schema、算法和脱敏 fixture。
 
@@ -115,15 +120,24 @@ planNext(state, participantSnapshot, terminalEvent)
 必须返回相同 disposition，不能重复 dispatch。任一时刻最多一个 active step；planner 每次最多生成
 一个 runRequest。
 
+claim 只属于原始人类事件。peer 与 finalizer 等内部 step 不创建 claim，也不伪造 message id；它们的
+幂等和审计只使用冻结的 cycle/step/run key，并通过 `parent_human_claim_id` 关联原 claim。
+
 Agent 输出只作为不可信 payload 被结构化包裹，不能携带控制 token、participant 变更、预算变更或下一
 目标。正文中的 `@Agent`、`→Codex`、命令名和绑定码都不参与 planner 决策。
 
 ## 5. 预算与失败
 
-- `max_rounds` 统计人类启动的 cycle，不再等同于 Agent run 数；
-- 每个 runtime run 单独增加 `agent_runs_started` 和 `resource_units_used`；
+- Dialogue v1 的 12 轮 / 12 资源默认值和 `policy_version=1.0` 保持不变；
+- Relay v1 必须使用新的 `policy_version=2.0` 和独立预算字段，候选默认值为 4 个 human cycle、
+  12 个 Agent run、2 小时和 12 资源单位；不得把 v1 的 `max_rounds` 静默重新解释；
+- 每个 runtime run 单独增加 `agent_runs_started` 和 `resource_units_used`，每个固定 cycle 消耗
+  3 个 Agent run 和至少 3 个资源单位；
 - 开始 cycle 前必须确认剩余预算能覆盖完整固定计划，不能走到 peer 后才发现 finalizer 无预算；
-- peer、host 或 finalizer 的 runtime 失败、观察超时、空终局或目标授权失效都使整个 Dialogue 硬失败；
+- peer、host 或 finalizer 的 runtime 失败、观察超时或空终局使整个 Dialogue 硬失败；
+- Owner 撤销 participant 授权属于受控取消，终态固定为
+  `cancelled/authorization_revoked`；准入前发现快照无效则拒绝启动，运行中发现快照损坏才以
+  `failed/dialogue_policy_invalid` 收口；
 - 首个版本不跳过失败参与者、不自动换人、不重试；
 - deadline 到达后不再 dispatch 新 step，迟到终局只用于关闭匹配 run，不得开启下一步；
 - 人工切回 Mapping 取消 active step，保留已完成 step 的审计事实。
@@ -132,7 +146,7 @@ Agent 输出只作为不可信 payload 被结构化包裹，不能携带控制 t
 
 - coordinator binding 是一次 Dialogue 的唯一状态所有者和唯一人类事件 claim owner；
 - 其他参与者的 binding 只提供授权和 runtime target，不得再次认领原人类事件；
-- internal relay 使用冻结的 `participant_id -> binding_id -> local_target_id`，不通过飞书标题、正文 mention、
+- internal relay 使用冻结的 `participant_id -> binding_ref -> local_target_id`，不通过飞书标题、正文 mention、
   最近活跃会话或模型选择目标；
 - 每个 agent run 的发布目标默认是 coordinator 当前 cycle 冻结的来源 generation；中间步骤不得直接向
   用户发布，只有 host finalizer 产生该 cycle 的用户可见答复；
@@ -143,6 +157,10 @@ Agent 输出只作为不可信 payload 被结构化包裹，不能携带控制 t
 现有 `$feishu-mode dialogue` 继续只创建 Dialogue v1，不得因安装新代码自动升级为多 Agent。
 Participant 配置、启用 Relay 和中断 Relay 必须使用新的结构化控制 intent；命令名和参数在实现 PR
 前单独确定。普通自然语言、Agent 回复、飞书卡片内容和引用命令均不得触发配置写入。
+
+现有 v1 校验器对 `turn_order` 和 `allow_agent_output_as_input=false` 的硬检查继续充当升级闸门。
+Slice C 必须显式引入 `policy_version=2.0`，新代码同时读取 v1/v2；只有显式 Relay 控制动作才能创建
+v2。回滚到不认识 v2 的旧代码前，必须先用 v2-capable 控制面切回 Mapping，不能直接覆盖安装。
 
 任何真实 participant 配置、模式启用、飞书写入或安装仍需对应动作的明确授权。
 
@@ -155,9 +173,11 @@ Slice A 必须覆盖：
 - 完整 cycle 预算预检、deadline、失败和人工取消；
 - Agent 正文 mention/命令不能改变计划；
 - Claude/Codex 共用模块契约一致；
-- shadow planner 不产生第二次 dispatch、飞书写入或 outbox。
+- 离线 simulator 不产生 dispatch、飞书写入、outbox 或 binding/state 写入。
 
-Slice B 必须覆盖 subscription 歧义、chat scope、binding 授权快照同步、代际轮转与回滚。Slice C 才做
+Slice B 的实时 shadow 证据必须写入独立 Git 外 `dialogue-planner-shadow/` sidecar，不取得 binding
+生命周期锁；sidecar 写入失败只能丢失 shadow 证据，不得改变真实回合结论。Slice B 还必须覆盖
+subscription 歧义、chat scope、binding 授权快照同步、代际轮转与回滚。Slice C 才做
 真实双 Agent 串行验收：精确目标、三个 Agent step、只有一个最终用户答复、预算正确、重复事件不重复
 运行、失败时停止且不串线。
 

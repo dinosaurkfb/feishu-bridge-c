@@ -182,6 +182,10 @@ planner；再在自动 Topic Generation 真实验收、可信 chat scope 和 bin
 finalizer 的固定串行接力。任何阶段都不得从 Agent 正文 mention 动态新增参与者或选择下一目标，
 也不得让同一人类事件被多个 binding 重复 claim。
 
+foundation 必须使用独立 schema 和离线 simulator，不修改 Dialogue v1 的 state schema 或 adapter 热路径。
+Relay 必须显式使用新的 policy version；其预算分别统计 human cycle、Agent run、时间和资源，不能静默
+复用 v1 的“12 轮 = 12 次主持 run”语义。授权撤销统一视为受控取消，不与 runtime 硬失败混用。
+
 ### FR-6 管理模式
 
 管理模式用于长期监督与增强，至少包含三种策略档案：

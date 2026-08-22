@@ -364,6 +364,8 @@ Dialogue v1 的首个实现纵切固定为一个 `bound_local_target` 主持者�
 下一纵切必须先冻结 versioned `participant_authorization_snapshot`，其中只允许公共稳定
 `participant/subscription/binding_ref/local_target` ID，不得包含 runtime locator。`binding_ref` 必须由
 adapter 对私有 legacy binding key 做稳定 opaque 派生，不能直接复用可能包含项目名的现有 binding id。
+派生算法固定为 SHA-256(`dialogue-binding-ref/v1`、runtime namespace、endpoint ID、private binding key，
+各字段以 NUL 分隔)，输出 `binding_ref_` 加前 24 位十六进制摘要，Claude/Codex 必须共用同一实现。
 活动 Dialogue 的授权撤销
 必须显式取消尚未 dispatch 的步骤并结束 Dialogue；配置更新不能静默改变已经冻结的参与者集合。
 
@@ -391,6 +393,7 @@ Agent Relay 必须显式升级到新的 policy version；旧 v1 状态及默认�
 预算为 4 个 human cycle、12 个 Agent run、2 小时和 12 资源单位，每个固定 cycle 在开始前预留
 3 个 run/资源单位。participant 授权撤销统一终止为 `cancelled/authorization_revoked`；runtime 失败、
 观察超时、空终局或状态损坏才进入 failed。回滚旧代码前必须先由认识新版本的控制面切回 Mapping。
+Slice C 安装器/卸载器还必须在检测到活动 v2 state 时拒绝直接降级，不能只依赖人工遵守流程。
 
 ### 9.3 Management Handler
 

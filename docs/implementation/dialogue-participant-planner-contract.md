@@ -92,6 +92,9 @@ Dialogue 启动时必须冻结一个不可变 `participant_authorization_snapsho
 - `binding_ref` 必须由 adapter 使用稳定哈希从私有 legacy binding key 派生；现有可能包含项目名的
   `binding_id` 不得直接写入公共快照。`binding_ref -> private binding locator` 的反向解析只保存在
   Git 外 adapter 控制面；
+- 派生算法固定为 SHA-256，输入依次包含版本化常量 `dialogue-binding-ref/v1`、runtime namespace、
+  endpoint ID 和私有 binding key，并用 NUL 分隔；公共值使用 `binding_ref_` 加前 24 位十六进制摘要。
+  Claude/Codex 不得各自改变字段顺序、前缀或截断长度；
 - 配置更新只影响下一次 Dialogue，除非显式中断并重建；
 - 快照及审计只能进入 Git 外控制面，Git 只保存 schema、算法和脱敏 fixture。
 
@@ -160,7 +163,8 @@ Participant 配置、启用 Relay 和中断 Relay 必须使用新的结构化控
 
 现有 v1 校验器对 `turn_order` 和 `allow_agent_output_as_input=false` 的硬检查继续充当升级闸门。
 Slice C 必须显式引入 `policy_version=2.0`，新代码同时读取 v1/v2；只有显式 Relay 控制动作才能创建
-v2。回滚到不认识 v2 的旧代码前，必须先用 v2-capable 控制面切回 Mapping，不能直接覆盖安装。
+v2。回滚到不认识 v2 的旧代码前，必须先用 v2-capable 控制面切回 Mapping，不能直接覆盖安装；
+Slice C 的安装器/卸载器必须检测活动 v2 state，并在未完成该转换时机械拒绝降级。
 
 任何真实 participant 配置、模式启用、飞书写入或安装仍需对应动作的明确授权。
 

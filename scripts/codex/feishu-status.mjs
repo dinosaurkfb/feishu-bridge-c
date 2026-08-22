@@ -4,8 +4,9 @@
 import { listPending } from "../outbox.mjs";
 import { validThreadId } from "./bind-compose.mjs";
 import {
-  bridgeHome, findRegisteredTaskForCodexThread, taskPaths,
+  bridgeHome, findRegisteredTaskForCodexThread, taskPaths, topicStateForTask,
 } from "./state.mjs";
+import { activeGeneration, pendingGeneration } from "../topic-generation.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -31,7 +32,24 @@ if (!found.ok) {
 const task = found.task;
 const active = (task.status ?? "active") === "active";
 const pending = listPending({ outboxDir: taskPaths(task, home).outbox }).length;
+const topic = topicStateForTask(task);
+if (!topic.ok) {
+  console.error("无法读取话题代际状态：" + topic.reason);
+  process.exit(1);
+}
+const activeTopic = activeGeneration(topic.state);
+const pendingTopic = pendingGeneration(topic.state);
+const readOnlyCount = topic.state.generations.filter((generation) => generation.status === "read-only").length;
 console.log("当前 Codex task：" + (active ? "已接入飞书" : "已暂停飞书接入"));
+console.log("当前话题代际：" + (activeTopic ? "第 " + activeTopic.generation + " 代" : "尚未完成首次认领"));
+if (pendingTopic) {
+  console.log("待认领话题代际：第 " + pendingTopic.generation + " 代" +
+    (pendingTopic.claim_expires_at ? "（截止 " + pendingTopic.claim_expires_at + "）" : ""));
+}
+if (readOnlyCount > 0) {
+  console.log("只读历史代际：" + readOnlyCount +
+    " 个（不再接收新指令；轮转前受理的结果仍会发回原话题）");
+}
 console.log("飞书入站：" + (active
   ? (task.inbound_state === "bound" ? "已绑定" : "等待首次真实 @M5Codex")
   : "已暂停"));

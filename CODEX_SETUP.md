@@ -110,7 +110,7 @@ node scripts/codex/install.mjs --apply
 - 向现有 `UserPromptSubmit` 和 `Stop` 数组追加本桥命令，保留其他 hooks；前者在 Git 外暂存
   本地文本输入，后者把同一 `turn_id` 的输入与最终答复确定性配对；
 - 安装 `m5codex-inbound-router` 和 `codex-longtask-feishu`；
-- 安装 `$feishu-bind`、`$feishu-unbind`、`$feishu-status` 三个 task 命令；
+- 安装 `$feishu-bind`、`$feishu-unbind`、`$feishu-status`、`$feishu-rotate` 四个 task 命令；
 - 创建 Git 外的空 registry，并为已登记 task 启用每轮自动发布；
 - 不发送飞书消息、不补发历史 outbox，也不代替用户确认 hook trust。
 
@@ -187,8 +187,14 @@ $feishu-status
 | `$feishu-bind` | 接入当前 task；暂停后再次运行会复用原话题恢复 |
 | `$feishu-unbind` | 可恢复地暂停入站和自动发布；不删除话题或历史 |
 | `$feishu-status` | 只读查看当前 task 的接入、绑定和待发布数量 |
+| `$feishu-rotate` | 创建下一话题代际；新话题认领前旧话题继续工作，认领后旧话题只读 |
 | `npm run doctor:codex` | 只读检查机器级依赖和安装状态 |
 | `npm test` | 运行 Claude 基线与 Codex adapter 全套本地回归 |
+
+`$feishu-rotate` 本身就是为当前精确 task 创建下一代话题的一次授权，不再二次确认。新话题建立后，
+在其中真实 `@M5Codex` 一次完成切换。等待认领默认 24 小时；若要取消尚未认领的候选，可在仓库
+中运行 `node scripts/codex/feishu-rotate.mjs --thread-id <精确 thread id> --cancel --apply`。
+取消只退休候选代际，不删除飞书话题，也不影响旧 active 话题。
 
 ## 工作原理
 

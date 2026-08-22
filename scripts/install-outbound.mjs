@@ -202,7 +202,7 @@ if (uninstall) {
 /**
  * 装哪些技能，以及装成什么名字。
  *
- * 三条控制命令在仓库里叫 claude-feishu-*，装出去要去掉前缀 —— 因为**装出去的目录名
+ * 四条控制命令在仓库里叫 claude-feishu-*，装出去要去掉前缀 —— 因为**装出去的目录名
  * 就是斜杠命令名**，而 Codex 那边用的是 $feishu-bind / $feishu-status / $feishu-unbind。
  * 两边同名，用户不用记两套。仓库里之所以要加前缀，是因为 skills/feishu-bind/
  * 已经被 Codex 那份占了 —— 它们装到不同的家目录（~/.codex vs ~/.claude），
@@ -213,10 +213,12 @@ const SKILLS = [
   { src: "claude-feishu-bind",       dst: "feishu-bind" },
   { src: "claude-feishu-status",     dst: "feishu-status" },
   { src: "claude-feishu-unbind",     dst: "feishu-unbind" },
+  { src: "claude-feishu-rotate",     dst: "feishu-rotate" },
 ];
 
 const skillSrcOf = (n) => path.join(ROOT, "skills", n, "SKILL.md");
 const skillDstOf = (n) => path.join(os.homedir(), ".claude", "skills", n, "SKILL.md");
+const renderSkill = (src) => src.replaceAll("{{BRIDGE_ROOT}}", ROOT);
 
 // 拷贝而不是软链：软链一旦仓库被移动或删除就变成悬空文件，而且各家扫描器
 // 对 readdir 是否跟随软链的处理并不一致（入站技能就在这上面栽过）。
@@ -227,7 +229,7 @@ const skillPlan = SKILLS.map((sk) => {
     return { ...sk, srcFile, dstFile, action: fs.existsSync(dstFile) ? "will-remove" : "already-absent" };
   }
   if (!fs.existsSync(srcFile)) return { ...sk, srcFile, dstFile, action: "source-missing" };
-  const src = fs.readFileSync(srcFile, "utf-8");
+  const src = renderSkill(fs.readFileSync(srcFile, "utf-8"));
   let dst = null;
   try { dst = fs.readFileSync(dstFile, "utf-8"); } catch { /* 还没装 */ }
   return { ...sk, srcFile, dstFile,
@@ -336,7 +338,7 @@ for (const sk of skillPlan) {
     fs.rmSync(path.dirname(sk.dstFile), { recursive: true, force: true });
   } else {
     fs.mkdirSync(path.dirname(sk.dstFile), { recursive: true });
-    fs.copyFileSync(sk.srcFile, sk.dstFile);
+    fs.writeFileSync(sk.dstFile, renderSkill(fs.readFileSync(sk.srcFile, "utf-8")), { mode: 0o600 });
   }
 }
 

@@ -16,7 +16,7 @@ node /Users/dk/claude-projects/feishu-bridge-cc/scripts/feishu-unbind.mjs --appl
 
 ## 暂停做什么、不做什么
 
-**做**：把绑定的 status 翻成 suspended。出站停发（进展留在本地），入站一律拒绝。
+**做**：把绑定状态翻成正式的 `paused`（旧 `suspended` 会兼容读取）。出站停发（进展留在本地），入站一律拒绝。
 
 **不做**：不删话题、不删登记、不删待发内容、不删回执、**不往飞书发任何消息**。
 暂停要能后悔 —— 话题里已经有历史对话，删掉登记会让那段历史变成孤儿。

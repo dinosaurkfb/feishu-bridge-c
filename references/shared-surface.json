@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-08-22T07:05:29.127Z",
+  "generated_at": "2026-08-22T07:57:02.984Z",
   "modules": {
     "bind-compose.mjs": [
       "DEFAULT_TERM_MS",
@@ -128,6 +128,30 @@
       "selectPendingSubscriptionClaim",
       "stableControlId",
       "validateSubscription"
+    ],
+    "topic-generation.mjs": [
+      "GENERATION_STATUS",
+      "ROTATION_STATUS",
+      "TOPIC_GENERATION_ARTIFACT_TYPE",
+      "TOPIC_GENERATION_PENDING_MS",
+      "TOPIC_GENERATION_SCHEMA_VERSION",
+      "activatePendingTopicGeneration",
+      "activeGeneration",
+      "activeGenerationForSession",
+      "applyTopicGenerationToMapping",
+      "channelGenerationId",
+      "closePendingTopicGeneration",
+      "failTopicRotation",
+      "generationById",
+      "materializeLegacyTopicFields",
+      "pendingGeneration",
+      "prepareTopicRotation",
+      "projectLegacyTopicGeneration",
+      "registerPendingTopicGeneration",
+      "resolveMappingOutboundGeneration",
+      "resolveOutboundGeneration",
+      "topicGenerationStateForLegacy",
+      "validateTopicGenerationState"
     ],
     "turn-input.mjs": [
       "MAX_LOCAL_INPUT_CHARS",

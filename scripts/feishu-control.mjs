@@ -1,5 +1,5 @@
 /**
- * 三条控制命令的共用核心：看状态、暂停、恢复。
+ * 控制命令的共用核心：看状态、暂停、恢复；话题轮转由 topic-generation-store 复用同一状态。
  *
  * 跟 Codex 侧的 `$feishu-status` / `$feishu-unbind` / `$feishu-bind` 对齐语义：
  *
@@ -24,6 +24,8 @@ import {
 } from "./project-resolve.mjs";
 import { outboxDirOf } from "./drain-outbox.mjs";
 import { listPending } from "./outbox.mjs";
+import { setClaudeTopicBindingStatus } from "./topic-generation-store.mjs";
+import { activeGeneration, pendingGeneration } from "./topic-generation.mjs";
 
 export const SUSPENDED = "suspended";
 
@@ -42,6 +44,9 @@ export function currentBinding({ root, claudeSessionId, registryFile, templateFi
   try { pending = listPending({ outboxDir }).length; } catch { /* 目录还没建：0 条 */ }
 
   const m = resolved.mapping;
+  const topicState = m.topic_generation_state ?? null;
+  const activeTopic = activeGeneration(topicState);
+  const pendingTopic = pendingGeneration(topicState);
   return {
     ok: true,
     root,
@@ -54,6 +59,11 @@ export function currentBinding({ root, claudeSessionId, registryFile, templateFi
     expiresAt: m.expires_at ?? null,
     displayName: resolved.config?.task_display_name ?? path.basename(root),
     pending,
+    activeGeneration: activeTopic?.generation ?? null,
+    pendingGeneration: pendingTopic?.generation ?? null,
+    pendingGenerationExpiresAt: pendingTopic?.claim_expires_at ?? null,
+    readOnlyGenerations: topicState?.generations?.filter((generation) =>
+      generation.status === "read-only").length ?? 0,
     // 话题 id 是 locator，只在需要时由调用方决定要不要显示；默认不进人类可读输出。
     _rootMessageId: m.feishu_root_message_id_reference ?? null,
   };
@@ -67,6 +77,22 @@ export function currentBinding({ root, claudeSessionId, registryFile, templateFi
 export function setBindingStatus({ root, claudeSessionId, status, registryFile, now = Date.now() }) {
   const resolved = resolveProject({ root, claudeSessionId, registryFile });
   if (!resolved.ok) return { ok: false, reason: resolved.reason };
+
+  if (resolved.mapping?.topic_generation_state) {
+    const normalizedStatus = status === SUSPENDED ? "paused" : status;
+    const changed = setClaudeTopicBindingStatus({
+      root, claudeSessionId, status: normalizedStatus, registryFile, now,
+    });
+    if (!changed.ok) return changed;
+    return {
+      ok: true,
+      changed: changed.changed !== false,
+      status,
+      store: resolved.source === "project-files"
+        ? projectMappingPath(root)
+        : (registryFile ?? registryPath()),
+    };
+  }
 
   const stamp = new Date(now).toISOString();
 
@@ -137,6 +163,15 @@ export function describeStatus(st, others = []) {
   lines.push("绑定级别  " + (st.level === "session"
     ? "这条工作线单独绑定（会话 " + String(st.claudeSessionId).slice(0, 8) + "）"
     : "整个项目共用一个话题"));
+  lines.push("当前代际  " + (st.activeGeneration === null ? "尚未完成首次认领" : "第 " + st.activeGeneration + " 代"));
+  if (st.pendingGeneration !== null) {
+    lines.push("待认领    第 " + st.pendingGeneration + " 代" +
+      (st.pendingGenerationExpiresAt ? "（截止 " + st.pendingGenerationExpiresAt + "）" : ""));
+  }
+  if (st.readOnlyGenerations > 0) {
+    lines.push("只读历史  " + st.readOnlyGenerations +
+      " 个代际（不再接收新指令；轮转前受理的结果仍会发回原话题）");
+  }
   lines.push("出站      " + (st.suspended ? "暂停中，进展留在本地不发出" : "正常"));
   lines.push("入站      " + (st.suspended ? "暂停中，话题里的指令一律被拒"
     : st.inboundBound ? "已绑定" : "还差一步：去话题里 @ 一下运输 agent"));

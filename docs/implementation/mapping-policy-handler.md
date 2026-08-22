@@ -78,9 +78,10 @@ runtime adapter 仍是完整 locator 的唯一所有者。它把 `localTargetId`
 `runRequest` 不包含 runtime locator。Claude/Codex adapter 分别把自己的 session/thread locator
 作为私有参数交给运行器；公共 policy 只提供同一组运行时中立字段。
 
-`origin.channelGenerationId` 在 claim 后、投递前冻结。当前尚无正式 Topic Generation 存储，
-因此它由 runtime、旧 binding key 和 Aily session 生成稳定 opaque id，并标记为
-`legacy_mapping_v1` 投影。后续生命周期切片可以替换投影来源，不改变 handler 或 adapter 接口。
+`origin.channelGenerationId` 在 claim 后、投递前冻结。本切片交付时尚无正式 Topic Generation
+存储，因此旧 binding 由 runtime、binding key 和 Aily session 生成稳定 opaque id，并标记为
+`legacy_mapping_v1` 投影。后续 `feat/topic-generation-lifecycle` 已在不改变 handler/adapter 接口的
+前提下加入正式代际状态；旧 generation 1 继续沿用这里的 opaque id，保证历史 run 可解析。
 
 ## 4. Canonical Event 与兼容入口
 

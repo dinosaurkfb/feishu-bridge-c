@@ -18,6 +18,12 @@ import {
   MESSAGE_RECEIVE_EVENT, buildLegacySubscriptionReadModel, compareFirstClaimShadow,
   legacyEndpointId, selectPendingSubscriptionClaim, stableControlId,
 } from "../subscription.mjs";
+import {
+  ROTATION_STATUS, activatePendingTopicGeneration, activeGeneration,
+  activeGenerationForSession, applyTopicGenerationToMapping, closePendingTopicGeneration,
+  failTopicRotation, materializeLegacyTopicFields, pendingGeneration, prepareTopicRotation,
+  registerPendingTopicGeneration, topicGenerationStateForLegacy,
+} from "../topic-generation.mjs";
 
 export const PENDING_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const ACTIVE_LEASE_MAX_MS = 12 * 60 * 60 * 1000;
@@ -185,7 +191,7 @@ export function appendConsumed(task, messageId, { home = bridgeHome(), max = 500
 }
 
 export function mappingForTask(task, { home = bridgeHome() } = {}) {
-  return {
+  const mapping = {
     schema_version: "1.0",
     binding_id: task.id + "@codex-registry",
     binding_mode: "codex_thread_binding",
@@ -193,6 +199,9 @@ export function mappingForTask(task, { home = bridgeHome() } = {}) {
     session_id: task.session_id ?? null,
     inbound_state: task.inbound_state ?? "pending",
     pending_token: task.pending_token ?? null,
+    pending_expires_at: task.pending_expires_at ?? null,
+    channel_generation_id: task.channel_generation_id ?? null,
+    topic_generation_state: task.topic_generation_state ?? null,
     inbound_prefix: Object.hasOwn(task, "inbound_prefix") ? task.inbound_prefix : DEFAULT_INBOUND_PREFIX,
     logical_task_key: task.logical_task_key,
     codex_thread_id: task.codex_thread_id,
@@ -205,6 +214,24 @@ export function mappingForTask(task, { home = bridgeHome() } = {}) {
     created_at: task.bound_at ?? null,
     _source: "codex-registry",
   };
+  const evolved = applyTopicGenerationToMapping(mapping, {
+    runtime: "codex",
+    bindingId: mapping.binding_id,
+  });
+  // 持久化的新状态一旦损坏必须 fail-closed，不能悄悄回落到旧字段继续收消息。
+  return evolved.ok ? evolved.mapping : {
+    ...mapping,
+    status: "invalid",
+    topic_generation_error: evolved.reason,
+  };
+}
+
+export function topicStateForTask(task, { now = Date.now() } = {}) {
+  return topicGenerationStateForLegacy(task, {
+    runtime: "codex",
+    bindingId: (task?.id ?? task?.logical_task_key) + "@codex-registry",
+    now,
+  });
 }
 
 export function resolveTask(task, { home = bridgeHome(), templatePath = templateFile(home) } = {}) {
@@ -231,7 +258,11 @@ export function findTaskForFeishuSession({ sessionId, home = bridgeHome() } = {}
   if (typeof sessionId !== "string" || !sessionId) return { ok: false, reason: "no_session_id" };
   const reg = loadRegistry(registryFile(home));
   if (!reg.ok) return reg;
-  const task = reg.tasks.find((t) => (t.status ?? "active") === "active" && t.session_id === sessionId);
+  const task = reg.tasks.find((candidate) => {
+    if ((candidate.status ?? "active") !== "active") return false;
+    const loaded = topicStateForTask(candidate);
+    return loaded.ok && Boolean(activeGenerationForSession(loaded.state, sessionId));
+  });
   if (!task) return { ok: false, reason: "no_binding_for_session", candidates: reg.tasks.length };
   const resolved = resolveTask(task, { home });
   return resolved.ok ? { ok: true, ...resolved } : resolved;
@@ -270,17 +301,24 @@ export function setTaskConnectionStatus({
     const current = task.status ?? "active";
     if (current === status) return { ok: true, changed: false, task };
 
-    task.status = status;
+    const loaded = topicStateForTask(task, { now });
+    if (!loaded.ok) return loaded;
+    loaded.state.binding_status = status;
+    loaded.state.updated_at = new Date(now).toISOString();
     if (status === "paused") {
       task.paused_at = new Date(now).toISOString();
     } else {
       task.resumed_at = new Date(now).toISOString();
       delete task.paused_at;
       // 尚未完成首次 mention 的绑定在恢复时重新获得完整握手窗口。
-      if (task.inbound_state === "pending" && !task.session_id) {
-        task.pending_expires_at = new Date(now + PENDING_WINDOW_MS).toISOString();
+      const pending = pendingGeneration(loaded.state);
+      if (pending && !activeGeneration(loaded.state)) {
+        pending.claim_expires_at = new Date(now + PENDING_WINDOW_MS).toISOString();
       }
     }
+    const materialized = materializeLegacyTopicFields(task, loaded.state);
+    if (!materialized.ok) return materialized;
+    Object.assign(task, materialized.record);
     writeRegistry(reg.tasks, file);
     return { ok: true, changed: true, task };
   } catch (err) {
@@ -311,10 +349,17 @@ export function refreshPendingTaskBinding({
     const task = reg.tasks.find((t) => t.codex_thread_id === threadId);
     if (!task) return { ok: false, reason: "thread_not_registered" };
     if ((task.status ?? "active") !== "active") return { ok: false, reason: "task_not_active" };
-    if (task.inbound_state !== "pending" || task.session_id) {
+    const loaded = topicStateForTask(task, { now });
+    if (!loaded.ok) return loaded;
+    const pending = pendingGeneration(loaded.state);
+    if (!pending || activeGeneration(loaded.state)) {
       return { ok: false, reason: "task_not_pending" };
     }
-    task.pending_expires_at = new Date(now + PENDING_WINDOW_MS).toISOString();
+    pending.claim_expires_at = new Date(now + PENDING_WINDOW_MS).toISOString();
+    loaded.state.updated_at = new Date(now).toISOString();
+    const materialized = materializeLegacyTopicFields(task, loaded.state);
+    if (!materialized.ok) return materialized;
+    Object.assign(task, materialized.record);
     task.pending_refreshed_at = new Date(now).toISOString();
     writeRegistry(reg.tasks, file);
     return { ok: true, task };
@@ -391,8 +436,17 @@ export function extractQuotedBindingTokens(content) {
 export function findPendingTask({ home = bridgeHome(), now = Date.now(), content } = {}) {
   const reg = loadRegistry(registryFile(home));
   if (!reg.ok) return reg;
-  const pending = reg.tasks.filter((t) =>
-    (t.status ?? "active") === "active" && t.inbound_state === "pending" && !t.session_id);
+  const pending = reg.tasks.flatMap((task) => {
+    if ((task.status ?? "active") !== "active") return [];
+    const loaded = topicStateForTask(task, { now });
+    if (!loaded.ok) return [];
+    const generation = pendingGeneration(loaded.state);
+    return generation ? [{
+      task,
+      generation,
+      operationId: loaded.state.rotation?.operation_id ?? null,
+    }] : [];
+  });
   if (pending.length === 0) return { ok: false, reason: "no_pending_binding" };
 
   const tokens = extractQuotedBindingTokens(content);
@@ -400,21 +454,37 @@ export function findPendingTask({ home = bridgeHome(), now = Date.now(), content
 
   let selected;
   if (tokens.length === 1) {
-    const matches = pending.filter((task) =>
-      typeof task.pending_token === "string" && task.pending_token.toLowerCase() === tokens[0]);
+    const matches = pending.filter(({ generation }) =>
+      typeof generation.pending_token === "string" &&
+      generation.pending_token.toLowerCase() === tokens[0]);
     if (matches.length === 0) return { ok: false, reason: "pending_binding_token_unknown" };
     if (matches.length > 1) return { ok: false, reason: "duplicate_pending_binding_token" };
     selected = matches[0];
   } else {
     // 兼容旧根消息或非话题表面：没有引用码时仍只允许全机唯一 pending，绝不按目录或标题猜。
     if (pending.length > 1) {
-      return { ok: false, reason: "multiple_pending_bindings", ids: pending.map((t) => t.id) };
+      return { ok: false, reason: "multiple_pending_bindings", ids: pending.map(({ task }) => task.id) };
     }
     selected = pending[0];
   }
 
-  if (now >= pendingDeadline(selected)) return { ok: false, reason: "pending_binding_expired" };
-  return { ok: true, task: selected, source: tokens.length === 1 ? "quoted_binding_token" : "sole_pending" };
+  const explicit = Date.parse(selected.generation.claim_expires_at ?? "");
+  const deadline = Number.isFinite(explicit) ? explicit : pendingDeadline(selected.task);
+  if (now >= deadline) return {
+    ok: false,
+    reason: "pending_binding_expired",
+    task: selected.task,
+    generation: selected.generation,
+    generationId: selected.generation.channel_generation_id,
+    operationId: selected.operationId,
+  };
+  return {
+    ok: true,
+    task: selected.task,
+    generation: selected.generation,
+    generationId: selected.generation.channel_generation_id,
+    source: tokens.length === 1 ? "quoted_binding_token" : "sole_pending",
+  };
 }
 
 /** 现有 Codex task registry → Subscription v1；不写控制面状态，不改变现有 task。 */
@@ -427,18 +497,23 @@ export function buildCodexSubscriptionProjection({ home = bridgeHome(), template
   if (!loadedTemplate.ok) return { ok: false, reason: "template_unusable" };
   const resolvedTemplate = loadedTemplate.template;
   const endpointId = legacyEndpointId({ runtime: "codex", agentUid: resolvedTemplate.agent_uid });
-  const records = reg.tasks.map((task) => ({
-    legacy_key: task.logical_task_key,
-    domain_key: task.root,
-    local_target_id: stableControlId("target", "codex", task.logical_task_key),
-    status: task.status ?? "active",
-    inbound_state: task.inbound_state ?? "pending",
-    session_id: task.session_id ?? null,
-    pending_token: task.pending_token ?? null,
-    pending_expires_at: task.pending_expires_at,
-    bound_at: task.bound_at,
-    chat_id: task.chat_id ?? resolvedTemplate.chat_id,
-  }));
+  const records = reg.tasks.map((task) => {
+    const state = topicStateForTask(task);
+    const pending = state.ok ? pendingGeneration(state.state) : null;
+    const active = state.ok ? activeGeneration(state.state) : null;
+    return {
+      legacy_key: task.logical_task_key,
+      domain_key: task.root,
+      local_target_id: stableControlId("target", "codex", task.logical_task_key),
+      status: task.status ?? "active",
+      inbound_state: pending ? "pending" : (task.inbound_state ?? "bound"),
+      session_id: pending ? null : (active?.session_id ?? task.session_id ?? null),
+      pending_token: pending?.pending_token ?? null,
+      pending_expires_at: pending?.claim_expires_at ?? null,
+      bound_at: pending?.created_at ?? task.bound_at,
+      chat_id: task.chat_id ?? resolvedTemplate.chat_id,
+    };
+  });
   return buildLegacySubscriptionReadModel({
     runtime: "codex", endpointId, template: resolvedTemplate, records,
     pendingWindowMs: PENDING_WINDOW_MS,
@@ -488,7 +563,10 @@ export function evaluatePromotion({ event, template, pending, now = Date.now() }
   return { ok: true, task: pending.task };
 }
 
-export function promoteTask({ logicalTaskKey, sessionId, home = bridgeHome(), now = Date.now() }) {
+export function promoteTask({
+  logicalTaskKey, sessionId, generationId, operationId,
+  home = bridgeHome(), now = Date.now(),
+}) {
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return { ok: false, reason: "registry_busy" };
@@ -498,23 +576,139 @@ export function promoteTask({ logicalTaskKey, sessionId, home = bridgeHome(), no
     if (!reg.ok) return reg;
     const task = reg.tasks.find((t) => t.logical_task_key === logicalTaskKey);
     if (!task) return { ok: false, reason: "entry_gone" };
-    if ((task.status ?? "active") !== "active" || task.inbound_state !== "pending") {
+    if ((task.status ?? "active") !== "active") {
       return { ok: false, reason: "entry_not_pending" };
     }
-    if (task.session_id && task.session_id !== sessionId) return { ok: false, reason: "already_bound_elsewhere" };
-    if (reg.tasks.some((t) => t.logical_task_key !== logicalTaskKey && t.session_id === sessionId)) {
+    const loaded = topicStateForTask(task, { now });
+    if (!loaded.ok || !pendingGeneration(loaded.state)) return { ok: false, reason: "entry_not_pending" };
+    const sessionUsed = reg.tasks.some((candidate) => {
+      if (candidate.logical_task_key === logicalTaskKey) return false;
+      const candidateState = topicStateForTask(candidate, { now });
+      return candidateState.ok && candidateState.state.generations.some((generation) =>
+        generation.session_id === sessionId && generation.status !== "retired");
+    });
+    if (sessionUsed) {
       return { ok: false, reason: "session_already_bound" };
     }
-    task.session_id = sessionId;
-    task.inbound_state = "bound";
-    task.inbound_bound_at = new Date(now).toISOString();
+    const activated = activatePendingTopicGeneration(loaded.state, {
+      generationId,
+      sessionId,
+      operationId,
+      now,
+    });
+    if (!activated.ok) return activated;
+    const materialized = materializeLegacyTopicFields(task, activated.state);
+    if (!materialized.ok) return materialized;
+    Object.assign(task, materialized.record, {
+      inbound_bound_at: new Date(now).toISOString(),
+    });
     writeRegistry(reg.tasks, file);
-    return { ok: true, task };
+    return {
+      ok: true,
+      task,
+      generation: activated.active,
+      previousGeneration: activated.previous,
+    };
   } catch (err) {
     return { ok: false, reason: "registry_unwritable", error: err.message };
   } finally {
     releasePublishLock(lockDir);
   }
+}
+
+function mutateTaskTopicState({
+  threadId,
+  home = bridgeHome(),
+  now = Date.now(),
+  mutate,
+} = {}) {
+  if (typeof threadId !== "string" || !threadId) return { ok: false, reason: "no_thread_id" };
+  const lockDir = path.join(home, "registry.lock");
+  const lock = acquirePublishLock(lockDir);
+  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  try {
+    const file = registryFile(home);
+    const reg = loadRegistry(file);
+    if (!reg.ok) return reg;
+    const task = reg.tasks.find((candidate) => candidate.codex_thread_id === threadId);
+    if (!task) return { ok: false, reason: "thread_not_registered" };
+    const loaded = topicStateForTask(task, { now });
+    if (!loaded.ok) return loaded;
+    const changed = mutate(loaded.state, task);
+    if (!changed?.ok) return changed;
+    const materialized = materializeLegacyTopicFields(task, changed.state);
+    if (!materialized.ok) return materialized;
+    Object.assign(task, materialized.record);
+    writeRegistry(reg.tasks, file);
+    return { ...changed, task };
+  } catch (err) {
+    return { ok: false, reason: "registry_unwritable", error: err.message };
+  } finally {
+    releasePublishLock(lockDir);
+  }
+}
+
+/** 轮转 phase 1：只登记 operation，网络调用在锁外由 CLI 完成。 */
+export function prepareTaskTopicRotation({
+  threadId, operationId, home = bridgeHome(), now = Date.now(),
+} = {}) {
+  return mutateTaskTopicState({
+    threadId, home, now,
+    mutate: (state) => prepareTopicRotation(state, { operationId, now }),
+  });
+}
+
+/** 轮转 phase 2：根话题创建成功后登记 pending generation。 */
+export function registerTaskTopicRotation({
+  threadId, operationId, rootMessageId, pendingToken, claimExpiresAt,
+  home = bridgeHome(), now = Date.now(),
+} = {}) {
+  return mutateTaskTopicState({
+    threadId, home, now,
+    mutate: (state) => registerPendingTopicGeneration(state, {
+      operationId, rootMessageId, pendingToken, claimExpiresAt, now,
+    }),
+  });
+}
+
+export function failTaskTopicRotation({
+  threadId, operationId, reason, home = bridgeHome(), now = Date.now(),
+} = {}) {
+  return mutateTaskTopicState({
+    threadId, home, now,
+    mutate: (state) => failTopicRotation(state, { operationId, reason, now }),
+  });
+}
+
+export function closeTaskTopicRotation({
+  threadId, operationId, reason = ROTATION_STATUS.CANCELLED,
+  home = bridgeHome(), now = Date.now(),
+} = {}) {
+  return mutateTaskTopicState({
+    threadId, home, now,
+    mutate: (state) => closePendingTopicGeneration(state, { operationId, reason, now }),
+  });
+}
+
+export function resolveTaskOutboundGeneration(task, generationId, { now = Date.now() } = {}) {
+  const loaded = topicStateForTask(task, { now });
+  if (!loaded.ok) return loaded;
+  const selected = generationId ??
+    activeGeneration(loaded.state)?.channel_generation_id ??
+    pendingGeneration(loaded.state)?.channel_generation_id;
+  const generation = loaded.state.generations.find((item) =>
+    item.channel_generation_id === selected);
+  const initialPending = generation?.status === "pending" &&
+    loaded.state.active_generation_id === null && loaded.state.generations.length === 1;
+  if (!generation || (!initialPending && !["active", "read-only"].includes(generation.status))) {
+    return { ok: false, reason: "outbound_generation_unavailable" };
+  }
+  return {
+    ok: true,
+    channelGenerationId: generation.channel_generation_id,
+    rootMessageId: generation.root_message_id,
+    status: generation.status,
+  };
 }
 
 export function logicalTaskKeyFor(root, threadId) {
@@ -526,7 +720,7 @@ export function makeTaskEntry({
   inboundPrefix = DEFAULT_INBOUND_PREFIX, chatId, chatName, now = Date.now(),
 }) {
   const logicalTaskKey = logicalTaskKeyFor(root, threadId);
-  return {
+  const base = {
     id: logicalTaskKey,
     runtime: "codex",
     root,
@@ -543,8 +737,13 @@ export function makeTaskEntry({
     inbound_prefix: inboundPrefix,
     auto_publish_on_completion: true,
     bound_at: new Date(now).toISOString(),
+    pending_expires_at: new Date(now + PENDING_WINDOW_MS).toISOString(),
     expires_at: new Date(now + 365 * 24 * 60 * 60 * 1000).toISOString(),
   };
+  const loaded = topicStateForTask(base, { now });
+  const materialized = loaded.ok ? materializeLegacyTopicFields(base, loaded.state) : loaded;
+  if (!materialized.ok) throw new Error("无法建立 Codex topic generation：" + materialized.reason);
+  return materialized.record;
 }
 
 const leaseFile = (threadId, home = bridgeHome()) =>

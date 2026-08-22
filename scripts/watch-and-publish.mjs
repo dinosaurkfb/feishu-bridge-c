@@ -17,10 +17,11 @@ import { readRunOutcome } from "./handoff.mjs";
 import { scanRuns, buildDraft, markPublished, publishDraft } from "./outbound.mjs";
 import { listPending, markSent } from "./outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
-import { recordClaimState } from "./claim.mjs";
+import { readClaim, recordClaimState } from "./claim.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
+import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 
 const SELF = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 
@@ -51,6 +52,18 @@ const startedAt = Date.now();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const finishUp = () => fs.rmSync(LOCK, { recursive: true, force: true });
+const acceptedClaim = readClaim({ claimsDir: CLAIMS, key });
+const originGenerationId = acceptedClaim?.origin_channel_generation_id ?? null;
+
+const groupByTargetGeneration = (records) => {
+  const groups = new Map();
+  for (const record of records) {
+    const target = record.target_channel_generation_id ?? "__legacy_active__";
+    if (!groups.has(target)) groups.set(target, []);
+    groups.get(target).push(record);
+  }
+  return [...groups.entries()];
+};
 
 /**
  * 兜底定时器可能正好在排空同一个 outbox。等它一小会儿而不是抢 ——
@@ -102,6 +115,8 @@ while (true) {
           kind: run.state === "completed" ? "reply" : "risk",
           text: d,
           source: "claude-run-watcher",
+          target_channel_generation_id: originGenerationId,
+          run_id: key,
           _run: true,
         });
       }
@@ -112,21 +127,28 @@ while (true) {
           // 身份从配置推，跟主出站路径走同一个解析；发之前 publishDraft 会校验凭据归属。
           const ident = resolveLarkIdentity(cfg);
           const mids = [];
-          for (const batch of outboundCardBatches(records)) {
-            const mid = publishDraft({
-              profile: ident.profile,
-              rootMessageId: mapping.feishu_root_message_id_reference,
-              card: composeOutboundCard(batch, { taskName: cfg.task_display_name, runtime: "claude" }),
-              larkBin: ident.bin,
-              larkHome: ident.configDir,
-              expectedAppId: ident.expectedAppId,
-            });
-            // 每张成功后立刻标记。后续卡片失败时，已送达的回合不会在重试中重复发送。
-            if (batch.some((record) => record._run === true)) {
-              markPublished({ runsDir: RUNS, key, messageId: mid });
+          for (const [targetKey, targetRecords] of groupByTargetGeneration(records)) {
+            const target = resolveMappingOutboundGeneration(
+              mapping,
+              targetKey === "__legacy_active__" ? null : targetKey,
+            );
+            if (!target.ok) throw new Error("冻结的出站话题代际不可用（" + target.reason + "）");
+            for (const batch of outboundCardBatches(targetRecords)) {
+              const mid = publishDraft({
+                profile: ident.profile,
+                rootMessageId: target.rootMessageId,
+                card: composeOutboundCard(batch, { taskName: cfg.task_display_name, runtime: "claude" }),
+                larkBin: ident.bin,
+                larkHome: ident.configDir,
+                expectedAppId: ident.expectedAppId,
+              });
+              // 每张成功后立刻标记。后续卡片失败时，已送达的回合不会在重试中重复发送。
+              if (batch.some((record) => record._run === true)) {
+                markPublished({ runsDir: RUNS, key, messageId: mid });
+              }
+              for (const record of batch.filter((item) => item._file)) markSent(record, mid);
+              mids.push(mid);
             }
-            for (const record of batch.filter((item) => item._file)) markSent(record, mid);
-            mids.push(mid);
           }
           console.log("published " + key.slice(0, 8) + " -> " + (mids.at(-1) ?? "none") +
             " (cards=" + mids.length + ", run=" + (run?.shouldPublish ? "yes" : "no") +

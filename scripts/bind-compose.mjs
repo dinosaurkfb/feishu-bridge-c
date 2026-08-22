@@ -14,6 +14,9 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import {
+  materializeLegacyTopicFields, topicGenerationStateForLegacy,
+} from "./topic-generation.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -180,7 +183,7 @@ export function composeStatusMessage({ name }) {
  * 所以登记表接进来的项目在入站侧天然关着，一行代码都不用加。
  */
 export function newRegistryEntry({ root, name, purpose, token, rootMessageId, now = Date.now() }) {
-  return {
+  const base = {
     id: path.basename(root),
     root,
     name,
@@ -190,7 +193,16 @@ export function newRegistryEntry({ root, name, purpose, token, rootMessageId, no
     inbound_state: "pending",
     pending_token: token,
     bound_at: new Date(now).toISOString(),
+    pending_expires_at: new Date(now + 24 * DAY_MS).toISOString(),
     expires_at: new Date(now + DEFAULT_TERM_MS).toISOString(),
     note: "由 bind-project 接入。续期：node scripts/binding.mjs --renew 1y --apply",
   };
+  const loaded = topicGenerationStateForLegacy(base, {
+    runtime: "claude",
+    bindingId: base.id + "@registry",
+    now,
+  });
+  const materialized = loaded.ok ? materializeLegacyTopicFields(base, loaded.state) : loaded;
+  if (!materialized.ok) throw new Error("无法建立 Claude topic generation：" + materialized.reason);
+  return materialized.record;
 }

@@ -5,10 +5,21 @@ import { composeDigest, listPending, markSent } from "../outbox.mjs";
 import { publishDraft } from "../outbound.mjs";
 import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
 import { resolveLarkIdentity } from "../chain-template.mjs";
-import { composeCodexOutboundCard } from "./outbound-card.mjs";
+import { composeCodexOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import {
-  bridgeHome, findTaskForCodexThread, loadRegistry, resolveTask, taskPaths,
+  bridgeHome, findTaskForCodexThread, loadRegistry, resolveTask,
+  resolveTaskOutboundGeneration, taskPaths,
 } from "./state.mjs";
+
+const groupByTargetGeneration = (records) => {
+  const groups = new Map();
+  for (const record of records) {
+    const key = record.target_channel_generation_id ?? "__legacy_active__";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(record);
+  }
+  return [...groups.entries()];
+};
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -67,15 +78,24 @@ try {
     console.log("队列已经由另一个发布动作排空。");
   } else {
     const identity = resolveLarkIdentity(resolved.template);
-    const messageId = publishDraft({
-      profile: identity.profile,
-      rootMessageId: resolved.mapping.feishu_root_message_id_reference,
-      card: composeCodexOutboundCard(current, { taskName: task.task_display_name }),
-      larkBin: identity.bin,
-      larkHome: identity.configDir,
-      expectedAppId: identity.expectedAppId,
-    });
-    for (const event of current) markSent(event, messageId);
+    for (const [targetKey, records] of groupByTargetGeneration(current)) {
+      const target = resolveTaskOutboundGeneration(
+        task,
+        targetKey === "__legacy_active__" ? null : targetKey,
+      );
+      if (!target.ok) throw new Error("冻结的出站话题代际不可用（" + target.reason + "）");
+      for (const batch of outboundCardBatches(records)) {
+        const messageId = publishDraft({
+          profile: identity.profile,
+          rootMessageId: target.rootMessageId,
+          card: composeCodexOutboundCard(batch, { taskName: task.task_display_name }),
+          larkBin: identity.bin,
+          larkHome: identity.configDir,
+          expectedAppId: identity.expectedAppId,
+        });
+        for (const event of batch) markSent(event, messageId);
+      }
+    }
     console.log("已由 " + resolved.template.transport_agent_name + " 发布 " + current.length + " 条。");
   }
 } catch (err) {

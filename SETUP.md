@@ -258,6 +258,11 @@ node scripts/bind-project.mjs --project ~/x --apply    # 建话题 + 登记
 话题；输入在顶部以小号灰字引用，下面直接显示回答。若输入原本来自该飞书话题，卡片只发回答，
 不把你的原消息重复一遍。超出卡片正文上限的完整事件仍保存在本机 outbox/run 记录中。
 
+**控制命令**：`/feishu-bind` 接入或恢复，`/feishu-unbind` 可恢复地暂停，`/feishu-status` 只读
+查看状态，`/feishu-rotate` 为同一 binding 创建下一话题代际。轮转的新话题在首次真实 mention
+前保持 pending，旧话题继续 active；认领成功后新话题 active、旧话题 read-only。待认领默认
+24 小时过期；显式取消可运行 `node scripts/feishu-rotate.mjs --cancel --apply`，不会删除话题历史。
+
 **续期**：绑定有效期是入站唯一的闸，到期前 30 天和 7 天会自动提醒。
 
 ```bash

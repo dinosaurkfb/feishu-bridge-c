@@ -78,10 +78,23 @@ attestation 的全部意义就是**跨多轮、跨话题轮转**积累至少 3 �
 
 `generated_at` 一律由已校验的 `nowMs` 经 `toISOString()` 产出，不透传调用方给的原值。
 `now` 接受数值、`Date` 对象和可解析字符串；`Date` 走 `getTime()` 而非 `Date.parse()`
-（后者经 `toString()` 会静默截掉毫秒）。超出 ECMAScript 时间值可表示范围（±8.64e15）的数值
-判为 `input_invalid` 而**不是抛异常** —— 本模块承诺只有调用方错误才返回 `ok:false`，
-从没承诺会抛。运行时 validator 对三个时间字段用往返相等判规范形式，比 JSON Schema 的
-`format: date-time` 更严；方向是有意的：运行时永远不能接受 schema 会拒的东西。
+（后者经 `toString()` 会静默截掉毫秒）。越界数值判为 `input_invalid` 而**不是抛异常** ——
+本模块承诺只有调用方错误才返回 `ok:false`，从没承诺会抛。
+
+三个时间字段（`generated_at`、`first_observed_at`、`last_observed_at`）的唯一合法形式是
+**UTC、毫秒、`Z` 结尾**，由 `CHAT_SCOPE_ATTESTATION_TIME_PATTERN` 固化，schema 的 `pattern`
+与运行时 validator **逐字同源**；运行时在正则之外再要求 `toISOString()` 往返相等，用来挡住
+形状合法但日期不存在的写法（如 `2026-02-30T00:00:00.000Z`，正则过得了）。
+
+边界按 **RFC3339 四位年份**卡（`0000-01-01` ～ `9999-12-31`），不是 ECMAScript 的 ±8.64e15。
+这个区别是一处真实缺陷的来源：`new Date(2.6e14).toISOString()` 产出
+`+010209-01-27T06:13:20.000Z`，六位年份，能被 `Date.parse` 往返却不是合法 RFC3339，
+schema 不收 —— 只按 ±8.64e15 放行，运行时就会产出 schema 校验不过的制品。
+probe 的 `observed_at` 越界同样判 `evidence_invalid`，且必须挡在计算时间范围**之前**。
+
+早先版本只做往返相等，自以为"运行时单向更严"，实际两个方向都不对：偏移写法上更严
+（schema 收、运行时拒），扩展年份上更松（运行时收、schema 拒）。现在是**双向等价**，
+测试对同一组样本同时跑 schema pattern 与运行时 validator，要求结论一致。
 
 `binding_ref` 已经把 runtime namespace、endpoint ID 和私有 binding key 一起编入派生哈希（见
 `dialogue-participant-planner-contract.md` §3），因此两个不同 runtime 的证据在结构上不可能共享同一
@@ -123,7 +136,9 @@ snapshot revision、过期、未来时间戳、locator 缺失、chat scope 不�
 证据窗口与时间输入另有专门覆盖：跨越 `freshness_ms` 的多轮证据仍成立（解耦正向）、判定源码不得
 出现 `freshness_ms`（解耦反向，源码级断言）、窗口边界闭区间、显式收紧生效且写入制品、非法窗口
 （0/负数/小数/字符串/超上限）判为调用方错误；以及 `Date` 入参不丢毫秒、非规范可解析字符串被折算成
-规范形式、越界时间值判错而不抛、validator 拒绝一切非规范 date-time。schema 一致性回归除枚举外
-还比对**字段集**与证据窗口上限，防止运行时与 schema 再次各自漂移。回滚只需删除
+规范形式、越界时间值判错而不抛、validator 拒绝一切非规范 date-time（含 `Z` 缺毫秒、`+08:00`
+偏移、六位扩展年份、不存在的日期）。schema 一致性回归除枚举外还比对**字段集**、证据窗口上限、
+三个时间字段的 `pattern` 与运行时常量同源，并对同一组时间样本同时跑 schema pattern 与运行时
+validator、要求结论一致 —— 防的正是"自以为单向更严、实际两个方向都漂"。回滚只需删除
 `scripts/dialogue-chat-scope-attestation.mjs`、对应 schema 文件与测试用例；由于没有任何热路径或
 持久化写入，回滚不需要清理任何运行时状态。

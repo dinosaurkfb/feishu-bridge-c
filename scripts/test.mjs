@@ -111,7 +111,7 @@ import { CANONICAL_TIME_PATTERN } from "./canonical-time.mjs";
 import {
   ATTESTATION_EVIDENCE_MAX_AGE_LIMIT_MS, ATTESTATION_EVIDENCE_MAX_AGE_MS,
   CHAT_SCOPE_ATTESTATION_ARTIFACT_TYPE, CHAT_SCOPE_ATTESTATION_REASON,
-  CHAT_SCOPE_ATTESTATION_STATUS, MIN_ATTESTATION_SAMPLES,
+  CHAT_SCOPE_ATTESTATION_STATUS, CHAT_SCOPE_ATTESTATION_TIME_PATTERN, MIN_ATTESTATION_SAMPLES,
   evaluateDialogueChatScopeAttestation, validateDialogueChatScopeAttestation,
 } from "./dialogue-chat-scope-attestation.mjs";
 import {
@@ -1486,7 +1486,11 @@ test("Chat scope attestation 的 generated_at 永远是规范 ISO，越界数值
 
   // 越界数值：Number.isFinite 拦不住，toISOString() 会抛 RangeError。
   // 本模块承诺"只有调用方错误才返回 ok:false"，没承诺会抛。
-  for (const outOfRange of [9e15, -9e15, Number.MAX_SAFE_INTEGER]) {
+  // 2.6e14 是另一类：它**不抛**，却会产出 "+010209-01-27T06:13:20.000Z" 这种六位年份 ——
+  // 能被 Date.parse 往返，但不是合法 RFC3339，schema 拒收。边界必须按四位年份卡，
+  // 而不是按 ECMAScript 的 ±8.64e15。
+  for (const outOfRange of [9e15, -9e15, Number.MAX_SAFE_INTEGER, 2.6e14,
+    Date.parse("9999-12-31T23:59:59.999Z") + 1]) {
     let outcome;
     assert.doesNotThrow(() => {
       outcome = evaluateDialogueChatScopeAttestation({ snapshot, probes, now: outOfRange });
@@ -1511,9 +1515,39 @@ test("Chat scope attestation validator 与 JSON Schema 对 date-time 同解", ()
 
   // 运行时不能接受 schema 会拒的东西 —— 这正是原来 Number.isFinite(Date.parse(x)) 的漏洞。
   for (const field of ["generated_at", "first_observed_at", "last_observed_at"]) {
-    for (const bad of ["2026-08-19", "2026-08-19T10:00:00", 1755597600000, null]) {
+    for (const bad of ["2026-08-19", "2026-08-19T10:00:00", "2026-08-19T10:00:00Z",
+      "2026-08-19T18:00:00+08:00", "+010209-01-27T06:13:20.000Z",
+      "2026-02-30T00:00:00.000Z", 1755597600000, null]) {
       assert.equal(validateDialogueChatScopeAttestation({ ...good, [field]: bad }).ok, false,
         field + " = " + JSON.stringify(bad) + " 不是规范 date-time，validator 必须拒");
+    }
+  }
+
+  // 双向等价：schema 的 pattern 与运行时用的是同一条，且两边对同一组样本判一致。
+  // 早先版本只做 toISOString 往返，自以为"单向更严"，其实两个方向都不对：
+  // 偏移写法上更严（schema 收、运行时拒），扩展年份上更松（运行时收、schema 拒）——
+  // 后者意味着运行时会产出 schema 校验不过的制品。
+  const timeRe = new RegExp(CHAT_SCOPE_ATTESTATION_TIME_PATTERN, "u");
+  const timeSchema = JSON.parse(fs.readFileSync(path.resolve("references",
+    "dialogue-chat-scope-attestation-v1.schema.json"), "utf-8"));
+  for (const field of ["generated_at", "first_observed_at", "last_observed_at"]) {
+    assert.equal(timeSchema.properties[field].pattern, CHAT_SCOPE_ATTESTATION_TIME_PATTERN,
+      field + " 的 schema pattern 必须与运行时同源");
+  }
+  for (const sample of ["2026-08-19T10:00:00.000Z", "0001-01-01T00:00:00.000Z",
+    "9999-12-31T23:59:59.999Z", "+010209-01-27T06:13:20.000Z", "2026-08-19T10:00:00Z",
+    "2026-08-19T18:00:00+08:00", "2026-08-19", "2026-02-30T00:00:00.000Z"]) {
+    const bySchema = timeRe.test(sample);
+    const byRuntime = validateDialogueChatScopeAttestation(
+      { ...good, generated_at: sample }).ok;
+    // 形状合法但日期不存在的（2026-02-30）schema pattern 拦不住，运行时靠往返相等再拦一道；
+    // 除此之外两边必须给出相同结论。
+    if (sample !== "2026-02-30T00:00:00.000Z") {
+      assert.equal(byRuntime, bySchema,
+        sample + "：schema pattern 与运行时 validator 结论必须一致");
+    } else {
+      assert.equal(bySchema, true);
+      assert.equal(byRuntime, false, "不存在的日期靠往返相等兜住");
     }
   }
   for (const bad of [undefined, 0, -1, 1.5, ATTESTATION_EVIDENCE_MAX_AGE_LIMIT_MS + 1]) {

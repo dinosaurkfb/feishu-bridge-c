@@ -13,7 +13,7 @@
     "schema_version": { "const": "1.0" },
     "artifact_type": { "const": "feishu_bridge_dialogue_chat_scope_attestation" },
     "attestation_version": { "const": "1.0" },
-    "generated_at": { "type": "string", "format": "date-time" },
+    "generated_at": { "type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" },
     "binding_ref": { "type": "string", "pattern": "^binding_ref_[0-9a-f]{24}$" },
     "authorization_snapshot_id": {
       "type": "string",
@@ -39,8 +39,8 @@
       "description": "判定这批证据是否过期所用的保留窗口（毫秒）。独立策略：与 subscription/chain config 里 freshness_ms 的消息处理新鲜度、防重放期限无关，不得互相复用。"
     },
     "sample_count": { "type": "integer", "minimum": 0 },
-    "first_observed_at": { "type": ["string", "null"], "format": "date-time" },
-    "last_observed_at": { "type": ["string", "null"], "format": "date-time" }
+    "first_observed_at": { "type": ["string", "null"], "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" },
+    "last_observed_at": { "type": ["string", "null"], "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" }
   },
   "allOf": [
     {

@@ -116,6 +116,8 @@ Claude project-file binding 与 Topic Generation 共用生命周期锁；registr
   consumed sidecar 与两套全量回归：Claude 336/336、Codex 79/79，18 个共享模块契约一致；
 - 真实链路证据覆盖显式进入 Dialogue、同一飞书话题的 3 个人类→Codex 串行回合、每轮自动回写、
   `3 / 12` 轮次与 `3 / 12` 资源计账、无悬挂活动回合，以及显式切回 Mapping；
+- 真实链路证据仅覆盖 Codex watcher 终局路径；Claude 后台 watcher 与活跃会话 Stop 收口
+  （包括截止时间后的悬挂回合收口）目前只有合成证据，Claude 端真实多回合验收尚未完成；
 - 真实验收不代表多 Agent 自动接力、并行发言、多人授权或自动 Topic Generation v1 已验收；
   这些能力仍需独立契约、授权和真实证据。
 

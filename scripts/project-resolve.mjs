@@ -52,8 +52,12 @@ export function loadConsumed(root, claudeSessionId) {
 }
 
 /** 只留最近 CONSUMED_MAX 条：幂等只需覆盖时效窗口，无限增长的列表迟早自己变成问题。 */
-export function appendConsumed(root, messageId, { max = CONSUMED_MAX, claudeSessionId } = {}) {
-  const ids = loadConsumed(root, claudeSessionId);
+export function appendConsumed(root, messageId, {
+  max = CONSUMED_MAX, claudeSessionId, seed = [],
+} = {}) {
+  const stored = loadConsumed(root, claudeSessionId);
+  const ids = stored.length > 0 ? stored
+    : (Array.isArray(seed) ? seed.filter((value) => typeof value === "string") : []);
   if (ids.includes(messageId)) return ids;
   const next = [...ids, messageId].slice(-max);
   const file = consumedPath(root, claudeSessionId);
@@ -112,6 +116,7 @@ export function mappingFromRegistryEntry(entry, { consumed = [] } = {}) {
     pending_expires_at: entry.pending_expires_at ?? null,
     channel_generation_id: entry.channel_generation_id ?? null,
     topic_generation_state: entry.topic_generation_state ?? null,
+    interaction_policy_state: entry.interaction_policy_state ?? null,
 
     inbound_prefix: null,
     // 会话级绑定把 Claude 会话 id 带进 mapping，入站据此投给指定的那条线。
@@ -161,6 +166,10 @@ export function resolveProject({ root, claudeSessionId, registryFile, templateFi
   if (fs.existsSync(mapPath)) {
     try {
       mapping = readJson(mapPath);
+      const sidecar = consumedPath(root, mapping?.claude_session_id ?? null);
+      if (fs.existsSync(sidecar)) {
+        mapping.consumed_message_ids = loadConsumed(root, mapping?.claude_session_id ?? null);
+      }
       source = "project-files";
     } catch (err) {
       // 文件在但读不出来是配错，不是没接 —— 必须说出来，静默会让进展无限期堆在本地。

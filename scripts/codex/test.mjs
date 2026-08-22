@@ -28,7 +28,7 @@ import {
 } from "../turn-input.mjs";
 import {
   classifyFeishuPrompt, composeAilyInboundContext, composeBindingContext, composeInitContext,
-  composeInvalidControlContext, composeRotateContext, composeRoutedCodexContext,
+  composeInvalidControlContext, composeModeContext, composeRotateContext, composeRoutedCodexContext,
   composeStatusContext, composeUnbindContext,
   isAilyInvocation, isBindingPrompt,
 } from "./prompt-hook.mjs";
@@ -38,12 +38,14 @@ import {
   findRegisteredTaskForCodexThread, findTaskForCodexThread, findTaskForFeishuSession,
   isThreadBusy, loadCodexTemplate, loadRegistry, makeTaskEntry, mappingForTask, recordThreadActivity, resolveTask,
   closeTaskTopicRotation, prepareTaskTopicRotation, promoteTask, recordTaskTopicActivity,
+  finalizeTaskDialogueTurn, interactionPolicyForTask, reserveTaskDialogueTurn,
   refreshPendingTaskBinding,
   registerTaskTopicRotation, resolveTaskOutboundGeneration, setTaskConnectionStatus,
-  setTaskDisplayName, shadowCodexFirstClaim, taskPaths, topicStateForTask,
+  setTaskDisplayName, setTaskInteractionMode, shadowCodexFirstClaim, taskPaths, topicStateForTask,
   validateCodexTemplate, validateRegistryTasks, writeRegistry,
 } from "./state.mjs";
 import { ROTATION_STATUS, activeGeneration, pendingGeneration } from "../topic-generation.mjs";
+import { DIALOGUE_TURN_STATUS } from "../interaction-policy.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
 const THREAD_A = "01911111-2222-7333-8444-555555555555";
@@ -96,6 +98,60 @@ test("thread id 只接受精确 UUID，不接受 --last 或名字", () => {
   assert.equal(validThreadId(THREAD_A), true);
   assert.equal(validThreadId("--last"), false);
   assert.equal(validThreadId("my-recent-thread"), false);
+});
+
+test("Codex task registry 原子保存 Dialogue 模式、回合与终局", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Dialogue", rootMessageId: "om_root", token: "abc123" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const enabled = setTaskInteractionMode({
+    threadId: THREAD_A, mode: "dialogue", home, now: 1_800_000_000_000,
+  });
+  assert.equal(enabled.ok, true);
+  const reserved = reserveTaskDialogueTurn({
+    threadId: THREAD_A, eventId: "om_dialogue", runId: "claim_dialogue",
+    localTargetId: "local_target", originChannelGenerationId: "generation",
+    runtimeTargetId: THREAD_A, home, now: 1_800_000_000_001,
+  });
+  assert.equal(reserved.accepted, true);
+  const finished = finalizeTaskDialogueTurn({
+    threadId: THREAD_A, runId: "claim_dialogue", status: DIALOGUE_TURN_STATUS.COMPLETED,
+    home, now: 1_800_000_000_002,
+  });
+  assert.equal(finished.ok, true);
+  const stored = loadRegistry(path.join(home, "registry.json")).tasks[0];
+  const loaded = interactionPolicyForTask(stored, { now: 1_800_000_000_003 });
+  assert.equal(loaded.state.policy_id, "dialogue");
+  assert.equal(loaded.state.dialogue.active_turn, null);
+  assert.equal(loaded.state.dialogue.last_turn.status, "completed");
+});
+
+test("Codex feishu-mode 默认只读，只有 --apply 才切换精确 task", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Mode", rootMessageId: "om_root", token: "abc123" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const cli = path.join(ROOT, "scripts", "codex", "feishu-mode.mjs");
+  const run = (...args) => spawnSync(process.execPath, [cli, "--thread-id", THREAD_A, ...args], {
+    encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+  });
+  const read = run();
+  assert.equal(read.status, 0, read.stderr);
+  assert.match(read.stdout, /Mapping/u);
+  const preview = run("--mode", "dialogue");
+  assert.match(preview.stdout, /dry-run/u);
+  assert.equal(loadRegistry(path.join(home, "registry.json")).tasks[0].interaction_policy_state, undefined);
+  const applied = run("--mode", "dialogue", "--apply");
+  assert.equal(applied.status, 0, applied.stderr);
+  assert.match(applied.stdout, /Dialogue/u);
+  assert.equal(loadRegistry(path.join(home, "registry.json")).tasks[0].interaction_policy_state.policy_id,
+    "dialogue");
+  const invalid = run("--mode", "automatic", "--apply");
+  assert.equal(invalid.status, 2);
+  assert.match(invalid.stderr, /mapping.*dialogue/u);
 });
 
 test("单 M5Codex 是模板强约束", () => {
@@ -1093,10 +1149,16 @@ test("Prompt hook 只接受占据整条输入的显式控制命令", () => {
   assert.equal(classifyFeishuPrompt("$feishu-unbind"), "unbind");
   assert.equal(classifyFeishuPrompt("$feishu-status"), "status");
   assert.equal(classifyFeishuPrompt("$feishu-rotate"), "rotate");
+  assert.equal(classifyFeishuPrompt("$feishu-mode"), "mode");
+  assert.equal(classifyFeishuPrompt("$feishu-mode dialogue"), "mode-dialogue");
+  assert.equal(classifyFeishuPrompt("$feishu-mode mapping"), "mode-mapping");
   assert.equal(classifyFeishuPrompt("[$feishu-bind](/Users/test/.codex/skills/feishu-bind/SKILL.md)"), "bind");
   assert.equal(classifyFeishuPrompt("[$feishu-unbind](/Users/test/.codex/skills/feishu-unbind/SKILL.md)"), "unbind");
   assert.equal(classifyFeishuPrompt("[$feishu-status](/Users/test/.codex/skills/feishu-status/SKILL.md)"), "status");
   assert.equal(classifyFeishuPrompt("[$feishu-rotate](/Users/test/.codex/skills/feishu-rotate/SKILL.md)"), "rotate");
+  assert.equal(classifyFeishuPrompt("[$feishu-mode](/Users/test/.codex/skills/feishu-mode/SKILL.md)"), "mode");
+  assert.equal(classifyFeishuPrompt(
+    "[$feishu-mode](/Users/test/.codex/skills/feishu-mode/SKILL.md)&#x20;dialogue"), "mode-dialogue");
   assert.equal(classifyFeishuPrompt(
     "[$feishu-bind](/Users/test/.codex/skills/feishu-bind/SKILL.md)&#x20;"), "bind");
   assert.equal(classifyFeishuPrompt("把当前 task 撤销飞书接入"), "none");
@@ -1110,6 +1172,7 @@ test("Prompt hook 只接受占据整条输入的显式控制命令", () => {
   assert.equal(classifyFeishuPrompt("$feishu-bind 然后继续"), "invalid-bind");
   assert.equal(classifyFeishuPrompt("$feishu-unbind 暂停一下"), "invalid-unbind");
   assert.equal(classifyFeishuPrompt("$feishu-rotate 现在"), "invalid-rotate");
+  assert.equal(classifyFeishuPrompt("$feishu-mode 自动"), "invalid-mode");
   assert.equal(classifyFeishuPrompt(
     "[$feishu-status](/Users/test/.codex/skills/feishu-status/SKILL.md) 看看"), "invalid-status");
   assert.equal(isBindingPrompt("继续写代码"), false);
@@ -1127,6 +1190,9 @@ test("Prompt hook 只接受占据整条输入的显式控制命令", () => {
   assert.match(composeStatusContext({ bridgeRoot: "/bridge", threadId: THREAD_A }), /feishu-status\.mjs/);
   assert.match(composeRotateContext({ bridgeRoot: "/bridge", threadId: THREAD_A }),
     /feishu-rotate\.mjs.*--apply/u);
+  assert.match(composeModeContext({ bridgeRoot: "/bridge", threadId: THREAD_A, mode: "dialogue" }),
+    /feishu-mode\.mjs.*--mode dialogue.*--apply/u);
+  assert.equal(composeModeContext({ bridgeRoot: "/bridge", threadId: THREAD_A }).includes("--apply"), false);
 });
 
 test("像控制命令但附带正文时明确提示格式，绝不执行或登记未绑定 task", () => {
@@ -1527,6 +1593,42 @@ test("关闭自动发布时 watcher 只把严格完成的最终答复兜底入�
   assert.equal(fs.existsSync(paths.sessionLock), false);
 });
 
+test("Codex watcher 严格完成后释放 Dialogue 活动回合", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Dialogue", rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = false;
+  writeRegistry([task], path.join(home, "registry.json"));
+  setTaskInteractionMode({ threadId: THREAD_A, mode: "dialogue", home, now: 1_800_000_000_000 });
+  const key = "d".repeat(64);
+  reserveTaskDialogueTurn({
+    threadId: THREAD_A, eventId: "om_dialogue_watch", runId: key,
+    localTargetId: "local", originChannelGenerationId: task.channel_generation_id,
+    runtimeTargetId: THREAD_A, home, now: 1_800_000_000_001,
+  });
+  const current = loadRegistry(path.join(home, "registry.json")).tasks[0];
+  const paths = taskPaths(current, home);
+  fs.mkdirSync(path.join(paths.claims, key + ".claim"), { recursive: true });
+  fs.writeFileSync(path.join(paths.claims, key + ".claim", "claim.json"), JSON.stringify({
+    claim_key: key, policy_id: "dialogue", origin_channel_generation_id: task.channel_generation_id,
+  }));
+  fs.mkdirSync(paths.runs, { recursive: true });
+  fs.mkdirSync(paths.sessionLock, { recursive: true });
+  fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), [
+    { type: "thread.started", thread_id: THREAD_A }, { type: "turn.started" }, { type: "turn.completed" },
+  ].map(JSON.stringify).join("\n") + "\n");
+  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify({ exit_code: 0 }));
+  fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "dialogue final");
+  const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
+    "--claim-key", key, "--task-key", task.logical_task_key,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.equal(run.status, 0, run.stderr);
+  const after = loadRegistry(path.join(home, "registry.json")).tasks[0];
+  assert.equal(interactionPolicyForTask(after).state.dialogue.active_turn, null);
+  assert.equal(interactionPolicyForTask(after).state.dialogue.last_turn.status, "completed");
+});
+
 test("watcher 抑制递归产生的错误答复，只保留风险回执", () => {
   const home = temp();
   const root = path.join(home, "workspace");
@@ -1637,7 +1739,7 @@ test("安装器在隔离 HOME 只追加 hooks、渲染技能路径且保留已�
   assert.equal(controlSkill.includes("AILY_CLI_*"), true);
   assert.equal(controlSkill.includes("m5codex-inbound-router"), true);
   assert.equal(controlSkill.includes("$feishu-unbind"), true);
-  for (const name of ["feishu-bind", "feishu-unbind", "feishu-status", "feishu-rotate"]) {
+  for (const name of ["feishu-bind", "feishu-unbind", "feishu-status", "feishu-rotate", "feishu-mode"]) {
     const commandSkill = fs.readFileSync(path.join(codexHome, "skills", name, "SKILL.md"), "utf-8");
     assert.equal(commandSkill.includes("name: " + name), true);
     if (name === "feishu-bind") {
@@ -1900,7 +2002,7 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
       Stop: [{ hooks: [{ command: "node " + path.join(ROOT, "scripts", "codex", "stop-hook.mjs") }] }],
     },
   }));
-  for (const name of ["m5codex-inbound-router", "codex-longtask-feishu", "feishu-bind", "feishu-unbind", "feishu-status", "feishu-rotate"]) {
+  for (const name of ["m5codex-inbound-router", "codex-longtask-feishu", "feishu-bind", "feishu-unbind", "feishu-status", "feishu-rotate", "feishu-mode"]) {
     const skillDir = path.join(codexHome, "skills", name);
     fs.mkdirSync(skillDir, { recursive: true });
     fs.writeFileSync(path.join(skillDir, "SKILL.md"), "---\nname: " + name + "\n---\n");

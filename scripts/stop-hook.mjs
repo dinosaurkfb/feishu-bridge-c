@@ -120,6 +120,11 @@ async function main() {
   const { appendEvent, listPending, MAX_REPLY_CHARS } = await import("./outbox.mjs");
   const { checkBinding, bindingWarning } = await import("./binding-health.mjs");
   const { isBridgeOwnedSession } = await import("./live-session.mjs");
+  const { finalizeClaudeDialogueTurn } = await import("./interaction-policy-store.mjs");
+  const { recordClaimState } = await import("./claim.mjs");
+  const {
+    DIALOGUE_POLICY_ID, DIALOGUE_TURN_STATUS, interactionPolicyStateForLegacy,
+  } = await import("./interaction-policy.mjs");
 
   // 桥自己起的会话不产生答复：转发那个只会说「sent」，跑活那个的结果归守望者发
   //（它能分辨 completed / blocked / failed，Stop 钩子看不出这些）。
@@ -140,6 +145,37 @@ async function main() {
     const boundSession = bound.ok ? bound.claudeSessionId : null;
     const outboxDir = outboxDirOf(project.root, boundSession);
     const inputDir = claudeTurnInputDir(project.root, boundSession);
+    // Dialogue 的现场投递没有后台 watcher；精确目标会话的 Stop 就是该回合的终局观察点。
+    // 只结束 active_turn.runtime_target_id 与本会话严格相同的回合，其他会话的 Stop 不得碰它。
+    if (!ownedByBridge && speakingSession && bound.ok) {
+      const interaction = interactionPolicyStateForLegacy(bound.mapping, {
+        bindingId: bound.mapping?.binding_id,
+      });
+      const activeTurn = interaction.ok ? interaction.state.dialogue?.active_turn : null;
+      if (interaction.ok && interaction.state.policy_id === DIALOGUE_POLICY_ID &&
+          activeTurn?.runtime_target_id === speakingSession) {
+        const finalized = finalizeClaudeDialogueTurn({
+          root: project.root,
+          claudeSessionId: boundSession,
+          runtimeTargetId: speakingSession,
+          status: reply ? DIALOGUE_TURN_STATUS.COMPLETED : DIALOGUE_TURN_STATUS.FAILED,
+          reason: reply ? null : "empty_final_output",
+        });
+        if (finalized.ok && finalized.changed !== false) {
+          recordClaimState({
+            claimsDir: path.join(project.root, ".runtime-data", "inbound", "delivery-claims"),
+            key: activeTurn.run_id,
+            state: reply ? "completed" : "failed",
+            detail: {
+              run_state: reply ? "completed" : "failed",
+              observed_by: "claude-live-stop-hook",
+              reason: reply ? null : "empty_final_output",
+            },
+          });
+        }
+        log(project.id + " dialogue finalize -> " + (finalized.ok ? "ok" : finalized.reason));
+      }
+    }
     // 答复只发给 **cwd 归属**的项目，不发给「会话记录里提到过路径」的那些。
     // 弱信号用来触发排空是安全的（那些内容本来就要发），但用它决定
     // 「把整段对话原文发到谁的话题里」不行 —— 一次误判就是把无关对话发给了 Frank。

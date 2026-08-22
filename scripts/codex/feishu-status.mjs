@@ -5,8 +5,10 @@ import { listPending } from "../outbox.mjs";
 import { validThreadId } from "./bind-compose.mjs";
 import {
   bridgeHome, findRegisteredTaskForCodexThread, taskPaths, topicStateForTask,
+  interactionPolicyForTask,
 } from "./state.mjs";
 import { activeGeneration, pendingGeneration } from "../topic-generation.mjs";
+import { interactionPolicySummary } from "../interaction-policy.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -40,8 +42,20 @@ if (!topic.ok) {
 const activeTopic = activeGeneration(topic.state);
 const pendingTopic = pendingGeneration(topic.state);
 const readOnlyCount = topic.state.generations.filter((generation) => generation.status === "read-only").length;
+const interaction = interactionPolicyForTask(task);
+if (!interaction.ok) {
+  console.error("无法读取交互策略状态：" + interaction.reason);
+  process.exit(1);
+}
+const policy = interactionPolicySummary(interaction.state);
 console.log("当前 Codex task：" + (active ? "已接入飞书" : "已暂停飞书接入"));
 console.log("当前话题代际：" + (activeTopic ? "第 " + activeTopic.generation + " 代" : "尚未完成首次认领"));
+console.log("交互模式：" + policy.label + " · v" + policy.policyVersion);
+if (policy.policyId === "dialogue") {
+  console.log("对话状态：" + policy.status + (policy.turnActive ? "（有活动回合）" : ""));
+  console.log("对话预算：" + policy.roundsStarted + " / " + policy.maxRounds + " 轮；" +
+    policy.resourceUnitsUsed + " / " + policy.maxResourceUnits + " 资源单位");
+}
 if (activeTopic) {
   console.log("自动轮转：" + (activeTopic.activity?.message_count ?? 0) + " / " +
     (activeTopic.activity?.auto_rotate_threshold ?? 30) + " 条有效业务消息");

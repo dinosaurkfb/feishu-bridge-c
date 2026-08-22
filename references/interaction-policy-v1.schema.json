@@ -1,0 +1,246 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dinosaurkfb/feishu-bridge-c/references/interaction-policy-v1.schema.json",
+  "title": "Feishu Bridge Interaction Policy v1",
+  "oneOf": [
+    { "$ref": "#/$defs/mapping" },
+    { "$ref": "#/$defs/dialogue" }
+  ],
+  "$defs": {
+    "base": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "binding_id",
+        "policy_id",
+        "policy_version",
+        "updated_at",
+        "dialogue"
+      ],
+      "properties": {
+        "schema_version": { "const": "1.0" },
+        "binding_id": { "type": "string", "minLength": 1 },
+        "policy_id": { "enum": ["mapping", "dialogue"] },
+        "policy_version": { "const": "1.0" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "mapping": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "schema_version": { "const": "1.0" },
+            "binding_id": { "type": "string", "minLength": 1 },
+            "policy_id": { "const": "mapping" },
+            "policy_version": { "const": "1.0" },
+            "updated_at": { "type": "string", "format": "date-time" },
+            "dialogue": {
+              "oneOf": [
+                { "type": "null" },
+                {
+                  "allOf": [
+                    { "$ref": "#/$defs/dialogue_state" },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "status": { "enum": ["completed", "failed", "cancelled"] }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "dialogue": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "schema_version": { "const": "1.0" },
+            "binding_id": { "type": "string", "minLength": 1 },
+            "policy_id": { "const": "dialogue" },
+            "policy_version": { "const": "1.0" },
+            "updated_at": { "type": "string", "format": "date-time" },
+            "dialogue": { "$ref": "#/$defs/dialogue_state" }
+          }
+        }
+      ]
+    },
+    "participant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["participant_id", "role"],
+      "properties": {
+        "participant_id": {
+          "enum": ["authorized_human", "bound_local_target"]
+        },
+        "role": { "enum": ["human", "host"] }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_rounds", "max_duration_ms", "max_resource_units"],
+      "properties": {
+        "max_rounds": { "type": "integer", "minimum": 1 },
+        "max_duration_ms": { "type": "integer", "minimum": 1 },
+        "max_resource_units": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "turn": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "run_id",
+        "dialogue_id",
+        "turn_index",
+        "local_target_id",
+        "origin_channel_generation_id",
+        "runtime_target_id",
+        "resource_units",
+        "status",
+        "dispatched_at"
+      ],
+      "properties": {
+        "event_id": { "type": "string", "minLength": 1 },
+        "run_id": { "type": "string", "minLength": 1 },
+        "dialogue_id": { "type": "string", "minLength": 1 },
+        "turn_index": { "type": "integer", "minimum": 1 },
+        "local_target_id": { "type": "string", "minLength": 1 },
+        "origin_channel_generation_id": { "type": "string", "minLength": 1 },
+        "runtime_target_id": { "type": ["string", "null"] },
+        "resource_units": { "type": "integer", "minimum": 1 },
+        "status": { "enum": ["dispatched", "completed", "failed", "cancelled"] },
+        "dispatched_at": { "type": "string", "format": "date-time" },
+        "finalized_at": { "type": "string", "format": "date-time" },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "processed_event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "run_id", "dialogue_id", "turn_index"],
+      "properties": {
+        "event_id": { "type": "string", "minLength": 1 },
+        "run_id": { "type": "string", "minLength": 1 },
+        "dialogue_id": { "type": "string", "minLength": 1 },
+        "turn_index": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "dialogue_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dialogue_id",
+        "status",
+        "host",
+        "participants",
+        "turn_order",
+        "allow_agent_output_as_input",
+        "finalization",
+        "concurrency",
+        "stop_conditions",
+        "budget",
+        "usage",
+        "next_turn_index",
+        "active_turn",
+        "processed_events",
+        "started_at",
+        "deadline_at",
+        "updated_at",
+        "ended_at",
+        "stop_reason"
+      ],
+      "properties": {
+        "dialogue_id": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["active", "completed", "failed", "cancelled"] },
+        "host": { "$ref": "#/$defs/participant" },
+        "participants": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "$ref": "#/$defs/participant" }
+        },
+        "turn_order": { "const": "human_then_host_serial" },
+        "allow_agent_output_as_input": { "const": false },
+        "finalization": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["summarizer_participant_id", "publish_target"],
+          "properties": {
+            "summarizer_participant_id": { "const": "bound_local_target" },
+            "publish_target": { "const": "origin_channel_generation" }
+          }
+        },
+        "concurrency": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max_active_turns",
+            "duplicate_event",
+            "mention_loop",
+            "agent_output_relay"
+          ],
+          "properties": {
+            "max_active_turns": { "const": 1 },
+            "duplicate_event": { "const": "idempotent" },
+            "mention_loop": { "const": "disabled" },
+            "agent_output_relay": { "const": "disabled" }
+          }
+        },
+        "stop_conditions": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 5,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "round_budget",
+              "time_budget",
+              "resource_budget",
+              "runtime_failure",
+              "human_interrupt"
+            ]
+          }
+        },
+        "budget": { "$ref": "#/$defs/budget" },
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["rounds_started", "resource_units_used"],
+          "properties": {
+            "rounds_started": { "type": "integer", "minimum": 0 },
+            "resource_units_used": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "next_turn_index": { "type": "integer", "minimum": 1 },
+        "active_turn": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/turn" }
+          ]
+        },
+        "last_turn": { "$ref": "#/$defs/turn" },
+        "processed_events": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/processed_event" }
+        },
+        "started_at": { "type": "string", "format": "date-time" },
+        "deadline_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "ended_at": { "type": ["string", "null"], "format": "date-time" },
+        "stop_reason": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

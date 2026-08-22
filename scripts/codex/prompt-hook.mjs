@@ -12,15 +12,24 @@ import { storeTurnInput } from "../turn-input.mjs";
 export function classifyFeishuPrompt(prompt) {
   if (typeof prompt !== "string") return "none";
   const p = prompt.trim().replace(/(?:(?:&#x20;|&nbsp;)\s*)+$/gu, "").trim();
-  if (p === "/init") return "init";
+  const commandText = p.replace(/(?:&#x20;|&nbsp;)/gu, " ").trim();
+  if (commandText === "/init") return "init";
 
   // 控制动作必须占据整条输入。CLI 保留裸 `$skill`；Desktop 会把显式技能调用序列化成
   // `[$skill](/absolute/.../$skill/SKILL.md)`。不能只查正文里有没有 token：用户可能正在
   // 讨论命令、粘贴 Agent 输出或引用旧消息，那些都没有控制授权。
-  const bare = /^\$(feishu-bind|feishu-unbind|feishu-status|feishu-rotate)$/u.exec(p);
+  const bareMode = /^\$feishu-mode(?:\s+(dialogue|mapping))?$/u.exec(commandText);
+  if (bareMode) return bareMode[1] ? "mode-" + bareMode[1] : "mode";
+  const bare = /^\$(feishu-bind|feishu-unbind|feishu-status|feishu-rotate)$/u.exec(commandText);
   if (bare) return bare[1].slice("feishu-".length);
 
-  const linked = /^\[\$(feishu-bind|feishu-unbind|feishu-status|feishu-rotate)\]\(([^\r\n)]+)\)$/u.exec(p);
+  const linkedMode = /^\[\$feishu-mode\]\(([^\r\n)]+)\)(?:\s+(dialogue|mapping))?$/u.exec(commandText);
+  if (linkedMode) {
+    const target = linkedMode[1].replace(/\\/gu, "/");
+    if (!target.endsWith("/feishu-mode/SKILL.md")) return "invalid-mode";
+    return linkedMode[2] ? "mode-" + linkedMode[2] : "mode";
+  }
+  const linked = /^\[\$(feishu-bind|feishu-unbind|feishu-status|feishu-rotate)\]\(([^\r\n)]+)\)$/u.exec(commandText);
   if (linked) {
     const name = linked[1];
     const target = linked[2].replace(/\\/gu, "/");
@@ -30,9 +39,11 @@ export function classifyFeishuPrompt(prompt) {
 
   // 看起来像从命令开始、但附带了参数或正文时，必须 fail-closed 且给出反馈。讨论、引用
   // 和转发通常不会从 token 开始，仍保持静默 none，避免把普通内容误当成控制动作。
-  const malformedBare = /^\$(feishu-bind|feishu-unbind|feishu-status|feishu-rotate)(?=\s|&#x20;|&nbsp;)/u.exec(p);
+  const malformedMode = /^(?:\$feishu-mode|\[\$feishu-mode\]\([^\r\n)]*\))(?=\s)/u.exec(commandText);
+  if (malformedMode) return "invalid-mode";
+  const malformedBare = /^\$(feishu-bind|feishu-unbind|feishu-status|feishu-rotate)(?=\s)/u.exec(commandText);
   if (malformedBare) return "invalid-" + malformedBare[1].slice("feishu-".length);
-  const malformedLinked = /^\[\$(feishu-bind|feishu-unbind|feishu-status|feishu-rotate)\]\([^\r\n)]*\)/u.exec(p);
+  const malformedLinked = /^\[\$(feishu-bind|feishu-unbind|feishu-status|feishu-rotate)\]\([^\r\n)]*\)/u.exec(commandText);
   if (malformedLinked) return "invalid-" + malformedLinked[1].slice("feishu-".length);
   return "none";
 }
@@ -87,6 +98,22 @@ export function composeRotateContext({ bridgeRoot, threadId }) {
     "直接运行以下两阶段轮转命令，不要再次要求确认：",
     "`node " + command + " --thread-id " + threadId + " --apply`",
     "新话题完成首次真实 mention 认领前，旧话题继续 active；认领成功后旧话题只读。不得删除旧话题或直接编辑 registry。",
+  ].join("\n");
+}
+
+export function composeModeContext({ bridgeRoot, threadId, mode = null }) {
+  const command = path.join(bridgeRoot, "scripts", "codex", "feishu-mode.mjs");
+  const write = mode === "dialogue" || mode === "mapping";
+  return [
+    "[Codex 飞书桥·交互模式] 用户通过 $feishu-mode" + (write ? " " + mode : "") +
+      (write ? " 明确授权切换当前精确 task 的交互策略。" : " 要求只读查看当前交互策略。"),
+    "当前 task 的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
+    "只运行以下" + (write ? "模式切换" : "只读") + "命令：",
+    "`node " + command + " --thread-id " + threadId +
+      (write ? " --mode " + mode + " --apply" : "") + "`",
+    write
+      ? "不要再次要求确认；不得直接编辑 registry。切回 mapping 会中止后续 Dialogue 编排，但不删除历史。"
+      : "不得修改 registry、policy、binding 或话题。",
   ].join("\n");
 }
 
@@ -246,6 +273,12 @@ async function main() {
     additionalContext = composeStatusContext({ bridgeRoot: tpl.template.bridge_root, threadId });
   } else if (action === "rotate") {
     additionalContext = composeRotateContext({ bridgeRoot: tpl.template.bridge_root, threadId });
+  } else if (action === "mode" || action.startsWith("mode-")) {
+    additionalContext = composeModeContext({
+      bridgeRoot: tpl.template.bridge_root,
+      threadId,
+      mode: action.startsWith("mode-") ? action.slice("mode-".length) : null,
+    });
   } else {
     process.exit(0);
   }

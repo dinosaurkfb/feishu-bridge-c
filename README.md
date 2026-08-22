@@ -175,7 +175,8 @@ claim、长期任务续接与最终答复发布都由 bridge 管理。新接一�
 3. UserPromptSubmit hook 在模型看到正文**之前**注入「本回合只准跑分发器」
 4. 分发器验调用方 agent、**只取一次**信封、构造无损 Canonical Event，再按可信字段选路
 5. 公共入站核心校验身份、发送者、群、话题、session、时效并取得幂等 claim
-6. Mapping Policy 返回明确处置；受理时生成不含 session/thread locator 的统一 `runRequest`
+6. 当前 Interaction Policy（Mapping 或 Dialogue）返回明确处置；受理时生成不含
+   session/thread locator 的统一 `runRequest`
 7. 飞书先收到“已受理”或明确拒绝原因（分发器**一个字都不加**，原样透出 handler 的话）
 8. runtime adapter 续接精确长期任务，任务使用原上下文执行指令
 9. hooks/watcher 确认真实终局并把最终答复写入 outbox
@@ -223,15 +224,22 @@ session 绑定。日常还可以使用：
 | unbind | `$feishu-unbind` | `/feishu-unbind` | 可恢复地暂停，不删话题、映射或历史 |
 | bind | `$feishu-bind` | `/feishu-bind` | 首次接入，或恢复已暂停的原话题连接 |
 | rotate | `$feishu-rotate` | `/feishu-rotate` | 为同一 binding 创建下一话题代际；旧话题保留为只读历史 |
+| mode | `$feishu-mode [dialogue\|mapping]` | `/feishu-mode [dialogue\|mapping]` | 无参数只读查看；显式切换当前 binding 的交互策略 |
 
 两边命令同名。差别只在绑定单位：Codex 绑一个精确 task，Claude 默认绑项目、
 也可以用 `bind-session` 让某一条会话单独占一个话题。
 
-当前发行版实际安装上表四项。`bind` 仍是把当前精确本地 target 接入一个话题的兼容入口：首次
+本版本实际安装上表五项。`bind` 仍是把当前精确本地 target 接入一个话题的兼容入口：首次
 接入时，它同时物化现有单群配置下的订阅授权快照，但不等同于未来可独立管理的 Subscription。
-架构路线图中的 `$feishu-connect`、`$feishu-subscribe` 和 `$feishu-mode` 分别用于 endpoint、独立订阅
-和交互策略，尚未开放，不能把需求文档里的建议命令误认为当前可用能力。详见
+架构路线图中的 `$feishu-connect` 和 `$feishu-subscribe` 分别用于 endpoint 与独立订阅，尚未开放，
+不能把需求文档里的建议命令误认为当前可用能力。详见
 [Agent 增强需求](docs/requirements/agent-enhancement-requirements.md#fr-7-显式控制面)。
+
+`mode` 默认只读。显式切到 `dialogue` 后，同一 binding 的后续人类消息共享一个有界 Dialogue：
+v1 只支持一名授权人类和当前精确本地 task 这个主持者，严格串行，默认最多 12 轮、2 小时、
+12 个资源单位。Agent 回复不会自动变成下一轮输入，也不会形成 mention 循环。切回 `mapping` 会
+人工中止尚未结束的 Dialogue，但保留历史。详见
+[Dialogue Policy v1](docs/implementation/dialogue-policy-v1.md)。
 
 运行 `rotate` 后，bridge 先创建一个 `pending` 新话题。首次真实 mention 完成认领前，旧话题仍是
 唯一 active；认领成功时，新旧状态在同一份 Git 外 binding 文档的一次原子替换中切换，新话题
@@ -317,6 +325,7 @@ node scripts/bind-project.mjs --project ~/your-project --apply
 scripts/
   envelope / selector / claim   Aily 信封、确定性选择器与原子认领
   mapping-policy               公共 Mapping Policy 与 runtime-neutral runRequest
+  interaction-policy           公共 Mapping/Dialogue 状态、预算、终局与 runRequest
   inbound / inbound-route       Claude 入站与项目路由
   outbox / outbound             可靠答复队列与飞书发布
   bind-* / registry / binding   话题创建、登记和生命周期
@@ -344,7 +353,7 @@ references/
 ## 开发与验证
 
 ```bash
-npm test                         # Claude 320 项 + Codex adapter 74 项回归
+npm test                         # Claude 336 项 + Codex adapter 79 项回归
 npm run test:claude              # 只运行 Claude 基线
 npm run test:codex               # 只运行 Codex adapter
 npm run doctor:codex             # Codex 机器级只读自检；不写配置、不联网
@@ -357,14 +366,14 @@ npm run install:codex:preview    # 预览 Codex 安装会修改什么
 ## 两条链路的共用边界
 
 `scripts/` 是底座，`scripts/codex/` 是 Codex 适配层。依赖是**单向**的：适配层从底座
-import 十六个模块，底座不反向依赖它（有测试守着方向）。
+import 十八个模块，底座不反向依赖它（有测试守着方向）。
 
-这意味着那十六个模块是真正的接触面 —— 任何一方改它，都可能悄悄改掉另一方依赖的东西。
+这意味着那十八个模块是真正的接触面 —— 任何一方改它，都可能悄悄改掉另一方依赖的东西。
 所以有三层护栏，从便宜到贵：
 
 | 护栏 | 抓什么 | 成本 |
 |---|---|---|
-| `npm run contract` | 共用模块的**导出面**变了（多了、少了、改名） | 机械，覆盖全部十六个 |
+| `npm run contract` | 共用模块的**导出面**变了（多了、少了、改名） | 机械，覆盖全部十八个 |
 | 行为契约测试 | 共用模块的**语义**变了（判重算法、文件命名、字段默认值） | 人工，只覆盖想得到的 |
 | `npm test` 同时跑两套 | 一方真的弄坏了另一方 | 已经是默认行为 |
 
@@ -387,6 +396,7 @@ import 十六个模块，底座不反向依赖它（有测试守着方向）。
 | 评审重构边界、实体模型、路由和生命周期 | [第三方智能体增强：架构契约](docs/architecture/agent-enhancement-contract.md) |
 | 评审现有映射模式如何迁移到公共 Policy Handler | [Mapping Policy Handler 迁移](docs/implementation/mapping-policy-handler.md) |
 | 理解话题轮转、代际切换与 24 小时认领期限 | [Topic Generation 生命周期](docs/implementation/topic-generation-lifecycle.md) |
+| 理解 Dialogue v1 的串行轮次、预算与停止契约 | [Dialogue Policy v1](docs/implementation/dialogue-policy-v1.md) |
 | 从零安装 Codex 飞书桥 | [CODEX_SETUP.md](CODEX_SETUP.md) |
 | 从零安装 Claude Code 飞书桥 | [SETUP.md](SETUP.md) |
 | 查看 Claude 当前运行状态与历史问题 | [STATE.md](STATE.md) |

@@ -346,6 +346,19 @@ evaluate -> plan -> dispatch -> observe -> finalize
 - Agent 之间的输出只在策略明确允许时成为下一轮输入；
 - 达到任一预算或停止条件后必须终止，不得靠模型自觉结束。
 
+Dialogue v1 的首个实现纵切固定为一个 `bound_local_target` 主持者、一名
+`authorized_human` 和 `human_then_host_serial`：
+
+- 任一时刻最多一个活动 turn；每轮只能由通过既有 sender/binding 准入的人类事件启动；
+- 主持者同时是 summarizer，发布目标是该轮受理时冻结的 origin Topic Generation；
+- 默认预算为 12 轮、2 小时、12 资源单位，v1 每个主持者 run 消耗 1 单位；
+- runtime 失败、观察超时或空终局使整个 Dialogue 硬失败；切回 Mapping 是人工取消；
+- `allow_agent_output_as_input=false`、mention loop disabled；任何 Agent 自动接力都不属于 v1。
+
+该纵切只落实 Dialogue 的状态、预算、串行、终局和控制面，不得宣称已经满足 FR-5 的多 Agent/
+子 Agent 协作目标。后续版本必须另行定义参与者授权、turn planner、逐 Agent 预算、循环检测和部分
+失败语义，不能只把 Agent 输出重新注入正文。
+
 ### 9.3 Management Handler
 
 - 必须声明 profile：`project_advancement`、`expert` 或 `training`；
@@ -505,7 +518,10 @@ bridge-home/
 - 本地输入/回复配对及飞书输入不重复；
 - control intent 不被普通讨论误触发；
 - policy permission fail-closed；
-- outbox 失败不误标成功、不自动重放。
+- Dialogue 的稳定 id/turn index、单活动回合、事件幂等、三类预算、runtime 失败、观察超时和人工
+  中断；
+- Agent 输出不自动接力、mention loop 禁用，公共 runRequest 不含 runtime locator；
+- outbox 失败不误标成功、不自动重放；
 - 每个数据面候选在切流前都能与旧结果做无副作用 shadow comparison。
 
 ### Runtime adapter 合同测试
@@ -543,7 +559,7 @@ bridge-home/
 | `feat/codex-inbound-dispatcher-contract` | Codex 接入 Claude 已有 dispatcher 契约，两端迁移到无损 canonical event | 重建 Claude dispatcher、新交互模式 |
 | `refactor/mapping-policy-handler` | 现有映射模式迁移 | 对话/管理功能 |
 | `feat/topic-generation-lifecycle` | 轮转与生命周期 | 多人授权 |
-| `feat/dialogue-policy` | 对话编排 | 管理模式 |
+| `feat/dialogue-policy-v1` | 单主持者/单授权人串行 Dialogue、预算、终局、人工中断与 mode 命令 | 多 Agent 自动接力、管理模式、多人授权 |
 | `feat/management-policies` | 推进、专家、带教 | 多人授权 |
 | `feat/multi-operator-authorization` | 人员授权矩阵与审计 | 其他模式重写 |
 

@@ -259,7 +259,10 @@ node scripts/bind-project.mjs --project ~/x --apply    # 建话题 + 登记
 不把你的原消息重复一遍。超出卡片正文上限的完整事件仍保存在本机 outbox/run 记录中。
 
 **控制命令**：`/feishu-bind` 接入或恢复，`/feishu-unbind` 可恢复地暂停，`/feishu-status` 只读
-查看状态，`/feishu-rotate` 为同一 binding 创建下一话题代际。轮转的新话题在首次真实 mention
+查看状态，`/feishu-rotate` 为同一 binding 创建下一话题代际，`/feishu-mode` 只读查看当前策略，
+`/feishu-mode dialogue` 与 `/feishu-mode mapping` 显式切换交互模式。Dialogue v1 只支持一名授权人类
+与一个主持会话的串行多轮对话，默认 12 轮 / 2 小时 / 12 资源单位；Agent 回复不会自动触发下一轮。
+轮转的新话题在首次真实 mention
 前保持 pending，旧话题继续 active；认领成功后新话题 active、旧话题 read-only。待认领默认
 24 小时过期；显式取消可运行 `node scripts/feishu-rotate.mjs --cancel --apply`，不会删除话题历史。
 

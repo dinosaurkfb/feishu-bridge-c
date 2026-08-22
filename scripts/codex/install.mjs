@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 安装 Codex adapter：追加 hooks、复制六项技能、初始化 registry，并为已登记 task 启用
+ * 安装 Codex adapter：追加 hooks、复制七项技能、初始化 registry，并为已登记 task 启用
  * 每轮自动发布。默认 dry-run；不修改 hook trust，安装本身不发送飞书。
  */
 
@@ -78,6 +78,7 @@ const skills = [
   { name: "feishu-unbind", files: ["SKILL.md"] },
   { name: "feishu-status", files: ["SKILL.md"] },
   { name: "feishu-rotate", files: ["SKILL.md"] },
+  { name: "feishu-mode", files: ["SKILL.md"] },
 ];
 const renderedSkill = (file) => fs.readFileSync(file, "utf-8")
   .replaceAll("{{BRIDGE_ROOT}}", ROOT)
@@ -89,7 +90,7 @@ console.log("  Stop             → " + stopAction);
 for (const skill of skills) {
   console.log("skill       " + path.join(CODEX_HOME, "skills", skill.name));
 }
-console.log("commands    $feishu-bind  $feishu-unbind  $feishu-status  $feishu-rotate（也出现在斜杠菜单）");
+console.log("commands    $feishu-bind  $feishu-unbind  $feishu-status  $feishu-rotate  $feishu-mode（也出现在斜杠菜单）");
 console.log("state       " + home + "（Git 外）");
 console.log("publish     绑定 task 每轮自动发布；失败留队，历史积压不自动补发" +
   (autoPublishMigrationCount === null ? "" : "（待迁移 " + autoPublishMigrationCount + " 个 task）"));

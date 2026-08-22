@@ -110,7 +110,8 @@ node scripts/codex/install.mjs --apply
 - 向现有 `UserPromptSubmit` 和 `Stop` 数组追加本桥命令，保留其他 hooks；前者在 Git 外暂存
   本地文本输入，后者把同一 `turn_id` 的输入与最终答复确定性配对；
 - 安装 `m5codex-inbound-router` 和 `codex-longtask-feishu`；
-- 安装 `$feishu-bind`、`$feishu-unbind`、`$feishu-status`、`$feishu-rotate` 四个 task 命令；
+- 安装 `$feishu-bind`、`$feishu-unbind`、`$feishu-status`、`$feishu-rotate`、`$feishu-mode`
+  五个 task 命令；
 - 创建 Git 外的空 registry，并为已登记 task 启用每轮自动发布；
 - 不发送飞书消息、不补发历史 outbox，也不代替用户确认 hook trust。
 
@@ -188,6 +189,7 @@ $feishu-status
 | `$feishu-unbind` | 可恢复地暂停入站和自动发布；不删除话题或历史 |
 | `$feishu-status` | 只读查看当前 task 的接入、绑定和待发布数量 |
 | `$feishu-rotate` | 创建下一话题代际；新话题认领前旧话题继续工作，认领后旧话题只读 |
+| `$feishu-mode` | 无参数只读查看；加 `dialogue` 或 `mapping` 显式切换交互策略 |
 | `npm run doctor:codex` | 只读检查机器级依赖和安装状态 |
 | `npm test` | 运行 Claude 基线与 Codex adapter 全套本地回归 |
 
@@ -235,6 +237,10 @@ node scripts/codex/install.mjs   # 再看一遍安装预览
 - 同仓库话题标题相同：分别进入对应 Codex task 再运行一次 `$feishu-bind`，原话题会就地改名；
 - 飞书有答复、Desktop 没画面：切换 task 或重新打开，读取已持久化历史；
 - 自动发布失败：答复留在 task outbox，不会被标记为已发送。
+
+交互策略命令：`$feishu-mode` 只读查看当前模式；`$feishu-mode dialogue` 开启单授权人类与当前
+精确 task 的串行有界对话；`$feishu-mode mapping` 回到一次输入对应一次运行，并人工中止尚未结束的
+Dialogue。默认预算为 12 轮 / 2 小时 / 12 资源单位，Agent 回复不会自动触发下一轮。
 
 只读查看历史或异常待发项：
 

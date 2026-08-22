@@ -24,6 +24,10 @@ import {
   failTopicRotation, materializeLegacyTopicFields, pendingGeneration, prepareTopicRotation,
   recordTopicGenerationActivity, registerPendingTopicGeneration, topicGenerationStateForLegacy,
 } from "../topic-generation.mjs";
+import {
+  finalizeDialogueTurn, interactionPolicyStateForLegacy, materializeInteractionPolicy,
+  reserveDialogueTurn, setInteractionPolicyMode,
+} from "../interaction-policy.mjs";
 
 export const PENDING_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const ACTIVE_LEASE_MAX_MS = 12 * 60 * 60 * 1000;
@@ -202,6 +206,7 @@ export function mappingForTask(task, { home = bridgeHome() } = {}) {
     pending_expires_at: task.pending_expires_at ?? null,
     channel_generation_id: task.channel_generation_id ?? null,
     topic_generation_state: task.topic_generation_state ?? null,
+    interaction_policy_state: task.interaction_policy_state ?? null,
     inbound_prefix: Object.hasOwn(task, "inbound_prefix") ? task.inbound_prefix : DEFAULT_INBOUND_PREFIX,
     logical_task_key: task.logical_task_key,
     codex_thread_id: task.codex_thread_id,
@@ -229,6 +234,13 @@ export function mappingForTask(task, { home = bridgeHome() } = {}) {
 export function topicStateForTask(task, { now = Date.now() } = {}) {
   return topicGenerationStateForLegacy(task, {
     runtime: "codex",
+    bindingId: (task?.id ?? task?.logical_task_key) + "@codex-registry",
+    now,
+  });
+}
+
+export function interactionPolicyForTask(task, { now = Date.now() } = {}) {
+  return interactionPolicyStateForLegacy(task, {
     bindingId: (task?.id ?? task?.logical_task_key) + "@codex-registry",
     now,
   });
@@ -699,6 +711,81 @@ export function recordTaskTopicActivity({
     threadId, home, now,
     mutate: (state) => recordTopicGenerationActivity(state, {
       generationId, eventKey, messageDelta, now, retryMs,
+    }),
+  });
+}
+
+function mutateTaskInteractionPolicy({
+  threadId,
+  home = bridgeHome(),
+  now = Date.now(),
+  lockRetries = 0,
+  mutate,
+} = {}) {
+  if (typeof threadId !== "string" || !threadId) return { ok: false, reason: "no_thread_id" };
+  const lockDir = path.join(home, "registry.lock");
+  let lock;
+  const wait = new Int32Array(new SharedArrayBuffer(4));
+  for (let attempt = 0; attempt <= lockRetries; attempt += 1) {
+    lock = acquirePublishLock(lockDir);
+    if (lock.ok || lock.reason !== "publisher_busy") break;
+    if (attempt < lockRetries) Atomics.wait(wait, 0, 0, 25);
+  }
+  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  try {
+    const file = registryFile(home);
+    const reg = loadRegistry(file);
+    if (!reg.ok) return reg;
+    const task = reg.tasks.find((candidate) => candidate.codex_thread_id === threadId);
+    if (!task) return { ok: false, reason: "thread_not_registered" };
+    const loaded = interactionPolicyForTask(task, { now });
+    if (!loaded.ok) return loaded;
+    const changed = mutate(loaded.state, task);
+    if (!changed?.ok) return changed;
+    if (changed.changed !== false) {
+      const materialized = materializeInteractionPolicy(task, changed.state);
+      if (!materialized.ok) return materialized;
+      Object.assign(task, materialized.record);
+      writeRegistry(reg.tasks, file);
+    }
+    return { ...changed, task };
+  } catch (err) {
+    return { ok: false, reason: "registry_unwritable", error: err.message };
+  } finally {
+    releasePublishLock(lockDir);
+  }
+}
+
+export function setTaskInteractionMode({
+  threadId, mode, budget, home = bridgeHome(), now = Date.now(),
+} = {}) {
+  return mutateTaskInteractionPolicy({
+    threadId, home, now,
+    mutate: (state) => setInteractionPolicyMode(state, { mode, budget, now }),
+  });
+}
+
+export function reserveTaskDialogueTurn({
+  threadId, eventId, runId, localTargetId, originChannelGenerationId,
+  runtimeTargetId, resourceUnits = 1, home = bridgeHome(), now = Date.now(),
+} = {}) {
+  return mutateTaskInteractionPolicy({
+    threadId, home, now,
+    mutate: (state) => reserveDialogueTurn(state, {
+      eventId, runId, localTargetId, originChannelGenerationId,
+      runtimeTargetId, resourceUnits, now,
+    }),
+  });
+}
+
+export function finalizeTaskDialogueTurn({
+  threadId, runId, runtimeTargetId, status, reason,
+  home = bridgeHome(), now = Date.now(),
+} = {}) {
+  return mutateTaskInteractionPolicy({
+    threadId, home, now, lockRetries: 20,
+    mutate: (state) => finalizeDialogueTurn(state, {
+      runId, runtimeTargetId, status, reason, now,
     }),
   });
 }

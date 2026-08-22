@@ -14,11 +14,16 @@ import { REJECT } from "../selector.mjs";
 import {
   MAPPING_DISPOSITION, buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
 } from "../mapping-policy.mjs";
+import {
+  DIALOGUE_POLICY_ID, DIALOGUE_REASON, DIALOGUE_TURN_STATUS,
+  applyInteractionPolicyToAdmission, handleDialoguePolicy,
+} from "../interaction-policy.mjs";
 import { handOffCodex } from "./handoff.mjs";
 import { recordCodexActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
 import {
   appendConsumed, bridgeHome, closeTaskTopicRotation, evaluatePromotion, findPendingTask,
-  findTaskForFeishuSession, isThreadBusy, loadCodexTemplate, promoteTask,
+  finalizeTaskDialogueTurn, findTaskForFeishuSession, interactionPolicyForTask,
+  isThreadBusy, loadCodexTemplate, promoteTask, reserveTaskDialogueTurn,
   shadowCodexFirstClaim, taskPaths,
 } from "./state.mjs";
 
@@ -196,6 +201,20 @@ const verdict = evaluateMappingAdmission({
   config: routed.config,
   now: Date.now(),
 });
+const interaction = interactionPolicyForTask(task);
+if (!interaction.ok) {
+  writeReceipt("policy-state-" + (event.message_id ?? Date.now()), {
+    status: "error", reason: interaction.reason, message_id: event.message_id ?? null,
+    claim_acquired: false, handed_off: false,
+  });
+  finish("error", { detail: "交互策略状态不可用（" + interaction.reason + "）" },
+    { reason: interaction.reason });
+}
+const policyEvaluation = applyInteractionPolicyToAdmission(verdict, interaction.state);
+const dialogueMode = policyEvaluation.policy_id === DIALOGUE_POLICY_ID;
+const handlePolicy = (args = {}) => dialogueMode
+  ? handleDialoguePolicy({ evaluation: policyEvaluation, ...args })
+  : handleMappingPolicy({ evaluation: policyEvaluation, ...args });
 
 if (justBound && verdict.decision === "reject" && verdict.reason === REJECT.EMPTY_INSTRUCTION) {
   appendConsumed(task, event.message_id, { home: HOME });
@@ -214,7 +233,7 @@ if (dryRun) {
 }
 
 if (verdict.decision === "reject") {
-  const policyOutcome = handleMappingPolicy({ evaluation: verdict });
+  const policyOutcome = handlePolicy();
   writeReceipt("reject-" + (event.message_id ?? Date.now()), {
     status: "rejected", reason: verdict.reason, message_id: event.message_id,
     logical_task_key: task.logical_task_key, claim_acquired: false, handed_off: false,
@@ -248,8 +267,8 @@ const claim = acquireClaim({
   meta: {
     session_id: event.session_id,
     codex_thread_id: task.codex_thread_id,
-    policy_id: verdict.policy_id,
-    policy_version: verdict.policy_version,
+    policy_id: policyEvaluation.policy_id,
+    policy_version: policyEvaluation.policy_version,
     local_target_id: mappingContext.localTargetId,
     origin_channel_generation_id: mappingContext.originChannelGenerationId,
     mapping_admission_shadow_match: verdict.admission_shadow?.match ?? null,
@@ -257,9 +276,7 @@ const claim = acquireClaim({
 });
 if (!claim.ok) {
   const duplicate = claim.reason === "duplicate";
-  const policyOutcome = handleMappingPolicy({
-    evaluation: verdict, claim, resolvedContext: mappingContext,
-  });
+  const policyOutcome = handlePolicy({ claim, resolvedContext: mappingContext });
   writeReceipt("claim-" + claim.reason + "-" + verdict.messageId, {
     status: duplicate ? "rejected" : "error",
     reason: claim.reason,
@@ -278,22 +295,17 @@ if (!claim.ok) {
   }, { reason: claim.reason });
 }
 
-const mappingRun = handleMappingPolicy({
-  evaluation: verdict,
-  claim,
-  resolvedContext: mappingContext,
-});
-if (mappingRun.disposition !== MAPPING_DISPOSITION.ACCEPTED || !mappingRun.runRequest) {
+let policyRun = dialogueMode ? null : handlePolicy({ claim, resolvedContext: mappingContext });
+if (!dialogueMode &&
+    (policyRun.disposition !== MAPPING_DISPOSITION.ACCEPTED || !policyRun.runRequest)) {
   recordClaimState({ claimsDir: paths.claims, key: claim.key, state: "failed",
-    detail: { reason: mappingRun.reason ?? "mapping_policy_rejected" } });
+    detail: { reason: policyRun.reason ?? "mapping_policy_rejected" } });
   finish("error", { detail: "映射策略没有生成可执行请求" },
-    { reason: mappingRun.reason ?? "mapping_policy_rejected" });
+    { reason: policyRun.reason ?? "mapping_policy_rejected" });
 }
 
 if (isThreadBusy(task.codex_thread_id, { home: HOME })) {
-  const busyOutcome = handleMappingPolicy({
-    evaluation: verdict, claim, resolvedContext: mappingContext, targetState: "busy",
-  });
+  const busyOutcome = handlePolicy({ claim, resolvedContext: mappingContext, targetState: "busy" });
   recordClaimState({ claimsDir: paths.claims, key: claim.key, state: "failed", detail: { reason: "target_busy" } });
   writeReceipt("busy-" + verdict.messageId, {
     status: "error", reason: "target_busy", message_id: verdict.messageId,
@@ -308,9 +320,7 @@ if (isThreadBusy(task.codex_thread_id, { home: HOME })) {
 
 const lock = acquireSessionLock(paths.sessionLock);
 if (!lock.ok) {
-  const busyOutcome = handleMappingPolicy({
-    evaluation: verdict, claim, resolvedContext: mappingContext, targetState: "busy",
-  });
+  const busyOutcome = handlePolicy({ claim, resolvedContext: mappingContext, targetState: "busy" });
   recordClaimState({ claimsDir: paths.claims, key: claim.key, state: "failed", detail: { reason: lock.reason } });
   writeReceipt("busy-lock-" + verdict.messageId, {
     status: "error", reason: lock.reason, message_id: verdict.messageId,
@@ -323,9 +333,44 @@ if (!lock.ok) {
   finish("error", { detail: "目标 Codex task 正忙，上一条飞书指令还没结束" }, { reason: lock.reason });
 }
 
+if (dialogueMode) {
+  const reservation = reserveTaskDialogueTurn({
+    threadId: task.codex_thread_id,
+    eventId: verdict.messageId,
+    runId: claim.key,
+    localTargetId: mappingContext.localTargetId,
+    originChannelGenerationId: mappingContext.originChannelGenerationId,
+    runtimeTargetId: task.codex_thread_id,
+    home: HOME,
+  });
+  if (!reservation.ok) {
+    releaseSessionLock(paths.sessionLock);
+    recordClaimState({ claimsDir: paths.claims, key: claim.key, state: "failed",
+      detail: { reason: reservation.reason } });
+    const busy = reservation.reason === DIALOGUE_REASON.TURN_ACTIVE;
+    finish(busy ? "error" : "rejected", {
+      detail: busy ? "Dialogue 当前仍有活动回合，请等待它完成" : undefined,
+      reasonText: busy ? undefined : "Dialogue 无法开始新回合（" + reservation.reason + "）",
+      taskName: task.task_display_name,
+    }, { reason: reservation.reason });
+  }
+  policyRun = handlePolicy({ claim, resolvedContext: mappingContext, reservation });
+  if (policyRun.disposition !== "accepted" || !policyRun.runRequest) {
+    releaseSessionLock(paths.sessionLock);
+    recordClaimState({ claimsDir: paths.claims, key: claim.key, state: "failed",
+      detail: { reason: policyRun.reason ?? "dialogue_policy_rejected" } });
+    finish("rejected", {
+      reasonText: "Dialogue 已达到停止条件（" + (policyRun.reason ?? "unknown") + "）",
+      taskName: task.task_display_name,
+    }, { reason: policyRun.reason ?? "dialogue_policy_rejected" });
+  }
+}
+
 const stamped = [
   "[飞书 · " + verdict.messageId + " · " + new Date(Number(event.created_at_ms)).toISOString() + "]",
-  mappingRun.runRequest.userInput,
+  ...(dialogueMode ? ["[Dialogue · " + policyRun.runRequest.policy.dialogue_id +
+    " · turn " + policyRun.runRequest.policy.turn_index + "]"] : []),
+  policyRun.runRequest.userInput,
 ].join("\n");
 let run;
 try {
@@ -334,13 +379,19 @@ try {
     threadId: task.codex_thread_id,
     instruction: stamped,
     runsDir: paths.runs,
-    key: mappingRun.runRequest.runId,
+    key: policyRun.runRequest.runId,
     taskKey: task.logical_task_key,
     bridgeHome: HOME,
     codexBin: process.env.FEISHU_CODEX_BIN ?? "codex",
   });
 } catch (err) {
   releaseSessionLock(paths.sessionLock);
+  if (dialogueMode) {
+    finalizeTaskDialogueTurn({
+      threadId: task.codex_thread_id, runId: claim.key,
+      status: DIALOGUE_TURN_STATUS.FAILED, reason: "handoff_failed", home: HOME,
+    });
+  }
   recordClaimState({ claimsDir: paths.claims, key: claim.key, state: "failed", detail: { error: err.message } });
   writeReceipt("handoff-failed-" + verdict.messageId, {
     status: "error", reason: "handoff_failed", message_id: verdict.messageId,
@@ -374,18 +425,22 @@ const topicActivity = recordCodexActivityAndMaybeRotate({
   root: task.root,
   threadId: task.codex_thread_id,
   home: HOME,
-  generationId: mappingRun.runRequest.origin.channelGenerationId,
+  generationId: policyRun.runRequest.origin.channelGenerationId,
   eventKey: "inbound:codex:" + verdict.messageId,
   messageDelta: 1,
 });
 writeReceipt("accepted-" + verdict.messageId, {
   status: "accepted", message_id: verdict.messageId, claim_key: claim.key,
-  run_id: mappingRun.runRequest.runId,
-  local_target_id: mappingRun.runRequest.localTargetId,
-  origin_channel_generation_id: mappingRun.runRequest.origin.channelGenerationId,
-  policy_id: mappingRun.policy_id,
-  policy_version: mappingRun.policy_version,
-  policy_disposition: mappingRun.disposition,
+  run_id: policyRun.runRequest.runId,
+  local_target_id: policyRun.runRequest.localTargetId,
+  origin_channel_generation_id: policyRun.runRequest.origin.channelGenerationId,
+  policy_id: policyRun.policy_id,
+  policy_version: policyRun.policy_version,
+  policy_disposition: policyRun.disposition,
+  ...(dialogueMode ? {
+    dialogue_id: policyRun.runRequest.policy.dialogue_id,
+    dialogue_turn_index: policyRun.runRequest.policy.turn_index,
+  } : {}),
   ...(verdict.admission_shadow ? { mapping_admission_shadow: verdict.admission_shadow } : {}),
   logical_task_key: task.logical_task_key, claim_acquired: true, handed_off: true,
   completion_observed: false, completion_owner: "codex_stop_hook_and_local_watcher",

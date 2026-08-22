@@ -202,7 +202,7 @@ if (uninstall) {
 /**
  * 装哪些技能，以及装成什么名字。
  *
- * 四条控制命令在仓库里叫 claude-feishu-*，装出去要去掉前缀 —— 因为**装出去的目录名
+ * 五条控制命令在仓库里叫 claude-feishu-*，装出去要去掉前缀 —— 因为**装出去的目录名
  * 就是斜杠命令名**，而 Codex 那边用的是 $feishu-bind / $feishu-status / $feishu-unbind。
  * 两边同名，用户不用记两套。仓库里之所以要加前缀，是因为 skills/feishu-bind/
  * 已经被 Codex 那份占了 —— 它们装到不同的家目录（~/.codex vs ~/.claude），
@@ -214,6 +214,7 @@ const SKILLS = [
   { src: "claude-feishu-status",     dst: "feishu-status" },
   { src: "claude-feishu-unbind",     dst: "feishu-unbind" },
   { src: "claude-feishu-rotate",     dst: "feishu-rotate" },
+  { src: "claude-feishu-mode",       dst: "feishu-mode" },
 ];
 
 const skillSrcOf = (n) => path.join(ROOT, "skills", n, "SKILL.md");

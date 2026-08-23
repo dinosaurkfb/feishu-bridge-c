@@ -135,8 +135,10 @@ if (!registered.ok) {
     (closed.ok
       ? "轮转已收口，旧代际仍保持 active；新建的那个话题需要人工清理。"
       : "**收口也失败了（" + closed.reason + "）**：轮转状态可能仍停在 preparing。" +
-        "旧代际保持 active，" + Math.round(TOPIC_GENERATION_PREPARING_STALE_MS / 60000) +
-        " 分钟后可重试轮转（超时后允许接管）。新建的那个话题需要人工清理。"));
+        "旧代际保持 active。若状态仍停在 preparing，" +
+        Math.round(TOPIC_GENERATION_PREPARING_STALE_MS / 60000) +
+        " 分钟后可由下一次轮转接管；若已进入 awaiting_claim，则去新话题真实 @ 完成认领。" +
+        "新建的那个话题需要人工清理。"));
 }
 try {
   publishDraft({

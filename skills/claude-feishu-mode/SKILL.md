@@ -8,9 +8,9 @@ description: 查看或显式切换当前 Claude 项目/工作线的 Mapping/Dial
 命令必须单独占据整条输入，只允许三种形式：
 
 ```bash
-node {{BRIDGE_ROOT}}/scripts/feishu-mode.mjs
-node {{BRIDGE_ROOT}}/scripts/feishu-mode.mjs --mode dialogue --apply
-node {{BRIDGE_ROOT}}/scripts/feishu-mode.mjs --mode mapping --apply
+node {{SCRIPT:feishu-mode.mjs}}
+node {{SCRIPT:feishu-mode.mjs}} --mode dialogue --apply
+node {{SCRIPT:feishu-mode.mjs}} --mode mapping --apply
 ```
 
 无参数只读查看。Dialogue v1 是单主持者、单授权人、串行回合，默认 12 轮、2 小时、12 资源单位；

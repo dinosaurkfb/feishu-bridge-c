@@ -20,7 +20,7 @@ M5Codex 自己的 Aily 工作区或 Codex thread 去运行绑定流程。
 UserPromptSubmit hook 会提供当前 thread id；直接运行：
 
 ```bash
-node {{BRIDGE_ROOT}}/scripts/codex/bind-task.mjs --project <当前项目绝对路径> --thread-id <当前thread-id> --apply
+node {{SCRIPT:codex/bind-task.mjs}} --project <当前项目绝对路径> --thread-id <当前thread-id> --apply
 ```
 
 只有用户明确要求“先预览”“看看将发送什么”时，才改为运行纯只读
@@ -51,7 +51,7 @@ Codex 官方 `/init` 用于生成项目 `AGENTS.md`，不是绑定命令。UserP
 `$feishu-unbind` 是对当前 task 的可恢复本地暂停授权。只运行 hook 注入的命令：
 
 ```bash
-node {{BRIDGE_ROOT}}/scripts/codex/feishu-unbind.mjs --thread-id <当前thread-id> --apply
+node {{SCRIPT:codex/feishu-unbind.mjs}} --thread-id <当前thread-id> --apply
 ```
 
 暂停后，飞书入站不再路由到该 task，Stop 不再入队，发布器也拒绝发送；原话题、映射、
@@ -60,7 +60,7 @@ node {{BRIDGE_ROOT}}/scripts/codex/feishu-unbind.mjs --thread-id <当前thread-i
 `$feishu-status` 只运行只读状态命令并转述 stdout：
 
 ```bash
-node {{BRIDGE_ROOT}}/scripts/codex/feishu-status.mjs --thread-id <当前thread-id>
+node {{SCRIPT:codex/feishu-status.mjs}} --thread-id <当前thread-id>
 ```
 
 不得为了显示状态而直接输出 registry 或任何 locator。
@@ -80,7 +80,7 @@ exit code 0 和非空最终输出后，才能为答复授予发布资格；失�
 升级前已有的历史待发项没有自动发布资格，不会因安装或下一轮 Stop 被补发。只读查看仍可用：
 
 ```bash
-node {{BRIDGE_ROOT}}/scripts/codex/drain-outbox.mjs --task-key <logical-task-key>
+node {{SCRIPT:codex/drain-outbox.mjs}} --task-key <logical-task-key>
 ```
 
 该命令的 `--apply` 只用于人工处理历史积压或异常待发项，仍需用户针对这批内容明确授权。

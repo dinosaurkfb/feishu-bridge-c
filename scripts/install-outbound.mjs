@@ -26,6 +26,7 @@ import { moduleRoot } from "./direct-run.mjs";
 import {
   applyRuntimeSync, planRuntimeSync, runtimeScript, verifyRuntime,
 } from "./runtime-install.mjs";
+import { nodeCommandPrefix, shellQuote } from "./shell-quote.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
 
@@ -234,22 +235,38 @@ const initAction = describe(initBefore, claimSingleHook(prompts, "init-hook.mjs"
 // 它做不到发消息这件事是代码事实，不是一个自觉遵守的 --dry-run 开关（有测试盯着）。
 // 真正建话题的那条仍然每次弹权限 —— 往群里发一条撤不掉的消息，本来就该有人点头。
 
-const PREVIEW_RULE = "Bash(node " + PREVIEW_SCRIPT + ":*)";
+// 放行规则必须与技能正文里那条命令**逐字一致**。技能现在打印的是加了引号的路径，
+// 规则要是还写裸路径，前缀就对不上 —— 预览会每次弹确认，而它本来是免确认的那一条。
+// 两处同源生成，另有测试盯着它们相等。
+const PREVIEW_RULE = "Bash(" + nodeCommandPrefix(PREVIEW_SCRIPT) + ":*)";
 const permissions = (settings.permissions ??= {});
 const allow = (permissions.allow ??= []);
 
 // 权限规则同样要收编：旧克隆各留了一条自己路径的放行规则，只加不减就会越积越多，
 // 而每一条都是一个「某个开发克隆里的脚本可以免确认执行」的长期授权。
-// 同样按安装器生成的确切形态匹配，不用子串包含 —— 一条 allow 规则是一次长期免确认授权，
-// 误删别人的、或漏掉旧克隆的，两种都不能接受。
-const PREVIEW_RULE_SHAPE = /^Bash\(node [^\s()]*\/scripts\/bind-preview\.mjs:\*\)$/u;
-const ownsPreview = (rule) => typeof rule === "string" && PREVIEW_RULE_SHAPE.test(rule);
-const permBefore = allow.filter(ownsPreview).length;
+// 一条 allow 规则是一次长期免确认授权，认宽认窄都不能接受。上一版为了容纳引号把
+// 判据放宽成 `[^()]*`，结果两头都坏了：`Bash(node --require '/other/…/bind-preview.mjs':*)`
+// 会被当成自己的删掉；而 HOME 含括号时（`/Users/a(b)/…`）反而认不出自己那条，
+// 重复安装会不断追加。
+//
+// 分成两件事各自用最严的判据：
+//   **当前规则**只认逐字相等 —— 它就是本安装器刚生成的那一条，没有任何模糊空间；
+//   **历史迁移**只认旧版完整模板（裸路径、无引号），且仅为迁移那一次存在。
+const LEGACY_PREVIEW_RULE =
+  /^Bash\(node (\/[^'"\s:]*\/scripts\/bind-preview\.mjs):\*\)$/u;
+const ownsPreview = (rule) => typeof rule === "string" &&
+  (rule === PREVIEW_RULE || LEGACY_PREVIEW_RULE.test(rule));
+const permOwned = allow.filter(ownsPreview);
+const permBefore = permOwned.length;
+// 只数条数不够：路径改指 runtime、或给路径加上 shell 引号之后，条数没变但内容变了。
+// 那时报 already-present 会让人以为什么都没动。
+const permSame = permBefore === 1 && permOwned[0] === PREVIEW_RULE;
 for (let i = allow.length - 1; i >= 0; i -= 1) if (ownsPreview(allow[i])) allow.splice(i, 1);
 if (!uninstall) allow.push(PREVIEW_RULE);
 const permAction = uninstall
   ? (permBefore > 0 ? "removed" : "already-absent")
-  : (permBefore === 0 ? "installed" : permBefore === 1 ? "already-present" : "deduped");
+  : (permBefore === 0 ? "installed" : permSame ? "already-present"
+    : permBefore === 1 ? "updated" : "deduped");
 
 // ---------- 登记表 ----------
 
@@ -299,9 +316,19 @@ const SKILLS = [
 
 const skillSrcOf = (n) => path.join(ROOT, "skills", n, "SKILL.md");
 const skillDstOf = (n) => path.join(os.homedir(), ".claude", "skills", n, "SKILL.md");
-// 技能里给模型看的命令也要指 runtime。否则 Frank 跑 /feishu-bind 时执行的是某个开发克隆的
-// 脚本 —— 那个克隆此刻停在哪条分支上没人知道，而这条命令会往群里发一条撤不掉的消息。
-const renderSkill = (src) => src.replaceAll("{{BRIDGE_ROOT}}", RUNTIME_BRIDGE_ROOT);
+/**
+ * 技能里给模型看的命令要指 runtime，而且**路径必须是 shell 安全的**。
+ *
+ * 指 runtime：否则 Frank 跑 /feishu-bind 时执行的是某个开发克隆的脚本，那个克隆此刻
+ * 停在哪条分支没人知道，而这条命令会往群里发一条撤不掉的消息。
+ *
+ * shell 安全：这些是**给 shell 执行的命令文本**。HOME 里有空格时裸路径会被拆词，
+ * 入站直接不可用（实测：argv 调用能跑，交给 /bin/sh -c 就失败）。所以模板写
+ * `{{SCRIPT:x.mjs}}`，由这里统一加引号 —— 引用是渲染器的职责，不是模板作者的记性。
+ */
+const renderSkill = (src) => src.replaceAll(
+  /\{\{SCRIPT:([A-Za-z0-9_./-]+)\}\}/gu,
+  (_, name) => shellQuote(path.join(RUNTIME_BRIDGE_ROOT, "scripts", name)));
 
 // 拷贝而不是软链：软链一旦仓库被移动或删除就变成悬空文件，而且各家扫描器
 // 对 readdir 是否跟随软链的处理并不一致（入站技能就在这上面栽过）。
@@ -454,7 +481,25 @@ for (const sk of skillPlan) {
 
 // launchd：先 bootout 再 bootstrap。改了 plist 不重新加载的话，跑的还是旧的那份，
 // 而且看不出来 —— 文件是新的，行为是旧的，是最难查的那种不一致。
+/**
+ * **HOME 被覆盖时一律不碰 launchctl。**
+ *
+ * plist 文件路径跟着 `os.homedir()` 走，所以指定 HOME 就能把安装引到别处 —— 看起来像
+ * 一个安全的沙箱安装。但 `launchctl bootout/bootstrap` 操作的是**真实用户的 launchd 域**，
+ * 跟 HOME 一点关系都没有。于是一次"沙箱"安装会把线上那个兜底定时器卸掉，
+ * 再把一个临时目录里的 plist 装进真实域 —— 临时目录一清，定时器就指向不存在的文件。
+ *
+ * 这不是假设：我为了测试 shell 安全性写了几条跑 `--apply` 的回归，用的正是临时 HOME，
+ * 结果把线上 30 分钟兜底任务切到了临时目录。Codex 只读复核时发现的。
+ *
+ * `os.userInfo().homedir` 读的是密码库，不受 HOME 环境变量影响，所以能可靠区分
+ * "真实安装"和"被重定向的安装"。
+ */
+const REAL_HOME = os.userInfo().homedir;
+const SANDBOXED = os.homedir() !== REAL_HOME;
+
 const launchctl = (args, { tolerate = false } = {}) => {
+  if (SANDBOXED) return { ok: false, skipped: true };
   try {
     execFileSync("/bin/launchctl", args, { stdio: "pipe", timeout: 15_000 });
     return { ok: true };
@@ -467,16 +512,24 @@ const launchctl = (args, { tolerate = false } = {}) => {
 const domain = "gui/" + process.getuid();
 let launchNote;
 if (uninstall) {
-  launchctl(["bootout", domain + "/" + LAUNCH_LABEL], { tolerate: true });
+  const booted = launchctl(["bootout", domain + "/" + LAUNCH_LABEL], { tolerate: true });
   fs.rmSync(PLIST, { force: true });
-  launchNote = "已卸载";
+  // 沙箱卸载只删得掉这个 HOME 下的 plist 文件，真实 launchd 里那个 job 还在跑。
+  // 报"已卸载"会让人以为清干净了 —— 跟安装那侧同一个不对称，说法要对称。
+  launchNote = booted.skipped
+    ? "plist 已删，但真实 launchd 未动（HOME 被重定向到 " + os.homedir() + "）"
+    : "已卸载";
 } else {
   fs.mkdirSync(path.dirname(PLIST), { recursive: true });
   fs.writeFileSync(PLIST, plistBody);
   launchctl(["bootout", domain + "/" + LAUNCH_LABEL], { tolerate: true }); // 没装过时必然失败，正常
-  launchNote = launchctl(["bootstrap", domain, PLIST]).ok
-    ? "已加载"
-    : "**plist 已写入但 launchctl 加载失败 —— 兜底重试目前不生效**";
+  const loaded = launchctl(["bootstrap", domain, PLIST]);
+  launchNote = loaded.skipped
+    // 说出来，别让人以为兜底装好了。沙箱安装不碰真实 launchd 是有意的，见 launchctl 处的说明。
+    ? "已跳过（HOME 被重定向到 " + os.homedir() + "，不碰真实 launchd）"
+    : loaded.ok
+      ? "已加载"
+      : "**plist 已写入但 launchctl 加载失败 —— 兜底重试目前不生效**";
 }
 
 console.log("\n" + (backup ? "settings 已改，备份：" + backup : "settings 无改动，未重写"));

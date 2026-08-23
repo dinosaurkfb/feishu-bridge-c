@@ -8,6 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { moduleRoot } from "../direct-run.mjs";
+import { shellQuote } from "../shell-quote.mjs";
 
 import {
   bridgeHome, enableAutoPublishForAllTasks, loadRegistry, registryFile,
@@ -25,7 +26,10 @@ const pickNode = () => {
   }
   return process.execPath;
 };
-const shellQuote = (value) => "'" + String(value).replace(/'/g, "'\\''") + "'";
+// 原来这里自带一份同样逻辑的 shellQuote。同一条策略写两遍就会漂 ——
+// 这个仓库今天已经为这类重复付过一次代价（时间格式在两处各写一份，边界收紧了一处、
+// 另一处没跟上）。改用共用实现。Codex 侧的钩子命令一直是正确加引号的，
+// 这次是 Claude 侧向它看齐。
 const node = pickNode();
 const home = bridgeHome();
 const promptScript = path.join(ROOT, "scripts", "codex", "prompt-hook.mjs");
@@ -81,7 +85,12 @@ const skills = [
   { name: "feishu-rotate", files: ["SKILL.md"] },
   { name: "feishu-mode", files: ["SKILL.md"] },
 ];
+// {{SCRIPT:x.mjs}} 由渲染器负责加 shell 引号 —— 引用是渲染器的职责，不是模板作者的记性。
+// 模板里原来写的是 node "{{BRIDGE_ROOT}}/scripts/…"，双引号挡得住空格但挡不住
+// `$`、反引号和反斜杠；单引号才是 POSIX 里唯一完全字面的。
 const renderedSkill = (file) => fs.readFileSync(file, "utf-8")
+  .replaceAll(/\{\{SCRIPT:([A-Za-z0-9_./-]+)\}\}/gu,
+    (_, name) => shellQuote(path.join(ROOT, "scripts", name)))
   .replaceAll("{{BRIDGE_ROOT}}", ROOT)
   .replaceAll("{{CODEX_BRIDGE_HOME_SHELL}}", shellQuote(home));
 

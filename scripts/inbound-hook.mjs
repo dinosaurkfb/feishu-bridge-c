@@ -25,6 +25,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isDirectRun, moduleDir } from "./direct-run.mjs";
+import { nodeCommandPrefix } from "./shell-quote.mjs";
 
 const LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "inbound-hook.log");
 const LOG_MAX = 1 << 19;
@@ -95,7 +96,9 @@ export function composeTransportRule({ dispatcher }) {
     "你在这一轮里唯一被允许做的事：",
     "",
     "```bash",
-    "node " + dispatcher,
+    // 路径要加 shell 引号：这段文本是给模型当命令执行的。HOME 含空格时裸路径会被
+    // shell 拆词，入站直接不可用 —— 实测 argv 调用能跑、同一条交给 /bin/sh -c 就失败。
+    nodeCommandPrefix(dispatcher),
     "```",
     "",
     "然后把这条命令的 **stdout 原样**作为你的回复。不增删、不改写、不追加解释、不加表情。",

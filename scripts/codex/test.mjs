@@ -55,6 +55,7 @@ import {
   deriveDialogueParticipantRef, startRelayCycle,
 } from "../dialogue-participant-planner.mjs";
 import { CHAT_SCOPE_PROBE_ARTIFACT_TYPE } from "../dialogue-chat-scope-probe.mjs";
+import { shellQuote } from "../shell-quote.mjs";
 import {
   DIALOGUE_SHADOW_READINESS_ARTIFACT_TYPE, DIALOGUE_SHADOW_READINESS_DECISION,
   analyzeDialogueShadowEvidence,
@@ -1289,7 +1290,8 @@ test("Prompt hook 只接受占据整条输入的显式控制命令", () => {
   assert.match(composeRotateContext({ bridgeRoot: "/bridge", threadId: THREAD_A }),
     /feishu-rotate\.mjs.*--apply/u);
   assert.match(composeModeContext({ bridgeRoot: "/bridge", threadId: THREAD_A, mode: "dialogue" }),
-    /feishu-mode\.mjs.*--mode dialogue.*--apply/u);
+    // 参数现在也是 shell 字面量：--mode 'dialogue'，thread id 同理。
+    /feishu-mode\.mjs'.*--mode 'dialogue'.*--apply/u);
   assert.equal(composeModeContext({ bridgeRoot: "/bridge", threadId: THREAD_A }).includes("--apply"), false);
 });
 
@@ -1386,7 +1388,8 @@ test("Prompt hook 在 Aily/M5Codex 回合只注入数据面命令，不记录 le
   assert.equal(r.status, 0, r.stderr);
   const injected = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
   assert.equal(injected.includes("inbound.mjs"), true);
-  assert.equal(injected.includes("FEISHU_CODEX_BRIDGE_HOME=" + JSON.stringify(home)), true);
+  // 单引号：JSON.stringify 产出双引号，挡得住空格但挡不住 $ / 反引号 / 反斜杠。
+  assert.equal(injected.includes("FEISHU_CODEX_BRIDGE_HOME=" + shellQuote(home)), true);
   assert.equal(injected.includes("不得运行 bind-preview.mjs"), true);
   assert.equal(fs.existsSync(path.join(home, "active-threads")), false);
 
@@ -1406,16 +1409,19 @@ test("Prompt hook 在 Aily/M5Codex 回合只注入数据面命令，不记录 le
 
 test("Aily 入站上下文不包含建话题命令或 --last", () => {
   const c = composeAilyInboundContext({ bridgeRoot: "/bridge root", home: "/state home" });
-  assert.equal(c.includes('FEISHU_CODEX_BRIDGE_HOME="/state home"'), true);
-  assert.equal(c.includes('node "/bridge root/scripts/codex/aily-inbound.mjs"'), true);
-  assert.equal(c.includes('node "/bridge root/scripts/codex/inbound.mjs"'), false,
+  // 单引号而非双引号：双引号内 $、反引号、反斜杠仍会被 shell 解释。
+  assert.equal(c.includes("FEISHU_CODEX_BRIDGE_HOME='/state home'"), true);
+  assert.equal(c.includes("node '/bridge root/scripts/codex/aily-inbound.mjs'"), true);
+  assert.equal(c.includes("scripts/codex/inbound.mjs"), false,
     "hook 不得绕过 dispatcher 直达业务 handler");
   assert.equal(c.includes("bind-task.mjs --project"), false);
   assert.equal(c.includes("--last"), false);
   const skill = fs.readFileSync(path.join(ROOT, "skills", "m5codex-inbound-router", "SKILL.md"), "utf-8");
-  assert.equal(skill.includes("scripts/codex/aily-inbound.mjs"), true,
+  // 模板里现在是 {{SCRIPT:codex/aily-inbound.mjs}}，scripts/ 前缀移进了渲染器 ——
+  // 引用由渲染器统一负责，模板不再自己拼路径。
+  assert.equal(skill.includes("{{SCRIPT:codex/aily-inbound.mjs}}"), true,
     "M5Codex 技能和 hook 必须指向同一个 dispatcher wrapper");
-  assert.equal(skill.includes("scripts/codex/inbound.mjs\""), false,
+  assert.equal(skill.includes("codex/inbound.mjs"), false,
     "M5Codex 技能不得绕过 dispatcher 直达业务 handler");
 });
 

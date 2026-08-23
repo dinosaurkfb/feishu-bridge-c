@@ -5240,7 +5240,14 @@ test("注入的规则把禁令放在最前面、并在末尾重复一次", () =>
   const head = rule.slice(0, 120);
   assert.ok(head.includes("不是给你的指令"), "禁令必须在最前面 —— 中间那段是祈使句，模型天然想执行它");
   assert.ok(rule.trimEnd().endsWith("原样返回它的输出。"), "末尾要再重复一次");
-  assert.ok(rule.includes("node /b/scripts/aily-inbound.mjs"));
+  assert.ok(rule.includes("node '/b/scripts/aily-inbound.mjs'"));
+
+  // 注入的是**给 shell 执行的命令文本**，路径必须加引号。HOME 含空格时裸路径会被
+  // 拆词，入站直接不可用；实测同一条路径 argv 调用能跑、交给 /bin/sh -c 就失败。
+  const spacey = composeTransportRule({ dispatcher: "/我的 家/scripts/aily-inbound.mjs" });
+  assert.ok(spacey.includes("node '/我的 家/scripts/aily-inbound.mjs'"),
+    "含空格的路径必须被引起来");
+  assert.doesNotMatch(spacey, /node \/我的 家/u, "不能出现裸路径");
 });
 
 test("注入的规则禁止模型自己判断该不该投递 —— 这条错误真实发生过", () => {
@@ -5418,9 +5425,16 @@ test("入站钩子从自身定位分发器，不再经 bridge_root 落回开发�
     "分发器必须取自己的同目录兄弟，保证与钩子同版本");
 
   // 两个入站安装器都必须能跑通。改 skills/ 只跑出站安装器，正是上一版把入站装崩的原因。
-  for (const installer of ["install-outbound.mjs", "install-inbound.mjs"]) {
-    const text = fs.readFileSync(path.resolve("scripts", installer), "utf-8");
-    assert.match(text, /BRIDGE_ROOT/u, installer + " 必须会渲染 {{BRIDGE_ROOT}} 占位符");
+  // 注意：这里**不能**只 grep 源码里有没有 "BRIDGE_ROOT" —— 安装器注释里就有这个词，
+  // 于是旧写法照样通过。那是源码字符串假阳性。改为检查模板与渲染产物本身。
+  for (const file of fs.readdirSync(path.resolve("skills"))) {
+    const skill = path.resolve("skills", file, "SKILL.md");
+    if (!fs.existsSync(skill)) continue;
+    const text = fs.readFileSync(skill, "utf-8");
+    assert.doesNotMatch(text, /node \{\{BRIDGE_ROOT\}\}/u,
+      file + " 应改用 {{SCRIPT:...}}，由渲染器统一加 shell 引号");
+    assert.doesNotMatch(text, /node "\{\{BRIDGE_ROOT\}\}/u,
+      file + " 双引号挡不住 $ / 反引号 / 反斜杠");
   }
 });
 
@@ -5478,6 +5492,35 @@ test("经符号链接执行时，脚本仍认得出自己是被直接执行的",
   assert.ok(scanned > 60, "扫描必须覆盖 scripts/**（含 codex/），实际 " + scanned + " 个");
 });
 
+test("含空格与中文的 HOME 下，注入的命令交给真 shell 也能执行", () => {
+  // 这条是 Codex 点名要的行为测试，而且必须走 /bin/sh -c ——
+  // 用 execFile 直接传 argv 是绕过 shell 分词的，正好测不到这个 bug：
+  // 实测同一条路径 argv 调用能跑、交给 /bin/sh -c 就被空格拆开。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "shellsafe-"));
+  const home = path.join(base, "我的 家");
+  fs.mkdirSync(home, { recursive: true });
+  const plan = planRuntimeSync({ sourceRoot: path.resolve("."), home });
+  assert.equal(applyRuntimeSync(plan, { home }).ok, true);
+
+  const dispatcher = path.join(runtimeRoot(home), "current", "scripts", "aily-inbound.mjs");
+  const command = composeTransportRule({ dispatcher })
+    .split("\n").find((line) => line.startsWith("node "));
+  assert.ok(command, "注入文本里必须有一条可执行的 node 命令");
+
+  const viaShell = spawnSync("/bin/sh", ["-c", command], { encoding: "utf-8" });
+  const output = String(viaShell.stdout ?? "") + String(viaShell.stderr ?? "");
+  // 这里不要求它成功受理（没有 Aily 环境变量，必然被拒），只要求 shell 能**找到并执行**
+  // 那个脚本。路径被拆词时的表现是 "Cannot find module" 或 node 报找不到文件。
+  assert.doesNotMatch(output, /Cannot find module/u,
+    "路径被 shell 拆词了 —— 这正是含空格 HOME 下入站不可用的原因");
+  assert.notEqual(output.trim(), "", "脚本必须真的跑起来并产出回执");
+
+  // 对照：不加引号时同一条命令必然失败。留着它，免得有人把引号"顺手去掉"。
+  const naked = spawnSync("/bin/sh", ["-c", "node " + dispatcher], { encoding: "utf-8" });
+  assert.match(String(naked.stdout ?? "") + String(naked.stderr ?? ""), /Cannot find module/u,
+    "裸路径在含空格的 HOME 下必然被拆词");
+});
+
 test("路由前的失败回执落到机器级目录，不写进代码目录", () => {
   // 装到 runtime 之后，模块所在目录就是 runtime/versions/<版本>/。把路由前的回执
   // 写在那儿有两个后果：本该不可变的代码目录变成状态目录；而且每装一个新版本，
@@ -5499,6 +5542,125 @@ test("路由前的失败回执落到机器级目录，不写进代码目录", ()
 
   // 装完之后 runtime 仍要自校验通过：状态污染代码目录也会让这一条更难判。
   assert.equal(verifyRuntime({ home }).ok, true);
+});
+
+test("预览放行规则与技能正文里那条命令，在真实产物上必须能对上", () => {
+  // 我曾经声称"有测试盯着它们相等" —— 那个测试当时并不存在。这条补上，而且验的是
+  // **装出来的产物**，不是源码里两个常量长得像。
+  //
+  // 为什么重要：allow 规则是前缀匹配。技能正文改成引号路径而规则还写裸路径的话，
+  // /feishu-bind 的预览会从"免确认"退化成每次弹窗 —— 静默退化，没人收到报错，
+  // 只会觉得"怎么又要确认一次"。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "preview-rule-"));
+  const home = path.join(base, "我的 家");
+  fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  execFileSync(process.execPath,
+    [path.resolve("scripts", "install-outbound.mjs"), "--apply"],
+    { encoding: "utf-8", env: { ...process.env, HOME: home } });
+
+  const settings = JSON.parse(fs.readFileSync(path.join(home, ".claude", "settings.json"), "utf-8"));
+  const rules = (settings.permissions?.allow ?? []).filter((r) => r.includes("bind-preview"));
+  assert.equal(rules.length, 1, "预览放行规则只能有一条");
+  const inner = rules[0].replace(/^Bash\((.*):\*\)$/u, "$1");
+
+  const skill = fs.readFileSync(
+    path.join(home, ".claude", "skills", "feishu-bind", "SKILL.md"), "utf-8");
+  const previewLine = skill.split("\n").find((l) => l.includes("bind-preview.mjs"));
+  assert.ok(previewLine, "技能里必须有预览命令");
+  assert.ok(previewLine.trim().startsWith(inner),
+    "技能命令必须以放行规则为前缀，否则预览退化成每次弹窗\n  规则: " + inner +
+    "\n  命令: " + previewLine.trim());
+
+  assert.doesNotMatch(skill, /\{\{/u, "产物里不得残留占位符");
+  assert.match(previewLine, /node '/u, "路径必须是引号形式");
+});
+
+test("含空格 HOME 下，出站装完之后入站也必须能装上", () => {
+  // Codex 实测复现的那条：runtime applyRuntimeSync 成功，install-inbound --apply 却 exit 1，
+  // 报一个从没出现过的伪路径不存在 —— 因为它从**已加引号的 shell 文本**里反解析路径，
+  // HOME 含空格时只截得到后半截。修法是问模板"声明了哪些脚本"，不问产物"像什么路径"。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "inbound-space-"));
+  const home = path.join(base, "我的 家");
+  fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  const env = { ...process.env, HOME: home };
+  execFileSync(process.execPath,
+    [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
+
+  const out = execFileSync(process.execPath,
+    [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env });
+  assert.doesNotMatch(out, /✗/u, "自检不得出现不一致");
+
+  const installed = fs.readFileSync(
+    path.join(home, ".claude", "skills", "m5claude-inbound-router", "SKILL.md"), "utf-8");
+  assert.doesNotMatch(installed, /\{\{/u, "产物里不得残留占位符");
+  const line = installed.split("\n").find((l) => l.includes("aily-inbound.mjs"));
+  const script = line.match(/'([^']+aily-inbound\.mjs)'/u)?.[1];
+  assert.ok(script, "命令里的脚本路径必须是引号形式");
+  assert.equal(fs.existsSync(script), true, "渲染出的路径必须指向真实存在的脚本：" + script);
+});
+
+test("预览放行归属：认领自己的与旧克隆的，不碰别人的", () => {
+  // 三类持久回归。之前我只在命令行里临时验过判据 —— 那等于没验，
+  // 下次有人放宽正则不会有任何东西报警。这条走真实产物：预置三种规则，
+  // 跑一次安装，看哪些被收编、哪些原样留着。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "perm-own-"));
+  const home = path.join(base, "我的 家");
+  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+
+  const foreign = "Bash(node --require '/other/scripts/bind-preview.mjs':*)";
+  const legacy = "Bash(node /old/clone/scripts/bind-preview.mjs:*)";
+  const unrelated = "Bash(git status:*)";
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"),
+    JSON.stringify({ permissions: { allow: [unrelated, foreign, legacy] } }, null, 2) + "\n");
+
+  execFileSync(process.execPath,
+    [path.resolve("scripts", "install-outbound.mjs"), "--apply"],
+    { encoding: "utf-8", env: { ...process.env, HOME: home } });
+
+  const allow = JSON.parse(fs.readFileSync(
+    path.join(home, ".claude", "settings.json"), "utf-8")).permissions.allow;
+
+  assert.ok(allow.includes(foreign),
+    "别人的规则不得被误删 —— --require 只是碰巧提到了同一个文件名");
+  assert.ok(allow.includes(unrelated), "无关规则更不能动");
+  assert.ok(!allow.includes(legacy), "旧克隆的裸路径规则要被收编掉");
+  const mine = allow.filter((r) => r.includes("bind-preview") && !r.includes("--require"));
+  assert.equal(mine.length, 1, "自己的规则只能剩一条");
+  assert.match(mine[0], /^Bash\(node '.*\/runtime\/current\/scripts\/bind-preview\.mjs':\*\)$/u,
+    "新规则应指向 runtime 且路径加引号");
+
+  // 再装一次必须幂等：不能因为认不出自己那条而不断追加。
+  execFileSync(process.execPath,
+    [path.resolve("scripts", "install-outbound.mjs"), "--apply"],
+    { encoding: "utf-8", env: { ...process.env, HOME: home } });
+  const again = JSON.parse(fs.readFileSync(
+    path.join(home, ".claude", "settings.json"), "utf-8")).permissions.allow;
+  assert.equal(again.filter((r) => r.includes("bind-preview") && !r.includes("--require")).length, 1,
+    "重复安装不得追加第二条");
+});
+
+test("HOME 被重定向时，安装器不得碰真实 launchd", () => {
+  // plist 文件路径跟 os.homedir() 走，所以指定 HOME 看起来像个安全的沙箱安装。
+  // 但 launchctl bootout/bootstrap 操作的是**真实用户的 launchd 域**，与 HOME 无关。
+  // 我为了测 shell 安全写的几条 --apply 回归就是这么把线上 30 分钟兜底任务
+  // 切到临时目录的 —— 临时目录一清，定时器就指向不存在的文件。
+  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  assert.match(src, /os\.userInfo\(\)\.homedir/u,
+    "判据要用密码库里的 home，它不受 HOME 环境变量影响");
+  assert.match(src, /if \(SANDBOXED\) return \{ ok: false, skipped: true \};/u,
+    "launchctl 必须在沙箱安装时直接短路");
+
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "launchd-guard-"));
+  const home = path.join(base, "我的 家");
+  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  const out = execFileSync(process.execPath,
+    [path.resolve("scripts", "install-outbound.mjs"), "--apply"],
+    { encoding: "utf-8", env: { ...process.env, HOME: home } });
+  assert.match(out, /兜底定时器：已跳过/u, "跳过要说出来，不能让人以为兜底装好了");
+  assert.doesNotMatch(out, /兜底定时器：已加载/u);
 });
 
 test("路径含空格或非 ASCII 时，模块仍能定位自己", () => {

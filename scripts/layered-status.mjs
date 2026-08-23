@@ -131,9 +131,41 @@ const relative = (ms, now) => {
 /**
  * 组装五个区。**纯函数** —— 取数在外面做，这里只决定"哪条事实属于哪一层"。
  */
+/**
+ * 把别的链路按它**自己声明的** relation_type 归到对应层。
+ *
+ * 没声明的留在附录 —— 判不出就不硬归类。上一版所有链路都只能进附录，
+ * 因为协议里根本没有这个字段。
+ */
+const KIND_TEXT = { transport: "消息运输", progress: "进度汇报" };
+const STATE_TEXT = { active: "正常", suspended: "已暂停", expired: "已过期", unknown: "状态未知" };
+const SCOPE_TEXT = { chat: "整个群", topic: "单个话题", project: "整个项目" };
+
+export function splitByRelation(sections = []) {
+  const byLayer = { subscription: [], binding: [], policy: [] };
+  const unsorted = [];
+  for (const s of sections) {
+    const rows = s.state === "ok" ? (s.connections ?? []) : [];
+    if (rows.length === 0) { unsorted.push(s); continue; }
+    const placed = rows.filter((c) => c.relation && byLayer[c.relation]);
+    for (const c of placed) byLayer[c.relation].push({ ...c, displayName: s.displayName });
+    if (placed.length < rows.length) {
+      unsorted.push({ ...s, connections: rows.filter((c) => !c.relation || !byLayer[c.relation]) });
+    }
+  }
+  return { byLayer, unsorted };
+}
+
+const relationRow = (c) => [c.displayName,
+  (KIND_TEXT[c.kind] ?? c.kind) + " · " + c.groupName + (c.topicName ? " / " + c.topicName : "") +
+  " · " + (SCOPE_TEXT[c.scope] ?? c.scope) + " · " + (STATE_TEXT[c.state] ?? c.state)];
+
 export function composeLayeredStatus({
-  st, others = [], endpoint, subscription, connectivity = null, now = Date.now(),
+  st, others = [], endpoint, subscription, connectivity = null,
+  otherLinks = null, now = Date.now(),
 }) {
+  // 别的链路里能归层的，直接进对应层；归不了的留给附录。
+  const split = otherLinks ? splitByRelation(otherLinks.sections) : { byLayer: null, unsorted: [] };
   // **没绑定不等于没有四层。**第 1、2 层照样有事实可报，只是第 3 层还没绑、
   // 第 4 层无从谈起。上一版在这里直接退回旧格式，等于四层模型在最需要它的时候消失。
   const bound = st.ok === true;
@@ -174,6 +206,7 @@ export function composeLayeredStatus({
       L2.push(["待认领绑定", subscription.pendingCount + " 条"]);
     }
   }
+  for (const c of split.byLayer?.subscription ?? []) L2.push(relationRow(c));
 
   if (!bound) {
     // not_bound 和"读不出来"必须分开：前者是还没接，后者是配错了或文件坏了。
@@ -217,6 +250,7 @@ export function composeLayeredStatus({
   }
   if (st.expiresAt) L3.push(["有效期", String(st.expiresAt).slice(0, 10)]);
   if (others.length > 1) L3.push(["本项目绑定数", others.length + " 条"]);
+  for (const c of split.byLayer?.binding ?? []) L3.push(relationRow(c));
 
   const L4 = [
     ["交互模式", st.policy?.ok ? st.policy.label + " · v" + st.policy.policyVersion : "状态不可用"],
@@ -233,19 +267,17 @@ export function composeLayeredStatus({
   }
   // **不许无条件声称"每轮自动发布"**，也不许说得比实际行为满。
   //
-  // auto_publish_on_completion 只被 inbound.mjs 和 watch-and-publish.mjs 读取。
-  // **每轮 Stop 和 30 分钟兜底都不读它** —— 而那两条恰好是主路径。所以在 Claude 侧
-  // 把它设成 false 几乎什么都不改变：进展照发。
-  //
-  // 上一版写"每轮完成时不自动发布（兜底排空仍会发出）"仍然不准，因为 Stop 每轮
-  // 都会排空。这是同一个错的第二版：措辞比行为说得满。
-  //
-  // 这个落差是产品缺口，已记入需求文档等 Frank 决定；状态展示只负责说准，不顺手改行为。
+  // 2026-08-24 起这个开关真的管住了所有自动发布路径（drainProject 默认遵守它），
+  // 所以"仅入队"这个说法现在**是准的**。此前它只被 inbound.mjs 和
+  // watch-and-publish.mjs 读，每轮 Stop 和 30 分钟兜底都不读 —— 那时候写"仅入队"
+  // 是在承诺一件开关做不到的事，措辞改过两版才追上行为。
   L4.push(["出站发布", st.suspended ? "暂停中，进展留在本地不发出"
     : st.autoPublish === true ? "每轮自动发布"
     : st.autoPublish === false
-      ? "配置已关，但进展仍会发出（Stop 与兜底排空不读这个开关）"
+      ? "仅入队，不自动发布（人工排空可用 --force 绕过）"
       : "状态不可用（读不到发布配置）"]);
+
+  for (const c of split.byLayer?.policy ?? []) L4.push(relationRow(c));
 
   const L5 = [["待发布答复", st.pending + " 条" + (st.pending && st.suspended ? "（恢复后会发出）" : "")]];
 

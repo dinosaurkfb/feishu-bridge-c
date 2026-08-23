@@ -27,9 +27,9 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { isDirectRun } from "./direct-run.mjs";
+import { isDirectRun, moduleRoot } from "./direct-run.mjs";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const ROOT = moduleRoot(import.meta.url, "..");
 export const SNAPSHOT_FILE = path.join(ROOT, "references", "shared-surface.json");
 const CODEX_DIR = path.join(ROOT, "scripts", "codex");
 

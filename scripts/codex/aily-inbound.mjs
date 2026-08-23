@@ -6,8 +6,9 @@ import path from "node:path";
 import { runInboundDispatcher } from "../inbound-dispatcher.mjs";
 import { legacyEndpointId } from "../subscription.mjs";
 import { bridgeHome, loadCodexTemplate } from "./state.mjs";
+import { moduleRoot } from "../direct-run.mjs";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
+const ROOT = moduleRoot(import.meta.url, "../..");
 const HOME = bridgeHome();
 const tpl = loadCodexTemplate();
 if (!tpl.ok) {

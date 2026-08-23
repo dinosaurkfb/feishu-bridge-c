@@ -10,8 +10,9 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { recordClaudeTopicActivity } from "./topic-generation-store.mjs";
+import { moduleRoot } from "./direct-run.mjs";
 
-const BRIDGE_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const BRIDGE_ROOT = moduleRoot(import.meta.url, "..");
 
 const nonEmpty = (value) => typeof value === "string" && value.trim().length > 0;
 

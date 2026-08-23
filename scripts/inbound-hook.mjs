@@ -24,7 +24,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { isDirectRun } from "./direct-run.mjs";
+import { isDirectRun, moduleDir } from "./direct-run.mjs";
 
 const LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "inbound-hook.log");
 const LOG_MAX = 1 << 19;
@@ -150,7 +150,7 @@ async function main() {
   // 二是脱离开发克隆：钩子本身已经装在 ~/.claude/feishu-bridge/runtime/current/ 下，
   // 而 bridge_root 仍是某个开发克隆 —— 那样出站迁走了、入站还落回克隆执行。
   const dispatcher = path.join(
-    path.dirname(new URL(import.meta.url).pathname), "aily-inbound.mjs");
+    moduleDir(import.meta.url), "aily-inbound.mjs");
 
   const context = composeTransportRule({ dispatcher });
   log("INJECT " + context.length + " 字符 → " + dispatcher);
@@ -164,7 +164,7 @@ if (isDirectRun(import.meta.url)) {
   if (process.argv.includes("--self-test")) {
     const { loadChainTemplate } = await import("./chain-template.mjs");
     console.log(composeTransportRule({
-      dispatcher: path.join(path.dirname(new URL(import.meta.url).pathname), "aily-inbound.mjs"),
+      dispatcher: path.join(moduleDir(import.meta.url), "aily-inbound.mjs"),
     }));
     process.exit(0);
   }

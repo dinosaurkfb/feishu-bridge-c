@@ -7,8 +7,9 @@ import path from "node:path";
 
 import { DEFAULT_CONFIG_BASE, validateChainTemplate } from "../chain-template.mjs";
 import { bridgeHome, templateFile, validateCodexTemplate } from "./state.mjs";
+import { moduleRoot } from "../direct-run.mjs";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
+const ROOT = moduleRoot(import.meta.url, "../..");
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
   return at >= 0 ? process.argv[at + 1] : undefined;

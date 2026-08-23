@@ -28,9 +28,9 @@ import { NO_PREFIX, UNLIMITED, isValidPrefix, isValidQuota } from "./selector.mj
 import { checkBinding, WARN_DAYS } from "./binding-health.mjs";
 import { projectMappingPath, resolveProject } from "./project-resolve.mjs";
 import { registryPath } from "./registry.mjs";
-import { isDirectRun } from "./direct-run.mjs";
+import { isDirectRun, moduleRoot } from "./direct-run.mjs";
 
-const SELF = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const SELF = moduleRoot(import.meta.url, "..");
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** 相对写法（1y / 6m / 90d）和绝对日期都收。相对量一律从**现在**起算，不是从原到期日续。 */

@@ -27,8 +27,9 @@ import os from "node:os";
 import path from "node:path";
 
 import { CHAIN_FIELDS, DEFAULT_CONFIG_BASE, templatePath, validateChainTemplate } from "./chain-template.mjs";
+import { moduleRoot } from "./direct-run.mjs";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const ROOT = moduleRoot(import.meta.url, "..");
 
 const arg = (n) => {
   const i = process.argv.indexOf("--" + n);

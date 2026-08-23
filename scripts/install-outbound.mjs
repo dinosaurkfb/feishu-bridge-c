@@ -21,12 +21,13 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { moduleRoot } from "./direct-run.mjs";
 
 import {
   applyRuntimeSync, planRuntimeSync, runtimeScript, verifyRuntime,
 } from "./runtime-install.mjs";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const ROOT = moduleRoot(import.meta.url, "..");
 
 /**
  * **全局配置里只出现 runtime 路径，绝不出现开发克隆路径。**

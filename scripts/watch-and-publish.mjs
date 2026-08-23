@@ -22,13 +22,14 @@ import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
 import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
+import { moduleRoot } from "./direct-run.mjs";
 import {
   businessActivitiesForPublishedBatch, recordClaudeActivityAndMaybeRotate,
 } from "./automatic-topic-rotation.mjs";
 import { finalizeClaudeDialogueTurn } from "./interaction-policy-store.mjs";
 import { DIALOGUE_POLICY_ID, DIALOGUE_TURN_STATUS } from "./interaction-policy.mjs";
 
-const SELF = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const SELF = moduleRoot(import.meta.url, "..");
 
 const key = process.argv[2];
 if (!key) {

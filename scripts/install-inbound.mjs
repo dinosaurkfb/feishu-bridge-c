@@ -30,8 +30,9 @@ import os from "node:os";
 import path from "node:path";
 
 import { runtimeScript, verifyRuntime } from "./runtime-install.mjs";
+import { moduleRoot } from "./direct-run.mjs";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const ROOT = moduleRoot(import.meta.url, "..");
 /**
  * 技能里的脚本路径指向 **runtime**，不指向这个克隆。
  *

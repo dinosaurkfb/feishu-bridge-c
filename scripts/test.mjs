@@ -13,6 +13,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { moduleDir } from "./direct-run.mjs";
 
 import {
   REJECT, bindingTokensInQuote, evaluateInbound, extractMentionIds, extractQuotedBlock,
@@ -1424,7 +1425,7 @@ test("Chat scope attestation 的证据窗口与 snapshot.freshness_ms 解耦", (
   // 会被完整性校验直接判 INVALID_SNAPSHOT，测不到想测的东西。
   // 真正要钉死的是"源码里根本不读这个字段"——这条防的是将来有人又把两条策略接回去。
   const source = fs.readFileSync(
-    path.join(path.dirname(new URL(import.meta.url).pathname),
+    path.join(moduleDir(import.meta.url),
       "dialogue-chat-scope-attestation.mjs"), "utf-8");
   const codeOnly = source.replace(/\/\*[\s\S]*?\*\//gu, "").replace(/\/\/[^\n]*/gu, "");
   assert.ok(!codeOnly.includes("freshness_ms"),
@@ -5475,6 +5476,78 @@ test("经符号链接执行时，脚本仍认得出自己是被直接执行的",
       " 不得直接读 process.argv[1]；判断是否直接执行一律用 isDirectRun");
   }
   assert.ok(scanned > 60, "扫描必须覆盖 scripts/**（含 codex/），实际 " + scanned + " 个");
+});
+
+test("路由前的失败回执落到机器级目录，不写进代码目录", () => {
+  // 装到 runtime 之后，模块所在目录就是 runtime/versions/<版本>/。把路由前的回执
+  // 写在那儿有两个后果：本该不可变的代码目录变成状态目录；而且每装一个新版本，
+  // 路由前的审计证据就换一个地方，排查时要翻遍所有历史版本目录才能拼出时间线。
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "unrouted-home-"));
+  const plan = planRuntimeSync({ sourceRoot: path.resolve("."), home });
+  assert.equal(applyRuntimeSync(plan, { home }).ok, true);
+  const versionDir = path.join(runtimeRoot(home), "versions", plan.version);
+
+  // 没有 Aily 环境变量 → 必然在路由之前就失败，正好走到我们要验的那条路径。
+  spawnSync(process.execPath, [path.join(versionDir, "scripts", "inbound.mjs")], {
+    encoding: "utf-8", env: { ...process.env, HOME: home },
+  });
+
+  assert.equal(fs.existsSync(path.join(versionDir, ".runtime-data")), false,
+    "代码目录里不得出现 .runtime-data —— 版本目录必须保持不可变");
+  assert.equal(fs.existsSync(path.join(home, ".claude", "feishu-bridge", "inbound")), true,
+    "路由前的状态应落在机器级 ~/.claude/feishu-bridge/inbound");
+
+  // 装完之后 runtime 仍要自校验通过：状态污染代码目录也会让这一条更难判。
+  assert.equal(verifyRuntime({ home }).ok, true);
+});
+
+test("路径含空格或非 ASCII 时，模块仍能定位自己", () => {
+  // new URL(import.meta.url).pathname 给的是 URL 的路径分量，仍是百分号编码的：
+  // 目录名含空格或中文时会拿到 /…/%E5%B8%A6%20%E7%A9%BA%E6%A0%BC，读文件直接 ENOENT。
+  // 现有路径全是 ASCII 所以一直没爆，但 runtime 装在 ~/.claude 下，home 目录名是
+  // 用户可控的 —— 这是定时炸弹，不是理论问题。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "modpath-"));
+  const dir = path.join(base, "带 空格 和中文");
+  fs.mkdirSync(dir, { recursive: true });
+  const probe = path.join(dir, "probe.mjs");
+  fs.writeFileSync(probe, [
+    'import { moduleDir } from ' + JSON.stringify(path.resolve("scripts", "direct-run.mjs")) + ';',
+    'import fs from "node:fs";',
+    'fs.readdirSync(moduleDir(import.meta.url));',
+    'process.stdout.write(moduleDir(import.meta.url));',
+  ].join("\n"));
+  const out = execFileSync(process.execPath, [probe], { encoding: "utf-8" });
+  // 比 realpath：macOS 上 os.tmpdir() 给的是 /var/…，而模块 URL 走的是 /private/var/…。
+  // 这条测试要验的是"百分号有没有被解码"，不是符号链接。
+  assert.equal(out, fs.realpathSync(dir),
+    "moduleDir 必须还原成真实路径，而不是百分号编码");
+
+  // 对照：旧写法在同一场景下必然读不到目录。留着它，免得有人"顺手简化"回去。
+  const legacy = path.join(dir, "legacy.mjs");
+  fs.writeFileSync(legacy, [
+    'import path from "node:path";',
+    'import fs from "node:fs";',
+    'try { fs.readdirSync(path.dirname(new URL(import.meta.url).pathname));',
+    '  process.stdout.write("ok"); } catch (e) { process.stdout.write(e.code); }',
+  ].join("\n"));
+  assert.equal(execFileSync(process.execPath, [legacy], { encoding: "utf-8" }), "ENOENT",
+    "旧写法在含空格/非 ASCII 的路径下会 ENOENT —— 这正是要根除它的原因");
+
+  // 全仓库不得再出现旧写法（递归、不解析注释，跟 process.argv[1] 那条同一套做法）。
+  const files = [];
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.name.endsWith(".mjs")) files.push(full);
+    }
+  };
+  walk(path.resolve("scripts"));
+  for (const file of files) {
+    if (["direct-run.mjs", "test.mjs"].includes(path.basename(file))) continue;
+    assert.doesNotMatch(fs.readFileSync(file, "utf-8"), /new URL\(import\.meta\.url\)\.pathname/u,
+      path.relative(path.resolve("scripts"), file) + " 应改用 moduleDir / moduleRoot");
+  }
 });
 
 test("经 runtime/current 执行 feishu-mode 必须真的产出输出", () => {

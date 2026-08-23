@@ -6,6 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { moduleRoot } from "../direct-run.mjs";
 
 import {
   appendEvent, listPending, markPublishEligibleByEventKey, suppressPublishByEventKey,
@@ -59,7 +60,7 @@ import {
   analyzeDialogueShadowEvidence,
 } from "../dialogue-shadow-readiness.mjs";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
+const ROOT = moduleRoot(import.meta.url, "../..");
 const THREAD_A = "01911111-2222-7333-8444-555555555555";
 const THREAD_B = "01922222-3333-7444-8555-666666666666";
 const TEMPLATE = {

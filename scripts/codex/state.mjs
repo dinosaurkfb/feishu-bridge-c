@@ -462,32 +462,67 @@ function scanAutoPublish(doc) {
   };
 }
 
-/** 读迁移回执。回执缺失只说明"没记录到"，不等于没跑过 —— 重跑是幂等的。 */
-export function readMigrationReceipt(home = bridgeHome(), id = AUTO_PUBLISH_MIGRATION_ID) {
+/**
+ * 读迁移账本。**只有 ENOENT 才算首次运行。**
+ *
+ * 解析失败、权限失败、顶层不是普通对象 —— 一律 fail-closed。把这些也当成"首次"，
+ * 会让一次迁移直接覆盖掉别的迁移的回执：账本坏了不是重建它的理由，是停下的理由。
+ */
+function readMigrationLedger(home) {
+  let raw;
   try {
-    return JSON.parse(fs.readFileSync(migrationsFile(home), "utf-8"))[id] ?? null;
-  } catch { return null; }
+    raw = fs.readFileSync(migrationsFile(home), "utf-8");
+  } catch (err) {
+    if (err.code === "ENOENT") return { ok: true, ledger: {} };
+    return { ok: false, reason: "migrations_unreadable", error: err.message };
+  }
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (err) {
+    return { ok: false, reason: "migrations_unreadable", error: err.message };
+  }
+  // 数组也是 JSON 对象，但 all[id] = … 之后 stringify 会把它丢掉 —— 于是
+  // 回执"写成功了"却读不回来。必须在这里挡掉，不能等到写完才发现。
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, reason: "migrations_shape_unexpected" };
+  }
+  return { ok: true, ledger: parsed };
+}
+
+/** 读某一版迁移的回执。回执缺失只说明"没记录到"，不等于没跑过 —— 重跑是幂等的。 */
+export function readMigrationReceipt(home = bridgeHome(), id = AUTO_PUBLISH_MIGRATION_ID) {
+  const read = readMigrationLedger(home);
+  return read.ok ? (read.ledger[id] ?? null) : null;
 }
 
 /**
- * 落盘回执。**先写登记表再写回执** —— 反过来的话，中途崩溃会留下一份声称迁移已完成
- * 但登记表没改的回执，那是往"谎报成功"的方向错。回执写不成只是"可能跑过"，安全方向。
+ * 落盘回执，并**读回来核验**。
+ *
+ * 先写登记表再写回执：反过来的话中途崩溃会留下一份声称迁移完成、但登记表没改的
+ * 回执 —— 往谎报成功的方向错。回执写不成只是"可能跑过"，安全方向。
+ *
+ * 写完必须重读核验才敢报 receipt:true。写入返回没报错不等于内容落对了 ——
+ * 账本是数组时 `all[id] = …` 就是这么无声无息地什么都没留下的。
  */
 function writeReceipt(home, { tasks, changed }) {
   try {
+    const read = readMigrationLedger(home);
+    if (!read.ok) return { receipt: false, receiptError: read.reason };
+
     const file = migrationsFile(home);
-    let all = {};
-    try { all = JSON.parse(fs.readFileSync(file, "utf-8")); } catch { /* 首次 */ }
-    all[AUTO_PUBLISH_MIGRATION_ID] = {
-      applied_at: new Date().toISOString(), tasks, changed,
-    };
+    const entry = { applied_at: new Date().toISOString(), tasks, changed };
+    const next = { ...read.ledger, [AUTO_PUBLISH_MIGRATION_ID]: entry };
     fs.mkdirSync(home, { recursive: true, mode: 0o700 });
     const tmp = file + ".tmp." + process.pid;
-    fs.writeFileSync(tmp, JSON.stringify(all, null, 2) + "\n", { mode: 0o600 });
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
     fs.renameSync(tmp, file);
+
+    const back = readMigrationReceipt(home);
+    if (!back || back.applied_at !== entry.applied_at || back.changed !== entry.changed) {
+      return { receipt: false, receiptError: "receipt_not_readable_after_write" };
+    }
     return { receipt: true };
   } catch (err) {
-    // 登记表已经改完了，只是留痕失败 —— 必须说出来，不能算完整成功。
+    // 登记表已经改完了。这里报 true 就是谎报。
     return { receipt: false, receiptError: err.message };
   }
 }
@@ -529,6 +564,11 @@ export function enableAutoPublishForAllTasks({ home = bridgeHome(), apply = fals
     if (!snap.ok) return snap;
     const scan = scanAutoPublish(snap.doc);
     if (!scan.ok) return scan;
+
+    // 锁内预检账本：账本坏了就别动登记表 —— 否则改完了却记不下来，
+    // 「跑没跑过、跑的是哪一版」立刻变回答不了的问题。
+    const ledger = readMigrationLedger(home);
+    if (!ledger.ok) return { ok: false, reason: ledger.reason, error: ledger.error };
 
     if (scan.pendingRefs.length > 0) {
       for (const task of scan.pendingRefs) task.auto_publish_on_completion = true;

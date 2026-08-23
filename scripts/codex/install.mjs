@@ -2,6 +2,7 @@
 /**
  * 安装 Codex adapter：追加 hooks、复制七项技能、初始化 registry，并为已登记 task 启用
  * 每轮自动发布。默认 dry-run；不修改 hook trust，安装本身不发送飞书。
+ * 安装**不改订阅策略**：历史 task 的迁移走 migrate-auto-publish.mjs，这里只报数。
  */
 
 import fs from "node:fs";
@@ -11,7 +12,7 @@ import { moduleRoot } from "../direct-run.mjs";
 import { shellQuote } from "../shell-quote.mjs";
 
 import {
-  bridgeHome, enableAutoPublishForAllTasks, loadRegistry, registryFile,
+  bridgeHome, enableAutoPublishForAllTasks, registryFile,
 } from "./state.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "../..");
@@ -35,10 +36,11 @@ const home = bridgeHome();
 const promptScript = path.join(ROOT, "scripts", "codex", "prompt-hook.mjs");
 const stopScript = path.join(ROOT, "scripts", "codex", "stop-hook.mjs");
 const log = path.join(home, "hook.log");
-const currentRegistry = loadRegistry(registryFile(home));
-const autoPublishMigrationCount = currentRegistry.ok
-  ? currentRegistry.tasks.filter((task) => task.auto_publish_on_completion !== true).length
-  : null;
+// 预览和落盘必须共用同一份扫描。原来这里用 loadRegistry 的**过滤视图**计数，
+// 而真正的迁移读的是原始文档 —— 于是预览说"待迁移 1 个"、实际会改 3 个，
+// 因为视图滤掉了 enabled:false 的 task 和 root 形状异常的记录。
+const autoPublishPreview = enableAutoPublishForAllTasks({ home });
+const autoPublishMigrationCount = autoPublishPreview.ok ? autoPublishPreview.changed : null;
 
 const hookCommand = (script) =>
   "if [ -x " + shellQuote(node) + " ] && [ -r " + shellQuote(script) + " ]; then " +

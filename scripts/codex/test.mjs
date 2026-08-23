@@ -2060,6 +2060,71 @@ test("apply 路径必须取锁后再读，待迁移为 0 也不许绕过锁", ()
   assert.equal(enableAutoPublishForAllTasks({ home, apply: false }).ok, true);
 });
 
+test("迁移账本坏了就停手：不写登记表，也不覆盖账本", () => {
+  // 账本是数组：JSON 上合法，但 all[id] = … 之后 stringify 会把它丢掉 ——
+  // 于是"写成功了"却读不回来。必须在动登记表之前就挡住。
+  for (const [ledger, reason] of [
+    ["[]", "migrations_shape_unexpected"],
+    ["null", "migrations_shape_unexpected"],
+    ["{ 坏掉的 json", "migrations_unreadable"],
+  ]) {
+    const home = temp();
+    const file = path.join(home, "registry.json");
+    const before = JSON.stringify({ schema_version: "1.0", runtime: "codex",
+      tasks: [{ logical_task_key: "a", root: "/tmp/a" }] });
+    fs.writeFileSync(file, before);
+    fs.writeFileSync(path.join(home, "migrations.json"), ledger);
+
+    const r = enableAutoPublishForAllTasks({ home, apply: true });
+    assert.equal(r.ok, false, "账本不可用时不该报成功：" + ledger);
+    assert.equal(r.reason, reason);
+    assert.equal(fs.readFileSync(file, "utf-8"), before, "登记表一个字节都不该动");
+    assert.equal(fs.readFileSync(path.join(home, "migrations.json"), "utf-8"), ledger,
+      "坏账本不是重建它的理由");
+  }
+});
+
+test("迁移回执不覆盖别的迁移，且写完要读回来核验", () => {
+  const home = temp();
+  fs.writeFileSync(path.join(home, "registry.json"), JSON.stringify({
+    schema_version: "1.0", runtime: "codex",
+    tasks: [{ logical_task_key: "a", root: "/tmp/a" }],
+  }));
+  const other = { applied_at: "2020-01-01T00:00:00.000Z", tasks: 9, changed: 9 };
+  fs.writeFileSync(path.join(home, "migrations.json"),
+    JSON.stringify({ some_other_migration_v3: other }));
+
+  const r = enableAutoPublishForAllTasks({ home, apply: true });
+  assert.equal(r.receipt, true);
+  const all = JSON.parse(fs.readFileSync(path.join(home, "migrations.json"), "utf-8"));
+  assert.deepEqual(all.some_other_migration_v3, other, "别人的回执不能被顺手抹掉");
+  assert.equal(all.auto_publish_on_completion_v1.changed, 1);
+  // 读回来核验：写入不报错 ≠ 内容落对了。
+  assert.deepEqual(readMigrationReceipt(home), all.auto_publish_on_completion_v1);
+});
+
+test("安装器预览的待迁移数必须等于实际会改的数", () => {
+  const dir = temp();
+  const home = path.join(dir, "bridge-home");
+  fs.mkdirSync(home, { recursive: true });
+  // 一个暂停、一个 root 形状异常 —— 两者都会被 loadRegistry 的过滤视图漏掉。
+  fs.writeFileSync(path.join(home, "registry.json"), JSON.stringify({
+    schema_version: "1.0", runtime: "codex",
+    tasks: [
+      { logical_task_key: "a", root: "/tmp/a" },
+      { logical_task_key: "b", root: "/tmp/b", enabled: false },
+      { logical_task_key: "c", root: "relative/bad" },
+    ],
+  }));
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs")], {
+    encoding: "utf-8",
+    env: { ...process.env, CODEX_HOME: path.join(dir, "codex-home"), FEISHU_CODEX_BRIDGE_HOME: home },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /待迁移 3 个 task/u, "预览报的数是过滤视图的话这里会是 1");
+  assert.equal(enableAutoPublishForAllTasks({ home }).changed, 3);
+});
+
 test("绑定预览为同一 thread 生成稳定逻辑键与平台幂等键", () => {
   const dir = temp();
   fs.writeFileSync(path.join(dir, "README.md"), "# Demo\n\n一个演示项目。\n");

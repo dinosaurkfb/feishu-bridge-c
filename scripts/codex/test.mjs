@@ -17,7 +17,9 @@ import {
 import { composeCodexBinding, resolveBindingTarget, validThreadId } from "./bind-compose.mjs";
 import { readCodexThreadTitle, sanitizeThreadTitle } from "./thread-title.mjs";
 import { updateTextMessage } from "./lark-message.mjs";
-import { classifyRunnerDiagnostic, readCodexRunOutcome, sanitizeCodexRunEnv } from "./handoff.mjs";
+import {
+  classifyRunnerDiagnostic, isCodexInboundExecution, readCodexRunOutcome, sanitizeCodexRunEnv,
+} from "./handoff.mjs";
 import {
   composeCodexOutboundCard, neutralizeCardMentions, outboundCardBatches, validateCodexOutboundCard,
 } from "./outbound-card.mjs";
@@ -1498,6 +1500,75 @@ test("目标 Codex 再次执行入站路由时严格判为 bridge_recursion", ()
   const result = readCodexRunOutcome({ logPath, exitPath, lastMessagePath, expectedThreadId: THREAD_A });
   assert.equal(result.state, "failed");
   assert.equal(result.reason, "bridge_recursion");
+});
+
+test("bridge_recursion 只识别真实入口执行，不把源码引用和排障命令当递归", () => {
+  assert.equal(isCodexInboundExecution("node /bridge/scripts/codex/inbound.mjs"), true);
+  assert.equal(isCodexInboundExecution(
+    "/bin/zsh -lc \"node /bridge/scripts/codex/aily-inbound.mjs\""), true);
+  assert.equal(isCodexInboundExecution(
+    "cd /bridge && FEISHU_BRIDGE_ROLE=test node scripts/codex/inbound.mjs"), true);
+  assert.equal(isCodexInboundExecution(
+    "node -r ts-node/register /bridge/scripts/codex/inbound.mjs"), true);
+  assert.equal(isCodexInboundExecution(
+    "env bash -c 'FEISHU_CODEX_BRIDGE_HOME=/tmp node /bridge/scripts/codex/aily-inbound.mjs --dry-run'"),
+    true);
+
+  // 真实调用形态：router 技能里那条命令的路径本来就带双引号，而 Codex 执行的命令一律是
+  // `/bin/zsh -lc "..."` —— 两者叠加，内层就成了 \"…\"。不还原转义的话，
+  // **真正的递归**会从检测里漏掉，风险方向从过度检测翻成漏检测。
+  assert.equal(isCodexInboundExecution(
+    "/bin/zsh -lc \"FEISHU_CODEX_BRIDGE_HOME='/Users/dk/.codex/feishu-bridge' " +
+    "node \\\"/bridge/scripts/codex/aily-inbound.mjs\\\"\""), true,
+    "zsh -lc 包裹且内层路径用转义双引号，是 router 技能被调用时的真实形态");
+  assert.equal(isCodexInboundExecution(
+    "/bin/zsh -lc \"bash -lc \\\"node /bridge/scripts/codex/inbound.mjs\\\"\""), true,
+    "嵌套包裹也要逐层剥开");
+  assert.equal(isCodexInboundExecution(
+    "/bin/zsh -lc \"rg -n \\\"bridge_recursion\\\" . && node \\\"/b/scripts/codex/inbound.mjs\\\"\""),
+    true, "同一条里既有只读命令又有真实执行时，仍按执行判定");
+
+  const benignCommands = [
+    "sed -n '1,220p' scripts/codex/inbound.mjs",
+    "rg -n 'bridge_recursion|m5codex-inbound-router|scripts/codex/inbound.mjs' scripts",
+    "git add scripts/codex/inbound.mjs skills/m5codex-inbound-router/SKILL.md",
+    "/bin/zsh -lc \"git diff -- scripts/codex/inbound.mjs && rg -n 'm5codex-inbound-router' .\"",
+    "node --input-type=module <<'NODE'\nconst marker = 'scripts/codex/inbound.mjs';\nNODE",
+    "node --input-type=module <<'NODE'\nconst fixture = `\nnode /bridge/scripts/codex/inbound.mjs\n`;\nNODE",
+    "node -e \"console.log('scripts/codex/inbound.mjs')\"",
+    // 还原转义后仍不能把只读命令算成执行 —— 补洞不能把误报补回来。
+    "/bin/zsh -lc \"rg -n \\\"scripts/codex/inbound.mjs\\\" scripts\"",
+    "/bin/zsh -lc \"sed -n '1,50p' \\\"/bridge/scripts/codex/inbound.mjs\\\"\"",
+    "/bin/zsh -lc \"echo \\\"node /bridge/scripts/codex/inbound.mjs\\\" > /tmp/note.txt\"",
+    // 引号内的分隔符不开启新命令。按原始文本无差别切分会切出一个看起来像执行的片段，
+    // 而这两条其实各自只是一条 echo / rg。
+    "/bin/zsh -lc \"echo \\\"ignore; node /bridge/scripts/codex/inbound.mjs\\\"\"",
+    "/bin/zsh -lc \"rg -n \\\"x|node /bridge/scripts/codex/inbound.mjs\\\" scripts\"",
+    // POSIX 双引号内 \\' 不是合法转义，不能把它当成干净引号还原掉。
+    "/bin/zsh -lc \"node \\\\'/bridge/scripts/codex/inbound.mjs\\\\'\"",
+  ];
+  for (const command of benignCommands) assert.equal(isCodexInboundExecution(command), false, command);
+
+  const dir = temp();
+  const logPath = path.join(dir, "run.jsonl");
+  const exitPath = path.join(dir, "exit.json");
+  const lastMessagePath = path.join(dir, "last.txt");
+  fs.writeFileSync(logPath, [
+    { type: "thread.started", thread_id: THREAD_A },
+    { type: "turn.started" },
+    ...benignCommands.map((command, index) => ({
+      type: "item.completed",
+      item: { type: "command_execution", command, status: index === 1 ? "failed" : "completed" },
+    })),
+    { type: "turn.completed" },
+  ].map(JSON.stringify).join("\n") + "\n");
+  fs.writeFileSync(exitPath, JSON.stringify({ status: "exited", exit_code: 0 }));
+  fs.writeFileSync(lastMessagePath, "真实任务已完成");
+  const result = readCodexRunOutcome({
+    logPath, exitPath, lastMessagePath, expectedThreadId: THREAD_A,
+  });
+  assert.equal(result.state, "completed");
+  assert.equal(result.finalText, "真实任务已完成");
 });
 
 test("Codex 启动前 Git 预检失败不会误报 thread_mismatch", () => {

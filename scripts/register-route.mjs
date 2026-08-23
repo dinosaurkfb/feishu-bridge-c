@@ -12,15 +12,21 @@
  */
 
 import { isDirectRun } from "./direct-run.mjs";
-import { registerRoute, registerSession, loadRoutes, routesPath } from "./inbound-routes.mjs";
+import { registerRouteBinding, loadRoutes, routesPath } from "./inbound-routes.mjs";
 
 const REASON_TEXT = {
   no_route_id: "缺 --id",
   handler_not_absolute: "--handler 必须是绝对路径",
   handler_missing: "handler 脚本不存在",
   route_id_owned_by_other_handler: "这个 id 已经指向别的脚本",
+  route_disabled: "这个 id 存在但被停用了；重新启用是另一件事，本命令不做",
+  handler_not_a_file: "--handler 不是普通文件",
+  handler_not_readable: "handler 不可读",
   no_session_id: "缺 --session",
   session_owned_by_other_route: "这个话题已经登记给别的路由",
+  routes_busy: "路由表正被别的进程写，稍后重试",
+  routes_table_unreadable: "路由表读不出来 —— 先修表，别覆盖它",
+  routes_table_shape_unexpected: "路由表结构异常 —— 先修表，别覆盖它",
 };
 
 function arg(name) {
@@ -51,6 +57,9 @@ function main() {
   }
 
   const before = loadRoutes(file);
+  if (!before.ok) {
+    fail({ reason: before.reason });
+  }
   const hasRoute = before.routes.some((r) => r.id === id);
   const declared = session ? before.sessions[session] : undefined;
 
@@ -67,20 +76,12 @@ function main() {
     return;
   }
 
-  // 先验话题归属再写路由：否则路由写进去了、话题被拒，留下半截登记。
-  if (declared && declared !== id) {
-    fail({ reason: "session_owned_by_other_route", owner: declared });
-  }
-
-  const r = registerRoute({ id, handler, note, file });
+  // 路由和话题在同一个事务里写。分两次写会留下半截登记：
+  // 路由写进去了、话题被别的进程抢先认领，于是登记被拒。
+  const r = registerRouteBinding({ id, handler, note, sessionId: session ?? null, file });
   if (!r.ok) fail(r);
-  let s = null;
-  if (session) {
-    s = registerSession({ sessionId: session, routeId: id, file });
-    if (!s.ok) fail(s);
-  }
-  console.log("\n已写入。路由 " + (r.changed ? "新增" : "无变化") +
-    (s ? "，话题 " + (s.changed ? "新增" : "无变化") : ""));
+  console.log("\n已写入。路由 " + (r.routeChanged ? "新增" : "无变化") +
+    (session ? "，话题 " + (r.sessionChanged ? "新增" : "无变化") : ""));
   console.log("默认路由未改动 —— 换默认路由是换权威路由，本命令不做。");
 }
 

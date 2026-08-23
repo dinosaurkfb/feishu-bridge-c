@@ -65,7 +65,7 @@ import {
   composeTransportRule, isAilyTransportTurn, isBridgeOwnedTurn,
 } from "./inbound-hook.mjs";
 import {
-  ROUTE_REJECT, loadRoutes, registerRoute, registerSession, selectRoute,
+  ROUTE_REJECT, loadRoutes, registerRoute, registerRouteBinding, registerSession, selectRoute,
 } from "./inbound-routes.mjs";
 import { ENVELOPE_ENV as ENV_PASS, inheritedEvent } from "./envelope.mjs";
 import { CANONICAL_EVENT_ENV } from "./canonical-event.mjs";
@@ -5185,11 +5185,113 @@ test("登记路由：幂等，同 id 换 handler 要拒，且不设 default", ()
   assert.equal(JSON.parse(fs.readFileSync(f, "utf-8")).routes[0].default, undefined);
 });
 
-test("登记路由：handler 必须是存在的绝对路径", () => {
-  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-rr3-")), "routes.json");
+test("登记路由：handler 必须是存在、可读的普通文件", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-rr3-"));
+  const f = path.join(dir, "routes.json");
   assert.equal(registerRoute({ id: "n", handler: "relative.mjs", file: f }).reason, "handler_not_absolute");
   assert.equal(registerRoute({ id: "n", handler: "/nope/nope.mjs", file: f }).reason, "handler_missing");
+  // 目录也能通过 existsSync，但登记出来的路由投不进去。
+  assert.equal(registerRoute({ id: "n", handler: dir, file: f }).reason, "handler_not_a_file");
   assert.equal(fs.existsSync(f), false);
+});
+
+test("路由表损坏时停手：不投递、不覆盖", () => {
+  for (const [content, reason] of [
+    ["{ 坏掉的 json", ROUTE_REJECT.TABLE_UNREADABLE],
+    ["[]", ROUTE_REJECT.TABLE_SHAPE],
+    ['{"routes":"nope"}', ROUTE_REJECT.TABLE_SHAPE],
+    ['{"routes":[],"sessions":[]}', ROUTE_REJECT.TABLE_SHAPE],
+  ]) {
+    const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-bad-")), "routes.json");
+    fs.writeFileSync(f, content);
+    const t = loadRoutes(f);
+    // 读不出来 ≠ 本机没配路由。当成空表会落到默认 handler，那不是降级，是投错。
+    assert.equal(t.ok, false, content);
+    assert.equal(t.reason, reason);
+    // 登记命令也不许把损坏的表当成首次创建覆盖掉。
+    assert.equal(registerRoute({ id: "n", handler: process.execPath, file: f }).reason, reason);
+    assert.equal(fs.readFileSync(f, "utf-8"), content, "坏表不是重建它的理由");
+  }
+});
+
+test("dispatcher 在路由表不可用时停止投递，不落到默认 handler", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-disp-bad-"));
+  const handler = path.join(dir, "handler.mjs");
+  fs.writeFileSync(handler, "// fixture\n");
+  const routesFile = path.join(dir, "routes.json");
+  fs.writeFileSync(routesFile, "{ 坏掉的 json");
+  let spawned = 0;
+  const out = [];
+  const result = runInboundDispatcher({
+    endpointId: "m5codex",
+    expectedCallerAgentUid: "agent_expected",
+    defaultRoute: { id: "codex", handler },
+    routesFile,
+    env: { AILY_CLI_CALLER_AGENT_UID: "agent_expected", AILY_CLI_SESSION_ID: "s" },
+    stdout: { write: (x) => out.push(x) }, stderr: { write: () => {} },
+    fetcher: () => ({ ok: true, attempts: 1, raw_envelope: { type: "message.create" }, event: {
+      message_id: "m-bad", session_id: "s-bad", sender_id: "frank",
+      created_at_ms: NOW, content: "执行",
+    } }),
+    spawnHandler: () => { spawned += 1; return { status: 0 }; },
+  });
+  assert.equal(spawned, 0, "表读不出来时一个 handler 都不该被叫起来");
+  assert.notEqual(result.exitCode, 0);
+  assert.match(out.join(""), /路由表读不出来/u);
+});
+
+test("登记路由：停用的同 id 路由不许报虚假成功", () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-dis-")), "routes.json");
+  fs.writeFileSync(f, JSON.stringify({
+    schema_version: "1.0",
+    routes: [{ id: "n", handler: process.execPath, enabled: false }],
+    sessions: {},
+  }));
+  // loadRoutes 根本不加载它，handler 实际没接通；返回 changed:false 是虚假成功。
+  assert.equal(loadRoutes(f).routes.length, 0);
+  const r = registerRoute({ id: "n", handler: process.execPath, file: f });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "route_disabled");
+  // 重新启用是另一件事，不能由登记命令暗中完成。
+  assert.equal(JSON.parse(fs.readFileSync(f, "utf-8")).routes[0].enabled, false);
+});
+
+test("登记是一个事务：任一边校验不过，两边都不写", () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-tx-")), "routes.json");
+  fs.writeFileSync(f, JSON.stringify({
+    schema_version: "1.0",
+    routes: [{ id: "self", handler: process.execPath, default: true }],
+    sessions: { s_taken: "self" },
+  }));
+  const r = registerRouteBinding({
+    id: "cc2cd", handler: process.execPath, sessionId: "s_taken", file: f,
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "session_owned_by_other_route");
+  const raw = JSON.parse(fs.readFileSync(f, "utf-8"));
+  // 分两次写的话，route 已经写进去了、session 才被拒 —— 留下半截登记。
+  assert.deepEqual(raw.routes.map((x) => x.id), ["self"]);
+  assert.equal(raw.sessions.s_taken, "self");
+
+  // 两边都过才写，且只写一次。
+  const ok = registerRouteBinding({
+    id: "cc2cd", handler: process.execPath, sessionId: "s_free", file: f,
+  });
+  assert.deepEqual(
+    { ok: ok.ok, routeChanged: ok.routeChanged, sessionChanged: ok.sessionChanged },
+    { ok: true, routeChanged: true, sessionChanged: true },
+  );
+});
+
+test("登记要取锁：锁被有效持有者占住时不写", () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lk-")), "routes.json");
+  fs.mkdirSync(f + ".lock", { recursive: true });
+  fs.writeFileSync(path.join(f + ".lock", "owner.json"),
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  const r = registerRoute({ id: "n", handler: process.execPath, file: f });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "routes_busy");
+  assert.equal(fs.existsSync(f), false, "没拿到锁就不该建表");
 });
 
 // ---------- 信封只取一次，往下传 ----------

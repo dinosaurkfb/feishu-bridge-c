@@ -84,7 +84,12 @@ function main() {
   const me = identifySelf();
   const self = me.ok ? me.sessionId : null;
 
-  const st = currentBinding({ root });
+  // **把已验证的会话传进去。**上一版只传 root，于是：
+  //   · 只有会话级绑定时被误报成 not_bound；
+  //   · 项目级与会话级并存时错选了项目级；
+  //   · st.level === "session" 那条分支对当前会话根本不可达。
+  // 选绑定的规则必须跟出站一致 —— 按另一套规则找，就会出现"这里说 A、实际发到 B"。
+  const st = currentBinding({ root, claudeSessionId: me.ok ? me.sessionId : undefined });
   if (!st.ok) {
     console.error("这个项目还没接入飞书（" + st.reason + "），没有可钉的投递目标。");
     process.exit(1);

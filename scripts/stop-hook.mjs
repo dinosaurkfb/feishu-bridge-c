@@ -222,7 +222,16 @@ async function main() {
       continue;
     }
 
-    const r = drainProject({ root: project.root, claudeSessionId: speakingSession, timeoutMs: PUBLISH_TIMEOUT_MS });
+    // **必须传 boundSession，不能传 speakingSession。**
+    //
+    // 上面第一段注释已经写明"outbox 目录必须跟着绑定走"，outboxDir 也照做了；但这里
+    // 一度还在传说话的会话，而 drainProject 会拿它**重算一遍目录**。项目级绑定时
+    // boundSession 是 null、说话会话是一个 uuid，于是写进 outbox/、却去读
+    // outbox-<uuid>/ —— 每一轮都稳定报 empty，进展只能等 30 分钟的兜底定时器。
+    // 日志里那对相邻的 "reply queued (N 字符)" 与 "-> {status:empty}" 就是它。
+    const r = drainProject({
+      root: project.root, claudeSessionId: boundSession, timeoutMs: PUBLISH_TIMEOUT_MS,
+    });
     log(project.id + " via=" + project.via.join("+") + " -> " + JSON.stringify(r));
 
     if (r.status === "published") {

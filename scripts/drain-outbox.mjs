@@ -192,7 +192,7 @@ if (import.meta.url === "file://" + process.argv[1]) {
 
   // --all 是兜底定时器该走的路径：登记表里的项目都排空一遍。
   // 只排本仓库会让后接进来的项目在钩子没跑到时永远没有兜底。
-  let roots;
+  let targets;
   if (process.argv.includes("--all")) {
     const { loadRegistry } = await import("./registry.mjs");
     const reg = loadRegistry();
@@ -200,16 +200,34 @@ if (import.meta.url === "file://" + process.argv[1]) {
       console.error("登记表读不了（" + reg.reason + "）：" + (reg.error ?? ""));
       process.exit(1);
     }
-    roots = reg.projects.map((p) => p.root);
-    if (roots.length === 0 && verbose) console.log("登记表里没有项目");
+    // 按**绑定**枚举，不是按项目根目录。
+    //
+    // 会话级绑定的 outbox 是 `outbox-<uuid>/`；原来只 map(p.root) 再不带会话地排空，
+    // 等于永远只看项目级那一个目录。对会话级绑定来说这不是「延迟」而是「永远发不出去」——
+    // 即时发布一旦失败，兜底根本找不到那批进展。同一 root 上项目级与会话级绑定可以并存，
+    // 所以这里按 (root, session) 去重，不能按 root 去重。
+    const seen = new Set();
+    targets = [];
+    for (const project of reg.projects) {
+      if (typeof project?.root !== "string" || !project.root) continue;
+      const claudeSessionId = project.claude_session_id ?? null;
+      const key = project.root + "\u0000" + (claudeSessionId ?? "");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      targets.push({ root: project.root, claudeSessionId });
+    }
+    if (targets.length === 0 && verbose) console.log("登记表里没有项目");
   } else {
-    roots = [arg("project") ?? SELF_ROOT];
+    targets = [{ root: arg("project") ?? SELF_ROOT, claudeSessionId: arg("session") ?? null }];
   }
 
   let hadError = false;
-  for (const root of roots) {
-    const tag = roots.length > 1 ? path.basename(root) + ": " : "";
-    const r = drainProject({ root, dryRun });
+  for (const { root, claudeSessionId } of targets) {
+    const tag = targets.length > 1
+      ? path.basename(root) +
+        (claudeSessionId ? "/" + String(claudeSessionId).slice(0, 8) : "") + ": "
+      : "";
+    const r = drainProject({ root, claudeSessionId, dryRun });
 
     if (r.status === "published") {
       console.log(tag + "已发布 " + r.count + " 条 -> " + r.messageId);

@@ -239,6 +239,11 @@ async function main() {
       notes.push("飞书出站：" + project.id + " 已发布 " + r.count + " 条进展。");
     } else if (r.status === "error") {
       notes.push("飞书出站：" + project.id + " 发布失败（" + r.reason + "），进展留在 outbox，兜底定时器会重试。");
+    } else if (r.status === "skipped" && r.reason === "auto_publish_disabled") {
+      // 这条必须说出来：按设置没发和发失败，下一步完全不同，
+      // 而沉默会让人以为发出去了。
+      notes.push("飞书出站：" + project.id + " 按设置未发布（自动发布已关），" +
+        r.count + " 条留在 outbox。");
     } else if (r.status === "skipped" && r.reason === "mapping_not_active") {
       // 这条必须说出来：绑定失效时进展会无限期堆在本地，而 Frank 什么都收不到。
       notes.push("飞书出站：" + project.id + " 的话题绑定已失效，" + r.count + " 条进展发不出去，需要重签绑定。");

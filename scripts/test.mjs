@@ -65,7 +65,7 @@ import {
   composeTransportRule, isAilyTransportTurn, isBridgeOwnedTurn,
 } from "./inbound-hook.mjs";
 import {
-  ROUTE_REJECT, loadRoutes, registerSession, selectRoute,
+  ROUTE_REJECT, loadRoutes, registerRoute, registerSession, selectRoute,
 } from "./inbound-routes.mjs";
 import { ENVELOPE_ENV as ENV_PASS, inheritedEvent } from "./envelope.mjs";
 import { CANONICAL_EVENT_ENV } from "./canonical-event.mjs";
@@ -5154,6 +5154,42 @@ test("登记话题：幂等，且不许把别人的话题抢过来", () => {
   assert.equal(stolen.owner, "cc2cd");
   // 静默改写会让「上一条进了 A、这一条进了 B」，那是最难查的一类
   assert.equal(loadRoutes(f).sessions.s1, "cc2cd");
+});
+
+test("登记路由：保住未知顶层字段与 enabled:false 的路由", () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-rr-")), "routes.json");
+  fs.writeFileSync(f, JSON.stringify({
+    schema_version: "1.0",
+    custom_marker: "KEEP_ME",
+    routes: [{ id: "off", handler: process.execPath, enabled: false }],
+    sessions: {},
+  }));
+  assert.equal(registerRoute({ id: "n", handler: process.execPath, file: f }).changed, true);
+  const raw = JSON.parse(fs.readFileSync(f, "utf-8"));
+  // 读取会过滤 enabled:false，重建则丢未知字段 —— 拿视图整体写回等于静默删数据
+  assert.equal(raw.custom_marker, "KEEP_ME");
+  assert.deepEqual(raw.routes.map((r) => r.id), ["off", "n"]);
+  assert.equal(raw.routes.find((r) => r.id === "off").enabled, false);
+});
+
+test("登记路由：幂等，同 id 换 handler 要拒，且不设 default", () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-rr2-")), "routes.json");
+  assert.equal(registerRoute({ id: "n", handler: process.execPath, file: f }).changed, true);
+  assert.equal(registerRoute({ id: "n", handler: process.execPath, file: f }).changed, false);
+  const repoint = registerRoute({ id: "n", handler: "/bin/ls", file: f });
+  assert.equal(repoint.ok, false);
+  assert.equal(repoint.reason, "route_id_owned_by_other_handler");
+  assert.equal(repoint.owner, process.execPath);
+  assert.equal(JSON.parse(fs.readFileSync(f, "utf-8")).routes[0].handler, process.execPath);
+  // 换默认路由是换权威路由，登记命令不做
+  assert.equal(JSON.parse(fs.readFileSync(f, "utf-8")).routes[0].default, undefined);
+});
+
+test("登记路由：handler 必须是存在的绝对路径", () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-rr3-")), "routes.json");
+  assert.equal(registerRoute({ id: "n", handler: "relative.mjs", file: f }).reason, "handler_not_absolute");
+  assert.equal(registerRoute({ id: "n", handler: "/nope/nope.mjs", file: f }).reason, "handler_missing");
+  assert.equal(fs.existsSync(f), false);
 });
 
 // ---------- 信封只取一次，往下传 ----------

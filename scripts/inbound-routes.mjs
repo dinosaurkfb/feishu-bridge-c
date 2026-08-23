@@ -115,9 +115,48 @@ export function registerSession({ sessionId, routeId, file = routesPath() }) {
   }
 
   doc.sessions[sessionId] = routeId;
+  writeRoutesDoc(doc, file);
+  return { ok: true, changed: true };
+}
+
+/**
+ * 登记一条路由。消费者接入本机时调它。
+ *
+ * **只改目标字段，不重建文档。**读进来的表原样保留，只往 `routes` 里加一项 ——
+ * 因为「读出来的视图」和「文件里的内容」不是一回事：读取会过滤掉 enabled:false
+ * 的项，重建则会丢掉本函数不认识的顶层字段。拿视图整体写回等于静默删数据。
+ *
+ * 幂等：同 id 同 handler 就什么都不做。同 id **换 handler** 会被拒 ——
+ * 那是把别人的话题悄悄改判给另一个脚本，跟 registerSession 拒绝改判是同一条理由。
+ *
+ * 刻意**不支持**设 default。默认路由是权威路由，换它要 Frank 逐次授权。
+ */
+export function registerRoute({ id, handler, note = null, file = routesPath() }) {
+  if (typeof id !== "string" || !id) return { ok: false, reason: "no_route_id" };
+  if (typeof handler !== "string" || !path.isAbsolute(handler)) {
+    return { ok: false, reason: "handler_not_absolute" };
+  }
+  if (!fs.existsSync(handler)) return { ok: false, reason: "handler_missing", handler };
+
+  let doc = { schema_version: "1.0", routes: [], sessions: {} };
+  try { doc = JSON.parse(fs.readFileSync(file, "utf-8")); } catch { /* 首次：用空表 */ }
+  if (!Array.isArray(doc.routes)) doc.routes = [];
+
+  const existing = doc.routes.find((r) => r && r.id === id);
+  if (existing) {
+    if (existing.handler === handler) return { ok: true, changed: false, id };
+    return { ok: false, reason: "route_id_owned_by_other_handler", owner: existing.handler };
+  }
+
+  doc.routes.push(note ? { id, handler, note } : { id, handler });
+  writeRoutesDoc(doc, file);
+  return { ok: true, changed: true, id };
+}
+
+/** 原子写。写到一半被打断会让整张表截断 —— 那不只是某条路由坏了，是入站全挂。 */
+function writeRoutesDoc(doc, file) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const tmp = file + ".tmp." + process.pid;
   fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
   fs.renameSync(tmp, file);
-  return { ok: true, changed: true };
 }

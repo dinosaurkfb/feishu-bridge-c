@@ -109,21 +109,42 @@ const INBOUND_HOOK_COMMAND =
  * 所以：新装的命令里埋一个**与路径无关的显式标记**，认它；同时对历史遗留的命令按
  * 安装器**当初生成的确切形态**严格解析（不是子串包含），只为迁移那一次。
  */
-/** 安装器历史上生成过的命令形态。严格到整条命令的开头，不给"碰巧提到这个路径"留空间。 */
-const LEGACY_HOOK_SHAPES = {
-  "stop-hook.mjs":
-    /^if \[ -x '[^']+' \] && \[ -r '[^']*\/scripts\/stop-hook\.mjs' \]; then /u,
-  "init-hook.mjs":
-    /^if \[ -x '[^']+' \] && \[ -r '[^']*\/scripts\/init-hook\.mjs' \]; then /u,
-  "inbound-hook.mjs":
-    /^if \[ -x '[^']+' \] && \[ -r '[^']*\/scripts\/inbound-hook\.mjs' \]; then /u,
+/**
+ * 历史遗留命令的严格识别。
+ *
+ * 只锚定开头 + 出现过某个脚本名是不够的：别的工具用同样的 guard 写法、同样的文件名，
+ * 一样会被我们认领然后删掉。所以这里把安装器**当初生成的完整模板**拆开验：
+ * guard 检查的 node 与脚本，必须和实际执行的 node 与脚本逐字相同；尾部也必须是
+ * 当初那两种形态之一。任何一处对不上就不是我们的，不碰。
+ */
+const escapeRe = (text) => text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+
+const LEGACY_BODY =
+  /^if \[ -x '([^']+)' \] && \[ -r '([^']+)' \]; then '([^']+)' '([^']+)'; else \{ command -p cat 2>\/dev\/null \|\| cat; \} >\/dev\/null 2>&1(.*)$/u;
+
+const legacyOwns = (command, basename) => {
+  const m = LEGACY_BODY.exec(command);
+  if (!m) return false;
+  const [, guardNode, guardScript, runNode, runScript, tail] = m;
+  // guard 与实际执行必须是同一个 node、同一个脚本 —— 这是安装器生成物的固有性质，
+  // 手写或别的工具生成的命令极少恰好满足。
+  if (guardNode !== runNode || guardScript !== runScript) return false;
+  if (!guardScript.endsWith("/scripts/" + basename)) return false;
+  if (basename === "stop-hook.mjs") {
+    return new RegExp("^; printf '%s hook-unavailable node=" + escapeRe(guardNode) +
+      "\\\\n' \"\\$\\(date -u \\+%Y-%m-%dT%H:%M:%SZ\\)\" >> '[^']*' 2>\\/dev\\/null \\|\\| :; fi$", "u")
+      .test(tail);
+  }
+  return /^ \|\| :; fi$/u.test(tail);
 };
 
 const ownsHook = (hook, basename) => {
   const command = hook?.command;
   if (typeof command !== "string") return false;
-  if (command.includes(HOOK_TAG + basename)) return true;
-  return LEGACY_HOOK_SHAPES[basename]?.test(command) ?? false;
+  // 新装认**固定的尾部注释**，不是任意位置的 includes —— 后者会把一条只是提到这个
+  // 字符串的命令（比如别人写的清理脚本）也认成自己的。
+  if (command.endsWith(" # " + HOOK_TAG + basename)) return true;
+  return legacyOwns(command, basename);
 };
 
 const countHooks = (list, basename) => (list ?? [])

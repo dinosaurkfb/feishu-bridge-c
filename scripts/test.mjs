@@ -9,6 +9,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -4528,6 +4529,38 @@ test("运行时安装是事务：相同版本 no-op，同一 entry 里别人的�
   const verified = verifyRuntime({ home });
   assert.equal(verified.ok, true);
   assert.equal(verified.version, plan.version);
+});
+
+test("入站技能安装幂等：连续两次 apply 之后自检一致、不再报 update", () => {
+  // 上一版只在写入那一步渲染 {{BRIDGE_ROOT}}，比较和自检仍拿未渲染源码去比 ——
+  // 装对了也会永远报 update，自检还会说"写入后内容不一致"。渲染类安装器最容易在这里
+  // 裂成两套真相，所以要求计划、写入、自检共用同一个 expectedContent。
+  const src = fs.readFileSync(path.resolve("scripts", "install-inbound.mjs"), "utf-8");
+  assert.match(src, /const expectedContent = /u);
+  assert.doesNotMatch(src,
+    /fs\.readFileSync\(path\.join\(SRC, f\), "utf-8"\) === fs\.readFileSync\(path\.join\(DST, f\)/u,
+    "自检不能拿未渲染的源码去比对已渲染的产物");
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "inbound-skill-"));
+  const run = (extra) => execFileSync(process.execPath,
+    [path.resolve("scripts", "install-inbound.mjs"), "--dir", dir, ...extra],
+    { encoding: "utf-8" });
+  run(["--apply"]);
+  const second = run(["--apply"]);
+  assert.doesNotMatch(second, /✗/u, "第二次安装的自检不能出现任何不一致");
+  assert.match(second, /✓ SKILL\.md/u);
+  assert.doesNotMatch(run([]), /^\s+(install|update)\s/mu,
+    "装好之后再看计划，不应还有文件改动");
+});
+
+test("钩子归属：guard 与实际执行不一致、或别的工具同名脚本，都不认领", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  // 新标记必须锚在固定尾部，不能是任意位置的 includes —— 否则一条只是提到该字符串的
+  // 命令（比如别人写的清理脚本）也会被认成自己的然后删掉。
+  assert.match(src, /command\.endsWith\(" # " \+ HOOK_TAG \+ basename\)/u);
+  // 历史遗留必须按完整模板认，并且用捕获组确认 guard 与执行的是同一个 node、同一个脚本。
+  assert.match(src, /guardNode !== runNode \|\| guardScript !== runScript/u);
+  assert.doesNotMatch(src, /LEGACY_HOOK_SHAPES/u, "只锚定开头的宽松形态已废弃");
 });
 
 test("入站钩子从自身定位分发器，不再经 bridge_root 落回开发克隆", () => {

@@ -40,6 +40,17 @@ const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..")
  */
 const RUNTIME_BRIDGE_ROOT = path.dirname(path.dirname(runtimeScript("aily-inbound.mjs")));
 const renderSkill = (text) => text.replaceAll("{{BRIDGE_ROOT}}", RUNTIME_BRIDGE_ROOT);
+
+/**
+ * 将要装进去的那份文本 —— **计划、写入、装完自检必须共用它**。
+ *
+ * 上一版只在写入那一步渲染，比较和自检仍拿未渲染的源码去比：装对了也会永远报 update，
+ * 自检还会说"写入后内容不一致"。渲染类安装器最容易在这里裂成两套真相，所以只留一个出口。
+ */
+const expectedContent = (f) =>
+  f === "SKILL.md"
+    ? renderSkill(fs.readFileSync(path.join(SRC, f), "utf-8"))
+    : fs.readFileSync(path.join(SRC, f), "utf-8");
 const SKILL_NAME = "m5claude-inbound-router";
 const SRC = path.join(ROOT, "skills", SKILL_NAME);
 const DEFAULT_SKILLS_ROOT = path.join(os.homedir(), ".claude", "skills");
@@ -90,7 +101,7 @@ if (manifest) {
  * 校验对象必须是**将要装进去的那份文本**，不是源码 —— 否则校验的和运行的不是同一件东西。
  */
 if (problems.length === 0) {
-  const body = renderSkill(fs.readFileSync(path.join(SRC, "SKILL.md"), "utf-8"));
+  const body = expectedContent("SKILL.md");
   if (body.includes("{{BRIDGE_ROOT}}")) problems.push("SKILL.md 里还有没渲染的占位符");
   const referenced = [...body.matchAll(/(\/[\w./-]*\/scripts\/[\w.-]+\.mjs)/g)].map((m) => m[1]);
   for (const p of new Set(referenced)) {
@@ -131,7 +142,7 @@ for (const f of files) {
   }
   let cur = null;
   try { cur = fs.readFileSync(dstFile, "utf-8"); } catch { /* 还没装 */ }
-  const src = fs.readFileSync(path.join(SRC, f), "utf-8");
+  const src = expectedContent(f);
   if (cur === null) changes.push([f, "install"]);
   else if (cur !== src) changes.push([f, "update"]);
 }
@@ -164,22 +175,14 @@ if (uninstall) {
 }
 
 fs.mkdirSync(DST, { recursive: true });
-for (const f of files) {
-  // SKILL.md 要渲染，manifest 原样拷 —— 后者不含路径占位符。
-  if (f === "SKILL.md") {
-    fs.writeFileSync(path.join(DST, f),
-      renderSkill(fs.readFileSync(path.join(SRC, f), "utf-8")), { mode: 0o600 });
-  } else {
-    fs.copyFileSync(path.join(SRC, f), path.join(DST, f));
-  }
-}
+for (const f of files) fs.writeFileSync(path.join(DST, f), expectedContent(f), { mode: 0o600 });
 
 // ---------- 装完自检 ----------
 
 console.log("\n已写入。自检：");
 for (const f of files) {
-  const same = fs.readFileSync(path.join(SRC, f), "utf-8") === fs.readFileSync(path.join(DST, f), "utf-8");
-  console.log("  " + (same ? "✓" : "✗") + " " + f + (same ? " 与仓库一致" : " 写入后内容不一致"));
+  const same = expectedContent(f) === fs.readFileSync(path.join(DST, f), "utf-8");
+  console.log("  " + (same ? "✓" : "✗") + " " + f + (same ? " 与预期一致" : " 写入后内容不一致"));
 }
 console.log("  ✓ 目标是真实目录（不是软链）");
 

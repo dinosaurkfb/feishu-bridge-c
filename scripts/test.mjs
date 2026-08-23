@@ -7701,6 +7701,57 @@ test("状态取不到的链路不会被当成「没有连接」而消失", () =>
   assert.deepEqual(Object.values(split.byLayer).map((x) => x.length), [0, 0, 0]);
 });
 
+test("完整链路：真实 provider 声明关系层，最终真的进第 2 层", () => {
+  // 上一版协议支持了 relation_type，**真实 provider 却产不出它** —— 于是文档说的
+  // "用 --relations subscription 重新登记就能进第 2 层"根本不成立：
+  // 登记只授予能力，provider 自己不声明，最终仍进附录。
+  // 所以这条从头走到尾，不用手工构造的 report。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-chain-"));
+  const providersFile = path.join(dir, "providers.json");
+  const bindingFile = path.join(dir, "binding.json");
+  fs.writeFileSync(bindingFile, JSON.stringify({
+    bind_scope: "chat", status: "active", chat_id: "oc_SECRET123456",
+    chat_name: "Claude2Codex", expires_at: "2099-01-01T00:00:00.000Z",
+  }));
+
+  const register = (extra) => spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"),
+    "--id", "cc2cd", "--script", path.resolve("scripts", "group-binding-status.mjs"),
+    "--kinds", "transport", "--project-root", dir, ...extra, "--apply",
+    "--", "--provider-id", "cc2cd", "--binding", bindingFile, ...(extra.length ? ["--relation", "subscription"] : []),
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: providersFile } });
+
+  // 先看没声明关系层时：连接取得到，但归不了层。
+  assert.equal(register([]).status, 0);
+  const plain = collectProjectConnectivity({ root: dir, providersFile });
+  assert.equal(plain.sections[0].state, "ok", plain.sections[0].reason ?? "");
+  assert.equal(plain.sections[0].connections[0].relation, null);
+  assert.equal(splitByRelation(plain.sections).byLayer.subscription.length, 0);
+
+  // 再声明关系层重新登记 —— 走真实登记命令与真实 provider。
+  fs.rmSync(providersFile);
+  assert.equal(register(["--relations", "subscription"]).status, 0);
+  const declared = collectProjectConnectivity({ root: dir, providersFile });
+  assert.equal(declared.sections[0].state, "ok", declared.sections[0].reason ?? "");
+  assert.equal(declared.sections[0].connections[0].relation, "subscription",
+    "真实 provider 必须真的产出 relation_type");
+
+  const split = splitByRelation(declared.sections);
+  assert.equal(split.byLayer.subscription.length, 1);
+  assert.equal(split.unsorted.length, 0, "归了层就不该再留在附录里重复一遍");
+
+  const endpoint = { runtime: "Claude Code", agentName: null, install: "ok", installReason: null,
+    version: "abc", selfCheck: ENDPOINT_SELF_CHECK, lastInboundAt: null };
+  const text = renderLayeredStatus(composeLayeredStatus({
+    st: layeredSt(), endpoint, subscription: { ok: true, items: [], pendingCount: 0 },
+    otherLinks: declared,
+  }));
+  const layer2 = text.slice(text.indexOf("第 2 层"), text.indexOf("第 3 层"));
+  assert.match(layer2, /Claude2Codex/u, "最终要真的出现在第 2 层");
+  // 全程不许漏 locator。
+  assert.equal(text.includes("oc_SECRET123456"), false);
+});
+
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (failed > 0) {

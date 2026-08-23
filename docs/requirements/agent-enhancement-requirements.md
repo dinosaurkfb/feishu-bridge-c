@@ -297,10 +297,11 @@ Relay 必须显式使用新的 policy version；其预算分别统计 human cycl
 | 精确话题—会话绑定 | 稳定 binding 与 Topic Generation 兼容投影已进入 `main`，Claude/Codex 保留各自 runtime locator | 继续统一生命周期与对外状态语义 |
 | 映射模式 | Mapping Policy Handler 已由 PR #7 合并并安装；旧 selector 仍唯一承重，新候选只做 shadow comparison | 真实样本一致后再灰度切换权威读取路径 |
 | 话题轮转 | Topic Generation 生命周期与显式 rotate 命令已由 PR #8 合并并安装；Codex 第 2 代话题的创建、真实 mention 认领与 binding 切换已完成首次真实验收；自动轮转 v1 已合并 `main`，按每代际 30 条有效业务消息创建 pending，新代际仍需真实 mention，但正式安装与真实自动触发验收后置 | 单独安装并验收自动创建、失败重试与不重复轮转，再评估多订阅 |
-| 对话模式 | Dialogue v1 已由 PR #11 合并 `main` 并完成 Codex 真实 3 回合验收；Slice A/B1 已由 PR #14/#15 合并 `main`，默认关闭且未安装；Slice B2a 正在增加不提升 trust 的脱敏 chat scope probe | 先用真实样本验证 Aily locator；多订阅权威路由必须等自动轮转 v1、可信 chat scope、授权快照同步和真实 shadow 一致性完成验收后再灰度切流，最后才开启固定串行 Agent Relay |
+| 对话模式 | Dialogue v1 已由 PR #11 合并 `main`，并在 Codex 精确 task 上完成真实 3 回合验收 —— **Claude 侧两条终局路径（后台 watcher、活跃会话 Stop 收口）仍只有合成证据**；Slice A/B1（PR #14/#15）、B2a chat scope probe、B2b shadow readiness audit（PR #17）、B2c chat scope attestation（PR #19）均已合并 `main`，默认关闭且未安装。B2b 有只读 CLI `dialogue-shadow-audit.mjs`；B2c 目前**没有任何调用方**，`attested_candidate` 只存在于单测 | 先补 Claude 侧真实验收；再用真实样本验证 Aily locator。多订阅权威路由必须等自动轮转 v1、可信 chat scope、授权快照同步和真实 shadow 一致性全部完成验收后再灰度切流，最后才开启固定串行 Agent Relay |
 | 项目推进/专家/带教 | 原型仅在未合并的 `feat/agent-supervisor-shadow-mvp` 实验分支，`main` 不含相关实现 | 纳入管理策略和分级权限 |
 | 多人授权 | 未实现 | 身份授权矩阵与审计归属 |
 | 显式控制面 | bind/status/unbind/rotate/mode 均已作为显式命令安装；无参 mode 只读，只有整条输入中的 `dialogue` / `mapping` 才写状态，真实验收已验证异常格式不触发 | 后续模式继续沿用结构化 intent 与逐次授权 |
+| 运行时安装 | 2026-08-23 由 PR #21–#24 收敛：Claude 侧的钩子、技能、预览放行与 launchd 全部指向 `~/.claude/feishu-bridge/runtime/current`（内容寻址、不可变版本 + 原子符号链接切换），不再指向任何开发克隆；此前本机存在两份钩子分别指向两个可能停在不同提交的克隆。**Codex 侧仍是克隆绑定** | Codex 侧做对等迁移；安装器与项目登记解耦（现在安装会把执行安装的克隆自动写进 registry） |
 
 ## 10. 验收标准
 

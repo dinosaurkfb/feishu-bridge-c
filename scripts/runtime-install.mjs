@@ -200,16 +200,13 @@ export function applyRuntimeSync(plan, { home = os.homedir() } = {}) {
       return { ok: true, version: plan.version, versionDir, noop: true };
     }
 
-    // 版本目录内容寻址、不可变。"存在但校验不过"只能整体换掉，不能原地补写；
-    // 而 rename 覆盖不了非空目录，所以先把坏的隔离出去再说。
+    // 版本目录内容寻址、不可变。"存在但校验不过"只能整体换掉，不能原地补写。
+    //
+    // **顺序是关键**：先把 staging 建好并验通过，再去动线上那个目录。
+    // 反过来（先隔离坏目录、再建 staging）的话，一旦 staging 中途失败 —— 比如
+    // plan 之后源码被改了 —— 坏目录已经被挪走，而 current 还指着它，于是 current 悬空，
+    // 出站入站一起静默停摆。现在最坏情况是"什么都没换成"，线上仍跑着原来那份。
     if (!verifyVersionDir(versionDir, plan.files).ok) {
-      if (fs.existsSync(versionDir)) {
-        const quarantine = path.join(root, "versions",
-          ".corrupt-" + plan.version + "." + Date.now());
-        try { fs.renameSync(versionDir, quarantine); }
-        catch { return { ok: false, reason: "corrupt_version_dir_stuck", version: plan.version }; }
-      }
-
       const staging = path.join(root, "versions", ".staging-" + plan.version + "." + process.pid);
       fs.rmSync(staging, { recursive: true, force: true });
       for (const file of plan.files) {
@@ -219,7 +216,7 @@ export function applyRuntimeSync(plan, { home = os.homedir() } = {}) {
         if (sha256(content) !== file.sha256) {
           fs.rmSync(staging, { recursive: true, force: true });
           // 计划到落盘之间源码变了（切了分支、跑了 git checkout）。宁可整次失败，
-          // 也不要装一份"清单与内容不符"的运行时。
+          // 也不要装一份"清单与内容不符"的运行时 —— 此刻还没碰过线上任何东西。
           return { ok: false, reason: "source_changed_during_apply", file: file.path };
         }
         writeAtomic(dest, content);
@@ -237,14 +234,30 @@ export function applyRuntimeSync(plan, { home = os.homedir() } = {}) {
       const staged = verifyVersionDir(staging, plan.files, { checkDirName: false });
       if (!staged.ok) {
         fs.rmSync(staging, { recursive: true, force: true });
-        return { ok: false, reason: "staging_verify_failed", detail: staged };
+        return { ok: false, reason: "staging_verify_failed", detail: staged.reason };
+      }
+
+      // staging 就绪，现在才动线上那个目录。rename 覆盖不了非空目录，所以先挪开。
+      let quarantine = null;
+      if (fs.existsSync(versionDir)) {
+        quarantine = path.join(root, "versions", ".corrupt-" + plan.version + "." + Date.now());
+        try { fs.renameSync(versionDir, quarantine); }
+        catch {
+          fs.rmSync(staging, { recursive: true, force: true });
+          return { ok: false, reason: "corrupt_version_dir_stuck", version: plan.version };
+        }
       }
       try {
         fs.renameSync(staging, versionDir);
       } catch {
-        // 竞态：另一个安装刚把同一个版本改名过去了。内容寻址，那份和我们这份一样，
-        // 下面那道闸会替我们确认这件事。
+        // 换上失败：必须把隔离的那份**放回原位**，否则 current 指向的目录就没了。
         fs.rmSync(staging, { recursive: true, force: true });
+        if (quarantine) { try { fs.renameSync(quarantine, versionDir); } catch { /* 见下面那道闸 */ } }
+        // 也可能是竞态：另一个安装刚把同版本目录改名过去了。内容寻址，那份和我们这份一样，
+        // 下面那道闸会替我们确认。确认不了就整次失败，不碰 current。
+        if (!verifyVersionDir(versionDir, plan.files).ok) {
+          return { ok: false, reason: "version_dir_swap_failed", version: plan.version };
+        }
       }
     }
 

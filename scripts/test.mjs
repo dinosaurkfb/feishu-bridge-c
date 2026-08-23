@@ -4647,7 +4647,28 @@ test("运行时安装的三种故障：坏版本、提交后写指针失败、�
     { path: "scripts/a.mjs", sha256: "b".repeat(64) },
   ]), null, "顺序不规范也不可信");
 
-  // ③ 提交前三方一致：版本目录里的清单版本、目录名、计划版本必须逐字相同。
+  // ③ 活动版本已损坏 + plan 之后源码又变了：apply 必须失败，而**原目录仍在、
+  //    current 不悬空**。先隔离坏目录再建 staging 的写法会在这里把 current 指空，
+  //    出站入站一起静默停摆。
+  const home3 = fs.mkdtempSync(path.join(os.tmpdir(), "rt-swap-"));
+  const src3 = fs.mkdtempSync(path.join(os.tmpdir(), "rt-swap-src-"));
+  fs.mkdirSync(path.join(src3, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(src3, "scripts", "a.mjs"), "export const a = 1;\n");
+  const p3 = planRuntimeSync({ sourceRoot: src3, home: home3 });
+  assert.equal(applyRuntimeSync(p3, { home: home3 }).ok, true);
+  const live = path.join(runtimeRoot(home3), "versions", p3.version);
+
+  fs.writeFileSync(path.join(live, "scripts", "a.mjs"), "export const a = 'corrupt';\n");
+  const replan = planRuntimeSync({ sourceRoot: src3, home: home3 });
+  fs.writeFileSync(path.join(src3, "scripts", "a.mjs"), "export const a = 'moved on';\n");
+  const failed = applyRuntimeSync(replan, { home: home3 });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.reason, "source_changed_during_apply");
+  assert.equal(fs.existsSync(live), true, "失败之后原版本目录必须还在");
+  assert.equal(fs.existsSync(path.join(runtimeRoot(home3), "current", "scripts", "a.mjs")), true,
+    "current 不得悬空 —— 悬空等于出站入站一起静默停摆");
+
+    // ③ 提交前三方一致：版本目录里的清单版本、目录名、计划版本必须逐字相同。
   const installer = fs.readFileSync(path.resolve("scripts", "runtime-install.mjs"), "utf-8");
   assert.match(installer, /ready\.manifest\?\.version !== plan\.version/u);
   assert.match(installer, /path\.basename\(versionDir\) !== plan\.version/u);

@@ -236,9 +236,15 @@ export function suppressRecords(records, { reason }) {
   const failed = [];
   for (const rec of records) {
     const file = rec._file;
-    if (typeof file !== "string") continue;
+    if (typeof file !== "string") { failed.push({ file: null, reason: "no_file_ref" }); continue; }
     let current;
-    try { current = JSON.parse(fs.readFileSync(file, "utf-8")); } catch { continue; }
+    try { current = JSON.parse(fs.readFileSync(file, "utf-8")); } catch {
+      // **不可逆操作不能静默漏项。**读不出来就是没停成，必须进 failed ——
+      // 否则调用方会以为整批都停了，而漏掉的那条继续每 30 分钟重试。
+      failed.push({ file, reason: "unreadable" });
+      continue;
+    }
+    // 已发出/已抑制不算漏项：目标状态已经达到。
     if (current.published_at !== null || current.publish_suppressed_at) continue;
     const next = {
       ...current,

@@ -27,9 +27,10 @@ import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
 import { listPending, suppressRecords } from "./outbox.mjs";
 import { outboxDirOf } from "./drain-outbox.mjs";
+import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 
 const FLAGS = new Set(["apply"]);
-const OPTIONS = new Set(["project", "session", "reason"]);
+const OPTIONS = new Set(["project", "session", "reason", "generation"]);
 
 /** 严格白名单：拼错的参数不许被执行成另一种操作。 */
 function parseArgs(tokens) {
@@ -63,22 +64,57 @@ function main() {
   const root = path.resolve(parsed.seen.get("project") ?? process.cwd());
   const session = parsed.seen.get("session") ?? null;
   const reason = parsed.seen.get("reason") ?? "manual_suppress";
+  const generation = parsed.seen.get("generation") ?? null;
 
   const outboxDir = outboxDirOf(root, session);
-  const pending = listPending({ outboxDir });
+  // **默认只停某一个代际。**诊断是针对某个话题代际给出的，而 outbox 里可能同时
+  // 躺着别的代际的待发内容 —— 一刀切会把不相干的一起永久停掉。
+  // 不给 --generation 就要求显式确认范围是"全部"。
+  const all = listPending({ outboxDir });
+  const pending = generation === null
+    ? all
+    : all.filter((r) => r.target_channel_generation_id === generation);
 
   console.log("项目      " + root);
-  console.log("待发      " + pending.length + " 条");
+  console.log("范围      " + (generation === null
+    ? "**整个 outbox**（未指定 --generation）" : "代际 " + generation.slice(0, 12) + "…"));
+  console.log("待发      " + pending.length + " 条" +
+    (generation === null ? "" : "（本代际）／全部 " + all.length + " 条"));
   console.log("理由      " + reason);
 
   if (pending.length === 0) { console.log("\n没有待发内容，无需改动。"); return; }
+  if (generation === null && all.length > 1) {
+    console.log("\n注意：outbox 里有多条待发，可能分属不同代际。");
+    console.log("要只停某一代，加 --generation <代际 id>。");
+  }
 
   console.log("\n**这是不可逆的**：被停下的这些内容不会再发出去，");
   console.log("也**不会**因为重新绑定或轮转话题而自动回来。");
 
   if (!apply) { console.log("\n[dry-run] 什么都没写。加 --apply 才生效。"); return; }
 
-  const done = suppressRecords(pending, { reason });
+  // **取发布锁。**预览、抑制、发布之间有竞态：正在发的那条可能刚好被抑制掉，
+  // 或者抑制的时候它已经发出去了。用同一把项目发布锁把这三者排开。
+  const lockDir = path.join(root, ".runtime-data", "outbound", "publish.lock");
+  const lock = acquirePublishLock(lockDir);
+  if (!lock.ok) {
+    console.error("发布器正忙（" + lock.reason + "），稍后再试 —— 不在它发的时候动 outbox。");
+    process.exit(1);
+  }
+  let done;
+  try {
+    // 锁内重读：预览到落盘之间可能有新内容进来，也可能有内容已经发出去了。
+    const fresh = listPending({ outboxDir })
+      .filter((r) => generation === null || r.target_channel_generation_id === generation);
+    if (fresh.length !== pending.length) {
+      console.error("outbox 在预览之后变了（" + pending.length + " → " + fresh.length +
+        " 条），没有动它。请重新预览确认。");
+      process.exit(1);
+    }
+    done = suppressRecords(fresh, { reason });
+  } finally {
+    releasePublishLock(lockDir);
+  }
   console.log("\n已停止重试 " + done.changed + " 条。");
   if (!done.ok) {
     // 部分失败要如实说，不能报"整批已停止"——那会让人以为噪音没了，而它还在。

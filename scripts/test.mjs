@@ -35,7 +35,9 @@ import {
   composeOutboundCard, outboundCardBatches, validateOutboundCard,
 } from "./outbound-card.mjs";
 import { PUBLISH_FAILURE, classifyPublishFailure } from "./outbound.mjs";
-import { drainProject, watcherActive } from "./drain-outbox.mjs";
+import {
+  drainProject, suppressCmd, watcherActive,
+} from "./drain-outbox.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
 import {
   applyRuntimeSync, planRuntimeSync, runtimeRoot, runtimeScript, verifyRuntime,
@@ -7982,6 +7984,69 @@ test("显式抑制命令：默认预览、说明不可逆、拼错的参数不�
   assert.equal(listPending({ outboxDir: obDir }).length, 0, "抑制之后不再算待发");
   const rec = JSON.parse(fs.readFileSync(path.join(obDir, "0001.json"), "utf-8"));
   assert.equal(rec.publish_suppressed_reason, "话题属于旧应用", "理由要能回答为什么");
+});
+
+test("带诊断的失败分支必须真的可达 —— 更具体的条件要先判", () => {
+  // 上一版把通用 status === "error" 排在前面，于是"error 且带诊断"那条**永远进不去**：
+  // 功能写了，在真实入口上一次都没跑过。跟之前那个 ReferenceError 是同一族 ——
+  // 代码存在不等于会被执行。
+  for (const rel of ["stop-hook.mjs", "drain-outbox.mjs"]) {
+    const src = fs.readFileSync(path.resolve("scripts", rel), "utf-8");
+    const generic = src.indexOf('r.status === "error") {');
+    const specific = src.indexOf('r.diagnosis?.kind === "root_owned_by_other_app"');
+    assert.ok(specific >= 0, rel + " 应当有带诊断的分支");
+    assert.ok(generic >= 0, rel + " 应当有通用失败分支");
+    assert.ok(specific < generic,
+      rel + "：带诊断那条必须排在通用 error 之前，否则永远进不去");
+  }
+});
+
+test("抑制默认按代际限定，并且漏项不许算成功", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-supgen-"));
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const mk = (n, gen) => fs.writeFileSync(path.join(obDir, n), JSON.stringify({
+    kind: "progress", text: "x", published_at: null, target_channel_generation_id: gen,
+  }));
+  mk("0001.json", "gen-a"); mk("0002.json", "gen-a"); mk("0003.json", "gen-b");
+
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir, ...args,
+  ], { encoding: "utf-8" });
+
+  // 不指定代际时要提醒可能跨代际 —— 诊断只针对一个代际，一刀切会误伤。
+  const wide = cli([]);
+  assert.match(wide.stdout, /整个 outbox/u);
+  assert.match(wide.stdout, /可能分属不同代际/u);
+
+  assert.equal(cli(["--generation", "gen-a", "--apply"]).status, 0);
+  const left = listPending({ outboxDir: obDir });
+  assert.equal(left.length, 1, "只该停掉指定代际那两条");
+  assert.equal(left[0].target_channel_generation_id, "gen-b");
+});
+
+test("抑制的漏项必须进 failed，不能静默算成功", () => {
+  // 不可逆操作静默漏项，会让调用方以为整批都停了，而漏掉的继续每 30 分钟重试。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-suploss-"));
+  const good = path.join(dir, "1.json");
+  fs.writeFileSync(good, JSON.stringify({ kind: "progress", text: "x", published_at: null }));
+  const broken = path.join(dir, "2.json");
+  fs.writeFileSync(broken, "{ 坏掉的 json");
+
+  const got = suppressRecords([{ _file: good }, { _file: broken }, { }], { reason: "t" });
+  assert.equal(got.changed, 1);
+  assert.equal(got.ok, false, "有漏项就不能报 ok");
+  assert.deepEqual(got.failed.map((f) => f.reason).sort(), ["no_file_ref", "unreadable"]);
+});
+
+test("提示里的抑制命令是绝对路径，不依赖当前工作目录", () => {
+  const cmd = suppressCmd();
+  assert.ok(path.isAbsolute(cmd), "相对路径等于让人猜自己在哪个目录");
+  assert.ok(fs.existsSync(cmd), "指向的脚本必须真的在：" + cmd);
+  for (const rel of ["stop-hook.mjs", "drain-outbox.mjs"]) {
+    assert.match(fs.readFileSync(path.resolve("scripts", rel), "utf-8"),
+      /suppressCmd\(\)/u, rel + " 的提示要用绝对路径");
+  }
 });
 
 summarySealed = true;

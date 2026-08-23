@@ -70,6 +70,11 @@ export function watcherActive(root) {
  * 排空一个项目的 outbox。返回结构化结果，自己不打印、不退出 ——
  * 它跑在会话结束钩子里，任何 throw 或 process.exit 都会砸到别人的会话上。
  */
+/** 抑制命令的绝对路径：提示里给相对路径，等于让人猜当前工作目录。 */
+export function suppressCmd() {
+  return path.join(moduleRoot(import.meta.url, ".."), "scripts", "feishu-suppress-outbox.mjs");
+}
+
 export function drainProject({
   root, claudeSessionId, dryRun = false, timeoutMs, force = false,
 } = {}) {
@@ -212,6 +217,8 @@ export function drainProject({
         // 诊断只是**线索**，不是判决 —— 调用方拿它给人看，不拿它做有损动作。
         diagnosis: diagnosis.kind === PUBLISH_FAILURE.ROOT_OWNED_BY_OTHER_APP
           ? { kind: diagnosis.kind, ownerName: diagnosis.ownerName ?? null,
+              // 带上代际：抑制命令要按代际限定范围，提示里不给它就等于让人一刀切。
+              generationId: failingTarget?.generationId ?? failingTarget?.channelGenerationId ?? null,
               count: listPending({ outboxDir }).length }
           : null,
       };
@@ -276,13 +283,14 @@ if (isDirectRun(import.meta.url)) {
       console.log(tag + "已发布 " + r.count + " 条 -> " + r.messageId);
     } else if (r.status === "dry_run") {
       console.log(tag + "[dry-run] 将发布 " + r.count + " 条：\n---\n" + r.text);
-    } else if (r.status === "error") {
-      console.error(tag + "排空失败（" + r.reason + "），进展留在 outbox：" + r.error);
-      hadError = true;
     } else if (r.status === "error" && r.diagnosis?.kind === "root_owned_by_other_app") {
       console.error(tag + "发布失败：话题由另一个应用（" + (r.diagnosis.ownerName ?? "未知") +
         "）创建，当前身份大概率回复不进去，重试可能一直失败。\n" +
-        "  要停止重试（不可逆）：feishu-suppress-outbox.mjs --project " + root + " --apply");
+        "  要停止重试（不可逆）：node " + suppressCmd() + " --project " + root +
+        " --generation " + (r.diagnosis.generationId ?? "<代际 id>") + " --apply");
+      hadError = true;
+    } else if (r.status === "error") {
+      console.error(tag + "排空失败（" + r.reason + "），进展留在 outbox：" + r.error);
       hadError = true;
     } else if (r.status === "skipped") {
       console.error(tag + "暂不发布：" + r.reason + (r.count ? "（" + r.count + " 条留在 outbox）" : ""));

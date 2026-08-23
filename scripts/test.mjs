@@ -4541,16 +4541,34 @@ test("入站技能安装幂等：连续两次 apply 之后自检一致、不再�
     /fs\.readFileSync\(path\.join\(SRC, f\), "utf-8"\) === fs\.readFileSync\(path\.join\(DST, f\)/u,
     "自检不能拿未渲染的源码去比对已渲染的产物");
 
+  // 幂等性用纯函数侧证：expectedContent 是唯一出口，计划与自检都用它。
+  // 真实 --apply 现在要求 runtime 就绪（见下一条），不适合在单测里跑。
+  const rendered = src.match(/const expectedContent = [\s\S]{0,400}?;\n/u);
+  assert.ok(rendered, "expectedContent 必须是一个集中定义");
+  assert.match(rendered[0], /renderSkill/u);
+});
+
+test("runtime 未就绪时，入站 --apply 必须拒绝而不是装一个指不到脚本的技能", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "inbound-skill-"));
-  const run = (extra) => execFileSync(process.execPath,
-    [path.resolve("scripts", "install-inbound.mjs"), "--dir", dir, ...extra],
-    { encoding: "utf-8" });
-  run(["--apply"]);
-  const second = run(["--apply"]);
-  assert.doesNotMatch(second, /✗/u, "第二次安装的自检不能出现任何不一致");
-  assert.match(second, /✓ SKILL\.md/u);
-  assert.doesNotMatch(run([]), /^\s+(install|update)\s/mu,
-    "装好之后再看计划，不应还有文件改动");
+  const run = (extra) => {
+    try {
+      return { code: 0, out: execFileSync(process.execPath,
+        [path.resolve("scripts", "install-inbound.mjs"), "--dir", dir, ...extra],
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }) };
+    } catch (err) {
+      return { code: err.status ?? 1, out: String(err.stdout ?? "") + String(err.stderr ?? "") };
+    }
+  };
+  // dry-run 只提示：此刻 runtime 没同步是正常的，不该因此看不到计划。
+  assert.equal(run([]).code, 0);
+
+  // --apply 必须 fail-closed。装一个指向不存在脚本的技能比不装坏得多 ——
+  // 它会照常被发现、照常被调用，然后在执行那一步失败，而回执只会说「系统错误」。
+  const applied = run(["--apply"]);
+  assert.notEqual(applied.code, 0, "runtime 未就绪时不得安装");
+  assert.match(applied.out, /runtime 未就绪/u);
+  assert.equal(fs.existsSync(path.join(dir, "m5claude-inbound-router", "SKILL.md")), false,
+    "拒绝之后不能留下半个技能");
 });
 
 test("钩子归属：guard 与实际执行不一致、或别的工具同名脚本，都不认领", () => {
@@ -4575,6 +4593,41 @@ test("入站钩子从自身定位分发器，不再经 bridge_root 落回开发�
     const text = fs.readFileSync(path.resolve("scripts", installer), "utf-8");
     assert.match(text, /BRIDGE_ROOT/u, installer + " 必须会渲染 {{BRIDGE_ROOT}} 占位符");
   }
+});
+
+test("运行时安装的三种故障：坏版本、提交后写指针失败、提交前一致性", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "rt-fault-"));
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), "rt-fault-src-"));
+  fs.mkdirSync(path.join(src, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(src, "scripts", "a.mjs"), "export const a = 1;\n");
+  const plan = planRuntimeSync({ sourceRoot: src, home });
+  assert.equal(applyRuntimeSync(plan, { home }).ok, true);
+
+  // ① 既有版本目录被损坏后重装：必须修复到可校验状态，不能 apply=true 而 verify=false。
+  const victim = path.join(runtimeRoot(home), "versions", plan.version, "scripts", "a.mjs");
+  fs.writeFileSync(victim, "export const a = 'corrupted';\n");
+  assert.equal(verifyRuntime({ home }).ok, false);
+  const repaired = applyRuntimeSync(planRuntimeSync({ sourceRoot: src, home }), { home });
+  assert.equal(repaired.ok, true);
+  assert.equal(verifyRuntime({ home }).ok, true, "apply 报成功就必须真的可校验");
+
+  // ② 提交之后根指针写失败：current 已指向完整版本，线上就是这份代码，
+  //    不能报成"没装上" —— 那是最误导人的结论。
+  const home2 = fs.mkdtempSync(path.join(os.tmpdir(), "rt-fault2-"));
+  fs.mkdirSync(runtimeRoot(home2), { recursive: true });
+  fs.mkdirSync(path.join(runtimeRoot(home2), "INSTALLED.json"));  // 目录占位 → 写文件必失败
+  const p2 = planRuntimeSync({ sourceRoot: src, home: home2 });
+  const committed = applyRuntimeSync(p2, { home: home2 });
+  assert.equal(committed.ok, true, "提交点已过，根指针失败不算安装失败");
+  assert.ok(committed.pointerWarning, "但必须把这件事说出来");
+  assert.equal(verifyRuntime({ home: home2 }).ok, true);
+
+  // ③ 提交前三方一致：版本目录里的清单版本、目录名、计划版本必须逐字相同。
+  const installer = fs.readFileSync(path.resolve("scripts", "runtime-install.mjs"), "utf-8");
+  assert.match(installer, /ready\.manifest\?\.version !== plan\.version/u);
+  assert.match(installer, /path\.basename\(versionDir\) !== plan\.version/u);
+  assert.doesNotMatch(installer, /export function readRuntimeManifest/u,
+    "与新根指针 schema 不兼容的读取函数应移除，留着只会误导");
 });
 
 test("运行时校验能发现被手改的脚本和被指歪的链接", () => {

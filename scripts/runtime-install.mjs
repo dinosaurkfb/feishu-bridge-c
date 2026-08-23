@@ -118,19 +118,6 @@ export function planRuntimeSync({ sourceRoot, home = os.homedir() } = {}) {
   };
 }
 
-export function readRuntimeManifest({ home = os.homedir() } = {}) {
-  const file = path.join(runtimeRoot(home), MANIFEST_NAME);
-  try {
-    const manifest = JSON.parse(fs.readFileSync(file, "utf-8"));
-    if (typeof manifest?.version !== "string" || !Array.isArray(manifest?.files)) {
-      return { ok: false, reason: "manifest_invalid" };
-    }
-    return { ok: true, manifest };
-  } catch {
-    return { ok: false, reason: "manifest_absent" };
-  }
-}
-
 /**
  * 安装锁。两个克隆同时装会让 current 与 manifest 分属不同版本 —— 那是一个谁都没见过、
  * 也没人会去查的状态。用 mkdir 的原子性做锁，失败即放弃，不等待：安装本来就该是
@@ -175,14 +162,22 @@ export function applyRuntimeSync(plan, { home = os.homedir() } = {}) {
   const lock = acquireInstallLock(root);
   if (!lock.ok) return lock;
   try {
-    // 已是当前版本且自校验通过 → 真正的 no-op。上一版这里仍会重写一遍活动版本，
-    // 等于每次安装都动一次线上正在被加载的文件。
+    // 已是当前版本且自校验通过 → 真正的 no-op，不去动线上正在被加载的文件。
     const already = verifyRuntime({ home });
     if (already.ok && already.version === plan.version) {
       return { ok: true, version: plan.version, versionDir, noop: true };
     }
 
+    // 版本目录内容寻址、不可变。"存在但校验不过"只能整体换掉，不能原地补写；
+    // 而 rename 覆盖不了非空目录，所以先把坏的隔离出去再说。
     if (!verifyVersionDir(versionDir, plan.files).ok) {
+      if (fs.existsSync(versionDir)) {
+        const quarantine = path.join(root, "versions",
+          ".corrupt-" + plan.version + "." + Date.now());
+        try { fs.renameSync(versionDir, quarantine); }
+        catch { return { ok: false, reason: "corrupt_version_dir_stuck", version: plan.version }; }
+      }
+
       const staging = path.join(root, "versions", ".staging-" + plan.version + "." + process.pid);
       fs.rmSync(staging, { recursive: true, force: true });
       for (const file of plan.files) {
@@ -197,8 +192,7 @@ export function applyRuntimeSync(plan, { home = os.homedir() } = {}) {
         }
         writeAtomic(dest, content);
       }
-      // manifest 放在版本目录**内部**：版本自带自己的清单，于是"这个版本完整吗"
-      // 是一个不依赖任何外部文件就能回答的问题。
+      // manifest 放在版本目录**内部**：一个版本完整与否，不依赖任何外部文件就能回答。
       writeAtomic(path.join(staging, MANIFEST_NAME), JSON.stringify({
         schema_version: "1.0",
         version: plan.version,
@@ -216,12 +210,19 @@ export function applyRuntimeSync(plan, { home = os.homedir() } = {}) {
       try {
         fs.renameSync(staging, versionDir);
       } catch {
-        // 竞态：另一个安装刚把同一个版本改名过去了。内容寻址，那份和我们这份一样。
+        // 竞态：另一个安装刚把同一个版本改名过去了。内容寻址，那份和我们这份一样，
+        // 下面那道闸会替我们确认这件事。
         fs.rmSync(staging, { recursive: true, force: true });
-        if (!verifyVersionDir(versionDir, plan.files).ok) {
-          return { ok: false, reason: "version_dir_unusable" };
-        }
       }
+    }
+
+    // **切 current 之前的最后一道闸。**三方必须逐字一致：目录里那份清单说的版本、
+    // 目录名本身、本次计划的版本。任何一处对不上都说明这不是我们要提交的东西 ——
+    // 宁可什么都不做，线上仍跑着旧版本，那是安全的。
+    const ready = verifyVersionDir(versionDir, plan.files);
+    if (!ready.ok || ready.manifest?.version !== plan.version ||
+        path.basename(versionDir) !== plan.version) {
+      return { ok: false, reason: "version_not_committable", version: plan.version };
     }
 
     // 唯一的提交点。此前任何失败，线上跑的都还是旧版本。
@@ -231,12 +232,18 @@ export function applyRuntimeSync(plan, { home = os.homedir() } = {}) {
     fs.symlinkSync(path.join("versions", plan.version), linkTmp);
     fs.renameSync(linkTmp, link);
 
-    // 根 manifest 只是一个"当前指向谁"的便利指针，真相在版本目录内部那份。
-    // 即使这一步失败，current 已经指向一个完整且自校验通过的版本，线上是可用的。
-    writeAtomic(path.join(root, MANIFEST_NAME), JSON.stringify({
-      schema_version: "1.0", version: plan.version, updated_at: new Date().toISOString(),
-    }, null, 2) + "\n");
-    return { ok: true, version: plan.version, versionDir };
+    // 到这里已经**提交**了：current 指向一个完整且自校验通过的版本，线上就是这份代码。
+    // 根指针只是"当前指向谁"的便利记录，真相在版本目录内部那份清单里。所以它写失败
+    // **不能**报成安装失败 —— 那会给出"apply=false 但新版本已经在线"这种最误导人的结论。
+    let pointerWarning = null;
+    try {
+      writeAtomic(path.join(root, MANIFEST_NAME), JSON.stringify({
+        schema_version: "1.0", version: plan.version, updated_at: new Date().toISOString(),
+      }, null, 2) + "\n");
+    } catch (err) {
+      pointerWarning = String(err?.message ?? err).slice(0, 200);
+    }
+    return { ok: true, version: plan.version, versionDir, pointerWarning };
   } catch (err) {
     return { ok: false, reason: "apply_failed", error: String(err?.message ?? err).slice(0, 200) };
   } finally {

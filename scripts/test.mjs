@@ -77,6 +77,9 @@ import {
 } from "./canonical-event.mjs";
 import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
 import { bindingToConnections } from "./group-binding-status.mjs";
+import {
+  SYNC_ACTION, SYNC_REJECT, planSubscriptionSync, renderSyncPlan, subscriptionCovers,
+} from "./subscription-sync.mjs";
 import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
 import {
   ENDPOINT_SELF_CHECK, composeLayeredStatus, endpointFacts, lastSuccessfulDispatchAt,
@@ -7831,6 +7834,100 @@ test("走真实 CLI 时 --force 必须真的传到 drainProject", () => {
   const src = fs.readFileSync(path.resolve("scripts", "drain-outbox.mjs"), "utf-8");
   assert.match(src, /drainProject\(\{ root, claudeSessionId, dryRun, force \}\)/u,
     "单项目和 --all 共用同一个调用点，force 必须在那里");
+});
+
+const syncSub = (over = {}) => ({
+  schema_version: "1.0", artifact_type: "feishu_bridge_subscription",
+  subscription_id: "s1", version: 1, endpoint_id: "ep1", domain_id: "d1", status: "active",
+  scope: { agent_uid: "a", transport_open_id: "ou", chat_id: "oc",
+    sender_ids: ["frank"], event_types: ["im.message.receive"] },
+  constraints: { freshness_ms: 900000 }, ...over,
+});
+const syncBinding = (id, over = {}) => ({
+  endpoint_id: "ep1", chat_id: "oc", transport_open_id: "ou",
+  local_target_id: id, private_binding_key: "k" + id, status: "active", ...over,
+});
+
+test("订阅撤销或暂停时，依赖它的 binding 必须被明确暂停", () => {
+  // FR-2.5 的要害在最后半句："不能依靠日常热路径重新解释配置"。
+  // 让热路径每次重看配置看着更省事，但那样改配置的那一刻什么都没发生，
+  // 后果散落在此后每一条消息上，而且没有一个可以对账的时刻。
+  for (const next of [null, syncSub({ status: "paused" })]) {
+    const got = planSubscriptionSync({
+      previous: syncSub(), next, bindings: [syncBinding("t1"), syncBinding("t2")],
+    });
+    assert.equal(got.ok, true);
+    assert.deepEqual(got.counts, { resnapshot: 0, suspend: 2, migrate: 0 });
+    // 不暂停的后果不是"它停了"，而是"它还在收消息，但依据的授权已经没了"。
+    assert.equal(got.plans.every((p) => p.action === SYNC_ACTION.SUSPEND), true);
+  }
+});
+
+test("订阅内容变了但仍覆盖 → 重新物化快照，不是暂停", () => {
+  const got = planSubscriptionSync({
+    previous: syncSub(), next: syncSub({ version: 2 }), bindings: [syncBinding("t1")],
+  });
+  assert.deepEqual(got.counts, { resnapshot: 1, suspend: 0, migrate: 0 });
+  // 一律暂停会把"授权还在、只是内容变了"也停掉 —— 那是把同步做成了断电。
+  assert.equal(got.plans[0].action, SYNC_ACTION.RESNAPSHOT);
+});
+
+test("只有唯一一条订阅接得住才算迁移，多条命中一律拒绝", () => {
+  const other = syncSub({ subscription_id: "s2" });
+  const single = planSubscriptionSync({
+    previous: syncSub(), next: null, bindings: [syncBinding("t1")], others: [other],
+  });
+  assert.equal(single.counts.migrate, 1);
+  assert.equal(single.plans[0].to.subscription_id, "s2");
+
+  // 跟 FR-2.6 首次认领同一条理由，而且这里更严重：
+  // 认领错了拒一条消息，迁移错了整条 binding 就归错了人。
+  const ambiguous = planSubscriptionSync({
+    previous: syncSub(), next: null, bindings: [syncBinding("t1")],
+    others: [other, syncSub({ subscription_id: "s3" })],
+  });
+  assert.equal(ambiguous.ok, false);
+  assert.equal(ambiguous.reason, SYNC_REJECT.AMBIGUOUS_TARGET);
+  assert.equal(ambiguous.candidates, 2);
+  assert.match(renderSyncPlan(ambiguous), /迁错了整条 binding 就归错了人/u);
+
+  // 暂停中的订阅不算"接得住" —— 迁过去也是没授权。
+  const inactive = planSubscriptionSync({
+    previous: syncSub(), next: null, bindings: [syncBinding("t1")],
+    others: [syncSub({ subscription_id: "s2", status: "paused" })],
+  });
+  assert.equal(inactive.counts.suspend, 1);
+  assert.equal(inactive.counts.migrate, 0);
+});
+
+test("覆盖判据只看可信字段，改个显示名不该改变归属", () => {
+  const sub = syncSub();
+  assert.equal(subscriptionCovers(sub, syncBinding("t1")), true);
+  // 换群、换运输身份、换 endpoint → 不覆盖。
+  assert.equal(subscriptionCovers(sub, syncBinding("t1", { chat_id: "oc_other" })), false);
+  assert.equal(subscriptionCovers(sub, syncBinding("t1", { transport_open_id: "ou_other" })), false);
+  assert.equal(subscriptionCovers(sub, syncBinding("t1", { endpoint_id: "ep2" })), false);
+  // 显示名之类不参与判定 —— 拿它们判归属，就等于让改名改变路由。
+  assert.equal(subscriptionCovers(sub, syncBinding("t1", { name: "换个名字" })), true);
+});
+
+test("不归这条订阅的 binding 不在本次变更范围里", () => {
+  const got = planSubscriptionSync({
+    previous: syncSub(), next: null,
+    bindings: [syncBinding("mine"), syncBinding("theirs", { chat_id: "oc_other" })],
+  });
+  assert.equal(got.plans.length, 1, "别的群那条不该被这次撤销牵连");
+  assert.equal(got.plans[0].binding.local_target_id, "mine");
+});
+
+test("拿一份说不清的订阅去同步要被拒", () => {
+  // 否则"说不清"会顺着同步扩散到每一条 binding 上。
+  const got = planSubscriptionSync({
+    previous: syncSub(), next: syncSub({ scope: { chat_id: "oc" } }),
+    bindings: [syncBinding("t1")],
+  });
+  assert.equal(got.ok, false);
+  assert.equal(got.reason, SYNC_REJECT.SUBSCRIPTION_INVALID);
 });
 
 summarySealed = true;

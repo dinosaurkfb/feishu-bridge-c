@@ -481,7 +481,25 @@ for (const sk of skillPlan) {
 
 // launchd：先 bootout 再 bootstrap。改了 plist 不重新加载的话，跑的还是旧的那份，
 // 而且看不出来 —— 文件是新的，行为是旧的，是最难查的那种不一致。
+/**
+ * **HOME 被覆盖时一律不碰 launchctl。**
+ *
+ * plist 文件路径跟着 `os.homedir()` 走，所以指定 HOME 就能把安装引到别处 —— 看起来像
+ * 一个安全的沙箱安装。但 `launchctl bootout/bootstrap` 操作的是**真实用户的 launchd 域**，
+ * 跟 HOME 一点关系都没有。于是一次"沙箱"安装会把线上那个兜底定时器卸掉，
+ * 再把一个临时目录里的 plist 装进真实域 —— 临时目录一清，定时器就指向不存在的文件。
+ *
+ * 这不是假设：我为了测试 shell 安全性写了几条跑 `--apply` 的回归，用的正是临时 HOME，
+ * 结果把线上 30 分钟兜底任务切到了临时目录。Codex 只读复核时发现的。
+ *
+ * `os.userInfo().homedir` 读的是密码库，不受 HOME 环境变量影响，所以能可靠区分
+ * "真实安装"和"被重定向的安装"。
+ */
+const REAL_HOME = os.userInfo().homedir;
+const SANDBOXED = os.homedir() !== REAL_HOME;
+
 const launchctl = (args, { tolerate = false } = {}) => {
+  if (SANDBOXED) return { ok: false, skipped: true };
   try {
     execFileSync("/bin/launchctl", args, { stdio: "pipe", timeout: 15_000 });
     return { ok: true };
@@ -501,9 +519,13 @@ if (uninstall) {
   fs.mkdirSync(path.dirname(PLIST), { recursive: true });
   fs.writeFileSync(PLIST, plistBody);
   launchctl(["bootout", domain + "/" + LAUNCH_LABEL], { tolerate: true }); // 没装过时必然失败，正常
-  launchNote = launchctl(["bootstrap", domain, PLIST]).ok
-    ? "已加载"
-    : "**plist 已写入但 launchctl 加载失败 —— 兜底重试目前不生效**";
+  const loaded = launchctl(["bootstrap", domain, PLIST]);
+  launchNote = loaded.skipped
+    // 说出来，别让人以为兜底装好了。沙箱安装不碰真实 launchd 是有意的，见 launchctl 处的说明。
+    ? "已跳过（HOME 被重定向到 " + os.homedir() + "，不碰真实 launchd）"
+    : loaded.ok
+      ? "已加载"
+      : "**plist 已写入但 launchctl 加载失败 —— 兜底重试目前不生效**";
 }
 
 console.log("\n" + (backup ? "settings 已改，备份：" + backup : "settings 无改动，未重写"));

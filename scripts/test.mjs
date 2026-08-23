@@ -5601,6 +5601,28 @@ test("含空格 HOME 下，出站装完之后入站也必须能装上", () => {
   assert.equal(fs.existsSync(script), true, "渲染出的路径必须指向真实存在的脚本：" + script);
 });
 
+test("HOME 被重定向时，安装器不得碰真实 launchd", () => {
+  // plist 文件路径跟 os.homedir() 走，所以指定 HOME 看起来像个安全的沙箱安装。
+  // 但 launchctl bootout/bootstrap 操作的是**真实用户的 launchd 域**，与 HOME 无关。
+  // 我为了测 shell 安全写的几条 --apply 回归就是这么把线上 30 分钟兜底任务
+  // 切到临时目录的 —— 临时目录一清，定时器就指向不存在的文件。
+  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  assert.match(src, /os\.userInfo\(\)\.homedir/u,
+    "判据要用密码库里的 home，它不受 HOME 环境变量影响");
+  assert.match(src, /if \(SANDBOXED\) return \{ ok: false, skipped: true \};/u,
+    "launchctl 必须在沙箱安装时直接短路");
+
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "launchd-guard-"));
+  const home = path.join(base, "我的 家");
+  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  const out = execFileSync(process.execPath,
+    [path.resolve("scripts", "install-outbound.mjs"), "--apply"],
+    { encoding: "utf-8", env: { ...process.env, HOME: home } });
+  assert.match(out, /兜底定时器：已跳过/u, "跳过要说出来，不能让人以为兜底装好了");
+  assert.doesNotMatch(out, /兜底定时器：已加载/u);
+});
+
 test("路径含空格或非 ASCII 时，模块仍能定位自己", () => {
   // new URL(import.meta.url).pathname 给的是 URL 的路径分量，仍是百分号编码的：
   // 目录名含空格或中文时会拿到 /…/%E5%B8%A6%20%E7%A9%BA%E6%A0%BC，读文件直接 ENOENT。

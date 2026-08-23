@@ -78,6 +78,10 @@ import {
 import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
 import { bindingToConnections } from "./group-binding-status.mjs";
 import {
+  ENDPOINT_SELF_CHECK, composeLayeredStatus, endpointFacts, lastSuccessfulDispatchAt,
+  renderLayeredStatus, subscriptionFacts,
+} from "./layered-status.mjs";
+import {
   collectConnectivity, collectStatusProviders, loadStatusProviders, renderConnectivity,
   validateProviderRegistry, validateProviderReport,
 } from "./status-providers.mjs";
@@ -7143,6 +7147,140 @@ test("直接执行时参数校验仍然严格", () => {
   } });
   assert.notEqual(run.status, 0);
   assert.match(run.stderr, /unknown_option/u);
+});
+
+const layeredSt = (over = {}) => ({
+  ok: true, displayName: "示例项目", level: "project", suspended: false,
+  activeGeneration: 4, activeGenerationMessages: 22, activeGenerationThreshold: 30,
+  pendingGeneration: null, readOnlyGenerations: 3, inboundBound: true,
+  expiresAt: "2027-08-19T00:00:00.000Z", pending: 0,
+  policy: { ok: true, label: "Mapping", policyId: "mapping", policyVersion: "1.0" },
+  ...over,
+});
+const layeredView = (over = {}, subOver = {}) => composeLayeredStatus({
+  st: layeredSt(over),
+  endpoint: { runtime: "Claude Code", installed: true, version: "abc123", selfCheck: ENDPOINT_SELF_CHECK,
+    lastInboundAt: null, ...(subOver.endpoint ?? {}) },
+  subscription: subOver.subscription ?? { ok: true, items: [], pendingCount: 0 },
+  connectivity: subOver.connectivity ?? null,
+  now: Date.parse("2026-08-23T12:00:00.000Z"),
+});
+
+test("四层视图：五个区都在，且不出总判断", () => {
+  const text = renderLayeredStatus(layeredView());
+  for (const [n, title] of [[1, "运行端点连接"], [2, "事件订阅"], [3, "精确通道绑定"], [4, "交互策略"]]) {
+    assert.match(text, new RegExp("第 " + n + " 层 · " + title, "u"));
+  }
+  assert.match(text, /待处理事件/u, "待处理事件是需求要求的第五区");
+
+  // 四层可能各自处于不同状态，一个总判断会把它们抹平成一句话。
+  assert.doesNotMatch(text, /✅/u);
+  assert.doesNotMatch(text, /已接入/u);
+
+  // 每层的事实要落在自己那层：待发条数不许被塞进端点层或绑定层。
+  const sections = text.split(/第 \d 层 · |待处理事件/u);
+  assert.equal(sections.filter((x) => x.includes("待发布答复")).length, 1);
+  assert.match(text.slice(text.indexOf("待处理事件")), /待发布答复/u);
+});
+
+test("第 1 层不许把未自检说成在线", () => {
+  // 用"不含在线二字"来验是错的：正文里合法地有"不代表当前在线"。
+  // 子串缺席分不出肯定和否定，所以逐字断言这两行的确切内容。
+  const rowOf = (text, label) => {
+    const line = text.split("\n").find((l) => l.trim().startsWith(label));
+    return line ? line.trim().replace(/^\S+\s+/u, "") : null;
+  };
+
+  const plain = renderLayeredStatus(layeredView());
+  assert.equal(rowOf(plain, "实时自检"), "未自检（端点自检 FR-1.4 尚未实现）");
+  assert.equal(rowOf(plain, "最近入站"), null, "没有历史证据时不该凭空出现这一行");
+
+  const withLog = renderLayeredStatus(layeredView({}, {
+    endpoint: { runtime: "Claude Code", installed: true, version: "abc123",
+      selfCheck: ENDPOINT_SELF_CHECK, lastInboundAt: Date.parse("2026-08-23T10:00:00.000Z") },
+  }));
+  // 历史证据的措辞必须停在"过去某刻工作过"，不能滑成"在线"。
+  assert.equal(rowOf(withLog, "最近入站"), "2 小时前（历史证据，不代表当前在线）");
+  assert.equal(rowOf(withLog, "实时自检"), "未自检（端点自检 FR-1.4 尚未实现）",
+    "有历史证据也不得把自检结论改掉");
+
+  // 路由登记只证明配置存在，日志只证明过去工作过 —— 都不该升级成一个在线判断。
+  assert.equal(ENDPOINT_SELF_CHECK, "not_implemented");
+});
+
+test("最近入站只取时间戳，不碰日志里的标识", () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-log-")), "aily.log");
+  fs.writeFileSync(file, [
+    "2026-08-23T09:00:00.000Z caller mismatch: got=none",
+    "2026-08-23T10:00:00.000Z dispatch -> cc2cd (session_registration)",
+    "2026-08-23T11:00:00.000Z caller mismatch: got=none",
+  ].join("\n"));
+  // 取的是最后一次**成功分发**，不是最后一行。
+  assert.equal(lastSuccessfulDispatchAt(file), Date.parse("2026-08-23T10:00:00.000Z"));
+  assert.equal(lastSuccessfulDispatchAt(path.join(path.dirname(file), "nope.log")), null,
+    "读不到日志不是错误");
+
+  const facts = endpointFacts({ runtimeDir: path.dirname(file), inboundLog: file });
+  assert.equal(facts.selfCheck, "not_implemented");
+  assert.equal(facts.installed, false, "没有 current 符号链接就是没装");
+});
+
+test("第 2 层脱敏：locator 字段一个都不出，群名不许用 ID 顶替", () => {
+  const model = {
+    ok: true,
+    endpoint_id: "ep_SECRET111111",
+    subscriptions: [{
+      subscription_id: "sub_SECRET222222", domain_id: "dom_SECRET333333", status: "active",
+      scope: {
+        agent_uid: "agent_SECRET444", transport_open_id: "ou_SECRET555555",
+        chat_id: "oc_SECRET666666", sender_ids: ["ou_SECRET777777"],
+        event_types: ["im.message.receive"],
+      },
+    }],
+    pending_bindings: [{ legacy_key: "lk_SECRET888", pending_token: "pt_SECRET999" }],
+  };
+  const facts = subscriptionFacts(model);
+  assert.equal(facts.ok, true);
+  assert.equal(facts.items[0].senderCount, 1, "只出数量，不出身份");
+  assert.equal(facts.items[0].groupName, null);
+
+  const text = renderLayeredStatus(layeredView({}, { subscription: facts }));
+  for (const secret of ["ep_SECRET111111", "sub_SECRET222222", "dom_SECRET333333",
+    "agent_SECRET444", "ou_SECRET555555", "oc_SECRET666666", "ou_SECRET777777",
+    "lk_SECRET888", "pt_SECRET999"]) {
+    assert.equal(text.includes(secret), false, "不得出现 " + secret);
+  }
+  // 投影里只有 chat_id 没有群名，拿 ID 顶替就等于把 locator 打出来了。
+  assert.match(text, /群名不可用/u);
+  assert.match(text, /授权发送者.*1 个/u);
+  assert.match(text, /im\.message\.receive/u);
+  assert.match(text, /待认领绑定.*1 条/u);
+});
+
+test("第 2 层读不到时说读不到，不装作没有订阅", () => {
+  const facts = subscriptionFacts({ ok: false, reason: "projection_invalid" });
+  assert.equal(facts.ok, false);
+  const text = renderLayeredStatus(layeredView({}, { subscription: facts }));
+  assert.match(text, /读不到（projection_invalid）/u);
+  assert.doesNotMatch(text, /本项目没有事件订阅/u, "读不到和没有是两回事");
+});
+
+test("其他消费者暂不硬归类", () => {
+  const text = renderLayeredStatus(layeredView({}, { connectivity: "  cc2cd  消息运输 · 某群" }));
+  // 当前 provider 协议只有 kind 和 scope，判不出一条连接是订阅、绑定还是策略。
+  assert.match(text, /其他消费者（尚未分层）/u);
+  assert.match(text, /cc2cd {2}消息运输/u);
+  // 判不出就别塞进某一层。
+  const layer2 = text.slice(text.indexOf("第 2 层"), text.indexOf("第 3 层"));
+  assert.equal(layer2.includes("cc2cd"), false);
+});
+
+test("第 4 层的自动轮转补出还剩几条", () => {
+  const text = renderLayeredStatus(layeredView());
+  assert.match(text, /自动轮转.*22 \/ 30 条（还剩 8 条）/u);
+  // 原始值本身不够用时才补，且补的是算出来的，不是编的。
+  const near = renderLayeredStatus(layeredView({ activeGenerationMessages: 30 }));
+  assert.match(near, /还剩 0 条/u);
 });
 
 summarySealed = true;

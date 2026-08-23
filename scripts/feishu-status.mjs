@@ -16,6 +16,8 @@
 import path from "node:path";
 
 import { bindingsForRoot, currentBinding, describeStatus } from "./feishu-control.mjs";
+import { buildClaudeSubscriptionProjection } from "./inbound-route.mjs";
+import { composeLayeredStatus, endpointFacts, renderLayeredStatus, subscriptionFacts } from "./layered-status.mjs";
 import { collectConnectivity, renderConnectivity } from "./status-providers.mjs";
 
 const arg = (n) => {
@@ -27,8 +29,22 @@ const root = path.resolve(arg("project") ?? process.cwd());
 const claudeSessionId = process.env.CLAUDE_CODE_SESSION_ID;
 
 const st = currentBinding({ root, claudeSessionId });
-console.log(describeStatus(st, bindingsForRoot({ root })));
+// 分层视图把它放进"其他消费者"那一节，标题由那边给。
+const layeredConnectivity = renderConnectivity(collectConnectivity(), { heading: null });
+const connectivity = renderConnectivity(collectConnectivity());
 
-const others = renderConnectivity(collectConnectivity());
-if (others) console.log("\n" + others);
+if (!st.ok) {
+  // 没绑定就没有四层可言，照旧给接入指引；本机其他链路仍然值得看见。
+  console.log(describeStatus(st, bindingsForRoot({ root })));
+  if (connectivity) console.log("\n" + connectivity);
+  process.exit(0);
+}
+
+console.log(renderLayeredStatus(composeLayeredStatus({
+  st,
+  others: bindingsForRoot({ root }),
+  endpoint: endpointFacts(),
+  subscription: subscriptionFacts(buildClaudeSubscriptionProjection({})),
+  connectivity: layeredConnectivity,
+})));
 process.exit(0);

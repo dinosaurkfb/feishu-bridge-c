@@ -311,7 +311,7 @@ const SCOPE_TEXT = { chat: "整个群", topic: "单个话题", project: "整个�
  * 渲染。**只渲染校验过的字段，绝不回显 provider 的原始输出。**
  * 不打印话题 id、会话 locator、凭据 —— 这条承诺由聚合方兑现，不外包给接入方。
  */
-export function renderConnectivity(view) {
+export function renderConnectivity(view, { heading = "其他链路" } = {}) {
   const lines = [];
   for (const s of view.sections) {
     const name = s.displayName;
@@ -345,5 +345,6 @@ export function renderConnectivity(view) {
       "入站已停止投递，这是需要处理的故障");
   }
   if (lines.length === 0) return null;
-  return "其他链路\n" + lines.join("\n");
+  // 分层视图自己会给这一节起标题，不能再叠一个。
+  return (heading ? heading + "\n" : "") + lines.join("\n");
 }

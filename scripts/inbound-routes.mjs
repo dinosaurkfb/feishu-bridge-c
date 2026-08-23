@@ -23,47 +23,126 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
+
 export const DEFAULT_ROUTES = path.join(os.homedir(), ".claude", "feishu-bridge", "routes.json");
 
 export function routesPath() {
   return process.env.FEISHU_BRIDGE_ROUTES || DEFAULT_ROUTES;
 }
 
+const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+
 /**
- * 读路由表。**读不到不是错误** —— 绝大多数机器只有一个消费者，那种情况下
- * 表不存在，分发器直接走默认路由，行为跟没有分发层时一模一样。
+ * 读路由表。**只有文件不存在才算"本机没配路由"。**
+ *
+ * 绝大多数机器只有一个消费者，那种情况下表不存在，分发器走默认路由，行为跟没有
+ * 分发层时一模一样 —— 这是正常状态，不是故障。
+ *
+ * 但"读不出来"和"没有"必须分开。表损坏时当成空表，后果有两个方向都很糟：
+ * 分发器会把消息转给默认 handler（本该属于别人的话题落到了别人手里），
+ * 登记命令会把损坏的表当成首次创建直接覆盖（剩下的登记全没了）。
+ * 所以除 ENOENT 外一律 fail-closed。
  */
 export function loadRoutes(file = routesPath()) {
-  let parsed;
-  try {
-    parsed = JSON.parse(fs.readFileSync(file, "utf-8"));
-  } catch {
-    return { ok: true, reason: "no_routes", file, routes: [], sessions: {} };
-  }
+  const read = readRoutesDoc(file);
+  if (!read.ok) return { ...read, file, routes: [], sessions: {} };
+  if (read.doc === null) return { ok: true, reason: "no_routes", file, routes: [], sessions: {} };
 
-  const routes = [];
-  for (const r of parsed.routes ?? []) {
-    if (!r || typeof r.id !== "string" || typeof r.handler !== "string") continue;
-    if (r.enabled === false) continue;
-    routes.push({ id: r.id, handler: r.handler, isDefault: r.default === true, note: r.note ?? null });
+  // 校验已经保证每一项都能确定地解释，这里只按 enabled 取舍 ——
+  // 静默过滤"看不懂的项"是上一版的做法，那正是歧义表能通过的原因。
+  const routes = (read.doc.routes ?? [])
+    .filter((r) => r.enabled !== false)
+    .map((r) => ({ id: r.id, handler: r.handler, isDefault: r.default === true, note: r.note ?? null }));
+  return { ok: true, file, routes, sessions: { ...(read.doc.sessions ?? {}) } };
+}
+
+// 纯空白的 id 拿去比较、拿去打日志都像"有值"，实际什么都定位不到。
+const nonEmptyString = (v) => typeof v === "string" && v.trim().length > 0;
+
+/**
+ * 校验整份路由表。**读取、dispatcher、每个写入口共用这一个。**
+ *
+ * 只查顶层形状不够：routes 是数组、sessions 是对象，里面照样可以有 null 项、
+ * 重复 id、两个 default。那种表上一版会静默过滤掉坏项然后返回 ok ——
+ * 于是**数组顺序变成了选路依据**，同一个 id 出现两次时先写的那个赢。
+ * 权威状态里解释不了的东西必须 fail-closed，不投递也不写入。
+ *
+ * 不认识的扩展字段原样保留 —— 校验的是能不能确定地解释，不是长得像不像。
+ */
+export function validateRoutesDoc(doc) {
+  const bad = (problem) => ({ ok: false, reason: ROUTE_REJECT.TABLE_SHAPE, problem });
+  if (!isPlainObject(doc)) return bad("table_not_object");
+
+  const routes = doc.routes ?? [];
+  if (!Array.isArray(routes)) return bad("routes_not_array");
+  const seen = new Set();
+  let activeDefaults = 0;
+  for (const r of routes) {
+    if (!isPlainObject(r)) return bad("route_not_object");
+    if (!nonEmptyString(r.id)) return bad("route_id_invalid");
+    if (!nonEmptyString(r.handler)) return bad("route_handler_invalid");
+    // 相对路径会按 dispatcher 的当前工作目录解析 —— 同一张表在不同项目目录下
+    // 会执行不同脚本，并把完整 Canonical Event 交给错的消费者。
+    // 只在写入口拦不住：旧表是直接读进来的，从没经过写入口。
+    if (!path.isAbsolute(r.handler)) return bad("route_handler_not_absolute");
+    if (r.enabled !== undefined && typeof r.enabled !== "boolean") return bad("route_enabled_not_boolean");
+    if (r.default !== undefined && typeof r.default !== "boolean") return bad("route_default_not_boolean");
+    // id 重复时"哪个生效"没有确定答案，只有数组顺序 —— 那不是答案。
+    if (seen.has(r.id)) return bad("route_id_duplicated");
+    seen.add(r.id);
+    if (r.default === true && r.enabled !== false) activeDefaults += 1;
   }
-  const sessions = {};
-  for (const [sid, id] of Object.entries(parsed.sessions ?? {})) {
-    if (typeof sid === "string" && typeof id === "string") sessions[sid] = id;
+  if (activeDefaults > 1) return bad("multiple_default_routes");
+
+  const sessions = doc.sessions ?? {};
+  if (!isPlainObject(sessions)) return bad("sessions_not_object");
+  for (const [sid, owner] of Object.entries(sessions)) {
+    if (!nonEmptyString(sid)) return bad("session_id_invalid");
+    if (!nonEmptyString(owner)) return bad("session_owner_invalid");
   }
-  return { ok: true, file, routes, sessions };
+  // 登记指向不存在或已停用的路由**不在这里拒**：那是逐条话题的问题，
+  // selectRoute 会按 session 报 UNKNOWN_ROUTE，比整表停摆精确。
+  return { ok: true };
+}
+
+/**
+ * 读原始文档并完整校验。返回 doc:null 表示文件不存在（可以初始化空表）。
+ *
+ * 结构异常不替换成空结构就继续 —— 那等于"我看不懂就当它没有"，
+ * 而下一步要么是投递、要么是整表写回，两者都会造成实质损失。
+ */
+function readRoutesDoc(file) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf-8");
+  } catch (err) {
+    if (err.code === "ENOENT") return { ok: true, doc: null };
+    return { ok: false, reason: ROUTE_REJECT.TABLE_UNREADABLE, error: err.message };
+  }
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (err) {
+    return { ok: false, reason: ROUTE_REJECT.TABLE_UNREADABLE, error: err.message };
+  }
+  const valid = validateRoutesDoc(parsed);
+  if (!valid.ok) return valid;
+  return { ok: true, doc: parsed };
 }
 
 export const ROUTE_REJECT = {
   NO_HANDLER: "no_route_handler",
   UNKNOWN_ROUTE: "session_maps_to_unknown_route",
   HANDLER_MISSING: "route_handler_missing",
+  TABLE_UNREADABLE: "routes_table_unreadable",
+  TABLE_SHAPE: "routes_table_shape_unexpected",
 };
 
 export const ROUTE_REJECT_TEXT = {
   [ROUTE_REJECT.NO_HANDLER]: "本机没有配置任何入站处理者",
   [ROUTE_REJECT.UNKNOWN_ROUTE]: "这个话题登记的路由在路由表里不存在",
   [ROUTE_REJECT.HANDLER_MISSING]: "路由指向的脚本不在",
+  [ROUTE_REJECT.TABLE_UNREADABLE]: "本机路由表读不出来，已停止投递",
+  [ROUTE_REJECT.TABLE_SHAPE]: "本机路由表结构异常，已停止投递",
 };
 
 /**
@@ -79,8 +158,10 @@ export const ROUTE_REJECT_TEXT = {
  */
 export function selectRoute({ sessionId, routes, sessions }) {
   const list = Array.isArray(routes) ? routes : [];
-  if (list.length === 0) return { ok: false, reason: ROUTE_REJECT.NO_HANDLER };
 
+  // 先看这个话题登记过什么，再谈有没有活动路由。反过来的话，登记指向唯一那条
+  // 且它被停用时，报的是"本机没配路由"而不是"这个话题登记的路由不存在" ——
+  // 两者都安全 fail-closed，但前者会让排查往错的方向走。
   const declared = sessions?.[sessionId];
   if (typeof declared === "string") {
     const hit = list.find((r) => r.id === declared);
@@ -88,36 +169,145 @@ export function selectRoute({ sessionId, routes, sessions }) {
     return { ok: true, route: hit, matchedBy: "session_registration" };
   }
 
+  if (list.length === 0) return { ok: false, reason: ROUTE_REJECT.NO_HANDLER };
+
   const fallback = list.find((r) => r.isDefault) ?? (list.length === 1 ? list[0] : null);
   if (!fallback) return { ok: false, reason: ROUTE_REJECT.NO_HANDLER, candidates: list.length };
   return { ok: true, route: fallback, matchedBy: "default" };
 }
 
+/** 路由表的写锁。登记 route 和登记 session 必须在同一把锁下，否则会丢更新。 */
+const routesLockDir = (file) => file + ".lock";
+
 /**
- * 把一个 session 登记给某条路由。消费者绑定新话题时调它。
+ * 一次事务里登记路由 + 认领话题。**这是唯一的写入口。**
  *
- * 幂等：已经登记给同一条路由就什么都不做。登记给**别的**路由会被拒 ——
- * 一个话题同时属于两个消费者是配置错误，静默改写会让「上一条消息进了 A、
- * 这一条进了 B」，那是最难查的一类。
+ * 为什么必须是一个事务：先写 route、再写 session 是两次读改写。中间任何一步
+ * 出事都会留下半截状态 —— 实测过预检之后话题被别的进程认领，结果新 route 已经
+ * 写进去了、session 登记被拒。锁外预检挡不住这个，因为预检和写入之间没有互斥。
+ *
+ * 校验全部在锁内重做一遍：锁外读到的那份跟要写的那份不是同一个快照。
+ */
+export function registerRouteBinding({ id, handler, note = null, sessionId = null, file = routesPath() }) {
+  if (typeof id !== "string" || !id) return { ok: false, reason: "no_route_id" };
+  if (typeof handler !== "string" || !path.isAbsolute(handler)) {
+    return { ok: false, reason: "handler_not_absolute" };
+  }
+  // 目录也能通过 existsSync。要求是可读的普通文件，否则登记出来的路由投不进去。
+  let stat;
+  try { stat = fs.statSync(handler); } catch { return { ok: false, reason: "handler_missing", handler }; }
+  if (!stat.isFile()) return { ok: false, reason: "handler_not_a_file", handler };
+  try { fs.accessSync(handler, fs.constants.R_OK); } catch {
+    return { ok: false, reason: "handler_not_readable", handler };
+  }
+  if (sessionId !== null && (typeof sessionId !== "string" || !sessionId)) {
+    return { ok: false, reason: "no_session_id" };
+  }
+
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const lockDir = routesLockDir(file);
+  const lock = acquirePublishLock(lockDir);
+  if (!lock.ok) return { ok: false, reason: "routes_busy" };
+  try {
+    const read = readRoutesDoc(file);
+    if (!read.ok) return { ok: false, reason: read.reason, error: read.error };
+    const doc = read.doc ?? { schema_version: "1.0", routes: [], sessions: {} };
+    if (!Array.isArray(doc.routes)) doc.routes = [];
+    if (!isPlainObject(doc.sessions)) doc.sessions = {};
+
+    // ---- 锁内校验：两边都过了才动任何一边 ----
+    const existing = doc.routes.find((r) => isPlainObject(r) && r.id === id);
+    if (existing) {
+      if (existing.handler !== handler) {
+        return { ok: false, reason: "route_id_owned_by_other_handler", owner: existing.handler };
+      }
+      // 停用的路由 loadRoutes 根本不加载，handler 实际没接通。报"已登记"是虚假成功。
+      // 重新启用是另一件事，要显式做，不能由登记命令暗中完成。
+      if (existing.enabled === false) return { ok: false, reason: "route_disabled", id };
+    }
+    const declared = sessionId === null ? undefined : doc.sessions[sessionId];
+    if (typeof declared === "string" && declared !== id) {
+      return { ok: false, reason: "session_owned_by_other_route", owner: declared };
+    }
+
+    // ---- 单次原子写 ----
+    const routeChanged = !existing;
+    const sessionChanged = sessionId !== null && declared !== id;
+    if (routeChanged) doc.routes.push(note ? { id, handler, note } : { id, handler });
+    if (sessionChanged) doc.sessions[sessionId] = id;
+    if (routeChanged || sessionChanged) {
+      const wrote = writeRoutesDoc(doc, file);
+      if (!wrote.ok) return wrote;
+    }
+    return { ok: true, id, routeChanged, sessionChanged };
+  } finally {
+    releasePublishLock(lockDir);
+  }
+}
+
+/**
+ * 只登记路由。走同一把锁 —— 不加锁的读改写在并发下会丢更新。
+ *
+ * 幂等：同 id 同 handler 就什么都不做。同 id **换 handler** 会被拒 ——
+ * 那是把别人的话题悄悄改判给另一个脚本。
+ *
+ * 刻意**不支持**设 default。默认路由是权威路由，换它要 Frank 逐次授权。
+ */
+export function registerRoute({ id, handler, note = null, file = routesPath() }) {
+  const r = registerRouteBinding({ id, handler, note, sessionId: null, file });
+  return r.ok ? { ok: true, changed: r.routeChanged, id: r.id } : r;
+}
+
+/**
+ * 把一个 session 登记给某条路由。
+ *
+ * 登记给**别的**路由会被拒：一个话题同时属于两个消费者是配置错误，静默改写会让
+ * 「上一条消息进了 A、这一条进了 B」，那是最难查的一类。
  */
 export function registerSession({ sessionId, routeId, file = routesPath() }) {
   if (typeof sessionId !== "string" || !sessionId) return { ok: false, reason: "no_session_id" };
   if (typeof routeId !== "string" || !routeId) return { ok: false, reason: "no_route_id" };
 
-  let doc = { schema_version: "1.0", routes: [], sessions: {} };
-  try { doc = JSON.parse(fs.readFileSync(file, "utf-8")); } catch { /* 首次：用上面的空表 */ }
-  doc.sessions ??= {};
-
-  const existing = doc.sessions[sessionId];
-  if (existing === routeId) return { ok: true, changed: false };
-  if (typeof existing === "string" && existing !== routeId) {
-    return { ok: false, reason: "session_owned_by_other_route", owner: existing };
-  }
-
-  doc.sessions[sessionId] = routeId;
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const tmp = file + ".tmp." + process.pid;
-  fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
-  fs.renameSync(tmp, file);
-  return { ok: true, changed: true };
+  const lockDir = routesLockDir(file);
+  const lock = acquirePublishLock(lockDir);
+  if (!lock.ok) return { ok: false, reason: "routes_busy" };
+  try {
+    const read = readRoutesDoc(file);
+    if (!read.ok) return { ok: false, reason: read.reason, error: read.error };
+    const doc = read.doc ?? { schema_version: "1.0", routes: [], sessions: {} };
+    if (!isPlainObject(doc.sessions)) doc.sessions = {};
+
+    const existing = doc.sessions[sessionId];
+    if (existing === routeId) return { ok: true, changed: false };
+    if (typeof existing === "string") {
+      return { ok: false, reason: "session_owned_by_other_route", owner: existing };
+    }
+    doc.sessions[sessionId] = routeId;
+    const wrote = writeRoutesDoc(doc, file);
+    if (!wrote.ok) return wrote;
+    return { ok: true, changed: true };
+  } finally {
+    releasePublishLock(lockDir);
+  }
+}
+
+/**
+ * 原子写。写到一半被打断会让整张表截断 —— 那不只是某条路由坏了，是入站全挂。
+ *
+ * 写之前再校验一遍：任何路径都不该把一张解释不了的表落到盘上。
+ * 失败返回受控结果，不让 fs 的异常穿透成 Node 堆栈 —— 那对调用方没法处置。
+ */
+function writeRoutesDoc(doc, file) {
+  const valid = validateRoutesDoc(doc);
+  if (!valid.ok) return valid;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const tmp = file + ".tmp." + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: "routes_unwritable", error: err.message };
+  }
 }

@@ -91,6 +91,12 @@ export function runInboundDispatcher({
   }
 
   const table = loadRoutes(routesFile);
+  if (!table.ok) {
+    // 表读不出来 ≠ 本机没配路由。当成空表会落到默认 handler，
+    // 于是本该属于别人的话题被投给了别人 —— 那不是降级，是投错。
+    log("routes table unusable: " + table.reason);
+    return fail(ROUTE_REJECT_TEXT[table.reason] ?? table.reason, table.reason);
+  }
   const fallback = defaultRoute && typeof defaultRoute.id === "string" &&
     typeof defaultRoute.handler === "string"
     ? [{ id: defaultRoute.id, handler: defaultRoute.handler, isDefault: true }]

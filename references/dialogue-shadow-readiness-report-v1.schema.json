@@ -559,9 +559,15 @@
   "allOf": [
     {
       "if": {
+        "required": [
+          "automated_checks"
+        ],
         "properties": {
           "automated_checks": {
             "contains": {
+              "required": [
+                "status"
+              ],
               "properties": {
                 "status": {
                   "enum": [
@@ -569,16 +575,10 @@
                     "insufficient"
                   ]
                 }
-              },
-              "required": [
-                "status"
-              ]
+              }
             }
           }
-        },
-        "required": [
-          "automated_checks"
-        ]
+        }
       },
       "then": {
         "properties": {
@@ -586,6 +586,13 @@
             "not": {
               "const": "manual_review_required"
             }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "decision": {
+            "const": "manual_review_required"
           }
         }
       }

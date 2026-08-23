@@ -1102,13 +1102,54 @@ test("validator 拒绝「检查没全过却说只差人工签字」的报告", (
   };
   assert.equal(validateDialogueShadowReadinessReport(allPass).ok, false);
 
-  // schema 侧同源：contains 一个非 pass 检查时禁止 manual_review_required。
+  // schema 侧必须是**双向**的。上一版我只断言"schema 里出现了 contains" ——
+  // 那是在验守卫长什么样，不是验它管不管用；而且它只覆盖了"存在非 pass → 不能 manual"
+  // 一个方向，"全部 pass → 必须 manual"完全没约束。
   const schema = JSON.parse(fs.readFileSync(path.resolve("references",
     "dialogue-shadow-readiness-report-v1.schema.json"), "utf-8"));
   const guard = (schema.allOf ?? []).find((rule) =>
-    JSON.stringify(rule).includes("manual_review_required") &&
-    JSON.stringify(rule).includes("contains"));
-  assert.ok(guard, "schema 必须也钉住这条，不能只靠运行时");
+    rule?.if?.properties?.automated_checks?.contains);
+  assert.ok(guard, "schema 必须也钉住 decision 契约，不能只靠运行时");
+  assert.deepEqual(guard.if.properties.automated_checks.contains.properties.status.enum,
+    ["fail", "insufficient"], "触发条件是「存在任一非 pass 检查」");
+  assert.deepEqual(guard.then.properties.decision, { not: { const: "manual_review_required" } },
+    "存在非 pass 时禁止 manual_review_required");
+  assert.deepEqual(guard.else.properties.decision, { const: "manual_review_required" },
+    "全部 pass 时必须是 manual_review_required —— 缺这一半就不是充要关系");
+});
+
+test("attestation 计数块必须自洽，缺字段或对不上都要拒", () => {
+  // onlyKeys 不要求字段存在，而 `?? {}` 又把缺失静默当成空桶 —— 两个宽松叠在一起，
+  // 一份没有 reason_counts 的报告能通过校验。这条把三处交叉一致性一起钉住。
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "readiness-counts-"));
+  recordDialogueBoundAuthorizationShadow({
+    shadowDir, authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.trustedEvent, runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy, now: NOW,
+  });
+  const report = analyzeShadowDir(shadowDir).report;
+  assert.equal(validateDialogueShadowReadinessReport(report).ok, true);
+
+  const withBlock = (block) => ({ ...report,
+    artifacts: { ...report.artifacts, attestations: { ...report.artifacts.attestations, ...block } } });
+  const stripped = { ...report,
+    artifacts: { ...report.artifacts,
+      attestations: { total: 1, attested: 0, unverified: 1 } } };
+  assert.equal(validateDialogueShadowReadinessReport(stripped).ok, false,
+    "reason_counts 整个缺失不得被当成空桶放过");
+  assert.equal(validateDialogueShadowReadinessReport(withBlock({ reason_counts: [] })).ok, false,
+    "数组不是普通对象");
+  assert.equal(validateDialogueShadowReadinessReport(
+    withBlock({ reason_counts: { "/private/secret": 1 } })).ok, false,
+    "任意 key 会把敏感字符串印进报告");
+  assert.equal(validateDialogueShadowReadinessReport(
+    withBlock({ reason_counts: { chat_scope_attestation_insufficient_evidence: 5 } })).ok, false,
+    "桶之和必须等于 total");
+  assert.equal(validateDialogueShadowReadinessReport(
+    withBlock({ attested: 1, unverified: 0 })).ok, false,
+    "attested 必须等于 attested 桶的计数");
 });
 
 test("attested 不等于 chat scope 可信：人工门禁一个都不能少", () => {

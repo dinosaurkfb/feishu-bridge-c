@@ -47,6 +47,16 @@ const KNOWN_REASONS = new Set([
 const onlyKeys = (value, allowed) => value && typeof value === "object" &&
   Object.keys(value).every((key) => allowed.includes(key));
 const nonNegativeInteger = (value) => Number.isInteger(value) && value >= 0;
+const plainObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
+/** 原因桶与 total / attested / unverified 三个数必须互相对得上。 */
+const attestationCountsAgree = (block) => {
+  const counts = Object.entries(block.reason_counts);
+  const sum = counts.reduce((n, [, v]) => n + v, 0);
+  const attestedBucket = block.reason_counts.attested ?? 0;
+  const others = sum - attestedBucket;
+  return sum === block.total && attestedBucket === block.attested && others === block.unverified;
+};
 const reasonBucket = (value) => value === null ? "accepted"
   : KNOWN_REASONS.has(value) ? value : "other";
 
@@ -416,10 +426,17 @@ export function validateDialogueShadowReadinessReport(report) {
         report?.artifacts?.attestations?.unverified].every(nonNegativeInteger) ||
       report.artifacts.attestations.attested + report.artifacts.attestations.unverified !==
         report.artifacts.attestations.total ||
+      // reason_counts 必须**存在**且是普通对象。onlyKeys 不要求字段存在，
+      // 而 `?? {}` 又会把"字段整个缺失"静默当成"空桶" —— 两个宽松叠在一起，
+      // 一份没有 reason_counts 的报告能通过校验。
+      !plainObject(report.artifacts.attestations.reason_counts) ||
       // 原因桶只允许 attestation 自己那套 key。任意 key 能进来就等于开了一条
       // 把敏感字符串印进报告的通道 —— 检查 id 那处已经栽过一次。
-      Object.entries(report.artifacts.attestations.reason_counts ?? {}).some(([key, value]) =>
+      Object.entries(report.artifacts.attestations.reason_counts).some(([key, value]) =>
         !ATTESTATION_REASON_BUCKETS.includes(key) || !nonNegativeInteger(value)) ||
+      // 桶要跟计数对得上，否则"结构合法"只是好看：三条各自独立，
+      // 少任何一条都能造出一份自洽不了却能过校验的报告。
+      !attestationCountsAgree(report.artifacts.attestations) ||
       !validMetric(report?.artifacts?.authorizations, ["active", "paused"]) ||
       ![report?.artifacts?.authorizations?.active, report?.artifacts?.authorizations?.paused]
         .every(nonNegativeInteger) ||

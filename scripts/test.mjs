@@ -7995,34 +7995,35 @@ test("钉住与留痕都失败时，绝不抛 —— 这一条消息的交付不
 });
 
 test("钉会话命令要按已验证的会话查绑定，不是只按项目", () => {
-  // 上一版只传 root：只有会话级绑定时被误报 not_bound；项目级与会话级并存时
-  // 错选了项目级；于是"这是会话级绑定，不需要另外钉"那条分支对当前会话根本不可达。
-  // 选绑定的规则必须跟出站一致 —— 按另一套规则找，就会出现"这里说 A、实际发到 B"。
+  // 上一版这条测试**本身是假阳性**：我造的是项目文件绑定，而 resolveProject 会把它
+  // 一律解释成项目级 —— 于是旧的错实现（只传 root）也照样通过。
+  // 现在按评审给的标准来：registry 里同根目录**同时**放项目级和会话级两条。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pinlvl-"));
+  const root = path.join(dir, "proj");
+  fs.mkdirSync(root);
+  const registryFile = path.join(dir, "registry.json");
+  const session = "01911111-2222-7333-8444-555555555555";
+  const projectEntry = newRegistryEntry({
+    root, name: "项目级", purpose: null, token: "aaa111", rootMessageId: "om_proj", now: NOW });
+  const sessionEntry = {
+    ...newRegistryEntry({
+      root, name: "会话级", purpose: null, token: "bbb222", rootMessageId: "om_sess", now: NOW }),
+    id: "sess-entry", claude_session_id: session,
+  };
+  fs.writeFileSync(registryFile, JSON.stringify({
+    schema_version: "1.0", projects: [projectEntry, sessionEntry] }));
+
+  // 传了会话 → 选中会话级；不传 → 落到项目级。后者正是旧实现的错处。
+  assert.equal(resolveProject({ root, claudeSessionId: session, registryFile }).bindingLevel,
+    "session");
+  assert.equal(resolveProject({ root, registryFile }).bindingLevel, "project");
+
+  // 命令必须把已验证的会话传下去。退回 currentBinding({ root }) 时这条会失败 ——
+  // 那是评审给的验收标准。
   const src = fs.readFileSync(path.resolve("scripts", "feishu-pin-session.mjs"), "utf-8");
   assert.match(src, /currentBinding\(\{ root, claudeSessionId:/u,
-    "必须把已验证的会话传给 currentBinding");
-
-  // 行为面：会话级绑定存在时，命令要认出它并拒绝重复钉。
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pinlvl-"));
-  const inbound = path.join(dir, ".runtime-data", "inbound");
-  fs.mkdirSync(inbound, { recursive: true });
-  const session = "01911111-2222-7333-8444-555555555555";
-  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
-    project_dir: dir, logical_task_key: "k", project_display_name: "P", task_display_name: "P",
-  }));
-  // 项目内文件里带上会话标识 → 这是一条会话级绑定。
-  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
-    status: "active", root_message_id: "om_fixture",
-    claude_session_id: session, channel_generation_id: "gen-1",
-  }));
-
-  const run = spawnSync(process.execPath, [
-    path.resolve("scripts", "feishu-pin-session.mjs"), "--project", dir, "--apply",
-  ], { encoding: "utf-8", env: { ...process.env, CLAUDE_CODE_SESSION_ID: session, CLAUDE_PID: "999999" } });
-  // 身份核验会先拦住（PID 对不上），但**绝不能**是 not_bound —— 那说明绑定都没找对。
-  assert.notEqual(run.status, 0);
-  assert.doesNotMatch(run.stderr, /还没接入飞书/u,
-    "会话级绑定存在时不该被误报成没接入");
+    "退回只传 root，就会在项目级与会话级并存时错选项目级");
+  assert.doesNotMatch(src, /currentBinding\(\{ root \}\)/u);
 });
 
 summarySealed = true;

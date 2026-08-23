@@ -485,7 +485,17 @@ if (boundSession) {
     // 现场只有一条时顺手钉下来 —— 那一刻没有歧义，钉了下次才不用碰运气。
     // 上一版**声明了这件事却没做**：生产路径固定传 pinned:null，也从不读 picked.pin，
     // 于是"已钉会话"那条分支只活在单测里。
-    if (picked.pin) writeDeliveryPin(config.project_dir, picked.pin);
+    if (picked.pin) {
+      // 写不成不影响这一条的投递（目标已经选定了），但**不能假装钉住了** ——
+      // 下一条消息会因为"没钉过"重新走歧义判断，而日志里若无痕迹就查不出为什么。
+      const pinned = writeDeliveryPin(config.project_dir, picked.pin);
+      if (!pinned.ok) {
+        // 留在 claim 里可对账 —— inbound 没有 log 通道，而"以为钉住了其实没钉"
+        // 会在下一条消息上表现成莫名其妙的歧义拒收，那时再查就没有痕迹了。
+        recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "note",
+          detail: { note: "delivery_pin_not_persisted", reason: pinned.reason } });
+      }
+    }
   } else if (picked.reason === DELIVERY_REJECT.AMBIGUOUS) {
     ambiguousDelivery = picked;
   }

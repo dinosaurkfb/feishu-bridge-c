@@ -4963,7 +4963,7 @@ test("状态命令和出站用的是同一条绑定选择规则", () => {
   assert.ok(src.includes("selectBindingEntry"));
 });
 
-test("五条控制技能都装成跟 Codex 同名的斜杠命令", () => {
+test("六条控制技能都装成跟 Codex 同名的斜杠命令", () => {
   const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
   for (const [repo, installed] of [
     ["claude-feishu-bind", "feishu-bind"],
@@ -4971,6 +4971,7 @@ test("五条控制技能都装成跟 Codex 同名的斜杠命令", () => {
     ["claude-feishu-unbind", "feishu-unbind"],
     ["claude-feishu-rotate", "feishu-rotate"],
     ["claude-feishu-mode", "feishu-mode"],
+    ["claude-feishu-pin-session", "feishu-pin-session"],
   ]) {
     assert.ok(src.includes(repo), "安装器要认得仓库里的 " + repo);
     assert.ok(src.includes('"' + installed + '"'), "要装成 /" + installed);
@@ -7676,7 +7677,7 @@ test("首选会话真的落盘、读得回、也撤得掉", () => {
   assert.equal(clearDeliveryPin(root).ok, true, "本来就没有也算成功");
 });
 
-test("钉会话命令：默认预览，且不许替别的项目的会话钉", () => {
+test("钉会话命令：身份要交叉核验，拼错的参数不许执行成另一种操作", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pincmd-"));
   const inbound = path.join(dir, ".runtime-data", "inbound");
   fs.mkdirSync(inbound, { recursive: true });
@@ -7691,17 +7692,64 @@ test("钉会话命令：默认预览，且不许替别的项目的会话钉", ()
     path.resolve("scripts", "feishu-pin-session.mjs"), "--project", dir, ...args,
   ], { encoding: "utf-8", env: { ...process.env, ...env } });
 
-  // 认不出自己就别猜。
-  const noSelf = run([], { CLAUDE_CODE_SESSION_ID: "" });
-  assert.notEqual(noSelf.status, 0);
-  assert.match(noSelf.stderr, /认不出这是哪条会话/u);
+  // **只信环境变量是不够的。**上一版只读 CLAUDE_CODE_SESSION_ID，
+  // 于是 PID 是假的也照样写 pin。现在 session id、PID、现场登记三者要对上。
+  const noEnv = run([], { CLAUDE_CODE_SESSION_ID: "", CLAUDE_PID: "" });
+  assert.notEqual(noEnv.status, 0);
+  assert.match(noEnv.stderr, /认不出这是哪条会话/u);
 
-  // 会话不在这个项目的现场里 → 拒。否则带 --project 从别处跑就能钉一条无关会话。
-  const foreign = run(["--apply"], { CLAUDE_CODE_SESSION_ID: "sess-foreign" });
-  assert.notEqual(foreign.status, 0);
-  assert.match(foreign.stderr, /不在该项目的现场记录里/u);
+  const fakePid = run(["--apply"], { CLAUDE_CODE_SESSION_ID: "sess-foreign", CLAUDE_PID: "999999" });
+  assert.notEqual(fakePid.status, 0, "对不上的 PID 不许写 pin");
+  assert.match(fakePid.stderr, /认不出这是哪条会话/u);
   assert.equal(readDeliveryPin(dir), null, "拒绝时不得写盘");
+
+  // **拼错的参数不许被执行成另一种操作。**上一版 --cleer --apply 被静默当成"钉住"。
+  // 这一课我在 register-status-provider 上刚学过，写这个新命令时没用上。
+  for (const [args, reason] of [
+    [["--cleer", "--apply"], "unknown_option"],
+    [["--apply", "--apply"], "duplicate_option"],
+    [["--project"], "option_needs_value"],
+    [["裸参数"], "unexpected_argument"],
+  ]) {
+    const bad = spawnSync(process.execPath, [
+      path.resolve("scripts", "feishu-pin-session.mjs"), ...args,
+    ], { encoding: "utf-8" });
+    assert.notEqual(bad.status, 0, reason);
+    assert.match(bad.stderr, new RegExp(reason, "u"));
+  }
+  assert.equal(readDeliveryPin(dir), null);
 });
+
+test("钉会话技能装出来之后，里面那条命令必须能跑", () => {
+  // 拒收回执把人指向这条命令，所以"技能装出来了"不够 —— 装出来的那条命令得真能执行。
+  // 之前栽过一次：文档里的示例漏了参数，照着登记之后 provider 直接 exit 2。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pinskill-"));
+  fs.mkdirSync(path.join(dir, ".claude", "skills"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), "{}\n");
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "install-outbound.mjs"), "--apply",
+  ], { encoding: "utf-8", env: {
+    ...process.env, HOME: dir,
+    CODEX_HOME: path.join(dir, "codex-home"),
+    FEISHU_CODEX_BRIDGE_HOME: path.join(dir, "bridge-home"),
+  } });
+  assert.equal(run.status, 0, run.stderr);
+
+  const installed = path.join(dir, ".claude", "skills", "feishu-pin-session", "SKILL.md");
+  assert.ok(fs.existsSync(installed), "技能要真的装出来");
+  const text = fs.readFileSync(installed, "utf-8");
+  assert.match(text, /name: feishu-pin-session/u);
+  // 渲染后必须指向 runtime，不能留占位符、也不能指向某个开发克隆。
+  assert.doesNotMatch(text, /\{\{SCRIPT/u, "占位符必须被渲染掉");
+  assert.match(text, /runtime\/current\/scripts\/feishu-pin-session\.mjs/u);
+
+  // 把技能里那条只读命令抠出来，确认它指向的脚本真的装到了 runtime。
+  const cmd = text.split("\n").find((l) => l.trim().startsWith("node '") && !l.includes("--"));
+  assert.ok(cmd, "技能里应当有一条无参数的只读命令");
+  const script = cmd.match(/'([^']+)'/u)[1];
+  assert.ok(fs.existsSync(script), "技能指向的脚本必须真的存在：" + script);
+});
+
 
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

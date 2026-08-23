@@ -22,20 +22,67 @@ import path from "node:path";
 
 import { isDirectRun } from "./direct-run.mjs";
 import { currentBinding } from "./feishu-control.mjs";
+import { identifySelf } from "./bind-session.mjs";
 import {
   clearDeliveryPin, findLiveSessions, readDeliveryPin, writeDeliveryPin,
 } from "./live-session.mjs";
 
-const arg = (name) => {
-  const at = process.argv.indexOf("--" + name);
-  return at >= 0 ? process.argv[at + 1] : undefined;
+/**
+ * 严格解析。**白名单，不是"认识的就用、不认识的忽略"。**
+ *
+ * 上一版见到未知参数直接忽略，于是 `--cleer --apply` 被静默当成"钉住"执行 ——
+ * 一个拼写错误换来了另一种操作。这一课我在 register-status-provider 上刚学过，
+ * 写这个新命令时没用上。
+ */
+const FLAGS = new Set(["apply", "clear"]);
+const OPTIONS = new Set(["project"]);
+
+function parseArgs(tokens) {
+  const seen = new Map();
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i];
+    if (typeof t !== "string" || !t.startsWith("--")) {
+      return { ok: false, reason: "unexpected_argument", detail: t };
+    }
+    const name = t.slice(2);
+    if (seen.has(name)) return { ok: false, reason: "duplicate_option", detail: t };
+    if (FLAGS.has(name)) { seen.set(name, true); continue; }
+    if (!OPTIONS.has(name)) return { ok: false, reason: "unknown_option", detail: t };
+    const value = tokens[i + 1];
+    if (typeof value !== "string" || value.startsWith("--")) {
+      return { ok: false, reason: "option_needs_value", detail: t };
+    }
+    seen.set(name, value);
+    i += 1;
+  }
+  return { ok: true, seen };
+}
+
+const REASON_TEXT = {
+  unexpected_argument: "只接受 --xxx 形式的参数",
+  duplicate_option: "同一个参数给了两次",
+  unknown_option: "不认识这个参数（拼错了？）",
+  option_needs_value: "这个参数缺少取值",
 };
 
 function main() {
-  const apply = process.argv.includes("--apply");
-  const clear = process.argv.includes("--clear");
-  const root = path.resolve(arg("project") ?? process.cwd());
-  const self = process.env.CLAUDE_CODE_SESSION_ID ?? null;
+  const parsed = parseArgs(process.argv.slice(2));
+  if (!parsed.ok) {
+    console.error("失败（" + parsed.reason + "）：" +
+      (REASON_TEXT[parsed.reason] ?? parsed.reason) +
+      (parsed.detail ? "：" + parsed.detail : ""));
+    process.exit(1);
+  }
+  const apply = parsed.seen.has("apply");
+  const clear = parsed.seen.has("clear");
+  const rootArg = parsed.seen.get("project");
+  const root = path.resolve(typeof rootArg === "string" ? rootArg : process.cwd());
+
+  // **不能只信环境变量。**identifySelf 会把 session id、PID 和现场登记三者对上 ——
+  // 上一版只读 CLAUDE_CODE_SESSION_ID，于是 PID 是假的也照样写 pin。
+  // 这个函数早就存在（bind-session 用它绑会话），我又写了一份只信环境变量的。
+  const me = identifySelf();
+  const self = me.ok ? me.sessionId : null;
 
   const st = currentBinding({ root });
   if (!st.ok) {
@@ -67,7 +114,7 @@ function main() {
 
   if (!self) {
     // 认不出自己就别猜。在别处替另一条会话钉，等于把刚拆掉的猜测换个地方装回去。
-    console.error("\n读不到 CLAUDE_CODE_SESSION_ID，认不出这是哪条会话。");
+    console.error("\n认不出这是哪条会话（" + me.reason + "）：" + (me.detail ?? ""));
     console.error("请**在你要接收消息的那条会话里**运行这条命令。");
     process.exit(1);
   }

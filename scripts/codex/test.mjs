@@ -1528,6 +1528,12 @@ test("bridge_recursion 只识别真实入口执行，不把源码引用和排障
     "/bin/zsh -lc \"rg -n \\\"scripts/codex/inbound.mjs\\\" scripts\"",
     "/bin/zsh -lc \"sed -n '1,50p' \\\"/bridge/scripts/codex/inbound.mjs\\\"\"",
     "/bin/zsh -lc \"echo \\\"node /bridge/scripts/codex/inbound.mjs\\\" > /tmp/note.txt\"",
+    // 引号内的分隔符不开启新命令。按原始文本无差别切分会切出一个看起来像执行的片段，
+    // 而这两条其实各自只是一条 echo / rg。
+    "/bin/zsh -lc \"echo \\\"ignore; node /bridge/scripts/codex/inbound.mjs\\\"\"",
+    "/bin/zsh -lc \"rg -n \\\"x|node /bridge/scripts/codex/inbound.mjs\\\" scripts\"",
+    // POSIX 双引号内 \\' 不是合法转义，不能把它当成干净引号还原掉。
+    "/bin/zsh -lc \"node \\\\'/bridge/scripts/codex/inbound.mjs\\\\'\"",
   ];
   for (const command of benignCommands) assert.equal(isCodexInboundExecution(command), false, command);
 

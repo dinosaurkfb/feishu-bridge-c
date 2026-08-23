@@ -116,7 +116,50 @@ const SHELL_WRAPPER =
  *
  * 单引号包裹体在 POSIX shell 里不处理任何转义，原样返回才是对的。
  */
-const unescapeDoubleQuoted = (body) => body.replace(/\\(["'\\$`])/gu, "$1");
+const unescapeDoubleQuoted = (body) => body.replace(/\\(["\\$`])/gu, "$1");
+
+/**
+ * 只在**引号之外**按 `;` `|` `&&` `||` 分段，并按 shell 语义处理引号与转义。
+ *
+ * 按原始文本无差别切分会造出新的误报：引号里的分隔符并不开启新命令。
+ *   echo "ignore; node …/inbound.mjs"        —— `;` 在双引号内
+ *   rg -n "x|node …/inbound.mjs" scripts     —— `|` 在双引号内
+ * 两者都只是一条 echo / rg，切开后却会冒出一个看起来像执行的片段。
+ *
+ * 顶层的反斜杠保留原样，不做还原：双引号内 `\'` 并不是合法转义（POSIX 双引号不转义单引号），
+ * 把它当成干净引号会让 `node \'…/inbound.mjs\'` 被误判成执行。
+ */
+const splitTopLevelSegments = (text) => {
+  const segments = [];
+  let current = "";
+  let quote = null;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null; else current += ch;
+      continue;
+    }
+    if (quote === "\"") {
+      if (ch === "\\" && i + 1 < text.length && "\"\\$`".includes(text[i + 1])) {
+        current += text[i + 1];
+        i += 1;
+      } else if (ch === "\"") quote = null;
+      else current += ch;
+      continue;
+    }
+    if (ch === "'" || ch === "\"") { quote = ch; continue; }
+    if (ch === "\\" && i + 1 < text.length) { current += ch + text[i + 1]; i += 1; continue; }
+    if (ch === ";" || ch === "|" || ch === "&") {
+      if ((ch === "|" || ch === "&") && text[i + 1] === ch) i += 1;
+      segments.push(current);
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  segments.push(current);
+  return segments;
+};
 
 export function isCodexInboundExecution(command) {
   if (typeof command !== "string" || command.trim().length === 0) return false;
@@ -130,7 +173,7 @@ export function isCodexInboundExecution(command) {
     text = (quote === "\"" ? unescapeDoubleQuoted(body) : body).trim();
   }
   // 不按换行拆分：换行后的文本可能是 heredoc/测试夹具，不代表新的 shell command。
-  return text.split(/&&|\|\||[;|]/u).some((segment) =>
+  return splitTopLevelSegments(text).some((segment) =>
     DIRECT_INBOUND_EXECUTION.test(segment.trim().replace(/^[('"\s]+/u, "")));
 }
 

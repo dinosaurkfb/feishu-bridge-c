@@ -33,7 +33,7 @@ node scripts/register-status-provider.mjs \
   --script /abs/provider.mjs \
   --kinds transport \
   --project-root /abs/project \
-  -- --binding /abs/binding.json
+  -- --provider-id cc2cd --binding /abs/binding.json
 ```
 
 默认只预览，`--apply` 才落盘。`--replace` 改登记、`--unregister` 撤销，同样默认预览。

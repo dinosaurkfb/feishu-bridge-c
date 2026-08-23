@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 /**
- * 自动轮转的可控演练 —— 把「失败重试」和「不重复轮转」跑成可读的证据。
+ * 自动轮转的可控演练 —— 把「失败重试」和「不重复启动轮转 worker」跑成可读的证据。
+ *
+ * **这里证明不了「不会重复创建飞书根话题」。**假子进程压根没建过话题，所以演练
+ * 能说的只是"冷却期内不会再起一个 worker"。真正的「同一轮只产生一个根话题」要靠
+ * 幂等键在真实轮转里验，仍然挂在待验收上 —— 上一版把结论写成"不重复建话题"，
+ * 是拿一个证明不了的说法当了证据。
  *
  * 为什么需要它：这两条在路线图上一直挂着「待验收」。它们的**状态机**有单元测试，
  * 但状态机对了不等于整条路走得通 —— 单元测试拿的是内存里的 state 对象，
@@ -94,7 +99,7 @@ export function drillFailureRetry() {
     root, generationId, eventKey: "immediate", registryFile,
     now: NOW + 100 + 1000, spawnImpl,
   });
-  check(steps, "失败后紧邻的消息不重复建话题",
+  check(steps, "失败后紧邻的消息不重复启动轮转 worker",
     immediate.shouldAutoRotate === false && launches.length === 1,
     "shouldAutoRotate=" + immediate.shouldAutoRotate + "，累计起子进程 " + launches.length + " 次");
 
@@ -107,7 +112,7 @@ export function drillFailureRetry() {
     retry.shouldAutoRotate === true && launches.length === 2,
     "累计起子进程 " + launches.length + " 次");
 
-  return { name: "失败重试与不重复轮转", steps };
+  return { name: "失败重试与不重复启动 worker", steps };
 }
 
 /**
@@ -160,7 +165,9 @@ function main() {
       : failed.length + " 项未通过。"));
     // 说清这份证据管到哪一步，别让它被当成真实验收。
     console.log("这是**可控演练**，不是真实验收：失败是注入的，时钟是喂的，不经飞书。");
-    console.log("它回答「失败之后会不会重试、会不会重复建话题」，不回答「飞书那边对不对」。");
+    console.log("它回答「失败之后会不会重试、冷却期内会不会再起一个 worker」。");
+    console.log("它**不**回答「会不会重复创建飞书根话题」—— 假子进程没建过话题，");
+    console.log("那条要靠幂等键在真实轮转里验，仍挂在待验收上。");
   }
   process.exit(failed.length === 0 ? 0 : 1);
 }

@@ -7486,44 +7486,49 @@ test("出站发布按真实配置渲染，读不到不许默认成开启", () =>
   assert.match(render(undefined), /出站发布.*状态不可用（读不到发布配置）/u);
 });
 
-test("发布开关只管住两条自动路径，兜底排空不受它约束", () => {
-  // 这条钉的是**实际行为**，不是渲染字符串 —— status 的措辞是照着这个事实写的，
-  // 哪天热路径改了、措辞没跟上，这里会先亮。
+test("发布开关关闭时，兜底排空照样走到发布准备", () => {
+  // 上一版这条是**假阳性**：夹具不是有效绑定，drainProject 直接返回
+  // {status:"error", reason:"not_bound"}，而断言只要求"不等于 empty"，
+  // 于是全绿却什么都没证明。我一边说"这条钉的是实际行为"，一边写了个走不到那一步的夹具。
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pub-"));
-  const cfg = path.join(dir, ".feishu-bridge.json");
-  const session = "01911111-2222-7333-8444-555555555555";
+  const inbound = path.join(dir, ".runtime-data", "inbound");
   const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
   fs.mkdirSync(obDir, { recursive: true });
-  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
-    kind: "progress", text: "待发", created_at: new Date().toISOString(),
-    published_at: null,
-  }));
-  fs.writeFileSync(cfg, JSON.stringify({
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
     project_dir: dir, logical_task_key: "k", project_display_name: "P",
     task_display_name: "P", auto_publish_on_completion: false,
   }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_fixture", claude_session_id: null,
+    channel_generation_id: "gen-1",
+  }));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
+    kind: "progress", text: "待发", created_at: new Date().toISOString(), published_at: null,
+  }));
 
-  // 兜底排空不读这个开关：关掉它，它照样往下走 —— 要是它遵守开关，
-  // 就会在这里因为"没开自动发布"提前短路，而不是继续去解析绑定。
+  // 开关关着，它仍然一路走到发布准备 —— 这才是"兜底排空不读这个开关"的行为证据。
   const drained = drainProject({ root: dir, claudeSessionId: null, dryRun: true });
-  assert.notEqual(drained.status, "empty", "有待发事件时不该报空");
-  assert.doesNotMatch(String(drained.reason ?? ""), /auto_publish|publish_disabled/u,
-    "兜底排空没有因为发布开关而停下 —— status 的措辞就是照着这个事实写的");
+  assert.equal(drained.status, "dry_run", "有效绑定下必须走到发布准备，否则这条断言什么都没证明");
+  assert.equal(drained.count, 1);
+});
 
-  // 两条自动路径读它 —— 用源码里那两处判断的存在来定位，
-  // 但断言的是"它们各自的判断条件里确实有这个字段"，不是"文件里提到过"。
+test("发布开关只被两条路径读取，而它们不是主路径", () => {
+  // 这几条是结构断言，管的是"哪个文件读了这个配置键"——它本身就是个源码事实。
+  // 上面那条才是行为证据。两层都要：行为证明兜底会发，结构说明为什么会发。
   for (const rel of ["inbound.mjs", "watch-and-publish.mjs"]) {
-    const src = fs.readFileSync(path.resolve("scripts", rel), "utf-8");
-    assert.match(src, /auto_publish_on_completion !== false/u,
-      rel + " 应当读取发布开关");
+    assert.match(fs.readFileSync(path.resolve("scripts", rel), "utf-8"),
+      /auto_publish_on_completion !== false/u, rel + " 应当读取发布开关");
   }
-  // 不读它的那两条恰好是主路径：每轮 Stop、30 分钟兜底。
+  // 不读它的这两条恰好是 Claude 侧主路径：每轮 Stop、30 分钟兜底。
   for (const rel of ["drain-outbox.mjs", "stop-hook.mjs"]) {
     assert.doesNotMatch(fs.readFileSync(path.resolve("scripts", rel), "utf-8"),
       /auto_publish_on_completion/u,
       rel + " 目前不读这个开关 —— 改了它就要同时改 status 的措辞");
   }
-  assert.equal(session.length, 36);
+  // Stop 每轮都调排空，所以"关掉开关"在 Claude 侧几乎不改变任何事。
+  assert.match(fs.readFileSync(path.resolve("scripts", "stop-hook.mjs"), "utf-8"),
+    /drainProject\(/u, "Stop 每轮排空是这条结论的前提");
 });
 
 test("绑定名称不冒充飞书当前话题标题", () => {
@@ -7562,6 +7567,53 @@ test("轮转演练本身要是绿的 —— 它是验收证据，烂了就没人
     assert.ok(drill.steps.length >= 3, drill.name + " 的步骤不该变少");
   }
 });
+
+test("按文档里那条命令登记，聚合方要真的能取到状态", () => {
+  // 上一版文档示例漏了 --provider-id，按它登记之后 provider 以 exit 2 失败，
+  // 而文档、安装器示例和测试都没人发现 —— 一条跑不起来的示例比没有示例更糟。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-e2e-"));
+  const providersFile = path.join(dir, "providers.json");
+  const bindingFile = path.join(dir, "binding.json");
+  fs.writeFileSync(bindingFile, JSON.stringify({
+    bind_scope: "chat", status: "active", chat_id: "oc_SECRET123456",
+    chat_name: "Claude2Codex", expires_at: "2099-01-01T00:00:00.000Z",
+  }));
+
+  // **把命令从文档里抠出来真跑**，不是照着抄一份 —— 抄一份只能证明"正确的写法能跑"，
+  // 拦不住文档自己漂移。上一版文档漏了 --provider-id，而没有任何东西发现。
+  const doc = fs.readFileSync(
+    path.resolve("docs", "implementation", "status-provider-protocol.md"), "utf-8");
+  const block = doc.slice(doc.indexOf("```bash") + 7);
+  const argv = block.slice(0, block.indexOf("```"))
+    .replaceAll("\\\n", " ")
+    .trim().split(/\s+/u)
+    .map((t) => t === "/abs/provider.mjs" ? path.resolve("scripts", "group-binding-status.mjs")
+      : t === "/abs/project" ? dir
+      : t === "/abs/binding.json" ? bindingFile
+      : t);
+  assert.equal(argv[0], "node", "文档里的示例应当是一条 node 命令");
+  assert.ok(argv.includes("--"), "示例应当带透传段");
+
+  const registered = spawnSync(process.execPath, [
+    path.resolve(argv[1]), ...argv.slice(2, argv.indexOf("--")), "--apply",
+    "--", ...argv.slice(argv.indexOf("--") + 1),
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: providersFile } });
+  assert.equal(registered.status, 0, "文档里那条命令必须能跑通：" + registered.stderr);
+
+  // 然后让聚合方真的执行它 —— 不注入 run，走真实 execFile。
+  const view = collectProjectConnectivity({ root: dir, providersFile });
+  assert.equal(view.sections.length, 1);
+  assert.equal(view.sections[0].state, "ok",
+    "按文档登记之后必须取得到状态：" + (view.sections[0].reason ?? ""));
+  assert.deepEqual(view.sections[0].connections, [{
+    kind: "transport", state: "active", scope: "chat",
+    groupName: "Claude2Codex", topicName: null,
+  }]);
+
+  // 顺带确认渲染出去的东西不带 locator。
+  assert.equal(renderConnectivity(view).includes("oc_SECRET123456"), false);
+});
+
 
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

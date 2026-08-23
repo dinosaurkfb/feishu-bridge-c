@@ -9,7 +9,8 @@
  *
  * 用法：
  *   node scripts/register-status-provider.mjs --id cc2cd \
- *     --script /abs/provider.mjs --kinds transport -- --binding /abs/binding.json
+ *     --script /abs/provider.mjs --kinds transport --project-root /abs/project \
+ *     -- --provider-id cc2cd --binding /abs/binding.json
  *   ...同上 --apply
  *
  * `--` 之后的都是传给 provider 的参数，原样存下，执行时逐项传递、不做展开。

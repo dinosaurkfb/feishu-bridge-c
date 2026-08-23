@@ -37,6 +37,7 @@ import {
 } from "./prompt-hook.mjs";
 import {
   buildCodexSubscriptionProjection, enableAutoPublishForAllTasks, evaluatePromotion,
+  readMigrationReceipt,
   extractQuotedBindingTokens, findPendingTask,
   findRegisteredTaskForCodexThread, findTaskForCodexThread, findTaskForFeishuSession,
   isThreadBusy, loadCodexTemplate, loadRegistry, makeTaskEntry, mappingForTask, recordThreadActivity, resolveTask,
@@ -1931,7 +1932,11 @@ test("安装器在隔离 HOME 只追加 hooks、渲染技能路径且保留已�
   }
   assert.equal(fs.existsSync(path.join(home, "registry.json")), true);
   assert.equal(fs.statSync(path.join(home, "receipts")).isDirectory(), true);
-  assert.equal(loadRegistry(path.join(home, "registry.json")).tasks[0].auto_publish_on_completion, true);
+  // **安装不再改订阅策略。**这条原来断言的正是"安装会把 task 的
+  // auto_publish_on_completion 改成 true" —— 那是装基础设施顺手改掉每条绑定的发布行为，
+  // 不预览、不留痕、不可选。现在它必须保持原样，迁移走显式的 migrate-auto-publish.mjs。
+  assert.equal(loadRegistry(path.join(home, "registry.json")).tasks[0].auto_publish_on_completion,
+    false, "安装不得改动既有 task 的发布策略");
 });
 
 test("入站前置回执目录不可写时只返回脱敏错误，不泄露 Node 堆栈", () => {
@@ -1957,10 +1962,204 @@ test("自动发布登记迁移幂等，暂停 task 也保留恢复后的发布�
   paused.auto_publish_on_completion = false;
   paused.status = "paused";
   writeRegistry([active, paused], path.join(home, "registry.json"));
-  assert.equal(enableAutoPublishForAllTasks({ home }).changed, 2);
-  assert.equal(enableAutoPublishForAllTasks({ home }).changed, 0);
+  // 默认只预览：报得出待迁移数，但不写。
+  const preview = enableAutoPublishForAllTasks({ home });
+  assert.equal(preview.changed, 2);
+  assert.equal(preview.applied, false, "不带 apply 不得落盘");
+  assert.equal(preview.migration, "auto_publish_on_completion_v1", "迁移要有版本身份");
+  assert.equal(enableAutoPublishForAllTasks({ home }).changed, 2,
+    "预览不改变状态，所以再预览一次数字不变");
+
+  assert.equal(enableAutoPublishForAllTasks({ home, apply: true }).changed, 2);
+  assert.equal(enableAutoPublishForAllTasks({ home, apply: true }).changed, 0);
   assert.deepEqual(loadRegistry(path.join(home, "registry.json")).tasks.map((task) => task.auto_publish_on_completion),
     [true, true]);
+});
+
+test("迁移只改目标字段：停用项、怪路径记录、未知顶层字段都不能被顺手删掉", () => {
+  const home = temp();
+  const file = path.join(home, "registry.json");
+  // 刻意绕过 writeRegistry 直接造文档：这些正是 loadRegistry 会滤掉、
+  // writeRegistry 会丢掉的东西，用视图读写就会静默删数据。
+  fs.writeFileSync(file, JSON.stringify({
+    schema_version: "1.0", runtime: "codex", custom_marker: "KEEP_ME",
+    tasks: [
+      { logical_task_key: "a", root: "/tmp/a" },
+      { logical_task_key: "b", root: "/tmp/b", enabled: false },
+      { logical_task_key: "c", root: "relative/bad" },
+    ],
+  }));
+  assert.equal(enableAutoPublishForAllTasks({ home, apply: true }).changed, 3);
+
+  const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
+  assert.deepEqual(raw.tasks.map((t) => t.logical_task_key), ["a", "b", "c"], "一条都不能少");
+  assert.equal(raw.custom_marker, "KEEP_ME", "不认识的顶层字段要原样留着");
+  assert.equal(raw.tasks[1].enabled, false, "停用状态不能被抹掉");
+  assert.equal(raw.tasks.every((t) => t.id === undefined), true, "迁移不得顺手补写 id");
+  assert.equal(raw.tasks.every((t) => t.auto_publish_on_completion === true), true);
+});
+
+test("迁移遇到解释不了的登记结构要 fail-closed，不许过滤后整表写回", () => {
+  for (const [shape, reason] of [
+    [{ tasks: "not-an-array" }, "registry_shape_unexpected"],
+    [{ tasks: [null] }, "registry_entry_unreadable"],
+    [{ tasks: [["a"]] }, "registry_entry_unreadable"],
+  ]) {
+    const home = temp();
+    const file = path.join(home, "registry.json");
+    const before = JSON.stringify({ schema_version: "1.0", ...shape });
+    fs.writeFileSync(file, before);
+    const r = enableAutoPublishForAllTasks({ home, apply: true });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, reason);
+    assert.equal(fs.readFileSync(file, "utf-8"), before, "拒绝时一个字节都不该动");
+  }
+});
+
+test("迁移留持久回执：零变更也留，且回执与实际计数自洽", () => {
+  const home = temp();
+  const file = path.join(home, "registry.json");
+  fs.writeFileSync(file, JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks: [
+    { logical_task_key: "a", root: "/tmp/a" },
+    { logical_task_key: "b", root: "/tmp/b", auto_publish_on_completion: true },
+  ] }));
+  assert.equal(readMigrationReceipt(home), null, "没跑过就没有回执");
+
+  const first = enableAutoPublishForAllTasks({ home, apply: true });
+  const r1 = readMigrationReceipt(home);
+  assert.equal(first.receipt, true);
+  assert.equal(r1.changed, first.changed, "回执得跟这次真改了多少条对得上");
+  assert.equal(r1.tasks, first.tasks);
+  assert.equal(r1.changed, 1);
+  assert.equal(typeof r1.applied_at, "string");
+
+  // 零变更也要留痕，否则「跑过但本来就没东西可改」和「从没跑过」分不开。
+  const second = enableAutoPublishForAllTasks({ home, apply: true });
+  assert.equal(second.changed, 0);
+  assert.equal(readMigrationReceipt(home).changed, 0);
+});
+
+test("apply 路径必须取锁后再读，待迁移为 0 也不许绕过锁", () => {
+  const home = temp();
+  fs.writeFileSync(path.join(home, "registry.json"), JSON.stringify({
+    schema_version: "1.0", runtime: "codex",
+    tasks: [{ logical_task_key: "a", root: "/tmp/a", auto_publish_on_completion: true }],
+  }));
+  const lockDir = path.join(home, "registry.lock");
+  fs.mkdirSync(lockDir, { recursive: true });
+  // 必须是**有效**的持有者，否则会被当成陈旧锁正当接管。
+  fs.writeFileSync(path.join(lockDir, "owner.json"),
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+
+  const r = enableAutoPublishForAllTasks({ home, apply: true });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "registry_busy", "旧实现在取锁前就返回了 applied:true");
+  assert.equal(readMigrationReceipt(home), null, "没跑成就不该留回执");
+
+  // 预览不写盘，所以不需要锁。
+  assert.equal(enableAutoPublishForAllTasks({ home, apply: false }).ok, true);
+});
+
+test("迁移账本坏了就停手：不写登记表，也不覆盖账本", () => {
+  // 账本是数组：JSON 上合法，但 all[id] = … 之后 stringify 会把它丢掉 ——
+  // 于是"写成功了"却读不回来。必须在动登记表之前就挡住。
+  for (const [ledger, reason] of [
+    ["[]", "migrations_shape_unexpected"],
+    ["null", "migrations_shape_unexpected"],
+    ["{ 坏掉的 json", "migrations_unreadable"],
+  ]) {
+    const home = temp();
+    const file = path.join(home, "registry.json");
+    const before = JSON.stringify({ schema_version: "1.0", runtime: "codex",
+      tasks: [{ logical_task_key: "a", root: "/tmp/a" }] });
+    fs.writeFileSync(file, before);
+    fs.writeFileSync(path.join(home, "migrations.json"), ledger);
+
+    const r = enableAutoPublishForAllTasks({ home, apply: true });
+    assert.equal(r.ok, false, "账本不可用时不该报成功：" + ledger);
+    assert.equal(r.reason, reason);
+    assert.equal(fs.readFileSync(file, "utf-8"), before, "登记表一个字节都不该动");
+    assert.equal(fs.readFileSync(path.join(home, "migrations.json"), "utf-8"), ledger,
+      "坏账本不是重建它的理由");
+  }
+});
+
+test("迁移回执不覆盖别的迁移，且写完要读回来核验", () => {
+  const home = temp();
+  fs.writeFileSync(path.join(home, "registry.json"), JSON.stringify({
+    schema_version: "1.0", runtime: "codex",
+    tasks: [{ logical_task_key: "a", root: "/tmp/a" }],
+  }));
+  const other = { applied_at: "2020-01-01T00:00:00.000Z", tasks: 9, changed: 9 };
+  fs.writeFileSync(path.join(home, "migrations.json"),
+    JSON.stringify({ some_other_migration_v3: other }));
+
+  const r = enableAutoPublishForAllTasks({ home, apply: true });
+  assert.equal(r.receipt, true);
+  const all = JSON.parse(fs.readFileSync(path.join(home, "migrations.json"), "utf-8"));
+  assert.deepEqual(all.some_other_migration_v3, other, "别人的回执不能被顺手抹掉");
+  assert.equal(all.auto_publish_on_completion_v1.changed, 1);
+  // 读回来核验：写入不报错 ≠ 内容落对了。
+  assert.deepEqual(readMigrationReceipt(home), all.auto_publish_on_completion_v1);
+});
+
+test("预览要把账本损坏和没有回执报成两种状态", () => {
+  const home = temp();
+  fs.writeFileSync(path.join(home, "registry.json"), JSON.stringify({
+    schema_version: "1.0", runtime: "codex", tasks: [],
+  }));
+  // 没有账本：确实是"没有回执"。
+  const none = enableAutoPublishForAllTasks({ home });
+  assert.equal(none.receipt, null);
+  assert.equal(none.receiptProblem, null);
+
+  // 账本坏了：不能跟上面长得一样，否则预览的审计语义是假的。
+  fs.writeFileSync(path.join(home, "migrations.json"), "[]");
+  const broken = enableAutoPublishForAllTasks({ home });
+  assert.equal(broken.ok, true, "预览本身仍可用");
+  assert.equal(broken.receipt, null);
+  assert.equal(broken.receiptProblem, "migrations_shape_unexpected");
+  // 而 --apply 在同样的账本下必须拒绝。
+  assert.equal(enableAutoPublishForAllTasks({ home, apply: true }).ok, false);
+});
+
+test("登记表不可读时，安装器要在 dry-run 退出之前就说出来", () => {
+  const dir = temp();
+  const home = path.join(dir, "bridge-home");
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "registry.json"), "{ 坏掉的 json");
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs")], {
+    encoding: "utf-8",
+    env: { ...process.env, CODEX_HOME: path.join(dir, "codex-home"), FEISHU_CODEX_BRIDGE_HOME: home },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const beforeExit = r.stdout.slice(0, r.stdout.indexOf("[dry-run]"));
+  // 静默省略会让"没有待迁移项"和"根本没读到"在预览里长得一模一样。
+  assert.match(beforeExit, /待迁移状态不可读/u);
+  // 但读不出状态不是替人改订阅的理由 —— dry-run 仍然什么都没写。
+  assert.equal(fs.readFileSync(path.join(home, "registry.json"), "utf-8"), "{ 坏掉的 json");
+});
+
+test("安装器预览的待迁移数必须等于实际会改的数", () => {
+  const dir = temp();
+  const home = path.join(dir, "bridge-home");
+  fs.mkdirSync(home, { recursive: true });
+  // 一个暂停、一个 root 形状异常 —— 两者都会被 loadRegistry 的过滤视图漏掉。
+  fs.writeFileSync(path.join(home, "registry.json"), JSON.stringify({
+    schema_version: "1.0", runtime: "codex",
+    tasks: [
+      { logical_task_key: "a", root: "/tmp/a" },
+      { logical_task_key: "b", root: "/tmp/b", enabled: false },
+      { logical_task_key: "c", root: "relative/bad" },
+    ],
+  }));
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs")], {
+    encoding: "utf-8",
+    env: { ...process.env, CODEX_HOME: path.join(dir, "codex-home"), FEISHU_CODEX_BRIDGE_HOME: home },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /待迁移 3 个 task/u, "预览报的数是过滤视图的话这里会是 1");
+  assert.equal(enableAutoPublishForAllTasks({ home }).changed, 3);
 });
 
 test("绑定预览为同一 thread 生成稳定逻辑键与平台幂等键", () => {

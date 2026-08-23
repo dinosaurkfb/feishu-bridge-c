@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 /**
- * 安装 Codex adapter：追加 hooks、复制七项技能、初始化 registry，并为已登记 task 启用
- * 每轮自动发布。默认 dry-run；不修改 hook trust，安装本身不发送飞书。
+ * 安装 Codex adapter：追加 hooks、复制七项技能、初始化 registry。
+ * 默认 dry-run；不修改 hook trust，安装本身不发送飞书。
+ *
+ * 安装**不改订阅策略**。新绑定登记时就默认开启自动发布；历史 task 的迁移走
+ * migrate-auto-publish.mjs，这里只报数。
  */
 
 import fs from "node:fs";
@@ -11,7 +14,7 @@ import { moduleRoot } from "../direct-run.mjs";
 import { shellQuote } from "../shell-quote.mjs";
 
 import {
-  bridgeHome, enableAutoPublishForAllTasks, loadRegistry, registryFile,
+  bridgeHome, enableAutoPublishForAllTasks, registryFile,
 } from "./state.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "../..");
@@ -35,10 +38,11 @@ const home = bridgeHome();
 const promptScript = path.join(ROOT, "scripts", "codex", "prompt-hook.mjs");
 const stopScript = path.join(ROOT, "scripts", "codex", "stop-hook.mjs");
 const log = path.join(home, "hook.log");
-const currentRegistry = loadRegistry(registryFile(home));
-const autoPublishMigrationCount = currentRegistry.ok
-  ? currentRegistry.tasks.filter((task) => task.auto_publish_on_completion !== true).length
-  : null;
+// 预览和落盘必须共用同一份扫描。原来这里用 loadRegistry 的**过滤视图**计数，
+// 而真正的迁移读的是原始文档 —— 于是预览说"待迁移 1 个"、实际会改 3 个，
+// 因为视图滤掉了 enabled:false 的 task 和 root 形状异常的记录。
+const autoPublishPreview = enableAutoPublishForAllTasks({ home });
+const autoPublishMigrationCount = autoPublishPreview.ok ? autoPublishPreview.changed : null;
 
 const hookCommand = (script) =>
   "if [ -x " + shellQuote(node) + " ] && [ -r " + shellQuote(script) + " ]; then " +
@@ -104,6 +108,13 @@ console.log("commands    $feishu-bind  $feishu-unbind  $feishu-status  $feishu-r
 console.log("state       " + home + "（Git 外）");
 console.log("publish     绑定 task 每轮自动发布；失败留队，历史积压不自动补发" +
   (autoPublishMigrationCount === null ? "" : "（待迁移 " + autoPublishMigrationCount + " 个 task）"));
+if (!autoPublishPreview.ok) {
+  // 读不出来就说读不出来，而且要在 dry-run 退出**之前**说 —— 静默省略会让
+  // "没有待迁移项"和"根本没读到"在预览里长得一模一样。
+  // 但**不因此恢复安装时改订阅**：读不出状态更不是替人改策略的理由。
+  console.log("            待迁移状态不可读（" + autoPublishPreview.reason + "）；" +
+    "可运行 scripts/codex/migrate-auto-publish.mjs 单独查看");
+}
 console.log("hook trust  不自动写信任；安装后由用户审阅并确认");
 
 if (!apply) {
@@ -145,11 +156,12 @@ if (!uninstall && !fs.existsSync(registryFile(home))) {
 if (!uninstall) {
   // task 尚未路由成功时的脱敏错误回执使用这个目录；提前创建，避免首个错误路径才 mkdir。
   fs.mkdirSync(path.join(home, "receipts"), { recursive: true, mode: 0o700 });
-  const migrated = enableAutoPublishForAllTasks({ home });
-  if (!migrated.ok) {
-    console.error("自动发布合同迁移失败：" + migrated.reason + (migrated.error ? "（" + migrated.error + "）" : ""));
-    process.exit(1);
+  // **安装不再改订阅策略。**原来这里会把所有已登记 task 的 auto_publish_on_completion
+  // 强改为 true —— 装一次基础设施，顺手把每条绑定的发布行为改掉，不预览、不留痕、不可选。
+  // 新绑定登记时就默认开启，不依赖这一步；历史 task 走显式的 migrate-auto-publish.mjs。
+  if (autoPublishPreview.ok && autoPublishPreview.changed > 0) {
+    console.log("自动发布  有 " + autoPublishPreview.changed + " 个历史 task 尚未启用；" +
+      "要迁移请显式运行 scripts/codex/migrate-auto-publish.mjs --apply");
   }
-  console.log("自动发布  已为 " + migrated.tasks + " 个已登记 task 启用（本次更新 " + migrated.changed + " 个）");
 }
 console.log("\n已完成本地安装。下一次 Codex 载入 hook 时会要求信任；请核对命令后再确认。");

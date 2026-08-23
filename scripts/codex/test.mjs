@@ -2103,6 +2103,43 @@ test("迁移回执不覆盖别的迁移，且写完要读回来核验", () => {
   assert.deepEqual(readMigrationReceipt(home), all.auto_publish_on_completion_v1);
 });
 
+test("预览要把账本损坏和没有回执报成两种状态", () => {
+  const home = temp();
+  fs.writeFileSync(path.join(home, "registry.json"), JSON.stringify({
+    schema_version: "1.0", runtime: "codex", tasks: [],
+  }));
+  // 没有账本：确实是"没有回执"。
+  const none = enableAutoPublishForAllTasks({ home });
+  assert.equal(none.receipt, null);
+  assert.equal(none.receiptProblem, null);
+
+  // 账本坏了：不能跟上面长得一样，否则预览的审计语义是假的。
+  fs.writeFileSync(path.join(home, "migrations.json"), "[]");
+  const broken = enableAutoPublishForAllTasks({ home });
+  assert.equal(broken.ok, true, "预览本身仍可用");
+  assert.equal(broken.receipt, null);
+  assert.equal(broken.receiptProblem, "migrations_shape_unexpected");
+  // 而 --apply 在同样的账本下必须拒绝。
+  assert.equal(enableAutoPublishForAllTasks({ home, apply: true }).ok, false);
+});
+
+test("登记表不可读时，安装器要在 dry-run 退出之前就说出来", () => {
+  const dir = temp();
+  const home = path.join(dir, "bridge-home");
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "registry.json"), "{ 坏掉的 json");
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs")], {
+    encoding: "utf-8",
+    env: { ...process.env, CODEX_HOME: path.join(dir, "codex-home"), FEISHU_CODEX_BRIDGE_HOME: home },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const beforeExit = r.stdout.slice(0, r.stdout.indexOf("[dry-run]"));
+  // 静默省略会让"没有待迁移项"和"根本没读到"在预览里长得一模一样。
+  assert.match(beforeExit, /待迁移状态不可读/u);
+  // 但读不出状态不是替人改订阅的理由 —— dry-run 仍然什么都没写。
+  assert.equal(fs.readFileSync(path.join(home, "registry.json"), "utf-8"), "{ 坏掉的 json");
+});
+
 test("安装器预览的待迁移数必须等于实际会改的数", () => {
   const dir = temp();
   const home = path.join(dir, "bridge-home");

@@ -551,7 +551,14 @@ export function enableAutoPublishForAllTasks({ home = bridgeHome(), apply = fals
     if (!snap.ok) return snap;
     const scan = scanAutoPublish(snap.doc);
     if (!scan.ok) return scan;
-    return report(scan, { applied: false, receipt: readMigrationReceipt(home) });
+    // 账本坏了和没有回执不是一回事。readMigrationReceipt 把两者都压成 null
+    // 是为了让调用方好写，但预览是审计用途，这里必须分开报。
+    const ledger = readMigrationLedger(home);
+    return report(scan, {
+      applied: false,
+      receipt: ledger.ok ? (ledger.ledger[AUTO_PUBLISH_MIGRATION_ID] ?? null) : null,
+      receiptProblem: ledger.ok ? null : ledger.reason,
+    });
   }
 
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });

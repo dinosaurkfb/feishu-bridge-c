@@ -35,10 +35,12 @@ function main() {
   for (const name of result.names ?? []) console.log("          · " + name);
 
   if (!apply) {
-    const prior = result.receipt;
-    console.log("上次执行  " + (prior
-      ? prior.applied_at + "（改了 " + prior.changed + " 条）"
-      : "没有回执 —— 可能从没跑过，也可能跑过但留痕失败；重跑是幂等的"));
+    // "账本坏了"和"没有回执"必须显示成两种状态，否则预览的审计语义是假的。
+    console.log("上次执行  " + (result.receiptProblem
+      ? "迁移账本不可用（" + result.receiptProblem + "）—— 先修账本，--apply 会拒绝执行"
+      : result.receipt
+        ? result.receipt.applied_at + "（改了 " + result.receipt.changed + " 条）"
+        : "没有回执 —— 可能从没跑过，也可能跑过但留痕失败；重跑是幂等的"));
     console.log("\n[dry-run] 什么都没写。加 --apply 才落盘。");
     return;
   }

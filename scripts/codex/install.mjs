@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 /**
- * 安装 Codex adapter：追加 hooks、复制七项技能、初始化 registry，并为已登记 task 启用
- * 每轮自动发布。默认 dry-run；不修改 hook trust，安装本身不发送飞书。
- * 安装**不改订阅策略**：历史 task 的迁移走 migrate-auto-publish.mjs，这里只报数。
+ * 安装 Codex adapter：追加 hooks、复制七项技能、初始化 registry。
+ * 默认 dry-run；不修改 hook trust，安装本身不发送飞书。
+ *
+ * 安装**不改订阅策略**。新绑定登记时就默认开启自动发布；历史 task 的迁移走
+ * migrate-auto-publish.mjs，这里只报数。
  */
 
 import fs from "node:fs";
@@ -106,6 +108,13 @@ console.log("commands    $feishu-bind  $feishu-unbind  $feishu-status  $feishu-r
 console.log("state       " + home + "（Git 外）");
 console.log("publish     绑定 task 每轮自动发布；失败留队，历史积压不自动补发" +
   (autoPublishMigrationCount === null ? "" : "（待迁移 " + autoPublishMigrationCount + " 个 task）"));
+if (!autoPublishPreview.ok) {
+  // 读不出来就说读不出来，而且要在 dry-run 退出**之前**说 —— 静默省略会让
+  // "没有待迁移项"和"根本没读到"在预览里长得一模一样。
+  // 但**不因此恢复安装时改订阅**：读不出状态更不是替人改策略的理由。
+  console.log("            待迁移状态不可读（" + autoPublishPreview.reason + "）；" +
+    "可运行 scripts/codex/migrate-auto-publish.mjs 单独查看");
+}
 console.log("hook trust  不自动写信任；安装后由用户审阅并确认");
 
 if (!apply) {
@@ -150,14 +159,8 @@ if (!uninstall) {
   // **安装不再改订阅策略。**原来这里会把所有已登记 task 的 auto_publish_on_completion
   // 强改为 true —— 装一次基础设施，顺手把每条绑定的发布行为改掉，不预览、不留痕、不可选。
   // 新绑定登记时就默认开启，不依赖这一步；历史 task 走显式的 migrate-auto-publish.mjs。
-  const pendingMigration = enableAutoPublishForAllTasks({ home });
-  if (!pendingMigration.ok) {
-    // 读不出来就说读不出来。静默忽略会让"没有待迁移项"和"根本没读到"长得一样。
-    // 但**不因此恢复安装时改订阅**：读不出状态更不是替人改策略的理由。
-    console.log("自动发布  待迁移状态不可读（" + pendingMigration.reason + "）；" +
-      "可运行 scripts/codex/migrate-auto-publish.mjs 单独查看");
-  } else if (pendingMigration.changed > 0) {
-    console.log("自动发布  有 " + pendingMigration.changed + " 个历史 task 尚未启用；" +
+  if (autoPublishPreview.ok && autoPublishPreview.changed > 0) {
+    console.log("自动发布  有 " + autoPublishPreview.changed + " 个历史 task 尚未启用；" +
       "要迁移请显式运行 scripts/codex/migrate-auto-publish.mjs --apply");
   }
 }

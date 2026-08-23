@@ -1078,6 +1078,39 @@ test("Dialogue shadow readiness 的自动检查 ID 受控，挡住路径泄露",
   assert.equal(rendered.includes(os.tmpdir()), false, "报告正文不得出现任何输入路径");
 });
 
+test("validator 拒绝「检查没全过却说只差人工签字」的报告", () => {
+  // Codex 复核时把一份空证据报告的 decision 直接篡改成 manual_review_required，
+  // 而 validator 照样接受 —— analyzer 算得对不代表契约被钉住。
+  // manual_review_required 是四个结论里唯一"可以往下走"的一个，
+  // 所以它必须是"自动检查全 pass"的充要条件。
+  const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), "readiness-tamper-"));
+  const report = analyzeShadowDir(emptyDir).report;
+  assert.notEqual(report.decision, DIALOGUE_SHADOW_READINESS_DECISION.MANUAL_REVIEW_REQUIRED);
+  assert.equal(validateDialogueShadowReadinessReport(report).ok, true);
+
+  const forged = { ...report,
+    decision: DIALOGUE_SHADOW_READINESS_DECISION.MANUAL_REVIEW_REQUIRED };
+  const rejected = validateDialogueShadowReadinessReport(forged);
+  assert.equal(rejected.ok, false, "检查没全过就不能说只差人工签字");
+  assert.equal(rejected.reason, "shadow_readiness_decision_inconsistent");
+
+  // 反向也要钉：全 pass 却报别的结论，同样不自洽。
+  const allPass = {
+    ...report,
+    automated_checks: report.automated_checks.map((c) => ({ ...c, status: "pass" })),
+    decision: DIALOGUE_SHADOW_READINESS_DECISION.NOT_READY,
+  };
+  assert.equal(validateDialogueShadowReadinessReport(allPass).ok, false);
+
+  // schema 侧同源：contains 一个非 pass 检查时禁止 manual_review_required。
+  const schema = JSON.parse(fs.readFileSync(path.resolve("references",
+    "dialogue-shadow-readiness-report-v1.schema.json"), "utf-8"));
+  const guard = (schema.allOf ?? []).find((rule) =>
+    JSON.stringify(rule).includes("manual_review_required") &&
+    JSON.stringify(rule).includes("contains"));
+  assert.ok(guard, "schema 必须也钉住这条，不能只靠运行时");
+});
+
 test("attested 不等于 chat scope 可信：人工门禁一个都不能少", () => {
   // 这条钉的是接入 attestation 时最容易滑坡的一步。B2c 判出 attested_candidate 之后，
   // 很自然会想"那 chat scope 就可信了吧" —— 不。attestation 说的是"多条独立真实观测
@@ -1124,7 +1157,14 @@ test("样本不够时 chat_scope_attested 报 insufficient，不报 fail", () =>
   assert.equal(report.automated_checks.find((c) => c.id === "chat_scope_attested").status,
     "insufficient", "一条观测是'还不够'，不是'坏了'");
   assert.equal(report.artifacts.attestations.total, 1);
-  assert.equal(report.artifacts.attestations.valid, 0);
+  assert.equal(report.artifacts.attestations.attested, 0);
+  assert.equal(report.artifacts.attestations.unverified, 1);
+  // 关键：样本不足只进 insufficient 桶，不能被记成 invalid —— 那正是"还不够"被
+  // 混成"坏了"的地方。字段名也刻意不叫 valid/invalid。
+  assert.deepEqual(report.artifacts.attestations.reason_counts,
+    { chat_scope_attestation_insufficient_evidence: 1 });
+  // 总体结论必须仍是 not_ready：有交互证据但检查没全过，不能滑到人工放行阶段。
+  assert.equal(report.decision, DIALOGUE_SHADOW_READINESS_DECISION.NOT_READY);
 });
 
 test("Dialogue shadow readiness 自动检查全过也只要求人工评审", () => {
@@ -1154,7 +1194,7 @@ test("Dialogue shadow readiness 自动检查全过也只要求人工评审", () 
     JSON.stringify(statuses));
   assert.equal(statuses.chat_scope_attested, "pass",
     "三条独立一致的观测应当让 attestation 成立");
-  assert.equal(analyzed.report.artifacts.attestations.valid, 1);
+  assert.equal(analyzed.report.artifacts.attestations.attested, 1);
   assert.equal(analyzed.report.decision,
     DIALOGUE_SHADOW_READINESS_DECISION.MANUAL_REVIEW_REQUIRED);
   assert.deepEqual(analyzed.report.manual_gates_unverified, [

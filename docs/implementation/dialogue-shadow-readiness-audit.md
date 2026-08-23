@@ -75,4 +75,3 @@ attestation（取它自己的 probe：`binding_ref` 与 `authorization_snapshot_
 - 结论仍封顶在 `manual_review_required`；
 - `trusted_locator_source` 仍留在 `manual_gates_unverified` 里；
 - 本检查通过**不构成**多订阅切流门禁 2 的满足条件，它只是让证据变得可读。
-

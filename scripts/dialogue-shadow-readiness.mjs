@@ -146,6 +146,28 @@ export const DIALOGUE_SHADOW_READINESS_CHECK_IDS = Object.freeze([
 ]);
 
 const check = (id, status) => ({ id, status });
+
+/**
+ * attestation 的受控原因桶。刻意与 binding-authorization / REJECT 那套分开 ——
+ * 那套里没有任何 attestation 的原因，全部会落进 "other"，分了等于没分。
+ */
+export const ATTESTATION_REASON_BUCKETS = Object.freeze([
+  "attested",
+  ...Object.values(CHAT_SCOPE_ATTESTATION_REASON),
+]);
+const attestationReasons = (results) => {
+  const out = {};
+  for (const item of results) {
+    const raw = item.ok
+      ? (item.attestation?.status === CHAT_SCOPE_ATTESTATION_STATUS.ATTESTED_CANDIDATE
+        ? "attested" : item.attestation?.reason)
+      : item.reason;
+    const key = ATTESTATION_REASON_BUCKETS.includes(raw) ? raw
+      : CHAT_SCOPE_ATTESTATION_REASON.INPUT_INVALID;
+    out[key] = (out[key] ?? 0) + 1;
+  }
+  return Object.fromEntries(Object.entries(out).sort(([a], [b]) => a.localeCompare(b)));
+};
 const histogram = (values) => {
   const out = {};
   for (const value of values) {
@@ -335,11 +357,17 @@ export function analyzeDialogueShadowEvidence(rawInput = {}) {
         candidate_reason_counts: histogram(validEvents.map((item) =>
           item.comparison.candidate_reason)),
       }),
-      // 只出计数与受控原因桶，不出 binding_ref、snapshot_id 或任何 locator。
-      attestations: metric(validAuthorizations.length, attested.length, {
-        reason_counts: histogram(attestations.map((item) =>
-          item.ok ? item.attestation?.reason ?? null : item.reason)),
-      }),
+      // **不用 metric()。**它算的是 invalid = total - valid，于是一份结构完全合法、
+      // 只是样本还不够的 attestation 会被记成 invalid —— 又把"还不够"和"坏了"混回一起，
+      // 而这正是接入 attestation 时最该分清的一件事。改用 attested / unverified 两个词，
+      // 并用 attestation 自己的受控原因集合分桶（复用 binding-authorization 那套会让
+      // 所有 attestation 原因落进 "other"，等于没分）。
+      attestations: {
+        total: validAuthorizations.length,
+        attested: attested.length,
+        unverified: validAuthorizations.length - attested.length,
+        reason_counts: attestationReasons(attestations),
+      },
       probes: metric(probes.length, validProbes.length, {
         chat_locator_present: validProbes.filter((item) => item.chat_locator_present).length,
         chat_scope_match: validProbes.filter((item) => item.chat_scope_match === true).length,
@@ -381,7 +409,17 @@ export function validateDialogueShadowReadinessReport(report) {
       // 缺失的目录数不可能多过被审的目录总数；能这样自相矛盾的报告是伪造或算错的。
       report.missing_source_dirs > report.source_count ||
       !onlyKeys(report?.artifacts, ["authorizations", "events", "probes", "attestations"]) ||
-      !validMetric(report?.artifacts?.attestations, ["reason_counts"]) ||
+      // attestation 块用自己的受控键，不套 metric 的 valid/invalid。
+      !onlyKeys(report?.artifacts?.attestations,
+        ["total", "attested", "unverified", "reason_counts"]) ||
+      ![report?.artifacts?.attestations?.total, report?.artifacts?.attestations?.attested,
+        report?.artifacts?.attestations?.unverified].every(nonNegativeInteger) ||
+      report.artifacts.attestations.attested + report.artifacts.attestations.unverified !==
+        report.artifacts.attestations.total ||
+      // 原因桶只允许 attestation 自己那套 key。任意 key 能进来就等于开了一条
+      // 把敏感字符串印进报告的通道 —— 检查 id 那处已经栽过一次。
+      Object.entries(report.artifacts.attestations.reason_counts ?? {}).some(([key, value]) =>
+        !ATTESTATION_REASON_BUCKETS.includes(key) || !nonNegativeInteger(value)) ||
       !validMetric(report?.artifacts?.authorizations, ["active", "paused"]) ||
       ![report?.artifacts?.authorizations?.active, report?.artifacts?.authorizations?.paused]
         .every(nonNegativeInteger) ||
@@ -412,6 +450,22 @@ export function validateDialogueShadowReadinessReport(report) {
       !Array.isArray(report?.manual_gates_unverified) ||
       JSON.stringify(report.manual_gates_unverified) !== JSON.stringify(MANUAL_GATES)) {
     return { ok: false, reason: "shadow_readiness_report_invalid" };
+  }
+
+  /**
+   * **decision 契约要由 validator 钉住，不能只靠 analyzer 算对。**
+   *
+   * analyzer 的方向本来就对（任一检查非 pass → not_ready），但 Codex 复核时把一份
+   * 空证据报告的 decision 直接篡改成 manual_review_required，validator 照样接受。
+   * 一份能通过校验的报告说"只差人工签字了"，而它的自动检查其实全是 insufficient ——
+   * 这正是这份审计最不该出的那种结论。
+   *
+   * manual_review_required 是四个结论里唯一"可以往下走"的一个，所以它必须是
+   * 自动检查全 pass 的**充要**条件，两层各自独立成立。
+   */
+  const allPassed = report.automated_checks.every((item) => item.status === "pass");
+  if (allPassed !== (report.decision === DIALOGUE_SHADOW_READINESS_DECISION.MANUAL_REVIEW_REQUIRED)) {
+    return { ok: false, reason: "shadow_readiness_decision_inconsistent" };
   }
   return { ok: true };
 }

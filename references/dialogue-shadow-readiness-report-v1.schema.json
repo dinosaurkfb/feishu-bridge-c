@@ -73,8 +73,8 @@
           "additionalProperties": false,
           "required": [
             "total",
-            "valid",
-            "invalid",
+            "attested",
+            "unverified",
             "reason_counts"
           ],
           "properties": {
@@ -82,23 +82,39 @@
               "type": "integer",
               "minimum": 0
             },
-            "valid": {
+            "attested": {
               "type": "integer",
               "minimum": 0
             },
-            "invalid": {
+            "unverified": {
               "type": "integer",
               "minimum": 0
             },
             "reason_counts": {
               "type": "object",
-              "additionalProperties": {
-                "type": "integer",
-                "minimum": 0
+              "additionalProperties": false,
+              "propertyNames": {
+                "enum": [
+                  "attested",
+                  "chat_scope_attestation_input_invalid",
+                  "chat_scope_attestation_evidence_invalid",
+                  "chat_scope_attestation_insufficient_evidence",
+                  "chat_scope_attestation_binding_mismatch",
+                  "chat_scope_attestation_snapshot_mismatch",
+                  "chat_scope_attestation_stale_evidence",
+                  "chat_scope_attestation_locator_missing",
+                  "chat_scope_attestation_scope_mismatch"
+                ]
+              },
+              "patternProperties": {
+                "^.*$": {
+                  "type": "integer",
+                  "minimum": 0
+                }
               }
             }
           },
-          "description": "逐 binding 的 chat scope attestation 聚合。只出计数与受控原因桶；attested 不等于 chat scope 可信，后者仍是 trusted_locator_source 人工门禁。"
+          "description": "逐 binding 的 chat scope attestation 聚合。刻意用 attested/unverified 而非 valid/invalid —— 样本不足是'还不够'不是'坏了'。attested 不等于 chat scope 可信，后者仍是 trusted_locator_source 人工门禁。"
         }
       }
     },
@@ -539,5 +555,40 @@
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "automated_checks": {
+            "contains": {
+              "properties": {
+                "status": {
+                  "enum": [
+                    "fail",
+                    "insufficient"
+                  ]
+                }
+              },
+              "required": [
+                "status"
+              ]
+            }
+          }
+        },
+        "required": [
+          "automated_checks"
+        ]
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "not": {
+              "const": "manual_review_required"
+            }
+          }
+        }
+      }
+    }
+  ]
 }

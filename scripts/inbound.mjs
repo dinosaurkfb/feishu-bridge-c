@@ -46,6 +46,19 @@ import {
 import {
   dialogueAuthorizationShadowEnabled, recordDialogueBoundAuthorizationShadow,
 } from "./dialogue-authorization-shadow-store.mjs";
+import { isDirectRun } from "./direct-run.mjs";
+import { composeCrashReceipt } from "./crash-receipt.mjs";
+/**
+ * 整个入站流程包在 main() 里，只有被直接执行时才跑。
+ *
+ * 在此之前这个文件是纯顶层脚本：**import 它就等于跑一次入站分发**。做冒烟测试时
+ * 我 import 过一次，它真的执行了整条流程并输出了拒绝回执 —— 那次没造成损害只是运气，
+ * 换个环境变量组合就会写 claim、写回执、甚至投递。
+ *
+ * 刻意**不重排函数体的缩进**：这个文件近七百行，重排会让 diff 完全无法评审，
+ * 而这次改动的实质只有"加一道守卫"。可读性代价换评审可读性，是有意的取舍。
+ */
+async function main() {
 
 const ROOT = moduleRoot(import.meta.url, "..");
 
@@ -689,3 +702,26 @@ finish("accepted", {
   taskName: config.task_display_name, messageId: verdict.messageId, key: claim.key,
   mode: run.mode, targetName: run.targetName,
 }, { claim_key: claim.key, run_log: run.logPath, delivery_mode: run.mode });
+}
+
+if (isDirectRun(import.meta.url)) {
+  // 用 catch 收口而不是顶层 await —— 后者会让 import 也等它跑完。
+  main().catch((err) => {
+    /**
+     * **stderr 只出脱敏信息。**
+     *
+     * Aily 会把进程输出带回模型可见通道，所以这里写什么等于对外发布什么。
+     * 上一版直接写 err.stack —— 那会把本机绝对路径和内部调用栈一起送出去，
+     * 而这个仓库为脱敏边界已经付过多次代价（Codex 用受控 ENOTDIR 探针实测复现）。
+     *
+     * 诊断细节不能丢，只是不能走这条通道：完整堆栈写进机器级日志文件，
+     * 那个文件只有本机能读。
+     */
+    const receipt = composeCrashReceipt({
+      error: err,
+      logFile: path.join(os.homedir(), ".claude", "feishu-bridge", "inbound-crash.log"),
+    });
+    process.stdout.write(receipt.text);
+    process.exit(1);
+  });
+}

@@ -32,6 +32,7 @@ import {
   composeOutboundCard, outboundCardBatches, validateOutboundCard,
 } from "./outbound-card.mjs";
 import { drainProject, watcherActive } from "./drain-outbox.mjs";
+import { composeCrashReceipt } from "./crash-receipt.mjs";
 import {
   applyRuntimeSync, planRuntimeSync, runtimeRoot, runtimeScript, verifyRuntime,
   versionFromFiles,
@@ -6098,6 +6099,44 @@ test("两侧 feishu-rotate 在登记失败时都收口，且不谎报收口成�
   }
 });
 
+test("import 两侧 inbound.mjs 不得产生任何输出或状态写入", () => {
+  // 在此之前它们是纯顶层脚本：**import 就等于跑一次入站分发**。我做冒烟测试时
+  // import 过一次，它真的执行了整条流程并输出了拒绝回执 —— 没造成损害只是运气，
+  // 换个环境变量组合就会写 claim、写回执、甚至投递。
+  //
+  // 行为验证而不是源码断言：断言"文件里有 isDirectRun"证明不了 import 是惰性的。
+  for (const rel of ["inbound.mjs", path.join("codex", "inbound.mjs")]) {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "inbound-import-"));
+    const home = path.join(cwd, "home");
+    fs.mkdirSync(home);
+    const target = path.resolve("scripts", rel);
+    const run = spawnSync(process.execPath,
+      ["-e", "import(" + JSON.stringify(target) + ").then(()=>{},(e)=>{" +
+        "process.stderr.write('IMPORT_THREW '+e.message)})"],
+      { cwd, encoding: "utf-8",
+        env: { ...process.env, HOME: home, CODEX_HOME: path.join(home, ".codex") } });
+    // **退出码必须查。**上一版只看 stdout / stderr / 文件，Codex 的变异探针让被 import
+    // 的模块直接 process.exit(1)，测试照样报 405/405 —— 又是一条"改坏了也照样绿"的断言。
+    assert.equal(run.status, 0, rel + " 被 import 时不得以非零码退出");
+    assert.equal(run.signal, null, rel + " 被 import 时不得被信号杀死");
+    assert.equal(run.error, undefined, rel + " 子进程本身不得启动失败");
+    assert.equal(run.stdout, "", rel + " 被 import 时不得有 stdout —— 那是给飞书的回执");
+    // 测试名说的是"不得产生任何输出"，那就直接断言 stderr 为空，而不是只查有没有出现
+    // 某个哨兵字符串 —— 后者放过了"import 时输出了别的东西"这整类情况。
+    // 哨兵仍留在子进程脚本里，为的是让 import 真的抛时错误信息更好认。
+    assert.equal(run.stderr, "", rel + " 被 import 时不得有 stderr（含抛出的错误）");
+    const created = [];
+    const walk = (dir) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) walk(full); else created.push(full);
+      }
+    };
+    walk(cwd);
+    assert.deepEqual(created, [], rel + " 被 import 时不得写任何文件（claim / 回执 / 状态）");
+  }
+});
+
 test("测试文件里没有写在汇总之后的 test()", () => {
   // 运行期封条只在那条 test() **真的被执行**时才触发。如果它藏在一个当前走不到的
   // 分支里，封条抓不到，而它一旦某天被执行就又是静默不计。这条从结构上兜住：
@@ -6113,6 +6152,66 @@ test("测试文件里没有写在汇总之后的 test()", () => {
   }
   assert.deepEqual(late, [],
     "第 " + late.join("、") + " 行的 test() 写在汇总之后，结果不会计入统计");
+});
+
+test("入站崩溃回执只出脱敏引用码，不把堆栈写进模型可见通道", () => {
+  // Aily 会把进程输出带回模型可见通道，所以 stdout/stderr 写什么等于对外发布什么。
+  // 上一版直接写 err.stack —— 本机绝对路径和内部调用栈一起送出去。
+  // 诊断细节不能丢，只是不能走这条通道：完整堆栈进机器级日志，对外只给引用码。
+  for (const rel of ["inbound.mjs", path.join("codex", "inbound.mjs")]) {
+    const src = fs.readFileSync(path.resolve("scripts", rel), "utf-8");
+    const tail = src.slice(src.indexOf("if (isDirectRun(import.meta.url))"));
+    assert.doesNotMatch(tail, /process\.stderr\.write\([^)]*err/u,
+      rel + "：不得把异常对象写进 stderr");
+    assert.doesNotMatch(tail, /stdout\.write\([^)]*err\?\.stack/u,
+      rel + "：不得把堆栈写进 stdout");
+    assert.match(tail, /inbound-crash\.log/u, rel + "：堆栈要留给本机日志，不能丢");
+    assert.match(tail, /composeCrashReceipt\(/u,
+      rel + "：回执由共用实现生成 —— 各写各的必然分叉");
+  }
+});
+
+test("崩溃回执：日志没写成就不给引用码", () => {
+  // Codex 用非法 FEISHU_CODEX_BRIDGE_HOME 实测过：上一版无论日志写没写成都输出引用码，
+  // 而本机没有任何日志含那个码 —— 等于让程序出具一份假的可查凭证。
+  // 拿着查不到的码去翻日志，比直接说"没留下诊断信息"更浪费时间。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "crash-receipt-"));
+
+  const ok = composeCrashReceipt({ error: new Error("boom"), logFile: path.join(dir, "a", "c.log") });
+  assert.equal(ok.logged, true);
+  assert.ok(ok.ref, "写成功时要给引用码");
+  assert.ok(ok.text.includes(ok.ref), "文案里的码要和日志里的是同一个 —— 否则对不上账");
+  const written = fs.readFileSync(path.join(dir, "a", "c.log"), "utf-8");
+  assert.ok(written.includes(ok.ref), "日志里必须含同一个引用码");
+  assert.match(written, /boom/u, "堆栈要真的留下来，不能只给个码");
+  assert.equal(fs.statSync(path.join(dir, "a", "c.log")).mode & 0o777, 0o600,
+    "崩溃日志含堆栈，权限必须是 0600");
+
+  // 目标是目录 → appendFileSync 必失败。
+  fs.mkdirSync(path.join(dir, "blocked"));
+  const bad = composeCrashReceipt({ error: new Error("boom"), logFile: path.join(dir, "blocked") });
+  assert.equal(bad.logged, false);
+  assert.equal(bad.ref, null, "没落盘就不能给码");
+  assert.doesNotMatch(bad.text, /inbound_/u, "文案里也不能出现看起来像码的东西");
+  assert.match(bad.text, /未能落盘/u, "要如实说没留下诊断信息");
+
+  // logFile 本身为 null（例如 bridgeHome() 抛了）也要走同一条路，不能崩。
+  const noPath = composeCrashReceipt({ error: new Error("boom"), logFile: null });
+  assert.equal(noPath.logged, false);
+  assert.equal(noPath.ref, null);
+
+  // 引用码带 PID 与随机量：只用毫秒时间戳的话，同毫秒并发会撞出两条同名记录。
+  const a = composeCrashReceipt({ error: new Error("x"), logFile: path.join(dir, "b.log"), now: 1 });
+  const b = composeCrashReceipt({ error: new Error("x"), logFile: path.join(dir, "b.log"), now: 1 });
+  assert.notEqual(a.ref, b.ref, "同一毫秒的两次崩溃必须给出不同引用码");
+
+  // 两侧 inbound 都必须走这个共用实现 —— 这个仓库反复出现"只修一侧"。
+  for (const rel of ["inbound.mjs", path.join("codex", "inbound.mjs")]) {
+    const src = fs.readFileSync(path.resolve("scripts", rel), "utf-8");
+    assert.match(src, /composeCrashReceipt\(/u, rel + " 必须走共用崩溃回执");
+    const tail = src.slice(src.indexOf("if (isDirectRun(import.meta.url))"));
+    assert.doesNotMatch(tail, /stderr\.write/u, rel + "：崩溃时不得写 stderr");
+  }
 });
 
 summarySealed = true;

@@ -5,6 +5,7 @@ import {
   DIALOGUE_POLICY_ID, MAPPING_POLICY_ID, interactionPolicySummary,
 } from "../interaction-policy.mjs";
 import { validThreadId } from "./bind-compose.mjs";
+import { isDirectRun } from "../direct-run.mjs";
 import {
   bridgeHome, findRegisteredTaskForCodexThread, interactionPolicyForTask,
   setTaskInteractionMode,
@@ -72,4 +73,4 @@ function main() {
   console.log(describeCodexInteractionPolicy(changed.state));
 }
 
-if (import.meta.url === "file://" + process.argv[1]) main();
+if (isDirectRun(import.meta.url)) main();

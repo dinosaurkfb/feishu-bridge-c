@@ -2,6 +2,7 @@
 /** 查看或显式切换当前 Claude binding 的 Interaction Policy。默认只读，写入必须 --apply。 */
 
 import path from "node:path";
+import { isDirectRun } from "./direct-run.mjs";
 
 import {
   DIALOGUE_POLICY_ID, MAPPING_POLICY_ID, interactionPolicySummary,
@@ -63,4 +64,4 @@ function main() {
   console.log(describeInteractionPolicy(changed.state));
 }
 
-if (import.meta.url === "file://" + process.argv[1]) main();
+if (isDirectRun(import.meta.url)) main();

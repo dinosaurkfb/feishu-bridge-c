@@ -24,6 +24,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isDirectRun } from "./direct-run.mjs";
 
 const LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "inbound-hook.log");
 const LOG_MAX = 1 << 19;
@@ -159,7 +160,7 @@ async function main() {
   process.exit(0);
 }
 
-if (import.meta.url === "file://" + process.argv[1]) {
+if (isDirectRun(import.meta.url)) {
   if (process.argv.includes("--self-test")) {
     const { loadChainTemplate } = await import("./chain-template.mjs");
     console.log(composeTransportRule({

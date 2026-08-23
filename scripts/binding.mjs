@@ -28,6 +28,7 @@ import { NO_PREFIX, UNLIMITED, isValidPrefix, isValidQuota } from "./selector.mj
 import { checkBinding, WARN_DAYS } from "./binding-health.mjs";
 import { projectMappingPath, resolveProject } from "./project-resolve.mjs";
 import { registryPath } from "./registry.mjs";
+import { isDirectRun } from "./direct-run.mjs";
 
 const SELF = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -73,7 +74,7 @@ export function validateNote(v) {
 
 // ---------- CLI ----------
 
-if (import.meta.url !== "file://" + process.argv[1]) {
+if (!isDirectRun(import.meta.url)) {
   // 被 import 时只提供上面那个纯函数，不碰任何文件。
 } else {
 

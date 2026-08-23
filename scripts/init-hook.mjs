@@ -15,6 +15,7 @@
  */
 
 import fs from "node:fs";
+import { isDirectRun } from "./direct-run.mjs";
 
 import {
   claudeTurnInputDir, clearTurnInput, isFeishuStampedInput, storeTurnInput,
@@ -114,7 +115,7 @@ async function main() {
   process.exit(0);
 }
 
-if (import.meta.url === "file://" + process.argv[1]) {
+if (isDirectRun(import.meta.url)) {
   // --self-test：喂一条合成 payload，把会注入的内容打出来。不读 stdin、不碰会话。
   if (process.argv.includes("--self-test")) {
     console.log(composeAsk());

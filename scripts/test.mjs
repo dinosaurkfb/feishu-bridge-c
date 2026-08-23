@@ -77,6 +77,9 @@ import {
 } from "./canonical-event.mjs";
 import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
 import { bindingToConnections } from "./group-binding-status.mjs";
+import {
+  CHECK_RESULT, ENDPOINT_CHECK, checkEndpoint, renderEndpointCheck,
+} from "./endpoint-self-check.mjs";
 import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
 import {
   ENDPOINT_SELF_CHECK, composeLayeredStatus, endpointFacts, lastSuccessfulDispatchAt,
@@ -7196,7 +7199,8 @@ test("第 1 层不许把未自检说成在线", () => {
   };
 
   const plain = renderLayeredStatus(layeredView());
-  assert.equal(rowOf(plain, "实时自检"), "未自检（端点自检 FR-1.4 尚未实现）");
+  assert.equal(rowOf(plain, "实时自检"), "未自检（本次没跑端点自检）",
+    "FR-1.4 已实现，但没跑就仍然是未自检 —— 代码存在不等于查过了");
   assert.equal(rowOf(plain, "最近入站"), null, "没有历史证据时不该凭空出现这一行");
 
   const withLog = renderLayeredStatus(layeredView({}, {
@@ -7205,11 +7209,11 @@ test("第 1 层不许把未自检说成在线", () => {
   }));
   // 历史证据的措辞必须停在"过去某刻工作过"，不能滑成"在线"。
   assert.equal(rowOf(withLog, "最近入站"), "2 小时前（历史证据，不代表当前在线）");
-  assert.equal(rowOf(withLog, "实时自检"), "未自检（端点自检 FR-1.4 尚未实现）",
+  assert.equal(rowOf(withLog, "实时自检"), "未自检（本次没跑端点自检）",
     "有历史证据也不得把自检结论改掉");
 
   // 路由登记只证明配置存在，日志只证明过去工作过 —— 都不该升级成一个在线判断。
-  assert.equal(ENDPOINT_SELF_CHECK, "not_implemented");
+  assert.equal(ENDPOINT_SELF_CHECK, "not_checked");
 });
 
 test("最近入站只取时间戳，不碰日志里的标识", () => {
@@ -7228,7 +7232,7 @@ test("最近入站只取时间戳，不碰日志里的标识", () => {
     runtimeDir: path.dirname(file), inboundLog: file,
     verify: () => ({ ok: false, reason: "current_absent" }),
   });
-  assert.equal(facts.selfCheck, "not_implemented");
+  assert.equal(facts.selfCheck, null, "不传自检报告就是没跑过");
   assert.equal(facts.install, "absent", "没有 current 符号链接就是没装");
 });
 
@@ -7614,6 +7618,92 @@ test("按文档里那条命令登记，聚合方要真的能取到状态", () =>
   assert.equal(renderConnectivity(view).includes("oc_SECRET123456"), false);
 });
 
+
+const okVerify = () => ({ ok: true });
+const okAccess = () => {};
+const okExec = () => "daemon running (pid 1)";
+const okAssert = () => ({ ok: true });
+const okIdentity = { configDir: "/d", profile: "p", expectedAppId: "appA" };
+const selfCheck = (over = {}) => checkEndpoint({
+  template: { lark_cli_bin: "/bin/lark-cli" }, identity: okIdentity,
+  verify: okVerify, access: okAccess, exec: okExec, assertFn: okAssert, ...over,
+});
+
+test("端点自检把 FR-1.4 的四种情形分开，各有各的下一步", () => {
+  const ready = selfCheck();
+  assert.equal(ready.verdict, "ready");
+  assert.deepEqual(ready.checks.map((c) => c.id),
+    [ENDPOINT_CHECK.BRIDGE, ENDPOINT_CHECK.ADAPTER, ENDPOINT_CHECK.DAEMON, ENDPOINT_CHECK.IDENTITY]);
+
+  // 四种失败各自可辨认，而且各带一条能执行的下一步 —— 混成一句"不可用"等于没说。
+  const cases = [
+    [{ verify: () => ({ ok: false, reason: "current_absent" }) }, ENDPOINT_CHECK.BRIDGE, /install-outbound/u],
+    [{ access: () => { throw new Error("nope"); } }, ENDPOINT_CHECK.ADAPTER, /执行权限/u],
+    [{ exec: () => "daemon not running" }, ENDPOINT_CHECK.DAEMON, /daemon start/u],
+    [{ assertFn: () => ({ ok: false, reason: "app_mismatch" }) }, ENDPOINT_CHECK.IDENTITY, /重新登录/u],
+  ];
+  for (const [over, id, action] of cases) {
+    const got = selfCheck(over);
+    assert.equal(got.verdict, "blocked", id);
+    assert.deepEqual(got.failed, [id]);
+    assert.match(got.checks.find((c) => c.id === id).action, action);
+  }
+
+  // 装了但坏了 ≠ 没装：两者都 fail，但下一步不同。
+  const broken = selfCheck({ verify: () => ({ ok: false, reason: "file_drifted" }) });
+  assert.match(broken.checks[0].detail, /运行时不可用（file_drifted）/u);
+  assert.doesNotMatch(broken.checks[0].detail, /未安装/u);
+});
+
+test("端点自检里「查不动」不许算成「有问题」，也不许算成「没问题」", () => {
+  // 探测超时、看不懂输出、缺配置 —— 都是没查清，不是查出问题。
+  for (const over of [
+    { exec: () => { const e = new Error("t"); e.code = "ETIMEDOUT"; throw e; } },
+    { exec: () => "某种看不懂的输出" },
+    { assertFn: () => { throw new Error("boom"); } },
+    { identity: { configDir: "/d", profile: "p" } },
+  ]) {
+    const got = selfCheck(over);
+    assert.equal(got.verdict, "incomplete", JSON.stringify(Object.keys(over)));
+    assert.deepEqual(got.failed, [], "没查清不能算失败");
+    assert.equal(got.unknown.length, 1);
+  }
+
+  // 但"二进制不在"是查出来的结论，该判 fail。
+  const missing = selfCheck({ exec: () => { const e = new Error("x"); e.code = "ENOENT"; throw e; } });
+  assert.equal(missing.verdict, "blocked");
+  assert.deepEqual(missing.failed, [ENDPOINT_CHECK.DAEMON]);
+
+  // 渲染要能看出三种符号不同。
+  const text = renderEndpointCheck(selfCheck({ exec: () => "某种看不懂的输出" }));
+  assert.match(text, /❔/u);
+  assert.match(text, /✅/u);
+  assert.doesNotMatch(text, /❌/u);
+});
+
+test("没跑自检时仍然显示未自检 —— 代码存在不等于查过了", () => {
+  const endpoint = { runtime: "Claude Code", agentName: null, install: "ok", installReason: null,
+    version: "abc", selfCheck: null, lastInboundAt: null };
+  const text = renderLayeredStatus(composeLayeredStatus({
+    st: layeredSt(), endpoint, subscription: { ok: true, items: [], pendingCount: 0 },
+  }));
+  assert.match(text, /实时自检.*未自检（本次没跑端点自检）/u);
+
+  // 查出问题时要报出是哪几项，不只说"有问题"。
+  const blocked = renderLayeredStatus(composeLayeredStatus({
+    st: layeredSt(),
+    endpoint: { ...endpoint, selfCheck: { verdict: "blocked", failed: ["daemon_running"], unknown: [] } },
+    subscription: { ok: true, items: [], pendingCount: 0 },
+  }));
+  assert.match(blocked, /有问题：daemon_running/u);
+
+  const incomplete = renderLayeredStatus(composeLayeredStatus({
+    st: layeredSt(),
+    endpoint: { ...endpoint, selfCheck: { verdict: "incomplete", failed: [], unknown: ["identity_matches"] } },
+    subscription: { ok: true, items: [], pendingCount: 0 },
+  }));
+  assert.match(incomplete, /没查清（查不清：identity_matches）/u);
+});
 
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

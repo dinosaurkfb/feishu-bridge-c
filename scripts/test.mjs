@@ -6249,6 +6249,30 @@ test("安装不登记项目，也不改动既有登记表", () => {
   const created = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
   assert.deepEqual(created.projects, [], "首次安装只建空表，不登记任何项目");
 
+  // **并发方抢先建表时不得覆盖。**上一版是 if (!existsSync) 再写 —— 典型的
+  // check-then-write：判定"不存在"到落盘之间若绑定流程刚建好表并写进第一条绑定，
+  // 那次 rename 会把它整份覆盖成空表。改用 wx 排他创建后这条是确定性的：
+  // 文件已存在必然 EEXIST，不存在竞争窗口。
+  const raced = JSON.stringify({
+    schema_version: "1.0",
+    projects: [{ id: "raced", root: "/tmp/raced", root_message_id: "om_raced" }],
+  }) + "\n";
+  fs.writeFileSync(registryFile, raced);
+  run(["--apply"]);
+  assert.equal(fs.readFileSync(registryFile, "utf-8"), raced,
+    "并发方已建表时，安装器不得覆盖其任何字节");
+
+  // 卸载不得创建订阅状态。
+  fs.rmSync(registryFile);
+  run(["--uninstall", "--apply"]);
+  assert.equal(fs.existsSync(registryFile), false,
+    "卸载基础设施不该凭空造出一份登记表");
+
+  const installerSrc = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  assert.doesNotMatch(installerSrc, /if \(!fs\.existsSync\(REGISTRY\)\)/u,
+    "不得再用 check-then-write 创建登记表");
+  assert.match(installerSrc, /flag: "wx"/u, "必须用排他创建");
+
   // 提示要有，但只能是提示 —— 不能替人做订阅决定。
   assert.match(run([]), /显式运行 \/feishu-bind/u, "未绑定时要提示怎么接入");
 

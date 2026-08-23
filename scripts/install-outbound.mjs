@@ -491,8 +491,37 @@ if (settingsAfter !== settingsBefore) {
  *
  * 装基础设施不该拿绑定数据当赌注。缺文件就建一份空的，其余交给显式绑定。
  */
-if (!fs.existsSync(REGISTRY)) {
-  writeJsonAtomic(REGISTRY, { schema_version: "1.0", projects: [] });
+/**
+ * **排他创建，不是「先查再写」。**
+ *
+ * 上一版是 `if (!existsSync) writeJsonAtomic(...)` —— 典型的 check-then-write：
+ * 从判定「不存在」到真正落盘之间，如果绑定流程恰好创建了登记表并写进第一条绑定，
+ * 随后那次 rename 会把它整份覆盖成空表。而绑定牵着话题历史，覆盖掉历史就成孤儿。
+ *
+ * 讽刺的是这个 PR 的主题正是「别让安装器碰绑定数据」，我却用一个竞态把同样的风险
+ * 又放了回去 —— 只是窗口变窄了，而窄窗口的竞态更难查。
+ *
+ * 用 `wx` 让创建本身原子：文件已存在就抛 EEXIST，那正是「不需要我建」，
+ * 直接当无操作 —— 不读、不写、不覆盖。
+ */
+let registryAction = "untouched";
+if (uninstall) {
+  // 卸载基础设施不该创建订阅状态。
+  registryAction = "untouched (uninstall)";
+} else {
+  try {
+    fs.mkdirSync(path.dirname(REGISTRY), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(REGISTRY,
+      JSON.stringify({ schema_version: "1.0", projects: [] }, null, 2) + "\n",
+      { flag: "wx", mode: 0o600 });
+    registryAction = "created (empty)";
+  } catch (err) {
+    if (err.code !== "EEXIST") {
+      console.error("登记表无法创建（" + err.code + "）：" + err.message);
+      process.exit(1);
+    }
+    // EEXIST：已经有了，可能正是一次并发绑定刚建的。什么都不做才是对的。
+  }
 }
 
 for (const sk of skillPlan) {
@@ -558,5 +587,7 @@ if (uninstall) {
 }
 
 console.log("\n" + (backup ? "settings 已改，备份：" + backup : "settings 无改动，未重写"));
+// 说出来：登记表牵着绑定和话题历史，"这次安装到底动没动它"不该靠人去猜。
+console.log("登记表    ：" + registryAction);
 console.log("兜底定时器：" + launchNote);
 console.log("钩子和技能都立即生效，不需要重启会话。");

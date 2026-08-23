@@ -102,6 +102,13 @@ import {
   validateDialogueChatScopeProbe,
 } from "./dialogue-chat-scope-probe.mjs";
 import {
+  DIALOGUE_SHADOW_READINESS_ARTIFACT_TYPE, DIALOGUE_SHADOW_READINESS_CHECK_IDS,
+  DIALOGUE_SHADOW_READINESS_DECISION,
+  analyzeDialogueShadowEvidence, readDialogueShadowEvidence,
+  renderDialogueShadowReadinessReport, validateDialogueShadowReadinessReport,
+} from "./dialogue-shadow-readiness.mjs";
+import { CANONICAL_TIME_PATTERN } from "./canonical-time.mjs";
+import {
   MAX_LOCAL_INPUT_CHARS, claudeTurnInputDir, clearTurnInput, isFeishuStampedInput,
   readTurnInput, storeTurnInput,
 } from "./turn-input.mjs";
@@ -882,6 +889,353 @@ test("Dialogue Slice B1 schema 固化授权快照与 shadow artifact", () => {
   assert.equal(scopeProbeSchema.properties.artifact_type.const,
     CHAT_SCOPE_PROBE_ARTIFACT_TYPE);
   assert.equal(scopeProbeSchema.properties.chat_scope_match.type.includes("null"), true);
+});
+
+const analyzeShadowDir = (shadowDir, generatedAt = NOW) => {
+  const loaded = readDialogueShadowEvidence({ shadowDirs: [shadowDir] });
+  assert.equal(loaded.ok, true);
+  return analyzeDialogueShadowEvidence({
+    sourceCount: loaded.evidence.source_count,
+    missingSourceDirs: loaded.evidence.missing_source_dirs,
+    readErrors: loaded.evidence.read_errors,
+    authorizations: loaded.evidence.authorizations,
+    events: loaded.evidence.events,
+    probes: loaded.evidence.probes,
+    generatedAt,
+  });
+};
+
+test("Dialogue shadow readiness 对无样本和未核验 chat scope 保持 fail-closed", () => {
+  const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-empty-"));
+  const empty = analyzeShadowDir(emptyDir);
+  assert.equal(empty.ok, true);
+  assert.equal(empty.report.decision, DIALOGUE_SHADOW_READINESS_DECISION.INSUFFICIENT_EVIDENCE);
+
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-shadow-"));
+  const observed = structuredClone(fixture.unverifiedEvent);
+  observed.extensions.aily_channel.chat_id = fixture.template.chat_id;
+  observed.extensions.aily_channel.thread_id = "private-thread-locator";
+  const wrote = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: observed,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  assert.equal(wrote.ok, true);
+  const analyzed = analyzeShadowDir(shadowDir);
+  assert.equal(analyzed.ok, true);
+  assert.equal(analyzed.report.decision, DIALOGUE_SHADOW_READINESS_DECISION.NOT_READY);
+  assert.equal(analyzed.report.correlation.complete_pairs, 1);
+  assert.equal(analyzed.report.artifacts.probes.chat_locator_present, 1);
+  assert.equal(analyzed.report.artifacts.probes.chat_scope_match, 1);
+  assert.equal(analyzed.report.artifacts.probes.canonical_verified, 0,
+    "runtime 字段存在且匹配也不能自行提升 canonical trust");
+  assert.equal(analyzed.report.artifacts.events.route_match, 0);
+  assert.equal(analyzed.report.artifacts.events.candidate_reason_counts.chat_scope_unverified, 1);
+  assert.equal(validateDialogueShadowReadinessReport(analyzed.report).ok, true);
+
+  const serialized = JSON.stringify(analyzed.report) + "\n" +
+    renderDialogueShadowReadinessReport(analyzed.report);
+  for (const secret of [shadowDir, fixture.template.chat_id, "private-thread-locator",
+    fixture.privateBindingKey, wrote.snapshot.binding_ref, wrote.evidence.event_ref]) {
+    assert.equal(serialized.includes(secret), false, "readiness 报告泄露私有证据：" + secret);
+  }
+});
+
+// —— 以下三条对应 Codex 对 PR #17 的三项阻断复审 ——
+
+/** evidence 是 snake_case，analyze 收 camelCase；显式映射，别把两套形状混着用。 */
+const asAnalyzeInput = (evidence) => ({
+  sourceCount: evidence.source_count,
+  missingSourceDirs: evidence.missing_source_dirs,
+  readErrors: evidence.read_errors,
+  authorizations: evidence.authorizations,
+  events: evidence.events,
+  probes: evidence.probes,
+});
+
+test("Dialogue shadow readiness 对缺失的证据源 fail-closed，但不误伤空目录", () => {
+  const real = fs.mkdtempSync(path.join(os.tmpdir(), "readiness-src-real-"));
+  fs.mkdirSync(path.join(real, "authorizations"), { recursive: true });
+  const gone = path.join(os.tmpdir(), "readiness-src-absent-" + Date.now());
+
+  const read = readDialogueShadowEvidence({ shadowDirs: [real, gone] });
+  assert.equal(read.evidence.source_count, 2);
+  assert.equal(read.evidence.missing_source_dirs, 1, "根目录不存在才算证据源缺失");
+
+  const analyzed = analyzeDialogueShadowEvidence({ ...asAnalyzeInput(read.evidence), generatedAt: NOW });
+  assert.equal(analyzed.ok, true);
+  assert.notEqual(analyzed.report.decision,
+    DIALOGUE_SHADOW_READINESS_DECISION.MANUAL_REVIEW_REQUIRED,
+    "看不全证据时绝不能给出'只差人工签字'的口径");
+  assert.equal(analyzed.report.decision, DIALOGUE_SHADOW_READINESS_DECISION.INVALID_EVIDENCE);
+  const sourceCheck = analyzed.report.automated_checks
+    .find((item) => item.id === "source_dirs_complete");
+  assert.equal(sourceCheck.status, "fail", "必须有一项检查明确指出是哪里不全");
+
+  // 存在但还空着的目录是合法的"尚未收集"，不能被算成证据缺失。
+  const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), "readiness-src-empty-"));
+  const emptyRead = readDialogueShadowEvidence({ shadowDirs: [emptyDir] });
+  assert.equal(emptyRead.evidence.missing_source_dirs, 0);
+  assert.equal(
+    analyzeDialogueShadowEvidence({ ...asAnalyzeInput(emptyRead.evidence), generatedAt: NOW })
+      .report.decision,
+    DIALOGUE_SHADOW_READINESS_DECISION.INSUFFICIENT_EVIDENCE);
+
+  // 自相矛盾的报告要拒：缺失数不可能多过总数。
+  const good = analyzed.report;
+  assert.equal(validateDialogueShadowReadinessReport(good).ok, true);
+  assert.equal(validateDialogueShadowReadinessReport(
+    { ...good, missing_source_dirs: good.source_count + 1 }).ok, false);
+});
+
+test("Dialogue shadow readiness 的 generated_at 规范化，越界判错而不抛", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "readiness-time-"));
+  const base = readDialogueShadowEvidence({ shadowDirs: [dir] }).evidence;
+  const run = (generatedAt) =>
+    analyzeDialogueShadowEvidence({ ...asAnalyzeInput(base), generatedAt });
+
+  assert.equal(run(NOW).report.generated_at, new Date(NOW).toISOString());
+  assert.equal(run(new Date(NOW + 123)).report.generated_at,
+    new Date(NOW + 123).toISOString(), "Date 入参不能丢毫秒");
+  assert.equal(run("Aug 19 2026").report.generated_at.endsWith("Z"), true);
+  assert.match(run("Aug 19 2026").report.generated_at, new RegExp(CANONICAL_TIME_PATTERN, "u"),
+    "Date.parse 收、JSON Schema 不收的写法必须被折算，不能原样进制品");
+
+  // 原实现在校验之前就调用了 iso()，Infinity 会直接抛 RangeError。
+  for (const bad of [Infinity, -Infinity, Number.NaN, 9e15, 2.6e14, "not-a-time", {}]) {
+    let outcome;
+    assert.doesNotThrow(() => { outcome = run(bad); },
+      "越界或非法时间必须判成 input_invalid，不能抛异常穿透给调用方");
+    assert.equal(outcome.ok, false);
+    assert.equal(outcome.reason, "shadow_readiness_input_invalid");
+  }
+
+  const report = run(NOW).report;
+  for (const bad of ["2026-08-19", "2026-08-19T10:00:00Z", "2026-08-19T18:00:00+08:00",
+    "+010209-01-27T06:13:20.000Z", "Aug 19 2026", 1755597600000, null]) {
+    assert.equal(validateDialogueShadowReadinessReport({ ...report, generated_at: bad }).ok, false,
+      "generated_at = " + JSON.stringify(bad) + " 必须被拒");
+  }
+});
+
+test("Dialogue shadow readiness 的自动检查 ID 受控，挡住路径泄露", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "readiness-ids-"));
+  const report = analyzeDialogueShadowEvidence({
+    ...asAnalyzeInput(readDialogueShadowEvidence({ shadowDirs: [dir] }).evidence),
+    generatedAt: NOW,
+  }).report;
+  assert.deepEqual(report.automated_checks.map((item) => item.id),
+    [...DIALOGUE_SHADOW_READINESS_CHECK_IDS], "集合与顺序都必须与受控清单一致");
+  assert.equal(validateDialogueShadowReadinessReport(report).ok, true);
+
+  const swap = (index, id) => {
+    const checks = report.automated_checks.map((item) => ({ ...item }));
+    checks[index] = { ...checks[index], id };
+    return { ...report, automated_checks: checks };
+  };
+  // 这条是本项阻断的原样复现：任意字符串能通过时，renderer 会把它原样打出去。
+  assert.equal(validateDialogueShadowReadinessReport(swap(0, "/private/secret/path")).ok, false,
+    "任意 id 必须被拒 —— 否则等于开了一条把绝对路径印进报告的通道");
+  assert.equal(validateDialogueShadowReadinessReport(swap(1, "samples_present_x")).ok, false);
+  assert.equal(validateDialogueShadowReadinessReport(
+    swap(1, DIALOGUE_SHADOW_READINESS_CHECK_IDS[0])).ok, false, "重复 id 要拒");
+
+  const reordered = [...report.automated_checks];
+  [reordered[0], reordered[1]] = [reordered[1], reordered[0]];
+  assert.equal(validateDialogueShadowReadinessReport(
+    { ...report, automated_checks: reordered }).ok, false, "顺序也钉死");
+  assert.equal(validateDialogueShadowReadinessReport(
+    { ...report, automated_checks: report.automated_checks.slice(1) }).ok, false, "缺项要拒");
+
+  // schema 与运行时同源：逐位 const 必须与受控清单逐字对齐。
+  const schema = JSON.parse(fs.readFileSync(path.resolve("references",
+    "dialogue-shadow-readiness-report-v1.schema.json"), "utf-8"));
+  assert.deepEqual(schema.properties.automated_checks.prefixItems.map((s) => s.properties.id.const),
+    [...DIALOGUE_SHADOW_READINESS_CHECK_IDS]);
+  assert.equal(schema.properties.automated_checks.items, false, "不允许多出未受控的检查项");
+  assert.equal(schema.properties.generated_at.pattern, CANONICAL_TIME_PATTERN);
+
+  // renderer 只输出受控检查名。
+  const rendered = renderDialogueShadowReadinessReport(report);
+  assert.equal(rendered.includes("/private/"), false);
+  assert.equal(rendered.includes(os.tmpdir()), false, "报告正文不得出现任何输入路径");
+});
+
+test("Dialogue shadow readiness 自动检查全过也只要求人工评审", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-trusted-"));
+  const wrote = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.trustedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  assert.equal(wrote.ok, true);
+  const analyzed = analyzeShadowDir(shadowDir);
+  assert.equal(analyzed.report.automated_checks.every((item) => item.status === "pass"), true);
+  assert.equal(analyzed.report.decision,
+    DIALOGUE_SHADOW_READINESS_DECISION.MANUAL_REVIEW_REQUIRED);
+  assert.deepEqual(analyzed.report.manual_gates_unverified, [
+    "trusted_locator_source", "both_runtime_coverage", "generation_rotation_coverage",
+    "rollback_rehearsal",
+  ]);
+  assert.match(renderDialogueShadowReadinessReport(analyzed.report),
+    /本报告不授权切换权威路由/u);
+});
+
+test("Dialogue shadow readiness 在授权修订覆盖旧快照后拒绝旧 event/probe", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-revision-"));
+  const wrote = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.trustedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  assert.equal(wrote.ok, true);
+  const pausedInput = structuredClone(fixture.context.authorizationInput);
+  pausedInput.binding.status = "paused";
+  const revised = syncDialogueAuthorizationShadowSnapshot({
+    shadowDir, authorizationInput: pausedInput, capturedAt: NOW + 1000,
+  });
+  assert.equal(revised.ok, true);
+  assert.equal(revised.snapshot.authorization_revision, 2);
+  assert.notEqual(revised.snapshot.snapshot_id, wrote.snapshot.snapshot_id);
+
+  const analyzed = analyzeShadowDir(shadowDir);
+  assert.equal(analyzed.report.decision, DIALOGUE_SHADOW_READINESS_DECISION.NOT_READY);
+  assert.equal(analyzed.report.correlation.missing_authorizations, 2,
+    "event 与 probe 引用的旧授权快照都必须显式失配");
+  assert.equal(analyzed.report.automated_checks.find((item) =>
+    item.id === "correlation_complete").status, "fail");
+});
+
+test("Dialogue shadow readiness 将只有 probe 的样本判为孤立且不放行", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-orphan-probe-"));
+  const wrote = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.trustedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  assert.equal(wrote.ok, true);
+  fs.rmSync(wrote.file);
+
+  const analyzed = analyzeShadowDir(shadowDir);
+  assert.equal(analyzed.report.decision, DIALOGUE_SHADOW_READINESS_DECISION.NOT_READY);
+  assert.equal(analyzed.report.correlation.complete_pairs, 0);
+  assert.equal(analyzed.report.correlation.orphan_events, 0);
+  assert.equal(analyzed.report.correlation.orphan_probes, 1);
+});
+
+test("Dialogue shadow readiness 合并多目录时检测跨目录重复且不重复计完整配对", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const firstDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-multi-a-"));
+  const secondDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-multi-b-"));
+  const wrote = recordDialogueBoundAuthorizationShadow({
+    shadowDir: firstDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.trustedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  assert.equal(wrote.ok, true);
+  for (const subdir of ["authorizations", "events", "scope-probes"]) {
+    fs.cpSync(path.join(firstDir, subdir), path.join(secondDir, subdir), { recursive: true });
+  }
+  const loaded = readDialogueShadowEvidence({ shadowDirs: [firstDir, secondDir] });
+  assert.equal(loaded.ok, true);
+  assert.equal(loaded.evidence.source_count, 2);
+  const analyzed = analyzeDialogueShadowEvidence({
+    sourceCount: loaded.evidence.source_count,
+    missingSourceDirs: loaded.evidence.missing_source_dirs,
+    readErrors: loaded.evidence.read_errors,
+    authorizations: loaded.evidence.authorizations,
+    events: loaded.evidence.events,
+    probes: loaded.evidence.probes,
+    generatedAt: NOW,
+  });
+  assert.equal(analyzed.ok, true);
+  assert.equal(analyzed.report.decision, DIALOGUE_SHADOW_READINESS_DECISION.NOT_READY);
+  assert.equal(analyzed.report.correlation.duplicate_ids, 3);
+  assert.equal(analyzed.report.correlation.complete_pairs, 0,
+    "同一 correlation key 的重复 artifact 不能被多算为完整配对");
+  assert.equal(analyzed.report.correlation.orphan_events, 2);
+  assert.equal(analyzed.report.correlation.orphan_probes, 2);
+
+  const cli = spawnSync(process.execPath, [path.resolve("scripts", "dialogue-shadow-audit.mjs"),
+    "--shadow-dir", firstDir, "--shadow-dir", secondDir, "--json"], { encoding: "utf-8" });
+  assert.equal(cli.status, 0, cli.stderr);
+  const cliReport = JSON.parse(cli.stdout);
+  assert.equal(cliReport.decision, DIALOGUE_SHADOW_READINESS_DECISION.NOT_READY);
+  for (const secret of [firstDir, secondDir, wrote.evidence.event_ref, wrote.snapshot.binding_ref]) {
+    assert.equal(cli.stdout.includes(secret), false,
+      "多目录 CLI 汇总不得回显私有路径或 opaque ref");
+  }
+});
+
+test("Dialogue shadow readiness 把损坏、孤立和 CLI 路径统一收敛为脱敏诊断", () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-corrupt-"));
+  const wrote = recordDialogueBoundAuthorizationShadow({
+    shadowDir,
+    authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.unverifiedEvent,
+    runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy,
+    now: NOW,
+  });
+  assert.equal(wrote.ok, true);
+  fs.writeFileSync(path.join(shadowDir, "events", "corrupt.json"), "{not-json\n");
+  fs.rmSync(wrote.scopeProbe.file);
+  const analyzed = analyzeShadowDir(shadowDir);
+  assert.equal(analyzed.report.decision, DIALOGUE_SHADOW_READINESS_DECISION.INVALID_EVIDENCE);
+  assert.equal(analyzed.report.read_errors, 1);
+  assert.equal(analyzed.report.correlation.orphan_events, 1);
+
+  const cli = spawnSync(process.execPath, [path.resolve("scripts", "dialogue-shadow-audit.mjs"),
+    "--shadow-dir", shadowDir, "--json"], { encoding: "utf-8" });
+  assert.equal(cli.status, 0, cli.stderr);
+  const report = JSON.parse(cli.stdout);
+  assert.equal(report.decision, DIALOGUE_SHADOW_READINESS_DECISION.INVALID_EVIDENCE);
+  assert.equal(cli.stdout.includes(shadowDir), false, "CLI 不得回显私有 sidecar 路径");
+  assert.equal(cli.stdout.includes(wrote.evidence.event_ref), false, "CLI 不得输出 opaque ref");
+});
+
+test("Dialogue shadow readiness schema 与运行时 artifact 固化一致", () => {
+  const schema = JSON.parse(fs.readFileSync(path.resolve("references",
+    "dialogue-shadow-readiness-report-v1.schema.json"), "utf-8"));
+  assert.equal(schema.properties.artifact_type.const,
+    DIALOGUE_SHADOW_READINESS_ARTIFACT_TYPE);
+  assert.deepEqual(schema.properties.manual_gates_unverified.const, [
+    "trusted_locator_source", "both_runtime_coverage", "generation_rotation_coverage",
+    "rollback_rehearsal",
+  ]);
+  const reasonNames = schema.$defs.eventMetrics.properties.candidate_reason_counts
+    .propertyNames.enum;
+  const runtimeReasonNames = ["accepted", "other", ...new Set([
+    ...Object.values(BINDING_AUTHORIZATION_REASON), ...Object.values(REJECT),
+  ])].sort();
+  assert.deepEqual([...reasonNames].sort(), runtimeReasonNames,
+    "JSON Schema 与运行时必须维护完全相同的受控 reason bucket 集合");
 });
 
 // ---------- Mapping Policy：公共准入、处置与 runtime-neutral runRequest ----------

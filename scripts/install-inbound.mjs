@@ -119,24 +119,35 @@ if (apply) {
 
 if (problems.length === 0) {
   const body = expectedContent("SKILL.md");
-  if (body.includes("{{BRIDGE_ROOT}}")) problems.push("SKILL.md 里还有没渲染的占位符");
-  const referenced = [...body.matchAll(/(\/[\w./-]*\/scripts\/[\w.-]+\.mjs)/g)].map((m) => m[1]);
-  for (const p of new Set(referenced)) {
-    // runtime 下的脚本要等出站安装器把代码同步过去才存在。这里只要求「要么已经装好、
-    // 要么明确是 runtime 路径」，不能因为还没同步就把入站技能判成装不了。
+  // 渲染后不该再剩任何占位符。这一条只看有没有 `{{`，不猜里面是什么。
+  if (/\{\{/u.test(body)) problems.push("SKILL.md 里还有没渲染的占位符");
+
+  // **不从渲染后的 shell 文本里反解析路径。**
+  //
+  // 上一版用 /(\/[\w./-]*\/scripts\/…)/ 去猜绝对路径。加了 shell 引号之后这个正则
+  // 依然"能匹配"，但 HOME 含空格时它只截得到后半截，于是拿一个根本不存在的伪路径
+  // 去判存在性、把安装拒掉。Codex 用临时 HOME「我的 家」实测复现：runtime 装好了，
+  // install-inbound --apply 却 exit 1，报一个从没出现过的路径不存在。
+  //
+  // 正确做法是问模板"你声明了哪些脚本"，而不是问渲染产物"你看起来像什么路径"。
+  // 声明是受控的（{{SCRIPT:name}}），路径由我们自己拼，不经过 shell 文本这一层。
+  const declared = [...fs.readFileSync(path.join(SRC, "SKILL.md"), "utf-8")
+    .matchAll(/\{\{SCRIPT:([A-Za-z0-9_./-]+)\}\}/gu)].map((m) => m[1]);
+  if (declared.length === 0) problems.push("SKILL.md 里找不到要执行的脚本路径");
+  for (const name of new Set(declared)) {
+    const p = path.join(RUNTIME_BRIDGE_ROOT, "scripts", name);
+    // runtime 下的脚本要等出站安装器把代码同步过去才存在。
     if (fs.existsSync(p)) continue;
-    if (p.startsWith(RUNTIME_BRIDGE_ROOT + "/") && !apply) {
+    if (!apply) {
       // dry-run 阶段只提示：此刻 runtime 还没同步是完全正常的，不该因此看不到计划。
       notes.push("引用的 runtime 脚本尚未同步（先跑 install-outbound.mjs --apply）：" + p);
     } else {
       // **--apply 必须 fail-closed。**装一个指向不存在脚本的技能，比不装坏得多：
       // 它会照常被发现、照常被调用，然后在执行那一步失败，而回执只会说「系统错误」。
       problems.push("SKILL.md 引用了不存在的脚本：" + p +
-        (p.startsWith(RUNTIME_BRIDGE_ROOT + "/")
-          ? "（先跑 install-outbound.mjs --apply 把 runtime 同步好）" : ""));
+        "（先跑 install-outbound.mjs --apply 把 runtime 同步好）");
     }
   }
-  if (referenced.length === 0) problems.push("SKILL.md 里找不到要执行的脚本路径");
 }
 
 // ---------- 验目标 ----------

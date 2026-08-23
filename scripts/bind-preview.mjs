@@ -23,6 +23,7 @@ import path from "node:path";
 
 import { loadChainTemplate } from "./chain-template.mjs";
 import { moduleDir } from "./direct-run.mjs";
+import { nodeCommandPrefix, shellQuote } from "./shell-quote.mjs";
 import {
   bindingToken, composeRootMessage, composeStatusMessage, readProjectIdentity,
 } from "./bind-compose.mjs";
@@ -64,5 +65,7 @@ console.log("\n--- 底下第一条（之后的回复可以盖掉它）---\n" +
   composeStatusMessage({ name }));
 
 console.log("\n这条命令什么都没做。真的建话题要跑：");
-console.log("  node " + path.join(moduleDir(import.meta.url)) +
-  "/bind-project.mjs --project " + root + " --apply");
+// 脚本路径和 --project 都要按 shell 字面量输出：这行是打印给人直接粘进终端执行的，
+// 路径含空格时裸拼会被拆词。参数同样要引 —— 项目目录名同样可能带空格。
+console.log("  " + nodeCommandPrefix(path.join(moduleDir(import.meta.url), "bind-project.mjs")) +
+  " --project " + shellQuote(root) + " --apply");

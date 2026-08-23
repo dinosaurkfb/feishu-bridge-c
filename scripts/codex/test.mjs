@@ -1290,7 +1290,8 @@ test("Prompt hook 只接受占据整条输入的显式控制命令", () => {
   assert.match(composeRotateContext({ bridgeRoot: "/bridge", threadId: THREAD_A }),
     /feishu-rotate\.mjs.*--apply/u);
   assert.match(composeModeContext({ bridgeRoot: "/bridge", threadId: THREAD_A, mode: "dialogue" }),
-    /feishu-mode\.mjs.*--mode dialogue.*--apply/u);
+    // 参数现在也是 shell 字面量：--mode 'dialogue'，thread id 同理。
+    /feishu-mode\.mjs'.*--mode 'dialogue'.*--apply/u);
   assert.equal(composeModeContext({ bridgeRoot: "/bridge", threadId: THREAD_A }).includes("--apply"), false);
 });
 

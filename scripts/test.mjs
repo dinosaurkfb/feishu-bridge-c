@@ -5425,9 +5425,16 @@ test("入站钩子从自身定位分发器，不再经 bridge_root 落回开发�
     "分发器必须取自己的同目录兄弟，保证与钩子同版本");
 
   // 两个入站安装器都必须能跑通。改 skills/ 只跑出站安装器，正是上一版把入站装崩的原因。
-  for (const installer of ["install-outbound.mjs", "install-inbound.mjs"]) {
-    const text = fs.readFileSync(path.resolve("scripts", installer), "utf-8");
-    assert.match(text, /BRIDGE_ROOT/u, installer + " 必须会渲染 {{BRIDGE_ROOT}} 占位符");
+  // 注意：这里**不能**只 grep 源码里有没有 "BRIDGE_ROOT" —— 安装器注释里就有这个词，
+  // 于是旧写法照样通过。那是源码字符串假阳性。改为检查模板与渲染产物本身。
+  for (const file of fs.readdirSync(path.resolve("skills"))) {
+    const skill = path.resolve("skills", file, "SKILL.md");
+    if (!fs.existsSync(skill)) continue;
+    const text = fs.readFileSync(skill, "utf-8");
+    assert.doesNotMatch(text, /node \{\{BRIDGE_ROOT\}\}/u,
+      file + " 应改用 {{SCRIPT:...}}，由渲染器统一加 shell 引号");
+    assert.doesNotMatch(text, /node "\{\{BRIDGE_ROOT\}\}/u,
+      file + " 双引号挡不住 $ / 反引号 / 反斜杠");
   }
 });
 
@@ -5535,6 +5542,63 @@ test("路由前的失败回执落到机器级目录，不写进代码目录", ()
 
   // 装完之后 runtime 仍要自校验通过：状态污染代码目录也会让这一条更难判。
   assert.equal(verifyRuntime({ home }).ok, true);
+});
+
+test("预览放行规则与技能正文里那条命令，在真实产物上必须能对上", () => {
+  // 我曾经声称"有测试盯着它们相等" —— 那个测试当时并不存在。这条补上，而且验的是
+  // **装出来的产物**，不是源码里两个常量长得像。
+  //
+  // 为什么重要：allow 规则是前缀匹配。技能正文改成引号路径而规则还写裸路径的话，
+  // /feishu-bind 的预览会从"免确认"退化成每次弹窗 —— 静默退化，没人收到报错，
+  // 只会觉得"怎么又要确认一次"。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "preview-rule-"));
+  const home = path.join(base, "我的 家");
+  fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  execFileSync(process.execPath,
+    [path.resolve("scripts", "install-outbound.mjs"), "--apply"],
+    { encoding: "utf-8", env: { ...process.env, HOME: home } });
+
+  const settings = JSON.parse(fs.readFileSync(path.join(home, ".claude", "settings.json"), "utf-8"));
+  const rules = (settings.permissions?.allow ?? []).filter((r) => r.includes("bind-preview"));
+  assert.equal(rules.length, 1, "预览放行规则只能有一条");
+  const inner = rules[0].replace(/^Bash\((.*):\*\)$/u, "$1");
+
+  const skill = fs.readFileSync(
+    path.join(home, ".claude", "skills", "feishu-bind", "SKILL.md"), "utf-8");
+  const previewLine = skill.split("\n").find((l) => l.includes("bind-preview.mjs"));
+  assert.ok(previewLine, "技能里必须有预览命令");
+  assert.ok(previewLine.trim().startsWith(inner),
+    "技能命令必须以放行规则为前缀，否则预览退化成每次弹窗\n  规则: " + inner +
+    "\n  命令: " + previewLine.trim());
+
+  assert.doesNotMatch(skill, /\{\{/u, "产物里不得残留占位符");
+  assert.match(previewLine, /node '/u, "路径必须是引号形式");
+});
+
+test("含空格 HOME 下，出站装完之后入站也必须能装上", () => {
+  // Codex 实测复现的那条：runtime applyRuntimeSync 成功，install-inbound --apply 却 exit 1，
+  // 报一个从没出现过的伪路径不存在 —— 因为它从**已加引号的 shell 文本**里反解析路径，
+  // HOME 含空格时只截得到后半截。修法是问模板"声明了哪些脚本"，不问产物"像什么路径"。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "inbound-space-"));
+  const home = path.join(base, "我的 家");
+  fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  const env = { ...process.env, HOME: home };
+  execFileSync(process.execPath,
+    [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
+
+  const out = execFileSync(process.execPath,
+    [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env });
+  assert.doesNotMatch(out, /✗/u, "自检不得出现不一致");
+
+  const installed = fs.readFileSync(
+    path.join(home, ".claude", "skills", "m5claude-inbound-router", "SKILL.md"), "utf-8");
+  assert.doesNotMatch(installed, /\{\{/u, "产物里不得残留占位符");
+  const line = installed.split("\n").find((l) => l.includes("aily-inbound.mjs"));
+  const script = line.match(/'([^']+aily-inbound\.mjs)'/u)?.[1];
+  assert.ok(script, "命令里的脚本路径必须是引号形式");
+  assert.equal(fs.existsSync(script), true, "渲染出的路径必须指向真实存在的脚本：" + script);
 });
 
 test("路径含空格或非 ASCII 时，模块仍能定位自己", () => {

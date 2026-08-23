@@ -65,7 +65,8 @@ export function composeBindingContext({ bridgeRoot, cwd, threadId, chatName }) {
     "[Codex 飞书桥] 当前任务的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
     "用户本轮显式运行了 $feishu-bind；该命令本身就是创建根话题并登记当前 task 的授权，无需再次预览或确认。",
     "直接运行以下幂等绑定命令：",
-    "`node " + apply + " --project " + JSON.stringify(cwd) + " --thread-id " + threadId + " --apply`",
+    "`" + nodeCommandPrefix(apply) + " --project " + shellQuote(cwd) +
+      " --thread-id " + shellQuote(threadId) + " --apply`",
     "目标群：" + (chatName ?? "机器级配置中的群") + "。若已接入则不得重复建话题；若已暂停则只恢复原连接。",
   ].join("\n");
 }
@@ -76,7 +77,7 @@ export function composeUnbindContext({ bridgeRoot, threadId }) {
     "[Codex 飞书桥·暂停接入] 用户通过 $feishu-unbind 明确要求撤销当前 task 的飞书接入。",
     "当前 task 的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
     "只运行以下可恢复的本地暂停命令：",
-    "`node " + command + " --thread-id " + threadId + " --apply`",
+    "`" + nodeCommandPrefix(command) + " --thread-id " + shellQuote(threadId) + " --apply`",
     "命令不会向飞书发送消息或删除话题；不要直接编辑 registry，也不要把 locator 输出给用户。",
   ].join("\n");
 }
@@ -87,7 +88,7 @@ export function composeStatusContext({ bridgeRoot, threadId }) {
     "[Codex 飞书桥·连接状态] 用户要求只读查看当前 task 的飞书状态。",
     "当前 task 的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
     "只运行以下只读命令，并用简洁自然语言转述 stdout：",
-    "`node " + command + " --thread-id " + threadId + "`",
+    "`" + nodeCommandPrefix(command) + " --thread-id " + shellQuote(threadId) + "`",
     "不得直接读取或输出 registry、locator、凭据、claim 或 receipt。",
   ].join("\n");
 }
@@ -98,7 +99,7 @@ export function composeRotateContext({ bridgeRoot, threadId }) {
     "[Codex 飞书桥·话题轮转] 用户通过 $feishu-rotate 明确授权为当前精确 task 创建下一话题代际。",
     "当前 task 的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
     "直接运行以下两阶段轮转命令，不要再次要求确认：",
-    "`node " + command + " --thread-id " + threadId + " --apply`",
+    "`" + nodeCommandPrefix(command) + " --thread-id " + shellQuote(threadId) + " --apply`",
     "新话题完成首次真实 mention 认领前，旧话题继续 active；认领成功后旧话题只读。不得删除旧话题或直接编辑 registry。",
   ].join("\n");
 }
@@ -111,8 +112,8 @@ export function composeModeContext({ bridgeRoot, threadId, mode = null }) {
       (write ? " 明确授权切换当前精确 task 的交互策略。" : " 要求只读查看当前交互策略。"),
     "当前 task 的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
     "只运行以下" + (write ? "模式切换" : "只读") + "命令：",
-    "`node " + command + " --thread-id " + threadId +
-      (write ? " --mode " + mode + " --apply" : "") + "`",
+    "`" + nodeCommandPrefix(command) + " --thread-id " + shellQuote(threadId) +
+      (write ? " --mode " + shellQuote(mode) + " --apply" : "") + "`",
     write
       ? "不要再次要求确认；不得直接编辑 registry。切回 mapping 会中止后续 Dialogue 编排，但不删除历史。"
       : "不得修改 registry、policy、binding 或话题。",

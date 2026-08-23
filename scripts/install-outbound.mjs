@@ -244,10 +244,18 @@ const allow = (permissions.allow ??= []);
 
 // 权限规则同样要收编：旧克隆各留了一条自己路径的放行规则，只加不减就会越积越多，
 // 而每一条都是一个「某个开发克隆里的脚本可以免确认执行」的长期授权。
-// 同样按安装器生成的确切形态匹配，不用子串包含 —— 一条 allow 规则是一次长期免确认授权，
-// 误删别人的、或漏掉旧克隆的，两种都不能接受。
-const PREVIEW_RULE_SHAPE = /^Bash\(node '?[^()]*\/scripts\/bind-preview\.mjs'?:\*\)$/u;
-const ownsPreview = (rule) => typeof rule === "string" && PREVIEW_RULE_SHAPE.test(rule);
+// 一条 allow 规则是一次长期免确认授权，认宽认窄都不能接受。上一版为了容纳引号把
+// 判据放宽成 `[^()]*`，结果两头都坏了：`Bash(node --require '/other/…/bind-preview.mjs':*)`
+// 会被当成自己的删掉；而 HOME 含括号时（`/Users/a(b)/…`）反而认不出自己那条，
+// 重复安装会不断追加。
+//
+// 分成两件事各自用最严的判据：
+//   **当前规则**只认逐字相等 —— 它就是本安装器刚生成的那一条，没有任何模糊空间；
+//   **历史迁移**只认旧版完整模板（裸路径、无引号），且仅为迁移那一次存在。
+const LEGACY_PREVIEW_RULE =
+  /^Bash\(node (\/[^'"\s:]*\/scripts\/bind-preview\.mjs):\*\)$/u;
+const ownsPreview = (rule) => typeof rule === "string" &&
+  (rule === PREVIEW_RULE || LEGACY_PREVIEW_RULE.test(rule));
 const permOwned = allow.filter(ownsPreview);
 const permBefore = permOwned.length;
 // 只数条数不够：路径改指 runtime、或给路径加上 shell 引号之后，条数没变但内容变了。

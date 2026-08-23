@@ -75,7 +75,17 @@ const TEMPLATE = {
 };
 let passed = 0;
 let failed = 0;
+/**
+ * 汇总打印之后就封条 —— 与 Claude 侧 test.mjs 同一条保障，理由也相同：
+ * 把新测试追加到文件末尾时，它的结果不会计入统计，而套件照样报绿。
+ * Claude 侧 2026-08-23 真实发生过一次，一口气三条从未生效。
+ */
+let summarySealed = false;
 const test = (name, fn) => {
+  if (summarySealed) {
+    console.error("\n✗ 测试「" + name + "」写在汇总之后 —— 它的结果不会计入统计。");
+    process.exit(1);
+  }
   try { fn(); passed += 1; }
   catch (err) { failed += 1; console.error("FAIL " + name + "\n" + (err.stack ?? err)); }
 };
@@ -2200,5 +2210,21 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
   assert.equal(JSON.parse(broken.stdout).ready, false);
 });
 
+test("Codex 测试文件里没有写在汇总之后的 test()", () => {
+  // 运行期封条只在那条 test() 真的被执行时触发；藏在走不到的分支里就抓不到。
+  // 这条从结构上兜住，两层各覆盖一种情形。
+  const src = fs.readFileSync(path.resolve(ROOT, "scripts", "codex", "test.mjs"), "utf-8")
+    .split("\n");
+  const sealAt = src.findIndex((line) => line.startsWith("summarySealed = true;"));
+  assert.ok(sealAt > 0, "找不到封条那一行 —— 它被改名或删掉了，本检查会失效");
+  const late = [];
+  for (let i = sealAt + 1; i < src.length; i += 1) {
+    if (/^\s*test\(/u.test(src[i])) late.push(i + 1);
+  }
+  assert.deepEqual(late, [],
+    "第 " + late.join("、") + " 行的 test() 写在汇总之后，结果不会计入统计");
+});
+
+summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (failed > 0) process.exit(1);

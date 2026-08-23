@@ -1078,21 +1078,83 @@ test("Dialogue shadow readiness 的自动检查 ID 受控，挡住路径泄露",
   assert.equal(rendered.includes(os.tmpdir()), false, "报告正文不得出现任何输入路径");
 });
 
+test("attested 不等于 chat scope 可信：人工门禁一个都不能少", () => {
+  // 这条钉的是接入 attestation 时最容易滑坡的一步。B2c 判出 attested_candidate 之后，
+  // 很自然会想"那 chat scope 就可信了吧" —— 不。attestation 说的是"多条独立真实观测
+  // 持续一致"，而 trusted_locator_source 问的是"Aily 那个字段的注入来源本身可不可信"。
+  // 前者证明不了后者：所有观测都可以一致地来自同一个不可信来源。
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "readiness-attested-"));
+  for (const suffix of ["a", "b", "c"]) {
+    const event = structuredClone(fixture.trustedEvent);
+    event.source.message_id = fixture.trustedEvent.source.message_id + "_" + suffix;
+    event.event_id = fixture.trustedEvent.event_id + "_" + suffix;
+    recordDialogueBoundAuthorizationShadow({
+      shadowDir, authorizationInput: fixture.context.authorizationInput,
+      canonicalEvent: event, runtimeNamespace: fixture.runtimeNamespace,
+      expectedBindingRef: fixture.context.expectedBindingRef,
+      legacy: fixture.context.legacy, now: NOW,
+    });
+  }
+  const report = analyzeShadowDir(shadowDir).report;
+  assert.equal(report.automated_checks.find((c) => c.id === "chat_scope_attested").status, "pass");
+  assert.equal(report.decision, DIALOGUE_SHADOW_READINESS_DECISION.MANUAL_REVIEW_REQUIRED,
+    "attested 也只能到人工评审，不能自动放行");
+  assert.ok(report.manual_gates_unverified.includes("trusted_locator_source"),
+    "trusted_locator_source 必须仍在未核验清单里 —— attestation 不代替它");
+
+  // 报告不得因为接入 attestation 而漏出 binding_ref、snapshot_id 或任何 locator。
+  const serialized = JSON.stringify(report);
+  assert.doesNotMatch(serialized, /binding_ref_[0-9a-f]/u);
+  assert.doesNotMatch(serialized, /binding_authorization_[0-9a-f]/u);
+  assert.doesNotMatch(serialized, /oc_|om_|ou_/u);
+});
+
+test("样本不够时 chat_scope_attested 报 insufficient，不报 fail", () => {
+  // "还没攒够"和"观测互相矛盾"是两件事。都报 fail 会让人去查一个不存在的故障。
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "readiness-few-"));
+  recordDialogueBoundAuthorizationShadow({
+    shadowDir, authorizationInput: fixture.context.authorizationInput,
+    canonicalEvent: fixture.trustedEvent, runtimeNamespace: fixture.runtimeNamespace,
+    expectedBindingRef: fixture.context.expectedBindingRef,
+    legacy: fixture.context.legacy, now: NOW,
+  });
+  const report = analyzeShadowDir(shadowDir).report;
+  assert.equal(report.automated_checks.find((c) => c.id === "chat_scope_attested").status,
+    "insufficient", "一条观测是'还不够'，不是'坏了'");
+  assert.equal(report.artifacts.attestations.total, 1);
+  assert.equal(report.artifacts.attestations.valid, 0);
+});
+
 test("Dialogue shadow readiness 自动检查全过也只要求人工评审", () => {
   const fixture = dialogueAuthorizationFixture();
   const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-readiness-trusted-"));
-  const wrote = recordDialogueBoundAuthorizationShadow({
-    shadowDir,
-    authorizationInput: fixture.context.authorizationInput,
-    canonicalEvent: fixture.trustedEvent,
-    runtimeNamespace: fixture.runtimeNamespace,
-    expectedBindingRef: fixture.context.expectedBindingRef,
-    legacy: fixture.context.legacy,
-    now: NOW,
-  });
-  assert.equal(wrote.ok, true);
+  // 要写够 MIN_ATTESTATION_SAMPLES 条互相独立的观测：chat_scope_attested 检查的正是
+  // "同一 binding 上多条独立真实观测持续一致"，一条样本按定义还不够格。
+  for (const suffix of ["a", "b", "c"]) {
+    const event = structuredClone(fixture.trustedEvent);
+    event.source.message_id = fixture.trustedEvent.source.message_id + "_" + suffix;
+    event.event_id = fixture.trustedEvent.event_id + "_" + suffix;
+    const wrote = recordDialogueBoundAuthorizationShadow({
+      shadowDir,
+      authorizationInput: fixture.context.authorizationInput,
+      canonicalEvent: event,
+      runtimeNamespace: fixture.runtimeNamespace,
+      expectedBindingRef: fixture.context.expectedBindingRef,
+      legacy: fixture.context.legacy,
+      now: NOW,
+    });
+    assert.equal(wrote.ok, true, suffix);
+  }
   const analyzed = analyzeShadowDir(shadowDir);
-  assert.equal(analyzed.report.automated_checks.every((item) => item.status === "pass"), true);
+  const statuses = Object.fromEntries(
+    analyzed.report.automated_checks.map((item) => [item.id, item.status]));
+  assert.equal(analyzed.report.automated_checks.every((item) => item.status === "pass"), true,
+    JSON.stringify(statuses));
+  assert.equal(statuses.chat_scope_attested, "pass",
+    "三条独立一致的观测应当让 attestation 成立");
+  assert.equal(analyzed.report.artifacts.attestations.valid, 1);
   assert.equal(analyzed.report.decision,
     DIALOGUE_SHADOW_READINESS_DECISION.MANUAL_REVIEW_REQUIRED);
   assert.deepEqual(analyzed.report.manual_gates_unverified, [

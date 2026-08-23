@@ -15,6 +15,10 @@ import {
 import {
   CANONICAL_TIME_PATTERN, canonicalIso, isCanonicalIso, isCanonicalMs, toCanonicalMs,
 } from "./canonical-time.mjs";
+import {
+  CHAT_SCOPE_ATTESTATION_REASON, CHAT_SCOPE_ATTESTATION_STATUS,
+  evaluateDialogueChatScopeAttestation,
+} from "./dialogue-chat-scope-attestation.mjs";
 import { validateDialogueChatScopeProbe } from "./dialogue-chat-scope-probe.mjs";
 import { REJECT } from "./selector.mjs";
 
@@ -136,6 +140,7 @@ export const DIALOGUE_SHADOW_READINESS_CHECK_IDS = Object.freeze([
   "chat_locator_present",
   "chat_scope_consistent",
   "canonical_scope_verified",
+  "chat_scope_attested",
   "legacy_candidate_route_match",
   "legacy_candidate_full_match",
 ]);
@@ -245,6 +250,40 @@ export function analyzeDialogueShadowEvidence(rawInput = {}) {
   // 结论却是 manual_review_required，正好是最危险的那种读法。
   const sourceDirsComplete = missingSourceDirs === 0;
 
+  /**
+   * 逐 binding 跑 chat scope attestation，把 B2c 那份聚合判定接进只读审计。
+   *
+   * 在此之前 attestation 没有任何调用方 —— `attested_candidate` 只存在于单测里。
+   * 一个没人读的判定既不能支撑门禁，也没人会发现它坏了。
+   *
+   * **它不提升 canonical trust。**这里只回答"证据够不够格被人拿去看"，
+   * 而"chat scope 是否可信"仍是 `trusted_locator_source` 这道人工门禁 ——
+   * attestation 说的是"多条独立真实观测持续一致"，不是"Aily 的字段注入来源已被证明可信"。
+   * 所以下面的结论仍然封顶在 manual_review_required，见 decision 处。
+   */
+  const attestations = validAuthorizations.map((snapshot) =>
+    evaluateDialogueChatScopeAttestation({
+      snapshot,
+      probes: validProbes.filter((probe) =>
+        probe.binding_ref === snapshot.binding_ref &&
+        probe.authorization_snapshot_id === snapshot.snapshot_id),
+      now: generatedMs,
+    }));
+  const attested = attestations.filter((item) =>
+    item.ok && item.attestation?.status === CHAT_SCOPE_ATTESTATION_STATUS.ATTESTED_CANDIDATE);
+  // 有授权快照、且每一个都攒够了独立一致的观测，才算这一项通过；
+  // 一个都没有时是 insufficient，不是 pass —— 空集合不构成证据。
+  const scopeAttested = validAuthorizations.length > 0 &&
+    attested.length === validAuthorizations.length;
+  // "证据还不够"和"证据有问题"必须分开报。attestation 要求至少
+  // MIN_ATTESTATION_SAMPLES 条互相独立的观测，刚接上时天然攒不够 —— 那是
+  // insufficient，不是 fail。报成 fail 会让人去查一个根本不存在的故障，
+  // 也会把"还没开始收集"和"收到了互相矛盾的观测"混成同一种红。
+  const attestationBlockers = attestations.filter((item) => !item.ok ||
+    item.attestation?.status !== CHAT_SCOPE_ATTESTATION_STATUS.ATTESTED_CANDIDATE);
+  const onlyNeedsMoreSamples = attestationBlockers.every((item) => item.ok &&
+    item.attestation?.reason === CHAT_SCOPE_ATTESTATION_REASON.INSUFFICIENT_EVIDENCE);
+
   const automatedChecks = [
     check("source_dirs_complete", sourceDirsComplete ? "pass" : "fail"),
     check("samples_present", sampleCount > 0 ? "pass" :
@@ -258,6 +297,8 @@ export function analyzeDialogueShadowEvidence(rawInput = {}) {
       scopeConsistent ? "pass" : "fail"),
     check("canonical_scope_verified", validProbes.length === 0 ? "insufficient" :
       canonicalVerified ? "pass" : "fail"),
+    check("chat_scope_attested", validAuthorizations.length === 0 ? "insufficient" :
+      scopeAttested ? "pass" : onlyNeedsMoreSamples ? "insufficient" : "fail"),
     check("legacy_candidate_route_match", validEvents.length === 0 ? "insufficient" :
       routeConsistent ? "pass" : "fail"),
     check("legacy_candidate_full_match", validEvents.length === 0 ? "insufficient" :
@@ -293,6 +334,11 @@ export function analyzeDialogueShadowEvidence(rawInput = {}) {
         full_match: validEvents.filter((item) => item.comparison.match).length,
         candidate_reason_counts: histogram(validEvents.map((item) =>
           item.comparison.candidate_reason)),
+      }),
+      // 只出计数与受控原因桶，不出 binding_ref、snapshot_id 或任何 locator。
+      attestations: metric(validAuthorizations.length, attested.length, {
+        reason_counts: histogram(attestations.map((item) =>
+          item.ok ? item.attestation?.reason ?? null : item.reason)),
       }),
       probes: metric(probes.length, validProbes.length, {
         chat_locator_present: validProbes.filter((item) => item.chat_locator_present).length,
@@ -334,7 +380,8 @@ export function validateDialogueShadowReadinessReport(report) {
         .every(nonNegativeInteger) ||
       // 缺失的目录数不可能多过被审的目录总数；能这样自相矛盾的报告是伪造或算错的。
       report.missing_source_dirs > report.source_count ||
-      !onlyKeys(report?.artifacts, ["authorizations", "events", "probes"]) ||
+      !onlyKeys(report?.artifacts, ["authorizations", "events", "probes", "attestations"]) ||
+      !validMetric(report?.artifacts?.attestations, ["reason_counts"]) ||
       !validMetric(report?.artifacts?.authorizations, ["active", "paused"]) ||
       ![report?.artifacts?.authorizations?.active, report?.artifacts?.authorizations?.paused]
         .every(nonNegativeInteger) ||

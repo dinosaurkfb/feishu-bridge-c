@@ -26,7 +26,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { CHAIN_FIELDS, DEFAULT_CONFIG_BASE, templatePath, validateChainTemplate } from "./chain-template.mjs";
+import {
+  CHAIN_FIELDS, DEFAULT_CONFIG_BASE, OPTIONAL_CHAIN_FIELDS, templatePath, validateChainTemplate,
+} from "./chain-template.mjs";
 import { moduleRoot } from "./direct-run.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
@@ -65,7 +67,10 @@ if (from !== undefined) {
 
 const tpl = { schema_version: "1.0", ...derived };
 
-for (const f of CHAIN_FIELDS) {
+// 必填 + 可选字段都要能从命令行给。**只遍历 CHAIN_FIELDS 是个洞**：
+// 往 OPTIONAL_CHAIN_FIELDS 里加了字段（如 aily_cli_bin），写入器却接不了，
+// 于是「模板支持这个字段」这句话只在读的那一侧成立。
+for (const f of [...CHAIN_FIELDS, ...OPTIONAL_CHAIN_FIELDS]) {
   const v = arg(flagOf(f));
   if (v === undefined) continue;
   // 数字字段要转，否则形状校验会把 "900000" 判成配错（那正是它该做的）。

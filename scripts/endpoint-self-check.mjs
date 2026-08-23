@@ -27,11 +27,22 @@ import fs from "node:fs";
 import { assertPublishIdentity } from "./chain-template.mjs";
 import { verifyRuntime } from "./runtime-install.mjs";
 
+/**
+ * 四项检查。**分清入站与出站** —— 上一版把它们混了：
+ * 用 lark-cli 在不在回答"adapter 可用吗"（lark-cli 是**出站** OpenAPI 客户端，
+ * 而 README 定义的 adapter 是 Aily 的 claude-code-local 运行环境），
+ * 用 assertPublishIdentity 回答"身份对吗"（那是**出站发布**身份，
+ * 不是入站 transport agent / endpoint / caller）。
+ *
+ * 后果是语义假阳性：入站身份 A、出站身份 B 的机器，四项全过、判 ready。
+ * **这个功能本来就是为了防"拿不知道冒充没事"，结果它自己犯了另一种：
+ * 拿别的知道冒充这个知道。**
+ */
 export const ENDPOINT_CHECK = Object.freeze({
   BRIDGE: "bridge_installed",
-  ADAPTER: "adapter_available",
-  DAEMON: "daemon_running",
-  IDENTITY: "identity_matches",
+  DAEMON: "aily_daemon_running",
+  INBOUND: "inbound_transport_identity",
+  OUTBOUND: "outbound_publish_identity",
 });
 
 /** 每项只有这三种结论。**unknown 不是 fail** —— 查不动和查出问题是两回事。 */
@@ -58,18 +69,35 @@ function checkBridge(verify) {
     "重装运行时；先看清是漂移还是链接异常");
 }
 
-/** adapter 在不在：lark-cli 得存在且可执行。 */
-function checkAdapter(bin, access) {
+/**
+ * **出站**：lark-cli 可执行 + 凭据属于模板说的那个应用。
+ *
+ * 这两件事都是出站的。它们过了只说明"发得出去"，**不说明入站接得住** ——
+ * 上一版拿它们当过了整条链路的证明。
+ */
+function checkOutbound(bin, identity, access, assertFn) {
   if (typeof bin !== "string" || !bin) {
-    return item(ENDPOINT_CHECK.ADAPTER, CHECK_RESULT.UNKNOWN, "模板里没有 lark_cli_bin");
+    return item(ENDPOINT_CHECK.OUTBOUND, CHECK_RESULT.UNKNOWN, "模板里没有 lark_cli_bin");
   }
-  try {
-    access(bin);
-    return item(ENDPOINT_CHECK.ADAPTER, CHECK_RESULT.PASS, "lark-cli 可执行");
-  } catch {
-    return item(ENDPOINT_CHECK.ADAPTER, CHECK_RESULT.FAIL, "lark-cli 不在或不能执行",
+  try { access(bin); } catch {
+    return item(ENDPOINT_CHECK.OUTBOUND, CHECK_RESULT.FAIL, "lark-cli 不在或不能执行",
       "确认 " + bin + " 存在且有执行权限");
   }
+  if (!identity?.expectedAppId) {
+    return item(ENDPOINT_CHECK.OUTBOUND, CHECK_RESULT.UNKNOWN, "lark-cli 可执行，但模板没声明期望的应用");
+  }
+  let got;
+  try {
+    got = assertFn({ configDir: identity.configDir, profile: identity.profile,
+      expectedAppId: identity.expectedAppId });
+  } catch {
+    return item(ENDPOINT_CHECK.OUTBOUND, CHECK_RESULT.UNKNOWN, "查不动出站凭据归属");
+  }
+  return got?.ok
+    ? item(ENDPOINT_CHECK.OUTBOUND, CHECK_RESULT.PASS, "lark-cli 可执行，凭据属于配置说的那个应用")
+    : item(ENDPOINT_CHECK.OUTBOUND, CHECK_RESULT.FAIL,
+      "出站身份不匹配（" + (got?.reason ?? "unknown") + "）",
+      "重新登录该 profile，或把模板改成实际在用的应用");
 }
 
 /**
@@ -104,24 +132,25 @@ function checkDaemon(bin, exec) {
   return item(ENDPOINT_CHECK.DAEMON, CHECK_RESULT.UNKNOWN, "看不懂 daemon status 的输出");
 }
 
-/** 凭据属不属于模板说的那个应用。复用发布前那道校验，两处判断不能分叉。 */
-function checkIdentity(identity, assertFn) {
-  if (!identity?.expectedAppId) {
-    return item(ENDPOINT_CHECK.IDENTITY, CHECK_RESULT.UNKNOWN, "模板没声明期望的应用");
-  }
-  let got;
-  try {
-    got = assertFn({
-      configDir: identity.configDir, profile: identity.profile,
-      expectedAppId: identity.expectedAppId,
-    });
-  } catch {
-    return item(ENDPOINT_CHECK.IDENTITY, CHECK_RESULT.UNKNOWN, "查不动凭据归属");
-  }
-  if (got?.ok) return item(ENDPOINT_CHECK.IDENTITY, CHECK_RESULT.PASS, "凭据属于配置说的那个应用");
-  return item(ENDPOINT_CHECK.IDENTITY, CHECK_RESULT.FAIL,
-    "身份不匹配（" + (got?.reason ?? "unknown") + "）",
-    "重新登录该 profile，或把模板改成实际在用的应用");
+/**
+ * **入站**：transport agent / Aily endpoint / caller 身份对不对。
+ *
+ * **本机没有可信的入站身份事实来源。**AILY_CLI_CALLER_AGENT_UID 只在真实入站回合的
+ * 环境里出现，status 跑的时候拿不到；模板里写的是**期望值**，不是观测值。
+ *
+ * 所以这一项**只能是 unknown**，除非将来有一条正面验证入站身份的途径。
+ * 拿出站身份顶替是上一版的做法，那让入站身份 A、出站身份 B 的机器判成了 ready。
+ *
+ * 历史证据（最近一次成功入站）由展示层单独给出，**不参与这一项的判定** ——
+ * 那是"过去某刻对过"，不是"现在对"。
+ */
+function checkInbound(template) {
+  const declared = typeof template?.agent_uid === "string" && template.agent_uid.length > 0;
+  return item(ENDPOINT_CHECK.INBOUND, CHECK_RESULT.UNKNOWN,
+    declared
+      ? "无法本机验证（模板声明了 transport agent，但那是期望值不是观测值）"
+      : "无法本机验证，且模板没有声明 transport agent",
+    declared ? null : "在链路模板里补上 agent_uid");
 }
 
 /**
@@ -137,9 +166,9 @@ export function checkEndpoint({
 } = {}) {
   const checks = [
     checkBridge(verify),
-    checkAdapter(template?.lark_cli_bin, access),
     checkDaemon(template?.aily_cli_bin, exec),
-    checkIdentity(identity, assertFn),
+    checkInbound(template),
+    checkOutbound(template?.lark_cli_bin, identity, access, assertFn),
   ];
   const failed = checks.filter((c) => c.result === CHECK_RESULT.FAIL);
   const unknown = checks.filter((c) => c.result === CHECK_RESULT.UNKNOWN);
@@ -156,9 +185,9 @@ export function checkEndpoint({
 const RESULT_MARK = { pass: "✅", fail: "❌", unknown: "❔" };
 const CHECK_LABEL = {
   [ENDPOINT_CHECK.BRIDGE]: "运行时",
-  [ENDPOINT_CHECK.ADAPTER]: "adapter",
-  [ENDPOINT_CHECK.DAEMON]: "daemon",
-  [ENDPOINT_CHECK.IDENTITY]: "身份",
+  [ENDPOINT_CHECK.DAEMON]: "Aily daemon",
+  [ENDPOINT_CHECK.INBOUND]: "入站身份",
+  [ENDPOINT_CHECK.OUTBOUND]: "出站身份",
 };
 
 export function renderEndpointCheck(report) {

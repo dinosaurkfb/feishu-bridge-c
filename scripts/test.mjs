@@ -7850,16 +7850,19 @@ const selfCheck = (over = {}) => checkEndpoint({
 
 test("端点自检把 FR-1.4 的四种情形分开，各有各的下一步", () => {
   const ready = selfCheck();
-  assert.equal(ready.verdict, "ready");
+  // **入站身份本机验不了，所以最好的结论就是 incomplete。**
+  // 上一版能判 ready，是因为拿出站身份顶替了入站 —— 那是语义假阳性。
+  assert.equal(ready.verdict, "incomplete");
+  assert.deepEqual(ready.unknown, [ENDPOINT_CHECK.INBOUND]);
   assert.deepEqual(ready.checks.map((c) => c.id),
-    [ENDPOINT_CHECK.BRIDGE, ENDPOINT_CHECK.ADAPTER, ENDPOINT_CHECK.DAEMON, ENDPOINT_CHECK.IDENTITY]);
+    [ENDPOINT_CHECK.BRIDGE, ENDPOINT_CHECK.DAEMON, ENDPOINT_CHECK.INBOUND, ENDPOINT_CHECK.OUTBOUND]);
 
   // 四种失败各自可辨认，而且各带一条能执行的下一步 —— 混成一句"不可用"等于没说。
   const cases = [
     [{ verify: () => ({ ok: false, reason: "current_absent" }) }, ENDPOINT_CHECK.BRIDGE, /install-outbound/u],
-    [{ access: () => { throw new Error("nope"); } }, ENDPOINT_CHECK.ADAPTER, /执行权限/u],
+    [{ access: () => { throw new Error("nope"); } }, ENDPOINT_CHECK.OUTBOUND, /执行权限/u],
     [{ exec: () => "daemon not running" }, ENDPOINT_CHECK.DAEMON, /daemon start/u],
-    [{ assertFn: () => ({ ok: false, reason: "app_mismatch" }) }, ENDPOINT_CHECK.IDENTITY, /重新登录/u],
+    [{ assertFn: () => ({ ok: false, reason: "app_mismatch" }) }, ENDPOINT_CHECK.OUTBOUND, /重新登录/u],
   ];
   for (const [over, id, action] of cases) {
     const got = selfCheck(over);
@@ -7885,7 +7888,7 @@ test("端点自检里「查不动」不许算成「有问题」，也不许算�
     const got = selfCheck(over);
     assert.equal(got.verdict, "incomplete", JSON.stringify(Object.keys(over)));
     assert.deepEqual(got.failed, [], "没查清不能算失败");
-    assert.equal(got.unknown.length, 1);
+    assert.equal(got.unknown.length, 2, "入站那项永远是 unknown，再加上这次注入的那项");
   }
 
   // 但"二进制不在"是查出来的结论，该判 fail。
@@ -7922,6 +7925,56 @@ test("没跑自检时仍然显示未自检 —— 代码存在不等于查过了
     subscription: { ok: true, items: [], pendingCount: 0 },
   }));
   assert.match(incomplete, /没查清（查不清：identity_matches）/u);
+});
+
+test("端点自检不许拿出站身份顶替入站 —— 这是语义假阳性", () => {
+  // 评审构造的探针：**入站声明 agent A、出站凭据属于 app B**，注入的检查全过。
+  // 上一版四项全过、判 ready —— 因为它用 lark-cli 在不在回答"adapter 可用吗"
+  //（lark-cli 是出站 OpenAPI 客户端，而 README 定义的 adapter 是 Aily 的
+  // claude-code-local 运行环境），用出站发布身份回答"身份对吗"。
+  //
+  // 这个功能本来就是为了防"拿不知道冒充没事"，结果它自己犯了另一种：
+  // **拿别的知道冒充这个知道。**
+  const got = checkEndpoint({
+    template: { agent_uid: "agent_A", lark_cli_bin: "/bin/x", aily_cli_bin: "/bin/y" },
+    identity: { configDir: "/d", profile: "p", expectedAppId: "app_B" },
+    verify: () => ({ ok: true }), access: () => {},
+    exec: () => "daemon running", assertFn: () => ({ ok: true }),
+  });
+  assert.notEqual(got.verdict, "ready", "出站全过不能证明入站接得住");
+  assert.equal(got.verdict, "incomplete");
+  assert.deepEqual(got.unknown, [ENDPOINT_CHECK.INBOUND]);
+
+  // 入站那项**永远**是 unknown：本机没有可信的入站身份事实来源。
+  // AILY_CLI_CALLER_AGENT_UID 只在真实入站回合的环境里出现，status 拿不到；
+  // 模板写的是期望值，不是观测值。
+  const inbound = got.checks.find((c) => c.id === ENDPOINT_CHECK.INBOUND);
+  assert.equal(inbound.result, CHECK_RESULT.UNKNOWN);
+  assert.match(inbound.detail, /期望值不是观测值/u);
+});
+
+test("真实 feishu-status CLI 跑出来的第 1 层不会声称四项全过", () => {
+  // 这条走真实 CLI，不是函数 stub —— 前几轮反复栽在"函数对了、真实入口是坏的"。
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "feishu-status.mjs"), "--project", process.cwd(),
+  ], { encoding: "utf-8" });
+  assert.equal(run.status, 0, run.stderr);
+  const layer1 = run.stdout.slice(0, run.stdout.indexOf("第 2 层"));
+  assert.match(layer1, /实时自检/u);
+  // 本机入站身份验不了，所以最好的结论是"没查清"，不该是"四项全过"。
+  assert.doesNotMatch(layer1, /四项全过/u,
+    "入站身份本机验不了时，不许报成全过");
+  assert.match(layer1, /没查清/u);
+  assert.match(layer1, /inbound_transport_identity/u, "要说清是哪一项没查清");
+});
+
+test("模板写入器要能接住可选字段", () => {
+  // aily_cli_bin 加进了 OPTIONAL_CHAIN_FIELDS，但写入器只遍历 CHAIN_FIELDS ——
+  // 于是"模板支持这个字段"这句话只在读的那一侧成立。
+  const src = fs.readFileSync(path.resolve("scripts", "init-chain-template.mjs"), "utf-8");
+  assert.match(src, /\[\.\.\.CHAIN_FIELDS, \.\.\.OPTIONAL_CHAIN_FIELDS\]/u,
+    "写入器必须同时遍历必填与可选字段");
+  assert.match(src, /OPTIONAL_CHAIN_FIELDS/u);
 });
 
 summarySealed = true;

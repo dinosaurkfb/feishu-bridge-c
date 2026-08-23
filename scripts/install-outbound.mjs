@@ -278,19 +278,27 @@ try {
   /* 首次安装：用上面的空表 */
 }
 
-const selfEntry = {
-  id: path.basename(ROOT),
-  root: ROOT,
-  note: "长期任务把关键进展写进 .runtime-data/outbound/outbox，会话结束时由出站钩子排空",
-};
+/**
+ * **安装只保证登记表存在，不登记任何项目。**
+ *
+ * 安装是「装基础设施」，项目登记是「订阅」—— 两件事混在一起有三个后果，都真实存在过：
+ *
+ *   一、从哪个目录跑一次安装，那个目录就被当成一个已接入项目。本机登记表里现在就有
+ *       两条这样的产物（只有 id/root/note，没有任何绑定字段），来自两个**开发克隆**。
+ *   二、`--uninstall` 会把那条删掉。可它删的是一条**绑定**，而绑定牵着话题历史 ——
+ *       卸载基础设施不该让历史变成孤儿。
+ *   三、迁到 runtime 之后这个耦合更别扭：代码已经不在开发克隆里跑了，
+ *       却还在把开发克隆写进登记表。
+ *
+ * 项目登记从此只来自显式绑定（bind-project / bind-session）—— 那也是控制面本来的规矩：
+ * 配置变更必须来自显式控制动作。
+ *
+ * 已有的登记条目一律不动，包括那两条历史产物：清理它们是改运行状态，
+ * 要由人显式决定，不能由一次安装顺手做掉。
+ */
 const selfAt = registry.projects.findIndex((p) => p?.root === ROOT);
-if (uninstall) {
-  if (selfAt >= 0) registry.projects.splice(selfAt, 1);
-} else if (selfAt >= 0) {
-  registry.projects[selfAt] = { ...registry.projects[selfAt], ...selfEntry };
-} else {
-  registry.projects.push(selfEntry);
-}
+const selfRegistered = selfAt >= 0;
+const selfBound = selfRegistered && Boolean(registry.projects[selfAt]?.root_message_id);
 
 // ---------- 全局技能 ----------
 
@@ -416,7 +424,13 @@ console.log("Stop 钩子 : " + stop.length + " 条（.orca 的那条必须还在
 console.log("/init 钩子: " + initAction + "        （UserPromptSubmit 共 " + prompts.length + " 条）");
 console.log("入站钩子 : " + inboundHookAction + "        （Aily 回合强制进运输层）");
 console.log("预览放行 : allow " + allow.length + " 条  → " + permAction);
-console.log("登记表   : " + REGISTRY + "  → " + registry.projects.length + " 个项目");
+console.log("登记表   : " + REGISTRY + "  → " + registry.projects.length +
+  " 个项目（安装只保证文件存在，不登记项目）");
+// 提示而不是动作：安装器不再替人做订阅决定，但也不该让人以为「装完就接上了」。
+if (!uninstall && !selfBound) {
+  console.log("           本目录" + (selfRegistered ? "在表内但未绑定话题" : "未登记") +
+    "；要接入请显式运行 /feishu-bind");
+}
 console.log("技能     : " + SKILLS.length + " 个（装进 ~/.claude/skills/）  → " + skillAction);
 for (const sk of skillPlan) console.log("           /" + sk.dst.padEnd(26) + sk.action);
 console.log("兜底定时 : " + PLIST + "  → " + plistAction + "（每 30 分钟排空全部登记项目）");
@@ -468,7 +482,18 @@ if (settingsAfter !== settingsBefore) {
   writeJsonAtomic(SETTINGS, settings);
 }
 
-writeJsonAtomic(REGISTRY, registry);
+/**
+ * **只在登记表不存在时创建，绝不重写既有内容。**
+ *
+ * 原来是无条件 writeJsonAtomic(REGISTRY, registry) —— 即使安装器不再增删条目，
+ * 那也意味着每次安装都把整份绑定数据读出来再整体写回去。这条路径上的任何一个
+ * 解析/序列化差错都会落到真实绑定上，而绑定牵着话题历史。
+ *
+ * 装基础设施不该拿绑定数据当赌注。缺文件就建一份空的，其余交给显式绑定。
+ */
+if (!fs.existsSync(REGISTRY)) {
+  writeJsonAtomic(REGISTRY, { schema_version: "1.0", projects: [] });
+}
 
 for (const sk of skillPlan) {
   if (uninstall) {

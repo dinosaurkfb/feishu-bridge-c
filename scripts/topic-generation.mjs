@@ -15,6 +15,11 @@ export const TOPIC_GENERATION_ACTIVITY_SCHEMA_VERSION = "1.0";
 export const TOPIC_GENERATION_ACTIVITY_MODE = "business_message_v1";
 export const TOPIC_GENERATION_AUTO_ROTATE_MESSAGES = 30;
 export const TOPIC_GENERATION_AUTO_ROTATE_RETRY_MS = 5 * 60 * 1000;
+/**
+ * PREPARING 停留多久算「上一次尝试没走完」，可以被新的轮转接管。
+ * 取得比自动轮转重试间隔长，免得接管与重试互相抢同一个窗口。
+ */
+export const TOPIC_GENERATION_PREPARING_STALE_MS = 15 * 60 * 1000;
 
 export const GENERATION_STATUS = Object.freeze({
   PENDING: "pending",
@@ -33,6 +38,24 @@ export const ROTATION_STATUS = Object.freeze({
 });
 
 const nonEmpty = (value) => typeof value === "string" && value.length > 0;
+
+/**
+ * 这份 rotation 是否仍在占位、挡住新的轮转。
+ *
+ * **两个调用点必须共用它**：prepareTopicRotation 的拒绝判据，和
+ * recordTopicGenerationActivity 里 shouldAutoRotate 的 rotationOpen。
+ * 各写各的话会分叉 —— 实测过一次：手工路径加了 PREPARING 超时，自动路径没加，
+ * 于是"手工能恢复、自动仍永久卡死"，比两边都卡还难查。
+ */
+const rotationBlocking = (state, now) => {
+  const status = state?.rotation?.status;
+  if (status === ROTATION_STATUS.AWAITING_CLAIM) return true;
+  if (status !== ROTATION_STATUS.PREPARING) return false;
+  const preparedAt = Date.parse(state.rotation.prepared_at ?? "");
+  // 时间戳读不出来时按"仍在占位"处理：宁可挡住，也不要凭一个坏字段就允许重建话题。
+  if (!Number.isFinite(preparedAt)) return true;
+  return now - preparedAt < TOPIC_GENERATION_PREPARING_STALE_MS;
+};
 const iso = (now) => new Date(now).toISOString();
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
@@ -319,8 +342,7 @@ export function recordTopicGenerationActivity(state, {
     activity.threshold_reached_at = iso(now);
   }
 
-  const rotationOpen = [ROTATION_STATUS.PREPARING, ROTATION_STATUS.AWAITING_CLAIM]
-    .includes(next.rotation?.status);
+  const rotationOpen = rotationBlocking(next, now);
   const lastAttempt = Date.parse(activity.last_auto_rotation_attempt_at ?? "");
   const retryReady = !Number.isFinite(lastAttempt) || now - lastAttempt >= retryMs;
   const shouldAutoRotate = next.binding_status === "active" &&
@@ -350,10 +372,7 @@ export function prepareTopicRotation(state, {
   if (state.binding_status !== "active") return { ok: false, reason: "binding_not_active" };
   if (!activeGeneration(state)) return { ok: false, reason: "no_active_generation" };
   if (pendingGeneration(state)) return { ok: false, reason: "rotation_already_pending" };
-  if (state.rotation && [ROTATION_STATUS.PREPARING, ROTATION_STATUS.AWAITING_CLAIM]
-    .includes(state.rotation.status)) {
-    return { ok: false, reason: "rotation_already_pending" };
-  }
+  if (rotationBlocking(state, now)) return { ok: false, reason: "rotation_already_pending" };
   if (!nonEmpty(operationId)) return { ok: false, reason: "rotation_operation_id_required" };
   const next = clone(state);
   next.rotation = {

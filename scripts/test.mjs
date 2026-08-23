@@ -143,7 +143,9 @@ import {
   stableControlId, validateSubscription,
 } from "./subscription.mjs";
 import {
-  ROTATION_STATUS, activatePendingTopicGeneration, activeGeneration,
+  ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, topicGenerationStateForLegacy,
+  TOPIC_GENERATION_PREPARING_STALE_MS,
+  activatePendingTopicGeneration, activeGeneration,
   closePendingTopicGeneration, materializeLegacyTopicFields, pendingGeneration,
   prepareTopicRotation, projectLegacyTopicGeneration, registerPendingTopicGeneration,
   recordTopicGenerationActivity, resolveOutboundGeneration, validateTopicGenerationState,
@@ -6022,6 +6024,65 @@ test("安装器不再把开发克隆路径写进全局配置", () => {
     assert.doesNotMatch(text, /\/Users\/[^\s"']*\/(claude-projects|codex-projects)\//u,
       file + " 里不能出现开发克隆的绝对路径，用 {{BRIDGE_ROOT}}");
   }
+});
+
+test("PREPARING 卡住不再永久堵死轮转：超时后自动与手工都能接管", () => {
+  // 真实缺陷，实测复现过：feishu-rotate 里新话题创建成功但登记 pending 失败时只 die、
+  // 不收口，rotation 停在 PREPARING。然后三条路同时堵死 ——
+  //   自动轮转被 !rotationOpen 挡住；
+  //   手工 /feishu-rotate 报 rotation_already_pending；
+  //   24 小时过期清理只处理 pending 代际，PREPARING 阶段还没有 pending 可清。
+  // 没有任何一条不动运行时状态就能恢复。
+  const legacy = { binding_id: "binding_wedge", feishu_root_message_id_reference: "om_w",
+    channel_generation_id: null, status: "active" };
+  const projected = topicGenerationStateForLegacy(legacy, { bindingId: "binding_wedge", now: NOW });
+  assert.equal(projected.ok, true);
+  const stuck = prepareTopicRotation(projected.state, { operationId: "op1", now: NOW }).state;
+  assert.equal(stuck.rotation.status, ROTATION_STATUS.PREPARING);
+  const genId = activeGeneration(stuck).channel_generation_id;
+  // messageDelta 有上限，攒到阈值要逐条记；返回最后一次的判定。
+  const driveToThreshold = (state, at, tag) => {
+    let cur = state, last = null;
+    for (let i = 0; i < TOPIC_GENERATION_AUTO_ROTATE_MESSAGES; i += 1) {
+      last = recordTopicGenerationActivity(cur, { generationId: genId,
+        eventKey: tag + i, messageDelta: 1, now: at });
+      if (last.ok) cur = last.state;
+    }
+    return last;
+  };
+
+  // 窗口内仍要挡住 —— 否则一次慢调用就会被当成卡死，重复建话题。
+  const inside = NOW + TOPIC_GENERATION_PREPARING_STALE_MS - 1;
+  assert.equal(prepareTopicRotation(stuck, { operationId: "op2", now: inside }).ok, false);
+  assert.equal(driveToThreshold(stuck, inside, "k").shouldAutoRotate, false,
+    "窗口内自动轮转也必须被挡");
+
+  // 超时之后两条路都要能接管，而且判据必须同源 —— 只修一条会变成
+  // "手工能恢复、自动仍卡死"，比两边都卡还难查。返修过程中真出现过这一步。
+  const after = NOW + TOPIC_GENERATION_PREPARING_STALE_MS;
+  assert.equal(prepareTopicRotation(stuck, { operationId: "op2", now: after }).ok, true,
+    "超时后手工轮转应能接管");
+  assert.equal(driveToThreshold(stuck, after, "m").shouldAutoRotate, true,
+    "超时后自动轮转也应能接管");
+
+  // prepared_at 读不出来时按"仍在占位"处理：宁可挡住，也不要凭一个坏字段就重建话题。
+  const broken = { ...stuck, rotation: { ...stuck.rotation, prepared_at: "坏值" } };
+  assert.equal(prepareTopicRotation(broken, { operationId: "op3", now: after }).ok, false);
+
+  // AWAITING_CLAIM 不受超时影响：那一阶段是在等人真实 @，等多久都正常。
+  const awaiting = { ...stuck,
+    rotation: { ...stuck.rotation, status: ROTATION_STATUS.AWAITING_CLAIM } };
+  assert.equal(prepareTopicRotation(awaiting, { operationId: "op4",
+    now: NOW + 30 * 24 * 3600 * 1000 }).ok, false, "等认领不是卡死，不能被接管");
+});
+
+test("feishu-rotate 在登记失败时也收口，不留 PREPARING", () => {
+  // 超时接管是兜底，但兜底不该替代显式收口 —— 那要等 15 分钟，而这里立刻就知道失败了。
+  // 同一个函数里两个相邻的失败出口，一个收口一个不收，是最容易漏的形状。
+  const src = fs.readFileSync(path.resolve("scripts", "feishu-rotate.mjs"), "utf-8");
+  const tail = src.slice(src.indexOf("if (!registered.ok) {"));
+  assert.match(tail.slice(0, tail.indexOf("\n}")), /failClaudeTopicRotation\(/u,
+    "登记失败必须收口，否则 rotation 停在 PREPARING");
 });
 
 test("测试文件里没有写在汇总之后的 test()", () => {

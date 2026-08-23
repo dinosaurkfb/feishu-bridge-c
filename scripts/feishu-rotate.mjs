@@ -106,7 +106,14 @@ const registered = registerClaudeTopicRotation({
   root, claudeSessionId, operationId, rootMessageId, pendingToken: token,
 });
 if (!registered.ok) {
-  die("新话题已创建，但 pending generation 登记失败（" + registered.reason + "）。旧代际仍保持 active。");
+  // **失败要收口。**上面 sendToChat 那条失败路径会调 failClaudeTopicRotation，这里原来
+  // 只 die 就走人 —— 同一个函数里两个相邻的失败出口，一个收口一个不收，最容易漏。
+  // 不收口的后果是 rotation 停在 PREPARING：自动轮转被挡、手工轮转报
+  // rotation_already_pending、而 24 小时过期清理只处理 pending 代际（此时还没有 pending）。
+  // 超时接管是兜底，但兜底不该替代显式收口 —— 那要等 15 分钟，而这里立刻就知道失败了。
+  failClaudeTopicRotation({ root, claudeSessionId, operationId, reason: registered.reason });
+  die("新话题已创建，但 pending generation 登记失败（" + registered.reason +
+    "）。轮转已收口，旧代际仍保持 active；新建的那个话题需要人工清理。");
 }
 
 try {

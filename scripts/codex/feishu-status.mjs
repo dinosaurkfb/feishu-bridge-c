@@ -26,6 +26,10 @@ const found = findRegisteredTaskForCodexThread({ threadId, home });
 if (!found.ok) {
   if (found.reason === "thread_not_registered") {
     console.log("当前 Codex task 尚未接入飞书。");
+    // 当前 task 没绑，不该妨碍看别的链路 —— 本机可能还有几条正常运转的，
+    // 而"这条没绑"和"本机什么都没有"是两回事。
+    const unbound = renderConnectivity(collectConnectivity());
+    if (unbound) console.log("\n" + unbound);
     process.exit(0);
   }
   console.error("无法读取连接状态：" + found.reason);

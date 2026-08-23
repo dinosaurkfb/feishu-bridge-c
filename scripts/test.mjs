@@ -6832,8 +6832,10 @@ test("状态入口登记命令：默认预览，受控写入", () => {
   assert.deepEqual(raw.providers[0].args, ["--binding", "/abs/b.json"], "-- 之后的参数原样存下");
   assert.equal(fs.statSync(file).mode & 0o777, 0o600);
 
-  // 幂等；同 id 换脚本要拒 —— 那是悄悄改判由谁来报这条链路的状态。
-  assert.match(cli(["--id", "cc2cd", "--script", script, "--apply"]).stdout, /无变化/u);
+  // 幂等要求**完全相同**：少了 -- 之后那两个参数就不是同一条登记了。
+  assert.match(cli(["--id", "cc2cd", "--script", script, "--apply", "--", "--binding", "/abs/b.json"]).stdout,
+    /无变化/u);
+  // 同 id 换脚本要拒 —— 那是悄悄改判由谁来报这条链路的状态。
   const repoint = cli(["--id", "cc2cd", "--script", path.resolve("scripts", "feishu-status.mjs"), "--apply"]);
   assert.notEqual(repoint.status, 0);
   assert.match(repoint.stderr, /provider_exists_with_other_script/u);
@@ -6843,6 +6845,108 @@ test("状态入口登记命令：默认预览，受控写入", () => {
   const onBroken = cli(["--id", "other", "--script", script, "--apply"]);
   assert.notEqual(onBroken.status, 0);
   assert.equal(fs.readFileSync(file, "utf-8"), "{ 坏掉的 json");
+});
+
+test("登记命令：-- 之后的参数不得越过授权闸门", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-bypass-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  // 控制面和数据面混在同一个 argv 里，"整个数组里搜 --apply"就会把
+  // 一个透传给 provider 的参数当成授权。
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"),
+    "--id", "cc2cd", "--script", script, "--", "--apply",
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /dry-run/u);
+  assert.equal(fs.existsSync(file), false, "透传参数不得触发落盘");
+
+  // --id 之类也一样：控制参数只从 -- 前半段读。
+  const spoof = spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"),
+    "--script", script, "--apply", "--", "--id", "sneaky",
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+  assert.equal(spoof.status, 2, "缺 --id 就该报用法，而不是从透传段捡一个");
+});
+
+test("登记命令：任一字段不同都不许报「无变化」", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-idem-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"), ...args,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+
+  assert.equal(cli(["--id", "cc2cd", "--script", script, "--apply", "--", "--binding", "/first.json"]).status, 0);
+  // 只比 script 会虚假宣称"无变化"，而文件里还是旧值。
+  const changed = cli(["--id", "cc2cd", "--script", script, "--kinds", "progress",
+    "--apply", "--", "--binding", "/second.json"]);
+  assert.notEqual(changed.status, 0);
+  assert.match(changed.stderr, /provider_exists_with_other_settings/u);
+  assert.match(changed.stderr, /args/u);
+  assert.match(changed.stderr, /allowed_kinds/u);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf-8")).providers[0].args,
+    ["--binding", "/first.json"], "拒绝时不得改动已有登记");
+
+  // 完全相同才幂等。
+  assert.match(cli(["--id", "cc2cd", "--script", script, "--apply", "--", "--binding", "/first.json"]).stdout,
+    /无变化/u);
+});
+
+test("登记命令：结构损坏的表不得因为 id 相同就提前成功", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-idem2-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  // 同 id 同 script，但表里另有一条解释不了的记录。
+  fs.writeFileSync(file, JSON.stringify({ providers: [
+    { id: "cc2cd", protocol: "feishu-bridge-status/v1", executable: process.execPath,
+      script, args: [], allowed_kinds: ["transport"] },
+    { id: "broken", protocol: "feishu-bridge-status/v1", executable: process.execPath,
+      script, args: [], allowed_kinds: ["god-mode"] },
+  ] }));
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"),
+    "--id", "cc2cd", "--script", script, "--apply",
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+  // 登记说成了、读取说没有，是最难查的一类不一致。
+  assert.notEqual(run.status, 0, "提前返回成功会跟 loadStatusProviders 的判断打架");
+  assert.equal(loadStatusProviders(file).ok, false, "确认这张表读取路径也认为不可用");
+});
+
+test("只授权 progress 的 provider 不得掩盖 transport 路由", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-kind-"));
+  const routesFile = path.join(dir, "routes.json");
+  const providersFile = path.join(dir, "providers.json");
+  fs.writeFileSync(routesFile, JSON.stringify({
+    routes: [{ id: "cc2cd", handler: process.execPath }], sessions: {},
+  }));
+  fs.writeFileSync(providersFile, JSON.stringify({ providers: [{
+    id: "cc2cd", protocol: "feishu-bridge-status/v1", executable: process.execPath,
+    script: "/abs/x.mjs", allowed_kinds: ["progress"],
+  }] }));
+  const run = () => ({ ok: true, connections: [
+    { kind: "progress", state: "active", scope: "project", groupName: "某群", topicName: null },
+  ] });
+
+  const text = renderConnectivity(collectConnectivity({ routesFile, providersFile, run }));
+  assert.match(text, /进度汇报/u);
+  // 按 id 一刀切会让这条 route 的运输状态凭空消失，且不提示未登记。
+  assert.match(text, /链路存在，状态入口未登记/u,
+    "只有获准报告 transport 的 provider 才算覆盖了一条 route");
+});
+
+test("provider 停用说的是状态入口停用，不是链路停用", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-dis2-"));
+  const providersFile = path.join(dir, "providers.json");
+  fs.writeFileSync(providersFile, JSON.stringify({ providers: [{
+    id: "cc2cd", protocol: "feishu-bridge-status/v1", executable: process.execPath,
+    script: "/abs/x.mjs", allowed_kinds: ["transport"], enabled: false,
+  }] }));
+  const text = renderConnectivity(collectConnectivity({
+    routesFile: path.join(dir, "no-routes.json"), providersFile,
+  }));
+  // 说成"已停用"会被读成链路停了，而那条 route 可能还在正常收消息。
+  assert.match(text, /状态入口已停用（链路本身不受影响）/u);
 });
 
 summarySealed = true;

@@ -244,13 +244,15 @@ export function collectStatusProviders({ file = statusProvidersPath(), run = run
   const sections = [];
   for (const provider of loaded.providers) {
     if (!provider.enabled) {
-      sections.push({ id: provider.id, displayName: provider.displayName, state: "disabled" });
+      sections.push({ id: provider.id, displayName: provider.displayName,
+        allowedKinds: provider.allowedKinds, state: "disabled" });
       continue;
     }
     const got = run(provider);
+    const base = { id: provider.id, displayName: provider.displayName, allowedKinds: provider.allowedKinds };
     sections.push(got.ok
-      ? { id: provider.id, displayName: provider.displayName, state: "ok", connections: got.connections }
-      : { id: provider.id, displayName: provider.displayName, state: "unavailable", reason: got.reason });
+      ? { ...base, state: "ok", connections: got.connections }
+      : { ...base, state: "unavailable", reason: got.reason });
   }
   return { ok: true, sections };
 }
@@ -273,10 +275,18 @@ export function collectConnectivity({
   const table = loadRoutes(routesFile);
 
   const sections = fromProviders.ok ? [...fromProviders.sections] : [];
-  const covered = new Set(sections.map((x) => x.id));
+
+  // **只有获准报告 transport 的 provider 才算覆盖了一条 route。**
+  // 按 id 一刀切会掩盖缺口：给一条 route 配一个只授权 progress 的同 id provider，
+  // 结果只显示"进度汇报正常"，那条 route 的运输状态凭空消失、也不提示未登记。
+  const coversTransport = new Set(
+    (fromProviders.ok ? fromProviders.sections : [])
+      .filter((x) => x.allowedKinds?.includes("transport"))
+      .map((x) => x.id));
+
   if (table.ok) {
     for (const route of table.routes) {
-      if (covered.has(route.id)) continue;
+      if (coversTransport.has(route.id)) continue;
       sections.push({
         id: route.id,
         // 路由 id 也会变成显示文本，跟 provider id 是同一个注入面。
@@ -309,7 +319,9 @@ export function renderConnectivity(view) {
       // 老实的空白好过看不见：说清是"看不到"，不是"没有"。
       lines.push("  " + name + "  链路存在，状态入口未登记" + (s.isDefault ? "（默认路由）" : ""));
     } else if (s.state === "disabled") {
-      lines.push("  " + name + "  已停用");
+      // 停的是**状态入口**，不是链路。说成"已停用"会被读成链路停了，
+      // 而那条 route 可能还在正常收消息。
+      lines.push("  " + name + "  状态入口已停用（链路本身不受影响）");
     } else if (s.state !== "ok") {
       lines.push("  " + name + "  状态取不到（" + s.reason + "）");
     } else if (s.connections.length === 0) {

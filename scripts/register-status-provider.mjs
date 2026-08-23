@@ -31,6 +31,7 @@ const REASON_TEXT = {
   allowed_kinds_invalid: "--kinds 只能是 " + PROVIDER_KINDS.join(" / "),
   provider_id_duplicated: "登记表里已经有同名 provider",
   provider_exists_with_other_script: "这个 id 已经指向别的脚本",
+  provider_exists_with_other_settings: "这个 id 已登记，但以下字段不同；改登记要显式先注销",
   status_providers_unreadable: "登记表读不出来 —— 先修表，别覆盖它",
   status_providers_shape_unexpected: "登记表结构异常 —— 先修表，别覆盖它",
   providers_busy: "登记表正被别的进程写，稍后重试",
@@ -38,21 +39,26 @@ const REASON_TEXT = {
   script_not_a_file: "--script 不是普通文件",
 };
 
+/**
+ * 先按 `--` 切开，**控制参数只从前半段读**。
+ *
+ * 原来 arg() 和 --apply 都在整个 argv 里搜，于是
+ * `... -- --apply` 会真的落盘 —— 一个透传给 provider 的参数，
+ * 越过了这个命令唯一的授权闸门。控制面和数据面混在一个数组里就会这样。
+ */
+const SPLIT_AT = process.argv.indexOf("--", 2);
+const CONTROL = SPLIT_AT >= 0 ? process.argv.slice(2, SPLIT_AT) : process.argv.slice(2);
+const PASSTHROUGH = SPLIT_AT >= 0 ? process.argv.slice(SPLIT_AT + 1) : [];
+
 function arg(name) {
-  const i = process.argv.indexOf("--" + name);
-  return i >= 0 ? process.argv[i + 1] : undefined;
+  const i = CONTROL.indexOf("--" + name);
+  return i >= 0 ? CONTROL[i + 1] : undefined;
 }
 
 function fail(reason, detail) {
   console.error("失败（" + reason + "）：" + (REASON_TEXT[reason] ?? reason) +
     (detail ? "：" + detail : ""));
   process.exit(1);
-}
-
-/** `--` 之后的一切都是 provider 的参数。分隔符本身不进去。 */
-function passthroughArgs() {
-  const at = process.argv.indexOf("--", 2);
-  return at >= 0 ? process.argv.slice(at + 1) : [];
 }
 
 function readDoc(file) {
@@ -71,8 +77,27 @@ function writeDoc(doc, file) {
   fs.renameSync(tmp, file);
 }
 
+/** 比较用的规范形。字段顺序不该影响"是不是同一条登记"。 */
+function normalize(entry) {
+  return {
+    id: entry.id, protocol: entry.protocol,
+    executable: entry.executable, script: entry.script,
+    args: [...(entry.args ?? [])],
+    allowed_kinds: [...(entry.allowed_kinds ?? [])].sort(),
+    display_name: entry.display_name ?? null,
+  };
+}
+
+/** 说清是哪几处不同 —— 只报字段名，不回显值（值里可能有路径和参数）。 */
+function diff(a, b) {
+  const x = normalize(a); const y = normalize(b);
+  return Object.keys(x)
+    .filter((k) => JSON.stringify(x[k]) !== JSON.stringify(y[k]))
+    .join("、");
+}
+
 function main() {
-  const apply = process.argv.includes("--apply");
+  const apply = CONTROL.includes("--apply");
   const id = arg("id");
   const script = arg("script");
   const executable = arg("executable") ?? process.execPath;
@@ -89,7 +114,7 @@ function main() {
 
   const entry = {
     id, protocol: PROVIDER_PROTOCOL, executable, script,
-    args: passthroughArgs(), allowed_kinds: kinds,
+    args: PASSTHROUGH, allowed_kinds: kinds,
     ...(displayName ? { display_name: displayName } : {}),
   };
 
@@ -125,12 +150,23 @@ function main() {
     const doc = read.doc ?? { schema_version: "1.0", providers: [] };
     if (!Array.isArray(doc.providers)) fail("status_providers_shape_unexpected");
 
-    const existing = doc.providers.find((p) => p && p.id === id);
+    // 先验**整表**再谈幂等：否则一张结构损坏、但恰好 id/script 相同的表
+    // 会提前"成功"返回，而随后 loadStatusProviders 照样判它损坏 ——
+    // 登记说成了，读取说没有，那是最难查的一类不一致。
+    const whole = validateProviderRegistry(doc);
+    if (!whole.ok) fail(whole.problem);
+
+    const existing = doc.providers.find((x) => x && x.id === id);
     if (existing) {
-      // 同 id 换脚本 = 悄悄改判由谁来报这条链路的状态。跟路由表那条同理。
+      // 只比 script 会虚假宣称"无变化"：args、allowed_kinds、executable、
+      // display_name 改了也照样报成功，而文件里还是旧值。
+      const same = JSON.stringify(normalize(existing)) === JSON.stringify(normalize(entry));
+      if (same) {
+        console.log("\n已登记，无变化。");
+        return;
+      }
       if (existing.script !== script) fail("provider_exists_with_other_script", existing.script);
-      console.log("\n已登记，无变化。");
-      return;
+      fail("provider_exists_with_other_settings", diff(existing, entry));
     }
     // 只往 providers 里加一项，不重建文档 —— 未知顶层字段原样保留。
     doc.providers.push(entry);

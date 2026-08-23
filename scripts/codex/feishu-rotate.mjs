@@ -18,6 +18,7 @@ import {
 } from "./state.mjs";
 import {
   ROTATION_STATUS, activeGeneration, pendingGeneration,
+  TOPIC_GENERATION_PREPARING_STALE_MS,
 } from "../topic-generation.mjs";
 
 const arg = (name) => {
@@ -120,7 +121,22 @@ const registered = registerTaskTopicRotation({
   home,
 });
 if (!registered.ok) {
-  die("新话题已创建，但 pending generation 登记失败（" + registered.reason + "）。旧代际仍保持 active。");
+  // **失败要收口，而且收口本身也可能失败。**
+  //
+  // 两处教训叠在一起：
+  //   同一函数里两个相邻失败出口，上面 sendToChat 那条收口了，这条原来只 die 就走人；
+  //   而收口调用自己也会因写入失败、锁竞争或 operation mismatch 返回 false ——
+  //   不看返回值就宣布"已收口"，等于生成一份虚假的完成回执，
+  //   而真实状态可能仍停在 PREPARING。要让人知道何时可以重试。
+  const closed = failTaskTopicRotation({
+    threadId: thread.threadId, operationId, reason: registered.reason, home,
+  });
+  die("新话题已创建，但 pending generation 登记失败（" + registered.reason + "）。" +
+    (closed.ok
+      ? "轮转已收口，旧代际仍保持 active；新建的那个话题需要人工清理。"
+      : "**收口也失败了（" + closed.reason + "）**：轮转状态可能仍停在 preparing。" +
+        "旧代际保持 active，" + Math.round(TOPIC_GENERATION_PREPARING_STALE_MS / 60000) +
+        " 分钟后可重试轮转（超时后允许接管）。新建的那个话题需要人工清理。"));
 }
 try {
   publishDraft({

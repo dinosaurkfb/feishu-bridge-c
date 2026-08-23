@@ -6076,13 +6076,26 @@ test("PREPARING 卡住不再永久堵死轮转：超时后自动与手工都能�
     now: NOW + 30 * 24 * 3600 * 1000 }).ok, false, "等认领不是卡死，不能被接管");
 });
 
-test("feishu-rotate 在登记失败时也收口，不留 PREPARING", () => {
-  // 超时接管是兜底，但兜底不该替代显式收口 —— 那要等 15 分钟，而这里立刻就知道失败了。
-  // 同一个函数里两个相邻的失败出口，一个收口一个不收，是最容易漏的形状。
-  const src = fs.readFileSync(path.resolve("scripts", "feishu-rotate.mjs"), "utf-8");
-  const tail = src.slice(src.indexOf("if (!registered.ok) {"));
-  assert.match(tail.slice(0, tail.indexOf("\n}")), /failClaudeTopicRotation\(/u,
-    "登记失败必须收口，否则 rotation 停在 PREPARING");
+test("两侧 feishu-rotate 在登记失败时都收口，且不谎报收口成功", () => {
+  // 两处教训叠在一起：
+  //   一、只修一侧不算修 —— 上一版我只改了 Claude 侧，Codex 侧同一个漏收口还在；
+  //   二、收口调用**自己也会失败**（写入失败、锁竞争、operation mismatch）。
+  //       不看返回值就宣布"已收口"，等于生成一份虚假的完成回执，
+  //       而真实状态可能仍停在 PREPARING。
+  for (const rel of ["feishu-rotate.mjs", path.join("codex", "feishu-rotate.mjs")]) {
+    const src = fs.readFileSync(path.resolve("scripts", rel), "utf-8");
+    const at = src.indexOf("if (!registered.ok) {");
+    assert.ok(at > 0, rel + " 里找不到登记失败分支");
+    const block = src.slice(at, src.indexOf("\n}", at));
+    assert.match(block, /fail(Claude|Task)TopicRotation\(/u,
+      rel + "：登记失败必须收口，否则 rotation 停在 PREPARING");
+    assert.match(block, /closed\.ok/u,
+      rel + "：必须检查收口结果 —— 收口自己也会失败");
+    assert.match(block, /closed\.reason/u,
+      rel + "：收口失败时要说出原因");
+    assert.match(block, /PREPARING_STALE_MS/u,
+      rel + "：收口失败时要告诉用户多久之后可以重试");
+  }
 });
 
 test("测试文件里没有写在汇总之后的 test()", () => {

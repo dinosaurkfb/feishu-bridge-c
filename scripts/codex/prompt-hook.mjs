@@ -3,6 +3,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { isDirectRun } from "../direct-run.mjs";
 
 import {
   bridgeHome, findRegisteredTaskForCodexThread, loadCodexTemplate, recordThreadActivity, taskPaths,
@@ -290,6 +291,6 @@ async function main() {
   }) + "\n");
 }
 
-if (import.meta.url === "file://" + process.argv[1]) {
+if (isDirectRun(import.meta.url)) {
   main().catch(() => process.exit(0));
 }

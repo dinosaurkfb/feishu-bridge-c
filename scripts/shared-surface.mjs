@@ -27,6 +27,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { isDirectRun } from "./direct-run.mjs";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 export const SNAPSHOT_FILE = path.join(ROOT, "references", "shared-surface.json");
@@ -113,7 +114,7 @@ export function describeProblem(p) {
 
 // ---------- CLI ----------
 
-if (import.meta.url === "file://" + process.argv[1]) {
+if (isDirectRun(import.meta.url)) {
   const current = await currentSurface();
   const modules = Object.keys(current);
 

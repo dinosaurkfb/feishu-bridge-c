@@ -24,6 +24,7 @@ import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { bindingsForRoot, currentBinding, describeStatus, setBindingStatus } from "./feishu-control.mjs";
 import { registryPath } from "./registry.mjs";
 import { publishDraft, sendToChat } from "./outbound.mjs";
+import { isDirectRun } from "./direct-run.mjs";
 import {
   bindingToken, composeRootMessage, composeStatusMessage, idempotencyKeyFor,
   newRegistryEntry, readProjectIdentity,
@@ -31,7 +32,7 @@ import {
 
 // ---------- CLI ----------
 
-if (import.meta.url === "file://" + process.argv[1]) {
+if (isDirectRun(import.meta.url)) {
 
 const arg = (n) => {
   const i = process.argv.indexOf("--" + n);

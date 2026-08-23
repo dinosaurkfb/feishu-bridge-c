@@ -5374,11 +5374,15 @@ test("入站技能安装幂等：连续两次 apply 之后自检一致、不再�
 
 test("runtime 未就绪时，入站 --apply 必须拒绝而不是装一个指不到脚本的技能", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "inbound-skill-"));
+  // HOME 指向空临时目录：这条测试要验的是"runtime 未就绪时拒绝"，不能依赖本机
+  // 到底装没装 runtime —— 那样测试结果会随开发机状态漂移，而且装上之后就再也测不到。
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "inbound-home-"));
   const run = (extra) => {
     try {
       return { code: 0, out: execFileSync(process.execPath,
         [path.resolve("scripts", "install-inbound.mjs"), "--dir", dir, ...extra],
-        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }) };
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"],
+          env: { ...process.env, HOME: fakeHome } }) };
     } catch (err) {
       return { code: err.status ?? 1, out: String(err.stdout ?? "") + String(err.stderr ?? "") };
     }
@@ -5416,6 +5420,46 @@ test("入站钩子从自身定位分发器，不再经 bridge_root 落回开发�
   for (const installer of ["install-outbound.mjs", "install-inbound.mjs"]) {
     const text = fs.readFileSync(path.resolve("scripts", installer), "utf-8");
     assert.match(text, /BRIDGE_ROOT/u, installer + " 必须会渲染 {{BRIDGE_ROOT}} 占位符");
+  }
+});
+
+test("经符号链接执行时，脚本仍认得出自己是被直接执行的", () => {
+  // 2026-08-23 真实故障：切到 runtime 当天，出站入站钩子同时变成空转且不留日志。
+  // 原因是各文件各写一遍 `import.meta.url === "file://" + process.argv[1]`——
+  // import.meta.url 给的是解析过符号链接的真实路径，process.argv[1] 给的是调用路径，
+  // 经 runtime/current/ 这个链接执行时两者永远不等，于是 main() 从不执行。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "direct-run-"));
+  const real = path.join(dir, "versions", "v1");
+  fs.mkdirSync(real, { recursive: true });
+  const script = path.join(real, "probe.mjs");
+  fs.writeFileSync(script, [
+    'import { isDirectRun } from ' + JSON.stringify(path.resolve("scripts", "direct-run.mjs")) + ';',
+    'process.stdout.write(isDirectRun(import.meta.url) ? "direct" : "imported");',
+  ].join("\n"));
+  fs.symlinkSync(path.join("versions", "v1"), path.join(dir, "current"));
+
+  const viaReal = execFileSync(process.execPath, [script], { encoding: "utf-8" });
+  const viaLink = execFileSync(process.execPath,
+    [path.join(dir, "current", "probe.mjs")], { encoding: "utf-8" });
+  assert.equal(viaReal, "direct");
+  assert.equal(viaLink, "direct", "经符号链接调用时也必须判为直接执行 —— 否则钩子静默空转");
+
+  // 旧判据在这里必然失败，留着这条对照，免得有人"顺手简化"回去。
+  const legacy = path.join(real, "legacy.mjs");
+  fs.writeFileSync(legacy,
+    'process.stdout.write(import.meta.url === "file://" + process.argv[1] ? "direct" : "imported");');
+  assert.equal(execFileSync(process.execPath,
+    [path.join(dir, "current", "legacy.mjs")], { encoding: "utf-8" }), "imported",
+    "旧判据经符号链接会误判成 imported —— 这正是当天钩子失灵的原因");
+
+  // 全仓库不得再出现旧判据。
+  for (const file of fs.readdirSync(path.resolve("scripts"))) {
+    // direct-run.mjs 的注释里就写着旧判据长什么样（说明它为什么错），跳过它。
+    if (!file.endsWith(".mjs") || file === "direct-run.mjs") continue;
+    const text = fs.readFileSync(path.resolve("scripts", file), "utf-8")
+      .replace(/\/\*[\s\S]*?\*\//gu, "").replace(/\/\/[^\n]*/gu, "");
+    assert.doesNotMatch(text,
+      /import\.meta\.url === "file:\/\/" \+ process\.argv\[1\]/u, file);
   }
 });
 

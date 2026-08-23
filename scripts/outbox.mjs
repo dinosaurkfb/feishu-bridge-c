@@ -12,6 +12,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { normalizeLocalInput } from "./turn-input.mjs";
+import { isDirectRun } from "./direct-run.mjs";
 
 /**
  * `reply` 是一轮对话的**原文答复**，由 Stop 钩子从 last_assistant_message 直接取，
@@ -245,7 +246,7 @@ export function composeDigest(records, { taskName }) {
 
 // ---------- CLI ----------
 
-if (import.meta.url === "file://" + process.argv[1]) {
+if (isDirectRun(import.meta.url)) {
   const SELF_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
   const arg = (n) => {
     const i = process.argv.indexOf("--" + n);

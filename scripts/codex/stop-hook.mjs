@@ -12,6 +12,7 @@ import { readClaim } from "../claim.mjs";
 import { extractReply } from "../stop-hook.mjs";
 import { clearTurnInput, readTurnInput } from "../turn-input.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
+import { isDirectRun } from "../direct-run.mjs";
 import {
   bridgeHome, findTaskForCodexThread, hookLogFile, mappingForTask,
   readThreadActivity, recordThreadActivity, taskPaths,
@@ -112,7 +113,7 @@ async function main() {
   if (systemMessage) process.stdout.write(JSON.stringify({ systemMessage, suppressOutput: true }) + "\n");
 }
 
-if (import.meta.url === "file://" + process.argv[1]) {
+if (isDirectRun(import.meta.url)) {
   main().catch((err) => {
     log("crashed: " + String(err?.message ?? err));
     process.exit(0);

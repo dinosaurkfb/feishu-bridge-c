@@ -19,6 +19,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isDirectRun } from "./direct-run.mjs";
 
 import {
   claudeTurnInputDir, clearTurnInput, readTurnInput,
@@ -250,7 +251,7 @@ async function main() {
 // 只有被直接执行时才真的跑。被 import（测试要 extractReply）时绝不能执行 ——
 // main() 是 async 且没人 await，测试同步跑完之后它才继续，然后一个 process.exit(0)
 // 会把失败的退出码抹成成功。测试报绿而实际红，是最坏的一种坏。
-if (import.meta.url === "file://" + process.argv[1]) {
+if (isDirectRun(import.meta.url)) {
   main().catch((err) => {
     log("hook crashed: " + String(err?.stack ?? err).slice(0, 500));
     process.exit(0); // 桥的故障绝不外溢到别人的会话

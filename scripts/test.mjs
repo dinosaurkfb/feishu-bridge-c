@@ -77,6 +77,7 @@ import {
 } from "./canonical-event.mjs";
 import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
 import { bindingToConnections } from "./group-binding-status.mjs";
+import { renderSubscriptions, subscriptionDetails } from "./feishu-subscribe.mjs";
 import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
 import {
   ENDPOINT_SELF_CHECK, composeLayeredStatus, endpointFacts, lastSuccessfulDispatchAt,
@@ -4972,6 +4973,7 @@ test("五条控制技能都装成跟 Codex 同名的斜杠命令", () => {
     ["claude-feishu-unbind", "feishu-unbind"],
     ["claude-feishu-rotate", "feishu-rotate"],
     ["claude-feishu-mode", "feishu-mode"],
+    ["claude-feishu-subscribe", "feishu-subscribe"],
   ]) {
     assert.ok(src.includes(repo), "安装器要认得仓库里的 " + repo);
     assert.ok(src.includes('"' + installed + '"'), "要装成 /" + installed);
@@ -7831,6 +7833,66 @@ test("走真实 CLI 时 --force 必须真的传到 drainProject", () => {
   const src = fs.readFileSync(path.resolve("scripts", "drain-outbox.mjs"), "utf-8");
   assert.match(src, /drainProject\(\{ root, claudeSessionId, dryRun, force \}\)/u,
     "单项目和 --all 共用同一个调用点，force 必须在那里");
+});
+
+test("订阅详情脱敏：只出计数与人读的名字", () => {
+  const model = {
+    ok: true, endpoint_id: "ep_SECRET1",
+    subscriptions: [{
+      subscription_id: "sub_SECRET2", domain_id: "dom_SECRET3", status: "active", version: 1,
+      scope: { agent_uid: "agent_S4", transport_open_id: "ou_S5", chat_id: "oc_S6",
+        sender_ids: ["ou_S7", "ou_S8"], event_types: ["im.message.receive"] },
+      constraints: { freshness_ms: 900000 },
+    }],
+    pending_bindings: [{ legacy_key: "lk_S9", pending_token: "pt_S10" }],
+  };
+  const view = subscriptionDetails(model, { groupName: "Frank智能体们" });
+  assert.equal(view.items[0].senderCount, 2, "只出数量，不出身份");
+  assert.equal(view.items[0].freshnessMs, 900000);
+
+  const text = renderSubscriptions(view);
+  for (const secret of ["ep_SECRET1", "sub_SECRET2", "dom_SECRET3", "agent_S4",
+    "ou_S5", "oc_S6", "ou_S7", "ou_S8", "lk_S9", "pt_S10"]) {
+    assert.equal(text.includes(secret), false, "不得出现 " + secret);
+  }
+  assert.match(text, /Frank智能体们/u);
+  assert.match(text, /15 分钟内的事件才受理/u, "新鲜度要换算成人读得懂的");
+  assert.match(text, /待认领绑定 1 条/u);
+});
+
+test("订阅：投影覆盖不到不等于没有订阅", () => {
+  const empty = subscriptionDetails({ ok: true, subscriptions: [], pending_bindings: [] });
+  // status 第 2 层已经栽过一次：把"看不见"说成"不存在"。这里不能再栽。
+  assert.match(renderSubscriptions(empty, { source: "project-files" }),
+    /不可用（本项目绑定走项目内文件，订阅投影未覆盖）/u);
+  // 走 registry 且确实没有时，才可以说"没有"。
+  assert.match(renderSubscriptions(empty, { source: "registry" }), /本项目没有事件订阅/u);
+  // 读不到是第三种。
+  assert.match(renderSubscriptions(subscriptionDetails({ ok: false, reason: "registry_unreadable" })),
+    /读不到订阅（registry_unreadable）/u);
+});
+
+test("订阅命令：只读、严格参数、把写为什么没开说清楚", () => {
+  const run = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "feishu-subscribe.mjs"), ...args,
+  ], { encoding: "utf-8" });
+
+  for (const [args, reason] of [
+    [["--projct", "/tmp"], "unknown_option"],
+    [["--project"], "option_needs_value"],
+    [["裸参数"], "unexpected_argument"],
+  ]) {
+    const bad = run(args);
+    assert.notEqual(bad.status, 0, reason);
+    assert.match(bad.stderr, new RegExp(reason, "u"));
+  }
+
+  const ok = run(["--project", process.cwd()]);
+  assert.equal(ok.status, 0, ok.stderr);
+  // 说清写为什么没开 —— "暂不支持"是排期，"缺这两条前置"才是事实。
+  assert.match(ok.stdout, /FR-2\.5/u);
+  assert.match(ok.stdout, /FR-2\.6/u);
+  assert.match(ok.stdout, /订阅说 A、授权快照仍说 B/u);
 });
 
 summarySealed = true;

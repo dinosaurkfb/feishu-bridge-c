@@ -293,7 +293,7 @@ Relay 必须显式使用新的 policy version；其预算分别统计 human cycl
 |---|---|---|
 | Aily → 本机 endpoint | Claude/Codex 均可用，共享 dispatcher 与 Canonical Event v1 已进入 `main` | 扩大真实样本并统一 endpoint 状态展示 |
 | hook 强制进入运输层 | Claude/Codex hooks 均已正式安装；dispatcher 契约已由 PR #6 合并 | 用新的真实 mention 验收秒级受理、精确续接与原话题回写 |
-| 项目—群订阅 | Subscription v1、首次认领消费者和 claim 纵切已由 PR #5 合并；尚未开放多订阅写入口 | 开放受控多订阅管理，不改变现有单订阅默认行为 |
+| 项目—群订阅 | Subscription v1、首次认领消费者和 claim 纵切已由 PR #5 合并；**2026-08-24 起有只读的 `$feishu-subscribe`**（订阅状态、群名、授权发送者数量、事件范围、新鲜度、待认领数，全部脱敏）。**写入口仍未开放，缺的是两条前置而非代码**：FR-2.5 的「改订阅 → 同步授权快照 → 明确暂停/迁移相关 binding」链路不存在，缺了它写入会造出「订阅说 A、授权快照仍说 B」的状态；FR-2.6 的多订阅歧义拒绝未经真实样本验证 | 开放受控多订阅管理，不改变现有单订阅默认行为 |
 | 精确话题—会话绑定 | 稳定 binding 与 Topic Generation 兼容投影已进入 `main`，Claude/Codex 保留各自 runtime locator | 继续统一生命周期与对外状态语义 |
 | 映射模式 | Mapping Policy Handler 已由 PR #7 合并并安装；旧 selector 仍唯一承重，新候选只做 shadow comparison | 真实样本一致后再灰度切换权威读取路径 |
 | 话题轮转 | Topic Generation 生命周期与显式 rotate 命令已由 PR #8 合并并安装；Codex 第 2 代话题的创建、真实 mention 认领与 binding 切换已完成首次真实验收；自动轮转 v1 已合并 `main`，默认阈值 30。**Codex 曾在临时阈值 5 下完成一次自动轮转的 happy-path 真实验证**（阈值随后恢复 30；该临时构建未推送远端，只创建代际时把 5 写进了当代运行时状态，新代际按代码默认取 30）—— **2026-08-23 Codex 侧在默认阈值 30 下完成一次真实自动轮转验收**：第 5 代计数冲到 44/30（超阈值 14 条）而**轮转尝试只有 1 次**，只产生第 6 代一个新代际，旧代际转 read-only；六个代际逐条核对，每代的 `auto_rotation_attempts` 都是 1，累计 5 次轮转没有一次重复建话题 —— **这条正是可控演练证明不了的那条**（演练的假子进程没建过话题）。仍待验收：**Claude 侧的真实轮转**，以及**真实的失败重试**（这五次全部一次成功，没有失败样本）。另有：**失败重试与「冷却期内不重复启动轮转 worker」已由 `scripts/rotation-drill.mjs` 做出可控演练证据**（演练的假子进程没建过话题，因此**证明不了「不会重复创建飞书根话题」**，那条仍待真实验收）（注入 spawn 与时钟，零外部副作用；已变异验证：去掉冷却窗口或让 PREPARING 永不超时都会让演练亮红）—— 但那是演练不是真实验收，**真实轮转与双 runtime 覆盖仍待 Frank 在飞书确认** | 补齐失败重试、不重复轮转与双 runtime 的真实验收，再评估多订阅 |

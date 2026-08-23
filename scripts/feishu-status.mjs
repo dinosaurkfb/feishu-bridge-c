@@ -6,16 +6,18 @@
  * 完全同一条选择规则 —— 状态命令要是按另一套规则找，就会出现「status 说绑的是 A、
  * 实际发到 B」这种最难查的不一致。
  *
- * 除了当前上下文，还会列出本机其他消费者的连接 —— 「我有哪些东西连到了哪些
- * 飞书群和话题」是**一个**问题，不该按实现拆成几条命令各答一半。
- * 那部分的取数和校验在 status-providers.mjs，坏了只影响显示，不影响入站。
+ * 按四层关系模型分区展示（§6），并**只看当前项目**：本项目的其他链路也一并列出，
+ * 因为「我有哪些东西连到了哪些飞书群和话题」是一个问题，不该按实现拆成几条命令
+ * 各答一半。整台机器的跨项目诊断归后续的 doctor 命令。
+ *
+ * 状态提供者的取数和校验在 status-providers.mjs，坏了只影响显示，不影响入站。
  *
  * 用法：node scripts/feishu-status.mjs [--project ~/x]
  */
 
 import path from "node:path";
 
-import { bindingsForRoot, currentBinding, describeStatus } from "./feishu-control.mjs";
+import { bindingsForRoot, currentBinding } from "./feishu-control.mjs";
 import { buildClaudeSubscriptionProjection } from "./inbound-route.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
 import { composeLayeredStatus, endpointFacts, renderLayeredStatus, subscriptionFacts } from "./layered-status.mjs";
@@ -37,7 +39,6 @@ const tpl = loaded?.ok ? (loaded.template ?? loaded) : null;
 // 只看当前项目的链路。整台机器的全景归后续的 doctor 命令。
 const projectLinks = collectProjectConnectivity({ root });
 const layeredConnectivity = renderConnectivity(projectLinks, { heading: null });
-const connectivity = renderConnectivity(projectLinks);
 
 console.log(renderLayeredStatus(composeLayeredStatus({
   st,

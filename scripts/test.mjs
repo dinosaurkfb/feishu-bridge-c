@@ -7450,6 +7450,25 @@ test("能读到 current 链接不等于装好了", () => {
   assert.doesNotMatch(text, /安装状态.*已安装/u);
 });
 
+test("没通过校验的版本号不许冒充运行时版本", () => {
+  const broken = endpointFacts({ verify: () => ({ ok: false, reason: "version_dir_missing" }) });
+  // 只读符号链接 basename 的话，坏掉的 runtime 会同时显示"看起来像真的版本号"
+  // 和"运行时不可用" —— 那个数字没有任何东西背书。
+  assert.equal(broken.version, null);
+
+  const ok = endpointFacts({ verify: () => ({ ok: true, version: "0123456789abcdef" }) });
+  assert.equal(ok.version, "0123456789ab", "通过校验才叫版本");
+
+  const endpoint = { runtime: "Claude Code", agentName: null, install: "broken",
+    installReason: "version_dir_missing", version: null, linkCandidate: "deadbeef1234",
+    selfCheck: ENDPOINT_SELF_CHECK, lastInboundAt: null };
+  const text = renderLayeredStatus(composeLayeredStatus({
+    st: { ok: false, reason: "not_bound" }, endpoint,
+    subscription: { ok: true, items: [], pendingCount: 0 },
+  }));
+  assert.match(text, /未通过校验（链接候选 deadbeef1234）/u);
+});
+
 test("出站发布按真实配置渲染，读不到不许默认成开启", () => {
   const endpoint = { runtime: "Claude Code", agentName: null, install: "ok", installReason: null,
     version: "abc123", selfCheck: ENDPOINT_SELF_CHECK, lastInboundAt: null };

@@ -48,17 +48,22 @@ export function endpointFacts({
   inboundLog = inboundLogDefault(),
   verify = () => verifyRuntime(),
 } = {}) {
-  let version = null;
-  try {
-    const target = fs.readlinkSync(path.join(runtimeDir, "current"));
-    version = path.basename(target).slice(0, 12);
-  } catch { /* 没装或读不到 */ }
-
   // **能读到符号链接不等于装好了。**上一版只看链接在不在，于是一个指向不存在目录的
   // current 也会显示"已安装"。三种状态要分开：没装 / 装好了 / 装的东西有问题。
   const verified = verify();
   const install = verified.ok ? "ok"
     : verified.reason === "current_absent" ? "absent" : "broken";
+
+  // **版本号也要过校验。**只读符号链接 basename 的话，一个坏掉的 runtime 会同时
+  // 显示"看起来像真的版本号"和"运行时不可用" —— 那个数字没有任何东西背书。
+  let version = null;
+  if (verified.ok) {
+    version = typeof verified.version === "string" ? verified.version.slice(0, 12) : null;
+  }
+  let linkCandidate = null;
+  try {
+    linkCandidate = path.basename(fs.readlinkSync(path.join(runtimeDir, "current"))).slice(0, 12);
+  } catch { /* 没装或读不到 */ }
 
   return {
     runtime,
@@ -66,6 +71,7 @@ export function endpointFacts({
     install,
     installReason: verified.ok ? null : verified.reason,
     version,
+    linkCandidate,
     selfCheck: ENDPOINT_SELF_CHECK,
     lastInboundAt: lastSuccessfulDispatchAt(inboundLog),
   };
@@ -136,7 +142,8 @@ export function composeLayeredStatus({
     // 运输 agent 的名字是模板里就有的，报名字比报 UID 有用且不算 locator。
     ["运输 agent", endpoint.agentName ?? "名称不可用"],
     // 上一版把版本号跟运行时拼在一行，被读成了 agent id。它是脚本内容哈希。
-    ["运行时版本", endpoint.version ?? "未安装"],
+    ["运行时版本", endpoint.version
+      ?? (endpoint.linkCandidate ? "未通过校验（链接候选 " + endpoint.linkCandidate + "）" : "未安装")],
     ["安装状态", endpoint.install === "ok" ? "已安装"
       : endpoint.install === "absent" ? "未安装"
       // 损坏、漂移、链接异常都不是"正常"，也不是"没装"。

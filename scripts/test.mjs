@@ -6114,6 +6114,11 @@ test("import 两侧 inbound.mjs 不得产生任何输出或状态写入", () => 
         "process.stderr.write('IMPORT_THREW '+e.message)})"],
       { cwd, encoding: "utf-8",
         env: { ...process.env, HOME: home, CODEX_HOME: path.join(home, ".codex") } });
+    // **退出码必须查。**上一版只看 stdout / stderr / 文件，Codex 的变异探针让被 import
+    // 的模块直接 process.exit(1)，测试照样报 405/405 —— 又是一条"改坏了也照样绿"的断言。
+    assert.equal(run.status, 0, rel + " 被 import 时不得以非零码退出");
+    assert.equal(run.signal, null, rel + " 被 import 时不得被信号杀死");
+    assert.equal(run.error, undefined, rel + " 子进程本身不得启动失败");
     assert.equal(run.stdout, "", rel + " 被 import 时不得有 stdout —— 那是给飞书的回执");
     assert.doesNotMatch(String(run.stderr), /IMPORT_THREW/u, rel + " 被 import 时不得抛");
     const created = [];
@@ -6143,6 +6148,22 @@ test("测试文件里没有写在汇总之后的 test()", () => {
   }
   assert.deepEqual(late, [],
     "第 " + late.join("、") + " 行的 test() 写在汇总之后，结果不会计入统计");
+});
+
+test("入站崩溃回执只出脱敏引用码，不把堆栈写进模型可见通道", () => {
+  // Aily 会把进程输出带回模型可见通道，所以 stdout/stderr 写什么等于对外发布什么。
+  // 上一版直接写 err.stack —— 本机绝对路径和内部调用栈一起送出去。
+  // 诊断细节不能丢，只是不能走这条通道：完整堆栈进机器级日志，对外只给引用码。
+  for (const rel of ["inbound.mjs", path.join("codex", "inbound.mjs")]) {
+    const src = fs.readFileSync(path.resolve("scripts", rel), "utf-8");
+    const tail = src.slice(src.indexOf("if (isDirectRun(import.meta.url))"));
+    assert.doesNotMatch(tail, /process\.stderr\.write\([^)]*err/u,
+      rel + "：不得把异常对象写进 stderr");
+    assert.doesNotMatch(tail, /stdout\.write\([^)]*err\?\.stack/u,
+      rel + "：不得把堆栈写进 stdout");
+    assert.match(tail, /inbound-crash\.log/u, rel + "：堆栈要留给本机日志，不能丢");
+    assert.match(tail, /const ref = /u, rel + "：对外要给一个可对照的引用码");
+  }
 });
 
 summarySealed = true;

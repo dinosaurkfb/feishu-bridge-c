@@ -507,8 +507,18 @@ finish("accepted", {
 if (isDirectRun(import.meta.url)) {
   // 用 catch 收口而不是顶层 await —— 后者会让 import 也等它跑完。
   main().catch((err) => {
-    process.stdout.write("系统错误 · 入站处理异常终止\n本条指令没有被投递。请勿视为已受理。\n");
-    process.stderr.write(String(err?.stack ?? err).slice(0, 2000) + "\n");
+    // stderr 一个字都不写：Aily 会把进程输出带回模型可见通道。
+    // 完整堆栈只进机器级日志，对外只给一个可对照的引用码。
+    const ref = "inbound_" + Date.now().toString(36);
+    try {
+      const logFile = path.join(bridgeHome(), "inbound-crash.log");
+      fs.mkdirSync(path.dirname(logFile), { recursive: true, mode: 0o700 });
+      fs.appendFileSync(logFile,
+        new Date().toISOString() + " " + ref + "\n" +
+        String(err?.stack ?? err) + "\n\n", { mode: 0o600 });
+    } catch { /* 日志写不了也不能改变对外输出 */ }
+    process.stdout.write("系统错误 · 入站处理异常终止（" + ref + "）\n" +
+      "本条指令没有被投递。请勿视为已受理。\n");
     process.exit(1);
   });
 }

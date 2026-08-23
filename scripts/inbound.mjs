@@ -706,8 +706,26 @@ finish("accepted", {
 if (isDirectRun(import.meta.url)) {
   // 用 catch 收口而不是顶层 await —— 后者会让 import 也等它跑完。
   main().catch((err) => {
-    process.stdout.write("系统错误 · 入站处理异常终止\n本条指令没有被投递。请勿视为已受理。\n");
-    process.stderr.write(String(err?.stack ?? err).slice(0, 2000) + "\n");
+    /**
+     * **stderr 只出脱敏信息。**
+     *
+     * Aily 会把进程输出带回模型可见通道，所以这里写什么等于对外发布什么。
+     * 上一版直接写 err.stack —— 那会把本机绝对路径和内部调用栈一起送出去，
+     * 而这个仓库为脱敏边界已经付过多次代价（Codex 用受控 ENOTDIR 探针实测复现）。
+     *
+     * 诊断细节不能丢，只是不能走这条通道：完整堆栈写进机器级日志文件，
+     * 那个文件只有本机能读。
+     */
+    const ref = "inbound_" + Date.now().toString(36);
+    try {
+      const logFile = path.join(os.homedir(), ".claude", "feishu-bridge", "inbound-crash.log");
+      fs.mkdirSync(path.dirname(logFile), { recursive: true, mode: 0o700 });
+      fs.appendFileSync(logFile,
+        new Date().toISOString() + " " + ref + "\n" +
+        String(err?.stack ?? err) + "\n\n", { mode: 0o600 });
+    } catch { /* 日志写不了也不能改变对外输出 */ }
+    process.stdout.write("系统错误 · 入站处理异常终止（" + ref + "）\n" +
+      "本条指令没有被投递。请勿视为已受理。\n");
     process.exit(1);
   });
 }

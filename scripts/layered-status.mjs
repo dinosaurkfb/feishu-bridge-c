@@ -233,14 +233,19 @@ export function composeLayeredStatus({
   }
   // **不许无条件声称"每轮自动发布"**，也不许说得比实际行为满。
   //
-  // auto_publish_on_completion 只管住 inbound.mjs 和 watch-and-publish.mjs 两条
-  // 自动路径；兜底排空 drain-outbox.mjs 根本不读它。所以关掉它**不等于**消息
-  // 留在本地 —— 说成"仅入队"是在承诺一件这个开关做不到的事。
-  // 这个落差是真实缺口，已记入需求文档；改发布行为是另一件事，不在状态展示里顺手做。
+  // auto_publish_on_completion 只被 inbound.mjs 和 watch-and-publish.mjs 读取。
+  // **每轮 Stop 和 30 分钟兜底都不读它** —— 而那两条恰好是主路径。所以在 Claude 侧
+  // 把它设成 false 几乎什么都不改变：进展照发。
+  //
+  // 上一版写"每轮完成时不自动发布（兜底排空仍会发出）"仍然不准，因为 Stop 每轮
+  // 都会排空。这是同一个错的第二版：措辞比行为说得满。
+  //
+  // 这个落差是产品缺口，已记入需求文档等 Frank 决定；状态展示只负责说准，不顺手改行为。
   L4.push(["出站发布", st.suspended ? "暂停中，进展留在本地不发出"
     : st.autoPublish === true ? "每轮自动发布"
-    : st.autoPublish === false ? "每轮完成时不自动发布（兜底排空仍会发出）"
-    : "状态不可用（读不到发布配置）"]);
+    : st.autoPublish === false
+      ? "配置已关，但进展仍会发出（Stop 与兜底排空不读这个开关）"
+      : "状态不可用（读不到发布配置）"]);
 
   const L5 = [["待发布答复", st.pending + " 条" + (st.pending && st.suspended ? "（恢复后会发出）" : "")]];
 

@@ -7480,7 +7480,7 @@ test("出站发布按真实配置渲染，读不到不许默认成开启", () =>
   assert.match(render(true), /出站发布.*每轮自动发布/u);
   // 配置明确关掉时仍显示"每轮自动发布"，是在报一个没查过的结论。
   // 但也不能说成"仅入队" —— 这个开关管不住兜底排空，那是承诺它做不到的事。
-  assert.match(render(false), /出站发布.*每轮完成时不自动发布（兜底排空仍会发出）/u);
+  assert.match(render(false), /出站发布.*配置已关，但进展仍会发出（Stop 与兜底排空不读这个开关）/u);
   // 读不到配置更不能默认成开启。
   assert.match(render(null), /出站发布.*状态不可用（读不到发布配置）/u);
   assert.match(render(undefined), /出站发布.*状态不可用（读不到发布配置）/u);
@@ -7517,9 +7517,12 @@ test("发布开关只管住两条自动路径，兜底排空不受它约束", ()
     assert.match(src, /auto_publish_on_completion !== false/u,
       rel + " 应当读取发布开关");
   }
-  const drainSrc = fs.readFileSync(path.resolve("scripts", "drain-outbox.mjs"), "utf-8");
-  assert.doesNotMatch(drainSrc, /auto_publish_on_completion/u,
-    "兜底排空目前不读这个开关 —— 改了它就要同时改 status 的措辞");
+  // 不读它的那两条恰好是主路径：每轮 Stop、30 分钟兜底。
+  for (const rel of ["drain-outbox.mjs", "stop-hook.mjs"]) {
+    assert.doesNotMatch(fs.readFileSync(path.resolve("scripts", rel), "utf-8"),
+      /auto_publish_on_completion/u,
+      rel + " 目前不读这个开关 —— 改了它就要同时改 status 的措辞");
+  }
   assert.equal(session.length, 36);
 });
 

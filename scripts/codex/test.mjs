@@ -1502,6 +1502,20 @@ test("bridge_recursion 只识别真实入口执行，不把源码引用和排障
     "env bash -c 'FEISHU_CODEX_BRIDGE_HOME=/tmp node /bridge/scripts/codex/aily-inbound.mjs --dry-run'"),
     true);
 
+  // 真实调用形态：router 技能里那条命令的路径本来就带双引号，而 Codex 执行的命令一律是
+  // `/bin/zsh -lc "..."` —— 两者叠加，内层就成了 \"…\"。不还原转义的话，
+  // **真正的递归**会从检测里漏掉，风险方向从过度检测翻成漏检测。
+  assert.equal(isCodexInboundExecution(
+    "/bin/zsh -lc \"FEISHU_CODEX_BRIDGE_HOME='/Users/dk/.codex/feishu-bridge' " +
+    "node \\\"/bridge/scripts/codex/aily-inbound.mjs\\\"\""), true,
+    "zsh -lc 包裹且内层路径用转义双引号，是 router 技能被调用时的真实形态");
+  assert.equal(isCodexInboundExecution(
+    "/bin/zsh -lc \"bash -lc \\\"node /bridge/scripts/codex/inbound.mjs\\\"\""), true,
+    "嵌套包裹也要逐层剥开");
+  assert.equal(isCodexInboundExecution(
+    "/bin/zsh -lc \"rg -n \\\"bridge_recursion\\\" . && node \\\"/b/scripts/codex/inbound.mjs\\\"\""),
+    true, "同一条里既有只读命令又有真实执行时，仍按执行判定");
+
   const benignCommands = [
     "sed -n '1,220p' scripts/codex/inbound.mjs",
     "rg -n 'bridge_recursion|m5codex-inbound-router|scripts/codex/inbound.mjs' scripts",
@@ -1510,6 +1524,10 @@ test("bridge_recursion 只识别真实入口执行，不把源码引用和排障
     "node --input-type=module <<'NODE'\nconst marker = 'scripts/codex/inbound.mjs';\nNODE",
     "node --input-type=module <<'NODE'\nconst fixture = `\nnode /bridge/scripts/codex/inbound.mjs\n`;\nNODE",
     "node -e \"console.log('scripts/codex/inbound.mjs')\"",
+    // 还原转义后仍不能把只读命令算成执行 —— 补洞不能把误报补回来。
+    "/bin/zsh -lc \"rg -n \\\"scripts/codex/inbound.mjs\\\" scripts\"",
+    "/bin/zsh -lc \"sed -n '1,50p' \\\"/bridge/scripts/codex/inbound.mjs\\\"\"",
+    "/bin/zsh -lc \"echo \\\"node /bridge/scripts/codex/inbound.mjs\\\" > /tmp/note.txt\"",
   ];
   for (const command of benignCommands) assert.equal(isCodexInboundExecution(command), false, command);
 

@@ -47,6 +47,7 @@ import {
   dialogueAuthorizationShadowEnabled, recordDialogueBoundAuthorizationShadow,
 } from "./dialogue-authorization-shadow-store.mjs";
 import { isDirectRun } from "./direct-run.mjs";
+import { composeCrashReceipt } from "./crash-receipt.mjs";
 /**
  * 整个入站流程包在 main() 里，只有被直接执行时才跑。
  *
@@ -716,16 +717,11 @@ if (isDirectRun(import.meta.url)) {
      * 诊断细节不能丢，只是不能走这条通道：完整堆栈写进机器级日志文件，
      * 那个文件只有本机能读。
      */
-    const ref = "inbound_" + Date.now().toString(36);
-    try {
-      const logFile = path.join(os.homedir(), ".claude", "feishu-bridge", "inbound-crash.log");
-      fs.mkdirSync(path.dirname(logFile), { recursive: true, mode: 0o700 });
-      fs.appendFileSync(logFile,
-        new Date().toISOString() + " " + ref + "\n" +
-        String(err?.stack ?? err) + "\n\n", { mode: 0o600 });
-    } catch { /* 日志写不了也不能改变对外输出 */ }
-    process.stdout.write("系统错误 · 入站处理异常终止（" + ref + "）\n" +
-      "本条指令没有被投递。请勿视为已受理。\n");
+    const receipt = composeCrashReceipt({
+      error: err,
+      logFile: path.join(os.homedir(), ".claude", "feishu-bridge", "inbound-crash.log"),
+    });
+    process.stdout.write(receipt.text);
     process.exit(1);
   });
 }

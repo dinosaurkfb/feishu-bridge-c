@@ -32,6 +32,7 @@ import {
   composeOutboundCard, outboundCardBatches, validateOutboundCard,
 } from "./outbound-card.mjs";
 import { drainProject, watcherActive } from "./drain-outbox.mjs";
+import { composeCrashReceipt } from "./crash-receipt.mjs";
 import {
   applyRuntimeSync, planRuntimeSync, runtimeRoot, runtimeScript, verifyRuntime,
   versionFromFiles,
@@ -6162,7 +6163,51 @@ test("入站崩溃回执只出脱敏引用码，不把堆栈写进模型可见�
     assert.doesNotMatch(tail, /stdout\.write\([^)]*err\?\.stack/u,
       rel + "：不得把堆栈写进 stdout");
     assert.match(tail, /inbound-crash\.log/u, rel + "：堆栈要留给本机日志，不能丢");
-    assert.match(tail, /const ref = /u, rel + "：对外要给一个可对照的引用码");
+    assert.match(tail, /composeCrashReceipt\(/u,
+      rel + "：回执由共用实现生成 —— 各写各的必然分叉");
+  }
+});
+
+test("崩溃回执：日志没写成就不给引用码", () => {
+  // Codex 用非法 FEISHU_CODEX_BRIDGE_HOME 实测过：上一版无论日志写没写成都输出引用码，
+  // 而本机没有任何日志含那个码 —— 等于让程序出具一份假的可查凭证。
+  // 拿着查不到的码去翻日志，比直接说"没留下诊断信息"更浪费时间。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "crash-receipt-"));
+
+  const ok = composeCrashReceipt({ error: new Error("boom"), logFile: path.join(dir, "a", "c.log") });
+  assert.equal(ok.logged, true);
+  assert.ok(ok.ref, "写成功时要给引用码");
+  assert.ok(ok.text.includes(ok.ref), "文案里的码要和日志里的是同一个 —— 否则对不上账");
+  const written = fs.readFileSync(path.join(dir, "a", "c.log"), "utf-8");
+  assert.ok(written.includes(ok.ref), "日志里必须含同一个引用码");
+  assert.match(written, /boom/u, "堆栈要真的留下来，不能只给个码");
+  assert.equal(fs.statSync(path.join(dir, "a", "c.log")).mode & 0o777, 0o600,
+    "崩溃日志含堆栈，权限必须是 0600");
+
+  // 目标是目录 → appendFileSync 必失败。
+  fs.mkdirSync(path.join(dir, "blocked"));
+  const bad = composeCrashReceipt({ error: new Error("boom"), logFile: path.join(dir, "blocked") });
+  assert.equal(bad.logged, false);
+  assert.equal(bad.ref, null, "没落盘就不能给码");
+  assert.doesNotMatch(bad.text, /inbound_/u, "文案里也不能出现看起来像码的东西");
+  assert.match(bad.text, /未能落盘/u, "要如实说没留下诊断信息");
+
+  // logFile 本身为 null（例如 bridgeHome() 抛了）也要走同一条路，不能崩。
+  const noPath = composeCrashReceipt({ error: new Error("boom"), logFile: null });
+  assert.equal(noPath.logged, false);
+  assert.equal(noPath.ref, null);
+
+  // 引用码带 PID 与随机量：只用毫秒时间戳的话，同毫秒并发会撞出两条同名记录。
+  const a = composeCrashReceipt({ error: new Error("x"), logFile: path.join(dir, "b.log"), now: 1 });
+  const b = composeCrashReceipt({ error: new Error("x"), logFile: path.join(dir, "b.log"), now: 1 });
+  assert.notEqual(a.ref, b.ref, "同一毫秒的两次崩溃必须给出不同引用码");
+
+  // 两侧 inbound 都必须走这个共用实现 —— 这个仓库反复出现"只修一侧"。
+  for (const rel of ["inbound.mjs", path.join("codex", "inbound.mjs")]) {
+    const src = fs.readFileSync(path.resolve("scripts", rel), "utf-8");
+    assert.match(src, /composeCrashReceipt\(/u, rel + " 必须走共用崩溃回执");
+    const tail = src.slice(src.indexOf("if (isDirectRun(import.meta.url))"));
+    assert.doesNotMatch(tail, /stderr\.write/u, rel + "：崩溃时不得写 stderr");
   }
 });
 

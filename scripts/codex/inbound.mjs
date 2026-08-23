@@ -35,6 +35,7 @@ import {
   shadowCodexFirstClaim, taskPaths,
 } from "./state.mjs";
 import { isDirectRun } from "../direct-run.mjs";
+import { composeCrashReceipt } from "../crash-receipt.mjs";
 /**
  * 整个入站流程包在 main() 里，只有被直接执行时才跑。
  *
@@ -509,16 +510,11 @@ if (isDirectRun(import.meta.url)) {
   main().catch((err) => {
     // stderr 一个字都不写：Aily 会把进程输出带回模型可见通道。
     // 完整堆栈只进机器级日志，对外只给一个可对照的引用码。
-    const ref = "inbound_" + Date.now().toString(36);
-    try {
-      const logFile = path.join(bridgeHome(), "inbound-crash.log");
-      fs.mkdirSync(path.dirname(logFile), { recursive: true, mode: 0o700 });
-      fs.appendFileSync(logFile,
-        new Date().toISOString() + " " + ref + "\n" +
-        String(err?.stack ?? err) + "\n\n", { mode: 0o600 });
-    } catch { /* 日志写不了也不能改变对外输出 */ }
-    process.stdout.write("系统错误 · 入站处理异常终止（" + ref + "）\n" +
-      "本条指令没有被投递。请勿视为已受理。\n");
+    // bridgeHome() 自己也可能因环境变量非法而抛，所以先兜住再算日志路径。
+    let logFile = null;
+    try { logFile = path.join(bridgeHome(), "inbound-crash.log"); } catch { /* 下面按未落盘处理 */ }
+    const receipt = composeCrashReceipt({ error: err, logFile });
+    process.stdout.write(receipt.text);
     process.exit(1);
   });
 }

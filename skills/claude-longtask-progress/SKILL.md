@@ -15,7 +15,7 @@ description: 说明已接飞书桥的项目如何把本地输入与回答确定�
 但在登记表里查不到这个目录，就静默退出。想知道接没接：
 
 ```bash
-node /Users/dk/claude-projects/feishu-bridge-cc/scripts/bind-preview.mjs
+node {{BRIDGE_ROOT}}/scripts/bind-preview.mjs
 ```
 
 这条**已经在权限白名单里**，不会弹确认 —— 它只打印，代码层面就发不了任何东西
@@ -61,7 +61,7 @@ node /Users/dk/claude-projects/feishu-bridge-cc/scripts/bind-preview.mjs
 （比如后台任务的输出里有个异常），而这轮回答不会提到它。这种时候：
 
 ```bash
-node /Users/dk/claude-projects/feishu-bridge-cc/scripts/outbox.mjs \
+node {{BRIDGE_ROOT}}/scripts/outbox.mjs \
   --kind risk --text "<一句话>" --source longtask
 ```
 

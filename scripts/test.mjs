@@ -9,6 +9,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -30,6 +31,10 @@ import {
   composeOutboundCard, outboundCardBatches, validateOutboundCard,
 } from "./outbound-card.mjs";
 import { drainProject, watcherActive } from "./drain-outbox.mjs";
+import {
+  applyRuntimeSync, planRuntimeSync, runtimeRoot, runtimeScript, verifyRuntime,
+  versionFromFiles,
+} from "./runtime-install.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
 import {
   findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession,
@@ -5280,6 +5285,269 @@ test("每条退出路径都留下可分辨的原因", () => {
 });
 
 // ---------- 汇总 ----------
+
+// ---------- 运行时安装：让全局配置不再指向任何开发克隆 ----------
+
+test("运行时同步：版本由内容决定，落盘后校验通过", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "rt-home-"));
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), "rt-src-"));
+  fs.mkdirSync(path.join(src, "scripts", "codex"), { recursive: true });
+  fs.writeFileSync(path.join(src, "scripts", "a.mjs"), "export const a = 1;\n");
+  fs.writeFileSync(path.join(src, "scripts", "codex", "b.mjs"), "export const b = 2;\n");
+  fs.writeFileSync(path.join(src, "scripts", "notes.txt"), "不该被复制");
+
+  const plan = planRuntimeSync({ sourceRoot: src, home });
+  assert.equal(plan.ok, true);
+  assert.deepEqual(plan.files.map((f) => f.path).sort(),
+    ["scripts/a.mjs", "scripts/codex/b.mjs"], "只复制 .mjs，其余文件不进运行时");
+  assert.equal(plan.alreadyCurrent, false);
+
+  // 同样的源码必须算出同样的版本 —— 否则每次安装都会白白切一次。
+  assert.equal(planRuntimeSync({ sourceRoot: src, home }).version, plan.version);
+
+  const applied = applyRuntimeSync(plan, { home });
+  assert.equal(applied.ok, true);
+  const verified = verifyRuntime({ home });
+  assert.equal(verified.ok, true);
+  assert.equal(verified.linkOk, true);
+  assert.equal(verified.version, plan.version);
+
+  // current 是符号链接，切换才可能是原子的；写成实体目录就退回了半新半旧的窗口。
+  assert.equal(fs.lstatSync(path.join(runtimeRoot(home), "current")).isSymbolicLink(), true);
+  assert.equal(fs.readFileSync(runtimeScript("a.mjs", home), "utf-8"), "export const a = 1;\n");
+
+  // 源码变了 → 新版本；旧版本目录仍在，可以指回去。
+  fs.writeFileSync(path.join(src, "scripts", "a.mjs"), "export const a = 99;\n");
+  const next = planRuntimeSync({ sourceRoot: src, home });
+  assert.notEqual(next.version, plan.version);
+  assert.equal(next.previousVersion, plan.version);
+  assert.equal(applyRuntimeSync(next, { home }).ok, true);
+  assert.equal(fs.existsSync(path.join(runtimeRoot(home), "versions", plan.version)), true,
+    "旧版本目录要留着 —— 回滚只需把 current 指回去，不必重新复制");
+});
+
+test("运行时安装是事务：相同版本 no-op，同一 entry 里别人的钩子不受牵连", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "rt-txn-"));
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), "rt-txn-src-"));
+  fs.mkdirSync(path.join(src, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(src, "scripts", "a.mjs"), "export const a = 1;\n");
+
+  const plan = planRuntimeSync({ sourceRoot: src, home });
+  assert.equal(applyRuntimeSync(plan, { home }).ok, true);
+
+  // 同版本重装必须是真的 no-op —— 不能再去动线上正在被加载的那些文件。
+  const again = applyRuntimeSync(planRuntimeSync({ sourceRoot: src, home }), { home });
+  assert.equal(again.ok, true);
+  assert.equal(again.noop, true);
+
+  // 版本目录内部自带清单：一个版本完整与否，不依赖根目录那份指针就能回答。
+  const inside = path.join(runtimeRoot(home), "versions", plan.version, "INSTALLED.json");
+  assert.equal(fs.existsSync(inside), true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(inside, "utf-8")).files.map((f) => f.path),
+    ["scripts/a.mjs"]);
+
+  // 根指针即使落后，verifyRuntime 也以版本目录内部为准 —— 切链接与写指针之间失败过，
+  // 那时线上其实是可用的，不该被报成坏掉。
+  fs.writeFileSync(path.join(runtimeRoot(home), "INSTALLED.json"),
+    JSON.stringify({ schema_version: "1.0", version: "stale" }) + "\n");
+  const verified = verifyRuntime({ home });
+  assert.equal(verified.ok, true);
+  assert.equal(verified.version, plan.version);
+});
+
+test("入站技能安装幂等：连续两次 apply 之后自检一致、不再报 update", () => {
+  // 上一版只在写入那一步渲染 {{BRIDGE_ROOT}}，比较和自检仍拿未渲染源码去比 ——
+  // 装对了也会永远报 update，自检还会说"写入后内容不一致"。渲染类安装器最容易在这里
+  // 裂成两套真相，所以要求计划、写入、自检共用同一个 expectedContent。
+  const src = fs.readFileSync(path.resolve("scripts", "install-inbound.mjs"), "utf-8");
+  assert.match(src, /const expectedContent = /u);
+  assert.doesNotMatch(src,
+    /fs\.readFileSync\(path\.join\(SRC, f\), "utf-8"\) === fs\.readFileSync\(path\.join\(DST, f\)/u,
+    "自检不能拿未渲染的源码去比对已渲染的产物");
+
+  // 幂等性用纯函数侧证：expectedContent 是唯一出口，计划与自检都用它。
+  // 真实 --apply 现在要求 runtime 就绪（见下一条），不适合在单测里跑。
+  const rendered = src.match(/const expectedContent = [\s\S]{0,400}?;\n/u);
+  assert.ok(rendered, "expectedContent 必须是一个集中定义");
+  assert.match(rendered[0], /renderSkill/u);
+});
+
+test("runtime 未就绪时，入站 --apply 必须拒绝而不是装一个指不到脚本的技能", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "inbound-skill-"));
+  const run = (extra) => {
+    try {
+      return { code: 0, out: execFileSync(process.execPath,
+        [path.resolve("scripts", "install-inbound.mjs"), "--dir", dir, ...extra],
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }) };
+    } catch (err) {
+      return { code: err.status ?? 1, out: String(err.stdout ?? "") + String(err.stderr ?? "") };
+    }
+  };
+  // dry-run 只提示：此刻 runtime 没同步是正常的，不该因此看不到计划。
+  assert.equal(run([]).code, 0);
+
+  // --apply 必须 fail-closed。装一个指向不存在脚本的技能比不装坏得多 ——
+  // 它会照常被发现、照常被调用，然后在执行那一步失败，而回执只会说「系统错误」。
+  const applied = run(["--apply"]);
+  assert.notEqual(applied.code, 0, "runtime 未就绪时不得安装");
+  assert.match(applied.out, /runtime 未就绪/u);
+  assert.equal(fs.existsSync(path.join(dir, "m5claude-inbound-router", "SKILL.md")), false,
+    "拒绝之后不能留下半个技能");
+});
+
+test("钩子归属：guard 与实际执行不一致、或别的工具同名脚本，都不认领", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  // 新标记必须锚在固定尾部，不能是任意位置的 includes —— 否则一条只是提到该字符串的
+  // 命令（比如别人写的清理脚本）也会被认成自己的然后删掉。
+  assert.match(src, /command\.endsWith\(" # " \+ HOOK_TAG \+ basename\)/u);
+  // 历史遗留必须按完整模板认，并且用捕获组确认 guard 与执行的是同一个 node、同一个脚本。
+  assert.match(src, /guardNode !== runNode \|\| guardScript !== runScript/u);
+  assert.doesNotMatch(src, /LEGACY_HOOK_SHAPES/u, "只锚定开头的宽松形态已废弃");
+});
+
+test("入站钩子从自身定位分发器，不再经 bridge_root 落回开发克隆", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "inbound-hook.mjs"), "utf-8");
+  assert.doesNotMatch(src, /bridgeRoot \+ "\/scripts\/aily-inbound\.mjs"/u,
+    "从模板字段拼路径会指向另一个克隆、另一个提交");
+  assert.match(src, /import\.meta\.url[\s\S]{0,120}aily-inbound\.mjs/u,
+    "分发器必须取自己的同目录兄弟，保证与钩子同版本");
+
+  // 两个入站安装器都必须能跑通。改 skills/ 只跑出站安装器，正是上一版把入站装崩的原因。
+  for (const installer of ["install-outbound.mjs", "install-inbound.mjs"]) {
+    const text = fs.readFileSync(path.resolve("scripts", installer), "utf-8");
+    assert.match(text, /BRIDGE_ROOT/u, installer + " 必须会渲染 {{BRIDGE_ROOT}} 占位符");
+  }
+});
+
+test("运行时安装的三种故障：坏版本、提交后写指针失败、提交前一致性", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "rt-fault-"));
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), "rt-fault-src-"));
+  fs.mkdirSync(path.join(src, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(src, "scripts", "a.mjs"), "export const a = 1;\n");
+  const plan = planRuntimeSync({ sourceRoot: src, home });
+  assert.equal(applyRuntimeSync(plan, { home }).ok, true);
+
+  // ① 既有版本目录被损坏后重装：必须修复到可校验状态，不能 apply=true 而 verify=false。
+  const victim = path.join(runtimeRoot(home), "versions", plan.version, "scripts", "a.mjs");
+  fs.writeFileSync(victim, "export const a = 'corrupted';\n");
+  assert.equal(verifyRuntime({ home }).ok, false);
+  const repaired = applyRuntimeSync(planRuntimeSync({ sourceRoot: src, home }), { home });
+  assert.equal(repaired.ok, true);
+  assert.equal(verifyRuntime({ home }).ok, true, "apply 报成功就必须真的可校验");
+
+  // ② 清单必须自证。把某个条目从清单里删掉、同时删掉文件，此前 verify 照报 ok ——
+  //    因为它只校验"清单里列出的那些"。现在版本号由清单内容重算，改清单就对不上目录名。
+  const home2 = fs.mkdtempSync(path.join(os.tmpdir(), "rt-tamper-"));
+  const src2 = fs.mkdtempSync(path.join(os.tmpdir(), "rt-tamper-src-"));
+  fs.mkdirSync(path.join(src2, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(src2, "scripts", "a.mjs"), "export const a = 1;\n");
+  fs.writeFileSync(path.join(src2, "scripts", "b.mjs"), "export const b = 2;\n");
+  const p2 = planRuntimeSync({ sourceRoot: src2, home: home2 });
+  assert.equal(applyRuntimeSync(p2, { home: home2 }).ok, true);
+  assert.equal(verifyRuntime({ home: home2 }).ok, true);
+
+  const dir2 = path.join(runtimeRoot(home2), "versions", p2.version);
+  const manifestPath = path.join(dir2, "INSTALLED.json");
+  const tampered = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+  tampered.files = tampered.files.filter((f) => !f.path.endsWith("b.mjs"));
+  fs.writeFileSync(manifestPath, JSON.stringify(tampered, null, 2) + "\n");
+  fs.rmSync(path.join(dir2, "scripts", "b.mjs"));
+  const tamperedCheck = verifyRuntime({ home: home2 });
+  assert.equal(tamperedCheck.ok, false,
+    "删清单条目 + 删文件之后必须能发现 —— 否则线上缺文件而校验报绿");
+
+  // 版本号也不能靠改 manifest.version 圆回来：它还要等于目录名。
+  const forged = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+  forged.version = versionFromFiles(forged.files);
+  fs.writeFileSync(manifestPath, JSON.stringify(forged, null, 2) + "\n");
+  assert.equal(verifyRuntime({ home: home2 }).ok, false, "改版本号会对不上目录名");
+
+  // 形状不合法的清单一律不可信，而不是勉强算出一个版本号。
+  assert.equal(versionFromFiles([{ path: "../escape.mjs", sha256: "a".repeat(64) }]), null);
+  assert.equal(versionFromFiles([{ path: "scripts/a.mjs", sha256: "nothex" }]), null);
+  assert.equal(versionFromFiles([
+    { path: "scripts/b.mjs", sha256: "a".repeat(64) },
+    { path: "scripts/a.mjs", sha256: "b".repeat(64) },
+  ]), null, "顺序不规范也不可信");
+
+  // ③ 活动版本已损坏 + plan 之后源码又变了：apply 必须失败，而**原目录仍在、
+  //    current 不悬空**。先隔离坏目录再建 staging 的写法会在这里把 current 指空，
+  //    出站入站一起静默停摆。
+  const home3 = fs.mkdtempSync(path.join(os.tmpdir(), "rt-swap-"));
+  const src3 = fs.mkdtempSync(path.join(os.tmpdir(), "rt-swap-src-"));
+  fs.mkdirSync(path.join(src3, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(src3, "scripts", "a.mjs"), "export const a = 1;\n");
+  const p3 = planRuntimeSync({ sourceRoot: src3, home: home3 });
+  assert.equal(applyRuntimeSync(p3, { home: home3 }).ok, true);
+  const live = path.join(runtimeRoot(home3), "versions", p3.version);
+
+  fs.writeFileSync(path.join(live, "scripts", "a.mjs"), "export const a = 'corrupt';\n");
+  const replan = planRuntimeSync({ sourceRoot: src3, home: home3 });
+  fs.writeFileSync(path.join(src3, "scripts", "a.mjs"), "export const a = 'moved on';\n");
+  const failed = applyRuntimeSync(replan, { home: home3 });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.reason, "source_changed_during_apply");
+  assert.equal(fs.existsSync(live), true, "失败之后原版本目录必须还在");
+  assert.equal(fs.existsSync(path.join(runtimeRoot(home3), "current", "scripts", "a.mjs")), true,
+    "current 不得悬空 —— 悬空等于出站入站一起静默停摆");
+
+    // ③ 提交前三方一致：版本目录里的清单版本、目录名、计划版本必须逐字相同。
+  const installer = fs.readFileSync(path.resolve("scripts", "runtime-install.mjs"), "utf-8");
+  assert.match(installer, /ready\.manifest\?\.version !== plan\.version/u);
+  assert.match(installer, /path\.basename\(versionDir\) !== plan\.version/u);
+  assert.doesNotMatch(installer, /export function readRuntimeManifest/u,
+    "与新根指针 schema 不兼容的读取函数应移除，留着只会误导");
+  // 根指针已删：它没有消费者，却凭空多出一份可能与 current 不一致的真相。
+  assert.doesNotMatch(installer, /writeAtomic\(path\.join\(root, MANIFEST_NAME\)/u);
+});
+
+test("运行时校验能发现被手改的脚本和被指歪的链接", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "rt-drift-"));
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), "rt-drift-src-"));
+  fs.mkdirSync(path.join(src, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(src, "scripts", "a.mjs"), "export const a = 1;\n");
+  const plan = planRuntimeSync({ sourceRoot: src, home });
+  assert.equal(applyRuntimeSync(plan, { home }).ok, true);
+  assert.equal(verifyRuntime({ home }).ok, true);
+
+  // 这套东西的失败是安静的：改一行、出站照跑，只是不再对应任何一次有记录的安装。
+  fs.writeFileSync(path.join(runtimeRoot(home), "versions", plan.version, "scripts", "a.mjs"),
+    "export const a = 'tampered';\n");
+  const drifted = verifyRuntime({ home });
+  assert.equal(drifted.ok, false);
+  assert.deepEqual(drifted.drifted, ["scripts/a.mjs"]);
+
+  const link = path.join(runtimeRoot(home), "current");
+  fs.unlinkSync(link);
+  fs.symlinkSync(path.join("versions", "nope"), link);
+  assert.equal(verifyRuntime({ home }).linkOk, false);
+});
+
+test("安装器不再把开发克隆路径写进全局配置", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  for (const name of ["stop-hook.mjs", "init-hook.mjs", "bind-preview.mjs",
+    "inbound-hook.mjs", "drain-outbox.mjs"]) {
+    assert.doesNotMatch(src, new RegExp('path\\.join\\(ROOT,\\s*"scripts",\\s*"' + name + '"', "u"),
+      name + " 必须走 runtimeScript()，不能再拼开发克隆路径");
+  }
+  // 幂等键换成脚本名 + feishu-bridge：旧写法拿克隆绝对路径当键，
+  // 第二个克隆装出来是追加而不是覆盖 —— 本机两份 Stop 钩子就是这么来的。
+  assert.doesNotMatch(src, /const MARKER = HOOK_SCRIPT/u);
+  assert.match(src, /claimSingleHook/u);
+  // 收编必须作用在 hook 上而不是整条 entry：同一条 entry 里可能还有别人的钩子，
+  // 按 entry 整条删会把 .orca 之类的一起删掉，而且删得很安静。
+  assert.match(src, /list\[i\]\.hooks = kept/u,
+    "同一 entry 里还有别人的 hook 时，只能摘掉自己那条，不能删整条");
+
+  // 技能源码也不能硬编码克隆路径，否则 Frank 跑 /feishu-bind 时执行的是某个开发分支的脚本。
+  for (const file of fs.readdirSync(path.resolve("skills"))) {
+    const skill = path.resolve("skills", file, "SKILL.md");
+    if (!fs.existsSync(skill)) continue;
+    const text = fs.readFileSync(skill, "utf-8");
+    assert.doesNotMatch(text, /\/Users\/[^\s"']*\/(claude-projects|codex-projects)\//u,
+      file + " 里不能出现开发克隆的绝对路径，用 {{BRIDGE_ROOT}}");
+  }
+});
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (failed > 0) {

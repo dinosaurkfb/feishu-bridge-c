@@ -138,13 +138,21 @@ async function main() {
     process.exit(0);
   }
 
+  // bridge_root 只当**前置判断**用：这台机器有没有配过桥。它不再负责定位代码。
   const bridgeRoot = tpl.template.bridge_root;
   if (typeof bridgeRoot !== "string" || !bridgeRoot) { log("skip no_bridge_root"); process.exit(0); }
 
-  const context = composeTransportRule({
-    dispatcher: bridgeRoot + "/scripts/aily-inbound.mjs",
-  });
-  log("INJECT " + context.length + " 字符 → " + bridgeRoot + "/scripts/aily-inbound.mjs");
+  // 分发器取**自己的同目录兄弟**，不从 bridge_root 拼。
+  //
+  // 理由有两条。一是版本一致：这个钩子是从哪份代码被加载的，就该把同一份代码里的
+  // 分发器交出去；从模板字段拼出来的路径可能指向另一个克隆、另一个提交。
+  // 二是脱离开发克隆：钩子本身已经装在 ~/.claude/feishu-bridge/runtime/current/ 下，
+  // 而 bridge_root 仍是某个开发克隆 —— 那样出站迁走了、入站还落回克隆执行。
+  const dispatcher = path.join(
+    path.dirname(new URL(import.meta.url).pathname), "aily-inbound.mjs");
+
+  const context = composeTransportRule({ dispatcher });
+  log("INJECT " + context.length + " 字符 → " + dispatcher);
   process.stdout.write(JSON.stringify({
     hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: context },
   }) + "\n");
@@ -154,9 +162,8 @@ async function main() {
 if (import.meta.url === "file://" + process.argv[1]) {
   if (process.argv.includes("--self-test")) {
     const { loadChainTemplate } = await import("./chain-template.mjs");
-    const tpl = loadChainTemplate();
     console.log(composeTransportRule({
-      dispatcher: (tpl.ok ? tpl.template.bridge_root : "<未配置>") + "/scripts/aily-inbound.mjs",
+      dispatcher: path.join(path.dirname(new URL(import.meta.url).pathname), "aily-inbound.mjs"),
     }));
     process.exit(0);
   }

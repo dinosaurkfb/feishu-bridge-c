@@ -7752,6 +7752,37 @@ test("完整链路：真实 provider 声明关系层，最终真的进第 2 层"
   assert.equal(text.includes("oc_SECRET123456"), false);
 });
 
+test("provider 的参数也走白名单：拼错的关系层不许静默退化", () => {
+  // --relaton 要是被忽略，这条链路就悄悄退回"未分层"，而人以为自己已经声明过了。
+  // **沉默的降级比报错难查得多。**
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-relargs-"));
+  const bindingFile = path.join(dir, "b.json");
+  fs.writeFileSync(bindingFile, JSON.stringify({
+    bind_scope: "chat", status: "active", chat_id: "oc_x",
+    chat_name: "G", expires_at: "2099-01-01T00:00:00.000Z",
+  }));
+  const run = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "group-binding-status.mjs"),
+    "--provider-id", "p", "--binding", bindingFile, ...args,
+  ], { encoding: "utf-8" });
+
+  for (const [args, reason] of [
+    [["--relaton", "subscription"], "unknown_option"],
+    [["--relation"], "option_needs_value"],
+    [["--relation", "a", "--relation", "b"], "duplicate_option"],
+    [["裸参数"], "unexpected_argument"],
+  ]) {
+    const bad = run(args);
+    assert.notEqual(bad.status, 0, reason);
+    assert.match(bad.stderr, new RegExp(reason, "u"));
+  }
+
+  // 正确写法照常可用 —— 拒的是拼错，不是这个参数本身。
+  const ok = run(["--relation", "subscription"]);
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(JSON.parse(ok.stdout).connections[0].relation_type, "subscription");
+});
+
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (failed > 0) {

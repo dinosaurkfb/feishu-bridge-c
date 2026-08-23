@@ -22,9 +22,32 @@ import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
 import { PROVIDER_PROTOCOL } from "./status-providers.mjs";
 
-function arg(name) {
-  const i = process.argv.indexOf("--" + name);
-  return i >= 0 ? process.argv[i + 1] : undefined;
+/**
+ * 严格白名单解析。**拼错的参数不许静默退化。**
+ *
+ * `--relaton subscription` 要是被忽略，这条链路就悄悄退回"未分层"，
+ * 而人以为自己已经声明过了 —— **沉默的降级比报错难查得多**。
+ */
+const OPTIONS = new Set(["provider-id", "binding", "relation"]);
+
+function parseArgs(tokens) {
+  const seen = new Map();
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i];
+    if (typeof t !== "string" || !t.startsWith("--")) {
+      return { ok: false, reason: "unexpected_argument", detail: t };
+    }
+    const name = t.slice(2);
+    if (seen.has(name)) return { ok: false, reason: "duplicate_option", detail: t };
+    if (!OPTIONS.has(name)) return { ok: false, reason: "unknown_option", detail: t };
+    const value = tokens[i + 1];
+    if (typeof value !== "string" || value.startsWith("--")) {
+      return { ok: false, reason: "option_needs_value", detail: t };
+    }
+    seen.set(name, value);
+    i += 1;
+  }
+  return { ok: true, seen };
 }
 
 /**
@@ -81,9 +104,14 @@ function readBinding(file) {
 }
 
 function main() {
-  const providerId = arg("provider-id");
-  const binding = arg("binding");
-  const relation = arg("relation") ?? null;
+  const parsed = parseArgs(process.argv.slice(2));
+  if (!parsed.ok) {
+    console.error(parsed.reason + (parsed.detail ? "：" + parsed.detail : ""));
+    process.exit(2);
+  }
+  const providerId = parsed.seen.get("provider-id");
+  const binding = parsed.seen.get("binding");
+  const relation = parsed.seen.get("relation") ?? null;
   if (!providerId || !binding || !path.isAbsolute(binding)) {
     console.error("用法：node scripts/group-binding-status.mjs --provider-id <id> --binding <绝对路径>");
     process.exit(2);

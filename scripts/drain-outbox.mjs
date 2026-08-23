@@ -14,9 +14,9 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { listPending, markSent, composeDigest } from "./outbox.mjs";
+import { listPending, markSent, composeDigest, suppressRecords } from "./outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
-import { publishDraft } from "./outbound.mjs";
+import { PUBLISH_FAILURE, classifyPublishFailure, publishDraft } from "./outbound.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
@@ -174,6 +174,21 @@ export function drainProject({ root, claudeSessionId, dryRun = false, timeoutMs 
   } catch (err) {
     // 不标记、不吞掉：留在 outbox，下一个排空者重试。
     // 截断放宽到 400：飞书的报错 JSON 前 200 字还没到 code 和 message，截短了等于没留痕。
+    // 判一次是"这次不行"还是"永远不行"。永久失败还留在 outbox 重试，
+    // 只会每 30 分钟稳定地制造一次噪音，而每轮 Stop 都会说一句假的"兜底定时器会重试"。
+    const verdict = classifyPublishFailure({
+      rootMessageId: mapping.root_message_id, expectedAppId: id.expectedAppId,
+      larkBin: id.bin, larkHome: id.configDir, profile: id.profile,
+    });
+    if (verdict.kind === PUBLISH_FAILURE.ROOT_OWNED_BY_OTHER_APP) {
+      const done = suppressRecords(pending, {
+        reason: "root_owned_by_other_app" + (verdict.ownerName ? ":" + verdict.ownerName : ""),
+      });
+      return {
+        status: "suppressed", root, reason: PUBLISH_FAILURE.ROOT_OWNED_BY_OTHER_APP,
+        count: done.changed, ownerName: verdict.ownerName ?? null,
+      };
+    }
     return { status: "error", root, reason: "publish_failed", error: String(err.message).slice(0, 400) };
   } finally {
     releasePublishLock(lockDir);
@@ -236,6 +251,11 @@ if (isDirectRun(import.meta.url)) {
       console.log(tag + "[dry-run] 将发布 " + r.count + " 条：\n---\n" + r.text);
     } else if (r.status === "error") {
       console.error(tag + "排空失败（" + r.reason + "），进展留在 outbox：" + r.error);
+      hadError = true;
+    } else if (r.status === "suppressed") {
+      console.error(tag + "永久失败：话题由另一个应用（" + (r.ownerName ?? "未知") +
+        "）创建，当前身份回复不进去；" + r.count + " 条已停止重试。" +
+        "要恢复：重新绑定或轮转话题。");
       hadError = true;
     } else if (r.status === "skipped") {
       console.error(tag + "暂不发布：" + r.reason + (r.count ? "（" + r.count + " 条留在 outbox）" : ""));

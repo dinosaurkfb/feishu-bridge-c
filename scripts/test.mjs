@@ -28,10 +28,13 @@ import {
   acquirePublishLock, attributeSession, fileContainsAny, isUnder,
   loadRegistry, releasePublishLock,
 } from "./registry.mjs";
-import { appendEvent, composeDigest, listPending, markSent } from "./outbox.mjs";
+import {
+  appendEvent, composeDigest, listPending, markSent, suppressRecords,
+} from "./outbox.mjs";
 import {
   composeOutboundCard, outboundCardBatches, validateOutboundCard,
 } from "./outbound-card.mjs";
+import { PUBLISH_FAILURE, classifyPublishFailure } from "./outbound.mjs";
 import { drainProject, watcherActive } from "./drain-outbox.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
 import {
@@ -4428,9 +4431,11 @@ test("出站传的是 LARKSUITE_CLI_CONFIG_DIR，不是那个不存在的 LARKSU
   assert.ok(code.includes("LARKSUITE_CLI_CONFIG_DIR"), "必须用真实存在的那个变量名");
   assert.ok(!code.includes("LARKSUITE_CLI_HOME"),
     "LARKSUITE_CLI_HOME 在 lark-cli 二进制里出现 0 次 —— 设了等于没设，而且不会报错");
-  // 两个共用发送入口都得钉住身份：只钉一个，另一个就会在 agent 的清洗环境里拿错身份。
-  assert.equal((code.match(/LARKSUITE_CLI_CONFIG_DIR/g) ?? []).length, 2);
-  assert.equal((code.match(/LARKSUITE_CLI_PROFILE/g) ?? []).length, 2);
+  // **每一个调 lark-cli 的入口**都要钉住身份，不只是发送的那两个：
+  // 两个发送入口 + 失败分类里那个只读探测。探测要是用错身份会得出错的判定，
+  // 而错的判定会让一条本可以发出去的内容被**永久抑制** —— 读错比发错更隐蔽。
+  assert.equal((code.match(/LARKSUITE_CLI_CONFIG_DIR/g) ?? []).length, 3);
+  assert.equal((code.match(/LARKSUITE_CLI_PROFILE/g) ?? []).length, 3);
 });
 
 // ---------- 身份解析与凭据归属校验 ----------
@@ -7614,6 +7619,67 @@ test("按文档里那条命令登记，聚合方要真的能取到状态", () =>
   assert.equal(renderConnectivity(view).includes("oc_SECRET123456"), false);
 });
 
+
+test("永久失败只在有正面证据时判定，探测不确定一律按瞬时", () => {
+  // **抑制是有损的**：这条内容再也不会发出去。所以宁可继续重试制造噪音，
+  // 也不能把一条本可以发出去的内容悄悄扔掉。
+  const base = { rootMessageId: "om_x", expectedAppId: "appA" };
+  const reply = (sender) => () => JSON.stringify({ ok: true, data: { messages: [{ sender }] } });
+
+  assert.equal(classifyPublishFailure({ ...base,
+    exec: reply({ id: "appB", id_type: "app_id", name: "CC" }) }).kind,
+    PUBLISH_FAILURE.ROOT_OWNED_BY_OTHER_APP);
+  assert.equal(classifyPublishFailure({ ...base,
+    exec: reply({ id: "appB", id_type: "app_id", name: "CC" }) }).ownerName, "CC");
+
+  // 同一个应用 → 那就是这次不行，接着重试。
+  assert.equal(classifyPublishFailure({ ...base,
+    exec: reply({ id: "appA", id_type: "app_id", name: "M5Claude" }) }).kind,
+    PUBLISH_FAILURE.TRANSIENT);
+
+  // 探测本身出问题的每一种，都必须落回瞬时。
+  for (const [exec, why] of [
+    [() => { throw new Error("network"); }, "探测失败"],
+    [() => "not json", "返回不是 JSON"],
+    [() => JSON.stringify({ ok: false }), "探测报错"],
+    [() => JSON.stringify({ ok: true, data: { messages: [] } }), "没有消息"],
+    [() => JSON.stringify({ ok: true, data: { messages: [{ sender: { id: "x", id_type: "open_id" } }] } }),
+      "发送者不是应用"],
+  ]) {
+    assert.equal(classifyPublishFailure({ ...base, exec }).kind, PUBLISH_FAILURE.TRANSIENT, why);
+  }
+  // 缺证据时也不许判永久。
+  assert.equal(classifyPublishFailure({}).kind, PUBLISH_FAILURE.TRANSIENT);
+  assert.equal(classifyPublishFailure({ rootMessageId: "om_x" }).kind, PUBLISH_FAILURE.TRANSIENT);
+});
+
+test("抑制只动没发出去的那些，且不重复抑制", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-supp-"));
+  const write = (name, extra) => {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, JSON.stringify({
+      kind: "progress", text: "x", created_at: new Date().toISOString(),
+      published_at: null, ...extra,
+    }));
+    return { _file: file };
+  };
+  const pending = write("0001.json", {});
+  const sent = write("0002.json", { published_at: "2026-01-01T00:00:00.000Z" });
+  const already = write("0003.json", { publish_suppressed_at: "2026-01-01T00:00:00.000Z" });
+
+  const done = suppressRecords([pending, sent, already], { reason: "root_owned_by_other_app:CC" });
+  assert.equal(done.changed, 1, "只该动那条真的还在等的");
+
+  const after = JSON.parse(fs.readFileSync(pending._file, "utf-8"));
+  assert.ok(after.publish_suppressed_at, "要留下抑制时间");
+  assert.equal(after.publish_suppressed_reason, "root_owned_by_other_app:CC", "理由要能回答为什么");
+  assert.equal(after.publish_eligible_at, null);
+  // 已发出的不许被改成"抑制"——那会让账对不上。
+  assert.equal(JSON.parse(fs.readFileSync(sent._file, "utf-8")).publish_suppressed_at, undefined);
+
+  // 被抑制之后就不再是待发 —— 噪音就是这样停下来的。
+  assert.equal(listPending({ outboxDir: dir }).length, 0);
+});
 
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

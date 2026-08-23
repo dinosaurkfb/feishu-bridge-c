@@ -217,6 +217,42 @@ export function suppressPublishByEventKey({ outboxDir, eventKey, reason }) {
  * reply 必须原样渲染：给一段两千字的答复加上「· 」前缀和【】分组，
  * 等于把它揉烂。它不是一条进展，它就是正文。
  */
+/**
+ * 把一批已经取出来的待发记录标成**永久失败**，停止重试。
+ *
+ * 为什么要有"永久"这个分类：cc2cd 有一条回复永远发不出去 —— 它要回到的那个话题是
+ * **另一个应用**（切到单智能体方案之前的 CC）建的，而现在的发布身份是 M5Claude。
+ * 换个身份重试同一件事，结果不会变。
+ *
+ * 而系统一直把它当瞬时失败：留在 outbox、每 30 分钟重试、每轮 Stop 都报一次
+ * "兜底定时器会重试"。**那句话是假的**，它只是在稳定地制造噪音。
+ *
+ * 抑制是**有损**的：这条内容再也不会发出去。所以只在拿到**正面证据**时才做，
+ * 探测失败一律按瞬时处理 —— 宁可继续重试制造噪音，也不能把一条本可以发出去的
+ * 内容悄悄扔掉。
+ */
+export function suppressRecords(records, { reason }) {
+  let changed = 0;
+  for (const rec of records) {
+    const file = rec._file;
+    if (typeof file !== "string") continue;
+    let current;
+    try { current = JSON.parse(fs.readFileSync(file, "utf-8")); } catch { continue; }
+    if (current.published_at !== null || current.publish_suppressed_at) continue;
+    const next = {
+      ...current,
+      publish_eligible_at: null,
+      publish_suppressed_at: new Date().toISOString(),
+      publish_suppressed_reason: String(reason ?? "permanent_publish_failure").slice(0, 200),
+    };
+    const tmp = file + ".tmp." + randomUUID();
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    changed += 1;
+  }
+  return { ok: true, changed };
+}
+
 export function composeDigest(records, { taskName }) {
   const replies = records.filter((r) => r.kind === "reply");
   const rest = records.filter((r) => r.kind !== "reply");

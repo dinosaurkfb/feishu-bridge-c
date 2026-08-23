@@ -7632,6 +7632,19 @@ test("发布失败要留下 lark-cli 说的话，不是命令回显", () => {
   // 没有 stderr 时用命令回显之后那段。
   assert.equal(publishErrorDetail({ message: command + "\n真正的报错在这里" }), "真正的报错在这里");
 
+  // **长 stderr 的真错误常在末尾。**上一版只对"纯命令回显"留头尾，对 stderr
+  // 仍从头截 —— 于是多行 runtime 提示加末尾错误码时，code 照样被切掉。
+  // 同一个错误换了个入口又犯一遍。
+  const longStderr = "runtime hint\n".repeat(60) + "code 230002: bot not in chat";
+  const kept = publishErrorDetail({ message: command, stderr: longStderr });
+  assert.ok(kept.endsWith("code 230002: bot not in chat"), "末尾的错误码必须留住");
+  assert.ok(kept.includes("…（中间省略）…"), "省略了就要说，别假装完整");
+
+  // **普通多行错误的第一行往往正是主错误。**只有 Command failed: 开头的那种
+  // 第一行才是命令回显，不能见到换行就删第一行。
+  assert.equal(publishErrorDetail({ message: "primary failure reason\nsecondary context" }),
+    "primary failure reason\nsecondary context");
+
   // 实在只有命令回显：头尾都要留 —— 尾部往往正是失败的那个参数。
   const onlyCommand = publishErrorDetail({ message: command });
   assert.ok(onlyCommand.includes("lark-cli"), "开头要认得出是哪条命令");

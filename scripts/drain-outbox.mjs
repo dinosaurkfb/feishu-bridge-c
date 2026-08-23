@@ -70,6 +70,15 @@ export function watcherActive(root) {
  * 排空一个项目的 outbox。返回结构化结果，自己不打印、不退出 ——
  * 它跑在会话结束钩子里，任何 throw 或 process.exit 都会砸到别人的会话上。
  */
+const PUBLISH_ERROR_CAP = 400;
+
+/** 长错误留头也留尾 —— **真正的错误码常常在末尾**，只留头等于把它扔了。 */
+function clipBothEnds(text) {
+  const t = String(text).trim();
+  if (t.length <= PUBLISH_ERROR_CAP) return t;
+  return t.slice(0, 160) + " …（中间省略）… " + t.slice(-200);
+}
+
 /**
  * 从发布失败里挑出**有用的那半**。
  *
@@ -77,22 +86,30 @@ export function watcherActive(root) {
  * 而这条命令带着整张卡片 JSON，光命令回显就上千字符 —— 从头截 400 字留下来的
  * 全是命令，lark-cli 真正说的话一个字都没有。
  *
- * 上一版发现过这个症状，改法是"把 400 放宽"。那治不了：问题不是**长度不够**，
- * 是**截错了方向**。现在优先用 stderr，其次用命令回显之后的部分；实在只有命令
- * 回显时头尾都留，而不是只留头。
+ * 上上版发现过这个症状，改法是"把 400 放宽"。那治不了：问题不是**长度不够**，
+ * 是**截错了方向**。
+ *
+ * 上一版只对"纯命令回显"留头尾，对 stderr 仍然从头截 —— 于是多行 runtime 提示
+ * 加末尾错误码时，`code 230002` 照样被切掉。**同一个错误换了个入口又犯一遍。**
+ * 现在头尾保留对**所有**长文本一视同仁。
+ *
+ * 另一处：上一版只要 message 有换行就删掉第一行。可只有 `Command failed:` 开头的
+ * 那种第一行才是命令回显 —— 普通多行错误的第一行往往正是主错误。**只在确实匹配
+ * 时才剥。**
  */
 export function publishErrorDetail(err) {
   const raw = err?.stderr;
   const stderr = typeof raw === "string" ? raw
     : (raw && typeof raw.toString === "function") ? raw.toString("utf-8") : "";
   const message = String(err?.message ?? "");
-  const afterCommand = message.includes("\n") ? message.slice(message.indexOf("\n") + 1) : "";
 
-  const detail = stderr.trim() || afterCommand.trim();
-  if (detail) return detail.slice(0, 400);
-  // 只有命令回显：留头也留尾 —— 尾部往往正是失败的那个参数。
-  return message.length <= 400 ? message
-    : message.slice(0, 160) + " …（中间省略）… " + message.slice(-200);
+  const isCommandEcho = message.startsWith("Command failed:");
+  const afterCommand = isCommandEcho && message.includes("\n")
+    ? message.slice(message.indexOf("\n") + 1)
+    : "";
+
+  const detail = stderr.trim() || afterCommand.trim() || message;
+  return clipBothEnds(detail);
 }
 
 export function drainProject({ root, claudeSessionId, dryRun = false, timeoutMs } = {}) {

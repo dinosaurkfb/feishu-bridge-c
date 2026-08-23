@@ -4,12 +4,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { moduleRoot } from "../direct-run.mjs";
 
 import {
   bridgeHome, loadCodexTemplate, loadRegistry, registryFile,
 } from "./state.mjs";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
+const ROOT = moduleRoot(import.meta.url, "../..");
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const JSON_OUTPUT = process.argv.includes("--json");
 const REQUIRED_SKILLS = [

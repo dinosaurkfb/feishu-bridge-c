@@ -12,7 +12,8 @@
  */
 
 import fs from "node:fs";
-import { pathToFileURL } from "node:url";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 export function isDirectRun(importMetaUrl) {
   const invoked = process.argv[1];
@@ -22,4 +23,23 @@ export function isDirectRun(importMetaUrl) {
   } catch {
     return false;
   }
+}
+
+/**
+ * 模块自己所在的目录。**别用 `new URL(import.meta.url).pathname`。**
+ *
+ * 那个属性给的是 URL 里的路径分量，仍是百分号编码的：目录名含空格或中文时会拿到
+ * `/…/%E5%B8%A6%20%E7%A9%BA%E6%A0%BC`，拿去读文件直接 ENOENT。实测过。
+ * Frank 现在的路径全是 ASCII 所以一直没爆，但 runtime 装在 `~/.claude/...` 下、
+ * 而 home 目录名是用户可控的 —— 这是颗定时炸弹，不是理论问题。
+ *
+ * `fileURLToPath` 会正确解码，并且在 Windows 上也给出合法路径。
+ */
+export function moduleDir(importMetaUrl) {
+  return path.dirname(fileURLToPath(importMetaUrl));
+}
+
+/** 模块所在目录往上若干层，用来定位仓库根。 */
+export function moduleRoot(importMetaUrl, ...up) {
+  return path.resolve(moduleDir(importMetaUrl), ...up);
 }

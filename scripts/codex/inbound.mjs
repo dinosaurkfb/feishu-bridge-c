@@ -7,6 +7,7 @@ import path from "node:path";
 
 import { acquireClaim, recordClaimState } from "../claim.mjs";
 import { fetchTriggerEvent } from "../envelope.mjs";
+import { moduleRoot } from "../direct-run.mjs";
 import {
   acquireSessionLock, releaseSessionLock, stampSessionLock,
 } from "../handoff.mjs";
@@ -34,7 +35,7 @@ import {
   shadowCodexFirstClaim, taskPaths,
 } from "./state.mjs";
 
-const BRIDGE_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
+const BRIDGE_ROOT = moduleRoot(import.meta.url, "../..");
 const HOME = bridgeHome();
 let receiptDir = path.join(HOME, "receipts");
 

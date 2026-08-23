@@ -22,6 +22,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { loadChainTemplate } from "./chain-template.mjs";
+import { moduleDir } from "./direct-run.mjs";
 import {
   bindingToken, composeRootMessage, composeStatusMessage, readProjectIdentity,
 } from "./bind-compose.mjs";
@@ -63,5 +64,5 @@ console.log("\n--- 底下第一条（之后的回复可以盖掉它）---\n" +
   composeStatusMessage({ name }));
 
 console.log("\n这条命令什么都没做。真的建话题要跑：");
-console.log("  node " + path.join(path.dirname(new URL(import.meta.url).pathname)) +
+console.log("  node " + path.join(moduleDir(import.meta.url)) +
   "/bind-project.mjs --project " + root + " --apply");

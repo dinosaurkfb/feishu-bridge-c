@@ -8,8 +8,9 @@ import { loadChainTemplate } from "./chain-template.mjs";
 import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
 import { routesPath } from "./inbound-routes.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
+import { moduleRoot } from "./direct-run.mjs";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const ROOT = moduleRoot(import.meta.url, "..");
 const tpl = loadChainTemplate();
 if (!tpl.ok) {
   process.stdout.write("系统错误 · 这台机器的链路模板不可用（" + tpl.reason +

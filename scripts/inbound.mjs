@@ -12,11 +12,13 @@
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import { REJECT } from "./selector.mjs";
 import { fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, recordClaimState } from "./claim.mjs";
+import { moduleRoot } from "./direct-run.mjs";
 import {
   MAPPING_DISPOSITION, buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
 } from "./mapping-policy.mjs";
@@ -45,12 +47,18 @@ import {
   dialogueAuthorizationShadowEnabled, recordDialogueBoundAuthorizationShadow,
 } from "./dialogue-authorization-shadow-store.mjs";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const ROOT = moduleRoot(import.meta.url, "..");
 
-// 运行期目录挂在**被路由到的那个项目**下，不再写死在本仓库。
-// 路由之前唯一能写的地方是本仓库 —— 取不到信封、认不出话题时的回执只能落这儿。
+// 运行期目录挂在**被路由到的那个项目**下。
+//
+// 路由之前（取不到信封、认不出话题）没有项目可挂，这批回执落到**机器级**目录，
+// 而不是本仓库。原来落本仓库，装到 runtime 之后就是落进
+// runtime/versions/<版本>/.runtime-data/ —— 两个后果都不能接受：
+// 本该不可变的代码目录变成了状态目录；而且每装一个新版本，路由前的审计证据就
+// 换一个地方，排查时得翻遍所有历史版本目录才能拼出完整时间线。
 const rtOf = (root) => path.join(root, ".runtime-data", "inbound");
-let RT = rtOf(ROOT);
+const UNROUTED_RT = path.join(os.homedir(), ".claude", "feishu-bridge", "inbound");
+let RT = UNROUTED_RT;
 let CLAIMS = path.join(RT, "delivery-claims");
 let RECEIPTS = path.join(RT, "receipts");
 let RUNS = path.join(RT, "runs");

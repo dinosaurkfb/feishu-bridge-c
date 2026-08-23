@@ -22,7 +22,7 @@ import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
 import { isLockStale } from "./handoff.mjs";
 import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
-import { isDirectRun } from "./direct-run.mjs";
+import { isDirectRun, moduleRoot } from "./direct-run.mjs";
 import {
   businessActivitiesForPublishedBatch, recordClaudeActivityAndMaybeRotate,
 } from "./automatic-topic-rotation.mjs";
@@ -187,7 +187,7 @@ if (isDirectRun(import.meta.url)) {
     const i = process.argv.indexOf("--" + n);
     return i >= 0 ? process.argv[i + 1] : undefined;
   };
-  const SELF_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+  const SELF_ROOT = moduleRoot(import.meta.url, "..");
   const verbose = process.argv.includes("--verbose");
   const dryRun = process.argv.includes("--dry-run");
 

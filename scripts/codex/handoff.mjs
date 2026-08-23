@@ -3,8 +3,9 @@
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { moduleDir } from "../direct-run.mjs";
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+const HERE = moduleDir(import.meta.url);
 const RUNNER = path.join(HERE, "run-resume.mjs");
 
 /** 目标 Codex task 不能继承 M5Codex/Aily 入站身份，否则 hook 会把它再次路由。 */

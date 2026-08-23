@@ -15,7 +15,7 @@ import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
 import { execFileSync } from "node:child_process";
 
 import { readRunOutcome } from "./handoff.mjs";
-import { isDirectRun } from "./direct-run.mjs";
+import { isDirectRun, moduleRoot } from "./direct-run.mjs";
 
 const PUBLISHED_MARK = ".published.json";
 
@@ -214,7 +214,7 @@ export function sendToChat({ profile, chatId, text, idempotencyKey, larkBin, lar
 // ---------- CLI ----------
 
 if (isDirectRun(import.meta.url)) {
-  const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+  const ROOT = moduleRoot(import.meta.url, "..");
   const RT = path.join(ROOT, ".runtime-data", "inbound");
   const runsDir = path.join(RT, "runs");
   const cfg = JSON.parse(fs.readFileSync(path.join(RT, "chain-config.json"), "utf-8"));

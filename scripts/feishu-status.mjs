@@ -6,17 +6,22 @@
  * 完全同一条选择规则 —— 状态命令要是按另一套规则找，就会出现「status 说绑的是 A、
  * 实际发到 B」这种最难查的不一致。
  *
- * 除了当前上下文，还会列出本机其他消费者的连接 —— 「我有哪些东西连到了哪些
- * 飞书群和话题」是**一个**问题，不该按实现拆成几条命令各答一半。
- * 那部分的取数和校验在 status-providers.mjs，坏了只影响显示，不影响入站。
+ * 按四层关系模型分区展示（§6），并**只看当前项目**：本项目的其他链路也一并列出，
+ * 因为「我有哪些东西连到了哪些飞书群和话题」是一个问题，不该按实现拆成几条命令
+ * 各答一半。整台机器的跨项目诊断归后续的 doctor 命令。
+ *
+ * 状态提供者的取数和校验在 status-providers.mjs，坏了只影响显示，不影响入站。
  *
  * 用法：node scripts/feishu-status.mjs [--project ~/x]
  */
 
 import path from "node:path";
 
-import { bindingsForRoot, currentBinding, describeStatus } from "./feishu-control.mjs";
-import { collectConnectivity, renderConnectivity } from "./status-providers.mjs";
+import { bindingsForRoot, currentBinding } from "./feishu-control.mjs";
+import { buildClaudeSubscriptionProjection } from "./inbound-route.mjs";
+import { loadChainTemplate } from "./chain-template.mjs";
+import { composeLayeredStatus, endpointFacts, renderLayeredStatus, subscriptionFacts } from "./layered-status.mjs";
+import { collectProjectConnectivity, renderConnectivity } from "./status-providers.mjs";
 
 const arg = (n) => {
   const i = process.argv.indexOf("--" + n);
@@ -27,8 +32,20 @@ const root = path.resolve(arg("project") ?? process.cwd());
 const claudeSessionId = process.env.CLAUDE_CODE_SESSION_ID;
 
 const st = currentBinding({ root, claudeSessionId });
-console.log(describeStatus(st, bindingsForRoot({ root })));
+// 分层视图把它放进"其他消费者"那一节，标题由那边给。
+const loaded = loadChainTemplate();
+const tpl = loaded?.ok ? (loaded.template ?? loaded) : null;
 
-const others = renderConnectivity(collectConnectivity());
-if (others) console.log("\n" + others);
+// 只看当前项目的链路。整台机器的全景归后续的 doctor 命令。
+const projectLinks = collectProjectConnectivity({ root });
+const layeredConnectivity = renderConnectivity(projectLinks, { heading: null });
+
+console.log(renderLayeredStatus(composeLayeredStatus({
+  st,
+  others: bindingsForRoot({ root }),
+  endpoint: endpointFacts({ agentName: tpl?.transport_agent_name ?? null }),
+  subscription: subscriptionFacts(buildClaudeSubscriptionProjection({ projectRoot: root }),
+    { groupName: tpl?.chat_name ?? null }),
+  connectivity: layeredConnectivity,
+})));
 process.exit(0);

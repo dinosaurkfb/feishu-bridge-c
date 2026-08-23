@@ -105,6 +105,12 @@ export function validateProviderRegistry(doc) {
       return bad("allowed_kinds_invalid");
     }
     if (p.enabled !== undefined && typeof p.enabled !== "boolean") return bad("enabled_not_boolean");
+    // 哪个项目的链路。status 只看当前项目 —— 没有它就归不了属，
+    // 归不了属的 provider 不进项目视图（那是 doctor 该管的机器级问题）。
+    if (p.project_root !== undefined &&
+        (typeof p.project_root !== "string" || !path.isAbsolute(p.project_root))) {
+      return bad("project_root_not_absolute");
+    }
     if (p.display_name !== undefined && cleanName(p.display_name) === null) {
       return bad("display_name_invalid");
     }
@@ -117,6 +123,7 @@ export function validateProviderRegistry(doc) {
       args: p.args ?? [],
       allowedKinds: [...p.allowed_kinds],
       enabled: p.enabled !== false,
+      projectRoot: p.project_root ?? null,
     });
   }
   return { ok: true, providers };
@@ -241,24 +248,37 @@ export function collectStatusProviders({ file = statusProvidersPath(), run = run
   const loaded = loadStatusProviders(file);
   if (!loaded.ok) return { ok: false, reason: loaded.reason, problem: loaded.problem, sections: [] };
 
-  const sections = [];
-  for (const provider of loaded.providers) {
-    if (!provider.enabled) {
-      sections.push({ id: provider.id, displayName: provider.displayName,
-        allowedKinds: provider.allowedKinds, state: "disabled" });
-      continue;
-    }
-    const got = run(provider);
-    const base = { id: provider.id, displayName: provider.displayName, allowedKinds: provider.allowedKinds };
-    sections.push(got.ok
-      ? { ...base, state: "ok", connections: got.connections }
-      : { ...base, state: "unavailable", reason: got.reason });
-  }
-  return { ok: true, sections };
+  return { ok: true, sections: runProviders(loaded.providers, run) };
 }
 
 /**
- * 把两份目录合成一张连通性视图。
+ * 只看当前项目的链路。**这是 status 用的那个。**
+ *
+ * 上一版把整台机器的消费者都列出来，那是我把范围做大了 —— Frank 最初的要求是
+ * "把**这个项目**有关的都列出来"。cc2cd 对 feishu-bridge-cc 来说是别人，
+ * 它出现在这里只会让每天要看的那屏变吵。
+ *
+ * "有 route 却没人报状态"那类跨项目的说不通，归后续的 doctor 命令管 ——
+ * status 是每天看的，doctor 是出问题才跑的，两者该查的东西本来就不一样。
+ */
+export function collectProjectConnectivity({
+  root, providersFile = statusProvidersPath(), run = runStatusProvider,
+} = {}) {
+  const loaded = loadStatusProviders(providersFile);
+  if (!loaded.ok) {
+    return { sections: [], providersProblem: loaded.problem ?? loaded.reason, routesProblem: null };
+  }
+  // **先过滤再执行。**上一版跑完全部 provider 再按归属过滤显示 —— 界面上看着
+  // 只有当前项目，实际已经把别的项目的脚本在 Frank 的交互会话里跑了一遍。
+  // 项目范围要是只管显示不管执行，那它就不是范围。
+  const want = typeof root === "string" ? path.resolve(root) : null;
+  const mine = loaded.providers.filter((p) =>
+    want !== null && typeof p.projectRoot === "string" && path.resolve(p.projectRoot) === want);
+  return { sections: runProviders(mine, run), providersProblem: null, routesProblem: null };
+}
+
+/**
+ * 把两份目录合成一张连通性视图。**机器全景，给后续的 doctor 用。**
  *
  * 路由表和 provider 表回答的是不同问题：**路由表知道有哪些入站消费者**，
  * provider 表知道**谁能报自己的状态**。只看后者，"有 route、没登记状态入口"
@@ -303,6 +323,21 @@ export function collectConnectivity({
   };
 }
 
+/** 跑一批 provider。停用的不跑 —— 停用就该是"连执行都不发生"。 */
+function runProviders(providers, run) {
+  const sections = [];
+  for (const provider of providers) {
+    const base = { id: provider.id, displayName: provider.displayName,
+      allowedKinds: provider.allowedKinds, projectRoot: provider.projectRoot };
+    if (!provider.enabled) { sections.push({ ...base, state: "disabled" }); continue; }
+    const got = run(provider);
+    sections.push(got.ok
+      ? { ...base, state: "ok", connections: got.connections }
+      : { ...base, state: "unavailable", reason: got.reason });
+  }
+  return sections;
+}
+
 const KIND_TEXT = { transport: "消息运输", progress: "进度汇报" };
 const STATE_TEXT = { active: "正常", suspended: "已暂停", expired: "已过期", unknown: "状态未知" };
 const SCOPE_TEXT = { chat: "整个群", topic: "单个话题", project: "整个项目" };
@@ -311,7 +346,7 @@ const SCOPE_TEXT = { chat: "整个群", topic: "单个话题", project: "整个�
  * 渲染。**只渲染校验过的字段，绝不回显 provider 的原始输出。**
  * 不打印话题 id、会话 locator、凭据 —— 这条承诺由聚合方兑现，不外包给接入方。
  */
-export function renderConnectivity(view) {
+export function renderConnectivity(view, { heading = "其他链路" } = {}) {
   const lines = [];
   for (const s of view.sections) {
     const name = s.displayName;
@@ -345,5 +380,6 @@ export function renderConnectivity(view) {
       "入站已停止投递，这是需要处理的故障");
   }
   if (lines.length === 0) return null;
-  return "其他链路\n" + lines.join("\n");
+  // 分层视图自己会给这一节起标题，不能再叠一个。
+  return (heading ? heading + "\n" : "") + lines.join("\n");
 }

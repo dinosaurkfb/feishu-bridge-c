@@ -1,0 +1,295 @@
+/**
+ * 按四层关系模型展示状态。
+ *
+ * 需求原文（docs/requirements/agent-enhancement-requirements.md:219）要求 status
+ * "只读展示四层状态和待处理事件"，而上一版把四层揉成了一张平表 —— 绑定级别、
+ * 交互模式、出站入站、待发条数排在一起，看不出它们分属不同的关系层。
+ *
+ * 四层（同文件 §6）：
+ *   1 运行端点连接  Aily Agent ──online──> 本机 adapter
+ *   2 事件订阅      Agent + 群 + sender + event type ──subscribe──> 项目/业务域
+ *   3 精确通道绑定  飞书 topic/session ──bind──> 本地 task/thread/session
+ *   4 交互策略      通道 ──policy──> 映射 / 对话 / 管理
+ * 外加需求要求的第五区：待处理事件。
+ *
+ * 两条刻意的克制：
+ *
+ *   · **不出总的绿色"已接入"。**四层完全可能各自处于不同状态（端点未自检、
+ *     订阅活动、通道已绑、策略 Dialogue），一个总判断会把它们抹平成一句话。
+ *   · **第 1 层不假装知道。**端点实时自检（FR-1.4）还没实现，所以这一层只说
+ *     "未自检"，附带的历史证据措辞上必须停在"过去某刻工作过"，不能滑成"在线"。
+ */
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+import { verifyRuntime } from "./runtime-install.mjs";
+
+/** 端点自检尚未实现。这个常量存在本身就是为了让"未实现"是显式的，而不是遗漏。 */
+export const ENDPOINT_SELF_CHECK = "not_implemented";
+
+const runtimeDirDefault = () =>
+  path.join(os.homedir(), ".claude", "feishu-bridge", "runtime");
+const inboundLogDefault = () =>
+  path.join(os.homedir(), ".claude", "feishu-bridge", "aily-inbound.log");
+
+/**
+ * 第 1 层能查到的事实。
+ *
+ * 能查：装没装、装的哪一版。
+ * 查不到：**它此刻在不在线** —— 路由登记只证明配置存在，日志只证明过去某个时刻
+ * 工作过。两者都不能升级成"在线"。
+ */
+export function endpointFacts({
+  runtime = "Claude Code",
+  agentName = null,
+  runtimeDir = runtimeDirDefault(),
+  inboundLog = inboundLogDefault(),
+  verify = () => verifyRuntime(),
+} = {}) {
+  // **能读到符号链接不等于装好了。**上一版只看链接在不在，于是一个指向不存在目录的
+  // current 也会显示"已安装"。三种状态要分开：没装 / 装好了 / 装的东西有问题。
+  const verified = verify();
+  const install = verified.ok ? "ok"
+    : verified.reason === "current_absent" ? "absent" : "broken";
+
+  // **版本号也要过校验。**只读符号链接 basename 的话，一个坏掉的 runtime 会同时
+  // 显示"看起来像真的版本号"和"运行时不可用" —— 那个数字没有任何东西背书。
+  let version = null;
+  if (verified.ok) {
+    version = typeof verified.version === "string" ? verified.version.slice(0, 12) : null;
+  }
+  let linkCandidate = null;
+  try {
+    linkCandidate = path.basename(fs.readlinkSync(path.join(runtimeDir, "current"))).slice(0, 12);
+  } catch { /* 没装或读不到 */ }
+
+  return {
+    runtime,
+    agentName,
+    install,
+    installReason: verified.ok ? null : verified.reason,
+    version,
+    linkCandidate,
+    selfCheck: ENDPOINT_SELF_CHECK,
+    lastInboundAt: lastSuccessfulDispatchAt(inboundLog),
+  };
+}
+
+/**
+ * 最近一次成功入站分发的时间。**只取时间戳，不碰日志里的任何标识。**
+ *
+ * 这是历史证据，不是在线证明 —— 渲染时必须原样这么说。
+ */
+export function lastSuccessfulDispatchAt(file) {
+  let text;
+  try { text = fs.readFileSync(file, "utf-8"); } catch { return null; }
+  let found = null;
+  for (const line of text.split("\n")) {
+    if (!line.includes("dispatch ->")) continue;
+    const at = Date.parse(line.slice(0, 24));
+    if (Number.isFinite(at)) found = at;
+  }
+  return found;
+}
+
+/**
+ * 第 2 层的脱敏视图。
+ *
+ * 能出的只有计数和人读的名字。endpoint_id / subscription_id / domain_id /
+ * agent_uid / transport_open_id / chat_id / sender_ids / local_target_id /
+ * legacy_key / pending_token 一个都不出。
+ *
+ * 群名由调用方从链路模板传进来（模板里本来就有 chat_name，绑定命令一直在打印它）。
+ * 订阅投影自己只有 chat_id —— 取不到名字时显示"不可用"，**不拿 ID 顶替**。
+ */
+export function subscriptionFacts(model, { groupName = null } = {}) {
+  if (!model || model.ok !== true) {
+    return { ok: false, reason: model?.reason ?? "subscription_unavailable" };
+  }
+  const items = (model.subscriptions ?? []).map((s) => ({
+    status: s.status === "active" ? "活动" : "暂停",
+    // 投影里只有 chat_id，但群名在链路模板里就有（绑定命令一直在打印它）。
+    // 上一版报"群名不可用"是我没把它接过来，不是真的没有。
+    groupName,
+    senderCount: (s.scope?.sender_ids ?? []).length,
+    eventTypes: [...(s.scope?.event_types ?? [])],
+  }));
+  return { ok: true, items, pendingCount: (model.pending_bindings ?? []).length };
+}
+
+const relative = (ms, now) => {
+  if (!Number.isFinite(ms)) return null;
+  const mins = Math.max(0, Math.round((now - ms) / 60000));
+  if (mins < 1) return "刚刚";
+  if (mins < 60) return mins + " 分钟前";
+  const hours = Math.round(mins / 60);
+  return hours < 48 ? hours + " 小时前" : Math.round(hours / 24) + " 天前";
+};
+
+/**
+ * 组装五个区。**纯函数** —— 取数在外面做，这里只决定"哪条事实属于哪一层"。
+ */
+export function composeLayeredStatus({
+  st, others = [], endpoint, subscription, connectivity = null, now = Date.now(),
+}) {
+  // **没绑定不等于没有四层。**第 1、2 层照样有事实可报，只是第 3 层还没绑、
+  // 第 4 层无从谈起。上一版在这里直接退回旧格式，等于四层模型在最需要它的时候消失。
+  const bound = st.ok === true;
+  const L1 = [
+    ["运行时", endpoint.runtime],
+    // 运输 agent 的名字是模板里就有的，报名字比报 UID 有用且不算 locator。
+    ["运输 agent", endpoint.agentName ?? "名称不可用"],
+    // 上一版把版本号跟运行时拼在一行，被读成了 agent id。它是脚本内容哈希。
+    ["运行时版本", endpoint.version
+      ?? (endpoint.linkCandidate ? "未通过校验（链接候选 " + endpoint.linkCandidate + "）" : "未安装")],
+    ["安装状态", endpoint.install === "ok" ? "已安装"
+      : endpoint.install === "absent" ? "未安装"
+      // 损坏、漂移、链接异常都不是"正常"，也不是"没装"。
+      : "不可用（" + (endpoint.installReason ?? "unknown") + "）"],
+    // FR-1.4 未实现。写出来，别让空白被读成"没问题"。
+    ["实时自检", "未自检（端点自检 FR-1.4 尚未实现）"],
+  ];
+  const seen = relative(endpoint.lastInboundAt, now);
+  if (seen) L1.push(["最近入站", seen + "（历史证据，不代表当前在线）"]);
+
+  const L2 = [];
+  if (!subscription.ok) {
+    L2.push(["订阅状态", "读不到（" + subscription.reason + "）"]);
+  } else if (subscription.items.length === 0 && st.source === "project-files") {
+    // **"投影覆盖不到"不等于"没有订阅"。**这个项目的绑定住在项目内文件里，
+    // 而订阅投影是从 registry 建的 —— 报"没有事件订阅"就是把看不见说成了不存在。
+    L2.push(["订阅状态", "不可用（本项目绑定走项目内文件，订阅投影未覆盖）"]);
+  } else if (subscription.items.length === 0) {
+    L2.push(["订阅状态", "本项目没有事件订阅"]);
+  } else {
+    for (const s of subscription.items) {
+      L2.push(["订阅状态", s.status]);
+      L2.push(["订阅群", s.groupName ?? "群名不可用（只有群 ID，不拿 ID 顶替）"]);
+      L2.push(["授权发送者", s.senderCount + " 个"]);
+      L2.push(["事件范围", s.eventTypes.join("、") || "未声明"]);
+    }
+    if (subscription.pendingCount > 0) {
+      L2.push(["待认领绑定", subscription.pendingCount + " 条"]);
+    }
+  }
+
+  if (!bound) {
+    // not_bound 和"读不出来"必须分开：前者是还没接，后者是配错了或文件坏了。
+    const why = st.reason === "not_bound"
+      ? "尚未绑定（接入：node scripts/bind-project.mjs --apply）"
+      : "状态不可读（" + (st.reason ?? "unknown") + "）";
+    return {
+      layers: [
+        { n: 1, title: "运行端点连接", rows: L1 },
+        { n: 2, title: "事件订阅", rows: L2 },
+        { n: 3, title: "精确通道绑定", rows: [["绑定状态", why]] },
+        { n: 4, title: "交互策略", rows: [["交互模式", "尚无通道策略（要先有绑定）"]] },
+      ],
+      // 待处理区也要跟着分开 —— 上一版两种情形共用"不适用（尚未绑定）"，
+      // 正是我在第 3 层要求分开的那件事，自己在这里又合回去了。
+      pendingEvents: [["待发布答复", st.reason === "not_bound"
+        ? "不适用（尚未绑定）" : "不适用（绑定状态不可读）"]],
+      connectivity,
+      suspended: false,
+    };
+  }
+
+  const L3 = [
+    // 叫"绑定名称"而不是"话题名"：这是绑定时用的名字，也是话题创建时的标题，
+    // 但用户可以在飞书里改名，本地没有读取当前标题的权威事实 —— 说成"话题名"
+    // 就是在声称一件我们没查过的事。
+    ["绑定名称", st.displayName ? "🌉 " + st.displayName : "名称不可用"],
+    ["绑定级别", st.level === "session"
+      ? "这条工作线单独绑定"
+      : "整个项目共用一个话题"],
+    ["当前代际", st.activeGeneration === null ? "尚未完成首次认领" : "第 " + st.activeGeneration + " 代"],
+    ["入站", st.suspended ? "暂停中，话题里的指令一律被拒"
+      : st.inboundBound ? "已绑定" : "还差一步：去话题里 @ 一下运输 agent"],
+  ];
+  if (st.pendingGeneration !== null && st.pendingGeneration !== undefined) {
+    L3.push(["待认领代际", "第 " + st.pendingGeneration + " 代" +
+      (st.pendingGenerationExpiresAt ? "（截止 " + String(st.pendingGenerationExpiresAt).slice(0, 10) + "）" : "")]);
+  }
+  if (st.readOnlyGenerations > 0) {
+    L3.push(["只读历史", st.readOnlyGenerations + " 个代际（不再接收新指令）"]);
+  }
+  if (st.expiresAt) L3.push(["有效期", String(st.expiresAt).slice(0, 10)]);
+  if (others.length > 1) L3.push(["本项目绑定数", others.length + " 条"]);
+
+  const L4 = [
+    ["交互模式", st.policy?.ok ? st.policy.label + " · v" + st.policy.policyVersion : "状态不可用"],
+  ];
+  if (st.policy?.policyId === "dialogue") {
+    L4.push(["对话预算", st.policy.roundsStarted + " / " + st.policy.maxRounds + " 轮；" +
+      st.policy.resourceUnitsUsed + " / " + st.policy.maxResourceUnits + " 资源单位"]);
+    L4.push(["对话状态", st.policy.status + (st.policy.turnActive ? "（有活动回合）" : "")]);
+  }
+  if (st.activeGeneration !== null) {
+    const used = Number.isInteger(st.activeGenerationMessages) ? st.activeGenerationMessages : 0;
+    const max = Number.isInteger(st.activeGenerationThreshold) ? st.activeGenerationThreshold : 30;
+    L4.push(["自动轮转", used + " / " + max + " 条（还剩 " + Math.max(0, max - used) + " 条）"]);
+  }
+  // **不许无条件声称"每轮自动发布"**，也不许说得比实际行为满。
+  //
+  // auto_publish_on_completion 只被 inbound.mjs 和 watch-and-publish.mjs 读取。
+  // **每轮 Stop 和 30 分钟兜底都不读它** —— 而那两条恰好是主路径。所以在 Claude 侧
+  // 把它设成 false 几乎什么都不改变：进展照发。
+  //
+  // 上一版写"每轮完成时不自动发布（兜底排空仍会发出）"仍然不准，因为 Stop 每轮
+  // 都会排空。这是同一个错的第二版：措辞比行为说得满。
+  //
+  // 这个落差是产品缺口，已记入需求文档等 Frank 决定；状态展示只负责说准，不顺手改行为。
+  L4.push(["出站发布", st.suspended ? "暂停中，进展留在本地不发出"
+    : st.autoPublish === true ? "每轮自动发布"
+    : st.autoPublish === false
+      ? "配置已关，但进展仍会发出（Stop 与兜底排空不读这个开关）"
+      : "状态不可用（读不到发布配置）"]);
+
+  const L5 = [["待发布答复", st.pending + " 条" + (st.pending && st.suspended ? "（恢复后会发出）" : "")]];
+
+  return {
+    layers: [
+      { n: 1, title: "运行端点连接", rows: L1 },
+      { n: 2, title: "事件订阅", rows: L2 },
+      { n: 3, title: "精确通道绑定", rows: L3 },
+      { n: 4, title: "交互策略", rows: L4 },
+    ],
+    pendingEvents: L5,
+    connectivity,
+    suspended: st.suspended === true,
+  };
+}
+
+/**
+ * 渲染。两列，标签左值右 —— 卡片在手机上较窄，不做复杂表格。
+ *
+ * 刻意**不出总判断**：分别陈述才符合这套架构契约。
+ */
+export function renderLayeredStatus(view) {
+  const lines = [];
+  const put = (rows) => {
+    for (const [k, v] of rows) lines.push("  " + k.padEnd(6, "　") + "  " + v);
+  };
+  for (const layer of view.layers) {
+    lines.push("第 " + layer.n + " 层 · " + layer.title);
+    put(layer.rows);
+    lines.push("");
+  }
+  lines.push("待处理事件");
+  put(view.pendingEvents);
+
+  if (view.connectivity) {
+    lines.push("");
+    // 同一个项目的另一条链路（比如 cc2cd 的群级绑定）。按语义它其实属于第 2 层，
+    // 但当前协议只有 kind 和 scope，判不出一条连接是订阅、绑定还是策略。
+    // **判不出就不硬归类** —— 等协议加上受控的 relation_type 再并进对应层。
+    lines.push("本项目的其他链路（尚未分层）");
+    lines.push(view.connectivity);
+  }
+  if (view.suspended) {
+    lines.push("", "恢复：node scripts/bind-project.mjs --apply（会复用原话题，不新建）");
+  }
+  return lines.join("\n");
+}

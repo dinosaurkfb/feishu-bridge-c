@@ -9,7 +9,8 @@
  *
  * 用法：
  *   node scripts/register-status-provider.mjs --id cc2cd \
- *     --script /abs/provider.mjs --kinds transport -- --binding /abs/binding.json
+ *     --script /abs/provider.mjs --kinds transport --project-root /abs/project \
+ *     -- --provider-id cc2cd --binding /abs/binding.json
  *   ...同上 --apply
  *
  * `--` 之后的都是传给 provider 的参数，原样存下，执行时逐项传递、不做展开。
@@ -26,6 +27,7 @@ import {
 
 const REASON_TEXT = {
   provider_id_invalid: "--id 只能是小写字母数字、下划线和连字符，且以字母数字开头",
+  project_root_not_absolute: "--project-root 必须是绝对路径",
   executable_not_absolute: "--executable 必须是绝对路径",
   script_not_absolute: "--script 必须是绝对路径",
   allowed_kinds_invalid: "--kinds 只能是 " + PROVIDER_KINDS.join(" / "),
@@ -69,7 +71,7 @@ function splitArgv(argv) {
  * "只接受这几个"和"拒绝这几个"差一个拼写错误，而破坏性操作那边差的是整个登记表。
  */
 const FLAGS = new Set(["apply", "replace", "unregister"]);
-const OPTIONS = new Set(["id", "script", "executable", "kinds", "display-name"]);
+const OPTIONS = new Set(["id", "script", "executable", "kinds", "display-name", "project-root"]);
 
 export function parseControl(tokens) {
   const seen = new Map();
@@ -128,6 +130,7 @@ function normalize(entry) {
     args: [...(entry.args ?? [])],
     allowed_kinds: [...(entry.allowed_kinds ?? [])].sort(),
     display_name: entry.display_name ?? null,
+    project_root: entry.project_root ?? null,
     enabled: entry.enabled !== false,
   };
 }
@@ -236,6 +239,8 @@ function main() {
   const executable = arg("executable") ?? process.execPath;
   const kinds = (arg("kinds") ?? "transport").split(",").map((k) => k.trim()).filter(Boolean);
   const displayName = arg("display-name");
+  // 归属哪个项目。默认取当前目录 —— 登记通常就在那个项目里做。
+  const projectRoot = path.resolve(arg("project-root") ?? process.cwd());
   const file = statusProvidersPath();
 
   if (!id || (!script && !unregister)) {
@@ -248,7 +253,7 @@ function main() {
 
   const entry = unregister ? { id } : {
     id, protocol: PROVIDER_PROTOCOL, executable, script,
-    args: passthrough, allowed_kinds: kinds,
+    args: passthrough, allowed_kinds: kinds, project_root: projectRoot,
     ...(displayName ? { display_name: displayName } : {}),
   };
 
@@ -270,6 +275,7 @@ function main() {
     console.log("执行      " + executable);
     console.log("参数      " + (entry.args.length > 0 ? entry.args.join(" ") : "（无）"));
     console.log("授权范围  " + kinds.join(", "));
+    console.log("归属项目  " + projectRoot);
   }
   console.log("结果      " + describePlan(plan));
 

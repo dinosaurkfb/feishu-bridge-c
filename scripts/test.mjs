@@ -77,9 +77,14 @@ import {
 } from "./canonical-event.mjs";
 import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
 import { bindingToConnections } from "./group-binding-status.mjs";
+import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
 import {
-  collectConnectivity, collectStatusProviders, loadStatusProviders, renderConnectivity,
-  validateProviderRegistry, validateProviderReport,
+  ENDPOINT_SELF_CHECK, composeLayeredStatus, endpointFacts, lastSuccessfulDispatchAt,
+  renderLayeredStatus, subscriptionFacts,
+} from "./layered-status.mjs";
+import {
+  collectConnectivity, collectProjectConnectivity, collectStatusProviders, loadStatusProviders,
+  renderConnectivity, validateProviderRegistry, validateProviderReport,
 } from "./status-providers.mjs";
 import {
   MAPPING_DISPOSITION, MAPPING_POLICY_ID, MAPPING_POLICY_VERSION,
@@ -7017,13 +7022,14 @@ test("深比较要含 enabled：重登记一条已停用的项不许报「无变
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-en-"));
   const file = path.join(dir, "providers.json");
   const script = path.resolve("scripts", "group-binding-status.mjs");
+  // 归属跟命令一致，这样唯一的差别就是 enabled —— 断言才指得准。
   fs.writeFileSync(file, JSON.stringify({ providers: [{
     id: "cc2cd", protocol: "feishu-bridge-status/v1", executable: process.execPath,
-    script, args: [], allowed_kinds: ["transport"], enabled: false,
+    script, args: [], allowed_kinds: ["transport"], project_root: "/abs/proj", enabled: false,
   }] }));
   const run = spawnSync(process.execPath, [
     path.resolve("scripts", "register-status-provider.mjs"),
-    "--id", "cc2cd", "--script", script,
+    "--id", "cc2cd", "--script", script, "--project-root", "/abs/proj",
   ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
   // 报"无变化"而它仍然停用，等于说"已经装好了"却没生效。
   assert.notEqual(run.status, 0);
@@ -7144,6 +7150,470 @@ test("直接执行时参数校验仍然严格", () => {
   assert.notEqual(run.status, 0);
   assert.match(run.stderr, /unknown_option/u);
 });
+
+const layeredSt = (over = {}) => ({
+  ok: true, displayName: "示例项目", level: "project", suspended: false,
+  activeGeneration: 4, activeGenerationMessages: 22, activeGenerationThreshold: 30,
+  pendingGeneration: null, readOnlyGenerations: 3, inboundBound: true,
+  expiresAt: "2027-08-19T00:00:00.000Z", pending: 0,
+  policy: { ok: true, label: "Mapping", policyId: "mapping", policyVersion: "1.0" },
+  source: "registry", autoPublish: true,
+  ...over,
+});
+const layeredView = (over = {}, subOver = {}) => composeLayeredStatus({
+  st: layeredSt(over),
+  endpoint: { runtime: "Claude Code", agentName: "M5Claude", install: "ok", installReason: null,
+    version: "abc123", selfCheck: ENDPOINT_SELF_CHECK, lastInboundAt: null,
+    ...(subOver.endpoint ?? {}) },
+  subscription: subOver.subscription ?? { ok: true, items: [], pendingCount: 0 },
+  connectivity: subOver.connectivity ?? null,
+  now: Date.parse("2026-08-23T12:00:00.000Z"),
+});
+
+test("四层视图：五个区都在，且不出总判断", () => {
+  const text = renderLayeredStatus(layeredView());
+  for (const [n, title] of [[1, "运行端点连接"], [2, "事件订阅"], [3, "精确通道绑定"], [4, "交互策略"]]) {
+    assert.match(text, new RegExp("第 " + n + " 层 · " + title, "u"));
+  }
+  assert.match(text, /待处理事件/u, "待处理事件是需求要求的第五区");
+
+  // 四层可能各自处于不同状态，一个总判断会把它们抹平成一句话。
+  assert.doesNotMatch(text, /✅/u);
+  assert.doesNotMatch(text, /已接入/u);
+
+  // 每层的事实要落在自己那层：待发条数不许被塞进端点层或绑定层。
+  const sections = text.split(/第 \d 层 · |待处理事件/u);
+  assert.equal(sections.filter((x) => x.includes("待发布答复")).length, 1);
+  assert.match(text.slice(text.indexOf("待处理事件")), /待发布答复/u);
+});
+
+test("第 1 层不许把未自检说成在线", () => {
+  // 用"不含在线二字"来验是错的：正文里合法地有"不代表当前在线"。
+  // 子串缺席分不出肯定和否定，所以逐字断言这两行的确切内容。
+  const rowOf = (text, label) => {
+    const line = text.split("\n").find((l) => l.trim().startsWith(label));
+    return line ? line.trim().replace(/^\S+\s+/u, "") : null;
+  };
+
+  const plain = renderLayeredStatus(layeredView());
+  assert.equal(rowOf(plain, "实时自检"), "未自检（端点自检 FR-1.4 尚未实现）");
+  assert.equal(rowOf(plain, "最近入站"), null, "没有历史证据时不该凭空出现这一行");
+
+  const withLog = renderLayeredStatus(layeredView({}, {
+    endpoint: { runtime: "Claude Code", installed: true, version: "abc123",
+      selfCheck: ENDPOINT_SELF_CHECK, lastInboundAt: Date.parse("2026-08-23T10:00:00.000Z") },
+  }));
+  // 历史证据的措辞必须停在"过去某刻工作过"，不能滑成"在线"。
+  assert.equal(rowOf(withLog, "最近入站"), "2 小时前（历史证据，不代表当前在线）");
+  assert.equal(rowOf(withLog, "实时自检"), "未自检（端点自检 FR-1.4 尚未实现）",
+    "有历史证据也不得把自检结论改掉");
+
+  // 路由登记只证明配置存在，日志只证明过去工作过 —— 都不该升级成一个在线判断。
+  assert.equal(ENDPOINT_SELF_CHECK, "not_implemented");
+});
+
+test("最近入站只取时间戳，不碰日志里的标识", () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-log-")), "aily.log");
+  fs.writeFileSync(file, [
+    "2026-08-23T09:00:00.000Z caller mismatch: got=none",
+    "2026-08-23T10:00:00.000Z dispatch -> cc2cd (session_registration)",
+    "2026-08-23T11:00:00.000Z caller mismatch: got=none",
+  ].join("\n"));
+  // 取的是最后一次**成功分发**，不是最后一行。
+  assert.equal(lastSuccessfulDispatchAt(file), Date.parse("2026-08-23T10:00:00.000Z"));
+  assert.equal(lastSuccessfulDispatchAt(path.join(path.dirname(file), "nope.log")), null,
+    "读不到日志不是错误");
+
+  const facts = endpointFacts({
+    runtimeDir: path.dirname(file), inboundLog: file,
+    verify: () => ({ ok: false, reason: "current_absent" }),
+  });
+  assert.equal(facts.selfCheck, "not_implemented");
+  assert.equal(facts.install, "absent", "没有 current 符号链接就是没装");
+});
+
+test("第 2 层脱敏：locator 字段一个都不出，群名不许用 ID 顶替", () => {
+  const model = {
+    ok: true,
+    endpoint_id: "ep_SECRET111111",
+    subscriptions: [{
+      subscription_id: "sub_SECRET222222", domain_id: "dom_SECRET333333", status: "active",
+      scope: {
+        agent_uid: "agent_SECRET444", transport_open_id: "ou_SECRET555555",
+        chat_id: "oc_SECRET666666", sender_ids: ["ou_SECRET777777"],
+        event_types: ["im.message.receive"],
+      },
+    }],
+    pending_bindings: [{ legacy_key: "lk_SECRET888", pending_token: "pt_SECRET999" }],
+  };
+  const facts = subscriptionFacts(model);
+  assert.equal(facts.ok, true);
+  assert.equal(facts.items[0].senderCount, 1, "只出数量，不出身份");
+  assert.equal(facts.items[0].groupName, null, "不传群名时不许拿 chat_id 顶替");
+  // 传了就用 —— 群名是模板里本来就有的可展示字段。
+  assert.equal(subscriptionFacts(model, { groupName: "Frank智能体们" }).items[0].groupName,
+    "Frank智能体们");
+
+  const text = renderLayeredStatus(layeredView({}, { subscription: facts }));
+  for (const secret of ["ep_SECRET111111", "sub_SECRET222222", "dom_SECRET333333",
+    "agent_SECRET444", "ou_SECRET555555", "oc_SECRET666666", "ou_SECRET777777",
+    "lk_SECRET888", "pt_SECRET999"]) {
+    assert.equal(text.includes(secret), false, "不得出现 " + secret);
+  }
+  // 投影里只有 chat_id 没有群名，拿 ID 顶替就等于把 locator 打出来了。
+  assert.match(text, /群名不可用/u);
+  assert.match(text, /授权发送者.*1 个/u);
+  assert.match(text, /im\.message\.receive/u);
+  assert.match(text, /待认领绑定.*1 条/u);
+});
+
+test("第 2 层读不到时说读不到，不装作没有订阅", () => {
+  const facts = subscriptionFacts({ ok: false, reason: "projection_invalid" });
+  assert.equal(facts.ok, false);
+  const text = renderLayeredStatus(layeredView({}, { subscription: facts }));
+  assert.match(text, /读不到（projection_invalid）/u);
+  assert.doesNotMatch(text, /本项目没有事件订阅/u, "读不到和没有是两回事");
+});
+
+test("同项目的其他链路暂不硬归类", () => {
+  const text = renderLayeredStatus(layeredView({}, { connectivity: "  cc2cd  消息运输 · 某群" }));
+  // 当前 provider 协议只有 kind 和 scope，判不出一条连接是订阅、绑定还是策略。
+  assert.match(text, /本项目的其他链路（尚未分层）/u);
+  assert.match(text, /cc2cd {2}消息运输/u);
+  // 判不出就别塞进某一层。
+  const layer2 = text.slice(text.indexOf("第 2 层"), text.indexOf("第 3 层"));
+  assert.equal(layer2.includes("cc2cd"), false);
+});
+
+test("第 4 层的自动轮转补出还剩几条", () => {
+  const text = renderLayeredStatus(layeredView());
+  assert.match(text, /自动轮转.*22 \/ 30 条（还剩 8 条）/u);
+  // 原始值本身不够用时才补，且补的是算出来的，不是编的。
+  const near = renderLayeredStatus(layeredView({ activeGenerationMessages: 30 }));
+  assert.match(near, /还剩 0 条/u);
+});
+
+test("status 只看当前项目的链路", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-scope-"));
+  const file = path.join(dir, "providers.json");
+  const mine = path.join(dir, "mine");
+  const theirs = path.join(dir, "theirs");
+  const entry = (id, root) => ({
+    id, protocol: "feishu-bridge-status/v1", executable: process.execPath,
+    script: "/abs/x.mjs", allowed_kinds: ["transport"],
+    ...(root === null ? {} : { project_root: root }),
+  });
+  fs.writeFileSync(file, JSON.stringify({ providers: [
+    entry("mine", mine), entry("theirs", theirs), entry("nowhere", null),
+  ] }));
+  const run = () => ({ ok: true, connections: [] });
+
+  const view = collectProjectConnectivity({ root: mine, providersFile: file, run });
+  assert.deepEqual(view.sections.map((x) => x.id), ["mine"],
+    "别的项目的链路不该出现在本项目的 status 里");
+
+  // 换个项目根，看到的就是那个项目的。
+  assert.deepEqual(
+    collectProjectConnectivity({ root: theirs, providersFile: file, run }).sections.map((x) => x.id),
+    ["theirs"]);
+
+  // 没声明归属的归不了属 —— 不进任何项目视图（那是 doctor 该管的机器级问题）。
+  for (const root of [mine, theirs]) {
+    assert.equal(
+      collectProjectConnectivity({ root, providersFile: file, run }).sections
+        .some((x) => x.id === "nowhere"), false);
+  }
+
+  // 机器全景仍然算得出来，只是不给 status 用。
+  const machine = collectConnectivity({
+    routesFile: path.join(dir, "no-routes.json"), providersFile: file, run,
+  });
+  assert.deepEqual(machine.sections.map((x) => x.id).sort(), ["mine", "nowhere", "theirs"]);
+});
+
+test("归属项目必须是绝对路径", () => {
+  const bad = validateProviderRegistry({ providers: [{
+    id: "x", protocol: "feishu-bridge-status/v1", executable: process.execPath,
+    script: "/abs/x.mjs", allowed_kinds: ["transport"], project_root: "relative/dir",
+  }] });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.problem, "project_root_not_absolute");
+
+  const ok = validateProviderRegistry({ providers: [{
+    id: "x", protocol: "feishu-bridge-status/v1", executable: process.execPath,
+    script: "/abs/x.mjs", allowed_kinds: ["transport"], project_root: "/abs/proj",
+  }] });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.providers[0].projectRoot, "/abs/proj");
+});
+
+test("登记命令记录归属项目，且归属变化不算无变化", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-scope2-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"),
+    "--id", "cc2cd", "--script", script, ...args,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+
+  const first = cli(["--project-root", "/abs/one", "--apply"]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.match(first.stdout, /归属项目 {2}\/abs\/one/u, "预览要说清这条算哪个项目的");
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf-8")).providers[0].project_root, "/abs/one");
+
+  // 换归属 = 换这条链路算谁的，不能报成"无变化"。
+  const moved = cli(["--project-root", "/abs/two", "--apply"]);
+  assert.notEqual(moved.status, 0);
+  assert.match(moved.stderr, /project_root/u);
+
+  assert.match(cli(["--project-root", "/abs/one", "--apply"]).stdout, /无需改动/u);
+});
+
+test("项目范围要管住执行，不只管住显示", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-exec-"));
+  const file = path.join(dir, "providers.json");
+  const entry = (id, root) => ({
+    id, protocol: "feishu-bridge-status/v1", executable: process.execPath,
+    script: "/abs/x.mjs", allowed_kinds: ["transport"], project_root: root,
+  });
+  fs.writeFileSync(file, JSON.stringify({ providers: [
+    entry("mine", "/p/mine"), entry("theirs", "/p/theirs"), entry("third", "/p/third"),
+  ] }));
+
+  const executed = [];
+  const run = (p) => { executed.push(p.id); return { ok: true, connections: [] }; };
+  const view = collectProjectConnectivity({ root: "/p/mine", providersFile: file, run });
+
+  assert.deepEqual(view.sections.map((x) => x.id), ["mine"]);
+  // 只管显示不管执行，等于把别的项目的脚本在当前交互会话里跑了一遍。
+  // 范围要是只管显示，那它就不是范围。
+  assert.deepEqual(executed, ["mine"], "别的项目的 provider 一个都不该被执行");
+});
+
+test("停用的 provider 连执行都不该发生", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-exec2-"));
+  const file = path.join(dir, "providers.json");
+  fs.writeFileSync(file, JSON.stringify({ providers: [{
+    id: "off", protocol: "feishu-bridge-status/v1", executable: process.execPath,
+    script: "/abs/x.mjs", allowed_kinds: ["transport"], project_root: "/p/mine", enabled: false,
+  }] }));
+  const executed = [];
+  const view = collectProjectConnectivity({
+    root: "/p/mine", providersFile: file,
+    run: (p) => { executed.push(p.id); return { ok: true, connections: [] }; },
+  });
+  assert.deepEqual(executed, []);
+  assert.equal(view.sections[0].state, "disabled");
+});
+
+test("未绑定项目仍要展示四层，且 not_bound 与读不出来分开", () => {
+  const endpoint = { runtime: "Claude Code", agentName: "M5Claude", install: "ok",
+    installReason: null, version: "abc123", selfCheck: ENDPOINT_SELF_CHECK, lastInboundAt: null };
+  const sub = { ok: true, items: [], pendingCount: 0 };
+
+  const notBound = renderLayeredStatus(composeLayeredStatus({
+    st: { ok: false, reason: "not_bound" }, endpoint, subscription: sub,
+  }));
+  // 四层模型在最需要它的时候消失，是上一版的表现。
+  for (const n of [1, 2, 3, 4]) assert.match(notBound, new RegExp("第 " + n + " 层", "u"));
+  assert.match(notBound, /尚未绑定/u);
+  assert.match(notBound, /尚无通道策略/u);
+  assert.match(notBound, /不适用（尚未绑定）/u);
+  // 第 1、2 层照样报已有事实。
+  assert.match(notBound, /M5Claude/u);
+
+  // 还没接 和 配错了/文件坏了 是两件事。
+  const broken = renderLayeredStatus(composeLayeredStatus({
+    st: { ok: false, reason: "config_unreadable" }, endpoint, subscription: sub,
+  }));
+  assert.match(broken, /状态不可读（config_unreadable）/u);
+  assert.doesNotMatch(broken, /尚未绑定/u);
+});
+
+test("能读到 current 链接不等于装好了", () => {
+  const facts = (verify) => endpointFacts({ verify: () => verify });
+  assert.equal(facts({ ok: true }).install, "ok");
+  assert.equal(facts({ ok: false, reason: "current_absent" }).install, "absent");
+  // 损坏、漂移、链接异常都不是"正常"，也不是"没装"。
+  for (const reason of ["version_dir_missing", "manifest_invalid", "file_drifted"]) {
+    const f = facts({ ok: false, reason });
+    assert.equal(f.install, "broken", reason);
+    assert.equal(f.installReason, reason);
+  }
+
+  const endpoint = { runtime: "Claude Code", agentName: null, install: "broken",
+    installReason: "version_dir_missing", version: "does-not-exi",
+    selfCheck: ENDPOINT_SELF_CHECK, lastInboundAt: null };
+  const text = renderLayeredStatus(composeLayeredStatus({
+    st: { ok: false, reason: "not_bound" }, endpoint, subscription: { ok: true, items: [], pendingCount: 0 },
+  }));
+  assert.match(text, /不可用（version_dir_missing）/u);
+  assert.doesNotMatch(text, /安装状态.*已安装/u);
+});
+
+test("没通过校验的版本号不许冒充运行时版本", () => {
+  const broken = endpointFacts({ verify: () => ({ ok: false, reason: "version_dir_missing" }) });
+  // 只读符号链接 basename 的话，坏掉的 runtime 会同时显示"看起来像真的版本号"
+  // 和"运行时不可用" —— 那个数字没有任何东西背书。
+  assert.equal(broken.version, null);
+
+  const ok = endpointFacts({ verify: () => ({ ok: true, version: "0123456789abcdef" }) });
+  assert.equal(ok.version, "0123456789ab", "通过校验才叫版本");
+
+  const endpoint = { runtime: "Claude Code", agentName: null, install: "broken",
+    installReason: "version_dir_missing", version: null, linkCandidate: "deadbeef1234",
+    selfCheck: ENDPOINT_SELF_CHECK, lastInboundAt: null };
+  const text = renderLayeredStatus(composeLayeredStatus({
+    st: { ok: false, reason: "not_bound" }, endpoint,
+    subscription: { ok: true, items: [], pendingCount: 0 },
+  }));
+  assert.match(text, /未通过校验（链接候选 deadbeef1234）/u);
+});
+
+test("出站发布按真实配置渲染，读不到不许默认成开启", () => {
+  const endpoint = { runtime: "Claude Code", agentName: null, install: "ok", installReason: null,
+    version: "abc123", selfCheck: ENDPOINT_SELF_CHECK, lastInboundAt: null };
+  const sub = { ok: true, items: [], pendingCount: 0 };
+  const render = (autoPublish) => renderLayeredStatus(composeLayeredStatus({
+    st: { ...layeredSt(), autoPublish }, endpoint, subscription: sub,
+  }));
+  assert.match(render(true), /出站发布.*每轮自动发布/u);
+  // 配置明确关掉时仍显示"每轮自动发布"，是在报一个没查过的结论。
+  // 但也不能说成"仅入队" —— 这个开关管不住兜底排空，那是承诺它做不到的事。
+  assert.match(render(false), /出站发布.*配置已关，但进展仍会发出（Stop 与兜底排空不读这个开关）/u);
+  // 读不到配置更不能默认成开启。
+  assert.match(render(null), /出站发布.*状态不可用（读不到发布配置）/u);
+  assert.match(render(undefined), /出站发布.*状态不可用（读不到发布配置）/u);
+});
+
+test("发布开关关闭时，兜底排空照样走到发布准备", () => {
+  // 上一版这条是**假阳性**：夹具不是有效绑定，drainProject 直接返回
+  // {status:"error", reason:"not_bound"}，而断言只要求"不等于 empty"，
+  // 于是全绿却什么都没证明。我一边说"这条钉的是实际行为"，一边写了个走不到那一步的夹具。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pub-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", auto_publish_on_completion: false,
+  }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_fixture", claude_session_id: null,
+    channel_generation_id: "gen-1",
+  }));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
+    kind: "progress", text: "待发", created_at: new Date().toISOString(), published_at: null,
+  }));
+
+  // 开关关着，它仍然一路走到发布准备 —— 这才是"兜底排空不读这个开关"的行为证据。
+  const drained = drainProject({ root: dir, claudeSessionId: null, dryRun: true });
+  assert.equal(drained.status, "dry_run", "有效绑定下必须走到发布准备，否则这条断言什么都没证明");
+  assert.equal(drained.count, 1);
+});
+
+test("发布开关只被两条路径读取，而它们不是主路径", () => {
+  // 这几条是结构断言，管的是"哪个文件读了这个配置键"——它本身就是个源码事实。
+  // 上面那条才是行为证据。两层都要：行为证明兜底会发，结构说明为什么会发。
+  for (const rel of ["inbound.mjs", "watch-and-publish.mjs"]) {
+    assert.match(fs.readFileSync(path.resolve("scripts", rel), "utf-8"),
+      /auto_publish_on_completion !== false/u, rel + " 应当读取发布开关");
+  }
+  // 不读它的这两条恰好是 Claude 侧主路径：每轮 Stop、30 分钟兜底。
+  for (const rel of ["drain-outbox.mjs", "stop-hook.mjs"]) {
+    assert.doesNotMatch(fs.readFileSync(path.resolve("scripts", rel), "utf-8"),
+      /auto_publish_on_completion/u,
+      rel + " 目前不读这个开关 —— 改了它就要同时改 status 的措辞");
+  }
+  // Stop 每轮都调排空，所以"关掉开关"在 Claude 侧几乎不改变任何事。
+  assert.match(fs.readFileSync(path.resolve("scripts", "stop-hook.mjs"), "utf-8"),
+    /drainProject\(/u, "Stop 每轮排空是这条结论的前提");
+});
+
+test("绑定名称不冒充飞书当前话题标题", () => {
+  const text = renderLayeredStatus(layeredView());
+  // 用户可以在飞书里改名，本地没有读取当前标题的权威事实 ——
+  // 叫它"话题名"就是在声称一件我们没查过的事。
+  assert.match(text, /绑定名称/u);
+  assert.doesNotMatch(text, /^ *话题 /mu);
+});
+
+test("投影覆盖不到不等于没有订阅", () => {
+  const endpoint = { runtime: "Claude Code", agentName: null, install: "ok", installReason: null,
+    version: "abc123", selfCheck: ENDPOINT_SELF_CHECK, lastInboundAt: null };
+  const empty = { ok: true, items: [], pendingCount: 0 };
+
+  // 绑定住在项目内文件里，而订阅投影是从 registry 建的。
+  const projectFiles = renderLayeredStatus(composeLayeredStatus({
+    st: { ...layeredSt(), source: "project-files" }, endpoint, subscription: empty,
+  }));
+  assert.match(projectFiles, /不可用（本项目绑定走项目内文件，订阅投影未覆盖）/u);
+
+  // 走 registry 的项目确实没有订阅时，才可以说"没有"。
+  const fromRegistry = renderLayeredStatus(composeLayeredStatus({
+    st: { ...layeredSt(), source: "registry" }, endpoint, subscription: empty,
+  }));
+  assert.match(fromRegistry, /本项目没有事件订阅/u);
+});
+
+test("轮转演练本身要是绿的 —— 它是验收证据，烂了就没人知道", () => {
+  // 演练脚本平时是人跑的。把它挂进套件，是为了让"演练自己坏了"当场亮，
+  // 而不是等到要拿它当证据的那天才发现它早就跑不动了。
+  for (const drill of [drillFailureRetry(), drillStuckPreparing()]) {
+    for (const step of drill.steps) {
+      assert.equal(step.pass, true, drill.name + " / " + step.name + "：" + step.detail);
+    }
+    assert.ok(drill.steps.length >= 3, drill.name + " 的步骤不该变少");
+  }
+});
+
+test("按文档里那条命令登记，聚合方要真的能取到状态", () => {
+  // 上一版文档示例漏了 --provider-id，按它登记之后 provider 以 exit 2 失败，
+  // 而文档、安装器示例和测试都没人发现 —— 一条跑不起来的示例比没有示例更糟。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-e2e-"));
+  const providersFile = path.join(dir, "providers.json");
+  const bindingFile = path.join(dir, "binding.json");
+  fs.writeFileSync(bindingFile, JSON.stringify({
+    bind_scope: "chat", status: "active", chat_id: "oc_SECRET123456",
+    chat_name: "Claude2Codex", expires_at: "2099-01-01T00:00:00.000Z",
+  }));
+
+  // **把命令从文档里抠出来真跑**，不是照着抄一份 —— 抄一份只能证明"正确的写法能跑"，
+  // 拦不住文档自己漂移。上一版文档漏了 --provider-id，而没有任何东西发现。
+  const doc = fs.readFileSync(
+    path.resolve("docs", "implementation", "status-provider-protocol.md"), "utf-8");
+  const block = doc.slice(doc.indexOf("```bash") + 7);
+  const argv = block.slice(0, block.indexOf("```"))
+    .replaceAll("\\\n", " ")
+    .trim().split(/\s+/u)
+    .map((t) => t === "/abs/provider.mjs" ? path.resolve("scripts", "group-binding-status.mjs")
+      : t === "/abs/project" ? dir
+      : t === "/abs/binding.json" ? bindingFile
+      : t);
+  assert.equal(argv[0], "node", "文档里的示例应当是一条 node 命令");
+  assert.ok(argv.includes("--"), "示例应当带透传段");
+
+  const registered = spawnSync(process.execPath, [
+    path.resolve(argv[1]), ...argv.slice(2, argv.indexOf("--")), "--apply",
+    "--", ...argv.slice(argv.indexOf("--") + 1),
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: providersFile } });
+  assert.equal(registered.status, 0, "文档里那条命令必须能跑通：" + registered.stderr);
+
+  // 然后让聚合方真的执行它 —— 不注入 run，走真实 execFile。
+  const view = collectProjectConnectivity({ root: dir, providersFile });
+  assert.equal(view.sections.length, 1);
+  assert.equal(view.sections[0].state, "ok",
+    "按文档登记之后必须取得到状态：" + (view.sections[0].reason ?? ""));
+  assert.deepEqual(view.sections[0].connections, [{
+    kind: "transport", state: "active", scope: "chat",
+    groupName: "Claude2Codex", topicName: null,
+  }]);
+
+  // 顺带确认渲染出去的东西不带 locator。
+  assert.equal(renderConnectivity(view).includes("oc_SECRET123456"), false);
+});
+
 
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

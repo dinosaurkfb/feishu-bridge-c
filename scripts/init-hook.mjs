@@ -103,6 +103,8 @@ async function main() {
   // 没有机器级模板就等于这台机器没装桥 —— 不该在这里教人怎么装，静默退出。
   if (!tpl.ok) process.exit(0);
 
+  // 这里用 bridge_root 只是判断「这台机器配过桥没有」，**不拿它定位任何代码**。
+  // 本钩子不执行桥的其他脚本，所以不存在入站钩子那种"从模板拼路径会落回开发克隆"的问题。
   if (typeof tpl.template.bridge_root !== "string" || !tpl.template.bridge_root) process.exit(0);
 
   const context = composeAsk();

@@ -70,61 +70,88 @@ function pickNode() {
 
 const NODE_BIN = pickNode();
 
+/** 埋进命令里的显式归属标记：与脚本路径无关，换克隆、换 runtime 都认得出自己那条。 */
+const HOOK_TAG = "FEISHU_BRIDGE_HOOK:";
+
 // 外层 if 是为了「node 或脚本不在了」时不把钩子报错弹到本机每一次会话结束上。
 // 但也绝不能真的静默：else 分支往出站日志里留一行，否则出站停摆将无从发现。
 const COMMAND =
   `if [ -x '${NODE_BIN}' ] && [ -r '${HOOK_SCRIPT}' ]; then '${NODE_BIN}' '${HOOK_SCRIPT}'; ` +
   `else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1; ` +
-  `printf '%s hook-unavailable node=${NODE_BIN}\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> '${LOG}' 2>/dev/null || :; fi`;
-
-/**
- * 幂等键**不能**再用脚本绝对路径。
- *
- * 旧写法是 `MARKER = HOOK_SCRIPT`，也就是安装它的那个克隆的绝对路径。于是第二个克隆
- * 跑一次安装，路径不同 → 找不到已有那条 → **追加**而不是覆盖。本机现在就有两份 Stop
- * 钩子和两份 UserPromptSubmit 钩子，指向两个代码版本可能不同的克隆，并发操作同一份
- * outbox 和同一份 Dialogue 状态。迁到 runtime 而不改这里，只会多出第三份。
- *
- * 改成按**脚本文件名**认领，并且要求命令里带 feishu-bridge 字样 —— 前者跨克隆、跨
- * runtime 都稳定，后者保证不会误伤 .orca 或别人碰巧同名的钩子。
- */
-const ownsScript = (command, basename) =>
-  typeof command === "string" &&
-  command.includes("/scripts/" + basename) &&
-  command.includes("feishu-bridge");
-
-/** 一条 settings 条目里，只要有任一 hook 命令是我们的，这条就归我们。 */
-const entryOwns = (entry, basename) =>
-  (entry?.hooks ?? []).some((h) => ownsScript(h?.command, basename));
-
-/**
- * 收编：把**所有**属于自己的条目都摘掉，再按需要放回恰好一条。
- *
- * 只改第一条匹配项是不够的 —— 那正是重复条目长期存活的原因：安装器每次都只看见
- * 自己那条，另一条永远没人管。返回被摘掉的条数，装完要报出来给人看。
- */
-const claimSingleEntry = (list, basename, entry) => {
-  let removed = 0;
-  for (let i = list.length - 1; i >= 0; i -= 1) {
-    if (entryOwns(list[i], basename)) { list.splice(i, 1); removed += 1; }
-  }
-  if (entry) list.push(entry);
-  return removed;
-};
+  `printf '%s hook-unavailable node=${NODE_BIN}\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> '${LOG}' 2>/dev/null || :; fi` +
+  ` # ${HOOK_TAG}stop-hook.mjs`;
 
 // /init 钩子跑在本机**每一次提交 prompt** 上，比 Stop 更热。
 // 跟 Stop 那条的区别：这里的 else 分支不往日志里写。UserPromptSubmit 的 stdout 会被
 // 当成上下文注入，每敲一句话就往日志追一行也没有意义 —— 缺 node 时它该彻底闭嘴。
 const INIT_COMMAND =
   `if [ -x '${NODE_BIN}' ] && [ -r '${INIT_HOOK_SCRIPT}' ]; then '${NODE_BIN}' '${INIT_HOOK_SCRIPT}'; ` +
-  `else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1 || :; fi`;
+  `else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1 || :; fi` +
+  ` # ${HOOK_TAG}init-hook.mjs`;
 
 // 入站钩子：让「任何 Aily 回合先进入运输层」成为硬约束，而不是靠模型记得调技能。
 // 跟 /init 钩子同一个事件（UserPromptSubmit），但判据完全不同、互不干扰：
 // 那个认 prompt 是不是 /init，这个认环境里有没有 daemon 注入的 AILY_CLI_*。
 const INBOUND_HOOK_COMMAND =
   `if [ -x '${NODE_BIN}' ] && [ -r '${INBOUND_HOOK_SCRIPT}' ]; then '${NODE_BIN}' '${INBOUND_HOOK_SCRIPT}'; ` +
-  `else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1 || :; fi`;
+  `else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1 || :; fi` +
+  ` # ${HOOK_TAG}inbound-hook.mjs`;
+
+/**
+ * 钩子归属判定。这里有两条必须同时满足的约束，缺一条都会出事：
+ *
+ *   宽了会误删。settings 是共享的，`.orca` 的整套钩子就在同一个数组里；而且**一条 entry
+ *   里可以有多个 hook**，其中只有一条是我们的。按 entry 整条删，会把同一条里别人的钩子
+ *   一起删掉，而且删得很安静。
+ *   窄了收敛不掉。旧写法用克隆绝对路径当键（`MARKER = HOOK_SCRIPT`），第二个克隆路径不同
+ *   就变成追加而非覆盖 —— 本机两份 Stop 钩子、两份 UserPromptSubmit 钩子就是这么来的。
+ *
+ * 所以：新装的命令里埋一个**与路径无关的显式标记**，认它；同时对历史遗留的命令按
+ * 安装器**当初生成的确切形态**严格解析（不是子串包含），只为迁移那一次。
+ */
+/** 安装器历史上生成过的命令形态。严格到整条命令的开头，不给"碰巧提到这个路径"留空间。 */
+const LEGACY_HOOK_SHAPES = {
+  "stop-hook.mjs":
+    /^if \[ -x '[^']+' \] && \[ -r '[^']*\/scripts\/stop-hook\.mjs' \]; then /u,
+  "init-hook.mjs":
+    /^if \[ -x '[^']+' \] && \[ -r '[^']*\/scripts\/init-hook\.mjs' \]; then /u,
+  "inbound-hook.mjs":
+    /^if \[ -x '[^']+' \] && \[ -r '[^']*\/scripts\/inbound-hook\.mjs' \]; then /u,
+};
+
+const ownsHook = (hook, basename) => {
+  const command = hook?.command;
+  if (typeof command !== "string") return false;
+  if (command.includes(HOOK_TAG + basename)) return true;
+  return LEGACY_HOOK_SHAPES[basename]?.test(command) ?? false;
+};
+
+const countHooks = (list, basename) => (list ?? [])
+  .reduce((n, entry) => n + (entry?.hooks ?? []).filter((h) => ownsHook(h, basename)).length, 0);
+
+/**
+ * 收编：摘掉**所有**属于自己的 hook，再放回恰好一条。
+ *
+ * 两个细节都来自实际教训：
+ *   摘"所有"而不是第一条 —— 只处理首个匹配项正是重复条目长期存活的原因，
+ *   安装器每次都只看见自己那条，另一条永远没人管。
+ *   摘的是 **hook** 而不是 entry —— 同一条 entry 里可能还有别人的钩子，
+ *   只有整条都属于我们时才删掉这条 entry。
+ */
+const claimSingleHook = (list, basename, entry) => {
+  let removed = 0;
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const hooks = list[i]?.hooks;
+    if (!Array.isArray(hooks)) continue;
+    const kept = hooks.filter((h) => !ownsHook(h, basename));
+    if (kept.length === hooks.length) continue;
+    removed += hooks.length - kept.length;
+    if (kept.length === 0) list.splice(i, 1);
+    else list[i].hooks = kept;
+  }
+  if (entry) list.push(entry);
+  return removed;
+};
 
 const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
@@ -148,8 +175,8 @@ const settings = JSON.parse(settingsBefore);
 settings.hooks ??= {};
 const stop = (settings.hooks.Stop ??= []);
 
-const stopBefore = stop.filter((entry) => entryOwns(entry, "stop-hook.mjs")).length;
-const stopRemoved = claimSingleEntry(stop, "stop-hook.mjs",
+const stopBefore = countHooks(stop, "stop-hook.mjs");
+const stopRemoved = claimSingleHook(stop, "stop-hook.mjs",
   uninstall ? null : { hooks: [{ type: "command", command: COMMAND, timeout: 20 }] });
 const action = uninstall
   ? (stopRemoved > 0 ? "removed" : "already-absent")
@@ -166,12 +193,12 @@ const describe = (before, removed) => uninstall
   ? (removed > 0 ? "removed" : "already-absent")
   : (before === 0 ? "installed" : before === 1 ? "updated" : "deduped");
 
-const inboundBefore = prompts.filter((e) => entryOwns(e, "inbound-hook.mjs")).length;
-const inboundHookAction = describe(inboundBefore, claimSingleEntry(prompts, "inbound-hook.mjs",
+const inboundBefore = countHooks(prompts, "inbound-hook.mjs");
+const inboundHookAction = describe(inboundBefore, claimSingleHook(prompts, "inbound-hook.mjs",
   uninstall ? null : { hooks: [{ type: "command", command: INBOUND_HOOK_COMMAND, timeout: 10 }] }));
 
-const initBefore = prompts.filter((e) => entryOwns(e, "init-hook.mjs")).length;
-const initAction = describe(initBefore, claimSingleEntry(prompts, "init-hook.mjs",
+const initBefore = countHooks(prompts, "init-hook.mjs");
+const initAction = describe(initBefore, claimSingleHook(prompts, "init-hook.mjs",
   uninstall ? null : { hooks: [{ type: "command", command: INIT_COMMAND, timeout: 10 }] }));
 
 // ---------- 权限：只放行预览，真发仍逐次确认 ----------
@@ -191,8 +218,10 @@ const allow = (permissions.allow ??= []);
 
 // 权限规则同样要收编：旧克隆各留了一条自己路径的放行规则，只加不减就会越积越多，
 // 而每一条都是一个「某个开发克隆里的脚本可以免确认执行」的长期授权。
-const ownsPreview = (rule) => typeof rule === "string" &&
-  rule.includes("/scripts/bind-preview.mjs") && rule.includes("feishu-bridge");
+// 同样按安装器生成的确切形态匹配，不用子串包含 —— 一条 allow 规则是一次长期免确认授权，
+// 误删别人的、或漏掉旧克隆的，两种都不能接受。
+const PREVIEW_RULE_SHAPE = /^Bash\(node [^\s()]*\/scripts\/bind-preview\.mjs:\*\)$/u;
+const ownsPreview = (rule) => typeof rule === "string" && PREVIEW_RULE_SHAPE.test(rule);
 const permBefore = allow.filter(ownsPreview).length;
 for (let i = allow.length - 1; i >= 0; i -= 1) if (ownsPreview(allow[i])) allow.splice(i, 1);
 if (!uninstall) allow.push(PREVIEW_RULE);

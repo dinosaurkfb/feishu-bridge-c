@@ -4501,6 +4501,49 @@ test("运行时同步：版本由内容决定，落盘后校验通过", () => {
     "旧版本目录要留着 —— 回滚只需把 current 指回去，不必重新复制");
 });
 
+test("运行时安装是事务：相同版本 no-op，同一 entry 里别人的钩子不受牵连", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "rt-txn-"));
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), "rt-txn-src-"));
+  fs.mkdirSync(path.join(src, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(src, "scripts", "a.mjs"), "export const a = 1;\n");
+
+  const plan = planRuntimeSync({ sourceRoot: src, home });
+  assert.equal(applyRuntimeSync(plan, { home }).ok, true);
+
+  // 同版本重装必须是真的 no-op —— 不能再去动线上正在被加载的那些文件。
+  const again = applyRuntimeSync(planRuntimeSync({ sourceRoot: src, home }), { home });
+  assert.equal(again.ok, true);
+  assert.equal(again.noop, true);
+
+  // 版本目录内部自带清单：一个版本完整与否，不依赖根目录那份指针就能回答。
+  const inside = path.join(runtimeRoot(home), "versions", plan.version, "INSTALLED.json");
+  assert.equal(fs.existsSync(inside), true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(inside, "utf-8")).files.map((f) => f.path),
+    ["scripts/a.mjs"]);
+
+  // 根指针即使落后，verifyRuntime 也以版本目录内部为准 —— 切链接与写指针之间失败过，
+  // 那时线上其实是可用的，不该被报成坏掉。
+  fs.writeFileSync(path.join(runtimeRoot(home), "INSTALLED.json"),
+    JSON.stringify({ schema_version: "1.0", version: "stale" }) + "\n");
+  const verified = verifyRuntime({ home });
+  assert.equal(verified.ok, true);
+  assert.equal(verified.version, plan.version);
+});
+
+test("入站钩子从自身定位分发器，不再经 bridge_root 落回开发克隆", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "inbound-hook.mjs"), "utf-8");
+  assert.doesNotMatch(src, /bridgeRoot \+ "\/scripts\/aily-inbound\.mjs"/u,
+    "从模板字段拼路径会指向另一个克隆、另一个提交");
+  assert.match(src, /import\.meta\.url[\s\S]{0,120}aily-inbound\.mjs/u,
+    "分发器必须取自己的同目录兄弟，保证与钩子同版本");
+
+  // 两个入站安装器都必须能跑通。改 skills/ 只跑出站安装器，正是上一版把入站装崩的原因。
+  for (const installer of ["install-outbound.mjs", "install-inbound.mjs"]) {
+    const text = fs.readFileSync(path.resolve("scripts", installer), "utf-8");
+    assert.match(text, /BRIDGE_ROOT/u, installer + " 必须会渲染 {{BRIDGE_ROOT}} 占位符");
+  }
+});
+
 test("运行时校验能发现被手改的脚本和被指歪的链接", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "rt-drift-"));
   const src = fs.mkdtempSync(path.join(os.tmpdir(), "rt-drift-src-"));
@@ -4533,7 +4576,11 @@ test("安装器不再把开发克隆路径写进全局配置", () => {
   // 幂等键换成脚本名 + feishu-bridge：旧写法拿克隆绝对路径当键，
   // 第二个克隆装出来是追加而不是覆盖 —— 本机两份 Stop 钩子就是这么来的。
   assert.doesNotMatch(src, /const MARKER = HOOK_SCRIPT/u);
-  assert.match(src, /claimSingleEntry/u);
+  assert.match(src, /claimSingleHook/u);
+  // 收编必须作用在 hook 上而不是整条 entry：同一条 entry 里可能还有别人的钩子，
+  // 按 entry 整条删会把 .orca 之类的一起删掉，而且删得很安静。
+  assert.match(src, /list\[i\]\.hooks = kept/u,
+    "同一 entry 里还有别人的 hook 时，只能摘掉自己那条，不能删整条");
 
   // 技能源码也不能硬编码克隆路径，否则 Frank 跑 /feishu-bind 时执行的是某个开发分支的脚本。
   for (const file of fs.readdirSync(path.resolve("skills"))) {

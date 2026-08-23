@@ -29,7 +29,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { runtimeScript } from "./runtime-install.mjs";
+
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+/**
+ * 技能里的脚本路径指向 **runtime**，不指向这个克隆。
+ *
+ * 理由跟出站安装器一致：技能是给模型看的可执行命令，指向开发克隆意味着 Frank 触发它时
+ * 跑的是某条正在开发的分支。SKILL.md 源码里写 `{{BRIDGE_ROOT}}` 占位符，安装时渲染。
+ */
+const RUNTIME_BRIDGE_ROOT = path.dirname(path.dirname(runtimeScript("aily-inbound.mjs")));
+const renderSkill = (text) => text.replaceAll("{{BRIDGE_ROOT}}", RUNTIME_BRIDGE_ROOT);
 const SKILL_NAME = "m5claude-inbound-router";
 const SRC = path.join(ROOT, "skills", SKILL_NAME);
 const DEFAULT_SKILLS_ROOT = path.join(os.homedir(), ".claude", "skills");
@@ -73,16 +83,25 @@ if (manifest) {
 }
 
 /**
- * SKILL.md 里写的是脚本的**绝对路径**。仓库一旦被移动，技能会照常被发现、
- * 照常被调用，然后在执行那一步失败 —— 而回执只会说「系统错误」。
- * 装之前就该发现这件事。
+ * 技能被发现、被调用都不会失败，失败发生在**执行那一步**，而回执只会说「系统错误」。
+ * 所以装之前就要确认它引用的脚本确实存在。
+ *
+ * 渲染之后再校验：源码里是 `{{BRIDGE_ROOT}}` 占位符，渲染后是 runtime 下的绝对路径。
+ * 校验对象必须是**将要装进去的那份文本**，不是源码 —— 否则校验的和运行的不是同一件东西。
  */
 if (problems.length === 0) {
-  const body = fs.readFileSync(path.join(SRC, "SKILL.md"), "utf-8");
+  const body = renderSkill(fs.readFileSync(path.join(SRC, "SKILL.md"), "utf-8"));
+  if (body.includes("{{BRIDGE_ROOT}}")) problems.push("SKILL.md 里还有没渲染的占位符");
   const referenced = [...body.matchAll(/(\/[\w./-]*\/scripts\/[\w.-]+\.mjs)/g)].map((m) => m[1]);
   for (const p of new Set(referenced)) {
-    if (!fs.existsSync(p)) problems.push("SKILL.md 引用了不存在的脚本：" + p);
-    else if (!p.startsWith(ROOT + "/")) notes.push("SKILL.md 引用的脚本不在本仓库内：" + p);
+    // runtime 下的脚本要等出站安装器把代码同步过去才存在。这里只要求「要么已经装好、
+    // 要么明确是 runtime 路径」，不能因为还没同步就把入站技能判成装不了。
+    if (fs.existsSync(p)) continue;
+    if (p.startsWith(RUNTIME_BRIDGE_ROOT + "/")) {
+      notes.push("引用的 runtime 脚本尚未同步（先跑 install-outbound.mjs --apply）：" + p);
+    } else {
+      problems.push("SKILL.md 引用了不存在的脚本：" + p);
+    }
   }
   if (referenced.length === 0) problems.push("SKILL.md 里找不到要执行的脚本路径");
 }
@@ -145,7 +164,15 @@ if (uninstall) {
 }
 
 fs.mkdirSync(DST, { recursive: true });
-for (const f of files) fs.copyFileSync(path.join(SRC, f), path.join(DST, f));
+for (const f of files) {
+  // SKILL.md 要渲染，manifest 原样拷 —— 后者不含路径占位符。
+  if (f === "SKILL.md") {
+    fs.writeFileSync(path.join(DST, f),
+      renderSkill(fs.readFileSync(path.join(SRC, f), "utf-8")), { mode: 0o600 });
+  } else {
+    fs.copyFileSync(path.join(SRC, f), path.join(DST, f));
+  }
+}
 
 // ---------- 装完自检 ----------
 

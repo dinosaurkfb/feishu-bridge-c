@@ -104,7 +104,7 @@ export function planRuntimeSync({ sourceRoot, home = os.homedir() } = {}) {
   // 版本号由内容决定：同样的源码算出同样的版本，重复安装就是无操作。
   const version = sha256(files.map((f) => f.path + ":" + f.sha256).join("\n")).slice(0, 16);
   const root = runtimeRoot(home);
-  const current = readRuntimeManifest({ home });
+  const current = verifyRuntime({ home });
   return {
     ok: true,
     version,
@@ -113,8 +113,8 @@ export function planRuntimeSync({ sourceRoot, home = os.homedir() } = {}) {
     sourceCommit: sourceCommit(sourceRoot),
     runtimeRoot: root,
     versionDir: path.join(root, "versions", version),
-    alreadyCurrent: current.ok && current.manifest.version === version,
-    previousVersion: current.ok ? current.manifest.version : null,
+    alreadyCurrent: current.ok && current.version === version,
+    previousVersion: current.version ?? null,
   };
 }
 
@@ -132,87 +132,171 @@ export function readRuntimeManifest({ home = os.homedir() } = {}) {
 }
 
 /**
- * 落盘。顺序刻意如此：**先把整个版本目录写完整，再切 current，最后写清单。**
+ * 安装锁。两个克隆同时装会让 current 与 manifest 分属不同版本 —— 那是一个谁都没见过、
+ * 也没人会去查的状态。用 mkdir 的原子性做锁，失败即放弃，不等待：安装本来就该是
+ * 人显式发起的一次性动作，排队等另一个安装完成没有意义。
+ */
+function acquireInstallLock(root) {
+  const dir = path.join(root, "install.lock");
+  try {
+    fs.mkdirSync(path.dirname(dir), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(dir);
+    return { ok: true, release: () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 已释放 */ } } };
+  } catch {
+    return { ok: false, reason: "install_locked" };
+  }
+}
+
+const writeAtomic = (file, content) => {
+  const tmp = file + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, content, { mode: 0o600 });
+  fs.renameSync(tmp, file);
+};
+
+/**
+ * 落盘，作为一次**事务**。
  *
- * 切换用 rename 覆盖一个临时符号链接，是原子操作 —— 任何时刻 `current` 要么指向旧版本、
- * 要么指向新版本，不存在指向半个目录的中间态。清单最后写，所以「清单说的版本」永远
- * 是一个已经完整落盘并已被 current 指向的版本。
+ * 顺序：加锁 → 写 staging 目录 → manifest 写进版本目录内部 → 整体校验 →
+ * 原子改名为不可变版本目录 → 切 current（唯一提交点）→ 最后才更新根 manifest 指针。
+ *
+ * 为什么不能只靠"符号链接切换是原子的"：那句话本身没错，但**整个安装不是一个事务**。
+ * 上一版就栽在这里 —— Codex 用故障注入复现出 current 已指向新版本、根 manifest 仍是旧版本
+ * 的状态，而此时 settings 早已指向 runtime/current，新代码已经生效且无从回滚。
+ *
+ * 现在版本目录是内容寻址且**不可变**：已经存在且自校验通过就直接复用，绝不原地覆盖
+ *（原地覆盖一个内容寻址的目录本身就是矛盾的）。真正的提交点只有 current 那一次 rename；
+ * 它之前的任何失败都不会改变线上正在跑的那份代码。
  */
 export function applyRuntimeSync(plan, { home = os.homedir() } = {}) {
   if (!plan?.ok) return plan ?? { ok: false, reason: "plan_missing" };
   const root = runtimeRoot(home);
   const versionDir = path.join(root, "versions", plan.version);
 
+  const lock = acquireInstallLock(root);
+  if (!lock.ok) return lock;
   try {
-    for (const file of plan.files) {
-      const dest = path.join(versionDir, file.path);
-      fs.mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
-      const content = fs.readFileSync(path.join(plan.sourceRoot, file.path));
-      if (sha256(content) !== file.sha256) {
-        // 计划到落盘之间源码变了。宁可整次失败，也不要装一份「清单与内容不符」的运行时。
-        return { ok: false, reason: "source_changed_during_apply", file: file.path };
-      }
-      const tmp = dest + ".tmp." + process.pid;
-      fs.writeFileSync(tmp, content, { mode: 0o600 });
-      fs.renameSync(tmp, dest);
+    // 已是当前版本且自校验通过 → 真正的 no-op。上一版这里仍会重写一遍活动版本，
+    // 等于每次安装都动一次线上正在被加载的文件。
+    const already = verifyRuntime({ home });
+    if (already.ok && already.version === plan.version) {
+      return { ok: true, version: plan.version, versionDir, noop: true };
     }
 
+    if (!verifyVersionDir(versionDir, plan.files).ok) {
+      const staging = path.join(root, "versions", ".staging-" + plan.version + "." + process.pid);
+      fs.rmSync(staging, { recursive: true, force: true });
+      for (const file of plan.files) {
+        const dest = path.join(staging, file.path);
+        fs.mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
+        const content = fs.readFileSync(path.join(plan.sourceRoot, file.path));
+        if (sha256(content) !== file.sha256) {
+          fs.rmSync(staging, { recursive: true, force: true });
+          // 计划到落盘之间源码变了（切了分支、跑了 git checkout）。宁可整次失败，
+          // 也不要装一份"清单与内容不符"的运行时。
+          return { ok: false, reason: "source_changed_during_apply", file: file.path };
+        }
+        writeAtomic(dest, content);
+      }
+      // manifest 放在版本目录**内部**：版本自带自己的清单，于是"这个版本完整吗"
+      // 是一个不依赖任何外部文件就能回答的问题。
+      writeAtomic(path.join(staging, MANIFEST_NAME), JSON.stringify({
+        schema_version: "1.0",
+        version: plan.version,
+        installed_at: new Date().toISOString(),
+        source_root: plan.sourceRoot,
+        source_commit: plan.sourceCommit,
+        files: plan.files,
+      }, null, 2) + "\n");
+
+      const staged = verifyVersionDir(staging, plan.files);
+      if (!staged.ok) {
+        fs.rmSync(staging, { recursive: true, force: true });
+        return { ok: false, reason: "staging_verify_failed", detail: staged };
+      }
+      try {
+        fs.renameSync(staging, versionDir);
+      } catch {
+        // 竞态：另一个安装刚把同一个版本改名过去了。内容寻址，那份和我们这份一样。
+        fs.rmSync(staging, { recursive: true, force: true });
+        if (!verifyVersionDir(versionDir, plan.files).ok) {
+          return { ok: false, reason: "version_dir_unusable" };
+        }
+      }
+    }
+
+    // 唯一的提交点。此前任何失败，线上跑的都还是旧版本。
     const link = path.join(root, CURRENT_LINK);
     const linkTmp = link + ".tmp." + process.pid;
     try { fs.unlinkSync(linkTmp); } catch { /* 上次残留 */ }
     fs.symlinkSync(path.join("versions", plan.version), linkTmp);
     fs.renameSync(linkTmp, link);
 
-    const manifest = {
-      schema_version: "1.0",
-      version: plan.version,
-      installed_at: new Date().toISOString(),
-      source_root: plan.sourceRoot,
-      source_commit: plan.sourceCommit,
-      files: plan.files,
-    };
-    const manifestPath = path.join(root, MANIFEST_NAME);
-    const manifestTmp = manifestPath + ".tmp." + process.pid;
-    fs.writeFileSync(manifestTmp, JSON.stringify(manifest, null, 2) + "\n", { mode: 0o600 });
-    fs.renameSync(manifestTmp, manifestPath);
-    return { ok: true, version: plan.version, versionDir, manifest };
+    // 根 manifest 只是一个"当前指向谁"的便利指针，真相在版本目录内部那份。
+    // 即使这一步失败，current 已经指向一个完整且自校验通过的版本，线上是可用的。
+    writeAtomic(path.join(root, MANIFEST_NAME), JSON.stringify({
+      schema_version: "1.0", version: plan.version, updated_at: new Date().toISOString(),
+    }, null, 2) + "\n");
+    return { ok: true, version: plan.version, versionDir };
   } catch (err) {
     return { ok: false, reason: "apply_failed", error: String(err?.message ?? err).slice(0, 200) };
+  } finally {
+    lock.release();
   }
 }
 
+/** 一个版本目录是不是完整且逐文件对得上它自己的清单。 */
+function verifyVersionDir(dir, expectedFiles) {
+  let manifest;
+  try { manifest = JSON.parse(fs.readFileSync(path.join(dir, MANIFEST_NAME), "utf-8")); }
+  catch { return { ok: false, reason: "manifest_absent" }; }
+  const files = Array.isArray(manifest?.files) ? manifest.files : null;
+  if (!files) return { ok: false, reason: "manifest_invalid" };
+  if (expectedFiles && (files.length !== expectedFiles.length ||
+      files.some((f, i) => f.path !== expectedFiles[i].path || f.sha256 !== expectedFiles[i].sha256))) {
+    return { ok: false, reason: "manifest_mismatch" };
+  }
+  const drifted = [];
+  const missing = [];
+  for (const file of files) {
+    let content;
+    try { content = fs.readFileSync(path.join(dir, file.path)); }
+    catch { missing.push(file.path); continue; }
+    if (sha256(content) !== file.sha256) drifted.push(file.path);
+  }
+  return { ok: drifted.length === 0 && missing.length === 0, drifted, missing, manifest };
+}
+
 /**
- * 线上这份运行时还是不是清单说的那一份。
+ * 线上这份运行时还是不是它自己清单说的那一份。
  *
  * 存在的理由很具体：这套东西的失败是**安静**的。有人手改了 current 下的某个脚本、
  * 或者符号链接被指到别处，出站会照跑，只是行为不再对应任何一次有记录的安装。
  * 有了逐文件哈希，「线上跑的是哪份代码」就变成一个可以回答的问题。
+ *
+ * 真相取自 current 指向的那个版本目录内部的清单，不取根目录那份指针 —— 后者只是便利，
+ * 而且它可能比 current 落后一步（切链接与写指针之间失败过）。
  */
 export function verifyRuntime({ home = os.homedir() } = {}) {
-  const loaded = readRuntimeManifest({ home });
-  if (!loaded.ok) return { ok: false, reason: loaded.reason };
   const root = runtimeRoot(home);
-  const versionDir = path.join(root, "versions", loaded.manifest.version);
-
   let linkTarget = null;
-  try { linkTarget = fs.readlinkSync(path.join(root, CURRENT_LINK)); } catch { /* 没有链接 */ }
-  const linkOk = linkTarget === path.join("versions", loaded.manifest.version);
-
-  const drifted = [];
-  const missing = [];
-  for (const file of loaded.manifest.files) {
-    let content;
-    try { content = fs.readFileSync(path.join(versionDir, file.path)); }
-    catch { missing.push(file.path); continue; }
-    if (sha256(content) !== file.sha256) drifted.push(file.path);
+  try { linkTarget = fs.readlinkSync(path.join(root, CURRENT_LINK)); } catch {
+    return { ok: false, reason: "current_absent", linkOk: false, drifted: [], missing: [] };
   }
+  const versionDir = path.join(root, linkTarget);
+  const checked = verifyVersionDir(versionDir, null);
+  if (!checked.manifest) {
+    return { ok: false, reason: checked.reason, linkOk: false, drifted: [], missing: [] };
+  }
+  const version = checked.manifest.version;
+  // 链接必须指向它自己声称的那个版本目录 —— 否则就是有人手工把 current 指歪了。
+  const linkOk = linkTarget === path.join("versions", version);
   return {
-    ok: linkOk && drifted.length === 0 && missing.length === 0,
-    version: loaded.manifest.version,
-    sourceCommit: loaded.manifest.source_commit ?? null,
+    ok: linkOk && checked.ok,
+    version,
+    sourceCommit: checked.manifest.source_commit ?? null,
     linkOk,
     linkTarget,
-    drifted,
-    missing,
+    drifted: checked.drifted ?? [],
+    missing: checked.missing ?? [],
   };
 }

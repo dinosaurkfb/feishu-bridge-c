@@ -131,9 +131,41 @@ const relative = (ms, now) => {
 /**
  * 组装五个区。**纯函数** —— 取数在外面做，这里只决定"哪条事实属于哪一层"。
  */
+/**
+ * 把别的链路按它**自己声明的** relation_type 归到对应层。
+ *
+ * 没声明的留在附录 —— 判不出就不硬归类。上一版所有链路都只能进附录，
+ * 因为协议里根本没有这个字段。
+ */
+const KIND_TEXT = { transport: "消息运输", progress: "进度汇报" };
+const STATE_TEXT = { active: "正常", suspended: "已暂停", expired: "已过期", unknown: "状态未知" };
+const SCOPE_TEXT = { chat: "整个群", topic: "单个话题", project: "整个项目" };
+
+export function splitByRelation(sections = []) {
+  const byLayer = { subscription: [], binding: [], policy: [] };
+  const unsorted = [];
+  for (const s of sections) {
+    const rows = s.state === "ok" ? (s.connections ?? []) : [];
+    if (rows.length === 0) { unsorted.push(s); continue; }
+    const placed = rows.filter((c) => c.relation && byLayer[c.relation]);
+    for (const c of placed) byLayer[c.relation].push({ ...c, displayName: s.displayName });
+    if (placed.length < rows.length) {
+      unsorted.push({ ...s, connections: rows.filter((c) => !c.relation || !byLayer[c.relation]) });
+    }
+  }
+  return { byLayer, unsorted };
+}
+
+const relationRow = (c) => [c.displayName,
+  (KIND_TEXT[c.kind] ?? c.kind) + " · " + c.groupName + (c.topicName ? " / " + c.topicName : "") +
+  " · " + (SCOPE_TEXT[c.scope] ?? c.scope) + " · " + (STATE_TEXT[c.state] ?? c.state)];
+
 export function composeLayeredStatus({
-  st, others = [], endpoint, subscription, connectivity = null, now = Date.now(),
+  st, others = [], endpoint, subscription, connectivity = null,
+  otherLinks = null, now = Date.now(),
 }) {
+  // 别的链路里能归层的，直接进对应层；归不了的留给附录。
+  const split = otherLinks ? splitByRelation(otherLinks.sections) : { byLayer: null, unsorted: [] };
   // **没绑定不等于没有四层。**第 1、2 层照样有事实可报，只是第 3 层还没绑、
   // 第 4 层无从谈起。上一版在这里直接退回旧格式，等于四层模型在最需要它的时候消失。
   const bound = st.ok === true;
@@ -174,6 +206,7 @@ export function composeLayeredStatus({
       L2.push(["待认领绑定", subscription.pendingCount + " 条"]);
     }
   }
+  for (const c of split.byLayer?.subscription ?? []) L2.push(relationRow(c));
 
   if (!bound) {
     // not_bound 和"读不出来"必须分开：前者是还没接，后者是配错了或文件坏了。
@@ -217,6 +250,7 @@ export function composeLayeredStatus({
   }
   if (st.expiresAt) L3.push(["有效期", String(st.expiresAt).slice(0, 10)]);
   if (others.length > 1) L3.push(["本项目绑定数", others.length + " 条"]);
+  for (const c of split.byLayer?.binding ?? []) L3.push(relationRow(c));
 
   const L4 = [
     ["交互模式", st.policy?.ok ? st.policy.label + " · v" + st.policy.policyVersion : "状态不可用"],
@@ -242,6 +276,8 @@ export function composeLayeredStatus({
     : st.autoPublish === false
       ? "仅入队，不自动发布（人工排空可用 --force 绕过）"
       : "状态不可用（读不到发布配置）"]);
+
+  for (const c of split.byLayer?.policy ?? []) L4.push(relationRow(c));
 
   const L5 = [["待发布答复", st.pending + " 条" + (st.pending && st.suspended ? "（恢复后会发出）" : "")]];
 

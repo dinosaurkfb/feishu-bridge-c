@@ -80,7 +80,7 @@ import { bindingToConnections } from "./group-binding-status.mjs";
 import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
 import {
   ENDPOINT_SELF_CHECK, composeLayeredStatus, endpointFacts, lastSuccessfulDispatchAt,
-  renderLayeredStatus, subscriptionFacts,
+  renderLayeredStatus, splitByRelation, subscriptionFacts,
 } from "./layered-status.mjs";
 import {
   collectConnectivity, collectProjectConnectivity, collectStatusProviders, loadStatusProviders,
@@ -6781,7 +6781,8 @@ test("有 route 没登记状态入口的消费者必须被列出来", () => {
     executable: process.execPath, script: "/abs/x.mjs", allowed_kinds: ["transport"],
   }] }));
   const run = () => ({ ok: true, connections: [
-    { kind: "transport", state: "active", scope: "chat", groupName: "Claude2Codex", topicName: null },
+    { kind: "transport", state: "active", scope: "chat",
+      groupName: "Claude2Codex", topicName: null, relation: null },
   ] });
 
   const view = collectConnectivity({ routesFile, providersFile, run });
@@ -7618,12 +7619,179 @@ test("按文档里那条命令登记，聚合方要真的能取到状态", () =>
   assert.deepEqual(view.sections[0].connections, [{
     kind: "transport", state: "active", scope: "chat",
     groupName: "Claude2Codex", topicName: null,
+    // 没声明 allowed_relations，所以这条连接没有关系层 —— 仍进附录，行为不变。
+    relation: null,
   }]);
 
   // 顺带确认渲染出去的东西不带 locator。
   assert.equal(renderConnectivity(view).includes("oc_SECRET123456"), false);
 });
 
+
+test("relation_type 受两层约束，provider 不能自己给自己发许可", () => {
+  const report = (relation) => JSON.stringify({
+    schema_version: "feishu-bridge-status/v1", provider_id: "p",
+    connections: [{
+      kind: "transport", state: "active", scope: "chat", group_name: "G",
+      ...(relation === undefined ? {} : { relation_type: relation }),
+    }],
+  });
+
+  // 没声明 allowed_relations 就没有这个能力 —— 老登记行为完全不变。
+  const undeclared = validateProviderReport(report("subscription"),
+    { providerId: "p", allowedKinds: ["transport"] });
+  assert.equal(undeclared.ok, false);
+  assert.equal(undeclared.reason, "connection_relation_not_allowed");
+
+  // 声明了才收，而且只收声明集合里的。
+  const declared = { providerId: "p", allowedKinds: ["transport"], allowedRelations: ["subscription"] };
+  assert.equal(validateProviderReport(report("subscription"), declared).connections[0].relation,
+    "subscription");
+  assert.equal(validateProviderReport(report("binding"), declared).reason,
+    "connection_relation_not_allowed");
+  assert.equal(validateProviderReport(report("nonsense"), declared).reason,
+    "connection_relation_invalid");
+
+  // 不标注也合法 —— 那条连接就是"归不了层"，进附录。
+  assert.equal(validateProviderReport(report(undefined), declared).connections[0].relation, null);
+});
+
+test("登记表的 allowed_relations 是受控枚举，且缺省等于没有能力", () => {
+  const entry = (over) => ({ providers: [{
+    id: "p", protocol: "feishu-bridge-status/v1", executable: process.execPath,
+    script: "/abs/x.mjs", allowed_kinds: ["transport"], ...over,
+  }] });
+  assert.deepEqual(validateProviderRegistry(entry({})).providers[0].allowedRelations, [],
+    "不声明就是空集，不是全集");
+  assert.deepEqual(
+    validateProviderRegistry(entry({ allowed_relations: ["binding"] })).providers[0].allowedRelations,
+    ["binding"]);
+  for (const bad of [[], ["god"], "subscription"]) {
+    assert.equal(validateProviderRegistry(entry({ allowed_relations: bad })).problem,
+      "allowed_relations_invalid", JSON.stringify(bad));
+  }
+});
+
+test("声明了关系层的连接并进对应层，没声明的留在附录", () => {
+  const sections = [{
+    id: "cc2cd", displayName: "cc2cd", state: "ok", connections: [
+      { kind: "transport", state: "active", scope: "chat", groupName: "Claude2Codex",
+        topicName: null, relation: "subscription" },
+      { kind: "progress", state: "active", scope: "project", groupName: "某群",
+        topicName: null, relation: null },
+    ],
+  }];
+  const split = splitByRelation(sections);
+  assert.equal(split.byLayer.subscription.length, 1);
+  assert.equal(split.byLayer.subscription[0].groupName, "Claude2Codex");
+  assert.equal(split.byLayer.binding.length, 0);
+  // 归不了层的那条仍要出现在附录里 —— 不是丢掉。
+  assert.equal(split.unsorted.length, 1);
+  assert.deepEqual(split.unsorted[0].connections.map((c) => c.groupName), ["某群"]);
+
+  const endpoint = { runtime: "Claude Code", agentName: null, install: "ok", installReason: null,
+    version: "abc", selfCheck: ENDPOINT_SELF_CHECK, lastInboundAt: null };
+  const text = renderLayeredStatus(composeLayeredStatus({
+    st: layeredSt(), endpoint, subscription: { ok: true, items: [], pendingCount: 0 },
+    otherLinks: { sections, providersProblem: null, routesProblem: null },
+  }));
+  const layer2 = text.slice(text.indexOf("第 2 层"), text.indexOf("第 3 层"));
+  assert.match(layer2, /Claude2Codex/u, "声明了 subscription 就该进第 2 层");
+  // 判不出的不许硬塞进某一层。
+  assert.equal(layer2.includes("某群"), false);
+});
+
+test("状态取不到的链路不会被当成「没有连接」而消失", () => {
+  const split = splitByRelation([
+    { id: "a", displayName: "a", state: "unavailable", reason: "provider_timeout" },
+    { id: "b", displayName: "b", state: "ok", connections: [] },
+  ]);
+  // 这两条都没有可归层的连接，但它们必须仍然出现在附录里被看见。
+  assert.deepEqual(split.unsorted.map((s) => s.id), ["a", "b"]);
+  assert.deepEqual(Object.values(split.byLayer).map((x) => x.length), [0, 0, 0]);
+});
+
+test("完整链路：真实 provider 声明关系层，最终真的进第 2 层", () => {
+  // 上一版协议支持了 relation_type，**真实 provider 却产不出它** —— 于是文档说的
+  // "用 --relations subscription 重新登记就能进第 2 层"根本不成立：
+  // 登记只授予能力，provider 自己不声明，最终仍进附录。
+  // 所以这条从头走到尾，不用手工构造的 report。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-chain-"));
+  const providersFile = path.join(dir, "providers.json");
+  const bindingFile = path.join(dir, "binding.json");
+  fs.writeFileSync(bindingFile, JSON.stringify({
+    bind_scope: "chat", status: "active", chat_id: "oc_SECRET123456",
+    chat_name: "Claude2Codex", expires_at: "2099-01-01T00:00:00.000Z",
+  }));
+
+  const register = (extra) => spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"),
+    "--id", "cc2cd", "--script", path.resolve("scripts", "group-binding-status.mjs"),
+    "--kinds", "transport", "--project-root", dir, ...extra, "--apply",
+    "--", "--provider-id", "cc2cd", "--binding", bindingFile, ...(extra.length ? ["--relation", "subscription"] : []),
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: providersFile } });
+
+  // 先看没声明关系层时：连接取得到，但归不了层。
+  assert.equal(register([]).status, 0);
+  const plain = collectProjectConnectivity({ root: dir, providersFile });
+  assert.equal(plain.sections[0].state, "ok", plain.sections[0].reason ?? "");
+  assert.equal(plain.sections[0].connections[0].relation, null);
+  assert.equal(splitByRelation(plain.sections).byLayer.subscription.length, 0);
+
+  // 再声明关系层重新登记 —— 走真实登记命令与真实 provider。
+  fs.rmSync(providersFile);
+  assert.equal(register(["--relations", "subscription"]).status, 0);
+  const declared = collectProjectConnectivity({ root: dir, providersFile });
+  assert.equal(declared.sections[0].state, "ok", declared.sections[0].reason ?? "");
+  assert.equal(declared.sections[0].connections[0].relation, "subscription",
+    "真实 provider 必须真的产出 relation_type");
+
+  const split = splitByRelation(declared.sections);
+  assert.equal(split.byLayer.subscription.length, 1);
+  assert.equal(split.unsorted.length, 0, "归了层就不该再留在附录里重复一遍");
+
+  const endpoint = { runtime: "Claude Code", agentName: null, install: "ok", installReason: null,
+    version: "abc", selfCheck: ENDPOINT_SELF_CHECK, lastInboundAt: null };
+  const text = renderLayeredStatus(composeLayeredStatus({
+    st: layeredSt(), endpoint, subscription: { ok: true, items: [], pendingCount: 0 },
+    otherLinks: declared,
+  }));
+  const layer2 = text.slice(text.indexOf("第 2 层"), text.indexOf("第 3 层"));
+  assert.match(layer2, /Claude2Codex/u, "最终要真的出现在第 2 层");
+  // 全程不许漏 locator。
+  assert.equal(text.includes("oc_SECRET123456"), false);
+});
+
+test("provider 的参数也走白名单：拼错的关系层不许静默退化", () => {
+  // --relaton 要是被忽略，这条链路就悄悄退回"未分层"，而人以为自己已经声明过了。
+  // **沉默的降级比报错难查得多。**
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-relargs-"));
+  const bindingFile = path.join(dir, "b.json");
+  fs.writeFileSync(bindingFile, JSON.stringify({
+    bind_scope: "chat", status: "active", chat_id: "oc_x",
+    chat_name: "G", expires_at: "2099-01-01T00:00:00.000Z",
+  }));
+  const run = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "group-binding-status.mjs"),
+    "--provider-id", "p", "--binding", bindingFile, ...args,
+  ], { encoding: "utf-8" });
+
+  for (const [args, reason] of [
+    [["--relaton", "subscription"], "unknown_option"],
+    [["--relation"], "option_needs_value"],
+    [["--relation", "a", "--relation", "b"], "duplicate_option"],
+    [["裸参数"], "unexpected_argument"],
+  ]) {
+    const bad = run(args);
+    assert.notEqual(bad.status, 0, reason);
+    assert.match(bad.stderr, new RegExp(reason, "u"));
+  }
+
+  // 正确写法照常可用 —— 拒的是拼错，不是这个参数本身。
+  const ok = run(["--relation", "subscription"]);
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(JSON.parse(ok.stdout).connections[0].relation_type, "subscription");
+});
 
 test("走真实 CLI 时 --force 必须真的传到 drainProject", () => {
   // 上一版 CLI 解析了 --force 却没传下去，于是文档和状态页承诺的人工绕过**不存在**。

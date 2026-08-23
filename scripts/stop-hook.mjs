@@ -239,12 +239,13 @@ async function main() {
       notes.push("飞书出站：" + project.id + " 已发布 " + r.count + " 条进展。");
     } else if (r.status === "error") {
       notes.push("飞书出站：" + project.id + " 发布失败（" + r.reason + "），进展留在 outbox，兜底定时器会重试。");
-    } else if (r.status === "suppressed") {
-      // **不能再说"兜底定时器会重试"** —— 那句话对永久失败是假的，
-      // 而每 30 分钟重复一次假话，比不说更糟。
-      notes.push("飞书出站：" + project.id + " 的话题是另一个应用（" +
-        (r.ownerName ?? "未知") + "）建的，当前身份回复不进去。" +
-        r.count + " 条已停止重试。要恢复：重新绑定或轮转话题，让新话题由当前身份创建。");
+    } else if (r.status === "error" && r.diagnosis?.kind === "root_owned_by_other_app") {
+      // 诊断是**线索不是判决**：说清重试大概率无用，但停不停由人决定。
+      // 上一版在这里直接说"已停止重试"，那是把一个自动做出的有损动作说成既成事实。
+      notes.push("飞书出站：" + project.id + " 发布失败。这个话题是另一个应用（" +
+        (r.diagnosis.ownerName ?? "未知") + "）建的，当前身份大概率回复不进去，" +
+        "重试可能一直失败。要停止重试：feishu-suppress-outbox.mjs --project " +
+        project.root + " --apply");
     } else if (r.status === "skipped" && r.reason === "mapping_not_active") {
       // 这条必须说出来：绑定失效时进展会无限期堆在本地，而 Frank 什么都收不到。
       notes.push("飞书出站：" + project.id + " 的话题绑定已失效，" + r.count + " 条进展发不出去，需要重签绑定。");

@@ -233,6 +233,7 @@ export function suppressPublishByEventKey({ outboxDir, eventKey, reason }) {
  */
 export function suppressRecords(records, { reason }) {
   let changed = 0;
+  const failed = [];
   for (const rec of records) {
     const file = rec._file;
     if (typeof file !== "string") continue;
@@ -245,12 +246,19 @@ export function suppressRecords(records, { reason }) {
       publish_suppressed_at: new Date().toISOString(),
       publish_suppressed_reason: String(reason ?? "permanent_publish_failure").slice(0, 200),
     };
-    const tmp = file + ".tmp." + randomUUID();
-    fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
-    fs.renameSync(tmp, file);
-    changed += 1;
+    try {
+      const tmp = file + ".tmp." + randomUUID();
+      fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+      fs.renameSync(tmp, file);
+      changed += 1;
+    } catch (err) {
+      // **不许半写后抛。**上一版第二条不可写时直接抛出去：前面几条已经被永久抑制，
+      // 调用方却只收到一个异常 —— 它不知道自己已经改掉了多少东西。
+      // 返回结构化的部分失败，让调用方能如实报"停了几条、几条没停成"。
+      failed.push({ file, reason: String(err.code ?? err.message).slice(0, 60) });
+    }
   }
-  return { ok: true, changed };
+  return { ok: failed.length === 0, changed, failed };
 }
 
 export function composeDigest(records, { taskName }) {

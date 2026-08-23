@@ -14,7 +14,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { listPending, markSent, composeDigest, suppressRecords } from "./outbox.mjs";
+import { listPending, markSent, composeDigest } from "./outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { PUBLISH_FAILURE, classifyPublishFailure, publishDraft } from "./outbound.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
@@ -98,6 +98,12 @@ export function drainProject({ root, claudeSessionId, dryRun = false, timeoutMs 
   }
   const { config: cfg, mapping } = resolved;
 
+  // **在 try 之外解析。**上一版把它放在 try 里，而 catch 要用它 —— 于是任何发布失败
+  // 都先撞上 ReferenceError，永远走不到诊断。身份从配置推，不认死任何 agent；
+  // 发之前 publishDraft 仍会校验凭据归属。
+  const id = resolveLarkIdentity(cfg);
+  let failingTarget = null;
+
   // 绑定失效时不发：话题可能已经不再是 Frank 认可的那个。
   if (mapping.status !== "active") {
     return { status: "skipped", root, reason: "mapping_not_active", count: listPending({ outboxDir }).length };
@@ -138,10 +144,11 @@ export function drainProject({ root, claudeSessionId, dryRun = false, timeoutMs 
       };
     }
 
-    // 身份从配置推，不在这里认死任何一个 agent；发之前 publishDraft 会校验凭据归属。
-    const id = resolveLarkIdentity(cfg);
     const messageIds = [];
     for (const item of targetBatches) {
+      // 记住正在发哪一个目标：失败诊断要查**这一条**的根消息，
+      // 而不是 mapping.root_message_id —— 后者可能是别的代际，甚至不存在。
+      failingTarget = item.target;
       const messageId = publishDraft({
         profile: id.profile,
         rootMessageId: item.target.rootMessageId,
@@ -174,22 +181,24 @@ export function drainProject({ root, claudeSessionId, dryRun = false, timeoutMs 
   } catch (err) {
     // 不标记、不吞掉：留在 outbox，下一个排空者重试。
     // 截断放宽到 400：飞书的报错 JSON 前 200 字还没到 code 和 message，截短了等于没留痕。
-    // 判一次是"这次不行"还是"永远不行"。永久失败还留在 outbox 重试，
-    // 只会每 30 分钟稳定地制造一次噪音，而每轮 Stop 都会说一句假的"兜底定时器会重试"。
-    const verdict = classifyPublishFailure({
-      rootMessageId: mapping.root_message_id, expectedAppId: id.expectedAppId,
-      larkBin: id.bin, larkHome: id.configDir, profile: id.profile,
-    });
-    if (verdict.kind === PUBLISH_FAILURE.ROOT_OWNED_BY_OTHER_APP) {
-      const done = suppressRecords(pending, {
-        reason: "root_owned_by_other_app" + (verdict.ownerName ? ":" + verdict.ownerName : ""),
+      // **只诊断，不自动抑制。**上一版的推理是"失败 + 根消息属于另一个应用 = 永久"，
+      // 那是**从相关性推因果**：瞬时的网络错误发生在跨应用根消息上，照样会触发
+      // 不可逆的抑制。有损动作不能建立在推断出来的因果上 —— 要么拿到确实表示
+      // 身份不兼容的平台错误码，要么由人显式下令。现在选后者。
+      const diagnosis = classifyPublishFailure({
+        rootMessageId: failingTarget?.rootMessageId ?? null,
+        expectedAppId: id?.expectedAppId,
+        larkBin: id?.bin, larkHome: id?.configDir, profile: id?.profile,
       });
       return {
-        status: "suppressed", root, reason: PUBLISH_FAILURE.ROOT_OWNED_BY_OTHER_APP,
-        count: done.changed, ownerName: verdict.ownerName ?? null,
+        status: "error", root, reason: "publish_failed",
+        error: String(err.message).slice(0, 400),
+        // 诊断只是**线索**，不是判决 —— 调用方拿它给人看，不拿它做有损动作。
+        diagnosis: diagnosis.kind === PUBLISH_FAILURE.ROOT_OWNED_BY_OTHER_APP
+          ? { kind: diagnosis.kind, ownerName: diagnosis.ownerName ?? null,
+              count: listPending({ outboxDir }).length }
+          : null,
       };
-    }
-    return { status: "error", root, reason: "publish_failed", error: String(err.message).slice(0, 400) };
   } finally {
     releasePublishLock(lockDir);
   }
@@ -252,10 +261,10 @@ if (isDirectRun(import.meta.url)) {
     } else if (r.status === "error") {
       console.error(tag + "排空失败（" + r.reason + "），进展留在 outbox：" + r.error);
       hadError = true;
-    } else if (r.status === "suppressed") {
-      console.error(tag + "永久失败：话题由另一个应用（" + (r.ownerName ?? "未知") +
-        "）创建，当前身份回复不进去；" + r.count + " 条已停止重试。" +
-        "要恢复：重新绑定或轮转话题。");
+    } else if (r.status === "error" && r.diagnosis?.kind === "root_owned_by_other_app") {
+      console.error(tag + "发布失败：话题由另一个应用（" + (r.diagnosis.ownerName ?? "未知") +
+        "）创建，当前身份大概率回复不进去，重试可能一直失败。\n" +
+        "  要停止重试（不可逆）：feishu-suppress-outbox.mjs --project " + root + " --apply");
       hadError = true;
     } else if (r.status === "skipped") {
       console.error(tag + "暂不发布：" + r.reason + (r.count ? "（" + r.count + " 条留在 outbox）" : ""));

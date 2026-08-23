@@ -7669,6 +7669,8 @@ test("抑制只动没发出去的那些，且不重复抑制", () => {
 
   const done = suppressRecords([pending, sent, already], { reason: "root_owned_by_other_app:CC" });
   assert.equal(done.changed, 1, "只该动那条真的还在等的");
+  assert.equal(done.ok, true);
+  assert.deepEqual(done.failed, []);
 
   const after = JSON.parse(fs.readFileSync(pending._file, "utf-8"));
   assert.ok(after.publish_suppressed_at, "要留下抑制时间");
@@ -7679,6 +7681,87 @@ test("抑制只动没发出去的那些，且不重复抑制", () => {
 
   // 被抑制之后就不再是待发 —— 噪音就是这样停下来的。
   assert.equal(listPending({ outboxDir: dir }).length, 0);
+});
+
+test("抑制写盘失败时报部分结果，不抛 —— 调用方得知道自己改掉了多少", () => {
+  // 上一版第二条不可写时直接抛出去：前面几条已经被永久抑制，调用方却只收到异常，
+  // 它不知道自己已经改掉了什么。而 drainProject 的契约是不向 Stop 钩子抛。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-supfail-"));
+  const mk = (name) => {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, JSON.stringify({ kind: "progress", text: "x", published_at: null }));
+    return { _file: file };
+  };
+  const a = mk("1.json");
+  const b = mk("2.json");
+  fs.chmodSync(dir, 0o500); // 目录不可写：两条都写不进去
+  try {
+    const got = suppressRecords([a, b], { reason: "t" });
+    assert.equal(got.ok, false, "写不成就不能报 ok");
+    assert.equal(got.changed, 0);
+    assert.equal(got.failed.length, 2, "要说得出几条没停成");
+  } finally {
+    fs.chmodSync(dir, 0o700);
+  }
+});
+
+test("发布失败只给诊断，不自动做有损动作", () => {
+  // 上一版的推理是"失败 + 根消息属于另一个应用 = 永久"——那是从相关性推因果：
+  // 一次瞬时的网络错误恰好发生在跨应用根消息上，照样会触发不可逆抑制。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-diag-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", lark_cli_bin: "/nonexistent/lark-cli",
+  }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_fixture", claude_session_id: null,
+    channel_generation_id: "gen-1",
+  }));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
+    kind: "progress", text: "待发", created_at: new Date().toISOString(), published_at: null,
+  }));
+
+  // 关键：真实入口下不许抛。上一版 id 定义在 try 里、catch 里用它，
+  // **任何发布失败都先撞上 ReferenceError**，永远走不到诊断。
+  let got;
+  assert.doesNotThrow(() => { got = drainProject({ root: dir, claudeSessionId: null }); });
+  assert.equal(got.status, "error");
+  assert.equal(got.reason, "publish_failed");
+
+  // 失败之后那条内容**仍然是待发** —— 没有被自动抑制掉。
+  assert.equal(listPending({ outboxDir: obDir }).length, 1, "诊断不得顺手把内容停掉");
+});
+
+test("显式抑制命令：默认预览、说明不可逆、拼错的参数不许执行", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-supcmd-"));
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
+    kind: "progress", text: "待发", created_at: new Date().toISOString(), published_at: null,
+  }));
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir, ...args,
+  ], { encoding: "utf-8" });
+
+  const preview = cli([]);
+  assert.equal(preview.status, 0);
+  assert.match(preview.stdout, /dry-run/u);
+  // 让人以为"以后还能恢复"的提示比不提示更糟。
+  assert.match(preview.stdout, /不可逆/u);
+  assert.match(preview.stdout, /不会.*因为重新绑定或轮转话题而自动回来/u);
+  assert.equal(listPending({ outboxDir: obDir }).length, 1, "预览不得写盘");
+
+  assert.notEqual(cli(["--aply"]).status, 0, "拼错的参数不许被当成 --apply");
+  assert.equal(listPending({ outboxDir: obDir }).length, 1);
+
+  assert.equal(cli(["--apply", "--reason", "话题属于旧应用"]).status, 0);
+  assert.equal(listPending({ outboxDir: obDir }).length, 0, "抑制之后不再算待发");
+  const rec = JSON.parse(fs.readFileSync(path.join(obDir, "0001.json"), "utf-8"));
+  assert.equal(rec.publish_suppressed_reason, "话题属于旧应用", "理由要能回答为什么");
 });
 
 summarySealed = true;

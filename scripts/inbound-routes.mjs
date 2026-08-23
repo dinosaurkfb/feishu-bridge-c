@@ -57,7 +57,8 @@ export function loadRoutes(file = routesPath()) {
   return { ok: true, file, routes, sessions: { ...(read.doc.sessions ?? {}) } };
 }
 
-const nonEmptyString = (v) => typeof v === "string" && v.length > 0;
+// 纯空白的 id 拿去比较、拿去打日志都像"有值"，实际什么都定位不到。
+const nonEmptyString = (v) => typeof v === "string" && v.trim().length > 0;
 
 /**
  * 校验整份路由表。**读取、dispatcher、每个写入口共用这一个。**
@@ -81,6 +82,10 @@ export function validateRoutesDoc(doc) {
     if (!isPlainObject(r)) return bad("route_not_object");
     if (!nonEmptyString(r.id)) return bad("route_id_invalid");
     if (!nonEmptyString(r.handler)) return bad("route_handler_invalid");
+    // 相对路径会按 dispatcher 的当前工作目录解析 —— 同一张表在不同项目目录下
+    // 会执行不同脚本，并把完整 Canonical Event 交给错的消费者。
+    // 只在写入口拦不住：旧表是直接读进来的，从没经过写入口。
+    if (!path.isAbsolute(r.handler)) return bad("route_handler_not_absolute");
     if (r.enabled !== undefined && typeof r.enabled !== "boolean") return bad("route_enabled_not_boolean");
     if (r.default !== undefined && typeof r.default !== "boolean") return bad("route_default_not_boolean");
     // id 重复时"哪个生效"没有确定答案，只有数组顺序 —— 那不是答案。
@@ -153,14 +158,18 @@ export const ROUTE_REJECT_TEXT = {
  */
 export function selectRoute({ sessionId, routes, sessions }) {
   const list = Array.isArray(routes) ? routes : [];
-  if (list.length === 0) return { ok: false, reason: ROUTE_REJECT.NO_HANDLER };
 
+  // 先看这个话题登记过什么，再谈有没有活动路由。反过来的话，登记指向唯一那条
+  // 且它被停用时，报的是"本机没配路由"而不是"这个话题登记的路由不存在" ——
+  // 两者都安全 fail-closed，但前者会让排查往错的方向走。
   const declared = sessions?.[sessionId];
   if (typeof declared === "string") {
     const hit = list.find((r) => r.id === declared);
     if (!hit) return { ok: false, reason: ROUTE_REJECT.UNKNOWN_ROUTE, declared };
     return { ok: true, route: hit, matchedBy: "session_registration" };
   }
+
+  if (list.length === 0) return { ok: false, reason: ROUTE_REJECT.NO_HANDLER };
 
   const fallback = list.find((r) => r.isDefault) ?? (list.length === 1 ? list[0] : null);
   if (!fallback) return { ok: false, reason: ROUTE_REJECT.NO_HANDLER, candidates: list.length };

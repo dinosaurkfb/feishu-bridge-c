@@ -5321,6 +5321,63 @@ test("路由表内部歧义一律 fail-closed，不只查顶层形状", () => {
   assert.equal(validateRoutesDoc({ custom: 1, routes: [{ id: "a", handler: "/a", extra: {} }] }).ok, true);
 });
 
+test("相对路径 handler 在每一处都要被拒，旧表也不例外", () => {
+  const doc = { routes: [{ id: "r", handler: "relative.mjs", default: true }], sessions: {} };
+  // 相对路径按 dispatcher 的 cwd 解析 —— 同一张表在不同项目目录下会执行不同脚本。
+  assert.equal(validateRoutesDoc(doc).problem, "route_handler_not_absolute");
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-rel-"));
+  const routesFile = path.join(dir, "routes.json");
+  const before = JSON.stringify(doc);
+  fs.writeFileSync(routesFile, before);
+  // 只在写入口拦不住：这张表是直接读进来的，从没经过写入口。
+  assert.equal(loadRoutes(routesFile).reason, ROUTE_REJECT.TABLE_SHAPE);
+  assert.equal(registerRoute({ id: "n", handler: process.execPath, file: routesFile }).reason,
+    ROUTE_REJECT.TABLE_SHAPE);
+  assert.equal(fs.readFileSync(routesFile, "utf-8"), before);
+
+  let spawned = 0;
+  const out = [];
+  const result = runInboundDispatcher({
+    endpointId: "m5codex",
+    expectedCallerAgentUid: "agent_expected",
+    defaultRoute: { id: "codex", handler: path.join(dir, "fallback.mjs") },
+    routesFile,
+    env: { AILY_CLI_CALLER_AGENT_UID: "agent_expected", AILY_CLI_SESSION_ID: "s" },
+    stdout: { write: (x) => out.push(x) }, stderr: { write: () => {} },
+    fetcher: () => ({ ok: true, attempts: 1, raw_envelope: { type: "message.create" }, event: {
+      message_id: "m-rel", session_id: "s-rel", sender_id: "frank",
+      created_at_ms: NOW, content: "执行",
+    } }),
+    spawnHandler: () => { spawned += 1; return { status: 0 }; },
+  });
+  assert.equal(spawned, 0, "解释不了的表不得投递给任何 handler");
+  assert.notEqual(result.exitCode, 0);
+});
+
+test("纯空白的 id 与 owner 判为无效", () => {
+  // 纯空白拿去比较、拿去打日志都像"有值"，实际什么都定位不到。
+  assert.equal(validateRoutesDoc({ routes: [{ id: "   ", handler: "/a" }] }).problem, "route_id_invalid");
+  assert.equal(validateRoutesDoc({ routes: [{ id: "a", handler: "  " }] }).problem, "route_handler_invalid");
+  assert.equal(validateRoutesDoc({ routes: [], sessions: { s: "  " } }).problem, "session_owner_invalid");
+  assert.equal(validateRoutesDoc({ routes: [], sessions: { "  ": "a" } }).problem, "session_id_invalid");
+});
+
+test("话题登记指向唯一但已停用的路由：报登记问题，不报本机没配路由", () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-dang-")), "routes.json");
+  fs.writeFileSync(f, JSON.stringify({
+    routes: [{ id: "only", handler: process.execPath, enabled: false }],
+    sessions: { s: "only" },
+  }));
+  const t = loadRoutes(f);
+  assert.equal(t.ok, true, "停用不等于表坏了 —— 一条坏映射不该拖垮别的话题");
+  assert.deepEqual(t.routes, []);
+  // 两种都安全 fail-closed，但报错方向不同会把排查带偏。
+  assert.equal(selectRoute({ sessionId: "s", ...t }).reason, ROUTE_REJECT.UNKNOWN_ROUTE);
+  // 没登记过的话题在没有活动路由时，仍然是"本机没配路由"。
+  assert.equal(selectRoute({ sessionId: "other", ...t }).reason, ROUTE_REJECT.NO_HANDLER);
+});
+
 test("重复 id 不许让数组顺序变成选路依据", () => {
   const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-dup-")), "routes.json");
   fs.writeFileSync(f, JSON.stringify({

@@ -6121,7 +6121,10 @@ test("import 两侧 inbound.mjs 不得产生任何输出或状态写入", () => 
     assert.equal(run.signal, null, rel + " 被 import 时不得被信号杀死");
     assert.equal(run.error, undefined, rel + " 子进程本身不得启动失败");
     assert.equal(run.stdout, "", rel + " 被 import 时不得有 stdout —— 那是给飞书的回执");
-    assert.doesNotMatch(String(run.stderr), /IMPORT_THREW/u, rel + " 被 import 时不得抛");
+    // 测试名说的是"不得产生任何输出"，那就直接断言 stderr 为空，而不是只查有没有出现
+    // 某个哨兵字符串 —— 后者放过了"import 时输出了别的东西"这整类情况。
+    // 哨兵仍留在子进程脚本里，为的是让 import 真的抛时错误信息更好认。
+    assert.equal(run.stderr, "", rel + " 被 import 时不得有 stderr（含抛出的错误）");
     const created = [];
     const walk = (dir) => {
       for (const e of fs.readdirSync(dir, { withFileTypes: true })) {

@@ -54,6 +54,12 @@ export function currentBinding({ root, claudeSessionId, registryFile, templateFi
     ok: true,
     root,
     source: resolved.source,
+    // 出站发布是不是每轮自动发。inbound.mjs 和 watch-and-publish.mjs 都读这个字段，
+    // 只有 status 没读，于是配置关掉了也照样显示"每轮自动发布"。
+    // 读不到 config 时给 null —— 让展示层报"状态不可用"，不许默认成开启。
+    autoPublish: resolved.config
+      ? resolved.config.auto_publish_on_completion !== false
+      : null,
     level: resolved.bindingLevel,
     claudeSessionId: resolved.claudeSessionId,
     status: m.status ?? "active",

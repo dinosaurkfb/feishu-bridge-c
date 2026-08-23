@@ -248,21 +248,7 @@ export function collectStatusProviders({ file = statusProvidersPath(), run = run
   const loaded = loadStatusProviders(file);
   if (!loaded.ok) return { ok: false, reason: loaded.reason, problem: loaded.problem, sections: [] };
 
-  const sections = [];
-  for (const provider of loaded.providers) {
-    if (!provider.enabled) {
-      sections.push({ id: provider.id, displayName: provider.displayName,
-        allowedKinds: provider.allowedKinds, projectRoot: provider.projectRoot, state: "disabled" });
-      continue;
-    }
-    const got = run(provider);
-    const base = { id: provider.id, displayName: provider.displayName,
-      allowedKinds: provider.allowedKinds, projectRoot: provider.projectRoot };
-    sections.push(got.ok
-      ? { ...base, state: "ok", connections: got.connections }
-      : { ...base, state: "unavailable", reason: got.reason });
-  }
-  return { ok: true, sections };
+  return { ok: true, sections: runProviders(loaded.providers, run) };
 }
 
 /**
@@ -278,16 +264,17 @@ export function collectStatusProviders({ file = statusProvidersPath(), run = run
 export function collectProjectConnectivity({
   root, providersFile = statusProvidersPath(), run = runStatusProvider,
 } = {}) {
-  const all = collectStatusProviders({ file: providersFile, run });
-  if (!all.ok) return { sections: [], providersProblem: all.problem ?? all.reason, routesProblem: null };
+  const loaded = loadStatusProviders(providersFile);
+  if (!loaded.ok) {
+    return { sections: [], providersProblem: loaded.problem ?? loaded.reason, routesProblem: null };
+  }
+  // **先过滤再执行。**上一版跑完全部 provider 再按归属过滤显示 —— 界面上看着
+  // 只有当前项目，实际已经把别的项目的脚本在 Frank 的交互会话里跑了一遍。
+  // 项目范围要是只管显示不管执行，那它就不是范围。
   const want = typeof root === "string" ? path.resolve(root) : null;
-  return {
-    sections: all.sections.filter((x) =>
-      want !== null && x.projectRoot !== null && x.projectRoot !== undefined &&
-      path.resolve(x.projectRoot) === want),
-    providersProblem: null,
-    routesProblem: null,
-  };
+  const mine = loaded.providers.filter((p) =>
+    want !== null && typeof p.projectRoot === "string" && path.resolve(p.projectRoot) === want);
+  return { sections: runProviders(mine, run), providersProblem: null, routesProblem: null };
 }
 
 /**
@@ -334,6 +321,21 @@ export function collectConnectivity({
     providersProblem: fromProviders.ok ? null : (fromProviders.problem ?? fromProviders.reason),
     routesProblem: table.ok ? null : table.reason,
   };
+}
+
+/** 跑一批 provider。停用的不跑 —— 停用就该是"连执行都不发生"。 */
+function runProviders(providers, run) {
+  const sections = [];
+  for (const provider of providers) {
+    const base = { id: provider.id, displayName: provider.displayName,
+      allowedKinds: provider.allowedKinds, projectRoot: provider.projectRoot };
+    if (!provider.enabled) { sections.push({ ...base, state: "disabled" }); continue; }
+    const got = run(provider);
+    sections.push(got.ok
+      ? { ...base, state: "ok", connections: got.connections }
+      : { ...base, state: "unavailable", reason: got.reason });
+  }
+  return sections;
 }
 
 const KIND_TEXT = { transport: "消息运输", progress: "进度汇报" };

@@ -39,18 +39,11 @@ const projectLinks = collectProjectConnectivity({ root });
 const layeredConnectivity = renderConnectivity(projectLinks, { heading: null });
 const connectivity = renderConnectivity(projectLinks);
 
-if (!st.ok) {
-  // 没绑定就没有四层可言，照旧给接入指引；本机其他链路仍然值得看见。
-  console.log(describeStatus(st, bindingsForRoot({ root })));
-  if (connectivity) console.log("\n" + connectivity);
-  process.exit(0);
-}
-
 console.log(renderLayeredStatus(composeLayeredStatus({
   st,
   others: bindingsForRoot({ root }),
   endpoint: endpointFacts({ agentName: tpl?.transport_agent_name ?? null }),
-  subscription: subscriptionFacts(buildClaudeSubscriptionProjection({}),
+  subscription: subscriptionFacts(buildClaudeSubscriptionProjection({ projectRoot: root }),
     { groupName: tpl?.chat_name ?? null }),
   connectivity: layeredConnectivity,
 })));

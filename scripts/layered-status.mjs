@@ -24,6 +24,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { verifyRuntime } from "./runtime-install.mjs";
+
 /** 端点自检尚未实现。这个常量存在本身就是为了让"未实现"是显式的，而不是遗漏。 */
 export const ENDPOINT_SELF_CHECK = "not_implemented";
 
@@ -44,6 +46,7 @@ export function endpointFacts({
   agentName = null,
   runtimeDir = runtimeDirDefault(),
   inboundLog = inboundLogDefault(),
+  verify = () => verifyRuntime(),
 } = {}) {
   let version = null;
   try {
@@ -51,10 +54,17 @@ export function endpointFacts({
     version = path.basename(target).slice(0, 12);
   } catch { /* 没装或读不到 */ }
 
+  // **能读到符号链接不等于装好了。**上一版只看链接在不在，于是一个指向不存在目录的
+  // current 也会显示"已安装"。三种状态要分开：没装 / 装好了 / 装的东西有问题。
+  const verified = verify();
+  const install = verified.ok ? "ok"
+    : verified.reason === "current_absent" ? "absent" : "broken";
+
   return {
     runtime,
     agentName,
-    installed: version !== null,
+    install,
+    installReason: verified.ok ? null : verified.reason,
     version,
     selfCheck: ENDPOINT_SELF_CHECK,
     lastInboundAt: lastSuccessfulDispatchAt(inboundLog),
@@ -118,13 +128,19 @@ const relative = (ms, now) => {
 export function composeLayeredStatus({
   st, others = [], endpoint, subscription, connectivity = null, now = Date.now(),
 }) {
+  // **没绑定不等于没有四层。**第 1、2 层照样有事实可报，只是第 3 层还没绑、
+  // 第 4 层无从谈起。上一版在这里直接退回旧格式，等于四层模型在最需要它的时候消失。
+  const bound = st.ok === true;
   const L1 = [
     ["运行时", endpoint.runtime],
     // 运输 agent 的名字是模板里就有的，报名字比报 UID 有用且不算 locator。
     ["运输 agent", endpoint.agentName ?? "名称不可用"],
     // 上一版把版本号跟运行时拼在一行，被读成了 agent id。它是脚本内容哈希。
     ["运行时版本", endpoint.version ?? "未安装"],
-    ["安装状态", endpoint.installed ? "已安装" : "未安装"],
+    ["安装状态", endpoint.install === "ok" ? "已安装"
+      : endpoint.install === "absent" ? "未安装"
+      // 损坏、漂移、链接异常都不是"正常"，也不是"没装"。
+      : "不可用（" + (endpoint.installReason ?? "unknown") + "）"],
     // FR-1.4 未实现。写出来，别让空白被读成"没问题"。
     ["实时自检", "未自检（端点自检 FR-1.4 尚未实现）"],
   ];
@@ -134,6 +150,10 @@ export function composeLayeredStatus({
   const L2 = [];
   if (!subscription.ok) {
     L2.push(["订阅状态", "读不到（" + subscription.reason + "）"]);
+  } else if (subscription.items.length === 0 && st.source === "project-files") {
+    // **"投影覆盖不到"不等于"没有订阅"。**这个项目的绑定住在项目内文件里，
+    // 而订阅投影是从 registry 建的 —— 报"没有事件订阅"就是把看不见说成了不存在。
+    L2.push(["订阅状态", "不可用（本项目绑定走项目内文件，订阅投影未覆盖）"]);
   } else if (subscription.items.length === 0) {
     L2.push(["订阅状态", "本项目没有事件订阅"]);
   } else {
@@ -148,9 +168,32 @@ export function composeLayeredStatus({
     }
   }
 
+  if (!bound) {
+    // not_bound 和"读不出来"必须分开：前者是还没接，后者是配错了或文件坏了。
+    const why = st.reason === "not_bound"
+      ? "尚未绑定（接入：node scripts/bind-project.mjs --apply）"
+      : "状态不可读（" + (st.reason ?? "unknown") + "）";
+    return {
+      layers: [
+        { n: 1, title: "运行端点连接", rows: L1 },
+        { n: 2, title: "事件订阅", rows: L2 },
+        { n: 3, title: "精确通道绑定", rows: [["绑定状态", why]] },
+        { n: 4, title: "交互策略", rows: [["交互模式", "尚无通道策略（要先有绑定）"]] },
+      ],
+      // 待处理区也要跟着分开 —— 上一版两种情形共用"不适用（尚未绑定）"，
+      // 正是我在第 3 层要求分开的那件事，自己在这里又合回去了。
+      pendingEvents: [["待发布答复", st.reason === "not_bound"
+        ? "不适用（尚未绑定）" : "不适用（绑定状态不可读）"]],
+      connectivity,
+      suspended: false,
+    };
+  }
+
   const L3 = [
-    // 话题标题就是「🌉 项目名」。上一版删掉总判断那行时，把项目名一起弄丢了。
-    ["话题", st.displayName ? "🌉 " + st.displayName : "名称不可用"],
+    // 叫"绑定名称"而不是"话题名"：这是绑定时用的名字，也是话题创建时的标题，
+    // 但用户可以在飞书里改名，本地没有读取当前标题的权威事实 —— 说成"话题名"
+    // 就是在声称一件我们没查过的事。
+    ["绑定名称", st.displayName ? "🌉 " + st.displayName : "名称不可用"],
     ["绑定级别", st.level === "session"
       ? "这条工作线单独绑定"
       : "整个项目共用一个话题"],
@@ -181,7 +224,12 @@ export function composeLayeredStatus({
     const max = Number.isInteger(st.activeGenerationThreshold) ? st.activeGenerationThreshold : 30;
     L4.push(["自动轮转", used + " / " + max + " 条（还剩 " + Math.max(0, max - used) + " 条）"]);
   }
-  L4.push(["出站发布", st.suspended ? "暂停中，进展留在本地不发出" : "每轮自动发布"]);
+  // **不许无条件声称"每轮自动发布"。**配置里明确关掉时也照样这么显示，是在报一个
+  // 没查过的结论；读不到配置时更不能默认成开启。
+  L4.push(["出站发布", st.suspended ? "暂停中，进展留在本地不发出"
+    : st.autoPublish === true ? "每轮自动发布"
+    : st.autoPublish === false ? "仅入队，未启用自动发布"
+    : "状态不可用（读不到发布配置）"]);
 
   const L5 = [["待发布答复", st.pending + " 条" + (st.pending && st.suspended ? "（恢复后会发出）" : "")]];
 

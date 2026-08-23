@@ -203,15 +203,22 @@ export function findPendingBinding({ content, registryFile, templateFile, now = 
 }
 
 /** 现有 Claude registry → Subscription v1；纯投影，不写 registry 或新控制面目录。 */
-export function buildClaudeSubscriptionProjection({ registryFile, templateFile } = {}) {
+export function buildClaudeSubscriptionProjection({
+  registryFile, templateFile, projectRoot = null,
+} = {}) {
   const registry = loadRegistry(registryFile);
   if (!registry.ok) return { ok: false, reason: "registry_unreadable" };
   const loaded = loadChainTemplate(templateFile);
   if (!loaded.ok) return { ok: false, reason: "template_unusable" };
   const template = loaded.template;
   const endpointId = legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid });
+  // 默认仍是全局视图 —— 首次认领 shadow 需要它，这个默认不能改。
+  // 传了 projectRoot 就只投影那一个项目：status 说"当前项目"，
+  // 就不能把别人的订阅和待认领计数算进来。
+  const want = typeof projectRoot === "string" ? path.resolve(projectRoot) : null;
   const records = [];
   for (const entry of registry.projects) {
+    if (want !== null && path.resolve(entry.root ?? "") !== want) continue;
     // 旧安装把根消息和绑定放在项目内 active-mapping.json，registry 只登记 root。
     // 这些行没有 root_message_id，但仍是现行数据面的真实绑定，投影不能把它们漏掉。
     const resolved = entry.root_message_id

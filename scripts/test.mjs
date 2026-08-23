@@ -13,6 +13,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { moduleDir } from "./direct-run.mjs";
 
 import {
@@ -7113,6 +7114,35 @@ test("控制参数走白名单：未知、拼错、裸参数、重复、缺值�
 
   // 拒的是"说不清的命令"，不是这些操作本身。
   assert.equal(cli(["--id", "probe", "--unregister", "--apply"]).status, 0);
+});
+
+test("被 import 时不得被调用方自己的命令行参数影响", () => {
+  // 现成的"被 import 时不得有 stderr"那条守卫抓不到这个：它 import 时 argv 是干净的。
+  // 参数解析一旦落在模块顶层，isDirectRun 就只护住了 main()。
+  for (const rel of ["register-status-provider.mjs", "register-route.mjs", "group-binding-status.mjs"]) {
+    // 模块路径必须写进代码里，不能当 argv[1] 传 —— 那会让 isDirectRun 判成直接执行，
+    // 探针就测不到"被 import"这个场景了。
+    const target = pathToFileURL(path.resolve("scripts", rel)).href;
+    const probe = "process.argv.push('caller.mjs','--caller-option','x','裸参数');" +
+      "import(" + JSON.stringify(target) + ").then(() => console.log('ok'));";
+    const run = spawnSync(process.execPath, ["-e", probe], { encoding: "utf-8" });
+    assert.equal(run.status, 0, rel + " 被 import 时不该以调用方的参数为准：" + run.stderr);
+    assert.equal(run.stderr, "", rel + " 被 import 时不得有 stderr");
+    assert.equal(run.stdout.trim(), "ok", rel + " 被 import 时不得有额外输出");
+  }
+});
+
+test("直接执行时参数校验仍然严格", () => {
+  // 上一条如果做过头（比如干脆不校验了），这条会亮。
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"),
+    "--id", "x", "--unregister", "--unknown-option", "y", "--apply",
+  ], { encoding: "utf-8", env: {
+    ...process.env,
+    FEISHU_BRIDGE_STATUS_PROVIDERS: path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-imp-")), "p.json"),
+  } });
+  assert.notEqual(run.status, 0);
+  assert.match(run.stderr, /unknown_option/u);
 });
 
 summarySealed = true;

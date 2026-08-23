@@ -53,9 +53,13 @@ const REASON_TEXT = {
  * `... -- --apply` 会真的落盘 —— 一个透传给 provider 的参数，
  * 越过了这个命令唯一的授权闸门。控制面和数据面混在一个数组里就会这样。
  */
-const SPLIT_AT = process.argv.indexOf("--", 2);
-const CONTROL = SPLIT_AT >= 0 ? process.argv.slice(2, SPLIT_AT) : process.argv.slice(2);
-const PASSTHROUGH = SPLIT_AT >= 0 ? process.argv.slice(SPLIT_AT + 1) : [];
+function splitArgv(argv) {
+  const at = argv.indexOf("--", 2);
+  return {
+    control: at >= 0 ? argv.slice(2, at) : argv.slice(2),
+    passthrough: at >= 0 ? argv.slice(at + 1) : [],
+  };
+}
 
 /**
  * 严格解析控制段。**白名单，不是黑名单。**
@@ -67,7 +71,7 @@ const PASSTHROUGH = SPLIT_AT >= 0 ? process.argv.slice(SPLIT_AT + 1) : [];
 const FLAGS = new Set(["apply", "replace", "unregister"]);
 const OPTIONS = new Set(["id", "script", "executable", "kinds", "display-name"]);
 
-function parseControl(tokens) {
+export function parseControl(tokens) {
   const seen = new Map();
   for (let i = 0; i < tokens.length; i += 1) {
     const t = tokens[i];
@@ -88,18 +92,7 @@ function parseControl(tokens) {
   return { ok: true, seen };
 }
 
-const parsed = parseControl(CONTROL);
-if (!parsed.ok) {
-  console.error("失败（" + parsed.reason + "）：" +
-    (REASON_TEXT[parsed.reason] ?? parsed.reason) + (parsed.detail ? "：" + parsed.detail : ""));
-  process.exit(1);
-}
 
-function arg(name) {
-  const v = parsed.seen.get(name);
-  return typeof v === "string" ? v : undefined;
-}
-function has(name) { return parsed.seen.has(name); }
 
 function fail(reason, detail) {
   console.error("失败（" + reason + "）：" + (REASON_TEXT[reason] ?? reason) +
@@ -208,6 +201,22 @@ function describePlan(plan) {
 const PLAN_FAILS = new Set(["registry_unreadable", "registry_invalid", "conflict"]);
 
 function main() {
+  // **解析放在 main 里面。**上一版它在模块顶层，于是 isDirectRun 只护住了 main()，
+  // 没护住解析：任何 import 这个模块的程序都会被**调用方自己的**命令行参数搞崩，
+  // 而现成的"被 import 时不得有 stderr"那条守卫抓不到 —— 它 import 时 argv 是干净的。
+  const { control, passthrough } = splitArgv(process.argv);
+  const parsed = parseControl(control);
+  if (!parsed.ok) {
+    console.error("失败（" + parsed.reason + "）：" +
+      (REASON_TEXT[parsed.reason] ?? parsed.reason) + (parsed.detail ? "：" + parsed.detail : ""));
+    process.exit(1);
+  }
+  const arg = (name) => {
+    const v = parsed.seen.get(name);
+    return typeof v === "string" ? v : undefined;
+  };
+  const has = (name) => parsed.seen.has(name);
+
   const apply = has("apply");
   const replace = has("replace");
   const unregister = has("unregister");
@@ -222,7 +231,7 @@ function main() {
     // 白名单已经挡掉未知参数；这里管的是"已知但在本模式下无意义"的那几个。
     const ignored = [...OPTIONS].filter((k) => k !== "id" && has(k));
     if (ignored.length > 0) fail("unregister_takes_no_config", ignored.join("、"));
-    if (PASSTHROUGH.length > 0) fail("unregister_takes_no_args");
+    if (passthrough.length > 0) fail("unregister_takes_no_args");
   }
   const executable = arg("executable") ?? process.execPath;
   const kinds = (arg("kinds") ?? "transport").split(",").map((k) => k.trim()).filter(Boolean);
@@ -239,7 +248,7 @@ function main() {
 
   const entry = unregister ? { id } : {
     id, protocol: PROVIDER_PROTOCOL, executable, script,
-    args: PASSTHROUGH, allowed_kinds: kinds,
+    args: passthrough, allowed_kinds: kinds,
     ...(displayName ? { display_name: displayName } : {}),
   };
 

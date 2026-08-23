@@ -406,18 +406,45 @@ export function setTaskDisplayName({ threadId, name, home = bridgeHome() } = {})
 }
 
 /** 安装新发布合同时一次性迁移所有既有 task；暂停项恢复后也应沿用同一合同。 */
-export function enableAutoPublishForAllTasks({ home = bridgeHome() } = {}) {
+/** 这次迁移的身份。写进结果里，让"跑没跑过、跑的是哪一版"变成可回答的问题。 */
+export const AUTO_PUBLISH_MIGRATION_ID = "auto_publish_on_completion_v1";
+
+/**
+ * 把既有 task 迁移到「完成即自动发布」。
+ *
+ * **默认只预览，`apply: true` 才写。**原来它挂在安装器上，每次 `--apply` 都会把所有
+ * task 的 auto_publish_on_completion 强改为 true —— 那是在改**订阅策略**，不是装基础设施。
+ * 后果是：装一次基础设施，顺手把每条绑定的发布行为改掉，而且不预览、不留痕、不可选。
+ *
+ * 新绑定不依赖这次迁移：登记时就默认 true（见 registerTask）。这里只处理历史 task。
+ */
+export function enableAutoPublishForAllTasks({ home = bridgeHome(), apply = false } = {}) {
+  const file = registryFile(home);
+  const preview = loadRegistry(file);
+  if (!preview.ok) return preview;
+  const pending = preview.tasks.filter((task) => task.auto_publish_on_completion !== true);
+  const summary = {
+    ok: true,
+    migration: AUTO_PUBLISH_MIGRATION_ID,
+    tasks: preview.tasks.length,
+    changed: pending.length,
+    // 只出计数与脱敏名称，不出 thread locator。
+    names: pending.map((task) => task.task_display_name ?? task.id ?? "(未命名)"),
+  };
+  if (!apply) return { ...summary, applied: false };
+  if (pending.length === 0) return { ...summary, applied: true, changed: 0 };
+
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return { ok: false, reason: "registry_busy" };
   try {
-    const file = registryFile(home);
+    // 取锁之后重读：预览与落盘之间可能有绑定写入，拿旧快照整体写回会把它抹掉。
     const reg = loadRegistry(file);
     if (!reg.ok) return reg;
-    const changed = reg.tasks.filter((task) => task.auto_publish_on_completion !== true).length;
-    if (changed === 0) return { ok: true, changed: 0, tasks: reg.tasks.length };
+    const actually = reg.tasks.filter((task) => task.auto_publish_on_completion !== true).length;
+    if (actually === 0) return { ...summary, applied: true, changed: 0 };
     writeRegistry(reg.tasks.map((task) => ({ ...task, auto_publish_on_completion: true })), file);
-    return { ok: true, changed, tasks: reg.tasks.length };
+    return { ...summary, applied: true, changed: actually, tasks: reg.tasks.length };
   } catch (err) {
     return { ok: false, reason: "registry_unwritable", error: err.message };
   } finally {

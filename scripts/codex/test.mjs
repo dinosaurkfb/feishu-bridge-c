@@ -1931,7 +1931,11 @@ test("安装器在隔离 HOME 只追加 hooks、渲染技能路径且保留已�
   }
   assert.equal(fs.existsSync(path.join(home, "registry.json")), true);
   assert.equal(fs.statSync(path.join(home, "receipts")).isDirectory(), true);
-  assert.equal(loadRegistry(path.join(home, "registry.json")).tasks[0].auto_publish_on_completion, true);
+  // **安装不再改订阅策略。**这条原来断言的正是"安装会把 task 的
+  // auto_publish_on_completion 改成 true" —— 那是装基础设施顺手改掉每条绑定的发布行为，
+  // 不预览、不留痕、不可选。现在它必须保持原样，迁移走显式的 migrate-auto-publish.mjs。
+  assert.equal(loadRegistry(path.join(home, "registry.json")).tasks[0].auto_publish_on_completion,
+    false, "安装不得改动既有 task 的发布策略");
 });
 
 test("入站前置回执目录不可写时只返回脱敏错误，不泄露 Node 堆栈", () => {
@@ -1957,8 +1961,16 @@ test("自动发布登记迁移幂等，暂停 task 也保留恢复后的发布�
   paused.auto_publish_on_completion = false;
   paused.status = "paused";
   writeRegistry([active, paused], path.join(home, "registry.json"));
-  assert.equal(enableAutoPublishForAllTasks({ home }).changed, 2);
-  assert.equal(enableAutoPublishForAllTasks({ home }).changed, 0);
+  // 默认只预览：报得出待迁移数，但不写。
+  const preview = enableAutoPublishForAllTasks({ home });
+  assert.equal(preview.changed, 2);
+  assert.equal(preview.applied, false, "不带 apply 不得落盘");
+  assert.equal(preview.migration, "auto_publish_on_completion_v1", "迁移要有版本身份");
+  assert.equal(enableAutoPublishForAllTasks({ home }).changed, 2,
+    "预览不改变状态，所以再预览一次数字不变");
+
+  assert.equal(enableAutoPublishForAllTasks({ home, apply: true }).changed, 2);
+  assert.equal(enableAutoPublishForAllTasks({ home, apply: true }).changed, 0);
   assert.deepEqual(loadRegistry(path.join(home, "registry.json")).tasks.map((task) => task.auto_publish_on_completion),
     [true, true]);
 });

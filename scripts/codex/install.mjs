@@ -145,11 +145,13 @@ if (!uninstall && !fs.existsSync(registryFile(home))) {
 if (!uninstall) {
   // task 尚未路由成功时的脱敏错误回执使用这个目录；提前创建，避免首个错误路径才 mkdir。
   fs.mkdirSync(path.join(home, "receipts"), { recursive: true, mode: 0o700 });
-  const migrated = enableAutoPublishForAllTasks({ home });
-  if (!migrated.ok) {
-    console.error("自动发布合同迁移失败：" + migrated.reason + (migrated.error ? "（" + migrated.error + "）" : ""));
-    process.exit(1);
+  // **安装不再改订阅策略。**原来这里会把所有已登记 task 的 auto_publish_on_completion
+  // 强改为 true —— 装一次基础设施，顺手把每条绑定的发布行为改掉，不预览、不留痕、不可选。
+  // 新绑定登记时就默认开启，不依赖这一步；历史 task 走显式的 migrate-auto-publish.mjs。
+  const pendingMigration = enableAutoPublishForAllTasks({ home });
+  if (pendingMigration.ok && pendingMigration.changed > 0) {
+    console.log("自动发布  有 " + pendingMigration.changed + " 个历史 task 尚未启用；" +
+      "要迁移请显式运行 scripts/codex/migrate-auto-publish.mjs --apply");
   }
-  console.log("自动发布  已为 " + migrated.tasks + " 个已登记 task 启用（本次更新 " + migrated.changed + " 个）");
 }
 console.log("\n已完成本地安装。下一次 Codex 载入 hook 时会要求信任；请核对命令后再确认。");

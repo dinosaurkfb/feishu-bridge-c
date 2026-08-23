@@ -112,7 +112,9 @@ export function publishErrorDetail(err) {
   return clipBothEnds(detail);
 }
 
-export function drainProject({ root, claudeSessionId, dryRun = false, timeoutMs } = {}) {
+export function drainProject({
+  root, claudeSessionId, dryRun = false, timeoutMs, force = false,
+} = {}) {
   const outboxDir = outboxDirOf(root, claudeSessionId);
 
   // 先看有没有东西可发。绝大多数会话在这一行就返回了 —— 不读配置、不碰锁。
@@ -139,6 +141,21 @@ export function drainProject({ root, claudeSessionId, dryRun = false, timeoutMs 
     };
   }
   const { config: cfg, mapping } = resolved;
+
+  // **发布开关要真的管住自动发布。**
+  //
+  // 它叫 auto_publish_on_completion，但此前只有 inbound.mjs 和 watch-and-publish.mjs
+  // 读它 —— 每轮 Stop 和 30 分钟兜底都不读，而那两条恰好是 Claude 侧的主路径。
+  // 于是把它设成 false 几乎什么都不改变，进展照发：**一个不生效的开关**。
+  //
+  // 现在默认遵守。显式人工排空要绕过就用 --force —— 绕过必须是明说的，
+  // 不能靠"哪个入口调的"来隐式决定。
+  if (!force && cfg.auto_publish_on_completion === false) {
+    return {
+      status: "skipped", root, reason: "auto_publish_disabled",
+      count: listPending({ outboxDir }).length,
+    };
+  }
 
   // 绑定失效时不发：话题可能已经不再是 Frank 认可的那个。
   if (mapping.status !== "active") {
@@ -264,13 +281,15 @@ if (isDirectRun(import.meta.url)) {
     targets = [{ root: arg("project") ?? SELF_ROOT, claudeSessionId: arg("session") ?? null }];
   }
 
+  // 绕过发布开关必须明说。
+  const force = process.argv.includes("--force");
   let hadError = false;
   for (const { root, claudeSessionId } of targets) {
     const tag = targets.length > 1
       ? path.basename(root) +
         (claudeSessionId ? "/" + String(claudeSessionId).slice(0, 8) : "") + ": "
       : "";
-    const r = drainProject({ root, claudeSessionId, dryRun });
+    const r = drainProject({ root, claudeSessionId, dryRun, force });
 
     if (r.status === "published") {
       console.log(tag + "已发布 " + r.count + " 条 -> " + r.messageId);

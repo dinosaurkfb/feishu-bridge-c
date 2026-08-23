@@ -7053,6 +7053,38 @@ test("Codex 侧：当前 task 未绑定时仍要显示全局链路", () => {
   assert.match(run.stdout, /cc2cd {2}链路存在，状态入口未登记/u);
 });
 
+test("歧义命令必须失败，不许被解释成破坏性更强的那个", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-amb-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"), "--id", "probe", ...args,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+
+  assert.equal(cli(["--script", script, "--apply"]).status, 0);
+  const before = fs.readFileSync(file, "utf-8");
+
+  // 上一版会静默选注销 —— 那是在替人做一个他没表达的决定。
+  const both = cli(["--script", script, "--replace", "--unregister", "--apply"]);
+  assert.notEqual(both.status, 0);
+  assert.match(both.stderr, /ambiguous_mode/u);
+
+  // 注销模式下静默忽略配置参数，会让人以为"顺手也更新了配置"。
+  const withConfig = cli(["--unregister", "--kinds", "progress", "--apply"]);
+  assert.notEqual(withConfig.status, 0);
+  assert.match(withConfig.stderr, /unregister_takes_no_config/u);
+  assert.match(withConfig.stderr, /kinds/u);
+
+  const withArgs = cli(["--unregister", "--apply", "--", "--binding", "/x.json"]);
+  assert.notEqual(withArgs.status, 0);
+  assert.match(withArgs.stderr, /unregister_takes_no_args/u);
+
+  assert.equal(fs.readFileSync(file, "utf-8"), before, "歧义命令一个字节都不该动");
+  // 干净的注销仍然可用 —— 拒的是歧义，不是注销本身。
+  assert.equal(cli(["--unregister", "--apply"]).status, 0);
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf-8")).providers.length, 0);
+});
+
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (failed > 0) {

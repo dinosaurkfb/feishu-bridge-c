@@ -31,7 +31,10 @@ const REASON_TEXT = {
   allowed_kinds_invalid: "--kinds 只能是 " + PROVIDER_KINDS.join(" / "),
   provider_id_duplicated: "登记表里已经有同名 provider",
   provider_exists_with_other_script: "这个 id 已经指向别的脚本",
-  provider_exists_with_other_settings: "这个 id 已登记，但以下字段不同；改登记要显式先注销",
+  provider_exists_with_other_settings: "这个 id 已登记，但以下字段不同",
+  ambiguous_mode: "--replace 和 --unregister 不能同时给；请分别执行",
+  unregister_takes_no_config: "注销模式下这些参数无效，去掉它们再执行",
+  unregister_takes_no_args: "注销模式下不接受 -- 之后的透传参数",
   status_providers_unreadable: "登记表读不出来 —— 先修表，别覆盖它",
   status_providers_shape_unexpected: "登记表结构异常 —— 先修表，别覆盖它",
   providers_busy: "登记表正被别的进程写，稍后重试",
@@ -165,9 +168,19 @@ function main() {
   const apply = CONTROL.includes("--apply");
   const replace = CONTROL.includes("--replace");
   const unregister = CONTROL.includes("--unregister");
+  // 歧义命令**不许被解释成破坏性更强的那个**。--replace --unregister 同时给出时，
+  // 上一版静默选了注销 —— 那是在替人做一个他没表达的决定，跟显式授权正相反。
+  if (replace && unregister) fail("ambiguous_mode");
   const mode = unregister ? "unregister" : (replace ? "replace" : "add");
   const id = arg("id");
   const script = arg("script");
+  if (unregister) {
+    // 注销模式下这些参数没有任何作用。静默忽略会让人以为"我顺手也更新了配置"。
+    const ignored = ["script", "executable", "kinds", "display-name"]
+      .filter((k) => CONTROL.includes("--" + k));
+    if (ignored.length > 0) fail("unregister_takes_no_config", ignored.join("、"));
+    if (PASSTHROUGH.length > 0) fail("unregister_takes_no_args");
+  }
   const executable = arg("executable") ?? process.execPath;
   const kinds = (arg("kinds") ?? "transport").split(",").map((k) => k.trim()).filter(Boolean);
   const displayName = arg("display-name");

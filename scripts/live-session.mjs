@@ -91,6 +91,27 @@ export function writeDeliveryPin(root, claudeSessionId, { now = Date.now() } = {
   }
 }
 
+/**
+ * 钉住首选会话并留痕，**两步都失败也不许抛**。
+ *
+ * 这是投递路径上的副作用：目标已经选定了，钉不钉得住都不该影响这一条的交付。
+ * 上一版留痕直接调 recordClaimState，而它遇到 IO 错误会抛 —— 目录权限或磁盘
+ * 出问题时两次写入都失败，入站会在**真正投递之前**崩掉。
+ * 为了记一条诊断而丢掉一条已经确定目标的消息，是把次要目的放在主要目的前面。
+ */
+export function pinAndNote({ root, sessionId, noteFile, now = Date.now() }) {
+  const written = writeDeliveryPin(root, sessionId, { now });
+  if (written.ok) return { pinned: true, noted: false };
+  let noted = false;
+  try {
+    fs.appendFileSync(noteFile,
+      new Date(now).toISOString() + " delivery_pin_not_persisted " + written.reason + "\n",
+      { mode: 0o600 });
+    noted = true;
+  } catch { /* 记不下就算了，绝不因此挡住投递 */ }
+  return { pinned: false, noted, reason: written.reason };
+}
+
 /** 撤销首选。文件本来就不在也算成功 —— 目标状态是"没有钉"，已经是了就不算失败。 */
 export function clearDeliveryPin(root) {
   try {

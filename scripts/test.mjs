@@ -40,7 +40,7 @@ import {
 } from "./runtime-install.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
 import {
-  DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliveryPinPath, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin,
+  DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliveryPinPath, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin,
 } from "./live-session.mjs";
 import { extractReply } from "./stop-hook.mjs";
 import {
@@ -7750,6 +7750,33 @@ test("钉会话技能装出来之后，里面那条命令必须能跑", () => {
   assert.ok(fs.existsSync(script), "技能指向的脚本必须真的存在：" + script);
 });
 
+
+test("钉住与留痕都失败时，绝不抛 —— 这一条消息的交付不受影响", () => {
+  // 上一版留痕直接调 recordClaimState，而它遇到 IO 错误会抛：目录权限或磁盘出问题时
+  // 两次写入都失败，入站会在**真正投递之前**崩掉。
+  // 为了记一条诊断而丢掉一条已经确定目标的消息，是把次要目的放在主要目的前面。
+  const bad = "/nonexistent-root-" + Date.now();
+  const got = pinAndNote({
+    root: bad, sessionId: "s", noteFile: path.join(bad, "nope", "a.log"),
+  });
+  assert.equal(got.pinned, false);
+  assert.equal(got.noted, false, "留痕也失败了");
+  assert.ok(got.reason, "但要说得出为什么");
+
+  // 钉得住时不需要留痕。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pinnote-"));
+  const ok = pinAndNote({ root: dir, sessionId: "s-ok", noteFile: path.join(dir, "n.log") });
+  assert.deepEqual({ pinned: ok.pinned, noted: ok.noted }, { pinned: true, noted: false });
+  assert.equal(readDeliveryPin(dir), "s-ok");
+
+  // 钉不住但记得下时，痕迹要能回答"为什么没钉住"。
+  const noteDir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-note-"));
+  const noteFile = path.join(noteDir, "n.log");
+  const partial = pinAndNote({ root: bad, sessionId: "s", noteFile });
+  assert.equal(partial.pinned, false);
+  assert.equal(partial.noted, true);
+  assert.match(fs.readFileSync(noteFile, "utf-8"), /delivery_pin_not_persisted/u);
+});
 
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

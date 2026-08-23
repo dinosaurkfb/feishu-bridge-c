@@ -33,7 +33,7 @@ import { handOff, acquireSessionLock, releaseSessionLock, stampSessionLock } fro
 import {
   DELIVERY_REJECT, DELIVERY_REJECT_TEXT,
   deliverToLiveSession, findLiveSessionById, findLiveSessions, hasPriorSession,
-  readDeliveryPin, selectDeliverySession, stampInstruction, writeDeliveryPin,
+  pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction,
 } from "./live-session.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
 import {
@@ -488,13 +488,11 @@ if (boundSession) {
     if (picked.pin) {
       // 写不成不影响这一条的投递（目标已经选定了），但**不能假装钉住了** ——
       // 下一条消息会因为"没钉过"重新走歧义判断，而日志里若无痕迹就查不出为什么。
-      const pinned = writeDeliveryPin(config.project_dir, picked.pin);
-      if (!pinned.ok) {
-        // 留在 claim 里可对账 —— inbound 没有 log 通道，而"以为钉住了其实没钉"
-        // 会在下一条消息上表现成莫名其妙的歧义拒收，那时再查就没有痕迹了。
-        recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "note",
-          detail: { note: "delivery_pin_not_persisted", reason: pinned.reason } });
-      }
+      // 钉住 + 留痕都是 best-effort：目标已经选定，这两步失败都不该影响这一条的交付。
+      pinAndNote({
+        root: config.project_dir, sessionId: picked.pin,
+        noteFile: path.join(CLAIMS, claim.key + ".notes.log"),
+      });
     }
   } else if (picked.reason === DELIVERY_REJECT.AMBIGUOUS) {
     ambiguousDelivery = picked;

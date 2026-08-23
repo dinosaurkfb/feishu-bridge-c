@@ -75,6 +75,7 @@ import {
   legacyEventFromCanonical, validateCanonicalEvent,
 } from "./canonical-event.mjs";
 import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
+import { bindingToConnections } from "./group-binding-status.mjs";
 import {
   collectStatusProviders, loadStatusProviders, renderStatusProviders,
   validateProviderRegistry, validateProviderReport,
@@ -6646,6 +6647,76 @@ test("没有 provider 登记时，状态输出跟以前一模一样", () => {
   assert.equal(got.ok, true);
   assert.equal(loadStatusProviders(file).reason, "no_providers", "没有文件不是错误");
   assert.equal(renderStatusProviders(got), null, "没有内容就不该多出一节");
+});
+
+test("群级绑定 provider：只报群名，locator 一个都不出", () => {
+  const binding = {
+    schema_version: "1.0", artifact_type: "cc2cd_group_binding", bind_scope: "chat",
+    status: "active", chat_id: "oc_SECRET123456", chat_name: "Claude2Codex",
+    frank_aily_id: "7621020633916345545", transport_open_id: "ou_SECRET7890ab",
+    bound_at: "2026-08-21T00:00:00.000Z", expires_at: "2027-08-20T00:00:00.000Z",
+    sessions: { session_4kw4su42fsg4p: { thread_id: "omt_SECRETxyz" } },
+  };
+  const got = bindingToConnections(binding, { now: Date.parse("2026-08-23T00:00:00.000Z") });
+  assert.deepEqual(got.connections,
+    [{ kind: "transport", state: "active", scope: "chat", group_name: "Claude2Codex" }]);
+
+  // 聚合方那边虽然也拦（未知字段整条拒），但拦截是最后一道，不是唯一一道。
+  const text = JSON.stringify(got);
+  for (const secret of ["oc_SECRET123456", "ou_SECRET7890ab", "omt_SECRETxyz",
+    "session_4kw4su42fsg4p", "7621020633916345545"]) {
+    assert.equal(text.includes(secret), false, "不得出现 " + secret);
+  }
+});
+
+test("群级绑定 provider：状态按 status 与有效期推导", () => {
+  const base = { bind_scope: "chat", chat_name: "G", expires_at: "2027-08-20T00:00:00.000Z" };
+  const now = Date.parse("2026-08-23T00:00:00.000Z");
+  const state = (over) => bindingToConnections({ ...base, ...over }, { now }).connections[0].state;
+  assert.equal(state({ status: "active" }), "active");
+  assert.equal(state({ status: "suspended" }), "suspended");
+  // 状态写着 active、但已经过期 —— 报 active 就是在撒谎。
+  assert.equal(state({ status: "active", expires_at: "2020-01-01T00:00:00.000Z" }), "expired");
+  assert.equal(state({ status: "active", expires_at: "不是时间" }), "active");
+  assert.equal(state({ status: "什么鬼" }), "unknown");
+});
+
+test("群级绑定 provider：没绑过和解释不了要分开", () => {
+  // 「读不到」和「没绑过」对使用者是同一件事：没有已连接的群。
+  assert.deepEqual(bindingToConnections(null).connections, []);
+  // 但文件在、内容却读不懂时报"没有绑定"，是在替它下一个它不该下的结论。
+  for (const doc of [{ bind_scope: "什么鬼" }, [], "字符串", { chat_name: "G" }]) {
+    const got = bindingToConnections(doc);
+    assert.equal(got.ok, false, JSON.stringify(doc));
+    assert.equal(got.reason, "binding_shape_unexpected");
+  }
+});
+
+test("群级绑定 provider：实际跑一遍，输出能过聚合方的校验", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-gb-"));
+  const file = path.join(dir, "binding.json");
+  fs.writeFileSync(file, JSON.stringify({
+    bind_scope: "chat", status: "active", chat_id: "oc_SECRET123456",
+    chat_name: "Claude2Codex", expires_at: "2099-01-01T00:00:00.000Z",
+  }));
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "group-binding-status.mjs"),
+    "--provider-id", "cc2cd", "--binding", file,
+  ], { encoding: "utf-8" });
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(run.stdout.includes("oc_SECRET123456"), false, "进程实际输出里也不能有 locator");
+
+  // 自己产的报告要能过自己定的校验 —— 否则协议和实现是两张皮。
+  const checked = validateProviderReport(run.stdout, { providerId: "cc2cd", allowedKinds: ["transport"] });
+  assert.equal(checked.ok, true, checked.reason);
+  assert.equal(checked.connections[0].groupName, "Claude2Codex");
+
+  // 解释不了的绑定要非零退出，让聚合方显示"状态取不到"而不是"没有绑定"。
+  fs.writeFileSync(file, JSON.stringify({ bind_scope: "什么鬼" }));
+  assert.notEqual(spawnSync(process.execPath, [
+    path.resolve("scripts", "group-binding-status.mjs"),
+    "--provider-id", "cc2cd", "--binding", file,
+  ], { encoding: "utf-8" }).status, 0);
 });
 
 summarySealed = true;

@@ -111,7 +111,7 @@ import { CANONICAL_TIME_PATTERN } from "./canonical-time.mjs";
 import {
   ATTESTATION_EVIDENCE_MAX_AGE_LIMIT_MS, ATTESTATION_EVIDENCE_MAX_AGE_MS,
   CHAT_SCOPE_ATTESTATION_ARTIFACT_TYPE, CHAT_SCOPE_ATTESTATION_REASON,
-  CHAT_SCOPE_ATTESTATION_STATUS, CHAT_SCOPE_ATTESTATION_TIME_PATTERN, MIN_ATTESTATION_SAMPLES,
+  CHAT_SCOPE_ATTESTATION_STATUS, MIN_ATTESTATION_SAMPLES,
   evaluateDialogueChatScopeAttestation, validateDialogueChatScopeAttestation,
 } from "./dialogue-chat-scope-attestation.mjs";
 import {
@@ -1527,11 +1527,11 @@ test("Chat scope attestation validator 与 JSON Schema 对 date-time 同解", ()
   // 早先版本只做 toISOString 往返，自以为"单向更严"，其实两个方向都不对：
   // 偏移写法上更严（schema 收、运行时拒），扩展年份上更松（运行时收、schema 拒）——
   // 后者意味着运行时会产出 schema 校验不过的制品。
-  const timeRe = new RegExp(CHAT_SCOPE_ATTESTATION_TIME_PATTERN, "u");
+  const timeRe = new RegExp(CANONICAL_TIME_PATTERN, "u");
   const timeSchema = JSON.parse(fs.readFileSync(path.resolve("references",
     "dialogue-chat-scope-attestation-v1.schema.json"), "utf-8"));
   for (const field of ["generated_at", "first_observed_at", "last_observed_at"]) {
-    assert.equal(timeSchema.properties[field].pattern, CHAT_SCOPE_ATTESTATION_TIME_PATTERN,
+    assert.equal(timeSchema.properties[field].pattern, CANONICAL_TIME_PATTERN,
       field + " 的 schema pattern 必须与运行时同源");
   }
   for (const sample of ["2026-08-19T10:00:00.000Z", "0001-01-01T00:00:00.000Z",

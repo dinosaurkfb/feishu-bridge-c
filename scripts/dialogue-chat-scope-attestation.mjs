@@ -13,6 +13,9 @@
  */
 
 import { validateDialogueBindingAuthorizationSnapshot } from "./dialogue-binding-authorization.mjs";
+import {
+  CANONICAL_TIME_PATTERN, canonicalIso, isCanonicalIso, isCanonicalMs, toCanonicalMs,
+} from "./canonical-time.mjs";
 import { validateDialogueChatScopeProbe } from "./dialogue-chat-scope-probe.mjs";
 
 export const CHAT_SCOPE_ATTESTATION_SCHEMA_VERSION = "1.0";
@@ -69,24 +72,13 @@ export const ATTESTATION_EVIDENCE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const ATTESTATION_EVIDENCE_MAX_AGE_LIMIT_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
- * 可接受时间值的边界 —— 不是 ECMAScript 的 ±8.64e15，而是 **RFC3339 四位年份**的边界。
- *
- * 两者不一样，差别正是一处真实缺陷：ECMAScript 允许扩展年份，`new Date(2.6e14).toISOString()`
- * 会产出 `+010209-01-27T06:13:20.000Z`（六位年份）。它能被 `Date.parse` 往返，却**不是**合法
- * 的 RFC3339 date-time，JSON Schema 不收。只按 ±8.64e15 放行，运行时就会产出 schema 拒收的
- * 制品 —— 也就是这个模块本来要消灭的那类不一致，只是换了个方向。
+ * 时间处理全部走共享的 canonical-time：本模块与 dialogue-shadow-readiness 用的是同一条策略，
+ * 各写一份正是这个仓库刚付出代价修掉的那类漂移 —— 一处收紧、另一处没跟上，制品就会在边界上
+ * 与 JSON Schema 分歧。schema 里三个时间字段的 `pattern` 直接引用 CANONICAL_TIME_PATTERN。
  */
-const MIN_RFC3339_MS = -62167219200000;  // 0000-01-01T00:00:00.000Z
-const MAX_RFC3339_MS = 253402300799999;  // 9999-12-31T23:59:59.999Z
-
-/**
- * 三个时间字段的唯一合法书写形式：UTC、毫秒、Z 结尾。
- * 与 schema 里同名三个字段的 `pattern` **逐字同源**，改一处必须改另一处
- * （`test.mjs` 的 schema 一致性回归会同时比对两边）。
- */
-export const CHAT_SCOPE_ATTESTATION_TIME_PATTERN =
-  "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$";
-const TIME_RE = new RegExp(CHAT_SCOPE_ATTESTATION_TIME_PATTERN, "u");
+const iso = canonicalIso;
+const toMs = toCanonicalMs;
+const representableMs = isCanonicalMs;
 
 const BINDING_REF_PATTERN = /^binding_ref_[0-9a-f]{24}$/u;
 const SNAPSHOT_ID_PATTERN = /^binding_authorization_[0-9a-f]{24}$/u;
@@ -94,41 +86,8 @@ const nonNegativeInteger = (value) => Number.isInteger(value) && value >= 0;
 const positiveInteger = (value) => Number.isInteger(value) && value > 0;
 const onlyKeys = (value, allowed) => value && typeof value === "object" &&
   Object.keys(value).every((key) => allowed.includes(key));
-const iso = (value) => new Date(value).toISOString();
 
-/**
- * Date 分支不能少：`Date.parse(dateObject)` 会先 toString()，而那个格式**没有毫秒**，
- * 于是一个 Date 入参会被静默截断到整秒（…123 → …000），既影响 generated_at 也影响过期算术。
- */
-const toMs = (value) => {
-  if (typeof value === "number") return value;
-  if (value instanceof Date) return value.getTime();
-  return Date.parse(value ?? "");
-};
-
-/**
- * 时间值能不能安全地写成本模块唯一认可的那种字符串。
- * 越界的既包括让 `toISOString()` 抛 RangeError 的，也包括虽然不抛、却会产出六位年份的。
- */
-const representableMs = (ms) =>
-  Number.isFinite(ms) && ms >= MIN_RFC3339_MS && ms <= MAX_RFC3339_MS;
-
-/**
- * 是不是本模块唯一认可的规范形式：先过正则，再要求 `toISOString()` 往返相等。
- *
- * 两道都要：正则挡掉 `+08:00` 偏移和六位年份这类**形状**不对的；往返相等挡掉形状对、
- * 但日期本身不存在的（例如 `2026-02-30T00:00:00.000Z`，正则过得了，往返回来却不是原串）。
- *
- * 与 schema 的关系是**双向等价**，不是"运行时更严"。早先的版本只做往返相等，自以为
- * 单向更严，实际两个方向都不对：偏移写法上更严（schema 收、运行时拒），扩展年份上更松
- * （运行时收、schema 拒）——后者意味着它会产出 schema 校验不过的制品。现在两边用同一条
- * `CHAT_SCOPE_ATTESTATION_TIME_PATTERN`，边界也同源。
- */
-const isCanonicalIso = (value) =>
-  typeof value === "string" && TIME_RE.test(value) &&
-  representableMs(Date.parse(value)) && iso(Date.parse(value)) === value;
-
-const emptyAttestation = ({ snapshot, generated, status, reason, evidenceMaxAgeMs,
+const emptyAttestation =({ snapshot, generated, status, reason, evidenceMaxAgeMs,
   sampleCount = 0, firstObservedAt = null, lastObservedAt = null }) => ({
   schema_version: CHAT_SCOPE_ATTESTATION_SCHEMA_VERSION,
   artifact_type: CHAT_SCOPE_ATTESTATION_ARTIFACT_TYPE,

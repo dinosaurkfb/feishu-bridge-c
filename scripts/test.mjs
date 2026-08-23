@@ -7625,6 +7625,46 @@ test("按文档里那条命令登记，聚合方要真的能取到状态", () =>
 });
 
 
+test("走真实 CLI 时 --force 必须真的传到 drainProject", () => {
+  // 上一版 CLI 解析了 --force 却没传下去，于是文档和状态页承诺的人工绕过**不存在**。
+  // 我的测试全是直接调函数，从没走过 CLI —— 缺的就是这一层。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cliforce-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", auto_publish_on_completion: false,
+  }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_fixture", claude_session_id: null,
+    channel_generation_id: "gen-1",
+  }));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
+    kind: "progress", text: "待发", created_at: new Date().toISOString(), published_at: null,
+  }));
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "drain-outbox.mjs"), "--project", dir, "--dry-run", ...args,
+  ], { encoding: "utf-8" });
+
+  const blocked = cli([]);
+  assert.match(blocked.stdout + blocked.stderr, /auto_publish_disabled/u, "默认要被开关挡住");
+  assert.doesNotMatch(blocked.stdout, /将发布/u);
+
+  const forced = cli(["--force"]);
+  assert.match(forced.stdout, /将发布 1 条/u, "--force 要真的走到发布准备");
+
+  // --all 那条路也得把 force 传下去 —— 两条入口只修一条，另一条照样是坏的。
+  const all = spawnSync(process.execPath, [
+    path.resolve("scripts", "drain-outbox.mjs"), "--all", "--dry-run", "--force",
+  ], { encoding: "utf-8" });
+  assert.equal(all.status === 0 || all.status === 1, true, "--all --force 至少要能跑完");
+  const src = fs.readFileSync(path.resolve("scripts", "drain-outbox.mjs"), "utf-8");
+  assert.match(src, /drainProject\(\{ root, claudeSessionId, dryRun, force \}\)/u,
+    "单项目和 --all 共用同一个调用点，force 必须在那里");
+});
+
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (failed > 0) {

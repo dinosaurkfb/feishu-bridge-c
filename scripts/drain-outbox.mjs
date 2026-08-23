@@ -247,7 +247,7 @@ if (isDirectRun(import.meta.url)) {
       ? path.basename(root) +
         (claudeSessionId ? "/" + String(claudeSessionId).slice(0, 8) : "") + ": "
       : "";
-    const r = drainProject({ root, claudeSessionId, dryRun });
+    const r = drainProject({ root, claudeSessionId, dryRun, force });
 
     if (r.status === "published") {
       console.log(tag + "已发布 " + r.count + " 条 -> " + r.messageId);

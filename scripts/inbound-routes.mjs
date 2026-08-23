@@ -49,21 +49,60 @@ export function loadRoutes(file = routesPath()) {
   if (!read.ok) return { ...read, file, routes: [], sessions: {} };
   if (read.doc === null) return { ok: true, reason: "no_routes", file, routes: [], sessions: {} };
 
-  const routes = [];
-  for (const r of read.doc.routes ?? []) {
-    if (!r || typeof r.id !== "string" || typeof r.handler !== "string") continue;
-    if (r.enabled === false) continue;
-    routes.push({ id: r.id, handler: r.handler, isDefault: r.default === true, note: r.note ?? null });
+  // 校验已经保证每一项都能确定地解释，这里只按 enabled 取舍 ——
+  // 静默过滤"看不懂的项"是上一版的做法，那正是歧义表能通过的原因。
+  const routes = (read.doc.routes ?? [])
+    .filter((r) => r.enabled !== false)
+    .map((r) => ({ id: r.id, handler: r.handler, isDefault: r.default === true, note: r.note ?? null }));
+  return { ok: true, file, routes, sessions: { ...(read.doc.sessions ?? {}) } };
+}
+
+const nonEmptyString = (v) => typeof v === "string" && v.length > 0;
+
+/**
+ * 校验整份路由表。**读取、dispatcher、每个写入口共用这一个。**
+ *
+ * 只查顶层形状不够：routes 是数组、sessions 是对象，里面照样可以有 null 项、
+ * 重复 id、两个 default。那种表上一版会静默过滤掉坏项然后返回 ok ——
+ * 于是**数组顺序变成了选路依据**，同一个 id 出现两次时先写的那个赢。
+ * 权威状态里解释不了的东西必须 fail-closed，不投递也不写入。
+ *
+ * 不认识的扩展字段原样保留 —— 校验的是能不能确定地解释，不是长得像不像。
+ */
+export function validateRoutesDoc(doc) {
+  const bad = (problem) => ({ ok: false, reason: ROUTE_REJECT.TABLE_SHAPE, problem });
+  if (!isPlainObject(doc)) return bad("table_not_object");
+
+  const routes = doc.routes ?? [];
+  if (!Array.isArray(routes)) return bad("routes_not_array");
+  const seen = new Set();
+  let activeDefaults = 0;
+  for (const r of routes) {
+    if (!isPlainObject(r)) return bad("route_not_object");
+    if (!nonEmptyString(r.id)) return bad("route_id_invalid");
+    if (!nonEmptyString(r.handler)) return bad("route_handler_invalid");
+    if (r.enabled !== undefined && typeof r.enabled !== "boolean") return bad("route_enabled_not_boolean");
+    if (r.default !== undefined && typeof r.default !== "boolean") return bad("route_default_not_boolean");
+    // id 重复时"哪个生效"没有确定答案，只有数组顺序 —— 那不是答案。
+    if (seen.has(r.id)) return bad("route_id_duplicated");
+    seen.add(r.id);
+    if (r.default === true && r.enabled !== false) activeDefaults += 1;
   }
-  const sessions = {};
-  for (const [sid, id] of Object.entries(read.doc.sessions ?? {})) {
-    if (typeof sid === "string" && typeof id === "string") sessions[sid] = id;
+  if (activeDefaults > 1) return bad("multiple_default_routes");
+
+  const sessions = doc.sessions ?? {};
+  if (!isPlainObject(sessions)) return bad("sessions_not_object");
+  for (const [sid, owner] of Object.entries(sessions)) {
+    if (!nonEmptyString(sid)) return bad("session_id_invalid");
+    if (!nonEmptyString(owner)) return bad("session_owner_invalid");
   }
-  return { ok: true, file, routes, sessions };
+  // 登记指向不存在或已停用的路由**不在这里拒**：那是逐条话题的问题，
+  // selectRoute 会按 session 报 UNKNOWN_ROUTE，比整表停摆精确。
+  return { ok: true };
 }
 
 /**
- * 读原始文档并校验形状。返回 doc:null 表示文件不存在（可以初始化空表）。
+ * 读原始文档并完整校验。返回 doc:null 表示文件不存在（可以初始化空表）。
  *
  * 结构异常不替换成空结构就继续 —— 那等于"我看不懂就当它没有"，
  * 而下一步要么是投递、要么是整表写回，两者都会造成实质损失。
@@ -80,13 +119,8 @@ function readRoutesDoc(file) {
   try { parsed = JSON.parse(raw); } catch (err) {
     return { ok: false, reason: ROUTE_REJECT.TABLE_UNREADABLE, error: err.message };
   }
-  if (!isPlainObject(parsed)) return { ok: false, reason: ROUTE_REJECT.TABLE_SHAPE };
-  if (parsed.routes !== undefined && !Array.isArray(parsed.routes)) {
-    return { ok: false, reason: ROUTE_REJECT.TABLE_SHAPE };
-  }
-  if (parsed.sessions !== undefined && !isPlainObject(parsed.sessions)) {
-    return { ok: false, reason: ROUTE_REJECT.TABLE_SHAPE };
-  }
+  const valid = validateRoutesDoc(parsed);
+  if (!valid.ok) return valid;
   return { ok: true, doc: parsed };
 }
 
@@ -192,7 +226,10 @@ export function registerRouteBinding({ id, handler, note = null, sessionId = nul
     const sessionChanged = sessionId !== null && declared !== id;
     if (routeChanged) doc.routes.push(note ? { id, handler, note } : { id, handler });
     if (sessionChanged) doc.sessions[sessionId] = id;
-    if (routeChanged || sessionChanged) writeRoutesDoc(doc, file);
+    if (routeChanged || sessionChanged) {
+      const wrote = writeRoutesDoc(doc, file);
+      if (!wrote.ok) return wrote;
+    }
     return { ok: true, id, routeChanged, sessionChanged };
   } finally {
     releasePublishLock(lockDir);
@@ -238,17 +275,30 @@ export function registerSession({ sessionId, routeId, file = routesPath() }) {
       return { ok: false, reason: "session_owned_by_other_route", owner: existing };
     }
     doc.sessions[sessionId] = routeId;
-    writeRoutesDoc(doc, file);
+    const wrote = writeRoutesDoc(doc, file);
+    if (!wrote.ok) return wrote;
     return { ok: true, changed: true };
   } finally {
     releasePublishLock(lockDir);
   }
 }
 
-/** 原子写。写到一半被打断会让整张表截断 —— 那不只是某条路由坏了，是入站全挂。 */
+/**
+ * 原子写。写到一半被打断会让整张表截断 —— 那不只是某条路由坏了，是入站全挂。
+ *
+ * 写之前再校验一遍：任何路径都不该把一张解释不了的表落到盘上。
+ * 失败返回受控结果，不让 fs 的异常穿透成 Node 堆栈 —— 那对调用方没法处置。
+ */
 function writeRoutesDoc(doc, file) {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const tmp = file + ".tmp." + process.pid;
-  fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
-  fs.renameSync(tmp, file);
+  const valid = validateRoutesDoc(doc);
+  if (!valid.ok) return valid;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const tmp = file + ".tmp." + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: "routes_unwritable", error: err.message };
+  }
 }

@@ -66,6 +66,7 @@ import {
 } from "./inbound-hook.mjs";
 import {
   ROUTE_REJECT, loadRoutes, registerRoute, registerRouteBinding, registerSession, selectRoute,
+  validateRoutesDoc,
 } from "./inbound-routes.mjs";
 import { ENVELOPE_ENV as ENV_PASS, inheritedEvent } from "./envelope.mjs";
 import { CANONICAL_EVENT_ENV } from "./canonical-event.mjs";
@@ -5281,6 +5282,54 @@ test("登记是一个事务：任一边校验不过，两边都不写", () => {
     { ok: ok.ok, routeChanged: ok.routeChanged, sessionChanged: ok.sessionChanged },
     { ok: true, routeChanged: true, sessionChanged: true },
   );
+});
+
+test("路由表内部歧义一律 fail-closed，不只查顶层形状", () => {
+  const cases = [
+    [{ routes: [null] }, "route_not_object"],
+    [{ routes: [{ id: "", handler: "/a" }] }, "route_id_invalid"],
+    [{ routes: [{ id: "a", handler: "" }] }, "route_handler_invalid"],
+    [{ routes: [{ id: "a", handler: "/a" }, { id: "a", handler: "/b" }] }, "route_id_duplicated"],
+    [{ routes: [{ id: "a", handler: "/a", default: true }, { id: "b", handler: "/b", default: true }] },
+      "multiple_default_routes"],
+    [{ routes: [{ id: "a", handler: "/a", enabled: "yes" }] }, "route_enabled_not_boolean"],
+    [{ routes: [{ id: "a", handler: "/a", default: 1 }] }, "route_default_not_boolean"],
+    [{ routes: [], sessions: { s: 42 } }, "session_owner_invalid"],
+    [{ routes: [], sessions: { "": "a" } }, "session_id_invalid"],
+  ];
+  for (const [doc, problem] of cases) {
+    const v = validateRoutesDoc(doc);
+    assert.equal(v.ok, false, problem);
+    assert.equal(v.reason, ROUTE_REJECT.TABLE_SHAPE);
+    assert.equal(v.problem, problem);
+
+    // 读取和写入都得拒，否则歧义表还能继续被写进去。
+    const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-amb-")), "routes.json");
+    const before = JSON.stringify(doc);
+    fs.writeFileSync(f, before);
+    assert.equal(loadRoutes(f).reason, ROUTE_REJECT.TABLE_SHAPE, problem);
+    assert.equal(registerRoute({ id: "n", handler: process.execPath, file: f }).reason,
+      ROUTE_REJECT.TABLE_SHAPE, problem);
+    assert.equal(fs.readFileSync(f, "utf-8"), before);
+  }
+  // 停用的那个不算 default，所以这张表是明确的。
+  assert.equal(validateRoutesDoc({ routes: [
+    { id: "a", handler: "/a", default: true, enabled: false },
+    { id: "b", handler: "/b", default: true },
+  ] }).ok, true);
+  // 不认识的扩展字段不影响判定。
+  assert.equal(validateRoutesDoc({ custom: 1, routes: [{ id: "a", handler: "/a", extra: {} }] }).ok, true);
+});
+
+test("重复 id 不许让数组顺序变成选路依据", () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-dup-")), "routes.json");
+  fs.writeFileSync(f, JSON.stringify({
+    routes: [{ id: "dup", handler: "/first" }, { id: "dup", handler: "/second" }],
+    sessions: { s: "dup" },
+  }));
+  const t = loadRoutes(f);
+  assert.equal(t.ok, false, "先写的那个赢不是答案，是巧合");
+  assert.deepEqual(t.routes, [], "拒绝时不得交出可用于选路的表");
 });
 
 test("登记要取锁：锁被有效持有者占住时不写", () => {

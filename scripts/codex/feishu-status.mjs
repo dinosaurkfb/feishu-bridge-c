@@ -9,6 +9,7 @@ import {
 } from "./state.mjs";
 import { activeGeneration, pendingGeneration } from "../topic-generation.mjs";
 import { interactionPolicySummary } from "../interaction-policy.mjs";
+import { collectConnectivity, renderConnectivity } from "../status-providers.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -75,3 +76,8 @@ console.log("答复发布：" + (active
   ? (task.auto_publish_on_completion === true ? "每轮自动发布（失败时留队）" : "仅入队，自动发布尚未启用")
   : "已暂停"));
 console.log("待发布答复：" + pending + " 条" + (active ? "" : "（已保留）"));
+
+// 「我有哪些东西连到了哪些飞书群和话题」两侧问的是同一个问题，
+// 没理由只有 Claude 侧答得全。渲染共用同一个，免得两边措辞分叉。
+const others = renderConnectivity(collectConnectivity());
+if (others) console.log("\n" + others);

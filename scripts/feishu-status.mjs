@@ -16,7 +16,7 @@
 import path from "node:path";
 
 import { bindingsForRoot, currentBinding, describeStatus } from "./feishu-control.mjs";
-import { collectStatusProviders, renderStatusProviders } from "./status-providers.mjs";
+import { collectConnectivity, renderConnectivity } from "./status-providers.mjs";
 
 const arg = (n) => {
   const i = process.argv.indexOf("--" + n);
@@ -29,6 +29,6 @@ const claudeSessionId = process.env.CLAUDE_CODE_SESSION_ID;
 const st = currentBinding({ root, claudeSessionId });
 console.log(describeStatus(st, bindingsForRoot({ root })));
 
-const others = renderStatusProviders(collectStatusProviders());
+const others = renderConnectivity(collectConnectivity());
 if (others) console.log("\n" + others);
 process.exit(0);

@@ -77,7 +77,7 @@ import {
 import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
 import { bindingToConnections } from "./group-binding-status.mjs";
 import {
-  collectStatusProviders, loadStatusProviders, renderStatusProviders,
+  collectConnectivity, collectStatusProviders, loadStatusProviders, renderConnectivity,
   validateProviderRegistry, validateProviderReport,
 } from "./status-providers.mjs";
 import {
@@ -6616,7 +6616,10 @@ test("一个 provider 坏掉只影响它自己那一节", () => {
   assert.equal(got.ok, true);
   assert.deepEqual(got.sections.map((x) => x.state), ["ok", "unavailable", "disabled"]);
 
-  const text = renderStatusProviders(got);
+  const view = collectConnectivity({
+    routesFile: path.join(path.dirname(file), "no-routes.json"), providersFile: file, run,
+  });
+  const text = renderConnectivity(view);
   assert.match(text, /Claude2Codex/u, "一个超时不该让另外两个也看不见");
   assert.match(text, /provider_timeout/u);
   assert.match(text, /已停用/u);
@@ -6628,10 +6631,9 @@ test("状态登记坏掉时说清楚：只影响显示，不影响入站", () =>
   const got = collectStatusProviders({ file });
   assert.equal(got.ok, false);
   assert.equal(got.reason, "status_providers_unreadable");
-  // 观测坏了会被当成故障，所以这句必须写在输出里。
-  assert.match(renderStatusProviders(got), /不影响飞书入站/u);
 
-  // 结构上的保证：状态登记和路由表是两份文件、两个校验域。
+  // 这条只管**结构上的保证**：状态登记和路由表是两份文件、两个校验域。
+  // 措辞怎么区分由「两份目录各自独立降级」那条管，不在这里重复断言。
   const routes = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-sp3-")), "routes.json");
   fs.writeFileSync(routes, JSON.stringify({
     routes: [{ id: "cc2cd", handler: process.execPath }], sessions: { s: "cc2cd" },
@@ -6646,7 +6648,7 @@ test("没有 provider 登记时，状态输出跟以前一模一样", () => {
   const got = collectStatusProviders({ file });
   assert.equal(got.ok, true);
   assert.equal(loadStatusProviders(file).reason, "no_providers", "没有文件不是错误");
-  assert.equal(renderStatusProviders(got), null, "没有内容就不该多出一节");
+  assert.equal(renderConnectivity(got), null, "没有内容就不该多出一节");
 });
 
 test("群级绑定 provider：只报群名，locator 一个都不出", () => {
@@ -6677,8 +6679,14 @@ test("群级绑定 provider：状态按 status 与有效期推导", () => {
   assert.equal(state({ status: "suspended" }), "suspended");
   // 状态写着 active、但已经过期 —— 报 active 就是在撒谎。
   assert.equal(state({ status: "active", expires_at: "2020-01-01T00:00:00.000Z" }), "expired");
-  assert.equal(state({ status: "active", expires_at: "不是时间" }), "active");
   assert.equal(state({ status: "什么鬼" }), "unknown");
+  // 有效期读不出来时报 active 是假正常。上一版这里断言的正是那个 bug ——
+  // 一条把错误写成期望的测试，比没有测试更糟：它会替错误挡住后来的质疑。
+  for (const bad of [{ expires_at: "不是时间" }, { expires_at: undefined }]) {
+    const got = bindingToConnections({ ...base, status: "active", ...bad }, { now });
+    assert.equal(got.ok, false, JSON.stringify(bad));
+    assert.equal(got.reason, "binding_shape_unexpected");
+  }
 });
 
 test("群级绑定 provider：没绑过和解释不了要分开", () => {
@@ -6717,6 +6725,124 @@ test("群级绑定 provider：实际跑一遍，输出能过聚合方的校验",
     path.resolve("scripts", "group-binding-status.mjs"),
     "--provider-id", "cc2cd", "--binding", file,
   ], { encoding: "utf-8" }).status, 0);
+});
+
+test("provider id 是受控标识符，不能同时当显示文本用", () => {
+  // id 会被当成显示名的兜底值，于是它同时是标识符**和**输出文本。
+  // 这个 id 既带 locator，又能靠换行伪造出一整行状态。
+  const evil = "oc_SECRET123456\nCodex  消息运输 · 某群 · 正常";
+  const v = validateProviderRegistry({ providers: [{
+    id: evil, protocol: "feishu-bridge-status/v1",
+    executable: process.execPath, script: "/abs/x.mjs", allowed_kinds: ["transport"],
+  }] });
+  assert.equal(v.ok, false);
+  assert.equal(v.problem, "provider_id_invalid");
+
+  for (const bad of ["", "  ", "-开头", "Upper", "a".repeat(33), "有空格 的"]) {
+    assert.equal(validateProviderRegistry({ providers: [{
+      id: bad, protocol: "feishu-bridge-status/v1",
+      executable: process.execPath, script: "/abs/x.mjs", allowed_kinds: ["transport"],
+    }] }).problem, "provider_id_invalid", JSON.stringify(bad));
+  }
+  assert.equal(validateProviderRegistry({ providers: [{
+    id: "cc2cd-2_x", protocol: "feishu-bridge-status/v1",
+    executable: process.execPath, script: "/abs/x.mjs", allowed_kinds: ["transport"],
+  }] }).ok, true);
+});
+
+test("报告顶层也是封闭结构", () => {
+  // 连接项封闭而顶层不封闭，等于"多带一个字段"只是换个地方放。
+  const got = validateProviderReport(JSON.stringify({
+    schema_version: "feishu-bridge-status/v1", provider_id: "p", connections: [],
+    chat_id: "oc_SECRET123456",
+  }), { providerId: "p", allowedKinds: ["transport"] });
+  assert.equal(got.ok, false);
+  assert.equal(got.reason, "report_unknown_field");
+  assert.equal(got.field, "chat_id");
+});
+
+test("有 route 没登记状态入口的消费者必须被列出来", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-conn-"));
+  const routesFile = path.join(dir, "routes.json");
+  const providersFile = path.join(dir, "providers.json");
+  fs.writeFileSync(routesFile, JSON.stringify({ routes: [
+    { id: "self", handler: process.execPath, default: true },
+    { id: "cc2cd", handler: process.execPath },
+    { id: "quiet", handler: process.execPath },
+  ], sessions: {} }));
+  fs.writeFileSync(providersFile, JSON.stringify({ providers: [{
+    id: "cc2cd", protocol: "feishu-bridge-status/v1",
+    executable: process.execPath, script: "/abs/x.mjs", allowed_kinds: ["transport"],
+  }] }));
+  const run = () => ({ ok: true, connections: [
+    { kind: "transport", state: "active", scope: "chat", groupName: "Claude2Codex", topicName: null },
+  ] });
+
+  const view = collectConnectivity({ routesFile, providersFile, run });
+  assert.deepEqual(view.sections.map((x) => x.id).sort(), ["cc2cd", "quiet", "self"]);
+
+  const text = renderConnectivity(view);
+  assert.match(text, /Claude2Codex/u);
+  // 在收消息、却没人知道它连到哪儿 —— 那正是最该被看见的一类。
+  assert.match(text, /quiet {2}链路存在，状态入口未登记/u);
+  assert.match(text, /self {2}链路存在，状态入口未登记（默认路由）/u);
+});
+
+test("两份目录各自独立降级，且两种故障的措辞不能一样", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-conn2-"));
+  const routesFile = path.join(dir, "routes.json");
+  const providersFile = path.join(dir, "providers.json");
+  fs.writeFileSync(routesFile, JSON.stringify({
+    routes: [{ id: "cc2cd", handler: process.execPath }], sessions: {},
+  }));
+  fs.writeFileSync(providersFile, "{ 坏掉的 json");
+
+  // 状态入口坏了：只影响显示，路由照样列得出来。
+  const a = renderConnectivity(collectConnectivity({ routesFile, providersFile }));
+  assert.match(a, /cc2cd {2}链路存在/u, "状态登记坏了不该让路由也看不见");
+  assert.match(a, /不影响飞书入站/u);
+
+  // 路由表坏了：入站**确实**停了，说成"只是显示问题"就是在瞒。
+  fs.writeFileSync(routesFile, "{ 也坏了");
+  fs.writeFileSync(providersFile, JSON.stringify({ providers: [] }));
+  const b = renderConnectivity(collectConnectivity({ routesFile, providersFile }));
+  assert.match(b, /入站已停止投递，这是需要处理的故障/u);
+  assert.doesNotMatch(b, /不影响飞书入站/u);
+});
+
+test("状态入口登记命令：默认预览，受控写入", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-regp-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"), ...args,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+
+  // 默认不写盘，而且要说清这是一次代码执行授权。
+  const preview = cli(["--id", "cc2cd", "--script", script]);
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.match(preview.stdout, /dry-run/u);
+  assert.match(preview.stdout, /在你的交互会话里执行/u);
+  assert.equal(fs.existsSync(file), false);
+
+  fs.writeFileSync(file, JSON.stringify({ schema_version: "1.0", custom_marker: "KEEP_ME", providers: [] }));
+  assert.equal(cli(["--id", "cc2cd", "--script", script, "--apply", "--", "--binding", "/abs/b.json"]).status, 0);
+  const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
+  assert.equal(raw.custom_marker, "KEEP_ME", "只加一项，不重建文档");
+  assert.deepEqual(raw.providers[0].args, ["--binding", "/abs/b.json"], "-- 之后的参数原样存下");
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+
+  // 幂等；同 id 换脚本要拒 —— 那是悄悄改判由谁来报这条链路的状态。
+  assert.match(cli(["--id", "cc2cd", "--script", script, "--apply"]).stdout, /无变化/u);
+  const repoint = cli(["--id", "cc2cd", "--script", path.resolve("scripts", "feishu-status.mjs"), "--apply"]);
+  assert.notEqual(repoint.status, 0);
+  assert.match(repoint.stderr, /provider_exists_with_other_script/u);
+
+  // 坏表不许被当成首次创建覆盖。
+  fs.writeFileSync(file, "{ 坏掉的 json");
+  const onBroken = cli(["--id", "other", "--script", script, "--apply"]);
+  assert.notEqual(onBroken.status, 0);
+  assert.equal(fs.readFileSync(file, "utf-8"), "{ 坏掉的 json");
 });
 
 summarySealed = true;

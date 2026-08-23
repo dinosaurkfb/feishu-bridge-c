@@ -42,10 +42,15 @@ export function bindingToConnections(doc, { now = Date.now() } = {}) {
     ? doc.chat_name.trim()
     : "（未命名群）";
 
+  // 有效期读不出来就**别报正常**。原来这里在 expires_at 缺失或非法时仍报 active，
+  // 那是假正常，而且跟本模块自己"解释不了就报状态取不到"的立场自相矛盾。
+  // 绑定方那边 checkBinding 对有效期就是 fail-closed 的，这里得一致。
   const expiresAt = Date.parse(doc.expires_at ?? "");
+  if (!Number.isFinite(expiresAt)) return { ok: false, reason: "binding_shape_unexpected" };
+
   let state = "unknown";
   if (doc.status === "active") {
-    state = Number.isFinite(expiresAt) && now >= expiresAt ? "expired" : "active";
+    state = now >= expiresAt ? "expired" : "active";
   } else if (doc.status === "suspended") {
     state = "suspended";
   }

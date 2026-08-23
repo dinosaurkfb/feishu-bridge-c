@@ -21,6 +21,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { loadRoutes, routesPath } from "./inbound-routes.mjs";
+
 export const PROVIDER_PROTOCOL = "feishu-bridge-status/v1";
 
 /** 受控枚举。provider 报了别的值就整条拒 —— 自由文本进不来。 */
@@ -30,6 +32,7 @@ export const CONNECTION_SCOPES = ["chat", "topic", "project"];
 
 /** 渲染用的字段就这些，都是人读的名字。additionalProperties 一律拒。 */
 const CONNECTION_KEYS = new Set(["kind", "state", "scope", "group_name", "topic_name"]);
+const REPORT_KEYS = new Set(["schema_version", "provider_id", "connections"]);
 
 const NAME_MAX = 60;
 export const PROVIDER_TIMEOUT_MS = 5000;
@@ -42,6 +45,16 @@ export function statusProvidersPath() {
 
 const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const isName = (v) => typeof v === "string" && v.trim().length > 0;
+
+/**
+ * provider id 走严格白名单。
+ *
+ * 只要求"非空"是不够的：id 会被当成显示名的兜底值，于是它同时是标识符**和**
+ * 输出文本。一个叫 "oc_SECRET123456\n  伪装  正常" 的 id 既能带 locator 出来，
+ * 又能靠换行伪造出一整行状态。标识符和展示文本混用就会这样，所以两边都收紧：
+ * id 本身受控，显示名也一律过 cleanName。
+ */
+const PROVIDER_ID = /^[a-z0-9][a-z0-9_-]{0,31}$/u;
 
 /**
  * 名字里不许出现 locator。结构化协议挡得住「多带一个 chat_id 字段」，
@@ -75,7 +88,7 @@ export function validateProviderRegistry(doc) {
   const providers = [];
   for (const p of list) {
     if (!isPlainObject(p)) return bad("provider_not_object");
-    if (!isName(p.id)) return bad("provider_id_invalid");
+    if (typeof p.id !== "string" || !PROVIDER_ID.test(p.id)) return bad("provider_id_invalid");
     if (seen.has(p.id)) return bad("provider_id_duplicated");
     seen.add(p.id);
     if (p.protocol !== PROVIDER_PROTOCOL) return bad("provider_protocol_unsupported");
@@ -97,7 +110,8 @@ export function validateProviderRegistry(doc) {
     }
     providers.push({
       id: p.id,
-      displayName: cleanName(p.display_name) ?? p.id,
+      // id 已经受控，这里再过一道：显示文本只有一个来源，不留第二条路。
+      displayName: cleanName(p.display_name) ?? cleanName(p.id) ?? "(未命名)",
       executable: p.executable,
       script: p.script,
       args: p.args ?? [],
@@ -134,6 +148,10 @@ export function validateProviderReport(text, { providerId, allowedKinds }) {
   let doc;
   try { doc = JSON.parse(text); } catch { return { ok: false, reason: "report_not_json" }; }
   if (!isPlainObject(doc)) return { ok: false, reason: "report_not_object" };
+  for (const key of Object.keys(doc)) {
+    // 连接项是封闭结构，报告顶层也得是 —— 否则"多带一个字段"只是换个地方放。
+    if (!REPORT_KEYS.has(key)) return { ok: false, reason: "report_unknown_field", field: key };
+  }
   if (doc.schema_version !== PROVIDER_PROTOCOL) {
     return { ok: false, reason: "report_protocol_unsupported" };
   }
@@ -237,6 +255,44 @@ export function collectStatusProviders({ file = statusProvidersPath(), run = run
   return { ok: true, sections };
 }
 
+/**
+ * 把两份目录合成一张连通性视图。
+ *
+ * 路由表和 provider 表回答的是不同问题：**路由表知道有哪些入站消费者**，
+ * provider 表知道**谁能报自己的状态**。只看后者，"有 route、没登记状态入口"
+ * 的消费者就完全不可见 —— 而那正是最需要被看见的一类：它在收消息，
+ * 却没人知道它连到了哪儿。
+ *
+ * 两份表**各自独立降级**：provider 表坏了不影响列出路由，路由表坏了不影响
+ * 已经取到的 provider 状态。观测能力不该是全有全无。
+ */
+export function collectConnectivity({
+  routesFile = routesPath(), providersFile = statusProvidersPath(), run = runStatusProvider,
+} = {}) {
+  const fromProviders = collectStatusProviders({ file: providersFile, run });
+  const table = loadRoutes(routesFile);
+
+  const sections = fromProviders.ok ? [...fromProviders.sections] : [];
+  const covered = new Set(sections.map((x) => x.id));
+  if (table.ok) {
+    for (const route of table.routes) {
+      if (covered.has(route.id)) continue;
+      sections.push({
+        id: route.id,
+        // 路由 id 也会变成显示文本，跟 provider id 是同一个注入面。
+        displayName: cleanName(route.id) ?? "(未命名)",
+        state: "unregistered",
+        isDefault: route.isDefault,
+      });
+    }
+  }
+  return {
+    sections,
+    providersProblem: fromProviders.ok ? null : (fromProviders.problem ?? fromProviders.reason),
+    routesProblem: table.ok ? null : table.reason,
+  };
+}
+
 const KIND_TEXT = { transport: "消息运输", progress: "进度汇报" };
 const STATE_TEXT = { active: "正常", suspended: "已暂停", expired: "已过期", unknown: "状态未知" };
 const SCOPE_TEXT = { chat: "整个群", topic: "单个话题", project: "整个项目" };
@@ -245,34 +301,37 @@ const SCOPE_TEXT = { chat: "整个群", topic: "单个话题", project: "整个�
  * 渲染。**只渲染校验过的字段，绝不回显 provider 的原始输出。**
  * 不打印话题 id、会话 locator、凭据 —— 这条承诺由聚合方兑现，不外包给接入方。
  */
-export function renderStatusProviders(result) {
-  if (!result.ok) {
-    // 观测坏了就说观测坏了。入站不受影响这句得说出来，否则会被当成故障。
-    return "其他链路  状态登记不可用（" + (result.problem ?? result.reason) + "）；" +
-      "这只影响本命令的显示，不影响飞书入站";
-  }
-  if (result.sections.length === 0) return null;
-
+export function renderConnectivity(view) {
   const lines = [];
-  for (const s of result.sections) {
-    if (s.state === "disabled") {
-      lines.push("  " + s.displayName + "  已停用");
-      continue;
-    }
-    if (s.state !== "ok") {
-      // 老实的空白好过看不见 —— 但要说清是"看不到"而不是"没有"。
-      lines.push("  " + s.displayName + "  状态取不到（" + s.reason + "）");
-      continue;
-    }
-    if (s.connections.length === 0) {
-      lines.push("  " + s.displayName + "  没有已连接的群或话题");
-      continue;
-    }
-    for (const c of s.connections) {
-      lines.push("  " + s.displayName + "  " + (KIND_TEXT[c.kind] ?? c.kind) + " · " +
-        c.groupName + (c.topicName ? " / " + c.topicName : "") +
-        " · " + (SCOPE_TEXT[c.scope] ?? c.scope) + " · " + (STATE_TEXT[c.state] ?? c.state));
+  for (const s of view.sections) {
+    const name = s.displayName;
+    if (s.state === "unregistered") {
+      // 老实的空白好过看不见：说清是"看不到"，不是"没有"。
+      lines.push("  " + name + "  链路存在，状态入口未登记" + (s.isDefault ? "（默认路由）" : ""));
+    } else if (s.state === "disabled") {
+      lines.push("  " + name + "  已停用");
+    } else if (s.state !== "ok") {
+      lines.push("  " + name + "  状态取不到（" + s.reason + "）");
+    } else if (s.connections.length === 0) {
+      lines.push("  " + name + "  没有已连接的群或话题");
+    } else {
+      for (const c of s.connections) {
+        lines.push("  " + name + "  " + (KIND_TEXT[c.kind] ?? c.kind) + " · " +
+          c.groupName + (c.topicName ? " / " + c.topicName : "") +
+          " · " + (SCOPE_TEXT[c.scope] ?? c.scope) + " · " + (STATE_TEXT[c.state] ?? c.state));
+      }
     }
   }
+  if (view.providersProblem) {
+    // 观测坏了会被当成故障，所以"不影响入站"这句必须说出来。
+    lines.push("  状态入口登记不可用（" + view.providersProblem + "）；" +
+      "这只影响本命令的显示，不影响飞书入站");
+  }
+  if (view.routesProblem) {
+    // 路由表读不出来则相反：入站**确实**会停，不能说成只是显示问题。
+    lines.push("  路由表不可用（" + view.routesProblem + "）；" +
+      "入站已停止投递，这是需要处理的故障");
+  }
+  if (lines.length === 0) return null;
   return "其他链路\n" + lines.join("\n");
 }

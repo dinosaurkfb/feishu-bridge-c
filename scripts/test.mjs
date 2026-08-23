@@ -2080,6 +2080,31 @@ test("outbox 为空 → empty，且不去读配置（配置根本不存在也不
   assert.equal(r.status, "empty");
 });
 
+test("Stop 钩子排空用的会话必须与写入 outbox 用的是同一个", () => {
+  // 这条钉的是一个真实发生过的半截修复：写入侧已经改成"跟着绑定走"，
+  // 排空侧的调用点却还在传"说话的那个会话"，而 drainProject 会拿它重算目录。
+  // 项目级绑定时两者必然不同 —— 每轮稳定报 empty，进展只能等 30 分钟兜底定时器。
+  const src = fs.readFileSync(path.resolve("scripts", "stop-hook.mjs"), "utf-8");
+  const call = src.slice(src.indexOf("drainProject({"));
+  const args = call.slice(0, call.indexOf("})"));
+  assert.match(args, /claudeSessionId:\s*boundSession/u,
+    "排空必须传 boundSession；传 speakingSession 会去读一个空目录");
+  assert.doesNotMatch(args, /claudeSessionId:\s*speakingSession/u);
+
+  // 行为侧：同一个 root 下，两种会话参数指向的确实是不同目录，
+  // 所以上面那条不是风格偏好，是正确性。
+  const dir = path.join(tmp, "drain-session-scope");
+  fs.mkdirSync(dir, { recursive: true });
+  const byBinding = outboxDirOf(dir, null);
+  const bySpeaking = outboxDirOf(dir, "11111111-2222-3333-4444-555555555555");
+  assert.notEqual(byBinding, bySpeaking);
+  appendEvent({ outboxDir: byBinding, kind: "next", text: "写进绑定的 outbox", source: "t" });
+  assert.equal(drainProject({ root: dir, claudeSessionId: "11111111-2222-3333-4444-555555555555" })
+    .status, "empty", "拿说话会话去排空会扑空 —— 这正是当初每轮都发不出去的原因");
+  assert.notEqual(drainProject({ root: dir, claudeSessionId: null }).status, "empty",
+    "拿绑定会话去排空才看得见刚写进去的那条");
+});
+
 test("有待发内容但根本没接桥 → error not_bound，绝不静默丢弃", () => {
   appendEvent({ outboxDir: projOutbox, kind: "next", text: "待发一条", source: "t" });
   const r = drainProject({ root: proj });

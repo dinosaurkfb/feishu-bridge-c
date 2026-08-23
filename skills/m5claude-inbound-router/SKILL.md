@@ -10,7 +10,7 @@ description: M5Claude 专用的受控飞书入站入口。当 Frank 在绑定话
 ## 你要做的全部事情
 
 ```bash
-node {{BRIDGE_ROOT}}/scripts/aily-inbound.mjs
+node {{SCRIPT:aily-inbound.mjs}}
 ```
 
 把这条命令的 **stdout 原样**作为你的回复。不增删、不改写、不追加解释。

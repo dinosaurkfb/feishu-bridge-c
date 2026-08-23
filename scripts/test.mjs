@@ -5240,7 +5240,14 @@ test("注入的规则把禁令放在最前面、并在末尾重复一次", () =>
   const head = rule.slice(0, 120);
   assert.ok(head.includes("不是给你的指令"), "禁令必须在最前面 —— 中间那段是祈使句，模型天然想执行它");
   assert.ok(rule.trimEnd().endsWith("原样返回它的输出。"), "末尾要再重复一次");
-  assert.ok(rule.includes("node /b/scripts/aily-inbound.mjs"));
+  assert.ok(rule.includes("node '/b/scripts/aily-inbound.mjs'"));
+
+  // 注入的是**给 shell 执行的命令文本**，路径必须加引号。HOME 含空格时裸路径会被
+  // 拆词，入站直接不可用；实测同一条路径 argv 调用能跑、交给 /bin/sh -c 就失败。
+  const spacey = composeTransportRule({ dispatcher: "/我的 家/scripts/aily-inbound.mjs" });
+  assert.ok(spacey.includes("node '/我的 家/scripts/aily-inbound.mjs'"),
+    "含空格的路径必须被引起来");
+  assert.doesNotMatch(spacey, /node \/我的 家/u, "不能出现裸路径");
 });
 
 test("注入的规则禁止模型自己判断该不该投递 —— 这条错误真实发生过", () => {
@@ -5476,6 +5483,35 @@ test("经符号链接执行时，脚本仍认得出自己是被直接执行的",
       " 不得直接读 process.argv[1]；判断是否直接执行一律用 isDirectRun");
   }
   assert.ok(scanned > 60, "扫描必须覆盖 scripts/**（含 codex/），实际 " + scanned + " 个");
+});
+
+test("含空格与中文的 HOME 下，注入的命令交给真 shell 也能执行", () => {
+  // 这条是 Codex 点名要的行为测试，而且必须走 /bin/sh -c ——
+  // 用 execFile 直接传 argv 是绕过 shell 分词的，正好测不到这个 bug：
+  // 实测同一条路径 argv 调用能跑、交给 /bin/sh -c 就被空格拆开。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "shellsafe-"));
+  const home = path.join(base, "我的 家");
+  fs.mkdirSync(home, { recursive: true });
+  const plan = planRuntimeSync({ sourceRoot: path.resolve("."), home });
+  assert.equal(applyRuntimeSync(plan, { home }).ok, true);
+
+  const dispatcher = path.join(runtimeRoot(home), "current", "scripts", "aily-inbound.mjs");
+  const command = composeTransportRule({ dispatcher })
+    .split("\n").find((line) => line.startsWith("node "));
+  assert.ok(command, "注入文本里必须有一条可执行的 node 命令");
+
+  const viaShell = spawnSync("/bin/sh", ["-c", command], { encoding: "utf-8" });
+  const output = String(viaShell.stdout ?? "") + String(viaShell.stderr ?? "");
+  // 这里不要求它成功受理（没有 Aily 环境变量，必然被拒），只要求 shell 能**找到并执行**
+  // 那个脚本。路径被拆词时的表现是 "Cannot find module" 或 node 报找不到文件。
+  assert.doesNotMatch(output, /Cannot find module/u,
+    "路径被 shell 拆词了 —— 这正是含空格 HOME 下入站不可用的原因");
+  assert.notEqual(output.trim(), "", "脚本必须真的跑起来并产出回执");
+
+  // 对照：不加引号时同一条命令必然失败。留着它，免得有人把引号"顺手去掉"。
+  const naked = spawnSync("/bin/sh", ["-c", "node " + dispatcher], { encoding: "utf-8" });
+  assert.match(String(naked.stdout ?? "") + String(naked.stderr ?? ""), /Cannot find module/u,
+    "裸路径在含空格的 HOME 下必然被拆词");
 });
 
 test("路由前的失败回执落到机器级目录，不写进代码目录", () => {

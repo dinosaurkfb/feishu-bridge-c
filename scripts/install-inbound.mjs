@@ -30,6 +30,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { runtimeScript, verifyRuntime } from "./runtime-install.mjs";
+import { shellQuote } from "./shell-quote.mjs";
 import { moduleRoot } from "./direct-run.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
@@ -40,7 +41,11 @@ const ROOT = moduleRoot(import.meta.url, "..");
  * 跑的是某条正在开发的分支。SKILL.md 源码里写 `{{BRIDGE_ROOT}}` 占位符，安装时渲染。
  */
 const RUNTIME_BRIDGE_ROOT = path.dirname(path.dirname(runtimeScript("aily-inbound.mjs")));
-const renderSkill = (text) => text.replaceAll("{{BRIDGE_ROOT}}", RUNTIME_BRIDGE_ROOT);
+// 与出站安装器同一套：模板写 {{SCRIPT:x.mjs}}，由渲染器统一加 shell 引号。
+// HOME 含空格时裸路径会被 shell 拆词，入站直接不可用。
+const renderSkill = (text) => text.replaceAll(
+  /\{\{SCRIPT:([A-Za-z0-9_./-]+)\}\}/gu,
+  (_, name) => shellQuote(path.join(RUNTIME_BRIDGE_ROOT, "scripts", name)));
 
 /**
  * 将要装进去的那份文本 —— **计划、写入、装完自检必须共用它**。

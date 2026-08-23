@@ -9,6 +9,7 @@ import {
   bridgeHome, findRegisteredTaskForCodexThread, loadCodexTemplate, recordThreadActivity, taskPaths,
 } from "./state.mjs";
 import { storeTurnInput } from "../turn-input.mjs";
+import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
 
 export function classifyFeishuPrompt(prompt) {
   if (typeof prompt !== "string") return "none";
@@ -146,8 +147,11 @@ export function composeInitContext({ connectionStatus = "none" } = {}) {
 
 export function composeAilyInboundContext({ bridgeRoot, home }) {
   const dispatcher = path.join(bridgeRoot, "scripts", "codex", "aily-inbound.mjs");
-  const command = "FEISHU_CODEX_BRIDGE_HOME=" + JSON.stringify(home) +
-    " node " + JSON.stringify(dispatcher);
+  // 用 shellQuote 而不是 JSON.stringify。后者产出的是**双引号**，挡得住空格，
+  // 但双引号内 `$`、反引号、反斜杠仍会被 shell 解释 —— 路径里带这些字符时，
+  // 那就不只是拆词，而是可能执行别的东西。POSIX 里唯一完全字面的是单引号。
+  const command = "FEISHU_CODEX_BRIDGE_HOME=" + shellQuote(home) +
+    " " + nodeCommandPrefix(dispatcher);
   return [
     "[Codex 飞书桥·M5Codex 入站] 当前回合来自 Aily 的 M5Codex 飞书调用。",
     "不得运行 bind-preview.mjs、bind-task.mjs 或 codex-longtask-feishu；不得把 M5Codex 自己的 Aily task 接到飞书。",

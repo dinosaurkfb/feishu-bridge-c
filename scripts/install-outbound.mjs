@@ -26,6 +26,7 @@ import { moduleRoot } from "./direct-run.mjs";
 import {
   applyRuntimeSync, planRuntimeSync, runtimeScript, verifyRuntime,
 } from "./runtime-install.mjs";
+import { nodeCommandPrefix, shellQuote } from "./shell-quote.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
 
@@ -234,7 +235,10 @@ const initAction = describe(initBefore, claimSingleHook(prompts, "init-hook.mjs"
 // 它做不到发消息这件事是代码事实，不是一个自觉遵守的 --dry-run 开关（有测试盯着）。
 // 真正建话题的那条仍然每次弹权限 —— 往群里发一条撤不掉的消息，本来就该有人点头。
 
-const PREVIEW_RULE = "Bash(node " + PREVIEW_SCRIPT + ":*)";
+// 放行规则必须与技能正文里那条命令**逐字一致**。技能现在打印的是加了引号的路径，
+// 规则要是还写裸路径，前缀就对不上 —— 预览会每次弹确认，而它本来是免确认的那一条。
+// 两处同源生成，另有测试盯着它们相等。
+const PREVIEW_RULE = "Bash(" + nodeCommandPrefix(PREVIEW_SCRIPT) + ":*)";
 const permissions = (settings.permissions ??= {});
 const allow = (permissions.allow ??= []);
 
@@ -242,14 +246,19 @@ const allow = (permissions.allow ??= []);
 // 而每一条都是一个「某个开发克隆里的脚本可以免确认执行」的长期授权。
 // 同样按安装器生成的确切形态匹配，不用子串包含 —— 一条 allow 规则是一次长期免确认授权，
 // 误删别人的、或漏掉旧克隆的，两种都不能接受。
-const PREVIEW_RULE_SHAPE = /^Bash\(node [^\s()]*\/scripts\/bind-preview\.mjs:\*\)$/u;
+const PREVIEW_RULE_SHAPE = /^Bash\(node '?[^()]*\/scripts\/bind-preview\.mjs'?:\*\)$/u;
 const ownsPreview = (rule) => typeof rule === "string" && PREVIEW_RULE_SHAPE.test(rule);
-const permBefore = allow.filter(ownsPreview).length;
+const permOwned = allow.filter(ownsPreview);
+const permBefore = permOwned.length;
+// 只数条数不够：路径改指 runtime、或给路径加上 shell 引号之后，条数没变但内容变了。
+// 那时报 already-present 会让人以为什么都没动。
+const permSame = permBefore === 1 && permOwned[0] === PREVIEW_RULE;
 for (let i = allow.length - 1; i >= 0; i -= 1) if (ownsPreview(allow[i])) allow.splice(i, 1);
 if (!uninstall) allow.push(PREVIEW_RULE);
 const permAction = uninstall
   ? (permBefore > 0 ? "removed" : "already-absent")
-  : (permBefore === 0 ? "installed" : permBefore === 1 ? "already-present" : "deduped");
+  : (permBefore === 0 ? "installed" : permSame ? "already-present"
+    : permBefore === 1 ? "updated" : "deduped");
 
 // ---------- 登记表 ----------
 
@@ -299,9 +308,19 @@ const SKILLS = [
 
 const skillSrcOf = (n) => path.join(ROOT, "skills", n, "SKILL.md");
 const skillDstOf = (n) => path.join(os.homedir(), ".claude", "skills", n, "SKILL.md");
-// 技能里给模型看的命令也要指 runtime。否则 Frank 跑 /feishu-bind 时执行的是某个开发克隆的
-// 脚本 —— 那个克隆此刻停在哪条分支上没人知道，而这条命令会往群里发一条撤不掉的消息。
-const renderSkill = (src) => src.replaceAll("{{BRIDGE_ROOT}}", RUNTIME_BRIDGE_ROOT);
+/**
+ * 技能里给模型看的命令要指 runtime，而且**路径必须是 shell 安全的**。
+ *
+ * 指 runtime：否则 Frank 跑 /feishu-bind 时执行的是某个开发克隆的脚本，那个克隆此刻
+ * 停在哪条分支没人知道，而这条命令会往群里发一条撤不掉的消息。
+ *
+ * shell 安全：这些是**给 shell 执行的命令文本**。HOME 里有空格时裸路径会被拆词，
+ * 入站直接不可用（实测：argv 调用能跑，交给 /bin/sh -c 就失败）。所以模板写
+ * `{{SCRIPT:x.mjs}}`，由这里统一加引号 —— 引用是渲染器的职责，不是模板作者的记性。
+ */
+const renderSkill = (src) => src.replaceAll(
+  /\{\{SCRIPT:([A-Za-z0-9_./-]+)\}\}/gu,
+  (_, name) => shellQuote(path.join(RUNTIME_BRIDGE_ROOT, "scripts", name)));
 
 // 拷贝而不是软链：软链一旦仓库被移动或删除就变成悬空文件，而且各家扫描器
 // 对 readdir 是否跟随软链的处理并不一致（入站技能就在这上面栽过）。

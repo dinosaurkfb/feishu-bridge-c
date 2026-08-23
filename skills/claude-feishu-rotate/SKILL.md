@@ -11,7 +11,7 @@ description: 为当前 Claude 项目或精确工作线创建下一飞书话题�
 只运行：
 
 ```bash
-node {{BRIDGE_ROOT}}/scripts/feishu-rotate.mjs --apply
+node {{SCRIPT:feishu-rotate.mjs}} --apply
 ```
 
 命令使用与出站相同的当前上下文选择规则：优先当前工作线的独立绑定，否则使用项目绑定。

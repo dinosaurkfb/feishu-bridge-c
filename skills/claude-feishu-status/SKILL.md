@@ -6,7 +6,7 @@ description: 只读查看当前项目（或当前这条工作线）的飞书接�
 # 查看飞书接入状态
 
 ```bash
-node {{BRIDGE_ROOT}}/scripts/feishu-status.mjs
+node {{SCRIPT:feishu-status.mjs}}
 ```
 
 把它的 stdout 用简洁的自然语言转述给 Frank。**不修改任何状态。**

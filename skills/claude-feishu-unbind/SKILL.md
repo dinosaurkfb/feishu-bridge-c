@@ -8,8 +8,8 @@ description: 可恢复地暂停当前项目（或当前这条工作线）的飞�
 **Frank 调用这条命令本身就是这次暂停的授权**，不必再问一遍"确认吗"。
 
 ```bash
-node {{BRIDGE_ROOT}}/scripts/feishu-unbind.mjs            # 先看会暂停什么
-node {{BRIDGE_ROOT}}/scripts/feishu-unbind.mjs --apply    # 再执行
+node {{SCRIPT:feishu-unbind.mjs}}            # 先看会暂停什么
+node {{SCRIPT:feishu-unbind.mjs}} --apply    # 再执行
 ```
 
 先跑不带 `--apply` 的那条，把「会暂停哪一条绑定、有多少待发内容」给他看，再执行。

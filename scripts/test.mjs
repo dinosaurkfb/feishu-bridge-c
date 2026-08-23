@@ -32,7 +32,7 @@ import { appendEvent, composeDigest, listPending, markSent } from "./outbox.mjs"
 import {
   composeOutboundCard, outboundCardBatches, validateOutboundCard,
 } from "./outbound-card.mjs";
-import { drainProject, watcherActive } from "./drain-outbox.mjs";
+import { drainProject, publishErrorDetail, watcherActive } from "./drain-outbox.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
 import {
   applyRuntimeSync, planRuntimeSync, runtimeRoot, runtimeScript, verifyRuntime,
@@ -7614,6 +7614,34 @@ test("按文档里那条命令登记，聚合方要真的能取到状态", () =>
   assert.equal(renderConnectivity(view).includes("oc_SECRET123456"), false);
 });
 
+
+test("发布失败要留下 lark-cli 说的话，不是命令回显", () => {
+  // 实机上这条报错长这样：Command failed: <带整张卡片 JSON 的命令>\n<stderr>。
+  // 命令回显上千字符，从头截 400 留下来的全是命令 —— cc2cd 那条卡住的进展
+  // 就是这么变成"查不出原因"的。上一版发现了症状，改法是把 400 放宽，
+  // 那治不了：问题不是长度不够，是截错了方向。
+  const command = "Command failed: /opt/homebrew/bin/lark-cli im +messages-reply --content "
+    + "x".repeat(2000);
+
+  // stderr 优先。
+  assert.equal(publishErrorDetail({ message: command, stderr: "code 230002: bot not in chat" }),
+    "code 230002: bot not in chat");
+  // Buffer 形式的 stderr 也要认。
+  assert.equal(publishErrorDetail({ message: command, stderr: Buffer.from("code 99991663") }),
+    "code 99991663");
+  // 没有 stderr 时用命令回显之后那段。
+  assert.equal(publishErrorDetail({ message: command + "\n真正的报错在这里" }), "真正的报错在这里");
+
+  // 实在只有命令回显：头尾都要留 —— 尾部往往正是失败的那个参数。
+  const onlyCommand = publishErrorDetail({ message: command });
+  assert.ok(onlyCommand.includes("lark-cli"), "开头要认得出是哪条命令");
+  assert.ok(onlyCommand.includes("…（中间省略）…"), "要说明中间被省了，别假装是完整的");
+  assert.ok(onlyCommand.endsWith("x".repeat(200)), "尾部必须保留");
+
+  // 短错误原样留下，不要平白加省略号。
+  assert.equal(publishErrorDetail({ message: "boom" }), "boom");
+  assert.equal(publishErrorDetail({}), "");
+});
 
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

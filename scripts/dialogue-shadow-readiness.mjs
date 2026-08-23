@@ -15,6 +15,10 @@ import {
 import {
   CANONICAL_TIME_PATTERN, canonicalIso, isCanonicalIso, isCanonicalMs, toCanonicalMs,
 } from "./canonical-time.mjs";
+import {
+  CHAT_SCOPE_ATTESTATION_REASON, CHAT_SCOPE_ATTESTATION_STATUS,
+  evaluateDialogueChatScopeAttestation,
+} from "./dialogue-chat-scope-attestation.mjs";
 import { validateDialogueChatScopeProbe } from "./dialogue-chat-scope-probe.mjs";
 import { REJECT } from "./selector.mjs";
 
@@ -43,6 +47,16 @@ const KNOWN_REASONS = new Set([
 const onlyKeys = (value, allowed) => value && typeof value === "object" &&
   Object.keys(value).every((key) => allowed.includes(key));
 const nonNegativeInteger = (value) => Number.isInteger(value) && value >= 0;
+const plainObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
+/** 原因桶与 total / attested / unverified 三个数必须互相对得上。 */
+const attestationCountsAgree = (block) => {
+  const counts = Object.entries(block.reason_counts);
+  const sum = counts.reduce((n, [, v]) => n + v, 0);
+  const attestedBucket = block.reason_counts.attested ?? 0;
+  const others = sum - attestedBucket;
+  return sum === block.total && attestedBucket === block.attested && others === block.unverified;
+};
 const reasonBucket = (value) => value === null ? "accepted"
   : KNOWN_REASONS.has(value) ? value : "other";
 
@@ -136,11 +150,34 @@ export const DIALOGUE_SHADOW_READINESS_CHECK_IDS = Object.freeze([
   "chat_locator_present",
   "chat_scope_consistent",
   "canonical_scope_verified",
+  "chat_scope_attested",
   "legacy_candidate_route_match",
   "legacy_candidate_full_match",
 ]);
 
 const check = (id, status) => ({ id, status });
+
+/**
+ * attestation 的受控原因桶。刻意与 binding-authorization / REJECT 那套分开 ——
+ * 那套里没有任何 attestation 的原因，全部会落进 "other"，分了等于没分。
+ */
+export const ATTESTATION_REASON_BUCKETS = Object.freeze([
+  "attested",
+  ...Object.values(CHAT_SCOPE_ATTESTATION_REASON),
+]);
+const attestationReasons = (results) => {
+  const out = {};
+  for (const item of results) {
+    const raw = item.ok
+      ? (item.attestation?.status === CHAT_SCOPE_ATTESTATION_STATUS.ATTESTED_CANDIDATE
+        ? "attested" : item.attestation?.reason)
+      : item.reason;
+    const key = ATTESTATION_REASON_BUCKETS.includes(raw) ? raw
+      : CHAT_SCOPE_ATTESTATION_REASON.INPUT_INVALID;
+    out[key] = (out[key] ?? 0) + 1;
+  }
+  return Object.fromEntries(Object.entries(out).sort(([a], [b]) => a.localeCompare(b)));
+};
 const histogram = (values) => {
   const out = {};
   for (const value of values) {
@@ -245,6 +282,40 @@ export function analyzeDialogueShadowEvidence(rawInput = {}) {
   // 结论却是 manual_review_required，正好是最危险的那种读法。
   const sourceDirsComplete = missingSourceDirs === 0;
 
+  /**
+   * 逐 binding 跑 chat scope attestation，把 B2c 那份聚合判定接进只读审计。
+   *
+   * 在此之前 attestation 没有任何调用方 —— `attested_candidate` 只存在于单测里。
+   * 一个没人读的判定既不能支撑门禁，也没人会发现它坏了。
+   *
+   * **它不提升 canonical trust。**这里只回答"证据够不够格被人拿去看"，
+   * 而"chat scope 是否可信"仍是 `trusted_locator_source` 这道人工门禁 ——
+   * attestation 说的是"多条独立真实观测持续一致"，不是"Aily 的字段注入来源已被证明可信"。
+   * 所以下面的结论仍然封顶在 manual_review_required，见 decision 处。
+   */
+  const attestations = validAuthorizations.map((snapshot) =>
+    evaluateDialogueChatScopeAttestation({
+      snapshot,
+      probes: validProbes.filter((probe) =>
+        probe.binding_ref === snapshot.binding_ref &&
+        probe.authorization_snapshot_id === snapshot.snapshot_id),
+      now: generatedMs,
+    }));
+  const attested = attestations.filter((item) =>
+    item.ok && item.attestation?.status === CHAT_SCOPE_ATTESTATION_STATUS.ATTESTED_CANDIDATE);
+  // 有授权快照、且每一个都攒够了独立一致的观测，才算这一项通过；
+  // 一个都没有时是 insufficient，不是 pass —— 空集合不构成证据。
+  const scopeAttested = validAuthorizations.length > 0 &&
+    attested.length === validAuthorizations.length;
+  // "证据还不够"和"证据有问题"必须分开报。attestation 要求至少
+  // MIN_ATTESTATION_SAMPLES 条互相独立的观测，刚接上时天然攒不够 —— 那是
+  // insufficient，不是 fail。报成 fail 会让人去查一个根本不存在的故障，
+  // 也会把"还没开始收集"和"收到了互相矛盾的观测"混成同一种红。
+  const attestationBlockers = attestations.filter((item) => !item.ok ||
+    item.attestation?.status !== CHAT_SCOPE_ATTESTATION_STATUS.ATTESTED_CANDIDATE);
+  const onlyNeedsMoreSamples = attestationBlockers.every((item) => item.ok &&
+    item.attestation?.reason === CHAT_SCOPE_ATTESTATION_REASON.INSUFFICIENT_EVIDENCE);
+
   const automatedChecks = [
     check("source_dirs_complete", sourceDirsComplete ? "pass" : "fail"),
     check("samples_present", sampleCount > 0 ? "pass" :
@@ -258,6 +329,8 @@ export function analyzeDialogueShadowEvidence(rawInput = {}) {
       scopeConsistent ? "pass" : "fail"),
     check("canonical_scope_verified", validProbes.length === 0 ? "insufficient" :
       canonicalVerified ? "pass" : "fail"),
+    check("chat_scope_attested", validAuthorizations.length === 0 ? "insufficient" :
+      scopeAttested ? "pass" : onlyNeedsMoreSamples ? "insufficient" : "fail"),
     check("legacy_candidate_route_match", validEvents.length === 0 ? "insufficient" :
       routeConsistent ? "pass" : "fail"),
     check("legacy_candidate_full_match", validEvents.length === 0 ? "insufficient" :
@@ -294,6 +367,17 @@ export function analyzeDialogueShadowEvidence(rawInput = {}) {
         candidate_reason_counts: histogram(validEvents.map((item) =>
           item.comparison.candidate_reason)),
       }),
+      // **不用 metric()。**它算的是 invalid = total - valid，于是一份结构完全合法、
+      // 只是样本还不够的 attestation 会被记成 invalid —— 又把"还不够"和"坏了"混回一起，
+      // 而这正是接入 attestation 时最该分清的一件事。改用 attested / unverified 两个词，
+      // 并用 attestation 自己的受控原因集合分桶（复用 binding-authorization 那套会让
+      // 所有 attestation 原因落进 "other"，等于没分）。
+      attestations: {
+        total: validAuthorizations.length,
+        attested: attested.length,
+        unverified: validAuthorizations.length - attested.length,
+        reason_counts: attestationReasons(attestations),
+      },
       probes: metric(probes.length, validProbes.length, {
         chat_locator_present: validProbes.filter((item) => item.chat_locator_present).length,
         chat_scope_match: validProbes.filter((item) => item.chat_scope_match === true).length,
@@ -334,7 +418,25 @@ export function validateDialogueShadowReadinessReport(report) {
         .every(nonNegativeInteger) ||
       // 缺失的目录数不可能多过被审的目录总数；能这样自相矛盾的报告是伪造或算错的。
       report.missing_source_dirs > report.source_count ||
-      !onlyKeys(report?.artifacts, ["authorizations", "events", "probes"]) ||
+      !onlyKeys(report?.artifacts, ["authorizations", "events", "probes", "attestations"]) ||
+      // attestation 块用自己的受控键，不套 metric 的 valid/invalid。
+      !onlyKeys(report?.artifacts?.attestations,
+        ["total", "attested", "unverified", "reason_counts"]) ||
+      ![report?.artifacts?.attestations?.total, report?.artifacts?.attestations?.attested,
+        report?.artifacts?.attestations?.unverified].every(nonNegativeInteger) ||
+      report.artifacts.attestations.attested + report.artifacts.attestations.unverified !==
+        report.artifacts.attestations.total ||
+      // reason_counts 必须**存在**且是普通对象。onlyKeys 不要求字段存在，
+      // 而 `?? {}` 又会把"字段整个缺失"静默当成"空桶" —— 两个宽松叠在一起，
+      // 一份没有 reason_counts 的报告能通过校验。
+      !plainObject(report.artifacts.attestations.reason_counts) ||
+      // 原因桶只允许 attestation 自己那套 key。任意 key 能进来就等于开了一条
+      // 把敏感字符串印进报告的通道 —— 检查 id 那处已经栽过一次。
+      Object.entries(report.artifacts.attestations.reason_counts).some(([key, value]) =>
+        !ATTESTATION_REASON_BUCKETS.includes(key) || !nonNegativeInteger(value)) ||
+      // 桶要跟计数对得上，否则"结构合法"只是好看：三条各自独立，
+      // 少任何一条都能造出一份自洽不了却能过校验的报告。
+      !attestationCountsAgree(report.artifacts.attestations) ||
       !validMetric(report?.artifacts?.authorizations, ["active", "paused"]) ||
       ![report?.artifacts?.authorizations?.active, report?.artifacts?.authorizations?.paused]
         .every(nonNegativeInteger) ||
@@ -365,6 +467,22 @@ export function validateDialogueShadowReadinessReport(report) {
       !Array.isArray(report?.manual_gates_unverified) ||
       JSON.stringify(report.manual_gates_unverified) !== JSON.stringify(MANUAL_GATES)) {
     return { ok: false, reason: "shadow_readiness_report_invalid" };
+  }
+
+  /**
+   * **decision 契约要由 validator 钉住，不能只靠 analyzer 算对。**
+   *
+   * analyzer 的方向本来就对（任一检查非 pass → not_ready），但 Codex 复核时把一份
+   * 空证据报告的 decision 直接篡改成 manual_review_required，validator 照样接受。
+   * 一份能通过校验的报告说"只差人工签字了"，而它的自动检查其实全是 insufficient ——
+   * 这正是这份审计最不该出的那种结论。
+   *
+   * manual_review_required 是四个结论里唯一"可以往下走"的一个，所以它必须是
+   * 自动检查全 pass 的**充要**条件，两层各自独立成立。
+   */
+  const allPassed = report.automated_checks.every((item) => item.status === "pass");
+  if (allPassed !== (report.decision === DIALOGUE_SHADOW_READINESS_DECISION.MANUAL_REVIEW_REQUIRED)) {
+    return { ok: false, reason: "shadow_readiness_decision_inconsistent" };
   }
   return { ok: true };
 }

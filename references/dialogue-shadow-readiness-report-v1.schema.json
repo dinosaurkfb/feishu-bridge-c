@@ -53,6 +53,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "attestations",
         "authorizations",
         "events",
         "probes"
@@ -66,6 +67,54 @@
         },
         "probes": {
           "$ref": "#/$defs/probeMetrics"
+        },
+        "attestations": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "total",
+            "attested",
+            "unverified",
+            "reason_counts"
+          ],
+          "properties": {
+            "total": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "attested": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "unverified": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "reason_counts": {
+              "type": "object",
+              "additionalProperties": false,
+              "propertyNames": {
+                "enum": [
+                  "attested",
+                  "chat_scope_attestation_input_invalid",
+                  "chat_scope_attestation_evidence_invalid",
+                  "chat_scope_attestation_insufficient_evidence",
+                  "chat_scope_attestation_binding_mismatch",
+                  "chat_scope_attestation_snapshot_mismatch",
+                  "chat_scope_attestation_stale_evidence",
+                  "chat_scope_attestation_locator_missing",
+                  "chat_scope_attestation_scope_mismatch"
+                ]
+              },
+              "patternProperties": {
+                "^.*$": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "description": "逐 binding 的 chat scope attestation 聚合。刻意用 attested/unverified 而非 valid/invalid —— 样本不足是'还不够'不是'坏了'。attested 不等于 chat scope 可信，后者仍是 trusted_locator_source 人工门禁。"
         }
       }
     },
@@ -104,8 +153,8 @@
     },
     "automated_checks": {
       "type": "array",
-      "minItems": 9,
-      "maxItems": 9,
+      "minItems": 10,
+      "maxItems": 10,
       "items": false,
       "prefixItems": [
         {
@@ -238,6 +287,26 @@
           "properties": {
             "id": {
               "const": "canonical_scope_verified"
+            },
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "insufficient"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "status"
+          ],
+          "properties": {
+            "id": {
+              "const": "chat_scope_attested"
             },
             "status": {
               "enum": [
@@ -486,5 +555,47 @@
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "automated_checks"
+        ],
+        "properties": {
+          "automated_checks": {
+            "contains": {
+              "required": [
+                "status"
+              ],
+              "properties": {
+                "status": {
+                  "enum": [
+                    "fail",
+                    "insufficient"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "not": {
+              "const": "manual_review_required"
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "decision": {
+            "const": "manual_review_required"
+          }
+        }
+      }
+    }
+  ]
 }

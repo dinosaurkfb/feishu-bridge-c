@@ -49,3 +49,29 @@ dialogue-chat-scope-attestation-shadow.md)）在纯 shadow 范围内对单个 bi
 本地合成测试只能证明汇总、关联、脱敏与 fail-closed 语义。真实 readiness 必须在 B1/B2a 已显式开启的
 机器上，用新的真实 mention 产生 sidecar 后运行。回滚只需移除本模块、CLI、schema 与文档；运行时热
 路径和既有 sidecar 未被改写。
+
+## chat scope attestation 已接入本审计
+
+B2c 的逐 binding attestation 此前**没有任何调用方** —— `attested_candidate` 只存在于单测。
+一个没人读的判定既支撑不了门禁，坏了也没人会发现。现在本审计对每个有效授权快照跑一次
+attestation（取它自己的 probe：`binding_ref` 与 `authorization_snapshot_id` 都匹配），
+产出两样东西：
+
+- 受控检查 `chat_scope_attested`：所有授权快照都攒够独立一致观测才 `pass`；
+- `artifacts.attestations`：脱敏计数与受控原因桶，不含 `binding_ref`、`snapshot_id` 或任何 locator。
+
+**「还不够」与「有问题」分开报。**attestation 要求至少 `MIN_ATTESTATION_SAMPLES` 条互相独立的
+观测，刚接上时天然攒不够，那是 `insufficient` 不是 `fail`。混成同一种红会让人去查一个不存在的
+故障，也会把「还没开始收集」和「收到了互相矛盾的观测」混为一谈。
+
+### attested ≠ chat scope 可信
+
+这是接入时最容易滑坡的一步，所以写在这里并有测试钉着：
+
+`attested_candidate` 说的是**多条独立真实观测持续一致**；`trusted_locator_source` 问的是
+**Aily 那个字段的注入来源本身可不可信**。前者证明不了后者 —— 所有观测完全可以一致地来自
+同一个不可信来源。因此：
+
+- 结论仍封顶在 `manual_review_required`；
+- `trusted_locator_source` 仍留在 `manual_gates_unverified` 里；
+- 本检查通过**不构成**多订阅切流门禁 2 的满足条件，它只是让证据变得可读。

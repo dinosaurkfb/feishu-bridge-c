@@ -39,6 +39,11 @@ session/thread/chat locator、sender 或项目名。
 报告不能授权安装、设置 `verified=true`、切换权威路由或开启 Agent Relay。真实写入与切流仍需独立
 评审、门禁证据和 Frank 的逐次授权。
 
+`feat/dialogue-chat-scope-attestation-shadow`（[`dialogue-chat-scope-attestation-shadow.md`](
+dialogue-chat-scope-attestation-shadow.md)）在纯 shadow 范围内对单个 binding 的 B2a 证据做进一步
+聚合判定，为 `generation_rotation_coverage` 之外的跨 revision 一致性提供更严格的候选信号；它不读取
+或写入本模块的证据目录，也不改变本报告的任何自动检查或人工门禁。
+
 ## 4. 证据层级与回滚
 
 本地合成测试只能证明汇总、关联、脱敏与 fail-closed 语义。真实 readiness 必须在 B1/B2a 已显式开启的

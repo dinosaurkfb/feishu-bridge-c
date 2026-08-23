@@ -89,7 +89,7 @@ import {
   BINDING_AUTHORIZATION_ARTIFACT_TYPE, BINDING_AUTHORIZATION_REASON,
   BOUND_AUTHORIZATION_SHADOW_ARTIFACT_TYPE,
   buildLegacyDialogueBoundAuthorizationContext, createDialogueBoundAuthorizationShadow,
-  evaluateDialogueBoundAuthorization,
+  evaluateDialogueBoundAuthorization, materializeDialogueBindingAuthorization,
   validateDialogueBindingAuthorizationSnapshot, validateDialogueBoundAuthorizationShadow,
 } from "./dialogue-binding-authorization.mjs";
 import {
@@ -108,6 +108,12 @@ import {
   renderDialogueShadowReadinessReport, validateDialogueShadowReadinessReport,
 } from "./dialogue-shadow-readiness.mjs";
 import { CANONICAL_TIME_PATTERN } from "./canonical-time.mjs";
+import {
+  ATTESTATION_EVIDENCE_MAX_AGE_LIMIT_MS, ATTESTATION_EVIDENCE_MAX_AGE_MS,
+  CHAT_SCOPE_ATTESTATION_ARTIFACT_TYPE, CHAT_SCOPE_ATTESTATION_REASON,
+  CHAT_SCOPE_ATTESTATION_STATUS, MIN_ATTESTATION_SAMPLES,
+  evaluateDialogueChatScopeAttestation, validateDialogueChatScopeAttestation,
+} from "./dialogue-chat-scope-attestation.mjs";
 import {
   MAX_LOCAL_INPUT_CHARS, claudeTurnInputDir, clearTurnInput, isFeishuStampedInput,
   readTurnInput, storeTurnInput,
@@ -1236,6 +1242,422 @@ test("Dialogue shadow readiness schema 与运行时 artifact 固化一致", () =
   ])].sort();
   assert.deepEqual([...reasonNames].sort(), runtimeReasonNames,
     "JSON Schema 与运行时必须维护完全相同的受控 reason bucket 集合");
+});
+
+// ---------- Dialogue Chat Scope Attestation（Slice B2c）：候选证据聚合，仍不提升 canonical trust ----------
+
+const chatScopeAttestationFixture = () => {
+  const fixture = dialogueAuthorizationFixture();
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), "dialogue-scope-attestation-"));
+  const synced = syncDialogueAuthorizationShadowSnapshot({
+    shadowDir, authorizationInput: fixture.context.authorizationInput, capturedAt: NOW,
+  });
+  assert.equal(synced.ok, true);
+  const buildProbe = ({
+    suffix, observedAt = NOW, chatId = fixture.template.chat_id, locatorPresent = true,
+    snapshot = synced.snapshot,
+  }) => {
+    const event = { ...baseEvent, message_id: "msg_attest_" + suffix };
+    const built = buildCanonicalEvent({
+      event, rawEnvelope: { type: "message.create", payload: { opaque: true } },
+      endpointId: fixture.endpointId, callerAgentUid: fixture.template.agent_uid,
+    });
+    assert.equal(built.ok, true);
+    const canonicalEvent = structuredClone(built.event);
+    if (locatorPresent) {
+      canonicalEvent.extensions.aily_channel.chat_id = chatId;
+      canonicalEvent.extensions.aily_channel.thread_id = "opaque-runtime-thread";
+    }
+    const created = createDialogueChatScopeProbe({ snapshot, canonicalEvent, observedAt });
+    assert.equal(created.ok, true);
+    return created.probe;
+  };
+  return { fixture, snapshot: synced.snapshot, buildProbe };
+};
+
+test("Chat scope attestation 证据缺失或独立样本不足时保持 unverified", () => {
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  const empty = evaluateDialogueChatScopeAttestation({ snapshot, probes: [], now: NOW });
+  assert.equal(empty.ok, true);
+  assert.equal(empty.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(empty.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.INSUFFICIENT_EVIDENCE);
+  assert.equal(empty.attestation.sample_count, 0);
+  assert.equal(empty.attestation.first_observed_at, null);
+  assert.equal(validateDialogueChatScopeAttestation(empty.attestation).ok, true);
+
+  const two = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: [buildProbe({ suffix: "1" }), buildProbe({ suffix: "2" })], now: NOW,
+  });
+  assert.equal(two.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(two.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.INSUFFICIENT_EVIDENCE);
+  assert.equal(two.attestation.sample_count, 2);
+
+  const duplicated = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: [buildProbe({ suffix: "same" }), buildProbe({ suffix: "same" })], now: NOW,
+  });
+  assert.equal(duplicated.attestation.sample_count, 1,
+    "同一 event 的重复观测不能凑成两条独立样本");
+  assert.equal(duplicated.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.INSUFFICIENT_EVIDENCE);
+});
+
+test("Chat scope attestation 对任何一条损坏或互相矛盾的证据整体 fail-closed", () => {
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  const probes = [buildProbe({ suffix: "a" }), buildProbe({ suffix: "b" }), buildProbe({ suffix: "c" })];
+  const corrupted = structuredClone(probes[1]);
+  corrupted.chat_scope_match = false;
+  const withCorrupted = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: [probes[0], corrupted, probes[2]], now: NOW,
+  });
+  assert.equal(withCorrupted.ok, true);
+  assert.equal(withCorrupted.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(withCorrupted.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.EVIDENCE_INVALID);
+  assert.equal(withCorrupted.attestation.sample_count, 0, "损坏证据不能保留部分计数凑数");
+
+  const conflictingOne = buildProbe({ suffix: "z" });
+  const conflictingTwo = buildProbe({ suffix: "z", chatId: "oc_other_private" });
+  assert.equal(conflictingOne.probe_id, conflictingTwo.probe_id,
+    "同一 snapshot/event 的观测必须落在同一冲突域");
+  assert.notEqual(conflictingOne.evidence_hash, conflictingTwo.evidence_hash);
+  const withConflict = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: [probes[0], probes[2], conflictingOne, conflictingTwo], now: NOW,
+  });
+  assert.equal(withConflict.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(withConflict.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.EVIDENCE_INVALID);
+});
+
+test("Chat scope attestation 拒绝跨 binding 或跨授权 revision 混入的证据", () => {
+  const { fixture, snapshot, buildProbe } = chatScopeAttestationFixture();
+  const validProbes = [buildProbe({ suffix: "1" }), buildProbe({ suffix: "2" })];
+
+  const otherInput = {
+    ...fixture.context.authorizationInput,
+    binding: {
+      ...fixture.context.authorizationInput.binding,
+      private_binding_key: "private-binding-other-line",
+    },
+  };
+  const otherMaterialized = materializeDialogueBindingAuthorization({ ...otherInput, capturedAt: NOW });
+  assert.equal(otherMaterialized.ok, true);
+  assert.notEqual(otherMaterialized.snapshot.binding_ref, snapshot.binding_ref);
+  const foreignProbe = buildProbe({ suffix: "foreign", snapshot: otherMaterialized.snapshot });
+  const crossBinding = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: [...validProbes, foreignProbe], now: NOW,
+  });
+  assert.equal(crossBinding.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(crossBinding.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.BINDING_MISMATCH);
+
+  const revisedSubscription = structuredClone(fixture.context.authorizationInput.subscription);
+  revisedSubscription.constraints = {
+    ...revisedSubscription.constraints,
+    freshness_ms: revisedSubscription.constraints.freshness_ms + 1000,
+  };
+  const revisedInput = { ...fixture.context.authorizationInput, subscription: revisedSubscription };
+  const revisedMaterialized = materializeDialogueBindingAuthorization({ ...revisedInput, capturedAt: NOW });
+  assert.equal(revisedMaterialized.ok, true);
+  assert.equal(revisedMaterialized.snapshot.binding_ref, snapshot.binding_ref);
+  assert.notEqual(revisedMaterialized.snapshot.snapshot_id, snapshot.snapshot_id);
+  const revisedProbe = buildProbe({ suffix: "revised", snapshot: revisedMaterialized.snapshot });
+  const crossSnapshot = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: [...validProbes, revisedProbe], now: NOW,
+  });
+  assert.equal(crossSnapshot.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(crossSnapshot.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.SNAPSHOT_MISMATCH);
+});
+
+test("Chat scope attestation 拒绝任何一条过期或未来时间戳的证据", () => {
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  const fresh = [buildProbe({ suffix: "1" }), buildProbe({ suffix: "2" })];
+  const stale = buildProbe({
+    suffix: "3", observedAt: NOW - ATTESTATION_EVIDENCE_MAX_AGE_MS - 1,
+  });
+  const staleResult = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: [...fresh, stale], now: NOW,
+  });
+  assert.equal(staleResult.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(staleResult.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.STALE_EVIDENCE);
+  assert.equal(staleResult.attestation.evidence_max_age_ms, ATTESTATION_EVIDENCE_MAX_AGE_MS,
+    "判定用的窗口必须写进制品，否则说不清当时凭什么认为证据过期");
+
+  const future = buildProbe({ suffix: "4", observedAt: NOW + 60_000 });
+  const futureResult = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: [...fresh, future], now: NOW,
+  });
+  assert.equal(futureResult.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(futureResult.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.EVIDENCE_INVALID,
+    "未来时间戳只能是损坏或篡改，不能算作过期之外的正常样本");
+});
+
+// 阻断项 1 的回归：证据保留窗口必须独立于消息防重放期限。
+test("Chat scope attestation 的证据窗口与 snapshot.freshness_ms 解耦", () => {
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  assert.ok(ATTESTATION_EVIDENCE_MAX_AGE_MS > snapshot.freshness_ms,
+    "前提：证据窗口必须比防重放期限长，否则跨轮取证根本攒不齐样本");
+
+  // 三条观测分散在远超 freshness_ms（默认 15 分钟）的时间里 —— 这正是 attestation
+  // 的正常工作形态：跨多轮、跨话题轮转积累。旧实现会把它们全判成过期。
+  const spread = [
+    buildProbe({ suffix: "1", observedAt: NOW - snapshot.freshness_ms * 4 }),
+    buildProbe({ suffix: "2", observedAt: NOW - snapshot.freshness_ms * 2 }),
+    buildProbe({ suffix: "3", observedAt: NOW }),
+  ];
+  const result = evaluateDialogueChatScopeAttestation({ snapshot, probes: spread, now: NOW });
+  assert.equal(result.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.ATTESTED_CANDIDATE,
+    "跨越防重放期限的多轮证据仍应成立；把两条策略焊在一起会让它永远无法成立");
+  assert.equal(result.attestation.reason, null);
+  assert.equal(result.attestation.sample_count, MIN_ATTESTATION_SAMPLES);
+  assert.equal(validateDialogueChatScopeAttestation(result.attestation).ok, true);
+
+  // 边界：正好压在证据窗口上的一条仍算数，越过一毫秒就不算。
+  const atEdge = buildProbe({ suffix: "e", observedAt: NOW - ATTESTATION_EVIDENCE_MAX_AGE_MS });
+  assert.equal(
+    evaluateDialogueChatScopeAttestation({
+      snapshot, probes: [...spread.slice(0, 2), atEdge], now: NOW,
+    }).attestation.status,
+    CHAT_SCOPE_ATTESTATION_STATUS.ATTESTED_CANDIDATE, "窗口是闭区间，边界上仍成立");
+
+  // 反向不能靠改 snapshot 来验：snapshot_id 是内容派生的，改 freshness_ms 等于伪造快照，
+  // 会被完整性校验直接判 INVALID_SNAPSHOT，测不到想测的东西。
+  // 真正要钉死的是"源码里根本不读这个字段"——这条防的是将来有人又把两条策略接回去。
+  const source = fs.readFileSync(
+    path.join(path.dirname(new URL(import.meta.url).pathname),
+      "dialogue-chat-scope-attestation.mjs"), "utf-8");
+  const codeOnly = source.replace(/\/\*[\s\S]*?\*\//gu, "").replace(/\/\/[^\n]*/gu, "");
+  assert.ok(!codeOnly.includes("freshness_ms"),
+    "attestation 的判定代码不得读取 snapshot.freshness_ms —— 那是消息防重放期限，不是证据保留期");
+});
+
+test("Chat scope attestation 的证据窗口可显式收紧，但不可取消过期", () => {
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  const spread = [
+    buildProbe({ suffix: "1", observedAt: NOW - 60 * 60 * 1000 }),
+    buildProbe({ suffix: "2", observedAt: NOW - 30 * 60 * 1000 }),
+    buildProbe({ suffix: "3", observedAt: NOW }),
+  ];
+  assert.equal(
+    evaluateDialogueChatScopeAttestation({ snapshot, probes: spread, now: NOW })
+      .attestation.status,
+    CHAT_SCOPE_ATTESTATION_STATUS.ATTESTED_CANDIDATE, "默认窗口下成立");
+
+  const strict = evaluateDialogueChatScopeAttestation({
+    snapshot, probes: spread, now: NOW, evidenceMaxAgeMs: 10 * 60 * 1000,
+  });
+  assert.equal(strict.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(strict.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.STALE_EVIDENCE);
+  assert.equal(strict.attestation.evidence_max_age_ms, 10 * 60 * 1000,
+    "制品要自述当时用的是哪个窗口，否则两份结论不同的 attestation 无法区分");
+
+  for (const bad of [0, -1, 1.5, "600000", null,
+    ATTESTATION_EVIDENCE_MAX_AGE_LIMIT_MS + 1]) {
+    const rejected = evaluateDialogueChatScopeAttestation({
+      snapshot, probes: spread, now: NOW, evidenceMaxAgeMs: bad,
+    });
+    assert.equal(rejected.ok, false, "非法证据窗口 " + String(bad) + " 必须判成调用方错误");
+    assert.equal(rejected.reason, CHAT_SCOPE_ATTESTATION_REASON.INPUT_INVALID);
+  }
+});
+
+// 阻断项 2 的回归：generated_at 必须一律由已校验的 nowMs 规范化。
+test("Chat scope attestation 的 generated_at 永远是规范 ISO，越界数值判错而不抛", () => {
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  const probes = [buildProbe({ suffix: "1" }), buildProbe({ suffix: "2" }),
+    buildProbe({ suffix: "3" })];
+  const expected = new Date(NOW).toISOString();
+
+  // Date 对象：旧实现会把它原样放进 generated_at（一个对象，不是 string/date-time），
+  // 而且 Date.parse(dateObject) 走 toString()，毫秒会被静默截断。
+  const withMs = new Date(NOW + 123);
+  const fromDate = evaluateDialogueChatScopeAttestation({ snapshot, probes, now: withMs });
+  assert.equal(typeof fromDate.attestation.generated_at, "string");
+  assert.equal(fromDate.attestation.generated_at, new Date(NOW + 123).toISOString(),
+    "Date 入参不能丢毫秒");
+  assert.equal(validateDialogueChatScopeAttestation(fromDate.attestation).ok, true);
+
+  // 可解析但非 RFC3339 的字符串：旧实现原样透传，schema 的 format: date-time 不认。
+  const fromLoose = evaluateDialogueChatScopeAttestation({
+    snapshot, probes, now: "2026-08-19T10:00:00Z",
+  });
+  assert.equal(fromLoose.attestation.generated_at, expected);
+  const fromDateOnly = evaluateDialogueChatScopeAttestation({
+    snapshot, probes, now: "2026-08-19",
+  });
+  assert.equal(fromDateOnly.attestation.generated_at, "2026-08-19T00:00:00.000Z",
+    "非规范但可解析的输入要被折算成规范形式，而不是原样透传");
+  assert.equal(validateDialogueChatScopeAttestation(fromDateOnly.attestation).ok, true);
+
+  // 越界数值：Number.isFinite 拦不住，toISOString() 会抛 RangeError。
+  // 本模块承诺"只有调用方错误才返回 ok:false"，没承诺会抛。
+  // 2.6e14 是另一类：它**不抛**，却会产出 "+010209-01-27T06:13:20.000Z" 这种六位年份 ——
+  // 能被 Date.parse 往返，但不是合法 RFC3339，schema 拒收。边界必须按四位年份卡，
+  // 而不是按 ECMAScript 的 ±8.64e15。
+  for (const outOfRange of [9e15, -9e15, Number.MAX_SAFE_INTEGER, 2.6e14,
+    Date.parse("9999-12-31T23:59:59.999Z") + 1]) {
+    let outcome;
+    assert.doesNotThrow(() => {
+      outcome = evaluateDialogueChatScopeAttestation({ snapshot, probes, now: outOfRange });
+    }, "越界时间值必须判成输入错误，不能抛异常穿透给调用方");
+    assert.equal(outcome.ok, false);
+    assert.equal(outcome.reason, CHAT_SCOPE_ATTESTATION_REASON.INPUT_INVALID);
+  }
+  for (const bad of [Number.NaN, Infinity, "not-a-time", {}]) {
+    assert.equal(evaluateDialogueChatScopeAttestation({ snapshot, probes, now: bad }).ok, false);
+  }
+});
+
+test("Chat scope attestation validator 与 JSON Schema 对 date-time 同解", () => {
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  const good = evaluateDialogueChatScopeAttestation({
+    snapshot,
+    probes: [buildProbe({ suffix: "1" }), buildProbe({ suffix: "2" }),
+      buildProbe({ suffix: "3" })],
+    now: NOW,
+  }).attestation;
+  assert.equal(validateDialogueChatScopeAttestation(good).ok, true);
+
+  // 运行时不能接受 schema 会拒的东西 —— 这正是原来 Number.isFinite(Date.parse(x)) 的漏洞。
+  for (const field of ["generated_at", "first_observed_at", "last_observed_at"]) {
+    for (const bad of ["2026-08-19", "2026-08-19T10:00:00", "2026-08-19T10:00:00Z",
+      "2026-08-19T18:00:00+08:00", "+010209-01-27T06:13:20.000Z",
+      "2026-02-30T00:00:00.000Z", 1755597600000, null]) {
+      assert.equal(validateDialogueChatScopeAttestation({ ...good, [field]: bad }).ok, false,
+        field + " = " + JSON.stringify(bad) + " 不是规范 date-time，validator 必须拒");
+    }
+  }
+
+  // 双向等价：schema 的 pattern 与运行时用的是同一条，且两边对同一组样本判一致。
+  // 早先版本只做 toISOString 往返，自以为"单向更严"，其实两个方向都不对：
+  // 偏移写法上更严（schema 收、运行时拒），扩展年份上更松（运行时收、schema 拒）——
+  // 后者意味着运行时会产出 schema 校验不过的制品。
+  const timeRe = new RegExp(CANONICAL_TIME_PATTERN, "u");
+  const timeSchema = JSON.parse(fs.readFileSync(path.resolve("references",
+    "dialogue-chat-scope-attestation-v1.schema.json"), "utf-8"));
+  for (const field of ["generated_at", "first_observed_at", "last_observed_at"]) {
+    assert.equal(timeSchema.properties[field].pattern, CANONICAL_TIME_PATTERN,
+      field + " 的 schema pattern 必须与运行时同源");
+  }
+  for (const sample of ["2026-08-19T10:00:00.000Z", "0001-01-01T00:00:00.000Z",
+    "9999-12-31T23:59:59.999Z", "+010209-01-27T06:13:20.000Z", "2026-08-19T10:00:00Z",
+    "2026-08-19T18:00:00+08:00", "2026-08-19", "2026-02-30T00:00:00.000Z"]) {
+    const bySchema = timeRe.test(sample);
+    const byRuntime = validateDialogueChatScopeAttestation(
+      { ...good, generated_at: sample }).ok;
+    // 形状合法但日期不存在的（2026-02-30）schema pattern 拦不住，运行时靠往返相等再拦一道；
+    // 除此之外两边必须给出相同结论。
+    if (sample !== "2026-02-30T00:00:00.000Z") {
+      assert.equal(byRuntime, bySchema,
+        sample + "：schema pattern 与运行时 validator 结论必须一致");
+    } else {
+      assert.equal(bySchema, true);
+      assert.equal(byRuntime, false, "不存在的日期靠往返相等兜住");
+    }
+  }
+  for (const bad of [undefined, 0, -1, 1.5, ATTESTATION_EVIDENCE_MAX_AGE_LIMIT_MS + 1]) {
+    assert.equal(
+      validateDialogueChatScopeAttestation({ ...good, evidence_max_age_ms: bad }).ok, false,
+      "evidence_max_age_ms = " + String(bad) + " 越界或缺失时必须拒");
+  }
+});
+
+test("Chat scope attestation 要求全部样本 locator 存在且 chat scope 一致", () => {
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  const missing = evaluateDialogueChatScopeAttestation({
+    snapshot,
+    probes: [buildProbe({ suffix: "1" }), buildProbe({ suffix: "2" }),
+      buildProbe({ suffix: "3", locatorPresent: false })],
+    now: NOW,
+  });
+  assert.equal(missing.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(missing.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.LOCATOR_MISSING);
+
+  const mismatch = evaluateDialogueChatScopeAttestation({
+    snapshot,
+    probes: [buildProbe({ suffix: "4" }), buildProbe({ suffix: "5" }),
+      buildProbe({ suffix: "6", chatId: "oc_other_private" })],
+    now: NOW,
+  });
+  assert.equal(mismatch.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
+  assert.equal(mismatch.attestation.reason, CHAT_SCOPE_ATTESTATION_REASON.SCOPE_MISMATCH);
+});
+
+test("Chat scope attestation 在足够、独立、新鲜且一致的真实观测后才产生 shadow candidate", () => {
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  const probes = [
+    buildProbe({ suffix: "1", observedAt: NOW - 3000 }),
+    buildProbe({ suffix: "2", observedAt: NOW - 2000 }),
+    buildProbe({ suffix: "3", observedAt: NOW - 1000 }),
+  ];
+  const result = evaluateDialogueChatScopeAttestation({ snapshot, probes, now: NOW });
+  assert.equal(result.ok, true);
+  assert.equal(result.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.ATTESTED_CANDIDATE);
+  assert.equal(result.attestation.reason, null);
+  assert.equal(result.attestation.sample_count, MIN_ATTESTATION_SAMPLES);
+  assert.equal(result.attestation.first_observed_at, new Date(NOW - 3000).toISOString());
+  assert.equal(result.attestation.last_observed_at, new Date(NOW - 1000).toISOString());
+  assert.equal(validateDialogueChatScopeAttestation(result.attestation).ok, true);
+
+  const serialized = JSON.stringify(result.attestation);
+  assert.equal(serialized.includes("oc_private_dialogue"), false,
+    "attestation 不得包含原始 chat_id");
+  assert.equal(serialized.includes("opaque-runtime-thread"), false,
+    "attestation 不得包含原始 thread locator");
+});
+
+test("Chat scope attestation 校验器拒绝 status/reason/sample_count 不自洽的记录", () => {
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  const probes = [buildProbe({ suffix: "1" }), buildProbe({ suffix: "2" }), buildProbe({ suffix: "3" })];
+  const ok = evaluateDialogueChatScopeAttestation({ snapshot, probes, now: NOW });
+  assert.equal(ok.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.ATTESTED_CANDIDATE);
+
+  const brokenReason = structuredClone(ok.attestation);
+  brokenReason.reason = CHAT_SCOPE_ATTESTATION_REASON.STALE_EVIDENCE;
+  assert.equal(validateDialogueChatScopeAttestation(brokenReason).ok, false);
+
+  const brokenCount = structuredClone(ok.attestation);
+  brokenCount.sample_count = 1;
+  assert.equal(validateDialogueChatScopeAttestation(brokenCount).ok, false,
+    "attested_candidate 不能低于固定最小样本数");
+
+  const brokenRange = structuredClone(ok.attestation);
+  brokenRange.first_observed_at = null;
+  assert.equal(validateDialogueChatScopeAttestation(brokenRange).ok, false);
+});
+
+test("Chat scope attestation 对调用方传入的畸形 snapshot/probes 返回 input_invalid", () => {
+  const bad = evaluateDialogueChatScopeAttestation({ snapshot: {}, probes: [], now: NOW });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.reason, CHAT_SCOPE_ATTESTATION_REASON.INPUT_INVALID);
+
+  const { snapshot } = chatScopeAttestationFixture();
+  const badProbes = evaluateDialogueChatScopeAttestation({ snapshot, probes: "not-array", now: NOW });
+  assert.equal(badProbes.ok, false);
+  assert.equal(badProbes.reason, CHAT_SCOPE_ATTESTATION_REASON.INPUT_INVALID);
+});
+
+test("Dialogue Chat Scope Attestation schema 与运行时常量一致", () => {
+  const schema = JSON.parse(fs.readFileSync(path.resolve("references",
+    "dialogue-chat-scope-attestation-v1.schema.json"), "utf-8"));
+  assert.equal(schema.properties.artifact_type.const, CHAT_SCOPE_ATTESTATION_ARTIFACT_TYPE);
+  assert.deepEqual(schema.properties.status.enum, Object.values(CHAT_SCOPE_ATTESTATION_STATUS));
+  assert.deepEqual(schema.properties.reason.enum,
+    [null, ...Object.values(CHAT_SCOPE_ATTESTATION_REASON).filter((reason) =>
+      reason !== CHAT_SCOPE_ATTESTATION_REASON.INPUT_INVALID)]);
+
+  // 字段集也要对齐。原来这条测试只比三个枚举，不比 key 集合 —— 那正是让运行时多出
+  // 一个 schema 不认识的字段（或反过来）而无人发现的那道缝。
+  const { snapshot, buildProbe } = chatScopeAttestationFixture();
+  const produced = evaluateDialogueChatScopeAttestation({
+    snapshot,
+    probes: [buildProbe({ suffix: "1" }), buildProbe({ suffix: "2" }),
+      buildProbe({ suffix: "3" })],
+    now: NOW,
+  }).attestation;
+  assert.deepEqual(Object.keys(produced).sort(), [...schema.required].sort(),
+    "运行时产出的字段集必须与 schema.required 完全相同");
+  assert.deepEqual([...schema.required].sort(), Object.keys(schema.properties).sort(),
+    "schema 里不应存在既非 required 又被 additionalProperties:false 排除的悬空字段");
+  assert.equal(schema.properties.evidence_max_age_ms.maximum,
+    ATTESTATION_EVIDENCE_MAX_AGE_LIMIT_MS,
+    "证据窗口上限必须两边同源，否则 validator 与 schema 会在边界上分歧");
+  assert.ok(ATTESTATION_EVIDENCE_MAX_AGE_MS <= ATTESTATION_EVIDENCE_MAX_AGE_LIMIT_MS);
 });
 
 // ---------- Mapping Policy：公共准入、处置与 runtime-neutral runRequest ----------

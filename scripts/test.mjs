@@ -77,6 +77,7 @@ import {
 } from "./canonical-event.mjs";
 import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
 import { bindingToConnections } from "./group-binding-status.mjs";
+import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
 import {
   ENDPOINT_SELF_CHECK, composeLayeredStatus, endpointFacts, lastSuccessfulDispatchAt,
   renderLayeredStatus, subscriptionFacts,
@@ -7546,6 +7547,17 @@ test("投影覆盖不到不等于没有订阅", () => {
     st: { ...layeredSt(), source: "registry" }, endpoint, subscription: empty,
   }));
   assert.match(fromRegistry, /本项目没有事件订阅/u);
+});
+
+test("轮转演练本身要是绿的 —— 它是验收证据，烂了就没人知道", () => {
+  // 演练脚本平时是人跑的。把它挂进套件，是为了让"演练自己坏了"当场亮，
+  // 而不是等到要拿它当证据的那天才发现它早就跑不动了。
+  for (const drill of [drillFailureRetry(), drillStuckPreparing()]) {
+    for (const step of drill.steps) {
+      assert.equal(step.pass, true, drill.name + " / " + step.name + "：" + step.detail);
+    }
+    assert.ok(drill.steps.length >= 3, drill.name + " 的步骤不该变少");
+  }
 });
 
 summarySealed = true;

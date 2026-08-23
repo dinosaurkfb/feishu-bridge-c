@@ -512,9 +512,13 @@ const launchctl = (args, { tolerate = false } = {}) => {
 const domain = "gui/" + process.getuid();
 let launchNote;
 if (uninstall) {
-  launchctl(["bootout", domain + "/" + LAUNCH_LABEL], { tolerate: true });
+  const booted = launchctl(["bootout", domain + "/" + LAUNCH_LABEL], { tolerate: true });
   fs.rmSync(PLIST, { force: true });
-  launchNote = "已卸载";
+  // 沙箱卸载只删得掉这个 HOME 下的 plist 文件，真实 launchd 里那个 job 还在跑。
+  // 报"已卸载"会让人以为清干净了 —— 跟安装那侧同一个不对称，说法要对称。
+  launchNote = booted.skipped
+    ? "plist 已删，但真实 launchd 未动（HOME 被重定向到 " + os.homedir() + "）"
+    : "已卸载";
 } else {
   fs.mkdirSync(path.dirname(PLIST), { recursive: true });
   fs.writeFileSync(PLIST, plistBody);

@@ -5601,6 +5601,46 @@ test("含空格 HOME 下，出站装完之后入站也必须能装上", () => {
   assert.equal(fs.existsSync(script), true, "渲染出的路径必须指向真实存在的脚本：" + script);
 });
 
+test("预览放行归属：认领自己的与旧克隆的，不碰别人的", () => {
+  // 三类持久回归。之前我只在命令行里临时验过判据 —— 那等于没验，
+  // 下次有人放宽正则不会有任何东西报警。这条走真实产物：预置三种规则，
+  // 跑一次安装，看哪些被收编、哪些原样留着。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "perm-own-"));
+  const home = path.join(base, "我的 家");
+  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+
+  const foreign = "Bash(node --require '/other/scripts/bind-preview.mjs':*)";
+  const legacy = "Bash(node /old/clone/scripts/bind-preview.mjs:*)";
+  const unrelated = "Bash(git status:*)";
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"),
+    JSON.stringify({ permissions: { allow: [unrelated, foreign, legacy] } }, null, 2) + "\n");
+
+  execFileSync(process.execPath,
+    [path.resolve("scripts", "install-outbound.mjs"), "--apply"],
+    { encoding: "utf-8", env: { ...process.env, HOME: home } });
+
+  const allow = JSON.parse(fs.readFileSync(
+    path.join(home, ".claude", "settings.json"), "utf-8")).permissions.allow;
+
+  assert.ok(allow.includes(foreign),
+    "别人的规则不得被误删 —— --require 只是碰巧提到了同一个文件名");
+  assert.ok(allow.includes(unrelated), "无关规则更不能动");
+  assert.ok(!allow.includes(legacy), "旧克隆的裸路径规则要被收编掉");
+  const mine = allow.filter((r) => r.includes("bind-preview") && !r.includes("--require"));
+  assert.equal(mine.length, 1, "自己的规则只能剩一条");
+  assert.match(mine[0], /^Bash\(node '.*\/runtime\/current\/scripts\/bind-preview\.mjs':\*\)$/u,
+    "新规则应指向 runtime 且路径加引号");
+
+  // 再装一次必须幂等：不能因为认不出自己那条而不断追加。
+  execFileSync(process.execPath,
+    [path.resolve("scripts", "install-outbound.mjs"), "--apply"],
+    { encoding: "utf-8", env: { ...process.env, HOME: home } });
+  const again = JSON.parse(fs.readFileSync(
+    path.join(home, ".claude", "settings.json"), "utf-8")).permissions.allow;
+  assert.equal(again.filter((r) => r.includes("bind-preview") && !r.includes("--require")).length, 1,
+    "重复安装不得追加第二条");
+});
+
 test("HOME 被重定向时，安装器不得碰真实 launchd", () => {
   // plist 文件路径跟 os.homedir() 走，所以指定 HOME 看起来像个安全的沙箱安装。
   // 但 launchctl bootout/bootstrap 操作的是**真实用户的 launchd 域**，与 HOME 无关。

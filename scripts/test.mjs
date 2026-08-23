@@ -163,7 +163,25 @@ let passed = 0;
 let failed = 0;
 const failures = [];
 
+/**
+ * 汇总打印之后就封条。之后任何 `test()` 调用立刻响亮失败。
+ *
+ * 防的是一个真实发生过、而且**报绿**的失败：把新测试追加到文件末尾，
+ * 而汇总与 process.exit 在更靠前的位置 —— 那几条要么根本不执行，要么执行了
+ * 但结果已经不计入统计。2026-08-23 我一次追加三条，套件照报 393 通过，
+ * 三条从未生效；其中一条正是防线上故障复现的。
+ *
+ * 用运行期封条而不是"扫描源码看有没有 test 写在汇总后面"：后者是在断言形状，
+ * 而这条断言的是效果 —— 只要一条测试的结果没被计入，就必须红。
+ */
+let summarySealed = false;
+
 function test(name, fn) {
+  if (summarySealed) {
+    console.error("\n✗ 测试「" + name + "」写在汇总之后 —— 它的结果不会计入统计。");
+    console.error("  把它移到 `console.log(\`\\n通过 …\`)` 之前。");
+    process.exit(1);
+  }
   try {
     fn();
     passed += 1;
@@ -6006,6 +6024,24 @@ test("安装器不再把开发克隆路径写进全局配置", () => {
   }
 });
 
+test("测试文件里没有写在汇总之后的 test()", () => {
+  // 运行期封条只在那条 test() **真的被执行**时才触发。如果它藏在一个当前走不到的
+  // 分支里，封条抓不到，而它一旦某天被执行就又是静默不计。这条从结构上兜住：
+  // 汇总那一行之后不允许再出现 test( 调用。
+  //
+  // 两层都要：结构检查覆盖"没执行到"，运行期封条覆盖"执行了但不计数"。
+  const src = fs.readFileSync(path.resolve("scripts", "test.mjs"), "utf-8").split("\n");
+  const sealAt = src.findIndex((line) => line.startsWith("summarySealed = true;"));
+  assert.ok(sealAt > 0, "找不到封条那一行 —— 它被改名或删掉了，本检查会失效");
+  const late = [];
+  for (let i = sealAt + 1; i < src.length; i += 1) {
+    if (/^\s*test\(/u.test(src[i])) late.push(i + 1);
+  }
+  assert.deepEqual(late, [],
+    "第 " + late.join("、") + " 行的 test() 写在汇总之后，结果不会计入统计");
+});
+
+summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (failed > 0) {
   for (const f of failures) console.log("  ✗ " + f);

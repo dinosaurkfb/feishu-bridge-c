@@ -50,6 +50,53 @@ export function findLiveSessionById({ projectRoot, claudeSessionId, sessionsDir 
     .find((s) => s.sessionId === claudeSessionId) ?? null;
 }
 
+export const DELIVERY_REJECT = Object.freeze({
+  NO_LIVE: "no_live_session",
+  AMBIGUOUS: "ambiguous_live_sessions",
+});
+
+/**
+ * 项目级绑定该投给哪条会话。**说不清就拒收，不猜。**
+ *
+ * 上一版的规则是「取最近开的 —— 最可能是他正看着的那个」。那是个猜测，
+ * 而它在实机上猜错了：Frank 在 cc2cd 开了两个会话，主要工作在先开的那个，
+ * 消息却被投给后开的。**他看着自己发出去的指令消失在另一个窗口里。**
+ *
+ * 现在的规则，从确定到不确定：
+ *   1. 钉过一条、而且它还活着 → 就投它
+ *   2. 没钉过、而现场只有一条 → 投它，并把它钉下来（不用问，因为没有歧义）
+ *   3. 其余情况（多条且没钉过、或钉的那条没了而现场有多条）→ **拒收**
+ *
+ * 第 3 条会让消息发不进去，这是有意的：投错会话比投不进去更糟 ——
+ * 投不进去你当场就知道，投错了你要等到发现"它怎么没反应"才知道，
+ * 而那时指令可能已经在另一个上下文里被执行了。
+ */
+export function selectDeliverySession({ pinned, live }) {
+  const sessions = Array.isArray(live) ? live : [];
+  if (sessions.length === 0) return { ok: false, reason: DELIVERY_REJECT.NO_LIVE };
+
+  if (typeof pinned === "string" && pinned) {
+    const hit = sessions.find((s) => s.sessionId === pinned);
+    if (hit) return { ok: true, session: hit, matchedBy: "pinned", pin: null };
+  }
+  if (sessions.length === 1) {
+    // 只有一条就没有歧义 —— 顺手钉下来，下次它不再是"碰巧只有一条"。
+    return { ok: true, session: sessions[0], matchedBy: "sole_live", pin: sessions[0].sessionId };
+  }
+  return {
+    ok: false,
+    reason: DELIVERY_REJECT.AMBIGUOUS,
+    candidates: sessions.length,
+    hadPin: typeof pinned === "string" && pinned.length > 0,
+  };
+}
+
+export const DELIVERY_REJECT_TEXT = Object.freeze({
+  [DELIVERY_REJECT.NO_LIVE]: "本机没有正在运行的会话可以接收",
+  [DELIVERY_REJECT.AMBIGUOUS]:
+    "这个项目同时开着多条会话，说不清该投给哪一条。请在你要接收的那条会话里运行 /feishu-bind --apply 把它钉下来",
+});
+
 export function findLiveSessions({ projectRoot, sessionsDir = SESSIONS_DIR, isAlive = alive }) {
   let files;
   try {

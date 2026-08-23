@@ -40,8 +40,7 @@ import {
 } from "./runtime-install.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
 import {
-  findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession,
-  stampInstruction, transcriptDirFor,
+  DELIVERY_REJECT, DELIVERY_REJECT_TEXT, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, selectDeliverySession, stampInstruction, transcriptDirFor,
 } from "./live-session.mjs";
 import { extractReply } from "./stop-hook.mjs";
 import {
@@ -7614,6 +7613,43 @@ test("按文档里那条命令登记，聚合方要真的能取到状态", () =>
   assert.equal(renderConnectivity(view).includes("oc_SECRET123456"), false);
 });
 
+
+test("投递会话说不清时拒收，不猜", () => {
+  const a = { sessionId: "a", name: "first" };
+  const b = { sessionId: "b", name: "second" };
+
+  // 钉过且还活着 → 就投它，跟谁先开的无关。
+  const pinned = selectDeliverySession({ pinned: "a", live: [b, a] });
+  assert.equal(pinned.ok, true);
+  assert.equal(pinned.session.sessionId, "a");
+  assert.equal(pinned.matchedBy, "pinned");
+  assert.equal(pinned.pin, null, "已经钉过就不用再钉");
+
+  // 只有一条 → 没有歧义，顺手钉下来。
+  const sole = selectDeliverySession({ pinned: null, live: [a] });
+  assert.equal(sole.ok, true);
+  assert.equal(sole.matchedBy, "sole_live");
+  assert.equal(sole.pin, "a", "下次它不再是「碰巧只有一条」");
+
+  // 多条且没钉过 → 拒收。上一版在这里取"最近开的"，而它在实机上猜错了。
+  const ambiguous = selectDeliverySession({ pinned: null, live: [a, b] });
+  assert.equal(ambiguous.ok, false);
+  assert.equal(ambiguous.reason, DELIVERY_REJECT.AMBIGUOUS);
+  assert.equal(ambiguous.candidates, 2);
+  assert.equal(ambiguous.hadPin, false);
+
+  // 钉的那条没了、现场还有多条 → 同样拒收，不许回落到猜。
+  const gone = selectDeliverySession({ pinned: "zzz", live: [a, b] });
+  assert.equal(gone.ok, false);
+  assert.equal(gone.reason, DELIVERY_REJECT.AMBIGUOUS);
+  assert.equal(gone.hadPin, true, "要能分清「从没钉过」和「钉的那条没了」");
+
+  // 一条都没有是另一回事。
+  assert.equal(selectDeliverySession({ pinned: "a", live: [] }).reason, DELIVERY_REJECT.NO_LIVE);
+
+  // 拒收理由要能直接告诉人怎么办，不能只丢一个错误码。
+  assert.match(DELIVERY_REJECT_TEXT[DELIVERY_REJECT.AMBIGUOUS], /feishu-bind/u);
+});
 
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

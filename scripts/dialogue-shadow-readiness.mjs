@@ -12,6 +12,9 @@ import {
   BINDING_AUTHORIZATION_REASON, validateDialogueBindingAuthorizationSnapshot,
   validateDialogueBoundAuthorizationShadow,
 } from "./dialogue-binding-authorization.mjs";
+import {
+  CANONICAL_TIME_PATTERN, canonicalIso, isCanonicalIso, isCanonicalMs, toCanonicalMs,
+} from "./canonical-time.mjs";
 import { validateDialogueChatScopeProbe } from "./dialogue-chat-scope-probe.mjs";
 import { REJECT } from "./selector.mjs";
 
@@ -40,7 +43,6 @@ const KNOWN_REASONS = new Set([
 const onlyKeys = (value, allowed) => value && typeof value === "object" &&
   Object.keys(value).every((key) => allowed.includes(key));
 const nonNegativeInteger = (value) => Number.isInteger(value) && value >= 0;
-const iso = (value) => new Date(value).toISOString();
 const reasonBucket = (value) => value === null ? "accepted"
   : KNOWN_REASONS.has(value) ? value : "other";
 
@@ -82,7 +84,16 @@ export function readDialogueShadowEvidence({ shadowDirs = [] } = {}) {
     const auth = readJsonFiles(path.join(root, "authorizations"));
     const events = readJsonFiles(path.join(root, "events"));
     const probes = readJsonFiles(path.join(root, "scope-probes"));
-    if (auth.missing && events.missing && probes.missing) evidence.missing_source_dirs += 1;
+    // 只有**根目录本身不在**才算证据源缺失。
+    //
+    // 原判据是"三个子目录都不存在"，它把两件不同的事混成了一件：
+    //   根目录不存在   —— 被点名要审的来源根本不在，报告是在看不全的证据上做的；
+    //   根目录在、空的 —— 合法的"还没收集到"，本来就该走 insufficient_evidence。
+    // 混在一起会二选一地错：要么放过前者（Codex 复审实测：一个完整目录 + 一个不存在的
+    // 目录，自动检查全 pass），要么把后者误判成证据损坏。
+    let rootPresent = false;
+    try { rootPresent = fs.statSync(root).isDirectory(); } catch { rootPresent = false; }
+    if (!rootPresent) evidence.missing_source_dirs += 1;
     evidence.read_errors += auth.readErrors + events.readErrors + probes.readErrors;
     evidence.authorizations.push(...auth.values);
     evidence.events.push(...events.values);
@@ -110,6 +121,25 @@ const correlationKey = (value) => [
 const metric = (total, valid, extra = {}) => ({
   total, valid, invalid: total - valid, ...extra,
 });
+/**
+ * 自动检查的**受控 ID 全集与顺序**。
+ *
+ * 之前 validator 只要求 `id` 是字符串，于是把某个 id 改成 `/private/secret/path` 也能通过，
+ * renderer 还会原样打出去 —— 直接违反"只输出固定检查名、不得泄露路径"的契约。
+ * 这里把集合与顺序一起钉死，schema 用 `prefixItems` 逐位 `const` 对齐同一份清单。
+ */
+export const DIALOGUE_SHADOW_READINESS_CHECK_IDS = Object.freeze([
+  "source_dirs_complete",
+  "samples_present",
+  "artifact_integrity",
+  "correlation_complete",
+  "chat_locator_present",
+  "chat_scope_consistent",
+  "canonical_scope_verified",
+  "legacy_candidate_route_match",
+  "legacy_candidate_full_match",
+]);
+
 const check = (id, status) => ({ id, status });
 const histogram = (values) => {
   const out = {};
@@ -124,23 +154,37 @@ const histogram = (values) => {
  * 汇总并关联三类 artifact。即使全部自动检查通过，结论也只到 manual_review_required；
  * 真实来源、双 runtime、轮转和回滚四道门禁无法由这些脱敏 artifact 单独证明。
  */
-export function analyzeDialogueShadowEvidence({
-  sourceCount = 0,
-  missingSourceDirs = 0,
-  readErrors = 0,
-  authorizations = [],
-  events = [],
-  probes = [],
-  generatedAt = Date.now(),
-} = {}) {
+export function analyzeDialogueShadowEvidence(rawInput = {}) {
+  const {
+    sourceCount = 0,
+    missingSourceDirs = 0,
+    readErrors = 0,
+    authorizations = [],
+    events = [],
+    probes = [],
+    generatedAt = Date.now(),
+  } = rawInput ?? {};
   if (![sourceCount, missingSourceDirs, readErrors].every(nonNegativeInteger) ||
       !Array.isArray(authorizations) || !Array.isArray(events) || !Array.isArray(probes)) {
     return { ok: false, reason: "shadow_readiness_input_invalid" };
   }
-  const generated = typeof generatedAt === "number" ? iso(generatedAt) : generatedAt;
-  if (!Number.isFinite(Date.parse(generated ?? ""))) {
+  // readDialogueShadowEvidence 返回的是 snake_case，本函数收 camelCase。直接把 evidence
+  // 摊进来看着能跑，实际会让 missingSourceDirs 静默取默认值 0 —— 也就是"没有缺失"，
+  // 恰好是不安全的那个方向，且报告里一切正常。这个坑很好踩（返修期间就踩过一次），
+  // 所以把它从静默降级改成响亮报错。
+  if (["source_count", "missing_source_dirs", "read_errors"]
+    .some((key) => key in rawInput)) {
     return { ok: false, reason: "shadow_readiness_input_invalid" };
   }
+  // 先校验、再折算。原实现顺序相反：`iso(Infinity)` 会在校验之前抛 RangeError，
+  // 而本函数的契约是返回 shadow_readiness_input_invalid，从没承诺会抛。
+  const generatedMs = toCanonicalMs(generatedAt);
+  if (!isCanonicalMs(generatedMs)) {
+    return { ok: false, reason: "shadow_readiness_input_invalid" };
+  }
+  // 一律规范化，不透传调用方原值 —— 否则 "Aug 23 2026" 这类 Date.parse 收、
+  // 而 JSON Schema 的 format: date-time 不收的字符串会直接进制品。
+  const generated = canonicalIso(generatedMs);
 
   const validAuthorizations = authorizations.filter((value) =>
     validateDialogueBindingAuthorizationSnapshot(value).ok);
@@ -195,7 +239,14 @@ export function analyzeDialogueShadowEvidence({
   const routeConsistent = all(validEvents, (event) => event.comparison.route_match === true);
   const fullComparisonMatch = all(validEvents, (event) => event.comparison.match === true);
 
+  // 被点名要审的目录一个都不能少。少一个就意味着这份报告是在**看不全**的证据上做的结论，
+  // 而 readiness audit 是 fail-closed 的：看不全时必须拒绝给出"只差人工签字"的口径。
+  // 原实现漏了这一项 —— 实测传入一个完整目录 + 一个不存在的目录，八项自动检查全 pass、
+  // 结论却是 manual_review_required，正好是最危险的那种读法。
+  const sourceDirsComplete = missingSourceDirs === 0;
+
   const automatedChecks = [
+    check("source_dirs_complete", sourceDirsComplete ? "pass" : "fail"),
     check("samples_present", sampleCount > 0 ? "pass" :
       hasInteractionEvidence ? "fail" : "insufficient"),
     check("artifact_integrity", artifactIntegrity ? "pass" : "fail"),
@@ -214,7 +265,10 @@ export function analyzeDialogueShadowEvidence({
   ];
 
   let decision;
-  if (!artifactIntegrity) decision = DIALOGUE_SHADOW_READINESS_DECISION.INVALID_EVIDENCE;
+  // 证据源缺失与证据损坏走同一个最保守出口：两种情况下这份报告都不足以支撑"可以人工签字了"。
+  if (!artifactIntegrity || !sourceDirsComplete) {
+    decision = DIALOGUE_SHADOW_READINESS_DECISION.INVALID_EVIDENCE;
+  }
   else if (!hasInteractionEvidence) {
     decision = DIALOGUE_SHADOW_READINESS_DECISION.INSUFFICIENT_EVIDENCE;
   } else if (automatedChecks.some((item) => item.status !== "pass")) {
@@ -274,10 +328,12 @@ export function validateDialogueShadowReadinessReport(report) {
     "automated_checks", "manual_gates_unverified"]) ||
       report?.schema_version !== DIALOGUE_SHADOW_READINESS_SCHEMA_VERSION ||
       report?.artifact_type !== DIALOGUE_SHADOW_READINESS_ARTIFACT_TYPE ||
-      !Number.isFinite(Date.parse(report?.generated_at ?? "")) ||
+      !isCanonicalIso(report?.generated_at) ||
       !Object.values(DIALOGUE_SHADOW_READINESS_DECISION).includes(report?.decision) ||
       ![report?.source_count, report?.missing_source_dirs, report?.read_errors]
         .every(nonNegativeInteger) ||
+      // 缺失的目录数不可能多过被审的目录总数；能这样自相矛盾的报告是伪造或算错的。
+      report.missing_source_dirs > report.source_count ||
       !onlyKeys(report?.artifacts, ["authorizations", "events", "probes"]) ||
       !validMetric(report?.artifacts?.authorizations, ["active", "paused"]) ||
       ![report?.artifacts?.authorizations?.active, report?.artifacts?.authorizations?.paused]
@@ -299,9 +355,13 @@ export function validateDialogueShadowReadinessReport(report) {
       !onlyKeys(report?.correlation, ["complete_pairs", "orphan_events", "orphan_probes",
         "missing_authorizations", "duplicate_ids"]) ||
       !Object.values(report?.correlation ?? {}).every(nonNegativeInteger) ||
-      !Array.isArray(report?.automated_checks) || report.automated_checks.length !== 8 ||
+      !Array.isArray(report?.automated_checks) ||
+      // 集合与顺序一起钉死。只校验"是字符串"时，把某个 id 换成 /private/secret/path
+      // 一样能通过，renderer 还会原样打出去 —— 那是路径泄露，不是格式问题。
+      JSON.stringify(report.automated_checks.map((item) => item?.id)) !==
+        JSON.stringify(DIALOGUE_SHADOW_READINESS_CHECK_IDS) ||
       report.automated_checks.some((item) => !onlyKeys(item, ["id", "status"]) ||
-        typeof item.id !== "string" || !CHECK_STATUS.has(item.status)) ||
+        !CHECK_STATUS.has(item.status)) ||
       !Array.isArray(report?.manual_gates_unverified) ||
       JSON.stringify(report.manual_gates_unverified) !== JSON.stringify(MANUAL_GATES)) {
     return { ok: false, reason: "shadow_readiness_report_invalid" };

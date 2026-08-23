@@ -5,61 +5,296 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema_version", "artifact_type", "generated_at", "decision", "source_count",
-    "missing_source_dirs", "read_errors", "artifacts", "correlation", "automated_checks",
+    "schema_version",
+    "artifact_type",
+    "generated_at",
+    "decision",
+    "source_count",
+    "missing_source_dirs",
+    "read_errors",
+    "artifacts",
+    "correlation",
+    "automated_checks",
     "manual_gates_unverified"
   ],
   "properties": {
-    "schema_version": { "const": "1.0" },
-    "artifact_type": { "const": "feishu_bridge_dialogue_shadow_readiness_report" },
-    "generated_at": { "type": "string", "format": "date-time" },
-    "decision": {
-      "enum": ["invalid_evidence", "insufficient_evidence", "not_ready", "manual_review_required"]
+    "schema_version": {
+      "const": "1.0"
     },
-    "source_count": { "type": "integer", "minimum": 0 },
-    "missing_source_dirs": { "type": "integer", "minimum": 0 },
-    "read_errors": { "type": "integer", "minimum": 0 },
+    "artifact_type": {
+      "const": "feishu_bridge_dialogue_shadow_readiness_report"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    },
+    "decision": {
+      "enum": [
+        "invalid_evidence",
+        "insufficient_evidence",
+        "not_ready",
+        "manual_review_required"
+      ]
+    },
+    "source_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "missing_source_dirs": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "read_errors": {
+      "type": "integer",
+      "minimum": 0
+    },
     "artifacts": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["authorizations", "events", "probes"],
+      "required": [
+        "authorizations",
+        "events",
+        "probes"
+      ],
       "properties": {
-        "authorizations": { "$ref": "#/$defs/authorizationMetrics" },
-        "events": { "$ref": "#/$defs/eventMetrics" },
-        "probes": { "$ref": "#/$defs/probeMetrics" }
+        "authorizations": {
+          "$ref": "#/$defs/authorizationMetrics"
+        },
+        "events": {
+          "$ref": "#/$defs/eventMetrics"
+        },
+        "probes": {
+          "$ref": "#/$defs/probeMetrics"
+        }
       }
     },
     "correlation": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "complete_pairs", "orphan_events", "orphan_probes", "missing_authorizations", "duplicate_ids"
+        "complete_pairs",
+        "orphan_events",
+        "orphan_probes",
+        "missing_authorizations",
+        "duplicate_ids"
       ],
       "properties": {
-        "complete_pairs": { "type": "integer", "minimum": 0 },
-        "orphan_events": { "type": "integer", "minimum": 0 },
-        "orphan_probes": { "type": "integer", "minimum": 0 },
-        "missing_authorizations": { "type": "integer", "minimum": 0 },
-        "duplicate_ids": { "type": "integer", "minimum": 0 }
+        "complete_pairs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "orphan_events": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "orphan_probes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "missing_authorizations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "duplicate_ids": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "automated_checks": {
       "type": "array",
-      "minItems": 8,
-      "maxItems": 8,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["id", "status"],
-        "properties": {
-          "id": { "type": "string" },
-          "status": { "enum": ["pass", "fail", "insufficient"] }
+      "minItems": 9,
+      "maxItems": 9,
+      "items": false,
+      "prefixItems": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "status"
+          ],
+          "properties": {
+            "id": {
+              "const": "source_dirs_complete"
+            },
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "insufficient"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "status"
+          ],
+          "properties": {
+            "id": {
+              "const": "samples_present"
+            },
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "insufficient"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "status"
+          ],
+          "properties": {
+            "id": {
+              "const": "artifact_integrity"
+            },
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "insufficient"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "status"
+          ],
+          "properties": {
+            "id": {
+              "const": "correlation_complete"
+            },
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "insufficient"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "status"
+          ],
+          "properties": {
+            "id": {
+              "const": "chat_locator_present"
+            },
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "insufficient"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "status"
+          ],
+          "properties": {
+            "id": {
+              "const": "chat_scope_consistent"
+            },
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "insufficient"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "status"
+          ],
+          "properties": {
+            "id": {
+              "const": "canonical_scope_verified"
+            },
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "insufficient"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "status"
+          ],
+          "properties": {
+            "id": {
+              "const": "legacy_candidate_route_match"
+            },
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "insufficient"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "status"
+          ],
+          "properties": {
+            "id": {
+              "const": "legacy_candidate_full_match"
+            },
+            "status": {
+              "enum": [
+                "pass",
+                "fail",
+                "insufficient"
+              ]
+            }
+          }
         }
-      }
+      ]
     },
     "manual_gates_unverified": {
       "const": [
-        "trusted_locator_source", "both_runtime_coverage", "generation_rotation_coverage",
+        "trusted_locator_source",
+        "both_runtime_coverage",
+        "generation_rotation_coverage",
         "rollback_rehearsal"
       ]
     }
@@ -67,26 +302,62 @@
   "$defs": {
     "baseMetrics": {
       "type": "object",
-      "required": ["total", "valid", "invalid"],
+      "required": [
+        "total",
+        "valid",
+        "invalid"
+      ],
       "properties": {
-        "total": { "type": "integer", "minimum": 0 },
-        "valid": { "type": "integer", "minimum": 0 },
-        "invalid": { "type": "integer", "minimum": 0 }
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "valid": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "invalid": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "authorizationMetrics": {
       "allOf": [
-        { "$ref": "#/$defs/baseMetrics" },
+        {
+          "$ref": "#/$defs/baseMetrics"
+        },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["total", "valid", "invalid", "active", "paused"],
+          "required": [
+            "total",
+            "valid",
+            "invalid",
+            "active",
+            "paused"
+          ],
           "properties": {
-            "total": { "type": "integer", "minimum": 0 },
-            "valid": { "type": "integer", "minimum": 0 },
-            "invalid": { "type": "integer", "minimum": 0 },
-            "active": { "type": "integer", "minimum": 0 },
-            "paused": { "type": "integer", "minimum": 0 }
+            "total": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "valid": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "invalid": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "active": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "paused": {
+              "type": "integer",
+              "minimum": 0
+            }
           }
         }
       ]
@@ -95,14 +366,34 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "total", "valid", "invalid", "route_match", "full_match", "candidate_reason_counts"
+        "total",
+        "valid",
+        "invalid",
+        "route_match",
+        "full_match",
+        "candidate_reason_counts"
       ],
       "properties": {
-        "total": { "type": "integer", "minimum": 0 },
-        "valid": { "type": "integer", "minimum": 0 },
-        "invalid": { "type": "integer", "minimum": 0 },
-        "route_match": { "type": "integer", "minimum": 0 },
-        "full_match": { "type": "integer", "minimum": 0 },
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "valid": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "invalid": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "route_match": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "full_match": {
+          "type": "integer",
+          "minimum": 0
+        },
         "candidate_reason_counts": {
           "type": "object",
           "propertyNames": {
@@ -140,7 +431,10 @@
               "transport_not_mentioned"
             ]
           },
-          "additionalProperties": { "type": "integer", "minimum": 0 }
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
         }
       }
     },
@@ -148,18 +442,48 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "total", "valid", "invalid", "chat_locator_present", "chat_scope_match",
-        "chat_scope_mismatch", "canonical_verified", "thread_locator_present"
+        "total",
+        "valid",
+        "invalid",
+        "chat_locator_present",
+        "chat_scope_match",
+        "chat_scope_mismatch",
+        "canonical_verified",
+        "thread_locator_present"
       ],
       "properties": {
-        "total": { "type": "integer", "minimum": 0 },
-        "valid": { "type": "integer", "minimum": 0 },
-        "invalid": { "type": "integer", "minimum": 0 },
-        "chat_locator_present": { "type": "integer", "minimum": 0 },
-        "chat_scope_match": { "type": "integer", "minimum": 0 },
-        "chat_scope_mismatch": { "type": "integer", "minimum": 0 },
-        "canonical_verified": { "type": "integer", "minimum": 0 },
-        "thread_locator_present": { "type": "integer", "minimum": 0 }
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "valid": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "invalid": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "chat_locator_present": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "chat_scope_match": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "chat_scope_mismatch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "canonical_verified": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "thread_locator_present": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     }
   }

@@ -37,6 +37,7 @@ import {
 } from "./prompt-hook.mjs";
 import {
   buildCodexSubscriptionProjection, enableAutoPublishForAllTasks, evaluatePromotion,
+  readMigrationReceipt,
   extractQuotedBindingTokens, findPendingTask,
   findRegisteredTaskForCodexThread, findTaskForCodexThread, findTaskForFeishuSession,
   isThreadBusy, loadCodexTemplate, loadRegistry, makeTaskEntry, mappingForTask, recordThreadActivity, resolveTask,
@@ -1973,6 +1974,90 @@ test("自动发布登记迁移幂等，暂停 task 也保留恢复后的发布�
   assert.equal(enableAutoPublishForAllTasks({ home, apply: true }).changed, 0);
   assert.deepEqual(loadRegistry(path.join(home, "registry.json")).tasks.map((task) => task.auto_publish_on_completion),
     [true, true]);
+});
+
+test("迁移只改目标字段：停用项、怪路径记录、未知顶层字段都不能被顺手删掉", () => {
+  const home = temp();
+  const file = path.join(home, "registry.json");
+  // 刻意绕过 writeRegistry 直接造文档：这些正是 loadRegistry 会滤掉、
+  // writeRegistry 会丢掉的东西，用视图读写就会静默删数据。
+  fs.writeFileSync(file, JSON.stringify({
+    schema_version: "1.0", runtime: "codex", custom_marker: "KEEP_ME",
+    tasks: [
+      { logical_task_key: "a", root: "/tmp/a" },
+      { logical_task_key: "b", root: "/tmp/b", enabled: false },
+      { logical_task_key: "c", root: "relative/bad" },
+    ],
+  }));
+  assert.equal(enableAutoPublishForAllTasks({ home, apply: true }).changed, 3);
+
+  const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
+  assert.deepEqual(raw.tasks.map((t) => t.logical_task_key), ["a", "b", "c"], "一条都不能少");
+  assert.equal(raw.custom_marker, "KEEP_ME", "不认识的顶层字段要原样留着");
+  assert.equal(raw.tasks[1].enabled, false, "停用状态不能被抹掉");
+  assert.equal(raw.tasks.every((t) => t.id === undefined), true, "迁移不得顺手补写 id");
+  assert.equal(raw.tasks.every((t) => t.auto_publish_on_completion === true), true);
+});
+
+test("迁移遇到解释不了的登记结构要 fail-closed，不许过滤后整表写回", () => {
+  for (const [shape, reason] of [
+    [{ tasks: "not-an-array" }, "registry_shape_unexpected"],
+    [{ tasks: [null] }, "registry_entry_unreadable"],
+    [{ tasks: [["a"]] }, "registry_entry_unreadable"],
+  ]) {
+    const home = temp();
+    const file = path.join(home, "registry.json");
+    const before = JSON.stringify({ schema_version: "1.0", ...shape });
+    fs.writeFileSync(file, before);
+    const r = enableAutoPublishForAllTasks({ home, apply: true });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, reason);
+    assert.equal(fs.readFileSync(file, "utf-8"), before, "拒绝时一个字节都不该动");
+  }
+});
+
+test("迁移留持久回执：零变更也留，且回执与实际计数自洽", () => {
+  const home = temp();
+  const file = path.join(home, "registry.json");
+  fs.writeFileSync(file, JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks: [
+    { logical_task_key: "a", root: "/tmp/a" },
+    { logical_task_key: "b", root: "/tmp/b", auto_publish_on_completion: true },
+  ] }));
+  assert.equal(readMigrationReceipt(home), null, "没跑过就没有回执");
+
+  const first = enableAutoPublishForAllTasks({ home, apply: true });
+  const r1 = readMigrationReceipt(home);
+  assert.equal(first.receipt, true);
+  assert.equal(r1.changed, first.changed, "回执得跟这次真改了多少条对得上");
+  assert.equal(r1.tasks, first.tasks);
+  assert.equal(r1.changed, 1);
+  assert.equal(typeof r1.applied_at, "string");
+
+  // 零变更也要留痕，否则「跑过但本来就没东西可改」和「从没跑过」分不开。
+  const second = enableAutoPublishForAllTasks({ home, apply: true });
+  assert.equal(second.changed, 0);
+  assert.equal(readMigrationReceipt(home).changed, 0);
+});
+
+test("apply 路径必须取锁后再读，待迁移为 0 也不许绕过锁", () => {
+  const home = temp();
+  fs.writeFileSync(path.join(home, "registry.json"), JSON.stringify({
+    schema_version: "1.0", runtime: "codex",
+    tasks: [{ logical_task_key: "a", root: "/tmp/a", auto_publish_on_completion: true }],
+  }));
+  const lockDir = path.join(home, "registry.lock");
+  fs.mkdirSync(lockDir, { recursive: true });
+  // 必须是**有效**的持有者，否则会被当成陈旧锁正当接管。
+  fs.writeFileSync(path.join(lockDir, "owner.json"),
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+
+  const r = enableAutoPublishForAllTasks({ home, apply: true });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "registry_busy", "旧实现在取锁前就返回了 applied:true");
+  assert.equal(readMigrationReceipt(home), null, "没跑成就不该留回执");
+
+  // 预览不写盘，所以不需要锁。
+  assert.equal(enableAutoPublishForAllTasks({ home, apply: false }).ok, true);
 });
 
 test("绑定预览为同一 thread 生成稳定逻辑键与平台幂等键", () => {

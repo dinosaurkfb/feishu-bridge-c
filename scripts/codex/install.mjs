@@ -149,7 +149,12 @@ if (!uninstall) {
   // 强改为 true —— 装一次基础设施，顺手把每条绑定的发布行为改掉，不预览、不留痕、不可选。
   // 新绑定登记时就默认开启，不依赖这一步；历史 task 走显式的 migrate-auto-publish.mjs。
   const pendingMigration = enableAutoPublishForAllTasks({ home });
-  if (pendingMigration.ok && pendingMigration.changed > 0) {
+  if (!pendingMigration.ok) {
+    // 读不出来就说读不出来。静默忽略会让"没有待迁移项"和"根本没读到"长得一样。
+    // 但**不因此恢复安装时改订阅**：读不出状态更不是替人改策略的理由。
+    console.log("自动发布  待迁移状态不可读（" + pendingMigration.reason + "）；" +
+      "可运行 scripts/codex/migrate-auto-publish.mjs 单独查看");
+  } else if (pendingMigration.changed > 0) {
     console.log("自动发布  有 " + pendingMigration.changed + " 个历史 task 尚未启用；" +
       "要迁移请显式运行 scripts/codex/migrate-auto-publish.mjs --apply");
   }

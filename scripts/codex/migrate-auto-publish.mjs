@@ -15,7 +15,7 @@
 
 import { isDirectRun } from "../direct-run.mjs";
 import {
-  AUTO_PUBLISH_MIGRATION_ID, bridgeHome, enableAutoPublishForAllTasks,
+  AUTO_PUBLISH_MIGRATION_ID, bridgeHome, enableAutoPublishForAllTasks, readMigrationReceipt,
 } from "./state.mjs";
 
 function main() {
@@ -35,12 +35,25 @@ function main() {
   for (const name of result.names ?? []) console.log("          · " + name);
 
   if (!apply) {
+    const prior = result.receipt;
+    console.log("上次执行  " + (prior
+      ? prior.applied_at + "（改了 " + prior.changed + " 条）"
+      : "没有回执 —— 可能从没跑过，也可能跑过但留痕失败；重跑是幂等的"));
     console.log("\n[dry-run] 什么都没写。加 --apply 才落盘。");
     return;
   }
+
   console.log(result.changed > 0
     ? "\n已为 " + result.changed + " 个历史 task 启用自动发布。"
     : "\n没有需要迁移的 task，未改动登记表。");
+
+  if (result.receipt === false) {
+    // 登记表已经改完了。这里说成完整成功就是谎报。
+    console.error("注意：登记表已更新，但迁移回执没写成（" + result.receiptError + "）。" +
+      "「跑没跑过」这个问题暂时答不了；重跑是幂等的。");
+    process.exit(1);
+  }
+  console.log("回执      " + JSON.stringify(readMigrationReceipt()));
 }
 
 if (isDirectRun(import.meta.url)) main();

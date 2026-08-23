@@ -405,46 +405,137 @@ export function setTaskDisplayName({ threadId, name, home = bridgeHome() } = {})
   }
 }
 
-/** 安装新发布合同时一次性迁移所有既有 task；暂停项恢复后也应沿用同一合同。 */
-/** 这次迁移的身份。写进结果里，让"跑没跑过、跑的是哪一版"变成可回答的问题。 */
+/** 这次迁移的身份。写进持久回执，让"跑没跑过、跑的是哪一版"变成可回答的问题。 */
 export const AUTO_PUBLISH_MIGRATION_ID = "auto_publish_on_completion_v1";
+
+const migrationsFile = (home) => path.join(home, "migrations.json");
+
+/**
+ * 读原始登记文档 —— **不用 loadRegistry**。
+ *
+ * loadRegistry 返回的是「视图」：它会滤掉 enabled:false 的 task、滤掉 root 不是绝对
+ * 路径的记录、给缺 id 的补写 id；writeRegistry 又只重建 schema_version/runtime/tasks
+ * 三个顶层字段。整表迁移用这对组合 = 把没被读出来的记录和不认识的顶层字段静默删掉。
+ * 迁移只该改目标字段，别的原样留着。
+ */
+function readRawRegistry(file) {
+  try {
+    return { ok: true, doc: JSON.parse(fs.readFileSync(file, "utf-8")) };
+  } catch (err) {
+    if (err.code === "ENOENT") return { ok: true, doc: null };
+    return { ok: false, reason: "registry_unreadable", error: err.message };
+  }
+}
+
+/** 原子写原始文档，保留全部顶层字段。跟 writeRegistry 一样先留 .prev 备份。 */
+function writeRawRegistry(doc, file) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  if (fs.existsSync(file)) fs.copyFileSync(file, file + ".prev");
+  const tmp = file + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+  fs.renameSync(tmp, file);
+}
+
+/**
+ * 扫描待迁移项。**遇到解释不了的结构就 fail-closed**，不过滤后继续 ——
+ * 过滤意味着"我看不懂这条，那就当它不存在"，而下一步是整表写回，等于删掉它。
+ *
+ * 返回的 pendingRefs 是 doc.tasks 里的**对象引用**，就地改字段，不重建数组。
+ */
+function scanAutoPublish(doc) {
+  if (doc === null) return { ok: true, total: 0, pendingRefs: [], names: [] };
+  if (!Array.isArray(doc.tasks)) return { ok: false, reason: "registry_shape_unexpected" };
+  const pendingRefs = [];
+  for (const task of doc.tasks) {
+    if (!task || typeof task !== "object" || Array.isArray(task)) {
+      return { ok: false, reason: "registry_entry_unreadable" };
+    }
+    if (task.auto_publish_on_completion !== true) pendingRefs.push(task);
+  }
+  return {
+    ok: true,
+    total: doc.tasks.length,
+    pendingRefs,
+    // 只出脱敏名称，不出 thread locator。
+    names: pendingRefs.map((t) =>
+      t.task_display_name ?? t.id ?? t.logical_task_key ?? "(未命名)"),
+  };
+}
+
+/** 读迁移回执。回执缺失只说明"没记录到"，不等于没跑过 —— 重跑是幂等的。 */
+export function readMigrationReceipt(home = bridgeHome(), id = AUTO_PUBLISH_MIGRATION_ID) {
+  try {
+    return JSON.parse(fs.readFileSync(migrationsFile(home), "utf-8"))[id] ?? null;
+  } catch { return null; }
+}
+
+/**
+ * 落盘回执。**先写登记表再写回执** —— 反过来的话，中途崩溃会留下一份声称迁移已完成
+ * 但登记表没改的回执，那是往"谎报成功"的方向错。回执写不成只是"可能跑过"，安全方向。
+ */
+function writeReceipt(home, { tasks, changed }) {
+  try {
+    const file = migrationsFile(home);
+    let all = {};
+    try { all = JSON.parse(fs.readFileSync(file, "utf-8")); } catch { /* 首次 */ }
+    all[AUTO_PUBLISH_MIGRATION_ID] = {
+      applied_at: new Date().toISOString(), tasks, changed,
+    };
+    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+    const tmp = file + ".tmp." + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify(all, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return { receipt: true };
+  } catch (err) {
+    // 登记表已经改完了，只是留痕失败 —— 必须说出来，不能算完整成功。
+    return { receipt: false, receiptError: err.message };
+  }
+}
 
 /**
  * 把既有 task 迁移到「完成即自动发布」。
  *
  * **默认只预览，`apply: true` 才写。**原来它挂在安装器上，每次 `--apply` 都会把所有
  * task 的 auto_publish_on_completion 强改为 true —— 那是在改**订阅策略**，不是装基础设施。
- * 后果是：装一次基础设施，顺手把每条绑定的发布行为改掉，而且不预览、不留痕、不可选。
  *
  * 新绑定不依赖这次迁移：登记时就默认 true（见 registerTask）。这里只处理历史 task。
+ *
+ * apply 路径下 **tasks/changed/names 全部出自锁内那一份文档**：预览快照和落盘快照
+ * 不是同一份时，会出现"改了这批、列的却是那批"。
  */
 export function enableAutoPublishForAllTasks({ home = bridgeHome(), apply = false } = {}) {
   const file = registryFile(home);
-  const preview = loadRegistry(file);
-  if (!preview.ok) return preview;
-  const pending = preview.tasks.filter((task) => task.auto_publish_on_completion !== true);
-  const summary = {
-    ok: true,
-    migration: AUTO_PUBLISH_MIGRATION_ID,
-    tasks: preview.tasks.length,
-    changed: pending.length,
-    // 只出计数与脱敏名称，不出 thread locator。
-    names: pending.map((task) => task.task_display_name ?? task.id ?? "(未命名)"),
-  };
-  if (!apply) return { ...summary, applied: false };
-  if (pending.length === 0) return { ...summary, applied: true, changed: 0 };
 
+  const report = (scan, extra) => ({
+    ok: true, migration: AUTO_PUBLISH_MIGRATION_ID,
+    tasks: scan.total, changed: scan.pendingRefs.length, names: scan.names, ...extra,
+  });
+
+  if (!apply) {
+    const snap = readRawRegistry(file);
+    if (!snap.ok) return snap;
+    const scan = scanAutoPublish(snap.doc);
+    if (!scan.ok) return scan;
+    return report(scan, { applied: false, receipt: readMigrationReceipt(home) });
+  }
+
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return { ok: false, reason: "registry_busy" };
   try {
-    // 取锁之后重读：预览与落盘之间可能有绑定写入，拿旧快照整体写回会把它抹掉。
-    const reg = loadRegistry(file);
-    if (!reg.ok) return reg;
-    const actually = reg.tasks.filter((task) => task.auto_publish_on_completion !== true).length;
-    if (actually === 0) return { ...summary, applied: true, changed: 0 };
-    writeRegistry(reg.tasks.map((task) => ({ ...task, auto_publish_on_completion: true })), file);
-    return { ...summary, applied: true, changed: actually, tasks: reg.tasks.length };
+    // 取锁之后才读：锁外读到的那份跟要写的那份不是同一个快照。
+    const snap = readRawRegistry(file);
+    if (!snap.ok) return snap;
+    const scan = scanAutoPublish(snap.doc);
+    if (!scan.ok) return scan;
+
+    if (scan.pendingRefs.length > 0) {
+      for (const task of scan.pendingRefs) task.auto_publish_on_completion = true;
+      writeRawRegistry(snap.doc, file);
+    }
+    // 零变更也留回执：否则"跑过但本来就没东西可改"和"从没跑过"分不开。
+    return report(scan, { applied: true, ...writeReceipt(home, { tasks: scan.total, changed: scan.pendingRefs.length }) });
   } catch (err) {
     return { ok: false, reason: "registry_unwritable", error: err.message };
   } finally {

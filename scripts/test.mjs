@@ -30,6 +30,9 @@ import {
   composeOutboundCard, outboundCardBatches, validateOutboundCard,
 } from "./outbound-card.mjs";
 import { drainProject, watcherActive } from "./drain-outbox.mjs";
+import {
+  applyRuntimeSync, planRuntimeSync, runtimeRoot, runtimeScript, verifyRuntime,
+} from "./runtime-install.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
 import {
   findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession,
@@ -4457,6 +4460,90 @@ test("每条退出路径都留下可分辨的原因", () => {
 });
 
 // ---------- 汇总 ----------
+
+// ---------- 运行时安装：让全局配置不再指向任何开发克隆 ----------
+
+test("运行时同步：版本由内容决定，落盘后校验通过", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "rt-home-"));
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), "rt-src-"));
+  fs.mkdirSync(path.join(src, "scripts", "codex"), { recursive: true });
+  fs.writeFileSync(path.join(src, "scripts", "a.mjs"), "export const a = 1;\n");
+  fs.writeFileSync(path.join(src, "scripts", "codex", "b.mjs"), "export const b = 2;\n");
+  fs.writeFileSync(path.join(src, "scripts", "notes.txt"), "不该被复制");
+
+  const plan = planRuntimeSync({ sourceRoot: src, home });
+  assert.equal(plan.ok, true);
+  assert.deepEqual(plan.files.map((f) => f.path).sort(),
+    ["scripts/a.mjs", "scripts/codex/b.mjs"], "只复制 .mjs，其余文件不进运行时");
+  assert.equal(plan.alreadyCurrent, false);
+
+  // 同样的源码必须算出同样的版本 —— 否则每次安装都会白白切一次。
+  assert.equal(planRuntimeSync({ sourceRoot: src, home }).version, plan.version);
+
+  const applied = applyRuntimeSync(plan, { home });
+  assert.equal(applied.ok, true);
+  const verified = verifyRuntime({ home });
+  assert.equal(verified.ok, true);
+  assert.equal(verified.linkOk, true);
+  assert.equal(verified.version, plan.version);
+
+  // current 是符号链接，切换才可能是原子的；写成实体目录就退回了半新半旧的窗口。
+  assert.equal(fs.lstatSync(path.join(runtimeRoot(home), "current")).isSymbolicLink(), true);
+  assert.equal(fs.readFileSync(runtimeScript("a.mjs", home), "utf-8"), "export const a = 1;\n");
+
+  // 源码变了 → 新版本；旧版本目录仍在，可以指回去。
+  fs.writeFileSync(path.join(src, "scripts", "a.mjs"), "export const a = 99;\n");
+  const next = planRuntimeSync({ sourceRoot: src, home });
+  assert.notEqual(next.version, plan.version);
+  assert.equal(next.previousVersion, plan.version);
+  assert.equal(applyRuntimeSync(next, { home }).ok, true);
+  assert.equal(fs.existsSync(path.join(runtimeRoot(home), "versions", plan.version)), true,
+    "旧版本目录要留着 —— 回滚只需把 current 指回去，不必重新复制");
+});
+
+test("运行时校验能发现被手改的脚本和被指歪的链接", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "rt-drift-"));
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), "rt-drift-src-"));
+  fs.mkdirSync(path.join(src, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(src, "scripts", "a.mjs"), "export const a = 1;\n");
+  const plan = planRuntimeSync({ sourceRoot: src, home });
+  assert.equal(applyRuntimeSync(plan, { home }).ok, true);
+  assert.equal(verifyRuntime({ home }).ok, true);
+
+  // 这套东西的失败是安静的：改一行、出站照跑，只是不再对应任何一次有记录的安装。
+  fs.writeFileSync(path.join(runtimeRoot(home), "versions", plan.version, "scripts", "a.mjs"),
+    "export const a = 'tampered';\n");
+  const drifted = verifyRuntime({ home });
+  assert.equal(drifted.ok, false);
+  assert.deepEqual(drifted.drifted, ["scripts/a.mjs"]);
+
+  const link = path.join(runtimeRoot(home), "current");
+  fs.unlinkSync(link);
+  fs.symlinkSync(path.join("versions", "nope"), link);
+  assert.equal(verifyRuntime({ home }).linkOk, false);
+});
+
+test("安装器不再把开发克隆路径写进全局配置", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  for (const name of ["stop-hook.mjs", "init-hook.mjs", "bind-preview.mjs",
+    "inbound-hook.mjs", "drain-outbox.mjs"]) {
+    assert.doesNotMatch(src, new RegExp('path\\.join\\(ROOT,\\s*"scripts",\\s*"' + name + '"', "u"),
+      name + " 必须走 runtimeScript()，不能再拼开发克隆路径");
+  }
+  // 幂等键换成脚本名 + feishu-bridge：旧写法拿克隆绝对路径当键，
+  // 第二个克隆装出来是追加而不是覆盖 —— 本机两份 Stop 钩子就是这么来的。
+  assert.doesNotMatch(src, /const MARKER = HOOK_SCRIPT/u);
+  assert.match(src, /claimSingleEntry/u);
+
+  // 技能源码也不能硬编码克隆路径，否则 Frank 跑 /feishu-bind 时执行的是某个开发分支的脚本。
+  for (const file of fs.readdirSync(path.resolve("skills"))) {
+    const skill = path.resolve("skills", file, "SKILL.md");
+    if (!fs.existsSync(skill)) continue;
+    const text = fs.readFileSync(skill, "utf-8");
+    assert.doesNotMatch(text, /\/Users\/[^\s"']*\/(claude-projects|codex-projects)\//u,
+      file + " 里不能出现开发克隆的绝对路径，用 {{BRIDGE_ROOT}}");
+  }
+});
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (failed > 0) {

@@ -22,14 +22,31 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import {
+  applyRuntimeSync, planRuntimeSync, runtimeScript, verifyRuntime,
+} from "./runtime-install.mjs";
+
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+
+/**
+ * **全局配置里只出现 runtime 路径，绝不出现开发克隆路径。**
+ *
+ * 钩子过去指向安装它的那个克隆，带来两个已经真实发生的后果：本机装了两份 Stop 与两份
+ * UserPromptSubmit 钩子（两个克隆、两条不同路径，见下面 hookEntries 的说明）；以及钩子跑的是
+ * 工作树当前 checkout 的代码，开发时切一次分支线上行为就跟着变。
+ *
+ * 现在代码复制到 ~/.claude/feishu-bridge/runtime/versions/<version>/，全局配置只认
+ * runtime/current 这个符号链接。切分支、删克隆都不再影响线上。
+ */
 const SETTINGS = path.join(os.homedir(), ".claude", "settings.json");
 const REGISTRY = path.join(os.homedir(), ".claude", "feishu-bridge", "registry.json");
 
-const HOOK_SCRIPT = path.join(ROOT, "scripts", "stop-hook.mjs");
-const INIT_HOOK_SCRIPT = path.join(ROOT, "scripts", "init-hook.mjs");
-const PREVIEW_SCRIPT = path.join(ROOT, "scripts", "bind-preview.mjs");
-const INBOUND_HOOK_SCRIPT = path.join(ROOT, "scripts", "inbound-hook.mjs");
+const HOOK_SCRIPT = runtimeScript("stop-hook.mjs");
+const INIT_HOOK_SCRIPT = runtimeScript("init-hook.mjs");
+const PREVIEW_SCRIPT = runtimeScript("bind-preview.mjs");
+/** 技能与 launchd 引用的「桥根目录」，同样是 runtime 而不是开发克隆。 */
+const RUNTIME_BRIDGE_ROOT = path.dirname(path.dirname(HOOK_SCRIPT));
+const INBOUND_HOOK_SCRIPT = runtimeScript("inbound-hook.mjs");
 const LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "stop-hook.log");
 
 /**
@@ -60,7 +77,40 @@ const COMMAND =
   `else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1; ` +
   `printf '%s hook-unavailable node=${NODE_BIN}\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> '${LOG}' 2>/dev/null || :; fi`;
 
-const MARKER = HOOK_SCRIPT; // 认脚本路径做幂等，命令别处怎么变都不会装两遍
+/**
+ * 幂等键**不能**再用脚本绝对路径。
+ *
+ * 旧写法是 `MARKER = HOOK_SCRIPT`，也就是安装它的那个克隆的绝对路径。于是第二个克隆
+ * 跑一次安装，路径不同 → 找不到已有那条 → **追加**而不是覆盖。本机现在就有两份 Stop
+ * 钩子和两份 UserPromptSubmit 钩子，指向两个代码版本可能不同的克隆，并发操作同一份
+ * outbox 和同一份 Dialogue 状态。迁到 runtime 而不改这里，只会多出第三份。
+ *
+ * 改成按**脚本文件名**认领，并且要求命令里带 feishu-bridge 字样 —— 前者跨克隆、跨
+ * runtime 都稳定，后者保证不会误伤 .orca 或别人碰巧同名的钩子。
+ */
+const ownsScript = (command, basename) =>
+  typeof command === "string" &&
+  command.includes("/scripts/" + basename) &&
+  command.includes("feishu-bridge");
+
+/** 一条 settings 条目里，只要有任一 hook 命令是我们的，这条就归我们。 */
+const entryOwns = (entry, basename) =>
+  (entry?.hooks ?? []).some((h) => ownsScript(h?.command, basename));
+
+/**
+ * 收编：把**所有**属于自己的条目都摘掉，再按需要放回恰好一条。
+ *
+ * 只改第一条匹配项是不够的 —— 那正是重复条目长期存活的原因：安装器每次都只看见
+ * 自己那条，另一条永远没人管。返回被摘掉的条数，装完要报出来给人看。
+ */
+const claimSingleEntry = (list, basename, entry) => {
+  let removed = 0;
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    if (entryOwns(list[i], basename)) { list.splice(i, 1); removed += 1; }
+  }
+  if (entry) list.push(entry);
+  return removed;
+};
 
 // /init 钩子跑在本机**每一次提交 prompt** 上，比 Stop 更热。
 // 跟 Stop 那条的区别：这里的 else 分支不往日志里写。UserPromptSubmit 的 stdout 会被
@@ -68,7 +118,6 @@ const MARKER = HOOK_SCRIPT; // 认脚本路径做幂等，命令别处怎么变�
 const INIT_COMMAND =
   `if [ -x '${NODE_BIN}' ] && [ -r '${INIT_HOOK_SCRIPT}' ]; then '${NODE_BIN}' '${INIT_HOOK_SCRIPT}'; ` +
   `else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1 || :; fi`;
-const INIT_MARKER = INIT_HOOK_SCRIPT;
 
 // 入站钩子：让「任何 Aily 回合先进入运输层」成为硬约束，而不是靠模型记得调技能。
 // 跟 /init 钩子同一个事件（UserPromptSubmit），但判据完全不同、互不干扰：
@@ -76,10 +125,21 @@ const INIT_MARKER = INIT_HOOK_SCRIPT;
 const INBOUND_HOOK_COMMAND =
   `if [ -x '${NODE_BIN}' ] && [ -r '${INBOUND_HOOK_SCRIPT}' ]; then '${NODE_BIN}' '${INBOUND_HOOK_SCRIPT}'; ` +
   `else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1 || :; fi`;
-const INBOUND_HOOK_MARKER = INBOUND_HOOK_SCRIPT;
 
 const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
+
+// ---------- 运行时代码：先落到固定位置，全局配置才有东西可指 ----------
+//
+// 顺序很重要：**先同步代码，再改 settings**。反过来的话，中间那一刻钩子已经指向
+// runtime，而 runtime 里还没有脚本 —— 钩子命令的 `[ -r … ]` 守卫会让它静默跳过，
+// 于是那段时间里结束的会话不会有任何出站，也不会有任何报错。
+const runtimePlan = uninstall ? null : planRuntimeSync({ sourceRoot: ROOT });
+if (runtimePlan && !runtimePlan.ok) {
+  console.error("运行时代码无法准备（" + runtimePlan.reason +
+    (runtimePlan.file ? "：" + runtimePlan.file : "") + "）。什么都没做。");
+  process.exit(1);
+}
 
 // ---------- settings.json ----------
 
@@ -88,24 +148,12 @@ const settings = JSON.parse(settingsBefore);
 settings.hooks ??= {};
 const stop = (settings.hooks.Stop ??= []);
 
-const alreadyAt = stop.findIndex((entry) =>
-  (entry?.hooks ?? []).some((h) => typeof h?.command === "string" && h.command.includes(MARKER)));
-
-let action;
-if (uninstall) {
-  if (alreadyAt < 0) action = "already-absent";
-  else {
-    stop.splice(alreadyAt, 1);
-    action = "removed";
-  }
-} else if (alreadyAt >= 0) {
-  // 已装过也要覆盖命令：脚本路径没变但 node 路径或包裹逻辑可能变了。
-  stop[alreadyAt] = { hooks: [{ type: "command", command: COMMAND, timeout: 20 }] };
-  action = "updated";
-} else {
-  stop.push({ hooks: [{ type: "command", command: COMMAND, timeout: 20 }] });
-  action = "installed";
-}
+const stopBefore = stop.filter((entry) => entryOwns(entry, "stop-hook.mjs")).length;
+const stopRemoved = claimSingleEntry(stop, "stop-hook.mjs",
+  uninstall ? null : { hooks: [{ type: "command", command: COMMAND, timeout: 20 }] });
+const action = uninstall
+  ? (stopRemoved > 0 ? "removed" : "already-absent")
+  : (stopBefore === 0 ? "installed" : stopBefore === 1 ? "updated" : "deduped");
 
 // ---------- UserPromptSubmit：/init 时问一句要不要接飞书 ----------
 //
@@ -113,36 +161,18 @@ if (uninstall) {
 // .orca 的 UserPromptSubmit 钩子就在这个数组里，覆盖掉它 Frank 的另一套工具会静默失灵。
 
 const prompts = (settings.hooks.UserPromptSubmit ??= []);
-const initAt = prompts.findIndex((entry) =>
-  (entry?.hooks ?? []).some((h) => typeof h?.command === "string" && h.command.includes(INIT_MARKER)));
+// 两个 UserPromptSubmit 钩子各自按脚本名幂等，互不覆盖。
+const describe = (before, removed) => uninstall
+  ? (removed > 0 ? "removed" : "already-absent")
+  : (before === 0 ? "installed" : before === 1 ? "updated" : "deduped");
 
-// 两个 UserPromptSubmit 钩子各自按脚本路径幂等，互不覆盖。
-const inboundAt = prompts.findIndex((entry) =>
-  (entry?.hooks ?? []).some((h) => typeof h?.command === "string" && h.command.includes(INBOUND_HOOK_MARKER)));
+const inboundBefore = prompts.filter((e) => entryOwns(e, "inbound-hook.mjs")).length;
+const inboundHookAction = describe(inboundBefore, claimSingleEntry(prompts, "inbound-hook.mjs",
+  uninstall ? null : { hooks: [{ type: "command", command: INBOUND_HOOK_COMMAND, timeout: 10 }] }));
 
-let inboundHookAction;
-if (uninstall) {
-  if (inboundAt < 0) inboundHookAction = "already-absent";
-  else { prompts.splice(inboundAt, 1); inboundHookAction = "removed"; }
-} else if (inboundAt >= 0) {
-  prompts[inboundAt] = { hooks: [{ type: "command", command: INBOUND_HOOK_COMMAND, timeout: 10 }] };
-  inboundHookAction = "updated";
-} else {
-  prompts.push({ hooks: [{ type: "command", command: INBOUND_HOOK_COMMAND, timeout: 10 }] });
-  inboundHookAction = "installed";
-}
-
-let initAction;
-if (uninstall) {
-  if (initAt < 0) initAction = "already-absent";
-  else { prompts.splice(initAt, 1); initAction = "removed"; }
-} else if (initAt >= 0) {
-  prompts[initAt] = { hooks: [{ type: "command", command: INIT_COMMAND, timeout: 10 }] };
-  initAction = "updated";
-} else {
-  prompts.push({ hooks: [{ type: "command", command: INIT_COMMAND, timeout: 10 }] });
-  initAction = "installed";
-}
+const initBefore = prompts.filter((e) => entryOwns(e, "init-hook.mjs")).length;
+const initAction = describe(initBefore, claimSingleEntry(prompts, "init-hook.mjs",
+  uninstall ? null : { hooks: [{ type: "command", command: INIT_COMMAND, timeout: 10 }] }));
 
 // ---------- 权限：只放行预览，真发仍逐次确认 ----------
 //
@@ -159,17 +189,16 @@ const PREVIEW_RULE = "Bash(node " + PREVIEW_SCRIPT + ":*)";
 const permissions = (settings.permissions ??= {});
 const allow = (permissions.allow ??= []);
 
-let permAction;
-const permAt = allow.indexOf(PREVIEW_RULE);
-if (uninstall) {
-  if (permAt < 0) permAction = "already-absent";
-  else { allow.splice(permAt, 1); permAction = "removed"; }
-} else if (permAt >= 0) {
-  permAction = "already-present";
-} else {
-  allow.push(PREVIEW_RULE);
-  permAction = "installed";
-}
+// 权限规则同样要收编：旧克隆各留了一条自己路径的放行规则，只加不减就会越积越多，
+// 而每一条都是一个「某个开发克隆里的脚本可以免确认执行」的长期授权。
+const ownsPreview = (rule) => typeof rule === "string" &&
+  rule.includes("/scripts/bind-preview.mjs") && rule.includes("feishu-bridge");
+const permBefore = allow.filter(ownsPreview).length;
+for (let i = allow.length - 1; i >= 0; i -= 1) if (ownsPreview(allow[i])) allow.splice(i, 1);
+if (!uninstall) allow.push(PREVIEW_RULE);
+const permAction = uninstall
+  ? (permBefore > 0 ? "removed" : "already-absent")
+  : (permBefore === 0 ? "installed" : permBefore === 1 ? "already-present" : "deduped");
 
 // ---------- 登记表 ----------
 
@@ -219,7 +248,9 @@ const SKILLS = [
 
 const skillSrcOf = (n) => path.join(ROOT, "skills", n, "SKILL.md");
 const skillDstOf = (n) => path.join(os.homedir(), ".claude", "skills", n, "SKILL.md");
-const renderSkill = (src) => src.replaceAll("{{BRIDGE_ROOT}}", ROOT);
+// 技能里给模型看的命令也要指 runtime。否则 Frank 跑 /feishu-bind 时执行的是某个开发克隆的
+// 脚本 —— 那个克隆此刻停在哪条分支上没人知道，而这条命令会往群里发一条撤不掉的消息。
+const renderSkill = (src) => src.replaceAll("{{BRIDGE_ROOT}}", RUNTIME_BRIDGE_ROOT);
 
 // 拷贝而不是软链：软链一旦仓库被移动或删除就变成悬空文件，而且各家扫描器
 // 对 readdir 是否跟随软链的处理并不一致（入站技能就在这上面栽过）。
@@ -254,7 +285,7 @@ const skillAction = skillPlan.some((s) => s.action === "source-missing") ? "sour
 const LAUNCH_LABEL = "com.frank.feishu-bridge-cc.drain";
 const PLIST = path.join(os.homedir(), "Library", "LaunchAgents", LAUNCH_LABEL + ".plist");
 const DRAIN_LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "drain.log");
-const DRAIN_SCRIPT = path.join(ROOT, "scripts", "drain-outbox.mjs");
+const DRAIN_SCRIPT = runtimeScript("drain-outbox.mjs");
 
 // --all：兜底要覆盖登记表里所有项目。只排本仓库的话，后接进来的项目就没有兜底了。
 const plistBody = `<?xml version="1.0" encoding="UTF-8"?>
@@ -268,7 +299,7 @@ const plistBody = `<?xml version="1.0" encoding="UTF-8"?>
     <string>${DRAIN_SCRIPT}</string>
     <string>--all</string>
   </array>
-  <key>WorkingDirectory</key><string>${ROOT}</string>
+  <key>WorkingDirectory</key><string>${RUNTIME_BRIDGE_ROOT}</string>
   <key>StartInterval</key><integer>1800</integer>
   <key>RunAtLoad</key><false/>
   <key>StandardOutPath</key><string>${DRAIN_LOG}</string>
@@ -293,6 +324,15 @@ if (uninstall) {
 
 // ---------- 落盘 ----------
 
+if (runtimePlan) {
+  console.log("运行时   : " + runtimePlan.runtimeRoot + "  → 版本 " + runtimePlan.version +
+    (runtimePlan.alreadyCurrent ? "（与线上相同，无需切换）"
+      : runtimePlan.previousVersion ? "（将从 " + runtimePlan.previousVersion + " 切换）"
+        : "（首次安装）"));
+  console.log("           " + runtimePlan.files.length + " 个脚本，来源 " +
+    (runtimePlan.sourceCommit ? runtimePlan.sourceCommit.slice(0, 12) : "非 git 仓库") +
+    " @ " + runtimePlan.sourceRoot);
+}
 console.log("settings : " + SETTINGS + "  → " + action);
 console.log("Stop 钩子 : " + stop.length + " 条（.orca 的那条必须还在）  → " + action);
 console.log("/init 钩子: " + initAction + "        （UserPromptSubmit 共 " + prompts.length + " 条）");
@@ -321,6 +361,24 @@ const writeJsonAtomic = (file, obj) => {
   fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n", { mode: 0o600 });
   fs.renameSync(tmp, file);
 };
+
+// 先把运行时代码落地，再动 settings。见上面 runtimePlan 处对顺序的说明。
+if (runtimePlan) {
+  const synced = applyRuntimeSync(runtimePlan);
+  if (!synced.ok) {
+    console.error("运行时代码落盘失败（" + synced.reason + "）：" +
+      (synced.error ?? synced.file ?? "") + "\nsettings 未改动。");
+    process.exit(1);
+  }
+  const checked = verifyRuntime();
+  if (!checked.ok) {
+    console.error("运行时校验未通过（链接 " + (checked.linkOk ? "ok" : "错") +
+      "，缺失 " + checked.missing.length + "，漂移 " + checked.drifted.length +
+      "）。settings 未改动。");
+    process.exit(1);
+  }
+  console.log("运行时   : 已装 " + checked.version + " 并校验通过");
+}
 
 // 内容没变就别动这个文件。反复重写只会攒出一堆备份，还平白给一份别人也在用的
 // 全局配置增加被写坏的机会。

@@ -76,6 +76,10 @@ import {
 } from "./canonical-event.mjs";
 import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
 import {
+  collectStatusProviders, loadStatusProviders, renderStatusProviders,
+  validateProviderRegistry, validateProviderReport,
+} from "./status-providers.mjs";
+import {
   MAPPING_DISPOSITION, MAPPING_POLICY_ID, MAPPING_POLICY_VERSION,
   buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
 } from "./mapping-policy.mjs";
@@ -6523,6 +6527,125 @@ test("安装不登记项目，也不改动既有登记表", () => {
   const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
   assert.doesNotMatch(src, /registry\.projects\.push\(/u, "安装器不得再往登记表塞条目");
   assert.doesNotMatch(src, /registry\.projects\.splice\(/u, "安装器不得再从登记表删条目");
+});
+
+// ---------- 状态提供者：一个问题一个答案，且坏了不牵连入站 ----------
+
+const PROTO = "feishu-bridge-status/v1";
+const providerRegistry = (over = {}) => ({ providers: [{
+  id: "fake", protocol: PROTO, executable: process.execPath, script: "/abs/fake.mjs",
+  allowed_kinds: ["transport"], ...over,
+}] });
+const providerReport = (conn = {}) => JSON.stringify({
+  schema_version: PROTO, provider_id: "fake",
+  connections: [{ kind: "transport", state: "active", scope: "chat", group_name: "Claude2Codex", ...conn }],
+});
+const asProvider = { providerId: "fake", allowedKinds: ["transport"] };
+
+test("provider 登记表：解释不了的一律拒", () => {
+  for (const [over, problem] of [
+    [{ id: "" }, "provider_id_invalid"],
+    [{ protocol: "other/v9" }, "provider_protocol_unsupported"],
+    [{ script: "relative.mjs" }, "script_not_absolute"],
+    [{ executable: "node" }, "executable_not_absolute"],
+    [{ args: "not-array" }, "args_not_string_array"],
+    [{ allowed_kinds: [] }, "allowed_kinds_invalid"],
+    [{ allowed_kinds: ["god-mode"] }, "allowed_kinds_invalid"],
+    [{ enabled: "yes" }, "enabled_not_boolean"],
+  ]) {
+    const v = validateProviderRegistry(providerRegistry(over));
+    assert.equal(v.ok, false, problem);
+    assert.equal(v.problem, problem);
+  }
+  assert.equal(validateProviderRegistry({ providers: [] }).ok, true);
+  assert.equal(validateProviderRegistry(providerRegistry()).providers[0].allowedKinds[0], "transport");
+});
+
+test("provider 报告：只收受控字段，多带一个就整条拒", () => {
+  // additionalProperties:false 是「不打印 locator」这条承诺的落实手段 ——
+  // 自由文本一旦直接展示，承诺就只能靠接入方替我守，那不成立。
+  const leaked = validateProviderReport(providerReport({ chat_id: "oc_abcdef123456" }), asProvider);
+  assert.equal(leaked.ok, false);
+  assert.equal(leaked.reason, "connection_unknown_field");
+  assert.equal(leaked.field, "chat_id");
+
+  // 挡不住「把 locator 塞进名字」是靠形状检查兜的，明确它管到哪一步。
+  assert.equal(validateProviderReport(providerReport({ group_name: "oc_abcdef123456" }), asProvider).reason,
+    "connection_group_name_invalid");
+  // 控制字符会把终端输出搞乱，压平而不是拒。
+  assert.equal(
+    validateProviderReport(providerReport({ group_name: "A\u0000B" }), asProvider).connections[0].groupName,
+    "A B");
+
+  for (const [conn, reason] of [
+    [{ kind: "nope" }, "connection_kind_invalid"],
+    [{ state: "nope" }, "connection_state_invalid"],
+    [{ scope: "nope" }, "connection_scope_invalid"],
+  ]) {
+    assert.equal(validateProviderReport(providerReport(conn), asProvider).reason, reason);
+  }
+  assert.equal(validateProviderReport("不是 json", asProvider).reason, "report_not_json");
+  assert.equal(validateProviderReport(JSON.stringify({ schema_version: "x" }), asProvider).reason,
+    "report_protocol_unsupported");
+});
+
+test("provider 不能自己扩大能力范围", () => {
+  // 登记时人给了 transport，它报 progress 就是在自己给自己发许可。
+  const over = validateProviderReport(providerReport({ kind: "progress" }), asProvider);
+  assert.equal(over.ok, false);
+  assert.equal(over.reason, "connection_kind_not_allowed");
+  // 同一份报告在授权更大的登记下就合法 —— 说明拒的是越权，不是这个值本身。
+  assert.equal(validateProviderReport(providerReport({ kind: "progress" }),
+    { providerId: "fake", allowedKinds: ["transport", "progress"] }).ok, true);
+});
+
+test("一个 provider 坏掉只影响它自己那一节", () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-sp-")), "providers.json");
+  fs.writeFileSync(file, JSON.stringify({ providers: [
+    { id: "good", protocol: PROTO, executable: process.execPath, script: "/abs/a.mjs", allowed_kinds: ["transport"] },
+    { id: "slow", protocol: PROTO, executable: process.execPath, script: "/abs/b.mjs", allowed_kinds: ["transport"] },
+    { id: "off", protocol: PROTO, executable: process.execPath, script: "/abs/c.mjs",
+      allowed_kinds: ["transport"], enabled: false },
+  ] }));
+  const run = (p) => p.id === "good"
+    ? { ok: true, connections: [{ kind: "transport", state: "active", scope: "chat",
+        groupName: "Claude2Codex", topicName: null }] }
+    : { ok: false, reason: "provider_timeout" };
+  const got = collectStatusProviders({ file, run });
+  assert.equal(got.ok, true);
+  assert.deepEqual(got.sections.map((x) => x.state), ["ok", "unavailable", "disabled"]);
+
+  const text = renderStatusProviders(got);
+  assert.match(text, /Claude2Codex/u, "一个超时不该让另外两个也看不见");
+  assert.match(text, /provider_timeout/u);
+  assert.match(text, /已停用/u);
+});
+
+test("状态登记坏掉时说清楚：只影响显示，不影响入站", () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-sp2-")), "providers.json");
+  fs.writeFileSync(file, "{ 坏掉的 json");
+  const got = collectStatusProviders({ file });
+  assert.equal(got.ok, false);
+  assert.equal(got.reason, "status_providers_unreadable");
+  // 观测坏了会被当成故障，所以这句必须写在输出里。
+  assert.match(renderStatusProviders(got), /不影响飞书入站/u);
+
+  // 结构上的保证：状态登记和路由表是两份文件、两个校验域。
+  const routes = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-sp3-")), "routes.json");
+  fs.writeFileSync(routes, JSON.stringify({
+    routes: [{ id: "cc2cd", handler: process.execPath }], sessions: { s: "cc2cd" },
+  }));
+  const table = loadRoutes(routes);
+  assert.equal(table.ok, true, "状态登记坏了不得让路由表 fail-closed");
+  assert.equal(selectRoute({ sessionId: "s", ...table }).route.id, "cc2cd", "投递照常");
+});
+
+test("没有 provider 登记时，状态输出跟以前一模一样", () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-sp4-")), "providers.json");
+  const got = collectStatusProviders({ file });
+  assert.equal(got.ok, true);
+  assert.equal(loadStatusProviders(file).reason, "no_providers", "没有文件不是错误");
+  assert.equal(renderStatusProviders(got), null, "没有内容就不该多出一节");
 });
 
 summarySealed = true;

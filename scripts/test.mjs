@@ -13,6 +13,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { moduleDir } from "./direct-run.mjs";
 
 import {
@@ -75,6 +76,11 @@ import {
   legacyEventFromCanonical, validateCanonicalEvent,
 } from "./canonical-event.mjs";
 import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
+import { bindingToConnections } from "./group-binding-status.mjs";
+import {
+  collectConnectivity, collectStatusProviders, loadStatusProviders, renderConnectivity,
+  validateProviderRegistry, validateProviderReport,
+} from "./status-providers.mjs";
 import {
   MAPPING_DISPOSITION, MAPPING_POLICY_ID, MAPPING_POLICY_VERSION,
   buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
@@ -6523,6 +6529,620 @@ test("安装不登记项目，也不改动既有登记表", () => {
   const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
   assert.doesNotMatch(src, /registry\.projects\.push\(/u, "安装器不得再往登记表塞条目");
   assert.doesNotMatch(src, /registry\.projects\.splice\(/u, "安装器不得再从登记表删条目");
+});
+
+// ---------- 状态提供者：一个问题一个答案，且坏了不牵连入站 ----------
+
+const PROTO = "feishu-bridge-status/v1";
+const providerRegistry = (over = {}) => ({ providers: [{
+  id: "fake", protocol: PROTO, executable: process.execPath, script: "/abs/fake.mjs",
+  allowed_kinds: ["transport"], ...over,
+}] });
+const providerReport = (conn = {}) => JSON.stringify({
+  schema_version: PROTO, provider_id: "fake",
+  connections: [{ kind: "transport", state: "active", scope: "chat", group_name: "Claude2Codex", ...conn }],
+});
+const asProvider = { providerId: "fake", allowedKinds: ["transport"] };
+
+test("provider 登记表：解释不了的一律拒", () => {
+  for (const [over, problem] of [
+    [{ id: "" }, "provider_id_invalid"],
+    [{ protocol: "other/v9" }, "provider_protocol_unsupported"],
+    [{ script: "relative.mjs" }, "script_not_absolute"],
+    [{ executable: "node" }, "executable_not_absolute"],
+    [{ args: "not-array" }, "args_not_string_array"],
+    [{ allowed_kinds: [] }, "allowed_kinds_invalid"],
+    [{ allowed_kinds: ["god-mode"] }, "allowed_kinds_invalid"],
+    [{ enabled: "yes" }, "enabled_not_boolean"],
+  ]) {
+    const v = validateProviderRegistry(providerRegistry(over));
+    assert.equal(v.ok, false, problem);
+    assert.equal(v.problem, problem);
+  }
+  assert.equal(validateProviderRegistry({ providers: [] }).ok, true);
+  assert.equal(validateProviderRegistry(providerRegistry()).providers[0].allowedKinds[0], "transport");
+});
+
+test("provider 报告：只收受控字段，多带一个就整条拒", () => {
+  // additionalProperties:false 是「不打印 locator」这条承诺的落实手段 ——
+  // 自由文本一旦直接展示，承诺就只能靠接入方替我守，那不成立。
+  const leaked = validateProviderReport(providerReport({ chat_id: "oc_abcdef123456" }), asProvider);
+  assert.equal(leaked.ok, false);
+  assert.equal(leaked.reason, "connection_unknown_field");
+  assert.equal(leaked.field, "chat_id");
+
+  // 挡不住「把 locator 塞进名字」是靠形状检查兜的，明确它管到哪一步。
+  assert.equal(validateProviderReport(providerReport({ group_name: "oc_abcdef123456" }), asProvider).reason,
+    "connection_group_name_invalid");
+  // 控制字符会把终端输出搞乱，压平而不是拒。
+  assert.equal(
+    validateProviderReport(providerReport({ group_name: "A\u0000B" }), asProvider).connections[0].groupName,
+    "A B");
+
+  for (const [conn, reason] of [
+    [{ kind: "nope" }, "connection_kind_invalid"],
+    [{ state: "nope" }, "connection_state_invalid"],
+    [{ scope: "nope" }, "connection_scope_invalid"],
+  ]) {
+    assert.equal(validateProviderReport(providerReport(conn), asProvider).reason, reason);
+  }
+  assert.equal(validateProviderReport("不是 json", asProvider).reason, "report_not_json");
+  assert.equal(validateProviderReport(JSON.stringify({ schema_version: "x" }), asProvider).reason,
+    "report_protocol_unsupported");
+});
+
+test("provider 不能自己扩大能力范围", () => {
+  // 登记时人给了 transport，它报 progress 就是在自己给自己发许可。
+  const over = validateProviderReport(providerReport({ kind: "progress" }), asProvider);
+  assert.equal(over.ok, false);
+  assert.equal(over.reason, "connection_kind_not_allowed");
+  // 同一份报告在授权更大的登记下就合法 —— 说明拒的是越权，不是这个值本身。
+  assert.equal(validateProviderReport(providerReport({ kind: "progress" }),
+    { providerId: "fake", allowedKinds: ["transport", "progress"] }).ok, true);
+});
+
+test("一个 provider 坏掉只影响它自己那一节", () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-sp-")), "providers.json");
+  fs.writeFileSync(file, JSON.stringify({ providers: [
+    { id: "good", protocol: PROTO, executable: process.execPath, script: "/abs/a.mjs", allowed_kinds: ["transport"] },
+    { id: "slow", protocol: PROTO, executable: process.execPath, script: "/abs/b.mjs", allowed_kinds: ["transport"] },
+    { id: "off", protocol: PROTO, executable: process.execPath, script: "/abs/c.mjs",
+      allowed_kinds: ["transport"], enabled: false },
+  ] }));
+  const run = (p) => p.id === "good"
+    ? { ok: true, connections: [{ kind: "transport", state: "active", scope: "chat",
+        groupName: "Claude2Codex", topicName: null }] }
+    : { ok: false, reason: "provider_timeout" };
+  const got = collectStatusProviders({ file, run });
+  assert.equal(got.ok, true);
+  assert.deepEqual(got.sections.map((x) => x.state), ["ok", "unavailable", "disabled"]);
+
+  const view = collectConnectivity({
+    routesFile: path.join(path.dirname(file), "no-routes.json"), providersFile: file, run,
+  });
+  const text = renderConnectivity(view);
+  assert.match(text, /Claude2Codex/u, "一个超时不该让另外两个也看不见");
+  assert.match(text, /provider_timeout/u);
+  assert.match(text, /已停用/u);
+});
+
+test("状态登记坏掉时说清楚：只影响显示，不影响入站", () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-sp2-")), "providers.json");
+  fs.writeFileSync(file, "{ 坏掉的 json");
+  const got = collectStatusProviders({ file });
+  assert.equal(got.ok, false);
+  assert.equal(got.reason, "status_providers_unreadable");
+
+  // 这条只管**结构上的保证**：状态登记和路由表是两份文件、两个校验域。
+  // 措辞怎么区分由「两份目录各自独立降级」那条管，不在这里重复断言。
+  const routes = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-sp3-")), "routes.json");
+  fs.writeFileSync(routes, JSON.stringify({
+    routes: [{ id: "cc2cd", handler: process.execPath }], sessions: { s: "cc2cd" },
+  }));
+  const table = loadRoutes(routes);
+  assert.equal(table.ok, true, "状态登记坏了不得让路由表 fail-closed");
+  assert.equal(selectRoute({ sessionId: "s", ...table }).route.id, "cc2cd", "投递照常");
+});
+
+test("没有 provider 登记时，状态输出跟以前一模一样", () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-sp4-")), "providers.json");
+  const got = collectStatusProviders({ file });
+  assert.equal(got.ok, true);
+  assert.equal(loadStatusProviders(file).reason, "no_providers", "没有文件不是错误");
+  assert.equal(renderConnectivity(got), null, "没有内容就不该多出一节");
+});
+
+test("群级绑定 provider：只报群名，locator 一个都不出", () => {
+  const binding = {
+    schema_version: "1.0", artifact_type: "cc2cd_group_binding", bind_scope: "chat",
+    status: "active", chat_id: "oc_SECRET123456", chat_name: "Claude2Codex",
+    frank_aily_id: "7621020633916345545", transport_open_id: "ou_SECRET7890ab",
+    bound_at: "2026-08-21T00:00:00.000Z", expires_at: "2027-08-20T00:00:00.000Z",
+    sessions: { session_4kw4su42fsg4p: { thread_id: "omt_SECRETxyz" } },
+  };
+  const got = bindingToConnections(binding, { now: Date.parse("2026-08-23T00:00:00.000Z") });
+  assert.deepEqual(got.connections,
+    [{ kind: "transport", state: "active", scope: "chat", group_name: "Claude2Codex" }]);
+
+  // 聚合方那边虽然也拦（未知字段整条拒），但拦截是最后一道，不是唯一一道。
+  const text = JSON.stringify(got);
+  for (const secret of ["oc_SECRET123456", "ou_SECRET7890ab", "omt_SECRETxyz",
+    "session_4kw4su42fsg4p", "7621020633916345545"]) {
+    assert.equal(text.includes(secret), false, "不得出现 " + secret);
+  }
+});
+
+test("群级绑定 provider：状态按 status 与有效期推导", () => {
+  const base = { bind_scope: "chat", chat_name: "G", expires_at: "2027-08-20T00:00:00.000Z" };
+  const now = Date.parse("2026-08-23T00:00:00.000Z");
+  const state = (over) => bindingToConnections({ ...base, ...over }, { now }).connections[0].state;
+  assert.equal(state({ status: "active" }), "active");
+  assert.equal(state({ status: "suspended" }), "suspended");
+  // 状态写着 active、但已经过期 —— 报 active 就是在撒谎。
+  assert.equal(state({ status: "active", expires_at: "2020-01-01T00:00:00.000Z" }), "expired");
+  assert.equal(state({ status: "什么鬼" }), "unknown");
+  // 有效期读不出来时报 active 是假正常。上一版这里断言的正是那个 bug ——
+  // 一条把错误写成期望的测试，比没有测试更糟：它会替错误挡住后来的质疑。
+  for (const bad of [{ expires_at: "不是时间" }, { expires_at: undefined }]) {
+    const got = bindingToConnections({ ...base, status: "active", ...bad }, { now });
+    assert.equal(got.ok, false, JSON.stringify(bad));
+    assert.equal(got.reason, "binding_shape_unexpected");
+  }
+});
+
+test("群级绑定 provider：没绑过和解释不了要分开", () => {
+  // 「读不到」和「没绑过」对使用者是同一件事：没有已连接的群。
+  assert.deepEqual(bindingToConnections(null).connections, []);
+  // 但文件在、内容却读不懂时报"没有绑定"，是在替它下一个它不该下的结论。
+  for (const doc of [{ bind_scope: "什么鬼" }, [], "字符串", { chat_name: "G" }]) {
+    const got = bindingToConnections(doc);
+    assert.equal(got.ok, false, JSON.stringify(doc));
+    assert.equal(got.reason, "binding_shape_unexpected");
+  }
+});
+
+test("群级绑定 provider：实际跑一遍，输出能过聚合方的校验", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-gb-"));
+  const file = path.join(dir, "binding.json");
+  fs.writeFileSync(file, JSON.stringify({
+    bind_scope: "chat", status: "active", chat_id: "oc_SECRET123456",
+    chat_name: "Claude2Codex", expires_at: "2099-01-01T00:00:00.000Z",
+  }));
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "group-binding-status.mjs"),
+    "--provider-id", "cc2cd", "--binding", file,
+  ], { encoding: "utf-8" });
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(run.stdout.includes("oc_SECRET123456"), false, "进程实际输出里也不能有 locator");
+
+  // 自己产的报告要能过自己定的校验 —— 否则协议和实现是两张皮。
+  const checked = validateProviderReport(run.stdout, { providerId: "cc2cd", allowedKinds: ["transport"] });
+  assert.equal(checked.ok, true, checked.reason);
+  assert.equal(checked.connections[0].groupName, "Claude2Codex");
+
+  // 解释不了的绑定要非零退出，让聚合方显示"状态取不到"而不是"没有绑定"。
+  fs.writeFileSync(file, JSON.stringify({ bind_scope: "什么鬼" }));
+  assert.notEqual(spawnSync(process.execPath, [
+    path.resolve("scripts", "group-binding-status.mjs"),
+    "--provider-id", "cc2cd", "--binding", file,
+  ], { encoding: "utf-8" }).status, 0);
+});
+
+test("provider id 是受控标识符，不能同时当显示文本用", () => {
+  // id 会被当成显示名的兜底值，于是它同时是标识符**和**输出文本。
+  // 这个 id 既带 locator，又能靠换行伪造出一整行状态。
+  const evil = "oc_SECRET123456\nCodex  消息运输 · 某群 · 正常";
+  const v = validateProviderRegistry({ providers: [{
+    id: evil, protocol: "feishu-bridge-status/v1",
+    executable: process.execPath, script: "/abs/x.mjs", allowed_kinds: ["transport"],
+  }] });
+  assert.equal(v.ok, false);
+  assert.equal(v.problem, "provider_id_invalid");
+
+  for (const bad of ["", "  ", "-开头", "Upper", "a".repeat(33), "有空格 的"]) {
+    assert.equal(validateProviderRegistry({ providers: [{
+      id: bad, protocol: "feishu-bridge-status/v1",
+      executable: process.execPath, script: "/abs/x.mjs", allowed_kinds: ["transport"],
+    }] }).problem, "provider_id_invalid", JSON.stringify(bad));
+  }
+  assert.equal(validateProviderRegistry({ providers: [{
+    id: "cc2cd-2_x", protocol: "feishu-bridge-status/v1",
+    executable: process.execPath, script: "/abs/x.mjs", allowed_kinds: ["transport"],
+  }] }).ok, true);
+});
+
+test("报告顶层也是封闭结构", () => {
+  // 连接项封闭而顶层不封闭，等于"多带一个字段"只是换个地方放。
+  const got = validateProviderReport(JSON.stringify({
+    schema_version: "feishu-bridge-status/v1", provider_id: "p", connections: [],
+    chat_id: "oc_SECRET123456",
+  }), { providerId: "p", allowedKinds: ["transport"] });
+  assert.equal(got.ok, false);
+  assert.equal(got.reason, "report_unknown_field");
+  assert.equal(got.field, "chat_id");
+});
+
+test("有 route 没登记状态入口的消费者必须被列出来", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-conn-"));
+  const routesFile = path.join(dir, "routes.json");
+  const providersFile = path.join(dir, "providers.json");
+  fs.writeFileSync(routesFile, JSON.stringify({ routes: [
+    { id: "self", handler: process.execPath, default: true },
+    { id: "cc2cd", handler: process.execPath },
+    { id: "quiet", handler: process.execPath },
+  ], sessions: {} }));
+  fs.writeFileSync(providersFile, JSON.stringify({ providers: [{
+    id: "cc2cd", protocol: "feishu-bridge-status/v1",
+    executable: process.execPath, script: "/abs/x.mjs", allowed_kinds: ["transport"],
+  }] }));
+  const run = () => ({ ok: true, connections: [
+    { kind: "transport", state: "active", scope: "chat", groupName: "Claude2Codex", topicName: null },
+  ] });
+
+  const view = collectConnectivity({ routesFile, providersFile, run });
+  assert.deepEqual(view.sections.map((x) => x.id).sort(), ["cc2cd", "quiet", "self"]);
+
+  const text = renderConnectivity(view);
+  assert.match(text, /Claude2Codex/u);
+  // 在收消息、却没人知道它连到哪儿 —— 那正是最该被看见的一类。
+  assert.match(text, /quiet {2}链路存在，状态入口未登记/u);
+  assert.match(text, /self {2}链路存在，状态入口未登记（默认路由）/u);
+});
+
+test("两份目录各自独立降级，且两种故障的措辞不能一样", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-conn2-"));
+  const routesFile = path.join(dir, "routes.json");
+  const providersFile = path.join(dir, "providers.json");
+  fs.writeFileSync(routesFile, JSON.stringify({
+    routes: [{ id: "cc2cd", handler: process.execPath }], sessions: {},
+  }));
+  fs.writeFileSync(providersFile, "{ 坏掉的 json");
+
+  // 状态入口坏了：只影响显示，路由照样列得出来。
+  const a = renderConnectivity(collectConnectivity({ routesFile, providersFile }));
+  assert.match(a, /cc2cd {2}链路存在/u, "状态登记坏了不该让路由也看不见");
+  assert.match(a, /不影响飞书入站/u);
+
+  // 路由表坏了：入站**确实**停了，说成"只是显示问题"就是在瞒。
+  fs.writeFileSync(routesFile, "{ 也坏了");
+  fs.writeFileSync(providersFile, JSON.stringify({ providers: [] }));
+  const b = renderConnectivity(collectConnectivity({ routesFile, providersFile }));
+  assert.match(b, /入站已停止投递，这是需要处理的故障/u);
+  assert.doesNotMatch(b, /不影响飞书入站/u);
+});
+
+test("状态入口登记命令：默认预览，受控写入", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-regp-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"), ...args,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+
+  // 默认不写盘，而且要说清这是一次代码执行授权。
+  const preview = cli(["--id", "cc2cd", "--script", script]);
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.match(preview.stdout, /dry-run/u);
+  assert.match(preview.stdout, /在你的交互会话里执行/u);
+  assert.equal(fs.existsSync(file), false);
+
+  fs.writeFileSync(file, JSON.stringify({ schema_version: "1.0", custom_marker: "KEEP_ME", providers: [] }));
+  assert.equal(cli(["--id", "cc2cd", "--script", script, "--apply", "--", "--binding", "/abs/b.json"]).status, 0);
+  const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
+  assert.equal(raw.custom_marker, "KEEP_ME", "只加一项，不重建文档");
+  assert.deepEqual(raw.providers[0].args, ["--binding", "/abs/b.json"], "-- 之后的参数原样存下");
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+
+  // 幂等要求**完全相同**：少了 -- 之后那两个参数就不是同一条登记了。
+  assert.match(cli(["--id", "cc2cd", "--script", script, "--apply", "--", "--binding", "/abs/b.json"]).stdout,
+    /无需改动/u);
+  // 同 id 换脚本要拒 —— 那是悄悄改判由谁来报这条链路的状态。
+  const repoint = cli(["--id", "cc2cd", "--script", path.resolve("scripts", "feishu-status.mjs"), "--apply"]);
+  assert.notEqual(repoint.status, 0);
+  assert.match(repoint.stderr, /provider_exists_with_other_script/u);
+
+  // 坏表不许被当成首次创建覆盖。
+  fs.writeFileSync(file, "{ 坏掉的 json");
+  const onBroken = cli(["--id", "other", "--script", script, "--apply"]);
+  assert.notEqual(onBroken.status, 0);
+  assert.equal(fs.readFileSync(file, "utf-8"), "{ 坏掉的 json");
+});
+
+test("登记命令：-- 之后的参数不得越过授权闸门", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-bypass-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  // 控制面和数据面混在同一个 argv 里，"整个数组里搜 --apply"就会把
+  // 一个透传给 provider 的参数当成授权。
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"),
+    "--id", "cc2cd", "--script", script, "--", "--apply",
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /dry-run/u);
+  assert.equal(fs.existsSync(file), false, "透传参数不得触发落盘");
+
+  // --id 之类也一样：控制参数只从 -- 前半段读。
+  const spoof = spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"),
+    "--script", script, "--apply", "--", "--id", "sneaky",
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+  assert.equal(spoof.status, 2, "缺 --id 就该报用法，而不是从透传段捡一个");
+});
+
+test("登记命令：任一字段不同都不许报「无变化」", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-idem-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"), ...args,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+
+  assert.equal(cli(["--id", "cc2cd", "--script", script, "--apply", "--", "--binding", "/first.json"]).status, 0);
+  // 只比 script 会虚假宣称"无变化"，而文件里还是旧值。
+  const changed = cli(["--id", "cc2cd", "--script", script, "--kinds", "progress",
+    "--apply", "--", "--binding", "/second.json"]);
+  assert.notEqual(changed.status, 0);
+  assert.match(changed.stderr, /provider_exists_with_other_settings/u);
+  assert.match(changed.stderr, /args/u);
+  assert.match(changed.stderr, /allowed_kinds/u);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf-8")).providers[0].args,
+    ["--binding", "/first.json"], "拒绝时不得改动已有登记");
+
+  // 完全相同才幂等。
+  assert.match(cli(["--id", "cc2cd", "--script", script, "--apply", "--", "--binding", "/first.json"]).stdout,
+    /无需改动/u);
+});
+
+test("登记命令：结构损坏的表不得因为 id 相同就提前成功", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-idem2-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  // 同 id 同 script，但表里另有一条解释不了的记录。
+  fs.writeFileSync(file, JSON.stringify({ providers: [
+    { id: "cc2cd", protocol: "feishu-bridge-status/v1", executable: process.execPath,
+      script, args: [], allowed_kinds: ["transport"] },
+    { id: "broken", protocol: "feishu-bridge-status/v1", executable: process.execPath,
+      script, args: [], allowed_kinds: ["god-mode"] },
+  ] }));
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"),
+    "--id", "cc2cd", "--script", script, "--apply",
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+  // 登记说成了、读取说没有，是最难查的一类不一致。
+  assert.notEqual(run.status, 0, "提前返回成功会跟 loadStatusProviders 的判断打架");
+  assert.equal(loadStatusProviders(file).ok, false, "确认这张表读取路径也认为不可用");
+});
+
+test("只授权 progress 的 provider 不得掩盖 transport 路由", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-kind-"));
+  const routesFile = path.join(dir, "routes.json");
+  const providersFile = path.join(dir, "providers.json");
+  fs.writeFileSync(routesFile, JSON.stringify({
+    routes: [{ id: "cc2cd", handler: process.execPath }], sessions: {},
+  }));
+  fs.writeFileSync(providersFile, JSON.stringify({ providers: [{
+    id: "cc2cd", protocol: "feishu-bridge-status/v1", executable: process.execPath,
+    script: "/abs/x.mjs", allowed_kinds: ["progress"],
+  }] }));
+  const run = () => ({ ok: true, connections: [
+    { kind: "progress", state: "active", scope: "project", groupName: "某群", topicName: null },
+  ] });
+
+  const text = renderConnectivity(collectConnectivity({ routesFile, providersFile, run }));
+  assert.match(text, /进度汇报/u);
+  // 按 id 一刀切会让这条 route 的运输状态凭空消失，且不提示未登记。
+  assert.match(text, /链路存在，状态入口未登记/u,
+    "只有获准报告 transport 的 provider 才算覆盖了一条 route");
+});
+
+test("provider 停用说的是状态入口停用，不是链路停用", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-dis2-"));
+  const providersFile = path.join(dir, "providers.json");
+  fs.writeFileSync(providersFile, JSON.stringify({ providers: [{
+    id: "cc2cd", protocol: "feishu-bridge-status/v1", executable: process.execPath,
+    script: "/abs/x.mjs", allowed_kinds: ["transport"], enabled: false,
+  }] }));
+  const text = renderConnectivity(collectConnectivity({
+    routesFile: path.join(dir, "no-routes.json"), providersFile,
+  }));
+  // 说成"已停用"会被读成链路停了，而那条 route 可能还在正常收消息。
+  assert.match(text, /状态入口已停用（链路本身不受影响）/u);
+});
+
+test("登记预览必须读真实状态：坏表和冲突都要在 dry-run 就暴露", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-plan-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"),
+    "--id", "cc2cd", "--script", script, ...args,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+
+  // 一个不读真实状态的预览，报的"没问题"不是从状态得出的 —— 那不是预览。
+  fs.writeFileSync(file, "{ 坏掉的 json");
+  const broken = cli([]);
+  assert.notEqual(broken.status, 0, "坏表不能等到 --apply 才炸");
+  assert.match(broken.stdout, /登记表读不出来/u);
+
+  fs.rmSync(file);
+  assert.equal(cli(["--apply", "--", "--binding", "/first.json"]).status, 0);
+  const conflict = cli(["--kinds", "progress", "--", "--binding", "/second.json"]);
+  assert.notEqual(conflict.status, 0, "冲突也要在预览就报");
+  assert.match(conflict.stdout, /已存在同 id 且配置不同/u);
+  assert.match(conflict.stdout, /args/u);
+  assert.match(conflict.stdout, /allowed_kinds/u);
+  // 提示必须指向**真实存在**的操作，否则等于把人推回手改 JSON。
+  assert.match(conflict.stdout, /--replace/u);
+  assert.match(conflict.stdout, /--unregister/u);
+
+  // 预览没写盘。
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf-8")).providers[0].args,
+    ["--binding", "/first.json"]);
+});
+
+test("登记有完整生命周期：替换与注销都默认预览", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-life-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"),
+    "--id", "cc2cd", ...args,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+
+  assert.equal(cli(["--script", script, "--apply", "--", "--binding", "/first.json"]).status, 0);
+
+  // --replace 默认也只预览。
+  const preview = cli(["--script", script, "--replace", "--kinds", "progress", "--", "--binding", "/second.json"]);
+  assert.equal(preview.status, 0);
+  assert.match(preview.stdout, /将替换已有登记/u);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf-8")).providers[0].allowed_kinds, ["transport"]);
+
+  assert.equal(cli(["--script", script, "--replace", "--kinds", "progress", "--apply",
+    "--", "--binding", "/second.json"]).status, 0);
+  const after = JSON.parse(fs.readFileSync(file, "utf-8")).providers[0];
+  assert.deepEqual(after.allowed_kinds, ["progress"]);
+  assert.deepEqual(after.args, ["--binding", "/second.json"]);
+
+  // 注销同样默认预览。
+  assert.match(cli(["--unregister"]).stdout, /将注销这条登记/u);
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf-8")).providers.length, 1);
+  assert.equal(cli(["--unregister", "--apply"]).status, 0);
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf-8")).providers.length, 0);
+  // 注销一个不存在的 id 不是错误，但要说清什么都没做。
+  assert.match(cli(["--unregister", "--apply"]).stdout, /登记表里没有这个 id/u);
+});
+
+test("深比较要含 enabled：重登记一条已停用的项不许报「无变化」", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-en-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  fs.writeFileSync(file, JSON.stringify({ providers: [{
+    id: "cc2cd", protocol: "feishu-bridge-status/v1", executable: process.execPath,
+    script, args: [], allowed_kinds: ["transport"], enabled: false,
+  }] }));
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"),
+    "--id", "cc2cd", "--script", script,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+  // 报"无变化"而它仍然停用，等于说"已经装好了"却没生效。
+  assert.notEqual(run.status, 0);
+  assert.match(run.stdout, /变化字段：enabled/u);
+});
+
+test("Codex 侧：当前 task 未绑定时仍要显示全局链路", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cxs-"));
+  const home = path.join(dir, "bridge-home");
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "registry.json"),
+    JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks: [] }));
+  const routesFile = path.join(dir, "routes.json");
+  fs.writeFileSync(routesFile, JSON.stringify({
+    routes: [{ id: "cc2cd", handler: process.execPath }], sessions: {},
+  }));
+
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "codex", "feishu-status.mjs"),
+    "--thread-id", "01911111-2222-7333-8444-999999999999",
+  ], { encoding: "utf-8", env: {
+    ...process.env, FEISHU_CODEX_BRIDGE_HOME: home, FEISHU_BRIDGE_ROUTES: routesFile,
+    FEISHU_BRIDGE_STATUS_PROVIDERS: path.join(dir, "none.json"),
+  } });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /尚未接入飞书/u);
+  // "这条没绑"和"本机什么都没有"是两回事。
+  assert.match(run.stdout, /cc2cd {2}链路存在，状态入口未登记/u);
+});
+
+test("歧义命令必须失败，不许被解释成破坏性更强的那个", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-amb-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"), "--id", "probe", ...args,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+
+  assert.equal(cli(["--script", script, "--apply"]).status, 0);
+  const before = fs.readFileSync(file, "utf-8");
+
+  // 上一版会静默选注销 —— 那是在替人做一个他没表达的决定。
+  const both = cli(["--script", script, "--replace", "--unregister", "--apply"]);
+  assert.notEqual(both.status, 0);
+  assert.match(both.stderr, /ambiguous_mode/u);
+
+  // 注销模式下静默忽略配置参数，会让人以为"顺手也更新了配置"。
+  const withConfig = cli(["--unregister", "--kinds", "progress", "--apply"]);
+  assert.notEqual(withConfig.status, 0);
+  assert.match(withConfig.stderr, /unregister_takes_no_config/u);
+  assert.match(withConfig.stderr, /kinds/u);
+
+  const withArgs = cli(["--unregister", "--apply", "--", "--binding", "/x.json"]);
+  assert.notEqual(withArgs.status, 0);
+  assert.match(withArgs.stderr, /unregister_takes_no_args/u);
+
+  assert.equal(fs.readFileSync(file, "utf-8"), before, "歧义命令一个字节都不该动");
+  // 干净的注销仍然可用 —— 拒的是歧义，不是注销本身。
+  assert.equal(cli(["--unregister", "--apply"]).status, 0);
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf-8")).providers.length, 0);
+});
+
+test("控制参数走白名单：未知、拼错、裸参数、重复、缺值一律拒", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-wl-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"), ...args,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+
+  assert.equal(cli(["--id", "probe", "--script", script, "--apply"]).status, 0);
+  const before = fs.readFileSync(file, "utf-8");
+
+  // "只接受这几个"和"拒绝这几个"差一个拼写错误，
+  // 而破坏性操作那边差的是整个登记表。
+  for (const [args, reason] of [
+    [["--id", "probe", "--unregister", "--unknown-option", "x", "--apply"], "unknown_option"],
+    [["--id", "p2", "--script", script, "--kindz", "progress", "--apply"], "unknown_option"],
+    [["--id", "probe", "--unregister", "裸的", "--apply"], "unexpected_argument"],
+    [["--id", "probe", "--id", "other", "--unregister", "--apply"], "duplicate_option"],
+    [["--id", "--unregister", "--apply"], "option_needs_value"],
+  ]) {
+    const run = cli(args);
+    assert.notEqual(run.status, 0, reason);
+    assert.match(run.stderr, new RegExp(reason, "u"));
+    assert.equal(fs.readFileSync(file, "utf-8"), before, "拒绝时一个字节都不该动：" + reason);
+  }
+
+  // 拒的是"说不清的命令"，不是这些操作本身。
+  assert.equal(cli(["--id", "probe", "--unregister", "--apply"]).status, 0);
+});
+
+test("被 import 时不得被调用方自己的命令行参数影响", () => {
+  // 现成的"被 import 时不得有 stderr"那条守卫抓不到这个：它 import 时 argv 是干净的。
+  // 参数解析一旦落在模块顶层，isDirectRun 就只护住了 main()。
+  for (const rel of ["register-status-provider.mjs", "register-route.mjs", "group-binding-status.mjs"]) {
+    // 模块路径必须写进代码里，不能当 argv[1] 传 —— 那会让 isDirectRun 判成直接执行，
+    // 探针就测不到"被 import"这个场景了。
+    const target = pathToFileURL(path.resolve("scripts", rel)).href;
+    const probe = "process.argv.push('caller.mjs','--caller-option','x','裸参数');" +
+      "import(" + JSON.stringify(target) + ").then(() => console.log('ok'));";
+    const run = spawnSync(process.execPath, ["-e", probe], { encoding: "utf-8" });
+    assert.equal(run.status, 0, rel + " 被 import 时不该以调用方的参数为准：" + run.stderr);
+    assert.equal(run.stderr, "", rel + " 被 import 时不得有 stderr");
+    assert.equal(run.stdout.trim(), "ok", rel + " 被 import 时不得有额外输出");
+  }
+});
+
+test("直接执行时参数校验仍然严格", () => {
+  // 上一条如果做过头（比如干脆不校验了），这条会亮。
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"),
+    "--id", "x", "--unregister", "--unknown-option", "y", "--apply",
+  ], { encoding: "utf-8", env: {
+    ...process.env,
+    FEISHU_BRIDGE_STATUS_PROVIDERS: path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-imp-")), "p.json"),
+  } });
+  assert.notEqual(run.status, 0);
+  assert.match(run.stderr, /unknown_option/u);
 });
 
 summarySealed = true;

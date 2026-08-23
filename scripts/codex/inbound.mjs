@@ -34,6 +34,18 @@ import {
   isThreadBusy, loadCodexTemplate, promoteTask, reserveTaskDialogueTurn,
   shadowCodexFirstClaim, taskPaths,
 } from "./state.mjs";
+import { isDirectRun } from "../direct-run.mjs";
+/**
+ * 整个入站流程包在 main() 里，只有被直接执行时才跑。
+ *
+ * 在此之前这个文件是纯顶层脚本：**import 它就等于跑一次入站分发**。做冒烟测试时
+ * 我 import 过一次，它真的执行了整条流程并输出了拒绝回执 —— 那次没造成损害只是运气，
+ * 换个环境变量组合就会写 claim、写回执、甚至投递。
+ *
+ * 刻意**不重排函数体的缩进**：这个文件近七百行，重排会让 diff 完全无法评审，
+ * 而这次改动的实质只有"加一道守卫"。可读性代价换评审可读性，是有意的取舍。
+ */
+async function main() {
 
 const BRIDGE_ROOT = moduleRoot(import.meta.url, "../..");
 const HOME = bridgeHome();
@@ -490,3 +502,13 @@ finish("accepted", {
   messageId: verdict.messageId,
   key: claim.key,
 }, { claim_key: claim.key, delivery_mode: run.mode });
+}
+
+if (isDirectRun(import.meta.url)) {
+  // 用 catch 收口而不是顶层 await —— 后者会让 import 也等它跑完。
+  main().catch((err) => {
+    process.stdout.write("系统错误 · 入站处理异常终止\n本条指令没有被投递。请勿视为已受理。\n");
+    process.stderr.write(String(err?.stack ?? err).slice(0, 2000) + "\n");
+    process.exit(1);
+  });
+}

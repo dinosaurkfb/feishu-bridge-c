@@ -6098,6 +6098,36 @@ test("两侧 feishu-rotate 在登记失败时都收口，且不谎报收口成�
   }
 });
 
+test("import 两侧 inbound.mjs 不得产生任何输出或状态写入", () => {
+  // 在此之前它们是纯顶层脚本：**import 就等于跑一次入站分发**。我做冒烟测试时
+  // import 过一次，它真的执行了整条流程并输出了拒绝回执 —— 没造成损害只是运气，
+  // 换个环境变量组合就会写 claim、写回执、甚至投递。
+  //
+  // 行为验证而不是源码断言：断言"文件里有 isDirectRun"证明不了 import 是惰性的。
+  for (const rel of ["inbound.mjs", path.join("codex", "inbound.mjs")]) {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "inbound-import-"));
+    const home = path.join(cwd, "home");
+    fs.mkdirSync(home);
+    const target = path.resolve("scripts", rel);
+    const run = spawnSync(process.execPath,
+      ["-e", "import(" + JSON.stringify(target) + ").then(()=>{},(e)=>{" +
+        "process.stderr.write('IMPORT_THREW '+e.message)})"],
+      { cwd, encoding: "utf-8",
+        env: { ...process.env, HOME: home, CODEX_HOME: path.join(home, ".codex") } });
+    assert.equal(run.stdout, "", rel + " 被 import 时不得有 stdout —— 那是给飞书的回执");
+    assert.doesNotMatch(String(run.stderr), /IMPORT_THREW/u, rel + " 被 import 时不得抛");
+    const created = [];
+    const walk = (dir) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) walk(full); else created.push(full);
+      }
+    };
+    walk(cwd);
+    assert.deepEqual(created, [], rel + " 被 import 时不得写任何文件（claim / 回执 / 状态）");
+  }
+});
+
 test("测试文件里没有写在汇总之后的 test()", () => {
   // 运行期封条只在那条 test() **真的被执行**时才触发。如果它藏在一个当前走不到的
   // 分支里，封条抓不到，而它一旦某天被执行就又是静默不计。这条从结构上兜住：

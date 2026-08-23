@@ -7478,10 +7478,48 @@ test("出站发布按真实配置渲染，读不到不许默认成开启", () =>
   }));
   assert.match(render(true), /出站发布.*每轮自动发布/u);
   // 配置明确关掉时仍显示"每轮自动发布"，是在报一个没查过的结论。
-  assert.match(render(false), /出站发布.*仅入队，未启用自动发布/u);
+  // 但也不能说成"仅入队" —— 这个开关管不住兜底排空，那是承诺它做不到的事。
+  assert.match(render(false), /出站发布.*每轮完成时不自动发布（兜底排空仍会发出）/u);
   // 读不到配置更不能默认成开启。
   assert.match(render(null), /出站发布.*状态不可用（读不到发布配置）/u);
   assert.match(render(undefined), /出站发布.*状态不可用（读不到发布配置）/u);
+});
+
+test("发布开关只管住两条自动路径，兜底排空不受它约束", () => {
+  // 这条钉的是**实际行为**，不是渲染字符串 —— status 的措辞是照着这个事实写的，
+  // 哪天热路径改了、措辞没跟上，这里会先亮。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pub-"));
+  const cfg = path.join(dir, ".feishu-bridge.json");
+  const session = "01911111-2222-7333-8444-555555555555";
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
+    kind: "progress", text: "待发", created_at: new Date().toISOString(),
+    published_at: null,
+  }));
+  fs.writeFileSync(cfg, JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", auto_publish_on_completion: false,
+  }));
+
+  // 兜底排空不读这个开关：关掉它，它照样往下走 —— 要是它遵守开关，
+  // 就会在这里因为"没开自动发布"提前短路，而不是继续去解析绑定。
+  const drained = drainProject({ root: dir, claudeSessionId: null, dryRun: true });
+  assert.notEqual(drained.status, "empty", "有待发事件时不该报空");
+  assert.doesNotMatch(String(drained.reason ?? ""), /auto_publish|publish_disabled/u,
+    "兜底排空没有因为发布开关而停下 —— status 的措辞就是照着这个事实写的");
+
+  // 两条自动路径读它 —— 用源码里那两处判断的存在来定位，
+  // 但断言的是"它们各自的判断条件里确实有这个字段"，不是"文件里提到过"。
+  for (const rel of ["inbound.mjs", "watch-and-publish.mjs"]) {
+    const src = fs.readFileSync(path.resolve("scripts", rel), "utf-8");
+    assert.match(src, /auto_publish_on_completion !== false/u,
+      rel + " 应当读取发布开关");
+  }
+  const drainSrc = fs.readFileSync(path.resolve("scripts", "drain-outbox.mjs"), "utf-8");
+  assert.doesNotMatch(drainSrc, /auto_publish_on_completion/u,
+    "兜底排空目前不读这个开关 —— 改了它就要同时改 status 的措辞");
+  assert.equal(session.length, 36);
 });
 
 test("绑定名称不冒充飞书当前话题标题", () => {

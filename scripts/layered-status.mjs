@@ -231,11 +231,15 @@ export function composeLayeredStatus({
     const max = Number.isInteger(st.activeGenerationThreshold) ? st.activeGenerationThreshold : 30;
     L4.push(["自动轮转", used + " / " + max + " 条（还剩 " + Math.max(0, max - used) + " 条）"]);
   }
-  // **不许无条件声称"每轮自动发布"。**配置里明确关掉时也照样这么显示，是在报一个
-  // 没查过的结论；读不到配置时更不能默认成开启。
+  // **不许无条件声称"每轮自动发布"**，也不许说得比实际行为满。
+  //
+  // auto_publish_on_completion 只管住 inbound.mjs 和 watch-and-publish.mjs 两条
+  // 自动路径；兜底排空 drain-outbox.mjs 根本不读它。所以关掉它**不等于**消息
+  // 留在本地 —— 说成"仅入队"是在承诺一件这个开关做不到的事。
+  // 这个落差是真实缺口，已记入需求文档；改发布行为是另一件事，不在状态展示里顺手做。
   L4.push(["出站发布", st.suspended ? "暂停中，进展留在本地不发出"
     : st.autoPublish === true ? "每轮自动发布"
-    : st.autoPublish === false ? "仅入队，未启用自动发布"
+    : st.autoPublish === false ? "每轮完成时不自动发布（兜底排空仍会发出）"
     : "状态不可用（读不到发布配置）"]);
 
   const L5 = [["待发布答复", st.pending + " 条" + (st.pending && st.suspended ? "（恢复后会发出）" : "")]];

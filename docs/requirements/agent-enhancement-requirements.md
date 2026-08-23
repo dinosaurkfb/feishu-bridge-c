@@ -211,7 +211,7 @@ Relay 必须显式使用新的 policy version；其预算分别统计 human cycl
 
 | 动作 | 建议命令 | 作用 |
 |---|---|---|
-| 检查端点 | `$feishu-connect` | 安装、恢复或只读检查 endpoint |
+| 检查端点 | ~~`$feishu-connect`~~ **不做** | 2026-08-24 由 Frank 否掉：Aily 侧的连接是**被动**的 —— 把第三方智能体加进来它就存在，本机没有任何东西能「发起」它，所以 connect 是个误导性动词。它真正要管的本机那一半已经各有归属：「安装、恢复」是 `install-outbound.mjs`（还更完整，管技能、launchd、预览放行），「只读检查」就是 **FR-1.4 端点自检**，那才是真缺的 |
 | 管理订阅 | `$feishu-subscribe` | 配置项目、群、Agent、sender 和事件范围 |
 | 绑定通道 | `$feishu-bind` | 将当前精确本地 target 绑定到话题 |
 | 设置策略 | `$feishu-mode` | 查看或修改当前通道的交互策略 |

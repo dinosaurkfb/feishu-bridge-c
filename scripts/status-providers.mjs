@@ -27,11 +27,26 @@ export const PROVIDER_PROTOCOL = "feishu-bridge-status/v1";
 
 /** 受控枚举。provider 报了别的值就整条拒 —— 自由文本进不来。 */
 export const PROVIDER_KINDS = ["transport", "progress"];
+
+/**
+ * 一条连接**属于四层里的哪一层**。
+ *
+ * 上一版只有 kind 和 scope，判不出一条连接是订阅、绑定还是策略，所以全部挂在
+ * 「本项目的其他链路（尚未分层）」附录里。硬按 kind=transport 归到第 2 层，
+ * 就是替它声明了它没声明的东西。
+ *
+ * 跟 kind 一样受**两层约束**：登记时由人声明 allowed_relations，provider 给每条
+ * 连接标注实际 relation_type，聚合方只接受声明集合内的值。没声明就没有能力 ——
+ * 于是老的登记（没有这个字段）行为完全不变，仍然进附录。
+ */
+export const CONNECTION_RELATIONS = ["subscription", "binding", "policy"];
 export const CONNECTION_STATES = ["active", "suspended", "expired", "unknown"];
 export const CONNECTION_SCOPES = ["chat", "topic", "project"];
 
 /** 渲染用的字段就这些，都是人读的名字。additionalProperties 一律拒。 */
-const CONNECTION_KEYS = new Set(["kind", "state", "scope", "group_name", "topic_name"]);
+const CONNECTION_KEYS = new Set([
+  "kind", "state", "scope", "group_name", "topic_name", "relation_type",
+]);
 const REPORT_KEYS = new Set(["schema_version", "provider_id", "connections"]);
 
 const NAME_MAX = 60;
@@ -104,6 +119,12 @@ export function validateProviderRegistry(doc) {
         p.allowed_kinds.some((k) => !PROVIDER_KINDS.includes(k))) {
       return bad("allowed_kinds_invalid");
     }
+    // 没声明就是没有能力：老登记不带这个字段，行为完全不变（连接仍进附录）。
+    if (p.allowed_relations !== undefined &&
+        (!Array.isArray(p.allowed_relations) || p.allowed_relations.length === 0 ||
+         p.allowed_relations.some((r) => !CONNECTION_RELATIONS.includes(r)))) {
+      return bad("allowed_relations_invalid");
+    }
     if (p.enabled !== undefined && typeof p.enabled !== "boolean") return bad("enabled_not_boolean");
     // 哪个项目的链路。status 只看当前项目 —— 没有它就归不了属，
     // 归不了属的 provider 不进项目视图（那是 doctor 该管的机器级问题）。
@@ -122,6 +143,7 @@ export function validateProviderRegistry(doc) {
       script: p.script,
       args: p.args ?? [],
       allowedKinds: [...p.allowed_kinds],
+      allowedRelations: Array.isArray(p.allowed_relations) ? [...p.allowed_relations] : [],
       enabled: p.enabled !== false,
       projectRoot: p.project_root ?? null,
     });
@@ -151,7 +173,7 @@ export function loadStatusProviders(file = statusProvidersPath()) {
  * 自由文本一旦直接展示，本命令「不打印 locator」那条承诺就没法兑现 ——
  * 那是我这边的承诺，不能指望每个接入方替我守。
  */
-export function validateProviderReport(text, { providerId, allowedKinds }) {
+export function validateProviderReport(text, { providerId, allowedKinds, allowedRelations = [] }) {
   let doc;
   try { doc = JSON.parse(text); } catch { return { ok: false, reason: "report_not_json" }; }
   if (!isPlainObject(doc)) return { ok: false, reason: "report_not_object" };
@@ -179,13 +201,25 @@ export function validateProviderReport(text, { providerId, allowedKinds }) {
     if (!allowedKinds.includes(c.kind)) return { ok: false, reason: "connection_kind_not_allowed" };
     if (!CONNECTION_STATES.includes(c.state)) return { ok: false, reason: "connection_state_invalid" };
     if (!CONNECTION_SCOPES.includes(c.scope)) return { ok: false, reason: "connection_scope_invalid" };
+    if (c.relation_type !== undefined) {
+      if (!CONNECTION_RELATIONS.includes(c.relation_type)) {
+        return { ok: false, reason: "connection_relation_invalid" };
+      }
+      // provider 不能自己给自己发许可 —— 跟 kind 那条同理。
+      if (!allowedRelations.includes(c.relation_type)) {
+        return { ok: false, reason: "connection_relation_not_allowed" };
+      }
+    }
     const group = cleanName(c.group_name);
     if (group === null) return { ok: false, reason: "connection_group_name_invalid" };
     const topic = c.topic_name === undefined ? null : cleanName(c.topic_name);
     if (c.topic_name !== undefined && topic === null) {
       return { ok: false, reason: "connection_topic_name_invalid" };
     }
-    connections.push({ kind: c.kind, state: c.state, scope: c.scope, groupName: group, topicName: topic });
+    connections.push({
+      kind: c.kind, state: c.state, scope: c.scope, groupName: group, topicName: topic,
+      relation: c.relation_type ?? null,
+    });
   }
   return { ok: true, connections };
 }
@@ -226,6 +260,7 @@ export function runStatusProvider(provider, { exec = execFileSync } = {}) {
   }
   return validateProviderReport(String(stdout), {
     providerId: provider.id, allowedKinds: provider.allowedKinds,
+    allowedRelations: provider.allowedRelations ?? [],
   });
 }
 

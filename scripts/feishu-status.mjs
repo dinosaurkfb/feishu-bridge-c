@@ -21,7 +21,9 @@ import { bindingsForRoot, currentBinding } from "./feishu-control.mjs";
 import { buildClaudeSubscriptionProjection } from "./inbound-route.mjs";
 import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { checkEndpoint } from "./endpoint-self-check.mjs";
-import { composeLayeredStatus, endpointFacts, renderLayeredStatus, subscriptionFacts } from "./layered-status.mjs";
+import {
+  composeLayeredStatus, endpointFacts, renderLayeredStatus, splitByRelation, subscriptionFacts,
+} from "./layered-status.mjs";
 import { collectProjectConnectivity, renderConnectivity } from "./status-providers.mjs";
 
 const arg = (n) => {
@@ -39,7 +41,10 @@ const tpl = loaded?.ok ? (loaded.template ?? loaded) : null;
 
 // 只看当前项目的链路。整台机器的全景归后续的 doctor 命令。
 const projectLinks = collectProjectConnectivity({ root });
-const layeredConnectivity = renderConnectivity(projectLinks, { heading: null });
+// 附录只放归不了层的那部分 —— 能归层的已经进了对应层，再出现一次就是重复。
+const unsorted = splitByRelation(projectLinks.sections).unsorted;
+const layeredConnectivity = renderConnectivity(
+  { ...projectLinks, sections: unsorted }, { heading: null });
 
 console.log(renderLayeredStatus(composeLayeredStatus({
   st,
@@ -52,5 +57,6 @@ console.log(renderLayeredStatus(composeLayeredStatus({
   subscription: subscriptionFacts(buildClaudeSubscriptionProjection({ projectRoot: root }),
     { groupName: tpl?.chat_name ?? null }),
   connectivity: layeredConnectivity,
+  otherLinks: projectLinks,
 })));
 process.exit(0);

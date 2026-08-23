@@ -12,7 +12,8 @@
  * 聚合方那边虽然也拦（未知字段整条拒），但拦截是最后一道，不是唯一一道。
  *
  * 用法：
- *   node scripts/group-binding-status.mjs --provider-id cc2cd --binding /abs/binding.json
+ *   node scripts/group-binding-status.mjs --provider-id cc2cd --binding /abs/binding.json \
+ *     [--relation subscription]
  */
 
 import fs from "node:fs";
@@ -21,9 +22,32 @@ import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
 import { PROVIDER_PROTOCOL } from "./status-providers.mjs";
 
-function arg(name) {
-  const i = process.argv.indexOf("--" + name);
-  return i >= 0 ? process.argv[i + 1] : undefined;
+/**
+ * 严格白名单解析。**拼错的参数不许静默退化。**
+ *
+ * `--relaton subscription` 要是被忽略，这条链路就悄悄退回"未分层"，
+ * 而人以为自己已经声明过了 —— **沉默的降级比报错难查得多**。
+ */
+const OPTIONS = new Set(["provider-id", "binding", "relation"]);
+
+function parseArgs(tokens) {
+  const seen = new Map();
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i];
+    if (typeof t !== "string" || !t.startsWith("--")) {
+      return { ok: false, reason: "unexpected_argument", detail: t };
+    }
+    const name = t.slice(2);
+    if (seen.has(name)) return { ok: false, reason: "duplicate_option", detail: t };
+    if (!OPTIONS.has(name)) return { ok: false, reason: "unknown_option", detail: t };
+    const value = tokens[i + 1];
+    if (typeof value !== "string" || value.startsWith("--")) {
+      return { ok: false, reason: "option_needs_value", detail: t };
+    }
+    seen.set(name, value);
+    i += 1;
+  }
+  return { ok: true, seen };
 }
 
 /**
@@ -33,7 +57,7 @@ function arg(name) {
  * 但**解释不了的内容**（文件在、却不是一份能读懂的绑定）要报错，让聚合方
  * 显示"状态取不到"，而不是显示"没有绑定" —— 后者是在替它下一个它不该下的结论。
  */
-export function bindingToConnections(doc, { now = Date.now() } = {}) {
+export function bindingToConnections(doc, { now = Date.now(), relation = null } = {}) {
   if (doc === null) return { ok: true, connections: [] };
   if (typeof doc !== "object" || Array.isArray(doc)) return { ok: false, reason: "binding_shape_unexpected" };
   if (doc.bind_scope !== "chat") return { ok: false, reason: "binding_shape_unexpected" };
@@ -57,7 +81,14 @@ export function bindingToConnections(doc, { now = Date.now() } = {}) {
 
   // scope 报 chat：话题是对账出来的，没有预先登记的话题名可报，
   // 而 sessions 里那些 thread_id 是 locator，不能出现在状态里。
-  return { ok: true, connections: [{ kind: "transport", state, scope: "chat", group_name: groupName }] };
+  //
+  // relation_type 由调用方用 --relation 指定，**不默认**：群级绑定按语义属于
+  // 第 2 层事件订阅（它决定群里的新话题进哪个域），但那是登记这条链路的人该确认的事，
+  // 不该由这个脚本替它断言。不指定就不带这个字段，连接进"尚未分层"附录。
+  return { ok: true, connections: [{
+    kind: "transport", state, scope: "chat", group_name: groupName,
+    ...(relation ? { relation_type: relation } : {}),
+  }] };
 }
 
 function readBinding(file) {
@@ -73,8 +104,14 @@ function readBinding(file) {
 }
 
 function main() {
-  const providerId = arg("provider-id");
-  const binding = arg("binding");
+  const parsed = parseArgs(process.argv.slice(2));
+  if (!parsed.ok) {
+    console.error(parsed.reason + (parsed.detail ? "：" + parsed.detail : ""));
+    process.exit(2);
+  }
+  const providerId = parsed.seen.get("provider-id");
+  const binding = parsed.seen.get("binding");
+  const relation = parsed.seen.get("relation") ?? null;
   if (!providerId || !binding || !path.isAbsolute(binding)) {
     console.error("用法：node scripts/group-binding-status.mjs --provider-id <id> --binding <绝对路径>");
     process.exit(2);
@@ -86,7 +123,7 @@ function main() {
     console.error(read.reason);
     process.exit(1);
   }
-  const got = bindingToConnections(read.doc);
+  const got = bindingToConnections(read.doc, { relation });
   if (!got.ok) {
     console.error(got.reason);
     process.exit(1);

@@ -47,6 +47,36 @@ export function runtimeScript(name, home = os.homedir()) {
 
 const sha256 = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 
+const HASH_RE = /^[0-9a-f]{64}$/u;
+
+/** 相对、规范、不含 `..` —— 清单里的路径会被直接拼进文件系统操作，不能是任意字符串。 */
+const safeRelPath = (value) => typeof value === "string" && value.length > 0 &&
+  !path.isAbsolute(value) && path.normalize(value) === value &&
+  !value.split("/").includes("..");
+
+/**
+ * 由文件清单**重算**版本号。plan 与 verify 必须共用这一个函数。
+ *
+ * 这是让清单自证的关键。此前 verify 只校验"清单里列出的那些文件"，于是把某个条目从
+ * 清单里删掉、同时删掉对应文件，verify 照样报 ok —— 线上实际已经缺文件。
+ * 现在版本号由清单内容派生，改清单就会改版本号，而版本号还要等于目录名，改不动。
+ *
+ * 顺带把清单的形状一起钉死：路径安全且唯一、顺序规范、哈希格式合法。任何一条不满足
+ * 就返回 null（= 这份清单不可信），而不是勉强算出一个数。
+ */
+export function versionFromFiles(files) {
+  if (!Array.isArray(files) || files.length === 0) return null;
+  const paths = [];
+  for (const file of files) {
+    if (!safeRelPath(file?.path) || !HASH_RE.test(file?.sha256 ?? "")) return null;
+    paths.push(file.path);
+  }
+  if (new Set(paths).size !== paths.length) return null;
+  const sorted = [...paths].sort();
+  if (paths.some((value, i) => value !== sorted[i])) return null;
+  return sha256(files.map((f) => f.path + ":" + f.sha256).join("\n")).slice(0, 16);
+}
+
 /**
  * 运行时需要哪些文件。
  *
@@ -91,7 +121,8 @@ export function planRuntimeSync({ sourceRoot, home = os.homedir() } = {}) {
   if (typeof sourceRoot !== "string" || !path.isAbsolute(sourceRoot)) {
     return { ok: false, reason: "source_root_invalid" };
   }
-  const relPaths = collectRuntimeFiles(sourceRoot);
+  // 排序后再算：版本号必须只由"哪些文件、内容是什么"决定，不受目录遍历顺序影响。
+  const relPaths = collectRuntimeFiles(sourceRoot).sort();
   if (relPaths.length === 0) return { ok: false, reason: "source_empty" };
 
   const files = [];
@@ -102,7 +133,8 @@ export function planRuntimeSync({ sourceRoot, home = os.homedir() } = {}) {
     files.push({ path: rel, sha256: sha256(content) });
   }
   // 版本号由内容决定：同样的源码算出同样的版本，重复安装就是无操作。
-  const version = sha256(files.map((f) => f.path + ":" + f.sha256).join("\n")).slice(0, 16);
+  const version = versionFromFiles(files);
+  if (!version) return { ok: false, reason: "file_list_invalid" };
   const root = runtimeRoot(home);
   const current = verifyRuntime({ home });
   return {
@@ -202,7 +234,7 @@ export function applyRuntimeSync(plan, { home = os.homedir() } = {}) {
         files: plan.files,
       }, null, 2) + "\n");
 
-      const staged = verifyVersionDir(staging, plan.files);
+      const staged = verifyVersionDir(staging, plan.files, { checkDirName: false });
       if (!staged.ok) {
         fs.rmSync(staging, { recursive: true, force: true });
         return { ok: false, reason: "staging_verify_failed", detail: staged };
@@ -232,18 +264,10 @@ export function applyRuntimeSync(plan, { home = os.homedir() } = {}) {
     fs.symlinkSync(path.join("versions", plan.version), linkTmp);
     fs.renameSync(linkTmp, link);
 
-    // 到这里已经**提交**了：current 指向一个完整且自校验通过的版本，线上就是这份代码。
-    // 根指针只是"当前指向谁"的便利记录，真相在版本目录内部那份清单里。所以它写失败
-    // **不能**报成安装失败 —— 那会给出"apply=false 但新版本已经在线"这种最误导人的结论。
-    let pointerWarning = null;
-    try {
-      writeAtomic(path.join(root, MANIFEST_NAME), JSON.stringify({
-        schema_version: "1.0", version: plan.version, updated_at: new Date().toISOString(),
-      }, null, 2) + "\n");
-    } catch (err) {
-      pointerWarning = String(err?.message ?? err).slice(0, 200);
-    }
-    return { ok: true, version: plan.version, versionDir, pointerWarning };
+    // 到这里就**提交完了**。刻意不再往根目录写一份"当前指向谁"的指针：
+    // 它没有消费者，却凭空多出一份可能与 current 不一致的真相，还要为它单独处理
+    // "写失败算不算安装失败"。current 这个符号链接本身就是唯一的、原子的答案。
+    return { ok: true, version: plan.version, versionDir };
   } catch (err) {
     return { ok: false, reason: "apply_failed", error: String(err?.message ?? err).slice(0, 200) };
   } finally {
@@ -251,17 +275,33 @@ export function applyRuntimeSync(plan, { home = os.homedir() } = {}) {
   }
 }
 
-/** 一个版本目录是不是完整且逐文件对得上它自己的清单。 */
-function verifyVersionDir(dir, expectedFiles) {
+/**
+ * 一个版本目录是不是完整、且它自己的清单可信。
+ *
+ * "可信"是重点：清单不能只被当成一份待核对的列表，它本身也要被核对。做法是从清单
+ * 重算版本号，要求等于清单声明的 version，也等于目录名 —— 于是删条目、改哈希、
+ * 换顺序都会让版本号对不上，改不动。
+ */
+function verifyVersionDir(dir, expectedFiles, { checkDirName = true } = {}) {
   let manifest;
   try { manifest = JSON.parse(fs.readFileSync(path.join(dir, MANIFEST_NAME), "utf-8")); }
   catch { return { ok: false, reason: "manifest_absent" }; }
   const files = Array.isArray(manifest?.files) ? manifest.files : null;
   if (!files) return { ok: false, reason: "manifest_invalid" };
-  if (expectedFiles && (files.length !== expectedFiles.length ||
-      files.some((f, i) => f.path !== expectedFiles[i].path || f.sha256 !== expectedFiles[i].sha256))) {
-    return { ok: false, reason: "manifest_mismatch" };
+
+  const recomputed = versionFromFiles(files);
+  if (!recomputed) return { ok: false, reason: "file_list_invalid", manifest };
+  if (recomputed !== manifest.version) {
+    return { ok: false, reason: "manifest_version_mismatch", manifest };
   }
+  // staging 目录还没提升，名字是 .staging-<version>.<pid>，这一条只对已提升的版本目录成立。
+  if (checkDirName && recomputed !== path.basename(dir)) {
+    return { ok: false, reason: "version_dir_name_mismatch", manifest };
+  }
+  if (expectedFiles && recomputed !== versionFromFiles(expectedFiles)) {
+    return { ok: false, reason: "plan_version_mismatch", manifest };
+  }
+
   const drifted = [];
   const missing = [];
   for (const file of files) {
@@ -299,6 +339,9 @@ export function verifyRuntime({ home = os.homedir() } = {}) {
   const linkOk = linkTarget === path.join("versions", version);
   return {
     ok: linkOk && checked.ok,
+    // 失败原因要传出去。这套东西的失败本来就安静，再吞掉原因就只剩"坏了"两个字，
+    // 而"清单被改过"和"某个文件被手改"需要的处置完全不同。
+    reason: checked.ok ? (linkOk ? null : "current_link_mismatch") : checked.reason,
     version,
     sourceCommit: checked.manifest.source_commit ?? null,
     linkOk,

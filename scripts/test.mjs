@@ -33,6 +33,7 @@ import {
 import { drainProject, watcherActive } from "./drain-outbox.mjs";
 import {
   applyRuntimeSync, planRuntimeSync, runtimeRoot, runtimeScript, verifyRuntime,
+  versionFromFiles,
 } from "./runtime-install.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
 import {
@@ -4611,16 +4612,40 @@ test("运行时安装的三种故障：坏版本、提交后写指针失败、�
   assert.equal(repaired.ok, true);
   assert.equal(verifyRuntime({ home }).ok, true, "apply 报成功就必须真的可校验");
 
-  // ② 提交之后根指针写失败：current 已指向完整版本，线上就是这份代码，
-  //    不能报成"没装上" —— 那是最误导人的结论。
-  const home2 = fs.mkdtempSync(path.join(os.tmpdir(), "rt-fault2-"));
-  fs.mkdirSync(runtimeRoot(home2), { recursive: true });
-  fs.mkdirSync(path.join(runtimeRoot(home2), "INSTALLED.json"));  // 目录占位 → 写文件必失败
-  const p2 = planRuntimeSync({ sourceRoot: src, home: home2 });
-  const committed = applyRuntimeSync(p2, { home: home2 });
-  assert.equal(committed.ok, true, "提交点已过，根指针失败不算安装失败");
-  assert.ok(committed.pointerWarning, "但必须把这件事说出来");
+  // ② 清单必须自证。把某个条目从清单里删掉、同时删掉文件，此前 verify 照报 ok ——
+  //    因为它只校验"清单里列出的那些"。现在版本号由清单内容重算，改清单就对不上目录名。
+  const home2 = fs.mkdtempSync(path.join(os.tmpdir(), "rt-tamper-"));
+  const src2 = fs.mkdtempSync(path.join(os.tmpdir(), "rt-tamper-src-"));
+  fs.mkdirSync(path.join(src2, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(src2, "scripts", "a.mjs"), "export const a = 1;\n");
+  fs.writeFileSync(path.join(src2, "scripts", "b.mjs"), "export const b = 2;\n");
+  const p2 = planRuntimeSync({ sourceRoot: src2, home: home2 });
+  assert.equal(applyRuntimeSync(p2, { home: home2 }).ok, true);
   assert.equal(verifyRuntime({ home: home2 }).ok, true);
+
+  const dir2 = path.join(runtimeRoot(home2), "versions", p2.version);
+  const manifestPath = path.join(dir2, "INSTALLED.json");
+  const tampered = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+  tampered.files = tampered.files.filter((f) => !f.path.endsWith("b.mjs"));
+  fs.writeFileSync(manifestPath, JSON.stringify(tampered, null, 2) + "\n");
+  fs.rmSync(path.join(dir2, "scripts", "b.mjs"));
+  const tamperedCheck = verifyRuntime({ home: home2 });
+  assert.equal(tamperedCheck.ok, false,
+    "删清单条目 + 删文件之后必须能发现 —— 否则线上缺文件而校验报绿");
+
+  // 版本号也不能靠改 manifest.version 圆回来：它还要等于目录名。
+  const forged = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+  forged.version = versionFromFiles(forged.files);
+  fs.writeFileSync(manifestPath, JSON.stringify(forged, null, 2) + "\n");
+  assert.equal(verifyRuntime({ home: home2 }).ok, false, "改版本号会对不上目录名");
+
+  // 形状不合法的清单一律不可信，而不是勉强算出一个版本号。
+  assert.equal(versionFromFiles([{ path: "../escape.mjs", sha256: "a".repeat(64) }]), null);
+  assert.equal(versionFromFiles([{ path: "scripts/a.mjs", sha256: "nothex" }]), null);
+  assert.equal(versionFromFiles([
+    { path: "scripts/b.mjs", sha256: "a".repeat(64) },
+    { path: "scripts/a.mjs", sha256: "b".repeat(64) },
+  ]), null, "顺序不规范也不可信");
 
   // ③ 提交前三方一致：版本目录里的清单版本、目录名、计划版本必须逐字相同。
   const installer = fs.readFileSync(path.resolve("scripts", "runtime-install.mjs"), "utf-8");
@@ -4628,6 +4653,8 @@ test("运行时安装的三种故障：坏版本、提交后写指针失败、�
   assert.match(installer, /path\.basename\(versionDir\) !== plan\.version/u);
   assert.doesNotMatch(installer, /export function readRuntimeManifest/u,
     "与新根指针 schema 不兼容的读取函数应移除，留着只会误导");
+  // 根指针已删：它没有消费者，却凭空多出一份可能与 current 不一致的真相。
+  assert.doesNotMatch(installer, /writeAtomic\(path\.join\(root, MANIFEST_NAME\)/u);
 });
 
 test("运行时校验能发现被手改的脚本和被指歪的链接", () => {

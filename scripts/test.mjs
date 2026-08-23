@@ -6214,6 +6214,73 @@ test("崩溃回执：日志没写成就不给引用码", () => {
   }
 });
 
+test("安装不登记项目，也不改动既有登记表", () => {
+  // 安装是"装基础设施"，项目登记是"订阅"。混在一起有三个真实后果：
+  //   从哪个目录跑一次安装，那个目录就被当成已接入项目（本机登记表里就有两条
+  //   这样的产物，只有 id/root/note、没有任何绑定字段，来自两个开发克隆）；
+  //   --uninstall 会把那条删掉 —— 删的是一条**绑定**，而绑定牵着话题历史；
+  //   迁到 runtime 之后更别扭：代码已不在开发克隆里跑，却还在把它写进登记表。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "registry-decouple-"));
+  const home = path.join(base, "home");
+  fs.mkdirSync(path.join(home, ".claude", "feishu-bridge"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  const registryFile = path.join(home, ".claude", "feishu-bridge", "registry.json");
+  const original = JSON.stringify({
+    schema_version: "1.0",
+    projects: [{ id: "someproj", root: "/tmp/someproj", root_message_id: "om_keep", session_id: "s1" }],
+  }) + "\n";
+  fs.writeFileSync(registryFile, original);
+
+  const run = (extra) => execFileSync(process.execPath,
+    [path.resolve("scripts", "install-outbound.mjs"), ...extra],
+    { encoding: "utf-8", env: { ...process.env, HOME: home } });
+
+  run(["--apply"]);
+  assert.equal(fs.readFileSync(registryFile, "utf-8"), original,
+    "安装不得改动登记表 —— 连重写一遍都不行，那是拿绑定数据当赌注");
+
+  run(["--uninstall", "--apply"]);
+  assert.equal(fs.readFileSync(registryFile, "utf-8"), original,
+    "卸载基础设施不得删除绑定 —— 绑定牵着话题历史，删了历史就成孤儿");
+
+  // 登记表缺失时只创建一份空的，不塞入本目录。
+  fs.rmSync(registryFile);
+  run(["--apply"]);
+  const created = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
+  assert.deepEqual(created.projects, [], "首次安装只建空表，不登记任何项目");
+
+  // **并发方抢先建表时不得覆盖。**上一版是 if (!existsSync) 再写 —— 典型的
+  // check-then-write：判定"不存在"到落盘之间若绑定流程刚建好表并写进第一条绑定，
+  // 那次 rename 会把它整份覆盖成空表。改用 wx 排他创建后这条是确定性的：
+  // 文件已存在必然 EEXIST，不存在竞争窗口。
+  const raced = JSON.stringify({
+    schema_version: "1.0",
+    projects: [{ id: "raced", root: "/tmp/raced", root_message_id: "om_raced" }],
+  }) + "\n";
+  fs.writeFileSync(registryFile, raced);
+  run(["--apply"]);
+  assert.equal(fs.readFileSync(registryFile, "utf-8"), raced,
+    "并发方已建表时，安装器不得覆盖其任何字节");
+
+  // 卸载不得创建订阅状态。
+  fs.rmSync(registryFile);
+  run(["--uninstall", "--apply"]);
+  assert.equal(fs.existsSync(registryFile), false,
+    "卸载基础设施不该凭空造出一份登记表");
+
+  const installerSrc = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  assert.doesNotMatch(installerSrc, /if \(!fs\.existsSync\(REGISTRY\)\)/u,
+    "不得再用 check-then-write 创建登记表");
+  assert.match(installerSrc, /flag: "wx"/u, "必须用排他创建");
+
+  // 提示要有，但只能是提示 —— 不能替人做订阅决定。
+  assert.match(run([]), /显式运行 \/feishu-bind/u, "未绑定时要提示怎么接入");
+
+  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  assert.doesNotMatch(src, /registry\.projects\.push\(/u, "安装器不得再往登记表塞条目");
+  assert.doesNotMatch(src, /registry\.projects\.splice\(/u, "安装器不得再从登记表删条目");
+});
+
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (failed > 0) {

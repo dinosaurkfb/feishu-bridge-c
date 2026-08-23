@@ -77,7 +77,11 @@ function writeDoc(doc, file) {
   fs.renameSync(tmp, file);
 }
 
-/** 比较用的规范形。字段顺序不该影响"是不是同一条登记"。 */
+/**
+ * 比较用的规范形。字段顺序不该影响"是不是同一条登记"，
+ * 而**语义默认值也要算进来** —— enabled 缺省是 true，漏掉它就会出现
+ * "重登记一条已停用的项，报无变化，而它仍然停用"。
+ */
 function normalize(entry) {
   return {
     id: entry.id, protocol: entry.protocol,
@@ -85,19 +89,83 @@ function normalize(entry) {
     args: [...(entry.args ?? [])],
     allowed_kinds: [...(entry.allowed_kinds ?? [])].sort(),
     display_name: entry.display_name ?? null,
+    enabled: entry.enabled !== false,
   };
 }
 
-/** 说清是哪几处不同 —— 只报字段名，不回显值（值里可能有路径和参数）。 */
-function diff(a, b) {
+/** 哪几处不同 —— 只报字段名，不回显值（值里有路径和参数）。 */
+function differingFields(a, b) {
   const x = normalize(a); const y = normalize(b);
-  return Object.keys(x)
-    .filter((k) => JSON.stringify(x[k]) !== JSON.stringify(y[k]))
-    .join("、");
+  return Object.keys(x).filter((k) => JSON.stringify(x[k]) !== JSON.stringify(y[k]));
 }
+
+/**
+ * 算出这次登记会发生什么。**预览和落盘共用它。**
+ *
+ * 上一版预览在读登记表**之前**就返回了，于是"登记表损坏""配置冲突"都要等到
+ * --apply 才暴露 —— 一个不读真实状态的预览，报的"没问题"不是从状态得出的，
+ * 那就不是预览，是安慰。
+ */
+export function planRegistration({ file, entry, mode = "add", readFile = readDoc }) {
+  const read = readFile(file);
+  if (!read.ok) return { action: "registry_unreadable", reason: read.reason };
+  const doc = read.doc ?? { schema_version: "1.0", providers: [] };
+  if (!Array.isArray(doc.providers)) {
+    return { action: "registry_invalid", reason: "status_providers_shape_unexpected" };
+  }
+  const whole = validateProviderRegistry(doc);
+  if (!whole.ok) return { action: "registry_invalid", reason: whole.problem };
+
+  const at = doc.providers.findIndex((x) => x && x.id === entry.id);
+  const existing = at >= 0 ? doc.providers[at] : null;
+
+  if (mode === "unregister") {
+    return existing ? { action: "remove", doc, at } : { action: "absent", doc };
+  }
+  if (!existing) {
+    return mode === "replace" ? { action: "absent", doc } : { action: "add", doc };
+  }
+  const fields = differingFields(existing, entry);
+  if (fields.length === 0) return { action: "unchanged", doc };
+  if (mode === "replace") return { action: "replace", doc, at, fields };
+  // 换脚本单独给个理由：那是**别人的脚本来报这条链路的状态**，
+  // 比"参数变了"严重得多，不该并进通用冲突里一笔带过。
+  return {
+    action: "conflict", doc, at, fields,
+    reason: fields.includes("script")
+      ? "provider_exists_with_other_script"
+      : "provider_exists_with_other_settings",
+  };
+}
+
+const PLAN_TEXT = {
+  add: "将新增这条登记",
+  unchanged: "已存在且完全相同，不会改动",
+  replace: "将替换已有登记，变化字段：",
+  conflict: "已存在同 id 且配置不同，变化字段：",
+  remove: "将注销这条登记",
+  absent: "登记表里没有这个 id",
+  registry_unreadable: "登记表读不出来 —— 先修表，别覆盖它",
+  registry_invalid: "登记表结构异常 —— 先修表，别覆盖它",
+};
+
+function describePlan(plan) {
+  const base = PLAN_TEXT[plan.action] ?? plan.action;
+  if (plan.action === "replace" || plan.action === "conflict") return base + plan.fields.join("、");
+  if (plan.action === "registry_unreadable" || plan.action === "registry_invalid") {
+    return base + "（" + plan.reason + "）";
+  }
+  return base;
+}
+
+/** 预览也要如实反映失败：报"没问题"却在 --apply 时才炸，等于预览撒谎。 */
+const PLAN_FAILS = new Set(["registry_unreadable", "registry_invalid", "conflict"]);
 
 function main() {
   const apply = CONTROL.includes("--apply");
+  const replace = CONTROL.includes("--replace");
+  const unregister = CONTROL.includes("--unregister");
+  const mode = unregister ? "unregister" : (replace ? "replace" : "add");
   const id = arg("id");
   const script = arg("script");
   const executable = arg("executable") ?? process.execPath;
@@ -105,37 +173,58 @@ function main() {
   const displayName = arg("display-name");
   const file = statusProvidersPath();
 
-  if (!id || !script) {
-    console.error("用法：node scripts/register-status-provider.mjs --id <id> --script <绝对路径> " +
-      "[--executable <绝对路径>] [--kinds transport,progress] [--display-name <名字>] " +
-      "[--apply] [-- <传给 provider 的参数...>]");
+  if (!id || (!script && !unregister)) {
+    console.error("用法：node scripts/register-status-provider.mjs --id <id> --script <绝对路径>\n" +
+      "        [--executable <绝对路径>] [--kinds transport,progress] [--display-name <名字>]\n" +
+      "        [--replace] [--apply] [-- <传给 provider 的参数...>]\n" +
+      "      注销：--id <id> --unregister [--apply]");
     process.exit(2);
   }
 
-  const entry = {
+  const entry = unregister ? { id } : {
     id, protocol: PROVIDER_PROTOCOL, executable, script,
     args: PASSTHROUGH, allowed_kinds: kinds,
     ...(displayName ? { display_name: displayName } : {}),
   };
 
-  // 先用真正的校验器过一遍：登记命令和读取路径必须共用同一套规则，
-  // 否则会出现"登记时说合法、读取时又说不合法"。
-  const shaped = validateProviderRegistry({ providers: [entry] });
-  if (!shaped.ok) fail(shaped.problem);
-  if (!fs.existsSync(script)) fail("script_missing", script);
-  if (!fs.statSync(script).isFile()) fail("script_not_a_file", script);
+  if (!unregister) {
+    // 登记命令和读取路径共用同一套规则，避免"登记时说合法、读取时又说不合法"。
+    const shaped = validateProviderRegistry({ providers: [entry] });
+    if (!shaped.ok) fail(shaped.problem);
+    if (!fs.existsSync(script)) fail("script_missing", script);
+    if (!fs.statSync(script).isFile()) fail("script_not_a_file", script);
+  }
+
+  // **先算计划再输出**：预览和落盘看的是同一份真实状态。
+  const plan = planRegistration({ file, entry, mode });
 
   console.log("登记表    " + file);
-  console.log("provider  " + id + " → " + script);
-  console.log("执行      " + executable);
-  console.log("参数      " + (entry.args.length > 0 ? entry.args.join(" ") : "（无）"));
-  console.log("授权范围  " + kinds.join(", "));
-  console.log("\n提醒：状态入口会在你的交互会话里执行上面这个命令。");
-  console.log("      它拿不到 AILY_CLI_* 和凭据（环境白名单只放 PATH/HOME/LANG/TZ），");
-  console.log("      但它仍然是一次代码执行 —— 确认这个脚本是你信任的。");
+  console.log("动作      " + (unregister ? "注销" : replace ? "替换" : "新增") + " · " + id);
+  if (!unregister) {
+    console.log("provider  " + id + " → " + script);
+    console.log("执行      " + executable);
+    console.log("参数      " + (entry.args.length > 0 ? entry.args.join(" ") : "（无）"));
+    console.log("授权范围  " + kinds.join(", "));
+  }
+  console.log("结果      " + describePlan(plan));
+
+  if (plan.action === "conflict") {
+    console.log("\n要改这条登记，用 --replace（同样默认预览）；要撤掉它，用 --unregister。");
+  }
+  if (!unregister && (plan.action === "add" || plan.action === "replace")) {
+    console.log("\n提醒：状态入口会在你的交互会话里执行上面这个命令。");
+    console.log("      它拿不到 AILY_CLI_* 和凭据（环境白名单只放 PATH/HOME/LANG/TZ），");
+    console.log("      但它仍然是一次代码执行 —— 确认这个脚本是你信任的。");
+  }
 
   if (!apply) {
     console.log("\n[dry-run] 什么都没写。加 --apply 才落盘。");
+    process.exit(PLAN_FAILS.has(plan.action) ? 1 : 0);
+  }
+  if (PLAN_FAILS.has(plan.action)) fail(plan.reason ?? "provider_exists_with_other_settings",
+    plan.fields ? plan.fields.join("、") : undefined);
+  if (plan.action === "unchanged" || plan.action === "absent") {
+    console.log("\n无需改动。");
     return;
   }
 
@@ -144,36 +233,25 @@ function main() {
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) fail("providers_busy");
   try {
-    // 取锁之后重读：锁外读到的那份跟要写的那份不是同一个快照。
-    const read = readDoc(file);
-    if (!read.ok) fail(read.reason);
-    const doc = read.doc ?? { schema_version: "1.0", providers: [] };
-    if (!Array.isArray(doc.providers)) fail("status_providers_shape_unexpected");
-
-    // 先验**整表**再谈幂等：否则一张结构损坏、但恰好 id/script 相同的表
-    // 会提前"成功"返回，而随后 loadStatusProviders 照样判它损坏 ——
-    // 登记说成了，读取说没有，那是最难查的一类不一致。
-    const whole = validateProviderRegistry(doc);
-    if (!whole.ok) fail(whole.problem);
-
-    const existing = doc.providers.find((x) => x && x.id === id);
-    if (existing) {
-      // 只比 script 会虚假宣称"无变化"：args、allowed_kinds、executable、
-      // display_name 改了也照样报成功，而文件里还是旧值。
-      const same = JSON.stringify(normalize(existing)) === JSON.stringify(normalize(entry));
-      if (same) {
-        console.log("\n已登记，无变化。");
-        return;
-      }
-      if (existing.script !== script) fail("provider_exists_with_other_script", existing.script);
-      fail("provider_exists_with_other_settings", diff(existing, entry));
+    // 取锁之后重算同一个计划：锁外那份跟要写的那份不是同一个快照。
+    const fresh = planRegistration({ file, entry, mode });
+    if (PLAN_FAILS.has(fresh.action)) {
+      fail(fresh.reason ?? "provider_exists_with_other_settings",
+        fresh.fields ? fresh.fields.join("、") : undefined);
     }
-    // 只往 providers 里加一项，不重建文档 —— 未知顶层字段原样保留。
-    doc.providers.push(entry);
-    const valid = validateProviderRegistry(doc);
+    if (fresh.action === "unchanged" || fresh.action === "absent") {
+      console.log("\n无需改动。");
+      return;
+    }
+    // 只动目标那一项，不重建文档 —— 未知顶层字段原样保留。
+    if (fresh.action === "add") fresh.doc.providers.push(entry);
+    else if (fresh.action === "replace") fresh.doc.providers[fresh.at] = entry;
+    else if (fresh.action === "remove") fresh.doc.providers.splice(fresh.at, 1);
+
+    const valid = validateProviderRegistry(fresh.doc);
     if (!valid.ok) fail(valid.problem);
-    writeDoc(doc, file);
-    console.log("\n已登记。");
+    writeDoc(fresh.doc, file);
+    console.log("\n" + (fresh.action === "remove" ? "已注销。" : "已写入。"));
   } finally {
     releasePublishLock(lockDir);
   }

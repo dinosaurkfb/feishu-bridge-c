@@ -33,7 +33,7 @@ import { handOff, acquireSessionLock, releaseSessionLock, stampSessionLock } fro
 import {
   DELIVERY_REJECT, DELIVERY_REJECT_TEXT,
   deliverToLiveSession, findLiveSessionById, findLiveSessions, hasPriorSession,
-  selectDeliverySession, stampInstruction,
+  readDeliveryPin, selectDeliverySession, stampInstruction, writeDeliveryPin,
 } from "./live-session.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
 import {
@@ -477,10 +477,18 @@ if (boundSession) {
   target = findLiveSessionById({ projectRoot: config.project_dir, claudeSessionId: boundSession });
 } else {
   const picked = selectDeliverySession({
-    pinned: null, live: findLiveSessions({ projectRoot: config.project_dir }),
+    pinned: readDeliveryPin(config.project_dir),
+    live: findLiveSessions({ projectRoot: config.project_dir }),
   });
-  if (picked.ok) target = picked.session;
-  else if (picked.reason === DELIVERY_REJECT.AMBIGUOUS) ambiguousDelivery = picked;
+  if (picked.ok) {
+    target = picked.session;
+    // 现场只有一条时顺手钉下来 —— 那一刻没有歧义，钉了下次才不用碰运气。
+    // 上一版**声明了这件事却没做**：生产路径固定传 pinned:null，也从不读 picked.pin，
+    // 于是"已钉会话"那条分支只活在单测里。
+    if (picked.pin) writeDeliveryPin(config.project_dir, picked.pin);
+  } else if (picked.reason === DELIVERY_REJECT.AMBIGUOUS) {
+    ambiguousDelivery = picked;
+  }
 }
 
 if (ambiguousDelivery) {

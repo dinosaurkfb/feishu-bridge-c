@@ -40,7 +40,7 @@ import {
 } from "./runtime-install.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
 import {
-  DELIVERY_REJECT, DELIVERY_REJECT_TEXT, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, selectDeliverySession, stampInstruction, transcriptDirFor,
+  DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliveryPinPath, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin,
 } from "./live-session.mjs";
 import { extractReply } from "./stop-hook.mjs";
 import {
@@ -7647,8 +7647,60 @@ test("投递会话说不清时拒收，不猜", () => {
   // 一条都没有是另一回事。
   assert.equal(selectDeliverySession({ pinned: "a", live: [] }).reason, DELIVERY_REJECT.NO_LIVE);
 
-  // 拒收理由要能直接告诉人怎么办，不能只丢一个错误码。
-  assert.match(DELIVERY_REJECT_TEXT[DELIVERY_REJECT.AMBIGUOUS], /feishu-bind/u);
+  // 拒收理由要指向一个**真的能做到那件事**的操作。上一版让人跑 /feishu-bind --apply，
+  // 而它要求单独输入、且是项目级；bind-session 又会新建话题 —— 都做不到
+  // "把现有项目级话题钉到这条会话"。提示指向做不到的操作，等于没有出路。
+  assert.match(DELIVERY_REJECT_TEXT[DELIVERY_REJECT.AMBIGUOUS], /feishu-pin-session\.mjs --apply/u);
+  assert.doesNotMatch(DELIVERY_REJECT_TEXT[DELIVERY_REJECT.AMBIGUOUS], /feishu-bind/u);
+});
+
+test("首选会话真的落盘、读得回、也撤得掉", () => {
+  // 上一版**声明了自动钉住却没做**：生产路径固定传 pinned:null，也从不读 picked.pin，
+  // 于是"已钉会话"那条分支只活在单测里。这条盯的是存取本身。
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pin-"));
+  assert.equal(readDeliveryPin(root), null, "没钉过就是 null");
+
+  assert.equal(writeDeliveryPin(root, "sess-a").ok, true);
+  assert.equal(readDeliveryPin(root), "sess-a");
+  assert.equal(fs.statSync(deliveryPinPath(root)).mode & 0o777, 0o600);
+
+  // 坏文件当作没钉过 —— 它只是个偏好，不该让入站停摆。
+  fs.writeFileSync(deliveryPinPath(root), "{ 坏掉的 json");
+  assert.equal(readDeliveryPin(root), null);
+  fs.writeFileSync(deliveryPinPath(root), JSON.stringify({ claude_session_id: 42 }));
+  assert.equal(readDeliveryPin(root), null, "形状不对也当没钉过");
+
+  assert.equal(writeDeliveryPin(root, "").ok, false);
+  assert.equal(clearDeliveryPin(root).ok, true);
+  assert.equal(readDeliveryPin(root), null);
+  assert.equal(clearDeliveryPin(root).ok, true, "本来就没有也算成功");
+});
+
+test("钉会话命令：默认预览，且不许替别的项目的会话钉", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pincmd-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P", task_display_name: "P",
+  }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_fixture", claude_session_id: null,
+    channel_generation_id: "gen-1",
+  }));
+  const run = (args, env) => spawnSync(process.execPath, [
+    path.resolve("scripts", "feishu-pin-session.mjs"), "--project", dir, ...args,
+  ], { encoding: "utf-8", env: { ...process.env, ...env } });
+
+  // 认不出自己就别猜。
+  const noSelf = run([], { CLAUDE_CODE_SESSION_ID: "" });
+  assert.notEqual(noSelf.status, 0);
+  assert.match(noSelf.stderr, /认不出这是哪条会话/u);
+
+  // 会话不在这个项目的现场里 → 拒。否则带 --project 从别处跑就能钉一条无关会话。
+  const foreign = run(["--apply"], { CLAUDE_CODE_SESSION_ID: "sess-foreign" });
+  assert.notEqual(foreign.status, 0);
+  assert.match(foreign.stderr, /不在该项目的现场记录里/u);
+  assert.equal(readDeliveryPin(dir), null, "拒绝时不得写盘");
 });
 
 summarySealed = true;

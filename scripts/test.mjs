@@ -7479,17 +7479,17 @@ test("出站发布按真实配置渲染，读不到不许默认成开启", () =>
   }));
   assert.match(render(true), /出站发布.*每轮自动发布/u);
   // 配置明确关掉时仍显示"每轮自动发布"，是在报一个没查过的结论。
-  // 但也不能说成"仅入队" —— 这个开关管不住兜底排空，那是承诺它做不到的事。
-  assert.match(render(false), /出站发布.*配置已关，但进展仍会发出（Stop 与兜底排空不读这个开关）/u);
+  // 2026-08-24 起开关真的管住了所有自动路径，所以"仅入队"这个说法现在是准的。
+  assert.match(render(false), /出站发布.*仅入队，不自动发布（人工排空可用 --force 绕过）/u);
   // 读不到配置更不能默认成开启。
   assert.match(render(null), /出站发布.*状态不可用（读不到发布配置）/u);
   assert.match(render(undefined), /出站发布.*状态不可用（读不到发布配置）/u);
 });
 
-test("发布开关关闭时，兜底排空照样走到发布准备", () => {
-  // 上一版这条是**假阳性**：夹具不是有效绑定，drainProject 直接返回
-  // {status:"error", reason:"not_bound"}，而断言只要求"不等于 empty"，
-  // 于是全绿却什么都没证明。我一边说"这条钉的是实际行为"，一边写了个走不到那一步的夹具。
+test("发布开关关闭时，自动排空被挡住；--force 才绕过", () => {
+  // 这条原来断言的是**坏行为**："开关关着也照样走到发布准备"。那是当时的事实，
+  // 但那个事实本身就是缺陷 —— 一个叫 auto_publish_on_completion 的开关管不住自动发布。
+  // 现在行为改了，断言跟着倒过来。
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pub-"));
   const inbound = path.join(dir, ".runtime-data", "inbound");
   const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
@@ -7507,28 +7507,38 @@ test("发布开关关闭时，兜底排空照样走到发布准备", () => {
     kind: "progress", text: "待发", created_at: new Date().toISOString(), published_at: null,
   }));
 
-  // 开关关着，它仍然一路走到发布准备 —— 这才是"兜底排空不读这个开关"的行为证据。
-  const drained = drainProject({ root: dir, claudeSessionId: null, dryRun: true });
-  assert.equal(drained.status, "dry_run", "有效绑定下必须走到发布准备，否则这条断言什么都没证明");
-  assert.equal(drained.count, 1);
+  const blocked = drainProject({ root: dir, claudeSessionId: null, dryRun: true });
+  assert.equal(blocked.status, "skipped");
+  assert.equal(blocked.reason, "auto_publish_disabled");
+  assert.equal(blocked.count, 1, "挡住不等于丢掉：条数要报出来");
+
+  // 绕过必须是明说的，不能靠"哪个入口调的"隐式决定。
+  const forced = drainProject({ root: dir, claudeSessionId: null, dryRun: true, force: true });
+  assert.equal(forced.status, "dry_run");
+  assert.equal(forced.count, 1);
+
+  // 开关没关时不受影响。
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", auto_publish_on_completion: true,
+  }));
+  assert.equal(drainProject({ root: dir, claudeSessionId: null, dryRun: true }).status, "dry_run");
 });
 
-test("发布开关只被两条路径读取，而它们不是主路径", () => {
-  // 这几条是结构断言，管的是"哪个文件读了这个配置键"——它本身就是个源码事实。
-  // 上面那条才是行为证据。两层都要：行为证明兜底会发，结构说明为什么会发。
+test("每条自动发布路径都要经过遵守开关的那道门", () => {
+  // 结构断言，管的是"哪个文件读了这个配置键"—— 它本身就是个源码事实。
+  // 上面那条才是行为证据。两层各管各的：行为证明挡住了，结构说明为什么挡得住。
   for (const rel of ["inbound.mjs", "watch-and-publish.mjs"]) {
     assert.match(fs.readFileSync(path.resolve("scripts", rel), "utf-8"),
       /auto_publish_on_completion !== false/u, rel + " 应当读取发布开关");
   }
-  // 不读它的这两条恰好是 Claude 侧主路径：每轮 Stop、30 分钟兜底。
-  for (const rel of ["drain-outbox.mjs", "stop-hook.mjs"]) {
-    assert.doesNotMatch(fs.readFileSync(path.resolve("scripts", rel), "utf-8"),
-      /auto_publish_on_completion/u,
-      rel + " 目前不读这个开关 —— 改了它就要同时改 status 的措辞");
-  }
-  // Stop 每轮都调排空，所以"关掉开关"在 Claude 侧几乎不改变任何事。
+  // Stop 与兜底不直接读它，而是走 drainProject —— 那道门在 drainProject 里。
+  const drain = fs.readFileSync(path.resolve("scripts", "drain-outbox.mjs"), "utf-8");
+  assert.match(drain, /cfg\.auto_publish_on_completion === false/u,
+    "drainProject 必须自己遵守开关，否则 Stop 和兜底又会绕过去");
+  assert.match(drain, /force/u, "绕过要有明说的入口");
   assert.match(fs.readFileSync(path.resolve("scripts", "stop-hook.mjs"), "utf-8"),
-    /drainProject\(/u, "Stop 每轮排空是这条结论的前提");
+    /drainProject\(/u, "Stop 每轮排空，所以它必须走同一道门");
 });
 
 test("绑定名称不冒充飞书当前话题标题", () => {
@@ -7614,6 +7624,46 @@ test("按文档里那条命令登记，聚合方要真的能取到状态", () =>
   assert.equal(renderConnectivity(view).includes("oc_SECRET123456"), false);
 });
 
+
+test("走真实 CLI 时 --force 必须真的传到 drainProject", () => {
+  // 上一版 CLI 解析了 --force 却没传下去，于是文档和状态页承诺的人工绕过**不存在**。
+  // 我的测试全是直接调函数，从没走过 CLI —— 缺的就是这一层。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cliforce-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", auto_publish_on_completion: false,
+  }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_fixture", claude_session_id: null,
+    channel_generation_id: "gen-1",
+  }));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
+    kind: "progress", text: "待发", created_at: new Date().toISOString(), published_at: null,
+  }));
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "drain-outbox.mjs"), "--project", dir, "--dry-run", ...args,
+  ], { encoding: "utf-8" });
+
+  const blocked = cli([]);
+  assert.match(blocked.stdout + blocked.stderr, /auto_publish_disabled/u, "默认要被开关挡住");
+  assert.doesNotMatch(blocked.stdout, /将发布/u);
+
+  const forced = cli(["--force"]);
+  assert.match(forced.stdout, /将发布 1 条/u, "--force 要真的走到发布准备");
+
+  // --all 那条路也得把 force 传下去 —— 两条入口只修一条，另一条照样是坏的。
+  const all = spawnSync(process.execPath, [
+    path.resolve("scripts", "drain-outbox.mjs"), "--all", "--dry-run", "--force",
+  ], { encoding: "utf-8" });
+  assert.equal(all.status === 0 || all.status === 1, true, "--all --force 至少要能跑完");
+  const src = fs.readFileSync(path.resolve("scripts", "drain-outbox.mjs"), "utf-8");
+  assert.match(src, /drainProject\(\{ root, claudeSessionId, dryRun, force \}\)/u,
+    "单项目和 --all 共用同一个调用点，force 必须在那里");
+});
 
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

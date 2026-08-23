@@ -5452,14 +5452,49 @@ test("经符号链接执行时，脚本仍认得出自己是被直接执行的",
     [path.join(dir, "current", "legacy.mjs")], { encoding: "utf-8" }), "imported",
     "旧判据经符号链接会误判成 imported —— 这正是当天钩子失灵的原因");
 
-  // 全仓库不得再出现旧判据。
-  for (const file of fs.readdirSync(path.resolve("scripts"))) {
-    // direct-run.mjs 的注释里就写着旧判据长什么样（说明它为什么错），跳过它。
-    if (!file.endsWith(".mjs") || file === "direct-run.mjs") continue;
-    const text = fs.readFileSync(path.resolve("scripts", file), "utf-8")
-      .replace(/\/\*[\s\S]*?\*\//gu, "").replace(/\/\/[^\n]*/gu, "");
-    assert.doesNotMatch(text,
-      /import\.meta\.url === "file:\/\/" \+ process\.argv\[1\]/u, file);
+  // 全仓库不得再出现旧判据 —— 但这条扫描本身上一版是**假阴性**，两个原因叠加：
+  // 只扫 scripts/ 第一层（漏掉 scripts/codex/），以及用 /\/\/[^\n]*/ 剥行注释时
+  // 把字符串里的 file:// 当成注释开头，正好把含旧判据的那几行截掉了。
+  // 现在改成递归扫描 + 直接禁用 process.argv[1]：不解析注释，就不会被注释语法骗。
+  const productScripts = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith(".mjs")) productScripts.push(full);
+    }
+  };
+  walk(path.resolve("scripts"));
+  const exempt = new Set(["direct-run.mjs", "test.mjs"]);
+  let scanned = 0;
+  for (const file of productScripts) {
+    if (exempt.has(path.basename(file))) continue;
+    scanned += 1;
+    assert.doesNotMatch(fs.readFileSync(file, "utf-8"), /process\.argv\[1\]/u,
+      path.relative(path.resolve("scripts"), file) +
+      " 不得直接读 process.argv[1]；判断是否直接执行一律用 isDirectRun");
+  }
+  assert.ok(scanned > 60, "扫描必须覆盖 scripts/**（含 codex/），实际 " + scanned + " 个");
+});
+
+test("经 runtime/current 执行 feishu-mode 必须真的产出输出", () => {
+  // 这条是行为回归，不是源码断言。上一版的源码扫描是假阴性，三个脚本漏网，
+  // 其中 feishu-mode.mjs 正是已安装技能直接调用的命令 —— 出入站恢复了，
+  // 而模式查看/切换仍然静默失效，且退出码 0、stdout 全空。
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "mode-home-"));
+  const plan = planRuntimeSync({ sourceRoot: path.resolve("."), home });
+  assert.equal(plan.ok, true);
+  assert.equal(applyRuntimeSync(plan, { home }).ok, true);
+
+  for (const rel of ["feishu-mode.mjs", path.join("codex", "feishu-mode.mjs")]) {
+    const viaCurrent = path.join(runtimeRoot(home), "current", "scripts", rel);
+    const run = spawnSync(process.execPath, [viaCurrent, "--project",
+      path.join(home, "not-bound")], {
+      encoding: "utf-8", env: { ...process.env, HOME: home },
+    });
+    const produced = String(run.stdout ?? "") + String(run.stderr ?? "");
+    assert.notEqual(produced.trim(), "",
+      rel + " 经符号链接执行时必须有输出 —— 空输出 + exit 0 正是当天那种静默失效");
   }
 });
 

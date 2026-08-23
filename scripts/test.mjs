@@ -7085,6 +7085,36 @@ test("歧义命令必须失败，不许被解释成破坏性更强的那个", ()
   assert.equal(JSON.parse(fs.readFileSync(file, "utf-8")).providers.length, 0);
 });
 
+test("控制参数走白名单：未知、拼错、裸参数、重复、缺值一律拒", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-wl-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"), ...args,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+
+  assert.equal(cli(["--id", "probe", "--script", script, "--apply"]).status, 0);
+  const before = fs.readFileSync(file, "utf-8");
+
+  // "只接受这几个"和"拒绝这几个"差一个拼写错误，
+  // 而破坏性操作那边差的是整个登记表。
+  for (const [args, reason] of [
+    [["--id", "probe", "--unregister", "--unknown-option", "x", "--apply"], "unknown_option"],
+    [["--id", "p2", "--script", script, "--kindz", "progress", "--apply"], "unknown_option"],
+    [["--id", "probe", "--unregister", "裸的", "--apply"], "unexpected_argument"],
+    [["--id", "probe", "--id", "other", "--unregister", "--apply"], "duplicate_option"],
+    [["--id", "--unregister", "--apply"], "option_needs_value"],
+  ]) {
+    const run = cli(args);
+    assert.notEqual(run.status, 0, reason);
+    assert.match(run.stderr, new RegExp(reason, "u"));
+    assert.equal(fs.readFileSync(file, "utf-8"), before, "拒绝时一个字节都不该动：" + reason);
+  }
+
+  // 拒的是"说不清的命令"，不是这些操作本身。
+  assert.equal(cli(["--id", "probe", "--unregister", "--apply"]).status, 0);
+});
+
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (failed > 0) {

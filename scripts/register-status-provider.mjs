@@ -33,6 +33,10 @@ const REASON_TEXT = {
   provider_exists_with_other_script: "这个 id 已经指向别的脚本",
   provider_exists_with_other_settings: "这个 id 已登记，但以下字段不同",
   ambiguous_mode: "--replace 和 --unregister 不能同时给；请分别执行",
+  unknown_option: "不认识这个参数（拼错了？）",
+  unexpected_argument: "只接受 --xxx 形式的参数",
+  duplicate_option: "同一个参数给了两次",
+  option_needs_value: "这个参数缺少取值",
   unregister_takes_no_config: "注销模式下这些参数无效，去掉它们再执行",
   unregister_takes_no_args: "注销模式下不接受 -- 之后的透传参数",
   status_providers_unreadable: "登记表读不出来 —— 先修表，别覆盖它",
@@ -53,10 +57,49 @@ const SPLIT_AT = process.argv.indexOf("--", 2);
 const CONTROL = SPLIT_AT >= 0 ? process.argv.slice(2, SPLIT_AT) : process.argv.slice(2);
 const PASSTHROUGH = SPLIT_AT >= 0 ? process.argv.slice(SPLIT_AT + 1) : [];
 
-function arg(name) {
-  const i = CONTROL.indexOf("--" + name);
-  return i >= 0 ? CONTROL[i + 1] : undefined;
+/**
+ * 严格解析控制段。**白名单，不是黑名单。**
+ *
+ * 上一版只拒绝四个已知配置项，于是 `--unknown-option x` 和拼错的 `--kindz`
+ * 都被静默忽略 —— 注销照样执行，新增照样用默认值登记。
+ * "只接受这几个"和"拒绝这几个"差一个拼写错误，而破坏性操作那边差的是整个登记表。
+ */
+const FLAGS = new Set(["apply", "replace", "unregister"]);
+const OPTIONS = new Set(["id", "script", "executable", "kinds", "display-name"]);
+
+function parseControl(tokens) {
+  const seen = new Map();
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i];
+    if (typeof t !== "string" || !t.startsWith("--")) {
+      return { ok: false, reason: "unexpected_argument" };
+    }
+    const name = t.slice(2);
+    if (seen.has(name)) return { ok: false, reason: "duplicate_option", detail: t };
+    if (FLAGS.has(name)) { seen.set(name, true); continue; }
+    if (!OPTIONS.has(name)) return { ok: false, reason: "unknown_option", detail: t };
+    const value = tokens[i + 1];
+    if (typeof value !== "string" || value.startsWith("--")) {
+      return { ok: false, reason: "option_needs_value", detail: t };
+    }
+    seen.set(name, value);
+    i += 1;
+  }
+  return { ok: true, seen };
 }
+
+const parsed = parseControl(CONTROL);
+if (!parsed.ok) {
+  console.error("失败（" + parsed.reason + "）：" +
+    (REASON_TEXT[parsed.reason] ?? parsed.reason) + (parsed.detail ? "：" + parsed.detail : ""));
+  process.exit(1);
+}
+
+function arg(name) {
+  const v = parsed.seen.get(name);
+  return typeof v === "string" ? v : undefined;
+}
+function has(name) { return parsed.seen.has(name); }
 
 function fail(reason, detail) {
   console.error("失败（" + reason + "）：" + (REASON_TEXT[reason] ?? reason) +
@@ -165,9 +208,9 @@ function describePlan(plan) {
 const PLAN_FAILS = new Set(["registry_unreadable", "registry_invalid", "conflict"]);
 
 function main() {
-  const apply = CONTROL.includes("--apply");
-  const replace = CONTROL.includes("--replace");
-  const unregister = CONTROL.includes("--unregister");
+  const apply = has("apply");
+  const replace = has("replace");
+  const unregister = has("unregister");
   // 歧义命令**不许被解释成破坏性更强的那个**。--replace --unregister 同时给出时，
   // 上一版静默选了注销 —— 那是在替人做一个他没表达的决定，跟显式授权正相反。
   if (replace && unregister) fail("ambiguous_mode");
@@ -176,8 +219,8 @@ function main() {
   const script = arg("script");
   if (unregister) {
     // 注销模式下这些参数没有任何作用。静默忽略会让人以为"我顺手也更新了配置"。
-    const ignored = ["script", "executable", "kinds", "display-name"]
-      .filter((k) => CONTROL.includes("--" + k));
+    // 白名单已经挡掉未知参数；这里管的是"已知但在本模式下无意义"的那几个。
+    const ignored = [...OPTIONS].filter((k) => k !== "id" && has(k));
     if (ignored.length > 0) fail("unregister_takes_no_config", ignored.join("、"));
     if (PASSTHROUGH.length > 0) fail("unregister_takes_no_args");
   }

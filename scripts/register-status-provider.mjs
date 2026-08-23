@@ -22,7 +22,8 @@ import path from "node:path";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { isDirectRun } from "./direct-run.mjs";
 import {
-  PROVIDER_KINDS, PROVIDER_PROTOCOL, statusProvidersPath, validateProviderRegistry,
+  CONNECTION_RELATIONS, PROVIDER_KINDS, PROVIDER_PROTOCOL, statusProvidersPath,
+  validateProviderRegistry,
 } from "./status-providers.mjs";
 
 const REASON_TEXT = {
@@ -31,6 +32,7 @@ const REASON_TEXT = {
   executable_not_absolute: "--executable 必须是绝对路径",
   script_not_absolute: "--script 必须是绝对路径",
   allowed_kinds_invalid: "--kinds 只能是 " + PROVIDER_KINDS.join(" / "),
+  allowed_relations_invalid: "--relations 只能是 " + CONNECTION_RELATIONS.join(" / "),
   provider_id_duplicated: "登记表里已经有同名 provider",
   provider_exists_with_other_script: "这个 id 已经指向别的脚本",
   provider_exists_with_other_settings: "这个 id 已登记，但以下字段不同",
@@ -71,7 +73,9 @@ function splitArgv(argv) {
  * "只接受这几个"和"拒绝这几个"差一个拼写错误，而破坏性操作那边差的是整个登记表。
  */
 const FLAGS = new Set(["apply", "replace", "unregister"]);
-const OPTIONS = new Set(["id", "script", "executable", "kinds", "display-name", "project-root"]);
+const OPTIONS = new Set([
+  "id", "script", "executable", "kinds", "relations", "display-name", "project-root",
+]);
 
 export function parseControl(tokens) {
   const seen = new Map();
@@ -131,6 +135,7 @@ function normalize(entry) {
     allowed_kinds: [...(entry.allowed_kinds ?? [])].sort(),
     display_name: entry.display_name ?? null,
     project_root: entry.project_root ?? null,
+    allowed_relations: [...(entry.allowed_relations ?? [])].sort(),
     enabled: entry.enabled !== false,
   };
 }
@@ -239,6 +244,8 @@ function main() {
   const executable = arg("executable") ?? process.execPath;
   const kinds = (arg("kinds") ?? "transport").split(",").map((k) => k.trim()).filter(Boolean);
   const displayName = arg("display-name");
+  // 没给就是没有能力：这条链路的连接仍然进"尚未分层"附录，跟以前一样。
+  const relations = (arg("relations") ?? "").split(",").map((x) => x.trim()).filter(Boolean);
   // 归属哪个项目。默认取当前目录 —— 登记通常就在那个项目里做。
   const projectRoot = path.resolve(arg("project-root") ?? process.cwd());
   const file = statusProvidersPath();
@@ -254,6 +261,7 @@ function main() {
   const entry = unregister ? { id } : {
     id, protocol: PROVIDER_PROTOCOL, executable, script,
     args: passthrough, allowed_kinds: kinds, project_root: projectRoot,
+    ...(relations.length > 0 ? { allowed_relations: relations } : {}),
     ...(displayName ? { display_name: displayName } : {}),
   };
 
@@ -274,7 +282,8 @@ function main() {
     console.log("provider  " + id + " → " + script);
     console.log("执行      " + executable);
     console.log("参数      " + (entry.args.length > 0 ? entry.args.join(" ") : "（无）"));
-    console.log("授权范围  " + kinds.join(", "));
+    console.log("授权范围  " + kinds.join(", ") +
+      (relations.length > 0 ? " · 关系层 " + relations.join(", ") : " · 关系层未声明（进附录）"));
     console.log("归属项目  " + projectRoot);
   }
   console.log("结果      " + describePlan(plan));

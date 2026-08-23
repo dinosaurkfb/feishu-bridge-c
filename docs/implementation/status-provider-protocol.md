@@ -84,9 +84,14 @@ node scripts/register-status-provider.mjs \
 | `scope` | `chat`（整个群）/ `topic`（单个话题）/ `project`（整个项目） |
 | `group_name` | 人读的群名，≤60 字符 |
 | `topic_name` | 可选，同上 |
+| `relation_type` | 可选，`subscription` / `binding` / `policy` —— 这条连接属于四层里的哪一层 |
 
-`kind` 受**两层约束**：登记时由人声明 `allowed_kinds`，provider 给每条连接标注实际
-`kind`，聚合方只接受声明集合内的值 —— provider 不能自己给自己发许可。
+`kind` 和 `relation_type` 都受**两层约束**：登记时由人声明 `allowed_kinds` /
+`allowed_relations`，provider 给每条连接标注实际值，聚合方只接受声明集合内的 ——
+provider 不能自己给自己发许可。
+
+**`allowed_relations` 缺省是空集，不是全集。** 没声明就没有这个能力，那条链路的连接
+仍然进「尚未分层」附录 —— 老的登记不带这个字段，行为完全不变。
 
 协议里没有错误通道。取不到状态时**非零退出**，聚合方会显示「状态取不到」——
 这跟「没有已连接的群」是两回事，不能混。
@@ -110,6 +115,10 @@ locator」是 status 对使用者的承诺，直接展示别人的输出等于�
 `scripts/group-binding-status.mjs` 把一份群级绑定翻译成本协议，第一个用它的是 cc2cd。
 绑定文件由消费者自己维护（各自 `.runtime-data` 下），脚本只读。
 
+关系层用 `--relation subscription` 显式指定，**不默认**：群级绑定按语义属于第 2 层
+事件订阅，但那是登记这条链路的人该确认的事，不该由脚本替它断言。不指定就不带这个
+字段，连接进「尚未分层」附录。
+
 它只报群名：`chat_id`、`transport_open_id`、`thread_id`、session id、`frank_aily_id`
 一个都不出 —— 聚合方那边虽然也拦，但拦截是最后一道，不是唯一一道。
 
@@ -119,10 +128,9 @@ locator」是 status 对使用者的承诺，直接展示别人的输出等于�
 
 ## 已知缺口
 
-- **连接的关系层判不出来。** cc2cd 的群级绑定按语义属于第 2 层事件订阅（它决定群里
-  新话题进哪个域），不是第 3 层通道绑定。但当前协议只有 `kind` 和 `scope`，
-  判不出一条连接是订阅、绑定还是策略。**判不出就不硬归类** —— 现在挂在
-  「本项目的其他链路（尚未分层）」附录里，等协议加上受控的 `relation_type` 再并入
-  对应层。
+- **现有的 cc2cd 登记还没声明关系层。** 要并进第 2 层需要**两边都做**：
+  登记时 `--relations subscription` 授予能力，**并且** provider 自己用
+  `--relation subscription` 声明。只做前者不够 —— 登记只授权，不代替声明。
+  这是一次授权动作，等 Frank。
 - **跨项目的诊断不在 status 里。** 「有 route 却没登记状态入口」这类问题归后续的
   `doctor` 命令：status 每天看、必须干净；doctor 出问题才跑、可以啰嗦。

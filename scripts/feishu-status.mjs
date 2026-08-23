@@ -17,8 +17,9 @@ import path from "node:path";
 
 import { bindingsForRoot, currentBinding, describeStatus } from "./feishu-control.mjs";
 import { buildClaudeSubscriptionProjection } from "./inbound-route.mjs";
+import { loadChainTemplate } from "./chain-template.mjs";
 import { composeLayeredStatus, endpointFacts, renderLayeredStatus, subscriptionFacts } from "./layered-status.mjs";
-import { collectConnectivity, renderConnectivity } from "./status-providers.mjs";
+import { collectProjectConnectivity, renderConnectivity } from "./status-providers.mjs";
 
 const arg = (n) => {
   const i = process.argv.indexOf("--" + n);
@@ -30,8 +31,13 @@ const claudeSessionId = process.env.CLAUDE_CODE_SESSION_ID;
 
 const st = currentBinding({ root, claudeSessionId });
 // 分层视图把它放进"其他消费者"那一节，标题由那边给。
-const layeredConnectivity = renderConnectivity(collectConnectivity(), { heading: null });
-const connectivity = renderConnectivity(collectConnectivity());
+const loaded = loadChainTemplate();
+const tpl = loaded?.ok ? (loaded.template ?? loaded) : null;
+
+// 只看当前项目的链路。整台机器的全景归后续的 doctor 命令。
+const projectLinks = collectProjectConnectivity({ root });
+const layeredConnectivity = renderConnectivity(projectLinks, { heading: null });
+const connectivity = renderConnectivity(projectLinks);
 
 if (!st.ok) {
   // 没绑定就没有四层可言，照旧给接入指引；本机其他链路仍然值得看见。
@@ -43,8 +49,9 @@ if (!st.ok) {
 console.log(renderLayeredStatus(composeLayeredStatus({
   st,
   others: bindingsForRoot({ root }),
-  endpoint: endpointFacts(),
-  subscription: subscriptionFacts(buildClaudeSubscriptionProjection({})),
+  endpoint: endpointFacts({ agentName: tpl?.transport_agent_name ?? null }),
+  subscription: subscriptionFacts(buildClaudeSubscriptionProjection({}),
+    { groupName: tpl?.chat_name ?? null }),
   connectivity: layeredConnectivity,
 })));
 process.exit(0);

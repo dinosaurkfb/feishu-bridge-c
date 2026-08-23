@@ -82,8 +82,8 @@ import {
   renderLayeredStatus, subscriptionFacts,
 } from "./layered-status.mjs";
 import {
-  collectConnectivity, collectStatusProviders, loadStatusProviders, renderConnectivity,
-  validateProviderRegistry, validateProviderReport,
+  collectConnectivity, collectProjectConnectivity, collectStatusProviders, loadStatusProviders,
+  renderConnectivity, validateProviderRegistry, validateProviderReport,
 } from "./status-providers.mjs";
 import {
   MAPPING_DISPOSITION, MAPPING_POLICY_ID, MAPPING_POLICY_VERSION,
@@ -7021,13 +7021,14 @@ test("深比较要含 enabled：重登记一条已停用的项不许报「无变
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-en-"));
   const file = path.join(dir, "providers.json");
   const script = path.resolve("scripts", "group-binding-status.mjs");
+  // 归属跟命令一致，这样唯一的差别就是 enabled —— 断言才指得准。
   fs.writeFileSync(file, JSON.stringify({ providers: [{
     id: "cc2cd", protocol: "feishu-bridge-status/v1", executable: process.execPath,
-    script, args: [], allowed_kinds: ["transport"], enabled: false,
+    script, args: [], allowed_kinds: ["transport"], project_root: "/abs/proj", enabled: false,
   }] }));
   const run = spawnSync(process.execPath, [
     path.resolve("scripts", "register-status-provider.mjs"),
-    "--id", "cc2cd", "--script", script,
+    "--id", "cc2cd", "--script", script, "--project-root", "/abs/proj",
   ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
   // 报"无变化"而它仍然停用，等于说"已经装好了"却没生效。
   assert.notEqual(run.status, 0);
@@ -7242,7 +7243,10 @@ test("第 2 层脱敏：locator 字段一个都不出，群名不许用 ID 顶�
   const facts = subscriptionFacts(model);
   assert.equal(facts.ok, true);
   assert.equal(facts.items[0].senderCount, 1, "只出数量，不出身份");
-  assert.equal(facts.items[0].groupName, null);
+  assert.equal(facts.items[0].groupName, null, "不传群名时不许拿 chat_id 顶替");
+  // 传了就用 —— 群名是模板里本来就有的可展示字段。
+  assert.equal(subscriptionFacts(model, { groupName: "Frank智能体们" }).items[0].groupName,
+    "Frank智能体们");
 
   const text = renderLayeredStatus(layeredView({}, { subscription: facts }));
   for (const secret of ["ep_SECRET111111", "sub_SECRET222222", "dom_SECRET333333",
@@ -7265,10 +7269,10 @@ test("第 2 层读不到时说读不到，不装作没有订阅", () => {
   assert.doesNotMatch(text, /本项目没有事件订阅/u, "读不到和没有是两回事");
 });
 
-test("其他消费者暂不硬归类", () => {
+test("同项目的其他链路暂不硬归类", () => {
   const text = renderLayeredStatus(layeredView({}, { connectivity: "  cc2cd  消息运输 · 某群" }));
   // 当前 provider 协议只有 kind 和 scope，判不出一条连接是订阅、绑定还是策略。
-  assert.match(text, /其他消费者（尚未分层）/u);
+  assert.match(text, /本项目的其他链路（尚未分层）/u);
   assert.match(text, /cc2cd {2}消息运输/u);
   // 判不出就别塞进某一层。
   const layer2 = text.slice(text.indexOf("第 2 层"), text.indexOf("第 3 层"));
@@ -7281,6 +7285,82 @@ test("第 4 层的自动轮转补出还剩几条", () => {
   // 原始值本身不够用时才补，且补的是算出来的，不是编的。
   const near = renderLayeredStatus(layeredView({ activeGenerationMessages: 30 }));
   assert.match(near, /还剩 0 条/u);
+});
+
+test("status 只看当前项目的链路", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-scope-"));
+  const file = path.join(dir, "providers.json");
+  const mine = path.join(dir, "mine");
+  const theirs = path.join(dir, "theirs");
+  const entry = (id, root) => ({
+    id, protocol: "feishu-bridge-status/v1", executable: process.execPath,
+    script: "/abs/x.mjs", allowed_kinds: ["transport"],
+    ...(root === null ? {} : { project_root: root }),
+  });
+  fs.writeFileSync(file, JSON.stringify({ providers: [
+    entry("mine", mine), entry("theirs", theirs), entry("nowhere", null),
+  ] }));
+  const run = () => ({ ok: true, connections: [] });
+
+  const view = collectProjectConnectivity({ root: mine, providersFile: file, run });
+  assert.deepEqual(view.sections.map((x) => x.id), ["mine"],
+    "别的项目的链路不该出现在本项目的 status 里");
+
+  // 换个项目根，看到的就是那个项目的。
+  assert.deepEqual(
+    collectProjectConnectivity({ root: theirs, providersFile: file, run }).sections.map((x) => x.id),
+    ["theirs"]);
+
+  // 没声明归属的归不了属 —— 不进任何项目视图（那是 doctor 该管的机器级问题）。
+  for (const root of [mine, theirs]) {
+    assert.equal(
+      collectProjectConnectivity({ root, providersFile: file, run }).sections
+        .some((x) => x.id === "nowhere"), false);
+  }
+
+  // 机器全景仍然算得出来，只是不给 status 用。
+  const machine = collectConnectivity({
+    routesFile: path.join(dir, "no-routes.json"), providersFile: file, run,
+  });
+  assert.deepEqual(machine.sections.map((x) => x.id).sort(), ["mine", "nowhere", "theirs"]);
+});
+
+test("归属项目必须是绝对路径", () => {
+  const bad = validateProviderRegistry({ providers: [{
+    id: "x", protocol: "feishu-bridge-status/v1", executable: process.execPath,
+    script: "/abs/x.mjs", allowed_kinds: ["transport"], project_root: "relative/dir",
+  }] });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.problem, "project_root_not_absolute");
+
+  const ok = validateProviderRegistry({ providers: [{
+    id: "x", protocol: "feishu-bridge-status/v1", executable: process.execPath,
+    script: "/abs/x.mjs", allowed_kinds: ["transport"], project_root: "/abs/proj",
+  }] });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.providers[0].projectRoot, "/abs/proj");
+});
+
+test("登记命令记录归属项目，且归属变化不算无变化", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-scope2-"));
+  const file = path.join(dir, "providers.json");
+  const script = path.resolve("scripts", "group-binding-status.mjs");
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"),
+    "--id", "cc2cd", "--script", script, ...args,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+
+  const first = cli(["--project-root", "/abs/one", "--apply"]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.match(first.stdout, /归属项目 {2}\/abs\/one/u, "预览要说清这条算哪个项目的");
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf-8")).providers[0].project_root, "/abs/one");
+
+  // 换归属 = 换这条链路算谁的，不能报成"无变化"。
+  const moved = cli(["--project-root", "/abs/two", "--apply"]);
+  assert.notEqual(moved.status, 0);
+  assert.match(moved.stderr, /project_root/u);
+
+  assert.match(cli(["--project-root", "/abs/one", "--apply"]).stdout, /无需改动/u);
 });
 
 summarySealed = true;

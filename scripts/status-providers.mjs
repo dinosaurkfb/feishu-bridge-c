@@ -105,6 +105,12 @@ export function validateProviderRegistry(doc) {
       return bad("allowed_kinds_invalid");
     }
     if (p.enabled !== undefined && typeof p.enabled !== "boolean") return bad("enabled_not_boolean");
+    // 哪个项目的链路。status 只看当前项目 —— 没有它就归不了属，
+    // 归不了属的 provider 不进项目视图（那是 doctor 该管的机器级问题）。
+    if (p.project_root !== undefined &&
+        (typeof p.project_root !== "string" || !path.isAbsolute(p.project_root))) {
+      return bad("project_root_not_absolute");
+    }
     if (p.display_name !== undefined && cleanName(p.display_name) === null) {
       return bad("display_name_invalid");
     }
@@ -117,6 +123,7 @@ export function validateProviderRegistry(doc) {
       args: p.args ?? [],
       allowedKinds: [...p.allowed_kinds],
       enabled: p.enabled !== false,
+      projectRoot: p.project_root ?? null,
     });
   }
   return { ok: true, providers };
@@ -245,11 +252,12 @@ export function collectStatusProviders({ file = statusProvidersPath(), run = run
   for (const provider of loaded.providers) {
     if (!provider.enabled) {
       sections.push({ id: provider.id, displayName: provider.displayName,
-        allowedKinds: provider.allowedKinds, state: "disabled" });
+        allowedKinds: provider.allowedKinds, projectRoot: provider.projectRoot, state: "disabled" });
       continue;
     }
     const got = run(provider);
-    const base = { id: provider.id, displayName: provider.displayName, allowedKinds: provider.allowedKinds };
+    const base = { id: provider.id, displayName: provider.displayName,
+      allowedKinds: provider.allowedKinds, projectRoot: provider.projectRoot };
     sections.push(got.ok
       ? { ...base, state: "ok", connections: got.connections }
       : { ...base, state: "unavailable", reason: got.reason });
@@ -258,7 +266,32 @@ export function collectStatusProviders({ file = statusProvidersPath(), run = run
 }
 
 /**
- * 把两份目录合成一张连通性视图。
+ * 只看当前项目的链路。**这是 status 用的那个。**
+ *
+ * 上一版把整台机器的消费者都列出来，那是我把范围做大了 —— Frank 最初的要求是
+ * "把**这个项目**有关的都列出来"。cc2cd 对 feishu-bridge-cc 来说是别人，
+ * 它出现在这里只会让每天要看的那屏变吵。
+ *
+ * "有 route 却没人报状态"那类跨项目的说不通，归后续的 doctor 命令管 ——
+ * status 是每天看的，doctor 是出问题才跑的，两者该查的东西本来就不一样。
+ */
+export function collectProjectConnectivity({
+  root, providersFile = statusProvidersPath(), run = runStatusProvider,
+} = {}) {
+  const all = collectStatusProviders({ file: providersFile, run });
+  if (!all.ok) return { sections: [], providersProblem: all.problem ?? all.reason, routesProblem: null };
+  const want = typeof root === "string" ? path.resolve(root) : null;
+  return {
+    sections: all.sections.filter((x) =>
+      want !== null && x.projectRoot !== null && x.projectRoot !== undefined &&
+      path.resolve(x.projectRoot) === want),
+    providersProblem: null,
+    routesProblem: null,
+  };
+}
+
+/**
+ * 把两份目录合成一张连通性视图。**机器全景，给后续的 doctor 用。**
  *
  * 路由表和 provider 表回答的是不同问题：**路由表知道有哪些入站消费者**，
  * provider 表知道**谁能报自己的状态**。只看后者，"有 route、没登记状态入口"

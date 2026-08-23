@@ -41,6 +41,7 @@ const inboundLogDefault = () =>
  */
 export function endpointFacts({
   runtime = "Claude Code",
+  agentName = null,
   runtimeDir = runtimeDirDefault(),
   inboundLog = inboundLogDefault(),
 } = {}) {
@@ -52,6 +53,7 @@ export function endpointFacts({
 
   return {
     runtime,
+    agentName,
     installed: version !== null,
     version,
     selfCheck: ENDPOINT_SELF_CHECK,
@@ -83,16 +85,18 @@ export function lastSuccessfulDispatchAt(file) {
  * agent_uid / transport_open_id / chat_id / sender_ids / local_target_id /
  * legacy_key / pending_token 一个都不出。
  *
- * 当前投影里**没有群名、只有 chat_id**，所以群名一律显示"不可用" ——
- * 拿 ID 顶替就等于把 locator 打出来了。
+ * 群名由调用方从链路模板传进来（模板里本来就有 chat_name，绑定命令一直在打印它）。
+ * 订阅投影自己只有 chat_id —— 取不到名字时显示"不可用"，**不拿 ID 顶替**。
  */
-export function subscriptionFacts(model) {
+export function subscriptionFacts(model, { groupName = null } = {}) {
   if (!model || model.ok !== true) {
     return { ok: false, reason: model?.reason ?? "subscription_unavailable" };
   }
   const items = (model.subscriptions ?? []).map((s) => ({
     status: s.status === "active" ? "活动" : "暂停",
-    groupName: null,                       // 投影里只有 chat_id，没有群名
+    // 投影里只有 chat_id，但群名在链路模板里就有（绑定命令一直在打印它）。
+    // 上一版报"群名不可用"是我没把它接过来，不是真的没有。
+    groupName,
     senderCount: (s.scope?.sender_ids ?? []).length,
     eventTypes: [...(s.scope?.event_types ?? [])],
   }));
@@ -115,7 +119,11 @@ export function composeLayeredStatus({
   st, others = [], endpoint, subscription, connectivity = null, now = Date.now(),
 }) {
   const L1 = [
-    ["运行时", endpoint.runtime + (endpoint.version ? " · " + endpoint.version : "")],
+    ["运行时", endpoint.runtime],
+    // 运输 agent 的名字是模板里就有的，报名字比报 UID 有用且不算 locator。
+    ["运输 agent", endpoint.agentName ?? "名称不可用"],
+    // 上一版把版本号跟运行时拼在一行，被读成了 agent id。它是脚本内容哈希。
+    ["运行时版本", endpoint.version ?? "未安装"],
     ["安装状态", endpoint.installed ? "已安装" : "未安装"],
     // FR-1.4 未实现。写出来，别让空白被读成"没问题"。
     ["实时自检", "未自检（端点自检 FR-1.4 尚未实现）"],
@@ -131,7 +139,7 @@ export function composeLayeredStatus({
   } else {
     for (const s of subscription.items) {
       L2.push(["订阅状态", s.status]);
-      L2.push(["订阅群", s.groupName ?? "群名不可用（投影里只有群 ID，不展示）"]);
+      L2.push(["订阅群", s.groupName ?? "群名不可用（只有群 ID，不拿 ID 顶替）"]);
       L2.push(["授权发送者", s.senderCount + " 个"]);
       L2.push(["事件范围", s.eventTypes.join("、") || "未声明"]);
     }
@@ -141,6 +149,8 @@ export function composeLayeredStatus({
   }
 
   const L3 = [
+    // 话题标题就是「🌉 项目名」。上一版删掉总判断那行时，把项目名一起弄丢了。
+    ["话题", st.displayName ? "🌉 " + st.displayName : "名称不可用"],
     ["绑定级别", st.level === "session"
       ? "这条工作线单独绑定"
       : "整个项目共用一个话题"],
@@ -208,10 +218,10 @@ export function renderLayeredStatus(view) {
 
   if (view.connectivity) {
     lines.push("");
-    // cc2cd 那种群级绑定按语义其实属于第 2 层，但当前 provider 协议只有
-    // kind 和 scope，判不出一条连接是订阅、绑定还是策略。**判不出就不硬归类** ——
-    // 等 provider 协议加上受控的 relation_type 再并进对应层。
-    lines.push("其他消费者（尚未分层）");
+    // 同一个项目的另一条链路（比如 cc2cd 的群级绑定）。按语义它其实属于第 2 层，
+    // 但当前协议只有 kind 和 scope，判不出一条连接是订阅、绑定还是策略。
+    // **判不出就不硬归类** —— 等协议加上受控的 relation_type 再并进对应层。
+    lines.push("本项目的其他链路（尚未分层）");
     lines.push(view.connectivity);
   }
   if (view.suspended) {

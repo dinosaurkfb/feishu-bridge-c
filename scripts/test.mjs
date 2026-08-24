@@ -82,7 +82,9 @@ import { bindingToConnections } from "./group-binding-status.mjs";
 import {
   SYNC_ACTION, SYNC_REJECT, authorizationCovers, planSubscriptionSync, renderSyncPlan,
 } from "./subscription-sync.mjs";
-import { APPLY_REJECT, planId, verifyExpect } from "./subscription-sync-apply.mjs";
+import {
+  APPLY_REJECT, applySubscriptionSync, planId, verifyExpect,
+} from "./subscription-sync-apply.mjs";
 import { renderSubscriptions, subscriptionDetails } from "./feishu-subscribe.mjs";
 import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
 import {
@@ -8699,6 +8701,168 @@ const applyEntry = (over = {}) => ({
   ...over,
 });
 const applyPlan = (entries) => ({ ok: true, noop: false, plans: entries });
+
+/**
+ * 落盘用的真实世界：真 materializer 生成的快照落在真目录里。
+ * 不自造结构 —— 上一轮的教训是"只能消费自己夹具的东西证明不了任何事"。
+ */
+const applyWorld = (over = {}) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-syncapply-"));
+  const bindingKey = "pbk-" + (over.key ?? "w1");
+  const binding = { private_binding_key: bindingKey,
+    local_target_id: "target_" + SYNC_HEX.slice(0, 20) + syncHexLabel(bindingKey), status: "active" };
+  const seeded = materializeDialogueBindingAuthorization({
+    runtimeNamespace: SYNC_NS, endpointId: SYNC_EP, subscription: syncSub(), binding });
+  assert.equal(seeded.ok, true, seeded.reason ?? "");
+  const snap = seeded.snapshot;
+  fs.mkdirSync(path.join(dir, "authorizations"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "authorizations", snap.binding_ref + ".json"),
+    JSON.stringify(snap, null, 2));
+  // 内容真的变了的下一版：多授权一个人。
+  const next = syncSub({ version: 2,
+    scope: { ...syncSub().scope, sender_ids: ["u_frank", "u_two"] } });
+  const world = {
+    previous: syncSub(), next, snapshots: [snap], others: [],
+    runtimeNamespace: SYNC_NS, bindings: { [snap.binding_ref]: binding }, now: NOW,
+  };
+  return { dir, snap, binding, world,
+    lockDir: path.join(dir, "control.lock"),
+    file: path.join(dir, "authorizations", snap.binding_ref + ".json"),
+    read: () => JSON.parse(fs.readFileSync(path.join(dir, "authorizations", snap.binding_ref + ".json"), "utf-8")) };
+};
+
+test("落盘：计划没变就写下去，同一 operation 重放不再写", () => {
+  const w = applyWorld();
+  const plan = planSubscriptionSync(w.world);
+  assert.equal(plan.counts.resnapshot, 1, "夹具应当产出一条 resnapshot");
+  const pid = planId(plan);
+
+  // **重读必须发生在锁之内**，否则"锁内重算"只是句好听的话。
+  // 让 readWorld 自己看那一刻锁在不在 —— 这是唯一能证明调用时机的办法。
+  let sawLock = null;
+  const run = () => applySubscriptionSync({
+    shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-first-0001",
+    expectedPlanId: pid,
+    readWorld: () => { sawLock = fs.existsSync(w.lockDir); return w.world; },
+  });
+
+  const first = run();
+  assert.equal(first.ok, true, first.reason ?? "");
+  assert.equal(sawLock, true, "readWorld 是在锁外被调的 —— 锁内重算就失去意义了");
+  assert.equal(first.written, 1);
+  assert.equal(first.replayed, false);
+  // 快照真的换了一版。
+  const after = w.read();
+  assert.notEqual(after.snapshot_id, w.snap.snapshot_id);
+  assert.equal(after.authorization_revision, w.snap.authorization_revision + 1);
+  assert.equal(after.subscription_version, 2);
+
+  // **同一个 operation 重放：一个字节都不该再写。**
+  const before = fs.statSync(w.file).mtimeMs;
+  const again = run();
+  assert.equal(again.ok, true);
+  assert.equal(again.replayed, true);
+  assert.equal(again.written, 0);
+  assert.equal(fs.statSync(w.file).mtimeMs, before, "重放不该碰文件");
+});
+
+test("落盘：锁内重算发现计划变了就零写入", () => {
+  // Codex 点名的两种漂移：并发新增 binding、快照 revision 变了。
+  // 共同点是**锁外算的那份计划已经不作数**，这时写下去的就是一份残缺的计划。
+  const w = applyWorld();
+  const pid = planId(planSubscriptionSync(w.world));
+
+  // 锁内重读时世界多了一条 binding —— 计划从 1 条变 2 条。
+  const extra = applyWorld({ key: "w2" });
+  const drifted = { ...w.world, snapshots: [w.snap, extra.snap],
+    bindings: { ...w.world.bindings, ...extra.world.bindings } };
+
+  const got = applySubscriptionSync({
+    shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-drift-0001",
+    expectedPlanId: pid, readWorld: () => drifted,
+  });
+  assert.equal(got.ok, false);
+  assert.equal(got.reason, APPLY_REJECT.PLAN_STALE);
+  assert.notEqual(got.actual, pid);
+  assert.ok(got.plan, "要把新算出来的计划给人看，不能只说一句「过期了」");
+  // **零写入。**
+  assert.equal(w.read().snapshot_id, w.snap.snapshot_id, "计划过期时一个字节都不许写");
+});
+
+test("落盘：快照被别的路径改过时，第二道 CAS 要拦住", () => {
+  // 锁只在本机有效。计划指纹对得上，但快照文件在锁之外被换过 —— 这时
+  // **第一层看不出来，只有逐条 CAS 拦得住。**
+  const w = applyWorld();
+  const plan = planSubscriptionSync(w.world);
+  const pid = planId(plan);
+
+  // 悄悄把盘上那份换成另一个 revision（合法快照，但不是计划依据的那一份）。
+  const bumped = materializeDialogueBindingAuthorization({
+    runtimeNamespace: SYNC_NS, endpointId: SYNC_EP,
+    subscription: syncSub({ version: 3, scope: { ...syncSub().scope, sender_ids: ["u_third"] } }),
+    binding: w.binding, previousSnapshot: w.snap });
+  assert.equal(bumped.ok, true, bumped.reason ?? "");
+  fs.writeFileSync(w.file, JSON.stringify(bumped.snapshot, null, 2));
+
+  const got = applySubscriptionSync({
+    shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-cas-00001",
+    expectedPlanId: pid, readWorld: () => w.world,
+  });
+  assert.equal(got.ok, false);
+  assert.equal(got.reason, APPLY_REJECT.EXPECT_MISMATCH);
+  assert.ok(got.field, "要说清是哪个字段对不上");
+  assert.equal(w.read().snapshot_id, bumped.snapshot.snapshot_id, "拦下来就不许动它");
+});
+
+test("落盘：另一笔事务没做完时不许再开一笔", () => {
+  const w = applyWorld();
+  const pid = planId(planSubscriptionSync(w.world));
+  // 手工留下一份停在 prepared 的记录 —— 那就是"上次没做完"的证据。
+  fs.mkdirSync(path.join(w.dir, "sync-operations"), { recursive: true });
+  fs.writeFileSync(path.join(w.dir, "sync-operations", "op-stuck-0001.json"),
+    JSON.stringify({ schema_version: "subscription-sync-operation/v1",
+      operation_id: "op-stuck-0001", plan_id: "sync_plan_" + "0".repeat(24),
+      status: "prepared", prepared_at: new Date().toISOString(), committed_at: null, writes: [] }));
+
+  const got = applySubscriptionSync({
+    shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-second-001",
+    expectedPlanId: pid, readWorld: () => w.world,
+  });
+  assert.equal(got.ok, false);
+  assert.equal(got.reason, APPLY_REJECT.OPERATION_IN_FLIGHT);
+  assert.equal(got.operationId, "op-stuck-0001", "要说清是哪一笔卡着");
+  assert.equal(w.read().snapshot_id, w.snap.snapshot_id, "零写入");
+});
+
+test("落盘：控制面锁被占时不动手；suspend / migrate 明确拒绝而不是编一个出来", () => {
+  const w = applyWorld();
+  const pid = planId(planSubscriptionSync(w.world));
+
+  // 锁被别人拿着（owner pid 必须是活的，否则会被当成崩溃残留接管）。
+  fs.mkdirSync(w.lockDir, { recursive: true });
+  fs.writeFileSync(path.join(w.lockDir, "owner.json"),
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  const busy = applySubscriptionSync({
+    shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-busy-00001",
+    expectedPlanId: pid, readWorld: () => w.world });
+  assert.equal(busy.reason, APPLY_REJECT.LOCK_BUSY);
+  assert.equal(w.read().snapshot_id, w.snap.snapshot_id, "拿不到锁就一个字节都不写");
+  fs.rmSync(w.lockDir, { recursive: true, force: true });
+
+  // **撤销/迁移还没定"被撤销的授权长什么样"，所以明确失败，不编一个出来。**
+  // 编错了会写出一份看着合法、语义错误的快照，而那种错只在下一条消息被放行或
+  // 被拒时才暴露。
+  const revoke = { ...w.world, next: null };
+  const revokePlan = planSubscriptionSync(revoke);
+  assert.equal(revokePlan.counts.suspend, 1);
+  const got = applySubscriptionSync({
+    shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-revoke-001",
+    expectedPlanId: planId(revokePlan), readWorld: () => revoke });
+  assert.equal(got.ok, false);
+  assert.equal(got.reason, APPLY_REJECT.UNSUPPORTED_ACTION);
+  assert.equal(got.action, SYNC_ACTION.SUSPEND);
+  assert.equal(w.read().snapshot_id, w.snap.snapshot_id, "零写入");
+});
 
 test("计划指纹顺序无关，但少一样内容都要变", () => {
   // 这份摘要要回答的问题只有一个：**锁内重算出来的，跟当初给人看的是不是同一份。**

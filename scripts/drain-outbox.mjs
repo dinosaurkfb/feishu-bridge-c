@@ -16,7 +16,7 @@ import path from "node:path";
 
 import { listPending, markSent, composeDigest } from "./outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
-import { publishDraft } from "./outbound.mjs";
+import { PUBLISH_FAILURE, classifyPublishFailure, publishDraft } from "./outbound.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
@@ -27,7 +27,13 @@ import {
   businessActivitiesForPublishedBatch, recordClaudeActivityAndMaybeRotate,
 } from "./automatic-topic-rotation.mjs";
 
-const groupByTargetGeneration = (records) => {
+/**
+ * 按目标代际分组。**导出给抑制命令共用** —— 两处各写一份解析就是分叉的开始，
+ * 而且实测已经分叉过：排空把旧格式记录归入当前代际，抑制命令却按原始字段过滤，
+ * 于是传诊断给出的代际 id 进去，显示"待发 0 条"。
+ * **提示指向的操作做不到它说的事。**
+ */
+export const groupByTargetGeneration = (records) => {
   const groups = new Map();
   for (const record of records) {
     const key = record.target_channel_generation_id ?? "__legacy_active__";
@@ -112,6 +118,11 @@ export function publishErrorDetail(err) {
   return clipBothEnds(detail);
 }
 
+/** 抑制命令的绝对路径：提示里给相对路径，等于让人猜当前工作目录。 */
+export function suppressCmd() {
+  return path.join(moduleRoot(import.meta.url, ".."), "scripts", "feishu-suppress-outbox.mjs");
+}
+
 export function drainProject({
   root, claudeSessionId, dryRun = false, timeoutMs, force = false,
 } = {}) {
@@ -142,6 +153,11 @@ export function drainProject({
   }
   const { config: cfg, mapping } = resolved;
 
+  // **在 try 之外解析。**上一版把它放在 try 里，而 catch 要用它 —— 于是任何发布失败
+  // 都先撞上 ReferenceError，永远走不到诊断。身份从配置推，不认死任何 agent；
+  // 发之前 publishDraft 仍会校验凭据归属。
+  const id = resolveLarkIdentity(cfg);
+  let failingTarget = null;
   // **发布开关要真的管住自动发布。**
   //
   // 它叫 auto_publish_on_completion，但此前只有 inbound.mjs 和 watch-and-publish.mjs
@@ -197,10 +213,11 @@ export function drainProject({
       };
     }
 
-    // 身份从配置推，不在这里认死任何一个 agent；发之前 publishDraft 会校验凭据归属。
-    const id = resolveLarkIdentity(cfg);
     const messageIds = [];
     for (const item of targetBatches) {
+      // 记住正在发哪一个目标：失败诊断要查**这一条**的根消息，
+      // 而不是 mapping.root_message_id —— 后者可能是别的代际，甚至不存在。
+      failingTarget = item.target;
       const messageId = publishDraft({
         profile: id.profile,
         rootMessageId: item.target.rootMessageId,
@@ -232,8 +249,28 @@ export function drainProject({
     };
   } catch (err) {
     // 不标记、不吞掉：留在 outbox，下一个排空者重试。
-    // 挑有用的那半：见 publishErrorDetail。
-    return { status: "error", root, reason: "publish_failed", error: publishErrorDetail(err) };
+      // **只诊断，不自动抑制。**上一版的推理是"失败 + 根消息属于另一个应用 = 永久"，
+      // 那是**从相关性推因果**：瞬时的网络错误发生在跨应用根消息上，照样会触发
+      // 不可逆的抑制。有损动作不能建立在推断出来的因果上 —— 要么拿到确实表示
+      // 身份不兼容的平台错误码，要么由人显式下令。现在选后者。
+      const diagnosis = classifyPublishFailure({
+        rootMessageId: failingTarget?.rootMessageId ?? null,
+        expectedAppId: id?.expectedAppId,
+        larkBin: id?.bin, larkHome: id?.configDir, profile: id?.profile,
+      });
+      return {
+        status: "error", root, reason: "publish_failed",
+        // 挑有用的那半：见 publishErrorDetail。**从头截固定长度会把真正的
+        // 错误码切掉** —— 这条命令光命令回显就上千字符，前 400 字全是命令。
+        error: publishErrorDetail(err),
+        // 诊断只是**线索**，不是判决 —— 调用方拿它给人看，不拿它做有损动作。
+        diagnosis: diagnosis.kind === PUBLISH_FAILURE.ROOT_OWNED_BY_OTHER_APP
+          ? { kind: diagnosis.kind, ownerName: diagnosis.ownerName ?? null,
+              // 带上代际：抑制命令要按代际限定范围，提示里不给它就等于让人一刀切。
+              generationId: failingTarget?.generationId ?? failingTarget?.channelGenerationId ?? null,
+              count: listPending({ outboxDir }).length }
+          : null,
+      };
   } finally {
     releasePublishLock(lockDir);
   }
@@ -295,6 +332,12 @@ if (isDirectRun(import.meta.url)) {
       console.log(tag + "已发布 " + r.count + " 条 -> " + r.messageId);
     } else if (r.status === "dry_run") {
       console.log(tag + "[dry-run] 将发布 " + r.count + " 条：\n---\n" + r.text);
+    } else if (r.status === "error" && r.diagnosis?.kind === "root_owned_by_other_app") {
+      console.error(tag + "发布失败：话题由另一个应用（" + (r.diagnosis.ownerName ?? "未知") +
+        "）创建，当前身份大概率回复不进去，重试可能一直失败。\n" +
+        "  要停止重试（不可逆）：node " + suppressCmd() + " --project " + root +
+        " --generation " + (r.diagnosis.generationId ?? "<代际 id>") + " --apply");
+      hadError = true;
     } else if (r.status === "error") {
       console.error(tag + "排空失败（" + r.reason + "），进展留在 outbox：" + r.error);
       hadError = true;

@@ -120,6 +120,55 @@ function truncate(s, n) {
  * 放在这里而不是各写一遍：只钉一个入口，另一个照样会用错的身份发出去，
  * 而已经发出去的消息是撤不干净的。
  */
+export const PUBLISH_FAILURE = Object.freeze({
+  TRANSIENT: "transient",
+  ROOT_OWNED_BY_OTHER_APP: "root_owned_by_other_app",
+});
+
+/**
+ * 发布失败之后判一次：是**这次不行**，还是**永远不行**。
+ *
+ * 目前只认一种永久失败：**要回复的根消息是另一个应用建的**。
+ * cc2cd 就是这样 —— 它的话题建于切到单智能体方案之前，属于应用 CC；
+ * 而现在的发布身份是 M5Claude。换个身份重试同一件事，结果不会变。
+ *
+ * **只在拿到正面证据时才判永久。**探测本身失败（网络、权限、读不到）一律按瞬时 ——
+ * 抑制是有损的，宁可继续重试制造噪音，也不能把一条本可以发出去的内容悄悄扔掉。
+ *
+ * 探测是**只读**的（messages-mget），而且只在失败路径上跑，happy path 不受影响。
+ */
+export function classifyPublishFailure({
+  rootMessageId, expectedAppId, larkBin, larkHome, profile, timeoutMs, exec = execFileSync,
+} = {}) {
+  if (!rootMessageId || !expectedAppId) return { kind: PUBLISH_FAILURE.TRANSIENT, reason: "no_evidence" };
+  let parsed;
+  try {
+    const out = exec(
+      larkBin ?? "lark-cli",
+      ["im", "+messages-mget", "--message-ids", rootMessageId, "--as", "bot", "--json"],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, LARKSUITE_CLI_PROFILE: profile,
+               ...(larkHome ? { LARKSUITE_CLI_CONFIG_DIR: larkHome } : {}) },
+        timeout: timeoutMs ?? 15_000, maxBuffer: 4 * 1024 * 1024 },
+    );
+    parsed = JSON.parse(out);
+  } catch {
+    return { kind: PUBLISH_FAILURE.TRANSIENT, reason: "probe_failed" };
+  }
+  const sender = parsed?.data?.messages?.[0]?.sender;
+  if (!parsed?.ok || sender?.id_type !== "app_id" || typeof sender?.id !== "string") {
+    return { kind: PUBLISH_FAILURE.TRANSIENT, reason: "probe_inconclusive" };
+  }
+  if (sender.id === expectedAppId) {
+    return { kind: PUBLISH_FAILURE.TRANSIENT, reason: "same_app" };
+  }
+  return {
+    kind: PUBLISH_FAILURE.ROOT_OWNED_BY_OTHER_APP,
+    // 只出应用名，不出 app id —— 那是身份标识，状态和日志里都不该出现。
+    ownerName: typeof sender.name === "string" ? sender.name.slice(0, 40) : null,
+  };
+}
+
 function preflight({ configDir, profile, expectedAppId }) {
   // 没给 expectedAppId 就是调用方没打算校验（老配置、测试）—— 不强求；但给了就必须过。
   if (!expectedAppId) return;

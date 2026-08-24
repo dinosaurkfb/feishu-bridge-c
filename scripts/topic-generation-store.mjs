@@ -43,6 +43,25 @@ export function loadClaudeTopicBinding({
   };
 }
 
+/**
+ * 代际变更用的锁目录。**只有这一份定义。**
+ *
+ * 别处再算一遍是最容易出的那种错：两处各拼一次路径，看起来都在"加锁"，
+ * 实际是两把互不认识的锁 —— 而症状只会在并发下偶发出现。
+ * 抑制命令要跟轮转串行，就必须拿到**同一个**目录。
+ */
+export function topicGenerationLockDir({ source, registryFile = registryPath(), root } = {}) {
+  if (source === "project-files") {
+    return path.join(path.dirname(projectMappingPath(root)), "topic-generation.lock");
+  }
+  if (source === "registry") return path.join(path.dirname(registryFile), "registry.lock");
+  // **说不清就不给锁。**上一版把 undefined 一并当成 registry 绑定，于是
+  // 一个根本没绑定的目录也会去动**本机全局的**控制面锁 —— 测试跑一次就碰一次，
+  // 未绑定项目的命令还会被报成"轮转中"。不知道该锁哪一把时返回 null，
+  // 由调用方决定是拒绝还是走不需要锁的路径。
+  return null;
+}
+
 function mutateClaudeTopicBinding({
   root,
   claudeSessionId,
@@ -54,9 +73,10 @@ function mutateClaudeTopicBinding({
   if (!current.ok) return current;
   const projectFile = projectMappingPath(root);
   const projectBacked = current.source === "project-files";
-  const lockDir = projectBacked
-    ? path.join(path.dirname(projectFile), "topic-generation.lock")
-    : path.join(path.dirname(registryFile), "registry.lock");
+  const lockDir = topicGenerationLockDir({ source: current.source, registryFile, root });
+  // 绑定已经解析出来了才走到这里，所以 source 必是两者之一；真出现第三种，
+  // 宁可明说也不要拿一把猜出来的锁去写。
+  if (lockDir === null) return { ok: false, reason: "binding_source_unknown" };
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return { ok: false, reason: "binding_busy" };
   try {

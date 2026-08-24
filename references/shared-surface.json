@@ -248,6 +248,7 @@
       "SUBSCRIPTION_REJECT",
       "SUBSCRIPTION_SCHEMA_VERSION",
       "buildLegacySubscriptionReadModel",
+      "claimable",
       "compareFirstClaimShadow",
       "legacyEndpointId",
       "selectPendingSubscriptionClaim",

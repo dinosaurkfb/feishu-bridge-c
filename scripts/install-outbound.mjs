@@ -320,6 +320,7 @@ const SKILLS = [
   { src: "claude-feishu-unbind",     dst: "feishu-unbind" },
   { src: "claude-feishu-rotate",     dst: "feishu-rotate" },
   { src: "claude-feishu-mode",       dst: "feishu-mode" },
+  { src: "claude-feishu-subscribe",  dst: "feishu-subscribe" },
   { src: "claude-feishu-pin-session", dst: "feishu-pin-session" },
 ];
 

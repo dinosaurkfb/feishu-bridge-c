@@ -321,6 +321,7 @@ const SKILLS = [
   { src: "claude-feishu-rotate",     dst: "feishu-rotate" },
   { src: "claude-feishu-mode",       dst: "feishu-mode" },
   { src: "claude-feishu-subscribe",  dst: "feishu-subscribe" },
+  { src: "claude-feishu-pin-session", dst: "feishu-pin-session" },
 ];
 
 const skillSrcOf = (n) => path.join(ROOT, "skills", n, "SKILL.md");

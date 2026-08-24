@@ -26,7 +26,7 @@ import {
   splitByRelation, subscriptionFacts,
 } from "./layered-status.mjs";
 import { collectProjectConnectivity, renderConnectivity } from "./status-providers.mjs";
-import { attributeSession, loadRegistry } from "./registry.mjs";
+import { exactProjectsForRoot, loadRegistryStrict } from "./registry.mjs";
 
 const arg = (n) => {
   const i = process.argv.indexOf("--" + n);
@@ -50,11 +50,17 @@ const layeredConnectivity = renderConnectivity(
 
 // **出站路由认不认这个项目。**第 3 层其余各行读的是项目内文件，
 // 而出站走登记表 —— 两套可以不一致，而那种不一致最难查。
-const reg = loadRegistry();
+// **用严格读取，不用 loadRegistry。**后者服务钩子：读不到就安静当成"没接桥"，
+// 于是 EACCES / EISDIR / 根节点是数组 全被当成 no_registry —— 状态页会把
+// "读不出来"报成"降级"。要据此下判断的调用方必须用严格版。
+const reg = loadRegistryStrict();
+// **精确匹配这个项目，不是"哪个登记项目能覆盖当前目录"。**
+// attributeSession 走的是目录包含关系：登记表里只有父目录 /projects、
+// 当前绑定是 /projects/A 时它照样命中 —— 状态页显示正常，
+// 而 Stop 钩子实际会把回答**归给父项目**。
 const outboundRouting = outboundRoutingFact({
   registryOk: reg.ok,
-  attributedCount: reg.ok
-    ? attributeSession({ projects: reg.projects, cwd: root, transcriptPath: null }).length : 0,
+  exactCount: reg.ok ? exactProjectsForRoot(reg.projects, root).length : 0,
   bound: st.ok === true,
 });
 

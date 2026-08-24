@@ -190,16 +190,20 @@ const relationRow = (c) => [c.displayName,
  *   · degraded  项目内绑定在，但登记表里没有 —— **绑定已降级，出站不会工作**
  *   · unknown   登记表读不出来。**不许把"没查清"报成"没问题"**，也不许报成"坏了"
  */
-export function outboundRoutingFact({ registryOk, attributedCount, bound }) {
+export function outboundRoutingFact({ registryOk, exactCount, bound }) {
   if (!bound) return null;                    // 项目内都没有绑定，这一层没什么可说
   if (registryOk !== true) return "unknown";
-  return attributedCount > 0 ? "routable" : "degraded";
+  // **多于一条也不算正常。**同一个项目在登记表里有两条时，出站挑哪一条是不确定的 ——
+  // 报"正常"等于把一个说不清的状态说成说得清。
+  if (exactCount > 1) return "ambiguous";
+  return exactCount === 1 ? "routable" : "degraded";
 }
 
 const OUTBOUND_ROUTING_TEXT = {
   degraded: "**绑定已降级** —— 项目内绑定在，但登记表里没有它，出站不会工作。"
     + "跑 /feishu-bind 补登记（复用原话题，不新建）",
   unknown: "说不清（登记表读不出来）—— 没查清，不代表没问题",
+  ambiguous: "**登记表里有多条这个项目** —— 出站挑哪一条不确定。先人工只保留一条",
 };
 
 export function composeLayeredStatus({
@@ -291,7 +295,7 @@ export function composeLayeredStatus({
   ];
   // **只在不正常的时候出这一行。**routable 是常态，天天报一句"正常"
   // 会把真正需要注意的那两种淹掉。
-  if (outboundRouting === "degraded" || outboundRouting === "unknown") {
+  if (outboundRouting !== null && outboundRouting !== "routable") {
     L3.push(["出站路由", OUTBOUND_ROUTING_TEXT[outboundRouting]]);
   }
   if (st.pendingGeneration !== null && st.pendingGeneration !== undefined) {

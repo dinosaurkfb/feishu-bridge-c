@@ -8212,19 +8212,20 @@ test("端点自检不许拿出站身份顶替入站 —— 这是语义假阳性
   assert.match(inbound.detail, /期望值不是观测值/u);
 });
 
-test("出站路由的三种结论要分开，且不许把「没查清」报成「没问题」", () => {
+test("出站路由的四种结论要分开，且不许把「没查清」报成「没问题」", () => {
   // 第 3 层其余各行读的是项目内文件，而出站走登记表 —— **两套**。
   // 不一致时状态页会理直气壮地报"已绑定 · 第 N 代 · 有效期 2027"，
-  // 而每一轮答复都没进过出站流程，一句错误提示都没有。线上就这么断了十几个小时，
-  // 我自己也是先信了第 3 层才判断错的。
+  // 而每一轮答复都没进过出站流程。线上就这么断了十几个小时。
   const bound = { bound: true };
-  assert.equal(outboundRoutingFact({ ...bound, registryOk: true, attributedCount: 1 }), "routable");
-  assert.equal(outboundRoutingFact({ ...bound, registryOk: true, attributedCount: 0 }), "degraded");
-  // **登记表读不出来是第三种**，既不能当成好也不能当成坏。
-  assert.equal(outboundRoutingFact({ ...bound, registryOk: false, attributedCount: 0 }), "unknown");
-  assert.equal(outboundRoutingFact({ ...bound, registryOk: undefined, attributedCount: 9 }), "unknown");
+  assert.equal(outboundRoutingFact({ ...bound, registryOk: true, exactCount: 1 }), "routable");
+  assert.equal(outboundRoutingFact({ ...bound, registryOk: true, exactCount: 0 }), "degraded");
+  // **多于一条也不算正常** —— 出站挑哪一条不确定，报"正常"是把说不清说成说得清。
+  assert.equal(outboundRoutingFact({ ...bound, registryOk: true, exactCount: 2 }), "ambiguous");
+  // **登记表读不出来是另一种**，既不能当成好也不能当成坏。
+  assert.equal(outboundRoutingFact({ ...bound, registryOk: false, exactCount: 0 }), "unknown");
+  assert.equal(outboundRoutingFact({ ...bound, registryOk: undefined, exactCount: 9 }), "unknown");
   // 项目内本来就没绑定 → 这一层没什么可说，不该硬报一个结论。
-  assert.equal(outboundRoutingFact({ bound: false, registryOk: true, attributedCount: 0 }), null);
+  assert.equal(outboundRoutingFact({ bound: false, registryOk: true, exactCount: 0 }), null);
 });
 
 test("真实 feishu-status CLI 会把「绑定已降级」说出来", () => {
@@ -8265,6 +8266,38 @@ test("真实 feishu-status CLI 会把「绑定已降级」说出来", () => {
   fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
     projects: [{ id: "p", root: proj, root_message_id: "om_x" }] }));
   assert.equal(run().includes("出站路由"), false, "正常时不该多这一行");
+
+  // **父目录不是这个项目。**evaluator 用目录包含关系时，登记表里只有父目录也会命中 ——
+  // 状态页显示正常，而 Stop 钩子实际会把回答**归给父项目**。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "parent", root: dir, root_message_id: "om_p" }] }));
+  const byParent = run();
+  assert.match(byParent, /绑定已降级/u, "父目录命中不算这个项目被登记");
+
+  // 同一个项目两条 → 出站挑哪一条不确定，不许报正常。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0", projects: [
+    { id: "a", root: proj, root_message_id: "om_a" },
+    { id: "b", root: proj + "/", root_message_id: "om_b" }] }));
+  assert.match(run(), /有多条这个项目/u, "逻辑重复也要说出来");
+
+  // ── 读取故障的三种，都必须是 unknown，不是 degraded ──
+  //
+  // 上一版用 loadRegistry()，它把所有读取异常都当成 no_registry ——
+  // EACCES / EISDIR 会被显示成"降级"，根节点是数组会被当成空表，
+  // **根节点是 null 甚至可能让 status 直接崩**。
+  fs.rmSync(reg);
+  fs.mkdirSync(reg);                                   // 路径是目录 → EISDIR
+  const isdir = run();
+  assert.match(isdir, /说不清（登记表读不出来）/u);
+  assert.equal(isdir.includes("绑定已降级"), false, "读不出来不等于降级");
+  fs.rmdirSync(reg);
+
+  for (const [what, body] of [["根节点是 null", "null"], ["根节点是数组", "[]"]]) {
+    fs.writeFileSync(reg, body);
+    const got = run();                                  // run() 内部断言了退出码为 0
+    assert.match(got, /说不清（登记表读不出来）/u, what);
+    assert.equal(got.includes("绑定已降级"), false, what + "：不等于降级");
+  }
 });
 
 test("真实 feishu-status CLI 跑出来的第 1 层不会声称全部通过", () => {

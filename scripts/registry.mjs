@@ -87,6 +87,16 @@ export function loadRegistry(file = registryPath()) {
     return { ok: false, reason: "bad_json", file, error: err.message, projects: [] };
   }
 
+  // **形状不对要跟坏 JSON 一样报出来，不能崩。**根节点是 null 时
+  // `parsed.projects` 直接抛 —— 而这个函数是钩子在用的，**崩在钩子里等于
+  // 整条出站无声消失**，比返回一个错误糟得多。
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, reason: "bad_shape", file, error: "根节点不是对象", projects: [] };
+  }
+  if (parsed.projects !== undefined && !Array.isArray(parsed.projects)) {
+    return { ok: false, reason: "bad_shape", file, error: "projects 不是数组", projects: [] };
+  }
+
   const projects = [];
   for (const p of parsed.projects ?? []) {
     if (!p || typeof p.root !== "string" || p.root.length === 0) continue;

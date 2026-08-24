@@ -22,7 +22,8 @@ import path from "node:path";
 
 import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { bindingsForRoot, currentBinding, describeStatus, setBindingStatus } from "./feishu-control.mjs";
-import { registryPath } from "./registry.mjs";
+import { acquirePublishLock, registryPath, releasePublishLock } from "./registry.mjs";
+import { topicGenerationLockDir } from "./topic-generation-store.mjs";
 import { publishDraft, sendToChat } from "./outbound.mjs";
 import { isDirectRun } from "./direct-run.mjs";
 import {
@@ -66,11 +67,39 @@ const template = tpl.template;
 // 重复建话题是这条命令唯一能造成的不可撤销的破坏。
 
 const regFile = registryPath();
-let registry = { schema_version: "1.0", projects: [] };
-try {
-  registry = JSON.parse(fs.readFileSync(regFile, "utf-8"));
-  registry.projects ??= [];
-} catch { /* 没有登记表就新建 */ }
+
+/**
+ * 读登记表。**只有"文件不存在"才当成空表。**
+ *
+ * 上一版把所有异常都当成"没有登记表"，于是坏 JSON、权限错误也会走进新建逻辑 ——
+ * 那等于拿一张空表去覆盖一份读不出来的真实登记表，**把别的项目的绑定一起抹掉**。
+ * 读不出来跟没有，是完全不同的两件事。
+ */
+function loadRegistryStrict(file) {
+  let text;
+  try { text = fs.readFileSync(file, "utf-8"); }
+  catch (err) {
+    if (err.code === "ENOENT") return { ok: true, registry: { schema_version: "1.0", projects: [] } };
+    return { ok: false, reason: "登记表读不了（" + err.code + "）：" + err.message };
+  }
+  let parsed;
+  try { parsed = JSON.parse(text); }
+  catch (err) { return { ok: false, reason: "登记表不是合法 JSON：" + err.message }; }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, reason: "登记表根节点不是对象" };
+  }
+  if (parsed.projects !== undefined && !Array.isArray(parsed.projects)) {
+    return { ok: false, reason: "登记表 projects 不是数组" };
+  }
+  parsed.projects ??= [];
+  return { ok: true, registry: parsed };
+}
+
+const loaded0 = loadRegistryStrict(regFile);
+if (!loaded0.ok) {
+  die(loaded0.reason, "没有动任何文件。先把 " + regFile + " 修好或挪走，再重跑。");
+}
+let registry = loaded0.registry;
 
 const at = registry.projects.findIndex((p) => p?.root === root);
 const already = at >= 0 ? registry.projects[at] : null;
@@ -132,20 +161,51 @@ if (fs.existsSync(legacyMapping)) {
     console.log("\n[dry-run] 什么都没写。加 --apply 补登记。");
     process.exit(0);
   }
-  const adopted = newRegistryEntry({
-    root, name: arg("name") ?? readProjectIdentity({ root }).name,
-    purpose: arg("purpose") ?? null, token: bindingToken(root), rootMessageId: rootId,
-  });
-  registry.projects.push(adopted);
+  // **锁内重读再写。**上一版拿锁外那份快照直接 push —— 并发的绑定或迁移
+  // 会被整体覆盖掉。登记表的锁跟轮转用的是同一把（registry 绑定那条分支），
+  // 路径由 topicGenerationLockDir 唯一定义，不在这里另拼一份。
+  const lockDir = topicGenerationLockDir({ source: "registry", registryFile: regFile, root });
+  const lock = acquirePublishLock(lockDir);
+  if (!lock.ok) die("登记表正忙（" + lock.reason + "），没有动它。稍后再试。");
   try {
-    fs.mkdirSync(path.dirname(regFile), { recursive: true, mode: 0o700 });
-    if (fs.existsSync(regFile)) fs.copyFileSync(regFile, regFile + ".prev");
-    const tmp = regFile + ".tmp." + process.pid;
-    fs.writeFileSync(tmp, JSON.stringify(registry, null, 2) + "\n", { mode: 0o600 });
-    fs.renameSync(tmp, regFile);
-  } catch (err) {
-    console.error("补登记没写成：" + err.message);
-    process.exit(1);
+    const fresh = loadRegistryStrict(regFile);
+    if (!fresh.ok) die(fresh.reason, "没有动任何文件。");
+    registry = fresh.registry;
+
+    // 同一个 root 出现多条 → 说不清该改哪一条，拒绝。
+    const sameRoot = registry.projects
+      .map((p, i) => ({ p, i }))
+      .filter((x) => x.p?.root === root);
+    if (sameRoot.length > 1) {
+      die("登记表里有 " + sameRoot.length + " 条同一个项目的记录，说不清该改哪一条。",
+        "先人工确认并只保留一条，再重跑。没有动任何文件。");
+    }
+    // 锁内重读后可能已经被别人补上了 —— 那就什么都不用做。
+    if (sameRoot.length === 1 && sameRoot[0].p.root_message_id) {
+      console.log("\n锁内重读发现它已经登记好了（可能是另一个进程刚补的），没有重复写。");
+      process.exit(0);
+    }
+
+    const adopted = newRegistryEntry({
+      root, name: arg("name") ?? readProjectIdentity({ root }).name,
+      purpose: arg("purpose") ?? null, token: bindingToken(root), rootMessageId: rootId,
+    });
+    // **有同 root 的残缺条目就地修，不再 push 一条** —— 那会制造重复归属。
+    if (sameRoot.length === 1) registry.projects[sameRoot[0].i] = { ...sameRoot[0].p, ...adopted };
+    else registry.projects.push(adopted);
+
+    try {
+      fs.mkdirSync(path.dirname(regFile), { recursive: true, mode: 0o700 });
+      if (fs.existsSync(regFile)) fs.copyFileSync(regFile, regFile + ".prev");
+      const tmp = regFile + ".tmp." + process.pid;
+      fs.writeFileSync(tmp, JSON.stringify(registry, null, 2) + "\n", { mode: 0o600 });
+      fs.renameSync(tmp, regFile);
+    } catch (err) {
+      console.error("补登记没写成：" + err.message);
+      process.exit(1);
+    }
+  } finally {
+    releasePublishLock(lockDir);
   }
   console.log("\n已补登记      " + regFile + "  （现在 " + registry.projects.length + " 个项目）");
   console.log("没有建新话题，也没有往群里发任何消息。下一轮会话结束时答复会走出站。");

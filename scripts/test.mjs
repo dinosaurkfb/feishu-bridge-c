@@ -8960,6 +8960,109 @@ test("测试不许走真实发布路径 —— 每个 drainProject 调用都要�
     "这些调用注入了 publish 却没注入 diagnose —— 失败后的诊断仍会真的出网");
 });
 
+test("补登记必须 fail-closed：读不出来的登记表不许被空表覆盖", () => {
+  // 评审在**已合并**的实现里查出来的。上一版把所有读取异常都当成"没有登记表"，
+  // 于是坏 JSON、权限错误也会走进新建逻辑 —— 那等于拿一张空表去覆盖一份读不出来的
+  // 真实登记表，**把别的项目的绑定一起抹掉**。
+  // 读不出来跟没有，是完全不同的两件事。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-bindfc-"));
+  const proj = path.join(dir, "proj");
+  const inbound = path.join(proj, ".runtime-data", "inbound");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: proj, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_existing",
+    feishu_root_message_id_reference: "om_existing", channel_generation_id: "gen-4" }));
+  const reg = path.join(dir, "registry.json");
+  const tpl = path.join(dir, "chain-config.json");
+  fs.writeFileSync(tpl, JSON.stringify(TPL));
+  const bind = (...args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, ...args,
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: reg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: dir } });
+  const raw = () => fs.readFileSync(reg, "utf-8");
+
+  // 坏 JSON：拒绝、非零退出、**文件一个字节都不许动**。
+  fs.writeFileSync(reg, "这不是 json{");
+  const broken = bind("--apply");
+  assert.equal(broken.status, 1);
+  assert.match(broken.stderr, /不是合法 JSON/u);
+  assert.match(broken.stderr, /没有动任何文件/u);
+  assert.equal(raw(), "这不是 json{", "读不出来就绝不许覆盖");
+
+  // 形状不对（projects 不是数组）也一样。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0", projects: "nope" }));
+  assert.equal(bind("--apply").status, 1, "projects 不是数组也要拒");
+
+  // **读取本身失败也要拒。**这一条不能漏：坏 JSON 走的是 parse 那条分支，
+  // 而"读不出来"走的是 readFileSync 的 catch —— 只测前者的话，
+  // 把 catch 改成"一律当空表"照样绿（第一版就是这样）。
+  fs.rmSync(reg);
+  fs.mkdirSync(reg);                       // 路径是目录 → 读取抛 EISDIR
+  const unreadable = bind("--apply");
+  assert.equal(unreadable.status, 1, "读不出来也要拒，不能当成空表");
+  assert.match(unreadable.stderr, /读不了|没有动任何文件/u);
+  assert.equal(fs.statSync(reg).isDirectory(), true, "拒绝时不许改动它");
+  fs.rmdirSync(reg);
+
+  // 只有"文件不存在"才当成空表。（上一步已经把它删掉了，这里不再删一次。）
+  assert.equal(fs.existsSync(reg), false);
+  const fresh = bind("--apply");
+  assert.equal(fresh.status, 0, fresh.stderr);
+  assert.equal(JSON.parse(raw()).projects.length, 1);
+});
+
+test("补登记要在锁内重读；同 root 多条拒绝，单条残缺就地修", () => {
+  // 另外两条 P1：上一版拿锁外那份快照直接 push —— 并发的绑定或迁移会被整体覆盖；
+  // 而且同 root 但缺 root_message_id 的条目会被再 push 一条，**制造重复归属**。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-bindlock-"));
+  const proj = path.join(dir, "proj");
+  const inbound = path.join(proj, ".runtime-data", "inbound");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: proj, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_existing",
+    feishu_root_message_id_reference: "om_existing", channel_generation_id: "gen-4" }));
+  const reg = path.join(dir, "registry.json");
+  const tpl = path.join(dir, "chain-config.json");
+  fs.writeFileSync(tpl, JSON.stringify(TPL));
+  const bind = (...args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, ...args,
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: reg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: dir } });
+  const projects = () => JSON.parse(fs.readFileSync(reg, "utf-8")).projects;
+
+  // 同 root 两条 → 说不清改哪条，拒绝且不动文件。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "a", root: proj }, { id: "b", root: proj }] }));
+  const dup = bind("--apply");
+  assert.equal(dup.status, 1);
+  assert.match(dup.stderr, /说不清该改哪一条/u);
+  assert.equal(projects().length, 2, "拒绝时不许动登记表");
+
+  // 同 root 一条但缺 root_message_id → **就地修**，不新增。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "stale", root: proj, name: "旧" }] }));
+  const fixed = bind("--apply");
+  assert.equal(fixed.status, 0, fixed.stderr);
+  assert.equal(projects().length, 1, "同 root 不许出现第二条 —— 那是重复归属");
+  assert.equal(projects()[0].root_message_id, "om_existing");
+
+  // 登记表控制锁被占 → 不动手。owner pid 必须活着，否则会被当成崩溃残留接管。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0", projects: [] }));
+  const lockDir = topicGenerationLockDir({ source: "registry", registryFile: reg, root: proj });
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(path.join(lockDir, "owner.json"),
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  const busy = bind("--apply");
+  assert.equal(busy.status, 1);
+  assert.match(busy.stderr, /登记表正忙/u);
+  assert.equal(projects().length, 0, "拿不到锁就一条都不许写");
+  fs.rmSync(lockDir, { recursive: true, force: true });
+});
+
 test("有 mapping 但没登记不算已接入 —— 那是发不出去还不报错的状态", () => {
   // 线上真事：这个项目的绑定在项目目录里，登记表里却没有它。
   // **出站路由看的是登记表** —— Stop 钩子挑不到项目就静默退出，一句日志都不写。

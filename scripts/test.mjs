@@ -82,6 +82,7 @@ import { bindingToConnections } from "./group-binding-status.mjs";
 import {
   SYNC_ACTION, SYNC_REJECT, authorizationCovers, planSubscriptionSync, renderSyncPlan,
 } from "./subscription-sync.mjs";
+import { APPLY_REJECT, planId, verifyExpect } from "./subscription-sync-apply.mjs";
 import { renderSubscriptions, subscriptionDetails } from "./feishu-subscribe.mjs";
 import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
 import {
@@ -8688,6 +8689,83 @@ test("授权内容没变就是 no-op，不许生成一份「重新物化」计�
     snapshots: [snap] });
   assert.equal(real.noop, false);
   assert.equal(real.counts.resnapshot, 1);
+});
+
+const applyEntry = (over = {}) => ({
+  bindingRef: "binding_ref_" + "a".repeat(24), localTargetId: "target_" + SYNC_HEX,
+  action: SYNC_ACTION.SUSPEND, reason: "subscription_revoked",
+  expect: { subscriptionId: SYNC_SID, subscriptionVersion: 1,
+    authorizationRevision: 1, snapshotId: "binding_authorization_" + "b".repeat(24) },
+  ...over,
+});
+const applyPlan = (entries) => ({ ok: true, noop: false, plans: entries });
+
+test("计划指纹顺序无关，但少一样内容都要变", () => {
+  // 这份摘要要回答的问题只有一个：**锁内重算出来的，跟当初给人看的是不是同一份。**
+  const a = applyEntry({ bindingRef: "binding_ref_" + "1".repeat(24) });
+  const b = applyEntry({ bindingRef: "binding_ref_" + "2".repeat(24) });
+
+  // 重读的顺序本来就可能不同 —— 顺序不该改变结论。
+  assert.equal(planId(applyPlan([a, b])), planId(applyPlan([b, a])));
+  // 条数变了就是另一份计划。
+  assert.notEqual(planId(applyPlan([a])), planId(applyPlan([a, b])));
+
+  // **每一样都要进指纹**：少放一样就会出现"指纹相同但写的东西不同"。
+  const base = planId(applyPlan([a]));
+  for (const [what, over] of [
+    ["动作", { action: SYNC_ACTION.RESNAPSHOT }],
+    ["迁移目标", { toSubscriptionId: "subscription_" + "f".repeat(24) }],
+    // expect 四个字段**逐个都要试**。第一版漏了 subscriptionId，
+    // 于是"指纹里不含它"这个变异照样绿 —— 少试一个，就少守一个。
+    ["订阅身份前置", { expect: { ...a.expect, subscriptionId: "subscription_" + "e".repeat(24) } }],
+    ["订阅版本前置", { expect: { ...a.expect, subscriptionVersion: 2 } }],
+    ["授权 revision 前置", { expect: { ...a.expect, authorizationRevision: 2 } }],
+    ["快照 id 前置", { expect: { ...a.expect, snapshotId: "binding_authorization_" + "c".repeat(24) } }],
+  ]) {
+    assert.notEqual(planId(applyPlan([{ ...a, ...over }])), base, what + "变了，指纹却没变");
+  }
+
+  // noop 也是一种结论，不能跟"空计划"混同。
+  assert.notEqual(planId({ ok: true, noop: true, plans: [] }),
+    planId({ ok: true, noop: false, plans: [] }));
+  // 算不出计划就没有指纹 —— 不许拿 null 当一个值去比。
+  assert.equal(planId({ ok: false, reason: "x" }), null);
+  assert.equal(planId(null), null);
+});
+
+test("落盘前的第二道 CAS：四个字段每一个都要比", () => {
+  // 锁内重算已经挡住绝大多数漂移，但**锁只在本机有效**，快照文件可能被别的路径
+  // 改写。这一层是对"锁之外还有人动过"的兜底。
+  const entry = applyEntry();
+  const current = {
+    subscription_id: SYNC_SID, subscription_version: 1,
+    authorization_revision: 1, snapshot_id: entry.expect.snapshotId,
+  };
+  assert.equal(verifyExpect(entry, current).ok, true);
+
+  // 逐个字段打歪，每一个都必须被指名道姓地拦下。
+  for (const [field, bad] of [
+    ["subscription_id", { subscription_id: "subscription_" + "f".repeat(24) }],
+    ["subscription_version", { subscription_version: 2 }],
+    ["authorization_revision", { authorization_revision: 2 }],
+    ["snapshot_id", { snapshot_id: "binding_authorization_" + "d".repeat(24) }],
+  ]) {
+    const got = verifyExpect(entry, { ...current, ...bad });
+    assert.equal(got.ok, false, field + " 变了却放行");
+    assert.equal(got.reason, APPLY_REJECT.EXPECT_MISMATCH);
+    assert.equal(got.field, field, "要说清是哪个字段对不上");
+  }
+
+  // 快照没了 —— 跟"对不上"分开报：前者是找不到，后者是找到了但不是那一份。
+  assert.equal(verifyExpect(entry, null).reason, APPLY_REJECT.SNAPSHOT_MISSING);
+
+  // **expect 自己缺字段也要拒**，不能因为"没写"就当成"不限制" ——
+  // 那正好是有损写入最不该有的宽容。
+  for (const f of ["subscriptionId", "subscriptionVersion", "authorizationRevision", "snapshotId"]) {
+    const holed = { ...entry.expect };
+    delete holed[f];
+    assert.equal(verifyExpect({ ...entry, expect: holed }, current).ok, false, f + " 缺失却放行");
+  }
 });
 
 test("拿一份说不清的订阅去同步要被拒", () => {

@@ -8,6 +8,16 @@
 
 import { stableControlId } from "./subscription.mjs";
 
+/**
+ * 这个值能不能当作代际 id 用 —— **全仓唯一的判据，住在"代际"这个概念的家里。**
+ *
+ * outbox 写入端、抑制核心的三态判定、两侧包装层的 expectation 检查都走它。
+ * 它散在各处的时候出过一次事：核心的 expectation 检查收紧成 trim() 之后，
+ * dependsOnMapping 还留在 length > 0 上，于是 `"   "` 被当成"自带明确代际"，
+ * 绕过全部守卫被永久抑制。**同一个概念一处分清、另一处混回去。**
+ */
+export const usableGeneration = (v) => typeof v === "string" && v.trim() !== "";
+
 export const TOPIC_GENERATION_SCHEMA_VERSION = "1.0";
 export const TOPIC_GENERATION_ARTIFACT_TYPE = "feishu_bridge_topic_generations";
 export const TOPIC_GENERATION_PENDING_MS = 24 * 60 * 60 * 1000;

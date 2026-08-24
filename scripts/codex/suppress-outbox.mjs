@@ -23,7 +23,9 @@ import path from "node:path";
 
 import { isDirectRun } from "../direct-run.mjs";
 import { listPending } from "../outbox.mjs";
-import { applySuppressionCore, dependsOnMapping, usableGeneration } from "../suppress-outbox-core.mjs";
+import {
+  applySuppressionCore, dependsOnMapping, generationTargetState, usableGeneration,
+} from "../suppress-outbox-core.mjs";
 import { activeGeneration, pendingGeneration } from "../topic-generation.mjs";
 import {
   bridgeHome, findTaskForCodexThread, loadRegistry, registryFile,
@@ -87,6 +89,9 @@ export function selectByGeneration(records, generation, task) {
   if (generation === null) return records;
   const out = [];
   for (const r of records) {
+    // **损坏记录无论指定哪个代际都要纳入。**它谁也匹配不上，原本会被静默排除 ——
+    // 不抑制是安全的，但人永远不知道有这么一条。纳进来让核心点名它。
+    if (generationTargetState(r) === "corrupt") { out.push(r); continue; }
     const own = r?.target_channel_generation_id ?? null;
     const resolved = own === null ? resolveTaskOutboundGeneration(task, null) : { ok: true };
     const id = own ?? (resolved.ok ? resolved.channelGenerationId ?? null : null);
@@ -263,6 +268,11 @@ function main() {
       : r.reason === "drift"
         ? "outbox 在预览之后变了（" + r.before + " → " + r.now +
           " 条待发，或换了内容），没有动它。请重新预览确认。"
+      : r.reason === "corrupt_target_generation"
+        ? "这批里有 " + r.count + " 条记录的目标代际是坏的（字段在，但不是可用代际），\n" +
+          "  " + (r.files ?? []).filter(Boolean).map((f) => String(f).split("/").pop()).join("、") + "\n" +
+          "  没有动任何一条 —— 说不清它该发去哪，就不能替它决定不发。\n" +
+          "  先确认这几条记录是怎么写坏的；混着处理会让人以为整批都办完了。"
       : r.reason === "generation_expectation_required"
         ? "这批待发里有旧格式记录（代际靠当前状态现算），落盘必须带上预览看到的那一代。\n" +
           "  先重新跑一次预览，把它打出来的 --expect-generation <代际 id> 原样带上。\n" +

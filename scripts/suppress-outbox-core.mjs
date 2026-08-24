@@ -16,12 +16,46 @@
 
 import { listPending, suppressRecords } from "./outbox.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
+import { usableGeneration } from "./topic-generation.mjs";
 
 const nonEmpty = (v) => typeof v === "string" && v.length > 0;
 
+/**
+ * 这个值能不能当作代际用 —— **全仓唯一的判据**。
+ *
+ * 两侧包装层的 expectation 检查、核心的前置条件、以及记录目标代际的三态判定
+ * 都走它。上一版它只管 expectation，`dependsOnMapping` 还留在旧的 length > 0 上，
+ * 于是空白目标绕过了全部守卫。**同一个概念在同一个 PR 里一处分清、另一处混回去，
+ * 这是第三次了。**
+ */
+export { usableGeneration };
+
+/**
+ * 一条待发记录的目标代际处于哪一态。**三态，不是两态。**
+ *
+ * 上一版只分"有/没有"，判据还是 length > 0 —— 于是
+ * `target_channel_generation_id: "   "` 被当成"自带明确代际"：不要求
+ * expectation、不取代际锁、不做轮转比较，**直接被永久抑制**。评审实测复现。
+ *
+ * - `legacy`  ：字段缺失或 null —— 合法的旧格式，代际靠当前 mapping 现算。
+ * - `frozen`  ：可用的非空代际 —— 目标已冻结，轮转不影响它。
+ * - `corrupt` ：字段在，但不是可用代际 —— **损坏记录**。
+ *               不许当成 legacy 去重新解释（那等于替它猜一个目标），
+ *               也不许当成 frozen 放行。fail-closed。
+ */
+export function generationTargetState(record) {
+  const raw = record?.target_channel_generation_id;
+  if (raw === undefined || raw === null) return "legacy";
+  return usableGeneration(raw) ? "frozen" : "corrupt";
+}
+
 /** 这批待发里有没有"代际靠 mapping 现算"的旧格式记录。 */
 export const dependsOnMapping = (records) =>
-  (records ?? []).some((r) => !nonEmpty(r?.target_channel_generation_id));
+  (records ?? []).some((r) => generationTargetState(r) === "legacy");
+
+/** 这批里有没有损坏的目标代际 —— 有就一条都不许动。 */
+export const corruptTargets = (records) =>
+  (records ?? []).filter((r) => generationTargetState(r) === "corrupt");
 
 /**
  * @param outboxDir        待发目录
@@ -33,19 +67,21 @@ export const dependsOnMapping = (records) =>
  * @param readState        锁内调用：() => { activeGeneration, select(records) }
  * @param reason           抑制理由，写进记录
  */
-/**
- * 这个值能不能当作「预览看到的代际」用。
- *
- * 两侧包装层都用它 —— 上一版 Codex 侧只拦 `null`，空串和纯空白就穿过去了，
- * 到核心才被拒，最后在界面上显示成"取锁失败"。**同一个判据两处各写一份，
- * 迟早在其中一处写松。**
- */
-export const usableGeneration = (v) => typeof v === "string" && v.trim() !== "";
-
 export function applySuppressionCore({
   outboxDir, publishLockDir, generationLockDir, pending,
   previewGenerationId = null, readState, reason,
 }) {
+  // **损坏记录：一条都不许动，锁一把都不拿。**
+  //
+  // 它的目标代际字段在、但不是可用代际。当成 legacy 去重新解释等于替它猜一个
+  // 目标；当成 frozen 放行则是拿一个说不清的值当"已冻结"——
+  // 两条路都会不可逆地停掉一条我们其实不知道该发去哪的内容。
+  // 这一批里只要有一条坏的，整批都不动：混着抑制会让人以为"那批都处理了"。
+  const corrupt = corruptTargets(pending);
+  if (corrupt.length > 0) {
+    return { ok: false, reason: "corrupt_target_generation",
+      count: corrupt.length, files: corrupt.map((r) => r?._file ?? null) };
+  }
   const needsGeneration = dependsOnMapping(pending);
   // **这批里有旧格式记录 → 必须带着预览看到的代际来落盘。这条前置条件属于核心，
   // 不属于哪个 CLI。**

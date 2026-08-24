@@ -31,7 +31,10 @@ import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { topicGenerationLockDir } from "./topic-generation-store.mjs";
 import { currentBinding } from "./feishu-control.mjs";
-import { applySuppressionCore, dependsOnMapping, usableGeneration } from "./suppress-outbox-core.mjs";
+import {
+  applySuppressionCore, corruptTargets, dependsOnMapping,
+  generationTargetState, usableGeneration,
+} from "./suppress-outbox-core.mjs";
 
 const nonEmptyStr = (v) => typeof v === "string" && v.length > 0;
 
@@ -78,12 +81,18 @@ function activeGenerationOf(mapping) {
 
 export function selectByGeneration(records, generation, mapping) {
   const out = [];
+  // **损坏记录无论指定哪个代际都要纳入。**它的 key 谁也匹配不上，
+  // 于是原本会被静默排除 —— 不抑制是安全的，但人永远不知道有这么一条。
+  // 纳进来，核心会 fail-closed 并点名是哪个文件。
+  out.push(...corruptTargets(records));
   for (const [key, group] of groupByTargetGeneration(records)) {
     const resolved = key === "__legacy_active__"
       ? resolveMappingOutboundGeneration(mapping, null)
       : { generationId: key };
     const id = resolved?.generationId ?? resolved?.channelGenerationId ?? key;
-    if (id === generation || key === generation) out.push(...group);
+    if (id === generation || key === generation) {
+      out.push(...group.filter((r) => generationTargetState(r) !== "corrupt"));
+    }
   }
   return out;
 }
@@ -226,6 +235,11 @@ function main() {
       : r.reason === "drift"
         ? "outbox 在预览之后变了（" + r.before + " → " + r.now +
           " 条待发，或换了内容），没有动它。请重新预览确认。"
+      : r.reason === "corrupt_target_generation"
+        ? "这批里有 " + r.count + " 条记录的目标代际是坏的（字段在，但不是可用代际），\n" +
+          "  " + (r.files ?? []).filter(Boolean).map((f) => String(f).split("/").pop()).join("、") + "\n" +
+          "  没有动任何一条 —— 说不清它该发去哪，就不能替它决定不发。\n" +
+          "  先确认这几条记录是怎么写坏的；混着处理会让人以为整批都办完了。"
       : r.reason === "generation_expectation_required"
         ? "这批待发里有旧格式记录（代际靠当前绑定推算），落盘必须带上预览看到的那一代。\n" +
           "  先重新跑一次预览，把它打出来的 --expect-generation <代际 id> 原样带上。\n" +

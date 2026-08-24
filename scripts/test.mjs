@@ -10512,6 +10512,109 @@ test("真实 CLI：缺 expectation / 纯空白 / 代际不可读，三种都不�
   }
 });
 
+test("写入端不许写出损坏记录：空白目标代际等同于没有目标", () => {
+  // **这是唯一能从源头杜绝损坏记录的地方。**这里本来就把 "" 映射成 null，
+  // 只是漏了纯空白 —— 空白串是 truthy，被原样写进去，就成了一条
+  // "目标字段在、但不是代际"的记录，下游只能去猜该怎么解释它。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-writer-"));
+  const read = (targetGenerationId) => {
+    const outboxDir = path.join(dir, "ob-" + Math.random().toString(36).slice(2));
+    fs.mkdirSync(outboxDir, { recursive: true });
+    const r = appendEvent({ outboxDir, kind: "milestone", text: "x",
+      source: "test", eventKey: "k", targetGenerationId });
+    assert.equal(r.ok, true, r.reason);
+    const f = fs.readdirSync(outboxDir)[0];
+    return JSON.parse(fs.readFileSync(path.join(outboxDir, f), "utf-8"))
+      .target_channel_generation_id;
+  };
+  for (const blank of ["", "   ", "\t\n"]) {
+    assert.equal(read(blank), null,
+      "空白目标必须落成 null（没有冻结目标），不能原样写进去：" + JSON.stringify(blank));
+  }
+  assert.equal(read(undefined), null, "不给就是没有目标");
+  assert.equal(read("gen-1"), "gen-1", "可用代际要原样冻结住");
+});
+
+test("空白目标代际是损坏记录：不许当自带代际放行，也不许当旧格式重新解释", () => {
+  // 评审实测复现的：判据分家 —— 核心的 expectation 检查收紧成 trim() 之后，
+  // dependsOnMapping 还留在 length > 0 上。于是 target_channel_generation_id: "   "
+  // 被当成"自带明确代际"：不要求 expectation、不取代际锁、不做轮转比较，
+  // **直接被永久抑制**。三态判定就是为了这个。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-corrupt-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const rec = path.join(obDir, "0001.json");
+  const genLock = path.join(dir, "gen.lock");
+  const pubLock = path.join(dir, "pub.lock");
+  const call = (target) => {
+    fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "x", published_at: null,
+      ...(target === undefined ? {} : { target_channel_generation_id: target }) }));
+    return applySuppressionCore({
+      outboxDir: obDir, publishLockDir: pubLock, generationLockDir: genLock,
+      pending: [{ _file: rec, ...(target === undefined ? {} : { target_channel_generation_id: target }) }],
+      previewGenerationId: null,
+      readState: () => ({ activeGeneration: "gen-1", select: (x) => x }), reason: "t",
+    });
+  };
+
+  // 三态各验一次。
+  for (const bad of ["   ", "", 7, {}]) {
+    const got = call(bad);
+    assert.equal(got.ok, false, "损坏目标不许放行：" + JSON.stringify(bad));
+    assert.equal(got.reason, "corrupt_target_generation");
+    assert.equal(got.count, 1);
+    assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
+      "一条都不许动 —— 说不清它该发去哪，就不能替它决定不发");
+    assert.equal(fs.existsSync(genLock), false, "拒绝发生在拿锁之前");
+    assert.equal(fs.existsSync(pubLock), false, "发布锁也没拿");
+  }
+  // 缺失 = 合法旧格式，走 expectation 那条路，不是 corrupt。
+  assert.equal(call(undefined).reason, "generation_expectation_required");
+  assert.equal(call(null).reason, "generation_expectation_required");
+  // 可用的非空代际 = 已冻结，放行。
+  const ok = call("gen-1");
+  assert.equal(ok.ok, true, "自带可用代际的记录该照常抑制：" + (ok.reason ?? ""));
+  assert.equal(ok.done.changed, 1);
+});
+
+test("「锁没拿」要证明从未获取，不是只证明已释放", () => {
+  // 评审的测试质量意见：进程结束后检查锁目录不存在，只能证明锁被释放了。
+  // **预先由别人持着锁**：如果拒绝真的发生在取锁之前，结果必须仍是
+  // generation_expectation_required —— 而不是 busy。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-prelock-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const rec = path.join(obDir, "0001.json");
+  fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "旧格式", published_at: null }));
+  const genLock = path.join(dir, "gen.lock");
+  const pubLock = path.join(dir, "pub.lock");
+  // owner 的 pid 必须活着，否则会被当成崩溃残留接管。
+  const hold = (d) => {
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, "owner.json"),
+      JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  };
+  const call = () => applySuppressionCore({
+    outboxDir: obDir, publishLockDir: pubLock, generationLockDir: genLock,
+    pending: [{ _file: rec }], previewGenerationId: null,
+    readState: () => ({ activeGeneration: "gen-1", select: (x) => x }), reason: "t",
+  });
+
+  hold(genLock);
+  const a = call();
+  assert.equal(a.reason, "generation_expectation_required",
+    "代际锁被别人持着也该报缺 expectation —— 报 rotation_busy 就说明它先去抢锁了");
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined);
+
+  fs.rmSync(genLock, { recursive: true, force: true });
+  hold(pubLock);
+  const b = call();
+  assert.equal(b.reason, "generation_expectation_required",
+    "发布锁被别人持着也一样 —— 报 publisher_busy 就说明它先去抢锁了");
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined);
+  assert.ok(fs.existsSync(pubLock), "别人的锁不许被顺手删掉");
+});
+
 test("核心不变量：旧格式记录缺 expectation 一律拒绝，两侧包装层都无权豁免", () => {
   // **这条直接打核心，不经任何 CLI。**两个包装层各自也有一道前置检查，
   // 于是把核心这道守卫拆掉时，走 CLI 的测试照样绿 —— 包装层先拦下了。

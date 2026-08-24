@@ -2679,6 +2679,66 @@ test("locateTask 的 task-key 分支必须读 home 那一份登记表", () => {
   }
 });
 
+test("空白目标代际是损坏记录 —— Codex 侧守着同一条三态判定", () => {
+  // 判据分家的后果两条链是共享的：核心一放松，两边同时漏。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-corrupt-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const rec = path.join(obDir, "0001.json");
+  const genLock = path.join(dir, "gen.lock");
+  const pubLock = path.join(dir, "pub.lock");
+  const call = (target) => {
+    fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "x", published_at: null,
+      ...(target === undefined ? {} : { target_channel_generation_id: target }) }));
+    return applySuppressionCore({
+      outboxDir: obDir, publishLockDir: pubLock, generationLockDir: genLock,
+      pending: [{ _file: rec, ...(target === undefined ? {} : { target_channel_generation_id: target }) }],
+      previewGenerationId: null,
+      readState: () => ({ activeGeneration: "gen-1", select: (x) => x }), reason: "t",
+    });
+  };
+  for (const bad of ["   ", "", 7, {}]) {
+    const got = call(bad);
+    assert.equal(got.ok, false, "损坏目标不许放行：" + JSON.stringify(bad));
+    assert.equal(got.reason, "corrupt_target_generation");
+    assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
+      "一条都不许动");
+    assert.equal(fs.existsSync(genLock), false, "拒绝发生在拿锁之前");
+    assert.equal(fs.existsSync(pubLock), false, "发布锁也没拿");
+  }
+  assert.equal(call(undefined).reason, "generation_expectation_required", "缺失=合法旧格式");
+  assert.equal(call("gen-1").ok, true, "自带可用代际该照常抑制");
+});
+
+test("「锁没拿」要证明从未获取 —— Codex 侧同样预先持锁验一次", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-prelock-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const rec = path.join(obDir, "0001.json");
+  fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "旧格式", published_at: null }));
+  const genLock = path.join(dir, "gen.lock");
+  const pubLock = path.join(dir, "pub.lock");
+  const hold = (d) => {
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, "owner.json"),
+      JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  };
+  const call = () => applySuppressionCore({
+    outboxDir: obDir, publishLockDir: pubLock, generationLockDir: genLock,
+    pending: [{ _file: rec }], previewGenerationId: null,
+    readState: () => ({ activeGeneration: "gen-1", select: (x) => x }), reason: "t",
+  });
+  hold(genLock);
+  assert.equal(call().reason, "generation_expectation_required",
+    "代际锁被别人持着也该报缺 expectation —— 报 rotation_busy 就说明它先去抢锁了");
+  fs.rmSync(genLock, { recursive: true, force: true });
+  hold(pubLock);
+  assert.equal(call().reason, "generation_expectation_required",
+    "发布锁被别人持着也一样");
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined);
+  assert.ok(fs.existsSync(pubLock), "别人的锁不许被顺手删掉");
+});
+
 test("核心不变量：旧格式记录缺 expectation 一律拒绝 —— Codex 侧也守着同一条", () => {
   // **这条直接打核心，不经 CLI。**包装层自己也有一道前置检查，于是把核心那道
   // 守卫拆掉时，走 CLI 的测试照样绿 —— 包装层先拦下了。

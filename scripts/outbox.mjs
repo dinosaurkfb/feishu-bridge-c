@@ -13,6 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { normalizeLocalInput } from "./turn-input.mjs";
 import { isDirectRun, moduleRoot } from "./direct-run.mjs";
+import { usableGeneration } from "./topic-generation.mjs";
 
 /**
  * `reply` 是一轮对话的**原文答复**，由 Stop 钩子从 last_assistant_message 直接取，
@@ -93,7 +94,11 @@ export function appendEvent({
     input_text: localInput || null,
     // INV-9：目标在 outbox 形成时冻结。飞书来源取受理 claim 的 origin generation；
     // 本地来源取此刻 active generation。旧事件没有该字段，发布器才回落到当前 active。
-    target_channel_generation_id: typeof targetGenerationId === "string" && targetGenerationId
+    // **判据跟核心共用。**这里本来就把 "" 映射成 null（没有冻结目标），
+    // 只是漏了纯空白 —— 空白串是 truthy，于是被原样写进去，成了一条
+    // "目标字段在、但不是代际"的损坏记录：抑制那侧会把它当成自带明确代际，
+    // 绕过全部守卫。写不出损坏记录，下游就不用去猜该怎么解释它。
+    target_channel_generation_id: usableGeneration(targetGenerationId)
       ? targetGenerationId
       : null,
     run_id: typeof runId === "string" && runId ? runId : null,

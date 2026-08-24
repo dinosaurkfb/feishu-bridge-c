@@ -96,15 +96,59 @@ if (suspended.ok && suspended.suspended) {
   process.exit(0);
 }
 
-if (already?.root_message_id || fs.existsSync(legacyMapping)) {
+// 已经登记过：确实接入了，什么都不用做。
+if (already?.root_message_id) {
   console.log(path.basename(root) + " 已经接入过了，没有重复建话题。");
-  if (already?.root_message_id) {
-    console.log("  根话题  " + already.root_message_id);
-    console.log("  入站    " + (already.inbound_state === "bound" ? "已绑定" : "待绑定"));
-  } else {
-    console.log("  绑定在项目目录里（老形式）：" + legacyMapping);
-  }
+  console.log("  根话题  " + already.root_message_id);
+  console.log("  入站    " + (already.inbound_state === "bound" ? "已绑定" : "待绑定"));
   console.log("看绑定详情：node scripts/binding.mjs");
+  process.exit(0);
+}
+
+// **有 mapping 但没登记 —— 这不是"已接入"，这是坏的。**
+//
+// 上一版把这两种情况合成一条：看到项目目录里有 mapping 就报"已经接入过了"然后退出。
+// 但**出站路由看的是登记表** —— Stop 钩子用 attributeSession(registry.projects, ...)
+// 挑项目，挑不到就**静默退出**，一句日志都不写。于是这个项目的每一轮答复
+// 根本没进过出站流程，而这条命令还告诉你"已经接入过了"。
+//
+// **一条让人以为修好了的成功提示，比报错更难查。**实际是从"话题里十几个小时没动静"
+// 才发现的，而那之前每次跑这条命令都说没问题。
+//
+// 补登记就行，不新建话题：mapping 里那个根消息就是现成的目标。
+if (fs.existsSync(legacyMapping)) {
+  let mapping = null;
+  try { mapping = JSON.parse(fs.readFileSync(legacyMapping, "utf-8")); } catch { /* 下面报 */ }
+  const rootId = mapping?.feishu_root_message_id_reference ?? mapping?.root_message_id ?? null;
+  if (!rootId) {
+    console.error(path.basename(root) + " 的项目内绑定读不出根话题，没法补登记。");
+    console.error("  文件：" + legacyMapping);
+    process.exit(1);
+  }
+  console.log(path.basename(root) + " 的绑定在项目目录里，但**登记表里没有它**。");
+  console.log("  后果   出站按登记表挑项目，挑不到就静默跳过 —— 答复发不出去，也不报错。");
+  console.log("  根话题 " + rootId + "（复用，不新建）");
+  if (!apply) {
+    console.log("\n[dry-run] 什么都没写。加 --apply 补登记。");
+    process.exit(0);
+  }
+  const adopted = newRegistryEntry({
+    root, name: arg("name") ?? readProjectIdentity({ root }).name,
+    purpose: arg("purpose") ?? null, token: bindingToken(root), rootMessageId: rootId,
+  });
+  registry.projects.push(adopted);
+  try {
+    fs.mkdirSync(path.dirname(regFile), { recursive: true, mode: 0o700 });
+    if (fs.existsSync(regFile)) fs.copyFileSync(regFile, regFile + ".prev");
+    const tmp = regFile + ".tmp." + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify(registry, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, regFile);
+  } catch (err) {
+    console.error("补登记没写成：" + err.message);
+    process.exit(1);
+  }
+  console.log("\n已补登记      " + regFile + "  （现在 " + registry.projects.length + " 个项目）");
+  console.log("没有建新话题，也没有往群里发任何消息。下一轮会话结束时答复会走出站。");
   process.exit(0);
 }
 

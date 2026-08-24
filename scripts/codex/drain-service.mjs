@@ -29,7 +29,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isDirectRun } from "../direct-run.mjs";
-import { listPending } from "../outbox.mjs";
+import { isCanonicalIso } from "../canonical-time.mjs";
 import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
 import { bridgeHome, loadRegistry, registryFile, taskPaths } from "./state.mjs";
@@ -181,8 +181,11 @@ export function auditOutbox(outboxDir) {
     // 停发的前提就是它还没发出去；两个字段同时有值，说明这条记录的状态是坏的。
     const sup = rec.publish_suppressed_at;
     if (sup !== undefined && sup !== null) {
-      if (typeof sup !== "string" || sup === "") {
-        unclassified.push({ file: f, why: "publish_suppressed_at 不是时间串" });
+      // **复用规范时间校验，不自己判"非空字符串"。**
+      // 纯空白、"abc"、"2026-13-45" 都能通过"非空"，却都不是时间 ——
+      // 判据松一点，损坏记录就又被当成合法状态藏起来。
+      if (!isCanonicalIso(sup)) {
+        unclassified.push({ file: f, why: "publish_suppressed_at 不是规范时间" });
         continue;
       }
       if (rec.published_at !== null) {
@@ -196,8 +199,8 @@ export function auditOutbox(outboxDir) {
     }
     const pub = rec.published_at;
     if (pub === null) { pending += 1; continue; }                        // pending
-    if (typeof pub === "string" && pub !== "") continue;                 // published
-    unclassified.push({ file: f, why: "published_at 既不是 null 也不是时间串" });
+    if (isCanonicalIso(pub)) continue;                                  // published
+    unclassified.push({ file: f, why: "published_at 既不是 null 也不是规范时间" });
   }
   return { ok: true, pending, unclassified };
 }
@@ -210,8 +213,14 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
   codexHome = codexHomeOf(home) } = {}) {
   const runtime = verifyRuntime({ root: codexRuntimeRoot(codexHome) });
   const file = plistPath(home);
+  // **只有 ENOENT 算"没装"。**上一版把所有读取错误都吞成"没装"——
+  // 把 plist 路径做成目录（EISDIR）、或者权限不足，状态都显示"未启用"，
+  // 停用命令还会说"本来就没启用"。**读不出来不等于没有**，
+  // 这跟登记表、outbox 那两条是同一个道理，我在第三处又犯了一次。
   let installed = null;
-  try { installed = fs.readFileSync(file, "utf-8"); } catch { /* 没装 */ }
+  let plistUnreadable = null;
+  try { installed = fs.readFileSync(file, "utf-8"); }
+  catch (err) { if (err.code !== "ENOENT") plistUnreadable = err.code ?? "unreadable"; }
   const wanted = plistBody({ home, codexHome });
   const backlog = classifyBacklog({ home: bridge });
   const scan = scanRunnable({ home: bridge });
@@ -228,7 +237,10 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
     //   查到 job → orphan（还在跑，但按谁的配置说不清）
     //   明确没有 → absent（正常默认态）
     //   查不清   → unverifiable —— **不许当成 orphan**，那是在声称一件没查过的事
-    phase: installed === null
+    plistUnreadable,
+    phase: plistUnreadable !== null
+      ? "plist_unreadable"
+      : installed === null
       ? { installed_not_loaded: "absent", unverifiable: "unverifiable" }[
           loadedPhase(spawnLaunchctl, null)] ?? "orphan"
       : installed !== wanted ? "stale"
@@ -292,12 +304,13 @@ export function loadedPhase(run = spawnLaunchctl, expect = null) {
 
 export const PHASE_TEXT = {
   absent: "未启用（安装后的默认态，不是故障）",
+  plist_unreadable: "**plist 读不出来 —— 不知道它是什么状态，一律当成可能在跑**",
   orphan: "**没有 plist，但 launchd 里还有同名 job 在 —— 它在按谁的配置跑说不清**",
   stale: "plist 与当前运行时对不上（要重装）",
   installed_not_loaded: "**plist 已写入但没被 launchd 加载 —— 定时器不会跑**",
   loaded: "已加载，正在按计划跑",
   loaded_other: "**同名 job 在跑，但参数不是当前这份 —— 跑的多半是旧配置**",
-  unverifiable: "plist 已写入；launchd 状态查不出来（不等于在跑）",
+  unverifiable: "launchd 状态查不出来 —— 不等于没在跑",
 };
 
 /**
@@ -432,6 +445,11 @@ function main() {
       console.log("\n本来就没启用，什么都没做。");
       process.exit(0);
     }
+    if (st.phase === "plist_unreadable") {
+      console.error("\nplist 读不出来（" + st.plistUnreadable + "），**不知道它是什么状态**。");
+      console.error("什么都没动 —— 先把那个文件处理掉再来。");
+      process.exit(1);
+    }
     if (st.phase === "unverifiable") {
       console.error("\nlaunchd 状态查不出来，**不敢说它有没有在跑**。");
       console.error("什么都没动 —— 先把 launchctl 能不能用查清楚。");
@@ -449,15 +467,20 @@ function main() {
       console.error("定时器报成「未启用」—— 先把它卸掉再来。");
       process.exit(1);
     }
-    fs.rmSync(st.plist, { force: true });
-    // **卸完再核一次。**bootout 返回 0 不等于它真的走了。
+    // **顺序：卸载 → 核验确实没了 → 才删 plist。**
+    //
+    // 上一版是先删 plist 再核验：bootout 返回成功但 job 仍在时，命令确实非零退出了，
+    // **可现场已经被改成 orphan** —— plist 没了、job 还在，比动手之前更糟。
+    // 核验没过就一个字节都不动，把现场留在原样。
     const after = loadedPhase(spawnLaunchctl, null);
     if (after !== "installed_not_loaded") {
-      console.error("\nplist 已删，但 launchd 里仍能查到（" + after + "）。");
-      console.error("**不当作已停用。**");
+      console.error("\nbootout 返回成功，但 launchd 里仍能查到（" + after + "）。");
+      console.error("**plist 一个字节没动。**删了的话现场会变成「没有 plist、job 还在」，");
+      console.error("比现在更难收拾。先把那个 job 处理掉再来。");
       process.exit(1);
     }
-    console.log("\n已停用。plist 已删除，launchd 里也没有它了。");
+    fs.rmSync(st.plist, { force: true });
+    console.log("\n已停用。launchd 里确认没有它了，plist 也已删除。");
     process.exit(0);
   }
 

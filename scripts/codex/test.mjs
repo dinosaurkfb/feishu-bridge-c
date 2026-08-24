@@ -2970,8 +2970,8 @@ test("三态要校验字段类型 —— 畸形 published_at 不许被当成已�
     put("bad" + i + ".json", { published_at: bad });
   }
   put("ok-pending.json", { published_at: null });
-  put("ok-published.json", { published_at: "2026-08-24T00:00:00Z" });
-  put("ok-suppressed.json", { published_at: null, publish_suppressed_at: "2026-08-24T00:00:00Z" });
+  put("ok-published.json", { published_at: "2026-08-24T00:00:00.000Z" });
+  put("ok-suppressed.json", { published_at: null, publish_suppressed_at: "2026-08-24T00:00:00.000Z" });
   // suppressed 字段本身畸形也要拦。
   put("bad-sup.json", { published_at: null, publish_suppressed_at: 7 });
   put("bad-sup2.json", { published_at: null, publish_suppressed_at: "" });
@@ -3020,14 +3020,101 @@ test("停用：卸载失败不许删 plist —— 还在跑的定时器不能被
   assert.match(r.stderr, /卸载失败/u);
 });
 
+test("时间串走规范校验 —— 纯空白和乱写的都不算合法状态", () => {
+  // 评审：上一版只要"非空字符串"就算合法时间，于是纯空白、"abc"、"2026-13-45"
+  // 都被当成合法状态，损坏记录又被藏起来。改用全仓统一的 isCanonicalIso。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-time-"));
+  const put = (n, rec) => fs.writeFileSync(path.join(dir, n), JSON.stringify(rec));
+  for (const [i, bad] of ["   ", "abc", "2026-13-45T99:99:99.000Z",
+    "2026-08-24T00:00:00Z"].entries()) {
+    put("p" + i + ".json", { published_at: bad });
+    put("s" + i + ".json", { published_at: null, publish_suppressed_at: bad });
+  }
+  put("good-p.json", { published_at: "2026-08-24T00:00:00.000Z" });
+  put("good-s.json", { published_at: null, publish_suppressed_at: "2026-08-24T00:00:00.000Z" });
+
+  const a = auditOutbox(dir);
+  assert.equal(a.pending, 0);
+  assert.equal(a.unclassified.length, 8,
+    "**8 条伪时间串都要被点出来**：" + JSON.stringify(a.unclassified.map((u) => u.file)));
+  // 缺毫秒的那种也不算 —— 产品写的是 toISOString()，判据就该按它来。
+  assert.ok(a.unclassified.some((u) => u.file === "p3.json"),
+    "缺毫秒的 ISO 串不是规范时间");
+});
+
+test("plist 读不出来不许当成「未启用」", () => {
+  // 评审实测：把 plist 路径做成目录，状态仍显示"未启用"，
+  // 停用命令还会说"本来就没启用"。**读不出来不等于没有** ——
+  // 这条道理我在登记表、outbox 上都写过，这是第三处。
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const bridge = path.join(dir, "bridge");
+  fs.mkdirSync(bridge, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));
+  const agents = path.join(fakeHome, "Library", "LaunchAgents");
+  fs.mkdirSync(agents, { recursive: true });
+  // **把 plist 路径做成目录** → 读它会 EISDIR。
+  fs.mkdirSync(path.join(agents, "com.frank.feishu-bridge-codex.drain.plist"));
+
+  const env = isolatedEnv({ HOME: fakeHome, CODEX_HOME: path.join(dir, "codex"),
+    FEISHU_CODEX_BRIDGE_HOME: bridge });
+  const status = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs")], { encoding: "utf-8", env });
+  assert.doesNotMatch(status.stdout, /未启用（安装后的默认态/u,
+    "**不许报成未启用**：" + status.stdout);
+  assert.match(status.stdout, /plist 读不出来/u);
+
+  // 停用也必须拒绝，而不是说"本来就没启用"。
+  const off = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--disable", "--apply"],
+    { encoding: "utf-8", env });
+  assert.notEqual(off.status, 0, "读不出来就不许当成没启用：" + off.stdout);
+  assert.doesNotMatch(off.stdout, /本来就没启用/u);
+});
+
+test("停用的顺序：核验没过时 plist 一个字节都不许动", () => {
+  // 评审实测：上一版先删 plist 再核验。bootout 返回成功但 job 仍在时，
+  // 命令确实非零退出了，**可现场已经被改成 orphan** —— plist 没了、job 还在，
+  // 比动手之前更糟。
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const bridge = path.join(dir, "bridge");
+  const bin = path.join(dir, "bin");
+  fs.mkdirSync(bridge, { recursive: true });
+  fs.mkdirSync(bin, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));
+  const agents = path.join(fakeHome, "Library", "LaunchAgents");
+  fs.mkdirSync(agents, { recursive: true });
+  const plist = path.join(agents, "com.frank.feishu-bridge-codex.drain.plist");
+  fs.writeFileSync(plist, "<plist/>");
+  const before = fs.readFileSync(plist, "utf-8");
+
+  // 假 launchctl：bootout 成功，但 list 始终说 job 还在。
+  const lc = path.join(bin, "launchctl");
+  fs.writeFileSync(lc, '#!/bin/sh\ncase "$1" in\n' +
+    '  list) echo \'{ "Program" = "/x"; "ProgramArguments" = ( "/x"; ); };\'; exit 0;;\n' +
+    'esac\nexit 0\n', { mode: 0o755 });
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--disable", "--apply"],
+    { encoding: "utf-8", env: isolatedEnv({ HOME: fakeHome,
+      CODEX_HOME: path.join(dir, "codex"), FEISHU_CODEX_BRIDGE_HOME: bridge,
+      FEISHU_BRIDGE_LAUNCHCTL: lc }) });
+
+  assert.notEqual(r.status, 0, "核验没过必须非零退出");
+  assert.equal(fs.existsSync(plist), true,
+    "**plist 不许被删** —— 删了现场就变成「没有 plist、job 还在」，比之前更糟");
+  assert.equal(fs.readFileSync(plist, "utf-8"), before, "一个字节都不许动");
+});
+
 test("三态必须互斥：既标已发布又标已停发的记录是坏的", () => {
   // 评审：上一版只要 publish_suppressed_at 是非空串就判 suppressed，
   // 不管 published_at 是什么 —— **一条自相矛盾的记录被静默接受**。
   // 停发的前提就是它还没发出去。
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-excl-"));
   const put = (n, rec) => fs.writeFileSync(path.join(dir, n), JSON.stringify(rec));
-  put("both.json", { published_at: "2026-08-24T00:00:00Z",
-    publish_suppressed_at: "2026-08-24T00:00:00Z" });
+  put("both.json", { published_at: "2026-08-24T00:00:00.000Z",
+    publish_suppressed_at: "2026-08-24T00:00:00.000Z" });
   const a = auditOutbox(dir);
   assert.equal(a.pending, 0);
   assert.equal(a.unclassified.length, 1, "**自相矛盾必须被点出来**");
@@ -3036,7 +3123,7 @@ test("三态必须互斥：既标已发布又标已停发的记录是坏的", ()
   // 正常的 suppressed（published_at 是 null）仍然算 suppressed。
   const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "cx-excl2-"));
   fs.writeFileSync(path.join(dir2, "s.json"), JSON.stringify({
-    published_at: null, publish_suppressed_at: "2026-08-24T00:00:00Z" }));
+    published_at: null, publish_suppressed_at: "2026-08-24T00:00:00.000Z" }));
   assert.deepEqual(auditOutbox(dir2), { ok: true, pending: 0, unclassified: [] });
 });
 
@@ -3189,9 +3276,9 @@ test("积压归类：每个 JSON 都要能归类，说不清就拦住", () => {
   const ok = (name, body) => fs.writeFileSync(path.join(dir, name), body);
 
   ok("pending.json", JSON.stringify({ kind: "milestone", published_at: null }));
-  ok("published.json", JSON.stringify({ published_at: "2026-08-24T00:00:00Z" }));
+  ok("published.json", JSON.stringify({ published_at: "2026-08-24T00:00:00.000Z" }));
   ok("suppressed.json", JSON.stringify({ published_at: null,
-    publish_suppressed_at: "2026-08-24T00:00:00Z" }));
+    publish_suppressed_at: "2026-08-24T00:00:00.000Z" }));
   let a = auditOutbox(dir);
   assert.equal(a.ok, true);
   assert.equal(a.pending, 1, "三态各一，只有一条待发");

@@ -174,7 +174,8 @@ try {
   // plist 写了没加载是故障（定时器不会跑）；未启用和查不出来都是 null。
   const ok = svc.phase === "loaded" ? true
     : (svc.phase === "stale" || svc.phase === "installed_not_loaded" ||
-       svc.phase === "loaded_other" || svc.phase === "orphan") ? false
+       svc.phase === "loaded_other" || svc.phase === "orphan" ||
+       svc.phase === "plist_unreadable") ? false
     : null;
   add("兜底排空", ok,
     (PHASE_TEXT[svc.phase] ?? svc.phase) +

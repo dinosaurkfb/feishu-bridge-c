@@ -5,12 +5,16 @@
  * 本机没有任何东西能「发起」它。所以没有 connect 这个动作，只有「本机接得住吗」。
  * 而在这之前，状态里第 1 层只能写「未自检」：不是查过说没问题，是根本没查。
  *
- * FR-1.4 要求区分四种，这四种的**下一步动作完全不同**，混成一句「不可用」等于没说：
+ * FR-1.4 要求区分四种失败，它们的**下一步动作完全不同**，混成一句「不可用」等于没说。
+ * 实现成五项 —— FR-1.4 的「身份不匹配」在本机分属两条互不替代的链路，合成一项
+ * 就会拿其中一个的结论冒充另一个：
  *
  *   bridge 未安装   → 跑安装器
- *   adapter 不可用  → lark-cli 不在或不能执行，装它
+ *   adapter 不可用  → Aily 的 claude-code-local 运行环境没登记或探测不可用
+ *                     （**不是** lark-cli —— 那是出站客户端，见下）
  *   daemon 离线     → aily-cli daemon start（**由人来做**）
- *   身份不匹配      → 凭据属于别的应用，重新登录或改模板
+ *   入站身份        → 本机没有可信的实时观测来源，**永远 unknown**
+ *   出站身份        → 凭据属于别的应用，重新登录或改模板
  *
  * 三条纪律：
  *
@@ -28,13 +32,15 @@ import { assertPublishIdentity } from "./chain-template.mjs";
 import { verifyRuntime } from "./runtime-install.mjs";
 
 /**
- * 四项检查。**分清入站与出站** —— 上一版把它们混了：
+ * 五项检查。**分清入站与出站** —— 上一版是四项，把它们混了：
  * 用 lark-cli 在不在回答"adapter 可用吗"（lark-cli 是**出站** OpenAPI 客户端，
  * 而 README 定义的 adapter 是 Aily 的 claude-code-local 运行环境），
  * 用 assertPublishIdentity 回答"身份对吗"（那是**出站发布**身份，
  * 不是入站 transport agent / endpoint / caller）。
  *
  * 后果是语义假阳性：入站身份 A、出站身份 B 的机器，四项全过、判 ready。
+ * 拆成五项之后，入站那项永远 unknown，同一台机器的总判定从 ready 落到 incomplete
+ * —— **这不是能力退步，是原来那个 ready 本来就是假的。**
  * **这个功能本来就是为了防"拿不知道冒充没事"，结果它自己犯了另一种：
  * 拿别的知道冒充这个知道。**
  */
@@ -117,22 +123,14 @@ function checkOutbound(bin, identity, access, assertFn) {
  */
 function checkDaemon(bin, exec) {
   const cmd = typeof bin === "string" && bin ? bin : "aily-cli";
-  let raw = null;
-  try {
-    raw = String(exec(cmd, ["daemon", "status", "--json"], {
-      encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: PROBE_TIMEOUT_MS,
-    }));
-  } catch (err) {
-    if (err?.code === "ENOENT") {
-      return item(ENDPOINT_CHECK.DAEMON, CHECK_RESULT.FAIL, "找不到 aily-cli（" + cmd + "）",
-        "确认 aily-cli 已安装，或在模板里写明 aily_cli_bin");
-    }
-    if (err?.code === "ETIMEDOUT") {
-      return item(ENDPOINT_CHECK.DAEMON, CHECK_RESULT.UNKNOWN, "查不动（超时）");
-    }
-    raw = String(err?.stdout ?? "") + String(err?.stderr ?? "");
+  const r = probe(cmd, ["daemon", "status", "--json"], exec);
+  if (r.enoent) {
+    return item(ENDPOINT_CHECK.DAEMON, CHECK_RESULT.FAIL, "找不到 aily-cli（" + cmd + "）",
+      "确认 aily-cli 已安装，或在模板里写明 aily_cli_bin");
   }
-  const parsed = parseJson(raw);
+  if (r.timeout) return item(ENDPOINT_CHECK.DAEMON, CHECK_RESULT.UNKNOWN, "查不动（超时）");
+
+  const parsed = r.json;
   if (parsed === null) {
     return item(ENDPOINT_CHECK.DAEMON, CHECK_RESULT.UNKNOWN, "看不懂 daemon status 的输出");
   }
@@ -148,14 +146,66 @@ function checkDaemon(bin, exec) {
     "daemon 状态说不清" + (code ? "（" + code + "）" : ""));
 }
 
-/** 从可能混着别的输出的文本里取出第一段 JSON。取不到就返回 null，不猜。 */
+/**
+ * 跑一次只读探测，**stdout 和 stderr 分开解析**。
+ *
+ * 上一版把两者拼起来再 JSON.parse。实机上 daemon 离线时 stdout 是一段完整合法的
+ * DAEMON_UNREACHABLE JSON、stderr 另有 "Aily runtime build: ..." 两行 ——
+ * 拼起来就成了「合法 JSON 后面跟着一段非 JSON」，解析失败，于是
+ * **一个明确的离线结论被报成了"看不懂"**。Codex 用本机 CLI 实测到这一条。
+ *
+ * stdout 是这些命令的数据通道，先看它；stdout 给不出结构再退到 stderr。
+ */
+function probe(cmd, args, exec) {
+  const opts = { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: PROBE_TIMEOUT_MS };
+  let out = "";
+  let err = "";
+  try {
+    out = String(exec(cmd, args, opts) ?? "");
+  } catch (e) {
+    if (e?.code === "ENOENT") return { enoent: true, json: null };
+    if (e?.code === "ETIMEDOUT") return { timeout: true, json: null };
+    out = String(e?.stdout ?? "");
+    err = String(e?.stderr ?? "");
+  }
+  return { json: parseJson(out) ?? parseJson(err), stdout: out, stderr: err };
+}
+
+/**
+ * 从可能混着别的输出的文本里取出**第一段完整** JSON。取不到就返回 null，不猜。
+ *
+ * 关键是"完整"：CLI 常在 JSON 之后再打一行 build 信息，整段 parse 必然失败。
+ * 从第一个 [ 或 { 起做括号配对（跳过字符串和转义），只截到配对处。
+ */
 function parseJson(text) {
   const t = String(text ?? "").trim();
   if (!t) return null;
   try { return JSON.parse(t); } catch { /* 往下试 */ }
   const at = t.search(/[[{]/u);
   if (at < 0) return null;
-  try { return JSON.parse(t.slice(at)); } catch { return null; }
+  const open = t[at];
+  const close = open === "[" ? "]" : "}";
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = at; i < t.length; i += 1) {
+    const c = t[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === open) depth += 1;
+    else if (c === close) {
+      depth -= 1;
+      if (depth === 0) {
+        try { return JSON.parse(t.slice(at, i + 1)); } catch { return null; }
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -170,18 +220,13 @@ function parseJson(text) {
  */
 function checkAdapter(bin, exec, adapterType) {
   const cmd = typeof bin === "string" && bin ? bin : "aily-cli";
-  let raw = null;
-  try {
-    raw = String(exec(cmd, ["adapter", "list", "--json"], {
-      encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: PROBE_TIMEOUT_MS,
-    }));
-  } catch (err) {
-    if (err?.code === "ETIMEDOUT") {
-      return item(ENDPOINT_CHECK.ADAPTER, CHECK_RESULT.UNKNOWN, "查不动（超时）");
-    }
-    raw = String(err?.stdout ?? "") + String(err?.stderr ?? "");
+  const r = probe(cmd, ["adapter", "list", "--json"], exec);
+  if (r.enoent) {
+    return item(ENDPOINT_CHECK.ADAPTER, CHECK_RESULT.FAIL, "找不到 aily-cli（" + cmd + "）",
+      "确认 aily-cli 已安装，或在模板里写明 aily_cli_bin");
   }
-  const parsed = parseJson(raw);
+  if (r.timeout) return item(ENDPOINT_CHECK.ADAPTER, CHECK_RESULT.UNKNOWN, "查不动（超时）");
+  const parsed = r.json;
   const list = Array.isArray(parsed) ? parsed
     : Array.isArray(parsed?.data?.adapters) ? parsed.data.adapters
       : Array.isArray(parsed?.data) ? parsed.data : null;
@@ -193,13 +238,13 @@ function checkAdapter(bin, exec, adapterType) {
     return item(ENDPOINT_CHECK.ADAPTER, CHECK_RESULT.FAIL, adapterType + " 没有登记",
       "在 Aily 里注册本机 adapter");
   }
-  const probe = hit.runtimeProbe;
-  if (probe?.available === true) {
+  const rp = hit.runtimeProbe;
+  if (rp?.available === true) {
     return item(ENDPOINT_CHECK.ADAPTER, CHECK_RESULT.PASS, adapterType + " 已登记且探测可用");
   }
-  if (probe?.available === false) {
+  if (rp?.available === false) {
     return item(ENDPOINT_CHECK.ADAPTER, CHECK_RESULT.FAIL,
-      adapterType + " 已登记但探测不可用" + (probe.reason ? "（" + probe.reason + "）" : ""),
+      adapterType + " 已登记但探测不可用" + (rp.reason ? "（" + rp.reason + "）" : ""),
       "确认对应的本机 CLI 可执行");
   }
   // 登记了但没有探测结论 —— 不能当成可用。

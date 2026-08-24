@@ -8208,6 +8208,83 @@ test("daemon 明确离线是 fail，不是「查不动」", () => {
     CHECK_RESULT.UNKNOWN);
 });
 
+test("daemon 离线的**真实**输出形态：stdout 是完整 JSON，stderr 另有 build 噪声", () => {
+  // 上面那条测试用的是合成形态 —— 只给 err.stdout，不给 stderr。**它就是这么绿着
+  // 放过线上故障的**：实机上 stdout 是合法 JSON、stderr 另有两行 runtime build，
+  // 代码把两者拼起来再 parse，于是"合法 JSON 后面跟着非 JSON"解析失败，
+  // 一个明确的 DAEMON_UNREACHABLE 被报成了"看不懂"。
+  // 这里的字节形态取自 Codex 在本机跑 aily-cli 的真实输出。
+  const realErr = (stdout, stderr) => () => {
+    const e = new Error("Command failed"); e.status = 1;
+    e.stdout = stdout; e.stderr = stderr;
+    throw e;
+  };
+  const daemonJson = JSON.stringify({
+    ok: false,
+    error: { code: "DAEMON_UNREACHABLE", message: "daemon not running", hint: "Run: aily-cli daemon start" },
+  }) + "\n";
+  const buildNoise = "Aily runtime build: version=0.1.44\n"
+    + "aggregate=798933c004f4009f89a50bdff1533e590e6c8434 ref=798933c\n";
+
+  const r = checkEndpoint({
+    template: { lark_cli_bin: "/bin/lark-cli" }, identity: okIdentity,
+    verify: okVerify, access: okAccess, assertFn: okAssert,
+    exec: (c, a) => (a[0] === "adapter"
+      ? realErr("", "daemon not running (socket: ...)\nRun: aily-cli daemon start\n" + buildNoise)()
+      : realErr(daemonJson, buildNoise)()),
+  });
+
+  const d = r.checks.find((c) => c.id === ENDPOINT_CHECK.DAEMON);
+  assert.equal(d.result, CHECK_RESULT.FAIL, "离线是查出来的结论，不是查不动");
+  assert.match(d.detail, /DAEMON_UNREACHABLE/u);
+  // daemon 都不在，adapter 自然探不出结论 —— 这个 unknown 是诚实的。
+  assert.equal(r.checks.find((c) => c.id === ENDPOINT_CHECK.ADAPTER).result, CHECK_RESULT.UNKNOWN);
+  assert.equal(r.verdict, "blocked");
+});
+
+test("JSON 后面跟着噪声也要能取出来，取不到就说取不到", () => {
+  // 分开解析 stdout/stderr 之后，单个通道里仍可能是「JSON + 一行日志」。
+  const one = (out) => checkEndpoint({
+    template: { lark_cli_bin: "/bin/lark-cli" }, identity: okIdentity,
+    verify: okVerify, access: okAccess, assertFn: okAssert,
+    exec: (c, a) => (a[0] === "adapter"
+      ? JSON.stringify([{ adapter: "claude-code-local", runtimeProbe: { available: true } }])
+      : out),
+  }).checks.find((c) => c.id === ENDPOINT_CHECK.DAEMON);
+
+  assert.equal(one(JSON.stringify({ ok: true, data: { running: true } }) + "\nbuild: x\n").result,
+    CHECK_RESULT.PASS, "尾部有日志不影响前面那段完整 JSON");
+  // **字符串里的括号不许算进配对。**注意反例要选不配对的（"}}"），
+  // 选 "}{"  那种一加一减正好抵消，不跳过字符串也照样对 —— 那条断言等于没测。
+  assert.equal(one(JSON.stringify({ ok: true, data: { running: true, note: "}}" } }) + "\n噪声").result,
+    CHECK_RESULT.PASS);
+  // 截断的 JSON 取不出来 —— 这时才是 unknown，不许猜。
+  assert.equal(one('{"ok": true, "data": {"running": true').result, CHECK_RESULT.UNKNOWN);
+});
+
+test("stdout 和 stderr 必须分开解析，不许拼起来当一段", () => {
+  // 拼接之所以危险，不只是"JSON 后面跟噪声"——那个 parseJson 已经能扛。
+  // 真正扛不住的是**前一个通道里有半截 JSON**：拼起来之后括号配对会跨通道
+  // 一路找下去，把两段无关的输出算成一段，结果是取不出或取错。
+  // 分开解析时 stdout 取不到就退到 stderr，答案仍然明确。
+  const r = checkEndpoint({
+    template: { lark_cli_bin: "/bin/lark-cli" }, identity: okIdentity,
+    verify: okVerify, access: okAccess, assertFn: okAssert,
+    exec: (c, a) => {
+      if (a[0] === "adapter") {
+        return JSON.stringify([{ adapter: "claude-code-local", runtimeProbe: { available: true } }]);
+      }
+      const e = new Error("Command failed"); e.status = 1;
+      e.stdout = '{"partial": [1, 2';                       // 半截，取不出
+      e.stderr = JSON.stringify({ ok: false, error: { code: "DAEMON_UNREACHABLE" } });
+      throw e;
+    },
+  });
+  const d = r.checks.find((c) => c.id === ENDPOINT_CHECK.DAEMON);
+  assert.equal(d.result, CHECK_RESULT.FAIL, "stdout 取不到就该退到 stderr，而不是报「看不懂」");
+  assert.match(d.detail, /DAEMON_UNREACHABLE/u);
+});
+
 test("adapter 查的是 claude-code-local，不是 lark-cli", () => {
   // FR-1.4 说的 adapter 是 Aily 的本机运行环境。出站发得出去，
   // 不代表 Aily 调得起本机的 Claude —— 两者都过也不能互相证明。

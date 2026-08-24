@@ -22,9 +22,11 @@ import { buildClaudeSubscriptionProjection } from "./inbound-route.mjs";
 import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { checkEndpoint } from "./endpoint-self-check.mjs";
 import {
-  composeLayeredStatus, endpointFacts, renderLayeredStatus, splitByRelation, subscriptionFacts,
+  composeLayeredStatus, endpointFacts, outboundRoutingFact, renderLayeredStatus,
+  splitByRelation, subscriptionFacts,
 } from "./layered-status.mjs";
 import { collectProjectConnectivity, renderConnectivity } from "./status-providers.mjs";
+import { attributeSession, loadRegistry } from "./registry.mjs";
 
 const arg = (n) => {
   const i = process.argv.indexOf("--" + n);
@@ -46,8 +48,19 @@ const unsorted = splitByRelation(projectLinks.sections).unsorted;
 const layeredConnectivity = renderConnectivity(
   { ...projectLinks, sections: unsorted }, { heading: null });
 
+// **出站路由认不认这个项目。**第 3 层其余各行读的是项目内文件，
+// 而出站走登记表 —— 两套可以不一致，而那种不一致最难查。
+const reg = loadRegistry();
+const outboundRouting = outboundRoutingFact({
+  registryOk: reg.ok,
+  attributedCount: reg.ok
+    ? attributeSession({ projects: reg.projects, cwd: root, transcriptPath: null }).length : 0,
+  bound: st.ok === true,
+});
+
 console.log(renderLayeredStatus(composeLayeredStatus({
   st,
+  outboundRouting,
   others: bindingsForRoot({ root }),
   endpoint: endpointFacts({
     agentName: tpl?.transport_agent_name ?? null,

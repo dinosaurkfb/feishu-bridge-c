@@ -741,7 +741,10 @@ test("Codex adapter 轮转期间旧 session 继续路由，认领后新旧代际
     "--thread-id", THREAD_A,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /只读历史代际：1 个.*轮转前受理的结果仍会发回原话题/u);
+  // 迁到四层之后措辞变了，**测的仍是同一件事**：有 1 个只读历史代际。
+  assert.match(status.stdout, /只读历史.*1 个代际/u,
+    "只读历史那条事实必须还在：" + status.stdout);
+  assert.match(status.stdout, /第 3 层 · 精确通道绑定/u, "而且要出现在第 3 层里");
 });
 
 test("Codex registry adapter 原子持久化代际计数，旧登记不会回扫历史", () => {
@@ -983,9 +986,14 @@ test("task 控制脚本不猜 thread，暂停和恢复都不调用飞书", () =>
   const status = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"),
     "--thread-id", THREAD_A], { encoding: "utf-8", env });
   assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /已接入飞书/);
-  assert.match(status.stdout, /当前话题代际/u);
-  assert.match(status.stdout, /自动轮转：0 \/ 30 条有效业务消息/u);
+  // 同上：四层里"接入状态"由第 3 层的入站行和绑定名称表达。
+  assert.match(status.stdout, /第 3 层 · 精确通道绑定/u, status.stdout);
+  assert.match(status.stdout, /入站/u);
+  assert.match(status.stdout, /当前代际/u);
+  // 四层里这行在第 4 层，措辞是「0 / 30 条（还剩 30 条）」——
+  // **测的仍是同一件事**：计数 0、阈值 30。
+  assert.match(status.stdout, /自动轮转.*0 \/ 30 条/u, status.stdout);
+  assert.match(status.stdout, /第 4 层 · 交互策略/u);
   assert.equal(status.stdout.includes(THREAD_A), false);
   assert.equal(status.stdout.includes("om_a"), false);
 
@@ -3259,6 +3267,79 @@ test("停用的顺序：核验没过时 plist 一个字节都不许动", () => {
   assert.equal(fs.existsSync(plist), true,
     "**plist 不许被删** —— 删了现场就变成「没有 plist、job 还在」，比之前更糟");
   assert.equal(fs.readFileSync(plist, "utf-8"), before, "一个字节都不许动");
+});
+
+test("四层 status：Codex 侧报的必须是自己那条链的事实，不是 Claude 的", () => {
+  // **这条迁移最容易办坏的地方。**endpointFacts 的 runtime / runtimeDir / verify
+  // 默认值全指向 Claude 那条链 —— 不显式给的话，第 1 层会写着"Claude Code"、
+  // 版本号报的是 Claude 运行时的哈希。而第 1 层问的正是"我这条链的端点"。
+  // 我第一次接线就是这样，输出看着完整、内容是别人的。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "四层示例",
+    rootMessageId: "om_root", token: "abc123" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.equal(r.status, 0, r.stderr);
+
+  // 四层都在。
+  for (const layer of ["第 1 层 · 运行端点连接", "第 2 层 · 事件订阅",
+    "第 3 层 · 精确通道绑定", "第 4 层 · 交互策略"]) {
+    assert.ok(r.stdout.includes(layer), "缺 " + layer + "：" + r.stdout);
+  }
+
+  // **第 1 层必须是 Codex 自己的。**
+  assert.match(r.stdout, /运行时.*Codex CLI/u, "运行时不许写成 Claude Code");
+  assert.doesNotMatch(r.stdout, /Claude Code/u, "**一个字都不许出现 Claude Code**");
+
+  // **绑定级别必须是 task 级。**落到 else 分支会写成"整个项目共用一个话题"，
+  // 那句话在 Codex 侧是错的。
+  assert.match(r.stdout, /绑定级别.*这条 task 单独一个话题/u);
+  assert.doesNotMatch(r.stdout, /整个项目共用一个话题/u);
+
+  // 绑定名称来自 task 自己。
+  assert.match(r.stdout, /绑定名称.*四层示例/u);
+
+  // **版本号必须来自 Codex 那条链。**这条单独验，因为它是最难发现的一类：
+  // 不传 runtimeDir/verify 的话输出看着完整，报的却是 Claude 运行时的哈希 ——
+  // 一个"看起来已安装"的第 1 层，背后是另一条链。
+  //
+  // 隔离环境里 Codex runtime 没装，所以这里必须报"未安装"；
+  // 若它报出了某个版本号，那个号只可能是从别处（本机 Claude 运行时）来的。
+  assert.match(r.stdout, /安装状态.*未安装/u,
+    "**Codex runtime 没装就必须报未安装** —— 报出版本号说明查的是别的链：" + r.stdout);
+  assert.match(r.stdout, /运行时版本.*未安装/u);
+
+  // **不许泄漏 locator。**status 刻意不打印这些。
+  assert.doesNotMatch(r.stdout, /om_root/u, "根消息 id 不许出现");
+  assert.doesNotMatch(r.stdout, new RegExp(THREAD_A, "u"), "thread id 不许出现");
+  assert.doesNotMatch(r.stdout, /abc123/u, "认领口令不许出现");
+});
+
+test("四层 status：这条 task 的登记表状态要单独报，不跟 task 自己的状态混", () => {
+  // 第 3 层其余各行读的是 task 自己的状态，而出站走登记表 ——
+  // 两套可以不一致，而**那种不一致最难查**：状态页说正常、出站挑不到它。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "abc123" });
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  // **登记表里没有它** —— task 文件在，但出站挑不到。
+  writeRegistry([], path.join(home, "registry.json"));
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  // 登记表里没有就找不到这条 thread —— 命令必须说清楚，不许假装正常。
+  assert.notEqual(r.stdout.includes("第 3 层 · 精确通道绑定") && r.status === 0
+    && !/降级|未登记|尚未接入/u.test(r.stdout), true,
+    "**登记表里没有它时不许报成一切正常**：" + r.stdout + r.stderr);
 });
 
 test("三态必须互斥：既标已发布又标已停发的记录是坏的", () => {

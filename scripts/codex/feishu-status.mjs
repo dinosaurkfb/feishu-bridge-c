@@ -1,15 +1,22 @@
 #!/usr/bin/env node
 /** 只读查看当前精确 Codex thread 的飞书连接状态；不输出任何 locator。 */
 
-import { listPending } from "../outbox.mjs";
 import { validThreadId } from "./bind-compose.mjs";
 import {
-  bridgeHome, findRegisteredTaskForCodexThread, taskPaths, topicStateForTask,
-  interactionPolicyForTask,
+  bridgeHome, findRegisteredTaskForCodexThread, loadCodexTemplate, loadRegistry, registryFile,
 } from "./state.mjs";
-import { activeGeneration, pendingGeneration } from "../topic-generation.mjs";
-import { interactionPolicySummary } from "../interaction-policy.mjs";
 import { collectConnectivity, renderConnectivity } from "../status-providers.mjs";
+import {
+  composeLayeredStatus, endpointFacts, outboundRoutingFact, renderLayeredStatus,
+  splitByRelation, subscriptionFacts,
+} from "../layered-status.mjs";
+import { checkEndpoint } from "../endpoint-self-check.mjs";
+import { resolveLarkIdentity } from "../chain-template.mjs";
+import path from "node:path";
+import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
+import { codexHomeOf } from "./drain-service.mjs";
+import { taskBindingFacts } from "./task-binding.mjs";
+import { buildCodexSubscriptionProjection } from "./subscription-projection.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -37,51 +44,56 @@ if (!found.ok) {
 }
 
 const task = found.task;
-const active = (task.status ?? "active") === "active";
-const pending = listPending({ outboxDir: taskPaths(task, home).outbox }).length;
-const topic = topicStateForTask(task);
-if (!topic.ok) {
-  console.error("无法读取话题代际状态：" + topic.reason);
+const st = taskBindingFacts({ task, home });
+if (!st.ok) {
+  console.error("无法读取这条 task 的状态：" + st.reason);
   process.exit(1);
 }
-const activeTopic = activeGeneration(topic.state);
-const pendingTopic = pendingGeneration(topic.state);
-const readOnlyCount = topic.state.generations.filter((generation) => generation.status === "read-only").length;
-const interaction = interactionPolicyForTask(task);
-if (!interaction.ok) {
-  console.error("无法读取交互策略状态：" + interaction.reason);
-  process.exit(1);
-}
-const policy = interactionPolicySummary(interaction.state);
-console.log("当前 Codex task：" + (active ? "已接入飞书" : "已暂停飞书接入"));
-console.log("当前话题代际：" + (activeTopic ? "第 " + activeTopic.generation + " 代" : "尚未完成首次认领"));
-console.log("交互模式：" + policy.label + " · v" + policy.policyVersion);
-if (policy.policyId === "dialogue") {
-  console.log("对话状态：" + policy.status + (policy.turnActive ? "（有活动回合）" : ""));
-  console.log("对话预算：" + policy.roundsStarted + " / " + policy.maxRounds + " 轮；" +
-    policy.resourceUnitsUsed + " / " + policy.maxResourceUnits + " 资源单位");
-}
-if (activeTopic) {
-  console.log("自动轮转：" + (activeTopic.activity?.message_count ?? 0) + " / " +
-    (activeTopic.activity?.auto_rotate_threshold ?? 30) + " 条有效业务消息");
-}
-if (pendingTopic) {
-  console.log("待认领话题代际：第 " + pendingTopic.generation + " 代" +
-    (pendingTopic.claim_expires_at ? "（截止 " + pendingTopic.claim_expires_at + "）" : ""));
-}
-if (readOnlyCount > 0) {
-  console.log("只读历史代际：" + readOnlyCount +
-    " 个（不再接收新指令；轮转前受理的结果仍会发回原话题）");
-}
-console.log("飞书入站：" + (active
-  ? (task.inbound_state === "bound" ? "已绑定" : "等待首次真实 @M5Codex")
-  : "已暂停"));
-console.log("答复发布：" + (active
-  ? (task.auto_publish_on_completion === true ? "每轮自动发布（失败时留队）" : "仅入队，自动发布尚未启用")
-  : "已暂停"));
-console.log("待发布答复：" + pending + " 条" + (active ? "" : "（已保留）"));
 
-// 「我有哪些东西连到了哪些飞书群和话题」两侧问的是同一个问题，
-// 没理由只有 Claude 侧答得全。渲染共用同一个，免得两边措辞分叉。
-const others = renderConnectivity(collectConnectivity());
-if (others) console.log("\n" + others);
+const loaded = loadCodexTemplate();
+const tpl = loaded?.ok ? loaded.template : null;
+
+// 只看本条链路。整台机器的全景归 doctor。
+const links = collectConnectivity();
+// 附录只放归不了层的那部分 —— 能归层的已经进了对应层，再出现一次就是重复。
+const unsorted = splitByRelation(links.sections).unsorted;
+const layeredConnectivity = renderConnectivity(
+  { ...links, sections: unsorted }, { heading: null });
+
+// **出站路由认不认这条 task。**第 3 层其余各行读的是 task 自己的状态，
+// 而出站走登记表 —— 两套可以不一致，而那种不一致最难查。
+const reg = loadRegistry(registryFile(home));
+const exact = reg.ok
+  ? (reg.tasks ?? []).filter((t) => t.codex_thread_id === threadId) : [];
+const outboundRouting = outboundRoutingFact({
+  registryOk: reg.ok,
+  exactCount: exact.length,
+  // **"是不是这条 task"和"出站会不会挑到它"是两个问题。**暂停的属于前者不属于后者。
+  routableCount: exact.filter((t) => (t.status ?? "active") === "active").length,
+  bound: st.ok === true,
+});
+
+console.log(renderLayeredStatus(composeLayeredStatus({
+  st,
+  outboundRouting,
+  // Codex 一条 thread 一条 task，没有"同一项目多条绑定"那一节。
+  others: [],
+  endpoint: endpointFacts({
+    // **这三样都必须显式给。**默认值全指向 Claude 那条链 ——
+    // 不给的话第 1 层会写着"Claude Code"、版本号报的是 Claude 运行时的哈希，
+    // 而那正是四层最该分清的东西：这一层问的是"我这条链的端点"。
+    runtime: "Codex CLI",
+    runtimeDir: path.join(codexRuntimeRoot(codexHomeOf()), "current"),
+    verify: () => verifyRuntime({ root: codexRuntimeRoot(codexHomeOf()) }),
+    agentName: tpl?.transport_agent_name ?? null,
+    // 端点自检：只读、限时、不修不启。模板读不出来时传 null ——
+    // **没查就是没查**，不许因为代码存在就当成查过了。
+    selfCheck: tpl ? checkEndpoint({ template: tpl, identity: resolveLarkIdentity(tpl) }) : null,
+  }),
+  subscription: subscriptionFacts(
+    buildCodexSubscriptionProjection({ home, threadId }),
+    { groupName: tpl?.chat_name ?? null }),
+  connectivity: layeredConnectivity,
+  otherLinks: links,
+})));
+process.exit(0);

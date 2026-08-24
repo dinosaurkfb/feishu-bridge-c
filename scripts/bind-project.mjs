@@ -143,6 +143,14 @@ const at = registry.projects.findIndex((p) => normalizeRoot(p?.root) === normali
 const already = at >= 0 ? registry.projects[at] : null;
 const legacyMapping = path.join(root, ".runtime-data", "inbound", "active-mapping.json");
 
+/** 从项目内 mapping 里读根话题。两处都要用，只留一份。 */
+function readLegacyRootId(file) {
+  try {
+    const m = JSON.parse(fs.readFileSync(file, "utf-8"));
+    return m?.feishu_root_message_id_reference ?? m?.root_message_id ?? null;
+  } catch { return null; }
+}
+
 // 暂停过的绑定：**复用原话题恢复**，绝不新建。
 // 新建等于把话题里已有的历史对话变成孤儿，而且群里会多出一个长得一样的话题。
 const suspended = currentBinding({ root });
@@ -153,6 +161,44 @@ if (suspended.ok && suspended.suspended) {
     console.log("\n[dry-run] 什么都没做。加 --apply 才真的恢复。");
     process.exit(0);
   }
+  // **恢复不是只把项目文件改回 active。**上一版到这里就 exit 0 了，
+  // 后面那些 registry 检查（缺失、停用、歧义）一条都不跑 —— 于是
+  // "mapping 暂停 + registry 里没这个项目"和"mapping 暂停 + 条目是停用的"
+  // 两种情况都会报**恢复成功，而出站继续失效**。
+  //
+  // 恢复要么把出站真的接回去，要么就别说恢复了。所以先把 registry 那一侧修好，
+  // 修不成就 fail-closed，不动项目文件。
+  const rootId = suspended.rootMessageId
+    ?? readLegacyRootId(path.join(root, ".runtime-data", "inbound", "active-mapping.json"));
+  const fixed = withRegistryTransaction({ regFile, root, mutate: (reg) => {
+    const same = reg.projects.map((p, i) => ({ p, i }))
+      .filter((x) => normalizeRoot(x.p?.root) === normalizeRoot(root));
+    if (same.length > 1) return { ok: false, kind: "ambiguous", count: same.length };
+    if (same.length === 1) {
+      // 停用的要启用回来 —— 否则 Stop 仍然挑不到它。
+      if (same[0].p.enabled === false) {
+        reg.projects[same[0].i] = { ...same[0].p, enabled: true };
+        return { ok: true, kind: "reenabled" };
+      }
+      return { ok: true, kind: "already_routable", skipWrite: true };
+    }
+    // registry 里根本没有 —— 用项目文件里那个根话题补登记，不新建。
+    if (!rootId) return { ok: false, kind: "no_root", reason: "项目内绑定读不出根话题" };
+    reg.projects.push(newRegistryEntry({
+      root, name: arg("name") ?? readProjectIdentity({ root }).name,
+      purpose: arg("purpose") ?? null, token: bindingToken(root), rootMessageId: rootId,
+    }));
+    return { ok: true, kind: "adopted" };
+  } });
+  if (!fixed.ok) {
+    const why = fixed.kind === "ambiguous"
+      ? "登记表里有 " + fixed.count + " 条同一个项目的记录，说不清该用哪一条"
+      : fixed.kind === "no_root" ? fixed.reason : fixed.reason;
+    die("恢复中止：" + why, "**项目文件没有改动** —— 出站接不回去的话，恢复就没有意义。");
+  }
+  if (fixed.kind === "reenabled") console.log("  登记表里那条是停用的，已启用回来。");
+  if (fixed.kind === "adopted") console.log("  登记表里没有它，已补登记（复用原话题）。");
+
   const r = setBindingStatus({ root, status: "active" });
   if (!r.ok) {
     console.error("恢复失败（" + r.reason + "）" + (r.error ? "：" + r.error : ""));

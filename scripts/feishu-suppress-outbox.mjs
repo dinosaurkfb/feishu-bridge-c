@@ -33,6 +33,8 @@ import { topicGenerationLockDir } from "./topic-generation-store.mjs";
 import { currentBinding } from "./feishu-control.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 
+const nonEmptyStr = (v) => typeof v === "string" && v.length > 0;
+
 const FLAGS = new Set(["apply"]);
 const OPTIONS = new Set(["project", "session", "reason", "generation"]);
 
@@ -96,16 +98,20 @@ export function selectByGeneration(records, generation, mapping) {
  * 现在临界区只返回结果，退出码由 main 在 try 之外决定。**那种写法在 main 里
  * 不再可能出现**，不是靠记得别写。
  *
- * ■ 为什么要拿两把锁
+ * ■ 什么时候需要第二把锁
  *
- * 只比 outbox 文件集合挡不住轮转。旧格式记录（没有 target_channel_generation_id）
- * 的目标代际是**从 mapping 现算的**：预览时 mapping 说当前是 gen-1，它就属于 gen-1；
+ * 只比 outbox 文件集合挡不住轮转。**旧格式记录**（没有 target_channel_generation_id）
+ * 的目标代际是从 mapping 现算的：预览时 mapping 说当前是 gen-1，它就属于 gen-1；
  * 轮转之后同一个文件属于 gen-2。文件没变、条数没变，集合校验一路放行，
  * 于是一条本该发到新话题的内容被按旧代际**永久**抑制掉。
  *
- * 评审用受控探针复现了这条。挡它需要的不是更细的文件比较，而是让"代际含义"
- * 在读的时候不会变 —— 所以先取**代际锁**（轮转用的那一把，同一个目录，
- * 由 topicGenerationLockDir 唯一定义）再取发布锁，然后在锁内重读 mapping。
+ * 挡它需要让"代际含义"在读的时候不会变 —— 所以取轮转用的那把**代际锁**
+ * （同一个目录，由 topicGenerationLockDir 唯一定义）再取发布锁，锁内重读 mapping。
+ *
+ * 但**只有真的依赖 mapping 解释代际时才需要它**。这批待发里一条旧格式记录都没有，
+ * 每条自带代际，轮转改变不了任何一条的归属 —— 那就不该去动控制面锁。
+ * 上一版无条件取锁，代价是：未绑定的项目也会去碰**本机全局**的 registry.lock，
+ * 测试跑一次碰一次，而未绑定项目的命令还会被报成"轮转中"。
  *
  * 加锁顺序固定为「代际锁 → 发布锁」。反向顺序不存在（排空与发布只取发布锁、
  * 且不动代际），所以不会死锁。
@@ -113,15 +119,23 @@ export function selectByGeneration(records, generation, mapping) {
 export function applySuppression({
   outboxDir, root, session = null, pending, generation, previewGenerationId = null, reason,
 }) {
-  const binding = currentBinding({ root, claudeSessionId: session });
-  const genLockDir = topicGenerationLockDir({ source: binding?.source, root });
-  const genLock = acquirePublishLock(genLockDir);
-  // 轮转正在进行 → 现在不是动 outbox 的时候。等它做完再来。
-  if (!genLock.ok) return { ok: false, reason: "rotation_busy" };
+  // 只有旧格式记录的代际是现算的；其余记录自带代际，轮转不影响它们。
+  const dependsOnMapping = pending.some((r) => !nonEmptyStr(r?.target_channel_generation_id));
+  let genLockDir = null;
+  if (dependsOnMapping) {
+    const binding = currentBinding({ root, claudeSessionId: session });
+    genLockDir = topicGenerationLockDir({ source: binding?.source, root });
+    // 这批里有旧格式记录，却说不清该跟哪一把锁串行 —— **明确拒绝**，
+    // 不许退而求其次去拿全局锁碰运气。
+    if (genLockDir === null) return { ok: false, reason: "binding_unresolved" };
+    const genLock = acquirePublishLock(genLockDir);
+    // 轮转正在进行 → 现在不是动 outbox 的时候。等它做完再来。
+    if (!genLock.ok) return { ok: false, reason: "rotation_busy" };
+  }
   const lockDir = path.join(root, ".runtime-data", "outbound", "publish.lock");
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) {
-    releasePublishLock(genLockDir);
+    if (genLockDir !== null) releasePublishLock(genLockDir);
     return { ok: false, reason: lock.reason };
   }
   try {
@@ -146,7 +160,7 @@ export function applySuppression({
     return { ok: true, done: suppressRecords(fresh, { reason }) };
   } finally {
     releasePublishLock(lockDir);
-    releasePublishLock(genLockDir);
+    if (genLockDir !== null) releasePublishLock(genLockDir);
   }
 }
 
@@ -203,6 +217,9 @@ function main() {
         ? "发布器正忙，稍后再试 —— 不在它发的时候动 outbox。"
       : r.reason === "rotation_busy"
         ? "话题正在轮转，稍后再试 —— 轮转会改变待发内容属于哪一代。"
+      : r.reason === "binding_unresolved"
+        ? "这批待发里有旧格式记录（代际靠当前绑定推算），但这个项目的绑定解析不出来。\n" +
+          "  没有可信的代际依据就不动它 —— 先 /feishu-bind 或确认项目路径。"
       : r.reason === "rotated"
         ? "预览之后话题轮转过（" + String(r.from).slice(0, 12) + "… → " +
           String(r.to).slice(0, 12) + "…），没有动 outbox。\n" +

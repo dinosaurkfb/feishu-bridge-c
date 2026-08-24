@@ -170,6 +170,7 @@ import {
 } from "./topic-generation.mjs";
 import {
   prepareClaudeTopicRotation, recordClaudeTopicActivity, registerClaudeTopicRotation,
+  topicGenerationLockDir,
 } from "./topic-generation-store.mjs";
 import {
   finalizeClaudeDialogueTurn, loadClaudeInteractionPolicy, reserveClaudeDialogueTurn,
@@ -178,6 +179,21 @@ import {
 import {
   businessActivitiesForPublishedBatch, launchAutomaticTopicRotation,
 } from "./automatic-topic-rotation.mjs";
+
+/**
+ * **整个套件用一个临时登记表，谁都够不到本机控制面。**
+ *
+ * 评审在他的机器上跑出 498/502，而我这边 502/502 —— 差别不在代码：有些夹具是
+ * 未绑定的临时目录，锁路径会一路落到 `~/.claude/feishu-bridge/registry.lock`，
+ * 也就是**本机真实的**控制面锁。测试跑一次碰一次，结果自然随机器而变。
+ *
+ * registryPath() 在调用时读这个环境变量，spawn 出去的子进程也继承它，
+ * 所以在这里设一次就够。已经显式设过的（比如从外面指定）不覆盖。
+ */
+if (!process.env.FEISHU_BRIDGE_REGISTRY) {
+  process.env.FEISHU_BRIDGE_REGISTRY = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), "bridge-test-registry-")), "registry.json");
+}
 
 let passed = 0;
 let failed = 0;
@@ -8153,7 +8169,14 @@ test("发布失败只给诊断，不自动做有损动作", () => {
 test("显式抑制命令：默认预览、说明不可逆、拼错的参数不许执行", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-supcmd-"));
   const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  const inbound = path.join(dir, ".runtime-data", "inbound");
   fs.mkdirSync(obDir, { recursive: true });
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_x", feishu_root_message_id_reference: "om_x",
+    claude_session_id: null, channel_generation_id: "gen-1" }));
   fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
     kind: "progress", text: "待发", created_at: new Date().toISOString(), published_at: null,
   }));
@@ -8299,7 +8322,17 @@ test("等量替换要真的挡住：造出漂移，不许抑制、不许静默�
   // 它验的是守卫长什么样，不是守卫做到了什么。这次真造一次漂移。
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-drift-"));
   const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  const inbound = path.join(dir, ".runtime-data", "inbound");
   fs.mkdirSync(obDir, { recursive: true });
+  fs.mkdirSync(inbound, { recursive: true });
+  // **夹具必须是绑定好的项目。**未绑定时锁路径会落到本机全局的 registry.lock ——
+  // 那不只是碰了不该碰的东西，测试结果还会随本机状态而变。
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_x",
+    feishu_root_message_id_reference: "om_x",
+    claude_session_id: null, channel_generation_id: "gen-1" }));
   const onDisk = path.join(obDir, "0002.json");
   fs.writeFileSync(onDisk, JSON.stringify({ kind: "progress", text: "预览之后才进来的", published_at: null }));
 
@@ -8406,6 +8439,46 @@ test("轮转正在进行时不动 outbox，两把锁的顺序固定", () => {
     "第一把锁失败时不许留下第二把");
 });
 
+test("未绑定的项目不许被报成「轮转中」，也不许去碰本机控制面锁", () => {
+  // 评审实测：未绑定项目的抑制入口报 rotation_busy。根因是锁路径在 source
+  // 未知时默认落到**本机全局**的 registry.lock —— 拿不到就说"轮转中"，
+  // 而这个项目根本没在轮转，甚至根本没绑定。
+  //
+  // 顺带：这也是他那边 498/502、我这边 502/502 的原因 ——
+  // 有夹具在跑的时候真的去动了本机的控制面锁。
+  const real = path.join(os.homedir(), ".claude", "feishu-bridge", "registry.lock");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-unbound-"));
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  // 旧格式记录：代际靠绑定推算 —— 而这个项目没有绑定。
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
+    kind: "progress", text: "孤儿", published_at: null }));
+
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir, "--apply",
+  ], { encoding: "utf-8" });
+
+  assert.equal(run.status, 1, "算不清就要非零退出");
+  assert.doesNotMatch(run.stderr, /轮转/u, "它没在轮转，别拿轮转当借口");
+  assert.match(run.stderr, /绑定解析不出来/u, "要说清真正的原因");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(obDir, "0001.json"), "utf-8"))
+    .publish_suppressed_at, undefined, "算不清就一条都不许动");
+  assert.equal(fs.existsSync(real), false, "跑测试不许在本机控制面上留下锁");
+});
+
+test("测试进程用的是临时登记表，够不到本机控制面", () => {
+  // 这条守的是整个套件的隔离前提。**它一旦失效，别的测试就会开始随机器而变红**，
+  // 而那种红看起来像是代码坏了。
+  const used = process.env.FEISHU_BRIDGE_REGISTRY;
+  assert.ok(used, "套件必须显式指定登记表");
+  assert.equal(used.startsWith(os.homedir()), false,
+    "登记表落在了 HOME 里：" + used);
+  assert.equal(topicGenerationLockDir({ source: undefined, root: "/tmp/x" }), null,
+    "说不清是哪种绑定时不许给出锁路径 —— 那会一路落到全局 registry.lock");
+  assert.equal(topicGenerationLockDir({ source: "registry", root: "/tmp/x" })
+    .startsWith(path.dirname(used)), true, "registry 绑定要用套件指定的那张表");
+});
+
 test("取不到锁时命令要非零退出并说清楚，不能静默报成功", () => {
   // main 里那条 `if (!r.ok)` 是漂移和占锁共用的同一条出口。
   // 上一版把临界区的 process.exit 换成 return，return 先跑 finally 再从整个
@@ -8417,6 +8490,10 @@ test("取不到锁时命令要非零退出并说清楚，不能静默报成功",
   fs.mkdirSync(obDir, { recursive: true });
   fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
     project_dir: dir, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_x",
+    feishu_root_message_id_reference: "om_x",
+    claude_session_id: null, channel_generation_id: "gen-1" }));
   fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
     kind: "progress", text: "a", published_at: null }));
   // 别人正拿着锁。**owner 的 pid 必须是活着的进程** —— 锁的过期判定会探活，

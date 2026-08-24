@@ -29,6 +29,8 @@ import { listPending, suppressRecords } from "./outbox.mjs";
 import { groupByTargetGeneration, outboxDirOf } from "./drain-outbox.mjs";
 import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { resolveProject } from "./project-resolve.mjs";
+import { topicGenerationLockDir } from "./topic-generation-store.mjs";
+import { currentBinding } from "./feishu-control.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 
 const FLAGS = new Set(["apply"]);
@@ -60,6 +62,18 @@ function parseArgs(tokens) {
  * 挑出属于某个代际的待发记录。旧格式记录没有 target_channel_generation_id，
  * 它们归属于**当前有效代际** —— 跟排空那边的判定一致。
  */
+/**
+ * mapping 现在的有效代际。**只有这一份定义。**
+ *
+ * 这个解析有两条分支，返回的字段名还不一样（generationId / channelGenerationId）。
+ * 各处各写一遍就会漏掉其中一条 —— 我第一版就漏了，于是"轮转到哪一代"永远算成 null，
+ * 比较看着还是通过的。
+ */
+function activeGenerationOf(mapping) {
+  const r = resolveMappingOutboundGeneration(mapping, null);
+  return r?.generationId ?? r?.channelGenerationId ?? null;
+}
+
 export function selectByGeneration(records, generation, mapping) {
   const out = [];
   for (const [key, group] of groupByTargetGeneration(records)) {
@@ -81,15 +95,48 @@ export function selectByGeneration(records, generation, mapping) {
  *
  * 现在临界区只返回结果，退出码由 main 在 try 之外决定。**那种写法在 main 里
  * 不再可能出现**，不是靠记得别写。
+ *
+ * ■ 为什么要拿两把锁
+ *
+ * 只比 outbox 文件集合挡不住轮转。旧格式记录（没有 target_channel_generation_id）
+ * 的目标代际是**从 mapping 现算的**：预览时 mapping 说当前是 gen-1，它就属于 gen-1；
+ * 轮转之后同一个文件属于 gen-2。文件没变、条数没变，集合校验一路放行，
+ * 于是一条本该发到新话题的内容被按旧代际**永久**抑制掉。
+ *
+ * 评审用受控探针复现了这条。挡它需要的不是更细的文件比较，而是让"代际含义"
+ * 在读的时候不会变 —— 所以先取**代际锁**（轮转用的那一把，同一个目录，
+ * 由 topicGenerationLockDir 唯一定义）再取发布锁，然后在锁内重读 mapping。
+ *
+ * 加锁顺序固定为「代际锁 → 发布锁」。反向顺序不存在（排空与发布只取发布锁、
+ * 且不动代际），所以不会死锁。
  */
-export function applySuppression({ outboxDir, root, pending, generation, mapping, reason }) {
+export function applySuppression({
+  outboxDir, root, session = null, pending, generation, previewGenerationId = null, reason,
+}) {
+  const binding = currentBinding({ root, claudeSessionId: session });
+  const genLockDir = topicGenerationLockDir({ source: binding?.source, root });
+  const genLock = acquirePublishLock(genLockDir);
+  // 轮转正在进行 → 现在不是动 outbox 的时候。等它做完再来。
+  if (!genLock.ok) return { ok: false, reason: "rotation_busy" };
   const lockDir = path.join(root, ".runtime-data", "outbound", "publish.lock");
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: lock.reason };
+  if (!lock.ok) {
+    releasePublishLock(genLockDir);
+    return { ok: false, reason: lock.reason };
+  }
   try {
+    // **锁内重读 mapping**，不用预览时那一份 —— 代际含义正是从它来的。
+    const resolved = resolveProject({ root, claudeSessionId: session });
+    const freshMapping = resolved.ok ? resolved.mapping : null;
+    const activeNow = activeGenerationOf(freshMapping);
+    if (previewGenerationId !== null && activeNow !== previewGenerationId) {
+      // 预览之后轮转过。即使一个文件都没变，"抑制这一代"的含义已经不是原来那个了。
+      return { ok: false, reason: "rotated", from: previewGenerationId, to: activeNow };
+    }
+
     // 预览到落盘之间可能有新内容进来，也可能有内容已经发出去了。
     const freshAll = listPending({ outboxDir });
-    const fresh = generation === null ? freshAll : selectByGeneration(freshAll, generation, mapping);
+    const fresh = generation === null ? freshAll : selectByGeneration(freshAll, generation, freshMapping);
     // **比集合，不是比数量。**只比条数挡不住等量替换：预览之后少一条旧的、
     // 多一条新的，总数没变，就会不可逆地抑制另一批内容。
     const before = new Set(pending.map((x) => x._file));
@@ -99,6 +146,7 @@ export function applySuppression({ outboxDir, root, pending, generation, mapping
     return { ok: true, done: suppressRecords(fresh, { reason }) };
   } finally {
     releasePublishLock(lockDir);
+    releasePublishLock(genLockDir);
   }
 }
 
@@ -125,6 +173,9 @@ function main() {
   // 旧格式记录 —— 它们没有这个字段，排空时被归入当前有效代际（__legacy_active__），
   // 于是按诊断给的代际 id 来筛，一条都筛不到。
   const pending = generation === null ? all : selectByGeneration(all, generation, mapping);
+  // 记下预览时的有效代际。落盘前要拿它跟锁内重读的结果比 —— 中间轮转过的话，
+  // "抑制这一代"的含义已经变了，即使一个文件都没动。
+  const previewGenerationId = activeGenerationOf(mapping);
 
   console.log("项目      " + root);
   console.log("范围      " + (generation === null
@@ -144,14 +195,22 @@ function main() {
 
   if (!apply) { console.log("\n[dry-run] 什么都没写。加 --apply 才生效。"); return; }
 
-  const r = applySuppression({ outboxDir, root, pending, generation, mapping, reason });
+  const r = applySuppression({
+    outboxDir, root, session, pending, generation, previewGenerationId, reason });
   if (!r.ok) {
-    console.error(r.reason === "publisher_busy"
-      ? "发布器正忙，稍后再试 —— 不在它发的时候动 outbox。"
+    console.error(
+      r.reason === "publisher_busy"
+        ? "发布器正忙，稍后再试 —— 不在它发的时候动 outbox。"
+      : r.reason === "rotation_busy"
+        ? "话题正在轮转，稍后再试 —— 轮转会改变待发内容属于哪一代。"
+      : r.reason === "rotated"
+        ? "预览之后话题轮转过（" + String(r.from).slice(0, 12) + "… → " +
+          String(r.to).slice(0, 12) + "…），没有动 outbox。\n" +
+          "  即使文件一个没变，「抑制这一代」的含义已经不是刚才那个了。请重新预览确认。"
       : r.reason === "drift"
         ? "outbox 在预览之后变了（" + r.before + " → " + r.now +
           " 条待发，或换了内容），没有动它。请重新预览确认。"
-        : "取发布锁失败（" + r.reason + "），没有动 outbox。");
+        : "取锁失败（" + r.reason + "），没有动 outbox。");
     process.exitCode = 1;
     return;
   }

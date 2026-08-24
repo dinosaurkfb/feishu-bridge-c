@@ -8320,6 +8320,92 @@ test("等量替换要真的挡住：造出漂移，不许抑制、不许静默�
     "中止路径也要把锁还回去");
 });
 
+test("预览后发生轮转要中止 —— 文件一个没变也不行", () => {
+  // 评审用受控探针复现的：旧格式记录（没有 target_channel_generation_id）
+  // 的目标代际是**从 mapping 现算的**。预览时 mapping 说当前是 gen-1，
+  // 它就属于 gen-1；轮转之后同一个文件属于 gen-2。
+  // 文件没变、条数没变，集合校验一路放行，于是一条本该发到新话题的内容
+  // 被按旧代际**永久**抑制掉。
+  //
+  // 所以这条测试刻意让文件集合**完全不变**，只让代际含义变 ——
+  // 只比文件的实现在这里必然放行。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-rotated-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  const mappingFile = path.join(inbound, "active-mapping.json");
+  // 旧格式 mapping：代际解析走 feishu_root_message_id_reference 那条分支。
+  const writeMapping = (genId) => fs.writeFileSync(mappingFile, JSON.stringify({
+    status: "active", root_message_id: "om_" + genId,
+    feishu_root_message_id_reference: "om_" + genId,
+    claude_session_id: null, channel_generation_id: genId,
+  }));
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  writeMapping("gen-1");
+  // 旧格式：**没有** target_channel_generation_id，代际靠 mapping 现算。
+  const rec = path.join(obDir, "0001.json");
+  fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "旧格式", published_at: null }));
+
+  const all = listPending({ outboxDir: obDir });
+  assert.equal(all.length, 1);
+
+  // 预览之后轮转：mapping 换代，outbox 一个字节没动。
+  writeMapping("gen-2");
+
+  const got = applySuppression({
+    outboxDir: obDir, root: dir, session: null, pending: all,
+    generation: "gen-1", previewGenerationId: "gen-1", reason: "t",
+  });
+
+  assert.equal(got.ok, false, "轮转过就必须中止");
+  assert.equal(got.reason, "rotated");
+  assert.deepEqual([got.from, got.to], ["gen-1", "gen-2"]);
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
+    "一条都不许动 —— 它现在属于新话题");
+  assert.equal(fs.existsSync(path.join(dir, ".runtime-data", "outbound", "publish.lock")), false,
+    "中止路径也要把发布锁还回去");
+  assert.equal(fs.existsSync(path.join(inbound, "topic-generation.lock")), false,
+    "代际锁也要还回去");
+});
+
+test("轮转正在进行时不动 outbox，两把锁的顺序固定", () => {
+  // 加锁顺序固定为「代际锁 → 发布锁」。反向顺序在仓库里不存在
+  // （排空与发布只取发布锁，且不动代际），所以不会死锁。
+  // 这条测的是：代际锁被别人拿着时，命令老老实实退出，而不是绕过去。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-rotbusy-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_x", claude_session_id: null,
+    channel_generation_id: "gen-1" }));
+  const rec = path.join(obDir, "0001.json");
+  fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "a", published_at: null }));
+
+  // 轮转拿着代际锁。owner 的 pid 必须活着，否则会被当成崩溃残留接管。
+  const genLock = path.join(inbound, "topic-generation.lock");
+  fs.mkdirSync(genLock, { recursive: true });
+  fs.writeFileSync(path.join(genLock, "owner.json"),
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+
+  const got = applySuppression({
+    outboxDir: obDir, root: dir, session: null,
+    pending: listPending({ outboxDir: obDir }), generation: null, reason: "t",
+  });
+  assert.equal(got.ok, false);
+  assert.equal(got.reason, "rotation_busy");
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined);
+  assert.ok(fs.existsSync(genLock), "别人的锁不许被顺手删掉");
+  // 代际锁没拿到就不该去碰发布锁。
+  assert.equal(fs.existsSync(path.join(dir, ".runtime-data", "outbound", "publish.lock")), false,
+    "第一把锁失败时不许留下第二把");
+});
+
 test("取不到锁时命令要非零退出并说清楚，不能静默报成功", () => {
   // main 里那条 `if (!r.ok)` 是漂移和占锁共用的同一条出口。
   // 上一版把临界区的 process.exit 换成 return，return 先跑 finally 再从整个

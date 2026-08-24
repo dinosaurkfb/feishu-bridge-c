@@ -43,6 +43,19 @@ export function loadClaudeTopicBinding({
   };
 }
 
+/**
+ * 代际变更用的锁目录。**只有这一份定义。**
+ *
+ * 别处再算一遍是最容易出的那种错：两处各拼一次路径，看起来都在"加锁"，
+ * 实际是两把互不认识的锁 —— 而症状只会在并发下偶发出现。
+ * 抑制命令要跟轮转串行，就必须拿到**同一个**目录。
+ */
+export function topicGenerationLockDir({ source, registryFile = registryPath(), root } = {}) {
+  return source === "project-files"
+    ? path.join(path.dirname(projectMappingPath(root)), "topic-generation.lock")
+    : path.join(path.dirname(registryFile), "registry.lock");
+}
+
 function mutateClaudeTopicBinding({
   root,
   claudeSessionId,
@@ -54,9 +67,7 @@ function mutateClaudeTopicBinding({
   if (!current.ok) return current;
   const projectFile = projectMappingPath(root);
   const projectBacked = current.source === "project-files";
-  const lockDir = projectBacked
-    ? path.join(path.dirname(projectFile), "topic-generation.lock")
-    : path.join(path.dirname(registryFile), "registry.lock");
+  const lockDir = topicGenerationLockDir({ source: current.source, registryFile, root });
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return { ok: false, reason: "binding_busy" };
   try {

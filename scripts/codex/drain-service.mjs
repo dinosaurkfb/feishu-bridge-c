@@ -506,6 +506,17 @@ function main() {
     process.exit(0);
   }
 
+  // **已经是健康的 loaded 就什么都不做。**
+  //
+  // 上一版无条件 bootout → bootstrap，而那可能**打断一次正在进行的排空**。
+  // 幂等重跑是常见操作（比如脚本里顺手带一句），不该有副作用；
+  // 真要重启的话，先 --disable 再 --enable，那是个明确的意图。
+  if (st.phase === "loaded") {
+    console.log("\n已经在跑，而且参数就是当前这份 —— 什么都没做。");
+    console.log("要重启的话：先 --disable --apply，再 --enable --apply。");
+    process.exit(0);
+  }
+
   fs.mkdirSync(path.dirname(st.plist), { recursive: true });
   // **先把同名的旧 job 卸掉。**不卸的话 bootstrap 会因"已存在"失败，
   // 而旧 job 继续按旧配置跑 —— 那正是"报了错却仍显示已加载"的来源。

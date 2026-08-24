@@ -18,7 +18,7 @@ import {
 import { auditSkills } from "./skill-content.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
 import {
-  HOOK_TAG, acceptsHookCommand, buildHookCommand, ownsHookCommand, parseHookCommand,
+  HOOK_TAG, acceptsHookCommand, buildHookCommand, ownsHookCommand, parseHookCommand, pickNode,
 } from "./hook-command.mjs";
 import { sweepEligible } from "./drain-all.mjs";
 
@@ -3040,6 +3040,109 @@ test("时间串走规范校验 —— 纯空白和乱写的都不算合法状态
   // 缺毫秒的那种也不算 —— 产品写的是 toISOString()，判据就该按它来。
   assert.ok(a.unclassified.some((u) => u.file === "p3.json"),
     "缺毫秒的 ISO 串不是规范时间");
+});
+
+test("启用必须 fail-closed：launchd 查不出来时，只许一次只读 list", () => {
+  // 评审指出：unverifiable 那道门槛**没有测试钉着** —— 单独删掉它，
+  // 整套仍然 135/135 全绿。产品行为当时是对的，但"对"没有守卫就守不住。
+  //
+  // 这条断言的是**控制面只被读、没被改**：一次 list，零 bootout、零 bootstrap，
+  // plist 逐字节不变。
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const codexHome = path.join(dir, "codex");
+  const bridge = path.join(dir, "bridge");
+  const bin = path.join(dir, "bin");
+  for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));
+  fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  const marker = path.join(dir, "CALLED");
+  const lc = path.join(bin, "launchctl");
+  // list 返回**看不懂的东西** → 拆不出 ProgramArguments → unverifiable。
+  fs.writeFileSync(lc, '#!/bin/sh\necho "$@" >> ' + JSON.stringify(marker) +
+    '\ncase "$1" in\n  list) echo "看不懂的输出"; exit 0;;\nesac\nexit 0\n', { mode: 0o755 });
+
+  const env = isolatedEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
+    FEISHU_CODEX_BRIDGE_HOME: bridge, FEISHU_BRIDGE_LAUNCHCTL: lc });
+  assert.equal(spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", env }).status, 0);
+
+  // 写一份**合法且与当前配置一致**的 plist —— 这样 phase 只可能由 launchd 那步决定。
+  const agents = path.join(fakeHome, "Library", "LaunchAgents");
+  fs.mkdirSync(agents, { recursive: true });
+  const plist = path.join(agents, "com.frank.feishu-bridge-codex.drain.plist");
+  fs.writeFileSync(plist, plistBody({ home: fakeHome, codexHome }));
+  const before = fs.readFileSync(plist);
+  fs.rmSync(marker, { force: true });
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--enable", "--apply"],
+    { encoding: "utf-8", env });
+
+  assert.notEqual(r.status, 0, "查不出来就必须拒绝：" + r.stdout);
+  assert.match(r.stderr, /launchd 状态查不出来/u, "要说清拒绝的原因");
+  assert.match(r.stderr, /什么都没动/u);
+
+  const calls = fs.existsSync(marker)
+    ? fs.readFileSync(marker, "utf-8").trim().split("\n").filter(Boolean) : [];
+  assert.equal(calls.length, 1, "**只许一次调用**（只读的 list）：" + JSON.stringify(calls));
+  assert.match(calls[0], /^list /u, "那一次必须是只读的 list");
+  assert.equal(calls.some((c) => /^(bootout|bootstrap)/u.test(c)), false,
+    "**控制面一次都不许被改**");
+  assert.deepEqual(fs.readFileSync(plist), before, "plist 逐字节不许变");
+});
+
+test("已经在健康运行时，重跑 --enable 是无操作 —— 不许打断正在进行的排空", () => {
+  // 评审的非阻断建议，我当成安全问题做了：无条件 bootout → bootstrap
+  // **可能打断一次正在进行的排空**。幂等重跑不该有副作用。
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const codexHome = path.join(dir, "codex");
+  const bridge = path.join(dir, "bridge");
+  const bin = path.join(dir, "bin");
+  for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));
+  fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  const marker = path.join(dir, "CALLED");
+  const lc = path.join(bin, "launchctl");
+  const expectScript = path.join(codexHome, "feishu-bridge", "runtime", "current",
+    "scripts", "codex", "drain-all.mjs");
+  // **用产品同一个函数挑 node，不自己猜。**猜错的话这条测的就成了"路径不一致"，
+  // 而不是"健康在跑时不该动手"。
+  const node = pickNode();
+  // list 报告"正在跑，而且参数就是当前这份"。
+  fs.writeFileSync(lc, '#!/bin/sh\necho "$@" >> ' + JSON.stringify(marker) +
+    '\ncase "$1" in\n  list) printf \'{\\n\\t"Program" = "%s";\\n\\t"ProgramArguments" = (\\n\\t\\t"%s";\\n\\t\\t"%s";\\n\\t);\\n};\\n\' ' +
+    JSON.stringify(node) + ' ' + JSON.stringify(node) + ' ' + JSON.stringify(expectScript) +
+    '; exit 0;;\nesac\nexit 0\n', { mode: 0o755 });
+
+  const env = isolatedEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
+    FEISHU_CODEX_BRIDGE_HOME: bridge, FEISHU_BRIDGE_LAUNCHCTL: lc });
+  assert.equal(spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", env }).status, 0);
+  const agents = path.join(fakeHome, "Library", "LaunchAgents");
+  fs.mkdirSync(agents, { recursive: true });
+  const plist = path.join(agents, "com.frank.feishu-bridge-codex.drain.plist");
+  fs.writeFileSync(plist, plistBody({ home: fakeHome, codexHome, node }));
+  const before = fs.readFileSync(plist);
+  fs.rmSync(marker, { force: true });
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--enable", "--apply"],
+    { encoding: "utf-8", env });
+
+  assert.equal(r.status, 0,
+    "健康在跑时重跑应当成功且无操作：" + r.stdout + r.stderr);
+  assert.match(r.stdout, /什么都没做/u);
+  const calls = fs.existsSync(marker)
+    ? fs.readFileSync(marker, "utf-8").trim().split("\n").filter(Boolean) : [];
+  assert.equal(calls.some((c) => /^(bootout|bootstrap)/u.test(c)), false,
+    "**不许 bootout/bootstrap** —— 那会打断正在进行的排空：" + JSON.stringify(calls));
+  assert.deepEqual(fs.readFileSync(plist), before, "plist 也不许被重写");
 });
 
 test("启用必须 fail-closed：plist 读不出来时，launchctl 一次都不许被调用", () => {

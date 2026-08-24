@@ -27,8 +27,8 @@ import {
 import { acquireClaim, claimKey, recordClaimState } from "./claim.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
-  acquirePublishLock, attributeSession, fileContainsAny, isUnder,
-  loadRegistry, releasePublishLock,
+  acquirePublishLock, attributeSession, exactProjectsForRoot, fileContainsAny, isUnder,
+  loadRegistry, loadRegistryStrict, normalizeRoot, releasePublishLock,
 } from "./registry.mjs";
 import {
   appendEvent, composeDigest, listPending, markSent, suppressRecords,
@@ -9085,6 +9085,71 @@ test("登记表的写入口只有一个 —— 建话题那条路径也走同一
   // 数**调用点**，别把函数定义也数进去（第一版就是这么多算了一处）。
   const calls = (src.match(/=\s*withRegistryTransaction\(\{/gu) ?? []).length;
   assert.equal(calls, 2, "补登记和新建绑定都要走同一个入口，实际 " + calls + " 处调用");
+});
+
+test("逻辑相同的 root 不许绕过 —— 尾斜杠也是同一个项目", () => {
+  // 评审抓的：前置检查挡得住字面完全相同的 root，但登记表里若是 "/project/"、
+  // 命令解析出来是 "/project"，**两次检查都认为没有记录** ——
+  // 于是可能先建飞书话题，再新增一条逻辑重复的记录。
+  //
+  // 根因是归一化写了两份：运行时的 loadRegistry 做尾斜杠处理，
+  // 而 bind 自己那份严格读取不做。现在两处共用 registry.mjs 里的同一个 normalizeRoot。
+  assert.equal(normalizeRoot("/a/b/"), normalizeRoot("/a/b"));
+  assert.equal(normalizeRoot("/a/b//"), normalizeRoot("/a/b"));
+  assert.equal(normalizeRoot(""), null);
+  assert.equal(normalizeRoot(null), null);
+  // 不同项目仍然不同 —— 别为了归一化把它们也拉平。
+  assert.notEqual(normalizeRoot("/a/b"), normalizeRoot("/a/bc"));
+
+  const projects = [{ root: "/x/proj/" }, { root: "/x/other" }];
+  assert.equal(exactProjectsForRoot(projects, "/x/proj").length, 1, "尾斜杠要认成同一个");
+  assert.equal(exactProjectsForRoot(projects, "/x/proj/").length, 1);
+  // **目录包含关系不算。**父目录不是这个项目。
+  assert.equal(exactProjectsForRoot([{ root: "/x" }], "/x/proj").length, 0);
+
+  // 走真实入口：登记表里是带尾斜杠的那条 → 必须认成"已经有了"，
+  // 不许建话题、不许新增第二条。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-slash-"));
+  const proj = path.join(dir, "proj");
+  fs.mkdirSync(path.join(proj, ".runtime-data", "inbound"), { recursive: true });
+  fs.writeFileSync(path.join(proj, ".runtime-data", "inbound", "chain-config.json"),
+    JSON.stringify({ project_dir: proj, logical_task_key: "k",
+      project_display_name: "P", task_display_name: "P" }));
+  const reg = path.join(dir, "registry.json");
+  const tpl = path.join(dir, "chain-config.json");
+  const screamer = path.join(dir, "lark-scream");
+  fs.writeFileSync(screamer, "#!/bin/sh\necho SCREAM >> " +
+    JSON.stringify(path.join(dir, "calls.log")) + "\nexit 9\n");
+  fs.chmodSync(screamer, 0o755);
+  fs.writeFileSync(tpl, JSON.stringify({ ...TPL, lark_cli_bin: screamer }));
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "slash", root: proj + "/", root_message_id: "om_a" }] }));
+
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, "--apply",
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: reg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: dir } });
+
+  assert.match(run.stdout, /已经接入过了/u, "带尾斜杠的那条就是它，不该当成没有");
+  assert.equal(fs.existsSync(path.join(dir, "calls.log")), false,
+    "**不许建话题** —— 往群里发消息是撤不回来的");
+  assert.equal(JSON.parse(fs.readFileSync(reg, "utf-8")).projects.length, 1,
+    "不许新增第二条逻辑重复的记录");
+
+  // **两条逻辑相同、写法不同 → 必须当成歧义拒绝。**
+  // 这一种只有前置的精确匹配挡得住：字面比较会认为"各只有一条"，
+  // 于是歧义根本不存在，命令照常往下走。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0", projects: [
+    { id: "with", root: proj + "/", root_message_id: "om_a" },
+    { id: "without", root: proj, root_message_id: "om_b" }] }));
+  const dup = spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, "--apply",
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: reg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: dir } });
+  assert.equal(dup.status, 1, "逻辑重复也是歧义，必须拒");
+  assert.match(dup.stderr, /说不清该(改|用)哪一条/u);
+  assert.equal(dup.stdout.includes("已经接入过了"), false, "不许把歧义盖过去");
+  assert.equal(fs.existsSync(path.join(dir, "calls.log")), false, "拒绝路径不许调用 lark");
 });
 
 test("同 root 多条：在任何动作之前就拒，不许先动飞书", () => {

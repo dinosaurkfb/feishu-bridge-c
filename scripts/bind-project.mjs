@@ -22,7 +22,10 @@ import path from "node:path";
 
 import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { bindingsForRoot, currentBinding, describeStatus, setBindingStatus } from "./feishu-control.mjs";
-import { acquirePublishLock, registryPath, releasePublishLock } from "./registry.mjs";
+import {
+  acquirePublishLock, exactProjectsForRoot, loadRegistryStrict, normalizeRoot,
+  registryPath, releasePublishLock,
+} from "./registry.mjs";
 import { topicGenerationLockDir } from "./topic-generation-store.mjs";
 import { publishDraft, sendToChat } from "./outbound.mjs";
 import { isDirectRun } from "./direct-run.mjs";
@@ -69,33 +72,6 @@ const template = tpl.template;
 const regFile = registryPath();
 
 /**
- * 读登记表。**只有"文件不存在"才当成空表。**
- *
- * 上一版把所有异常都当成"没有登记表"，于是坏 JSON、权限错误也会走进新建逻辑 ——
- * 那等于拿一张空表去覆盖一份读不出来的真实登记表，**把别的项目的绑定一起抹掉**。
- * 读不出来跟没有，是完全不同的两件事。
- */
-function loadRegistryStrict(file) {
-  let text;
-  try { text = fs.readFileSync(file, "utf-8"); }
-  catch (err) {
-    if (err.code === "ENOENT") return { ok: true, registry: { schema_version: "1.0", projects: [] } };
-    return { ok: false, reason: "登记表读不了（" + err.code + "）：" + err.message };
-  }
-  let parsed;
-  try { parsed = JSON.parse(text); }
-  catch (err) { return { ok: false, reason: "登记表不是合法 JSON：" + err.message }; }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return { ok: false, reason: "登记表根节点不是对象" };
-  }
-  if (parsed.projects !== undefined && !Array.isArray(parsed.projects)) {
-    return { ok: false, reason: "登记表 projects 不是数组" };
-  }
-  parsed.projects ??= [];
-  return { ok: true, registry: parsed };
-}
-
-/**
  * **这个 CLI 里所有登记表写入的唯一入口。**
  *
  * 两条要求合在一处：
@@ -114,20 +90,23 @@ function withRegistryTransaction({ regFile, root, mutate }) {
   if (!lock.ok) return { ok: false, kind: "busy", reason: lock.reason };
   try {
     const fresh = loadRegistryStrict(regFile);
-    if (!fresh.ok) return { ok: false, kind: "unreadable", reason: fresh.reason };
-    const decided = mutate(fresh.registry);
+    if (!fresh.ok) {
+      return { ok: false, kind: "unreadable", reason: fresh.reason + "：" + fresh.error };
+    }
+    const reg = { ...fresh.raw, projects: fresh.projects };
+    const decided = mutate(reg);
     if (!decided.ok) return decided;
     if (decided.skipWrite) return decided;
     try {
       fs.mkdirSync(path.dirname(regFile), { recursive: true, mode: 0o700 });
       if (fs.existsSync(regFile)) fs.copyFileSync(regFile, regFile + ".prev");
       const tmp = regFile + ".tmp." + process.pid;
-      fs.writeFileSync(tmp, JSON.stringify(fresh.registry, null, 2) + "\n", { mode: 0o600 });
+      fs.writeFileSync(tmp, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
       fs.renameSync(tmp, regFile);
     } catch (err) {
       return { ok: false, kind: "write_failed", reason: err.message };
     }
-    return { ...decided, count: fresh.registry.projects.length };
+    return { ...decided, count: reg.projects.length };
   } finally {
     releasePublishLock(lockDir);
   }
@@ -135,9 +114,11 @@ function withRegistryTransaction({ regFile, root, mutate }) {
 
 const loaded0 = loadRegistryStrict(regFile);
 if (!loaded0.ok) {
-  die(loaded0.reason, "没有动任何文件。先把 " + regFile + " 修好或挪走，再重跑。");
+  die("登记表" + (loaded0.reason === "bad_json" ? "不是合法 JSON"
+    : loaded0.reason === "bad_shape" ? "形状不对" : "读不了") + "：" + loaded0.error,
+    "没有动任何文件。先把 " + regFile + " 修好或挪走，再重跑。");
 }
-let registry = loaded0.registry;
+let registry = { ...loaded0.raw, projects: loaded0.projects };
 
 // **歧义要在任何动作之前就拦下。**
 //
@@ -150,12 +131,15 @@ let registry = loaded0.registry;
 //
 // 后者尤其糟：那是不可撤销的。所以这里先数，数不清就立刻停 ——
 // 事务内仍会重读重判，防的是并发变化，两处不是重复而是各管一段。
-const sameRootAll = registry.projects.filter((p) => p?.root === root);
+// **用规范化后的 root 比。**`/project/` 和 `/project` 是同一个项目，
+// 而登记表里可能是带斜杠的那条、命令解析出来是不带的 —— 字面比较两次都说"没有"，
+// 于是可能先建话题、再新增一条逻辑重复的记录。
+const sameRootAll = exactProjectsForRoot(registry.projects, root);
 if (sameRootAll.length > 1) {
   die("登记表里有 " + sameRootAll.length + " 条同一个项目的记录，说不清该用哪一条。",
     "先人工确认并只保留一条，再重跑。什么都没做，也没有往群里发任何消息。");
 }
-const at = registry.projects.findIndex((p) => p?.root === root);
+const at = registry.projects.findIndex((p) => normalizeRoot(p?.root) === normalizeRoot(root));
 const already = at >= 0 ? registry.projects[at] : null;
 const legacyMapping = path.join(root, ".runtime-data", "inbound", "active-mapping.json");
 
@@ -217,7 +201,7 @@ if (fs.existsSync(legacyMapping)) {
   }
   const done = withRegistryTransaction({ regFile, root, mutate: (reg) => {
     // 同一个 root 出现多条 → 说不清该改哪一条。
-    const sameRoot = reg.projects.map((p, i) => ({ p, i })).filter((x) => x.p?.root === root);
+    const sameRoot = reg.projects.map((p, i) => ({ p, i })).filter((x) => normalizeRoot(x.p?.root) === normalizeRoot(root));
     if (sameRoot.length > 1) return { ok: false, kind: "ambiguous", count: sameRoot.length };
     // 锁内重读后可能已经被别人补上了 —— 那就什么都不用做。
     if (sameRoot.length === 1 && sameRoot[0].p.root_message_id) {
@@ -294,7 +278,7 @@ console.log("\n根话题已建立  " + rootMessageId);
 // 跟补登记并发时仍会互相覆盖 —— 那样"登记表控制锁"就只是名义上的。
 // 建话题可以在锁外靠平台幂等键，但拿到根消息之后必须进同一笔登记事务。
 const registered = withRegistryTransaction({ regFile, root, mutate: (reg) => {
-  const sameRoot = reg.projects.map((p, i) => ({ p, i })).filter((x) => x.p?.root === root);
+  const sameRoot = reg.projects.map((p, i) => ({ p, i })).filter((x) => normalizeRoot(x.p?.root) === normalizeRoot(root));
   if (sameRoot.length > 1) return { ok: false, kind: "ambiguous", count: sameRoot.length };
   const entry = newRegistryEntry({ root, name, purpose, token, rootMessageId });
   if (sameRoot.length === 1) reg.projects[sameRoot[0].i] = { ...sameRoot[0].p, ...entry };

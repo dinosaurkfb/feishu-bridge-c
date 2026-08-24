@@ -21,6 +21,53 @@ export function registryPath() {
 const stripTrailingSlash = (p) => (p.length > 1 && p.endsWith("/") ? p.replace(/\/+$/, "") : p);
 
 /**
+ * 项目 root 的规范形式。**只有这一份定义。**
+ *
+ * `/project/` 和 `/project` 是同一个项目，但字符串不等。两处各写一份归一化，
+ * 就会出现"前置检查说没有、运行时说有"——那正是一次漏判：登记表里是带斜杠的那条，
+ * 命令解析出来是不带的，两次都认为"没记录"，于是可能先建话题再新增一条逻辑重复记录。
+ */
+export const normalizeRoot = (root) => (typeof root === "string" && root.length > 0
+  ? stripTrailingSlash(path.resolve(root)) : null);
+
+/** 登记表里**精确**是这个项目的条目。目录包含关系不算 —— 见 exactProjectsForRoot 的注释。 */
+export function exactProjectsForRoot(projects, root) {
+  const want = normalizeRoot(root);
+  if (want === null) return [];
+  return (projects ?? []).filter((p) => normalizeRoot(p?.root) === want);
+}
+
+/**
+ * 严格读登记表：**只有"文件不存在"算空表。**
+ *
+ * loadRegistry() 对钩子是对的 —— 绝大多数机器根本没接桥，读不到必须安静退出。
+ * 但对**要据此做判断或写入**的调用方（bind / status）不行：它把 EACCES、EISDIR
+ * 一律当成 no_registry，于是"读不出来"被当成了"没有"。
+ * 前者会让 bind 拿空表去覆盖一份读不出来的真表；后者会让 status 把"没查清"
+ * 报成"降级"。
+ *
+ * 抽到这里是因为 bind 和 status 各写一份就会再次分叉 —— 那是今天已经付过一次的代价。
+ */
+export function loadRegistryStrict(file = registryPath()) {
+  let raw;
+  try { raw = fs.readFileSync(file, "utf-8"); }
+  catch (err) {
+    if (err.code === "ENOENT") return { ok: true, file, projects: [], missing: true };
+    return { ok: false, reason: "unreadable", file, error: err.code + ": " + err.message };
+  }
+  let parsed;
+  try { parsed = JSON.parse(raw); }
+  catch (err) { return { ok: false, reason: "bad_json", file, error: err.message }; }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, reason: "bad_shape", file, error: "根节点不是对象" };
+  }
+  if (parsed.projects !== undefined && !Array.isArray(parsed.projects)) {
+    return { ok: false, reason: "bad_shape", file, error: "projects 不是数组" };
+  }
+  return { ok: true, file, raw: parsed, projects: parsed.projects ?? [] };
+}
+
+/**
  * 读登记表。读不到不是错误 —— 绝大多数机器/会话根本没接桥，
  * 那种情况必须安静返回空表，让钩子立刻退出。
  */

@@ -28,15 +28,40 @@ const groupByTargetGeneration = (records) => {
   return [...groups.entries()];
 };
 
-export function publishEligibleTaskEvents({ task, home = bridgeHome(), timeoutMs = 12_000 } = {}) {
+/**
+ * 发送之前必须成立的每一件事 —— **不碰 outbox、不发任何东西**。
+ *
+ * 抽出来是因为兜底调度器的启用门槛要验"这条链跑不跑得通"。
+ * 上一版那道门槛把整个 publishEligibleTaskEvents 换成假的，于是它验的是
+ * "我的假函数能被调用"，跟真实链路无关：评审实测同一个 task 门禁报 ok，
+ * 真实路径却是 template_unusable。**替换掉被测对象的检查等于没有检查。**
+ *
+ * 主链自己也走这个函数 —— 分成两份写的话，门槛迟早验的是另一件事。
+ */
+export function preflightTask({ task, home = bridgeHome() } = {}) {
   if (!task || task.auto_publish_on_completion !== true) {
-    return { status: "disabled", reason: "auto_publish_disabled" };
+    return { ok: false, status: "disabled", reason: "auto_publish_disabled" };
   }
   const resolved = resolveTask(task, { home });
-  if (!resolved.ok) return { status: "error", reason: resolved.reason };
+  if (!resolved.ok) return { ok: false, status: "error", reason: resolved.reason };
   if (resolved.mapping.status !== "active" || !resolved.mapping.feishu_root_message_id_reference) {
-    return { status: "skipped", reason: "mapping_not_active" };
+    return { ok: false, status: "skipped", reason: "mapping_not_active" };
   }
+  // 身份解析不出来的话，真到发的时候才炸 —— 门槛必须在这里就发现。
+  try {
+    const identity = resolveLarkIdentity(resolved.template);
+    if (!identity) return { ok: false, status: "error", reason: "identity_unresolved" };
+  } catch (err) {
+    return { ok: false, status: "error",
+      reason: "identity_unresolved", error: String(err?.message ?? err).slice(0, 200) };
+  }
+  return { ok: true, resolved };
+}
+
+export function publishEligibleTaskEvents({ task, home = bridgeHome(), timeoutMs = 12_000 } = {}) {
+  const pre = preflightTask({ task, home });
+  if (!pre.ok) return { status: pre.status, reason: pre.reason };
+  const resolved = pre.resolved;
 
   const paths = taskPaths(task, home);
   const eligible = () => listPending({ outboxDir: paths.outbox })

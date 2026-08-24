@@ -31,7 +31,7 @@ import path from "node:path";
 import { isDirectRun } from "../direct-run.mjs";
 import { listPending } from "../outbox.mjs";
 import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
-import { sweepEligible } from "./drain-all.mjs";
+import { preflightTask } from "./publish-eligible.mjs";
 import { bridgeHome, loadRegistry, registryFile, taskPaths } from "./state.mjs";
 
 const CHAIN = "codex";
@@ -62,11 +62,23 @@ export const drainScriptPath = (home = os.homedir(), codexHome = codexHomeOf(hom
 export const codexHomeOf = (home = os.homedir()) =>
   process.env.CODEX_HOME || path.join(home, ".codex");
 
+/**
+ * plist 是 XML —— **路径必须转义**。
+ *
+ * 家目录里出现 `&` 就足以让整份 plist 变成非法 XML：launchd 加载失败，
+ * 而我们写文件那一步是"成功"的。含空格和中文的路径这个仓库已经栽过一次
+ * （那次是 shell 引号），XML 是同一个道理换了一种语法。
+ */
+const xml = (text) => String(text)
+  .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+
 export function plistBody({ home = os.homedir(), node = pickNode(),
   codexHome = codexHomeOf(home) } = {}) {
   const script = drainScriptPath(home, codexHome);
   const workdir = path.join(codexRuntimeRoot(codexHome), "current");
   const log = path.join(codexHome, "feishu-bridge", "drain.log");
+  const [xNode, xScript, xWork, xLog, xHome, xBridge] =
+    [node, script, workdir, log, home, path.join(codexHome, "feishu-bridge")].map(xml);
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -74,19 +86,19 @@ export function plistBody({ home = os.homedir(), node = pickNode(),
   <key>Label</key><string>${LAUNCH_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${node}</string>
-    <string>${script}</string>
+    <string>${xNode}</string>
+    <string>${xScript}</string>
   </array>
-  <key>WorkingDirectory</key><string>${workdir}</string>
+  <key>WorkingDirectory</key><string>${xWork}</string>
   <key>StartInterval</key><integer>1800</integer>
   <key>RunAtLoad</key><false/>
-  <key>StandardOutPath</key><string>${log}</string>
-  <key>StandardErrorPath</key><string>${log}</string>
+  <key>StandardOutPath</key><string>${xLog}</string>
+  <key>StandardErrorPath</key><string>${xLog}</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-    <key>HOME</key><string>${home}</string>
-    <key>FEISHU_CODEX_BRIDGE_HOME</key><string>${path.join(codexHome, "feishu-bridge")}</string>
+    <key>HOME</key><string>${xHome}</string>
+    <key>FEISHU_CODEX_BRIDGE_HOME</key><string>${xBridge}</string>
   </dict>
 </dict>
 </plist>
@@ -104,14 +116,36 @@ export function classifyBacklog({ home = bridgeHome() } = {}) {
   if (!reg.ok) return { ok: false, reason: "registry_unreadable" };
   const tasks = [];
   let total = 0;
+  let unreadable = 0;
   for (const t of reg.tasks ?? []) {
+    const outboxDir = taskPaths(t, home).outbox;
     let n = 0;
-    try { n = listPending({ outboxDir: taskPaths(t, home).outbox }).length; }
+    try { n = listPending({ outboxDir }).length; }
     catch { return { ok: false, reason: "outbox_unreadable" }; }
+    // **listPending 会静默跳过读不出来的文件。**于是一个装满坏 JSON 的 outbox
+    // 会被数成"0 条积压"，门槛放行，定时器装上 —— 而那些文件到底是什么内容
+    // 谁也不知道。**读不出来不等于没有**，这跟登记表那条是同一个道理。
+    const bad = unreadableRecords(outboxDir);
+    unreadable += bad.length;
     total += n;
-    if (n > 0) tasks.push({ key: t?.logical_task_key ?? null, pending: n });
+    if (n > 0 || bad.length > 0) {
+      tasks.push({ key: t?.logical_task_key ?? null, pending: n, unreadable: bad.length });
+    }
   }
-  return { ok: true, total, tasks };
+  return { ok: true, total, unreadable, tasks };
+}
+
+/** outbox 里有几个文件根本读不出来。listPending 会跳过它们，所以要单独数。 */
+export function unreadableRecords(outboxDir) {
+  let files;
+  try { files = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json")); }
+  catch { return []; }
+  const bad = [];
+  for (const f of files) {
+    try { JSON.parse(fs.readFileSync(path.join(outboxDir, f), "utf-8")); }
+    catch { bad.push(f); }
+  }
+  return bad;
 }
 
 /**
@@ -136,7 +170,7 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
     // 那正是"界面说正常、实际不工作"的形状。
     phase: installed === null ? "absent"
       : installed !== wanted ? "stale"
-      : loadedPhase(),
+      : loadedPhase(spawnLaunchctl, drainScriptPath(home, codexHome)),
     enabled: installed !== null,
     stale: installed !== null && installed !== wanted,
     plist: file,
@@ -147,14 +181,25 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
 /**
  * launchd 里到底有没有它。**读不出来就说读不出来**，不许由"文件在"推出"在跑"。
  */
-export function loadedPhase(run = spawnLaunchctl) {
+export function loadedPhase(run = spawnLaunchctl, expectScript = null) {
   const r = run(["list", LAUNCH_LABEL]);
-  if (r.ok) return "loaded";
-  // 明确的"没这个服务"和"我查不了"是两件事。
-  if (typeof r.detail === "string" && /could not find|No such/iu.test(r.detail)) {
-    return "installed_not_loaded";
+  if (!r.ok) {
+    // 明确的"没这个服务"和"我查不了"是两件事。
+    if (typeof r.detail === "string" && /could not find|No such/iu.test(r.detail)) {
+      return "installed_not_loaded";
+    }
+    return "unverifiable";
   }
-  return "unverifiable";
+  // **同名 job 在，不等于跑的是我们刚写的那份。**
+  //
+  // 先写新 plist 再 bootstrap，失败时 plist 留在原地；而如果旧的同名 job 还在
+  // launchd 里跑着，只看"有没有这个 label"就会报"已加载，正在按计划跑"——
+  // 实际跑的是旧配置。评审用这个场景做出了假绿。
+  if (expectScript !== null) {
+    const args = typeof r.stdout === "string" ? r.stdout : "";
+    if (!args.includes(expectScript)) return "loaded_other";
+  }
+  return "loaded";
 }
 
 export const PHASE_TEXT = {
@@ -162,6 +207,7 @@ export const PHASE_TEXT = {
   stale: "plist 与当前运行时对不上（要重装）",
   installed_not_loaded: "**plist 已写入但没被 launchd 加载 —— 定时器不会跑**",
   loaded: "已加载，正在按计划跑",
+  loaded_other: "**同名 job 在跑，但参数不是当前这份 —— 跑的多半是旧配置**",
   unverifiable: "plist 已写入；launchd 状态查不出来（不等于在跑）",
 };
 
@@ -175,14 +221,26 @@ export const PHASE_TEXT = {
  * **不发任何东西 —— 注入一个只观察的 publish。**上一版我在文档里把这道门槛
  * 写成了"已有"，实际根本没实现："不确定的事别写成确定"，这次栽在自己写的注释上。
  */
-export function scanRunnable({ home = bridgeHome(), sweep } = {}) {
-  const run = sweep ?? sweepEligible;
-  try {
-    const r = run({ home, publish: () => ({ status: "dry" }) });
-    return r.ok ? { ok: true, tasks: r.results.length } : { ok: false, reason: r.reason };
-  } catch (err) {
-    return { ok: false, reason: String(err?.message ?? err).slice(0, 200) };
+export function scanRunnable({ home = bridgeHome(), preflight = preflightTask } = {}) {
+  const reg = loadRegistry(registryFile(home));
+  if (!reg.ok) return { ok: false, reason: "registry_unreadable" };
+  const broken = [];
+  for (const task of reg.tasks ?? []) {
+    let r;
+    try { r = preflight({ task, home }); }
+    catch (err) { r = { ok: false, status: "error",
+      reason: String(err?.message ?? err).slice(0, 120) }; }
+    // disabled / skipped 是正常状态（没开自动发布、mapping 没激活）——
+    // 只有 error 才说明这条链本身跑不通。
+    if (!r.ok && r.status === "error") {
+      broken.push({ key: task?.logical_task_key ?? null, reason: r.reason });
+    }
   }
+  if (broken.length > 0) {
+    return { ok: false,
+      reason: broken.map((b) => (b.key ?? "?") + "：" + b.reason).join("；") };
+  }
+  return { ok: true, tasks: (reg.tasks ?? []).length };
 }
 
 export function enableBlockers(state) {
@@ -197,6 +255,10 @@ export function enableBlockers(state) {
     blockers.push({ code: "backlog_unreadable", detail: state.backlog.reason });
   } else if (state.backlog.total > 0) {
     blockers.push({ code: "backlog_unclassified", detail: state.backlog.total + " 条待发" });
+  }
+  if (state.backlog.ok && (state.backlog.unreadable ?? 0) > 0) {
+    blockers.push({ code: "backlog_corrupt",
+      detail: state.backlog.unreadable + " 个文件读不出来" });
   }
   return blockers;
 }
@@ -226,6 +288,12 @@ function main() {
   console.log("运行时    " + (st.runtimeOk
     ? "校验通过" : "**校验不过**（" + st.runtimeReason + "）"));
   console.log("排空脚本  " + drainScriptPath(home));
+  if (st.backlog.ok && (st.backlog.unreadable ?? 0) > 0) {
+    console.log("损坏文件  **" + st.backlog.unreadable + " 个读不出来**（不计入待发数）");
+  }
+  console.log("链路预检  " + (st.scan.ok
+    ? "通过（" + st.scan.tasks + " 个 task 走真实发布前置检查）"
+    : "**跑不通**（" + st.scan.reason + "）"));
   if (st.backlog.ok) {
     console.log("历史积压  " + st.backlog.total + " 条" +
       (st.backlog.total > 0 ? "（分布在 " + st.backlog.tasks.length + " 个 task）" : ""));
@@ -247,6 +315,9 @@ function main() {
           console.error("  · 还有 " + b.detail + " 没处理。**定时器一启用它们就会被发出去** ——");
           console.error("    先决定这批内容是发还是停（scripts/codex/suppress-outbox.mjs），");
           console.error("    再回来启用。这一步不许省：省掉它就是替人做了一个不可逆的决定。");
+        } else if (b.code === "backlog_corrupt") {
+          console.error("  · outbox 里有 " + b.detail + "。**读不出来不等于没有** ——");
+          console.error("    这些文件是什么内容谁也不知道，不能当成「没有积压」放行。");
         } else if (b.code === "scan_failed") {
           console.error("  · eligible-only 扫描跑不通（" + b.detail + "）——");
           console.error("    定时器要跑的就是它，跑不通就不能装。");
@@ -277,6 +348,9 @@ function main() {
   }
 
   fs.mkdirSync(path.dirname(st.plist), { recursive: true });
+  // **先把同名的旧 job 卸掉。**不卸的话 bootstrap 会因"已存在"失败，
+  // 而旧 job 继续按旧配置跑 —— 那正是"报了错却仍显示已加载"的来源。
+  spawnLaunchctl(["bootout", "gui/" + process.getuid() + "/" + LAUNCH_LABEL]);
   fs.writeFileSync(st.plist, plistBody({ home }), { mode: 0o644 });
   const loaded = spawnLaunchctl(["bootstrap", "gui/" + process.getuid(), st.plist]);
   if (!loaded.ok) {
@@ -292,7 +366,8 @@ function main() {
 
 function spawnLaunchctl(args) {
   const r = spawnSync("launchctl", args, { encoding: "utf-8" });
-  if (r.status === 0) return { ok: true };
+  // stdout 要带回来 —— 核验"跑的是不是我们这份"靠的就是它。
+  if (r.status === 0) return { ok: true, stdout: r.stdout ?? "" };
   return { ok: false, detail: (r.stderr || r.stdout || "status " + r.status).trim() };
 }
 

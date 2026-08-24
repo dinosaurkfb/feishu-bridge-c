@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { moduleRoot } from "../direct-run.mjs";
 import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
+import { acceptsHookCommand, ownsHookCommand } from "./hook-command.mjs";
 import { PHASE_TEXT, serviceState } from "./drain-service.mjs";
 
 import {
@@ -40,30 +41,22 @@ function commandPath(name, extra = []) {
 }
 
 /**
- * 某个事件下有几条**我们的** hook，各自指向哪。
+ * 某个事件下有几条**我们的** hook —— 判据来自安装器同一份模块。
  *
- * 判据从"命令里出现某个绝对路径"改成"命令里出现 scripts/codex/<名字>"，
- * 原因：旧判据实际在问"钩子指不指向我这个克隆"。于是同一套线上安装，
- * 从 A 克隆跑 doctor 说装好了，从 B 克隆跑就说没装 —— 报告取决于谁在哪跑，
- * 而不是线上是什么样。迁移到 runtime/current 之后，它会永远报缺失。
- *
- * 返回全部命中的条目：**"恰好一条"本身就是要检查的事实**。
- * Codex 文档说多个匹配的 hook 会全部运行，重复一条就是旧代码还在跑。
+ * 上一版这里自己写了一套"命令里出现 scripts/codex/<名字>"的判据。
+ * 评审用反例证明了它是假绿：一条 `echo <runtime/current/.../stop-hook.mjs>`
+ * 被 doctor 判为"恰好 1 条，指向 runtime/current"，而安装器根本不认它。
+ * **验收工具和被验收的东西必须说同一件事。**
  */
-function hookEntries(hooks, event, basename) {
+function hookCommands(hooks, event, basename) {
   const out = [];
   for (const entry of hooks?.hooks?.[event] ?? []) {
     for (const hook of entry?.hooks ?? []) {
-      if (typeof hook?.command === "string" && hook.command.includes("scripts/codex/" + basename)) {
-        out.push(hook.command);
-      }
+      if (ownsHookCommand(hook?.command, basename)) out.push(hook.command);
     }
   }
   return out;
 }
-
-/** 这条命令指的是不是 runtime/current 下那一份。 */
-const pointsAtRuntime = (command, expected) => command.includes(expected);
 
 const checks = [];
 const add = (name, ok, detail, next = null) => checks.push({ name, ok, detail, next });
@@ -118,12 +111,13 @@ const hookReport = [
   ["UserPromptSubmit", "prompt-hook.mjs", expectPrompt],
   ["Stop", "stop-hook.mjs", expectStop],
 ].map(([event, basename, expected]) => {
-  const found = hookEntries(hooks, event, basename);
+  const found = hookCommands(hooks, event, basename);
   if (found.length === 0) return { event, ok: false, why: "缺失" };
   // **重复一条就是旧代码还在跑。**Codex 文档说多个匹配的 hook 会全部运行 ——
   // 迁移时如果按完整路径去找旧条目，路径一换就匹配不上，于是新增而不是替换。
   if (found.length > 1) return { event, ok: false, why: found.length + " 条重复" };
-  if (!pointsAtRuntime(found[0], expected)) return { event, ok: false, why: "指向 runtime 之外" };
+  // **逐字相等，不是包含。**acceptsHookCommand 同时验"是我们的"和"正是这个脚本"。
+  if (!acceptsHookCommand(found[0], expected)) return { event, ok: false, why: "指向 runtime 之外" };
   return { event, ok: true, why: "恰好 1 条，指向 runtime/current" };
 });
 const hooksOk = hookReport.every((r) => r.ok);
@@ -163,7 +157,8 @@ try {
   // 四态各自的判定：**只有真的被 launchd 加载了才算通过**。
   // plist 写了没加载是故障（定时器不会跑）；未启用和查不出来都是 null。
   const ok = svc.phase === "loaded" ? true
-    : (svc.phase === "stale" || svc.phase === "installed_not_loaded") ? false
+    : (svc.phase === "stale" || svc.phase === "installed_not_loaded" ||
+       svc.phase === "loaded_other") ? false
     : null;
   add("兜底排空", ok,
     (PHASE_TEXT[svc.phase] ?? svc.phase) +

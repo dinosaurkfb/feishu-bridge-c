@@ -12,8 +12,11 @@ import {
   checkArgShape, locateTask, parseArgs as parseCodexSuppressArgs,
 } from "./suppress-outbox.mjs";
 import {
-  classifyBacklog, drainScriptPath, enableBlockers, plistBody,
+  classifyBacklog, drainScriptPath, enableBlockers, loadedPhase, plistBody, scanRunnable,
 } from "./drain-service.mjs";
+import {
+  HOOK_TAG, acceptsHookCommand, buildHookCommand, ownsHookCommand, parseHookCommand,
+} from "./hook-command.mjs";
 import { sweepEligible } from "./drain-all.mjs";
 
 import {
@@ -2877,6 +2880,128 @@ test("迁移必须收敛旧克隆的 hook，而不是在旁边再加一条", () 
     "**同一条 entry 里别人的 hook 必须原样留下** —— 按 entry 整条删会把它一起带走");
   assert.ok(commands("Stop").some((c) => c.includes("/z/stop-hook.mjs")),
     "长得像但 guard 与执行的脚本对不上的，不是我们的，不许碰");
+});
+
+test("hook 归属：整条锚定 —— 只提一句标记或路径的外部 hook 不许被认领", () => {
+  // 评审的两个反例，一条都不许中：
+  //   echo FEISHU_BRIDGE_CODEX_HOOK:prompt-hook.mjs   （提到标记）
+  //   echo <runtime/current/.../stop-hook.mjs>        （提到路径）
+  // 前者会被安装器删掉，后者会被 doctor 判为正常 —— 两种都是判据只做子串包含。
+  const script = "/r/current/scripts/codex/stop-hook.mjs";
+  const good = buildHookCommand({ node: "/opt/homebrew/bin/node", script,
+    home: "/h", log: "/h/hook.log" });
+
+  assert.equal(ownsHookCommand(good, "stop-hook.mjs"), true, "自己造的要认得出");
+  assert.equal(acceptsHookCommand(good, script), true);
+
+  for (const impostor of [
+    "echo " + HOOK_TAG + "stop-hook.mjs",
+    "echo " + script,
+    "# " + HOOK_TAG + "stop-hook.mjs\necho 假的",
+    "rg " + script,
+    good + " ; rm -rf /",                       // 尾部多东西 → 不是我们的
+    good.replace("/h/hook.log", "/h/hook.log' ; evil '"),
+  ]) {
+    assert.equal(parseHookCommand(impostor), null,
+      "**不许认领**：" + impostor.slice(0, 60));
+  }
+
+  // guard 检查的脚本与实际执行的不同 → 不是我们的。
+  const mismatched = good.replace(
+    "'/opt/homebrew/bin/node' '" + script + "';",
+    "'/opt/homebrew/bin/node' '/z/stop-hook.mjs';");
+  assert.equal(parseHookCommand(mismatched), null, "guard 与执行对不上就不是我们的");
+
+  // **专门验 acceptsHookCommand 自己那一步。**
+  // 上一版这里只用"指向别的脚本"来验，而那种命令 parseHookCommand 就先拒了 ——
+  // 两道守卫互相遮挡，把 accepts 改成子串包含也照样绿。
+  // 这里要的是一条**parse 认可、但脚本只是前缀关系**的命令：
+  // 只有"逐字相等"能分开，"包含"分不开。
+  const nested = "/r/current/scripts/codex/stop-hook.mjs.bak/stop-hook.mjs";
+  const nestedCmd = buildHookCommand({ node: "/opt/homebrew/bin/node", script: nested,
+    home: "/h", log: "/h/hook.log" });
+  assert.notEqual(parseHookCommand(nestedCmd), null, "这条本身是合法的我们的 hook");
+  assert.equal(acceptsHookCommand(nestedCmd, script), false,
+    "**逐字相等，不是包含** —— 命令里确实出现了 " + script + " 这个前缀");
+  assert.equal(acceptsHookCommand(nestedCmd, nested), true, "它自己那条要接受");
+});
+
+test("启用门槛的链路预检必须走真实主链，不许把被测对象换掉", () => {
+  // 评审实测的假绿：上一版把整个 publishEligibleTaskEvents 换成假函数，
+  // 于是门槛验的是"我的假函数能被调用"。同一个 task 走真实路径是 template_unusable，
+  // 门禁却报 ok。**替换掉被测对象的检查等于没有检查。**
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "abc123" });
+  task.logical_task_key = "k";
+  writeRegistry([task], path.join(home, "registry.json"));
+
+  // 没有 chain-config.json → 真实预检必然 template_unusable。
+  const scanned = scanRunnable({ home });
+  assert.equal(scanned.ok, false, "真实链路跑不通就必须报跑不通");
+  assert.match(scanned.reason, /template_unusable/u, "要说清是哪一步不通");
+  assert.equal(enableBlockers({ runtimeOk: true, scan: scanned,
+    backlog: { ok: true, total: 0, unreadable: 0 } }).length, 1, "跑不通就要拦");
+
+  // 预检成功时不拦。
+  const okScan = { ok: true, tasks: 1 };
+  assert.deepEqual(enableBlockers({ runtimeOk: true, scan: okScan,
+    backlog: { ok: true, total: 0, unreadable: 0 } }), []);
+});
+
+test("坏 JSON 不许把积压数成 0 —— 读不出来不等于没有", () => {
+  // 评审实测：outbox 里全是坏 JSON 时，listPending 静默跳过，
+  // 积压被统计成 0，门槛放行，定时器装上 —— 而那些文件是什么谁也不知道。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "abc123" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const outbox = taskPaths(task, home).outbox;
+  fs.mkdirSync(outbox, { recursive: true });
+  fs.writeFileSync(path.join(outbox, "0001.json"), "{ 这不是 JSON");
+
+  const backlog = classifyBacklog({ home });
+  assert.equal(backlog.ok, true);
+  assert.equal(backlog.total, 0, "坏文件确实不算待发");
+  assert.equal(backlog.unreadable, 1, "**但必须被数出来**");
+  const blockers = enableBlockers({ runtimeOk: true, scan: { ok: true },
+    backlog });
+  assert.equal(blockers.length, 1, "有读不出来的文件就要拦");
+  assert.equal(blockers[0].code, "backlog_corrupt");
+});
+
+test("同名旧 job 还在跑时不许报「已加载」", () => {
+  // 评审实测：先写新 plist 再 bootstrap，失败时 plist 留在原地；
+  // 若旧的同名 job 还在 launchd 里，只看 label 存在就会报"已加载，正在按计划跑"——
+  // 实际跑的是旧配置。
+  const fake = (stdout) => () => ({ ok: true, stdout });
+  assert.equal(loadedPhase(fake("/new/drain-all.mjs"), "/new/drain-all.mjs"), "loaded");
+  assert.equal(loadedPhase(fake("/OLD/clone/drain-outbox.mjs"), "/new/drain-all.mjs"),
+    "loaded_other", "**参数不是当前这份就不许说已加载**");
+  assert.equal(loadedPhase(() => ({ ok: false, detail: "could not find service" }), "/x"),
+    "installed_not_loaded");
+  assert.equal(loadedPhase(() => ({ ok: false, detail: "权限不足" }), "/x"),
+    "unverifiable", "查不出来就说查不出来");
+});
+
+test("plist 里的路径必须 XML 转义", () => {
+  // 家目录里一个 & 就足以让整份 plist 变成非法 XML：launchd 加载失败，
+  // 而"写文件"那一步是成功的。含空格和中文的路径这个仓库已经栽过一次（那次是 shell 引号）。
+  const body = plistBody({ home: "/Users/a&b/工 作 <区>", node: "/opt/homebrew/bin/node" });
+  // 只查 <string> 里的**值**——plist 本身当然到处是尖括号。
+  const values = [...body.matchAll(/<string>([\s\S]*?)<\/string>/gu)].map((m) => m[1]);
+  assert.ok(values.length > 0, "得真的取到值才算数");
+  for (const v of values) {
+    assert.doesNotMatch(v.replace(/&(amp|lt|gt);/gu, ""), /[&<>]/u,
+      "值里不许有裸的 & < >：" + v);
+  }
+  assert.ok(body.includes("&amp;"), "& 要转义");
+  assert.ok(body.includes("&lt;区&gt;"), "< > 要转义");
+  assert.ok(body.includes("工 作"), "空格和中文原样保留");
 });
 
 test("launchd 加载失败必须非零退出 —— 不许报成「已启用」", () => {

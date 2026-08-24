@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { moduleRoot } from "../direct-run.mjs";
 import { shellQuote } from "../shell-quote.mjs";
+import { buildHookCommand, ownsHookCommand } from "./hook-command.mjs";
 
 import {
   bridgeHome, enableAutoPublishForAllTasks, registryFile,
@@ -60,12 +61,7 @@ const autoPublishPreview = enableAutoPublishForAllTasks({ home });
 const runtimePlan = uninstall ? null : planRuntimeSync({ sourceRoot: ROOT, root: RUNTIME_ROOT });
 const autoPublishMigrationCount = autoPublishPreview.ok ? autoPublishPreview.changed : null;
 
-const hookCommand = (script) =>
-  "# " + HOOK_TAG + path.basename(script) + "\n" +
-  "if [ -x " + shellQuote(node) + " ] && [ -r " + shellQuote(script) + " ]; then " +
-  "FEISHU_CODEX_BRIDGE_HOME=" + shellQuote(home) + " " + shellQuote(node) + " " + shellQuote(script) + "; " +
-  "else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1; " +
-  "printf '%s hook-unavailable\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> " + shellQuote(log) + " 2>/dev/null || :; fi";
+const hookCommand = (script) => buildHookCommand({ node, script, home, log });
 
 let before = "";
 let hooks = { hooks: {} };
@@ -81,49 +77,6 @@ try {
 hooks.hooks ??= {};
 
 /**
- * 埋进命令里的**显式归属标记**：与脚本路径无关，换克隆、换 runtime 都认得出自己那条。
- *
- * 归属判据宽了窄了都出事，Claude 侧已经为这两头各付过一次代价：
- *
- *   宽了会误删。**一条 entry 里可以有多个 hook**，其中只有一条是我们的；
- *   按 entry 整条删会把同一条里别人的钩子一起删掉，而且删得很安静。
- *   光看"命令里出现过这个文件名"更宽 —— rg/cat/echo 提到那个路径也会被认领。
- *
- *   窄了收敛不掉。用绝对路径当键的话，路径一换就变成追加而非覆盖 ——
- *   本机两份 Stop 钩子就是这么来的，而多个匹配的 hook 会全部运行。
- */
-const HOOK_TAG = "FEISHU_BRIDGE_CODEX_HOOK:";
-
-const escapeRe = (text) => text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-
-/**
- * 历史遗留命令的**严格**识别 —— 只为迁移那一次。
- *
- * 不是子串包含：把安装器当初生成的完整模板拆开验，guard 里检查的 node 与脚本
- * 必须和实际执行的逐字相同，脚本名必须正是我们那两个之一。
- * 任何一处对不上就不是我们的，不碰。
- */
-const LEGACY = new RegExp(
-  "^if \\[ -x '([^']+)' \\] && \\[ -r '([^']+)' \\]; then " +
-  "FEISHU_CODEX_BRIDGE_HOME='[^']*' '([^']+)' '([^']+)'; " +
-  "else \\{ command -p cat 2>/dev/null \\|\\| cat; \\} >/dev/null 2>&1; ", "u");
-
-const OUR_SCRIPTS = new Set(["prompt-hook.mjs", "stop-hook.mjs"]);
-
-/** 这一条 child hook 是不是我们的。**按 child 粒度，不按 entry。** */
-function ownsHook(hook, basename) {
-  const cmd = typeof hook?.command === "string" ? hook.command : null;
-  if (cmd === null) return false;
-  if (cmd.includes(HOOK_TAG + basename)) return true;      // 新形态：认标记
-  const m = LEGACY.exec(cmd);                              // 旧形态：严格解析
-  if (!m) return false;
-  const [, guardNode, guardScript, runNode, runScript] = m;
-  if (guardNode !== runNode || guardScript !== runScript) return false;
-  const name = path.basename(runScript);
-  return OUR_SCRIPTS.has(name) && name === basename;
-}
-
-/**
  * 让某个事件下**恰好只剩一条**我们的 hook，且**只动我们自己那一条 child**。
  */
 function updateHook(event, script, timeout) {
@@ -133,7 +86,7 @@ function updateHook(event, script, timeout) {
   const kept = [];
   for (const entry of entries) {
     const children = (entry?.hooks ?? []).filter((h) => {
-      if (!ownsHook(h, basename)) return true;
+      if (!ownsHookCommand(h?.command, basename)) return true;
       dropped += 1;
       return false;
     });

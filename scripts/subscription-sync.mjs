@@ -41,12 +41,32 @@
  *
  * ■ 归属看身份，不看范围
  *
- * "哪些 binding 原来依赖这条订阅"只能用 binding 记着的 subscription_id 回答。
+ * "哪些 binding 原来依赖这条订阅"只能用授权快照记着的 subscription_id 回答。
  * 上一版用范围覆盖代替，于是撤销 sub-a 会把明明属于 sub-b 的同群 binding
- * 一起列进来暂停。范围覆盖只够用来找**迁移候选**，不能代替归属。
+ * 一起列进来暂停。范围覆盖不能代替归属。
+ *
+ * ■ 输入就是仓库自己产出的那份授权快照
+ *
+ * 上一版要求 binding 自带 chat_id / transport_open_id / agent_uid /
+ * authorized_sender_ids 这些**原始 locator**。而正式快照
+ * （materializeDialogueBindingAuthorization）刻意一个都不存 —— 它只存
+ * binding_ref / agent_participant_id / authorized_human_participant_ids /
+ * chat_scope_ref 这些不可逆 ref。
+ *
+ * 评审拿仓库自己的 materializer 生成了一份合法快照喂进来，得到 `bindings_invalid: chat_id`。
+ * 也就是说，那一版**证明不了它能同步真实的快照**，测试用的是自造的结构 ——
+ * 一个只能消费自己夹具的计划器，不是 FR-2.5 的可落地前置。
+ *
+ * 现在直接消费正式快照。**比较全部在 ref 空间里做**：从候选订阅按同一套确定性
+ * 规则派生出 ref，再跟快照里的 ref 比。这样既不需要原始 locator 流进计划器，
+ * 输出也不会夹带它们 —— 计划里只有 binding_ref、动作、以及版本前置条件。
  */
 
 import { validateSubscription } from "./subscription.mjs";
+import {
+  deriveDialogueChatScopeRef, validateDialogueBindingAuthorizationSnapshot,
+} from "./dialogue-binding-authorization.mjs";
+import { deriveDialogueParticipantRef } from "./dialogue-participant-planner.mjs";
 
 export const SYNC_ACTION = Object.freeze({
   RESNAPSHOT: "resnapshot",
@@ -59,8 +79,10 @@ export const SYNC_REJECT = Object.freeze({
   PREVIOUS_INVALID: "previous_invalid",
   IDENTITY_CHANGED: "subscription_identity_changed",
   VERSION_NOT_ADVANCED: "version_not_advanced",
-  BINDINGS_INVALID: "bindings_invalid",
+  SNAPSHOTS_INVALID: "snapshots_invalid",
   OTHERS_INVALID: "others_invalid",
+  NAMESPACE_INVALID: "runtime_namespace_invalid",
+  MIGRATION_TARGET_INVALID: "migration_target_invalid",
   MIGRATION_TARGET_UNKNOWN: "migration_target_unknown",
   MIGRATION_INCOMPATIBLE: "migration_incompatible",
 });
@@ -68,72 +90,76 @@ export const SYNC_REJECT = Object.freeze({
 const ACTIVE = "active";
 
 const nonEmpty = (v) => typeof v === "string" && v.length > 0;
-const isPlainObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 const strList = (v) => (Array.isArray(v) && v.every(nonEmpty) && v.length > 0 ? v : null);
 const covers = (outer, inner) => inner.every((x) => outer.includes(x));
 
-/** binding 必须自带的字段。**少一个就不校验**等于让不完整的记录绕过所有判据。 */
-const BINDING_FIELDS = ["subscription_id", "endpoint_id", "domain_id", "local_target_id",
-  "chat_id", "transport_open_id", "agent_uid"];
-
-function validateBinding(binding) {
-  if (!isPlainObject(binding)) return "not_an_object";
-  for (const f of BINDING_FIELDS) if (!nonEmpty(binding[f])) return f;
-  if (!strList(binding.authorized_sender_ids)) return "authorized_sender_ids";
-  if (!strList(binding.event_types)) return "event_types";
-  if (!Number.isFinite(binding.freshness_ms) || binding.freshness_ms <= 0) return "freshness_ms";
-  if (!["active", "suspended"].includes(binding.status)) return "status";
-  return null;
+/**
+ * 把一条订阅投影到**快照所在的 ref 空间**。
+ *
+ * 快照里没有原始 locator，只有不可逆 ref。要判断一条订阅能不能覆盖某份快照，
+ * 唯一诚实的办法是按同一套确定性规则从订阅派生出 ref 再比 ——
+ * 而不是要求调用方把 chat_id / transport_open_id 这些东西额外传进来。
+ *
+ * 派生失败（字段缺失或不合规）就返回 null，由调用方当成"覆盖不了"。
+ */
+function projectSubscription(subscription, runtimeNamespace) {
+  const endpointId = subscription?.endpoint_id;
+  const scope = subscription?.scope ?? {};
+  const agent = deriveDialogueParticipantRef({
+    kind: "agent", runtimeNamespace, endpointId, privateIdentityKey: scope.transport_open_id,
+  });
+  const chat = deriveDialogueChatScopeRef({ endpointId, privateChatId: scope.chat_id });
+  const senderIds = strList(scope.sender_ids);
+  if (!agent.ok || !chat.ok || !senderIds) return null;
+  const humans = senderIds.map((senderId) => deriveDialogueParticipantRef({
+    kind: "human", runtimeNamespace: "feishu", endpointId, privateIdentityKey: senderId,
+  }));
+  if (humans.some((h) => !h.ok)) return null;
+  return {
+    agentParticipantId: agent.participantId,
+    chatScopeRef: chat.chatScopeRef,
+    humanParticipantIds: humans.map((h) => h.participantId),
+    eventTypes: strList(scope.event_types) ?? [],
+    freshnessMs: subscription?.constraints?.freshness_ms,
+  };
 }
 
 /**
- * 一条订阅的**范围**覆不覆盖一条 binding —— 只看路由事实。
+ * 目标订阅的授权是否**完全覆盖**这份快照现在依据的授权。
  *
- * 判据只有可信字段：同一个 endpoint、同一个群、同一个运输身份。刻意不看显示名
- * 或项目路径 —— 那些是展示用的，拿它们判归属就等于让改个名字改变路由。
- *
- * **这不是归属，也不足以支撑迁移。**归属看 binding 记着的 subscription_id；
- * 迁移要过 authorizationCovers() 那一关。这个函数只够用来找候选。
+ * 迁移是重新归属，不是换个指针。少比一样，就可能把 binding 交给一条不该看到它的
+ * 订阅 —— 而这件事在下一条消息被放行或被拒之前是看不出来的。所以每一样都要比，
+ * 派生不出来或缺字段一律不通过（"没写"不等于"不限制"）。
  */
-export function subscriptionCovers(subscription, binding) {
-  if (!subscription || !binding) return false;
-  if (subscription.endpoint_id !== binding.endpoint_id) return false;
-  const scope = subscription.scope ?? {};
-  if (nonEmpty(binding.chat_id) && scope.chat_id !== binding.chat_id) return false;
-  if (nonEmpty(binding.transport_open_id) &&
-      scope.transport_open_id !== binding.transport_open_id) return false;
-  return true;
-}
-
-/**
- * 目标订阅的授权是否**完全覆盖**这条 binding 现在所需的授权。
- *
- * 迁移是重新归属，不是换个指针。少比一样，就可能把 binding 交给一条
- * 不该看到它的订阅 —— 而这件事在下一条消息被放行或被拒之前是看不出来的。
- * 所以每一样都要比，缺字段一律不通过（"没写"不等于"不限制"）。
- */
-export function authorizationCovers(subscription, binding) {
-  if (!subscription || !binding) return { ok: false, missing: "input" };
+export function authorizationCovers(subscription, snapshot, { runtimeNamespace } = {}) {
+  if (!subscription || !snapshot) return { ok: false, missing: "input" };
   if (subscription.status !== ACTIVE) return { ok: false, missing: "status" };
-  for (const [f, a, b] of [
-    ["endpoint_id", subscription.endpoint_id, binding.endpoint_id],
-    // **跨业务域绝不自动归属。**
-    ["domain_id", subscription.domain_id, binding.domain_id],
-    ["agent_uid", subscription.scope?.agent_uid, binding.agent_uid],
-    ["chat_id", subscription.scope?.chat_id, binding.chat_id],
-    ["transport_open_id", subscription.scope?.transport_open_id, binding.transport_open_id],
-  ]) {
-    if (!nonEmpty(a) || a !== b) return { ok: false, missing: f };
+  if (!nonEmpty(subscription.endpoint_id) || subscription.endpoint_id !== snapshot.endpoint_id) {
+    return { ok: false, missing: "endpoint_id" };
   }
-  const senders = strList(subscription.scope?.sender_ids);
-  const events = strList(subscription.scope?.event_types);
-  const need = { s: strList(binding.authorized_sender_ids), e: strList(binding.event_types) };
-  if (!senders || !need.s || !covers(senders, need.s)) return { ok: false, missing: "sender_ids" };
-  if (!events || !need.e || !covers(events, need.e)) return { ok: false, missing: "event_types" };
-  const fresh = subscription.constraints?.freshness_ms;
-  // 新的新鲜度窗口更严，就收不下这条 binding 原本受理的事件 —— 那不是覆盖。
-  if (!Number.isFinite(fresh) || !Number.isFinite(binding.freshness_ms) ||
-      fresh < binding.freshness_ms) return { ok: false, missing: "freshness_ms" };
+  // **跨业务域绝不自动归属。**
+  if (!nonEmpty(subscription.domain_id) || subscription.domain_id !== snapshot.domain_id) {
+    return { ok: false, missing: "domain_id" };
+  }
+  const projected = projectSubscription(subscription, runtimeNamespace);
+  if (projected === null) return { ok: false, missing: "scope" };
+  if (projected.agentParticipantId !== snapshot.agent_participant_id) {
+    return { ok: false, missing: "agent_participant_id" };
+  }
+  if (projected.chatScopeRef !== snapshot.chat_scope_ref) {
+    return { ok: false, missing: "chat_scope_ref" };
+  }
+  const needHumans = strList(snapshot.authorized_human_participant_ids) ?? [];
+  if (!covers(projected.humanParticipantIds, needHumans)) {
+    return { ok: false, missing: "authorized_human_participant_ids" };
+  }
+  const needEvents = strList(snapshot.event_types) ?? [];
+  if (!covers(projected.eventTypes, needEvents)) return { ok: false, missing: "event_types" };
+  // 新的新鲜度窗口更严，就收不下这份快照原本受理的事件 —— 那不是覆盖。
+  if (!Number.isFinite(projected.freshnessMs) || !Number.isFinite(snapshot.freshness_ms) ||
+      projected.freshnessMs < snapshot.freshness_ms) {
+    return { ok: false, missing: "freshness_ms" };
+  }
   return { ok: true, missing: null };
 }
 
@@ -150,90 +176,129 @@ const fingerprint = (sub) => JSON.stringify({
 const reject = (reason, extra = {}) => ({ ok: false, reason, ...extra });
 
 /**
+ * 计划条目**只带稳定引用和版本前置条件**。
+ *
+ * 不回传整份快照或整条目标订阅：那会把 private_binding_key、群和发送者 locator
+ * 一路带到调用方和日志里。落盘那一半要的也不是这些，是"改哪个 binding_ref、
+ * 在什么版本前置条件下改"。
+ */
+const entry = (snapshot, action, reason, extra = {}) => ({
+  bindingRef: snapshot.binding_ref,
+  localTargetId: snapshot.local_target_id,
+  action,
+  reason,
+  // 落盘时用它做 CAS：快照还是当初那一版才允许写。
+  expect: {
+    subscriptionId: snapshot.subscription_id,
+    subscriptionVersion: snapshot.subscription_version,
+    authorizationRevision: snapshot.authorization_revision,
+    snapshotId: snapshot.snapshot_id,
+  },
+  ...extra,
+});
+
+/**
  * 算出这次变更影响哪些 binding、各该怎么处置。**纯函数，不碰磁盘。**
  *
+ * `snapshots` 是正式的 dialogue_binding_authorization 快照，逐份校验。
  * `next` 为 null 表示订阅被撤销。`migrateTo` 是人显式指定的迁移目标
- * subscription_id —— 不给就一律暂停，不自动迁。
+ * subscription_id —— 不给（null）就一律暂停，不自动迁。
  *
- * 输入一律先校验。上一版只校验 next：previous 传 null 照收、bindings 传 null
- * 直接抛 TypeError、版本从 2 退回 1 也认、前后完全相同还生成一份 resnapshot 计划。
- * **一个 fail-open 的控制面比没有控制面更危险** —— 它会让人以为已经算过了。
+ * 输入一律先校验，且**参数对象本身也要能缺**：上一版不带参数直接抛 TypeError，
+ * 崩溃不是拒绝。**一个 fail-open 的控制面比没有控制面更危险** ——
+ * 它会让人以为已经算过了。
  */
-export function planSubscriptionSync({ previous, next, bindings = [], others = [], migrateTo = null }) {
+export function planSubscriptionSync(input) {
+  // **解构默认值只挡 undefined，不挡 null。**上一版写 `{...} = {}`，
+  // planSubscriptionSync(null) 照样抛 TypeError —— 崩溃不是拒绝。
+  const {
+    previous, next, snapshots = [], others = [], migrateTo = null, runtimeNamespace,
+  } = (input && typeof input === "object") ? input : {};
+  if (!nonEmpty(runtimeNamespace)) return reject(SYNC_REJECT.NAMESPACE_INVALID);
+
   const prev = validateSubscription(previous);
   if (!prev.ok) return reject(SYNC_REJECT.PREVIOUS_INVALID, { problems: prev.problems ?? null });
 
-  if (next !== null) {
+  if (next !== null && next !== undefined) {
     const valid = validateSubscription(next);
     if (!valid.ok) return reject(SYNC_REJECT.SUBSCRIPTION_INVALID, { problems: valid.problems ?? null });
-    // 换了 subscription_id 不是"更新"，是把一条订阅替换成另一条 —— 受影响面完全不同，
-    // 不能借普通更新的外壳走过去。
-    if (next.subscription_id !== previous.subscription_id) {
-      return reject(SYNC_REJECT.IDENTITY_CHANGED);
-    }
+    // 换了 subscription_id 不是"更新"，是把一条订阅替换成另一条 —— 受影响面完全不同。
+    if (next.subscription_id !== previous.subscription_id) return reject(SYNC_REJECT.IDENTITY_CHANGED);
+  }
+  const revokedInput = next === null || next === undefined;
+
+  // **版本单调性先于 no-op。**上一版先比指纹：内容相同而版本从 2 退回 1 时
+  // 直接判 no-op 放行 —— 版本回退本身就违反控制面契约，不该因为内容相同而被赦免。
+  if (!revokedInput && next.version < previous.version) {
+    return reject(SYNC_REJECT.VERSION_NOT_ADVANCED, { from: previous.version, to: next.version });
   }
 
-  if (!Array.isArray(bindings)) return reject(SYNC_REJECT.BINDINGS_INVALID, { at: -1, problem: "not_an_array" });
-  for (const [i, b] of bindings.entries()) {
-    const problem = validateBinding(b);
-    if (problem) return reject(SYNC_REJECT.BINDINGS_INVALID, { at: i, problem });
+  if (!Array.isArray(snapshots)) {
+    return reject(SYNC_REJECT.SNAPSHOTS_INVALID, { at: -1, problem: "not_an_array" });
+  }
+  for (const [i, snap] of snapshots.entries()) {
+    if (!validateDialogueBindingAuthorizationSnapshot(snap).ok) {
+      return reject(SYNC_REJECT.SNAPSHOTS_INVALID, { at: i, problem: "invalid_snapshot" });
+    }
   }
 
   if (!Array.isArray(others)) return reject(SYNC_REJECT.OTHERS_INVALID, { at: -1, problem: "not_an_array" });
   const seen = new Set([previous.subscription_id]);
   for (const [i, o] of others.entries()) {
-    const valid = validateSubscription(o);
-    if (!valid.ok) return reject(SYNC_REJECT.OTHERS_INVALID, { at: i, problem: "invalid" });
+    if (!validateSubscription(o).ok) return reject(SYNC_REJECT.OTHERS_INVALID, { at: i, problem: "invalid" });
     // 同一个 id 出现两次，"唯一目标"就无从谈起。
     if (seen.has(o.subscription_id)) return reject(SYNC_REJECT.OTHERS_INVALID, { at: i, problem: "duplicate_id" });
     seen.add(o.subscription_id);
   }
 
+  // **显式控制参数的类型错误不能降级成另一种动作。**上一版 migrateTo: 42
+  // 被当成"没指定迁移"，静默生成暂停计划 —— 人明明按了迁移。只有 null 是"没指定"。
+  if (migrateTo !== null && migrateTo !== undefined && !nonEmpty(migrateTo)) {
+    return reject(SYNC_REJECT.MIGRATION_TARGET_INVALID, { migrateTo: typeof migrateTo });
+  }
+  const target = nonEmpty(migrateTo) ? migrateTo : null;
+
   // 授权内容一字未变 → 什么都不用做。**生成一份"重新物化"计划不是无害的**：
   // 它会让人以为确实发生了变更，也会让每次保存都刷一遍所有快照。
-  if (next !== null && fingerprint(next) === fingerprint(previous)) {
+  if (!revokedInput && fingerprint(next) === fingerprint(previous)) {
     return { ok: true, noop: true, plans: [], counts: { resnapshot: 0, suspend: 0, migrate: 0 } };
   }
-  // 内容变了，版本就必须往前走。允许回退等于让两份不同的授权共用一个版本号，
-  // 之后没有任何办法判断哪一份更新。
-  if (next !== null && !(next.version > previous.version)) {
+  // 内容变了，版本就必须往前走。允许原地不动等于让两份不同的授权共用一个版本号。
+  if (!revokedInput && next.version === previous.version) {
     return reject(SYNC_REJECT.VERSION_NOT_ADVANCED, { from: previous.version, to: next.version });
   }
 
-  const revoked = next === null;
+  const revoked = revokedInput;
   const paused = !revoked && next.status !== ACTIVE;
   const plans = [];
 
-  for (const binding of bindings) {
-    // **归属看身份。**范围一样但属于别条订阅的 binding，不在这次变更范围里。
-    if (binding.subscription_id !== previous.subscription_id) continue;
+  for (const snapshot of snapshots) {
+    // **归属看身份。**范围一样但属于别条订阅的快照，不在这次变更范围里。
+    if (snapshot.subscription_id !== previous.subscription_id) continue;
 
-    if (!revoked && !paused && authorizationCovers(next, binding).ok) {
-      plans.push({ binding, action: SYNC_ACTION.RESNAPSHOT, reason: "scope_changed" });
+    if (!revoked && !paused && authorizationCovers(next, snapshot, { runtimeNamespace }).ok) {
+      plans.push(entry(snapshot, SYNC_ACTION.RESNAPSHOT, "scope_changed"));
       continue;
     }
 
-    if (nonEmpty(migrateTo)) {
-      const target = others.find((o) => o.subscription_id === migrateTo);
-      if (!target) return reject(SYNC_REJECT.MIGRATION_TARGET_UNKNOWN, { migrateTo });
-      const fit = authorizationCovers(target, binding);
+    if (target !== null) {
+      const to = others.find((o) => o.subscription_id === target);
+      if (!to) return reject(SYNC_REJECT.MIGRATION_TARGET_UNKNOWN, { migrateTo: target });
+      const fit = authorizationCovers(to, snapshot, { runtimeNamespace });
       if (!fit.ok) {
         return reject(SYNC_REJECT.MIGRATION_INCOMPATIBLE, {
-          migrateTo, missing: fit.missing,
-          localTargetId: binding.local_target_id ?? null,
+          migrateTo: target, missing: fit.missing, localTargetId: snapshot.local_target_id,
         });
       }
-      plans.push({ binding, action: SYNC_ACTION.MIGRATE, to: target, reason: "explicit_target" });
+      plans.push(entry(snapshot, SYNC_ACTION.MIGRATE, "explicit_target", { toSubscriptionId: target }));
       continue;
     }
 
     // 没有显式目标 → 暂停。有候选也只是告诉人有候选，不替人决定归属。
-    const candidates = others.filter((o) => authorizationCovers(o, binding).ok);
-    plans.push({
-      binding, action: SYNC_ACTION.SUSPEND,
-      reason: revoked ? "subscription_revoked" : paused ? "subscription_paused" : "no_longer_covered",
-      migrationCandidates: candidates.length,
-    });
+    const candidates = others.filter((o) => authorizationCovers(o, snapshot, { runtimeNamespace }).ok);
+    plans.push(entry(snapshot, SYNC_ACTION.SUSPEND,
+      revoked ? "subscription_revoked" : paused ? "subscription_paused" : "no_longer_covered",
+      { migrationCandidates: candidates.length }));
   }
 
   const counts = { resnapshot: 0, suspend: 0, migrate: 0 };
@@ -252,8 +317,10 @@ const REJECT_TEXT = {
   [SYNC_REJECT.PREVIOUS_INVALID]: "变更前那份订阅说不清，算不出谁受影响",
   [SYNC_REJECT.IDENTITY_CHANGED]: "前后不是同一条订阅 —— 那是替换，不是更新",
   [SYNC_REJECT.VERSION_NOT_ADVANCED]: "授权变了但版本没往前走，之后没法判断哪份更新",
-  [SYNC_REJECT.BINDINGS_INVALID]: "binding 记录不完整，缺字段就没法比授权",
+  [SYNC_REJECT.SNAPSHOTS_INVALID]: "授权快照说不清，缺了它没法比授权",
   [SYNC_REJECT.OTHERS_INVALID]: "其余订阅列表说不清",
+  [SYNC_REJECT.NAMESPACE_INVALID]: "没给运行时命名空间，派生不出可比较的引用",
+  [SYNC_REJECT.MIGRATION_TARGET_INVALID]: "迁移目标不是一个订阅 id —— 不猜你是不是想迁",
   [SYNC_REJECT.MIGRATION_TARGET_UNKNOWN]: "指定的迁移目标不在候选里",
   [SYNC_REJECT.MIGRATION_INCOMPATIBLE]:
     "目标订阅的授权覆盖不了这条 binding —— 迁过去就是把它交给一条不该看到它的订阅",
@@ -270,7 +337,7 @@ export function renderSyncPlan(plan) {
   const lines = ["受影响 " + plan.plans.length + " 条 binding："];
   for (const p of plan.plans) {
     // 只出本地 target 的短标识，不出 subscription_id / chat_id 之类。
-    const id = String(p.binding.local_target_id ?? "?").slice(0, 12);
+    const id = String(p.localTargetId ?? "?").slice(0, 12);
     const hint = p.action === SYNC_ACTION.SUSPEND && p.migrationCandidates > 0
       ? "（有 " + p.migrationCandidates + " 条订阅授权上接得住；要迁请显式指定目标）" : "";
     lines.push("  " + id + "…  " + (ACTION_TEXT[p.action] ?? p.action) + hint);

@@ -78,7 +78,6 @@ import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
 import { bindingToConnections } from "./group-binding-status.mjs";
 import {
   SYNC_ACTION, SYNC_REJECT, authorizationCovers, planSubscriptionSync, renderSyncPlan,
-  subscriptionCovers,
 } from "./subscription-sync.mjs";
 import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
 import {
@@ -7836,412 +7835,266 @@ test("走真实 CLI 时 --force 必须真的传到 drainProject", () => {
     "单项目和 --all 共用同一个调用点，force 必须在那里");
 });
 
+const SYNC_HEX = "0123456789abcdef01234567";
+const SYNC_NS = "claude";
+const SYNC_EP = "endpoint_" + SYNC_HEX;
+const SYNC_DOM = "domain_" + SYNC_HEX;
+const SYNC_SID = "subscription_" + SYNC_HEX;
 const syncSub = (over = {}) => ({
   schema_version: "1.0", artifact_type: "feishu_bridge_subscription",
-  subscription_id: "s1", version: 1, endpoint_id: "ep1", domain_id: "d1", status: "active",
-  scope: { agent_uid: "a", transport_open_id: "ou", chat_id: "oc",
-    sender_ids: ["frank"], event_types: ["im.message.receive"] },
+  subscription_id: SYNC_SID, version: 1, endpoint_id: SYNC_EP, domain_id: SYNC_DOM, status: "active",
+  scope: { agent_uid: "agent1", transport_open_id: "ou_bot", chat_id: "oc_group",
+    sender_ids: ["u_frank"], event_types: ["im.message.receive"] },
   constraints: { freshness_ms: 900000 }, ...over,
 });
-const syncBinding = (id, over = {}) => ({
-  // **binding 自带它归属哪条订阅**，以及它现在依据的那份授权到底是什么。
-  // 上一版的夹具两样都没有，于是"归属"只能靠范围猜、"兼容"只能比三个字段 ——
-  // 夹具缺字段，判据就永远补不齐。
-  subscription_id: "s1", endpoint_id: "ep1", domain_id: "d1", agent_uid: "a",
-  chat_id: "oc", transport_open_id: "ou",
-  authorized_sender_ids: ["frank"], event_types: ["im.message.receive"], freshness_ms: 900000,
-  local_target_id: id, private_binding_key: "k" + id, status: "active", ...over,
-});
-
-test("投递会话说不清时拒收，不猜", () => {
-  const a = { sessionId: "a", name: "first" };
-  const b = { sessionId: "b", name: "second" };
-
-  // 钉过且还活着 → 就投它，跟谁先开的无关。
-  const pinned = selectDeliverySession({ pinned: "a", live: [b, a] });
-  assert.equal(pinned.ok, true);
-  assert.equal(pinned.session.sessionId, "a");
-  assert.equal(pinned.matchedBy, "pinned");
-  assert.equal(pinned.pin, null, "已经钉过就不用再钉");
-
-  // 只有一条 → 没有歧义，顺手钉下来。
-  const sole = selectDeliverySession({ pinned: null, live: [a] });
-  assert.equal(sole.ok, true);
-  assert.equal(sole.matchedBy, "sole_live");
-  assert.equal(sole.pin, "a", "下次它不再是「碰巧只有一条」");
-
-  // 多条且没钉过 → 拒收。上一版在这里取"最近开的"，而它在实机上猜错了。
-  const ambiguous = selectDeliverySession({ pinned: null, live: [a, b] });
-  assert.equal(ambiguous.ok, false);
-  assert.equal(ambiguous.reason, DELIVERY_REJECT.AMBIGUOUS);
-  assert.equal(ambiguous.candidates, 2);
-  assert.equal(ambiguous.hadPin, false);
-
-  // 钉的那条没了、现场还有多条 → 同样拒收，不许回落到猜。
-  const gone = selectDeliverySession({ pinned: "zzz", live: [a, b] });
-  assert.equal(gone.ok, false);
-  assert.equal(gone.reason, DELIVERY_REJECT.AMBIGUOUS);
-  assert.equal(gone.hadPin, true, "要能分清「从没钉过」和「钉的那条没了」");
-
-  // 一条都没有是另一回事。
-  assert.equal(selectDeliverySession({ pinned: "a", live: [] }).reason, DELIVERY_REJECT.NO_LIVE);
-
-  // 拒收理由要指向一个**真的能做到那件事**的操作。上一版让人跑 /feishu-bind --apply，
-  // 而它要求单独输入、且是项目级；bind-session 又会新建话题 —— 都做不到
-  // "把现有项目级话题钉到这条会话"。提示指向做不到的操作，等于没有出路。
-  assert.match(DELIVERY_REJECT_TEXT[DELIVERY_REJECT.AMBIGUOUS], /feishu-pin-session\.mjs --apply/u);
-  assert.doesNotMatch(DELIVERY_REJECT_TEXT[DELIVERY_REJECT.AMBIGUOUS], /feishu-bind/u);
-});
-
-test("首选会话真的落盘、读得回、也撤得掉", () => {
-  // 上一版**声明了自动钉住却没做**：生产路径固定传 pinned:null，也从不读 picked.pin，
-  // 于是"已钉会话"那条分支只活在单测里。这条盯的是存取本身。
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pin-"));
-  assert.equal(readDeliveryPin(root), null, "没钉过就是 null");
-
-  assert.equal(writeDeliveryPin(root, "sess-a").ok, true);
-  assert.equal(readDeliveryPin(root), "sess-a");
-  assert.equal(fs.statSync(deliveryPinPath(root)).mode & 0o777, 0o600);
-
-  // 坏文件当作没钉过 —— 它只是个偏好，不该让入站停摆。
-  fs.writeFileSync(deliveryPinPath(root), "{ 坏掉的 json");
-  assert.equal(readDeliveryPin(root), null);
-  fs.writeFileSync(deliveryPinPath(root), JSON.stringify({ claude_session_id: 42 }));
-  assert.equal(readDeliveryPin(root), null, "形状不对也当没钉过");
-
-  assert.equal(writeDeliveryPin(root, "").ok, false);
-  assert.equal(clearDeliveryPin(root).ok, true);
-  assert.equal(readDeliveryPin(root), null);
-  assert.equal(clearDeliveryPin(root).ok, true, "本来就没有也算成功");
-});
-
-test("钉会话命令：身份要交叉核验，拼错的参数不许执行成另一种操作", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pincmd-"));
-  const inbound = path.join(dir, ".runtime-data", "inbound");
-  fs.mkdirSync(inbound, { recursive: true });
-  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
-    project_dir: dir, logical_task_key: "k", project_display_name: "P", task_display_name: "P",
-  }));
-  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
-    status: "active", root_message_id: "om_fixture", claude_session_id: null,
-    channel_generation_id: "gen-1",
-  }));
-  const run = (args, env) => spawnSync(process.execPath, [
-    path.resolve("scripts", "feishu-pin-session.mjs"), "--project", dir, ...args,
-  ], { encoding: "utf-8", env: { ...process.env, ...env } });
-
-  // **只信环境变量是不够的。**上一版只读 CLAUDE_CODE_SESSION_ID，
-  // 于是 PID 是假的也照样写 pin。现在 session id、PID、现场登记三者要对上。
-  const noEnv = run([], { CLAUDE_CODE_SESSION_ID: "", CLAUDE_PID: "" });
-  assert.notEqual(noEnv.status, 0);
-  assert.match(noEnv.stderr, /认不出这是哪条会话/u);
-
-  const fakePid = run(["--apply"], { CLAUDE_CODE_SESSION_ID: "sess-foreign", CLAUDE_PID: "999999" });
-  assert.notEqual(fakePid.status, 0, "对不上的 PID 不许写 pin");
-  assert.match(fakePid.stderr, /认不出这是哪条会话/u);
-  assert.equal(readDeliveryPin(dir), null, "拒绝时不得写盘");
-
-  // **拼错的参数不许被执行成另一种操作。**上一版 --cleer --apply 被静默当成"钉住"。
-  // 这一课我在 register-status-provider 上刚学过，写这个新命令时没用上。
-  for (const [args, reason] of [
-    [["--cleer", "--apply"], "unknown_option"],
-    [["--apply", "--apply"], "duplicate_option"],
-    [["--project"], "option_needs_value"],
-    [["裸参数"], "unexpected_argument"],
-  ]) {
-    const bad = spawnSync(process.execPath, [
-      path.resolve("scripts", "feishu-pin-session.mjs"), ...args,
-    ], { encoding: "utf-8" });
-    assert.notEqual(bad.status, 0, reason);
-    assert.match(bad.stderr, new RegExp(reason, "u"));
-  }
-  assert.equal(readDeliveryPin(dir), null);
-});
-
-test("钉会话技能装出来之后，里面那条命令必须能跑", () => {
-  // 拒收回执把人指向这条命令，所以"技能装出来了"不够 —— 装出来的那条命令得真能执行。
-  // 之前栽过一次：文档里的示例漏了参数，照着登记之后 provider 直接 exit 2。
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pinskill-"));
-  fs.mkdirSync(path.join(dir, ".claude", "skills"), { recursive: true });
-  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), "{}\n");
-  const run = spawnSync(process.execPath, [
-    path.resolve("scripts", "install-outbound.mjs"), "--apply",
-  ], { encoding: "utf-8", env: {
-    ...process.env, HOME: dir,
-    CODEX_HOME: path.join(dir, "codex-home"),
-    FEISHU_CODEX_BRIDGE_HOME: path.join(dir, "bridge-home"),
-  } });
-  assert.equal(run.status, 0, run.stderr);
-
-  const installed = path.join(dir, ".claude", "skills", "feishu-pin-session", "SKILL.md");
-  assert.ok(fs.existsSync(installed), "技能要真的装出来");
-  const text = fs.readFileSync(installed, "utf-8");
-  assert.match(text, /name: feishu-pin-session/u);
-  // 渲染后必须指向 runtime，不能留占位符、也不能指向某个开发克隆。
-  assert.doesNotMatch(text, /\{\{SCRIPT/u, "占位符必须被渲染掉");
-  assert.match(text, /runtime\/current\/scripts\/feishu-pin-session\.mjs/u);
-
-  // 把技能里那条只读命令抠出来，确认它指向的脚本真的装到了 runtime。
-  const cmd = text.split("\n").find((l) => l.trim().startsWith("node '") && !l.includes("--"));
-  assert.ok(cmd, "技能里应当有一条无参数的只读命令");
-  const script = cmd.match(/'([^']+)'/u)[1];
-  assert.ok(fs.existsSync(script), "技能指向的脚本必须真的存在：" + script);
-});
-
-test("钉住与留痕都失败时，绝不抛 —— 这一条消息的交付不受影响", () => {
-  // 上一版留痕直接调 recordClaimState，而它遇到 IO 错误会抛：目录权限或磁盘出问题时
-  // 两次写入都失败，入站会在**真正投递之前**崩掉。
-  // 为了记一条诊断而丢掉一条已经确定目标的消息，是把次要目的放在主要目的前面。
-  const bad = "/nonexistent-root-" + Date.now();
-  const got = pinAndNote({
-    root: bad, sessionId: "s", noteFile: path.join(bad, "nope", "a.log"),
+/**
+ * **夹具用仓库自己的 materializer 生成，不自造结构。**
+ *
+ * 上一版自造了一份带 chat_id / transport_open_id / authorized_sender_ids 的
+ * "binding"，测试全绿 —— 但正式快照刻意一个原始 locator 都不存。评审拿真
+ * materializer 生成一份合法快照喂进计划器，得到 bindings_invalid: chat_id。
+ * **一个只能消费自己夹具的计划器，证明不了任何事。**
+ */
+// local_target_id 只收十六进制，所以标签要先算成十六进制 —— 直接把标签
+// 拼进去会得到 target_...h1 这种不合规 id，而失败信息只会说"输入非法"。
+const syncHexLabel = (label) => {
+  let h = 0x811c9dc5;
+  for (const ch of label) { h ^= ch.charCodeAt(0); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(16).padStart(8, "0").slice(0, 4);
+};
+const syncSnapshot = (label, { subscription = syncSub(), status = "active" } = {}) => {
+  const m = materializeDialogueBindingAuthorization({
+    runtimeNamespace: SYNC_NS, endpointId: SYNC_EP, subscription,
+    binding: {
+      private_binding_key: "pbk-" + label,
+      local_target_id: "target_" + SYNC_HEX.slice(0, 20) + syncHexLabel(label),
+      status,
+    },
   });
-  assert.equal(got.pinned, false);
-  assert.equal(got.noted, false, "留痕也失败了");
-  assert.ok(got.reason, "但要说得出为什么");
+  assert.equal(m.ok, true, "夹具必须是真 materializer 生成的合法快照：" + (m.reason ?? ""));
+  return m.snapshot;
+};
 
-  // 钉得住时不需要留痕。
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pinnote-"));
-  const ok = pinAndNote({ root: dir, sessionId: "s-ok", noteFile: path.join(dir, "n.log") });
-  assert.deepEqual({ pinned: ok.pinned, noted: ok.noted }, { pinned: true, noted: false });
-  assert.equal(readDeliveryPin(dir), "s-ok");
+const plan = (over = {}) => planSubscriptionSync({ runtimeNamespace: SYNC_NS, ...over });
 
-  // 钉不住但记得下时，痕迹要能回答"为什么没钉住"。
-  const noteDir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-note-"));
-  const noteFile = path.join(noteDir, "n.log");
-  const partial = pinAndNote({ root: bad, sessionId: "s", noteFile });
-  assert.equal(partial.pinned, false);
-  assert.equal(partial.noted, true);
-  assert.match(fs.readFileSync(noteFile, "utf-8"), /delivery_pin_not_persisted/u);
+test("计划器要能消费仓库自己产出的真实授权快照", () => {
+  // 评审的复现路径：真 materializer 生成的合法快照喂进去 → bindings_invalid: chat_id。
+  // 正式快照里**一个原始 locator 都没有**，只有不可逆 ref。
+  // 所以比较必须整个搬到 ref 空间里做，从候选订阅按同一套确定性规则派生出 ref 再比。
+  const snap = syncSnapshot("aa");
+  assert.equal(snap.chat_id, undefined, "正式快照里就不该有 chat_id");
+  assert.ok(snap.chat_scope_ref.startsWith("chat_scope_ref_"));
+
+  const got = plan({ previous: syncSub(), next: null, snapshots: [snap] });
+  assert.equal(got.ok, true, "真快照必须能被消费：" + (got.reason ?? ""));
+  assert.deepEqual(got.counts, { resnapshot: 0, suspend: 1, migrate: 0 });
+
+  // 内容变了但仍覆盖 → 重新物化，而不是暂停。
+  const wider = syncSub({ version: 2, scope: { ...syncSub().scope, sender_ids: ["u_frank", "u_two"] } });
+  assert.equal(plan({ previous: syncSub(), next: wider, snapshots: [snap] }).counts.resnapshot, 1);
+  // 换了群 → 派生出的 chat_scope_ref 不同 → 不再覆盖 → 暂停。
+  const moved = syncSub({ version: 2, scope: { ...syncSub().scope, chat_id: "oc_elsewhere" } });
+  assert.equal(plan({ previous: syncSub(), next: moved, snapshots: [snap] }).counts.suspend, 1);
 });
 
-test("钉会话命令要按已验证的会话查绑定，不是只按项目", () => {
-  // 上一版这条测试**本身是假阳性**：我造的是项目文件绑定，而 resolveProject 会把它
-  // 一律解释成项目级 —— 于是旧的错实现（只传 root）也照样通过。
-  // 现在按评审给的标准来：registry 里同根目录**同时**放项目级和会话级两条。
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pinlvl-"));
-  const root = path.join(dir, "proj");
-  fs.mkdirSync(root);
-  const registryFile = path.join(dir, "registry.json");
-  const session = "01911111-2222-7333-8444-555555555555";
-  const projectEntry = newRegistryEntry({
-    root, name: "项目级", purpose: null, token: "aaa111", rootMessageId: "om_proj", now: NOW });
-  const sessionEntry = {
-    ...newRegistryEntry({
-      root, name: "会话级", purpose: null, token: "bbb222", rootMessageId: "om_sess", now: NOW }),
-    id: "sess-entry", claude_session_id: session,
-  };
-  fs.writeFileSync(registryFile, JSON.stringify({
-    schema_version: "1.0", projects: [projectEntry, sessionEntry] }));
-
-  // 传了会话 → 选中会话级；不传 → 落到项目级。后者正是旧实现的错处。
-  assert.equal(resolveProject({ root, claudeSessionId: session, registryFile }).bindingLevel,
-    "session");
-  assert.equal(resolveProject({ root, registryFile }).bindingLevel, "project");
-
-  // 命令必须把已验证的会话传下去。退回 currentBinding({ root }) 时这条会失败 ——
-  // 那是评审给的验收标准。
-  const src = fs.readFileSync(path.resolve("scripts", "feishu-pin-session.mjs"), "utf-8");
-  assert.match(src, /currentBinding\(\{ root, claudeSessionId:/u,
-    "退回只传 root，就会在项目级与会话级并存时错选项目级");
-  assert.doesNotMatch(src, /currentBinding\(\{ root \}\)/u);
+test("计划里只出稳定引用和版本前置条件，不夹带 locator", () => {
+  // 上一版把整份 binding 和整条目标订阅原样回传，于是 private_binding_key、
+  // 群和发送者 locator 一路跟到调用方和日志里。落盘要的也不是这些。
+  const snap = syncSnapshot("bb");
+  const p = plan({ previous: syncSub(), next: null, snapshots: [snap] }).plans[0];
+  assert.deepEqual(Object.keys(p).sort(),
+    ["action", "bindingRef", "expect", "localTargetId", "migrationCandidates", "reason"]);
+  const blob = JSON.stringify(p);
+  for (const leak of ["pbk-", "oc_group", "u_frank", "ou_bot"]) {
+    assert.equal(blob.includes(leak), false, "计划里漏出了 " + leak);
+  }
+  // 版本前置条件要够落盘做 CAS —— 快照还是当初那一版才允许写。
+  assert.equal(p.expect.subscriptionVersion, 1);
+  assert.equal(p.expect.snapshotId, snap.snapshot_id);
+  assert.equal(p.expect.authorizationRevision, snap.authorization_revision);
 });
+
 test("订阅撤销或暂停时，依赖它的 binding 必须被明确暂停", () => {
   // FR-2.5 的要害在最后半句："不能依靠日常热路径重新解释配置"。
   // 让热路径每次重看配置看着更省事，但那样改配置的那一刻什么都没发生，
   // 后果散落在此后每一条消息上，而且没有一个可以对账的时刻。
-  // 暂停也要升版本 —— 它是一次真的授权变更，不是元数据改动。
   for (const next of [null, syncSub({ status: "paused", version: 2 })]) {
-    const got = planSubscriptionSync({
-      previous: syncSub(), next, bindings: [syncBinding("t1"), syncBinding("t2")],
-    });
-    assert.equal(got.ok, true);
+    const got = plan({ previous: syncSub(), next, snapshots: [syncSnapshot("c1"), syncSnapshot("c2")] });
+    assert.equal(got.ok, true, got.reason);
     assert.deepEqual(got.counts, { resnapshot: 0, suspend: 2, migrate: 0 });
     // 不暂停的后果不是"它停了"，而是"它还在收消息，但依据的授权已经没了"。
     assert.equal(got.plans.every((p) => p.action === SYNC_ACTION.SUSPEND), true);
   }
 });
 
-test("订阅内容变了但仍覆盖 → 重新物化快照，不是暂停", () => {
-  // 注意 next 必须是**内容真的变了**。只涨版本号是 no-op，
-  // 拿它当"内容变了"的样本，这条测试就测不到 resnapshot 那条分支。
-  const got = planSubscriptionSync({
-    previous: syncSub(),
-    next: syncSub({ version: 2, scope: { ...syncSub().scope, sender_ids: ["frank", "另一个人"] } }),
-    bindings: [syncBinding("t1")],
-  });
-  assert.deepEqual(got.counts, { resnapshot: 1, suspend: 0, migrate: 0 });
-  // 一律暂停会把"授权还在、只是内容变了"也停掉 —— 那是把同步做成了断电。
-  assert.equal(got.plans[0].action, SYNC_ACTION.RESNAPSHOT);
-});
-
 test("迁移必须由人显式指定目标 —— 「只剩这一条」不是授权", () => {
   // 上一版：唯一一条范围接得住就自动迁。评审用反例打穿了 ——
   // 那条"唯一候选"可以属于别的业务域、别的 agent、只授权别的人和别的事件类型。
   // 这跟自动抑制是同一类错误：从"只剩这一条"推出"那就是它"。
-  const other = syncSub({ subscription_id: "s2" });
-  const auto = planSubscriptionSync({
-    previous: syncSub(), next: null, bindings: [syncBinding("t1")], others: [other],
-  });
-  assert.equal(auto.ok, true);
+  const snap = syncSnapshot("d1");
+  const otherId = "subscription_" + "f".repeat(24);
+  const other = syncSub({ subscription_id: otherId });
+
+  const auto = plan({ previous: syncSub(), next: null, snapshots: [snap], others: [other] });
   assert.equal(auto.counts.migrate, 0, "没有显式目标就不许迁");
   assert.equal(auto.counts.suspend, 1, "默认是暂停：安全、可恢复、后果明确");
   assert.equal(auto.plans[0].migrationCandidates, 1, "有候选要告诉人，但不替人决定");
   assert.match(renderSyncPlan(auto), /要迁请显式指定目标/u);
 
-  // 显式指定且授权确实覆盖 → 才迁。
-  const explicit = planSubscriptionSync({
-    previous: syncSub(), next: null, bindings: [syncBinding("t1")],
-    others: [other], migrateTo: "s2",
-  });
+  const explicit = plan({
+    previous: syncSub(), next: null, snapshots: [snap], others: [other], migrateTo: otherId });
   assert.equal(explicit.counts.migrate, 1);
-  assert.equal(explicit.plans[0].to.subscription_id, "s2");
-  assert.equal(explicit.plans[0].reason, "explicit_target");
+  assert.equal(explicit.plans[0].toSubscriptionId, otherId);
 
   // 指定了一个不在候选里的目标 → 拒，不静默降级成暂停。
-  const unknown = planSubscriptionSync({
-    previous: syncSub(), next: null, bindings: [syncBinding("t1")],
-    others: [other], migrateTo: "s9",
-  });
-  assert.equal(unknown.reason, SYNC_REJECT.MIGRATION_TARGET_UNKNOWN);
+  assert.equal(plan({ previous: syncSub(), next: null, snapshots: [snap], others: [other],
+    migrateTo: "subscription_" + "a".repeat(24) }).reason, SYNC_REJECT.MIGRATION_TARGET_UNKNOWN);
 });
 
 test("迁移目标的授权必须逐项覆盖，差一样都不许迁", () => {
   // 评审给的反例：一条属于 domain-a、授权 frank、只收 message 的 binding，
-  // 上一版会被迁到 other-domain、other-agent、只授权别人和别的事件的订阅 ——
-  // 因为"接得住"只比了 endpoint / 群 / 运输身份。**迁移是重新归属，不是换指针。**
+  // 上一版会被迁到 other-domain、other-agent、只授权别人和别的事件的订阅。
+  // **迁移是重新归属，不是换指针。**
+  const snap = syncSnapshot("e1");
+  const otherId = "subscription_" + "f".repeat(24);
+  const base = syncSub().scope;
   const cases = [
-    ["domain_id", { domain_id: "other-domain" }],
-    ["agent_uid", { scope: { ...syncSub().scope, agent_uid: "other-agent" } }],
-    ["sender_ids", { scope: { ...syncSub().scope, sender_ids: ["someone-else"] } }],
-    ["event_types", { scope: { ...syncSub().scope, event_types: ["im.chat.updated"] } }],
-    // 新窗口更严 → 收不下这条 binding 原本受理的事件，那不是覆盖。
+    ["domain_id", { domain_id: "domain_" + "b".repeat(24) }],
+    ["agent_participant_id", { scope: { ...base, transport_open_id: "ou_other" } }],
+    ["chat_scope_ref", { scope: { ...base, chat_id: "oc_other" } }],
+    ["authorized_human_participant_ids", { scope: { ...base, sender_ids: ["u_someone_else"] } }],
+    ["event_types", { scope: { ...base, event_types: ["im.chat.updated"] } }],
+    // 新窗口更严 → 收不下这份快照原本受理的事件，那不是覆盖。
     ["freshness_ms", { constraints: { freshness_ms: 60000 } }],
     ["status", { status: "paused" }],
   ];
   for (const [missing, over] of cases) {
-    const target = syncSub({ subscription_id: "s2", ...over });
-    const got = planSubscriptionSync({
-      previous: syncSub(), next: null, bindings: [syncBinding("t1")],
-      others: [target], migrateTo: "s2",
-    });
-    assert.equal(got.ok, false, missing + " 不同也被放行了");
-    assert.equal(got.reason, SYNC_REJECT.MIGRATION_INCOMPATIBLE, missing);
+    const target = syncSub({ subscription_id: otherId, ...over });
+    const got = plan({ previous: syncSub(), next: null, snapshots: [snap],
+      others: [target], migrateTo: otherId });
+    assert.equal(got.reason, SYNC_REJECT.MIGRATION_INCOMPATIBLE, missing + " 被放行了");
     assert.equal(got.missing, missing, missing + " 的差异要指名道姓");
     // 同一条差异下，连"候选"都不该算它。
-    const auto = planSubscriptionSync({
-      previous: syncSub(), next: null, bindings: [syncBinding("t1")], others: [target],
-    });
-    assert.equal(auto.plans[0].migrationCandidates, 0, missing + "：授权不覆盖就不是候选");
+    assert.equal(plan({ previous: syncSub(), next: null, snapshots: [snap], others: [target] })
+      .plans[0].migrationCandidates, 0, missing + "：授权不覆盖就不是候选");
   }
 
   // 目标授权更宽（多授权一个人、多收一种事件、窗口更松）→ 覆盖得住，可以迁。
-  const wider = syncSub({
-    subscription_id: "s2",
-    scope: { ...syncSub().scope, sender_ids: ["frank", "someone"], event_types: ["im.message.receive", "im.chat.updated"] },
-    constraints: { freshness_ms: 1800000 },
-  });
-  const ok = planSubscriptionSync({
-    previous: syncSub(), next: null, bindings: [syncBinding("t1")], others: [wider], migrateTo: "s2",
-  });
-  assert.equal(ok.counts.migrate, 1, "更宽的授权是覆盖，不该被挡");
+  const wider = syncSub({ subscription_id: otherId,
+    scope: { ...base, sender_ids: ["u_frank", "u_two"], event_types: ["im.message.receive", "im.chat.updated"] },
+    constraints: { freshness_ms: 1800000 } });
+  assert.equal(plan({ previous: syncSub(), next: null, snapshots: [snap],
+    others: [wider], migrateTo: otherId }).counts.migrate, 1, "更宽的授权是覆盖，不该被挡");
 });
 
-test("归属看 binding 记着的订阅身份，不看范围", () => {
+test("归属看快照记着的订阅身份，不看范围", () => {
   // 上一版用范围覆盖代替归属：撤销 sub-a，会把明明属于 sub-b 的同群 binding
   // 一起列进来暂停。**同一个群里本来就可以有多条订阅。**
-  const got = planSubscriptionSync({
-    previous: syncSub(), next: null,
-    bindings: [syncBinding("mine"), syncBinding("theirs", { subscription_id: "s2" })],
-  });
+  const otherId = "subscription_" + "f".repeat(24);
+  const mine = syncSnapshot("f1");
+  const theirs = syncSnapshot("f2", { subscription: syncSub({ subscription_id: otherId }) });
+  const got = plan({ previous: syncSub(), next: null, snapshots: [mine, theirs] });
   assert.equal(got.plans.length, 1, "范围一样但属于别条订阅的，不在这次变更范围里");
-  assert.equal(got.plans[0].binding.local_target_id, "mine");
-});
-
-test("不归这条订阅的 binding 不在本次变更范围里", () => {
-  const got = planSubscriptionSync({
-    previous: syncSub(), next: null,
-    bindings: [syncBinding("mine"), syncBinding("theirs", { subscription_id: "s2", chat_id: "oc_other" })],
-  });
-  assert.equal(got.plans.length, 1, "别的群那条不该被这次撤销牵连");
-  assert.equal(got.plans[0].binding.local_target_id, "mine");
+  assert.equal(got.plans[0].bindingRef, mine.binding_ref);
 });
 
 test("输入契约不许 fail-open —— 一个算错的控制面比没有控制面更危险", () => {
-  // 这几条都是评审实测出来的：它们当时全都"成功"返回。
-  // 控制面返回 ok 的含义是"我算过了"，算不清就必须说算不清。
-  const base = { previous: syncSub(), next: syncSub({ version: 2 }), bindings: [syncBinding("t1")] };
+  // 这几条都是评审实测出来的：它们当时全都"成功"返回，或者直接崩。
+  // 控制面返回 ok 的含义是"我算过了"，算不清就必须说算不清。**崩溃不是拒绝。**
+  const snap = syncSnapshot("g1");
+  const base = { previous: syncSub(), next: syncSub({ version: 2 }), snapshots: [snap] };
 
-  // previous 缺失/说不清 → 根本算不出谁受影响。上一版 previous=null、next=null 返回成功且零计划。
-  assert.equal(planSubscriptionSync({ ...base, previous: null }).reason, SYNC_REJECT.PREVIOUS_INVALID);
-  assert.equal(planSubscriptionSync({ previous: null, next: null, bindings: [] }).ok, false);
+  // 连参数对象都没有 —— 上一版 planSubscriptionSync() 和 (null) 都直接抛 TypeError。
+  assert.equal(planSubscriptionSync().ok, false);
+  assert.equal(planSubscriptionSync(null).ok, false);
+  assert.equal(planSubscriptionSync(undefined).reason, SYNC_REJECT.NAMESPACE_INVALID);
 
-  // bindings 传 null 上一版直接抛 TypeError —— 崩溃不是拒绝。
-  assert.equal(planSubscriptionSync({ ...base, bindings: null }).reason, SYNC_REJECT.BINDINGS_INVALID);
-  // binding 缺字段 → 缺哪个就说哪个，不许"没写=不限制"。
-  for (const f of ["subscription_id", "domain_id", "agent_uid", "authorized_sender_ids",
-    "event_types", "freshness_ms"]) {
-    const bad = { ...syncBinding("t1") };
-    delete bad[f];
-    const got = planSubscriptionSync({ ...base, bindings: [bad] });
-    assert.equal(got.reason, SYNC_REJECT.BINDINGS_INVALID, f);
-    assert.equal(got.problem, f, f + " 要指名道姓");
-  }
+  // 没有命名空间就派生不出可比较的 ref，不能假装算过了。
+  assert.equal(planSubscriptionSync({ ...base }).reason, SYNC_REJECT.NAMESPACE_INVALID);
+
+  assert.equal(plan({ ...base, previous: null }).reason, SYNC_REJECT.PREVIOUS_INVALID);
+  assert.equal(plan({ previous: null, next: null, snapshots: [] }).ok, false);
+
+  // snapshots 传 null / 不是合法快照 → 拒。
+  assert.equal(plan({ ...base, snapshots: null }).reason, SYNC_REJECT.SNAPSHOTS_INVALID);
+  assert.equal(plan({ ...base, snapshots: [{ ...snap, chat_scope_ref: "bogus" }] }).reason,
+    SYNC_REJECT.SNAPSHOTS_INVALID);
+  // 自造的 adapter 私有结构也要被挡住 —— 上一版正是靠它才显得能跑。
+  assert.equal(plan({ ...base, snapshots: [{ subscription_id: SYNC_SID, chat_id: "oc_group" }] }).reason,
+    SYNC_REJECT.SNAPSHOTS_INVALID);
 
   // others 说不清 / 同一个 id 出现两次 → "唯一目标"无从谈起。
-  assert.equal(planSubscriptionSync({ ...base, others: null }).reason, SYNC_REJECT.OTHERS_INVALID);
-  assert.equal(planSubscriptionSync({ ...base, others: [{ nonsense: true }] }).reason,
-    SYNC_REJECT.OTHERS_INVALID);
-  assert.equal(planSubscriptionSync({
-    ...base, others: [syncSub({ subscription_id: "s2" }), syncSub({ subscription_id: "s2" })],
-  }).problem, "duplicate_id");
-  // 跟被改的这条同 id 也不行。
-  assert.equal(planSubscriptionSync({ ...base, others: [syncSub()] }).problem, "duplicate_id");
+  const otherId = "subscription_" + "f".repeat(24);
+  assert.equal(plan({ ...base, others: null }).reason, SYNC_REJECT.OTHERS_INVALID);
+  assert.equal(plan({ ...base, others: [{ nonsense: true }] }).reason, SYNC_REJECT.OTHERS_INVALID);
+  assert.equal(plan({ ...base, others: [syncSub({ subscription_id: otherId }),
+    syncSub({ subscription_id: otherId })] }).problem, "duplicate_id");
+  assert.equal(plan({ ...base, others: [syncSub()] }).problem, "duplicate_id");
 
   // 换了 subscription_id 不是更新，是替换。
-  assert.equal(planSubscriptionSync({ ...base, next: syncSub({ subscription_id: "s2", version: 2 }) }).reason,
+  assert.equal(plan({ ...base, next: syncSub({ subscription_id: otherId, version: 2 }) }).reason,
     SYNC_REJECT.IDENTITY_CHANGED);
+});
 
-  // 版本回退、原地不动都不行 —— 两份不同的授权共用一个版本号，之后没法判断哪份更新。
-  const changed = (v) => syncSub({ version: v, scope: { ...syncSub().scope, sender_ids: ["someone"] } });
-  assert.equal(planSubscriptionSync({ ...base, previous: syncSub({ version: 2 }), next: changed(1) }).reason,
+test("显式控制参数的类型错误不许降级成另一种动作", () => {
+  // 评审实测：migrateTo: 42 被当成"没指定迁移"，静默生成暂停计划 ——
+  // **人明明按了迁移，系统做了别的事，还报成功。**只有 null 才是"没指定"。
+  const snap = syncSnapshot("h1");
+  const base = { previous: syncSub(), next: null, snapshots: [snap] };
+  for (const bad of [42, "", 0, false, {}, []]) {
+    const got = plan({ ...base, migrateTo: bad });
+    assert.equal(got.ok, false, JSON.stringify(bad) + " 被当成了「没指定迁移」");
+    assert.equal(got.reason, SYNC_REJECT.MIGRATION_TARGET_INVALID, JSON.stringify(bad));
+  }
+  // 只有 null / 不传才是"没指定"。
+  assert.equal(plan({ ...base, migrateTo: null }).counts.suspend, 1);
+  assert.equal(plan(base).counts.suspend, 1);
+});
+
+test("版本回退不许因为内容相同而被赦免", () => {
+  // 评审实测：previous.version=2、next.version=1、授权内容完全相同 → ok:true, noop:true。
+  // **版本回退本身就违反控制面单调契约**，不该因为内容相同就放行 ——
+  // 单调性检查必须排在 no-op 判断之前。
+  const snap = syncSnapshot("i1");
+  const back = plan({ previous: syncSub({ version: 2 }), next: syncSub({ version: 1 }), snapshots: [snap] });
+  assert.equal(back.ok, false, "内容相同的版本回退也要拒");
+  assert.equal(back.reason, SYNC_REJECT.VERSION_NOT_ADVANCED);
+  assert.deepEqual([back.from, back.to], [2, 1]);
+
+  // 内容变了、版本回退 → 同样拒。
+  const changed = syncSub({ version: 1, scope: { ...syncSub().scope, sender_ids: ["u_two"] } });
+  assert.equal(plan({ previous: syncSub({ version: 2 }), next: changed, snapshots: [snap] }).reason,
     SYNC_REJECT.VERSION_NOT_ADVANCED);
-  assert.equal(planSubscriptionSync({ ...base, next: changed(1) }).reason,
+  // 内容变了、版本原地不动 → 也拒。
+  assert.equal(plan({ previous: syncSub(),
+    next: syncSub({ scope: { ...syncSub().scope, sender_ids: ["u_two"] } }), snapshots: [snap] }).reason,
     SYNC_REJECT.VERSION_NOT_ADVANCED);
 });
 
 test("授权内容没变就是 no-op，不许生成一份「重新物化」计划", () => {
   // 上一版前后完全相同也照样产出 resnapshot。**那不是无害的**：
   // 它会让人以为确实发生了变更，也会让每次保存都刷一遍所有快照。
-  const same = planSubscriptionSync({
-    previous: syncSub(), next: syncSub(), bindings: [syncBinding("t1")],
-  });
-  assert.equal(same.ok, true);
+  const snap = syncSnapshot("j1");
+  const same = plan({ previous: syncSub(), next: syncSub(), snapshots: [snap] });
   assert.equal(same.noop, true);
   assert.deepEqual(same.counts, { resnapshot: 0, suspend: 0, migrate: 0 });
   assert.match(renderSyncPlan(same), /没有变化/u);
 
   // 只涨版本号、内容一字未动 —— 同样是 no-op。指纹里不含 version。
-  assert.equal(planSubscriptionSync({
-    previous: syncSub(), next: syncSub({ version: 5 }), bindings: [syncBinding("t1")],
-  }).noop, true);
+  assert.equal(plan({ previous: syncSub(), next: syncSub({ version: 5 }), snapshots: [snap] }).noop, true);
 
   // 内容真的变了才算变更。
-  const real = planSubscriptionSync({
-    previous: syncSub(),
-    next: syncSub({ version: 2, scope: { ...syncSub().scope, sender_ids: ["frank", "另一个人"] } }),
-    bindings: [syncBinding("t1")],
-  });
+  const real = plan({ previous: syncSub(),
+    next: syncSub({ version: 2, scope: { ...syncSub().scope, sender_ids: ["u_frank", "u_two"] } }),
+    snapshots: [snap] });
   assert.equal(real.noop, false);
   assert.equal(real.counts.resnapshot, 1);
 });
 
 test("拿一份说不清的订阅去同步要被拒", () => {
   // 否则"说不清"会顺着同步扩散到每一条 binding 上。
-  const got = planSubscriptionSync({
-    previous: syncSub(), next: syncSub({ scope: { chat_id: "oc" } }),
-    bindings: [syncBinding("t1")],
-  });
+  const got = plan({ previous: syncSub(), next: syncSub({ scope: { chat_id: "oc" } }),
+    snapshots: [syncSnapshot("k1")] });
   assert.equal(got.ok, false);
   assert.equal(got.reason, SYNC_REJECT.SUBSCRIPTION_INVALID);
 });

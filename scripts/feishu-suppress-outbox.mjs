@@ -31,12 +31,15 @@ import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { topicGenerationLockDir } from "./topic-generation-store.mjs";
 import { currentBinding } from "./feishu-control.mjs";
-import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
+import {
+  applySuppressionCore, corruptTargets, dependsOnMapping,
+  generationTargetState, usableGeneration,
+} from "./suppress-outbox-core.mjs";
 
 const nonEmptyStr = (v) => typeof v === "string" && v.length > 0;
 
 const FLAGS = new Set(["apply"]);
-const OPTIONS = new Set(["project", "session", "reason", "generation"]);
+const OPTIONS = new Set(["project", "session", "reason", "generation", "expect-generation"]);
 
 /** 严格白名单：拼错的参数不许被执行成另一种操作。 */
 function parseArgs(tokens) {
@@ -78,12 +81,18 @@ function activeGenerationOf(mapping) {
 
 export function selectByGeneration(records, generation, mapping) {
   const out = [];
+  // **损坏记录无论指定哪个代际都要纳入。**它的 key 谁也匹配不上，
+  // 于是原本会被静默排除 —— 不抑制是安全的，但人永远不知道有这么一条。
+  // 纳进来，核心会 fail-closed 并点名是哪个文件。
+  out.push(...corruptTargets(records));
   for (const [key, group] of groupByTargetGeneration(records)) {
     const resolved = key === "__legacy_active__"
       ? resolveMappingOutboundGeneration(mapping, null)
       : { generationId: key };
     const id = resolved?.generationId ?? resolved?.channelGenerationId ?? key;
-    if (id === generation || key === generation) out.push(...group);
+    if (id === generation || key === generation) {
+      out.push(...group.filter((r) => generationTargetState(r) !== "corrupt"));
+    }
   }
   return out;
 }
@@ -119,51 +128,26 @@ export function selectByGeneration(records, generation, mapping) {
 export function applySuppression({
   outboxDir, root, session = null, pending, generation, previewGenerationId = null, reason,
 }) {
-  // 只有旧格式记录的代际是现算的；其余记录自带代际，轮转不影响它们。
-  const dependsOnMapping = pending.some((r) => !nonEmptyStr(r?.target_channel_generation_id));
-  let genLockDir = null;
-  if (dependsOnMapping) {
-    const binding = currentBinding({ root, claudeSessionId: session });
-    genLockDir = topicGenerationLockDir({ source: binding?.source, root });
-    // 这批里有旧格式记录，却说不清该跟哪一把锁串行 —— **明确拒绝**，
-    // 不许退而求其次去拿全局锁碰运气。
-    if (genLockDir === null) return { ok: false, reason: "binding_unresolved" };
-    const genLock = acquirePublishLock(genLockDir);
-    // 轮转正在进行 → 现在不是动 outbox 的时候。等它做完再来。
-    if (!genLock.ok) return { ok: false, reason: "rotation_busy" };
-  }
-  const lockDir = path.join(root, ".runtime-data", "outbound", "publish.lock");
-  const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) {
-    if (genLockDir !== null) releasePublishLock(genLockDir);
-    return { ok: false, reason: lock.reason };
-  }
-  try {
-    // **锁内重读 mapping**，不用预览时那一份 —— 代际含义正是从它来的。
-    const resolved = resolveProject({ root, claudeSessionId: session });
-    const freshMapping = resolved.ok ? resolved.mapping : null;
-    const activeNow = activeGenerationOf(freshMapping);
-    // 只有旧格式记录的归属会随轮转改变。每条都自带代际时，轮转不影响任何一条 ——
-    // 这时再因为轮转中止，就是在拒绝一件本来安全的事。
-    if (dependsOnMapping && previewGenerationId !== null && activeNow !== previewGenerationId) {
-      // 预览之后轮转过。即使一个文件都没变，"抑制这一代"的含义已经不是原来那个了。
-      return { ok: false, reason: "rotated", from: previewGenerationId, to: activeNow };
-    }
-
-    // 预览到落盘之间可能有新内容进来，也可能有内容已经发出去了。
-    const freshAll = listPending({ outboxDir });
-    const fresh = generation === null ? freshAll : selectByGeneration(freshAll, generation, freshMapping);
-    // **比集合，不是比数量。**只比条数挡不住等量替换：预览之后少一条旧的、
-    // 多一条新的，总数没变，就会不可逆地抑制另一批内容。
-    const before = new Set(pending.map((x) => x._file));
-    const now = new Set(fresh.map((x) => x._file));
-    const same = before.size === now.size && [...before].every((f) => now.has(f));
-    if (!same) return { ok: false, reason: "drift", before: before.size, now: now.size };
-    return { ok: true, done: suppressRecords(fresh, { reason }) };
-  } finally {
-    releasePublishLock(lockDir);
-    if (genLockDir !== null) releasePublishLock(genLockDir);
-  }
+  // 判据在 suppress-outbox-core 里，两条链路共用。这里只回答三个本地问题：
+  // 锁在哪、锁内怎么重读、这批要选哪些。
+  const needsGeneration = dependsOnMapping(pending);
+  const binding = needsGeneration ? currentBinding({ root, claudeSessionId: session }) : null;
+  return applySuppressionCore({
+    outboxDir,
+    publishLockDir: path.join(root, ".runtime-data", "outbound", "publish.lock"),
+    generationLockDir: needsGeneration
+      ? topicGenerationLockDir({ source: binding?.source, root }) : null,
+    pending, previewGenerationId, reason,
+    readState: () => {
+      const resolved = resolveProject({ root, claudeSessionId: session });
+      const freshMapping = resolved.ok ? resolved.mapping : null;
+      return {
+        activeGeneration: activeGenerationOf(freshMapping),
+        select: (all) => (generation === null
+          ? all : selectByGeneration(all, generation, freshMapping)),
+      };
+    },
+  });
 }
 
 function main() {
@@ -189,9 +173,14 @@ function main() {
   // 旧格式记录 —— 它们没有这个字段，排空时被归入当前有效代际（__legacy_active__），
   // 于是按诊断给的代际 id 来筛，一条都筛不到。
   const pending = generation === null ? all : selectByGeneration(all, generation, mapping);
-  // 记下预览时的有效代际。落盘前要拿它跟锁内重读的结果比 —— 中间轮转过的话，
-  // "抑制这一代"的含义已经变了，即使一个文件都没动。
-  const previewGenerationId = activeGenerationOf(mapping);
+  // **预览看到的代际必须由人带进来，不能在这里现算。**
+  //
+  // 预览和 --apply 是两次独立运行；在这里现算，第二个进程拿到的就是轮转之后的值，
+  // 跟自己一比总是相等 —— 而"预览之后轮转过"恰恰只可能跨进程发生。
+  // 缺省时由核心拒绝（generation_expectation_required），这里只负责解析和显示。
+  const nowGeneration = activeGenerationOf(mapping);
+  const expectGeneration = parsed.seen.get("expect-generation") ?? null;
+  const needsExpect = dependsOnMapping(pending);
 
   console.log("项目      " + root);
   console.log("范围      " + (generation === null
@@ -209,10 +198,39 @@ function main() {
   console.log("\n**这是不可逆的**：被停下的这些内容不会再发出去，");
   console.log("也**不会**因为重新绑定或轮转话题而自动回来。");
 
-  if (!apply) { console.log("\n[dry-run] 什么都没写。加 --apply 才生效。"); return; }
+  if (!apply) {
+    console.log("\n[dry-run] 什么都没写。");
+    // **预览必须先说损坏。**上一版这里不查 corrupt：预览退出 0 还说
+    // "每条都自带代际，轮转不影响它们"，加 --apply 才报损坏并拒绝 ——
+    // **安全的预览和真实执行给出了相反的结论**，而预览正是人用来做决定的那一步。
+    const broken = corruptTargets(pending);
+    if (broken.length > 0) {
+      console.log("这批里有 " + broken.length + " 条记录的目标代际是坏的" +
+        "（字段在，但不是可用代际）：");
+      for (const b of broken) console.log("  " + String(b?._file ?? "?").split("/").pop());
+      console.log("**加 --apply 也不会动它们** —— 整批都会被拒。");
+      console.log("先确认这几条记录是怎么写坏的 —— 说不清它该发去哪，就不能替它决定不发。");
+      return;
+    }
+    if (needsExpect && !usableGeneration(nowGeneration)) {
+      // **不许打印一个能复制的假值。**上一版这里印 `<读不出代际>`，人照抄之后
+      // 它当然对不上，于是被报成"发生轮转" —— 而根本没轮转，是代际读不出来。
+      console.log("这批里有旧格式记录（代际靠当前状态现算），**但现在读不出当前代际**。");
+      console.log("这种状态下没有可信的代际依据，落盘会被拒 —— 先确认绑定是否正常。");
+    } else if (needsExpect) {
+      console.log("这批里有旧格式记录（代际靠当前状态现算）。落盘要带上现在这一代：");
+      console.log("  --apply --expect-generation " + nowGeneration);
+      console.log("**带它是为了让「预览之后轮转过」拦得住** —— 两次运行之间轮转了，");
+      console.log("这个值就对不上，命令会中止而不是按旧代际停错东西。");
+    } else {
+      console.log("加 --apply 才生效。（每条都自带代际，轮转不影响它们。）");
+    }
+    return;
+  }
 
   const r = applySuppression({
-    outboxDir, root, session, pending, generation, previewGenerationId, reason });
+    outboxDir, root, session, pending, generation,
+    previewGenerationId: expectGeneration, reason });
   if (!r.ok) {
     console.error(
       r.reason === "publisher_busy"
@@ -229,6 +247,15 @@ function main() {
       : r.reason === "drift"
         ? "outbox 在预览之后变了（" + r.before + " → " + r.now +
           " 条待发，或换了内容），没有动它。请重新预览确认。"
+      : r.reason === "corrupt_target_generation"
+        ? "这批里有 " + r.count + " 条记录的目标代际是坏的（字段在，但不是可用代际），\n" +
+          "  " + (r.files ?? []).filter(Boolean).map((f) => String(f).split("/").pop()).join("、") + "\n" +
+          "  没有动任何一条 —— 说不清它该发去哪，就不能替它决定不发。\n" +
+          "  先确认这几条记录是怎么写坏的；混着处理会让人以为整批都办完了。"
+      : r.reason === "generation_expectation_required"
+        ? "这批待发里有旧格式记录（代际靠当前绑定推算），落盘必须带上预览看到的那一代。\n" +
+          "  先重新跑一次预览，把它打出来的 --expect-generation <代际 id> 原样带上。\n" +
+          "  一条都没动，锁也一把都没拿 —— 缺的只是这个参数。"
         : "取锁失败（" + r.reason + "），没有动 outbox。");
     process.exitCode = 1;
     return;

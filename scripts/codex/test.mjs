@@ -7,6 +7,10 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { moduleRoot } from "../direct-run.mjs";
+import { applySuppressionCore } from "../suppress-outbox-core.mjs";
+import {
+  checkArgShape, locateTask, parseArgs as parseCodexSuppressArgs,
+} from "./suppress-outbox.mjs";
 
 import {
   appendEvent, listPending, markPublishEligibleByEventKey, suppressPublishByEventKey,
@@ -2422,6 +2426,453 @@ test("Codex 测试文件里没有写在汇总之后的 test()", () => {
   }
   assert.deepEqual(late, [],
     "第 " + late.join("、") + " 行的 test() 写在汇总之后，结果不会计入统计");
+});
+
+test("Codex 抑制：共用核心的判据在这一侧也真的生效", () => {
+  // **不只是"命令存在"。**判据抽成了共用核心，但共用只有在两边都真的接上时才成立 ——
+  // Claude 侧那批回归证明不了 Codex 这一侧接对了。所以这里直接驱动核心，
+  // 用 Codex 的路径布局，把每条判据各验一遍。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-suppress-"));
+  const outbox = path.join(dir, "outbox");
+  const publishLock = path.join(dir, "publish.lock");
+  const genLock = path.join(dir, "registry.lock");
+  fs.mkdirSync(outbox, { recursive: true });
+  const write = (name, extra = {}) => {
+    fs.writeFileSync(path.join(outbox, name),
+      JSON.stringify({ kind: "progress", text: name, published_at: null, ...extra }));
+  };
+  const readRec = (name) => JSON.parse(fs.readFileSync(path.join(outbox, name), "utf-8"));
+  const state = (gen) => ({ activeGeneration: gen, select: (r) => r });
+  const call = (over) => applySuppressionCore({
+    outboxDir: outbox, publishLockDir: publishLock, generationLockDir: genLock,
+    previewGenerationId: "gen-1", readState: () => state("gen-1"), reason: "t", ...over });
+
+  // ① 正常：全停下来。
+  write("0001.json", { target_channel_generation_id: "gen-1" });
+  let pending = listPending({ outboxDir: outbox });
+  let got = call({ pending, reason: "历史内容" });
+  assert.equal(got.ok, true, got.reason ?? "");
+  assert.equal(got.done.changed, 1);
+  assert.equal(readRec("0001.json").publish_suppressed_reason, "历史内容");
+  assert.equal(fs.existsSync(publishLock), false, "跑完要把发布锁还回去");
+
+  // ② 等量替换：条数没变、内容换了 → 必须中止。
+  write("0002.json", { target_channel_generation_id: "gen-1" });
+  pending = listPending({ outboxDir: outbox });
+  fs.rmSync(path.join(outbox, "0002.json"));
+  write("0003.json", { target_channel_generation_id: "gen-1" });
+  got = call({ pending });
+  assert.equal(got.reason, "drift", "只比条数的话这里会放行");
+  assert.equal(readRec("0003.json").publish_suppressed_at, undefined, "中止就一条不许动");
+
+  // ③ 旧格式记录 + 预览后轮转 → 必须中止，**即使文件一个没变**。
+  fs.rmSync(path.join(outbox, "0003.json"));
+  write("0004.json");                       // 没有 target_channel_generation_id
+  pending = listPending({ outboxDir: outbox });
+  got = call({ pending, readState: () => state("gen-2") });
+  assert.equal(got.reason, "rotated");
+  assert.deepEqual([got.from, got.to], ["gen-1", "gen-2"]);
+  assert.equal(readRec("0004.json").publish_suppressed_at, undefined);
+
+  // ④ 有旧格式记录、却给不出代际锁 → 明确拒绝，不许拿一把猜出来的锁碰运气。
+  assert.equal(call({ pending, generationLockDir: null }).reason, "binding_unresolved");
+
+  // ⑤ 代际锁被占（轮转进行中）→ 不动手，也不许去碰发布锁。
+  fs.mkdirSync(genLock, { recursive: true });
+  fs.writeFileSync(path.join(genLock, "owner.json"),
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  got = call({ pending });
+  assert.equal(got.reason, "rotation_busy");
+  assert.equal(fs.existsSync(publishLock), false, "第一把锁没拿到就不许留下第二把");
+  fs.rmSync(genLock, { recursive: true, force: true });
+
+  // ⑥ 每条都自带代际时，轮转不该拦 —— 那时中止是在拒绝一件本来安全的事。
+  fs.rmSync(path.join(outbox, "0004.json"));
+  write("0005.json", { target_channel_generation_id: "gen-9" });
+  pending = listPending({ outboxDir: outbox });
+  got = call({ pending, readState: () => state("gen-2") });
+  assert.equal(got.ok, true, "没有旧格式记录时轮转不该拦：" + (got.reason ?? ""));
+  assert.equal(fs.existsSync(genLock), false, "这种情况下压根不该去取代际锁");
+});
+
+test("Codex 抑制命令：默认只预览，参数拼错不许被当成别的操作", () => {
+  // 有损且不可逆，所以默认预览、白名单严格。
+  const ok = parseCodexSuppressArgs(["--thread-id", "t1", "--apply", "--reason", "x"]);
+  assert.equal(ok.ok, true);
+  assert.equal(ok.seen.get("apply"), true);
+  for (const [what, argv] of [
+    ["拼错 apply", ["--aply"]],
+    ["未知参数", ["--force"]],
+    ["重复参数", ["--thread-id", "a", "--thread-id", "b"]],
+    ["缺值", ["--thread-id", "--apply"]],
+    ["裸参数", ["thread-id"]],
+  ]) {
+    assert.equal(parseCodexSuppressArgs(argv).ok, false, what + " 竟然被接受了");
+  }
+});
+
+test("Codex 真实 CLI：缺 expectation / 纯空白 / 代际不可读，都不许说成取锁失败或轮转", () => {
+  // 跟 Claude 侧同一条要求：核心分清的三类原因，到界面上不许又混成一句
+  // "取锁失败"。上一版 Codex 侧还多一个毛病 —— 包装层只拦 null，
+  // 空串和纯空白穿到核心，界面就只剩兜底那句。
+  const mk = (withState) => {
+    const home = temp();
+    const root = path.join(home, "project");
+    fs.mkdirSync(root, { recursive: true });
+    const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Sup",
+      rootMessageId: "om_root", token: "abc123" });
+    // **删掉状态是造不出「读不出代际」的** —— 它会从 task 现合成一份。
+    // 要让 topicStateForTask 真的失败，得给一份结构上就不合法的状态。
+    if (!withState) task.topic_generation_state = { generations: "not-an-array" };
+    fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+    writeRegistry([task], path.join(home, "registry.json"));
+    const paths = taskPaths(task, home);
+    fs.mkdirSync(paths.outbox, { recursive: true });
+    const rec = path.join(paths.outbox, "0001.json");
+    // 旧格式：没有 target_channel_generation_id。
+    fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "旧格式", published_at: null }));
+    return { home, rec };
+  };
+  const cliPath = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
+  const run = (home, ...args) => spawnSync(process.execPath,
+    [cliPath, "--thread-id", THREAD_A, ...args],
+    { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  const untouched = (rec) =>
+    JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at;
+
+  // ① 完全不给
+  {
+    const { home, rec } = mk(true);
+    const r = run(home, "--all-generations", "--apply", "--reason", "t");
+    assert.notEqual(r.status, 0, "缺 expectation 必须非零退出");
+    assert.match(r.stderr, /--expect-generation/u, "要说清缺的是什么、怎么补");
+    assert.doesNotMatch(r.stderr, /取锁失败/u, "**这不是取锁失败**");
+    assert.doesNotMatch(r.stderr, /轮转/u, "也没有发生轮转");
+    assert.equal(untouched(rec), undefined, "零抑制");
+    assert.equal(fs.existsSync(path.join(home, "registry.lock")), false,
+      "拒绝发生在拿锁之前 —— 代际锁没拿");
+  }
+
+  // ② 纯空白
+  {
+    const { home, rec } = mk(true);
+    const r = run(home, "--all-generations", "--apply", "--reason", "t",
+      "--expect-generation", "   ");
+    assert.notEqual(r.status, 0, "纯空白必须非零退出");
+    assert.match(r.stderr, /--expect-generation/u);
+    assert.doesNotMatch(r.stderr, /取锁失败/u, "**这不是取锁失败**");
+    assert.doesNotMatch(r.stderr, /轮转/u, "空白串不是「世界变了」，是这个值根本不是代际");
+    assert.equal(untouched(rec), undefined, "零抑制");
+    assert.equal(fs.existsSync(path.join(home, "registry.lock")), false,
+      "拒绝发生在拿锁之前");
+  }
+
+  // ③ 代际读不出来 —— 预览不许印一个能复制的假值
+  {
+    const { home, rec } = mk(false);
+    const preview = run(home, "--all-generations");
+    assert.equal(preview.status, 0, preview.stderr);
+    assert.doesNotMatch(preview.stdout, /--apply --expect-generation \S/u,
+      "**读不出代际时不许给出可复制的参数** —— 照抄之后会被误报成轮转");
+    assert.match(preview.stdout, /读不出当前代际/u, "要直说是代际读不出来");
+    const r = run(home, "--all-generations", "--apply", "--reason", "t");
+    assert.notEqual(r.status, 0);
+    assert.doesNotMatch(r.stderr, /取锁失败/u, "**这不是取锁失败**");
+    assert.doesNotMatch(r.stderr, /轮转/u, "没有轮转");
+    assert.equal(untouched(rec), undefined, "零抑制");
+  }
+});
+
+test("Codex 抑制命令：真实入口 —— 预览后轮转必须 rotated 且零抑制", () => {
+  // 评审指出：上一版的 readState 闭包引用了**加锁前**读到的 task ——
+  // 我为共用核心设计了"锁内怎么重读"这个接口，**然后在实现它的时候把旧值闭包了进去**。
+  // 接口对了，实现是假的：预览后轮转，旧格式记录仍会按旧代际被不可逆抑制。
+  //
+  // 而且他说得对 —— 之前那条回归只驱动共用核心，**没验包装层接线**。
+  // 这跟我在 Stop 钩子上栽的那次一模一样：纯函数全绿、真实入口是坏的。
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Sup",
+    rootMessageId: "om_root", token: "abc123" });
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const regFile = path.join(home, "registry.json");
+  writeRegistry([task], regFile);
+
+  const paths = taskPaths(task, home);
+  fs.mkdirSync(paths.outbox, { recursive: true });
+  // **旧格式记录**：没有 target_channel_generation_id，代际靠当前状态现算。
+  const rec = path.join(paths.outbox, "0001.json");
+  fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "旧格式", published_at: null }));
+
+  const cli = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
+  const run = (...args) => spawnSync(process.execPath, [cli, "--thread-id", THREAD_A, ...args],
+    { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  const suppressed = () => JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at;
+
+  // 预览：能看到那一条。
+  const preview = run("--all-generations");
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.match(preview.stdout, /待发      1 条/u);
+  assert.match(preview.stdout, /dry-run/u);
+  assert.equal(suppressed(), undefined, "预览不许写盘");
+
+  // 预览必须把「落盘时该带哪一代」原样打出来 —— 不然人没处抄。
+  const told = /--expect-generation (channel_generation_[0-9a-f]{24})/u.exec(preview.stdout);
+  assert.ok(told, "预览要打出该带的代际：" + preview.stdout);
+  const seenGeneration = told[1];
+
+  // 不带它就不许落盘。**跨进程的轮转保护全靠这个值**。
+  const bare = run("--all-generations", "--apply", "--reason", "t");
+  assert.notEqual(bare.status, 0, "不带 --expect-generation 不许落盘");
+  assert.match(bare.stderr, /--expect-generation/u);
+  assert.equal(suppressed(), undefined, "被拦下时零抑制");
+
+  // **预览之后轮转**：registry 换代，outbox 一个字节没动。
+  // 新建的 task 第一代是 pending（还没被真实 @ 认领过），先标成 active 再造轮转。
+  const rotated = JSON.parse(fs.readFileSync(regFile, "utf-8"));
+  const state = rotated.tasks[0].topic_generation_state;
+  assert.ok(state?.generations?.length, "夹具应当带着代际状态");
+  const first = state.generations[0];
+  first.status = "read-only";
+  state.generations.push({ ...first, status: "active", generation: (first.generation ?? 1) + 1,
+    channel_generation_id: "channel_generation_" + "f".repeat(24),
+    root_message_id: "om_next", session_id: null, pending_token: null });
+  rotated.tasks[0].channel_generation_id = "channel_generation_" + "f".repeat(24);
+  fs.writeFileSync(regFile, JSON.stringify(rotated, null, 2));
+
+  // 带着**预览那一刻**看到的代际来落盘 —— 现实里人就是照着预览抄的。
+  const after = run("--all-generations", "--apply", "--reason", "t",
+    "--expect-generation", seenGeneration);
+  assert.notEqual(after.status, 0,
+    "轮转过就必须中止。stdout=" + after.stdout + " stderr=" + after.stderr);
+  assert.match(after.stderr, /轮转过/u);
+  assert.equal(suppressed(), undefined, "**零抑制** —— 那条内容现在属于新话题");
+});
+
+test("locateTask 的 task-key 分支必须读 home 那一份登记表", () => {
+  // 评审实测：这个分支拿的锁是 home/registry.lock，读的却是**默认位置**的
+  // registry.json —— 显式指定 home 时，锁和被保护的文件根本不是同一份状态。
+  // 现网没立刻炸，只是因为 CLI 的 home 恰好来自同一个环境变量。
+  // **靠巧合保持一致的东西不算守住了。**
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cx-home-"));
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), "cx-other-"));
+  const task = makeTaskEntry({ root: path.join(home, "p"), threadId: THREAD_A,
+    name: "只在 home 里", rootMessageId: "om_root", token: "abc123" });
+  task.logical_task_key = "only-in-home";
+  fs.writeFileSync(path.join(home, "registry.json"),
+    JSON.stringify({ schema_version: "1.0", tasks: [task] }, null, 2));
+  // 默认位置（由环境变量决定）指向一份**不含这条 task** 的登记表。
+  fs.writeFileSync(path.join(other, "registry.json"),
+    JSON.stringify({ schema_version: "1.0", tasks: [] }, null, 2));
+
+  const prev = process.env.FEISHU_CODEX_BRIDGE_HOME;
+  process.env.FEISHU_CODEX_BRIDGE_HOME = other;
+  try {
+    const got = locateTask({ threadId: null, taskKey: "only-in-home", home });
+    assert.equal(got.ok, true,
+      "读的必须是 home 那一份；读默认位置就会找不到（" + (got.reason ?? "") + "）");
+    assert.equal(got.task.logical_task_key, "only-in-home");
+  } finally {
+    if (prev === undefined) delete process.env.FEISHU_CODEX_BRIDGE_HOME;
+    else process.env.FEISHU_CODEX_BRIDGE_HOME = prev;
+  }
+});
+
+test("Codex 预览和 --apply 不许给出相反结论：损坏记录在预览里就要点名", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Sup",
+    rootMessageId: "om_root", token: "abc123" });
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  writeRegistry([task], path.join(home, "registry.json"));
+  const paths = taskPaths(task, home);
+  fs.mkdirSync(paths.outbox, { recursive: true });
+  const rec = path.join(paths.outbox, "0001.json");
+  fs.writeFileSync(rec, JSON.stringify({ kind: "milestone", text: "坏的",
+    published_at: null, target_channel_generation_id: "   " }));
+  const cliPath = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
+  const run = (...args) => spawnSync(process.execPath,
+    [cliPath, "--thread-id", THREAD_A, ...args],
+    { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+
+  const preview = run("--all-generations");
+  assert.match(preview.stdout, /目标代际是坏的/u, "预览就要点名损坏");
+  assert.match(preview.stdout, /0001\.json/u, "要说清是哪个文件");
+  assert.doesNotMatch(preview.stdout, /每条都自带代际/u,
+    "**这是错的判断** —— 它的目标字段在，但不是代际");
+
+  const r = run("--all-generations", "--apply", "--reason", "t");
+  assert.notEqual(r.status, 0, "预览说会拒，真跑就必须拒");
+  assert.match(r.stderr, /目标代际是坏的/u);
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
+    "零抑制");
+});
+
+test("锁内重读要重判损坏：文件名一个没变，目标字段变坏也必须中止", () => {
+  // 评审实测复现的：锁外判的是**预览快照**。同一个文件的目标代际在预览之后
+  // 变坏时，文件名集合一个字节没变，集合 CAS 一路放行 ——
+  // 于是一条已经说不清该发去哪的内容被永久抑制。
+  //
+  // 这跟"锁内重读却闭包了旧值"是同一类：接口留了重读，实现只拿它比了文件名。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-relock-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const rec = path.join(obDir, "0001.json");
+  // **磁盘上已经是坏的**，而预览快照记的是好的 gen-1。
+  fs.writeFileSync(rec, JSON.stringify({ kind: "milestone", text: "x",
+    published_at: null, target_channel_generation_id: "   " }));
+
+  const got = applySuppressionCore({
+    outboxDir: obDir, publishLockDir: path.join(dir, "pub.lock"),
+    generationLockDir: path.join(dir, "gen.lock"),
+    pending: [{ _file: rec, target_channel_generation_id: "gen-1" }],
+    previewGenerationId: "gen-1",
+    readState: () => ({ activeGeneration: "gen-1", select: (x) => x }),
+    reason: "t",
+  });
+
+  assert.equal(got.ok, false, "锁内重读必须发现它变坏了");
+  assert.equal(got.reason, "corrupt_target_generation");
+  assert.equal(got.atRecheck, true, "要说清是锁内重判时发现的，不是锁外那一次");
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
+    "**零抑制** —— 说不清该发去哪，就不能替它决定不发");
+});
+
+test("空白目标代际是损坏记录 —— Codex 侧守着同一条三态判定", () => {
+  // 判据分家的后果两条链是共享的：核心一放松，两边同时漏。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-corrupt-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const rec = path.join(obDir, "0001.json");
+  const genLock = path.join(dir, "gen.lock");
+  const pubLock = path.join(dir, "pub.lock");
+  const call = (target) => {
+    fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "x", published_at: null,
+      ...(target === undefined ? {} : { target_channel_generation_id: target }) }));
+    return applySuppressionCore({
+      outboxDir: obDir, publishLockDir: pubLock, generationLockDir: genLock,
+      pending: [{ _file: rec, ...(target === undefined ? {} : { target_channel_generation_id: target }) }],
+      previewGenerationId: null,
+      readState: () => ({ activeGeneration: "gen-1", select: (x) => x }), reason: "t",
+    });
+  };
+  for (const bad of ["   ", "", 7, {}]) {
+    const got = call(bad);
+    assert.equal(got.ok, false, "损坏目标不许放行：" + JSON.stringify(bad));
+    assert.equal(got.reason, "corrupt_target_generation");
+    assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
+      "一条都不许动");
+    assert.equal(fs.existsSync(genLock), false, "拒绝发生在拿锁之前");
+    assert.equal(fs.existsSync(pubLock), false, "发布锁也没拿");
+  }
+  assert.equal(call(undefined).reason, "generation_expectation_required", "缺失=合法旧格式");
+  assert.equal(call("gen-1").ok, true, "自带可用代际该照常抑制");
+});
+
+test("「锁没拿」要证明从未获取 —— Codex 侧同样预先持锁验一次", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-prelock-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const rec = path.join(obDir, "0001.json");
+  fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "旧格式", published_at: null }));
+  const genLock = path.join(dir, "gen.lock");
+  const pubLock = path.join(dir, "pub.lock");
+  const hold = (d) => {
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, "owner.json"),
+      JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  };
+  const call = () => applySuppressionCore({
+    outboxDir: obDir, publishLockDir: pubLock, generationLockDir: genLock,
+    pending: [{ _file: rec }], previewGenerationId: null,
+    readState: () => ({ activeGeneration: "gen-1", select: (x) => x }), reason: "t",
+  });
+  hold(genLock);
+  assert.equal(call().reason, "generation_expectation_required",
+    "代际锁被别人持着也该报缺 expectation —— 报 rotation_busy 就说明它先去抢锁了");
+  fs.rmSync(genLock, { recursive: true, force: true });
+  hold(pubLock);
+  assert.equal(call().reason, "generation_expectation_required",
+    "发布锁被别人持着也一样");
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined);
+  assert.ok(fs.existsSync(pubLock), "别人的锁不许被顺手删掉");
+});
+
+test("核心不变量：旧格式记录缺 expectation 一律拒绝 —— Codex 侧也守着同一条", () => {
+  // **这条直接打核心，不经 CLI。**包装层自己也有一道前置检查，于是把核心那道
+  // 守卫拆掉时，走 CLI 的测试照样绿 —— 包装层先拦下了。
+  // 两条链共享的是核心，那这条不变量就必须在两边各有一个直接的守卫：
+  // 退回"允许 null"时，两侧要同时变红。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-core-inv-"));
+  const obDir = path.join(dir, "outbox");
+  const genLock = path.join(dir, "gen.lock");
+  fs.mkdirSync(obDir, { recursive: true });
+  const rec = path.join(obDir, "0001.json");
+  fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "旧格式", published_at: null }));
+  const call = (previewGenerationId) => applySuppressionCore({
+    outboxDir: obDir, publishLockDir: path.join(dir, "pub.lock"),
+    generationLockDir: genLock,
+    pending: [{ _file: rec }], previewGenerationId,
+    readState: () => ({ activeGeneration: "gen-1", select: (r) => r }),
+    reason: "t",
+  });
+
+  for (const missing of [null, undefined, "", "   "]) {
+    const got = call(missing);
+    assert.equal(got.ok, false, "缺 expectation 不许放行：" + JSON.stringify(missing));
+    assert.equal(got.reason, "generation_expectation_required");
+  }
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
+    "被拒时一条都不许动");
+  assert.equal(fs.existsSync(genLock), false, "拒绝发生在拿锁之前，不许留代际锁");
+  assert.equal(fs.existsSync(path.join(dir, "pub.lock")), false, "也不许留发布锁");
+
+  const ok = call("gen-1");
+  assert.equal(ok.ok, true, "带了就该放行：" + (ok.reason ?? ""));
+  assert.equal(ok.done.changed, 1);
+});
+
+test("Codex 抑制命令：目标和范围都必须显式给", () => {
+  // **有损操作的默认值不该是"最大范围"。**上一版不传 --generation 就作用于整个
+  // outbox；同时传 --thread-id 和 --task-key 会静默择一 ——
+  // 两条都是"少说一句话就扩大破坏范围"，而这个动作不可逆。
+  assert.equal(checkArgShape(new Map([["thread-id", "t"], ["task-key", "k"],
+    ["generation", "g"]])).reason, "target_ambiguous");
+  assert.equal(checkArgShape(new Map([["generation", "g"]])).reason, "target_missing");
+  assert.equal(checkArgShape(new Map([["thread-id", "t"]])).reason, "scope_missing");
+  assert.equal(checkArgShape(new Map([["thread-id", "t"], ["generation", "g"],
+    ["all-generations", true]])).reason, "scope_conflict");
+  assert.equal(checkArgShape(new Map([["thread-id", "t"], ["generation", "g"]])).ok, true);
+  assert.equal(checkArgShape(new Map([["task-key", "k"], ["all-generations", true]])).ok, true);
+
+  // 真实入口：歧义命令必须非零退出，且 outbox 一个字节不变。
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Sup2",
+    rootMessageId: "om_root", token: "abc124" });
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  writeRegistry([task], path.join(home, "registry.json"));
+  const paths = taskPaths(task, home);
+  fs.mkdirSync(paths.outbox, { recursive: true });
+  const rec = path.join(paths.outbox, "0001.json");
+  const body = JSON.stringify({ kind: "progress", text: "x", published_at: null });
+  fs.writeFileSync(rec, body);
+
+  const cli = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
+  for (const args of [
+    ["--thread-id", THREAD_A, "--apply"],                                  // 没给范围
+    ["--thread-id", THREAD_A, "--task-key", "k", "--all-generations", "--apply"],
+    ["--thread-id", THREAD_A, "--generation", "g", "--all-generations", "--apply"],
+    ["--all-generations", "--apply"],                                      // 没给目标
+  ]) {
+    const r = spawnSync(process.execPath, [cli, ...args],
+      { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+    assert.notEqual(r.status, 0, args.join(" ") + " 竟然被接受了");
+    assert.equal(fs.readFileSync(rec, "utf-8"), body, args.join(" ") + "：outbox 不许被动");
+  }
 });
 
 summarySealed = true;

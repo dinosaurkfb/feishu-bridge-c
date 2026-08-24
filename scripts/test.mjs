@@ -9087,6 +9087,62 @@ test("登记表的写入口只有一个 —— 建话题那条路径也走同一
   assert.equal(calls, 2, "补登记和新建绑定都要走同一个入口，实际 " + calls + " 处调用");
 });
 
+test("同 root 多条：在任何动作之前就拒，不许先动飞书", () => {
+  // 评审指出：歧义检查只在登记事务里，而事务**之前**还有三条快速路径 ——
+  // 恢复暂停的绑定、报"已经接入"退出、进入建话题流程，它们都靠 findIndex
+  // 取第一条同 root 记录。于是：
+  //
+  //   · 第一条完整 → 直接报"已接入"退出，歧义根本没被发现；
+  //   · 第一条不完整、第二条完整 → **可能先产生飞书侧动作**，之后才在事务里拒绝。
+  //
+  // 后者尤其糟：那是不可撤销的。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-dupfast-"));
+  const proj = path.join(dir, "proj");
+  fs.mkdirSync(path.join(proj, ".runtime-data", "inbound"), { recursive: true });
+  fs.writeFileSync(path.join(proj, ".runtime-data", "inbound", "chain-config.json"),
+    JSON.stringify({ project_dir: proj, logical_task_key: "k",
+      project_display_name: "P", task_display_name: "P" }));
+  const reg = path.join(dir, "registry.json");
+  const tpl = path.join(dir, "chain-config.json");
+  // **把 lark 二进制指到一个"被调用就尖叫"的桩上** —— 这条测试要证明的是
+  // "飞书调用次数为零"，而不是"命令退出码不为零"。
+  const screamer = path.join(dir, "lark-scream");
+  fs.writeFileSync(screamer, "#!/bin/sh\necho SCREAM >> " +
+    JSON.stringify(path.join(dir, "calls.log")) + "\nexit 9\n");
+  fs.chmodSync(screamer, 0o755);
+  fs.writeFileSync(tpl, JSON.stringify({ ...TPL, lark_cli_bin: screamer }));
+  const calls = () => (fs.existsSync(path.join(dir, "calls.log"))
+    ? fs.readFileSync(path.join(dir, "calls.log"), "utf-8").trim().split("\n").filter(Boolean).length
+    : 0);
+  const bind = () => spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, "--apply",
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: reg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: dir } });
+
+  // ① 第一条完整、第二条也在 → 不许报"已接入"把歧义盖过去。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0", projects: [
+    { id: "full", root: proj, root_message_id: "om_a" },
+    { id: "other", root: proj, root_message_id: "om_b" }] }));
+  const first = bind();
+  assert.equal(first.status, 1, "歧义必须非零退出");
+  assert.equal(first.stdout.includes("已经接入过了"), false,
+    "报「已接入」等于把歧义盖过去了");
+  assert.match(first.stderr, /说不清该(改|用)哪一条/u);
+  assert.equal(calls(), 0, "拒绝路径不许调用 lark");
+
+  // ② 第一条不完整、第二条完整、且**没有项目内 mapping**（会走建话题流程）
+  //    → 必须在动飞书之前就停。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0", projects: [
+    { id: "stale", root: proj },
+    { id: "full", root: proj, root_message_id: "om_b" }] }));
+  assert.equal(fs.existsSync(path.join(proj, ".runtime-data", "inbound", "active-mapping.json")),
+    false, "这条用例要走建话题流程，所以不能有项目内 mapping");
+  const second = bind();
+  assert.equal(second.status, 1);
+  assert.equal(calls(), 0, "**建话题之前就该停** —— 往群里发消息是撤不回来的");
+  assert.equal(JSON.parse(fs.readFileSync(reg, "utf-8")).projects.length, 2, "登记表不许被动");
+});
+
 test("补登记要在锁内重读；同 root 多条拒绝，单条残缺就地修", () => {
   // 另外两条 P1：上一版拿锁外那份快照直接 push —— 并发的绑定或迁移会被整体覆盖；
   // 而且同 root 但缺 root_message_id 的条目会被再 push 一条，**制造重复归属**。
@@ -9113,7 +9169,9 @@ test("补登记要在锁内重读；同 root 多条拒绝，单条残缺就地�
     projects: [{ id: "a", root: proj }, { id: "b", root: proj }] }));
   const dup = bind("--apply");
   assert.equal(dup.status, 1);
-  assert.match(dup.stderr, /说不清该改哪一条/u);
+  // 前置检查和事务内检查措辞不同 —— 两处都该认，因为**两处各管一段**：
+  // 前置管"任何动作之前"，事务内管"并发变化"。
+  assert.match(dup.stderr, /说不清该(改|用)哪一条/u);
   assert.equal(projects().length, 2, "拒绝时不许动登记表");
 
   // 同 root 一条但缺 root_message_id → **就地修**，不新增。

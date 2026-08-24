@@ -139,6 +139,22 @@ if (!loaded0.ok) {
 }
 let registry = loaded0.registry;
 
+// **歧义要在任何动作之前就拦下。**
+//
+// 上一版只把这条检查放进了登记事务里，而事务**之前**还有三条快速路径：
+// 恢复暂停的绑定、报"已经接入"退出、进入建话题流程。它们都靠 findIndex
+// 取第一条同 root 记录 —— 于是登记表里有两条时：
+//
+//   · 第一条完整 → 直接报"已接入"退出，歧义根本没被发现；
+//   · 第一条不完整、第二条完整 → **可能先产生飞书侧动作**，之后才在事务里拒绝。
+//
+// 后者尤其糟：那是不可撤销的。所以这里先数，数不清就立刻停 ——
+// 事务内仍会重读重判，防的是并发变化，两处不是重复而是各管一段。
+const sameRootAll = registry.projects.filter((p) => p?.root === root);
+if (sameRootAll.length > 1) {
+  die("登记表里有 " + sameRootAll.length + " 条同一个项目的记录，说不清该用哪一条。",
+    "先人工确认并只保留一条，再重跑。什么都没做，也没有往群里发任何消息。");
+}
 const at = registry.projects.findIndex((p) => p?.root === root);
 const already = at >= 0 ? registry.projects[at] : null;
 const legacyMapping = path.join(root, ".runtime-data", "inbound", "active-mapping.json");

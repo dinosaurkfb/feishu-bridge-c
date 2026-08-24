@@ -177,9 +177,42 @@ const relationRow = (c) => [c.displayName,
   (KIND_TEXT[c.kind] ?? c.kind) + " · " + c.groupName + (c.topicName ? " / " + c.topicName : "") +
   " · " + (SCOPE_TEXT[c.scope] ?? c.scope) + " · " + (STATE_TEXT[c.state] ?? c.state)];
 
+/**
+ * 出站路由认不认这个项目。
+ *
+ * **第 3 层读的是项目内文件，而出站路由走的是登记表 —— 两套。**
+ * 它们可以不一致，而不一致的那种状态最难查：状态页理直气壮地报"已绑定 · 第 N 代 ·
+ * 有效期 2027"，实际每一轮答复都没进过出站流程，一句错误提示也没有。
+ * 这不是假想 —— 线上就这么断了十几个小时，我自己也是先信了第 3 层才判断错的。
+ *
+ * 三种结论要分开：
+ *   · routable  出站认得它
+ *   · degraded  项目内绑定在，但登记表里没有 —— **绑定已降级，出站不会工作**
+ *   · unknown   登记表读不出来。**不许把"没查清"报成"没问题"**，也不许报成"坏了"
+ */
+export function outboundRoutingFact({ registryOk, exactCount, routableCount, bound }) {
+  if (!bound) return null;                    // 项目内都没有绑定，这一层没什么可说
+  if (registryOk !== true) return "unknown";
+  // **多于一条也不算正常。**同一个项目在登记表里有两条时，出站挑哪一条是不确定的 ——
+  // 报"正常"等于把一个说不清的状态说成说得清。
+  if (exactCount > 1) return "ambiguous";
+  if (exactCount === 0) return "degraded";
+  // **有记录 ≠ 出站会挑到它。**enabled:false 的条目被 loadRegistry 过滤掉，
+  // Stop 挑不到 —— 这时报 routable 就是界面说正常、实际发不出去。
+  return routableCount === 1 ? "routable" : "disabled";
+}
+
+const OUTBOUND_ROUTING_TEXT = {
+  degraded: "**绑定已降级** —— 项目内绑定在，但登记表里没有它，出站不会工作。"
+    + "跑 /feishu-bind 补登记（复用原话题，不新建）",
+  unknown: "说不清（登记表读不出来）—— 没查清，不代表没问题",
+  ambiguous: "**登记表里有多条这个项目** —— 出站挑哪一条不确定。先人工只保留一条",
+  disabled: "**登记表里这条是停用的** —— 出站会跳过它，答复发不出去",
+};
+
 export function composeLayeredStatus({
   st, others = [], endpoint, subscription, connectivity = null,
-  otherLinks = null, now = Date.now(),
+  otherLinks = null, outboundRouting = null, now = Date.now(),
 }) {
   // 别的链路里能归层的，直接进对应层；归不了的留给附录。
   const split = otherLinks ? splitByRelation(otherLinks.sections) : { byLayer: null, unsorted: [] };
@@ -264,6 +297,11 @@ export function composeLayeredStatus({
     ["入站", st.suspended ? "暂停中，话题里的指令一律被拒"
       : st.inboundBound ? "已绑定" : "还差一步：去话题里 @ 一下运输 agent"],
   ];
+  // **只在不正常的时候出这一行。**routable 是常态，天天报一句"正常"
+  // 会把真正需要注意的那两种淹掉。
+  if (outboundRouting !== null && outboundRouting !== "routable") {
+    L3.push(["出站路由", OUTBOUND_ROUTING_TEXT[outboundRouting]]);
+  }
   if (st.pendingGeneration !== null && st.pendingGeneration !== undefined) {
     L3.push(["待认领代际", "第 " + st.pendingGeneration + " 代" +
       (st.pendingGenerationExpiresAt ? "（截止 " + String(st.pendingGenerationExpiresAt).slice(0, 10) + "）" : "")]);

@@ -21,6 +21,73 @@ export function registryPath() {
 const stripTrailingSlash = (p) => (p.length > 1 && p.endsWith("/") ? p.replace(/\/+$/, "") : p);
 
 /**
+ * 项目 root 的规范形式。**只有这一份定义。**
+ *
+ * `/project/` 和 `/project` 是同一个项目，但字符串不等。两处各写一份归一化，
+ * 就会出现"前置检查说没有、运行时说有"——那正是一次漏判：登记表里是带斜杠的那条，
+ * 命令解析出来是不带的，两次都认为"没记录"，于是可能先建话题再新增一条逻辑重复记录。
+ */
+export const normalizeRoot = (root) => (typeof root === "string" && root.length > 0
+  ? stripTrailingSlash(path.resolve(root)) : null);
+
+/**
+ * 登记表里**精确**是这个项目的条目。目录包含关系不算 ——
+ * 父目录 /projects 不是 /projects/A。
+ *
+ * **注意它只回答"是不是这个项目"，不回答"能不能路由"。**
+ * `enabled: false` 的条目仍会被返回 —— 因为"有一条停用的记录"和"一条都没有"
+ * 是不同的状态，前者该说"停用了"，后者才该说"没登记"。
+ * 要判断能不能出站，用 routableProjectsForRoot。
+ */
+export function exactProjectsForRoot(projects, root) {
+  const want = normalizeRoot(root);
+  if (want === null) return [];
+  return (projects ?? []).filter((p) => normalizeRoot(p?.root) === want);
+}
+
+/**
+ * 精确是这个项目、**而且出站真的会挑到它**的条目。
+ *
+ * 分开这两个概念，是因为它们不一致时后果最难查：`enabled: false` 的记录被
+ * loadRegistry 过滤掉（Stop 挑不到它），而 bind 会把它算成"已经接入"、
+ * status 会算成 routable —— **界面明确报正常，实际不会出站**。
+ * 这跟登记表缺失那次是同一种病，只是换了个入口。
+ */
+export function routableProjectsForRoot(projects, root) {
+  return exactProjectsForRoot(projects, root).filter((p) => p?.enabled !== false);
+}
+
+/**
+ * 严格读登记表：**只有"文件不存在"算空表。**
+ *
+ * loadRegistry() 对钩子是对的 —— 绝大多数机器根本没接桥，读不到必须安静退出。
+ * 但对**要据此做判断或写入**的调用方（bind / status）不行：它把 EACCES、EISDIR
+ * 一律当成 no_registry，于是"读不出来"被当成了"没有"。
+ * 前者会让 bind 拿空表去覆盖一份读不出来的真表；后者会让 status 把"没查清"
+ * 报成"降级"。
+ *
+ * 抽到这里是因为 bind 和 status 各写一份就会再次分叉 —— 那是今天已经付过一次的代价。
+ */
+export function loadRegistryStrict(file = registryPath()) {
+  let raw;
+  try { raw = fs.readFileSync(file, "utf-8"); }
+  catch (err) {
+    if (err.code === "ENOENT") return { ok: true, file, projects: [], missing: true };
+    return { ok: false, reason: "unreadable", file, error: err.code + ": " + err.message };
+  }
+  let parsed;
+  try { parsed = JSON.parse(raw); }
+  catch (err) { return { ok: false, reason: "bad_json", file, error: err.message }; }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, reason: "bad_shape", file, error: "根节点不是对象" };
+  }
+  if (parsed.projects !== undefined && !Array.isArray(parsed.projects)) {
+    return { ok: false, reason: "bad_shape", file, error: "projects 不是数组" };
+  }
+  return { ok: true, file, raw: parsed, projects: parsed.projects ?? [] };
+}
+
+/**
  * 读登记表。读不到不是错误 —— 绝大多数机器/会话根本没接桥，
  * 那种情况必须安静返回空表，让钩子立刻退出。
  */
@@ -40,11 +107,26 @@ export function loadRegistry(file = registryPath()) {
     return { ok: false, reason: "bad_json", file, error: err.message, projects: [] };
   }
 
+  // **形状不对要跟坏 JSON 一样报出来，不能崩。**根节点是 null 时
+  // `parsed.projects` 直接抛 —— 而这个函数是钩子在用的，**崩在钩子里等于
+  // 整条出站无声消失**，比返回一个错误糟得多。
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, reason: "bad_shape", file, error: "根节点不是对象", projects: [] };
+  }
+  if (parsed.projects !== undefined && !Array.isArray(parsed.projects)) {
+    return { ok: false, reason: "bad_shape", file, error: "projects 不是数组", projects: [] };
+  }
+
   const projects = [];
   for (const p of parsed.projects ?? []) {
     if (!p || typeof p.root !== "string" || p.root.length === 0) continue;
     if (p.enabled === false) continue;
-    const root = stripTrailingSlash(p.root);
+    // **跟 normalizeRoot 用同一份规范化。**上一版这里只去尾斜杠，
+    // 而 bind/status 走 path.resolve —— 登记成 /a/../project 时两边结论不同：
+    // bind/status 说"已接入、可路由"，而 Stop 仍拿原路径匹配不到，
+    // **又回到"状态显示正常、出站静默失效"**。
+    const root = normalizeRoot(p.root);
+    if (root === null) continue;
     // 整条带过去，不再只挑 id / root。绑定信息（root_message_id / expires_at / name）
     // 现在就住在这一行里 —— 见 project-resolve.mjs。id 和 root 仍然由这里归一化，
     // 免得每个调用方各自去处理「没写 id」和「结尾多个斜杠」。
@@ -54,9 +136,11 @@ export function loadRegistry(file = registryPath()) {
 }
 
 export function isUnder(child, root) {
-  if (typeof child !== "string" || child.length === 0) return false;
-  const c = stripTrailingSlash(child);
-  return c === root || c.startsWith(root + "/");
+  // 两侧都过同一份规范化 —— 归属判断和 bind/status 的判断必须用同一个 root 契约。
+  const c = normalizeRoot(child);
+  const r = normalizeRoot(root);
+  if (c === null || r === null) return false;
+  return c === r || c.startsWith(r + "/");
 }
 
 /**

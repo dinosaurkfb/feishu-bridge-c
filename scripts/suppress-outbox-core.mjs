@@ -33,6 +33,15 @@ export const dependsOnMapping = (records) =>
  * @param readState        锁内调用：() => { activeGeneration, select(records) }
  * @param reason           抑制理由，写进记录
  */
+/**
+ * 这个值能不能当作「预览看到的代际」用。
+ *
+ * 两侧包装层都用它 —— 上一版 Codex 侧只拦 `null`，空串和纯空白就穿过去了，
+ * 到核心才被拒，最后在界面上显示成"取锁失败"。**同一个判据两处各写一份，
+ * 迟早在其中一处写松。**
+ */
+export const usableGeneration = (v) => typeof v === "string" && v.trim() !== "";
+
 export function applySuppressionCore({
   outboxDir, publishLockDir, generationLockDir, pending,
   previewGenerationId = null, readState, reason,
@@ -57,7 +66,7 @@ export function applySuppressionCore({
     // 空白串也算没给。放它过去的话，它会在下面被判成 rotated
     // （from: "   "）—— 结果同样是零抑制，但报出来的原因是错的：
     // 那不是"世界变了"，那是"这个值根本不是代际"。
-    if (typeof previewGenerationId !== "string" || previewGenerationId.trim() === "") {
+    if (!usableGeneration(previewGenerationId)) {
       return { ok: false, reason: "generation_expectation_required" };
     }
     const got = acquirePublishLock(generationLockDir);

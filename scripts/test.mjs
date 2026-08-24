@@ -10440,6 +10440,78 @@ test("Claude 真实入口：预览 → 轮转 → 带旧 expectation 落盘，�
     "代际锁也要还回去");
 });
 
+test("真实 CLI：缺 expectation / 纯空白 / 代际不可读，三种都不许说成取锁失败或轮转", () => {
+  // 评审实测出来的：核心把三类原因分清了（绑定解析不出来、缺 expectation、
+  // 真的轮转了），**到了界面又混回一句"取锁失败"**。
+  // 这正是"同一个概念一处分清、另一处混回去"，仓库里已经栽过一次。
+  const mk = () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-why-"));
+    const inbound = path.join(dir, ".runtime-data", "inbound");
+    const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+    fs.mkdirSync(inbound, { recursive: true });
+    fs.mkdirSync(obDir, { recursive: true });
+    fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+      project_dir: dir, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+    fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
+      kind: "progress", text: "旧格式", published_at: null }));
+    return { dir, inbound, obDir };
+  };
+  const bound = (inbound, g) => fs.writeFileSync(path.join(inbound, "active-mapping.json"),
+    JSON.stringify({ status: "active", root_message_id: "om_" + g,
+      feishu_root_message_id_reference: "om_" + g, claude_session_id: null,
+      channel_generation_id: g }));
+  const cli = (dir, args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir, ...args,
+  ], { encoding: "utf-8" });
+  const untouched = (obDir) =>
+    JSON.parse(fs.readFileSync(path.join(obDir, "0001.json"), "utf-8")).publish_suppressed_at;
+
+  // ① 完全不给
+  {
+    const { dir, inbound, obDir } = mk();
+    bound(inbound, "gen-1");
+    const r = cli(dir, ["--apply", "--reason", "t"]);
+    assert.notEqual(r.status, 0, "缺 expectation 必须非零退出");
+    assert.match(r.stderr, /--expect-generation/u, "要说清缺的是什么、怎么补");
+    assert.doesNotMatch(r.stderr, /取锁失败/u, "**这不是取锁失败**");
+    assert.doesNotMatch(r.stderr, /轮转/u, "也没有发生轮转");
+    assert.equal(untouched(obDir), undefined, "零抑制");
+    assert.equal(fs.existsSync(path.join(dir, ".runtime-data", "outbound", "publish.lock")),
+      false, "拒绝发生在拿锁之前");
+    assert.equal(fs.existsSync(path.join(inbound, "topic-generation.lock")), false,
+      "代际锁也没拿");
+  }
+
+  // ② 纯空白 —— 上一版它会穿过包装层，最后被报成"轮转"（from: "   "）
+  {
+    const { dir, inbound, obDir } = mk();
+    bound(inbound, "gen-1");
+    const r = cli(dir, ["--apply", "--reason", "t", "--expect-generation", "   "]);
+    assert.notEqual(r.status, 0, "纯空白必须非零退出");
+    assert.match(r.stderr, /--expect-generation/u);
+    assert.doesNotMatch(r.stderr, /取锁失败/u, "**这不是取锁失败**");
+    assert.doesNotMatch(r.stderr, /轮转/u, "空白串不是「世界变了」，是这个值根本不是代际");
+    assert.equal(untouched(obDir), undefined, "零抑制");
+    assert.equal(fs.existsSync(path.join(dir, ".runtime-data", "outbound", "publish.lock")),
+      false, "拒绝发生在拿锁之前");
+  }
+
+  // ③ 代际读不出来 —— 预览不许印一个能复制的假值
+  {
+    const { dir, inbound, obDir } = mk();          // 不写 active-mapping.json
+    const preview = cli(dir, []);
+    assert.equal(preview.status, 0, preview.stderr);
+    assert.doesNotMatch(preview.stdout, /--apply --expect-generation \S/u,
+      "**读不出代际时不许给出可复制的参数** —— 照抄之后会被误报成轮转");
+    assert.match(preview.stdout, /读不出当前代际/u, "要直说是代际读不出来");
+    const r = cli(dir, ["--apply", "--reason", "t"]);
+    assert.notEqual(r.status, 0);
+    assert.doesNotMatch(r.stderr, /取锁失败/u, "**这不是取锁失败**");
+    assert.doesNotMatch(r.stderr, /轮转/u, "没有轮转");
+    assert.equal(untouched(obDir), undefined, "零抑制");
+  }
+});
+
 test("核心不变量：旧格式记录缺 expectation 一律拒绝，两侧包装层都无权豁免", () => {
   // **这条直接打核心，不经任何 CLI。**两个包装层各自也有一道前置检查，
   // 于是把核心这道守卫拆掉时，走 CLI 的测试照样绿 —— 包装层先拦下了。

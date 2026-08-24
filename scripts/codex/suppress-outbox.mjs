@@ -23,7 +23,7 @@ import path from "node:path";
 
 import { isDirectRun } from "../direct-run.mjs";
 import { listPending } from "../outbox.mjs";
-import { applySuppressionCore, dependsOnMapping } from "../suppress-outbox-core.mjs";
+import { applySuppressionCore, dependsOnMapping, usableGeneration } from "../suppress-outbox-core.mjs";
 import { activeGeneration, pendingGeneration } from "../topic-generation.mjs";
 import {
   bridgeHome, findTaskForCodexThread, loadRegistry, registryFile,
@@ -213,9 +213,14 @@ function main() {
   console.log("也**不会**因为重新绑定或轮转话题而自动回来。");
   if (!apply) {
     console.log("\n[dry-run] 什么都没写。");
-    if (needsExpect) {
+    if (needsExpect && !usableGeneration(nowGeneration)) {
+      // **不许打印一个能复制的假值。**上一版这里印 `<读不出代际>`，人照抄之后
+      // 它当然对不上，于是被报成"发生轮转" —— 而根本没轮转，是代际读不出来。
+      console.log("这批里有旧格式记录（代际靠当前状态现算），**但现在读不出当前代际**。");
+      console.log("这种状态下没有可信的代际依据，落盘会被拒 —— 先确认这条 task 的状态。");
+    } else if (needsExpect) {
       console.log("这批里有旧格式记录（代际靠当前状态现算）。落盘要带上现在这一代：");
-      console.log("  --apply --expect-generation " + (nowGeneration ?? "<读不出代际>"));
+      console.log("  --apply --expect-generation " + nowGeneration);
       console.log("**带它是为了让「预览之后轮转过」拦得住** —— 两次运行之间轮转了，");
       console.log("这个值就对不上，命令会中止而不是按旧代际停错东西。");
     } else {
@@ -223,13 +228,11 @@ function main() {
     }
     return;
   }
-  if (needsExpect && expectGeneration === null) {
-    console.error("这批里有旧格式记录，--apply 必须带 --expect-generation <代际 id>。");
-    console.error("  先跑一次预览，它会把该带的值打出来。");
-    console.error("  **不带它的话，「预览之后轮转过」这件事拦不住** —— 两次运行各算各的。");
-    process.exit(1);
-  }
-
+  // **这里不再自己判一次「有没有带 expectation」。**
+  //
+  // 上一版在这儿拦了一道，结果有两个：一是只拦 null，空串和纯空白穿了过去；
+  // 二是核心那条 generation_expectation_required 分支永远走不到，界面上就只剩
+  // 兜底的"取锁失败"。判定归核心一处，这里只负责把它说清楚。
   const r = applySuppressionCore({
     outboxDir: paths.outbox,
     publishLockDir: paths.publishLock,
@@ -260,6 +263,10 @@ function main() {
       : r.reason === "drift"
         ? "outbox 在预览之后变了（" + r.before + " → " + r.now +
           " 条待发，或换了内容），没有动它。请重新预览确认。"
+      : r.reason === "generation_expectation_required"
+        ? "这批待发里有旧格式记录（代际靠当前状态现算），落盘必须带上预览看到的那一代。\n" +
+          "  先重新跑一次预览，把它打出来的 --expect-generation <代际 id> 原样带上。\n" +
+          "  一条都没动，锁也一把都没拿 —— 缺的只是这个参数。"
         : "取锁失败（" + r.reason + "），没有动 outbox。");
     process.exitCode = 1;
     return;

@@ -31,7 +31,7 @@ import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { topicGenerationLockDir } from "./topic-generation-store.mjs";
 import { currentBinding } from "./feishu-control.mjs";
-import { applySuppressionCore, dependsOnMapping } from "./suppress-outbox-core.mjs";
+import { applySuppressionCore, dependsOnMapping, usableGeneration } from "./suppress-outbox-core.mjs";
 
 const nonEmptyStr = (v) => typeof v === "string" && v.length > 0;
 
@@ -191,9 +191,14 @@ function main() {
 
   if (!apply) {
     console.log("\n[dry-run] 什么都没写。");
-    if (needsExpect) {
+    if (needsExpect && !usableGeneration(nowGeneration)) {
+      // **不许打印一个能复制的假值。**上一版这里印 `<读不出代际>`，人照抄之后
+      // 它当然对不上，于是被报成"发生轮转" —— 而根本没轮转，是代际读不出来。
+      console.log("这批里有旧格式记录（代际靠当前状态现算），**但现在读不出当前代际**。");
+      console.log("这种状态下没有可信的代际依据，落盘会被拒 —— 先确认绑定是否正常。");
+    } else if (needsExpect) {
       console.log("这批里有旧格式记录（代际靠当前状态现算）。落盘要带上现在这一代：");
-      console.log("  --apply --expect-generation " + (nowGeneration ?? "<读不出代际>"));
+      console.log("  --apply --expect-generation " + nowGeneration);
       console.log("**带它是为了让「预览之后轮转过」拦得住** —— 两次运行之间轮转了，");
       console.log("这个值就对不上，命令会中止而不是按旧代际停错东西。");
     } else {
@@ -221,6 +226,10 @@ function main() {
       : r.reason === "drift"
         ? "outbox 在预览之后变了（" + r.before + " → " + r.now +
           " 条待发，或换了内容），没有动它。请重新预览确认。"
+      : r.reason === "generation_expectation_required"
+        ? "这批待发里有旧格式记录（代际靠当前绑定推算），落盘必须带上预览看到的那一代。\n" +
+          "  先重新跑一次预览，把它打出来的 --expect-generation <代际 id> 原样带上。\n" +
+          "  一条都没动，锁也一把都没拿 —— 缺的只是这个参数。"
         : "取锁失败（" + r.reason + "），没有动 outbox。");
     process.exitCode = 1;
     return;

@@ -2511,6 +2511,78 @@ test("Codex 抑制命令：默认只预览，参数拼错不许被当成别的�
   }
 });
 
+test("Codex 真实 CLI：缺 expectation / 纯空白 / 代际不可读，都不许说成取锁失败或轮转", () => {
+  // 跟 Claude 侧同一条要求：核心分清的三类原因，到界面上不许又混成一句
+  // "取锁失败"。上一版 Codex 侧还多一个毛病 —— 包装层只拦 null，
+  // 空串和纯空白穿到核心，界面就只剩兜底那句。
+  const mk = (withState) => {
+    const home = temp();
+    const root = path.join(home, "project");
+    fs.mkdirSync(root, { recursive: true });
+    const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Sup",
+      rootMessageId: "om_root", token: "abc123" });
+    // **删掉状态是造不出「读不出代际」的** —— 它会从 task 现合成一份。
+    // 要让 topicStateForTask 真的失败，得给一份结构上就不合法的状态。
+    if (!withState) task.topic_generation_state = { generations: "not-an-array" };
+    fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+    writeRegistry([task], path.join(home, "registry.json"));
+    const paths = taskPaths(task, home);
+    fs.mkdirSync(paths.outbox, { recursive: true });
+    const rec = path.join(paths.outbox, "0001.json");
+    // 旧格式：没有 target_channel_generation_id。
+    fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "旧格式", published_at: null }));
+    return { home, rec };
+  };
+  const cliPath = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
+  const run = (home, ...args) => spawnSync(process.execPath,
+    [cliPath, "--thread-id", THREAD_A, ...args],
+    { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  const untouched = (rec) =>
+    JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at;
+
+  // ① 完全不给
+  {
+    const { home, rec } = mk(true);
+    const r = run(home, "--all-generations", "--apply", "--reason", "t");
+    assert.notEqual(r.status, 0, "缺 expectation 必须非零退出");
+    assert.match(r.stderr, /--expect-generation/u, "要说清缺的是什么、怎么补");
+    assert.doesNotMatch(r.stderr, /取锁失败/u, "**这不是取锁失败**");
+    assert.doesNotMatch(r.stderr, /轮转/u, "也没有发生轮转");
+    assert.equal(untouched(rec), undefined, "零抑制");
+    assert.equal(fs.existsSync(path.join(home, "registry.lock")), false,
+      "拒绝发生在拿锁之前 —— 代际锁没拿");
+  }
+
+  // ② 纯空白
+  {
+    const { home, rec } = mk(true);
+    const r = run(home, "--all-generations", "--apply", "--reason", "t",
+      "--expect-generation", "   ");
+    assert.notEqual(r.status, 0, "纯空白必须非零退出");
+    assert.match(r.stderr, /--expect-generation/u);
+    assert.doesNotMatch(r.stderr, /取锁失败/u, "**这不是取锁失败**");
+    assert.doesNotMatch(r.stderr, /轮转/u, "空白串不是「世界变了」，是这个值根本不是代际");
+    assert.equal(untouched(rec), undefined, "零抑制");
+    assert.equal(fs.existsSync(path.join(home, "registry.lock")), false,
+      "拒绝发生在拿锁之前");
+  }
+
+  // ③ 代际读不出来 —— 预览不许印一个能复制的假值
+  {
+    const { home, rec } = mk(false);
+    const preview = run(home, "--all-generations");
+    assert.equal(preview.status, 0, preview.stderr);
+    assert.doesNotMatch(preview.stdout, /--apply --expect-generation \S/u,
+      "**读不出代际时不许给出可复制的参数** —— 照抄之后会被误报成轮转");
+    assert.match(preview.stdout, /读不出当前代际/u, "要直说是代际读不出来");
+    const r = run(home, "--all-generations", "--apply", "--reason", "t");
+    assert.notEqual(r.status, 0);
+    assert.doesNotMatch(r.stderr, /取锁失败/u, "**这不是取锁失败**");
+    assert.doesNotMatch(r.stderr, /轮转/u, "没有轮转");
+    assert.equal(untouched(rec), undefined, "零抑制");
+  }
+});
+
 test("Codex 抑制命令：真实入口 —— 预览后轮转必须 rotated 且零抑制", () => {
   // 评审指出：上一版的 readState 闭包引用了**加锁前**读到的 task ——
   // 我为共用核心设计了"锁内怎么重读"这个接口，**然后在实现它的时候把旧值闭包了进去**。

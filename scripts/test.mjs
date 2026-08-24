@@ -182,19 +182,41 @@ import {
 } from "./automatic-topic-rotation.mjs";
 
 /**
- * **整个套件用一个临时登记表，谁都够不到本机控制面。**
+ * **整个套件无条件用一个临时登记表。**
  *
- * 评审在他的机器上跑出 498/502，而我这边 502/502 —— 差别不在代码：有些夹具是
- * 未绑定的临时目录，锁路径会一路落到 `~/.claude/feishu-bridge/registry.lock`，
- * 也就是**本机真实的**控制面锁。测试跑一次碰一次，结果自然随机器而变。
+ * 上一版写的是"环境变量没设过才设" —— 那是**条件性隔离**：开发机上只要
+ * FEISHU_BRIDGE_REGISTRY 已经指向生产登记表，套件就会接着用它，
+ * 于是测试仍会去竞争旁边那把真实的 registry.lock。
+ * 末尾那条"不许落在 HOME 里"的断言发现得太晚 —— 那时控制面已经被碰过了。
  *
- * registryPath() 在调用时读这个环境变量，spawn 出去的子进程也继承它，
- * 所以在这里设一次就够。已经显式设过的（比如从外面指定）不覆盖。
+ * 现在：产品环境变量一律被覆盖，不当测试注入口。确实需要指定路径时用**测试专用**
+ * 的 FEISHU_BRIDGE_TEST_REGISTRY，而且**在任何一条测试跑起来之前**就验它，
+ * 指向生产路径或 HOME 里的任何位置一律拒绝启动。
  */
-if (!process.env.FEISHU_BRIDGE_REGISTRY) {
-  process.env.FEISHU_BRIDGE_REGISTRY = path.join(
-    fs.mkdtempSync(path.join(os.tmpdir(), "bridge-test-registry-")), "registry.json");
+function chooseTestRegistry({ override, home }) {
+  if (override === undefined || override === null || override === "") {
+    return { ok: true, kind: "temp" };
+  }
+  const abs = path.resolve(override);
+  if (abs === path.join(home, ".claude", "feishu-bridge", "registry.json")) {
+    return { ok: false, reason: "production" };
+  }
+  if (abs === home || abs.startsWith(home + path.sep)) return { ok: false, reason: "inside_home" };
+  return { ok: true, kind: "override", path: abs };
 }
+
+const chosenRegistry = chooseTestRegistry({
+  override: process.env.FEISHU_BRIDGE_TEST_REGISTRY, home: os.homedir(),
+});
+if (!chosenRegistry.ok) {
+  console.error("拒绝运行：FEISHU_BRIDGE_TEST_REGISTRY 指向" +
+    (chosenRegistry.reason === "production" ? "生产登记表" : " HOME 里的路径") +
+    " —— 测试不许碰本机控制面。");
+  process.exit(2);
+}
+process.env.FEISHU_BRIDGE_REGISTRY = chosenRegistry.kind === "temp"
+  ? path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-test-registry-")), "registry.json")
+  : chosenRegistry.path;
 
 let passed = 0;
 let failed = 0;
@@ -9025,6 +9047,39 @@ test("预览后发生轮转要中止 —— 文件一个没变也不行", () => 
     "代际锁也要还回去");
 });
 
+test("每条都自带代际时，轮转不该拦住抑制", () => {
+  // 轮转只会改变**旧格式记录**的归属。每条都写明了目标代际时，
+  // 轮转前后它们属于谁都没变 —— 这时再中止，就是在拒绝一件本来安全的事。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-nolegacy-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  const writeMapping = (g) => fs.writeFileSync(path.join(inbound, "active-mapping.json"),
+    JSON.stringify({ status: "active", root_message_id: "om_" + g,
+      feishu_root_message_id_reference: "om_" + g, claude_session_id: null,
+      channel_generation_id: g }));
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  writeMapping("gen-1");
+  const rec = path.join(obDir, "0001.json");
+  // **自带代际**，不靠 mapping 推算。
+  fs.writeFileSync(rec, JSON.stringify({
+    kind: "progress", text: "新格式", published_at: null, target_channel_generation_id: "gen-1" }));
+
+  const all = listPending({ outboxDir: obDir });
+  writeMapping("gen-2");                                  // 预览之后轮转
+
+  const got = applySuppression({
+    outboxDir: obDir, root: dir, session: null, pending: all,
+    generation: null, previewGenerationId: "gen-1", reason: "t",
+  });
+  assert.equal(got.ok, true, "没有旧格式记录时轮转不该拦：" + (got.reason ?? ""));
+  assert.equal(got.done.changed, 1);
+  // 也不该去动代际锁。
+  assert.equal(fs.existsSync(path.join(inbound, "topic-generation.lock")), false);
+});
+
 test("轮转正在进行时不动 outbox，两把锁的顺序固定", () => {
   // 加锁顺序固定为「代际锁 → 发布锁」。反向顺序在仓库里不存在
   // （排空与发布只取发布锁，且不动代际），所以不会死锁。
@@ -9088,6 +9143,30 @@ test("未绑定的项目不许被报成「轮转中」，也不许去碰本机�
   assert.equal(fs.existsSync(real), false, "跑测试不许在本机控制面上留下锁");
 });
 
+test("登记表的选择在跑测试之前就定死，且拒绝一切指向本机的路径", () => {
+  // 这条守的是隔离**决定本身**，不是决定的结果。上一版只在末尾断言
+  // "登记表不在 HOME 里" —— 那时该碰的已经碰过了。
+  const home = "/Users/someone";
+  const prod = path.join(home, ".claude", "feishu-bridge", "registry.json");
+
+  // 不指定 → 临时表。空串也算不指定，不许被当成"指定了一个相对路径"。
+  for (const none of [undefined, null, ""]) {
+    assert.equal(chooseTestRegistry({ override: none, home }).kind, "temp", JSON.stringify(none));
+  }
+  // 指向生产登记表 → 拒绝启动，而且要说清是哪一种。
+  assert.deepEqual(chooseTestRegistry({ override: prod, home }), { ok: false, reason: "production" });
+  // HOME 里的任何位置都不行 —— 不只是生产那一个文件。
+  for (const inside of [home, path.join(home, "x.json"), path.join(home, "a", "b", "r.json")]) {
+    assert.equal(chooseTestRegistry({ override: inside, home }).reason, "inside_home", inside);
+  }
+  // 名字以 HOME 开头但不是 HOME 下的目录，不该被误伤。
+  assert.equal(chooseTestRegistry({ override: home + "-other/r.json", home }).ok, true);
+  // HOME 之外可以显式指定。
+  const out = chooseTestRegistry({ override: "/tmp/t/r.json", home });
+  assert.equal(out.kind, "override");
+  assert.equal(out.path, "/tmp/t/r.json");
+});
+
 test("测试进程用的是临时登记表，够不到本机控制面", () => {
   // 这条守的是整个套件的隔离前提。**它一旦失效，别的测试就会开始随机器而变红**，
   // 而那种红看起来像是代码坏了。
@@ -9095,6 +9174,9 @@ test("测试进程用的是临时登记表，够不到本机控制面", () => {
   assert.ok(used, "套件必须显式指定登记表");
   assert.equal(used.startsWith(os.homedir()), false,
     "登记表落在了 HOME 里：" + used);
+  // **产品环境变量不是测试注入口。**外面设了也一律被覆盖 ——
+  // 只有测试专用那个才有发言权，而它在启动前就验过了。
+  assert.notEqual(used, path.join(os.homedir(), ".claude", "feishu-bridge", "registry.json"));
   assert.equal(topicGenerationLockDir({ source: undefined, root: "/tmp/x" }), null,
     "说不清是哪种绑定时不许给出锁路径 —— 那会一路落到全局 registry.lock");
   assert.equal(topicGenerationLockDir({ source: "registry", root: "/tmp/x" })

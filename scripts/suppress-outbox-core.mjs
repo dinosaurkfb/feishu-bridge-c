@@ -128,6 +128,19 @@ export function applySuppressionCore({
         from: previewGenerationId, to: state.activeGeneration ?? null };
     }
     const fresh = state.select(listPending({ outboxDir }));
+    // **锁内重读之后要再判一次损坏，不能只比文件名。**
+    //
+    // 锁外那次判的是预览快照。同一个文件的目标代际在预览之后变坏时，
+    // 文件名集合一个字节没变，集合 CAS 一路放行 ——
+    // 于是一条我们已经说不清该发去哪的内容被永久抑制。评审实测复现。
+    //
+    // 这跟"锁内重读却闭包了旧值"是同一类：接口留了重读，实现只拿它比了文件名。
+    const corruptNow = corruptTargets(fresh);
+    if (corruptNow.length > 0) {
+      return { ok: false, reason: "corrupt_target_generation",
+        count: corruptNow.length, files: corruptNow.map((r) => r?._file ?? null),
+        atRecheck: true };
+    }
     // **比集合，不是比数量。**只比条数挡不住等量替换：预览之后少一条旧的、
     // 多一条新的，总数没变，就会不可逆地抑制另一批内容。
     const before = new Set(pending.map((x) => x._file));

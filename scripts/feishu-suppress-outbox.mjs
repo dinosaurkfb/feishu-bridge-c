@@ -200,6 +200,18 @@ function main() {
 
   if (!apply) {
     console.log("\n[dry-run] 什么都没写。");
+    // **预览必须先说损坏。**上一版这里不查 corrupt：预览退出 0 还说
+    // "每条都自带代际，轮转不影响它们"，加 --apply 才报损坏并拒绝 ——
+    // **安全的预览和真实执行给出了相反的结论**，而预览正是人用来做决定的那一步。
+    const broken = corruptTargets(pending);
+    if (broken.length > 0) {
+      console.log("这批里有 " + broken.length + " 条记录的目标代际是坏的" +
+        "（字段在，但不是可用代际）：");
+      for (const b of broken) console.log("  " + String(b?._file ?? "?").split("/").pop());
+      console.log("**加 --apply 也不会动它们** —— 整批都会被拒。");
+      console.log("先确认这几条记录是怎么写坏的 —— 说不清它该发去哪，就不能替它决定不发。");
+      return;
+    }
     if (needsExpect && !usableGeneration(nowGeneration)) {
       // **不许打印一个能复制的假值。**上一版这里印 `<读不出代际>`，人照抄之后
       // 它当然对不上，于是被报成"发生轮转" —— 而根本没轮转，是代际读不出来。

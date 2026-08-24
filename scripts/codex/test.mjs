@@ -2679,6 +2679,67 @@ test("locateTask 的 task-key 分支必须读 home 那一份登记表", () => {
   }
 });
 
+test("Codex 预览和 --apply 不许给出相反结论：损坏记录在预览里就要点名", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Sup",
+    rootMessageId: "om_root", token: "abc123" });
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  writeRegistry([task], path.join(home, "registry.json"));
+  const paths = taskPaths(task, home);
+  fs.mkdirSync(paths.outbox, { recursive: true });
+  const rec = path.join(paths.outbox, "0001.json");
+  fs.writeFileSync(rec, JSON.stringify({ kind: "milestone", text: "坏的",
+    published_at: null, target_channel_generation_id: "   " }));
+  const cliPath = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
+  const run = (...args) => spawnSync(process.execPath,
+    [cliPath, "--thread-id", THREAD_A, ...args],
+    { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+
+  const preview = run("--all-generations");
+  assert.match(preview.stdout, /目标代际是坏的/u, "预览就要点名损坏");
+  assert.match(preview.stdout, /0001\.json/u, "要说清是哪个文件");
+  assert.doesNotMatch(preview.stdout, /每条都自带代际/u,
+    "**这是错的判断** —— 它的目标字段在，但不是代际");
+
+  const r = run("--all-generations", "--apply", "--reason", "t");
+  assert.notEqual(r.status, 0, "预览说会拒，真跑就必须拒");
+  assert.match(r.stderr, /目标代际是坏的/u);
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
+    "零抑制");
+});
+
+test("锁内重读要重判损坏：文件名一个没变，目标字段变坏也必须中止", () => {
+  // 评审实测复现的：锁外判的是**预览快照**。同一个文件的目标代际在预览之后
+  // 变坏时，文件名集合一个字节没变，集合 CAS 一路放行 ——
+  // 于是一条已经说不清该发去哪的内容被永久抑制。
+  //
+  // 这跟"锁内重读却闭包了旧值"是同一类：接口留了重读，实现只拿它比了文件名。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-relock-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const rec = path.join(obDir, "0001.json");
+  // **磁盘上已经是坏的**，而预览快照记的是好的 gen-1。
+  fs.writeFileSync(rec, JSON.stringify({ kind: "milestone", text: "x",
+    published_at: null, target_channel_generation_id: "   " }));
+
+  const got = applySuppressionCore({
+    outboxDir: obDir, publishLockDir: path.join(dir, "pub.lock"),
+    generationLockDir: path.join(dir, "gen.lock"),
+    pending: [{ _file: rec, target_channel_generation_id: "gen-1" }],
+    previewGenerationId: "gen-1",
+    readState: () => ({ activeGeneration: "gen-1", select: (x) => x }),
+    reason: "t",
+  });
+
+  assert.equal(got.ok, false, "锁内重读必须发现它变坏了");
+  assert.equal(got.reason, "corrupt_target_generation");
+  assert.equal(got.atRecheck, true, "要说清是锁内重判时发现的，不是锁外那一次");
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
+    "**零抑制** —— 说不清该发去哪，就不能替它决定不发");
+});
+
 test("空白目标代际是损坏记录 —— Codex 侧守着同一条三态判定", () => {
   // 判据分家的后果两条链是共享的：核心一放松，两边同时漏。
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-corrupt-"));

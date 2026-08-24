@@ -10535,6 +10535,73 @@ test("写入端不许写出损坏记录：空白目标代际等同于没有目�
   assert.equal(read("gen-1"), "gen-1", "可用代际要原样冻结住");
 });
 
+test("预览和 --apply 不许给出相反结论：损坏记录在预览里就要点名", () => {
+  // 评审实测：预览退出 0，还说"每条都自带代际，轮转不影响它们"；
+  // 加 --apply 才报损坏并拒绝。**安全的那一步给了错的结论**，
+  // 而预览正是人用来做决定的那一步 —— 照着它做决定就是照着错的做。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-preview-corrupt-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_x", feishu_root_message_id_reference: "om_x",
+    claude_session_id: null, channel_generation_id: "gen-1" }));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
+    kind: "milestone", text: "坏的", published_at: null,
+    target_channel_generation_id: "   " }));
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir, ...args,
+  ], { encoding: "utf-8" });
+
+  const preview = cli([]);
+  assert.match(preview.stdout, /目标代际是坏的/u, "预览就要点名损坏");
+  assert.match(preview.stdout, /0001\.json/u, "要说清是哪个文件");
+  assert.doesNotMatch(preview.stdout, /每条都自带代际/u,
+    "**这是错的判断** —— 它的目标字段在，但不是代际");
+  assert.doesNotMatch(preview.stdout, /--apply --expect-generation/u,
+    "不许给出一个照抄之后也不会成功的命令");
+
+  // 预览说会被拒，--apply 就必须真的拒 —— 两步结论要一致。
+  const r = cli(["--apply", "--reason", "t"]);
+  assert.notEqual(r.status, 0, "预览说会拒，真跑就必须拒");
+  assert.match(r.stderr, /目标代际是坏的/u);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(obDir, "0001.json"), "utf-8"))
+    .publish_suppressed_at, undefined, "零抑制");
+});
+
+test("锁内重读要重判损坏：文件名一个没变，目标字段变坏也必须中止", () => {
+  // 评审实测复现的：锁外判的是**预览快照**。同一个文件的目标代际在预览之后
+  // 变坏时，文件名集合一个字节没变，集合 CAS 一路放行 ——
+  // 于是一条已经说不清该发去哪的内容被永久抑制。
+  //
+  // 这跟"锁内重读却闭包了旧值"是同一类：接口留了重读，实现只拿它比了文件名。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-relock-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const rec = path.join(obDir, "0001.json");
+  // **磁盘上已经是坏的**，而预览快照记的是好的 gen-1。
+  fs.writeFileSync(rec, JSON.stringify({ kind: "milestone", text: "x",
+    published_at: null, target_channel_generation_id: "   " }));
+
+  const got = applySuppressionCore({
+    outboxDir: obDir, publishLockDir: path.join(dir, "pub.lock"),
+    generationLockDir: path.join(dir, "gen.lock"),
+    pending: [{ _file: rec, target_channel_generation_id: "gen-1" }],
+    previewGenerationId: "gen-1",
+    readState: () => ({ activeGeneration: "gen-1", select: (x) => x }),
+    reason: "t",
+  });
+
+  assert.equal(got.ok, false, "锁内重读必须发现它变坏了");
+  assert.equal(got.reason, "corrupt_target_generation");
+  assert.equal(got.atRecheck, true, "要说清是锁内重判时发现的，不是锁外那一次");
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
+    "**零抑制** —— 说不清该发去哪，就不能替它决定不发");
+});
+
 test("空白目标代际是损坏记录：不许当自带代际放行，也不许当旧格式重新解释", () => {
   // 评审实测复现的：判据分家 —— 核心的 expectation 检查收紧成 trim() 之后，
   // dependsOnMapping 还留在 length > 0 上。于是 target_channel_generation_id: "   "

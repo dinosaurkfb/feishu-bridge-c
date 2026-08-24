@@ -9013,6 +9013,80 @@ test("补登记必须 fail-closed：读不出来的登记表不许被空表覆�
   assert.equal(JSON.parse(raw()).projects.length, 1);
 });
 
+test("锁内一律不 exit —— 每条退出路径跑完锁都得还回去", () => {
+  // **这个坑我踩过两次。**`process.exit()` 会跳过 finally，锁就漏了；
+  // 上一版补登记的锁内有四条 exit 路径（重读失败、同 root 多条、别人刚补好、写盘失败）。
+  // 现在锁内只返回结果，退出码和输出全在锁释放之后 —— 这条逐个验。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-lockleak2-"));
+  const proj = path.join(dir, "proj");
+  const inbound = path.join(proj, ".runtime-data", "inbound");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: proj, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_existing",
+    feishu_root_message_id_reference: "om_existing", channel_generation_id: "gen-4" }));
+  const reg = path.join(dir, "registry.json");
+  const tpl = path.join(dir, "chain-config.json");
+  fs.writeFileSync(tpl, JSON.stringify(TPL));
+  const bind = () => spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, "--apply",
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: reg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: dir } });
+  const lockDir = topicGenerationLockDir({ source: "registry", registryFile: reg, root: proj });
+  const noLock = (what) => assert.equal(fs.existsSync(lockDir), false, what + " 之后锁没还回去");
+
+  // ① 同 root 多条 → 拒绝
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "a", root: proj }, { id: "b", root: proj }] }));
+  assert.equal(bind().status, 1);
+  noLock("同 root 多条被拒");
+
+  // ② 锁内发现别人已经补好了 → 什么都不做
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "done", root: proj, root_message_id: "om_existing" }] }));
+  const already = bind();
+  assert.equal(already.status, 0, already.stderr);
+  assert.match(already.stdout, /已经接入过了|已经登记好了/u);
+  noLock("发现别人已补好");
+
+  // ③ 写盘失败 → 非零退出。把登记表所在目录设成只读来造这个失败。
+  const roDir = path.join(dir, "ro");
+  fs.mkdirSync(roDir, { recursive: true });
+  const roReg = path.join(roDir, "registry.json");
+  fs.writeFileSync(roReg, JSON.stringify({ schema_version: "1.0", projects: [] }));
+  fs.chmodSync(roDir, 0o500);
+  const roLock = topicGenerationLockDir({ source: "registry", registryFile: roReg, root: proj });
+  const failed = spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, "--apply",
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: roReg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: dir } });
+  fs.chmodSync(roDir, 0o700);
+  assert.notEqual(failed.status, 0, "写不进去就要非零退出");
+  assert.equal(fs.existsSync(roLock), false, "写盘失败之后锁也得还回去");
+});
+
+test("登记表的写入口只有一个 —— 建话题那条路径也走同一笔事务", () => {
+  // 评审指出：上一版只有补登记分支进了锁，**正常新建绑定仍在锁外整体写回**，
+  // 跟补登记并发时照样互相覆盖 —— 那样"登记表控制锁"就只是名义上的。
+  //
+  // 行为上不好造并发，所以这里钉住"文件里没有第二条写回路径"：
+  // 整体写回 registry 的语句只许出现在事务函数里。
+  const src = fs.readFileSync(path.resolve("scripts", "bind-project.mjs"), "utf-8");
+  // 用"原子重命名到登记表文件"当锚点 —— 那是真正提交写入的那一步，
+  // 比匹配变量名稳（变量可能叫 registry，也可能叫 fresh.registry）。
+  const writes = [...src.matchAll(/renameSync\(tmp, regFile\)/gu)];
+  assert.equal(writes.length, 1, "登记表写回只许有一处（在事务函数里），实际 " + writes.length + " 处");
+  const inTx = src.indexOf("function withRegistryTransaction");
+  const txEnd = src.indexOf("\n}\n", src.indexOf("} finally {", inTx));
+  assert.ok(writes[0].index > inTx && writes[0].index < txEnd,
+    "那唯一一处必须在 withRegistryTransaction 里面");
+  // 两条路径都用它。
+  // 数**调用点**，别把函数定义也数进去（第一版就是这么多算了一处）。
+  const calls = (src.match(/=\s*withRegistryTransaction\(\{/gu) ?? []).length;
+  assert.equal(calls, 2, "补登记和新建绑定都要走同一个入口，实际 " + calls + " 处调用");
+});
+
 test("补登记要在锁内重读；同 root 多条拒绝，单条残缺就地修", () => {
   // 另外两条 P1：上一版拿锁外那份快照直接 push —— 并发的绑定或迁移会被整体覆盖；
   // 而且同 root 但缺 root_message_id 的条目会被再 push 一条，**制造重复归属**。

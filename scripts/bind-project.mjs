@@ -95,6 +95,44 @@ function loadRegistryStrict(file) {
   return { ok: true, registry: parsed };
 }
 
+/**
+ * **这个 CLI 里所有登记表写入的唯一入口。**
+ *
+ * 两条要求合在一处：
+ *
+ *   · 锁内重读、校验、更新、原子写 —— 拿锁外那份快照写回去，
+ *     并发的另一个 binder 就会被整体覆盖。
+ *   · **锁内一律不 exit、不 die。**`process.exit()` 会跳过 finally，锁就漏了 ——
+ *     这个坑我在抑制命令上踩过一次，这里又踩了一次：上一版锁内有四条 exit 路径。
+ *     所以这里只返回结果，退出码和输出全部由调用方在锁释放之后处理。
+ *
+ * mutate(registry) 在锁内跑，返回 { ok, ... }；ok 为 true 时才写盘。
+ */
+function withRegistryTransaction({ regFile, root, mutate }) {
+  const lockDir = topicGenerationLockDir({ source: "registry", registryFile: regFile, root });
+  const lock = acquirePublishLock(lockDir);
+  if (!lock.ok) return { ok: false, kind: "busy", reason: lock.reason };
+  try {
+    const fresh = loadRegistryStrict(regFile);
+    if (!fresh.ok) return { ok: false, kind: "unreadable", reason: fresh.reason };
+    const decided = mutate(fresh.registry);
+    if (!decided.ok) return decided;
+    if (decided.skipWrite) return decided;
+    try {
+      fs.mkdirSync(path.dirname(regFile), { recursive: true, mode: 0o700 });
+      if (fs.existsSync(regFile)) fs.copyFileSync(regFile, regFile + ".prev");
+      const tmp = regFile + ".tmp." + process.pid;
+      fs.writeFileSync(tmp, JSON.stringify(fresh.registry, null, 2) + "\n", { mode: 0o600 });
+      fs.renameSync(tmp, regFile);
+    } catch (err) {
+      return { ok: false, kind: "write_failed", reason: err.message };
+    }
+    return { ...decided, count: fresh.registry.projects.length };
+  } finally {
+    releasePublishLock(lockDir);
+  }
+}
+
 const loaded0 = loadRegistryStrict(regFile);
 if (!loaded0.ok) {
   die(loaded0.reason, "没有动任何文件。先把 " + regFile + " 修好或挪走，再重跑。");
@@ -161,53 +199,39 @@ if (fs.existsSync(legacyMapping)) {
     console.log("\n[dry-run] 什么都没写。加 --apply 补登记。");
     process.exit(0);
   }
-  // **锁内重读再写。**上一版拿锁外那份快照直接 push —— 并发的绑定或迁移
-  // 会被整体覆盖掉。登记表的锁跟轮转用的是同一把（registry 绑定那条分支），
-  // 路径由 topicGenerationLockDir 唯一定义，不在这里另拼一份。
-  const lockDir = topicGenerationLockDir({ source: "registry", registryFile: regFile, root });
-  const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) die("登记表正忙（" + lock.reason + "），没有动它。稍后再试。");
-  try {
-    const fresh = loadRegistryStrict(regFile);
-    if (!fresh.ok) die(fresh.reason, "没有动任何文件。");
-    registry = fresh.registry;
-
-    // 同一个 root 出现多条 → 说不清该改哪一条，拒绝。
-    const sameRoot = registry.projects
-      .map((p, i) => ({ p, i }))
-      .filter((x) => x.p?.root === root);
-    if (sameRoot.length > 1) {
-      die("登记表里有 " + sameRoot.length + " 条同一个项目的记录，说不清该改哪一条。",
-        "先人工确认并只保留一条，再重跑。没有动任何文件。");
-    }
+  const done = withRegistryTransaction({ regFile, root, mutate: (reg) => {
+    // 同一个 root 出现多条 → 说不清该改哪一条。
+    const sameRoot = reg.projects.map((p, i) => ({ p, i })).filter((x) => x.p?.root === root);
+    if (sameRoot.length > 1) return { ok: false, kind: "ambiguous", count: sameRoot.length };
     // 锁内重读后可能已经被别人补上了 —— 那就什么都不用做。
     if (sameRoot.length === 1 && sameRoot[0].p.root_message_id) {
-      console.log("\n锁内重读发现它已经登记好了（可能是另一个进程刚补的），没有重复写。");
-      process.exit(0);
+      return { ok: true, kind: "already", skipWrite: true };
     }
-
     const adopted = newRegistryEntry({
       root, name: arg("name") ?? readProjectIdentity({ root }).name,
       purpose: arg("purpose") ?? null, token: bindingToken(root), rootMessageId: rootId,
     });
     // **有同 root 的残缺条目就地修，不再 push 一条** —— 那会制造重复归属。
-    if (sameRoot.length === 1) registry.projects[sameRoot[0].i] = { ...sameRoot[0].p, ...adopted };
-    else registry.projects.push(adopted);
+    if (sameRoot.length === 1) reg.projects[sameRoot[0].i] = { ...sameRoot[0].p, ...adopted };
+    else reg.projects.push(adopted);
+    return { ok: true, kind: "adopted" };
+  } });
 
-    try {
-      fs.mkdirSync(path.dirname(regFile), { recursive: true, mode: 0o700 });
-      if (fs.existsSync(regFile)) fs.copyFileSync(regFile, regFile + ".prev");
-      const tmp = regFile + ".tmp." + process.pid;
-      fs.writeFileSync(tmp, JSON.stringify(registry, null, 2) + "\n", { mode: 0o600 });
-      fs.renameSync(tmp, regFile);
-    } catch (err) {
-      console.error("补登记没写成：" + err.message);
-      process.exit(1);
+  // **退出码和输出全部在锁释放之后。**
+  if (!done.ok) {
+    if (done.kind === "busy") die("登记表正忙（" + done.reason + "），没有动它。稍后再试。");
+    if (done.kind === "unreadable") die(done.reason, "没有动任何文件。");
+    if (done.kind === "ambiguous") {
+      die("登记表里有 " + done.count + " 条同一个项目的记录，说不清该改哪一条。",
+        "先人工确认并只保留一条，再重跑。没有动任何文件。");
     }
-  } finally {
-    releasePublishLock(lockDir);
+    die("补登记没写成：" + done.reason);
   }
-  console.log("\n已补登记      " + regFile + "  （现在 " + registry.projects.length + " 个项目）");
+  if (done.kind === "already") {
+    console.log("\n锁内重读发现它已经登记好了（可能是另一个进程刚补的），没有重复写。");
+    process.exit(0);
+  }
+  console.log("\n已补登记      " + regFile + "  （现在 " + done.count + " 个项目）");
   console.log("没有建新话题，也没有往群里发任何消息。下一轮会话结束时答复会走出站。");
   process.exit(0);
 }
@@ -250,21 +274,25 @@ console.log("\n根话题已建立  " + rootMessageId);
 
 // 2. 登记。到这一步话题已经在群里了，所以这里失败不能静默 ——
 //    重跑会命中平台侧幂等键，不会多建一个话题。
-const entry = newRegistryEntry({ root, name, purpose, token, rootMessageId });
-if (at >= 0) registry.projects[at] = { ...registry.projects[at], ...entry };
-else registry.projects.push(entry);
-
-try {
-  fs.mkdirSync(path.dirname(regFile), { recursive: true, mode: 0o700 });
-  if (fs.existsSync(regFile)) fs.copyFileSync(regFile, regFile + ".prev");
-  const tmp = regFile + ".tmp." + process.pid;
-  fs.writeFileSync(tmp, JSON.stringify(registry, null, 2) + "\n", { mode: 0o600 });
-  fs.renameSync(tmp, regFile);
-} catch (err) {
-  die("话题建好了（" + rootMessageId + "）但登记没写成：" + err.message,
-    "修好权限后重跑同一条命令即可，幂等键保证不会多建一个话题。");
+// **走跟补登记同一个事务入口。**上一版这里拿最初读到的那份 registry 直接整体写回，
+// 跟补登记并发时仍会互相覆盖 —— 那样"登记表控制锁"就只是名义上的。
+// 建话题可以在锁外靠平台幂等键，但拿到根消息之后必须进同一笔登记事务。
+const registered = withRegistryTransaction({ regFile, root, mutate: (reg) => {
+  const sameRoot = reg.projects.map((p, i) => ({ p, i })).filter((x) => x.p?.root === root);
+  if (sameRoot.length > 1) return { ok: false, kind: "ambiguous", count: sameRoot.length };
+  const entry = newRegistryEntry({ root, name, purpose, token, rootMessageId });
+  if (sameRoot.length === 1) reg.projects[sameRoot[0].i] = { ...sameRoot[0].p, ...entry };
+  else reg.projects.push(entry);
+  return { ok: true, kind: "registered" };
+} });
+if (!registered.ok) {
+  const why = registered.kind === "ambiguous"
+    ? "登记表里有 " + registered.count + " 条同一个项目的记录，说不清该改哪一条"
+    : registered.reason;
+  die("话题建好了（" + rootMessageId + "）但登记没写成：" + why,
+    "修好之后重跑同一条命令即可，幂等键保证不会多建一个话题。");
 }
-console.log("已登记        " + regFile + "  （现在 " + registry.projects.length + " 个项目）");
+console.log("已登记        " + regFile + "  （现在 " + registered.count + " 个项目）");
 
 // 3. 发状态回复。走 publishDraft，也就是出站平时走的那条路径 —— 它到了话题里，
 //    出站就是真的通了，不是我说通了。

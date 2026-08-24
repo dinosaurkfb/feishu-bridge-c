@@ -139,6 +139,8 @@ async function main() {
   const reply = ownedByBridge ? null : extractReply(payload, { maxChars: MAX_REPLY_CHARS });
 
   const notes = [];
+  // 只有真的进了 notes 的项目才算"报过"。
+  const reported = [];
 
   for (const project of attributed) {
     // 先解析出**这一轮该用哪条绑定**：有会话级绑定且对得上就用它，否则回落到项目级。
@@ -238,6 +240,9 @@ async function main() {
     log(project.id + " via=" + project.via.join("+") + " -> " + JSON.stringify(r));
 
     const who = projectLabel(project);
+    // 记下"这一轮真的报了哪些项目"。末尾那句解释要按它来算，不能按"被归属到哪些"
+    // 算 —— 非当前项目没东西可报时不产生提示，解释却会孤零零挂在那儿。
+    const before = notes.length;
     if (r.status === "published") {
       notes.push("飞书出站：" + who + " 已发布 " + r.count + " 条进展。");
     } else if (r.status === "error" && r.diagnosis?.kind === "root_owned_by_other_app") {
@@ -258,9 +263,10 @@ async function main() {
       // 这条必须说出来：绑定失效时进展会无限期堆在本地，而 Frank 什么都收不到。
       notes.push("飞书出站：" + who + " 的话题绑定已失效，" + r.count + " 条进展发不出去，需要重签绑定。");
     }
+    if (notes.length > before) reported.push(project);
   }
 
-  finish(notes.join(" ") + foreignHint(attributed));
+  finish(notes.join(" ") + foreignHint(reported));
 }
 
 // 只有被直接执行时才真的跑。被 import（测试要 extractReply）时绝不能执行 ——

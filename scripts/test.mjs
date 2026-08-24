@@ -8923,16 +8923,20 @@ test("真实 Stop 钩子会把「非当前项目」说出来 —— 纯函数对
   const transcript = path.join(dir, "t.jsonl");
   fs.writeFileSync(transcript, "刚才在讨论 " + proj + " 的问题\n");
 
-  const runHook = (cwd) => {
+  const rawHook = (cwd, extra = {}) => {
     const run = spawnSync(process.execPath, [path.resolve("scripts", "stop-hook.mjs")], {
       encoding: "utf-8",
       input: JSON.stringify({ cwd, transcript_path: transcript, session_id: "s1",
-        last_assistant_message: "hi" }),
+        last_assistant_message: "hi", ...extra }),
       env: { ...process.env, FEISHU_BRIDGE_REGISTRY: reg },
     });
     assert.equal(run.status, 0, run.stderr);
-    assert.ok(run.stdout.trim(), "钩子必须说点什么 —— 崩掉时它是静默的");
-    return JSON.parse(run.stdout).systemMessage;
+    return run.stdout.trim();
+  };
+  const runHook = (cwd) => {
+    const out = rawHook(cwd);
+    assert.ok(out, "钩子必须说点什么 —— 崩掉时它是静默的");
+    return JSON.parse(out).systemMessage;
   };
 
   // cwd 在别处：必须标出来，并解释一次为什么带上它。
@@ -8944,6 +8948,16 @@ test("真实 Stop 钩子会把「非当前项目」说出来 —— 纯函数对
   const own = runHook(proj);
   assert.match(own, /projA 发布失败/u);
   assert.equal(own.includes("非当前项目"), false, "当前项目不该被标记");
+
+  // **非当前项目没东西可报时，那句解释不许孤零零地出现。**
+  // 上一版按"被归属到哪些项目"决定要不要解释，而不是按"实际报了哪些" ——
+  // 于是 outbox 为空时一条提示都没有，解释却照样打出来，挂在那儿没有指向。
+  // 注意要连本轮答复一起去掉：钩子会把 last_assistant_message 排进 outbox，
+  // 那本身就成了"有事可报"。清空 outbox 并且这一轮不带答复。
+  const ob = path.join(proj, ".runtime-data", "outbound", "outbox");
+  for (const f of fs.readdirSync(ob)) fs.rmSync(path.join(ob, f));
+  assert.equal(rawHook(elsewhere, { last_assistant_message: "" }), "",
+    "非当前项目无事可报时应当完全沉默，而不是只留一句解释");
 });
 
 test("带诊断的失败分支必须真的可达 —— 更具体的条件要先判", () => {

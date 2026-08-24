@@ -23,14 +23,17 @@ export function projectLabel(project) {
 }
 
 /**
- * 只有确实带上了非当前项目时，才在末尾解释一次为什么。
+ * 只有**确实出现在提示里**的非当前项目，才在末尾解释一次为什么。
  *
- * 解释放在末尾说一次，而不是每条提示里都重复 —— 手机上卡片窄，
+ * 上一版看的是"被归属到哪些项目"，而不是"实际报了哪些项目"。非当前项目的 outbox
+ * 为空时它一条提示都不产生，但解释照样打出来 —— **一句解释挂在那儿，
+ * 前面却没有任何被标记的东西**。评审用真实钩子实测到了这个孤儿提示。
+ *
+ * 解释放末尾说一次，而不是每条提示里都重复 —— 手机上卡片窄，
  * 每条都带一遍会把真正的结论挤下去。
  */
-export function foreignHint(attributed) {
-  const foreign = (attributed ?? []).filter((p) => !p?.via?.includes("cwd"));
+export function foreignHint(reported) {
+  const foreign = (reported ?? []).filter((p) => !p?.via?.includes("cwd"));
   if (foreign.length === 0) return "";
   return " （标「非当前项目」的是因为本会话提到过它的路径，才被一起排空。）";
 }
-

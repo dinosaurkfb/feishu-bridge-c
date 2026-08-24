@@ -3117,6 +3117,7 @@ const projOutbox = path.join(proj, ".runtime-data", "outbound", "outbox");
 const projInbound = path.join(proj, ".runtime-data", "inbound");
 
 test("outbox 为空 → empty，且不去读配置（配置根本不存在也不该报错）", () => {
+  // 发布前返回：outbox 为空
   const r = drainProject({ root: proj });
   assert.equal(r.status, "empty");
 });
@@ -3138,6 +3139,7 @@ test("兜底排空按绑定枚举，会话级 outbox 不会被漏掉", () => {
   const sessionDir = outboxDirOf(dir, session);
   assert.notEqual(projectDir, sessionDir);
   appendEvent({ outboxDir: sessionDir, kind: "next", text: "会话级待发", source: "t" });
+  // 发布前返回：outbox 为空
   assert.equal(drainProject({ root: dir, claudeSessionId: null }).status, "empty",
     "项目级排空看不见会话级 outbox —— 这正是漏掉的那一半");
   assert.notEqual(drainProject({ root: dir, claudeSessionId: session }).status, "empty");
@@ -3162,6 +3164,7 @@ test("Stop 钩子排空用的会话必须与写入 outbox 用的是同一个", (
   const bySpeaking = outboxDirOf(dir, "11111111-2222-3333-4444-555555555555");
   assert.notEqual(byBinding, bySpeaking);
   appendEvent({ outboxDir: byBinding, kind: "next", text: "写进绑定的 outbox", source: "t" });
+  // 发布前返回：outbox 为空
   assert.equal(drainProject({ root: dir, claudeSessionId: "11111111-2222-3333-4444-555555555555" })
     .status, "empty", "拿说话会话去排空会扑空 —— 这正是当初每轮都发不出去的原因");
   assert.notEqual(drainProject({ root: dir, claudeSessionId: null }).status, "empty",
@@ -3170,6 +3173,7 @@ test("Stop 钩子排空用的会话必须与写入 outbox 用的是同一个", (
 
 test("有待发内容但根本没接桥 → error not_bound，绝不静默丢弃", () => {
   appendEvent({ outboxDir: projOutbox, kind: "next", text: "待发一条", source: "t" });
+  // 发布前返回：没有任何绑定（not_bound）
   const r = drainProject({ root: proj });
   assert.equal(r.status, "error");
   // 「哪儿都没有绑定」和「绑定在但读不出来」必须是两个原因：
@@ -3180,6 +3184,7 @@ test("有待发内容但根本没接桥 → error not_bound，绝不静默丢弃
 test("绑定文件在但是坏 JSON → config_unreadable，跟没接桥区分开", () => {
   fs.mkdirSync(projInbound, { recursive: true });
   fs.writeFileSync(path.join(projInbound, "active-mapping.json"), "{ 这不是 json");
+  // 发布前返回：绑定文件是坏 JSON（config_unreadable）
   const r = drainProject({ root: proj });
   assert.equal(r.status, "error");
   assert.equal(r.reason, "config_unreadable");
@@ -3192,6 +3197,7 @@ test("绑定不是 active → skipped，进展留在本地", () => {
     JSON.stringify({ task_display_name: "T", lark_cli_profile: "claude" }));
   fs.writeFileSync(path.join(projInbound, "active-mapping.json"),
     JSON.stringify({ status: "closed", feishu_root_message_id_reference: "om_x" }));
+  // 发布前返回：绑定不是 active（mapping_not_active）
   const r = drainProject({ root: proj });
   assert.equal(r.status, "skipped");
   assert.equal(r.reason, "mapping_not_active");
@@ -3211,6 +3217,7 @@ test("dry-run 出摘要但不标记已发", () => {
 test("已有发布者在排空 → 让路，不并发发送", () => {
   const lock = path.join(proj, ".runtime-data", "outbound", "publish.lock");
   assert.equal(acquirePublishLock(lock).ok, true);
+  // 发布前返回：发布锁被别人拿着（publisher_busy）
   const r = drainProject({ root: proj });
   assert.equal(r.status, "skipped");
   assert.equal(r.reason, "publisher_busy");
@@ -8816,8 +8823,18 @@ test("发布失败只给诊断，不自动做有损动作", () => {
 
   // 关键：真实入口下不许抛。上一版 id 定义在 try 里、catch 里用它，
   // **任何发布失败都先撞上 ReferenceError**，永远走不到诊断。
+  //
+  // 发布用注入的失败函数。上一版靠 lark_cli_bin 指向不存在的二进制来间接保证
+  // 不发出去 —— 但那个字段在某些配置组合下会被机器级模板覆盖，
+  // **间接保证不算保证**（我拿一个假二进制探过一次，照样打到了真实 API）。
   let got;
-  assert.doesNotThrow(() => { got = drainProject({ root: dir, claudeSessionId: null }); });
+  const boom = () => {
+    const e = new Error("Command failed: lark-cli"); e.stderr = "code 230002"; throw e;
+  };
+  assert.doesNotThrow(() => {
+    got = drainProject({ root: dir, claudeSessionId: null, publish: boom,
+      diagnose: () => ({ kind: "root_owned_by_other_app", ownerName: "CC" }) });
+  });
   assert.equal(got.status, "error");
   assert.equal(got.reason, "publish_failed");
 
@@ -8866,22 +8883,81 @@ test("带诊断的失败也要留 lark-cli 说的话，不是命令回显", () =
   // String(err.message).slice(0, 400)。两个 PR 单独看都对，合起来必须两样都要。
   // 没有守卫的话，以后谁重解一次冲突、顺手选了另一侧，**不会有任何人发现**。
   //
-  // **这是结构断言，我知道它比行为断言弱。**行为版本要让 drainProject 的发布
-  // 真的失败一次，而 drainProject 没有注入口 —— 试过一次，它**直接打到了真实
-  // 飞书 API**（拿到真实错误码 99992354）。在补上注入口之前，宁可要一条弱守卫，
-  // 也不要一条会往外发请求的测试。注入口另开一条改动，不混进这次合并。
+  // 合并那轮这里只能做结构断言：drainProject 当时没有发布注入口，行为版本会
+  // **打到真实飞书 API**（我踩过一次，拿到真实错误码 99992354）。
+  // 现在有注入口了，换成走真实失败路径。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-diagdetail-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", lark_cli_profile: "claude" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_x", feishu_root_message_id_reference: "om_x",
+    claude_session_id: null, channel_generation_id: "gen-1" }));
+  appendEvent({ outboxDir: obDir, kind: "next", text: "待发一条", source: "t" });
+
+  // 真实形态：Command failed + 整条带卡片 JSON 的命令回显，真错误在 stderr。
+  const err = new Error("Command failed: /opt/homebrew/bin/lark-cli im +messages-reply --content "
+    + "x".repeat(2000));
+  err.stderr = "code 230002: bot not in chat";
+
+  // **diagnose 也要注入。**只挡住 publish 只挡住了"写"：失败之后的身份诊断
+  // 会跑 lark-cli `im +messages-mget` 去查根消息归属，那同样是一次出网请求。
   //
-  // 弱归弱，逐字钉住每一个分支：错误字段必须是 publishErrorDetail(err)，
-  // 且整个文件里不许再出现按固定长度截 message 的写法。
-  const src = fs.readFileSync(path.resolve("scripts", "drain-outbox.mjs"), "utf-8");
-  assert.equal((src.match(/error: publishErrorDetail\(err\),/gu) ?? []).length, 1,
-    "失败返回里的 error 字段必须用 publishErrorDetail");
-  assert.doesNotMatch(src, /String\(err\.message\)\.slice\(/u,
-    "退回按固定长度截命令回显，就等于把真正的错误码扔了");
-  assert.doesNotMatch(src, /err\.message.{0,20}slice\(0, \d+\)/u);
-  // publishErrorDetail 本身的行为在 #35 的用例里验过，这里只钉"用的是它"。
-  assert.equal(publishErrorDetail({ message: "Command failed: x", stderr: "code 230002" }),
-    "code 230002");
+  // 断言它**确实被调到**，而不只是"传了进去"：夹具里没有 outbound_app_id 时，
+  // 真实诊断函数会提前返回、不出网 —— 两版行为一模一样，
+  // **光看结果分不出用的是哪个**。计数是唯一能分辨的证据。
+  let diagnoseCalls = 0;
+  const safeDiagnose = () => {
+    diagnoseCalls += 1;
+    return { kind: PUBLISH_FAILURE.TRANSIENT, reason: "test_stub" };
+  };
+  const r = drainProject({
+    root: dir, publish: () => { throw err; }, diagnose: safeDiagnose });
+  assert.equal(diagnoseCalls, 1, "诊断必须走注入的那个 —— 否则失败路径仍会真的出网");
+
+  assert.equal(r.status, "error");
+  assert.equal(r.reason, "publish_failed");
+  assert.equal(r.error, "code 230002: bot not in chat",
+    "留下的必须是 lark-cli 说的话；退回 slice(0, 400) 会变成一整条命令回显");
+  assert.equal(r.error.includes("lark-cli im"), false, "不许把命令回显当成错误留下");
+  // 失败不许标记已发 —— 内容要留在 outbox 等重试。
+  assert.equal(listPending({ outboxDir: obDir }).length, 1);
+});
+
+test("测试不许走真实发布路径 —— 每个 drainProject 调用都要说清它为什么安全", () => {
+  // 这条是**对测试自己的守卫**。drainProject 的非 dry-run 路径通向真实飞书 API，
+  // 而代码里没有任何提示会告诉你这一点：它看起来和普通单元测试一样。我踩过一次。
+  //
+  // 考虑过在 publishDraft 里加一个"禁止真实发布"的开关，但那等于给生产代码留一个
+  // 能悄悄关掉发布的环境变量 —— 一旦泄漏到线上，出站就断了，而且是静默地断。
+  // 宁可在测试这一侧立规矩。
+  const lines = fs.readFileSync(path.resolve("scripts", "test.mjs"), "utf-8").split("\n");
+  const sites = [];
+  for (const [i, line] of lines.entries()) {
+    const at = line.indexOf("drainProject({");
+    if (at < 0) continue;
+    // 跳过字符串字面量里的出现 —— 有一条测试正是在读源码里找这个串。
+    if (at > 0 && ["\"", "'", "`"].includes(line[at - 1])) continue;
+    sites.push({ i, line, near: lines.slice(Math.max(0, i - 5), i + 3).join("\n") });
+  }
+  assert.ok(sites.length >= 10, "扫描失效就等于没守，实际只找到 " + sites.length + " 处");
+
+  const unexplained = sites.filter((site) =>
+    !/dryRun: true|publish:/u.test(site.near) && !site.near.includes("// 发布前返回："));
+  assert.deepEqual(unexplained.map((x) => (x.i + 1) + ": " + x.line.trim()), [],
+    "这些 drainProject 调用既没注入 publish、也没写「// 发布前返回：」说明它为什么发不出去");
+
+  // **注入了写就必须注入读。**评审实测：只注入 publish 时，失败之后的身份诊断
+  // 照样跑 lark-cli `im +messages-mget` —— "挡住了写"不等于"不出网"。
+  // 会走到失败分支的调用（也就是注入了 publish 的那些）必须同时注入 diagnose。
+  const halfInjected = sites.filter((site) =>
+    site.near.includes("publish:") && !site.near.includes("diagnose:"));
+  assert.deepEqual(halfInjected.map((x) => (x.i + 1) + ": " + x.line.trim()), [],
+    "这些调用注入了 publish 却没注入 diagnose —— 失败后的诊断仍会真的出网");
 });
 
 test("带诊断的失败分支必须真的可达 —— 更具体的条件要先判", () => {

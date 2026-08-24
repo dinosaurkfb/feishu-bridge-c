@@ -19,7 +19,8 @@ import path from "node:path";
 
 import { bindingsForRoot, currentBinding } from "./feishu-control.mjs";
 import { buildClaudeSubscriptionProjection } from "./inbound-route.mjs";
-import { loadChainTemplate } from "./chain-template.mjs";
+import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
+import { checkEndpoint } from "./endpoint-self-check.mjs";
 import {
   composeLayeredStatus, endpointFacts, renderLayeredStatus, splitByRelation, subscriptionFacts,
 } from "./layered-status.mjs";
@@ -48,7 +49,11 @@ const layeredConnectivity = renderConnectivity(
 console.log(renderLayeredStatus(composeLayeredStatus({
   st,
   others: bindingsForRoot({ root }),
-  endpoint: endpointFacts({ agentName: tpl?.transport_agent_name ?? null }),
+  endpoint: endpointFacts({
+    agentName: tpl?.transport_agent_name ?? null,
+    // 端点自检（FR-1.4）。只读、限时、不修不启。
+    selfCheck: tpl ? checkEndpoint({ template: tpl, identity: resolveLarkIdentity(tpl) }) : null,
+  }),
   subscription: subscriptionFacts(buildClaudeSubscriptionProjection({ projectRoot: root }),
     { groupName: tpl?.chat_name ?? null }),
   connectivity: layeredConnectivity,

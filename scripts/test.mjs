@@ -21,7 +21,9 @@ import {
   isValidPrefix, isValidQuota, normalizeBody,
 } from "./selector.mjs";
 import { NOTE_MAX, resolveUntil, validateNote } from "./binding.mjs";
-import { FETCH_BACKOFF_MS, RECENT_TURNS, buildEventsArgs, fetchTriggerEvent } from "./envelope.mjs";
+import {
+  ENVELOPE_ENV as ENV_PASS, FETCH_BACKOFF_MS, RECENT_TURNS, buildEventsArgs, fetchTriggerEvent, inheritedEvent,
+} from "./envelope.mjs";
 import { acquireClaim, claimKey, recordClaimState } from "./claim.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
@@ -36,7 +38,7 @@ import {
 } from "./outbound-card.mjs";
 import { PUBLISH_FAILURE, classifyPublishFailure } from "./outbound.mjs";
 import {
-  drainProject, publishErrorDetail, suppressCmd, watcherActive,
+  drainProject, outboxDirOf, publishErrorDetail, suppressCmd, watcherActive,
 } from "./drain-outbox.mjs";
 import { applySuppression } from "./feishu-suppress-outbox.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
@@ -46,7 +48,7 @@ import {
 } from "./runtime-install.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
 import {
-  DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliveryPinPath, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin,
+  DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliveryPinPath, findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin,
 } from "./live-session.mjs";
 import { extractReply } from "./stop-hook.mjs";
 import {
@@ -60,9 +62,7 @@ import {
 import {
   consumedPath, mappingFromRegistryEntry, resolveProject, selectBindingEntry,
 } from "./project-resolve.mjs";
-import { outboxDirOf } from "./drain-outbox.mjs";
 import { identifySelf, newSessionEntry } from "./bind-session.mjs";
-import { findLiveSessionById } from "./live-session.mjs";
 import {
   SUSPENDED, bindingsForRoot, currentBinding, describeStatus, setBindingStatus,
 } from "./feishu-control.mjs";
@@ -74,11 +74,8 @@ import {
   ROUTE_REJECT, loadRoutes, registerRoute, registerRouteBinding, registerSession, selectRoute,
   validateRoutesDoc,
 } from "./inbound-routes.mjs";
-import { ENVELOPE_ENV as ENV_PASS, inheritedEvent } from "./envelope.mjs";
-import { CANONICAL_EVENT_ENV } from "./canonical-event.mjs";
 import {
-  CANONICAL_EVENT_ENV as CANONICAL_PASS, buildCanonicalEvent, inheritedCanonicalEvent,
-  legacyEventFromCanonical, validateCanonicalEvent,
+  CANONICAL_EVENT_ENV, CANONICAL_EVENT_ENV as CANONICAL_PASS, buildCanonicalEvent, inheritedCanonicalEvent, legacyEventFromCanonical, validateCanonicalEvent,
 } from "./canonical-event.mjs";
 import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
 import { bindingToConnections } from "./group-binding-status.mjs";
@@ -87,8 +84,8 @@ import {
 } from "./subscription-sync.mjs";
 import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
 import {
-  ENDPOINT_SELF_CHECK, composeLayeredStatus, endpointFacts, lastSuccessfulDispatchAt,
-  renderLayeredStatus, splitByRelation, subscriptionFacts,
+  ENDPOINT_SELF_CHECK, SELF_CHECK_TEXT, composeLayeredStatus, endpointFacts,
+  lastSuccessfulDispatchAt, renderLayeredStatus, splitByRelation, subscriptionFacts,
 } from "./layered-status.mjs";
 import {
   collectConnectivity, collectProjectConnectivity, collectStatusProviders, loadStatusProviders,
@@ -330,6 +327,9 @@ const dialogueAuthorizationFixture = () => {
 
 // ---------- 报文解析（真实格式） ----------
 
+import {
+  CHECK_RESULT, ENDPOINT_CHECK, checkEndpoint, renderEndpointCheck,
+} from "./endpoint-self-check.mjs";
 
 test("从真实 <at> 标签提取 mention id", () => {
   assert.deepEqual(extractMentionIds(baseEvent.content), [M5CLAUDE]);
@@ -7225,7 +7225,8 @@ test("第 1 层不许把未自检说成在线", () => {
   };
 
   const plain = renderLayeredStatus(layeredView());
-  assert.equal(rowOf(plain, "实时自检"), "未自检（端点自检 FR-1.4 尚未实现）");
+  assert.equal(rowOf(plain, "实时自检"), "未自检（本次没跑端点自检）",
+    "FR-1.4 已实现，但没跑就仍然是未自检 —— 代码存在不等于查过了");
   assert.equal(rowOf(plain, "最近入站"), null, "没有历史证据时不该凭空出现这一行");
 
   const withLog = renderLayeredStatus(layeredView({}, {
@@ -7234,11 +7235,11 @@ test("第 1 层不许把未自检说成在线", () => {
   }));
   // 历史证据的措辞必须停在"过去某刻工作过"，不能滑成"在线"。
   assert.equal(rowOf(withLog, "最近入站"), "2 小时前（历史证据，不代表当前在线）");
-  assert.equal(rowOf(withLog, "实时自检"), "未自检（端点自检 FR-1.4 尚未实现）",
+  assert.equal(rowOf(withLog, "实时自检"), "未自检（本次没跑端点自检）",
     "有历史证据也不得把自检结论改掉");
 
   // 路由登记只证明配置存在，日志只证明过去工作过 —— 都不该升级成一个在线判断。
-  assert.equal(ENDPOINT_SELF_CHECK, "not_implemented");
+  assert.equal(ENDPOINT_SELF_CHECK, "not_checked");
 });
 
 test("最近入站只取时间戳，不碰日志里的标识", () => {
@@ -7257,7 +7258,7 @@ test("最近入站只取时间戳，不碰日志里的标识", () => {
     runtimeDir: path.dirname(file), inboundLog: file,
     verify: () => ({ ok: false, reason: "current_absent" }),
   });
-  assert.equal(facts.selfCheck, "not_implemented");
+  assert.equal(facts.selfCheck, null, "不传自检报告就是没跑过");
   assert.equal(facts.install, "absent", "没有 current 符号链接就是没装");
 });
 
@@ -7656,47 +7657,6 @@ test("按文档里那条命令登记，聚合方要真的能取到状态", () =>
 });
 
 
-test("发布失败要留下 lark-cli 说的话，不是命令回显", () => {
-  // 实机上这条报错长这样：Command failed: <带整张卡片 JSON 的命令>\n<stderr>。
-  // 命令回显上千字符，从头截 400 留下来的全是命令 —— cc2cd 那条卡住的进展
-  // 就是这么变成"查不出原因"的。上一版发现了症状，改法是把 400 放宽，
-  // 那治不了：问题不是长度不够，是截错了方向。
-  const command = "Command failed: /opt/homebrew/bin/lark-cli im +messages-reply --content "
-    + "x".repeat(2000);
-
-  // stderr 优先。
-  assert.equal(publishErrorDetail({ message: command, stderr: "code 230002: bot not in chat" }),
-    "code 230002: bot not in chat");
-  // Buffer 形式的 stderr 也要认。
-  assert.equal(publishErrorDetail({ message: command, stderr: Buffer.from("code 99991663") }),
-    "code 99991663");
-  // 没有 stderr 时用命令回显之后那段。
-  assert.equal(publishErrorDetail({ message: command + "\n真正的报错在这里" }), "真正的报错在这里");
-
-  // **长 stderr 的真错误常在末尾。**上一版只对"纯命令回显"留头尾，对 stderr
-  // 仍从头截 —— 于是多行 runtime 提示加末尾错误码时，code 照样被切掉。
-  // 同一个错误换了个入口又犯一遍。
-  const longStderr = "runtime hint\n".repeat(60) + "code 230002: bot not in chat";
-  const kept = publishErrorDetail({ message: command, stderr: longStderr });
-  assert.ok(kept.endsWith("code 230002: bot not in chat"), "末尾的错误码必须留住");
-  assert.ok(kept.includes("…（中间省略）…"), "省略了就要说，别假装完整");
-
-  // **普通多行错误的第一行往往正是主错误。**只有 Command failed: 开头的那种
-  // 第一行才是命令回显，不能见到换行就删第一行。
-  assert.equal(publishErrorDetail({ message: "primary failure reason\nsecondary context" }),
-    "primary failure reason\nsecondary context");
-
-  // 实在只有命令回显：头尾都要留 —— 尾部往往正是失败的那个参数。
-  const onlyCommand = publishErrorDetail({ message: command });
-  assert.ok(onlyCommand.includes("lark-cli"), "开头要认得出是哪条命令");
-  assert.ok(onlyCommand.includes("…（中间省略）…"), "要说明中间被省了，别假装是完整的");
-  assert.ok(onlyCommand.endsWith("x".repeat(200)), "尾部必须保留");
-
-  // 短错误原样留下，不要平白加省略号。
-  assert.equal(publishErrorDetail({ message: "boom" }), "boom");
-  assert.equal(publishErrorDetail({}), "");
-});
-
 test("relation_type 受两层约束，provider 不能自己给自己发许可", () => {
   const report = (relation) => JSON.stringify({
     schema_version: "feishu-bridge-status/v1", provider_id: "p",
@@ -7943,6 +7903,360 @@ const syncSnapshot = (label, { subscription = syncSub(), status = "active" } = {
 };
 
 const plan = (over = {}) => planSubscriptionSync({ runtimeNamespace: SYNC_NS, ...over });
+
+const okVerify = () => ({ ok: true });
+const okAccess = () => {};
+const okExec = () => "daemon running (pid 1)";
+const okAssert = () => ({ ok: true });
+const okIdentity = { configDir: "/d", profile: "p", expectedAppId: "appA" };
+const okExecJson = (cmd, args) => (args[0] === "adapter"
+  ? JSON.stringify([{ adapter: "claude-code-local", runtimeProbe: { available: true } }])
+  : JSON.stringify({ ok: true, data: { running: true, pid: 1 } }));
+const selfCheck = (over = {}) => checkEndpoint({
+  template: { lark_cli_bin: "/bin/lark-cli" }, identity: okIdentity,
+  verify: okVerify, access: okAccess, exec: okExecJson, assertFn: okAssert, ...over,
+});
+
+test("端点自检把 FR-1.4 的四种情形分开，各有各的下一步", () => {
+  const ready = selfCheck();
+  // **入站身份本机验不了，所以最好的结论就是 incomplete。**
+  // 上一版能判 ready，是因为拿出站身份顶替了入站 —— 那是语义假阳性。
+  assert.equal(ready.verdict, "incomplete");
+  assert.deepEqual(ready.unknown, [ENDPOINT_CHECK.INBOUND]);
+  assert.deepEqual(ready.checks.map((c) => c.id),
+    [ENDPOINT_CHECK.BRIDGE, ENDPOINT_CHECK.DAEMON, ENDPOINT_CHECK.ADAPTER,
+      ENDPOINT_CHECK.INBOUND, ENDPOINT_CHECK.OUTBOUND]);
+
+  // 四种失败各自可辨认，而且各带一条能执行的下一步 —— 混成一句"不可用"等于没说。
+  const cases = [
+    [{ verify: () => ({ ok: false, reason: "current_absent" }) }, ENDPOINT_CHECK.BRIDGE, /install-outbound/u],
+    [{ access: () => { throw new Error("nope"); } }, ENDPOINT_CHECK.OUTBOUND, /执行权限/u],
+    [{ exec: (c, a) => (a[0] === "adapter"
+      ? JSON.stringify([{ adapter: "claude-code-local", runtimeProbe: { available: true } }])
+      : JSON.stringify({ ok: false, error: { code: "DAEMON_UNREACHABLE" } })) },
+      ENDPOINT_CHECK.DAEMON, /daemon start/u],
+    [{ assertFn: () => ({ ok: false, reason: "app_mismatch" }) }, ENDPOINT_CHECK.OUTBOUND, /重新登录/u],
+  ];
+  for (const [over, id, action] of cases) {
+    const got = selfCheck(over);
+    assert.equal(got.verdict, "blocked", id);
+    assert.deepEqual(got.failed, [id]);
+    assert.match(got.checks.find((c) => c.id === id).action, action);
+  }
+
+  // 装了但坏了 ≠ 没装：两者都 fail，但下一步不同。
+  const broken = selfCheck({ verify: () => ({ ok: false, reason: "file_drifted" }) });
+  assert.match(broken.checks[0].detail, /运行时不可用（file_drifted）/u);
+  assert.doesNotMatch(broken.checks[0].detail, /未安装/u);
+});
+
+test("端点自检里「查不动」不许算成「有问题」，也不许算成「没问题」", () => {
+  // 探测超时、看不懂输出、缺配置 —— 都是没查清，不是查出问题。
+  for (const over of [
+    { exec: () => { const e = new Error("t"); e.code = "ETIMEDOUT"; throw e; } },
+    { exec: () => "某种看不懂的输出" },
+    { assertFn: () => { throw new Error("boom"); } },
+    { identity: { configDir: "/d", profile: "p" } },
+  ]) {
+    const got = selfCheck(over);
+    assert.equal(got.verdict, "incomplete", JSON.stringify(Object.keys(over)));
+    assert.deepEqual(got.failed, [], "没查清不能算失败");
+    assert.ok(got.unknown.length >= 2, "入站那项永远是 unknown，再加上这次注入的");
+  }
+
+  // 但"二进制不在"是查出来的结论，该判 fail。
+  const missing = selfCheck({ exec: () => { const e = new Error("x"); e.code = "ENOENT"; throw e; } });
+  assert.equal(missing.verdict, "blocked");
+  assert.ok(missing.failed.includes(ENDPOINT_CHECK.DAEMON));
+
+  // 渲染要能看出三种符号不同。
+  const text = renderEndpointCheck(selfCheck({ exec: () => "某种看不懂的输出" }));
+  assert.match(text, /❔/u);
+  assert.match(text, /✅/u);
+  assert.doesNotMatch(text, /❌/u);
+});
+
+test("没跑自检时仍然显示未自检 —— 代码存在不等于查过了", () => {
+  const endpoint = { runtime: "Claude Code", agentName: null, install: "ok", installReason: null,
+    version: "abc", selfCheck: null, lastInboundAt: null };
+  const text = renderLayeredStatus(composeLayeredStatus({
+    st: layeredSt(), endpoint, subscription: { ok: true, items: [], pendingCount: 0 },
+  }));
+  assert.match(text, /实时自检.*未自检（本次没跑端点自检）/u);
+
+  // 查出问题时要报出是哪几项，不只说"有问题"。
+  const blocked = renderLayeredStatus(composeLayeredStatus({
+    st: layeredSt(),
+    endpoint: { ...endpoint, selfCheck: { verdict: "blocked", failed: ["daemon_running"], unknown: [] } },
+    subscription: { ok: true, items: [], pendingCount: 0 },
+  }));
+  assert.match(blocked, /有问题：daemon_running/u);
+
+  const incomplete = renderLayeredStatus(composeLayeredStatus({
+    st: layeredSt(),
+    endpoint: { ...endpoint, selfCheck: { verdict: "incomplete", failed: [], unknown: ["identity_matches"] } },
+    subscription: { ok: true, items: [], pendingCount: 0 },
+  }));
+  assert.match(incomplete, /没查清（查不清：identity_matches）/u);
+});
+
+test("端点自检不许拿出站身份顶替入站 —— 这是语义假阳性", () => {
+  // 评审构造的探针：**入站声明 agent A、出站凭据属于 app B**，注入的检查全过。
+  // 上一版四项全过、判 ready —— 因为它用 lark-cli 在不在回答"adapter 可用吗"
+  //（lark-cli 是出站 OpenAPI 客户端，而 README 定义的 adapter 是 Aily 的
+  // claude-code-local 运行环境），用出站发布身份回答"身份对吗"。
+  //
+  // 这个功能本来就是为了防"拿不知道冒充没事"，结果它自己犯了另一种：
+  // **拿别的知道冒充这个知道。**
+  const got = checkEndpoint({
+    template: { agent_uid: "agent_A", lark_cli_bin: "/bin/x", aily_cli_bin: "/bin/y" },
+    identity: { configDir: "/d", profile: "p", expectedAppId: "app_B" },
+    verify: () => ({ ok: true }), access: () => {},
+    exec: (c, a) => (a[0] === "adapter"
+      ? JSON.stringify([{ adapter: "claude-code-local", runtimeProbe: { available: true } }])
+      : JSON.stringify({ ok: true, data: { running: true } })),
+    assertFn: () => ({ ok: true }),
+  });
+  // **其余四项全过，也不能因此判 ready** —— 入站那项本机验不了。
+  assert.notEqual(got.verdict, "ready", "出站全过不能证明入站接得住");
+  assert.equal(got.verdict, "incomplete");
+  assert.deepEqual(got.unknown, [ENDPOINT_CHECK.INBOUND]);
+
+  // 入站那项**永远**是 unknown：本机没有可信的入站身份事实来源。
+  // AILY_CLI_CALLER_AGENT_UID 只在真实入站回合的环境里出现，status 拿不到；
+  // 模板写的是期望值，不是观测值。
+  const inbound = got.checks.find((c) => c.id === ENDPOINT_CHECK.INBOUND);
+  assert.equal(inbound.result, CHECK_RESULT.UNKNOWN);
+  assert.match(inbound.detail, /期望值不是观测值/u);
+});
+
+test("真实 feishu-status CLI 跑出来的第 1 层不会声称全部通过", () => {
+  // 这条走真实 CLI，不是函数 stub —— 前几轮反复栽在"函数对了、真实入口是坏的"。
+  //
+  // **断言必须与本机状态无关。**上一版硬要求出现"没查清"，那等于假定 daemon
+  // 一定在跑：评审在 daemon 离线的机器上跑同一份代码得到的是"有问题"，
+  // 于是我这边 499/499、他那边 498/499。**一条会因为机器状态而红的测试，
+  // 测的是机器，不是代码。**
+  //
+  // 与状态无关的不变量只有两条：不许声称全部通过；入站那项必须仍是查不清。
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "feishu-status.mjs"), "--project", process.cwd(),
+  ], { encoding: "utf-8" });
+  assert.equal(run.status, 0, run.stderr);
+  const layer1 = run.stdout.slice(0, run.stdout.indexOf("第 2 层"));
+  assert.match(layer1, /实时自检/u);
+
+  // 引用产品常量而不是复制字面量 —— 复制的那份在文案改了之后会变成空断言。
+  assert.equal(layer1.includes(SELF_CHECK_TEXT.ready), false,
+    "入站身份本机验不了，任何情况下都不许报成全部通过");
+  // daemon 在跑就是"没查清"，离线就是"有问题"，两者都对；只有 ready 不对。
+  assert.ok(layer1.includes(SELF_CHECK_TEXT.incomplete) || layer1.includes(SELF_CHECK_TEXT.blocked),
+    "结论要么是没查清、要么是有问题，不该是别的：" + layer1);
+  assert.match(layer1, /inbound_transport_identity/u, "要说清入站那项没查清");
+});
+
+test("自检结论的文案里不许写死检查项数", () => {
+  // 上一版 ready 写的是"四项全过"。检查从四项加到五项之后，它就成了一句
+  // **给用户看的错话**，而且没有任何测试会因此变红 —— 文案里的数字没人盯。
+  // 这里不去断言"数字必须是 5"（那样加一项又要改一处），
+  // 而是让**写数字这件事本身**变红：结论要说"全部通过"，不要替人数数。
+  for (const [verdict, text] of Object.entries(SELF_CHECK_TEXT)) {
+    assert.doesNotMatch(text, /[0-9一二三四五六七八九十]/u,
+      verdict + " 的文案写了项数「" + text + "」—— 检查项一增减它就变成错话");
+  }
+  // 五项这个事实由检查项集合本身承载，不由文案承载。
+  assert.equal(Object.keys(ENDPOINT_CHECK).length, 5,
+    "改了检查项数就要同时想清楚：有没有别处把它写死了");
+});
+
+test("模板写入器要能接住可选字段", () => {
+  // aily_cli_bin 加进了 OPTIONAL_CHAIN_FIELDS，但写入器只遍历 CHAIN_FIELDS ——
+  // 于是"模板支持这个字段"这句话只在读的那一侧成立。
+  const src = fs.readFileSync(path.resolve("scripts", "init-chain-template.mjs"), "utf-8");
+  assert.match(src, /\[\.\.\.CHAIN_FIELDS, \.\.\.OPTIONAL_CHAIN_FIELDS\]/u,
+    "写入器必须同时遍历必填与可选字段");
+  assert.match(src, /OPTIONAL_CHAIN_FIELDS/u);
+});
+
+test("daemon 明确离线是 fail，不是「查不动」", () => {
+  // 上一版跑不带 --json 的 daemon status，非零退出一律落到 unknown ——
+  // 于是 daemon **真的离线**时报的是"查不动"。而 aily-cli 明确会给 DAEMON_UNREACHABLE。
+  // **离线是查出来的结论，必须是 fail**；报成 unknown 等于让人以为"可能没事"。
+  const adapterOk = JSON.stringify([{ adapter: "claude-code-local", runtimeProbe: { available: true } }]);
+  const withDaemon = (daemonOut, throwIt = false) => checkEndpoint({
+    template: { lark_cli_bin: "/bin/lark-cli" }, identity: okIdentity,
+    verify: okVerify, access: okAccess, assertFn: okAssert,
+    exec: (c, a) => {
+      if (a[0] === "adapter") return adapterOk;
+      if (throwIt) { const e = new Error("x"); e.stdout = daemonOut; throw e; }
+      return daemonOut;
+    },
+  });
+
+  const offline = withDaemon(JSON.stringify({ ok: false, error: { code: "DAEMON_UNREACHABLE" } }));
+  const d = offline.checks.find((c) => c.id === ENDPOINT_CHECK.DAEMON);
+  assert.equal(d.result, CHECK_RESULT.FAIL);
+  assert.match(d.detail, /DAEMON_UNREACHABLE/u);
+
+  // 非零退出时 JSON 常在 err.stdout 里 —— 不看它就等于把明确答案当成没答案。
+  const thrown = withDaemon(JSON.stringify({ ok: false, error: { code: "DAEMON_UNREACHABLE" } }), true);
+  assert.equal(thrown.checks.find((c) => c.id === ENDPOINT_CHECK.DAEMON).result, CHECK_RESULT.FAIL);
+
+  // 看不懂才是 unknown。
+  assert.equal(withDaemon("不是 JSON").checks.find((c) => c.id === ENDPOINT_CHECK.DAEMON).result,
+    CHECK_RESULT.UNKNOWN);
+});
+
+test("daemon 离线的**真实**输出形态：stdout 是完整 JSON，stderr 另有 build 噪声", () => {
+  // 上面那条测试用的是合成形态 —— 只给 err.stdout，不给 stderr。**它就是这么绿着
+  // 放过线上故障的**：实机上 stdout 是合法 JSON、stderr 另有两行 runtime build，
+  // 代码把两者拼起来再 parse，于是"合法 JSON 后面跟着非 JSON"解析失败，
+  // 一个明确的 DAEMON_UNREACHABLE 被报成了"看不懂"。
+  // 这里的字节形态取自 Codex 在本机跑 aily-cli 的真实输出。
+  const realErr = (stdout, stderr) => () => {
+    const e = new Error("Command failed"); e.status = 1;
+    e.stdout = stdout; e.stderr = stderr;
+    throw e;
+  };
+  const daemonJson = JSON.stringify({
+    ok: false,
+    error: { code: "DAEMON_UNREACHABLE", message: "daemon not running", hint: "Run: aily-cli daemon start" },
+  }) + "\n";
+  const buildNoise = "Aily runtime build: version=0.1.44\n"
+    + "aggregate=798933c004f4009f89a50bdff1533e590e6c8434 ref=798933c\n";
+
+  const r = checkEndpoint({
+    template: { lark_cli_bin: "/bin/lark-cli" }, identity: okIdentity,
+    verify: okVerify, access: okAccess, assertFn: okAssert,
+    exec: (c, a) => (a[0] === "adapter"
+      ? realErr("", "daemon not running (socket: ...)\nRun: aily-cli daemon start\n" + buildNoise)()
+      : realErr(daemonJson, buildNoise)()),
+  });
+
+  const d = r.checks.find((c) => c.id === ENDPOINT_CHECK.DAEMON);
+  assert.equal(d.result, CHECK_RESULT.FAIL, "离线是查出来的结论，不是查不动");
+  assert.match(d.detail, /DAEMON_UNREACHABLE/u);
+  // daemon 都不在，adapter 自然探不出结论 —— 这个 unknown 是诚实的。
+  assert.equal(r.checks.find((c) => c.id === ENDPOINT_CHECK.ADAPTER).result, CHECK_RESULT.UNKNOWN);
+  assert.equal(r.verdict, "blocked");
+});
+
+test("JSON 后面跟着噪声也要能取出来，取不到就说取不到", () => {
+  // 分开解析 stdout/stderr 之后，单个通道里仍可能是「JSON + 一行日志」。
+  const one = (out) => checkEndpoint({
+    template: { lark_cli_bin: "/bin/lark-cli" }, identity: okIdentity,
+    verify: okVerify, access: okAccess, assertFn: okAssert,
+    exec: (c, a) => (a[0] === "adapter"
+      ? JSON.stringify([{ adapter: "claude-code-local", runtimeProbe: { available: true } }])
+      : out),
+  }).checks.find((c) => c.id === ENDPOINT_CHECK.DAEMON);
+
+  assert.equal(one(JSON.stringify({ ok: true, data: { running: true } }) + "\nbuild: x\n").result,
+    CHECK_RESULT.PASS, "尾部有日志不影响前面那段完整 JSON");
+  // **字符串里的括号不许算进配对。**注意反例要选不配对的（"}}"），
+  // 选 "}{"  那种一加一减正好抵消，不跳过字符串也照样对 —— 那条断言等于没测。
+  assert.equal(one(JSON.stringify({ ok: true, data: { running: true, note: "}}" } }) + "\n噪声").result,
+    CHECK_RESULT.PASS);
+  // 截断的 JSON 取不出来 —— 这时才是 unknown，不许猜。
+  assert.equal(one('{"ok": true, "data": {"running": true').result, CHECK_RESULT.UNKNOWN);
+});
+
+test("stdout 和 stderr 必须分开解析，不许拼起来当一段", () => {
+  // 拼接之所以危险，不只是"JSON 后面跟噪声"——那个 parseJson 已经能扛。
+  // 真正扛不住的是**前一个通道里有半截 JSON**：拼起来之后括号配对会跨通道
+  // 一路找下去，把两段无关的输出算成一段，结果是取不出或取错。
+  // 分开解析时 stdout 取不到就退到 stderr，答案仍然明确。
+  const r = checkEndpoint({
+    template: { lark_cli_bin: "/bin/lark-cli" }, identity: okIdentity,
+    verify: okVerify, access: okAccess, assertFn: okAssert,
+    exec: (c, a) => {
+      if (a[0] === "adapter") {
+        return JSON.stringify([{ adapter: "claude-code-local", runtimeProbe: { available: true } }]);
+      }
+      const e = new Error("Command failed"); e.status = 1;
+      e.stdout = '{"partial": [1, 2';                       // 半截，取不出
+      e.stderr = JSON.stringify({ ok: false, error: { code: "DAEMON_UNREACHABLE" } });
+      throw e;
+    },
+  });
+  const d = r.checks.find((c) => c.id === ENDPOINT_CHECK.DAEMON);
+  assert.equal(d.result, CHECK_RESULT.FAIL, "stdout 取不到就该退到 stderr，而不是报「看不懂」");
+  assert.match(d.detail, /DAEMON_UNREACHABLE/u);
+});
+
+test("adapter 查的是 claude-code-local，不是 lark-cli", () => {
+  // FR-1.4 说的 adapter 是 Aily 的本机运行环境。出站发得出去，
+  // 不代表 Aily 调得起本机的 Claude —— 两者都过也不能互相证明。
+  const daemonOk = JSON.stringify({ ok: true, data: { running: true } });
+  const withAdapters = (list) => checkEndpoint({
+    template: { lark_cli_bin: "/bin/lark-cli" }, identity: okIdentity,
+    verify: okVerify, access: okAccess, assertFn: okAssert,
+    exec: (c, a) => (a[0] === "adapter" ? JSON.stringify(list) : daemonOk),
+  }).checks.find((x) => x.id === ENDPOINT_CHECK.ADAPTER);
+
+  assert.equal(withAdapters([{ adapter: "claude-code-local", runtimeProbe: { available: true } }]).result,
+    CHECK_RESULT.PASS);
+  // 没登记 → fail。
+  assert.equal(withAdapters([{ adapter: "codex-local", runtimeProbe: { available: true } }]).result,
+    CHECK_RESULT.FAIL);
+  // 登记了但探测不可用 → fail，跟"没登记"分开报。
+  const unavailable = withAdapters([
+    { adapter: "claude-code-local", runtimeProbe: { available: false, reason: "cli missing" } }]);
+  assert.equal(unavailable.result, CHECK_RESULT.FAIL);
+  assert.match(unavailable.detail, /探测不可用/u);
+  // **登记了但没有探测结论 ≠ 可用。**
+  assert.equal(withAdapters([{ adapter: "claude-code-local" }]).result, CHECK_RESULT.UNKNOWN);
+});
+
+test("模板的派生、命令行覆盖、预览必须用同一个字段集合", () => {
+  // aily_cli_bin 加进了可选字段，但派生只遍历 CHAIN_FIELDS —— 旧项目配好的值
+  // 经 --from 初始化照样丢。上一轮我只补了命令行那一侧。
+  const src = fs.readFileSync(path.resolve("scripts", "init-chain-template.mjs"), "utf-8");
+  assert.equal((src.match(/for \(const f of TEMPLATE_FIELDS\)/gu) ?? []).length, 3,
+    "派生、覆盖、预览三处都要用同一个集合");
+  assert.doesNotMatch(src, /for \(const f of CHAIN_FIELDS\)/u,
+    "只遍历必填字段就会漏掉可选的");
+});
+test("发布失败要留下 lark-cli 说的话，不是命令回显", () => {
+  // 实机上这条报错长这样：Command failed: <带整张卡片 JSON 的命令>\n<stderr>。
+  // 命令回显上千字符，从头截 400 留下来的全是命令 —— cc2cd 那条卡住的进展
+  // 就是这么变成"查不出原因"的。上一版发现了症状，改法是把 400 放宽，
+  // 那治不了：问题不是长度不够，是截错了方向。
+  const command = "Command failed: /opt/homebrew/bin/lark-cli im +messages-reply --content "
+    + "x".repeat(2000);
+
+  // stderr 优先。
+  assert.equal(publishErrorDetail({ message: command, stderr: "code 230002: bot not in chat" }),
+    "code 230002: bot not in chat");
+  // Buffer 形式的 stderr 也要认。
+  assert.equal(publishErrorDetail({ message: command, stderr: Buffer.from("code 99991663") }),
+    "code 99991663");
+  // 没有 stderr 时用命令回显之后那段。
+  assert.equal(publishErrorDetail({ message: command + "\n真正的报错在这里" }), "真正的报错在这里");
+
+  // **长 stderr 的真错误常在末尾。**上一版只对"纯命令回显"留头尾，对 stderr
+  // 仍从头截 —— 于是多行 runtime 提示加末尾错误码时，code 照样被切掉。
+  // 同一个错误换了个入口又犯一遍。
+  const longStderr = "runtime hint\n".repeat(60) + "code 230002: bot not in chat";
+  const kept = publishErrorDetail({ message: command, stderr: longStderr });
+  assert.ok(kept.endsWith("code 230002: bot not in chat"), "末尾的错误码必须留住");
+  assert.ok(kept.includes("…（中间省略）…"), "省略了就要说，别假装完整");
+
+  // **普通多行错误的第一行往往正是主错误。**只有 Command failed: 开头的那种
+  // 第一行才是命令回显，不能见到换行就删第一行。
+  assert.equal(publishErrorDetail({ message: "primary failure reason\nsecondary context" }),
+    "primary failure reason\nsecondary context");
+
+  // 实在只有命令回显：头尾都要留 —— 尾部往往正是失败的那个参数。
+  const onlyCommand = publishErrorDetail({ message: command });
+  assert.ok(onlyCommand.includes("lark-cli"), "开头要认得出是哪条命令");
+  assert.ok(onlyCommand.includes("…（中间省略）…"), "要说明中间被省了，别假装是完整的");
+  assert.ok(onlyCommand.endsWith("x".repeat(200)), "尾部必须保留");
+
+  // 短错误原样留下，不要平白加省略号。
+  assert.equal(publishErrorDetail({ message: "boom" }), "boom");
+  assert.equal(publishErrorDetail({}), "");
+});
 
 test("计划器要能消费仓库自己产出的真实授权快照", () => {
   // 评审的复现路径：真 materializer 生成的合法快照喂进去 → bindings_invalid: chat_id。

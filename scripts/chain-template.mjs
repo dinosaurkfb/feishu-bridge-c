@@ -55,7 +55,7 @@ export const CHAIN_FIELDS = [
  * 刻意跟必填分开：往 CHAIN_FIELDS 里加一个字段，等于让所有已经生成好的模板
  * 立刻变成「不完整」而全线拒绝 —— 加字段不该是一次静默的破坏性变更。
  */
-export const OPTIONAL_CHAIN_FIELDS = ["lark_cli_config_base", "bridge_root"];
+export const OPTIONAL_CHAIN_FIELDS = ["lark_cli_config_base", "bridge_root", "aily_cli_bin"];
 
 /** 项目级字段：每个项目不同，由 bind-project 现场算出来。 */
 export const PROJECT_FIELDS = [

@@ -31,7 +31,7 @@ import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { topicGenerationLockDir } from "./topic-generation-store.mjs";
 import { currentBinding } from "./feishu-control.mjs";
-import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
+import { applySuppressionCore, dependsOnMapping } from "./suppress-outbox-core.mjs";
 
 const nonEmptyStr = (v) => typeof v === "string" && v.length > 0;
 
@@ -119,51 +119,26 @@ export function selectByGeneration(records, generation, mapping) {
 export function applySuppression({
   outboxDir, root, session = null, pending, generation, previewGenerationId = null, reason,
 }) {
-  // 只有旧格式记录的代际是现算的；其余记录自带代际，轮转不影响它们。
-  const dependsOnMapping = pending.some((r) => !nonEmptyStr(r?.target_channel_generation_id));
-  let genLockDir = null;
-  if (dependsOnMapping) {
-    const binding = currentBinding({ root, claudeSessionId: session });
-    genLockDir = topicGenerationLockDir({ source: binding?.source, root });
-    // 这批里有旧格式记录，却说不清该跟哪一把锁串行 —— **明确拒绝**，
-    // 不许退而求其次去拿全局锁碰运气。
-    if (genLockDir === null) return { ok: false, reason: "binding_unresolved" };
-    const genLock = acquirePublishLock(genLockDir);
-    // 轮转正在进行 → 现在不是动 outbox 的时候。等它做完再来。
-    if (!genLock.ok) return { ok: false, reason: "rotation_busy" };
-  }
-  const lockDir = path.join(root, ".runtime-data", "outbound", "publish.lock");
-  const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) {
-    if (genLockDir !== null) releasePublishLock(genLockDir);
-    return { ok: false, reason: lock.reason };
-  }
-  try {
-    // **锁内重读 mapping**，不用预览时那一份 —— 代际含义正是从它来的。
-    const resolved = resolveProject({ root, claudeSessionId: session });
-    const freshMapping = resolved.ok ? resolved.mapping : null;
-    const activeNow = activeGenerationOf(freshMapping);
-    // 只有旧格式记录的归属会随轮转改变。每条都自带代际时，轮转不影响任何一条 ——
-    // 这时再因为轮转中止，就是在拒绝一件本来安全的事。
-    if (dependsOnMapping && previewGenerationId !== null && activeNow !== previewGenerationId) {
-      // 预览之后轮转过。即使一个文件都没变，"抑制这一代"的含义已经不是原来那个了。
-      return { ok: false, reason: "rotated", from: previewGenerationId, to: activeNow };
-    }
-
-    // 预览到落盘之间可能有新内容进来，也可能有内容已经发出去了。
-    const freshAll = listPending({ outboxDir });
-    const fresh = generation === null ? freshAll : selectByGeneration(freshAll, generation, freshMapping);
-    // **比集合，不是比数量。**只比条数挡不住等量替换：预览之后少一条旧的、
-    // 多一条新的，总数没变，就会不可逆地抑制另一批内容。
-    const before = new Set(pending.map((x) => x._file));
-    const now = new Set(fresh.map((x) => x._file));
-    const same = before.size === now.size && [...before].every((f) => now.has(f));
-    if (!same) return { ok: false, reason: "drift", before: before.size, now: now.size };
-    return { ok: true, done: suppressRecords(fresh, { reason }) };
-  } finally {
-    releasePublishLock(lockDir);
-    if (genLockDir !== null) releasePublishLock(genLockDir);
-  }
+  // 判据在 suppress-outbox-core 里，两条链路共用。这里只回答三个本地问题：
+  // 锁在哪、锁内怎么重读、这批要选哪些。
+  const needsGeneration = dependsOnMapping(pending);
+  const binding = needsGeneration ? currentBinding({ root, claudeSessionId: session }) : null;
+  return applySuppressionCore({
+    outboxDir,
+    publishLockDir: path.join(root, ".runtime-data", "outbound", "publish.lock"),
+    generationLockDir: needsGeneration
+      ? topicGenerationLockDir({ source: binding?.source, root }) : null,
+    pending, previewGenerationId, reason,
+    readState: () => {
+      const resolved = resolveProject({ root, claudeSessionId: session });
+      const freshMapping = resolved.ok ? resolved.mapping : null;
+      return {
+        activeGeneration: activeGenerationOf(freshMapping),
+        select: (all) => (generation === null
+          ? all : selectByGeneration(all, generation, freshMapping)),
+      };
+    },
+  });
 }
 
 function main() {

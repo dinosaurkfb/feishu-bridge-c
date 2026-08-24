@@ -7,6 +7,8 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { moduleRoot } from "../direct-run.mjs";
+import { applySuppressionCore } from "../suppress-outbox-core.mjs";
+import { parseArgs as parseCodexSuppressArgs } from "./suppress-outbox.mjs";
 
 import {
   appendEvent, listPending, markPublishEligibleByEventKey, suppressPublishByEventKey,
@@ -2422,6 +2424,89 @@ test("Codex 测试文件里没有写在汇总之后的 test()", () => {
   }
   assert.deepEqual(late, [],
     "第 " + late.join("、") + " 行的 test() 写在汇总之后，结果不会计入统计");
+});
+
+test("Codex 抑制：共用核心的判据在这一侧也真的生效", () => {
+  // **不只是"命令存在"。**判据抽成了共用核心，但共用只有在两边都真的接上时才成立 ——
+  // Claude 侧那批回归证明不了 Codex 这一侧接对了。所以这里直接驱动核心，
+  // 用 Codex 的路径布局，把每条判据各验一遍。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-suppress-"));
+  const outbox = path.join(dir, "outbox");
+  const publishLock = path.join(dir, "publish.lock");
+  const genLock = path.join(dir, "registry.lock");
+  fs.mkdirSync(outbox, { recursive: true });
+  const write = (name, extra = {}) => {
+    fs.writeFileSync(path.join(outbox, name),
+      JSON.stringify({ kind: "progress", text: name, published_at: null, ...extra }));
+  };
+  const readRec = (name) => JSON.parse(fs.readFileSync(path.join(outbox, name), "utf-8"));
+  const state = (gen) => ({ activeGeneration: gen, select: (r) => r });
+  const call = (over) => applySuppressionCore({
+    outboxDir: outbox, publishLockDir: publishLock, generationLockDir: genLock,
+    previewGenerationId: "gen-1", readState: () => state("gen-1"), reason: "t", ...over });
+
+  // ① 正常：全停下来。
+  write("0001.json", { target_channel_generation_id: "gen-1" });
+  let pending = listPending({ outboxDir: outbox });
+  let got = call({ pending, reason: "历史内容" });
+  assert.equal(got.ok, true, got.reason ?? "");
+  assert.equal(got.done.changed, 1);
+  assert.equal(readRec("0001.json").publish_suppressed_reason, "历史内容");
+  assert.equal(fs.existsSync(publishLock), false, "跑完要把发布锁还回去");
+
+  // ② 等量替换：条数没变、内容换了 → 必须中止。
+  write("0002.json", { target_channel_generation_id: "gen-1" });
+  pending = listPending({ outboxDir: outbox });
+  fs.rmSync(path.join(outbox, "0002.json"));
+  write("0003.json", { target_channel_generation_id: "gen-1" });
+  got = call({ pending });
+  assert.equal(got.reason, "drift", "只比条数的话这里会放行");
+  assert.equal(readRec("0003.json").publish_suppressed_at, undefined, "中止就一条不许动");
+
+  // ③ 旧格式记录 + 预览后轮转 → 必须中止，**即使文件一个没变**。
+  fs.rmSync(path.join(outbox, "0003.json"));
+  write("0004.json");                       // 没有 target_channel_generation_id
+  pending = listPending({ outboxDir: outbox });
+  got = call({ pending, readState: () => state("gen-2") });
+  assert.equal(got.reason, "rotated");
+  assert.deepEqual([got.from, got.to], ["gen-1", "gen-2"]);
+  assert.equal(readRec("0004.json").publish_suppressed_at, undefined);
+
+  // ④ 有旧格式记录、却给不出代际锁 → 明确拒绝，不许拿一把猜出来的锁碰运气。
+  assert.equal(call({ pending, generationLockDir: null }).reason, "binding_unresolved");
+
+  // ⑤ 代际锁被占（轮转进行中）→ 不动手，也不许去碰发布锁。
+  fs.mkdirSync(genLock, { recursive: true });
+  fs.writeFileSync(path.join(genLock, "owner.json"),
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  got = call({ pending });
+  assert.equal(got.reason, "rotation_busy");
+  assert.equal(fs.existsSync(publishLock), false, "第一把锁没拿到就不许留下第二把");
+  fs.rmSync(genLock, { recursive: true, force: true });
+
+  // ⑥ 每条都自带代际时，轮转不该拦 —— 那时中止是在拒绝一件本来安全的事。
+  fs.rmSync(path.join(outbox, "0004.json"));
+  write("0005.json", { target_channel_generation_id: "gen-9" });
+  pending = listPending({ outboxDir: outbox });
+  got = call({ pending, readState: () => state("gen-2") });
+  assert.equal(got.ok, true, "没有旧格式记录时轮转不该拦：" + (got.reason ?? ""));
+  assert.equal(fs.existsSync(genLock), false, "这种情况下压根不该去取代际锁");
+});
+
+test("Codex 抑制命令：默认只预览，参数拼错不许被当成别的操作", () => {
+  // 有损且不可逆，所以默认预览、白名单严格。
+  const ok = parseCodexSuppressArgs(["--thread-id", "t1", "--apply", "--reason", "x"]);
+  assert.equal(ok.ok, true);
+  assert.equal(ok.seen.get("apply"), true);
+  for (const [what, argv] of [
+    ["拼错 apply", ["--aply"]],
+    ["未知参数", ["--force"]],
+    ["重复参数", ["--thread-id", "a", "--thread-id", "b"]],
+    ["缺值", ["--thread-id", "--apply"]],
+    ["裸参数", ["thread-id"]],
+  ]) {
+    assert.equal(parseCodexSuppressArgs(argv).ok, false, what + " 竟然被接受了");
+  }
 });
 
 summarySealed = true;

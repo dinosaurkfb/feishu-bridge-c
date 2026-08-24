@@ -9202,6 +9202,63 @@ test("测试不许走真实发布路径 —— 每个 drainProject 调用都要�
     "这些调用注入了 publish 却没注入 diagnose —— 失败后的诊断仍会真的出网");
 });
 
+test("有 mapping 但没登记不算已接入 —— 那是发不出去还不报错的状态", () => {
+  // 线上真事：这个项目的绑定在项目目录里，登记表里却没有它。
+  // **出站路由看的是登记表** —— Stop 钩子挑不到项目就静默退出，一句日志都不写。
+  // 于是每一轮答复根本没进过出站流程，而 bind 命令还报"已经接入过了"。
+  // 是从"话题里十几个小时没动静"才发现的。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-adopt-"));
+  const proj = path.join(dir, "proj");
+  const inbound = path.join(proj, ".runtime-data", "inbound");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: proj, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_existing",
+    feishu_root_message_id_reference: "om_existing",
+    claude_session_id: null, channel_generation_id: "gen-4" }));
+  const reg = path.join(dir, "registry.json");
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0", projects: [] }));
+  // 机器级链路模板也要隔离 —— 不给的话命令会在读模板那一步就退出，
+  // 测到的就不是这条分支了。
+  const tpl = path.join(dir, "chain-config.json");
+  fs.writeFileSync(tpl, JSON.stringify(TPL));
+
+  const bind = (...args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, ...args,
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: reg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: dir } });
+  const projects = () => JSON.parse(fs.readFileSync(reg, "utf-8")).projects;
+
+  // 预览：要说清坏在哪，而不是"已经接入过了"。
+  const preview = bind();
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.match(preview.stdout, /登记表里没有它/u);
+  assert.match(preview.stdout, /静默跳过/u, "要说清后果：发不出去且不报错");
+  assert.equal(preview.stdout.includes("已经接入过了"), false,
+    "这不是已接入 —— 报成已接入正是这个缺陷本身");
+  assert.equal(projects().length, 0, "预览不许写盘");
+
+  // 落盘：补登记、**复用原话题**、不发任何消息。
+  const applied = bind("--apply");
+  assert.equal(applied.status, 0, applied.stderr);
+  assert.match(applied.stdout, /已补登记/u);
+  assert.match(applied.stdout, /没有建新话题/u);
+  assert.equal(projects().length, 1);
+  assert.equal(projects()[0].root_message_id, "om_existing",
+    "必须复用 mapping 里那个根话题，新建等于把历史对话变成孤儿");
+
+  // 补完之后出站才挑得到它 —— 这才是"通了"的判据。
+  assert.deepEqual(
+    attributeSession({ projects: projects(), cwd: proj, transcriptPath: null }).map((x) => x.root),
+    [proj], "补登记之后出站必须能挑到这个项目");
+
+  // 再跑一次：幂等，不许变成两条。
+  const again = bind("--apply");
+  assert.match(again.stdout, /已经接入过了/u, "这时才该说已接入");
+  assert.equal(projects().length, 1);
+});
+
 test("带诊断的失败分支必须真的可达 —— 更具体的条件要先判", () => {
   // 上一版把通用 status === "error" 排在前面，于是"error 且带诊断"那条**永远进不去**：
   // 功能写了，在真实入口上一次都没跑过。跟之前那个 ReferenceError 是同一族 ——

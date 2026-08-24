@@ -8,7 +8,8 @@
 import { listPending, markSent } from "../outbox.mjs";
 import { publishDraft } from "../outbound.mjs";
 import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
-import { resolveLarkIdentity } from "../chain-template.mjs";
+import fs from "node:fs";
+import { assertPublishIdentity, resolveLarkIdentity } from "../chain-template.mjs";
 import { composeCodexOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import {
   businessActivitiesForPublishedBatch,
@@ -47,15 +48,32 @@ export function preflightTask({ task, home = bridgeHome() } = {}) {
   if (resolved.mapping.status !== "active" || !resolved.mapping.feishu_root_message_id_reference) {
     return { ok: false, status: "skipped", reason: "mapping_not_active" };
   }
-  // 身份解析不出来的话，真到发的时候才炸 —— 门槛必须在这里就发现。
+  // **resolveLarkIdentity 只是拼路径，它永远返回对象。**
+  // 上一版拿它当身份检查，于是 lark-cli 不存在、凭据目录读不出来、
+  // profile 不在、凭据的 app id 跟配置对不上 —— 一律"通过"。
+  // 评审用不存在的二进制和凭据目录实测，门槛照样报 ok:true。
+  //
+  // 真正的检查是 assertPublishIdentity（"我手上这份凭据确实属于我以为的那个应用"），
+  // 加上 lark-cli 本身可不可执行。**发之前会做的，门槛就得做。**
+  let identity;
   try {
-    const identity = resolveLarkIdentity(resolved.template);
-    if (!identity) return { ok: false, status: "error", reason: "identity_unresolved" };
+    identity = resolveLarkIdentity(resolved.template);
   } catch (err) {
-    return { ok: false, status: "error",
-      reason: "identity_unresolved", error: String(err?.message ?? err).slice(0, 200) };
+    return { ok: false, status: "error", reason: "identity_unresolved",
+      error: String(err?.message ?? err).slice(0, 200) };
   }
-  return { ok: true, resolved };
+  const bin = identity?.bin;
+  if (typeof bin !== "string" || bin.length === 0) {
+    return { ok: false, status: "error", reason: "lark_cli_unset" };
+  }
+  try { fs.accessSync(bin, fs.constants.X_OK); }
+  catch { return { ok: false, status: "error", reason: "lark_cli_not_executable" }; }
+  const checked = assertPublishIdentity(identity);
+  if (!checked?.ok) {
+    return { ok: false, status: "error",
+      reason: checked?.reason ?? "identity_mismatch" };
+  }
+  return { ok: true, resolved, identity };
 }
 
 export function publishEligibleTaskEvents({ task, home = bridgeHome(), timeoutMs = 12_000 } = {}) {

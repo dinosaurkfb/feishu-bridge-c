@@ -6,7 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { moduleRoot } from "../direct-run.mjs";
 import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
-import { acceptsHookCommand, ownsHookCommand } from "./hook-command.mjs";
+import { acceptsHookCommand, ownsHookCommand, pickNode } from "./hook-command.mjs";
+import { SKILL_NAMES, auditSkills } from "./skill-content.mjs";
 import { PHASE_TEXT, serviceState } from "./drain-service.mjs";
 
 import {
@@ -105,8 +106,16 @@ let hooks = null;
 const hooksFile = path.join(CODEX_HOME, "hooks.json");
 try { hooks = JSON.parse(fs.readFileSync(hooksFile, "utf-8")); } catch { /* 下方统一报告 */ }
 const RUNTIME_CURRENT = path.join(RUNTIME_ROOT, "current");
-const expectPrompt = path.join(RUNTIME_CURRENT, "scripts", "codex", "prompt-hook.mjs");
-const expectStop = path.join(RUNTIME_CURRENT, "scripts", "codex", "stop-hook.mjs");
+// **期望定义要跟安装器逐字同源**：node、脚本、bridge home、日志四项都算。
+// 只比脚本路径的话，node 指到不存在的二进制、日志写错地方，doctor 照样报正常。
+const expectOf = (name) => ({
+  node: pickNode(),
+  script: path.join(RUNTIME_CURRENT, "scripts", "codex", name),
+  home,
+  log: path.join(home, "hook.log"),
+});
+const expectPrompt = expectOf("prompt-hook.mjs");
+const expectStop = expectOf("stop-hook.mjs");
 const hookReport = [
   ["UserPromptSubmit", "prompt-hook.mjs", expectPrompt],
   ["Stop", "stop-hook.mjs", expectStop],
@@ -117,7 +126,9 @@ const hookReport = [
   // 迁移时如果按完整路径去找旧条目，路径一换就匹配不上，于是新增而不是替换。
   if (found.length > 1) return { event, ok: false, why: found.length + " 条重复" };
   // **逐字相等，不是包含。**acceptsHookCommand 同时验"是我们的"和"正是这个脚本"。
-  if (!acceptsHookCommand(found[0], expected)) return { event, ok: false, why: "指向 runtime 之外" };
+  if (!acceptsHookCommand(found[0], expected)) {
+    return { event, ok: false, why: "与安装器会写的那条对不上（脚本/node/home/日志任一不同）" };
+  }
   return { event, ok: true, why: "恰好 1 条，指向 runtime/current" };
 });
 const hooksOk = hookReport.every((r) => r.ok);
@@ -131,11 +142,16 @@ add("Codex hooks", hooksOk,
 add("hook 信任", null, "本地读不到 Codex 的信任状态；hook 已安装不等于已信任",
   "在 Codex 里用 /hooks 核对命令后确认；迁移改了命令，多半需要重新信任");
 
-const missingSkills = REQUIRED_SKILLS.filter((name) =>
-  !fs.existsSync(path.join(CODEX_HOME, "skills", name, "SKILL.md")));
-add("Codex skills", missingSkills.length === 0,
-  missingSkills.length === 0 ? REQUIRED_SKILLS.length + " 项均已安装" : "缺少 " + missingSkills.join(", "),
-  "运行 `node scripts/codex/install.mjs --apply`");
+// **逐字节比对，不是"文件在不在"。**runtime 换了、路径改了，旧内容照样存在；
+// 只查存在的话，一次没生效的安装看起来跟成功一模一样。
+const skillAudit = auditSkills({
+  repoRoot: ROOT, codexHome: CODEX_HOME,
+  runtimeCurrent: RUNTIME_CURRENT, bridgeHome: home,
+});
+add("Codex skills", skillAudit.ok,
+  skillAudit.ok ? SKILL_NAMES.length + " 项内容均与期望逐字节一致"
+    : skillAudit.problems.map((p) => p.skill + "/" + p.file + "：" + p.why).join("；"),
+  "运行 `node scripts/codex/install.mjs` 预览，确认后加 `--apply`");
 
 const registry = loadRegistry(registryFile(home));
 const tasks = registry.ok ? registry.tasks : [];

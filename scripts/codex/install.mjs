@@ -12,7 +12,8 @@ import os from "node:os";
 import path from "node:path";
 import { moduleRoot } from "../direct-run.mjs";
 import { shellQuote } from "../shell-quote.mjs";
-import { buildHookCommand, ownsHookCommand } from "./hook-command.mjs";
+import { buildHookCommand, ownsHookCommand, pickNode } from "./hook-command.mjs";
+import { SKILLS, expectedSkillContent } from "./skill-content.mjs";
 
 import {
   bridgeHome, enableAutoPublishForAllTasks, registryFile,
@@ -27,12 +28,7 @@ const HOOKS = path.join(CODEX_HOME, "hooks.json");
 const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
 
-const pickNode = () => {
-  for (const file of ["/opt/homebrew/bin/node", "/usr/local/bin/node", process.execPath]) {
-    try { fs.accessSync(file, fs.constants.X_OK); return file; } catch { /* next */ }
-  }
-  return process.execPath;
-};
+
 // 原来这里自带一份同样逻辑的 shellQuote。同一条策略写两遍就会漂 ——
 // 这个仓库今天已经为这类重复付过一次代价（时间格式在两处各写一份，边界收紧了一处、
 // 另一处没跟上）。改用共用实现。Codex 侧的钩子命令一直是正确加引号的，
@@ -107,23 +103,9 @@ function updateHook(event, script, timeout) {
 const promptAction = updateHook("UserPromptSubmit", promptScript, 10);
 const stopAction = updateHook("Stop", stopScript, 20);
 
-const skills = [
-  { name: "m5codex-inbound-router", files: ["SKILL.md", "aily-cli-skill.json"] },
-  { name: "codex-longtask-feishu", files: ["SKILL.md"] },
-  { name: "feishu-bind", files: ["SKILL.md"] },
-  { name: "feishu-unbind", files: ["SKILL.md"] },
-  { name: "feishu-status", files: ["SKILL.md"] },
-  { name: "feishu-rotate", files: ["SKILL.md"] },
-  { name: "feishu-mode", files: ["SKILL.md"] },
-];
-// {{SCRIPT:x.mjs}} 由渲染器负责加 shell 引号 —— 引用是渲染器的职责，不是模板作者的记性。
-// 模板里原来写的是 node "{{BRIDGE_ROOT}}/scripts/…"，双引号挡得住空格但挡不住
-// `$`、反引号和反斜杠；单引号才是 POSIX 里唯一完全字面的。
-const renderedSkill = (file) => fs.readFileSync(file, "utf-8")
-  .replaceAll(/\{\{SCRIPT:([A-Za-z0-9_./-]+)\}\}/gu,
-    (_, name) => shellQuote(path.join(RUNTIME_CURRENT, "scripts", name)))
-  .replaceAll("{{BRIDGE_ROOT}}", RUNTIME_CURRENT)
-  .replaceAll("{{CODEX_BRIDGE_HOME_SHELL}}", shellQuote(home));
+const skills = SKILLS;
+const renderedSkill = (file, name) => expectedSkillContent({
+  sourceFile: file, name, runtimeCurrent: RUNTIME_CURRENT, bridgeHome: home });
 
 console.log("hooks       " + HOOKS);
 console.log("  UserPromptSubmit → " + promptAction);
@@ -202,8 +184,7 @@ for (const skill of skills) {
   fs.mkdirSync(dst, { recursive: true, mode: 0o700 });
   for (const name of skill.files) {
     const source = path.join(src, name);
-    const content = name === "SKILL.md" ? renderedSkill(source) : fs.readFileSync(source);
-    fs.writeFileSync(path.join(dst, name), content, { mode: 0o600 });
+    fs.writeFileSync(path.join(dst, name), renderedSkill(source, name), { mode: 0o600 });
   }
 }
 

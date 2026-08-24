@@ -72,6 +72,12 @@ export const codexHomeOf = (home = os.homedir()) =>
 const xml = (text) => String(text)
   .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 
+/** launchd 里**应该**跑的东西。跟 plist 同源 —— 各写一份就会漂。 */
+export function expectedJob({ home = os.homedir(), codexHome = codexHomeOf(home),
+  node = pickNode() } = {}) {
+  return { node, args: [node, drainScriptPath(home, codexHome)] };
+}
+
 export function plistBody({ home = os.homedir(), node = pickNode(),
   codexHome = codexHomeOf(home) } = {}) {
   const script = drainScriptPath(home, codexHome);
@@ -118,34 +124,60 @@ export function classifyBacklog({ home = bridgeHome() } = {}) {
   let total = 0;
   let unreadable = 0;
   for (const t of reg.tasks ?? []) {
-    const outboxDir = taskPaths(t, home).outbox;
-    let n = 0;
-    try { n = listPending({ outboxDir }).length; }
-    catch { return { ok: false, reason: "outbox_unreadable" }; }
-    // **listPending 会静默跳过读不出来的文件。**于是一个装满坏 JSON 的 outbox
-    // 会被数成"0 条积压"，门槛放行，定时器装上 —— 而那些文件到底是什么内容
-    // 谁也不知道。**读不出来不等于没有**，这跟登记表那条是同一个道理。
-    const bad = unreadableRecords(outboxDir);
-    unreadable += bad.length;
-    total += n;
-    if (n > 0 || bad.length > 0) {
-      tasks.push({ key: t?.logical_task_key ?? null, pending: n, unreadable: bad.length });
+    const audit = auditOutbox(taskPaths(t, home).outbox);
+    if (!audit.ok) return { ok: false, reason: audit.reason };
+    unreadable += audit.unclassified.length;
+    total += audit.pending;
+    if (audit.pending > 0 || audit.unclassified.length > 0) {
+      tasks.push({ key: t?.logical_task_key ?? null, pending: audit.pending,
+        unreadable: audit.unclassified.length });
     }
   }
   return { ok: true, total, unreadable, tasks };
 }
 
-/** outbox 里有几个文件根本读不出来。listPending 会跳过它们，所以要单独数。 */
-export function unreadableRecords(outboxDir) {
+/**
+ * 把一个 outbox 里的**每一个 JSON 都归类**：pending / published / suppressed，
+ * 三样都不是就是 unclassified。
+ *
+ * **只补坏 JSON 是不够的**（上一版就是这样）。评审补了两个反例：
+ *   · outbox 路径读不出来、或者根本不是目录；
+ *   · JSON 能解析、但不是合法的 outbox 记录（比如 `{}`）。
+ * 两种都会让门槛报"0 条积压"然后放行。
+ *
+ * **只有目录不存在才算真的空。**其余任何"说不清"都必须拦住 ——
+ * 那些文件是什么内容谁也不知道，而定时器一启用就会去动它们。
+ */
+export function auditOutbox(outboxDir) {
   let files;
-  try { files = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json")); }
-  catch { return []; }
-  const bad = [];
-  for (const f of files) {
-    try { JSON.parse(fs.readFileSync(path.join(outboxDir, f), "utf-8")); }
-    catch { bad.push(f); }
+  try {
+    const st = fs.statSync(outboxDir);
+    if (!st.isDirectory()) return { ok: false, reason: "outbox_not_a_directory" };
+    files = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json"));
+  } catch (err) {
+    // 不存在 = 还没发过东西，合法的空。其他错误（权限等）说不清，拦住。
+    if (err.code === "ENOENT") return { ok: true, pending: 0, unclassified: [] };
+    return { ok: false, reason: "outbox_unreadable" };
   }
-  return bad;
+  let pending = 0;
+  const unclassified = [];
+  for (const f of files) {
+    let rec;
+    try { rec = JSON.parse(fs.readFileSync(path.join(outboxDir, f), "utf-8")); }
+    catch { unclassified.push({ file: f, why: "读不出来" }); continue; }
+    if (rec === null || typeof rec !== "object" || Array.isArray(rec)) {
+      unclassified.push({ file: f, why: "不是记录对象" }); continue;
+    }
+    // 合法记录必须能落进这三态之一。`{}` 落不进 —— 它既没发过也没被停过，
+    // 却也没有 published_at 这个字段可依据。
+    const hasPublished = "published_at" in rec;
+    const suppressed = typeof rec.publish_suppressed_at === "string" && rec.publish_suppressed_at;
+    if (suppressed) continue;                       // suppressed
+    if (!hasPublished) { unclassified.push({ file: f, why: "缺 published_at，无法归类" }); continue; }
+    if (rec.published_at === null) pending += 1;    // pending
+    // 其余是 published
+  }
+  return { ok: true, pending, unclassified };
 }
 
 /**
@@ -170,7 +202,7 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
     // 那正是"界面说正常、实际不工作"的形状。
     phase: installed === null ? "absent"
       : installed !== wanted ? "stale"
-      : loadedPhase(spawnLaunchctl, drainScriptPath(home, codexHome)),
+      : loadedPhase(spawnLaunchctl, expectedJob({ home, codexHome })),
     enabled: installed !== null,
     stale: installed !== null && installed !== wanted,
     plist: file,
@@ -181,7 +213,23 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
 /**
  * launchd 里到底有没有它。**读不出来就说读不出来**，不许由"文件在"推出"在跑"。
  */
-export function loadedPhase(run = spawnLaunchctl, expectScript = null) {
+/**
+ * 从 `launchctl list <label>` 的输出里拆出 Program 与完整的 ProgramArguments。
+ *
+ * 拆出来才能**精确核对**。上一版只查输出里"包不包含期望脚本路径"——
+ * 评审构造了一个实际运行 /bin/echo、仅把期望脚本当参数的 job，照样被判成 loaded。
+ * 子串包含分不开"跑的是它"和"提到了它"。
+ */
+export function parseLaunchctlList(text) {
+  if (typeof text !== "string") return null;
+  const program = /"Program"\s*=\s*"((?:[^"\\]|\\.)*)";/u.exec(text);
+  const block = /"ProgramArguments"\s*=\s*\(([\s\S]*?)\);/u.exec(text);
+  if (!block) return null;
+  const args = [...block[1].matchAll(/"((?:[^"\\]|\\.)*)"/gu)].map((m) => m[1]);
+  return { program: program ? program[1] : null, args };
+}
+
+export function loadedPhase(run = spawnLaunchctl, expect = null) {
   const r = run(["list", LAUNCH_LABEL]);
   if (!r.ok) {
     // 明确的"没这个服务"和"我查不了"是两件事。
@@ -190,16 +238,17 @@ export function loadedPhase(run = spawnLaunchctl, expectScript = null) {
     }
     return "unverifiable";
   }
+  if (expect === null) return "loaded";
+  const parsed = parseLaunchctlList(r.stdout);
+  // **拆不出来就说查不出来，不许当成 loaded。**
+  if (parsed === null) return "unverifiable";
+  const sameProgram = parsed.program === null || parsed.program === expect.node;
+  const sameArgs = parsed.args.length === expect.args.length &&
+    parsed.args.every((a, i) => a === expect.args[i]);
   // **同名 job 在，不等于跑的是我们刚写的那份。**
-  //
-  // 先写新 plist 再 bootstrap，失败时 plist 留在原地；而如果旧的同名 job 还在
-  // launchd 里跑着，只看"有没有这个 label"就会报"已加载，正在按计划跑"——
-  // 实际跑的是旧配置。评审用这个场景做出了假绿。
-  if (expectScript !== null) {
-    const args = typeof r.stdout === "string" ? r.stdout : "";
-    if (!args.includes(expectScript)) return "loaded_other";
-  }
-  return "loaded";
+  // 先写新 plist 再 bootstrap，失败时 plist 留在原地；旧的同名 job 还在跑的话，
+  // 只看 label 就会报"已加载，正在按计划跑"，而实际跑的是旧配置。
+  return sameProgram && sameArgs ? "loaded" : "loaded_other";
 }
 
 export const PHASE_TEXT = {
@@ -350,7 +399,14 @@ function main() {
   fs.mkdirSync(path.dirname(st.plist), { recursive: true });
   // **先把同名的旧 job 卸掉。**不卸的话 bootstrap 会因"已存在"失败，
   // 而旧 job 继续按旧配置跑 —— 那正是"报了错却仍显示已加载"的来源。
-  spawnLaunchctl(["bootout", "gui/" + process.getuid() + "/" + LAUNCH_LABEL]);
+  const out = spawnLaunchctl(["bootout", "gui/" + process.getuid() + "/" + LAUNCH_LABEL]);
+  // **只有"本来就没有"可以忽略。**其他失败意味着旧 job 还在，
+  // 接着 bootstrap 只会失败或让旧配置继续跑 —— 那正是假绿的来源。
+  if (!out.ok && !/could not find|No such|not.*loaded/iu.test(out.detail ?? "")) {
+    console.error("\n卸载旧的同名 job 失败：" + out.detail);
+    console.error("**没有动 plist。**旧 job 可能还在按旧配置跑，先处理它再来。");
+    process.exit(1);
+  }
   fs.writeFileSync(st.plist, plistBody({ home }), { mode: 0o644 });
   const loaded = spawnLaunchctl(["bootstrap", "gui/" + process.getuid(), st.plist]);
   if (!loaded.ok) {
@@ -360,7 +416,14 @@ function main() {
     console.error("**定时器现在不会跑。**修好后重跑本命令。");
     process.exit(1);
   }
-  console.log("\n已启用，定时器已加载。");
+  // **bootstrap 返回 0 不等于跑的是我们这份。**重新读一次，核验实际参数。
+  const after = loadedPhase(spawnLaunchctl, expectedJob({ home }));
+  if (after !== "loaded") {
+    console.error("\nbootstrap 报成功，但核验实际 job 得到：" + (PHASE_TEXT[after] ?? after));
+    console.error("**不当作已启用。**");
+    process.exit(1);
+  }
+  console.log("\n已启用，定时器已加载（实际参数已核验）。");
   console.log("每 30 分钟扫一次全部登记 task；**只发已取得发布资格的内容**。");
 }
 

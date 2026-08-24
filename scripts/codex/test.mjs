@@ -12,8 +12,11 @@ import {
   checkArgShape, locateTask, parseArgs as parseCodexSuppressArgs,
 } from "./suppress-outbox.mjs";
 import {
-  classifyBacklog, drainScriptPath, enableBlockers, loadedPhase, plistBody, scanRunnable,
+  auditOutbox, classifyBacklog, drainScriptPath, enableBlockers, loadedPhase,
+  plistBody, scanRunnable,
 } from "./drain-service.mjs";
+import { auditSkills } from "./skill-content.mjs";
+import { preflightTask } from "./publish-eligible.mjs";
 import {
   HOOK_TAG, acceptsHookCommand, buildHookCommand, ownsHookCommand, parseHookCommand,
 } from "./hook-command.mjs";
@@ -2882,6 +2885,204 @@ test("迁移必须收敛旧克隆的 hook，而不是在旁边再加一条", () 
     "长得像但 guard 与执行的脚本对不上的，不是我们的，不许碰");
 });
 
+test("链路预检必须真验身份：lark-cli 不在、凭据对不上都要拦", () => {
+  // 评审实测：resolveLarkIdentity **只是拼路径，永远返回对象** ——
+  // 拿它当身份检查的话，二进制不存在、凭据目录读不出来、profile 不在、
+  // app id 对不上，一律"通过"。而真实发送会在这几处失败。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "abc123" });
+  writeRegistry([task], path.join(home, "registry.json"));
+
+  const bin = path.join(home, "lark-cli");
+  fs.writeFileSync(bin, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  const credBase = path.join(home, "creds");
+  const agentDir = path.join(credBase, String(TEMPLATE.agent_uid ?? "agent"));
+  fs.mkdirSync(agentDir, { recursive: true });
+  const writeCred = (appId) => fs.writeFileSync(path.join(agentDir, "config.json"),
+    JSON.stringify({ apps: [{ name: TEMPLATE.lark_cli_profile, appId }] }));
+
+  const withTemplate = (mut) => {
+    const t = JSON.parse(JSON.stringify(TEMPLATE));
+    t.lark_cli_bin = bin;
+    t.lark_cli_config_base = credBase;
+    mut(t);
+    fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(t));
+    return preflightTask({ task, home });
+  };
+
+  writeCred(TEMPLATE.outbound_app_id);
+  const good = withTemplate(() => {});
+  assert.equal(good.ok, true, "配置齐全时该通过：" + (good.reason ?? ""));
+
+  // 二进制不存在
+  const missing = withTemplate((t) => { t.lark_cli_bin = "/definitely/missing/lark"; });
+  assert.equal(missing.ok, false, "**lark-cli 不存在必须拦**");
+  assert.equal(missing.reason, "lark_cli_not_executable");
+
+  // 二进制在但不可执行
+  const notExec = path.join(home, "not-exec");
+  fs.writeFileSync(notExec, "x", { mode: 0o600 });
+  assert.equal(withTemplate((t) => { t.lark_cli_bin = notExec; }).reason,
+    "lark_cli_not_executable", "不可执行也要拦");
+
+  // 凭据目录读不出来
+  assert.equal(withTemplate((t) => { t.lark_cli_config_base = "/definitely/missing"; }).reason,
+    "config_dir_unreadable", "**凭据目录读不出来必须拦**");
+
+  // 凭据里的 app id 跟配置对不上 —— 拿着别人的身份发
+  writeCred("cli_someoneelse");
+  assert.equal(withTemplate(() => {}).reason, "app_id_mismatch",
+    "**凭据属于别的应用必须拦**");
+  writeCred(TEMPLATE.outbound_app_id);
+});
+
+test("积压归类：每个 JSON 都要能归类，说不清就拦住", () => {
+  // 评审：上一版只补了坏 JSON，没覆盖"路径不是目录"和"能解析但不是记录（如 {}）"。
+  // **只有目录不存在才算真的空。**
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-audit-"));
+  const ok = (name, body) => fs.writeFileSync(path.join(dir, name), body);
+
+  ok("pending.json", JSON.stringify({ kind: "milestone", published_at: null }));
+  ok("published.json", JSON.stringify({ published_at: "2026-08-24T00:00:00Z" }));
+  ok("suppressed.json", JSON.stringify({ published_at: null,
+    publish_suppressed_at: "2026-08-24T00:00:00Z" }));
+  let a = auditOutbox(dir);
+  assert.equal(a.ok, true);
+  assert.equal(a.pending, 1, "三态各一，只有一条待发");
+  assert.deepEqual(a.unclassified, [], "三态都能归类");
+
+  ok("empty.json", "{}");
+  ok("broken.json", "这不是 JSON");
+  ok("array.json", "[]");
+  a = auditOutbox(dir);
+  assert.equal(a.pending, 1, "待发数不受影响");
+  assert.equal(a.unclassified.length, 3,
+    "**{} / 坏 JSON / 数组都必须被点出来**：" + JSON.stringify(a.unclassified));
+
+  // 目录不存在 = 合法的空。
+  assert.deepEqual(auditOutbox(path.join(dir, "nope")), { ok: true, pending: 0, unclassified: [] });
+
+  // 路径是文件不是目录 → 说不清，拦住。
+  const file = path.join(dir, "afile");
+  fs.writeFileSync(file, "x");
+  assert.equal(auditOutbox(file).ok, false);
+  assert.equal(auditOutbox(file).reason, "outbox_not_a_directory");
+});
+
+test("hook 往返：含单引号的路径，装两次仍然只有一条", () => {
+  // 评审实测：shellQuote 把 ' 编码成 '\'' ，而 '([^']+)' 在第一个内嵌引号处就断了。
+  // 于是在含 ' 的 CODEX_HOME 下连装两次，UserPromptSubmit 和 Stop **各出现 2 条**——
+  // 第二次没认出第一次装的那条。
+  const dir = temp();
+  const codexHome = path.join(dir, "co'dex-home");     // 目录名里带单引号
+  const home = path.join(dir, "bridge'home");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
+  writeRegistry([], path.join(home, "registry.json"));
+  const env = { ...process.env, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home };
+  const install = () => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
+
+  assert.equal(install().status, 0);
+  assert.equal(install().status, 0, "第二次安装");
+
+  const hooks = JSON.parse(fs.readFileSync(path.join(codexHome, "hooks.json"), "utf-8"));
+  for (const [event, basename] of [["UserPromptSubmit", "prompt-hook.mjs"], ["Stop", "stop-hook.mjs"]]) {
+    const mine = (hooks.hooks[event] ?? [])
+      .flatMap((e) => (e.hooks ?? []).map((h) => h.command))
+      .filter((c) => ownsHookCommand(c, basename));
+    assert.equal(mine.length, 1,
+      "**装两次也只能有一条**（" + event + "）：" + mine.length + " 条");
+    // 往返：解析出来再造回去必须逐字相同。
+    const parsed = parseHookCommand(mine[0]);
+    assert.notEqual(parsed, null, "含单引号的路径必须解析得出");
+    assert.equal(buildHookCommand(parsed), mine[0], "build → parse → build 要往返");
+  }
+});
+
+test("doctor 比对完整期望定义 —— node/home/日志任一不对都不许算正常", () => {
+  // 评审实测：把 node 换成 /definitely/missing/node、bridge home 和日志也改错，
+  // doctor 仍报 hooks 正常，因为它只比 parsed.script。
+  const script = "/r/current/scripts/codex/stop-hook.mjs";
+  const expect = { node: "/opt/homebrew/bin/node", script, home: "/h", log: "/h/hook.log" };
+  const good = buildHookCommand(expect);
+  assert.equal(acceptsHookCommand(good, expect), true);
+
+  for (const [field, value] of [["node", "/definitely/missing/node"],
+    ["home", "/wrong"], ["log", "/wrong/hook.log"]]) {
+    const drifted = buildHookCommand({ ...expect, [field]: value });
+    assert.equal(parseHookCommand(drifted) !== null, true, "它本身仍是我们的 hook");
+    assert.equal(acceptsHookCommand(drifted, expect), false,
+      "**" + field + " 不对就不许算正常**");
+  }
+});
+
+test("技能要逐字节比对 —— 「文件在」不等于「装对了」", () => {
+  // 评审实测：安装后把 feishu-status/SKILL.md 换成陈旧内容，
+  // doctor 仍报 {"name":"Codex skills","ok":true,"detail":"7 项均已安装"}。
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  const home = path.join(dir, "bridge-home");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
+  writeRegistry([], path.join(home, "registry.json"));
+  const runtimeCurrent = path.join(codexHome, "feishu-bridge", "runtime", "current");
+  assert.equal(spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", env: { ...process.env, CODEX_HOME: codexHome,
+      FEISHU_CODEX_BRIDGE_HOME: home } }).status, 0);
+
+  const audit = () => auditSkills({ repoRoot: ROOT, codexHome, runtimeCurrent, bridgeHome: home });
+  assert.equal(audit().ok, true, "刚装完必须逐字节一致：" + JSON.stringify(audit().problems));
+
+  // 换成陈旧内容：文件仍在。
+  const victim = path.join(codexHome, "skills", "feishu-status", "SKILL.md");
+  fs.writeFileSync(victim, "---\nname: feishu-status\n---\n旧内容\n");
+  const stale = audit();
+  assert.equal(stale.ok, false, "**内容不对必须被发现**");
+  assert.deepEqual(stale.problems.map((p) => p.skill), ["feishu-status"]);
+  assert.equal(stale.problems[0].why, "内容与期望不符");
+
+  // 非模板文件（aily-cli-skill.json）也要纳入。
+  const json = path.join(codexHome, "skills", "m5codex-inbound-router", "aily-cli-skill.json");
+  fs.writeFileSync(json, "{}");
+  assert.ok(audit().problems.some((p) => p.file === "aily-cli-skill.json"),
+    "非 SKILL.md 的文件也要比对");
+});
+
+test("launchd 核验要精确到完整参数 —— 跑 /bin/echo 的同名 job 不算数", () => {
+  // 评审构造的反例：实际运行 /bin/echo、仅把期望脚本当参数的 job，
+  // 子串匹配照样判成 loaded。
+  const expect = { node: "/opt/homebrew/bin/node",
+    args: ["/opt/homebrew/bin/node", "/r/current/scripts/codex/drain-all.mjs"] };
+  const listing = (program, args) => '{\n\t"Program" = "' + program + '";\n' +
+    '\t"ProgramArguments" = (\n' + args.map((a) => '\t\t"' + a + '";\n').join("") + '\t);\n};';
+  const run = (text) => () => ({ ok: true, stdout: text });
+
+  assert.equal(loadedPhase(run(listing(expect.node, expect.args)), expect), "loaded");
+  assert.equal(loadedPhase(run(listing("/bin/echo", ["/bin/echo", expect.args[1]])), expect),
+    "loaded_other", "**实际跑的是 /bin/echo**");
+  assert.equal(loadedPhase(run(listing(expect.node, [...expect.args, "--extra"])), expect),
+    "loaded_other", "多一个参数就不是我们那份");
+  assert.equal(loadedPhase(run(listing(expect.node, [expect.args[0]])), expect),
+    "loaded_other", "少一个参数也不是");
+  assert.equal(loadedPhase(run("看不懂的输出"), expect), "unverifiable",
+    "**拆不出来就说查不出来，不许当 loaded**");
+});
+
+test("plist 必须是 macOS 真的能解析的 XML", () => {
+  // 字符串断言只能证明"我写的字符串里有转义"。真解析才能证明 launchd 读得进去。
+  const body = plistBody({ home: "/Users/a&b/工 作 <区>/o'brien",
+    node: "/opt/homebrew/bin/node" });
+  const file = path.join(temp(), "t.plist");
+  fs.writeFileSync(file, body);
+  const r = spawnSync("plutil", ["-lint", file], { encoding: "utf-8" });
+  assert.equal(r.status, 0, "**plutil 必须能解析**：" + (r.stdout + r.stderr).slice(0, 300));
+});
+
 test("hook 归属：整条锚定 —— 只提一句标记或路径的外部 hook 不许被认领", () => {
   // 评审的两个反例，一条都不许中：
   //   echo FEISHU_BRIDGE_CODEX_HOOK:prompt-hook.mjs   （提到标记）
@@ -2978,13 +3179,18 @@ test("同名旧 job 还在跑时不许报「已加载」", () => {
   // 评审实测：先写新 plist 再 bootstrap，失败时 plist 留在原地；
   // 若旧的同名 job 还在 launchd 里，只看 label 存在就会报"已加载，正在按计划跑"——
   // 实际跑的是旧配置。
-  const fake = (stdout) => () => ({ ok: true, stdout });
-  assert.equal(loadedPhase(fake("/new/drain-all.mjs"), "/new/drain-all.mjs"), "loaded");
-  assert.equal(loadedPhase(fake("/OLD/clone/drain-outbox.mjs"), "/new/drain-all.mjs"),
+  // 期望现在是完整的 { node, args }，不再是一个脚本路径 ——
+  // 只比脚本路径挡不住"实际跑 /bin/echo、把脚本当参数"那种 job。
+  const expect = { node: "/n", args: ["/n", "/new/drain-all.mjs"] };
+  const listing = (program, args) => '{\n\t"Program" = "' + program + '";\n' +
+    '\t"ProgramArguments" = (\n' + args.map((a) => '\t\t"' + a + '";\n').join("") + '\t);\n};';
+  const fake = (text) => () => ({ ok: true, stdout: text });
+  assert.equal(loadedPhase(fake(listing("/n", ["/n", "/new/drain-all.mjs"])), expect), "loaded");
+  assert.equal(loadedPhase(fake(listing("/n", ["/n", "/OLD/clone/drain-outbox.mjs"])), expect),
     "loaded_other", "**参数不是当前这份就不许说已加载**");
-  assert.equal(loadedPhase(() => ({ ok: false, detail: "could not find service" }), "/x"),
+  assert.equal(loadedPhase(() => ({ ok: false, detail: "could not find service" }), expect),
     "installed_not_loaded");
-  assert.equal(loadedPhase(() => ({ ok: false, detail: "权限不足" }), "/x"),
+  assert.equal(loadedPhase(() => ({ ok: false, detail: "权限不足" }), expect),
     "unverifiable", "查不出来就说查不出来");
 });
 

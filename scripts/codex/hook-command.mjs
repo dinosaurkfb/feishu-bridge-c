@@ -11,8 +11,20 @@
  * 别人的 hook 里随便提一句这个标记就会被误删。
  */
 
+import fs from "node:fs";
 import path from "node:path";
 import { shellQuote } from "../shell-quote.mjs";
+
+/**
+ * 钩子命令里用哪个 node。**安装器和 doctor 必须挑出同一个**——
+ * 各写一份的话，doctor 拿它自己挑的那个去比对，永远比不上。
+ */
+export function pickNode(candidates = ["/opt/homebrew/bin/node", "/usr/local/bin/node"]) {
+  for (const file of [...candidates, process.execPath]) {
+    try { fs.accessSync(file, fs.constants.X_OK); return file; } catch { /* next */ }
+  }
+  return process.execPath;
+}
 
 /** 埋进命令首行的归属标记：与脚本路径无关，换克隆、换 runtime 都认得出自己那条。 */
 export const HOOK_TAG = "FEISHU_BRIDGE_CODEX_HOOK:";
@@ -38,59 +50,76 @@ export function buildHookCommand({ node, script, home, log }) {
 const escapeRe = (text) => text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 
 /**
- * 现行形态：**首行必须正好是标记行，其后必须是我们生成的模板**。
- * 只认标记不看后面，等于谁写一句 echo 都能冒充。
+ * 拆一个 shellQuote 出来的单引号串。
+ *
+ * shellQuote 把 `'` 编码成 `'\''`（收尾、转义的引号、再开头）。
+ * 用 `'([^']+)'` 去匹配就会在第一个内嵌引号处断掉 —— 评审实测：
+ * 在含 `'` 的 CODEX_HOME 下连装两次，**UserPromptSubmit 和 Stop 各出现 2 条**，
+ * 因为第二次没认出第一次装的那条。
+ */
+const QUOTED = "'(?:[^']|'\\\\'')*'";
+const unquote = (text) => text.slice(1, -1).replaceAll("'\\''", "'");
+
+/**
+ * 现行形态：**首行标记 + 我们生成的模板**，整条锚定。
+ *
+ * 捕获出 node / 脚本 / home / 日志四项，供 build → parse → build 往返校验。
  */
 const CURRENT = new RegExp(
   "^# " + escapeRe(HOOK_TAG) + "([a-z-]+\\.mjs)\\n" +
-  "if \\[ -x '([^']+)' \\] && \\[ -r '([^']+)' \\]; then " +
-  "FEISHU_CODEX_BRIDGE_HOME='[^']*' '([^']+)' '([^']+)'; " +
+  "if \\[ -x (" + QUOTED + ") \\] && \\[ -r (" + QUOTED + ") \\]; then " +
+  "FEISHU_CODEX_BRIDGE_HOME=(" + QUOTED + ") (" + QUOTED + ") (" + QUOTED + "); " +
   "else \\{ command -p cat 2>/dev/null \\|\\| cat; \\} >/dev/null 2>&1; " +
   "printf '%s hook-unavailable\\\\n' \"\\$\\(date -u \\+%Y-%m-%dT%H:%M:%SZ\\)\" >> " +
-  "'[^']*' 2>/dev/null \\|\\| :; fi$", "u");
+  "(" + QUOTED + ") 2>/dev/null \\|\\| :; fi$", "u");
 
-/**
- * 历史形态（没有标记行）：只为迁移那一次，同样**整条锚定**。
- */
+/** 历史形态（没有标记行），只为迁移那一次，同样整条锚定。 */
 const LEGACY = new RegExp(
-  "^if \\[ -x '([^']+)' \\] && \\[ -r '([^']+)' \\]; then " +
-  "FEISHU_CODEX_BRIDGE_HOME='[^']*' '([^']+)' '([^']+)'; " +
+  "^if \\[ -x (" + QUOTED + ") \\] && \\[ -r (" + QUOTED + ") \\]; then " +
+  "FEISHU_CODEX_BRIDGE_HOME=(" + QUOTED + ") (" + QUOTED + ") (" + QUOTED + "); " +
   "else \\{ command -p cat 2>/dev/null \\|\\| cat; \\} >/dev/null 2>&1; " +
   "printf '%s hook-unavailable\\\\n' \"\\$\\(date -u \\+%Y-%m-%dT%H:%M:%SZ\\)\" >> " +
-  "'[^']*' 2>/dev/null \\|\\| :; fi$", "u");
+  "(" + QUOTED + ") 2>/dev/null \\|\\| :; fi$", "u");
 
 /**
- * 解析一条命令：是不是我们的、指向哪个脚本。
+ * 解析一条命令。**判据是"能否原样重建"，不是"长得像"。**
  *
- * 返回 `null` 表示"不是我们的" —— **安装器据此决定碰不碰，doctor 据此决定认不认，
- * 两边用的是这同一个函数**。
+ * 拆出四项之后拿 buildHookCommand 重造一遍，逐字对不上就不是我们的 ——
+ * 这样识别和构造在结构上不可能分家：改了构造而没改识别，往返立刻失败。
  */
 export function parseHookCommand(command) {
   if (typeof command !== "string") return null;
   const cur = CURRENT.exec(command);
-  if (cur) {
-    const [, tagged, guardNode, guardScript, runNode, runScript] = cur;
-    // guard 检查的和实际执行的必须逐字相同；标记里写的名字也要对得上。
-    if (guardNode !== runNode || guardScript !== runScript) return null;
-    const name = path.basename(runScript);
-    if (!OUR_SCRIPTS.has(name) || name !== tagged) return null;
-    return { script: runScript, basename: name, form: "current" };
-  }
-  const old = LEGACY.exec(command);
-  if (!old) return null;
-  const [, guardNode, guardScript, runNode, runScript] = old;
+  const old = cur ? null : LEGACY.exec(command);
+  const m = cur ?? old;
+  if (!m) return null;
+  const parts = (cur ? m.slice(2) : m.slice(1)).map(unquote);
+  const [guardNode, guardScript, home, runNode, runScript, log] = parts;
   if (guardNode !== runNode || guardScript !== runScript) return null;
-  const name = path.basename(runScript);
-  if (!OUR_SCRIPTS.has(name)) return null;
-  return { script: runScript, basename: name, form: "legacy" };
+  const basename = path.basename(runScript);
+  if (!OUR_SCRIPTS.has(basename)) return null;
+  if (cur && basename !== m[1]) return null;          // 标记里写的名字要对得上
+  const parsed = { node: runNode, script: runScript, home, log, basename,
+    form: cur ? "current" : "legacy" };
+  // **往返校验**：现行形态必须能被原样重建。历史形态不做（它本来就没有标记行）。
+  if (cur && buildHookCommand(parsed) !== command) return null;
+  return parsed;
 }
 
 /** 这条命令是不是我们的、且正好是这个脚本的。 */
 export const ownsHookCommand = (command, basename) =>
   parseHookCommand(command)?.basename === basename;
 
-/** 这条命令是不是**我们的**、且执行的正是期望的那个脚本（逐字相等，不是包含）。 */
-export function acceptsHookCommand(command, expectedScript) {
+/**
+ * 这条命令是不是**跟安装器现在会写的那条逐字相同**。
+ *
+ * 上一版只比 parsed.script。评审实测：把 node 换成 /definitely/missing/node、
+ * bridge home 和日志路径也改错，doctor 仍报 hooks 正常 ——
+ * **只比一个字段等于放过了其余三个**。现在比整条。
+ */
+export function acceptsHookCommand(command, expected) {
   const parsed = parseHookCommand(command);
-  return parsed !== null && parsed.script === expectedScript;
+  if (parsed === null) return false;
+  if (typeof expected === "string") return parsed.script === expected;   // 旧签名
+  return command === buildHookCommand(expected);
 }

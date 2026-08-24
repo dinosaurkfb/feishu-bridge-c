@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 /**
- * 查看本项目的事件订阅（第 2 层）。**当前只读。**
+ * 查看本项目的事件订阅（第 2 层）。**当前只读，且只有 Claude 侧。**
+ *
+ * Codex 侧有 buildCodexSubscriptionProjection()，但还没有对应的 CLI / 技能 /
+ * 安装入口。把它说成 `$feishu-subscribe`（两侧同名的斜杠命令）是不成立的 ——
+ * 那会让人在 Codex 里敲一个不存在的命令。所以这里明确写 `/feishu-subscribe`，
+ * Codex 侧标为待迁移。
  *
  * status 第 2 层给的是一行概览；这条命令给全貌 —— 允许哪些发送者、哪些事件类型、
  * 新鲜度约束、有没有待认领的绑定。FR-10 要求 status 能答"subscription 命中范围"，
@@ -32,6 +37,7 @@ import path from "node:path";
 
 import { isDirectRun } from "./direct-run.mjs";
 import { buildClaudeSubscriptionProjection } from "./inbound-route.mjs";
+import { claimable } from "./subscription.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
 import { currentBinding } from "./feishu-control.mjs";
 
@@ -67,19 +73,26 @@ const MINUTE = 60_000;
  * 不出：endpoint_id、subscription_id、domain_id、agent_uid、transport_open_id、
  * chat_id、sender_ids、local_target_id、legacy_key、pending_token。
  */
-export function subscriptionDetails(model, { groupName = null } = {}) {
+export function subscriptionDetails(model, { groupName = null, templateChatId = null, now = Date.now() } = {}) {
   if (!model || model.ok !== true) {
     return { ok: false, reason: model?.reason ?? "subscription_unavailable" };
   }
   const items = (model.subscriptions ?? []).map((s) => ({
     status: s.status === "active" ? "活动" : "暂停",
-    groupName,
+    // **群名只能用在它确实对应的那条订阅上。**多订阅指向不同群时，
+    // 把模板群名套给每一条，就会把别的群错报成模板群 ——
+    // 那比"群名不可用"糟得多：一个错的名字比没有名字更难发现。
+    groupName: (templateChatId !== null && s.scope?.chat_id === templateChatId)
+      ? groupName : null,
     senderCount: (s.scope?.sender_ids ?? []).length,
     eventTypes: [...(s.scope?.event_types ?? [])],
     freshnessMs: Number.isFinite(s.constraints?.freshness_ms) ? s.constraints.freshness_ms : null,
     version: s.version ?? null,
   }));
-  return { ok: true, items, pendingCount: (model.pending_bindings ?? []).length };
+  // **待认领要用跟热路径同一个判据。**直接取数组长度会把已绑定、暂停、过期的
+  // 也算进去 —— 一个绑好的项目会显示"待认领"，让人以为还有一步没做完。
+  const pendingCount = (model.pending_bindings ?? []).filter((b) => claimable(b, now)).length;
+  return { ok: true, items, pendingCount };
 }
 
 export function renderSubscriptions(view, { source = null } = {}) {
@@ -119,7 +132,7 @@ function main() {
   console.log(renderSubscriptions(
     subscriptionDetails(
       buildClaudeSubscriptionProjection({ projectRoot: root }),
-      { groupName: tpl?.chat_name ?? null },
+      { groupName: tpl?.chat_name ?? null, templateChatId: tpl?.chat_id ?? null },
     ),
     { source: currentBinding({ root }).source ?? null },
   ));

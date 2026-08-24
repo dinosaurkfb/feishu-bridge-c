@@ -231,7 +231,10 @@ session 绑定。日常还可以使用：
 
 本版本实际安装上表五项。`bind` 仍是把当前精确本地 target 接入一个话题的兼容入口：首次
 接入时，它同时物化现有单群配置下的订阅授权快照，但不等同于未来可独立管理的 Subscription。
-架构路线图中的 `$feishu-connect` 和 `$feishu-subscribe` 分别用于 endpoint 与独立订阅，尚未开放，
+架构路线图中的 `$feishu-connect` 已确认**不做**（Aily 侧的连接是被动的，本机没有「发起」这个动作；
+本机那一半归端点自检）。`/feishu-subscribe` **Claude 侧自 2026-08-24 起可用，但只读** ——
+增删订阅仍未开放（缺 FR-2.5 的授权快照同步链路与 FR-2.6 的多订阅歧义拒绝）；Codex 侧待迁移。
+以下关于「尚未开放」的描述仅适用于独立订阅的**写**入口，
 不能把需求文档里的建议命令误认为当前可用能力。详见
 [Agent 增强需求](docs/requirements/agent-enhancement-requirements.md#fr-7-显式控制面)。
 

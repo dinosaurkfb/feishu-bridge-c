@@ -189,6 +189,21 @@ const reject = (reason, extra = {}) => ({ ok: false, reason, ...extra });
  * `evidence.chat_id` 尚未由现有 Aily envelope 稳定提供时，兼容路径会继续计算并显式标记
  * `scope_unverified: ["chat_id"]`；因此该结果只能用于 shadow，不能直接成为切流依据。
  */
+/**
+ * 这条 pending binding 现在还能被认领吗。
+ *
+ * **展示和热路径必须用同一个判据。**曾经展示层直接取 pending_bindings.length，
+ * 而那个数组里躺着已绑定、暂停、过期的记录 —— 于是一个绑好的项目也会显示"待认领"，
+ * 让人以为还有一步没做完。
+ */
+export function claimable(binding, now = Date.now()) {
+  if (!binding || binding.status !== "active") return false;
+  if (binding.inbound_state !== "pending") return false;
+  if (binding.session_bound) return false;
+  const deadline = binding.claim_expires_at_ms;
+  return !Number.isFinite(deadline) || now < deadline;
+}
+
 export function selectPendingSubscriptionClaim({ model, evidence, bindingTokens = [], now = Date.now() } = {}) {
   if (!model?.ok) return reject(model?.reason ?? SUBSCRIPTION_REJECT.PROJECTION_INVALID);
   if (model.schema_version !== SUBSCRIPTION_SCHEMA_VERSION ||
@@ -234,8 +249,7 @@ export function selectPendingSubscriptionClaim({ model, evidence, bindingTokens 
 
   const subscriptionIds = new Set(candidates.map((subscription) => subscription.subscription_id));
   const pending = model.pending_bindings.filter((binding) =>
-    subscriptionIds.has(binding.subscription_id) && binding.status === "active" &&
-    binding.inbound_state === "pending" && !binding.session_bound);
+    subscriptionIds.has(binding.subscription_id) && claimable(binding, now));
 
   const tokens = uniqueStrings(bindingTokens.map((token) => String(token).toLowerCase()));
   if (tokens.length > 1) return reject(SUBSCRIPTION_REJECT.TOKEN_AMBIGUOUS);

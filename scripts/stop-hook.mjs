@@ -116,7 +116,8 @@ async function main() {
   });
   if (attributed.length === 0) process.exit(0);
 
-  const { drainProject, watcherActive, outboxDirOf } = await import("./drain-outbox.mjs");
+  const { drainProject, watcherActive, outboxDirOf, suppressCmd } =
+    await import("./drain-outbox.mjs");
   const { resolveProject } = await import("./project-resolve.mjs");
   const { appendEvent, listPending, MAX_REPLY_CHARS } = await import("./outbox.mjs");
   const { checkBinding, bindingWarning } = await import("./binding-health.mjs");
@@ -237,6 +238,13 @@ async function main() {
 
     if (r.status === "published") {
       notes.push("飞书出站：" + project.id + " 已发布 " + r.count + " 条进展。");
+    } else if (r.status === "error" && r.diagnosis?.kind === "root_owned_by_other_app") {
+      // 诊断是**线索不是判决**：说清重试大概率无用，但停不停由人决定。
+      // 上一版在这里直接说"已停止重试"，那是把一个自动做出的有损动作说成既成事实。
+      notes.push("飞书出站：" + project.id + " 发布失败。这个话题是另一个应用（" +
+        (r.diagnosis.ownerName ?? "未知") + "）建的，当前身份大概率回复不进去，" +
+        "重试可能一直失败。要停止重试：node " + suppressCmd() + " --project " +
+        project.root + " --generation " + (r.diagnosis.generationId ?? "<代际 id>") + " --apply");
     } else if (r.status === "error") {
       notes.push("飞书出站：" + project.id + " 发布失败（" + r.reason + "），进展留在 outbox，兜底定时器会重试。");
     } else if (r.status === "skipped" && r.reason === "auto_publish_disabled") {

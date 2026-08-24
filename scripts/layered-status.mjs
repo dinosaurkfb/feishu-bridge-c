@@ -26,8 +26,24 @@ import path from "node:path";
 
 import { verifyRuntime } from "./runtime-install.mjs";
 
-/** 端点自检尚未实现。这个常量存在本身就是为了让"未实现"是显式的，而不是遗漏。 */
-export const ENDPOINT_SELF_CHECK = "not_implemented";
+/**
+ * 自检结论的人读文案。**导出是为了让测试引用它，而不是复制一份字面量** ——
+ * 复制的那份在文案改了之后会静悄悄地变成"永远成立"的空断言。
+ *
+ * ready 这条刻意不写数字。上一版写死"四项全过"，检查从四项加到五项之后
+ * 它就成了一句给用户看的错话，而且**没有任何测试会因此变红**。
+ */
+export const SELF_CHECK_TEXT = {
+  ready: "全部通过",
+  // blocked 和 incomplete 必须分开：一个是**查出问题**，一个是**没查清**。
+  // 把"没查清"显示成"有问题"会让人去修一个不存在的故障，
+  // 显示成"没问题"则更糟 —— 那是拿不知道冒充没事。
+  blocked: "有问题",
+  incomplete: "没查清",
+};
+
+/** 没跑自检时的占位。**代码存在不等于查过了** —— 不传报告就仍然是"未自检"。 */
+export const ENDPOINT_SELF_CHECK = "not_checked";
 
 const runtimeDirDefault = () =>
   path.join(os.homedir(), ".claude", "feishu-bridge", "runtime");
@@ -44,6 +60,7 @@ const inboundLogDefault = () =>
 export function endpointFacts({
   runtime = "Claude Code",
   agentName = null,
+  selfCheck = null,
   runtimeDir = runtimeDirDefault(),
   inboundLog = inboundLogDefault(),
   verify = () => verifyRuntime(),
@@ -72,7 +89,7 @@ export function endpointFacts({
     installReason: verified.ok ? null : verified.reason,
     version,
     linkCandidate,
-    selfCheck: ENDPOINT_SELF_CHECK,
+    selfCheck,
     lastInboundAt: lastSuccessfulDispatchAt(inboundLog),
   };
 }
@@ -180,8 +197,14 @@ export function composeLayeredStatus({
       : endpoint.install === "absent" ? "未安装"
       // 损坏、漂移、链接异常都不是"正常"，也不是"没装"。
       : "不可用（" + (endpoint.installReason ?? "unknown") + "）"],
-    // FR-1.4 未实现。写出来，别让空白被读成"没问题"。
-    ["实时自检", "未自检（端点自检 FR-1.4 尚未实现）"],
+    // FR-1.4 做完之前这里只能写"未自检"。现在能查了，就报真实结论 ——
+    // 但**没查还是要说没查**：不传 selfCheckReport 时仍是"未自检"，
+    // 不能因为代码存在就当成查过了。
+    ["实时自检", endpoint.selfCheck?.verdict
+      ? SELF_CHECK_TEXT[endpoint.selfCheck.verdict] +
+        (endpoint.selfCheck.failed?.length ? "：" + endpoint.selfCheck.failed.join("、") : "") +
+        (endpoint.selfCheck.unknown?.length ? "（查不清：" + endpoint.selfCheck.unknown.join("、") + "）" : "")
+      : "未自检（本次没跑端点自检）"],
   ];
   const seen = relative(endpoint.lastInboundAt, now);
   if (seen) L1.push(["最近入站", seen + "（历史证据，不代表当前在线）"]);

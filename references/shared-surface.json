@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-08-23T23:26:14.762Z",
+  "generated_at": "2026-08-23T23:29:50.772Z",
   "modules": {
     "automatic-topic-rotation.mjs": [
       "businessActivitiesForPublishedBatch",
@@ -171,7 +171,9 @@
       "validateOutboundCard"
     ],
     "outbound.mjs": [
+      "PUBLISH_FAILURE",
       "buildDraft",
+      "classifyPublishFailure",
       "markPublished",
       "publishDraft",
       "scanRuns",
@@ -186,7 +188,8 @@
       "listPending",
       "markPublishEligibleByEventKey",
       "markSent",
-      "suppressPublishByEventKey"
+      "suppressPublishByEventKey",
+      "suppressRecords"
     ],
     "registry.mjs": [
       "DEFAULT_REGISTRY",
@@ -245,6 +248,7 @@
       "SUBSCRIPTION_REJECT",
       "SUBSCRIPTION_SCHEMA_VERSION",
       "buildLegacySubscriptionReadModel",
+      "claimable",
       "compareFirstClaimShadow",
       "legacyEndpointId",
       "selectPendingSubscriptionClaim",

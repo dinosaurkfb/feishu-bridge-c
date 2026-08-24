@@ -87,7 +87,7 @@ import {
 import { renderSubscriptions, subscriptionDetails } from "./feishu-subscribe.mjs";
 import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
 import {
-  ENDPOINT_SELF_CHECK, SELF_CHECK_TEXT, composeLayeredStatus, endpointFacts,
+  ENDPOINT_SELF_CHECK, SELF_CHECK_TEXT, composeLayeredStatus, endpointFacts, outboundRoutingFact,
   lastSuccessfulDispatchAt, renderLayeredStatus, splitByRelation, subscriptionFacts,
 } from "./layered-status.mjs";
 import {
@@ -8211,6 +8211,106 @@ test("端点自检不许拿出站身份顶替入站 —— 这是语义假阳性
   const inbound = got.checks.find((c) => c.id === ENDPOINT_CHECK.INBOUND);
   assert.equal(inbound.result, CHECK_RESULT.UNKNOWN);
   assert.match(inbound.detail, /期望值不是观测值/u);
+});
+
+test("出站路由的五种结论要分开，且不许把「没查清」报成「没问题」", () => {
+  // 第 3 层其余各行读的是项目内文件，而出站走登记表 —— **两套**。
+  // 不一致时状态页会理直气壮地报"已绑定 · 第 N 代 · 有效期 2027"，
+  // 而每一轮答复都没进过出站流程。线上就这么断了十几个小时。
+  const b = { bound: true, registryOk: true };
+  assert.equal(outboundRoutingFact({ ...b, exactCount: 1, routableCount: 1 }), "routable");
+  assert.equal(outboundRoutingFact({ ...b, exactCount: 0, routableCount: 0 }), "degraded");
+  // **多于一条也不算正常** —— 出站挑哪一条不确定，报"正常"是把说不清说成说得清。
+  assert.equal(outboundRoutingFact({ ...b, exactCount: 2, routableCount: 2 }), "ambiguous");
+  // **有记录 ≠ 出站会挑到它。**停用的条目被 loadRegistry 过滤掉，Stop 挑不到。
+  assert.equal(outboundRoutingFact({ ...b, exactCount: 1, routableCount: 0 }), "disabled");
+  // **登记表读不出来是另一种**，既不能当成好也不能当成坏。
+  assert.equal(outboundRoutingFact({ bound: true, registryOk: false,
+    exactCount: 0, routableCount: 0 }), "unknown");
+  assert.equal(outboundRoutingFact({ bound: true, registryOk: undefined,
+    exactCount: 9, routableCount: 9 }), "unknown");
+  // 项目内本来就没绑定 → 这一层没什么可说，不该硬报一个结论。
+  assert.equal(outboundRoutingFact({ bound: false, registryOk: true,
+    exactCount: 0, routableCount: 0 }), null);
+});
+
+test("真实 feishu-status CLI 会把「绑定已降级」说出来", () => {
+  // **这条必须走真实 CLI。**这个 bug 的本质就是"函数对了、真实入口没接上" ——
+  // 纯函数测试全绿的时候，状态页照样可以一个字都不提。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-degraded-"));
+  const proj = path.join(dir, "proj");
+  const inbound = path.join(proj, ".runtime-data", "inbound");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: proj, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_x", feishu_root_message_id_reference: "om_x",
+    channel_generation_id: "gen-4" }));
+  const reg = path.join(dir, "registry.json");
+  const run = () => {
+    const r = spawnSync(process.execPath, [
+      path.resolve("scripts", "feishu-status.mjs"), "--project", proj,
+    ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_REGISTRY: reg, HOME: dir } });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout;
+  };
+
+  // 登记表里没有它 → 必须说清降级、说清后果、给出下一步。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0", projects: [] }));
+  const degraded = run();
+  assert.match(degraded, /绑定已降级/u);
+  assert.match(degraded, /出站不会工作/u, "要说清后果，不只是说状态名");
+  assert.match(degraded, /feishu-bind/u, "要给出下一步");
+
+  // 登记表读不出来 → 说不清，**不许报成没问题**。
+  fs.writeFileSync(reg, "坏{");
+  const unknown = run();
+  assert.match(unknown, /说不清（登记表读不出来）/u);
+  assert.equal(unknown.includes("绑定已降级"), false, "读不出来不等于降级");
+
+  // 登记表里有它 → **不出这一行**。常态天天报一句"正常"会把该注意的淹掉。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "p", root: proj, root_message_id: "om_x" }] }));
+  assert.equal(run().includes("出站路由"), false, "正常时不该多这一行");
+
+  // **父目录不是这个项目。**evaluator 用目录包含关系时，登记表里只有父目录也会命中 ——
+  // 状态页显示正常，而 Stop 钩子实际会把回答**归给父项目**。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "parent", root: dir, root_message_id: "om_p" }] }));
+  const byParent = run();
+  assert.match(byParent, /绑定已降级/u, "父目录命中不算这个项目被登记");
+
+  // 同一个项目两条 → 出站挑哪一条不确定，不许报正常。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0", projects: [
+    { id: "a", root: proj, root_message_id: "om_a" },
+    { id: "b", root: proj + "/", root_message_id: "om_b" }] }));
+  assert.match(run(), /有多条这个项目/u, "逻辑重复也要说出来");
+
+  // 唯一那条是停用的 → **不许报正常**，也不该说成"没登记"。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "p", root: proj, root_message_id: "om_x", enabled: false }] }));
+  const off = run();
+  assert.match(off, /这条是停用的/u);
+  assert.equal(off.includes("绑定已降级"), false, "有记录但停用，跟一条都没有是两回事");
+
+  // ── 读取故障的三种，都必须是 unknown，不是 degraded ──
+  //
+  // 上一版用 loadRegistry()，它把所有读取异常都当成 no_registry ——
+  // EACCES / EISDIR 会被显示成"降级"，根节点是数组会被当成空表，
+  // **根节点是 null 甚至可能让 status 直接崩**。
+  fs.rmSync(reg);
+  fs.mkdirSync(reg);                                   // 路径是目录 → EISDIR
+  const isdir = run();
+  assert.match(isdir, /说不清（登记表读不出来）/u);
+  assert.equal(isdir.includes("绑定已降级"), false, "读不出来不等于降级");
+  fs.rmdirSync(reg);
+
+  for (const [what, body] of [["根节点是 null", "null"], ["根节点是数组", "[]"]]) {
+    fs.writeFileSync(reg, body);
+    const got = run();                                  // run() 内部断言了退出码为 0
+    assert.match(got, /说不清（登记表读不出来）/u, what);
+    assert.equal(got.includes("绑定已降级"), false, what + "：不等于降级");
+  }
 });
 
 test("真实 feishu-status CLI 跑出来的第 1 层不会声称全部通过", () => {

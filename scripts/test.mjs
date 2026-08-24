@@ -8049,6 +8049,64 @@ test("提示里的抑制命令是绝对路径，不依赖当前工作目录", ()
   }
 });
 
+test("抑制要跟排空用同一套代际解析，旧格式记录不能漏", () => {
+  // 实测过：排空把旧格式记录归入当前有效代际，抑制命令却按原始字段过滤，
+  // 于是传诊断给出的代际 id 进去显示"待发 0 条"。
+  // **提示指向的操作做不到它说的事** —— 这个错犯到第三次了。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-legacy-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_x", claude_session_id: null,
+    channel_generation_id: "gen-1" }));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
+    kind: "progress", text: "新", published_at: null, target_channel_generation_id: "gen-1" }));
+  // 旧格式：**没有** target_channel_generation_id
+  fs.writeFileSync(path.join(obDir, "0002.json"), JSON.stringify({
+    kind: "progress", text: "旧格式", published_at: null }));
+
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "feishu-suppress-outbox.mjs"),
+    "--project", dir, "--generation", "gen-1",
+  ], { encoding: "utf-8" });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /待发\s+2 条（本代际）/u,
+    "旧格式那条也必须被选中，否则提示等于空头支票");
+});
+
+test("抑制中止时不许泄漏发布锁，也不许只比数量", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-lockleak-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_x", claude_session_id: null,
+    channel_generation_id: "gen-1" }));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
+    kind: "progress", text: "a", published_at: null }));
+
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir, "--apply",
+  ], { encoding: "utf-8" });
+  assert.equal(run.status, 0, run.stderr);
+  // process.exit 会跳过 finally —— 那样锁就只能等过期接管。
+  assert.equal(fs.existsSync(path.join(dir, ".runtime-data", "outbound", "publish.lock")), false,
+    "跑完必须把发布锁释放掉");
+
+  // 集合比较：只比条数挡不住等量替换（少一条旧的、多一条新的，总数没变）。
+  const src = fs.readFileSync(path.resolve("scripts", "feishu-suppress-outbox.mjs"), "utf-8");
+  assert.match(src, /new Set\(pending\.map\(\(r\) => r\._file\)\)/u,
+    "锁内要比稳定记录集合，不是比计数");
+  assert.doesNotMatch(src, /fresh\.length !== pending\.length/u);
+});
+
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (failed > 0) {

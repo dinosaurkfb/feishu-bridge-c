@@ -27,7 +27,13 @@ import {
   businessActivitiesForPublishedBatch, recordClaudeActivityAndMaybeRotate,
 } from "./automatic-topic-rotation.mjs";
 
-const groupByTargetGeneration = (records) => {
+/**
+ * 按目标代际分组。**导出给抑制命令共用** —— 两处各写一份解析就是分叉的开始，
+ * 而且实测已经分叉过：排空把旧格式记录归入当前代际，抑制命令却按原始字段过滤，
+ * 于是传诊断给出的代际 id 进去，显示"待发 0 条"。
+ * **提示指向的操作做不到它说的事。**
+ */
+export const groupByTargetGeneration = (records) => {
   const groups = new Map();
   for (const record of records) {
     const key = record.target_channel_generation_id ?? "__legacy_active__";

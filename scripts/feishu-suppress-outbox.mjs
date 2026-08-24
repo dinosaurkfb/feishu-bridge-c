@@ -26,7 +26,9 @@ import path from "node:path";
 
 import { isDirectRun } from "./direct-run.mjs";
 import { listPending, suppressRecords } from "./outbox.mjs";
-import { outboxDirOf } from "./drain-outbox.mjs";
+import { groupByTargetGeneration, outboxDirOf } from "./drain-outbox.mjs";
+import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
+import { resolveProject } from "./project-resolve.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 
 const FLAGS = new Set(["apply"]);
@@ -54,6 +56,22 @@ function parseArgs(tokens) {
   return { ok: true, seen };
 }
 
+/**
+ * 挑出属于某个代际的待发记录。旧格式记录没有 target_channel_generation_id，
+ * 它们归属于**当前有效代际** —— 跟排空那边的判定一致。
+ */
+export function selectByGeneration(records, generation, mapping) {
+  const out = [];
+  for (const [key, group] of groupByTargetGeneration(records)) {
+    const resolved = key === "__legacy_active__"
+      ? resolveMappingOutboundGeneration(mapping, null)
+      : { generationId: key };
+    const id = resolved?.generationId ?? resolved?.channelGenerationId ?? key;
+    if (id === generation || key === generation) out.push(...group);
+  }
+  return out;
+}
+
 function main() {
   const parsed = parseArgs(process.argv.slice(2));
   if (!parsed.ok) {
@@ -66,14 +84,17 @@ function main() {
   const reason = parsed.seen.get("reason") ?? "manual_suppress";
   const generation = parsed.seen.get("generation") ?? null;
 
+  const resolved = resolveProject({ root, claudeSessionId: session });
+  const mapping = resolved.ok ? resolved.mapping : null;
   const outboxDir = outboxDirOf(root, session);
   // **默认只停某一个代际。**诊断是针对某个话题代际给出的，而 outbox 里可能同时
   // 躺着别的代际的待发内容 —— 一刀切会把不相干的一起永久停掉。
   // 不给 --generation 就要求显式确认范围是"全部"。
   const all = listPending({ outboxDir });
-  const pending = generation === null
-    ? all
-    : all.filter((r) => r.target_channel_generation_id === generation);
+  // **跟排空用同一套代际解析。**直接按 r.target_channel_generation_id 过滤会漏掉
+  // 旧格式记录 —— 它们没有这个字段，排空时被归入当前有效代际（__legacy_active__），
+  // 于是按诊断给的代际 id 来筛，一条都筛不到。
+  const pending = generation === null ? all : selectByGeneration(all, generation, mapping);
 
   console.log("项目      " + root);
   console.log("范围      " + (generation === null
@@ -102,18 +123,29 @@ function main() {
     process.exit(1);
   }
   let done;
+  let drift = null;
   try {
     // 锁内重读：预览到落盘之间可能有新内容进来，也可能有内容已经发出去了。
-    const fresh = listPending({ outboxDir })
-      .filter((r) => generation === null || r.target_channel_generation_id === generation);
-    if (fresh.length !== pending.length) {
-      console.error("outbox 在预览之后变了（" + pending.length + " → " + fresh.length +
-        " 条），没有动它。请重新预览确认。");
-      process.exit(1);
+    const freshAll = listPending({ outboxDir });
+    const fresh = generation === null ? freshAll : selectByGeneration(freshAll, generation, mapping);
+    // **比集合，不是比数量。**只比条数挡不住等量替换：预览之后少一条旧的、
+    // 多一条新的，总数没变，就会不可逆地抑制另一批内容。
+    const before = new Set(pending.map((r) => r._file));
+    const now = new Set(fresh.map((r) => r._file));
+    const same = before.size === now.size && [...before].every((f) => now.has(f));
+    if (!same) {
+      drift = { before: before.size, now: now.size };
+      return;   // **不要 process.exit** —— 它会跳过 finally，锁就泄漏了
     }
     done = suppressRecords(fresh, { reason });
   } finally {
     releasePublishLock(lockDir);
+  }
+  if (drift) {
+    console.error("outbox 在预览之后变了（" + drift.before + " → " + drift.now +
+      " 条待发，或换了内容），没有动它。请重新预览确认。");
+    process.exitCode = 1;
+    return;
   }
   console.log("\n已停止重试 " + done.changed + " 条。");
   if (!done.ok) {

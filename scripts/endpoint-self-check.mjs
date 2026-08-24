@@ -41,9 +41,13 @@ import { verifyRuntime } from "./runtime-install.mjs";
 export const ENDPOINT_CHECK = Object.freeze({
   BRIDGE: "bridge_installed",
   DAEMON: "aily_daemon_running",
+  ADAPTER: "aily_adapter_available",
   INBOUND: "inbound_transport_identity",
   OUTBOUND: "outbound_publish_identity",
 });
+
+/** 本机 adapter 的类型。FR-1.4 说的 adapter 是它，不是 lark-cli。 */
+export const CLAUDE_ADAPTER_TYPE = "claude-code-local";
 
 /** 每项只有这三种结论。**unknown 不是 fail** —— 查不动和查出问题是两回事。 */
 export const CHECK_RESULT = Object.freeze({
@@ -101,35 +105,106 @@ function checkOutbound(bin, identity, access, assertFn) {
 }
 
 /**
- * daemon 在不在。
+ * daemon 在不在。**用 --json**。
  *
- * **退出码为 0 不足以判定在跑** —— 实测 `daemon status` 在 daemon 停着时同样退 0，
- * 所以看输出里怎么说。看不懂就报 unknown，不猜。
+ * 上一版跑不带 --json 的 `daemon status`，非零退出一律落到"探测失败"（unknown）。
+ * 于是 daemon **真的离线**时报的是"查不动" —— 而 aily-cli 明确会给出
+ * DAEMON_UNREACHABLE。**离线是查出来的结论，必须是 fail**；
+ * 把它报成 unknown，等于让人以为"可能没事"。
+ *
+ * 非零退出时错误对象上带着 stdout/stderr，JSON 往往就在里面 —— 不看它就等于
+ * 把一个明确的答案当成了没答案。
  */
 function checkDaemon(bin, exec) {
-  // 模板没声明就按 PATH 找 —— aily_cli_bin 是可选字段，
-  // 加进必填会让所有已经生成好的模板立刻变成"不完整"而全线拒绝。
   const cmd = typeof bin === "string" && bin ? bin : "aily-cli";
-  let out;
+  let raw = null;
   try {
-    out = String(exec(cmd, ["daemon", "status"], {
+    raw = String(exec(cmd, ["daemon", "status", "--json"], {
       encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: PROBE_TIMEOUT_MS,
     }));
   } catch (err) {
-    // "二进制不在"是查出来的结论，"超时/别的错"是没查成 —— 两者不能合并。
     if (err?.code === "ENOENT") {
       return item(ENDPOINT_CHECK.DAEMON, CHECK_RESULT.FAIL, "找不到 aily-cli（" + cmd + "）",
         "确认 aily-cli 已安装，或在模板里写明 aily_cli_bin");
     }
-    return item(ENDPOINT_CHECK.DAEMON, CHECK_RESULT.UNKNOWN,
-      "查不动（" + (err?.code === "ETIMEDOUT" ? "超时" : "探测失败") + "）");
+    if (err?.code === "ETIMEDOUT") {
+      return item(ENDPOINT_CHECK.DAEMON, CHECK_RESULT.UNKNOWN, "查不动（超时）");
+    }
+    raw = String(err?.stdout ?? "") + String(err?.stderr ?? "");
   }
-  if (/not running|stopped|no daemon/iu.test(out)) {
-    return item(ENDPOINT_CHECK.DAEMON, CHECK_RESULT.FAIL, "daemon 没在跑",
+  const parsed = parseJson(raw);
+  if (parsed === null) {
+    return item(ENDPOINT_CHECK.DAEMON, CHECK_RESULT.UNKNOWN, "看不懂 daemon status 的输出");
+  }
+  if (parsed.ok === true && parsed.data?.running === true) {
+    return item(ENDPOINT_CHECK.DAEMON, CHECK_RESULT.PASS, "daemon 在跑");
+  }
+  const code = parsed.error?.code ?? parsed.code ?? null;
+  if (code === "DAEMON_UNREACHABLE" || parsed.data?.running === false) {
+    return item(ENDPOINT_CHECK.DAEMON, CHECK_RESULT.FAIL, "daemon 没在跑" + (code ? "（" + code + "）" : ""),
       "由你运行 aily-cli daemon start —— 自检不替你启动");
   }
-  if (/running/iu.test(out)) return item(ENDPOINT_CHECK.DAEMON, CHECK_RESULT.PASS, "daemon 在跑");
-  return item(ENDPOINT_CHECK.DAEMON, CHECK_RESULT.UNKNOWN, "看不懂 daemon status 的输出");
+  return item(ENDPOINT_CHECK.DAEMON, CHECK_RESULT.UNKNOWN,
+    "daemon 状态说不清" + (code ? "（" + code + "）" : ""));
+}
+
+/** 从可能混着别的输出的文本里取出第一段 JSON。取不到就返回 null，不猜。 */
+function parseJson(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return null;
+  try { return JSON.parse(t); } catch { /* 往下试 */ }
+  const at = t.search(/[[{]/u);
+  if (at < 0) return null;
+  try { return JSON.parse(t.slice(at)); } catch { return null; }
+}
+
+/**
+ * **本机 adapter**：Aily 的 claude-code-local 运行环境在不在、探得到吗。
+ *
+ * 上一版拿 lark-cli 在不在回答这个问题 —— 但 lark-cli 是**出站** OpenAPI 客户端，
+ * README 定义的 adapter 是这个。两者都过不能互相证明：
+ * 出站发得出去，不代表 Aily 调得起本机的 Claude。
+ *
+ * 「登记了」和「探得到」也是两件事：adapter list 里有这一条只说明注册过，
+ * runtimeProbe.available 才是"现在能用"。
+ */
+function checkAdapter(bin, exec, adapterType) {
+  const cmd = typeof bin === "string" && bin ? bin : "aily-cli";
+  let raw = null;
+  try {
+    raw = String(exec(cmd, ["adapter", "list", "--json"], {
+      encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: PROBE_TIMEOUT_MS,
+    }));
+  } catch (err) {
+    if (err?.code === "ETIMEDOUT") {
+      return item(ENDPOINT_CHECK.ADAPTER, CHECK_RESULT.UNKNOWN, "查不动（超时）");
+    }
+    raw = String(err?.stdout ?? "") + String(err?.stderr ?? "");
+  }
+  const parsed = parseJson(raw);
+  const list = Array.isArray(parsed) ? parsed
+    : Array.isArray(parsed?.data?.adapters) ? parsed.data.adapters
+      : Array.isArray(parsed?.data) ? parsed.data : null;
+  if (list === null) {
+    return item(ENDPOINT_CHECK.ADAPTER, CHECK_RESULT.UNKNOWN, "看不懂 adapter list 的输出");
+  }
+  const hit = list.find((a) => a?.adapter === adapterType || a?.runtime?.type === adapterType);
+  if (!hit) {
+    return item(ENDPOINT_CHECK.ADAPTER, CHECK_RESULT.FAIL, adapterType + " 没有登记",
+      "在 Aily 里注册本机 adapter");
+  }
+  const probe = hit.runtimeProbe;
+  if (probe?.available === true) {
+    return item(ENDPOINT_CHECK.ADAPTER, CHECK_RESULT.PASS, adapterType + " 已登记且探测可用");
+  }
+  if (probe?.available === false) {
+    return item(ENDPOINT_CHECK.ADAPTER, CHECK_RESULT.FAIL,
+      adapterType + " 已登记但探测不可用" + (probe.reason ? "（" + probe.reason + "）" : ""),
+      "确认对应的本机 CLI 可执行");
+  }
+  // 登记了但没有探测结论 —— 不能当成可用。
+  return item(ENDPOINT_CHECK.ADAPTER, CHECK_RESULT.UNKNOWN,
+    adapterType + " 已登记，但没有探测结论");
 }
 
 /**
@@ -163,10 +238,12 @@ export function checkEndpoint({
   access = (bin) => fs.accessSync(bin, fs.constants.X_OK),
   exec = execFileSync,
   assertFn = assertPublishIdentity,
+  adapterType = CLAUDE_ADAPTER_TYPE,
 } = {}) {
   const checks = [
     checkBridge(verify),
     checkDaemon(template?.aily_cli_bin, exec),
+    checkAdapter(template?.aily_cli_bin, exec, adapterType),
     checkInbound(template),
     checkOutbound(template?.lark_cli_bin, identity, access, assertFn),
   ];
@@ -186,6 +263,7 @@ const RESULT_MARK = { pass: "✅", fail: "❌", unknown: "❔" };
 const CHECK_LABEL = {
   [ENDPOINT_CHECK.BRIDGE]: "运行时",
   [ENDPOINT_CHECK.DAEMON]: "Aily daemon",
+  [ENDPOINT_CHECK.ADAPTER]: "本机 adapter",
   [ENDPOINT_CHECK.INBOUND]: "入站身份",
   [ENDPOINT_CHECK.OUTBOUND]: "出站身份",
 };

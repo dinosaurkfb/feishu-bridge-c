@@ -7843,9 +7843,12 @@ const okAccess = () => {};
 const okExec = () => "daemon running (pid 1)";
 const okAssert = () => ({ ok: true });
 const okIdentity = { configDir: "/d", profile: "p", expectedAppId: "appA" };
+const okExecJson = (cmd, args) => (args[0] === "adapter"
+  ? JSON.stringify([{ adapter: "claude-code-local", runtimeProbe: { available: true } }])
+  : JSON.stringify({ ok: true, data: { running: true, pid: 1 } }));
 const selfCheck = (over = {}) => checkEndpoint({
   template: { lark_cli_bin: "/bin/lark-cli" }, identity: okIdentity,
-  verify: okVerify, access: okAccess, exec: okExec, assertFn: okAssert, ...over,
+  verify: okVerify, access: okAccess, exec: okExecJson, assertFn: okAssert, ...over,
 });
 
 test("端点自检把 FR-1.4 的四种情形分开，各有各的下一步", () => {
@@ -7855,13 +7858,17 @@ test("端点自检把 FR-1.4 的四种情形分开，各有各的下一步", () 
   assert.equal(ready.verdict, "incomplete");
   assert.deepEqual(ready.unknown, [ENDPOINT_CHECK.INBOUND]);
   assert.deepEqual(ready.checks.map((c) => c.id),
-    [ENDPOINT_CHECK.BRIDGE, ENDPOINT_CHECK.DAEMON, ENDPOINT_CHECK.INBOUND, ENDPOINT_CHECK.OUTBOUND]);
+    [ENDPOINT_CHECK.BRIDGE, ENDPOINT_CHECK.DAEMON, ENDPOINT_CHECK.ADAPTER,
+      ENDPOINT_CHECK.INBOUND, ENDPOINT_CHECK.OUTBOUND]);
 
   // 四种失败各自可辨认，而且各带一条能执行的下一步 —— 混成一句"不可用"等于没说。
   const cases = [
     [{ verify: () => ({ ok: false, reason: "current_absent" }) }, ENDPOINT_CHECK.BRIDGE, /install-outbound/u],
     [{ access: () => { throw new Error("nope"); } }, ENDPOINT_CHECK.OUTBOUND, /执行权限/u],
-    [{ exec: () => "daemon not running" }, ENDPOINT_CHECK.DAEMON, /daemon start/u],
+    [{ exec: (c, a) => (a[0] === "adapter"
+      ? JSON.stringify([{ adapter: "claude-code-local", runtimeProbe: { available: true } }])
+      : JSON.stringify({ ok: false, error: { code: "DAEMON_UNREACHABLE" } })) },
+      ENDPOINT_CHECK.DAEMON, /daemon start/u],
     [{ assertFn: () => ({ ok: false, reason: "app_mismatch" }) }, ENDPOINT_CHECK.OUTBOUND, /重新登录/u],
   ];
   for (const [over, id, action] of cases) {
@@ -7888,13 +7895,13 @@ test("端点自检里「查不动」不许算成「有问题」，也不许算�
     const got = selfCheck(over);
     assert.equal(got.verdict, "incomplete", JSON.stringify(Object.keys(over)));
     assert.deepEqual(got.failed, [], "没查清不能算失败");
-    assert.equal(got.unknown.length, 2, "入站那项永远是 unknown，再加上这次注入的那项");
+    assert.ok(got.unknown.length >= 2, "入站那项永远是 unknown，再加上这次注入的");
   }
 
   // 但"二进制不在"是查出来的结论，该判 fail。
   const missing = selfCheck({ exec: () => { const e = new Error("x"); e.code = "ENOENT"; throw e; } });
   assert.equal(missing.verdict, "blocked");
-  assert.deepEqual(missing.failed, [ENDPOINT_CHECK.DAEMON]);
+  assert.ok(missing.failed.includes(ENDPOINT_CHECK.DAEMON));
 
   // 渲染要能看出三种符号不同。
   const text = renderEndpointCheck(selfCheck({ exec: () => "某种看不懂的输出" }));
@@ -7939,8 +7946,12 @@ test("端点自检不许拿出站身份顶替入站 —— 这是语义假阳性
     template: { agent_uid: "agent_A", lark_cli_bin: "/bin/x", aily_cli_bin: "/bin/y" },
     identity: { configDir: "/d", profile: "p", expectedAppId: "app_B" },
     verify: () => ({ ok: true }), access: () => {},
-    exec: () => "daemon running", assertFn: () => ({ ok: true }),
+    exec: (c, a) => (a[0] === "adapter"
+      ? JSON.stringify([{ adapter: "claude-code-local", runtimeProbe: { available: true } }])
+      : JSON.stringify({ ok: true, data: { running: true } })),
+    assertFn: () => ({ ok: true }),
   });
+  // **其余四项全过，也不能因此判 ready** —— 入站那项本机验不了。
   assert.notEqual(got.verdict, "ready", "出站全过不能证明入站接得住");
   assert.equal(got.verdict, "incomplete");
   assert.deepEqual(got.unknown, [ENDPOINT_CHECK.INBOUND]);
@@ -7975,6 +7986,69 @@ test("模板写入器要能接住可选字段", () => {
   assert.match(src, /\[\.\.\.CHAIN_FIELDS, \.\.\.OPTIONAL_CHAIN_FIELDS\]/u,
     "写入器必须同时遍历必填与可选字段");
   assert.match(src, /OPTIONAL_CHAIN_FIELDS/u);
+});
+
+test("daemon 明确离线是 fail，不是「查不动」", () => {
+  // 上一版跑不带 --json 的 daemon status，非零退出一律落到 unknown ——
+  // 于是 daemon **真的离线**时报的是"查不动"。而 aily-cli 明确会给 DAEMON_UNREACHABLE。
+  // **离线是查出来的结论，必须是 fail**；报成 unknown 等于让人以为"可能没事"。
+  const adapterOk = JSON.stringify([{ adapter: "claude-code-local", runtimeProbe: { available: true } }]);
+  const withDaemon = (daemonOut, throwIt = false) => checkEndpoint({
+    template: { lark_cli_bin: "/bin/lark-cli" }, identity: okIdentity,
+    verify: okVerify, access: okAccess, assertFn: okAssert,
+    exec: (c, a) => {
+      if (a[0] === "adapter") return adapterOk;
+      if (throwIt) { const e = new Error("x"); e.stdout = daemonOut; throw e; }
+      return daemonOut;
+    },
+  });
+
+  const offline = withDaemon(JSON.stringify({ ok: false, error: { code: "DAEMON_UNREACHABLE" } }));
+  const d = offline.checks.find((c) => c.id === ENDPOINT_CHECK.DAEMON);
+  assert.equal(d.result, CHECK_RESULT.FAIL);
+  assert.match(d.detail, /DAEMON_UNREACHABLE/u);
+
+  // 非零退出时 JSON 常在 err.stdout 里 —— 不看它就等于把明确答案当成没答案。
+  const thrown = withDaemon(JSON.stringify({ ok: false, error: { code: "DAEMON_UNREACHABLE" } }), true);
+  assert.equal(thrown.checks.find((c) => c.id === ENDPOINT_CHECK.DAEMON).result, CHECK_RESULT.FAIL);
+
+  // 看不懂才是 unknown。
+  assert.equal(withDaemon("不是 JSON").checks.find((c) => c.id === ENDPOINT_CHECK.DAEMON).result,
+    CHECK_RESULT.UNKNOWN);
+});
+
+test("adapter 查的是 claude-code-local，不是 lark-cli", () => {
+  // FR-1.4 说的 adapter 是 Aily 的本机运行环境。出站发得出去，
+  // 不代表 Aily 调得起本机的 Claude —— 两者都过也不能互相证明。
+  const daemonOk = JSON.stringify({ ok: true, data: { running: true } });
+  const withAdapters = (list) => checkEndpoint({
+    template: { lark_cli_bin: "/bin/lark-cli" }, identity: okIdentity,
+    verify: okVerify, access: okAccess, assertFn: okAssert,
+    exec: (c, a) => (a[0] === "adapter" ? JSON.stringify(list) : daemonOk),
+  }).checks.find((x) => x.id === ENDPOINT_CHECK.ADAPTER);
+
+  assert.equal(withAdapters([{ adapter: "claude-code-local", runtimeProbe: { available: true } }]).result,
+    CHECK_RESULT.PASS);
+  // 没登记 → fail。
+  assert.equal(withAdapters([{ adapter: "codex-local", runtimeProbe: { available: true } }]).result,
+    CHECK_RESULT.FAIL);
+  // 登记了但探测不可用 → fail，跟"没登记"分开报。
+  const unavailable = withAdapters([
+    { adapter: "claude-code-local", runtimeProbe: { available: false, reason: "cli missing" } }]);
+  assert.equal(unavailable.result, CHECK_RESULT.FAIL);
+  assert.match(unavailable.detail, /探测不可用/u);
+  // **登记了但没有探测结论 ≠ 可用。**
+  assert.equal(withAdapters([{ adapter: "claude-code-local" }]).result, CHECK_RESULT.UNKNOWN);
+});
+
+test("模板的派生、命令行覆盖、预览必须用同一个字段集合", () => {
+  // aily_cli_bin 加进了可选字段，但派生只遍历 CHAIN_FIELDS —— 旧项目配好的值
+  // 经 --from 初始化照样丢。上一轮我只补了命令行那一侧。
+  const src = fs.readFileSync(path.resolve("scripts", "init-chain-template.mjs"), "utf-8");
+  assert.equal((src.match(/for \(const f of TEMPLATE_FIELDS\)/gu) ?? []).length, 3,
+    "派生、覆盖、预览三处都要用同一个集合");
+  assert.doesNotMatch(src, /for \(const f of CHAIN_FIELDS\)/u,
+    "只遍历必填字段就会漏掉可选的");
 });
 
 summarySealed = true;

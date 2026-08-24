@@ -29,6 +29,9 @@ import path from "node:path";
 import {
   CHAIN_FIELDS, DEFAULT_CONFIG_BASE, OPTIONAL_CHAIN_FIELDS, templatePath, validateChainTemplate,
 } from "./chain-template.mjs";
+
+/** 模板认识的全部字段。**派生、命令行覆盖、预览必须用同一个集合**，否则只会改一半。 */
+const TEMPLATE_FIELDS = [...CHAIN_FIELDS, ...OPTIONAL_CHAIN_FIELDS];
 import { moduleRoot } from "./direct-run.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
@@ -58,7 +61,9 @@ if (from !== undefined) {
     console.error(err.message);
     process.exit(1);
   }
-  for (const f of CHAIN_FIELDS) {
+    // 必填 + 可选**同一个集合**。上一轮我只补了命令行那一侧，派生这侧没补 ——
+    // 于是旧项目里已经配好的 aily_cli_bin，经 --from 初始化之后照样丢。
+  for (const f of TEMPLATE_FIELDS) {
     if (cfg[f] !== undefined) { derived[f] = cfg[f]; sources[f] = "项目配置"; }
   }
 }
@@ -70,7 +75,7 @@ const tpl = { schema_version: "1.0", ...derived };
 // 必填 + 可选字段都要能从命令行给。**只遍历 CHAIN_FIELDS 是个洞**：
 // 往 OPTIONAL_CHAIN_FIELDS 里加了字段（如 aily_cli_bin），写入器却接不了，
 // 于是「模板支持这个字段」这句话只在读的那一侧成立。
-for (const f of [...CHAIN_FIELDS, ...OPTIONAL_CHAIN_FIELDS]) {
+for (const f of TEMPLATE_FIELDS) {
   const v = arg(flagOf(f));
   if (v === undefined) continue;
   // 数字字段要转，否则形状校验会把 "900000" 判成配错（那正是它该做的）。
@@ -113,7 +118,9 @@ const mask = (v) => {
 console.log("模板    " + templatePath());
 if (from !== undefined) console.log("派生自  " + path.resolve(from));
 console.log("");
-for (const f of CHAIN_FIELDS) {
+// 预览也要列可选字段 —— 只列必填的话，配了 aily_cli_bin 也看不见，
+// 而看不见的配置跟没配一样难查。
+for (const f of TEMPLATE_FIELDS) {
   const has = tpl[f] !== undefined && tpl[f] !== null && tpl[f] !== "";
   const src = has ? "  ← " + (sources[f] ?? "?") : "";
   console.log("  " + (has ? "✓" : "✗") + " " + f.padEnd(24) + (has ? mask(tpl[f]) : "缺  用 --" + flagOf(f)) + src);

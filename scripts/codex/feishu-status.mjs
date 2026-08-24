@@ -3,7 +3,8 @@
 
 import { validThreadId } from "./bind-compose.mjs";
 import {
-  bridgeHome, findRegisteredTaskForCodexThread, loadCodexTemplate, loadRegistry, registryFile,
+  bridgeHome, buildCodexSubscriptionProjection, findRegisteredTaskForCodexThread,
+  loadCodexTemplate, loadRegistry, registryFile,
 } from "./state.mjs";
 import { collectConnectivity, renderConnectivity } from "../status-providers.mjs";
 import {
@@ -16,7 +17,6 @@ import path from "node:path";
 import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
 import { codexHomeOf } from "./drain-service.mjs";
 import { taskBindingFacts } from "./task-binding.mjs";
-import { buildCodexSubscriptionProjection } from "./subscription-projection.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);

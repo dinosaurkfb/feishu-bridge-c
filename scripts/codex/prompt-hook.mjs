@@ -11,6 +11,17 @@ import {
 import { storeTurnInput } from "../turn-input.mjs";
 import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
 
+/**
+ * 不带参数的控制命令 —— **只有这一份清单**。
+ *
+ * 这些名字原本在四条正则里各写一遍：加一个命令要改四处，
+ * 漏一处的后果是"裸写能用、Desktop 的链接形式不认"，或者"带参数时不再 fail-closed"——
+ * 两种都得等真人踩到才发现。
+ */
+const SIMPLE_COMMANDS = [
+  "feishu-bind", "feishu-unbind", "feishu-status", "feishu-rotate", "feishu-subscribe",
+];
+
 export function classifyFeishuPrompt(prompt) {
   if (typeof prompt !== "string") return "none";
   const p = prompt.trim().replace(/(?:(?:&#x20;|&nbsp;)\s*)+$/gu, "").trim();
@@ -22,7 +33,7 @@ export function classifyFeishuPrompt(prompt) {
   // 讨论命令、粘贴 Agent 输出或引用旧消息，那些都没有控制授权。
   const bareMode = /^\$feishu-mode(?:\s+(dialogue|mapping))?$/u.exec(commandText);
   if (bareMode) return bareMode[1] ? "mode-" + bareMode[1] : "mode";
-  const bare = /^\$(feishu-bind|feishu-unbind|feishu-status|feishu-rotate)$/u.exec(commandText);
+  const bare = new RegExp("^\\$(" + SIMPLE_COMMANDS.join("|") + ")$", "u").exec(commandText);
   if (bare) return bare[1].slice("feishu-".length);
 
   const linkedMode = /^\[\$feishu-mode\]\(([^\r\n)]+)\)(?:\s+(dialogue|mapping))?$/u.exec(commandText);
@@ -31,7 +42,8 @@ export function classifyFeishuPrompt(prompt) {
     if (!target.endsWith("/feishu-mode/SKILL.md")) return "invalid-mode";
     return linkedMode[2] ? "mode-" + linkedMode[2] : "mode";
   }
-  const linked = /^\[\$(feishu-bind|feishu-unbind|feishu-status|feishu-rotate)\]\(([^\r\n)]+)\)$/u.exec(commandText);
+  const linked = new RegExp("^\\[\\$(" + SIMPLE_COMMANDS.join("|") +
+    ")\\]\\(([^\\r\\n)]+)\\)$", "u").exec(commandText);
   if (linked) {
     const name = linked[1];
     const target = linked[2].replace(/\\/gu, "/");
@@ -43,9 +55,11 @@ export function classifyFeishuPrompt(prompt) {
   // 和转发通常不会从 token 开始，仍保持静默 none，避免把普通内容误当成控制动作。
   const malformedMode = /^(?:\$feishu-mode|\[\$feishu-mode\]\([^\r\n)]*\))(?=\s)/u.exec(commandText);
   if (malformedMode) return "invalid-mode";
-  const malformedBare = /^\$(feishu-bind|feishu-unbind|feishu-status|feishu-rotate)(?=\s)/u.exec(commandText);
+  const malformedBare = new RegExp("^\\$(" + SIMPLE_COMMANDS.join("|") +
+    ")(?=\\s)", "u").exec(commandText);
   if (malformedBare) return "invalid-" + malformedBare[1].slice("feishu-".length);
-  const malformedLinked = /^\[\$(feishu-bind|feishu-unbind|feishu-status|feishu-rotate)\]\([^\r\n)]*\)/u.exec(commandText);
+  const malformedLinked = new RegExp("^\\[\\$(" + SIMPLE_COMMANDS.join("|") +
+    ")\\]\\([^\\r\\n)]*\\)", "u").exec(commandText);
   if (malformedLinked) return "invalid-" + malformedLinked[1].slice("feishu-".length);
   return "none";
 }
@@ -90,6 +104,21 @@ export function composeStatusContext({ bridgeRoot, threadId }) {
     "只运行以下只读命令，并用简洁自然语言转述 stdout：",
     "`" + nodeCommandPrefix(command) + " --thread-id " + shellQuote(threadId) + "`",
     "不得直接读取或输出 registry、locator、凭据、claim 或 receipt。",
+  ].join("\n");
+}
+
+export function composeSubscribeContext({ bridgeRoot, threadId }) {
+  const command = path.join(bridgeRoot, "scripts", "codex", "feishu-subscribe.mjs");
+  return [
+    "[Codex 飞书桥·事件订阅] 用户要求只读查看当前 task 的事件订阅（第 2 层）。",
+    "当前 task 的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
+    "只运行以下只读命令，并**保留 stdout 的结构**转述（标签 + 值两列）：",
+    "`" + nodeCommandPrefix(command) + " --thread-id " + shellQuote(threadId) + "`",
+    // **写入口没开的原因本身就是信息。**概括成"暂不支持修改"，
+    // 下一个来问"为什么不能改"的人就得重新把这段考古一遍。
+    "脚本末尾会说明写入口为什么还没开 —— 那段原样转述，不要概括成「暂不支持修改」。",
+    "不得直接读取或输出 registry、locator、凭据、claim 或 receipt；",
+    "「授权发送者 N 个」只出数量不出身份，群名不可用时不要拿群 ID 顶替。",
   ].join("\n");
 }
 
@@ -277,6 +306,8 @@ async function main() {
     additionalContext = composeUnbindContext({ bridgeRoot: tpl.template.bridge_root, threadId });
   } else if (action === "status") {
     additionalContext = composeStatusContext({ bridgeRoot: tpl.template.bridge_root, threadId });
+  } else if (action === "subscribe") {
+    additionalContext = composeSubscribeContext({ bridgeRoot: tpl.template.bridge_root, threadId });
   } else if (action === "rotate") {
     additionalContext = composeRotateContext({ bridgeRoot: tpl.template.bridge_root, threadId });
   } else if (action === "mode" || action.startsWith("mode-")) {

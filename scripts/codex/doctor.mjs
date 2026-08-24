@@ -17,15 +17,9 @@ import {
 const ROOT = moduleRoot(import.meta.url, "../..");
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const JSON_OUTPUT = process.argv.includes("--json");
-const REQUIRED_SKILLS = [
-  "m5codex-inbound-router",
-  "codex-longtask-feishu",
-  "feishu-bind",
-  "feishu-unbind",
-  "feishu-status",
-  "feishu-rotate",
-  "feishu-mode",
-];
+// 技能清单只有一份 —— 在 skill-content.mjs 里。
+// 这里曾经又抄了一遍：加一个技能要改两处，漏一处就变成
+// "安装器装了、doctor 不知道要查"，而那正好是这轮反复栽的那件事。
 
 function commandPath(name, extra = []) {
   const candidates = [

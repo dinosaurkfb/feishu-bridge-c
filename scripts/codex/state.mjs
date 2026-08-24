@@ -665,8 +665,16 @@ export function findPendingTask({ home = bridgeHome(), now = Date.now(), content
   };
 }
 
-/** 现有 Codex task registry → Subscription v1；不写控制面状态，不改变现有 task。 */
-export function buildCodexSubscriptionProjection({ home = bridgeHome(), template } = {}) {
+/**
+ * 现有 Codex task registry → Subscription v1；不写控制面状态，不改变现有 task。
+ *
+ * `threadId` 传了就只投影那一条 —— status 和 subscribe 说"当前这条 task"，
+ * 就不能把别的 task 的订阅和待认领计数算进来。
+ * **默认仍是全局视图**：首次认领 shadow 需要它，那个默认不能改。
+ */
+export function buildCodexSubscriptionProjection({
+  home = bridgeHome(), template, threadId = null,
+} = {}) {
   const reg = loadRegistry(registryFile(home));
   if (!reg.ok) return reg;
   const loadedTemplate = template
@@ -675,7 +683,9 @@ export function buildCodexSubscriptionProjection({ home = bridgeHome(), template
   if (!loadedTemplate.ok) return { ok: false, reason: "template_unusable" };
   const resolvedTemplate = loadedTemplate.template;
   const endpointId = legacyEndpointId({ runtime: "codex", agentUid: resolvedTemplate.agent_uid });
-  const records = reg.tasks.map((task) => {
+  const records = reg.tasks.filter(
+    (task) => threadId === null || task.codex_thread_id === threadId,
+  ).map((task) => {
     const state = topicStateForTask(task);
     const pending = state.ok ? pendingGeneration(state.state) : null;
     const active = state.ok ? activeGeneration(state.state) : null;

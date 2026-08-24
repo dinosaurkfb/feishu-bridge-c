@@ -123,8 +123,19 @@ export function suppressCmd() {
   return path.join(moduleRoot(import.meta.url, ".."), "scripts", "feishu-suppress-outbox.mjs");
 }
 
+/**
+ * `publish` 是**唯一的发布注入口**。默认就是真的发。
+ *
+ * 加它的原因：这条失败路径此前根本没法做行为测试 —— `publishDraft` 的
+ * `larkBin` 来自机器级模板（`resolveLarkIdentity`），**不是**项目 chain-config 里的
+ * `lark_cli_bin`，所以给临时项目写一个假的二进制挡不住它。我为了测一条失败分支
+ * 跑过一次非 dry-run 的 drainProject，**它直接打到了真实飞书 API**
+ * （拿到真实错误码 99992354，所幸根消息是假的，什么都没发出去）。
+ *
+ * 注入口只改测试的可达性，不改生产行为：不传就是 publishDraft 本身。
+ */
 export function drainProject({
-  root, claudeSessionId, dryRun = false, timeoutMs, force = false,
+  root, claudeSessionId, dryRun = false, timeoutMs, force = false, publish = publishDraft,
 } = {}) {
   const outboxDir = outboxDirOf(root, claudeSessionId);
 
@@ -218,7 +229,7 @@ export function drainProject({
       // 记住正在发哪一个目标：失败诊断要查**这一条**的根消息，
       // 而不是 mapping.root_message_id —— 后者可能是别的代际，甚至不存在。
       failingTarget = item.target;
-      const messageId = publishDraft({
+      const messageId = publish({
         profile: id.profile,
         rootMessageId: item.target.rootMessageId,
         card: item.card,

@@ -193,15 +193,39 @@ import {
  * 的 FEISHU_BRIDGE_TEST_REGISTRY，而且**在任何一条测试跑起来之前**就验它，
  * 指向生产路径或 HOME 里的任何位置一律拒绝启动。
  */
+/**
+ * 把路径解析成**真实路径**，文件还不存在也要能解析。
+ *
+ * 上一版只用 path.resolve() 做字符串前缀比较 —— 那挡不住符号链接：
+ * 一个字面上在 HOME 外、实际指向 HOME 内的链接会被直接放行。
+ * 逐级往上找到第一个真实存在的祖先，realpath 它，再把剩下的部分拼回去。
+ */
+function realPathOf(p) {
+  let cur = path.resolve(p);
+  const rest = [];
+  for (;;) {
+    try { return path.join(fs.realpathSync(cur), ...rest.slice().reverse()); }
+    catch { /* 这一级还不存在，继续往上 */ }
+    const parent = path.dirname(cur);
+    if (parent === cur) return path.resolve(p);   // 一直到根都解析不了
+    rest.push(path.basename(cur));
+    cur = parent;
+  }
+}
+
 function chooseTestRegistry({ override, home }) {
   if (override === undefined || override === null || override === "") {
     return { ok: true, kind: "temp" };
   }
-  const abs = path.resolve(override);
-  if (abs === path.join(home, ".claude", "feishu-bridge", "registry.json")) {
+  // **比真实路径，不比字面路径。**
+  const realHome = realPathOf(home);
+  const abs = realPathOf(override);
+  if (abs === path.join(realHome, ".claude", "feishu-bridge", "registry.json")) {
     return { ok: false, reason: "production" };
   }
-  if (abs === home || abs.startsWith(home + path.sep)) return { ok: false, reason: "inside_home" };
+  if (abs === realHome || abs.startsWith(realHome + path.sep)) {
+    return { ok: false, reason: "inside_home" };
+  }
   return { ok: true, kind: "override", path: abs };
 }
 
@@ -9167,10 +9191,40 @@ test("登记表的选择在跑测试之前就定死，且拒绝一切指向本�
   }
   // 名字以 HOME 开头但不是 HOME 下的目录，不该被误伤。
   assert.equal(chooseTestRegistry({ override: home + "-other/r.json", home }).ok, true);
-  // HOME 之外可以显式指定。
+  // HOME 之外可以显式指定。**返回的是真实路径**（/tmp 在 macOS 上本身就是
+  // 符号链接），后面的比较也都基于它。
   const out = chooseTestRegistry({ override: "/tmp/t/r.json", home });
   assert.equal(out.kind, "override");
-  assert.equal(out.path, "/tmp/t/r.json");
+  assert.equal(out.path, realPathOf("/tmp/t/r.json"));
+  assert.equal(path.isAbsolute(out.path), true);
+});
+
+test("符号链接不许绕过隔离 —— 比的是真实路径，不是字面路径", () => {
+  // 评审复现的：字面在 HOME 外、实际指向 HOME 内的链接会被放行，
+  // 因为上一版只用 path.resolve() 做字符串前缀比较。
+  const home = os.homedir();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-symlink-"));
+  const link = path.join(outside, "looks-outside");
+  fs.symlinkSync(home, link, "dir");
+
+  // 字面上在 HOME 外……
+  assert.equal(link.startsWith(home + path.sep), false, "字面路径确实在 HOME 外");
+  // ……但真实目标在 HOME 内，必须拦住。
+  assert.equal(chooseTestRegistry({ override: path.join(link, "somewhere.json"), home }).reason,
+    "inside_home");
+  // 经链接指向生产登记表也要认得出来。
+  assert.equal(chooseTestRegistry({
+    override: path.join(link, ".claude", "feishu-bridge", "registry.json"), home }).reason,
+    "production");
+
+  // 走真实进程：必须在任何测试跑起来之前就以 exit 2 拒绝。
+  const run = spawnSync(process.execPath, [path.resolve("scripts", "test.mjs")], {
+    encoding: "utf-8",
+    env: { ...process.env, FEISHU_BRIDGE_TEST_REGISTRY: path.join(link, "r.json") },
+  });
+  assert.equal(run.status, 2, "经符号链接指向 HOME 也要拒绝启动");
+  assert.match(run.stderr, /不许碰本机控制面/u);
+  assert.equal(run.stdout.includes("通过 "), false, "拒绝要发生在任何测试跑起来之前");
 });
 
 test("测试进程用的是临时登记表，够不到本机控制面", () => {

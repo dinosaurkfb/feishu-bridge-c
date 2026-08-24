@@ -83,7 +83,7 @@ import {
   SYNC_ACTION, SYNC_REJECT, authorizationCovers, planSubscriptionSync, renderSyncPlan,
 } from "./subscription-sync.mjs";
 import {
-  APPLY_REJECT, applySubscriptionSync, planId, verifyExpect,
+  APPLY_REJECT, applySubscriptionSync, buildWriteSet, planId, verifyExpect,
 } from "./subscription-sync-apply.mjs";
 import { renderSubscriptions, subscriptionDetails } from "./feishu-subscribe.mjs";
 import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
@@ -8720,6 +8720,10 @@ const applyEntry = (over = {}) => ({
   ...over,
 });
 const applyPlan = (entries) => ({ ok: true, noop: false, plans: entries });
+// 指纹要含物化后的目标快照，所以造一份最小写集陪它。
+const applyWrites = (entries, snapId = "binding_authorization_" + "9".repeat(24)) =>
+  entries.map((e) => ({ entry: e, target: { snapshot_id: snapId } }));
+const pidOf = (entries, snapId) => planId(applyPlan(entries), applyWrites(entries, snapId));
 
 /**
  * 落盘用的真实世界：真 materializer 生成的快照落在真目录里。
@@ -8744,7 +8748,14 @@ const applyWorld = (over = {}) => {
     previous: syncSub(), next, snapshots: [snap], others: [],
     runtimeNamespace: SYNC_NS, bindings: { [snap.binding_ref]: binding }, now: NOW,
   };
-  return { dir, snap, binding, world,
+  // **指纹要含物化后的目标快照**，所以算它必须连 buildWriteSet 一起走。
+  const pid = (over2 = {}) => {
+    const wd = { ...world, ...over2 };
+    const pl = planSubscriptionSync(wd);
+    const built = buildWriteSet({ plan: pl, world: wd, shadowDir: dir });
+    return built.ok ? planId(pl, built.writes) : null;
+  };
+  return { dir, snap, binding, world, pid,
     lockDir: path.join(dir, "control.lock"),
     file: path.join(dir, "authorizations", snap.binding_ref + ".json"),
     read: () => JSON.parse(fs.readFileSync(path.join(dir, "authorizations", snap.binding_ref + ".json"), "utf-8")) };
@@ -8754,7 +8765,7 @@ test("落盘：计划没变就写下去，同一 operation 重放不再写", () 
   const w = applyWorld();
   const plan = planSubscriptionSync(w.world);
   assert.equal(plan.counts.resnapshot, 1, "夹具应当产出一条 resnapshot");
-  const pid = planId(plan);
+  const pid = w.pid();
 
   // **重读必须发生在锁之内**，否则"锁内重算"只是句好听的话。
   // 让 readWorld 自己看那一刻锁在不在 —— 这是唯一能证明调用时机的办法。
@@ -8789,7 +8800,7 @@ test("落盘：锁内重算发现计划变了就零写入", () => {
   // Codex 点名的两种漂移：并发新增 binding、快照 revision 变了。
   // 共同点是**锁外算的那份计划已经不作数**，这时写下去的就是一份残缺的计划。
   const w = applyWorld();
-  const pid = planId(planSubscriptionSync(w.world));
+  const pid = w.pid();
 
   // 锁内重读时世界多了一条 binding —— 计划从 1 条变 2 条。
   const extra = applyWorld({ key: "w2" });
@@ -8808,14 +8819,13 @@ test("落盘：锁内重算发现计划变了就零写入", () => {
   assert.equal(w.read().snapshot_id, w.snap.snapshot_id, "计划过期时一个字节都不许写");
 });
 
-test("落盘：快照被别的路径改过时，第二道 CAS 要拦住", () => {
-  // 锁只在本机有效。计划指纹对得上，但快照文件在锁之外被换过 —— 这时
-  // **第一层看不出来，只有逐条 CAS 拦得住。**
+test("落盘：快照被别的路径改过 —— 两层里总有一层拦住它", () => {
+  // 指纹现在含**物化后的目标快照**，所以盘上那份被换掉时，重算出来的目标也跟着变，
+  // 第一层（plan_stale）就会拦住。上一版指纹不含目标，这种漂移只有第二层看得见。
+  // 这条只钉住"被拦住且零写入"，不钉是哪一层 —— **钉住是哪一层就等于把实现写进断言**。
   const w = applyWorld();
-  const plan = planSubscriptionSync(w.world);
-  const pid = planId(plan);
+  const pid = w.pid();
 
-  // 悄悄把盘上那份换成另一个 revision（合法快照，但不是计划依据的那一份）。
   const bumped = materializeDialogueBindingAuthorization({
     runtimeNamespace: SYNC_NS, endpointId: SYNC_EP,
     subscription: syncSub({ version: 3, scope: { ...syncSub().scope, sender_ids: ["u_third"] } }),
@@ -8827,15 +8837,126 @@ test("落盘：快照被别的路径改过时，第二道 CAS 要拦住", () => 
     shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-cas-00001",
     expectedPlanId: pid, readWorld: () => w.world,
   });
-  assert.equal(got.ok, false);
-  assert.equal(got.reason, APPLY_REJECT.EXPECT_MISMATCH);
-  assert.ok(got.field, "要说清是哪个字段对不上");
+  assert.equal(got.ok, false, "盘上被换过就不许写下去");
+  assert.ok([APPLY_REJECT.PLAN_STALE, APPLY_REJECT.EXPECT_MISMATCH].includes(got.reason),
+    "要么指纹对不上、要么 CAS 对不上，不该是别的：" + got.reason);
   assert.equal(w.read().snapshot_id, bumped.snapshot.snapshot_id, "拦下来就不许动它");
+});
+
+test("落盘：重试按恢复清单走，第三种状态一律拒", () => {
+  // 评审指出的：上一版重试要"再规划一次"，而部分写入之后重新规划会看到自己写出的
+  // 新状态，指纹先变 —— **于是在 plan_stale 就返回了，"已等于目标就跳过"那条
+  // 永远没机会执行**。所以 prepared 记录不是日志，是恢复清单：重试以它为准，不再规划。
+  const w = applyWorld();
+  const pid = w.pid();
+  const opId = "op-resume-001";
+
+  // 手工造一份"做到一半"的现场：prepared 记录在，但快照还没写。
+  const plan = planSubscriptionSync(w.world);
+  const built = buildWriteSet({ plan, world: w.world, shadowDir: w.dir });
+  assert.equal(built.ok, true, built.reason ?? "");
+  const target = built.writes[0].target;
+  fs.mkdirSync(path.join(w.dir, "sync-operations"), { recursive: true });
+  const journal = {
+    schema_version: "subscription-sync-operation/v1", operation_id: opId, plan_id: pid,
+    status: "prepared", prepared_at: new Date().toISOString(), committed_at: null,
+    writes: [{ binding_ref: w.snap.binding_ref,
+      expect: { subscription_id: w.snap.subscription_id,
+        subscription_version: w.snap.subscription_version,
+        authorization_revision: w.snap.authorization_revision,
+        snapshot_id: w.snap.snapshot_id },
+      target }],
+  };
+  const jf = path.join(w.dir, "sync-operations", opId + ".json");
+  fs.writeFileSync(jf, JSON.stringify(journal, null, 2));
+
+  // 重试：**不重新规划**，按清单把没写的写完。
+  const resumed = applySubscriptionSync({
+    shadowDir: w.dir, lockDir: w.lockDir, operationId: opId, expectedPlanId: pid,
+    readWorld: () => { throw new Error("重试不该再规划"); },
+  });
+  assert.equal(resumed.ok, true, resumed.reason ?? "");
+  assert.equal(resumed.resumed, true);
+  assert.equal(resumed.written, 1);
+  assert.equal(w.read().snapshot_id, target.snapshot_id);
+  assert.equal(JSON.parse(fs.readFileSync(jf, "utf-8")).status, "committed");
+
+  // 再重试一次：每一项都已是目标值 → 跳过，不重复写。
+  fs.writeFileSync(jf, JSON.stringify({ ...journal, status: "prepared" }, null, 2));
+  const before = fs.statSync(w.file).mtimeMs;
+  const again = applySubscriptionSync({
+    shadowDir: w.dir, lockDir: w.lockDir, operationId: opId, expectedPlanId: pid,
+    readWorld: () => { throw new Error("不该规划"); } });
+  assert.equal(again.ok, true);
+  assert.equal(again.written, 0);
+  assert.equal(again.skipped, 1, "已经是目标值的要算跳过，不是重写");
+  assert.equal(fs.statSync(w.file).mtimeMs, before);
+
+  // **第三种状态：既不是原值也不是目标值 → 拒。**中间有别人动过，
+  // 接着写就是拿过期计划覆盖别人的结果。
+  const stranger = materializeDialogueBindingAuthorization({
+    runtimeNamespace: SYNC_NS, endpointId: SYNC_EP,
+    subscription: syncSub({ version: 9, scope: { ...syncSub().scope, sender_ids: ["u_x"] } }),
+    binding: w.binding, previousSnapshot: JSON.parse(fs.readFileSync(w.file, "utf-8")) });
+  assert.equal(stranger.ok, true, stranger.reason ?? "");
+  fs.writeFileSync(w.file, JSON.stringify(stranger.snapshot, null, 2));
+  fs.writeFileSync(jf, JSON.stringify({ ...journal, status: "prepared" }, null, 2));
+  const diverged = applySubscriptionSync({
+    shadowDir: w.dir, lockDir: w.lockDir, operationId: opId, expectedPlanId: pid,
+    readWorld: () => { throw new Error("不该规划"); } });
+  assert.equal(diverged.ok, false);
+  assert.equal(diverged.reason, APPLY_REJECT.EXPECT_MISMATCH);
+  assert.equal(w.read().snapshot_id, stranger.snapshot.snapshot_id, "拒绝时不许覆盖别人的结果");
+});
+
+test("落盘：同一 operation id 换一份计划不许报「已经做过了」", () => {
+  // 评审指出的：上一版只看 status=committed 就返回幂等成功，没核对是不是同一份计划。
+  // 复用 operation id 去跑另一份计划，会被误报成已完成 —— **那份计划一个字都没写。**
+  const w = applyWorld();
+  const opId = "op-reuse-0001";
+  fs.mkdirSync(path.join(w.dir, "sync-operations"), { recursive: true });
+  fs.writeFileSync(path.join(w.dir, "sync-operations", opId + ".json"), JSON.stringify({
+    schema_version: "subscription-sync-operation/v1", operation_id: opId,
+    plan_id: "sync_plan_" + "a".repeat(24), status: "committed",
+    prepared_at: new Date().toISOString(), committed_at: new Date().toISOString(), writes: [] }));
+
+  const got = applySubscriptionSync({
+    shadowDir: w.dir, lockDir: w.lockDir, operationId: opId,
+    expectedPlanId: w.pid(), readWorld: () => w.world });
+  assert.equal(got.ok, false);
+  assert.equal(got.reason, APPLY_REJECT.OPERATION_REUSED);
+  assert.equal(w.read().snapshot_id, w.snap.snapshot_id, "零写入");
+});
+
+test("落盘：读不出来的记录不算「没有记录」", () => {
+  // fail-open 的代价：另一笔事务的记录读不出来时当成"没有"，就会在一份
+  // 说不清的状态上再叠一笔。只有"还没有过任何一次"才算空。
+  const w = applyWorld();
+  fs.mkdirSync(path.join(w.dir, "sync-operations"), { recursive: true });
+  fs.writeFileSync(path.join(w.dir, "sync-operations", "op-broken-001.json"), "不是 json{");
+  const got = applySubscriptionSync({
+    shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-after-0001",
+    expectedPlanId: w.pid(), readWorld: () => w.world });
+  assert.equal(got.ok, false);
+  assert.equal(got.reason, APPLY_REJECT.JOURNAL_UNREADABLE);
+  assert.equal(w.read().snapshot_id, w.snap.snapshot_id, "零写入");
+});
+
+test("落盘：readWorld 抛异常要变成结构化失败，不是把异常扔给调用方", () => {
+  const w = applyWorld();
+  const got = applySubscriptionSync({
+    shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-throw-0001",
+    expectedPlanId: w.pid(), readWorld: () => { throw new Error("读世界炸了"); } });
+  assert.equal(got.ok, false);
+  assert.equal(got.reason, APPLY_REJECT.WORLD_UNREADABLE);
+  assert.match(got.error, /读世界炸了/u);
+  // 抛出去的话锁也就漏了 —— 顺带验一下。
+  assert.equal(fs.existsSync(w.lockDir), false, "异常路径也要把锁还回去");
 });
 
 test("落盘：另一笔事务没做完时不许再开一笔", () => {
   const w = applyWorld();
-  const pid = planId(planSubscriptionSync(w.world));
+  const pid = w.pid();
   // 手工留下一份停在 prepared 的记录 —— 那就是"上次没做完"的证据。
   fs.mkdirSync(path.join(w.dir, "sync-operations"), { recursive: true });
   fs.writeFileSync(path.join(w.dir, "sync-operations", "op-stuck-0001.json"),
@@ -8855,7 +8976,7 @@ test("落盘：另一笔事务没做完时不许再开一笔", () => {
 
 test("落盘：控制面锁被占时不动手；suspend / migrate 明确拒绝而不是编一个出来", () => {
   const w = applyWorld();
-  const pid = planId(planSubscriptionSync(w.world));
+  const pid = w.pid();
 
   // 锁被别人拿着（owner pid 必须是活的，否则会被当成崩溃残留接管）。
   fs.mkdirSync(w.lockDir, { recursive: true });
@@ -8874,9 +8995,10 @@ test("落盘：控制面锁被占时不动手；suspend / migrate 明确拒绝�
   const revoke = { ...w.world, next: null };
   const revokePlan = planSubscriptionSync(revoke);
   assert.equal(revokePlan.counts.suspend, 1);
+  // suspend 连写集都造不出来，给什么指纹都一样 —— 它会先在动作那一关失败。
   const got = applySubscriptionSync({
     shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-revoke-001",
-    expectedPlanId: planId(revokePlan), readWorld: () => revoke });
+    expectedPlanId: "sync_plan_" + "0".repeat(24), readWorld: () => revoke });
   assert.equal(got.ok, false);
   assert.equal(got.reason, APPLY_REJECT.UNSUPPORTED_ACTION);
   assert.equal(got.action, SYNC_ACTION.SUSPEND);
@@ -8889,12 +9011,17 @@ test("计划指纹顺序无关，但少一样内容都要变", () => {
   const b = applyEntry({ bindingRef: "binding_ref_" + "2".repeat(24) });
 
   // 重读的顺序本来就可能不同 —— 顺序不该改变结论。
-  assert.equal(planId(applyPlan([a, b])), planId(applyPlan([b, a])));
+  assert.equal(pidOf([a, b]), pidOf([b, a]));
   // 条数变了就是另一份计划。
-  assert.notEqual(planId(applyPlan([a])), planId(applyPlan([a, b])));
+  assert.notEqual(pidOf([a]), pidOf([a, b]));
+  // **将要写下去的内容变了，指纹必须变。**上一版只放动作和旧快照前置条件，
+  // 于是两份内容不同的新授权可以算出同一个指纹 —— "计划没变"成了假话。
+  assert.notEqual(pidOf([a]), pidOf([a], "binding_authorization_" + "8".repeat(24)));
+  // 给不出写集就没有指纹：不许拿一份只描述意图的东西当"将写什么"的凭据。
+  assert.equal(planId(applyPlan([a])), null);
 
   // **每一样都要进指纹**：少放一样就会出现"指纹相同但写的东西不同"。
-  const base = planId(applyPlan([a]));
+  const base = pidOf([a]);
   for (const [what, over] of [
     ["动作", { action: SYNC_ACTION.RESNAPSHOT }],
     ["迁移目标", { toSubscriptionId: "subscription_" + "f".repeat(24) }],
@@ -8905,15 +9032,15 @@ test("计划指纹顺序无关，但少一样内容都要变", () => {
     ["授权 revision 前置", { expect: { ...a.expect, authorizationRevision: 2 } }],
     ["快照 id 前置", { expect: { ...a.expect, snapshotId: "binding_authorization_" + "c".repeat(24) } }],
   ]) {
-    assert.notEqual(planId(applyPlan([{ ...a, ...over }])), base, what + "变了，指纹却没变");
+    assert.notEqual(pidOf([{ ...a, ...over }]), base, what + "变了，指纹却没变");
   }
 
   // noop 也是一种结论，不能跟"空计划"混同。
-  assert.notEqual(planId({ ok: true, noop: true, plans: [] }),
-    planId({ ok: true, noop: false, plans: [] }));
+  assert.notEqual(planId({ ok: true, noop: true, plans: [] }, []),
+    planId({ ok: true, noop: false, plans: [] }, []));
   // 算不出计划就没有指纹 —— 不许拿 null 当一个值去比。
-  assert.equal(planId({ ok: false, reason: "x" }), null);
-  assert.equal(planId(null), null);
+  assert.equal(planId({ ok: false, reason: "x" }, []), null);
+  assert.equal(planId(null, []), null);
 });
 
 test("落盘前的第二道 CAS：四个字段每一个都要比", () => {

@@ -27,8 +27,8 @@ import {
 import { acquireClaim, claimKey, recordClaimState } from "./claim.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
-  acquirePublishLock, attributeSession, fileContainsAny, isUnder,
-  loadRegistry, releasePublishLock,
+  acquirePublishLock, attributeSession, exactProjectsForRoot, fileContainsAny, isUnder,
+  loadRegistry, loadRegistryStrict, normalizeRoot, releasePublishLock,
 } from "./registry.mjs";
 import {
   appendEvent, composeDigest, listPending, markSent, suppressRecords,
@@ -9017,6 +9017,306 @@ test("测试不许走真实发布路径 —— 每个 drainProject 调用都要�
     site.near.includes("publish:") && !site.near.includes("diagnose:"));
   assert.deepEqual(halfInjected.map((x) => (x.i + 1) + ": " + x.line.trim()), [],
     "这些调用注入了 publish 却没注入 diagnose —— 失败后的诊断仍会真的出网");
+});
+
+test("补登记必须 fail-closed：读不出来的登记表不许被空表覆盖", () => {
+  // 评审在**已合并**的实现里查出来的。上一版把所有读取异常都当成"没有登记表"，
+  // 于是坏 JSON、权限错误也会走进新建逻辑 —— 那等于拿一张空表去覆盖一份读不出来的
+  // 真实登记表，**把别的项目的绑定一起抹掉**。
+  // 读不出来跟没有，是完全不同的两件事。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-bindfc-"));
+  const proj = path.join(dir, "proj");
+  const inbound = path.join(proj, ".runtime-data", "inbound");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: proj, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_existing",
+    feishu_root_message_id_reference: "om_existing", channel_generation_id: "gen-4" }));
+  const reg = path.join(dir, "registry.json");
+  const tpl = path.join(dir, "chain-config.json");
+  fs.writeFileSync(tpl, JSON.stringify(TPL));
+  const bind = (...args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, ...args,
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: reg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: dir } });
+  const raw = () => fs.readFileSync(reg, "utf-8");
+
+  // 坏 JSON：拒绝、非零退出、**文件一个字节都不许动**。
+  fs.writeFileSync(reg, "这不是 json{");
+  const broken = bind("--apply");
+  assert.equal(broken.status, 1);
+  assert.match(broken.stderr, /不是合法 JSON/u);
+  assert.match(broken.stderr, /没有动任何文件/u);
+  assert.equal(raw(), "这不是 json{", "读不出来就绝不许覆盖");
+
+  // 形状不对（projects 不是数组）也一样。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0", projects: "nope" }));
+  assert.equal(bind("--apply").status, 1, "projects 不是数组也要拒");
+
+  // **读取本身失败也要拒。**这一条不能漏：坏 JSON 走的是 parse 那条分支，
+  // 而"读不出来"走的是 readFileSync 的 catch —— 只测前者的话，
+  // 把 catch 改成"一律当空表"照样绿（第一版就是这样）。
+  fs.rmSync(reg);
+  fs.mkdirSync(reg);                       // 路径是目录 → 读取抛 EISDIR
+  const unreadable = bind("--apply");
+  assert.equal(unreadable.status, 1, "读不出来也要拒，不能当成空表");
+  assert.match(unreadable.stderr, /读不了|没有动任何文件/u);
+  assert.equal(fs.statSync(reg).isDirectory(), true, "拒绝时不许改动它");
+  fs.rmdirSync(reg);
+
+  // 只有"文件不存在"才当成空表。（上一步已经把它删掉了，这里不再删一次。）
+  assert.equal(fs.existsSync(reg), false);
+  const fresh = bind("--apply");
+  assert.equal(fresh.status, 0, fresh.stderr);
+  assert.equal(JSON.parse(raw()).projects.length, 1);
+});
+
+test("锁内一律不 exit —— 每条退出路径跑完锁都得还回去", () => {
+  // **这个坑我踩过两次。**`process.exit()` 会跳过 finally，锁就漏了；
+  // 上一版补登记的锁内有四条 exit 路径（重读失败、同 root 多条、别人刚补好、写盘失败）。
+  // 现在锁内只返回结果，退出码和输出全在锁释放之后 —— 这条逐个验。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-lockleak2-"));
+  const proj = path.join(dir, "proj");
+  const inbound = path.join(proj, ".runtime-data", "inbound");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: proj, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_existing",
+    feishu_root_message_id_reference: "om_existing", channel_generation_id: "gen-4" }));
+  const reg = path.join(dir, "registry.json");
+  const tpl = path.join(dir, "chain-config.json");
+  fs.writeFileSync(tpl, JSON.stringify(TPL));
+  const bind = () => spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, "--apply",
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: reg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: dir } });
+  const lockDir = topicGenerationLockDir({ source: "registry", registryFile: reg, root: proj });
+  const noLock = (what) => assert.equal(fs.existsSync(lockDir), false, what + " 之后锁没还回去");
+
+  // ① 同 root 多条 → 拒绝
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "a", root: proj }, { id: "b", root: proj }] }));
+  assert.equal(bind().status, 1);
+  noLock("同 root 多条被拒");
+
+  // ② 锁内发现别人已经补好了 → 什么都不做
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "done", root: proj, root_message_id: "om_existing" }] }));
+  const already = bind();
+  assert.equal(already.status, 0, already.stderr);
+  assert.match(already.stdout, /已经接入过了|已经登记好了/u);
+  noLock("发现别人已补好");
+
+  // ③ 写盘失败 → 非零退出。把登记表所在目录设成只读来造这个失败。
+  const roDir = path.join(dir, "ro");
+  fs.mkdirSync(roDir, { recursive: true });
+  const roReg = path.join(roDir, "registry.json");
+  fs.writeFileSync(roReg, JSON.stringify({ schema_version: "1.0", projects: [] }));
+  fs.chmodSync(roDir, 0o500);
+  const roLock = topicGenerationLockDir({ source: "registry", registryFile: roReg, root: proj });
+  const failed = spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, "--apply",
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: roReg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: dir } });
+  fs.chmodSync(roDir, 0o700);
+  assert.notEqual(failed.status, 0, "写不进去就要非零退出");
+  assert.equal(fs.existsSync(roLock), false, "写盘失败之后锁也得还回去");
+});
+
+test("登记表的写入口只有一个 —— 建话题那条路径也走同一笔事务", () => {
+  // 评审指出：上一版只有补登记分支进了锁，**正常新建绑定仍在锁外整体写回**，
+  // 跟补登记并发时照样互相覆盖 —— 那样"登记表控制锁"就只是名义上的。
+  //
+  // 行为上不好造并发，所以这里钉住"文件里没有第二条写回路径"：
+  // 整体写回 registry 的语句只许出现在事务函数里。
+  const src = fs.readFileSync(path.resolve("scripts", "bind-project.mjs"), "utf-8");
+  // 用"原子重命名到登记表文件"当锚点 —— 那是真正提交写入的那一步，
+  // 比匹配变量名稳（变量可能叫 registry，也可能叫 fresh.registry）。
+  const writes = [...src.matchAll(/renameSync\(tmp, regFile\)/gu)];
+  assert.equal(writes.length, 1, "登记表写回只许有一处（在事务函数里），实际 " + writes.length + " 处");
+  const inTx = src.indexOf("function withRegistryTransaction");
+  const txEnd = src.indexOf("\n}\n", src.indexOf("} finally {", inTx));
+  assert.ok(writes[0].index > inTx && writes[0].index < txEnd,
+    "那唯一一处必须在 withRegistryTransaction 里面");
+  // 两条路径都用它。
+  // 数**调用点**，别把函数定义也数进去（第一版就是这么多算了一处）。
+  const calls = (src.match(/=\s*withRegistryTransaction\(\{/gu) ?? []).length;
+  assert.equal(calls, 2, "补登记和新建绑定都要走同一个入口，实际 " + calls + " 处调用");
+});
+
+test("逻辑相同的 root 不许绕过 —— 尾斜杠也是同一个项目", () => {
+  // 评审抓的：前置检查挡得住字面完全相同的 root，但登记表里若是 "/project/"、
+  // 命令解析出来是 "/project"，**两次检查都认为没有记录** ——
+  // 于是可能先建飞书话题，再新增一条逻辑重复的记录。
+  //
+  // 根因是归一化写了两份：运行时的 loadRegistry 做尾斜杠处理，
+  // 而 bind 自己那份严格读取不做。现在两处共用 registry.mjs 里的同一个 normalizeRoot。
+  assert.equal(normalizeRoot("/a/b/"), normalizeRoot("/a/b"));
+  assert.equal(normalizeRoot("/a/b//"), normalizeRoot("/a/b"));
+  assert.equal(normalizeRoot(""), null);
+  assert.equal(normalizeRoot(null), null);
+  // 不同项目仍然不同 —— 别为了归一化把它们也拉平。
+  assert.notEqual(normalizeRoot("/a/b"), normalizeRoot("/a/bc"));
+
+  const projects = [{ root: "/x/proj/" }, { root: "/x/other" }];
+  assert.equal(exactProjectsForRoot(projects, "/x/proj").length, 1, "尾斜杠要认成同一个");
+  assert.equal(exactProjectsForRoot(projects, "/x/proj/").length, 1);
+  // **目录包含关系不算。**父目录不是这个项目。
+  assert.equal(exactProjectsForRoot([{ root: "/x" }], "/x/proj").length, 0);
+
+  // 走真实入口：登记表里是带尾斜杠的那条 → 必须认成"已经有了"，
+  // 不许建话题、不许新增第二条。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-slash-"));
+  const proj = path.join(dir, "proj");
+  fs.mkdirSync(path.join(proj, ".runtime-data", "inbound"), { recursive: true });
+  fs.writeFileSync(path.join(proj, ".runtime-data", "inbound", "chain-config.json"),
+    JSON.stringify({ project_dir: proj, logical_task_key: "k",
+      project_display_name: "P", task_display_name: "P" }));
+  const reg = path.join(dir, "registry.json");
+  const tpl = path.join(dir, "chain-config.json");
+  const screamer = path.join(dir, "lark-scream");
+  fs.writeFileSync(screamer, "#!/bin/sh\necho SCREAM >> " +
+    JSON.stringify(path.join(dir, "calls.log")) + "\nexit 9\n");
+  fs.chmodSync(screamer, 0o755);
+  fs.writeFileSync(tpl, JSON.stringify({ ...TPL, lark_cli_bin: screamer }));
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "slash", root: proj + "/", root_message_id: "om_a" }] }));
+
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, "--apply",
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: reg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: dir } });
+
+  assert.match(run.stdout, /已经接入过了/u, "带尾斜杠的那条就是它，不该当成没有");
+  assert.equal(fs.existsSync(path.join(dir, "calls.log")), false,
+    "**不许建话题** —— 往群里发消息是撤不回来的");
+  assert.equal(JSON.parse(fs.readFileSync(reg, "utf-8")).projects.length, 1,
+    "不许新增第二条逻辑重复的记录");
+
+  // **两条逻辑相同、写法不同 → 必须当成歧义拒绝。**
+  // 这一种只有前置的精确匹配挡得住：字面比较会认为"各只有一条"，
+  // 于是歧义根本不存在，命令照常往下走。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0", projects: [
+    { id: "with", root: proj + "/", root_message_id: "om_a" },
+    { id: "without", root: proj, root_message_id: "om_b" }] }));
+  const dup = spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, "--apply",
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: reg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: dir } });
+  assert.equal(dup.status, 1, "逻辑重复也是歧义，必须拒");
+  assert.match(dup.stderr, /说不清该(改|用)哪一条/u);
+  assert.equal(dup.stdout.includes("已经接入过了"), false, "不许把歧义盖过去");
+  assert.equal(fs.existsSync(path.join(dir, "calls.log")), false, "拒绝路径不许调用 lark");
+});
+
+test("同 root 多条：在任何动作之前就拒，不许先动飞书", () => {
+  // 评审指出：歧义检查只在登记事务里，而事务**之前**还有三条快速路径 ——
+  // 恢复暂停的绑定、报"已经接入"退出、进入建话题流程，它们都靠 findIndex
+  // 取第一条同 root 记录。于是：
+  //
+  //   · 第一条完整 → 直接报"已接入"退出，歧义根本没被发现；
+  //   · 第一条不完整、第二条完整 → **可能先产生飞书侧动作**，之后才在事务里拒绝。
+  //
+  // 后者尤其糟：那是不可撤销的。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-dupfast-"));
+  const proj = path.join(dir, "proj");
+  fs.mkdirSync(path.join(proj, ".runtime-data", "inbound"), { recursive: true });
+  fs.writeFileSync(path.join(proj, ".runtime-data", "inbound", "chain-config.json"),
+    JSON.stringify({ project_dir: proj, logical_task_key: "k",
+      project_display_name: "P", task_display_name: "P" }));
+  const reg = path.join(dir, "registry.json");
+  const tpl = path.join(dir, "chain-config.json");
+  // **把 lark 二进制指到一个"被调用就尖叫"的桩上** —— 这条测试要证明的是
+  // "飞书调用次数为零"，而不是"命令退出码不为零"。
+  const screamer = path.join(dir, "lark-scream");
+  fs.writeFileSync(screamer, "#!/bin/sh\necho SCREAM >> " +
+    JSON.stringify(path.join(dir, "calls.log")) + "\nexit 9\n");
+  fs.chmodSync(screamer, 0o755);
+  fs.writeFileSync(tpl, JSON.stringify({ ...TPL, lark_cli_bin: screamer }));
+  const calls = () => (fs.existsSync(path.join(dir, "calls.log"))
+    ? fs.readFileSync(path.join(dir, "calls.log"), "utf-8").trim().split("\n").filter(Boolean).length
+    : 0);
+  const bind = () => spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, "--apply",
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: reg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: dir } });
+
+  // ① 第一条完整、第二条也在 → 不许报"已接入"把歧义盖过去。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0", projects: [
+    { id: "full", root: proj, root_message_id: "om_a" },
+    { id: "other", root: proj, root_message_id: "om_b" }] }));
+  const first = bind();
+  assert.equal(first.status, 1, "歧义必须非零退出");
+  assert.equal(first.stdout.includes("已经接入过了"), false,
+    "报「已接入」等于把歧义盖过去了");
+  assert.match(first.stderr, /说不清该(改|用)哪一条/u);
+  assert.equal(calls(), 0, "拒绝路径不许调用 lark");
+
+  // ② 第一条不完整、第二条完整、且**没有项目内 mapping**（会走建话题流程）
+  //    → 必须在动飞书之前就停。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0", projects: [
+    { id: "stale", root: proj },
+    { id: "full", root: proj, root_message_id: "om_b" }] }));
+  assert.equal(fs.existsSync(path.join(proj, ".runtime-data", "inbound", "active-mapping.json")),
+    false, "这条用例要走建话题流程，所以不能有项目内 mapping");
+  const second = bind();
+  assert.equal(second.status, 1);
+  assert.equal(calls(), 0, "**建话题之前就该停** —— 往群里发消息是撤不回来的");
+  assert.equal(JSON.parse(fs.readFileSync(reg, "utf-8")).projects.length, 2, "登记表不许被动");
+});
+
+test("补登记要在锁内重读；同 root 多条拒绝，单条残缺就地修", () => {
+  // 另外两条 P1：上一版拿锁外那份快照直接 push —— 并发的绑定或迁移会被整体覆盖；
+  // 而且同 root 但缺 root_message_id 的条目会被再 push 一条，**制造重复归属**。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-bindlock-"));
+  const proj = path.join(dir, "proj");
+  const inbound = path.join(proj, ".runtime-data", "inbound");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: proj, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_existing",
+    feishu_root_message_id_reference: "om_existing", channel_generation_id: "gen-4" }));
+  const reg = path.join(dir, "registry.json");
+  const tpl = path.join(dir, "chain-config.json");
+  fs.writeFileSync(tpl, JSON.stringify(TPL));
+  const bind = (...args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, ...args,
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: reg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: dir } });
+  const projects = () => JSON.parse(fs.readFileSync(reg, "utf-8")).projects;
+
+  // 同 root 两条 → 说不清改哪条，拒绝且不动文件。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "a", root: proj }, { id: "b", root: proj }] }));
+  const dup = bind("--apply");
+  assert.equal(dup.status, 1);
+  // 前置检查和事务内检查措辞不同 —— 两处都该认，因为**两处各管一段**：
+  // 前置管"任何动作之前"，事务内管"并发变化"。
+  assert.match(dup.stderr, /说不清该(改|用)哪一条/u);
+  assert.equal(projects().length, 2, "拒绝时不许动登记表");
+
+  // 同 root 一条但缺 root_message_id → **就地修**，不新增。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "stale", root: proj, name: "旧" }] }));
+  const fixed = bind("--apply");
+  assert.equal(fixed.status, 0, fixed.stderr);
+  assert.equal(projects().length, 1, "同 root 不许出现第二条 —— 那是重复归属");
+  assert.equal(projects()[0].root_message_id, "om_existing");
+
+  // 登记表控制锁被占 → 不动手。owner pid 必须活着，否则会被当成崩溃残留接管。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0", projects: [] }));
+  const lockDir = topicGenerationLockDir({ source: "registry", registryFile: reg, root: proj });
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(path.join(lockDir, "owner.json"),
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  const busy = bind("--apply");
+  assert.equal(busy.status, 1);
+  assert.match(busy.stderr, /登记表正忙/u);
+  assert.equal(projects().length, 0, "拿不到锁就一条都不许写");
+  fs.rmSync(lockDir, { recursive: true, force: true });
 });
 
 test("有 mapping 但没登记不算已接入 —— 那是发不出去还不报错的状态", () => {

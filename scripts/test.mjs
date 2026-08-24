@@ -8945,6 +8945,19 @@ test("落盘：被改过的恢复清单一律拒 —— 五种改法，写文件
       shadowDir: w.dir, lockDir: w.lockDir, operationId: opId, expectedPlanId: pid,
       readWorld: () => { throw new Error("恢复路径不该规划"); } });
   };
+  // **最强的对手：连 expectedPlanId 也一起改对。**
+  //
+  // 上面那个 tryWith 传的是原始 pid，所以任何改动指纹的篡改都会先被
+  // "清单自报的 plan_id ≠ 期望的" 拦下 —— 结构校验根本没轮到出手。
+  // 真实场景里这一层确实先挡住了大多数情况，但**只要有一条路径能同时给出
+  // 匹配的期望指纹**（比如一个会重新推导的脚本），结构校验就是唯一剩下的防线。
+  const tryFully = (journal) => {
+    fs.writeFileSync(jf, JSON.stringify(journal, null, 2));
+    return applySubscriptionSync({
+      shadowDir: w.dir, lockDir: w.lockDir, operationId: opId,
+      expectedPlanId: journal.plan_id,
+      readWorld: () => { throw new Error("恢复路径不该规划"); } });
+  };
 
   // 先确认这份没改过的能过 —— 否则下面每一条"被拒"都可能是别的原因造成的。
   const okRun = tryWith(good);
@@ -8995,16 +9008,34 @@ test("落盘：被改过的恢复清单一律拒 —— 五种改法，写文件
   ];
   for (const [what, journal] of selfConsistent) {
     const before = w.read().snapshot_id;
-    const got = tryWith(journal);
+    const got = tryFully(journal);
     assert.equal(got.ok, false, what + " 竟然被放行了");
     assert.equal(got.reason, APPLY_REJECT.JOURNAL_UNREADABLE, what);
     assert.equal(w.read().snapshot_id, before, what + "：拒绝时不许动文件");
   }
 
+  // **非法动作 + 重算正确指纹。**指纹管的是"有没有被改过"，
+  // 管不了"改成的东西合不合法" —— 会重算指纹的对手不受它约束。
+  for (const badAction of ["bogus", SYNC_ACTION.SUSPEND, SYNC_ACTION.MIGRATE, null]) {
+    const j = resign({ ...good, writes: [{ ...good.writes[0], action: badAction }] });
+    const before = w.read().snapshot_id;
+    const got = tryFully(j);
+    assert.equal(got.ok, false, "action=" + badAction + " 竟然被放行了");
+    assert.equal(got.reason, APPLY_REJECT.JOURNAL_UNREADABLE, String(badAction));
+    assert.equal(w.read().snapshot_id, before, "action=" + badAction + "：拒绝时不许动文件");
+  }
+  // resnapshot 不该有迁移目标。
+  const withTo = resign({ ...good,
+    writes: [{ ...good.writes[0], to: "subscription_" + "f".repeat(24) }] });
+  const toGot = tryFully(withTo);
+  assert.equal(toGot.ok, false, "resnapshot 带迁移目标却被放行");
+  assert.equal(toGot.reason, APPLY_REJECT.JOURNAL_UNREADABLE,
+    "要被结构校验拦下，不是靠指纹对不上");
+
   // 文件名跟里面记的 operation 不一致 —— 挪个文件名就能冒充另一笔事务。
   const renamed = resign({ ...good, operation_id: "op-someone-else" });
   const before2 = w.read().snapshot_id;
-  const got2 = tryWith(renamed);
+  const got2 = tryFully(renamed);
   assert.equal(got2.ok, false, "文件名与 operation_id 不一致却被放行");
   assert.equal(got2.reason, APPLY_REJECT.JOURNAL_UNREADABLE);
   assert.equal(w.read().snapshot_id, before2);
@@ -9021,6 +9052,50 @@ test("拼快照路径本身就拒绝不合规的 ref", () => {
       world: w.world, shadowDir: w.dir,
     }), /binding_ref 不合规/u, JSON.stringify(evil));
   }
+});
+
+test("落盘：盘上是残片不算「已写入」—— 不许把没做完的事务记成做完", () => {
+  // 评审指出的：上一版判"已写入"只比 snapshot_id。盘上只要有
+  // `{"snapshot_id":"目标 id"}` 这么一个残片，就会被当成完整落盘，
+  // 然后事务被标记 committed —— **而目标快照的内容根本不存在**。
+  //
+  // 这条最要命：恢复清单正是靠 committed / prepared 判断该不该重做。
+  // 把没做完的记成做完，那份内容就再也不会被补上了。
+  const w = applyWorld();
+  const pid = w.pid();
+  const opId = "op-shard-0001";
+  const plan = planSubscriptionSync(w.world);
+  const built = buildWriteSet({ plan, world: w.world, shadowDir: w.dir });
+  assert.equal(built.ok, true, built.reason ?? "");
+  const target = built.writes[0].target;
+  const journal = {
+    schema_version: JOURNAL_SCHEMA, operation_id: opId, plan_id: pid, noop: false,
+    status: "prepared", prepared_at: new Date().toISOString(), committed_at: null,
+    writes: [{ binding_ref: w.snap.binding_ref, action: plan.plans[0].action, to: null,
+      expect: { subscription_id: w.snap.subscription_id,
+        subscription_version: w.snap.subscription_version,
+        authorization_revision: w.snap.authorization_revision,
+        snapshot_id: w.snap.snapshot_id },
+      target }],
+  };
+  const jf = path.join(w.dir, "sync-operations", opId + ".json");
+  fs.mkdirSync(path.dirname(jf), { recursive: true });
+  fs.writeFileSync(jf, JSON.stringify(journal, null, 2));
+
+  // 盘上放一个只有目标 snapshot_id 的残片。
+  fs.writeFileSync(w.file, JSON.stringify({ snapshot_id: target.snapshot_id }));
+
+  const got = applySubscriptionSync({
+    shadowDir: w.dir, lockDir: w.lockDir, operationId: opId, expectedPlanId: pid,
+    readWorld: () => { throw new Error("恢复路径不该规划"); } });
+
+  assert.equal(got.ok, false, "残片被当成了已写入");
+  assert.equal(got.reason, APPLY_REJECT.EXPECT_MISMATCH);
+  // **事务不许被标记完成。**记成 committed 的话，这条内容再也不会被补上。
+  assert.equal(JSON.parse(fs.readFileSync(jf, "utf-8")).status, "prepared",
+    "没做完的事务不许记成 committed");
+  // 也不许拿目标去覆盖那个残片 —— 现在说不清盘上到底发生过什么。
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(w.file, "utf-8"))), ["snapshot_id"]);
 });
 
 test("落盘：同一 operation id 换一份计划不许报「已经做过了」", () => {

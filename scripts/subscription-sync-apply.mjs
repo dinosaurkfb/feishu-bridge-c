@@ -248,6 +248,13 @@ function validateJournal(j, { operationId = null } = {}) {
     if (!BINDING_REF.test(w.binding_ref ?? "")) return false;
     if (seen.has(w.binding_ref)) return false;          // 两项写同一个文件
     seen.add(w.binding_ref);
+    // **清单只许执行这个落盘器真的实现了的动作。**
+    // action 进了指纹，所以改动作指纹会变 —— 但会重算指纹的对手不受这个约束：
+    // 写 action:"bogus" 再重算一个匹配的 plan_id，清单就通过了，
+    // 然后恢复过程照样把 target 写下去。指纹管的是"有没有被改过"，
+    // **管不了"改成的东西合不合法"**。
+    if (w.action !== SYNC_ACTION.RESNAPSHOT) return false;
+    if (w.to !== null && w.to !== undefined) return false;   // resnapshot 没有迁移目标
     if (!onlyKeys(w.expect, ["subscription_id", "subscription_version",
       "authorization_revision", "snapshot_id"])) return false;
     for (const v of Object.values(w.expect)) if (v === undefined || v === null) return false;
@@ -336,9 +343,17 @@ function readJournalStrict(file, operationId = null) {
  * 这时候接着写就是拿一份过期的计划去覆盖别人的结果。
  */
 function itemState(current, item) {
-  if (current?.snapshot_id === item.target.snapshot_id) return "applied";
-  const cas = verifyExpect({ expect: item.expect }, current);
-  return cas.ok ? "pending" : "diverged";
+  // **盘上那份必须先是一份合法快照。**上一版只比 snapshot_id：
+  // 盘上只要有 `{"snapshot_id":"目标 id"}` 这么一个残片，就会被判成"已写入"，
+  // 然后事务被标记 committed —— **而目标快照的内容根本不存在**。
+  // 那等于把一次没做完的事务记成做完了，而恢复清单正是靠这个状态判断该不该重做。
+  if (current === null || current === undefined) {
+    // 文件还不存在：只有当这条本来就没写过时才算 pending，其余交给 CAS 判。
+    return verifyExpect({ expect: item.expect }, current).ok ? "pending" : "diverged";
+  }
+  if (!validateDialogueBindingAuthorizationSnapshot(current).ok) return "diverged";
+  if (current.snapshot_id === item.target.snapshot_id) return "applied";
+  return verifyExpect({ expect: item.expect }, current).ok ? "pending" : "diverged";
 }
 
 /**

@@ -18,8 +18,10 @@
  *          **resnapshot 那一步的落盘地基已经有了**（subscription-sync-apply.mjs），
  *          但控制面没闭环：suspend / migrate 这些动作还没实现。
  *
- *   FR-2.6 首次认领未命中**唯一** subscription 时必须拒绝。现在全机器只有一条订阅，
- *          不存在歧义；加第二条就会有，而歧义处理没经过真实样本验证。
+ *   FR-2.6 首次认领未命中**唯一** subscription 时必须拒绝。这条判据本身在，
+ *          但**没有经过多订阅的真实样本验证**。
+ *          "现在只有一条所以不会有歧义"是个没被计算过的断言，
+ *          不该写死在源码里当理由 —— 加第二条订阅时没人会回来改它。
  *
  * **一个假装能写、实际拒绝的开关比没有开关更糟。**所以这条命令只读，
  * 并如实说明写为什么没开。
@@ -97,7 +99,10 @@ function main() {
     buildCodexSubscriptionProjection({ home, threadId }),
     // **群名只能用在它确实对应的那条订阅上。**把模板群名套给每一条，
     // 就会把别的群错报成模板群 —— 一个错的名字比没有名字更难发现。
-    { groupName: tpl?.chat_name ?? null, templateChatId: tpl?.chat_id ?? null });
+    // **优先用这条 task 自己的群事实**（task 支持覆盖 chat_id/chat_name）——
+    // 只传模板的话，一个已知群名的 task 会被报成"群名不可用"。
+    { groupName: found.task?.chat_name ?? tpl?.chat_name ?? null,
+      templateChatId: found.task?.chat_id ?? tpl?.chat_id ?? null });
 
   console.log(renderSubscriptions(view));
   console.log(WRITE_NOTE);

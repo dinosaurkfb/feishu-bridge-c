@@ -7168,8 +7168,16 @@ test("Codex 侧：当前 task 未绑定时仍要显示全局链路", () => {
   // Codex 侧看到的就是一条在它那里跑不通的指令。
   assert.match(run.stdout, /\$feishu-bind/u);
   assert.doesNotMatch(run.stdout, /bind-project\.mjs/u);
-  // "这条没绑"和"本机什么都没有"是两回事。
-  assert.match(run.stdout, /cc2cd {2}链路存在，状态入口未登记/u);
+  // **未绑定时不再显示（也不再执行）别的项目的 provider。**
+  //
+  // 这条断言原本要的是"这条没绑不该妨碍看别的链路"。但那个"看"是靠机器级
+  // collector 实现的，而它会**把所有 provider 都跑一遍** ——
+  // 界面上过滤掉了，脚本已经在这台机器上执行了。
+  // 未绑定时没有可信的项目根，说不清是谁的就不该替谁执行。
+  //
+  // 所以这里断言相反的事实：**别的项目的链路不许出现**。
+  assert.doesNotMatch(run.stdout, /cc2cd/u,
+    "未绑定时不许把别的项目的 provider 跑出来：" + run.stdout);
 });
 
 test("歧义命令必须失败，不许被解释成破坏性更强的那个", () => {

@@ -6,7 +6,7 @@ import {
   bridgeHome, buildCodexSubscriptionProjection, findRegisteredTaskForCodexThread,
   loadCodexTemplate, loadRegistry, registryFile,
 } from "./state.mjs";
-import { collectConnectivity, renderConnectivity } from "../status-providers.mjs";
+import { collectProjectConnectivity, renderConnectivity } from "../status-providers.mjs";
 import {
   composeLayeredStatus, endpointFacts, outboundRoutingFact, renderLayeredStatus,
   splitByRelation, subscriptionFacts,
@@ -43,6 +43,7 @@ const found = findRegisteredTaskForCodexThread({ threadId, home });
  * 同时区分"这条没绑"和"读不出来"—— 前者是正常状态，后者是故障；
  * 混成一句的话，一个坏掉的 registry 看起来就跟没绑过一样。
  */
+const task = found.ok ? found.task : null;
 const st = found.ok
   ? taskBindingFacts({ task: found.task, home })
   // **"还没接"要用渲染器认得的那个名字。**渲染器按 not_bound 区分
@@ -54,8 +55,19 @@ const st = found.ok
 const loaded = loadCodexTemplate();
 const tpl = loaded?.ok ? loaded.template : null;
 
-// 只看本条链路。整台机器的全景归 doctor。
-const links = collectConnectivity();
+// **只看本条链路 —— 而且要"先过滤再执行"。**
+//
+// 上一版这里调机器级 collectConnectivity()：它会**把所有 provider 都跑一遍**，
+// 再按归属过滤显示。界面上看着只有当前项目，实际已经在这台机器上执行了
+// 别的项目的脚本。评审用 marker 文件证明了 —— 输出里看不见，marker 却建出来了。
+// collectProjectConnectivity 的注释里写着同一个坑已经修过一次，
+// 而我在 Codex 侧又用回了那个机器级的。
+//
+// 未绑定时没有可信的项目根 —— **那就一个 provider 都不跑**，
+// 不许退回机器全景：说不清是谁的，就不该替谁执行。
+const links = found.ok
+  ? collectProjectConnectivity({ root: found.task.root })
+  : { sections: [], providersProblem: null, routesProblem: null };
 // 附录只放归不了层的那部分 —— 能归层的已经进了对应层，再出现一次就是重复。
 const unsorted = splitByRelation(links.sections).unsorted;
 const layeredConnectivity = renderConnectivity(
@@ -101,7 +113,11 @@ console.log(renderLayeredStatus(composeLayeredStatus({
   }),
   subscription: subscriptionFacts(
     buildCodexSubscriptionProjection({ home, threadId }),
-    { groupName: tpl?.chat_name ?? null, templateChatId: tpl?.chat_id ?? null }),
+    // **优先用这条 task 自己的群事实。**task 支持覆盖 chat_id/chat_name；
+    // 只传模板的话，一个已知群名的 task 会被报成"群名不可用"——
+    // 上一轮我修掉了"错报模板群名"，却把"把知道的说成不知道"留下了。
+    { groupName: task?.chat_name ?? tpl?.chat_name ?? null,
+      templateChatId: task?.chat_id ?? tpl?.chat_id ?? null }),
   connectivity: layeredConnectivity,
   otherLinks: links,
 })));

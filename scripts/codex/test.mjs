@@ -3412,6 +3412,109 @@ test("subscribe 命令：读得出订阅，且不泄漏任何 locator", () => {
   assert.notEqual(typo.status, 0, "**拼错的参数不许被当成对的**");
 });
 
+test("status 不许执行别的项目的 provider —— 不显示还不够，必须不跑", () => {
+  // **评审用 marker 文件证明的：输出里看不见，marker 却建出来了。**
+  // 机器级 collectConnectivity 会把所有 provider 都跑一遍再按归属过滤显示 ——
+  // 界面上干净，别人的脚本已经在这台机器上执行过了。
+  // 「项目范围要是只管显示不管执行，那它就不是范围。」
+  const dir = temp();
+  const home = path.join(dir, "bridge");
+  const mine = path.join(dir, "mine");
+  const theirs = path.join(dir, "theirs");
+  for (const d of [home, mine, theirs]) fs.mkdirSync(d, { recursive: true });
+  const task = makeTaskEntry({ root: mine, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  // 别的项目的 provider：**跑起来就留 marker**。
+  //
+  // 夹具必须是真实格式（id / protocol / executable / script / allowed_kinds /
+  // project_root）—— 我第一版写的是 name/projectRoot/command，**根本加载不进去**，
+  // 于是那条测试从头到尾没验到任何东西：连机器级 collector 都"没执行"。
+  const marker = path.join(dir, "THEIRS_RAN");
+  const script = path.join(dir, "theirs.mjs");
+  fs.writeFileSync(script,
+    'import fs from "node:fs";\n' +
+    "fs.writeFileSync(" + JSON.stringify(marker) + ', "ran");\n' +
+    'process.stdout.write(JSON.stringify({ schema_version: "feishu-bridge-status/v1",' +
+    ' provider_id: "theirs", connections: [] }));\n');
+  const providers = path.join(dir, "providers.json");
+  fs.writeFileSync(providers, JSON.stringify({
+    providers: [{
+      id: "theirs", protocol: "feishu-bridge-status/v1",
+      executable: process.execPath, script,
+      allowed_kinds: ["transport"], project_root: theirs,
+    }],
+  }));
+
+  const run = (threadId) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", threadId],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home,
+      FEISHU_BRIDGE_STATUS_PROVIDERS: providers }) });
+
+  // 本项目也放一个 provider，跑起来留自己的 marker ——
+  // **只断言"别人的没跑"是不够的**：root 传空时两个都不跑，那条断言照样成立，
+  // 于是"过滤失效"和"什么都没跑"分不开。要同时断言**自己的确实跑了**。
+  const mineMarker = path.join(dir, "MINE_RAN");
+  const mineScript = path.join(dir, "mine.mjs");
+  fs.writeFileSync(mineScript,
+    'import fs from "node:fs";\n' +
+    "fs.writeFileSync(" + JSON.stringify(mineMarker) + ', "ran");\n' +
+    'process.stdout.write(JSON.stringify({ schema_version: "feishu-bridge-status/v1",' +
+    ' provider_id: "mine", connections: [] }));\n');
+  fs.writeFileSync(providers, JSON.stringify({
+    providers: [
+      { id: "theirs", protocol: "feishu-bridge-status/v1",
+        executable: process.execPath, script, allowed_kinds: ["transport"],
+        project_root: theirs },
+      { id: "mine", protocol: "feishu-bridge-status/v1",
+        executable: process.execPath, script: mineScript, allowed_kinds: ["transport"],
+        project_root: mine },
+    ],
+  }));
+
+  // ① 绑定状态：本项目的要跑，别人的一个都不跑。
+  const bound = run(THREAD_A);
+  assert.equal(bound.status, 0, bound.stderr);
+  assert.equal(fs.existsSync(mineMarker), true,
+    "**本项目的 provider 该跑** —— 不跑的话下面那条断言就没有意义了");
+  assert.equal(fs.existsSync(marker), false,
+    "**别的项目的 provider 被执行了** —— 不显示还不够，必须不跑");
+  assert.doesNotMatch(bound.stdout, /别人的项目/u);
+  fs.rmSync(mineMarker, { force: true });
+
+  // ② 未绑定：没有可信的项目根 → 一个 provider 都不跑，不许退回机器全景。
+  const unbound = run(THREAD_B);
+  assert.equal(unbound.status, 0, unbound.stderr);
+  assert.equal(fs.existsSync(marker), false,
+    "**未绑定时更不该跑** —— 说不清是谁的，就不该替谁执行");
+});
+
+test("群名优先用 task 自己的覆盖，而不是把知道的说成不知道", () => {
+  // 上一轮修掉了"错报模板群名"，却把"已知 task 群名被报成不可用"留下了。
+  // 两种都是错的：一个说了错名字，一个把知道的说成不知道。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  // **task 自己覆盖了群**（不是模板那个群）。
+  task.chat_id = "oc_task_own_group";
+  task.chat_name = "这条 task 自己的群";
+  writeRegistry([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /订阅群.*这条 task 自己的群/u,
+    "**已知的 task 群名不许被报成不可用**：" + r.stdout);
+  // 而且不许把模板那个群的名字套上来。
+  assert.doesNotMatch(r.stdout, new RegExp(TEMPLATE.chat_name ?? "___", "u"));
+});
+
 test("四层 status：Codex 侧报的必须是自己那条链的事实，不是 Claude 的", () => {
   // **这条迁移最容易办坏的地方。**endpointFacts 的 runtime / runtimeDir / verify
   // 默认值全指向 Claude 那条链 —— 不显式给的话，第 1 层会写着"Claude Code"、
@@ -3488,10 +3591,13 @@ test("四层 status：这条 task 的登记表状态要单独报，不跟 task �
   const r = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A],
     { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
-  // 登记表里没有就找不到这条 thread —— 命令必须说清楚，不许假装正常。
-  assert.notEqual(r.stdout.includes("第 3 层 · 精确通道绑定") && r.status === 0
-    && !/降级|未登记|尚未接入/u.test(r.stdout), true,
-    "**登记表里没有它时不许报成一切正常**：" + r.stdout + r.stderr);
+  // 登记表里没有它 → 第 3 层必须说"尚未绑定"，不许假装绑好了。
+  // **四层照出**（没绑定不等于没有四层），但第 3 层要说实话。
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /第 3 层 · 精确通道绑定/u, "四层要照出");
+  assert.match(r.stdout, /尚未绑定/u,
+    "**登记表里没有它时不许报成绑好了**：" + r.stdout);
+  assert.doesNotMatch(r.stdout, /当前代际/u, "没绑就没有代际可报");
 });
 
 test("三态必须互斥：既标已发布又标已停发的记录是坏的", () => {

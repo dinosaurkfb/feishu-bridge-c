@@ -83,7 +83,8 @@ import {
   SYNC_ACTION, SYNC_REJECT, authorizationCovers, planSubscriptionSync, renderSyncPlan,
 } from "./subscription-sync.mjs";
 import {
-  APPLY_REJECT, applySubscriptionSync, buildWriteSet, planId, verifyExpect,
+  APPLY_REJECT, JOURNAL_SCHEMA, applySubscriptionSync, buildWriteSet, fingerprintOf,
+  planId, verifyExpect,
 } from "./subscription-sync-apply.mjs";
 import { renderSubscriptions, subscriptionDetails } from "./feishu-subscribe.mjs";
 import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
@@ -8857,10 +8858,14 @@ test("落盘：重试按恢复清单走，第三种状态一律拒", () => {
   assert.equal(built.ok, true, built.reason ?? "");
   const target = built.writes[0].target;
   fs.mkdirSync(path.join(w.dir, "sync-operations"), { recursive: true });
+  // **清单要是合法的 v2**：每项封闭、target 是合法快照且 binding_ref 对得上，
+  // 而且 plan_id 必须能从清单自己重算出来 —— 校验端会重算再对。
   const journal = {
-    schema_version: "subscription-sync-operation/v1", operation_id: opId, plan_id: pid,
-    status: "prepared", prepared_at: new Date().toISOString(), committed_at: null,
+    schema_version: JOURNAL_SCHEMA, operation_id: opId, plan_id: pid,
+    noop: false, status: "prepared",
+    prepared_at: new Date().toISOString(), committed_at: null,
     writes: [{ binding_ref: w.snap.binding_ref,
+      action: plan.plans[0].action, to: plan.plans[0].toSubscriptionId ?? null,
       expect: { subscription_id: w.snap.subscription_id,
         subscription_version: w.snap.subscription_version,
         authorization_revision: w.snap.authorization_revision,
@@ -8909,16 +8914,127 @@ test("落盘：重试按恢复清单走，第三种状态一律拒", () => {
   assert.equal(w.read().snapshot_id, stranger.snapshot.snapshot_id, "拒绝时不许覆盖别人的结果");
 });
 
+test("落盘：被改过的恢复清单一律拒 —— 五种改法，写文件之前就拦下", () => {
+  // 评审指出：上一版只验顶层字段和"writes 是数组"，于是一份被改过的 prepared 记录
+  // 可以让恢复路径拼出 authorizations/ 之外的路径、缺 target 时抛异常、
+  // 写进非法快照、两项写同一个文件，**或者改了 target 却保持旧 plan_id**。
+  //
+  // 最后那条是关键：只信清单自报的 plan_id，等于把"写什么"的决定权交给了那个文件。
+  const w = applyWorld();
+  const pid = w.pid();
+  const opId = "op-tamper-001";
+  const plan = planSubscriptionSync(w.world);
+  const built = buildWriteSet({ plan, world: w.world, shadowDir: w.dir });
+  assert.equal(built.ok, true, built.reason ?? "");
+  const good = {
+    schema_version: JOURNAL_SCHEMA, operation_id: opId, plan_id: pid, noop: false,
+    status: "prepared", prepared_at: new Date().toISOString(), committed_at: null,
+    writes: [{ binding_ref: w.snap.binding_ref, action: plan.plans[0].action, to: null,
+      expect: { subscription_id: w.snap.subscription_id,
+        subscription_version: w.snap.subscription_version,
+        authorization_revision: w.snap.authorization_revision,
+        snapshot_id: w.snap.snapshot_id },
+      target: built.writes[0].target }],
+  };
+  const jf = path.join(w.dir, "sync-operations", opId + ".json");
+  fs.mkdirSync(path.dirname(jf), { recursive: true });
+
+  const tryWith = (journal) => {
+    fs.writeFileSync(jf, JSON.stringify(journal, null, 2));
+    return applySubscriptionSync({
+      shadowDir: w.dir, lockDir: w.lockDir, operationId: opId, expectedPlanId: pid,
+      readWorld: () => { throw new Error("恢复路径不该规划"); } });
+  };
+
+  // 先确认这份没改过的能过 —— 否则下面每一条"被拒"都可能是别的原因造成的。
+  const okRun = tryWith(good);
+  assert.equal(okRun.ok, true, "没改过的清单应当能跑：" + (okRun.reason ?? ""));
+  const afterGood = w.read().snapshot_id;
+
+  // 五种改法，逐个来。每一种都要求：拒绝 + 盘上那份不变。
+  const bad = [
+    ["路径穿越", { ...good, writes: [{ ...good.writes[0], binding_ref: "../../x" }] }],
+    ["缺 target", { ...good, writes: [{ binding_ref: good.writes[0].binding_ref,
+      action: good.writes[0].action, to: null, expect: good.writes[0].expect }] }],
+    ["重复 binding", { ...good, writes: [good.writes[0], good.writes[0]] }],
+    ["非法 target", { ...good, writes: [{ ...good.writes[0],
+      target: { ...good.writes[0].target, snapshot_id: "not_a_snapshot_id" } }] }],
+    // **改了 target 但保持旧 plan_id** —— 重算指纹才拦得住。
+    ["改 target 保旧指纹", null],
+  ];
+  const bumped = materializeDialogueBindingAuthorization({
+    runtimeNamespace: SYNC_NS, endpointId: SYNC_EP,
+    subscription: syncSub({ version: 7, scope: { ...syncSub().scope, sender_ids: ["u_other"] } }),
+    binding: w.binding, previousSnapshot: w.snap });
+  assert.equal(bumped.ok, true, bumped.reason ?? "");
+  bad[4][1] = { ...good, writes: [{ ...good.writes[0], target: bumped.snapshot }] };
+
+  for (const [what, journal] of bad) {
+    const before = w.read().snapshot_id;
+    const got = tryWith(journal);
+    assert.equal(got.ok, false, what + " 竟然被放行了");
+    assert.equal(got.reason, APPLY_REJECT.JOURNAL_UNREADABLE, what);
+    assert.equal(w.read().snapshot_id, before, what + "：拒绝时不许动文件");
+  }
+  assert.equal(w.read().snapshot_id, afterGood, "五种改法都没能改动盘上那份");
+
+  // ── 更强的对手：改了内容，**还把指纹一起改对** ──
+  //
+  // 上面五条里有三条其实是被"重算指纹"拦下的，单项校验在那些用例里是冗余的。
+  // 一个会重算指纹的篡改者能绕过那一层 —— 那时只剩结构校验挡在前面。
+  const resign = (journal) => ({ ...journal,
+    plan_id: fingerprintOf(journal.noop, journal.writes.map((x) => ({
+      binding_ref: x.binding_ref, action: x.action, to: x.to ?? null,
+      target_snapshot_id: x.target?.snapshot_id, expect: x.expect }))) });
+
+  const selfConsistent = [
+    ["路径穿越（指纹也改对）", resign({ ...good,
+      writes: [{ ...good.writes[0], binding_ref: "../../x",
+        target: { ...good.writes[0].target, binding_ref: "../../x" } }] })],
+    ["重复 binding（指纹也改对）", resign({ ...good, writes: [good.writes[0], good.writes[0]] })],
+  ];
+  for (const [what, journal] of selfConsistent) {
+    const before = w.read().snapshot_id;
+    const got = tryWith(journal);
+    assert.equal(got.ok, false, what + " 竟然被放行了");
+    assert.equal(got.reason, APPLY_REJECT.JOURNAL_UNREADABLE, what);
+    assert.equal(w.read().snapshot_id, before, what + "：拒绝时不许动文件");
+  }
+
+  // 文件名跟里面记的 operation 不一致 —— 挪个文件名就能冒充另一笔事务。
+  const renamed = resign({ ...good, operation_id: "op-someone-else" });
+  const before2 = w.read().snapshot_id;
+  const got2 = tryWith(renamed);
+  assert.equal(got2.ok, false, "文件名与 operation_id 不一致却被放行");
+  assert.equal(got2.reason, APPLY_REJECT.JOURNAL_UNREADABLE);
+  assert.equal(w.read().snapshot_id, before2);
+});
+
+test("拼快照路径本身就拒绝不合规的 ref", () => {
+  // 校验那一层当然也拦，但**拼路径这个动作本身就不该接受没验过的输入** ——
+  // 少一层"顺序对了才安全"的假设。
+  const w = applyWorld();
+  for (const evil of ["../../x", "binding_ref_", "", null, "binding_ref_XYZ"]) {
+    assert.throws(() => buildWriteSet({
+      plan: { ok: true, noop: false, plans: [{ bindingRef: evil, action: SYNC_ACTION.RESNAPSHOT,
+        expect: {} }] },
+      world: w.world, shadowDir: w.dir,
+    }), /binding_ref 不合规/u, JSON.stringify(evil));
+  }
+});
+
 test("落盘：同一 operation id 换一份计划不许报「已经做过了」", () => {
   // 评审指出的：上一版只看 status=committed 就返回幂等成功，没核对是不是同一份计划。
   // 复用 operation id 去跑另一份计划，会被误报成已完成 —— **那份计划一个字都没写。**
   const w = applyWorld();
   const opId = "op-reuse-0001";
   fs.mkdirSync(path.join(w.dir, "sync-operations"), { recursive: true });
+  // 空 writes 的清单：指纹就是"没有条目"的那个，plan_id 得跟它对得上。
+  const emptyPid = planId({ ok: true, noop: false, plans: [] }, []);
   fs.writeFileSync(path.join(w.dir, "sync-operations", opId + ".json"), JSON.stringify({
-    schema_version: "subscription-sync-operation/v1", operation_id: opId,
-    plan_id: "sync_plan_" + "a".repeat(24), status: "committed",
-    prepared_at: new Date().toISOString(), committed_at: new Date().toISOString(), writes: [] }));
+    schema_version: JOURNAL_SCHEMA, operation_id: opId, plan_id: emptyPid, noop: false,
+    status: "committed", prepared_at: new Date().toISOString(),
+    committed_at: new Date().toISOString(), writes: [] }));
 
   const got = applySubscriptionSync({
     shadowDir: w.dir, lockDir: w.lockDir, operationId: opId,
@@ -8960,9 +9076,10 @@ test("落盘：另一笔事务没做完时不许再开一笔", () => {
   // 手工留下一份停在 prepared 的记录 —— 那就是"上次没做完"的证据。
   fs.mkdirSync(path.join(w.dir, "sync-operations"), { recursive: true });
   fs.writeFileSync(path.join(w.dir, "sync-operations", "op-stuck-0001.json"),
-    JSON.stringify({ schema_version: "subscription-sync-operation/v1",
-      operation_id: "op-stuck-0001", plan_id: "sync_plan_" + "0".repeat(24),
-      status: "prepared", prepared_at: new Date().toISOString(), committed_at: null, writes: [] }));
+    JSON.stringify({ schema_version: JOURNAL_SCHEMA,
+      operation_id: "op-stuck-0001", plan_id: planId({ ok: true, noop: false, plans: [] }, []),
+      noop: false, status: "prepared", prepared_at: new Date().toISOString(),
+      committed_at: null, writes: [] }));
 
   const got = applySubscriptionSync({
     shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-second-001",

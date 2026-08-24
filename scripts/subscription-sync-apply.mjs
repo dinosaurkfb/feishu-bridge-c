@@ -58,32 +58,46 @@ import { SYNC_ACTION, planSubscriptionSync } from "./subscription-sync.mjs";
 const digest = (prefix, parts) => prefix + crypto.createHash("sha256")
   .update(parts.join("\0")).digest("hex").slice(0, 24);
 
+/** 参与指纹的规范形状。**plan 和恢复清单必须用同一个** —— 两处各算一份，
+ *  就会出现"清单自报的 plan_id 跟它自己的内容对不上却没人发现"。 */
+const canonicalItem = (it) => ({
+  binding_ref: it.binding_ref ?? null,
+  action: it.action ?? null,
+  to: it.to ?? null,
+  target_snapshot_id: it.target_snapshot_id ?? null,
+  expect: {
+    subscription_id: it.expect?.subscription_id ?? null,
+    subscription_version: it.expect?.subscription_version ?? null,
+    authorization_revision: it.expect?.authorization_revision ?? null,
+    snapshot_id: it.expect?.snapshot_id ?? null,
+  },
+});
+
+/** 导出是为了让测试能造出**改了内容还把指纹一起改对**的清单 ——
+ *  只有那种对手才能分别验证每一条结构校验。 */
+export function fingerprintOf(noop, items) {
+  const entries = items.map(canonicalItem)
+    .sort((a, b) => String(a.binding_ref).localeCompare(String(b.binding_ref)));
+  if (entries.some((e) => e.target_snapshot_id === null)) return null;
+  return digest("sync_plan_", [
+    "subscription-sync-plan/v2", JSON.stringify({ noop: noop === true, entries }),
+  ]);
+}
+
 export function planId(plan, writes = null) {
   if (!plan || plan.ok !== true) return null;
   // **指纹必须覆盖"将要写什么"，不只是"打算做什么"。**
   // 上一版只放了动作、目标订阅 id 和旧快照前置条件 ——
   // 两份内容不同的新授权可以算出同一个指纹，那样"计划没变"就成了假话。
-  // 所以物化出来的目标快照 id 也要进去；给不出 writes 时返回 null，
-  // 不许拿一份只描述意图的指纹去当"将写什么"的凭据。
   if (writes === null) return null;
   const byRef = new Map(writes.map((w) => [w.entry.bindingRef, w.target.snapshot_id]));
-  const entries = (plan.plans ?? []).map((p) => ({
+  return fingerprintOf(plan.noop, (plan.plans ?? []).map((p) => ({
     binding_ref: p.bindingRef ?? null,
     action: p.action ?? null,
     to: p.toSubscriptionId ?? null,
     target_snapshot_id: byRef.get(p.bindingRef) ?? null,
-    expect: {
-      subscription_id: p.expect?.subscriptionId ?? null,
-      subscription_version: p.expect?.subscriptionVersion ?? null,
-      authorization_revision: p.expect?.authorizationRevision ?? null,
-      snapshot_id: p.expect?.snapshotId ?? null,
-    },
-  })).sort((a, b) => String(a.binding_ref).localeCompare(String(b.binding_ref)));
-  if (entries.some((e) => e.target_snapshot_id === null)) return null;
-  return digest("sync_plan_", [
-    "subscription-sync-plan/v2",
-    JSON.stringify({ noop: plan.noop === true, entries }),
-  ]);
+    expect: expectOf(p),
+  })));
 }
 
 export const APPLY_REJECT = Object.freeze({
@@ -162,8 +176,23 @@ const atomicWriteJson = (file, value) => {
   }
 };
 
-const snapshotFile = (shadowDir, bindingRef) =>
-  path.join(shadowDir, "authorizations", bindingRef + ".json");
+/** binding_ref 的形状。跟 dialogue-binding-authorization 里那份一致 ——
+ *  它没导出，这里重述一次并有测试钉住两边不许分叉。 */
+const BINDING_REF = /^binding_ref_[0-9a-f]{24}$/u;
+
+/**
+ * 快照文件路径。**不合规的 ref 直接抛，不拼路径。**
+ *
+ * 防的是路径穿越：一份被改过的恢复清单里写 `../../x`，拼出来就落到
+ * authorizations/ 之外了。校验那一层当然也拦，但**拼路径这个动作本身
+ * 就不该接受任何没验过的输入** —— 少一层依赖顺序上的假设。
+ */
+const snapshotFile = (shadowDir, bindingRef) => {
+  if (!BINDING_REF.test(bindingRef ?? "")) {
+    throw new Error("binding_ref 不合规，拒绝拼路径：" + String(bindingRef).slice(0, 60));
+  }
+  return path.join(shadowDir, "authorizations", bindingRef + ".json");
+};
 const journalFile = (shadowDir, operationId) =>
   path.join(shadowDir, "sync-operations", operationId + ".json");
 
@@ -179,12 +208,60 @@ export const JOURNAL_STATUS = Object.freeze({ PREPARED: "prepared", COMMITTED: "
  * prepared 先写、committed 后写：中间崩掉时记录停在 prepared，
  * **那本身就是"没做完"的证据**，而不是靠猜。
  */
-function validateJournal(j) {
-  return !!j && j.schema_version === "subscription-sync-operation/v1"
-    && OPERATION_ID.test(j.operation_id ?? "")
-    && typeof j.plan_id === "string" && j.plan_id.length > 0
-    && Object.values(JOURNAL_STATUS).includes(j.status)
-    && Array.isArray(j.writes);
+export const JOURNAL_SCHEMA = "subscription-sync-operation/v2";
+
+const onlyKeys = (o, keys) => o && typeof o === "object" && !Array.isArray(o)
+  && Object.keys(o).every((k) => keys.includes(k));
+
+/**
+ * 恢复清单必须**自己可信**。
+ *
+ * 上一版只验了顶层几个字段和"writes 是数组" —— 于是一份被改过的 prepared 记录
+ * 可以让恢复路径：拼出 authorizations/ 之外的路径、缺 target 时抛异常、
+ * 写进一份非法快照、两项写同一个文件，**或者改了 target 却保持旧 plan_id**。
+ *
+ * 最后那条是关键：只信清单自报的 plan_id，等于把"写什么"的决定权交给了那个文件。
+ * 所以这里从清单**重算指纹**再跟它自报的对 —— 对不上就是被动过。
+ *
+ * schema 升到 v2：把"日志"改成"恢复清单"是不兼容的形状变化，
+ * 不能让旧文件在新语义下被当成有效清单。
+ */
+function validateJournal(j, { operationId = null } = {}) {
+  if (!onlyKeys(j, ["schema_version", "operation_id", "plan_id", "noop",
+    "status", "prepared_at", "committed_at", "writes"])) return false;
+  if (j.schema_version !== JOURNAL_SCHEMA) return false;
+  if (!OPERATION_ID.test(j.operation_id ?? "")) return false;
+  // 文件名跟里面记的 operation 必须一致 —— 否则挪个文件名就能冒充另一笔事务。
+  if (operationId !== null && j.operation_id !== operationId) return false;
+  if (typeof j.plan_id !== "string" || j.plan_id.length === 0) return false;
+  if (typeof j.noop !== "boolean") return false;
+  if (!Object.values(JOURNAL_STATUS).includes(j.status)) return false;
+  if (!Array.isArray(j.writes)) return false;
+
+  const seen = new Set();
+  for (const w of j.writes) {
+    if (!onlyKeys(w, ["binding_ref", "action", "to", "expect", "target"])) return false;
+    // 这一条是**冗余的**：下面 target 必须是合法快照（那里卡了 ref 形状），
+    // 且 target.binding_ref === binding_ref，两条合起来已经堵死。
+    // 单独去掉它变异不会变红 —— 留着是多一层，不是承重的那一层。承重的是
+    // snapshotFile 里那个 throw（去掉它变异立刻红）。
+    if (!BINDING_REF.test(w.binding_ref ?? "")) return false;
+    if (seen.has(w.binding_ref)) return false;          // 两项写同一个文件
+    seen.add(w.binding_ref);
+    if (!onlyKeys(w.expect, ["subscription_id", "subscription_version",
+      "authorization_revision", "snapshot_id"])) return false;
+    for (const v of Object.values(w.expect)) if (v === undefined || v === null) return false;
+    if (!validateDialogueBindingAuthorizationSnapshot(w.target).ok) return false;
+    // 目标快照必须就是这一项要写的那个文件的内容。
+    if (w.target.binding_ref !== w.binding_ref) return false;
+  }
+
+  // **从清单重算指纹，跟它自报的对。**
+  const recomputed = fingerprintOf(j.noop, j.writes.map((w) => ({
+    binding_ref: w.binding_ref, action: w.action, to: w.to ?? null,
+    target_snapshot_id: w.target.snapshot_id, expect: w.expect,
+  })));
+  return recomputed !== null && recomputed === j.plan_id;
 }
 
 /**
@@ -241,11 +318,13 @@ export function buildWriteSet({ plan, world, shadowDir }) {
  * 否则"锁内重算"只是句好听的话。
  */
 /** 只有"文件不存在"算空。**读不出来跟没有是两件事**，其余一律拒绝。 */
-function readJournalStrict(file) {
+function readJournalStrict(file, operationId = null) {
   const got = readJson(file);
   if (!got.ok) return { ok: false, reason: APPLY_REJECT.JOURNAL_UNREADABLE, file };
   if (got.value === null) return { ok: true, journal: null };
-  if (!validateJournal(got.value)) return { ok: false, reason: APPLY_REJECT.JOURNAL_UNREADABLE, file };
+  if (!validateJournal(got.value, { operationId })) {
+    return { ok: false, reason: APPLY_REJECT.JOURNAL_UNREADABLE, file };
+  }
   return { ok: true, journal: got.value };
 }
 
@@ -302,7 +381,7 @@ export function applySubscriptionSync({
     }
     for (const f of names) {
       if (!f.endsWith(".json") || f === path.basename(mine)) continue;
-      const other = readJournalStrict(path.join(dir, f));
+      const other = readJournalStrict(path.join(dir, f), f.replace(/\.json$/u, ""));
       if (!other.ok) return other;
       if (other.journal?.status === JOURNAL_STATUS.PREPARED) {
         return { ok: false, reason: APPLY_REJECT.OPERATION_IN_FLIGHT,
@@ -310,7 +389,7 @@ export function applySubscriptionSync({
       }
     }
 
-    const own = readJournalStrict(mine);
+    const own = readJournalStrict(mine, operationId);
     if (!own.ok) return own;
 
     // ② 同一个 operation 已提交。**要核对是不是同一份计划** ——
@@ -360,21 +439,24 @@ export function applySubscriptionSync({
       }
       items.push({
         binding_ref: w.entry.bindingRef,
-        expect: {
-          subscription_id: w.entry.expect.subscriptionId,
-          subscription_version: w.entry.expect.subscriptionVersion,
-          authorization_revision: w.entry.expect.authorizationRevision,
-          snapshot_id: w.entry.expect.snapshotId,
-        },
+        action: w.entry.action,
+        to: w.entry.toSubscriptionId ?? null,
+        expect: expectOf(w.entry),
         target: w.target,
       });
     }
 
     const journal = {
-      schema_version: "subscription-sync-operation/v1",
-      operation_id: operationId, plan_id: fresh, status: JOURNAL_STATUS.PREPARED,
+      schema_version: JOURNAL_SCHEMA,
+      operation_id: operationId, plan_id: fresh, noop: plan.noop === true,
+      status: JOURNAL_STATUS.PREPARED,
       prepared_at: new Date().toISOString(), committed_at: null, writes: items,
     };
+    // **自己产出的清单也要过同一道校验。**产出端和校验端分叉时，
+    // 坏清单会一路写到盘上，等重试时才炸 —— 那时已经动过文件了。
+    if (!validateJournal(journal, { operationId })) {
+      return { ok: false, reason: APPLY_REJECT.JOURNAL_WRITE_FAILED, stage: "manifest_invalid" };
+    }
     try { atomicWriteJson(mine, journal); }
     catch (err) {
       return { ok: false, reason: APPLY_REJECT.JOURNAL_WRITE_FAILED,

@@ -174,7 +174,9 @@ export function planRuntimeSync({ sourceRoot, home = os.homedir(), chain = "clau
   const version = versionFromFiles(files);
   if (!version) return { ok: false, reason: "file_list_invalid" };
   const root = rootOf({ root: rootOverride, home, chain });
-  const current = verifyRuntime({ home });
+  // **查的必须是本次解析出的那个 root。**只传 home 的话，默认 chain 是 claude ——
+  // 给 Codex 算计划时会去查 Claude 的运行时。
+  const current = verifyRuntime({ root });
   return {
     ok: true,
     version,
@@ -233,7 +235,12 @@ export function applyRuntimeSync(plan, { home = os.homedir(), chain = "claude", 
   if (!lock.ok) return lock;
   try {
     // 已是当前版本且自校验通过 → 真正的 no-op，不去动线上正在被加载的文件。
-    const already = verifyRuntime({ home });
+    //
+    // **必须查本次这个 root。**这里曾经只传 home（默认 claude）——
+    // 而两条链装的是同一份 scripts/，版本哈希必然相同，
+    // 于是"装完 Claude 再装 Codex"必然被判成 no-op，Codex 的 current 根本不建。
+    // 生产上这不是偶发，是必然。
+    const already = verifyRuntime({ root });
     if (already.ok && already.version === plan.version) {
       return { ok: true, version: plan.version, versionDir, noop: true };
     }

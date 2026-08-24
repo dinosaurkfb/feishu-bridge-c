@@ -31,6 +31,7 @@ import path from "node:path";
 import { isDirectRun } from "../direct-run.mjs";
 import { listPending } from "../outbox.mjs";
 import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
+import { sweepEligible } from "./drain-all.mjs";
 import { bridgeHome, loadRegistry, registryFile, taskPaths } from "./state.mjs";
 
 const CHAIN = "codex";
@@ -52,7 +53,7 @@ const pickNode = () => {
  * 长期绑在某人的工作目录上。
  */
 export const drainScriptPath = (home = os.homedir(), codexHome = codexHomeOf(home)) =>
-  path.join(codexRuntimeRoot(codexHome), "current", "scripts", "codex", "drain-outbox.mjs");
+  path.join(codexRuntimeRoot(codexHome), "current", "scripts", "codex", "drain-all.mjs");
 
 /**
  * 这台机器上 Codex 的家目录。**CODEX_HOME 优先** —— 它是这条链的隔离点，
@@ -75,7 +76,6 @@ export function plistBody({ home = os.homedir(), node = pickNode(),
   <array>
     <string>${node}</string>
     <string>${script}</string>
-    <string>--all</string>
   </array>
   <key>WorkingDirectory</key><string>${workdir}</string>
   <key>StartInterval</key><integer>1800</integer>
@@ -126,9 +126,17 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
   try { installed = fs.readFileSync(file, "utf-8"); } catch { /* 没装 */ }
   const wanted = plistBody({ home, codexHome });
   const backlog = classifyBacklog({ home: bridge });
+  const scan = scanRunnable({ home: bridge });
   return {
+    scan,
     runtimeOk: runtime.ok === true,
     runtimeReason: runtime.ok ? null : (runtime.reason ?? "drift"),
+    // **四态，不是"文件在不在"。**plist 写了但没 bootstrap 成功的话，
+    // 定时器根本不会跑 —— 而只看文件存在会报"已启用"，
+    // 那正是"界面说正常、实际不工作"的形状。
+    phase: installed === null ? "absent"
+      : installed !== wanted ? "stale"
+      : loadedPhase(),
     enabled: installed !== null,
     stale: installed !== null && installed !== wanted,
     plist: file,
@@ -137,11 +145,51 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
 }
 
 /**
+ * launchd 里到底有没有它。**读不出来就说读不出来**，不许由"文件在"推出"在跑"。
+ */
+export function loadedPhase(run = spawnLaunchctl) {
+  const r = run(["list", LAUNCH_LABEL]);
+  if (r.ok) return "loaded";
+  // 明确的"没这个服务"和"我查不了"是两件事。
+  if (typeof r.detail === "string" && /could not find|No such/iu.test(r.detail)) {
+    return "installed_not_loaded";
+  }
+  return "unverifiable";
+}
+
+export const PHASE_TEXT = {
+  absent: "未启用（安装后的默认态，不是故障）",
+  stale: "plist 与当前运行时对不上（要重装）",
+  installed_not_loaded: "**plist 已写入但没被 launchd 加载 —— 定时器不会跑**",
+  loaded: "已加载，正在按计划跑",
+  unverifiable: "plist 已写入；launchd 状态查不出来（不等于在跑）",
+};
+
+/**
  * 能不能启用。**每一条都是硬门槛，任何一条不过就什么都不写。**
  * 返回全部未过的项，不是第一条 —— 一次说清比让人来回试三遍强。
  */
+/**
+ * eligible-only 扫描本身跑不跑得通。
+ *
+ * **不发任何东西 —— 注入一个只观察的 publish。**上一版我在文档里把这道门槛
+ * 写成了"已有"，实际根本没实现："不确定的事别写成确定"，这次栽在自己写的注释上。
+ */
+export function scanRunnable({ home = bridgeHome(), sweep } = {}) {
+  const run = sweep ?? sweepEligible;
+  try {
+    const r = run({ home, publish: () => ({ status: "dry" }) });
+    return r.ok ? { ok: true, tasks: r.results.length } : { ok: false, reason: r.reason };
+  } catch (err) {
+    return { ok: false, reason: String(err?.message ?? err).slice(0, 200) };
+  }
+}
+
 export function enableBlockers(state) {
   const blockers = [];
+  if (state.scan && !state.scan.ok) {
+    blockers.push({ code: "scan_failed", detail: state.scan.reason });
+  }
   if (!state.runtimeOk) {
     blockers.push({ code: "runtime_unverified", detail: state.runtimeReason });
   }
@@ -174,9 +222,7 @@ function main() {
   const st = serviceState({ home });
 
   console.log("调度器    " + st.plist);
-  console.log("状态      " + (st.enabled
-    ? (st.stale ? "已启用，但内容与当前运行时对不上（要重装）" : "已启用")
-    : "**未启用（安装后的默认态，不是故障）**"));
+  console.log("状态      " + (PHASE_TEXT[st.phase] ?? st.phase));
   console.log("运行时    " + (st.runtimeOk
     ? "校验通过" : "**校验不过**（" + st.runtimeReason + "）"));
   console.log("排空脚本  " + drainScriptPath(home));
@@ -201,6 +247,9 @@ function main() {
           console.error("  · 还有 " + b.detail + " 没处理。**定时器一启用它们就会被发出去** ——");
           console.error("    先决定这批内容是发还是停（scripts/codex/suppress-outbox.mjs），");
           console.error("    再回来启用。这一步不许省：省掉它就是替人做了一个不可逆的决定。");
+        } else if (b.code === "scan_failed") {
+          console.error("  · eligible-only 扫描跑不通（" + b.detail + "）——");
+          console.error("    定时器要跑的就是它，跑不通就不能装。");
         } else if (b.code === "runtime_unverified") {
           console.error("  · 运行时校验不过（" + b.detail + "）—— 先跑 scripts/codex/install.mjs --apply。");
         } else {
@@ -230,8 +279,15 @@ function main() {
   fs.mkdirSync(path.dirname(st.plist), { recursive: true });
   fs.writeFileSync(st.plist, plistBody({ home }), { mode: 0o644 });
   const loaded = spawnLaunchctl(["bootstrap", "gui/" + process.getuid(), st.plist]);
-  console.log("\n已启用。" + (loaded.ok ? "定时器已加载。" : "plist 已写入，但加载没成功：" + loaded.detail));
-  console.log("每 30 分钟排空一次全部登记 task；只处理取得发布资格的内容。");
+  if (!loaded.ok) {
+    // **加载失败必须非零退出。**报成功而定时器没在跑，就是"界面说正常、实际不工作"——
+    // 兜底本来就是最后一道，它悄悄不工作的话没有第二处会发现。
+    console.error("\nplist 已写入，但 launchd 加载失败：" + loaded.detail);
+    console.error("**定时器现在不会跑。**修好后重跑本命令。");
+    process.exit(1);
+  }
+  console.log("\n已启用，定时器已加载。");
+  console.log("每 30 分钟扫一次全部登记 task；**只发已取得发布资格的内容**。");
 }
 
 function spawnLaunchctl(args) {

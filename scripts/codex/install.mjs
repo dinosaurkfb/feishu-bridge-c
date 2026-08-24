@@ -61,6 +61,7 @@ const runtimePlan = uninstall ? null : planRuntimeSync({ sourceRoot: ROOT, root:
 const autoPublishMigrationCount = autoPublishPreview.ok ? autoPublishPreview.changed : null;
 
 const hookCommand = (script) =>
+  "# " + HOOK_TAG + path.basename(script) + "\n" +
   "if [ -x " + shellQuote(node) + " ] && [ -r " + shellQuote(script) + " ]; then " +
   "FEISHU_CODEX_BRIDGE_HOME=" + shellQuote(home) + " " + shellQuote(node) + " " + shellQuote(script) + "; " +
   "else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1; " +
@@ -80,43 +81,74 @@ try {
 hooks.hooks ??= {};
 
 /**
- * 认一条 hook 条目是不是"我们的"。
+ * 埋进命令里的**显式归属标记**：与脚本路径无关，换克隆、换 runtime 都认得出自己那条。
  *
- * **按脚本文件名认，不按完整路径。**旧写法用 command.includes(完整路径)：
- * 路径从开发克隆换成 runtime/current 的那一刻它就匹配不上了，
- * 于是不是替换、而是**新增一条** —— 指向旧克隆的那条原地不动，
- * 两条 hook 同时在跑，而 Codex 文档说多个匹配的 hook 会全部运行。
- * 迁移本身会制造出它要消灭的问题。
+ * 归属判据宽了窄了都出事，Claude 侧已经为这两头各付过一次代价：
+ *
+ *   宽了会误删。**一条 entry 里可以有多个 hook**，其中只有一条是我们的；
+ *   按 entry 整条删会把同一条里别人的钩子一起删掉，而且删得很安静。
+ *   光看"命令里出现过这个文件名"更宽 —— rg/cat/echo 提到那个路径也会被认领。
+ *
+ *   窄了收敛不掉。用绝对路径当键的话，路径一换就变成追加而非覆盖 ——
+ *   本机两份 Stop 钩子就是这么来的，而多个匹配的 hook 会全部运行。
  */
-const ownsScript = (entry, basename) => (entry?.hooks ?? []).some((h) =>
-  typeof h.command === "string" && h.command.includes("scripts/codex/" + basename));
+const HOOK_TAG = "FEISHU_BRIDGE_CODEX_HOOK:";
+
+const escapeRe = (text) => text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 
 /**
- * 让某个事件下**恰好只剩一条**我们的 hook。
+ * 历史遗留命令的**严格**识别 —— 只为迁移那一次。
  *
- * 返回值要能区分"本来就只有一条、换了内容"和"清掉了几条重复的" ——
- * 后者是迁移时最该被看见的事实。
+ * 不是子串包含：把安装器当初生成的完整模板拆开验，guard 里检查的 node 与脚本
+ * 必须和实际执行的逐字相同，脚本名必须正是我们那两个之一。
+ * 任何一处对不上就不是我们的，不碰。
+ */
+const LEGACY = new RegExp(
+  "^if \\[ -x '([^']+)' \\] && \\[ -r '([^']+)' \\]; then " +
+  "FEISHU_CODEX_BRIDGE_HOME='[^']*' '([^']+)' '([^']+)'; " +
+  "else \\{ command -p cat 2>/dev/null \\|\\| cat; \\} >/dev/null 2>&1; ", "u");
+
+const OUR_SCRIPTS = new Set(["prompt-hook.mjs", "stop-hook.mjs"]);
+
+/** 这一条 child hook 是不是我们的。**按 child 粒度，不按 entry。** */
+function ownsHook(hook, basename) {
+  const cmd = typeof hook?.command === "string" ? hook.command : null;
+  if (cmd === null) return false;
+  if (cmd.includes(HOOK_TAG + basename)) return true;      // 新形态：认标记
+  const m = LEGACY.exec(cmd);                              // 旧形态：严格解析
+  if (!m) return false;
+  const [, guardNode, guardScript, runNode, runScript] = m;
+  if (guardNode !== runNode || guardScript !== runScript) return false;
+  const name = path.basename(runScript);
+  return OUR_SCRIPTS.has(name) && name === basename;
+}
+
+/**
+ * 让某个事件下**恰好只剩一条**我们的 hook，且**只动我们自己那一条 child**。
  */
 function updateHook(event, script, timeout) {
   const basename = path.basename(script);
-  const entries = (hooks.hooks[event] ??= []);
-  const mine = entries.filter((e) => ownsScript(e, basename));
-  const others = entries.filter((e) => !ownsScript(e, basename));
-
+  const entries = hooks.hooks[event] ?? [];
+  let dropped = 0;
+  const kept = [];
+  for (const entry of entries) {
+    const children = (entry?.hooks ?? []).filter((h) => {
+      if (!ownsHook(h, basename)) return true;
+      dropped += 1;
+      return false;
+    });
+    // 同一条 entry 里别人的 hook 必须原样留下；整条都是我们的才丢掉这条。
+    if (children.length > 0) kept.push({ ...entry, hooks: children });
+  }
   if (uninstall) {
-    hooks.hooks[event] = others;
-    return mine.length > 0 ? "removed(" + mine.length + ")" : "already-absent";
+    hooks.hooks[event] = kept;
+    return dropped > 0 ? "removed(" + dropped + ")" : "already-absent";
   }
-  // 别人的 hook 一条不动，我们的全部丢掉重建成一条。
-  hooks.hooks[event] = [...others,
+  hooks.hooks[event] = [...kept,
     { hooks: [{ type: "command", command: hookCommand(script), timeout }] }];
-  if (mine.length === 0) return "installed";
-  if (mine.length === 1) {
-    const was = JSON.stringify(mine[0]);
-    const now = JSON.stringify(hooks.hooks[event][hooks.hooks[event].length - 1]);
-    return was === now ? "unchanged" : "updated";
-  }
-  return "converged(清掉 " + mine.length + " 条，只留 1 条)";
+  if (dropped === 0) return "installed";
+  if (dropped === 1) return "updated";
+  return "converged(清掉 " + dropped + " 条，只留 1 条)";
 }
 
 const promptAction = updateHook("UserPromptSubmit", promptScript, 10);

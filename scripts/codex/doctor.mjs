@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { moduleRoot } from "../direct-run.mjs";
 import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
-import { serviceState } from "./drain-service.mjs";
+import { PHASE_TEXT, serviceState } from "./drain-service.mjs";
 
 import {
   bridgeHome, loadCodexTemplate, loadRegistry, registryFile,
@@ -160,22 +160,41 @@ const failed = (check) => check.ok === false;
 // 把它报成故障，人就会去"修"一件本来就该这样的事。
 try {
   const svc = serviceState();
-  add("兜底排空", svc.enabled ? (svc.stale ? false : true) : null,
-    svc.enabled
-      ? (svc.stale ? "已启用，但 plist 与当前运行时对不上" : "已启用")
-      : "未启用（默认态，不是故障）" +
-        (svc.backlog.ok && svc.backlog.total > 0
-          ? "；还有 " + svc.backlog.total + " 条历史积压未分类" : ""),
-    svc.enabled && svc.stale
-      ? "重跑 `node scripts/codex/drain-service.mjs --enable --apply`" : null);
+  // 四态各自的判定：**只有真的被 launchd 加载了才算通过**。
+  // plist 写了没加载是故障（定时器不会跑）；未启用和查不出来都是 null。
+  const ok = svc.phase === "loaded" ? true
+    : (svc.phase === "stale" || svc.phase === "installed_not_loaded") ? false
+    : null;
+  add("兜底排空", ok,
+    (PHASE_TEXT[svc.phase] ?? svc.phase) +
+      (svc.phase === "absent" && svc.backlog.ok && svc.backlog.total > 0
+        ? "；还有 " + svc.backlog.total + " 条历史积压未分类" : ""),
+    ok === false ? "重跑 `node scripts/codex/drain-service.mjs --enable --apply`" : null);
 } catch (err) {
   add("兜底排空", null, "状态读不出来（" + err.message + "）");
 }
 
-const ready = checks.every((check) => check.ok !== false);
-const next = [...new Set(checks.filter((check) => failed(check) && check.next).map((check) => check.next))];
+/**
+ * 三态汇总。**"查不清"不等于"就绪"。**
+ *
+ * 上一版是 every(ok !== false)：全是 null 时也报 ready:true、exit 0、
+ * "机器级组件已就绪" —— 而 hook 信任本来就查不到，于是它永远算通过。
+ * 那把三态又压回了两态，只是压向了另一边。
+ *
+ *   任一 false        → blocked（有真故障）
+ *   无 false、有 null → incomplete（还差人去确认的事，不是坏了）
+ *   全 true           → ready
+ */
+const overall = checks.some((check) => check.ok === false) ? "blocked"
+  : checks.some((check) => check.ok === null) ? "incomplete" : "ready";
+const ready = overall === "ready";
+// 待办要**同时收 false 和 null**：hook 信任那条永远是 null，
+// 而它恰恰是迁移之后最需要人去做的一步。只收 false 就等于把它藏起来。
+const next = [...new Set(checks
+  .filter((check) => check.ok !== true && check.next)
+  .map((check) => check.next))];
 if (JSON_OUTPUT) {
-  process.stdout.write(JSON.stringify({ ready, checks, next }, null, 2) + "\n");
+  process.stdout.write(JSON.stringify({ ready, overall, checks, next }, null, 2) + "\n");
 } else {
   console.log("Codex 飞书桥 · 只读自检\n");
   for (const check of checks) {
@@ -185,6 +204,8 @@ if (JSON_OUTPUT) {
   if (next.length > 0) {
     console.log("\n下一步：");
     next.forEach((item, index) => console.log((index + 1) + ". " + item));
+  } else if (overall === "incomplete") {
+    console.log("\n还差人确认几件本地查不出来的事（上面标 ? 的）；没有发现故障。");
   } else if (tasks.length === 0) {
     console.log("\n机器已就绪。请在要接入的 Codex task 中运行 `$feishu-bind`。");
   } else {
@@ -192,4 +213,6 @@ if (JSON_OUTPUT) {
   }
 }
 
+// **incomplete 也非零退出。**它不是故障，但也不是"可以不管了"——
+// 让脚本把它当成功，人就永远不会去做那一步。
 process.exitCode = ready ? 0 : 1;

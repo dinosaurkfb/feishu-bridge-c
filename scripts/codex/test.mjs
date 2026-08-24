@@ -14,6 +14,7 @@ import {
 import {
   classifyBacklog, drainScriptPath, enableBlockers, plistBody,
 } from "./drain-service.mjs";
+import { sweepEligible } from "./drain-all.mjs";
 
 import {
   appendEvent, listPending, markPublishEligibleByEventKey, suppressPublishByEventKey,
@@ -2412,14 +2413,27 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
       FEISHU_CODEX_BRIDGE_HOME: home,
     },
   });
-  const healthy = run();
-  assert.equal(healthy.status, 0, healthy.stderr);
-  assert.equal(JSON.parse(healthy.stdout).ready, true);
+  // **装好之后不是 ready，是 incomplete。**hook 信任本地查不到，
+  // 调度器默认没启用 —— 两件都不是故障，但也都不是"可以不管了"。
+  // 上一版这里断言 ready:true，等于把"查不清"钉成了"通过"。
+  const healthy = JSON.parse(run().stdout);
+  assert.equal(healthy.overall, "incomplete",
+    "全新装好 = 没有故障、但还差人确认：" + JSON.stringify(healthy.checks));
+  assert.equal(healthy.ready, false, "ready 只能在全 true 时成立");
+  assert.equal(healthy.checks.some((c) => c.ok === false), false,
+    "**一条真故障都不该有** —— incomplete 是因为有 null，不是因为有 false");
+  assert.ok(healthy.checks.some((c) => c.ok === null), "确实存在查不清的项");
+  // 查不清的那几项要出现在待办里，不能被藏起来。
+  assert.ok(healthy.next.some((n) => /hooks/u.test(n)),
+    "hook 信任那条必须出现在下一步里：" + JSON.stringify(healthy.next));
+  assert.equal(run().status, 1, "incomplete 也非零退出 —— 当成功就没人去做那一步");
 
   fs.rmSync(path.join(codexHome, "skills", "feishu-status"), { recursive: true });
   const broken = run();
   assert.equal(broken.status, 1);
-  assert.equal(JSON.parse(broken.stdout).ready, false);
+  const brokenJson = JSON.parse(broken.stdout);
+  assert.equal(brokenJson.ready, false);
+  assert.equal(brokenJson.overall, "blocked", "**真故障要和「查不清」分得开**");
 });
 
 test("Codex 测试文件里没有写在汇总之后的 test()", () => {
@@ -2798,15 +2812,34 @@ test("迁移必须收敛旧克隆的 hook，而不是在旁边再加一条", () 
   fs.mkdirSync(home, { recursive: true });
   writeRegistry([], path.join(home, "registry.json"));
 
-  // 造出迁移前的现场：hook 指向某个开发克隆，另外还有一条别人的 hook。
-  const stale = "/Users/someone/codex-projects/old-clone/scripts/codex/stop-hook.mjs";
-  const stalePrompt = "/Users/someone/codex-projects/old-clone/scripts/codex/prompt-hook.mjs";
+  // **夹具必须是现场真正的形状。**线上那两条是安装器当初生成的完整模板
+  //（我核对过真机的 ~/.codex/hooks.json）。造一条裸的 `node <path>` 去测，
+  // 测的就是另一件事 —— 严格解析本来就不该认领那种。
+  const legacy = (script) =>
+    "if [ -x '/opt/homebrew/bin/node' ] && [ -r '" + script + "' ]; then " +
+    "FEISHU_CODEX_BRIDGE_HOME='/Users/someone/.codex/feishu-bridge' " +
+    "'/opt/homebrew/bin/node' '" + script + "'; " +
+    "else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1; " +
+    "printf '%s hook-unavailable\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> " +
+    "'/Users/someone/.codex/feishu-bridge/hook.log' 2>/dev/null || :; fi";
+  const clone = "/Users/someone/codex-projects/old-clone/scripts/codex/";
   fs.writeFileSync(path.join(codexHome, "hooks.json"), JSON.stringify({
     hooks: {
-      UserPromptSubmit: [{ hooks: [{ type: "command", command: "node " + stalePrompt }] }],
+      UserPromptSubmit: [{ hooks: [
+        { type: "command", command: legacy(clone + "prompt-hook.mjs") },
+      ] }],
       Stop: [
-        { hooks: [{ type: "command", command: "别人的 hook，不许动" }] },
-        { hooks: [{ type: "command", command: "node " + stale }] },
+        // **同一条 entry 里既有我们的、又有别人的** —— 按 entry 整条删就会
+        // 把别人那条一起删掉，而且删得很安静。
+        { hooks: [
+          { type: "command", command: "别人的 hook，不许动" },
+          { type: "command", command: legacy(clone + "stop-hook.mjs") },
+        ] },
+        // 长得像、但不是我们的：guard 检查的脚本和实际执行的不是同一个。
+        { hooks: [{ type: "command", command:
+          "if [ -x '/opt/homebrew/bin/node' ] && [ -r '/x/stop-hook.mjs' ]; then " +
+          "FEISHU_CODEX_BRIDGE_HOME='/y' '/opt/homebrew/bin/node' '/z/stop-hook.mjs'; " +
+          "else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1; " }] },
       ],
     },
   }));
@@ -2841,7 +2874,91 @@ test("迁移必须收敛旧克隆的 hook，而不是在旁边再加一条", () 
 
   // **别人的 hook 一条都不许动。**
   assert.ok(commands("Stop").includes("别人的 hook，不许动"),
-    "收敛自己的 hook 不等于可以动别人的");
+    "**同一条 entry 里别人的 hook 必须原样留下** —— 按 entry 整条删会把它一起带走");
+  assert.ok(commands("Stop").some((c) => c.includes("/z/stop-hook.mjs")),
+    "长得像但 guard 与执行的脚本对不上的，不是我们的，不许碰");
+});
+
+test("launchd 加载失败必须非零退出 —— 不许报成「已启用」", () => {
+  // **兜底是最后一道，它悄悄不工作没有第二处会发现。**
+  // plist 写了但 bootstrap 失败时报成功，就是"界面说正常、实际不跑"。
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const codexHome = path.join(dir, "codex-home");
+  const bridge = path.join(dir, "bridge");
+  const bin = path.join(dir, "bin");
+  for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));      // 空 → 积压门槛过
+
+  // 假 launchctl：list 说没有，bootstrap 失败。**不碰真机的 launchd。**
+  fs.writeFileSync(path.join(bin, "launchctl"),
+    '#!/bin/sh\ncase "$1" in\n  list) echo "could not find service" >&2; exit 113;;\n' +
+    '  bootstrap) echo "Load failed: 5: Input/output error" >&2; exit 5;;\nesac\nexit 0\n',
+    { mode: 0o700 });
+
+  const env = { ...process.env, HOME: fakeHome, PATH: bin + path.delimiter + process.env.PATH,
+    CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridge };
+  // 先把运行时装好，否则会卡在运行时那道门槛上，测不到我们要测的东西。
+  const installed = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
+  assert.equal(installed.status, 0, installed.stderr);
+
+  const realAgents = path.join(os.homedir(), "Library", "LaunchAgents");
+  const before = fs.existsSync(realAgents) ? fs.readdirSync(realAgents).sort().join(",") : "";
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--enable", "--apply"],
+    { encoding: "utf-8", env });
+
+  assert.notEqual(r.status, 0,
+    "**加载失败必须非零退出**：" + r.stdout + r.stderr);
+  assert.match(r.stderr, /加载失败/u, "要说清是加载失败，不是别的");
+  assert.doesNotMatch(r.stdout, /已启用，定时器已加载/u,
+    "没加载成功就不许说已加载");
+
+  // 真机的 LaunchAgents 一个字节都不许动。
+  const after = fs.existsSync(realAgents) ? fs.readdirSync(realAgents).sort().join(",") : "";
+  assert.equal(after, before, "给了 HOME 还往真机的 LaunchAgents 写");
+});
+
+test("兜底扫描：逐 task 走 eligible-only，一个失败不许拖垮其他", () => {
+  // 兜底的价值就在于它是最后一道。一条坏记录让整轮扫描中断，等于没有兜底。
+  // **publish 是注入的 —— 测试不许打到真实飞书。**
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const mk = (key, thread) => {
+    const t = makeTaskEntry({ root, threadId: thread, name: key,
+      rootMessageId: "om_" + key, token: "abc123" });
+    t.logical_task_key = key;
+    return t;
+  };
+  writeRegistry([mk("a", THREAD_A), mk("b", THREAD_B)], path.join(home, "registry.json"));
+
+  const seen = [];
+  const swept = sweepEligible({
+    home,
+    publish: ({ task }) => {
+      seen.push(task.logical_task_key);
+      if (task.logical_task_key === "a") throw new Error("这条炸了");
+      return { status: "published", count: 2 };
+    },
+  });
+
+  assert.equal(swept.ok, true);
+  assert.deepEqual(seen, ["a", "b"], "**第一个抛了，第二个仍然要跑**");
+  assert.equal(swept.errors.length, 1);
+  assert.equal(swept.errors[0].key, "a");
+  assert.equal(swept.errors[0].reason, "threw");
+  assert.equal(swept.tally.published, 1, "没炸的那个照常发");
+
+  // 登记表**坏了**（不是"不存在"）→ 明确失败，不许报成"扫了 0 个 task"。
+  // 文件不存在是合法的"还没有 task"，新装机器本来就这样；坏文件才是故障。
+  const badHome = temp();
+  fs.writeFileSync(path.join(badHome, "registry.json"), "{ 这不是 JSON");
+  const broken = sweepEligible({ home: badHome });
+  assert.equal(broken.ok, false, "**读不出来不等于没有** —— 报成 0 条就会静默空转");
+  assert.equal(broken.reason, "registry_unreadable");
 });
 
 test("调度器：历史积压没分类时拒绝启用，且一条都不写", () => {
@@ -2897,13 +3014,18 @@ test("调度器指向的必须是 runtime/current，不是任何开发克隆", (
   const home = temp();
   const script = drainScriptPath(home);
   assert.match(script,
-    /\.codex\/feishu-bridge\/runtime\/current\/scripts\/codex\/drain-outbox\.mjs$/u);
+    /\.codex\/feishu-bridge\/runtime\/current\/scripts\/codex\/drain-all\.mjs$/u);
   const body = plistBody({ home, node: "/opt/homebrew/bin/node" });
   assert.ok(body.includes(script), "plist 里跑的必须是这个路径");
   assert.doesNotMatch(body, /claude-projects|codex-projects/u,
     "**plist 里不许出现任何开发克隆路径**");
-  assert.ok(body.includes("<string>--all</string>"),
-    "兜底要覆盖全部登记 task —— 只排一个的话，其他 task 就没有兜底");
+  // **不再传 --all。**drain-outbox 根本不支持它：拿到 --all 会打一行
+  // "找不到目标 task" 然后 exit 0 —— 定时器每 30 分钟静默空转，
+  // 而外部看起来一切正常。现在跑的是真正的机器级 eligible-only 扫描入口。
+  assert.doesNotMatch(body, /<string>--all<\/string>/u,
+    "--all 是个不存在的用法，不许再出现在 plist 里");
+  assert.ok(body.includes("drain-all.mjs"),
+    "跑的必须是逐 task 的 eligible-only 扫描入口");
   assert.ok(body.includes("<key>RunAtLoad</key><false/>"),
     "装上不等于立刻跑一次");
 });

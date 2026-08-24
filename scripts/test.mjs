@@ -10602,6 +10602,35 @@ test("锁内重读要重判损坏：文件名一个没变，目标字段变坏�
     "**零抑制** —— 说不清该发去哪，就不能替它决定不发");
 });
 
+test("Claude 已装同一版时，Codex 仍必须真的装上 —— 内部校验不许查错链", () => {
+  // **这是生产上的必然，不是偶发。**两条链装的是同一份 scripts/，
+  // 版本哈希必然相同；applyRuntimeSync 内部若只按 home 查（默认 chain=claude），
+  // 就会认定"已经是这一版"而 no-op —— Codex 的 current 根本不建，
+  // 而 apply 报的是 ok:true。评审实测复现，我也复现了。
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-coexist-"));
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cosrc-"));
+  fs.mkdirSync(path.join(src, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(src, "scripts", "a.mjs"), "export const a = 1;\n");
+
+  const claudePlan = planRuntimeSync({ sourceRoot: src, home });
+  assert.equal(applyRuntimeSync(claudePlan, { home }).ok, true);
+
+  const codexRoot = path.join(home, ".codex", "feishu-bridge", "runtime");
+  const codexPlan = planRuntimeSync({ sourceRoot: src, root: codexRoot });
+  assert.equal(codexPlan.version, claudePlan.version,
+    "同一份源码，版本必然相同 —— 这正是这个坑的前提");
+
+  const applied = applyRuntimeSync(codexPlan, { home, root: codexRoot });
+  assert.equal(applied.ok, true);
+  assert.notEqual(applied.noop, true,
+    "**Claude 装过同一版不该让 Codex 变成 no-op** —— 内部校验查错了链");
+  assert.equal(fs.existsSync(path.join(codexRoot, "current")), true,
+    "current 必须真的建出来");
+  assert.equal(verifyRuntime({ root: codexRoot }).ok, true);
+  // 两条都还在，互不影响。
+  assert.equal(verifyRuntime({ home, chain: "claude" }).ok, true);
+});
+
 test("两条链的运行时必须落在各自的家目录，且互不覆盖", () => {
   // **刻意不共用一份。**共用能少一次版本漂移，但会把两条链的升级绑死 ——
   // 给 Claude 装一版就等于给 Codex 也装了，出问题也没法只回滚一条。

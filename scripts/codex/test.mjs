@@ -8,7 +8,9 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { moduleRoot } from "../direct-run.mjs";
 import { applySuppressionCore } from "../suppress-outbox-core.mjs";
-import { parseArgs as parseCodexSuppressArgs } from "./suppress-outbox.mjs";
+import {
+  checkArgShape, parseArgs as parseCodexSuppressArgs,
+} from "./suppress-outbox.mjs";
 
 import {
   appendEvent, listPending, markPublishEligibleByEventKey, suppressPublishByEventKey,
@@ -2506,6 +2508,114 @@ test("Codex 抑制命令：默认只预览，参数拼错不许被当成别的�
     ["裸参数", ["thread-id"]],
   ]) {
     assert.equal(parseCodexSuppressArgs(argv).ok, false, what + " 竟然被接受了");
+  }
+});
+
+test("Codex 抑制命令：真实入口 —— 预览后轮转必须 rotated 且零抑制", () => {
+  // 评审指出：上一版的 readState 闭包引用了**加锁前**读到的 task ——
+  // 我为共用核心设计了"锁内怎么重读"这个接口，**然后在实现它的时候把旧值闭包了进去**。
+  // 接口对了，实现是假的：预览后轮转，旧格式记录仍会按旧代际被不可逆抑制。
+  //
+  // 而且他说得对 —— 之前那条回归只驱动共用核心，**没验包装层接线**。
+  // 这跟我在 Stop 钩子上栽的那次一模一样：纯函数全绿、真实入口是坏的。
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Sup",
+    rootMessageId: "om_root", token: "abc123" });
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const regFile = path.join(home, "registry.json");
+  writeRegistry([task], regFile);
+
+  const paths = taskPaths(task, home);
+  fs.mkdirSync(paths.outbox, { recursive: true });
+  // **旧格式记录**：没有 target_channel_generation_id，代际靠当前状态现算。
+  const rec = path.join(paths.outbox, "0001.json");
+  fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "旧格式", published_at: null }));
+
+  const cli = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
+  const run = (...args) => spawnSync(process.execPath, [cli, "--thread-id", THREAD_A, ...args],
+    { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  const suppressed = () => JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at;
+
+  // 预览：能看到那一条。
+  const preview = run("--all-generations");
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.match(preview.stdout, /待发      1 条/u);
+  assert.match(preview.stdout, /dry-run/u);
+  assert.equal(suppressed(), undefined, "预览不许写盘");
+
+  // 预览必须把「落盘时该带哪一代」原样打出来 —— 不然人没处抄。
+  const told = /--expect-generation (channel_generation_[0-9a-f]{24})/u.exec(preview.stdout);
+  assert.ok(told, "预览要打出该带的代际：" + preview.stdout);
+  const seenGeneration = told[1];
+
+  // 不带它就不许落盘。**跨进程的轮转保护全靠这个值**。
+  const bare = run("--all-generations", "--apply", "--reason", "t");
+  assert.notEqual(bare.status, 0, "不带 --expect-generation 不许落盘");
+  assert.match(bare.stderr, /--expect-generation/u);
+  assert.equal(suppressed(), undefined, "被拦下时零抑制");
+
+  // **预览之后轮转**：registry 换代，outbox 一个字节没动。
+  // 新建的 task 第一代是 pending（还没被真实 @ 认领过），先标成 active 再造轮转。
+  const rotated = JSON.parse(fs.readFileSync(regFile, "utf-8"));
+  const state = rotated.tasks[0].topic_generation_state;
+  assert.ok(state?.generations?.length, "夹具应当带着代际状态");
+  const first = state.generations[0];
+  first.status = "read-only";
+  state.generations.push({ ...first, status: "active", generation: (first.generation ?? 1) + 1,
+    channel_generation_id: "channel_generation_" + "f".repeat(24),
+    root_message_id: "om_next", session_id: null, pending_token: null });
+  rotated.tasks[0].channel_generation_id = "channel_generation_" + "f".repeat(24);
+  fs.writeFileSync(regFile, JSON.stringify(rotated, null, 2));
+
+  // 带着**预览那一刻**看到的代际来落盘 —— 现实里人就是照着预览抄的。
+  const after = run("--all-generations", "--apply", "--reason", "t",
+    "--expect-generation", seenGeneration);
+  assert.notEqual(after.status, 0,
+    "轮转过就必须中止。stdout=" + after.stdout + " stderr=" + after.stderr);
+  assert.match(after.stderr, /轮转过/u);
+  assert.equal(suppressed(), undefined, "**零抑制** —— 那条内容现在属于新话题");
+});
+
+test("Codex 抑制命令：目标和范围都必须显式给", () => {
+  // **有损操作的默认值不该是"最大范围"。**上一版不传 --generation 就作用于整个
+  // outbox；同时传 --thread-id 和 --task-key 会静默择一 ——
+  // 两条都是"少说一句话就扩大破坏范围"，而这个动作不可逆。
+  assert.equal(checkArgShape(new Map([["thread-id", "t"], ["task-key", "k"],
+    ["generation", "g"]])).reason, "target_ambiguous");
+  assert.equal(checkArgShape(new Map([["generation", "g"]])).reason, "target_missing");
+  assert.equal(checkArgShape(new Map([["thread-id", "t"]])).reason, "scope_missing");
+  assert.equal(checkArgShape(new Map([["thread-id", "t"], ["generation", "g"],
+    ["all-generations", true]])).reason, "scope_conflict");
+  assert.equal(checkArgShape(new Map([["thread-id", "t"], ["generation", "g"]])).ok, true);
+  assert.equal(checkArgShape(new Map([["task-key", "k"], ["all-generations", true]])).ok, true);
+
+  // 真实入口：歧义命令必须非零退出，且 outbox 一个字节不变。
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Sup2",
+    rootMessageId: "om_root", token: "abc124" });
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  writeRegistry([task], path.join(home, "registry.json"));
+  const paths = taskPaths(task, home);
+  fs.mkdirSync(paths.outbox, { recursive: true });
+  const rec = path.join(paths.outbox, "0001.json");
+  const body = JSON.stringify({ kind: "progress", text: "x", published_at: null });
+  fs.writeFileSync(rec, body);
+
+  const cli = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
+  for (const args of [
+    ["--thread-id", THREAD_A, "--apply"],                                  // 没给范围
+    ["--thread-id", THREAD_A, "--task-key", "k", "--all-generations", "--apply"],
+    ["--thread-id", THREAD_A, "--generation", "g", "--all-generations", "--apply"],
+    ["--all-generations", "--apply"],                                      // 没给目标
+  ]) {
+    const r = spawnSync(process.execPath, [cli, ...args],
+      { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+    assert.notEqual(r.status, 0, args.join(" ") + " 竟然被接受了");
+    assert.equal(fs.readFileSync(rec, "utf-8"), body, args.join(" ") + "：outbox 不许被动");
   }
 });
 

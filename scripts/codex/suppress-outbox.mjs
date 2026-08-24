@@ -26,7 +26,7 @@ import { listPending } from "../outbox.mjs";
 import { applySuppressionCore, dependsOnMapping } from "../suppress-outbox-core.mjs";
 import { activeGeneration, pendingGeneration } from "../topic-generation.mjs";
 import {
-  bridgeHome, findTaskForCodexThread, loadRegistry,
+  bridgeHome, findTaskForCodexThread, loadRegistry, registryFile,
   resolveTask, resolveTaskOutboundGeneration, taskPaths, topicStateForTask,
 } from "./state.mjs";
 
@@ -129,7 +129,10 @@ export function locateTask({ threadId, taskKey, home }) {
     if (!found?.task) return { ok: false, reason: "task_not_found" };
     return { ok: true, task: found.task };
   }
-  const reg = loadRegistry();
+  // **读的必须是 home 那一份。**上一版这里调 loadRegistry() 读默认位置，
+  // 而拿的锁是 home/registry.lock —— 显式指定 home 时，锁和被保护的文件
+  // 可能根本不是同一份状态。现在两者靠同一个 home 保持一致，不靠巧合。
+  const reg = loadRegistry(registryFile(home));
   if (!reg.ok) return { ok: false, reason: "registry_unreadable" };
   const hits = reg.tasks.filter((t) => t.logical_task_key === taskKey);
   if (hits.length === 0) return { ok: false, reason: "task_not_found" };

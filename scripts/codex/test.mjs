@@ -9,7 +9,7 @@ import { pathToFileURL } from "node:url";
 import { moduleRoot } from "../direct-run.mjs";
 import { applySuppressionCore } from "../suppress-outbox-core.mjs";
 import {
-  checkArgShape, parseArgs as parseCodexSuppressArgs,
+  checkArgShape, locateTask, parseArgs as parseCodexSuppressArgs,
 } from "./suppress-outbox.mjs";
 
 import {
@@ -2576,6 +2576,69 @@ test("Codex 抑制命令：真实入口 —— 预览后轮转必须 rotated 且
     "轮转过就必须中止。stdout=" + after.stdout + " stderr=" + after.stderr);
   assert.match(after.stderr, /轮转过/u);
   assert.equal(suppressed(), undefined, "**零抑制** —— 那条内容现在属于新话题");
+});
+
+test("locateTask 的 task-key 分支必须读 home 那一份登记表", () => {
+  // 评审实测：这个分支拿的锁是 home/registry.lock，读的却是**默认位置**的
+  // registry.json —— 显式指定 home 时，锁和被保护的文件根本不是同一份状态。
+  // 现网没立刻炸，只是因为 CLI 的 home 恰好来自同一个环境变量。
+  // **靠巧合保持一致的东西不算守住了。**
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cx-home-"));
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), "cx-other-"));
+  const task = makeTaskEntry({ root: path.join(home, "p"), threadId: THREAD_A,
+    name: "只在 home 里", rootMessageId: "om_root", token: "abc123" });
+  task.logical_task_key = "only-in-home";
+  fs.writeFileSync(path.join(home, "registry.json"),
+    JSON.stringify({ schema_version: "1.0", tasks: [task] }, null, 2));
+  // 默认位置（由环境变量决定）指向一份**不含这条 task** 的登记表。
+  fs.writeFileSync(path.join(other, "registry.json"),
+    JSON.stringify({ schema_version: "1.0", tasks: [] }, null, 2));
+
+  const prev = process.env.FEISHU_CODEX_BRIDGE_HOME;
+  process.env.FEISHU_CODEX_BRIDGE_HOME = other;
+  try {
+    const got = locateTask({ threadId: null, taskKey: "only-in-home", home });
+    assert.equal(got.ok, true,
+      "读的必须是 home 那一份；读默认位置就会找不到（" + (got.reason ?? "") + "）");
+    assert.equal(got.task.logical_task_key, "only-in-home");
+  } finally {
+    if (prev === undefined) delete process.env.FEISHU_CODEX_BRIDGE_HOME;
+    else process.env.FEISHU_CODEX_BRIDGE_HOME = prev;
+  }
+});
+
+test("核心不变量：旧格式记录缺 expectation 一律拒绝 —— Codex 侧也守着同一条", () => {
+  // **这条直接打核心，不经 CLI。**包装层自己也有一道前置检查，于是把核心那道
+  // 守卫拆掉时，走 CLI 的测试照样绿 —— 包装层先拦下了。
+  // 两条链共享的是核心，那这条不变量就必须在两边各有一个直接的守卫：
+  // 退回"允许 null"时，两侧要同时变红。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-core-inv-"));
+  const obDir = path.join(dir, "outbox");
+  const genLock = path.join(dir, "gen.lock");
+  fs.mkdirSync(obDir, { recursive: true });
+  const rec = path.join(obDir, "0001.json");
+  fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "旧格式", published_at: null }));
+  const call = (previewGenerationId) => applySuppressionCore({
+    outboxDir: obDir, publishLockDir: path.join(dir, "pub.lock"),
+    generationLockDir: genLock,
+    pending: [{ _file: rec }], previewGenerationId,
+    readState: () => ({ activeGeneration: "gen-1", select: (r) => r }),
+    reason: "t",
+  });
+
+  for (const missing of [null, undefined, "", "   "]) {
+    const got = call(missing);
+    assert.equal(got.ok, false, "缺 expectation 不许放行：" + JSON.stringify(missing));
+    assert.equal(got.reason, "generation_expectation_required");
+  }
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
+    "被拒时一条都不许动");
+  assert.equal(fs.existsSync(genLock), false, "拒绝发生在拿锁之前，不许留代际锁");
+  assert.equal(fs.existsSync(path.join(dir, "pub.lock")), false, "也不许留发布锁");
+
+  const ok = call("gen-1");
+  assert.equal(ok.ok, true, "带了就该放行：" + (ok.reason ?? ""));
+  assert.equal(ok.done.changed, 1);
 });
 
 test("Codex 抑制命令：目标和范围都必须显式给", () => {

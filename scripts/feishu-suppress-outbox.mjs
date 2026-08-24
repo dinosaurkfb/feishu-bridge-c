@@ -36,7 +36,7 @@ import { applySuppressionCore, dependsOnMapping } from "./suppress-outbox-core.m
 const nonEmptyStr = (v) => typeof v === "string" && v.length > 0;
 
 const FLAGS = new Set(["apply"]);
-const OPTIONS = new Set(["project", "session", "reason", "generation"]);
+const OPTIONS = new Set(["project", "session", "reason", "generation", "expect-generation"]);
 
 /** 严格白名单：拼错的参数不许被执行成另一种操作。 */
 function parseArgs(tokens) {
@@ -164,9 +164,14 @@ function main() {
   // 旧格式记录 —— 它们没有这个字段，排空时被归入当前有效代际（__legacy_active__），
   // 于是按诊断给的代际 id 来筛，一条都筛不到。
   const pending = generation === null ? all : selectByGeneration(all, generation, mapping);
-  // 记下预览时的有效代际。落盘前要拿它跟锁内重读的结果比 —— 中间轮转过的话，
-  // "抑制这一代"的含义已经变了，即使一个文件都没动。
-  const previewGenerationId = activeGenerationOf(mapping);
+  // **预览看到的代际必须由人带进来，不能在这里现算。**
+  //
+  // 预览和 --apply 是两次独立运行；在这里现算，第二个进程拿到的就是轮转之后的值，
+  // 跟自己一比总是相等 —— 而"预览之后轮转过"恰恰只可能跨进程发生。
+  // 缺省时由核心拒绝（generation_expectation_required），这里只负责解析和显示。
+  const nowGeneration = activeGenerationOf(mapping);
+  const expectGeneration = parsed.seen.get("expect-generation") ?? null;
+  const needsExpect = dependsOnMapping(pending);
 
   console.log("项目      " + root);
   console.log("范围      " + (generation === null
@@ -184,10 +189,22 @@ function main() {
   console.log("\n**这是不可逆的**：被停下的这些内容不会再发出去，");
   console.log("也**不会**因为重新绑定或轮转话题而自动回来。");
 
-  if (!apply) { console.log("\n[dry-run] 什么都没写。加 --apply 才生效。"); return; }
+  if (!apply) {
+    console.log("\n[dry-run] 什么都没写。");
+    if (needsExpect) {
+      console.log("这批里有旧格式记录（代际靠当前状态现算）。落盘要带上现在这一代：");
+      console.log("  --apply --expect-generation " + (nowGeneration ?? "<读不出代际>"));
+      console.log("**带它是为了让「预览之后轮转过」拦得住** —— 两次运行之间轮转了，");
+      console.log("这个值就对不上，命令会中止而不是按旧代际停错东西。");
+    } else {
+      console.log("加 --apply 才生效。（每条都自带代际，轮转不影响它们。）");
+    }
+    return;
+  }
 
   const r = applySuppression({
-    outboxDir, root, session, pending, generation, previewGenerationId, reason });
+    outboxDir, root, session, pending, generation,
+    previewGenerationId: expectGeneration, reason });
   if (!r.ok) {
     console.error(
       r.reason === "publisher_busy"

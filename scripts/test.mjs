@@ -42,6 +42,7 @@ import {
   drainProject, outboxDirOf, publishErrorDetail, suppressCmd, watcherActive,
 } from "./drain-outbox.mjs";
 import { applySuppression } from "./feishu-suppress-outbox.mjs";
+import { applySuppressionCore } from "./suppress-outbox-core.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
 import {
   applyRuntimeSync, planRuntimeSync, runtimeRoot, runtimeScript, verifyRuntime,
@@ -9629,7 +9630,18 @@ test("显式抑制命令：默认预览、说明不可逆、拼错的参数不�
   assert.notEqual(cli(["--aply"]).status, 0, "拼错的参数不许被当成 --apply");
   assert.equal(listPending({ outboxDir: obDir }).length, 1);
 
-  assert.equal(cli(["--apply", "--reason", "话题属于旧应用"]).status, 0);
+  // 预览必须把"落盘该带哪一代"原样打出来 —— 不然人没处抄。
+  const told = /--expect-generation (\S+)/u.exec(preview.stdout);
+  assert.ok(told, "预览要打出该带的代际：" + preview.stdout);
+  assert.equal(told[1], "gen-1");
+
+  // 不带就不许落盘。**跨进程的轮转保护全靠这个值**，缺了它这道守卫等于没有。
+  const bare = cli(["--apply", "--reason", "话题属于旧应用"]);
+  assert.notEqual(bare.status, 0, "不带 --expect-generation 不许落盘");
+  assert.equal(listPending({ outboxDir: obDir }).length, 1, "被拦下时一条都不许动");
+
+  assert.equal(cli(["--apply", "--reason", "话题属于旧应用",
+    "--expect-generation", "gen-1"]).status, 0);
   assert.equal(listPending({ outboxDir: obDir }).length, 0, "抑制之后不再算待发");
   const rec = JSON.parse(fs.readFileSync(path.join(obDir, "0001.json"), "utf-8"));
   assert.equal(rec.publish_suppressed_reason, "话题属于旧应用", "理由要能回答为什么");
@@ -10335,6 +10347,9 @@ test("抑制中止时不许泄漏发布锁，也不许只比数量", () => {
 
   const run = spawnSync(process.execPath, [
     path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir, "--apply",
+    // 旧格式记录必须带着预览看到的代际来 —— 这是核心的前置条件，
+    // 不带的话在到达本条要测的行为之前就被拒了。
+    "--expect-generation", "gen-1",
   ], { encoding: "utf-8" });
   assert.equal(run.status, 0, run.stderr);
   // process.exit 会跳过 finally —— 那样锁就只能等过期接管。
@@ -10366,7 +10381,8 @@ test("等量替换要真的挡住：造出漂移，不许抑制、不许静默�
   // 只比数量的写法在这里必然放行，然后不可逆地抑制掉一条它从没给人看过的内容。
   const r = applySuppression({
     outboxDir: obDir, root: dir, pending: [{ _file: path.join(obDir, "0001.json") }],
-    generation: null, mapping: null, reason: "t",
+    // 旧格式记录要带着预览看到的代际 —— 这条测的是漂移，先满足前置条件。
+    generation: null, mapping: null, previewGenerationId: "gen-1", reason: "t",
   });
 
   assert.equal(r.ok, false, "漂移必须中止");
@@ -10377,6 +10393,87 @@ test("等量替换要真的挡住：造出漂移，不许抑制、不许静默�
     "中止就是一条都不许动");
   assert.equal(fs.existsSync(path.join(dir, ".runtime-data", "outbound", "publish.lock")), false,
     "中止路径也要把锁还回去");
+});
+
+test("Claude 真实入口：预览 → 轮转 → 带旧 expectation 落盘，必须 rotated 且零抑制", () => {
+  // 上面那条走的是函数层。**函数层绿不等于命令绿** —— 命令此前是在自己进程里
+  // 现算 previewGenerationId，跟自己一比总是相等，于是这道守卫在真实入口上
+  // 从来没生效过。这条专门守命令这一层：两次独立运行，中间轮转。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cli-rot-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  const writeMapping = (g) => fs.writeFileSync(path.join(inbound, "active-mapping.json"),
+    JSON.stringify({ status: "active", root_message_id: "om_" + g,
+      feishu_root_message_id_reference: "om_" + g, claude_session_id: null,
+      channel_generation_id: g }));
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  writeMapping("gen-1");
+  const rec = path.join(obDir, "0001.json");
+  // 旧格式：没有 target_channel_generation_id，代际靠 mapping 现算。
+  fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "旧格式", published_at: null }));
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir, ...args,
+  ], { encoding: "utf-8" });
+
+  const preview = cli([]);
+  assert.equal(preview.status, 0, preview.stderr);
+  const told = /--expect-generation (\S+)/u.exec(preview.stdout);
+  assert.ok(told, "预览要打出该带的代际：" + preview.stdout);
+  assert.equal(told[1], "gen-1");
+
+  // **预览之后轮转**：mapping 换代，outbox 一个字节没动。
+  writeMapping("gen-2");
+
+  // 人照着预览抄的是 gen-1 —— 命令必须发现世界已经变了。
+  const after = cli(["--apply", "--reason", "t", "--expect-generation", told[1]]);
+  assert.notEqual(after.status, 0,
+    "轮转过就必须中止。stdout=" + after.stdout + " stderr=" + after.stderr);
+  assert.match(after.stderr, /轮转/u, "要说清是轮转，别报成别的");
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
+    "**零抑制** —— 那条内容现在属于新话题");
+  assert.equal(fs.existsSync(path.join(dir, ".runtime-data", "outbound", "publish.lock")), false,
+    "中止路径也要把发布锁还回去");
+  assert.equal(fs.existsSync(path.join(inbound, "topic-generation.lock")), false,
+    "代际锁也要还回去");
+});
+
+test("核心不变量：旧格式记录缺 expectation 一律拒绝，两侧包装层都无权豁免", () => {
+  // **这条直接打核心，不经任何 CLI。**两个包装层各自也有一道前置检查，
+  // 于是把核心这道守卫拆掉时，走 CLI 的测试照样绿 —— 包装层先拦下了。
+  // 核心的不变量必须由直接调用来守，否则"共享核心"就只共享了锁和比较，
+  // 没共享最关键的调用前置条件。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-core-inv-"));
+  const obDir = path.join(dir, "outbox");
+  const genLock = path.join(dir, "gen.lock");
+  fs.mkdirSync(obDir, { recursive: true });
+  const rec = path.join(obDir, "0001.json");
+  fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "旧格式", published_at: null }));
+  const call = (previewGenerationId) => applySuppressionCore({
+    outboxDir: obDir, publishLockDir: path.join(dir, "pub.lock"),
+    generationLockDir: genLock,
+    pending: [{ _file: rec }], previewGenerationId,
+    readState: () => ({ activeGeneration: "gen-1", select: (r) => r }),
+    reason: "t",
+  });
+
+  for (const missing of [null, undefined, "", "   "]) {
+    const got = call(missing);
+    assert.equal(got.ok, false, "缺 expectation 不许放行：" + JSON.stringify(missing));
+    assert.equal(got.reason, "generation_expectation_required");
+  }
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
+    "被拒时一条都不许动");
+  // 拒绝发生在拿锁之前 —— 不许留下任何一把。
+  assert.equal(fs.existsSync(genLock), false, "拒绝路径不许留代际锁");
+  assert.equal(fs.existsSync(path.join(dir, "pub.lock")), false, "也不许留发布锁");
+
+  // 带上就该放行 —— 否则这条守卫是"永远拒绝"，同样是坏的。
+  const ok = call("gen-1");
+  assert.equal(ok.ok, true, "带了就该放行：" + (ok.reason ?? ""));
+  assert.equal(ok.done.changed, 1);
 });
 
 test("预览后发生轮转要中止 —— 文件一个没变也不行", () => {
@@ -10487,7 +10584,9 @@ test("轮转正在进行时不动 outbox，两把锁的顺序固定", () => {
 
   const got = applySuppression({
     outboxDir: obDir, root: dir, session: null,
-    pending: listPending({ outboxDir: obDir }), generation: null, reason: "t",
+    pending: listPending({ outboxDir: obDir }), generation: null,
+    // 同上：这条测的是两把锁的顺序，前置条件先满足。
+    previewGenerationId: "gen-1", reason: "t",
   });
   assert.equal(got.ok, false);
   assert.equal(got.reason, "rotation_busy");
@@ -10515,6 +10614,9 @@ test("未绑定的项目不许被报成「轮转中」，也不许去碰本机�
 
   const run = spawnSync(process.execPath, [
     path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir, "--apply",
+    // 旧格式记录必须带着预览看到的代际来 —— 这是核心的前置条件，
+    // 不带的话在到达本条要测的行为之前就被拒了。
+    "--expect-generation", "gen-1",
   ], { encoding: "utf-8" });
 
   assert.equal(run.status, 1, "算不清就要非零退出");
@@ -10634,6 +10736,9 @@ test("取不到锁时命令要非零退出并说清楚，不能静默报成功",
 
   const run = spawnSync(process.execPath, [
     path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir, "--apply",
+    // 旧格式记录必须带着预览看到的代际来 —— 这是核心的前置条件，
+    // 不带的话在到达本条要测的行为之前就被拒了。
+    "--expect-generation", "gen-1",
   ], { encoding: "utf-8" });
 
   assert.equal(run.status, 1, "没做成就必须非零退出");

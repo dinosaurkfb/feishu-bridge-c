@@ -38,11 +38,28 @@ export function applySuppressionCore({
   previewGenerationId = null, readState, reason,
 }) {
   const needsGeneration = dependsOnMapping(pending);
+  // **这批里有旧格式记录 → 必须带着预览看到的代际来落盘。这条前置条件属于核心，
+  // 不属于哪个 CLI。**
+  //
+  // 上一版把它留给调用方，两个包装层就各自现算了一个值 —— 而预览和 --apply 是
+  // 两次独立运行，第二个进程算出的是轮转之后的值，前后一比总是相等。
+  // **而「预览之后轮转过」恰恰只可能跨进程发生**，于是这道守卫从来没生效过。
+  //
+  // 包装层负责解析和显示 --expect-generation，但不许决定它可不可以不给。
   let genLock = null;
   if (needsGeneration) {
     // 有旧格式记录却说不清该跟哪一把锁串行 —— **明确拒绝**，
     // 不许退而求其次去拿一把猜出来的锁碰运气。
+    // 这条排在 expectation 之前：连绑定都解析不出来时，"缺预览代际"是个
+    // 派生症状，报它会盖住真正的原因。
     if (!nonEmpty(generationLockDir)) return { ok: false, reason: "binding_unresolved" };
+    // 到这儿说明代际这个概念是成立的 —— 那就必须带着预览看到的那一代来。
+    // 空白串也算没给。放它过去的话，它会在下面被判成 rotated
+    // （from: "   "）—— 结果同样是零抑制，但报出来的原因是错的：
+    // 那不是"世界变了"，那是"这个值根本不是代际"。
+    if (typeof previewGenerationId !== "string" || previewGenerationId.trim() === "") {
+      return { ok: false, reason: "generation_expectation_required" };
+    }
     const got = acquirePublishLock(generationLockDir);
     // 轮转正在进行 → 现在不是动 outbox 的时候。
     if (!got.ok) return { ok: false, reason: "rotation_busy" };
@@ -61,8 +78,7 @@ export function applySuppressionCore({
     }
     // 只有旧格式记录的归属会随轮转改变。每条都自带代际时轮转不影响任何一条 ——
     // 这时再因为轮转中止，就是在拒绝一件本来安全的事。
-    if (needsGeneration && previewGenerationId !== null &&
-        state.activeGeneration !== previewGenerationId) {
+    if (needsGeneration && state.activeGeneration !== previewGenerationId) {
       return { ok: false, reason: "rotated",
         from: previewGenerationId, to: state.activeGeneration ?? null };
     }

@@ -38,6 +38,7 @@ import { PUBLISH_FAILURE, classifyPublishFailure } from "./outbound.mjs";
 import {
   drainProject, suppressCmd, watcherActive,
 } from "./drain-outbox.mjs";
+import { applySuppression } from "./feishu-suppress-outbox.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
 import {
   applyRuntimeSync, planRuntimeSync, runtimeRoot, runtimeScript, verifyRuntime,
@@ -8291,11 +8292,64 @@ test("抑制中止时不许泄漏发布锁，也不许只比数量", () => {
   assert.equal(fs.existsSync(path.join(dir, ".runtime-data", "outbound", "publish.lock")), false,
     "跑完必须把发布锁释放掉");
 
-  // 集合比较：只比条数挡不住等量替换（少一条旧的、多一条新的，总数没变）。
-  const src = fs.readFileSync(path.resolve("scripts", "feishu-suppress-outbox.mjs"), "utf-8");
-  assert.match(src, /new Set\(pending\.map\(\(r\) => r\._file\)\)/u,
-    "锁内要比稳定记录集合，不是比计数");
-  assert.doesNotMatch(src, /fresh\.length !== pending\.length/u);
+});
+
+test("等量替换要真的挡住：造出漂移，不许抑制、不许静默成功、不许留锁", () => {
+  // 上一版这里断言的是"源码里出现 new Set(...)"。**那种断言改坏了也照样绿** ——
+  // 它验的是守卫长什么样，不是守卫做到了什么。这次真造一次漂移。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-drift-"));
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const onDisk = path.join(obDir, "0002.json");
+  fs.writeFileSync(onDisk, JSON.stringify({ kind: "progress", text: "预览之后才进来的", published_at: null }));
+
+  // 预览时看到的是 0001，落盘时磁盘上只剩 0002 —— **两边都是 1 条**。
+  // 只比数量的写法在这里必然放行，然后不可逆地抑制掉一条它从没给人看过的内容。
+  const r = applySuppression({
+    outboxDir: obDir, root: dir, pending: [{ _file: path.join(obDir, "0001.json") }],
+    generation: null, mapping: null, reason: "t",
+  });
+
+  assert.equal(r.ok, false, "漂移必须中止");
+  assert.equal(r.reason, "drift");
+  assert.equal(r.before, 1);
+  assert.equal(r.now, 1, "两侧同为 1 条 —— 只比计数的实现在这里会漏过去");
+  assert.equal(JSON.parse(fs.readFileSync(onDisk, "utf-8")).publish_suppressed_at, undefined,
+    "中止就是一条都不许动");
+  assert.equal(fs.existsSync(path.join(dir, ".runtime-data", "outbound", "publish.lock")), false,
+    "中止路径也要把锁还回去");
+});
+
+test("取不到锁时命令要非零退出并说清楚，不能静默报成功", () => {
+  // main 里那条 `if (!r.ok)` 是漂移和占锁共用的同一条出口。
+  // 上一版把临界区的 process.exit 换成 return，return 先跑 finally 再从整个
+  // main() 返回，这条出口整段被跳过 —— 命令以 0 退出，等于对没做成的事报成功。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-busy-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P", task_display_name: "P" }));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
+    kind: "progress", text: "a", published_at: null }));
+  // 别人正拿着锁。**owner 的 pid 必须是活着的进程** —— 锁的过期判定会探活，
+  // 填一个不存在的 pid 就会被正确地当成崩溃残留接管掉，那测的就不是占锁路径了。
+  // （第一版就是这么写的，命令照常抑制成功，差点被当成产品缺陷。）
+  const lockDir = path.join(dir, ".runtime-data", "outbound", "publish.lock");
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(path.join(lockDir, "owner.json"),
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir, "--apply",
+  ], { encoding: "utf-8" });
+
+  assert.equal(run.status, 1, "没做成就必须非零退出");
+  assert.match(run.stderr, /发布器正忙/u, "要说清为什么没做");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(obDir, "0001.json"), "utf-8"))
+    .publish_suppressed_at, undefined, "一条都不许动");
+  assert.ok(fs.existsSync(lockDir), "别人的锁不许被顺手删掉");
 });
 
 summarySealed = true;

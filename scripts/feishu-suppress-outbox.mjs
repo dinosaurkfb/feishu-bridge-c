@@ -72,6 +72,36 @@ export function selectByGeneration(records, generation, mapping) {
   return out;
 }
 
+/**
+ * 锁内重读 + 抑制。**整段独立出来，是为了让 main 里不再有 try/finally。**
+ *
+ * 上一版为了修锁泄漏，把临界区里的 process.exit(1) 换成了 return —— 而 return
+ * 会先跑 finally、再从**整个 main() 返回**，后面的报错和 exitCode 全部跳过：
+ * 命令静默退出 0，对着一次没做成的操作报成功。比原来的锁泄漏更糟。
+ *
+ * 现在临界区只返回结果，退出码由 main 在 try 之外决定。**那种写法在 main 里
+ * 不再可能出现**，不是靠记得别写。
+ */
+export function applySuppression({ outboxDir, root, pending, generation, mapping, reason }) {
+  const lockDir = path.join(root, ".runtime-data", "outbound", "publish.lock");
+  const lock = acquirePublishLock(lockDir);
+  if (!lock.ok) return { ok: false, reason: lock.reason };
+  try {
+    // 预览到落盘之间可能有新内容进来，也可能有内容已经发出去了。
+    const freshAll = listPending({ outboxDir });
+    const fresh = generation === null ? freshAll : selectByGeneration(freshAll, generation, mapping);
+    // **比集合，不是比数量。**只比条数挡不住等量替换：预览之后少一条旧的、
+    // 多一条新的，总数没变，就会不可逆地抑制另一批内容。
+    const before = new Set(pending.map((x) => x._file));
+    const now = new Set(fresh.map((x) => x._file));
+    const same = before.size === now.size && [...before].every((f) => now.has(f));
+    if (!same) return { ok: false, reason: "drift", before: before.size, now: now.size };
+    return { ok: true, done: suppressRecords(fresh, { reason }) };
+  } finally {
+    releasePublishLock(lockDir);
+  }
+}
+
 function main() {
   const parsed = parseArgs(process.argv.slice(2));
   if (!parsed.ok) {
@@ -114,39 +144,18 @@ function main() {
 
   if (!apply) { console.log("\n[dry-run] 什么都没写。加 --apply 才生效。"); return; }
 
-  // **取发布锁。**预览、抑制、发布之间有竞态：正在发的那条可能刚好被抑制掉，
-  // 或者抑制的时候它已经发出去了。用同一把项目发布锁把这三者排开。
-  const lockDir = path.join(root, ".runtime-data", "outbound", "publish.lock");
-  const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) {
-    console.error("发布器正忙（" + lock.reason + "），稍后再试 —— 不在它发的时候动 outbox。");
-    process.exit(1);
-  }
-  let done;
-  let drift = null;
-  try {
-    // 锁内重读：预览到落盘之间可能有新内容进来，也可能有内容已经发出去了。
-    const freshAll = listPending({ outboxDir });
-    const fresh = generation === null ? freshAll : selectByGeneration(freshAll, generation, mapping);
-    // **比集合，不是比数量。**只比条数挡不住等量替换：预览之后少一条旧的、
-    // 多一条新的，总数没变，就会不可逆地抑制另一批内容。
-    const before = new Set(pending.map((r) => r._file));
-    const now = new Set(fresh.map((r) => r._file));
-    const same = before.size === now.size && [...before].every((f) => now.has(f));
-    if (!same) {
-      drift = { before: before.size, now: now.size };
-      return;   // **不要 process.exit** —— 它会跳过 finally，锁就泄漏了
-    }
-    done = suppressRecords(fresh, { reason });
-  } finally {
-    releasePublishLock(lockDir);
-  }
-  if (drift) {
-    console.error("outbox 在预览之后变了（" + drift.before + " → " + drift.now +
-      " 条待发，或换了内容），没有动它。请重新预览确认。");
+  const r = applySuppression({ outboxDir, root, pending, generation, mapping, reason });
+  if (!r.ok) {
+    console.error(r.reason === "publisher_busy"
+      ? "发布器正忙，稍后再试 —— 不在它发的时候动 outbox。"
+      : r.reason === "drift"
+        ? "outbox 在预览之后变了（" + r.before + " → " + r.now +
+          " 条待发，或换了内容），没有动它。请重新预览确认。"
+        : "取发布锁失败（" + r.reason + "），没有动 outbox。");
     process.exitCode = 1;
     return;
   }
+  const done = r.done;
   console.log("\n已停止重试 " + done.changed + " 条。");
   if (!done.ok) {
     // 部分失败要如实说，不能报"整批已停止"——那会让人以为噪音没了，而它还在。

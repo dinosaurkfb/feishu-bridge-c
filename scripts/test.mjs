@@ -51,6 +51,7 @@ import {
   DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliveryPinPath, findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin,
 } from "./live-session.mjs";
 import { extractReply } from "./stop-hook.mjs";
+import { foreignHint, projectLabel } from "./stop-note.mjs";
 import {
   CHAIN_FIELDS, assertPublishIdentity, materializeProjectConfig,
   resolveLarkIdentity, validateChainTemplate,
@@ -3748,6 +3749,9 @@ test("Claude UserPromptSubmit 与 Stop 配对本地输入，飞书来源戳只�
     ...process.env,
     FEISHU_BRIDGE_REGISTRY: registryFile,
     FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+    // 钩子的日志路径写死在 os.homedir() 上 —— 不换 HOME 就会写进**真实的**
+    // ~/.claude/feishu-bridge/stop-hook.log，超过 1 MiB 还会删掉重建。
+    HOME: home,
   };
   const initHook = path.join(path.resolve("scripts"), "init-hook.mjs");
   const stopHook = path.join(path.resolve("scripts"), "stop-hook.mjs");
@@ -9432,6 +9436,163 @@ test("取不到锁时命令要非零退出并说清楚，不能静默报成功",
     .publish_suppressed_at, undefined, "一条都不许动");
   assert.ok(fs.existsSync(lockDir), "别人的锁不许被顺手删掉");
 });
+test("Stop 提示要说清这条失败是不是当前项目的", () => {
+  // Frank 实际撞上的：本会话一直在讨论另一个项目，每一轮 Stop 都跟着报一次
+  // **那个项目**的发布失败，看上去像是**这个**项目出了故障。
+  // 名字一直都有，缺的是"它不是当前这个"。
+  //
+  // 根因在挑项目的规则：cwd 在项目下，**或者项目路径出现在本会话的 transcript 里**
+  // —— "在对话里聊到某个项目"就会被挂上那个项目。
+  assert.equal(projectLabel({ id: "cc2cd", via: ["cwd"] }), "cc2cd",
+    "当前项目不该加噪音");
+  assert.equal(projectLabel({ id: "cc2cd", via: ["transcript"] }), "cc2cd（非当前项目）");
+  // 两条规则都命中时，它确实是当前项目。
+  assert.equal(projectLabel({ id: "cc2cd", via: ["cwd", "transcript"] }), "cc2cd");
+  // via 缺失时按"说不清"处理 —— 宁可多标一句，也不要让人以为是当前项目。
+  assert.equal(projectLabel({ id: "x" }), "x（非当前项目）");
+
+  // 解释只在确实带上了非当前项目时出现，而且只出现一次 ——
+  // 手机上卡片窄，每条提示都重复一遍会把真正的结论挤下去。
+  assert.equal(foreignHint([{ id: "a", via: ["cwd"] }]), "");
+  assert.equal(foreignHint([]), "");
+  assert.match(foreignHint([{ id: "a", via: ["cwd"] }, { id: "b", via: ["transcript"] }]),
+    /提到过它的路径/u);
+  assert.equal(foreignHint([{ id: "b", via: ["transcript"] }, { id: "c", via: ["transcript"] }])
+    .split("非当前项目").length - 1, 1, "解释只说一次");
+});
+
+test("真实 Stop 钩子会把「非当前项目」说出来 —— 纯函数对了不算数", () => {
+  // **这条是补出来的，而且是被现场教训逼出来的。**上面那条纯函数测试全绿的时候，
+  // 真实钩子每一次调用都在崩：动态 import 那行我以为写进去了，其实锚点没匹配上，
+  // 于是 projectLabel 未定义 —— ReferenceError，钩子静默退出，
+  // **一句提示都发不出来，而 535 条测试全是绿的。**
+  //
+  // 这个项目已经在同一族问题上栽过：函数写对了，真实入口根本走不到那儿。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-stopnote-"));
+  const proj = path.join(dir, "projA");
+  const elsewhere = path.join(dir, "elsewhere");
+  fs.mkdirSync(path.join(proj, ".runtime-data", "inbound"), { recursive: true });
+  fs.mkdirSync(path.join(proj, ".runtime-data", "outbound", "outbox"), { recursive: true });
+  fs.mkdirSync(elsewhere, { recursive: true });
+  fs.writeFileSync(path.join(proj, ".runtime-data", "inbound", "chain-config.json"),
+    JSON.stringify({ project_dir: proj, logical_task_key: "k",
+      project_display_name: "A", task_display_name: "A" }));
+  fs.writeFileSync(path.join(proj, ".runtime-data", "outbound", "outbox", "0001.json"),
+    JSON.stringify({ kind: "progress", text: "x", published_at: null }));
+  const reg = path.join(dir, "registry.json");
+  fs.writeFileSync(reg, JSON.stringify({
+    schema_version: "1.0", projects: [{ id: "projA", root: proj, name: "A" }] }));
+  // transcript 里提到 projA 的路径 —— 这就是"聊到它就被挂上它"的那条规则。
+  const transcript = path.join(dir, "t.jsonl");
+  fs.writeFileSync(transcript, "刚才在讨论 " + proj + " 的问题\n");
+
+  // **子进程也得换 HOME。**只换 registry 是不够的：钩子的日志路径写死在
+  // os.homedir() 上，于是跑一次测试就往**真实的** ~/.claude/feishu-bridge/stop-hook.log
+  // 里写一次，超过 1 MiB 还会把它删掉重建。我自己就是靠翻那个日志查出
+  // ReferenceError 的 —— 也就是说这条测试一直在污染我用来排障的东西。
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-stophome-"));
+  const prodLog = path.join(os.homedir(), ".claude", "feishu-bridge", "stop-hook.log");
+  const prodBefore = fs.existsSync(prodLog) ? fs.statSync(prodLog).size : null;
+
+  const rawHook = (cwd, extra = {}) => {
+    const run = spawnSync(process.execPath, [path.resolve("scripts", "stop-hook.mjs")], {
+      encoding: "utf-8",
+      input: JSON.stringify({ cwd, transcript_path: transcript, session_id: "s1",
+        last_assistant_message: "hi", ...extra }),
+      env: { ...process.env, FEISHU_BRIDGE_REGISTRY: reg, HOME: fakeHome },
+    });
+    assert.equal(run.status, 0, run.stderr);
+    return run.stdout.trim();
+  };
+  const runHook = (cwd) => {
+    const out = rawHook(cwd);
+    assert.ok(out, "钩子必须说点什么 —— 崩掉时它是静默的");
+    return JSON.parse(out).systemMessage;
+  };
+
+  // cwd 在别处：必须标出来，并解释一次为什么带上它。
+  const foreign = runHook(elsewhere);
+  assert.match(foreign, /projA（非当前项目）/u);
+  assert.match(foreign, /提到过它的路径/u);
+
+  // cwd 就在项目里：不许加这些噪音。
+  const own = runHook(proj);
+  assert.match(own, /projA 发布失败/u);
+  assert.equal(own.includes("非当前项目"), false, "当前项目不该被标记");
+
+  // **非当前项目没东西可报时，那句解释不许孤零零地出现。**
+  // 上一版按"被归属到哪些项目"决定要不要解释，而不是按"实际报了哪些" ——
+  // 于是 outbox 为空时一条提示都没有，解释却照样打出来，挂在那儿没有指向。
+  // 注意要连本轮答复一起去掉：钩子会把 last_assistant_message 排进 outbox，
+  // 那本身就成了"有事可报"。清空 outbox 并且这一轮不带答复。
+  const ob = path.join(proj, ".runtime-data", "outbound", "outbox");
+  for (const f of fs.readdirSync(ob)) fs.rmSync(path.join(ob, f));
+  assert.equal(rawHook(elsewhere, { last_assistant_message: "" }), "",
+    "非当前项目无事可报时应当完全沉默，而不是只留一句解释");
+
+  // 三次调用都跑完了，现在验日志落在哪。
+  const fakeLog = path.join(fakeHome, ".claude", "feishu-bridge", "stop-hook.log");
+  assert.equal(fs.existsSync(fakeLog), true, "日志应当落在临时 HOME 里");
+  assert.ok(fs.statSync(fakeLog).size > 0, "临时 HOME 的日志应当真的写进去了");
+  // **真实 HOME 的日志一个字节都不许变。**
+  const prodAfter = fs.existsSync(prodLog) ? fs.statSync(prodLog).size : null;
+  assert.equal(prodAfter, prodBefore,
+    "跑测试改动了真实的 stop-hook.log —— 那正是排障时要看的东西");
+});
+
+test("spawn 钩子必须换 HOME —— 否则会写进真实的排障日志", () => {
+  // 评审查出来的：钩子的日志路径写死在 os.homedir() 上，测试只换 registry 不换 HOME，
+  // 就会往**真实的** ~/.claude/feishu-bridge/stop-hook.log 里写，
+  // 超过 1 MiB 还会删掉重建。**那正是排障时要看的东西** ——
+  // 我自己就是靠翻它查出 ReferenceError 的，等于测试在污染自己的证据。
+  //
+  // 这条守整套：凡是 spawn 钩子脚本的地方，env 里必须带 HOME。
+  const src = fs.readFileSync(path.resolve("scripts", "test.mjs"), "utf-8");
+  const lines = src.split("\n");
+  const HOOKS = ["stop-hook.mjs", "init-hook.mjs", "inbound-hook.mjs"];
+
+  // **钩子路径常常存在变量里**（const stopHook = path.join(..., "stop-hook.mjs")），
+  // 只认字面量会漏掉那些调用点 —— 第一版就漏了一处，而"扫描失效等于没守"。
+  const hookVars = new Set();
+  for (const line of lines) {
+    const m = line.match(/const\s+([A-Za-z0-9_$]+)\s*=.*(stop-hook|init-hook|inbound-hook)\.mjs/u);
+    if (m) hookVars.add(m[1]);
+  }
+  assert.ok(hookVars.size >= 1, "没认出任何钩子路径变量，扫描多半已失效");
+
+  // 哪些 env 变量的定义里带了 HOME —— 引用它们的 spawn 就是安全的。
+  const safeEnvVars = new Set();
+  for (const [i, line] of lines.entries()) {
+    const m = line.match(/const\s+([A-Za-z0-9_$]+)\s*=\s*\{\s*$/u);
+    if (!m) continue;
+    const end = lines.slice(i, i + 30).findIndex((l, k) => k > 0 && /^\s*\};/u.test(l));
+    if (end < 0) continue;
+    if (/\bHOME:/u.test(lines.slice(i, i + end + 1).join("\n"))) safeEnvVars.add(m[1]);
+  }
+
+  const bad = [];
+  let scanned = 0;
+  for (const [i, line] of lines.entries()) {
+    if (!line.includes("spawnSync(process.execPath")) continue;
+    const block = lines.slice(i, i + 14).join("\n");
+    const isHook = HOOKS.some((h) => block.includes(h))
+      || [...hookVars].some((v) => new RegExp("\\[\\s*" + v + "\\s*\\]", "u").test(block));
+    if (!isHook) continue;
+    scanned += 1;
+    // env 要么就地写、要么引用一个变量。**按行距找会误判**：同一个 env 变量
+    // 可能被下面几十行外的调用共用。所以直接看"这个 env 变量的定义里有没有 HOME"。
+    // 用 \bHOME: 而不是 HOME:，否则 LARKSUITE_CLI_HOME: 之类会顶替掉真正的 HOME。
+    const inline = /\bHOME:/u.test(block);
+    // 两种写法都要认：`env: someVar` 和对象简写 `env,`。
+    // 第一版只认前者，于是七处用简写的调用点全被误报成不安全。
+    const viaVar = [...safeEnvVars].some((v) =>
+      new RegExp("env:\\s*" + v + "\\b|(^|[\\s{,])" + v + "\\s*,", "mu").test(block));
+    if (!inline && !viaVar) bad.push((i + 1) + ": " + line.trim());
+  }
+  assert.ok(scanned >= 2, "只扫到 " + scanned + " 处 spawn 钩子 —— 扫描失效就等于没守");
+  assert.deepEqual(bad, [], "这些地方 spawn 了钩子却没换 HOME，会写进真实排障日志");
+});
+
 
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

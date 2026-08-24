@@ -118,6 +118,7 @@ async function main() {
 
   const { drainProject, watcherActive, outboxDirOf, suppressCmd } =
     await import("./drain-outbox.mjs");
+  const { foreignHint, projectLabel } = await import("./stop-note.mjs");
   const { resolveProject } = await import("./project-resolve.mjs");
   const { appendEvent, listPending, MAX_REPLY_CHARS } = await import("./outbox.mjs");
   const { checkBinding, bindingWarning } = await import("./binding-health.mjs");
@@ -138,6 +139,8 @@ async function main() {
   const reply = ownedByBridge ? null : extractReply(payload, { maxChars: MAX_REPLY_CHARS });
 
   const notes = [];
+  // 只有真的进了 notes 的项目才算"报过"。
+  const reported = [];
 
   for (const project of attributed) {
     // 先解析出**这一轮该用哪条绑定**：有会话级绑定且对得上就用它，否则回落到项目级。
@@ -236,29 +239,34 @@ async function main() {
     });
     log(project.id + " via=" + project.via.join("+") + " -> " + JSON.stringify(r));
 
+    const who = projectLabel(project);
+    // 记下"这一轮真的报了哪些项目"。末尾那句解释要按它来算，不能按"被归属到哪些"
+    // 算 —— 非当前项目没东西可报时不产生提示，解释却会孤零零挂在那儿。
+    const before = notes.length;
     if (r.status === "published") {
-      notes.push("飞书出站：" + project.id + " 已发布 " + r.count + " 条进展。");
+      notes.push("飞书出站：" + who + " 已发布 " + r.count + " 条进展。");
     } else if (r.status === "error" && r.diagnosis?.kind === "root_owned_by_other_app") {
       // 诊断是**线索不是判决**：说清重试大概率无用，但停不停由人决定。
       // 上一版在这里直接说"已停止重试"，那是把一个自动做出的有损动作说成既成事实。
-      notes.push("飞书出站：" + project.id + " 发布失败。这个话题是另一个应用（" +
+      notes.push("飞书出站：" + who + " 发布失败。这个话题是另一个应用（" +
         (r.diagnosis.ownerName ?? "未知") + "）建的，当前身份大概率回复不进去，" +
         "重试可能一直失败。要停止重试：node " + suppressCmd() + " --project " +
         project.root + " --generation " + (r.diagnosis.generationId ?? "<代际 id>") + " --apply");
     } else if (r.status === "error") {
-      notes.push("飞书出站：" + project.id + " 发布失败（" + r.reason + "），进展留在 outbox，兜底定时器会重试。");
+      notes.push("飞书出站：" + who + " 发布失败（" + r.reason + "），进展留在 outbox，兜底定时器会重试。");
     } else if (r.status === "skipped" && r.reason === "auto_publish_disabled") {
       // 这条必须说出来：按设置没发和发失败，下一步完全不同，
       // 而沉默会让人以为发出去了。
-      notes.push("飞书出站：" + project.id + " 按设置未发布（自动发布已关），" +
+      notes.push("飞书出站：" + who + " 按设置未发布（自动发布已关），" +
         r.count + " 条留在 outbox。");
     } else if (r.status === "skipped" && r.reason === "mapping_not_active") {
       // 这条必须说出来：绑定失效时进展会无限期堆在本地，而 Frank 什么都收不到。
-      notes.push("飞书出站：" + project.id + " 的话题绑定已失效，" + r.count + " 条进展发不出去，需要重签绑定。");
+      notes.push("飞书出站：" + who + " 的话题绑定已失效，" + r.count + " 条进展发不出去，需要重签绑定。");
     }
+    if (notes.length > before) reported.push(project);
   }
 
-  finish(notes.join(" "));
+  finish(notes.join(" ") + foreignHint(reported));
 }
 
 // 只有被直接执行时才真的跑。被 import（测试要 extractReply）时绝不能执行 ——

@@ -290,8 +290,11 @@ export function composeLayeredStatus({
     // 但用户可以在飞书里改名，本地没有读取当前标题的权威事实 —— 说成"话题名"
     // 就是在声称一件我们没查过的事。
     ["绑定名称", st.displayName ? "🌉 " + st.displayName : "名称不可用"],
-    ["绑定级别", st.level === "session"
-      ? "这条工作线单独绑定"
+    // **三种级别，不是两种。**Codex 一条 thread 就是一条 task，
+    // 既不是"项目共用"也不是"会话单独绑" —— 落到 else 分支就会写着
+    // "整个项目共用一个话题"，那句话在 Codex 侧是错的。
+    ["绑定级别", st.level === "session" ? "这条工作线单独绑定"
+      : st.level === "task" ? "这条 task 单独一个话题"
       : "整个项目共用一个话题"],
     ["当前代际", st.activeGeneration === null ? "尚未完成首次认领" : "第 " + st.activeGeneration + " 代"],
     ["入站", st.suspended ? "暂停中，话题里的指令一律被拒"

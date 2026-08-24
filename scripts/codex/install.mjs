@@ -12,10 +12,15 @@ import os from "node:os";
 import path from "node:path";
 import { moduleRoot } from "../direct-run.mjs";
 import { shellQuote } from "../shell-quote.mjs";
+import { buildHookCommand, ownsHookCommand, pickNode } from "./hook-command.mjs";
+import { SKILLS, expectedSkillContent } from "./skill-content.mjs";
 
 import {
   bridgeHome, enableAutoPublishForAllTasks, registryFile,
 } from "./state.mjs";
+import {
+  applyRuntimeSync, codexRuntimeRoot, planRuntimeSync, verifyRuntime,
+} from "../runtime-install.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "../..");
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
@@ -23,32 +28,36 @@ const HOOKS = path.join(CODEX_HOME, "hooks.json");
 const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
 
-const pickNode = () => {
-  for (const file of ["/opt/homebrew/bin/node", "/usr/local/bin/node", process.execPath]) {
-    try { fs.accessSync(file, fs.constants.X_OK); return file; } catch { /* next */ }
-  }
-  return process.execPath;
-};
+
 // 原来这里自带一份同样逻辑的 shellQuote。同一条策略写两遍就会漂 ——
 // 这个仓库今天已经为这类重复付过一次代价（时间格式在两处各写一份，边界收紧了一处、
 // 另一处没跟上）。改用共用实现。Codex 侧的钩子命令一直是正确加引号的，
 // 这次是 Claude 侧向它看齐。
 const node = pickNode();
 const home = bridgeHome();
-const promptScript = path.join(ROOT, "scripts", "codex", "prompt-hook.mjs");
-const stopScript = path.join(ROOT, "scripts", "codex", "stop-hook.mjs");
+// **钩子只认 runtime/current，不再写安装时所在的那个克隆。**
+//
+// 旧写法是 path.join(ROOT, ...)，ROOT 是跑安装器时的仓库路径 —— 于是线上行为
+// 取决于那个目录当时 checkout 到哪。实测过一次代价：线上钩子指向的克隆停在
+// 一天前，落后 main 198 个提交，而没有任何地方会报出来。
+// **根从 CODEX_HOME 推出来，不从 os.homedir() 拼。**
+// CODEX_HOME 本来就是这条链的家目录覆盖点；用 os.homedir() 的话，
+// 只隔离了 CODEX_HOME 的测试会真的往本机装一份运行时 —— 实测发生过。
+const CHAIN = "codex";
+const RUNTIME_ROOT = codexRuntimeRoot(CODEX_HOME);
+const RUNTIME_CURRENT = path.join(RUNTIME_ROOT, "current");
+const promptScript = path.join(RUNTIME_CURRENT, "scripts", "codex", "prompt-hook.mjs");
+const stopScript = path.join(RUNTIME_CURRENT, "scripts", "codex", "stop-hook.mjs");
 const log = path.join(home, "hook.log");
 // 预览和落盘必须共用同一份扫描。原来这里用 loadRegistry 的**过滤视图**计数，
 // 而真正的迁移读的是原始文档 —— 于是预览说"待迁移 1 个"、实际会改 3 个，
 // 因为视图滤掉了 enabled:false 的 task 和 root 形状异常的记录。
 const autoPublishPreview = enableAutoPublishForAllTasks({ home });
+// 运行时计划要在 dry-run 打印之前算好 —— 预览必须说清将要装哪一版。
+const runtimePlan = uninstall ? null : planRuntimeSync({ sourceRoot: ROOT, root: RUNTIME_ROOT });
 const autoPublishMigrationCount = autoPublishPreview.ok ? autoPublishPreview.changed : null;
 
-const hookCommand = (script) =>
-  "if [ -x " + shellQuote(node) + " ] && [ -r " + shellQuote(script) + " ]; then " +
-  "FEISHU_CODEX_BRIDGE_HOME=" + shellQuote(home) + " " + shellQuote(node) + " " + shellQuote(script) + "; " +
-  "else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1; " +
-  "printf '%s hook-unavailable\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> " + shellQuote(log) + " 2>/dev/null || :; fi";
+const hookCommand = (script) => buildHookCommand({ node, script, home, log });
 
 let before = "";
 let hooks = { hooks: {} };
@@ -63,40 +72,40 @@ try {
 }
 hooks.hooks ??= {};
 
+/**
+ * 让某个事件下**恰好只剩一条**我们的 hook，且**只动我们自己那一条 child**。
+ */
 function updateHook(event, script, timeout) {
-  const entries = (hooks.hooks[event] ??= []);
-  const at = entries.findIndex((entry) =>
-    (entry?.hooks ?? []).some((h) => typeof h.command === "string" && h.command.includes(script)));
-  if (uninstall) {
-    if (at >= 0) entries.splice(at, 1);
-    return at >= 0 ? "removed" : "already-absent";
+  const basename = path.basename(script);
+  const entries = hooks.hooks[event] ?? [];
+  let dropped = 0;
+  const kept = [];
+  for (const entry of entries) {
+    const children = (entry?.hooks ?? []).filter((h) => {
+      if (!ownsHookCommand(h?.command, basename)) return true;
+      dropped += 1;
+      return false;
+    });
+    // 同一条 entry 里别人的 hook 必须原样留下；整条都是我们的才丢掉这条。
+    if (children.length > 0) kept.push({ ...entry, hooks: children });
   }
-  const value = { hooks: [{ type: "command", command: hookCommand(script), timeout }] };
-  if (at >= 0) entries[at] = value;
-  else entries.push(value);
-  return at >= 0 ? "updated" : "installed";
+  if (uninstall) {
+    hooks.hooks[event] = kept;
+    return dropped > 0 ? "removed(" + dropped + ")" : "already-absent";
+  }
+  hooks.hooks[event] = [...kept,
+    { hooks: [{ type: "command", command: hookCommand(script), timeout }] }];
+  if (dropped === 0) return "installed";
+  if (dropped === 1) return "updated";
+  return "converged(清掉 " + dropped + " 条，只留 1 条)";
 }
 
 const promptAction = updateHook("UserPromptSubmit", promptScript, 10);
 const stopAction = updateHook("Stop", stopScript, 20);
 
-const skills = [
-  { name: "m5codex-inbound-router", files: ["SKILL.md", "aily-cli-skill.json"] },
-  { name: "codex-longtask-feishu", files: ["SKILL.md"] },
-  { name: "feishu-bind", files: ["SKILL.md"] },
-  { name: "feishu-unbind", files: ["SKILL.md"] },
-  { name: "feishu-status", files: ["SKILL.md"] },
-  { name: "feishu-rotate", files: ["SKILL.md"] },
-  { name: "feishu-mode", files: ["SKILL.md"] },
-];
-// {{SCRIPT:x.mjs}} 由渲染器负责加 shell 引号 —— 引用是渲染器的职责，不是模板作者的记性。
-// 模板里原来写的是 node "{{BRIDGE_ROOT}}/scripts/…"，双引号挡得住空格但挡不住
-// `$`、反引号和反斜杠；单引号才是 POSIX 里唯一完全字面的。
-const renderedSkill = (file) => fs.readFileSync(file, "utf-8")
-  .replaceAll(/\{\{SCRIPT:([A-Za-z0-9_./-]+)\}\}/gu,
-    (_, name) => shellQuote(path.join(ROOT, "scripts", name)))
-  .replaceAll("{{BRIDGE_ROOT}}", ROOT)
-  .replaceAll("{{CODEX_BRIDGE_HOME_SHELL}}", shellQuote(home));
+const skills = SKILLS;
+const renderedSkill = (file, name) => expectedSkillContent({
+  sourceFile: file, name, runtimeCurrent: RUNTIME_CURRENT, bridgeHome: home });
 
 console.log("hooks       " + HOOKS);
 console.log("  UserPromptSubmit → " + promptAction);
@@ -116,6 +125,16 @@ if (!autoPublishPreview.ok) {
     "可运行 scripts/codex/migrate-auto-publish.mjs 单独查看");
 }
 console.log("hook trust  不自动写信任；安装后由用户审阅并确认");
+if (!uninstall) {
+  console.log("运行时      " + RUNTIME_ROOT +
+    (runtimePlan?.ok
+      ? "  → 版本 " + runtimePlan.version.slice(0, 16) +
+        "（" + runtimePlan.files.length + " 个脚本，来源 " + ROOT + "）"
+      : "  → 算不出计划（" + (runtimePlan?.reason ?? "unknown") + "）"));
+}
+// **调度器不在这条命令里。**装了但没启用是默认态，不是某个检查碰巧生效的结果。
+// 评审的裁决：启用要是一条独立命令，否则仍可能误组合。
+console.log("兜底排空    未启用（默认）—— 单独跑 scripts/codex/drain-service.mjs 启用");
 
 if (!apply) {
   console.log("\n[dry-run] 什么都没写。加 --apply 才安装。");
@@ -128,6 +147,26 @@ const writeAtomic = (file, text) => {
   fs.writeFileSync(tmp, text, { mode: 0o600 });
   fs.renameSync(tmp, file);
 };
+
+// **先装运行时，再写钩子。**顺序反了的话，钩子会有一段时间指向还不存在的路径 ——
+// 那期间每一轮 Stop 都走 hook-unavailable 分支，进展静默留在本地。
+if (!uninstall) {
+  if (!runtimePlan?.ok) {
+    console.error("运行时计划算不出来（" + (runtimePlan?.reason ?? "unknown") + "），什么都没装。");
+    process.exit(1);
+  }
+  const synced = applyRuntimeSync(runtimePlan, { root: RUNTIME_ROOT });
+  if (!synced.ok) {
+    console.error("运行时装不上（" + synced.reason + "），钩子没动。");
+    process.exit(1);
+  }
+  const checked = verifyRuntime({ root: RUNTIME_ROOT });
+  if (!checked.ok) {
+    console.error("运行时装完校验不过（" + (checked.reason ?? "drift") + "），钩子没动。");
+    process.exit(1);
+  }
+  console.log("运行时    ：已装 " + runtimePlan.version.slice(0, 16) + " 并校验通过");
+}
 
 const after = JSON.stringify(hooks, null, 2) + "\n";
 if (after !== before) {
@@ -145,8 +184,7 @@ for (const skill of skills) {
   fs.mkdirSync(dst, { recursive: true, mode: 0o700 });
   for (const name of skill.files) {
     const source = path.join(src, name);
-    const content = name === "SKILL.md" ? renderedSkill(source) : fs.readFileSync(source);
-    fs.writeFileSync(path.join(dst, name), content, { mode: 0o600 });
+    fs.writeFileSync(path.join(dst, name), renderedSkill(source, name), { mode: 0o600 });
   }
 }
 

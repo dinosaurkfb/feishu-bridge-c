@@ -11,6 +11,16 @@ import { applySuppressionCore } from "../suppress-outbox-core.mjs";
 import {
   checkArgShape, locateTask, parseArgs as parseCodexSuppressArgs,
 } from "./suppress-outbox.mjs";
+import {
+  absentJob, auditOutbox, classifyBacklog, drainScriptPath, enableBlockers, loadedPhase,
+  plistBody, scanRunnable,
+} from "./drain-service.mjs";
+import { auditSkills } from "./skill-content.mjs";
+import { preflightTask } from "./publish-eligible.mjs";
+import {
+  HOOK_TAG, acceptsHookCommand, buildHookCommand, ownsHookCommand, parseHookCommand, pickNode,
+} from "./hook-command.mjs";
+import { sweepEligible } from "./drain-all.mjs";
 
 import {
   appendEvent, listPending, markPublishEligibleByEventKey, suppressPublishByEventKey,
@@ -67,6 +77,22 @@ import {
 } from "../dialogue-shadow-readiness.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "../..");
+
+/**
+ * **所有测试一律走假的 launchctl，永不读真实控制面。**
+ *
+ * 评审实测：两条回归隔离了 HOME 却没隔离 launchd 域，他那台机器上有同名 job，
+ * 于是同一份代码在我这里 127/127、在他那里 125/127。
+ * 造一个"服务不存在"的假 launchctl 放在这里，任何要查服务状态的测试都用它。
+ */
+const fakeLaunchctlDir = fs.mkdtempSync(path.join(os.tmpdir(), "fake-launchctl-"));
+const FAKE_LAUNCHCTL = path.join(fakeLaunchctlDir, "launchctl");
+fs.writeFileSync(FAKE_LAUNCHCTL,
+  '#!/bin/sh\necho "Could not find service in domain" >&2\nexit 113\n', { mode: 0o755 });
+/** 跑子进程时用的环境：真实 launchd 域一律屏蔽掉。 */
+const isolatedEnv = (extra = {}) => ({
+  ...process.env, FEISHU_BRIDGE_LAUNCHCTL: FAKE_LAUNCHCTL, ...extra,
+});
 const THREAD_A = "01911111-2222-7333-8444-555555555555";
 const THREAD_B = "01922222-3333-7444-8555-666666666666";
 const TEMPLATE = {
@@ -237,7 +263,7 @@ test("Codex feishu-mode 默认只读，只有 --apply 才切换精确 task", () 
   writeRegistry([task], path.join(home, "registry.json"));
   const cli = path.join(ROOT, "scripts", "codex", "feishu-mode.mjs");
   const run = (...args) => spawnSync(process.execPath, [cli, "--thread-id", THREAD_A, ...args], {
-    encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   const read = run();
   assert.equal(read.status, 0, read.stderr);
@@ -338,7 +364,7 @@ test("Codex inbound 进程通道不把结构化诊断或 locator 泄露到 Aily 
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "inbound.mjs")], {
     encoding: "utf-8",
     env: {
-      ...process.env,
+      ...isolatedEnv(),
       FEISHU_CODEX_BRIDGE_HOME: home,
       AILY_CLI_CALLER_AGENT_UID: "agent_not_m5codex",
     },
@@ -543,7 +569,7 @@ test("完整入站链路用引用绑定码在多个 pending 中只绑定目标 t
   const result = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], {
     encoding: "utf-8",
     env: {
-      ...process.env,
+      ...isolatedEnv(),
       PATH: bin + path.delimiter + process.env.PATH,
       FEISHU_CODEX_BRIDGE_HOME: home,
       AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid,
@@ -625,7 +651,7 @@ test("暂停连接会同时关闭入站、Stop 入队和发布资格，恢复时
       session_id: THREAD_A, turn_id: "turn_paused", cwd: root, last_assistant_message: "不应入队",
     }),
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(stop.status, 0, stop.stderr);
   assert.equal(listPending({ outboxDir: taskPaths(task, home).outbox }).length, 0);
@@ -713,9 +739,12 @@ test("Codex adapter 轮转期间旧 session 继续路由，认领后新旧代际
   const status = spawnSync(process.execPath, [
     path.join(ROOT, "scripts", "codex", "feishu-status.mjs"),
     "--thread-id", THREAD_A,
-  ], { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /只读历史代际：1 个.*轮转前受理的结果仍会发回原话题/u);
+  // 迁到四层之后措辞变了，**测的仍是同一件事**：有 1 个只读历史代际。
+  assert.match(status.stdout, /只读历史.*1 个代际/u,
+    "只读历史那条事实必须还在：" + status.stdout);
+  assert.match(status.stdout, /第 3 层 · 精确通道绑定/u, "而且要出现在第 3 层里");
 });
 
 test("Codex registry adapter 原子持久化代际计数，旧登记不会回扫历史", () => {
@@ -796,7 +825,7 @@ test("Codex 轮转 CLI 可显式取消 pending，且完全不调用飞书", () =
     "--apply",
   ], {
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(cancelled.status, 0, cancelled.stderr);
   assert.match(cancelled.stdout, /旧话题仍是唯一 active/u);
@@ -896,7 +925,7 @@ test("bind-task 重跑只续期 active pending，不创建或回复第二个话�
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
     "--project", root, "--thread-id", THREAD_A, "--name", "A", "--apply"], {
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(run.status, 0, run.stderr);
   assert.match(run.stdout, /刷新首次绑定窗口/u);
@@ -932,7 +961,7 @@ test("pending 续期不被超过编辑时限的旧话题标题阻断", () => {
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
     "--project", root, "--thread-id", THREAD_A, "--name", "New", "--apply"], {
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(run.status, 0, run.stderr);
   assert.match(run.stdout, /刷新首次绑定窗口/u);
@@ -952,14 +981,19 @@ test("task 控制脚本不猜 thread，暂停和恢复都不调用飞书", () =>
   delete task.topic_generation_state;
   delete task.channel_generation_id;
   writeRegistry([task], path.join(home, "registry.json"));
-  const env = { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home };
+  const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home };
 
   const status = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"),
     "--thread-id", THREAD_A], { encoding: "utf-8", env });
   assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /已接入飞书/);
-  assert.match(status.stdout, /当前话题代际/u);
-  assert.match(status.stdout, /自动轮转：0 \/ 30 条有效业务消息/u);
+  // 同上：四层里"接入状态"由第 3 层的入站行和绑定名称表达。
+  assert.match(status.stdout, /第 3 层 · 精确通道绑定/u, status.stdout);
+  assert.match(status.stdout, /入站/u);
+  assert.match(status.stdout, /当前代际/u);
+  // 四层里这行在第 4 层，措辞是「0 / 30 条（还剩 30 条）」——
+  // **测的仍是同一件事**：计数 0、阈值 30。
+  assert.match(status.stdout, /自动轮转.*0 \/ 30 条/u, status.stdout);
+  assert.match(status.stdout, /第 4 层 · 交互策略/u);
   assert.equal(status.stdout.includes(THREAD_A), false);
   assert.equal(status.stdout.includes("om_a"), false);
 
@@ -1246,7 +1280,7 @@ test("Stop 与 watcher 并发写同一事件键时只留下一个文件", () => 
     JSON.stringify(process.execPath) + " " + JSON.stringify(worker) + " &").join("\n") + "\nwait\n";
   const run = spawnSync("/bin/sh", ["-c", command], {
     encoding: "utf-8",
-    env: { ...process.env, TEST_OUTBOX: outboxDir },
+    env: { ...isolatedEnv(), TEST_OUTBOX: outboxDir },
   });
   assert.equal(run.status, 0, run.stderr);
   assert.equal(fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json")).length, 1);
@@ -1325,7 +1359,7 @@ test("像控制命令但附带正文时明确提示格式，绝不执行或登�
       prompt: "$feishu-bind 绑到测试群",
     }),
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(r.status, 0, r.stderr);
   const injected = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
@@ -1347,7 +1381,7 @@ test("$feishu-bind 直接注入幂等绑定命令，不再产生二次确认回�
       prompt: "$feishu-bind",
     }),
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(r.status, 0, r.stderr);
   const injected = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
@@ -1370,7 +1404,7 @@ test("/init 只追加初始化成功后的询问，不触发绑定或飞书写�
   const r = spawnSync(process.execPath, [hook], {
     input: JSON.stringify({ session_id: THREAD_A, turn_id: "turn_init", cwd: "/work", prompt: "/init" }),
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(r.status, 0, r.stderr);
   const injected = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
@@ -1394,7 +1428,7 @@ test("Prompt hook 在 Aily/M5Codex 回合只注入数据面命令，不记录 le
     }),
     encoding: "utf-8",
     env: {
-      ...process.env,
+      ...isolatedEnv(),
       FEISHU_CODEX_BRIDGE_HOME: home,
       AILY_CLI_SESSION_ID: "session_feishu",
       AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid,
@@ -1412,7 +1446,7 @@ test("Prompt hook 在 Aily/M5Codex 回合只注入数据面命令，不记录 le
     input: JSON.stringify({ session_id: THREAD_B, prompt: "$feishu-bind" }),
     encoding: "utf-8",
     env: {
-      ...process.env,
+      ...isolatedEnv(),
       FEISHU_CODEX_BRIDGE_HOME: home,
       AILY_CLI_SESSION_ID: "session_feishu",
       AILY_CLI_CALLER_AGENT_UID: "agent_other",
@@ -1450,7 +1484,7 @@ test("目标 codex-run 优先于残留 Aily 环境，明确禁止再次路由", 
     input: JSON.stringify({ session_id: THREAD_A, turn_id: "turn_routed", cwd: "/work", prompt: "/init" }),
     encoding: "utf-8",
     env: {
-      ...process.env,
+      ...isolatedEnv(),
       FEISHU_CODEX_BRIDGE_HOME: home,
       FEISHU_BRIDGE_ROLE: "codex-run",
       AILY_CLI_SESSION_ID: "should_not_route",
@@ -1642,7 +1676,7 @@ printf '%s' "$prompt" > "$last"
     "--log", log, "--stderr", stderr, "--last-message", last, "--exit-receipt", exit,
     "--codex-bin", fake,
   ], { encoding: "utf-8", env: {
-    ...process.env,
+    ...isolatedEnv(),
     EXPECTED_THREAD: THREAD_A,
     ARGS_OUT: argsOut,
     ENV_OUT: envOut,
@@ -1675,7 +1709,7 @@ test("Codex Stop hook：相同正文的两个 turn 各入队一次，同一 turn
   const run = (turn) => spawnSync(process.execPath, [hook], {
     input: JSON.stringify({ session_id: THREAD_A, turn_id: turn, cwd: root, last_assistant_message: "一样" }),
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(run("turn-1").status, 0);
   assert.equal(run("turn-2").status, 0);
@@ -1692,7 +1726,7 @@ test("Codex UserPromptSubmit 与 Stop 按 turn_id 配对本地输入，入站 ru
   writeRegistry([task], path.join(home, "registry.json"));
   const promptHook = path.join(ROOT, "scripts", "codex", "prompt-hook.mjs");
   const stopHook = path.join(ROOT, "scripts", "codex", "stop-hook.mjs");
-  const env = { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home };
+  const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home };
 
   const submitted = spawnSync(process.execPath, [promptHook], {
     input: JSON.stringify({
@@ -1742,7 +1776,7 @@ test("Codex Stop hook 自动发布本地回合，并保留旧的非 eligible 积
       session_id: THREAD_A, turn_id: "turn-auto", cwd: root, last_assistant_message: "新答复",
     }),
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /已自动发布到绑定话题/u);
@@ -1775,7 +1809,7 @@ test("关闭自动发布时 watcher 只把严格完成的最终答复兜底入�
   fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "watcher final");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
-  ], { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(listPending({ outboxDir: paths.outbox }).length, 1);
   assert.equal(fs.existsSync(paths.sessionLock), false);
@@ -1810,7 +1844,7 @@ test("Codex watcher 严格完成后释放 Dialogue 活动回合", () => {
   fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "dialogue final");
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
-  ], { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   assert.equal(run.status, 0, run.stderr);
   const after = loadRegistry(path.join(home, "registry.json")).tasks[0];
   assert.equal(interactionPolicyForTask(after).state.dialogue.active_turn, null);
@@ -1844,7 +1878,7 @@ test("watcher 抑制递归产生的错误答复，只保留风险回执", () => 
   fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "EPERM stack");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
-  ], { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   assert.equal(r.status, 1, r.stderr);
   const pending = listPending({ outboxDir: paths.outbox });
   assert.equal(pending.length, 1);
@@ -1872,7 +1906,7 @@ test("watcher 对启动前 Git 预检失败给出真实且脱敏的风险回执"
     "Not inside a trusted directory and --skip-git-repo-check was not specified. secret-token\n");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
-  ], { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   assert.equal(r.status, 1, r.stderr);
   const pending = listPending({ outboxDir: paths.outbox });
   assert.equal(pending.length, 1);
@@ -1887,7 +1921,7 @@ test("安装器默认 dry-run，不创建 hooks 或状态", () => {
   const home = path.join(dir, "bridge-home");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs")], {
     encoding: "utf-8",
-    env: { ...process.env, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /dry-run/);
@@ -1910,7 +1944,7 @@ test("安装器在隔离 HOME 只追加 hooks、渲染技能路径且保留已�
   writeRegistry([legacyTask], path.join(home, "registry.json"));
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
     encoding: "utf-8",
-    env: { ...process.env, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(r.status, 0, r.stderr);
   const hooks = JSON.parse(fs.readFileSync(path.join(codexHome, "hooks.json"), "utf-8"));
@@ -1920,7 +1954,12 @@ test("安装器在隔离 HOME 只追加 hooks、渲染技能路径且保留已�
   const skill = fs.readFileSync(path.join(codexHome, "skills", "m5codex-inbound-router", "SKILL.md"), "utf-8");
   assert.equal(skill.includes("{{BRIDGE_ROOT}}"), false);
   assert.equal(skill.includes("{{CODEX_BRIDGE_HOME_SHELL}}"), false);
-  assert.equal(skill.includes(ROOT), true);
+  // **技能里不许再出现开发克隆路径。**上一版这里断言的正好相反（includes(ROOT)）——
+  // 那是在把"技能指向安装者的工作目录"钉成契约。现在钉的是 runtime/current。
+  assert.equal(skill.includes(ROOT), false,
+    "技能里不许嵌开发克隆路径 —— 那个目录一 checkout，线上行为就变了");
+  assert.ok(skill.includes(path.join(codexHome, "feishu-bridge", "runtime", "current")),
+    "技能必须指向 runtime/current：" + skill.slice(0, 200));
   assert.equal(skill.includes("FEISHU_CODEX_BRIDGE_HOME='" + home + "'"), true);
   assert.equal(skill.includes("待绑定话题或已绑定话题"), true);
   const controlSkill = fs.readFileSync(path.join(codexHome, "skills", "codex-longtask-feishu", "SKILL.md"), "utf-8");
@@ -1949,7 +1988,7 @@ test("入站前置回执目录不可写时只返回脱敏错误，不泄露 Node
   fs.writeFileSync(blockedHome, "blocked");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "inbound.mjs")], {
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: blockedHome },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: blockedHome },
   });
   assert.equal(r.status, 1);
   assert.match(r.stdout, /系统错误/u);
@@ -2134,7 +2173,7 @@ test("登记表不可读时，安装器要在 dry-run 退出之前就说出来",
   fs.writeFileSync(path.join(home, "registry.json"), "{ 坏掉的 json");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs")], {
     encoding: "utf-8",
-    env: { ...process.env, CODEX_HOME: path.join(dir, "codex-home"), FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), CODEX_HOME: path.join(dir, "codex-home"), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(r.status, 0, r.stderr);
   const beforeExit = r.stdout.slice(0, r.stdout.indexOf("[dry-run]"));
@@ -2159,7 +2198,7 @@ test("安装器预览的待迁移数必须等于实际会改的数", () => {
   }));
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs")], {
     encoding: "utf-8",
-    env: { ...process.env, CODEX_HOME: path.join(dir, "codex-home"), FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), CODEX_HOME: path.join(dir, "codex-home"), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /待迁移 3 个 task/u, "预览报的数是过滤视图的话这里会是 1");
@@ -2259,7 +2298,7 @@ test("bind-task 显式跨群 apply 把根消息发到目标群并登记该 task 
     "--chat-name", "智能体进化",
     "--apply"], {
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home, FAKE_CALLS_FILE: calls },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home, FAKE_CALLS_FILE: calls },
   });
   assert.equal(run.status, 0, run.stderr);
   assert.match(run.stdout, /群\s+智能体进化/u);
@@ -2382,35 +2421,49 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
     lark_cli_bin: path.join(bin, "lark-cli"),
   }));
   writeRegistry([], path.join(home, "registry.json"));
-  fs.writeFileSync(path.join(codexHome, "hooks.json"), JSON.stringify({
-    hooks: {
-      UserPromptSubmit: [{ hooks: [{ command: "node " + path.join(ROOT, "scripts", "codex", "prompt-hook.mjs") }] }],
-      Stop: [{ hooks: [{ command: "node " + path.join(ROOT, "scripts", "codex", "stop-hook.mjs") }] }],
-    },
-  }));
-  for (const name of ["m5codex-inbound-router", "codex-longtask-feishu", "feishu-bind", "feishu-unbind", "feishu-status", "feishu-rotate", "feishu-mode"]) {
-    const skillDir = path.join(codexHome, "skills", name);
-    fs.mkdirSync(skillDir, { recursive: true });
-    fs.writeFileSync(path.join(skillDir, "SKILL.md"), "---\nname: " + name + "\n---\n");
-  }
+  // **"健康"就是安装器装出来的样子 —— 由安装器自己构造，不手写。**
+  //
+  // 上一版这里手写 hooks 指向 ROOT（开发克隆）、手写空壳技能。那份夹具描述的是
+  // 一个 doctor 认得、但安装器从来不会产出的状态；判据一改它就得跟着改，
+  // 而"跟着改"的时候很容易把 doctor 改松了去迁就夹具。
+  // 现在两者绑在一起：安装器和 doctor 谁跑偏，这条都会红。
+  const installed = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
+      encoding: "utf-8",
+      env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+    });
+  assert.equal(installed.status, 0, "夹具依赖安装器成功：" + installed.stderr);
 
   const run = () => spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "doctor.mjs"), "--json"], {
     encoding: "utf-8",
     env: {
-      ...process.env,
+      ...isolatedEnv(),
       PATH: bin + path.delimiter + (process.env.PATH ?? ""),
       CODEX_HOME: codexHome,
       FEISHU_CODEX_BRIDGE_HOME: home,
     },
   });
-  const healthy = run();
-  assert.equal(healthy.status, 0, healthy.stderr);
-  assert.equal(JSON.parse(healthy.stdout).ready, true);
+  // **装好之后不是 ready，是 incomplete。**hook 信任本地查不到，
+  // 调度器默认没启用 —— 两件都不是故障，但也都不是"可以不管了"。
+  // 上一版这里断言 ready:true，等于把"查不清"钉成了"通过"。
+  const healthy = JSON.parse(run().stdout);
+  assert.equal(healthy.overall, "incomplete",
+    "全新装好 = 没有故障、但还差人确认：" + JSON.stringify(healthy.checks));
+  assert.equal(healthy.ready, false, "ready 只能在全 true 时成立");
+  assert.equal(healthy.checks.some((c) => c.ok === false), false,
+    "**一条真故障都不该有** —— incomplete 是因为有 null，不是因为有 false");
+  assert.ok(healthy.checks.some((c) => c.ok === null), "确实存在查不清的项");
+  // 查不清的那几项要出现在待办里，不能被藏起来。
+  assert.ok(healthy.next.some((n) => /hooks/u.test(n)),
+    "hook 信任那条必须出现在下一步里：" + JSON.stringify(healthy.next));
+  assert.equal(run().status, 1, "incomplete 也非零退出 —— 当成功就没人去做那一步");
 
   fs.rmSync(path.join(codexHome, "skills", "feishu-status"), { recursive: true });
   const broken = run();
   assert.equal(broken.status, 1);
-  assert.equal(JSON.parse(broken.stdout).ready, false);
+  const brokenJson = JSON.parse(broken.stdout);
+  assert.equal(brokenJson.ready, false);
+  assert.equal(brokenJson.overall, "blocked", "**真故障要和「查不清」分得开**");
 });
 
 test("Codex 测试文件里没有写在汇总之后的 test()", () => {
@@ -2536,7 +2589,7 @@ test("Codex 真实 CLI：缺 expectation / 纯空白 / 代际不可读，都不�
   const cliPath = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
   const run = (home, ...args) => spawnSync(process.execPath,
     [cliPath, "--thread-id", THREAD_A, ...args],
-    { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   const untouched = (rec) =>
     JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at;
 
@@ -2607,7 +2660,7 @@ test("Codex 抑制命令：真实入口 —— 预览后轮转必须 rotated 且
 
   const cli = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
   const run = (...args) => spawnSync(process.execPath, [cli, "--thread-id", THREAD_A, ...args],
-    { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   const suppressed = () => JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at;
 
   // 预览：能看到那一条。
@@ -2695,7 +2748,7 @@ test("Codex 预览和 --apply 不许给出相反结论：损坏记录在预览�
   const cliPath = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
   const run = (...args) => spawnSync(process.execPath,
     [cliPath, "--thread-id", THREAD_A, ...args],
-    { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
 
   const preview = run("--all-generations");
   assert.match(preview.stdout, /目标代际是坏的/u, "预览就要点名损坏");
@@ -2738,6 +2791,1139 @@ test("锁内重读要重判损坏：文件名一个没变，目标字段变坏�
   assert.equal(got.atRecheck, true, "要说清是锁内重判时发现的，不是锁外那一次");
   assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
     "**零抑制** —— 说不清该发去哪，就不能替它决定不发");
+});
+
+test("安装器只许写进 CODEX_HOME —— 真机的 ~/.codex 一个字节都不许碰", () => {
+  // **这条守的是一次实测事故。**新代码用 os.homedir() 算运行时根，而这套测试
+  // 只隔离了 CODEX_HOME —— 于是跑一次测试就往真机装了 3.7M 的运行时。
+  // 这个仓库为"测试污染真机"付过三次代价，那是第四次。
+  //
+  // 根因不是"某条测试忘了隔离"，是**隔离点没接到实现里**。所以守卫也不能是
+  // "记得设 HOME"，而必须是：给了 CODEX_HOME，就一个字节都不许落在它外面。
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  const home = path.join(dir, "bridge-home");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
+  writeRegistry([], path.join(home, "registry.json"));
+
+  // 真机上那个位置现在是什么样，记下来。
+  const realCodexRuntime = path.join(os.homedir(), ".codex", "feishu-bridge", "runtime");
+  const before = fs.existsSync(realCodexRuntime)
+    ? fs.readdirSync(realCodexRuntime).sort().join(",") : "<不存在>";
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
+      encoding: "utf-8",
+      env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+    });
+  assert.equal(r.status, 0, r.stderr);
+
+  // 该装的地方装了。
+  assert.equal(fs.existsSync(path.join(codexHome, "feishu-bridge", "runtime", "current")), true,
+    "运行时必须落在 CODEX_HOME 下");
+
+  // **不该动的地方一个字节没动。**
+  const after = fs.existsSync(realCodexRuntime)
+    ? fs.readdirSync(realCodexRuntime).sort().join(",") : "<不存在>";
+  assert.equal(after, before,
+    "给了 CODEX_HOME 还往真机写 —— 这正是那次污染的形状");
+});
+
+test("迁移必须收敛旧克隆的 hook，而不是在旁边再加一条", () => {
+  // **迁移最容易办坏的就是这一步。**旧写法按完整路径找已有条目：
+  // 路径从开发克隆换成 runtime/current 的那一刻就匹配不上，
+  // 于是新增而不是替换 —— 指向旧克隆的那条原地不动。
+  // Codex 文档说多个匹配的 hook 会全部运行，等于新旧两份代码同时在跑。
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  const home = path.join(dir, "bridge-home");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
+  writeRegistry([], path.join(home, "registry.json"));
+
+  // **夹具必须是现场真正的形状。**线上那两条是安装器当初生成的完整模板
+  //（我核对过真机的 ~/.codex/hooks.json）。造一条裸的 `node <path>` 去测，
+  // 测的就是另一件事 —— 严格解析本来就不该认领那种。
+  const legacy = (script) =>
+    "if [ -x '/opt/homebrew/bin/node' ] && [ -r '" + script + "' ]; then " +
+    "FEISHU_CODEX_BRIDGE_HOME='/Users/someone/.codex/feishu-bridge' " +
+    "'/opt/homebrew/bin/node' '" + script + "'; " +
+    "else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1; " +
+    "printf '%s hook-unavailable\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> " +
+    "'/Users/someone/.codex/feishu-bridge/hook.log' 2>/dev/null || :; fi";
+  const clone = "/Users/someone/codex-projects/old-clone/scripts/codex/";
+  fs.writeFileSync(path.join(codexHome, "hooks.json"), JSON.stringify({
+    hooks: {
+      UserPromptSubmit: [{ hooks: [
+        { type: "command", command: legacy(clone + "prompt-hook.mjs") },
+      ] }],
+      Stop: [
+        // **同一条 entry 里既有我们的、又有别人的** —— 按 entry 整条删就会
+        // 把别人那条一起删掉，而且删得很安静。
+        { hooks: [
+          { type: "command", command: "别人的 hook，不许动" },
+          { type: "command", command: legacy(clone + "stop-hook.mjs") },
+        ] },
+        // 长得像、但不是我们的：guard 检查的脚本和实际执行的不是同一个。
+        { hooks: [{ type: "command", command:
+          "if [ -x '/opt/homebrew/bin/node' ] && [ -r '/x/stop-hook.mjs' ]; then " +
+          "FEISHU_CODEX_BRIDGE_HOME='/y' '/opt/homebrew/bin/node' '/z/stop-hook.mjs'; " +
+          "else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1; " }] },
+      ],
+    },
+  }));
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
+      encoding: "utf-8",
+      env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+    });
+  assert.equal(r.status, 0, r.stderr);
+
+  const hooks = JSON.parse(fs.readFileSync(path.join(codexHome, "hooks.json"), "utf-8"));
+  const commands = (event) => (hooks.hooks[event] ?? [])
+    .flatMap((e) => (e.hooks ?? []).map((h) => h.command));
+
+  // 旧克隆路径必须一个不剩。
+  const all = JSON.stringify(hooks);
+  assert.equal(all.includes("old-clone"), false,
+    "**旧克隆的 hook 必须被收掉，不是留在旁边**：" + all);
+
+  // 我们的 hook 各恰好一条。
+  const mine = (event, basename) =>
+    commands(event).filter((c) => c.includes("scripts/codex/" + basename));
+  assert.equal(mine("UserPromptSubmit", "prompt-hook.mjs").length, 1, "恰好 1 条");
+  assert.equal(mine("Stop", "stop-hook.mjs").length, 1, "恰好 1 条");
+
+  // 而且指向 runtime/current。
+  const expected = path.join(codexHome, "feishu-bridge", "runtime", "current",
+    "scripts", "codex", "stop-hook.mjs");
+  assert.ok(mine("Stop", "stop-hook.mjs")[0].includes(expected),
+    "必须指向 runtime/current：" + mine("Stop", "stop-hook.mjs")[0]);
+
+  // **别人的 hook 一条都不许动。**
+  assert.ok(commands("Stop").includes("别人的 hook，不许动"),
+    "**同一条 entry 里别人的 hook 必须原样留下** —— 按 entry 整条删会把它一起带走");
+  assert.ok(commands("Stop").some((c) => c.includes("/z/stop-hook.mjs")),
+    "长得像但 guard 与执行的脚本对不上的，不是我们的，不许碰");
+});
+
+test("装好的 runtime 必须能自证 —— doctor 在自己的运行环境里不许失灵", () => {
+  // 评审实测：runtime 只收 scripts/**\/*.mjs，技能源模板进不去；
+  // 从 runtime/current 跑 doctor，8 个技能文件全部报"源模板读不出来"——
+  // **唯一的验收工具在它自己的运行环境里失灵。**
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const codexHome = path.join(dir, "codex");
+  const bridge = path.join(dir, "bridge");
+  const bin = path.join(dir, "bin");
+  for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
+  for (const n of ["codex", "aily-cli", "lark-cli"]) {
+    fs.writeFileSync(path.join(bin, n), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  }
+  writeRegistry([], path.join(bridge, "registry.json"));
+  fs.writeFileSync(path.join(bridge, "chain-config.json"),
+    JSON.stringify({ ...TEMPLATE, lark_cli_bin: path.join(bin, "lark-cli") }));
+  const env = { ...isolatedEnv(), HOME: fakeHome, CODEX_HOME: codexHome,
+    FEISHU_CODEX_BRIDGE_HOME: bridge, PATH: bin + path.delimiter + process.env.PATH };
+
+  assert.equal(spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", env }).status, 0);
+
+  // **从装好的 runtime 里跑**，不是从仓库里跑。
+  const installedDoctor = path.join(codexHome, "feishu-bridge", "runtime", "current",
+    "scripts", "codex", "doctor.mjs");
+  assert.equal(fs.existsSync(installedDoctor), true, "doctor 要在 runtime 里");
+  const r = spawnSync(process.execPath, [installedDoctor, "--json"], { encoding: "utf-8", env });
+  const report = JSON.parse(r.stdout);
+  const skills = report.checks.find((c) => c.name === "Codex skills");
+  assert.equal(skills.ok, true,
+    "**runtime 里的 doctor 必须能核验技能**：" + skills.detail);
+  assert.doesNotMatch(skills.detail, /源模板读不出来/u);
+  const hooks = report.checks.find((c) => c.name === "Codex hooks");
+  assert.equal(hooks.ok, true, hooks.detail);
+  // 一条真故障都不该有；只剩"查不清"的项。
+  assert.equal(report.checks.filter((c) => c.ok === false).length, 0,
+    "装完之后不该有故障：" + JSON.stringify(report.checks.filter((c) => c.ok === false)));
+  assert.equal(report.overall, "incomplete");
+});
+
+test("lark_cli_bin 指到目录不算可执行 —— X_OK 对目录也成立", () => {
+  // 评审实测：目录的"可执行"是"可进入"，accessSync(X_OK) 通过、isFile 是 false。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "abc123" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const aDir = path.join(home, "adir");
+  fs.mkdirSync(aDir);
+  const t = JSON.parse(JSON.stringify(TEMPLATE));
+  t.lark_cli_bin = aDir;
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(t));
+  const r = preflightTask({ task, home });
+  assert.equal(r.ok, false, "**目录不是可执行文件**");
+  assert.equal(r.reason, "lark_cli_not_a_file");
+});
+
+test("三态要校验字段类型 —— 畸形 published_at 不许被当成已发布藏起来", () => {
+  // 评审实测：published_at 放 false / 0 / {} / "" 时，上一版全当"已发布"静默跳过，
+  // 结果 ok:true, pending:0, unclassified:[] —— **一批损坏记录被永久藏起来，
+  // 门槛还照样放行。**
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-strict-"));
+  const put = (name, rec) => fs.writeFileSync(path.join(dir, name), JSON.stringify(rec));
+  for (const [i, bad] of [false, 0, {}, "", [], true].entries()) {
+    put("bad" + i + ".json", { published_at: bad });
+  }
+  put("ok-pending.json", { published_at: null });
+  put("ok-published.json", { published_at: "2026-08-24T00:00:00.000Z" });
+  put("ok-suppressed.json", { published_at: null, publish_suppressed_at: "2026-08-24T00:00:00.000Z" });
+  // suppressed 字段本身畸形也要拦。
+  put("bad-sup.json", { published_at: null, publish_suppressed_at: 7 });
+  put("bad-sup2.json", { published_at: null, publish_suppressed_at: "" });
+
+  const a = auditOutbox(dir);
+  assert.equal(a.ok, true);
+  assert.equal(a.pending, 1, "只有一条真待发");
+  assert.equal(a.unclassified.length, 8,
+    "**6 条畸形 published_at + 2 条畸形 suppressed 都要点出来**：" +
+    JSON.stringify(a.unclassified.map((u) => u.file)));
+});
+
+test("停用：卸载失败不许删 plist —— 还在跑的定时器不能被显示成「未启用」", () => {
+  // 评审实测：上一版是"卸载失败也照删 plist"。后果有两层 ——
+  // 旧 job 可能还在跑，而 plist 一删，下次查状态就报 absent。
+  // **一个还在跑的定时器被显示成「未启用」，比报错更糟。**
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const codexHome = path.join(dir, "codex");
+  const bridge = path.join(dir, "bridge");
+  const bin = path.join(dir, "bin");
+  for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));
+  // 假 launchctl：list 说有、bootout 失败（不是"没有这个服务"）。
+  fs.writeFileSync(path.join(bin, "launchctl"),
+    '#!/bin/sh\ncase "$1" in\n' +
+    '  list) echo \'{ "Program" = "/x"; "ProgramArguments" = ( "/x"; ); };\'; exit 0;;\n' +
+    '  bootout) echo "Boot-out failed: 5: Input/output error" >&2; exit 5;;\nesac\nexit 0\n',
+    { mode: 0o700 });
+  const agents = path.join(fakeHome, "Library", "LaunchAgents");
+  fs.mkdirSync(agents, { recursive: true });
+  const plist = path.join(agents, "com.frank.feishu-bridge-codex.drain.plist");
+  fs.writeFileSync(plist, "<plist/>");
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--disable", "--apply"],
+    { encoding: "utf-8", env: isolatedEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
+      FEISHU_CODEX_BRIDGE_HOME: bridge,
+      // **这条测的就是"卸载失败"**，要用自己那份会失败的假 launchctl，
+      // 不是全局那份"服务不存在"的。
+      FEISHU_BRIDGE_LAUNCHCTL: path.join(bin, "launchctl"),
+      PATH: bin + path.delimiter + process.env.PATH }) });
+
+  assert.notEqual(r.status, 0, "卸载失败必须非零退出：" + r.stdout);
+  assert.equal(fs.existsSync(plist), true, "**plist 不许被删**");
+  assert.match(r.stderr, /卸载失败/u);
+});
+
+test("时间串走规范校验 —— 纯空白和乱写的都不算合法状态", () => {
+  // 评审：上一版只要"非空字符串"就算合法时间，于是纯空白、"abc"、"2026-13-45"
+  // 都被当成合法状态，损坏记录又被藏起来。改用全仓统一的 isCanonicalIso。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-time-"));
+  const put = (n, rec) => fs.writeFileSync(path.join(dir, n), JSON.stringify(rec));
+  for (const [i, bad] of ["   ", "abc", "2026-13-45T99:99:99.000Z",
+    "2026-08-24T00:00:00Z"].entries()) {
+    put("p" + i + ".json", { published_at: bad });
+    put("s" + i + ".json", { published_at: null, publish_suppressed_at: bad });
+  }
+  put("good-p.json", { published_at: "2026-08-24T00:00:00.000Z" });
+  put("good-s.json", { published_at: null, publish_suppressed_at: "2026-08-24T00:00:00.000Z" });
+
+  const a = auditOutbox(dir);
+  assert.equal(a.pending, 0);
+  assert.equal(a.unclassified.length, 8,
+    "**8 条伪时间串都要被点出来**：" + JSON.stringify(a.unclassified.map((u) => u.file)));
+  // 缺毫秒的那种也不算 —— 产品写的是 toISOString()，判据就该按它来。
+  assert.ok(a.unclassified.some((u) => u.file === "p3.json"),
+    "缺毫秒的 ISO 串不是规范时间");
+});
+
+test("启用必须 fail-closed：launchd 查不出来时，只许一次只读 list", () => {
+  // 评审指出：unverifiable 那道门槛**没有测试钉着** —— 单独删掉它，
+  // 整套仍然 135/135 全绿。产品行为当时是对的，但"对"没有守卫就守不住。
+  //
+  // 这条断言的是**控制面只被读、没被改**：一次 list，零 bootout、零 bootstrap，
+  // plist 逐字节不变。
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const codexHome = path.join(dir, "codex");
+  const bridge = path.join(dir, "bridge");
+  const bin = path.join(dir, "bin");
+  for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));
+  fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  const marker = path.join(dir, "CALLED");
+  const lc = path.join(bin, "launchctl");
+  // list 返回**看不懂的东西** → 拆不出 ProgramArguments → unverifiable。
+  fs.writeFileSync(lc, '#!/bin/sh\necho "$@" >> ' + JSON.stringify(marker) +
+    '\ncase "$1" in\n  list) echo "看不懂的输出"; exit 0;;\nesac\nexit 0\n', { mode: 0o755 });
+
+  const env = isolatedEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
+    FEISHU_CODEX_BRIDGE_HOME: bridge, FEISHU_BRIDGE_LAUNCHCTL: lc });
+  assert.equal(spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", env }).status, 0);
+
+  // 写一份**合法且与当前配置一致**的 plist —— 这样 phase 只可能由 launchd 那步决定。
+  const agents = path.join(fakeHome, "Library", "LaunchAgents");
+  fs.mkdirSync(agents, { recursive: true });
+  const plist = path.join(agents, "com.frank.feishu-bridge-codex.drain.plist");
+  fs.writeFileSync(plist, plistBody({ home: fakeHome, codexHome }));
+  const before = fs.readFileSync(plist);
+  fs.rmSync(marker, { force: true });
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--enable", "--apply"],
+    { encoding: "utf-8", env });
+
+  assert.notEqual(r.status, 0, "查不出来就必须拒绝：" + r.stdout);
+  assert.match(r.stderr, /launchd 状态查不出来/u, "要说清拒绝的原因");
+  assert.match(r.stderr, /什么都没动/u);
+
+  const calls = fs.existsSync(marker)
+    ? fs.readFileSync(marker, "utf-8").trim().split("\n").filter(Boolean) : [];
+  assert.equal(calls.length, 1, "**只许一次调用**（只读的 list）：" + JSON.stringify(calls));
+  assert.match(calls[0], /^list /u, "那一次必须是只读的 list");
+  assert.equal(calls.some((c) => /^(bootout|bootstrap)/u.test(c)), false,
+    "**控制面一次都不许被改**");
+  assert.deepEqual(fs.readFileSync(plist), before, "plist 逐字节不许变");
+});
+
+test("已经在健康运行时，重跑 --enable 是无操作 —— 不许打断正在进行的排空", () => {
+  // 评审的非阻断建议，我当成安全问题做了：无条件 bootout → bootstrap
+  // **可能打断一次正在进行的排空**。幂等重跑不该有副作用。
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const codexHome = path.join(dir, "codex");
+  const bridge = path.join(dir, "bridge");
+  const bin = path.join(dir, "bin");
+  for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));
+  fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  const marker = path.join(dir, "CALLED");
+  const lc = path.join(bin, "launchctl");
+  const expectScript = path.join(codexHome, "feishu-bridge", "runtime", "current",
+    "scripts", "codex", "drain-all.mjs");
+  // **用产品同一个函数挑 node，不自己猜。**猜错的话这条测的就成了"路径不一致"，
+  // 而不是"健康在跑时不该动手"。
+  const node = pickNode();
+  // list 报告"正在跑，而且参数就是当前这份"。
+  fs.writeFileSync(lc, '#!/bin/sh\necho "$@" >> ' + JSON.stringify(marker) +
+    '\ncase "$1" in\n  list) printf \'{\\n\\t"Program" = "%s";\\n\\t"ProgramArguments" = (\\n\\t\\t"%s";\\n\\t\\t"%s";\\n\\t);\\n};\\n\' ' +
+    JSON.stringify(node) + ' ' + JSON.stringify(node) + ' ' + JSON.stringify(expectScript) +
+    '; exit 0;;\nesac\nexit 0\n', { mode: 0o755 });
+
+  const env = isolatedEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
+    FEISHU_CODEX_BRIDGE_HOME: bridge, FEISHU_BRIDGE_LAUNCHCTL: lc });
+  assert.equal(spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", env }).status, 0);
+  const agents = path.join(fakeHome, "Library", "LaunchAgents");
+  fs.mkdirSync(agents, { recursive: true });
+  const plist = path.join(agents, "com.frank.feishu-bridge-codex.drain.plist");
+  fs.writeFileSync(plist, plistBody({ home: fakeHome, codexHome, node }));
+  const before = fs.readFileSync(plist);
+  fs.rmSync(marker, { force: true });
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--enable", "--apply"],
+    { encoding: "utf-8", env });
+
+  assert.equal(r.status, 0,
+    "健康在跑时重跑应当成功且无操作：" + r.stdout + r.stderr);
+  assert.match(r.stdout, /什么都没做/u);
+  const calls = fs.existsSync(marker)
+    ? fs.readFileSync(marker, "utf-8").trim().split("\n").filter(Boolean) : [];
+  assert.equal(calls.some((c) => /^(bootout|bootstrap)/u.test(c)), false,
+    "**不许 bootout/bootstrap** —— 那会打断正在进行的排空：" + JSON.stringify(calls));
+  assert.deepEqual(fs.readFileSync(plist), before, "plist 也不许被重写");
+});
+
+test("启用必须 fail-closed：plist 读不出来时，launchctl 一次都不许被调用", () => {
+  // 评审实测：上一版启用路径先 bootout、再写盘才抛 EISDIR ——
+  // **退出码是 1，可 launchd 控制面已经被动过**。
+  // 报错报对了、事情办坏了，跟停用那条是同一种病。
+  //
+  // 所以这条断言的不是"退出码非零"，而是**它一次都没碰过控制面**。
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const codexHome = path.join(dir, "codex");
+  const bridge = path.join(dir, "bridge");
+  const bin = path.join(dir, "bin");
+  for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));
+  fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  // 记账用的假 launchctl：**被调用一次就留痕**。
+  const marker = path.join(dir, "CALLED");
+  const lc = path.join(bin, "launchctl");
+  fs.writeFileSync(lc, '#!/bin/sh\necho "$@" >> ' + JSON.stringify(marker) +
+    '\necho "Could not find service" >&2\nexit 113\n', { mode: 0o755 });
+
+  // **把 plist 路径做成目录** → 读它 EISDIR。
+  const agents = path.join(fakeHome, "Library", "LaunchAgents");
+  fs.mkdirSync(agents, { recursive: true });
+  const plistPathAsDir = path.join(agents, "com.frank.feishu-bridge-codex.drain.plist");
+  fs.mkdirSync(plistPathAsDir);
+
+  const env = isolatedEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
+    FEISHU_CODEX_BRIDGE_HOME: bridge, FEISHU_BRIDGE_LAUNCHCTL: lc });
+  // 先把运行时装好，免得卡在运行时那道门槛上、测不到我们要测的东西。
+  assert.equal(spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", env }).status, 0);
+  // 安装本身不该碰 launchctl；从这里开始计数。
+  fs.rmSync(marker, { force: true });
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--enable", "--apply"],
+    { encoding: "utf-8", env });
+
+  assert.notEqual(r.status, 0, "必须拒绝：" + r.stdout);
+  assert.match(r.stderr, /plist 读不出来/u, "要说清拒绝的原因");
+  assert.match(r.stderr, /什么都没动/u);
+  assert.equal(fs.existsSync(marker), false,
+    "**launchctl 一次都不许被调用** —— 调用过就说明拒绝发生在动手之后：" +
+    (fs.existsSync(marker) ? fs.readFileSync(marker, "utf-8") : ""));
+  // 现场保持原样：还是一个目录，不是被写成了文件。
+  assert.equal(fs.statSync(plistPathAsDir).isDirectory(), true,
+    "plist 路径的类型都不许被改");
+});
+
+test("plist 读不出来不许当成「未启用」", () => {
+  // 评审实测：把 plist 路径做成目录，状态仍显示"未启用"，
+  // 停用命令还会说"本来就没启用"。**读不出来不等于没有** ——
+  // 这条道理我在登记表、outbox 上都写过，这是第三处。
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const bridge = path.join(dir, "bridge");
+  fs.mkdirSync(bridge, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));
+  const agents = path.join(fakeHome, "Library", "LaunchAgents");
+  fs.mkdirSync(agents, { recursive: true });
+  // **把 plist 路径做成目录** → 读它会 EISDIR。
+  fs.mkdirSync(path.join(agents, "com.frank.feishu-bridge-codex.drain.plist"));
+
+  const env = isolatedEnv({ HOME: fakeHome, CODEX_HOME: path.join(dir, "codex"),
+    FEISHU_CODEX_BRIDGE_HOME: bridge });
+  const status = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs")], { encoding: "utf-8", env });
+  assert.doesNotMatch(status.stdout, /未启用（安装后的默认态/u,
+    "**不许报成未启用**：" + status.stdout);
+  assert.match(status.stdout, /plist 读不出来/u);
+
+  // 停用也必须拒绝，而不是说"本来就没启用"。
+  const off = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--disable", "--apply"],
+    { encoding: "utf-8", env });
+  assert.notEqual(off.status, 0, "读不出来就不许当成没启用：" + off.stdout);
+  assert.doesNotMatch(off.stdout, /本来就没启用/u);
+});
+
+test("停用的顺序：核验没过时 plist 一个字节都不许动", () => {
+  // 评审实测：上一版先删 plist 再核验。bootout 返回成功但 job 仍在时，
+  // 命令确实非零退出了，**可现场已经被改成 orphan** —— plist 没了、job 还在，
+  // 比动手之前更糟。
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const bridge = path.join(dir, "bridge");
+  const bin = path.join(dir, "bin");
+  fs.mkdirSync(bridge, { recursive: true });
+  fs.mkdirSync(bin, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));
+  const agents = path.join(fakeHome, "Library", "LaunchAgents");
+  fs.mkdirSync(agents, { recursive: true });
+  const plist = path.join(agents, "com.frank.feishu-bridge-codex.drain.plist");
+  fs.writeFileSync(plist, "<plist/>");
+  const before = fs.readFileSync(plist, "utf-8");
+
+  // 假 launchctl：bootout 成功，但 list 始终说 job 还在。
+  const lc = path.join(bin, "launchctl");
+  fs.writeFileSync(lc, '#!/bin/sh\ncase "$1" in\n' +
+    '  list) echo \'{ "Program" = "/x"; "ProgramArguments" = ( "/x"; ); };\'; exit 0;;\n' +
+    'esac\nexit 0\n', { mode: 0o755 });
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--disable", "--apply"],
+    { encoding: "utf-8", env: isolatedEnv({ HOME: fakeHome,
+      CODEX_HOME: path.join(dir, "codex"), FEISHU_CODEX_BRIDGE_HOME: bridge,
+      FEISHU_BRIDGE_LAUNCHCTL: lc }) });
+
+  assert.notEqual(r.status, 0, "核验没过必须非零退出");
+  assert.equal(fs.existsSync(plist), true,
+    "**plist 不许被删** —— 删了现场就变成「没有 plist、job 还在」，比之前更糟");
+  assert.equal(fs.readFileSync(plist, "utf-8"), before, "一个字节都不许动");
+});
+
+test("四层 status：Codex 侧报的必须是自己那条链的事实，不是 Claude 的", () => {
+  // **这条迁移最容易办坏的地方。**endpointFacts 的 runtime / runtimeDir / verify
+  // 默认值全指向 Claude 那条链 —— 不显式给的话，第 1 层会写着"Claude Code"、
+  // 版本号报的是 Claude 运行时的哈希。而第 1 层问的正是"我这条链的端点"。
+  // 我第一次接线就是这样，输出看着完整、内容是别人的。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "四层示例",
+    rootMessageId: "om_root", token: "abc123" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.equal(r.status, 0, r.stderr);
+
+  // 四层都在。
+  for (const layer of ["第 1 层 · 运行端点连接", "第 2 层 · 事件订阅",
+    "第 3 层 · 精确通道绑定", "第 4 层 · 交互策略"]) {
+    assert.ok(r.stdout.includes(layer), "缺 " + layer + "：" + r.stdout);
+  }
+
+  // **第 1 层必须是 Codex 自己的。**
+  assert.match(r.stdout, /运行时.*Codex CLI/u, "运行时不许写成 Claude Code");
+  assert.doesNotMatch(r.stdout, /Claude Code/u, "**一个字都不许出现 Claude Code**");
+
+  // **绑定级别必须是 task 级。**落到 else 分支会写成"整个项目共用一个话题"，
+  // 那句话在 Codex 侧是错的。
+  assert.match(r.stdout, /绑定级别.*这条 task 单独一个话题/u);
+  assert.doesNotMatch(r.stdout, /整个项目共用一个话题/u);
+
+  // 绑定名称来自 task 自己。
+  assert.match(r.stdout, /绑定名称.*四层示例/u);
+
+  // **版本号必须来自 Codex 那条链。**这条单独验，因为它是最难发现的一类：
+  // 不传 runtimeDir/verify 的话输出看着完整，报的却是 Claude 运行时的哈希 ——
+  // 一个"看起来已安装"的第 1 层，背后是另一条链。
+  //
+  // 隔离环境里 Codex runtime 没装，所以这里必须报"未安装"；
+  // 若它报出了某个版本号，那个号只可能是从别处（本机 Claude 运行时）来的。
+  assert.match(r.stdout, /安装状态.*未安装/u,
+    "**Codex runtime 没装就必须报未安装** —— 报出版本号说明查的是别的链：" + r.stdout);
+  assert.match(r.stdout, /运行时版本.*未安装/u);
+
+  // **不许泄漏 locator。**status 刻意不打印这些。
+  assert.doesNotMatch(r.stdout, /om_root/u, "根消息 id 不许出现");
+  assert.doesNotMatch(r.stdout, new RegExp(THREAD_A, "u"), "thread id 不许出现");
+  assert.doesNotMatch(r.stdout, /abc123/u, "认领口令不许出现");
+});
+
+test("四层 status：这条 task 的登记表状态要单独报，不跟 task 自己的状态混", () => {
+  // 第 3 层其余各行读的是 task 自己的状态，而出站走登记表 ——
+  // 两套可以不一致，而**那种不一致最难查**：状态页说正常、出站挑不到它。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "abc123" });
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  // **登记表里没有它** —— task 文件在，但出站挑不到。
+  writeRegistry([], path.join(home, "registry.json"));
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  // 登记表里没有就找不到这条 thread —— 命令必须说清楚，不许假装正常。
+  assert.notEqual(r.stdout.includes("第 3 层 · 精确通道绑定") && r.status === 0
+    && !/降级|未登记|尚未接入/u.test(r.stdout), true,
+    "**登记表里没有它时不许报成一切正常**：" + r.stdout + r.stderr);
+});
+
+test("三态必须互斥：既标已发布又标已停发的记录是坏的", () => {
+  // 评审：上一版只要 publish_suppressed_at 是非空串就判 suppressed，
+  // 不管 published_at 是什么 —— **一条自相矛盾的记录被静默接受**。
+  // 停发的前提就是它还没发出去。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-excl-"));
+  const put = (n, rec) => fs.writeFileSync(path.join(dir, n), JSON.stringify(rec));
+  put("both.json", { published_at: "2026-08-24T00:00:00.000Z",
+    publish_suppressed_at: "2026-08-24T00:00:00.000Z" });
+  const a = auditOutbox(dir);
+  assert.equal(a.pending, 0);
+  assert.equal(a.unclassified.length, 1, "**自相矛盾必须被点出来**");
+  assert.match(a.unclassified[0].why, /自相矛盾/u);
+
+  // 正常的 suppressed（published_at 是 null）仍然算 suppressed。
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "cx-excl2-"));
+  fs.writeFileSync(path.join(dir2, "s.json"), JSON.stringify({
+    published_at: null, publish_suppressed_at: "2026-08-24T00:00:00.000Z" }));
+  assert.deepEqual(auditOutbox(dir2), { ok: true, pending: 0, unclassified: [] });
+});
+
+test("loadedPhase 与 absentJob 必须共用同一份缺席判据", () => {
+  // 两处各写一份的话，同一个错误串在两处得到不同结论 ——
+  // absentJob 说"这是真失败"，loadedPhase 却说"服务不存在"。
+  for (const detail of ["Boot-out failed: 5: Input/output error",
+    "could not load service", "job not loaded correctly"]) {
+    assert.equal(absentJob(detail), false, "这是真失败：" + detail);
+    assert.equal(loadedPhase(() => ({ ok: false, detail }), null), "unverifiable",
+      "**真失败在 loadedPhase 里也必须是 unverifiable，不是 installed_not_loaded**：" + detail);
+  }
+  for (const detail of ["Could not find service \"x\" in domain", "No such process"]) {
+    assert.equal(absentJob(detail), true);
+    assert.equal(loadedPhase(() => ({ ok: false, detail }), null), "installed_not_loaded");
+  }
+});
+
+test("没有 plist 时的三种可能：absent / orphan / unverifiable，查不清不许报 orphan", () => {
+  // 评审：查不清就报 orphan，等于声称一件没查过的事 —— 而 orphan 是"还在跑"，
+  // 会把人引去做一次不必要的卸载。
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const codexHome = path.join(dir, "codex");
+  const bridge = path.join(dir, "bridge");
+  fs.mkdirSync(fakeHome, { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(bridge, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));
+  const bin = path.join(dir, "bin");
+  fs.mkdirSync(bin, { recursive: true });
+
+  const withLaunchctl = (script) => {
+    const f = path.join(bin, "launchctl");
+    fs.writeFileSync(f, script, { mode: 0o755 });
+    const r = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "drain-service.mjs")],
+      { encoding: "utf-8", env: isolatedEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
+        FEISHU_CODEX_BRIDGE_HOME: bridge, FEISHU_BRIDGE_LAUNCHCTL: f }) });
+    return r.stdout;
+  };
+
+  // ① 明确没有 → absent
+  assert.match(withLaunchctl('#!/bin/sh\necho "Could not find service" >&2\nexit 113\n'),
+    /未启用（安装后的默认态/u, "明确没有就是 absent");
+
+  // ② 查到 job、没有 plist → orphan
+  assert.match(withLaunchctl('#!/bin/sh\necho \'{ "Program" = "/x"; "ProgramArguments" = ( "/x"; ); };\'\nexit 0\n'),
+    /没有 plist，但 launchd 里还有同名 job/u, "查到 job 就是 orphan");
+
+  // ③ **查不清 → unverifiable，不许报 orphan**
+  const unclear = withLaunchctl('#!/bin/sh\necho "Operation not permitted" >&2\nexit 1\n');
+  assert.doesNotMatch(unclear, /没有 plist，但 launchd 里还有同名 job/u,
+    "**查不清不许说成 orphan** —— 那是在声称一件没查过的事");
+});
+
+test("launchctl 必须走注入口 —— 测试不许读真实控制面", () => {
+  // 评审实测：同一份代码在我这里 127/127、在他那里 125/127，
+  // 因为两条回归隔离了 HOME 却没隔离 launchd 域。
+  // **这条钉的是注入口本身存在且被尊重。**
+  const dir = temp();
+  const marker = path.join(dir, "CALLED");
+  const f = path.join(dir, "launchctl");
+  fs.writeFileSync(f, '#!/bin/sh\necho called >> ' + JSON.stringify(marker) +
+    '\necho "Could not find service" >&2\nexit 113\n', { mode: 0o755 });
+  const bridge = path.join(dir, "bridge");
+  fs.mkdirSync(bridge, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs")],
+    { encoding: "utf-8", env: isolatedEnv({ HOME: path.join(dir, "home"),
+      CODEX_HOME: path.join(dir, "codex"), FEISHU_CODEX_BRIDGE_HOME: bridge,
+      FEISHU_BRIDGE_LAUNCHCTL: f }) });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fs.existsSync(marker), true,
+    "**注入口必须被真的用上** —— 没被调用说明它还在读别的地方");
+});
+
+test("「本来就没有这个服务」的判据不许放宽", () => {
+  // 上一版还认 not.*loaded —— 那能匹配上 "could not load"、
+  // "job not loaded correctly" 之类**真正的失败**。判据放宽一点，
+  // "卸载失败"就会被当成"本来就没有"，于是照样往下走。
+  assert.equal(absentJob("Could not find service \"x\" in domain"), true);
+  assert.equal(absentJob("No such file or directory"), true);
+  for (const real of ["Boot-out failed: 5: Input/output error",
+    "could not load service", "job not loaded correctly", "Operation not permitted"]) {
+    assert.equal(absentJob(real), false, "**这是真失败，不是「本来就没有」**：" + real);
+  }
+});
+
+test("链路预检必须真验身份：lark-cli 不在、凭据对不上都要拦", () => {
+  // 评审实测：resolveLarkIdentity **只是拼路径，永远返回对象** ——
+  // 拿它当身份检查的话，二进制不存在、凭据目录读不出来、profile 不在、
+  // app id 对不上，一律"通过"。而真实发送会在这几处失败。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "abc123" });
+  writeRegistry([task], path.join(home, "registry.json"));
+
+  const bin = path.join(home, "lark-cli");
+  fs.writeFileSync(bin, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  const credBase = path.join(home, "creds");
+  const agentDir = path.join(credBase, String(TEMPLATE.agent_uid ?? "agent"));
+  fs.mkdirSync(agentDir, { recursive: true });
+  const writeCred = (appId) => fs.writeFileSync(path.join(agentDir, "config.json"),
+    JSON.stringify({ apps: [{ name: TEMPLATE.lark_cli_profile, appId }] }));
+
+  const withTemplate = (mut) => {
+    const t = JSON.parse(JSON.stringify(TEMPLATE));
+    t.lark_cli_bin = bin;
+    t.lark_cli_config_base = credBase;
+    mut(t);
+    fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(t));
+    return preflightTask({ task, home });
+  };
+
+  writeCred(TEMPLATE.outbound_app_id);
+  const good = withTemplate(() => {});
+  assert.equal(good.ok, true, "配置齐全时该通过：" + (good.reason ?? ""));
+
+  // 二进制不存在
+  const missing = withTemplate((t) => { t.lark_cli_bin = "/definitely/missing/lark"; });
+  assert.equal(missing.ok, false, "**lark-cli 不存在必须拦**");
+  assert.equal(missing.reason, "lark_cli_not_executable");
+
+  // 二进制在但不可执行
+  const notExec = path.join(home, "not-exec");
+  fs.writeFileSync(notExec, "x", { mode: 0o600 });
+  assert.equal(withTemplate((t) => { t.lark_cli_bin = notExec; }).reason,
+    "lark_cli_not_executable", "不可执行也要拦");
+
+  // 凭据目录读不出来
+  assert.equal(withTemplate((t) => { t.lark_cli_config_base = "/definitely/missing"; }).reason,
+    "config_dir_unreadable", "**凭据目录读不出来必须拦**");
+
+  // 凭据里的 app id 跟配置对不上 —— 拿着别人的身份发
+  writeCred("cli_someoneelse");
+  assert.equal(withTemplate(() => {}).reason, "app_id_mismatch",
+    "**凭据属于别的应用必须拦**");
+  writeCred(TEMPLATE.outbound_app_id);
+});
+
+test("积压归类：每个 JSON 都要能归类，说不清就拦住", () => {
+  // 评审：上一版只补了坏 JSON，没覆盖"路径不是目录"和"能解析但不是记录（如 {}）"。
+  // **只有目录不存在才算真的空。**
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-audit-"));
+  const ok = (name, body) => fs.writeFileSync(path.join(dir, name), body);
+
+  ok("pending.json", JSON.stringify({ kind: "milestone", published_at: null }));
+  ok("published.json", JSON.stringify({ published_at: "2026-08-24T00:00:00.000Z" }));
+  ok("suppressed.json", JSON.stringify({ published_at: null,
+    publish_suppressed_at: "2026-08-24T00:00:00.000Z" }));
+  let a = auditOutbox(dir);
+  assert.equal(a.ok, true);
+  assert.equal(a.pending, 1, "三态各一，只有一条待发");
+  assert.deepEqual(a.unclassified, [], "三态都能归类");
+
+  ok("empty.json", "{}");
+  ok("broken.json", "这不是 JSON");
+  ok("array.json", "[]");
+  a = auditOutbox(dir);
+  assert.equal(a.pending, 1, "待发数不受影响");
+  assert.equal(a.unclassified.length, 3,
+    "**{} / 坏 JSON / 数组都必须被点出来**：" + JSON.stringify(a.unclassified));
+
+  // 目录不存在 = 合法的空。
+  assert.deepEqual(auditOutbox(path.join(dir, "nope")), { ok: true, pending: 0, unclassified: [] });
+
+  // 路径是文件不是目录 → 说不清，拦住。
+  const file = path.join(dir, "afile");
+  fs.writeFileSync(file, "x");
+  assert.equal(auditOutbox(file).ok, false);
+  assert.equal(auditOutbox(file).reason, "outbox_not_a_directory");
+});
+
+test("hook 往返：含单引号的路径，装两次仍然只有一条", () => {
+  // 评审实测：shellQuote 把 ' 编码成 '\'' ，而 '([^']+)' 在第一个内嵌引号处就断了。
+  // 于是在含 ' 的 CODEX_HOME 下连装两次，UserPromptSubmit 和 Stop **各出现 2 条**——
+  // 第二次没认出第一次装的那条。
+  const dir = temp();
+  const codexHome = path.join(dir, "co'dex-home");     // 目录名里带单引号
+  const home = path.join(dir, "bridge'home");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
+  writeRegistry([], path.join(home, "registry.json"));
+  const env = { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home };
+  const install = () => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
+
+  assert.equal(install().status, 0);
+  assert.equal(install().status, 0, "第二次安装");
+
+  const hooks = JSON.parse(fs.readFileSync(path.join(codexHome, "hooks.json"), "utf-8"));
+  for (const [event, basename] of [["UserPromptSubmit", "prompt-hook.mjs"], ["Stop", "stop-hook.mjs"]]) {
+    const mine = (hooks.hooks[event] ?? [])
+      .flatMap((e) => (e.hooks ?? []).map((h) => h.command))
+      .filter((c) => ownsHookCommand(c, basename));
+    assert.equal(mine.length, 1,
+      "**装两次也只能有一条**（" + event + "）：" + mine.length + " 条");
+    // 往返：解析出来再造回去必须逐字相同。
+    const parsed = parseHookCommand(mine[0]);
+    assert.notEqual(parsed, null, "含单引号的路径必须解析得出");
+    assert.equal(buildHookCommand(parsed), mine[0], "build → parse → build 要往返");
+  }
+});
+
+test("doctor 比对完整期望定义 —— node/home/日志任一不对都不许算正常", () => {
+  // 评审实测：把 node 换成 /definitely/missing/node、bridge home 和日志也改错，
+  // doctor 仍报 hooks 正常，因为它只比 parsed.script。
+  const script = "/r/current/scripts/codex/stop-hook.mjs";
+  const expect = { node: "/opt/homebrew/bin/node", script, home: "/h", log: "/h/hook.log" };
+  const good = buildHookCommand(expect);
+  assert.equal(acceptsHookCommand(good, expect), true);
+
+  for (const [field, value] of [["node", "/definitely/missing/node"],
+    ["home", "/wrong"], ["log", "/wrong/hook.log"]]) {
+    const drifted = buildHookCommand({ ...expect, [field]: value });
+    assert.equal(parseHookCommand(drifted) !== null, true, "它本身仍是我们的 hook");
+    assert.equal(acceptsHookCommand(drifted, expect), false,
+      "**" + field + " 不对就不许算正常**");
+  }
+});
+
+test("技能要逐字节比对 —— 「文件在」不等于「装对了」", () => {
+  // 评审实测：安装后把 feishu-status/SKILL.md 换成陈旧内容，
+  // doctor 仍报 {"name":"Codex skills","ok":true,"detail":"7 项均已安装"}。
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  const home = path.join(dir, "bridge-home");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
+  writeRegistry([], path.join(home, "registry.json"));
+  const runtimeCurrent = path.join(codexHome, "feishu-bridge", "runtime", "current");
+  assert.equal(spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", env: { ...isolatedEnv(), CODEX_HOME: codexHome,
+      FEISHU_CODEX_BRIDGE_HOME: home } }).status, 0);
+
+  const audit = () => auditSkills({ repoRoot: ROOT, codexHome, runtimeCurrent, bridgeHome: home });
+  assert.equal(audit().ok, true, "刚装完必须逐字节一致：" + JSON.stringify(audit().problems));
+
+  // 换成陈旧内容：文件仍在。
+  const victim = path.join(codexHome, "skills", "feishu-status", "SKILL.md");
+  fs.writeFileSync(victim, "---\nname: feishu-status\n---\n旧内容\n");
+  const stale = audit();
+  assert.equal(stale.ok, false, "**内容不对必须被发现**");
+  assert.deepEqual(stale.problems.map((p) => p.skill), ["feishu-status"]);
+  assert.equal(stale.problems[0].why, "内容与期望不符");
+
+  // 非模板文件（aily-cli-skill.json）也要纳入。
+  const json = path.join(codexHome, "skills", "m5codex-inbound-router", "aily-cli-skill.json");
+  fs.writeFileSync(json, "{}");
+  assert.ok(audit().problems.some((p) => p.file === "aily-cli-skill.json"),
+    "非 SKILL.md 的文件也要比对");
+});
+
+test("launchd 核验要精确到完整参数 —— 跑 /bin/echo 的同名 job 不算数", () => {
+  // 评审构造的反例：实际运行 /bin/echo、仅把期望脚本当参数的 job，
+  // 子串匹配照样判成 loaded。
+  const expect = { node: "/opt/homebrew/bin/node",
+    args: ["/opt/homebrew/bin/node", "/r/current/scripts/codex/drain-all.mjs"] };
+  const listing = (program, args) => '{\n\t"Program" = "' + program + '";\n' +
+    '\t"ProgramArguments" = (\n' + args.map((a) => '\t\t"' + a + '";\n').join("") + '\t);\n};';
+  const run = (text) => () => ({ ok: true, stdout: text });
+
+  assert.equal(loadedPhase(run(listing(expect.node, expect.args)), expect), "loaded");
+  assert.equal(loadedPhase(run(listing("/bin/echo", ["/bin/echo", expect.args[1]])), expect),
+    "loaded_other", "**实际跑的是 /bin/echo**");
+  assert.equal(loadedPhase(run(listing(expect.node, [...expect.args, "--extra"])), expect),
+    "loaded_other", "多一个参数就不是我们那份");
+  assert.equal(loadedPhase(run(listing(expect.node, [expect.args[0]])), expect),
+    "loaded_other", "少一个参数也不是");
+  assert.equal(loadedPhase(run("看不懂的输出"), expect), "unverifiable",
+    "**拆不出来就说查不出来，不许当 loaded**");
+});
+
+test("plist 必须是 macOS 真的能解析的 XML", () => {
+  // 字符串断言只能证明"我写的字符串里有转义"。真解析才能证明 launchd 读得进去。
+  const body = plistBody({ home: "/Users/a&b/工 作 <区>/o'brien",
+    node: "/opt/homebrew/bin/node" });
+  const file = path.join(temp(), "t.plist");
+  fs.writeFileSync(file, body);
+  const r = spawnSync("plutil", ["-lint", file], { encoding: "utf-8" });
+  assert.equal(r.status, 0, "**plutil 必须能解析**：" + (r.stdout + r.stderr).slice(0, 300));
+});
+
+test("hook 归属：整条锚定 —— 只提一句标记或路径的外部 hook 不许被认领", () => {
+  // 评审的两个反例，一条都不许中：
+  //   echo FEISHU_BRIDGE_CODEX_HOOK:prompt-hook.mjs   （提到标记）
+  //   echo <runtime/current/.../stop-hook.mjs>        （提到路径）
+  // 前者会被安装器删掉，后者会被 doctor 判为正常 —— 两种都是判据只做子串包含。
+  const script = "/r/current/scripts/codex/stop-hook.mjs";
+  const good = buildHookCommand({ node: "/opt/homebrew/bin/node", script,
+    home: "/h", log: "/h/hook.log" });
+
+  assert.equal(ownsHookCommand(good, "stop-hook.mjs"), true, "自己造的要认得出");
+  assert.equal(acceptsHookCommand(good, script), true);
+
+  for (const impostor of [
+    "echo " + HOOK_TAG + "stop-hook.mjs",
+    "echo " + script,
+    "# " + HOOK_TAG + "stop-hook.mjs\necho 假的",
+    "rg " + script,
+    good + " ; rm -rf /",                       // 尾部多东西 → 不是我们的
+    good.replace("/h/hook.log", "/h/hook.log' ; evil '"),
+  ]) {
+    assert.equal(parseHookCommand(impostor), null,
+      "**不许认领**：" + impostor.slice(0, 60));
+  }
+
+  // guard 检查的脚本与实际执行的不同 → 不是我们的。
+  const mismatched = good.replace(
+    "'/opt/homebrew/bin/node' '" + script + "';",
+    "'/opt/homebrew/bin/node' '/z/stop-hook.mjs';");
+  assert.equal(parseHookCommand(mismatched), null, "guard 与执行对不上就不是我们的");
+
+  // **专门验 acceptsHookCommand 自己那一步。**
+  // 上一版这里只用"指向别的脚本"来验，而那种命令 parseHookCommand 就先拒了 ——
+  // 两道守卫互相遮挡，把 accepts 改成子串包含也照样绿。
+  // 这里要的是一条**parse 认可、但脚本只是前缀关系**的命令：
+  // 只有"逐字相等"能分开，"包含"分不开。
+  const nested = "/r/current/scripts/codex/stop-hook.mjs.bak/stop-hook.mjs";
+  const nestedCmd = buildHookCommand({ node: "/opt/homebrew/bin/node", script: nested,
+    home: "/h", log: "/h/hook.log" });
+  assert.notEqual(parseHookCommand(nestedCmd), null, "这条本身是合法的我们的 hook");
+  assert.equal(acceptsHookCommand(nestedCmd, script), false,
+    "**逐字相等，不是包含** —— 命令里确实出现了 " + script + " 这个前缀");
+  assert.equal(acceptsHookCommand(nestedCmd, nested), true, "它自己那条要接受");
+});
+
+test("启用门槛的链路预检必须走真实主链，不许把被测对象换掉", () => {
+  // 评审实测的假绿：上一版把整个 publishEligibleTaskEvents 换成假函数，
+  // 于是门槛验的是"我的假函数能被调用"。同一个 task 走真实路径是 template_unusable，
+  // 门禁却报 ok。**替换掉被测对象的检查等于没有检查。**
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "abc123" });
+  task.logical_task_key = "k";
+  writeRegistry([task], path.join(home, "registry.json"));
+
+  // 没有 chain-config.json → 真实预检必然 template_unusable。
+  const scanned = scanRunnable({ home });
+  assert.equal(scanned.ok, false, "真实链路跑不通就必须报跑不通");
+  assert.match(scanned.reason, /template_unusable/u, "要说清是哪一步不通");
+  assert.equal(enableBlockers({ runtimeOk: true, scan: scanned,
+    backlog: { ok: true, total: 0, unreadable: 0 } }).length, 1, "跑不通就要拦");
+
+  // 预检成功时不拦。
+  const okScan = { ok: true, tasks: 1 };
+  assert.deepEqual(enableBlockers({ runtimeOk: true, scan: okScan,
+    backlog: { ok: true, total: 0, unreadable: 0 } }), []);
+});
+
+test("坏 JSON 不许把积压数成 0 —— 读不出来不等于没有", () => {
+  // 评审实测：outbox 里全是坏 JSON 时，listPending 静默跳过，
+  // 积压被统计成 0，门槛放行，定时器装上 —— 而那些文件是什么谁也不知道。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "abc123" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const outbox = taskPaths(task, home).outbox;
+  fs.mkdirSync(outbox, { recursive: true });
+  fs.writeFileSync(path.join(outbox, "0001.json"), "{ 这不是 JSON");
+
+  const backlog = classifyBacklog({ home });
+  assert.equal(backlog.ok, true);
+  assert.equal(backlog.total, 0, "坏文件确实不算待发");
+  assert.equal(backlog.unreadable, 1, "**但必须被数出来**");
+  const blockers = enableBlockers({ runtimeOk: true, scan: { ok: true },
+    backlog });
+  assert.equal(blockers.length, 1, "有读不出来的文件就要拦");
+  assert.equal(blockers[0].code, "backlog_corrupt");
+});
+
+test("同名旧 job 还在跑时不许报「已加载」", () => {
+  // 评审实测：先写新 plist 再 bootstrap，失败时 plist 留在原地；
+  // 若旧的同名 job 还在 launchd 里，只看 label 存在就会报"已加载，正在按计划跑"——
+  // 实际跑的是旧配置。
+  // 期望现在是完整的 { node, args }，不再是一个脚本路径 ——
+  // 只比脚本路径挡不住"实际跑 /bin/echo、把脚本当参数"那种 job。
+  const expect = { node: "/n", args: ["/n", "/new/drain-all.mjs"] };
+  const listing = (program, args) => '{\n\t"Program" = "' + program + '";\n' +
+    '\t"ProgramArguments" = (\n' + args.map((a) => '\t\t"' + a + '";\n').join("") + '\t);\n};';
+  const fake = (text) => () => ({ ok: true, stdout: text });
+  assert.equal(loadedPhase(fake(listing("/n", ["/n", "/new/drain-all.mjs"])), expect), "loaded");
+  assert.equal(loadedPhase(fake(listing("/n", ["/n", "/OLD/clone/drain-outbox.mjs"])), expect),
+    "loaded_other", "**参数不是当前这份就不许说已加载**");
+  assert.equal(loadedPhase(() => ({ ok: false, detail: "could not find service" }), expect),
+    "installed_not_loaded");
+  assert.equal(loadedPhase(() => ({ ok: false, detail: "权限不足" }), expect),
+    "unverifiable", "查不出来就说查不出来");
+});
+
+test("plist 里的路径必须 XML 转义", () => {
+  // 家目录里一个 & 就足以让整份 plist 变成非法 XML：launchd 加载失败，
+  // 而"写文件"那一步是成功的。含空格和中文的路径这个仓库已经栽过一次（那次是 shell 引号）。
+  const body = plistBody({ home: "/Users/a&b/工 作 <区>", node: "/opt/homebrew/bin/node" });
+  // 只查 <string> 里的**值**——plist 本身当然到处是尖括号。
+  const values = [...body.matchAll(/<string>([\s\S]*?)<\/string>/gu)].map((m) => m[1]);
+  assert.ok(values.length > 0, "得真的取到值才算数");
+  for (const v of values) {
+    assert.doesNotMatch(v.replace(/&(amp|lt|gt);/gu, ""), /[&<>]/u,
+      "值里不许有裸的 & < >：" + v);
+  }
+  assert.ok(body.includes("&amp;"), "& 要转义");
+  assert.ok(body.includes("&lt;区&gt;"), "< > 要转义");
+  assert.ok(body.includes("工 作"), "空格和中文原样保留");
+});
+
+test("launchd 加载失败必须非零退出 —— 不许报成「已启用」", () => {
+  // **兜底是最后一道，它悄悄不工作没有第二处会发现。**
+  // plist 写了但 bootstrap 失败时报成功，就是"界面说正常、实际不跑"。
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const codexHome = path.join(dir, "codex-home");
+  const bridge = path.join(dir, "bridge");
+  const bin = path.join(dir, "bin");
+  for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));      // 空 → 积压门槛过
+
+  // 假 launchctl：list 说没有，bootstrap 失败。**不碰真机的 launchd。**
+  fs.writeFileSync(path.join(bin, "launchctl"),
+    '#!/bin/sh\ncase "$1" in\n  list) echo "could not find service" >&2; exit 113;;\n' +
+    '  bootstrap) echo "Load failed: 5: Input/output error" >&2; exit 5;;\nesac\nexit 0\n',
+    { mode: 0o700 });
+
+  const env = { ...isolatedEnv(), HOME: fakeHome, PATH: bin + path.delimiter + process.env.PATH,
+    CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridge };
+  // 先把运行时装好，否则会卡在运行时那道门槛上，测不到我们要测的东西。
+  const installed = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
+  assert.equal(installed.status, 0, installed.stderr);
+
+  const realAgents = path.join(os.homedir(), "Library", "LaunchAgents");
+  const before = fs.existsSync(realAgents) ? fs.readdirSync(realAgents).sort().join(",") : "";
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--enable", "--apply"],
+    { encoding: "utf-8", env });
+
+  assert.notEqual(r.status, 0,
+    "**加载失败必须非零退出**：" + r.stdout + r.stderr);
+  assert.match(r.stderr, /加载失败/u, "要说清是加载失败，不是别的");
+  assert.doesNotMatch(r.stdout, /已启用，定时器已加载/u,
+    "没加载成功就不许说已加载");
+
+  // 真机的 LaunchAgents 一个字节都不许动。
+  const after = fs.existsSync(realAgents) ? fs.readdirSync(realAgents).sort().join(",") : "";
+  assert.equal(after, before, "给了 HOME 还往真机的 LaunchAgents 写");
+});
+
+test("兜底扫描：逐 task 走 eligible-only，一个失败不许拖垮其他", () => {
+  // 兜底的价值就在于它是最后一道。一条坏记录让整轮扫描中断，等于没有兜底。
+  // **publish 是注入的 —— 测试不许打到真实飞书。**
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const mk = (key, thread) => {
+    const t = makeTaskEntry({ root, threadId: thread, name: key,
+      rootMessageId: "om_" + key, token: "abc123" });
+    t.logical_task_key = key;
+    return t;
+  };
+  writeRegistry([mk("a", THREAD_A), mk("b", THREAD_B)], path.join(home, "registry.json"));
+
+  const seen = [];
+  const swept = sweepEligible({
+    home,
+    publish: ({ task }) => {
+      seen.push(task.logical_task_key);
+      if (task.logical_task_key === "a") throw new Error("这条炸了");
+      return { status: "published", count: 2 };
+    },
+  });
+
+  assert.equal(swept.ok, true);
+  assert.deepEqual(seen, ["a", "b"], "**第一个抛了，第二个仍然要跑**");
+  assert.equal(swept.errors.length, 1);
+  assert.equal(swept.errors[0].key, "a");
+  assert.equal(swept.errors[0].reason, "threw");
+  assert.equal(swept.tally.published, 1, "没炸的那个照常发");
+
+  // 登记表**坏了**（不是"不存在"）→ 明确失败，不许报成"扫了 0 个 task"。
+  // 文件不存在是合法的"还没有 task"，新装机器本来就这样；坏文件才是故障。
+  const badHome = temp();
+  fs.writeFileSync(path.join(badHome, "registry.json"), "{ 这不是 JSON");
+  const broken = sweepEligible({ home: badHome });
+  assert.equal(broken.ok, false, "**读不出来不等于没有** —— 报成 0 条就会静默空转");
+  assert.equal(broken.reason, "registry_unreadable");
+});
+
+test("调度器：历史积压没分类时拒绝启用，且一条都不写", () => {
+  // **这条是这条命令存在的主要理由。**Codex 链一直没有兜底定时器，
+  // outbox 里攒着一批历史内容；装上定时器的那一刻它们会被发出去。
+  // 省掉这道门槛就是替人做了一个不可逆的决定。
+  const home = temp();
+  const bridge = path.join(home, "bridge");
+  fs.mkdirSync(bridge, { recursive: true });
+  const root = path.join(home, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "abc123" });
+  writeRegistry([task], path.join(bridge, "registry.json"));
+  const paths = taskPaths(task, bridge);
+  fs.mkdirSync(paths.outbox, { recursive: true });
+
+  // 空 outbox：分类这一关不该拦。
+  const empty = classifyBacklog({ home: bridge });
+  assert.equal(empty.ok, true);
+  assert.equal(empty.total, 0);
+  assert.deepEqual(enableBlockers({ runtimeOk: true, backlog: empty }), [],
+    "没有积压时不该有任何门槛");
+
+  // 有一条待发：必须拦。
+  fs.writeFileSync(path.join(paths.outbox, "0001.json"),
+    JSON.stringify({ kind: "milestone", text: "历史内容", published_at: null }));
+  const withBacklog = classifyBacklog({ home: bridge });
+  assert.equal(withBacklog.total, 1);
+  assert.equal(withBacklog.tasks.length, 1);
+  const blockers = enableBlockers({ runtimeOk: true, backlog: withBacklog });
+  assert.equal(blockers.length, 1, "有积压就必须拦");
+  assert.equal(blockers[0].code, "backlog_unclassified");
+
+  // 运行时校验不过也要拦，而且**两条要一起报**，不是只报第一条。
+  const both = enableBlockers({ runtimeOk: false, runtimeReason: "current_absent",
+    backlog: withBacklog });
+  assert.equal(both.length, 2, "两条门槛都不过就要一次说清，别让人来回试");
+  assert.deepEqual(both.map((b) => b.code).sort(),
+    ["backlog_unclassified", "runtime_unverified"]);
+
+  // 登记表读不出来 → 也拦，而且不能报成"没有积压"。
+  const unreadable = enableBlockers({ runtimeOk: true,
+    backlog: { ok: false, reason: "registry_unreadable" } });
+  assert.equal(unreadable.length, 1);
+  assert.equal(unreadable[0].code, "backlog_unreadable",
+    "**读不出来不等于没有** —— 报成 0 条就会放行");
+});
+
+test("调度器指向的必须是 runtime/current，不是任何开发克隆", () => {
+  // 定时器一装就长期存在。让它指向某个开发克隆，等于把线上行为长期绑在
+  // 某人的工作目录上 —— 那正是这次迁移要消灭的东西。
+  const home = temp();
+  const script = drainScriptPath(home);
+  assert.match(script,
+    /\.codex\/feishu-bridge\/runtime\/current\/scripts\/codex\/drain-all\.mjs$/u);
+  const body = plistBody({ home, node: "/opt/homebrew/bin/node" });
+  assert.ok(body.includes(script), "plist 里跑的必须是这个路径");
+  assert.doesNotMatch(body, /claude-projects|codex-projects/u,
+    "**plist 里不许出现任何开发克隆路径**");
+  // **不再传 --all。**drain-outbox 根本不支持它：拿到 --all 会打一行
+  // "找不到目标 task" 然后 exit 0 —— 定时器每 30 分钟静默空转，
+  // 而外部看起来一切正常。现在跑的是真正的机器级 eligible-only 扫描入口。
+  assert.doesNotMatch(body, /<string>--all<\/string>/u,
+    "--all 是个不存在的用法，不许再出现在 plist 里");
+  assert.ok(body.includes("drain-all.mjs"),
+    "跑的必须是逐 task 的 eligible-only 扫描入口");
+  assert.ok(body.includes("<key>RunAtLoad</key><false/>"),
+    "装上不等于立刻跑一次");
 });
 
 test("空白目标代际是损坏记录 —— Codex 侧守着同一条三态判定", () => {
@@ -2869,7 +4055,7 @@ test("Codex 抑制命令：目标和范围都必须显式给", () => {
     ["--all-generations", "--apply"],                                      // 没给目标
   ]) {
     const r = spawnSync(process.execPath, [cli, ...args],
-      { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+      { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
     assert.notEqual(r.status, 0, args.join(" ") + " 竟然被接受了");
     assert.equal(fs.readFileSync(rec, "utf-8"), body, args.join(" ") + "：outbox 不许被动");
   }

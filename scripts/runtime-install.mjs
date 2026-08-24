@@ -32,17 +32,55 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-/** 运行时根目录。刻意放在 ~/.claude/feishu-bridge 下，跟日志、登记表同源好排查。 */
-export function runtimeRoot(home = os.homedir()) {
-  return path.join(home, ".claude", "feishu-bridge", "runtime");
+/**
+ * 两条链各自的运行时住在哪。
+ *
+ * **刻意不共用一份。**两条链共享 scripts/ 里的大部分模块，共用运行时能少一次
+ * 版本漂移 —— 但那会把两条链的升级绑死：给 Claude 装一版就等于给 Codex 也装了，
+ * 出问题时也没法只回滚一条。评审的裁决是各自独立。
+ *
+ * 键是链名，值是家目录下的那一段。**新增一条链只能改这里**，
+ * 不许在别处再拼一次路径。
+ */
+export const CHAIN_HOME_DIR = { claude: ".claude", codex: ".codex" };
+
+/**
+ * 运行时根目录。刻意放在各自的 <家目录>/feishu-bridge 下，
+ * 跟日志、登记表同源好排查。
+ *
+ * `chain` 默认 claude —— 既有调用方一个都不用改。
+ */
+export function runtimeRoot(home = os.homedir(), chain = "claude") {
+  const dir = CHAIN_HOME_DIR[chain];
+  if (dir === undefined) throw new Error("未知的链：" + String(chain));
+  return path.join(home, dir, "feishu-bridge", "runtime");
 }
+
+/**
+ * 三个入口共用的"根到底是哪一个"。
+ *
+ * **显式 root 压过 home+chain。**这不只是灵活性 —— Codex 链的家目录本来就有
+ * 一个现成的覆盖点（CODEX_HOME），而 home+chain 拼出来的永远是真实 HOME。
+ * 只隔离了 CODEX_HOME 的测试于是会往真机里装一份运行时：**这个仓库已经为
+ * "测试污染真机"付过三次代价**，这是第四次，根因每次都是"隔离点没接到实现里"。
+ */
+/**
+ * Codex 链的运行时根 —— **从 CODEX_HOME 推，这是这条链唯一正确的算法。**
+ * 只有这一处知道 "<codex家>/feishu-bridge/runtime" 这个形状。
+ */
+export const codexRuntimeRoot = (codexHome =
+  process.env.CODEX_HOME || path.join(os.homedir(), ".codex")) =>
+  path.join(codexHome, "feishu-bridge", "runtime");
+
+const rootOf = ({ root, home = os.homedir(), chain = "claude" }) =>
+  typeof root === "string" && root.length > 0 ? root : runtimeRoot(home, chain);
 
 export const CURRENT_LINK = "current";
 export const MANIFEST_NAME = "INSTALLED.json";
 
 /** 钩子和定时器实际引用的稳定路径 —— 全局配置里只应出现这一种形状。 */
-export function runtimeScript(name, home = os.homedir()) {
-  return path.join(runtimeRoot(home), CURRENT_LINK, "scripts", name);
+export function runtimeScript(name, home = os.homedir(), chain = "claude") {
+  return path.join(runtimeRoot(home, chain), CURRENT_LINK, "scripts", name);
 }
 
 const sha256 = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
@@ -80,25 +118,35 @@ export function versionFromFiles(files) {
 /**
  * 运行时需要哪些文件。
  *
- * 只有 `scripts/`：实测运行路径不读 `references/` 或仓库里任何别的资源
- *（`shared-surface.mjs` 读，但那是开发期契约工具，不在钩子路径上）。
- * 少复制一个目录就少一处「装完之后仓库变了、运行时没跟上」的不一致来源。
+ * `scripts/**\/*.mjs`：钩子和定时器实际执行的代码。
+ *
+ * `skills/**`：技能的**源模板**。这一份是后加的 —— 装完之后 doctor 要拿
+ * "期望内容"跟装出来的逐字节比对，而它自己就跑在 runtime 里。
+ * 模板不进 runtime 的话，从 runtime 跑的 doctor 报的是"源模板读不出来"，
+ * **唯一的验收工具在自己的运行环境里失灵**。评审在临时环境实测到 8 个技能
+ * 全部这样报。
+ *
+ * 仍然不收 `references/`：那是开发期契约工具用的，不在任何运行路径上。
  */
+const RUNTIME_TREES = [
+  { dir: "scripts", keep: (name) => name.endsWith(".mjs") },
+  { dir: "skills", keep: () => true },
+];
+
 export function collectRuntimeFiles(sourceRoot) {
-  const base = path.join(sourceRoot, "scripts");
   const out = [];
-  const walk = (dir) => {
+  const walk = (dir, keep) => {
     let entries;
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
     for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
       const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) { walk(full); continue; }
-      if (!entry.isFile() || !entry.name.endsWith(".mjs")) continue;
+      if (entry.isDirectory()) { walk(full, keep); continue; }
+      if (!entry.isFile() || !keep(entry.name)) continue;
       out.push(path.relative(sourceRoot, full));
     }
   };
-  walk(base);
-  return out;
+  for (const tree of RUNTIME_TREES) walk(path.join(sourceRoot, tree.dir), tree.keep);
+  return out.sort();
 }
 
 /** 来源提交，仅用于事后追溯「线上这份代码是哪儿来的」。不是 git 仓库也不算错。 */
@@ -117,7 +165,7 @@ function sourceCommit(sourceRoot) {
  * 算出这份源码对应的版本号与逐文件哈希。纯计算，不落盘 —— 于是 dry-run 与 apply
  * 看到的是同一个版本号，不会出现「预览说要装 A、实际装了 B」。
  */
-export function planRuntimeSync({ sourceRoot, home = os.homedir() } = {}) {
+export function planRuntimeSync({ sourceRoot, home = os.homedir(), chain = "claude", root: rootOverride } = {}) {
   if (typeof sourceRoot !== "string" || !path.isAbsolute(sourceRoot)) {
     return { ok: false, reason: "source_root_invalid" };
   }
@@ -135,8 +183,10 @@ export function planRuntimeSync({ sourceRoot, home = os.homedir() } = {}) {
   // 版本号由内容决定：同样的源码算出同样的版本，重复安装就是无操作。
   const version = versionFromFiles(files);
   if (!version) return { ok: false, reason: "file_list_invalid" };
-  const root = runtimeRoot(home);
-  const current = verifyRuntime({ home });
+  const root = rootOf({ root: rootOverride, home, chain });
+  // **查的必须是本次解析出的那个 root。**只传 home 的话，默认 chain 是 claude ——
+  // 给 Codex 算计划时会去查 Claude 的运行时。
+  const current = verifyRuntime({ root });
   return {
     ok: true,
     version,
@@ -186,16 +236,21 @@ const writeAtomic = (file, content) => {
  *（原地覆盖一个内容寻址的目录本身就是矛盾的）。真正的提交点只有 current 那一次 rename；
  * 它之前的任何失败都不会改变线上正在跑的那份代码。
  */
-export function applyRuntimeSync(plan, { home = os.homedir() } = {}) {
+export function applyRuntimeSync(plan, { home = os.homedir(), chain = "claude", root: rootOverride } = {}) {
   if (!plan?.ok) return plan ?? { ok: false, reason: "plan_missing" };
-  const root = runtimeRoot(home);
+  const root = rootOf({ root: rootOverride, home, chain });
   const versionDir = path.join(root, "versions", plan.version);
 
   const lock = acquireInstallLock(root);
   if (!lock.ok) return lock;
   try {
     // 已是当前版本且自校验通过 → 真正的 no-op，不去动线上正在被加载的文件。
-    const already = verifyRuntime({ home });
+    //
+    // **必须查本次这个 root。**这里曾经只传 home（默认 claude）——
+    // 而两条链装的是同一份 scripts/，版本哈希必然相同，
+    // 于是"装完 Claude 再装 Codex"必然被判成 no-op，Codex 的 current 根本不建。
+    // 生产上这不是偶发，是必然。
+    const already = verifyRuntime({ root });
     if (already.ok && already.version === plan.version) {
       return { ok: true, version: plan.version, versionDir, noop: true };
     }
@@ -336,8 +391,8 @@ function verifyVersionDir(dir, expectedFiles, { checkDirName = true } = {}) {
  * 真相取自 current 指向的那个版本目录内部的清单，不取根目录那份指针 —— 后者只是便利，
  * 而且它可能比 current 落后一步（切链接与写指针之间失败过）。
  */
-export function verifyRuntime({ home = os.homedir() } = {}) {
-  const root = runtimeRoot(home);
+export function verifyRuntime({ home = os.homedir(), chain = "claude", root: rootOverride } = {}) {
+  const root = rootOf({ root: rootOverride, home, chain });
   let linkTarget = null;
   try { linkTarget = fs.readlinkSync(path.join(root, CURRENT_LINK)); } catch {
     return { ok: false, reason: "current_absent", linkOk: false, drifted: [], missing: [] };

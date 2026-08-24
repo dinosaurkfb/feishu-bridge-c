@@ -176,11 +176,20 @@ export function auditOutbox(outboxDir) {
     //   pending   ：published_at === null
     //   published ：published_at 是非空字符串
     // 三样都不是 → 说不清，拦住。
+    // **三态必须互斥。**上一版只要 publish_suppressed_at 是非空串就判 suppressed，
+    // 不管 published_at 是什么 —— 一条"既发过又被停过"的自相矛盾记录会被静默接受。
+    // 停发的前提就是它还没发出去；两个字段同时有值，说明这条记录的状态是坏的。
     const sup = rec.publish_suppressed_at;
     if (sup !== undefined && sup !== null) {
-      if (typeof sup === "string" && sup !== "") continue;               // suppressed
-      unclassified.push({ file: f, why: "publish_suppressed_at 不是时间串" });
-      continue;
+      if (typeof sup !== "string" || sup === "") {
+        unclassified.push({ file: f, why: "publish_suppressed_at 不是时间串" });
+        continue;
+      }
+      if (rec.published_at !== null) {
+        unclassified.push({ file: f, why: "既标了已发布又标了已停发，状态自相矛盾" });
+        continue;
+      }
+      continue;                                                          // suppressed
     }
     if (!("published_at" in rec)) {
       unclassified.push({ file: f, why: "缺 published_at，无法归类" }); continue;
@@ -215,8 +224,13 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
     // 那正是"界面说正常、实际不工作"的形状。
     // **没有 plist 不等于没在跑。**孤儿 job（plist 被删了、job 还在 launchd 里）
     // 曾经会被报成 absent —— 一个还在跑的定时器显示成"未启用"。
+    // **没有 plist 时的三种可能，不是两种。**
+    //   查到 job → orphan（还在跑，但按谁的配置说不清）
+    //   明确没有 → absent（正常默认态）
+    //   查不清   → unverifiable —— **不许当成 orphan**，那是在声称一件没查过的事
     phase: installed === null
-      ? (loadedPhase(spawnLaunchctl, null) === "installed_not_loaded" ? "absent" : "orphan")
+      ? { installed_not_loaded: "absent", unverifiable: "unverifiable" }[
+          loadedPhase(spawnLaunchctl, null)] ?? "orphan"
       : installed !== wanted ? "stale"
       : loadedPhase(spawnLaunchctl, expectedJob({ home, codexHome })),
     enabled: installed !== null,
@@ -259,11 +273,9 @@ export const absentJob = (detail) =>
 export function loadedPhase(run = spawnLaunchctl, expect = null) {
   const r = run(["list", LAUNCH_LABEL]);
   if (!r.ok) {
-    // 明确的"没这个服务"和"我查不了"是两件事。
-    if (typeof r.detail === "string" && /could not find|No such/iu.test(r.detail)) {
-      return "installed_not_loaded";
-    }
-    return "unverifiable";
+    // 明确的"没这个服务"和"我查不了"是两件事。**判据跟 absentJob 共用同一份** ——
+    // 这里曾经内联了一个更宽的正则，于是同一个错误串在两处得到不同结论。
+    return absentJob(r.detail) ? "installed_not_loaded" : "unverifiable";
   }
   if (expect === null) return "loaded";
   const parsed = parseLaunchctlList(r.stdout);
@@ -414,9 +426,16 @@ function main() {
   }
 
   if (disable) {
-    if (!st.enabled && st.phase !== "loaded" && st.phase !== "loaded_other") {
+    // **"没有 plist"不等于"没在跑"。**orphan 就是 plist 没了、job 还在 ——
+    // 那种情况下直接说"本来就没启用"，等于把一个还在跑的定时器当成不存在。
+    if (st.phase === "absent") {
       console.log("\n本来就没启用，什么都没做。");
       process.exit(0);
+    }
+    if (st.phase === "unverifiable") {
+      console.error("\nlaunchd 状态查不出来，**不敢说它有没有在跑**。");
+      console.error("什么都没动 —— 先把 launchctl 能不能用查清楚。");
+      process.exit(1);
     }
     const out = spawnLaunchctl(["bootout", "gui/" + process.getuid() + "/" + LAUNCH_LABEL]);
     // **只有"确实没有这个服务"可以忽略。**
@@ -431,6 +450,13 @@ function main() {
       process.exit(1);
     }
     fs.rmSync(st.plist, { force: true });
+    // **卸完再核一次。**bootout 返回 0 不等于它真的走了。
+    const after = loadedPhase(spawnLaunchctl, null);
+    if (after !== "installed_not_loaded") {
+      console.error("\nplist 已删，但 launchd 里仍能查到（" + after + "）。");
+      console.error("**不当作已停用。**");
+      process.exit(1);
+    }
     console.log("\n已停用。plist 已删除，launchd 里也没有它了。");
     process.exit(0);
   }
@@ -466,8 +492,21 @@ function main() {
   console.log("每 30 分钟扫一次全部登记 task；**只发已取得发布资格的内容**。");
 }
 
+/**
+ * launchctl 的**唯一入口，带显式注入口**。
+ *
+ * 评审实测：两条回归隔离了 HOME，却没隔离真实用户的 launchd 域 ——
+ * 他那台机器上有同名 job，临时 HOME 就被判成 orphan，**同一份代码
+ * 在我这里 127/127、在他那里 125/127**。"全绿"带着机器状态前提，
+ * 那个数字就不作数。这个仓库为"测试碰真机"付过四次代价，这是第五次。
+ *
+ * 根因照例不是"某条测试忘了造假"，是**隔离点没接到实现里**。
+ */
+export const LAUNCHCTL_ENV = "FEISHU_BRIDGE_LAUNCHCTL";
+
 function spawnLaunchctl(args) {
-  const r = spawnSync("launchctl", args, { encoding: "utf-8" });
+  const bin = process.env[LAUNCHCTL_ENV] || "launchctl";
+  const r = spawnSync(bin, args, { encoding: "utf-8" });
   // stdout 要带回来 —— 核验"跑的是不是我们这份"靠的就是它。
   if (r.status === 0) return { ok: true, stdout: r.stdout ?? "" };
   return { ok: false, detail: (r.stderr || r.stdout || "status " + r.status).trim() };

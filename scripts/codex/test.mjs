@@ -77,6 +77,22 @@ import {
 } from "../dialogue-shadow-readiness.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "../..");
+
+/**
+ * **所有测试一律走假的 launchctl，永不读真实控制面。**
+ *
+ * 评审实测：两条回归隔离了 HOME 却没隔离 launchd 域，他那台机器上有同名 job，
+ * 于是同一份代码在我这里 127/127、在他那里 125/127。
+ * 造一个"服务不存在"的假 launchctl 放在这里，任何要查服务状态的测试都用它。
+ */
+const fakeLaunchctlDir = fs.mkdtempSync(path.join(os.tmpdir(), "fake-launchctl-"));
+const FAKE_LAUNCHCTL = path.join(fakeLaunchctlDir, "launchctl");
+fs.writeFileSync(FAKE_LAUNCHCTL,
+  '#!/bin/sh\necho "Could not find service in domain" >&2\nexit 113\n', { mode: 0o755 });
+/** 跑子进程时用的环境：真实 launchd 域一律屏蔽掉。 */
+const isolatedEnv = (extra = {}) => ({
+  ...process.env, FEISHU_BRIDGE_LAUNCHCTL: FAKE_LAUNCHCTL, ...extra,
+});
 const THREAD_A = "01911111-2222-7333-8444-555555555555";
 const THREAD_B = "01922222-3333-7444-8555-666666666666";
 const TEMPLATE = {
@@ -247,7 +263,7 @@ test("Codex feishu-mode 默认只读，只有 --apply 才切换精确 task", () 
   writeRegistry([task], path.join(home, "registry.json"));
   const cli = path.join(ROOT, "scripts", "codex", "feishu-mode.mjs");
   const run = (...args) => spawnSync(process.execPath, [cli, "--thread-id", THREAD_A, ...args], {
-    encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   const read = run();
   assert.equal(read.status, 0, read.stderr);
@@ -348,7 +364,7 @@ test("Codex inbound 进程通道不把结构化诊断或 locator 泄露到 Aily 
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "inbound.mjs")], {
     encoding: "utf-8",
     env: {
-      ...process.env,
+      ...isolatedEnv(),
       FEISHU_CODEX_BRIDGE_HOME: home,
       AILY_CLI_CALLER_AGENT_UID: "agent_not_m5codex",
     },
@@ -553,7 +569,7 @@ test("完整入站链路用引用绑定码在多个 pending 中只绑定目标 t
   const result = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], {
     encoding: "utf-8",
     env: {
-      ...process.env,
+      ...isolatedEnv(),
       PATH: bin + path.delimiter + process.env.PATH,
       FEISHU_CODEX_BRIDGE_HOME: home,
       AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid,
@@ -635,7 +651,7 @@ test("暂停连接会同时关闭入站、Stop 入队和发布资格，恢复时
       session_id: THREAD_A, turn_id: "turn_paused", cwd: root, last_assistant_message: "不应入队",
     }),
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(stop.status, 0, stop.stderr);
   assert.equal(listPending({ outboxDir: taskPaths(task, home).outbox }).length, 0);
@@ -723,7 +739,7 @@ test("Codex adapter 轮转期间旧 session 继续路由，认领后新旧代际
   const status = spawnSync(process.execPath, [
     path.join(ROOT, "scripts", "codex", "feishu-status.mjs"),
     "--thread-id", THREAD_A,
-  ], { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   assert.equal(status.status, 0, status.stderr);
   assert.match(status.stdout, /只读历史代际：1 个.*轮转前受理的结果仍会发回原话题/u);
 });
@@ -806,7 +822,7 @@ test("Codex 轮转 CLI 可显式取消 pending，且完全不调用飞书", () =
     "--apply",
   ], {
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(cancelled.status, 0, cancelled.stderr);
   assert.match(cancelled.stdout, /旧话题仍是唯一 active/u);
@@ -906,7 +922,7 @@ test("bind-task 重跑只续期 active pending，不创建或回复第二个话�
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
     "--project", root, "--thread-id", THREAD_A, "--name", "A", "--apply"], {
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(run.status, 0, run.stderr);
   assert.match(run.stdout, /刷新首次绑定窗口/u);
@@ -942,7 +958,7 @@ test("pending 续期不被超过编辑时限的旧话题标题阻断", () => {
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
     "--project", root, "--thread-id", THREAD_A, "--name", "New", "--apply"], {
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(run.status, 0, run.stderr);
   assert.match(run.stdout, /刷新首次绑定窗口/u);
@@ -962,7 +978,7 @@ test("task 控制脚本不猜 thread，暂停和恢复都不调用飞书", () =>
   delete task.topic_generation_state;
   delete task.channel_generation_id;
   writeRegistry([task], path.join(home, "registry.json"));
-  const env = { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home };
+  const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home };
 
   const status = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"),
     "--thread-id", THREAD_A], { encoding: "utf-8", env });
@@ -1256,7 +1272,7 @@ test("Stop 与 watcher 并发写同一事件键时只留下一个文件", () => 
     JSON.stringify(process.execPath) + " " + JSON.stringify(worker) + " &").join("\n") + "\nwait\n";
   const run = spawnSync("/bin/sh", ["-c", command], {
     encoding: "utf-8",
-    env: { ...process.env, TEST_OUTBOX: outboxDir },
+    env: { ...isolatedEnv(), TEST_OUTBOX: outboxDir },
   });
   assert.equal(run.status, 0, run.stderr);
   assert.equal(fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json")).length, 1);
@@ -1335,7 +1351,7 @@ test("像控制命令但附带正文时明确提示格式，绝不执行或登�
       prompt: "$feishu-bind 绑到测试群",
     }),
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(r.status, 0, r.stderr);
   const injected = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
@@ -1357,7 +1373,7 @@ test("$feishu-bind 直接注入幂等绑定命令，不再产生二次确认回�
       prompt: "$feishu-bind",
     }),
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(r.status, 0, r.stderr);
   const injected = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
@@ -1380,7 +1396,7 @@ test("/init 只追加初始化成功后的询问，不触发绑定或飞书写�
   const r = spawnSync(process.execPath, [hook], {
     input: JSON.stringify({ session_id: THREAD_A, turn_id: "turn_init", cwd: "/work", prompt: "/init" }),
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(r.status, 0, r.stderr);
   const injected = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
@@ -1404,7 +1420,7 @@ test("Prompt hook 在 Aily/M5Codex 回合只注入数据面命令，不记录 le
     }),
     encoding: "utf-8",
     env: {
-      ...process.env,
+      ...isolatedEnv(),
       FEISHU_CODEX_BRIDGE_HOME: home,
       AILY_CLI_SESSION_ID: "session_feishu",
       AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid,
@@ -1422,7 +1438,7 @@ test("Prompt hook 在 Aily/M5Codex 回合只注入数据面命令，不记录 le
     input: JSON.stringify({ session_id: THREAD_B, prompt: "$feishu-bind" }),
     encoding: "utf-8",
     env: {
-      ...process.env,
+      ...isolatedEnv(),
       FEISHU_CODEX_BRIDGE_HOME: home,
       AILY_CLI_SESSION_ID: "session_feishu",
       AILY_CLI_CALLER_AGENT_UID: "agent_other",
@@ -1460,7 +1476,7 @@ test("目标 codex-run 优先于残留 Aily 环境，明确禁止再次路由", 
     input: JSON.stringify({ session_id: THREAD_A, turn_id: "turn_routed", cwd: "/work", prompt: "/init" }),
     encoding: "utf-8",
     env: {
-      ...process.env,
+      ...isolatedEnv(),
       FEISHU_CODEX_BRIDGE_HOME: home,
       FEISHU_BRIDGE_ROLE: "codex-run",
       AILY_CLI_SESSION_ID: "should_not_route",
@@ -1652,7 +1668,7 @@ printf '%s' "$prompt" > "$last"
     "--log", log, "--stderr", stderr, "--last-message", last, "--exit-receipt", exit,
     "--codex-bin", fake,
   ], { encoding: "utf-8", env: {
-    ...process.env,
+    ...isolatedEnv(),
     EXPECTED_THREAD: THREAD_A,
     ARGS_OUT: argsOut,
     ENV_OUT: envOut,
@@ -1685,7 +1701,7 @@ test("Codex Stop hook：相同正文的两个 turn 各入队一次，同一 turn
   const run = (turn) => spawnSync(process.execPath, [hook], {
     input: JSON.stringify({ session_id: THREAD_A, turn_id: turn, cwd: root, last_assistant_message: "一样" }),
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(run("turn-1").status, 0);
   assert.equal(run("turn-2").status, 0);
@@ -1702,7 +1718,7 @@ test("Codex UserPromptSubmit 与 Stop 按 turn_id 配对本地输入，入站 ru
   writeRegistry([task], path.join(home, "registry.json"));
   const promptHook = path.join(ROOT, "scripts", "codex", "prompt-hook.mjs");
   const stopHook = path.join(ROOT, "scripts", "codex", "stop-hook.mjs");
-  const env = { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home };
+  const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home };
 
   const submitted = spawnSync(process.execPath, [promptHook], {
     input: JSON.stringify({
@@ -1752,7 +1768,7 @@ test("Codex Stop hook 自动发布本地回合，并保留旧的非 eligible 积
       session_id: THREAD_A, turn_id: "turn-auto", cwd: root, last_assistant_message: "新答复",
     }),
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /已自动发布到绑定话题/u);
@@ -1785,7 +1801,7 @@ test("关闭自动发布时 watcher 只把严格完成的最终答复兜底入�
   fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "watcher final");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
-  ], { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(listPending({ outboxDir: paths.outbox }).length, 1);
   assert.equal(fs.existsSync(paths.sessionLock), false);
@@ -1820,7 +1836,7 @@ test("Codex watcher 严格完成后释放 Dialogue 活动回合", () => {
   fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "dialogue final");
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
-  ], { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   assert.equal(run.status, 0, run.stderr);
   const after = loadRegistry(path.join(home, "registry.json")).tasks[0];
   assert.equal(interactionPolicyForTask(after).state.dialogue.active_turn, null);
@@ -1854,7 +1870,7 @@ test("watcher 抑制递归产生的错误答复，只保留风险回执", () => 
   fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "EPERM stack");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
-  ], { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   assert.equal(r.status, 1, r.stderr);
   const pending = listPending({ outboxDir: paths.outbox });
   assert.equal(pending.length, 1);
@@ -1882,7 +1898,7 @@ test("watcher 对启动前 Git 预检失败给出真实且脱敏的风险回执"
     "Not inside a trusted directory and --skip-git-repo-check was not specified. secret-token\n");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
-  ], { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   assert.equal(r.status, 1, r.stderr);
   const pending = listPending({ outboxDir: paths.outbox });
   assert.equal(pending.length, 1);
@@ -1897,7 +1913,7 @@ test("安装器默认 dry-run，不创建 hooks 或状态", () => {
   const home = path.join(dir, "bridge-home");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs")], {
     encoding: "utf-8",
-    env: { ...process.env, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /dry-run/);
@@ -1920,7 +1936,7 @@ test("安装器在隔离 HOME 只追加 hooks、渲染技能路径且保留已�
   writeRegistry([legacyTask], path.join(home, "registry.json"));
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
     encoding: "utf-8",
-    env: { ...process.env, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(r.status, 0, r.stderr);
   const hooks = JSON.parse(fs.readFileSync(path.join(codexHome, "hooks.json"), "utf-8"));
@@ -1964,7 +1980,7 @@ test("入站前置回执目录不可写时只返回脱敏错误，不泄露 Node
   fs.writeFileSync(blockedHome, "blocked");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "inbound.mjs")], {
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: blockedHome },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: blockedHome },
   });
   assert.equal(r.status, 1);
   assert.match(r.stdout, /系统错误/u);
@@ -2149,7 +2165,7 @@ test("登记表不可读时，安装器要在 dry-run 退出之前就说出来",
   fs.writeFileSync(path.join(home, "registry.json"), "{ 坏掉的 json");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs")], {
     encoding: "utf-8",
-    env: { ...process.env, CODEX_HOME: path.join(dir, "codex-home"), FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), CODEX_HOME: path.join(dir, "codex-home"), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(r.status, 0, r.stderr);
   const beforeExit = r.stdout.slice(0, r.stdout.indexOf("[dry-run]"));
@@ -2174,7 +2190,7 @@ test("安装器预览的待迁移数必须等于实际会改的数", () => {
   }));
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs")], {
     encoding: "utf-8",
-    env: { ...process.env, CODEX_HOME: path.join(dir, "codex-home"), FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), CODEX_HOME: path.join(dir, "codex-home"), FEISHU_CODEX_BRIDGE_HOME: home },
   });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /待迁移 3 个 task/u, "预览报的数是过滤视图的话这里会是 1");
@@ -2274,7 +2290,7 @@ test("bind-task 显式跨群 apply 把根消息发到目标群并登记该 task 
     "--chat-name", "智能体进化",
     "--apply"], {
     encoding: "utf-8",
-    env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home, FAKE_CALLS_FILE: calls },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home, FAKE_CALLS_FILE: calls },
   });
   assert.equal(run.status, 0, run.stderr);
   assert.match(run.stdout, /群\s+智能体进化/u);
@@ -2406,14 +2422,14 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
   const installed = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
       encoding: "utf-8",
-      env: { ...process.env, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+      env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
     });
   assert.equal(installed.status, 0, "夹具依赖安装器成功：" + installed.stderr);
 
   const run = () => spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "doctor.mjs"), "--json"], {
     encoding: "utf-8",
     env: {
-      ...process.env,
+      ...isolatedEnv(),
       PATH: bin + path.delimiter + (process.env.PATH ?? ""),
       CODEX_HOME: codexHome,
       FEISHU_CODEX_BRIDGE_HOME: home,
@@ -2565,7 +2581,7 @@ test("Codex 真实 CLI：缺 expectation / 纯空白 / 代际不可读，都不�
   const cliPath = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
   const run = (home, ...args) => spawnSync(process.execPath,
     [cliPath, "--thread-id", THREAD_A, ...args],
-    { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   const untouched = (rec) =>
     JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at;
 
@@ -2636,7 +2652,7 @@ test("Codex 抑制命令：真实入口 —— 预览后轮转必须 rotated 且
 
   const cli = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
   const run = (...args) => spawnSync(process.execPath, [cli, "--thread-id", THREAD_A, ...args],
-    { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   const suppressed = () => JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at;
 
   // 预览：能看到那一条。
@@ -2724,7 +2740,7 @@ test("Codex 预览和 --apply 不许给出相反结论：损坏记录在预览�
   const cliPath = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
   const run = (...args) => spawnSync(process.execPath,
     [cliPath, "--thread-id", THREAD_A, ...args],
-    { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
 
   const preview = run("--all-generations");
   assert.match(preview.stdout, /目标代际是坏的/u, "预览就要点名损坏");
@@ -2791,7 +2807,7 @@ test("安装器只许写进 CODEX_HOME —— 真机的 ~/.codex 一个字节都
   const r = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
       encoding: "utf-8",
-      env: { ...process.env, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+      env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
     });
   assert.equal(r.status, 0, r.stderr);
 
@@ -2853,7 +2869,7 @@ test("迁移必须收敛旧克隆的 hook，而不是在旁边再加一条", () 
   const r = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
       encoding: "utf-8",
-      env: { ...process.env, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+      env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
     });
   assert.equal(r.status, 0, r.stderr);
 
@@ -2901,7 +2917,7 @@ test("装好的 runtime 必须能自证 —— doctor 在自己的运行环境�
   writeRegistry([], path.join(bridge, "registry.json"));
   fs.writeFileSync(path.join(bridge, "chain-config.json"),
     JSON.stringify({ ...TEMPLATE, lark_cli_bin: path.join(bin, "lark-cli") }));
-  const env = { ...process.env, HOME: fakeHome, CODEX_HOME: codexHome,
+  const env = { ...isolatedEnv(), HOME: fakeHome, CODEX_HOME: codexHome,
     FEISHU_CODEX_BRIDGE_HOME: bridge, PATH: bin + path.delimiter + process.env.PATH };
 
   assert.equal(spawnSync(process.execPath,
@@ -2992,12 +3008,112 @@ test("停用：卸载失败不许删 plist —— 还在跑的定时器不能被
 
   const r = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--disable", "--apply"],
-    { encoding: "utf-8", env: { ...process.env, HOME: fakeHome, CODEX_HOME: codexHome,
-      FEISHU_CODEX_BRIDGE_HOME: bridge, PATH: bin + path.delimiter + process.env.PATH } });
+    { encoding: "utf-8", env: isolatedEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
+      FEISHU_CODEX_BRIDGE_HOME: bridge,
+      // **这条测的就是"卸载失败"**，要用自己那份会失败的假 launchctl，
+      // 不是全局那份"服务不存在"的。
+      FEISHU_BRIDGE_LAUNCHCTL: path.join(bin, "launchctl"),
+      PATH: bin + path.delimiter + process.env.PATH }) });
 
   assert.notEqual(r.status, 0, "卸载失败必须非零退出：" + r.stdout);
   assert.equal(fs.existsSync(plist), true, "**plist 不许被删**");
   assert.match(r.stderr, /卸载失败/u);
+});
+
+test("三态必须互斥：既标已发布又标已停发的记录是坏的", () => {
+  // 评审：上一版只要 publish_suppressed_at 是非空串就判 suppressed，
+  // 不管 published_at 是什么 —— **一条自相矛盾的记录被静默接受**。
+  // 停发的前提就是它还没发出去。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-excl-"));
+  const put = (n, rec) => fs.writeFileSync(path.join(dir, n), JSON.stringify(rec));
+  put("both.json", { published_at: "2026-08-24T00:00:00Z",
+    publish_suppressed_at: "2026-08-24T00:00:00Z" });
+  const a = auditOutbox(dir);
+  assert.equal(a.pending, 0);
+  assert.equal(a.unclassified.length, 1, "**自相矛盾必须被点出来**");
+  assert.match(a.unclassified[0].why, /自相矛盾/u);
+
+  // 正常的 suppressed（published_at 是 null）仍然算 suppressed。
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "cx-excl2-"));
+  fs.writeFileSync(path.join(dir2, "s.json"), JSON.stringify({
+    published_at: null, publish_suppressed_at: "2026-08-24T00:00:00Z" }));
+  assert.deepEqual(auditOutbox(dir2), { ok: true, pending: 0, unclassified: [] });
+});
+
+test("loadedPhase 与 absentJob 必须共用同一份缺席判据", () => {
+  // 两处各写一份的话，同一个错误串在两处得到不同结论 ——
+  // absentJob 说"这是真失败"，loadedPhase 却说"服务不存在"。
+  for (const detail of ["Boot-out failed: 5: Input/output error",
+    "could not load service", "job not loaded correctly"]) {
+    assert.equal(absentJob(detail), false, "这是真失败：" + detail);
+    assert.equal(loadedPhase(() => ({ ok: false, detail }), null), "unverifiable",
+      "**真失败在 loadedPhase 里也必须是 unverifiable，不是 installed_not_loaded**：" + detail);
+  }
+  for (const detail of ["Could not find service \"x\" in domain", "No such process"]) {
+    assert.equal(absentJob(detail), true);
+    assert.equal(loadedPhase(() => ({ ok: false, detail }), null), "installed_not_loaded");
+  }
+});
+
+test("没有 plist 时的三种可能：absent / orphan / unverifiable，查不清不许报 orphan", () => {
+  // 评审：查不清就报 orphan，等于声称一件没查过的事 —— 而 orphan 是"还在跑"，
+  // 会把人引去做一次不必要的卸载。
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const codexHome = path.join(dir, "codex");
+  const bridge = path.join(dir, "bridge");
+  fs.mkdirSync(fakeHome, { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(bridge, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));
+  const bin = path.join(dir, "bin");
+  fs.mkdirSync(bin, { recursive: true });
+
+  const withLaunchctl = (script) => {
+    const f = path.join(bin, "launchctl");
+    fs.writeFileSync(f, script, { mode: 0o755 });
+    const r = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "drain-service.mjs")],
+      { encoding: "utf-8", env: isolatedEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
+        FEISHU_CODEX_BRIDGE_HOME: bridge, FEISHU_BRIDGE_LAUNCHCTL: f }) });
+    return r.stdout;
+  };
+
+  // ① 明确没有 → absent
+  assert.match(withLaunchctl('#!/bin/sh\necho "Could not find service" >&2\nexit 113\n'),
+    /未启用（安装后的默认态/u, "明确没有就是 absent");
+
+  // ② 查到 job、没有 plist → orphan
+  assert.match(withLaunchctl('#!/bin/sh\necho \'{ "Program" = "/x"; "ProgramArguments" = ( "/x"; ); };\'\nexit 0\n'),
+    /没有 plist，但 launchd 里还有同名 job/u, "查到 job 就是 orphan");
+
+  // ③ **查不清 → unverifiable，不许报 orphan**
+  const unclear = withLaunchctl('#!/bin/sh\necho "Operation not permitted" >&2\nexit 1\n');
+  assert.doesNotMatch(unclear, /没有 plist，但 launchd 里还有同名 job/u,
+    "**查不清不许说成 orphan** —— 那是在声称一件没查过的事");
+});
+
+test("launchctl 必须走注入口 —— 测试不许读真实控制面", () => {
+  // 评审实测：同一份代码在我这里 127/127、在他那里 125/127，
+  // 因为两条回归隔离了 HOME 却没隔离 launchd 域。
+  // **这条钉的是注入口本身存在且被尊重。**
+  const dir = temp();
+  const marker = path.join(dir, "CALLED");
+  const f = path.join(dir, "launchctl");
+  fs.writeFileSync(f, '#!/bin/sh\necho called >> ' + JSON.stringify(marker) +
+    '\necho "Could not find service" >&2\nexit 113\n', { mode: 0o755 });
+  const bridge = path.join(dir, "bridge");
+  fs.mkdirSync(bridge, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs")],
+    { encoding: "utf-8", env: isolatedEnv({ HOME: path.join(dir, "home"),
+      CODEX_HOME: path.join(dir, "codex"), FEISHU_CODEX_BRIDGE_HOME: bridge,
+      FEISHU_BRIDGE_LAUNCHCTL: f }) });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fs.existsSync(marker), true,
+    "**注入口必须被真的用上** —— 没被调用说明它还在读别的地方");
 });
 
 test("「本来就没有这个服务」的判据不许放宽", () => {
@@ -3109,7 +3225,7 @@ test("hook 往返：含单引号的路径，装两次仍然只有一条", () => 
   fs.mkdirSync(codexHome, { recursive: true });
   fs.mkdirSync(home, { recursive: true });
   writeRegistry([], path.join(home, "registry.json"));
-  const env = { ...process.env, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home };
+  const env = { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home };
   const install = () => spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
 
@@ -3159,7 +3275,7 @@ test("技能要逐字节比对 —— 「文件在」不等于「装对了」", 
   const runtimeCurrent = path.join(codexHome, "feishu-bridge", "runtime", "current");
   assert.equal(spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
-    { encoding: "utf-8", env: { ...process.env, CODEX_HOME: codexHome,
+    { encoding: "utf-8", env: { ...isolatedEnv(), CODEX_HOME: codexHome,
       FEISHU_CODEX_BRIDGE_HOME: home } }).status, 0);
 
   const audit = () => auditSkills({ repoRoot: ROOT, codexHome, runtimeCurrent, bridgeHome: home });
@@ -3354,7 +3470,7 @@ test("launchd 加载失败必须非零退出 —— 不许报成「已启用」"
     '  bootstrap) echo "Load failed: 5: Input/output error" >&2; exit 5;;\nesac\nexit 0\n',
     { mode: 0o700 });
 
-  const env = { ...process.env, HOME: fakeHome, PATH: bin + path.delimiter + process.env.PATH,
+  const env = { ...isolatedEnv(), HOME: fakeHome, PATH: bin + path.delimiter + process.env.PATH,
     CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridge };
   // 先把运行时装好，否则会卡在运行时那道门槛上，测不到我们要测的东西。
   const installed = spawnSync(process.execPath,
@@ -3617,7 +3733,7 @@ test("Codex 抑制命令：目标和范围都必须显式给", () => {
     ["--all-generations", "--apply"],                                      // 没给目标
   ]) {
     const r = spawnSync(process.execPath, [cli, ...args],
-      { encoding: "utf-8", env: { ...process.env, FEISHU_CODEX_BRIDGE_HOME: home } });
+      { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
     assert.notEqual(r.status, 0, args.join(" ") + " 竟然被接受了");
     assert.equal(fs.readFileSync(rec, "utf-8"), body, args.join(" ") + "：outbox 不许被动");
   }

@@ -80,6 +80,8 @@ export const SYNC_REJECT = Object.freeze({
   IDENTITY_CHANGED: "subscription_identity_changed",
   VERSION_NOT_ADVANCED: "version_not_advanced",
   SNAPSHOTS_INVALID: "snapshots_invalid",
+  NEXT_MISSING: "next_missing",
+  DUPLICATE_BINDING: "duplicate_binding_ref",
   OTHERS_INVALID: "others_invalid",
   NAMESPACE_INVALID: "runtime_namespace_invalid",
   MIGRATION_TARGET_INVALID: "migration_target_invalid",
@@ -219,13 +221,17 @@ export function planSubscriptionSync(input) {
   const prev = validateSubscription(previous);
   if (!prev.ok) return reject(SYNC_REJECT.PREVIOUS_INVALID, { problems: prev.problems ?? null });
 
-  if (next !== null && next !== undefined) {
+  // **漏传不等于撤销。**上一版把 undefined 一并当成"订阅被撤销"，于是
+  // 一次参数漏传就会生成一整批 suspend 计划，和显式撤销一模一样 ——
+  // 控制面参数漏传绝不能降级成有损操作。只有显式 null 才是撤销。
+  if (next === undefined) return reject(SYNC_REJECT.NEXT_MISSING);
+  if (next !== null) {
     const valid = validateSubscription(next);
     if (!valid.ok) return reject(SYNC_REJECT.SUBSCRIPTION_INVALID, { problems: valid.problems ?? null });
     // 换了 subscription_id 不是"更新"，是把一条订阅替换成另一条 —— 受影响面完全不同。
     if (next.subscription_id !== previous.subscription_id) return reject(SYNC_REJECT.IDENTITY_CHANGED);
   }
-  const revokedInput = next === null || next === undefined;
+  const revokedInput = next === null;
 
   // **版本单调性先于 no-op。**上一版先比指纹：内容相同而版本从 2 退回 1 时
   // 直接判 no-op 放行 —— 版本回退本身就违反控制面契约，不该因为内容相同而被赦免。
@@ -236,10 +242,19 @@ export function planSubscriptionSync(input) {
   if (!Array.isArray(snapshots)) {
     return reject(SYNC_REJECT.SNAPSHOTS_INVALID, { at: -1, problem: "not_an_array" });
   }
+  const seenBindings = new Set();
   for (const [i, snap] of snapshots.entries()) {
     if (!validateDialogueBindingAuthorizationSnapshot(snap).ok) {
       return reject(SYNC_REJECT.SNAPSHOTS_INVALID, { at: i, problem: "invalid_snapshot" });
     }
+    // **同一个 binding 只能有一份当前授权。**同一 binding_ref 出现两次（无论是
+    // 重复传入还是两个不同 revision 同时在场），说明输入本身就说不清哪份算数。
+    // 放行的代价是落盘时对同一条 binding 重复执行 —— 而计数还会显示 2，
+    // 让人以为影响面比实际更大。
+    if (seenBindings.has(snap.binding_ref)) {
+      return reject(SYNC_REJECT.DUPLICATE_BINDING, { at: i, bindingRef: snap.binding_ref });
+    }
+    seenBindings.add(snap.binding_ref);
   }
 
   if (!Array.isArray(others)) return reject(SYNC_REJECT.OTHERS_INVALID, { at: -1, problem: "not_an_array" });
@@ -318,6 +333,8 @@ const REJECT_TEXT = {
   [SYNC_REJECT.IDENTITY_CHANGED]: "前后不是同一条订阅 —— 那是替换，不是更新",
   [SYNC_REJECT.VERSION_NOT_ADVANCED]: "授权变了但版本没往前走，之后没法判断哪份更新",
   [SYNC_REJECT.SNAPSHOTS_INVALID]: "授权快照说不清，缺了它没法比授权",
+  [SYNC_REJECT.NEXT_MISSING]: "没告诉我改成什么样 —— 漏传不等于撤销，撤销要显式传 null",
+  [SYNC_REJECT.DUPLICATE_BINDING]: "同一条 binding 出现了多份授权快照，说不清哪份算数",
   [SYNC_REJECT.OTHERS_INVALID]: "其余订阅列表说不清",
   [SYNC_REJECT.NAMESPACE_INVALID]: "没给运行时命名空间，派生不出可比较的引用",
   [SYNC_REJECT.MIGRATION_TARGET_INVALID]: "迁移目标不是一个订阅 id —— 不猜你是不是想迁",

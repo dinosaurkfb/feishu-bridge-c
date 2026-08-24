@@ -8036,6 +8036,59 @@ test("输入契约不许 fail-open —— 一个算错的控制面比没有控�
     SYNC_REJECT.IDENTITY_CHANGED);
 });
 
+test("漏传 next 不等于撤销 —— 参数漏传不许降级成有损操作", () => {
+  // 评审实测：遗漏 next 会成功生成一整批 subscription_revoked 暂停计划，
+  // 跟显式撤销**一模一样**。契约写的是 next: null 才是撤销。
+  // 一次参数漏传就把一批 binding 停掉，而调用方还收到 ok:true。
+  const snap = syncSnapshot("m1");
+  const missing = planSubscriptionSync({
+    runtimeNamespace: SYNC_NS, previous: syncSub(), snapshots: [snap] });
+  assert.equal(missing.ok, false, "漏传 next 必须拒绝");
+  assert.equal(missing.reason, SYNC_REJECT.NEXT_MISSING);
+  assert.match(renderSyncPlan(missing), /漏传不等于撤销/u);
+
+  // 显式写 undefined 也是漏传 —— 不许因为"写出来了"就当成有意图。
+  assert.equal(plan({ previous: syncSub(), next: undefined, snapshots: [snap] }).reason,
+    SYNC_REJECT.NEXT_MISSING);
+
+  // 只有显式 null 才撤销，行为不变。
+  const revoked = plan({ previous: syncSub(), next: null, snapshots: [snap] });
+  assert.equal(revoked.ok, true);
+  assert.equal(revoked.plans[0].reason, "subscription_revoked");
+});
+
+test("同一条 binding 只能有一份当前授权，重复输入要 fail-closed", () => {
+  // 评审实测：同一份合法快照传两次 → 两条针对同一 bindingRef 的暂停计划，计数也是 2。
+  // 落盘会对同一条 binding 重复执行；计数还会让人以为影响面比实际更大。
+  const snap = syncSnapshot("n1");
+  const dup = plan({ previous: syncSub(), next: null, snapshots: [snap, snap] });
+  assert.equal(dup.ok, false, "重复的 binding_ref 必须拒绝");
+  assert.equal(dup.reason, SYNC_REJECT.DUPLICATE_BINDING);
+  assert.equal(dup.bindingRef, snap.binding_ref, "要指出是哪一条");
+
+  // **不同 revision 同时在场也算说不清哪份算数**，不是"取新的那份"——
+  // 计划器不该替人决定哪一份是当前授权。
+  //
+  // 注意这里必须造一份**真的合法**的新 revision：直接改 authorization_revision
+  // 会让 snapshot_id 对不上，那条会先被当成非法快照拒掉 —— 测到的就不是重复了。
+  const bumped = materializeDialogueBindingAuthorization({
+    runtimeNamespace: SYNC_NS, endpointId: SYNC_EP, previousSnapshot: snap,
+    subscription: syncSub({ version: 2, scope: { ...syncSub().scope, sender_ids: ["u_frank", "u_two"] } }),
+    binding: { private_binding_key: "pbk-n1",
+      local_target_id: "target_" + SYNC_HEX.slice(0, 20) + syncHexLabel("n1"), status: "active" },
+  });
+  assert.equal(bumped.ok, true, bumped.reason ?? "");
+  assert.equal(bumped.snapshot.binding_ref, snap.binding_ref, "同一条 binding");
+  assert.notEqual(bumped.snapshot.authorization_revision, snap.authorization_revision);
+  assert.equal(plan({ previous: syncSub(), next: null, snapshots: [snap, bumped.snapshot] }).reason,
+    SYNC_REJECT.DUPLICATE_BINDING);
+
+  // 不同 binding 正常并存。
+  const two = plan({ previous: syncSub(), next: null, snapshots: [snap, syncSnapshot("n2")] });
+  assert.equal(two.ok, true);
+  assert.equal(two.counts.suspend, 2);
+});
+
 test("显式控制参数的类型错误不许降级成另一种动作", () => {
   // 评审实测：migrateTo: 42 被当成"没指定迁移"，静默生成暂停计划 ——
   // **人明明按了迁移，系统做了别的事，还报成功。**只有 null 才是"没指定"。

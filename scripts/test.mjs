@@ -223,6 +223,18 @@ function testRegistryRoot({ tmpRoot, home }) {
   return { ok: true, root: realTmp };
 }
 
+/**
+ * 隔离之后这一轮该用的环境。**纯函数：传什么 env 进来就按什么算。**
+ *
+ * 抽出来是为了让"产品环境变量一律被覆盖"这件事**可以直接断言**。
+ * 之前它只在启动那几行里发生，要验就得 spawn 一个设了变量的子进程并期待它跑完 ——
+ * 而跑得完的子进程会执行到 spawn 测试、再生孙进程，无限递归。
+ * 现在传一个假的 env 对象进来就能验，不用启动任何进程。
+ */
+function isolatedEnv({ env, registryDir }) {
+  return { ...env, FEISHU_BRIDGE_REGISTRY: path.join(registryDir, "registry.json") };
+}
+
 const registryRoot = testRegistryRoot({ tmpRoot: os.tmpdir(), home: os.homedir() });
 if (!registryRoot.ok) {
   console.error("拒绝运行：临时目录 " + registryRoot.tmp +
@@ -237,7 +249,7 @@ if (fs.readdirSync(registryDir).length !== 0) {
 }
 fs.chmodSync(registryDir, 0o700);
 // **产品环境变量一律覆盖**，外面设成什么都不影响这一轮。
-process.env.FEISHU_BRIDGE_REGISTRY = path.join(registryDir, "registry.json");
+Object.assign(process.env, isolatedEnv({ env: process.env, registryDir }));
 
 let passed = 0;
 let failed = 0;
@@ -9275,6 +9287,36 @@ test("测试登记表由本轮自己新建，外面设什么都不作数", () =>
   const src = fs.readFileSync(path.resolve("scripts", "test.mjs"), "utf-8");
   assert.equal(src.includes(legacyOverride), false,
     "外部覆盖入口必须彻底删掉，不是留着不用");
+});
+
+test("产品环境变量一律被覆盖 —— 传个假 env 就能验，不用启动进程", () => {
+  // 这条补的是评审那句非阻断建议。**"外面设了也不作数"以前只能间接验**：
+  // 要么在设了变量的条件下重跑整套（我当时就是这么验的，属于环境相关），
+  // 要么 spawn 一个设了变量的子进程期待它跑完 —— 而跑得完的子进程会执行到
+  // spawn 测试、再生孙进程，无限递归。
+  //
+  // 抽成纯函数之后，传一个假 env 进来就能直接断言。
+  const dir = "/tmp/bridge-fake-registry-dir";
+  const want = path.join(dir, "registry.json");
+  const prod = path.join(os.homedir(), ".claude", "feishu-bridge", "registry.json");
+
+  // 外面指向生产登记表 → 必须被覆盖。
+  assert.equal(isolatedEnv({ env: { FEISHU_BRIDGE_REGISTRY: prod }, registryDir: dir })
+    .FEISHU_BRIDGE_REGISTRY, want);
+  // 外面指向别的什么 → 一样被覆盖。
+  assert.equal(isolatedEnv({ env: { FEISHU_BRIDGE_REGISTRY: "/somewhere/else.json" }, registryDir: dir })
+    .FEISHU_BRIDGE_REGISTRY, want);
+  // 外面什么都没设 → 也要设上。
+  assert.equal(isolatedEnv({ env: {}, registryDir: dir }).FEISHU_BRIDGE_REGISTRY, want);
+
+  // **别的环境变量不许被顺手改掉。**隔离只管这一个键。
+  const kept = isolatedEnv({ env: { PATH: "/bin", HOME: "/h", FEISHU_BRIDGE_REGISTRY: prod }, registryDir: dir });
+  assert.equal(kept.PATH, "/bin");
+  assert.equal(kept.HOME, "/h");
+
+  // 而这一轮真实用的那个，确实来自本轮新建的目录。
+  assert.equal(process.env.FEISHU_BRIDGE_REGISTRY,
+    isolatedEnv({ env: {}, registryDir }).FEISHU_BRIDGE_REGISTRY);
 });
 
 test("临时目录本身在 HOME 里就拒绝启动", () => {

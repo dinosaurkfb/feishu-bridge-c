@@ -8975,6 +8975,20 @@ test("落盘：被改过的恢复清单一律拒 —— 五种改法，写文件
     // **改了 target 但保持旧 plan_id** —— 重算指纹才拦得住。
     ["改 target 保旧指纹", null],
   ];
+  // 再往前物化两版，得到 revision = expect + 2 的**合法**快照。
+  const mid = materializeDialogueBindingAuthorization({
+    runtimeNamespace: SYNC_NS, endpointId: SYNC_EP,
+    subscription: syncSub({ version: 2, scope: { ...syncSub().scope, sender_ids: ["u_a"] } }),
+    binding: w.binding, previousSnapshot: w.snap });
+  assert.equal(mid.ok, true, mid.reason ?? "");
+  const skipRevision = materializeDialogueBindingAuthorization({
+    runtimeNamespace: SYNC_NS, endpointId: SYNC_EP,
+    subscription: syncSub({ version: 3, scope: { ...syncSub().scope, sender_ids: ["u_b"] } }),
+    binding: w.binding, previousSnapshot: mid.snapshot });
+  assert.equal(skipRevision.ok, true, skipRevision.reason ?? "");
+  assert.equal(skipRevision.snapshot.authorization_revision,
+    w.snap.authorization_revision + 2, "夹具要的就是跳级");
+
   const bumped = materializeDialogueBindingAuthorization({
     runtimeNamespace: SYNC_NS, endpointId: SYNC_EP,
     subscription: syncSub({ version: 7, scope: { ...syncSub().scope, sender_ids: ["u_other"] } }),
@@ -9075,6 +9089,18 @@ test("落盘：被改过的恢复清单一律拒 —— 五种改法，写文件
       writes: [{ ...good.writes[0],
         expect: { ...good.writes[0].expect,
           subscription_version: good.writes[0].target.subscription_version + 1 } }] })],
+    // **revision 跳级**：清单和指纹都自洽，只有"严格 +1"这条约束挡得住。
+    // 造一份 revision 从 N 跳到 N+2 的合法快照 —— 它是合法的，但**不是这个计划
+    // 能产生的 resnapshot**。
+    ["授权 revision 跳级", resign({ ...good,
+      writes: [{ ...good.writes[0],
+        expect: { ...good.writes[0].expect,
+          authorization_revision: good.writes[0].target.authorization_revision - 2 } }] })],
+    // **revision 跳级**：清单和指纹都自洽，只有"严格 +1"这条约束挡得住。
+    // 注意要往上抬 target，不能往下压 expect —— 压到 0 会先被"必须是正整数"
+    // 那条拦下，**测到的就不是跳级了**（第一版就是这么写的，变异照样绿）。
+    ["授权 revision 跳级", resign({ ...good, writes: [{ ...good.writes[0],
+      target: skipRevision.snapshot }] })],
     ["授权 revision 没往前走", resign({ ...good,
       writes: [{ ...good.writes[0],
         expect: { ...good.writes[0].expect,

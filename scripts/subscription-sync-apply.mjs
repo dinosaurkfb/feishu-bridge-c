@@ -292,9 +292,12 @@ function validateJournal(j, { operationId = null } = {}) {
     // **实际完成一次隐式迁移**。而迁移本该由人显式指定目标并逐项校验授权覆盖。
     // 花整轮力气把迁移关在门外，这里却留了一道后门。
     if (w.target.subscription_id !== w.expect.subscription_id) return false;
-    // 授权 revision 只能往前走：物化新快照必然 +1，回退或原地不动说明这份清单
-    // 不是照着当前那一版算出来的。
-    if (!(w.target.authorization_revision > w.expect.authorization_revision)) return false;
+    // **授权 revision 必须严格 +1，不是"往前走就行"。**
+    // 正式 materializer 的合法演进就是 +1；写 `>` 的话，可以造一份 revision
+    // 从 4 跳到 6 的合法快照，重算 snapshot_id、指纹和 plan_id 之后照样通过 ——
+    // **而那不是这个计划能产生的 resnapshot。**
+    // "往前走"和"就是下一版"是两件事。
+    if (w.target.authorization_revision !== w.expect.authorization_revision + 1) return false;
     // 订阅版本不许倒退。
     if (w.target.subscription_version < w.expect.subscription_version) return false;
   }

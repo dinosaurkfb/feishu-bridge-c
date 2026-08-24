@@ -3730,6 +3730,9 @@ test("Claude UserPromptSubmit 与 Stop 配对本地输入，飞书来源戳只�
     ...process.env,
     FEISHU_BRIDGE_REGISTRY: registryFile,
     FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+    // 钩子的日志路径写死在 os.homedir() 上 —— 不换 HOME 就会写进**真实的**
+    // ~/.claude/feishu-bridge/stop-hook.log，超过 1 MiB 还会删掉重建。
+    HOME: home,
   };
   const initHook = path.join(path.resolve("scripts"), "init-hook.mjs");
   const stopHook = path.join(path.resolve("scripts"), "stop-hook.mjs");
@@ -8923,12 +8926,20 @@ test("真实 Stop 钩子会把「非当前项目」说出来 —— 纯函数对
   const transcript = path.join(dir, "t.jsonl");
   fs.writeFileSync(transcript, "刚才在讨论 " + proj + " 的问题\n");
 
+  // **子进程也得换 HOME。**只换 registry 是不够的：钩子的日志路径写死在
+  // os.homedir() 上，于是跑一次测试就往**真实的** ~/.claude/feishu-bridge/stop-hook.log
+  // 里写一次，超过 1 MiB 还会把它删掉重建。我自己就是靠翻那个日志查出
+  // ReferenceError 的 —— 也就是说这条测试一直在污染我用来排障的东西。
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-stophome-"));
+  const prodLog = path.join(os.homedir(), ".claude", "feishu-bridge", "stop-hook.log");
+  const prodBefore = fs.existsSync(prodLog) ? fs.statSync(prodLog).size : null;
+
   const rawHook = (cwd, extra = {}) => {
     const run = spawnSync(process.execPath, [path.resolve("scripts", "stop-hook.mjs")], {
       encoding: "utf-8",
       input: JSON.stringify({ cwd, transcript_path: transcript, session_id: "s1",
         last_assistant_message: "hi", ...extra }),
-      env: { ...process.env, FEISHU_BRIDGE_REGISTRY: reg },
+      env: { ...process.env, FEISHU_BRIDGE_REGISTRY: reg, HOME: fakeHome },
     });
     assert.equal(run.status, 0, run.stderr);
     return run.stdout.trim();
@@ -8958,6 +8969,68 @@ test("真实 Stop 钩子会把「非当前项目」说出来 —— 纯函数对
   for (const f of fs.readdirSync(ob)) fs.rmSync(path.join(ob, f));
   assert.equal(rawHook(elsewhere, { last_assistant_message: "" }), "",
     "非当前项目无事可报时应当完全沉默，而不是只留一句解释");
+
+  // 三次调用都跑完了，现在验日志落在哪。
+  const fakeLog = path.join(fakeHome, ".claude", "feishu-bridge", "stop-hook.log");
+  assert.equal(fs.existsSync(fakeLog), true, "日志应当落在临时 HOME 里");
+  assert.ok(fs.statSync(fakeLog).size > 0, "临时 HOME 的日志应当真的写进去了");
+  // **真实 HOME 的日志一个字节都不许变。**
+  const prodAfter = fs.existsSync(prodLog) ? fs.statSync(prodLog).size : null;
+  assert.equal(prodAfter, prodBefore,
+    "跑测试改动了真实的 stop-hook.log —— 那正是排障时要看的东西");
+});
+
+test("spawn 钩子必须换 HOME —— 否则会写进真实的排障日志", () => {
+  // 评审查出来的：钩子的日志路径写死在 os.homedir() 上，测试只换 registry 不换 HOME，
+  // 就会往**真实的** ~/.claude/feishu-bridge/stop-hook.log 里写，
+  // 超过 1 MiB 还会删掉重建。**那正是排障时要看的东西** ——
+  // 我自己就是靠翻它查出 ReferenceError 的，等于测试在污染自己的证据。
+  //
+  // 这条守整套：凡是 spawn 钩子脚本的地方，env 里必须带 HOME。
+  const src = fs.readFileSync(path.resolve("scripts", "test.mjs"), "utf-8");
+  const lines = src.split("\n");
+  const HOOKS = ["stop-hook.mjs", "init-hook.mjs", "inbound-hook.mjs"];
+
+  // **钩子路径常常存在变量里**（const stopHook = path.join(..., "stop-hook.mjs")），
+  // 只认字面量会漏掉那些调用点 —— 第一版就漏了一处，而"扫描失效等于没守"。
+  const hookVars = new Set();
+  for (const line of lines) {
+    const m = line.match(/const\s+([A-Za-z0-9_$]+)\s*=.*(stop-hook|init-hook|inbound-hook)\.mjs/u);
+    if (m) hookVars.add(m[1]);
+  }
+  assert.ok(hookVars.size >= 1, "没认出任何钩子路径变量，扫描多半已失效");
+
+  // 哪些 env 变量的定义里带了 HOME —— 引用它们的 spawn 就是安全的。
+  const safeEnvVars = new Set();
+  for (const [i, line] of lines.entries()) {
+    const m = line.match(/const\s+([A-Za-z0-9_$]+)\s*=\s*\{\s*$/u);
+    if (!m) continue;
+    const end = lines.slice(i, i + 30).findIndex((l, k) => k > 0 && /^\s*\};/u.test(l));
+    if (end < 0) continue;
+    if (/\bHOME:/u.test(lines.slice(i, i + end + 1).join("\n"))) safeEnvVars.add(m[1]);
+  }
+
+  const bad = [];
+  let scanned = 0;
+  for (const [i, line] of lines.entries()) {
+    if (!line.includes("spawnSync(process.execPath")) continue;
+    const block = lines.slice(i, i + 14).join("\n");
+    const isHook = HOOKS.some((h) => block.includes(h))
+      || [...hookVars].some((v) => new RegExp("\\[\\s*" + v + "\\s*\\]", "u").test(block));
+    if (!isHook) continue;
+    scanned += 1;
+    // env 要么就地写、要么引用一个变量。**按行距找会误判**：同一个 env 变量
+    // 可能被下面几十行外的调用共用。所以直接看"这个 env 变量的定义里有没有 HOME"。
+    // 用 \bHOME: 而不是 HOME:，否则 LARKSUITE_CLI_HOME: 之类会顶替掉真正的 HOME。
+    const inline = /\bHOME:/u.test(block);
+    // 两种写法都要认：`env: someVar` 和对象简写 `env,`。
+    // 第一版只认前者，于是七处用简写的调用点全被误报成不安全。
+    const viaVar = [...safeEnvVars].some((v) =>
+      new RegExp("env:\\s*" + v + "\\b|(^|[\\s{,])" + v + "\\s*,", "mu").test(block));
+    if (!inline && !viaVar) bad.push((i + 1) + ": " + line.trim());
+  }
+  assert.ok(scanned >= 2, "只扫到 " + scanned + " 处 spawn 钩子 —— 扫描失效就等于没守");
+  assert.deepEqual(bad, [], "这些地方 spawn 了钩子却没换 HOME，会写进真实排障日志");
 });
 
 test("带诊断的失败分支必须真的可达 —— 更具体的条件要先判", () => {

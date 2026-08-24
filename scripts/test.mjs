@@ -181,23 +181,23 @@ import {
 } from "./automatic-topic-rotation.mjs";
 
 /**
- * **整个套件无条件用一个临时登记表。**
+ * **整个套件用一个本轮自己新建的私有临时登记表。**
  *
- * 上一版写的是"环境变量没设过才设" —— 那是**条件性隔离**：开发机上只要
- * FEISHU_BRIDGE_REGISTRY 已经指向生产登记表，套件就会接着用它，
- * 于是测试仍会去竞争旁边那把真实的 registry.lock。
- * 末尾那条"不许落在 HOME 里"的断言发现得太晚 —— 那时控制面已经被碰过了。
+ * 这块前后返工了四轮，每轮都是补一个新的路径反例：先是条件性隔离（外面设过就用外面的），
+ * 再是符号链接绕过，再是生产路径常量没规范化。第四轮评审用**硬链接**说清了症结：
+ * realpath 只能消除符号链接别名，**证明不了两个路径不是同一个文件** ——
+ * HOME 外造一个生产登记表的硬链接，dev + inode 完全相同，任何路径比较都看不出来。
+ * 再往下还有挂载别名和时序竞争。
  *
- * 现在：产品环境变量一律被覆盖，不当测试注入口。确实需要指定路径时用**测试专用**
- * 的 FEISHU_BRIDGE_TEST_REGISTRY，而且**在任何一条测试跑起来之前**就验它，
- * 指向生产路径或 HOME 里的任何位置一律拒绝启动。
- */
-/**
- * 把路径解析成**真实路径**，文件还不存在也要能解析。
+ * 所以问题不在判据不够严，在**接口形状**：只要允许调用方指定整个套件的登记表文件，
+ * 就永远在证明"这个路径不是那个文件"，而那是证不完的。
  *
- * 上一版只用 path.resolve() 做字符串前缀比较 —— 那挡不住符号链接：
- * 一个字面上在 HOME 外、实际指向 HOME 内的链接会被直接放行。
- * 逐级往上找到第一个真实存在的祖先，realpath 它，再把剩下的部分拼回去。
+ * 现在换成：不接受任何外部指定，产品级 FEISHU_BRIDGE_REGISTRY 一律忽略，
+ * 由套件自己在系统临时目录里 mkdtemp 出一个私有目录。
+ * **安全性来自"这个目录是本轮新建、本进程独占"，不再来自路径比较。**
+ *
+ * 个别测试要自定义登记表时，用它自己那次 spawn 的 env 或函数参数，
+ * 不通过全进程环境变量重定向 —— 那是另一回事，不受这里影响。
  */
 function realPathOf(p) {
   let cur = path.resolve(p);
@@ -206,42 +206,37 @@ function realPathOf(p) {
     try { return path.join(fs.realpathSync(cur), ...rest.slice().reverse()); }
     catch { /* 这一级还不存在，继续往上 */ }
     const parent = path.dirname(cur);
-    if (parent === cur) return path.resolve(p);   // 一直到根都解析不了
+    if (parent === cur) return path.resolve(p);
     rest.push(path.basename(cur));
     cur = parent;
   }
 }
 
-function chooseTestRegistry({ override, home }) {
-  if (override === undefined || override === null || override === "") {
-    return { ok: true, kind: "temp" };
-  }
-  // **比真实路径，不比字面路径 —— 两侧都要规范化。**
-  // 上一版只规范化了输入路径和 HOME，生产路径常量还是拼出来的字面量。
-  // 若 ~/.claude 自己是指向 HOME 外的符号链接，真实的生产登记表就在 HOME 外，
-  // 于是**经链接写和直接写真实目标，两种写法都会被放行** —— 而它们是同一个文件。
+/** 临时根本身不能落在 HOME 里 —— 那样"临时"就没有隔离作用了。 */
+function testRegistryRoot({ tmpRoot, home }) {
+  const realTmp = realPathOf(tmpRoot);
   const realHome = realPathOf(home);
-  const realProduction = realPathOf(path.join(home, ".claude", "feishu-bridge", "registry.json"));
-  const abs = realPathOf(override);
-  if (abs === realProduction) return { ok: false, reason: "production" };
-  if (abs === realHome || abs.startsWith(realHome + path.sep)) {
-    return { ok: false, reason: "inside_home" };
+  if (realTmp === realHome || realTmp.startsWith(realHome + path.sep)) {
+    return { ok: false, reason: "tmp_inside_home", tmp: realTmp };
   }
-  return { ok: true, kind: "override", path: abs };
+  return { ok: true, root: realTmp };
 }
 
-const chosenRegistry = chooseTestRegistry({
-  override: process.env.FEISHU_BRIDGE_TEST_REGISTRY, home: os.homedir(),
-});
-if (!chosenRegistry.ok) {
-  console.error("拒绝运行：FEISHU_BRIDGE_TEST_REGISTRY 指向" +
-    (chosenRegistry.reason === "production" ? "生产登记表" : " HOME 里的路径") +
-    " —— 测试不许碰本机控制面。");
+const registryRoot = testRegistryRoot({ tmpRoot: os.tmpdir(), home: os.homedir() });
+if (!registryRoot.ok) {
+  console.error("拒绝运行：临时目录 " + registryRoot.tmp +
+    " 在 HOME 里 —— 测试登记表必须落在 HOME 之外。");
   process.exit(2);
 }
-process.env.FEISHU_BRIDGE_REGISTRY = chosenRegistry.kind === "temp"
-  ? path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-test-registry-")), "registry.json")
-  : chosenRegistry.path;
+const registryDir = fs.mkdtempSync(path.join(registryRoot.root, "bridge-test-registry-"));
+// mkdtemp 保证新建且 0700；这里把这个前提断言出来，而不是默认它成立。
+if (fs.readdirSync(registryDir).length !== 0) {
+  console.error("拒绝运行：新建的临时登记表目录不是空的 —— " + registryDir);
+  process.exit(2);
+}
+fs.chmodSync(registryDir, 0o700);
+// **产品环境变量一律覆盖**，外面设成什么都不影响这一轮。
+process.env.FEISHU_BRIDGE_REGISTRY = path.join(registryDir, "registry.json");
 
 let passed = 0;
 let failed = 0;
@@ -8547,99 +8542,56 @@ test("未绑定的项目不许被报成「轮转中」，也不许去碰本机�
   assert.equal(fs.existsSync(real), false, "跑测试不许在本机控制面上留下锁");
 });
 
-test("登记表的选择在跑测试之前就定死，且拒绝一切指向本机的路径", () => {
-  // 这条守的是隔离**决定本身**，不是决定的结果。上一版只在末尾断言
-  // "登记表不在 HOME 里" —— 那时该碰的已经碰过了。
-  const home = "/Users/someone";
-  const prod = path.join(home, ".claude", "feishu-bridge", "registry.json");
-
-  // 不指定 → 临时表。空串也算不指定，不许被当成"指定了一个相对路径"。
-  for (const none of [undefined, null, ""]) {
-    assert.equal(chooseTestRegistry({ override: none, home }).kind, "temp", JSON.stringify(none));
-  }
-  // 指向生产登记表 → 拒绝启动，而且要说清是哪一种。
-  assert.deepEqual(chooseTestRegistry({ override: prod, home }), { ok: false, reason: "production" });
-  // HOME 里的任何位置都不行 —— 不只是生产那一个文件。
-  for (const inside of [home, path.join(home, "x.json"), path.join(home, "a", "b", "r.json")]) {
-    assert.equal(chooseTestRegistry({ override: inside, home }).reason, "inside_home", inside);
-  }
-  // 名字以 HOME 开头但不是 HOME 下的目录，不该被误伤。
-  assert.equal(chooseTestRegistry({ override: home + "-other/r.json", home }).ok, true);
-  // HOME 之外可以显式指定。**返回的是真实路径**（/tmp 在 macOS 上本身就是
-  // 符号链接），后面的比较也都基于它。
-  const out = chooseTestRegistry({ override: "/tmp/t/r.json", home });
-  assert.equal(out.kind, "override");
-  assert.equal(out.path, realPathOf("/tmp/t/r.json"));
-  assert.equal(path.isAbsolute(out.path), true);
-});
-
-test("~/.claude 自己是符号链接时，生产登记表的两种写法都要拦住", () => {
-  // 评审抓的是**对称的那一半**：上一版规范化了输入路径和 HOME，
-  // 却没规范化用来比较的生产路径常量。若 ~/.claude 指向 HOME 外，
-  // 真实的生产登记表就在 HOME 外 —— 经链接写和直接写真实目标，
-  // **两种写法指的是同一个文件，却都会被放行**。
-  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-fakehome-"));
-  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-elsewhere-"));
-  fs.symlinkSync(elsewhere, path.join(fakeHome, ".claude"), "dir");
-
-  const viaLink = path.join(fakeHome, ".claude", "feishu-bridge", "registry.json");
-  const viaReal = path.join(elsewhere, "feishu-bridge", "registry.json");
-  // 真实目标确实在这个 HOME 之外 —— 否则这条测试测的就不是这件事。
-  assert.equal(realPathOf(viaReal).startsWith(realPathOf(fakeHome) + path.sep), false);
-  // 但它们是同一个文件，两种写法都必须判成 production。
-  assert.equal(realPathOf(viaLink), realPathOf(viaReal), "两种写法应指向同一个文件");
-  assert.equal(chooseTestRegistry({ override: viaLink, home: fakeHome }).reason, "production");
-  assert.equal(chooseTestRegistry({ override: viaReal, home: fakeHome }).reason, "production");
-
-  // 同一个链接下的别的文件不是生产表，但它在 HOME 的 .claude 里 —— 仍然不该被用作
-  // 测试登记表？不：它真实位置在 HOME 外，且不是生产表，属于可以显式指定的范围。
-  // 这里写清楚，是因为"拦住什么"和"不拦什么"同样重要。
-  assert.equal(chooseTestRegistry({
-    override: path.join(elsewhere, "unrelated.json"), home: fakeHome }).ok, true);
-});
-
-test("符号链接不许绕过隔离 —— 比的是真实路径，不是字面路径", () => {
-  // 评审复现的：字面在 HOME 外、实际指向 HOME 内的链接会被放行，
-  // 因为上一版只用 path.resolve() 做字符串前缀比较。
-  const home = os.homedir();
-  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-symlink-"));
-  const link = path.join(outside, "looks-outside");
-  fs.symlinkSync(home, link, "dir");
-
-  // 字面上在 HOME 外……
-  assert.equal(link.startsWith(home + path.sep), false, "字面路径确实在 HOME 外");
-  // ……但真实目标在 HOME 内，必须拦住。
-  assert.equal(chooseTestRegistry({ override: path.join(link, "somewhere.json"), home }).reason,
-    "inside_home");
-  // 经链接指向生产登记表也要认得出来。
-  assert.equal(chooseTestRegistry({
-    override: path.join(link, ".claude", "feishu-bridge", "registry.json"), home }).reason,
-    "production");
-
-  // 走真实进程：必须在任何测试跑起来之前就以 exit 2 拒绝。
-  const run = spawnSync(process.execPath, [path.resolve("scripts", "test.mjs")], {
-    encoding: "utf-8",
-    env: { ...process.env, FEISHU_BRIDGE_TEST_REGISTRY: path.join(link, "r.json") },
-  });
-  assert.equal(run.status, 2, "经符号链接指向 HOME 也要拒绝启动");
-  assert.match(run.stderr, /不许碰本机控制面/u);
-  assert.equal(run.stdout.includes("通过 "), false, "拒绝要发生在任何测试跑起来之前");
-});
-
-test("测试进程用的是临时登记表，够不到本机控制面", () => {
-  // 这条守的是整个套件的隔离前提。**它一旦失效，别的测试就会开始随机器而变红**，
-  // 而那种红看起来像是代码坏了。
+test("测试登记表由本轮自己新建，外面设什么都不作数", () => {
+  // **安全性来自"这个目录是本轮新建、本进程独占"，不是来自路径比较。**
+  // 前三轮都在补路径反例（条件性隔离、符号链接、生产路径常量），
+  // 第四轮评审用硬链接说清了症结：realpath 消除不了硬链接，
+  // dev + inode 相同的两个路径，任何路径比较都看不出来。
   const used = process.env.FEISHU_BRIDGE_REGISTRY;
   assert.ok(used, "套件必须显式指定登记表");
-  assert.equal(used.startsWith(os.homedir()), false,
+  assert.equal(path.dirname(used), registryDir, "必须用本轮新建的那个目录");
+  assert.equal(used.startsWith(realPathOf(os.homedir()) + path.sep), false,
     "登记表落在了 HOME 里：" + used);
-  // **产品环境变量不是测试注入口。**外面设了也一律被覆盖 ——
-  // 只有测试专用那个才有发言权，而它在启动前就验过了。
-  assert.notEqual(used, path.join(os.homedir(), ".claude", "feishu-bridge", "registry.json"));
-  assert.equal(topicGenerationLockDir({ source: undefined, root: "/tmp/x" }), null,
-    "说不清是哪种绑定时不许给出锁路径 —— 那会一路落到全局 registry.lock");
-  assert.equal(topicGenerationLockDir({ source: "registry", root: "/tmp/x" })
-    .startsWith(path.dirname(used)), true, "registry 绑定要用套件指定的那张表");
+  assert.equal(used, path.join(registryDir, "registry.json"));
+
+  // 目录本身：本轮新建、权限受控。
+  const st = fs.statSync(registryDir);
+  assert.equal(st.isDirectory(), true);
+  assert.equal(st.mode & 0o777, 0o700, "私有目录不该让别人读写");
+
+  // **不再有外部覆盖入口。**那个变量已经删掉，代码里不许再出现 ——
+  // 留着它就等于留着那条证不完的路径比较。
+  //
+  // 这里只能做源码断言，原因写清楚：行为版本要 spawn 一个设了它的子进程并
+  // **期待正常跑完**，而正常跑完的子进程会执行到这几条 spawn 测试、再生一个孙进程，
+  // 无限递归。下面 TMPDIR 那条能用 spawn，是因为子进程在任何测试跑起来之前就退出了。
+  //
+  // 变量名拆开写：整段字面量出现在这个文件里，断言就永远不成立（第一版正是如此）。
+  const legacyOverride = "FEISHU_BRIDGE" + "_TEST_REGISTRY";
+  const src = fs.readFileSync(path.resolve("scripts", "test.mjs"), "utf-8");
+  assert.equal(src.includes(legacyOverride), false,
+    "外部覆盖入口必须彻底删掉，不是留着不用");
+});
+
+test("临时目录本身在 HOME 里就拒绝启动", () => {
+  // 唯一还需要拒绝的情形：TMPDIR 被指到 HOME 里，那样"临时"就没有隔离作用了。
+  const home = "/Users/someone";
+  assert.equal(testRegistryRoot({ tmpRoot: "/Users/someone/tmp", home }).reason, "tmp_inside_home");
+  assert.equal(testRegistryRoot({ tmpRoot: home, home }).reason, "tmp_inside_home");
+  // 名字以 HOME 开头但不在 HOME 下，不许误伤。
+  assert.equal(testRegistryRoot({ tmpRoot: "/Users/someone-other/tmp", home }).ok, true);
+  assert.equal(testRegistryRoot({ tmpRoot: "/tmp", home }).ok, true);
+
+  // 走真实进程：TMPDIR 指到 HOME 里 → 在任何一条测试跑起来之前就 exit 2。
+  const inHome = path.join(os.homedir(), ".bridge-test-tmp-should-refuse");
+  const run = spawnSync(process.execPath, [path.resolve("scripts", "test.mjs")], {
+    encoding: "utf-8", env: { ...process.env, TMPDIR: inHome },
+  });
+  assert.equal(run.status, 2, "临时目录在 HOME 里必须拒绝启动");
+  assert.match(run.stderr, /在 HOME 里/u);
+  assert.equal(run.stdout.includes("通过 "), false, "拒绝要发生在任何测试跑起来之前");
+  // 拒绝路径不许顺手在 HOME 里造目录。
+  assert.equal(fs.existsSync(inHome), false, "拒绝时不该已经建好了目录");
 });
 
 test("取不到锁时命令要非零退出并说清楚，不能静默报成功", () => {

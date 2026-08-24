@@ -163,6 +163,16 @@ if (suspended.ok && suspended.suspended) {
   process.exit(0);
 }
 
+// **停用的登记不是"已经接入"。**loadRegistry 会把 enabled:false 过滤掉 ——
+// Stop 挑不到它，出站不会工作。报"已经接入过了"就是界面说正常、实际发不出去，
+// 跟登记表缺失那次是同一种病，只是换了个入口。
+if (already && already.enabled === false) {
+  console.log(path.basename(root) + " 在登记表里，但**那条是停用的** —— 出站会跳过它。");
+  console.log("  根话题  " + (already.root_message_id ?? "（没记）"));
+  console.log("  恢复：跑 /feishu-unbind 的反向操作，或人工把 enabled 改回来再重跑本命令。");
+  process.exit(1);
+}
+
 // 已经登记过：确实接入了，什么都不用做。
 if (already?.root_message_id) {
   console.log(path.basename(root) + " 已经接入过了，没有重复建话题。");

@@ -30,11 +30,31 @@ const stripTrailingSlash = (p) => (p.length > 1 && p.endsWith("/") ? p.replace(/
 export const normalizeRoot = (root) => (typeof root === "string" && root.length > 0
   ? stripTrailingSlash(path.resolve(root)) : null);
 
-/** 登记表里**精确**是这个项目的条目。目录包含关系不算 —— 见 exactProjectsForRoot 的注释。 */
+/**
+ * 登记表里**精确**是这个项目的条目。目录包含关系不算 ——
+ * 父目录 /projects 不是 /projects/A。
+ *
+ * **注意它只回答"是不是这个项目"，不回答"能不能路由"。**
+ * `enabled: false` 的条目仍会被返回 —— 因为"有一条停用的记录"和"一条都没有"
+ * 是不同的状态，前者该说"停用了"，后者才该说"没登记"。
+ * 要判断能不能出站，用 routableProjectsForRoot。
+ */
 export function exactProjectsForRoot(projects, root) {
   const want = normalizeRoot(root);
   if (want === null) return [];
   return (projects ?? []).filter((p) => normalizeRoot(p?.root) === want);
+}
+
+/**
+ * 精确是这个项目、**而且出站真的会挑到它**的条目。
+ *
+ * 分开这两个概念，是因为它们不一致时后果最难查：`enabled: false` 的记录被
+ * loadRegistry 过滤掉（Stop 挑不到它），而 bind 会把它算成"已经接入"、
+ * status 会算成 routable —— **界面明确报正常，实际不会出站**。
+ * 这跟登记表缺失那次是同一种病，只是换了个入口。
+ */
+export function routableProjectsForRoot(projects, root) {
+  return exactProjectsForRoot(projects, root).filter((p) => p?.enabled !== false);
 }
 
 /**
@@ -91,7 +111,12 @@ export function loadRegistry(file = registryPath()) {
   for (const p of parsed.projects ?? []) {
     if (!p || typeof p.root !== "string" || p.root.length === 0) continue;
     if (p.enabled === false) continue;
-    const root = stripTrailingSlash(p.root);
+    // **跟 normalizeRoot 用同一份规范化。**上一版这里只去尾斜杠，
+    // 而 bind/status 走 path.resolve —— 登记成 /a/../project 时两边结论不同：
+    // bind/status 说"已接入、可路由"，而 Stop 仍拿原路径匹配不到，
+    // **又回到"状态显示正常、出站静默失效"**。
+    const root = normalizeRoot(p.root);
+    if (root === null) continue;
     // 整条带过去，不再只挑 id / root。绑定信息（root_message_id / expires_at / name）
     // 现在就住在这一行里 —— 见 project-resolve.mjs。id 和 root 仍然由这里归一化，
     // 免得每个调用方各自去处理「没写 id」和「结尾多个斜杠」。
@@ -101,9 +126,11 @@ export function loadRegistry(file = registryPath()) {
 }
 
 export function isUnder(child, root) {
-  if (typeof child !== "string" || child.length === 0) return false;
-  const c = stripTrailingSlash(child);
-  return c === root || c.startsWith(root + "/");
+  // 两侧都过同一份规范化 —— 归属判断和 bind/status 的判断必须用同一个 root 契约。
+  const c = normalizeRoot(child);
+  const r = normalizeRoot(root);
+  if (c === null || r === null) return false;
+  return c === r || c.startsWith(r + "/");
 }
 
 /**

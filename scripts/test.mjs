@@ -29,6 +29,7 @@ import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcom
 import {
   acquirePublishLock, attributeSession, exactProjectsForRoot, fileContainsAny, isUnder,
   loadRegistry, loadRegistryStrict, normalizeRoot, releasePublishLock,
+  routableProjectsForRoot,
 } from "./registry.mjs";
 import {
   appendEvent, composeDigest, listPending, markSent, suppressRecords,
@@ -9085,6 +9086,84 @@ test("登记表的写入口只有一个 —— 建话题那条路径也走同一
   // 数**调用点**，别把函数定义也数进去（第一版就是这么多算了一处）。
   const calls = (src.match(/=\s*withRegistryTransaction\(\{/gu) ?? []).length;
   assert.equal(calls, 2, "补登记和新建绑定都要走同一个入口，实际 " + calls + " 处调用");
+});
+
+test("root 归一化只有一份 —— bind / status / Stop 三侧结论必须一致", () => {
+  // 评审抓的：严格路径用 path.resolve()，而生产的 loadRegistry 只去尾斜杠。
+  // 登记成 /a/../project 时，bind/status 归一化后说"已接入、可路由"，
+  // 而 Stop 仍拿原路径匹配不到 —— **又回到"状态显示正常、出站静默失效"**。
+  //
+  // 我上一轮刚说"归一化必须共用同一份"，然后**只改了两处、漏了第三处**。
+  // 所以这条不测某一侧，测的是**三侧对同一份登记表得出同一个结论**。
+  const weird = [
+    ["尾斜杠", (r) => r + "/"],
+    ["多余斜杠", (r) => r + "//"],
+    ["回退路径", (r) => path.join(r, "x", "..")],
+    ["当前目录段", (r) => path.join(r, ".")],
+  ];
+  for (const [what, mangle] of weird) {
+    const real = "/tmp/bridge-norm-demo/proj";
+    const written = mangle(real);
+    const projects = [{ id: "p", root: written, root_message_id: "om_x" }];
+
+    // ① bind / status 侧：精确匹配
+    assert.equal(exactProjectsForRoot(projects, real).length, 1, what + "：精确匹配漏了");
+    // ② Stop 侧：归属判断。**直接传原始形式** —— 先替它 normalizeRoot 一遍，
+    //    等于替被测函数把活干了，那样 isUnder 自己退化也测不出来。
+    assert.equal(isUnder(real, written), true, what + "：Stop 侧匹配不到");
+    // 反过来：cwd 是奇怪形式、登记是规范形式。
+    assert.equal(isUnder(written, real), true, what + "：反向也要认");
+    // ③ 反过来也一样 —— 写的是规范形式、查的是奇怪形式。
+    assert.equal(exactProjectsForRoot([{ root: real }], written).length, 1,
+      what + "：反向也要认");
+  }
+
+  // loadRegistry 返回的 root 必须已经是规范形式 —— 否则下游各自再归一化一次，
+  // 分叉就从这里开始。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-norm-"));
+  const reg = path.join(dir, "registry.json");
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "p", root: "/tmp/x/y/../y/", root_message_id: "om_x" }] }));
+  const loaded = loadRegistry(reg);
+  assert.equal(loaded.ok, true);
+  assert.equal(loaded.projects[0].root, normalizeRoot("/tmp/x/y"),
+    "loadRegistry 交出去的 root 必须已经规范化");
+});
+
+test("停用的登记不算「已接入」，也不算「可路由」", () => {
+  // 评审抓的：enabled:false 的记录被 loadRegistry 过滤掉（Stop 挑不到），
+  // 而 bind 会算成"已经接入"、status 会算成 routable ——
+  // **界面明确报正常，实际不会出站。**跟登记表缺失那次是同一种病，换了个入口。
+  const projects = [{ id: "p", root: "/x/proj", root_message_id: "om_x", enabled: false }];
+  // "是不是这个项目"和"能不能路由"是两个问题，分开答。
+  assert.equal(exactProjectsForRoot(projects, "/x/proj").length, 1, "它确实是这个项目");
+  assert.equal(routableProjectsForRoot(projects, "/x/proj").length, 0, "但出站挑不到它");
+  // Stop 侧确实会过滤掉它 —— 三侧结论要对得上。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-disabled-"));
+  const reg = path.join(dir, "registry.json");
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0", projects }));
+  assert.equal(loadRegistry(reg).projects.length, 0, "Stop 侧看不到停用的条目");
+
+  // （状态页那一侧的断言在 status 分支上 —— outboundRoutingFact 住在那儿。）
+
+  // bind：不许报"已经接入过了"。
+  const proj = path.join(dir, "proj");
+  fs.mkdirSync(path.join(proj, ".runtime-data", "inbound"), { recursive: true });
+  fs.writeFileSync(path.join(proj, ".runtime-data", "inbound", "chain-config.json"),
+    JSON.stringify({ project_dir: proj, logical_task_key: "k",
+      project_display_name: "P", task_display_name: "P" }));
+  const tpl = path.join(dir, "chain-config.json");
+  fs.writeFileSync(tpl, JSON.stringify(TPL));
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "p", root: proj, root_message_id: "om_x", enabled: false }] }));
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, "--apply",
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: reg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: dir } });
+  assert.notEqual(run.status, 0, "停用的不该报成功");
+  assert.match(run.stdout + run.stderr, /停用/u, "要说清是停用了");
+  assert.equal((run.stdout + run.stderr).includes("已经接入过了"), false,
+    "报「已接入」等于界面说正常、实际发不出去");
 });
 
 test("逻辑相同的 root 不许绕过 —— 尾斜杠也是同一个项目", () => {

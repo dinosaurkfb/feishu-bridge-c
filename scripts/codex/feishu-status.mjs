@@ -30,25 +30,26 @@ if (!validThreadId(threadId)) {
 
 const home = bridgeHome();
 const found = findRegisteredTaskForCodexThread({ threadId, home });
-if (!found.ok) {
-  if (found.reason === "thread_not_registered") {
-    console.log("当前 Codex task 尚未接入飞书。");
-    // 当前 task 没绑，不该妨碍看别的链路 —— 本机可能还有几条正常运转的，
-    // 而"这条没绑"和"本机什么都没有"是两回事。
-    const unbound = renderConnectivity(collectConnectivity());
-    if (unbound) console.log("\n" + unbound);
-    process.exit(0);
-  }
-  console.error("无法读取连接状态：" + found.reason);
-  process.exit(1);
-}
 
-const task = found.task;
-const st = taskBindingFacts({ task, home });
-if (!st.ok) {
-  console.error("无法读取这条 task 的状态：" + st.reason);
-  process.exit(1);
-}
+/**
+ * **没绑定不等于没有四层。**
+ *
+ * 上一版在这里直接退出，未绑定时只剩一句"尚未接入飞书"——
+ * 四层模型在最需要它的时候消失了：正是没绑的时候，人才要知道
+ * 运行时装没装、订阅活不活动。第 1、2 层照样有事实可报，
+ * 只是第 3 层还没绑、第 4 层无从谈起。
+ * 共用渲染器本来就 handle 这个，是我接线时提前 return 把它绕过去了。
+ *
+ * 同时区分"这条没绑"和"读不出来"—— 前者是正常状态，后者是故障；
+ * 混成一句的话，一个坏掉的 registry 看起来就跟没绑过一样。
+ */
+const st = found.ok
+  ? taskBindingFacts({ task: found.task, home })
+  // **"还没接"要用渲染器认得的那个名字。**渲染器按 not_bound 区分
+  // "尚未绑定"和"状态不可读"；Codex 侧管它叫 thread_not_registered，
+  // 直接透传的话，一条**从没绑过**的 task 会被报成"状态不可读"——
+  // 那是把正常状态说成了故障。同一个概念两个名字，翻译层负责对齐。
+  : { ok: false, reason: found.reason === "thread_not_registered" ? "not_bound" : found.reason };
 
 const loaded = loadCodexTemplate();
 const tpl = loaded?.ok ? loaded.template : null;
@@ -75,6 +76,9 @@ const outboundRouting = outboundRoutingFact({
 
 console.log(renderLayeredStatus(composeLayeredStatus({
   st,
+  // Codex 侧的接入办法是 $feishu-bind，不是 Claude 那条脚本命令。
+  // **一个错的下一步比没有下一步更糟。**
+  bindHint: "$feishu-bind",
   outboundRouting,
   // Codex 一条 thread 一条 task，没有"同一项目多条绑定"那一节。
   others: [],
@@ -85,6 +89,11 @@ console.log(renderLayeredStatus(composeLayeredStatus({
     runtime: "Codex CLI",
     runtimeDir: path.join(codexRuntimeRoot(codexHomeOf()), "current"),
     verify: () => verifyRuntime({ root: codexRuntimeRoot(codexHomeOf()) }),
+    // **入站日志也是 Claude 默认值。**我上一版只显式给了 runtime/runtimeDir/verify，
+    // 漏了这一个 —— 评审用反例证明：只写一条 Claude 的入站日志，
+    // Codex 状态就会把它显示成自己的"最近入站"。
+    // 同一类默认值有四个，我修了三个 —— **补一处、不找同类**，又一次。
+    inboundLog: path.join(home, "dispatcher.log"),
     agentName: tpl?.transport_agent_name ?? null,
     // 端点自检：只读、限时、不修不启。模板读不出来时传 null ——
     // **没查就是没查**，不许因为代码存在就当成查过了。
@@ -92,7 +101,7 @@ console.log(renderLayeredStatus(composeLayeredStatus({
   }),
   subscription: subscriptionFacts(
     buildCodexSubscriptionProjection({ home, threadId }),
-    { groupName: tpl?.chat_name ?? null }),
+    { groupName: tpl?.chat_name ?? null, templateChatId: tpl?.chat_id ?? null }),
   connectivity: layeredConnectivity,
   otherLinks: links,
 })));

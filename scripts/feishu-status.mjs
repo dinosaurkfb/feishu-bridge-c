@@ -78,7 +78,9 @@ console.log(renderLayeredStatus(composeLayeredStatus({
     selfCheck: tpl ? checkEndpoint({ template: tpl, identity: resolveLarkIdentity(tpl) }) : null,
   }),
   subscription: subscriptionFacts(buildClaudeSubscriptionProjection({ projectRoot: root }),
-    { groupName: tpl?.chat_name ?? null }),
+      // chat_id 也要给：**群名只能用在它确实对应的那条订阅上** ——
+      // 无条件套上去的话，指向别的群的订阅会被错报成模板群。
+      { groupName: tpl?.chat_name ?? null, templateChatId: tpl?.chat_id ?? null }),
   connectivity: layeredConnectivity,
   otherLinks: projectLinks,
 })));

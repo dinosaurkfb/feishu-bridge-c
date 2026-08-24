@@ -9188,8 +9188,12 @@ test("登记表的写入口只有一个 —— 建话题那条路径也走同一
     "那唯一一处必须在 withRegistryTransaction 里面");
   // 两条路径都用它。
   // 数**调用点**，别把函数定义也数进去（第一版就是这么多算了一处）。
+  // 三处：补登记、新建绑定、**从暂停恢复**。恢复那条是后加的 ——
+  // 它原本直接改项目文件就退出，registry 那一侧根本没修，
+  // 于是"恢复成功、出站继续失效"。
   const calls = (src.match(/=\s*withRegistryTransaction\(\{/gu) ?? []).length;
-  assert.equal(calls, 2, "补登记和新建绑定都要走同一个入口，实际 " + calls + " 处调用");
+  assert.equal(calls, 3,
+    "补登记、新建绑定、从暂停恢复都要走同一个入口，实际 " + calls + " 处调用");
 });
 
 test("root 归一化只有一份 —— bind / status / Stop 三侧结论必须一致", () => {
@@ -9232,6 +9236,76 @@ test("root 归一化只有一份 —— bind / status / Stop 三侧结论必须�
   assert.equal(loaded.ok, true);
   assert.equal(loaded.projects[0].root, normalizeRoot("/tmp/x/y"),
     "loadRegistry 交出去的 root 必须已经规范化");
+});
+
+test("从暂停恢复要把出站真的接回去 —— 判据是能路由，不是命令返回 0", () => {
+  // 评审抓的：恢复分支到 setBindingStatus 就 exit 0 了，后面那些 registry 检查
+  // 一条都不跑。于是两种情况会报**恢复成功、而出站继续失效**：
+  //   · mapping 暂停 + registry 里没这个项目；
+  //   · mapping 暂停 + registry 条目是 enabled:false。
+  //
+  // 上一轮我把歧义检查前移，**却只前移了那一条** —— 同一个错误的第二次。
+  const mk = () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-resume-"));
+    const proj = path.join(dir, "proj");
+    const inbound = path.join(proj, ".runtime-data", "inbound");
+    fs.mkdirSync(inbound, { recursive: true });
+    fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+      project_dir: proj, logical_task_key: "k",
+      project_display_name: "P", task_display_name: "P" }));
+    // 暂停中的项目内绑定。
+    fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+      status: "suspended", root_message_id: "om_x",
+      feishu_root_message_id_reference: "om_x", channel_generation_id: "gen-4" }));
+    const reg = path.join(dir, "registry.json");
+    const tpl = path.join(dir, "chain-config.json");
+    fs.writeFileSync(tpl, JSON.stringify(TPL));
+    return { dir, proj, reg, tpl };
+  };
+  const run = (e) => spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", e.proj, "--apply",
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: e.reg, FEISHU_BRIDGE_CHAIN_TEMPLATE: e.tpl, HOME: e.dir } });
+  // **成功的判据：出站真的挑得到它。**命令返回 0 不算数 —— 那正是上一版的假象。
+  const routable = (e) => {
+    const loaded = loadRegistry(e.reg);
+    return loaded.ok
+      && attributeSession({ projects: loaded.projects, cwd: e.proj, transcriptPath: null })
+        .some((p) => normalizeRoot(p.root) === normalizeRoot(e.proj));
+  };
+
+  // ① registry 里根本没有 → 恢复要顺手补登记（复用原话题）。
+  const a = mk();
+  fs.writeFileSync(a.reg, JSON.stringify({ schema_version: "1.0", projects: [] }));
+  const ra = run(a);
+  assert.equal(ra.status, 0, ra.stderr);
+  assert.match(ra.stdout, /已恢复/u);
+  assert.equal(routable(a), true, "恢复之后出站必须挑得到它 —— 否则那句「已恢复」是假的");
+  assert.equal(JSON.parse(fs.readFileSync(a.reg, "utf-8")).projects[0].root_message_id,
+    "om_x", "复用原话题，不新建");
+
+  // ② registry 条目是停用的 → 恢复要把它启用回来。
+  const b = mk();
+  fs.writeFileSync(b.reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "p", root: b.proj, root_message_id: "om_x", enabled: false }] }));
+  assert.equal(routable(b), false, "前提：停用时出站挑不到");
+  const rb = run(b);
+  assert.equal(rb.status, 0, rb.stderr);
+  assert.equal(routable(b), true, "恢复之后必须启用回来");
+
+  // ③ registry 里有两条 → **不许恢复**，而且不许动项目文件。
+  const c = mk();
+  fs.writeFileSync(c.reg, JSON.stringify({ schema_version: "1.0", projects: [
+    { id: "a", root: c.proj, root_message_id: "om_a" },
+    { id: "b", root: c.proj + "/", root_message_id: "om_b" }] }));
+  const rc = run(c);
+  assert.notEqual(rc.status, 0, "说不清该用哪条时不许恢复");
+  // 前置的歧义检查会先拦下（它在任何动作之前，**这正是对的**）；
+  // 恢复分支里那道是并发变化时的第二关。两种措辞都该认。
+  assert.match(rc.stderr, /恢复中止|说不清该(改|用)哪一条/u);
+  assert.equal(JSON.parse(fs.readFileSync(
+    path.join(c.proj, ".runtime-data", "inbound", "active-mapping.json"), "utf-8")).status,
+    "suspended", "**项目文件不许被改** —— 出站接不回去的话，恢复没有意义");
 });
 
 test("停用的登记不算「已接入」，也不算「可路由」", () => {

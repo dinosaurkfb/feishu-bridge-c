@@ -8174,10 +8174,16 @@ test("真实 feishu-status CLI 跑出来的第 1 层不会声称全部通过", (
   // 引用产品常量而不是复制字面量 —— 复制的那份在文案改了之后会变成空断言。
   assert.equal(layer1.includes(SELF_CHECK_TEXT.ready), false,
     "入站身份本机验不了，任何情况下都不许报成全部通过");
-  // daemon 在跑就是"没查清"，离线就是"有问题"，两者都对；只有 ready 不对。
-  assert.ok(layer1.includes(SELF_CHECK_TEXT.incomplete) || layer1.includes(SELF_CHECK_TEXT.blocked),
-    "结论要么是没查清、要么是有问题，不该是别的：" + layer1);
-  assert.match(layer1, /inbound_transport_identity/u, "要说清入站那项没查清");
+
+  // **合法状态有三种，不是两种。**桥没装 / 模板不可用的机器上自检根本不会跑，
+  // 那时正确结论是"未自检"。上一版只允许"没查清"和"有问题"，
+  // 于是在一个干净 HOME 上会红 —— 我自己换 HOME 跑才发现，
+  // 这已经是同一类错误的第三次了：**断言写的是我这台机器，不是这段代码。**
+  const ran = layer1.includes(SELF_CHECK_TEXT.incomplete) || layer1.includes(SELF_CHECK_TEXT.blocked);
+  assert.ok(ran || layer1.includes("未自检"),
+    "结论只能是未自检 / 没查清 / 有问题三者之一：" + layer1);
+  // 真跑了自检，就必须点名入站那一项 —— 没跑的时候没有这个义务。
+  if (ran) assert.match(layer1, /inbound_transport_identity/u, "要说清入站那项没查清");
 });
 
 test("自检结论的文案里不许写死检查项数", () => {

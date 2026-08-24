@@ -51,6 +51,7 @@ import {
   DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliveryPinPath, findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin,
 } from "./live-session.mjs";
 import { extractReply } from "./stop-hook.mjs";
+import { foreignHint, projectLabel } from "./stop-note.mjs";
 import {
   CHAIN_FIELDS, assertPublishIdentity, materializeProjectConfig,
   resolveLarkIdentity, validateChainTemplate,
@@ -8870,6 +8871,79 @@ test("带诊断的失败也要留 lark-cli 说的话，不是命令回显", () =
   // publishErrorDetail 本身的行为在 #35 的用例里验过，这里只钉"用的是它"。
   assert.equal(publishErrorDetail({ message: "Command failed: x", stderr: "code 230002" }),
     "code 230002");
+});
+
+test("Stop 提示要说清这条失败是不是当前项目的", () => {
+  // Frank 实际撞上的：本会话一直在讨论另一个项目，每一轮 Stop 都跟着报一次
+  // **那个项目**的发布失败，看上去像是**这个**项目出了故障。
+  // 名字一直都有，缺的是"它不是当前这个"。
+  //
+  // 根因在挑项目的规则：cwd 在项目下，**或者项目路径出现在本会话的 transcript 里**
+  // —— "在对话里聊到某个项目"就会被挂上那个项目。
+  assert.equal(projectLabel({ id: "cc2cd", via: ["cwd"] }), "cc2cd",
+    "当前项目不该加噪音");
+  assert.equal(projectLabel({ id: "cc2cd", via: ["transcript"] }), "cc2cd（非当前项目）");
+  // 两条规则都命中时，它确实是当前项目。
+  assert.equal(projectLabel({ id: "cc2cd", via: ["cwd", "transcript"] }), "cc2cd");
+  // via 缺失时按"说不清"处理 —— 宁可多标一句，也不要让人以为是当前项目。
+  assert.equal(projectLabel({ id: "x" }), "x（非当前项目）");
+
+  // 解释只在确实带上了非当前项目时出现，而且只出现一次 ——
+  // 手机上卡片窄，每条提示都重复一遍会把真正的结论挤下去。
+  assert.equal(foreignHint([{ id: "a", via: ["cwd"] }]), "");
+  assert.equal(foreignHint([]), "");
+  assert.match(foreignHint([{ id: "a", via: ["cwd"] }, { id: "b", via: ["transcript"] }]),
+    /提到过它的路径/u);
+  assert.equal(foreignHint([{ id: "b", via: ["transcript"] }, { id: "c", via: ["transcript"] }])
+    .split("非当前项目").length - 1, 1, "解释只说一次");
+});
+
+test("真实 Stop 钩子会把「非当前项目」说出来 —— 纯函数对了不算数", () => {
+  // **这条是补出来的，而且是被现场教训逼出来的。**上面那条纯函数测试全绿的时候，
+  // 真实钩子每一次调用都在崩：动态 import 那行我以为写进去了，其实锚点没匹配上，
+  // 于是 projectLabel 未定义 —— ReferenceError，钩子静默退出，
+  // **一句提示都发不出来，而 535 条测试全是绿的。**
+  //
+  // 这个项目已经在同一族问题上栽过：函数写对了，真实入口根本走不到那儿。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-stopnote-"));
+  const proj = path.join(dir, "projA");
+  const elsewhere = path.join(dir, "elsewhere");
+  fs.mkdirSync(path.join(proj, ".runtime-data", "inbound"), { recursive: true });
+  fs.mkdirSync(path.join(proj, ".runtime-data", "outbound", "outbox"), { recursive: true });
+  fs.mkdirSync(elsewhere, { recursive: true });
+  fs.writeFileSync(path.join(proj, ".runtime-data", "inbound", "chain-config.json"),
+    JSON.stringify({ project_dir: proj, logical_task_key: "k",
+      project_display_name: "A", task_display_name: "A" }));
+  fs.writeFileSync(path.join(proj, ".runtime-data", "outbound", "outbox", "0001.json"),
+    JSON.stringify({ kind: "progress", text: "x", published_at: null }));
+  const reg = path.join(dir, "registry.json");
+  fs.writeFileSync(reg, JSON.stringify({
+    schema_version: "1.0", projects: [{ id: "projA", root: proj, name: "A" }] }));
+  // transcript 里提到 projA 的路径 —— 这就是"聊到它就被挂上它"的那条规则。
+  const transcript = path.join(dir, "t.jsonl");
+  fs.writeFileSync(transcript, "刚才在讨论 " + proj + " 的问题\n");
+
+  const runHook = (cwd) => {
+    const run = spawnSync(process.execPath, [path.resolve("scripts", "stop-hook.mjs")], {
+      encoding: "utf-8",
+      input: JSON.stringify({ cwd, transcript_path: transcript, session_id: "s1",
+        last_assistant_message: "hi" }),
+      env: { ...process.env, FEISHU_BRIDGE_REGISTRY: reg },
+    });
+    assert.equal(run.status, 0, run.stderr);
+    assert.ok(run.stdout.trim(), "钩子必须说点什么 —— 崩掉时它是静默的");
+    return JSON.parse(run.stdout).systemMessage;
+  };
+
+  // cwd 在别处：必须标出来，并解释一次为什么带上它。
+  const foreign = runHook(elsewhere);
+  assert.match(foreign, /projA（非当前项目）/u);
+  assert.match(foreign, /提到过它的路径/u);
+
+  // cwd 就在项目里：不许加这些噪音。
+  const own = runHook(proj);
+  assert.match(own, /projA 发布失败/u);
+  assert.equal(own.includes("非当前项目"), false, "当前项目不该被标记");
 });
 
 test("带诊断的失败分支必须真的可达 —— 更具体的条件要先判", () => {

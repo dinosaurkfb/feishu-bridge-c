@@ -217,12 +217,14 @@ function chooseTestRegistry({ override, home }) {
   if (override === undefined || override === null || override === "") {
     return { ok: true, kind: "temp" };
   }
-  // **比真实路径，不比字面路径。**
+  // **比真实路径，不比字面路径 —— 两侧都要规范化。**
+  // 上一版只规范化了输入路径和 HOME，生产路径常量还是拼出来的字面量。
+  // 若 ~/.claude 自己是指向 HOME 外的符号链接，真实的生产登记表就在 HOME 外，
+  // 于是**经链接写和直接写真实目标，两种写法都会被放行** —— 而它们是同一个文件。
   const realHome = realPathOf(home);
+  const realProduction = realPathOf(path.join(home, ".claude", "feishu-bridge", "registry.json"));
   const abs = realPathOf(override);
-  if (abs === path.join(realHome, ".claude", "feishu-bridge", "registry.json")) {
-    return { ok: false, reason: "production" };
-  }
+  if (abs === realProduction) return { ok: false, reason: "production" };
   if (abs === realHome || abs.startsWith(realHome + path.sep)) {
     return { ok: false, reason: "inside_home" };
   }
@@ -9197,6 +9199,31 @@ test("登记表的选择在跑测试之前就定死，且拒绝一切指向本�
   assert.equal(out.kind, "override");
   assert.equal(out.path, realPathOf("/tmp/t/r.json"));
   assert.equal(path.isAbsolute(out.path), true);
+});
+
+test("~/.claude 自己是符号链接时，生产登记表的两种写法都要拦住", () => {
+  // 评审抓的是**对称的那一半**：上一版规范化了输入路径和 HOME，
+  // 却没规范化用来比较的生产路径常量。若 ~/.claude 指向 HOME 外，
+  // 真实的生产登记表就在 HOME 外 —— 经链接写和直接写真实目标，
+  // **两种写法指的是同一个文件，却都会被放行**。
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-fakehome-"));
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-elsewhere-"));
+  fs.symlinkSync(elsewhere, path.join(fakeHome, ".claude"), "dir");
+
+  const viaLink = path.join(fakeHome, ".claude", "feishu-bridge", "registry.json");
+  const viaReal = path.join(elsewhere, "feishu-bridge", "registry.json");
+  // 真实目标确实在这个 HOME 之外 —— 否则这条测试测的就不是这件事。
+  assert.equal(realPathOf(viaReal).startsWith(realPathOf(fakeHome) + path.sep), false);
+  // 但它们是同一个文件，两种写法都必须判成 production。
+  assert.equal(realPathOf(viaLink), realPathOf(viaReal), "两种写法应指向同一个文件");
+  assert.equal(chooseTestRegistry({ override: viaLink, home: fakeHome }).reason, "production");
+  assert.equal(chooseTestRegistry({ override: viaReal, home: fakeHome }).reason, "production");
+
+  // 同一个链接下的别的文件不是生产表，但它在 HOME 的 .claude 里 —— 仍然不该被用作
+  // 测试登记表？不：它真实位置在 HOME 外，且不是生产表，属于可以显式指定的范围。
+  // 这里写清楚，是因为"拦住什么"和"不拦什么"同样重要。
+  assert.equal(chooseTestRegistry({
+    override: path.join(elsewhere, "unrelated.json"), home: fakeHome }).ok, true);
 });
 
 test("符号链接不许绕过隔离 —— 比的是真实路径，不是字面路径", () => {

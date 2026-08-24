@@ -190,13 +190,16 @@ const relationRow = (c) => [c.displayName,
  *   · degraded  项目内绑定在，但登记表里没有 —— **绑定已降级，出站不会工作**
  *   · unknown   登记表读不出来。**不许把"没查清"报成"没问题"**，也不许报成"坏了"
  */
-export function outboundRoutingFact({ registryOk, exactCount, bound }) {
+export function outboundRoutingFact({ registryOk, exactCount, routableCount, bound }) {
   if (!bound) return null;                    // 项目内都没有绑定，这一层没什么可说
   if (registryOk !== true) return "unknown";
   // **多于一条也不算正常。**同一个项目在登记表里有两条时，出站挑哪一条是不确定的 ——
   // 报"正常"等于把一个说不清的状态说成说得清。
   if (exactCount > 1) return "ambiguous";
-  return exactCount === 1 ? "routable" : "degraded";
+  if (exactCount === 0) return "degraded";
+  // **有记录 ≠ 出站会挑到它。**enabled:false 的条目被 loadRegistry 过滤掉，
+  // Stop 挑不到 —— 这时报 routable 就是界面说正常、实际发不出去。
+  return routableCount === 1 ? "routable" : "disabled";
 }
 
 const OUTBOUND_ROUTING_TEXT = {
@@ -204,6 +207,7 @@ const OUTBOUND_ROUTING_TEXT = {
     + "跑 /feishu-bind 补登记（复用原话题，不新建）",
   unknown: "说不清（登记表读不出来）—— 没查清，不代表没问题",
   ambiguous: "**登记表里有多条这个项目** —— 出站挑哪一条不确定。先人工只保留一条",
+  disabled: "**登记表里这条是停用的** —— 出站会跳过它，答复发不出去",
 };
 
 export function composeLayeredStatus({

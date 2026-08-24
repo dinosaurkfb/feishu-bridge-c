@@ -8213,20 +8213,25 @@ test("端点自检不许拿出站身份顶替入站 —— 这是语义假阳性
   assert.match(inbound.detail, /期望值不是观测值/u);
 });
 
-test("出站路由的四种结论要分开，且不许把「没查清」报成「没问题」", () => {
+test("出站路由的五种结论要分开，且不许把「没查清」报成「没问题」", () => {
   // 第 3 层其余各行读的是项目内文件，而出站走登记表 —— **两套**。
   // 不一致时状态页会理直气壮地报"已绑定 · 第 N 代 · 有效期 2027"，
   // 而每一轮答复都没进过出站流程。线上就这么断了十几个小时。
-  const bound = { bound: true };
-  assert.equal(outboundRoutingFact({ ...bound, registryOk: true, exactCount: 1 }), "routable");
-  assert.equal(outboundRoutingFact({ ...bound, registryOk: true, exactCount: 0 }), "degraded");
+  const b = { bound: true, registryOk: true };
+  assert.equal(outboundRoutingFact({ ...b, exactCount: 1, routableCount: 1 }), "routable");
+  assert.equal(outboundRoutingFact({ ...b, exactCount: 0, routableCount: 0 }), "degraded");
   // **多于一条也不算正常** —— 出站挑哪一条不确定，报"正常"是把说不清说成说得清。
-  assert.equal(outboundRoutingFact({ ...bound, registryOk: true, exactCount: 2 }), "ambiguous");
+  assert.equal(outboundRoutingFact({ ...b, exactCount: 2, routableCount: 2 }), "ambiguous");
+  // **有记录 ≠ 出站会挑到它。**停用的条目被 loadRegistry 过滤掉，Stop 挑不到。
+  assert.equal(outboundRoutingFact({ ...b, exactCount: 1, routableCount: 0 }), "disabled");
   // **登记表读不出来是另一种**，既不能当成好也不能当成坏。
-  assert.equal(outboundRoutingFact({ ...bound, registryOk: false, exactCount: 0 }), "unknown");
-  assert.equal(outboundRoutingFact({ ...bound, registryOk: undefined, exactCount: 9 }), "unknown");
+  assert.equal(outboundRoutingFact({ bound: true, registryOk: false,
+    exactCount: 0, routableCount: 0 }), "unknown");
+  assert.equal(outboundRoutingFact({ bound: true, registryOk: undefined,
+    exactCount: 9, routableCount: 9 }), "unknown");
   // 项目内本来就没绑定 → 这一层没什么可说，不该硬报一个结论。
-  assert.equal(outboundRoutingFact({ bound: false, registryOk: true, exactCount: 0 }), null);
+  assert.equal(outboundRoutingFact({ bound: false, registryOk: true,
+    exactCount: 0, routableCount: 0 }), null);
 });
 
 test("真实 feishu-status CLI 会把「绑定已降级」说出来", () => {
@@ -8280,6 +8285,13 @@ test("真实 feishu-status CLI 会把「绑定已降级」说出来", () => {
     { id: "a", root: proj, root_message_id: "om_a" },
     { id: "b", root: proj + "/", root_message_id: "om_b" }] }));
   assert.match(run(), /有多条这个项目/u, "逻辑重复也要说出来");
+
+  // 唯一那条是停用的 → **不许报正常**，也不该说成"没登记"。
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0",
+    projects: [{ id: "p", root: proj, root_message_id: "om_x", enabled: false }] }));
+  const off = run();
+  assert.match(off, /这条是停用的/u);
+  assert.equal(off.includes("绑定已降级"), false, "有记录但停用，跟一条都没有是两回事");
 
   // ── 读取故障的三种，都必须是 unknown，不是 degraded ──
   //

@@ -26,7 +26,9 @@ import {
   splitByRelation, subscriptionFacts,
 } from "./layered-status.mjs";
 import { collectProjectConnectivity, renderConnectivity } from "./status-providers.mjs";
-import { exactProjectsForRoot, loadRegistryStrict } from "./registry.mjs";
+import {
+  exactProjectsForRoot, loadRegistryStrict, routableProjectsForRoot,
+} from "./registry.mjs";
 
 const arg = (n) => {
   const i = process.argv.indexOf("--" + n);
@@ -61,6 +63,8 @@ const reg = loadRegistryStrict();
 const outboundRouting = outboundRoutingFact({
   registryOk: reg.ok,
   exactCount: reg.ok ? exactProjectsForRoot(reg.projects, root).length : 0,
+  // **"是不是这个项目"和"出站会不会挑到它"是两个问题。**停用的条目属于前者不属于后者。
+  routableCount: reg.ok ? routableProjectsForRoot(reg.projects, root).length : 0,
   bound: st.ok === true,
 });
 

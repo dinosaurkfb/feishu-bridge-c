@@ -3042,6 +3042,57 @@ test("时间串走规范校验 —— 纯空白和乱写的都不算合法状态
     "缺毫秒的 ISO 串不是规范时间");
 });
 
+test("启用必须 fail-closed：plist 读不出来时，launchctl 一次都不许被调用", () => {
+  // 评审实测：上一版启用路径先 bootout、再写盘才抛 EISDIR ——
+  // **退出码是 1，可 launchd 控制面已经被动过**。
+  // 报错报对了、事情办坏了，跟停用那条是同一种病。
+  //
+  // 所以这条断言的不是"退出码非零"，而是**它一次都没碰过控制面**。
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const codexHome = path.join(dir, "codex");
+  const bridge = path.join(dir, "bridge");
+  const bin = path.join(dir, "bin");
+  for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));
+  fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  // 记账用的假 launchctl：**被调用一次就留痕**。
+  const marker = path.join(dir, "CALLED");
+  const lc = path.join(bin, "launchctl");
+  fs.writeFileSync(lc, '#!/bin/sh\necho "$@" >> ' + JSON.stringify(marker) +
+    '\necho "Could not find service" >&2\nexit 113\n', { mode: 0o755 });
+
+  // **把 plist 路径做成目录** → 读它 EISDIR。
+  const agents = path.join(fakeHome, "Library", "LaunchAgents");
+  fs.mkdirSync(agents, { recursive: true });
+  const plistPathAsDir = path.join(agents, "com.frank.feishu-bridge-codex.drain.plist");
+  fs.mkdirSync(plistPathAsDir);
+
+  const env = isolatedEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
+    FEISHU_CODEX_BRIDGE_HOME: bridge, FEISHU_BRIDGE_LAUNCHCTL: lc });
+  // 先把运行时装好，免得卡在运行时那道门槛上、测不到我们要测的东西。
+  assert.equal(spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", env }).status, 0);
+  // 安装本身不该碰 launchctl；从这里开始计数。
+  fs.rmSync(marker, { force: true });
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--enable", "--apply"],
+    { encoding: "utf-8", env });
+
+  assert.notEqual(r.status, 0, "必须拒绝：" + r.stdout);
+  assert.match(r.stderr, /plist 读不出来/u, "要说清拒绝的原因");
+  assert.match(r.stderr, /什么都没动/u);
+  assert.equal(fs.existsSync(marker), false,
+    "**launchctl 一次都不许被调用** —— 调用过就说明拒绝发生在动手之后：" +
+    (fs.existsSync(marker) ? fs.readFileSync(marker, "utf-8") : ""));
+  // 现场保持原样：还是一个目录，不是被写成了文件。
+  assert.equal(fs.statSync(plistPathAsDir).isDirectory(), true,
+    "plist 路径的类型都不许被改");
+});
+
 test("plist 读不出来不许当成「未启用」", () => {
   // 评审实测：把 plist 路径做成目录，状态仍显示"未启用"，
   // 停用命令还会说"本来就没启用"。**读不出来不等于没有** ——

@@ -345,8 +345,27 @@ export function scanRunnable({ home = bridgeHome(), preflight = preflightTask } 
   return { ok: true, tasks: (reg.tasks ?? []).length };
 }
 
+/**
+ * 这些状态下不许启用 —— **拒绝必须发生在动任何东西之前**。
+ *
+ * plist 读不出来：上一版没拦，于是启用路径先 bootout、再写盘才抛 EISDIR ——
+ * **退出码是 1，可 launchd 控制面已经被动过**。报错报对了、事情办坏了，
+ * 跟停用那条是同一种病。
+ *
+ * launchd 状态查不出来：这时候 bootstrap 之后也核验不了，
+ * 早拦比"动完再说没法确认"强。
+ */
+const PHASE_BLOCKS = {
+  plist_unreadable: "plist 读不出来",
+  unverifiable: "launchd 状态查不出来",
+};
+
 export function enableBlockers(state) {
   const blockers = [];
+  const phaseWhy = PHASE_BLOCKS[state.phase];
+  if (phaseWhy !== undefined) {
+    blockers.push({ code: "phase_blocks", detail: phaseWhy });
+  }
   if (state.scan && !state.scan.ok) {
     blockers.push({ code: "scan_failed", detail: state.scan.reason });
   }
@@ -417,6 +436,9 @@ function main() {
           console.error("  · 还有 " + b.detail + " 没处理。**定时器一启用它们就会被发出去** ——");
           console.error("    先决定这批内容是发还是停（scripts/codex/suppress-outbox.mjs），");
           console.error("    再回来启用。这一步不许省：省掉它就是替人做了一个不可逆的决定。");
+        } else if (b.code === "phase_blocks") {
+          console.error("  · " + b.detail + " —— **什么都没动**（没有 bootout、没有写盘）。");
+          console.error("    先把它查清楚：动过控制面之后再失败，比现在难收拾。");
         } else if (b.code === "backlog_corrupt") {
           console.error("  · outbox 里有 " + b.detail + "。**读不出来不等于没有** ——");
           console.error("    这些文件是什么内容谁也不知道，不能当成「没有积压」放行。");

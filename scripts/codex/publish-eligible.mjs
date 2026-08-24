@@ -66,8 +66,16 @@ export function preflightTask({ task, home = bridgeHome() } = {}) {
   if (typeof bin !== "string" || bin.length === 0) {
     return { ok: false, status: "error", reason: "lark_cli_unset" };
   }
-  try { fs.accessSync(bin, fs.constants.X_OK); }
-  catch { return { ok: false, status: "error", reason: "lark_cli_not_executable" }; }
+  // **X_OK 对目录也成立** —— 目录的"可执行"是"可进入"。
+  // 只查 X_OK 的话，lark_cli_bin 指到一个目录也算通过，真到发的时候才炸。
+  try {
+    if (!fs.statSync(bin).isFile()) {
+      return { ok: false, status: "error", reason: "lark_cli_not_a_file" };
+    }
+    fs.accessSync(bin, fs.constants.X_OK);
+  } catch {
+    return { ok: false, status: "error", reason: "lark_cli_not_executable" };
+  }
   const checked = assertPublishIdentity(identity);
   if (!checked?.ok) {
     return { ok: false, status: "error",

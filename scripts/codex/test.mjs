@@ -12,7 +12,7 @@ import {
   checkArgShape, locateTask, parseArgs as parseCodexSuppressArgs,
 } from "./suppress-outbox.mjs";
 import {
-  auditOutbox, classifyBacklog, drainScriptPath, enableBlockers, loadedPhase,
+  absentJob, auditOutbox, classifyBacklog, drainScriptPath, enableBlockers, loadedPhase,
   plistBody, scanRunnable,
 } from "./drain-service.mjs";
 import { auditSkills } from "./skill-content.mjs";
@@ -2883,6 +2883,133 @@ test("迁移必须收敛旧克隆的 hook，而不是在旁边再加一条", () 
     "**同一条 entry 里别人的 hook 必须原样留下** —— 按 entry 整条删会把它一起带走");
   assert.ok(commands("Stop").some((c) => c.includes("/z/stop-hook.mjs")),
     "长得像但 guard 与执行的脚本对不上的，不是我们的，不许碰");
+});
+
+test("装好的 runtime 必须能自证 —— doctor 在自己的运行环境里不许失灵", () => {
+  // 评审实测：runtime 只收 scripts/**\/*.mjs，技能源模板进不去；
+  // 从 runtime/current 跑 doctor，8 个技能文件全部报"源模板读不出来"——
+  // **唯一的验收工具在它自己的运行环境里失灵。**
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const codexHome = path.join(dir, "codex");
+  const bridge = path.join(dir, "bridge");
+  const bin = path.join(dir, "bin");
+  for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
+  for (const n of ["codex", "aily-cli", "lark-cli"]) {
+    fs.writeFileSync(path.join(bin, n), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  }
+  writeRegistry([], path.join(bridge, "registry.json"));
+  fs.writeFileSync(path.join(bridge, "chain-config.json"),
+    JSON.stringify({ ...TEMPLATE, lark_cli_bin: path.join(bin, "lark-cli") }));
+  const env = { ...process.env, HOME: fakeHome, CODEX_HOME: codexHome,
+    FEISHU_CODEX_BRIDGE_HOME: bridge, PATH: bin + path.delimiter + process.env.PATH };
+
+  assert.equal(spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", env }).status, 0);
+
+  // **从装好的 runtime 里跑**，不是从仓库里跑。
+  const installedDoctor = path.join(codexHome, "feishu-bridge", "runtime", "current",
+    "scripts", "codex", "doctor.mjs");
+  assert.equal(fs.existsSync(installedDoctor), true, "doctor 要在 runtime 里");
+  const r = spawnSync(process.execPath, [installedDoctor, "--json"], { encoding: "utf-8", env });
+  const report = JSON.parse(r.stdout);
+  const skills = report.checks.find((c) => c.name === "Codex skills");
+  assert.equal(skills.ok, true,
+    "**runtime 里的 doctor 必须能核验技能**：" + skills.detail);
+  assert.doesNotMatch(skills.detail, /源模板读不出来/u);
+  const hooks = report.checks.find((c) => c.name === "Codex hooks");
+  assert.equal(hooks.ok, true, hooks.detail);
+  // 一条真故障都不该有；只剩"查不清"的项。
+  assert.equal(report.checks.filter((c) => c.ok === false).length, 0,
+    "装完之后不该有故障：" + JSON.stringify(report.checks.filter((c) => c.ok === false)));
+  assert.equal(report.overall, "incomplete");
+});
+
+test("lark_cli_bin 指到目录不算可执行 —— X_OK 对目录也成立", () => {
+  // 评审实测：目录的"可执行"是"可进入"，accessSync(X_OK) 通过、isFile 是 false。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "abc123" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const aDir = path.join(home, "adir");
+  fs.mkdirSync(aDir);
+  const t = JSON.parse(JSON.stringify(TEMPLATE));
+  t.lark_cli_bin = aDir;
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(t));
+  const r = preflightTask({ task, home });
+  assert.equal(r.ok, false, "**目录不是可执行文件**");
+  assert.equal(r.reason, "lark_cli_not_a_file");
+});
+
+test("三态要校验字段类型 —— 畸形 published_at 不许被当成已发布藏起来", () => {
+  // 评审实测：published_at 放 false / 0 / {} / "" 时，上一版全当"已发布"静默跳过，
+  // 结果 ok:true, pending:0, unclassified:[] —— **一批损坏记录被永久藏起来，
+  // 门槛还照样放行。**
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-strict-"));
+  const put = (name, rec) => fs.writeFileSync(path.join(dir, name), JSON.stringify(rec));
+  for (const [i, bad] of [false, 0, {}, "", [], true].entries()) {
+    put("bad" + i + ".json", { published_at: bad });
+  }
+  put("ok-pending.json", { published_at: null });
+  put("ok-published.json", { published_at: "2026-08-24T00:00:00Z" });
+  put("ok-suppressed.json", { published_at: null, publish_suppressed_at: "2026-08-24T00:00:00Z" });
+  // suppressed 字段本身畸形也要拦。
+  put("bad-sup.json", { published_at: null, publish_suppressed_at: 7 });
+  put("bad-sup2.json", { published_at: null, publish_suppressed_at: "" });
+
+  const a = auditOutbox(dir);
+  assert.equal(a.ok, true);
+  assert.equal(a.pending, 1, "只有一条真待发");
+  assert.equal(a.unclassified.length, 8,
+    "**6 条畸形 published_at + 2 条畸形 suppressed 都要点出来**：" +
+    JSON.stringify(a.unclassified.map((u) => u.file)));
+});
+
+test("停用：卸载失败不许删 plist —— 还在跑的定时器不能被显示成「未启用」", () => {
+  // 评审实测：上一版是"卸载失败也照删 plist"。后果有两层 ——
+  // 旧 job 可能还在跑，而 plist 一删，下次查状态就报 absent。
+  // **一个还在跑的定时器被显示成「未启用」，比报错更糟。**
+  const dir = temp();
+  const fakeHome = path.join(dir, "home");
+  const codexHome = path.join(dir, "codex");
+  const bridge = path.join(dir, "bridge");
+  const bin = path.join(dir, "bin");
+  for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
+  writeRegistry([], path.join(bridge, "registry.json"));
+  // 假 launchctl：list 说有、bootout 失败（不是"没有这个服务"）。
+  fs.writeFileSync(path.join(bin, "launchctl"),
+    '#!/bin/sh\ncase "$1" in\n' +
+    '  list) echo \'{ "Program" = "/x"; "ProgramArguments" = ( "/x"; ); };\'; exit 0;;\n' +
+    '  bootout) echo "Boot-out failed: 5: Input/output error" >&2; exit 5;;\nesac\nexit 0\n',
+    { mode: 0o700 });
+  const agents = path.join(fakeHome, "Library", "LaunchAgents");
+  fs.mkdirSync(agents, { recursive: true });
+  const plist = path.join(agents, "com.frank.feishu-bridge-codex.drain.plist");
+  fs.writeFileSync(plist, "<plist/>");
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--disable", "--apply"],
+    { encoding: "utf-8", env: { ...process.env, HOME: fakeHome, CODEX_HOME: codexHome,
+      FEISHU_CODEX_BRIDGE_HOME: bridge, PATH: bin + path.delimiter + process.env.PATH } });
+
+  assert.notEqual(r.status, 0, "卸载失败必须非零退出：" + r.stdout);
+  assert.equal(fs.existsSync(plist), true, "**plist 不许被删**");
+  assert.match(r.stderr, /卸载失败/u);
+});
+
+test("「本来就没有这个服务」的判据不许放宽", () => {
+  // 上一版还认 not.*loaded —— 那能匹配上 "could not load"、
+  // "job not loaded correctly" 之类**真正的失败**。判据放宽一点，
+  // "卸载失败"就会被当成"本来就没有"，于是照样往下走。
+  assert.equal(absentJob("Could not find service \"x\" in domain"), true);
+  assert.equal(absentJob("No such file or directory"), true);
+  for (const real of ["Boot-out failed: 5: Input/output error",
+    "could not load service", "job not loaded correctly", "Operation not permitted"]) {
+    assert.equal(absentJob(real), false, "**这是真失败，不是「本来就没有」**：" + real);
+  }
 });
 
 test("链路预检必须真验身份：lark-cli 不在、凭据对不上都要拦", () => {

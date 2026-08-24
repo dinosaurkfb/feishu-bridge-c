@@ -118,25 +118,35 @@ export function versionFromFiles(files) {
 /**
  * 运行时需要哪些文件。
  *
- * 只有 `scripts/`：实测运行路径不读 `references/` 或仓库里任何别的资源
- *（`shared-surface.mjs` 读，但那是开发期契约工具，不在钩子路径上）。
- * 少复制一个目录就少一处「装完之后仓库变了、运行时没跟上」的不一致来源。
+ * `scripts/**\/*.mjs`：钩子和定时器实际执行的代码。
+ *
+ * `skills/**`：技能的**源模板**。这一份是后加的 —— 装完之后 doctor 要拿
+ * "期望内容"跟装出来的逐字节比对，而它自己就跑在 runtime 里。
+ * 模板不进 runtime 的话，从 runtime 跑的 doctor 报的是"源模板读不出来"，
+ * **唯一的验收工具在自己的运行环境里失灵**。评审在临时环境实测到 8 个技能
+ * 全部这样报。
+ *
+ * 仍然不收 `references/`：那是开发期契约工具用的，不在任何运行路径上。
  */
+const RUNTIME_TREES = [
+  { dir: "scripts", keep: (name) => name.endsWith(".mjs") },
+  { dir: "skills", keep: () => true },
+];
+
 export function collectRuntimeFiles(sourceRoot) {
-  const base = path.join(sourceRoot, "scripts");
   const out = [];
-  const walk = (dir) => {
+  const walk = (dir, keep) => {
     let entries;
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
     for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
       const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) { walk(full); continue; }
-      if (!entry.isFile() || !entry.name.endsWith(".mjs")) continue;
+      if (entry.isDirectory()) { walk(full, keep); continue; }
+      if (!entry.isFile() || !keep(entry.name)) continue;
       out.push(path.relative(sourceRoot, full));
     }
   };
-  walk(base);
-  return out;
+  for (const tree of RUNTIME_TREES) walk(path.join(sourceRoot, tree.dir), tree.keep);
+  return out.sort();
 }
 
 /** 来源提交，仅用于事后追溯「线上这份代码是哪儿来的」。不是 git 仓库也不算错。 */

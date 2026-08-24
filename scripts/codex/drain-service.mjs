@@ -168,14 +168,27 @@ export function auditOutbox(outboxDir) {
     if (rec === null || typeof rec !== "object" || Array.isArray(rec)) {
       unclassified.push({ file: f, why: "不是记录对象" }); continue;
     }
-    // 合法记录必须能落进这三态之一。`{}` 落不进 —— 它既没发过也没被停过，
-    // 却也没有 published_at 这个字段可依据。
-    const hasPublished = "published_at" in rec;
-    const suppressed = typeof rec.publish_suppressed_at === "string" && rec.publish_suppressed_at;
-    if (suppressed) continue;                       // suppressed
-    if (!hasPublished) { unclassified.push({ file: f, why: "缺 published_at，无法归类" }); continue; }
-    if (rec.published_at === null) pending += 1;    // pending
-    // 其余是 published
+    // **三态要严格校验字段的类型，不能只看"有没有这个键"。**
+    // 评审实测：published_at 放 false / 0 / {} / "" 时，上一版都当成"已发布"
+    // 静默跳过 —— 一批损坏记录就这样被永久藏起来，门槛还照样放行。
+    //
+    //   suppressed：publish_suppressed_at 是非空字符串
+    //   pending   ：published_at === null
+    //   published ：published_at 是非空字符串
+    // 三样都不是 → 说不清，拦住。
+    const sup = rec.publish_suppressed_at;
+    if (sup !== undefined && sup !== null) {
+      if (typeof sup === "string" && sup !== "") continue;               // suppressed
+      unclassified.push({ file: f, why: "publish_suppressed_at 不是时间串" });
+      continue;
+    }
+    if (!("published_at" in rec)) {
+      unclassified.push({ file: f, why: "缺 published_at，无法归类" }); continue;
+    }
+    const pub = rec.published_at;
+    if (pub === null) { pending += 1; continue; }                        // pending
+    if (typeof pub === "string" && pub !== "") continue;                 // published
+    unclassified.push({ file: f, why: "published_at 既不是 null 也不是时间串" });
   }
   return { ok: true, pending, unclassified };
 }
@@ -200,7 +213,10 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
     // **四态，不是"文件在不在"。**plist 写了但没 bootstrap 成功的话，
     // 定时器根本不会跑 —— 而只看文件存在会报"已启用"，
     // 那正是"界面说正常、实际不工作"的形状。
-    phase: installed === null ? "absent"
+    // **没有 plist 不等于没在跑。**孤儿 job（plist 被删了、job 还在 launchd 里）
+    // 曾经会被报成 absent —— 一个还在跑的定时器显示成"未启用"。
+    phase: installed === null
+      ? (loadedPhase(spawnLaunchctl, null) === "installed_not_loaded" ? "absent" : "orphan")
       : installed !== wanted ? "stale"
       : loadedPhase(spawnLaunchctl, expectedJob({ home, codexHome })),
     enabled: installed !== null,
@@ -229,6 +245,17 @@ export function parseLaunchctlList(text) {
   return { program: program ? program[1] : null, args };
 }
 
+/**
+ * launchctl 的这条错误是不是"本来就没有这个服务"。
+ *
+ * **只认这一种。**上一版还认 `not.*loaded`，那能匹配上
+ * "could not load"、"failed: job not loaded correctly" 之类真正的失败 ——
+ * 判据放宽一点，"卸载失败"就会被当成"本来就没有"。
+ */
+export const absentJob = (detail) =>
+  typeof detail === "string" &&
+  /(could not find (the )?(specified )?service|no such (file|process)|not find service)/iu.test(detail);
+
 export function loadedPhase(run = spawnLaunchctl, expect = null) {
   const r = run(["list", LAUNCH_LABEL]);
   if (!r.ok) {
@@ -253,6 +280,7 @@ export function loadedPhase(run = spawnLaunchctl, expect = null) {
 
 export const PHASE_TEXT = {
   absent: "未启用（安装后的默认态，不是故障）",
+  orphan: "**没有 plist，但 launchd 里还有同名 job 在 —— 它在按谁的配置跑说不清**",
   stale: "plist 与当前运行时对不上（要重装）",
   installed_not_loaded: "**plist 已写入但没被 launchd 加载 —— 定时器不会跑**",
   loaded: "已加载，正在按计划跑",
@@ -386,13 +414,24 @@ function main() {
   }
 
   if (disable) {
-    if (!st.enabled) { console.log("\n本来就没启用，什么都没做。"); process.exit(0); }
-    try {
-      const r = spawnLaunchctl(["bootout", "gui/" + process.getuid() + "/" + LAUNCH_LABEL]);
-      if (!r.ok) console.log("（launchctl bootout 没成功，继续删 plist：" + r.detail + "）");
-    } catch { /* 卸载失败不阻断删文件 */ }
+    if (!st.enabled && st.phase !== "loaded" && st.phase !== "loaded_other") {
+      console.log("\n本来就没启用，什么都没做。");
+      process.exit(0);
+    }
+    const out = spawnLaunchctl(["bootout", "gui/" + process.getuid() + "/" + LAUNCH_LABEL]);
+    // **只有"确实没有这个服务"可以忽略。**
+    //
+    // 上一版是"卸载失败也照删 plist"，后果有两层：旧 job 可能还在跑，
+    // 而 plist 一删，下一次状态查询就报 absent —— **一个还在跑的定时器
+    // 被显示成"未启用"**，比报错更糟。
+    if (!out.ok && !absentJob(out.detail)) {
+      console.error("\n卸载失败：" + out.detail);
+      console.error("**plist 没有删。**删了的话，下次查状态会把一个可能还在跑的");
+      console.error("定时器报成「未启用」—— 先把它卸掉再来。");
+      process.exit(1);
+    }
     fs.rmSync(st.plist, { force: true });
-    console.log("\n已停用。plist 已删除。");
+    console.log("\n已停用。plist 已删除，launchd 里也没有它了。");
     process.exit(0);
   }
 
@@ -402,7 +441,7 @@ function main() {
   const out = spawnLaunchctl(["bootout", "gui/" + process.getuid() + "/" + LAUNCH_LABEL]);
   // **只有"本来就没有"可以忽略。**其他失败意味着旧 job 还在，
   // 接着 bootstrap 只会失败或让旧配置继续跑 —— 那正是假绿的来源。
-  if (!out.ok && !/could not find|No such|not.*loaded/iu.test(out.detail ?? "")) {
+  if (!out.ok && !absentJob(out.detail)) {
     console.error("\n卸载旧的同名 job 失败：" + out.detail);
     console.error("**没有动 plist。**旧 job 可能还在按旧配置跑，先处理它再来。");
     process.exit(1);

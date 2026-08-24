@@ -31,7 +31,9 @@ import {
 } from "./interaction-policy-store.mjs";
 import { handOff, acquireSessionLock, releaseSessionLock, stampSessionLock } from "./handoff.mjs";
 import {
-  deliverToLiveSession, findLiveSessionById, findLiveSessions, hasPriorSession, stampInstruction,
+  DELIVERY_REJECT, DELIVERY_REJECT_TEXT,
+  deliverToLiveSession, findLiveSessionById, findLiveSessions, hasPriorSession,
+  pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction,
 } from "./live-session.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
 import {
@@ -463,11 +465,52 @@ if (!dialogueMode &&
 //
 // 这两条分支必须互斥。都走 --continue 的话会有两个进程写同一份 transcript ——
 // 现在没撞上纯粹是因为旧设计钉的是另一份记录，那是运气不是设计。
-// 会话级绑定要投给**它绑的那条线**；项目级绑定沿用「现场最近开的那个」。
+// 会话级绑定要投给**它绑的那条线**；项目级绑定原来沿用「现场最近开的那个」。
 const boundSession = routed.mapping?.claude_session_id ?? null;
-const target = boundSession
-  ? findLiveSessionById({ projectRoot: config.project_dir, claudeSessionId: boundSession })
-  : (findLiveSessions({ projectRoot: config.project_dir })[0] ?? null);
+// 那是猜，而它在实机上猜错过：同一个项目开着两条会话，Frank 在先开的那条工作，
+// 指令被投给了后开的那条 —— 他看着自己发出去的指令消失在另一个窗口里。
+// 现在只有一条会话时才投，多条就拒。理由跟下面那段「不回落到项目行为」一样：
+// **投错会话比投不进去更糟** —— 投不进去当场就知道，投错了要等到「它怎么没反应」才知道。
+let ambiguousDelivery = null;
+let target = null;
+if (boundSession) {
+  target = findLiveSessionById({ projectRoot: config.project_dir, claudeSessionId: boundSession });
+} else {
+  const picked = selectDeliverySession({
+    pinned: readDeliveryPin(config.project_dir),
+    live: findLiveSessions({ projectRoot: config.project_dir }),
+  });
+  if (picked.ok) {
+    target = picked.session;
+    // 现场只有一条时顺手钉下来 —— 那一刻没有歧义，钉了下次才不用碰运气。
+    // 上一版**声明了这件事却没做**：生产路径固定传 pinned:null，也从不读 picked.pin，
+    // 于是"已钉会话"那条分支只活在单测里。
+    if (picked.pin) {
+      // 写不成不影响这一条的投递（目标已经选定了），但**不能假装钉住了** ——
+      // 下一条消息会因为"没钉过"重新走歧义判断，而日志里若无痕迹就查不出为什么。
+      // 钉住 + 留痕都是 best-effort：目标已经选定，这两步失败都不该影响这一条的交付。
+      pinAndNote({
+        root: config.project_dir, sessionId: picked.pin,
+        noteFile: path.join(CLAIMS, claim.key + ".notes.log"),
+      });
+    }
+  } else if (picked.reason === DELIVERY_REJECT.AMBIGUOUS) {
+    ambiguousDelivery = picked;
+  }
+}
+
+if (ambiguousDelivery) {
+  recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed",
+    detail: { reason: DELIVERY_REJECT.AMBIGUOUS, candidates: ambiguousDelivery.candidates } });
+  writeReceipt("ambiguous-" + verdict.messageId, {
+    status: "rejected", reason: DELIVERY_REJECT.AMBIGUOUS,
+    message_id: verdict.messageId, claim_acquired: true, handed_off: false,
+  });
+  finish("rejected", {
+    reasonText: DELIVERY_REJECT_TEXT[DELIVERY_REJECT.AMBIGUOUS],
+    taskName: config.task_display_name,
+  }, { reason: DELIVERY_REJECT.AMBIGUOUS });
+}
 
 const reserveDialogue = (runtimeTargetId, { beforeReject = null } = {}) => {
   const reservation = reserveClaudeDialogueTurn({

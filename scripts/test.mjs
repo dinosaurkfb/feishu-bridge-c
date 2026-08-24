@@ -44,7 +44,7 @@ import {
 } from "./runtime-install.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
 import {
-  findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, stampInstruction, transcriptDirFor,
+  DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliveryPinPath, findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin,
 } from "./live-session.mjs";
 import { extractReply } from "./stop-hook.mjs";
 import {
@@ -6785,8 +6785,7 @@ test("有 route 没登记状态入口的消费者必须被列出来", () => {
     executable: process.execPath, script: "/abs/x.mjs", allowed_kinds: ["transport"],
   }] }));
   const run = () => ({ ok: true, connections: [
-    { kind: "transport", state: "active", scope: "chat",
-      groupName: "Claude2Codex", topicName: null, relation: null },
+    { kind: "transport", state: "active", scope: "chat", groupName: "Claude2Codex", topicName: null },
   ] });
 
   const view = collectConnectivity({ routesFile, providersFile, run });
@@ -7632,7 +7631,6 @@ test("按文档里那条命令登记，聚合方要真的能取到状态", () =>
   assert.equal(renderConnectivity(view).includes("oc_SECRET123456"), false);
 });
 
-
 test("relation_type 受两层约束，provider 不能自己给自己发许可", () => {
   const report = (relation) => JSON.stringify({
     schema_version: "feishu-bridge-status/v1", provider_id: "p",
@@ -7851,6 +7849,199 @@ const selfCheck = (over = {}) => checkEndpoint({
   verify: okVerify, access: okAccess, exec: okExecJson, assertFn: okAssert, ...over,
 });
 
+test("投递会话说不清时拒收，不猜", () => {
+  const a = { sessionId: "a", name: "first" };
+  const b = { sessionId: "b", name: "second" };
+
+  // 钉过且还活着 → 就投它，跟谁先开的无关。
+  const pinned = selectDeliverySession({ pinned: "a", live: [b, a] });
+  assert.equal(pinned.ok, true);
+  assert.equal(pinned.session.sessionId, "a");
+  assert.equal(pinned.matchedBy, "pinned");
+  assert.equal(pinned.pin, null, "已经钉过就不用再钉");
+
+  // 只有一条 → 没有歧义，顺手钉下来。
+  const sole = selectDeliverySession({ pinned: null, live: [a] });
+  assert.equal(sole.ok, true);
+  assert.equal(sole.matchedBy, "sole_live");
+  assert.equal(sole.pin, "a", "下次它不再是「碰巧只有一条」");
+
+  // 多条且没钉过 → 拒收。上一版在这里取"最近开的"，而它在实机上猜错了。
+  const ambiguous = selectDeliverySession({ pinned: null, live: [a, b] });
+  assert.equal(ambiguous.ok, false);
+  assert.equal(ambiguous.reason, DELIVERY_REJECT.AMBIGUOUS);
+  assert.equal(ambiguous.candidates, 2);
+  assert.equal(ambiguous.hadPin, false);
+
+  // 钉的那条没了、现场还有多条 → 同样拒收，不许回落到猜。
+  const gone = selectDeliverySession({ pinned: "zzz", live: [a, b] });
+  assert.equal(gone.ok, false);
+  assert.equal(gone.reason, DELIVERY_REJECT.AMBIGUOUS);
+  assert.equal(gone.hadPin, true, "要能分清「从没钉过」和「钉的那条没了」");
+
+  // 一条都没有是另一回事。
+  assert.equal(selectDeliverySession({ pinned: "a", live: [] }).reason, DELIVERY_REJECT.NO_LIVE);
+
+  // 拒收理由要指向一个**真的能做到那件事**的操作。上一版让人跑 /feishu-bind --apply，
+  // 而它要求单独输入、且是项目级；bind-session 又会新建话题 —— 都做不到
+  // "把现有项目级话题钉到这条会话"。提示指向做不到的操作，等于没有出路。
+  assert.match(DELIVERY_REJECT_TEXT[DELIVERY_REJECT.AMBIGUOUS], /feishu-pin-session\.mjs --apply/u);
+  assert.doesNotMatch(DELIVERY_REJECT_TEXT[DELIVERY_REJECT.AMBIGUOUS], /feishu-bind/u);
+});
+
+test("首选会话真的落盘、读得回、也撤得掉", () => {
+  // 上一版**声明了自动钉住却没做**：生产路径固定传 pinned:null，也从不读 picked.pin，
+  // 于是"已钉会话"那条分支只活在单测里。这条盯的是存取本身。
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pin-"));
+  assert.equal(readDeliveryPin(root), null, "没钉过就是 null");
+
+  assert.equal(writeDeliveryPin(root, "sess-a").ok, true);
+  assert.equal(readDeliveryPin(root), "sess-a");
+  assert.equal(fs.statSync(deliveryPinPath(root)).mode & 0o777, 0o600);
+
+  // 坏文件当作没钉过 —— 它只是个偏好，不该让入站停摆。
+  fs.writeFileSync(deliveryPinPath(root), "{ 坏掉的 json");
+  assert.equal(readDeliveryPin(root), null);
+  fs.writeFileSync(deliveryPinPath(root), JSON.stringify({ claude_session_id: 42 }));
+  assert.equal(readDeliveryPin(root), null, "形状不对也当没钉过");
+
+  assert.equal(writeDeliveryPin(root, "").ok, false);
+  assert.equal(clearDeliveryPin(root).ok, true);
+  assert.equal(readDeliveryPin(root), null);
+  assert.equal(clearDeliveryPin(root).ok, true, "本来就没有也算成功");
+});
+
+test("钉会话命令：身份要交叉核验，拼错的参数不许执行成另一种操作", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pincmd-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P", task_display_name: "P",
+  }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_fixture", claude_session_id: null,
+    channel_generation_id: "gen-1",
+  }));
+  const run = (args, env) => spawnSync(process.execPath, [
+    path.resolve("scripts", "feishu-pin-session.mjs"), "--project", dir, ...args,
+  ], { encoding: "utf-8", env: { ...process.env, ...env } });
+
+  // **只信环境变量是不够的。**上一版只读 CLAUDE_CODE_SESSION_ID，
+  // 于是 PID 是假的也照样写 pin。现在 session id、PID、现场登记三者要对上。
+  const noEnv = run([], { CLAUDE_CODE_SESSION_ID: "", CLAUDE_PID: "" });
+  assert.notEqual(noEnv.status, 0);
+  assert.match(noEnv.stderr, /认不出这是哪条会话/u);
+
+  const fakePid = run(["--apply"], { CLAUDE_CODE_SESSION_ID: "sess-foreign", CLAUDE_PID: "999999" });
+  assert.notEqual(fakePid.status, 0, "对不上的 PID 不许写 pin");
+  assert.match(fakePid.stderr, /认不出这是哪条会话/u);
+  assert.equal(readDeliveryPin(dir), null, "拒绝时不得写盘");
+
+  // **拼错的参数不许被执行成另一种操作。**上一版 --cleer --apply 被静默当成"钉住"。
+  // 这一课我在 register-status-provider 上刚学过，写这个新命令时没用上。
+  for (const [args, reason] of [
+    [["--cleer", "--apply"], "unknown_option"],
+    [["--apply", "--apply"], "duplicate_option"],
+    [["--project"], "option_needs_value"],
+    [["裸参数"], "unexpected_argument"],
+  ]) {
+    const bad = spawnSync(process.execPath, [
+      path.resolve("scripts", "feishu-pin-session.mjs"), ...args,
+    ], { encoding: "utf-8" });
+    assert.notEqual(bad.status, 0, reason);
+    assert.match(bad.stderr, new RegExp(reason, "u"));
+  }
+  assert.equal(readDeliveryPin(dir), null);
+});
+
+test("钉会话技能装出来之后，里面那条命令必须能跑", () => {
+  // 拒收回执把人指向这条命令，所以"技能装出来了"不够 —— 装出来的那条命令得真能执行。
+  // 之前栽过一次：文档里的示例漏了参数，照着登记之后 provider 直接 exit 2。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pinskill-"));
+  fs.mkdirSync(path.join(dir, ".claude", "skills"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), "{}\n");
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "install-outbound.mjs"), "--apply",
+  ], { encoding: "utf-8", env: {
+    ...process.env, HOME: dir,
+    CODEX_HOME: path.join(dir, "codex-home"),
+    FEISHU_CODEX_BRIDGE_HOME: path.join(dir, "bridge-home"),
+  } });
+  assert.equal(run.status, 0, run.stderr);
+
+  const installed = path.join(dir, ".claude", "skills", "feishu-pin-session", "SKILL.md");
+  assert.ok(fs.existsSync(installed), "技能要真的装出来");
+  const text = fs.readFileSync(installed, "utf-8");
+  assert.match(text, /name: feishu-pin-session/u);
+  // 渲染后必须指向 runtime，不能留占位符、也不能指向某个开发克隆。
+  assert.doesNotMatch(text, /\{\{SCRIPT/u, "占位符必须被渲染掉");
+  assert.match(text, /runtime\/current\/scripts\/feishu-pin-session\.mjs/u);
+
+  // 把技能里那条只读命令抠出来，确认它指向的脚本真的装到了 runtime。
+  const cmd = text.split("\n").find((l) => l.trim().startsWith("node '") && !l.includes("--"));
+  assert.ok(cmd, "技能里应当有一条无参数的只读命令");
+  const script = cmd.match(/'([^']+)'/u)[1];
+  assert.ok(fs.existsSync(script), "技能指向的脚本必须真的存在：" + script);
+});
+
+test("钉住与留痕都失败时，绝不抛 —— 这一条消息的交付不受影响", () => {
+  // 上一版留痕直接调 recordClaimState，而它遇到 IO 错误会抛：目录权限或磁盘出问题时
+  // 两次写入都失败，入站会在**真正投递之前**崩掉。
+  // 为了记一条诊断而丢掉一条已经确定目标的消息，是把次要目的放在主要目的前面。
+  const bad = "/nonexistent-root-" + Date.now();
+  const got = pinAndNote({
+    root: bad, sessionId: "s", noteFile: path.join(bad, "nope", "a.log"),
+  });
+  assert.equal(got.pinned, false);
+  assert.equal(got.noted, false, "留痕也失败了");
+  assert.ok(got.reason, "但要说得出为什么");
+
+  // 钉得住时不需要留痕。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pinnote-"));
+  const ok = pinAndNote({ root: dir, sessionId: "s-ok", noteFile: path.join(dir, "n.log") });
+  assert.deepEqual({ pinned: ok.pinned, noted: ok.noted }, { pinned: true, noted: false });
+  assert.equal(readDeliveryPin(dir), "s-ok");
+
+  // 钉不住但记得下时，痕迹要能回答"为什么没钉住"。
+  const noteDir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-note-"));
+  const noteFile = path.join(noteDir, "n.log");
+  const partial = pinAndNote({ root: bad, sessionId: "s", noteFile });
+  assert.equal(partial.pinned, false);
+  assert.equal(partial.noted, true);
+  assert.match(fs.readFileSync(noteFile, "utf-8"), /delivery_pin_not_persisted/u);
+});
+
+test("钉会话命令要按已验证的会话查绑定，不是只按项目", () => {
+  // 上一版这条测试**本身是假阳性**：我造的是项目文件绑定，而 resolveProject 会把它
+  // 一律解释成项目级 —— 于是旧的错实现（只传 root）也照样通过。
+  // 现在按评审给的标准来：registry 里同根目录**同时**放项目级和会话级两条。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-pinlvl-"));
+  const root = path.join(dir, "proj");
+  fs.mkdirSync(root);
+  const registryFile = path.join(dir, "registry.json");
+  const session = "01911111-2222-7333-8444-555555555555";
+  const projectEntry = newRegistryEntry({
+    root, name: "项目级", purpose: null, token: "aaa111", rootMessageId: "om_proj", now: NOW });
+  const sessionEntry = {
+    ...newRegistryEntry({
+      root, name: "会话级", purpose: null, token: "bbb222", rootMessageId: "om_sess", now: NOW }),
+    id: "sess-entry", claude_session_id: session,
+  };
+  fs.writeFileSync(registryFile, JSON.stringify({
+    schema_version: "1.0", projects: [projectEntry, sessionEntry] }));
+
+  // 传了会话 → 选中会话级；不传 → 落到项目级。后者正是旧实现的错处。
+  assert.equal(resolveProject({ root, claudeSessionId: session, registryFile }).bindingLevel,
+    "session");
+  assert.equal(resolveProject({ root, registryFile }).bindingLevel, "project");
+
+  // 命令必须把已验证的会话传下去。退回 currentBinding({ root }) 时这条会失败 ——
+  // 那是评审给的验收标准。
+  const src = fs.readFileSync(path.resolve("scripts", "feishu-pin-session.mjs"), "utf-8");
+  assert.match(src, /currentBinding\(\{ root, claudeSessionId:/u,
+    "退回只传 root，就会在项目级与会话级并存时错选项目级");
+  assert.doesNotMatch(src, /currentBinding\(\{ root \}\)/u);
+});
 test("端点自检把 FR-1.4 的四种情形分开，各有各的下一步", () => {
   const ready = selfCheck();
   // **入站身份本机验不了，所以最好的结论就是 incomplete。**

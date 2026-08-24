@@ -50,6 +50,129 @@ export function findLiveSessionById({ projectRoot, claudeSessionId, sessionsDir 
     .find((s) => s.sessionId === claudeSessionId) ?? null;
 }
 
+/**
+ * 项目级绑定"首选哪条本地会话"的落脚点。
+ *
+ * **刻意不复用 claude_session_id。**那个字段是会话级绑定的标志 —— 借它来存首选会话
+ * 会顺带改变绑定级别和 outbox 目录语义（会话级 outbox 是 outbox-<uuid>/）。
+ * 这里要表达的只是"投给哪条会话"，不是"这条绑定属于哪条会话"，两件事不能共用一个字段。
+ */
+export const deliveryPinPath = (root) =>
+  path.join(root, ".runtime-data", "inbound", "delivery-session.json");
+
+/** 读首选会话。读不到、坏了、形状不对，一律当作没钉过 —— 它只是个偏好，不是权威状态。 */
+export function readDeliveryPin(root) {
+  try {
+    const doc = JSON.parse(fs.readFileSync(deliveryPinPath(root), "utf-8"));
+    const id = doc?.claude_session_id;
+    return typeof id === "string" && id.length > 0 ? id : null;
+  } catch { return null; }
+}
+
+/** 原子写。写坏了只会退回"没钉过"，不会让入站停摆。 */
+export function writeDeliveryPin(root, claudeSessionId, { now = Date.now() } = {}) {
+  if (typeof claudeSessionId !== "string" || !claudeSessionId) {
+    return { ok: false, reason: "no_session_id" };
+  }
+  const file = deliveryPinPath(root);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const tmp = file + ".tmp." + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify({
+      schema_version: "1.0",
+      artifact_type: "feishu_bridge_delivery_pin",
+      claude_session_id: claudeSessionId,
+      pinned_at: new Date(now).toISOString(),
+    }, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return { ok: true, file };
+  } catch (err) {
+    return { ok: false, reason: "pin_unwritable", error: String(err.message).slice(0, 200) };
+  }
+}
+
+/**
+ * 钉住首选会话并留痕，**两步都失败也不许抛**。
+ *
+ * 这是投递路径上的副作用：目标已经选定了，钉不钉得住都不该影响这一条的交付。
+ * 上一版留痕直接调 recordClaimState，而它遇到 IO 错误会抛 —— 目录权限或磁盘
+ * 出问题时两次写入都失败，入站会在**真正投递之前**崩掉。
+ * 为了记一条诊断而丢掉一条已经确定目标的消息，是把次要目的放在主要目的前面。
+ */
+export function pinAndNote({ root, sessionId, noteFile, now = Date.now() }) {
+  const written = writeDeliveryPin(root, sessionId, { now });
+  if (written.ok) return { pinned: true, noted: false };
+  let noted = false;
+  try {
+    fs.appendFileSync(noteFile,
+      new Date(now).toISOString() + " delivery_pin_not_persisted " + written.reason + "\n",
+      { mode: 0o600 });
+    noted = true;
+  } catch { /* 记不下就算了，绝不因此挡住投递 */ }
+  return { pinned: false, noted, reason: written.reason };
+}
+
+/** 撤销首选。文件本来就不在也算成功 —— 目标状态是"没有钉"，已经是了就不算失败。 */
+export function clearDeliveryPin(root) {
+  try {
+    fs.rmSync(deliveryPinPath(root), { force: true });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: "pin_unwritable", error: String(err.message).slice(0, 200) };
+  }
+}
+
+export const DELIVERY_REJECT = Object.freeze({
+  NO_LIVE: "no_live_session",
+  AMBIGUOUS: "ambiguous_live_sessions",
+});
+
+/**
+ * 项目级绑定该投给哪条会话。**说不清就拒收，不猜。**
+ *
+ * 上一版的规则是「取最近开的 —— 最可能是他正看着的那个」。那是个猜测，
+ * 而它在实机上猜错了：Frank 在 cc2cd 开了两个会话，主要工作在先开的那个，
+ * 消息却被投给后开的。**他看着自己发出去的指令消失在另一个窗口里。**
+ *
+ * 现在的规则，从确定到不确定：
+ *   1. 钉过一条、而且它还活着 → 就投它
+ *   2. 没钉过、而现场只有一条 → 投它，并把它钉下来（不用问，因为没有歧义）
+ *   3. 其余情况（多条且没钉过、或钉的那条没了而现场有多条）→ **拒收**
+ *
+ * 第 3 条会让消息发不进去，这是有意的：投错会话比投不进去更糟 ——
+ * 投不进去你当场就知道，投错了你要等到发现"它怎么没反应"才知道，
+ * 而那时指令可能已经在另一个上下文里被执行了。
+ */
+export function selectDeliverySession({ pinned, live }) {
+  const sessions = Array.isArray(live) ? live : [];
+  if (sessions.length === 0) return { ok: false, reason: DELIVERY_REJECT.NO_LIVE };
+
+  if (typeof pinned === "string" && pinned) {
+    const hit = sessions.find((s) => s.sessionId === pinned);
+    if (hit) return { ok: true, session: hit, matchedBy: "pinned", pin: null };
+  }
+  if (sessions.length === 1) {
+    // 只有一条就没有歧义 —— 顺手钉下来，下次它不再是"碰巧只有一条"。
+    return { ok: true, session: sessions[0], matchedBy: "sole_live", pin: sessions[0].sessionId };
+  }
+  return {
+    ok: false,
+    reason: DELIVERY_REJECT.AMBIGUOUS,
+    candidates: sessions.length,
+    hadPin: typeof pinned === "string" && pinned.length > 0,
+  };
+}
+
+export const DELIVERY_REJECT_TEXT = Object.freeze({
+  [DELIVERY_REJECT.NO_LIVE]: "本机没有正在运行的会话可以接收",
+  // 提示必须指向一个**真的能做到那件事**的操作。上一版让人跑 /feishu-bind --apply，
+  // 而它要求单独输入、且是项目级；bind-session 又会新建话题 —— 都做不到
+  // "把现有项目级话题钉到这条会话"。
+  [DELIVERY_REJECT.AMBIGUOUS]:
+    "这个项目同时开着多条会话，说不清该投给哪一条。请在你要接收的那条会话里运行：" +
+    "node ~/.claude/feishu-bridge/runtime/current/scripts/feishu-pin-session.mjs --apply",
+});
+
 export function findLiveSessions({ projectRoot, sessionsDir = SESSIONS_DIR, isAlive = alive }) {
   let files;
   try {

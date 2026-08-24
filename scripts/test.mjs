@@ -8820,7 +8820,8 @@ test("发布失败只给诊断，不自动做有损动作", () => {
     const e = new Error("Command failed: lark-cli"); e.stderr = "code 230002"; throw e;
   };
   assert.doesNotThrow(() => {
-    got = drainProject({ root: dir, claudeSessionId: null, publish: boom });
+    got = drainProject({ root: dir, claudeSessionId: null, publish: boom,
+      diagnose: () => ({ kind: "root_owned_by_other_app", ownerName: "CC" }) });
   });
   assert.equal(got.status, "error");
   assert.equal(got.reason, "publish_failed");
@@ -8891,7 +8892,20 @@ test("带诊断的失败也要留 lark-cli 说的话，不是命令回显", () =
     + "x".repeat(2000));
   err.stderr = "code 230002: bot not in chat";
 
-  const r = drainProject({ root: dir, publish: () => { throw err; } });
+  // **diagnose 也要注入。**只挡住 publish 只挡住了"写"：失败之后的身份诊断
+  // 会跑 lark-cli `im +messages-mget` 去查根消息归属，那同样是一次出网请求。
+  //
+  // 断言它**确实被调到**，而不只是"传了进去"：夹具里没有 outbound_app_id 时，
+  // 真实诊断函数会提前返回、不出网 —— 两版行为一模一样，
+  // **光看结果分不出用的是哪个**。计数是唯一能分辨的证据。
+  let diagnoseCalls = 0;
+  const safeDiagnose = () => {
+    diagnoseCalls += 1;
+    return { kind: PUBLISH_FAILURE.TRANSIENT, reason: "test_stub" };
+  };
+  const r = drainProject({
+    root: dir, publish: () => { throw err; }, diagnose: safeDiagnose });
+  assert.equal(diagnoseCalls, 1, "诊断必须走注入的那个 —— 否则失败路径仍会真的出网");
 
   assert.equal(r.status, "error");
   assert.equal(r.reason, "publish_failed");
@@ -8924,6 +8938,14 @@ test("测试不许走真实发布路径 —— 每个 drainProject 调用都要�
     !/dryRun: true|publish:/u.test(site.near) && !site.near.includes("// 发布前返回："));
   assert.deepEqual(unexplained.map((x) => (x.i + 1) + ": " + x.line.trim()), [],
     "这些 drainProject 调用既没注入 publish、也没写「// 发布前返回：」说明它为什么发不出去");
+
+  // **注入了写就必须注入读。**评审实测：只注入 publish 时，失败之后的身份诊断
+  // 照样跑 lark-cli `im +messages-mget` —— "挡住了写"不等于"不出网"。
+  // 会走到失败分支的调用（也就是注入了 publish 的那些）必须同时注入 diagnose。
+  const halfInjected = sites.filter((site) =>
+    site.near.includes("publish:") && !site.near.includes("diagnose:"));
+  assert.deepEqual(halfInjected.map((x) => (x.i + 1) + ": " + x.line.trim()), [],
+    "这些调用注入了 publish 却没注入 diagnose —— 失败后的诊断仍会真的出网");
 });
 
 test("带诊断的失败分支必须真的可达 —— 更具体的条件要先判", () => {

@@ -132,10 +132,16 @@ export function suppressCmd() {
  * 跑过一次非 dry-run 的 drainProject，**它直接打到了真实飞书 API**
  * （拿到真实错误码 99992354，所幸根消息是假的，什么都没发出去）。
  *
- * 注入口只改测试的可达性，不改生产行为：不传就是 publishDraft 本身。
+ * **两个口都要有。**只注入 publish 只挡住了"写"：发布失败之后还要跑身份诊断，
+ * 而 classifyPublishFailure 会执行 lark-cli `im +messages-mget` 去查根消息的归属 ——
+ * 那同样是一次真实的出网请求。评审用假二进制实测到了这一点：注入的发布函数抛错后，
+ * 诊断进程照样被调起来。**"挡住了写"不等于"不出网"。**
+ *
+ * 注入口只改测试的可达性，不改生产行为：不传就是 publishDraft / classifyPublishFailure 本身。
  */
 export function drainProject({
-  root, claudeSessionId, dryRun = false, timeoutMs, force = false, publish = publishDraft,
+  root, claudeSessionId, dryRun = false, timeoutMs, force = false,
+  publish = publishDraft, diagnose = classifyPublishFailure,
 } = {}) {
   const outboxDir = outboxDirOf(root, claudeSessionId);
 
@@ -264,7 +270,7 @@ export function drainProject({
       // 那是**从相关性推因果**：瞬时的网络错误发生在跨应用根消息上，照样会触发
       // 不可逆的抑制。有损动作不能建立在推断出来的因果上 —— 要么拿到确实表示
       // 身份不兼容的平台错误码，要么由人显式下令。现在选后者。
-      const diagnosis = classifyPublishFailure({
+      const diagnosis = diagnose({
         rootMessageId: failingTarget?.rootMessageId ?? null,
         expectedAppId: id?.expectedAppId,
         larkBin: id?.bin, larkHome: id?.configDir, profile: id?.profile,

@@ -77,7 +77,8 @@ import {
 import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
 import { bindingToConnections } from "./group-binding-status.mjs";
 import {
-  SYNC_ACTION, SYNC_REJECT, planSubscriptionSync, renderSyncPlan, subscriptionCovers,
+  SYNC_ACTION, SYNC_REJECT, authorizationCovers, planSubscriptionSync, renderSyncPlan,
+  subscriptionCovers,
 } from "./subscription-sync.mjs";
 import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
 import {
@@ -7843,7 +7844,12 @@ const syncSub = (over = {}) => ({
   constraints: { freshness_ms: 900000 }, ...over,
 });
 const syncBinding = (id, over = {}) => ({
-  endpoint_id: "ep1", chat_id: "oc", transport_open_id: "ou",
+  // **binding 自带它归属哪条订阅**，以及它现在依据的那份授权到底是什么。
+  // 上一版的夹具两样都没有，于是"归属"只能靠范围猜、"兼容"只能比三个字段 ——
+  // 夹具缺字段，判据就永远补不齐。
+  subscription_id: "s1", endpoint_id: "ep1", domain_id: "d1", agent_uid: "a",
+  chat_id: "oc", transport_open_id: "ou",
+  authorized_sender_ids: ["frank"], event_types: ["im.message.receive"], freshness_ms: 900000,
   local_target_id: id, private_binding_key: "k" + id, status: "active", ...over,
 });
 
@@ -8044,7 +8050,8 @@ test("订阅撤销或暂停时，依赖它的 binding 必须被明确暂停", ()
   // FR-2.5 的要害在最后半句："不能依靠日常热路径重新解释配置"。
   // 让热路径每次重看配置看着更省事，但那样改配置的那一刻什么都没发生，
   // 后果散落在此后每一条消息上，而且没有一个可以对账的时刻。
-  for (const next of [null, syncSub({ status: "paused" })]) {
+  // 暂停也要升版本 —— 它是一次真的授权变更，不是元数据改动。
+  for (const next of [null, syncSub({ status: "paused", version: 2 })]) {
     const got = planSubscriptionSync({
       previous: syncSub(), next, bindings: [syncBinding("t1"), syncBinding("t2")],
     });
@@ -8056,60 +8063,177 @@ test("订阅撤销或暂停时，依赖它的 binding 必须被明确暂停", ()
 });
 
 test("订阅内容变了但仍覆盖 → 重新物化快照，不是暂停", () => {
+  // 注意 next 必须是**内容真的变了**。只涨版本号是 no-op，
+  // 拿它当"内容变了"的样本，这条测试就测不到 resnapshot 那条分支。
   const got = planSubscriptionSync({
-    previous: syncSub(), next: syncSub({ version: 2 }), bindings: [syncBinding("t1")],
+    previous: syncSub(),
+    next: syncSub({ version: 2, scope: { ...syncSub().scope, sender_ids: ["frank", "另一个人"] } }),
+    bindings: [syncBinding("t1")],
   });
   assert.deepEqual(got.counts, { resnapshot: 1, suspend: 0, migrate: 0 });
   // 一律暂停会把"授权还在、只是内容变了"也停掉 —— 那是把同步做成了断电。
   assert.equal(got.plans[0].action, SYNC_ACTION.RESNAPSHOT);
 });
 
-test("只有唯一一条订阅接得住才算迁移，多条命中一律拒绝", () => {
+test("迁移必须由人显式指定目标 —— 「只剩这一条」不是授权", () => {
+  // 上一版：唯一一条范围接得住就自动迁。评审用反例打穿了 ——
+  // 那条"唯一候选"可以属于别的业务域、别的 agent、只授权别的人和别的事件类型。
+  // 这跟自动抑制是同一类错误：从"只剩这一条"推出"那就是它"。
   const other = syncSub({ subscription_id: "s2" });
-  const single = planSubscriptionSync({
+  const auto = planSubscriptionSync({
     previous: syncSub(), next: null, bindings: [syncBinding("t1")], others: [other],
   });
-  assert.equal(single.counts.migrate, 1);
-  assert.equal(single.plans[0].to.subscription_id, "s2");
+  assert.equal(auto.ok, true);
+  assert.equal(auto.counts.migrate, 0, "没有显式目标就不许迁");
+  assert.equal(auto.counts.suspend, 1, "默认是暂停：安全、可恢复、后果明确");
+  assert.equal(auto.plans[0].migrationCandidates, 1, "有候选要告诉人，但不替人决定");
+  assert.match(renderSyncPlan(auto), /要迁请显式指定目标/u);
 
-  // 跟 FR-2.6 首次认领同一条理由，而且这里更严重：
-  // 认领错了拒一条消息，迁移错了整条 binding 就归错了人。
-  const ambiguous = planSubscriptionSync({
+  // 显式指定且授权确实覆盖 → 才迁。
+  const explicit = planSubscriptionSync({
     previous: syncSub(), next: null, bindings: [syncBinding("t1")],
-    others: [other, syncSub({ subscription_id: "s3" })],
+    others: [other], migrateTo: "s2",
   });
-  assert.equal(ambiguous.ok, false);
-  assert.equal(ambiguous.reason, SYNC_REJECT.AMBIGUOUS_TARGET);
-  assert.equal(ambiguous.candidates, 2);
-  assert.match(renderSyncPlan(ambiguous), /迁错了整条 binding 就归错了人/u);
+  assert.equal(explicit.counts.migrate, 1);
+  assert.equal(explicit.plans[0].to.subscription_id, "s2");
+  assert.equal(explicit.plans[0].reason, "explicit_target");
 
-  // 暂停中的订阅不算"接得住" —— 迁过去也是没授权。
-  const inactive = planSubscriptionSync({
+  // 指定了一个不在候选里的目标 → 拒，不静默降级成暂停。
+  const unknown = planSubscriptionSync({
     previous: syncSub(), next: null, bindings: [syncBinding("t1")],
-    others: [syncSub({ subscription_id: "s2", status: "paused" })],
+    others: [other], migrateTo: "s9",
   });
-  assert.equal(inactive.counts.suspend, 1);
-  assert.equal(inactive.counts.migrate, 0);
+  assert.equal(unknown.reason, SYNC_REJECT.MIGRATION_TARGET_UNKNOWN);
 });
 
-test("覆盖判据只看可信字段，改个显示名不该改变归属", () => {
-  const sub = syncSub();
-  assert.equal(subscriptionCovers(sub, syncBinding("t1")), true);
-  // 换群、换运输身份、换 endpoint → 不覆盖。
-  assert.equal(subscriptionCovers(sub, syncBinding("t1", { chat_id: "oc_other" })), false);
-  assert.equal(subscriptionCovers(sub, syncBinding("t1", { transport_open_id: "ou_other" })), false);
-  assert.equal(subscriptionCovers(sub, syncBinding("t1", { endpoint_id: "ep2" })), false);
-  // 显示名之类不参与判定 —— 拿它们判归属，就等于让改名改变路由。
-  assert.equal(subscriptionCovers(sub, syncBinding("t1", { name: "换个名字" })), true);
+test("迁移目标的授权必须逐项覆盖，差一样都不许迁", () => {
+  // 评审给的反例：一条属于 domain-a、授权 frank、只收 message 的 binding，
+  // 上一版会被迁到 other-domain、other-agent、只授权别人和别的事件的订阅 ——
+  // 因为"接得住"只比了 endpoint / 群 / 运输身份。**迁移是重新归属，不是换指针。**
+  const cases = [
+    ["domain_id", { domain_id: "other-domain" }],
+    ["agent_uid", { scope: { ...syncSub().scope, agent_uid: "other-agent" } }],
+    ["sender_ids", { scope: { ...syncSub().scope, sender_ids: ["someone-else"] } }],
+    ["event_types", { scope: { ...syncSub().scope, event_types: ["im.chat.updated"] } }],
+    // 新窗口更严 → 收不下这条 binding 原本受理的事件，那不是覆盖。
+    ["freshness_ms", { constraints: { freshness_ms: 60000 } }],
+    ["status", { status: "paused" }],
+  ];
+  for (const [missing, over] of cases) {
+    const target = syncSub({ subscription_id: "s2", ...over });
+    const got = planSubscriptionSync({
+      previous: syncSub(), next: null, bindings: [syncBinding("t1")],
+      others: [target], migrateTo: "s2",
+    });
+    assert.equal(got.ok, false, missing + " 不同也被放行了");
+    assert.equal(got.reason, SYNC_REJECT.MIGRATION_INCOMPATIBLE, missing);
+    assert.equal(got.missing, missing, missing + " 的差异要指名道姓");
+    // 同一条差异下，连"候选"都不该算它。
+    const auto = planSubscriptionSync({
+      previous: syncSub(), next: null, bindings: [syncBinding("t1")], others: [target],
+    });
+    assert.equal(auto.plans[0].migrationCandidates, 0, missing + "：授权不覆盖就不是候选");
+  }
+
+  // 目标授权更宽（多授权一个人、多收一种事件、窗口更松）→ 覆盖得住，可以迁。
+  const wider = syncSub({
+    subscription_id: "s2",
+    scope: { ...syncSub().scope, sender_ids: ["frank", "someone"], event_types: ["im.message.receive", "im.chat.updated"] },
+    constraints: { freshness_ms: 1800000 },
+  });
+  const ok = planSubscriptionSync({
+    previous: syncSub(), next: null, bindings: [syncBinding("t1")], others: [wider], migrateTo: "s2",
+  });
+  assert.equal(ok.counts.migrate, 1, "更宽的授权是覆盖，不该被挡");
+});
+
+test("归属看 binding 记着的订阅身份，不看范围", () => {
+  // 上一版用范围覆盖代替归属：撤销 sub-a，会把明明属于 sub-b 的同群 binding
+  // 一起列进来暂停。**同一个群里本来就可以有多条订阅。**
+  const got = planSubscriptionSync({
+    previous: syncSub(), next: null,
+    bindings: [syncBinding("mine"), syncBinding("theirs", { subscription_id: "s2" })],
+  });
+  assert.equal(got.plans.length, 1, "范围一样但属于别条订阅的，不在这次变更范围里");
+  assert.equal(got.plans[0].binding.local_target_id, "mine");
 });
 
 test("不归这条订阅的 binding 不在本次变更范围里", () => {
   const got = planSubscriptionSync({
     previous: syncSub(), next: null,
-    bindings: [syncBinding("mine"), syncBinding("theirs", { chat_id: "oc_other" })],
+    bindings: [syncBinding("mine"), syncBinding("theirs", { subscription_id: "s2", chat_id: "oc_other" })],
   });
   assert.equal(got.plans.length, 1, "别的群那条不该被这次撤销牵连");
   assert.equal(got.plans[0].binding.local_target_id, "mine");
+});
+
+test("输入契约不许 fail-open —— 一个算错的控制面比没有控制面更危险", () => {
+  // 这几条都是评审实测出来的：它们当时全都"成功"返回。
+  // 控制面返回 ok 的含义是"我算过了"，算不清就必须说算不清。
+  const base = { previous: syncSub(), next: syncSub({ version: 2 }), bindings: [syncBinding("t1")] };
+
+  // previous 缺失/说不清 → 根本算不出谁受影响。上一版 previous=null、next=null 返回成功且零计划。
+  assert.equal(planSubscriptionSync({ ...base, previous: null }).reason, SYNC_REJECT.PREVIOUS_INVALID);
+  assert.equal(planSubscriptionSync({ previous: null, next: null, bindings: [] }).ok, false);
+
+  // bindings 传 null 上一版直接抛 TypeError —— 崩溃不是拒绝。
+  assert.equal(planSubscriptionSync({ ...base, bindings: null }).reason, SYNC_REJECT.BINDINGS_INVALID);
+  // binding 缺字段 → 缺哪个就说哪个，不许"没写=不限制"。
+  for (const f of ["subscription_id", "domain_id", "agent_uid", "authorized_sender_ids",
+    "event_types", "freshness_ms"]) {
+    const bad = { ...syncBinding("t1") };
+    delete bad[f];
+    const got = planSubscriptionSync({ ...base, bindings: [bad] });
+    assert.equal(got.reason, SYNC_REJECT.BINDINGS_INVALID, f);
+    assert.equal(got.problem, f, f + " 要指名道姓");
+  }
+
+  // others 说不清 / 同一个 id 出现两次 → "唯一目标"无从谈起。
+  assert.equal(planSubscriptionSync({ ...base, others: null }).reason, SYNC_REJECT.OTHERS_INVALID);
+  assert.equal(planSubscriptionSync({ ...base, others: [{ nonsense: true }] }).reason,
+    SYNC_REJECT.OTHERS_INVALID);
+  assert.equal(planSubscriptionSync({
+    ...base, others: [syncSub({ subscription_id: "s2" }), syncSub({ subscription_id: "s2" })],
+  }).problem, "duplicate_id");
+  // 跟被改的这条同 id 也不行。
+  assert.equal(planSubscriptionSync({ ...base, others: [syncSub()] }).problem, "duplicate_id");
+
+  // 换了 subscription_id 不是更新，是替换。
+  assert.equal(planSubscriptionSync({ ...base, next: syncSub({ subscription_id: "s2", version: 2 }) }).reason,
+    SYNC_REJECT.IDENTITY_CHANGED);
+
+  // 版本回退、原地不动都不行 —— 两份不同的授权共用一个版本号，之后没法判断哪份更新。
+  const changed = (v) => syncSub({ version: v, scope: { ...syncSub().scope, sender_ids: ["someone"] } });
+  assert.equal(planSubscriptionSync({ ...base, previous: syncSub({ version: 2 }), next: changed(1) }).reason,
+    SYNC_REJECT.VERSION_NOT_ADVANCED);
+  assert.equal(planSubscriptionSync({ ...base, next: changed(1) }).reason,
+    SYNC_REJECT.VERSION_NOT_ADVANCED);
+});
+
+test("授权内容没变就是 no-op，不许生成一份「重新物化」计划", () => {
+  // 上一版前后完全相同也照样产出 resnapshot。**那不是无害的**：
+  // 它会让人以为确实发生了变更，也会让每次保存都刷一遍所有快照。
+  const same = planSubscriptionSync({
+    previous: syncSub(), next: syncSub(), bindings: [syncBinding("t1")],
+  });
+  assert.equal(same.ok, true);
+  assert.equal(same.noop, true);
+  assert.deepEqual(same.counts, { resnapshot: 0, suspend: 0, migrate: 0 });
+  assert.match(renderSyncPlan(same), /没有变化/u);
+
+  // 只涨版本号、内容一字未动 —— 同样是 no-op。指纹里不含 version。
+  assert.equal(planSubscriptionSync({
+    previous: syncSub(), next: syncSub({ version: 5 }), bindings: [syncBinding("t1")],
+  }).noop, true);
+
+  // 内容真的变了才算变更。
+  const real = planSubscriptionSync({
+    previous: syncSub(),
+    next: syncSub({ version: 2, scope: { ...syncSub().scope, sender_ids: ["frank", "另一个人"] } }),
+    bindings: [syncBinding("t1")],
+  });
+  assert.equal(real.noop, false);
+  assert.equal(real.counts.resnapshot, 1);
 });
 
 test("拿一份说不清的订阅去同步要被拒", () => {

@@ -9032,6 +9032,47 @@ test("落盘：被改过的恢复清单一律拒 —— 五种改法，写文件
   assert.equal(toGot.reason, APPLY_REJECT.JOURNAL_UNREADABLE,
     "要被结构校验拦下，不是靠指纹对不上");
 
+  // ── 最阴的一种：**删字段，连指纹都不用重算** ──
+  //
+  // 上一版的"严格校验"只禁止未知字段，不要求允许的字段必须存在。删掉 to 之后
+  // `undefined` 被放行，而指纹用 `to ?? null` 把"缺失"和 null 算成一样 ——
+  // **这份清单连 plan_id 都不用改就还是有效的**。
+  // 恢复清单是写入授权的依据，这种宽容正是它最不该有的。
+  const dropKey = (obj, key) => { const c = { ...obj }; delete c[key]; return c; };
+  // **用哪个 harness 取决于被改的字段在不在指纹里** —— 这一点必须想清楚，
+  // 否则测到的是指纹比对，不是结构校验：
+  //   · 不在指纹里（时间、状态）→ tryWith，原始指纹就是它们的真实形态；
+  //   · 在指纹里（action / expect / noop）→ 必须 resign + tryFully，
+  //     否则先被"指纹对不上"拦下，**结构校验根本没轮到出手**。
+  const notInFingerprint = [
+    // 删掉 to 之后指纹不变（`to ?? null` 把缺失和 null 算成一样）——
+    // **这份清单连 plan_id 都不用改就还是有效的**，是最阴的一种。
+    ["写项缺 to", { ...good, writes: [dropKey(good.writes[0], "to")] }],
+    ["写项缺 target", { ...good, writes: [dropKey(good.writes[0], "target")] }],
+    ["顶层缺 prepared_at", dropKey(good, "prepared_at")],
+    ["prepared 却带着提交时间", { ...good, committed_at: new Date().toISOString() }],
+    ["committed 却没有提交时间", { ...good, status: "committed", committed_at: null }],
+  ];
+  const inFingerprint = [
+    ["写项缺 action", resign({ ...good, writes: [dropKey(good.writes[0], "action")] })],
+    ["expect 缺一个字段", resign({ ...good,
+      writes: [{ ...good.writes[0], expect: dropKey(good.writes[0].expect, "snapshot_id") }] })],
+    ["noop 却带着待写项", resign({ ...good, noop: true })],
+    ["版本号不是正整数", resign({ ...good,
+      writes: [{ ...good.writes[0], expect: { ...good.writes[0].expect, subscription_version: 0 } }] })],
+    ["revision 不是正整数", resign({ ...good,
+      writes: [{ ...good.writes[0], expect: { ...good.writes[0].expect, authorization_revision: -1 } }] })],
+  ];
+  for (const [group, cases] of [[tryWith, notInFingerprint], [tryFully, inFingerprint]]) {
+    for (const [what, journal] of cases) {
+      const before = w.read().snapshot_id;
+      const got = group(journal);
+      assert.equal(got.ok, false, what + " 竟然被放行了");
+      assert.equal(got.reason, APPLY_REJECT.JOURNAL_UNREADABLE, what);
+      assert.equal(w.read().snapshot_id, before, what + "：拒绝时不许动文件");
+    }
+  }
+
   // 文件名跟里面记的 operation 不一致 —— 挪个文件名就能冒充另一笔事务。
   const renamed = resign({ ...good, operation_id: "op-someone-else" });
   const before2 = w.read().snapshot_id;

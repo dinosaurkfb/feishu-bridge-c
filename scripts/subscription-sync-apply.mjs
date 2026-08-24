@@ -210,8 +210,18 @@ export const JOURNAL_STATUS = Object.freeze({ PREPARED: "prepared", COMMITTED: "
  */
 export const JOURNAL_SCHEMA = "subscription-sync-operation/v2";
 
-const onlyKeys = (o, keys) => o && typeof o === "object" && !Array.isArray(o)
-  && Object.keys(o).every((k) => keys.includes(k));
+/**
+ * **键集合必须恰好相等**，不是"没有多余的"。
+ *
+ * 上一版用的是"只禁止未知字段"，而**不要求允许的字段必须存在** ——
+ * 最直接的绕过是删掉 `to`：`undefined` 被放行，而指纹又把"缺失"和 null 算成一样，
+ * 于是攻击者**连指纹都不用重算**。恢复清单是写入授权的依据，
+ * 这种宽容正是它最不该有的。
+ */
+const exactKeys = (o, keys) => o && typeof o === "object" && !Array.isArray(o)
+  && Object.keys(o).length === keys.length && keys.every((k) => Object.hasOwn(o, k));
+
+const isIsoTime = (v) => typeof v === "string" && Number.isFinite(Date.parse(v));
 
 /**
  * 恢复清单必须**自己可信**。
@@ -227,7 +237,7 @@ const onlyKeys = (o, keys) => o && typeof o === "object" && !Array.isArray(o)
  * 不能让旧文件在新语义下被当成有效清单。
  */
 function validateJournal(j, { operationId = null } = {}) {
-  if (!onlyKeys(j, ["schema_version", "operation_id", "plan_id", "noop",
+  if (!exactKeys(j, ["schema_version", "operation_id", "plan_id", "noop",
     "status", "prepared_at", "committed_at", "writes"])) return false;
   if (j.schema_version !== JOURNAL_SCHEMA) return false;
   if (!OPERATION_ID.test(j.operation_id ?? "")) return false;
@@ -237,10 +247,17 @@ function validateJournal(j, { operationId = null } = {}) {
   if (typeof j.noop !== "boolean") return false;
   if (!Object.values(JOURNAL_STATUS).includes(j.status)) return false;
   if (!Array.isArray(j.writes)) return false;
+  // 状态和时间要自洽。prepared 却带着提交时间、committed 却没有 ——
+  // 那样的记录说不清事务到底走到哪一步，而恢复正是靠它判断。
+  if (!isIsoTime(j.prepared_at)) return false;
+  if (j.status === JOURNAL_STATUS.PREPARED && j.committed_at !== null) return false;
+  if (j.status === JOURNAL_STATUS.COMMITTED && !isIsoTime(j.committed_at)) return false;
+  // noop 与条目数自洽：什么都不做就不该带着待写项。
+  if (j.noop === true && j.writes.length !== 0) return false;
 
   const seen = new Set();
   for (const w of j.writes) {
-    if (!onlyKeys(w, ["binding_ref", "action", "to", "expect", "target"])) return false;
+    if (!exactKeys(w, ["binding_ref", "action", "to", "expect", "target"])) return false;
     // 这一条是**冗余的**：下面 target 必须是合法快照（那里卡了 ref 形状），
     // 且 target.binding_ref === binding_ref，两条合起来已经堵死。
     // 单独去掉它变异不会变红 —— 留着是多一层，不是承重的那一层。承重的是
@@ -254,10 +271,17 @@ function validateJournal(j, { operationId = null } = {}) {
     // 然后恢复过程照样把 target 写下去。指纹管的是"有没有被改过"，
     // **管不了"改成的东西合不合法"**。
     if (w.action !== SYNC_ACTION.RESNAPSHOT) return false;
-    if (w.to !== null && w.to !== undefined) return false;   // resnapshot 没有迁移目标
-    if (!onlyKeys(w.expect, ["subscription_id", "subscription_version",
+    // 严格等于 null，缺失不算。**这一条和 exactKeys 互为冗余**：
+    // 各自单独都能拦住"删掉 to"，所以单独去掉任一个变异都不会红。
+    // 两个都留是纵深防御 —— 但我不为它们编造独立的承重测试。
+    if (w.to !== null) return false;
+    if (!exactKeys(w.expect, ["subscription_id", "subscription_version",
       "authorization_revision", "snapshot_id"])) return false;
-    for (const v of Object.values(w.expect)) if (v === undefined || v === null) return false;
+    if (typeof w.expect.subscription_id !== "string" || w.expect.subscription_id.length === 0) return false;
+    if (typeof w.expect.snapshot_id !== "string" || w.expect.snapshot_id.length === 0) return false;
+    if (!Number.isInteger(w.expect.subscription_version) || w.expect.subscription_version <= 0) return false;
+    if (!Number.isInteger(w.expect.authorization_revision) ||
+        w.expect.authorization_revision <= 0) return false;
     if (!validateDialogueBindingAuthorizationSnapshot(w.target).ok) return false;
     // 目标快照必须就是这一项要写的那个文件的内容。
     if (w.target.binding_ref !== w.binding_ref) return false;

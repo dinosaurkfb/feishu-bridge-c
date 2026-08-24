@@ -275,7 +275,7 @@ function checkInbound(template) {
 
 /**
  * 跑一遍自检。**顺序是从根到梢**：bridge 没装，后面几项查了也没意义。
- * 但**不早退** —— 一次说清全部四项，比让人修一个跑一次强。
+ * 但**不早退** —— 一次说清全部五项，比让人修一个跑一次强。
  */
 export function checkEndpoint({
   template, identity,

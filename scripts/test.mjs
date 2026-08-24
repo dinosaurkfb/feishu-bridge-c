@@ -77,8 +77,8 @@ import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
 import { bindingToConnections } from "./group-binding-status.mjs";
 import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
 import {
-  ENDPOINT_SELF_CHECK, composeLayeredStatus, endpointFacts, lastSuccessfulDispatchAt,
-  renderLayeredStatus, splitByRelation, subscriptionFacts,
+  ENDPOINT_SELF_CHECK, SELF_CHECK_TEXT, composeLayeredStatus, endpointFacts,
+  lastSuccessfulDispatchAt, renderLayeredStatus, splitByRelation, subscriptionFacts,
 } from "./layered-status.mjs";
 import {
   collectConnectivity, collectProjectConnectivity, collectStatusProviders, loadStatusProviders,
@@ -8155,19 +8155,43 @@ test("端点自检不许拿出站身份顶替入站 —— 这是语义假阳性
   assert.match(inbound.detail, /期望值不是观测值/u);
 });
 
-test("真实 feishu-status CLI 跑出来的第 1 层不会声称四项全过", () => {
+test("真实 feishu-status CLI 跑出来的第 1 层不会声称全部通过", () => {
   // 这条走真实 CLI，不是函数 stub —— 前几轮反复栽在"函数对了、真实入口是坏的"。
+  //
+  // **断言必须与本机状态无关。**上一版硬要求出现"没查清"，那等于假定 daemon
+  // 一定在跑：评审在 daemon 离线的机器上跑同一份代码得到的是"有问题"，
+  // 于是我这边 499/499、他那边 498/499。**一条会因为机器状态而红的测试，
+  // 测的是机器，不是代码。**
+  //
+  // 与状态无关的不变量只有两条：不许声称全部通过；入站那项必须仍是查不清。
   const run = spawnSync(process.execPath, [
     path.resolve("scripts", "feishu-status.mjs"), "--project", process.cwd(),
   ], { encoding: "utf-8" });
   assert.equal(run.status, 0, run.stderr);
   const layer1 = run.stdout.slice(0, run.stdout.indexOf("第 2 层"));
   assert.match(layer1, /实时自检/u);
-  // 本机入站身份验不了，所以最好的结论是"没查清"，不该是"四项全过"。
-  assert.doesNotMatch(layer1, /四项全过/u,
-    "入站身份本机验不了时，不许报成全过");
-  assert.match(layer1, /没查清/u);
-  assert.match(layer1, /inbound_transport_identity/u, "要说清是哪一项没查清");
+
+  // 引用产品常量而不是复制字面量 —— 复制的那份在文案改了之后会变成空断言。
+  assert.equal(layer1.includes(SELF_CHECK_TEXT.ready), false,
+    "入站身份本机验不了，任何情况下都不许报成全部通过");
+  // daemon 在跑就是"没查清"，离线就是"有问题"，两者都对；只有 ready 不对。
+  assert.ok(layer1.includes(SELF_CHECK_TEXT.incomplete) || layer1.includes(SELF_CHECK_TEXT.blocked),
+    "结论要么是没查清、要么是有问题，不该是别的：" + layer1);
+  assert.match(layer1, /inbound_transport_identity/u, "要说清入站那项没查清");
+});
+
+test("自检结论的文案里不许写死检查项数", () => {
+  // 上一版 ready 写的是"四项全过"。检查从四项加到五项之后，它就成了一句
+  // **给用户看的错话**，而且没有任何测试会因此变红 —— 文案里的数字没人盯。
+  // 这里不去断言"数字必须是 5"（那样加一项又要改一处），
+  // 而是让**写数字这件事本身**变红：结论要说"全部通过"，不要替人数数。
+  for (const [verdict, text] of Object.entries(SELF_CHECK_TEXT)) {
+    assert.doesNotMatch(text, /[0-9一二三四五六七八九十]/u,
+      verdict + " 的文案写了项数「" + text + "」—— 检查项一增减它就变成错话");
+  }
+  // 五项这个事实由检查项集合本身承载，不由文案承载。
+  assert.equal(Object.keys(ENDPOINT_CHECK).length, 5,
+    "改了检查项数就要同时想清楚：有没有别处把它写死了");
 });
 
 test("模板写入器要能接住可选字段", () => {

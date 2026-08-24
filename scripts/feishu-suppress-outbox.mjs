@@ -143,7 +143,9 @@ export function applySuppression({
     const resolved = resolveProject({ root, claudeSessionId: session });
     const freshMapping = resolved.ok ? resolved.mapping : null;
     const activeNow = activeGenerationOf(freshMapping);
-    if (previewGenerationId !== null && activeNow !== previewGenerationId) {
+    // 只有旧格式记录的归属会随轮转改变。每条都自带代际时，轮转不影响任何一条 ——
+    // 这时再因为轮转中止，就是在拒绝一件本来安全的事。
+    if (dependsOnMapping && previewGenerationId !== null && activeNow !== previewGenerationId) {
       // 预览之后轮转过。即使一个文件都没变，"抑制这一代"的含义已经不是原来那个了。
       return { ok: false, reason: "rotated", from: previewGenerationId, to: activeNow };
     }

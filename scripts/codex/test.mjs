@@ -11,6 +11,9 @@ import { applySuppressionCore } from "../suppress-outbox-core.mjs";
 import {
   checkArgShape, locateTask, parseArgs as parseCodexSuppressArgs,
 } from "./suppress-outbox.mjs";
+import {
+  classifyBacklog, drainScriptPath, enableBlockers, plistBody,
+} from "./drain-service.mjs";
 
 import {
   appendEvent, listPending, markPublishEligibleByEventKey, suppressPublishByEventKey,
@@ -1920,7 +1923,12 @@ test("安装器在隔离 HOME 只追加 hooks、渲染技能路径且保留已�
   const skill = fs.readFileSync(path.join(codexHome, "skills", "m5codex-inbound-router", "SKILL.md"), "utf-8");
   assert.equal(skill.includes("{{BRIDGE_ROOT}}"), false);
   assert.equal(skill.includes("{{CODEX_BRIDGE_HOME_SHELL}}"), false);
-  assert.equal(skill.includes(ROOT), true);
+  // **技能里不许再出现开发克隆路径。**上一版这里断言的正好相反（includes(ROOT)）——
+  // 那是在把"技能指向安装者的工作目录"钉成契约。现在钉的是 runtime/current。
+  assert.equal(skill.includes(ROOT), false,
+    "技能里不许嵌开发克隆路径 —— 那个目录一 checkout，线上行为就变了");
+  assert.ok(skill.includes(path.join(codexHome, "feishu-bridge", "runtime", "current")),
+    "技能必须指向 runtime/current：" + skill.slice(0, 200));
   assert.equal(skill.includes("FEISHU_CODEX_BRIDGE_HOME='" + home + "'"), true);
   assert.equal(skill.includes("待绑定话题或已绑定话题"), true);
   const controlSkill = fs.readFileSync(path.join(codexHome, "skills", "codex-longtask-feishu", "SKILL.md"), "utf-8");
@@ -2382,17 +2390,18 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
     lark_cli_bin: path.join(bin, "lark-cli"),
   }));
   writeRegistry([], path.join(home, "registry.json"));
-  fs.writeFileSync(path.join(codexHome, "hooks.json"), JSON.stringify({
-    hooks: {
-      UserPromptSubmit: [{ hooks: [{ command: "node " + path.join(ROOT, "scripts", "codex", "prompt-hook.mjs") }] }],
-      Stop: [{ hooks: [{ command: "node " + path.join(ROOT, "scripts", "codex", "stop-hook.mjs") }] }],
-    },
-  }));
-  for (const name of ["m5codex-inbound-router", "codex-longtask-feishu", "feishu-bind", "feishu-unbind", "feishu-status", "feishu-rotate", "feishu-mode"]) {
-    const skillDir = path.join(codexHome, "skills", name);
-    fs.mkdirSync(skillDir, { recursive: true });
-    fs.writeFileSync(path.join(skillDir, "SKILL.md"), "---\nname: " + name + "\n---\n");
-  }
+  // **"健康"就是安装器装出来的样子 —— 由安装器自己构造，不手写。**
+  //
+  // 上一版这里手写 hooks 指向 ROOT（开发克隆）、手写空壳技能。那份夹具描述的是
+  // 一个 doctor 认得、但安装器从来不会产出的状态；判据一改它就得跟着改，
+  // 而"跟着改"的时候很容易把 doctor 改松了去迁就夹具。
+  // 现在两者绑在一起：安装器和 doctor 谁跑偏，这条都会红。
+  const installed = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
+      encoding: "utf-8",
+      env: { ...process.env, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+    });
+  assert.equal(installed.status, 0, "夹具依赖安装器成功：" + installed.stderr);
 
   const run = () => spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "doctor.mjs"), "--json"], {
     encoding: "utf-8",
@@ -2738,6 +2747,165 @@ test("锁内重读要重判损坏：文件名一个没变，目标字段变坏�
   assert.equal(got.atRecheck, true, "要说清是锁内重判时发现的，不是锁外那一次");
   assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
     "**零抑制** —— 说不清该发去哪，就不能替它决定不发");
+});
+
+test("安装器只许写进 CODEX_HOME —— 真机的 ~/.codex 一个字节都不许碰", () => {
+  // **这条守的是一次实测事故。**新代码用 os.homedir() 算运行时根，而这套测试
+  // 只隔离了 CODEX_HOME —— 于是跑一次测试就往真机装了 3.7M 的运行时。
+  // 这个仓库为"测试污染真机"付过三次代价，那是第四次。
+  //
+  // 根因不是"某条测试忘了隔离"，是**隔离点没接到实现里**。所以守卫也不能是
+  // "记得设 HOME"，而必须是：给了 CODEX_HOME，就一个字节都不许落在它外面。
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  const home = path.join(dir, "bridge-home");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
+  writeRegistry([], path.join(home, "registry.json"));
+
+  // 真机上那个位置现在是什么样，记下来。
+  const realCodexRuntime = path.join(os.homedir(), ".codex", "feishu-bridge", "runtime");
+  const before = fs.existsSync(realCodexRuntime)
+    ? fs.readdirSync(realCodexRuntime).sort().join(",") : "<不存在>";
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
+      encoding: "utf-8",
+      env: { ...process.env, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+    });
+  assert.equal(r.status, 0, r.stderr);
+
+  // 该装的地方装了。
+  assert.equal(fs.existsSync(path.join(codexHome, "feishu-bridge", "runtime", "current")), true,
+    "运行时必须落在 CODEX_HOME 下");
+
+  // **不该动的地方一个字节没动。**
+  const after = fs.existsSync(realCodexRuntime)
+    ? fs.readdirSync(realCodexRuntime).sort().join(",") : "<不存在>";
+  assert.equal(after, before,
+    "给了 CODEX_HOME 还往真机写 —— 这正是那次污染的形状");
+});
+
+test("迁移必须收敛旧克隆的 hook，而不是在旁边再加一条", () => {
+  // **迁移最容易办坏的就是这一步。**旧写法按完整路径找已有条目：
+  // 路径从开发克隆换成 runtime/current 的那一刻就匹配不上，
+  // 于是新增而不是替换 —— 指向旧克隆的那条原地不动。
+  // Codex 文档说多个匹配的 hook 会全部运行，等于新旧两份代码同时在跑。
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  const home = path.join(dir, "bridge-home");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
+  writeRegistry([], path.join(home, "registry.json"));
+
+  // 造出迁移前的现场：hook 指向某个开发克隆，另外还有一条别人的 hook。
+  const stale = "/Users/someone/codex-projects/old-clone/scripts/codex/stop-hook.mjs";
+  const stalePrompt = "/Users/someone/codex-projects/old-clone/scripts/codex/prompt-hook.mjs";
+  fs.writeFileSync(path.join(codexHome, "hooks.json"), JSON.stringify({
+    hooks: {
+      UserPromptSubmit: [{ hooks: [{ type: "command", command: "node " + stalePrompt }] }],
+      Stop: [
+        { hooks: [{ type: "command", command: "别人的 hook，不许动" }] },
+        { hooks: [{ type: "command", command: "node " + stale }] },
+      ],
+    },
+  }));
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
+      encoding: "utf-8",
+      env: { ...process.env, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+    });
+  assert.equal(r.status, 0, r.stderr);
+
+  const hooks = JSON.parse(fs.readFileSync(path.join(codexHome, "hooks.json"), "utf-8"));
+  const commands = (event) => (hooks.hooks[event] ?? [])
+    .flatMap((e) => (e.hooks ?? []).map((h) => h.command));
+
+  // 旧克隆路径必须一个不剩。
+  const all = JSON.stringify(hooks);
+  assert.equal(all.includes("old-clone"), false,
+    "**旧克隆的 hook 必须被收掉，不是留在旁边**：" + all);
+
+  // 我们的 hook 各恰好一条。
+  const mine = (event, basename) =>
+    commands(event).filter((c) => c.includes("scripts/codex/" + basename));
+  assert.equal(mine("UserPromptSubmit", "prompt-hook.mjs").length, 1, "恰好 1 条");
+  assert.equal(mine("Stop", "stop-hook.mjs").length, 1, "恰好 1 条");
+
+  // 而且指向 runtime/current。
+  const expected = path.join(codexHome, "feishu-bridge", "runtime", "current",
+    "scripts", "codex", "stop-hook.mjs");
+  assert.ok(mine("Stop", "stop-hook.mjs")[0].includes(expected),
+    "必须指向 runtime/current：" + mine("Stop", "stop-hook.mjs")[0]);
+
+  // **别人的 hook 一条都不许动。**
+  assert.ok(commands("Stop").includes("别人的 hook，不许动"),
+    "收敛自己的 hook 不等于可以动别人的");
+});
+
+test("调度器：历史积压没分类时拒绝启用，且一条都不写", () => {
+  // **这条是这条命令存在的主要理由。**Codex 链一直没有兜底定时器，
+  // outbox 里攒着一批历史内容；装上定时器的那一刻它们会被发出去。
+  // 省掉这道门槛就是替人做了一个不可逆的决定。
+  const home = temp();
+  const bridge = path.join(home, "bridge");
+  fs.mkdirSync(bridge, { recursive: true });
+  const root = path.join(home, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "abc123" });
+  writeRegistry([task], path.join(bridge, "registry.json"));
+  const paths = taskPaths(task, bridge);
+  fs.mkdirSync(paths.outbox, { recursive: true });
+
+  // 空 outbox：分类这一关不该拦。
+  const empty = classifyBacklog({ home: bridge });
+  assert.equal(empty.ok, true);
+  assert.equal(empty.total, 0);
+  assert.deepEqual(enableBlockers({ runtimeOk: true, backlog: empty }), [],
+    "没有积压时不该有任何门槛");
+
+  // 有一条待发：必须拦。
+  fs.writeFileSync(path.join(paths.outbox, "0001.json"),
+    JSON.stringify({ kind: "milestone", text: "历史内容", published_at: null }));
+  const withBacklog = classifyBacklog({ home: bridge });
+  assert.equal(withBacklog.total, 1);
+  assert.equal(withBacklog.tasks.length, 1);
+  const blockers = enableBlockers({ runtimeOk: true, backlog: withBacklog });
+  assert.equal(blockers.length, 1, "有积压就必须拦");
+  assert.equal(blockers[0].code, "backlog_unclassified");
+
+  // 运行时校验不过也要拦，而且**两条要一起报**，不是只报第一条。
+  const both = enableBlockers({ runtimeOk: false, runtimeReason: "current_absent",
+    backlog: withBacklog });
+  assert.equal(both.length, 2, "两条门槛都不过就要一次说清，别让人来回试");
+  assert.deepEqual(both.map((b) => b.code).sort(),
+    ["backlog_unclassified", "runtime_unverified"]);
+
+  // 登记表读不出来 → 也拦，而且不能报成"没有积压"。
+  const unreadable = enableBlockers({ runtimeOk: true,
+    backlog: { ok: false, reason: "registry_unreadable" } });
+  assert.equal(unreadable.length, 1);
+  assert.equal(unreadable[0].code, "backlog_unreadable",
+    "**读不出来不等于没有** —— 报成 0 条就会放行");
+});
+
+test("调度器指向的必须是 runtime/current，不是任何开发克隆", () => {
+  // 定时器一装就长期存在。让它指向某个开发克隆，等于把线上行为长期绑在
+  // 某人的工作目录上 —— 那正是这次迁移要消灭的东西。
+  const home = temp();
+  const script = drainScriptPath(home);
+  assert.match(script,
+    /\.codex\/feishu-bridge\/runtime\/current\/scripts\/codex\/drain-outbox\.mjs$/u);
+  const body = plistBody({ home, node: "/opt/homebrew/bin/node" });
+  assert.ok(body.includes(script), "plist 里跑的必须是这个路径");
+  assert.doesNotMatch(body, /claude-projects|codex-projects/u,
+    "**plist 里不许出现任何开发克隆路径**");
+  assert.ok(body.includes("<string>--all</string>"),
+    "兜底要覆盖全部登记 task —— 只排一个的话，其他 task 就没有兜底");
+  assert.ok(body.includes("<key>RunAtLoad</key><false/>"),
+    "装上不等于立刻跑一次");
 });
 
 test("空白目标代际是损坏记录 —— Codex 侧守着同一条三态判定", () => {

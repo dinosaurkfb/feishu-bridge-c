@@ -10602,6 +10602,39 @@ test("锁内重读要重判损坏：文件名一个没变，目标字段变坏�
     "**零抑制** —— 说不清该发去哪，就不能替它决定不发");
 });
 
+test("两条链的运行时必须落在各自的家目录，且互不覆盖", () => {
+  // **刻意不共用一份。**共用能少一次版本漂移，但会把两条链的升级绑死 ——
+  // 给 Claude 装一版就等于给 Codex 也装了，出问题也没法只回滚一条。
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-chains-"));
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-src-"));
+  fs.mkdirSync(path.join(src, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(src, "scripts", "a.mjs"), "export const a = 1;\n");
+
+  const claudeRoot = runtimeRoot(home, "claude");
+  const codexRoot = runtimeRoot(home, "codex");
+  assert.notEqual(claudeRoot, codexRoot, "两条链不许指向同一个目录");
+  assert.match(claudeRoot, /\.claude\/feishu-bridge\/runtime$/u);
+  assert.match(codexRoot, /\.codex\/feishu-bridge\/runtime$/u);
+
+  // 只装 codex 那条：claude 那边必须仍然什么都没有。
+  const p1 = planRuntimeSync({ sourceRoot: src, home, chain: "codex" });
+  assert.equal(applyRuntimeSync(p1, { home, chain: "codex" }).ok, true);
+  assert.equal(verifyRuntime({ home, chain: "codex" }).ok, true);
+  assert.equal(fs.existsSync(claudeRoot), false,
+    "装 codex 不许顺手把 claude 那条也建出来");
+  assert.equal(verifyRuntime({ home, chain: "claude" }).ok, false,
+    "claude 那条没装就该报没装");
+
+  // 钩子路径也必须分开 —— 这是"线上到底跑哪一份"的唯一依据。
+  assert.match(runtimeScript("stop-hook.mjs", home, "codex"),
+    /\.codex\/feishu-bridge\/runtime\/current\/scripts\/stop-hook\.mjs$/u);
+  assert.notEqual(runtimeScript("stop-hook.mjs", home, "codex"),
+    runtimeScript("stop-hook.mjs", home, "claude"));
+
+  // 未知的链要炸，不许静默落到 claude —— 拼错链名等于装错地方。
+  assert.throws(() => runtimeRoot(home, "cdoex"), /未知的链/u);
+});
+
 test("空白目标代际是损坏记录：不许当自带代际放行，也不许当旧格式重新解释", () => {
   // 评审实测复现的：判据分家 —— 核心的 expectation 检查收紧成 trim() 之后，
   // dependsOnMapping 还留在 length > 0 上。于是 target_channel_generation_id: "   "

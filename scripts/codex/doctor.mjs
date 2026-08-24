@@ -5,6 +5,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { moduleRoot } from "../direct-run.mjs";
+import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
+import { serviceState } from "./drain-service.mjs";
 
 import {
   bridgeHome, loadCodexTemplate, loadRegistry, registryFile,
@@ -37,11 +39,31 @@ function commandPath(name, extra = []) {
   return null;
 }
 
-function hookInstalled(hooks, event, script) {
-  return (hooks?.hooks?.[event] ?? []).some((entry) =>
-    (entry?.hooks ?? []).some((hook) =>
-      typeof hook?.command === "string" && hook.command.includes(script)));
+/**
+ * 某个事件下有几条**我们的** hook，各自指向哪。
+ *
+ * 判据从"命令里出现某个绝对路径"改成"命令里出现 scripts/codex/<名字>"，
+ * 原因：旧判据实际在问"钩子指不指向我这个克隆"。于是同一套线上安装，
+ * 从 A 克隆跑 doctor 说装好了，从 B 克隆跑就说没装 —— 报告取决于谁在哪跑，
+ * 而不是线上是什么样。迁移到 runtime/current 之后，它会永远报缺失。
+ *
+ * 返回全部命中的条目：**"恰好一条"本身就是要检查的事实**。
+ * Codex 文档说多个匹配的 hook 会全部运行，重复一条就是旧代码还在跑。
+ */
+function hookEntries(hooks, event, basename) {
+  const out = [];
+  for (const entry of hooks?.hooks?.[event] ?? []) {
+    for (const hook of entry?.hooks ?? []) {
+      if (typeof hook?.command === "string" && hook.command.includes("scripts/codex/" + basename)) {
+        out.push(hook.command);
+      }
+    }
+  }
+  return out;
 }
+
+/** 这条命令指的是不是 runtime/current 下那一份。 */
+const pointsAtRuntime = (command, expected) => command.includes(expected);
 
 const checks = [];
 const add = (name, ok, detail, next = null) => checks.push({ name, ok, detail, next });
@@ -65,9 +87,19 @@ add("机器级模板", template.ok, template.ok ? "结构与单智能体约束�
 const configuredRoot = template.ok && typeof template.template.bridge_root === "string"
   ? path.resolve(template.template.bridge_root)
   : null;
-add("仓库路径", configuredRoot === ROOT,
-  configuredRoot === ROOT ? "机器级模板指向当前仓库" : "模板仍指向其他位置",
-  "仓库移动后重新生成机器级模板，并重新安装 hooks/skills");
+// **不再检查"模板指不指向当前仓库"。**那条问的是"你是从哪个克隆跑的 doctor"，
+// 不是"线上装的是什么"。同一套安装换个目录跑就换个结论 —— 这种检查在迁移之后
+// 会稳定误报，而它恰恰是唯一的验收工具。
+// **根必须跟安装器用同一个算法。**这里曾经用 os.homedir() 拼，而安装器走
+// CODEX_HOME —— 两边算出不同的路径，doctor 就会永远说"指向 runtime 之外"，
+// 而线上其实是好的。判据和被判据的对象必须共用同一个函数。
+const RUNTIME_ROOT = codexRuntimeRoot(CODEX_HOME);
+const runtime = verifyRuntime({ root: RUNTIME_ROOT });
+add("运行时", runtime.ok === true,
+  runtime.ok
+    ? "current 指向 " + String(runtime.version ?? "?").slice(0, 16) + "，清单与内容一致"
+    : "校验不过（" + (runtime.reason ?? "drift") + "）",
+  "运行 `node scripts/codex/install.mjs` 预览，确认后加 `--apply`");
 
 const configuredLark = template.ok && typeof template.template.lark_cli_bin === "string"
   ? template.template.lark_cli_bin
@@ -79,14 +111,31 @@ add("lark-cli", larkBin !== null, larkBin === null ? "未找到可执行文件" 
 let hooks = null;
 const hooksFile = path.join(CODEX_HOME, "hooks.json");
 try { hooks = JSON.parse(fs.readFileSync(hooksFile, "utf-8")); } catch { /* 下方统一报告 */ }
-const promptScript = path.join(ROOT, "scripts", "codex", "prompt-hook.mjs");
-const stopScript = path.join(ROOT, "scripts", "codex", "stop-hook.mjs");
-const promptHook = hookInstalled(hooks, "UserPromptSubmit", promptScript);
-const stopHook = hookInstalled(hooks, "Stop", stopScript);
-add("Codex hooks", promptHook && stopHook,
-  promptHook && stopHook ? "UserPromptSubmit 与 Stop 均已安装" :
-    "缺少" + [!promptHook ? " UserPromptSubmit" : "", !stopHook ? " Stop" : ""].join(""),
+const RUNTIME_CURRENT = path.join(RUNTIME_ROOT, "current");
+const expectPrompt = path.join(RUNTIME_CURRENT, "scripts", "codex", "prompt-hook.mjs");
+const expectStop = path.join(RUNTIME_CURRENT, "scripts", "codex", "stop-hook.mjs");
+const hookReport = [
+  ["UserPromptSubmit", "prompt-hook.mjs", expectPrompt],
+  ["Stop", "stop-hook.mjs", expectStop],
+].map(([event, basename, expected]) => {
+  const found = hookEntries(hooks, event, basename);
+  if (found.length === 0) return { event, ok: false, why: "缺失" };
+  // **重复一条就是旧代码还在跑。**Codex 文档说多个匹配的 hook 会全部运行 ——
+  // 迁移时如果按完整路径去找旧条目，路径一换就匹配不上，于是新增而不是替换。
+  if (found.length > 1) return { event, ok: false, why: found.length + " 条重复" };
+  if (!pointsAtRuntime(found[0], expected)) return { event, ok: false, why: "指向 runtime 之外" };
+  return { event, ok: true, why: "恰好 1 条，指向 runtime/current" };
+});
+const hooksOk = hookReport.every((r) => r.ok);
+add("Codex hooks", hooksOk,
+  hooksOk ? "UserPromptSubmit 与 Stop 各恰好 1 条，均指向 runtime/current"
+    : hookReport.filter((r) => !r.ok).map((r) => r.event + "：" + r.why).join("；"),
   "运行 `node scripts/codex/install.mjs` 预览，确认后加 `--apply`");
+// **信任状态读不到就说读不到，不许由"文件存在"推出"已信任"。**
+// Codex 文档明说 hook 定义变了要按新的定义哈希重新信任 ——
+// 迁移正好会改变命令本身，这一步最容易被当成已经完成。
+add("hook 信任", null, "本地读不到 Codex 的信任状态；hook 已安装不等于已信任",
+  "在 Codex 里用 /hooks 核对命令后确认；迁移改了命令，多半需要重新信任");
 
 const missingSkills = REQUIRED_SKILLS.filter((name) =>
   !fs.existsSync(path.join(CODEX_HOME, "skills", name, "SKILL.md")));
@@ -102,13 +151,37 @@ add("task 登记表", registry.ok,
   registry.ok ? "已登记 " + tasks.length + " 个，启用 " + active.length + " 个，入站绑定 " + bound.length + " 个" : registry.reason,
   "安装器会创建空登记表；随后在目标 task 中运行 `$feishu-bind`");
 
-const ready = checks.every((check) => check.ok);
-const next = [...new Set(checks.filter((check) => !check.ok && check.next).map((check) => check.next))];
+// **三态，不是两态。**ok === null 表示"这件事本地查不出来"，
+// 它既不是通过、也不是故障。上一版只有真/假，于是"查不清"被画成 ✗ ——
+// 人会去修一件本来就查不清的事；反过来把它算成通过，就是在声称一件没查过的事。
+// 第 1 层的 inbound 自检早就是这个道理（永远 unknown），这里跟它对齐。
+const failed = (check) => check.ok === false;
+// 调度器状态单独报，而且**未启用不算故障** —— 那是安装后的默认态。
+// 把它报成故障，人就会去"修"一件本来就该这样的事。
+try {
+  const svc = serviceState();
+  add("兜底排空", svc.enabled ? (svc.stale ? false : true) : null,
+    svc.enabled
+      ? (svc.stale ? "已启用，但 plist 与当前运行时对不上" : "已启用")
+      : "未启用（默认态，不是故障）" +
+        (svc.backlog.ok && svc.backlog.total > 0
+          ? "；还有 " + svc.backlog.total + " 条历史积压未分类" : ""),
+    svc.enabled && svc.stale
+      ? "重跑 `node scripts/codex/drain-service.mjs --enable --apply`" : null);
+} catch (err) {
+  add("兜底排空", null, "状态读不出来（" + err.message + "）");
+}
+
+const ready = checks.every((check) => check.ok !== false);
+const next = [...new Set(checks.filter((check) => failed(check) && check.next).map((check) => check.next))];
 if (JSON_OUTPUT) {
   process.stdout.write(JSON.stringify({ ready, checks, next }, null, 2) + "\n");
 } else {
   console.log("Codex 飞书桥 · 只读自检\n");
-  for (const check of checks) console.log((check.ok ? "✓ " : "✗ ") + check.name + "：" + check.detail);
+  for (const check of checks) {
+    const mark = check.ok === true ? "✓ " : check.ok === false ? "✗ " : "? ";
+    console.log(mark + check.name + "：" + check.detail);
+  }
   if (next.length > 0) {
     console.log("\n下一步：");
     next.forEach((item, index) => console.log((index + 1) + ". " + item));

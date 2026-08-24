@@ -9053,11 +9053,35 @@ test("落盘：被改过的恢复清单一律拒 —— 五种改法，写文件
     ["prepared 却带着提交时间", { ...good, committed_at: new Date().toISOString() }],
     ["committed 却没有提交时间", { ...good, status: "committed", committed_at: null }],
   ];
+  // ── 最狠的一种：**把迁移伪装成 resnapshot** ──
+  //
+  // 造一份**另一条订阅**的合法快照、重算指纹、以 action=resnapshot 写入 ——
+  // 上一版只验了"目标是合法快照且 binding_ref 相同"，于是这份清单能通过，
+  // **实际完成一次隐式迁移**。而迁移本该由人显式指定目标并逐项校验授权覆盖。
+  const otherSub = syncSub({ subscription_id: "subscription_" + "e".repeat(24) });
+  const foreign = materializeDialogueBindingAuthorization({
+    runtimeNamespace: SYNC_NS, endpointId: SYNC_EP, subscription: otherSub,
+    binding: w.binding, previousSnapshot: w.snap });
+  assert.equal(foreign.ok, true, foreign.reason ?? "");
+  assert.equal(foreign.snapshot.binding_ref, w.snap.binding_ref, "同一条 binding");
+  assert.notEqual(foreign.snapshot.subscription_id, w.snap.subscription_id, "但换了订阅");
+
   const inFingerprint = [
+    ["伪装成 resnapshot 的隐式迁移", resign({ ...good,
+      writes: [{ ...good.writes[0], target: foreign.snapshot }] })],
+    ["noop=false 却一条都不写", resign({ ...good, noop: false, writes: [] })],
+    ["noop=true 却带着待写项", resign({ ...good, noop: true })],
+    ["订阅版本倒退", resign({ ...good,
+      writes: [{ ...good.writes[0],
+        expect: { ...good.writes[0].expect,
+          subscription_version: good.writes[0].target.subscription_version + 1 } }] })],
+    ["授权 revision 没往前走", resign({ ...good,
+      writes: [{ ...good.writes[0],
+        expect: { ...good.writes[0].expect,
+          authorization_revision: good.writes[0].target.authorization_revision } }] })],
     ["写项缺 action", resign({ ...good, writes: [dropKey(good.writes[0], "action")] })],
     ["expect 缺一个字段", resign({ ...good,
       writes: [{ ...good.writes[0], expect: dropKey(good.writes[0].expect, "snapshot_id") }] })],
-    ["noop 却带着待写项", resign({ ...good, noop: true })],
     ["版本号不是正整数", resign({ ...good,
       writes: [{ ...good.writes[0], expect: { ...good.writes[0].expect, subscription_version: 0 } }] })],
     ["revision 不是正整数", resign({ ...good,
@@ -9146,9 +9170,10 @@ test("落盘：同一 operation id 换一份计划不许报「已经做过了」
   const opId = "op-reuse-0001";
   fs.mkdirSync(path.join(w.dir, "sync-operations"), { recursive: true });
   // 空 writes 的清单：指纹就是"没有条目"的那个，plan_id 得跟它对得上。
-  const emptyPid = planId({ ok: true, noop: false, plans: [] }, []);
+  // 空 writes 必须配 noop:true —— 两者是恒等关系。
+  const emptyPid = planId({ ok: true, noop: true, plans: [] }, []);
   fs.writeFileSync(path.join(w.dir, "sync-operations", opId + ".json"), JSON.stringify({
-    schema_version: JOURNAL_SCHEMA, operation_id: opId, plan_id: emptyPid, noop: false,
+    schema_version: JOURNAL_SCHEMA, operation_id: opId, plan_id: emptyPid, noop: true,
     status: "committed", prepared_at: new Date().toISOString(),
     committed_at: new Date().toISOString(), writes: [] }));
 
@@ -9193,8 +9218,8 @@ test("落盘：另一笔事务没做完时不许再开一笔", () => {
   fs.mkdirSync(path.join(w.dir, "sync-operations"), { recursive: true });
   fs.writeFileSync(path.join(w.dir, "sync-operations", "op-stuck-0001.json"),
     JSON.stringify({ schema_version: JOURNAL_SCHEMA,
-      operation_id: "op-stuck-0001", plan_id: planId({ ok: true, noop: false, plans: [] }, []),
-      noop: false, status: "prepared", prepared_at: new Date().toISOString(),
+      operation_id: "op-stuck-0001", plan_id: planId({ ok: true, noop: true, plans: [] }, []),
+      noop: true, status: "prepared", prepared_at: new Date().toISOString(),
       committed_at: null, writes: [] }));
 
   const got = applySubscriptionSync({

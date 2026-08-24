@@ -252,8 +252,10 @@ function validateJournal(j, { operationId = null } = {}) {
   if (!isIsoTime(j.prepared_at)) return false;
   if (j.status === JOURNAL_STATUS.PREPARED && j.committed_at !== null) return false;
   if (j.status === JOURNAL_STATUS.COMMITTED && !isIsoTime(j.committed_at)) return false;
-  // noop 与条目数自洽：什么都不做就不该带着待写项。
-  if (j.noop === true && j.writes.length !== 0) return false;
+  // **noop 与条目数是恒等关系，不是单向的。**上一版只拒绝
+  // "noop=true 却带着待写项"，却接受"noop=false 却一条都没有" ——
+  // 后者同样说不清：既然什么都不写，为什么不是 noop。
+  if (j.noop !== (j.writes.length === 0)) return false;
 
   const seen = new Set();
   for (const w of j.writes) {
@@ -285,6 +287,16 @@ function validateJournal(j, { operationId = null } = {}) {
     if (!validateDialogueBindingAuthorizationSnapshot(w.target).ok) return false;
     // 目标快照必须就是这一项要写的那个文件的内容。
     if (w.target.binding_ref !== w.binding_ref) return false;
+    // **resnapshot 不许换订阅。**上一版只验了目标是合法快照且 binding_ref 相同 ——
+    // 于是可以造一份**另一条订阅**的合法快照、重算指纹、以 action=resnapshot 写入，
+    // **实际完成一次隐式迁移**。而迁移本该由人显式指定目标并逐项校验授权覆盖。
+    // 花整轮力气把迁移关在门外，这里却留了一道后门。
+    if (w.target.subscription_id !== w.expect.subscription_id) return false;
+    // 授权 revision 只能往前走：物化新快照必然 +1，回退或原地不动说明这份清单
+    // 不是照着当前那一版算出来的。
+    if (!(w.target.authorization_revision > w.expect.authorization_revision)) return false;
+    // 订阅版本不许倒退。
+    if (w.target.subscription_version < w.expect.subscription_version) return false;
   }
 
   // **从清单重算指纹，跟它自报的对。**

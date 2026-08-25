@@ -225,6 +225,69 @@ export function loadRegistry(file = registryFile()) {
   return { ok: true, file, tasks, schemaVersion: parsed.schema_version ?? "1.0" };
 }
 
+/**
+ * **登记表的唯一写入口：读原文档、就地改目标条目、写回。**
+ *
+ * ■ 为什么必须这样
+ *
+ * loadRegistry 返回的是**过滤后的活动视图**（停用条目已经不在里面）。
+ * 而此前七个写路径都是"改视图里的对象 → writeRegistry(reg.tasks)"——
+ * 后者从零重建 `{schema_version, runtime, tasks}`。两件事叠在一起：
+ *   · 停用条目**被静默删掉**；
+ *   · 顶层未知字段**被静默删掉**；
+ *   · 条目上的未知字段也一样。
+ * 评审实测："启用 A + 停用 B + 顶层扩展字段"，只改 A 的显示名，
+ * 落盘后 B 和顶层字段都没了，而调用方拿到的是 ok:true。
+ *
+ * 迁移逻辑里本来就写着"视图 + 重建会静默删数据"——**普通写路径还在重复它**。
+ *
+ * ■ 契约
+ *
+ * mutate 拿到的是**原始 tasks 数组**（含停用条目、含未知字段），就地改。
+ * 返回 false 表示什么都没改（不写盘）。除 tasks 外的顶层字段原样保留。
+ * 调用方**只读热路径**仍然可以用 loadRegistry 的活动视图 —— 那是安全的；
+ * 危险的只有"拿视图去重建整表"。
+ */
+export function mutateRegistryDocument(file, mutate) {
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(file, "utf-8")); }
+  catch (err) {
+    // **不存在 = 空文档**，首次写入本来就要把它建出来。
+    // 其余读取错误说不清 —— 那时候写回去会覆盖掉一份我们没读懂的文件。
+    if (err.code === "ENOENT") parsed = { schema_version: "1.0", runtime: "codex", tasks: [] };
+    else return { ok: false, reason: "registry_unreadable" };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, reason: "registry_malformed" };
+  }
+  if (parsed.tasks !== undefined && !Array.isArray(parsed.tasks)) {
+    return { ok: false, reason: "registry_malformed" };
+  }
+  const raw = parsed.tasks ?? [];
+  const changed = mutate(raw);
+  if (changed === false) return { ok: true, changed: false, file };
+  const valid = validateRegistryTasks(raw.filter((t) => t && t.enabled !== false));
+  if (!valid.ok) {
+    return { ok: false, reason: "duplicate_binding_fields", fields: valid.duplicateFields };
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  // **顶层原样保留** —— 只换 tasks。
+  const next = { ...parsed, tasks: raw };
+  if (fs.existsSync(file)) fs.copyFileSync(file, file + ".prev");
+  const tmp = file + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  return { ok: true, changed: true, file };
+}
+
+/** 在原始 tasks 数组里按稳定身份找那一条 —— 写路径只能这样定位。 */
+export function findRawTask(raw, task) {
+  return (raw ?? []).find((t) =>
+    t && typeof t === "object"
+    && (t.logical_task_key === task.logical_task_key
+      || (task.codex_thread_id && t.codex_thread_id === task.codex_thread_id))) ?? null;
+}
+
 export function writeRegistry(tasks, file = registryFile()) {
   const valid = validateRegistryTasks(tasks);
   if (!valid.ok) throw new Error("registry 存在重复绑定字段：" + valid.duplicateFields.join(", "));
@@ -248,7 +311,8 @@ export function addTask(task, { home = bridgeHome() } = {}) {
     if (reg.tasks.some((t) => t.codex_thread_id === task.codex_thread_id)) {
       return { ok: false, reason: "thread_already_bound" };
     }
-    writeRegistry([...reg.tasks, task], file);
+    const wrote = mutateRegistryDocument(file, (rawTasks) => { rawTasks.push(task); });
+    if (!wrote.ok) return wrote;
     return { ok: true, task };
   } catch (err) {
     return { ok: false, reason: "registry_unwritable", error: err.message };
@@ -415,7 +479,14 @@ export function setTaskConnectionStatus({
     const materialized = materializeLegacyTopicFields(task, loaded.state);
     if (!materialized.ok) return materialized;
     Object.assign(task, materialized.record);
-    writeRegistry(reg.tasks, file);
+    // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
+    // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
+    const wrote = mutateRegistryDocument(file, (rawTasks) => {
+      const target = findRawTask(rawTasks, task);
+      if (!target) return false;
+      Object.assign(target, task);
+    });
+    if (!wrote.ok) return wrote;
     return { ok: true, changed: true, task };
   } catch (err) {
     return { ok: false, reason: "registry_unwritable", error: err.message };
@@ -457,7 +528,14 @@ export function refreshPendingTaskBinding({
     if (!materialized.ok) return materialized;
     Object.assign(task, materialized.record);
     task.pending_refreshed_at = new Date(now).toISOString();
-    writeRegistry(reg.tasks, file);
+    // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
+    // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
+    const wrote = mutateRegistryDocument(file, (rawTasks) => {
+      const target = findRawTask(rawTasks, task);
+      if (!target) return false;
+      Object.assign(target, task);
+    });
+    if (!wrote.ok) return wrote;
     return { ok: true, task };
   } catch (err) {
     return { ok: false, reason: "registry_unwritable", error: err.message };
@@ -479,7 +557,14 @@ export function setTaskDisplayName({ threadId, name, home = bridgeHome() } = {})
     const task = reg.tasks.find((t) => t.codex_thread_id === threadId);
     if (!task) return { ok: false, reason: "thread_not_registered" };
     task.task_display_name = name.trim();
-    writeRegistry(reg.tasks, file);
+    // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
+    // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
+    const wrote = mutateRegistryDocument(file, (rawTasks) => {
+      const target = findRawTask(rawTasks, task);
+      if (!target) return false;
+      Object.assign(target, task);
+    });
+    if (!wrote.ok) return wrote;
     return { ok: true, task };
   } catch (err) {
     return { ok: false, reason: "registry_unwritable", error: err.message };
@@ -873,7 +958,14 @@ export function promoteTask({
     Object.assign(task, materialized.record, {
       inbound_bound_at: new Date(now).toISOString(),
     });
-    writeRegistry(reg.tasks, file);
+    // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
+    // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
+    const wrote = mutateRegistryDocument(file, (rawTasks) => {
+      const target = findRawTask(rawTasks, task);
+      if (!target) return false;
+      Object.assign(target, task);
+    });
+    if (!wrote.ok) return wrote;
     return {
       ok: true,
       task,
@@ -910,7 +1002,14 @@ function mutateTaskTopicState({
     const materialized = materializeLegacyTopicFields(task, changed.state);
     if (!materialized.ok) return materialized;
     Object.assign(task, materialized.record);
-    writeRegistry(reg.tasks, file);
+    // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
+    // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
+    const wrote = mutateRegistryDocument(file, (rawTasks) => {
+      const target = findRawTask(rawTasks, task);
+      if (!target) return false;
+      Object.assign(target, task);
+    });
+    if (!wrote.ok) return wrote;
     return { ...changed, task };
   } catch (err) {
     return { ok: false, reason: "registry_unwritable", error: err.message };
@@ -1005,7 +1104,14 @@ function mutateTaskInteractionPolicy({
       const materialized = materializeInteractionPolicy(task, changed.state);
       if (!materialized.ok) return materialized;
       Object.assign(task, materialized.record);
-      writeRegistry(reg.tasks, file);
+      // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
+    // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
+    const wrote = mutateRegistryDocument(file, (rawTasks) => {
+      const target = findRawTask(rawTasks, task);
+      if (!target) return false;
+      Object.assign(target, task);
+    });
+    if (!wrote.ok) return wrote;
     }
     return { ...changed, task };
   } catch (err) {

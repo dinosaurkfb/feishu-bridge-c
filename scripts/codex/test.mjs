@@ -70,7 +70,8 @@ import {
   closeTaskTopicRotation, prepareTaskTopicRotation, promoteTask, recordTaskTopicActivity,
   finalizeTaskDialogueTurn, interactionPolicyForTask, reserveTaskDialogueTurn,
   refreshPendingTaskBinding,
-  registerTaskTopicRotation, resolveTaskOutboundGeneration, setTaskConnectionStatus,
+  addTask, mutateRegistryDocument, registerTaskTopicRotation, resolveTaskOutboundGeneration,
+  setTaskConnectionStatus,
   setTaskDisplayName, setTaskInteractionMode, shadowCodexFirstClaim, taskPaths, topicStateForTask,
   validateCodexTemplate, validateRegistryTasks, writeRegistry,
 } from "./state.mjs";
@@ -5710,6 +5711,84 @@ test("输出边界的规矩自己也要守：不许内嵌换行", () => {
     "**正常输出里不许出现占位符** —— 出现就说明格式串自己带了控制字符：" +
     r.stdout.split("\n")[0]);
   assert.match(r.stdout.split("\n")[0], /^积压 1 条。$/u, "首行要干净");
+});
+
+
+test("登记表写入不许重建整表：停用条目、未知字段、顶层字段都要留住", () => {
+  // 评审实测："启用 A + 停用 B + 顶层扩展字段"，只改 A 的显示名，
+  // 落盘后 **B 和顶层字段都没了**，而调用方拿到的是 ok:true。共 7 个同类写入点。
+  //
+  // 根因是两件事叠加：loadRegistry 返回的是**过滤后的活动视图**（停用的不在里面，
+  // 而且每条都是副本），writeRegistry 又从零重建 { schema_version, runtime, tasks }。
+  // **迁移逻辑里本来就写着"视图 + 重建会静默删数据"—— 普通写路径还在重复它。**
+  const home = temp();
+  const file = path.join(home, "registry.json");
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const a = makeTaskEntry({ root, threadId: THREAD_A, name: "A",
+    rootMessageId: "om_a", token: "a1b2c3" });
+  a.未知条目字段 = "要留住";
+  const b = makeTaskEntry({ root: path.join(home, "q"), threadId: THREAD_B, name: "B",
+    rootMessageId: "om_b", token: "b1b2c3" });
+  b.enabled = false;
+  fs.mkdirSync(path.join(home, "q"), { recursive: true });
+  // 直接写原始文档 —— 带上一个顶层扩展字段。
+  fs.writeFileSync(file, JSON.stringify({
+    schema_version: "1.0", runtime: "codex", 顶层扩展字段: "也要留住", tasks: [a, b],
+  }, null, 2));
+
+  const readBack = () => JSON.parse(fs.readFileSync(file, "utf-8"));
+  const survives = (where) => {
+    const doc = readBack();
+    assert.equal(doc.顶层扩展字段, "也要留住", where + "：**顶层未知字段被删了**");
+    assert.equal((doc.tasks ?? []).length, 2, where + "：**停用条目被删了**");
+    const rawA = doc.tasks.find((t) => t.codex_thread_id === THREAD_A);
+    assert.equal(rawA?.未知条目字段, "要留住", where + "：**条目上的未知字段被删了**");
+    const rawB = doc.tasks.find((t) => t.codex_thread_id === THREAD_B);
+    assert.equal(rawB?.enabled, false, where + "：停用标记要留住");
+  };
+
+  // ① 改显示名
+  const renamed = setTaskDisplayName({ threadId: THREAD_A, name: "A2", home });
+  assert.equal(renamed.ok, true, JSON.stringify(renamed));
+  assert.equal(readBack().tasks.find((t) => t.codex_thread_id === THREAD_A).task_display_name,
+    "A2", "改动本身要落盘");
+  survives("改显示名之后");
+
+  // ② 改状态
+  const paused = setTaskConnectionStatus({ threadId: THREAD_A, status: "paused", home });
+  assert.equal(paused.ok, true, JSON.stringify(paused));
+  survives("改状态之后");
+
+  // ③ 新增 task
+  const THIRD = "01a01ecf-84ea-7a43-a44e-0710d008999c";
+  const c = makeTaskEntry({ root: path.join(home, "r"), threadId: THIRD, name: "C",
+    rootMessageId: "om_c", token: "c1b2c3" });
+  fs.mkdirSync(path.join(home, "r"), { recursive: true });
+  const added = addTask(c, { home });
+  assert.equal(added.ok, true, JSON.stringify(added));
+  assert.equal(readBack().tasks.length, 3, "新增要真的加进去");
+  assert.equal(readBack().顶层扩展字段, "也要留住", "新增之后顶层字段也要留住");
+  assert.equal(readBack().tasks.filter((t) => t.enabled === false).length, 1,
+    "新增之后停用条目也要留住");
+});
+
+test("登记表首次写入要能把文件建出来，读不懂时不许覆盖", () => {
+  // ENOENT = 空文档（首次写入本来就要建它）；
+  // **其余读取错误说不清 —— 那时候写回去会覆盖一份我们没读懂的文件。**
+  const home = temp();
+  const file = path.join(home, "registry.json");
+  const created = mutateRegistryDocument(file, (raw) => { raw.push({ x: 1 }); });
+  assert.equal(created.ok, true, "首次写入要能建文件");
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf-8")).tasks.length, 1);
+
+  // 读不懂 → 拒绝，且**原文件一个字节都不许动**。
+  fs.writeFileSync(file, "{ 这不是 JSON");
+  const before = fs.readFileSync(file, "utf-8");
+  const refused = mutateRegistryDocument(file, () => { throw new Error("不该被调用"); });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.reason, "registry_unreadable");
+  assert.equal(fs.readFileSync(file, "utf-8"), before, "**读不懂就不许覆盖**");
 });
 
 

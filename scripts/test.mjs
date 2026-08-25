@@ -11615,6 +11615,14 @@ test("watcher 的例外：坏 outbox 整批不发，但 run 结果**真的发出
   assert.match(calls[0], /这一轮的结果/u, "发出去的应当是 run 结果");
   assert.equal(/好的/u.test(calls[0]), false, "**outbox 那一半不许混进这一次发送**");
 
+  // **还要证明它落了标。**
+  // 只断言"调了发布器"的话，删掉 markPublished 测试照样绿 ——
+  // 而那意味着**下一轮会把同一个 run 再发一次**。
+  // "发出去了"和"记下了发出去"是两件事，后者才挡得住重复发送。
+  const stamp = path.join(runs, key + ".published.json");
+  assert.equal(fs.existsSync(stamp), true, "**run 结果要落标**，否则会被重复发送");
+  assert.match(fs.readFileSync(stamp, "utf-8"), /om_sent/u, "标记里要记下真实 message id");
+
   // outbox 两份都不许被动。
   assert.equal(fs.readFileSync(bad, "utf-8"), badBefore, "**损坏文件不许被动**");
   assert.equal(JSON.parse(fs.readFileSync(good, "utf-8")).published_at, null,

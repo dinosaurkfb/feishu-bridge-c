@@ -29,7 +29,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isDirectRun } from "../direct-run.mjs";
-import { isCanonicalIso } from "../canonical-time.mjs";
+import { auditOutbox } from "../outbox.mjs";
+
+// **auditOutbox 住在 scripts/outbox.mjs**（listPending 的隔壁）——
+// 抑制核心和 Claude 侧也要用它，留在 Codex 适配器里两侧就够不着。
+// 这里转出只是不打断既有导入点；**定义只有一份**。
+export { auditOutbox };
 import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
 import { bridgeHome, loadRegistry, registryFile, taskPaths } from "./state.mjs";
@@ -136,74 +141,6 @@ export function classifyBacklog({ home = bridgeHome() } = {}) {
   return { ok: true, total, unreadable, tasks };
 }
 
-/**
- * 把一个 outbox 里的**每一个 JSON 都归类**：pending / published / suppressed，
- * 三样都不是就是 unclassified。
- *
- * **只补坏 JSON 是不够的**（上一版就是这样）。评审补了两个反例：
- *   · outbox 路径读不出来、或者根本不是目录；
- *   · JSON 能解析、但不是合法的 outbox 记录（比如 `{}`）。
- * 两种都会让门槛报"0 条积压"然后放行。
- *
- * **只有目录不存在才算真的空。**其余任何"说不清"都必须拦住 ——
- * 那些文件是什么内容谁也不知道，而定时器一启用就会去动它们。
- */
-export function auditOutbox(outboxDir) {
-  let files;
-  try {
-    const st = fs.statSync(outboxDir);
-    if (!st.isDirectory()) return { ok: false, reason: "outbox_not_a_directory" };
-    files = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json"));
-  } catch (err) {
-    // 不存在 = 还没发过东西，合法的空。其他错误（权限等）说不清，拦住。
-    if (err.code === "ENOENT") return { ok: true, pending: 0, unclassified: [] };
-    return { ok: false, reason: "outbox_unreadable" };
-  }
-  let pending = 0;
-  const unclassified = [];
-  for (const f of files) {
-    let rec;
-    try { rec = JSON.parse(fs.readFileSync(path.join(outboxDir, f), "utf-8")); }
-    catch { unclassified.push({ file: f, why: "读不出来" }); continue; }
-    if (rec === null || typeof rec !== "object" || Array.isArray(rec)) {
-      unclassified.push({ file: f, why: "不是记录对象" }); continue;
-    }
-    // **三态要严格校验字段的类型，不能只看"有没有这个键"。**
-    // 评审实测：published_at 放 false / 0 / {} / "" 时，上一版都当成"已发布"
-    // 静默跳过 —— 一批损坏记录就这样被永久藏起来，门槛还照样放行。
-    //
-    //   suppressed：publish_suppressed_at 是非空字符串
-    //   pending   ：published_at === null
-    //   published ：published_at 是非空字符串
-    // 三样都不是 → 说不清，拦住。
-    // **三态必须互斥。**上一版只要 publish_suppressed_at 是非空串就判 suppressed，
-    // 不管 published_at 是什么 —— 一条"既发过又被停过"的自相矛盾记录会被静默接受。
-    // 停发的前提就是它还没发出去；两个字段同时有值，说明这条记录的状态是坏的。
-    const sup = rec.publish_suppressed_at;
-    if (sup !== undefined && sup !== null) {
-      // **复用规范时间校验，不自己判"非空字符串"。**
-      // 纯空白、"abc"、"2026-13-45" 都能通过"非空"，却都不是时间 ——
-      // 判据松一点，损坏记录就又被当成合法状态藏起来。
-      if (!isCanonicalIso(sup)) {
-        unclassified.push({ file: f, why: "publish_suppressed_at 不是规范时间" });
-        continue;
-      }
-      if (rec.published_at !== null) {
-        unclassified.push({ file: f, why: "既标了已发布又标了已停发，状态自相矛盾" });
-        continue;
-      }
-      continue;                                                          // suppressed
-    }
-    if (!("published_at" in rec)) {
-      unclassified.push({ file: f, why: "缺 published_at，无法归类" }); continue;
-    }
-    const pub = rec.published_at;
-    if (pub === null) { pending += 1; continue; }                        // pending
-    if (isCanonicalIso(pub)) continue;                                  // published
-    unclassified.push({ file: f, why: "published_at 既不是 null 也不是规范时间" });
-  }
-  return { ok: true, pending, unclassified };
-}
 
 /**
  * 现在处于哪个状态。**"未启用"是安装后的正常态，不是故障。**

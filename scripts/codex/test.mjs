@@ -15,6 +15,8 @@ import {
   absentJob, auditOutbox, classifyBacklog, drainScriptPath, enableBlockers, loadedPhase,
   plistBody, scanRunnable,
 } from "./drain-service.mjs";
+import { outboxMutationBlocker } from "../outbox.mjs";
+import { collectBacklog, describeRecordState, suppressCommandFor } from "./feishu-outbox.mjs";
 import { auditSkills } from "./skill-content.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
 import {
@@ -142,6 +144,61 @@ const test = (name, fn) => {
   catch (err) { failed += 1; console.error("FAIL " + name + "\n" + (err.stack ?? err)); }
 };
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), "feishu-codex-adapter-test-"));
+
+/**
+ * 一条**真实形状**的 outbox 记录。
+ *
+ * 以前各处夹具写的是 `{ kind, text, published_at: null }` —— 而真实记录
+ * （含升级前那批历史积压）一直都带着 id / kind / text / created_at。
+ * 夹具比真实数据宽松，于是"没有 id、没有时间的文件被永久抑制"这个缺陷
+ * 在全绿的套件下活了下来，是评审用反例挖出来的。
+ *
+ * **夹具要像真的**，否则守卫收紧时红的是测试，不是缺陷。
+ */
+/**
+ * 测试里模拟"人从预览输出里复制过来的摘要"。
+ *
+ * **产品代码绝不能这么做** —— 在 --apply 时现算就只覆盖进程内窗口，
+ * 那正是被评审逮到两次的写法。测试里这样算是合法的：它扮演的是
+ * 人手上那份预览输出，而不是第二个进程自己重新算一遍。
+ */
+/**
+ * 走**真实的两步流程**跑抑制：先预览，从输出里取回摘要，再带着它落盘。
+ *
+ * 这正是这道守卫要保护的东西 —— 摘要必须**跨进程**由人带过来。
+ * 测试里如果直接在 apply 时算一个，就跟评审逮到的产品缺陷是同一个写法。
+ */
+function suppressViaPreview(cli, args) {
+  const preview = cli(args);
+  const m = /--expect-digest (\S+)/u.exec(preview.stdout ?? "");
+  if (!m) return { preview, applied: null, digest: null };
+  const applied = cli([...args, "--apply", "--expect-digest", m[1]]);
+  return { preview, applied, digest: m[1] };
+}
+
+function digestFromDisk(outboxDir, select = (r) => r) {
+  return suppressionDigest({
+    files: auditOutbox(outboxDir).files,
+    // **按核心锁内那条算法算** —— 用合成的 pending 算会跟它对不上。
+    records: select(listPending({ outboxDir })),
+  });
+}
+
+let recSeq = 0;
+function outboxRecord(extra = {}) {
+  recSeq += 1;
+  return {
+    id: "evt-" + String(recSeq).padStart(6, "0"),
+    // **kind 必须在 KINDS 里** —— "progress" 不是合法 kind，
+    // appendEvent 根本造不出来。夹具用生产入口造不出的值，
+    // 就等于替被测代码放行了一类现实中不存在的输入。
+    kind: "milestone",
+    text: "夹具正文 " + recSeq,
+    created_at: new Date(Date.UTC(2026, 7, 24, 0, 0, recSeq % 60)).toISOString(),
+    published_at: null,
+    ...extra,
+  };
+}
 
 test("Codex 将 chat scope probe 纳入受保护共用面", () => {
   assert.equal(CHAT_SCOPE_PROBE_ARTIFACT_TYPE, "feishu_bridge_dialogue_chat_scope_probe");
@@ -4290,8 +4347,8 @@ test("三态必须互斥：既标已发布又标已停发的记录是坏的", ()
   // 停发的前提就是它还没发出去。
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-excl-"));
   const put = (n, rec) => fs.writeFileSync(path.join(dir, n), JSON.stringify(rec));
-  put("both.json", { published_at: "2026-08-24T00:00:00.000Z",
-    publish_suppressed_at: "2026-08-24T00:00:00.000Z" });
+  put("both.json", outboxRecord({ published_at: "2026-08-24T00:00:00.000Z",
+    publish_suppressed_at: "2026-08-24T00:00:00.000Z" }));
   const a = auditOutbox(dir);
   assert.equal(a.pending, 0);
   assert.equal(a.unclassified.length, 1, "**自相矛盾必须被点出来**");
@@ -4299,9 +4356,10 @@ test("三态必须互斥：既标已发布又标已停发的记录是坏的", ()
 
   // 正常的 suppressed（published_at 是 null）仍然算 suppressed。
   const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "cx-excl2-"));
-  fs.writeFileSync(path.join(dir2, "s.json"), JSON.stringify({
-    published_at: null, publish_suppressed_at: "2026-08-24T00:00:00.000Z" }));
-  assert.deepEqual(auditOutbox(dir2), { ok: true, pending: 0, unclassified: [] });
+  fs.writeFileSync(path.join(dir2, "s.json"), JSON.stringify(outboxRecord({
+    published_at: null, publish_suppressed_at: "2026-08-24T00:00:00.000Z" })));
+  assert.deepEqual(auditOutbox(dir2),
+    { ok: true, pending: 0, unclassified: [], unexplainable: [], files: ["s.json"] });
 });
 
 test("loadedPhase 与 absentJob 必须共用同一份缺席判据", () => {
@@ -4470,7 +4528,8 @@ test("积压归类：每个 JSON 都要能归类，说不清就拦住", () => {
     "**{} / 坏 JSON / 数组都必须被点出来**：" + JSON.stringify(a.unclassified));
 
   // 目录不存在 = 合法的空。
-  assert.deepEqual(auditOutbox(path.join(dir, "nope")), { ok: true, pending: 0, unclassified: [] });
+  assert.deepEqual(auditOutbox(path.join(dir, "nope")),
+    { ok: true, pending: 0, unclassified: [], unexplainable: [], files: [] });
 
   // 路径是文件不是目录 → 说不清，拦住。
   const file = path.join(dir, "afile");
@@ -5002,6 +5061,305 @@ test("Codex 抑制命令：目标和范围都必须显式给", () => {
     assert.equal(fs.readFileSync(rec, "utf-8"), body, args.join(" ") + "：outbox 不许被动");
   }
 });
+
+test("积压查看：读不出来绝不能显示成「没有积压」", () => {
+  // **这个命令服务的是一个不可逆决定。**上一版直接用 listPending，
+  // 而它把目录错误吞成 []、把坏 JSON 静默跳过 —— 复审实测：放个坏文件进去，
+  // CLI 照样 exit 0 说"所有 task 的 outbox 都是空的"。
+  // 一份假的"没有积压"会让人放心地授权抑制。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "示例 task",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const ob = taskPaths(task, home).outbox;
+  fs.mkdirSync(ob, { recursive: true });
+  fs.writeFileSync(path.join(ob, "0001.json"), "{ 这不是 JSON");
+
+  const got = collectBacklog({ home });
+  assert.equal(got.ok, true);
+  assert.equal(got.tasks.length, 1, "**读不出来的 task 必须出现在报告里**");
+  assert.equal(got.tasks[0].unclassified.length, 1);
+  assert.deepEqual(got.tasks[0].unclassified.map((u) => u.file), ["0001.json"], "要点名");
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.notEqual(r.status, 0, "**说不清就必须非零退出**");
+  assert.match(r.stdout + r.stderr, /0001\.json/u);
+  assert.equal(/都是空的/u.test(r.stdout), false, "不许说成空的");
+});
+
+test("积压查看：点名一条不存在的 task 是错误，不是「没有积压」", () => {
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  writeRegistry([makeTaskEntry({ root, threadId: THREAD_A, name: "T",
+    rootMessageId: "om_root", token: "a1b2c3" })], path.join(home, "registry.json"));
+
+  assert.equal(collectBacklog({ home, taskKey: "no-such-key" }).reason, "task_not_found");
+  assert.equal(collectBacklog({ home, threadId: THREAD_B }).reason, "task_not_found");
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs"), "--task-key", "no-such-key"],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.notEqual(r.status, 0);
+  assert.equal(/没有积压[^—]/u.test(r.stdout), false, "不许把「找不到」说成「没有积压」");
+});
+
+test("积压查看：记录层和 task 层分开说，不编原因", () => {
+  // 上一版把两层混在一句里：task 已暂停时，每条记录仍显示"等待下一次排空" ——
+  // 那是编出来的。**混层就会编。**
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "T",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  task.auto_publish_on_completion = false;             // task 层：没开自动发布
+  writeRegistry([task], path.join(home, "registry.json"));
+  const ob = taskPaths(task, home).outbox;
+  fs.mkdirSync(ob, { recursive: true });
+  fs.writeFileSync(path.join(ob, "0001.json"), JSON.stringify({
+    kind: "reply", text: "就绪的那条", published_at: null,
+    publish_eligible_at: new Date().toISOString(), created_at: new Date().toISOString(),
+  }));
+
+  const t = collectBacklog({ home }).tasks[0];
+  // **记录层只说记录**：它自己是就绪的。
+  assert.equal(t.records[0].state, "ready");
+  assert.equal(/排空|等待/u.test(t.records[0].why), false, "记录层不许编发布时机");
+  // **task 层单独说**，而且说的是真原因。
+  assert.equal(t.taskState.ok, false);
+  assert.match(t.taskState.text, /没有开启自动发布/u);
+});
+
+test("积压查看：有损坏记录时不给抑制命令 —— 那条命令一定会被拒", () => {
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "T",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const ob = taskPaths(task, home).outbox;
+  fs.mkdirSync(ob, { recursive: true });
+  const base = { kind: "reply" };
+  fs.writeFileSync(path.join(ob, "0001.json"),
+    JSON.stringify(outboxRecord({ ...base, text: "好的" })));
+
+  // 全好 → 给命令，而且**必须是真能跑的**：非 locator 的 --task-key + 引号。
+  const good = collectBacklog({ home }).tasks[0];
+  const cmd = suppressCommandFor(good);
+  assert.ok(cmd, "干净的一批要给出处置命令");
+  assert.match(cmd, /--task-key /u);
+  assert.equal(cmd.includes("<"), false, "**不许留占位符** —— 占位符不是可执行命令");
+  assert.equal(cmd.includes(THREAD_A), false, "不许把 thread id 写进命令");
+  assert.match(cmd, /'/u, "路径要加引号");
+
+  // 加一条损坏的 → **不给命令**（抑制对这种情况整批拒绝）。
+  fs.writeFileSync(path.join(ob, "0002.json"),
+    JSON.stringify({ ...base, text: "坏的", target_channel_generation_id: "   " }));
+  const bad = collectBacklog({ home }).tasks[0];
+  assert.equal(suppressCommandFor(bad), null, "有损坏记录就不许给注定被拒的命令");
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.equal(/suppress-outbox\.mjs/u.test(r.stdout), false, "有损坏记录时不许打印抑制命令");
+  assert.match(r.stdout, /整批拒绝/u, "要说明为什么没有出路");
+});
+
+test("积压查看：只读 —— 真实 CLI 跑完一个字节都不许变", () => {
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "T",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const ob = taskPaths(task, home).outbox;
+  fs.mkdirSync(ob, { recursive: true });
+  fs.writeFileSync(path.join(ob, "0001.json"), JSON.stringify(outboxRecord({
+    kind: "reply", text: "很久以前的一条答复",
+    created_at: new Date(Date.now() - 5 * 24 * 3600 * 1000).toISOString(),
+  })));
+  const before = fs.readdirSync(ob).map((f) => fs.readFileSync(path.join(ob, f), "utf-8"));
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /很久以前/u, "要能看到内容");
+  assert.match(r.stdout, /5 天前/u);
+  assert.deepEqual(fs.readdirSync(ob).map((f) => fs.readFileSync(path.join(ob, f), "utf-8")),
+    before, "**查看命令一个字节都不许改**");
+
+  // 拼错的参数、同时给两个选择器 —— 都不许静默退化。
+  const bad = (...a) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs"), ...a],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) }).status;
+  assert.notEqual(bad("--thread--id", THREAD_A), 0);
+  assert.notEqual(bad("--thread-id", THREAD_A, "--task-key", "k"), 0);
+});
+
+test("积压查看：没有发布资格 + 目标已经没了 —— 不许只说「尚未取得发布资格」", () => {
+  // 评审：先返回 not_eligible 再谈目标，于是一条"永远发不出去"的历史积压
+  // 只显示"尚未取得发布资格"，听起来像等等就好。
+  // **最该被看见的那一类被藏得最深** —— 它正是人要决定清不清的那种。
+  const gone = describeRecordState(
+    { id: "e1", kind: "reply", text: "x", created_at: "2026-08-20T00:00:00.000Z",
+      target_channel_generation_id: "channel_generation_" + "f".repeat(24) },
+    { resolveTarget: () => ({ ok: false, reason: "generation_not_found" }) });
+  assert.equal(gone.code, "target_gone", "**目标没了优先于资格**");
+  assert.match(gone.text, /永远发不出去/u);
+  assert.match(gone.text, /还没取得发布资格/u, "资格那一维也要照说，只是不能盖住前者");
+
+  // 目标还在、只是没资格 —— 那才是真的"等等就好"。
+  const waiting = describeRecordState(
+    { id: "e2", kind: "reply", text: "x", created_at: "2026-08-20T00:00:00.000Z" },
+    { resolveTarget: () => ({ ok: true }) });
+  assert.equal(waiting.code, "not_eligible");
+  assert.match(waiting.text, /目标话题还在/u);
+});
+
+test("可解释判据：id 纯空白不算 id", () => {
+  // 评审实测：id:"   " 通过长度检查，该记录 unexplainable:[]，随后被成功抑制。
+  // 生产入口生成的 id 不可能是纯空白。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-blankid-"));
+  fs.writeFileSync(path.join(dir, "0001.json"), JSON.stringify({ ...outboxRecord(), id: "   " }));
+  fs.writeFileSync(path.join(dir, "0002.json"), JSON.stringify({ ...outboxRecord(), id: "" }));
+  fs.writeFileSync(path.join(dir, "0003.json"), JSON.stringify(outboxRecord()));
+  const bad = new Set((auditOutbox(dir).unexplainable ?? []).map((u) => u.file));
+  assert.ok(bad.has("0001.json"), "**纯空白 id 不算 id**");
+  assert.ok(bad.has("0002.json"));
+  assert.equal(bad.has("0003.json"), false, "正常的不许误伤");
+});
+
+test("处置命令要真能跑：含空格和单引号的路径，交给真实 /bin/sh -c", () => {
+  // **这条测试我弄丢过一次。**
+  //
+  // 它在第 3 轮加进来，第 6 轮我重写查看命令时把它换成了形状断言
+  // （`assert.match(cmd, /'/u, "路径要加引号")`）—— 而"字符串里有引号"
+  // 恰恰是我自己在第 3 轮写下的反面教材：**断言它像命令，不等于它能跑。**
+  // 拆分时用全历史比对才发现少了这条，补回来。
+  //
+  // 仓库为这类事付过账：经符号链接执行、含空格的 HOME、真 shell 执行 ——
+  // 三种场景各自都让全绿的套件漏掉过线上故障。
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cx don't-"));   // 空格 + 单引号
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "T",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const ob = taskPaths(task, home).outbox;
+  fs.mkdirSync(ob, { recursive: true });
+  fs.writeFileSync(path.join(ob, "0001.json"), JSON.stringify(outboxRecord({
+    kind: "reply", text: "一条" })));
+
+  const entry = collectBacklog({ home }).tasks[0];
+  const cmd = suppressCommandFor(entry);
+  assert.ok(cmd, "干净的一批要给出命令");
+
+  // **交给真 shell 跑。**只要求它不是"命令找不到 / 语法错" ——
+  // 抑制本身会因为缺 --expect-digest 之类而拒绝，那是它该做的事。
+  const r = spawnSync("/bin/sh", ["-c", cmd],
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.notEqual(r.status, 127, "**127 = shell 没找到命令**，说明路径被空格拆词了");
+  assert.equal(/not found|No such file|syntax error|unexpected/u.test(r.stderr), false,
+    "shell 层不许报错：" + r.stderr.slice(0, 200));
+  assert.match(r.stdout + r.stderr, /task|待发|outbox/u,
+    "命令应该真的执行到了脚本里：" + (r.stdout + r.stderr).slice(0, 200));
+});
+
+test("审计：只有目录不存在才算空，读不出来必须说出来", () => {
+  // 变异验证抓到的缺口：这一层原本没有测试盯着"读不出来"这条分支 ——
+  // 把 ENOENT 判断改成恒真（任何读取错误都当成空），套件照样绿。
+  // **"读不出来"和"是空的"是两件事**：前者说不清目录里有什么，
+  // 而下游会拿这个结论去做不可逆的事。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "cx-auditread-"));
+
+  // ① 目录不存在 = 还没发过东西，合法的空。
+  const none = auditOutbox(path.join(base, "never-existed"));
+  assert.equal(none.ok, true, "不存在是合法的空");
+  assert.equal(none.pending, 0);
+
+  // ② 路径是文件而不是目录 → **说不清，必须拦住**。
+  const asFile = path.join(base, "outbox-as-file");
+  fs.writeFileSync(asFile, "我不是目录");
+  const notDir = auditOutbox(asFile);
+  assert.equal(notDir.ok, false, "**不是目录不许报成空**");
+  assert.equal(notDir.reason, "outbox_not_a_directory");
+
+  // ③ 目录不可读（权限）→ 同样不许报成空。
+  const noRead = path.join(base, "outbox-noread");
+  fs.mkdirSync(noRead);
+  fs.writeFileSync(path.join(noRead, "0001.json"), JSON.stringify(outboxRecord()));
+  fs.chmodSync(noRead, 0o000);
+  try {
+    const denied = auditOutbox(noRead);
+    // root 跑测试时读得动，那就跳过这一档 —— 但不许静默当成通过。
+    if (denied.ok === true) {
+      assert.equal(denied.pending, 1, "读得动就该看到那一条，而不是报空");
+    } else {
+      assert.equal(denied.reason, "outbox_unreadable", "**读不出来不许报成空**");
+    }
+  } finally {
+    fs.chmodSync(noRead, 0o700);
+  }
+
+  // 统一守卫对这两种都要给出阻断结论。
+  assert.equal(outboxMutationBlocker(notDir)?.reason, "outbox_not_a_directory");
+  assert.equal(outboxMutationBlocker(none), null, "合法的空不许被拦");
+});
+
+
+test("登记表读取：结构坏掉要 fail-closed，不许抛也不许静默成空表", () => {
+  // 两件事一起守：
+  // ① 顶层结构异常（根节点 null / 数组 / 字符串、tasks 不是数组）——
+  //    上一版会抛 TypeError 或被读成"正常的空表"。
+  // ② 逐条畸形（null / 字符串 / 缺 root / 缺 key）—— 上一版直接 continue，
+  //    最终返回 ok:true 加一张空表。
+  //
+  // **静默过滤等于把「表坏了」说成「表是空的」** —— 人会去重新绑定，
+  // 而真正该做的是看一眼这张表。
+  const write = (body) => {
+    const home = temp();
+    const f = path.join(home, "registry.json");
+    fs.writeFileSync(f, typeof body === "string" ? body : JSON.stringify(body));
+    return f;
+  };
+
+  for (const [name, body] of [
+    ["根节点 null", "null"],
+    ["根节点是数组", "[]"],
+    ["根节点是字符串", JSON.stringify("nope")],
+    ["tasks 不是数组", { tasks: {} }],
+  ]) {
+    let reg;
+    assert.doesNotThrow(() => { reg = loadRegistry(write(body)); }, name + "：**不许抛**");
+    assert.equal(reg.ok, false, name + "：不许当成读得通");
+    assert.equal(reg.reason, "registry_malformed", name);
+  }
+
+  for (const [name, tasks] of [
+    ["null 条目", [null]],
+    ["字符串条目", ["x"]],
+    ["缺 root/key", [{ foo: "bar" }]],
+    ["root 不是绝对路径", [{ root: "relative", logical_task_key: "k" }]],
+  ]) {
+    const reg = loadRegistry(write({ tasks }));
+    assert.equal(reg.ok, false, name + "：**不许静默过滤成空表**");
+    assert.equal(reg.reason, "registry_malformed", name);
+    assert.ok(reg.detail?.includes("#0"), name + "：要带索引，人才知道看第几条");
+  }
+
+  // 显式停用的条目仍然照常跳过 —— 那是合法状态，不是畸形。
+  assert.equal(loadRegistry(write({ tasks: [{ enabled: false }] })).ok, true, "停用不算畸形");
+  // 正常表照常读得出来。
+  const good = write({ tasks: [{ root: "/tmp/x", logical_task_key: "k" }] });
+  assert.equal(loadRegistry(good).ok, true);
+  assert.equal(loadRegistry(good).tasks.length, 1);
+});
+
 
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);

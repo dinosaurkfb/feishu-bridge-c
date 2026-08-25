@@ -130,12 +130,48 @@ export function loadRegistry(file = registryFile()) {
     if (err.code === "ENOENT") return { ok: true, file, tasks: [], reason: "no_registry" };
     return { ok: false, file, tasks: [], reason: "registry_unreadable", error: err.message };
   }
+  // **结构异常要 fail-closed，不能靠"访问它时会不会抛"来兜。**
+  //
+  // 评审实测：根节点是 null 或 tasks 是 {} 时两条定位路径都抛 TypeError；
+  // 根节点是 [] 时被误报成"目标不存在"——**坏掉的登记表被说成没有这条 task**，
+  // 人会去查绑定、去重新绑，而问题在别处。
+  // 上一轮我只透传了 loadRegistry 已经结构化返回的故障，没管它自己不校验结构。
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, file, tasks: [], reason: "registry_malformed",
+      detail: "根节点不是对象" };
+  }
+  if (parsed.tasks !== undefined && !Array.isArray(parsed.tasks)) {
+    return { ok: false, file, tasks: [], reason: "registry_malformed",
+      detail: "tasks 不是数组" };
+  }
   const tasks = [];
-  for (const task of parsed.tasks ?? []) {
-    if (!task || task.enabled === false) continue;
-    if (typeof task.root !== "string" || !path.isAbsolute(task.root)) continue;
-    if (typeof task.logical_task_key !== "string" || !task.logical_task_key) continue;
+  const malformed = [];
+  for (const [i, task] of (parsed.tasks ?? []).entries()) {
+    // **停用的条目才允许被跳过；畸形的必须说出来。**
+    //
+    // 上一版对 null、字符串、缺 root/key 的对象一律 continue，最终返回
+    // ok:true 加一张空表 —— 评审实测 tasks:[null]、["x"]、[{foo:"bar"}]
+    // 都被解释成"正常的空登记表"，定位层于是误报 task_not_found。
+    // **静默过滤等于把「表坏了」说成「表是空的」**，人会去重新绑定，
+    // 而真正该做的是看一眼这张表。
+    if (task && typeof task === "object" && !Array.isArray(task) && task.enabled === false) {
+      continue;
+    }
+    if (!task || typeof task !== "object" || Array.isArray(task)) {
+      malformed.push({ index: i, why: "不是 task 对象" }); continue;
+    }
+    if (typeof task.root !== "string" || !path.isAbsolute(task.root)) {
+      malformed.push({ index: i, why: "root 不是绝对路径" }); continue;
+    }
+    if (typeof task.logical_task_key !== "string" || !task.logical_task_key) {
+      malformed.push({ index: i, why: "缺 logical_task_key" }); continue;
+    }
     tasks.push({ ...task, id: task.id ?? task.logical_task_key });
+  }
+  if (malformed.length > 0) {
+    return { ok: false, file, tasks: [], reason: "registry_malformed",
+      detail: malformed.map((m) => "#" + m.index + "（" + m.why + "）").join("、"),
+      entries: malformed };
   }
   const valid = validateRegistryTasks(tasks);
   if (!valid.ok) return { ok: false, file, tasks: [], ...valid };

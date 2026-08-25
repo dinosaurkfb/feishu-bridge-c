@@ -72,9 +72,6 @@ const home = bridgeHome();
 const template = loadCodexTemplate();
 add("机器级模板", template.ok, template.ok ? "结构与单智能体约束通过" : template.reason,
   "按 CODEX_SETUP.md 运行 `init-chain-template.mjs`，先 dry-run 再加 `--apply`");
-const configuredRoot = template.ok && typeof template.template.bridge_root === "string"
-  ? path.resolve(template.template.bridge_root)
-  : null;
 // **不再检查"模板指不指向当前仓库"。**那条问的是"你是从哪个克隆跑的 doctor"，
 // 不是"线上装的是什么"。同一套安装换个目录跑就换个结论 —— 这种检查在迁移之后
 // 会稳定误报，而它恰恰是唯一的验收工具。
@@ -100,6 +97,31 @@ let hooks = null;
 const hooksFile = path.join(CODEX_HOME, "hooks.json");
 try { hooks = JSON.parse(fs.readFileSync(hooksFile, "utf-8")); } catch { /* 下方统一报告 */ }
 const RUNTIME_CURRENT = path.join(RUNTIME_ROOT, "current");
+
+/**
+ * **注入的命令跑的是哪一份代码。**
+ *
+ * 删掉旧的"仓库路径"判据时留下了一个空档：那条问的是"模板指不指向我这个克隆"，
+ * 方向确实错了 —— 但删了之后**没有任何检查在看 bridge_root**。
+ * 于是迁移之后出现过一个从外部看不出来的状态：hooks.json 指向 runtime/current、
+ * hook 在跑也被信任了，而它注入的命令是从模板的 bridge_root 拼的，
+ * 那个字段还指着旧克隆 —— Codex 一直在跑一天前的代码。
+ *
+ * 命令路径现在已经改成只认 runtime/current。但模板里留着一个指向别处的
+ * bridge_root 仍然危险：它看起来像"桥在哪儿"的权威答案。
+ * 所以这条判据问的是**它跟 runtime/current 一不一致**，
+ * 不是"它指不指向我这个克隆"—— 后者换个目录跑就换个结论。
+ */
+const configuredRoot = template.ok && typeof template.template.bridge_root === "string"
+  ? path.resolve(template.template.bridge_root)
+  : null;
+const wantRoot = path.resolve(RUNTIME_CURRENT);
+add("模板 bridge_root", configuredRoot === null ? null : configuredRoot === wantRoot,
+  configuredRoot === null ? "模板里没有 bridge_root（读不出来）"
+    : configuredRoot === wantRoot ? "与 runtime/current 一致"
+    : "**指向 runtime 之外** —— 若有地方按它拼命令，跑的就不是装好的那一份",
+  configuredRoot !== null && configuredRoot !== wantRoot
+    ? "重新生成机器级模板：`node scripts/codex/init-chain-template.mjs`（先 dry-run）" : null);
 // **期望定义要跟安装器逐字同源**：node、脚本、bridge home、日志四项都算。
 // 只比脚本路径的话，node 指到不存在的二进制、日志写错地方，doctor 照样报正常。
 const expectOf = (name) => ({

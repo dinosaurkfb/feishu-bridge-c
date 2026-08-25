@@ -3515,6 +3515,125 @@ test("群名优先用 task 自己的覆盖，而不是把知道的说成不知�
   assert.doesNotMatch(r.stdout, new RegExp(TEMPLATE.chat_name ?? "___", "u"));
 });
 
+test("钩子注入的命令必须跑 runtime/current —— 不许按模板的 bridge_root 拼", () => {
+  // **这是迁移真正漏掉的那一半，而且从外部完全看不出来。**
+  // hooks.json 已经指向 runtime/current、hook 在跑也被信任了，
+  // 可注入的命令是从模板的 bridge_root 拼的 —— 那个字段还指着旧克隆。
+  // 结果：钩子路径是新的、命令路径是旧的，Codex 一直在跑一天前的代码，
+  // status 出的是迁移前的旧格式。是 Frank 问"为什么 status 还是旧格式"才查出来的。
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  const home = path.join(dir, "bridge-home");
+  const root = path.join(dir, "project");
+  for (const d of [codexHome, home, root]) fs.mkdirSync(d, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  // **模板里故意留一个指向别处的 bridge_root** —— 就是迁移前的现场。
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({
+    ...TEMPLATE, bridge_root: "/Users/someone/old-clone/feishu-bridge-c" }));
+
+  const env = isolatedEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home });
+  const runtimeCurrent = path.join(codexHome, "feishu-bridge", "runtime", "current");
+
+  const hook = () => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "prompt-hook.mjs")],
+    { encoding: "utf-8", env, input: JSON.stringify({
+      prompt: "$feishu-status", cwd: root, session_id: THREAD_A, turn_id: "t1" }) });
+
+  const before = hook();
+  const ctxBefore = JSON.parse(before.stdout || "{}")
+    ?.hookSpecificOutput?.additionalContext ?? "";
+  assert.ok(ctxBefore.includes(runtimeCurrent),
+    "**注入的命令必须指向 runtime/current**：" + ctxBefore);
+  assert.equal(ctxBefore.includes("old-clone"), false,
+    "**不许按模板的 bridge_root 拼** —— 那个字段会漂：" + ctxBefore);
+});
+
+test("安装器要把模板的 bridge_root 更新到 runtime/current", () => {
+  // 它由 init-chain-template 写成"生成模板时那个仓库路径"，安装器一直不碰它。
+  // 于是每次迁移都会留下这个漂移，而**没有任何检查在看它**
+  //（旧的"仓库路径"判据被我删了，删完只剩一个没人用的死变量）。
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  const home = path.join(dir, "bridge-home");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
+  writeRegistry([], path.join(home, "registry.json"));
+  const tplFile = path.join(home, "chain-config.json");
+  fs.writeFileSync(tplFile, JSON.stringify({
+    ...TEMPLATE, bridge_root: "/Users/someone/old-clone/feishu-bridge-c" }));
+
+  const env = isolatedEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home });
+  assert.equal(spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", env }).status, 0);
+
+  // **doctor 必须能查出这种漂移** —— 装之前它就该是 ✗。
+  // 这条单独验，因为判据本身也可能被写成"永远通过"，那样它就白加了。
+  const drifted = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "doctor.mjs"), "--json"],
+    { encoding: "utf-8", env });
+  const beforeReport = JSON.parse(drifted.stdout);
+  const beforeCheck = beforeReport.checks.find((c) => c.name === "模板 bridge_root");
+  assert.ok(beforeCheck, "doctor 必须有这条判据");
+
+  const after = JSON.parse(fs.readFileSync(tplFile, "utf-8"));
+  assert.equal(after.bridge_root,
+    path.join(codexHome, "feishu-bridge", "runtime", "current"),
+    "**装完必须指向 runtime/current**");
+  // **只改这一个字段**：模板里还有群、身份、凭据位置，装一次基础设施不该动它们。
+  for (const key of ["chat_id", "agent_uid", "transport_open_id", "lark_cli_profile"]) {
+    if (TEMPLATE[key] === undefined) continue;
+    assert.equal(after[key], TEMPLATE[key], "不许顺手改 " + key);
+  }
+
+  // 装完之后 doctor 该说一致了。
+  const fixed = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "doctor.mjs"), "--json"],
+    { encoding: "utf-8", env });
+  const afterCheck = JSON.parse(fixed.stdout).checks.find((c) => c.name === "模板 bridge_root");
+  assert.equal(afterCheck.ok, true, "装完必须一致：" + afterCheck.detail);
+});
+
+test("doctor 的 bridge_root 判据不许写成「永远通过」", () => {
+  // **判据本身也要被验。**上一版加完之后我做变异，把它改成恒 true —— 全绿。
+  // 那说明那条判据当时一条守卫都没有：加了个看起来对的东西，坏了也没人知道。
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  const home = path.join(dir, "bridge-home");
+  const bin = path.join(dir, "bin");
+  for (const d of [codexHome, home, bin]) fs.mkdirSync(d, { recursive: true });
+  for (const n of ["codex", "aily-cli", "lark-cli"]) {
+    fs.writeFileSync(path.join(bin, n), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  }
+  writeRegistry([], path.join(home, "registry.json"));
+  const env = isolatedEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home,
+    PATH: bin + path.delimiter + process.env.PATH });
+  // 先正常装一遍（安装器会把 bridge_root 校正过来）。
+  fs.writeFileSync(path.join(home, "chain-config.json"),
+    JSON.stringify({ ...TEMPLATE, lark_cli_bin: path.join(bin, "lark-cli") }));
+  assert.equal(spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", env }).status, 0);
+
+  const check = () => JSON.parse(spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "doctor.mjs"), "--json"],
+    { encoding: "utf-8", env }).stdout).checks.find((c) => c.name === "模板 bridge_root");
+
+  assert.equal(check().ok, true, "装完是一致的：" + check().detail);
+
+  // **然后把它改坏** —— 判据必须由 true 变 false。
+  const tplFile = path.join(home, "chain-config.json");
+  const doc = JSON.parse(fs.readFileSync(tplFile, "utf-8"));
+  doc.bridge_root = "/Users/someone/old-clone/feishu-bridge-c";
+  fs.writeFileSync(tplFile, JSON.stringify(doc, null, 2));
+  const broken = check();
+  assert.equal(broken.ok, false,
+    "**改坏了必须报 ✗** —— 恒真的判据等于没有判据：" + broken.detail);
+  assert.match(broken.detail, /runtime 之外/u);
+});
+
 test("四层 status：Codex 侧报的必须是自己那条链的事实，不是 Claude 的", () => {
   // **这条迁移最容易办坏的地方。**endpointFacts 的 runtime / runtimeDir / verify
   // 默认值全指向 Claude 那条链 —— 不显式给的话，第 1 层会写着"Claude Code"、

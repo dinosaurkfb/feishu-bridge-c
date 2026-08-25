@@ -2,6 +2,7 @@
 /** Codex UserPromptSubmit：记录精确 thread 活跃租约，并为飞书控制动作注入确定性命令。 */
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { isDirectRun } from "../direct-run.mjs";
 
@@ -10,6 +11,7 @@ import {
 } from "./state.mjs";
 import { storeTurnInput } from "../turn-input.mjs";
 import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
+import { codexRuntimeRoot } from "../runtime-install.mjs";
 
 /**
  * 不带参数的控制命令 —— **只有这一份清单**。
@@ -72,6 +74,21 @@ export function isAilyInvocation(env = process.env) {
   return ["AILY_CLI_SESSION_ID", "AILY_CLI_RUN_ID", "AILY_CLI_CALLER_AGENT_UID"]
     .some((name) => typeof env[name] === "string" && env[name].length > 0);
 }
+
+/**
+ * 注入的命令跑哪一份代码。**只认 runtime/current，不读模板的 bridge_root。**
+ *
+ * 迁移时踩过一个从外部完全看不出来的状态：hooks.json 已经改指 runtime/current、
+ * hook 在跑也被信任了，**可注入的命令是从模板的 bridge_root 拼的**，
+ * 而那个字段还指着旧克隆 —— 于是 Codex 一直在跑一天前的代码，
+ * status 出的是迁移前的旧格式。钩子路径是新的，命令路径是旧的。
+ *
+ * 模板是机器级配置，会漂；runtime/current 是安装器刚校验过的那一份。
+ * **命令路径的唯一事实来源只能是后者。**
+ */
+const runtimeScriptsRoot = () =>
+  path.join(codexRuntimeRoot(process.env.CODEX_HOME || path.join(os.homedir(), ".codex")),
+    "current");
 
 export function composeBindingContext({ bridgeRoot, cwd, threadId, chatName }) {
   const apply = path.join(bridgeRoot, "scripts", "codex", "bind-task.mjs");
@@ -222,7 +239,7 @@ async function main() {
       hookSpecificOutput: {
         hookEventName: "UserPromptSubmit",
         additionalContext: composeAilyInboundContext({
-          bridgeRoot: tpl.template.bridge_root,
+          bridgeRoot: runtimeScriptsRoot(),
           home: bridgeHome(),
         }),
       },
@@ -297,22 +314,22 @@ async function main() {
   let additionalContext;
   if (action === "bind") {
     additionalContext = composeBindingContext({
-      bridgeRoot: tpl.template.bridge_root,
+      bridgeRoot: runtimeScriptsRoot(),
       cwd,
       threadId,
       chatName: tpl.template.chat_name,
     });
   } else if (action === "unbind") {
-    additionalContext = composeUnbindContext({ bridgeRoot: tpl.template.bridge_root, threadId });
+    additionalContext = composeUnbindContext({ bridgeRoot: runtimeScriptsRoot(), threadId });
   } else if (action === "status") {
-    additionalContext = composeStatusContext({ bridgeRoot: tpl.template.bridge_root, threadId });
+    additionalContext = composeStatusContext({ bridgeRoot: runtimeScriptsRoot(), threadId });
   } else if (action === "subscribe") {
-    additionalContext = composeSubscribeContext({ bridgeRoot: tpl.template.bridge_root, threadId });
+    additionalContext = composeSubscribeContext({ bridgeRoot: runtimeScriptsRoot(), threadId });
   } else if (action === "rotate") {
-    additionalContext = composeRotateContext({ bridgeRoot: tpl.template.bridge_root, threadId });
+    additionalContext = composeRotateContext({ bridgeRoot: runtimeScriptsRoot(), threadId });
   } else if (action === "mode" || action.startsWith("mode-")) {
     additionalContext = composeModeContext({
-      bridgeRoot: tpl.template.bridge_root,
+      bridgeRoot: runtimeScriptsRoot(),
       threadId,
       mode: action.startsWith("mode-") ? action.slice("mode-".length) : null,
     });

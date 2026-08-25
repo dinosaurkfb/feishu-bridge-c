@@ -168,6 +168,36 @@ if (!uninstall) {
   console.log("运行时    ：已装 " + runtimePlan.version.slice(0, 16) + " 并校验通过");
 }
 
+// **把模板的 bridge_root 更新到 runtime/current。**
+//
+// 它由 init-chain-template 写成"生成模板时那个仓库路径"，而安装器一直不碰它 ——
+// 于是迁移之后留下一个从外部看不出来的漂移：hooks.json 指向 runtime/current，
+// 而按 bridge_root 拼出来的命令仍指着旧克隆。钩子路径是新的、命令路径是旧的，
+// Codex 跑的是迁移前的代码。
+//
+// **只改这一个字段**，其余原样：模板里还有群、身份、凭据位置这些东西，
+// 装一次基础设施不该顺手改掉它们。
+if (!uninstall) {
+  const tplFile = path.join(home, "chain-config.json");
+  try {
+    const raw = fs.readFileSync(tplFile, "utf-8");
+    const doc = JSON.parse(raw);
+    if (doc.bridge_root !== RUNTIME_CURRENT) {
+      const before = doc.bridge_root;
+      doc.bridge_root = RUNTIME_CURRENT;
+      writeAtomic(tplFile, JSON.stringify(doc, null, 2) + "\n");
+      console.log("模板      ：bridge_root " + (before ?? "(无)") + " → runtime/current");
+    }
+  } catch (err) {
+    // 读不出来就说读不出来 —— 不许静默跳过：这个字段错了会让整条链跑旧代码。
+    if (err.code !== "ENOENT") {
+      console.error("模板 bridge_root 更新失败（" + (err.code ?? err.message) + "）。");
+      console.error("**hooks 没动。**先把模板处理好再装 —— 它错了整条链会跑旧代码。");
+      process.exit(1);
+    }
+  }
+}
+
 const after = JSON.stringify(hooks, null, 2) + "\n";
 if (after !== before) {
   if (fs.existsSync(HOOKS)) fs.copyFileSync(HOOKS, HOOKS + ".bak." + Date.now());

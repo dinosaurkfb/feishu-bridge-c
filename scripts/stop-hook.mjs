@@ -116,7 +116,7 @@ async function main() {
   });
   if (attributed.length === 0) process.exit(0);
 
-  const { drainProject, watcherActive, outboxDirOf, suppressCmd } =
+  const { drainProject, localOutboxMessage, watcherActive, outboxDirOf, suppressCmd } =
     await import("./drain-outbox.mjs");
   const { foreignHint, projectLabel } = await import("./stop-note.mjs");
   const { resolveProject } = await import("./project-resolve.mjs");
@@ -228,8 +228,15 @@ async function main() {
       }
     }
 
-    // 空 outbox 的项目连守望者都不用问 —— 这是最常见的情况，越早返回越好。
-    if (listPending({ outboxDir }).length === 0) continue;
+    // **不许在这里自己判"空"。**
+    //
+    // listPending 把目录错误吞成 []、把坏 JSON 静默跳过 —— 于是
+    // "只有一份坏文件"的 outbox 在这里就被 continue 掉了，Stop 完全不出声。
+    // 评审用**不带答复**的真实 Stop 进程复现：stdout 空、stderr 空、坏文件还在。
+    //
+    // 判断委托给已经修正的 drainProject：它先审计、再谈空不空。
+    // 代价是常见的"真空"项目多走一次审计（一次 readdir），
+    // 换掉的是"读不出来被当成没有东西可发"这一整类。
 
     // **弱信号归属的项目：只在这一轮真给它写过东西时才排空。**
     //
@@ -280,6 +287,16 @@ async function main() {
         (r.diagnosis.ownerName ?? "未知") + "）建的，当前身份大概率回复不进去，" +
         "重试可能一直失败。要停止重试：node " + suppressCmd() + " --project " +
         project.root + " --generation " + (r.diagnosis.generationId ?? "<代际 id>") + " --apply");
+    } else if (r.status === "error" && r.local === true) {
+      // **这不是发布失败，别让人去查飞书。**
+      //
+      // 本地 outbox 说不清（读不出来 / 归不了类 / 解释不了，含"目标代际是坏的"）——
+      // 问题在本地那几个文件里。说成"发布失败"的话，人会去查网络、凭据、话题，
+      // 而问题根本不在那边。**报错报错了地方，比不报还费时间。**
+      // 也不说"兜底定时器会重试"：重试多少次都一样，它需要人来看。
+      //
+      // 判据只有统一守卫一份 —— 这里只负责把它的结论讲清楚。
+      notes.push("飞书出站：" + who + " 的" + localOutboxMessage(r));
     } else if (r.status === "error") {
       notes.push("飞书出站：" + who + " 发布失败（" + r.reason + "），进展留在 outbox，兜底定时器会重试。");
     } else if (r.status === "skipped" && r.reason === "auto_publish_disabled") {

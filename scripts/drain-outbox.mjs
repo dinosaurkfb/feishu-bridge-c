@@ -14,7 +14,9 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { listPending, markSent, composeDigest } from "./outbox.mjs";
+import {
+  auditOutbox, composeDigest, listPending, markSent, outboxMutationBlocker,
+} from "./outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { PUBLISH_FAILURE, classifyPublishFailure, publishDraft } from "./outbound.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
@@ -118,6 +120,26 @@ export function publishErrorDetail(err) {
   return clipBothEnds(detail);
 }
 
+/**
+ * 把统一守卫的结论讲成人话。**Stop 和 CLI 共用这一份措辞。**
+ *
+ * 它只读 blocker 的结论，**不重新判断** —— 判据只有一份。
+ *
+ * 「目录读不出来」和「某几条记录解释不了」要分开说：前者根本没有"N 处"可数
+ * （守卫对读取失败返回 count: 0），照着模板渲染会打出"0 处说不清"，
+ * 那句话既不成立也没法照着排查。
+ */
+export function localOutboxMessage(r) {
+  const head = r.reason === "outbox_unreadable" ? "本地 outbox 读不出来"
+    : r.reason === "outbox_not_a_directory" ? "本地 outbox 那个路径不是目录"
+      : "本地 outbox 有 " + (r.count ?? 0) + " 处说不清" +
+        ((r.files ?? []).length ? "（" + r.files.join("、") + "）" : "");
+  const why = (r.details ?? []).map((d) => "\n    " + d.file + " —— " + d.why).join("");
+  return head + "。\n" +
+    "  **这不是发布失败，是本地记录的问题** —— 重试没用，需要人看一眼。整批都没有动。" +
+    why;
+}
+
 /** 抑制命令的绝对路径：提示里给相对路径，等于让人猜当前工作目录。 */
 export function suppressCmd() {
   return path.join(moduleRoot(import.meta.url, ".."), "scripts", "feishu-suppress-outbox.mjs");
@@ -146,6 +168,14 @@ export function drainProject({
   const outboxDir = outboxDirOf(root, claudeSessionId);
 
   // 先看有没有东西可发。绝大多数会话在这一行就返回了 —— 不读配置、不碰锁。
+  // **审计要在任何"空"结论之前。**
+  //
+  // listPending 把目录错误吞成 []、把坏 JSON 静默跳过 —— 评审实测：
+  // outbox 里只有一份坏 JSON 时 drainProject 返回 {status:"empty"}；
+  // outbox 路径是普通文件时也返回 empty；真实 Stop 面对这种 outbox **完全无输出**。
+  // **"读不出来"被报成"没有东西可发"，是这条线上反复出现的同一个错误。**
+  const preflight = outboxMutationBlocker(auditOutbox(outboxDir));
+  if (preflight) return { status: "error", root, ...preflight, local: true };
   if (listPending({ outboxDir }).length === 0) return { status: "empty", root };
 
   // 项目文件优先，没有就回落到「机器模板 + 登记表那一行」。
@@ -201,6 +231,22 @@ export function drainProject({
 
   try {
     // 锁内重新读一遍：刚才排队等锁的时候，别的发布者可能已经把这批发掉了。
+    // **取锁之后再审计一次** —— 锁外那次和这次之间，别人可能刚写进来一个坏文件。
+    //
+    // **读取也放在审计之后**：上一版注释写"先审计"、实际先 listPending，
+    // 空结论确实在审计之后所以不影响安全，但**注释比实现完整**这件事本身
+    // 就是下一个缺陷的入口 —— 这条线上已经因此栽过。
+    // **这个 outbox 现在能不能动 —— 只认统一守卫。
+    //
+    // 取舍是明确的：**不要静默跳过单个坏文件后把其余照发**。
+    // 对"本次选择的这一批"整批 fail-closed 并点名；
+    // 调度器本来就按项目隔离，一个项目坏掉不会拖住别的项目。
+    //
+    // **损坏的目标代际也归它管。**审计已经把"字段在、但不是可用代际"
+    // 算进不可解释里了 —— 这里再单独判一次就是同一件事的第二份判据，
+    // 而"两份判据"正是这条线上被反复罚过的东西。
+    const blocked = outboxMutationBlocker(auditOutbox(outboxDir));
+    if (blocked) return { status: "error", root, ...blocked, local: true };
     const pending = listPending({ outboxDir });
     if (pending.length === 0) return { status: "empty", root };
 
@@ -354,6 +400,15 @@ if (isDirectRun(import.meta.url)) {
         "）创建，当前身份大概率回复不进去，重试可能一直失败。\n" +
         "  要停止重试（不可逆）：node " + suppressCmd() + " --project " + root +
         " --generation " + (r.diagnosis.generationId ?? "<代际 id>") + " --apply");
+      hadError = true;
+    } else if (r.status === "error" && r.local === true) {
+      // **本地问题要点名。**上一版落进下面那条通用分支，打出来是
+      // "排空失败（outbox_unexplainable），进展留在 outbox：undefined" ——
+      // 没有文件名、没有坏在哪，等于没兑现"整批拒绝并点名"。
+      // 而且"排空失败"会把人支去查飞书。
+      //
+      // 渲染只**读守卫的结论**，不重新判断（判据只有一份）。
+      console.error(tag + localOutboxMessage(r));
       hadError = true;
     } else if (r.status === "error") {
       console.error(tag + "排空失败（" + r.reason + "），进展留在 outbox：" + r.error);

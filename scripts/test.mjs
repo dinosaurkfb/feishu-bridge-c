@@ -258,6 +258,28 @@ fs.chmodSync(registryDir, 0o700);
 // **产品环境变量一律覆盖**，外面设成什么都不影响这一轮。
 Object.assign(process.env, isolatedEnv({ env: process.env, registryDir }));
 
+/**
+ * 一条**真实形状**的 outbox 记录。
+ *
+ * 夹具以前写 `{ kind: "progress", text, created_at, published_at }` ——
+ * 少了 id，而且 **"progress" 根本不在 KINDS 里，appendEvent 造不出来**。
+ * 审计收紧到"能不能解释这条记录"之后，红的是这些夹具，不是缺陷。
+ *
+ * **夹具比真实数据宽松，等于替被测代码放行了一类现实中不存在的输入。**
+ */
+let recSeq = 0;
+function outboxRecord(extra = {}) {
+  recSeq += 1;
+  return {
+    id: "evt-" + String(recSeq).padStart(6, "0"),
+    kind: "milestone",
+    text: "夹具正文 " + recSeq,
+    created_at: new Date(Date.UTC(2026, 7, 24, 0, 0, recSeq % 60)).toISOString(),
+    published_at: null,
+    ...extra,
+  };
+}
+
 let passed = 0;
 let failed = 0;
 const failures = [];
@@ -7688,10 +7710,12 @@ test("发布开关关闭时，自动排空被挡住；--force 才绕过", () => 
   fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
     status: "active", root_message_id: "om_fixture", claude_session_id: null,
     channel_generation_id: "gen-1",
+    // **必须给 expires_at。**缺了会被判成 malformed，Stop 每次都往 outbox
+    // 追加一条到期预警 —— 那会把"只有坏文件"这个场景冲掉，
+    // 测试就绕开了它要测的东西。评审点名过这一点。
+    expires_at: "2099-01-01T00:00:00.000Z",
   }));
-  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
-    kind: "progress", text: "待发", created_at: new Date().toISOString(), published_at: null,
-  }));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify(outboxRecord({ text: "待发" })));
 
   const blocked = drainProject({ root: dir, claudeSessionId: null, dryRun: true });
   assert.equal(blocked.status, "skipped");
@@ -7993,10 +8017,12 @@ test("走真实 CLI 时 --force 必须真的传到 drainProject", () => {
   fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
     status: "active", root_message_id: "om_fixture", claude_session_id: null,
     channel_generation_id: "gen-1",
+    // **必须给 expires_at。**缺了会被判成 malformed，Stop 每次都往 outbox
+    // 追加一条到期预警 —— 那会把"只有坏文件"这个场景冲掉，
+    // 测试就绕开了它要测的东西。评审点名过这一点。
+    expires_at: "2099-01-01T00:00:00.000Z",
   }));
-  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
-    kind: "progress", text: "待发", created_at: new Date().toISOString(), published_at: null,
-  }));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify(outboxRecord({ text: "待发" })));
   const cli = (args) => spawnSync(process.execPath, [
     path.resolve("scripts", "drain-outbox.mjs"), "--project", dir, "--dry-run", ...args,
   ], { encoding: "utf-8" });
@@ -9673,10 +9699,12 @@ test("发布失败只给诊断，不自动做有损动作", () => {
   fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
     status: "active", root_message_id: "om_fixture", claude_session_id: null,
     channel_generation_id: "gen-1",
+    // **必须给 expires_at。**缺了会被判成 malformed，Stop 每次都往 outbox
+    // 追加一条到期预警 —— 那会把"只有坏文件"这个场景冲掉，
+    // 测试就绕开了它要测的东西。评审点名过这一点。
+    expires_at: "2099-01-01T00:00:00.000Z",
   }));
-  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
-    kind: "progress", text: "待发", created_at: new Date().toISOString(), published_at: null,
-  }));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify(outboxRecord({ text: "待发" })));
 
   // 关键：真实入口下不许抛。上一版 id 定义在 try 里、catch 里用它，
   // **任何发布失败都先撞上 ReferenceError**，永远走不到诊断。
@@ -9710,9 +9738,7 @@ test("显式抑制命令：默认预览、说明不可逆、拼错的参数不�
   fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
     status: "active", root_message_id: "om_x", feishu_root_message_id_reference: "om_x",
     claude_session_id: null, channel_generation_id: "gen-1" }));
-  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
-    kind: "progress", text: "待发", created_at: new Date().toISOString(), published_at: null,
-  }));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify(outboxRecord({ text: "待发" })));
   const cli = (args) => spawnSync(process.execPath, [
     path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir, ...args,
   ], { encoding: "utf-8" });
@@ -11281,7 +11307,7 @@ test("真实 Stop 钩子会把「非当前项目」说出来 —— 纯函数对
     JSON.stringify({ project_dir: proj, logical_task_key: "k",
       project_display_name: "A", task_display_name: "A" }));
   fs.writeFileSync(path.join(proj, ".runtime-data", "outbound", "outbox", "0001.json"),
-    JSON.stringify({ kind: "progress", text: "x", published_at: null }));
+    JSON.stringify(outboxRecord({ text: "x" })));
   const reg = path.join(dir, "registry.json");
   fs.writeFileSync(reg, JSON.stringify({
     schema_version: "1.0", projects: [{ id: "projA", root: proj, name: "A" }] }));
@@ -11397,6 +11423,294 @@ test("spawn 钩子必须换 HOME —— 否则会写进真实的排障日志", (
   }
   assert.ok(scanned >= 2, "只扫到 " + scanned + " 处 spawn 钩子 —— 扫描失效就等于没守");
   assert.deepEqual(bad, [], "这些地方 spawn 了钩子却没换 HOME，会写进真实排障日志");
+});
+
+
+/** 一个能走到发布准备的最小项目 —— 四条测试共用。 */
+function drainFixture(records) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-l6-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", lark_cli_bin: "/nonexistent/lark-cli",
+  }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_fixture", claude_session_id: null,
+    channel_generation_id: "gen-1",
+    // **必须给 expires_at。**缺了会被判成 malformed，Stop 每次都往 outbox
+    // 追加一条到期预警 —— 那会把"只有坏文件"这个场景冲掉，
+    // 测试就绕开了它要测的东西。评审点名过这一点。
+    expires_at: "2099-01-01T00:00:00.000Z",
+  }));
+  for (const [name, body] of Object.entries(records)) {
+    fs.writeFileSync(path.join(obDir, name),
+      typeof body === "string" ? body : JSON.stringify(body));
+  }
+  return { dir, obDir };
+}
+
+test("Claude 排空：损坏记录报成本地问题，一次发布器都不调", () => {
+  // 记录的目标代际字段在、但不是可用代际。解析代际时会抛异常，
+  // 而外层把异常一律记成 publish_failed —— 于是一条**本地的数据损坏**
+  // 被报成"飞书发布失败"，人会去查网络、查凭据、查话题，
+  // 而问题根本不在那边。**报错报错了地方，比不报还费时间。**
+  const { dir, obDir } = drainFixture({
+    "0001.json": outboxRecord({ text: "坏的", target_channel_generation_id: "   " }),
+  });
+  const before = fs.readFileSync(path.join(obDir, "0001.json"), "utf-8");
+  let published = 0;
+  let diagnosed = 0;
+  // 两个注入口都要挨着调用点：守卫按邻近窗口扫描，离得远就等于没注入。
+  // **"挡住了写"不等于"不出网"** —— 诊断也会真的调 lark-cli。
+  const boom = () => { published += 1; throw new Error("不该走到这里"); };
+  const diag = () => { diagnosed += 1; return { kind: PUBLISH_FAILURE.TRANSIENT }; };
+  const r = drainProject({
+    root: dir, publish: boom, diagnose: diag,
+  });
+  assert.equal(r.status, "error");
+  // **判据只有统一守卫一份。**损坏的目标代际已经被审计算进"解释不了"里 ——
+  // 这里再单独判一次就是同一件事的第二份判据。
+  assert.equal(r.reason, "outbox_unexplainable", "**不许报成 publish_failed**");
+  assert.match(r.details?.[0]?.why ?? "", /target_channel_generation_id/u,
+    "要说清是目标代际的问题，不是笼统的「有问题」");
+  assert.equal(r.local, true, "要标成本地问题 —— 排查方向完全不同");
+  assert.deepEqual(r.files, ["0001.json"], "要指名道姓是哪条");
+  assert.equal(published, 0, "**零发布器调用**");
+  assert.equal(diagnosed, 0, "**零诊断调用** —— 诊断也会真的出网");
+  assert.equal(fs.readFileSync(path.join(obDir, "0001.json"), "utf-8"), before, "整批不动");
+});
+
+test("Claude 排空：outbox 说不清就整批 fail-closed，不跳过坏文件发其余", () => {
+  // 取舍是明确的：**不要静默跳过单个坏文件后把其余照发**。
+  // 对"本次选择的这一批"整批 fail-closed 并点名；
+  // 调度器本来就按项目隔离，一个项目坏掉不会拖住别的项目。
+  const { dir, obDir } = drainFixture({
+    "0001.json": outboxRecord({ text: "好的" }),
+    "0002.json": "{ 这不是 JSON",
+  });
+  let published = 0;
+  const send = () => { published += 1; return "om_x"; };
+  const diag = () => ({ kind: PUBLISH_FAILURE.TRANSIENT });
+  const r = drainProject({
+    root: dir, publish: send, diagnose: diag,
+  });
+  assert.equal(r.status, "error", "**有说不清的文件就整批不动**");
+  assert.equal(r.local, true);
+  assert.deepEqual(r.files, ["0002.json"], "要点名");
+  assert.equal(published, 0, "**好的那条也不许被单独发掉**");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(obDir, "0001.json"), "utf-8"))
+    .published_at, null, "好的那条不许被标记已发");
+
+  // 坏文件拿走 → 恢复正常。守卫不能把好情况也挡了。
+  fs.rmSync(path.join(obDir, "0002.json"));
+  const ok = drainProject({
+    root: dir, publish: send, diagnose: diag,
+  });
+  assert.equal(ok.status, "published", JSON.stringify(ok));
+  assert.equal(published, 1, "干净时必须真的发出去");
+});
+
+test("Stop 文案：本地损坏不许说成「发布失败」，也不许提兜底重试", () => {
+  // **内部原因改了而提示没改，等于没改**：人看到的仍是"发布失败"。
+  // 这条走**真实 Stop 钩子进程**，不是读源码找字符串。
+  const { dir } = drainFixture({
+    "0001.json": outboxRecord({ text: "坏的", target_channel_generation_id: "   " }),
+  });
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-l6-home-"));
+  const registryFile = path.join(home, "registry.json");
+  fs.writeFileSync(registryFile, JSON.stringify({ projects: [{
+    id: "l6", root: dir, name: "P", root_message_id: "om_fixture",
+    expires_at: "2099-01-01T00:00:00Z",
+  }] }));
+  const stopHook = path.join(path.resolve("scripts"), "stop-hook.mjs");
+  const r = spawnSync(process.execPath, [stopHook], {
+    input: JSON.stringify({ session_id: "s1", cwd: dir, last_assistant_message: "本轮答复" }),
+    encoding: "utf-8",
+    env: {
+      ...process.env,
+      FEISHU_BRIDGE_REGISTRY: registryFile,
+      // 钩子的日志路径写死在 os.homedir() 上 —— 不换 HOME 就会写进真实排障日志。
+      HOME: home,
+    },
+  });
+  const said = (r.stdout ?? "") + (r.stderr ?? "");
+  assert.match(said, /本地记录的问题/u, "**必须说清是本地问题**：" + said.slice(0, 300));
+  assert.match(said, /重试没用/u);
+  assert.match(said, /0001\.json/u, "要指名道姓是哪条");
+  assert.match(said, /target_channel_generation_id/u, "要说清坏在哪个字段");
+  // 「发布失败」只许出现在**否定句**里 —— 光断言"不含这四个字"会把
+  // "这不是发布失败"这句正确的说明也判成违规（第一版就是这么写的，
+  // 而且窗口还取错了：那句里"不是"前面还有 ** 标记）。
+  // 所以逐处检查：每一次出现前面都必须有"不是"。
+  const claims = [...said.matchAll(/发布失败/gu)]
+    .filter((m) => !said.slice(Math.max(0, m.index - 8), m.index).includes("不是"));
+  assert.deepEqual(claims.map((m) => said.slice(m.index - 10, m.index + 6)), [],
+    "不许把本地损坏说成发布失败");
+  assert.equal(/兜底定时器会重试/u.test(said), false, "**不许暗示重试能解决**");
+});
+
+test("watcher 的例外：坏 outbox 整批不发，但 run 结果**真的发出去**（真实进程）", () => {
+  // **上一版这条测试测了个寂寞。**评审指出：它把自动发布关掉了，
+  // 于是整批本来就不会发 —— 去掉 !outboxBlocked、或者让 run 那一支也被挡住，
+  // 断言照样全绿。末尾用"不存在的二进制仍不存在"证明不触网也无效。
+  //
+  // 现在按评审给的形状：**开启自动发布 + 可记账的假 lark-cli**，
+  // 证明真正的例外成立 —— outbox 那一半整批不发，run 结果恰好发一次。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-l6-watch-"));
+  const rt = path.join(dir, ".runtime-data", "inbound");
+  const runs = path.join(rt, "runs");
+  const claims = path.join(rt, "delivery-claims");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  for (const d of [rt, runs, claims, obDir]) fs.mkdirSync(d, { recursive: true });
+
+  // 可记账的假 lark-cli：每次调用往 argsFile 追加一行。
+  const argsFile = path.join(dir, "lark-calls.jsonl");
+  const bin = path.join(dir, "fake-lark.cjs");
+  fs.writeFileSync(bin, "#!" + process.execPath + "\n" +
+    "require('node:fs').appendFileSync(" + JSON.stringify(argsFile) +
+    ", JSON.stringify(process.argv.slice(2)) + '\\n');\n" +
+    "process.stdout.write('{\"ok\":true,\"data\":{\"message_id\":\"om_sent\"}}');\n",
+    { mode: 0o700 });
+
+  fs.writeFileSync(path.join(rt, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", lark_cli_bin: bin,
+    auto_publish_on_completion: true,          // **开着** —— 否则这条测试测不到东西
+  }));
+  fs.writeFileSync(path.join(rt, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_fixture", claude_session_id: null,
+    channel_generation_id: "gen-1",
+    // **必须给 expires_at。**缺了会被判成 malformed，Stop 每次都往 outbox
+    // 追加一条到期预警 —— 那会把"只有坏文件"这个场景冲掉，
+    // 测试就绕开了它要测的东西。评审点名过这一点。
+    expires_at: "2099-01-01T00:00:00.000Z",
+  }));
+  const good = path.join(obDir, "0001.json");
+  fs.writeFileSync(good, JSON.stringify(outboxRecord({ text: "好的" })));
+  const bad = path.join(obDir, "0002.json");
+  fs.writeFileSync(bad, "{ 这不是 JSON");
+  const badBefore = fs.readFileSync(bad, "utf-8");
+
+  const key = "k".repeat(64);
+  fs.writeFileSync(path.join(runs, key + ".jsonl"),
+    JSON.stringify({ type: "result", is_error: false, result: "这一轮的结果" }) + "\n");
+
+  const r = spawnSync(process.execPath,
+    [path.resolve("scripts", "watch-and-publish.mjs"), key, dir],
+    { encoding: "utf-8", env: { ...process.env, HOME: dir }, timeout: 60_000 });
+  assert.equal(r.status, 0, "进程要正常退出：" + (r.stdout ?? "") + (r.stderr ?? ""));
+
+  const all = (r.stdout ?? "") + (r.stderr ?? "");
+  assert.match(all, /本地 outbox 有问题/u, "要点名本地 outbox 有问题：" + all.slice(0, 300));
+  assert.match(all, /0002\.json/u, "要点名是哪个文件");
+  assert.equal(/执行结果照常发/u.test(all), false, "措辞不许说死");
+
+  // **核心例外：run 结果真的发出去了，而且恰好一次。**
+  const calls = fs.existsSync(argsFile)
+    ? fs.readFileSync(argsFile, "utf-8").trim().split("\n").filter(Boolean) : [];
+  assert.equal(calls.length, 1, "**run 结果要恰好发一次**，实际 " + calls.length + " 次");
+  assert.match(calls[0], /这一轮的结果/u, "发出去的应当是 run 结果");
+  assert.equal(/好的/u.test(calls[0]), false, "**outbox 那一半不许混进这一次发送**");
+
+  // **还要证明它落了标。**
+  // 只断言"调了发布器"的话，删掉 markPublished 测试照样绿 ——
+  // 而那意味着**下一轮会把同一个 run 再发一次**。
+  // "发出去了"和"记下了发出去"是两件事，后者才挡得住重复发送。
+  const stamp = path.join(runs, key + ".published.json");
+  assert.equal(fs.existsSync(stamp), true, "**run 结果要落标**，否则会被重复发送");
+  assert.match(fs.readFileSync(stamp, "utf-8"), /om_sent/u, "标记里要记下真实 message id");
+
+  // outbox 两份都不许被动。
+  assert.equal(fs.readFileSync(bad, "utf-8"), badBefore, "**损坏文件不许被动**");
+  assert.equal(JSON.parse(fs.readFileSync(good, "utf-8")).published_at, null,
+    "**好的那条也不许被单独发掉**");
+});
+
+test("排空 CLI 要点名 —— 不许打出「undefined」", () => {
+  // 评审实测真实 CLI 输出：
+  //   排空失败（outbox_unexplainable），进展留在 outbox：undefined
+  // 没有文件名、没有坏在哪，等于没兑现"整批拒绝并点名"；
+  // 而且"排空失败"会把人支去查飞书。
+  const { dir } = drainFixture({
+    "0001.json": outboxRecord({ text: "好的" }),
+    "0002.json": "{ 这不是 JSON",
+  });
+  const r = spawnSync(process.execPath,
+    [path.resolve("scripts", "drain-outbox.mjs"), "--project", dir],
+    { encoding: "utf-8", env: { ...process.env, HOME: dir } });
+  const all = (r.stdout ?? "") + (r.stderr ?? "");
+  assert.notEqual(r.status, 0, "本地问题要非零退出");
+  assert.match(all, /0002\.json/u, "**要点名是哪个文件**：" + all.slice(0, 300));
+  assert.match(all, /本地记录的问题/u, "要说清是本地问题");
+  assert.equal(/undefined/u.test(all), false, "**不许打出 undefined**");
+  // 「排空失败」会把人支去查飞书 —— 本地问题不该用这个词。
+  assert.equal(/排空失败/u.test(all), false, "本地问题不许说成排空失败");
+});
+
+test("outbox 读不出来时不许说成「0 处说不清」", () => {
+  // 统一守卫对读取失败返回 count: 0，照着"N 处"的模板渲染会打出"0 处说不清" ——
+  // 那句话既不成立、也没法照着排查。
+  // **"目录读不出来"和"某几条记录解释不了"要分开说。**
+  const { dir, obDir } = drainFixture({ "0001.json": outboxRecord({ text: "x" }) });
+  // 把 outbox 换成一个普通文件 —— 它不是目录。
+  fs.rmSync(obDir, { recursive: true });
+  fs.writeFileSync(obDir, "我不是目录");
+  const r = spawnSync(process.execPath,
+    [path.resolve("scripts", "drain-outbox.mjs"), "--project", dir],
+    { encoding: "utf-8", env: { ...process.env, HOME: dir } });
+  const all = (r.stdout ?? "") + (r.stderr ?? "");
+  assert.notEqual(r.status, 0);
+  assert.match(all, /不是目录/u, "**要说清是目录本身的问题**：" + all.slice(0, 300));
+  assert.equal(/0 处说不清/u.test(all), false, "**不许打出「0 处说不清」**");
+});
+
+test("只有坏 JSON 的 outbox 不许被报成「空」", () => {
+  // 评审实测三种，全都被报成 empty 或完全无输出：
+  //   · outbox 只有一份坏 JSON → drainProject 返回 {status:"empty"}
+  //   · outbox 路径是普通文件 → 仍返回 empty
+  //   · 真实 Stop 面对这种 outbox → **完全无输出**
+  // 根因是"空"的判断跑在审计之前，而 listPending 把这些都吞了。
+  const { dir } = drainFixture({ "0001.json": "{ 这不是 JSON" });
+  let published = 0;
+  const send = () => { published += 1; return "om_x"; };
+  const diag = () => ({ kind: PUBLISH_FAILURE.TRANSIENT });
+  const r = drainProject({
+    root: dir, publish: send, diagnose: diag,
+  });
+  assert.notEqual(r.status, "empty", "**读不出来不等于没有东西可发**");
+  assert.equal(r.status, "error");
+  assert.equal(r.local, true);
+  assert.equal(published, 0, "零发布器调用");
+
+  // 真实 Stop 也必须出声，而不是静默退出。
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-l6-h2-"));
+  const registryFile = path.join(home, "registry.json");
+  fs.writeFileSync(registryFile, JSON.stringify({ projects: [{
+    id: "l6b", root: dir, name: "P", root_message_id: "om_fixture",
+    expires_at: "2099-01-01T00:00:00Z",
+  }] }));
+  const stopHook = path.join(path.resolve("scripts"), "stop-hook.mjs");
+  // **不许带 last_assistant_message。**
+  //
+  // 评审指出：带了答复，钩子会先追加一条正常 reply，
+  // 于是 outbox 里就不再是"只有坏文件"—— **这条测试就绕开了它要测的场景**。
+  // 上一版我正是这么写的，测了个寂寞。
+  const st = spawnSync(process.execPath, [stopHook], {
+    input: JSON.stringify({ session_id: "s1", cwd: dir }),
+    encoding: "utf-8",
+    env: { ...process.env, FEISHU_BRIDGE_REGISTRY: registryFile, HOME: home },
+  });
+  const said = (st.stdout ?? "") + (st.stderr ?? "");
+  // 前提：**那份坏文件必须原封不动**。钩子自己可能写别的东西（到期预警），
+  // 但它不许把坏文件处理掉、也不许因此绕开审计。
+  assert.equal(fs.readFileSync(path.join(dir, ".runtime-data", "outbound", "outbox",
+    "0001.json"), "utf-8"), "{ 这不是 JSON", "**坏文件一个字节都不许动**");
+  assert.notEqual(said.trim(), "", "**Stop 不许完全不出声**");
+  assert.match(said, /本地记录的问题/u);
+  assert.match(said, /0001\.json/u, "要点名");
 });
 
 

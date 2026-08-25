@@ -13,7 +13,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { normalizeLocalInput } from "./turn-input.mjs";
 import { isDirectRun, moduleRoot } from "./direct-run.mjs";
-import { usableGeneration } from "./topic-generation.mjs";
+import { generationTargetState, usableGeneration } from "./topic-generation.mjs";
+import { isCanonicalIso } from "./canonical-time.mjs";
 
 /**
  * `reply` 是一轮对话的**原文答复**，由 Stop 钩子从 last_assistant_message 直接取，
@@ -331,4 +332,159 @@ if (isDirectRun(import.meta.url)) {
     process.exit(r.reason === "duplicate" ? 0 : 1);
   }
   console.log("已记录 " + r.id + " → " + path.basename(ROOT));
+}
+
+/**
+ * 这条记录**取得了自动发布授权**吗。
+ *
+ * `publish_eligible_at` 是授权字段，不是普通时间戳：它一旦为真，
+ * Stop、watcher、兜底调度器都会把这条内容发到飞书。
+ *
+ * 上一版的筛选是"非空字符串就算数" —— 评审实测把它设成
+ * `not-a-canonical-time`，审计照样 ok:true，**自动发布真的调了发布器**。
+ * 一个畸形的值被当成了人的授权。
+ *
+ * **判据只有这一份**：筛选、审计、锁内快照都走它。
+ */
+export const hasPublishAuthorization = (rec) => isCanonicalIso(rec?.publish_eligible_at);
+
+export function explainabilityGaps(rec) {
+  const gaps = [];
+  // **trim 后非空**，不是"长度大于 0"。生产入口生成的 id 不可能是纯空白，
+  // 而 id:"   " 在上一版能通过 —— 于是一条谁也认不出来的记录被成功抑制。
+  const str = (v) => typeof v === "string" && v.trim().length > 0;
+  if (!str(rec?.id)) gaps.push("id");
+  // **判据要跟生产入口对齐。**上一版只要求"非空字符串"，于是
+  // kind:"not-a-kind" 被判为正常并成功抑制 —— 而 appendEvent 根本造不出这种记录。
+  // 评审实测复现。**审计放行的集合不该比生产能产出的集合更大**：
+  // 多出来的那部分谁也说不清是怎么来的，而抑制是不可逆的。
+  if (!KINDS.includes(rec?.kind)) gaps.push("kind");
+  // 同理：appendEvent 要求正文 trim 后非空（empty_text 会被拒），审计也要求同一条。
+  if (typeof rec?.text !== "string" || rec.text.trim().length === 0) gaps.push("text");
+  if (!isCanonicalIso(rec?.created_at)) gaps.push("created_at");
+  // **授权字段只接受 null 或规范时间。**别的值一律说不清 ——
+  // 而"说不清的授权"会被下游当成真的授权。
+  const auth = rec?.publish_eligible_at;
+  if (auth !== undefined && auth !== null && !isCanonicalIso(auth)) {
+    gaps.push("publish_eligible_at");
+  }
+  // **目标代际也要在这一层看见。**
+  //
+  // 上一版没验它：一条字段齐全的记录只要把 target_channel_generation_id
+  // 写成纯空白，审计就报干净、统一守卫返回 null。查看器之所以能拦住，
+  // 是因为它**自己又查了一次** —— 所谓"唯一守卫"实际上是两份判据，
+  // 而这正是这条线上反复被罚的那件事。
+  // 抑制核心的 corruptTargets 保留作纵深防御，但判定从这里开始。
+  if (generationTargetState(rec) === "corrupt") gaps.push("target_channel_generation_id");
+  return gaps;
+}
+
+/**
+ * **这个 outbox 现在能不能动？** 不可逆入口只认这一项。
+ *
+ * 上一轮的毛病就是"核心接了、消费方没接"：unexplainable 在核心里生成了，
+ * 两侧 CLI 的预览和查看器都还只看 unclassified —— 于是预览 exit 0 说可以加
+ * --apply，落盘时才被拒。**预览和执行给出相反结论**，这是同一个坑的第二次。
+ *
+ * 所以把"能不能动"收成一个函数：新增一类阻断因素时，所有入口自动跟上，
+ * 而不是等哪个消费方漏接了被评审逮到。
+ *
+ * @returns null 表示可以动；否则是该报的原因（含 count/files）。
+ */
+export function outboxMutationBlocker(audit) {
+  if (!audit || audit.ok !== true) {
+    return { reason: audit?.reason ?? "outbox_unreadable", count: 0, files: [] };
+  }
+  for (const [key, reason] of [
+    ["unclassified", "outbox_unclassified"],
+    ["unexplainable", "outbox_unexplainable"],
+  ]) {
+    const hits = audit[key] ?? [];
+    if (hits.length > 0) {
+      return { reason, count: hits.length, files: hits.map((u) => u.file), details: hits };
+    }
+  }
+  return null;
+}
+
+export function auditOutbox(outboxDir) {
+  let files;
+  try {
+    const st = fs.statSync(outboxDir);
+    if (!st.isDirectory()) return { ok: false, reason: "outbox_not_a_directory" };
+    files = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json"));
+  } catch (err) {
+    // 不存在 = 还没发过东西，合法的空。其他错误（权限等）说不清，拦住。
+    if (err.code === "ENOENT") {
+      return { ok: true, pending: 0, unclassified: [], unexplainable: [], files: [] };
+    }
+    return { ok: false, reason: "outbox_unreadable" };
+  }
+  let pending = 0;
+  const unclassified = [];
+  const unexplainable = [];
+  for (const f of files) {
+    let rec;
+    try { rec = JSON.parse(fs.readFileSync(path.join(outboxDir, f), "utf-8")); }
+    catch { unclassified.push({ file: f, why: "读不出来" }); continue; }
+    if (rec === null || typeof rec !== "object" || Array.isArray(rec)) {
+      unclassified.push({ file: f, why: "不是记录对象" }); continue;
+    }
+    // **能不能归三态，和能不能解释这条记录，是两回事。**
+    //
+    // 上一版只验对象类型和发布三态，于是
+    // `{"published_at":null,"target_channel_generation_id":"gen-1"}`
+    // 得到 pending:1、unclassified:[] —— 一条没有 id、没有 kind、没有正文、
+    // 没有时间的文件被判成合法待发，然后被**永久抑制**。
+    // 抑制是不可逆的：连"这是什么"都说不出来的东西，不能替它做这个决定。
+    //
+    // 这里要的不是"字段齐全"，而是**足以解释它**：是什么、什么时候、哪一类。
+    // 真实历史记录（含升级前那批）这四样都有，收紧不会误伤。
+    const missing = explainabilityGaps(rec);
+    // **分开报，不并进 unclassified。**
+    // "三态判不出来"和"这条记录解释不了"是两个问题：前者是不知道它处于
+    // 什么状态，后者是知道状态但不知道它是什么。混成一个字段，读的人
+    // 就会把两种完全不同的处置方式当成一种 —— 这仓库为"字段名让人误读"
+    // 罚过一次了。归类照常进行；能不能对它动手，由调用方按这个字段决定。
+    if (missing.length > 0) {
+      unexplainable.push({ file: f, why: "缺少解释这条记录所必需的字段：" + missing.join("、") });
+    }
+    // **三态要严格校验字段的类型，不能只看"有没有这个键"。**
+    // 评审实测：published_at 放 false / 0 / {} / "" 时，上一版都当成"已发布"
+    // 静默跳过 —— 一批损坏记录就这样被永久藏起来，门槛还照样放行。
+    //
+    //   suppressed：publish_suppressed_at 是非空字符串
+    //   pending   ：published_at === null
+    //   published ：published_at 是非空字符串
+    // 三样都不是 → 说不清，拦住。
+    // **三态必须互斥。**上一版只要 publish_suppressed_at 是非空串就判 suppressed，
+    // 不管 published_at 是什么 —— 一条"既发过又被停过"的自相矛盾记录会被静默接受。
+    // 停发的前提就是它还没发出去；两个字段同时有值，说明这条记录的状态是坏的。
+    const sup = rec.publish_suppressed_at;
+    if (sup !== undefined && sup !== null) {
+      // **复用规范时间校验，不自己判"非空字符串"。**
+      // 纯空白、"abc"、"2026-13-45" 都能通过"非空"，却都不是时间 ——
+      // 判据松一点，损坏记录就又被当成合法状态藏起来。
+      if (!isCanonicalIso(sup)) {
+        unclassified.push({ file: f, why: "publish_suppressed_at 不是规范时间" });
+        continue;
+      }
+      if (rec.published_at !== null) {
+        unclassified.push({ file: f, why: "既标了已发布又标了已停发，状态自相矛盾" });
+        continue;
+      }
+      continue;                                                          // suppressed
+    }
+    if (!("published_at" in rec)) {
+      unclassified.push({ file: f, why: "缺 published_at，无法归类" }); continue;
+    }
+    const pub = rec.published_at;
+    if (pub === null) { pending += 1; continue; }                        // pending
+    if (isCanonicalIso(pub)) continue;                                  // published
+    unclassified.push({ file: f, why: "published_at 既不是 null 也不是规范时间" });
+  }
+  // **files 是这个目录里全部 JSON 的文件名**，不只是待发那些。
+  // 抑制的 CAS 要用它：只比"待发集合"的话，一个坏 JSON 对 CAS 完全不可见 ——
+  // 预览到落盘之间冒出来一个，集合前后一模一样，一路放行。评审实测复现。
+  return { ok: true, pending, unclassified, unexplainable, files: [...files] };
 }

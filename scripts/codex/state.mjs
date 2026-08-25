@@ -122,6 +122,103 @@ export function loadCodexTemplate(file = templateFile()) {
   return loaded;
 }
 
+/**
+ * **登记表文档的身份契约 —— 读和写前共用这一份。**
+ *
+ * 上一版写前只查了启用条目的几个重复字段：评审实测登记表已有停用 key `same` 时，
+ * addTask 仍能新增启用 key `same` 并返回成功，**落盘后的登记表立刻变成不可读**。
+ * 写入把一份自己都读不回来的文档固化下来，比拒绝写入糟得多。
+ *
+ * 覆盖：形状、停用条目的存储身份、key 字符集、大小写折叠判重、id 契约。
+ * 纯函数，不碰文件。
+ */
+export function validateRegistryDocument(parsed) {
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, reason: "registry_malformed", detail: "根节点不是对象" };
+  }
+  if (parsed.tasks !== undefined && !Array.isArray(parsed.tasks)) {
+    return { ok: false, reason: "registry_malformed", detail: "tasks 不是数组" };
+  }
+  const entries = (parsed.tasks ?? []).map((raw, index) => ({ index, raw }));
+  const malformed = [];
+  // ■ 第一遍：**身份**。覆盖整张原始表，**含停用条目**。
+  //
+  // 上一版在判重之前就把停用条目 continue 掉了 —— 评审实测：
+  // 一条停用 task 和一条启用 task 用完全相同的 key，loadRegistry 仍报 ok，
+  // 两者的 outbox 和锁路径完全相同，**启用的那条会去动停用那条的历史内容**。
+  // 停用不代表它不占存储身份：目录还在，里面的东西还在。
+  const derived = new Map();
+  const ids = new Map();
+  for (const { index: i, raw } of entries) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      malformed.push({ index: i, why: "不是 task 对象" }); continue;
+    }
+    // **停用的条目只查"它占不占存储身份"。**
+    //
+    // 判据要精确到这一点：停用不代表它不占目录（目录还在，里面的东西还在），
+    // 但一条连 key 都没有的停用条目跟谁都撞不上，没有理由把整张表判坏。
+    // 启用的条目仍然全查。
+    const disabled = raw.enabled === false;
+    const hasKey = typeof raw.logical_task_key === "string" && raw.logical_task_key !== "";
+    if (disabled && !hasKey) continue;
+    if (!disabled && (typeof raw.root !== "string" || !path.isAbsolute(raw.root))) {
+      malformed.push({ index: i, why: "root 不是绝对路径" }); continue;
+    }
+    if (!hasKey) {
+      malformed.push({ index: i, why: "缺 logical_task_key" }); continue;
+    }
+    // **key 的字符集要跟生成端一致。**存储目录是 safeKey(key) 算出来的，
+    // 它把非法字符统一换成 `_`：`a/b` 和 `a?b` 会落到同一个 tasks/a_b/。
+    if (!/^[A-Za-z0-9_-]+$/u.test(raw.logical_task_key)) {
+      malformed.push({ index: i, why: "logical_task_key 含非法字符（只允许 A-Za-z0-9_-）" });
+      continue;
+    }
+    // **按目标文件系统的等价关系判重。**本机默认大小写不敏感：
+    // Task-A 和 task-a 是两个不同的 key，却指向同一个 inode。
+    const storage = safeKey(raw.logical_task_key).toLowerCase();
+    if (derived.has(storage)) {
+      malformed.push({ index: i,
+        why: "存储键与 #" + derived.get(storage) + " 在大小写折叠后相同（都是 " + storage + "）" });
+    } else {
+      derived.set(storage, i);
+    }
+    // **id：缺失才补；存在就必须等于 key。**
+    // 用 Object.hasOwn 判"存在"，不能用 ?? —— 那会把显式的 "id": null
+    // 当成缺失并静默改成 key，而显式空值是**说不清**，不是缺省。
+    if (Object.hasOwn(raw, "id") && raw.id !== raw.logical_task_key) {
+      malformed.push({ index: i,
+        why: "id 与 logical_task_key 不一致（id=" + JSON.stringify(raw.id).slice(0, 40) + "）" });
+      continue;
+    }
+    if (ids.has(raw.logical_task_key)) {
+      malformed.push({ index: i, why: "id 与 #" + ids.get(raw.logical_task_key) + " 相同" });
+    } else {
+      ids.set(raw.logical_task_key, i);
+    }
+  }
+
+  if (malformed.length > 0) {
+    return { ok: false, reason: "registry_malformed",
+      detail: malformed.map((m) => "#" + m.index + "（" + m.why + "）").join("、"),
+      entries: malformed };
+  }
+  // **活动视图的重复绑定字段也归这一份。**
+  //
+  // 上一版 loadRegistry 调两个校验器，写入口只调了其中一个 —— 评审实测：
+  // 两条活动记录 key 分别是 a、b、codex_thread_id 相同时，
+  // loadRegistry 正确拒绝（duplicate_binding），validateRegistryDocument 却 ok:true，
+  // 于是"坏表被隐式修好"照旧存在，**只是我上一条测试恰好选了重复存储键，
+  // 正好落在第一层校验里**。
+  // 一个"共用校验器"只要还有第二份判据在外面，它就不叫共用。
+  const dup = validateRegistryTasks((parsed.tasks ?? []).filter(
+    (t) => t && typeof t === "object" && t.enabled !== false));
+  if (!dup.ok) {
+    return { ok: false, reason: "duplicate_binding",
+      detail: "重复绑定字段：" + dup.duplicateFields.join("、"),
+      duplicateFields: dup.duplicateFields };
+  }
+  return { ok: true };
+}
 export function loadRegistry(file = registryFile()) {
   let parsed;
   try {
@@ -130,19 +227,171 @@ export function loadRegistry(file = registryFile()) {
     if (err.code === "ENOENT") return { ok: true, file, tasks: [], reason: "no_registry" };
     return { ok: false, file, tasks: [], reason: "registry_unreadable", error: err.message };
   }
-  const tasks = [];
-  for (const task of parsed.tasks ?? []) {
-    if (!task || task.enabled === false) continue;
-    if (typeof task.root !== "string" || !path.isAbsolute(task.root)) continue;
-    if (typeof task.logical_task_key !== "string" || !task.logical_task_key) continue;
-    tasks.push({ ...task, id: task.id ?? task.logical_task_key });
+  // **结构异常要 fail-closed，不能靠"访问它时会不会抛"来兜。**
+  //
+  // 评审实测：根节点是 null 或 tasks 是 {} 时两条定位路径都抛 TypeError；
+  // 根节点是 [] 时被误报成"目标不存在"——**坏掉的登记表被说成没有这条 task**，
+  // 人会去查绑定、去重新绑，而问题在别处。
+  // 上一轮我只透传了 loadRegistry 已经结构化返回的故障，没管它自己不校验结构。
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, file, tasks: [], reason: "registry_malformed",
+      detail: "根节点不是对象" };
   }
-  const valid = validateRegistryTasks(tasks);
-  if (!valid.ok) return { ok: false, file, tasks: [], ...valid };
+  if (parsed.tasks !== undefined && !Array.isArray(parsed.tasks)) {
+    return { ok: false, file, tasks: [], reason: "registry_malformed",
+      detail: "tasks 不是数组" };
+  }
+  // **身份契约跟写入口共用一份** —— 读放行的和写放行的必须是同一个集合。
+  const verdict = validateRegistryDocument(parsed);
+  if (!verdict.ok) return { ok: false, file, tasks: [], ...verdict };
+  const tasks = [];
+
+  // 身份都验过了，这里才轮到"停用的不参与后续"。
+  for (const raw of parsed.tasks ?? []) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    if (raw.enabled === false) continue;
+    if (typeof raw.logical_task_key !== "string" || !raw.logical_task_key) continue;
+    tasks.push({ ...raw, id: Object.hasOwn(raw, "id") ? raw.id : raw.logical_task_key });
+  }
+
   return { ok: true, file, tasks, schemaVersion: parsed.schema_version ?? "1.0" };
 }
 
-export function writeRegistry(tasks, file = registryFile()) {
+/**
+ * **登记表的唯一写入口：读原文档、就地改目标条目、写回。**
+ *
+ * ■ 为什么必须这样
+ *
+ * loadRegistry 返回的是**过滤后的活动视图**（停用条目已经不在里面）。
+ * 而此前七个写路径都是"改视图里的对象 → writeRegistryFixtureUnvalidated(reg.tasks)"——
+ * 后者从零重建 `{schema_version, runtime, tasks}`。两件事叠在一起：
+ *   · 停用条目**被静默删掉**；
+ *   · 顶层未知字段**被静默删掉**；
+ *   · 条目上的未知字段也一样。
+ * 评审实测："启用 A + 停用 B + 顶层扩展字段"，只改 A 的显示名，
+ * 落盘后 B 和顶层字段都没了，而调用方拿到的是 ok:true。
+ *
+ * 迁移逻辑里本来就写着"视图 + 重建会静默删数据"——**普通写路径还在重复它**。
+ *
+ * ■ 契约
+ *
+ * mutate 拿到的是**原始 tasks 数组**（含停用条目、含未知字段），就地改。
+ * 返回 false 表示什么都没改（不写盘）。除 tasks 外的顶层字段原样保留。
+ * 调用方**只读热路径**仍然可以用 loadRegistry 的活动视图 —— 那是安全的；
+ * 危险的只有"拿视图去重建整表"。
+ */
+/**
+ * **就地替换原始数组里的那一条** —— 而不是往上叠字段。
+ *
+ * `Object.assign` 只能加和改，**删不掉**。评审实测：恢复连接时视图副本里
+ * `delete task.paused_at` 了，落盘却仍留着 paused_at ——
+ * 磁盘上的状态同时声称"active"和"曾在当前记录中暂停"。
+ * **删除语义在 assign 那条路上根本到不了盘。**
+ *
+ * 保真规则仍然守住："原来没有 id 就仍然没有" ——
+ * 视图里的 id 是 loadRegistry 补的，不是文档里本来就有的。
+ */
+export function replaceRawTask(raw, task) {
+  const found = findRawTask(raw, task);
+  if (!found.ok) return found;
+  const at = raw.indexOf(found.entry);
+  const next = { ...task };
+  if (!Object.hasOwn(found.entry, "id")) delete next.id;
+  raw[at] = next;
+  return { ok: true, entry: next };
+}
+
+export function mutateRegistryDocument(file, mutate) {
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(file, "utf-8")); }
+  catch (err) {
+    // **不存在 = 空文档**，首次写入本来就要把它建出来。
+    // 其余读取错误说不清 —— 那时候写回去会覆盖掉一份我们没读懂的文件。
+    if (err.code === "ENOENT") parsed = { schema_version: "1.0", runtime: "codex", tasks: [] };
+    else return { ok: false, reason: "registry_unreadable" };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, reason: "registry_malformed" };
+  }
+  if (parsed.tasks !== undefined && !Array.isArray(parsed.tasks)) {
+    return { ok: false, reason: "registry_malformed" };
+  }
+  // **回调之前先校验原文档。**
+  //
+  // 上一版只在改完之后校验：评审构造了一张因重复存储键而被 loadRegistry 拒绝的表，
+  // 让回调删掉冲突项 —— 修改前读不出来、mutateRegistryDocument 却返回 ok:true，
+  // **坏表被悄悄覆盖成一张新表**。
+  // 那既不符合"读放行的和写放行的是同一个集合"，也等于给普通写入口
+  // 发了一张**未经授权的隐式修复许可**。修表是人的决定，不是写显示名的副作用。
+  const before = validateRegistryDocument(parsed);
+  if (!before.ok) return { ok: false, ...before };
+
+  const raw = parsed.tasks ?? [];
+  const changed = mutate(raw);
+  // mutate 可以返回 { ok:false, reason } 中止 —— **"找不到目标"必须是错误，
+  // 不是"没改动"**：后者会让调用方宣称成功。
+  if (changed && changed.ok === false) return { ...changed, file };
+  if (changed === false) return { ok: true, changed: false, file };
+  // 改完再校验一次：前一次保证 fail-closed，这一次保证不会写坏。
+  // 写入把一份自己都读不回来的文档固化下来，比拒绝写入糟得多。
+  const verdict = validateRegistryDocument({ ...parsed, tasks: raw });
+  if (!verdict.ok) return { ok: false, ...verdict };
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  // **顶层原样保留** —— 只换 tasks。
+  const next = { ...parsed, tasks: raw };
+  if (fs.existsSync(file)) fs.copyFileSync(file, file + ".prev");
+  const tmp = file + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  return { ok: true, changed: true, file };
+}
+
+/**
+ * 在原始 tasks 数组里定位那一条 —— **按全表唯一的存储键精确定位**。
+ *
+ * 上一版写的是"key 相同 **或** thread 相同"，评审实测：
+ * 停用旧条目与启用新条目 thread 相同、key 不同时，改新条目的显示名
+ * **先命中了停用那条**，随后它被覆盖成新条目的身份 —— 调用返回 ok:true，
+ * 登记表却出现重复 key/id，下一次读取直接 registry_malformed。
+ * **"或"在定位上等于放宽，而定位放宽就是改错东西。**
+ *
+ * 零项和多项都必须失败，不许当成 changed:false ——
+ * "什么都没找到"和"不需要改"是两回事。
+ */
+export function findRawTask(raw, task) {
+  const want = safeKey(task?.logical_task_key ?? "").toLowerCase();
+  if (!want) return { ok: false, reason: "entry_key_missing" };
+  const hits = (raw ?? []).filter((t) =>
+    t && typeof t === "object" && typeof t.logical_task_key === "string"
+    && safeKey(t.logical_task_key).toLowerCase() === want);
+  if (hits.length === 0) return { ok: false, reason: "entry_gone" };
+  if (hits.length > 1) return { ok: false, reason: "entry_ambiguous", count: hits.length };
+  const hit = hits[0];
+  // **其他身份字段存在就必须对得上** —— 对不上说明这不是同一条。
+  if (task?.codex_thread_id && hit.codex_thread_id
+      && hit.codex_thread_id !== task.codex_thread_id) {
+    return { ok: false, reason: "entry_identity_mismatch" };
+  }
+  return { ok: true, entry: hit };
+}
+
+/**
+ * **只给测试用的夹具写入口。生产路径一律走 mutateRegistryDocument。**
+ *
+ * 名字里带 FixtureUnvalidated 是刻意的：上一版我只在注释里写"用途写死在名字"
+ * 和"有一条测试盯着这件事"——**而函数还叫 writeRegistry，那条测试也不存在**。
+ * 又一次把设计意图写成了已实现的行为。现在名字和守卫都补上了。
+ *
+ * 它从零重建 { schema_version, runtime, tasks } —— 顶层未知字段会丢，
+ * 而且不走完整文档校验：评审实测 writeRegistryFixtureUnvalidated([{ x: 1 }]) 成功、
+ * 随后 loadRegistry 直接 registry_malformed。
+ * 只要它还是一个不校验的公开写入口，"唯一写入口"这句话就不成立。
+ *
+ * 保留它是因为 86 处测试夹具靠它构造初始状态（**包括故意构造坏表**），
+ * 那是合法用途。所以这里不加校验，而是把用途写死在名字和这段话里：
+ * **生产代码里再出现它就是错的**，有一条测试盯着这件事。
+ */
+export function writeRegistryFixtureUnvalidated(tasks, file = registryFile()) {
   const valid = validateRegistryTasks(tasks);
   if (!valid.ok) throw new Error("registry 存在重复绑定字段：" + valid.duplicateFields.join(", "));
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -165,7 +414,8 @@ export function addTask(task, { home = bridgeHome() } = {}) {
     if (reg.tasks.some((t) => t.codex_thread_id === task.codex_thread_id)) {
       return { ok: false, reason: "thread_already_bound" };
     }
-    writeRegistry([...reg.tasks, task], file);
+    const wrote = mutateRegistryDocument(file, (rawTasks) => { rawTasks.push(task); });
+    if (!wrote.ok) return wrote;
     return { ok: true, task };
   } catch (err) {
     return { ok: false, reason: "registry_unwritable", error: err.message };
@@ -332,7 +582,14 @@ export function setTaskConnectionStatus({
     const materialized = materializeLegacyTopicFields(task, loaded.state);
     if (!materialized.ok) return materialized;
     Object.assign(task, materialized.record);
-    writeRegistry(reg.tasks, file);
+    // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
+    // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
+    const wrote = mutateRegistryDocument(file, (rawTasks) => {
+      const done = replaceRawTask(rawTasks, task);
+      if (!done.ok) return done;            // 找不到 / 有歧义 → 错误，不是"没改动"
+      return true;
+    });
+    if (!wrote.ok) return wrote;
     return { ok: true, changed: true, task };
   } catch (err) {
     return { ok: false, reason: "registry_unwritable", error: err.message };
@@ -374,7 +631,14 @@ export function refreshPendingTaskBinding({
     if (!materialized.ok) return materialized;
     Object.assign(task, materialized.record);
     task.pending_refreshed_at = new Date(now).toISOString();
-    writeRegistry(reg.tasks, file);
+    // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
+    // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
+    const wrote = mutateRegistryDocument(file, (rawTasks) => {
+      const done = replaceRawTask(rawTasks, task);
+      if (!done.ok) return done;            // 找不到 / 有歧义 → 错误，不是"没改动"
+      return true;
+    });
+    if (!wrote.ok) return wrote;
     return { ok: true, task };
   } catch (err) {
     return { ok: false, reason: "registry_unwritable", error: err.message };
@@ -396,7 +660,14 @@ export function setTaskDisplayName({ threadId, name, home = bridgeHome() } = {})
     const task = reg.tasks.find((t) => t.codex_thread_id === threadId);
     if (!task) return { ok: false, reason: "thread_not_registered" };
     task.task_display_name = name.trim();
-    writeRegistry(reg.tasks, file);
+    // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
+    // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
+    const wrote = mutateRegistryDocument(file, (rawTasks) => {
+      const done = replaceRawTask(rawTasks, task);
+      if (!done.ok) return done;            // 找不到 / 有歧义 → 错误，不是"没改动"
+      return true;
+    });
+    if (!wrote.ok) return wrote;
     return { ok: true, task };
   } catch (err) {
     return { ok: false, reason: "registry_unwritable", error: err.message };
@@ -445,6 +716,16 @@ function writeRawRegistry(doc, file) {
 function scanAutoPublish(doc) {
   if (doc === null) return { ok: true, total: 0, pendingRefs: [], names: [] };
   if (!Array.isArray(doc.tasks)) return { ok: false, reason: "registry_shape_unexpected" };
+  // **迁移也要过共用契约。**
+  //
+  // 上一版这里只查数组/对象形状，写回又走另一套 writeRawRegistry ——
+  // 评审实测：两条 codex_thread_id 重复的登记，主读取器返回 duplicate_binding，
+  // 而 enableAutoPublishForAllTasks({apply:true}) 返回 ok:true、改了两个条目、
+  // **写完登记表仍然不可读**。
+  // 那违反"读、写前、写后接受同一集合"，而且它是我漏掉的第二条整表写路径 ——
+  // 我之前扫的是 writeRegistry(，`writeRawRegistry(` 根本不匹配。
+  const verdict = validateRegistryDocument(doc);
+  if (!verdict.ok) return { ok: false, ...verdict };
   const pendingRefs = [];
   for (const task of doc.tasks) {
     if (!task || typeof task !== "object" || Array.isArray(task)) {
@@ -579,6 +860,9 @@ export function enableAutoPublishForAllTasks({ home = bridgeHome(), apply = fals
 
     if (scan.pendingRefs.length > 0) {
       for (const task of scan.pendingRefs) task.auto_publish_on_completion = true;
+      // 改完再校验一次：前一次保证 fail-closed，这一次保证不会写坏。
+      const after = validateRegistryDocument(snap.doc);
+      if (!after.ok) return { ok: false, ...after };
       writeRawRegistry(snap.doc, file);
     }
     // 零变更也留回执：否则"跑过但本来就没东西可改"和"从没跑过"分不开。
@@ -790,7 +1074,14 @@ export function promoteTask({
     Object.assign(task, materialized.record, {
       inbound_bound_at: new Date(now).toISOString(),
     });
-    writeRegistry(reg.tasks, file);
+    // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
+    // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
+    const wrote = mutateRegistryDocument(file, (rawTasks) => {
+      const done = replaceRawTask(rawTasks, task);
+      if (!done.ok) return done;            // 找不到 / 有歧义 → 错误，不是"没改动"
+      return true;
+    });
+    if (!wrote.ok) return wrote;
     return {
       ok: true,
       task,
@@ -827,7 +1118,14 @@ function mutateTaskTopicState({
     const materialized = materializeLegacyTopicFields(task, changed.state);
     if (!materialized.ok) return materialized;
     Object.assign(task, materialized.record);
-    writeRegistry(reg.tasks, file);
+    // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
+    // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
+    const wrote = mutateRegistryDocument(file, (rawTasks) => {
+      const done = replaceRawTask(rawTasks, task);
+      if (!done.ok) return done;            // 找不到 / 有歧义 → 错误，不是"没改动"
+      return true;
+    });
+    if (!wrote.ok) return wrote;
     return { ...changed, task };
   } catch (err) {
     return { ok: false, reason: "registry_unwritable", error: err.message };
@@ -922,7 +1220,14 @@ function mutateTaskInteractionPolicy({
       const materialized = materializeInteractionPolicy(task, changed.state);
       if (!materialized.ok) return materialized;
       Object.assign(task, materialized.record);
-      writeRegistry(reg.tasks, file);
+      // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
+    // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
+    const wrote = mutateRegistryDocument(file, (rawTasks) => {
+      const done = replaceRawTask(rawTasks, task);
+      if (!done.ok) return done;            // 找不到 / 有歧义 → 错误，不是"没改动"
+      return true;
+    });
+    if (!wrote.ok) return wrote;
     }
     return { ...changed, task };
   } catch (err) {

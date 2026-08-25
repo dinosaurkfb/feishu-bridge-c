@@ -142,6 +142,8 @@ async function main() {
   // 只有真的进了 notes 的项目才算"报过"。
   const reported = [];
 
+  // 这一轮真给哪些项目写过东西 —— 排空的分级判断按它来，不按"被归属到哪些"。
+  const wroteThisTurn = new Set();
   for (const project of attributed) {
     // 先解析出**这一轮该用哪条绑定**：有会话级绑定且对得上就用它，否则回落到项目级。
     // outbox 目录必须跟着绑定走，不能跟着「说话的那个会话」走 ——
@@ -201,7 +203,10 @@ async function main() {
       // 成功后保留本轮单文件缓存，直到下一次 UserPromptSubmit 原子覆写。这样 Stop hook
       // 若在同一回合重入，仍会拿到相同 capture_id 并命中事件级幂等；立即删除反而会让
       // 第二次 Stop 退回正文指纹，制造一条没有输入块的重复答复。
-      if (r.ok) log(project.id + " reply queued (" + reply.length + " 字符)");
+      if (r.ok) {
+        wroteThisTurn.add(project.root);
+        log(project.id + " reply queued (" + reply.length + " 字符)");
+      }
     } else if (!reply && speakingSession && project.via.includes("cwd")) {
       clearTurnInput({ dir: inputDir, key: speakingSession });
     }
@@ -215,11 +220,34 @@ async function main() {
         kind: warning.kind, text: warning.text, source: "binding-health",
         targetGenerationId: bound.ok ? bound.mapping?.channel_generation_id : undefined,
       });
-      if (r.ok) log(project.id + " binding warning recorded: " + warning.kind);
+      if (r.ok) {
+        // **这条也要记账。**体检预警不看 via —— 弱信号归属的项目也会被写进一条。
+        // 漏记的话下面那道分级判断会把它跳过，**预警就永远发不出去**。
+        wroteThisTurn.add(project.root);
+        log(project.id + " binding warning recorded: " + warning.kind);
+      }
     }
 
     // 空 outbox 的项目连守望者都不用问 —— 这是最常见的情况，越早返回越好。
     if (listPending({ outboxDir }).length === 0) continue;
+
+    // **弱信号归属的项目：只在这一轮真给它写过东西时才排空。**
+    //
+    // 两个信号的强弱本来就不一样，而上一版只在**写入**那一侧区分了
+    // （appendEvent 要求 via 含 cwd），排空这一侧没分 —— 于是
+    // transcript 归属带来的唯一效果，就是替**别人的项目**重试它自己的旧积压。
+    //
+    // 真事：我在这条会话里诊断过 cc2cd，它的路径就进了转录（119 次，只追加）。
+    // 从那以后每一轮 Stop 都去排空 cc2cd —— 而我从没给它写过一个字节，
+    // 它自己还有两条活会话在排。结果是每轮把同一条发布失败复述一遍。
+    //
+    // 弱信号存在的理由是"会话起在别处却操作了本项目，进展别卡在本地"——
+    // 而"进展"只可能由本轮写入产生，写入又只在 cwd 时发生。
+    // **所以这里收窄不会让任何进展卡住**：别人的积压有它自己的会话和兜底定时器。
+    if (!project.via.includes("cwd") && !wroteThisTurn.has(project.root)) {
+      log(project.id + " via=" + project.via.join("+") + " skipped (本轮没给它写过东西)");
+      continue;
+    }
 
     if (watcherActive(project.root)) {
       // 守望者会把执行结果和这批进展合成一条发。抢在它前面发就是把一次指令拆成三条消息。

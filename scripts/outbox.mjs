@@ -391,6 +391,7 @@ export function explainabilityGaps(rec) {
  *
  * @returns null 表示可以动；否则是该报的原因（含 count/files）。
  */
+
 export function outboxMutationBlocker(audit) {
   if (!audit || audit.ok !== true) {
     return { reason: audit?.reason ?? "outbox_unreadable", count: 0, files: [] };

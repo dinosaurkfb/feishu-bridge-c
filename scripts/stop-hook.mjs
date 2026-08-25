@@ -280,6 +280,21 @@ async function main() {
         (r.diagnosis.ownerName ?? "未知") + "）建的，当前身份大概率回复不进去，" +
         "重试可能一直失败。要停止重试：node " + suppressCmd() + " --project " +
         project.root + " --generation " + (r.diagnosis.generationId ?? "<代际 id>") + " --apply");
+    } else if (r.status === "error" && r.local === true) {
+      // **这不是发布失败，别让人去查飞书。**
+      //
+      // 本地 outbox 说不清（读不出来 / 归不了类 / 解释不了，含"目标代际是坏的"）——
+      // 问题在本地那几个文件里。说成"发布失败"的话，人会去查网络、凭据、话题，
+      // 而问题根本不在那边。**报错报错了地方，比不报还费时间。**
+      // 也不说"兜底定时器会重试"：重试多少次都一样，它需要人来看。
+      //
+      // 判据只有统一守卫一份 —— 这里只负责把它的结论讲清楚。
+      const which = (r.files ?? []).length ? "（" + r.files.join("、") + "）" : "";
+      const why = (r.details ?? []).map((d) => "    " + d.file + " —— " + d.why).join("\n");
+      notes.push("飞书出站：" + who + " 的本地 outbox 有 " + (r.count ?? 0) +
+        " 处说不清" + which + "。\n" +
+        "  **这不是发布失败，是本地记录的问题** —— 重试没用，需要人看一眼。整批都没有动。" +
+        (why ? "\n" + why : ""));
     } else if (r.status === "error") {
       notes.push("飞书出站：" + who + " 发布失败（" + r.reason + "），进展留在 outbox，兜底定时器会重试。");
     } else if (r.status === "skipped" && r.reason === "auto_publish_disabled") {

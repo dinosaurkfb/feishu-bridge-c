@@ -15,7 +15,9 @@ import path from "node:path";
 
 import { readRunOutcome } from "./handoff.mjs";
 import { scanRuns, buildDraft, markPublished, publishDraft } from "./outbound.mjs";
-import { listPending, markSent } from "./outbox.mjs";
+import {
+  auditOutbox, listPending, markSent, outboxMutationBlocker,
+} from "./outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { readClaim, recordClaimState } from "./claim.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
@@ -125,7 +127,21 @@ while (true) {
       //
       // 等不到锁就只发执行结果，进展那一半让给正在排空的那一方：
       // 代价是 Frank 收到两条而不是一条，而扣着执行结果不发的代价大得多。
-      const pendingOutbox = publishLock.ok ? listPending({ outboxDir: OUTBOX }) : [];
+      // **outbox 说不清就整批不带，但当轮 run 结果照发。**
+      //
+      // 这是评审明确给的例外：run 结果不是 outbox 记录，它有独立来源和回执 ——
+      // 因为本地 outbox 里躺着一个坏文件就扣着执行结果不发，代价大得多。
+      // 但 outbox 那一半必须**整批拒绝并点名**，不许"跳过坏的、把其余照发"。
+      const outboxBlocked = publishLock.ok
+        ? outboxMutationBlocker(auditOutbox(OUTBOX)) : null;
+      const pendingOutbox = (publishLock.ok && !outboxBlocked)
+        ? listPending({ outboxDir: OUTBOX }) : [];
+      if (outboxBlocked) {
+        console.error("本地 outbox 有问题（" + outboxBlocked.reason +
+          ((outboxBlocked.files ?? []).length ? "：" + outboxBlocked.files.join("、") : "") +
+          "）——**这一批 outbox 内容没有发送**，本轮执行结果照常发。" +
+          "这不是飞书故障，重试没用。");
+      }
 
       const records = [];
       if (run?.shouldPublish) {

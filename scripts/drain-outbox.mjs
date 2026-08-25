@@ -14,7 +14,9 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { listPending, markSent, composeDigest } from "./outbox.mjs";
+import {
+  auditOutbox, composeDigest, listPending, markSent, outboxMutationBlocker,
+} from "./outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { PUBLISH_FAILURE, classifyPublishFailure, publishDraft } from "./outbound.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
@@ -203,6 +205,18 @@ export function drainProject({
     // 锁内重新读一遍：刚才排队等锁的时候，别的发布者可能已经把这批发掉了。
     const pending = listPending({ outboxDir });
     if (pending.length === 0) return { status: "empty", root };
+
+    // **这个 outbox 现在能不能动 —— 只认统一守卫。**
+    //
+    // 取舍是明确的：**不要静默跳过单个坏文件后把其余照发**。
+    // 对"本次选择的这一批"整批 fail-closed 并点名；
+    // 调度器本来就按项目隔离，一个项目坏掉不会拖住别的项目。
+    //
+    // **损坏的目标代际也归它管。**审计已经把"字段在、但不是可用代际"
+    // 算进不可解释里了 —— 这里再单独判一次就是同一件事的第二份判据，
+    // 而"两份判据"正是这条线上被反复罚过的东西。
+    const blocked = outboxMutationBlocker(auditOutbox(outboxDir));
+    if (blocked) return { status: "error", root, ...blocked, local: true };
 
     const targetBatches = groupByTargetGeneration(pending).flatMap(([targetKey, records]) => {
       const target = resolveMappingOutboundGeneration(

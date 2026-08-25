@@ -21,6 +21,7 @@ import {
   HOOK_TAG, acceptsHookCommand, buildHookCommand, ownsHookCommand, parseHookCommand, pickNode,
 } from "./hook-command.mjs";
 import { composeSubscribeContext } from "./prompt-hook.mjs";
+import { recordCodexActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
 import {
   INTENT_TTL_MS, buildIntentParams, consumeIntent, intentDir, issueIntent,
 } from "./intent.mjs";
@@ -3663,10 +3664,11 @@ test("自动轮转不许被门禁卡死，也不许靠 --automatic 绕过", () =
     params: buildIntentParams("rotate", { op: "cancel" }), home }).reason, "intent_params_mismatch");
 });
 
-test("接线：决策方签的真实票要能跑进 worker，代际变了就拒", () => {
-  // **评审点名要的那条。**上一版两端各拼各的参数（签发端加了 generation、
-  // 消费端只写 project），真实 worker 到不了轮转逻辑 —— 而单测各自签各自的票，
-  // 两边都绿。这条从决策方签票开始，一路跑到真实 CLI。
+test("接线：走真实决策路径签票 → 真实 CLI 过门禁；代际变了就拒", () => {
+  // **上一版这条直接调 issueIntent —— 等于测试自己充当授权者**，
+  // 于是它证明不了"生产里那条链能走通"，也没抓住重试撞墓碑那个缺陷。
+  // 评审指出来的。现在从 recordCodexActivityAndMaybeRotate 进去，
+  // 由它自己决定、自己签字、自己把票交给 launcher。
   const home = temp();
   const root = path.join(home, "p");
   fs.mkdirSync(root, { recursive: true });
@@ -3678,32 +3680,60 @@ test("接线：决策方签的真实票要能跑进 worker，代际变了就拒"
   delete task.channel_generation_id;
   writeRegistry([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
-  const env = isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
 
   const stored = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
   const gen = activeGeneration(topicStateForTask(stored).state).channel_generation_id;
 
-  // 决策方签的票（绑住这一代）→ 真实 CLI 必须过门禁。
-  const good = issueIntent({ action: "rotate:auto", threadId: THREAD_A,
-    params: buildIntentParams("rotate:auto", { project: root, generation: gen }), home });
+  // 数到阈值 —— 让决策方自己决定要轮转。
+  let launched = null;
+  const drive = (i) => recordCodexActivityAndMaybeRotate({
+    root, threadId: THREAD_A, home, generationId: gen,
+    eventKey: "evt-" + i, messageDelta: 1,
+    spawnImpl: (bin, args) => { launched = args; return { pid: 1, unref() {} }; },
+  });
+  let decided = null;
+  for (let i = 0; i < 40 && !decided; i += 1) {
+    const r = drive(i);
+    if (r.shouldAutoRotate) decided = r;
+  }
+  assert.ok(decided, "夹具要能数到阈值");
+  assert.equal(decided.rotationLaunch?.ok, true,
+    "**决策方要能签出票并启动 worker**：" + JSON.stringify(decided.rotationLaunch));
+  assert.ok(launched, "worker 要被启动");
+
+  // 把决策方交给 worker 的那张票，喂进真实 CLI —— 必须过门禁。
+  const at = launched.indexOf("--intent");
+  assert.notEqual(at, -1, "launcher 必须把票传下去：" + JSON.stringify(launched));
+  const ticket = launched[at + 1];
+  const env = isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
   const pass = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "feishu-rotate.mjs"),
       "--project", root, "--thread-id", THREAD_A, "--automatic", "--apply",
-      "--intent", good.id],
+      "--intent", ticket],
     { encoding: "utf-8", env });
   assert.doesNotMatch(pass.stderr ?? "", /凭证/u,
-    "**决策方签的票必须过门禁**：" + pass.stderr);
+    "**决策方签的票必须过真实 CLI 的门禁**：" + pass.stderr);
 
-  // **代际变了的票要拒** —— 那是另一次决定。
-  const stale = issueIntent({ action: "rotate:auto", threadId: THREAD_A, turnId: "other",
-    params: buildIntentParams("rotate:auto", { project: root, generation: "channel_generation_" + "0".repeat(24) }), home });
-  const rejected = spawnSync(process.execPath,
-    [path.join(ROOT, "scripts", "codex", "feishu-rotate.mjs"),
-      "--project", root, "--thread-id", THREAD_A, "--automatic", "--apply",
-      "--intent", stale.id],
-    { encoding: "utf-8", env });
-  assert.match(rejected.stderr ?? "", /凭证授权的不是这一次操作/u,
-    "**代际对不上必须拒**：" + rejected.stderr);
+  // **冷却之后的新决策必须能拿到新票。**
+  //
+  // 评审实测到的：首次启动成功、票被消费，**重试请求就撞上那张墓碑**
+  //（intent_already_used）—— 自动轮转从此再也起不来。
+  // 槽位里要带上"这次决策的号"：同一次决策幂等，新决策换号拿新票。
+  let retried = null;
+  for (let i = 100; i < 160 && !retried; i += 1) {
+    const r = recordCodexActivityAndMaybeRotate({
+      root, threadId: THREAD_A, home, generationId: gen,
+      eventKey: "retry-" + i, messageDelta: 1, retryMs: 0,
+      spawnImpl: (bin, args) => { launched = args; return { pid: 1, unref() {} }; },
+    });
+    if (r.shouldAutoRotate) retried = r;
+  }
+  assert.ok(retried, "冷却之后要能再次决定轮转");
+  assert.equal(retried.rotationLaunch?.ok, true,
+    "**重试必须能拿到新票**，不该撞上上次那张墓碑：" +
+    JSON.stringify(retried.rotationLaunch));
+  const at2 = launched.indexOf("--intent");
+  assert.notEqual(launched[at2 + 1], ticket, "新决策要拿到不同的票");
 });
 
 test("签发是原子的：并发只产生一个授权，消费后不许重签", () => {
@@ -3811,6 +3841,59 @@ test("轮转脚本真实入口：人工票不能拿去跑 --automatic", () => {
     JSON.stringify({ status: r2.status, stderr: r2.stderr }).slice(0, 300));
 });
 
+test("$feishu-rotate cancel 有真入口，而且能拿到取消的票", () => {
+  // **评审指出：取消在生产里永远拿不到凭证。**
+  // 带参数的控制命令被判成 invalid-rotate，于是那个能力只有测试能用 ——
+  // 而测试自己充当授权者，那不算证明。要么给真入口，要么撤掉能力。
+  assert.equal(classifyFeishuPrompt("$feishu-rotate cancel"), "rotate-cancel");
+  assert.equal(classifyFeishuPrompt("[$feishu-rotate](/x/feishu-rotate/SKILL.md) cancel"),
+    "rotate-cancel", "Desktop 的链接形式也要认");
+  assert.equal(classifyFeishuPrompt("$feishu-rotate"), "rotate", "不带参数仍是创建");
+  // 畸形仍要 fail-closed 并给反馈 —— 不许静默成 none。
+  assert.equal(classifyFeishuPrompt("$feishu-rotate 别的"), "invalid-rotate");
+  assert.equal(classifyFeishuPrompt("讨论 $feishu-rotate cancel"), "none");
+
+  // 注入的命令要带 --cancel，票也要是取消那一张。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "prompt-hook.mjs")],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }),
+      input: JSON.stringify({ prompt: "$feishu-rotate cancel", cwd: root,
+        session_id: THREAD_A, turn_id: "t1" }) });
+  const ctx = JSON.parse(r.stdout || "{}")?.hookSpecificOutput?.additionalContext ?? "";
+  assert.match(ctx, /--cancel/u, "**注入的命令必须带 --cancel**：" + ctx);
+  assert.match(ctx, /--intent '[0-9a-f]{32}'/u, "而且要带票");
+
+  // 那张票必须是**取消**的票 —— 拿它去创建要被拒。
+  const id = /--intent '([0-9a-f]{32})'/u.exec(ctx)[1];
+  assert.equal(consumeIntent({ id, action: "rotate", threadId: THREAD_A,
+    params: buildIntentParams("rotate", { op: "create" }), home }).reason,
+    "intent_params_mismatch", "**取消的票不许拿去创建**");
+});
+
+test("跨群绑定的群名要进摘要 —— A 群的票不许绑到 B 群", () => {
+  // 评审实测：chat_name 不在摘要里，群名 A/B 的摘要完全相同。
+  // 群名是**发给人看的那个名字**，换了名字就是另一次操作。
+  const home = temp();
+  const T = THREAD_A;
+  const a = issueIntent({ action: "bind", threadId: T, turnId: "c1",
+    params: buildIntentParams("bind", { project: "/p", chat: "oc_a", chatName: "A 群" }), home });
+  assert.equal(consumeIntent({ id: a.id, action: "bind", threadId: T, turnId: "c1",
+    params: buildIntentParams("bind", { project: "/p", chat: "oc_a", chatName: "B 群" }), home })
+    .reason, "intent_params_mismatch", "**换了群名必须拒**");
+  const b = issueIntent({ action: "bind", threadId: T, turnId: "c2",
+    params: buildIntentParams("bind", { project: "/p", chat: "oc_a", chatName: "A 群" }), home });
+  assert.equal(consumeIntent({ id: b.id, action: "bind", threadId: T, turnId: "c2",
+    params: buildIntentParams("bind", { project: "/p", chat: "oc_a", chatName: "A 群" }), home })
+    .ok, true, "一致就放行");
+});
+
 test("凭证绑的是这一次操作，不是这一类操作", () => {
   // 评审的三个反例：mode 不分 dialogue/mapping、rotate 不分创建/取消、
   // bind 不绑 project。**只绑命令族等于"授权了这一类"，那不是授权。**
@@ -3837,33 +3920,42 @@ test("凭证绑的是这一次操作，不是这一类操作", () => {
     params: buildIntentParams("bind", { project: "/a" }), home }).ok, true);
 });
 
-test("同一次输入只签一张票，重复调钩子不许多签", () => {
-  // 评审实测：同 session_id + turn_id + prompt 连跑两次钩子会签出**两张**，
-  // 各自都能消费 —— "一次输入只授权一次操作"根本不成立。
+test("同一次输入只签一张票；消费之后不许重签", () => {
+  // **这条整条重写过。**上一版有两处错：
+  //   · 动作写 bind、参数却用 rotate:auto 的构造器 —— 摘要跟真实路径无关；
+  //   · 断言"消费后重签是新的一张"，而新契约是**拒绝重签** ——
+  //     更糟的是它靠 notEqual(undefined, 旧 id) 假通过：
+  //     c 是 { ok: false }，c.id 就是 undefined，那条断言恒真。
+  //     **我把 bug 写进了断言，还让它一直绿着。**
   const home = temp();
   const T = THREAD_A;
   const same = () => issueIntent({ action: "bind", threadId: T, turnId: "turn-1",
-    params: buildIntentParams("rotate:auto", { project: "/p" }), home });
+    params: buildIntentParams("bind", { project: "/p" }), home });
 
   const a = same();
   const b = same();
   assert.equal(a.id, b.id, "**同一次输入必须拿到同一张票**");
   assert.equal(b.reused, true, "第二次是复用，不是新签");
 
-  // 消费掉之后不再复用（已消费的不算活票）—— 重签是新的一张。
   assert.equal(consumeIntent({ id: a.id, action: "bind", threadId: T, turnId: "turn-1",
-    params: buildIntentParams("rotate:auto", { project: "/p" }), home }).ok, true);
-  const c = same();
-  assert.notEqual(c.id, a.id, "已消费的不许被复用");
+    params: buildIntentParams("bind", { project: "/p" }), home }).ok, true);
 
-  // **换了轮次就是另一次输入。**
+  // **消费之后拒绝重签** —— 这一次输入已经授权过一次了。
+  const c = same();
+  assert.equal(c.ok, false, "**消费后不许再签**：" + JSON.stringify(c));
+  assert.equal(c.reason, "intent_already_used");
+
+  // 换了轮次就是另一次输入，可以签。
   const other = issueIntent({ action: "bind", threadId: T, turnId: "turn-2",
-    params: buildIntentParams("rotate:auto", { project: "/p" }), home });
-  assert.notEqual(other.id, c.id);
+    params: buildIntentParams("bind", { project: "/p" }), home });
+  assert.equal(other.ok, true);
+  assert.notEqual(other.id, a.id);
+
   // 换了意图也是。
   const diff = issueIntent({ action: "bind", threadId: T, turnId: "turn-1",
-    params: { project: "/other" }, home });
-  assert.notEqual(diff.id, c.id);
+    params: buildIntentParams("bind", { project: "/other" }), home });
+  assert.equal(diff.ok, true, "不同意图不受那张墓碑影响");
+  assert.notEqual(diff.id, a.id);
 });
 
 test("只读的 $feishu-mode 不许签出可当写票用的凭证", () => {

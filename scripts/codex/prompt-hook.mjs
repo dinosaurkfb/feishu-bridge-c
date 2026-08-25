@@ -22,7 +22,7 @@ import { buildIntentParams, issueIntent } from "./intent.mjs";
  * 两种都得等真人踩到才发现。
  */
 const SIMPLE_COMMANDS = [
-  "feishu-bind", "feishu-unbind", "feishu-status", "feishu-rotate", "feishu-subscribe",
+  "feishu-bind", "feishu-unbind", "feishu-status", "feishu-subscribe",
 ];
 
 export function classifyFeishuPrompt(prompt) {
@@ -36,9 +36,24 @@ export function classifyFeishuPrompt(prompt) {
   // 讨论命令、粘贴 Agent 输出或引用旧消息，那些都没有控制授权。
   const bareMode = /^\$feishu-mode(?:\s+(dialogue|mapping))?$/u.exec(commandText);
   if (bareMode) return bareMode[1] ? "mode-" + bareMode[1] : "mode";
+  // **取消轮转要有真入口。**
+  //
+  // 上一版这条命令带了参数就被判成 invalid-rotate —— 于是"取消等待认领的代际"
+  // 这个能力在生产里**永远拿不到凭证**，只有测试能用（测试自己充当授权者，
+  // 那不算证明）。要么给真入口，要么撤掉能力；这个能力是有用的，所以给入口。
+  // 形状照 $feishu-mode 的先例：整条精确匹配，讨论和引用照样到不了这里。
+  const bareRotate = /^\$feishu-rotate(?:\s+(cancel))?$/u.exec(commandText);
+  if (bareRotate) return bareRotate[1] ? "rotate-cancel" : "rotate";
   const bare = new RegExp("^\\$(" + SIMPLE_COMMANDS.join("|") + ")$", "u").exec(commandText);
   if (bare) return bare[1].slice("feishu-".length);
 
+  const linkedRotate =
+    /^\[\$feishu-rotate\]\(([^\r\n)]+)\)(?:\s+(cancel))?$/u.exec(commandText);
+  if (linkedRotate) {
+    const target = linkedRotate[1].replace(/\\/gu, "/");
+    if (!target.endsWith("/feishu-rotate/SKILL.md")) return "invalid-rotate";
+    return linkedRotate[2] ? "rotate-cancel" : "rotate";
+  }
   const linkedMode = /^\[\$feishu-mode\]\(([^\r\n)]+)\)(?:\s+(dialogue|mapping))?$/u.exec(commandText);
   if (linkedMode) {
     const target = linkedMode[1].replace(/\\/gu, "/");
@@ -58,6 +73,11 @@ export function classifyFeishuPrompt(prompt) {
   // 和转发通常不会从 token 开始，仍保持静默 none，避免把普通内容误当成控制动作。
   const malformedMode = /^(?:\$feishu-mode|\[\$feishu-mode\]\([^\r\n)]*\))(?=\s)/u.exec(commandText);
   if (malformedMode) return "invalid-mode";
+  // rotate 从 SIMPLE_COMMANDS 里挪出来之后，畸形形态也要单独兜住 ——
+  // 漏了的话 `$feishu-rotate 别的` 会静默变成 none，**用户得不到任何反馈**。
+  const malformedRotate =
+    /^(?:\$feishu-rotate|\[\$feishu-rotate\]\([^\r\n)]*\))(?=\s)/u.exec(commandText);
+  if (malformedRotate) return "invalid-rotate";
   const malformedBare = new RegExp("^\\$(" + SIMPLE_COMMANDS.join("|") +
     ")(?=\\s)", "u").exec(commandText);
   if (malformedBare) return "invalid-" + malformedBare[1].slice("feishu-".length);
@@ -150,14 +170,20 @@ export function composeSubscribeContext({ bridgeRoot, threadId }) {
   ].join("\n");
 }
 
-export function composeRotateContext({ bridgeRoot, threadId, intentId }) {
+export function composeRotateContext({ bridgeRoot, threadId, intentId, op = "create" }) {
   const command = path.join(bridgeRoot, "scripts", "codex", "feishu-rotate.mjs");
+  const cancel = op === "cancel";
   return [
-    "[Codex 飞书桥·话题轮转] 用户通过 $feishu-rotate 明确授权为当前精确 task 创建下一话题代际。",
+    cancel
+      ? "[Codex 飞书桥·取消轮转] 用户通过 $feishu-rotate cancel 明确要求取消等待认领的话题代际。"
+      : "[Codex 飞书桥·话题轮转] 用户通过 $feishu-rotate 明确授权为当前精确 task 创建下一话题代际。",
     "当前 task 的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
-    "直接运行以下两阶段轮转命令，不要再次要求确认：",
-    "`" + nodeCommandPrefix(command) + " --thread-id " + shellQuote(threadId) + " --apply" + intentArg(intentId) + "`",
-    "新话题完成首次真实 mention 认领前，旧话题继续 active；认领成功后旧话题只读。不得删除旧话题或直接编辑 registry。",
+    cancel ? "直接运行以下取消命令，不要再次要求确认：" : "直接运行以下两阶段轮转命令，不要再次要求确认：",
+    "`" + nodeCommandPrefix(command) + " --thread-id " + shellQuote(threadId) +
+      (cancel ? " --cancel" : "") + " --apply" + intentArg(intentId) + "`",
+    cancel
+      ? "取消只丢弃尚未认领的那一代；已经 active 的话题不受影响。不得删除任何话题或直接编辑 registry。"
+      : "新话题完成首次真实 mention 认领前，旧话题继续 active；认领成功后旧话题只读。不得删除旧话题或直接编辑 registry。",
   ].join("\n");
 }
 
@@ -338,14 +364,17 @@ async function main() {
   // 一张 rotate 票能创建也能取消。更糟的是**无参数的只读 $feishu-mode
   // 也会签出一张 mode 票，而它能被当写票消费** —— 一次只读输入换来一次写授权。
   const modeArg = action.startsWith("mode-") ? action.slice("mode-".length) : null;
-  const intentAction = action.startsWith("mode") ? "mode" : action;
+  const intentAction = action.startsWith("mode") ? "mode"
+    : action.startsWith("rotate") ? "rotate" : action;
+  const rotateOp = action === "rotate-cancel" ? "cancel" : "create";
   // **参数只由共用构造器拼。**上一版这里 bind 给的是空对象，
   // 而 bind-task 消费的是 { project } —— 摘要对不上，**真实绑定全线卡死**，
   // 而单测各自签各自的票，两边都绿。
   const intentParams = WRITE_ACTIONS.has(intentAction)
     ? buildIntentParams(intentAction, {
-        mode: modeArg, op: "create",           // 钩子只注入创建那条
-        project: cwd, chat: null, name: null,  // 钩子不传群和名字
+        mode: modeArg,
+        op: rotateOp,                          // 创建还是取消，按分类结果来
+        project: cwd, chat: null, name: null, chatName: null,  // 钩子不传群
       })
     : {};
   // **只读的 $feishu-mode（不带参数）不签票。**它只是看当前模式。
@@ -386,8 +415,9 @@ async function main() {
     additionalContext = composeStatusContext({ bridgeRoot: runtimeScriptsRoot(), threadId });
   } else if (action === "subscribe") {
     additionalContext = composeSubscribeContext({ bridgeRoot: runtimeScriptsRoot(), threadId });
-  } else if (action === "rotate") {
-    additionalContext = composeRotateContext({ bridgeRoot: runtimeScriptsRoot(), threadId, intentId });
+  } else if (action === "rotate" || action === "rotate-cancel") {
+    additionalContext = composeRotateContext({
+      bridgeRoot: runtimeScriptsRoot(), threadId, intentId, op: rotateOp });
   } else if (action === "mode" || action.startsWith("mode-")) {
     additionalContext = composeModeContext({
       bridgeRoot: runtimeScriptsRoot(),

@@ -65,8 +65,11 @@ const rotateAction = automatic ? "rotate:auto" : "rotate";
 const rotateParams = automatic
   // **跟签发端共用同一个构造器。**上一版这里只写 { project }，
   // 而签发端加了 generation —— 摘要对不上，真实 worker 到不了轮转逻辑。
+  // **attempt 也要读出来** —— 签发端带了它，消费端不读就又是两端不一致。
+  // 它在 activity 里：每决定一次轮转 +1。
   ? buildIntentParams("rotate:auto", {
-      project: root, generation: active?.channel_generation_id ?? null })
+      project: root, generation: active?.channel_generation_id ?? null,
+      attempt: active?.activity?.auto_rotation_attempts ?? null })
   : buildIntentParams("rotate", { op: cancel ? "cancel" : "create" });
 const intent = requireIntent({
   apply, action: rotateAction, threadId: thread.threadId, params: rotateParams,

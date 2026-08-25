@@ -370,6 +370,10 @@ export function recordTopicGenerationActivity(state, {
     messageCount: activity.message_count,
     threshold: activity.auto_rotate_threshold,
     shouldAutoRotate,
+    // **这次决策的权威身份。**每决定一次轮转它就 +1，冷却后的新决策是新的号。
+    // 授权凭证按它做幂等：同一次决策重复签得到同一张票，新决策换号拿新票 ——
+    // 否则首次消费完之后的重试会撞上墓碑，自动轮转再也起不来（评审实测到的）。
+    autoRotationAttempt: activity.auto_rotation_attempts,
   };
 }
 

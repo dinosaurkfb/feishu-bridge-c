@@ -29,7 +29,11 @@ export function recordCodexActivityAndMaybeRotate({
   // 票绑住这次决定的代际身份：换一代就是另一次决定，旧票不该还能用。
   const issued = issueIntent({
     action: "rotate:auto", threadId,
-    params: buildIntentParams("rotate:auto", { project: root, generation: generationId ?? null }),
+    params: buildIntentParams("rotate:auto", {
+      project: root, generation: generationId ?? null,
+      // 带上这次决策的号 —— 冷却之后的新决策是新号，不会撞上上次那张墓碑。
+      attempt: recorded.autoRotationAttempt ?? null,
+    }),
     home,
   });
   if (!issued.ok) {

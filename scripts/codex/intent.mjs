@@ -76,11 +76,19 @@ export const intentDir = (home) => path.join(home, "intents");
  * 所以参数只在这里构造。**加字段就要两端同时生效**，没有第二个地方能漏。
  */
 export const intentParamsFor = {
-  bind: ({ project, chat = null, name = null }) => ({ project, chat, name }),
+  // chatName 也要进摘要：评审实测群名 A/B 的摘要完全相同 ——
+  // 一张"绑到 A 群"的票能拿去绑到 B 群，而群名是**发给人看的那个名字**。
+  bind: ({ project, chat = null, name = null, chatName = null }) =>
+    ({ project, chat, name, chatName }),
   unbind: () => ({}),
   mode: ({ mode }) => ({ mode }),
   rotate: ({ op }) => ({ op }),
-  "rotate:auto": ({ project, generation = null }) => ({ project, generation }),
+  // **attempt 是这次决策的身份。**只按 (project, generation) 的话，
+  // 同一代际的**重试**会撞上前一次的墓碑（评审实测 intent_already_used）——
+  // 首次启动成功、消费掉，冷却之后的新决策就再也签不出票。
+  // 同一次决策幂等靠 attempt 相同；新决策换 attempt，拿到新票。
+  "rotate:auto": ({ project, generation = null, attempt = null }) =>
+    ({ project, generation, attempt }),
 };
 
 /** 按动作构造参数；未知动作直接炸 —— 静默给个空对象等于关掉这道校验。 */

@@ -37,6 +37,14 @@ import { codexReplyEventKey, markPublishEligibleByEventKey } from "./outbox.mjs"
 
 const SUFFIX = ".eligibility_pending.json";
 
+/**
+ * 一张恢复标记的**完整键集** —— 不多不少。
+ * 就是 recordClaimState 加上 watch-run 那份 detail 实际写出来的那些。
+ */
+const MARKER_KEYS = [
+  "claim_key", "event_key", "promote_failed", "recorded_at", "run_state", "schema_version", "state",
+].sort();
+
 /** 同步等一小会儿 —— 这条链上的函数都是同步契约，不能改成 async。 */
 function waitSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -66,6 +74,16 @@ export function listEligibilityPending({ claimsDir, threadId }) {
     try { doc = JSON.parse(fs.readFileSync(file, "utf-8")); }
     catch { bad("读不出来"); continue; }
     if (doc === null || typeof doc !== "object" || Array.isArray(doc)) { bad("不是记录对象"); continue; }
+    // **封闭键集**：这是发布授权制品，按真实产物要求"不多不少"。
+    //
+    // 上一版只在字段存在时才对账 event_key —— 评审实测：**把 event_key 删掉，
+    // 标记照样被接受、目标拿到资格、标记被撤**。只拒绝错值而放过缺字段，
+    // 等于给伪造留了最省事的一条路：少写一个字段就绕过了对账。
+    const keys = Object.keys(doc).sort();
+    const missing = MARKER_KEYS.filter((k) => !keys.includes(k));
+    if (missing.length > 0) { bad("缺字段：" + missing.join("、")); continue; }
+    const extra = keys.filter((k) => !MARKER_KEYS.includes(k));
+    if (extra.length > 0) { bad("多出不认识的字段：" + extra.join("、")); continue; }
     if (doc.schema_version !== "1.0") { bad("schema_version 不认识"); continue; }
     // 文件名与内容必须自洽 —— 否则一张错配的标记能替另一条事件要资格。
     if (doc.claim_key !== key) { bad("claim_key 跟文件名对不上"); continue; }
@@ -76,7 +94,7 @@ export function listEligibilityPending({ claimsDir, threadId }) {
     if (typeof threadId !== "string" || !threadId) { bad("不知道属于哪条 thread，无法自己算事件键"); continue; }
     // **事件键自己算。**标记自带的那个只用来对账：对不上说明这张标记被改过。
     const eventKey = codexReplyEventKey({ threadId, claimKey: key });
-    if (doc.event_key !== undefined && doc.event_key !== eventKey) {
+    if (doc.event_key !== eventKey) {
       bad("event_key 跟按 thread 与 claim 算出来的对不上"); continue;
     }
     items.push({ file, key, eventKey });
@@ -131,4 +149,23 @@ export function settleEligibilityPending({
     attempts += 1;
   }
   return { ...last, attempts };
+}
+
+/**
+ * 从一次扫描的结果里取出**某一条 claim 现在到底怎么样了**。
+ *
+ * watcher 原来只认 `recovered` —— 复查时若变成 event_not_found、
+ * record_unclassified 或 claims_unreadable，它仍然照最初那个
+ * `publisher_busy` 去报告。**报出来的原因不是真的原因，比不报还费时间。**
+ */
+export function eligibilityOutcomeFor(settle, key) {
+  if (!settle.ok) return { ok: false, reason: settle.reason };
+  const done = settle.recovered.find((r) => r.key === key);
+  if (done) return { ok: true, reason: done.reason };
+  const stuck = settle.pending.find((r) => r.key === key);
+  if (stuck) return { ok: false, reason: stuck.reason };
+  const broken = settle.unusable.find((r) => r.key === key);
+  if (broken) return { ok: false, reason: "marker_unusable", why: broken.unusable };
+  // 标记不在了，而这一轮又不是我们恢复掉的 —— 照实说，别拿旧原因顶包。
+  return { ok: false, reason: "marker_missing" };
 }

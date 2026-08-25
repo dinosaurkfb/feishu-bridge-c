@@ -53,7 +53,10 @@
 所以事件键按 thread + 文件名里的 claim key **自己算**，命中记录还要 `run_id === claim_key`、
 必须唯一。
 
-第 5 层保留：marker（发布授权制品）验真、watcher/恢复的其余部分、发布路径的锁内快照。
+**第 3 层完成恢复标记验真**（封闭键集、事件键自己算、命中唯一且 run_id 对得上）。
+第 5 层保留：发布路径的锁内快照，以及完整的自动发布生命周期
+（**run 完成 marker** 的验真、watcher 的其余接线、**发布筛选那侧**的授权判据收敛）。
+写端的授权判据已在第 3 层收敛。
 
 第 2 层已合入 `main`，所以 3、4、5 都**从 `main` 起分支**。
 
@@ -135,19 +138,25 @@ auditOutbox → outboxMutationBlocker → 查看器是否给命令
 
 - ~~三个写方共用同一把发布锁~~ —— **已移到第 3 层**（见上面的范围调整）。
   这一层只需保证发布本身也在同一把锁内。
+- ~~eligibility_pending 要有消费者~~ —— **已移到第 3 层**（同上）。
+  连同它必需的标记验真一起。
 - **锁的失败要有人接住**：给资格提升加锁之后 `publisher_busy` 成了真实路径，
   而 watcher 忽略返回值照样记 `completed` —— 那条答复**再没有任何路径获得资格**。
   **自己新加的失败模式，得自己接住。**
-- **`eligibility_pending` 要有消费者**：留了状态没人管等于没留。
-  恢复器放在拿发布锁**之前**（提升自己要拿那把锁，锁内调会自己卡死自己）。
-- **marker 是发布授权制品，必须验真**：封闭 schema、文件名与 `claim_key` 一致、
-  规范时间、`run_state=completed`、**`event_key` 必须由 task/thread/claim 推导得出
-  （不能由 marker 自带）**、outbox 记录的 `run_id === claim_key`。
+- **run 完成 marker 是发布授权制品，必须验真**：封闭 schema、文件名与 `claim_key`
+  一致、规范时间、`run_state=completed`、**`event_key` 必须由 task/thread/claim
+  推导得出（不能由 marker 自带）**、outbox 记录的 `run_id === claim_key`。
   否则一张错配的 marker 可以给另一条事件授予自动发布资格。
+
+  **注意这跟第 3 层做完的那个不是同一个制品**：第 3 层验的是
+  `eligibility_pending` 恢复标记（`claims/<key>.eligibility_pending.json`），
+  这里说的是 run 完成 marker。判据要求相同，所以第 3 层那份实现可以照抄；
+  但两者各自都得验，**共用一个名字不等于共用一份校验**。
 - **锁内字节快照**：同第 4 层。
-- **授权判据只有一份**：`publish_eligible_at` 只认规范 ISO；
-  读端与**写端**共用（写端曾把任意非空字符串判成 `already_eligible`，
-  于是 watcher 记 completed 而发布筛选不认，答复再次永久留队）。
+- **授权判据只有一份**：`publish_eligible_at` 只认规范 ISO（`hasPublishAuthorization`）。
+  写端已在第 3 层收敛（原来把任意非空字符串判成 `already_eligible`，于是恢复器撤掉
+  标记而发布筛选不认，答复再次永久留队 —— 而且唯一的恢复证据被销毁了）。
+  **这一层要把发布筛选那侧也收敛过来。**
 
 ## 5. 工艺要求（六层通用）
 

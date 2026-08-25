@@ -273,7 +273,16 @@ function markEligibleLocked({ outboxDir, eventKey, requireRunId = null }) {
   if (verdict.state === "suppressed") {
     return { ok: true, changed: false, reason: "already_suppressed", record: rec };
   }
-  if (typeof rec.publish_eligible_at === "string" && rec.publish_eligible_at) {
+  // **"已经有资格"要用唯一那份授权判据。**
+  //
+  // 上一版是"非空字符串就算数"，跟 hasPublishAuthorization 分叉：
+  // 评审把值设成 not-a-canonical-time，恢复器返回 already_eligible 并撤掉标记，
+  // 而发布器判它**未获授权** —— 于是"一轮已完成、却再也没有恢复路径"。
+  // 一份畸形的值同时是"够了，别管了"和"不算数，别发"，唯一的恢复证据被销毁。
+  if (rec.publish_eligible_at !== undefined && rec.publish_eligible_at !== null) {
+    if (!hasPublishAuthorization(rec)) {
+      return { ok: false, reason: "record_unclassified", why: "publish_eligible_at 不是规范时间" };
+    }
     return { ok: true, changed: false, reason: "already_eligible", record: { ...rec, _file: file } };
   }
   const next = { ...rec, publish_eligible_at: new Date().toISOString() };

@@ -26,7 +26,8 @@ import {
 } from "./envelope.mjs";
 import { acquireClaim, claimKey, recordClaimState } from "./claim.mjs";
 import {
-  listEligibilityPending, recoverEligibilityPending, settleEligibilityPending,
+  eligibilityOutcomeFor, listEligibilityPending, recoverEligibilityPending,
+  settleEligibilityPending,
 } from "./eligibility-recovery.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
@@ -35,8 +36,8 @@ import {
   routableProjectsForRoot,
 } from "./registry.mjs";
 import {
-  appendEvent, auditOutbox, codexReplyEventKey, composeDigest, listPending,
-  markPublishEligibleByEventKey, markSent, suppressPublishByEventKey,
+  appendEvent, auditOutbox, codexReplyEventKey, composeDigest, hasPublishAuthorization,
+  listPending, markPublishEligibleByEventKey, markSent, suppressPublishByEventKey,
 } from "./outbox.mjs";
 import {
   composeOutboundCard, outboundCardBatches, validateOutboundCard,
@@ -279,6 +280,17 @@ let recSeq = 0;
  * 默认**占着发布锁** —— 这条链上的每一个缺陷都只在"锁被别人拿着"时才出现，
  * 夹具默认不占锁的话，一整批测试会在一条根本走不到的路径上全绿。
  */
+/** 一张**完整**的恢复标记 —— 就是 recordClaimState + watch-run 那份 detail 真会写出来的键集。 */
+function fullMarker(key, patch = {}) {
+  return {
+    schema_version: "1.0", claim_key: key, state: "eligibility_pending",
+    recorded_at: "2026-08-25T00:00:00.000Z",
+    run_state: "completed", promote_failed: "publisher_busy",
+    event_key: codexReplyEventKey({ threadId: "th-1", claimKey: key }),
+    ...patch,
+  };
+}
+
 function eligFixture({ holdLock = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-elig-"));
   const outboxDir = path.join(dir, "outbox");
@@ -12388,10 +12400,8 @@ test("恢复标记是发布授权制品：event_key 自己算，不信它自报"
   fs.writeFileSync(path.join(g.outboxDir, "0002.json"), JSON.stringify(outboxRecord({
     text: "别人的答复", event_key: victimEk, run_id: "victim", publish_eligible_at: null })));
   // 攻击者的标记：文件名 = claim_key = attacker，但自报 event_key 指向 victim。
-  fs.writeFileSync(path.join(g.claimsDir, "attacker.eligibility_pending.json"), JSON.stringify({
-    schema_version: "1.0", claim_key: "attacker", state: "eligibility_pending",
-    recorded_at: "2026-08-25T00:00:00.000Z", run_state: "completed", event_key: victimEk,
-  }));
+  fs.writeFileSync(path.join(g.claimsDir, "attacker.eligibility_pending.json"),
+    JSON.stringify(fullMarker("attacker", { event_key: victimEk })));
 
   const r = recoverEligibilityPending(g.args());
   assert.deepEqual(r.recovered, [], "错配的标记一条都不许恢复");
@@ -12430,29 +12440,41 @@ test("同一个事件键有两条记录：模棱两可就不许授予资格", ()
 
 test("恢复器：看不懂的标记一律不动，也不许拿它去提升别人的资格", () => {
   const g = eligFixture({ holdLock: false });
-  const good = {
-    schema_version: "1.0", state: "eligibility_pending",
-    recorded_at: "2026-08-25T00:00:00.000Z", run_state: "completed",
-  };
   const write = (name, doc) => {
     const f = path.join(g.claimsDir, name);
     fs.writeFileSync(f, typeof doc === "string" ? doc : JSON.stringify(doc));
     return f;
   };
-  // 逐个分支都要造到 —— "这段文字里提到了它"不算断言。
+  // **每张样本都是完整标记、只坏一处** —— 否则先撞上的是别的分支，
+  // 这条测试就变成"总有个理由"，而不是"这个分支挡住了"。
+  const ek = (k) => codexReplyEventKey({ threadId: g.threadId, claimKey: k });
+  const at = (k, patch) => write(k + ".eligibility_pending.json",
+    { ...fullMarker(k, { event_key: ek(k) }), ...patch });
+  const drop = (k, field) => {
+    const doc = fullMarker(k, { event_key: ek(k) });
+    delete doc[field];
+    return write(k + ".eligibility_pending.json", doc);
+  };
   const bad = [
     ["半截文件", write("a.eligibility_pending.json", "{ 坏了"), /读不出来/u],
     ["不是对象", write("b.eligibility_pending.json", [1, 2]), /不是记录对象/u],
-    ["claim_key 错配", write("c.eligibility_pending.json", { ...good, claim_key: "别人" }),
-      /claim_key 跟文件名对不上/u],
-    ["state 不是这个", write("d.eligibility_pending.json", { ...good, claim_key: "d", state: "completed" }),
-      /state 不是 eligibility_pending/u],
-    ["schema 不认识", write("e.eligibility_pending.json", { ...good, claim_key: "e", schema_version: "9" }),
-      /schema_version 不认识/u],
-    ["recorded_at 不是时间", write("f.eligibility_pending.json", { ...good, claim_key: "f", recorded_at: "刚才" }),
-      /recorded_at 不是规范时间/u],
-    ["这一轮没跑完", write("g.eligibility_pending.json", { ...good, claim_key: "g", run_state: "running" }),
-      /run_state 不是 completed/u],
+    ["claim_key 错配", at("c", { claim_key: "别人" }), /claim_key 跟文件名对不上/u],
+    ["state 不是这个", at("d", { state: "completed" }), /state 不是 eligibility_pending/u],
+    ["schema 不认识", at("e", { schema_version: "9" }), /schema_version 不认识/u],
+    ["recorded_at 不是时间", at("f", { recorded_at: "刚才" }), /recorded_at 不是规范时间/u],
+    ["这一轮没跑完", at("g", { run_state: "running" }), /run_state 不是 completed/u],
+    // **缺字段跟错值一样危险**：评审实测删掉 event_key 后标记照样被接受、
+    // 目标拿到资格、标记被撤 —— 少写一个字段就绕过了对账。
+    ["缺 event_key", drop("h", "event_key"), /缺字段：event_key/u],
+    ["缺 run_state", drop("i", "run_state"), /缺字段：run_state/u],
+    ["缺 recorded_at", drop("j", "recorded_at"), /缺字段：recorded_at/u],
+    ["缺 claim_key", drop("k", "claim_key"), /缺字段：claim_key/u],
+    ["缺 schema_version", drop("l", "schema_version"), /缺字段：schema_version/u],
+    ["缺 state", drop("m", "state"), /缺字段：state/u],
+    ["缺 promote_failed", drop("n", "promote_failed"), /缺字段：promote_failed/u],
+    ["多出不认识的字段", at("o", { 悄悄加的: 1 }), /多出不认识的字段：悄悄加的/u],
+    ["event_key 指向别人", at("p", { event_key: ek("别人") }),
+      /event_key 跟按 thread 与 claim 算出来的对不上/u],
   ];
   const listed = listEligibilityPending({ claimsDir: g.claimsDir, threadId: g.threadId });
   assert.equal(listed.ok, true);
@@ -12460,6 +12482,7 @@ test("恢复器：看不懂的标记一律不动，也不许拿它去提升别�
   for (const [why, f, pattern] of bad) {
     const got = listed.items.find((x) => x.file === f);
     assert.ok(got, why + "：没被列出来");
+    assert.ok(got.unusable, why + "：**竟然被当成有效标记**");
     assert.match(got.unusable, pattern, why + "：理由说得不对 —— " + got.unusable);
   }
 
@@ -12471,6 +12494,68 @@ test("恢复器：看不懂的标记一律不动，也不许拿它去提升别�
   assert.equal(g.read().publish_eligible_at, null,
     "**一张看不懂的标记不许给任何记录发资格**");
   assert.equal(fs.existsSync(g.lockDir), false, "一把锁都不该拿");
+
+  // 守卫不能把好情况也一起挡了：完整无缺的标记必须照常恢复。
+  const h = eligFixture({ holdLock: false });
+  fs.writeFileSync(h.markerFile, JSON.stringify(fullMarker(h.key, { event_key: h.ek })));
+  assert.equal(recoverEligibilityPending(h.args()).recovered.length, 1, "干净时必须照常放行");
+});
+
+test("已有资格的判据要跟发布授权同一份：畸形值不算「已经有结论」", () => {
+  // 评审实测：publish_eligible_at 设成 not-a-canonical-time，恢复器返回
+  // already_eligible 并撤掉标记，而发布器判它 **hasPublishAuthorization=false**。
+  // 一份畸形的值同时是"够了，别管了"和"不算数，别发" ——
+  // 于是"一轮已完成、却再也没有恢复路径"，唯一的恢复证据还被销毁了。
+  for (const bad of ["not-a-canonical-time", "", 0, false, {}, "2026-08-25 00:00:00"]) {
+    const g = eligFixture({ holdLock: false });
+    fs.writeFileSync(path.join(g.outboxDir, "0001.json"),
+      JSON.stringify({ ...g.read(), publish_eligible_at: bad }));
+    g.marker();
+    const label = " —— publish_eligible_at=" + JSON.stringify(bad);
+    const rec0 = g.read();
+    assert.equal(hasPublishAuthorization(rec0), false, "前提：发布器判它没授权" + label);
+    const r = recoverEligibilityPending(g.args());
+    assert.deepEqual(r.recovered, [], "畸形值不算「已经有结论」" + label);
+    assert.equal(r.pending[0].reason, "record_unclassified", "得说是损坏" + label);
+    assert.deepEqual(g.read(), rec0, "一个字都不许改" + label);
+    assert.equal(fs.existsSync(g.markerFile), true, "**不许销毁唯一的恢复证据**" + label);
+  }
+  // 规范时间才算数，而且不许重复写。
+  const ok = eligFixture({ holdLock: false });
+  const stamped = { ...ok.read(), publish_eligible_at: "2026-08-25T00:00:00.000Z" };
+  fs.writeFileSync(path.join(ok.outboxDir, "0001.json"), JSON.stringify(stamped));
+  ok.marker();
+  const r = recoverEligibilityPending(ok.args());
+  assert.equal(r.recovered[0].reason, "already_eligible");
+  assert.equal(ok.read().publish_eligible_at, "2026-08-25T00:00:00.000Z", "不许改写已有的授权时间");
+});
+
+test("报出来的原因要是复查之后的原因，不是最初那个", () => {
+  // watcher 原来只认 recovered：复查时变成 event_not_found / record_unclassified /
+  // claims_unreadable，它仍然照最初那个 publisher_busy 报。
+  // **报错报错了地方，比不报还费时间。**
+  const g = eligFixture({ holdLock: false });
+  const K = g.key;
+  const cases = [
+    ["恢复成功", { ok: true, recovered: [{ key: K, reason: "promoted" }], pending: [], unusable: [] },
+      { ok: true, reason: "promoted" }],
+    ["复查时记录不见了", { ok: true, recovered: [], pending: [{ key: K, reason: "event_not_found" }], unusable: [] },
+      { ok: false, reason: "event_not_found" }],
+    ["复查时记录损坏了", { ok: true, recovered: [], pending: [{ key: K, reason: "record_unclassified" }], unusable: [] },
+      { ok: false, reason: "record_unclassified" }],
+    ["claims 目录读不出来", { ok: false, reason: "claims_unreadable", recovered: [], pending: [], unusable: [] },
+      { ok: false, reason: "claims_unreadable" }],
+    ["标记自己坏了", { ok: true, recovered: [], pending: [], unusable: [{ key: K, unusable: "缺字段：event_key" }] },
+      { ok: false, reason: "marker_unusable", why: "缺字段：event_key" }],
+    ["标记不见了", { ok: true, recovered: [], pending: [], unusable: [] },
+      { ok: false, reason: "marker_missing" }],
+    // 别人的结论不许算到我头上。
+    ["只有别人的结论", { ok: true, recovered: [{ key: "别人", reason: "promoted" }], pending: [], unusable: [] },
+      { ok: false, reason: "marker_missing" }],
+  ];
+  for (const [why, settle, want] of cases) {
+    assert.deepEqual(eligibilityOutcomeFor(settle, K), want, why);
+  }
 });
 
 test("claims 目录读不出来是故障，不是「一条都没有」", () => {

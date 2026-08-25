@@ -3,7 +3,7 @@
 
 import { readClaim, recordClaimState } from "../claim.mjs";
 import {
-  recoverEligibilityPending, settleEligibilityPending,
+  eligibilityOutcomeFor, recoverEligibilityPending, settleEligibilityPending,
 } from "../eligibility-recovery.mjs";
 import { releaseSessionLock } from "../handoff.mjs";
 import {
@@ -123,8 +123,10 @@ try {
           claimsDir: paths.claims, outboxDir: paths.outbox,
           publishLockDir: paths.publishLock, threadId: task.codex_thread_id,
         });
-        const mine = settle.recovered.find((r) => r.key === key);
-        if (mine) settled = { ok: true, reason: mine.reason };
+        // **报出来的原因要是复查之后的原因。**只认 recovered 的话，
+        // 复查时变成 event_not_found / record_unclassified / claims_unreadable，
+        // 最终仍会照最初那个 publisher_busy 去报告。
+        settled = eligibilityOutcomeFor(settle, key);
       }
       if (!settled.ok) {
         const why = settled.reason ?? "说不清";

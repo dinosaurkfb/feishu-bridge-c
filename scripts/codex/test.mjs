@@ -20,6 +20,7 @@ import { preflightTask } from "./publish-eligible.mjs";
 import {
   HOOK_TAG, acceptsHookCommand, buildHookCommand, ownsHookCommand, parseHookCommand, pickNode,
 } from "./hook-command.mjs";
+import { composeSubscribeContext } from "./prompt-hook.mjs";
 import { sweepEligible } from "./drain-all.mjs";
 
 import {
@@ -3269,6 +3270,251 @@ test("停用的顺序：核验没过时 plist 一个字节都不许动", () => {
   assert.equal(fs.readFileSync(plist, "utf-8"), before, "一个字节都不许动");
 });
 
+test("每个命令都要有对应的技能，装出来还要能被 doctor 核验", () => {
+  // **清单漏一项的后果是"命令能敲、技能没装"**，而那要等真人敲了才发现。
+  // 这条把三样绑在一起：prompt-hook 认得的命令、技能清单、装出来的产物。
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  const home = path.join(dir, "bridge-home");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
+  writeRegistry([], path.join(home, "registry.json"));
+  const env = isolatedEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home });
+  assert.equal(spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", env }).status, 0);
+
+  // prompt-hook 认得的每一个 $feishu-x，都必须有同名技能装出来。
+  for (const name of ["feishu-bind", "feishu-unbind", "feishu-status",
+    "feishu-rotate", "feishu-subscribe"]) {
+    assert.notEqual(classifyFeishuPrompt("$" + name), "none",
+      name + " 必须被 prompt-hook 认得");
+    assert.equal(
+      fs.existsSync(path.join(codexHome, "skills", name, "SKILL.md")), true,
+      "**命令认得但技能没装**：" + name);
+  }
+
+  // 装出来的还要能通过逐字节核验 —— "文件在"不等于"装对了"。
+  const runtimeCurrent = path.join(codexHome, "feishu-bridge", "runtime", "current");
+  const audit = auditSkills({ repoRoot: ROOT, codexHome, runtimeCurrent, bridgeHome: home });
+  assert.equal(audit.ok, true, JSON.stringify(audit.problems));
+});
+
+test("订阅投影只许有一份实现", () => {
+  // **我在这个 PR 里真的造了第二份。**state.mjs 早就有
+  // buildCodexSubscriptionProjection（还在 shadowCodexFirstClaim 的真实路径上用着），
+  // 我没查就新建了 scripts/codex/subscription-projection.mjs —— 两份并存的话，
+  // 一份改了另一份没跟上，两边对"订阅活动"的判断就会分叉，
+  // 而那种分叉最难查：两个命令都说自己正常。
+  //
+  // 这条钉的是"只有一处定义"。文件级断言，因为这正是**改坏了照样绿**的形状：
+  // 第二份存在时所有测试都能过。
+  const dir = path.join(ROOT, "scripts", "codex");
+  // 排除测试文件自己 —— 这条断言里写着那个正则，会把自己算进去。
+  const defs = fs.readdirSync(dir).filter((f) => f.endsWith(".mjs") && f !== "test.mjs")
+    .filter((f) => {
+    const text = fs.readFileSync(path.join(dir, f), "utf-8");
+    return /export function buildCodexSubscriptionProjection/u.test(text);
+  });
+  assert.deepEqual(defs, ["state.mjs"],
+    "**订阅投影只能定义一次**，现在有：" + JSON.stringify(defs));
+
+  // 带 threadId 时只投影那一条；不带时仍是全局视图（首次认领 shadow 依赖它）。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const a = makeTaskEntry({ root, threadId: THREAD_A, name: "A",
+    rootMessageId: "om_a", token: "a1b2c3" });
+  const b = makeTaskEntry({ root, threadId: THREAD_B, name: "B",
+    rootMessageId: "om_b", token: "d4e5f6" });
+  writeRegistry([a, b], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  const all = buildCodexSubscriptionProjection({ home });
+  const one = buildCodexSubscriptionProjection({ home, threadId: THREAD_A });
+  assert.equal(all.ok, true, all.reason);
+  assert.equal(one.ok, true, one.reason);
+  assert.equal((all.pending_bindings ?? []).length, 2, "不带 threadId 仍是全局视图");
+  assert.equal((one.pending_bindings ?? []).length, 1,
+    "**带 threadId 只投影那一条** —— 否则 status 会把别人的待认领算进来");
+});
+
+test("$feishu-subscribe：四种输入形式都要判对，讨论时不许触发", () => {
+  // 命令名原本在四条正则里各写一遍。**漏一处的后果分两种**：
+  // 裸写能用但 Desktop 的链接形式不认；或者带了参数时不再 fail-closed。
+  // 两种都得等真人踩到才发现，所以这里四种形式各验一次。
+  assert.equal(classifyFeishuPrompt("$feishu-subscribe"), "subscribe");
+  assert.equal(classifyFeishuPrompt("[$feishu-subscribe](/x/feishu-subscribe/SKILL.md)"),
+    "subscribe", "Desktop 会把技能调用序列化成链接形式");
+  assert.equal(classifyFeishuPrompt("$feishu-subscribe 多余的"), "invalid-subscribe",
+    "**带了参数必须 fail-closed**，不许静默当成裸命令执行");
+  assert.equal(classifyFeishuPrompt("[$feishu-subscribe](/x/别的技能/SKILL.md)"),
+    "invalid-subscribe", "链接指向别的技能就不算");
+  // **讨论、引用、转发都没有控制授权。**
+  assert.equal(classifyFeishuPrompt("我们讨论一下 $feishu-subscribe 这个命令"), "none");
+  assert.equal(classifyFeishuPrompt("前面还有字 $feishu-subscribe"), "none");
+  // 收成一份清单之后，既有命令一个都不许坏。
+  for (const name of ["bind", "unbind", "status", "rotate"]) {
+    assert.equal(classifyFeishuPrompt("$feishu-" + name), name, name + " 不许被改坏");
+  }
+});
+
+test("$feishu-subscribe：注入的命令只读，且要求原样转述「为什么不能写」", () => {
+  const ctx = composeSubscribeContext({ bridgeRoot: "/r", threadId: THREAD_A });
+  assert.ok(ctx.includes("/r/scripts/codex/feishu-subscribe.mjs"), "要指向对的脚本");
+  assert.ok(ctx.includes(THREAD_A), "要带精确 thread id");
+  // 只禁 --apply。"不得使用 --last"这句**本身就该在** —— 我第一版把它一起禁了，
+  // 那是把一条安全要求当成了违规。
+  assert.doesNotMatch(ctx, /--apply/u, "**只读命令不许出现 --apply**");
+  assert.match(ctx, /不得使用 --last/u, "而「不许猜线程」这条要求必须在");
+  // **原因本身就是信息。**概括成"暂不支持修改"，下一个来问"为什么"的人
+  // 就得把这段重新考古一遍。
+  assert.match(ctx, /原样转述/u);
+  assert.match(ctx, /不要概括成/u);
+  assert.match(ctx, /只出数量不出身份/u, "脱敏要求要带进去");
+});
+
+test("subscribe 命令：读得出订阅，且不泄漏任何 locator", () => {
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "订阅示例",
+    // 认领口令必须是 6 位十六进制（subscription.mjs 的格式要求）——
+    // 我第一版写了 "tok123456"，投影直接判 record:pending_token 不合法。
+    // **改夹具，不是放松判据。**
+    rootMessageId: "om_secret_root", token: "a1b2c3" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-subscribe.mjs"), "--thread-id", THREAD_A],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.equal(r.status, 0, r.stderr);
+  if (!/订阅状态/u.test(r.stdout)) {
+    // 投影不合法时把 problems 打出来 —— "invalid" 三个字查不出是哪个字段。
+    const probe = buildCodexSubscriptionProjection({ home, threadId: THREAD_A });
+    assert.fail("投影不可用：" + JSON.stringify(probe).slice(0, 400) + "\n" + r.stdout);
+  }
+  assert.match(r.stdout, /授权发送者.*只出数量，不出身份/u);
+  assert.match(r.stdout, /写入口还没开/u, "为什么不能写要说清楚");
+
+  // **一个 locator 都不许出现。**
+  for (const secret of ["om_secret_root", "a1b2c3", THREAD_A,
+    TEMPLATE.chat_id, TEMPLATE.agent_uid, TEMPLATE.transport_open_id]) {
+    if (!secret) continue;
+    assert.equal(r.stdout.includes(secret), false, "泄漏了：" + secret);
+  }
+
+  // 拼错的参数不许静默退化。
+  const typo = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-subscribe.mjs"), "--thread--id", THREAD_A],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.notEqual(typo.status, 0, "**拼错的参数不许被当成对的**");
+});
+
+test("status 不许执行别的项目的 provider —— 不显示还不够，必须不跑", () => {
+  // **评审用 marker 文件证明的：输出里看不见，marker 却建出来了。**
+  // 机器级 collectConnectivity 会把所有 provider 都跑一遍再按归属过滤显示 ——
+  // 界面上干净，别人的脚本已经在这台机器上执行过了。
+  // 「项目范围要是只管显示不管执行，那它就不是范围。」
+  const dir = temp();
+  const home = path.join(dir, "bridge");
+  const mine = path.join(dir, "mine");
+  const theirs = path.join(dir, "theirs");
+  for (const d of [home, mine, theirs]) fs.mkdirSync(d, { recursive: true });
+  const task = makeTaskEntry({ root: mine, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  // 别的项目的 provider：**跑起来就留 marker**。
+  //
+  // 夹具必须是真实格式（id / protocol / executable / script / allowed_kinds /
+  // project_root）—— 我第一版写的是 name/projectRoot/command，**根本加载不进去**，
+  // 于是那条测试从头到尾没验到任何东西：连机器级 collector 都"没执行"。
+  const marker = path.join(dir, "THEIRS_RAN");
+  const script = path.join(dir, "theirs.mjs");
+  fs.writeFileSync(script,
+    'import fs from "node:fs";\n' +
+    "fs.writeFileSync(" + JSON.stringify(marker) + ', "ran");\n' +
+    'process.stdout.write(JSON.stringify({ schema_version: "feishu-bridge-status/v1",' +
+    ' provider_id: "theirs", connections: [] }));\n');
+  const providers = path.join(dir, "providers.json");
+  fs.writeFileSync(providers, JSON.stringify({
+    providers: [{
+      id: "theirs", protocol: "feishu-bridge-status/v1",
+      executable: process.execPath, script,
+      allowed_kinds: ["transport"], project_root: theirs,
+    }],
+  }));
+
+  const run = (threadId) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", threadId],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home,
+      FEISHU_BRIDGE_STATUS_PROVIDERS: providers }) });
+
+  // 本项目也放一个 provider，跑起来留自己的 marker ——
+  // **只断言"别人的没跑"是不够的**：root 传空时两个都不跑，那条断言照样成立，
+  // 于是"过滤失效"和"什么都没跑"分不开。要同时断言**自己的确实跑了**。
+  const mineMarker = path.join(dir, "MINE_RAN");
+  const mineScript = path.join(dir, "mine.mjs");
+  fs.writeFileSync(mineScript,
+    'import fs from "node:fs";\n' +
+    "fs.writeFileSync(" + JSON.stringify(mineMarker) + ', "ran");\n' +
+    'process.stdout.write(JSON.stringify({ schema_version: "feishu-bridge-status/v1",' +
+    ' provider_id: "mine", connections: [] }));\n');
+  fs.writeFileSync(providers, JSON.stringify({
+    providers: [
+      { id: "theirs", protocol: "feishu-bridge-status/v1",
+        executable: process.execPath, script, allowed_kinds: ["transport"],
+        project_root: theirs },
+      { id: "mine", protocol: "feishu-bridge-status/v1",
+        executable: process.execPath, script: mineScript, allowed_kinds: ["transport"],
+        project_root: mine },
+    ],
+  }));
+
+  // ① 绑定状态：本项目的要跑，别人的一个都不跑。
+  const bound = run(THREAD_A);
+  assert.equal(bound.status, 0, bound.stderr);
+  assert.equal(fs.existsSync(mineMarker), true,
+    "**本项目的 provider 该跑** —— 不跑的话下面那条断言就没有意义了");
+  assert.equal(fs.existsSync(marker), false,
+    "**别的项目的 provider 被执行了** —— 不显示还不够，必须不跑");
+  assert.doesNotMatch(bound.stdout, /别人的项目/u);
+  fs.rmSync(mineMarker, { force: true });
+
+  // ② 未绑定：没有可信的项目根 → 一个 provider 都不跑，不许退回机器全景。
+  const unbound = run(THREAD_B);
+  assert.equal(unbound.status, 0, unbound.stderr);
+  assert.equal(fs.existsSync(marker), false,
+    "**未绑定时更不该跑** —— 说不清是谁的，就不该替谁执行");
+});
+
+test("群名优先用 task 自己的覆盖，而不是把知道的说成不知道", () => {
+  // 上一轮修掉了"错报模板群名"，却把"已知 task 群名被报成不可用"留下了。
+  // 两种都是错的：一个说了错名字，一个把知道的说成不知道。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  // **task 自己覆盖了群**（不是模板那个群）。
+  task.chat_id = "oc_task_own_group";
+  task.chat_name = "这条 task 自己的群";
+  writeRegistry([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /订阅群.*这条 task 自己的群/u,
+    "**已知的 task 群名不许被报成不可用**：" + r.stdout);
+  // 而且不许把模板那个群的名字套上来。
+  assert.doesNotMatch(r.stdout, new RegExp(TEMPLATE.chat_name ?? "___", "u"));
+});
+
 test("四层 status：Codex 侧报的必须是自己那条链的事实，不是 Claude 的", () => {
   // **这条迁移最容易办坏的地方。**endpointFacts 的 runtime / runtimeDir / verify
   // 默认值全指向 Claude 那条链 —— 不显式给的话，第 1 层会写着"Claude Code"、
@@ -3309,11 +3555,20 @@ test("四层 status：Codex 侧报的必须是自己那条链的事实，不是 
   // 不传 runtimeDir/verify 的话输出看着完整，报的却是 Claude 运行时的哈希 ——
   // 一个"看起来已安装"的第 1 层，背后是另一条链。
   //
-  // 隔离环境里 Codex runtime 没装，所以这里必须报"未安装"；
-  // 若它报出了某个版本号，那个号只可能是从别处（本机 Claude 运行时）来的。
-  assert.match(r.stdout, /安装状态.*未安装/u,
-    "**Codex runtime 没装就必须报未安装** —— 报出版本号说明查的是别的链：" + r.stdout);
-  assert.match(r.stdout, /运行时版本.*未安装/u);
+  // **判据不能是"未安装"** —— 那依赖本机 Codex runtime 恰好没装。
+  // 真装上之后这条就失效了（我装完线上就撞到了），跟 launchd 那条是同一种病：
+  // 夹具依赖真机状态。改成给一个**隔离的空 CODEX_HOME**，
+  // 那里必然没有 runtime；若它仍报出版本号，那个号只可能来自别的链。
+  const emptyCodexHome = path.join(home, "empty-codex");
+  fs.mkdirSync(emptyCodexHome, { recursive: true });
+  const isolated = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home,
+      CODEX_HOME: emptyCodexHome }) });
+  assert.equal(isolated.status, 0, isolated.stderr);
+  assert.match(isolated.stdout, /安装状态.*未安装/u,
+    "**空的 CODEX_HOME 里必须报未安装** —— 报出版本号说明查的是别的链：" + isolated.stdout);
+  assert.match(isolated.stdout, /运行时版本.*未安装/u);
 
   // **不许泄漏 locator。**status 刻意不打印这些。
   assert.doesNotMatch(r.stdout, /om_root/u, "根消息 id 不许出现");
@@ -3336,10 +3591,13 @@ test("四层 status：这条 task 的登记表状态要单独报，不跟 task �
   const r = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A],
     { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
-  // 登记表里没有就找不到这条 thread —— 命令必须说清楚，不许假装正常。
-  assert.notEqual(r.stdout.includes("第 3 层 · 精确通道绑定") && r.status === 0
-    && !/降级|未登记|尚未接入/u.test(r.stdout), true,
-    "**登记表里没有它时不许报成一切正常**：" + r.stdout + r.stderr);
+  // 登记表里没有它 → 第 3 层必须说"尚未绑定"，不许假装绑好了。
+  // **四层照出**（没绑定不等于没有四层），但第 3 层要说实话。
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /第 3 层 · 精确通道绑定/u, "四层要照出");
+  assert.match(r.stdout, /尚未绑定/u,
+    "**登记表里没有它时不许报成绑好了**：" + r.stdout);
+  assert.doesNotMatch(r.stdout, /当前代际/u, "没绑就没有代际可报");
 });
 
 test("三态必须互斥：既标已发布又标已停发的记录是坏的", () => {

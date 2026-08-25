@@ -25,6 +25,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { verifyRuntime } from "./runtime-install.mjs";
+import { claimable } from "./subscription.mjs";
 
 /**
  * 自检结论的人读文案。**导出是为了让测试引用它，而不是复制一份字面量** ——
@@ -121,19 +122,28 @@ export function lastSuccessfulDispatchAt(file) {
  * 群名由调用方从链路模板传进来（模板里本来就有 chat_name，绑定命令一直在打印它）。
  * 订阅投影自己只有 chat_id —— 取不到名字时显示"不可用"，**不拿 ID 顶替**。
  */
-export function subscriptionFacts(model, { groupName = null } = {}) {
+export function subscriptionFacts(model, {
+  groupName = null, templateChatId = null, now = Date.now(),
+} = {}) {
   if (!model || model.ok !== true) {
     return { ok: false, reason: model?.reason ?? "subscription_unavailable" };
   }
   const items = (model.subscriptions ?? []).map((s) => ({
     status: s.status === "active" ? "活动" : "暂停",
-    // 投影里只有 chat_id，但群名在链路模板里就有（绑定命令一直在打印它）。
-    // 上一版报"群名不可用"是我没把它接过来，不是真的没有。
-    groupName,
+    // **群名只能用在它确实对应的那条订阅上。**投影里只有 chat_id，群名在模板里；
+    // 无条件套上去的话，指向别的群的订阅会被错报成模板群 ——
+    // **一个错的名字比没有名字更难发现**。核对不上就报不可用。
+    // feishu-subscribe 那条命令一直是这么做的，这里是向它看齐。
+    groupName: (templateChatId !== null && s.scope?.chat_id === templateChatId)
+      ? groupName : null,
     senderCount: (s.scope?.sender_ids ?? []).length,
     eventTypes: [...(s.scope?.event_types ?? [])],
   }));
-  return { ok: true, items, pendingCount: (model.pending_bindings ?? []).length };
+  // **待认领要用跟热路径同一个判据。**直接取数组长度会把已绑定、暂停、过期的
+  // 也算进去 —— 一个绑好的项目会显示"待认领"，让人以为还有一步没做完。
+  // 同一份投影在 status 显示 1、在 subscribe 显示 0，正是这么来的。
+  return { ok: true, items,
+    pendingCount: (model.pending_bindings ?? []).filter((b) => claimable(b, now)).length };
 }
 
 const relative = (ms, now) => {
@@ -213,6 +223,7 @@ const OUTBOUND_ROUTING_TEXT = {
 export function composeLayeredStatus({
   st, others = [], endpoint, subscription, connectivity = null,
   otherLinks = null, outboundRouting = null, now = Date.now(),
+  bindHint = "node scripts/bind-project.mjs --apply",
 }) {
   // 别的链路里能归层的，直接进对应层；归不了的留给附录。
   const split = otherLinks ? splitByRelation(otherLinks.sections) : { byLayer: null, unsorted: [] };
@@ -266,8 +277,11 @@ export function composeLayeredStatus({
 
   if (!bound) {
     // not_bound 和"读不出来"必须分开：前者是还没接，后者是配错了或文件坏了。
+    // **接入的办法两条链不一样。**写死 Claude 那条命令的话，
+    // Codex 侧看到的是一条在它那里跑不通的指令 ——
+    // 一个错的下一步比没有下一步更糟。
     const why = st.reason === "not_bound"
-      ? "尚未绑定（接入：node scripts/bind-project.mjs --apply）"
+      ? "尚未绑定（接入：" + bindHint + "）"
       : "状态不可读（" + (st.reason ?? "unknown") + "）";
     return {
       layers: [

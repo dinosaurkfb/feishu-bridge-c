@@ -19,6 +19,7 @@ export const SKILLS = [
   { name: "feishu-status", files: ["SKILL.md"] },
   { name: "feishu-rotate", files: ["SKILL.md"] },
   { name: "feishu-mode", files: ["SKILL.md"] },
+  { name: "feishu-subscribe", files: ["SKILL.md"] },
 ];
 
 export const SKILL_NAMES = SKILLS.map((s) => s.name);

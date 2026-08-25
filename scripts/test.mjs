@@ -7158,9 +7158,26 @@ test("Codex 侧：当前 task 未绑定时仍要显示全局链路", () => {
     FEISHU_BRIDGE_STATUS_PROVIDERS: path.join(dir, "none.json"),
   } });
   assert.equal(run.status, 0, run.stderr);
-  assert.match(run.stdout, /尚未接入飞书/u);
-  // "这条没绑"和"本机什么都没有"是两回事。
-  assert.match(run.stdout, /cc2cd {2}链路存在，状态入口未登记/u);
+  // **没绑定不等于没有四层。**上一版这里只有一句"尚未接入飞书"就退出了 ——
+  // 四层模型在最需要它的时候消失：正是没绑的时候，人才要知道运行时装没装、
+  // 订阅活不活动。现在四层照出，第 3 层说"尚未绑定"。
+  assert.match(run.stdout, /第 1 层 · 运行端点连接/u, run.stdout);
+  assert.match(run.stdout, /第 3 层 · 精确通道绑定/u);
+  assert.match(run.stdout, /尚未绑定/u, "要说清是没绑，不是读不出来");
+  // **接入的办法必须是 Codex 那条。**写死 Claude 的脚本命令，
+  // Codex 侧看到的就是一条在它那里跑不通的指令。
+  assert.match(run.stdout, /\$feishu-bind/u);
+  assert.doesNotMatch(run.stdout, /bind-project\.mjs/u);
+  // **未绑定时不再显示（也不再执行）别的项目的 provider。**
+  //
+  // 这条断言原本要的是"这条没绑不该妨碍看别的链路"。但那个"看"是靠机器级
+  // collector 实现的，而它会**把所有 provider 都跑一遍** ——
+  // 界面上过滤掉了，脚本已经在这台机器上执行了。
+  // 未绑定时没有可信的项目根，说不清是谁的就不该替谁执行。
+  //
+  // 所以这里断言相反的事实：**别的项目的链路不许出现**。
+  assert.doesNotMatch(run.stdout, /cc2cd/u,
+    "未绑定时不许把别的项目的 provider 跑出来：" + run.stdout);
 });
 
 test("歧义命令必须失败，不许被解释成破坏性更强的那个", () => {
@@ -7348,15 +7365,30 @@ test("第 2 层脱敏：locator 字段一个都不出，群名不许用 ID 顶�
         event_types: ["im.message.receive"],
       },
     }],
-    pending_bindings: [{ legacy_key: "lk_SECRET888", pending_token: "pt_SECRET999" }],
+    // **要真的可认领才算一条。**上一版只写了 key 和 token，
+    // 按 claimable() 它 status 不是 active、inbound_state 不是 pending —— 不该算。
+    // 计数改用 claimable 之后这条夹具就不成立了：**是夹具不真实，不是判据太严**。
+    pending_bindings: [{
+      legacy_key: "lk_SECRET888", pending_token: "pt_SECRET999",
+      status: "active", inbound_state: "pending", session_bound: false,
+    }],
   };
   const facts = subscriptionFacts(model);
   assert.equal(facts.ok, true);
   assert.equal(facts.items[0].senderCount, 1, "只出数量，不出身份");
   assert.equal(facts.items[0].groupName, null, "不传群名时不许拿 chat_id 顶替");
-  // 传了就用 —— 群名是模板里本来就有的可展示字段。
+  // **传了还不够 —— 得对得上那条订阅的 chat_id 才用。**
+  // 无条件套上去的话，指向别的群的订阅会被错报成模板群，
+  // 而**一个错的名字比没有名字更难发现**。
+  const chatId = model.subscriptions[0].scope.chat_id;
+  assert.equal(subscriptionFacts(model,
+    { groupName: "Frank智能体们", templateChatId: chatId }).items[0].groupName,
+    "Frank智能体们", "chat_id 对得上才用群名");
+  assert.equal(subscriptionFacts(model,
+    { groupName: "Frank智能体们", templateChatId: "oc_别的群" }).items[0].groupName,
+    null, "**chat_id 对不上就不许用那个名字**");
   assert.equal(subscriptionFacts(model, { groupName: "Frank智能体们" }).items[0].groupName,
-    "Frank智能体们");
+    null, "没给 chat_id 就没法核对，同样不许用");
 
   const text = renderLayeredStatus(layeredView({}, { subscription: facts }));
   for (const secret of ["ep_SECRET111111", "sub_SECRET222222", "dom_SECRET333333",

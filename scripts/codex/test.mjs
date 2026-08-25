@@ -15,8 +15,13 @@ import {
   absentJob, auditOutbox, classifyBacklog, drainScriptPath, enableBlockers, loadedPhase,
   plistBody, scanRunnable,
 } from "./drain-service.mjs";
-import { outboxMutationBlocker } from "../outbox.mjs";
-import { collectBacklog, describeRecordState, suppressCommandFor } from "./feishu-outbox.mjs";
+import {
+  explainabilityGaps, hasPublishAuthorization, outboxMutationBlocker,
+} from "../outbox.mjs";
+import { generationTargetState } from "../topic-generation.mjs";
+import {
+  collectBacklog, describeRecordState, sanitizeForDisplay, suppressCommandFor,
+} from "./feishu-outbox.mjs";
 import { auditSkills } from "./skill-content.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
 import {
@@ -5358,6 +5363,124 @@ test("登记表读取：结构坏掉要 fail-closed，不许抛也不许静默�
   const good = write({ tasks: [{ root: "/tmp/x", logical_task_key: "k" }] });
   assert.equal(loadRegistry(good).ok, true);
   assert.equal(loadRegistry(good).tasks.length, 1);
+});
+
+
+test("统一守卫要看得见损坏的目标代际 —— 不许靠查看器自己再查一次", () => {
+  // 评审实测：一条字段齐全的记录只要把 target_channel_generation_id 写成纯空白，
+  // auditOutbox 报干净、outboxMutationBlocker 返回 null；
+  // **查看器之所以拦住，是因为它自己又查了一次 state === "corrupt"** ——
+  // 所谓"唯一守卫"实际上是两份判据。判据现在下沉到 topic-generation。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-corrupt-audit-"));
+  fs.writeFileSync(path.join(dir, "0001.json"),
+    JSON.stringify(outboxRecord({ target_channel_generation_id: "   " })));
+
+  const audit = auditOutbox(dir);
+  assert.equal(audit.unexplainable.length, 1, "**审计自己就要看见它**");
+  assert.match(audit.unexplainable[0].why, /target_channel_generation_id/u);
+  assert.notEqual(outboxMutationBlocker(audit), null, "**守卫必须给出阻断结论**");
+  assert.equal(outboxMutationBlocker(audit).reason, "outbox_unexplainable");
+
+  const rec = JSON.parse(fs.readFileSync(path.join(dir, "0001.json"), "utf-8"));
+  assert.equal(generationTargetState(rec), "corrupt");
+  assert.ok(explainabilityGaps(rec).includes("target_channel_generation_id"));
+
+  fs.writeFileSync(path.join(dir, "0001.json"), JSON.stringify(outboxRecord({
+    target_channel_generation_id: "channel_generation_" + "a".repeat(24) })));
+  assert.deepEqual(auditOutbox(dir).unexplainable, []);
+  assert.equal(outboxMutationBlocker(auditOutbox(dir)), null);
+});
+
+test("查看器的授权判据只有一份：不许一边说解释不了、一边说已就绪", () => {
+  // 评审实测：对 publish_eligible_at:"not-a-canonical-time"
+  //   hasPublishAuthorization=false / explainabilityGaps 点名 / describeRecordState=ready
+  // **同一个 CLI 给出两个相反的结论。**
+  const malformed = { id: "e1", kind: "reply", text: "x",
+    created_at: "2026-08-20T00:00:00.000Z", publish_eligible_at: "not-a-canonical-time" };
+  const state = describeRecordState(malformed, { resolveTarget: () => ({ ok: true }) });
+  assert.notEqual(state.code, "ready", "**畸形授权不许显示成已就绪**");
+  assert.equal(state.code, "auth_malformed");
+  assert.match(state.text, /需要人看/u, "要跟「还没轮到它」分开说");
+  assert.equal(hasPublishAuthorization(malformed), false);
+  assert.ok(explainabilityGaps(malformed).includes("publish_eligible_at"));
+
+  const notYet = { ...malformed, publish_eligible_at: null };
+  assert.equal(describeRecordState(notYet, { resolveTarget: () => ({ ok: true }) }).code,
+    "not_eligible");
+  const ready = { ...malformed, publish_eligible_at: new Date().toISOString() };
+  assert.equal(describeRecordState(ready, { resolveTarget: () => ({ ok: true }) }).code, "ready");
+});
+
+test("登记表：两个 task 不许落到同一个存储目录", () => {
+  // 评审实测：a/b 和 a?b 都被 safeKey 换成 a_b，
+  // **两条 task 的 outbox 和锁混在一起**，而登记表照样 ok。
+  const home = temp();
+  const f = path.join(home, "registry.json");
+  fs.writeFileSync(f, JSON.stringify({ tasks: [
+    { root: "/tmp/a", logical_task_key: "a/b" },
+    { root: "/tmp/b", logical_task_key: "a?b" },
+  ] }));
+  const reg = loadRegistry(f);
+  assert.equal(reg.ok, false, "**不许放行**");
+  assert.equal(reg.reason, "registry_malformed");
+  assert.match(reg.detail, /非法字符/u, "要说清是字符集的问题");
+
+  fs.writeFileSync(f, JSON.stringify({ tasks: [
+    { root: "/tmp/a", logical_task_key: "Task-A_1" },
+    { root: "/tmp/b", logical_task_key: "Task-B_2" },
+  ] }));
+  assert.equal(loadRegistry(f).ok, true);
+  assert.equal(loadRegistry(f).tasks.length, 2);
+});
+
+test("查看内容不许带终端控制序列 —— 它服务的是不可逆决定", () => {
+  // 评审实测：清屏序列原样进了输出。outbox 正文是模型生成的，
+  // 而这个视图是人用来决定要不要永久停掉内容的。
+  // 一段内容能清屏、移光标、伪造后面的提示行，人看到的就不是实际存在的东西。
+  const ESC = String.fromCharCode(27);
+  const BIDI = String.fromCharCode(0x202e);
+  const evil = "正常开头" + ESC + "[2J" + ESC + "[H伪造的提示" + BIDI + "reversed";
+  const clean = sanitizeForDisplay(evil);
+  for (const ch of [ESC, BIDI, String.fromCharCode(0)]) {
+    assert.equal(clean.includes(ch), false, "控制符漏出去了：" + JSON.stringify(ch));
+  }
+  assert.match(clean, /正常开头/u, "可见内容要留着");
+  assert.ok(clean.includes(String.fromCharCode(0xfffd)),
+    "**换成占位符而不是删掉** —— 「这里原本有东西」是信息");
+
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A,
+    name: "名字里也有" + ESC + "[31m颜色", rootMessageId: "om_root", token: "a1b2c3" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const ob = taskPaths(task, home).outbox;
+  fs.mkdirSync(ob, { recursive: true });
+  fs.writeFileSync(path.join(ob, "0001.json"), JSON.stringify(outboxRecord({
+    kind: "reply", text: evil })));
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.equal(r.stdout.includes(ESC), false, "**stdout 里不许有 ESC**");
+  assert.equal(r.stdout.includes(BIDI), false);
+});
+
+test("登记表的精确诊断要到得了用户手上", () => {
+  // 上一版查看层把所有失败都改写成 registry_unreadable，
+  // 登记表那层刚做出来的"结构坏了、第几条坏了"到不了用户。
+  const home = temp();
+  fs.writeFileSync(path.join(home, "registry.json"), JSON.stringify({ tasks: [null] }));
+  const got = collectBacklog({ home });
+  assert.equal(got.ok, false);
+  assert.equal(got.reason, "registry_malformed", "**不许压扁成 registry_unreadable**");
+  assert.ok(got.detail?.includes("#0"), "索引要透传");
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /结构不对/u);
+  assert.match(r.stderr, /#0/u, "人要知道看第几条");
 });
 
 

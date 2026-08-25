@@ -640,3 +640,21 @@ export function resolveMappingOutboundGeneration(mapping, generationId) {
   }
   return { ok: false, reason: "outbound_generation_unavailable" };
 }
+
+/**
+ * 一条待发记录的目标代际处于哪一态。**三态，不是两态。**
+ *
+ * - `legacy`  ：字段缺失或 null —— 合法的旧格式，代际靠当前 mapping 现算。
+ * - `frozen`  ：可用的非空代际 —— 目标已冻结，轮转不影响它。
+ * - `corrupt` ：字段在，但不是可用代际 —— **损坏记录**。fail-closed。
+ *
+ * **它住在这里而不是抑制核心**：审计要用它，抑制核心也要用它。
+ * 放在 usableGeneration 隔壁，两边从同一处拿 —— 评审实测过上一版的后果：
+ * 完整记录只要把目标代际写成纯空白，auditOutbox 仍报干净、blocker 返回 null，
+ * **查看器之所以拦住是因为它自己又查了一次 —— "唯一守卫"实际上是两份判据。**
+ */
+export function generationTargetState(record) {
+  const raw = record?.target_channel_generation_id;
+  if (raw === undefined || raw === null) return "legacy";
+  return usableGeneration(raw) ? "frozen" : "corrupt";
+}

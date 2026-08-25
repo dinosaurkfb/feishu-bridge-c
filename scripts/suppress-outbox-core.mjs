@@ -16,7 +16,7 @@
 
 import { listPending, suppressRecords } from "./outbox.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
-import { usableGeneration } from "./topic-generation.mjs";
+import { generationTargetState, usableGeneration } from "./topic-generation.mjs";
 
 const nonEmpty = (v) => typeof v === "string" && v.length > 0;
 
@@ -30,24 +30,11 @@ const nonEmpty = (v) => typeof v === "string" && v.length > 0;
  */
 export { usableGeneration };
 
-/**
- * 一条待发记录的目标代际处于哪一态。**三态，不是两态。**
- *
- * 上一版只分"有/没有"，判据还是 length > 0 —— 于是
- * `target_channel_generation_id: "   "` 被当成"自带明确代际"：不要求
- * expectation、不取代际锁、不做轮转比较，**直接被永久抑制**。评审实测复现。
- *
- * - `legacy`  ：字段缺失或 null —— 合法的旧格式，代际靠当前 mapping 现算。
- * - `frozen`  ：可用的非空代际 —— 目标已冻结，轮转不影响它。
- * - `corrupt` ：字段在，但不是可用代际 —— **损坏记录**。
- *               不许当成 legacy 去重新解释（那等于替它猜一个目标），
- *               也不许当成 frozen 放行。fail-closed。
- */
-export function generationTargetState(record) {
-  const raw = record?.target_channel_generation_id;
-  if (raw === undefined || raw === null) return "legacy";
-  return usableGeneration(raw) ? "frozen" : "corrupt";
-}
+// **判据住在 topic-generation.mjs**（usableGeneration 的隔壁）——
+// 审计和抑制核心都要用它；留在这里的话审计就够不着，
+// 于是"统一守卫"会漏掉损坏代际。这里只转出。
+export { generationTargetState };
+
 
 /** 这批待发里有没有"代际靠 mapping 现算"的旧格式记录。 */
 export const dependsOnMapping = (records) =>

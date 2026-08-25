@@ -13,7 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { normalizeLocalInput } from "./turn-input.mjs";
 import { isDirectRun, moduleRoot } from "./direct-run.mjs";
-import { usableGeneration } from "./topic-generation.mjs";
+import { generationTargetState, usableGeneration } from "./topic-generation.mjs";
 import { isCanonicalIso } from "./canonical-time.mjs";
 
 /**
@@ -368,6 +368,14 @@ export function explainabilityGaps(rec) {
   if (auth !== undefined && auth !== null && !isCanonicalIso(auth)) {
     gaps.push("publish_eligible_at");
   }
+  // **目标代际也要在这一层看见。**
+  //
+  // 上一版没验它：一条字段齐全的记录只要把 target_channel_generation_id
+  // 写成纯空白，审计就报干净、统一守卫返回 null。查看器之所以能拦住，
+  // 是因为它**自己又查了一次** —— 所谓"唯一守卫"实际上是两份判据，
+  // 而这正是这条线上反复被罚的那件事。
+  // 抑制核心的 corruptTargets 保留作纵深防御，但判定从这里开始。
+  if (generationTargetState(rec) === "corrupt") gaps.push("target_channel_generation_id");
   return gaps;
 }
 

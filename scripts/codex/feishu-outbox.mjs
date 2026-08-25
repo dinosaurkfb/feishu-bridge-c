@@ -43,6 +43,7 @@ import { isDirectRun, moduleDir } from "../direct-run.mjs";
 import { listPending } from "../outbox.mjs";
 import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
 import { generationTargetState } from "../suppress-outbox-core.mjs";
+import { hasPublishAuthorization } from "../outbox.mjs";
 import { auditOutbox } from "./drain-service.mjs";
 import { outboxMutationBlocker } from "../outbox.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
@@ -91,9 +92,25 @@ export function ageText(iso, now = Date.now()) {
   return Math.round(d / DAY) + " 天前";
 }
 
+/**
+ * 把要显示的文本**去掉控制序列**。
+ *
+ * outbox 的正文是模型生成的，而这个视图是人用来做**不可逆决定**的。
+ * 评审实测：`\u001b[2J\u001b[H` 原样进了输出 —— 一段内容可以清屏、移光标、
+ * 伪造后面的提示行，让人看到的和实际存在的东西不一样。
+ *
+ * 覆盖 C0/C1 控制符和双向文本控制符；正文、名称、kind、外部错误文本都要过它。
+ * 换成可见占位符而不是删掉 —— **"这里原本有东西"本身是信息**。
+ */
+export function sanitizeForDisplay(text) {
+  return String(text ?? "").replace(
+    /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu,
+    "\uFFFD");
+}
+
 /** 正文压成一行，默认截断 —— 一屏能看完才叫"看得见"。 */
 export function oneLine(text, { full = false, width = 60 } = {}) {
-  const flat = String(text ?? "").replace(/\s+/gu, " ").trim();
+  const flat = sanitizeForDisplay(text).replace(/\s+/gu, " ").trim();
   if (full || flat.length <= width) return flat || "(空)";
   return flat.slice(0, width) + "…";
 }
@@ -120,10 +137,21 @@ export function describeRecordState(record, { resolveTarget = null } = {}) {
   // 听起来像"等等就好"，实际是**永远发不出去**。
   // 恰恰是最该被看见的那一类被藏得最深：它正是人要决定清不清的那种。
   // 所以先解析目标，target_gone 优先于资格。
-  const hasEligibility = typeof record?.publish_eligible_at === "string"
-    && record.publish_eligible_at.length > 0;
+  // **授权判据只有一份。**
+  //
+  // 上一版这里又写了一遍"非空字符串" —— 于是对
+  // publish_eligible_at:"not-a-canonical-time"，审计说"解释不了"、
+  // 查看器却说"记录本身已就绪"：**同一个 CLI 给出两个相反的结论。**
+  const hasEligibility = hasPublishAuthorization(record);
+  // 而且"畸形授权"和"尚未授权"要分开说 —— 前者需要人看，后者等等就好。
+  const malformedAuth = record?.publish_eligible_at !== undefined
+    && record?.publish_eligible_at !== null && !hasEligibility;
 
   if (typeof resolveTarget !== "function") {
+    if (malformedAuth) {
+      return { code: "auth_malformed",
+        text: "发布资格字段是坏的（不是规范时间）—— 需要人看一眼" };
+    }
     return hasEligibility
       ? { code: "unknown_target", text: "记录本身没问题；目标话题是否仍有效，这里判不出来" }
       : { code: "not_eligible", text: "尚未取得发布资格（目标话题是否仍有效，这里判不出来）" };
@@ -132,13 +160,17 @@ export function describeRecordState(record, { resolveTarget = null } = {}) {
   try { target = resolveTarget(record?.target_channel_generation_id ?? null); }
   catch (err) {
     return { code: "unknown_target",
-      text: "目标话题解析不出来（" + String(err?.message ?? err).slice(0, 60) + "）" };
+      text: "目标话题解析不出来（" + sanitizeForDisplay(String(err?.message ?? err)).slice(0, 60) + "）" };
   }
   if (!target?.ok) {
     // **目标没了就是没了**，有没有资格都改变不了这个事实 —— 先说这个。
     return { code: "target_gone",
       text: "目标话题代际已经不可用（" + (target?.reason ?? "说不清") + "）—— 永远发不出去" +
         (hasEligibility ? "" : "；这条也还没取得发布资格") };
+  }
+  if (malformedAuth) {
+    return { code: "auth_malformed",
+      text: "发布资格字段是坏的（不是规范时间）—— **这不是「还没轮到它」，是需要人看一眼**" };
   }
   if (!hasEligibility) {
     return { code: "not_eligible", text: "尚未取得发布资格（目标话题还在）" };
@@ -151,7 +183,9 @@ export function describeTaskPublishability({ task, home }) {
   let pre;
   try { pre = preflightTask({ task, home }); }
   catch (err) {
-    return { ok: false, text: "这个 task 能否发布查不出来（" + String(err?.message ?? err).slice(0, 80) + "）" };
+    return { ok: false,
+      text: "这个 task 能否发布查不出来（" +
+        sanitizeForDisplay(String(err?.message ?? err)).slice(0, 80) + "）" };
   }
   if (pre?.ok) return { ok: true, text: "task 可发布" };
   const known = {
@@ -172,7 +206,13 @@ export function describeTaskPublishability({ task, home }) {
  */
 export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey = null } = {}) {
   const reg = loadRegistry(registryFile(home));
-  if (!reg.ok) return { ok: false, reason: "registry_unreadable" };
+  // **原样透传受控 reason/detail。**上一版一律改写成 registry_unreadable ——
+  // 登记表那层刚做出来的精确诊断（结构坏了、第几条坏了）到不了用户手上，
+  // 他看到的只有"读不出登记表"。
+  if (!reg.ok) {
+    return { ok: false, reason: reg.reason ?? "registry_unreadable",
+      detail: reg.detail ? sanitizeForDisplay(reg.detail) : null };
+  }
   const all = reg.tasks ?? [];
   const selected = all.filter((t) =>
     (threadId === null || t.codex_thread_id === threadId) &&
@@ -187,7 +227,7 @@ export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey =
     const outboxDir = taskPaths(task, home).outbox;
     const audit = auditOutbox(outboxDir);
     const entry = {
-      name: task.task_display_name ?? task.logical_task_key ?? "(未命名)",
+      name: sanitizeForDisplay(task.task_display_name ?? task.logical_task_key ?? "(未命名)"),
       taskKey: task.logical_task_key ?? null,
       readable: audit.ok === true,
       unreadableReason: audit.ok === true ? null : (audit.reason ?? "说不清"),
@@ -208,7 +248,7 @@ export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey =
         const state = describeRecordState(r, { resolveTarget });
         entry.records.push({
           file: path.basename(r._file ?? ""),
-          kind: r.kind ?? "?",
+          kind: sanitizeForDisplay(r.kind ?? "?"),
           createdAt: r.created_at ?? null,
           text: r.text ?? "",
           state: state.code,
@@ -256,7 +296,10 @@ function main() {
   if (!got.ok) {
     console.error(got.reason === "task_not_found"
       ? "没有这个 task —— **不是「没有积压」，是点名的那一条不存在。**"
-      : "读不出登记表（" + got.reason + "）。");
+      : got.reason === "registry_malformed"
+        ? "登记表结构不对" + (got.detail ? "（" + got.detail + "）" : "") +
+          " —— **这不是「没有积压」**，先看一眼那张表。"
+        : "读不出登记表（" + got.reason + "）。");
     process.exit(1);
   }
   if (got.tasks.length === 0) {

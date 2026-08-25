@@ -166,7 +166,29 @@ export function loadRegistry(file = registryFile()) {
     if (typeof task.logical_task_key !== "string" || !task.logical_task_key) {
       malformed.push({ index: i, why: "缺 logical_task_key" }); continue;
     }
+    // **key 的字符集要跟生成端一致。**
+    //
+    // 存储目录是 safeKey(logical_task_key) 算出来的，它把非法字符统一换成 `_`。
+    // 于是 `a/b` 和 `a?b` 会落到同一个 tasks/a_b/ —— **两条 task 的 outbox
+    // 和锁混在一起**，而登记表照样报 ok。评审实测复现。
+    // 生成端本来就只产 [A-Za-z0-9_-]+，读取端要求同一条规矩。
+    if (!/^[A-Za-z0-9_-]+$/u.test(task.logical_task_key)) {
+      malformed.push({ index: i, why: "logical_task_key 含非法字符（只允许 A-Za-z0-9_-）" });
+      continue;
+    }
     tasks.push({ ...task, id: task.id ?? task.logical_task_key });
+  }
+  // **派生出来的存储键也必须唯一。**字符集收紧之后一般不会撞，
+  // 但唯一性是这里要保证的性质，不能靠"字符集大概够用"来间接成立。
+  const derived = new Map();
+  for (const [i, t] of tasks.entries()) {
+    const key = safeKey(t.logical_task_key);
+    if (derived.has(key)) {
+      malformed.push({ index: i,
+        why: "存储键与 #" + derived.get(key) + " 相同（都是 " + key + "）" });
+    } else {
+      derived.set(key, i);
+    }
   }
   if (malformed.length > 0) {
     return { ok: false, file, tasks: [], reason: "registry_malformed",

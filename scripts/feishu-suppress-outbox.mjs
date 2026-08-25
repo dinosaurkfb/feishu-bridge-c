@@ -29,7 +29,7 @@
 import path from "node:path";
 
 import { isDirectRun } from "./direct-run.mjs";
-import { auditOutbox, listPending, outboxMutationBlocker } from "./outbox.mjs";
+import { outboxMutationBlocker, readOutboxSnapshot } from "./outbox.mjs";
 import { groupByTargetGeneration, outboxDirOf } from "./drain-outbox.mjs";
 import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { resolveProject } from "./project-resolve.mjs";
@@ -192,7 +192,18 @@ function main() {
   //
   // 预览必须跟执行给出同一个结论：只在核心那层挡，人看完预览再去 --apply
   // 才撞上拒绝，而预览正是他用来做决定的那一步。
-  const blocked = outboxMutationBlocker(auditOutbox(outboxDir));
+  //
+  // **整个预览只读这一次盘。**审计、待发选择、逐条展示、摘要 —— 全部消费
+  // 下面这一份快照。曾经这里读三遍（审计一遍、listPending 一遍、算摘要再一遍），
+  // 评审在其中两次读之间做同名替换：**人看到 A，摘要绑的是 B**。
+  const snap = readOutboxSnapshot(outboxDir);
+  if (!snap.ok) {
+    console.error(snap.reason === "outbox_not_a_directory"
+      ? "outbox 那个路径不是目录" : "outbox 读不出来");
+    process.exitCode = 1;
+    return;
+  }
+  const blocked = outboxMutationBlocker(snap.audit);
   if (blocked) {
     console.error({
       outbox_unreadable: "outbox 读不出来",
@@ -206,7 +217,7 @@ function main() {
     return;
   }
 
-  const all = listPending({ outboxDir });
+  const all = snap.records;
   // **跟排空用同一套代际解析。**直接按 r.target_channel_generation_id 过滤会漏掉
   // 旧格式记录 —— 它们没有这个字段，排空时被归入当前有效代际（__legacy_active__），
   // 于是按诊断给的代际 id 来筛，一条都筛不到。
@@ -240,8 +251,8 @@ function main() {
   console.log("");
   const needsExpect = dependsOnMapping(pending);
   // 预览要显示的摘要。**只在预览路径上算**，--apply 走命令行带回来的那份。
-  const previewDigest = suppressionDigest({
-    outboxDir: outboxDir, files: auditOutbox(outboxDir).files, records: pending });
+  // 文件集合和每条的字节都来自上面那一份快照 —— **这里不再读盘**。
+  const previewDigest = suppressionDigest({ files: snap.files, records: pending });
 
   console.log("项目      " + root);
   console.log("范围      " + (generation === null

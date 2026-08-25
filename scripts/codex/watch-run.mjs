@@ -2,6 +2,7 @@
 /** 一次性 watcher：确认 Codex run 终局、兜底入队、按发布合同处理并释放 task 锁。 */
 
 import { readClaim, recordClaimState } from "../claim.mjs";
+import { recoverEligibilityPending } from "../eligibility-recovery.mjs";
 import { releaseSessionLock } from "../handoff.mjs";
 import {
   appendEvent, markPublishEligibleByEventKey, MAX_REPLY_CHARS, suppressPublishByEventKey,
@@ -39,6 +40,17 @@ const run = {
 const eventKey = "codex:" + task.codex_thread_id + ":claim:" + key + ":reply";
 const acceptedClaim = readClaim({ claimsDir: paths.claims, key });
 const targetGenerationId = acceptedClaim?.origin_channel_generation_id ?? null;
+// **上一轮卡住的资格，在这里补上。**
+//
+// 提升取不到发布锁时（publisher_busy）watcher 只记一个 eligibility_pending 就退了；
+// 没人消费的话那条答复再没有任何路径获得资格。
+// **必须在拿发布锁之前跑** —— 它内部要拿那把锁，锁内调会自己卡死自己。
+const recovered = recoverEligibilityPending({
+  claimsDir: paths.claims, outboxDir: paths.outbox, publishLockDir: paths.publishLock });
+for (const r of recovered.recovered) console.error("补回发布资格：" + r.key + "（" + r.reason + "）");
+for (const r of recovered.pending) console.error("资格仍卡住：" + r.key + "（" + r.reason + "）");
+for (const r of recovered.unusable) console.error("恢复标记看不懂，没动：" + r.key + " —— " + r.unusable);
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const started = Date.now();
 const MAX_WAIT_MS = 4 * 60 * 60 * 1000;

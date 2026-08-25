@@ -26,7 +26,7 @@
 import path from "node:path";
 
 import { isDirectRun } from "../direct-run.mjs";
-import { auditOutbox, listPending, outboxMutationBlocker } from "../outbox.mjs";
+import { outboxMutationBlocker, readOutboxSnapshot } from "../outbox.mjs";
 import {
   applySuppressionCore, corruptTargets, dependsOnMapping, suppressionDigest,
   generationTargetState, usableGeneration,
@@ -213,7 +213,18 @@ function main() {
   //
   // 预览必须跟执行给出同一个结论：只在核心那层挡，人看完预览再去 --apply
   // 才撞上拒绝，而预览正是他用来做决定的那一步。
-  const blocked = outboxMutationBlocker(auditOutbox(paths.outbox));
+  //
+  // **整个预览只读这一次盘。**审计、待发选择、逐条展示、摘要 —— 全部消费
+  // 下面这一份快照。曾经这里读三遍（审计一遍、listPending 一遍、算摘要再一遍），
+  // 评审在其中两次读之间做同名替换：**人看到 A，摘要绑的是 B**。
+  const snap = readOutboxSnapshot(paths.outbox);
+  if (!snap.ok) {
+    console.error(snap.reason === "outbox_not_a_directory"
+      ? "outbox 那个路径不是目录" : "outbox 读不出来");
+    process.exitCode = 1;
+    return;
+  }
+  const blocked = outboxMutationBlocker(snap.audit);
   if (blocked) {
     console.error({
       outbox_unreadable: "outbox 读不出来",
@@ -227,7 +238,7 @@ function main() {
     return;
   }
 
-  const all = listPending({ outboxDir: paths.outbox });
+  const all = snap.records;
   const pending = selectByGeneration(all, generation, task);
   // **预览看到的代际必须由人带进来。**
   //
@@ -268,8 +279,8 @@ function main() {
   console.log("");
   const needsExpect = dependsOnMapping(pending);
   // 预览要显示的摘要。**只在预览路径上算**，--apply 走命令行带回来的那份。
-  const previewDigest = suppressionDigest({
-    outboxDir: paths.outbox, files: auditOutbox(paths.outbox).files, records: pending });
+  // 文件集合和每条的字节都来自上面那一份快照 —— **这里不再读盘**。
+  const previewDigest = suppressionDigest({ files: snap.files, records: pending });
 
   if (pending.length === 0) { console.log("\n没有待发内容，无需改动。"); return; }
   if (generation === null && all.length > 1) {

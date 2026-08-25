@@ -19,7 +19,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-import { auditOutbox, listPending, outboxMutationBlocker } from "./outbox.mjs";
+import {
+  auditOutbox, listPending, outboxMutationBlocker, readOutboxSnapshot,
+} from "./outbox.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { generationTargetState, usableGeneration } from "./topic-generation.mjs";
 
@@ -146,12 +148,19 @@ export function suppressionDigest({ outboxDir = null, files = [], records = [] }
   const snapshots = records.map((r) => {
     const name = nameOf(r);
     const file = r?._file ?? (outboxDir ? path.join(outboxDir, name) : null);
-    let raw;
-    try { raw = fs.readFileSync(file); }
-    catch {
-      // 读不出来 → 一个**不可能跟真实内容相撞**的标记，让摘要必然变化。
-      // 真正的拦截在审计那一层（读不出来的文件根本走不到这儿）。
-      raw = Buffer.from("\u0000unreadable\u0000" + name);
+    // **优先用记录自带的那份字节。**
+    //
+    // 快照（readOutboxSnapshot）已经把原始字节挂在 `_raw` 上了；
+    // 在这里重新读盘就等于"渲染看一份、摘要看另一份"——
+    // 评审在两次读之间做同名替换，**人看到 A、摘要绑的是 B**。
+    // 只有在调用方给不出字节时才回落到读盘。
+    let raw = r?._raw;
+    if (!raw) {
+      try { raw = fs.readFileSync(file); }
+      catch {
+        // 读不出来 → 一个不可能跟真实内容相撞的标记，让摘要必然变化。
+        raw = Buffer.from("\u0000unreadable\u0000" + name);
+      }
     }
     return { name, file, raw };
   });
@@ -244,12 +253,15 @@ export function applySuppressionCore({
       return { ok: false, reason: "rotated",
         from: previewGenerationId, to: state.activeGeneration ?? null };
     }
-    // **这个 outbox 现在能不能动 —— 只认统一守卫。**
-    // 判据跟只读视图共用一份；这里再自己判一次就是第二份判据。
-    const blocked = outboxMutationBlocker(auditOutbox(outboxDir));
+    // **锁内只读这一次盘** —— 审计、选择、摘要、写回全用这一份字节。
+    const snap = readOutboxSnapshot(outboxDir);
+    if (!snap.ok) return { ok: false, reason: snap.reason, files: [] };
+    // 能不能动，只认统一守卫；判据跟只读视图共用一份。
+    const blocked = outboxMutationBlocker(snap.audit);
     if (blocked) return { ok: false, ...blocked };
 
-    const fresh = state.select(listPending({ outboxDir }));
+    // 代际选择仍归调用方 —— 快照函数不接 selector 回调，那是另一件事。
+    const fresh = state.select(snap.records);
     // **锁内重读之后要再判一次损坏，不能只比文件名。**
     //
     // 锁外那次判的是预览快照。同一个文件的目标代际在预览之后变坏时，
@@ -270,18 +282,13 @@ export function applySuppressionCore({
     const same = before.size === now.size && [...before].every((f) => now.has(f));
     if (!same) return { ok: false, reason: "drift", before: before.size, now: now.size };
 
-    // **锁内只读这一次盘**：摘要核对和写回用同一份字节，中间不留窗口。
-    const snapshots = [];
-    for (const r of fresh) {
-      const file = r?._file;
-      if (typeof file !== "string") return { ok: false, reason: "outbox_unreadable", files: [] };
-      try { snapshots.push({ name: path.basename(file), file, raw: fs.readFileSync(file) }); }
-      catch { return { ok: false, reason: "outbox_unreadable", files: [path.basename(file)] }; }
-    }
+    // 字节来自上面那一次读 —— **这里不再读盘**。
+    const snapshots = fresh.map((r) => ({
+      name: path.basename(String(r._file)), file: r._file, raw: r._raw }));
     // 锁内重算，跟人带回来的那份比。**这一步才是真正的跨进程 CAS** ——
     // 文件集合、每条的字节只要有一点跟预览时不同就中止，
     // 包括"预览之后新进来一条"这种待发集合比较看不出来的情况。
-    const nowDigest = digestOfSnapshots(auditOutbox(outboxDir).files, snapshots);
+    const nowDigest = digestOfSnapshots(snap.files, snapshots);
     if (nowDigest !== previewDigest) {
       return { ok: false, reason: "digest_mismatch",
         expected: previewDigest, actual: nowDigest };

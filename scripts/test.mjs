@@ -25,6 +25,9 @@ import {
   ENVELOPE_ENV as ENV_PASS, FETCH_BACKOFF_MS, RECENT_TURNS, buildEventsArgs, fetchTriggerEvent, inheritedEvent,
 } from "./envelope.mjs";
 import { acquireClaim, claimKey, recordClaimState } from "./claim.mjs";
+import {
+  listEligibilityPending, recoverEligibilityPending,
+} from "./eligibility-recovery.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
   acquirePublishLock, attributeSession, exactProjectsForRoot, fileContainsAny, isUnder,
@@ -12137,6 +12140,176 @@ test("抑制预览要摊开将要停掉的内容 —— 摘要绑的是人看过
   assert.equal((r2.stdout ?? "").includes(ESC), false, "**预览里不许有 ESC**");
 });
 
+
+test("预览只许读一次盘：两次读之间被同名替换，摘要必须仍绑人看过的那份", () => {
+  // 上一条测试只断言"同一份输出里同时出现正文和摘要"——**抓不住这个缺陷**：
+  // 渲染和摘要各读一次盘时，两次输出照样都出现，只是它们看的不是同一份字节。
+  // 评审实测过这条路径：人看到 A / 随后文件被同名换成 B / 预览给出的摘要 == B 的摘要。
+  // 于是他照抄摘要落盘，**永久抑制了一条自己从没看过的记录**。
+  //
+  // 所以这条测试在两次读之间真的把文件换掉：只读一次的实现摘要绑 A，读两次的绑 B。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-l3-onread-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", lark_cli_bin: "/nonexistent/lark-cli",
+  }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_fixture", claude_session_id: null,
+    channel_generation_id: "gen-1", expires_at: "2099-01-01T00:00:00.000Z",
+  }));
+
+  const target = path.join(obDir, "0001.json");
+  const bytesA = Buffer.from(JSON.stringify(outboxRecord({
+    text: "版本A：人看到的就是这句", target_channel_generation_id: "gen-1" })));
+  const bytesB = Buffer.from(JSON.stringify(outboxRecord({
+    text: "版本B：偷换进来的", target_channel_generation_id: "gen-1" })));
+  fs.writeFileSync(target, bytesA);
+
+  // 第一次读到这个文件之后立刻把盘上换成 B。再读一次的实现就会看到 B。
+  const swap = path.join(dir, "swap-after-first-read.mjs");
+  fs.writeFileSync(swap, [
+    'import fs from "node:fs";',
+    'const real = fs.readFileSync;',
+    'const target = process.env.SWAP_TARGET;',
+    'let swapped = false;',
+    'fs.readFileSync = function (p, ...rest) {',
+    '  const out = real.call(this, p, ...rest);',
+    '  if (!swapped && String(p) === target) {',
+    '    swapped = true;',
+    '    fs.writeFileSync(target, Buffer.from(process.env.SWAP_TO, "base64"));',
+    '  }',
+    '  return out;',
+    '};',
+  ].join("\n"));
+
+  const r = spawnSync(process.execPath, [
+    "--import", pathToFileURL(swap).href,
+    path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir,
+  ], { encoding: "utf-8", env: { ...process.env, HOME: dir,
+    SWAP_TARGET: target, SWAP_TO: bytesB.toString("base64") } });
+  const out = r.stdout ?? "";
+
+  // 前提：探针真的换了盘上那份 —— 不然这条测试什么都没测。
+  assert.equal(fs.readFileSync(target).toString(), bytesB.toString(),
+    "探针没生效：文件没被换掉，后面的断言就不成立");
+  assert.match(out, /版本A：人看到的就是这句/u, "渲染读的是第一次那份");
+
+  const printed = /--expect-digest (sup-[0-9a-f]{24})/u.exec(out);
+  assert.ok(printed, "预览要给出摘要：" + out.slice(0, 300));
+  const digestOf = (raw) => suppressionDigest({
+    files: ["0001.json"], records: [{ _file: target, _raw: raw }] });
+  assert.equal(printed[1], digestOf(bytesA),
+    "**摘要必须绑人看过的 A**；等于 B 的摘要就说明渲染和摘要读的不是同一份");
+  assert.notEqual(digestOf(bytesA), digestOf(bytesB), "A、B 的摘要本来就该不同");
+});
+
+test("eligibility_pending 要有消费者：卡住的资格下一轮必须补回来", () => {
+  // 给资格提升加发布锁之后 publisher_busy 成了真实路径：提升只重试约 720ms，
+  // 而竞争方持锁做真实网络发布，默认可达 12 秒。watcher 记下 eligibility_pending
+  // 就退出了 —— **没人消费的话，那条答复再没有任何路径获得资格**。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-elig-"));
+  const outboxDir = path.join(dir, "outbox");
+  const claimsDir = path.join(dir, "claims");
+  const lockDir = path.join(dir, "publish.lock");
+  fs.mkdirSync(outboxDir); fs.mkdirSync(claimsDir);
+  const ek = "codex:th:claim:k1:reply";
+  fs.writeFileSync(path.join(outboxDir, "0001.json"),
+    JSON.stringify(outboxRecord({ text: "答复", event_key: ek })));
+
+  // 先复现"卡住"本身：锁被别人持着，提升就是拿不到。
+  assert.equal(acquirePublishLock(lockDir).ok, true);
+  const blocked = markPublishEligibleByEventKey({ outboxDir, eventKey: ek, publishLockDir: lockDir });
+  assert.equal(blocked.ok, false, "锁被占着就该提不上去");
+  assert.equal(blocked.reason, "publisher_busy");
+  const marker = recordClaimState({ claimsDir, key: "k1", state: "eligibility_pending",
+    detail: { run_state: "completed", promote_failed: blocked.reason, event_key: ek } });
+
+  // 锁还占着的时候恢复器也提不上去 —— 但**绝不能把标记删掉**。
+  const stillHeld = recoverEligibilityPending({ claimsDir, outboxDir, publishLockDir: lockDir });
+  assert.deepEqual(stillHeld.recovered, []);
+  assert.equal(stillHeld.pending[0].reason, "publisher_busy");
+  assert.equal(fs.existsSync(marker), true, "**没恢复成就不许撤标记**，撤了就再没人管了");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(outboxDir, "0001.json"), "utf-8"))
+    .publish_eligible_at, undefined, "没拿到锁就不许写");
+
+  // 锁放开之后，下一轮必须真的把资格补上，并撤掉标记。
+  releasePublishLock(lockDir);
+  const done = recoverEligibilityPending({ claimsDir, outboxDir, publishLockDir: lockDir });
+  assert.equal(done.recovered.length, 1, "锁放开了就该补回来");
+  assert.equal(done.recovered[0].eventKey, ek);
+  const rec = JSON.parse(fs.readFileSync(path.join(outboxDir, "0001.json"), "utf-8"));
+  assert.equal(typeof rec.publish_eligible_at, "string");
+  assert.match(rec.publish_eligible_at, /^\d{4}-\d{2}-\d{2}T/u, "写的得是规范时间");
+  assert.equal(fs.existsSync(marker), false, "有结论了就撤标记，别让下一轮反复重试");
+});
+
+test("恢复器：看不懂的标记一律不动，也不许拿它去提升别人的资格", () => {
+  // 一张错配的标记如果能提升资格，就等于给另一条事件发了发布授权。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-elig-bad-"));
+  const outboxDir = path.join(dir, "outbox");
+  const claimsDir = path.join(dir, "claims");
+  const lockDir = path.join(dir, "publish.lock");
+  fs.mkdirSync(outboxDir); fs.mkdirSync(claimsDir);
+  const ek = "codex:th:claim:victim:reply";
+  const recFile = path.join(outboxDir, "0001.json");
+  fs.writeFileSync(recFile, JSON.stringify(outboxRecord({ text: "别人的答复", event_key: ek })));
+
+  const write = (name, doc) => {
+    const f = path.join(claimsDir, name);
+    fs.writeFileSync(f, typeof doc === "string" ? doc : JSON.stringify(doc));
+    return f;
+  };
+  const good = { schema_version: "1.0", state: "eligibility_pending", event_key: ek };
+  // 逐个分支都要验到 —— "这段文字里提到了它"不算断言。
+  const bad = [
+    ["半截文件", write("a.eligibility_pending.json", "{ 坏了")],
+    ["不是对象", write("b.eligibility_pending.json", [1, 2])],
+    ["claim_key 跟文件名对不上", write("c.eligibility_pending.json", { ...good, claim_key: "别人" })],
+    ["state 不是这个", write("d.eligibility_pending.json", { ...good, claim_key: "d", state: "completed" })],
+    ["缺 event_key", write("e.eligibility_pending.json", { ...good, claim_key: "e", event_key: "" })],
+  ];
+  const listed = listEligibilityPending({ claimsDir });
+  assert.equal(listed.length, bad.length, "结构不对的也要列出来，不许静默跳过");
+  assert.equal(listed.every((x) => typeof x.unusable === "string"), true,
+    "每一条都得说清为什么看不懂：" + JSON.stringify(listed));
+
+  const r = recoverEligibilityPending({ claimsDir, outboxDir, publishLockDir: lockDir });
+  assert.deepEqual(r.recovered, []);
+  assert.deepEqual(r.pending, []);
+  assert.equal(r.unusable.length, bad.length);
+  for (const [why, f] of bad) assert.equal(fs.existsSync(f), true, why + "：看不懂就不许删");
+  assert.equal(JSON.parse(fs.readFileSync(recFile, "utf-8")).publish_eligible_at, undefined,
+    "**一张看不懂的标记不许给任何记录发资格**");
+  assert.equal(fs.existsSync(lockDir), false, "一把锁都不该拿");
+});
+
+test("停发是终局：恢复器不许把人已经永久停掉的记录重新提上资格", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-elig-sup-"));
+  const outboxDir = path.join(dir, "outbox");
+  const claimsDir = path.join(dir, "claims");
+  const lockDir = path.join(dir, "publish.lock");
+  fs.mkdirSync(outboxDir); fs.mkdirSync(claimsDir);
+  const ek = "codex:th:claim:k9:reply";
+  const recFile = path.join(outboxDir, "0001.json");
+  fs.writeFileSync(recFile, JSON.stringify({
+    ...outboxRecord({ text: "人已经停掉的", event_key: ek }),
+    publish_suppressed_at: "2026-08-25T00:00:00.000Z",
+  }));
+  const marker = recordClaimState({ claimsDir, key: "k9", state: "eligibility_pending",
+    detail: { run_state: "completed", promote_failed: "publisher_busy", event_key: ek } });
+
+  const r = recoverEligibilityPending({ claimsDir, outboxDir, publishLockDir: lockDir });
+  assert.equal(r.recovered[0].reason, "already_suppressed", "结论是「已经有结论」，不是「提上去了」");
+  const rec = JSON.parse(fs.readFileSync(recFile, "utf-8"));
+  assert.equal(rec.publish_eligible_at, undefined,
+    "**停掉的记录一个字都不许改** —— 靠下游筛选兜住不算，判据一变人停掉的东西就复活了");
+  assert.equal(rec.publish_suppressed_at, "2026-08-25T00:00:00.000Z");
+  assert.equal(fs.existsSync(marker), false, "已经有结论了，标记该撤 —— 否则永远重试");
+});
 
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

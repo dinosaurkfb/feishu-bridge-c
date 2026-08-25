@@ -5900,6 +5900,208 @@ test("只写改动，不顺带补写视图合成的默认值", () => {
 });
 
 
+/**
+ * **每个登记表 mutator 的语义差分契约。**
+ *
+ * 这一层最近三轮的 P1 有个共同形状：**都是我的修法自己引入的**
+ * （"或"定位、写前不校验、补写 id、删除落不了盘）。
+ * 变异验证能证明"守卫有效"，但证明不了"我没在别处开新口子"。
+ *
+ * 评审给的答案是给每个 mutator 建语义差分契约 —— 直接比较修改前后的原始 JSON：
+ *   · ok:false ⇒ 文件字节完全不变
+ *   · ok:true  ⇒ 修改后仍能被同一读取器接受
+ *   · 除明确允许的 JSON 路径外，其余内容深度相等
+ *   · 应删除的字段确实消失，而不只是新字段出现
+ *   · 调换数组顺序、加入无关停用条目/扩展字段后，目标与结果不变
+ *   · 注入重复或矛盾身份后，必须转成 fail-closed
+ *
+ * 这类检查会直接抓住本轮那三条。**"允许变化清单"必须由人写出来** ——
+ * 差集本身只能告诉你变了，不能判断变得对不对。
+ */
+function registryContract({ name, build, run, allowed, mustVanish = [], addsEntries = 0 }) {
+  const read = (f) => JSON.parse(fs.readFileSync(f, "utf-8"));
+  const at = (doc, p) => p.split(".").reduce((o, k) =>
+    (o == null ? o : o[/^\d+$/u.test(k) ? Number(k) : k]), doc);
+
+  // 把两份文档摊平成"路径 → 值"，再比路径集合。
+  const flatten = (v, prefix, out) => {
+    if (v !== null && typeof v === "object") {
+      for (const k of Object.keys(v)) flatten(v[k], prefix ? prefix + "." + k : k, out);
+      if (Object.keys(v).length === 0) out.set(prefix, Array.isArray(v) ? "[]" : "{}");
+    } else {
+      out.set(prefix, JSON.stringify(v));
+    }
+    return out;
+  };
+  // 允许清单用 * 匹配任意一段（通常是数组下标）。
+  const ok = (p) => allowed.some((pat) => new RegExp(
+    "^" + pat.split(".").map((x) => x === "*" ? "[^.]+"
+      : x.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")).join("\\.") + "(\\..+)?$", "u").test(p));
+
+  const diffPaths = (a, b) => {
+    const fa = flatten(a, "", new Map());
+    const fb = flatten(b, "", new Map());
+    const keys = new Set([...fa.keys(), ...fb.keys()]);
+    return [...keys].filter((k) => fa.get(k) !== fb.get(k));
+  };
+
+  // ① 成功路径：允许清单之外的一切都必须深度相等。
+  {
+    const { home, file } = build();
+    const before = read(file);
+    const r = run({ home, file });
+    assert.equal(r.ok, true, name + "：正常路径应当成功 —— " + JSON.stringify(r));
+    const after = read(file);
+    assert.equal(loadRegistry(file).ok, true, name + "：**改完必须还读得回来**");
+    const stray = diffPaths(before, after).filter((p) => !ok(p));
+    assert.deepEqual(stray, [],
+      name + "：**允许清单之外的路径变了** —— 清单要由人写全，" +
+      "差集本身只能告诉你变了、不能判断变得对不对");
+    for (const p of mustVanish) {
+      assert.equal(at(after, p), undefined,
+        name + "：**应当消失的字段还在盘上**（" + p + "）—— assign 只能加不能删");
+    }
+  }
+
+  // ② 无关噪音不许改变结果：加停用条目、加顶层扩展字段、调换数组顺序。
+  {
+    const { home, file } = build();
+    const doc = read(file);
+    doc.顶层扩展 = "无关";
+    doc.tasks.push({ root: "/tmp/zz", logical_task_key: "unrelated-disabled",
+      id: "unrelated-disabled", enabled: false });
+    doc.tasks.reverse();
+    fs.writeFileSync(file, JSON.stringify(doc, null, 2));
+    const before = read(file);
+    const r = run({ home, file });
+    assert.equal(r.ok, true, name + "：无关噪音不该让它失败 —— " + JSON.stringify(r));
+    const after = read(file);
+    assert.equal(after.顶层扩展, "无关", name + "：**顶层扩展字段被删了**");
+    assert.equal(after.tasks.length, before.tasks.length + addsEntries,
+      name + "：**条目数不对**（应当只多 " + addsEntries + " 条）");
+    assert.ok(after.tasks.some((t) => t.logical_task_key === "unrelated-disabled"
+      && t.enabled === false), name + "：**无关的停用条目被删了**");
+    assert.equal(loadRegistry(file).ok, true, name + "：加噪音之后仍要读得回来");
+  }
+
+  // ③ 注入矛盾身份 → 必须 fail-closed，且**文件一个字节都不许动**。
+  {
+    const { home, file } = build();
+    const doc = read(file);
+    doc.tasks.push({ ...doc.tasks[0],
+      codex_thread_id: "01922222-0000-7000-8000-000000000abc" });
+    fs.writeFileSync(file, JSON.stringify(doc, null, 2));
+    const before = fs.readFileSync(file, "utf-8");
+    const r = run({ home, file });
+    assert.equal(r.ok, false, name + "：**矛盾身份必须 fail-closed**");
+    assert.equal(fs.readFileSync(file, "utf-8"), before,
+      name + "：**被拒之后文件字节必须完全不变**");
+  }
+}
+
+test("语义差分契约：改显示名", () => {
+  registryContract({
+    name: "setTaskDisplayName",
+    build: () => {
+      const home = temp();
+      const root = path.join(home, "p");
+      fs.mkdirSync(root, { recursive: true });
+      const t = makeTaskEntry({ root, threadId: THREAD_A, name: "旧名",
+        rootMessageId: "om_a", token: "a1b2c3" });
+      const file = path.join(home, "registry.json");
+      fs.writeFileSync(file, JSON.stringify({ schema_version: "1.0", runtime: "codex",
+        tasks: [t] }, null, 2));
+      return { home, file };
+    },
+    run: ({ home }) => setTaskDisplayName({ threadId: THREAD_A, name: "新名", home }),
+    allowed: ["tasks.*.task_display_name"],
+  });
+});
+
+test("语义差分契约：暂停与恢复 —— 删除语义必须落盘", () => {
+  // **本轮 P1 就在这里**：恢复连接时视图里 delete 了 paused_at，
+  // 而 Object.assign 只能加不能删 —— 磁盘上同时是 active 和 paused_at。
+  const build = () => {
+    const home = temp();
+    const root = path.join(home, "p");
+    fs.mkdirSync(root, { recursive: true });
+    const t = makeTaskEntry({ root, threadId: THREAD_A, name: "T",
+      rootMessageId: "om_a", token: "a1b2c3" });
+    const file = path.join(home, "registry.json");
+    fs.writeFileSync(file, JSON.stringify({ schema_version: "1.0", runtime: "codex",
+      tasks: [t] }, null, 2));
+    setTaskConnectionStatus({ threadId: THREAD_A, status: "paused", home, now: 1000 });
+    return { home, file };
+  };
+  // 前提：暂停之后盘上确实有 paused_at。
+  const probe = build();
+  assert.ok(JSON.parse(fs.readFileSync(probe.file, "utf-8")).tasks[0].paused_at,
+    "前提：暂停要写下 paused_at");
+
+  registryContract({
+    name: "setTaskConnectionStatus(resume)",
+    build,
+    run: ({ home }) =>
+      setTaskConnectionStatus({ threadId: THREAD_A, status: "active", home, now: 2000 }),
+    // **清单由人写全**：恢复连接本来就要改这些。
+    allowed: [
+      "tasks.*.status", "tasks.*.paused_at", "tasks.*.resumed_at",
+      "tasks.*.pending_expires_at",
+      "tasks.*.topic_generation_state.binding_status",
+      "tasks.*.topic_generation_state.updated_at",
+      "tasks.*.topic_generation_state.generations.*.claim_expires_at",
+    ],
+    mustVanish: ["tasks.0.paused_at"],
+  });
+});
+
+test("语义差分契约：新增 task", () => {
+  registryContract({
+    name: "addTask",
+    build: () => {
+      const home = temp();
+      const root = path.join(home, "p");
+      fs.mkdirSync(root, { recursive: true });
+      const t = makeTaskEntry({ root, threadId: THREAD_A, name: "已有",
+        rootMessageId: "om_a", token: "a1b2c3" });
+      const file = path.join(home, "registry.json");
+      fs.writeFileSync(file, JSON.stringify({ schema_version: "1.0", runtime: "codex",
+        tasks: [t] }, null, 2));
+      return { home, file };
+    },
+    run: ({ home }) => {
+      const root = path.join(home, "q");
+      fs.mkdirSync(root, { recursive: true });
+      return addTask(makeTaskEntry({ root, threadId: THREAD_B, name: "新增",
+        rootMessageId: "om_b", token: "b1b2c3" }), { home });
+    },
+    // 新增会在数组末尾多一项 —— 允许清单只覆盖新增那一项。
+    allowed: ["tasks.1", "tasks.2"],
+    addsEntries: 1,
+  });
+});
+
+test("坏表不许被写入口隐式修好 —— 修表是人的决定", () => {
+  // 评审构造：一张因重复存储键而被 loadRegistry 拒绝的表，
+  // 让回调删掉冲突项 —— 修改前读不出来、mutateRegistryDocument 却返回 ok:true，
+  // **坏表被悄悄覆盖成一张新表**。
+  // 那等于给普通写入口发了一张未经授权的隐式修复许可。
+  const home = temp();
+  const file = path.join(home, "registry.json");
+  fs.writeFileSync(file, JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks: [
+    { root: "/tmp/a", logical_task_key: "dup", id: "dup" },
+    { root: "/tmp/b", logical_task_key: "DUP", id: "DUP" },
+  ] }, null, 2));
+  assert.equal(loadRegistry(file).ok, false, "前提：这张表读不出来");
+  const before = fs.readFileSync(file, "utf-8");
+
+  const r = mutateRegistryDocument(file, (raw) => { raw.pop(); return true; });
+  assert.equal(r.ok, false, "**坏表不许被隐式修好**");
+  assert.equal(r.reason, "registry_malformed");
+  assert.equal(fs.readFileSync(file, "utf-8"), before, "文件一个字节都不许动");
+});
+
+
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (failed > 0) process.exit(1);

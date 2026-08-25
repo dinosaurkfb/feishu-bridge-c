@@ -267,6 +267,27 @@ export function loadRegistry(file = registryFile()) {
  * 调用方**只读热路径**仍然可以用 loadRegistry 的活动视图 —— 那是安全的；
  * 危险的只有"拿视图去重建整表"。
  */
+/**
+ * **就地替换原始数组里的那一条** —— 而不是往上叠字段。
+ *
+ * `Object.assign` 只能加和改，**删不掉**。评审实测：恢复连接时视图副本里
+ * `delete task.paused_at` 了，落盘却仍留着 paused_at ——
+ * 磁盘上的状态同时声称"active"和"曾在当前记录中暂停"。
+ * **删除语义在 assign 那条路上根本到不了盘。**
+ *
+ * 保真规则仍然守住："原来没有 id 就仍然没有" ——
+ * 视图里的 id 是 loadRegistry 补的，不是文档里本来就有的。
+ */
+export function replaceRawTask(raw, task) {
+  const found = findRawTask(raw, task);
+  if (!found.ok) return found;
+  const at = raw.indexOf(found.entry);
+  const next = { ...task };
+  if (!Object.hasOwn(found.entry, "id")) delete next.id;
+  raw[at] = next;
+  return { ok: true, entry: next };
+}
+
 export function mutateRegistryDocument(file, mutate) {
   let parsed;
   try { parsed = JSON.parse(fs.readFileSync(file, "utf-8")); }
@@ -282,16 +303,24 @@ export function mutateRegistryDocument(file, mutate) {
   if (parsed.tasks !== undefined && !Array.isArray(parsed.tasks)) {
     return { ok: false, reason: "registry_malformed" };
   }
+  // **回调之前先校验原文档。**
+  //
+  // 上一版只在改完之后校验：评审构造了一张因重复存储键而被 loadRegistry 拒绝的表，
+  // 让回调删掉冲突项 —— 修改前读不出来、mutateRegistryDocument 却返回 ok:true，
+  // **坏表被悄悄覆盖成一张新表**。
+  // 那既不符合"读放行的和写放行的是同一个集合"，也等于给普通写入口
+  // 发了一张**未经授权的隐式修复许可**。修表是人的决定，不是写显示名的副作用。
+  const before = validateRegistryDocument(parsed);
+  if (!before.ok) return { ok: false, ...before };
+
   const raw = parsed.tasks ?? [];
   const changed = mutate(raw);
   // mutate 可以返回 { ok:false, reason } 中止 —— **"找不到目标"必须是错误，
   // 不是"没改动"**：后者会让调用方宣称成功。
   if (changed && changed.ok === false) return { ...changed, file };
   if (changed === false) return { ok: true, changed: false, file };
-  // **写前用跟读同一份身份契约。**上一版只查了启用条目的几个重复字段：
-  // 登记表已有停用 key `same` 时仍能新增启用 key `same` 并返回成功，
-  // **落盘后的文档立刻变成不可读**。写入把一份自己都读不回来的文档固化下来，
-  // 比拒绝写入糟得多。
+  // 改完再校验一次：前一次保证 fail-closed，这一次保证不会写坏。
+  // 写入把一份自己都读不回来的文档固化下来，比拒绝写入糟得多。
   const verdict = validateRegistryDocument({ ...parsed, tasks: raw });
   if (!verdict.ok) return { ok: false, ...verdict };
   const dup = validateRegistryTasks(raw.filter((t) => t && t.enabled !== false));
@@ -337,6 +366,18 @@ export function findRawTask(raw, task) {
   return { ok: true, entry: hit };
 }
 
+/**
+ * **只给测试用的夹具写入口。生产路径一律走 mutateRegistryDocument。**
+ *
+ * 它从零重建 { schema_version, runtime, tasks } —— 顶层未知字段会丢，
+ * 而且不走完整文档校验：评审实测 writeRegistry([{ x: 1 }]) 成功、
+ * 随后 loadRegistry 直接 registry_malformed。
+ * 只要它还是一个不校验的公开写入口，"唯一写入口"这句话就不成立。
+ *
+ * 保留它是因为 86 处测试夹具靠它构造初始状态（**包括故意构造坏表**），
+ * 那是合法用途。所以这里不加校验，而是把用途写死在名字和这段话里：
+ * **生产代码里再出现它就是错的**，有一条测试盯着这件事。
+ */
 export function writeRegistry(tasks, file = registryFile()) {
   const valid = validateRegistryTasks(tasks);
   if (!valid.ok) throw new Error("registry 存在重复绑定字段：" + valid.duplicateFields.join(", "));
@@ -531,15 +572,8 @@ export function setTaskConnectionStatus({
     // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
     // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
     const wrote = mutateRegistryDocument(file, (rawTasks) => {
-      const found = findRawTask(rawTasks, task);
-      if (!found.ok) return found;          // 找不到 / 有歧义 → 错误，不是"没改动"
-      // **只把改动写回去，不顺带补写视图合成的默认值。**
-      // 活动视图里的 id 是 loadRegistry 补的；原条目没有 id 时，
-      // 改个显示名不该顺手把 id 也写进去 —— 那不是"字段丢失"，
-      // 但同样违反"只修改目标字段"的保真契约。
-      const patch = { ...task };
-      if (!Object.hasOwn(found.entry, "id")) delete patch.id;
-      Object.assign(found.entry, patch);
+      const done = replaceRawTask(rawTasks, task);
+      if (!done.ok) return done;            // 找不到 / 有歧义 → 错误，不是"没改动"
       return true;
     });
     if (!wrote.ok) return wrote;
@@ -587,15 +621,8 @@ export function refreshPendingTaskBinding({
     // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
     // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
     const wrote = mutateRegistryDocument(file, (rawTasks) => {
-      const found = findRawTask(rawTasks, task);
-      if (!found.ok) return found;          // 找不到 / 有歧义 → 错误，不是"没改动"
-      // **只把改动写回去，不顺带补写视图合成的默认值。**
-      // 活动视图里的 id 是 loadRegistry 补的；原条目没有 id 时，
-      // 改个显示名不该顺手把 id 也写进去 —— 那不是"字段丢失"，
-      // 但同样违反"只修改目标字段"的保真契约。
-      const patch = { ...task };
-      if (!Object.hasOwn(found.entry, "id")) delete patch.id;
-      Object.assign(found.entry, patch);
+      const done = replaceRawTask(rawTasks, task);
+      if (!done.ok) return done;            // 找不到 / 有歧义 → 错误，不是"没改动"
       return true;
     });
     if (!wrote.ok) return wrote;
@@ -623,15 +650,8 @@ export function setTaskDisplayName({ threadId, name, home = bridgeHome() } = {})
     // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
     // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
     const wrote = mutateRegistryDocument(file, (rawTasks) => {
-      const found = findRawTask(rawTasks, task);
-      if (!found.ok) return found;          // 找不到 / 有歧义 → 错误，不是"没改动"
-      // **只把改动写回去，不顺带补写视图合成的默认值。**
-      // 活动视图里的 id 是 loadRegistry 补的；原条目没有 id 时，
-      // 改个显示名不该顺手把 id 也写进去 —— 那不是"字段丢失"，
-      // 但同样违反"只修改目标字段"的保真契约。
-      const patch = { ...task };
-      if (!Object.hasOwn(found.entry, "id")) delete patch.id;
-      Object.assign(found.entry, patch);
+      const done = replaceRawTask(rawTasks, task);
+      if (!done.ok) return done;            // 找不到 / 有歧义 → 错误，不是"没改动"
       return true;
     });
     if (!wrote.ok) return wrote;
@@ -1031,15 +1051,8 @@ export function promoteTask({
     // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
     // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
     const wrote = mutateRegistryDocument(file, (rawTasks) => {
-      const found = findRawTask(rawTasks, task);
-      if (!found.ok) return found;          // 找不到 / 有歧义 → 错误，不是"没改动"
-      // **只把改动写回去，不顺带补写视图合成的默认值。**
-      // 活动视图里的 id 是 loadRegistry 补的；原条目没有 id 时，
-      // 改个显示名不该顺手把 id 也写进去 —— 那不是"字段丢失"，
-      // 但同样违反"只修改目标字段"的保真契约。
-      const patch = { ...task };
-      if (!Object.hasOwn(found.entry, "id")) delete patch.id;
-      Object.assign(found.entry, patch);
+      const done = replaceRawTask(rawTasks, task);
+      if (!done.ok) return done;            // 找不到 / 有歧义 → 错误，不是"没改动"
       return true;
     });
     if (!wrote.ok) return wrote;
@@ -1082,15 +1095,8 @@ function mutateTaskTopicState({
     // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
     // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
     const wrote = mutateRegistryDocument(file, (rawTasks) => {
-      const found = findRawTask(rawTasks, task);
-      if (!found.ok) return found;          // 找不到 / 有歧义 → 错误，不是"没改动"
-      // **只把改动写回去，不顺带补写视图合成的默认值。**
-      // 活动视图里的 id 是 loadRegistry 补的；原条目没有 id 时，
-      // 改个显示名不该顺手把 id 也写进去 —— 那不是"字段丢失"，
-      // 但同样违反"只修改目标字段"的保真契约。
-      const patch = { ...task };
-      if (!Object.hasOwn(found.entry, "id")) delete patch.id;
-      Object.assign(found.entry, patch);
+      const done = replaceRawTask(rawTasks, task);
+      if (!done.ok) return done;            // 找不到 / 有歧义 → 错误，不是"没改动"
       return true;
     });
     if (!wrote.ok) return wrote;
@@ -1191,15 +1197,8 @@ function mutateTaskInteractionPolicy({
       // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
     // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
     const wrote = mutateRegistryDocument(file, (rawTasks) => {
-      const found = findRawTask(rawTasks, task);
-      if (!found.ok) return found;          // 找不到 / 有歧义 → 错误，不是"没改动"
-      // **只把改动写回去，不顺带补写视图合成的默认值。**
-      // 活动视图里的 id 是 loadRegistry 补的；原条目没有 id 时，
-      // 改个显示名不该顺手把 id 也写进去 —— 那不是"字段丢失"，
-      // 但同样违反"只修改目标字段"的保真契约。
-      const patch = { ...task };
-      if (!Object.hasOwn(found.entry, "id")) delete patch.id;
-      Object.assign(found.entry, patch);
+      const done = replaceRawTask(rawTasks, task);
+      if (!done.ok) return done;            // 找不到 / 有歧义 → 错误，不是"没改动"
       return true;
     });
     if (!wrote.ok) return wrote;

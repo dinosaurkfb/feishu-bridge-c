@@ -70,7 +70,8 @@ import {
   closeTaskTopicRotation, prepareTaskTopicRotation, promoteTask, recordTaskTopicActivity,
   finalizeTaskDialogueTurn, interactionPolicyForTask, reserveTaskDialogueTurn,
   refreshPendingTaskBinding,
-  addTask, mutateRegistryDocument, registerTaskTopicRotation, resolveTaskOutboundGeneration,
+  addTask, findRawTask, mutateRegistryDocument, registerTaskTopicRotation,
+  validateRegistryDocument, resolveTaskOutboundGeneration,
   setTaskConnectionStatus,
   setTaskDisplayName, setTaskInteractionMode, shadowCodexFirstClaim, taskPaths, topicStateForTask,
   validateCodexTemplate, validateRegistryTasks, writeRegistry,
@@ -5778,9 +5779,20 @@ test("登记表首次写入要能把文件建出来，读不懂时不许覆盖",
   // **其余读取错误说不清 —— 那时候写回去会覆盖一份我们没读懂的文件。**
   const home = temp();
   const file = path.join(home, "registry.json");
-  const created = mutateRegistryDocument(file, (raw) => { raw.push({ x: 1 }); });
-  assert.equal(created.ok, true, "首次写入要能建文件");
+  // **写进去的必须是合法文档。**上一版这条测试写 { x: 1 } 并期待成功 ——
+  // 那等于固化一份 loadRegistry 读不回来的文件，是评审点名的问题。
+  const created = mutateRegistryDocument(file,
+    (raw) => { raw.push({ root: "/tmp/a", logical_task_key: "k", id: "k" }); return true; });
+  assert.equal(created.ok, true, "首次写入要能建文件：" + JSON.stringify(created));
   assert.equal(JSON.parse(fs.readFileSync(file, "utf-8")).tasks.length, 1);
+  // **写完必须读得回来** —— 写入不许把不可读的文档固化下来。
+  assert.equal(loadRegistry(file).ok, true, "写完的文档必须读得回来");
+
+  // 非法内容一律拒绝写入。
+  const bad = mutateRegistryDocument(file, (raw) => { raw.push({ x: 1 }); return true; });
+  assert.equal(bad.ok, false, "**不许写入自己都读不回来的文档**");
+  assert.equal(bad.reason, "registry_malformed");
+  assert.equal(loadRegistry(file).tasks.length, 1, "被拒之后原文档不变");
 
   // 读不懂 → 拒绝，且**原文件一个字节都不许动**。
   fs.writeFileSync(file, "{ 这不是 JSON");
@@ -5789,6 +5801,102 @@ test("登记表首次写入要能把文件建出来，读不懂时不许覆盖",
   assert.equal(refused.ok, false);
   assert.equal(refused.reason, "registry_unreadable");
   assert.equal(fs.readFileSync(file, "utf-8"), before, "**读不懂就不许覆盖**");
+});
+
+
+test("写入定位必须精确：thread 相同、key 不同时不许改错条目", () => {
+  // 评审实测：上一版写的是"key 相同 **或** thread 相同"——
+  // 停用旧条目与启用新条目 thread 相同、key 不同时，改新条目的显示名
+  // **先命中了停用那条**，随后它被覆盖成新条目的身份：
+  // 调用返回 ok:true，登记表却出现重复 key/id，下一次读取直接 registry_malformed。
+  // **"或"在定位上等于放宽，而定位放宽就是改错东西。**
+  const home = temp();
+  const file = path.join(home, "registry.json");
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const older = makeTaskEntry({ root, threadId: THREAD_A, name: "旧",
+    rootMessageId: "om_old", token: "a1b2c3" });
+  older.logical_task_key = "old-key"; older.id = "old-key"; older.enabled = false;
+  const newer = makeTaskEntry({ root, threadId: THREAD_A, name: "新",
+    rootMessageId: "om_new", token: "b1b2c3" });
+  newer.logical_task_key = "new-key"; newer.id = "new-key";
+  fs.writeFileSync(file, JSON.stringify({ schema_version: "1.0", runtime: "codex",
+    tasks: [older, newer] }, null, 2));
+
+  const r = setTaskDisplayName({ threadId: THREAD_A, name: "改过的", home });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const doc = JSON.parse(fs.readFileSync(file, "utf-8"));
+  const raw = (k) => doc.tasks.find((t) => t.logical_task_key === k);
+  assert.equal(raw("new-key")?.task_display_name, "改过的", "该改的那条要改到");
+  assert.equal(raw("old-key")?.task_display_name, "旧", "**停用那条一个字都不许动**");
+  assert.equal(raw("old-key")?.enabled, false, "停用标记要留住");
+  assert.equal(doc.tasks.length, 2);
+  // **改完必须还读得回来** —— 上一版改完就 registry_malformed。
+  assert.equal(loadRegistry(file).ok, true, "改完的登记表必须读得回来");
+
+  // 找不到目标是**错误**，不是"没改动"。
+  const gone = mutateRegistryDocument(file, (rawTasks) =>
+    findRawTask(rawTasks, { logical_task_key: "not-there" }));
+  assert.equal(gone.ok, false, "**找不到不许当成没改动**");
+  assert.equal(gone.reason, "entry_gone");
+});
+
+test("写前用跟读同一份身份契约 —— 不许固化一份读不回来的文档", () => {
+  // 评审实测：登记表已有**停用** key `same` 时，addTask 仍能新增启用 key `same`
+  // 并返回成功，**落盘后的登记表立刻变成不可读**。
+  // 写前只查了启用条目的几个重复字段，没复用读那侧的完整契约。
+  const home = temp();
+  const file = path.join(home, "registry.json");
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const disabled = makeTaskEntry({ root, threadId: THREAD_B, name: "停用的",
+    rootMessageId: "om_b", token: "b1b2c3" });
+  disabled.logical_task_key = "same"; disabled.id = "same"; disabled.enabled = false;
+  fs.writeFileSync(file, JSON.stringify({ schema_version: "1.0", runtime: "codex",
+    tasks: [disabled] }, null, 2));
+  const before = fs.readFileSync(file, "utf-8");
+
+  const clash = makeTaskEntry({ root, threadId: THREAD_A, name: "新的",
+    rootMessageId: "om_a", token: "a1b2c3" });
+  clash.logical_task_key = "same"; clash.id = "same";
+  const added = addTask(clash, { home });
+  assert.equal(added.ok, false, "**不许新增一个跟停用条目撞 key 的 task**");
+  assert.equal(added.reason, "registry_malformed");
+  assert.equal(fs.readFileSync(file, "utf-8"), before, "被拒之后原文档一个字节都不许动");
+  assert.equal(loadRegistry(file).ok, true, "原文档仍然读得回来");
+
+  // 读和写放行的必须是同一个集合。
+  const doc = JSON.parse(before);
+  assert.equal(validateRegistryDocument(doc).ok, true);
+  assert.equal(validateRegistryDocument({ ...doc, tasks: [...doc.tasks, clash] }).ok, false,
+    "同一份契约要给出同一个答案");
+});
+
+test("只写改动，不顺带补写视图合成的默认值", () => {
+  // 评审：原条目没有 id 时，仅修改显示名也会顺带补写 id。
+  // 不是字段丢失，但违反"只修改目标字段"的保真契约 ——
+  // 活动视图里的 id 是 loadRegistry 补的，不是文档里本来就有的。
+  const home = temp();
+  const file = path.join(home, "registry.json");
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const t = makeTaskEntry({ root, threadId: THREAD_A, name: "T",
+    rootMessageId: "om_a", token: "a1b2c3" });
+  delete t.id;                                   // 文档里本来就没有 id
+  fs.writeFileSync(file, JSON.stringify({ schema_version: "1.0", runtime: "codex",
+    tasks: [t] }, null, 2));
+
+  assert.equal(setTaskDisplayName({ threadId: THREAD_A, name: "改过的", home }).ok, true);
+  const raw = JSON.parse(fs.readFileSync(file, "utf-8")).tasks[0];
+  assert.equal(raw.task_display_name, "改过的", "改动要落盘");
+  assert.equal(Object.hasOwn(raw, "id"), false, "**不许顺带补写 id**");
+
+  // 本来就有 id 的照常保留。
+  const t2 = { ...t, id: t.logical_task_key };
+  fs.writeFileSync(file, JSON.stringify({ schema_version: "1.0", runtime: "codex",
+    tasks: [t2] }, null, 2));
+  assert.equal(setTaskDisplayName({ threadId: THREAD_A, name: "再改", home }).ok, true);
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf-8")).tasks[0].id, t.logical_task_key);
 });
 
 

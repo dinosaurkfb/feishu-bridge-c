@@ -122,35 +122,25 @@ export function loadCodexTemplate(file = templateFile()) {
   return loaded;
 }
 
-export function loadRegistry(file = registryFile()) {
-  let parsed;
-  try {
-    parsed = JSON.parse(fs.readFileSync(file, "utf-8"));
-  } catch (err) {
-    if (err.code === "ENOENT") return { ok: true, file, tasks: [], reason: "no_registry" };
-    return { ok: false, file, tasks: [], reason: "registry_unreadable", error: err.message };
-  }
-  // **结构异常要 fail-closed，不能靠"访问它时会不会抛"来兜。**
-  //
-  // 评审实测：根节点是 null 或 tasks 是 {} 时两条定位路径都抛 TypeError；
-  // 根节点是 [] 时被误报成"目标不存在"——**坏掉的登记表被说成没有这条 task**，
-  // 人会去查绑定、去重新绑，而问题在别处。
-  // 上一轮我只透传了 loadRegistry 已经结构化返回的故障，没管它自己不校验结构。
+/**
+ * **登记表文档的身份契约 —— 读和写前共用这一份。**
+ *
+ * 上一版写前只查了启用条目的几个重复字段：评审实测登记表已有停用 key `same` 时，
+ * addTask 仍能新增启用 key `same` 并返回成功，**落盘后的登记表立刻变成不可读**。
+ * 写入把一份自己都读不回来的文档固化下来，比拒绝写入糟得多。
+ *
+ * 覆盖：形状、停用条目的存储身份、key 字符集、大小写折叠判重、id 契约。
+ * 纯函数，不碰文件。
+ */
+export function validateRegistryDocument(parsed) {
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return { ok: false, file, tasks: [], reason: "registry_malformed",
-      detail: "根节点不是对象" };
+    return { ok: false, reason: "registry_malformed", detail: "根节点不是对象" };
   }
   if (parsed.tasks !== undefined && !Array.isArray(parsed.tasks)) {
-    return { ok: false, file, tasks: [], reason: "registry_malformed",
-      detail: "tasks 不是数组" };
+    return { ok: false, reason: "registry_malformed", detail: "tasks 不是数组" };
   }
-  const tasks = [];
+  const entries = (parsed.tasks ?? []).map((raw, index) => ({ index, raw }));
   const malformed = [];
-  const entries = [];
-  for (const [i, task] of (parsed.tasks ?? []).entries()) {
-    entries.push({ index: i, raw: task });
-  }
-
   // ■ 第一遍：**身份**。覆盖整张原始表，**含停用条目**。
   //
   // 上一版在判重之前就把停用条目 continue 掉了 —— 评审实测：
@@ -207,19 +197,48 @@ export function loadRegistry(file = registryFile()) {
     }
   }
 
-  // ■ 第二遍：**过滤**。身份都验过了，这里才轮到"停用的不参与后续"。
-  for (const { raw } of entries) {
+  if (malformed.length > 0) {
+    return { ok: false, reason: "registry_malformed",
+      detail: malformed.map((m) => "#" + m.index + "（" + m.why + "）").join("、"),
+      entries: malformed };
+  }
+  return { ok: true };
+}
+export function loadRegistry(file = registryFile()) {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, "utf-8"));
+  } catch (err) {
+    if (err.code === "ENOENT") return { ok: true, file, tasks: [], reason: "no_registry" };
+    return { ok: false, file, tasks: [], reason: "registry_unreadable", error: err.message };
+  }
+  // **结构异常要 fail-closed，不能靠"访问它时会不会抛"来兜。**
+  //
+  // 评审实测：根节点是 null 或 tasks 是 {} 时两条定位路径都抛 TypeError；
+  // 根节点是 [] 时被误报成"目标不存在"——**坏掉的登记表被说成没有这条 task**，
+  // 人会去查绑定、去重新绑，而问题在别处。
+  // 上一轮我只透传了 loadRegistry 已经结构化返回的故障，没管它自己不校验结构。
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, file, tasks: [], reason: "registry_malformed",
+      detail: "根节点不是对象" };
+  }
+  if (parsed.tasks !== undefined && !Array.isArray(parsed.tasks)) {
+    return { ok: false, file, tasks: [], reason: "registry_malformed",
+      detail: "tasks 不是数组" };
+  }
+  // **身份契约跟写入口共用一份** —— 读放行的和写放行的必须是同一个集合。
+  const verdict = validateRegistryDocument(parsed);
+  if (!verdict.ok) return { ok: false, file, tasks: [], ...verdict };
+  const tasks = [];
+
+  // 身份都验过了，这里才轮到"停用的不参与后续"。
+  for (const raw of parsed.tasks ?? []) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
     if (raw.enabled === false) continue;
     if (typeof raw.logical_task_key !== "string" || !raw.logical_task_key) continue;
     tasks.push({ ...raw, id: Object.hasOwn(raw, "id") ? raw.id : raw.logical_task_key });
   }
 
-  if (malformed.length > 0) {
-    return { ok: false, file, tasks: [], reason: "registry_malformed",
-      detail: malformed.map((m) => "#" + m.index + "（" + m.why + "）").join("、"),
-      entries: malformed };
-  }
   const valid = validateRegistryTasks(tasks);
   if (!valid.ok) return { ok: false, file, tasks: [], ...valid };
   return { ok: true, file, tasks, schemaVersion: parsed.schema_version ?? "1.0" };
@@ -265,10 +284,19 @@ export function mutateRegistryDocument(file, mutate) {
   }
   const raw = parsed.tasks ?? [];
   const changed = mutate(raw);
+  // mutate 可以返回 { ok:false, reason } 中止 —— **"找不到目标"必须是错误，
+  // 不是"没改动"**：后者会让调用方宣称成功。
+  if (changed && changed.ok === false) return { ...changed, file };
   if (changed === false) return { ok: true, changed: false, file };
-  const valid = validateRegistryTasks(raw.filter((t) => t && t.enabled !== false));
-  if (!valid.ok) {
-    return { ok: false, reason: "duplicate_binding_fields", fields: valid.duplicateFields };
+  // **写前用跟读同一份身份契约。**上一版只查了启用条目的几个重复字段：
+  // 登记表已有停用 key `same` 时仍能新增启用 key `same` 并返回成功，
+  // **落盘后的文档立刻变成不可读**。写入把一份自己都读不回来的文档固化下来，
+  // 比拒绝写入糟得多。
+  const verdict = validateRegistryDocument({ ...parsed, tasks: raw });
+  if (!verdict.ok) return { ok: false, ...verdict };
+  const dup = validateRegistryTasks(raw.filter((t) => t && t.enabled !== false));
+  if (!dup.ok) {
+    return { ok: false, reason: "duplicate_binding_fields", fields: dup.duplicateFields };
   }
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   // **顶层原样保留** —— 只换 tasks。
@@ -280,12 +308,33 @@ export function mutateRegistryDocument(file, mutate) {
   return { ok: true, changed: true, file };
 }
 
-/** 在原始 tasks 数组里按稳定身份找那一条 —— 写路径只能这样定位。 */
+/**
+ * 在原始 tasks 数组里定位那一条 —— **按全表唯一的存储键精确定位**。
+ *
+ * 上一版写的是"key 相同 **或** thread 相同"，评审实测：
+ * 停用旧条目与启用新条目 thread 相同、key 不同时，改新条目的显示名
+ * **先命中了停用那条**，随后它被覆盖成新条目的身份 —— 调用返回 ok:true，
+ * 登记表却出现重复 key/id，下一次读取直接 registry_malformed。
+ * **"或"在定位上等于放宽，而定位放宽就是改错东西。**
+ *
+ * 零项和多项都必须失败，不许当成 changed:false ——
+ * "什么都没找到"和"不需要改"是两回事。
+ */
 export function findRawTask(raw, task) {
-  return (raw ?? []).find((t) =>
-    t && typeof t === "object"
-    && (t.logical_task_key === task.logical_task_key
-      || (task.codex_thread_id && t.codex_thread_id === task.codex_thread_id))) ?? null;
+  const want = safeKey(task?.logical_task_key ?? "").toLowerCase();
+  if (!want) return { ok: false, reason: "entry_key_missing" };
+  const hits = (raw ?? []).filter((t) =>
+    t && typeof t === "object" && typeof t.logical_task_key === "string"
+    && safeKey(t.logical_task_key).toLowerCase() === want);
+  if (hits.length === 0) return { ok: false, reason: "entry_gone" };
+  if (hits.length > 1) return { ok: false, reason: "entry_ambiguous", count: hits.length };
+  const hit = hits[0];
+  // **其他身份字段存在就必须对得上** —— 对不上说明这不是同一条。
+  if (task?.codex_thread_id && hit.codex_thread_id
+      && hit.codex_thread_id !== task.codex_thread_id) {
+    return { ok: false, reason: "entry_identity_mismatch" };
+  }
+  return { ok: true, entry: hit };
 }
 
 export function writeRegistry(tasks, file = registryFile()) {
@@ -482,9 +531,16 @@ export function setTaskConnectionStatus({
     // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
     // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
     const wrote = mutateRegistryDocument(file, (rawTasks) => {
-      const target = findRawTask(rawTasks, task);
-      if (!target) return false;
-      Object.assign(target, task);
+      const found = findRawTask(rawTasks, task);
+      if (!found.ok) return found;          // 找不到 / 有歧义 → 错误，不是"没改动"
+      // **只把改动写回去，不顺带补写视图合成的默认值。**
+      // 活动视图里的 id 是 loadRegistry 补的；原条目没有 id 时，
+      // 改个显示名不该顺手把 id 也写进去 —— 那不是"字段丢失"，
+      // 但同样违反"只修改目标字段"的保真契约。
+      const patch = { ...task };
+      if (!Object.hasOwn(found.entry, "id")) delete patch.id;
+      Object.assign(found.entry, patch);
+      return true;
     });
     if (!wrote.ok) return wrote;
     return { ok: true, changed: true, task };
@@ -531,9 +587,16 @@ export function refreshPendingTaskBinding({
     // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
     // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
     const wrote = mutateRegistryDocument(file, (rawTasks) => {
-      const target = findRawTask(rawTasks, task);
-      if (!target) return false;
-      Object.assign(target, task);
+      const found = findRawTask(rawTasks, task);
+      if (!found.ok) return found;          // 找不到 / 有歧义 → 错误，不是"没改动"
+      // **只把改动写回去，不顺带补写视图合成的默认值。**
+      // 活动视图里的 id 是 loadRegistry 补的；原条目没有 id 时，
+      // 改个显示名不该顺手把 id 也写进去 —— 那不是"字段丢失"，
+      // 但同样违反"只修改目标字段"的保真契约。
+      const patch = { ...task };
+      if (!Object.hasOwn(found.entry, "id")) delete patch.id;
+      Object.assign(found.entry, patch);
+      return true;
     });
     if (!wrote.ok) return wrote;
     return { ok: true, task };
@@ -560,9 +623,16 @@ export function setTaskDisplayName({ threadId, name, home = bridgeHome() } = {})
     // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
     // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
     const wrote = mutateRegistryDocument(file, (rawTasks) => {
-      const target = findRawTask(rawTasks, task);
-      if (!target) return false;
-      Object.assign(target, task);
+      const found = findRawTask(rawTasks, task);
+      if (!found.ok) return found;          // 找不到 / 有歧义 → 错误，不是"没改动"
+      // **只把改动写回去，不顺带补写视图合成的默认值。**
+      // 活动视图里的 id 是 loadRegistry 补的；原条目没有 id 时，
+      // 改个显示名不该顺手把 id 也写进去 —— 那不是"字段丢失"，
+      // 但同样违反"只修改目标字段"的保真契约。
+      const patch = { ...task };
+      if (!Object.hasOwn(found.entry, "id")) delete patch.id;
+      Object.assign(found.entry, patch);
+      return true;
     });
     if (!wrote.ok) return wrote;
     return { ok: true, task };
@@ -961,9 +1031,16 @@ export function promoteTask({
     // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
     // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
     const wrote = mutateRegistryDocument(file, (rawTasks) => {
-      const target = findRawTask(rawTasks, task);
-      if (!target) return false;
-      Object.assign(target, task);
+      const found = findRawTask(rawTasks, task);
+      if (!found.ok) return found;          // 找不到 / 有歧义 → 错误，不是"没改动"
+      // **只把改动写回去，不顺带补写视图合成的默认值。**
+      // 活动视图里的 id 是 loadRegistry 补的；原条目没有 id 时，
+      // 改个显示名不该顺手把 id 也写进去 —— 那不是"字段丢失"，
+      // 但同样违反"只修改目标字段"的保真契约。
+      const patch = { ...task };
+      if (!Object.hasOwn(found.entry, "id")) delete patch.id;
+      Object.assign(found.entry, patch);
+      return true;
     });
     if (!wrote.ok) return wrote;
     return {
@@ -1005,9 +1082,16 @@ function mutateTaskTopicState({
     // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
     // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
     const wrote = mutateRegistryDocument(file, (rawTasks) => {
-      const target = findRawTask(rawTasks, task);
-      if (!target) return false;
-      Object.assign(target, task);
+      const found = findRawTask(rawTasks, task);
+      if (!found.ok) return found;          // 找不到 / 有歧义 → 错误，不是"没改动"
+      // **只把改动写回去，不顺带补写视图合成的默认值。**
+      // 活动视图里的 id 是 loadRegistry 补的；原条目没有 id 时，
+      // 改个显示名不该顺手把 id 也写进去 —— 那不是"字段丢失"，
+      // 但同样违反"只修改目标字段"的保真契约。
+      const patch = { ...task };
+      if (!Object.hasOwn(found.entry, "id")) delete patch.id;
+      Object.assign(found.entry, patch);
+      return true;
     });
     if (!wrote.ok) return wrote;
     return { ...changed, task };
@@ -1107,9 +1191,16 @@ function mutateTaskInteractionPolicy({
       // **不许拿视图重建整表。**视图里的 task 是副本，且停用条目/顶层未知字段
     // 都不在视图里 —— 重建一次就把它们静默删了。就地改原文档里的那一条。
     const wrote = mutateRegistryDocument(file, (rawTasks) => {
-      const target = findRawTask(rawTasks, task);
-      if (!target) return false;
-      Object.assign(target, task);
+      const found = findRawTask(rawTasks, task);
+      if (!found.ok) return found;          // 找不到 / 有歧义 → 错误，不是"没改动"
+      // **只把改动写回去，不顺带补写视图合成的默认值。**
+      // 活动视图里的 id 是 loadRegistry 补的；原条目没有 id 时，
+      // 改个显示名不该顺手把 id 也写进去 —— 那不是"字段丢失"，
+      // 但同样违反"只修改目标字段"的保真契约。
+      const patch = { ...task };
+      if (!Object.hasOwn(found.entry, "id")) delete patch.id;
+      Object.assign(found.entry, patch);
+      return true;
     });
     if (!wrote.ok) return wrote;
     }

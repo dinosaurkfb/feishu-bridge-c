@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { moduleRoot } from "../direct-run.mjs";
-import { applySuppressionCore } from "../suppress-outbox-core.mjs";
+import { applySuppressionCore, suppressionDigest } from "../suppress-outbox-core.mjs";
 import {
   checkArgShape, locateTask, parseArgs as parseCodexSuppressArgs,
 } from "./suppress-outbox.mjs";
@@ -2622,12 +2622,13 @@ test("Codex 抑制：共用核心的判据在这一侧也真的生效", () => {
   fs.mkdirSync(outbox, { recursive: true });
   const write = (name, extra = {}) => {
     fs.writeFileSync(path.join(outbox, name),
-      JSON.stringify({ kind: "progress", text: name, published_at: null, ...extra }));
+      JSON.stringify(outboxRecord({ text: name, ...extra })));
   };
   const readRec = (name) => JSON.parse(fs.readFileSync(path.join(outbox, name), "utf-8"));
   const state = (gen) => ({ activeGeneration: gen, select: (r) => r });
   const call = (over) => applySuppressionCore({
     outboxDir: outbox, publishLockDir: publishLock, generationLockDir: genLock,
+    previewDigest: digestFromDisk(outbox),
     previewGenerationId: "gen-1", readState: () => state("gen-1"), reason: "t", ...over });
 
   // ① 正常：全停下来。
@@ -2713,7 +2714,7 @@ test("Codex 真实 CLI：缺 expectation / 纯空白 / 代际不可读，都不�
     fs.mkdirSync(paths.outbox, { recursive: true });
     const rec = path.join(paths.outbox, "0001.json");
     // 旧格式：没有 target_channel_generation_id。
-    fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "旧格式", published_at: null }));
+    fs.writeFileSync(rec, JSON.stringify(outboxRecord({ text: "旧格式" })));
     return { home, rec };
   };
   const cliPath = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
@@ -2786,7 +2787,7 @@ test("Codex 抑制命令：真实入口 —— 预览后轮转必须 rotated 且
   fs.mkdirSync(paths.outbox, { recursive: true });
   // **旧格式记录**：没有 target_channel_generation_id，代际靠当前状态现算。
   const rec = path.join(paths.outbox, "0001.json");
-  fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "旧格式", published_at: null }));
+  fs.writeFileSync(rec, JSON.stringify(outboxRecord({ text: "旧格式" })));
 
   const cli = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
   const run = (...args) => spawnSync(process.execPath, [cli, "--thread-id", THREAD_A, ...args],
@@ -2825,8 +2826,12 @@ test("Codex 抑制命令：真实入口 —— 预览后轮转必须 rotated 且
   fs.writeFileSync(regFile, JSON.stringify(rotated, null, 2));
 
   // 带着**预览那一刻**看到的代际来落盘 —— 现实里人就是照着预览抄的。
+  // 摘要也从预览抄 —— 轮转不动 outbox，它仍然对得上，
+  // 中止的原因必须是「轮转过」而不是「摘要对不上」。
+  const seenDigest = (/--expect-digest (\S+)/u.exec(preview.stdout ?? "") ?? [])[1];
+  assert.ok(seenDigest, "预览要打出摘要：" + preview.stdout);
   const after = run("--all-generations", "--apply", "--reason", "t",
-    "--expect-generation", seenGeneration);
+    "--expect-generation", seenGeneration, "--expect-digest", seenDigest);
   assert.notEqual(after.status, 0,
     "轮转过就必须中止。stdout=" + after.stdout + " stderr=" + after.stderr);
   assert.match(after.stderr, /轮转过/u);
@@ -2875,22 +2880,27 @@ test("Codex 预览和 --apply 不许给出相反结论：损坏记录在预览�
   const paths = taskPaths(task, home);
   fs.mkdirSync(paths.outbox, { recursive: true });
   const rec = path.join(paths.outbox, "0001.json");
-  fs.writeFileSync(rec, JSON.stringify({ kind: "milestone", text: "坏的",
-    published_at: null, target_channel_generation_id: "   " }));
+  fs.writeFileSync(rec, JSON.stringify(outboxRecord({ kind: "milestone", text: "坏的",
+    target_channel_generation_id: "   " })));
   const cliPath = path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs");
   const run = (...args) => spawnSync(process.execPath,
     [cliPath, "--thread-id", THREAD_A, ...args],
     { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
 
   const preview = run("--all-generations");
-  assert.match(preview.stdout, /目标代际是坏的/u, "预览就要点名损坏");
-  assert.match(preview.stdout, /0001\.json/u, "要说清是哪个文件");
-  assert.doesNotMatch(preview.stdout, /每条都自带代际/u,
+  // **损坏代际现在由统一守卫在更早一层接住**，判据跟只读视图共用一份。
+  // 结果比原来更强：预览直接非零退出，而不是打印一段说明再让人去 --apply。
+  const previewAll = (preview.stdout ?? "") + (preview.stderr ?? "");
+  assert.notEqual(preview.status, 0, "**预览就要拒绝**：" + previewAll.slice(0, 200));
+  assert.match(previewAll, /说不清/u, "预览就要点名损坏");
+  assert.match(previewAll, /0001\.json/u, "要说清是哪个文件");
+  assert.doesNotMatch(previewAll, /每条都自带代际/u,
     "**这是错的判断** —— 它的目标字段在，但不是代际");
 
   const r = run("--all-generations", "--apply", "--reason", "t");
   assert.notEqual(r.status, 0, "预览说会拒，真跑就必须拒");
-  assert.match(r.stderr, /目标代际是坏的/u);
+  assert.match((r.stdout ?? "") + (r.stderr ?? ""), /说不清/u,
+    "**两步要给出同一个结论**");
   assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
     "零抑制");
 });
@@ -2906,21 +2916,23 @@ test("锁内重读要重判损坏：文件名一个没变，目标字段变坏�
   fs.mkdirSync(obDir, { recursive: true });
   const rec = path.join(obDir, "0001.json");
   // **磁盘上已经是坏的**，而预览快照记的是好的 gen-1。
-  fs.writeFileSync(rec, JSON.stringify({ kind: "milestone", text: "x",
-    published_at: null, target_channel_generation_id: "   " }));
+  fs.writeFileSync(rec, JSON.stringify(outboxRecord({ kind: "milestone", text: "x",
+    target_channel_generation_id: "   " })));
 
   const got = applySuppressionCore({
     outboxDir: obDir, publishLockDir: path.join(dir, "pub.lock"),
     generationLockDir: path.join(dir, "gen.lock"),
     pending: [{ _file: rec, target_channel_generation_id: "gen-1" }],
+    previewDigest: digestFromDisk(path.dirname(rec)),
     previewGenerationId: "gen-1",
     readState: () => ({ activeGeneration: "gen-1", select: (x) => x }),
     reason: "t",
   });
 
   assert.equal(got.ok, false, "锁内重读必须发现它变坏了");
-  assert.equal(got.reason, "corrupt_target_generation");
-  assert.equal(got.atRecheck, true, "要说清是锁内重判时发现的，不是锁外那一次");
+  // 判据只有一份：损坏代际由统一守卫（审计层）接住，核心不再判第二次。
+  assert.equal(got.reason, "outbox_unexplainable");
+  assert.deepEqual(got.files, [path.basename(rec)], "要点名是哪一条");
   assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
     "**零抑制** —— 说不清该发去哪，就不能替它决定不发");
 });
@@ -4988,11 +5000,12 @@ test("空白目标代际是损坏记录 —— Codex 侧守着同一条三态判
   const genLock = path.join(dir, "gen.lock");
   const pubLock = path.join(dir, "pub.lock");
   const call = (target) => {
-    fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "x", published_at: null,
-      ...(target === undefined ? {} : { target_channel_generation_id: target }) }));
+    fs.writeFileSync(rec, JSON.stringify(outboxRecord({ text: "x",
+      ...(target === undefined ? {} : { target_channel_generation_id: target }) })));
     return applySuppressionCore({
       outboxDir: obDir, publishLockDir: pubLock, generationLockDir: genLock,
       pending: [{ _file: rec, ...(target === undefined ? {} : { target_channel_generation_id: target }) }],
+      previewDigest: digestFromDisk(path.dirname(rec)),
       previewGenerationId: null,
       readState: () => ({ activeGeneration: "gen-1", select: (x) => x }), reason: "t",
     });
@@ -5000,9 +5013,11 @@ test("空白目标代际是损坏记录 —— Codex 侧守着同一条三态判
   for (const bad of ["   ", "", 7, {}]) {
     const got = call(bad);
     assert.equal(got.ok, false, "损坏目标不许放行：" + JSON.stringify(bad));
-    assert.equal(got.reason, "corrupt_target_generation");
+    // 判据只有一份：损坏代际由统一守卫（审计层）接住。
+    assert.equal(got.reason, "outbox_unexplainable");
     assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
       "一条都不许动");
+    // 同一个守卫在拿锁之前也跑一次 —— 明显不该动时连锁都不拿。
     assert.equal(fs.existsSync(genLock), false, "拒绝发生在拿锁之前");
     assert.equal(fs.existsSync(pubLock), false, "发布锁也没拿");
   }
@@ -5015,7 +5030,7 @@ test("「锁没拿」要证明从未获取 —— Codex 侧同样预先持锁验
   const obDir = path.join(dir, "outbox");
   fs.mkdirSync(obDir, { recursive: true });
   const rec = path.join(obDir, "0001.json");
-  fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "旧格式", published_at: null }));
+  fs.writeFileSync(rec, JSON.stringify(outboxRecord({ text: "旧格式" })));
   const genLock = path.join(dir, "gen.lock");
   const pubLock = path.join(dir, "pub.lock");
   const hold = (d) => {
@@ -5025,7 +5040,8 @@ test("「锁没拿」要证明从未获取 —— Codex 侧同样预先持锁验
   };
   const call = () => applySuppressionCore({
     outboxDir: obDir, publishLockDir: pubLock, generationLockDir: genLock,
-    pending: [{ _file: rec }], previewGenerationId: null,
+    pending: [{ _file: rec }], previewDigest: digestFromDisk(path.dirname(rec)),
+    previewGenerationId: null,
     readState: () => ({ activeGeneration: "gen-1", select: (x) => x }), reason: "t",
   });
   hold(genLock);
@@ -5049,11 +5065,12 @@ test("核心不变量：旧格式记录缺 expectation 一律拒绝 —— Codex
   const genLock = path.join(dir, "gen.lock");
   fs.mkdirSync(obDir, { recursive: true });
   const rec = path.join(obDir, "0001.json");
-  fs.writeFileSync(rec, JSON.stringify({ kind: "progress", text: "旧格式", published_at: null }));
+  fs.writeFileSync(rec, JSON.stringify(outboxRecord({ text: "旧格式" })));
   const call = (previewGenerationId) => applySuppressionCore({
     outboxDir: obDir, publishLockDir: path.join(dir, "pub.lock"),
     generationLockDir: genLock,
-    pending: [{ _file: rec }], previewGenerationId,
+    pending: [{ _file: rec }], previewDigest: digestFromDisk(path.dirname(rec)),
+    previewGenerationId,
     readState: () => ({ activeGeneration: "gen-1", select: (r) => r }),
     reason: "t",
   });

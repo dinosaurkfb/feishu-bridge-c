@@ -223,55 +223,6 @@ export function suppressPublishByEventKey({ outboxDir, eventKey, reason }) {
  * reply 必须原样渲染：给一段两千字的答复加上「· 」前缀和【】分组，
  * 等于把它揉烂。它不是一条进展，它就是正文。
  */
-/**
- * 把一批已经取出来的待发记录标成**永久失败**，停止重试。
- *
- * 为什么要有它：有一类发布失败重试再多次也不会变 —— 比如话题是另一个应用建的，
- * 当前身份回复不进去。那种情况下每 30 分钟重试一次只是稳定地制造噪音，
- * 而每轮 Stop 都会说一句"兜底定时器会重试"，那句话是假的。
- *
- * **但判定"永久"这件事由人做，不由代码做。**曾经试过自动判：诊断到"根消息属于
- * 另一个应用"就抑制。那是**从相关性推因果** —— 一次瞬时的网络错误恰好发生在
- * 跨应用根消息上，照样会触发不可逆的抑制。有损动作不能建立在推断出来的因果上。
- *
- * 所以排空只诊断并报告，这个函数只被显式的 feishu-suppress-outbox 命令调用。
- */
-export function suppressRecords(records, { reason }) {
-  let changed = 0;
-  const failed = [];
-  for (const rec of records) {
-    const file = rec._file;
-    if (typeof file !== "string") { failed.push({ file: null, reason: "no_file_ref" }); continue; }
-    let current;
-    try { current = JSON.parse(fs.readFileSync(file, "utf-8")); } catch {
-      // **不可逆操作不能静默漏项。**读不出来就是没停成，必须进 failed ——
-      // 否则调用方会以为整批都停了，而漏掉的那条继续每 30 分钟重试。
-      failed.push({ file, reason: "unreadable" });
-      continue;
-    }
-    // 已发出/已抑制不算漏项：目标状态已经达到。
-    if (current.published_at !== null || current.publish_suppressed_at) continue;
-    const next = {
-      ...current,
-      publish_eligible_at: null,
-      publish_suppressed_at: new Date().toISOString(),
-      publish_suppressed_reason: String(reason ?? "permanent_publish_failure").slice(0, 200),
-    };
-    try {
-      const tmp = file + ".tmp." + randomUUID();
-      fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
-      fs.renameSync(tmp, file);
-      changed += 1;
-    } catch (err) {
-      // **不许半写后抛。**上一版第二条不可写时直接抛出去：前面几条已经被永久抑制，
-      // 调用方却只收到一个异常 —— 它不知道自己已经改掉了多少东西。
-      // 返回结构化的部分失败，让调用方能如实报"停了几条、几条没停成"。
-      failed.push({ file, reason: String(err.code ?? err.message).slice(0, 60) });
-    }
-  }
-  return { ok: failed.length === 0, changed, failed };
-}
-
 export function composeDigest(records, { taskName }) {
   const replies = records.filter((r) => r.kind === "reply");
   const rest = records.filter((r) => r.kind !== "reply");

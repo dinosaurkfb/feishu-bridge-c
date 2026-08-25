@@ -11108,6 +11108,96 @@ test("Stop 提示要说清这条失败是不是当前项目的", () => {
     .split("非当前项目").length - 1, 1, "解释只说一次");
 });
 
+test("弱信号归属：写过就必须排空，没写过才跳过 —— 两半都要守", () => {
+  // **只守"没写过就跳过"是不够的。**把判断改成"弱信号一律跳过"，那条断言照样成立，
+  // 可绑定体检的预警就永远发不出去了 —— 它会往 outbox 写，而它不看 via。
+  // 所以这条同时守另一半：**写过了就必须排**。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-weak-"));
+  const proj = path.join(dir, "projA");
+  const elsewhere = path.join(dir, "elsewhere");
+  const ob = path.join(proj, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(ob, { recursive: true });
+  fs.mkdirSync(elsewhere, { recursive: true });
+  fs.mkdirSync(path.join(proj, ".runtime-data", "inbound"), { recursive: true });
+  fs.writeFileSync(path.join(proj, ".runtime-data", "inbound", "chain-config.json"),
+    JSON.stringify({ project_dir: proj, logical_task_key: "k",
+      project_display_name: "projA", task_display_name: "projA" }));
+  fs.writeFileSync(path.join(proj, ".runtime-data", "inbound", "active-mapping.json"),
+    JSON.stringify({ status: "active", root_message_id: "om_x",
+      feishu_root_message_id_reference: "om_x", claude_session_id: null,
+      channel_generation_id: "gen-1",
+      // **有效期设远。**否则绑定体检会往 outbox 追一条到期预警，
+      // 那条**本来就该发**（它是项目属性，兜底定时器不做体检）——
+      // 于是这条测试测的就成了体检那一路，而不是"替别人重试旧积压"。
+      // 探针跑出来才看清：不设远的话它根本命中不到我要测的分支。
+      expires_at: "2099-01-01T00:00:00.000Z" }));
+
+  const fakeHome = path.join(dir, "home");
+  fs.mkdirSync(path.join(fakeHome, ".claude", "feishu-bridge"), { recursive: true });
+  fs.writeFileSync(path.join(fakeHome, ".claude", "feishu-bridge", "registry.json"),
+    JSON.stringify({ schema_version: "1.0", projects: [
+      { id: "projA", root: proj, status: "active", enabled: true }] }));
+  const transcript = path.join(dir, "t.jsonl");
+  fs.writeFileSync(transcript, "刚才在讨论 " + proj + " 的问题\n");
+
+  const run = (cwd, extra = {}) => spawnSync(process.execPath,
+    [path.resolve("scripts", "stop-hook.mjs")], {
+      encoding: "utf-8",
+      // **只换 HOME 不够**，还要显式指登记表 —— 既有那条 stopnote 测试就是这么传的。
+      // 我漏了这一个，于是钩子在测试里根本没跑起来（stdout/stderr 全空），
+      // 而同样的场景用探针跑是正常的。**两边不一致时，先怀疑夹具。**
+      env: { ...process.env, HOME: fakeHome,
+        FEISHU_BRIDGE_REGISTRY: path.join(fakeHome, ".claude", "feishu-bridge", "registry.json") },
+      input: JSON.stringify({ cwd, transcript_path: transcript, session_id: "s1",
+        last_assistant_message: "本轮答复", ...extra }),
+    });
+
+  // ① 弱信号 + outbox 里有旧记录 + 本轮没给它写 → 跳过，完全沉默。
+  fs.writeFileSync(path.join(ob, "0001.json"), JSON.stringify({
+    kind: "progress", text: "别人的旧积压", published_at: null,
+    target_channel_generation_id: "gen-1" }));
+  const skipped = run(elsewhere);
+  assert.equal(skipped.status, 0, skipped.stderr);
+  assert.equal((skipped.stdout ?? "").trim(), "",
+    "**没给它写过东西就不该替它排空**：" + skipped.stdout);
+  // 那条旧记录一个字节没动 —— 没被发、也没被标记。
+  const still = JSON.parse(fs.readFileSync(path.join(ob, "0001.json"), "utf-8"));
+  assert.equal(still.published_at, null, "不许替别人把它发出去");
+
+  // ② **弱信号 + 本轮给它写了体检预警 → 必须排空。**
+  //
+  // 这一半单独守，因为收窄最容易过头：把判断写成"弱信号一律跳过"，
+  // ①③ 都还是绿的，**可绑定到期预警就永远发不出去了** ——
+  // Stop 钩子是唯一会发它的地方，兜底定时器不做体检。
+  // 而它恰恰是给休眠项目用的：那种项目没有自己的活会话。
+  const mapFile = path.join(proj, ".runtime-data", "inbound", "active-mapping.json");
+  const mapping = JSON.parse(fs.readFileSync(mapFile, "utf-8"));
+  // 有效期改成三天后 —— 体检会追一条预警。
+  mapping.expires_at = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
+  fs.writeFileSync(mapFile, JSON.stringify(mapping));
+  for (const f of fs.readdirSync(ob)) fs.rmSync(path.join(ob, f));
+
+  const warned = run(elsewhere, { last_assistant_message: "" });
+  assert.equal(warned.status, 0, warned.stderr);
+  assert.notEqual((warned.stdout ?? "").trim(), "",
+    "**体检预警必须发得出去** —— 它是项目属性，兜底定时器不做体检：" +
+    JSON.stringify(warned.stdout));
+
+  // 恢复远期有效期，再验强信号那一路。
+  mapping.expires_at = "2099-01-01T00:00:00.000Z";
+  fs.writeFileSync(mapFile, JSON.stringify(mapping));
+  fs.writeFileSync(path.join(ob, "0002.json"), JSON.stringify({
+    kind: "progress", text: "旧积压", published_at: null,
+    target_channel_generation_id: "gen-1" }));
+
+  // ③ cwd 在项目里 → 照常排空（强信号那一路不许被误伤）。
+  const own = run(proj);
+  assert.equal(own.status, 0, own.stderr);
+  assert.notEqual((own.stdout ?? "").trim(), "",
+    "**当前项目照常报** —— 收窄的是弱信号那一路，不是所有路。" +
+    "stdout=" + JSON.stringify(own.stdout) + " stderr=" + JSON.stringify(own.stderr).slice(0, 300));
+});
+
 test("真实 Stop 钩子会把「非当前项目」说出来 —— 纯函数对了不算数", () => {
   // **这条是补出来的，而且是被现场教训逼出来的。**上面那条纯函数测试全绿的时候，
   // 真实钩子每一次调用都在崩：动态 import 那行我以为写进去了，其实锚点没匹配上，
@@ -11157,25 +11247,28 @@ test("真实 Stop 钩子会把「非当前项目」说出来 —— 纯函数对
     return JSON.parse(out).systemMessage;
   };
 
-  // cwd 在别处：必须标出来，并解释一次为什么带上它。
-  const foreign = runHook(elsewhere);
-  assert.match(foreign, /projA（非当前项目）/u);
-  assert.match(foreign, /提到过它的路径/u);
+  // **cwd 在别处、且本轮没给它写过东西：不再替它排空，完全沉默。**
+  //
+  // 这条断言反过来了，因为行为变了 —— 而变的理由正是这个夹具的形状：
+  // transcript 提到某项目、它 outbox 里躺着旧记录、本轮一个字节都没给它写。
+  // 上一版每一轮都替它重试那批旧的，把同一条发布失败复述给 Frank。
+  //
+  // 弱信号存在的理由是"进展别卡在本地"，而进展只可能由本轮写入产生，
+  // 写入又只在 cwd 时发生 —— 所以收窄不会让任何进展卡住：
+  // 别人的积压有它自己的会话和兜底定时器。
+  assert.equal(rawHook(elsewhere), "",
+    "**本轮没给它写过东西就不该替它排空** —— 那是替别人重试它自己的旧积压");
 
   // cwd 就在项目里：不许加这些噪音。
   const own = runHook(proj);
   assert.match(own, /projA 发布失败/u);
   assert.equal(own.includes("非当前项目"), false, "当前项目不该被标记");
 
-  // **非当前项目没东西可报时，那句解释不许孤零零地出现。**
-  // 上一版按"被归属到哪些项目"决定要不要解释，而不是按"实际报了哪些" ——
-  // 于是 outbox 为空时一条提示都没有，解释却照样打出来，挂在那儿没有指向。
-  // 注意要连本轮答复一起去掉：钩子会把 last_assistant_message 排进 outbox，
-  // 那本身就成了"有事可报"。清空 outbox 并且这一轮不带答复。
+  // 非当前项目本来就没东西可报时，同样完全沉默。
   const ob = path.join(proj, ".runtime-data", "outbound", "outbox");
   for (const f of fs.readdirSync(ob)) fs.rmSync(path.join(ob, f));
   assert.equal(rawHook(elsewhere, { last_assistant_message: "" }), "",
-    "非当前项目无事可报时应当完全沉默，而不是只留一句解释");
+    "非当前项目无事可报时应当完全沉默");
 
   // 三次调用都跑完了，现在验日志落在哪。
   const fakeLog = path.join(fakeHome, ".claude", "feishu-bridge", "stop-hook.log");

@@ -10,7 +10,7 @@ import {
   bridgeHome, findRegisteredTaskForCodexThread, interactionPolicyForTask,
   setTaskInteractionMode,
 } from "./state.mjs";
-import { requireIntent } from "./intent.mjs";
+import { buildIntentParams, requireIntent } from "./intent.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -70,7 +70,8 @@ function main() {
   // （出过真事故）。凭证把"技能被选中"和"这次操作被授权"分开。
   // **参数要带上** —— 一张 dialogue 票不该能切 mapping。
   const intent = requireIntent({
-    apply: true, action: "mode", threadId, params: { mode }, home });
+    apply: true, action: "mode", threadId,
+    params: buildIntentParams("mode", { mode }), home });
   if (!intent.ok) { console.error(intent.text); process.exit(1); }
   const changed = setTaskInteractionMode({ threadId, mode, home });
   if (!changed.ok) {

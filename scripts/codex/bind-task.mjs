@@ -14,7 +14,7 @@ import {
   addTask, bridgeHome, findRegisteredTaskForCodexThread, loadCodexTemplate, makeTaskEntry,
   refreshPendingTaskBinding, setTaskConnectionStatus, setTaskDisplayName,
 } from "./state.mjs";
-import { requireIntent } from "./intent.mjs";
+import { buildIntentParams, requireIntent } from "./intent.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -37,7 +37,9 @@ if (!thread.ok) die("无法确定当前 Codex thread（" + thread.reason + "）�
 // 钩子才签发一张，用完即焚。
 const intent = requireIntent({
   apply, action: "bind", threadId: thread.threadId,
-  params: { project: root }, home: bridgeHome() });
+  params: buildIntentParams("bind", { project: root, chat: arg("chat-id") ?? null,
+    name: arg("name") ?? null }),
+  home: bridgeHome() });
 if (!intent.ok) die(intent.text);
 const existing = findRegisteredTaskForCodexThread({ threadId: thread.threadId });
 if (existing.ok) {

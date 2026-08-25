@@ -64,6 +64,32 @@ export const intentDir = (home) => path.join(home, "intents");
  * 所以凭证绑的是"规范化之后的完整写意图"：动作 + 排序后的参数键值。
  * 参数对不上就不是同一次操作 —— 哪怕命令族一样。
  */
+/**
+ * 每种动作的参数**长什么样 —— 只有这一份**。
+ *
+ * 签发端和消费端各拼各的，拼出来必然不一样：
+ *   · bind：钩子签的是空参数，脚本消费 { project }；
+ *   · rotate:auto：签发端加了 generation，消费端只校验 project。
+ * 两处都"看起来对"，合起来是 intent_params_mismatch —— **真实入口全线卡死**，
+ * 而单测各自签各自的票，两边都绿。评审用行为探针打穿的。
+ *
+ * 所以参数只在这里构造。**加字段就要两端同时生效**，没有第二个地方能漏。
+ */
+export const intentParamsFor = {
+  bind: ({ project, chat = null, name = null }) => ({ project, chat, name }),
+  unbind: () => ({}),
+  mode: ({ mode }) => ({ mode }),
+  rotate: ({ op }) => ({ op }),
+  "rotate:auto": ({ project, generation = null }) => ({ project, generation }),
+};
+
+/** 按动作构造参数；未知动作直接炸 —— 静默给个空对象等于关掉这道校验。 */
+export function buildIntentParams(action, input = {}) {
+  const build = intentParamsFor[action];
+  if (typeof build !== "function") throw new Error("未知的意图动作：" + String(action));
+  return build(input);
+}
+
 export function intentDigest({ action, params = {} }) {
   const norm = Object.keys(params).sort()
     .filter((k) => params[k] !== undefined && params[k] !== null)
@@ -83,25 +109,27 @@ const nonEmpty = (v) => typeof v === "string" && v.length > 0;
  * @param turnId   这一轮的标识；跨轮复用要被拒
  */
 /**
- * 找一张**还活着**的同意图凭证：同 thread、同 turn、同精确意图，且没过期。
+ * 签发账本：**一个 (thread, turn, 意图) 只对应一个槽位，用目录名占位。**
  *
- * 已消费的（.consumed）不算 —— 它们不该被复用，那正是"一次只授权一次"的含义。
+ * 上一版是"先查再随机创建"—— 中间有窗口，评审用 32 个并发签发进程实测跑出
+ * **4 张不同的活票**。而且消费之后同一 turn 同一意图还能再签一张，
+ * "一次输入只授权一次"仍然不成立（我那条测试甚至明确期待重签，是写错了）。
+ *
+ * 现在：mkdir 那个槽位 —— **同一个名字只可能被一个进程建成功**，
+ * 失败的一方去读已经写好的那张票。消费时在槽位里留一块墓碑（consumed），
+ * 之后任何重签都被墓碑挡住。
+ *
+ * 三条语义因此成立：
+ *   消费前重复签发 → 同一张票；
+ *   消费后再签     → **拒绝**，不是发新的；
+ *   并发签发       → 只产生一个授权。
  */
-function findLiveIntent({ digest, threadId, turnId, home, now }) {
-  let files;
-  try { files = fs.readdirSync(intentDir(home)).filter((f) => f.endsWith(".json")); }
-  catch { return null; }
-  for (const f of files) {
-    let rec;
-    try { rec = JSON.parse(fs.readFileSync(path.join(intentDir(home), f), "utf-8")); }
-    catch { continue; }
-    if (rec?.digest !== digest || rec?.thread_id !== threadId) continue;
-    if ((rec?.turn_id ?? null) !== (nonEmpty(turnId) ? turnId : null)) continue;
-    if (!isCanonicalIso(rec?.expires_at) || now >= Date.parse(rec.expires_at)) continue;
-    return { id: rec.id, record: rec };
-  }
-  return null;
-}
+const slotDir = (home, key) => path.join(intentDir(home), "slots", key);
+
+const slotKey = ({ digest, threadId, turnId }) =>
+  crypto.createHash("sha256")
+    .update([digest, threadId, turnId ?? ""].join("\u0000"))
+    .digest("hex").slice(0, 32);
 
 export function issueIntent({
   action, threadId, turnId = null, params = {}, home, now = Date.now(),
@@ -111,19 +139,58 @@ export function issueIntent({
   }
   const digest = intentDigest({ action, params });
 
-  // **同一次输入只签一张。**
+  // **抢槽位。**mkdir 是原子的：同一个名字只可能被一个进程建成功。
+  const key = slotKey({ digest, threadId, turnId });
+  const slot = slotDir(home, key);
+  // **父目录先建好，槽位本身必须非 recursive 地建。**
   //
-  // 上一版每调一次钩子就新签一张，两张都能各自消费 ——
-  // "一次输入只授权一次操作"根本不成立。评审同 prompt 连跑两次就复现了。
-  // 幂等键 = thread + turn + 精确意图；已消费的不再复用（找不到就重签）。
-  const existing = findLiveIntent({ digest, threadId, turnId, home, now });
-  if (existing) return { ok: true, id: existing.id, record: existing.record, reused: true };
+  // recursive: true 在目录已存在时**不报 EEXIST** —— 于是每个进程都以为自己
+  // 抢到了槽位，各自去签一张。实测 32 个并发跑出 2 张（比"先查再建"的 4 张好，
+  // 但仍然不对）。互斥全靠 EEXIST，而 recursive 把它吞了。
+  let won = false;
+  try { fs.mkdirSync(path.dirname(slot), { recursive: true, mode: 0o700 }); }
+  catch (err) {
+    return { ok: false, reason: "intent_unwritable", error: String(err?.message ?? err).slice(0, 200) };
+  }
+  try {
+    fs.mkdirSync(slot, { mode: 0o700 });   // 不加 recursive：已存在就要抛 EEXIST
+    won = true;
+  } catch (err) {
+    if (err.code !== "EEXIST") {
+      return { ok: false, reason: "intent_unwritable", error: String(err?.message ?? err).slice(0, 200) };
+    }
+  }
+  // 没抢到的一方要等赢家把 id 写完 —— 否则会读到一个还空着的槽位。
+  if (!won) {
+    for (let i = 0; i < 200 && !fs.existsSync(path.join(slot, "id")); i += 1) {
+      if (fs.existsSync(path.join(slot, "consumed"))) break;
+      try { fs.readdirSync(slot); } catch { /* 忙等一小会儿 */ }
+    }
+  }
+  // **墓碑优先于一切。**这一次输入已经授权过一次了，不再发第二张。
+  if (fs.existsSync(path.join(slot, "consumed"))) {
+    return { ok: false, reason: "intent_already_used" };
+  }
+  if (!won || fs.existsSync(path.join(slot, "id"))) {
+    // 没抢到，或抢到了但别人已经写好 —— 读那一张，不新建。
+    try {
+      const existingId = fs.readFileSync(path.join(slot, "id"), "utf-8").trim();
+      const rec = JSON.parse(fs.readFileSync(path.join(intentDir(home), existingId + ".json"), "utf-8"));
+      if (isCanonicalIso(rec?.expires_at) && now < Date.parse(rec.expires_at)) {
+        return { ok: true, id: existingId, record: rec, reused: true };
+      }
+      // 过期了：同一次输入的授权窗口已经关了，不续签。
+      return { ok: false, reason: "intent_expired" };
+    } catch {
+      return { ok: false, reason: "intent_unreadable" };
+    }
+  }
 
   const id = crypto.randomBytes(16).toString("hex");
   const dir = intentDir(home);
   const record = {
     schema_version: "1.0",
-    id, action, thread_id: threadId, digest,
+    id, action, thread_id: threadId, digest, slot_key: key,
     turn_id: nonEmpty(turnId) ? turnId : null,
     issued_at: new Date(now).toISOString(),
     expires_at: new Date(now + INTENT_TTL_MS).toISOString(),
@@ -134,6 +201,8 @@ export function issueIntent({
     const tmp = file + ".tmp." + process.pid;
     fs.writeFileSync(tmp, JSON.stringify(record, null, 2) + "\n", { mode: 0o600 });
     fs.renameSync(tmp, file);
+    // 槽位里记下这张票的 id —— 后来者据此读到同一张。
+    fs.writeFileSync(path.join(slot, "id"), id, { mode: 0o600 });
   } catch (err) {
     return { ok: false, reason: "intent_unwritable", error: String(err?.message ?? err).slice(0, 200) };
   }
@@ -170,6 +239,18 @@ export function consumeIntent({
   let record;
   try { record = JSON.parse(fs.readFileSync(consumed, "utf-8")); }
   catch { return { ok: false, reason: "intent_corrupt" }; }
+
+  // **立墓碑。**没有它的话，同一次输入消费完还能再签一张 ——
+  // "一次输入只授权一次"就只是句话。墓碑立在槽位里，重签第一眼就撞上它。
+  // 立不上也继续：票已经被 rename 掉了，这一次的授权是有效的；
+  // 但要留痕，否则"墓碑没立上"和"从没立过"分不开。
+  if (nonEmpty(record?.slot_key)) {
+    try {
+      fs.mkdirSync(slotDir(home, record.slot_key), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(slotDir(home, record.slot_key), "consumed"),
+        new Date(now).toISOString(), { mode: 0o600 });
+    } catch { /* 见上：不阻断本次，但下面会报出来 */ }
+  }
 
   // 消费掉了才校验内容 —— **对不上也不还回去**，一张被误用的凭证不该还能再试一次。
   if (record?.action !== action) return { ok: false, reason: "intent_action_mismatch" };

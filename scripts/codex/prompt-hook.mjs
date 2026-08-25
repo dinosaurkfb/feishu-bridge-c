@@ -12,7 +12,7 @@ import {
 import { storeTurnInput } from "../turn-input.mjs";
 import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
 import { codexRuntimeRoot } from "../runtime-install.mjs";
-import { issueIntent } from "./intent.mjs";
+import { buildIntentParams, issueIntent } from "./intent.mjs";
 
 /**
  * 不带参数的控制命令 —— **只有这一份清单**。
@@ -339,9 +339,14 @@ async function main() {
   // 也会签出一张 mode 票，而它能被当写票消费** —— 一次只读输入换来一次写授权。
   const modeArg = action.startsWith("mode-") ? action.slice("mode-".length) : null;
   const intentAction = action.startsWith("mode") ? "mode" : action;
-  const intentParams =
-    intentAction === "mode" ? { mode: modeArg }
-    : intentAction === "rotate" ? { op: "create" }   // 钩子只注入创建那条
+  // **参数只由共用构造器拼。**上一版这里 bind 给的是空对象，
+  // 而 bind-task 消费的是 { project } —— 摘要对不上，**真实绑定全线卡死**，
+  // 而单测各自签各自的票，两边都绿。
+  const intentParams = WRITE_ACTIONS.has(intentAction)
+    ? buildIntentParams(intentAction, {
+        mode: modeArg, op: "create",           // 钩子只注入创建那条
+        project: cwd, chat: null, name: null,  // 钩子不传群和名字
+      })
     : {};
   // **只读的 $feishu-mode（不带参数）不签票。**它只是看当前模式。
   const wantsIntent = WRITE_ACTIONS.has(intentAction) &&

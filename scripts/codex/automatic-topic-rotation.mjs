@@ -2,7 +2,7 @@
 
 import { launchAutomaticTopicRotation } from "../automatic-topic-rotation.mjs";
 import { bridgeHome, recordTaskTopicActivity } from "./state.mjs";
-import { issueIntent } from "./intent.mjs";
+import { buildIntentParams, issueIntent } from "./intent.mjs";
 
 export function recordCodexActivityAndMaybeRotate({
   root,
@@ -29,7 +29,7 @@ export function recordCodexActivityAndMaybeRotate({
   // 票绑住这次决定的代际身份：换一代就是另一次决定，旧票不该还能用。
   const issued = issueIntent({
     action: "rotate:auto", threadId,
-    params: { project: root, generation: generationId ?? null },
+    params: buildIntentParams("rotate:auto", { project: root, generation: generationId ?? null }),
     home,
   });
   if (!issued.ok) {

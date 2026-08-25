@@ -2107,34 +2107,75 @@ test("自动发布登记迁移幂等，暂停 task 也保留恢复后的发布�
     [true, true]);
 });
 
-test("迁移只改目标字段：停用项、怪路径记录、未知顶层字段都不能被顺手删掉", () => {
+test("迁移只改目标字段：停用项、未知条目字段、未知顶层字段都不能被顺手删掉", () => {
   const home = temp();
   const file = path.join(home, "registry.json");
-  // 刻意绕过 writeRegistry 直接造文档：这些正是 loadRegistry 会滤掉、
-  // writeRegistry 会丢掉的东西，用视图读写就会静默删数据。
+  // 刻意绕过夹具写入口直接造文档：停用项和未知字段正是"视图 + 整表重建"会删掉的东西。
   fs.writeFileSync(file, JSON.stringify({
     schema_version: "1.0", runtime: "codex", custom_marker: "KEEP_ME",
     tasks: [
-      { logical_task_key: "a", root: "/tmp/a" },
+      { logical_task_key: "a", root: "/tmp/a", 未知条目字段: "KEEP" },
       { logical_task_key: "b", root: "/tmp/b", enabled: false },
-      { logical_task_key: "c", root: "relative/bad" },
     ],
   }));
-  assert.equal(enableAutoPublishForAllTasks({ home, apply: true }).changed, 3);
+  assert.equal(enableAutoPublishForAllTasks({ home, apply: true }).changed, 2);
 
   const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
-  assert.deepEqual(raw.tasks.map((t) => t.logical_task_key), ["a", "b", "c"], "一条都不能少");
+  assert.deepEqual(raw.tasks.map((t) => t.logical_task_key), ["a", "b"], "一条都不能少");
   assert.equal(raw.custom_marker, "KEEP_ME", "不认识的顶层字段要原样留着");
+  assert.equal(raw.tasks[0].未知条目字段, "KEEP", "条目上的未知字段也要留着");
   assert.equal(raw.tasks[1].enabled, false, "停用状态不能被抹掉");
   assert.equal(raw.tasks.every((t) => t.id === undefined), true, "迁移不得顺手补写 id");
   assert.equal(raw.tasks.every((t) => t.auto_publish_on_completion === true), true);
 });
 
+test("迁移不许在主读取器已经拒绝的表上改盘", () => {
+  // 评审实测：两条 codex_thread_id 重复的登记，主读取器返回 duplicate_binding，
+  // 而 enableAutoPublishForAllTasks({apply:true}) 返回 ok:true、改了两个条目，
+  // **写完登记表仍然不可读**。
+  // 那违反"读、写前、写后接受同一集合"——而且它是我漏掉的第二条整表写路径：
+  // 我之前扫的是 writeRegistry(，`writeRawRegistry(` 根本不匹配。
+  const cases = {
+    "thread 重复": [
+      { logical_task_key: "a", root: "/tmp/a", codex_thread_id: "01922222-3333-7444-8555-000000000001" },
+      { logical_task_key: "b", root: "/tmp/b", codex_thread_id: "01922222-3333-7444-8555-000000000001" },
+    ],
+    "root 不是绝对路径": [{ logical_task_key: "c", root: "relative/bad" }],
+    "key 含非法字符": [{ logical_task_key: "a/b", root: "/tmp/a" }],
+    "存储键折叠后相同": [
+      { logical_task_key: "Same", root: "/tmp/a" },
+      { logical_task_key: "same", root: "/tmp/b" },
+    ],
+  };
+  for (const [why, tasks] of Object.entries(cases)) {
+    const home = temp();
+    const file = path.join(home, "registry.json");
+    fs.writeFileSync(file, JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks }));
+    assert.equal(loadRegistry(file).ok, false, why + "：前提是主读取器拒绝它");
+    const before = fs.readFileSync(file, "utf-8");
+
+    // 预览也要拒绝 —— 不能先说"可以迁移 N 条"再在 apply 时翻脸。
+    const preview = enableAutoPublishForAllTasks({ home, apply: false });
+    assert.equal(preview.ok, false, why + "：**预览就要拒绝**");
+    const applied = enableAutoPublishForAllTasks({ home, apply: true });
+    assert.equal(applied.ok, false, why + "：**apply 必须拒绝**");
+    assert.equal(fs.readFileSync(file, "utf-8"), before, why + "：登记表字节必须不变");
+    // 回执不许产生 —— 否则"跑过了"这件事会被记下来，而它根本没跑成。
+    const ledger = path.join(home, "migrations.json");
+    if (fs.existsSync(ledger)) {
+      assert.equal(/auto_publish/u.test(fs.readFileSync(ledger, "utf-8")), false,
+        why + "：**迁移回执不许产生**");
+    }
+  }
+});
+
 test("迁移遇到解释不了的登记结构要 fail-closed，不许过滤后整表写回", () => {
   for (const [shape, reason] of [
     [{ tasks: "not-an-array" }, "registry_shape_unexpected"],
-    [{ tasks: [null] }, "registry_entry_unreadable"],
-    [{ tasks: [["a"]] }, "registry_entry_unreadable"],
+    // 条目级问题现在由**共用契约**先拦下 —— reason 变成 registry_malformed，
+    // 但性质不变：fail-closed 且一个字节都不动。
+    [{ tasks: [null] }, "registry_malformed"],
+    [{ tasks: [["a"]] }, "registry_malformed"],
   ]) {
     const home = temp();
     const file = path.join(home, "registry.json");
@@ -2281,7 +2322,7 @@ test("安装器预览的待迁移数必须等于实际会改的数", () => {
     tasks: [
       { logical_task_key: "a", root: "/tmp/a" },
       { logical_task_key: "b", root: "/tmp/b", enabled: false },
-      { logical_task_key: "c", root: "relative/bad" },
+      { logical_task_key: "c", root: "/tmp/c", 未知条目字段: "x" },
     ],
   }));
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs")], {

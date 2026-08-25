@@ -716,6 +716,16 @@ function writeRawRegistry(doc, file) {
 function scanAutoPublish(doc) {
   if (doc === null) return { ok: true, total: 0, pendingRefs: [], names: [] };
   if (!Array.isArray(doc.tasks)) return { ok: false, reason: "registry_shape_unexpected" };
+  // **迁移也要过共用契约。**
+  //
+  // 上一版这里只查数组/对象形状，写回又走另一套 writeRawRegistry ——
+  // 评审实测：两条 codex_thread_id 重复的登记，主读取器返回 duplicate_binding，
+  // 而 enableAutoPublishForAllTasks({apply:true}) 返回 ok:true、改了两个条目、
+  // **写完登记表仍然不可读**。
+  // 那违反"读、写前、写后接受同一集合"，而且它是我漏掉的第二条整表写路径 ——
+  // 我之前扫的是 writeRegistry(，`writeRawRegistry(` 根本不匹配。
+  const verdict = validateRegistryDocument(doc);
+  if (!verdict.ok) return { ok: false, ...verdict };
   const pendingRefs = [];
   for (const task of doc.tasks) {
     if (!task || typeof task !== "object" || Array.isArray(task)) {
@@ -850,6 +860,9 @@ export function enableAutoPublishForAllTasks({ home = bridgeHome(), apply = fals
 
     if (scan.pendingRefs.length > 0) {
       for (const task of scan.pendingRefs) task.auto_publish_on_completion = true;
+      // 改完再校验一次：前一次保证 fail-closed，这一次保证不会写坏。
+      const after = validateRegistryDocument(snap.doc);
+      if (!after.ok) return { ok: false, ...after };
       writeRawRegistry(snap.doc, file);
     }
     // 零变更也留回执：否则"跑过但本来就没东西可改"和"从没跑过"分不开。

@@ -20,7 +20,7 @@ import {
   ROTATION_STATUS, activeGeneration, pendingGeneration,
   TOPIC_GENERATION_PREPARING_STALE_MS,
 } from "../topic-generation.mjs";
-import { requireIntent } from "../intent.mjs";
+import { requireIntent } from "./intent.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);

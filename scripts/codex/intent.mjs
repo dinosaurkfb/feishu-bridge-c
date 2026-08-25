@@ -23,23 +23,29 @@
  *
  * ■ 为什么是"原子消费"
  *
- * 消费用 rename：同一个 inode 只可能被 rename 成功一次，失败的一方拿到 ENOENT。
+ * 消费用 rename：**同一个源路径只能被一个消费者抢到**，失败的一方拿到 ENOENT。
+ *（原来写的是"同一 inode 只能 rename 一次"—— 不准确：同一 inode 可以被
+ * rename 很多次，起作用的是"这个路径只存在一次"。评审用 12 个并发进程验过：
+ * 恰好 1 个成功、11 个拿到 already_used。）
  * 先读后删会有窗口，两个进程可以都读到同一张凭证。
  * 消费必须发生在**任何副作用之前** —— 拿完锁再检查，锁已经被动过了。
  *
- * ■ 为什么住在共用层
+ * ■ 为什么住在 scripts/codex/
  *
- * 自动轮转由共用的 automatic-topic-rotation.mjs 发起，它要签字。
- * 把凭证层留在 scripts/codex/ 里，共用代码就得反向依赖 codex 目录 ——
- * 那条依赖方向有守卫盯着，而且盯得对：共用代码依赖某一条链，
- * 另一条链就会被牵着走。**home 由调用方传，不再有默认值。**
+ * 我一度把它上移到共用层，理由是"自动轮转由共用 launcher 发起、它要签字"——
+ * **那个理由本身就是个 bug**：launcher 不该自己签，签字必须发生在做出决定
+ * 的那一刻。签发挪回决策点之后，共用代码不再需要这套凭证，
+ * 消费端也全在 Codex 侧。将来 Claude 真正共用这套契约时再提升。
+ *
+ * **home 由调用方传，没有默认值** —— 上移那一轮去掉了对 codex bridgeHome 的
+ * 依赖，这个改动本身是好的，保留。
  */
 
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { isCanonicalIso } from "./canonical-time.mjs";
+import { isCanonicalIso } from "../canonical-time.mjs";
 
 /** 凭证有效期。够人看一眼命令再确认，短到跨不过一个会话。 */
 export const INTENT_TTL_MS = 5 * 60 * 1000;
@@ -205,22 +211,6 @@ export const INTENT_REJECT_TEXT = {
 export const intentRejectText = (reason) =>
   INTENT_REJECT_TEXT[reason] ?? ("凭证校验失败（" + reason + "），拒绝执行。");
 
-/**
- * **系统自己发起的操作**（不是人输入的命令）怎么授权。
- *
- * 自动轮转就是一例：发布器数到阈值，自己去调轮转脚本 —— 这条路径**没有用户输入**，
- * 所以不可能有 hook 签发的凭证。上一版的门禁把它整条卡死了
- *（评审实测：--automatic --apply 得到 intent_missing、exit 1）。
- *
- * **但不能让 --automatic 直接绕过门禁** —— 那样任何 agent 加上这个参数
- * 就能强制轮转，等于开了一扇没锁的后门。
- *
- * 做法：让**做出决定的那一方**签发。发布器数到阈值 → 它签一张
- * `rotate:auto` 凭证 → 轮转脚本消费它。授权链条仍然完整：
- * 谁做的决定，谁签的字。跟人工那条的区别只是签发者不同，
- * 而两者用的是同一套一次性、带摘要、可核验的凭证。
- */
-export const SYSTEM_ACTIONS = new Set(["rotate:auto"]);
 
 /**
  * 有副作用的控制脚本的**统一门禁**。

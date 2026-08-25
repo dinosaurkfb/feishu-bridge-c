@@ -518,6 +518,54 @@ test("只有最终业务卡片计数；本地输入与回复合并卡计 2，纯
   assert.equal(inboundReply[0].messageDelta, 1);
 });
 
+test("Claude 侧有副作用的技能必须关掉模型自动调用 —— 五个，不是四个", () => {
+  // **Claude Code 默认允许模型自动调用技能。**技能描述里那句"仅在显式运行时使用"
+  // 是给模型看的约定，宿主不认它。
+  //
+  // 评审提醒我漏了 pin-session —— 它也是写技能（钉住投递目标会改变入站路由）。
+  // 我原来只数了 bind/unbind/rotate/mode 四个。
+  const WRITE_SKILLS = ["claude-feishu-bind", "claude-feishu-unbind",
+    "claude-feishu-rotate", "claude-feishu-mode", "claude-feishu-pin-session"];
+  for (const name of WRITE_SKILLS) {
+    const f = path.resolve("skills", name, "SKILL.md");
+    const text = fs.readFileSync(f, "utf-8");
+    const fm = text.slice(0, text.indexOf("\n---", 4));
+    assert.match(fm, /^disable-model-invocation:\s*true$/mu,
+      "**缺宿主级开关**：" + name);
+  }
+  // 只读技能不加 —— 加了会让"哪些有副作用"变模糊。
+  for (const name of ["claude-feishu-status", "claude-feishu-subscribe"]) {
+    const text = fs.readFileSync(path.resolve("skills", name, "SKILL.md"), "utf-8");
+    const fm = text.slice(0, text.indexOf("\n---", 4));
+    assert.doesNotMatch(fm, /disable-model-invocation/u,
+      "只读技能不该有这个开关：" + name);
+  }
+});
+
+test("直接调 launcher 不许产生凭证 —— 签字必须在做出决定那一刻", () => {
+  // **评审实测出来的：上一版在 launcher 里签票。**
+  // 那等于自签自授权 —— 绕过计数和阈值直接调它，它照样签出票、照样启动 worker。
+  // 「谁做的决定，谁签的字」被写成了「谁动手，谁签字」，那不是授权链条。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-launcher-"));
+  const home = path.join(dir, "home");
+  fs.mkdirSync(home, { recursive: true });
+
+  let spawned = false;
+  const r = launchAutomaticTopicRotation({
+    runtime: "codex", root: path.join(dir, "p"), threadId: "thread-a", home,
+    // **不给票** —— 模拟"绕过决策直接调它"。
+    spawnImpl: () => { spawned = true; return { pid: 1, unref() {} }; },
+  });
+
+  assert.equal(r.ok, false, "**没有票就不许启动**：" + JSON.stringify(r));
+  assert.equal(r.reason, "intent_required");
+  assert.equal(spawned, false, "worker 一次都不许被启动");
+  // **而且它不许自己签一张出来。**
+  const intents = path.join(home, "intents");
+  assert.equal(fs.existsSync(intents) ? fs.readdirSync(intents).length : 0, 0,
+    "**launcher 不许自签** —— 自签自授权不是授权");
+});
+
 test("自动轮转启动器只启动既有两阶段 CLI，不等待、不继承 Aily 入站身份", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "auto-rotation-launch-"));
   const root = path.join(home, "project");
@@ -525,6 +573,8 @@ test("自动轮转启动器只启动既有两阶段 CLI，不等待、不继承 
   let observed;
   const result = launchAutomaticTopicRotation({
     runtime: "codex", root, threadId: "thread-a", home,
+    // **票由决策方给进来。**launcher 自己不签 —— 见下一条测试。
+    intentId: "0".repeat(32),
     env: { SAFE_VALUE: "yes", AILY_CLI_AGENT_UID: "must-strip" },
     spawnImpl: (bin, args, options) => {
       observed = { bin, args, options };

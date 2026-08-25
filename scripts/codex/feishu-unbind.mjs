@@ -5,7 +5,7 @@ import { validThreadId } from "./bind-compose.mjs";
 import {
   bridgeHome, findRegisteredTaskForCodexThread, setTaskConnectionStatus,
 } from "./state.mjs";
-import { requireIntent } from "../intent.mjs";
+import { requireIntent } from "./intent.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);

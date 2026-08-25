@@ -12,7 +12,7 @@ import {
 import { storeTurnInput } from "../turn-input.mjs";
 import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
 import { codexRuntimeRoot } from "../runtime-install.mjs";
-import { issueIntent } from "../intent.mjs";
+import { issueIntent } from "./intent.mjs";
 
 /**
  * 不带参数的控制命令 —— **只有这一份清单**。

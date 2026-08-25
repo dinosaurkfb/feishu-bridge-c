@@ -10,7 +10,7 @@ import {
   bridgeHome, findRegisteredTaskForCodexThread, interactionPolicyForTask,
   setTaskInteractionMode,
 } from "./state.mjs";
-import { requireIntent } from "../intent.mjs";
+import { requireIntent } from "./intent.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);

@@ -11,7 +11,6 @@ import path from "node:path";
 
 import { recordClaudeTopicActivity } from "./topic-generation-store.mjs";
 import { moduleRoot } from "./direct-run.mjs";
-import { issueIntent } from "./intent.mjs";
 
 const BRIDGE_ROOT = moduleRoot(import.meta.url, "..");
 
@@ -49,6 +48,8 @@ export function launchAutomaticTopicRotation({
   threadId,
   claudeSessionId,
   home,
+  // **由决策方给进来的一次性凭证。**launcher 自己不签 —— 见下面的注释。
+  intentId = null,
   bridgeRoot = BRIDGE_ROOT,
   spawnImpl = spawn,
   env = process.env,
@@ -65,17 +66,16 @@ export function launchAutomaticTopicRotation({
   const args = [script, "--project", root, "--automatic", "--apply"];
   if (isCodex) {
     args.push("--thread-id", threadId);
-    // **做出决定的一方签字。**这条路径没有用户输入，所以不可能有 hook 签的凭证；
-    // 但也不能让 --automatic 直接绕过门禁 —— 那样谁加上这个参数都能强制轮转。
-    // 发布器数到阈值、决定要轮转，就由它签一张 rotate:auto。
-    // 授权链条仍然完整：谁做的决定，谁签的字。
-    const issued = issueIntent({
-      action: "rotate:auto", threadId, params: { project: root }, home,
-    });
-    if (!issued.ok) {
-      return { ok: false, reason: "intent_unissuable", detail: issued.reason };
+    // **凭证必须由做出决定的那一方给进来，launcher 不许自己签。**
+    //
+    // 上一版是在这里签的 —— 那等于自签自授权：**绕过计数和阈值直接调 launcher，
+    // 它照样签出票、照样启动 worker**。评审直接调它就复现了。
+    // 签字必须发生在"确认要轮转"那一刻（recordCodexActivityAndMaybeRotate 里
+    // shouldAutoRotate 为真之后），并绑住那次决定的代际身份。
+    if (!nonEmpty(intentId)) {
+      return { ok: false, reason: "intent_required" };
     }
-    args.push("--intent", issued.id);
+    args.push("--intent", intentId);
   }
   if (!isCodex && nonEmpty(claudeSessionId)) args.push("--claude-session-id", claudeSessionId);
 

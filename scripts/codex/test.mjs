@@ -21,7 +21,7 @@ import {
   HOOK_TAG, acceptsHookCommand, buildHookCommand, ownsHookCommand, parseHookCommand, pickNode,
 } from "./hook-command.mjs";
 import { composeSubscribeContext } from "./prompt-hook.mjs";
-import { INTENT_TTL_MS, consumeIntent, intentDir, issueIntent } from "../intent.mjs";
+import { INTENT_TTL_MS, consumeIntent, intentDir, issueIntent } from "./intent.mjs";
 import { sweepEligible } from "./drain-all.mjs";
 
 import {
@@ -3286,6 +3286,61 @@ test("停用的顺序：核验没过时 plist 一个字节都不许动", () => {
   assert.equal(fs.existsSync(plist), true,
     "**plist 不许被删** —— 删了现场就变成「没有 plist、job 还在」，比之前更糟");
   assert.equal(fs.readFileSync(plist, "utf-8"), before, "一个字节都不许动");
+});
+
+test("有副作用的技能必须关掉隐式调用，且装出来要带上那份策略", () => {
+  // **宿主级的那一层。**技能描述里写着"讨论和引用不得触发"，
+  // 但那是给模型看的约定 —— 宿主的技能选择不受它约束，出过真事故。
+  //
+  // 这一层跟凭证门禁**同时存在**，缺一不可：
+  //   这里挡「误选」，凭证挡「误执行」。
+  // 单靠凭证的话，每次误选都要靠门禁兜底 —— 而门禁是最后一道，不该当第一道用。
+  const WRITE_SKILLS = ["feishu-bind", "feishu-unbind", "feishu-rotate", "feishu-mode"];
+  for (const name of WRITE_SKILLS) {
+    const f = path.join(ROOT, "skills", name, "agents", "openai.yaml");
+    assert.equal(fs.existsSync(f), true, "**缺策略文件**：" + name);
+    const text = fs.readFileSync(f, "utf-8");
+    assert.match(text, /allow_implicit_invocation:\s*false/u,
+      name + " 必须关掉隐式调用：" + text);
+  }
+  // 只读技能不需要 —— 加了只是噪音，而且会让"哪些有副作用"这件事变模糊。
+  for (const name of ["feishu-status", "feishu-subscribe"]) {
+    assert.equal(fs.existsSync(path.join(ROOT, "skills", name, "agents", "openai.yaml")),
+      false, "只读技能不该有这份策略：" + name);
+  }
+
+  // **装出来也要带上，而且逐字节一致。**清单漏了它的话，
+  // 线上就只有凭证那一层 —— 而"同时存在"才是设计。
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  const home = path.join(dir, "bridge-home");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
+  writeRegistry([], path.join(home, "registry.json"));
+  const env = isolatedEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home });
+  assert.equal(spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", env }).status, 0);
+
+  for (const name of WRITE_SKILLS) {
+    const installed = path.join(codexHome, "skills", name, "agents", "openai.yaml");
+    assert.equal(fs.existsSync(installed), true, "**装出来必须带上**：" + name);
+    assert.equal(fs.readFileSync(installed, "utf-8"),
+      fs.readFileSync(path.join(ROOT, "skills", name, "agents", "openai.yaml"), "utf-8"),
+      name + " 装出来的内容要逐字节一致");
+  }
+  // doctor 也要能核验它 —— "文件在"不等于"装对了"。
+  const audit = auditSkills({ repoRoot: ROOT, codexHome,
+    runtimeCurrent: path.join(codexHome, "feishu-bridge", "runtime", "current"),
+    bridgeHome: home });
+  assert.equal(audit.ok, true, JSON.stringify(audit.problems));
+  fs.writeFileSync(path.join(codexHome, "skills", "feishu-bind", "agents", "openai.yaml"),
+    "policy:\n  allow_implicit_invocation: true\n");
+  const tampered = auditSkills({ repoRoot: ROOT, codexHome,
+    runtimeCurrent: path.join(codexHome, "feishu-bridge", "runtime", "current"),
+    bridgeHome: home });
+  assert.equal(tampered.ok, false, "**被改成 true 必须被 doctor 发现**");
+  assert.ok(tampered.problems.some((p) => p.file === "agents/openai.yaml"));
 });
 
 test("每个命令都要有对应的技能，装出来还要能被 doctor 核验", () => {

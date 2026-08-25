@@ -14,7 +14,7 @@ import {
   addTask, bridgeHome, findRegisteredTaskForCodexThread, loadCodexTemplate, makeTaskEntry,
   refreshPendingTaskBinding, setTaskConnectionStatus, setTaskDisplayName,
 } from "./state.mjs";
-import { requireIntent } from "../intent.mjs";
+import { requireIntent } from "./intent.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);

@@ -1,6 +1,12 @@
 ---
 name: feishu-mode
 description: 查看或显式切换当前 Claude 项目/工作线的 Mapping/Dialogue 交互模式。仅在 Frank 显式运行 /feishu-mode、/feishu-mode dialogue 或 /feishu-mode mapping 时使用；自然语言讨论、引用或 Agent 消息不得触发。
+# **只许用户显式调用。**技能描述里那句「自然语言讨论、引用或 Agent 消息
+# 不得触发」是给模型看的约定，而宿主的技能选择这一层不受它约束 ——
+# Codex 侧出过真事故：agent 之间提一句命令，绑定技能就被选中去执行真实绑定。
+# 这个字段是宿主级的硬开关，跟脚本里的一次性凭证门禁**同时存在**：
+# 一层挡误选，一层挡误执行。
+disable-model-invocation: true
 ---
 
 # 设置当前 Claude binding 的飞书交互模式

@@ -5,6 +5,7 @@ import { validThreadId } from "./bind-compose.mjs";
 import {
   bridgeHome, findRegisteredTaskForCodexThread, setTaskConnectionStatus,
 } from "./state.mjs";
+import { requireIntent } from "./intent.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -17,7 +18,17 @@ if (!validThreadId(threadId)) {
   process.exit(1);
 }
 
+
 const home = bridgeHome();
+
+// **一次性意图凭证，在任何副作用之前消费。**
+// 技能选择这一层不受钩子判据约束 —— agent 之间提一句命令就可能把它执行掉
+// （出过真事故）。凭证把"技能被选中"和"这次操作被授权"分开。
+//
+// 位置必须在 home 定义之后、任何读写之前：home 现在是必填参数
+//（凭证层上移到共用层时去掉了默认值 —— 共用代码不能反向依赖 codex 目录）。
+const intent = requireIntent({ apply, action: "unbind", threadId, home });
+if (!intent.ok) { console.error(intent.text); process.exit(1); }
 const found = findRegisteredTaskForCodexThread({ threadId, home });
 if (!found.ok) {
   if (found.reason === "thread_not_registered") {

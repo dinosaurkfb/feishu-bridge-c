@@ -214,7 +214,10 @@ for (const skill of skills) {
   fs.mkdirSync(dst, { recursive: true, mode: 0o700 });
   for (const name of skill.files) {
     const source = path.join(src, name);
-    fs.writeFileSync(path.join(dst, name), renderedSkill(source, name), { mode: 0o600 });
+    const target = path.join(dst, name);
+    // **文件名可能带子目录**（agents/openai.yaml）—— 不先建目录就 ENOENT。
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(target, renderedSkill(source, name), { mode: 0o600 });
   }
 }
 

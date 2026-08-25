@@ -11,9 +11,10 @@ import {
 } from "./bind-compose.mjs";
 import { updateTextMessage } from "./lark-message.mjs";
 import {
-  addTask, findRegisteredTaskForCodexThread, loadCodexTemplate, makeTaskEntry,
+  addTask, bridgeHome, findRegisteredTaskForCodexThread, loadCodexTemplate, makeTaskEntry,
   refreshPendingTaskBinding, setTaskConnectionStatus, setTaskDisplayName,
 } from "./state.mjs";
+import { buildIntentParams, requireIntent } from "./intent.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -26,6 +27,20 @@ if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) die("项目目录�
 
 const thread = resolveThreadId({ explicit: arg("thread-id"), root });
 if (!thread.ok) die("无法确定当前 Codex thread（" + thread.reason + "），拒绝猜测或使用 --last。");
+
+// **一次性意图凭证，在任何副作用之前消费。**
+//
+// 出过真事故：一条 agent 之间的消息里提到了这个命令，绑定技能就被选中、
+// 直接来跑真实绑定。技能描述里写着"讨论和引用不得触发"，钩子的判据也是
+// 整条精确匹配 —— **但技能选择这一层不受那条判据约束**。
+// 凭证把"技能被选中"和"这次操作被授权"分开：只有人亲自输入完整命令时，
+// 钩子才签发一张，用完即焚。
+const intent = requireIntent({
+  apply, action: "bind", threadId: thread.threadId,
+  params: buildIntentParams("bind", { project: root, chat: arg("chat-id") ?? null,
+    name: arg("name") ?? null }),
+  home: bridgeHome() });
+if (!intent.ok) die(intent.text);
 const existing = findRegisteredTaskForCodexThread({ threadId: thread.threadId });
 if (existing.ok) {
   if ((existing.task.status ?? "active") === "active") {

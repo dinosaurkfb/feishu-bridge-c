@@ -14,11 +14,11 @@ import { shellQuote } from "../shell-quote.mjs";
 export const SKILLS = [
   { name: "m5codex-inbound-router", files: ["SKILL.md", "aily-cli-skill.json"] },
   { name: "codex-longtask-feishu", files: ["SKILL.md"] },
-  { name: "feishu-bind", files: ["SKILL.md"] },
-  { name: "feishu-unbind", files: ["SKILL.md"] },
+  { name: "feishu-bind", files: ["SKILL.md", "agents/openai.yaml"] },
+  { name: "feishu-unbind", files: ["SKILL.md", "agents/openai.yaml"] },
   { name: "feishu-status", files: ["SKILL.md"] },
-  { name: "feishu-rotate", files: ["SKILL.md"] },
-  { name: "feishu-mode", files: ["SKILL.md"] },
+  { name: "feishu-rotate", files: ["SKILL.md", "agents/openai.yaml"] },
+  { name: "feishu-mode", files: ["SKILL.md", "agents/openai.yaml"] },
   { name: "feishu-subscribe", files: ["SKILL.md"] },
 ];
 

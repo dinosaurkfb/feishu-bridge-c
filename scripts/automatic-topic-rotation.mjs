@@ -48,6 +48,8 @@ export function launchAutomaticTopicRotation({
   threadId,
   claudeSessionId,
   home,
+  // **由决策方给进来的一次性凭证。**launcher 自己不签 —— 见下面的注释。
+  intentId = null,
   bridgeRoot = BRIDGE_ROOT,
   spawnImpl = spawn,
   env = process.env,
@@ -62,7 +64,19 @@ export function launchAutomaticTopicRotation({
     ? path.join(bridgeRoot, "scripts", "codex", "feishu-rotate.mjs")
     : path.join(bridgeRoot, "scripts", "feishu-rotate.mjs");
   const args = [script, "--project", root, "--automatic", "--apply"];
-  if (isCodex) args.push("--thread-id", threadId);
+  if (isCodex) {
+    args.push("--thread-id", threadId);
+    // **凭证必须由做出决定的那一方给进来，launcher 不许自己签。**
+    //
+    // 上一版是在这里签的 —— 那等于自签自授权：**绕过计数和阈值直接调 launcher，
+    // 它照样签出票、照样启动 worker**。评审直接调它就复现了。
+    // 签字必须发生在"确认要轮转"那一刻（recordCodexActivityAndMaybeRotate 里
+    // shouldAutoRotate 为真之后），并绑住那次决定的代际身份。
+    if (!nonEmpty(intentId)) {
+      return { ok: false, reason: "intent_required" };
+    }
+    args.push("--intent", intentId);
+  }
   if (!isCodex && nonEmpty(claudeSessionId)) args.push("--claude-session-id", claudeSessionId);
 
   const logFile = isCodex

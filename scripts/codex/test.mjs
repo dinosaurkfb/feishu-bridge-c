@@ -21,6 +21,10 @@ import {
   HOOK_TAG, acceptsHookCommand, buildHookCommand, ownsHookCommand, parseHookCommand, pickNode,
 } from "./hook-command.mjs";
 import { composeSubscribeContext } from "./prompt-hook.mjs";
+import { recordCodexActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
+import {
+  INTENT_TTL_MS, buildIntentParams, consumeIntent, intentDir, issueIntent,
+} from "./intent.mjs";
 import { sweepEligible } from "./drain-all.mjs";
 
 import {
@@ -91,6 +95,22 @@ const FAKE_LAUNCHCTL = path.join(fakeLaunchctlDir, "launchctl");
 fs.writeFileSync(FAKE_LAUNCHCTL,
   '#!/bin/sh\necho "Could not find service in domain" >&2\nexit 113\n', { mode: 0o755 });
 /** 跑子进程时用的环境：真实 launchd 域一律屏蔽掉。 */
+/**
+ * 给测试签一张真凭证，返回该带的命令参数。
+ *
+ * **走产品自己的 issueIntent，不手写凭证文件** —— 手写的话签发格式一改，
+ * 测试就跟真实脱节，而签发恰恰是这道门禁的另一半。
+ */
+const withIntent = (action, threadId, home, input = {}) => {
+  // **走产品同一个参数构造器，绝不手拼。**
+  // 手拼正是这轮被打穿的病根：签发端和消费端各拼各的，拼出来不一样，
+  // 真实入口全线 intent_params_mismatch，而各自签票的单测两边都绿。
+  const issued = issueIntent({
+    action, threadId, params: buildIntentParams(action, input), home });
+  assert.equal(issued.ok, true, "签发凭证失败：" + (issued.reason ?? ""));
+  return ["--intent", issued.id];
+};
+
 const isolatedEnv = (extra = {}) => ({
   ...process.env, FEISHU_BRIDGE_LAUNCHCTL: FAKE_LAUNCHCTL, ...extra,
 });
@@ -272,11 +292,13 @@ test("Codex feishu-mode 默认只读，只有 --apply 才切换精确 task", () 
   const preview = run("--mode", "dialogue");
   assert.match(preview.stdout, /dry-run/u);
   assert.equal(loadRegistry(path.join(home, "registry.json")).tasks[0].interaction_policy_state, undefined);
-  const applied = run("--mode", "dialogue", "--apply");
+  const applied = run("--mode", "dialogue", "--apply", ...withIntent("mode", THREAD_A, home, { mode: "dialogue" }));
   assert.equal(applied.status, 0, applied.stderr);
   assert.match(applied.stdout, /Dialogue/u);
   assert.equal(loadRegistry(path.join(home, "registry.json")).tasks[0].interaction_policy_state.policy_id,
     "dialogue");
+  // **非法模式该在消费凭证之前就被拒** —— 不给凭证也应该失败在"模式不对"上，
+  // 而不是失败在"没凭证"上。参数校验排在门禁前面才是对的顺序。
   const invalid = run("--mode", "automatic", "--apply");
   assert.equal(invalid.status, 2);
   assert.match(invalid.stderr, /mapping.*dialogue/u);
@@ -823,7 +845,8 @@ test("Codex 轮转 CLI 可显式取消 pending，且完全不调用飞书", () =
     "--project", root,
     "--thread-id", THREAD_A,
     "--cancel",
-    "--apply",
+    // **取消要取消的票。**一张创建票拿来取消会被拒 —— 那正是参数绑定的意义。
+    "--apply", ...withIntent("rotate", THREAD_A, home, { op: "cancel" }),
   ], {
     encoding: "utf-8",
     env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
@@ -924,7 +947,7 @@ test("bind-task 重跑只续期 active pending，不创建或回复第二个话�
   writeRegistry([task], path.join(home, "registry.json"));
 
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
-    "--project", root, "--thread-id", THREAD_A, "--name", "A", "--apply"], {
+    "--project", root, "--thread-id", THREAD_A, "--name", "A", "--apply", ...withIntent("bind", THREAD_A, home, { project: root, name: "A" })], {
     encoding: "utf-8",
     env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
@@ -960,7 +983,7 @@ test("pending 续期不被超过编辑时限的旧话题标题阻断", () => {
   writeRegistry([task], path.join(home, "registry.json"));
 
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
-    "--project", root, "--thread-id", THREAD_A, "--name", "New", "--apply"], {
+    "--project", root, "--thread-id", THREAD_A, "--name", "New", "--apply", ...withIntent("bind", THREAD_A, home, { project: root, name: "New" })], {
     encoding: "utf-8",
     env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
   });
@@ -1005,13 +1028,13 @@ test("task 控制脚本不猜 thread，暂停和恢复都不调用飞书", () =>
   assert.equal(findTaskForCodexThread({ threadId: THREAD_A, home }).ok, true);
 
   const paused = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-unbind.mjs"),
-    "--thread-id", THREAD_A, "--apply"], { encoding: "utf-8", env });
+    "--thread-id", THREAD_A, "--apply", ...withIntent("unbind", THREAD_A, home)], { encoding: "utf-8", env });
   assert.equal(paused.status, 0, paused.stderr);
   assert.match(paused.stdout, /已暂停/);
   assert.equal(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task.status, "paused");
 
   const resumed = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
-    "--project", root, "--thread-id", THREAD_A, "--apply"], { encoding: "utf-8", env });
+    "--project", root, "--thread-id", THREAD_A, "--apply", ...withIntent("bind", THREAD_A, home, { project: root })], { encoding: "utf-8", env });
   assert.equal(resumed.status, 0, resumed.stderr);
   assert.match(resumed.stdout, /复用原话题|继续使用原话题/);
   assert.equal(findTaskForCodexThread({ threadId: THREAD_A, home }).ok, true);
@@ -2297,7 +2320,8 @@ test("bind-task 显式跨群 apply 把根消息发到目标群并登记该 task 
     "--name", "智能体进化｜Aily主动求助验收",
     "--chat-id", "oc_lab",
     "--chat-name", "智能体进化",
-    "--apply"], {
+    "--apply", ...withIntent("bind", THREAD_A, home, {
+        project: root, chat: "oc_lab", name: "智能体进化｜Aily主动求助验收" })], {
     encoding: "utf-8",
     env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home, FAKE_CALLS_FILE: calls },
   });
@@ -3270,6 +3294,61 @@ test("停用的顺序：核验没过时 plist 一个字节都不许动", () => {
   assert.equal(fs.readFileSync(plist, "utf-8"), before, "一个字节都不许动");
 });
 
+test("有副作用的技能必须关掉隐式调用，且装出来要带上那份策略", () => {
+  // **宿主级的那一层。**技能描述里写着"讨论和引用不得触发"，
+  // 但那是给模型看的约定 —— 宿主的技能选择不受它约束，出过真事故。
+  //
+  // 这一层跟凭证门禁**同时存在**，缺一不可：
+  //   这里挡「误选」，凭证挡「误执行」。
+  // 单靠凭证的话，每次误选都要靠门禁兜底 —— 而门禁是最后一道，不该当第一道用。
+  const WRITE_SKILLS = ["feishu-bind", "feishu-unbind", "feishu-rotate", "feishu-mode"];
+  for (const name of WRITE_SKILLS) {
+    const f = path.join(ROOT, "skills", name, "agents", "openai.yaml");
+    assert.equal(fs.existsSync(f), true, "**缺策略文件**：" + name);
+    const text = fs.readFileSync(f, "utf-8");
+    assert.match(text, /allow_implicit_invocation:\s*false/u,
+      name + " 必须关掉隐式调用：" + text);
+  }
+  // 只读技能不需要 —— 加了只是噪音，而且会让"哪些有副作用"这件事变模糊。
+  for (const name of ["feishu-status", "feishu-subscribe"]) {
+    assert.equal(fs.existsSync(path.join(ROOT, "skills", name, "agents", "openai.yaml")),
+      false, "只读技能不该有这份策略：" + name);
+  }
+
+  // **装出来也要带上，而且逐字节一致。**清单漏了它的话，
+  // 线上就只有凭证那一层 —— 而"同时存在"才是设计。
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  const home = path.join(dir, "bridge-home");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
+  writeRegistry([], path.join(home, "registry.json"));
+  const env = isolatedEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home });
+  assert.equal(spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", env }).status, 0);
+
+  for (const name of WRITE_SKILLS) {
+    const installed = path.join(codexHome, "skills", name, "agents", "openai.yaml");
+    assert.equal(fs.existsSync(installed), true, "**装出来必须带上**：" + name);
+    assert.equal(fs.readFileSync(installed, "utf-8"),
+      fs.readFileSync(path.join(ROOT, "skills", name, "agents", "openai.yaml"), "utf-8"),
+      name + " 装出来的内容要逐字节一致");
+  }
+  // doctor 也要能核验它 —— "文件在"不等于"装对了"。
+  const audit = auditSkills({ repoRoot: ROOT, codexHome,
+    runtimeCurrent: path.join(codexHome, "feishu-bridge", "runtime", "current"),
+    bridgeHome: home });
+  assert.equal(audit.ok, true, JSON.stringify(audit.problems));
+  fs.writeFileSync(path.join(codexHome, "skills", "feishu-bind", "agents", "openai.yaml"),
+    "policy:\n  allow_implicit_invocation: true\n");
+  const tampered = auditSkills({ repoRoot: ROOT, codexHome,
+    runtimeCurrent: path.join(codexHome, "feishu-bridge", "runtime", "current"),
+    bridgeHome: home });
+  assert.equal(tampered.ok, false, "**被改成 true 必须被 doctor 发现**");
+  assert.ok(tampered.problems.some((p) => p.file === "agents/openai.yaml"));
+});
+
 test("每个命令都要有对应的技能，装出来还要能被 doctor 核验", () => {
   // **清单漏一项的后果是"命令能敲、技能没装"**，而那要等真人敲了才发现。
   // 这条把三样绑在一起：prompt-hook 认得的命令、技能清单、装出来的产物。
@@ -3513,6 +3592,492 @@ test("群名优先用 task 自己的覆盖，而不是把知道的说成不知�
     "**已知的 task 群名不许被报成不可用**：" + r.stdout);
   // 而且不许把模板那个群的名字套上来。
   assert.doesNotMatch(r.stdout, new RegExp(TEMPLATE.chat_name ?? "___", "u"));
+});
+
+test("意图凭证：复现那次事故 —— 没有凭证的 --apply 一律拒绝", () => {
+  // **这条钉的是一次真事故。**一条 agent 之间的消息里提到了某个 $ 命令，
+  // Codex 的绑定技能就被选中，直接去跑真实绑定（那次是审批门挡住的）。
+  //
+  // 技能描述里写着"自然语言讨论、引用或 Agent 消息不得触发"，
+  // 钩子的判据也是整条精确匹配 —— **但技能选择这一层不受那条判据约束**。
+  // description 负责路由（"这段话像不像在说这件事"），
+  // 那跟"这次真的被授权了吗"是两个问题。混淆代理。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  writeRegistry([], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const env = isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
+
+  // 事故的形状：agent 自己去跑 bind-task --apply，**没有凭证**。
+  const noIntent = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
+      "--project", root, "--thread-id", THREAD_A, "--apply"],
+    { encoding: "utf-8", env });
+  assert.notEqual(noIntent.status, 0, "**没有凭证必须拒绝**：" + noIntent.stdout);
+  assert.match(noIntent.stderr, /一次性意图凭证/u);
+  assert.match(noIntent.stderr, /agent 之间转述、引用、正文夹带都不会有/u,
+    "要说清为什么它拿不到凭证");
+  // **没有任何状态被改变。**
+  assert.equal(fs.existsSync(path.join(home, "tasks")), false, "不许留下 task 目录");
+
+  // 预览不需要凭证 —— 它没有副作用，要凭证只会把凭证消费在没用的地方。
+  const preview = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
+      "--project", root, "--thread-id", THREAD_A],
+    { encoding: "utf-8", env });
+  assert.doesNotMatch(preview.stderr, /一次性意图凭证/u, "预览不该要凭证");
+});
+
+test("自动轮转不许被门禁卡死，也不许靠 --automatic 绕过", () => {
+  // **每种情形用不同的 turn。**签发按 (thread, turn, 意图) 幂等 ——
+  // 同一 turn 连签同类票会拿到同一张（或消费后被墓碑挡住）。
+  // 这条要验的是"不同意图互不通用"，所以每次换 turn 才测得到那件事。
+  // **评审实测：加了门禁之后，自动轮转整条被卡死**（intent_missing, exit 1）。
+  // 那条路径由发布器数到阈值自己发起，**没有用户输入**，不可能有 hook 签的票。
+  //
+  // 但也不能让 --automatic 直接绕过 —— 那样谁加上这个参数都能强制轮转，
+  // 等于开一扇没锁的后门。做法是让**做出决定的一方签字**。
+  const home = temp();
+  const T = THREAD_A;
+
+  // ① 发布器签的 rotate:auto 票，轮转脚本能消费。
+  const auto = issueIntent({ action: "rotate:auto", threadId: T, turnId: "a1",
+    params: buildIntentParams("rotate:auto", { project: "/p" }), home });
+  assert.equal(consumeIntent({ id: auto.id, action: "rotate:auto", threadId: T,
+    params: buildIntentParams("rotate:auto", { project: "/p" }), home }).ok, true, "自动那条要能走通");
+
+  // ② **人工票不能拿去做自动轮转，反过来也不行。**
+  const manual = issueIntent({ action: "rotate", threadId: T, turnId: "a2",
+    params: buildIntentParams("rotate", { op: "create" }), home });
+  assert.equal(consumeIntent({ id: manual.id, action: "rotate:auto", threadId: T,
+    params: buildIntentParams("rotate:auto", { project: "/p" }), home }).reason, "intent_action_mismatch");
+  const auto2 = issueIntent({ action: "rotate:auto", threadId: T, turnId: "a3",
+    params: buildIntentParams("rotate:auto", { project: "/p" }), home });
+  assert.equal(consumeIntent({ id: auto2.id, action: "rotate", threadId: T,
+    params: buildIntentParams("rotate", { op: "create" }), home }).reason, "intent_action_mismatch");
+
+  // ③ **创建票不能拿去取消。**三种情形各自授权，不是一张通票。
+  const create = issueIntent({ action: "rotate", threadId: T, turnId: "a4",
+    params: buildIntentParams("rotate", { op: "create" }), home });
+  assert.equal(consumeIntent({ id: create.id, action: "rotate", threadId: T,
+    params: buildIntentParams("rotate", { op: "cancel" }), home }).reason, "intent_params_mismatch");
+});
+
+test("接线：走真实决策路径签票 → 真实 CLI 过门禁；代际变了就拒", () => {
+  // **上一版这条直接调 issueIntent —— 等于测试自己充当授权者**，
+  // 于是它证明不了"生产里那条链能走通"，也没抓住重试撞墓碑那个缺陷。
+  // 评审指出来的。现在从 recordCodexActivityAndMaybeRotate 进去，
+  // 由它自己决定、自己签字、自己把票交给 launcher。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  task.session_id = "aily_session_a";
+  task.inbound_state = "bound";
+  delete task.topic_generation_state;
+  delete task.channel_generation_id;
+  writeRegistry([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  const stored = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
+  const gen = activeGeneration(topicStateForTask(stored).state).channel_generation_id;
+
+  // 数到阈值 —— 让决策方自己决定要轮转。
+  let launched = null;
+  const drive = (i) => recordCodexActivityAndMaybeRotate({
+    root, threadId: THREAD_A, home, generationId: gen,
+    eventKey: "evt-" + i, messageDelta: 1,
+    spawnImpl: (bin, args) => { launched = args; return { pid: 1, unref() {} }; },
+  });
+  let decided = null;
+  for (let i = 0; i < 40 && !decided; i += 1) {
+    const r = drive(i);
+    if (r.shouldAutoRotate) decided = r;
+  }
+  assert.ok(decided, "夹具要能数到阈值");
+  assert.equal(decided.rotationLaunch?.ok, true,
+    "**决策方要能签出票并启动 worker**：" + JSON.stringify(decided.rotationLaunch));
+  assert.ok(launched, "worker 要被启动");
+
+  // 把决策方交给 worker 的那张票，喂进真实 CLI —— 必须过门禁。
+  const at = launched.indexOf("--intent");
+  assert.notEqual(at, -1, "launcher 必须把票传下去：" + JSON.stringify(launched));
+  const ticket = launched[at + 1];
+  const env = isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
+  const pass = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-rotate.mjs"),
+      "--project", root, "--thread-id", THREAD_A, "--automatic", "--apply",
+      "--intent", ticket],
+    { encoding: "utf-8", env });
+  assert.doesNotMatch(pass.stderr ?? "", /凭证/u,
+    "**决策方签的票必须过真实 CLI 的门禁**：" + pass.stderr);
+
+  // **冷却之后的新决策必须能拿到新票。**
+  //
+  // 评审实测到的：首次启动成功、票被消费，**重试请求就撞上那张墓碑**
+  //（intent_already_used）—— 自动轮转从此再也起不来。
+  // 槽位里要带上"这次决策的号"：同一次决策幂等，新决策换号拿新票。
+  let retried = null;
+  for (let i = 100; i < 160 && !retried; i += 1) {
+    const r = recordCodexActivityAndMaybeRotate({
+      root, threadId: THREAD_A, home, generationId: gen,
+      eventKey: "retry-" + i, messageDelta: 1, retryMs: 0,
+      spawnImpl: (bin, args) => { launched = args; return { pid: 1, unref() {} }; },
+    });
+    if (r.shouldAutoRotate) retried = r;
+  }
+  assert.ok(retried, "冷却之后要能再次决定轮转");
+  assert.equal(retried.rotationLaunch?.ok, true,
+    "**重试必须能拿到新票**，不该撞上上次那张墓碑：" +
+    JSON.stringify(retried.rotationLaunch));
+  const at2 = launched.indexOf("--intent");
+  assert.notEqual(launched[at2 + 1], ticket, "新决策要拿到不同的票");
+});
+
+test("签发是原子的：并发只产生一个授权，消费后不许重签", () => {
+  // 评审实测：上一版"先查再随机创建"，32 个并发签发进程跑出 **4 张不同活票**。
+  // 我改成 mkdir 抢槽位之后仍有 2 张 —— 因为 recursive: true 在目录已存在时
+  // **不报 EEXIST**，每个进程都以为自己抢到了。互斥全靠 EEXIST，recursive 把它吞了。
+  const home = temp();
+  const T = THREAD_A;
+  const sign = () => issueIntent({ action: "bind", threadId: T, turnId: "same-turn",
+    params: buildIntentParams("bind", { project: "/p" }), home });
+
+  // 消费前重复签 → 同一张。
+  const a = sign();
+  const b = sign();
+  assert.equal(a.id, b.id, "**消费前重复签必须是同一张**");
+  assert.equal(b.reused, true);
+
+  // **真并发。**顺序调两次证明不了原子性 —— 把槽位改回 recursive: true
+  // （EEXIST 被吞、每个进程都以为自己抢到了）时，上面那两行照样绿。
+  // 必须真的同时开多个进程。
+  const concHome = temp();
+  const one = path.join(concHome, "one.mjs");
+  fs.writeFileSync(one,
+    'import { issueIntent, buildIntentParams } from ' +
+    JSON.stringify(path.join(ROOT, "scripts", "codex", "intent.mjs")) + ';\n' +
+    'const r = issueIntent({ action: "bind", threadId: ' + JSON.stringify(T) + ',\n' +
+    '  turnId: "conc", params: buildIntentParams("bind", { project: "/p" }),\n' +
+    '  home: process.env.H });\n' +
+    'process.stdout.write((r.ok ? r.id : "ERR:" + r.reason) + "\\n");\n');
+  // **spawnSync 在循环里是顺序的** —— 那样写出来的"并发测试"根本不并发，
+  // 我第一版就是那样。用 shell 把它们同时放出去再 wait。
+  const out = path.join(concHome, "out.txt");
+  const sh = spawnSync("/bin/sh", ["-c",
+    'for i in $(seq 1 16); do node ' + JSON.stringify(one) +
+    ' >> ' + JSON.stringify(out) + ' 2>/dev/null & done; wait'],
+    { encoding: "utf-8", env: { ...process.env, H: concHome } });
+  assert.equal(sh.status, 0, sh.stderr);
+  const lines = fs.readFileSync(out, "utf-8").trim().split("\n").filter(Boolean);
+  assert.ok(lines.length >= 8, "至少要真的跑起来几个：" + lines.length);
+  const ids = new Set(lines.map((x) => x.trim()).filter((x) => x && !x.startsWith("ERR")));
+  assert.equal(ids.size, 1,
+    "**并发只能产生一个授权**，实际 " + ids.size + " 个：" + [...ids].join(" "));
+
+  // 消费。
+  assert.equal(consumeIntent({ id: a.id, action: "bind", threadId: T, turnId: "same-turn",
+    params: buildIntentParams("bind", { project: "/p" }), home }).ok, true);
+
+  // **消费后不许重签** —— 这一次输入已经授权过一次了。
+  const after = sign();
+  assert.equal(after.ok, false, "**消费后不许再签**：" + JSON.stringify(after));
+  assert.equal(after.reason, "intent_already_used");
+});
+
+test("轮转脚本真实入口：人工票不能拿去跑 --automatic", () => {
+  // **函数层验过还不够。**把脚本里那行改成三种共用 "rotate"，函数层的断言
+  // 全都还是绿的 —— 因为它们验的是凭证层，不是脚本怎么选 action。
+  // 这条打真实 CLI。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  // **要有 active generation，门禁才走得到。**
+  //
+  // 门禁绑住"这次决定的是哪一代"，所以它必须排在代际读出来之后 ——
+  // 而新建 task 的第一代是 pending。夹具不真实的话，脚本会先因为
+  // "没有 active generation"退出，**根本走不到凭证那一层**：
+  // 于是这条测试测的是别的东西，我第一版就是这样。
+  task.session_id = "aily_session_a";
+  task.inbound_state = "bound";
+  // **这两行 delete 是必须的**，探针跑出来才看清：留着 makeTaskEntry 造的那份
+  // 代际状态，第一代永远是 pending；删掉之后才会按 bound 重新合成出 active。
+  // 既有夹具里那两行 delete 就是干这个的，我一开始没看懂它们为什么在。
+  delete task.topic_generation_state;
+  delete task.channel_generation_id;
+  writeRegistry([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const env = isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
+
+  // 拿一张**人工创建**的票，去跑自动轮转 —— 必须被拒。
+  const manual = issueIntent({ action: "rotate", threadId: THREAD_A,
+    params: buildIntentParams("rotate", { op: "create" }), home });
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-rotate.mjs"),
+      "--project", root, "--thread-id", THREAD_A, "--automatic", "--apply",
+      "--intent", manual.id],
+    { encoding: "utf-8", env });
+  // **断言必须能分辨"被凭证拒"和"因别的原因失败"。**
+  // 只断言非零退出是恒真的：这个夹具里 task 没有 active generation，
+  // 业务判断本来就会非零退出 —— 于是把 action 改成通票，这条照样绿。
+  // 实测过：那个变异下整套 157/0。
+  assert.match(r.stderr, /凭证授权的不是这个动作/u,
+    "**必须是被凭证拒的**，不是因为别的原因失败：" +
+    JSON.stringify({ status: r.status, stdout: r.stdout, stderr: r.stderr }).slice(0, 400));
+
+  // 反过来：自动票去跑人工创建，也必须被拒。
+  const auto = issueIntent({ action: "rotate:auto", threadId: THREAD_A,
+    params: { project: root }, home });
+  const r2 = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-rotate.mjs"),
+      "--project", root, "--thread-id", THREAD_A, "--apply", "--intent", auto.id],
+    { encoding: "utf-8", env });
+  assert.match(r2.stderr, /凭证授权的不是这个动作/u,
+    "**必须是被凭证拒的**：" +
+    JSON.stringify({ status: r2.status, stderr: r2.stderr }).slice(0, 300));
+});
+
+test("$feishu-rotate cancel 有真入口，而且能拿到取消的票", () => {
+  // **评审指出：取消在生产里永远拿不到凭证。**
+  // 带参数的控制命令被判成 invalid-rotate，于是那个能力只有测试能用 ——
+  // 而测试自己充当授权者，那不算证明。要么给真入口，要么撤掉能力。
+  assert.equal(classifyFeishuPrompt("$feishu-rotate cancel"), "rotate-cancel");
+  assert.equal(classifyFeishuPrompt("[$feishu-rotate](/x/feishu-rotate/SKILL.md) cancel"),
+    "rotate-cancel", "Desktop 的链接形式也要认");
+  assert.equal(classifyFeishuPrompt("$feishu-rotate"), "rotate", "不带参数仍是创建");
+  // 畸形仍要 fail-closed 并给反馈 —— 不许静默成 none。
+  assert.equal(classifyFeishuPrompt("$feishu-rotate 别的"), "invalid-rotate");
+  assert.equal(classifyFeishuPrompt("讨论 $feishu-rotate cancel"), "none");
+
+  // 注入的命令要带 --cancel，票也要是取消那一张。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "prompt-hook.mjs")],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }),
+      input: JSON.stringify({ prompt: "$feishu-rotate cancel", cwd: root,
+        session_id: THREAD_A, turn_id: "t1" }) });
+  const ctx = JSON.parse(r.stdout || "{}")?.hookSpecificOutput?.additionalContext ?? "";
+  assert.match(ctx, /--cancel/u, "**注入的命令必须带 --cancel**：" + ctx);
+  assert.match(ctx, /--intent '[0-9a-f]{32}'/u, "而且要带票");
+
+  // 那张票必须是**取消**的票 —— 拿它去创建要被拒。
+  const id = /--intent '([0-9a-f]{32})'/u.exec(ctx)[1];
+  assert.equal(consumeIntent({ id, action: "rotate", threadId: THREAD_A,
+    params: buildIntentParams("rotate", { op: "create" }), home }).reason,
+    "intent_params_mismatch", "**取消的票不许拿去创建**");
+});
+
+test("跨群绑定的群名要进摘要 —— A 群的票不许绑到 B 群", () => {
+  // 评审实测：chat_name 不在摘要里，群名 A/B 的摘要完全相同。
+  // 群名是**发给人看的那个名字**，换了名字就是另一次操作。
+  const home = temp();
+  const T = THREAD_A;
+  const a = issueIntent({ action: "bind", threadId: T, turnId: "c1",
+    params: buildIntentParams("bind", { project: "/p", chat: "oc_a", chatName: "A 群" }), home });
+  assert.equal(consumeIntent({ id: a.id, action: "bind", threadId: T, turnId: "c1",
+    params: buildIntentParams("bind", { project: "/p", chat: "oc_a", chatName: "B 群" }), home })
+    .reason, "intent_params_mismatch", "**换了群名必须拒**");
+  const b = issueIntent({ action: "bind", threadId: T, turnId: "c2",
+    params: buildIntentParams("bind", { project: "/p", chat: "oc_a", chatName: "A 群" }), home });
+  assert.equal(consumeIntent({ id: b.id, action: "bind", threadId: T, turnId: "c2",
+    params: buildIntentParams("bind", { project: "/p", chat: "oc_a", chatName: "A 群" }), home })
+    .ok, true, "一致就放行");
+});
+
+test("凭证绑的是这一次操作，不是这一类操作", () => {
+  // 评审的三个反例：mode 不分 dialogue/mapping、rotate 不分创建/取消、
+  // bind 不绑 project。**只绑命令族等于"授权了这一类"，那不是授权。**
+  const home = temp();
+  const T = THREAD_A;
+
+  // 每次换 turn —— 签发按 (thread, turn, 意图) 幂等，同 turn 会拿到同一张。
+  const dialogue = issueIntent({ action: "mode", threadId: T, turnId: "p1",
+    params: buildIntentParams("mode", { mode: "dialogue" }), home });
+  assert.equal(consumeIntent({ id: dialogue.id, action: "mode", threadId: T,
+    params: buildIntentParams("mode", { mode: "mapping" }), home }).reason, "intent_params_mismatch",
+    "**一张 dialogue 票不该能切 mapping**");
+
+  const bindA = issueIntent({ action: "bind", threadId: T, turnId: "p2",
+    params: buildIntentParams("bind", { project: "/a" }), home });
+  assert.equal(consumeIntent({ id: bindA.id, action: "bind", threadId: T,
+    params: buildIntentParams("bind", { project: "/b" }), home }).reason, "intent_params_mismatch",
+    "**一张 /a 的绑定票不该能绑 /b**");
+
+  // 参数对上就放行。
+  const ok = issueIntent({ action: "bind", threadId: T, turnId: "p3",
+    params: buildIntentParams("bind", { project: "/a" }), home });
+  assert.equal(consumeIntent({ id: ok.id, action: "bind", threadId: T,
+    params: buildIntentParams("bind", { project: "/a" }), home }).ok, true);
+});
+
+test("同一次输入只签一张票；消费之后不许重签", () => {
+  // **这条整条重写过。**上一版有两处错：
+  //   · 动作写 bind、参数却用 rotate:auto 的构造器 —— 摘要跟真实路径无关；
+  //   · 断言"消费后重签是新的一张"，而新契约是**拒绝重签** ——
+  //     更糟的是它靠 notEqual(undefined, 旧 id) 假通过：
+  //     c 是 { ok: false }，c.id 就是 undefined，那条断言恒真。
+  //     **我把 bug 写进了断言，还让它一直绿着。**
+  const home = temp();
+  const T = THREAD_A;
+  const same = () => issueIntent({ action: "bind", threadId: T, turnId: "turn-1",
+    params: buildIntentParams("bind", { project: "/p" }), home });
+
+  const a = same();
+  const b = same();
+  assert.equal(a.id, b.id, "**同一次输入必须拿到同一张票**");
+  assert.equal(b.reused, true, "第二次是复用，不是新签");
+
+  assert.equal(consumeIntent({ id: a.id, action: "bind", threadId: T, turnId: "turn-1",
+    params: buildIntentParams("bind", { project: "/p" }), home }).ok, true);
+
+  // **消费之后拒绝重签** —— 这一次输入已经授权过一次了。
+  const c = same();
+  assert.equal(c.ok, false, "**消费后不许再签**：" + JSON.stringify(c));
+  assert.equal(c.reason, "intent_already_used");
+
+  // 换了轮次就是另一次输入，可以签。
+  const other = issueIntent({ action: "bind", threadId: T, turnId: "turn-2",
+    params: buildIntentParams("bind", { project: "/p" }), home });
+  assert.equal(other.ok, true);
+  assert.notEqual(other.id, a.id);
+
+  // 换了意图也是。
+  const diff = issueIntent({ action: "bind", threadId: T, turnId: "turn-1",
+    params: buildIntentParams("bind", { project: "/other" }), home });
+  assert.equal(diff.ok, true, "不同意图不受那张墓碑影响");
+  assert.notEqual(diff.id, a.id);
+});
+
+test("只读的 $feishu-mode 不许签出可当写票用的凭证", () => {
+  // **评审实测到的最险的一条**：无参数的只读 $feishu-mode 会签出一张 mode 票，
+  // 而那张票能被核心当写票消费 —— **一次只读输入换来一次写授权。**
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const env = isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
+
+  const hook = (prompt) => {
+    const r = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "prompt-hook.mjs")],
+      { encoding: "utf-8", env, input: JSON.stringify({
+        prompt, cwd: root, session_id: THREAD_A, turn_id: "t1" }) });
+    return JSON.parse(r.stdout || "{}")?.hookSpecificOutput?.additionalContext ?? "";
+  };
+  const dir = intentDir(home);
+  const count = () => (fs.existsSync(dir) ? fs.readdirSync(dir) : [])
+    .filter((f) => f.endsWith(".json")).length;
+
+  const before = count();
+  const readOnly = hook("$feishu-mode");
+  assert.doesNotMatch(readOnly, /--intent/u, "只读那条不该带凭证");
+  assert.equal(count(), before,
+    "**只读的 $feishu-mode 不许签票** —— 签了就是一次只读输入换一次写授权");
+
+  // 带参数的才签，而且票绑着那个参数。
+  const write = hook("$feishu-mode dialogue");
+  assert.match(write, /--intent '[0-9a-f]{32}'/u, "带参数的要签：" + write);
+  assert.equal(count(), before + 1);
+});
+
+test("意图凭证：重放、串动作、串 thread、过期，四种都要拒", () => {
+  const home = temp();
+  const T = THREAD_A;
+
+  // ① 正常消费一次成功
+  const a = issueIntent({ action: "bind", threadId: T, turnId: "r0", home });
+  assert.equal(consumeIntent({ id: a.id, action: "bind", threadId: T, home }).ok, true);
+  // **② 同一张再用一次 —— 必须拒。**这是"一次输入只授权一次操作"的全部含义。
+  assert.equal(consumeIntent({ id: a.id, action: "bind", threadId: T, home }).reason,
+    "intent_already_used");
+
+  // ③ 串动作：拿 bind 的凭证去做 unbind
+  const b = issueIntent({ action: "bind", threadId: T, turnId: "r1", home });
+  assert.equal(consumeIntent({ id: b.id, action: "unbind", threadId: T, home }).reason,
+    "intent_action_mismatch");
+  // **对不上也不还回去** —— 一张被误用的凭证不该还能再试一次。
+  assert.equal(consumeIntent({ id: b.id, action: "bind", threadId: T, home }).reason,
+    "intent_already_used");
+
+  // ④ 串 thread
+  const c = issueIntent({ action: "bind", threadId: T, turnId: "r2", home });
+  assert.equal(consumeIntent({ id: c.id, action: "bind", threadId: THREAD_B, home }).reason,
+    "intent_thread_mismatch");
+
+  // ⑤ 过期
+  const d = issueIntent({ action: "bind", threadId: T, home });
+  assert.equal(consumeIntent({ id: d.id, action: "bind", threadId: T, home,
+    now: Date.now() + INTENT_TTL_MS + 1 }).reason, "intent_expired");
+
+  // ⑥ 没给 / 伪造 / 路径穿越
+  assert.equal(consumeIntent({ action: "bind", threadId: T, home }).reason, "intent_missing");
+  assert.equal(consumeIntent({ id: "deadbeef", action: "bind", threadId: T, home }).reason,
+    "intent_id_malformed");
+  assert.equal(consumeIntent({ id: "../../etc/passwd", action: "bind", threadId: T, home }).reason,
+    "intent_id_malformed", "**id 会被拼进路径，不能是任意字符串**");
+  assert.equal(consumeIntent({ id: "f".repeat(32), action: "bind", threadId: T, home }).reason,
+    "intent_not_found", "格式对但没签发过的，也拒");
+});
+
+test("意图凭证：钩子只给写动作签，只读的不签", () => {
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const env = isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
+
+  const hook = (prompt) => {
+    const r = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "prompt-hook.mjs")],
+      { encoding: "utf-8", env, input: JSON.stringify({
+        prompt, cwd: root, session_id: THREAD_A, turn_id: "t1" }) });
+    return JSON.parse(r.stdout || "{}")?.hookSpecificOutput?.additionalContext ?? "";
+  };
+
+  // 写动作：命令里必须带凭证。
+  const unbind = hook("$feishu-unbind");
+  // 命令里是 shell 引号包着的 —— 断言要按真实形状写，不是按我以为的形状。
+  assert.match(unbind, /--intent '[0-9a-f]{32}'/u, "写动作要带凭证：" + unbind);
+
+  // **只读动作不签** —— 多发一张就多一个能被误用的东西。
+  //
+  // 只断言"命令里没有 --intent"是**不够的**：把 status 加进 WRITE_ACTIONS 之后
+  // 命令里照样不会出现 --intent（status 的 compose 根本不接 intentId），
+  // 可凭证已经被签出来躺在磁盘上了。变异实测：那样改，整套仍然全绿。
+  // 所以要直接数**磁盘上多没多出凭证**。
+  const dir = intentDir(home);
+  const countIntents = () => (fs.existsSync(dir) ? fs.readdirSync(dir) : [])
+    .filter((f) => f.endsWith(".json")).length;
+
+  const beforeReadOnly = countIntents();
+  const status = hook("$feishu-status");
+  assert.doesNotMatch(status, /--intent/u, "只读不该有凭证：" + status);
+  const subscribe = hook("$feishu-subscribe");
+  assert.doesNotMatch(subscribe, /--intent/u);
+  assert.equal(countIntents(), beforeReadOnly,
+    "**只读动作不许签发凭证** —— 命令里看不见，不等于没签出来躺在磁盘上");
+
+  // **讨论、引用不许签发。**这就是那次事故的入口。
+  const before = countIntents();
+  assert.equal(hook("我们讨论一下 $feishu-unbind 这个命令"), "", "讨论不该注入任何东西");
+  assert.equal(hook("前面有字 $feishu-unbind"), "");
+  assert.equal(countIntents(), before, "**讨论不许签发凭证** —— 签了就等于给了一次授权");
 });
 
 test("钩子注入的命令必须跑 runtime/current —— 不许按模板的 bridge_root 拼", () => {

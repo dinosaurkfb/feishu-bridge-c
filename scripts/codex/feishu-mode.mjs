@@ -10,6 +10,7 @@ import {
   bridgeHome, findRegisteredTaskForCodexThread, interactionPolicyForTask,
   setTaskInteractionMode,
 } from "./state.mjs";
+import { buildIntentParams, requireIntent } from "./intent.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -64,6 +65,14 @@ function main() {
     console.log("[dry-run] 什么都没写。加 --apply 才切换。");
     process.exit(0);
   }
+  // **一次性意图凭证，在写之前消费。**
+  // 技能选择这一层不受钩子判据约束 —— agent 之间提一句命令就可能把它执行掉
+  // （出过真事故）。凭证把"技能被选中"和"这次操作被授权"分开。
+  // **参数要带上** —— 一张 dialogue 票不该能切 mapping。
+  const intent = requireIntent({
+    apply: true, action: "mode", threadId,
+    params: buildIntentParams("mode", { mode }), home });
+  if (!intent.ok) { console.error(intent.text); process.exit(1); }
   const changed = setTaskInteractionMode({ threadId, mode, home });
   if (!changed.ok) {
     console.error("模式没有切换（" + changed.reason + "）。");

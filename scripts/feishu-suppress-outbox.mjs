@@ -19,7 +19,11 @@
  *
  * 用法：
  *   node scripts/feishu-suppress-outbox.mjs --project /abs/dir
- *   node scripts/feishu-suppress-outbox.mjs --project /abs/dir --apply --reason "话题属于旧应用"
+ *   node scripts/feishu-suppress-outbox.mjs --project /abs/dir --apply \\
+ *     --expect-digest <预览打印的摘要> --reason "话题属于旧应用"
+ *
+ * **--apply 必须带 --expect-digest**：那个值只能来自预览输出。
+ * 在这里现算等于没有跨进程保护 —— 预览之后新进来的内容会被一起永久停掉。
  */
 
 import path from "node:path";
@@ -153,6 +157,19 @@ export function applySuppression({
   });
 }
 
+
+/**
+ * 打印用的单行文本。**outbox 正文是模型生成的**，而这个预览服务于一个
+ * 不可逆决定 —— 一段内容不该能清屏、移光标、伪造后面的行。
+ * 控制符换成可见占位符：**"这里原本有东西"本身是信息**。
+ */
+const sanitizeLine = (v, width = 72) => {
+  const flat = String(v ?? "")
+    .replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]|\p{Bidi_Control}/gu, "\uFFFD")
+    .replace(/\s+/gu, " ").trim();
+  return flat.length <= width ? (flat || "(空)") : flat.slice(0, width) + "…";
+};
+
 function main() {
   const parsed = parseArgs(process.argv.slice(2));
   if (!parsed.ok) {
@@ -201,6 +218,26 @@ function main() {
   // 缺省时由核心拒绝（generation_expectation_required），这里只负责解析和显示。
   const nowGeneration = activeGenerationOf(mapping);
   const expectGeneration = parsed.seen.get("expect-generation") ?? null;
+
+  // **让人看见他将要停掉的到底是哪几条。**
+  //
+  // 上一版预览只报"待发 N 条"—— 而摘要是在这一刻现算的。
+  // 于是存在这条路径：查看器展示了记录 A → A 被等量替换成 B →
+  // 抑制预览仍显示"1 条"、为 B 生成新摘要 → 人照抄摘要 →
+  // **B 被永久抑制，而他从没看过 B**。
+  // 摘要防住了"预览之后变化"，却证明不了"摘要对应人审阅过的内容"。
+  //
+  // 所以预览把每一条摊开，摘要从**同一份快照**产出：人看到什么，摘要就绑什么。
+  console.log("");
+  console.log("将要停掉的是这几条：");
+  for (const [i, r] of pending.entries()) {
+    const name = String(r?._file ?? "").split("/").pop();
+    const line = sanitizeLine(r?.text);
+    console.log("  " + String(i + 1).padStart(2) + ". " + name +
+      "  [" + sanitizeLine(r?.kind) + "]  " + (r?.created_at ?? "时间不明"));
+    console.log("      " + line);
+  }
+  console.log("");
   const needsExpect = dependsOnMapping(pending);
   // 预览要显示的摘要。**只在预览路径上算**，--apply 走命令行带回来的那份。
   const previewDigest = suppressionDigest({

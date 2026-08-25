@@ -1317,7 +1317,11 @@ test("入站 Stop 的答复只有经 watcher 提升资格后才能自动发布",
   const outboxDir = taskPaths(task, home).outbox;
   appendEvent({ outboxDir, kind: "reply", text: "严格终局答复", eventKey: "claim-reply" });
   assert.equal(publishEligibleTaskEvents({ task, home }).status, "empty");
-  assert.equal(markPublishEligibleByEventKey({ outboxDir, eventKey: "claim-reply" }).ok, true);
+  // **锁是必需参数** —— 不给就拒绝，别留"忘了传"的入口。
+  assert.equal(markPublishEligibleByEventKey({ outboxDir, eventKey: "claim-reply" }).reason,
+    "publish_lock_required", "不带锁不许改语义");
+  assert.equal(markPublishEligibleByEventKey({ outboxDir, eventKey: "claim-reply",
+    publishLockDir: taskPaths(task, home).publishLock }).ok, true);
   assert.equal(publishEligibleTaskEvents({ task, home }).status, "published");
   assert.equal(listPending({ outboxDir }).length, 0);
 });
@@ -1326,7 +1330,13 @@ test("严格终局失败的半成品答复保留证据但退出发布队列", ()
   const outboxDir = path.join(temp(), "outbox");
   const first = appendEvent({ outboxDir, kind: "reply", text: "半成品", eventKey: "failed-claim" });
   assert.equal(first.ok, true);
-  assert.equal(suppressPublishByEventKey({ outboxDir, eventKey: "failed-claim", reason: "nonzero_exit" }).ok, true);
+  // **同一个文件的第三个写方也不许绕过。**
+  assert.equal(suppressPublishByEventKey({
+    outboxDir, eventKey: "failed-claim", reason: "nonzero_exit" }).reason,
+    "publish_lock_required", "不带锁不许改语义");
+  assert.equal(suppressPublishByEventKey({ outboxDir, eventKey: "failed-claim",
+    reason: "nonzero_exit",
+    publishLockDir: path.join(outboxDir, "..", "publish.lock") }).ok, true);
   assert.equal(listPending({ outboxDir }).length, 0);
   const saved = JSON.parse(fs.readFileSync(first.file, "utf-8"));
   assert.equal(saved.text, "半成品");

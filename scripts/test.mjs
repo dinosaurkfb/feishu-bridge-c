@@ -32,7 +32,8 @@ import {
   routableProjectsForRoot,
 } from "./registry.mjs";
 import {
-  appendEvent, auditOutbox, composeDigest, listPending, markSent,
+  appendEvent, auditOutbox, composeDigest, listPending, markPublishEligibleByEventKey,
+  markSent, suppressPublishByEventKey,
 } from "./outbox.mjs";
 import {
   composeOutboundCard, outboundCardBatches, validateOutboundCard,
@@ -12013,6 +12014,127 @@ test("锁内那道守卫：锁前是好的、拿到锁之后才变坏，也必�
   assert.equal(got.reason, "outbox_unclassified");
   assert.deepEqual(got.files, ["0002.json"], "要点名");
   assert.equal(fs.readFileSync(good, "utf-8"), before, "好的那条一个字节都不许动");
+});
+
+
+test("同一条记录的所有写方共用一把锁 —— 快照到写回之间不许被改", () => {
+  // **摘要只保护到"预览 → 锁内快照"，保护不了"快照 → 写回"。**
+  // 评审用探针在"快照读完、写回之前"改掉同一条记录：
+  // 核心仍返回 ok，并发写入的新内容被旧快照覆盖，然后那条记录被永久抑制。
+  //
+  // 这也是为什么统一写锁必须在这一层，而不是留到第 5 层 ——
+  // **抑制事务的核心保证只有在所有写方共用同一把锁时才成立。**
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-l3-lock-"));
+  const ob = path.join(base, "outbox");
+  fs.mkdirSync(ob, { recursive: true });
+  const lock = path.join(base, "publish.lock");
+  assert.equal(appendEvent({ outboxDir: ob, kind: "reply", text: "内容", eventKey: "k1" }).ok, true);
+
+  // ① 抑制持锁期间，另外两个写方都必须拿不到锁。
+  const held = acquirePublishLock(lock);
+  assert.equal(held.ok, true);
+  const during = markPublishEligibleByEventKey({
+    outboxDir: ob, eventKey: "k1", publishLockDir: lock });
+  assert.equal(during.ok, false, "**持锁期间不许改同一条记录的语义**");
+  assert.equal(during.reason, "publisher_busy");
+  const during2 = suppressPublishByEventKey({
+    outboxDir: ob, eventKey: "k1", reason: "t", publishLockDir: lock });
+  assert.equal(during2.reason, "publisher_busy", "第三个写方同样要被挡住");
+  releasePublishLock(lock);
+
+  // ② 不带锁一律拒绝 —— 别留"忘了传"的入口。
+  assert.equal(markPublishEligibleByEventKey({ outboxDir: ob, eventKey: "k1" }).reason,
+    "publish_lock_required");
+  assert.equal(suppressPublishByEventKey({ outboxDir: ob, eventKey: "k1", reason: "t" }).reason,
+    "publish_lock_required");
+
+  // ③ 放锁之后正常路径仍走得通 —— 有界重试不能把好情况也堵死。
+  assert.equal(markPublishEligibleByEventKey({
+    outboxDir: ob, eventKey: "k1", publishLockDir: lock }).ok, true);
+});
+
+test("抑制的语义差分契约：除允许清单外一律不变", () => {
+  // 抑制是**不可逆写入**，"除允许清单外一律不变"在这里比在登记表更值钱。
+  // 允许清单**必须由人写全** —— 差集本身只能告诉你变了，不能判断变得对不对。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-l3-contract-"));
+  const dir = path.join(base, "outbox");
+  fs.mkdirSync(dir);
+  const file = path.join(dir, "0001.json");
+  fs.writeFileSync(file, JSON.stringify(outboxRecord({
+    text: "要停的", target_channel_generation_id: "gen-1",
+    publish_eligible_at: "2026-08-24T00:00:00.000Z",
+    未知字段: "要留住",
+  }), null, 2));
+  const before = JSON.parse(fs.readFileSync(file, "utf-8"));
+
+  const r = suppressAll(dir, { reason: "历史内容" });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const after = JSON.parse(fs.readFileSync(file, "utf-8"));
+
+  // 允许变化的三个字段 —— 逐条写出来。
+  const allowed = new Set(["publish_eligible_at", "publish_suppressed_at",
+    "publish_suppressed_reason"]);
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+  const stray = [...keys].filter((k) =>
+    !allowed.has(k) && JSON.stringify(before[k]) !== JSON.stringify(after[k]));
+  assert.deepEqual(stray, [], "**允许清单之外的字段变了**");
+
+  // 该变的确实变成了预期值。
+  assert.equal(after.publish_eligible_at, null, "资格要被清掉");
+  assert.ok(after.publish_suppressed_at, "要留下抑制时间");
+  assert.equal(after.publish_suppressed_reason, "历史内容", "理由要能回答为什么");
+  // 未知字段要留住 —— 抑制不是重写这条记录。
+  assert.equal(after.未知字段, "要留住", "**未知字段不许被顺手删掉**");
+  // 被抑制之后不再是待发。
+  assert.equal(listPending({ outboxDir: dir }).length, 0);
+
+  // 失败路径：文件字节完全不变。
+  fs.writeFileSync(path.join(dir, "0002.json"), "{ 坏的");
+  const bytes = fs.readdirSync(dir).map((f) => fs.readFileSync(path.join(dir, f), "utf-8"));
+  const refused = suppressAll(dir);
+  assert.equal(refused.ok, false, "有坏文件就拒绝");
+  assert.deepEqual(fs.readdirSync(dir).map((f) => fs.readFileSync(path.join(dir, f), "utf-8")),
+    bytes, "**ok:false ⇒ 文件字节完全不变**");
+});
+
+test("抑制预览要摊开将要停掉的内容 —— 摘要绑的是人看过的那份", () => {
+  // 评审的路径：查看器展示记录 A → A 被等量替换成 B →
+  // 抑制预览仍只显示"1 条"、为 B 生成新摘要 → 人照抄摘要 →
+  // **B 被永久抑制，而他从没看过 B**。
+  // 摘要防住了"预览之后变化"，却证明不了"摘要对应人审阅过的内容"。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-l3-preview-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", lark_cli_bin: "/nonexistent/lark-cli",
+  }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_fixture", claude_session_id: null,
+    channel_generation_id: "gen-1", expires_at: "2099-01-01T00:00:00.000Z",
+  }));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify(outboxRecord({
+    text: "这段正文人必须看见", target_channel_generation_id: "gen-1" })));
+
+  const r = spawnSync(process.execPath,
+    [path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir],
+    { encoding: "utf-8", env: { ...process.env, HOME: dir } });
+  const out = r.stdout ?? "";
+  assert.match(out, /将要停掉的是这几条/u, "预览要摊开内容：" + out.slice(0, 300));
+  assert.match(out, /这段正文人必须看见/u, "**人必须看见要停的是什么**");
+  assert.match(out, /0001\.json/u, "要点名文件");
+  assert.match(out, /--expect-digest sup-[0-9a-f]{24}/u, "同一份输出里给出摘要");
+
+  // 控制符不许漏 —— 这个预览服务于不可逆决定。
+  const ESC = String.fromCharCode(27);
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify(outboxRecord({
+    text: "正常" + ESC + "[2J伪造", target_channel_generation_id: "gen-1" })));
+  const r2 = spawnSync(process.execPath,
+    [path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir],
+    { encoding: "utf-8", env: { ...process.env, HOME: dir } });
+  assert.equal((r2.stdout ?? "").includes(ESC), false, "**预览里不许有 ESC**");
 });
 
 

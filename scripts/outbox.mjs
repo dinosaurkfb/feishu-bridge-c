@@ -15,6 +15,8 @@ import { normalizeLocalInput } from "./turn-input.mjs";
 import { isDirectRun, moduleRoot } from "./direct-run.mjs";
 import { generationTargetState, usableGeneration } from "./topic-generation.mjs";
 import { isCanonicalIso } from "./canonical-time.mjs";
+// registry 不反向依赖 outbox —— 没有环。
+import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 
 /**
  * `reply` 是一轮对话的**原文答复**，由 Stop 钩子从 last_assistant_message 直接取，
@@ -161,8 +163,50 @@ export function markSent(rec, messageId) {
  * 观察到目标 thread、turn.completed、exit 0 和非空最终输出后才调用这里。按 event key
  * 找而不是按文件名猜，重复调用幂等，已发布事件也不会被复活。
  */
-export function markPublishEligibleByEventKey({ outboxDir, eventKey }) {
+/**
+ * 取发布锁，**取不到就短暂重试**。
+ *
+ * 这些临界区都很短（读一个文件、写回去），争用几乎总是瞬时的。
+ * 一次拿不到就放弃，会把"稍等一下就好"变成"这条记录永远改不动"。
+ * 但重试是**有界**的：拿不到就得让调用方知道。
+ */
+function acquirePublishLockWithRetry(dir, { attempts = 6, waitMs = 120 } = {}) {
+  let last = null;
+  for (let i = 0; i < attempts; i += 1) {
+    last = acquirePublishLock(dir);
+    if (last.ok) return last;
+    if (i < attempts - 1) {
+      // 同步等一小会儿 —— 这些函数都是同步契约，不能改成 async。
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
+    }
+  }
+  return last;
+}
+
+export function markPublishEligibleByEventKey({ outboxDir, eventKey, publishLockDir }) {
   if (typeof eventKey !== "string" || !eventKey.trim()) return { ok: false, reason: "no_event_key" };
+  // **改同一条记录的语义，就得跟抑制拿同一把锁。**
+  //
+  // 抑制在锁内读一份字节快照、核对摘要、然后写回。如果这里不取锁，
+  // 就能在"快照读完、写回之前"改掉同一条记录 —— 抑制照样成功，
+  // **并发写入的新内容被旧快照覆盖，然后那条记录被永久抑制**。
+  // 摘要只保护到"预览 → 锁内快照"，保护不了"快照 → 写回"。
+  //
+  // 锁是必需参数：说不清跟谁串行就不许改，别留一个"忘了传"的入口。
+  if (typeof publishLockDir !== "string" || !publishLockDir) {
+    return { ok: false, reason: "publish_lock_required" };
+  }
+  const lock = acquirePublishLockWithRetry(publishLockDir);
+  if (!lock.ok) return { ok: false, reason: "publisher_busy", detail: lock.reason };
+  try {
+    return markEligibleLocked({ outboxDir, eventKey });
+  } finally {
+    releasePublishLock(publishLockDir);
+  }
+}
+
+/** 锁内那一段。**只在持有发布锁时调用。** */
+function markEligibleLocked({ outboxDir, eventKey }) {
   let files;
   try {
     files = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json"));
@@ -188,8 +232,30 @@ export function markPublishEligibleByEventKey({ outboxDir, eventKey }) {
 }
 
 /** 保留原始事件作审计，但把严格终局失败对应的半成品答复移出所有发布队列。 */
-export function suppressPublishByEventKey({ outboxDir, eventKey, reason }) {
+export function suppressPublishByEventKey({ outboxDir, eventKey, reason, publishLockDir }) {
   if (typeof eventKey !== "string" || !eventKey.trim()) return { ok: false, reason: "no_event_key" };
+  // **改同一条记录的语义，就得跟抑制拿同一把锁。**
+  //
+  // 抑制在锁内读一份字节快照、核对摘要、然后写回。如果这里不取锁，
+  // 就能在"快照读完、写回之前"改掉同一条记录 —— 抑制照样成功，
+  // **并发写入的新内容被旧快照覆盖，然后那条记录被永久抑制**。
+  // 摘要只保护到"预览 → 锁内快照"，保护不了"快照 → 写回"。
+  //
+  // 锁是必需参数：说不清跟谁串行就不许改，别留一个"忘了传"的入口。
+  if (typeof publishLockDir !== "string" || !publishLockDir) {
+    return { ok: false, reason: "publish_lock_required" };
+  }
+  const lock = acquirePublishLockWithRetry(publishLockDir);
+  if (!lock.ok) return { ok: false, reason: "publisher_busy", detail: lock.reason };
+  try {
+    return suppressByEventKeyLocked({ outboxDir, eventKey, reason });
+  } finally {
+    releasePublishLock(publishLockDir);
+  }
+}
+
+/** 锁内那一段。**只在持有发布锁时调用。** */
+function suppressByEventKeyLocked({ outboxDir, eventKey, reason }) {
   let files;
   try {
     files = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json"));

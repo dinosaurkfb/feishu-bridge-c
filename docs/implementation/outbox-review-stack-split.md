@@ -27,14 +27,21 @@
 |---|---|---|---|
 | 1 | `fix/journal-canonical-time` | 恢复清单时间校验改用 `isCanonicalIso` | 已合 #57 |
 | 2 | `feat/outbox-review-read-model` | 只读视图 + 共用读取语义硬化 | 已合 #58 |
-| 3 | `fix/outbox-suppression-transaction` | 抑制事务 | **未开始** |
+| 3 | `fix/outbox-suppression-transaction` | 抑制事务（**含统一写锁**） | 待审 |
 | 4 | `fix/codex-manual-drain-cas` | 手工发布计划与目标 CAS | **未开始** |
 | 5 | `fix/codex-auto-publish-lifecycle` | 自动发布生命周期 | **未开始** |
 | 6 | `fix/claude-outbox-fail-closed` | Claude 侧接线 | 已合 #59 |
 
 依赖：3、4、5 都建立在第 2 层给出的读模型上（`auditOutbox` / `outboxMutationBlocker` /
 `explainabilityGaps` / `hasPublishAuthorization` / `generationTargetState`）。
-**3 与 4、5 之间没有强依赖**，但 4 会用到 3 引入的摘要形状，建议按序做。
+4 会用到 3 引入的摘要形状，建议按序做。
+
+**范围调整（评审指出）**：原计划把"同一条记录的所有写方共用一把发布锁"放在第 5 层。
+但抑制事务的核心保证——"摘要核对过的那份字节就是写回去的那份"——**只有在所有写方
+共用同一把锁时才成立**：评审用探针在"快照读完、写回之前"改掉同一条记录，
+核心仍返回 ok，并发写入的新内容被旧快照覆盖然后被永久抑制。
+所以统一写锁**移进第 3 层**。第 5 层保留：资格制品与验真、watcher/恢复、
+发布路径的锁内快照。
 
 第 2 层已合入 `main`，所以 3、4、5 都**从 `main` 起分支**。
 
@@ -109,9 +116,8 @@ auditOutbox → outboxMutationBlocker → 查看器是否给命令
 
 ### 4.1 要做的
 
-- **三个写方共用同一把发布锁**：资格提升（`markPublishEligibleByEventKey`）、
-  严格终局抑制（`suppressPublishByEventKey`）、发布本身。
-  理由：曾经只给其中一个加锁，"同一个文件的第三个写方"漏了。
+- ~~三个写方共用同一把发布锁~~ —— **已移到第 3 层**（见上面的范围调整）。
+  这一层只需保证发布本身也在同一把锁内。
 - **锁的失败要有人接住**：给资格提升加锁之后 `publisher_busy` 成了真实路径，
   而 watcher 忽略返回值照样记 `completed` —— 那条答复**再没有任何路径获得资格**。
   **自己新加的失败模式，得自己接住。**

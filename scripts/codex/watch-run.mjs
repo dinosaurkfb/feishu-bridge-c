@@ -79,7 +79,29 @@ try {
         runId: key,
       });
       // Stop 只保存入站答复；四项终局证据齐全后，watcher 才允许它自动发布。
-      markPublishEligibleByEventKey({ outboxDir: paths.outbox, eventKey });
+      // **锁是必需的**：资格提升跟抑制改的是同一条记录的语义，
+      // 不共用一把锁就会出现"抑制读完快照、写回之前资格被改掉"的窗口。
+      const promoted = markPublishEligibleByEventKey({
+        outboxDir: paths.outbox, eventKey, publishLockDir: paths.publishLock });
+      // **自己新加的失败模式，得自己接住。**
+      // 加锁之后 publisher_busy 成了真实路径 —— 忽略它的话，
+      // 这一轮会被记成 completed，而那条答复再没有任何路径获得资格。
+      if (!promoted.ok) {
+        appendEvent({
+          outboxDir: paths.outbox, kind: "risk",
+          text: task.task_display_name + " 的这一轮答复已经跑完，但没能取得发布资格（" +
+            (promoted.reason ?? "说不清") + "）。**它不会自动发出去**，需要人看一眼。",
+          source: "codex-run-watcher",
+          eventKey: "codex:" + task.codex_thread_id + ":claim:" + key + ":promote-failed",
+        });
+        recordClaimState({
+          claimsDir: paths.claims, key, state: "eligibility_pending",
+          detail: { run_state: "completed", promote_failed: promoted.reason ?? "unknown",
+            event_key: eventKey },
+        });
+        process.exitCode = 1;
+        break;
+      }
       publishEligibleTaskEvents({ task, home });
       recordClaimState({
         claimsDir: paths.claims,
@@ -100,7 +122,20 @@ try {
     }
 
     // Stop 可能已经保存了一段未通过严格终局校验的答复；保留证据但永久移出发布队列。
-    suppressPublishByEventKey({ outboxDir: paths.outbox, eventKey, reason: outcome.reason });
+    const stopped = suppressPublishByEventKey({ outboxDir: paths.outbox, eventKey,
+      reason: outcome.reason, publishLockDir: paths.publishLock });
+    // **没停成就得说出来。**半成品答复留在队列里会被下一轮发出去。
+    // event_not_found 是"本来就没有要停的东西"（Stop 还没入队）—— 那是常态，不是故障。
+    if (!stopped.ok
+        && !["already_published", "event_not_found", "no_event_key"].includes(stopped.reason)) {
+      appendEvent({
+        outboxDir: paths.outbox, kind: "risk",
+        text: task.task_display_name + " 的失败答复没能移出发布队列（" +
+          (stopped.reason ?? "说不清") + "）——**它可能被发出去**，需要人看一眼。",
+        source: "codex-run-watcher",
+        eventKey: "codex:" + task.codex_thread_id + ":claim:" + key + ":suppress-failed-" + "a",
+      });
+    }
     const reasonText = failureLabel(outcome);
     appendEvent({
       outboxDir: paths.outbox,
@@ -136,7 +171,20 @@ try {
     // watcher 自己超时不等于 Codex runner 已退出。此时保留 session lock，让下一条入站通过
     // owner pid 探活继续 fail-closed；直接放锁会允许两个 resume 并发踩同一 thread。
     releaseLock = false;
-    suppressPublishByEventKey({ outboxDir: paths.outbox, eventKey, reason: "watch_timeout" });
+    const stoppedTimeout = suppressPublishByEventKey({ outboxDir: paths.outbox, eventKey,
+      reason: "watch_timeout", publishLockDir: paths.publishLock });
+    // **没停成就得说出来。**半成品答复留在队列里会被下一轮发出去。
+    // event_not_found 是"本来就没有要停的东西"（Stop 还没入队）—— 那是常态，不是故障。
+    if (!stoppedTimeout.ok
+        && !["already_published", "event_not_found", "no_event_key"].includes(stoppedTimeout.reason)) {
+      appendEvent({
+        outboxDir: paths.outbox, kind: "risk",
+        text: task.task_display_name + " 的失败答复没能移出发布队列（" +
+          (stoppedTimeout.reason ?? "说不清") + "）——**它可能被发出去**，需要人看一眼。",
+        source: "codex-run-watcher",
+        eventKey: "codex:" + task.codex_thread_id + ":claim:" + key + ":suppress-failed-" + "b",
+      });
+    }
     appendEvent({
       outboxDir: paths.outbox,
       kind: "risk",

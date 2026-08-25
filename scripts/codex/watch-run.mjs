@@ -2,10 +2,13 @@
 /** 一次性 watcher：确认 Codex run 终局、兜底入队、按发布合同处理并释放 task 锁。 */
 
 import { readClaim, recordClaimState } from "../claim.mjs";
-import { recoverEligibilityPending } from "../eligibility-recovery.mjs";
+import {
+  recoverEligibilityPending, settleEligibilityPending,
+} from "../eligibility-recovery.mjs";
 import { releaseSessionLock } from "../handoff.mjs";
 import {
-  appendEvent, markPublishEligibleByEventKey, MAX_REPLY_CHARS, suppressPublishByEventKey,
+  appendEvent, codexReplyEventKey, markPublishEligibleByEventKey, MAX_REPLY_CHARS,
+  suppressPublishByEventKey,
 } from "../outbox.mjs";
 import { readCodexRunOutcome } from "./handoff.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
@@ -37,7 +40,7 @@ const run = {
   errPath: paths.runs + "/" + key + ".stderr.log",
   lastMessagePath: paths.runs + "/" + key + ".last-message.txt",
 };
-const eventKey = "codex:" + task.codex_thread_id + ":claim:" + key + ":reply";
+const eventKey = codexReplyEventKey({ threadId: task.codex_thread_id, claimKey: key });
 const acceptedClaim = readClaim({ claimsDir: paths.claims, key });
 const targetGenerationId = acceptedClaim?.origin_channel_generation_id ?? null;
 // **上一轮卡住的资格，在这里补上。**
@@ -46,10 +49,16 @@ const targetGenerationId = acceptedClaim?.origin_channel_generation_id ?? null;
 // 没人消费的话那条答复再没有任何路径获得资格。
 // **必须在拿发布锁之前跑** —— 它内部要拿那把锁，锁内调会自己卡死自己。
 const recovered = recoverEligibilityPending({
-  claimsDir: paths.claims, outboxDir: paths.outbox, publishLockDir: paths.publishLock });
-for (const r of recovered.recovered) console.error("补回发布资格：" + r.key + "（" + r.reason + "）");
-for (const r of recovered.pending) console.error("资格仍卡住：" + r.key + "（" + r.reason + "）");
-for (const r of recovered.unusable) console.error("恢复标记看不懂，没动：" + r.key + " —— " + r.unusable);
+  claimsDir: paths.claims, outboxDir: paths.outbox,
+  publishLockDir: paths.publishLock, threadId: task.codex_thread_id });
+if (!recovered.ok) {
+  // 读不出 claims 目录跟"一条都没有"长得一样，含义却相反 —— 说出来。
+  console.error("claims 目录读不出来（" + recovered.reason + "），这一轮没法确认有没有卡住的资格。");
+} else {
+  for (const r of recovered.recovered) console.error("补回发布资格：" + r.key + "（" + r.reason + "）");
+  for (const r of recovered.pending) console.error("资格仍卡住：" + r.key + "（" + r.reason + "）");
+  for (const r of recovered.unusable) console.error("恢复标记看不懂，没动：" + r.key + " —— " + r.unusable);
+}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const started = Date.now();
@@ -95,21 +104,36 @@ try {
       // 不共用一把锁就会出现"抑制读完快照、写回之前资格被改掉"的窗口。
       const promoted = markPublishEligibleByEventKey({
         outboxDir: paths.outbox, eventKey, publishLockDir: paths.publishLock });
-      // **自己新加的失败模式，得自己接住。**
-      // 加锁之后 publisher_busy 成了真实路径 —— 忽略它的话，
-      // 这一轮会被记成 completed，而那条答复再没有任何路径获得资格。
+      // **自己新加的失败模式，得自己接住 —— 而且要接到有结论为止。**
+      //
+      // 加锁之后 publisher_busy 成了真实路径：这里只重试约 720ms，
+      // 竞争方却会持锁做真实网络发布，默认可达 12 秒。
+      // 光记一个 eligibility_pending 就退出是不够的 —— 那要等到**下一条入站消息**
+      // 触发下一个 watcher 才会被扫到，中间这条答复一直卡着。
+      let settled = promoted;
       if (!promoted.ok) {
-        appendEvent({
-          outboxDir: paths.outbox, kind: "risk",
-          text: task.task_display_name + " 的这一轮答复已经跑完，但没能取得发布资格（" +
-            (promoted.reason ?? "说不清") + "）。**它不会自动发出去**，需要人看一眼。",
-          source: "codex-run-watcher",
-          eventKey: "codex:" + task.codex_thread_id + ":claim:" + key + ":promote-failed",
-        });
+        // 先落标记：先写证据再重试，中途崩掉也还有人能接着管。
         recordClaimState({
           claimsDir: paths.claims, key, state: "eligibility_pending",
           detail: { run_state: "completed", promote_failed: promoted.reason ?? "unknown",
             event_key: eventKey },
+        });
+        // 自己扫到有结论为止。只对 publisher_busy 重试 —— 别的失败多等也不会变好。
+        const settle = settleEligibilityPending({
+          claimsDir: paths.claims, outboxDir: paths.outbox,
+          publishLockDir: paths.publishLock, threadId: task.codex_thread_id,
+        });
+        const mine = settle.recovered.find((r) => r.key === key);
+        if (mine) settled = { ok: true, reason: mine.reason };
+      }
+      if (!settled.ok) {
+        const why = settled.reason ?? "说不清";
+        appendEvent({
+          outboxDir: paths.outbox, kind: "risk",
+          text: task.task_display_name + " 的这一轮答复已经跑完，但没能取得发布资格（" +
+            why + "）。**它不会自动发出去**，需要人看一眼。",
+          source: "codex-run-watcher",
+          eventKey: "codex:" + task.codex_thread_id + ":claim:" + key + ":promote-failed",
         });
         process.exitCode = 1;
         break;

@@ -26,7 +26,7 @@ import {
 } from "./envelope.mjs";
 import { acquireClaim, claimKey, recordClaimState } from "./claim.mjs";
 import {
-  listEligibilityPending, recoverEligibilityPending,
+  listEligibilityPending, recoverEligibilityPending, settleEligibilityPending,
 } from "./eligibility-recovery.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
@@ -35,8 +35,8 @@ import {
   routableProjectsForRoot,
 } from "./registry.mjs";
 import {
-  appendEvent, auditOutbox, composeDigest, listPending, markPublishEligibleByEventKey,
-  markSent, suppressPublishByEventKey,
+  appendEvent, auditOutbox, codexReplyEventKey, composeDigest, listPending,
+  markPublishEligibleByEventKey, markSent, suppressPublishByEventKey,
 } from "./outbox.mjs";
 import {
   composeOutboundCard, outboundCardBatches, validateOutboundCard,
@@ -273,6 +273,36 @@ Object.assign(process.env, isolatedEnv({ env: process.env, registryDir }));
  * **夹具比真实数据宽松，等于替被测代码放行了一类现实中不存在的输入。**
  */
 let recSeq = 0;
+/**
+ * eligibility_pending 恢复链的夹具。
+ *
+ * 默认**占着发布锁** —— 这条链上的每一个缺陷都只在"锁被别人拿着"时才出现，
+ * 夹具默认不占锁的话，一整批测试会在一条根本走不到的路径上全绿。
+ */
+function eligFixture({ holdLock = true } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-elig-"));
+  const outboxDir = path.join(dir, "outbox");
+  const claimsDir = path.join(dir, "claims");
+  const lockDir = path.join(dir, "publish.lock");
+  fs.mkdirSync(outboxDir); fs.mkdirSync(claimsDir);
+  const threadId = "th-1";
+  const key = "k1";
+  const ek = codexReplyEventKey({ threadId, claimKey: key });
+  fs.writeFileSync(path.join(outboxDir, "0001.json"),
+    // 夹具要像真的：appendEvent 写出来的记录一定带 publish_eligible_at（null）。
+    JSON.stringify(outboxRecord({
+      text: "答复", event_key: ek, run_id: key, publish_eligible_at: null })));
+  if (holdLock) assert.equal(acquirePublishLock(lockDir).ok, true, "夹具要先占住锁");
+  const markerFile = path.join(claimsDir, key + ".eligibility_pending.json");
+  return {
+    dir, outboxDir, claimsDir, lockDir, threadId, key, ek, markerFile,
+    args: () => ({ claimsDir, outboxDir, publishLockDir: lockDir, threadId }),
+    read: () => JSON.parse(fs.readFileSync(path.join(outboxDir, "0001.json"), "utf-8")),
+    marker: () => recordClaimState({ claimsDir, key, state: "eligibility_pending",
+      detail: { run_state: "completed", promote_failed: "publisher_busy", event_key: ek } }),
+  };
+}
+
 function outboxRecord(extra = {}) {
   recSeq += 1;
   return {
@@ -11956,6 +11986,86 @@ test("抑制事务：说不清的 outbox 整批不动，且预览与执行结论
 });
 
 
+test("能解析但归不了类的记录，同样整批不动 —— 逐个分支都要挡住", () => {
+  // 上一条用的是**半截 JSON**，那条路径在 parse 的 catch 里就拦下了，
+  // **根本走不到三态判据**。于是"判据被换成宽松的"这种改动照样全绿 ——
+  // 实测过：把快照那侧换成一份宽松判据，整套 606 条一条都不红。
+  //
+  // 所以这里逐个分支造"能解析、但说不清"的记录。
+  const cases = [
+    ["published_at 放 false", { published_at: false }, /published_at 既不是 null 也不是规范时间/u],
+    ["published_at 放 0", { published_at: 0 }, /published_at 既不是 null 也不是规范时间/u],
+    ["published_at 放空串", { published_at: "" }, /published_at 既不是 null 也不是规范时间/u],
+    ["published_at 不是规范时间", { published_at: "2026-08-25 00:00:00" },
+      /published_at 既不是 null 也不是规范时间/u],
+    ["缺 published_at", "缺字段", /缺 published_at/u],
+    ["publish_suppressed_at 不是时间", { publish_suppressed_at: "abc" },
+      /publish_suppressed_at 不是规范时间/u],
+    ["既已发布又已停发", { published_at: "2026-08-25T00:00:00.000Z",
+      publish_suppressed_at: "2026-08-25T00:00:00.000Z" }, /自相矛盾/u],
+    ["不是记录对象", "数组", /不是记录对象/u],
+  ];
+  for (const [why, patch, pattern] of cases) {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-l3-sem-"));
+    const dir = path.join(base, "outbox");
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, "0001.json"), JSON.stringify(outboxRecord({
+      text: "合法的一条", target_channel_generation_id: "gen-1" })));
+    const bad = outboxRecord({ text: "坏的", target_channel_generation_id: "gen-1" });
+    if (patch === "缺字段") delete bad.published_at;
+    const body = patch === "数组" ? [1, 2] : (patch === "缺字段" ? bad : { ...bad, ...patch });
+    fs.writeFileSync(path.join(dir, "0002.json"), JSON.stringify(body));
+
+    // 前提：它确实能被解析 —— 否则测的就还是 parse 的 catch。
+    JSON.parse(fs.readFileSync(path.join(dir, "0002.json"), "utf-8"));
+    // 前提：它对 listPending 不可见，所以只比待发集合看不见它。
+    assert.equal(listPending({ outboxDir: dir }).length, 1, why + "：前提不成立");
+
+    const before = fs.readdirSync(dir).map((f) => fs.readFileSync(path.join(dir, f), "utf-8"));
+    const got = suppressAll(dir);
+    assert.equal(got.ok, false, why + "：**说不清就得整批不动**");
+    assert.equal(got.reason, "outbox_unclassified", why + "：理由不对 —— " + got.reason);
+    assert.deepEqual(got.files, ["0002.json"], why + "：要点名");
+    const detail = (got.details ?? []).find((d) => d.file === "0002.json");
+    assert.ok(detail, why + "：要说清为什么");
+    assert.match(detail.why, pattern, why + "：理由说得不对 —— " + detail.why);
+    assert.deepEqual(fs.readdirSync(dir).map((f) => fs.readFileSync(path.join(dir, f), "utf-8")),
+      before, why + "：一个字节都不许改");
+  }
+});
+
+test("语义损坏在真实 CLI 预览里也要挡住 —— 不是只有核心那层认", () => {
+  // 预览是人做不可逆决定的那一步。**它跟核心必须给出同一个结论**，
+  // 否则人看完"待发 1 条"去 --apply 才撞上拒绝。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-l3-semcli-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", lark_cli_bin: "/nonexistent/lark-cli",
+  }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_fixture", claude_session_id: null,
+    channel_generation_id: "gen-1", expires_at: "2099-01-01T00:00:00.000Z",
+  }));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify(outboxRecord({
+    text: "合法的一条", target_channel_generation_id: "gen-1" })));
+  fs.writeFileSync(path.join(obDir, "0002.json"), JSON.stringify({
+    ...outboxRecord({ text: "坏的", target_channel_generation_id: "gen-1" }),
+    published_at: false }));
+
+  const r = spawnSync(process.execPath,
+    [path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir],
+    { encoding: "utf-8", env: { ...process.env, HOME: dir } });
+  assert.notEqual(r.status, 0, "预览就该失败");
+  assert.match(r.stderr ?? "", /0002\.json/u, "要点名是哪个文件");
+  assert.match(r.stderr ?? "", /published_at 既不是 null 也不是规范时间/u, "要说清为什么");
+  assert.equal((r.stdout ?? "").includes("--expect-digest"), false,
+    "**不许打印落盘命令** —— 提示指向的操作必须真能做");
+});
+
 test("守卫在拿锁之前也跑一次 —— 明显不该动时连锁都不去争", () => {
   // 同一个守卫在两个时点各跑一次，单独拆掉任一个另一个都会接住 ——
   // 所以要分别钉住。这一条钉**锁前那次**：
@@ -12207,108 +12317,206 @@ test("预览只许读一次盘：两次读之间被同名替换，摘要必须�
   assert.notEqual(digestOf(bytesA), digestOf(bytesB), "A、B 的摘要本来就该不同");
 });
 
-test("eligibility_pending 要有消费者：卡住的资格下一轮必须补回来", () => {
+test("eligibility_pending 要有消费者：卡住的资格必须补回来", () => {
   // 给资格提升加发布锁之后 publisher_busy 成了真实路径：提升只重试约 720ms，
   // 而竞争方持锁做真实网络发布，默认可达 12 秒。watcher 记下 eligibility_pending
   // 就退出了 —— **没人消费的话，那条答复再没有任何路径获得资格**。
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-elig-"));
-  const outboxDir = path.join(dir, "outbox");
-  const claimsDir = path.join(dir, "claims");
-  const lockDir = path.join(dir, "publish.lock");
-  fs.mkdirSync(outboxDir); fs.mkdirSync(claimsDir);
-  const ek = "codex:th:claim:k1:reply";
-  fs.writeFileSync(path.join(outboxDir, "0001.json"),
-    JSON.stringify(outboxRecord({ text: "答复", event_key: ek })));
-
-  // 先复现"卡住"本身：锁被别人持着，提升就是拿不到。
-  assert.equal(acquirePublishLock(lockDir).ok, true);
-  const blocked = markPublishEligibleByEventKey({ outboxDir, eventKey: ek, publishLockDir: lockDir });
+  const g = eligFixture();
+  const blocked = markPublishEligibleByEventKey({
+    outboxDir: g.outboxDir, eventKey: g.ek, publishLockDir: g.lockDir });
   assert.equal(blocked.ok, false, "锁被占着就该提不上去");
   assert.equal(blocked.reason, "publisher_busy");
-  const marker = recordClaimState({ claimsDir, key: "k1", state: "eligibility_pending",
-    detail: { run_state: "completed", promote_failed: blocked.reason, event_key: ek } });
+  const marker = g.marker();
 
   // 锁还占着的时候恢复器也提不上去 —— 但**绝不能把标记删掉**。
-  const stillHeld = recoverEligibilityPending({ claimsDir, outboxDir, publishLockDir: lockDir });
+  const stillHeld = recoverEligibilityPending(g.args());
   assert.deepEqual(stillHeld.recovered, []);
   assert.equal(stillHeld.pending[0].reason, "publisher_busy");
   assert.equal(fs.existsSync(marker), true, "**没恢复成就不许撤标记**，撤了就再没人管了");
-  assert.equal(JSON.parse(fs.readFileSync(path.join(outboxDir, "0001.json"), "utf-8"))
-    .publish_eligible_at, undefined, "没拿到锁就不许写");
+  assert.equal(g.read().publish_eligible_at, null, "没拿到锁就不许写");
 
-  // 锁放开之后，下一轮必须真的把资格补上，并撤掉标记。
-  releasePublishLock(lockDir);
-  const done = recoverEligibilityPending({ claimsDir, outboxDir, publishLockDir: lockDir });
+  // 锁放开之后必须真的把资格补上，并撤掉标记。
+  releasePublishLock(g.lockDir);
+  const done = recoverEligibilityPending(g.args());
   assert.equal(done.recovered.length, 1, "锁放开了就该补回来");
-  assert.equal(done.recovered[0].eventKey, ek);
-  const rec = JSON.parse(fs.readFileSync(path.join(outboxDir, "0001.json"), "utf-8"));
-  assert.equal(typeof rec.publish_eligible_at, "string");
-  assert.match(rec.publish_eligible_at, /^\d{4}-\d{2}-\d{2}T/u, "写的得是规范时间");
+  assert.equal(done.recovered[0].eventKey, g.ek);
+  assert.match(g.read().publish_eligible_at, /^\d{4}-\d{2}-\d{2}T/u, "写的得是规范时间");
   assert.equal(fs.existsSync(marker), false, "有结论了就撤标记，别让下一轮反复重试");
 });
 
-test("恢复器：看不懂的标记一律不动，也不许拿它去提升别人的资格", () => {
-  // 一张错配的标记如果能提升资格，就等于给另一条事件发了发布授权。
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-elig-bad-"));
-  const outboxDir = path.join(dir, "outbox");
-  const claimsDir = path.join(dir, "claims");
-  const lockDir = path.join(dir, "publish.lock");
-  fs.mkdirSync(outboxDir); fs.mkdirSync(claimsDir);
-  const ek = "codex:th:claim:victim:reply";
-  const recFile = path.join(outboxDir, "0001.json");
-  fs.writeFileSync(recFile, JSON.stringify(outboxRecord({ text: "别人的答复", event_key: ek })));
+test("卡住的资格要在本轮就扫到有结论，不能等下一条入站消息", () => {
+  // 只在 watcher 启动时扫一遍是不够的：**那要等到下一条入站消息**才会发生。
+  // 若之后没人再说话，这条答复就永久卡住。所以写下标记的那一轮自己得扫到有结论。
+  const g = eligFixture();
+  g.marker();
+  // 竞争方持锁做真实网络发布 —— 用注入的 wait 扮演"等着等着对方放锁了"。
+  let waited = 0;
+  const settle = settleEligibilityPending({
+    ...g.args(), waitMs: 1, wait: () => { waited += 1; if (waited === 3) releasePublishLock(g.lockDir); },
+  });
+  assert.equal(waited >= 3, true, "锁没放开之前要一直重试，实际等了 " + waited + " 次");
+  assert.equal(settle.recovered.length, 1, "对方放锁之后必须在同一轮里补上");
+  assert.match(g.read().publish_eligible_at, /^\d{4}-\d{2}-\d{2}T/u);
 
+  // 预算用完就得停，并且**照实说仍然卡着** —— 不许拖成沉默。
+  const h = eligFixture();
+  h.marker();
+  const out = settleEligibilityPending({ ...h.args(), budgetMs: 0, waitMs: 1, wait: () => {} });
+  assert.deepEqual(out.recovered, []);
+  assert.equal(out.pending[0].reason, "publisher_busy");
+  assert.equal(fs.existsSync(h.markerFile), true, "预算用完也不许撤标记");
+  releasePublishLock(h.lockDir);
+});
+
+test("只对 publisher_busy 重试：别的失败不许拖成沉默", () => {
+  // 记录不见了、身份对不上、记录损坏 —— 这些多等一会儿不会变好。
+  const g = eligFixture({ holdLock: false });
+  fs.rmSync(path.join(g.outboxDir, "0001.json"));
+  g.marker();
+  let waited = 0;
+  const out = settleEligibilityPending({ ...g.args(), waitMs: 1, wait: () => { waited += 1; } });
+  assert.equal(waited, 0, "event_not_found 不该重试，实际等了 " + waited + " 次");
+  assert.equal(out.pending[0].reason, "event_not_found");
+  assert.equal(fs.existsSync(g.markerFile), true, "说不清就留着标记");
+});
+
+test("恢复标记是发布授权制品：event_key 自己算，不信它自报", () => {
+  // 评审构造的：标记 claim_key 与文件名自洽，但 event_key 指向别人的答复 ——
+  // **这张标记于是替另一条 claim 拿到了发布资格**。
+  const g = eligFixture({ holdLock: false });
+  const victimEk = codexReplyEventKey({ threadId: g.threadId, claimKey: "victim" });
+  fs.writeFileSync(path.join(g.outboxDir, "0002.json"), JSON.stringify(outboxRecord({
+    text: "别人的答复", event_key: victimEk, run_id: "victim", publish_eligible_at: null })));
+  // 攻击者的标记：文件名 = claim_key = attacker，但自报 event_key 指向 victim。
+  fs.writeFileSync(path.join(g.claimsDir, "attacker.eligibility_pending.json"), JSON.stringify({
+    schema_version: "1.0", claim_key: "attacker", state: "eligibility_pending",
+    recorded_at: "2026-08-25T00:00:00.000Z", run_state: "completed", event_key: victimEk,
+  }));
+
+  const r = recoverEligibilityPending(g.args());
+  assert.deepEqual(r.recovered, [], "错配的标记一条都不许恢复");
+  assert.equal(r.unusable.length, 1);
+  assert.match(r.unusable[0].unusable, /event_key 跟按 thread 与 claim 算出来的对不上/u);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(g.outboxDir, "0002.json"), "utf-8"))
+    .publish_eligible_at, null, "**不许替另一条 claim 授予发布资格**");
+});
+
+test("恢复标记：命中的记录必须真的属于那个 claim（run_id 对得上）", () => {
+  // 就算 event_key 是自己算出来的，命中的那条记录也可能不属于这个 claim ——
+  // 资格是发布授权，身份对不上就得拦住。
+  const g = eligFixture({ holdLock: false });
+  const rec = g.read();
+  fs.writeFileSync(path.join(g.outboxDir, "0001.json"),
+    JSON.stringify({ ...rec, run_id: "别的-claim" }));
+  g.marker();
+  const r = recoverEligibilityPending(g.args());
+  assert.deepEqual(r.recovered, []);
+  assert.equal(r.pending[0].reason, "run_id_mismatch");
+  assert.equal(g.read().publish_eligible_at, null, "身份对不上就一个字都不许写");
+  assert.equal(fs.existsSync(g.markerFile), true, "也不许撤标记");
+});
+
+test("同一个事件键有两条记录：模棱两可就不许授予资格", () => {
+  const g = eligFixture({ holdLock: false });
+  fs.writeFileSync(path.join(g.outboxDir, "0002.json"), JSON.stringify(g.read()));
+  g.marker();
+  const r = recoverEligibilityPending(g.args());
+  assert.equal(r.pending[0].reason, "event_key_ambiguous");
+  for (const n of ["0001.json", "0002.json"]) {
+    assert.equal(JSON.parse(fs.readFileSync(path.join(g.outboxDir, n), "utf-8"))
+      .publish_eligible_at, null, n + " 不许拿到资格");
+  }
+});
+
+test("恢复器：看不懂的标记一律不动，也不许拿它去提升别人的资格", () => {
+  const g = eligFixture({ holdLock: false });
+  const good = {
+    schema_version: "1.0", state: "eligibility_pending",
+    recorded_at: "2026-08-25T00:00:00.000Z", run_state: "completed",
+  };
   const write = (name, doc) => {
-    const f = path.join(claimsDir, name);
+    const f = path.join(g.claimsDir, name);
     fs.writeFileSync(f, typeof doc === "string" ? doc : JSON.stringify(doc));
     return f;
   };
-  const good = { schema_version: "1.0", state: "eligibility_pending", event_key: ek };
-  // 逐个分支都要验到 —— "这段文字里提到了它"不算断言。
+  // 逐个分支都要造到 —— "这段文字里提到了它"不算断言。
   const bad = [
-    ["半截文件", write("a.eligibility_pending.json", "{ 坏了")],
-    ["不是对象", write("b.eligibility_pending.json", [1, 2])],
-    ["claim_key 跟文件名对不上", write("c.eligibility_pending.json", { ...good, claim_key: "别人" })],
-    ["state 不是这个", write("d.eligibility_pending.json", { ...good, claim_key: "d", state: "completed" })],
-    ["缺 event_key", write("e.eligibility_pending.json", { ...good, claim_key: "e", event_key: "" })],
+    ["半截文件", write("a.eligibility_pending.json", "{ 坏了"), /读不出来/u],
+    ["不是对象", write("b.eligibility_pending.json", [1, 2]), /不是记录对象/u],
+    ["claim_key 错配", write("c.eligibility_pending.json", { ...good, claim_key: "别人" }),
+      /claim_key 跟文件名对不上/u],
+    ["state 不是这个", write("d.eligibility_pending.json", { ...good, claim_key: "d", state: "completed" }),
+      /state 不是 eligibility_pending/u],
+    ["schema 不认识", write("e.eligibility_pending.json", { ...good, claim_key: "e", schema_version: "9" }),
+      /schema_version 不认识/u],
+    ["recorded_at 不是时间", write("f.eligibility_pending.json", { ...good, claim_key: "f", recorded_at: "刚才" }),
+      /recorded_at 不是规范时间/u],
+    ["这一轮没跑完", write("g.eligibility_pending.json", { ...good, claim_key: "g", run_state: "running" }),
+      /run_state 不是 completed/u],
   ];
-  const listed = listEligibilityPending({ claimsDir });
-  assert.equal(listed.length, bad.length, "结构不对的也要列出来，不许静默跳过");
-  assert.equal(listed.every((x) => typeof x.unusable === "string"), true,
-    "每一条都得说清为什么看不懂：" + JSON.stringify(listed));
+  const listed = listEligibilityPending({ claimsDir: g.claimsDir, threadId: g.threadId });
+  assert.equal(listed.ok, true);
+  assert.equal(listed.items.length, bad.length, "结构不对的也要列出来，不许静默跳过");
+  for (const [why, f, pattern] of bad) {
+    const got = listed.items.find((x) => x.file === f);
+    assert.ok(got, why + "：没被列出来");
+    assert.match(got.unusable, pattern, why + "：理由说得不对 —— " + got.unusable);
+  }
 
-  const r = recoverEligibilityPending({ claimsDir, outboxDir, publishLockDir: lockDir });
+  const r = recoverEligibilityPending(g.args());
   assert.deepEqual(r.recovered, []);
   assert.deepEqual(r.pending, []);
   assert.equal(r.unusable.length, bad.length);
   for (const [why, f] of bad) assert.equal(fs.existsSync(f), true, why + "：看不懂就不许删");
-  assert.equal(JSON.parse(fs.readFileSync(recFile, "utf-8")).publish_eligible_at, undefined,
+  assert.equal(g.read().publish_eligible_at, null,
     "**一张看不懂的标记不许给任何记录发资格**");
-  assert.equal(fs.existsSync(lockDir), false, "一把锁都不该拿");
+  assert.equal(fs.existsSync(g.lockDir), false, "一把锁都不该拿");
+});
+
+test("claims 目录读不出来是故障，不是「一条都没有」", () => {
+  // 这两件事在输出上长得一模一样，含义却相反：后者意味着可能有一批答复正卡着没人管。
+  const g = eligFixture({ holdLock: false });
+  fs.rmSync(g.claimsDir, { recursive: true });
+  fs.writeFileSync(g.claimsDir, "这不是目录");
+  const listed = listEligibilityPending({ claimsDir: g.claimsDir, threadId: g.threadId });
+  assert.equal(listed.ok, false);
+  assert.equal(listed.reason, "claims_unreadable");
+  const r = recoverEligibilityPending(g.args());
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "claims_unreadable");
 });
 
 test("停发是终局：恢复器不许把人已经永久停掉的记录重新提上资格", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-elig-sup-"));
-  const outboxDir = path.join(dir, "outbox");
-  const claimsDir = path.join(dir, "claims");
-  const lockDir = path.join(dir, "publish.lock");
-  fs.mkdirSync(outboxDir); fs.mkdirSync(claimsDir);
-  const ek = "codex:th:claim:k9:reply";
-  const recFile = path.join(outboxDir, "0001.json");
-  fs.writeFileSync(recFile, JSON.stringify({
-    ...outboxRecord({ text: "人已经停掉的", event_key: ek }),
-    publish_suppressed_at: "2026-08-25T00:00:00.000Z",
-  }));
-  const marker = recordClaimState({ claimsDir, key: "k9", state: "eligibility_pending",
-    detail: { run_state: "completed", promote_failed: "publisher_busy", event_key: ek } });
-
-  const r = recoverEligibilityPending({ claimsDir, outboxDir, publishLockDir: lockDir });
+  const g = eligFixture({ holdLock: false });
+  fs.writeFileSync(path.join(g.outboxDir, "0001.json"), JSON.stringify({
+    ...g.read(), publish_suppressed_at: "2026-08-25T00:00:00.000Z" }));
+  g.marker();
+  const r = recoverEligibilityPending(g.args());
   assert.equal(r.recovered[0].reason, "already_suppressed", "结论是「已经有结论」，不是「提上去了」");
-  const rec = JSON.parse(fs.readFileSync(recFile, "utf-8"));
-  assert.equal(rec.publish_eligible_at, undefined,
+  const rec = g.read();
+  assert.equal(rec.publish_eligible_at, null,
     "**停掉的记录一个字都不许改** —— 靠下游筛选兜住不算，判据一变人停掉的东西就复活了");
   assert.equal(rec.publish_suppressed_at, "2026-08-25T00:00:00.000Z");
-  assert.equal(fs.existsSync(marker), false, "已经有结论了，标记该撤 —— 否则永远重试");
+  assert.equal(fs.existsSync(g.markerFile), false, "已经有结论了，标记该撤 —— 否则永远重试");
+});
+
+test("停发字段坏掉了不算「已经有结论」：不许撤标记", () => {
+  // 只看"字段非 null"的话，publish_suppressed_at 放 "abc" 也会被当成已停发，
+  // 于是恢复器撤掉标记 —— 一条损坏记录就这样再没人管。
+  for (const bad of ["abc", "", 0, false, {}, [], "2026-08-25 00:00:00", "2026-13-45T00:00:00.000Z"]) {
+    const g = eligFixture({ holdLock: false });
+    fs.writeFileSync(path.join(g.outboxDir, "0001.json"), JSON.stringify({
+      ...g.read(), publish_suppressed_at: bad }));
+    g.marker();
+    const r = recoverEligibilityPending(g.args());
+    const label = " —— publish_suppressed_at=" + JSON.stringify(bad);
+    // **字段在场就得是规范时间**，falsy 也不例外：""、0、false 都不是"没标停发"，
+    // 而是"标了、但标的不是时间"。判据松一点，损坏记录就又被藏起来。
+    assert.deepEqual(r.recovered, [], "损坏值不许当成已停发" + label);
+    assert.equal(r.pending[0].reason, "record_unclassified", "得说是损坏" + label);
+    assert.equal(g.read().publish_eligible_at, null, "损坏就不许写" + label);
+    assert.equal(fs.existsSync(g.markerFile), true, "损坏不算有结论，标记要留着" + label);
+  }
 });
 
 summarySealed = true;

@@ -183,7 +183,28 @@ function acquirePublishLockWithRetry(dir, { attempts = 6, waitMs = 120 } = {}) {
   return last;
 }
 
-export function markPublishEligibleByEventKey({ outboxDir, eventKey, publishLockDir }) {
+/**
+ * Codex 一轮答复的事件键 —— **只有这一份公式**。
+ *
+ * 恢复消费者不能信标记自报的 event_key：一张 claim_key 与文件名自洽、
+ * 但 event_key 指向别人答复的标记，就能替另一条 claim 授予发布资格。
+ * 所以它按 thread + 文件名里的 claim key 自己算一遍。
+ * 算的人多了公式就会分叉，因此 watcher、Stop 钩子、恢复器共用这个函数。
+ */
+export function codexReplyEventKey({ threadId, claimKey }) {
+  return "codex:" + threadId + ":claim:" + claimKey + ":reply";
+}
+
+/**
+ * 给一条事件授予自动发布资格。
+ *
+ * @param requireRunId 非空时，命中的那条记录必须 `run_id === requireRunId`。
+ *        恢复消费者必须传 —— 它处理的是"标记说该给谁资格"，
+ *        而标记是发布授权制品，得验真。
+ */
+export function markPublishEligibleByEventKey({
+  outboxDir, eventKey, publishLockDir, requireRunId = null,
+}) {
   if (typeof eventKey !== "string" || !eventKey.trim()) return { ok: false, reason: "no_event_key" };
   // **改同一条记录的语义，就得跟抑制拿同一把锁。**
   //
@@ -199,45 +220,67 @@ export function markPublishEligibleByEventKey({ outboxDir, eventKey, publishLock
   const lock = acquirePublishLockWithRetry(publishLockDir);
   if (!lock.ok) return { ok: false, reason: "publisher_busy", detail: lock.reason };
   try {
-    return markEligibleLocked({ outboxDir, eventKey });
+    return markEligibleLocked({ outboxDir, eventKey, requireRunId });
   } finally {
     releasePublishLock(publishLockDir);
   }
 }
 
 /** 锁内那一段。**只在持有发布锁时调用。** */
-function markEligibleLocked({ outboxDir, eventKey }) {
+function markEligibleLocked({ outboxDir, eventKey, requireRunId = null }) {
   let files;
   try {
-    files = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json"));
+    files = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json")).sort();
   } catch {
     return { ok: false, reason: "event_not_found" };
   }
+  // **先把命中全找出来，再判断。**找到第一条就返回的话，"同一个事件键有两条记录"
+  // 这种损坏永远看不见 —— 而资格是发布授权，模棱两可时必须拦住。
+  const hits = [];
   for (const name of files) {
     const file = path.join(outboxDir, name);
     let rec;
     try { rec = JSON.parse(fs.readFileSync(file, "utf-8")); } catch { continue; }
+    if (rec === null || typeof rec !== "object" || Array.isArray(rec)) continue;
     if (rec.event_key !== eventKey) continue;
-    if (rec.published_at !== null) return { ok: true, changed: false, reason: "already_published", record: rec };
-    // **停发是终局，资格提升不许再碰它。**
-    //
-    // 恢复消费者会重试提升 —— 如果这里不认停发，一条人已经永久停掉的记录
-    // 会被写上 publish_eligible_at。它不会因此被发出去（筛选认停发），
-    // 但那是**靠下游又一份判据兜住的**；判据一变，人停掉的东西就复活了。
-    // 结论是"已经有结论"，所以返回 ok —— 让恢复器撤掉标记，不要永远重试。
-    if (rec.publish_suppressed_at !== undefined && rec.publish_suppressed_at !== null) {
-      return { ok: true, changed: false, reason: "already_suppressed", record: rec };
-    }
-    if (typeof rec.publish_eligible_at === "string" && rec.publish_eligible_at) {
-      return { ok: true, changed: false, reason: "already_eligible", record: { ...rec, _file: file } };
-    }
-    const next = { ...rec, publish_eligible_at: new Date().toISOString() };
-    const tmp = file + ".tmp." + randomUUID();
-    fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
-    fs.renameSync(tmp, file);
-    return { ok: true, changed: true, record: { ...next, _file: file } };
+    hits.push({ file, rec });
   }
-  return { ok: false, reason: "event_not_found" };
+  if (hits.length === 0) return { ok: false, reason: "event_not_found" };
+  if (hits.length > 1) return { ok: false, reason: "event_key_ambiguous", count: hits.length };
+  const { file, rec } = hits[0];
+  // 标记自报的身份不算数：要求这条记录确实属于那个 claim。
+  if (requireRunId !== null && rec.run_id !== requireRunId) {
+    return { ok: false, reason: "run_id_mismatch" };
+  }
+
+  // **三态判据跟审计、抑制共用同一份。**
+  //
+  // 这里本来自己判"published_at 非 null 就是已发布"、"publish_suppressed_at 非空
+  // 就是已停发"——比共用判据松：published_at 放 false、publish_suppressed_at 放
+  // "abc"，都会被当成"已经有结论"，于是恢复器撤掉标记，那条答复再没人管。
+  // 损坏就该说损坏。
+  const verdict = classifyOutboxRecord(rec);
+  if (verdict.unclassified) {
+    return { ok: false, reason: "record_unclassified", why: verdict.why };
+  }
+  if (verdict.state === "published") {
+    return { ok: true, changed: false, reason: "already_published", record: rec };
+  }
+  // **停发是终局，资格提升不许再碰它。**
+  // 它不会因此被发出去（发布筛选认停发），但那是靠下游**另一份判据**兜住的；
+  // 判据一变，人永久停掉的东西就复活了。
+  // 返回 ok 是因为"已经有结论"——让恢复器撤掉标记，不要永远重试。
+  if (verdict.state === "suppressed") {
+    return { ok: true, changed: false, reason: "already_suppressed", record: rec };
+  }
+  if (typeof rec.publish_eligible_at === "string" && rec.publish_eligible_at) {
+    return { ok: true, changed: false, reason: "already_eligible", record: { ...rec, _file: file } };
+  }
+  const next = { ...rec, publish_eligible_at: new Date().toISOString() };
+  const tmp = file + ".tmp." + randomUUID();
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  return { ok: true, changed: true, record: { ...next, _file: file } };
 }
 
 /** 保留原始事件作审计，但把严格终局失败对应的半成品答复移出所有发布队列。 */

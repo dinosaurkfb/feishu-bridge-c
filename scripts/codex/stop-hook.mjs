@@ -7,7 +7,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { appendEvent, MAX_REPLY_CHARS } from "../outbox.mjs";
+import { appendEvent, codexReplyEventKey, MAX_REPLY_CHARS } from "../outbox.mjs";
 import { readClaim } from "../claim.mjs";
 import { extractReply } from "../stop-hook.mjs";
 import { clearTurnInput, readTurnInput } from "../turn-input.mjs";
@@ -68,7 +68,7 @@ async function main() {
     process.exit(0);
   }
   const eventKey = typeof claimKey === "string" && claimKey
-    ? "codex:" + threadId + ":claim:" + claimKey + ":reply"
+    ? codexReplyEventKey({ threadId, claimKey })
     : "codex:" + threadId + ":turn:" + (payload.turn_id ?? "unknown") + ":reply";
   const input = !claimKey && turnKey
     ? readTurnInput({ dir: paths.turnInputs, key: turnKey })

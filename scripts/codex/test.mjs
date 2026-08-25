@@ -6269,6 +6269,64 @@ test("唯一校验器要覆盖全部重复绑定字段 —— 读放行的和写
 });
 
 
+test("Codex 包装层同样只许读一次盘：两次读之间被同名替换，摘要仍绑人看过的那份", () => {
+  // 单快照的竞态回归原本只走 Claude 侧 CLI。**两侧接线会分叉** —— 这条线上
+  // 已经出现过一次"纯函数全绿、某一侧包装层是坏的"。所以这一侧也要有真实入口回归。
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "SupSnap",
+    rootMessageId: "om_root", token: "abc125" });
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  const paths = taskPaths(task, home);
+  fs.mkdirSync(paths.outbox, { recursive: true });
+
+  const target = path.join(paths.outbox, "0001.json");
+  const bytesA = Buffer.from(JSON.stringify(outboxRecord({ text: "版本A：人看到的就是这句" })));
+  const bytesB = Buffer.from(JSON.stringify(outboxRecord({ text: "版本B：偷换进来的" })));
+  fs.writeFileSync(target, bytesA);
+
+  // 第一次读到这个文件之后立刻把盘上换成 B。再读一次的实现就会看到 B。
+  const swap = path.join(home, "swap-after-first-read.mjs");
+  fs.writeFileSync(swap, [
+    'import fs from "node:fs";',
+    'const real = fs.readFileSync;',
+    'const target = process.env.SWAP_TARGET;',
+    'let swapped = false;',
+    'fs.readFileSync = function (p, ...rest) {',
+    '  const out = real.call(this, p, ...rest);',
+    '  if (!swapped && String(p) === target) {',
+    '    swapped = true;',
+    '    fs.writeFileSync(target, Buffer.from(process.env.SWAP_TO, "base64"));',
+    '  }',
+    '  return out;',
+    '};',
+  ].join("\n"));
+
+  const r = spawnSync(process.execPath, [
+    "--import", pathToFileURL(swap).href,
+    path.join(ROOT, "scripts", "codex", "suppress-outbox.mjs"),
+    "--thread-id", THREAD_A, "--all-generations",
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+    SWAP_TARGET: target, SWAP_TO: bytesB.toString("base64") } });
+  const out = r.stdout ?? "";
+
+  // 前提：探针真的换了盘上那份 —— 不然这条测试什么都没测。
+  assert.equal(fs.readFileSync(target).toString(), bytesB.toString(),
+    "探针没生效：文件没被换掉，后面的断言就不成立");
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(out, /版本A：人看到的就是这句/u, "渲染读的是第一次那份");
+
+  const printed = /--expect-digest (sup-[0-9a-f]{24})/u.exec(out);
+  assert.ok(printed, "预览要给出摘要：" + out.slice(0, 300));
+  const digestOf = (raw) => suppressionDigest({
+    files: ["0001.json"], records: [{ _file: target, _raw: raw }] });
+  assert.equal(printed[1], digestOf(bytesA),
+    "**摘要必须绑人看过的 A**；等于 B 的摘要就说明渲染和摘要读的不是同一份");
+  assert.notEqual(digestOf(bytesA), digestOf(bytesB), "A、B 的摘要本来就该不同");
+});
+
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (failed > 0) process.exit(1);

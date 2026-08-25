@@ -181,13 +181,31 @@ export function loadRegistry(file = registryFile()) {
   // **派生出来的存储键也必须唯一。**字符集收紧之后一般不会撞，
   // 但唯一性是这里要保证的性质，不能靠"字符集大概够用"来间接成立。
   const derived = new Map();
+  const ids = new Map();
   for (const [i, t] of tasks.entries()) {
-    const key = safeKey(t.logical_task_key);
+    // **按目标文件系统的等价关系判重，不是按字符串相等。**
+    // 本机默认大小写不敏感：Task-A 和 task-a 是两个不同的 key，
+    // 却指向**同一个 inode** —— outbox 和锁照样混在一起。评审实测复现。
+    const key = safeKey(t.logical_task_key).toLowerCase();
     if (derived.has(key)) {
       malformed.push({ index: i,
-        why: "存储键与 #" + derived.get(key) + " 相同（都是 " + key + "）" });
+        why: "存储键与 #" + derived.get(key) + " 在大小写折叠后相同（都是 " + key + "）" });
     } else {
       derived.set(key, i);
+    }
+    // **id 不许自带一个跟 key 不一致的值。**
+    // 读取端原样保留已有 id，于是两条不同 key、相同 id 的 task
+    // binding_id 会撞成同一个。id 要么缺（补成 key），要么必须等于 key。
+    const rawId = t.id;
+    if (rawId !== undefined && rawId !== t.logical_task_key) {
+      malformed.push({ index: i,
+        why: "id 与 logical_task_key 不一致（id=" + String(rawId).slice(0, 40) + "）" });
+      continue;
+    }
+    if (ids.has(t.logical_task_key)) {
+      malformed.push({ index: i, why: "id 与 #" + ids.get(t.logical_task_key) + " 相同" });
+    } else {
+      ids.set(t.logical_task_key, i);
     }
   }
   if (malformed.length > 0) {

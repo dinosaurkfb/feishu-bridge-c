@@ -44,6 +44,7 @@ import { listPending } from "../outbox.mjs";
 import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
 import { generationTargetState } from "../suppress-outbox-core.mjs";
 import { hasPublishAuthorization } from "../outbox.mjs";
+import { isCanonicalIso } from "../canonical-time.mjs";
 import { auditOutbox } from "./drain-service.mjs";
 import { outboxMutationBlocker } from "../outbox.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
@@ -84,7 +85,11 @@ const DAY = 24 * HOUR;
 
 /** 多久以前。**给相对时间** —— 人关心的是"这有多旧"。 */
 export function ageText(iso, now = Date.now()) {
-  const ms = Date.parse(iso ?? "");
+  // **先走规范判据。**审计会拒绝非规范 created_at，而这里如果还用
+  // Date.parse，同一份报告就会一边说"解释不了"、一边给出"32 小时前"
+  // 这种精确到看着可信的年龄。评审用 "Aug 25 2026" 实测复现。
+  if (!isCanonicalIso(iso)) return "时间不是规范格式，读不出来";
+  const ms = Date.parse(iso);
   if (!Number.isFinite(ms)) return "时间读不出来";
   const d = Math.max(0, now - ms);
   if (d < HOUR) return Math.round(d / MINUTE) + " 分钟前";
@@ -96,17 +101,32 @@ export function ageText(iso, now = Date.now()) {
  * 把要显示的文本**去掉控制序列**。
  *
  * outbox 的正文是模型生成的，而这个视图是人用来做**不可逆决定**的。
- * 评审实测：`\u001b[2J\u001b[H` 原样进了输出 —— 一段内容可以清屏、移光标、
+ * 评审第一轮实测：清屏序列原样进了输出 —— 一段内容可以清屏、移光标、
  * 伪造后面的提示行，让人看到的和实际存在的东西不一样。
  *
- * 覆盖 C0/C1 控制符和双向文本控制符；正文、名称、kind、外部错误文本都要过它。
+ * 第二轮又指出两个漏口，都比第一个更难想到：
+ *   · 换行、回车、TAB、U+2028/U+2029 没处理 —— 换行同样能伪造后续行；
+ *   · **坏文件名压根没经过净化**。而这个命令的用途恰恰是查看畸形文件，
+ *     所以文件名不能当成可信输入。
+ *
+ * 所以判据放宽到"所有 C0/C1 + 行分隔符 + 双向文本控制符"，
+ * 并且在**最终输出边界**统一过一遍（见 say/warn），
+ * 而不是逐个插值点去记得调用它 —— 那种写法漏一个就前功尽弃。
+ *
  * 换成可见占位符而不是删掉 —— **"这里原本有东西"本身是信息**。
  */
 export function sanitizeForDisplay(text) {
   return String(text ?? "").replace(
-    /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu,
+    /[\u0000-\u001F\u007F-\u009F\u2028\u2029\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu,
     "\uFFFD");
 }
+
+/**
+ * **输出边界。**这个文件里所有打印都走这两个 —— 直接 console.log 会漏掉净化。
+ * 换行由这里加，所以格式串里不需要也不允许内嵌 \n。
+ */
+const say = (line = "") => console.log(sanitizeForDisplay(line));
+const warn = (line = "") => console.error(sanitizeForDisplay(line));
 
 /** 正文压成一行，默认截断 —— 一屏能看完才叫"看得见"。 */
 export function oneLine(text, { full = false, width = 60 } = {}) {
@@ -142,15 +162,30 @@ export function describeRecordState(record, { resolveTarget = null } = {}) {
   // 上一版这里又写了一遍"非空字符串" —— 于是对
   // publish_eligible_at:"not-a-canonical-time"，审计说"解释不了"、
   // 查看器却说"记录本身已就绪"：**同一个 CLI 给出两个相反的结论。**
-  const hasEligibility = hasPublishAuthorization(record);
-  // 而且"畸形授权"和"尚未授权"要分开说 —— 前者需要人看，后者等等就好。
-  const malformedAuth = record?.publish_eligible_at !== undefined
-    && record?.publish_eligible_at !== null && !hasEligibility;
+  // **授权是三态，不是布尔。**
+  //
+  // 上一版把它压回布尔之后，目标失效那条分支又用 hasEligibility === false
+  // 输出"还没取得发布资格" —— **畸形授权在那里退化成了尚未授权**；
+  // 目标解析抛错时更是把授权损坏完全藏起来。评审实测复现。
+  // 三态跟目标状态**组合渲染**，不许在任何一条分支上再压成布尔。
+  //   granted   ：规范时间，真的取得了授权
+  //   malformed ：字段在但不是规范时间 —— 需要人看
+  //   pending   ：null / 缺失 —— 等等就好
+  const rawAuth = record?.publish_eligible_at;
+  const auth = hasPublishAuthorization(record) ? "granted"
+    : (rawAuth === undefined || rawAuth === null) ? "pending" : "malformed";
+  const hasEligibility = auth === "granted";
+  const malformedAuth = auth === "malformed";
+  // 授权那一维的说法，拼进每一条结论里 —— 不许因为目标那边有事就吞掉它。
+  const authNote = auth === "granted" ? ""
+    : auth === "malformed" ? "；**发布资格字段是坏的，需要人看一眼**"
+      : "；这条也还没取得发布资格";
 
   if (typeof resolveTarget !== "function") {
     if (malformedAuth) {
       return { code: "auth_malformed",
-        text: "发布资格字段是坏的（不是规范时间）—— 需要人看一眼" };
+        text: "发布资格字段是坏的（不是规范时间）—— 需要人看一眼；" +
+          "目标话题是否仍有效，这里判不出来" };
     }
     return hasEligibility
       ? { code: "unknown_target", text: "记录本身没问题；目标话题是否仍有效，这里判不出来" }
@@ -159,14 +194,17 @@ export function describeRecordState(record, { resolveTarget = null } = {}) {
   let target;
   try { target = resolveTarget(record?.target_channel_generation_id ?? null); }
   catch (err) {
-    return { code: "unknown_target",
-      text: "目标话题解析不出来（" + sanitizeForDisplay(String(err?.message ?? err)).slice(0, 60) + "）" };
+    // **抛错也不许把授权损坏藏起来。**
+    return { code: malformedAuth ? "auth_malformed" : "unknown_target",
+      text: "目标话题解析不出来（" + String(err?.message ?? err).slice(0, 60) + "）" + authNote };
   }
   if (!target?.ok) {
     // **目标没了就是没了**，有没有资格都改变不了这个事实 —— 先说这个。
+    // 但授权那一维要照说：上一版在这里把三态压回布尔，
+    // 于是"畸形授权 + 目标失效"被渲染成了"还没取得发布资格"。
     return { code: "target_gone",
       text: "目标话题代际已经不可用（" + (target?.reason ?? "说不清") + "）—— 永远发不出去" +
-        (hasEligibility ? "" : "；这条也还没取得发布资格") };
+        authNote };
   }
   if (malformedAuth) {
     return { code: "auth_malformed",
@@ -284,7 +322,7 @@ export function suppressCommandFor(entry) {
 function main() {
   const parsed = parseArgs(process.argv.slice(2));
   if (!parsed.ok) {
-    console.error("失败（" + parsed.reason + "）" + (parsed.detail ? "：" + parsed.detail : ""));
+    warn("失败（" + parsed.reason + "）" + (parsed.detail ? "：" + parsed.detail : ""));
     process.exit(1);
   }
   const full = parsed.seen.get("full") === true;
@@ -294,7 +332,7 @@ function main() {
     taskKey: parsed.seen.get("task-key") ?? null,
   });
   if (!got.ok) {
-    console.error(got.reason === "task_not_found"
+    warn(got.reason === "task_not_found"
       ? "没有这个 task —— **不是「没有积压」，是点名的那一条不存在。**"
       : got.reason === "registry_malformed"
         ? "登记表结构不对" + (got.detail ? "（" + got.detail + "）" : "") +
@@ -303,58 +341,58 @@ function main() {
     process.exit(1);
   }
   if (got.tasks.length === 0) {
-    console.log("没有积压 —— 所有 task 的 outbox 都读得通，且都是空的。");
+    say("没有积压 —— 所有 task 的 outbox 都读得通，且都是空的。");
     process.exit(0);
   }
 
   let trouble = false;
   const readable = got.tasks.filter((t) => t.readable && t.unclassified.length === 0);
   const total = readable.reduce((n, t) => n + t.records.length, 0);
-  console.log("积压 " + total + " 条" +
+  say("积压 " + total + " 条" +
     (readable.length === got.tasks.length ? "" : "（另有 task 读不全，见下）") + "。\n");
 
   for (const t of got.tasks) {
-    console.log("【" + t.name + "】" + (t.taskKey ? t.taskKey : ""));
-    console.log("  " + t.taskState.text);
+    say("【" + t.name + "】" + (t.taskKey ? t.taskKey : ""));
+    say("  " + t.taskState.text);
     if (!t.readable) {
       trouble = true;
-      console.log("  **outbox 读不出来（" + t.unreadableReason + "）—— 这里的条数不可信。**");
-      console.log("");
+      say("  **outbox 读不出来（" + t.unreadableReason + "）—— 这里的条数不可信。**");
+      say("");
       continue;
     }
     if (t.unclassified.length > 0) {
       trouble = true;
-      console.log("  **有 " + t.unclassified.length + " 个文件归不了类，整体不可信：**");
-      for (const u of t.unclassified) console.log("    " + u.file + " —— " + u.why);
+      say("  **有 " + t.unclassified.length + " 个文件归不了类，整体不可信：**");
+      for (const u of t.unclassified) say("    " + u.file + " —— " + u.why);
     }
     if ((t.unexplainable ?? []).length > 0) {
       trouble = true;
-      console.log("  **有 " + t.unexplainable.length + " 条记录解释不了，不能对它们动手：**");
-      for (const u of t.unexplainable) console.log("    " + u.file + " —— " + u.why);
+      say("  **有 " + t.unexplainable.length + " 条记录解释不了，不能对它们动手：**");
+      for (const u of t.unexplainable) say("    " + u.file + " —— " + u.why);
     }
-    console.log("  待发 " + t.records.length + " 条");
+    say("  待发 " + t.records.length + " 条");
     for (const [i, r] of t.records.entries()) {
-      console.log("  " + String(i + 1).padStart(2) + ". [" + r.kind + "] " +
+      say("  " + String(i + 1).padStart(2) + ". [" + r.kind + "] " +
         ageText(r.createdAt) + " · " + r.why);
-      console.log("      " + oneLine(r.text, { full }));
+      say("      " + oneLine(r.text, { full }));
     }
     const cmd = suppressCommandFor(t);
     if (cmd) {
-      console.log("  要停止重试这个 task 的这些内容（**不可逆**）：");
-      console.log("    " + cmd);
-      console.log("    先不加 --apply 看预览；预览会打出落盘该带的 --expect-digest");
-      console.log("    （必要时还有 --expect-generation），照抄上去再加 --apply。");
+      say("  要停止重试这个 task 的这些内容（**不可逆**）：");
+      say("    " + cmd);
+      say("    先不加 --apply 看预览；预览会打出落盘该带的 --expect-digest");
+      say("    （必要时还有 --expect-generation），照抄上去再加 --apply。");
     } else if (t.blocked) {
       // 已经在上面点过名了，这里只说清没有出路。
-      console.log("  这个 task 的 outbox 有说不清的内容，**抑制会整批拒绝** ——");
-      console.log("  先确认上面点名的文件是什么。");
+      say("  这个 task 的 outbox 有说不清的内容，**抑制会整批拒绝** ——");
+      say("  先确认上面点名的文件是什么。");
     } else if (t.records.some((r) => r.state === "corrupt")) {
       trouble = true;
       // **不给注定被拒的命令。**抑制要求整批可归类，有一条坏的就整批不动。
-      console.log("  这个 task 里有损坏记录，**抑制命令会整批拒绝** —— 现在没有自动处置路径，");
-      console.log("  请把上面点名的文件交给维护者。");
+      say("  这个 task 里有损坏记录，**抑制命令会整批拒绝** —— 现在没有自动处置路径，");
+      say("  请把上面点名的文件交给维护者。");
     }
-    console.log("");
+    say("");
   }
   process.exit(trouble ? 1 : 0);
 }

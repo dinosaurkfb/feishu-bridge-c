@@ -20,7 +20,7 @@ import {
 } from "../outbox.mjs";
 import { generationTargetState } from "../topic-generation.mjs";
 import {
-  collectBacklog, describeRecordState, sanitizeForDisplay, suppressCommandFor,
+  ageText, collectBacklog, describeRecordState, sanitizeForDisplay, suppressCommandFor,
 } from "./feishu-outbox.mjs";
 import { auditSkills } from "./skill-content.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
@@ -2799,7 +2799,9 @@ test("locateTask 的 task-key 分支必须读 home 那一份登记表", () => {
   const other = fs.mkdtempSync(path.join(os.tmpdir(), "cx-other-"));
   const task = makeTaskEntry({ root: path.join(home, "p"), threadId: THREAD_A,
     name: "只在 home 里", rootMessageId: "om_root", token: "abc123" });
+  // id 必须跟 key 同步 —— 读取端现在拒绝两者不一致的条目。
   task.logical_task_key = "only-in-home";
+  task.id = "only-in-home";
   fs.writeFileSync(path.join(home, "registry.json"),
     JSON.stringify({ schema_version: "1.0", tasks: [task] }, null, 2));
   // 默认位置（由环境变量决定）指向一份**不含这条 task** 的登记表。
@@ -4708,6 +4710,7 @@ test("启用门槛的链路预检必须走真实主链，不许把被测对象�
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
     rootMessageId: "om_root", token: "abc123" });
   task.logical_task_key = "k";
+  task.id = "k";
   writeRegistry([task], path.join(home, "registry.json"));
 
   // 没有 chain-config.json → 真实预检必然 template_unusable。
@@ -4833,6 +4836,7 @@ test("兜底扫描：逐 task 走 eligible-only，一个失败不许拖垮其他
     const t = makeTaskEntry({ root, threadId: thread, name: key,
       rootMessageId: "om_" + key, token: "abc123" });
     t.logical_task_key = key;
+    t.id = key;
     return t;
   };
   writeRegistry([mk("a", THREAD_A), mk("b", THREAD_B)], path.join(home, "registry.json"));
@@ -5481,6 +5485,121 @@ test("登记表的精确诊断要到得了用户手上", () => {
   assert.notEqual(r.status, 0);
   assert.match(r.stderr, /结构不对/u);
   assert.match(r.stderr, /#0/u, "人要知道看第几条");
+});
+
+
+test("存储键按大小写折叠判重，id 不许跟 key 分叉", () => {
+  // 评审实测两处：
+  // ① 本机默认大小写不敏感：Task-A 与 task-a 通过校验，**却指向同一个 inode**，
+  //    outbox 和锁照样混在一起 —— 字符串相等挡不住文件系统的等价关系。
+  // ② 读取端原样保留已有 id：两条不同 key、相同 id 的 task，
+  //    binding_id 会撞成同一个。
+  const write = (tasks) => {
+    const home = temp();
+    const f = path.join(home, "registry.json");
+    fs.writeFileSync(f, JSON.stringify({ tasks }));
+    return f;
+  };
+
+  const folded = loadRegistry(write([
+    { root: "/tmp/a", logical_task_key: "Task-A", id: "Task-A" },
+    { root: "/tmp/b", logical_task_key: "task-a", id: "task-a" },
+  ]));
+  assert.equal(folded.ok, false, "**大小写折叠后相同就不许放行**");
+  assert.equal(folded.reason, "registry_malformed");
+  assert.match(folded.detail, /大小写折叠/u, "要说清是折叠之后撞的");
+
+  const sameId = loadRegistry(write([
+    { root: "/tmp/a", logical_task_key: "task-one", id: "same" },
+    { root: "/tmp/b", logical_task_key: "task-two", id: "same" },
+  ]));
+  assert.equal(sameId.ok, false, "**id 与 key 不一致就不许放行**");
+  assert.match(sameId.detail, /id 与 logical_task_key 不一致/u);
+
+  // id 缺失 → 补成 key，仍然合法。
+  const noId = loadRegistry(write([{ root: "/tmp/a", logical_task_key: "task-one" }]));
+  assert.equal(noId.ok, true, "id 缺失是合法的");
+  assert.equal(noId.tasks[0].id, "task-one", "要补成 key");
+  // 真正不同的 key 照常通过。
+  assert.equal(loadRegistry(write([
+    { root: "/tmp/a", logical_task_key: "task-one", id: "task-one" },
+    { root: "/tmp/b", logical_task_key: "task-two", id: "task-two" },
+  ])).ok, true);
+});
+
+test("坏文件名也要过净化 —— 这个命令的用途就是查看畸形文件", () => {
+  // 评审实测：创建名为 evil<ESC>[2J.json 的坏记录，真实 CLI 的 stdout 仍含 ESC。
+  // **文件名不能被视为可信输入** —— 恰恰因为这个命令是用来看畸形文件的。
+  // 另外换行、TAB、U+2028/U+2029 上一版也没处理：换行同样能伪造后续行。
+  const ESC = String.fromCharCode(27);
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "T",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const ob = taskPaths(task, home).outbox;
+  fs.mkdirSync(ob, { recursive: true });
+  // 文件名里带 ESC，内容是坏 JSON —— 它一定会被点名，于是文件名一定会被打印。
+  fs.writeFileSync(path.join(ob, "evil" + ESC + "[2J.json"), "{ 坏的");
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.notEqual(r.status, 0, "坏文件要被点名");
+  const all = r.stdout + r.stderr;
+  assert.match(all, /evil/u, "确实打印了这个文件名");
+  assert.equal(all.includes(ESC), false, "**文件名里的 ESC 不许漏出去**");
+
+  // 净化判据要覆盖换行族。
+  for (const code of [0x0a, 0x0d, 0x09, 0x2028, 0x2029, 0x1b, 0x202e, 0x00]) {
+    const ch = String.fromCharCode(code);
+    assert.equal(sanitizeForDisplay("a" + ch + "b").includes(ch), false,
+      "U+" + code.toString(16) + " 漏出去了");
+  }
+});
+
+test("授权是三态：目标失效时也不许把「畸形」说成「尚未」", () => {
+  // 评审实测：授权畸形 + 目标正常时已正确报 auth_malformed；
+  // 但目标同时失效时，又因为 hasEligibility === false 输出"还没取得发布资格" ——
+  // **三态在那条分支上被压回了布尔**；目标解析抛错时更是完全藏起来。
+  const base = { id: "e1", kind: "reply", text: "x", created_at: "2026-08-20T00:00:00.000Z" };
+  const malformed = { ...base, publish_eligible_at: "not-a-canonical-time" };
+
+  // ① 目标失效 + 授权畸形 → 两件事都要说。
+  const gone = describeRecordState(malformed,
+    { resolveTarget: () => ({ ok: false, reason: "generation_not_found" }) });
+  assert.equal(gone.code, "target_gone");
+  assert.match(gone.text, /永远发不出去/u);
+  assert.match(gone.text, /资格字段是坏的/u, "**畸形授权不许退化成「尚未」**");
+  assert.equal(/还没取得发布资格/u.test(gone.text), false);
+
+  // ② 目标失效 + 尚未授权 → 说法要不同。
+  const pendingAuth = describeRecordState({ ...base, publish_eligible_at: null },
+    { resolveTarget: () => ({ ok: false, reason: "generation_not_found" }) });
+  assert.match(pendingAuth.text, /还没取得发布资格/u);
+  assert.equal(/资格字段是坏的/u.test(pendingAuth.text), false);
+
+  // ③ 目标解析抛错 → 授权损坏不许被藏起来。
+  const threw = describeRecordState(malformed,
+    { resolveTarget: () => { throw new Error("炸了"); } });
+  assert.equal(threw.code, "auth_malformed", "**抛错也要把授权损坏说出来**");
+  assert.match(threw.text, /资格字段是坏的/u);
+});
+
+test("时间展示也走规范判据 —— 不许一边说解释不了、一边给出精确年龄", () => {
+  // 评审实测：created_at = "Aug 25 2026" 同时得到
+  // explainabilityGaps=["created_at"] 和"32 小时前"。
+  // 后者精确到看着可信，而它根本不是规范时间。
+  for (const bad of ["Aug 25 2026", "8/25/2026", "2026/08/25", "2026-08-25",
+    "2026-08-25T01:02:03Z"]) {
+    assert.match(ageText(bad), /不是规范格式/u, JSON.stringify(bad) + " 竟然给出了年龄");
+    assert.ok(explainabilityGaps({ id: "a", kind: "reply", text: "x", created_at: bad })
+      .includes("created_at"), JSON.stringify(bad) + " 审计应当点名");
+  }
+  // 规范时间照常给相对时间。
+  const now = Date.now();
+  assert.match(ageText(new Date(now - 3 * 3600 * 1000).toISOString(), now), /小时前/u);
 });
 
 

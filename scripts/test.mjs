@@ -9074,6 +9074,22 @@ test("落盘：重试按恢复清单走，第三种状态一律拒", () => {
   assert.equal(w.read().snapshot_id, target.snapshot_id);
   assert.equal(JSON.parse(fs.readFileSync(jf, "utf-8")).status, "committed");
 
+  // **清单里的时间必须是规范时间，不是"Date.parse 认得的东西"。**
+  //
+  // Date.parse 认 `Aug 25 2026`、`8/25/2026`、`2026-08-25`…… 于是一份清单
+  // 可以带着任意形状的时间通过校验。而清单是**崩溃之后唯一的依据**：
+  // 它说 prepared 在什么时候、committed 在什么时候，重试照着它走。
+  // 时间格式不统一，两份清单就没法比较，也没法判断谁更新。
+  for (const bad of ["Aug 25 2026", "8/25/2026", "2026/08/25", "2026-08-25",
+    "2026-08-25T01:02:03Z"]) {
+    fs.writeFileSync(jf, JSON.stringify({ ...journal, prepared_at: bad }, null, 2));
+    const badRun = applySubscriptionSync({
+      shadowDir: w.dir, lockDir: w.lockDir, operationId: opId, expectedPlanId: pid,
+      readWorld: () => { throw new Error("不该规划"); } });
+    assert.equal(badRun.ok, false,
+      "**非规范时间必须被拒**：" + JSON.stringify(bad) + " → " + JSON.stringify(badRun));
+  }
+
   // 再重试一次：每一项都已是目标值 → 跳过，不重复写。
   fs.writeFileSync(jf, JSON.stringify({ ...journal, status: "prepared" }, null, 2));
   const before = fs.statSync(w.file).mtimeMs;

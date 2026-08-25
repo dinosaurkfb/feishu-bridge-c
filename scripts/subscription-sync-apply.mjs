@@ -43,6 +43,7 @@ import {
   materializeDialogueBindingAuthorization, validateDialogueBindingAuthorizationSnapshot,
 } from "./dialogue-binding-authorization.mjs";
 import { SYNC_ACTION, planSubscriptionSync } from "./subscription-sync.mjs";
+import { isCanonicalIso } from "./canonical-time.mjs";
 
 /**
  * 计划指纹。**只含影响写什么的字段**，顺序无关。
@@ -221,7 +222,18 @@ export const JOURNAL_SCHEMA = "subscription-sync-operation/v2";
 const exactKeys = (o, keys) => o && typeof o === "object" && !Array.isArray(o)
   && Object.keys(o).length === keys.length && keys.every((k) => Object.hasOwn(o, k));
 
-const isIsoTime = (v) => typeof v === "string" && Number.isFinite(Date.parse(v));
+/**
+ * 恢复清单里的时间必须是**规范时间**，不是"Date.parse 认得的东西"。
+ *
+ * Date.parse 认 `Aug 25 2026`、`8/25/2026`、`2026/08/25`、`2026-08-25`……
+ * 于是一份清单可以带着任意形状的时间通过校验，而清单是**崩溃之后唯一的依据**：
+ * 它说 prepared 在什么时候、committed 在什么时候，重试要照着它走。
+ * 时间格式不统一，两份清单就没法比较，也没法判断谁更新。
+ *
+ * 全仓已经有一份规范判据（canonical-time.mjs），这里跟它对齐 ——
+ * 又一处"同一个概念两处各写一份"，只是这处一直没人碰。
+ */
+const isIsoTime = (v) => isCanonicalIso(v);
 
 /**
  * 恢复清单必须**自己可信**。

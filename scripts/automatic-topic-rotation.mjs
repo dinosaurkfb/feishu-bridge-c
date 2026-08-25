@@ -11,6 +11,7 @@ import path from "node:path";
 
 import { recordClaudeTopicActivity } from "./topic-generation-store.mjs";
 import { moduleRoot } from "./direct-run.mjs";
+import { issueIntent } from "./intent.mjs";
 
 const BRIDGE_ROOT = moduleRoot(import.meta.url, "..");
 
@@ -62,7 +63,20 @@ export function launchAutomaticTopicRotation({
     ? path.join(bridgeRoot, "scripts", "codex", "feishu-rotate.mjs")
     : path.join(bridgeRoot, "scripts", "feishu-rotate.mjs");
   const args = [script, "--project", root, "--automatic", "--apply"];
-  if (isCodex) args.push("--thread-id", threadId);
+  if (isCodex) {
+    args.push("--thread-id", threadId);
+    // **做出决定的一方签字。**这条路径没有用户输入，所以不可能有 hook 签的凭证；
+    // 但也不能让 --automatic 直接绕过门禁 —— 那样谁加上这个参数都能强制轮转。
+    // 发布器数到阈值、决定要轮转，就由它签一张 rotate:auto。
+    // 授权链条仍然完整：谁做的决定，谁签的字。
+    const issued = issueIntent({
+      action: "rotate:auto", threadId, params: { project: root }, home,
+    });
+    if (!issued.ok) {
+      return { ok: false, reason: "intent_unissuable", detail: issued.reason };
+    }
+    args.push("--intent", issued.id);
+  }
   if (!isCodex && nonEmpty(claudeSessionId)) args.push("--claude-session-id", claudeSessionId);
 
   const logFile = isCodex

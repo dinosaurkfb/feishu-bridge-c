@@ -11,10 +11,10 @@ import {
 } from "./bind-compose.mjs";
 import { updateTextMessage } from "./lark-message.mjs";
 import {
-  addTask, findRegisteredTaskForCodexThread, loadCodexTemplate, makeTaskEntry,
+  addTask, bridgeHome, findRegisteredTaskForCodexThread, loadCodexTemplate, makeTaskEntry,
   refreshPendingTaskBinding, setTaskConnectionStatus, setTaskDisplayName,
 } from "./state.mjs";
-import { requireIntent } from "./intent.mjs";
+import { requireIntent } from "../intent.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -35,7 +35,9 @@ if (!thread.ok) die("无法确定当前 Codex thread（" + thread.reason + "）�
 // 整条精确匹配 —— **但技能选择这一层不受那条判据约束**。
 // 凭证把"技能被选中"和"这次操作被授权"分开：只有人亲自输入完整命令时，
 // 钩子才签发一张，用完即焚。
-const intent = requireIntent({ apply, action: "bind", threadId: thread.threadId });
+const intent = requireIntent({
+  apply, action: "bind", threadId: thread.threadId,
+  params: { project: root }, home: bridgeHome() });
 if (!intent.ok) die(intent.text);
 const existing = findRegisteredTaskForCodexThread({ threadId: thread.threadId });
 if (existing.ok) {

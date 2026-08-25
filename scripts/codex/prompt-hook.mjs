@@ -12,7 +12,7 @@ import {
 import { storeTurnInput } from "../turn-input.mjs";
 import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
 import { codexRuntimeRoot } from "../runtime-install.mjs";
-import { issueIntent } from "./intent.mjs";
+import { issueIntent } from "../intent.mjs";
 
 /**
  * 不带参数的控制命令 —— **只有这一份清单**。
@@ -332,10 +332,26 @@ async function main() {
    * 只给有副作用的动作签。只读的（status / subscribe）不需要，
    * 多发一张就多一个能被误用的东西。
    */
+  // **凭证绑的是"这一次操作"，不是"这一类操作"。**
+  //
+  // 上一版只按命令族签：一张 mode 票能切 dialogue 也能切 mapping，
+  // 一张 rotate 票能创建也能取消。更糟的是**无参数的只读 $feishu-mode
+  // 也会签出一张 mode 票，而它能被当写票消费** —— 一次只读输入换来一次写授权。
+  const modeArg = action.startsWith("mode-") ? action.slice("mode-".length) : null;
   const intentAction = action.startsWith("mode") ? "mode" : action;
+  const intentParams =
+    intentAction === "mode" ? { mode: modeArg }
+    : intentAction === "rotate" ? { op: "create" }   // 钩子只注入创建那条
+    : {};
+  // **只读的 $feishu-mode（不带参数）不签票。**它只是看当前模式。
+  const wantsIntent = WRITE_ACTIONS.has(intentAction) &&
+    !(intentAction === "mode" && modeArg === null);
   let intentId = null;
-  if (WRITE_ACTIONS.has(intentAction)) {
-    const issued = issueIntent({ action: intentAction, threadId, home: bridgeHome() });
+  if (wantsIntent) {
+    const issued = issueIntent({
+      action: intentAction, threadId, params: intentParams,
+      turnId: payload.turn_id ?? null, home: bridgeHome(),
+    });
     // **签不出来就不给命令。**给一条注定被拒的命令比不给更糟：
     // 人会以为是别的地方坏了。
     if (!issued.ok) {

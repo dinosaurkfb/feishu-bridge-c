@@ -26,19 +26,45 @@
  * 消费用 rename：同一个 inode 只可能被 rename 成功一次，失败的一方拿到 ENOENT。
  * 先读后删会有窗口，两个进程可以都读到同一张凭证。
  * 消费必须发生在**任何副作用之前** —— 拿完锁再检查，锁已经被动过了。
+ *
+ * ■ 为什么住在共用层
+ *
+ * 自动轮转由共用的 automatic-topic-rotation.mjs 发起，它要签字。
+ * 把凭证层留在 scripts/codex/ 里，共用代码就得反向依赖 codex 目录 ——
+ * 那条依赖方向有守卫盯着，而且盯得对：共用代码依赖某一条链，
+ * 另一条链就会被牵着走。**home 由调用方传，不再有默认值。**
  */
 
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { isCanonicalIso } from "../canonical-time.mjs";
-import { bridgeHome } from "./state.mjs";
+import { isCanonicalIso } from "./canonical-time.mjs";
 
 /** 凭证有效期。够人看一眼命令再确认，短到跨不过一个会话。 */
 export const INTENT_TTL_MS = 5 * 60 * 1000;
 
-export const intentDir = (home = bridgeHome()) => path.join(home, "intents");
+export const intentDir = (home) => path.join(home, "intents");
+
+/**
+ * 一次授权到底授权了**哪一次操作**。
+ *
+ * 上一版只绑命令族，评审用三个反例打穿了：
+ *   · mode 不分 dialogue / mapping；
+ *   · rotate 不分创建 / 取消；
+ *   · bind 不绑 project / chat / name；
+ *   · **无参数的只读 $feishu-mode 也会签出一张 mode 票，而它能被当写票消费**。
+ *
+ * 所以凭证绑的是"规范化之后的完整写意图"：动作 + 排序后的参数键值。
+ * 参数对不上就不是同一次操作 —— 哪怕命令族一样。
+ */
+export function intentDigest({ action, params = {} }) {
+  const norm = Object.keys(params).sort()
+    .filter((k) => params[k] !== undefined && params[k] !== null)
+    .map((k) => k + "=" + String(params[k]));
+  return crypto.createHash("sha256")
+    .update(action + "\u0000" + norm.join("\u0000")).digest("hex").slice(0, 32);
+}
 
 const idPattern = /^[0-9a-f]{32}$/u;
 const nonEmpty = (v) => typeof v === "string" && v.length > 0;
@@ -50,17 +76,48 @@ const nonEmpty = (v) => typeof v === "string" && v.length > 0;
  * @param threadId 精确 thread；凭证只对这一条有效
  * @param turnId   这一轮的标识；跨轮复用要被拒
  */
+/**
+ * 找一张**还活着**的同意图凭证：同 thread、同 turn、同精确意图，且没过期。
+ *
+ * 已消费的（.consumed）不算 —— 它们不该被复用，那正是"一次只授权一次"的含义。
+ */
+function findLiveIntent({ digest, threadId, turnId, home, now }) {
+  let files;
+  try { files = fs.readdirSync(intentDir(home)).filter((f) => f.endsWith(".json")); }
+  catch { return null; }
+  for (const f of files) {
+    let rec;
+    try { rec = JSON.parse(fs.readFileSync(path.join(intentDir(home), f), "utf-8")); }
+    catch { continue; }
+    if (rec?.digest !== digest || rec?.thread_id !== threadId) continue;
+    if ((rec?.turn_id ?? null) !== (nonEmpty(turnId) ? turnId : null)) continue;
+    if (!isCanonicalIso(rec?.expires_at) || now >= Date.parse(rec.expires_at)) continue;
+    return { id: rec.id, record: rec };
+  }
+  return null;
+}
+
 export function issueIntent({
-  action, threadId, turnId = null, home = bridgeHome(), now = Date.now(),
+  action, threadId, turnId = null, params = {}, home, now = Date.now(),
 }) {
   if (!nonEmpty(action) || !nonEmpty(threadId)) {
     return { ok: false, reason: "intent_fields_missing" };
   }
+  const digest = intentDigest({ action, params });
+
+  // **同一次输入只签一张。**
+  //
+  // 上一版每调一次钩子就新签一张，两张都能各自消费 ——
+  // "一次输入只授权一次操作"根本不成立。评审同 prompt 连跑两次就复现了。
+  // 幂等键 = thread + turn + 精确意图；已消费的不再复用（找不到就重签）。
+  const existing = findLiveIntent({ digest, threadId, turnId, home, now });
+  if (existing) return { ok: true, id: existing.id, record: existing.record, reused: true };
+
   const id = crypto.randomBytes(16).toString("hex");
   const dir = intentDir(home);
   const record = {
     schema_version: "1.0",
-    id, action, thread_id: threadId,
+    id, action, thread_id: threadId, digest,
     turn_id: nonEmpty(turnId) ? turnId : null,
     issued_at: new Date(now).toISOString(),
     expires_at: new Date(now + INTENT_TTL_MS).toISOString(),
@@ -84,7 +141,7 @@ export function issueIntent({
  * "没给凭证"和"凭证过期"要人做的事不一样。
  */
 export function consumeIntent({
-  id, action, threadId, turnId = null, home = bridgeHome(), now = Date.now(),
+  id, action, threadId, turnId = null, params = {}, home, now = Date.now(),
 }) {
   if (!nonEmpty(id)) return { ok: false, reason: "intent_missing" };
   // **格式先验。**id 会被拼进路径，不能是任意字符串。
@@ -110,6 +167,12 @@ export function consumeIntent({
 
   // 消费掉了才校验内容 —— **对不上也不还回去**，一张被误用的凭证不该还能再试一次。
   if (record?.action !== action) return { ok: false, reason: "intent_action_mismatch" };
+  // **参数也要对上。**只比命令族的话，一张 mode 票能切 dialogue 也能切 mapping，
+  // 一张 rotate 票能创建也能取消 —— 那不是"授权了这次操作"，
+  // 是"授权了这一类操作"。
+  if (record?.digest !== intentDigest({ action, params })) {
+    return { ok: false, reason: "intent_params_mismatch" };
+  }
   if (record?.thread_id !== threadId) return { ok: false, reason: "intent_thread_mismatch" };
   if (nonEmpty(turnId) && nonEmpty(record?.turn_id) && record.turn_id !== turnId) {
     return { ok: false, reason: "intent_turn_mismatch" };
@@ -130,6 +193,9 @@ export const INTENT_REJECT_TEXT = {
   intent_already_used: "这张凭证已经用过了。**一次输入只授权一次操作**，请重新输入。",
   intent_expired: "凭证已过期。请重新输入那条命令。",
   intent_action_mismatch: "凭证授权的不是这个动作，拒绝执行。",
+  intent_params_mismatch:
+    "凭证授权的不是这一次操作（参数对不上），拒绝执行。\n" +
+    "  **一次输入只授权那一次操作** —— 换了参数就得重新输入命令。",
   intent_thread_mismatch: "凭证属于另一条 thread，拒绝执行。",
   intent_turn_mismatch: "凭证来自另一轮对话，拒绝执行。",
   intent_corrupt: "凭证内容读不出来，拒绝执行。",
@@ -138,6 +204,23 @@ export const INTENT_REJECT_TEXT = {
 
 export const intentRejectText = (reason) =>
   INTENT_REJECT_TEXT[reason] ?? ("凭证校验失败（" + reason + "），拒绝执行。");
+
+/**
+ * **系统自己发起的操作**（不是人输入的命令）怎么授权。
+ *
+ * 自动轮转就是一例：发布器数到阈值，自己去调轮转脚本 —— 这条路径**没有用户输入**，
+ * 所以不可能有 hook 签发的凭证。上一版的门禁把它整条卡死了
+ *（评审实测：--automatic --apply 得到 intent_missing、exit 1）。
+ *
+ * **但不能让 --automatic 直接绕过门禁** —— 那样任何 agent 加上这个参数
+ * 就能强制轮转，等于开了一扇没锁的后门。
+ *
+ * 做法：让**做出决定的那一方**签发。发布器数到阈值 → 它签一张
+ * `rotate:auto` 凭证 → 轮转脚本消费它。授权链条仍然完整：
+ * 谁做的决定，谁签的字。跟人工那条的区别只是签发者不同，
+ * 而两者用的是同一套一次性、带摘要、可核验的凭证。
+ */
+export const SYSTEM_ACTIONS = new Set(["rotate:auto"]);
 
 /**
  * 有副作用的控制脚本的**统一门禁**。
@@ -150,12 +233,13 @@ export const intentRejectText = (reason) =>
  * 反而把凭证消费在没用的地方。
  */
 export function requireIntent({
-  apply, action, threadId, argv = process.argv, home = bridgeHome(), now = Date.now(),
+  apply, action, threadId, params = {}, argv = process.argv,
+  home, now = Date.now(),
 }) {
   if (!apply) return { ok: true, skipped: "dry-run" };
   const at = argv.indexOf("--intent");
   const id = at >= 0 ? argv[at + 1] : undefined;
-  const r = consumeIntent({ id, action, threadId, home, now });
+  const r = consumeIntent({ id, action, threadId, params, home, now });
   if (r.ok) return r;
   return { ok: false, reason: r.reason, text: intentRejectText(r.reason) };
 }

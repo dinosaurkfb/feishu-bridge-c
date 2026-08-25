@@ -20,7 +20,7 @@ import {
   ROTATION_STATUS, activeGeneration, pendingGeneration,
   TOPIC_GENERATION_PREPARING_STALE_MS,
 } from "../topic-generation.mjs";
-import { requireIntent } from "./intent.mjs";
+import { requireIntent } from "../intent.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -38,7 +38,23 @@ if (!thread.ok) die("无法确定当前 Codex task（" + thread.reason + "）。
 // **一次性意图凭证，在任何副作用之前消费。**
 // 技能选择这一层不受钩子判据约束 —— agent 之间提一句命令就可能把它执行掉
 // （出过真事故）。凭证把"技能被选中"和"这次操作被授权"分开。
-const intent = requireIntent({ apply, action: "rotate", threadId: thread.threadId });
+// **三种情形各自授权，不是一张通票。**
+//
+//   自动轮转 —— 发布器数到阈值自己决定的，由**它**签字（rotate:auto）；
+//   人工创建 —— 用户敲了命令，hook 签字（rotate，params 里带 create）；
+//   人工取消 —— 同上，但 params 里带 cancel。
+//
+// 上一版三种共用一张 "rotate" 票：一张创建票能拿去取消，
+// 而 --automatic 干脆没有签发入口、被整条卡死。
+// **"授权了这一类操作"不是授权。**
+const rotateAction = automatic ? "rotate:auto" : "rotate";
+const rotateParams = automatic
+  ? { project: root }
+  : { op: cancel ? "cancel" : "create" };
+const intent = requireIntent({
+  apply, action: rotateAction, threadId: thread.threadId, params: rotateParams,
+  home: bridgeHome(),
+});
 if (!intent.ok) die(intent.text);
 
 const found = findRegisteredTaskForCodexThread({ threadId: thread.threadId });

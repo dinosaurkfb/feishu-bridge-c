@@ -74,7 +74,7 @@ import {
   validateRegistryDocument, resolveTaskOutboundGeneration,
   setTaskConnectionStatus,
   setTaskDisplayName, setTaskInteractionMode, shadowCodexFirstClaim, taskPaths, topicStateForTask,
-  validateCodexTemplate, validateRegistryTasks, writeRegistry,
+  validateCodexTemplate, validateRegistryTasks, writeRegistryFixtureUnvalidated,
 } from "./state.mjs";
 import { ROTATION_STATUS, activeGeneration, pendingGeneration } from "../topic-generation.mjs";
 import { DIALOGUE_TURN_STATUS } from "../interaction-policy.mjs";
@@ -302,7 +302,7 @@ function autoPublishFixture({ enabled = true, workingPublisher = true } = {}) {
   }));
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
   task.auto_publish_on_completion = enabled;
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   return { home, root, task, bin, argsFile };
 }
 
@@ -317,7 +317,7 @@ test("Codex task registry 原子保存 Dialogue 模式、回合与终局", () =>
   const root = path.join(home, "project");
   fs.mkdirSync(root);
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Dialogue", rootMessageId: "om_root", token: "abc123" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const enabled = setTaskInteractionMode({
     threadId: THREAD_A, mode: "dialogue", home, now: 1_800_000_000_000,
   });
@@ -345,7 +345,7 @@ test("Codex feishu-mode 默认只读，只有 --apply 才切换精确 task", () 
   const root = path.join(home, "project");
   fs.mkdirSync(root);
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Mode", rootMessageId: "om_root", token: "abc123" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const cli = path.join(ROOT, "scripts", "codex", "feishu-mode.mjs");
   const run = (...args) => spawnSync(process.execPath, [cli, "--thread-id", THREAD_A, ...args], {
     encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
@@ -472,7 +472,7 @@ test("同一项目可登记两个 Codex task，路由不按项目猜", () => {
   b.session_id = "session_b"; b.inbound_state = "bound";
   delete a.topic_generation_state; delete a.channel_generation_id;
   delete b.topic_generation_state; delete b.channel_generation_id;
-  writeRegistry([a, b], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([a, b], path.join(home, "registry.json"));
   const reg = loadRegistry(path.join(home, "registry.json"));
   assert.equal(reg.tasks.length, 2);
   assert.notEqual(a.logical_task_key, b.logical_task_key);
@@ -491,7 +491,7 @@ test("多个待绑定 Codex task 由根消息引用中的绑定码精确选择",
   const b = makeTaskEntry({
     root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "62ca4f",
   });
-  writeRegistry([a, b], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([a, b], path.join(home, "registry.json"));
   const content = [
     '<at id="ou_same" type="employee">M5Codex</at> 继续处理',
     "",
@@ -513,7 +513,7 @@ test("绑定码必须来自引用行，正文手打不能在多个 pending 中�
   const home = temp();
   const root = path.join(home, "same-project");
   fs.mkdirSync(root);
-  writeRegistry([
+  writeRegistryFixtureUnvalidated([
     makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30" }),
     makeTaskEntry({ root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "62ca4f" }),
   ], path.join(home, "registry.json"));
@@ -529,7 +529,7 @@ test("未知、重复或多个引用绑定码全部 fail-closed", () => {
   fs.mkdirSync(root);
   const a = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30" });
   const b = makeTaskEntry({ root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "62ca4f" });
-  writeRegistry([a, b], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([a, b], path.join(home, "registry.json"));
 
   assert.equal(findPendingTask({ home, content: "> 绑定码  abc123" }).reason,
     "pending_binding_token_unknown");
@@ -539,7 +539,7 @@ test("未知、重复或多个引用绑定码全部 fail-closed", () => {
   b.pending_token = "5fba30";
   delete b.topic_generation_state;
   delete b.channel_generation_id;
-  writeRegistry([a, b], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([a, b], path.join(home, "registry.json"));
   assert.equal(findPendingTask({ home, content: "> 绑定码  5fba30" }).reason,
     "duplicate_pending_binding_token");
 });
@@ -551,7 +551,7 @@ test("没有引用码时保留唯一 pending 的兼容路径", () => {
   const task = makeTaskEntry({
     root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30",
   });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const selected = findPendingTask({ home, content: "<at>M5Codex</at>" });
   assert.equal(selected.ok, true);
   assert.equal(selected.source, "sole_pending");
@@ -568,7 +568,7 @@ test("Codex 旧 task 登记只读投影成一份订阅和两个本地目标", ()
   const b = makeTaskEntry({
     root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "62ca4f", now,
   });
-  writeRegistry([a, b], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([a, b], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   const before = fs.readFileSync(path.join(home, "registry.json"), "utf-8");
 
@@ -595,7 +595,7 @@ test("Codex 首次认领 shadow 与现行绑定码选择一致且不写 task reg
   const b = makeTaskEntry({
     root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "62ca4f", now,
   });
-  writeRegistry([a, b], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([a, b], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   const event = {
     message_id: "msg_shadow", session_id: "session_shadow",
@@ -626,7 +626,7 @@ test("完整入站链路用引用绑定码在多个 pending 中只绑定目标 t
   const b = makeTaskEntry({
     root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "62ca4f",
   });
-  writeRegistry([a, b], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([a, b], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
 
   const fakeAily = path.join(bin, "aily-cli");
@@ -703,7 +703,7 @@ test("Feishu session 与 Codex thread 是两把独立且精确的键", () => {
   task.inbound_state = "bound";
   delete task.topic_generation_state;
   delete task.channel_generation_id;
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   const routed = findTaskForFeishuSession({ sessionId: "aily_session_a", home });
   assert.equal(routed.ok, true);
@@ -723,7 +723,7 @@ test("暂停连接会同时关闭入站、Stop 入队和发布资格，恢复时
   task.inbound_state = "bound";
   delete task.topic_generation_state;
   delete task.channel_generation_id;
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
 
   const paused = setTaskConnectionStatus({ threadId: THREAD_A, status: "paused", home, now: 1000 });
@@ -760,7 +760,7 @@ test("active 但首次 mention 已过期的 task 可只刷新原话题握手窗�
   delete task.pending_expires_at;
   delete task.topic_generation_state;
   delete task.channel_generation_id;
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
 
   const now = Date.parse("2026-08-22T05:00:00.000Z");
   assert.equal(findPendingTask({ home, now }).reason, "pending_binding_expired");
@@ -779,7 +779,7 @@ test("Codex adapter 轮转期间旧 session 继续路由，认领后新旧代际
   const task = makeTaskEntry({
     root, threadId: THREAD_A, name: "A", rootMessageId: "om_old", token: "aaa111", now: 1000,
   });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   const first = promoteTask({
     logicalTaskKey: task.logical_task_key,
@@ -841,7 +841,7 @@ test("Codex registry adapter 原子持久化代际计数，旧登记不会回扫
   const task = makeTaskEntry({
     root, threadId: THREAD_A, name: "A", rootMessageId: "om_old", token: "aaa111", now: 1000,
   });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   promoteTask({
     logicalTaskKey: task.logical_task_key, generationId: task.channel_generation_id,
     sessionId: "session_old", home, now: 1100,
@@ -867,7 +867,7 @@ test("Codex 轮转取消只退休 pending generation，不影响旧 active", () 
   const task = makeTaskEntry({
     root, threadId: THREAD_A, name: "A", rootMessageId: "om_old", token: "aaa111", now: 1000,
   });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   promoteTask({
     logicalTaskKey: task.logical_task_key, generationId: task.channel_generation_id,
     sessionId: "session_old", home, now: 1100,
@@ -894,7 +894,7 @@ test("Codex 轮转 CLI 可显式取消 pending，且完全不调用飞书", () =
   const task = makeTaskEntry({
     root, threadId: THREAD_A, name: "A", rootMessageId: "om_old", token: "aaa111", now: 1000,
   });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   promoteTask({
     logicalTaskKey: task.logical_task_key, generationId: task.channel_generation_id,
     sessionId: "session_old", home, now: 1100,
@@ -928,7 +928,7 @@ test("过期的轮转候选携带精确 operation，可在一次原子写中退�
   const task = makeTaskEntry({
     root, threadId: THREAD_A, name: "A", rootMessageId: "om_old", token: "aaa111", now: 1000,
   });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   promoteTask({
     logicalTaskKey: task.logical_task_key, generationId: task.channel_generation_id,
     sessionId: "session_old", home, now: 1100,
@@ -1008,7 +1008,7 @@ test("bind-task 重跑只续期 active pending，不创建或回复第二个话�
   delete task.channel_generation_id;
   delete task.topic_generation_state;
   delete task.channel_generation_id;
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
 
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
     "--project", root, "--thread-id", THREAD_A, "--name", "A", "--apply", ...withIntent("bind", THREAD_A, home, { project: root, name: "A" })], {
@@ -1044,7 +1044,7 @@ test("pending 续期不被超过编辑时限的旧话题标题阻断", () => {
   });
   task.bound_at = "2026-01-01T00:00:00.000Z";
   delete task.pending_expires_at;
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
 
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
     "--project", root, "--thread-id", THREAD_A, "--name", "New", "--apply", ...withIntent("bind", THREAD_A, home, { project: root, name: "New" })], {
@@ -1068,7 +1068,7 @@ test("task 控制脚本不猜 thread，暂停和恢复都不调用飞书", () =>
   task.inbound_state = "bound";
   delete task.topic_generation_state;
   delete task.channel_generation_id;
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home };
 
   const status = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"),
@@ -1110,7 +1110,7 @@ test("registry 对重复 thread/topic/session fail-closed", () => {
   const b = makeTaskEntry({ root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "b" });
   b.codex_thread_id = THREAD_A;
   assert.deepEqual(validateRegistryTasks([a, b]).duplicateFields, ["codex_thread_id"]);
-  assert.throws(() => writeRegistry([a, b], path.join(temp(), "registry.json")), /重复绑定/);
+  assert.throws(() => writeRegistryFixtureUnvalidated([a, b], path.join(temp(), "registry.json")), /重复绑定/);
 });
 
 test("Codex task 的 claim/outbox 全部在 ~/.codex 桥状态下，不落项目目录", () => {
@@ -1792,7 +1792,7 @@ test("Codex Stop hook：相同正文的两个 turn 各入队一次，同一 turn
   fs.mkdirSync(root);
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
   task.auto_publish_on_completion = false;
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const hook = path.join(ROOT, "scripts", "codex", "stop-hook.mjs");
   const run = (turn) => spawnSync(process.execPath, [hook], {
     input: JSON.stringify({ session_id: THREAD_A, turn_id: turn, cwd: root, last_assistant_message: "一样" }),
@@ -1811,7 +1811,7 @@ test("Codex UserPromptSubmit 与 Stop 按 turn_id 配对本地输入，入站 ru
   fs.mkdirSync(root);
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
   task.auto_publish_on_completion = false;
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const promptHook = path.join(ROOT, "scripts", "codex", "prompt-hook.mjs");
   const stopHook = path.join(ROOT, "scripts", "codex", "stop-hook.mjs");
   const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home };
@@ -1884,7 +1884,7 @@ test("关闭自动发布时 watcher 只把严格完成的最终答复兜底入�
   fs.mkdirSync(root);
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
   task.auto_publish_on_completion = false;
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const paths = taskPaths(task, home);
   fs.mkdirSync(paths.runs, { recursive: true });
   fs.mkdirSync(paths.claims, { recursive: true });
@@ -1909,7 +1909,7 @@ test("Codex watcher 严格完成后释放 Dialogue 活动回合", () => {
   fs.mkdirSync(root);
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Dialogue", rootMessageId: "om_a", token: "a" });
   task.auto_publish_on_completion = false;
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   setTaskInteractionMode({ threadId: THREAD_A, mode: "dialogue", home, now: 1_800_000_000_000 });
   const key = "d".repeat(64);
   reserveTaskDialogueTurn({
@@ -1945,7 +1945,7 @@ test("watcher 抑制递归产生的错误答复，只保留风险回执", () => 
   fs.mkdirSync(root);
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
   task.auto_publish_on_completion = false;
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const paths = taskPaths(task, home);
   fs.mkdirSync(paths.runs, { recursive: true });
   fs.mkdirSync(paths.claims, { recursive: true });
@@ -1981,7 +1981,7 @@ test("watcher 对启动前 Git 预检失败给出真实且脱敏的风险回执"
   fs.mkdirSync(root);
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
   task.auto_publish_on_completion = false;
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const paths = taskPaths(task, home);
   fs.mkdirSync(paths.runs, { recursive: true });
   fs.mkdirSync(paths.claims, { recursive: true });
@@ -2029,7 +2029,7 @@ test("安装器在隔离 HOME 只追加 hooks、渲染技能路径且保留已�
   fs.mkdirSync(root);
   const legacyTask = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
   legacyTask.auto_publish_on_completion = false;
-  writeRegistry([legacyTask], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([legacyTask], path.join(home, "registry.json"));
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
     encoding: "utf-8",
     env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
@@ -2092,7 +2092,7 @@ test("自动发布登记迁移幂等，暂停 task 也保留恢复后的发布�
   active.auto_publish_on_completion = false;
   paused.auto_publish_on_completion = false;
   paused.status = "paused";
-  writeRegistry([active, paused], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([active, paused], path.join(home, "registry.json"));
   // 默认只预览：报得出待迁移数，但不写。
   const preview = enableAutoPublishForAllTasks({ home });
   assert.equal(preview.changed, 2);
@@ -2339,7 +2339,7 @@ test("task 级目标群覆盖只进入 Git 外运行映射，不改变机器模�
     root, threadId: THREAD_A, name: "实验主管", rootMessageId: "om_lab", token: "lab",
     chatId: "oc_lab", chatName: "智能体进化",
   });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const resolved = findTaskForCodexThread({ threadId: THREAD_A, home });
   assert.equal(resolved.ok, true);
   const mapped = mappingForTask(task, { home });
@@ -2453,7 +2453,7 @@ test("旧 Codex 绑定可原地更新显示名，不改变根消息与 thread lo
   const task = makeTaskEntry({
     root, threadId: THREAD_A, name: "hv-meeting", rootMessageId: "om_existing", token: "abc123",
   });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const renamed = setTaskDisplayName({ threadId: THREAD_A, name: "hv-meeting｜任务一", home });
   assert.equal(renamed.ok, true);
   const after = loadRegistry(path.join(home, "registry.json")).tasks[0];
@@ -2509,7 +2509,7 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
     ...TEMPLATE,
     lark_cli_bin: path.join(bin, "lark-cli"),
   }));
-  writeRegistry([], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
   // **"健康"就是安装器装出来的样子 —— 由安装器自己构造，不手写。**
   //
   // 上一版这里手写 hooks 指向 ROOT（开发克隆）、手写空壳技能。那份夹具描述的是
@@ -2667,7 +2667,7 @@ test("Codex 真实 CLI：缺 expectation / 纯空白 / 代际不可读，都不�
     // 要让 topicStateForTask 真的失败，得给一份结构上就不合法的状态。
     if (!withState) task.topic_generation_state = { generations: "not-an-array" };
     fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
-    writeRegistry([task], path.join(home, "registry.json"));
+    writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
     const paths = taskPaths(task, home);
     fs.mkdirSync(paths.outbox, { recursive: true });
     const rec = path.join(paths.outbox, "0001.json");
@@ -2739,7 +2739,7 @@ test("Codex 抑制命令：真实入口 —— 预览后轮转必须 rotated 且
     rootMessageId: "om_root", token: "abc123" });
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   const regFile = path.join(home, "registry.json");
-  writeRegistry([task], regFile);
+  writeRegistryFixtureUnvalidated([task], regFile);
 
   const paths = taskPaths(task, home);
   fs.mkdirSync(paths.outbox, { recursive: true });
@@ -2830,7 +2830,7 @@ test("Codex 预览和 --apply 不许给出相反结论：损坏记录在预览�
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Sup",
     rootMessageId: "om_root", token: "abc123" });
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const paths = taskPaths(task, home);
   fs.mkdirSync(paths.outbox, { recursive: true });
   const rec = path.join(paths.outbox, "0001.json");
@@ -2896,7 +2896,7 @@ test("安装器只许写进 CODEX_HOME —— 真机的 ~/.codex 一个字节都
   const home = path.join(dir, "bridge-home");
   fs.mkdirSync(codexHome, { recursive: true });
   fs.mkdirSync(home, { recursive: true });
-  writeRegistry([], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
 
   // 真机上那个位置现在是什么样，记下来。
   const realCodexRuntime = path.join(os.homedir(), ".codex", "feishu-bridge", "runtime");
@@ -2931,7 +2931,7 @@ test("迁移必须收敛旧克隆的 hook，而不是在旁边再加一条", () 
   const home = path.join(dir, "bridge-home");
   fs.mkdirSync(codexHome, { recursive: true });
   fs.mkdirSync(home, { recursive: true });
-  writeRegistry([], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
 
   // **夹具必须是现场真正的形状。**线上那两条是安装器当初生成的完整模板
   //（我核对过真机的 ~/.codex/hooks.json）。造一条裸的 `node <path>` 去测，
@@ -3013,7 +3013,7 @@ test("装好的 runtime 必须能自证 —— doctor 在自己的运行环境�
   for (const n of ["codex", "aily-cli", "lark-cli"]) {
     fs.writeFileSync(path.join(bin, n), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
   }
-  writeRegistry([], path.join(bridge, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(bridge, "registry.json"));
   fs.writeFileSync(path.join(bridge, "chain-config.json"),
     JSON.stringify({ ...TEMPLATE, lark_cli_bin: path.join(bin, "lark-cli") }));
   const env = { ...isolatedEnv(), HOME: fakeHome, CODEX_HOME: codexHome,
@@ -3048,7 +3048,7 @@ test("lark_cli_bin 指到目录不算可执行 —— X_OK 对目录也成立", 
   fs.mkdirSync(root, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
     rootMessageId: "om_root", token: "abc123" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const aDir = path.join(home, "adir");
   fs.mkdirSync(aDir);
   const t = JSON.parse(JSON.stringify(TEMPLATE));
@@ -3093,7 +3093,7 @@ test("停用：卸载失败不许删 plist —— 还在跑的定时器不能被
   const bridge = path.join(dir, "bridge");
   const bin = path.join(dir, "bin");
   for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
-  writeRegistry([], path.join(bridge, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(bridge, "registry.json"));
   // 假 launchctl：list 说有、bootout 失败（不是"没有这个服务"）。
   fs.writeFileSync(path.join(bin, "launchctl"),
     '#!/bin/sh\ncase "$1" in\n' +
@@ -3153,7 +3153,7 @@ test("启用必须 fail-closed：launchd 查不出来时，只许一次只读 li
   const bridge = path.join(dir, "bridge");
   const bin = path.join(dir, "bin");
   for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
-  writeRegistry([], path.join(bridge, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(bridge, "registry.json"));
   fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TEMPLATE));
 
   const marker = path.join(dir, "CALLED");
@@ -3202,7 +3202,7 @@ test("已经在健康运行时，重跑 --enable 是无操作 —— 不许打�
   const bridge = path.join(dir, "bridge");
   const bin = path.join(dir, "bin");
   for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
-  writeRegistry([], path.join(bridge, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(bridge, "registry.json"));
   fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TEMPLATE));
 
   const marker = path.join(dir, "CALLED");
@@ -3256,7 +3256,7 @@ test("启用必须 fail-closed：plist 读不出来时，launchctl 一次都不�
   const bridge = path.join(dir, "bridge");
   const bin = path.join(dir, "bin");
   for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
-  writeRegistry([], path.join(bridge, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(bridge, "registry.json"));
   fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TEMPLATE));
 
   // 记账用的假 launchctl：**被调用一次就留痕**。
@@ -3303,7 +3303,7 @@ test("plist 读不出来不许当成「未启用」", () => {
   const fakeHome = path.join(dir, "home");
   const bridge = path.join(dir, "bridge");
   fs.mkdirSync(bridge, { recursive: true });
-  writeRegistry([], path.join(bridge, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(bridge, "registry.json"));
   const agents = path.join(fakeHome, "Library", "LaunchAgents");
   fs.mkdirSync(agents, { recursive: true });
   // **把 plist 路径做成目录** → 读它会 EISDIR。
@@ -3335,7 +3335,7 @@ test("停用的顺序：核验没过时 plist 一个字节都不许动", () => {
   const bin = path.join(dir, "bin");
   fs.mkdirSync(bridge, { recursive: true });
   fs.mkdirSync(bin, { recursive: true });
-  writeRegistry([], path.join(bridge, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(bridge, "registry.json"));
   const agents = path.join(fakeHome, "Library", "LaunchAgents");
   fs.mkdirSync(agents, { recursive: true });
   const plist = path.join(agents, "com.frank.feishu-bridge-codex.drain.plist");
@@ -3388,7 +3388,7 @@ test("有副作用的技能必须关掉隐式调用，且装出来要带上那�
   const home = path.join(dir, "bridge-home");
   fs.mkdirSync(codexHome, { recursive: true });
   fs.mkdirSync(home, { recursive: true });
-  writeRegistry([], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
   const env = isolatedEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home });
   assert.equal(spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
@@ -3423,7 +3423,7 @@ test("每个命令都要有对应的技能，装出来还要能被 doctor 核验
   const home = path.join(dir, "bridge-home");
   fs.mkdirSync(codexHome, { recursive: true });
   fs.mkdirSync(home, { recursive: true });
-  writeRegistry([], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
   const env = isolatedEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home });
   assert.equal(spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
@@ -3472,7 +3472,7 @@ test("订阅投影只许有一份实现", () => {
     rootMessageId: "om_a", token: "a1b2c3" });
   const b = makeTaskEntry({ root, threadId: THREAD_B, name: "B",
     rootMessageId: "om_b", token: "d4e5f6" });
-  writeRegistry([a, b], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([a, b], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
 
   const all = buildCodexSubscriptionProjection({ home });
@@ -3528,7 +3528,7 @@ test("subscribe 命令：读得出订阅，且不泄漏任何 locator", () => {
     // 我第一版写了 "tok123456"，投影直接判 record:pending_token 不合法。
     // **改夹具，不是放松判据。**
     rootMessageId: "om_secret_root", token: "a1b2c3" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
 
   const r = spawnSync(process.execPath,
@@ -3569,7 +3569,7 @@ test("status 不许执行别的项目的 provider —— 不显示还不够，�
   for (const d of [home, mine, theirs]) fs.mkdirSync(d, { recursive: true });
   const task = makeTaskEntry({ root: mine, threadId: THREAD_A, name: "S",
     rootMessageId: "om_root", token: "a1b2c3" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
 
   // 别的项目的 provider：**跑起来就留 marker**。
@@ -3647,7 +3647,7 @@ test("群名优先用 task 自己的覆盖，而不是把知道的说成不知�
   // **task 自己覆盖了群**（不是模板那个群）。
   task.chat_id = "oc_task_own_group";
   task.chat_name = "这条 task 自己的群";
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
 
   const r = spawnSync(process.execPath,
@@ -3671,7 +3671,7 @@ test("意图凭证：复现那次事故 —— 没有凭证的 --apply 一律拒
   const home = temp();
   const root = path.join(home, "p");
   fs.mkdirSync(root, { recursive: true });
-  writeRegistry([], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   const env = isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
 
@@ -3744,7 +3744,7 @@ test("接线：走真实决策路径签票 → 真实 CLI 过门禁；代际变�
   task.inbound_state = "bound";
   delete task.topic_generation_state;
   delete task.channel_generation_id;
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
 
   const stored = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
@@ -3875,7 +3875,7 @@ test("轮转脚本真实入口：人工票不能拿去跑 --automatic", () => {
   // 既有夹具里那两行 delete 就是干这个的，我一开始没看懂它们为什么在。
   delete task.topic_generation_state;
   delete task.channel_generation_id;
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   const env = isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
 
@@ -3925,7 +3925,7 @@ test("$feishu-rotate cancel 有真入口，而且能拿到取消的票", () => {
   fs.mkdirSync(root, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
     rootMessageId: "om_root", token: "a1b2c3" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   const r = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "prompt-hook.mjs")],
@@ -4032,7 +4032,7 @@ test("只读的 $feishu-mode 不许签出可当写票用的凭证", () => {
   fs.mkdirSync(root, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
     rootMessageId: "om_root", token: "a1b2c3" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   const env = isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
 
@@ -4104,7 +4104,7 @@ test("意图凭证：钩子只给写动作签，只读的不签", () => {
   fs.mkdirSync(root, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
     rootMessageId: "om_root", token: "a1b2c3" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   const env = isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
 
@@ -4159,7 +4159,7 @@ test("钩子注入的命令必须跑 runtime/current —— 不许按模板的 b
   for (const d of [codexHome, home, root]) fs.mkdirSync(d, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
     rootMessageId: "om_root", token: "a1b2c3" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   // **模板里故意留一个指向别处的 bridge_root** —— 就是迁移前的现场。
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({
     ...TEMPLATE, bridge_root: "/Users/someone/old-clone/feishu-bridge-c" }));
@@ -4190,7 +4190,7 @@ test("安装器要把模板的 bridge_root 更新到 runtime/current", () => {
   const home = path.join(dir, "bridge-home");
   fs.mkdirSync(codexHome, { recursive: true });
   fs.mkdirSync(home, { recursive: true });
-  writeRegistry([], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
   const tplFile = path.join(home, "chain-config.json");
   fs.writeFileSync(tplFile, JSON.stringify({
     ...TEMPLATE, bridge_root: "/Users/someone/old-clone/feishu-bridge-c" }));
@@ -4238,7 +4238,7 @@ test("doctor 的 bridge_root 判据不许写成「永远通过」", () => {
   for (const n of ["codex", "aily-cli", "lark-cli"]) {
     fs.writeFileSync(path.join(bin, n), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
   }
-  writeRegistry([], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
   const env = isolatedEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home,
     PATH: bin + path.delimiter + process.env.PATH });
   // 先正常装一遍（安装器会把 bridge_root 校正过来）。
@@ -4275,7 +4275,7 @@ test("四层 status：Codex 侧报的必须是自己那条链的事实，不是 
   fs.mkdirSync(root, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "四层示例",
     rootMessageId: "om_root", token: "abc123" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
 
   const r = spawnSync(process.execPath,
@@ -4336,7 +4336,7 @@ test("四层 status：这条 task 的登记表状态要单独报，不跟 task �
     rootMessageId: "om_root", token: "abc123" });
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   // **登记表里没有它** —— task 文件在，但出站挑不到。
-  writeRegistry([], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
 
   const r = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A],
@@ -4396,7 +4396,7 @@ test("没有 plist 时的三种可能：absent / orphan / unverifiable，查不�
   fs.mkdirSync(fakeHome, { recursive: true });
   fs.mkdirSync(codexHome, { recursive: true });
   fs.mkdirSync(bridge, { recursive: true });
-  writeRegistry([], path.join(bridge, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(bridge, "registry.json"));
   const bin = path.join(dir, "bin");
   fs.mkdirSync(bin, { recursive: true });
 
@@ -4435,7 +4435,7 @@ test("launchctl 必须走注入口 —— 测试不许读真实控制面", () =>
     '\necho "Could not find service" >&2\nexit 113\n', { mode: 0o755 });
   const bridge = path.join(dir, "bridge");
   fs.mkdirSync(bridge, { recursive: true });
-  writeRegistry([], path.join(bridge, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(bridge, "registry.json"));
 
   const r = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "drain-service.mjs")],
@@ -4468,7 +4468,7 @@ test("链路预检必须真验身份：lark-cli 不在、凭据对不上都要�
   fs.mkdirSync(root, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
     rootMessageId: "om_root", token: "abc123" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
 
   const bin = path.join(home, "lark-cli");
   fs.writeFileSync(bin, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
@@ -4556,7 +4556,7 @@ test("hook 往返：含单引号的路径，装两次仍然只有一条", () => 
   const home = path.join(dir, "bridge'home");
   fs.mkdirSync(codexHome, { recursive: true });
   fs.mkdirSync(home, { recursive: true });
-  writeRegistry([], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
   const env = { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home };
   const install = () => spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
@@ -4603,7 +4603,7 @@ test("技能要逐字节比对 —— 「文件在」不等于「装对了」", 
   const home = path.join(dir, "bridge-home");
   fs.mkdirSync(codexHome, { recursive: true });
   fs.mkdirSync(home, { recursive: true });
-  writeRegistry([], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
   const runtimeCurrent = path.join(codexHome, "feishu-bridge", "runtime", "current");
   assert.equal(spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
@@ -4713,7 +4713,7 @@ test("启用门槛的链路预检必须走真实主链，不许把被测对象�
     rootMessageId: "om_root", token: "abc123" });
   task.logical_task_key = "k";
   task.id = "k";
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
 
   // 没有 chain-config.json → 真实预检必然 template_unusable。
   const scanned = scanRunnable({ home });
@@ -4736,7 +4736,7 @@ test("坏 JSON 不许把积压数成 0 —— 读不出来不等于没有", () =
   fs.mkdirSync(root, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
     rootMessageId: "om_root", token: "abc123" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const outbox = taskPaths(task, home).outbox;
   fs.mkdirSync(outbox, { recursive: true });
   fs.writeFileSync(path.join(outbox, "0001.json"), "{ 这不是 JSON");
@@ -4795,7 +4795,7 @@ test("launchd 加载失败必须非零退出 —— 不许报成「已启用」"
   const bridge = path.join(dir, "bridge");
   const bin = path.join(dir, "bin");
   for (const d of [fakeHome, codexHome, bridge, bin]) fs.mkdirSync(d, { recursive: true });
-  writeRegistry([], path.join(bridge, "registry.json"));      // 空 → 积压门槛过
+  writeRegistryFixtureUnvalidated([], path.join(bridge, "registry.json"));      // 空 → 积压门槛过
 
   // 假 launchctl：list 说没有，bootstrap 失败。**不碰真机的 launchd。**
   fs.writeFileSync(path.join(bin, "launchctl"),
@@ -4841,7 +4841,7 @@ test("兜底扫描：逐 task 走 eligible-only，一个失败不许拖垮其他
     t.id = key;
     return t;
   };
-  writeRegistry([mk("a", THREAD_A), mk("b", THREAD_B)], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([mk("a", THREAD_A), mk("b", THREAD_B)], path.join(home, "registry.json"));
 
   const seen = [];
   const swept = sweepEligible({
@@ -4880,7 +4880,7 @@ test("调度器：历史积压没分类时拒绝启用，且一条都不写", ()
   fs.mkdirSync(root, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
     rootMessageId: "om_root", token: "abc123" });
-  writeRegistry([task], path.join(bridge, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(bridge, "registry.json"));
   const paths = taskPaths(task, bridge);
   fs.mkdirSync(paths.outbox, { recursive: true });
 
@@ -5052,7 +5052,7 @@ test("Codex 抑制命令：目标和范围都必须显式给", () => {
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Sup2",
     rootMessageId: "om_root", token: "abc124" });
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const paths = taskPaths(task, home);
   fs.mkdirSync(paths.outbox, { recursive: true });
   const rec = path.join(paths.outbox, "0001.json");
@@ -5083,7 +5083,7 @@ test("积压查看：读不出来绝不能显示成「没有积压」", () => {
   fs.mkdirSync(root, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "示例 task",
     rootMessageId: "om_root", token: "a1b2c3" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const ob = taskPaths(task, home).outbox;
   fs.mkdirSync(ob, { recursive: true });
   fs.writeFileSync(path.join(ob, "0001.json"), "{ 这不是 JSON");
@@ -5106,7 +5106,7 @@ test("积压查看：点名一条不存在的 task 是错误，不是「没有�
   const home = temp();
   const root = path.join(home, "p");
   fs.mkdirSync(root, { recursive: true });
-  writeRegistry([makeTaskEntry({ root, threadId: THREAD_A, name: "T",
+  writeRegistryFixtureUnvalidated([makeTaskEntry({ root, threadId: THREAD_A, name: "T",
     rootMessageId: "om_root", token: "a1b2c3" })], path.join(home, "registry.json"));
 
   assert.equal(collectBacklog({ home, taskKey: "no-such-key" }).reason, "task_not_found");
@@ -5128,7 +5128,7 @@ test("积压查看：记录层和 task 层分开说，不编原因", () => {
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "T",
     rootMessageId: "om_root", token: "a1b2c3" });
   task.auto_publish_on_completion = false;             // task 层：没开自动发布
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const ob = taskPaths(task, home).outbox;
   fs.mkdirSync(ob, { recursive: true });
   fs.writeFileSync(path.join(ob, "0001.json"), JSON.stringify({
@@ -5151,7 +5151,7 @@ test("积压查看：有损坏记录时不给抑制命令 —— 那条命令一
   fs.mkdirSync(root, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "T",
     rootMessageId: "om_root", token: "a1b2c3" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const ob = taskPaths(task, home).outbox;
   fs.mkdirSync(ob, { recursive: true });
   const base = { kind: "reply" };
@@ -5186,7 +5186,7 @@ test("积压查看：只读 —— 真实 CLI 跑完一个字节都不许变", (
   fs.mkdirSync(root, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "T",
     rootMessageId: "om_root", token: "a1b2c3" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const ob = taskPaths(task, home).outbox;
   fs.mkdirSync(ob, { recursive: true });
   fs.writeFileSync(path.join(ob, "0001.json"), JSON.stringify(outboxRecord({
@@ -5260,7 +5260,7 @@ test("处置命令要真能跑：含空格和单引号的路径，交给真实 /
   fs.mkdirSync(root, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "T",
     rootMessageId: "om_root", token: "a1b2c3" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const ob = taskPaths(task, home).outbox;
   fs.mkdirSync(ob, { recursive: true });
   fs.writeFileSync(path.join(ob, "0001.json"), JSON.stringify(outboxRecord({
@@ -5459,7 +5459,7 @@ test("查看内容不许带终端控制序列 —— 它服务的是不可逆决
   fs.mkdirSync(root, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A,
     name: "名字里也有" + ESC + "[31m颜色", rootMessageId: "om_root", token: "a1b2c3" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const ob = taskPaths(task, home).outbox;
   fs.mkdirSync(ob, { recursive: true });
   fs.writeFileSync(path.join(ob, "0001.json"), JSON.stringify(outboxRecord({
@@ -5539,7 +5539,7 @@ test("坏文件名也要过净化 —— 这个命令的用途就是查看畸形
   fs.mkdirSync(root, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "T",
     rootMessageId: "om_root", token: "a1b2c3" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const ob = taskPaths(task, home).outbox;
   fs.mkdirSync(ob, { recursive: true });
   // 文件名里带 ESC，内容是坏 JSON —— 它一定会被点名，于是文件名一定会被打印。
@@ -5680,7 +5680,7 @@ test("净化覆盖全部双向控制符，包括 U+061C", () => {
   fs.mkdirSync(root, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "T",
     rootMessageId: "om_root", token: "a1b2c3" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const ob = taskPaths(task, home).outbox;
   fs.mkdirSync(ob, { recursive: true });
   fs.writeFileSync(path.join(ob, "evil" + ALM + "name.json"), "{ 坏的");
@@ -5698,7 +5698,7 @@ test("输出边界的规矩自己也要守：不许内嵌换行", () => {
   fs.mkdirSync(root, { recursive: true });
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "T",
     rootMessageId: "om_root", token: "a1b2c3" });
-  writeRegistry([task], path.join(home, "registry.json"));
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const ob = taskPaths(task, home).outbox;
   fs.mkdirSync(ob, { recursive: true });
   fs.writeFileSync(path.join(ob, "0001.json"), JSON.stringify(outboxRecord({
@@ -5918,7 +5918,9 @@ test("只写改动，不顺带补写视图合成的默认值", () => {
  * 这类检查会直接抓住本轮那三条。**"允许变化清单"必须由人写出来** ——
  * 差集本身只能告诉你变了，不能判断变得对不对。
  */
-function registryContract({ name, build, run, allowed, mustVanish = [], addsEntries = 0 }) {
+function registryContract({
+  name, build, run, allowed, assertAfter, mustVanish = [], addsEntries = 0,
+}) {
   const read = (f) => JSON.parse(fs.readFileSync(f, "utf-8"));
   const at = (doc, p) => p.split(".").reduce((o, k) =>
     (o == null ? o : o[/^\d+$/u.test(k) ? Number(k) : k]), doc);
@@ -5961,6 +5963,10 @@ function registryContract({ name, build, run, allowed, mustVanish = [], addsEntr
       assert.equal(at(after, p), undefined,
         name + "：**应当消失的字段还在盘上**（" + p + "）—— assign 只能加不能删");
     }
+    // **还要证明操作真的生效。**
+    // 只查"没有多余变化"的话，一个返回 ok:true 却什么都不写的实现照样通过 ——
+    // 差集为空，断言全绿。契约必须同时说清"该变的变成了什么"。
+    assertAfter(after, "正常路径");
   }
 
   // ② 无关噪音不许改变结果：加停用条目、加顶层扩展字段、调换数组顺序。
@@ -5982,6 +5988,8 @@ function registryContract({ name, build, run, allowed, mustVanish = [], addsEntr
     assert.ok(after.tasks.some((t) => t.logical_task_key === "unrelated-disabled"
       && t.enabled === false), name + "：**无关的停用条目被删了**");
     assert.equal(loadRegistry(file).ok, true, name + "：加噪音之后仍要读得回来");
+    // 换序噪音下同样要证明操作生效 —— 顺序变了还能改对，才说明定位是按身份走的。
+    assertAfter(after, "换序噪音路径");
   }
 
   // ③ 注入矛盾身份 → 必须 fail-closed，且**文件一个字节都不许动**。
@@ -6015,6 +6023,11 @@ test("语义差分契约：改显示名", () => {
     },
     run: ({ home }) => setTaskDisplayName({ threadId: THREAD_A, name: "新名", home }),
     allowed: ["tasks.*.task_display_name"],
+    assertAfter: (doc, where) => {
+      const t = doc.tasks.find((x) => x.codex_thread_id === THREAD_A);
+      assert.equal(t?.task_display_name, "新名",
+        where + "：**改动没落盘** —— 返回 ok 不等于写了东西");
+    },
   });
 });
 
@@ -6052,6 +6065,13 @@ test("语义差分契约：暂停与恢复 —— 删除语义必须落盘", () 
       "tasks.*.topic_generation_state.generations.*.claim_expires_at",
     ],
     mustVanish: ["tasks.0.paused_at"],
+    assertAfter: (doc, where) => {
+      const t = doc.tasks.find((x) => x.codex_thread_id === THREAD_A);
+      assert.equal(t?.status, "active", where + "：**状态没改成 active**");
+      assert.equal(Object.hasOwn(t ?? {}, "paused_at"), false,
+        where + "：**paused_at 还在** —— 删除语义没落盘");
+      assert.ok(t?.resumed_at, where + "：resumed_at 要写下来");
+    },
   });
 });
 
@@ -6078,6 +6098,11 @@ test("语义差分契约：新增 task", () => {
     // 新增会在数组末尾多一项 —— 允许清单只覆盖新增那一项。
     allowed: ["tasks.1", "tasks.2"],
     addsEntries: 1,
+    assertAfter: (doc, where) => {
+      const t = doc.tasks.find((x) => x.codex_thread_id === THREAD_B);
+      assert.ok(t, where + "：**新增的 task 不在盘上**");
+      assert.equal(t.task_display_name, "新增", where + "：新增内容要对");
+    },
   });
 });
 
@@ -6099,6 +6124,80 @@ test("坏表不许被写入口隐式修好 —— 修表是人的决定", () => 
   assert.equal(r.ok, false, "**坏表不许被隐式修好**");
   assert.equal(r.reason, "registry_malformed");
   assert.equal(fs.readFileSync(file, "utf-8"), before, "文件一个字节都不许动");
+});
+
+
+test("夹具写入口不许出现在生产代码里", () => {
+  // **上一版我在注释里写了"用途写死在名字"和"有一条测试盯着这件事"——
+  // 而函数还叫 writeRegistry，那条测试也不存在。**
+  // 又一次把设计意图写成了已实现的行为。现在名字和守卫都补上。
+  //
+  // 它不校验文档、从零重建顶层，是第二个能写出不可读文档的入口；
+  // 保留它只因为 86 处测试夹具要靠它构造初始状态（**包括故意构造坏表**）。
+  const roots = [path.join(ROOT, "scripts")];
+  const offenders = [];
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) { walk(full); continue; }
+      if (!e.name.endsWith(".mjs")) continue;
+      if (e.name === "test.mjs") continue;                    // 测试自己可以用
+      const src = fs.readFileSync(full, "utf-8");
+      for (const [i, line] of src.split("\n").entries()) {
+        // 跳过注释行 —— 这里刻意不做正则剥注释（`//` 在 file:// 里会骗人），
+        // 只看行首是不是注释符。
+        const t = line.trim();
+        if (t.startsWith("*") || t.startsWith("//")) continue;
+        if (!t.includes("writeRegistryFixtureUnvalidated")) continue;
+        // 定义本身和导出不算引用。
+        if (t.startsWith("export function writeRegistryFixtureUnvalidated")) continue;
+        offenders.push(path.relative(ROOT, full) + ":" + (i + 1) + "  " + t.slice(0, 60));
+      }
+    }
+  };
+  for (const r of roots) walk(r);
+  assert.deepEqual(offenders, [],
+    "**生产代码里出现了夹具写入口** —— 它不校验文档，会写出读不回来的登记表：\n  " +
+    offenders.join("\n  "));
+});
+
+test("唯一校验器要覆盖全部重复绑定字段 —— 读放行的和写放行的必须一致", () => {
+  // 评审实测：两条活动记录 key 分别是 a、b、codex_thread_id 相同时，
+  // loadRegistry 正确拒绝（duplicate_binding），validateRegistryDocument 却 ok:true，
+  // **于是"坏表被隐式修好"照旧存在** ——
+  // 我上一条测试恰好选了重复存储键，正好落在第一层校验里。
+  // **一个"共用校验器"只要还有第二份判据在外面，它就不叫共用。**
+  const base = (over) => ({
+    root: "/tmp/x", logical_task_key: "k", id: "k",
+    codex_thread_id: "01922222-3333-7444-8555-000000000001",
+    root_message_id: "om_1", session_id: "s1", ...over });
+
+  for (const field of ["logical_task_key", "codex_thread_id", "root_message_id", "session_id"]) {
+    const a = base({});
+    const b = base({ logical_task_key: "k2", id: "k2",
+      codex_thread_id: "01922222-3333-7444-8555-000000000002",
+      root_message_id: "om_2", session_id: "s2" });
+    b[field] = a[field];                     // 只让这一个字段撞上
+    if (field === "logical_task_key") b.id = a.id;
+    const doc = { schema_version: "1.0", runtime: "codex", tasks: [a, b] };
+
+    // 读那侧拒绝。
+    const home = temp();
+    const file = path.join(home, "registry.json");
+    fs.writeFileSync(file, JSON.stringify(doc, null, 2));
+    assert.equal(loadRegistry(file).ok, false, field + "：读那侧应当拒绝");
+    // **同一份校验器也要拒绝** —— 否则写那侧会放行。
+    assert.equal(validateRegistryDocument(doc).ok, false,
+      field + "：**共用校验器漏了这个字段**");
+
+    // 写入口：回调根本不许被执行，文件一个字节都不许动。
+    const before = fs.readFileSync(file, "utf-8");
+    let called = false;
+    const r = mutateRegistryDocument(file, (raw) => { called = true; raw.pop(); return true; });
+    assert.equal(r.ok, false, field + "：**坏表不许被隐式修好**");
+    assert.equal(called, false, field + "：**回调不许被执行** —— 校验要在它之前");
+    assert.equal(fs.readFileSync(file, "utf-8"), before, field + "：文件字节必须不变");
+  }
 });
 
 

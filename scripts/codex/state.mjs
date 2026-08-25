@@ -202,6 +202,21 @@ export function validateRegistryDocument(parsed) {
       detail: malformed.map((m) => "#" + m.index + "（" + m.why + "）").join("、"),
       entries: malformed };
   }
+  // **活动视图的重复绑定字段也归这一份。**
+  //
+  // 上一版 loadRegistry 调两个校验器，写入口只调了其中一个 —— 评审实测：
+  // 两条活动记录 key 分别是 a、b、codex_thread_id 相同时，
+  // loadRegistry 正确拒绝（duplicate_binding），validateRegistryDocument 却 ok:true，
+  // 于是"坏表被隐式修好"照旧存在，**只是我上一条测试恰好选了重复存储键，
+  // 正好落在第一层校验里**。
+  // 一个"共用校验器"只要还有第二份判据在外面，它就不叫共用。
+  const dup = validateRegistryTasks((parsed.tasks ?? []).filter(
+    (t) => t && typeof t === "object" && t.enabled !== false));
+  if (!dup.ok) {
+    return { ok: false, reason: "duplicate_binding",
+      detail: "重复绑定字段：" + dup.duplicateFields.join("、"),
+      duplicateFields: dup.duplicateFields };
+  }
   return { ok: true };
 }
 export function loadRegistry(file = registryFile()) {
@@ -239,8 +254,6 @@ export function loadRegistry(file = registryFile()) {
     tasks.push({ ...raw, id: Object.hasOwn(raw, "id") ? raw.id : raw.logical_task_key });
   }
 
-  const valid = validateRegistryTasks(tasks);
-  if (!valid.ok) return { ok: false, file, tasks: [], ...valid };
   return { ok: true, file, tasks, schemaVersion: parsed.schema_version ?? "1.0" };
 }
 
@@ -250,7 +263,7 @@ export function loadRegistry(file = registryFile()) {
  * ■ 为什么必须这样
  *
  * loadRegistry 返回的是**过滤后的活动视图**（停用条目已经不在里面）。
- * 而此前七个写路径都是"改视图里的对象 → writeRegistry(reg.tasks)"——
+ * 而此前七个写路径都是"改视图里的对象 → writeRegistryFixtureUnvalidated(reg.tasks)"——
  * 后者从零重建 `{schema_version, runtime, tasks}`。两件事叠在一起：
  *   · 停用条目**被静默删掉**；
  *   · 顶层未知字段**被静默删掉**；
@@ -323,10 +336,6 @@ export function mutateRegistryDocument(file, mutate) {
   // 写入把一份自己都读不回来的文档固化下来，比拒绝写入糟得多。
   const verdict = validateRegistryDocument({ ...parsed, tasks: raw });
   if (!verdict.ok) return { ok: false, ...verdict };
-  const dup = validateRegistryTasks(raw.filter((t) => t && t.enabled !== false));
-  if (!dup.ok) {
-    return { ok: false, reason: "duplicate_binding_fields", fields: dup.duplicateFields };
-  }
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   // **顶层原样保留** —— 只换 tasks。
   const next = { ...parsed, tasks: raw };
@@ -369,8 +378,12 @@ export function findRawTask(raw, task) {
 /**
  * **只给测试用的夹具写入口。生产路径一律走 mutateRegistryDocument。**
  *
+ * 名字里带 FixtureUnvalidated 是刻意的：上一版我只在注释里写"用途写死在名字"
+ * 和"有一条测试盯着这件事"——**而函数还叫 writeRegistry，那条测试也不存在**。
+ * 又一次把设计意图写成了已实现的行为。现在名字和守卫都补上了。
+ *
  * 它从零重建 { schema_version, runtime, tasks } —— 顶层未知字段会丢，
- * 而且不走完整文档校验：评审实测 writeRegistry([{ x: 1 }]) 成功、
+ * 而且不走完整文档校验：评审实测 writeRegistryFixtureUnvalidated([{ x: 1 }]) 成功、
  * 随后 loadRegistry 直接 registry_malformed。
  * 只要它还是一个不校验的公开写入口，"唯一写入口"这句话就不成立。
  *
@@ -378,7 +391,7 @@ export function findRawTask(raw, task) {
  * 那是合法用途。所以这里不加校验，而是把用途写死在名字和这段话里：
  * **生产代码里再出现它就是错的**，有一条测试盯着这件事。
  */
-export function writeRegistry(tasks, file = registryFile()) {
+export function writeRegistryFixtureUnvalidated(tasks, file = registryFile()) {
   const valid = validateRegistryTasks(tasks);
   if (!valid.ok) throw new Error("registry 存在重复绑定字段：" + valid.duplicateFields.join(", "));
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });

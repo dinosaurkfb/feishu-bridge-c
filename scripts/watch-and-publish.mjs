@@ -137,10 +137,13 @@ while (true) {
       const pendingOutbox = (publishLock.ok && !outboxBlocked)
         ? listPending({ outboxDir: OUTBOX }) : [];
       if (outboxBlocked) {
+        // **措辞要收窄。**上一版无条件说"执行结果照常发"，
+        // 而真正发不发还受 run.shouldPublish 和自动发布开关约束 ——
+        // 说死了就会在它其实没发的时候骗人。
         console.error("本地 outbox 有问题（" + outboxBlocked.reason +
           ((outboxBlocked.files ?? []).length ? "：" + outboxBlocked.files.join("、") : "") +
-          "）——**这一批 outbox 内容没有发送**，本轮执行结果照常发。" +
-          "这不是飞书故障，重试没用。");
+          "）——**这一批 outbox 内容没有发送**（这不是飞书故障，重试没用）。" +
+          "本轮执行结果不受影响，按原有条件处理。");
       }
 
       const records = [];

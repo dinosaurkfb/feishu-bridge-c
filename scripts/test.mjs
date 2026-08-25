@@ -11295,7 +11295,7 @@ test("真实 Stop 钩子会把「非当前项目」说出来 —— 纯函数对
     JSON.stringify({ project_dir: proj, logical_task_key: "k",
       project_display_name: "A", task_display_name: "A" }));
   fs.writeFileSync(path.join(proj, ".runtime-data", "outbound", "outbox", "0001.json"),
-    JSON.stringify({ kind: "progress", text: "x", published_at: null }));
+    JSON.stringify(outboxRecord({ text: "x" })));
   const reg = path.join(dir, "registry.json");
   fs.writeFileSync(reg, JSON.stringify({
     schema_version: "1.0", projects: [{ id: "projA", root: proj, name: "A" }] }));
@@ -11536,25 +11536,133 @@ test("Stop 文案：本地损坏不许说成「发布失败」，也不许提兜
   assert.equal(/兜底定时器会重试/u.test(said), false, "**不许暗示重试能解决**");
 });
 
-test("watcher 的例外：outbox 整批拒绝，但当轮 run 结果照发", () => {
-  // 评审给的例外：run 结果不是 outbox 记录，它有独立来源和回执 ——
-  // 因为本地 outbox 里躺着一个坏文件就扣着执行结果不发，代价大得多。
-  // 但 outbox 那一半必须**整批拒绝并点名**，不许"跳过坏的、把其余照发"。
-  const src = fs.readFileSync(path.resolve("scripts", "watch-and-publish.mjs"), "utf-8");
-  // 结构断言：三件事必须同时成立，逐条验，不是"这段文字里提到了它"。
-  assert.match(src, /outboxMutationBlocker\(auditOutbox\(OUTBOX\)\)/u,
-    "**要走统一守卫**，不是自己再判一次");
-  assert.match(src, /const pendingOutbox = \(publishLock\.ok && !outboxBlocked\)/u,
-    "**被拦下时不许把 outbox 记录带进这一批**");
-  const guard = src.slice(src.indexOf("if (outboxBlocked)"));
-  assert.match(guard.slice(0, 400), /没有发送/u, "要说清 outbox 那一半没发");
-  assert.match(guard.slice(0, 400), /本轮执行结果照常发/u, "**要说清 run 结果照发**");
-  assert.match(guard.slice(0, 400), /不是飞书故障/u, "不许把本地问题说成飞书故障");
-  // run 结果那一支不受 outboxBlocked 影响 —— 它在 records 里是独立分支。
-  const runBranch = src.slice(src.indexOf("if (run?.shouldPublish)"),
-    src.indexOf("records.push(...pendingOutbox)"));
-  assert.equal(/outboxBlocked/u.test(runBranch), false,
-    "**run 结果那一支不许被 outbox 的状态左右**");
+test("watcher 的例外：坏 outbox 整批不发，run 结果按原有条件处理（真实进程）", () => {
+  // 评审指出上一版这条测试是**读源码匹配正则** —— 那不是"真实入口"。
+  // 现在真跑 watch-and-publish 进程，验四件事：
+  //   · 损坏 outbox 不发布、不落标
+  //   · run 结果仍按原有发布条件处理
+  //   · 损坏文件一个字节不变
+  //   · 不触网
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-l6-watch-"));
+  const rt = path.join(dir, ".runtime-data", "inbound");
+  const runs = path.join(rt, "runs");
+  const claims = path.join(rt, "delivery-claims");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  for (const d of [rt, runs, claims, obDir]) fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(rt, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P",
+    // **不触网的兜底**：指向一个不存在的二进制，真发起来必然失败且不出网。
+    lark_cli_bin: path.join(dir, "no-such-lark-cli"),
+    auto_publish_on_completion: false,        // run 结果那一支按原有条件：这里是关的
+  }));
+  fs.writeFileSync(path.join(rt, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_fixture", claude_session_id: null,
+    channel_generation_id: "gen-1",
+  }));
+  // 一条好记录 + 一份坏 JSON —— 整批都不许发。
+  const good = path.join(obDir, "0001.json");
+  fs.writeFileSync(good, JSON.stringify(outboxRecord({ text: "好的" })));
+  const bad = path.join(obDir, "0002.json");
+  fs.writeFileSync(bad, "{ 这不是 JSON");
+  const badBefore = fs.readFileSync(bad, "utf-8");
+
+  const key = "k".repeat(64);
+  fs.writeFileSync(path.join(runs, key + ".jsonl"),
+    JSON.stringify({ type: "result", is_error: false, result: "这一轮的结果" }) + "\n");
+
+  const r = spawnSync(process.execPath,
+    [path.resolve("scripts", "watch-and-publish.mjs"), key, dir],
+    { encoding: "utf-8", env: { ...process.env, HOME: dir }, timeout: 60_000 });
+
+  const all = (r.stdout ?? "") + (r.stderr ?? "");
+  assert.match(all, /本地 outbox 有问题/u, "**要点名本地 outbox 有问题**：" + all.slice(0, 300));
+  assert.match(all, /0002\.json/u, "要点名是哪个文件");
+  assert.match(all, /不是飞书故障/u);
+  // **措辞要收窄**：不许无条件说"执行结果照常发" —— 它还受开关和 shouldPublish 约束。
+  assert.equal(/执行结果照常发/u.test(all), false, "不许把「照常发」说死");
+
+  // 坏文件一个字节不变；好记录也不许被标记已发（整批不动）。
+  assert.equal(fs.readFileSync(bad, "utf-8"), badBefore, "**损坏文件不许被动**");
+  assert.equal(JSON.parse(fs.readFileSync(good, "utf-8")).published_at, null,
+    "**好的那条也不许被单独发掉**");
+  // 不触网：那个 lark-cli 根本不存在，真调了会留下痕迹。
+  assert.equal(fs.existsSync(path.join(dir, "no-such-lark-cli")), false);
+});
+
+test("排空 CLI 要点名 —— 不许打出「undefined」", () => {
+  // 评审实测真实 CLI 输出：
+  //   排空失败（outbox_unexplainable），进展留在 outbox：undefined
+  // 没有文件名、没有坏在哪，等于没兑现"整批拒绝并点名"；
+  // 而且"排空失败"会把人支去查飞书。
+  const { dir } = drainFixture({
+    "0001.json": outboxRecord({ text: "好的" }),
+    "0002.json": "{ 这不是 JSON",
+  });
+  const r = spawnSync(process.execPath,
+    [path.resolve("scripts", "drain-outbox.mjs"), "--project", dir],
+    { encoding: "utf-8", env: { ...process.env, HOME: dir } });
+  const all = (r.stdout ?? "") + (r.stderr ?? "");
+  assert.notEqual(r.status, 0, "本地问题要非零退出");
+  assert.match(all, /0002\.json/u, "**要点名是哪个文件**：" + all.slice(0, 300));
+  assert.match(all, /本地记录的问题/u, "要说清是本地问题");
+  assert.equal(/undefined/u.test(all), false, "**不许打出 undefined**");
+  // 「排空失败」会把人支去查飞书 —— 本地问题不该用这个词。
+  assert.equal(/排空失败/u.test(all), false, "本地问题不许说成排空失败");
+});
+
+test("outbox 读不出来时不许说成「0 处说不清」", () => {
+  // 统一守卫对读取失败返回 count: 0，照着"N 处"的模板渲染会打出"0 处说不清" ——
+  // 那句话既不成立、也没法照着排查。
+  // **"目录读不出来"和"某几条记录解释不了"要分开说。**
+  const { dir, obDir } = drainFixture({ "0001.json": outboxRecord({ text: "x" }) });
+  // 把 outbox 换成一个普通文件 —— 它不是目录。
+  fs.rmSync(obDir, { recursive: true });
+  fs.writeFileSync(obDir, "我不是目录");
+  const r = spawnSync(process.execPath,
+    [path.resolve("scripts", "drain-outbox.mjs"), "--project", dir],
+    { encoding: "utf-8", env: { ...process.env, HOME: dir } });
+  const all = (r.stdout ?? "") + (r.stderr ?? "");
+  assert.notEqual(r.status, 0);
+  assert.match(all, /不是目录/u, "**要说清是目录本身的问题**：" + all.slice(0, 300));
+  assert.equal(/0 处说不清/u.test(all), false, "**不许打出「0 处说不清」**");
+});
+
+test("只有坏 JSON 的 outbox 不许被报成「空」", () => {
+  // 评审实测三种，全都被报成 empty 或完全无输出：
+  //   · outbox 只有一份坏 JSON → drainProject 返回 {status:"empty"}
+  //   · outbox 路径是普通文件 → 仍返回 empty
+  //   · 真实 Stop 面对这种 outbox → **完全无输出**
+  // 根因是"空"的判断跑在审计之前，而 listPending 把这些都吞了。
+  const { dir } = drainFixture({ "0001.json": "{ 这不是 JSON" });
+  let published = 0;
+  const send = () => { published += 1; return "om_x"; };
+  const diag = () => ({ kind: PUBLISH_FAILURE.TRANSIENT });
+  const r = drainProject({
+    root: dir, publish: send, diagnose: diag,
+  });
+  assert.notEqual(r.status, "empty", "**读不出来不等于没有东西可发**");
+  assert.equal(r.status, "error");
+  assert.equal(r.local, true);
+  assert.equal(published, 0, "零发布器调用");
+
+  // 真实 Stop 也必须出声，而不是静默退出。
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-l6-h2-"));
+  const registryFile = path.join(home, "registry.json");
+  fs.writeFileSync(registryFile, JSON.stringify({ projects: [{
+    id: "l6b", root: dir, name: "P", root_message_id: "om_fixture",
+    expires_at: "2099-01-01T00:00:00Z",
+  }] }));
+  const stopHook = path.join(path.resolve("scripts"), "stop-hook.mjs");
+  const st = spawnSync(process.execPath, [stopHook], {
+    input: JSON.stringify({ session_id: "s1", cwd: dir, last_assistant_message: "本轮答复" }),
+    encoding: "utf-8",
+    env: { ...process.env, FEISHU_BRIDGE_REGISTRY: registryFile, HOME: home },
+  });
+  const said = (st.stdout ?? "") + (st.stderr ?? "");
+  assert.notEqual(said.trim(), "", "**Stop 不许完全不出声**");
+  assert.match(said, /本地记录的问题/u);
+  assert.match(said, /0001\.json/u, "要点名");
 });
 
 

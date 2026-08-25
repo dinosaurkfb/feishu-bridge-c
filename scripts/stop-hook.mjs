@@ -116,7 +116,7 @@ async function main() {
   });
   if (attributed.length === 0) process.exit(0);
 
-  const { drainProject, watcherActive, outboxDirOf, suppressCmd } =
+  const { drainProject, localOutboxMessage, watcherActive, outboxDirOf, suppressCmd } =
     await import("./drain-outbox.mjs");
   const { foreignHint, projectLabel } = await import("./stop-note.mjs");
   const { resolveProject } = await import("./project-resolve.mjs");
@@ -289,12 +289,7 @@ async function main() {
       // 也不说"兜底定时器会重试"：重试多少次都一样，它需要人来看。
       //
       // 判据只有统一守卫一份 —— 这里只负责把它的结论讲清楚。
-      const which = (r.files ?? []).length ? "（" + r.files.join("、") + "）" : "";
-      const why = (r.details ?? []).map((d) => "    " + d.file + " —— " + d.why).join("\n");
-      notes.push("飞书出站：" + who + " 的本地 outbox 有 " + (r.count ?? 0) +
-        " 处说不清" + which + "。\n" +
-        "  **这不是发布失败，是本地记录的问题** —— 重试没用，需要人看一眼。整批都没有动。" +
-        (why ? "\n" + why : ""));
+      notes.push("飞书出站：" + who + " 的" + localOutboxMessage(r));
     } else if (r.status === "error") {
       notes.push("飞书出站：" + who + " 发布失败（" + r.reason + "），进展留在 outbox，兜底定时器会重试。");
     } else if (r.status === "skipped" && r.reason === "auto_publish_disabled") {

@@ -116,9 +116,12 @@ export function ageText(iso, now = Date.now()) {
  * 换成可见占位符而不是删掉 —— **"这里原本有东西"本身是信息**。
  */
 export function sanitizeForDisplay(text) {
+  // **双向控制符用 Unicode 属性，不手数码位。**
+  // 上一版手写区间漏了 U+061C（ARABIC LETTER MARK）—— 评审把它放进坏文件名，
+  // 真实 CLI 的 stdout 原样带出来了。手数码位这条路的错误模式就是"漏掉的那个"，
+  // 跟摘要手挑字段是同一类问题：补一个还有下一个。
   return String(text ?? "").replace(
-    /[\u0000-\u001F\u007F-\u009F\u2028\u2029\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu,
-    "\uFFFD");
+    /[\u0000-\u001F\u007F-\u009F\u2028\u2029]|\p{Bidi_Control}/gu, "\uFFFD");
 }
 
 /**
@@ -348,8 +351,12 @@ function main() {
   let trouble = false;
   const readable = got.tasks.filter((t) => t.readable && t.unclassified.length === 0);
   const total = readable.reduce((n, t) => n + t.records.length, 0);
+  // **这里曾经内嵌过一个 \n** —— 而输出边界的规则正是我自己在同一个文件里定的：
+  // 格式串不许带换行。净化器把它换成了 U+FFFD，真实输出首行成了"积压 1 条。<?>"。
+  // 空行单独发一次。
   say("积压 " + total + " 条" +
-    (readable.length === got.tasks.length ? "" : "（另有 task 读不全，见下）") + "。\n");
+    (readable.length === got.tasks.length ? "" : "（另有 task 读不全，见下）") + "。");
+  say("");
 
   for (const t of got.tasks) {
     say("【" + t.name + "】" + (t.taskKey ? t.taskKey : ""));

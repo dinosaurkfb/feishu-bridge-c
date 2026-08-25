@@ -146,68 +146,75 @@ export function loadRegistry(file = registryFile()) {
   }
   const tasks = [];
   const malformed = [];
+  const entries = [];
   for (const [i, task] of (parsed.tasks ?? []).entries()) {
-    // **停用的条目才允许被跳过；畸形的必须说出来。**
-    //
-    // 上一版对 null、字符串、缺 root/key 的对象一律 continue，最终返回
-    // ok:true 加一张空表 —— 评审实测 tasks:[null]、["x"]、[{foo:"bar"}]
-    // 都被解释成"正常的空登记表"，定位层于是误报 task_not_found。
-    // **静默过滤等于把「表坏了」说成「表是空的」**，人会去重新绑定，
-    // 而真正该做的是看一眼这张表。
-    if (task && typeof task === "object" && !Array.isArray(task) && task.enabled === false) {
-      continue;
-    }
-    if (!task || typeof task !== "object" || Array.isArray(task)) {
+    entries.push({ index: i, raw: task });
+  }
+
+  // ■ 第一遍：**身份**。覆盖整张原始表，**含停用条目**。
+  //
+  // 上一版在判重之前就把停用条目 continue 掉了 —— 评审实测：
+  // 一条停用 task 和一条启用 task 用完全相同的 key，loadRegistry 仍报 ok，
+  // 两者的 outbox 和锁路径完全相同，**启用的那条会去动停用那条的历史内容**。
+  // 停用不代表它不占存储身份：目录还在，里面的东西还在。
+  const derived = new Map();
+  const ids = new Map();
+  for (const { index: i, raw } of entries) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
       malformed.push({ index: i, why: "不是 task 对象" }); continue;
     }
-    if (typeof task.root !== "string" || !path.isAbsolute(task.root)) {
+    // **停用的条目只查"它占不占存储身份"。**
+    //
+    // 判据要精确到这一点：停用不代表它不占目录（目录还在，里面的东西还在），
+    // 但一条连 key 都没有的停用条目跟谁都撞不上，没有理由把整张表判坏。
+    // 启用的条目仍然全查。
+    const disabled = raw.enabled === false;
+    const hasKey = typeof raw.logical_task_key === "string" && raw.logical_task_key !== "";
+    if (disabled && !hasKey) continue;
+    if (!disabled && (typeof raw.root !== "string" || !path.isAbsolute(raw.root))) {
       malformed.push({ index: i, why: "root 不是绝对路径" }); continue;
     }
-    if (typeof task.logical_task_key !== "string" || !task.logical_task_key) {
+    if (!hasKey) {
       malformed.push({ index: i, why: "缺 logical_task_key" }); continue;
     }
-    // **key 的字符集要跟生成端一致。**
-    //
-    // 存储目录是 safeKey(logical_task_key) 算出来的，它把非法字符统一换成 `_`。
-    // 于是 `a/b` 和 `a?b` 会落到同一个 tasks/a_b/ —— **两条 task 的 outbox
-    // 和锁混在一起**，而登记表照样报 ok。评审实测复现。
-    // 生成端本来就只产 [A-Za-z0-9_-]+，读取端要求同一条规矩。
-    if (!/^[A-Za-z0-9_-]+$/u.test(task.logical_task_key)) {
+    // **key 的字符集要跟生成端一致。**存储目录是 safeKey(key) 算出来的，
+    // 它把非法字符统一换成 `_`：`a/b` 和 `a?b` 会落到同一个 tasks/a_b/。
+    if (!/^[A-Za-z0-9_-]+$/u.test(raw.logical_task_key)) {
       malformed.push({ index: i, why: "logical_task_key 含非法字符（只允许 A-Za-z0-9_-）" });
       continue;
     }
-    tasks.push({ ...task, id: task.id ?? task.logical_task_key });
-  }
-  // **派生出来的存储键也必须唯一。**字符集收紧之后一般不会撞，
-  // 但唯一性是这里要保证的性质，不能靠"字符集大概够用"来间接成立。
-  const derived = new Map();
-  const ids = new Map();
-  for (const [i, t] of tasks.entries()) {
-    // **按目标文件系统的等价关系判重，不是按字符串相等。**
-    // 本机默认大小写不敏感：Task-A 和 task-a 是两个不同的 key，
-    // 却指向**同一个 inode** —— outbox 和锁照样混在一起。评审实测复现。
-    const key = safeKey(t.logical_task_key).toLowerCase();
-    if (derived.has(key)) {
+    // **按目标文件系统的等价关系判重。**本机默认大小写不敏感：
+    // Task-A 和 task-a 是两个不同的 key，却指向同一个 inode。
+    const storage = safeKey(raw.logical_task_key).toLowerCase();
+    if (derived.has(storage)) {
       malformed.push({ index: i,
-        why: "存储键与 #" + derived.get(key) + " 在大小写折叠后相同（都是 " + key + "）" });
+        why: "存储键与 #" + derived.get(storage) + " 在大小写折叠后相同（都是 " + storage + "）" });
     } else {
-      derived.set(key, i);
+      derived.set(storage, i);
     }
-    // **id 不许自带一个跟 key 不一致的值。**
-    // 读取端原样保留已有 id，于是两条不同 key、相同 id 的 task
-    // binding_id 会撞成同一个。id 要么缺（补成 key），要么必须等于 key。
-    const rawId = t.id;
-    if (rawId !== undefined && rawId !== t.logical_task_key) {
+    // **id：缺失才补；存在就必须等于 key。**
+    // 用 Object.hasOwn 判"存在"，不能用 ?? —— 那会把显式的 "id": null
+    // 当成缺失并静默改成 key，而显式空值是**说不清**，不是缺省。
+    if (Object.hasOwn(raw, "id") && raw.id !== raw.logical_task_key) {
       malformed.push({ index: i,
-        why: "id 与 logical_task_key 不一致（id=" + String(rawId).slice(0, 40) + "）" });
+        why: "id 与 logical_task_key 不一致（id=" + JSON.stringify(raw.id).slice(0, 40) + "）" });
       continue;
     }
-    if (ids.has(t.logical_task_key)) {
-      malformed.push({ index: i, why: "id 与 #" + ids.get(t.logical_task_key) + " 相同" });
+    if (ids.has(raw.logical_task_key)) {
+      malformed.push({ index: i, why: "id 与 #" + ids.get(raw.logical_task_key) + " 相同" });
     } else {
-      ids.set(t.logical_task_key, i);
+      ids.set(raw.logical_task_key, i);
     }
   }
+
+  // ■ 第二遍：**过滤**。身份都验过了，这里才轮到"停用的不参与后续"。
+  for (const { raw } of entries) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    if (raw.enabled === false) continue;
+    if (typeof raw.logical_task_key !== "string" || !raw.logical_task_key) continue;
+    tasks.push({ ...raw, id: Object.hasOwn(raw, "id") ? raw.id : raw.logical_task_key });
+  }
+
   if (malformed.length > 0) {
     return { ok: false, file, tasks: [], reason: "registry_malformed",
       detail: malformed.map((m) => "#" + m.index + "（" + m.why + "）").join("、"),

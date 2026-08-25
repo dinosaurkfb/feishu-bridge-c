@@ -5603,6 +5603,116 @@ test("时间展示也走规范判据 —— 不许一边说解释不了、一边
 });
 
 
+test("停用条目也占存储身份 —— 判重要在过滤之前", () => {
+  // 评审实测：一条**停用** task 和一条启用 task 用完全相同的 key，
+  // loadRegistry 仍报 ok，两者 outbox/锁路径完全相同 ——
+  // **启用的那条会去动停用那条的历史内容。**
+  // 停用不代表它不占目录：目录还在，里面的东西还在。
+  const write = (tasks) => {
+    const home = temp();
+    const f = path.join(home, "registry.json");
+    fs.writeFileSync(f, JSON.stringify({ tasks }));
+    return f;
+  };
+
+  const clash = loadRegistry(write([
+    { root: "/tmp/a", logical_task_key: "same-key", id: "same-key", enabled: false },
+    { root: "/tmp/b", logical_task_key: "same-key", id: "same-key" },
+  ]));
+  assert.equal(clash.ok, false, "**停用的那条也要参与判重**");
+  assert.equal(clash.reason, "registry_malformed");
+  assert.match(clash.detail, /#0/u, "要指回原始索引，不是过滤之后的位置");
+
+  // 大小写折叠同理 —— 停用那条也算。
+  assert.equal(loadRegistry(write([
+    { root: "/tmp/a", logical_task_key: "Same-Key", id: "Same-Key", enabled: false },
+    { root: "/tmp/b", logical_task_key: "same-key", id: "same-key" },
+  ])).ok, false, "折叠后相同也要拦");
+
+  // 但一条连 key 都没有的停用条目跟谁都撞不上 —— 不该把整张表判坏。
+  assert.equal(loadRegistry(write([{ enabled: false }])).ok, true, "无 key 的停用不算畸形");
+  assert.equal(loadRegistry(write([
+    { enabled: false },
+    { root: "/tmp/b", logical_task_key: "k", id: "k" },
+  ])).tasks.length, 1, "停用的不进结果集");
+});
+
+test("id 的缺失与显式空值是两回事", () => {
+  // 评审：用 ?? 补写 id，使显式的 "id": null 被当成"字段缺失"并静默改成 key。
+  // 契约是"缺失才补；存在则必须等于 key" —— **显式空值是说不清，不是缺省**。
+  const write = (task) => {
+    const home = temp();
+    const f = path.join(home, "registry.json");
+    fs.writeFileSync(f, JSON.stringify({ tasks: [task] }));
+    return f;
+  };
+  const missing = loadRegistry(write({ root: "/tmp/a", logical_task_key: "k" }));
+  assert.equal(missing.ok, true, "缺失是合法的");
+  assert.equal(missing.tasks[0].id, "k", "缺失才补成 key");
+
+  for (const bad of [null, "", 0, false]) {
+    const got = loadRegistry(write({ root: "/tmp/a", logical_task_key: "k", id: bad }));
+    assert.equal(got.ok, false, JSON.stringify(bad) + " 竟然被当成缺失");
+    assert.match(got.detail, /id 与 logical_task_key 不一致/u);
+  }
+  // 显式且相等 → 合法。
+  assert.equal(loadRegistry(write({ root: "/tmp/a", logical_task_key: "k", id: "k" })).ok, true);
+});
+
+test("净化覆盖全部双向控制符，包括 U+061C", () => {
+  // 评审把 U+061C（ARABIC LETTER MARK）放进坏文件名，真实 CLI 原样带了出来。
+  // **手数码位的错误模式就是"漏掉的那个"** —— 改用 Unicode Bidi_Control 属性。
+  const ALM = String.fromCharCode(0x061c);
+  assert.equal(sanitizeForDisplay("a" + ALM + "b").includes(ALM), false, "U+061C 漏出去了");
+  // 属性覆盖的其余码位也要过。
+  for (const cp of [0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
+    0x2066, 0x2067, 0x2068, 0x2069]) {
+    const ch = String.fromCodePoint(cp);
+    assert.equal(sanitizeForDisplay("a" + ch + "b").includes(ch), false,
+      "U+" + cp.toString(16) + " 漏出去了");
+  }
+
+  // 真实 CLI：文件名里带 U+061C 也不许漏。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "T",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const ob = taskPaths(task, home).outbox;
+  fs.mkdirSync(ob, { recursive: true });
+  fs.writeFileSync(path.join(ob, "evil" + ALM + "name.json"), "{ 坏的");
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.equal((r.stdout + r.stderr).includes(ALM), false, "**文件名里的 U+061C 不许漏**");
+});
+
+test("输出边界的规矩自己也要守：不许内嵌换行", () => {
+  // 我在这个文件里定了"格式串不许带换行"，然后在同一个文件里破了它 ——
+  // 净化器把那个 \n 换成了 U+FFFD，真实输出首行成了"积压 1 条。<?>"。
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "T",
+    rootMessageId: "om_root", token: "a1b2c3" });
+  writeRegistry([task], path.join(home, "registry.json"));
+  const ob = taskPaths(task, home).outbox;
+  fs.mkdirSync(ob, { recursive: true });
+  fs.writeFileSync(path.join(ob, "0001.json"), JSON.stringify(outboxRecord({
+    kind: "reply", text: "一条" })));
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.includes(String.fromCharCode(0xfffd)), false,
+    "**正常输出里不许出现占位符** —— 出现就说明格式串自己带了控制字符：" +
+    r.stdout.split("\n")[0]);
+  assert.match(r.stdout.split("\n")[0], /^积压 1 条。$/u, "首行要干净");
+});
+
+
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (failed > 0) process.exit(1);

@@ -228,8 +228,15 @@ async function main() {
       }
     }
 
-    // 空 outbox 的项目连守望者都不用问 —— 这是最常见的情况，越早返回越好。
-    if (listPending({ outboxDir }).length === 0) continue;
+    // **不许在这里自己判"空"。**
+    //
+    // listPending 把目录错误吞成 []、把坏 JSON 静默跳过 —— 于是
+    // "只有一份坏文件"的 outbox 在这里就被 continue 掉了，Stop 完全不出声。
+    // 评审用**不带答复**的真实 Stop 进程复现：stdout 空、stderr 空、坏文件还在。
+    //
+    // 判断委托给已经修正的 drainProject：它先审计、再谈空不空。
+    // 代价是常见的"真空"项目多走一次审计（一次 readdir），
+    // 换掉的是"读不出来被当成没有东西可发"这一整类。
 
     // **弱信号归属的项目：只在这一轮真给它写过东西时才排空。**
     //

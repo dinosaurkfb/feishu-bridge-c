@@ -232,10 +232,11 @@ export function drainProject({
   try {
     // 锁内重新读一遍：刚才排队等锁的时候，别的发布者可能已经把这批发掉了。
     // **取锁之后再审计一次** —— 锁外那次和这次之间，别人可能刚写进来一个坏文件。
-    // 顺序同样是"审计在空之前"：先确认目录说得清，再谈里面有没有东西。
-    const pending = listPending({ outboxDir });
-
-    // **这个 outbox 现在能不能动 —— 只认统一守卫。**
+    //
+    // **读取也放在审计之后**：上一版注释写"先审计"、实际先 listPending，
+    // 空结论确实在审计之后所以不影响安全，但**注释比实现完整**这件事本身
+    // 就是下一个缺陷的入口 —— 这条线上已经因此栽过。
+    // **这个 outbox 现在能不能动 —— 只认统一守卫。
     //
     // 取舍是明确的：**不要静默跳过单个坏文件后把其余照发**。
     // 对"本次选择的这一批"整批 fail-closed 并点名；
@@ -246,6 +247,7 @@ export function drainProject({
     // 而"两份判据"正是这条线上被反复罚过的东西。
     const blocked = outboxMutationBlocker(auditOutbox(outboxDir));
     if (blocked) return { status: "error", root, ...blocked, local: true };
+    const pending = listPending({ outboxDir });
     if (pending.length === 0) return { status: "empty", root };
 
     const targetBatches = groupByTargetGeneration(pending).flatMap(([targetKey, records]) => {

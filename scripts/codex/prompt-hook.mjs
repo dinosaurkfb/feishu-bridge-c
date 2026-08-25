@@ -12,6 +12,7 @@ import {
 import { storeTurnInput } from "../turn-input.mjs";
 import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
 import { codexRuntimeRoot } from "../runtime-install.mjs";
+import { issueIntent } from "./intent.mjs";
 
 /**
  * 不带参数的控制命令 —— **只有这一份清单**。
@@ -86,29 +87,39 @@ export function isAilyInvocation(env = process.env) {
  * 模板是机器级配置，会漂；runtime/current 是安装器刚校验过的那一份。
  * **命令路径的唯一事实来源只能是后者。**
  */
+/**
+ * 把凭证拼进命令。**没有凭证时拼空串** —— 让脚本自己拒，
+ * 而不是在这里悄悄给一条不带凭证的命令。
+ */
+/** 有副作用的动作 —— **只有这些需要凭证**。只读的多发一张就多一个能被误用的东西。 */
+const WRITE_ACTIONS = new Set(["bind", "unbind", "rotate", "mode"]);
+
+const intentArg = (intentId) =>
+  typeof intentId === "string" && intentId ? " --intent " + shellQuote(intentId) : "";
+
 const runtimeScriptsRoot = () =>
   path.join(codexRuntimeRoot(process.env.CODEX_HOME || path.join(os.homedir(), ".codex")),
     "current");
 
-export function composeBindingContext({ bridgeRoot, cwd, threadId, chatName }) {
+export function composeBindingContext({ bridgeRoot, cwd, threadId, chatName, intentId }) {
   const apply = path.join(bridgeRoot, "scripts", "codex", "bind-task.mjs");
   return [
     "[Codex 飞书桥] 当前任务的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
     "用户本轮显式运行了 $feishu-bind；该命令本身就是创建根话题并登记当前 task 的授权，无需再次预览或确认。",
     "直接运行以下幂等绑定命令：",
     "`" + nodeCommandPrefix(apply) + " --project " + shellQuote(cwd) +
-      " --thread-id " + shellQuote(threadId) + " --apply`",
+      " --thread-id " + shellQuote(threadId) + " --apply" + intentArg(intentId) + "`",
     "目标群：" + (chatName ?? "机器级配置中的群") + "。若已接入则不得重复建话题；若已暂停则只恢复原连接。",
   ].join("\n");
 }
 
-export function composeUnbindContext({ bridgeRoot, threadId }) {
+export function composeUnbindContext({ bridgeRoot, threadId, intentId }) {
   const command = path.join(bridgeRoot, "scripts", "codex", "feishu-unbind.mjs");
   return [
     "[Codex 飞书桥·暂停接入] 用户通过 $feishu-unbind 明确要求撤销当前 task 的飞书接入。",
     "当前 task 的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
     "只运行以下可恢复的本地暂停命令：",
-    "`" + nodeCommandPrefix(command) + " --thread-id " + shellQuote(threadId) + " --apply`",
+    "`" + nodeCommandPrefix(command) + " --thread-id " + shellQuote(threadId) + " --apply" + intentArg(intentId) + "`",
     "命令不会向飞书发送消息或删除话题；不要直接编辑 registry，也不要把 locator 输出给用户。",
   ].join("\n");
 }
@@ -139,18 +150,18 @@ export function composeSubscribeContext({ bridgeRoot, threadId }) {
   ].join("\n");
 }
 
-export function composeRotateContext({ bridgeRoot, threadId }) {
+export function composeRotateContext({ bridgeRoot, threadId, intentId }) {
   const command = path.join(bridgeRoot, "scripts", "codex", "feishu-rotate.mjs");
   return [
     "[Codex 飞书桥·话题轮转] 用户通过 $feishu-rotate 明确授权为当前精确 task 创建下一话题代际。",
     "当前 task 的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
     "直接运行以下两阶段轮转命令，不要再次要求确认：",
-    "`" + nodeCommandPrefix(command) + " --thread-id " + shellQuote(threadId) + " --apply`",
+    "`" + nodeCommandPrefix(command) + " --thread-id " + shellQuote(threadId) + " --apply" + intentArg(intentId) + "`",
     "新话题完成首次真实 mention 认领前，旧话题继续 active；认领成功后旧话题只读。不得删除旧话题或直接编辑 registry。",
   ].join("\n");
 }
 
-export function composeModeContext({ bridgeRoot, threadId, mode = null }) {
+export function composeModeContext({ bridgeRoot, threadId, mode = null , intentId }) {
   const command = path.join(bridgeRoot, "scripts", "codex", "feishu-mode.mjs");
   const write = mode === "dialogue" || mode === "mapping";
   return [
@@ -159,7 +170,7 @@ export function composeModeContext({ bridgeRoot, threadId, mode = null }) {
     "当前 task 的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
     "只运行以下" + (write ? "模式切换" : "只读") + "命令：",
     "`" + nodeCommandPrefix(command) + " --thread-id " + shellQuote(threadId) +
-      (write ? " --mode " + shellQuote(mode) + " --apply" : "") + "`",
+      (write ? " --mode " + shellQuote(mode) + " --apply" + intentArg(intentId) : "") + "`",
     write
       ? "不要再次要求确认；不得直接编辑 registry。切回 mapping 会中止后续 Dialogue 编排，但不删除历史。"
       : "不得修改 registry、policy、binding 或话题。",
@@ -312,26 +323,56 @@ async function main() {
   const tpl = loadCodexTemplate();
   if (!tpl.ok || typeof tpl.template.bridge_root !== "string") process.exit(0);
   let additionalContext;
+  /**
+   * **凭证只在这里签发，只此一处。**
+   *
+   * 走到这里意味着 classifyFeishuPrompt 判定原始输入是**完整、独立**的控制命令
+   * （整条精确匹配 —— 讨论和引用到不了这里）。这就是"原始意图"的证明。
+   *
+   * 只给有副作用的动作签。只读的（status / subscribe）不需要，
+   * 多发一张就多一个能被误用的东西。
+   */
+  const intentAction = action.startsWith("mode") ? "mode" : action;
+  let intentId = null;
+  if (WRITE_ACTIONS.has(intentAction)) {
+    const issued = issueIntent({ action: intentAction, threadId, home: bridgeHome() });
+    // **签不出来就不给命令。**给一条注定被拒的命令比不给更糟：
+    // 人会以为是别的地方坏了。
+    if (!issued.ok) {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "UserPromptSubmit",
+          additionalContext: "[Codex 飞书桥] 无法签发一次性意图凭证（" + issued.reason +
+            "）。**没有执行任何操作**，也不要手工绕过 —— 凭证是这条命令的授权依据。",
+        },
+      }) + "\n");
+      process.exit(0);
+    }
+    intentId = issued.id;
+  }
+
   if (action === "bind") {
     additionalContext = composeBindingContext({
       bridgeRoot: runtimeScriptsRoot(),
       cwd,
       threadId,
       chatName: tpl.template.chat_name,
+      intentId,
     });
   } else if (action === "unbind") {
-    additionalContext = composeUnbindContext({ bridgeRoot: runtimeScriptsRoot(), threadId });
+    additionalContext = composeUnbindContext({ bridgeRoot: runtimeScriptsRoot(), threadId, intentId });
   } else if (action === "status") {
     additionalContext = composeStatusContext({ bridgeRoot: runtimeScriptsRoot(), threadId });
   } else if (action === "subscribe") {
     additionalContext = composeSubscribeContext({ bridgeRoot: runtimeScriptsRoot(), threadId });
   } else if (action === "rotate") {
-    additionalContext = composeRotateContext({ bridgeRoot: runtimeScriptsRoot(), threadId });
+    additionalContext = composeRotateContext({ bridgeRoot: runtimeScriptsRoot(), threadId, intentId });
   } else if (action === "mode" || action.startsWith("mode-")) {
     additionalContext = composeModeContext({
       bridgeRoot: runtimeScriptsRoot(),
       threadId,
       mode: action.startsWith("mode-") ? action.slice("mode-".length) : null,
+      intentId,
     });
   } else {
     process.exit(0);

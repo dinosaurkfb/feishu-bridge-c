@@ -20,6 +20,7 @@ import {
   ROTATION_STATUS, activeGeneration, pendingGeneration,
   TOPIC_GENERATION_PREPARING_STALE_MS,
 } from "../topic-generation.mjs";
+import { requireIntent } from "./intent.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -33,6 +34,13 @@ const root = path.resolve(arg("project") ?? process.cwd());
 if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) die("项目目录不存在：" + root);
 const thread = resolveThreadId({ explicit: arg("thread-id"), root });
 if (!thread.ok) die("无法确定当前 Codex task（" + thread.reason + "）。");
+
+// **一次性意图凭证，在任何副作用之前消费。**
+// 技能选择这一层不受钩子判据约束 —— agent 之间提一句命令就可能把它执行掉
+// （出过真事故）。凭证把"技能被选中"和"这次操作被授权"分开。
+const intent = requireIntent({ apply, action: "rotate", threadId: thread.threadId });
+if (!intent.ok) die(intent.text);
+
 const found = findRegisteredTaskForCodexThread({ threadId: thread.threadId });
 if (!found.ok) die("当前 Codex task 尚未接入飞书。");
 const task = found.task;

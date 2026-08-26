@@ -10,6 +10,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { isCanonicalIso } from "./canonical-time.mjs";
 
 import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
 
@@ -131,16 +132,14 @@ export function claimRunPublish({ runsDir, key, staleMs = 5 * 60 * 1000, now = D
       { flag: "wx", mode: 0o600 });
   } catch (err) {
     if (err.code !== "EEXIST") return { ok: false, reason: "io_error", error: String(err.message).slice(0, 200) };
-    // reap 锁自己也可能死在半路：只按 mtime 超时接管（30s 远大于一次接管耗时）。
-    let reapStale = false;
-    try { reapStale = now - fs.statSync(reapLock).mtimeMs > 30_000; } catch { /* 刚释放 */ }
-    if (!reapStale) return { ok: false, reason: "claimed_by_other" };
-    fs.rmSync(reapLock, { force: true });
-    try {
-      fs.writeFileSync(reapLock,
-        JSON.stringify({ pid: process.pid, at: new Date(now).toISOString() }) + "\n",
-        { flag: "wx", mode: 0o600 });
-    } catch { return { ok: false, reason: "claimed_by_other" }; }
+    // **reap 锁不在热路径自愈。**上一版按 mtime 超时"判旧 → rm → wx"再抢 ——
+    // 评审固定时序复现：内层接管者夺锁建了新 claim，外层拿着旧核对结果
+    // 把它删掉再建自己的 —— 两个 ok:true。同一个反模式在低一层复发，
+    // 递归不会收敛。所以：**reap 锁存在即 fail-closed**，
+    // 崩溃残留（双重退化情形）交给显式维护清理，不在这里赌。
+    return { ok: false, reason: "reap_lock_held",
+      detail: "接管互斥锁被占（或为崩溃残留）：" + reapLock +
+        " —— 若确认无接管者存活，人工删除该文件" };
   }
   try {
     const current = readOwner();
@@ -172,8 +171,10 @@ export function readRunReceipt({ runsDir, key } = {}) {
   }
   try {
     const doc = JSON.parse(raw);
+    // published_at 必须是规范时间 —— "非空字符串"会让 {"published_at":"不是时间"}
+    // 冒充合法回执，一条 run 被永久跳过（同一族判据错误的又一处）。
     if (doc && typeof doc === "object" && !Array.isArray(doc)
-      && typeof doc.published_at === "string" && doc.published_at) {
+      && isCanonicalIso(doc.published_at)) {
       return { state: "valid", publishedAt: doc.published_at,
         messageId: doc.feishu_message_id ?? null };
     }

@@ -100,9 +100,10 @@ outbox 损坏时仍须独立发出（整批 fail-closed 的例外）。所以边
   - 预算内（默认 15s，`FEISHU_BRIDGE_PUBLISH_WAIT_MS` 可调，解析与资格恢复
     共用 `boundedBudgetMs`）等同一把发布锁；拿到后 run 先发、释放后 outbox 走事务。
   - 预算耗尽：**run 单发** —— 并发互斥由**发布前原子 claim**（按 run key，
-    `wx` 单步创建；stale 只接管死进程，摘除用 rename 原子化 ——
-    "判 stale → rm → wx" 会让多个接管者同时得手；release 带 token
-    只释放自己的代际）提供，回执在发送后落（评审实测：只有回执时
+    `wx` 单步创建；stale 只接管死进程；接管经 reap 锁串行 +
+    token 代际核对 —— "判 stale → rm → wx" 与 rename 摘除都被实测击穿过；
+    reap 锁**不在热路径自愈**（存在即 fail-closed，残留交显式维护）——
+    自愈就是同一反模式低一层复发；release 带 token 只释放自己的代际）提供，回执在发送后落（评审实测：只有回执时
     两个并发 watcher 会真实双发）。**崩溃窗口仍是 at-least-once**，
     与全线口径一致 —— 不存在"零双发"，只有"并发不双发"。
     扣着执行结果不发的代价大得多；

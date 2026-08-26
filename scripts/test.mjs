@@ -49,7 +49,8 @@ import {
   validateOutboundCard,
 } from "./outbound-card.mjs";
 import {
-  PUBLISH_FAILURE, claimRunPublish, classifyPublishFailure, releaseRunPublishClaim,
+  PUBLISH_FAILURE, claimRunPublish, classifyPublishFailure, readRunReceipt,
+  releaseRunPublishClaim,
 } from "./outbound.mjs";
 import {
   describeDrainOutcome, drainProject, outboxDirOf, suppressCmd, watcherActive,
@@ -14538,9 +14539,9 @@ test("发布锁 io 故障不是竞争：不套「让给持锁方」的话术（�
 });
 
 test("stale 接管：N 个接管者同抢一份死 PID 的 claim，恰好一个得手", () => {
-  // 评审实测：「判 stale → rm → wx」下 64 个接管者出了 3 个 winner ——
-  // 后到者的 rm 删掉了先到者刚创建的新 claim。rename 摘除只命中旧 inode，
-  // 摘完大家重抢 wx，恰好一个赢。
+  // 评审实测：「判 stale → rm → wx」下 64 个接管者出了 3 个 winner；
+  // 换 rename 摘除照样击穿（rename 按路径不按 inode，16 并发出 5 个）。
+  // 定稿：reap 锁串行接管 + token 代际核对，恰好一个赢。
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-reap-"));
   const runs = path.join(dir, "runs");
   fs.mkdirSync(runs);
@@ -14638,6 +14639,47 @@ test("回执三态：损坏回执 fail-closed，不发也不当送达（真实�
     assert.equal(sent.length, 0, why + "：**说不清就不许发**（可能双发）：" + said.slice(0, 300));
     assert.match(said, /回执损坏|说不清送没送达/u, why + "：要报警，不许静默当成已送达");
   }
+});
+
+test("过期 reap 锁：两个接管者都必须 fail-closed，不许自愈再抢", () => {
+  // 评审固定时序复现过：热路径按 mtime 自愈 reap 锁 → 内层夺锁建新 claim、
+  // 外层拿旧核对结果删掉它再建自己的 —— 两个 ok:true。
+  // 同一个反模式低一层复发，递归不会收敛。定稿：**reap 锁存在即 fail-closed**。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-reaplock-"));
+  const runs = path.join(dir, "runs");
+  fs.mkdirSync(runs);
+  const key = "4".repeat(64);
+  const claimFile = path.join(runs, key + ".publish-claim.json");
+  // 旧 claim（死 PID）+ 一把"过期"的 reap 锁（老 mtime）。
+  fs.writeFileSync(claimFile,
+    JSON.stringify({ pid: 999999999, at: "2020-01-01T00:00:00.000Z", token: "old" }) + "\n");
+  const reapLock = claimFile + ".reaplock";
+  fs.writeFileSync(reapLock, JSON.stringify({ pid: 999999998, at: "2020-01-01T00:00:00.000Z" }) + "\n");
+  const past = new Date(Date.now() - 3600_000);
+  fs.utimesSync(reapLock, past, past);
+
+  for (const who of ["接管者一", "接管者二"]) {
+    const r = claimRunPublish({ runsDir: runs, key });
+    assert.equal(r.ok, false, who + "：**残留 reap 锁在场就不许得手** —— " + JSON.stringify(r));
+    assert.equal(r.reason, "reap_lock_held", who);
+    assert.match(r.detail, /人工删除/u, who + "：要指路显式维护，不是让人干等");
+  }
+  assert.equal(fs.existsSync(claimFile), true, "旧 claim 一个字都不许动");
+  assert.equal(fs.existsSync(reapLock), true, "残留锁也不许在热路径被清");
+});
+
+test("回执时间必须是规范时间：非空字符串冒充不了合法送达", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-receipt-iso-"));
+  const runs = path.join(dir, "runs");
+  fs.mkdirSync(runs);
+  const key = "3".repeat(64);
+  const file = path.join(runs, key + ".published.json");
+  fs.writeFileSync(file, JSON.stringify({ published_at: "不是时间", feishu_message_id: "om" }));
+  const r = readRunReceipt({ runsDir: runs, key });
+  assert.equal(r.state, "unreadable",
+    "**冒充的时间不算送达** —— 否则这条 run 被永久跳过：" + JSON.stringify(r));
+  fs.writeFileSync(file, JSON.stringify({ published_at: "2026-08-26T00:00:00.000Z" }));
+  assert.equal(readRunReceipt({ runsDir: runs, key }).state, "valid", "规范时间照常放行");
 });
 
 summarySealed = true;

@@ -18,6 +18,7 @@ import {
 import {
   codexReplyEventKey, explainabilityGaps, hasPublishAuthorization, outboxMutationBlocker,
 } from "../outbox.mjs";
+import { matrixRowsFor } from "../test-support/publish-matrix.mjs";
 import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
 import { generationTargetState } from "../topic-generation.mjs";
 import {
@@ -6744,6 +6745,107 @@ test("项目级积压：内容、损坏结论、完整性都要跟 task 那半�
     assert.match(said, /不完整/u, "要明说这个数不完整");
   }
 });
+
+// ---------- 契约矩阵（codex 侧）：行由登记表状态生成 ----------
+//
+// legacy 子集 = 该实现今天真实满足的场景。翻 migrated（登记表改状态）会让
+// matrixRowsFor 要求完整契约 —— 没接线就红，翻状态藏不住没干活。
+
+const PUBLISH_ENTRY_STATUS = JSON.parse(fs.readFileSync(
+  path.join(ROOT, "references", "publish-entry-status.json"), "utf-8"));
+
+const codexEligibleRunner = {
+  caps: new Set(["publish"]),
+  notApplicable: {},
+  fixture() {
+    const { home, task, argsFile } = autoPublishFixture();
+    const obDir = taskPaths(task, home).outbox;
+    return {
+      // 这个入口只发**取得授权**的记录 —— seed 造的是"会被它发布的一条"。
+      seed(text) {
+        appendEvent({ outboxDir: obDir, kind: "reply", text,
+          eventKey: "matrix-" + text, publishEligible: true });
+      },
+      seedPaused(text) {
+        appendEvent({ outboxDir: obDir, kind: "reply", text,
+          eventKey: "matrix-" + text, publishEligible: true });
+        recordPublishFailure(listPending({ outboxDir: obDir }).find((r) => r.text === text),
+          { permanent: true, reason: "err_11310" });
+      },
+      attempt(behavior) {
+        assert.equal(behavior, "ok", "codex-eligible 的 legacy 行只申报了成功路径");
+        const before = fs.existsSync(argsFile) ? 1 : 0;
+        publishEligibleTaskEvents({ task, home });
+        return { publishCalls: (fs.existsSync(argsFile) ? 1 : 0) - before };
+      },
+      read(text) {
+        for (const f of fs.readdirSync(obDir)) {
+          try {
+            const rec = JSON.parse(fs.readFileSync(path.join(obDir, f), "utf-8"));
+            if (rec.text === text) return rec;
+          } catch { /* 略过 */ }
+        }
+        throw new Error("codex 矩阵夹具里找不到：" + text);
+      },
+    };
+  },
+};
+
+const codexDrainRunner = {
+  caps: new Set(["publish"]),
+  notApplicable: {},
+  fixture() {
+    const { home, task, argsFile } = autoPublishFixture();
+    const obDir = taskPaths(task, home).outbox;
+    const h = {
+      seed(text) {
+        appendEvent({ outboxDir: obDir, kind: "milestone", text, eventKey: "mx-" + text });
+      },
+      seedPaused(text) {
+        appendEvent({ outboxDir: obDir, kind: "milestone", text, eventKey: "mx-" + text });
+        recordPublishFailure(listPending({ outboxDir: obDir }).find((r) => r.text === text),
+          { permanent: true, reason: "err_11310" });
+      },
+      attempt(behavior) {
+        assert.equal(behavior, "ok", "codex-drain 的 legacy 行只申报了成功路径");
+        const before = fs.existsSync(argsFile) ? fs.statSync(argsFile).size : 0;
+        const r = spawnSync(process.execPath,
+          [path.join(ROOT, "scripts", "codex", "drain-outbox.mjs"),
+            "--thread-id", THREAD_A, "--apply"],
+          { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+        assert.equal(r.status, 0, "codex drain 要正常退出：" + (r.stderr ?? "").slice(0, 300));
+        const after = fs.existsSync(argsFile) ? fs.statSync(argsFile).size : 0;
+        return { publishCalls: after !== before || (before > 0 && after > 0) ? 1 : 0 };
+      },
+      read: null,
+    };
+    h.read = (text) => {
+      for (const f of fs.readdirSync(obDir)) {
+        try {
+          const rec = JSON.parse(fs.readFileSync(path.join(obDir, f), "utf-8"));
+          if (rec.text === text) return rec;
+        } catch { /* 略过 */ }
+      }
+      throw new Error("codex-drain 矩阵夹具里找不到：" + text);
+    };
+    return h;
+  },
+};
+
+for (const row of matrixRowsFor({
+  registry: PUBLISH_ENTRY_STATUS,
+  suite: "codex",
+  runners: { "codex-drain": codexDrainRunner, "codex-eligible": codexEligibleRunner },
+  legacySubsets: {
+    // **两个入口今天既不跳过已暂停、也不做失败记账**（重构计划 §0 那四个 ✗）。
+    // 子集只申报它们真实满足的"基本发布"。R2b2 接入事务后翻 migrated，
+    // matrixRowsFor 会强制完整契约。
+    "codex-drain": ["基本发布：待发的发出去并落标"],
+    "codex-eligible": ["基本发布：待发的发出去并落标"],
+  },
+})) {
+  test("矩阵[" + row.entry + "·" + row.status + "] " + row.title, () => row.run(assert));
+}
 
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);

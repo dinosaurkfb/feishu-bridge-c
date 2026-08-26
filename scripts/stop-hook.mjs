@@ -278,7 +278,11 @@ async function main() {
     // 记下"这一轮真的报了哪些项目"。末尾那句解释要按它来算，不能按"被归属到哪些"
     // 算 —— 非当前项目没东西可报时不产生提示，解释却会孤零零挂在那儿。
     const before = notes.length;
-    if (r.status === "published") {
+    if (r.status === "published" && (r.bookkeepingFailures ?? []).length > 0) {
+      notes.push("飞书出站：" + who + " 已发布 " + r.count +
+        " 条进展，但发布后记账失败 " + r.bookkeepingFailures.length +
+        " 处（内容已送达、不会重发；轮转活动可能没记上，需要人看一眼）。");
+    } else if (r.status === "published") {
       notes.push("飞书出站：" + who + " 已发布 " + r.count + " 条进展。");
     } else if (r.status === "error" && r.permanent === true) {
       // **不许说"会重试"。**永久拒绝的定义就是再等不会变好；

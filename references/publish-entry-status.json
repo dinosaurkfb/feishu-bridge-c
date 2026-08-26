@@ -3,19 +3,23 @@
   "implementations": {
     "claude-drain": {
       "file": "drain-outbox.mjs",
-      "status": "migrated"
+      "status": "migrated",
+      "suite": "claude"
     },
     "claude-watcher": {
       "file": "watch-and-publish.mjs",
-      "status": "legacy"
+      "status": "legacy",
+      "suite": "claude"
     },
     "codex-drain": {
       "file": "codex/drain-outbox.mjs",
-      "status": "legacy"
+      "status": "legacy",
+      "suite": "codex"
     },
     "codex-eligible": {
       "file": "codex/publish-eligible.mjs",
-      "status": "legacy"
+      "status": "legacy",
+      "suite": "codex"
     }
   },
   "direct_paths_excluded": {

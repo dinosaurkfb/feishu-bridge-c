@@ -262,6 +262,17 @@ export function drainProject({
  */
 export function describeDrainOutcome(r, { root, verbose = false } = {}) {
   if (r.status === "published") {
+    // **发布后的记账缺口不许沉默。**消息确实送达了（不是发布失败），
+    // 但轮转活动没记上 —— 不说出来，下一次代际决策就建立在缺账上。
+    if ((r.bookkeepingFailures ?? []).length > 0) {
+      return {
+        error: true,
+        text: "已发布 " + r.count + " 条 -> " + r.messageId +
+          "，**但有 " + r.bookkeepingFailures.length + " 处发布后记账失败**" +
+          "（内容已送达、不会重发；轮转活动可能没记上）：\n" +
+          r.bookkeepingFailures.map((b) => "  " + b.messageId + " —— " + b.error).join("\n"),
+      };
+    }
     return { text: "已发布 " + r.count + " 条 -> " + r.messageId, error: false };
   }
   if (r.status === "dry_run") {

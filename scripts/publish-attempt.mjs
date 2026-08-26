@@ -100,6 +100,9 @@ export function publishOutboxAttempt({
       " —— 枚举是闭的，新策略先进 CANDIDATE_POLICIES 再用");
   }
 
+  // 锁只试一次 —— 维持 drain 既有语义（拿不到就 skipped，调度器稍后再来）。
+  // **有界重试节奏推迟到 R2b1**：watcher 共锁后的等待/失败/延期语义是
+  // 计划文档指定的 R2b1 验收点，重试节奏跟它一起定，不在这里先斩后奏。
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return { status: "skipped", reason: lock.reason };
 
@@ -149,6 +152,21 @@ export function publishOutboxAttempt({
       }));
     });
 
+    // **切批不许重选。**batchCards 是入口的卡片协议（比如 reply 一轮一张卡），
+    // 但它拿到的权力只有"怎么分组"，没有"发不发谁"。评审实测：让它返回空数组，
+    // 事务报 published、发布调用为 0、记录仍 pending —— 一次假成功。
+    // 漏项、重复、外来记录同理。所以发布前先验：**批次恰好覆盖 selected 一次**。
+    const flattened = targetBatches.flatMap((item) => item.batch);
+    const selectedFiles = selected.map((r) => String(r._file)).sort();
+    const batchedFiles = flattened.map((r) => String(r?._file)).sort();
+    if (JSON.stringify(selectedFiles) !== JSON.stringify(batchedFiles)) {
+      return {
+        status: "error", reason: "batching_mismatch", local: true,
+        detail: "batchCards 改写了候选集合：选了 " + selected.length +
+          " 条、批里 " + flattened.length + " 条 —— 切批只许分组，不许增删",
+      };
+    }
+
     if (dryRun) {
       // **预演零改盘** —— 这条在显式重试上被击穿过一次（预先清标），
       // 现在结构上不可能：清标只发生在 markSent 里，而 dry-run 走不到那儿。
@@ -156,20 +174,35 @@ export function publishOutboxAttempt({
     }
 
     const messageIds = [];
+    const bookkeepingFailures = [];
     for (const item of targetBatches) {
       // 失败要打在**这一批**上、诊断要查**这一个**目标 —— 不是全部待发。
       failingTarget = item.target;
       failingBatch = item.batch;
       const messageId = publishBatch({ target: item.target, card: item.card });
-      // 记账钩子在 publish 之后、markSent 之前 —— 维持既有顺序（轮转先于落标）。
-      if (onBatchPublished) onBatchPublished({ batch: item.batch, target: item.target, messageId });
-      // 发布成功才落标；保护字段在同一次写里清掉。
+      // **过了这一行，消息已经送达** —— 后面的任何失败都不是"发布失败"。
+      //
+      // 评审实测第一版：钩子抛错落进统一 catch，被当成网络失败记重试账、
+      // 记录仍 pending —— **下一轮把已送达的内容再发一遍**。
+      // 程序此刻明知发布成功、handle 都在手里，重发不是不可避免的崩溃窗口，
+      // 是分类错误。所以：钩子失败照样落标（防重发压倒一切），
+      // 记账缺口大声报出去（轮转账丢了要人知道，但那是可恢复的，重发不可撤）。
+      try {
+        // 记账钩子在落标之前 —— 维持轮转先于 markSent 的既有顺序。
+        if (onBatchPublished) onBatchPublished({ batch: item.batch, target: item.target, messageId });
+      } catch (hookErr) {
+        bookkeepingFailures.push({ messageId,
+          error: String(hookErr?.message ?? hookErr).slice(0, 300) });
+      }
+      // 发布成功就落标；保护字段在同一次写里清掉。
       for (const record of item.batch) markSent(record, messageId);
       messageIds.push(messageId);
     }
     return {
       status: "published", count: selected.length,
       messageId: messageIds.at(-1) ?? null, messageIds,
+      // 空数组 = 账都记全了。非空必须被调用方看见 —— 沉默的缺账下次没人查。
+      bookkeepingFailures,
     };
   } catch (err) {
     // 失败批次不落标、不吞掉；**成败都有账**。

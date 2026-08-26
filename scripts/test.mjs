@@ -68,7 +68,7 @@ import { bindingWarning, checkBinding } from "./binding-health.mjs";
 import {
   DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliveryPinPath, findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin,
 } from "./live-session.mjs";
-import { extractReply } from "./stop-hook.mjs";
+import { extractReply, postDeliveryBits } from "./stop-hook.mjs";
 import { foreignHint, projectLabel } from "./stop-note.mjs";
 import {
   CHAIN_FIELDS, assertPublishIdentity, materializeProjectConfig,
@@ -14363,6 +14363,22 @@ test("Stop 热入口：发到一半失败要说清两半（真实进程）", () 
   assert.match(said, /已送达 1 张/u, "已送达的事实要在");
   assert.equal(/进展留在 outbox，兜底定时器会重试。/u.test(said), false,
     "**不许用整批失败的措辞暗示什么都没发出去**");
+});
+
+test("Stop 的 partial 措辞：两类发布后异常都要在，一类不许吞另一类", () => {
+  // 评审构造："第一批送达但记账失败 + 第二批发布失败" ——
+  // 上一版 partial 分支只提落标缺口，轮转账缺失被整个吞掉。
+  const both = postDeliveryBits({
+    deliveredUnrecorded: [{ messageId: "om_1", file: "a.json", error: "改名失败" }],
+    bookkeepingFailures: [{ messageId: "om_1", error: "ledger failed" }],
+  });
+  assert.match(both, /没落标、下一轮可能重发/u);
+  assert.match(both, /记账失败/u, "**轮转账缺失不许被落标缺口吞掉**");
+  // 只有记账缺口时同样要说。
+  assert.match(postDeliveryBits({ bookkeepingFailures: [{ messageId: "m", error: "x" }] }),
+    /记账失败/u);
+  // 都没有 = 空串，别加空标点。
+  assert.equal(postDeliveryBits({}), "");
 });
 
 summarySealed = true;

@@ -27,6 +27,22 @@ import {
 
 // 会话结束是同步阻塞点：Frank 的终端在等它返回。发不出去就留在 outbox，
 // 兜底定时器 30 分钟内会重试 —— 宁可晚发，不可吊住会话。
+/**
+ * 两类发布后异常的组合措辞。**同时发生就同时说** —— 单独渲染任何一类
+ * 都会把另一类吞掉（评审在 published 和 partial 两个分支各抓到一次）。
+ * 返回以"；"开头的追加片段；两类都没有时为空串。
+ */
+export function postDeliveryBits(r) {
+  const bits = [];
+  if ((r.deliveredUnrecorded ?? []).length > 0) {
+    bits.push(r.deliveredUnrecorded.length + " 条**送达后没落标、下一轮可能重发**（先去话题核对）");
+  }
+  if ((r.bookkeepingFailures ?? []).length > 0) {
+    bits.push(r.bookkeepingFailures.length + " 处发布后记账失败（已送达不重发，轮转账可能缺）");
+  }
+  return bits.length === 0 ? "" : "；" + bits.join("；");
+}
+
 const PUBLISH_TIMEOUT_MS = 12_000;
 
 const LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "stop-hook.log");
@@ -281,24 +297,18 @@ async function main() {
     if (r.status === "published"
       && ((r.deliveredUnrecorded ?? []).length > 0 || (r.bookkeepingFailures ?? []).length > 0)) {
       // 两类同时发生就同时说 —— else-if 会把轮转账缺口藏在落标失败后面。
-      const bits = [];
-      if ((r.deliveredUnrecorded ?? []).length > 0) {
-        bits.push(r.deliveredUnrecorded.length + " 条**送达后没落标、下一轮可能重发**（先去话题核对）");
-      }
-      if ((r.bookkeepingFailures ?? []).length > 0) {
-        bits.push(r.bookkeepingFailures.length + " 处发布后记账失败（已送达不重发，轮转账可能缺）");
-      }
-      notes.push("飞书出站：" + who + " 已发布 " + r.count + " 条，但有 " + bits.join("；") + "。");
+      notes.push("飞书出站：" + who + " 已发布 " + r.count + " 条，但有" +
+        postDeliveryBits(r).replace(/^；/u, " ") + "。");
     } else if (r.status === "published") {
       notes.push("飞书出站：" + who + " 已发布 " + r.count + " 条进展。");
     } else if (r.status === "error" && r.partial === true) {
       // **打了一半的失败要说清两半** —— 落进"整批被拒"或"留在 outbox 会重试"
       // 都在骗人：前者藏了已送达的事实，后者暗示什么都没发出去。
-      const extra = (r.deliveredUnrecorded ?? []).length > 0
-        ? "；另有 " + r.deliveredUnrecorded.length + " 条**送达后没落标、可能重发**（先去话题核对）" : "";
+      // **两类发布后异常也要组合着说**（评审实测："第一批送达但记账失败 +
+      // 第二批发布失败"的组合，只提落标缺口会把轮转账缺失整个吞掉）。
       notes.push("飞书出站：" + who + " 发到一半失败：已送达 " +
         (r.messageIds ?? []).length + " 张卡片（已落标 " + (r.publishedRecords ?? 0) +
-        " 条，不会重发）" + extra + "；失败那批" +
+        " 条，不会重发）" + postDeliveryBits(r) + "；失败那批" +
         (r.permanent === true ? "已暂停自动重试" : "留在 outbox，兜底定时器会重试") + "。");
     } else if (r.status === "error" && r.permanent === true) {
       // **不许说"会重试"。**永久拒绝的定义就是再等不会变好；

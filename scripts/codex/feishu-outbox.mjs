@@ -48,7 +48,9 @@ import { isCanonicalIso } from "../canonical-time.mjs";
 import { auditOutbox } from "./drain-service.mjs";
 import { outboxMutationBlocker } from "../outbox.mjs";
 import { outboxDirOf } from "../drain-outbox.mjs";
-import { loadRegistryStrict as loadClaudeRegistryStrict } from "../registry.mjs";
+import {
+  loadRegistryStrict as loadClaudeRegistryStrict, normalizeRoot,
+} from "../registry.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
 import {
   bridgeHome, loadRegistry, registryFile, resolveTaskOutboundGeneration, taskPaths,
@@ -288,21 +290,25 @@ export function collectProjectBacklog() {
       bad.push({ at, why: "root 不是非空字符串" }); continue;
     }
     if (!path.isAbsolute(root)) { bad.push({ at, why: "root 不是绝对路径" }); continue; }
+    // **去重之前先规范化。**评审实测：`/project` 和 `/project/` 被当成两个项目，
+    // 同一条 outbox 记录被统计、展示两次 —— 人看到的条数是假的。
+    // 规范化用共用那份，不在这里另写一套（"root 的规范形式只有这一份定义"）。
+    const normalized = normalizeRoot(root);
     const sid = project.claude_session_id;
     if (sid !== undefined && sid !== null
       && (typeof sid !== "string" || sid.trim().length === 0)) {
       bad.push({ at, why: "claude_session_id 形状不对" }); continue;
     }
     const claudeSessionId = sid ?? null;
-    const key = root + "\u0000" + (claudeSessionId ?? "");
+    const key = normalized + "\u0000" + (claudeSessionId ?? "");
     if (seen.has(key)) continue;
     seen.add(key);
-    const outboxDir = outboxDirOf(root, claudeSessionId);
+    const outboxDir = outboxDirOf(normalized, claudeSessionId);
     const audit = auditOutbox(outboxDir);
     const entry = {
-      name: sanitizeForDisplay(path.basename(root)) +
+      name: sanitizeForDisplay(path.basename(normalized)) +
         (claudeSessionId ? "/" + sanitizeForDisplay(String(claudeSessionId).slice(0, 8)) : ""),
-      root,
+      root: normalized,
       readable: audit.ok === true,
       unreadableReason: audit.ok === true ? null : (audit.reason ?? "说不清"),
       unclassified: audit.ok === true ? (audit.unclassified ?? []) : [],

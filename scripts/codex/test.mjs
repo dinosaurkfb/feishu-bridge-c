@@ -6601,6 +6601,35 @@ test("坏的登记项不许静默跳过，全景说不清就不许说没有积�
   assert.equal(withReg(() => collectProjectBacklog()).ok, true, "干净时必须照常放行");
 });
 
+test("项目全景要先规范化 root：/p 和 /p/ 不是两个项目", () => {
+  // 评审实测：`/project` 与 `/project/` 被当成两个项目，
+  // **同一条 outbox 记录被统计、展示两次** —— 人看到的条数是假的。
+  const home = temp();
+  const proj = path.join(home, "cc2cd");
+  const obDir = path.join(proj, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(obDir, "0001.json"),
+    JSON.stringify(outboxRecord({ text: "只有这一条" })));
+
+  const registry = path.join(home, "registry.json");
+  fs.writeFileSync(registry, JSON.stringify({ schema_version: "1.0", projects: [
+    { root: proj, claude_session_id: null },
+    { root: proj + "/", claude_session_id: null },       // 同一个项目，写法不同
+  ] }));
+  const before = process.env.FEISHU_BRIDGE_REGISTRY;
+  process.env.FEISHU_BRIDGE_REGISTRY = registry;
+  try {
+    const got = collectProjectBacklog();
+    assert.equal(got.ok, true, JSON.stringify(got));
+    assert.equal(got.projects.length, 1,
+      "**同一个项目不许出现两次** —— 实际 " + got.projects.length + " 次");
+    assert.equal(got.projects[0].records.length, 1, "那一条也不许被数两遍");
+  } finally {
+    if (before === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY;
+    else process.env.FEISHU_BRIDGE_REGISTRY = before;
+  }
+});
+
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (failed > 0) process.exit(1);

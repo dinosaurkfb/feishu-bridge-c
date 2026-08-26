@@ -13382,6 +13382,119 @@ test("watcher 连续失败也要记账，五次上限对它同样成立（真实
   assert.equal(rec.published_at, null, "没发出去就不许标已发布");
 });
 
+test("两个输出通道都可信：真错误码在 stdout 里也不许漏掉", () => {
+  // 评审实测：stdout 里是真正的平台响应，stderr 里只有一句构建提示，
+  // 上一版只读 stderr 且只要它非空就不再看别的 —— 于是判成暂时失败，
+  // **给人的详情也把真错误码丢了**。lark-cli 把结构化响应写在 stdout 是常态。
+  const err = new Error("Command failed: /bin/lark-cli " +
+    JSON.stringify({ text: "正文里也写着 ErrCode: 11310" }));
+  err.stdout = JSON.stringify({ ok: false, error: { code: 230099,
+    message: "Failed to create card content, ext=ErrCode: 11310; ErrMsg: card table number over limit" } });
+  err.stderr = "note: build cache warm";
+  const trusted = trustedPublishResponse(err);
+  assert.match(trusted, /11310/u, "**stdout 里的平台响应必须进来**");
+  assert.match(trusted, /build cache warm/u, "stderr 也不许丢");
+  assert.equal(publishRetryability(trusted).permanent, true, "真错误码要能判出来");
+
+  // 只有 stdout 的情形。
+  const onlyOut = new Error("Command failed: x");
+  onlyOut.stdout = "httpCode 403 forbidden";
+  assert.equal(publishRetryability(trustedPublishResponse(onlyOut)).reason, "http_403");
+
+  // **两个通道都空才回落到命令回显之后那半**，而回显本身仍然不许进。
+  const echoOnly = new Error("Command failed: /bin/lark-cli " +
+    JSON.stringify({ text: "ErrCode: 11310" }));
+  echoOnly.stdout = ""; echoOnly.stderr = "";
+  assert.equal(trustedPublishResponse(echoOnly), "", "回显里全是我们自己喂进去的");
+  assert.equal(publishRetryability(trustedPublishResponse(echoOnly)).permanent, false);
+});
+
+test("重试状态机：次数和状态必须互相印证", () => {
+  // 评审实测两个方向：
+  //   · attempts 写成 999 被判 retrying、审计报 ok —— 早该暂停的记录仍进自动发布
+  //   · attempts:1 + kind:retry_exhausted 也被接受 —— 生产写不出这种形状
+  const base = outboxRecord({ text: "一条" });
+  const paused = (attempts, kind) => ({ ...base,
+    publish_attempts: attempts, publish_rejected_at: "2026-08-26T00:00:00.000Z",
+    publish_rejected_reason: "x", publish_rejected_kind: kind });
+
+  for (let n = 1; n < MAX_AUTO_PUBLISH_ATTEMPTS; n += 1) {
+    assert.equal(retryProtectionState({ ...base, publish_attempts: n }), "retrying",
+      n + " 次该是 retrying");
+  }
+  // **到了上限还说自己在重试，就是自相矛盾。**
+  for (const n of [MAX_AUTO_PUBLISH_ATTEMPTS, MAX_AUTO_PUBLISH_ATTEMPTS + 1, 999]) {
+    assert.equal(retryProtectionState({ ...base, publish_attempts: n }), "corrupt",
+      n + " 次不许还算 retrying");
+    assert.equal(isPermanentlyRejected({ ...base, publish_attempts: n }), false,
+      n + " 次的畸形记录也不许被当成 paused");
+    assert.ok(explainabilityGaps({ ...base, publish_attempts: n })
+      .includes("publish_retry_protection"), n + " 次要被审计看见");
+  }
+
+  // 成因跟次数对得上才算数。
+  assert.equal(retryProtectionState(paused(MAX_AUTO_PUBLISH_ATTEMPTS, "retry_exhausted")), "paused");
+  for (const n of [1, 2, MAX_AUTO_PUBLISH_ATTEMPTS - 1]) {
+    assert.equal(retryProtectionState(paused(n, "retry_exhausted")), "corrupt",
+      "试了 " + n + " 次就说预算耗尽是自相矛盾的");
+  }
+  // 平台拒绝可以发生在任何一次 —— 第一次就可能被拒。
+  for (const n of [1, 3, MAX_AUTO_PUBLISH_ATTEMPTS, 99]) {
+    assert.equal(retryProtectionState(paused(n, "platform_rejected")), "paused",
+      "平台拒绝在第 " + n + " 次也成立");
+  }
+});
+
+test("暂停成因要一路到达视图，不许把两种统称为「被飞书拒绝」", () => {
+  // 评审：kind 落盘了，但 needs_attention 只返回 file/why，
+  // 于是 Stop 和积压视图仍把 retry_exhausted 说成"被飞书永久拒绝"。
+  // **这正是本轮声称修好的跨进程误导。**
+  const exhausted = describeDrainOutcome({ status: "needs_attention", count: 1,
+    rejected: [{ file: "a.json", kind: "retry_exhausted", why: "自动重试预算耗尽：…" }] },
+    { root: "/p" });
+  assert.match(exhausted.text, /值得再试一次/u, "**预算耗尽要说清值得再试**");
+  assert.equal(exhausted.text.includes("平台拒绝，不改内容"), false);
+
+  const rejected = describeDrainOutcome({ status: "needs_attention", count: 1,
+    rejected: [{ file: "b.json", kind: "platform_rejected", why: "平台拒绝（err_11310）" }] },
+    { root: "/p" });
+  assert.match(rejected.text, /不改内容再试也一样/u, "**平台拒绝要说清再试无用**");
+  assert.equal(rejected.text.includes("值得再试一次"), false);
+
+  // 成因缺失时不许编 —— 说"成因不明"，不是随便挑一个。
+  const unknown = describeDrainOutcome({ status: "needs_attention", count: 1,
+    rejected: [{ file: "c.json", why: "?" }] }, { root: "/p" });
+  assert.match(unknown.text, /成因不明/u);
+
+  // **上面三条喂的是手工构造的输入 —— 它们证明不了 kind 真的被放进去了。**
+  // （我上一版就停在这里，把 drainProject 里那行 kind 删掉，测试照样全绿。）
+  // 所以这一段走真实入口：让它自己走到 needs_attention，再看返回里有没有成因。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-kindflow-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", lark_cli_profile: "claude" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_x", feishu_root_message_id_reference: "om_x",
+    claude_session_id: null, channel_generation_id: "gen-1" }));
+  appendEvent({ outboxDir: obDir, kind: "next", text: "会被平台拒的一条", source: "t" });
+
+  const err = new Error("Command failed: x");
+  err.stderr = "ext=ErrCode: 11310; ErrMsg: card table number over limit";
+  const safeDiagnose = () => ({ kind: PUBLISH_FAILURE.TRANSIENT, reason: "stub" });
+  drainProject({ root: dir, publish: () => { throw err; }, diagnose: safeDiagnose });
+  const next = drainProject({ root: dir, publish: () => { throw err; }, diagnose: safeDiagnose });
+
+  assert.equal(next.status, "needs_attention", JSON.stringify(next).slice(0, 200));
+  assert.equal(next.rejected[0].kind, "platform_rejected",
+    "**真实入口必须把成因放进结果里** —— 落了盘却不往上传，下一个进程照样分不清");
+  assert.match(describeDrainOutcome(next, { root: dir }).text, /不改内容再试也一样/u,
+    "端到端：从落盘到措辞，成因不许中途丢");
+});
+
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (failed > 0) {

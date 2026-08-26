@@ -16,7 +16,7 @@ import path from "node:path";
 
 import {
   MAX_AUTO_PUBLISH_ATTEMPTS, auditOutbox, composeDigest, isPermanentlyRejected, listPending,
-  markSent, outboxMutationBlocker, recordPublishFailure,
+  markSent, outboxMutationBlocker, pauseKindOf, recordPublishFailure,
 } from "./outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { PUBLISH_FAILURE, classifyPublishFailure, publishDraft } from "./outbound.mjs";
@@ -222,10 +222,16 @@ function clipBothEnds(text) {
  * 拿不到可信响应就返回空串 —— 调用方据此按暂时失败处理。
  */
 export function trustedPublishResponse(err) {
-  const raw = err?.stderr;
-  const stderr = typeof raw === "string" ? raw
-    : (raw && typeof raw.toString === "function") ? raw.toString("utf-8") : "";
-  if (stderr.trim()) return stderr.trim();
+  const asText = (raw) => (typeof raw === "string" ? raw
+    : (raw && typeof raw.toString === "function") ? raw.toString("utf-8") : "").trim();
+  // **两个输出通道都可信，要合起来看。**
+  //
+  // 上一版只读 stderr、而且只要 stderr 非空就不再看别的。评审实测：
+  // stdout 里是 `code: 230099` 这条真正的平台响应、stderr 里只有一句构建提示，
+  // 于是被判成暂时失败，**给人的详情也把真错误码丢了**。
+  // lark-cli 把结构化响应写在 stdout 是常态，注释当时也承诺了会读它。
+  const channels = [asText(err?.stdout), asText(err?.stderr)].filter(Boolean);
+  if (channels.length > 0) return channels.join("\n");
   const message = String(err?.message ?? "");
   // `Command failed: <命令>\n<真正的输出>` —— 只有换行**之后**那半是子进程说的。
   // 没有换行就意味着我们只拿到了命令回显本身，那里面全是我们自己喂进去的东西。
@@ -410,8 +416,12 @@ export function drainProject({
         ? { status: "empty", root }
         : { status: "needs_attention", root, reason: "permanently_rejected",
             count: rejected.length,
+            // **成因要一路带到视图。**落了盘却不往上传，
+            // 下一个进程照样只能把两种情形统称为"被飞书拒绝"——
+            // 而它们的下一步不同。pauseKindOf 是那份判据的唯一读法。
             rejected: rejected.map((r) => ({
               file: path.basename(String(r._file ?? "")),
+              kind: pauseKindOf(r),
               why: r.publish_rejected_reason ?? "未说明" })) };
     }
 
@@ -601,7 +611,10 @@ export function describeDrainOutcome(r, { root, verbose = false } = {}) {
     return {
       error: true,
       text: r.count + " 条已暂停自动重试，等你看一眼：\n" +
-        (r.rejected ?? []).map((item) => "  " + item.file + " —— " + item.why).join("\n") +
+        (r.rejected ?? []).map((item) => "  " + item.file + "（" +
+          (item.kind === "retry_exhausted" ? "重试预算耗尽，值得再试一次"
+            : item.kind === "platform_rejected" ? "平台拒绝，不改内容再试也一样"
+              : "成因不明") + "）—— " + item.why).join("\n") +
         // **--force 要带上。**自动发布关掉时不带它会被开关提前挡住 ——
         // 提示指向的操作做不到它说的事，这个坑踩过不止一次。
         "\n  修好起因之后要重发：node " + drainCmd() + " --project " + root +

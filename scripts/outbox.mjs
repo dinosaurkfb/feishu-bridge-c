@@ -195,11 +195,19 @@ export function retryProtectionState(rec) {
   // （0 次意味着"从没试过却已经在重试状态"，生产写不出来）。
   if (!Number.isSafeInteger(attempts) || attempts < 1) return "corrupt";
 
-  if (present[1] === false && present[2] === false && present[3] === false) return "retrying";
+  if (present[1] === false && present[2] === false && present[3] === false) {
+    // **retrying 必须还在预算内。**评审实测：attempts 写成 999 时上一版判 retrying、
+    // 审计报 ok —— 于是一条**早就该暂停**的畸形记录仍然进入自动发布。
+    // 状态机封闭的意思是次数和状态必须互相印证，不是各说各话。
+    return attempts < MAX_AUTO_PUBLISH_ATTEMPTS ? "retrying" : "corrupt";
+  }
   // 剩下的只能是 paused —— 而 paused 要求另外三个**全部**在场且合法。
   if (!isCanonicalIso(at)) return "corrupt";
   if (typeof why !== "string" || why.trim().length === 0) return "corrupt";
   if (!PAUSE_KINDS.includes(kind)) return "corrupt";
+  // 成因也要跟次数对得上：**预算耗尽**只可能发生在试满之后。
+  // 反过来 attempts:1 + retry_exhausted 是自相矛盾的形状，生产写不出来。
+  if (kind === "retry_exhausted" && attempts < MAX_AUTO_PUBLISH_ATTEMPTS) return "corrupt";
   return "paused";
 }
 

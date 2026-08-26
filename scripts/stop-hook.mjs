@@ -288,8 +288,16 @@ async function main() {
         : " 被飞书拒绝（" + r.permanentReason + "）") +
         "，**已暂停自动重试**，需要人看一眼。");
     } else if (r.status === "needs_attention") {
-      notes.push("飞书出站：" + who + " 有 " + r.count +
-        " 条被飞书永久拒绝过，不会再自动重试，等你处理。");
+      // **不许把两种成因统称为"被飞书拒绝"。**预算耗尽值得人再试一次，
+      // 平台拒绝不改内容再试也一样 —— 说混了会把人支去做错的事。
+      const kinds = new Set((r.rejected ?? []).map((item) => item.kind));
+      const label = kinds.size === 1 && kinds.has("retry_exhausted")
+        ? "连着发不出去、重试预算已耗尽"
+        : kinds.size === 1 && kinds.has("platform_rejected")
+          ? "被飞书拒绝"
+          : "发不出去";
+      notes.push("飞书出站：" + who + " 有 " + r.count + " 条" + label +
+        "，**已暂停自动重试**，等你处理。");
     } else if (r.status === "error" && r.diagnosis?.kind === "root_owned_by_other_app") {
       // 诊断是**线索不是判决**：说清重试大概率无用，但停不停由人决定。
       // 上一版在这里直接说"已停止重试"，那是把一个自动做出的有损动作说成既成事实。

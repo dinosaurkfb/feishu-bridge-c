@@ -18,6 +18,7 @@ import {
 import {
   explainabilityGaps, hasPublishAuthorization, outboxMutationBlocker,
 } from "../outbox.mjs";
+import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
 import { generationTargetState } from "../topic-generation.mjs";
 import {
   ageText, collectBacklog, describeRecordState, sanitizeForDisplay, suppressCommandFor,
@@ -6325,6 +6326,95 @@ test("Codex 包装层同样只许读一次盘：两次读之间被同名替换�
   assert.equal(printed[1], digestOf(bytesA),
     "**摘要必须绑人看过的 A**；等于 B 的摘要就说明渲染和摘要读的不是同一份");
   assert.notEqual(digestOf(bytesA), digestOf(bytesB), "A、B 的摘要本来就该不同");
+});
+
+test("watcher：资格一直卡住时要照实说原因，并留下恢复标记", () => {
+  // 发布锁被别人一直占着 —— 这是加锁之后**真实可达**的路径。
+  // 这一轮不许被记成 completed（那条答复就再没人管了），
+  // 要留下 eligibility_pending 标记、发一条说清原因的 risk、并以非 0 退出。
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Stuck",
+    rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = false;
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  const paths = taskPaths(task, home);
+  fs.mkdirSync(paths.runs, { recursive: true });
+  fs.mkdirSync(paths.claims, { recursive: true });
+  fs.mkdirSync(paths.sessionLock, { recursive: true });
+  const key = "b".repeat(64);
+  fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), [
+    { type: "thread.started", thread_id: THREAD_A }, { type: "turn.started" }, { type: "turn.completed" },
+  ].map(JSON.stringify).join("\n") + "\n");
+  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify({ exit_code: 0 }));
+  fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "卡住的答复");
+
+  fs.mkdirSync(path.dirname(paths.publishLock), { recursive: true });
+  assert.equal(acquirePublishLock(paths.publishLock).ok, true, "前提：别人正持着发布锁");
+  try {
+    const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
+      "--claim-key", key, "--task-key", task.logical_task_key,
+    ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+      FEISHU_BRIDGE_ELIGIBILITY_BUDGET_MS: "0" } });
+    assert.notEqual(r.status, 0, "卡住不许算成功");
+
+    const marker = path.join(paths.claims, key + ".eligibility_pending.json");
+    assert.equal(fs.existsSync(marker), true, "**要留下恢复证据**");
+    assert.equal(fs.existsSync(path.join(paths.claims, key + ".completed.json")), false,
+      "不许记成 completed —— 那条答复就再没人管了");
+
+    const events = fs.readdirSync(paths.outbox)
+      .map((f) => JSON.parse(fs.readFileSync(path.join(paths.outbox, f), "utf-8")));
+    const risk = events.find((e) => e.kind === "risk");
+    assert.ok(risk, "要发一条 risk：" + JSON.stringify(events.map((e) => e.kind)));
+    assert.match(risk.text, /publisher_busy/u, "**要说清真实原因**，不是「说不清」");
+    const reply = events.find((e) => e.kind === "reply");
+    assert.ok(reply, "答复本身要留在队列里");
+    assert.equal(reply.publish_eligible_at, null, "没拿到锁就不许有资格");
+  } finally {
+    releasePublishLock(paths.publishLock);
+  }
+});
+
+test("watcher：标记自己看不懂时要说出具体那句，不是只说 marker_unusable", () => {
+  // claim key 形状不对 → 写出来的标记文件名不是 claim key 的形状。
+  // 人真正需要知道的是那句具体的，只渲染 reason 的话最终只会说 marker_unusable。
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "BadKey",
+    rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = false;
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  const paths = taskPaths(task, home);
+  fs.mkdirSync(paths.runs, { recursive: true });
+  fs.mkdirSync(paths.claims, { recursive: true });
+  fs.mkdirSync(paths.sessionLock, { recursive: true });
+  const key = "k1";                       // 生产入口造不出这种 key
+  fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), [
+    { type: "thread.started", thread_id: THREAD_A }, { type: "turn.started" }, { type: "turn.completed" },
+  ].map(JSON.stringify).join("\n") + "\n");
+  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify({ exit_code: 0 }));
+  fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "答复");
+
+  fs.mkdirSync(path.dirname(paths.publishLock), { recursive: true });
+  assert.equal(acquirePublishLock(paths.publishLock).ok, true, "前提：别人正持着发布锁");
+  try {
+    const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
+      "--claim-key", key, "--task-key", task.logical_task_key,
+    ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+      FEISHU_BRIDGE_ELIGIBILITY_BUDGET_MS: "0" } });
+    assert.notEqual(r.status, 0);
+    const risk = fs.readdirSync(paths.outbox)
+      .map((f) => JSON.parse(fs.readFileSync(path.join(paths.outbox, f), "utf-8")))
+      .find((e) => e.kind === "risk");
+    assert.ok(risk, "要发一条 risk");
+    assert.match(risk.text, /marker_unusable/u);
+    assert.match(risk.text, /文件名不是 claim key 的形状/u, "**具体那句要说出来**");
+  } finally {
+    releasePublishLock(paths.publishLock);
+  }
 });
 
 summarySealed = true;

@@ -45,6 +45,18 @@ const MARKER_KEYS = [
   "claim_key", "event_key", "promote_failed", "recorded_at", "run_state", "schema_version", "state",
 ].sort();
 
+/**
+ * claim key 的真实形状：`claimKey()` 是 sha256 的十六进制摘要，恒为 64 位。
+ *
+ * **封闭 schema 只封键名等于没封。**评审实测：用一个真实的 64 位 key、
+ * 但把 promote_failed 写成对象，标记照样获授权并被删除；空身份也一样能构造。
+ * 键集说的是"有哪些字段"，取值域说的才是"这些字段能是什么"。
+ */
+const CLAIM_KEY_SHAPE = /^[0-9a-f]{64}$/u;
+
+/** 提升失败的原因：这条链上的 reason 全是小写下划线短标识，不是自由文本。 */
+const REASON_SHAPE = /^[a-z][a-z0-9_]{0,63}$/u;
+
 /** 同步等一小会儿 —— 这条链上的函数都是同步契约，不能改成 async。 */
 function waitSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -85,6 +97,11 @@ export function listEligibilityPending({ claimsDir, threadId }) {
     const extra = keys.filter((k) => !MARKER_KEYS.includes(k));
     if (extra.length > 0) { bad("多出不认识的字段：" + extra.join("、")); continue; }
     if (doc.schema_version !== "1.0") { bad("schema_version 不认识"); continue; }
+    // **取值域跟键集一起验。**
+    if (!CLAIM_KEY_SHAPE.test(String(key))) { bad("文件名不是 claim key 的形状"); continue; }
+    if (typeof doc.promote_failed !== "string" || !REASON_SHAPE.test(doc.promote_failed)) {
+      bad("promote_failed 不是原因标识"); continue;
+    }
     // 文件名与内容必须自洽 —— 否则一张错配的标记能替另一条事件要资格。
     if (doc.claim_key !== key) { bad("claim_key 跟文件名对不上"); continue; }
     if (doc.state !== "eligibility_pending") { bad("state 不是 eligibility_pending"); continue; }
@@ -166,6 +183,32 @@ export function eligibilityOutcomeFor(settle, key) {
   if (stuck) return { ok: false, reason: stuck.reason };
   const broken = settle.unusable.find((r) => r.key === key);
   if (broken) return { ok: false, reason: "marker_unusable", why: broken.unusable };
-  // 标记不在了，而这一轮又不是我们恢复掉的 —— 照实说，别拿旧原因顶包。
+  // 标记不在了 —— **但这是有歧义的**：可能是另一个进程先恢复成功并撤了标记。
+  // 光凭"本次扫描没看到"就报失败，会让这一轮不发布、不写 completed、
+  // 也不收口 Dialogue。真正的答案只能去问目标记录本身，见 settleOwnEligibility。
   return { ok: false, reason: "marker_missing" };
+}
+
+/**
+ * **这一轮自己那条 claim 的资格，最终到底怎么样了。**
+ *
+ * 先扫到有结论，再把结论翻译成"我这条"的结论；
+ * 若标记不在了，**在锁下按当前 event/run 重新核对目标记录** ——
+ * 已 eligible / published / suppressed 都算成功，只有这样才排除
+ * "另一个恢复器先做完了"这种歧义。
+ */
+export function settleOwnEligibility({
+  claimsDir, outboxDir, publishLockDir, threadId, claimKey, ...pacing
+}) {
+  const settle = settleEligibilityPending({
+    claimsDir, outboxDir, publishLockDir, threadId, ...pacing });
+  const outcome = eligibilityOutcomeFor(settle, claimKey);
+  if (outcome.reason !== "marker_missing") return outcome;
+  // 去问记录本身。它要么已经有结论（别人做完了），要么还待发（那就现在提上去）。
+  const recheck = markPublishEligibleByEventKey({
+    outboxDir, eventKey: codexReplyEventKey({ threadId, claimKey }),
+    publishLockDir, requireRunId: claimKey,
+  });
+  if (recheck.ok) return { ok: true, reason: recheck.reason ?? (recheck.changed ? "promoted" : "unchanged") };
+  return { ok: false, reason: recheck.reason ?? "marker_missing" };
 }

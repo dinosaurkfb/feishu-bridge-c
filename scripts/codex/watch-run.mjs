@@ -3,7 +3,7 @@
 
 import { readClaim, recordClaimState } from "../claim.mjs";
 import {
-  eligibilityOutcomeFor, recoverEligibilityPending, settleEligibilityPending,
+  recoverEligibilityPending, settleOwnEligibility,
 } from "../eligibility-recovery.mjs";
 import { releaseSessionLock } from "../handoff.mjs";
 import {
@@ -59,6 +59,17 @@ if (!recovered.ok) {
   for (const r of recovered.pending) console.error("资格仍卡住：" + r.key + "（" + r.reason + "）");
   for (const r of recovered.unusable) console.error("恢复标记看不懂，没动：" + r.key + " —— " + r.unusable);
 }
+
+/**
+ * 等资格的预算。默认 60 秒 —— 竞争方持锁做真实网络发布默认可达 12 秒，
+ * 留足余量。**只接受非负整数**，写错就用默认值：一个看不懂的值不该
+ * 静默变成"零预算"，那会把这条恢复路径悄悄关掉。
+ */
+const eligibilityBudgetMs = (() => {
+  const raw = process.env.FEISHU_BRIDGE_ELIGIBILITY_BUDGET_MS;
+  if (raw === undefined) return 60_000;
+  return /^\d+$/u.test(raw) ? Number(raw) : 60_000;
+})();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const started = Date.now();
@@ -119,17 +130,21 @@ try {
             event_key: eventKey },
         });
         // 自己扫到有结论为止。只对 publisher_busy 重试 —— 别的失败多等也不会变好。
-        const settle = settleEligibilityPending({
+        // 标记不在了要去问记录本身：可能是另一个恢复器先做完了。
+        const settled_ = settleOwnEligibility({
           claimsDir: paths.claims, outboxDir: paths.outbox,
-          publishLockDir: paths.publishLock, threadId: task.codex_thread_id,
+          publishLockDir: paths.publishLock, threadId: task.codex_thread_id, claimKey: key,
+          budgetMs: eligibilityBudgetMs,
         });
         // **报出来的原因要是复查之后的原因。**只认 recovered 的话，
         // 复查时变成 event_not_found / record_unclassified / claims_unreadable，
         // 最终仍会照最初那个 publisher_busy 去报告。
-        settled = eligibilityOutcomeFor(settle, key);
+        settled = settled_;
       }
       if (!settled.ok) {
-        const why = settled.reason ?? "说不清";
+        // **真实原因要说出来。**只渲染 reason 的话最终只会说 marker_unusable，
+        // 而人真正需要知道的是"缺 event_key"这种具体的那句。
+        const why = (settled.reason ?? "说不清") + (settled.why ? "：" + settled.why : "");
         appendEvent({
           outboxDir: paths.outbox, kind: "risk",
           text: task.task_display_name + " 的这一轮答复已经跑完，但没能取得发布资格（" +

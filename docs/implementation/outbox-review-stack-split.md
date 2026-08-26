@@ -53,9 +53,12 @@
 所以事件键按 thread + 文件名里的 claim key **自己算**，命中记录还要 `run_id === claim_key`、
 必须唯一。
 
-**第 3 层完成恢复标记验真**（封闭键集、事件键自己算、命中唯一且 run_id 对得上）。
+**第 3 层完成恢复标记验真**（封闭键集**连同取值域**、事件键自己算、
+命中唯一且 run_id 对得上；标记缺席时在锁下按当前 event/run 复核，
+排除"另一个恢复器先做完了"这种歧义）。
 第 5 层保留：发布路径的锁内快照，以及完整的自动发布生命周期
-（**run 完成 marker** 的验真、watcher 的其余接线、**发布筛选那侧**的授权判据收敛）。
+（自动发布授权凭据的验真 —— 那个凭据**今天还不存在**，见 4.1、
+watcher 的其余接线、**发布筛选那侧**的授权判据收敛）。
 写端的授权判据已在第 3 层收敛。
 
 第 2 层已合入 `main`，所以 3、4、5 都**从 `main` 起分支**。
@@ -143,15 +146,22 @@ auditOutbox → outboxMutationBlocker → 查看器是否给命令
 - **锁的失败要有人接住**：给资格提升加锁之后 `publisher_busy` 成了真实路径，
   而 watcher 忽略返回值照样记 `completed` —— 那条答复**再没有任何路径获得资格**。
   **自己新加的失败模式，得自己接住。**
-- **run 完成 marker 是发布授权制品，必须验真**：封闭 schema、文件名与 `claim_key`
-  一致、规范时间、`run_state=completed`、**`event_key` 必须由 task/thread/claim
-  推导得出（不能由 marker 自带）**、outbox 记录的 `run_id === claim_key`。
-  否则一张错配的 marker 可以给另一条事件授予自动发布资格。
+- **自动发布的授权凭据要验真。**
 
-  **注意这跟第 3 层做完的那个不是同一个制品**：第 3 层验的是
-  `eligibility_pending` 恢复标记（`claims/<key>.eligibility_pending.json`），
-  这里说的是 run 完成 marker。判据要求相同，所以第 3 层那份实现可以照抄；
-  但两者各自都得验，**共用一个名字不等于共用一份校验**。
+  **先说清现状，别把计划写成现有物**：今天并**不存在**一个"run 完成 marker"。
+  资格是 watcher 在 run 终局确认后直接写 `publish_eligible_at`；
+  `claims/<key>.completed.json` 是**发布调用之后**才写的，它是记录不是凭据。
+  终局证据是 run 的 `.jsonl` / `.exit.json` / `.last-message.txt`。
+
+  这一层要做的是二选一（先定，再做）：
+  - 让 `readCodexRunOutcome` 那套终局证据本身成为受验的凭据；
+  - 或者**新增**一个显式的 run 完成 marker，并按下面这套验真。
+
+  验真要求（跟第 3 层恢复标记那份相同，实现可照抄）：封闭 schema **连同取值域**、
+  文件名与 `claim_key` 一致且是真实 key 形状、规范时间、`run_state=completed`、
+  **`event_key` 由 task/thread/claim 推导得出（不能由凭据自带）**、
+  outbox 记录的 `run_id === claim_key` 且命中唯一。
+  **共用一份要求不等于共用一份校验** —— 两个制品各自都得验。
 - **锁内字节快照**：同第 4 层。
 - **授权判据只有一份**：`publish_eligible_at` 只认规范 ISO（`hasPublishAuthorization`）。
   写端已在第 3 层收敛（原来把任意非空字符串判成 `already_eligible`，于是恢复器撤掉

@@ -96,14 +96,99 @@ export const PUBLISH_SCENARIOS = [
         "**正文里的错误码不许把自己判成平台拒绝**");
     },
   },
+  {
+    name: "dry-run：预演零改盘、零出网",
+    needs: ["publish", "dryRun"],
+    run(h, assert) {
+      h.seed("预演的那条");
+      const before = h.read("预演的那条");
+      const { publishCalls } = h.attempt("ok", { dryRun: true });
+      assert.equal(publishCalls, 0, "预演不许真的发");
+      assert.deepEqual(h.read("预演的那条"), before, "**预演一个字段都不许动**");
+    },
+  },
+  {
+    name: "显式重试：失败仍暂停，不许悄悄放回自动队列",
+    needs: ["publish", "failStates", "explicitRetry"],
+    run(h, assert) {
+      h.seed("重试又被拒的那条");
+      h.attempt("fail-platform");
+      assert.equal(retryProtection(h.read("重试又被拒的那条")).status, "paused", "前提：先暂停");
+      h.attempt("fail-platform", { retryRejected: true });
+      const rp = retryProtection(h.read("重试又被拒的那条"));
+      assert.equal(rp.status, "paused", "**再试还是被拒，就还是暂停**");
+      assert.equal(rp.kind, "platform_rejected");
+      const { publishCalls } = h.attempt("ok");
+      assert.equal(publishCalls, 0, "不带显式重试就仍然不进批次");
+    },
+  },
+  {
+    name: "显式重试：成功后落标、保护字段清干净",
+    needs: ["publish", "failStates", "explicitRetry"],
+    run(h, assert) {
+      h.seed("重试后发成的那条");
+      h.attempt("fail-platform");
+      const { publishCalls } = h.attempt("ok", { retryRejected: true });
+      assert.ok(publishCalls >= 1, "显式重试要真的发");
+      const rec = h.read("重试后发成的那条");
+      assert.match(rec.published_at ?? "", /^\d{4}/u, "发成了要落标");
+      assert.equal(retryProtection(rec).status, "clean", "**保护字段要在同一次写里清干净**");
+    },
+  },
+  {
+    name: "保护字段损坏：整批不动，一条不发",
+    needs: ["publish", "auditGate"],
+    run(h, assert) {
+      h.seed("好的那条");
+      h.seedCorruptProtection("坏形状的那条");
+      const { publishCalls } = h.attempt("ok");
+      assert.equal(publishCalls, 0, "**说不清就整批不动** —— 好的那条也不许发");
+      assert.equal(h.read("好的那条").published_at, null);
+      assert.equal(h.read("坏形状的那条").published_at, null, "坏的那条更不许动");
+    },
+  },
 ];
 
 /**
+ * 登记表 schema 校验。**每个套件都对全表跑一遍** —— 拼错 suite 的实现
+ * 会被两边同时跳过（评审实测：suite 写错 → 0 行、静默），
+ * 所以合法性必须全局验，不能只看自己认领的那几份。
+ */
+export function validatePublishRegistry(registry) {
+  const problems = [];
+  const impls = registry?.implementations;
+  if (impls === null || typeof impls !== "object") return ["implementations 不是对象"];
+  for (const [entry, meta] of Object.entries(impls)) {
+    if (!["legacy", "migrated"].includes(meta?.status)) {
+      problems.push(entry + "：status 不合法（" + String(meta?.status) + "）—— 拼错会被当成 legacy 静默生成 0 行");
+    }
+    if (!["claude", "codex"].includes(meta?.suite)) {
+      problems.push(entry + "：suite 不合法（" + String(meta?.suite) + "）—— 拼错会被两个套件同时跳过");
+    }
+    for (const name of Object.keys(meta?.not_applicable ?? {})) {
+      if (!PUBLISH_SCENARIOS.some((sc) => sc.name === name)) {
+        problems.push(entry + "：not_applicable 申报了不存在的场景「" + name + "」");
+      }
+    }
+  }
+  return problems;
+}
+
+/**
  * 由登记状态生成本套件要执行的矩阵行。
- * migrated 缺能力未申报 → 生成一条必红的行，翻状态就藏不住没接线。
+ *
+ * **适用性是登记表里的受控申报（not_applicable），不是 runner 自报** ——
+ * runner 自报能把所有场景都报成不适用，0 行照样绿（评审实测）。
+ * 登记表进评审、进版本，赖不掉。
+ *
+ * migrated 缺 runner / status 非法 / 缺能力未申报 / 一行都不执行 → 必红行。
  */
 export function matrixRowsFor({ registry, suite, runners, legacySubsets }) {
   const rows = [];
+  for (const problem of validatePublishRegistry(registry)) {
+    rows.push({ entry: "登记表", status: "invalid", title: problem,
+      run: (assert) => assert.fail("登记表不合法：" + problem) });
+  }
   for (const [entry, meta] of Object.entries(registry.implementations)) {
     if (meta.suite !== suite) continue;
     const runner = runners[entry];
@@ -113,6 +198,8 @@ export function matrixRowsFor({ registry, suite, runners, legacySubsets }) {
         run: (assert) => assert.fail(entry + " 在登记表里归 " + suite + " 套件，却没有矩阵 runner") });
       continue;
     }
+    if (!["legacy", "migrated"].includes(status)) continue;   // 已由校验行报红
+    const na = meta.not_applicable ?? {};
     const pick = status === "migrated"
       ? PUBLISH_SCENARIOS
       : PUBLISH_SCENARIOS.filter((sc) => (legacySubsets[entry] ?? []).includes(sc.name));
@@ -124,18 +211,26 @@ export function matrixRowsFor({ registry, suite, runners, legacySubsets }) {
         }
       }
     }
+    let executable = 0;
     for (const sc of pick) {
+      if (status === "migrated" && sc.name in na) continue;    // 受控申报的不适用
       const capable = sc.needs.every((c) => runner.caps.has(c));
       if (!capable) {
-        if (status === "migrated" && !(sc.name in (runner.notApplicable ?? {}))) {
+        if (status === "migrated") {
           rows.push({ entry, status, title: sc.name,
             run: (assert) => assert.fail(entry + " 是 migrated，场景「" + sc.name +
-              "」既没实现也没申报不适用 —— 翻状态不许跳过完整契约") });
+              "」既没实现也没在登记表申报不适用 —— 翻状态不许跳过完整契约") });
         }
         continue;
       }
+      executable += 1;
       rows.push({ entry, status, title: sc.name,
         run: (assert) => sc.run(runner.fixture(), assert) });
+    }
+    if (status === "migrated" && executable === 0) {
+      rows.push({ entry, status, title: "migrated 却一行都不执行",
+        run: (assert) => assert.fail(entry +
+          " 把所有场景都申报成不适用 —— migrated 至少要执行一个场景，否则状态是空话") });
     }
   }
   return rows;

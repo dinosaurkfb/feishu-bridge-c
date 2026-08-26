@@ -13016,8 +13016,7 @@ function drainMatrixFixture() {
 // ---------- 矩阵执行：状态驱动，行由登记表生成 ----------
 
 const drainMatrixRunner = {
-  caps: new Set(["publish", "failStates"]),
-  notApplicable: {},
+  caps: new Set(["publish", "failStates", "dryRun", "explicitRetry", "auditGate"]),
   fixture() {
     const g = drainMatrixFixture();
     const markers = [];
@@ -13035,6 +13034,13 @@ const drainMatrixRunner = {
       seedPaused(text) {
         markers.push(text); g.add(text);
         recordPublishFailure(g.pendingOf(text), { permanent: true, reason: "err_11310" });
+      },
+      seedCorruptProtection(text) {
+        // 坏形状要直接写盘（生产入口造不出来）—— 本文件在 token 豁免名单上。
+        markers.push(text);
+        const file = path.join(g.obDir, "corrupt-" + markers.length + ".json");
+        fs.writeFileSync(file, JSON.stringify({
+          ...outboxRecord({ text }), publish_attempts: "five" }));
       },
       attempt(behavior, opts = {}) {
         let publishCalls = 0;
@@ -13064,8 +13070,7 @@ const drainMatrixRunner = {
 };
 
 const watcherMatrixRunner = {
-  caps: new Set(["publish", "failStates"]),
-  notApplicable: {},
+  caps: new Set(["publish", "failStates", "auditGate"]),
   fixture() {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-matrix-w-"));
     const rt = path.join(dir, ".runtime-data", "inbound");
@@ -13121,6 +13126,12 @@ const watcherMatrixRunner = {
         recordPublishFailure(listPending({ outboxDir: obDir }).find((r) => r.text === text),
           { permanent: true, reason: "err_11310" });
       },
+      seedCorruptProtection(text) {
+        markers.push(text);
+        fs.appendFileSync(markersFile, text + "\n");
+        fs.writeFileSync(path.join(obDir, "corrupt-" + markers.length + ".json"),
+          JSON.stringify({ ...outboxRecord({ text }), publish_attempts: "five" }));
+      },
       attempt(behavior) {
         fs.writeFileSync(modeFile, behavior);
         turn += 1;
@@ -13155,9 +13166,11 @@ for (const row of matrixRowsFor({
   suite: "claude",
   runners: { "claude-drain": drainMatrixRunner, "claude-watcher": watcherMatrixRunner },
   legacySubsets: {
-    // watcher 今天满足全部五个跨入口场景 —— legacy 只表示"还没走事务"，
+    // watcher 满足全部**它有能力跑**的场景 —— legacy 只表示"还没走事务"，
     // 不是"行为缺失"。R2b1 翻 migrated 时这份申报删掉。
-    "claude-watcher": PUBLISH_SCENARIOS.map((sc) => sc.name),
+    "claude-watcher": PUBLISH_SCENARIOS
+      .filter((sc) => sc.needs.every((c) => ["publish", "failStates", "auditGate"].includes(c)))
+      .map((sc) => sc.name),
   },
 })) {
   test("矩阵[" + row.entry + "·" + row.status + "] " + row.title, () => row.run(assert));
@@ -13850,7 +13863,7 @@ test("发布事务：authorized_only 只消费授权结论，不自己造判据"
   assert.equal(junk.published_at, null, "垃圾授权那条一个字都不许动");
 });
 
-test("发布事务：记账钩子在落标之前跑，抛错按发布失败处理", () => {
+test("发布事务：记账钩子在落标之前跑，抛错不算发布失败", () => {
   // 顺序是语义：轮转活动记录必须先于 markSent（维持既有顺序）。
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-hook-"));
   const obDir = path.join(dir, "outbox");
@@ -13921,6 +13934,10 @@ test("发布事务：切批只许分组，不许增删候选", () => {
     ["漏一条", (records) => [records.slice(0, 1)]],
     ["重复一条", (records) => [records, records.slice(0, 1)]],
     ["塞外来记录", (records) => [[...records, { _file: "/别处/x.json", text: "外来" }]]],
+    // **评审的击穿点**：保留同一 _file、把整条记录克隆换内容 ——
+    // 按路径集合比对完全看不出来，发布的是伪造正文、markSent 还会把
+    // 磁盘原文改写成伪造内容。必须按对象身份验。
+    ["同路径克隆换内容", (records) => [[{ ...records[0], text: "FORGED" }, ...records.slice(1)]]],
   ]) {
     const g = mk();
     const { r, calls } = run(g, bad);
@@ -13953,56 +13970,50 @@ test("发布后记账缺口要一路到达渲染层，不许沉默", () => {
   assert.equal(clean.error, false);
 });
 
-test("矩阵机器：翻 migrated 自动要求完整契约，藏不住没接线", () => {
-  // 这台机器的承诺就是"状态驱动"。它自己的分支得逐个钉住 ——
-  // 真实登记表现在没有 migrated-缺能力 的组合，出错路径没人踩。
+test("矩阵机器：翻 migrated 自动要求完整契约，静默绕过的三条路都封死", () => {
+  // 评审实测过三条绕过：status 拼错→当 legacy 生成 0 行；suite 拼错→两套件
+  // 都跳过；runner 把所有场景自报不适用→0 行照样绿。逐条钉住。
   const scenarios = PUBLISH_SCENARIOS.map((sc) => sc.name);
-  const mk = (status, runner) => matrixRowsFor({
-    registry: { implementations: { "x-entry": { file: "x.mjs", status, suite: "t" } } },
-    suite: "t", runners: { "x-entry": runner },
-    legacySubsets: { "x-entry": ["基本发布：待发的发出去并落标"] },
-  });
+  const reg = (meta) => ({ implementations: { "x-entry": { file: "x.mjs", suite: "claude", ...meta } } });
+  const mk = (meta, runner, subsets = {}) => matrixRowsFor({
+    registry: reg(meta), suite: "claude", runners: { "x-entry": runner }, legacySubsets: subsets });
   const fails = (rows) => rows.filter((r) => {
     try { r.run(assert); return false; } catch { return true; }
   });
-
-  // migrated + 全能力 runner → 全部场景成行、没有必红行。
-  const able = { caps: new Set(["publish", "failStates"]), notApplicable: {},
+  const able = { caps: new Set(["publish", "failStates", "dryRun", "explicitRetry", "auditGate"]),
     fixture: () => { throw new Error("这条测试不真跑场景"); } };
-  const allRows = mk("migrated", able);
-  assert.equal(allRows.length, scenarios.length, "migrated 要拿到全部场景");
 
-  // migrated + 缺能力、没申报 → 必须生成必红行。
-  const lame = { caps: new Set(["publish"]), notApplicable: {}, fixture: () => ({}) };
-  const lameRows = mk("migrated", lame);
-  const mustFail = fails(lameRows.filter((r) => r.title !== "基本发布：待发的发出去并落标"
-    && r.title !== "已暂停的不进批次，也不从视野消失"));
-  assert.ok(mustFail.length >= 3,
-    "**缺 failStates 的三个场景必须成为必红行** —— 实际 " + mustFail.length);
+  // migrated + 全能力 → 全部场景成行、无必红行（fixture 抛错说明行会真执行，不算）。
+  const allRows = mk({ status: "migrated" }, able);
+  assert.equal(allRows.length, scenarios.length, "migrated 要拿到全部 " + scenarios.length + " 个场景");
 
-  // migrated + 缺能力但申报了不适用 → 允许跳过（申报是显式的，不是沉默的）。
-  // 桩给零能力：所有场景都走"缺能力"分支，只验申报豁免那条路。
-  const declared = { caps: new Set(),
-    notApplicable: Object.fromEntries(scenarios.map((n) => [n, "R2b1 再定"])),
-    fixture: () => ({}) };
-  const declaredRows = mk("migrated", declared);
-  assert.equal(declaredRows.length, 0, "全部申报了就一行都不生成");
-  assert.equal(fails(declaredRows).length, 0, "显式申报的不适用不许误伤");
+  // migrated + 缺能力、登记表没申报 → 必红行。
+  const lame = { caps: new Set(["publish"]), fixture: () => ({}) };
+  const lameFails = fails(mk({ status: "migrated" }, lame));
+  assert.ok(lameFails.length >= 6, "缺能力的场景必须成必红行，实际 " + lameFails.length);
 
-  // legacy 申报了不存在的场景 → 必红行。
-  const bad = matrixRowsFor({
-    registry: { implementations: { "x-entry": { file: "x.mjs", status: "legacy", suite: "t" } } },
-    suite: "t", runners: { "x-entry": able },
-    legacySubsets: { "x-entry": ["编造的场景名"] },
-  });
-  assert.ok(fails(bad).length >= 1, "申报不存在的场景必须红");
+  // **适用性是登记表的受控申报，不是 runner 自报。**申报了的允许跳过；
+  // 但全申报光 = migrated 一行不执行 → 必红。
+  const allNa = Object.fromEntries(scenarios.map((n) => [n, "测试用"]));
+  const swallowed = mk({ status: "migrated", not_applicable: allNa }, lame);
+  assert.equal(fails(swallowed).length, 1, "全申报光必须留一条必红行");
+  assert.match(swallowed.find((r) => { try { r.run(assert); return false; } catch { return true; } }).title,
+    /一行都不执行/u);
 
-  // 登记了却没有 runner → 必红行。
-  const orphan = matrixRowsFor({
-    registry: { implementations: { "x-entry": { file: "x.mjs", status: "legacy", suite: "t" } } },
-    suite: "t", runners: {}, legacySubsets: {},
-  });
-  assert.equal(fails(orphan).length, 1, "没有 runner 的登记必须红");
+  // status 拼错 → 校验行必红，不许静默当 legacy。
+  assert.ok(fails(mk({ status: "migratedd" }, able)).length >= 1, "status 拼错必须红");
+  // suite 拼错 → 校验行必红（全表校验，谁跑谁都能看见）。
+  const badSuite = matrixRowsFor({
+    registry: { implementations: { "x-entry": { file: "x.mjs", suite: "clade", status: "legacy" } } },
+    suite: "claude", runners: {}, legacySubsets: {} });
+  assert.ok(fails(badSuite).length >= 1, "suite 拼错必须红");
+  // not_applicable 申报不存在的场景 → 校验行必红。
+  assert.ok(fails(mk({ status: "migrated", not_applicable: { "编造的": "x" } }, able)).length >= 1);
+
+  // legacy 申报不存在的场景 / 无 runner → 必红。
+  assert.ok(fails(mk({ status: "legacy" }, able, { "x-entry": ["编造的场景名"] })).length >= 1);
+  assert.equal(fails(matrixRowsFor({
+    registry: reg({ status: "legacy" }), suite: "claude", runners: {}, legacySubsets: {} })).length, 1);
 });
 
 test("发布事务：锁内单快照 —— 两次读之间被换盘，发布的仍是第一次那份", () => {
@@ -14041,6 +14052,41 @@ test("发布事务：锁内单快照 —— 两次读之间被换盘，发布的
   } finally {
     fs.readFileSync = real;
   }
+});
+
+test("送达后没落标：单独分类、如实说可能重发，不进重试账", () => {
+  // 评审探针：网络发布成功后 markSent 的原子改名失败 —— 第一版落进统一
+  // catch 报 publish_failed、记一次失败账，下一轮再发 = **重发已送达内容**。
+  // 正确分类是 deliveredUnrecorded：不是发布失败（不记重试账）、
+  // 也不敢承诺"不会重发"（盘上确实没记）—— 要人去话题核对。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-unrecorded-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir);
+  const target = path.join(obDir, "0001.json");
+  fs.writeFileSync(target, JSON.stringify(outboxRecord({ text: "送达但没落标的" })));
+
+  // 探针：发布之后把记录文件所在目录改成只读，markSent 的改名就会失败。
+  let calls = 0;
+  const r = publishOutboxAttempt({
+    outboxDir: obDir, lockDir: path.join(dir, "lock"), policy: "all_unpaused",
+    batchCards: (records) => [records], resolveTarget: () => ({ ok: true }),
+    composeCard: () => ({}),
+    publishBatch: () => { calls += 1; fs.chmodSync(obDir, 0o500); return "om_sent"; },
+  });
+  fs.chmodSync(obDir, 0o700);
+  assert.equal(calls, 1, "前提：网络发布确实成功了一次");
+  assert.equal(r.status, "published", "**送达了就不是 publish_failed**");
+  assert.equal(r.deliveredUnrecorded.length, 1, "落标失败要单独分类");
+  assert.match(r.deliveredUnrecorded[0].file, /0001\.json/u);
+  const rec = JSON.parse(fs.readFileSync(target, "utf-8"));
+  assert.equal(rec.published_at, null, "前提：盘上确实没落标");
+  assert.equal(rec.publish_attempts, undefined, "**不许记重试账** —— 这不是发布失败");
+
+  // 渲染必须说"可能重发"，不许说"不会重发"。
+  const said = describeDrainOutcome(r, { root: dir });
+  assert.equal(said.error, true);
+  assert.match(said.text, /可能把它们重发/u, "**要如实说可能重发**");
+  assert.equal(said.text.includes("不会重发"), false, "落标失败时不许承诺不重发");
 });
 
 summarySealed = true;

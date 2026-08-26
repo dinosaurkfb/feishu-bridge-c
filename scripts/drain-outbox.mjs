@@ -262,6 +262,17 @@ export function drainProject({
  */
 export function describeDrainOutcome(r, { root, verbose = false } = {}) {
   if (r.status === "published") {
+    // **落标失败比记账缺口重一级：消息送达了但盘上没记 —— 下一轮可能重发。**
+    // 不许承诺"不会重发"，要人来核对（比如去话题里看那条在不在）。
+    if ((r.deliveredUnrecorded ?? []).length > 0) {
+      return {
+        error: true,
+        text: "已发布 " + r.count + " 条 -> " + r.messageId +
+          "，**但有 " + r.deliveredUnrecorded.length + " 条送达后没落标** —— " +
+          "**下一轮可能把它们重发一遍**，先去话题里核对再决定要不要手工标记：\n" +
+          r.deliveredUnrecorded.map((d) => "  " + d.file + "（" + d.messageId + "）—— " + d.error).join("\n"),
+      };
+    }
     // **发布后的记账缺口不许沉默。**消息确实送达了（不是发布失败），
     // 但轮转活动没记上 —— 不说出来，下一次代际决策就建立在缺账上。
     if ((r.bookkeepingFailures ?? []).length > 0) {

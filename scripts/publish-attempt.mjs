@@ -79,7 +79,8 @@ export const groupByTargetGeneration = (records) => {
  * @param publishBatch     ({target, card}) => messageId（真正出网的那一步）
  * @param onBatchPublished 可选 ({batch, target, messageId})，**只许记账不许否决** ——
  *                         在 publish 之后、markSent 之前调用（维持既有顺序：
- *                         轮转活动记录先于落标）。它抛错按发布失败处理。
+ *                         轮转活动记录先于落标）。**它抛错不算发布失败**：
+ *                         落标照做（防重发），缺口进 bookkeepingFailures。
  *
  * @returns
  *   { status:"skipped", reason }                     拿不到锁
@@ -152,18 +153,25 @@ export function publishOutboxAttempt({
       }));
     });
 
-    // **切批不许重选。**batchCards 是入口的卡片协议（比如 reply 一轮一张卡），
-    // 但它拿到的权力只有"怎么分组"，没有"发不发谁"。评审实测：让它返回空数组，
-    // 事务报 published、发布调用为 0、记录仍 pending —— 一次假成功。
-    // 漏项、重复、外来记录同理。所以发布前先验：**批次恰好覆盖 selected 一次**。
-    const flattened = targetBatches.flatMap((item) => item.batch);
-    const selectedFiles = selected.map((r) => String(r._file)).sort();
-    const batchedFiles = flattened.map((r) => String(r?._file)).sort();
-    if (JSON.stringify(selectedFiles) !== JSON.stringify(batchedFiles)) {
+    // **切批不许重选，也不许换内容。**batchCards 只有"怎么分组"的权力。
+    // 第一版按 _file 集合比对 —— 评审实测：保留同一路径、把整条记录换成
+    // {...record, text:"FORGED"}，照常发布伪造正文，**markSent 还把磁盘原文
+    // 改成了伪造内容**。所以按**对象身份**验：批次成员必须是 selected 里的
+    // 同一批对象、每个恰好一次 —— 克隆换字段进不来，快照承诺才立得住。
+    const remaining = new Set(selected);
+    let mismatch = null;
+    for (const item of targetBatches) {
+      for (const member of item.batch) {
+        if (!remaining.has(member)) { mismatch = "批里出现了不属于本次候选的对象（外来、重复或被克隆改写）"; break; }
+        remaining.delete(member);
+      }
+      if (mismatch) break;
+    }
+    if (!mismatch && remaining.size > 0) mismatch = "有 " + remaining.size + " 条候选被切批丢掉";
+    if (mismatch) {
       return {
         status: "error", reason: "batching_mismatch", local: true,
-        detail: "batchCards 改写了候选集合：选了 " + selected.length +
-          " 条、批里 " + flattened.length + " 条 —— 切批只许分组，不许增删",
+        detail: "batchCards 改写了候选集合：" + mismatch + " —— 切批只许分组，不许增删或换内容",
       };
     }
 
@@ -175,18 +183,20 @@ export function publishOutboxAttempt({
 
     const messageIds = [];
     const bookkeepingFailures = [];
+    const deliveredUnrecorded = [];
     for (const item of targetBatches) {
       // 失败要打在**这一批**上、诊断要查**这一个**目标 —— 不是全部待发。
       failingTarget = item.target;
       failingBatch = item.batch;
       const messageId = publishBatch({ target: item.target, card: item.card });
-      // **过了这一行，消息已经送达** —— 后面的任何失败都不是"发布失败"。
-      //
-      // 评审实测第一版：钩子抛错落进统一 catch，被当成网络失败记重试账、
-      // 记录仍 pending —— **下一轮把已送达的内容再发一遍**。
-      // 程序此刻明知发布成功、handle 都在手里，重发不是不可避免的崩溃窗口，
-      // 是分类错误。所以：钩子失败照样落标（防重发压倒一切），
-      // 记账缺口大声报出去（轮转账丢了要人知道，但那是可恢复的，重发不可撤）。
+      // **过了这一行，消息已经送达** —— 后面的任何失败都不是"发布失败"，
+      // 不进统一 catch、不记重试账。评审两轮各击穿一半：
+      //   · 钩子抛错曾被当网络失败 → 记录仍 pending → 下一轮重发已送达内容
+      //   · markSent 自己落盘失败也曾走同一条路 → 同样重发
+      // 分两类说清：
+      //   bookkeepingFailures —— 钩子失败。落标照做（防重发），轮转账丢了可补。
+      //   deliveredUnrecorded —— 落标失败。**消息已送达但盘上没记**，
+      //     下一轮确实可能重发 —— 不许承诺"不会重发"，要人来核对。
       try {
         // 记账钩子在落标之前 —— 维持轮转先于 markSent 的既有顺序。
         if (onBatchPublished) onBatchPublished({ batch: item.batch, target: item.target, messageId });
@@ -194,8 +204,14 @@ export function publishOutboxAttempt({
         bookkeepingFailures.push({ messageId,
           error: String(hookErr?.message ?? hookErr).slice(0, 300) });
       }
-      // 发布成功就落标；保护字段在同一次写里清掉。
-      for (const record of item.batch) markSent(record, messageId);
+      for (const record of item.batch) {
+        try { markSent(record, messageId); }
+        catch (markErr) {
+          deliveredUnrecorded.push({ messageId,
+            file: path.basename(String(record._file ?? "")),
+            error: String(markErr?.message ?? markErr).slice(0, 300) });
+        }
+      }
       messageIds.push(messageId);
     }
     return {
@@ -203,6 +219,7 @@ export function publishOutboxAttempt({
       messageId: messageIds.at(-1) ?? null, messageIds,
       // 空数组 = 账都记全了。非空必须被调用方看见 —— 沉默的缺账下次没人查。
       bookkeepingFailures,
+      deliveredUnrecorded,
     };
   } catch (err) {
     // 失败批次不落标、不吞掉；**成败都有账**。

@@ -6706,7 +6706,11 @@ test("项目级积压：内容、损坏结论、完整性都要跟 task 那半�
     const { home, obDir, registry } = setup();
     fs.writeFileSync(path.join(obDir, "0001.json"),
       JSON.stringify(outboxRecord({ text: "项目级正文必须可见" })));
-    const said = run(home, registry).stdout ?? "";
+    const clean = run(home, registry);
+    // **退出码也是承诺的一部分。**只断言文案的话，把 exit 改成非 0
+    // （或反过来对损坏也 exit 0）测试照样绿，而调用方是按退出码判断的。
+    assert.equal(clean.status, 0, "干净的积压不是故障，不许非 0 退出");
+    const said = clean.stdout ?? "";
     assert.match(said, /项目级正文必须可见/u,
       "**只报数量等于没回答「积压里是什么」**：" + said.slice(0, 400));
     assert.match(said, /0001\.json|\[milestone\]/u, "要给出记录的身份");
@@ -6718,6 +6722,7 @@ test("项目级积压：内容、损坏结论、完整性都要跟 task 那半�
     fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
       ...outboxRecord({ text: "损坏的" }), publish_attempts: 5 }));   // 缺暂停字段
     const r = run(home, registry);
+    assert.notEqual(r.status, 0, "**解释不了就得非 0 退出** —— 调用方按它判断");
     const said = (r.stdout ?? "") + (r.stderr ?? "");
     assert.match(said, /解释不了|归不了类/u,
       "**审计的结论不许被丢掉**：" + said.slice(0, 400));
@@ -6730,6 +6735,7 @@ test("项目级积压：内容、损坏结论、完整性都要跟 task 那半�
     const { home, obDir, registry } = setup();
     fs.writeFileSync(path.join(obDir, "0001.json"), "{ 这不是 JSON");
     const r = run(home, registry);
+    assert.notEqual(r.status, 0, "**坏 JSON 也得非 0 退出**");
     const said = (r.stdout ?? "") + (r.stderr ?? "");
     assert.match(said, /归不了类/u, "坏文件要点名");
     assert.equal(/积压 0 条。/u.test(said), false,

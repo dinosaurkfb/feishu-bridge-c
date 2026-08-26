@@ -6521,7 +6521,8 @@ test("积压视图：项目级绑定也在视野里，措辞不许超出实际�
 
   // 空的时候确实是空的 —— 守卫不能把好情况也一起报成有事。
   assert.deepEqual(withReg(() => collectProjectBacklog()),
-    { ok: true, scanned: true, projects: [] }, "真空的时候要说空");
+    { ok: true, scanned: true, projects: [], complete: true, problems: [] },
+    "真空的时候要说空且完整");
 
   // 放 3 条进去 —— 这正是 cc2cd 当时的样子。
   for (let i = 1; i <= 3; i += 1) {
@@ -6547,6 +6548,11 @@ test("积压视图：项目级绑定也在视野里，措辞不许超出实际�
   const broken = withReg(() => collectProjectBacklog());
   assert.equal(broken.ok, false, "**读不出来绝不能显示成没有积压**");
   assert.equal(broken.projects.length, 0);
+  // **失败分支也要闭合 {complete, problems}**。评审实测：只给 ok/reason 的话，
+  // 全景聚合里坏 JSON 变成 complete:false + problems:[] —— 说"不完整"却点不出名。
+  assert.equal(broken.complete, false);
+  assert.ok((broken.problems ?? []).some((x) => /读不出来/u.test(x.why)),
+    "problems 要说清是登记表坏了：" + JSON.stringify(broken.problems));
 
   // **路径是目录也算读不出来。**上一版用宽松读取器，它把 EISDIR / EACCES
   // 一律变成"成功的空表" —— 评审实测返回 {ok:true, projects:[]}，
@@ -6593,6 +6599,8 @@ test("坏的登记项不许静默跳过，全景说不清就不许说没有积�
     const got = withReg(() => collectProjectBacklog());
     assert.equal(got.ok, false, why + "：**说不清却报了 ok** —— " + JSON.stringify(got));
     assert.equal(got.reason, "registry_entry_malformed", why);
+    assert.equal(got.complete, false, why + "：失败分支也要闭合 complete");
+    assert.ok((got.problems ?? []).length > 0, why + "：坏登记项要出现在 problems 里");
     assert.match(got.bad?.[0]?.why ?? "", expect, why + "：理由不对 —— " + JSON.stringify(got.bad));
     assert.match(got.bad?.[0]?.at ?? "", /projects\[1\]/u, why + "：要点名是第几项");
   }
@@ -7046,6 +7054,119 @@ test("codex drain：只有轮转记账缺口也要非零退出（真实 CLI）",
   assert.match(h.read("送达但账缺的一条").published_at ?? "", /^\d{4}/u, "消息要落标（不重发）");
   assert.match(said, /记账失败/u, "提示要在：" + said.slice(0, 250));
   assert.notEqual(out.status, 0, "**不完整成功不许 exit 0**");
+});
+
+test("R5 completeness：收集层给结论，坏一处就 complete:false 并点名", () => {
+  const home = temp();
+  const proj = path.join(home, "cc2cd");
+  const obDir = path.join(proj, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const registry = path.join(home, "registry.json");
+  fs.writeFileSync(registry, JSON.stringify({
+    schema_version: "1.0", projects: [{ root: proj, claude_session_id: null }] }));
+  const before = process.env.FEISHU_BRIDGE_REGISTRY;
+  process.env.FEISHU_BRIDGE_REGISTRY = registry;
+  try {
+    fs.writeFileSync(path.join(obDir, "good.json"), JSON.stringify(outboxRecord({ text: "好的" })));
+    const clean = collectProjectBacklog();
+    assert.equal(clean.complete, true, "干净时 complete");
+    assert.deepEqual(clean.problems, []);
+
+    fs.writeFileSync(path.join(obDir, "bad.json"), "{ 坏了");
+    const dirty = collectProjectBacklog();
+    assert.equal(dirty.complete, false, "**坏一处就不完整** —— 精确数字的底气就没了");
+    assert.ok(dirty.problems.some((x) => /bad\.json/u.test(x.at)),
+      "problems 要点名：" + JSON.stringify(dirty.problems));
+    // 全景聚合也要变不完整。
+    const whole = collectBacklog({ home });
+    assert.equal(whole.complete, false, "全景聚合要继承项目侧的不完整");
+    assert.ok(whole.problems.some((x) => /bad\.json/u.test(x.at)));
+
+    // **顶层继承必须无条件**：项目登记表整体坏掉（projects.ok:false）时，
+    // 聚合层若只在 ok && scanned 时吸收问题，就得到 complete:false 而
+    // problems:[] —— 结论与点名脱节，第二个消费者还得回去啃 reason/bad。
+    // 项目登记表换独立文件写坏 —— 这个测试里它跟 Codex task 登记表共用一个
+    // 文件，直接写坏会把 task 侧也弄瞎，测的就不再是"单侧瞎了"。
+    const projReg = path.join(home, "proj-reg.json");
+    fs.writeFileSync(projReg, "{ 这不是 JSON");
+    process.env.FEISHU_BRIDGE_REGISTRY = projReg;
+    const orphanWhole = collectBacklog({ home });
+    assert.equal(orphanWhole.ok, true, "task 侧登记表是好的，整体调用不该失败");
+    assert.equal(orphanWhole.complete, false, "项目侧瞎了就不完整");
+    assert.ok(orphanWhole.problems.length > 0,
+      "**complete:false 必须点得出名**：" + JSON.stringify(orphanWhole.problems));
+    assert.ok(orphanWhole.problems.some((x) => /登记表/u.test(x.why)),
+      "要说清是登记表的问题：" + JSON.stringify(orphanWhole.problems));
+    // 坏登记项（而非坏 JSON）也一样要继承。
+    fs.writeFileSync(projReg, JSON.stringify({
+      schema_version: "1.0", projects: [{ root: 42 }] }));
+    const entryWhole = collectBacklog({ home });
+    assert.equal(entryWhole.complete, false);
+    assert.ok(entryWhole.problems.some((x) => /projects\[0\]/u.test(x.at)),
+      "坏在第几条要点名：" + JSON.stringify(entryWhole.problems));
+
+    // **混合故障：合法项目坏 outbox + 相邻坏登记项，两类问题都要在。**
+    // 评审实测：坏登记项分支先返回、outbox 问题后收集，于是只报前者 ——
+    // 坏 outbox 要等人修完登记表、跑第二遍才看得见。
+    fs.writeFileSync(projReg, JSON.stringify({ schema_version: "1.0",
+      projects: [{ root: proj, claude_session_id: null }, { root: 42 }] }));
+    const mixed = collectProjectBacklog();
+    assert.equal(mixed.ok, false);
+    assert.equal(mixed.complete, false);
+    assert.ok(mixed.problems.some((x) => /projects\[1\]/u.test(x.at)),
+      "坏登记项要在：" + JSON.stringify(mixed.problems));
+    assert.ok(mixed.problems.some((x) => /bad\.json/u.test(x.at)),
+      "**已扫出的坏 outbox 也要在，不许等第二遍**：" + JSON.stringify(mixed.problems));
+    // 顶层继承同样两类都要在。
+    const mixedWhole = collectBacklog({ home });
+    assert.ok(mixedWhole.problems.some((x) => /projects\[1\]/u.test(x.at)));
+    assert.ok(mixedWhole.problems.some((x) => /bad\.json/u.test(x.at)),
+      "顶层也不许丢已扫出的那半：" + JSON.stringify(mixedWhole.problems));
+    // 真实 CLI 在同一次输出里要把两类都点名。
+    const mixedCli = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
+      { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+        FEISHU_BRIDGE_REGISTRY: projReg } });
+    assert.notEqual(mixedCli.status, 0);
+    assert.match(mixedCli.stderr, /projects\[1\]/u, "CLI 要点名坏登记项：" + mixedCli.stderr);
+    assert.match(mixedCli.stderr, /bad\.json/u,
+      "**CLI 同一次输出就要点名坏 outbox**：" + mixedCli.stderr);
+    // 恢复：项目侧指回共用那份好登记表，后面的区分场景继续用。
+    process.env.FEISHU_BRIDGE_REGISTRY = registry;
+
+    // **区分场景：task 侧只有 unexplainable**（渲染层若自己现算，
+    // 它那份判据只看 readable/unclassified —— 恰好漏掉这一类，
+    // 于是打出「积压 N 条。」的假精确）。
+    fs.rmSync(path.join(obDir, "bad.json"));
+    const troot = path.join(home, "tproj");
+    fs.mkdirSync(troot, { recursive: true });
+    const ttask = makeTaskEntry({ root: troot, threadId: THREAD_A, name: "T-unexp",
+      rootMessageId: "om_t", token: "t" });
+    writeRegistryFixtureUnvalidated([ttask], path.join(home, "registry.json.codex"));
+    // codex 登记表默认路径就是 home/registry.json —— 上面被项目级用了；
+    // 直接写 codex 自己的默认位置。
+    writeRegistryFixtureUnvalidated([ttask], path.join(home, "registry.json"));
+    const tob = taskPaths(ttask, home).outbox;
+    fs.mkdirSync(tob, { recursive: true });
+    fs.writeFileSync(path.join(tob, "weird.json"), JSON.stringify({
+      ...outboxRecord({ text: "解释不了的" }), publish_attempts: "five" }));
+    // 项目级 registry 换独立文件避免互相踩。
+    const preg2 = path.join(home, "proj-registry.json");
+    fs.writeFileSync(preg2, JSON.stringify({ schema_version: "1.0", projects: [] }));
+    process.env.FEISHU_BRIDGE_REGISTRY = preg2;
+    const r = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
+      { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+        FEISHU_BRIDGE_REGISTRY: preg2 } });
+    const said = (r.stdout ?? "") + (r.stderr ?? "");
+    assert.match(said, /不完整/u,
+      "**task 侧 unexplainable 也要让总数标不完整**：" + said.slice(0, 300));
+    assert.equal(/积压 \d+ 条。/u.test(said), false,
+      "不许给假精确的总数：" + said.slice(0, 200));
+  } finally {
+    if (before === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY;
+    else process.env.FEISHU_BRIDGE_REGISTRY = before;
+  }
 });
 
 summarySealed = true;

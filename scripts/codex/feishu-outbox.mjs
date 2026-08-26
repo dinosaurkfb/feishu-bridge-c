@@ -246,19 +246,19 @@ export function describeTaskPublishability({ task, home }) {
 }
 
 /**
- * @returns {{ok:true, tasks:Array}|{ok:false, reason:string}}
- * 每个 task 带 `readable`：false 表示 outbox 读不全，**这时候的条数不可信**。
- */
-/**
  * 项目级绑定的积压。
  *
  * 它们不在 Codex 登记表里 —— 那张表管的是 task。项目级绑定登记在 Claude 那张
  * registry 里，outbox 路径由 outboxDirOf 决定（会话级绑定是 `outbox-<uuid>/`）。
  * **判据共用**：路径用 outboxDirOf、审计用 auditOutbox，不在这里另写一份。
  *
- * @returns {{ok:true, scanned:true, projects:object[]}|{ok:false, reason:string}}
+ * @returns {{ok:true, scanned:true, projects:object[], complete:boolean,
+ *          problems:{at:string,why:string}[]}
+ *          |{ok:false, scanned:false, reason:string, complete:false,
+ *          problems:{at:string,why:string}[]}}
  *          读不出登记表是**故障**，不是"没有项目" —— 这两件事在输出上长得一样，
- *          含义却相反。
+ *          含义却相反。**失败分支同样闭合 {complete, problems}**：消费者只须
+ *          读这两个字段就知道"完整吗、为什么不完整"，不必再理解 reason/bad。
  */
 export function collectProjectBacklog() {
   // **用严格读取器。**宽松那个把 EISDIR / EACCES 一律变成"成功的空表"——
@@ -266,7 +266,14 @@ export function collectProjectBacklog() {
   // 于是"读不出来"又一次显示成了"没有积压"。它还会过滤停用条目，
   // 而停用绑定的 outbox 里照样可能躺着发不出去的内容，正是要给人看的。
   const reg = loadClaudeRegistryStrict();
-  if (!reg.ok) return { ok: false, scanned: false, reason: reg.reason ?? "registry_unreadable", projects: [] };
+  if (!reg.ok) {
+    // **失败分支也要闭合 {complete, problems} 契约。**评审实测：这里只给
+    // ok/reason，聚合层又只在 ok 时吸收项目侧问题，于是坏 JSON 在全景里
+    // 得到 {complete:false, problems:[]} —— 结论说"不完整"，却点不出名。
+    const why = reg.reason ?? "registry_unreadable";
+    return { ok: false, scanned: false, reason: why, projects: [], complete: false,
+      problems: [{ at: "claude-registry", why: "项目登记表读不出来（" + why + "）" }] };
+  }
   const seen = new Set();
   const projects = [];
   // **坏的登记项不许静默跳过。**
@@ -341,22 +348,48 @@ export function collectProjectBacklog() {
       projects.push(entry);
     }
   }
+  // **completeness 是收集层的结论，不是渲染层的现算**（R5）。
+  // 判定散在渲染层的话，第二个消费者又得自己算一遍 —— 算漏的那个
+  // 就会把残缺视野当完整视野报（"积压 0 条"那类假精确）。
+  //
+  // **在坏登记项判定之前收集** —— 评审实测：先返回再收集的话，
+  // "合法项目坏 outbox + 相邻坏登记项"这种混合故障只报后者，
+  // 坏 outbox 要等人修完登记表、跑第二遍才看得见。
+  const problems = [];
+  for (const entry of projects) {
+    if (!entry.readable) problems.push({ at: entry.name, why: "outbox 读不出来（" + entry.unreadableReason + "）" });
+    for (const u of entry.unclassified ?? []) problems.push({ at: entry.name + "/" + u.file, why: u.why });
+    for (const u of entry.unexplainable ?? []) problems.push({ at: entry.name + "/" + u.file, why: u.why });
+  }
   // **有坏项就整体报不完整**，不许拿一份残缺的全景去支撑"没有积压"这个结论。
+  // problems 合并两类：坏登记项（解释视野为什么残缺）在前，已扫出的 outbox 问题在后
+  // —— **全部已观察到的问题一次给全**。
   if (bad.length > 0) {
     return { ok: false, scanned: false, reason: "registry_entry_malformed",
-      bad, projects };
+      bad, projects, complete: false,
+      problems: [...bad.map((b) => ({ at: "claude-registry/" + b.at, why: b.why })), ...problems] };
   }
-  return { ok: true, scanned: true, projects };
+  return { ok: true, scanned: true, projects, complete: problems.length === 0, problems };
 }
 
+/**
+ * @returns {{ok:true, tasks:Array, projects:object, complete:boolean,
+ *          problems:{at:string,why:string}[]}
+ *          |{ok:false, reason:string, complete:false,
+ *          problems:{at:string,why:string}[]}}
+ * 每个 task 带 `readable`：false 表示 outbox 读不全，**这时候的条数不可信**。
+ * completeness 只有这一份定义：problems 为空才 complete —— 失败分支也闭合它。
+ */
 export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey = null } = {}) {
   const reg = loadRegistry(registryFile(home));
   // **原样透传受控 reason/detail。**上一版一律改写成 registry_unreadable ——
   // 登记表那层刚做出来的精确诊断（结构坏了、第几条坏了）到不了用户手上，
   // 他看到的只有"读不出登记表"。
   if (!reg.ok) {
-    return { ok: false, reason: reg.reason ?? "registry_unreadable",
-      detail: reg.detail ? sanitizeForDisplay(reg.detail) : null };
+    const why = reg.reason ?? "registry_unreadable";
+    return { ok: false, reason: why,
+      detail: reg.detail ? sanitizeForDisplay(reg.detail) : null, complete: false,
+      problems: [{ at: "codex-registry", why: "task 登记表读不出来（" + why + "）" }] };
   }
   const all = reg.tasks ?? [];
   const selected = all.filter((t) =>
@@ -364,7 +397,8 @@ export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey =
     (taskKey === null || t.logical_task_key === taskKey));
   // **点名要一条却没找到，是错误，不是"没有积压"。**
   if ((threadId !== null || taskKey !== null) && selected.length === 0) {
-    return { ok: false, reason: "task_not_found" };
+    return { ok: false, reason: "task_not_found", complete: false,
+      problems: [{ at: taskKey ?? threadId, why: "点名的 task 不存在" }] };
   }
 
   // **项目级绑定也在视野里。**
@@ -380,7 +414,7 @@ export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey =
   // 点名了 thread/task 时不扫项目级：那次问的是"这一条 task 怎么样"。
   const projects = (threadId === null && taskKey === null)
     ? collectProjectBacklog()
-    : { ok: true, scanned: false, projects: [] };
+    : { ok: true, scanned: false, projects: [], complete: true, problems: [] };
 
   const tasks = [];
   for (const task of selected) {
@@ -422,7 +456,21 @@ export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey =
       tasks.push(entry);
     }
   }
-  return { ok: true, tasks, projects };
+  // 两半的 completeness 聚合成一份结论 —— 消费者只读它，不再自己算。
+  const problems = [];
+  for (const t of tasks) {
+    if (!t.readable) problems.push({ at: t.name, why: "outbox 读不出来（" + t.unreadableReason + "）" });
+    for (const u of t.unclassified ?? []) problems.push({ at: t.name + "/" + u.file, why: u.why });
+    for (const u of t.unexplainable ?? []) problems.push({ at: t.name + "/" + u.file, why: u.why });
+  }
+  // **无条件汇总项目侧问题。**失败分支现在也闭合 {complete, problems}，
+  // 聚合层再按 ok/scanned 挑着吸收，就又把"为什么不完整"弄丢了 ——
+  // 评审实测正是这样：坏 JSON 得到 complete:false 而 problems:[]。
+  problems.push(...(projects.problems ?? []));
+  // complete 只有这一份定义：没有问题就是完整。projects.ok===false 时它的
+  // problems 非空，自然落进上面那句 —— 不需要第二个条件来补。
+  const complete = problems.length === 0;
+  return { ok: true, tasks, projects, complete, problems };
 }
 
 /**
@@ -469,7 +517,9 @@ function main() {
   if (proj.ok === false) {
     warn("项目级绑定的登记表说不清（" + proj.reason + "）—— " +
       "**这不是「没有积压」**，项目级那半边视野现在是瞎的。");
-    for (const b of proj.bad ?? []) warn("  " + b.at + " —— " + b.why);
+    // 打印完整 problems —— 里面既有坏登记项，也有**已扫出的** outbox 问题。
+    // 只打坏登记项的话，坏 outbox 要等修完登记表、跑第二遍才看得见。
+    for (const b of proj.problems ?? []) warn("  " + b.at + " —— " + b.why);
     process.exit(1);
   }
 
@@ -493,26 +543,22 @@ function main() {
   // 同一件事写两份，第二份总会少点什么。这条线上已经因此栽过很多次。
   const projectSections = [];
   let projectTotal = 0;
-  let projectComplete = true;
   for (const entry of proj.projects) {
     const lines = [];
     lines.push("【项目 " + entry.name + "】");
     if (!entry.readable) {
       trouble = true;
-      projectComplete = false;
       lines.push("  **outbox 读不出来（" + entry.unreadableReason + "）—— 这里的条数不可信。**");
       projectSections.push(lines);
       continue;
     }
     if ((entry.unclassified ?? []).length > 0) {
       trouble = true;
-      projectComplete = false;
       lines.push("  **有 " + entry.unclassified.length + " 个文件归不了类，整体不可信：**");
       for (const u of entry.unclassified) lines.push("    " + u.file + " —— " + u.why);
     }
     if ((entry.unexplainable ?? []).length > 0) {
       trouble = true;
-      projectComplete = false;
       lines.push("  **有 " + entry.unexplainable.length + " 条记录解释不了，不能对它们动手：**");
       for (const u of entry.unexplainable) lines.push("    " + u.file + " —— " + u.why);
     }
@@ -546,7 +592,8 @@ function main() {
   // **一个精确的数字暗示着「我全看清了」，而那不成立。**
   const taskTotal = readable.reduce((n, t) => n + t.records.length, 0);
   const total = taskTotal + projectTotal;
-  const complete = projectComplete && readable.length === got.tasks.length;
+  // completeness 读收集层的结论 —— 这里现算就是第二份判据（R5 上移）。
+  const complete = got.complete === true;
   // **这里曾经内嵌过一个 \n** —— 而输出边界的规则正是我自己在同一个文件里定的：
   // 格式串不许带换行。净化器把它换成了 U+FFFD，真实输出首行成了"积压 1 条。<?>"。
   // 空行单独发一次。

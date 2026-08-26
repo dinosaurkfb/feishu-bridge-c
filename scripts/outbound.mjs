@@ -9,6 +9,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
 
@@ -42,15 +43,19 @@ export function scanRuns({ runsDir }) {
     const logPath = path.join(runsDir, f);
     const outcome = readRunOutcome(logPath);
     const pres = PRESENTATION[outcome.state] ?? PRESENTATION.missing;
-    const publishedAt = readPublished(runsDir, key);
+    const receipt = readRunReceipt({ runsDir, key });
+    const publishedAt = receipt.state === "valid" ? receipt.publishedAt : null;
 
     out.push({
       key,
       logPath,
       state: outcome.state,
       label: pres.label,
-      shouldPublish: pres.publish && publishedAt === null,
-      alreadyPublished: publishedAt !== null,
+      // 回执说不清时**两头都不许**：不发（可能双发）、也不当已发（可能漏发）。
+      shouldPublish: pres.publish && receipt.state === "absent",
+      alreadyPublished: receipt.state === "valid",
+      receiptUnreadable: receipt.state === "unreadable"
+        ? (receipt.why ?? "说不清") : null,
       truthful: pres.truthful,
       finalText: outcome.finalText ?? null,
       deniedTools: outcome.deniedTools ?? null,
@@ -59,13 +64,8 @@ export function scanRuns({ runsDir }) {
   return out;
 }
 
-function readPublished(runsDir, key) {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(runsDir, key + PUBLISHED_MARK), "utf-8")).published_at;
-  } catch {
-    return null;
-  }
-}
+// readPublished 已被回执三态取代 —— "存在即已发"的判法把缺字段的回执
+// 静默当成已送达，一条 run 结果就此永久消失（评审同款缺陷在 scanRuns 这层的分身）。
 
 /** 发布后落标记，防止同一个 run 被重复发布到话题里。 */
 /**
@@ -85,50 +85,116 @@ function readPublished(runsDir, key) {
  */
 export function claimRunPublish({ runsDir, key, staleMs = 5 * 60 * 1000, now = Date.now() } = {}) {
   const file = path.join(runsDir, key + ".publish-claim.json");
+  const reapLock = file + ".reaplock";
+  const token = randomUUID();
   const attempt = () => {
     try {
-      // **单步原子创建（wx）**。第一版用 mkdir + 再写 owner 两步 ——
-      // 并发对手在两步之间读到空 owner、按"可接管"抢走了 claim，
-      // 互斥当场失效（实测两个 watcher 各发一张）。wx 把创建和内容并成一个系统调用。
+      // wx 单步原子创建（两步 mkdir+owner 被实测在步间抢占过）。
       fs.writeFileSync(file,
-        JSON.stringify({ pid: process.pid, at: new Date(now).toISOString() }) + "\n",
+        JSON.stringify({ pid: process.pid, at: new Date(now).toISOString(), token }) + "\n",
         { flag: "wx", mode: 0o600 });
-      return { ok: true, file };
+      return { ok: true, file, token };
     } catch (err) {
       if (err.code === "EEXIST") return { ok: false, reason: "claimed_by_other" };
       return { ok: false, reason: "io_error", error: String(err.message).slice(0, 200) };
     }
   };
+  const readOwner = () => {
+    try { return JSON.parse(fs.readFileSync(file, "utf-8")); } catch { return null; }
+  };
+  const isStale = (owner) => {
+    // **只接管死进程**：活着的 owner 即使超龄也不抢 —— 没有 lease/heartbeat
+    // 就凭年龄抢活人，会顶掉慢的合法持有者（评审点名）。
+    if (owner && Number.isFinite(owner.pid)) {
+      try { process.kill(owner.pid, 0); return false; } catch { return true; }
+    }
+    try { return now - fs.statSync(file).mtimeMs > staleMs; } catch { return false; }
+  };
+
   const first = attempt();
   if (first.ok || first.reason !== "claimed_by_other") return first;
-  // stale 判定：owner 读得出且（超龄 或 进程死了）才可接管。
-  // **读不出不算立刻可接管** —— 那可能只是对手刚创建（虽然 wx 下几乎不可能），
-  // 按文件 mtime 的年龄兜底。
-  let owner = null;
-  try { owner = JSON.parse(fs.readFileSync(file, "utf-8")); } catch { /* 按 mtime 兜底 */ }
-  let stale = false;
-  if (owner) {
-    const at = Date.parse(owner.at ?? "");
-    let alive = false;
-    if (Number.isFinite(owner.pid)) {
-      try { process.kill(owner.pid, 0); alive = true; } catch { alive = false; }
-    }
-    stale = (Number.isFinite(at) && now - at > staleMs) || !alive;
-  } else {
-    try { stale = now - fs.statSync(file).mtimeMs > staleMs; } catch { stale = true; }
+  const seen = readOwner();
+  if (!isStale(seen)) return first;
+
+  // ■ stale 接管：**必须串行**（评审实测三个教训堆在这一段上）
+  //
+  //   · "判 stale → rm → wx"：后到者的 rm 删掉先到者刚创建的新 claim，
+  //     64 个接管者出了 3 个 winner。
+  //   · 换成 rename 摘除：rename 按**路径**不按 inode —— 后到者照样把
+  //     winner 的新 claim 重命名走，16 个里出了 5 个 winner。
+  //   · 所以移除动作本身要独占：reap 锁（wx 单步）串行化接管，
+  //     持锁者**重读并核对还是刚才那一代**（token 比对）才许移除。
+  //     核对失败 = 有人已经接上了 —— 放手认输。
+  try {
+    fs.writeFileSync(reapLock,
+      JSON.stringify({ pid: process.pid, at: new Date(now).toISOString() }) + "\n",
+      { flag: "wx", mode: 0o600 });
+  } catch (err) {
+    if (err.code !== "EEXIST") return { ok: false, reason: "io_error", error: String(err.message).slice(0, 200) };
+    // reap 锁自己也可能死在半路：只按 mtime 超时接管（30s 远大于一次接管耗时）。
+    let reapStale = false;
+    try { reapStale = now - fs.statSync(reapLock).mtimeMs > 30_000; } catch { /* 刚释放 */ }
+    if (!reapStale) return { ok: false, reason: "claimed_by_other" };
+    fs.rmSync(reapLock, { force: true });
+    try {
+      fs.writeFileSync(reapLock,
+        JSON.stringify({ pid: process.pid, at: new Date(now).toISOString() }) + "\n",
+        { flag: "wx", mode: 0o600 });
+    } catch { return { ok: false, reason: "claimed_by_other" }; }
   }
-  if (!stale) return first;
+  try {
+    const current = readOwner();
+    // **代际核对**：还是我刚才判 stale 的那一代才许动手。
+    if (!current || current.token !== seen?.token || !isStale(current)) {
+      return { ok: false, reason: "claimed_by_other" };
+    }
+    fs.rmSync(file, { force: true });
+    return attempt();
+  } finally {
+    fs.rmSync(reapLock, { force: true });
+  }
+}
+
+/**
+ * 回执三态。**存在 ≠ 有效送达**（评审点名：existsSync 会把空文件、坏 JSON、
+ * 目录都说成"已送达"，结果被永久跳过）。
+ *   absent     —— 没有回执，可以发
+ *   valid      —— 结构合法（有 published_at），确实送达过
+ *   unreadable —— 有东西但说不清 —— **fail-closed，别发也别当送达**，要报警
+ */
+export function readRunReceipt({ runsDir, key } = {}) {
+  const file = path.join(runsDir, key + PUBLISHED_MARK);
+  let raw;
+  try { raw = fs.readFileSync(file, "utf-8"); }
+  catch (err) {
+    return err.code === "ENOENT" ? { state: "absent" }
+      : { state: "unreadable", why: String(err.code ?? err.message) };
+  }
+  try {
+    const doc = JSON.parse(raw);
+    if (doc && typeof doc === "object" && !Array.isArray(doc)
+      && typeof doc.published_at === "string" && doc.published_at) {
+      return { state: "valid", publishedAt: doc.published_at,
+        messageId: doc.feishu_message_id ?? null };
+    }
+    return { state: "unreadable", why: "结构不合法" };
+  } catch {
+    return { state: "unreadable", why: "不是 JSON" };
+  }
+}
+
+/**
+ * **只释放自己的代际。**release 带 token：不带或对不上就不动 ——
+ * 否则旧持有者能删掉接管者刚创建的新 claim（评审点名）。
+ */
+export function releaseRunPublishClaim({ runsDir, key, token } = {}) {
+  const file = path.join(runsDir, key + ".publish-claim.json");
+  try {
+    const owner = JSON.parse(fs.readFileSync(file, "utf-8"));
+    if (owner?.token !== token) return false;
+  } catch { return false; }
   fs.rmSync(file, { force: true });
-  return attempt();
-}
-
-/** 这条 run 已经有送达回执了吗。claim 拿到后**必须复核它** —— 见 claimRunPublish。 */
-export function hasRunReceipt({ runsDir, key } = {}) {
-  return fs.existsSync(path.join(runsDir, key + PUBLISHED_MARK));
-}
-
-export function releaseRunPublishClaim({ runsDir, key } = {}) {
-  fs.rmSync(path.join(runsDir, key + ".publish-claim.json"), { force: true });
+  return true;
 }
 
 export function markPublished({ runsDir, key, messageId }) {

@@ -15,7 +15,7 @@ import path from "node:path";
 
 import { readRunOutcome } from "./handoff.mjs";
 import {
-  buildDraft, claimRunPublish, hasRunReceipt, markPublished, publishDraft,
+  buildDraft, claimRunPublish, markPublished, publishDraft, readRunReceipt,
   releaseRunPublishClaim, scanRuns,
 } from "./outbound.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
@@ -140,6 +140,12 @@ while (true) {
     // —— 通道一：run 结果 ——
     const publishLock = await waitForPublishLock();
     try {
+      if (run?.receiptUnreadable) {
+        // 上游（scanRuns）已按三态把 shouldPublish 关掉 —— 但**必须报警**，
+        // 静默跳过就是"损坏回执被当成已送达"的旧病换个位置复发。
+        console.error("run 回执损坏（" + run.receiptUnreadable + "）—— **说不清送没送达，" +
+          "本轮不发**。去话题核对后手工处理 " + key.slice(0, 8) + " 的回执文件。");
+      }
       if (run?.shouldPublish && autoOk) {
         const draft = buildDraft(run, { taskName: cfg.task_display_name });
         if (draft) {
@@ -167,9 +173,16 @@ while (true) {
           const claim = claimRunPublish({ runsDir: RUNS, key });
           // **claim 后复核回执** —— shouldPublish 是并发对手完成之前读的，
           // 对手发完释放 claim 后这里能拿到新 claim；回执才是持久的真相。
-          if (claim.ok && hasRunReceipt({ runsDir: RUNS, key })) {
-            releaseRunPublishClaim({ runsDir: RUNS, key });
-            console.error("run 结果已由另一个 watcher 送达（回执在），本轮不再发。");
+          const receipt = claim.ok ? readRunReceipt({ runsDir: RUNS, key }) : null;
+          if (claim.ok && receipt.state === "valid") {
+            releaseRunPublishClaim({ runsDir: RUNS, key, token: claim.token });
+            console.error("run 结果已由另一个 watcher 送达（回执合法），本轮不再发。");
+          } else if (claim.ok && receipt.state === "unreadable") {
+            // **回执说不清 ≠ 没送达。**这时发可能双发、跳过可能漏发 ——
+            // fail-closed：不发、报警、留给人核对。
+            releaseRunPublishClaim({ runsDir: RUNS, key, token: claim.token });
+            console.error("run 回执损坏（" + receipt.why + "）—— **说不清送没送达，" +
+              "本轮不发**。去话题核对后手工处理 " + key.slice(0, 8) + " 的回执文件。");
           } else if (!claim.ok) {
             console.error("run 结果本轮不发：" + (claim.reason === "claimed_by_other"
               ? "另一个 watcher 正在发同一条 run（claim 互斥）"
@@ -189,7 +202,7 @@ while (true) {
               });
               // 回执先落（防重发压倒一切），轮转记账失败只记缺口不回滚。
               markPublished({ runsDir: RUNS, key, messageId: mid });
-              releaseRunPublishClaim({ runsDir: RUNS, key });
+              releaseRunPublishClaim({ runsDir: RUNS, key, token: claim.token });
               try { rotationHook({ batch: [runRecord], target, messageId: mid }); }
               catch (hookErr) {
                 console.error("run 结果已送达（" + mid + "），但轮转记账失败：" +
@@ -198,7 +211,7 @@ while (true) {
               console.log("published run " + key.slice(0, 8) + " -> " + mid);
             } catch (err) {
               // 失败要撤 claim（别把重试路径也锁死）；留痕、不伪造送达。
-              releaseRunPublishClaim({ runsDir: RUNS, key });
+              releaseRunPublishClaim({ runsDir: RUNS, key, token: claim.token });
               fs.writeFileSync(path.join(RUNS, key + ".publish-failed.json"),
                 JSON.stringify({ at: new Date().toISOString(),
                   error: String(err.message).slice(0, 500) }, null, 2));

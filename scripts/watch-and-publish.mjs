@@ -14,7 +14,10 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { readRunOutcome } from "./handoff.mjs";
-import { scanRuns, buildDraft, markPublished, publishDraft } from "./outbound.mjs";
+import {
+  buildDraft, claimRunPublish, hasRunReceipt, markPublished, publishDraft,
+  releaseRunPublishClaim, scanRuns,
+} from "./outbound.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { claudeRotationBatchHook } from "./drain-outbox.mjs";
 import { publishOutboxAttempt } from "./publish-attempt.mjs";
@@ -77,6 +80,10 @@ async function waitForPublishLock() {
   for (;;) {
     const r = acquirePublishLock(PUBLISH_LOCK);
     if (r.ok) return r;
+    // **io_error 不是竞争。**评审实测：锁目录不可写时被伪装成 busy，
+    // 预算走完照样进"让给持锁方"的措辞 —— 基础设施故障被说成了礼让。
+    // 只有真正的 publisher_busy 才配等预算；别的原因立刻如实返回。
+    if (r.reason !== "publisher_busy") return r;
     if (Date.now() >= deadline) return { ok: false, reason: "publisher_busy" };
     await sleep(Math.min(1500, Math.max(50, deadline - Date.now())));
   }
@@ -143,37 +150,60 @@ while (true) {
             target_channel_generation_id: originGenerationId,
             run_id: key,
           };
-          if (!publishLock.ok) {
+          if (!publishLock.ok && publishLock.reason === "publisher_busy") {
             console.error("发布锁等了 " + publishWaitMs + "ms 没等到 —— " +
-              "run 结果按既有契约**无锁单发**（独立回执，零双发风险）；" +
+              "run 结果按既有契约单发（**发布前 claim 互斥并发双发**；" +
+              "崩溃窗口仍是 at-least-once，与全线口径一致）；" +
               "outbox 那一半本轮让给持锁方。");
+          } else if (!publishLock.ok) {
+            // **基础设施故障不是礼让。**说成"让给持锁方"会把人支去等一个不存在的对手。
+            console.error("发布锁基础设施故障（" + publishLock.reason +
+              (publishLock.error ? "：" + publishLock.error : "") +
+              "）—— 这不是竞争。run 结果仍尝试经 claim 单发（claim 在 runs 目录，" +
+              "与锁不同盘符时还有机会成功）。");
           }
-          try {
-            const ident = resolveLarkIdentity(cfg);
-            const target = resolveMappingOutboundGeneration(mapping, originGenerationId);
-            if (!target.ok) throw new Error("冻结的出站话题代际不可用（" + target.reason + "）");
-            const mid = publishDraft({
-              profile: ident.profile,
-              rootMessageId: target.rootMessageId,
-              card: composeOutboundCard([runRecord], { taskName: cfg.task_display_name, runtime: "claude" }),
-              larkBin: ident.bin,
-              larkHome: ident.configDir,
-              expectedAppId: ident.expectedAppId,
-            });
-            // 回执先落（防重发压倒一切），轮转记账失败只记缺口不回滚。
-            markPublished({ runsDir: RUNS, key, messageId: mid });
-            try { rotationHook({ batch: [runRecord], target, messageId: mid }); }
-            catch (hookErr) {
-              console.error("run 结果已送达（" + mid + "），但轮转记账失败：" +
-                String(hookErr?.message ?? hookErr).slice(0, 200));
+          // **发布前原子 claim** —— 回执在发送之后，光靠它挡不住两个并发 watcher
+          // 同时读到 shouldPublish 各发一张（评审实测真实双发）。
+          const claim = claimRunPublish({ runsDir: RUNS, key });
+          // **claim 后复核回执** —— shouldPublish 是并发对手完成之前读的，
+          // 对手发完释放 claim 后这里能拿到新 claim；回执才是持久的真相。
+          if (claim.ok && hasRunReceipt({ runsDir: RUNS, key })) {
+            releaseRunPublishClaim({ runsDir: RUNS, key });
+            console.error("run 结果已由另一个 watcher 送达（回执在），本轮不再发。");
+          } else if (!claim.ok) {
+            console.error("run 结果本轮不发：" + (claim.reason === "claimed_by_other"
+              ? "另一个 watcher 正在发同一条 run（claim 互斥）"
+              : "claim 基础设施故障（" + claim.reason + "）—— fail-closed，不无保护地发"));
+          } else {
+            try {
+              const ident = resolveLarkIdentity(cfg);
+              const target = resolveMappingOutboundGeneration(mapping, originGenerationId);
+              if (!target.ok) throw new Error("冻结的出站话题代际不可用（" + target.reason + "）");
+              const mid = publishDraft({
+                profile: ident.profile,
+                rootMessageId: target.rootMessageId,
+                card: composeOutboundCard([runRecord], { taskName: cfg.task_display_name, runtime: "claude" }),
+                larkBin: ident.bin,
+                larkHome: ident.configDir,
+                expectedAppId: ident.expectedAppId,
+              });
+              // 回执先落（防重发压倒一切），轮转记账失败只记缺口不回滚。
+              markPublished({ runsDir: RUNS, key, messageId: mid });
+              releaseRunPublishClaim({ runsDir: RUNS, key });
+              try { rotationHook({ batch: [runRecord], target, messageId: mid }); }
+              catch (hookErr) {
+                console.error("run 结果已送达（" + mid + "），但轮转记账失败：" +
+                  String(hookErr?.message ?? hookErr).slice(0, 200));
+              }
+              console.log("published run " + key.slice(0, 8) + " -> " + mid);
+            } catch (err) {
+              // 失败要撤 claim（别把重试路径也锁死）；留痕、不伪造送达。
+              releaseRunPublishClaim({ runsDir: RUNS, key });
+              fs.writeFileSync(path.join(RUNS, key + ".publish-failed.json"),
+                JSON.stringify({ at: new Date().toISOString(),
+                  error: String(err.message).slice(0, 500) }, null, 2));
+              console.error("run 结果发布失败: " + String(err.message).slice(0, 300));
             }
-            console.log("published run " + key.slice(0, 8) + " -> " + mid);
-          } catch (err) {
-            // run 通道失败：留痕、不伪造送达。分类与重试保护不适用 —— 它不是 outbox 记录。
-            fs.writeFileSync(path.join(RUNS, key + ".publish-failed.json"),
-              JSON.stringify({ at: new Date().toISOString(),
-                error: String(err.message).slice(0, 500) }, null, 2));
-            console.error("run 结果发布失败: " + String(err.message).slice(0, 300));
           }
         }
       }
@@ -204,8 +234,11 @@ while (true) {
       if (r2.status === "published") {
         console.log("published outbox " + key.slice(0, 8) + " -> " + r2.messageId +
           " (cards=" + r2.messageIds.length + ")" + postDeliveryBits(r2));
+      } else if (r2.status === "skipped" && r2.reason === "publisher_busy") {
+        console.error("outbox 这一半没发（publisher_busy）—— 让给持锁方，进展留在 outbox。");
       } else if (r2.status === "skipped") {
-        console.error("outbox 这一半没发（" + r2.reason + "）—— 让给持锁方，进展留在 outbox。");
+        console.error("outbox 这一半没发：发布锁基础设施故障（" + r2.reason +
+          "）—— **这不是竞争，重试前先修锁目录**。进展留在 outbox。");
       } else if (r2.status === "error" && r2.local === true) {
         console.error("本地 outbox 有问题（" + (r2.reason ?? "说不清") +
           ((r2.files ?? []).length ? "：" + r2.files.join("、") : "") +

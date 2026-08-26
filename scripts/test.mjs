@@ -14436,7 +14436,7 @@ test("watcher 共锁语义：预算耗尽 run 独走、outbox 永不无锁（真
       const lines = fs.readFileSync(argsFile, "utf-8").split("\n").filter(Boolean);
       const fresh = lines.slice(linesBefore);
       assert.ok(fresh.some((l) => l.includes("第 1 轮")),
-        "**run 结果要无锁单发出去** —— 扣着执行结果的代价大得多：" + fresh.length);
+        "**run 结果要经 claim 单发出去** —— 扣着执行结果的代价大得多：" + fresh.length);
       assert.equal(publishCalls, 0, "**outbox 永不无锁** —— 含 marker 的调用必须是 0");
       assert.equal(h.read("锁被占时不许发的进展").published_at, null,
         "outbox 记录不许被无锁发出");
@@ -14451,6 +14451,88 @@ test("watcher 共锁语义：预算耗尽 run 独走、outbox 永不无锁（真
   const after = h.attempt("ok");
   assert.ok(after.publishCalls >= 1, "锁放开后要补发");
   assert.match(h.read("锁被占时不许发的进展").published_at ?? "", /^\d{4}/u);
+});
+
+test("run 通道并发互斥：两个 watcher 同一 run，只许发出一张（真实进程）", () => {
+  // 评审实测：只有"发送后回执"时，两个并发 watcher 同时读到 shouldPublish、
+  // 各发一张 —— 真实双发。发布前原子 claim 才互斥得住。
+  //
+  // test() 基座是同步的（fn() 不 await）—— 异步测试会假通过。
+  // 并发编排放进子进程编排器，本体保持同步。
+  const h = watcherMatrixRunner.fixture();
+  const lockDir = path.join(h.dir, ".runtime-data", "outbound", "publish.lock");
+  fs.mkdirSync(path.dirname(lockDir), { recursive: true });
+  assert.equal(acquirePublishLock(lockDir).ok, true, "锁一直被占：两边都走预算耗尽那条路");
+  try {
+    const runs = path.join(h.dir, ".runtime-data", "inbound", "runs");
+    const key = "9".repeat(64);
+    fs.writeFileSync(path.join(runs, key + ".jsonl"),
+      JSON.stringify({ type: "result", is_error: false, result: "并发那一轮" }) + "\n");
+    const orchestrator = path.join(h.dir, "orchestrate.mjs");
+    fs.writeFileSync(orchestrator, [
+      'import { spawn } from "node:child_process";',
+      'const [watcher, key, dir] = process.argv.slice(2);',
+      'const one = () => new Promise((resolve) => {',
+      '  const c = spawn(process.execPath, [watcher, key, dir],',
+      '    { env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"] });',
+      '  let out = "";',
+      '  c.stdout.on("data", (d) => { out += d; });',
+      '  c.stderr.on("data", (d) => { out += d; });',
+      '  c.on("close", (code) => resolve({ code, out }));',
+      '});',
+      'const [a, b] = await Promise.all([one(), one()]);',
+      'console.log(JSON.stringify({ codes: [a.code, b.code], out: a.out + b.out }));',
+    ].join("\n"));
+    const r = spawnSync(process.execPath,
+      [orchestrator, path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir],
+      { encoding: "utf-8", env: { ...process.env, HOME: h.dir,
+        FEISHU_BRIDGE_PUBLISH_WAIT_MS: "500" }, timeout: 90_000 });
+    assert.equal(r.status, 0, (r.stderr ?? "").slice(0, 300));
+    const parsed = JSON.parse((r.stdout ?? "").trim().split("\n").at(-1));
+    assert.deepEqual(parsed.codes, [0, 0], parsed.out.slice(0, 300));
+    const argsFile = path.join(h.dir, "lark-calls.jsonl");
+    const sent = fs.existsSync(argsFile)
+      ? fs.readFileSync(argsFile, "utf-8").split("\n").filter((l) => l.includes("并发那一轮")) : [];
+    assert.equal(sent.length, 1,
+      "**同一条 run 只许发出一张卡** —— 实际发了 " + sent.length + " 张。\n输出：" +
+      parsed.out.slice(0, 1200));
+    assert.match(parsed.out, /claim 互斥|正在发同一条 run|已由另一个 watcher 送达/u,
+      "没发的那个要说清为什么（claim 输了或复核到回执）");
+  } finally {
+    releasePublishLock(lockDir);
+  }
+});
+
+test("发布锁 io 故障不是竞争：不套「让给持锁方」的话术（真实进程）", () => {
+  // 评审实测：锁目录不可写时被伪装成 busy —— 基础设施故障被说成礼让，
+  // 人会去等一个不存在的对手。
+  const h = watcherMatrixRunner.fixture();
+  h.seed("io 故障时的进展");
+  const outbound = path.join(h.dir, ".runtime-data", "outbound");
+  const runs = path.join(h.dir, ".runtime-data", "inbound", "runs");
+  const key = "8".repeat(64);
+  fs.writeFileSync(path.join(runs, key + ".jsonl"),
+    JSON.stringify({ type: "result", is_error: false, result: "io 故障那一轮" }) + "\n");
+  // outbound 目录改只读：acquirePublishLock 的 mkdir 直接 io_error。
+  fs.chmodSync(outbound, 0o500);
+  let r;
+  try {
+    r = spawnSync(process.execPath,
+      [path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir],
+      { encoding: "utf-8", env: { ...process.env, HOME: h.dir,
+        FEISHU_BRIDGE_PUBLISH_WAIT_MS: "500" }, timeout: 60_000 });
+  } finally {
+    fs.chmodSync(outbound, 0o700);
+  }
+  const said = (r.stdout ?? "") + (r.stderr ?? "");
+  assert.match(said, /基础设施故障/u, "**要说是基础设施故障**：" + said.slice(0, 400));
+  assert.equal(/让给持锁方/u.test(said), false,
+    "**不许把 io 故障说成礼让** —— 人会去等一个不存在的对手");
+  // run 结果仍经 claim 单发（claim 在 runs 目录，不受 outbound 只读影响）。
+  const argsFile = path.join(h.dir, "lark-calls.jsonl");
+  const sent = fs.existsSync(argsFile)
+    ? fs.readFileSync(argsFile, "utf-8").split("\n").filter((l) => l.includes("io 故障那一轮")) : [];
+  assert.equal(sent.length, 1, "run 结果要经 claim 发出去（claim 与锁不同目录）");
 });
 
 summarySealed = true;

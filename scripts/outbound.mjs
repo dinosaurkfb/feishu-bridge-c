@@ -68,6 +68,69 @@ function readPublished(runsDir, key) {
 }
 
 /** 发布后落标记，防止同一个 run 被重复发布到话题里。 */
+/**
+ * run 结果的**发布前原子 claim**。
+ *
+ * 回执（markPublished）写在发送**之后** —— 只有回执的话，两个并发 watcher
+ * 会同时读到 shouldPublish、各发一张，评审实测真实双发。
+ * claim 用 mkdir 的原子性在发送**之前**互斥；发完写回执再撤 claim。
+ *
+ * **协议是三步，缺一不可**：claim → **复核回执** → 发送。
+ * 只有 claim 不够：A 发完释放 claim 后，晚到的 B 能拿到新 claim ——
+ * 而 B 的 shouldPublish 是在 A 完成前读的（评审场景实测）。
+ * claim 后复核回执才把这个窗口关上。
+ *
+ * **崩溃窗口仍是 at-least-once**（与全线口径一致）：发出后、写回执前崩掉，
+ * claim 过期（stale）后会被接管重发。不存在"零双发"，只有"并发不双发"。
+ */
+export function claimRunPublish({ runsDir, key, staleMs = 5 * 60 * 1000, now = Date.now() } = {}) {
+  const file = path.join(runsDir, key + ".publish-claim.json");
+  const attempt = () => {
+    try {
+      // **单步原子创建（wx）**。第一版用 mkdir + 再写 owner 两步 ——
+      // 并发对手在两步之间读到空 owner、按"可接管"抢走了 claim，
+      // 互斥当场失效（实测两个 watcher 各发一张）。wx 把创建和内容并成一个系统调用。
+      fs.writeFileSync(file,
+        JSON.stringify({ pid: process.pid, at: new Date(now).toISOString() }) + "\n",
+        { flag: "wx", mode: 0o600 });
+      return { ok: true, file };
+    } catch (err) {
+      if (err.code === "EEXIST") return { ok: false, reason: "claimed_by_other" };
+      return { ok: false, reason: "io_error", error: String(err.message).slice(0, 200) };
+    }
+  };
+  const first = attempt();
+  if (first.ok || first.reason !== "claimed_by_other") return first;
+  // stale 判定：owner 读得出且（超龄 或 进程死了）才可接管。
+  // **读不出不算立刻可接管** —— 那可能只是对手刚创建（虽然 wx 下几乎不可能），
+  // 按文件 mtime 的年龄兜底。
+  let owner = null;
+  try { owner = JSON.parse(fs.readFileSync(file, "utf-8")); } catch { /* 按 mtime 兜底 */ }
+  let stale = false;
+  if (owner) {
+    const at = Date.parse(owner.at ?? "");
+    let alive = false;
+    if (Number.isFinite(owner.pid)) {
+      try { process.kill(owner.pid, 0); alive = true; } catch { alive = false; }
+    }
+    stale = (Number.isFinite(at) && now - at > staleMs) || !alive;
+  } else {
+    try { stale = now - fs.statSync(file).mtimeMs > staleMs; } catch { stale = true; }
+  }
+  if (!stale) return first;
+  fs.rmSync(file, { force: true });
+  return attempt();
+}
+
+/** 这条 run 已经有送达回执了吗。claim 拿到后**必须复核它** —— 见 claimRunPublish。 */
+export function hasRunReceipt({ runsDir, key } = {}) {
+  return fs.existsSync(path.join(runsDir, key + PUBLISHED_MARK));
+}
+
+export function releaseRunPublishClaim({ runsDir, key } = {}) {
+  fs.rmSync(path.join(runsDir, key + ".publish-claim.json"), { force: true });
+}
+
 export function markPublished({ runsDir, key, messageId }) {
   const file = path.join(runsDir, key + PUBLISHED_MARK);
   const tmp = file + ".tmp." + process.pid;

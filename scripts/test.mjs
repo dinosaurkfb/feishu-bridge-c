@@ -12696,6 +12696,24 @@ test("等待预算必须有限：一个配置值不许把有界等待变成无�
   releasePublishLock(g.lockDir);
 });
 
+test("标记还在那条路径上，具体原因同样要一路传上来", () => {
+  // 上一条走的是"标记缺席"路径。**更常见的是标记还在**，
+  // 而那条路上 why 被丢在了三个地方：pending → outcomeFor → watcher 渲染。
+  const g = eligFixture({ holdLock: false });
+  fs.writeFileSync(path.join(g.outboxDir, "0001.json"),
+    JSON.stringify({ ...g.read(), publish_eligible_at: "not-a-canonical-time" }));
+  g.marker();
+  assert.equal(fs.existsSync(g.markerFile), true, "前提：走的是标记还在那条路径");
+
+  const sweep = recoverEligibilityPending(g.args());
+  assert.equal(sweep.pending[0].why, "publish_eligible_at 不是规范时间", "扫描那层不许丢");
+  assert.deepEqual(eligibilityOutcomeFor(sweep, g.key),
+    { ok: false, reason: "record_unclassified", why: "publish_eligible_at 不是规范时间" },
+    "取结论那层也不许丢");
+  const own = settleOwnEligibility({ ...g.args(), claimKey: g.key, waitMs: 1, wait: () => {} });
+  assert.equal(own.why, "publish_eligible_at 不是规范时间", "**一路到顶都得在**");
+});
+
 test("复核给出的具体原因要一路传上来，不能只剩一个 reason", () => {
   // 底层已经知道是哪个字段出的问题，中间一层把 why 丢了的话，
   // 人最终只看到 record_unclassified —— 还得自己去猜是哪个字段。

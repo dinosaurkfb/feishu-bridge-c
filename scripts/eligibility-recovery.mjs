@@ -174,7 +174,8 @@ export function recoverEligibilityPending({ claimsDir, outboxDir, publishLockDir
     if (item.unusable) { unusable.push(item); continue; }
     const r = markPublishEligibleByEventKey({
       outboxDir, eventKey: item.eventKey, publishLockDir, requireRunId: item.key });
-    if (!r.ok) { pending.push({ ...item, reason: r.reason }); continue; }
+    // why 一路带上 —— 只报 record_unclassified 的话，人还得自己去猜是哪个字段。
+    if (!r.ok) { pending.push({ ...item, reason: r.reason, ...(r.why ? { why: r.why } : {}) }); continue; }
     // 有结论了 —— 标记可以撤了。删不掉不算失败：下一轮会再走一遍，
     // 而重复提升是幂等的（already_eligible）。
     try { fs.unlinkSync(item.file); } catch { /* 下轮再说 */ }
@@ -214,7 +215,7 @@ export function eligibilityOutcomeFor(settle, key) {
   const done = settle.recovered.find((r) => r.key === key);
   if (done) return { ok: true, reason: done.reason };
   const stuck = settle.pending.find((r) => r.key === key);
-  if (stuck) return { ok: false, reason: stuck.reason };
+  if (stuck) return { ok: false, reason: stuck.reason, ...(stuck.why ? { why: stuck.why } : {}) };
   const broken = settle.unusable.find((r) => r.key === key);
   if (broken) return { ok: false, reason: "marker_unusable", why: broken.unusable };
   // 标记不在了 —— **但这是有歧义的**：可能是另一个进程先恢复成功并撤了标记。

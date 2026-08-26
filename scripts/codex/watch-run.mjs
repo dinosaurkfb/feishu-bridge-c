@@ -64,7 +64,9 @@ if (!recovered.ok) {
   console.error("claims 目录读不出来（" + recovered.reason + "），这一轮没法确认有没有卡住的资格。");
 } else {
   for (const r of recovered.recovered) console.error("补回发布资格：" + r.key + "（" + r.reason + "）");
-  for (const r of recovered.pending) console.error("资格仍卡住：" + r.key + "（" + r.reason + "）");
+  for (const r of recovered.pending) {
+    console.error("资格仍卡住：" + r.key + "（" + r.reason + (r.why ? "：" + r.why : "") + "）");
+  }
   for (const r of recovered.unusable) console.error("恢复标记看不懂，没动：" + r.key + " —— " + r.unusable);
 }
 

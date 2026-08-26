@@ -9,6 +9,8 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { isCanonicalIso } from "./canonical-time.mjs";
 
 import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
 
@@ -42,15 +44,19 @@ export function scanRuns({ runsDir }) {
     const logPath = path.join(runsDir, f);
     const outcome = readRunOutcome(logPath);
     const pres = PRESENTATION[outcome.state] ?? PRESENTATION.missing;
-    const publishedAt = readPublished(runsDir, key);
+    const receipt = readRunReceipt({ runsDir, key });
+    const publishedAt = receipt.state === "valid" ? receipt.publishedAt : null;
 
     out.push({
       key,
       logPath,
       state: outcome.state,
       label: pres.label,
-      shouldPublish: pres.publish && publishedAt === null,
-      alreadyPublished: publishedAt !== null,
+      // 回执说不清时**两头都不许**：不发（可能双发）、也不当已发（可能漏发）。
+      shouldPublish: pres.publish && receipt.state === "absent",
+      alreadyPublished: receipt.state === "valid",
+      receiptUnreadable: receipt.state === "unreadable"
+        ? (receipt.why ?? "说不清") : null,
       truthful: pres.truthful,
       finalText: outcome.finalText ?? null,
       deniedTools: outcome.deniedTools ?? null,
@@ -59,15 +65,141 @@ export function scanRuns({ runsDir }) {
   return out;
 }
 
-function readPublished(runsDir, key) {
+// readPublished 已被回执三态取代 —— "存在即已发"的判法把缺字段的回执
+// 静默当成已送达，一条 run 结果就此永久消失（评审同款缺陷在 scanRuns 这层的分身）。
+
+/** 发布后落标记，防止同一个 run 被重复发布到话题里。 */
+/**
+ * run 结果的**发布前原子 claim**。
+ *
+ * 回执（markPublished）写在发送**之后** —— 只有回执的话，两个并发 watcher
+ * 会同时读到 shouldPublish、各发一张，评审实测真实双发。
+ * claim 用 mkdir 的原子性在发送**之前**互斥；发完写回执再撤 claim。
+ *
+ * **协议是三步，缺一不可**：claim → **复核回执** → 发送。
+ * 只有 claim 不够：A 发完释放 claim 后，晚到的 B 能拿到新 claim ——
+ * 而 B 的 shouldPublish 是在 A 完成前读的（评审场景实测）。
+ * claim 后复核回执才把这个窗口关上。
+ *
+ * **崩溃窗口仍是 at-least-once**（与全线口径一致）：发出后、写回执前崩掉，
+ * claim 过期（stale）后会被接管重发。不存在"零双发"，只有"并发不双发"。
+ */
+export function claimRunPublish({ runsDir, key, staleMs = 5 * 60 * 1000, now = Date.now() } = {}) {
+  const file = path.join(runsDir, key + ".publish-claim.json");
+  const reapLock = file + ".reaplock";
+  const token = randomUUID();
+  const attempt = () => {
+    try {
+      // wx 单步原子创建（两步 mkdir+owner 被实测在步间抢占过）。
+      fs.writeFileSync(file,
+        JSON.stringify({ pid: process.pid, at: new Date(now).toISOString(), token }) + "\n",
+        { flag: "wx", mode: 0o600 });
+      return { ok: true, file, token };
+    } catch (err) {
+      if (err.code === "EEXIST") return { ok: false, reason: "claimed_by_other" };
+      return { ok: false, reason: "io_error", error: String(err.message).slice(0, 200) };
+    }
+  };
+  const readOwner = () => {
+    try { return JSON.parse(fs.readFileSync(file, "utf-8")); } catch { return null; }
+  };
+  const isStale = (owner) => {
+    // **只接管死进程**：活着的 owner 即使超龄也不抢 —— 没有 lease/heartbeat
+    // 就凭年龄抢活人，会顶掉慢的合法持有者（评审点名）。
+    if (owner && Number.isFinite(owner.pid)) {
+      try { process.kill(owner.pid, 0); return false; } catch { return true; }
+    }
+    try { return now - fs.statSync(file).mtimeMs > staleMs; } catch { return false; }
+  };
+
+  const first = attempt();
+  if (first.ok || first.reason !== "claimed_by_other") return first;
+  const seen = readOwner();
+  if (!isStale(seen)) return first;
+
+  // ■ stale 接管：**必须串行**（评审实测三个教训堆在这一段上）
+  //
+  //   · "判 stale → rm → wx"：后到者的 rm 删掉先到者刚创建的新 claim，
+  //     64 个接管者出了 3 个 winner。
+  //   · 换成 rename 摘除：rename 按**路径**不按 inode —— 后到者照样把
+  //     winner 的新 claim 重命名走，16 个里出了 5 个 winner。
+  //   · 所以移除动作本身要独占：reap 锁（wx 单步）串行化接管，
+  //     持锁者**重读并核对还是刚才那一代**（token 比对）才许移除。
+  //     核对失败 = 有人已经接上了 —— 放手认输。
   try {
-    return JSON.parse(fs.readFileSync(path.join(runsDir, key + PUBLISHED_MARK), "utf-8")).published_at;
-  } catch {
-    return null;
+    fs.writeFileSync(reapLock,
+      JSON.stringify({ pid: process.pid, at: new Date(now).toISOString() }) + "\n",
+      { flag: "wx", mode: 0o600 });
+  } catch (err) {
+    if (err.code !== "EEXIST") return { ok: false, reason: "io_error", error: String(err.message).slice(0, 200) };
+    // **reap 锁不在热路径自愈。**上一版按 mtime 超时"判旧 → rm → wx"再抢 ——
+    // 评审固定时序复现：内层接管者夺锁建了新 claim，外层拿着旧核对结果
+    // 把它删掉再建自己的 —— 两个 ok:true。同一个反模式在低一层复发，
+    // 递归不会收敛。所以：**reap 锁存在即 fail-closed**，
+    // 崩溃残留（双重退化情形）交给显式维护清理，不在这里赌。
+    // **只指向显式维护入口，不给"人工删除"的旁路** —— 直接 rm 绕过维护互斥，
+    // 两个操作者又能重现"删掉新活锁"的竞态（评审点名）。
+    return { ok: false, reason: "reap_lock_held",
+      detail: "接管互斥锁被占（或为崩溃残留）：" + reapLock +
+        " —— 用显式维护入口 repair-run-claim.mjs 处理，不要直接删除" };
+  }
+  try {
+    const current = readOwner();
+    // **代际核对**：还是我刚才判 stale 的那一代才许动手。
+    if (!current || current.token !== seen?.token || !isStale(current)) {
+      return { ok: false, reason: "claimed_by_other" };
+    }
+    fs.rmSync(file, { force: true });
+    return attempt();
+  } finally {
+    fs.rmSync(reapLock, { force: true });
   }
 }
 
-/** 发布后落标记，防止同一个 run 被重复发布到话题里。 */
+/**
+ * 回执三态。**存在 ≠ 有效送达**（评审点名：existsSync 会把空文件、坏 JSON、
+ * 目录都说成"已送达"，结果被永久跳过）。
+ *   absent     —— 没有回执，可以发
+ *   valid      —— 结构合法（有 published_at），确实送达过
+ *   unreadable —— 有东西但说不清 —— **fail-closed，别发也别当送达**，要报警
+ */
+export function readRunReceipt({ runsDir, key } = {}) {
+  const file = path.join(runsDir, key + PUBLISHED_MARK);
+  let raw;
+  try { raw = fs.readFileSync(file, "utf-8"); }
+  catch (err) {
+    return err.code === "ENOENT" ? { state: "absent" }
+      : { state: "unreadable", why: String(err.code ?? err.message) };
+  }
+  try {
+    const doc = JSON.parse(raw);
+    // published_at 必须是规范时间 —— "非空字符串"会让 {"published_at":"不是时间"}
+    // 冒充合法回执，一条 run 被永久跳过（同一族判据错误的又一处）。
+    if (doc && typeof doc === "object" && !Array.isArray(doc)
+      && isCanonicalIso(doc.published_at)) {
+      return { state: "valid", publishedAt: doc.published_at,
+        messageId: doc.feishu_message_id ?? null };
+    }
+    return { state: "unreadable", why: "结构不合法" };
+  } catch {
+    return { state: "unreadable", why: "不是 JSON" };
+  }
+}
+
+/**
+ * **只释放自己的代际。**release 带 token：不带或对不上就不动 ——
+ * 否则旧持有者能删掉接管者刚创建的新 claim（评审点名）。
+ */
+export function releaseRunPublishClaim({ runsDir, key, token } = {}) {
+  const file = path.join(runsDir, key + ".publish-claim.json");
+  try {
+    const owner = JSON.parse(fs.readFileSync(file, "utf-8"));
+    if (owner?.token !== token) return false;
+  } catch { return false; }
+  fs.rmSync(file, { force: true });
+  return true;
+}
+
 export function markPublished({ runsDir, key, messageId }) {
   const file = path.join(runsDir, key + PUBLISHED_MARK);
   const tmp = file + ".tmp." + process.pid;

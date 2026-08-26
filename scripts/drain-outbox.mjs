@@ -94,6 +94,28 @@ export function localOutboxMessage(r) {
  * **不要从进程参数里取** —— 经符号链接执行时那给的是链接本身，
  * 提示里打出来的命令人照抄会指到别处。有一条守卫直接禁用了那个 API。
  */
+/**
+ * Claude 侧发布后的轮转记账钩子。**drain 与 watcher 共用这一份。**
+ * 只记账不否决；记账函数失败不抛、返回 ok:false —— 这里转成受控抛错，
+ * 让发布事务把它归进 bookkeepingFailures（发布已成，照样落标防重发）。
+ */
+export function claudeRotationBatchHook({ root, claudeSessionId }) {
+  return ({ batch, target, messageId }) => {
+    for (const activity of businessActivitiesForPublishedBatch(batch, {
+      messageId, runtime: "claude",
+    })) {
+      const recorded = recordClaudeActivityAndMaybeRotate({
+        root, claudeSessionId,
+        generationId: target.channelGenerationId,
+        ...activity,
+      });
+      if (recorded && recorded.ok === false) {
+        throw new Error("轮转活动记账失败（" + (recorded.reason ?? "说不清") + "）");
+      }
+    }
+  };
+}
+
 export function drainCmd() {
   return path.join(moduleRoot(import.meta.url, ".."), "scripts", "drain-outbox.mjs");
 }
@@ -209,24 +231,11 @@ export function drainProject({
       expectedAppId: id.expectedAppId,
       timeoutMs,
     }),
-    // 记账钩子：**只记账，不否决**。轮转活动记录维持"发布之后、落标之前"的既有顺序。
-    onBatchPublished: ({ batch, target, messageId }) => {
-      for (const activity of businessActivitiesForPublishedBatch(batch, {
-        messageId, runtime: "claude",
-      })) {
-        const recorded = recordClaudeActivityAndMaybeRotate({
-          root,
-          claudeSessionId: resolved.claudeSessionId ?? mapping.claude_session_id ?? claudeSessionId,
-          generationId: target.channelGenerationId,
-          ...activity,
-        });
-        // **它失败时不抛，返回 ok:false** —— 忽略返回值等于把轮转账缺口吞掉。
-        // 转成受控抛错，让事务把它归进 bookkeepingFailures（发布已成，照样落标）。
-        if (recorded && recorded.ok === false) {
-          throw new Error("轮转活动记账失败（" + (recorded.reason ?? "说不清") + "）");
-        }
-      }
-    },
+    // 记账钩子：**只记账，不否决**。实现与 watcher 共用同一份 —— 各抄一份的话
+    // "检查 ok:false"这类修法就会又一次只修一处。
+    onBatchPublished: claudeRotationBatchHook({
+      root, claudeSessionId: resolved.claudeSessionId ?? mapping.claude_session_id ?? claudeSessionId,
+    }),
   });
 
   // 入口只做入口的事：补上 root、Claude 特有的措辞素材与跨应用诊断。

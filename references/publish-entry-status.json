@@ -8,8 +8,13 @@
     },
     "claude-watcher": {
       "file": "watch-and-publish.mjs",
-      "status": "legacy",
-      "suite": "claude"
+      "status": "migrated",
+      "suite": "claude",
+      "not_applicable": {
+        "dry-run：预演零改盘、零出网": "watcher 由 Stop 自动触发，没有 dry-run 入口；预演语义属于人工 drain CLI",
+        "显式重试：失败仍暂停，不许悄悄放回自动队列": "显式重试（--retry-rejected）是人工 drain 的 CLI 语义，watcher 没有人工参数面",
+        "显式重试：成功后落标、保护字段清干净": "同上 —— 显式重试只存在于人工 drain CLI"
+      }
     },
     "codex-drain": {
       "file": "codex/drain-outbox.mjs",

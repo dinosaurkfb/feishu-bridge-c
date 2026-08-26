@@ -14710,31 +14710,74 @@ test("reap 锁残留：真实 watcher 要给出锁路径与维护命令，维护
   assert.equal(sentEarly.length, 0, "残留锁在场不许发");
   assert.match(said, /reaplock/u, "**锁路径要在输出里** —— 人得知道删哪个：" + said.slice(0, 300));
   assert.match(said, /repair-run-claim\.mjs/u, "**要指路显式维护命令**");
+  const cmdLine = said.split("\n").find((l) => l.includes("repair-run-claim.mjs")) ?? "";
+  assert.equal(cmdLine.includes("--apply"), false,
+    "**提示的命令行不许带 --apply** —— 说默认预览却给带 --apply 的命令是教人跳过预览：" + cmdLine);
+  assert.match(said, new RegExp("--key " + key, "u"), "要带 --key 只清这一条的残留");
   const failRecord = JSON.parse(fs.readFileSync(path.join(runs, key + ".publish-failed.json"), "utf-8"));
   assert.equal(failRecord.reason, "reap_lock_held", "要落持久失败记录");
 
-  // ② 维护入口：预览零改盘；活持有者不动；死残留 --apply 才清。
-  const live = repairRunClaims({ runsDir: runs, apply: true, now: Date.now() });
-  void live;
-  // 先造一个"活持有者"的 claim 验拒删。
+  // ② 维护入口：**只清 reap 锁，claim 一个字不动**（"判死 → 删 claim"被评审
+  // 固定时序击穿过：热路径抢先接管后，维护者按旧结论删掉新 claim）。
+  // 预览真的零改盘；活持有者不动；--apply 才清死锁。
+  const preview = repairRunClaims({ runsDir: runs });
+  assert.equal(preview.apply, false);
+  assert.equal(fs.existsSync(reapLock), true, "**预览零改盘** —— reap 锁还在");
+  assert.equal(fs.existsSync(claimFile), true, "claim 也在");
+  assert.ok(preview.actions.some((a) => a.action === "would_remove"), JSON.stringify(preview.actions));
+
+  // 活持有者的 reap 锁不许动。
   const liveKey = "1".repeat(64);
-  fs.writeFileSync(path.join(runs, liveKey + ".publish-claim.json"),
-    JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "t" }) + "\n");
+  const liveReap = path.join(runs, liveKey + ".publish-claim.json.reaplock");
+  fs.writeFileSync(liveReap, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }) + "\n");
   const report = repairRunClaims({ runsDir: runs, apply: true });
   const keptLive = report.actions.find((a) => a.file.startsWith(liveKey));
   assert.equal(keptLive.action, "kept", "**活持有者一律不动**：" + JSON.stringify(keptLive));
-  assert.equal(fs.existsSync(path.join(runs, liveKey + ".publish-claim.json")), true);
-  assert.equal(fs.existsSync(reapLock), false, "死残留要被清掉");
-  assert.equal(fs.existsSync(claimFile), false);
+  assert.equal(fs.existsSync(liveReap), true);
+  assert.equal(fs.existsSync(reapLock), false, "死 reap 锁要被清掉");
+  assert.equal(fs.existsSync(claimFile), true,
+    "**死 claim 不由维护入口删** —— 留给热路径接管协议自取（32 并发回归钉过恰好一个）");
+  fs.rmSync(liveReap, { force: true });
 
-  // ③ 清理之后 watcher 恢复发布。
+  // ③ 清理 reap 锁之后，watcher 经协议接管死 claim、恢复发布。
   const r2 = spawnSync(process.execPath,
     [path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir],
     { encoding: "utf-8", env: { ...process.env, HOME: h.dir }, timeout: 60_000 });
   void r2;
   const sent = fs.readFileSync(argsFile, "utf-8").split("\n")
     .filter((l) => l.includes("被残留锁拦住那一轮"));
-  assert.equal(sent.length, 1, "**维护后要恢复发布** —— 恢复入口不是摆设");
+    assert.equal(sent.length, 1, "**维护后要恢复发布** —— 恢复入口不是摆设");
+});
+
+test("维护 CLI 是破坏性命令：白名单之外一个参数都不收", () => {
+  // 评审实测：includes("--apply") 全数组扫法把 `--unknown -- --apply` 也当授权，
+  // 未知参数静默接受、照删、exit 0。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-repaircli-"));
+  const runs = path.join(dir, ".runtime-data", "inbound", "runs");
+  fs.mkdirSync(runs, { recursive: true });
+  const reap = path.join(runs, "0".repeat(64) + ".publish-claim.json.reaplock");
+  fs.writeFileSync(reap, JSON.stringify({ pid: 999999999, at: "2020-01-01T00:00:00.000Z" }) + "\n");
+  const cli = (args) => spawnSync(process.execPath,
+    [path.resolve("scripts", "repair-run-claim.mjs"), ...args], { encoding: "utf-8" });
+
+  for (const [why, args] of [
+    ["未知参数", ["--project", dir, "--unknown-option"]],
+    ["-- 透传", ["--project", dir, "--", "--apply"]],
+    ["裸参数", ["--project", dir, "extra"]],
+    ["key 形状不对", ["--project", dir, "--key", "k1", "--apply"]],
+  ]) {
+    const r = cli(args);
+    assert.notEqual(r.status, 0, why + "：必须拒绝 —— " + (r.stdout ?? ""));
+    assert.equal(fs.existsSync(reap), true, why + "：**拒绝时一个文件都不许动**");
+  }
+  // 正路：预览不删、--apply 删。
+  const p1 = cli(["--project", dir]);
+  assert.equal(p1.status, 0, p1.stderr);
+  assert.match(p1.stdout, /dry-run/u);
+  assert.equal(fs.existsSync(reap), true, "预览零改盘");
+  const p2 = cli(["--project", dir, "--apply"]);
+  assert.equal(p2.status, 0, p2.stderr);
+  assert.equal(fs.existsSync(reap), false, "--apply 才清");
 });
 
 summarySealed = true;

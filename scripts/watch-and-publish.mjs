@@ -24,6 +24,7 @@ import { publishOutboxAttempt } from "./publish-attempt.mjs";
 import { boundedBudgetMs } from "./eligibility-recovery.mjs";
 import { postDeliveryBits } from "./stop-note.mjs";
 import { repairCmd } from "./repair-run-claim.mjs";
+import { shellQuote } from "./shell-quote.mjs";
 import { readClaim, recordClaimState } from "./claim.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
@@ -190,9 +191,12 @@ while (true) {
             fs.writeFileSync(path.join(RUNS, key + ".publish-failed.json"),
               JSON.stringify({ at: new Date().toISOString(), reason: "reap_lock_held",
                 detail: claim.detail ?? null }, null, 2));
+            // 提示的命令**默认预览**（不带 --apply —— 说"默认预览"却给带
+            // --apply 的命令，等于教人跳过预览）；路径过 shellQuote；
+            // 带 --key 只清这一条 run 的残留，别一杆子扫全项目。
             console.error("run 结果本轮不发：接管互斥锁残留。\n  " +
-              (claim.detail ?? "") + "\n  显式维护（核验持有者已死才删，默认预览）：\n  node " +
-              repairCmd() + " --project " + ROOT + " --apply");
+              (claim.detail ?? "") + "\n  显式维护（先预览，确认后自行加 --apply）：\n  node " +
+              shellQuote(repairCmd()) + " --project " + shellQuote(ROOT) + " --key " + key);
           } else if (!claim.ok) {
             console.error("run 结果本轮不发：" + (claim.reason === "claimed_by_other"
               ? "另一个 watcher 正在发同一条 run（claim 互斥）"

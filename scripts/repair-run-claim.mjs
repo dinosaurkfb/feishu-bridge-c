@@ -2,10 +2,21 @@
 /**
  * run 发布 claim 的**显式维护入口**。
  *
- * reap 锁刻意不在热路径自愈（自愈就是"判旧 → rm → wx"反模式低一层复发，
- * 评审两轮各击穿一层）。代价是崩溃残留会让该 run 的发布永久 fail-closed ——
- * 恢复动作收进这里：**核验持有者确实已死才删**，不让人直接 rm 一个
- * 可能仍被活进程持有的锁。默认预览，--apply 才动盘。
+ * ■ 它只清 reap 锁，**不碰 claim**
+ *
+ * 第一版"判死 → 删 claim"被评审固定时序击穿：维护者读到旧死 claim、
+ * 热路径抢先完成接管写入新 token、维护者按旧结论删掉了**新** claim ——
+ * 两个 watcher 同时自认持有授权。"删除前再读一次"仍有窗口；
+ * 与热路径共享互斥又会引入新的一层锁。所以采用更简单的安全形状：
+ * **维护只移除阻塞热路径的 reap 锁**（核验其持有者确实已死），
+ * 死 claim 本身留给热路径既有的 token/reap 接管协议自取 ——
+ * 那条路已被 32 并发回归钉住"恰好一个得手"。
+ *
+ * ■ 严格参数面
+ *
+ * 这是破坏性 CLI：只认 --project <路径>、--key <64位十六进制>、--apply。
+ * 未知参数、裸参数、`--` 透传一律拒绝退出 —— includes("--apply") 那种
+ * 全数组扫法会把 `-- --apply` 也当成授权（评审实测）。默认预览。
  */
 
 import fs from "node:fs";
@@ -13,8 +24,8 @@ import path from "node:path";
 
 import { isDirectRun, moduleDir } from "./direct-run.mjs";
 
-const CLAIM_SUFFIX = ".publish-claim.json";
 const REAP_SUFFIX = ".publish-claim.json.reaplock";
+const KEY_SHAPE = /^[0-9a-f]{64}$/u;
 
 const ownerDead = (file, { staleMs, now }) => {
   let owner = null;
@@ -32,15 +43,18 @@ const ownerDead = (file, { staleMs, now }) => {
 };
 
 /**
- * 扫描并（apply 时）清理死残留。**活持有者一律不动并说明原因。**
+ * 扫描并（apply 时）清理**死掉的 reap 锁**。活持有者一律不动并说明原因。
+ * claim 文件永远不动 —— 见文件头。
  */
-export function repairRunClaims({ runsDir, apply = false, staleMs = 5 * 60 * 1000, now = Date.now() } = {}) {
+export function repairRunClaims({ runsDir, key = null, apply = false,
+  staleMs = 5 * 60 * 1000, now = Date.now() } = {}) {
   let names;
   try { names = fs.readdirSync(runsDir); }
   catch { return { ok: false, reason: "runs_unreadable", runsDir }; }
   const actions = [];
   for (const name of names.sort()) {
-    if (!name.endsWith(CLAIM_SUFFIX) && !name.endsWith(REAP_SUFFIX)) continue;
+    if (!name.endsWith(REAP_SUFFIX)) continue;
+    if (key !== null && !name.startsWith(key)) continue;
     const file = path.join(runsDir, name);
     const verdict = ownerDead(file, { staleMs, now });
     if (!verdict.dead) {
@@ -54,24 +68,38 @@ export function repairRunClaims({ runsDir, apply = false, staleMs = 5 * 60 * 100
 }
 
 export function repairCmd() {
-  // URL pathname 在含空格/非 ASCII 路径下会给出转义串 —— 用共用的 moduleDir。
   return path.join(moduleDir(import.meta.url), "repair-run-claim.mjs");
 }
 
 if (isDirectRun(import.meta.url)) {
-  const arg = (n) => {
-    const at = process.argv.indexOf("--" + n);
-    return at >= 0 ? process.argv[at + 1] : undefined;
-  };
-  const root = arg("project");
-  if (!root) { console.error("用法：repair-run-claim.mjs --project <root> [--apply]"); process.exit(2); }
-  const runsDir = path.join(root, ".runtime-data", "inbound", "runs");
-  const r = repairRunClaims({ runsDir, apply: process.argv.includes("--apply") });
+  // 严格解析：白名单之外一个都不收。
+  const argv = process.argv.slice(2);
+  let project = null;
+  let key = null;
+  let apply = false;
+  let bad = null;
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === "--project") { project = argv[++i]; }
+    else if (a === "--key") { key = argv[++i]; }
+    else if (a === "--apply") { apply = true; }
+    else { bad = a; break; }
+  }
+  if (bad !== null || !project || typeof project !== "string"
+    || (key !== null && (typeof key !== "string" || !KEY_SHAPE.test(key)))) {
+    console.error(bad !== null
+      ? "不认识的参数：" + bad + " —— 这是破坏性命令，只认 --project <root> [--key <64位hex>] [--apply]"
+      : "用法：repair-run-claim.mjs --project <root> [--key <64位hex>] [--apply]");
+    process.exit(2);
+  }
+  const runsDir = path.join(project, ".runtime-data", "inbound", "runs");
+  const r = repairRunClaims({ runsDir, key, apply });
   if (!r.ok) { console.error("runs 目录读不出来：" + runsDir); process.exit(1); }
-  if (r.actions.length === 0) { console.log("没有 claim/reap 残留。"); process.exit(0); }
+  if (r.actions.length === 0) { console.log("没有匹配的 reap 锁残留。"); process.exit(0); }
   for (const a of r.actions) {
     console.log((a.action === "kept" ? "保留  " : a.action === "removed" ? "已删  " : "将删  ") +
       a.file + " —— " + a.why);
   }
-  if (!r.apply) console.log("\n[dry-run] 没动任何文件。加 --apply 才真的清理。");
+  if (!r.apply) console.log("\n[dry-run] 没动任何文件。确认后加 --apply。");
+  else console.log("\n死 claim（若有）不由本命令处理 —— 热路径的接管协议会自取。");
 }

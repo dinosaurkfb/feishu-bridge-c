@@ -68,7 +68,8 @@ import { bindingWarning, checkBinding } from "./binding-health.mjs";
 import {
   DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliveryPinPath, findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin,
 } from "./live-session.mjs";
-import { extractReply, postDeliveryBits } from "./stop-hook.mjs";
+import { extractReply } from "./stop-hook.mjs";
+import { postDeliveryBits } from "./stop-note.mjs";
 import { foreignHint, projectLabel } from "./stop-note.mjs";
 import {
   CHAIN_FIELDS, assertPublishIdentity, materializeProjectConfig,
@@ -14377,8 +14378,43 @@ test("Stop 的 partial 措辞：两类发布后异常都要在，一类不许吞
   // 只有记账缺口时同样要说。
   assert.match(postDeliveryBits({ bookkeepingFailures: [{ messageId: "m", error: "x" }] }),
     /记账失败/u);
+  // **只有落标失败也要说** —— 缺这条的话，"只在两类同时存在时才显示落标失败"
+  // 这种改法照样绿。
+  const onlyUnrecorded = postDeliveryBits({
+    deliveredUnrecorded: [{ messageId: "m", file: "a.json", error: "x" }] });
+  assert.match(onlyUnrecorded, /没落标、下一轮可能重发/u);
+  assert.equal(onlyUnrecorded.includes("记账失败"), false, "没有的类别不许硬凑");
   // 都没有 = 空串，别加空标点。
   assert.equal(postDeliveryBits({}), "");
+});
+
+test("轮转记账以 ok:false 静默失败时，必须进 bookkeepingFailures（真实记账函数）", () => {
+  // 评审实测：recordClaudeActivityAndMaybeRotate 失败不抛、返回 {ok:false}，
+  // drain 的钩子忽略返回值 —— 轮转账缺口无声消失。
+  // 这条回归**必须经过真实记账函数**：注入一个直接 throw 的假 callback
+  // 测的只是事务的 catch，不是 drain 有没有看返回值。
+  const g = drainMatrixFixture();
+  // 只有 reply 会产生轮转活动（finalBusinessRecords 按 kind 过滤）——
+  // 用 next 之类的进展记录，这条测试就一次记账都不会发生、测了个寂寞。
+  appendEvent({ outboxDir: g.obDir, kind: "reply", text: "发成但记账挂了的一条",
+    source: "t", eventKey: "rot-e1" });
+  // 逼真实记账函数失败：inbound 目录改只读 —— 绑定状态写不进去，
+  // 返回 {ok:false}（实测 reason 是 binding_busy：锁目录都建不出来）。
+  const inboundDir = path.join(g.dir, ".runtime-data", "inbound");
+  fs.chmodSync(inboundDir, 0o500);
+  let r;
+  try { r = g.attempt({ publish: () => "om_sent" }); }
+  finally { fs.chmodSync(inboundDir, 0o700); }
+  assert.equal(r.status, "published", "发布本身成功");
+  assert.ok((r.bookkeepingFailures ?? []).length >= 1,
+    "**ok:false 必须变成 bookkeepingFailures** —— 静默吞掉就没人知道轮转账缺了");
+  assert.match(r.bookkeepingFailures[0].error, /轮转活动记账失败/u,
+    "要带上真实原因：" + JSON.stringify(r.bookkeepingFailures));
+  const marked = fs.readdirSync(g.obDir)
+    .map((f) => JSON.parse(fs.readFileSync(path.join(g.obDir, f), "utf-8")))
+    .find((x) => x.text === "发成但记账挂了的一条");
+  assert.match(marked.published_at ?? "", /^\d{4}/u,
+    "记账失败不影响落标 —— 防重发压倒一切");
 });
 
 summarySealed = true;

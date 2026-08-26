@@ -214,12 +214,17 @@ export function drainProject({
       for (const activity of businessActivitiesForPublishedBatch(batch, {
         messageId, runtime: "claude",
       })) {
-        recordClaudeActivityAndMaybeRotate({
+        const recorded = recordClaudeActivityAndMaybeRotate({
           root,
           claudeSessionId: resolved.claudeSessionId ?? mapping.claude_session_id ?? claudeSessionId,
           generationId: target.channelGenerationId,
           ...activity,
         });
+        // **它失败时不抛，返回 ok:false** —— 忽略返回值等于把轮转账缺口吞掉。
+        // 转成受控抛错，让事务把它归进 bookkeepingFailures（发布已成，照样落标）。
+        if (recorded && recorded.ok === false) {
+          throw new Error("轮转活动记账失败（" + (recorded.reason ?? "说不清") + "）");
+        }
       }
     },
   });

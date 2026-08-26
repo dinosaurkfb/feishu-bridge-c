@@ -27,22 +27,6 @@ import {
 
 // 会话结束是同步阻塞点：Frank 的终端在等它返回。发不出去就留在 outbox，
 // 兜底定时器 30 分钟内会重试 —— 宁可晚发，不可吊住会话。
-/**
- * 两类发布后异常的组合措辞。**同时发生就同时说** —— 单独渲染任何一类
- * 都会把另一类吞掉（评审在 published 和 partial 两个分支各抓到一次）。
- * 返回以"；"开头的追加片段；两类都没有时为空串。
- */
-export function postDeliveryBits(r) {
-  const bits = [];
-  if ((r.deliveredUnrecorded ?? []).length > 0) {
-    bits.push(r.deliveredUnrecorded.length + " 条**送达后没落标、下一轮可能重发**（先去话题核对）");
-  }
-  if ((r.bookkeepingFailures ?? []).length > 0) {
-    bits.push(r.bookkeepingFailures.length + " 处发布后记账失败（已送达不重发，轮转账可能缺）");
-  }
-  return bits.length === 0 ? "" : "；" + bits.join("；");
-}
-
 const PUBLISH_TIMEOUT_MS = 12_000;
 
 const LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "stop-hook.log");
@@ -134,7 +118,7 @@ async function main() {
 
   const { drainProject, localOutboxMessage, watcherActive, outboxDirOf, suppressCmd } =
     await import("./drain-outbox.mjs");
-  const { foreignHint, projectLabel } = await import("./stop-note.mjs");
+  const { foreignHint, postDeliveryBits, projectLabel } = await import("./stop-note.mjs");
   const { resolveProject } = await import("./project-resolve.mjs");
   const { appendEvent, listPending, MAX_REPLY_CHARS } = await import("./outbox.mjs");
   const { checkBinding, bindingWarning } = await import("./binding-health.mjs");

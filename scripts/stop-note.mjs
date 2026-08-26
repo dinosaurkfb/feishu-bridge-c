@@ -37,3 +37,20 @@ export function foreignHint(reported) {
   if (foreign.length === 0) return "";
   return " （标「非当前项目」的是因为本会话提到过它的路径，才被一起排空。）";
 }
+
+/**
+ * 两类发布后异常的组合措辞。**同时发生就同时说** —— 单独渲染任何一类
+ * 都会把另一类吞掉（评审在 published 和 partial 两个分支各抓到一次）。
+ * 返回以"；"开头的追加片段；两类都没有时为空串。
+ */
+export function postDeliveryBits(r) {
+  const bits = [];
+  if ((r.deliveredUnrecorded ?? []).length > 0) {
+    bits.push(r.deliveredUnrecorded.length + " 条**送达后没落标、下一轮可能重发**（先去话题核对）");
+  }
+  if ((r.bookkeepingFailures ?? []).length > 0) {
+    bits.push(r.bookkeepingFailures.length + " 处发布后记账失败（已送达不重发，轮转账可能缺）");
+  }
+  return bits.length === 0 ? "" : "；" + bits.join("；");
+}
+

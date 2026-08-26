@@ -53,4 +53,3 @@ export function postDeliveryBits(r) {
   }
   return bits.length === 0 ? "" : "；" + bits.join("；");
 }
-

@@ -50,9 +50,11 @@ import {
 } from "./outbound-card.mjs";
 import { PUBLISH_FAILURE, classifyPublishFailure } from "./outbound.mjs";
 import {
-  describeDrainOutcome, drainProject, outboxDirOf, publishErrorDetail, publishRetryability,
-  suppressCmd, trustedPublishResponse, watcherActive,
+  describeDrainOutcome, drainProject, outboxDirOf, suppressCmd, watcherActive,
 } from "./drain-outbox.mjs";
+import {
+  normalizePublishFailure, publishErrorDetail, publishRetryability,
+} from "./publish-failure.mjs";
 import { applySuppression } from "./feishu-suppress-outbox.mjs";
 import { applySuppressionCore, suppressionDigest } from "./suppress-outbox-core.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
@@ -12891,7 +12893,8 @@ test("永久拒绝与暂时失败要分开：拿不准算暂时", () => {
     ["httpCode 200 但别的地方炸了", false, "2xx 不是拒绝"],
     ["ErrCode: 99999 没见过的码", false, "**没见过的码不许猜成永久** —— 兜底的是次数上限"],
   ]) {
-    const got = publishRetryability(detail);
+    // 对象边界之后，分类的入口只有 normalize —— 表里的文本扮演 stderr。
+    const got = publishRetryability(normalizePublishFailure({ stderr: detail }));
     assert.equal(got.permanent, permanent, why + " —— " + JSON.stringify(detail).slice(0, 50) +
       " 判成了 " + JSON.stringify(got));
   }
@@ -13025,7 +13028,7 @@ test("认不出来的失败也不许无限重试：次数上限才是兜底那�
   // **认不出来的失败**：没有 httpCode、没有已知 ErrCode。
   const opaque = new Error("Command failed: x");
   opaque.stderr = "something went wrong, code 230099";
-  assert.equal(publishRetryability(opaque.stderr).permanent, false, "前提：这个认不出来");
+  assert.equal(publishRetryability(normalizePublishFailure(opaque)).permanent, false, "前提：这个认不出来");
 
   const safeDiagnose = () => ({ kind: PUBLISH_FAILURE.TRANSIENT, reason: "stub" });
   let calls = 0;
@@ -13262,9 +13265,9 @@ test("卡片正文不许伪造平台错误码：判定只喂可信响应", () =>
   const forged = new Error("Command failed: /bin/lark-cli im reply --card " +
     JSON.stringify({ text: "事故复盘：ErrCode: 11310 到底是什么？httpCode 400 又是什么？" }));
   forged.stderr = "";
-  assert.equal(trustedPublishResponse(forged), "",
+  assert.equal(normalizePublishFailure(forged).trusted, "",
     "**命令回显不是平台说的话** —— 拿不到可信响应就该是空");
-  assert.equal(publishRetryability(trustedPublishResponse(forged)).permanent, false,
+  assert.equal(publishRetryability(normalizePublishFailure(forged)).permanent, false,
     "**正文里的错误码不许把自己判成永久拒绝**");
   // 但给人看的详情仍要留下线索 —— 用途不同。
   assert.match(publishErrorDetail(forged), /Command failed/u, "人还是需要看到发生了什么");
@@ -13272,15 +13275,15 @@ test("卡片正文不许伪造平台错误码：判定只喂可信响应", () =>
   // 真的平台响应照常认。
   const real = new Error("Command failed: /bin/lark-cli x");
   real.stderr = "ext=ErrCode: 11310; ErrMsg: card table number over limit";
-  assert.equal(publishRetryability(trustedPublishResponse(real)).permanent, true,
+  assert.equal(publishRetryability(normalizePublishFailure(real)).permanent, true,
     "守卫不能把真的也一起挡了");
 
   // 命令回显**之后**那半是子进程说的，可信。
   const afterEcho = new Error("Command failed: /bin/lark-cli " +
     JSON.stringify({ text: "正文里写着 ErrCode: 11310" }) + "\nhttpCode 400, errCode 230099");
-  assert.equal(trustedPublishResponse(afterEcho), "httpCode 400, errCode 230099",
+  assert.equal(normalizePublishFailure(afterEcho).trusted, "httpCode 400, errCode 230099",
     "只取换行之后那半");
-  assert.equal(publishRetryability(trustedPublishResponse(afterEcho)).reason, "http_400");
+  assert.equal(publishRetryability(normalizePublishFailure(afterEcho)).reason, "http_400");
 });
 
 test("暂停成因要落盘：进程结束之后仍要分得清是哪一种", () => {
@@ -13380,6 +13383,15 @@ test("watcher 连续失败也要记账，五次上限对它同样成立（真实
   assert.equal(rec.publish_attempts, MAX_AUTO_PUBLISH_ATTEMPTS,
     "上限是 " + MAX_AUTO_PUBLISH_ATTEMPTS + "，实际累计 " + rec.publish_attempts);
   assert.equal(rec.published_at, null, "没发出去就不许标已发布");
+
+  // **落盘的 reason 是要给人看的 —— 命令回显（含卡片正文）不许漏进去。**
+  // 回显的开头是整条命令，卡片 JSON 就在里面：拿原始 message 一截，
+  // 留下的全是命令、平台说的话一个字没有 —— 这正是 A1 那次 12 小时的形状，
+  // 只是这回发生在落盘字段上。
+  assert.match(rec.publish_rejected_reason, /boom/u,
+    "平台真说的那句（stderr）要在 reason 里");
+  assert.equal(rec.publish_rejected_reason.includes("一直发不出去的那条"), false,
+    "**卡片正文不许漏进落盘的 reason** —— 那是命令回显里的用户内容");
 });
 
 test("两个输出通道都可信：真错误码在 stdout 里也不许漏掉", () => {
@@ -13391,22 +13403,22 @@ test("两个输出通道都可信：真错误码在 stdout 里也不许漏掉", 
   err.stdout = JSON.stringify({ ok: false, error: { code: 230099,
     message: "Failed to create card content, ext=ErrCode: 11310; ErrMsg: card table number over limit" } });
   err.stderr = "note: build cache warm";
-  const trusted = trustedPublishResponse(err);
-  assert.match(trusted, /11310/u, "**stdout 里的平台响应必须进来**");
-  assert.match(trusted, /build cache warm/u, "stderr 也不许丢");
-  assert.equal(publishRetryability(trusted).permanent, true, "真错误码要能判出来");
+  const failure = normalizePublishFailure(err);
+  assert.match(failure.trusted, /11310/u, "**stdout 里的平台响应必须进来**");
+  assert.match(failure.trusted, /build cache warm/u, "stderr 也不许丢");
+  assert.equal(publishRetryability(failure).permanent, true, "真错误码要能判出来");
 
   // 只有 stdout 的情形。
   const onlyOut = new Error("Command failed: x");
   onlyOut.stdout = "httpCode 403 forbidden";
-  assert.equal(publishRetryability(trustedPublishResponse(onlyOut)).reason, "http_403");
+  assert.equal(publishRetryability(normalizePublishFailure(onlyOut)).reason, "http_403");
 
   // **两个通道都空才回落到命令回显之后那半**，而回显本身仍然不许进。
   const echoOnly = new Error("Command failed: /bin/lark-cli " +
     JSON.stringify({ text: "ErrCode: 11310" }));
   echoOnly.stdout = ""; echoOnly.stderr = "";
-  assert.equal(trustedPublishResponse(echoOnly), "", "回显里全是我们自己喂进去的");
-  assert.equal(publishRetryability(trustedPublishResponse(echoOnly)).permanent, false);
+  assert.equal(normalizePublishFailure(echoOnly).trusted, "", "回显里全是我们自己喂进去的");
+  assert.equal(publishRetryability(normalizePublishFailure(echoOnly)).permanent, false);
 });
 
 test("重试状态机：次数和状态必须互相印证", () => {
@@ -13642,6 +13654,26 @@ test("受控成因枚举不许在运行时被扩宽", () => {
   try { PAUSE_KINDS.push("invented_kind"); } catch { /* 冻结数组会抛，正好 */ }
   assert.equal(retryProtection(forged).status, "corrupt",
     "**就算导出面被动过，判据也不许跟着变宽**");
+});
+
+test("发布失败分类是对象边界：裸字符串和手搓对象都进不来", () => {
+  // 上一版靠调用纪律（"判定只喂可信那份，别传错字符串"）——
+  // 纪律会被忘记，这条线上"接了 N 个消费者漏了第 N+1 个"已经发生了七次。
+  // 现在唯一取得判定资格的路是 normalizePublishFailure。
+  assert.throws(() => publishRetryability("httpCode 400"), TypeError,
+    "**裸字符串必须被拒** —— 它可能是含卡片正文的那份");
+  assert.throws(() => publishRetryability({ trusted: "ErrCode: 11310" }), TypeError,
+    "**手搓对象也进不来** —— 否则把用户内容当 trusted 塞进来就绕过了边界");
+  assert.throws(() => publishRetryability(undefined), TypeError);
+
+  const failure = normalizePublishFailure({ stderr: "httpCode 400" });
+  assert.equal(Object.isFrozen(failure), true, "规范形要冻结 —— 拿到之后改 trusted 也不行");
+  assert.equal(publishRetryability(failure).permanent, true, "正路必须通");
+  // display 与 trusted 的分工：display 兜底给人看，trusted 宁缺毋滥。
+  const echoOnly = normalizePublishFailure({
+    message: "Command failed: /bin/lark-cli " + JSON.stringify({ text: "正文 ErrCode: 11310" }) });
+  assert.equal(echoOnly.trusted, "");
+  assert.match(echoOnly.display, /Command failed/u, "人仍要看到发生了什么");
 });
 
 summarySealed = true;

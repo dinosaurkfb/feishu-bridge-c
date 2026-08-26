@@ -20,6 +20,7 @@ import {
 } from "./outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { PUBLISH_FAILURE, classifyPublishFailure, publishDraft } from "./outbound.mjs";
+import { normalizePublishFailure, publishRetryability } from "./publish-failure.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
@@ -75,181 +76,7 @@ export function watcherActive(root) {
   return !isLockStale(lockDir);
 }
 
-/**
- * 排空一个项目的 outbox。返回结构化结果，自己不打印、不退出 ——
- * 它跑在会话结束钩子里，任何 throw 或 process.exit 都会砸到别人的会话上。
- */
-const PUBLISH_ERROR_CAP = 400;
 
-/**
- * 这次失败是**永久拒绝**还是**暂时失败**。
- *
- * 分不开的后果是实测过的：cc2cd 三条答复各含 6 个表格，飞书回
- * `ErrCode: 11310; ErrMsg: card table number over limit`。
- * 排空对失败一律"留在 outbox，下一轮重试"，于是 **68 条失败行、
- * 每 30 分钟一次、空转 12 小时**，稳定地制造噪音而没有任何一次能成功。
- *
- * ■ 两个信号，都是"认出来"的
- *
- *   · httpCode 4xx = 请求本身不被接受（408 / 429 例外：超时和限流
- *     恰恰是"现在不行、待会儿行"）
- *   · 已知的永久 ErrCode —— 卡片结构越界这一类，内容不改就永远发不出去
- *
- * ■ 但**认出来这条路本身是不可靠的**
- *
- * 实测：那次故障的 lark-cli 输出**根本没有 httpCode**，只有 `"code": 230099`，
- * 真正的 11310 埋在 `ext=` 里。我第一版只按 HTTP 状态码分类，
- * 在真实数据上会把它判成"暂时" —— **判据看着对，喂真实数据就不成立**。
- *
- * 而且错误码表永远追不齐。所以真正兜底的不是这个函数，是
- * `MAX_AUTO_PUBLISH_ATTEMPTS`：它不需要认识任何错误码。
- * 这个函数只负责"认出来的就别再等了"，**拿不准一律算暂时** ——
- * 误判成永久会让一条本该发出去的答复停下来等人，误判成暂时只是多试几次，
- * 上限还兜着。两种错的代价不对称。
- */
-const TRANSIENT_HTTP = new Set([408, 429]);
-
-/**
- * 已知的永久 ErrCode。**这张表注定是不全的** —— 它只是让认得出的那些少走几轮，
- * 真正保证"不会无限重试"的是次数上限。
- */
-const PERMANENT_ERR_CODES = new Set([
-  11310,   // card table number over limit —— 卡片表格数超限，内容不改就永远发不出去
-]);
-
-export function publishRetryability(detail) {
-  const text = String(detail ?? "");
-  const errCode = /ErrCode:\s*(\d+)/u.exec(text);
-  if (errCode && PERMANENT_ERR_CODES.has(Number(errCode[1]))) {
-    return { permanent: true, reason: "err_" + errCode[1] };
-  }
-  // `httpCode 400` 和 `"httpCode": 400` 都要认 —— 两种形态都在真实输出里见过。
-  const http = /httpCode"?\s*:?\s*(\d{3})/u.exec(text);
-  if (!http) return { permanent: false, reason: "no_permanent_signal" };
-  const code = Number(http[1]);
-  if (code >= 400 && code < 500 && !TRANSIENT_HTTP.has(code)) {
-    return { permanent: true, reason: "http_" + code };
-  }
-  return { permanent: false, reason: "http_" + code };
-}
-
-/**
- * 错误里那些**认得出来的诊断片段** —— 截断时一个都不许丢。
- *
- * 顺序即优先级：真正说明白"为什么被拒"的是 ext 里那对 ErrCode/ErrMsg，
- * 外层的 code/httpCode 只说明"被拒了"。
- */
-const DIAGNOSTIC_PATTERNS = [
-  /ErrCode:\s*\d+/gu,
-  /ErrMsg:\s*[^;"\n]{1,120}/gu,
-  /ErrorValue:\s*[^;"\n]{1,60}/gu,
-  // `httpCode 400` 和 `"httpCode": 400` 都要认 —— 两种形态在真实输出里都见过，
-  // 正文承诺了会捞它们，就不能只认其中一种。
-  /httpCode"?\s*:?\s*\d{3}/gu,
-  /errCode"?\s*:?\s*\d+/gu,
-  /"code":\s*\d+/gu,
-];
-
-/** 被省略段里带诊断码的片段，去重后按出现顺序返回。 */
-function diagnosticsMissingFrom(full, kept) {
-  const found = [];
-  for (const re of DIAGNOSTIC_PATTERNS) {
-    for (const m of String(full).matchAll(re)) {
-      const piece = m[0].trim();
-      if (kept.includes(piece) || found.includes(piece)) continue;
-      found.push(piece);
-      if (found.length >= 6) return found;   // 病态输入不许把日志撑爆
-    }
-  }
-  return found;
-}
-
-/**
- * 长错误留头也留尾 —— **真正的错误码常常在末尾**，只留头等于把它扔了。
- *
- * 但留头留尾也不够，**这一条是付过账的**：飞书返回的是一层嵌套 JSON，
- * 真正的原因躺在 `error.message` 的中段：
- *
- *     "message": "Failed to create card content, ext=ErrCode: 11310;
- *                 ErrMsg: card table number over limit; ..."
- *
- * head 160 落在 message 值中间、tail 200 落进 log_id，**被切掉的正是那对
- * ErrCode/ErrMsg**。整份 drain.log 里 `11310` 出现 0 次 ——
- * 答案一直在返回里，一次故障绕了 12 小时只因为日志把它切了。
- *
- * 上一版注释自己就写着"上上版发现过这个症状，改法是把 400 放宽，那治不了"。
- * **同一个错误换了个入口又犯了一遍**：这回不是长度不够、也不是方向不对，
- * 是**中段**被吃了。所以现在不靠位置猜，而是把认得出来的诊断片段单独捞出来附在后面。
- */
-function clipBothEnds(text) {
-  const t = String(text).trim();
-  if (t.length <= PUBLISH_ERROR_CAP) return t;
-  const kept = t.slice(0, 160) + " …（中间省略）… " + t.slice(-200);
-  const rescued = diagnosticsMissingFrom(t, kept);
-  return rescued.length === 0
-    ? kept
-    : kept + "\n  被省略段里的诊断：" + rescued.join("; ");
-}
-
-/**
- * 从发布失败里挑出**有用的那半**。
- *
- * Node 的 execSync 错误长这样：`Command failed: <整条命令>\n<stderr>`。
- * 而这条命令带着整张卡片 JSON，光命令回显就上千字符 —— 从头截 400 字留下来的
- * 全是命令，lark-cli 真正说的话一个字都没有。
- *
- * 上上版发现过这个症状，改法是"把 400 放宽"。那治不了：问题不是**长度不够**，
- * 是**截错了方向**。
- *
- * 上一版只对"纯命令回显"留头尾，对 stderr 仍然从头截 —— 于是多行 runtime 提示
- * 加末尾错误码时，`code 230002` 照样被切掉。**同一个错误换了个入口又犯一遍。**
- * 现在头尾保留对**所有**长文本一视同仁。
- *
- * 另一处：上一版只要 message 有换行就删掉第一行。可只有 `Command failed:` 开头的
- * 那种第一行才是命令回显 —— 普通多行错误的第一行往往正是主错误。**只在确实匹配
- * 时才剥。**
- */
-/**
- * **只有平台真的说过的话**才能拿来做判定。
- *
- * 这是一条安全边界，不是整洁问题。卡片 JSON 会整个进入子进程 argv，
- * 于是 Node 的 `Command failed: <整条命令>` 里**包含用户内容**。
- * 评审实测：子进程静默 exit 1、卡片正文里写着 `ErrCode: 11310`，
- * 分类器就在命令回显里搜到了它，判成 `{permanent:true, reason:"err_11310"}` ——
- * **一段正文让自己被永久停发**。
- *
- * 所以判定的输入只能是子进程的 stdout/stderr，或者命令回显**之后**那部分。
- * 拿不到可信响应就返回空串 —— 调用方据此按暂时失败处理。
- */
-export function trustedPublishResponse(err) {
-  const asText = (raw) => (typeof raw === "string" ? raw
-    : (raw && typeof raw.toString === "function") ? raw.toString("utf-8") : "").trim();
-  // **两个输出通道都可信，要合起来看。**
-  //
-  // 上一版只读 stderr、而且只要 stderr 非空就不再看别的。评审实测：
-  // stdout 里是 `code: 230099` 这条真正的平台响应、stderr 里只有一句构建提示，
-  // 于是被判成暂时失败，**给人的详情也把真错误码丢了**。
-  // lark-cli 把结构化响应写在 stdout 是常态，注释当时也承诺了会读它。
-  const channels = [asText(err?.stdout), asText(err?.stderr)].filter(Boolean);
-  if (channels.length > 0) return channels.join("\n");
-  const message = String(err?.message ?? "");
-  // `Command failed: <命令>\n<真正的输出>` —— 只有换行**之后**那半是子进程说的。
-  // 没有换行就意味着我们只拿到了命令回显本身，那里面全是我们自己喂进去的东西。
-  if (!message.startsWith("Command failed:") || !message.includes("\n")) return "";
-  return message.slice(message.indexOf("\n") + 1).trim();
-}
-
-/**
- * 给人看的失败详情。
- *
- * 跟 `trustedPublishResponse` 的区别是**用途不同**：这里拿不到可信响应时
- * 仍然把原始 message 打出来（人需要线索），但那份**绝不能拿去做判定** ——
- * 它含用户内容。判定一律走 trustedPublishResponse。
- */
-export function publishErrorDetail(err) {
-  const trusted = trustedPublishResponse(err);
-  return clipBothEnds(trusted || String(err?.message ?? ""));
-}
 
 /**
  * 把统一守卫的结论讲成人话。**Stop 和 CLI 共用这一份措辞。**
@@ -506,10 +333,11 @@ export function drainProject({
       // **永久拒绝要落到记录上**，否则下一轮定时排空照撞不误。
       // 锁还在手里（catch 在 try 内、finally 之前），改的是同一条记录的语义，
       // 跟抑制、资格提升共用这把锁 —— 满足统一写锁那条。
-      const detail = publishErrorDetail(err);
-      // **判定只喂可信响应。**detail 在拿不到可信响应时会回落到含命令回显的原始
-      // message —— 那里面有卡片正文，用它判定等于让内容决定自己的命运。
-      const retryability = publishRetryability(trustedPublishResponse(err));
+      // **规范化一次，各取所需。**判定只吃 failure（对象边界，混不进
+      // 命令回显里的用户内容）；给人看的走 display。
+      const failure = normalizePublishFailure(err);
+      const retryability = publishRetryability(failure);
+      const detail = failure.display;
       const marked = [];
       let pausedKind = null;
       for (const record of failingBatch ?? []) {
@@ -537,7 +365,7 @@ export function drainProject({
         permanentReason: pausedKind === null ? null
           : (pausedKind === "platform_rejected" ? retryability.reason : "retry_exhausted"),
         markedRejected: marked,
-        // 挑有用的那半：见 publishErrorDetail。**从头截固定长度会把真正的
+        // 挑有用的那半：见 publish-failure.mjs。**从头截固定长度会把真正的
         // 错误码切掉** —— 这条命令光命令回显就上千字符，前 400 字全是命令。
         error: detail,
         // 诊断只是**线索**，不是判决 —— 调用方拿它给人看，不拿它做有损动作。

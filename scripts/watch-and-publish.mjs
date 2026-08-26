@@ -19,7 +19,7 @@ import {
   auditOutbox, isPermanentlyRejected, listPending, markSent, outboxMutationBlocker,
   recordPublishFailure,
 } from "./outbox.mjs";
-import { publishRetryability, trustedPublishResponse } from "./drain-outbox.mjs";
+import { normalizePublishFailure, publishRetryability } from "./publish-failure.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { readClaim, recordClaimState } from "./claim.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
@@ -227,14 +227,14 @@ while (true) {
           // 锁还在手里（catch 在 try 内、finally 之前），跟抑制、资格提升共用那把锁。
           // 判定只喂**可信响应** —— 卡片正文会进命令回显，用它判定等于让内容
           // 决定自己的命运。
-          const trusted = trustedPublishResponse(err);
-          const retryability = publishRetryability(trusted);
+          const failure = normalizePublishFailure(err);
+          const retryability = publishRetryability(failure);
           const paused = [];
           for (const record of (failingBatch ?? []).filter((item) => item._file)) {
             try {
               const outcome = recordPublishFailure(record, {
                 permanent: retryability.permanent,
-                reason: retryability.reason + "：" + (trusted || String(err.message ?? "")),
+                reason: retryability.reason + "：" + failure.display,
               });
               if (outcome.paused) paused.push(path.basename(String(record._file)));
             } catch { /* 记不上不算失败：下一轮还会再撞一次，但不会更坏 */ }

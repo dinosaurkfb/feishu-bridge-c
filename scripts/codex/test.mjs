@@ -7104,6 +7104,33 @@ test("R5 completeness：收集层给结论，坏一处就 complete:false 并点�
     assert.equal(entryWhole.complete, false);
     assert.ok(entryWhole.problems.some((x) => /projects\[0\]/u.test(x.at)),
       "坏在第几条要点名：" + JSON.stringify(entryWhole.problems));
+
+    // **混合故障：合法项目坏 outbox + 相邻坏登记项，两类问题都要在。**
+    // 评审实测：坏登记项分支先返回、outbox 问题后收集，于是只报前者 ——
+    // 坏 outbox 要等人修完登记表、跑第二遍才看得见。
+    fs.writeFileSync(projReg, JSON.stringify({ schema_version: "1.0",
+      projects: [{ root: proj, claude_session_id: null }, { root: 42 }] }));
+    const mixed = collectProjectBacklog();
+    assert.equal(mixed.ok, false);
+    assert.equal(mixed.complete, false);
+    assert.ok(mixed.problems.some((x) => /projects\[1\]/u.test(x.at)),
+      "坏登记项要在：" + JSON.stringify(mixed.problems));
+    assert.ok(mixed.problems.some((x) => /bad\.json/u.test(x.at)),
+      "**已扫出的坏 outbox 也要在，不许等第二遍**：" + JSON.stringify(mixed.problems));
+    // 顶层继承同样两类都要在。
+    const mixedWhole = collectBacklog({ home });
+    assert.ok(mixedWhole.problems.some((x) => /projects\[1\]/u.test(x.at)));
+    assert.ok(mixedWhole.problems.some((x) => /bad\.json/u.test(x.at)),
+      "顶层也不许丢已扫出的那半：" + JSON.stringify(mixedWhole.problems));
+    // 真实 CLI 在同一次输出里要把两类都点名。
+    const mixedCli = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
+      { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+        FEISHU_BRIDGE_REGISTRY: projReg } });
+    assert.notEqual(mixedCli.status, 0);
+    assert.match(mixedCli.stderr, /projects\[1\]/u, "CLI 要点名坏登记项：" + mixedCli.stderr);
+    assert.match(mixedCli.stderr, /bad\.json/u,
+      "**CLI 同一次输出就要点名坏 outbox**：" + mixedCli.stderr);
     // 恢复：项目侧指回共用那份好登记表，后面的区分场景继续用。
     process.env.FEISHU_BRIDGE_REGISTRY = registry;
 

@@ -348,20 +348,26 @@ export function collectProjectBacklog() {
       projects.push(entry);
     }
   }
-  // **有坏项就整体报不完整**，不许拿一份残缺的全景去支撑"没有积压"这个结论。
-  if (bad.length > 0) {
-    return { ok: false, scanned: false, reason: "registry_entry_malformed",
-      bad, projects, complete: false,
-      problems: bad.map((b) => ({ at: "claude-registry/" + b.at, why: b.why })) };
-  }
   // **completeness 是收集层的结论，不是渲染层的现算**（R5）。
   // 判定散在渲染层的话，第二个消费者又得自己算一遍 —— 算漏的那个
   // 就会把残缺视野当完整视野报（"积压 0 条"那类假精确）。
+  //
+  // **在坏登记项判定之前收集** —— 评审实测：先返回再收集的话，
+  // "合法项目坏 outbox + 相邻坏登记项"这种混合故障只报后者，
+  // 坏 outbox 要等人修完登记表、跑第二遍才看得见。
   const problems = [];
   for (const entry of projects) {
     if (!entry.readable) problems.push({ at: entry.name, why: "outbox 读不出来（" + entry.unreadableReason + "）" });
     for (const u of entry.unclassified ?? []) problems.push({ at: entry.name + "/" + u.file, why: u.why });
     for (const u of entry.unexplainable ?? []) problems.push({ at: entry.name + "/" + u.file, why: u.why });
+  }
+  // **有坏项就整体报不完整**，不许拿一份残缺的全景去支撑"没有积压"这个结论。
+  // problems 合并两类：坏登记项（解释视野为什么残缺）在前，已扫出的 outbox 问题在后
+  // —— **全部已观察到的问题一次给全**。
+  if (bad.length > 0) {
+    return { ok: false, scanned: false, reason: "registry_entry_malformed",
+      bad, projects, complete: false,
+      problems: [...bad.map((b) => ({ at: "claude-registry/" + b.at, why: b.why })), ...problems] };
   }
   return { ok: true, scanned: true, projects, complete: problems.length === 0, problems };
 }
@@ -511,7 +517,9 @@ function main() {
   if (proj.ok === false) {
     warn("项目级绑定的登记表说不清（" + proj.reason + "）—— " +
       "**这不是「没有积压」**，项目级那半边视野现在是瞎的。");
-    for (const b of proj.bad ?? []) warn("  " + b.at + " —— " + b.why);
+    // 打印完整 problems —— 里面既有坏登记项，也有**已扫出的** outbox 问题。
+    // 只打坏登记项的话，坏 outbox 要等修完登记表、跑第二遍才看得见。
+    for (const b of proj.problems ?? []) warn("  " + b.at + " —— " + b.why);
     process.exit(1);
   }
 

@@ -6562,6 +6562,45 @@ test("积压视图：项目级绑定也在视野里，措辞不许超出实际�
   assert.deepEqual(none.projects, []);
 });
 
+test("坏的登记项不许静默跳过，全景说不清就不许说没有积压", () => {
+  // 评审实测：登记表是 {"projects":[{"root":42}]} 时上一版直接 continue 掉，
+  // 返回 {ok:true, projects:[]} —— **真实 CLI 随后声称项目级视野为空**。
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-badentry-"));
+  const registry = path.join(home, "registry.json");
+  const withReg = (fn) => {
+    const before = process.env.FEISHU_BRIDGE_REGISTRY;
+    process.env.FEISHU_BRIDGE_REGISTRY = registry;
+    try { return fn(); } finally {
+      if (before === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY;
+      else process.env.FEISHU_BRIDGE_REGISTRY = before;
+    }
+  };
+  const good = { root: path.join(home, "p"), claude_session_id: null };
+  fs.mkdirSync(path.join(home, "p", ".runtime-data", "outbound", "outbox"), { recursive: true });
+
+  for (const [why, entry, expect] of [
+    ["root 是数字", { root: 42 }, /root 不是非空字符串/u],
+    ["root 是纯空白", { root: "   " }, /root 不是非空字符串/u],
+    ["root 缺席", {}, /root 不是非空字符串/u],
+    ["root 是相对路径", { root: "relative/path" }, /root 不是绝对路径/u],
+    ["登记项不是对象", [1, 2], /不是登记项对象/u],
+    ["登记项是 null", null, /不是登记项对象/u],
+    ["session 形状不对", { root: "/abs", claude_session_id: 7 }, /claude_session_id 形状不对/u],
+    ["session 是空串", { root: "/abs", claude_session_id: "" }, /claude_session_id 形状不对/u],
+  ]) {
+    fs.writeFileSync(registry, JSON.stringify({ schema_version: "1.0", projects: [good, entry] }));
+    const got = withReg(() => collectProjectBacklog());
+    assert.equal(got.ok, false, why + "：**说不清却报了 ok** —— " + JSON.stringify(got));
+    assert.equal(got.reason, "registry_entry_malformed", why);
+    assert.match(got.bad?.[0]?.why ?? "", expect, why + "：理由不对 —— " + JSON.stringify(got.bad));
+    assert.match(got.bad?.[0]?.at ?? "", /projects\[1\]/u, why + "：要点名是第几项");
+  }
+
+  // 全都合法时照常放行 —— 守卫不能把好情况也一起挡了。
+  fs.writeFileSync(registry, JSON.stringify({ schema_version: "1.0", projects: [good] }));
+  assert.equal(withReg(() => collectProjectBacklog()).ok, true, "干净时必须照常放行");
+});
+
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (failed > 0) process.exit(1);

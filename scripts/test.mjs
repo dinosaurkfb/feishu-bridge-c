@@ -36,11 +36,13 @@ import {
   loadRegistry, loadRegistryStrict, normalizeRoot, releasePublishLock,
   routableProjectsForRoot,
 } from "./registry.mjs";
+import * as outboxModule from "./outbox.mjs";
 import {
   MAX_AUTO_PUBLISH_ATTEMPTS, appendEvent, auditOutbox, classifyOutboxRecord,
-  clearPermanentRejection, codexReplyEventKey, composeDigest, explainabilityGaps,
+  codexReplyEventKey, composeDigest, explainabilityGaps,
   hasPublishAuthorization, isPermanentlyRejected, listPending, markPublishEligibleByEventKey,
-  markSent, outboxMutationBlocker, recordPublishFailure, suppressPublishByEventKey,
+  markSent, outboxMutationBlocker, pauseKindOf, recordPublishFailure, retryProtectionState,
+  suppressPublishByEventKey,
 } from "./outbox.mjs";
 import {
   capMarkdownTables, composeOutboundCard, countMarkdownTables, outboundCardBatches,
@@ -49,11 +51,10 @@ import {
 import { PUBLISH_FAILURE, classifyPublishFailure } from "./outbound.mjs";
 import {
   describeDrainOutcome, drainProject, outboxDirOf, publishErrorDetail, publishRetryability,
-  suppressCmd, watcherActive,
+  suppressCmd, trustedPublishResponse, watcherActive,
 } from "./drain-outbox.mjs";
 import { applySuppression } from "./feishu-suppress-outbox.mjs";
 import { applySuppressionCore, suppressionDigest } from "./suppress-outbox-core.mjs";
-import * as outboxModule from "./outbox.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
 import {
   applyRuntimeSync, planRuntimeSync, runtimeRoot, runtimeScript, verifyRuntime,
@@ -12906,8 +12907,8 @@ test("被永久拒绝的记录：不再自动重试，但也不许当成不存�
 
   assert.equal(isPermanentlyRejected(rec), false, "一开始不是被拒状态");
   const outcome = recordPublishFailure(rec, { permanent: true, reason: "http_400：ErrCode: 11310" });
-  assert.deepEqual({ rejected: outcome.rejected, attempts: outcome.attempts },
-    { rejected: true, attempts: 1 }, "认出来的永久错误第一次就该停");
+  assert.deepEqual({ paused: outcome.paused, attempts: outcome.attempts, kind: outcome.kind },
+    { paused: true, attempts: 1, kind: "platform_rejected" }, "认出来的永久错误第一次就该停");
   const after = JSON.parse(fs.readFileSync(file, "utf-8"));
 
   assert.match(after.publish_rejected_at, /^\d{4}-\d{2}-\d{2}T/u, "写的得是规范时间");
@@ -12926,12 +12927,11 @@ test("被永久拒绝的记录：不再自动重试，但也不许当成不存�
   // outbox 仍然说得清（守卫不许因为多了两个字段就整批拦下）。
   assert.equal(outboxMutationBlocker(auditOutbox(obDir)), null, "多两个字段不该让整批说不清");
 
-  // 人显式下令能撤销 —— 起因修好之后不该只剩「不可逆抑制」一条路。
-  clearPermanentRejection(listPending({ outboxDir: obDir })[0]);
-  const cleared = JSON.parse(fs.readFileSync(file, "utf-8"));
-  assert.equal(cleared.publish_rejected_at, undefined, "撤销要真的把字段删掉，不是置空");
-  assert.equal(cleared.publish_rejected_reason, undefined);
-  assert.equal(isPermanentlyRejected(cleared), false);
+  // **撤销保护的唯一路径是发布成功**（markSent 那一次写）。
+  // 曾经有一个 clearPermanentRejection 公开导出，实现的正是"发布前撤掉保护" ——
+  // 而那恰恰是本轮废掉的缺陷。留着它等于给后来的调用方留一条重新引入的路。
+  assert.equal("clearPermanentRejection" in outboxModule, false,
+    "**预先撤保护的能力不许留在共用面上**");
 });
 
 test("真实排空：永久拒绝要落到记录上，下一轮不再撞同一堵墙", () => {
@@ -12989,6 +12989,7 @@ test("真实排空：永久拒绝要落到记录上，下一轮不再撞同一�
     const at = path.join(dir2, ".runtime-data", "outbound", "outbox", f);
     const rec = JSON.parse(fs.readFileSync(at, "utf-8"));
     delete rec.publish_rejected_at; delete rec.publish_rejected_reason;
+    delete rec.publish_rejected_kind; delete rec.publish_attempts;
     fs.writeFileSync(at, JSON.stringify(rec));
   }
   fs.rmSync(path.join(dir2, ".runtime-data", "outbound", "publish.lock"), { recursive: true, force: true });
@@ -13086,34 +13087,45 @@ test("重试保护那三个字段必须自洽，写坏了不许悄悄回到自�
   // 保护字段就重新进入了自动发布队列**。
   const good = { ...outboxRecord({ text: "一条" }),
     publish_attempts: 3, publish_rejected_at: "2026-08-26T00:00:00.000Z",
-    publish_rejected_reason: "平台拒绝（err_11310）" };
+    publish_rejected_reason: "平台拒绝（err_11310）", publish_rejected_kind: "platform_rejected" };
   assert.deepEqual(explainabilityGaps(good), [], "正常那份不许被误伤：" +
     JSON.stringify(explainabilityGaps(good)));
   // 三个字段都不在也合法 —— 绝大多数记录就是这样。
   assert.deepEqual(explainabilityGaps(outboxRecord({ text: "干净的" })), []);
 
+  // retrying 也是合法形状：只有 attempts、还在预算内。
+  assert.deepEqual(explainabilityGaps({ ...outboxRecord({ text: "重试中" }),
+    publish_attempts: 2 }), [], "retrying 形状不许被误伤");
+
+  const paused = { publish_attempts: 3, publish_rejected_at: "2026-08-26T00:00:00.000Z",
+    publish_rejected_reason: "平台拒绝（err_11310）", publish_rejected_kind: "platform_rejected" };
   const cases = [
-    ["attempts 是字符串", { publish_attempts: "five" }, "publish_attempts"],
-    ["attempts 是小数", { publish_attempts: 1.5 }, "publish_attempts"],
-    ["attempts 是负数", { publish_attempts: -1 }, "publish_attempts"],
-    ["attempts 是对象", { publish_attempts: {} }, "publish_attempts"],
-    ["rejected_at 不是时间", { publish_rejected_at: "not-a-time",
-      publish_rejected_reason: "x" }, "publish_rejected_at"],
-    ["rejected_at 是 null", { publish_rejected_at: null,
-      publish_rejected_reason: "x" }, "publish_rejected_at"],
-    ["reason 是对象", { publish_rejected_at: "2026-08-26T00:00:00.000Z",
-      publish_rejected_reason: {} }, "publish_rejected_reason"],
-    ["reason 是纯空白", { publish_rejected_at: "2026-08-26T00:00:00.000Z",
-      publish_rejected_reason: "   " }, "publish_rejected_reason"],
-    // **两个方向都要查**：有理由没时间同样说不清。
-    ["有时间没理由", { publish_rejected_at: "2026-08-26T00:00:00.000Z" },
-      "publish_rejected_reason"],
-    ["有理由没时间", { publish_rejected_reason: "被拒了" }, "publish_rejected_at"],
+    ["attempts 是字符串", { publish_attempts: "five" }],
+    ["attempts 是小数", { publish_attempts: 1.5 }],
+    ["attempts 是负数", { publish_attempts: -1 }],
+    ["attempts 是对象", { publish_attempts: {} }],
+    // **0 次也不行**：从没试过却已经在重试状态，生产写不出这种形状。
+    ["attempts 是 0", { publish_attempts: 0 }],
+    ["rejected_at 不是时间", { ...paused, publish_rejected_at: "not-a-time" }],
+    ["rejected_at 是 null", { ...paused, publish_rejected_at: null }],
+    ["reason 是对象", { ...paused, publish_rejected_reason: {} }],
+    ["reason 是纯空白", { ...paused, publish_rejected_reason: "   " }],
+    ["kind 不在受控取值里", { ...paused, publish_rejected_kind: "随便写的" }],
+    ["kind 缺席", (() => { const x = { ...paused }; delete x.publish_rejected_kind; return x; })()],
+    // **每个方向都要查**：少任何一件都说不清它到底是不是暂停了。
+    ["有时间没理由", { publish_attempts: 3, publish_rejected_at: "2026-08-26T00:00:00.000Z",
+      publish_rejected_kind: "platform_rejected" }],
+    ["有理由没时间", { publish_attempts: 3, publish_rejected_reason: "被拒了",
+      publish_rejected_kind: "platform_rejected" }],
+    // **paused 却没有 attempts** —— 生产也产不出来。
+    ["没有 attempts", (() => { const x = { ...paused }; delete x.publish_attempts; return x; })()],
   ];
-  for (const [why, patch, field] of cases) {
+  for (const [why, patch] of cases) {
     const rec = { ...outboxRecord({ text: "一条" }), ...patch };
-    assert.ok(explainabilityGaps(rec).includes(field),
+    assert.ok(explainabilityGaps(rec).includes("publish_retry_protection"),
       why + "：**说不清却报了干净** —— " + JSON.stringify(explainabilityGaps(rec)));
+    assert.equal(isPermanentlyRejected(rec), false,
+      why + "：坏形状不许被当成 paused（那会让它悄悄退出自动队列而无人知晓）");
   }
 
   // 真实入口：写坏的记录必须让整批不动，而不是让它偷偷回到队列。
@@ -13240,6 +13252,134 @@ test("既是永久拒绝又带跨应用诊断时，先说实际落盘状态", ()
   assert.equal(describeDrainOutcome({ status: "empty" }, { root: "/p" }), null);
   assert.match(describeDrainOutcome({ status: "empty" }, { root: "/p", verbose: true }).text,
     /outbox 为空/u);
+});
+
+test("卡片正文不许伪造平台错误码：判定只喂可信响应", () => {
+  // **这是安全边界，不是整洁问题。**卡片 JSON 会整个进入子进程 argv，
+  // 于是 Node 的 `Command failed: <整条命令>` 里包含用户内容。
+  // 评审实测：子进程静默 exit 1、卡片正文里写着 ErrCode: 11310，
+  // 分类器就在命令回显里搜到了它 —— **一段正文让自己被永久停发**。
+  const forged = new Error("Command failed: /bin/lark-cli im reply --card " +
+    JSON.stringify({ text: "事故复盘：ErrCode: 11310 到底是什么？httpCode 400 又是什么？" }));
+  forged.stderr = "";
+  assert.equal(trustedPublishResponse(forged), "",
+    "**命令回显不是平台说的话** —— 拿不到可信响应就该是空");
+  assert.equal(publishRetryability(trustedPublishResponse(forged)).permanent, false,
+    "**正文里的错误码不许把自己判成永久拒绝**");
+  // 但给人看的详情仍要留下线索 —— 用途不同。
+  assert.match(publishErrorDetail(forged), /Command failed/u, "人还是需要看到发生了什么");
+
+  // 真的平台响应照常认。
+  const real = new Error("Command failed: /bin/lark-cli x");
+  real.stderr = "ext=ErrCode: 11310; ErrMsg: card table number over limit";
+  assert.equal(publishRetryability(trustedPublishResponse(real)).permanent, true,
+    "守卫不能把真的也一起挡了");
+
+  // 命令回显**之后**那半是子进程说的，可信。
+  const afterEcho = new Error("Command failed: /bin/lark-cli " +
+    JSON.stringify({ text: "正文里写着 ErrCode: 11310" }) + "\nhttpCode 400, errCode 230099");
+  assert.equal(trustedPublishResponse(afterEcho), "httpCode 400, errCode 230099",
+    "只取换行之后那半");
+  assert.equal(publishRetryability(trustedPublishResponse(afterEcho)).reason, "http_400");
+});
+
+test("暂停成因要落盘：进程结束之后仍要分得清是哪一种", () => {
+  // 评审实测：kind 只在返回值里带着，落盘只写 attempts/时间/reason ——
+  // 进程一结束，Stop 和积压视图就只能把两者统称为"被飞书拒绝"。
+  // 而它们的下一步不同：预算耗尽值得人再试一次，平台拒绝不改内容再试也一样。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-kind-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir);
+
+  const make = (name, text) => {
+    fs.writeFileSync(path.join(obDir, name), JSON.stringify(outboxRecord({ text })));
+    return listPending({ outboxDir: obDir }).find((r) => r.text === text);
+  };
+  const rejected = make("0001.json", "被平台拒的");
+  recordPublishFailure(rejected, { permanent: true, reason: "err_11310" });
+  const onDisk = JSON.parse(fs.readFileSync(path.join(obDir, "0001.json"), "utf-8"));
+  assert.equal(onDisk.publish_rejected_kind, "platform_rejected", "**成因要落盘**");
+  assert.equal(pauseKindOf(onDisk), "platform_rejected");
+
+  // 撞满次数那条：前 4 次只累计，第 5 次才暂停。
+  let exhausted = make("0002.json", "一直发不出去的");
+  for (let i = 1; i <= MAX_AUTO_PUBLISH_ATTEMPTS; i += 1) {
+    const out = recordPublishFailure(exhausted, { permanent: false, reason: "no_permanent_signal" });
+    assert.equal(out.paused, i === MAX_AUTO_PUBLISH_ATTEMPTS, "第 " + i + " 次的暂停判断不对");
+    exhausted = listPending({ outboxDir: obDir }).find((r) => r.text === "一直发不出去的");
+    if (i < MAX_AUTO_PUBLISH_ATTEMPTS) {
+      assert.equal(retryProtectionState(exhausted), "retrying", "第 " + i + " 次之后该是 retrying");
+      assert.equal(exhausted.publish_rejected_kind, undefined, "还没暂停就不许写成因");
+    }
+  }
+  assert.equal(retryProtectionState(exhausted), "paused");
+  assert.equal(exhausted.publish_rejected_kind, "retry_exhausted",
+    "**撞满次数不许写成平台拒绝** —— 下一步不同");
+  assert.match(exhausted.publish_rejected_reason, /自动重试预算耗尽/u);
+});
+
+
+test("watcher 连续失败也要记账，五次上限对它同样成立（真实进程）", () => {
+  // 评审用真实 watcher 进程连造 6 次失败，结果 publish_attempts 仍是 undefined ——
+  // watcher 只写 run 失败回执，**没有走同一套失败记账**。
+  // 于是"五次上限"只约束排空、不约束 watcher，同一条记录照样可以被无限自动重试。
+  // 过滤掉已暂停的只挡住了一半：**不记账就永远到不了「已暂停」**。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-watchacct-"));
+  const rt = path.join(dir, ".runtime-data", "inbound");
+  const runs = path.join(rt, "runs");
+  const claims = path.join(rt, "delivery-claims");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  for (const d of [rt, runs, claims, obDir]) fs.mkdirSync(d, { recursive: true });
+
+  // 假 lark-cli：**只对那条 outbox 内容失败**，run 结果照常成功。
+  //
+  // 不能做成"总是失败"—— run 批次排在前面，它一失败就抛出去，
+  // outbox 那批根本轮不到，于是测的就不是 outbox 的记账了。
+  const argsFile = path.join(dir, "lark-calls.jsonl");
+  const bin = path.join(dir, "fake-lark-fail.cjs");
+  fs.writeFileSync(bin, [
+    "#!" + process.execPath,
+    "const fsx = require('node:fs');",
+    "const all = process.argv.slice(2).join(' ');",
+    "fsx.appendFileSync(" + JSON.stringify(argsFile) + ", all + '\\n');",
+    "if (all.includes('一直发不出去的那条')) {",
+    "  process.stderr.write('boom: 说不出所以然');",
+    "  process.exit(1);",
+    "}",
+    "process.stdout.write('{\"ok\":true,\"data\":{\"message_id\":\"om_sent\"}}');",
+  ].join("\n") + "\n", { mode: 0o700 });
+
+  fs.writeFileSync(path.join(rt, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", lark_cli_bin: bin, auto_publish_on_completion: true,
+  }));
+  fs.writeFileSync(path.join(rt, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_fixture", claude_session_id: null,
+    channel_generation_id: "gen-1", expires_at: "2099-01-01T00:00:00.000Z",
+  }));
+  fs.writeFileSync(path.join(obDir, "0001.json"),
+    JSON.stringify(outboxRecord({ text: "一直发不出去的那条" })));
+
+  const runWatcher = (n) => {
+    const key = String(n).repeat(64).slice(0, 64);
+    fs.writeFileSync(path.join(runs, key + ".jsonl"),
+      JSON.stringify({ type: "result", is_error: false, result: "第 " + n + " 轮" }) + "\n");
+    return spawnSync(process.execPath,
+      [path.resolve("scripts", "watch-and-publish.mjs"), key, dir],
+      { encoding: "utf-8", env: { ...process.env, HOME: dir }, timeout: 60_000 });
+  };
+
+  // 连跑 7 轮 —— 比上限多两轮，跑不停的话这里会看得见。
+  for (let i = 1; i <= 7; i += 1) runWatcher(i);
+
+  const rec = JSON.parse(fs.readFileSync(path.join(obDir, "0001.json"), "utf-8"));
+  assert.equal(retryProtectionState(rec), "paused",
+    "**watcher 连续失败之后这条必须已暂停** —— 实际是 " + retryProtectionState(rec) +
+    "，attempts=" + rec.publish_attempts);
+  assert.equal(rec.publish_rejected_kind, "retry_exhausted", "认不出来的失败是预算耗尽");
+  assert.equal(rec.publish_attempts, MAX_AUTO_PUBLISH_ATTEMPTS,
+    "上限是 " + MAX_AUTO_PUBLISH_ATTEMPTS + "，实际累计 " + rec.publish_attempts);
+  assert.equal(rec.published_at, null, "没发出去就不许标已发布");
 });
 
 summarySealed = true;

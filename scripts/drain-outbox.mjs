@@ -209,19 +209,40 @@ function clipBothEnds(text) {
  * 那种第一行才是命令回显 —— 普通多行错误的第一行往往正是主错误。**只在确实匹配
  * 时才剥。**
  */
-export function publishErrorDetail(err) {
+/**
+ * **只有平台真的说过的话**才能拿来做判定。
+ *
+ * 这是一条安全边界，不是整洁问题。卡片 JSON 会整个进入子进程 argv，
+ * 于是 Node 的 `Command failed: <整条命令>` 里**包含用户内容**。
+ * 评审实测：子进程静默 exit 1、卡片正文里写着 `ErrCode: 11310`，
+ * 分类器就在命令回显里搜到了它，判成 `{permanent:true, reason:"err_11310"}` ——
+ * **一段正文让自己被永久停发**。
+ *
+ * 所以判定的输入只能是子进程的 stdout/stderr，或者命令回显**之后**那部分。
+ * 拿不到可信响应就返回空串 —— 调用方据此按暂时失败处理。
+ */
+export function trustedPublishResponse(err) {
   const raw = err?.stderr;
   const stderr = typeof raw === "string" ? raw
     : (raw && typeof raw.toString === "function") ? raw.toString("utf-8") : "";
+  if (stderr.trim()) return stderr.trim();
   const message = String(err?.message ?? "");
+  // `Command failed: <命令>\n<真正的输出>` —— 只有换行**之后**那半是子进程说的。
+  // 没有换行就意味着我们只拿到了命令回显本身，那里面全是我们自己喂进去的东西。
+  if (!message.startsWith("Command failed:") || !message.includes("\n")) return "";
+  return message.slice(message.indexOf("\n") + 1).trim();
+}
 
-  const isCommandEcho = message.startsWith("Command failed:");
-  const afterCommand = isCommandEcho && message.includes("\n")
-    ? message.slice(message.indexOf("\n") + 1)
-    : "";
-
-  const detail = stderr.trim() || afterCommand.trim() || message;
-  return clipBothEnds(detail);
+/**
+ * 给人看的失败详情。
+ *
+ * 跟 `trustedPublishResponse` 的区别是**用途不同**：这里拿不到可信响应时
+ * 仍然把原始 message 打出来（人需要线索），但那份**绝不能拿去做判定** ——
+ * 它含用户内容。判定一律走 trustedPublishResponse。
+ */
+export function publishErrorDetail(err) {
+  const trusted = trustedPublishResponse(err);
+  return clipBothEnds(trusted || String(err?.message ?? ""));
 }
 
 /**
@@ -472,8 +493,11 @@ export function drainProject({
       // 锁还在手里（catch 在 try 内、finally 之前），改的是同一条记录的语义，
       // 跟抑制、资格提升共用这把锁 —— 满足统一写锁那条。
       const detail = publishErrorDetail(err);
-      const retryability = publishRetryability(detail);
+      // **判定只喂可信响应。**detail 在拿不到可信响应时会回落到含命令回显的原始
+      // message —— 那里面有卡片正文，用它判定等于让内容决定自己的命运。
+      const retryability = publishRetryability(trustedPublishResponse(err));
       const marked = [];
+      let pausedKind = null;
       for (const record of failingBatch ?? []) {
         try {
           // 认出来的永久错误立刻停；认不出来的靠次数上限兜底。
@@ -481,7 +505,10 @@ export function drainProject({
             permanent: retryability.permanent,
             reason: retryability.reason + "：" + detail,
           });
-          if (outcome.rejected) marked.push(path.basename(String(record._file ?? "")));
+          if (outcome.paused) {
+            marked.push(path.basename(String(record._file ?? "")));
+            pausedKind = outcome.kind;
+          }
         } catch { /* 记不上不算失败：下一轮还会再撞一次，但不会更坏 */ }
       }
       return {
@@ -491,10 +518,10 @@ export function drainProject({
         // **报"永久"要以实际打没打标为准**，不是以"认出来了吗"为准 ——
         // 撞满次数上限的那次同样是"不会再自动重试"，说成会重试就是骗人。
         permanent: marked.length > 0,
-        permanentKind: marked.length === 0 ? null
-          : (retryability.permanent ? "platform_rejected" : "retry_exhausted"),
-        permanentReason: marked.length === 0 ? null
-          : (retryability.permanent ? retryability.reason : "retry_exhausted"),
+        // 成因**以实际落盘的那个为准**，不在这里第二次推断。
+        permanentKind: pausedKind,
+        permanentReason: pausedKind === null ? null
+          : (pausedKind === "platform_rejected" ? retryability.reason : "retry_exhausted"),
         markedRejected: marked,
         // 挑有用的那半：见 publishErrorDetail。**从头截固定长度会把真正的
         // 错误码切掉** —— 这条命令光命令回显就上千字符，前 400 字全是命令。

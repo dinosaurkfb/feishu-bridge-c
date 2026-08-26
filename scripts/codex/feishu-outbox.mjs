@@ -267,18 +267,42 @@ export function collectProjectBacklog() {
   if (!reg.ok) return { ok: false, scanned: false, reason: reg.reason ?? "registry_unreadable", projects: [] };
   const seen = new Set();
   const projects = [];
-  for (const project of reg.projects ?? []) {
-    if (typeof project?.root !== "string" || !project.root) continue;
-    const claudeSessionId = project.claude_session_id ?? null;
-    const key = project.root + "\u0000" + (claudeSessionId ?? "");
+  // **坏的登记项不许静默跳过。**
+  //
+  // 评审实测：登记表是 {"projects":[{"root":42}]} 时，上一版 `continue` 掉它，
+  // 返回 {ok:true, projects:[]} —— **真实 CLI 随后声称项目级视野为空**。
+  // 严格读取器只验根节点和 projects 是不是数组，成员形状得在这一层验。
+  //
+  // 这跟"读不出登记表"是同一条规矩：说不清有哪些项目，就不能说没有积压。
+  const bad = [];
+  const entries = Array.isArray(reg.projects) ? reg.projects : [];
+  for (const [i, project] of entries.entries()) {
+    const at = "projects[" + i + "]";
+    if (project === null || typeof project !== "object" || Array.isArray(project)) {
+      bad.push({ at, why: "不是登记项对象" }); continue;
+    }
+    const root = project.root;
+    // root 要是 trim 后非空的绝对路径 —— 相对路径解析出来是哪儿取决于当前工作目录，
+    // 那意味着同一张表在不同进程里指向不同地方。
+    if (typeof root !== "string" || root.trim().length === 0) {
+      bad.push({ at, why: "root 不是非空字符串" }); continue;
+    }
+    if (!path.isAbsolute(root)) { bad.push({ at, why: "root 不是绝对路径" }); continue; }
+    const sid = project.claude_session_id;
+    if (sid !== undefined && sid !== null
+      && (typeof sid !== "string" || sid.trim().length === 0)) {
+      bad.push({ at, why: "claude_session_id 形状不对" }); continue;
+    }
+    const claudeSessionId = sid ?? null;
+    const key = root + "\u0000" + (claudeSessionId ?? "");
     if (seen.has(key)) continue;
     seen.add(key);
-    const outboxDir = outboxDirOf(project.root, claudeSessionId);
+    const outboxDir = outboxDirOf(root, claudeSessionId);
     const audit = auditOutbox(outboxDir);
     const entry = {
-      name: sanitizeForDisplay(path.basename(project.root)) +
+      name: sanitizeForDisplay(path.basename(root)) +
         (claudeSessionId ? "/" + sanitizeForDisplay(String(claudeSessionId).slice(0, 8)) : ""),
-      root: project.root,
+      root,
       readable: audit.ok === true,
       unreadableReason: audit.ok === true ? null : (audit.reason ?? "说不清"),
       unclassified: audit.ok === true ? (audit.unclassified ?? []) : [],
@@ -304,6 +328,11 @@ export function collectProjectBacklog() {
       || entry.unexplainable.length > 0 || entry.records.length > 0) {
       projects.push(entry);
     }
+  }
+  // **有坏项就整体报不完整**，不许拿一份残缺的全景去支撑"没有积压"这个结论。
+  if (bad.length > 0) {
+    return { ok: false, scanned: false, reason: "registry_entry_malformed",
+      bad, projects };
   }
   return { ok: true, scanned: true, projects };
 }
@@ -426,8 +455,9 @@ function main() {
   // **读不出项目登记表就不许说"没有积压"。**这跟"读不出 task 登记表"是同一条规矩，
   // 上一版漏了后半边视野，于是连这条规矩也一起漏了。
   if (proj.ok === false) {
-    warn("项目级绑定的登记表读不出来（" + proj.reason + "）—— " +
+    warn("项目级绑定的登记表说不清（" + proj.reason + "）—— " +
       "**这不是「没有积压」**，项目级那半边视野现在是瞎的。");
+    for (const b of proj.bad ?? []) warn("  " + b.at + " —— " + b.why);
     process.exit(1);
   }
 

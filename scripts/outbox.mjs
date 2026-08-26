@@ -149,30 +149,72 @@ export function listPending({ outboxDir }) {
 }
 
 /**
- * 这条记录**上一次是被永久拒绝的**吗。
- *
- * 永久拒绝 = 平台明确说了「这样发不出去」，或者已经试到了次数上限。
- * 两者的共同点是：**再等 30 分钟不会变好**。
- *
- * 判据只有这一份：排空的选择、积压视图、重试命令都走它。
- *
- * **它不改变三态。**记录仍然是 pending（没发出去、也没被停发），
- * 只是不再参与自动重试 —— 停发是不可逆的，而「这次发不出去」不该顺手变成「永远别发」。
- */
-export const isPermanentlyRejected = (rec) => isCanonicalIso(rec?.publish_rejected_at);
-
-/**
  * **自动重试的次数上限。**
  *
  * 光靠"认出永久错误码"不够，而且这一点是实测出来的：cc2cd 那次故障里，
- * lark-cli 输出**根本没有 httpCode**，只有 `"code": 230099` ——
- * 我第一版按 HTTP 状态码分类，在真实数据上会把它判成"暂时"，照样无限重试。
- *
+ * lark-cli 输出**根本没有 httpCode**，只有 `"code": 230099`。
  * 错误码表永远追不齐：下一个没见过的限制码又会转起来。
  * 所以次数上限是**兜底判据**，它不需要认识任何错误码。
  * 12 小时 / 每 30 分钟 = 24 次，现在最多 5 次。
  */
 export const MAX_AUTO_PUBLISH_ATTEMPTS = 5;
+
+/**
+ * 暂停自动重试的两种成因。**受控取值，别处不许自造字符串。**
+ *
+ *   platform_rejected —— 平台明确说了这样发不出去；不改内容再试多少次都一样
+ *   retry_exhausted   —— 只是自动重试预算用完了；值得人再试一次
+ *
+ * 两者都表现为"已暂停自动重试"，但**下一步不同**，说混了会把人支去做错的事。
+ * 所以它必须**落盘**：只在返回值里带着的话，进程一结束，
+ * Stop 和积压视图就只能把两者统称为"被飞书拒绝"。
+ */
+export const PAUSE_KINDS = ["platform_rejected", "retry_exhausted"];
+
+/**
+ * 一条记录的**重试保护状态**。三态，充要。
+ *
+ *   clean    —— 三个字段都不在（绝大多数记录）
+ *   retrying —— 只有 attempts（≥1），还在自动重试预算内
+ *   paused   —— attempts（≥1）+ at + reason + kind 四件齐全
+ *
+ * 其余一切形状都是 `corrupt`。**"封闭"的意思就是没有第四种合法形状** ——
+ * 评审两次指出这里不够封闭：先是三个字段完全不验，然后是
+ * `attempts: 0` 和"有 at/reason 却没 attempts"仍被放行，
+ * 而生产写入端根本产不出这两种形状。**审计放行的集合不该比生产能产出的更大。**
+ */
+export function retryProtectionState(rec) {
+  const attempts = rec?.publish_attempts;
+  const at = rec?.publish_rejected_at;
+  const why = rec?.publish_rejected_reason;
+  const kind = rec?.publish_rejected_kind;
+  const present = [attempts, at, why, kind].map((v) => v !== undefined);
+
+  if (!present.some(Boolean)) return "clean";
+  // attempts 是这台状态机的地基：任何非 clean 形状都必须有它，而且至少 1 次
+  // （0 次意味着"从没试过却已经在重试状态"，生产写不出来）。
+  if (!Number.isSafeInteger(attempts) || attempts < 1) return "corrupt";
+
+  if (present[1] === false && present[2] === false && present[3] === false) return "retrying";
+  // 剩下的只能是 paused —— 而 paused 要求另外三个**全部**在场且合法。
+  if (!isCanonicalIso(at)) return "corrupt";
+  if (typeof why !== "string" || why.trim().length === 0) return "corrupt";
+  if (!PAUSE_KINDS.includes(kind)) return "corrupt";
+  return "paused";
+}
+
+/**
+ * 这条记录**已经暂停自动重试**了吗。
+ *
+ * 判据只有这一份：排空的选择、watcher 的选择、积压视图都走它。
+ * **它不改变三态。**记录仍然是 pending（没发出去、也没被停发）——
+ * 停发是不可逆的，而「这次发不出去」不该顺手变成「永远别发」。
+ */
+export const isPermanentlyRejected = (rec) => retryProtectionState(rec) === "paused";
+
+/** 暂停的成因。没暂停就是 null。 */
+export const pauseKindOf = (rec) =>
+  (retryProtectionState(rec) === "paused" ? rec.publish_rejected_kind : null);
 
 const rewrite = (rec, mutate) => {
   const next = { ...rec };
@@ -191,7 +233,7 @@ const rewrite = (rec, mutate) => {
  * **必须在持有发布锁时调用** —— 它改的是同一条记录的语义，
  * 跟抑制、资格提升共用那把锁。
  *
- * @returns {{rejected:boolean, attempts:number, reason:string|null}}
+ * @returns {{paused:boolean, attempts:number, kind:string|null, reason:string|null}}
  */
 export function recordPublishFailure(rec, {
   permanent = false, reason = "未说明", maxAttempts = MAX_AUTO_PUBLISH_ATTEMPTS,
@@ -201,12 +243,15 @@ export function recordPublishFailure(rec, {
   const attempts = prior + 1;
   const exhausted = attempts >= maxAttempts;
   if (!permanent && !exhausted) {
-    rewrite(rec, (next) => { next.publish_attempts = attempts; });
-    return { rejected: false, attempts, reason: null };
+    rewrite(rec, (next) => {
+      next.publish_attempts = attempts;
+      // 回到 retrying 就必须把 paused 那三件一起撤干净，否则形状不自洽。
+      delete next.publish_rejected_at;
+      delete next.publish_rejected_reason;
+      delete next.publish_rejected_kind;
+    });
+    return { paused: false, attempts, kind: null, reason: null };
   }
-  // **撞满次数只证明「自动重试预算耗尽」，不证明「飞书永久拒绝」。**
-  // 两者都表现为"暂停自动重试"，但下一步不同：前者值得人再试一次，
-  // 后者不改内容再试多少次都一样。说混了会把人支去做错的事。
   const kind = permanent ? "platform_rejected" : "retry_exhausted";
   const why = (permanent
     ? "平台拒绝（" + String(reason) + "）"
@@ -216,22 +261,9 @@ export function recordPublishFailure(rec, {
     next.publish_attempts = attempts;
     next.publish_rejected_at = new Date().toISOString();
     next.publish_rejected_reason = why;
+    next.publish_rejected_kind = kind;
   });
-  return { rejected: true, attempts, kind, reason: why };
-}
-
-/**
- * 人显式下令重试：把永久拒绝的标记和失败计数一起清掉。**同样要持有发布锁。**
- *
- * **计数也要清。**只清标记不清计数的话，人修好起因、重试一次再失败，
- * 立刻又撞上上限 —— 那不叫给了一次机会。
- */
-export function clearPermanentRejection(rec) {
-  return rewrite(rec, (next) => {
-    delete next.publish_rejected_at;
-    delete next.publish_rejected_reason;
-    delete next.publish_attempts;
-  });
+  return { paused: true, attempts, kind, reason: why };
 }
 
 export function markSent(rec, messageId) {
@@ -244,6 +276,7 @@ export function markSent(rec, messageId) {
   // 会把记录重新暴露给自动发布。保护要留到确实不需要为止，而不是提前撤。
   delete next.publish_rejected_at;
   delete next.publish_rejected_reason;
+  delete next.publish_rejected_kind;
   delete next.publish_attempts;
   const tmp = rec._file + ".tmp." + randomUUID();
   fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
@@ -549,31 +582,18 @@ export function explainabilityGaps(rec) {
   // 抑制核心的 corruptTargets 保留作纵深防御，但判定从这里开始。
   if (generationTargetState(rec) === "corrupt") gaps.push("target_channel_generation_id");
 
-  // **重试保护那三个字段也要在这一层看见。**
+  // **重试保护那几个字段也要在这一层看见，而且要验成一台封闭状态机。**
   //
-  // 评审实测：把它们改成 "five" / "not-a-time" / 一个对象，auditOutbox 仍报 ok:true，
-  // 而 isPermanentlyRejected 判 false —— **一条被永久拒绝的记录靠写坏自己的
-  // 保护字段就重新进入了自动发布队列**。
-  //
-  // 它们不构成第四种状态，但必须是一台**封闭、自洽**的辅助状态机：
-  //   · publish_attempts：缺省，或非负安全整数
-  //   · publish_rejected_at：缺省，或规范时间
-  //   · publish_rejected_reason：跟 publish_rejected_at 同生共死，且非空
-  // 自洽的意思是**两个方向都要查**：有理由没时间同样说不清。
-  const attempts = rec?.publish_attempts;
-  if (attempts !== undefined
-    && (!Number.isSafeInteger(attempts) || attempts < 0)) gaps.push("publish_attempts");
-  const rejectedAt = rec?.publish_rejected_at;
-  const rejectedWhy = rec?.publish_rejected_reason;
-  if (rejectedAt !== undefined && !isCanonicalIso(rejectedAt)) gaps.push("publish_rejected_at");
-  if (rejectedWhy !== undefined
-    && (typeof rejectedWhy !== "string" || rejectedWhy.trim().length === 0)) {
-    gaps.push("publish_rejected_reason");
-  }
-  if ((rejectedAt === undefined) !== (rejectedWhy === undefined)) {
-    // 只有一半的话说不清它到底是不是被拒了 —— 而这个问题的答案决定要不要再发。
-    gaps.push(rejectedAt === undefined ? "publish_rejected_at" : "publish_rejected_reason");
-  }
+  // 评审两次指出这里不够封闭：先是三个字段完全不验 —— 把它们改成
+  // "five" / "not-a-time" / 一个对象，auditOutbox 仍报 ok:true，
+  // **一条已暂停的记录靠写坏自己的保护字段就重新进入了自动发布队列**；
+  // 然后是 `attempts: 0`、"有 at/reason 却没 attempts" 仍被放行，
+  // 而生产写入端根本产不出这两种形状。
+  // **审计放行的集合不该比生产能产出的集合更大。**
+  // 名字点的是**整台状态机**而不是某一个字段 —— 坏的是形状，
+  // 说成"publish_attempts 有问题"会把人支去只看那一个字段。
+  if (retryProtectionState(rec) === "corrupt") gaps.push("publish_retry_protection");
+
   return gaps;
 }
 

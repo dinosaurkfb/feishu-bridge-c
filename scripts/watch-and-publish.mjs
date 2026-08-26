@@ -17,7 +17,9 @@ import { readRunOutcome } from "./handoff.mjs";
 import { scanRuns, buildDraft, markPublished, publishDraft } from "./outbound.mjs";
 import {
   auditOutbox, isPermanentlyRejected, listPending, markSent, outboxMutationBlocker,
+  recordPublishFailure,
 } from "./outbox.mjs";
+import { publishRetryability, trustedPublishResponse } from "./drain-outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { readClaim, recordClaimState } from "./claim.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
@@ -132,6 +134,7 @@ while (true) {
       // 这是评审明确给的例外：run 结果不是 outbox 记录，它有独立来源和回执 ——
       // 因为本地 outbox 里躺着一个坏文件就扣着执行结果不发，代价大得多。
       // 但 outbox 那一半必须**整批拒绝并点名**，不许"跳过坏的、把其余照发"。
+      let failingBatch = null;
       const outboxBlocked = publishLock.ok
         ? outboxMutationBlocker(auditOutbox(OUTBOX)) : null;
       // **被永久拒绝的这里也要跳过。**判据跟排空共用一份。
@@ -177,6 +180,8 @@ while (true) {
             );
             if (!target.ok) throw new Error("冻结的出站话题代际不可用（" + target.reason + "）");
             for (const batch of outboundCardBatches(targetRecords)) {
+              // 记住正在发哪一批：失败要**给这一批**记账，不是给全部待发。
+              failingBatch = batch;
               const mid = publishDraft({
                 profile: ident.profile,
                 rootMessageId: target.rootMessageId,
@@ -211,7 +216,33 @@ while (true) {
           // 留痕给人工，但绝不伪造已送达。
           fs.writeFileSync(path.join(RUNS, key + ".publish-failed.json"),
             JSON.stringify({ at: new Date().toISOString(), error: String(err.message).slice(0, 500) }, null, 2));
-          console.error("publish failed (outbox 保留待重试): " + err.message);
+
+          // **失败也要走同一套记账。**
+          //
+          // 上一版 watcher 只写 run 失败回执就完了 —— 评审用真实进程连造 6 次失败，
+          // publish_attempts 仍是 undefined。于是"五次上限"**只约束排空、不约束
+          // watcher**，同一条记录照样可以被无限自动重试。
+          // 过滤掉已暂停的只挡住了一半：不记账就永远到不了"已暂停"。
+          //
+          // 锁还在手里（catch 在 try 内、finally 之前），跟抑制、资格提升共用那把锁。
+          // 判定只喂**可信响应** —— 卡片正文会进命令回显，用它判定等于让内容
+          // 决定自己的命运。
+          const trusted = trustedPublishResponse(err);
+          const retryability = publishRetryability(trusted);
+          const paused = [];
+          for (const record of (failingBatch ?? []).filter((item) => item._file)) {
+            try {
+              const outcome = recordPublishFailure(record, {
+                permanent: retryability.permanent,
+                reason: retryability.reason + "：" + (trusted || String(err.message ?? "")),
+              });
+              if (outcome.paused) paused.push(path.basename(String(record._file)));
+            } catch { /* 记不上不算失败：下一轮还会再撞一次，但不会更坏 */ }
+          }
+          console.error("publish failed" +
+            (paused.length > 0
+              ? "（这几条已暂停自动重试：" + paused.join("、") + "）"
+              : "（outbox 保留待重试）") + ": " + err.message);
         }
       }
     } finally {

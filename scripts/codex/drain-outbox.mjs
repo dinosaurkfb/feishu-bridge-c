@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 /** 逐次授权的 Codex outbox 发布入口。默认只预览，只有 --apply 才发送。 */
 
-import { composeDigest, listPending } from "../outbox.mjs";
+import { composeDigest } from "../outbox.mjs";
 import { publishDraft } from "../outbound.mjs";
 import { publishOutboxAttempt } from "../publish-attempt.mjs";
 import { codexRotationBatchHook } from "./rotation-hook.mjs";
+import { postDeliveryBits } from "../stop-note.mjs";
 import { resolveLarkIdentity } from "../chain-template.mjs";
 import { composeCodexOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import {
@@ -45,27 +46,17 @@ if (resolved.mapping.status !== "active" || !resolved.mapping.feishu_root_messag
 }
 
 const paths = taskPaths(task, home);
-const pending = listPending({ outboxDir: paths.outbox });
-if (pending.length === 0) {
-  console.log(task.task_display_name + " 的 outbox 为空。");
-  process.exit(0);
-}
-const text = composeDigest(pending, { taskName: task.task_display_name });
-console.log("task   " + task.task_display_name + "  " + task.logical_task_key);
-console.log("身份   " + resolved.template.transport_agent_name + "（单 M5Codex）");
-console.log("待发布 " + pending.length + " 条\n\n---\n" + text + "\n---");
-if (!apply) {
-  console.log("\n[dry-run] 没有发送。确认本次发布后加 --apply。");
-  process.exit(0);
-}
 
-// 锁、快照、审计、候选（含已暂停跳过）、切批校验、成败记账 —— 全在事务里。
-// 此前这个入口**既不跳过已暂停、也不做失败记账**（重构计划 §0 的两个 ✗）。
+// **预览也走事务。**上一版在事务前用宽松的 listPending 出预览、空队列直接退 ——
+// 评审实测：outbox 只有坏 JSON 时 dry-run 和 --apply 都说"为空" exit 0；
+// 混着坏文件时预览照给、--apply 才被事务拒 —— **预览与执行结论不一致**，
+// 而预览正是人做决定的那一步。现在两条路都从事务的同一份快照出结果。
 const identity = resolveLarkIdentity(resolved.template);
 const r = publishOutboxAttempt({
   outboxDir: paths.outbox,
   lockDir: paths.publishLock,
   policy: "all_unpaused",
+  dryRun: !apply,
   batchCards: outboundCardBatches,
   resolveTarget: (generationKey) => resolveTaskOutboundGeneration(task, generationKey),
   composeCard: (batch) => composeCodexOutboundCard(batch, { taskName: task.task_display_name }),
@@ -81,12 +72,17 @@ const r = publishOutboxAttempt({
     root: task.root, threadId: task.codex_thread_id, home,
   }),
 });
-if (r.status === "published") {
+if (r.status === "dry_run") {
+  const text = composeDigest(r.selected, { taskName: task.task_display_name });
+  console.log("task   " + task.task_display_name + "  " + task.logical_task_key);
+  console.log("身份   " + resolved.template.transport_agent_name + "（单 M5Codex）");
+  console.log("待发布 " + r.count + " 条（" + r.batches.length + " 张卡）\n\n---\n" + text + "\n---");
+  console.log("\n[dry-run] 没有发送。确认本次发布后加 --apply。");
+} else if (r.status === "published") {
+  // 两类发布后缺口共用同一份组合措辞 —— 各写一份就会又漏一类（评审在
+  // partial 分支实测漏掉了轮转账缺失）。
   console.log("已由 " + resolved.template.transport_agent_name + " 发布 " + r.count + " 条。" +
-    ((r.bookkeepingFailures ?? []).length > 0
-      ? "\n有 " + r.bookkeepingFailures.length + " 处发布后记账失败（已送达不重发，轮转账可能缺）。" : "") +
-    ((r.deliveredUnrecorded ?? []).length > 0
-      ? "\n**有 " + r.deliveredUnrecorded.length + " 条送达后没落标，下一轮可能重发 —— 先去话题核对。**" : ""));
+    postDeliveryBits(r).replace(/^；/u, "\n"));
   if ((r.deliveredUnrecorded ?? []).length > 0) process.exitCode = 1;
 } else if (r.status === "empty") {
   console.log("队列已经由另一个发布动作排空。");
@@ -104,6 +100,7 @@ if (r.status === "published") {
 } else {
   console.error("发布失败，队列保持未发送：" + (r.error ?? r.reason) +
     ((r.partial === true) ? "\n（失败前已送达 " + (r.messageIds ?? []).length + " 张，已落标的不会重发）" : "") +
+    postDeliveryBits(r) +
     ((r.markedRejected ?? []).length > 0 ? "\n这几条已暂停自动重试：" + r.markedRejected.join("、") : ""));
   process.exitCode = 1;
 }

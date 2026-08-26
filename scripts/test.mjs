@@ -14908,8 +14908,9 @@ test("维护提示的命令要经得起真 shell：含空格中文引号的项�
   assert.equal(fs.existsSync(claimFile), true, "claim 由热路径协议自取，维护不碰");
 });
 
-test("发布写原语只许事务碰：markSent 与失败记账在别处零出现（原始扫描）", () => {
-  // R2 收官：四份实现都走事务之后，低层写原语收私有 ——
+test("发布写原语限制生产调用面：落标与失败记账只许事务碰（原始扫描）", () => {
+  // R2 收官：四份实现都走事务之后，**限制低层写原语的生产调用面**
+  //（它们仍公开导出 —— 事务和测试要用；"收私有"指的是调用面，不是导出面）。
   // "太容易被绕过的 API"正是四个入口各漏一角的土壤（计划文档 §0）。
   // 与 R1 的字段扫描同一形状：精确路径豁免、原始扫描不解析注释。
   const tokens = ["markSent", "recordPublishFailure"];
@@ -14938,14 +14939,19 @@ test("发布写原语只许事务碰：markSent 与失败记账在别处零出�
     "这些文件绕过事务直接碰发布写原语（或在注释里留了名字诱人照抄）");
   assert.ok(scanned >= 60, "扫描面缩水了：" + scanned);
   // 自证有效：豁免之外种一个违规必须被抓 —— 夹具树验证。
+  // **两个 token 全种、期望字面写死** —— 只种一个的话，token 列表缩水
+  // 照样绿（R1 那次期望自我引用的同款教训）。
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-primscan-"));
-  fs.writeFileSync(path.join(fixture, "sneak.mjs"), "const x = markSent;\n");
+  fs.writeFileSync(path.join(fixture, "sneak.mjs"),
+    "const x = markSent; const y = recordPublishFailure;\n");
   const proofOffenders = [];
   for (const entry of fs.readdirSync(fixture, { withFileTypes: true })) {
     const text = fs.readFileSync(path.join(fixture, entry.name), "utf-8");
     for (const t of tokens) if (text.includes(t)) proofOffenders.push(entry.name + " ← " + t);
   }
-  assert.deepEqual(proofOffenders, ["sneak.mjs ← markSent"], "扫描器要能抓住种下的违规");
+  assert.deepEqual(proofOffenders,
+    ["sneak.mjs ← markSent", "sneak.mjs ← recordPublishFailure"],
+    "扫描器要把两个 token 都抓住 —— 期望写死，列表缩水就红");
 });
 
 summarySealed = true;

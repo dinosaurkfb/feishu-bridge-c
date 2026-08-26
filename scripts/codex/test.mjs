@@ -6781,7 +6781,13 @@ function codexMatrixFixture() {
     "const mode = fsx.readFileSync(" + JSON.stringify(modeFile) + ", 'utf-8').trim();",
     "const markers = fsx.readFileSync(" + JSON.stringify(markersFile) + ", 'utf-8')",
     "  .split('\\n').filter(Boolean);",
-    "if (mode !== 'ok' && markers.some((m) => all.includes(m))) {",
+    "let n = 0;",
+    "try { n = Number(fsx.readFileSync(" + JSON.stringify(path.join(home, 'call-n.txt')) + ", 'utf-8')) || 0; } catch {}",
+    "n += 1; fsx.writeFileSync(" + JSON.stringify(path.join(home, 'call-n.txt')) + ", String(n));",
+    "if (mode === 'fail-second' && n >= 2) {",
+    "  process.stderr.write('boom-opaque: 说不清'); process.exit(1);",
+    "}",
+    "if (mode !== 'ok' && mode !== 'fail-second' && markers.some((m) => all.includes(m))) {",
     "  if (mode === 'fail-opaque') { process.stderr.write('boom-opaque: 说不清'); }",
     "  if (mode === 'fail-platform') {",
     "    process.stderr.write('ext=ErrCode: 11310; ErrMsg: card table number over limit');",
@@ -6869,6 +6875,7 @@ const codexDrainRunner = {
   fixture() {
     const g = codexMatrixFixture();
     return {
+      obDir: g.obDir, home: g.home, task: g.task,
       seed(text) {
         g.mark(text);
         codexSeq += 1;
@@ -6946,6 +6953,73 @@ test("codex 轮转记账 ok:false 也要进 bookkeepingFailures（真实记账�
     "**ok:false 必须进缺口清单**：" + JSON.stringify(r).slice(0, 200));
   assert.match(r.bookkeepingFailures[0].error, /轮转活动记账失败/u);
   assert.match(h.read("发成但记账挂了的").published_at ?? "", /^\d{4}/u, "照样落标防重发");
+});
+
+test("codex drain：预览与执行给出同一个结论 —— 坏 outbox 不许说「为空」（真实 CLI）", () => {
+  // 评审实测旧旁路：只有坏 JSON 时 dry-run 和 --apply 都 exit 0 说"为空"；
+  // 混着坏文件时预览照给、--apply 才被拒 —— 预览正是人做决定的那一步。
+  const h = codexDrainRunner.fixture();
+  const run = (args) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-outbox.mjs"), "--thread-id", THREAD_A, ...args],
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: h.home } });
+
+  // 只有坏 JSON：两条路都要拒绝，不许说为空。
+  fs.writeFileSync(path.join(h.obDir, "bad.json"), "{ 坏了");
+  for (const [why, args] of [["dry-run", []], ["--apply", ["--apply"]]]) {
+    const r = run(args);
+    assert.notEqual(r.status, 0, why + "：坏 outbox 必须拒绝");
+    const said = (r.stdout ?? "") + (r.stderr ?? "");
+    assert.equal(/为空/u.test(said), false, why + "：**不许把读不出来说成为空**");
+    assert.match(said, /本地 outbox 有问题|归不了类|bad\.json/u, why + "：要点名 —— " + said.slice(0, 200));
+  }
+
+  // 混着一条好的：预览也必须拒绝（跟执行同一结论），不许只预览好的那条。
+  h.seed("好的那条");
+  const mixed = run([]);
+  assert.notEqual(mixed.status, 0, "混着坏文件时预览也要拒绝");
+  assert.equal(/好的那条/u.test(mixed.stdout ?? ""), false,
+    "**不许跳过坏的、把其余照常预览** —— 预览与执行必须同一结论");
+
+  // 坏文件清掉后预览恢复，正文可见。
+  fs.rmSync(path.join(h.obDir, "bad.json"));
+  const clean = run([]);
+  assert.equal(clean.status, 0, clean.stderr);
+  assert.match(clean.stdout, /好的那条/u, "干净时预览照常给正文");
+  assert.match(clean.stdout, /dry-run/u);
+});
+
+test("codex drain：partial 时两类发布后缺口都要说（真实 CLI 组合）", () => {
+  // 评审实测：第一批送达但轮转账 binding_busy 失败 + 第二批网络失败 ——
+  // 输出只说"已送达 1 张"，轮转账缺失整个消失。
+  // 两批要用 reply（一轮一张卡）—— 进展类记录会合批成一张，凑不出 partial。
+  const h = codexDrainRunner.fixture();
+  appendEvent({ outboxDir: h.obDir, kind: "reply", text: "先发成的一条",
+    eventKey: "combo-1" });
+  appendEvent({ outboxDir: h.obDir, kind: "reply", text: "后失败的一条",
+    eventKey: "combo-2" });
+  // 只对第二条失败；第一条送达但轮转账因绑定锁 binding_busy 失败。
+  // 事件文件名是哈希，谁先发不确定 —— 用"第二次调用才失败"的模式保证一成一败。
+  fs.writeFileSync(path.join(h.home, "mode.txt"), "fail-second");
+  const regLock = path.join(h.home, "registry.lock");
+  fs.mkdirSync(regLock, { recursive: true });
+  fs.writeFileSync(path.join(regLock, "owner.json"),
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  let out;
+  try {
+    out = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "drain-outbox.mjs"),
+        "--thread-id", THREAD_A, "--apply"],
+      { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: h.home } });
+  } finally {
+    fs.rmSync(regLock, { recursive: true, force: true });
+  }
+  const said = (out.stdout ?? "") + (out.stderr ?? "");
+  // 前提：确实打成 partial（一成一败）。
+  const both = [h.read("先发成的一条"), h.read("后失败的一条")];
+  assert.equal(both.filter((x) => x.published_at !== null).length, 1,
+    "前提：恰好一成一败 —— " + said.slice(0, 300));
+  assert.match(said, /已送达 1 张/u, "前段事实要在：" + said.slice(0, 300));
+  assert.match(said, /记账失败/u, "**轮转账缺失不许被 partial 吞掉**：" + said.slice(0, 300));
 });
 
 summarySealed = true;

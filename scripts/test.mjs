@@ -14774,12 +14774,22 @@ test("维护 CLI 是破坏性命令：白名单之外一个参数都不收", () 
     assert.notEqual(r.status, 0, why + "：必须拒绝 —— " + (r.stdout ?? ""));
     assert.equal(fs.existsSync(reap), true, why + "：**拒绝时一个文件都不许动**");
   }
-  // **核心函数自己也守范围不变量** —— 绕过 CLI 直接调必须被拒、零动作。
-  {
-    const direct = repairRunClaims({ runsDir: runs, apply: true });
-    assert.equal(direct.ok, false, "**没给范围的直接调用必须拒绝**");
-    assert.equal(direct.reason, "scope_required");
-    assert.equal(fs.existsSync(reap), true, "零动作");
+  // **核心函数自己也守范围不变量，且参数类型是封闭联合** ——
+  // 绕过 CLI 直接调必须被拒、零动作。评审探针：all:"false"/0/{}、
+  // key:[合法hex]、apply:"false" 全都曾 ok:true 照删。
+  for (const [why, args] of [
+    ["没给范围", { apply: true }],
+    ["all 是字符串 \"false\"", { all: "false", apply: true }],
+    ["all 是 0", { all: 0, apply: true }],
+    ["all 是对象", { all: {}, apply: true }],
+    ["all 是数组", { all: [], apply: true }],
+    ["key 是数组包 hex", { key: ["0".repeat(64)], apply: true }],
+    ["apply 是字符串 \"false\"", { all: true, apply: "false" }],
+    ["范围给了两个", { key: "0".repeat(64), all: true, apply: true }],
+  ]) {
+    const direct = repairRunClaims({ runsDir: runs, ...args });
+    assert.equal(direct.ok, false, why + "：**必须拒绝** —— " + JSON.stringify(direct));
+    assert.equal(fs.existsSync(reap), true, why + "：零动作");
   }
   // 缺值 / flag 当值 / 重复参数 —— 都在任何文件操作之前拒绝。
   // **给"flag 被当成路径"造一个真靶**：名为 --key 的目录里放一把死锁。

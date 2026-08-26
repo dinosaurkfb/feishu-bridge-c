@@ -14,7 +14,7 @@
  *
  * ■ 严格参数面
  *
- * 这是破坏性 CLI：只认 --project <路径>、--key <64位十六进制>、--apply。
+ * 这是破坏性 CLI：只认 --project <路径>、--key <64位十六进制>、--all、--apply。
  * 未知参数、裸参数、`--` 透传一律拒绝退出 —— includes("--apply") 那种
  * 全数组扫法会把 `-- --apply` 也当成授权（评审实测）。默认预览。
  */
@@ -52,12 +52,19 @@ export function repairRunClaims({ runsDir, key = null, all = false, apply = fals
   // repairRunClaims({runsDir, apply:true}) 清了全项目 —— 包装层查了、
   // 核心不查，绕过包装就绕过约束。--key 与 --all 二选一，在任何
   // 文件操作之前拒绝。
-  if ((key === null) === (all === false)) {
-    return { ok: false, reason: "scope_required",
-      detail: "必须显式给范围：key（精确一条）或 all（全项目），二选一" };
+  // **参数类型也是封闭联合**（评审探针：all:"false"/0/{}、key:[合法hex]、
+  // apply:"false" 全都 ok:true 照删 —— truthy/String() 把类型面撑开了）。
+  // 任何 I/O 之前：布尔就是布尔、key 是 null 或合法字符串、范围恰好一个。
+  if (typeof all !== "boolean" || typeof apply !== "boolean") {
+    return { ok: false, reason: "bad_arguments",
+      detail: "all 与 apply 必须是布尔值（收到 " + typeof all + " / " + typeof apply + "）" };
   }
-  if (key !== null && !KEY_SHAPE.test(String(key))) {
+  if (key !== null && (typeof key !== "string" || !KEY_SHAPE.test(key))) {
     return { ok: false, reason: "bad_key" };
+  }
+  if ((key !== null) === all) {
+    return { ok: false, reason: "scope_required",
+      detail: "必须显式给范围：key（精确一条）或 all（全项目），恰好一个" };
   }
   let names;
   try { names = fs.readdirSync(runsDir); }

@@ -40,7 +40,7 @@
 import path from "node:path";
 
 import { isDirectRun, moduleDir } from "../direct-run.mjs";
-import { isPermanentlyRejected, listPending } from "../outbox.mjs";
+import { isPermanentlyRejected, listPending, pauseKindOf } from "../outbox.mjs";
 import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
 import { generationTargetState } from "../suppress-outbox-core.mjs";
 import { hasPublishAuthorization } from "../outbox.mjs";
@@ -325,6 +325,7 @@ export function collectProjectBacklog() {
           text: r.text ?? "",
           // 被永久拒绝过的要单独说 —— 它不会再自动重试，是在等人。
           rejected: isPermanentlyRejected(r),
+          rejectedKind: pauseKindOf(r),
           rejectedWhy: isPermanentlyRejected(r)
             ? sanitizeForDisplay(String(r.publish_rejected_reason ?? "未说明")) : null,
         });
@@ -483,9 +484,17 @@ function main() {
       continue;
     }
     const stuck = entry.records.filter((r) => r.rejected);
+    // **成因也要到这个消费者。**上一轮接通了 drain → 渲染 → Stop，
+    // **漏了这里** —— 于是全景仍把"重试预算耗尽"说成"被飞书永久拒绝"。
+    // 同一条策略又一次少接了一个消费者。
     say("项目 " + entry.name + "：待发 " + entry.records.length + " 条" +
-      (stuck.length > 0 ? "，其中 " + stuck.length + " 条被飞书永久拒绝过、不会再自动重试" : "") + "。");
-    for (const r of stuck) say("  " + r.file + " —— " + r.rejectedWhy);
+      (stuck.length > 0 ? "，其中 " + stuck.length + " 条已暂停自动重试" : "") + "。");
+    for (const r of stuck) {
+      say("  " + r.file + "（" + (r.rejectedKind === "retry_exhausted"
+        ? "重试预算耗尽，值得再试一次"
+        : r.rejectedKind === "platform_rejected" ? "平台拒绝，不改内容再试也一样"
+          : "成因不明") + "）—— " + r.rejectedWhy);
+    }
     if ((entry.unclassified ?? []).length > 0) {
       warn("  另有 " + entry.unclassified.length + " 个文件归不了类。");
       trouble = true;
@@ -493,7 +502,12 @@ function main() {
   }
 
   const readable = got.tasks.filter((t) => t.readable && t.unclassified.length === 0);
-  const total = readable.reduce((n, t) => n + t.records.length, 0);
+  // **总数要含项目级。**上一版只累加 got.tasks —— 于是同一次输出里
+  // 先说"项目 X：待发 1 条"，紧接着又说"积压 0 条"，**自己跟自己矛盾**。
+  // 一份自相矛盾的报告比没有报告更坏：人不知道该信哪一句。
+  const taskTotal = readable.reduce((n, t) => n + t.records.length, 0);
+  const projectTotal = proj.projects.reduce((n, e) => n + e.records.length, 0);
+  const total = taskTotal + projectTotal;
   // **这里曾经内嵌过一个 \n** —— 而输出边界的规则正是我自己在同一个文件里定的：
   // 格式串不许带换行。净化器把它换成了 U+FFFD，真实输出首行成了"积压 1 条。<?>"。
   // 空行单独发一次。

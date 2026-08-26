@@ -13495,6 +13495,37 @@ test("暂停成因要一路到达视图，不许把两种统称为「被飞书�
     "端到端：从落盘到措辞，成因不许中途丢");
 });
 
+test("失败阈值只有一个：写入端不许产出读取端判为损坏的状态", () => {
+  // 评审实测：recordPublishFailure 公开接受 maxAttempts，而读取端固定按
+  // 全局上限校验 —— `maxAttempts: 1` 写出的记录，读取端立刻判 corrupt、
+  // 审计报说不清。**写入端能合法产出读取端认为损坏的状态**，
+  // 这台状态机就不叫封闭。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-onethresh-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir);
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify(outboxRecord({ text: "一条" })));
+
+  // 就算调用方硬塞一个覆盖参数，也不许改变阈值。
+  for (let i = 1; i < MAX_AUTO_PUBLISH_ATTEMPTS; i += 1) {
+    const rec = listPending({ outboxDir: obDir })[0];
+    const out = recordPublishFailure(rec, {
+      permanent: false, reason: "no_permanent_signal", maxAttempts: 1 });
+    assert.equal(out.paused, false,
+      "第 " + i + " 次就暂停了 —— **调用方不许覆盖阈值**");
+    const onDisk = listPending({ outboxDir: obDir })[0];
+    assert.equal(retryProtectionState(onDisk), "retrying",
+      "第 " + i + " 次之后读取端应判 retrying，实际 " + retryProtectionState(onDisk));
+    assert.deepEqual(explainabilityGaps(onDisk), [],
+      "**写入端刚写出来的东西，审计不许说它损坏**");
+  }
+  const last = recordPublishFailure(listPending({ outboxDir: obDir })[0],
+    { permanent: false, reason: "no_permanent_signal", maxAttempts: 1 });
+  assert.equal(last.paused, true, "到了全局上限才暂停");
+  const done = JSON.parse(fs.readFileSync(path.join(obDir, "0001.json"), "utf-8"));
+  assert.equal(retryProtectionState(done), "paused");
+  assert.deepEqual(explainabilityGaps(done), [], "读写两端必须对得上");
+});
+
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (failed > 0) {

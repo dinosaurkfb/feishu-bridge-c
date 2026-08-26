@@ -6630,6 +6630,56 @@ test("项目全景要先规范化 root：/p 和 /p/ 不是两个项目", () => {
   }
 });
 
+test("Codex 全景：成因要到这个消费者，总数要含项目级（真实 CLI）", () => {
+  // 评审两条，都出在同一次输出里：
+  //   · 全景把 retry_exhausted 说成"被飞书永久拒绝" —— 上一轮接通了
+  //     drain → 渲染 → Stop，**漏了这个消费者**
+  //   · "项目 X：待发 1 条" 紧接着 "积压 0 条" —— total 只累加 tasks，
+  //     一份**自己跟自己矛盾**的报告
+  //
+  // 所以这条走真实 CLI，不喂手工构造的结果。
+  const home = temp();
+  const proj = path.join(home, "cc2cd");
+  const obDir = path.join(proj, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(obDir, "0001.json"),
+    JSON.stringify(outboxRecord({ text: "预算耗尽的那条" })));
+  fs.writeFileSync(path.join(obDir, "0002.json"),
+    JSON.stringify(outboxRecord({ text: "被平台拒的那条" })));
+
+  const byText = (t) => listPending({ outboxDir: obDir }).find((r) => r.text === t);
+  // 前 4 次只累计，第 5 次才转 paused —— 走真实记账，不手写字段。
+  for (let i = 1; i <= 5; i += 1) {
+    recordPublishFailure(byText("预算耗尽的那条"),
+      { permanent: false, reason: "no_permanent_signal" });
+  }
+  recordPublishFailure(byText("被平台拒的那条"), { permanent: true, reason: "err_11310" });
+
+  const registry = path.join(home, "registry.json");
+  fs.writeFileSync(registry, JSON.stringify({
+    schema_version: "1.0", projects: [{ root: proj, claude_session_id: null }] }));
+  writeRegistryFixtureUnvalidated([], path.join(home, "registry.json") + ".codex");
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+      FEISHU_BRIDGE_REGISTRY: registry } });
+  const said = (r.stdout ?? "") + (r.stderr ?? "");
+
+  assert.match(said, /预算耗尽的那条|0001\.json/u, "项目级积压要出现：" + said.slice(0, 400));
+  assert.match(said, /重试预算耗尽，值得再试一次/u,
+    "**预算耗尽要说清值得再试** —— 这个消费者上一轮被漏掉了");
+  assert.match(said, /平台拒绝，不改内容再试也一样/u, "平台拒绝要说清再试无用");
+  assert.equal(/被飞书永久拒绝/u.test(said), false,
+    "**不许把两种成因统称为「被飞书永久拒绝」**");
+
+  // **总数不许自相矛盾。**
+  const total = /积压 (\d+) 条/u.exec(said);
+  assert.ok(total, "要给出总数：" + said.slice(0, 400));
+  assert.equal(Number(total[1]) >= 2, true,
+    "**总数要含项目级** —— 同一次输出里说了项目待发 2 条，总数却是 " + total[1]);
+});
+
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (failed > 0) process.exit(1);

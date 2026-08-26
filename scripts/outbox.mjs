@@ -243,13 +243,17 @@ const rewrite = (rec, mutate) => {
  *
  * @returns {{paused:boolean, attempts:number, kind:string|null, reason:string|null}}
  */
-export function recordPublishFailure(rec, {
-  permanent = false, reason = "未说明", maxAttempts = MAX_AUTO_PUBLISH_ATTEMPTS,
-} = {}) {
+export function recordPublishFailure(rec, { permanent = false, reason = "未说明" } = {}) {
   const prior = Number.isSafeInteger(rec?.publish_attempts) && rec.publish_attempts > 0
     ? rec.publish_attempts : 0;
   const attempts = prior + 1;
-  const exhausted = attempts >= maxAttempts;
+  // **阈值只有一个,不给调用方覆盖。**
+  //
+  // 上一版公开接受 maxAttempts,而读取端固定按全局上限校验 ——
+  // 评审实测 `maxAttempts: 1` 写出的记录，读取端立刻判 corrupt、审计报说不清：
+  // **写入端能合法产出读取端认为损坏的状态**。
+  // 没有任何生产调用方需要覆盖它，那就别留这个口子。
+  const exhausted = attempts >= MAX_AUTO_PUBLISH_ATTEMPTS;
   if (!permanent && !exhausted) {
     rewrite(rec, (next) => {
       next.publish_attempts = attempts;

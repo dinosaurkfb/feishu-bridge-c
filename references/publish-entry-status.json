@@ -4,7 +4,10 @@
     "claude-drain": {
       "file": "drain-outbox.mjs",
       "status": "migrated",
-      "suite": "claude"
+      "suite": "claude",
+      "not_applicable": {
+        "手工计划 CAS：不带预览摘要不发，预览之后世界变了旧摘要作废": "Claude drain 由 Stop/定时器自动驱动，没有人工预览-落盘两段式；人工计划摘要属于逐次授权的 Codex 手工入口，Claude 侧引入人工 CAS 时翻掉本申报"
+      }
     },
     "claude-watcher": {
       "file": "watch-and-publish.mjs",
@@ -13,7 +16,8 @@
       "not_applicable": {
         "dry-run：预演零改盘、零出网": "watcher 由 Stop 自动触发，没有 dry-run 入口；预演语义属于人工 drain CLI",
         "显式重试：失败仍暂停，不许悄悄放回自动队列": "显式重试（--retry-rejected）是人工 drain 的 CLI 语义，watcher 没有人工参数面",
-        "显式重试：成功后落标、保护字段清干净": "同上 —— 显式重试只存在于人工 drain CLI"
+        "显式重试：成功后落标、保护字段清干净": "同上 —— 显式重试只存在于人工 drain CLI",
+        "手工计划 CAS：不带预览摘要不发，预览之后世界变了旧摘要作废": "watcher 由 Stop 自动触发，没有预览面，也就没有可带回的计划摘要"
       }
     },
     "codex-drain": {
@@ -32,7 +36,8 @@
       "not_applicable": {
         "dry-run：预演零改盘、零出网": "自动发布路径没有预览面 —— 预览语义属于人工 CLI",
         "显式重试：失败仍暂停，不许悄悄放回自动队列": "自动路径没有人工重试参数",
-        "显式重试：成功后落标、保护字段清干净": "同上"
+        "显式重试：成功后落标、保护字段清干净": "同上",
+        "手工计划 CAS：不带预览摘要不发，预览之后世界变了旧摘要作废": "自动发布路径没有预览面 —— 计划摘要的值只能来自人手里那份预览输出"
       }
     }
   },

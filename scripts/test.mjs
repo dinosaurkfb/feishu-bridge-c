@@ -10850,6 +10850,68 @@ test("预览和 --apply 不许给出相反结论：损坏记录在预览里就�
     .publish_suppressed_at, undefined, "零抑制");
 });
 
+test("发布事务：manualPlan 落盘缺摘要就拒绝，非法组合当场抛（第 4 层）", () => {
+  // expectPlanDigest 在错误组合下**当场抛**而不是静默忽略 ——
+  // 静默忽略的后果是调用方以为自己有 CAS 保护，而实际一条守卫都没生效。
+  assert.throws(() => publishOutboxAttempt({ policy: "all_unpaused",
+    expectPlanDigest: "pub-" + "0".repeat(24) }), TypeError, "非 manualPlan 给摘要要抛");
+  assert.throws(() => publishOutboxAttempt({ policy: "all_unpaused", manualPlan: true,
+    dryRun: true, expectPlanDigest: "pub-" + "0".repeat(24) }), TypeError, "预览给摘要要抛");
+  // 缺前提在拿锁之前拒绝；验的是形状 —— 纯空白、抑制摘要（sup- 前缀）都不算给了。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-planpre-"));
+  const call = (expectPlanDigest) => publishOutboxAttempt({
+    outboxDir: path.join(dir, "outbox"), lockDir: path.join(dir, "pub.lock"),
+    policy: "all_unpaused", manualPlan: true, expectPlanDigest,
+    batchCards: (x) => [x], resolveTarget: () => ({ ok: true, rootMessageId: "om" }),
+    composeCard: () => ({}), publishBatch: () => "om_x",
+  });
+  for (const bad of [null, "   ", "sup-" + "0".repeat(24), "pub-XYZ"]) {
+    const r = call(bad);
+    assert.equal(r.status, "error", JSON.stringify(bad));
+    assert.equal(r.reason, "plan_expectation_required", JSON.stringify(bad));
+  }
+  // 锁在被拒后没被占住：形状合法的摘要能走到锁内（空 outbox → empty）。
+  fs.mkdirSync(path.join(dir, "outbox"), { recursive: true });
+  assert.equal(call("pub-" + "0".repeat(24)).status, "empty",
+    "前置拒绝不许把锁攥在手里");
+});
+
+test("抑制锁内重选：select 产出说不清目标的记录也要中止（atRecheck）", () => {
+  // 磁盘上变坏的记录由审计闸门在更早接住（上一条测试钉着）。这一条守的是
+  // 剩下的口子：**锁内重读后的重新选择**（readState().select 是调用方回调）
+  // 产出目标说不清的记录 —— 文件名集合没变、字节没变，集合 CAS 和摘要
+  // 都拦不住（损坏发生在内存里的重新解释，不在盘上）。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-atrecheck-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const rec = path.join(obDir, "0001.json");
+  // 磁盘干净：旧格式记录（无目标字段），审计放行。
+  fs.writeFileSync(rec, JSON.stringify(outboxRecord({ kind: "milestone", text: "x" })));
+  const pending = [{ ...JSON.parse(fs.readFileSync(rec, "utf-8")), _file: rec }];
+
+  const got = applySuppressionCore({
+    outboxDir: obDir, publishLockDir: path.join(dir, "pub.lock"),
+    generationLockDir: path.join(dir, "gen.lock"),
+    pending,
+    previewDigest: digestFromDisk(obDir),
+    previewGenerationId: "gen-1",
+    readState: () => ({
+      activeGeneration: "gen-1",
+      // 重新选择把目标字段解释坏了：同 _file、同 _raw，目标却说不清。
+      select: (records) => records.map((r) => ({
+        ...r, target_channel_generation_id: "   " })),
+    }),
+    reason: "t",
+  });
+
+  assert.equal(got.ok, false, "说不清目标就必须中止");
+  assert.equal(got.reason, "corrupt_target_generation", JSON.stringify(got));
+  assert.equal(got.atRecheck, true, "**要标明是锁内重判发现的** —— 处置方式不同");
+  assert.deepEqual(got.files, [rec], "要点名是哪一条");
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
+    "**零抑制** —— 说不清该发去哪，就不能替它决定不发");
+});
+
 test("锁内重读要重判损坏：文件名一个没变，目标字段变坏也必须中止", () => {
   // 评审实测复现的：锁外判的是**预览快照**。同一个文件的目标代际在预览之后
   // 变坏时，文件名集合一个字节没变，集合 CAS 一路放行 ——

@@ -25,6 +25,7 @@
  * 共用这把锁但互不进对方的审计闸门 —— 见 R2b1。
  */
 
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 import {
@@ -67,12 +68,54 @@ export const groupByTargetGeneration = (records) => {
 };
 
 /**
+ * 发布计划的**稳定摘要**（第 4 层，形状照抄第 3 层抑制 CAS）。
+ *
+ * ■ 为什么绑目标，不只绑内容
+ *
+ * 旧格式记录的目标靠当前状态现算 —— 预览时目标是 om_old，轮转到 om_new 后
+ * **文件一个字节没变**，只绑内容的摘要照样相等，--apply 会把内容发去新话题。
+ * **人授权的是"发到那个话题"，不只是"发这些字"。**所以摘要绑三样：
+ * 预览所见的文件集合、每条选中记录的原始字节、以及**解析后的**每批目标
+ * （代际键 + 根消息）。
+ *
+ * ■ 为什么不能在 apply 时现算
+ *
+ * 预览和 --apply 是两次独立运行。apply 现算出的是"现在"的值，跟自己一比
+ * 总是相等 —— 而"预览之后世界变了"恰恰只可能跨进程发生。这条在抑制那边
+ * 犯过三次，这里直接继承结论：摘要的值只能来自人手里那份预览输出。
+ * 算法只有这一份，预览与落盘都在锁内同一次快照上调它。
+ */
+const PLAN_DIGEST_SHAPE = /^pub-[0-9a-f]{24}$/u;
+function planDigestOf(files, targetBatches) {
+  const h = createHash("sha256");
+  h.update("v1\nfiles\n");
+  for (const f of [...files].sort()) h.update(String(f) + "\n");
+  h.update("plan\n");
+  for (const item of targetBatches) {
+    // 目标取**解析后**的值 —— 记录字段只有代际键，防不住"键没变、键背后的
+    // 根消息变了"。rootMessageId 是 publishBatch 真正要发去的地方。
+    h.update("target\u0000" + String(item.key) + "\u0000" +
+      String(item.target?.rootMessageId ?? "") + "\n");
+    for (const record of item.batch) {
+      h.update(path.basename(String(record._file)) + "\u0000");
+      h.update(createHash("sha256").update(record._raw ?? "").digest("hex"));
+      h.update("\n");
+    }
+  }
+  return "pub-" + h.digest("hex").slice(0, 24);
+}
+
+/**
  * 一次发布尝试。**锁内单快照，成败都有账。**
  *
  * @param outboxDir        outbox 目录
  * @param lockDir          发布锁目录（跟抑制、资格提升共用同一把）
  * @param policy           CANDIDATE_POLICIES 之一，别的一律抛 —— 枚举是闭的
  * @param dryRun           预演：走完选择与构卡，不发布、**零改盘**
+ * @param manualPlan       逐次授权的人工入口置 true：落盘必须带回预览摘要。
+ *                         **这个前置属于事务，不属于哪个 CLI** —— 包装层负责
+ *                         解析和显示 --expect-digest，但不许决定它可不可以不给。
+ * @param expectPlanDigest 预览打印、由人原样带回来的计划摘要（manualPlan 落盘时必填）
  * @param batchCards       (records) => records[][]  按卡片规则切批（入口的协议）
  * @param resolveTarget    (generationKeyOrNull) => {ok:true,...} | {ok:false,reason}
  * @param composeCard      (batch, target) => card
@@ -97,11 +140,24 @@ export const groupByTargetGeneration = (records) => {
  */
 export function publishOutboxAttempt({
   outboxDir, lockDir, policy, dryRun = false,
+  manualPlan = false, expectPlanDigest = null,
   batchCards, resolveTarget, composeCard, publishBatch, onBatchPublished = null,
 }) {
   if (!POLICY_SET.has(policy)) {
     throw new TypeError("未知候选策略：" + String(policy) +
       " —— 枚举是闭的，新策略先进 CANDIDATE_POLICIES 再用");
+  }
+  // expectPlanDigest 只在「manualPlan 落盘」这一种组合下有意义。
+  // 其他组合给了值是调用方代码错误，不是运行时状态 —— 当场抛，不静默忽略：
+  // 静默忽略的后果是调用方以为自己有 CAS 保护，而实际一条守卫都没生效。
+  if (expectPlanDigest !== null && (!manualPlan || dryRun)) {
+    throw new TypeError("expectPlanDigest 只在 manualPlan 且非 dryRun 时接受");
+  }
+  // **缺前提不是并发问题**，在拿锁之前就拒绝（跟抑制的 digest_expectation_required
+  // 同一条道理）。验形状不验非空：纯空白能穿过 length 检查。
+  if (manualPlan && !dryRun
+    && (typeof expectPlanDigest !== "string" || !PLAN_DIGEST_SHAPE.test(expectPlanDigest))) {
+    return { status: "error", reason: "plan_expectation_required", local: true };
   }
 
   // 锁只试一次 —— 维持 drain 既有语义（拿不到就 skipped，调度器稍后再来）。
@@ -195,7 +251,7 @@ export function publishOutboxAttempt({
           }
         }
         if (batchingMismatch) break;
-        targetBatches.push({ batch, target, card: composeCard(batch, target) });
+        targetBatches.push({ batch, target, key: targetKey, card: composeCard(batch, target) });
       }
       if (batchingMismatch) break;
       if (remaining.size > 0) {
@@ -218,10 +274,22 @@ export function publishOutboxAttempt({
       };
     }
 
+    // 摘要在锁内、批次校验之后算 —— 预览与落盘用的是同一段代码、同一份快照。
+    // 目标解析失败到不了这里（上面直接抛进 batching_failed）：
+    // **解析不了目标就没有"正常的计划"可哈希**。
+    const planDigest = planDigestOf(snap.files, targetBatches);
     if (dryRun) {
       // **预演零改盘** —— 这条在显式重试上被击穿过一次（预先清标），
       // 现在结构上不可能：清标只发生在 markSent 里，而 dry-run 走不到那儿。
-      return { status: "dry_run", count: selected.length, batches: targetBatches, selected };
+      return { status: "dry_run", count: selected.length, batches: targetBatches,
+        selected, planDigest };
+    }
+    // **这一步才是真正的跨进程 CAS**：文件集合、每条的字节、每批解析后的目标，
+    // 只要有一点跟预览时不同就整批中止 —— 包括"预览之后新进来一条"和
+    // "文件没变、目标轮转了"这两种别的比对方式看不出来的情况。
+    if (manualPlan && planDigest !== expectPlanDigest) {
+      return { status: "error", reason: "plan_changed", local: true,
+        expected: expectPlanDigest, actual: planDigest };
     }
 
     for (const item of targetBatches) {

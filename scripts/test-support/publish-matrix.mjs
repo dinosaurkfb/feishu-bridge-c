@@ -138,6 +138,29 @@ export const PUBLISH_SCENARIOS = [
     },
   },
   {
+    name: "手工计划 CAS：不带预览摘要不发，预览之后世界变了旧摘要作废",
+    needs: ["publish", "manualPlan"],
+    run(h, assert) {
+      h.seed("等人点头的那条");
+      const refused = h.attempt("ok", { withoutPlanDigest: true });
+      assert.equal(refused.publishCalls, 0, "**落盘不带预览摘要一张都不许发**");
+      assert.equal(h.read("等人点头的那条").published_at, null);
+      const digest = h.planDigest();
+      assert.ok(typeof digest === "string" && digest.length > 0, "预览要给出计划摘要");
+      // 预览之后世界变了：新进一条 —— 人没看过它，旧摘要必须作废。
+      h.seed("预览之后混进来的那条");
+      const stale = h.attempt("ok", { planDigest: digest });
+      assert.equal(stale.publishCalls, 0, "**预览之后世界变了，旧摘要必须拒绝**");
+      assert.equal(h.read("等人点头的那条").published_at, null,
+        "一张都不许发 —— 包括人确实看过的那条：混着发等于替人扩大授权范围");
+      assert.equal(h.read("预览之后混进来的那条").published_at, null);
+      // 重新预览、带新摘要 —— 正常放行。
+      const ok = h.attempt("ok", { planDigest: h.planDigest() });
+      assert.ok(ok.publishCalls >= 1, "重新预览后要能发");
+      assert.match(h.read("等人点头的那条").published_at ?? "", /^\d{4}/u);
+    },
+  },
+  {
     name: "保护字段损坏：整批不动，一条不发",
     needs: ["publish", "auditGate"],
     run(h, assert) {

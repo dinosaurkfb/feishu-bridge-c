@@ -51,20 +51,47 @@ export function repairRunClaims({ runsDir, key = null, apply = false,
   let names;
   try { names = fs.readdirSync(runsDir); }
   catch { return { ok: false, reason: "runs_unreadable", runsDir }; }
-  const actions = [];
-  for (const name of names.sort()) {
-    if (!name.endsWith(REAP_SUFFIX)) continue;
-    if (key !== null && !name.startsWith(key)) continue;
-    const file = path.join(runsDir, name);
-    const verdict = ownerDead(file, { staleMs, now });
-    if (!verdict.dead) {
-      actions.push({ file: name, action: "kept", why: verdict.why });
-      continue;
+
+  // **维护者也要串行。**评审固定时序：维护者 A 判旧 owner 已死 →
+  // 维护者 B 删旧 reap → 热路径创建活进程的新 reap → A 按旧结论 rm 掉新 reap。
+  // 同款 TOCTOU 低一层复发。维护锁 wx 单步、**不自愈**（教义一致：
+  // 自愈就是反模式再低一层）；残留 fail-closed 指路人工。
+  // 串行 + 热路径对 reap 锁从不自愈（EEXIST 即 fail-closed）⇒
+  // 死 reap 在本维护者 rm 之前不可能被换成活的，rm 不会误伤。
+  const maintLock = path.join(runsDir, ".repair-maintenance.lock");
+  if (apply) {
+    try {
+      fs.writeFileSync(maintLock,
+        JSON.stringify({ pid: process.pid, at: new Date(now).toISOString() }) + "\n",
+        { flag: "wx", mode: 0o600 });
+    } catch (err) {
+      return err.code === "EEXIST"
+        ? { ok: false, reason: "maintenance_lock_held",
+            detail: "另一个维护者在场（或其崩溃残留）：" + maintLock +
+              " —— 确认无维护者存活后人工删除该文件再试" }
+        : { ok: false, reason: "io_error", error: String(err.message).slice(0, 200) };
     }
-    if (apply) fs.rmSync(file, { force: true });
-    actions.push({ file: name, action: apply ? "removed" : "would_remove", why: verdict.why });
   }
-  return { ok: true, runsDir, apply, actions };
+  try {
+    const actions = [];
+    for (const name of names.sort()) {
+      if (!name.endsWith(REAP_SUFFIX)) continue;
+      // **--key 是精确目标，不是前缀。**评审实测 <key>f 的文件被
+      // startsWith 顺带删掉 —— 破坏性命令的靶子必须逐字。
+      if (key !== null && name !== key + REAP_SUFFIX) continue;
+      const file = path.join(runsDir, name);
+      const verdict = ownerDead(file, { staleMs, now });
+      if (!verdict.dead) {
+        actions.push({ file: name, action: "kept", why: verdict.why });
+        continue;
+      }
+      if (apply) fs.rmSync(file, { force: true });
+      actions.push({ file: name, action: apply ? "removed" : "would_remove", why: verdict.why });
+    }
+    return { ok: true, runsDir, apply, actions };
+  } finally {
+    if (apply) fs.rmSync(maintLock, { force: true });
+  }
 }
 
 export function repairCmd() {
@@ -76,25 +103,35 @@ if (isDirectRun(import.meta.url)) {
   const argv = process.argv.slice(2);
   let project = null;
   let key = null;
+  let allKeys = false;
   let apply = false;
   let bad = null;
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === "--project") { project = argv[++i]; }
     else if (a === "--key") { key = argv[++i]; }
+    else if (a === "--all") { allKeys = true; }
     else if (a === "--apply") { apply = true; }
     else { bad = a; break; }
   }
+  // **范围必须显式**：--key <精确目标> 或 --all 二选一 ——
+  // "没写 key 就默认全项目"会让人为一条 run 报警、顺手清掉整个项目的残留。
+  const usage = "用法：repair-run-claim.mjs --project <root> (--key <64位hex> | --all) [--apply]";
   if (bad !== null || !project || typeof project !== "string"
+    || (key === null) === (allKeys === false)
     || (key !== null && (typeof key !== "string" || !KEY_SHAPE.test(key)))) {
     console.error(bad !== null
-      ? "不认识的参数：" + bad + " —— 这是破坏性命令，只认 --project <root> [--key <64位hex>] [--apply]"
-      : "用法：repair-run-claim.mjs --project <root> [--key <64位hex>] [--apply]");
+      ? "不认识的参数：" + bad + " —— 这是破坏性命令。" + usage
+      : usage);
     process.exit(2);
   }
   const runsDir = path.join(project, ".runtime-data", "inbound", "runs");
   const r = repairRunClaims({ runsDir, key, apply });
-  if (!r.ok) { console.error("runs 目录读不出来：" + runsDir); process.exit(1); }
+  if (!r.ok && r.reason === "maintenance_lock_held") {
+    console.error("维护互斥：" + r.detail);
+    process.exit(1);
+  }
+  if (!r.ok) { console.error("维护失败（" + r.reason + "）：" + runsDir); process.exit(1); }
   if (r.actions.length === 0) { console.log("没有匹配的 reap 锁残留。"); process.exit(0); }
   for (const a of r.actions) {
     console.log((a.action === "kept" ? "保留  " : a.action === "removed" ? "已删  " : "将删  ") +

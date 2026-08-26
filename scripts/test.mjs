@@ -14770,14 +14770,93 @@ test("维护 CLI 是破坏性命令：白名单之外一个参数都不收", () 
     assert.notEqual(r.status, 0, why + "：必须拒绝 —— " + (r.stdout ?? ""));
     assert.equal(fs.existsSync(reap), true, why + "：**拒绝时一个文件都不许动**");
   }
-  // 正路：预览不删、--apply 删。
-  const p1 = cli(["--project", dir]);
+  // **范围必须显式**：不带 --key/--all 拒绝；两个都带也拒绝。
+  for (const [why, args] of [
+    ["没给范围", ["--project", dir]],
+    ["范围给了两个", ["--project", dir, "--key", "0".repeat(64), "--all"]],
+  ]) {
+    const r = cli(args);
+    assert.notEqual(r.status, 0, why + "：必须拒绝");
+    assert.equal(fs.existsSync(reap), true, why + "：零动作");
+  }
+  // **--key 是精确目标**：<key>f 的邻居不许被顺带删掉。
+  const neighbor = path.join(runs, "0".repeat(64) + "f".padEnd(1, "f") + ".publish-claim.json.reaplock");
+  fs.writeFileSync(neighbor, JSON.stringify({ pid: 999999999, at: "2020-01-01T00:00:00.000Z" }) + "\n");
+  const exact = cli(["--project", dir, "--key", "0".repeat(64), "--apply"]);
+  assert.equal(exact.status, 0, exact.stderr);
+  assert.equal(fs.existsSync(reap), false, "点名的那个要清掉");
+  assert.equal(fs.existsSync(neighbor), true, "**前缀邻居一根毫毛都不许动**");
+  fs.rmSync(neighbor, { force: true });
+
+  // 正路：--all 预览不删、--apply 删。
+  fs.writeFileSync(reap, JSON.stringify({ pid: 999999999, at: "2020-01-01T00:00:00.000Z" }) + "\n");
+  const p1 = cli(["--project", dir, "--all"]);
   assert.equal(p1.status, 0, p1.stderr);
   assert.match(p1.stdout, /dry-run/u);
   assert.equal(fs.existsSync(reap), true, "预览零改盘");
-  const p2 = cli(["--project", dir, "--apply"]);
+  const p2 = cli(["--project", dir, "--all", "--apply"]);
   assert.equal(p2.status, 0, p2.stderr);
   assert.equal(fs.existsSync(reap), false, "--apply 才清");
+
+  // **维护互斥**：维护锁在场 → fail-closed 零动作（不自愈，指路人工）。
+  fs.writeFileSync(reap, JSON.stringify({ pid: 999999999, at: "2020-01-01T00:00:00.000Z" }) + "\n");
+  fs.writeFileSync(path.join(runs, ".repair-maintenance.lock"), "{}");
+  const held = cli(["--project", dir, "--all", "--apply"]);
+  assert.notEqual(held.status, 0, "维护锁在场必须拒绝");
+  assert.match((held.stderr ?? ""), /维护互斥|人工删除/u);
+  assert.equal(fs.existsSync(reap), true, "**互斥时零动作**");
+});
+
+test("维护提示的命令要经得起真 shell：含空格中文引号的项目路径原样可用", () => {
+  // 评审要求的形状：从 watcher 输出提取完整命令，经真 shell 执行 dry-run，
+  // 再追加 --apply 验证精确目标。源码断言 shellQuote 在不在是"守卫的样子"，
+  // 真 shell 跑过才算数 —— 这条线上被路径坑过不止一次。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-nasty-"));
+  const root = path.join(base, "有 空格'引号的 目录");
+  const rt = path.join(root, ".runtime-data", "inbound");
+  const runs = path.join(rt, "runs");
+  const obDir = path.join(root, ".runtime-data", "outbound", "outbox");
+  for (const d of [rt, runs, path.join(rt, "delivery-claims"), obDir]) {
+    fs.mkdirSync(d, { recursive: true });
+  }
+  const bin = path.join(base, "fake-lark.cjs");
+  fs.writeFileSync(bin, "#!" + process.execPath + "\n" +
+    "process.stdout.write('{\"ok\":true,\"data\":{\"message_id\":\"om\"}}');\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(rt, "chain-config.json"), JSON.stringify({
+    project_dir: root, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", lark_cli_bin: bin, auto_publish_on_completion: true }));
+  fs.writeFileSync(path.join(rt, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_fixture", claude_session_id: null,
+    channel_generation_id: "gen-1", expires_at: "2099-01-01T00:00:00.000Z" }));
+  const key = "0".repeat(64);
+  fs.writeFileSync(path.join(runs, key + ".jsonl"),
+    JSON.stringify({ type: "result", is_error: false, result: "路径刁钻那一轮" }) + "\n");
+  const claimFile = path.join(runs, key + ".publish-claim.json");
+  fs.writeFileSync(claimFile,
+    JSON.stringify({ pid: 999999999, at: "2020-01-01T00:00:00.000Z", token: "old" }) + "\n");
+  const reapLock = claimFile + ".reaplock";
+  fs.writeFileSync(reapLock, JSON.stringify({ pid: 999999998, at: "2020-01-01T00:00:00.000Z" }) + "\n");
+  const past = new Date(Date.now() - 3600_000);
+  fs.utimesSync(reapLock, past, past);
+
+  const r1 = spawnSync(process.execPath,
+    [path.resolve("scripts", "watch-and-publish.mjs"), key, root],
+    { encoding: "utf-8", env: { ...process.env, HOME: root }, timeout: 60_000 });
+  const said = (r1.stdout ?? "") + (r1.stderr ?? "");
+  const cmdLine = (said.split("\n").find((l) => l.includes("repair-run-claim.mjs")) ?? "").trim();
+  assert.ok(cmdLine.startsWith("node "), "要给出完整可执行命令：" + said.slice(0, 300));
+
+  // 真 shell 跑 dry-run：路径里的空格中文引号都不许把命令拆散。
+  const dry = spawnSync("/bin/sh", ["-c", cmdLine], { encoding: "utf-8" });
+  assert.equal(dry.status, 0, "**照抄的命令必须能跑**：" + (dry.stderr ?? "") + cmdLine);
+  assert.match(dry.stdout, /dry-run/u, "默认必须是预览");
+  assert.equal(fs.existsSync(reapLock), true, "预览零改盘");
+
+  // 追加 --apply：精确清掉点名那把锁，claim 不动。
+  const applied = spawnSync("/bin/sh", ["-c", cmdLine + " --apply"], { encoding: "utf-8" });
+  assert.equal(applied.status, 0, applied.stderr);
+  assert.equal(fs.existsSync(reapLock), false, "点名的 reap 锁要清掉");
+  assert.equal(fs.existsSync(claimFile), true, "claim 由热路径协议自取，维护不碰");
 });
 
 summarySealed = true;

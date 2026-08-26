@@ -261,33 +261,49 @@ export function drainProject({
  * @returns {{text:string, error:boolean}|null} null = 不用说话
  */
 export function describeDrainOutcome(r, { root, verbose = false } = {}) {
-  if (r.status === "published") {
-    // **落标失败比记账缺口重一级：消息送达了但盘上没记 —— 下一轮可能重发。**
-    // 不许承诺"不会重发"，要人来核对（比如去话题里看那条在不在）。
-    if ((r.deliveredUnrecorded ?? []).length > 0) {
-      return {
-        error: true,
-        text: "已发布 " + r.count + " 条 -> " + r.messageId +
-          "，**但有 " + r.deliveredUnrecorded.length + " 条送达后没落标** —— " +
-          "**下一轮可能把它们重发一遍**，先去话题里核对再决定要不要手工标记：\n" +
-          r.deliveredUnrecorded.map((d) => "  " + d.file + "（" + d.messageId + "）—— " + d.error).join("\n"),
-      };
+  // 发布后的两类异常各自成段，**同时发生就同时展示** ——
+  // 上一版 if/else if 只展示落标失败，轮转账缺口跟着消失（评审点名）。
+  const postDeliveryNotes = (rr) => {
+    const parts = [];
+    if ((rr.deliveredUnrecorded ?? []).length > 0) {
+      // 落标失败比记账缺口重一级：消息送达了但盘上没记 —— 下一轮可能重发。
+      parts.push("**有 " + rr.deliveredUnrecorded.length + " 条送达后没落标，" +
+        "下一轮可能把它们重发一遍** —— 先去话题里核对再决定要不要手工标记：\n" +
+        rr.deliveredUnrecorded.map((d) => "  " + d.file + "（" + d.messageId + "）—— " + d.error).join("\n"));
     }
-    // **发布后的记账缺口不许沉默。**消息确实送达了（不是发布失败），
-    // 但轮转活动没记上 —— 不说出来，下一次代际决策就建立在缺账上。
-    if ((r.bookkeepingFailures ?? []).length > 0) {
-      return {
-        error: true,
-        text: "已发布 " + r.count + " 条 -> " + r.messageId +
-          "，**但有 " + r.bookkeepingFailures.length + " 处发布后记账失败**" +
-          "（内容已送达、不会重发；轮转活动可能没记上）：\n" +
-          r.bookkeepingFailures.map((b) => "  " + b.messageId + " —— " + b.error).join("\n"),
-      };
+    if ((rr.bookkeepingFailures ?? []).length > 0) {
+      parts.push("**有 " + rr.bookkeepingFailures.length + " 处发布后记账失败**" +
+        "（那部分内容已送达、不会因此重发；轮转活动可能没记上）：\n" +
+        rr.bookkeepingFailures.map((b) => "  " + b.messageId + " —— " + b.error).join("\n"));
+    }
+    return parts;
+  };
+  if (r.status === "published") {
+    const notes = postDeliveryNotes(r);
+    if (notes.length > 0) {
+      return { error: true,
+        text: "已发布 " + r.count + " 条 -> " + r.messageId + "，" + notes.join("\n") };
     }
     return { text: "已发布 " + r.count + " 条 -> " + r.messageId, error: false };
   }
   if (r.status === "dry_run") {
     return { text: "[dry-run] 将发布 " + r.count + " 条：\n---\n" + r.text, error: false };
+  }
+  if (r.status === "error" && r.reason === "publish_failed" && (r.partial === true
+    || (r.deliveredUnrecorded ?? []).length > 0 || (r.bookkeepingFailures ?? []).length > 0)) {
+    // **失败前的进度要说出来**：前几批确实送达了 —— 只报失败会让人把整批重跑，
+    // 或者手工把已送达的又发一遍。
+    const notes = postDeliveryNotes(r);
+    return {
+      error: true,
+      text: "这一批发到一半失败（" + r.error + "）。\n" +
+        "  **失败前已送达 " + (r.messageIds ?? []).length + " 张卡片、落标 " +
+        (r.publishedRecords ?? 0) + " 条** —— 已落标的不会重发。" +
+        (notes.length > 0 ? "\n" + notes.join("\n") : "") +
+        ((r.markedRejected ?? []).length > 0
+          ? "\n  失败那一批已暂停自动重试：" + r.markedRejected.join("、") : "") +
+        "\n  剩余未发的留在 outbox，下一轮照常尝试。",
+    };
   }
   if (r.status === "error" && r.permanent === true) {
     // **先看实际落盘状态，诊断只是补充线索。**

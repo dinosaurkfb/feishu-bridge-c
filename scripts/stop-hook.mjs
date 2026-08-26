@@ -278,14 +278,17 @@ async function main() {
     // 记下"这一轮真的报了哪些项目"。末尾那句解释要按它来算，不能按"被归属到哪些"
     // 算 —— 非当前项目没东西可报时不产生提示，解释却会孤零零挂在那儿。
     const before = notes.length;
-    if (r.status === "published" && (r.deliveredUnrecorded ?? []).length > 0) {
-      notes.push("飞书出站：" + who + " 已发布 " + r.count + " 条，但有 " +
-        r.deliveredUnrecorded.length + " 条**送达后没落标，下一轮可能重发** —— " +
-        "先去话题核对。");
-    } else if (r.status === "published" && (r.bookkeepingFailures ?? []).length > 0) {
-      notes.push("飞书出站：" + who + " 已发布 " + r.count +
-        " 条进展，但发布后记账失败 " + r.bookkeepingFailures.length +
-        " 处（内容已送达、不会重发；轮转活动可能没记上，需要人看一眼）。");
+    if (r.status === "published"
+      && ((r.deliveredUnrecorded ?? []).length > 0 || (r.bookkeepingFailures ?? []).length > 0)) {
+      // 两类同时发生就同时说 —— else-if 会把轮转账缺口藏在落标失败后面。
+      const bits = [];
+      if ((r.deliveredUnrecorded ?? []).length > 0) {
+        bits.push(r.deliveredUnrecorded.length + " 条**送达后没落标、下一轮可能重发**（先去话题核对）");
+      }
+      if ((r.bookkeepingFailures ?? []).length > 0) {
+        bits.push(r.bookkeepingFailures.length + " 处发布后记账失败（已送达不重发，轮转账可能缺）");
+      }
+      notes.push("飞书出站：" + who + " 已发布 " + r.count + " 条，但有 " + bits.join("；") + "。");
     } else if (r.status === "published") {
       notes.push("飞书出站：" + who + " 已发布 " + r.count + " 条进展。");
     } else if (r.status === "error" && r.permanent === true) {

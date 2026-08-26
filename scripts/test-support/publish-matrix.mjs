@@ -2,8 +2,10 @@
  * 发布契约矩阵：**场景 × 入口，由登记状态驱动**。
  *
  * 登记表是 references/publish-entry-status.json。规则：
- *   · migrated —— 跑**全部**适用场景；runner 缺能力又没申报 notApplicable
+ *   · migrated —— 跑**全部**适用场景；缺能力而登记表又没申报 not_applicable
  *     就直接红（"翻状态自动启用完整契约"就靠这条）
+ *   · **适用性是登记表里的受控申报（not_applicable，带非空理由），
+ *     不是 runner 自报** —— 自报能把所有场景报成不适用而 0 行照样绿
  *   · legacy   —— 只跑该实现今天真实满足的申报子集；子集里的名字必须真实存在
  *   · 每份实现归属一个套件（登记表 suite 字段），谁的套件谁执行
  *
@@ -165,9 +167,17 @@ export function validatePublishRegistry(registry) {
     if (!["claude", "codex"].includes(meta?.suite)) {
       problems.push(entry + "：suite 不合法（" + String(meta?.suite) + "）—— 拼错会被两个套件同时跳过");
     }
-    for (const name of Object.keys(meta?.not_applicable ?? {})) {
+    const na = meta?.not_applicable;
+    if (na !== undefined && (na === null || typeof na !== "object" || Array.isArray(na))) {
+      problems.push(entry + "：not_applicable 不是对象");
+    }
+    for (const [name, why] of Object.entries((na && typeof na === "object" && !Array.isArray(na)) ? na : {})) {
       if (!PUBLISH_SCENARIOS.some((sc) => sc.name === name)) {
         problems.push(entry + "：not_applicable 申报了不存在的场景「" + name + "」");
+      }
+      // **申报必须带理由** —— "不适用"三个字本身不构成契约，理由才可评审。
+      if (typeof why !== "string" || why.trim().length === 0) {
+        problems.push(entry + "：not_applicable「" + name + "」没有给出非空理由");
       }
     }
   }

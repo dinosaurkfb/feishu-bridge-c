@@ -13962,7 +13962,7 @@ test("发布后记账缺口要一路到达渲染层，不许沉默", () => {
   const said = describeDrainOutcome({ status: "published", count: 2, messageId: "om_x",
     bookkeepingFailures: [{ messageId: "om_x", error: "轮转登记写不进去" }] }, { root: "/p" });
   assert.equal(said.error, true, "缺账要以醒目方式出现（退出码非 0）");
-  assert.match(said.text, /已送达、不会重发/u, "**必须说清消息没丢** —— 否则人会去重发");
+  assert.match(said.text, /已送达、不会因此重发/u, "**必须说清消息没丢** —— 否则人会去重发");
   assert.match(said.text, /轮转登记写不进去/u, "具体原因要在");
   // 账记全了就照旧安静。
   const clean = describeDrainOutcome({ status: "published", count: 2, messageId: "om_x",
@@ -13980,6 +13980,8 @@ test("矩阵机器：翻 migrated 自动要求完整契约，静默绕过的三�
   const fails = (rows) => rows.filter((r) => {
     try { r.run(assert); return false; } catch { return true; }
   });
+  const validationRow = (rows, pattern) =>
+    rows.some((r) => r.entry === "登记表" && pattern.test(r.title));
   const able = { caps: new Set(["publish", "failStates", "dryRun", "explicitRetry", "auditGate"]),
     fixture: () => { throw new Error("这条测试不真跑场景"); } };
 
@@ -14000,15 +14002,22 @@ test("矩阵机器：翻 migrated 自动要求完整契约，静默绕过的三�
   assert.match(swallowed.find((r) => { try { r.run(assert); return false; } catch { return true; } }).title,
     /一行都不执行/u);
 
-  // status 拼错 → 校验行必红，不许静默当 legacy。
-  assert.ok(fails(mk({ status: "migratedd" }, able)).length >= 1, "status 拼错必须红");
   // suite 拼错 → 校验行必红（全表校验，谁跑谁都能看见）。
   const badSuite = matrixRowsFor({
     registry: { implementations: { "x-entry": { file: "x.mjs", suite: "clade", status: "legacy" } } },
     suite: "claude", runners: {}, legacySubsets: {} });
-  assert.ok(fails(badSuite).length >= 1, "suite 拼错必须红");
-  // not_applicable 申报不存在的场景 → 校验行必红。
-  assert.ok(fails(mk({ status: "migrated", not_applicable: { "编造的": "x" } }, able)).length >= 1);
+  assert.ok(validationRow(badSuite, /suite 不合法/u), "suite 拼错必须出校验行");
+  // not_applicable 申报不存在的场景 / 没给理由 / 不是对象 → 必须出**校验行**。
+  // 按校验行标题查，不数 fails() —— able 夹具本来就抛，数总失败会被稀释成恒真。
+  assert.ok(validationRow(mk({ status: "migrated", not_applicable: { "编造的": "x" } }, able),
+    /不存在的场景/u), "申报不存在的场景要出校验行");
+  assert.ok(validationRow(mk({ status: "migrated",
+    not_applicable: { "dry-run：预演零改盘、零出网": "  " } }, able),
+    /没有给出非空理由/u), "**空白理由必须出校验行** —— 理由才是可评审的部分");
+  assert.ok(validationRow(mk({ status: "migrated", not_applicable: ["列表"] }, able),
+    /不是对象/u), "not_applicable 不是对象要出校验行");
+  // status / suite 拼错的断言同理按校验行查。
+  assert.ok(validationRow(mk({ status: "migratedd" }, able), /status 不合法/u));
 
   // legacy 申报不存在的场景 / 无 runner → 必红。
   assert.ok(fails(mk({ status: "legacy" }, able, { "x-entry": ["编造的场景名"] })).length >= 1);
@@ -14087,6 +14096,123 @@ test("送达后没落标：单独分类、如实说可能重发，不进重试�
   assert.equal(said.error, true);
   assert.match(said.text, /可能把它们重发/u, "**要如实说可能重发**");
   assert.equal(said.text.includes("不会重发"), false, "落标失败时不许承诺不重发");
+});
+
+test("发布事务：原地改写与跨代际攒批都进不来（评审第三轮反例）", () => {
+  // 反例一：batchCards 不克隆、直接 record.text = "FORGED" —— 对象身份没变，
+  // 上一版照常发布伪造正文并把磁盘改写。现在内容要对快照字节。
+  const mk = (recs) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-inplace-"));
+    const obDir = path.join(dir, "outbox");
+    fs.mkdirSync(obDir);
+    for (const [i, extra] of recs.entries()) {
+      fs.writeFileSync(path.join(obDir, "000" + (i + 1) + ".json"),
+        JSON.stringify(outboxRecord({ text: "原文" + (i + 1), ...extra })));
+    }
+    return { dir, obDir };
+  };
+  const g1 = mk([{}]);
+  let calls1 = 0;
+  const r1 = publishOutboxAttempt({
+    outboxDir: g1.obDir, lockDir: path.join(g1.dir, "lock"), policy: "all_unpaused",
+    batchCards: (records) => { records[0].text = "FORGED"; return [records]; },
+    resolveTarget: () => ({ ok: true }), composeCard: (b) => ({ body: b[0].text }),
+    publishBatch: () => { calls1 += 1; return "om"; },
+  });
+  assert.equal(r1.status, "error", "原地改写必须拦下");
+  assert.equal(r1.reason, "batching_mismatch");
+  assert.match(r1.detail, /原地改写/u, "要说清是哪种越权");
+  assert.equal(calls1, 0, "一条都不许发");
+  assert.match(fs.readFileSync(path.join(g1.obDir, "0001.json"), "utf-8"), /原文1/u,
+    "**磁盘原文不许被改写**");
+
+  // 反例二：gen-A 的记录**再次**出现在 gen-B 那组 —— 每组都对"全局集合"验
+  // 是看不出来的（A 在全局集合里），只有**按本组集合**验才拦得住。
+  // 后果是 A 被发到两个话题、其中一个是错的。
+  const g2 = mk([{ target_channel_generation_id: "gen-A" },
+    { target_channel_generation_id: "gen-B" }]);
+  const sentTo = [];
+  let stash = null;
+  const r2 = publishOutboxAttempt({
+    outboxDir: g2.obDir, lockDir: path.join(g2.dir, "lock"), policy: "all_unpaused",
+    batchCards: (records) => {
+      if (stash === null) { stash = records; return [records]; }  // gen-A 正常发并攒下
+      return [[...records, ...stash]];                            // gen-B 里再塞一遍 A
+    },
+    resolveTarget: (gen) => ({ ok: true, generation: gen }),
+    composeCard: (b, target) => ({ gen: target.generation, texts: b.map((x) => x.text) }),
+    publishBatch: ({ card }) => { sentTo.push(card); return "om"; },
+  });
+  assert.equal(r2.status, "error", "跨代际重复必须拦下：" + JSON.stringify(r2).slice(0, 150));
+  assert.equal(r2.reason, "batching_mismatch");
+  assert.deepEqual(sentTo, [], "**一张卡都不许发** —— 校验在任何发布之前完成");
+
+  // 反例三（评审的原始击穿形态）：gen-A 那次返回空、把 A 攒到 gen-B 那次 ——
+  // "先合批、最后做一次全局校验"的写法对它完全失明（全局集合恰好相等），
+  // A 就被发到了 gen-B 的话题。只有**每次 batchCards 返回后立刻按本组验**才拦得住。
+  const g3 = mk([{ target_channel_generation_id: "gen-A" },
+    { target_channel_generation_id: "gen-B" }]);
+  const sentTo3 = [];
+  let stash3 = null;
+  const r3 = publishOutboxAttempt({
+    outboxDir: g3.obDir, lockDir: path.join(g3.dir, "lock"), policy: "all_unpaused",
+    batchCards: (records) => {
+      if (stash3 === null) { stash3 = records; return []; }
+      return [[...stash3, ...records]];
+    },
+    resolveTarget: (gen) => ({ ok: true, generation: gen }),
+    composeCard: (b, target) => ({ gen: target.generation, texts: b.map((x) => x.text) }),
+    publishBatch: ({ card }) => { sentTo3.push(card); return "om"; },
+  });
+  assert.equal(r3.status, "error", "攒批合并必须拦下");
+  assert.deepEqual(sentTo3, [], "A 一张都不许发到 gen-B");
+});
+
+test("发布事务：后段失败不许抹掉前段已送达的事实（partial outcome）", () => {
+  // 评审探针：第一批送达且落标、第二批网络失败 —— 上一版返回值只剩
+  // publish_failed，第一批的 message id、数量、核对提示全没了。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-partial-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir);
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify(outboxRecord({ text: "先发成的" })));
+  fs.writeFileSync(path.join(obDir, "0002.json"), JSON.stringify(outboxRecord({ text: "后失败的" })));
+  let n = 0;
+  const r = publishOutboxAttempt({
+    outboxDir: obDir, lockDir: path.join(dir, "lock"), policy: "all_unpaused",
+    batchCards: (records) => records.map((x) => [x]),
+    resolveTarget: () => ({ ok: true }), composeCard: (b) => ({ body: b[0].text }),
+    publishBatch: ({ card }) => {
+      n += 1;
+      if (card.body === "后失败的") {
+        const err = new Error("Command failed: x");
+        err.stderr = "boom-opaque";
+        throw err;
+      }
+      return "om_first";
+    },
+  });
+  assert.equal(r.status, "error");
+  assert.equal(r.partial, true, "**要明确说这是打了一半的**");
+  assert.deepEqual(r.messageIds, ["om_first"], "前段的 message id 必须还在");
+  assert.equal(r.publishedRecords, 1, "前段落标数必须还在");
+  assert.match(fs.readFileSync(path.join(obDir, "0001.json"), "utf-8"), /published_at": "2/u,
+    "前提：第一批确实落标了");
+  // 渲染要把两件事都说了：已送达多少、失败的那批怎么办。
+  const said = describeDrainOutcome({ ...r, root: dir }, { root: dir });
+  assert.match(said.text, /已送达 1 张卡片/u, "**前段事实要到渲染层**");
+  assert.match(said.text, /已落标的不会重发/u);
+});
+
+test("渲染：落标失败与记账缺口同时发生要同时展示", () => {
+  // 上一版 else-if 只展示落标失败，轮转账缺口跟着消失（评审点名）。
+  const said = describeDrainOutcome({ status: "published", count: 3, messageId: "om_z",
+    deliveredUnrecorded: [{ messageId: "om_z", file: "a.json", error: "改名失败" }],
+    bookkeepingFailures: [{ messageId: "om_y", error: "轮转登记写不进去" }] }, { root: "/p" });
+  assert.equal(said.error, true);
+  assert.match(said.text, /没落标/u, "落标失败要在");
+  assert.match(said.text, /记账失败/u, "**记账缺口不许被落标失败盖住**");
+  assert.match(said.text, /改名失败/u);
+  assert.match(said.text, /轮转登记写不进去/u);
 });
 
 summarySealed = true;

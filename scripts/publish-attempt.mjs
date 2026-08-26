@@ -109,6 +109,14 @@ export function publishOutboxAttempt({
 
   let failingTarget = null;
   let failingBatch = null;
+  // **部分进度要在失败时存活。**评审探针：第一批送达（甚至送达但没落标）、
+  // 第二批网络失败 —— 上一版返回值只剩 publish_failed，第一批的 message id、
+  // 已发布数量、deliveredUnrecorded 全被抹掉，连"去话题核对"的提示都消失了。
+  // 所以累计器在 try 外，catch 原样带走。
+  const messageIds = [];
+  const bookkeepingFailures = [];
+  const deliveredUnrecorded = [];
+  let publishedRecords = 0;
   try {
     // **锁内只读这一次盘。**审计、选择、构卡、写回全用这一份快照 ——
     // 上一版是 auditOutbox + listPending 两次读，两读之间的窗口
@@ -145,33 +153,51 @@ export function publishOutboxAttempt({
       return { status: "empty" };
     }
 
-    const targetBatches = groupByTargetGeneration(selected).flatMap(([targetKey, records]) => {
+    // **切批不许重选、不许换内容、不许跨代际。**batchCards 只有"怎么分组"的权力。
+    // 三轮评审各击穿一层：返回空数组（假成功）→ 同路径克隆换内容（伪造发布 +
+    // 磁盘被改写）→ 原地改写原对象、以及把 gen-A 的记录攒到 gen-B 那次返回
+    // （全局集合相等，却发去了错误话题）。所以校验做在**每次 batchCards 返回后、
+    // composeCard 之前，按代际逐组**做，三道一起：
+    //   身份 —— 成员必须是本组的同一批对象、各恰好一次（克隆进不来）
+    //   内容 —— 成员当前内容必须仍等于快照字节（原地改写进不来）
+    //   代际 —— 组外对象直接算外来（跨组攒批进不来）
+    let batchingMismatch = null;
+    const contentOf = (r) => {
+      const { _file, _raw, ...rest } = r;
+      void _file; void _raw;
+      return JSON.stringify(rest);
+    };
+    const targetBatches = [];
+    for (const [targetKey, records] of groupByTargetGeneration(selected)) {
       const target = resolveTarget(targetKey === LEGACY_TARGET_KEY ? null : targetKey);
       if (!target.ok) throw new Error("冻结的出站话题代际不可用（" + target.reason + "）");
-      return batchCards(records).map((batch) => ({
-        batch, target, card: composeCard(batch, target),
-      }));
-    });
-
-    // **切批不许重选，也不许换内容。**batchCards 只有"怎么分组"的权力。
-    // 第一版按 _file 集合比对 —— 评审实测：保留同一路径、把整条记录换成
-    // {...record, text:"FORGED"}，照常发布伪造正文，**markSent 还把磁盘原文
-    // 改成了伪造内容**。所以按**对象身份**验：批次成员必须是 selected 里的
-    // 同一批对象、每个恰好一次 —— 克隆换字段进不来，快照承诺才立得住。
-    const remaining = new Set(selected);
-    let mismatch = null;
-    for (const item of targetBatches) {
-      for (const member of item.batch) {
-        if (!remaining.has(member)) { mismatch = "批里出现了不属于本次候选的对象（外来、重复或被克隆改写）"; break; }
-        remaining.delete(member);
+      const remaining = new Set(records);
+      for (const batch of batchCards(records)) {
+        for (const member of batch) {
+          if (!remaining.has(member)) {
+            batchingMismatch = "本代际的批里出现了不属于它的对象（外来、重复、克隆或跨代际攒批）";
+            break;
+          }
+          remaining.delete(member);
+          if (contentOf(member) !== JSON.stringify(JSON.parse(member._raw.toString("utf-8")))) {
+            batchingMismatch = "记录内容被原地改写、与快照字节不一致：" +
+              path.basename(String(member._file ?? ""));
+            break;
+          }
+        }
+        if (batchingMismatch) break;
+        targetBatches.push({ batch, target, card: composeCard(batch, target) });
       }
-      if (mismatch) break;
+      if (batchingMismatch) break;
+      if (remaining.size > 0) {
+        batchingMismatch = "本代际有 " + remaining.size + " 条候选被切批丢掉";
+        break;
+      }
     }
-    if (!mismatch && remaining.size > 0) mismatch = "有 " + remaining.size + " 条候选被切批丢掉";
-    if (mismatch) {
+    if (batchingMismatch) {
       return {
         status: "error", reason: "batching_mismatch", local: true,
-        detail: "batchCards 改写了候选集合：" + mismatch + " —— 切批只许分组，不许增删或换内容",
+        detail: "batchCards 越权：" + batchingMismatch + " —— 切批只许分组",
       };
     }
 
@@ -181,9 +207,6 @@ export function publishOutboxAttempt({
       return { status: "dry_run", count: selected.length, batches: targetBatches, selected };
     }
 
-    const messageIds = [];
-    const bookkeepingFailures = [];
-    const deliveredUnrecorded = [];
     for (const item of targetBatches) {
       // 失败要打在**这一批**上、诊断要查**这一个**目标 —— 不是全部待发。
       failingTarget = item.target;
@@ -205,7 +228,7 @@ export function publishOutboxAttempt({
           error: String(hookErr?.message ?? hookErr).slice(0, 300) });
       }
       for (const record of item.batch) {
-        try { markSent(record, messageId); }
+        try { markSent(record, messageId); publishedRecords += 1; }
         catch (markErr) {
           deliveredUnrecorded.push({ messageId,
             file: path.basename(String(record._file ?? "")),
@@ -250,6 +273,9 @@ export function publishOutboxAttempt({
       markedRejected: marked,
       error: failure.display,
       failingTarget,
+      // **失败前的进度不许被抹掉**：前几批确实发出去了，磁盘也这么记着。
+      partial: messageIds.length > 0,
+      publishedRecords, messageIds, bookkeepingFailures, deliveredUnrecorded,
     };
   } finally {
     releasePublishLock(lockDir);

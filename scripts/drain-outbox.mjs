@@ -16,7 +16,7 @@ import path from "node:path";
 
 import {
   MAX_AUTO_PUBLISH_ATTEMPTS, auditOutbox, composeDigest, isPermanentlyRejected, listPending,
-  markSent, outboxMutationBlocker, pauseKindOf, recordPublishFailure,
+  markSent, outboxMutationBlocker, recordPublishFailure, retryProtection,
 } from "./outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { PUBLISH_FAILURE, classifyPublishFailure, publishDraft } from "./outbound.mjs";
@@ -419,10 +419,14 @@ export function drainProject({
             // **成因要一路带到视图。**落了盘却不往上传，
             // 下一个进程照样只能把两种情形统称为"被飞书拒绝"——
             // 而它们的下一步不同。pauseKindOf 是那份判据的唯一读法。
-            rejected: rejected.map((r) => ({
-              file: path.basename(String(r._file ?? "")),
-              kind: pauseKindOf(r),
-              why: r.publish_rejected_reason ?? "未说明" })) };
+            rejected: rejected.map((r) => {
+              // **读法只有投影这一份** —— 上一版在这里拼裸字段取原因，
+              // 等于绕过封闭联合又解释了一遍状态。
+              const rp = retryProtection(r);
+              return { file: path.basename(String(r._file ?? "")),
+                kind: rp.status === "paused" ? rp.kind : null,
+                why: rp.status === "paused" ? rp.reason : "未说明" };
+            }) };
     }
 
     const targetBatches = groupByTargetGeneration(pending).flatMap(([targetKey, records]) => {

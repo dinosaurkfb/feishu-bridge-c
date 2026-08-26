@@ -41,8 +41,8 @@ import {
   MAX_AUTO_PUBLISH_ATTEMPTS, appendEvent, auditOutbox, classifyOutboxRecord,
   codexReplyEventKey, composeDigest, explainabilityGaps,
   hasPublishAuthorization, isPermanentlyRejected, listPending, markPublishEligibleByEventKey,
-  markSent, outboxMutationBlocker, pauseKindOf, recordPublishFailure, retryProtectionState,
-  suppressPublishByEventKey,
+  markSent, outboxMutationBlocker, pauseKindOf, recordPublishFailure, retryProtection,
+  retryProtectionState, suppressPublishByEventKey,
 } from "./outbox.mjs";
 import {
   capMarkdownTables, composeOutboundCard, countMarkdownTables, outboundCardBatches,
@@ -13524,6 +13524,82 @@ test("失败阈值只有一个：写入端不许产出读取端判为损坏的�
   const done = JSON.parse(fs.readFileSync(path.join(obDir, "0001.json"), "utf-8"));
   assert.equal(retryProtectionState(done), "paused");
   assert.deepEqual(explainabilityGaps(done), [], "读写两端必须对得上");
+});
+
+test("重试保护投影：封闭联合，每个状态携带自己的数据", () => {
+  // 上一版只有状态字符串，展示层还得自己拼裸字段取原因 ——
+  // "每个读者都重新解释状态"正是这条线上反复漏接的根。
+  const base = outboxRecord({ text: "一条" });
+  const iso = "2026-08-26T00:00:00.000Z";
+
+  assert.deepEqual(retryProtection(base), { status: "clean" });
+  assert.deepEqual(retryProtection({ ...base, publish_attempts: 2 }),
+    { status: "retrying", attempts: 2 });
+  assert.deepEqual(retryProtection({ ...base, publish_attempts: MAX_AUTO_PUBLISH_ATTEMPTS,
+    publish_rejected_at: iso, publish_rejected_reason: "自动重试预算耗尽：…",
+    publish_rejected_kind: "retry_exhausted" }),
+    { status: "paused", attempts: MAX_AUTO_PUBLISH_ATTEMPTS, at: iso,
+      reason: "自动重试预算耗尽：…", kind: "retry_exhausted" },
+    "**paused 要把 at/reason/kind 一并给全** —— 消费者不许再回去摸字段");
+
+  // corrupt 也要说清为什么 —— 一个裸的 corrupt 逼着人自己去对着四个字段猜。
+  for (const [patch, pattern] of [
+    [{ publish_attempts: 0 }, /不是正整数/u],
+    [{ publish_attempts: 999 }, /已到上限却没有暂停记录/u],
+    [{ publish_attempts: 3, publish_rejected_at: "abc",
+      publish_rejected_reason: "x", publish_rejected_kind: "platform_rejected" },
+      /不是规范时间/u],
+    [{ publish_attempts: 3, publish_rejected_at: iso,
+      publish_rejected_reason: "  ", publish_rejected_kind: "platform_rejected" },
+      /缺失或为空/u],
+    [{ publish_attempts: 3, publish_rejected_at: iso,
+      publish_rejected_reason: "x", publish_rejected_kind: "随便" },
+      /不在受控取值里/u],
+    [{ publish_attempts: 1, publish_rejected_at: iso,
+      publish_rejected_reason: "x", publish_rejected_kind: "retry_exhausted" },
+      /自相矛盾/u],
+  ]) {
+    const rp = retryProtection({ ...base, ...patch });
+    assert.equal(rp.status, "corrupt", JSON.stringify(patch));
+    assert.match(rp.reason, pattern, "corrupt 要说清为什么：" + rp.reason);
+  }
+
+  // 三个派生只许是投影的薄壳 —— 各自另写一份就又是第二份判据。
+  const paused = { ...base, publish_attempts: 1, publish_rejected_at: iso,
+    publish_rejected_reason: "平台拒绝（err_11310）", publish_rejected_kind: "platform_rejected" };
+  assert.equal(retryProtectionState(paused), "paused");
+  assert.equal(isPermanentlyRejected(paused), true);
+  assert.equal(pauseKindOf(paused), "platform_rejected");
+  assert.equal(pauseKindOf({ ...base, publish_attempts: 1 }), null);
+});
+
+test("重试保护字段：唯一的读写处是 outbox.mjs，别处零出现（原始扫描）", () => {
+  // **行为测试证不了模块边界** —— 展示层拼一次裸字段，语义测试照样全绿
+  //（渲染结果一样），漏的是"下次字段语义变了，那处不会跟着变"。
+  // 原始扫描、不解析注释：跟禁用 process.argv[1] 那条守卫同一形状，
+  // 注释也不许写字段名 —— 免得下一个人照着注释里的名字又拼回去。
+  const fields = ["publish_attempts", "publish_rejected_at",
+    "publish_rejected_reason", "publish_rejected_kind"];
+  const offenders = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith(".mjs")) {
+        if (entry.name === "outbox.mjs" || entry.name === "test.mjs") continue;
+        const text = fs.readFileSync(full, "utf-8");
+        for (const f of fields) {
+          if (text.includes(f)) offenders.push(path.relative(path.resolve("scripts"), full) + " ← " + f);
+        }
+      }
+    }
+  };
+  walk(path.resolve("scripts"));
+  assert.deepEqual(offenders, [],
+    "这些文件绕过了投影直接摸字段（或在注释里留了字段名）");
+  // 扫描本身要有效：outbox.mjs 里真有这些字段。
+  const home = fs.readFileSync(path.resolve("scripts", "outbox.mjs"), "utf-8");
+  for (const f of fields) assert.ok(home.includes(f), "扫描失效：连 outbox.mjs 里都找不到 " + f);
 });
 
 summarySealed = true;

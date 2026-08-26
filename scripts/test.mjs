@@ -14663,7 +14663,9 @@ test("过期 reap 锁：两个接管者都必须 fail-closed，不许自愈再�
     const r = claimRunPublish({ runsDir: runs, key });
     assert.equal(r.ok, false, who + "：**残留 reap 锁在场就不许得手** —— " + JSON.stringify(r));
     assert.equal(r.reason, "reap_lock_held", who);
-    assert.match(r.detail, /人工删除/u, who + "：要指路显式维护，不是让人干等");
+    assert.match(r.detail, /repair-run-claim/u, who + "：只许指向显式维护入口");
+    assert.equal(/人工删除/u.test(r.detail), false,
+      who + "：**不给直接 rm 的旁路** —— 那会绕过维护互斥");
   }
   assert.equal(fs.existsSync(claimFile), true, "旧 claim 一个字都不许动");
   assert.equal(fs.existsSync(reapLock), true, "残留锁也不许在热路径被清");
@@ -14710,7 +14712,9 @@ test("reap 锁残留：真实 watcher 要给出锁路径与维护命令，维护
   assert.equal(sentEarly.length, 0, "残留锁在场不许发");
   assert.match(said, /reaplock/u, "**锁路径要在输出里** —— 人得知道删哪个：" + said.slice(0, 300));
   assert.match(said, /repair-run-claim\.mjs/u, "**要指路显式维护命令**");
-  const cmdLine = said.split("\n").find((l) => l.includes("repair-run-claim.mjs")) ?? "";
+  const cmdLine = said.split("\n").map((l) => l.trim())
+    .find((l) => l.startsWith("node ") && l.includes("repair-run-claim.mjs")) ?? "";
+  assert.ok(cmdLine !== "", "要有可执行命令行");
   assert.equal(cmdLine.includes("--apply"), false,
     "**提示的命令行不许带 --apply** —— 说默认预览却给带 --apply 的命令是教人跳过预览：" + cmdLine);
   assert.match(said, new RegExp("--key " + key, "u"), "要带 --key 只清这一条的残留");
@@ -14720,7 +14724,7 @@ test("reap 锁残留：真实 watcher 要给出锁路径与维护命令，维护
   // ② 维护入口：**只清 reap 锁，claim 一个字不动**（"判死 → 删 claim"被评审
   // 固定时序击穿过：热路径抢先接管后，维护者按旧结论删掉新 claim）。
   // 预览真的零改盘；活持有者不动；--apply 才清死锁。
-  const preview = repairRunClaims({ runsDir: runs });
+  const preview = repairRunClaims({ runsDir: runs, all: true });
   assert.equal(preview.apply, false);
   assert.equal(fs.existsSync(reapLock), true, "**预览零改盘** —— reap 锁还在");
   assert.equal(fs.existsSync(claimFile), true, "claim 也在");
@@ -14730,7 +14734,7 @@ test("reap 锁残留：真实 watcher 要给出锁路径与维护命令，维护
   const liveKey = "1".repeat(64);
   const liveReap = path.join(runs, liveKey + ".publish-claim.json.reaplock");
   fs.writeFileSync(liveReap, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }) + "\n");
-  const report = repairRunClaims({ runsDir: runs, apply: true });
+  const report = repairRunClaims({ runsDir: runs, all: true, apply: true });
   const keptLive = report.actions.find((a) => a.file.startsWith(liveKey));
   assert.equal(keptLive.action, "kept", "**活持有者一律不动**：" + JSON.stringify(keptLive));
   assert.equal(fs.existsSync(liveReap), true);
@@ -14769,6 +14773,38 @@ test("维护 CLI 是破坏性命令：白名单之外一个参数都不收", () 
     const r = cli(args);
     assert.notEqual(r.status, 0, why + "：必须拒绝 —— " + (r.stdout ?? ""));
     assert.equal(fs.existsSync(reap), true, why + "：**拒绝时一个文件都不许动**");
+  }
+  // **核心函数自己也守范围不变量** —— 绕过 CLI 直接调必须被拒、零动作。
+  {
+    const direct = repairRunClaims({ runsDir: runs, apply: true });
+    assert.equal(direct.ok, false, "**没给范围的直接调用必须拒绝**");
+    assert.equal(direct.reason, "scope_required");
+    assert.equal(fs.existsSync(reap), true, "零动作");
+  }
+  // 缺值 / flag 当值 / 重复参数 —— 都在任何文件操作之前拒绝。
+  // **给"flag 被当成路径"造一个真靶**：名为 --key 的目录里放一把死锁。
+  // 光断言退出码不够 —— 假值路径读不了也会非 0，变异照样绿（实测）。
+  const flagRuns = path.join(dir, "--key", ".runtime-data", "inbound", "runs");
+  fs.mkdirSync(flagRuns, { recursive: true });
+  const flagLock = path.join(flagRuns, "0".repeat(64) + ".publish-claim.json.reaplock");
+  fs.writeFileSync(flagLock, JSON.stringify({ pid: 999999999, at: "2020-01-01T00:00:00.000Z" }) + "\n");
+  {
+    const r = spawnSync(process.execPath,
+      [path.resolve("scripts", "repair-run-claim.mjs"), "--project", "--key", "--all", "--apply"],
+      { encoding: "utf-8", cwd: dir });
+    assert.notEqual(r.status, 0, "--project 缺值必须拒绝");
+    assert.equal(fs.existsSync(flagLock), true,
+      "**名为 --key 的目录里的锁一根毫毛都不许动** —— flag 被当路径就会删到这");
+  }
+  for (const [why, args] of [
+    ["--project 缺值（把 --key 当路径）", ["--project", "--key", "--all", "--apply"]],
+    ["--key 缺值", ["--project", dir, "--key", "--apply"]],
+    ["重复 --project", ["--project", dir, "--project", dir, "--all"]],
+    ["重复 --apply", ["--project", dir, "--all", "--apply", "--apply"]],
+  ]) {
+    const r = cli(args);
+    assert.notEqual(r.status, 0, why + "：必须拒绝 —— " + (r.stdout ?? ""));
+    assert.equal(fs.existsSync(reap), true, why + "：零动作");
   }
   // **范围必须显式**：不带 --key/--all 拒绝；两个都带也拒绝。
   for (const [why, args] of [
@@ -14843,8 +14879,10 @@ test("维护提示的命令要经得起真 shell：含空格中文引号的项�
     [path.resolve("scripts", "watch-and-publish.mjs"), key, root],
     { encoding: "utf-8", env: { ...process.env, HOME: root }, timeout: 60_000 });
   const said = (r1.stdout ?? "") + (r1.stderr ?? "");
-  const cmdLine = (said.split("\n").find((l) => l.includes("repair-run-claim.mjs")) ?? "").trim();
-  assert.ok(cmdLine.startsWith("node "), "要给出完整可执行命令：" + said.slice(0, 300));
+  // detail 行也提到入口名 —— 只认以 node 开头的那行命令。
+  const cmdLine = (said.split("\n").map((l) => l.trim())
+    .find((l) => l.startsWith("node ") && l.includes("repair-run-claim.mjs")) ?? "");
+  assert.ok(cmdLine !== "", "要给出完整可执行命令：" + said.slice(0, 300));
 
   // 真 shell 跑 dry-run：路径里的空格中文引号都不许把命令拆散。
   const dry = spawnSync("/bin/sh", ["-c", cmdLine], { encoding: "utf-8" });

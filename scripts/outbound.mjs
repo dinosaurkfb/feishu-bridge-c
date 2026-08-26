@@ -137,9 +137,11 @@ export function claimRunPublish({ runsDir, key, staleMs = 5 * 60 * 1000, now = D
     // 把它删掉再建自己的 —— 两个 ok:true。同一个反模式在低一层复发，
     // 递归不会收敛。所以：**reap 锁存在即 fail-closed**，
     // 崩溃残留（双重退化情形）交给显式维护清理，不在这里赌。
+    // **只指向显式维护入口，不给"人工删除"的旁路** —— 直接 rm 绕过维护互斥，
+    // 两个操作者又能重现"删掉新活锁"的竞态（评审点名）。
     return { ok: false, reason: "reap_lock_held",
       detail: "接管互斥锁被占（或为崩溃残留）：" + reapLock +
-        " —— 若确认无接管者存活，人工删除该文件" };
+        " —— 用显式维护入口 repair-run-claim.mjs 处理，不要直接删除" };
   }
   try {
     const current = readOwner();

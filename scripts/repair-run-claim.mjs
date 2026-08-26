@@ -46,8 +46,19 @@ const ownerDead = (file, { staleMs, now }) => {
  * 扫描并（apply 时）清理**死掉的 reap 锁**。活持有者一律不动并说明原因。
  * claim 文件永远不动 —— 见文件头。
  */
-export function repairRunClaims({ runsDir, key = null, apply = false,
+export function repairRunClaims({ runsDir, key = null, all = false, apply = false,
   staleMs = 5 * 60 * 1000, now = Date.now() } = {}) {
+  // **范围显式是核心不变量，不是 CLI 包装的礼貌。**评审实测直接调
+  // repairRunClaims({runsDir, apply:true}) 清了全项目 —— 包装层查了、
+  // 核心不查，绕过包装就绕过约束。--key 与 --all 二选一，在任何
+  // 文件操作之前拒绝。
+  if ((key === null) === (all === false)) {
+    return { ok: false, reason: "scope_required",
+      detail: "必须显式给范围：key（精确一条）或 all（全项目），二选一" };
+  }
+  if (key !== null && !KEY_SHAPE.test(String(key))) {
+    return { ok: false, reason: "bad_key" };
+  }
   let names;
   try { names = fs.readdirSync(runsDir); }
   catch { return { ok: false, reason: "runs_unreadable", runsDir }; }
@@ -106,13 +117,23 @@ if (isDirectRun(import.meta.url)) {
   let allKeys = false;
   let apply = false;
   let bad = null;
-  for (let i = 0; i < argv.length; i += 1) {
+  const seen = new Set();
+  // 取值参数的值**不能缺、不能像另一个 flag** —— 否则 `--project --key`
+  // 会把 --key 当成项目目录（评审实测照删 exit 0）。重复参数一律拒绝。
+  const takeValue = (name, i) => {
+    const v = argv[i + 1];
+    if (v === undefined || v.startsWith("--")) { bad = name + " 缺值"; return undefined; }
+    return v;
+  };
+  for (let i = 0; i < argv.length && bad === null; i += 1) {
     const a = argv[i];
-    if (a === "--project") { project = argv[++i]; }
-    else if (a === "--key") { key = argv[++i]; }
+    if (seen.has(a)) { bad = "重复参数：" + a; break; }
+    seen.add(a);
+    if (a === "--project") { project = takeValue(a, i); i += 1; }
+    else if (a === "--key") { key = takeValue(a, i); i += 1; }
     else if (a === "--all") { allKeys = true; }
     else if (a === "--apply") { apply = true; }
-    else { bad = a; break; }
+    else { bad = a; }
   }
   // **范围必须显式**：--key <精确目标> 或 --all 二选一 ——
   // "没写 key 就默认全项目"会让人为一条 run 报警、顺手清掉整个项目的残留。
@@ -126,7 +147,7 @@ if (isDirectRun(import.meta.url)) {
     process.exit(2);
   }
   const runsDir = path.join(project, ".runtime-data", "inbound", "runs");
-  const r = repairRunClaims({ runsDir, key, apply });
+  const r = repairRunClaims({ runsDir, key, all: allKeys, apply });
   if (!r.ok && r.reason === "maintenance_lock_held") {
     console.error("维护互斥：" + r.detail);
     process.exit(1);

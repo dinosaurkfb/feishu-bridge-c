@@ -15,6 +15,8 @@ import { normalizeLocalInput } from "./turn-input.mjs";
 import { isDirectRun, moduleRoot } from "./direct-run.mjs";
 import { generationTargetState, usableGeneration } from "./topic-generation.mjs";
 import { isCanonicalIso } from "./canonical-time.mjs";
+// registry 不反向依赖 outbox —— 没有环。
+import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 
 /**
  * `reply` 是一轮对话的**原文答复**，由 Stop 钩子从 last_assistant_message 直接取，
@@ -161,35 +163,160 @@ export function markSent(rec, messageId) {
  * 观察到目标 thread、turn.completed、exit 0 和非空最终输出后才调用这里。按 event key
  * 找而不是按文件名猜，重复调用幂等，已发布事件也不会被复活。
  */
-export function markPublishEligibleByEventKey({ outboxDir, eventKey }) {
+/**
+ * 取发布锁，**取不到就短暂重试**。
+ *
+ * 这些临界区都很短（读一个文件、写回去），争用几乎总是瞬时的。
+ * 一次拿不到就放弃，会把"稍等一下就好"变成"这条记录永远改不动"。
+ * 但重试是**有界**的：拿不到就得让调用方知道。
+ */
+function acquirePublishLockWithRetry(dir, { attempts = 6, waitMs = 120 } = {}) {
+  let last = null;
+  for (let i = 0; i < attempts; i += 1) {
+    last = acquirePublishLock(dir);
+    if (last.ok) return last;
+    if (i < attempts - 1) {
+      // 同步等一小会儿 —— 这些函数都是同步契约，不能改成 async。
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
+    }
+  }
+  return last;
+}
+
+/**
+ * Codex 一轮答复的事件键 —— **只有这一份公式**。
+ *
+ * 恢复消费者不能信标记自报的 event_key：一张 claim_key 与文件名自洽、
+ * 但 event_key 指向别人答复的标记，就能替另一条 claim 授予发布资格。
+ * 所以它按 thread + 文件名里的 claim key 自己算一遍。
+ * 算的人多了公式就会分叉，因此 watcher、Stop 钩子、恢复器共用这个函数。
+ */
+export function codexReplyEventKey({ threadId, claimKey }) {
+  return "codex:" + threadId + ":claim:" + claimKey + ":reply";
+}
+
+/**
+ * 给一条事件授予自动发布资格。
+ *
+ * @param requireRunId 非空时，命中的那条记录必须 `run_id === requireRunId`。
+ *        恢复消费者必须传 —— 它处理的是"标记说该给谁资格"，
+ *        而标记是发布授权制品，得验真。
+ */
+export function markPublishEligibleByEventKey({
+  outboxDir, eventKey, publishLockDir, requireRunId = null,
+}) {
   if (typeof eventKey !== "string" || !eventKey.trim()) return { ok: false, reason: "no_event_key" };
+  // **改同一条记录的语义，就得跟抑制拿同一把锁。**
+  //
+  // 抑制在锁内读一份字节快照、核对摘要、然后写回。如果这里不取锁，
+  // 就能在"快照读完、写回之前"改掉同一条记录 —— 抑制照样成功，
+  // **并发写入的新内容被旧快照覆盖，然后那条记录被永久抑制**。
+  // 摘要只保护到"预览 → 锁内快照"，保护不了"快照 → 写回"。
+  //
+  // 锁是必需参数：说不清跟谁串行就不许改，别留一个"忘了传"的入口。
+  if (typeof publishLockDir !== "string" || !publishLockDir) {
+    return { ok: false, reason: "publish_lock_required" };
+  }
+  const lock = acquirePublishLockWithRetry(publishLockDir);
+  if (!lock.ok) return { ok: false, reason: "publisher_busy", detail: lock.reason };
+  try {
+    return markEligibleLocked({ outboxDir, eventKey, requireRunId });
+  } finally {
+    releasePublishLock(publishLockDir);
+  }
+}
+
+/** 锁内那一段。**只在持有发布锁时调用。** */
+function markEligibleLocked({ outboxDir, eventKey, requireRunId = null }) {
   let files;
   try {
-    files = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json"));
+    files = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json")).sort();
   } catch {
     return { ok: false, reason: "event_not_found" };
   }
+  // **先把命中全找出来，再判断。**找到第一条就返回的话，"同一个事件键有两条记录"
+  // 这种损坏永远看不见 —— 而资格是发布授权，模棱两可时必须拦住。
+  const hits = [];
   for (const name of files) {
     const file = path.join(outboxDir, name);
     let rec;
     try { rec = JSON.parse(fs.readFileSync(file, "utf-8")); } catch { continue; }
+    if (rec === null || typeof rec !== "object" || Array.isArray(rec)) continue;
     if (rec.event_key !== eventKey) continue;
-    if (rec.published_at !== null) return { ok: true, changed: false, reason: "already_published", record: rec };
-    if (typeof rec.publish_eligible_at === "string" && rec.publish_eligible_at) {
-      return { ok: true, changed: false, reason: "already_eligible", record: { ...rec, _file: file } };
-    }
-    const next = { ...rec, publish_eligible_at: new Date().toISOString() };
-    const tmp = file + ".tmp." + randomUUID();
-    fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
-    fs.renameSync(tmp, file);
-    return { ok: true, changed: true, record: { ...next, _file: file } };
+    hits.push({ file, rec });
   }
-  return { ok: false, reason: "event_not_found" };
+  if (hits.length === 0) return { ok: false, reason: "event_not_found" };
+  if (hits.length > 1) return { ok: false, reason: "event_key_ambiguous", count: hits.length };
+  const { file, rec } = hits[0];
+  // 标记自报的身份不算数：要求这条记录确实属于那个 claim。
+  if (requireRunId !== null && rec.run_id !== requireRunId) {
+    return { ok: false, reason: "run_id_mismatch" };
+  }
+
+  // **三态判据跟审计、抑制共用同一份。**
+  //
+  // 这里本来自己判"published_at 非 null 就是已发布"、"publish_suppressed_at 非空
+  // 就是已停发"——比共用判据松：published_at 放 false、publish_suppressed_at 放
+  // "abc"，都会被当成"已经有结论"，于是恢复器撤掉标记，那条答复再没人管。
+  // 损坏就该说损坏。
+  const verdict = classifyOutboxRecord(rec);
+  if (verdict.unclassified) {
+    return { ok: false, reason: "record_unclassified", why: verdict.why };
+  }
+  if (verdict.state === "published") {
+    return { ok: true, changed: false, reason: "already_published", record: rec };
+  }
+  // **停发是终局，资格提升不许再碰它。**
+  // 它不会因此被发出去（发布筛选认停发），但那是靠下游**另一份判据**兜住的；
+  // 判据一变，人永久停掉的东西就复活了。
+  // 返回 ok 是因为"已经有结论"——让恢复器撤掉标记，不要永远重试。
+  if (verdict.state === "suppressed") {
+    return { ok: true, changed: false, reason: "already_suppressed", record: rec };
+  }
+  // **"已经有资格"要用唯一那份授权判据。**
+  //
+  // 上一版是"非空字符串就算数"，跟 hasPublishAuthorization 分叉：
+  // 评审把值设成 not-a-canonical-time，恢复器返回 already_eligible 并撤掉标记，
+  // 而发布器判它**未获授权** —— 于是"一轮已完成、却再也没有恢复路径"。
+  // 一份畸形的值同时是"够了，别管了"和"不算数，别发"，唯一的恢复证据被销毁。
+  if (rec.publish_eligible_at !== undefined && rec.publish_eligible_at !== null) {
+    if (!hasPublishAuthorization(rec)) {
+      return { ok: false, reason: "record_unclassified", why: "publish_eligible_at 不是规范时间" };
+    }
+    return { ok: true, changed: false, reason: "already_eligible", record: { ...rec, _file: file } };
+  }
+  const next = { ...rec, publish_eligible_at: new Date().toISOString() };
+  const tmp = file + ".tmp." + randomUUID();
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  return { ok: true, changed: true, record: { ...next, _file: file } };
 }
 
 /** 保留原始事件作审计，但把严格终局失败对应的半成品答复移出所有发布队列。 */
-export function suppressPublishByEventKey({ outboxDir, eventKey, reason }) {
+export function suppressPublishByEventKey({ outboxDir, eventKey, reason, publishLockDir }) {
   if (typeof eventKey !== "string" || !eventKey.trim()) return { ok: false, reason: "no_event_key" };
+  // **改同一条记录的语义，就得跟抑制拿同一把锁。**
+  //
+  // 抑制在锁内读一份字节快照、核对摘要、然后写回。如果这里不取锁，
+  // 就能在"快照读完、写回之前"改掉同一条记录 —— 抑制照样成功，
+  // **并发写入的新内容被旧快照覆盖，然后那条记录被永久抑制**。
+  // 摘要只保护到"预览 → 锁内快照"，保护不了"快照 → 写回"。
+  //
+  // 锁是必需参数：说不清跟谁串行就不许改，别留一个"忘了传"的入口。
+  if (typeof publishLockDir !== "string" || !publishLockDir) {
+    return { ok: false, reason: "publish_lock_required" };
+  }
+  const lock = acquirePublishLockWithRetry(publishLockDir);
+  if (!lock.ok) return { ok: false, reason: "publisher_busy", detail: lock.reason };
+  try {
+    return suppressByEventKeyLocked({ outboxDir, eventKey, reason });
+  } finally {
+    releasePublishLock(publishLockDir);
+  }
+}
+
+/** 锁内那一段。**只在持有发布锁时调用。** */
+function suppressByEventKeyLocked({ outboxDir, eventKey, reason }) {
   let files;
   try {
     files = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json"));
@@ -223,55 +350,6 @@ export function suppressPublishByEventKey({ outboxDir, eventKey, reason }) {
  * reply 必须原样渲染：给一段两千字的答复加上「· 」前缀和【】分组，
  * 等于把它揉烂。它不是一条进展，它就是正文。
  */
-/**
- * 把一批已经取出来的待发记录标成**永久失败**，停止重试。
- *
- * 为什么要有它：有一类发布失败重试再多次也不会变 —— 比如话题是另一个应用建的，
- * 当前身份回复不进去。那种情况下每 30 分钟重试一次只是稳定地制造噪音，
- * 而每轮 Stop 都会说一句"兜底定时器会重试"，那句话是假的。
- *
- * **但判定"永久"这件事由人做，不由代码做。**曾经试过自动判：诊断到"根消息属于
- * 另一个应用"就抑制。那是**从相关性推因果** —— 一次瞬时的网络错误恰好发生在
- * 跨应用根消息上，照样会触发不可逆的抑制。有损动作不能建立在推断出来的因果上。
- *
- * 所以排空只诊断并报告，这个函数只被显式的 feishu-suppress-outbox 命令调用。
- */
-export function suppressRecords(records, { reason }) {
-  let changed = 0;
-  const failed = [];
-  for (const rec of records) {
-    const file = rec._file;
-    if (typeof file !== "string") { failed.push({ file: null, reason: "no_file_ref" }); continue; }
-    let current;
-    try { current = JSON.parse(fs.readFileSync(file, "utf-8")); } catch {
-      // **不可逆操作不能静默漏项。**读不出来就是没停成，必须进 failed ——
-      // 否则调用方会以为整批都停了，而漏掉的那条继续每 30 分钟重试。
-      failed.push({ file, reason: "unreadable" });
-      continue;
-    }
-    // 已发出/已抑制不算漏项：目标状态已经达到。
-    if (current.published_at !== null || current.publish_suppressed_at) continue;
-    const next = {
-      ...current,
-      publish_eligible_at: null,
-      publish_suppressed_at: new Date().toISOString(),
-      publish_suppressed_reason: String(reason ?? "permanent_publish_failure").slice(0, 200),
-    };
-    try {
-      const tmp = file + ".tmp." + randomUUID();
-      fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
-      fs.renameSync(tmp, file);
-      changed += 1;
-    } catch (err) {
-      // **不许半写后抛。**上一版第二条不可写时直接抛出去：前面几条已经被永久抑制，
-      // 调用方却只收到一个异常 —— 它不知道自己已经改掉了多少东西。
-      // 返回结构化的部分失败，让调用方能如实报"停了几条、几条没停成"。
-      failed.push({ file, reason: String(err.code ?? err.message).slice(0, 60) });
-    }
-  }
-  return { ok: failed.length === 0, changed, failed };
-}
-
 export function composeDigest(records, { taskName }) {
   const replies = records.filter((r) => r.kind === "reply");
   const rest = records.filter((r) => r.kind !== "reply");
@@ -408,6 +486,112 @@ export function outboxMutationBlocker(audit) {
   return null;
 }
 
+/**
+ * 一条记录处于三态里的哪一态 —— **判据只有这一份**。
+ *
+ *   suppressed：publish_suppressed_at 是规范时间
+ *   pending   ：published_at === null
+ *   published ：published_at 是规范时间
+ * 三样都不是 → 说不清，拦住。
+ *
+ * **三态必须互斥。**曾经只要 publish_suppressed_at 非空就判 suppressed，
+ * 不管 published_at 是什么 —— 一条"既发过又被停过"的自相矛盾记录被静默接受。
+ * 停发的前提就是它还没发出去。
+ *
+ * **严格校验字段类型，不能只看"有没有这个键"。**评审实测：published_at
+ * 放 false / 0 / {} / "" 时都曾被当成"已发布"静默跳过 ——
+ * 一批损坏记录就这样被永久藏起来。
+ */
+export function classifyOutboxRecord(rec) {
+  if (rec === null || typeof rec !== "object" || Array.isArray(rec)) {
+    return { unclassified: true, why: "不是记录对象" };
+  }
+  const sup = rec.publish_suppressed_at;
+  if (sup !== undefined && sup !== null) {
+    // 复用规范时间校验，不自己判"非空字符串" —— 纯空白、"abc"、"2026-13-45"
+    // 都能通过"非空"，却都不是时间。判据松一点，损坏记录就又被藏起来。
+    if (!isCanonicalIso(sup)) {
+      return { unclassified: true, why: "publish_suppressed_at 不是规范时间" };
+    }
+    if (rec.published_at !== null) {
+      return { unclassified: true, why: "既标了已发布又标了已停发，状态自相矛盾" };
+    }
+    return { state: "suppressed" };
+  }
+  if (!("published_at" in rec)) {
+    return { unclassified: true, why: "缺 published_at，无法归类" };
+  }
+  const pub = rec.published_at;
+  if (pub === null) return { state: "pending" };
+  if (isCanonicalIso(pub)) return { state: "published" };
+  return { unclassified: true, why: "published_at 既不是 null 也不是规范时间" };
+}
+
+/**
+ * **一次读盘，之后全用这一份。**
+ *
+ * ■ 为什么必须只读一次
+ *
+ * 抑制预览曾经读两遍：渲染正文一遍、算摘要一遍。评审在两次读之间做同名替换 ——
+ * **人看到的是 A，拿到的摘要绑的是 B**，随后他"合法地"永久抑制了 B。
+ * 摘要能防住"预览之后变化"，却防不住"渲染和摘要看的不是同一份"。
+ *
+ * 同理，锁内也只读一次：审计、选择、摘要、写回全用这一份字节，
+ * 中间不留任何"再读一次"的窗口。
+ *
+ * ■ 边界
+ *
+ * 它只负责 readdir / read / parse / classify，**不接 selector 回调** ——
+ * 代际选择仍归调用方的 readState().select。把选择并进来会让这个函数
+ * 依赖调用方的回调，那是另一件事。
+ *
+ * @returns {{ok:true, files:string[], records:object[], audit:object}|{ok:false, reason:string}}
+ *          records 里每条带 `_file`（绝对路径）和 `_raw`（原始字节）。
+ */
+export function readOutboxSnapshot(outboxDir) {
+  let names;
+  try {
+    const st = fs.statSync(outboxDir);
+    if (!st.isDirectory()) return { ok: false, reason: "outbox_not_a_directory" };
+    names = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json")).sort();
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return { ok: true, files: [], records: [],
+        audit: { ok: true, pending: 0, unclassified: [], unexplainable: [], files: [] } };
+    }
+    return { ok: false, reason: "outbox_unreadable" };
+  }
+  const unclassified = [];
+  const unexplainable = [];
+  const records = [];
+  let pending = 0;
+  for (const name of names) {
+    const file = path.join(outboxDir, name);
+    let raw;
+    try { raw = fs.readFileSync(file); }
+    catch { unclassified.push({ file: name, why: "读不出来" }); continue; }
+    let rec;
+    try { rec = JSON.parse(raw.toString("utf-8")); }
+    catch { unclassified.push({ file: name, why: "读不出来" }); continue; }
+    const verdict = classifyOutboxRecord(rec);
+    if (verdict.unclassified) { unclassified.push({ file: name, why: verdict.why }); continue; }
+    const gaps = explainabilityGaps(rec);
+    if (gaps.length > 0) {
+      unexplainable.push({ file: name, why: "缺少解释这条记录所必需的字段：" + gaps.join("、") });
+    }
+    if (verdict.state === "pending") {
+      pending += 1;
+      records.push({ ...rec, _file: file, _raw: raw });
+    }
+  }
+  return {
+    ok: true,
+    files: [...names],
+    records,
+    audit: { ok: true, pending, unclassified, unexplainable, files: [...names] },
+  };
+}
+
 export function auditOutbox(outboxDir) {
   let files;
   try {
@@ -450,39 +634,10 @@ export function auditOutbox(outboxDir) {
     if (missing.length > 0) {
       unexplainable.push({ file: f, why: "缺少解释这条记录所必需的字段：" + missing.join("、") });
     }
-    // **三态要严格校验字段的类型，不能只看"有没有这个键"。**
-    // 评审实测：published_at 放 false / 0 / {} / "" 时，上一版都当成"已发布"
-    // 静默跳过 —— 一批损坏记录就这样被永久藏起来，门槛还照样放行。
-    //
-    //   suppressed：publish_suppressed_at 是非空字符串
-    //   pending   ：published_at === null
-    //   published ：published_at 是非空字符串
-    // 三样都不是 → 说不清，拦住。
-    // **三态必须互斥。**上一版只要 publish_suppressed_at 是非空串就判 suppressed，
-    // 不管 published_at 是什么 —— 一条"既发过又被停过"的自相矛盾记录会被静默接受。
-    // 停发的前提就是它还没发出去；两个字段同时有值，说明这条记录的状态是坏的。
-    const sup = rec.publish_suppressed_at;
-    if (sup !== undefined && sup !== null) {
-      // **复用规范时间校验，不自己判"非空字符串"。**
-      // 纯空白、"abc"、"2026-13-45" 都能通过"非空"，却都不是时间 ——
-      // 判据松一点，损坏记录就又被当成合法状态藏起来。
-      if (!isCanonicalIso(sup)) {
-        unclassified.push({ file: f, why: "publish_suppressed_at 不是规范时间" });
-        continue;
-      }
-      if (rec.published_at !== null) {
-        unclassified.push({ file: f, why: "既标了已发布又标了已停发，状态自相矛盾" });
-        continue;
-      }
-      continue;                                                          // suppressed
-    }
-    if (!("published_at" in rec)) {
-      unclassified.push({ file: f, why: "缺 published_at，无法归类" }); continue;
-    }
-    const pub = rec.published_at;
-    if (pub === null) { pending += 1; continue; }                        // pending
-    if (isCanonicalIso(pub)) continue;                                  // published
-    unclassified.push({ file: f, why: "published_at 既不是 null 也不是规范时间" });
+    // 三态判据跟快照读取共用一份 —— 两处各写一遍就会分叉。
+    const verdict = classifyOutboxRecord(rec);
+    if (verdict.unclassified) { unclassified.push({ file: f, why: verdict.why }); continue; }
+    if (verdict.state === "pending") pending += 1;
   }
   // **files 是这个目录里全部 JSON 的文件名**，不只是待发那些。
   // 抑制的 CAS 要用它：只比"待发集合"的话，一个坏 JSON 对 CAS 完全不可见 ——

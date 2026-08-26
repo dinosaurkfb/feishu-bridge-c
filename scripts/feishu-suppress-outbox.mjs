@@ -19,27 +19,33 @@
  *
  * 用法：
  *   node scripts/feishu-suppress-outbox.mjs --project /abs/dir
- *   node scripts/feishu-suppress-outbox.mjs --project /abs/dir --apply --reason "话题属于旧应用"
+ *   node scripts/feishu-suppress-outbox.mjs --project /abs/dir --apply \\
+ *     --expect-digest <预览打印的摘要> --reason "话题属于旧应用"
+ *
+ * **--apply 必须带 --expect-digest**：那个值只能来自预览输出。
+ * 在这里现算等于没有跨进程保护 —— 预览之后新进来的内容会被一起永久停掉。
  */
 
 import path from "node:path";
 
 import { isDirectRun } from "./direct-run.mjs";
-import { listPending, suppressRecords } from "./outbox.mjs";
+import { outboxMutationBlocker, readOutboxSnapshot } from "./outbox.mjs";
 import { groupByTargetGeneration, outboxDirOf } from "./drain-outbox.mjs";
 import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { topicGenerationLockDir } from "./topic-generation-store.mjs";
 import { currentBinding } from "./feishu-control.mjs";
 import {
-  applySuppressionCore, corruptTargets, dependsOnMapping,
+  applySuppressionCore, corruptTargets, dependsOnMapping, suppressionDigest,
   generationTargetState, usableGeneration,
 } from "./suppress-outbox-core.mjs";
 
 const nonEmptyStr = (v) => typeof v === "string" && v.length > 0;
 
 const FLAGS = new Set(["apply"]);
-const OPTIONS = new Set(["project", "session", "reason", "generation", "expect-generation"]);
+const OPTIONS = new Set([
+  "project", "session", "reason", "generation", "expect-generation", "expect-digest",
+]);
 
 /** 严格白名单：拼错的参数不许被执行成另一种操作。 */
 function parseArgs(tokens) {
@@ -126,7 +132,8 @@ export function selectByGeneration(records, generation, mapping) {
  * 且不动代际），所以不会死锁。
  */
 export function applySuppression({
-  outboxDir, root, session = null, pending, generation, previewGenerationId = null, reason,
+  outboxDir, root, session = null, pending, generation,
+  previewDigest = null, previewGenerationId = null, reason,
 }) {
   // 判据在 suppress-outbox-core 里，两条链路共用。这里只回答三个本地问题：
   // 锁在哪、锁内怎么重读、这批要选哪些。
@@ -137,7 +144,7 @@ export function applySuppression({
     publishLockDir: path.join(root, ".runtime-data", "outbound", "publish.lock"),
     generationLockDir: needsGeneration
       ? topicGenerationLockDir({ source: binding?.source, root }) : null,
-    pending, previewGenerationId, reason,
+    pending, previewDigest, previewGenerationId, reason,
     readState: () => {
       const resolved = resolveProject({ root, claudeSessionId: session });
       const freshMapping = resolved.ok ? resolved.mapping : null;
@@ -149,6 +156,19 @@ export function applySuppression({
     },
   });
 }
+
+
+/**
+ * 打印用的单行文本。**outbox 正文是模型生成的**，而这个预览服务于一个
+ * 不可逆决定 —— 一段内容不该能清屏、移光标、伪造后面的行。
+ * 控制符换成可见占位符：**"这里原本有东西"本身是信息**。
+ */
+const sanitizeLine = (v, width = 72) => {
+  const flat = String(v ?? "")
+    .replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]|\p{Bidi_Control}/gu, "\uFFFD")
+    .replace(/\s+/gu, " ").trim();
+  return flat.length <= width ? (flat || "(空)") : flat.slice(0, width) + "…";
+};
 
 function main() {
   const parsed = parseArgs(process.argv.slice(2));
@@ -168,7 +188,36 @@ function main() {
   // **默认只停某一个代际。**诊断是针对某个话题代际给出的，而 outbox 里可能同时
   // 躺着别的代际的待发内容 —— 一刀切会把不相干的一起永久停掉。
   // 不给 --generation 就要求显式确认范围是"全部"。
-  const all = listPending({ outboxDir });
+  // **这个 outbox 现在能不能动 —— 只认统一守卫。**
+  //
+  // 预览必须跟执行给出同一个结论：只在核心那层挡，人看完预览再去 --apply
+  // 才撞上拒绝，而预览正是他用来做决定的那一步。
+  //
+  // **整个预览只读这一次盘。**审计、待发选择、逐条展示、摘要 —— 全部消费
+  // 下面这一份快照。曾经这里读三遍（审计一遍、listPending 一遍、算摘要再一遍），
+  // 评审在其中两次读之间做同名替换：**人看到 A，摘要绑的是 B**。
+  const snap = readOutboxSnapshot(outboxDir);
+  if (!snap.ok) {
+    console.error(snap.reason === "outbox_not_a_directory"
+      ? "outbox 那个路径不是目录" : "outbox 读不出来");
+    process.exitCode = 1;
+    return;
+  }
+  const blocked = outboxMutationBlocker(snap.audit);
+  if (blocked) {
+    console.error({
+      outbox_unreadable: "outbox 读不出来",
+      outbox_not_a_directory: "outbox 那个路径不是目录",
+      outbox_unclassified: "outbox 里有 " + blocked.count + " 个文件归不了类",
+      outbox_unexplainable: "outbox 里有 " + blocked.count + " 条记录解释不了",
+    }[blocked.reason] ?? ("outbox 有问题（" + blocked.reason + "）"));
+    for (const d of blocked.details ?? []) console.error("  " + d.file + " —— " + d.why);
+    console.error("**说不清目录里有什么，就不能做不可逆的事** —— 一条都没有动。");
+    process.exitCode = 1;
+    return;
+  }
+
+  const all = snap.records;
   // **跟排空用同一套代际解析。**直接按 r.target_channel_generation_id 过滤会漏掉
   // 旧格式记录 —— 它们没有这个字段，排空时被归入当前有效代际（__legacy_active__），
   // 于是按诊断给的代际 id 来筛，一条都筛不到。
@@ -180,7 +229,30 @@ function main() {
   // 缺省时由核心拒绝（generation_expectation_required），这里只负责解析和显示。
   const nowGeneration = activeGenerationOf(mapping);
   const expectGeneration = parsed.seen.get("expect-generation") ?? null;
+
+  // **让人看见他将要停掉的到底是哪几条。**
+  //
+  // 上一版预览只报"待发 N 条"—— 而摘要是在这一刻现算的。
+  // 于是存在这条路径：查看器展示了记录 A → A 被等量替换成 B →
+  // 抑制预览仍显示"1 条"、为 B 生成新摘要 → 人照抄摘要 →
+  // **B 被永久抑制，而他从没看过 B**。
+  // 摘要防住了"预览之后变化"，却证明不了"摘要对应人审阅过的内容"。
+  //
+  // 所以预览把每一条摊开，摘要从**同一份快照**产出：人看到什么，摘要就绑什么。
+  console.log("");
+  console.log("将要停掉的是这几条：");
+  for (const [i, r] of pending.entries()) {
+    const name = String(r?._file ?? "").split("/").pop();
+    const line = sanitizeLine(r?.text);
+    console.log("  " + String(i + 1).padStart(2) + ". " + name +
+      "  [" + sanitizeLine(r?.kind) + "]  " + (r?.created_at ?? "时间不明"));
+    console.log("      " + line);
+  }
+  console.log("");
   const needsExpect = dependsOnMapping(pending);
+  // 预览要显示的摘要。**只在预览路径上算**，--apply 走命令行带回来的那份。
+  // 文件集合和每条的字节都来自上面那一份快照 —— **这里不再读盘**。
+  const previewDigest = suppressionDigest({ files: snap.files, records: pending });
 
   console.log("项目      " + root);
   console.log("范围      " + (generation === null
@@ -212,6 +284,11 @@ function main() {
       console.log("先确认这几条记录是怎么写坏的 —— 说不清它该发去哪，就不能替它决定不发。");
       return;
     }
+    // **摘要在预览这一步产生，人复制它过去。**在 --apply 时现算等于没有守卫。
+    console.log("落盘要带上这批的摘要：");
+    console.log("  --apply --expect-digest " + previewDigest);
+    console.log("**它绑住了目录里全部文件、以及每条待处置记录的字节** ——");
+    console.log("预览之后哪怕只新进来一条，落盘也会中止，而不是把你没见过的东西一起停掉。");
     if (needsExpect && !usableGeneration(nowGeneration)) {
       // **不许打印一个能复制的假值。**上一版这里印 `<读不出代际>`，人照抄之后
       // 它当然对不上，于是被报成"发生轮转" —— 而根本没轮转，是代际读不出来。
@@ -230,10 +307,22 @@ function main() {
 
   const r = applySuppression({
     outboxDir, root, session, pending, generation,
+    // **只从命令行拿。**这里现算等于没有跨进程保护。
+    previewDigest: parsed.seen.get("expect-digest") ?? null,
     previewGenerationId: expectGeneration, reason });
   if (!r.ok) {
     console.error(
-      r.reason === "publisher_busy"
+      r.reason === "digest_expectation_required"
+        ? "落盘必须带 --apply --expect-digest <预览打印的摘要>。\n" +
+          "  **不带它就没有跨进程保护** —— 预览之后新进来的内容会被一起永久停掉。"
+      : r.reason === "digest_mismatch"
+        ? "预览之后这批变过了（摘要对不上），**一条都没有动**。\n" +
+          "  期望 " + r.expected + "，现在是 " + r.actual + "。\n" +
+          "  重新跑一次预览，确认现在这批确实是你要停的，再用新摘要落盘。"
+      : r.reason === "outbox_unclassified" || r.reason === "outbox_unexplainable"
+        ? "outbox 里有 " + r.count + " 处说不清（" + (r.files ?? []).join("、") +
+          "）—— **说不清目录里有什么，就不能做不可逆的事**，一条都没有动。"
+      : r.reason === "publisher_busy"
         ? "发布器正忙，稍后再试 —— 不在它发的时候动 outbox。"
       : r.reason === "rotation_busy"
         ? "话题正在轮转，稍后再试 —— 轮转会改变待发内容属于哪一代。"

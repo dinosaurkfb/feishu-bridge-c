@@ -14,7 +14,14 @@
  * 各自只提供自己的路径和"锁内怎么重读"。
  */
 
-import { listPending, suppressRecords } from "./outbox.mjs";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+
+import {
+  auditOutbox, listPending, outboxMutationBlocker, readOutboxSnapshot,
+} from "./outbox.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { generationTargetState, usableGeneration } from "./topic-generation.mjs";
 
@@ -54,22 +61,166 @@ export const corruptTargets = (records) =>
  * @param readState        锁内调用：() => { activeGeneration, select(records) }
  * @param reason           抑制理由，写进记录
  */
+/**
+ * 把一批已经取出来的待发记录标成**永久失败**，停止重试。
+ *
+ * 为什么要有它：有一类发布失败重试再多次也不会变 —— 比如话题是另一个应用建的，
+ * 当前身份回复不进去。那种情况下每 30 分钟重试一次只是稳定地制造噪音，
+ * 而每轮 Stop 都会说一句"兜底定时器会重试"，那句话是假的。
+ *
+ * **但判定"永久"这件事由人做，不由代码做。**曾经试过自动判：诊断到"根消息属于
+ * 另一个应用"就抑制。那是**从相关性推因果** —— 一次瞬时的网络错误恰好发生在
+ * 跨应用根消息上，照样会触发不可逆的抑制。有损动作不能建立在推断出来的因果上。
+ *
+ * 所以排空只诊断并报告，这个函数只被显式的 feishu-suppress-outbox 命令调用。
+ *
+ * ■ 为什么它住在这里，而且不导出
+ *
+ * 它是**无条件的写原语**：给它一批记录，它就把它们永久停掉。
+ * 放在 outbox.mjs 公开导出时，统一守卫拒绝的记录**直接调它就能停掉** ——
+ * 守卫写在调用方那一侧，永远是"记得调的人才受约束"。
+ *
+ * 现在它是本模块私有的：外面唯一能走的路是 applySuppressionCore，
+ * 而那条路上审计、摘要、锁一个都跳不过去。
+ */
+function suppressSnapshots(snapshots, { reason }) {
+  let changed = 0;
+  const failed = [];
+  for (const snap of snapshots) {
+    const file = snap.file;
+    if (typeof file !== "string") { failed.push({ file: null, reason: "no_file_ref" }); continue; }
+    let current;
+    // **不重读盘。**用的就是算摘要时那一份字节 ——
+    // "算摘要读一次、写回再读一次"之间的窗口里，别的写方能改掉这条记录的语义，
+    // 而摘要已经核对过了。读一次、之后全用这一份，窗口才真的没有。
+    try { current = JSON.parse(snap.raw.toString("utf-8")); } catch {
+      // **不可逆操作不能静默漏项。**读不出来就是没停成，必须进 failed ——
+      // 否则调用方会以为整批都停了，而漏掉的那条继续每 30 分钟重试。
+      failed.push({ file, reason: "unreadable" });
+      continue;
+    }
+    // 已发出/已抑制不算漏项：目标状态已经达到。
+    if (current.published_at !== null || current.publish_suppressed_at) continue;
+    const next = {
+      ...current,
+      publish_eligible_at: null,
+      publish_suppressed_at: new Date().toISOString(),
+      publish_suppressed_reason: String(reason ?? "permanent_publish_failure").slice(0, 200),
+    };
+    try {
+      const tmp = file + ".tmp." + randomUUID();
+      fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+      fs.renameSync(tmp, file);
+      changed += 1;
+    } catch (err) {
+      // **不许半写后抛。**上一版第二条不可写时直接抛出去：前面几条已经被永久抑制，
+      // 调用方却只收到一个异常 —— 它不知道自己已经改掉了多少东西。
+      // 返回结构化的部分失败，让调用方能如实报"停了几条、几条没停成"。
+      failed.push({ file, reason: String(err.code ?? err.message).slice(0, 60) });
+    }
+  }
+  return { ok: failed.length === 0, changed, failed };
+}
+
+/**
+ * 这一批的**稳定摘要**。预览打印它，`--apply` 必须原样带回来。
+ *
+ * ■ 为什么不能在 apply 时现算
+ *
+ * 预览和 --apply 是两次独立运行。在 apply 时现算，第二个进程算出的是
+ * "现在"的值，跟自己一比总是相等 —— **而"预览之后世界变了"恰恰只可能
+ * 跨进程发生**，于是守卫只覆盖进程内窗口，等于没有。
+ * 这条线上同一个错误犯过三次（previewGenerationId、previewFiles、以及
+ * 以为已经修好的那次），所以摘要的值只能来自人手里那份预览输出。
+ *
+ * ■ 为什么绑原始字节，而不是挑几个字段
+ *
+ * 手挑字段的错误模式是**"想不到的那个字段"**：曾经挑了
+ * id/kind/created_at/目标代际/正文，漏了 publish_eligible_at ——
+ * 把它从 null 改成合法时间之后**摘要一模一样**，旧摘要照样落盘，
+ * 抑制了一条语义已经变了的记录。补一个还有下一个。
+ *
+ * 绑**整个文件的字节**：任何字段的任何改动都会让摘要变掉，不需要有人预先想全。
+ * 文件名用 basename —— 摘要不能因为临时目录不同而变。
+ */
+export function suppressionDigest({ outboxDir = null, files = [], records = [] } = {}) {
+  const nameOf = (r) => path.basename(String(r?._file ?? ""));
+  const snapshots = records.map((r) => {
+    const name = nameOf(r);
+    const file = r?._file ?? (outboxDir ? path.join(outboxDir, name) : null);
+    // **优先用记录自带的那份字节。**
+    //
+    // 快照（readOutboxSnapshot）已经把原始字节挂在 `_raw` 上了；
+    // 在这里重新读盘就等于"渲染看一份、摘要看另一份"——
+    // 评审在两次读之间做同名替换，**人看到 A、摘要绑的是 B**。
+    // 只有在调用方给不出字节时才回落到读盘。
+    let raw = r?._raw;
+    if (!raw) {
+      try { raw = fs.readFileSync(file); }
+      catch {
+        // 读不出来 → 一个不可能跟真实内容相撞的标记，让摘要必然变化。
+        raw = Buffer.from("\u0000unreadable\u0000" + name);
+      }
+    }
+    return { name, file, raw };
+  });
+  return digestOfSnapshots(files, snapshots);
+}
+
+/**
+ * 摘要的**唯一算法**。锁内那次读到的字节直接喂给它，不再为算摘要重读一遍 ——
+ * "算摘要读一次、写回再读一次"之间的窗口正是要防的地方。
+ */
+function digestOfSnapshots(files, snapshots) {
+  const h = createHash("sha256");
+  h.update("v1\nfiles\n");
+  for (const f of [...files].sort()) h.update(String(f) + "\n");
+  h.update("records\n");
+  for (const snap of [...snapshots].sort((a, b) => (a.name < b.name ? -1 : 1))) {
+    h.update(snap.name + "\u0000");
+    h.update(createHash("sha256").update(snap.raw).digest("hex"));
+    h.update("\n");
+  }
+  return "sup-" + h.digest("hex").slice(0, 24);
+}
+
+/** 摘要的形状。**在拿锁之前就要验** —— 纯空白不是"没给"，但也不是有效值。 */
+const DIGEST_SHAPE = /^sup-[0-9a-f]{24}$/u;
+
 export function applySuppressionCore({
   outboxDir, publishLockDir, generationLockDir, pending,
+  // 预览打印、由人原样带回来的摘要。**必填** —— 跟 previewGenerationId 同一条
+  // 道理：在这里现算就只覆盖进程内窗口，而要防的事只发生在两次运行之间。
+  previewDigest = null,
   previewGenerationId = null, readState, reason,
 }) {
-  // **损坏记录：一条都不许动，锁一把都不拿。**
+  // **说不清就一条都不动，锁一把都不拿。**
   //
-  // 它的目标代际字段在、但不是可用代际。当成 legacy 去重新解释等于替它猜一个
-  // 目标；当成 frozen 放行则是拿一个说不清的值当"已冻结"——
+  // 这里用的是**跟锁内同一个守卫**，不是第二份判据 ——
+  // 同一个函数在两个时点各跑一次：这一次省掉"明显不该动时还去拿两把锁"，
+  // 锁内那一次才是有约束力的那道（它看的是"此刻"的目录状态）。
+  //
+  // 目标代际"字段在、但不是可用代际"也归它：当成 legacy 去重新解释等于替它
+  // 猜一个目标；当成 frozen 放行则是拿一个说不清的值当"已冻结"——
   // 两条路都会不可逆地停掉一条我们其实不知道该发去哪的内容。
-  // 这一批里只要有一条坏的，整批都不动：混着抑制会让人以为"那批都处理了"。
-  const corrupt = corruptTargets(pending);
-  if (corrupt.length > 0) {
-    return { ok: false, reason: "corrupt_target_generation",
-      count: corrupt.length, files: corrupt.map((r) => r?._file ?? null) };
-  }
+  // 这一批里只要有一条说不清，整批都不动：混着抑制会让人以为"那批都处理了"。
+  const early = outboxMutationBlocker(auditOutbox(outboxDir));
+  if (early) return { ok: false, ...early };
   const needsGeneration = dependsOnMapping(pending);
+  // **代际那条前置先判**：它更具体（只在有旧格式记录时才需要），
+  // 让摘要那条盖住它的话，人看到的是"去补摘要"，补完才发现真正缺的是代际。
+  // 两条都在拿锁之前 —— **缺前提不是并发问题，别报成取锁失败**。
+  if (needsGeneration) {
+    if (!nonEmpty(generationLockDir)) return { ok: false, reason: "binding_unresolved" };
+    if (!usableGeneration(previewGenerationId)) {
+      return { ok: false, reason: "generation_expectation_required" };
+    }
+  }
+  // 验的是**形状**，不是"非空"：纯空白 "   " 长度是 3，只查 length 会让它
+  // 一路穿过去开始取锁，最后报 publisher_busy —— 缺前提被报成并发问题。
+  if (typeof previewDigest !== "string" || !DIGEST_SHAPE.test(previewDigest)) {
+    return { ok: false, reason: "digest_expectation_required" };
+  }
   // **这批里有旧格式记录 → 必须带着预览看到的代际来落盘。这条前置条件属于核心，
   // 不属于哪个 CLI。**
   //
@@ -80,18 +231,6 @@ export function applySuppressionCore({
   // 包装层负责解析和显示 --expect-generation，但不许决定它可不可以不给。
   let genLock = null;
   if (needsGeneration) {
-    // 有旧格式记录却说不清该跟哪一把锁串行 —— **明确拒绝**，
-    // 不许退而求其次去拿一把猜出来的锁碰运气。
-    // 这条排在 expectation 之前：连绑定都解析不出来时，"缺预览代际"是个
-    // 派生症状，报它会盖住真正的原因。
-    if (!nonEmpty(generationLockDir)) return { ok: false, reason: "binding_unresolved" };
-    // 到这儿说明代际这个概念是成立的 —— 那就必须带着预览看到的那一代来。
-    // 空白串也算没给。放它过去的话，它会在下面被判成 rotated
-    // （from: "   "）—— 结果同样是零抑制，但报出来的原因是错的：
-    // 那不是"世界变了"，那是"这个值根本不是代际"。
-    if (!usableGeneration(previewGenerationId)) {
-      return { ok: false, reason: "generation_expectation_required" };
-    }
     const got = acquirePublishLock(generationLockDir);
     // 轮转正在进行 → 现在不是动 outbox 的时候。
     if (!got.ok) return { ok: false, reason: "rotation_busy" };
@@ -114,7 +253,15 @@ export function applySuppressionCore({
       return { ok: false, reason: "rotated",
         from: previewGenerationId, to: state.activeGeneration ?? null };
     }
-    const fresh = state.select(listPending({ outboxDir }));
+    // **锁内只读这一次盘** —— 审计、选择、摘要、写回全用这一份字节。
+    const snap = readOutboxSnapshot(outboxDir);
+    if (!snap.ok) return { ok: false, reason: snap.reason, files: [] };
+    // 能不能动，只认统一守卫；判据跟只读视图共用一份。
+    const blocked = outboxMutationBlocker(snap.audit);
+    if (blocked) return { ok: false, ...blocked };
+
+    // 代际选择仍归调用方 —— 快照函数不接 selector 回调，那是另一件事。
+    const fresh = state.select(snap.records);
     // **锁内重读之后要再判一次损坏，不能只比文件名。**
     //
     // 锁外那次判的是预览快照。同一个文件的目标代际在预览之后变坏时，
@@ -134,7 +281,19 @@ export function applySuppressionCore({
     const now = new Set(fresh.map((x) => x._file));
     const same = before.size === now.size && [...before].every((f) => now.has(f));
     if (!same) return { ok: false, reason: "drift", before: before.size, now: now.size };
-    return { ok: true, done: suppressRecords(fresh, { reason }) };
+
+    // 字节来自上面那一次读 —— **这里不再读盘**。
+    const snapshots = fresh.map((r) => ({
+      name: path.basename(String(r._file)), file: r._file, raw: r._raw }));
+    // 锁内重算，跟人带回来的那份比。**这一步才是真正的跨进程 CAS** ——
+    // 文件集合、每条的字节只要有一点跟预览时不同就中止，
+    // 包括"预览之后新进来一条"这种待发集合比较看不出来的情况。
+    const nowDigest = digestOfSnapshots(snap.files, snapshots);
+    if (nowDigest !== previewDigest) {
+      return { ok: false, reason: "digest_mismatch",
+        expected: previewDigest, actual: nowDigest };
+    }
+    return { ok: true, done: suppressSnapshots(snapshots, { reason }) };
   } finally {
     releasePublishLock(publishLockDir);
     if (genLock !== null) releasePublishLock(genLock);

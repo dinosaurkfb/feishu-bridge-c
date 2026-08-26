@@ -16,15 +16,19 @@
  *
  * 用法：
  *   node scripts/codex/suppress-outbox.mjs --thread-id <id> --generation <代际 id>
- *   node scripts/codex/suppress-outbox.mjs --task-key <key> --all-generations --apply --reason "..."
+ *   node scripts/codex/suppress-outbox.mjs --task-key <key> --all-generations --apply \\
+ *     --expect-digest <预览打印的摘要> --reason "..."
+ *
+ * **--apply 必须带 --expect-digest**：那个值只能来自预览输出。
+ * 在这里现算等于没有跨进程保护 —— 预览之后新进来的内容会被一起永久停掉。
  */
 
 import path from "node:path";
 
 import { isDirectRun } from "../direct-run.mjs";
-import { listPending } from "../outbox.mjs";
+import { outboxMutationBlocker, readOutboxSnapshot } from "../outbox.mjs";
 import {
-  applySuppressionCore, corruptTargets, dependsOnMapping,
+  applySuppressionCore, corruptTargets, dependsOnMapping, suppressionDigest,
   generationTargetState, usableGeneration,
 } from "../suppress-outbox-core.mjs";
 import { activeGeneration, pendingGeneration } from "../topic-generation.mjs";
@@ -34,7 +38,10 @@ import {
 } from "./state.mjs";
 
 const FLAGS = new Set(["apply", "all-generations"]);
-const OPTIONS = new Set(["task-key", "thread-id", "generation", "reason", "expect-generation"]);
+const OPTIONS = new Set([
+  "task-key", "thread-id", "generation", "reason",
+  "expect-generation", "expect-digest",
+]);
 
 /**
  * 参数之间的硬约束。**有损操作的默认值不该是"最大范围"。**
@@ -147,6 +154,19 @@ export function locateTask({ threadId, taskKey, home }) {
   return { ok: true, task: hits[0] };
 }
 
+
+/**
+ * 打印用的单行文本。**outbox 正文是模型生成的**，而这个预览服务于一个
+ * 不可逆决定 —— 一段内容不该能清屏、移光标、伪造后面的行。
+ * 控制符换成可见占位符：**"这里原本有东西"本身是信息**。
+ */
+const sanitizeLine = (v, width = 72) => {
+  const flat = String(v ?? "")
+    .replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]|\p{Bidi_Control}/gu, "\uFFFD")
+    .replace(/\s+/gu, " ").trim();
+  return flat.length <= width ? (flat || "(空)") : flat.slice(0, width) + "…";
+};
+
 function main() {
   const parsed = parseArgs(process.argv.slice(2));
   if (!parsed.ok) {
@@ -189,7 +209,36 @@ function main() {
   }
 
   const paths = taskPaths(task, home);
-  const all = listPending({ outboxDir: paths.outbox });
+  // **这个 outbox 现在能不能动 —— 只认统一守卫。**
+  //
+  // 预览必须跟执行给出同一个结论：只在核心那层挡，人看完预览再去 --apply
+  // 才撞上拒绝，而预览正是他用来做决定的那一步。
+  //
+  // **整个预览只读这一次盘。**审计、待发选择、逐条展示、摘要 —— 全部消费
+  // 下面这一份快照。曾经这里读三遍（审计一遍、listPending 一遍、算摘要再一遍），
+  // 评审在其中两次读之间做同名替换：**人看到 A，摘要绑的是 B**。
+  const snap = readOutboxSnapshot(paths.outbox);
+  if (!snap.ok) {
+    console.error(snap.reason === "outbox_not_a_directory"
+      ? "outbox 那个路径不是目录" : "outbox 读不出来");
+    process.exitCode = 1;
+    return;
+  }
+  const blocked = outboxMutationBlocker(snap.audit);
+  if (blocked) {
+    console.error({
+      outbox_unreadable: "outbox 读不出来",
+      outbox_not_a_directory: "outbox 那个路径不是目录",
+      outbox_unclassified: "outbox 里有 " + blocked.count + " 个文件归不了类",
+      outbox_unexplainable: "outbox 里有 " + blocked.count + " 条记录解释不了",
+    }[blocked.reason] ?? ("outbox 有问题（" + blocked.reason + "）"));
+    for (const d of blocked.details ?? []) console.error("  " + d.file + " —— " + d.why);
+    console.error("**说不清目录里有什么，就不能做不可逆的事** —— 一条都没有动。");
+    process.exitCode = 1;
+    return;
+  }
+
+  const all = snap.records;
   const pending = selectByGeneration(all, generation, task);
   // **预览看到的代际必须由人带进来。**
   //
@@ -208,7 +257,30 @@ function main() {
   console.log("待发      " + pending.length + " 条" +
     (generation === null ? "" : "（本代际）／全部 " + all.length + " 条"));
   console.log("理由      " + reason);
+
+  // **让人看见他将要停掉的到底是哪几条。**
+  //
+  // 上一版预览只报"待发 N 条"—— 而摘要是在这一刻现算的。
+  // 于是存在这条路径：查看器展示了记录 A → A 被等量替换成 B →
+  // 抑制预览仍显示"1 条"、为 B 生成新摘要 → 人照抄摘要 →
+  // **B 被永久抑制，而他从没看过 B**。
+  // 摘要防住了"预览之后变化"，却证明不了"摘要对应人审阅过的内容"。
+  //
+  // 所以预览把每一条摊开，摘要从**同一份快照**产出：人看到什么，摘要就绑什么。
+  console.log("");
+  console.log("将要停掉的是这几条：");
+  for (const [i, r] of pending.entries()) {
+    const name = String(r?._file ?? "").split("/").pop();
+    const line = sanitizeLine(r?.text);
+    console.log("  " + String(i + 1).padStart(2) + ". " + name +
+      "  [" + sanitizeLine(r?.kind) + "]  " + (r?.created_at ?? "时间不明"));
+    console.log("      " + line);
+  }
+  console.log("");
   const needsExpect = dependsOnMapping(pending);
+  // 预览要显示的摘要。**只在预览路径上算**，--apply 走命令行带回来的那份。
+  // 文件集合和每条的字节都来自上面那一份快照 —— **这里不再读盘**。
+  const previewDigest = suppressionDigest({ files: snap.files, records: pending });
 
   if (pending.length === 0) { console.log("\n没有待发内容，无需改动。"); return; }
   if (generation === null && all.length > 1) {
@@ -231,6 +303,11 @@ function main() {
       console.log("先确认这几条记录是怎么写坏的 —— 说不清它该发去哪，就不能替它决定不发。");
       return;
     }
+    // **摘要在预览这一步产生，人复制它过去。**在 --apply 时现算等于没有守卫。
+    console.log("落盘要带上这批的摘要：");
+    console.log("  --apply --expect-digest " + previewDigest);
+    console.log("**它绑住了目录里全部文件、以及每条待处置记录的字节** ——");
+    console.log("预览之后哪怕只新进来一条，落盘也会中止，而不是把你没见过的东西一起停掉。");
     if (needsExpect && !usableGeneration(nowGeneration)) {
       // **不许打印一个能复制的假值。**上一版这里印 `<读不出代际>`，人照抄之后
       // 它当然对不上，于是被报成"发生轮转" —— 而根本没轮转，是代际读不出来。
@@ -256,7 +333,10 @@ function main() {
     publishLockDir: paths.publishLock,
     // Codex 侧的代际状态住在 registry 里，跟轮转共用 registry.lock。
     generationLockDir: path.join(home, "registry.lock"),
-    pending, previewGenerationId: expectGeneration, reason,
+    pending,
+    // **只从命令行拿。**这里现算等于没有跨进程保护。
+    previewDigest: parsed.seen.get("expect-digest") ?? null,
+    previewGenerationId: expectGeneration, reason,
     // **锁内重新定位，不用锁外那个 task。**闭包旧值的话，
     // "锁内重读"就只是句好听的话 —— 轮转检查会拿着过期的代际去比。
     readState: () => {
@@ -272,7 +352,17 @@ function main() {
   // **退出码和输出都在锁释放之后。**锁内 process.exit 会跳过 finally —— 那个坑踩过两次。
   if (!r.ok) {
     console.error(
-      r.reason === "publisher_busy" ? "发布器正忙，稍后再试 —— 不在它发的时候动 outbox。"
+      r.reason === "digest_expectation_required"
+        ? "落盘必须带 --apply --expect-digest <预览打印的摘要>。\n" +
+          "  **不带它就没有跨进程保护** —— 预览之后新进来的内容会被一起永久停掉。"
+      : r.reason === "digest_mismatch"
+        ? "预览之后这批变过了（摘要对不上），**一条都没有动**。\n" +
+          "  期望 " + r.expected + "，现在是 " + r.actual + "。\n" +
+          "  重新跑一次预览，确认现在这批确实是你要停的，再用新摘要落盘。"
+      : r.reason === "outbox_unclassified" || r.reason === "outbox_unexplainable"
+        ? "outbox 里有 " + r.count + " 处说不清（" + (r.files ?? []).join("、") +
+          "）—— **说不清目录里有什么，就不能做不可逆的事**，一条都没有动。"
+      : r.reason === "publisher_busy" ? "发布器正忙，稍后再试 —— 不在它发的时候动 outbox。"
       : r.reason === "rotation_busy" ? "话题正在轮转，稍后再试 —— 轮转会改变待发内容属于哪一代。"
       : r.reason === "rotated"
         ? "预览之后话题轮转过（" + String(r.from).slice(0, 12) + "… → " +

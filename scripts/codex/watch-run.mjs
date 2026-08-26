@@ -2,9 +2,13 @@
 /** 一次性 watcher：确认 Codex run 终局、兜底入队、按发布合同处理并释放 task 锁。 */
 
 import { readClaim, recordClaimState } from "../claim.mjs";
+import {
+  eligibilityBudgetMs, settleEligibilityPending, settleOwnEligibility,
+} from "../eligibility-recovery.mjs";
 import { releaseSessionLock } from "../handoff.mjs";
 import {
-  appendEvent, markPublishEligibleByEventKey, MAX_REPLY_CHARS, suppressPublishByEventKey,
+  appendEvent, codexReplyEventKey, markPublishEligibleByEventKey, MAX_REPLY_CHARS,
+  suppressPublishByEventKey,
 } from "../outbox.mjs";
 import { readCodexRunOutcome } from "./handoff.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
@@ -36,9 +40,36 @@ const run = {
   errPath: paths.runs + "/" + key + ".stderr.log",
   lastMessagePath: paths.runs + "/" + key + ".last-message.txt",
 };
-const eventKey = "codex:" + task.codex_thread_id + ":claim:" + key + ":reply";
+const eventKey = codexReplyEventKey({ threadId: task.codex_thread_id, claimKey: key });
 const acceptedClaim = readClaim({ claimsDir: paths.claims, key });
 const targetGenerationId = acceptedClaim?.origin_channel_generation_id ?? null;
+// **上一轮卡住的资格，在这里补上 —— 而且要等到有结论。**
+//
+// 提升取不到发布锁时（publisher_busy）watcher 只记一个 eligibility_pending 就退了；
+// 没人消费的话那条答复再没有任何路径获得资格。
+//
+// **这里必须用有界的那个消费者，不能只扫一次。**评审实测：只扫一次时，
+// 启动这一刻若撞上 publisher_busy，而随后这一轮**自己**的资格直接拿到了成功，
+// 就再也不会进 settleOwnEligibility 那个分支 —— 旧标记继续留着、旧答复仍无资格，
+// 若没有下一条入站消息，就再无消费者。
+// 共用截止时间只保护"自己刚写的标记"，保护不了历史标记。
+//
+// **必须在拿发布锁之前跑** —— 它内部要拿那把锁，锁内调会自己卡死自己。
+const recovered = settleEligibilityPending({
+  claimsDir: paths.claims, outboxDir: paths.outbox,
+  publishLockDir: paths.publishLock, threadId: task.codex_thread_id,
+  budgetMs: eligibilityBudgetMs(process.env.FEISHU_BRIDGE_ELIGIBILITY_BUDGET_MS) });
+if (!recovered.ok) {
+  // 读不出 claims 目录跟"一条都没有"长得一样，含义却相反 —— 说出来。
+  console.error("claims 目录读不出来（" + recovered.reason + "），这一轮没法确认有没有卡住的资格。");
+} else {
+  for (const r of recovered.recovered) console.error("补回发布资格：" + r.key + "（" + r.reason + "）");
+  for (const r of recovered.pending) {
+    console.error("资格仍卡住：" + r.key + "（" + r.reason + (r.why ? "：" + r.why : "") + "）");
+  }
+  for (const r of recovered.unusable) console.error("恢复标记看不懂，没动：" + r.key + " —— " + r.unusable);
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const started = Date.now();
 const MAX_WAIT_MS = 4 * 60 * 60 * 1000;
@@ -79,7 +110,51 @@ try {
         runId: key,
       });
       // Stop 只保存入站答复；四项终局证据齐全后，watcher 才允许它自动发布。
-      markPublishEligibleByEventKey({ outboxDir: paths.outbox, eventKey });
+      // **锁是必需的**：资格提升跟抑制改的是同一条记录的语义，
+      // 不共用一把锁就会出现"抑制读完快照、写回之前资格被改掉"的窗口。
+      const promoted = markPublishEligibleByEventKey({
+        outboxDir: paths.outbox, eventKey, publishLockDir: paths.publishLock });
+      // **自己新加的失败模式，得自己接住 —— 而且要接到有结论为止。**
+      //
+      // 加锁之后 publisher_busy 成了真实路径：这里只重试约 720ms，
+      // 竞争方却会持锁做真实网络发布，默认可达 12 秒。
+      // 光记一个 eligibility_pending 就退出是不够的 —— 那要等到**下一条入站消息**
+      // 触发下一个 watcher 才会被扫到，中间这条答复一直卡着。
+      let settled = promoted;
+      if (!promoted.ok) {
+        // 先落标记：先写证据再重试，中途崩掉也还有人能接着管。
+        recordClaimState({
+          claimsDir: paths.claims, key, state: "eligibility_pending",
+          detail: { run_state: "completed", promote_failed: promoted.reason ?? "unknown",
+            event_key: eventKey },
+        });
+        // 自己扫到有结论为止。只对 publisher_busy 重试 —— 别的失败多等也不会变好。
+        // 标记不在了要去问记录本身：可能是另一个恢复器先做完了。
+        const settled_ = settleOwnEligibility({
+          claimsDir: paths.claims, outboxDir: paths.outbox,
+          publishLockDir: paths.publishLock, threadId: task.codex_thread_id, claimKey: key,
+          // 预算解析只有一份判据 —— 有限安全整数、有上限、不合规回落默认值。
+          budgetMs: eligibilityBudgetMs(process.env.FEISHU_BRIDGE_ELIGIBILITY_BUDGET_MS),
+        });
+        // **报出来的原因要是复查之后的原因。**只认 recovered 的话，
+        // 复查时变成 event_not_found / record_unclassified / claims_unreadable，
+        // 最终仍会照最初那个 publisher_busy 去报告。
+        settled = settled_;
+      }
+      if (!settled.ok) {
+        // **真实原因要说出来。**只渲染 reason 的话最终只会说 marker_unusable，
+        // 而人真正需要知道的是"缺 event_key"这种具体的那句。
+        const why = (settled.reason ?? "说不清") + (settled.why ? "：" + settled.why : "");
+        appendEvent({
+          outboxDir: paths.outbox, kind: "risk",
+          text: task.task_display_name + " 的这一轮答复已经跑完，但没能取得发布资格（" +
+            why + "）。**它不会自动发出去**，需要人看一眼。",
+          source: "codex-run-watcher",
+          eventKey: "codex:" + task.codex_thread_id + ":claim:" + key + ":promote-failed",
+        });
+        process.exitCode = 1;
+        break;
+      }
       publishEligibleTaskEvents({ task, home });
       recordClaimState({
         claimsDir: paths.claims,
@@ -100,7 +175,20 @@ try {
     }
 
     // Stop 可能已经保存了一段未通过严格终局校验的答复；保留证据但永久移出发布队列。
-    suppressPublishByEventKey({ outboxDir: paths.outbox, eventKey, reason: outcome.reason });
+    const stopped = suppressPublishByEventKey({ outboxDir: paths.outbox, eventKey,
+      reason: outcome.reason, publishLockDir: paths.publishLock });
+    // **没停成就得说出来。**半成品答复留在队列里会被下一轮发出去。
+    // event_not_found 是"本来就没有要停的东西"（Stop 还没入队）—— 那是常态，不是故障。
+    if (!stopped.ok
+        && !["already_published", "event_not_found", "no_event_key"].includes(stopped.reason)) {
+      appendEvent({
+        outboxDir: paths.outbox, kind: "risk",
+        text: task.task_display_name + " 的失败答复没能移出发布队列（" +
+          (stopped.reason ?? "说不清") + "）——**它可能被发出去**，需要人看一眼。",
+        source: "codex-run-watcher",
+        eventKey: "codex:" + task.codex_thread_id + ":claim:" + key + ":suppress-failed-" + "a",
+      });
+    }
     const reasonText = failureLabel(outcome);
     appendEvent({
       outboxDir: paths.outbox,
@@ -136,7 +224,20 @@ try {
     // watcher 自己超时不等于 Codex runner 已退出。此时保留 session lock，让下一条入站通过
     // owner pid 探活继续 fail-closed；直接放锁会允许两个 resume 并发踩同一 thread。
     releaseLock = false;
-    suppressPublishByEventKey({ outboxDir: paths.outbox, eventKey, reason: "watch_timeout" });
+    const stoppedTimeout = suppressPublishByEventKey({ outboxDir: paths.outbox, eventKey,
+      reason: "watch_timeout", publishLockDir: paths.publishLock });
+    // **没停成就得说出来。**半成品答复留在队列里会被下一轮发出去。
+    // event_not_found 是"本来就没有要停的东西"（Stop 还没入队）—— 那是常态，不是故障。
+    if (!stoppedTimeout.ok
+        && !["already_published", "event_not_found", "no_event_key"].includes(stoppedTimeout.reason)) {
+      appendEvent({
+        outboxDir: paths.outbox, kind: "risk",
+        text: task.task_display_name + " 的失败答复没能移出发布队列（" +
+          (stoppedTimeout.reason ?? "说不清") + "）——**它可能被发出去**，需要人看一眼。",
+        source: "codex-run-watcher",
+        eventKey: "codex:" + task.codex_thread_id + ":claim:" + key + ":suppress-failed-" + "b",
+      });
+    }
     appendEvent({
       outboxDir: paths.outbox,
       kind: "risk",

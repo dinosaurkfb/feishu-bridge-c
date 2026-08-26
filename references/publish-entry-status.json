@@ -1,0 +1,37 @@
+{
+  "__comment": "发布路径的全部实现与直发路径登记。契约矩阵按 status 决定每行执行的契约集；publishDraft 的 importer 扫描按本表做集合相等 —— 新文件引它而不登记，测试就红。",
+  "implementations": {
+    "claude-drain": {
+      "file": "drain-outbox.mjs",
+      "status": "migrated",
+      "suite": "claude"
+    },
+    "claude-watcher": {
+      "file": "watch-and-publish.mjs",
+      "status": "legacy",
+      "suite": "claude"
+    },
+    "codex-drain": {
+      "file": "codex/drain-outbox.mjs",
+      "status": "legacy",
+      "suite": "codex"
+    },
+    "codex-eligible": {
+      "file": "codex/publish-eligible.mjs",
+      "status": "legacy",
+      "suite": "codex"
+    }
+  },
+  "direct_paths_excluded": {
+    "__why": "直接发布、不消费 outbox，各有自己的授权面 —— 计划文档 §0 明确排除",
+    "files": [
+      "bind-compose.mjs",
+      "bind-project.mjs",
+      "bind-session.mjs",
+      "codex/bind-task.mjs",
+      "codex/feishu-rotate.mjs",
+      "feishu-rotate.mjs",
+      "outbound.mjs"
+    ]
+  }
+}

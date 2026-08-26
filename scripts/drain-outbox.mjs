@@ -15,13 +15,11 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
-  MAX_AUTO_PUBLISH_ATTEMPTS, auditOutbox, composeDigest, isPermanentlyRejected, listPending,
-  markSent, outboxMutationBlocker, recordPublishFailure, retryProtection,
+  MAX_AUTO_PUBLISH_ATTEMPTS, auditOutbox, composeDigest, listPending, outboxMutationBlocker,
 } from "./outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { PUBLISH_FAILURE, classifyPublishFailure, publishDraft } from "./outbound.mjs";
-import { normalizePublishFailure, publishRetryability } from "./publish-failure.mjs";
-import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
+import { publishOutboxAttempt } from "./publish-attempt.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
 import { isLockStale } from "./handoff.mjs";
@@ -31,21 +29,10 @@ import {
   businessActivitiesForPublishedBatch, recordClaudeActivityAndMaybeRotate,
 } from "./automatic-topic-rotation.mjs";
 
-/**
- * 按目标代际分组。**导出给抑制命令共用** —— 两处各写一份解析就是分叉的开始，
- * 而且实测已经分叉过：排空把旧格式记录归入当前代际，抑制命令却按原始字段过滤，
- * 于是传诊断给出的代际 id 进去，显示"待发 0 条"。
- * **提示指向的操作做不到它说的事。**
- */
-export const groupByTargetGeneration = (records) => {
-  const groups = new Map();
-  for (const record of records) {
-    const key = record.target_channel_generation_id ?? "__legacy_active__";
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(record);
-  }
-  return [...groups.entries()];
-};
+// groupByTargetGeneration 已移居 publish-attempt.mjs（唯一一份 —— 此前
+// watcher 还私藏了一份抄写）。这里 re-export 兼容既有消费者。
+export { groupByTargetGeneration } from "./publish-attempt.mjs";
+
 
 /**
  * outbox 按**绑定**分目录，不是按项目。
@@ -90,8 +77,10 @@ export function watcherActive(root) {
 export function localOutboxMessage(r) {
   const head = r.reason === "outbox_unreadable" ? "本地 outbox 读不出来"
     : r.reason === "outbox_not_a_directory" ? "本地 outbox 那个路径不是目录"
-      : "本地 outbox 有 " + (r.count ?? 0) + " 处说不清" +
-        ((r.files ?? []).length ? "（" + r.files.join("、") + "）" : "");
+      : r.reason === "batching_mismatch" || r.reason === "batching_failed"
+        ? "切批阶段被拦下（" + (r.detail ?? r.reason) + "）"
+        : "本地 outbox 有 " + (r.count ?? 0) + " 处说不清" +
+          ((r.files ?? []).length ? "（" + r.files.join("、") + "）" : "");
   const why = (r.details ?? []).map((d) => "\n    " + d.file + " —— " + d.why).join("");
   return head + "。\n" +
     "  **这不是发布失败，是本地记录的问题** —— 重试没用，需要人看一眼。整批都没有动。" +
@@ -197,188 +186,75 @@ export function drainProject({
     return { status: "skipped", root, reason: "mapping_not_active", count: listPending({ outboxDir }).length };
   }
 
-  const lockDir = publishLockOf(root);
-  const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { status: "skipped", root, reason: lock.reason };
-
-  try {
-    // 锁内重新读一遍：刚才排队等锁的时候，别的发布者可能已经把这批发掉了。
-    // **取锁之后再审计一次** —— 锁外那次和这次之间，别人可能刚写进来一个坏文件。
-    //
-    // **读取也放在审计之后**：上一版注释写"先审计"、实际先 listPending，
-    // 空结论确实在审计之后所以不影响安全，但**注释比实现完整**这件事本身
-    // 就是下一个缺陷的入口 —— 这条线上已经因此栽过。
-    // **这个 outbox 现在能不能动 —— 只认统一守卫。
-    //
-    // 取舍是明确的：**不要静默跳过单个坏文件后把其余照发**。
-    // 对"本次选择的这一批"整批 fail-closed 并点名；
-    // 调度器本来就按项目隔离，一个项目坏掉不会拖住别的项目。
-    //
-    // **损坏的目标代际也归它管。**审计已经把"字段在、但不是可用代际"
-    // 算进不可解释里了 —— 这里再单独判一次就是同一件事的第二份判据，
-    // 而"两份判据"正是这条线上被反复罚过的东西。
-    const blocked = outboxMutationBlocker(auditOutbox(outboxDir));
-    if (blocked) return { status: "error", root, ...blocked, local: true };
-    const all = listPending({ outboxDir });
-    // **上次被永久拒绝的不再自动重试。**判据跟积压视图共用一份。
-    // 它们仍是 pending（没发出去、也没被停发）—— 只是等人看一眼，
-    // 而不是每 30 分钟再撞一次同一堵墙。停发是不可逆的，
-    // 「这次发不出去」不该顺手变成「永远别发」。
-    const held = all.filter(isPermanentlyRejected);
-    const rejected = retryRejected ? [] : held;
-    // **重试只在内存里放行，不预先改盘。**
-    //
-    // 上一版在这里就把标记清了 —— 而清标发生在 dry-run、构卡、真实发布**之前**：
-    // 评审实测 `dryRun:true + retryRejected:true` 返回 dry_run，
-    // **文件字节却已经变了、保护标记已经没了**；构卡失败或进程中断同样会把记录
-    // 重新暴露给自动发布。**预演不许改盘，保护不许提前撤。**
-    //
-    // 标记的清除移到发布成功之后 —— 而那时 markSent 本来就要重写这条记录，
-    // 所以顺手在同一次写里清掉，连额外的写都不用。
-    const pending = retryRejected ? all : all.filter((r) => !isPermanentlyRejected(r));
-    if (pending.length === 0) {
-      // **有被拒的就不能报 empty。**报 empty 会让人以为队列干净了，
-      // 而其实有内容正等着他处理 —— 一份假的「没有积压」比没有报告更坏。
-      return rejected.length === 0
-        ? { status: "empty", root }
-        : { status: "needs_attention", root, reason: "permanently_rejected",
-            count: rejected.length,
-            // **成因要一路带到视图。**落了盘却不往上传，
-            // 下一个进程照样只能把两种情形统称为"被飞书拒绝"——
-            // 而它们的下一步不同。pauseKindOf 是那份判据的唯一读法。
-            rejected: rejected.map((r) => {
-              // **读法只有投影这一份** —— 上一版在这里拼裸字段取原因，
-              // 等于绕过封闭联合又解释了一遍状态。
-              const rp = retryProtection(r);
-              return { file: path.basename(String(r._file ?? "")),
-                kind: rp.status === "paused" ? rp.kind : null,
-                why: rp.status === "paused" ? rp.reason : "未说明" };
-            }) };
-    }
-
-    const targetBatches = groupByTargetGeneration(pending).flatMap(([targetKey, records]) => {
-      const target = resolveMappingOutboundGeneration(
-        mapping,
-        targetKey === "__legacy_active__" ? null : targetKey,
-      );
-      if (!target.ok) throw new Error("冻结的出站话题代际不可用（" + target.reason + "）");
-      return outboundCardBatches(records).map((batch) => ({
-        batch,
-        target,
-        card: composeOutboundCard(batch, {
-          taskName: cfg.task_display_name,
-          runtime: "claude",
-        }),
-      }));
-    });
-    const cards = targetBatches.map((item) => item.card);
-    if (dryRun) {
-      return {
-        status: "dry_run",
-        root,
-        count: pending.length,
-        cards,
-        text: composeDigest(pending, { taskName: cfg.task_display_name }),
-      };
-    }
-
-    const messageIds = [];
-    for (const item of targetBatches) {
-      // 记住正在发哪一个目标：失败诊断要查**这一条**的根消息，
-      // 而不是 mapping.root_message_id —— 后者可能是别的代际，甚至不存在。
-      failingTarget = item.target;
-      // 记住正在发哪一批：永久拒绝要打在**这一批**的记录上，不是全部待发。
-      failingBatch = item.batch;
-      const messageId = publish({
-        profile: id.profile,
-        rootMessageId: item.target.rootMessageId,
-        card: item.card,
-        larkBin: id.bin,
-        larkHome: id.configDir,
-        expectedAppId: id.expectedAppId,
-        timeoutMs,
-      });
-      for (const activity of businessActivitiesForPublishedBatch(item.batch, {
+  // **锁内的一切交给唯一发布事务。**这里只提供 Claude 侧的四样：
+  // 怎么解析目标代际、怎么构卡、用哪个身份发、发完一批记什么账。
+  // 锁、快照、审计、候选选择、失败记账、落标全在事务里 ——
+  // 四份手写实现各漏一角的日子到此为止。
+  const r = publishOutboxAttempt({
+    outboxDir,
+    lockDir: publishLockOf(root),
+    policy: retryRejected ? "explicit_retry_paused" : "all_unpaused",
+    dryRun,
+    batchCards: outboundCardBatches,
+    resolveTarget: (generationKey) => resolveMappingOutboundGeneration(mapping, generationKey),
+    composeCard: (batch) => composeOutboundCard(batch, {
+      taskName: cfg.task_display_name, runtime: "claude",
+    }),
+    publishBatch: ({ target, card }) => publish({
+      profile: id.profile,
+      rootMessageId: target.rootMessageId,
+      card,
+      larkBin: id.bin,
+      larkHome: id.configDir,
+      expectedAppId: id.expectedAppId,
+      timeoutMs,
+    }),
+    // 记账钩子：**只记账，不否决**。轮转活动记录维持"发布之后、落标之前"的既有顺序。
+    onBatchPublished: ({ batch, target, messageId }) => {
+      for (const activity of businessActivitiesForPublishedBatch(batch, {
         messageId, runtime: "claude",
       })) {
-        recordClaudeActivityAndMaybeRotate({
+        const recorded = recordClaudeActivityAndMaybeRotate({
           root,
           claudeSessionId: resolved.claudeSessionId ?? mapping.claude_session_id ?? claudeSessionId,
-          generationId: item.target.channelGenerationId,
+          generationId: target.channelGenerationId,
           ...activity,
         });
+        // **它失败时不抛，返回 ok:false** —— 忽略返回值等于把轮转账缺口吞掉。
+        // 转成受控抛错，让事务把它归进 bookkeepingFailures（发布已成，照样落标）。
+        if (recorded && recorded.ok === false) {
+          throw new Error("轮转活动记账失败（" + (recorded.reason ?? "说不清") + "）");
+        }
       }
-      // 发布成功了才清保护标记 —— markSent 本来就要重写这条记录，同一次写里做完。
-      for (const record of item.batch) markSent(record, messageId);
-      messageIds.push(messageId);
-    }
+    },
+  });
+
+  // 入口只做入口的事：补上 root、Claude 特有的措辞素材与跨应用诊断。
+  if (r.status === "dry_run") {
     return {
-      status: "published",
-      root,
-      count: pending.length,
-      messageId: messageIds.at(-1) ?? null,
-      messageIds,
+      status: "dry_run", root, count: r.count,
+      cards: r.batches.map((item) => item.card),
+      text: composeDigest(r.selected, { taskName: cfg.task_display_name }),
     };
-  } catch (err) {
-    // 不标记、不吞掉：留在 outbox，下一个排空者重试。
-      // **只诊断，不自动抑制。**上一版的推理是"失败 + 根消息属于另一个应用 = 永久"，
-      // 那是**从相关性推因果**：瞬时的网络错误发生在跨应用根消息上，照样会触发
-      // 不可逆的抑制。有损动作不能建立在推断出来的因果上 —— 要么拿到确实表示
-      // 身份不兼容的平台错误码，要么由人显式下令。现在选后者。
-      const diagnosis = diagnose({
-        rootMessageId: failingTarget?.rootMessageId ?? null,
-        expectedAppId: id?.expectedAppId,
-        larkBin: id?.bin, larkHome: id?.configDir, profile: id?.profile,
-      });
-      // **永久拒绝要落到记录上**，否则下一轮定时排空照撞不误。
-      // 锁还在手里（catch 在 try 内、finally 之前），改的是同一条记录的语义，
-      // 跟抑制、资格提升共用这把锁 —— 满足统一写锁那条。
-      // **规范化一次，各取所需。**判定只吃 failure（对象边界，混不进
-      // 命令回显里的用户内容）；给人看的走 display。
-      const failure = normalizePublishFailure(err);
-      const retryability = publishRetryability(failure);
-      const detail = failure.display;
-      const marked = [];
-      let pausedKind = null;
-      for (const record of failingBatch ?? []) {
-        try {
-          // 认出来的永久错误立刻停；认不出来的靠次数上限兜底。
-          const outcome = recordPublishFailure(record, {
-            permanent: retryability.permanent,
-            reason: retryability.reason + "：" + detail,
-          });
-          if (outcome.paused) {
-            marked.push(path.basename(String(record._file ?? "")));
-            pausedKind = outcome.kind;
-          }
-        } catch { /* 记不上不算失败：下一轮还会再撞一次，但不会更坏 */ }
-      }
-      return {
-        status: "error", root, reason: "publish_failed",
-        // **报"永久"要以实际打没打标为准**，不是以"认出来了吗"为准 ——
-        // 撞满次数上限的那次同样是"不会再自动重试"，说成会重试就是骗人。
-        // **报"永久"要以实际打没打标为准**，不是以"认出来了吗"为准 ——
-        // 撞满次数上限的那次同样是"不会再自动重试"，说成会重试就是骗人。
-        permanent: marked.length > 0,
-        // 成因**以实际落盘的那个为准**，不在这里第二次推断。
-        permanentKind: pausedKind,
-        permanentReason: pausedKind === null ? null
-          : (pausedKind === "platform_rejected" ? retryability.reason : "retry_exhausted"),
-        markedRejected: marked,
-        // 挑有用的那半：见 publish-failure.mjs。**从头截固定长度会把真正的
-        // 错误码切掉** —— 这条命令光命令回显就上千字符，前 400 字全是命令。
-        error: detail,
-        // 诊断只是**线索**，不是判决 —— 调用方拿它给人看，不拿它做有损动作。
-        diagnosis: diagnosis.kind === PUBLISH_FAILURE.ROOT_OWNED_BY_OTHER_APP
-          ? { kind: diagnosis.kind, ownerName: diagnosis.ownerName ?? null,
-              // 带上代际：抑制命令要按代际限定范围，提示里不给它就等于让人一刀切。
-              generationId: failingTarget?.generationId ?? failingTarget?.channelGenerationId ?? null,
-              count: listPending({ outboxDir }).length }
-          : null,
-      };
-  } finally {
-    releasePublishLock(lockDir);
   }
+  if (r.status === "error" && r.reason === "publish_failed") {
+    // 诊断只是**线索**，不是判决 —— 调用方拿它给人看，不拿它做有损动作。
+    const diagnosis = diagnose({
+      rootMessageId: r.failingTarget?.rootMessageId ?? null,
+      expectedAppId: id?.expectedAppId,
+      larkBin: id?.bin, larkHome: id?.configDir, profile: id?.profile,
+    });
+    const { failingTarget, ...rest } = r;
+    return {
+      ...rest, root,
+      diagnosis: diagnosis.kind === PUBLISH_FAILURE.ROOT_OWNED_BY_OTHER_APP
+        ? { kind: diagnosis.kind, ownerName: diagnosis.ownerName ?? null,
+            generationId: failingTarget?.generationId ?? failingTarget?.channelGenerationId ?? null,
+            count: listPending({ outboxDir }).length }
+        : null,
+    };
+  }
+  return { ...r, root };
 }
 
 /**
@@ -392,11 +268,49 @@ export function drainProject({
  * @returns {{text:string, error:boolean}|null} null = 不用说话
  */
 export function describeDrainOutcome(r, { root, verbose = false } = {}) {
+  // 发布后的两类异常各自成段，**同时发生就同时展示** ——
+  // 上一版 if/else if 只展示落标失败，轮转账缺口跟着消失（评审点名）。
+  const postDeliveryNotes = (rr) => {
+    const parts = [];
+    if ((rr.deliveredUnrecorded ?? []).length > 0) {
+      // 落标失败比记账缺口重一级：消息送达了但盘上没记 —— 下一轮可能重发。
+      parts.push("**有 " + rr.deliveredUnrecorded.length + " 条送达后没落标，" +
+        "下一轮可能把它们重发一遍** —— 先去话题里核对再决定要不要手工标记：\n" +
+        rr.deliveredUnrecorded.map((d) => "  " + d.file + "（" + d.messageId + "）—— " + d.error).join("\n"));
+    }
+    if ((rr.bookkeepingFailures ?? []).length > 0) {
+      parts.push("**有 " + rr.bookkeepingFailures.length + " 处发布后记账失败**" +
+        "（那部分内容已送达、不会因此重发；轮转活动可能没记上）：\n" +
+        rr.bookkeepingFailures.map((b) => "  " + b.messageId + " —— " + b.error).join("\n"));
+    }
+    return parts;
+  };
   if (r.status === "published") {
+    const notes = postDeliveryNotes(r);
+    if (notes.length > 0) {
+      return { error: true,
+        text: "已发布 " + r.count + " 条 -> " + r.messageId + "，" + notes.join("\n") };
+    }
     return { text: "已发布 " + r.count + " 条 -> " + r.messageId, error: false };
   }
   if (r.status === "dry_run") {
     return { text: "[dry-run] 将发布 " + r.count + " 条：\n---\n" + r.text, error: false };
+  }
+  if (r.status === "error" && r.reason === "publish_failed" && (r.partial === true
+    || (r.deliveredUnrecorded ?? []).length > 0 || (r.bookkeepingFailures ?? []).length > 0)) {
+    // **失败前的进度要说出来**：前几批确实送达了 —— 只报失败会让人把整批重跑，
+    // 或者手工把已送达的又发一遍。
+    const notes = postDeliveryNotes(r);
+    return {
+      error: true,
+      text: "这一批发到一半失败（" + r.error + "）。\n" +
+        "  **失败前已送达 " + (r.messageIds ?? []).length + " 张卡片、落标 " +
+        (r.publishedRecords ?? 0) + " 条** —— 已落标的不会重发。" +
+        (notes.length > 0 ? "\n" + notes.join("\n") : "") +
+        ((r.markedRejected ?? []).length > 0
+          ? "\n  失败那一批已暂停自动重试：" + r.markedRejected.join("、") : "") +
+        "\n  剩余未发的留在 outbox，下一轮照常尝试。",
+    };
   }
   if (r.status === "error" && r.permanent === true) {
     // **先看实际落盘状态，诊断只是补充线索。**

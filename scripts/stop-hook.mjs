@@ -118,7 +118,7 @@ async function main() {
 
   const { drainProject, localOutboxMessage, watcherActive, outboxDirOf, suppressCmd } =
     await import("./drain-outbox.mjs");
-  const { foreignHint, projectLabel } = await import("./stop-note.mjs");
+  const { foreignHint, postDeliveryBits, projectLabel } = await import("./stop-note.mjs");
   const { resolveProject } = await import("./project-resolve.mjs");
   const { appendEvent, listPending, MAX_REPLY_CHARS } = await import("./outbox.mjs");
   const { checkBinding, bindingWarning } = await import("./binding-health.mjs");
@@ -278,8 +278,22 @@ async function main() {
     // 记下"这一轮真的报了哪些项目"。末尾那句解释要按它来算，不能按"被归属到哪些"
     // 算 —— 非当前项目没东西可报时不产生提示，解释却会孤零零挂在那儿。
     const before = notes.length;
-    if (r.status === "published") {
+    if (r.status === "published"
+      && ((r.deliveredUnrecorded ?? []).length > 0 || (r.bookkeepingFailures ?? []).length > 0)) {
+      // 两类同时发生就同时说 —— else-if 会把轮转账缺口藏在落标失败后面。
+      notes.push("飞书出站：" + who + " 已发布 " + r.count + " 条，但有" +
+        postDeliveryBits(r).replace(/^；/u, " ") + "。");
+    } else if (r.status === "published") {
       notes.push("飞书出站：" + who + " 已发布 " + r.count + " 条进展。");
+    } else if (r.status === "error" && r.partial === true) {
+      // **打了一半的失败要说清两半** —— 落进"整批被拒"或"留在 outbox 会重试"
+      // 都在骗人：前者藏了已送达的事实，后者暗示什么都没发出去。
+      // **两类发布后异常也要组合着说**（评审实测："第一批送达但记账失败 +
+      // 第二批发布失败"的组合，只提落标缺口会把轮转账缺失整个吞掉）。
+      notes.push("飞书出站：" + who + " 发到一半失败：已送达 " +
+        (r.messageIds ?? []).length + " 张卡片（已落标 " + (r.publishedRecords ?? 0) +
+        " 条，不会重发）" + postDeliveryBits(r) + "；失败那批" +
+        (r.permanent === true ? "已暂停自动重试" : "留在 outbox，兜底定时器会重试") + "。");
     } else if (r.status === "error" && r.permanent === true) {
       // **不许说"会重试"。**永久拒绝的定义就是再等不会变好；
       // 说成会重试，人就会等 —— 而它已经这样空转过 12 小时。

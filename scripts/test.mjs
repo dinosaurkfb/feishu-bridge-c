@@ -26,6 +26,7 @@ import {
 } from "./envelope.mjs";
 import { acquireClaim, claimKey, recordClaimState } from "./claim.mjs";
 import {
+  ELIGIBILITY_BUDGET_DEFAULT_MS, ELIGIBILITY_BUDGET_MAX_MS, eligibilityBudgetMs,
   eligibilityOutcomeFor, listEligibilityPending, recoverEligibilityPending,
   settleEligibilityPending, settleOwnEligibility,
 } from "./eligibility-recovery.mjs";
@@ -12620,6 +12621,79 @@ test("标记不在了是有歧义的：可能是另一个恢复器先做完了",
   const got = settleOwnEligibility({ ...pend.args(), claimKey: pend.key, waitMs: 1, wait: () => {} });
   assert.equal(got.ok, true);
   assert.match(pend.read().publish_eligible_at, /^\d{4}-\d{2}-\d{2}T/u);
+});
+
+test("标记不在了之后的复核，也要在同一个截止时间内一直重试", () => {
+  // 评审实测：复核只调一次 markPublishEligibleByEventKey（内部固定重试约 720ms），
+  // 传 5 秒预算、锁 1.2 秒后释放，它仍在 625ms 时返回 publisher_busy。
+  // 而这正是真实竞态本身 —— **别的恢复器撤标之后，发布器随即持锁去发**。
+  // 答复可能已经在发了，watcher 却不写 completed、不收口 Dialogue。
+  //
+  // 现有回归全用 holdLock:false，**根本没覆盖这个窗口**。
+  const g = eligFixture();                       // 锁被别人占着
+  fs.writeFileSync(path.join(g.outboxDir, "0001.json"), JSON.stringify({
+    ...g.read(), publish_eligible_at: "2026-08-25T00:00:00.000Z" }));
+  assert.equal(fs.existsSync(g.markerFile), false, "前提：标记已被别人撤掉");
+
+  let waited = 0;
+  const r = settleOwnEligibility({
+    ...g.args(), claimKey: g.key, waitMs: 1,
+    wait: () => { waited += 1; if (waited === 3) releasePublishLock(g.lockDir); },
+  });
+  assert.equal(waited >= 3, true, "复核撞上 publisher_busy 就该接着等，实际等了 " + waited + " 次");
+  assert.deepEqual(r, { ok: true, reason: "already_eligible" },
+    "**别人做完了就是成功** —— 不许因为复核只试了一次就报 publisher_busy");
+
+  // 预算用完仍拿不到锁，就照实说 publisher_busy（不许拖成沉默，也不许假成功）。
+  const h = eligFixture();
+  const out = settleOwnEligibility({
+    ...h.args(), claimKey: h.key, budgetMs: 0, waitMs: 1, wait: () => {} });
+  assert.deepEqual(out, { ok: false, reason: "publisher_busy" });
+  releasePublishLock(h.lockDir);
+});
+
+test("等待预算必须有限：一个配置值不许把有界等待变成无限等待", () => {
+  // 评审实测：/^\d+$/ 放行 400 位数字 → Number() 得到 Infinity → 截止时间也是
+  // Infinity → 锁一直繁忙时循环**永不结束**，watcher 外层那个四小时窗口
+  // 和 session lock 释放全都执行不到。
+  const D = ELIGIBILITY_BUDGET_DEFAULT_MS;
+  const MAX = ELIGIBILITY_BUDGET_MAX_MS;
+  for (const [raw, want, why] of [
+    [undefined, D, "没配就用默认"],
+    ["", D, "空串不是数"],
+    ["0", 0, "零预算是合法的（只试一次）"],
+    ["5000", 5000, "正常值原样用"],
+    ["1".repeat(400), D, "**400 位数字不许变成 Infinity**"],
+    ["999999999999", D, "超过位数上限就回落默认，不是截断"],
+    ["abc", D, "不是数"],
+    ["-1", D, "负数"],
+    ["1e9", D, "科学计数法不认"],
+    ["12.5", D, "小数不认"],
+    [" 5000 ", D, "带空白不认"],
+    ["999999999", MAX, "合法但过大 → 夹到上限"],
+    [Infinity, D, "直接传 Infinity 也不行"],
+    [NaN, D, "NaN"],
+    [-5, D, "负数"],
+    [Number.MAX_SAFE_INTEGER + 2, D, "不是安全整数"],
+    [3000, 3000, "数字原样用"],
+  ]) {
+    assert.equal(eligibilityBudgetMs(raw), want, why + " —— " + JSON.stringify(String(raw)).slice(0, 40));
+  }
+
+  // **守卫也要长在循环那一侧**，不只长在解析那一侧：
+  // 就算有人绕过解析直接传 Infinity 进来，循环也必须停得下来。
+  const g = eligFixture();                       // 锁一直占着，永远 publisher_busy
+  let waited = 0;
+  const started = Date.now();
+  const r = settleOwnEligibility({
+    ...g.args(), claimKey: g.key, budgetMs: Infinity, waitMs: 1,
+    wait: () => { waited += 1; if (waited > 5000) throw new Error("循环没有尽头"); },
+    now: (() => { let t = started; return () => (t += 1000); })(),
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "publisher_busy");
+  assert.equal(waited <= 61, true, "默认预算 60s、间隔 1s 的话最多等 60 次，实际 " + waited);
+  releasePublishLock(g.lockDir);
 });
 
 test("claims 目录读不出来是故障，不是「一条都没有」", () => {

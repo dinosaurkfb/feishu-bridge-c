@@ -15,7 +15,11 @@
  * 它决定"给哪条记录发资格"。评审构造过：标记的 claim_key 与文件名自洽，
  * 但 `event_key` 指向别人的答复 —— 于是这张标记替另一条 claim 拿到了发布资格。
  * 所以 **event_key 一律自己按 thread + 文件名里的 claim key 算**，
- * 不信标记自报的那个；命中的记录还必须 `run_id === claim_key`。
+ * 不信标记自报的那个；命中的记录还必须唯一且 `run_id === claim_key`。
+ *
+ * **封闭 schema 要连取值域一起封。**只封键名的话，一个真实的 64 位 key 配上
+ * `promote_failed: {}` 照样能拿到授权 —— 键集说的是"有哪些字段"，
+ * 取值域说的才是"这些字段能是什么"。
  *
  * ■ 边界
  *
@@ -47,19 +51,54 @@ const MARKER_KEYS = [
 
 /**
  * claim key 的真实形状：`claimKey()` 是 sha256 的十六进制摘要，恒为 64 位。
- *
- * **封闭 schema 只封键名等于没封。**评审实测：用一个真实的 64 位 key、
- * 但把 promote_failed 写成对象，标记照样获授权并被删除；空身份也一样能构造。
- * 键集说的是"有哪些字段"，取值域说的才是"这些字段能是什么"。
+ * 文件名就是 key，所以这一条同时封住了文件名。
  */
 const CLAIM_KEY_SHAPE = /^[0-9a-f]{64}$/u;
 
 /** 提升失败的原因：这条链上的 reason 全是小写下划线短标识，不是自由文本。 */
 const REASON_SHAPE = /^[a-z][a-z0-9_]{0,63}$/u;
 
+/**
+ * 等资格的预算：默认 60 秒（竞争方持锁做真实网络发布默认可达 12 秒，留足余量），
+ * 上限 10 分钟。
+ *
+ * **必须是有限的安全整数。**评审实测：`/^\d+$/` 放行了一个 400 位数字，
+ * `Number()` 得到 `Infinity`，截止时间也成了 `Infinity` —— 锁一直繁忙时
+ * 这个循环**永不结束**，watcher 外层那个四小时窗口和 session lock 释放
+ * 全都执行不到。**有界等待被一个配置值变成了无限等待。**
+ *
+ * 不合规一律回落默认值：一个看不懂的值不该静默把恢复路径关掉（当成 0），
+ * 也不该把它变成永远（Infinity）。
+ */
+export const ELIGIBILITY_BUDGET_DEFAULT_MS = 60_000;
+export const ELIGIBILITY_BUDGET_MAX_MS = 10 * 60_000;
+
+export function eligibilityBudgetMs(raw) {
+  const n = typeof raw === "string" ? (/^\d{1,9}$/u.test(raw) ? Number(raw) : NaN) : raw;
+  if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0) {
+    return ELIGIBILITY_BUDGET_DEFAULT_MS;
+  }
+  return Math.min(n, ELIGIBILITY_BUDGET_MAX_MS);
+}
+
 /** 同步等一小会儿 —— 这条链上的函数都是同步契约，不能改成 async。 */
 function waitSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * **一个共用的重试循环** —— 两处等待用同一份节奏与截止时间语义。
+ * 各自只提供"这一次做什么"和"什么情况才值得再等"。
+ */
+function retryUntil({ deadline, waitMs, now, wait, attempt, retryWhen }) {
+  let last = attempt();
+  let attempts = 1;
+  while (retryWhen(last) && now() < deadline) {
+    wait(waitMs);
+    last = attempt();
+    attempts += 1;
+  }
+  return { last, attempts };
 }
 
 /**
@@ -86,8 +125,8 @@ export function listEligibilityPending({ claimsDir, threadId }) {
     try { doc = JSON.parse(fs.readFileSync(file, "utf-8")); }
     catch { bad("读不出来"); continue; }
     if (doc === null || typeof doc !== "object" || Array.isArray(doc)) { bad("不是记录对象"); continue; }
+
     // **封闭键集**：这是发布授权制品，按真实产物要求"不多不少"。
-    //
     // 上一版只在字段存在时才对账 event_key —— 评审实测：**把 event_key 删掉，
     // 标记照样被接受、目标拿到资格、标记被撤**。只拒绝错值而放过缺字段，
     // 等于给伪造留了最省事的一条路：少写一个字段就绕过了对账。
@@ -96,18 +135,19 @@ export function listEligibilityPending({ claimsDir, threadId }) {
     if (missing.length > 0) { bad("缺字段：" + missing.join("、")); continue; }
     const extra = keys.filter((k) => !MARKER_KEYS.includes(k));
     if (extra.length > 0) { bad("多出不认识的字段：" + extra.join("、")); continue; }
-    if (doc.schema_version !== "1.0") { bad("schema_version 不认识"); continue; }
+
     // **取值域跟键集一起验。**
+    if (doc.schema_version !== "1.0") { bad("schema_version 不认识"); continue; }
     if (!CLAIM_KEY_SHAPE.test(String(key))) { bad("文件名不是 claim key 的形状"); continue; }
-    if (typeof doc.promote_failed !== "string" || !REASON_SHAPE.test(doc.promote_failed)) {
-      bad("promote_failed 不是原因标识"); continue;
-    }
     // 文件名与内容必须自洽 —— 否则一张错配的标记能替另一条事件要资格。
     if (doc.claim_key !== key) { bad("claim_key 跟文件名对不上"); continue; }
     if (doc.state !== "eligibility_pending") { bad("state 不是 eligibility_pending"); continue; }
     if (!isCanonicalIso(doc.recorded_at)) { bad("recorded_at 不是规范时间"); continue; }
     // 只有"这一轮确实跑完了"才谈得上发布资格。
     if (doc.run_state !== "completed") { bad("run_state 不是 completed"); continue; }
+    if (typeof doc.promote_failed !== "string" || !REASON_SHAPE.test(doc.promote_failed)) {
+      bad("promote_failed 不是原因标识"); continue;
+    }
     if (typeof threadId !== "string" || !threadId) { bad("不知道属于哪条 thread，无法自己算事件键"); continue; }
     // **事件键自己算。**标记自带的那个只用来对账：对不上说明这张标记被改过。
     const eventKey = codexReplyEventKey({ threadId, claimKey: key });
@@ -146,25 +186,19 @@ export function recoverEligibilityPending({ claimsDir, outboxDir, publishLockDir
 /**
  * 一直扫到没有 `publisher_busy` 为止，或者预算用完。
  *
- * **只在 watcher 自己刚写下标记之后用。**光靠"下一个 watcher 启动时扫一遍"不够：
- * 那要等到下一条入站消息才会发生，中间这条答复一直卡着。
- * 竞争方持锁做真实网络发布可达 12 秒，所以预算要盖得住它。
- *
  * 只对 `publisher_busy` 重试 —— 其余失败（记录不见了、身份对不上、记录损坏）
  * 不会因为多等一会儿就变好，重试只是把故障拖成沉默。
  */
 export function settleEligibilityPending({
   claimsDir, outboxDir, publishLockDir, threadId,
-  budgetMs = 60_000, waitMs = 1500, now = () => Date.now(), wait = waitSync,
+  budgetMs = ELIGIBILITY_BUDGET_DEFAULT_MS, waitMs = 1500,
+  now = () => Date.now(), wait = waitSync,
 }) {
-  const deadline = now() + budgetMs;
-  let last = recoverEligibilityPending({ claimsDir, outboxDir, publishLockDir, threadId });
-  let attempts = 1;
-  while (last.ok && last.pending.some((p) => p.reason === "publisher_busy") && now() < deadline) {
-    wait(waitMs);
-    last = recoverEligibilityPending({ claimsDir, outboxDir, publishLockDir, threadId });
-    attempts += 1;
-  }
+  const { last, attempts } = retryUntil({
+    deadline: now() + eligibilityBudgetMs(budgetMs), waitMs, now, wait,
+    attempt: () => recoverEligibilityPending({ claimsDir, outboxDir, publishLockDir, threadId }),
+    retryWhen: (r) => r.ok && r.pending.some((x) => x.reason === "publisher_busy"),
+  });
   return { ...last, attempts };
 }
 
@@ -192,23 +226,39 @@ export function eligibilityOutcomeFor(settle, key) {
 /**
  * **这一轮自己那条 claim 的资格，最终到底怎么样了。**
  *
- * 先扫到有结论，再把结论翻译成"我这条"的结论；
- * 若标记不在了，**在锁下按当前 event/run 重新核对目标记录** ——
- * 已 eligible / published / suppressed 都算成功，只有这样才排除
- * "另一个恢复器先做完了"这种歧义。
+ * 每一轮：扫一遍 → 翻译成"我这条"的结论 → 若标记不在了，**在锁下按当前
+ * event/run 复核目标记录**（已 eligible / published / suppressed 都算成功，
+ * 还待发就现在提上去）。
+ *
+ * **复核跟扫描共用同一个截止时间。**评审实测：复核只调一次
+ * `markPublishEligibleByEventKey`（内部固定重试约 720ms），
+ * 传 5 秒预算、锁 1.2 秒后释放，它仍在 625ms 时返回 `publisher_busy`。
+ * 而这正是真实竞态本身 —— 别的恢复器撤标之后，发布器随即持锁去发。
+ * 答复可能已经在发了，watcher 却不写 completed、不收口 Dialogue。
  */
 export function settleOwnEligibility({
-  claimsDir, outboxDir, publishLockDir, threadId, claimKey, ...pacing
+  claimsDir, outboxDir, publishLockDir, threadId, claimKey,
+  budgetMs = ELIGIBILITY_BUDGET_DEFAULT_MS, waitMs = 1500,
+  now = () => Date.now(), wait = waitSync,
 }) {
-  const settle = settleEligibilityPending({
-    claimsDir, outboxDir, publishLockDir, threadId, ...pacing });
-  const outcome = eligibilityOutcomeFor(settle, claimKey);
-  if (outcome.reason !== "marker_missing") return outcome;
-  // 去问记录本身。它要么已经有结论（别人做完了），要么还待发（那就现在提上去）。
-  const recheck = markPublishEligibleByEventKey({
-    outboxDir, eventKey: codexReplyEventKey({ threadId, claimKey }),
-    publishLockDir, requireRunId: claimKey,
+  const once = () => {
+    const sweep = recoverEligibilityPending({ claimsDir, outboxDir, publishLockDir, threadId });
+    const outcome = eligibilityOutcomeFor(sweep, claimKey);
+    if (outcome.reason !== "marker_missing") return outcome;
+    const recheck = markPublishEligibleByEventKey({
+      outboxDir, eventKey: codexReplyEventKey({ threadId, claimKey }),
+      publishLockDir, requireRunId: claimKey,
+    });
+    if (recheck.ok) {
+      return { ok: true, reason: recheck.reason ?? (recheck.changed ? "promoted" : "unchanged") };
+    }
+    return { ok: false, reason: recheck.reason ?? "marker_missing" };
+  };
+  const { last } = retryUntil({
+    deadline: now() + eligibilityBudgetMs(budgetMs), waitMs, now, wait,
+    attempt: once,
+    // 只有"锁被别人占着"值得再等。
+    retryWhen: (r) => !r.ok && r.reason === "publisher_busy",
   });
-  if (recheck.ok) return { ok: true, reason: recheck.reason ?? (recheck.changed ? "promoted" : "unchanged") };
-  return { ok: false, reason: recheck.reason ?? "marker_missing" };
+  return last;
 }

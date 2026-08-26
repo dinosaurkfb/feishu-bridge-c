@@ -3,7 +3,7 @@
 
 import { readClaim, recordClaimState } from "../claim.mjs";
 import {
-  recoverEligibilityPending, settleOwnEligibility,
+  eligibilityBudgetMs, recoverEligibilityPending, settleOwnEligibility,
 } from "../eligibility-recovery.mjs";
 import { releaseSessionLock } from "../handoff.mjs";
 import {
@@ -59,17 +59,6 @@ if (!recovered.ok) {
   for (const r of recovered.pending) console.error("资格仍卡住：" + r.key + "（" + r.reason + "）");
   for (const r of recovered.unusable) console.error("恢复标记看不懂，没动：" + r.key + " —— " + r.unusable);
 }
-
-/**
- * 等资格的预算。默认 60 秒 —— 竞争方持锁做真实网络发布默认可达 12 秒，
- * 留足余量。**只接受非负整数**，写错就用默认值：一个看不懂的值不该
- * 静默变成"零预算"，那会把这条恢复路径悄悄关掉。
- */
-const eligibilityBudgetMs = (() => {
-  const raw = process.env.FEISHU_BRIDGE_ELIGIBILITY_BUDGET_MS;
-  if (raw === undefined) return 60_000;
-  return /^\d+$/u.test(raw) ? Number(raw) : 60_000;
-})();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const started = Date.now();
@@ -134,7 +123,8 @@ try {
         const settled_ = settleOwnEligibility({
           claimsDir: paths.claims, outboxDir: paths.outbox,
           publishLockDir: paths.publishLock, threadId: task.codex_thread_id, claimKey: key,
-          budgetMs: eligibilityBudgetMs,
+          // 预算解析只有一份判据 —— 有限安全整数、有上限、不合规回落默认值。
+          budgetMs: eligibilityBudgetMs(process.env.FEISHU_BRIDGE_ELIGIBILITY_BUDGET_MS),
         });
         // **报出来的原因要是复查之后的原因。**只认 recovered 的话，
         // 复查时变成 event_not_found / record_unclassified / claims_unreadable，

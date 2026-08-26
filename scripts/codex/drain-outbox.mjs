@@ -1,29 +1,18 @@
 #!/usr/bin/env node
 /** 逐次授权的 Codex outbox 发布入口。默认只预览，只有 --apply 才发送。 */
 
-import { composeDigest, listPending, markSent } from "../outbox.mjs";
+import { composeDigest, listPending } from "../outbox.mjs";
 import { publishDraft } from "../outbound.mjs";
-import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
+import { publishOutboxAttempt } from "../publish-attempt.mjs";
+import { codexRotationBatchHook } from "./rotation-hook.mjs";
 import { resolveLarkIdentity } from "../chain-template.mjs";
 import { composeCodexOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
-import {
-  businessActivitiesForPublishedBatch,
-} from "../automatic-topic-rotation.mjs";
-import { recordCodexActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
 import {
   bridgeHome, findTaskForCodexThread, loadRegistry, resolveTask,
   resolveTaskOutboundGeneration, taskPaths,
 } from "./state.mjs";
 
-const groupByTargetGeneration = (records) => {
-  const groups = new Map();
-  for (const record of records) {
-    const key = record.target_channel_generation_id ?? "__legacy_active__";
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(record);
-  }
-  return [...groups.entries()];
-};
+// groupByTargetGeneration 已收归 publish-attempt.mjs（此前四处各抄一份）。
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -70,52 +59,51 @@ if (!apply) {
   process.exit(0);
 }
 
-const lock = acquirePublishLock(paths.publishLock);
-if (!lock.ok) {
-  console.error("发布器正忙（" + lock.reason + "），没有发送。");
-  process.exit(1);
-}
-try {
-  // 锁内重读，防止用户预览后另一个授权动作已经发掉。
-  const current = listPending({ outboxDir: paths.outbox });
-  if (current.length === 0) {
-    console.log("队列已经由另一个发布动作排空。");
-  } else {
-    const identity = resolveLarkIdentity(resolved.template);
-    for (const [targetKey, records] of groupByTargetGeneration(current)) {
-      const target = resolveTaskOutboundGeneration(
-        task,
-        targetKey === "__legacy_active__" ? null : targetKey,
-      );
-      if (!target.ok) throw new Error("冻结的出站话题代际不可用（" + target.reason + "）");
-      for (const batch of outboundCardBatches(records)) {
-        const messageId = publishDraft({
-          profile: identity.profile,
-          rootMessageId: target.rootMessageId,
-          card: composeCodexOutboundCard(batch, { taskName: task.task_display_name }),
-          larkBin: identity.bin,
-          larkHome: identity.configDir,
-          expectedAppId: identity.expectedAppId,
-        });
-        for (const activity of businessActivitiesForPublishedBatch(batch, {
-          messageId, runtime: "codex",
-        })) {
-          recordCodexActivityAndMaybeRotate({
-            root: task.root,
-            threadId: task.codex_thread_id,
-            home,
-            generationId: target.channelGenerationId,
-            ...activity,
-          });
-        }
-        for (const event of batch) markSent(event, messageId);
-      }
-    }
-    console.log("已由 " + resolved.template.transport_agent_name + " 发布 " + current.length + " 条。");
-  }
-} catch (err) {
-  console.error("发布失败，队列保持未发送：" + err.message);
+// 锁、快照、审计、候选（含已暂停跳过）、切批校验、成败记账 —— 全在事务里。
+// 此前这个入口**既不跳过已暂停、也不做失败记账**（重构计划 §0 的两个 ✗）。
+const identity = resolveLarkIdentity(resolved.template);
+const r = publishOutboxAttempt({
+  outboxDir: paths.outbox,
+  lockDir: paths.publishLock,
+  policy: "all_unpaused",
+  batchCards: outboundCardBatches,
+  resolveTarget: (generationKey) => resolveTaskOutboundGeneration(task, generationKey),
+  composeCard: (batch) => composeCodexOutboundCard(batch, { taskName: task.task_display_name }),
+  publishBatch: ({ target, card }) => publishDraft({
+    profile: identity.profile,
+    rootMessageId: target.rootMessageId,
+    card,
+    larkBin: identity.bin,
+    larkHome: identity.configDir,
+    expectedAppId: identity.expectedAppId,
+  }),
+  onBatchPublished: codexRotationBatchHook({
+    root: task.root, threadId: task.codex_thread_id, home,
+  }),
+});
+if (r.status === "published") {
+  console.log("已由 " + resolved.template.transport_agent_name + " 发布 " + r.count + " 条。" +
+    ((r.bookkeepingFailures ?? []).length > 0
+      ? "\n有 " + r.bookkeepingFailures.length + " 处发布后记账失败（已送达不重发，轮转账可能缺）。" : "") +
+    ((r.deliveredUnrecorded ?? []).length > 0
+      ? "\n**有 " + r.deliveredUnrecorded.length + " 条送达后没落标，下一轮可能重发 —— 先去话题核对。**" : ""));
+  if ((r.deliveredUnrecorded ?? []).length > 0) process.exitCode = 1;
+} else if (r.status === "empty") {
+  console.log("队列已经由另一个发布动作排空。");
+} else if (r.status === "needs_attention") {
+  console.error(r.count + " 条已暂停自动重试，等人处理：");
+  for (const item of r.rejected ?? []) console.error("  " + item.file + " —— " + item.why);
   process.exitCode = 1;
-} finally {
-  releasePublishLock(paths.publishLock);
+} else if (r.status === "skipped") {
+  console.error("发布器正忙（" + r.reason + "），没有发送。");
+  process.exitCode = 1;
+} else if (r.status === "error" && r.local === true) {
+  console.error("本地 outbox 有问题（" + (r.reason ?? "说不清") +
+    ((r.files ?? []).length ? "：" + r.files.join("、") : "") + "）—— 整批没动，这不是飞书故障。");
+  process.exitCode = 1;
+} else {
+  console.error("发布失败，队列保持未发送：" + (r.error ?? r.reason) +
+    ((r.partial === true) ? "\n（失败前已送达 " + (r.messageIds ?? []).length + " 张，已落标的不会重发）" : "") +
+    ((r.markedRejected ?? []).length > 0 ? "\n这几条已暂停自动重试：" + r.markedRejected.join("、") : ""));
+  process.exitCode = 1;
 }

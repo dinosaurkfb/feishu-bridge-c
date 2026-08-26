@@ -5,29 +5,17 @@
  * 授予。这样升级前的历史积压、失败 run 的半成品答复都不会被下一轮顺带发出。
  */
 
-import { listPending, markSent } from "../outbox.mjs";
 import { publishDraft } from "../outbound.mjs";
-import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
+import { publishOutboxAttempt } from "../publish-attempt.mjs";
+import { codexRotationBatchHook } from "./rotation-hook.mjs";
 import fs from "node:fs";
 import { assertPublishIdentity, resolveLarkIdentity } from "../chain-template.mjs";
 import { composeCodexOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import {
-  businessActivitiesForPublishedBatch,
-} from "../automatic-topic-rotation.mjs";
-import { recordCodexActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
-import {
   bridgeHome, resolveTask, resolveTaskOutboundGeneration, taskPaths,
 } from "./state.mjs";
 
-const groupByTargetGeneration = (records) => {
-  const groups = new Map();
-  for (const record of records) {
-    const key = record.target_channel_generation_id ?? "__legacy_active__";
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(record);
-  }
-  return [...groups.entries()];
-};
+// groupByTargetGeneration 已收归 publish-attempt.mjs（此前四处各抄一份）。
 
 /**
  * 发送之前必须成立的每一件事 —— **不碰 outbox、不发任何东西**。
@@ -88,63 +76,33 @@ export function publishEligibleTaskEvents({ task, home = bridgeHome(), timeoutMs
   const pre = preflightTask({ task, home });
   if (!pre.ok) return { status: pre.status, reason: pre.reason };
   const resolved = pre.resolved;
-
   const paths = taskPaths(task, home);
-  const eligible = () => listPending({ outboxDir: paths.outbox })
-    .filter((event) => typeof event.publish_eligible_at === "string" && event.publish_eligible_at);
-  if (eligible().length === 0) return { status: "empty" };
 
-  const lock = acquirePublishLock(paths.publishLock);
-  if (!lock.ok) return { status: "deferred", reason: lock.reason };
-  try {
-    // 锁内重读，避免 Stop 与 watcher 同时拿到同一批事件。
-    const current = eligible();
-    if (current.length === 0) return { status: "empty" };
-    const identity = resolveLarkIdentity(resolved.template);
-    const messageIds = [];
-    // reply 一轮一张卡，才能让本地输入与对应答复保持精确配对。没有回合可依附的进展
-    // 继续合批，避免同类通知把话题刷屏。每张成功后立即标记，后续失败不会重发前一张。
-    for (const [targetKey, targetRecords] of groupByTargetGeneration(current)) {
-      const target = resolveTaskOutboundGeneration(
-        task,
-        targetKey === "__legacy_active__" ? null : targetKey,
-      );
-      if (!target.ok) throw new Error("冻结的出站话题代际不可用（" + target.reason + "）");
-      for (const batch of outboundCardBatches(targetRecords)) {
-        const messageId = publishDraft({
-          profile: identity.profile,
-          rootMessageId: target.rootMessageId,
-          card: composeCodexOutboundCard(batch, { taskName: task.task_display_name }),
-          larkBin: identity.bin,
-          larkHome: identity.configDir,
-          expectedAppId: identity.expectedAppId,
-          timeoutMs,
-        });
-        for (const activity of businessActivitiesForPublishedBatch(batch, {
-          messageId, runtime: "codex",
-        })) {
-          recordCodexActivityAndMaybeRotate({
-            root: task.root,
-            threadId: task.codex_thread_id,
-            home,
-            generationId: target.channelGenerationId,
-            ...activity,
-          });
-        }
-        for (const event of batch) markSent(event, messageId);
-        messageIds.push(messageId);
-      }
-    }
-    return {
-      status: "published",
-      count: current.length,
-      messageId: messageIds.at(-1) ?? null,
-      messageIds,
-    };
-  } catch (err) {
-    // 不标记、不吞掉；后续 Stop/watcher 会再次尝试所有 eligible 事件。
-    return { status: "error", reason: "publish_failed", error: String(err?.message ?? err).slice(0, 400) };
-  } finally {
-    releasePublishLock(paths.publishLock);
-  }
+  // 锁外速查只为省一次锁竞争；真正的选择在事务锁内快照上按
+  // authorized_only 策略做 —— **授权判据只有 hasPublishAuthorization 一份**
+  //（此前这里是"非空字符串"，正是第 5 层要收敛的分叉；事务接入后结构性消失）。
+  const identity = resolveLarkIdentity(resolved.template);
+  const r = publishOutboxAttempt({
+    outboxDir: paths.outbox,
+    lockDir: paths.publishLock,
+    policy: "authorized_only",
+    batchCards: outboundCardBatches,
+    resolveTarget: (generationKey) => resolveTaskOutboundGeneration(task, generationKey),
+    composeCard: (batch) => composeCodexOutboundCard(batch, { taskName: task.task_display_name }),
+    publishBatch: ({ target, card }) => publishDraft({
+      profile: identity.profile,
+      rootMessageId: target.rootMessageId,
+      card,
+      larkBin: identity.bin,
+      larkHome: identity.configDir,
+      expectedAppId: identity.expectedAppId,
+      timeoutMs,
+    }),
+    onBatchPublished: codexRotationBatchHook({
+      root: task.root, threadId: task.codex_thread_id, home,
+    }),
+  });
+  // 旧契约映射：锁忙叫 deferred（Stop/watcher 稍后再试）。
+  if (r.status === "skipped") return { status: "deferred", reason: r.reason };
+  return r;
 }

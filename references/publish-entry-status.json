@@ -18,13 +18,22 @@
     },
     "codex-drain": {
       "file": "codex/drain-outbox.mjs",
-      "status": "legacy",
-      "suite": "codex"
+      "status": "migrated",
+      "suite": "codex",
+      "not_applicable": {
+        "显式重试：失败仍暂停，不许悄悄放回自动队列": "人工重试参数（--retry-rejected）目前只在 Claude drain 的 CLI 面；Codex 侧待有需求时另立同名参数并翻掉本申报",
+        "显式重试：成功后落标、保护字段清干净": "同上"
+      }
     },
     "codex-eligible": {
       "file": "codex/publish-eligible.mjs",
-      "status": "legacy",
-      "suite": "codex"
+      "status": "migrated",
+      "suite": "codex",
+      "not_applicable": {
+        "dry-run：预演零改盘、零出网": "自动发布路径没有预览面 —— 预览语义属于人工 CLI",
+        "显式重试：失败仍暂停，不许悄悄放回自动队列": "自动路径没有人工重试参数",
+        "显式重试：成功后落标、保护字段清干净": "同上"
+      }
     }
   },
   "direct_paths_excluded": {

@@ -1,6 +1,7 @@
 # 发布路径重构：把散在四份实现里的策略收进承重接口
 
-状态：计划，经 Codex 架构评审一轮修订（2026-08-26）。
+状态：**R1 / R3 / R2a / R2b1 / R2b2 已全部合入 main**（PR #63–#67，2026-08-26/27）。
+剩余：R5（全景 completeness）。原文如下，§0 表格已按完成状态标注。
 触发条件已满足 —— A 批次（PR #61）连续五轮被打回，**每一轮的失败形状相同**：
 一条策略散在多处，接了 N 个消费者漏了第 N+1 个。评审（Codex）的结论：
 反复失败的主因是跨入口策略没有被代码结构收敛，其次是测试验证方法，
@@ -14,8 +15,8 @@
 |---|---|---|---|---|
 | `drainProject`（drain-outbox.mjs） | ✓ | ✓ | listPending | ✗ |
 | `watch-and-publish.mjs`（Claude watcher） | ✓ | ✓ | listPending | ✗ |
-| `codex/drain-outbox.mjs`（Codex 手工排空） | **✗** | **✗** | listPending | ✗ |
-| `codex/publish-eligible.mjs`（Codex 自动发布） | **✗** | **✗** | **非空字符串**（:93，即第 5 层要收敛的分叉） | ✗ |
+| `codex/drain-outbox.mjs`（Codex 手工排空） | ~~✗~~ ✓(R2b2) | ~~✗~~ ✓(R2b2) | 事务 | ✓ |
+| `codex/publish-eligible.mjs`（Codex 自动发布） | ~~✗~~ ✓(R2b2) | ~~✗~~ ✓(R2b2) | ~~非空字符串~~ **hasPublishAuthorization**(R2b2) | ✓ |
 
 **加粗那四个 ✗ 是现在就存在于 main 上的缺口** —— A 批次五轮返修只接通了
 Claude 侧那两份实现，Codex 侧两份从没进过任何一轮的视野。这不是疏忽的偶然，

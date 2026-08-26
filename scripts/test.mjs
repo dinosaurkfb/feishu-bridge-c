@@ -41,8 +41,8 @@ import {
   MAX_AUTO_PUBLISH_ATTEMPTS, appendEvent, auditOutbox, classifyOutboxRecord,
   codexReplyEventKey, composeDigest, explainabilityGaps,
   hasPublishAuthorization, isPermanentlyRejected, listPending, markPublishEligibleByEventKey,
-  markSent, outboxMutationBlocker, pauseKindOf, recordPublishFailure, retryProtection,
-  retryProtectionState, suppressPublishByEventKey,
+  markSent, outboxMutationBlocker, PAUSE_KINDS, pauseKindOf, recordPublishFailure,
+  retryProtection, retryProtectionState, suppressPublishByEventKey,
 } from "./outbox.mjs";
 import {
   capMarkdownTables, composeOutboundCard, countMarkdownTables, outboundCardBatches,
@@ -13574,32 +13574,64 @@ test("重试保护投影：封闭联合，每个状态携带自己的数据", ()
 });
 
 test("重试保护字段：唯一的读写处是 outbox.mjs，别处零出现（原始扫描）", () => {
-  // **行为测试证不了模块边界** —— 展示层拼一次裸字段，语义测试照样全绿
-  //（渲染结果一样），漏的是"下次字段语义变了，那处不会跟着变"。
-  // 原始扫描、不解析注释：跟禁用 process.argv[1] 那条守卫同一形状，
-  // 注释也不许写字段名 —— 免得下一个人照着注释里的名字又拼回去。
+  // **行为测试证不了模块边界** —— 展示层拼一次裸字段，语义测试照样全绿。
+  // 原始扫描、不解析注释：跟禁用 process.argv[1] 那条守卫同一形状。
+  //
+  // **豁免按精确路径，不按文件名。**评审实测：按文件名豁免时，
+  // 在 scripts/codex/ 下放一个同名 outbox.mjs 直接摸字段，扫描照样零命中 ——
+  // 豁免面比意图宽，守卫就有了一条免检通道。
   const fields = ["publish_attempts", "publish_rejected_at",
     "publish_rejected_reason", "publish_rejected_kind"];
-  const offenders = [];
-  const walk = (dir) => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else if (entry.name.endsWith(".mjs")) {
-        if (entry.name === "outbox.mjs" || entry.name === "test.mjs") continue;
+  const scan = (rootDir, exemptRel) => {
+    const offenders = [];
+    let scanned = 0;
+    const walk = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) { walk(full); continue; }
+        if (!entry.name.endsWith(".mjs")) continue;
+        const rel = path.relative(rootDir, full);
+        if (exemptRel.has(rel)) continue;
+        scanned += 1;
         const text = fs.readFileSync(full, "utf-8");
-        for (const f of fields) {
-          if (text.includes(f)) offenders.push(path.relative(path.resolve("scripts"), full) + " ← " + f);
-        }
+        for (const f of fields) if (text.includes(f)) offenders.push(rel + " ← " + f);
       }
-    }
+    };
+    walk(rootDir);
+    return { offenders, scanned };
   };
-  walk(path.resolve("scripts"));
-  assert.deepEqual(offenders, [],
+
+  // 先证明扫描器自己是有效的：造一棵夹具树，嵌套同名 outbox.mjs 里放违规。
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-tokenscan-"));
+  fs.mkdirSync(path.join(fixture, "codex"), { recursive: true });
+  fs.writeFileSync(path.join(fixture, "outbox.mjs"), "// 真身，豁免\nconst a = { publish_attempts: 1 };\n");
+  fs.writeFileSync(path.join(fixture, "codex", "outbox.mjs"),
+    "// 冒名的嵌套同名文件\nconst sneak = rec.publish_attempts;\n");
+  fs.writeFileSync(path.join(fixture, "clean.mjs"), "export const ok = 1;\n");
+  const proof = scan(fixture, new Set(["outbox.mjs"]));
+  assert.deepEqual(proof.offenders, ["codex/outbox.mjs ← publish_attempts"],
+    "**嵌套同名文件必须被抓住** —— 抓不住就是免检通道：" + JSON.stringify(proof));
+
+  // 再扫真的。豁免只有三个精确路径：唯一读写处 + 两份测试（夹具合法写裸字段）。
+  const real = scan(path.resolve("scripts"),
+    new Set(["outbox.mjs", "test.mjs", path.join("codex", "test.mjs")]));
+  assert.deepEqual(real.offenders, [],
     "这些文件绕过了投影直接摸字段（或在注释里留了字段名）");
-  // 扫描本身要有效：outbox.mjs 里真有这些字段。
-  const home = fs.readFileSync(path.resolve("scripts", "outbox.mjs"), "utf-8");
-  for (const f of fields) assert.ok(home.includes(f), "扫描失效：连 outbox.mjs 里都找不到 " + f);
+  // 扫描面自检：产品脚本数量有底线，走空目录不算扫过。
+  assert.ok(real.scanned >= 60, "扫描面缩水了：只扫到 " + real.scanned + " 个文件");
+});
+
+test("受控成因枚举不许在运行时被扩宽", () => {
+  // 评审实测：导出数组可变时，PAUSE_KINDS.push("invented_kind") 让原本
+  // corrupt 的记录变成合法 paused —— 封闭联合被进程内代码扩宽。
+  assert.equal(Object.isFrozen(PAUSE_KINDS), true, "导出的枚举必须冻结");
+  const forged = { ...outboxRecord({ text: "一条" }), publish_attempts: 1,
+    publish_rejected_at: "2026-08-26T00:00:00.000Z",
+    publish_rejected_reason: "x", publish_rejected_kind: "invented_kind" };
+  assert.equal(retryProtection(forged).status, "corrupt", "前提：编造的 kind 是 corrupt");
+  try { PAUSE_KINDS.push("invented_kind"); } catch { /* 冻结数组会抛，正好 */ }
+  assert.equal(retryProtection(forged).status, "corrupt",
+    "**就算导出面被动过，判据也不许跟着变宽**");
 });
 
 summarySealed = true;

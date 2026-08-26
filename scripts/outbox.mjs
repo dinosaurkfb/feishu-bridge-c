@@ -169,7 +169,12 @@ export const MAX_AUTO_PUBLISH_ATTEMPTS = 5;
  * 所以它必须**落盘**：只在返回值里带着的话，进程一结束，
  * Stop 和积压视图就只能把两者统称为"被飞书拒绝"。
  */
-export const PAUSE_KINDS = ["platform_rejected", "retry_exhausted"];
+export const PAUSE_KINDS = Object.freeze(["platform_rejected", "retry_exhausted"]);
+
+// **校验不依赖导出值。**评审实测：导出数组可变时，进程内 push 一个编造的
+// kind 就能让原本 corrupt 的记录变成合法 paused —— 封闭联合被运行时扩宽。
+// 冻结挡住改写，私有集合保证就算导出面被换掉，判据也不动。
+const PAUSE_KIND_SET = new Set(PAUSE_KINDS);
 
 /**
  * 一条记录的**重试保护投影** —— 唯一的读法，返回封闭联合：
@@ -223,7 +228,7 @@ export function retryProtection(rec) {
   if (typeof reason !== "string" || reason.trim().length === 0) {
     return { status: "corrupt", reason: "publish_rejected_reason 缺失或为空" };
   }
-  if (!PAUSE_KINDS.includes(kind)) {
+  if (!PAUSE_KIND_SET.has(kind)) {
     return { status: "corrupt", reason: "publish_rejected_kind 不在受控取值里" };
   }
   // 成因也要跟次数对得上：**预算耗尽**只可能发生在试满之后。

@@ -6546,6 +6546,20 @@ test("积压视图：项目级绑定也在视野里，措辞不许超出实际�
   const broken = withReg(() => collectProjectBacklog());
   assert.equal(broken.ok, false, "**读不出来绝不能显示成没有积压**");
   assert.equal(broken.projects.length, 0);
+
+  // **路径是目录也算读不出来。**上一版用宽松读取器，它把 EISDIR / EACCES
+  // 一律变成"成功的空表" —— 评审实测返回 {ok:true, projects:[]}，
+  // 于是"读不出来"又一次显示成了"没有积压"。
+  fs.rmSync(registry);
+  fs.mkdirSync(registry);
+  const asDir = withReg(() => collectProjectBacklog());
+  assert.equal(asDir.ok, false, "**登记表是目录时不许报成空表**：" + JSON.stringify(asDir));
+  fs.rmSync(registry, { recursive: true });
+
+  // 完全不存在是合法的空 —— 还没接过任何项目。守卫不能把好情况也一起挡了。
+  const none = withReg(() => collectProjectBacklog());
+  assert.equal(none.ok, true, "登记表还没建过是合法的空");
+  assert.deepEqual(none.projects, []);
 });
 
 summarySealed = true;

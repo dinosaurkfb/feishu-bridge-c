@@ -16,7 +16,7 @@ import path from "node:path";
 import { readRunOutcome } from "./handoff.mjs";
 import { scanRuns, buildDraft, markPublished, publishDraft } from "./outbound.mjs";
 import {
-  auditOutbox, listPending, markSent, outboxMutationBlocker,
+  auditOutbox, isPermanentlyRejected, listPending, markSent, outboxMutationBlocker,
 } from "./outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { readClaim, recordClaimState } from "./claim.mjs";
@@ -134,8 +134,13 @@ while (true) {
       // 但 outbox 那一半必须**整批拒绝并点名**，不许"跳过坏的、把其余照发"。
       const outboxBlocked = publishLock.ok
         ? outboxMutationBlocker(auditOutbox(OUTBOX)) : null;
+      // **被永久拒绝的这里也要跳过。**判据跟排空共用一份。
+      //
+      // 评审实测：watcher 直接把整个 listPending() 塞进发布批次 ——
+      // 于是"不会再自动重试"只对 drainProject 成立，**入站完成后的 watcher 会绕过它**。
+      // 一个共用判据只要还有第二条路绕过去，它就不叫共用。
       const pendingOutbox = (publishLock.ok && !outboxBlocked)
-        ? listPending({ outboxDir: OUTBOX }) : [];
+        ? listPending({ outboxDir: OUTBOX }).filter((r) => !isPermanentlyRejected(r)) : [];
       if (outboxBlocked) {
         // **措辞要收窄。**上一版无条件说"执行结果照常发"，
         // 而真正发不发还受 run.shouldPublish 和自动发布开关约束 ——

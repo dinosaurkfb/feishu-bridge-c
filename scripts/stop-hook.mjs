@@ -280,6 +280,16 @@ async function main() {
     const before = notes.length;
     if (r.status === "published") {
       notes.push("飞书出站：" + who + " 已发布 " + r.count + " 条进展。");
+    } else if (r.status === "error" && r.permanent === true) {
+      // **不许说"会重试"。**永久拒绝的定义就是再等不会变好；
+      // 说成会重试，人就会等 —— 而它已经这样空转过 12 小时。
+      notes.push("飞书出站：" + who + (r.permanentKind === "retry_exhausted"
+        ? " 连着发不出去，自动重试预算已耗尽"
+        : " 被飞书拒绝（" + r.permanentReason + "）") +
+        "，**已暂停自动重试**，需要人看一眼。");
+    } else if (r.status === "needs_attention") {
+      notes.push("飞书出站：" + who + " 有 " + r.count +
+        " 条被飞书永久拒绝过，不会再自动重试，等你处理。");
     } else if (r.status === "error" && r.diagnosis?.kind === "root_owned_by_other_app") {
       // 诊断是**线索不是判决**：说清重试大概率无用，但停不停由人决定。
       // 上一版在这里直接说"已停止重试"，那是把一个自动做出的有损动作说成既成事实。
@@ -297,14 +307,6 @@ async function main() {
       //
       // 判据只有统一守卫一份 —— 这里只负责把它的结论讲清楚。
       notes.push("飞书出站：" + who + " 的" + localOutboxMessage(r));
-    } else if (r.status === "error" && r.permanent === true) {
-      // **不许说"会重试"。**永久拒绝的定义就是再等不会变好；
-      // 说成会重试，人就会等 —— 而它已经这样空转过 12 小时。
-      notes.push("飞书出站：" + who + " 被飞书永久拒绝（" + r.permanentReason +
-        "），**不会再自动重试**，需要人看一眼。");
-    } else if (r.status === "needs_attention") {
-      notes.push("飞书出站：" + who + " 有 " + r.count +
-        " 条被飞书永久拒绝过，不会再自动重试，等你处理。");
     } else if (r.status === "error") {
       notes.push("飞书出站：" + who + " 发布失败（" + r.reason + "），进展留在 outbox，兜底定时器会重试。");
     } else if (r.status === "skipped" && r.reason === "auto_publish_disabled") {

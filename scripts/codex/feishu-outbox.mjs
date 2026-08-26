@@ -48,7 +48,7 @@ import { isCanonicalIso } from "../canonical-time.mjs";
 import { auditOutbox } from "./drain-service.mjs";
 import { outboxMutationBlocker } from "../outbox.mjs";
 import { outboxDirOf } from "../drain-outbox.mjs";
-import { loadRegistry as loadClaudeRegistry } from "../registry.mjs";
+import { loadRegistryStrict as loadClaudeRegistryStrict } from "../registry.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
 import {
   bridgeHome, loadRegistry, registryFile, resolveTaskOutboundGeneration, taskPaths,
@@ -259,7 +259,11 @@ export function describeTaskPublishability({ task, home }) {
  *          含义却相反。
  */
 export function collectProjectBacklog() {
-  const reg = loadClaudeRegistry();
+  // **用严格读取器。**宽松那个把 EISDIR / EACCES 一律变成"成功的空表"——
+  // 评审实测：登记表路径是目录时返回 {ok:true, projects:[]}，
+  // 于是"读不出来"又一次显示成了"没有积压"。它还会过滤停用条目，
+  // 而停用绑定的 outbox 里照样可能躺着发不出去的内容，正是要给人看的。
+  const reg = loadClaudeRegistryStrict();
   if (!reg.ok) return { ok: false, scanned: false, reason: reg.reason ?? "registry_unreadable", projects: [] };
   const seen = new Set();
   const projects = [];

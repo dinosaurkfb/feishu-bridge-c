@@ -38,9 +38,9 @@ import {
 } from "./registry.mjs";
 import {
   MAX_AUTO_PUBLISH_ATTEMPTS, appendEvent, auditOutbox, classifyOutboxRecord,
-  clearPermanentRejection, codexReplyEventKey, composeDigest, hasPublishAuthorization,
-  isPermanentlyRejected, listPending, markPublishEligibleByEventKey, markSent,
-  outboxMutationBlocker, recordPublishFailure, suppressPublishByEventKey,
+  clearPermanentRejection, codexReplyEventKey, composeDigest, explainabilityGaps,
+  hasPublishAuthorization, isPermanentlyRejected, listPending, markPublishEligibleByEventKey,
+  markSent, outboxMutationBlocker, recordPublishFailure, suppressPublishByEventKey,
 } from "./outbox.mjs";
 import {
   capMarkdownTables, composeOutboundCard, countMarkdownTables, outboundCardBatches,
@@ -48,7 +48,8 @@ import {
 } from "./outbound-card.mjs";
 import { PUBLISH_FAILURE, classifyPublishFailure } from "./outbound.mjs";
 import {
-  drainProject, outboxDirOf, publishErrorDetail, publishRetryability, suppressCmd, watcherActive,
+  describeDrainOutcome, drainProject, outboxDirOf, publishErrorDetail, publishRetryability,
+  suppressCmd, watcherActive,
 } from "./drain-outbox.mjs";
 import { applySuppression } from "./feishu-suppress-outbox.mjs";
 import { applySuppressionCore, suppressionDigest } from "./suppress-outbox-core.mjs";
@@ -13038,19 +13039,207 @@ test("认不出来的失败也不许无限重试：次数上限才是兜底那�
     "**必须自己停下来** —— 这就是那 12 小时空转的根");
   assert.equal(calls, MAX_AUTO_PUBLISH_ATTEMPTS,
     "上限是 " + MAX_AUTO_PUBLISH_ATTEMPTS + " 次，实际试了 " + calls + " 次");
-  assert.match(last.rejected[0].why, /试了 5 次都没成/u, "**要说清是撞了上限，不是平台拒绝**");
+  assert.match(last.rejected[0].why, /自动重试预算耗尽/u,
+    "**要说清是撞了上限，不是平台拒绝** —— 下一步不同：前者值得再试一次");
+  assert.equal(last.rejected[0].why.includes("平台拒绝"), false, "不许说成平台拒绝");
 
   // 再跑一轮：**一次都不许再调**。
   const before = calls;
   drainProject({ root: dir, publish: boom, diagnose: safeDiagnose });
   assert.equal(calls, before, "停了就是停了");
 
-  // 人显式重试：计数也要清 —— 只清标记不清计数的话，再失败一次就立刻又撞上限，
-  // 那不叫给了一次机会。
+  // 人显式重试 = **现在再试一次**，不是重置预算。
+  //
+  // 上一版在选择那一步就把标记清了，于是 dry-run 也会改盘、构卡失败也会把记录
+  // 重新暴露给自动发布 —— **预演不许改盘，保护不许提前撤**。
+  const dry = drainProject({
+    root: dir, publish: boom, diagnose: safeDiagnose, retryRejected: true, dryRun: true });
+  assert.equal(dry.status, "dry_run", "前提：dry-run 走到了发布准备");
+  assert.equal(calls, before, "dry-run 不许真的发");
+  const afterDry = listPending({ outboxDir: obDir })[0];
+  assert.equal(isPermanentlyRejected(afterDry), true,
+    "**dry-run 一个字节都不许改** —— 保护标记必须还在");
+  assert.equal(afterDry.publish_attempts, MAX_AUTO_PUBLISH_ATTEMPTS, "计数也不许被动");
+
   drainProject({ root: dir, publish: boom, diagnose: safeDiagnose, retryRejected: true });
-  assert.equal(calls, before + 1, "--retry-rejected 要真的再试");
-  const rec = listPending({ outboxDir: obDir })[0];
-  assert.equal(rec.publish_attempts, 1, "**计数要从头开始**，实际是 " + rec.publish_attempts);
+  assert.equal(calls, before + 1, "--retry-rejected 要真的再试一次");
+  const afterRetry = listPending({ outboxDir: obDir })[0];
+  assert.equal(isPermanentlyRejected(afterRetry), true,
+    "**再试还是失败，就还是被拒** —— 不许因为人试过一次就悄悄放回自动队列");
+
+  // 发成功了，保护字段才该消失 —— 那时它们已经没有意义。
+  let sent = 0;
+  drainProject({ root: dir, diagnose: safeDiagnose, retryRejected: true,
+    publish: () => { sent += 1; return "om_ok"; } });
+  assert.equal(sent, 1);
+  const files = fs.readdirSync(obDir).map((f) => JSON.parse(fs.readFileSync(path.join(obDir, f), "utf-8")));
+  const done = files.find((r) => r.published_at !== null);
+  assert.ok(done, "发出去了就该标已发布");
+  assert.equal(done.publish_rejected_at, undefined, "发成功后保护字段要清干净");
+  assert.equal(done.publish_attempts, undefined);
+  assert.equal(done.publish_rejected_reason, undefined);
+});
+
+test("重试保护那三个字段必须自洽，写坏了不许悄悄回到自动队列", () => {
+  // 评审实测：把它们改成 "five" / "not-a-time" / 一个对象，auditOutbox 仍 ok:true，
+  // 而 isPermanentlyRejected 判 false —— **一条被永久拒绝的记录靠写坏自己的
+  // 保护字段就重新进入了自动发布队列**。
+  const good = { ...outboxRecord({ text: "一条" }),
+    publish_attempts: 3, publish_rejected_at: "2026-08-26T00:00:00.000Z",
+    publish_rejected_reason: "平台拒绝（err_11310）" };
+  assert.deepEqual(explainabilityGaps(good), [], "正常那份不许被误伤：" +
+    JSON.stringify(explainabilityGaps(good)));
+  // 三个字段都不在也合法 —— 绝大多数记录就是这样。
+  assert.deepEqual(explainabilityGaps(outboxRecord({ text: "干净的" })), []);
+
+  const cases = [
+    ["attempts 是字符串", { publish_attempts: "five" }, "publish_attempts"],
+    ["attempts 是小数", { publish_attempts: 1.5 }, "publish_attempts"],
+    ["attempts 是负数", { publish_attempts: -1 }, "publish_attempts"],
+    ["attempts 是对象", { publish_attempts: {} }, "publish_attempts"],
+    ["rejected_at 不是时间", { publish_rejected_at: "not-a-time",
+      publish_rejected_reason: "x" }, "publish_rejected_at"],
+    ["rejected_at 是 null", { publish_rejected_at: null,
+      publish_rejected_reason: "x" }, "publish_rejected_at"],
+    ["reason 是对象", { publish_rejected_at: "2026-08-26T00:00:00.000Z",
+      publish_rejected_reason: {} }, "publish_rejected_reason"],
+    ["reason 是纯空白", { publish_rejected_at: "2026-08-26T00:00:00.000Z",
+      publish_rejected_reason: "   " }, "publish_rejected_reason"],
+    // **两个方向都要查**：有理由没时间同样说不清。
+    ["有时间没理由", { publish_rejected_at: "2026-08-26T00:00:00.000Z" },
+      "publish_rejected_reason"],
+    ["有理由没时间", { publish_rejected_reason: "被拒了" }, "publish_rejected_at"],
+  ];
+  for (const [why, patch, field] of cases) {
+    const rec = { ...outboxRecord({ text: "一条" }), ...patch };
+    assert.ok(explainabilityGaps(rec).includes(field),
+      why + "：**说不清却报了干净** —— " + JSON.stringify(explainabilityGaps(rec)));
+  }
+
+  // 真实入口：写坏的记录必须让整批不动，而不是让它偷偷回到队列。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-fieldshape-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir);
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
+    ...outboxRecord({ text: "写坏保护字段的" }), publish_attempts: "five" }));
+  const blocked = outboxMutationBlocker(auditOutbox(obDir));
+  assert.ok(blocked, "**写坏保护字段的记录必须被守卫看见**");
+  assert.equal(blocked.reason, "outbox_unexplainable");
+});
+
+test("watcher 也要跳过被永久拒绝的 —— 判据不许有第二条路绕过去（真实进程）", () => {
+  // 评审实测：watcher 直接把整个 listPending() 塞进发布批次，
+  // 于是"不会再自动重试"**只对 drainProject 成立**。
+  // 一个共用判据只要还有第二条路绕过去，它就不叫共用。
+  //
+  // **这条必须驱动真实 watcher 进程。**我第一版在测试里把那行判据抄了一遍
+  // 然后断言它 —— 那测的是我抄的那份，不是产品里那份：
+  // 把 watcher 的过滤删掉，测试照样全绿。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-watcherskip-"));
+  const rt = path.join(dir, ".runtime-data", "inbound");
+  const runs = path.join(rt, "runs");
+  const claims = path.join(rt, "delivery-claims");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  for (const d of [rt, runs, claims, obDir]) fs.mkdirSync(d, { recursive: true });
+
+  // 可记账的假 lark-cli：每次调用往 argsFile 追加一行。
+  const argsFile = path.join(dir, "lark-calls.jsonl");
+  const bin = path.join(dir, "fake-lark.cjs");
+  fs.writeFileSync(bin, "#!" + process.execPath + "\n" +
+    "require('node:fs').appendFileSync(" + JSON.stringify(argsFile) +
+    ", JSON.stringify(process.argv.slice(2)) + '\\n');\n" +
+    "process.stdout.write('{\"ok\":true,\"data\":{\"message_id\":\"om_sent\"}}');\n",
+    { mode: 0o700 });
+
+  fs.writeFileSync(path.join(rt, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", lark_cli_bin: bin, auto_publish_on_completion: true,
+  }));
+  fs.writeFileSync(path.join(rt, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_fixture", claude_session_id: null,
+    channel_generation_id: "gen-1", expires_at: "2099-01-01T00:00:00.000Z",
+  }));
+  fs.writeFileSync(path.join(obDir, "0001.json"),
+    JSON.stringify(outboxRecord({ text: "正常的那条" })));
+  fs.writeFileSync(path.join(obDir, "0002.json"),
+    JSON.stringify(outboxRecord({ text: "已经被永久拒绝的那条" })));
+  const victim = listPending({ outboxDir: obDir }).find((r) => r.text.includes("永久拒绝"));
+  recordPublishFailure(victim, { permanent: true, reason: "err_11310" });
+  // 前提：它确实被标成了被拒 —— 否则这条测试什么都没测。
+  assert.equal(isPermanentlyRejected(listPending({ outboxDir: obDir })
+    .find((r) => r.text.includes("永久拒绝"))), true, "前提不成立");
+
+  const key = "w".repeat(64);
+  fs.writeFileSync(path.join(runs, key + ".jsonl"),
+    JSON.stringify({ type: "result", is_error: false, result: "这一轮的结果" }) + "\n");
+
+  const r = spawnSync(process.execPath,
+    [path.resolve("scripts", "watch-and-publish.mjs"), key, dir],
+    { encoding: "utf-8", env: { ...process.env, HOME: dir }, timeout: 60_000 });
+  assert.equal(r.status, 0, "进程要正常退出：" + (r.stdout ?? "") + (r.stderr ?? ""));
+
+  const sent = fs.existsSync(argsFile) ? fs.readFileSync(argsFile, "utf-8") : "";
+  assert.match(sent, /正常的那条/u, "正常那条要发出去");
+  assert.equal(/已经被永久拒绝的那条/u.test(sent), false,
+    "**被拒的不许被 watcher 发出去** —— 那就是绕过去的第二条路");
+
+  // 它仍然在盘上、仍然在 listPending 里 —— 只是不参与自动发布。
+  const still = listPending({ outboxDir: obDir }).find((r) => r.text.includes("永久拒绝"));
+  assert.ok(still, "**不许从视野里消失** —— 消失了就没人知道它在等处理");
+  assert.equal(still.published_at, null, "没发出去就不许标已发布");
+});
+
+test("既是永久拒绝又带跨应用诊断时，先说实际落盘状态", () => {
+  // 评审构造：同一次失败同时得到 permanent:true 和 diagnosis root_owned_by_other_app。
+  // 上一版把 diagnosis 排在前面，于是仍然说"重试可能一直失败"并推荐**不可逆抑制** ——
+  // 把"已经暂停自动重试"和"可恢复的重试入口"两件事一起藏了。
+  //
+  // **分支顺序是语义，不是排版**，所以它得能被验。原来内嵌在 CLI 里，
+  // 唯一能验它的办法是真的跑一次发布（那会打到真实飞书），
+  // 或者去断言源码文本（那种断言改坏了照样绿）。现在抽成了纯函数。
+  const both = {
+    status: "error", reason: "publish_failed",
+    permanent: true, permanentKind: "platform_rejected", permanentReason: "err_11310",
+    error: "ext=ErrCode: 11310; ErrMsg: card table number over limit",
+    markedRejected: ["0001.json"],
+    diagnosis: { kind: "root_owned_by_other_app", ownerName: "别的应用", generationId: "gen-1" },
+  };
+  const said = describeDrainOutcome(both, { root: "/p" });
+  assert.equal(said.error, true);
+  assert.match(said.text, /已暂停自动重试/u, "**先说实际落盘状态**");
+  assert.equal(said.text.includes("重试可能一直失败"), false,
+    "**不许说成还会重试** —— 它已经停了");
+  assert.match(said.text, /--retry-rejected --force/u,
+    "可恢复的重试入口不许被藏起来，而且要带 --force（自动发布关掉时不带会被挡）");
+  assert.match(said.text, /别的应用/u, "跨应用诊断作为补充线索仍要说");
+  assert.equal(said.text.includes("--apply"), false,
+    "**不许在这里推荐不可逆抑制** —— 还有可恢复的路可走");
+
+  // 只有诊断、不是永久拒绝时，仍走原来那条。
+  const onlyDiag = { status: "error", reason: "publish_failed", error: "boom",
+    diagnosis: { kind: "root_owned_by_other_app", ownerName: "别的应用", generationId: "gen-1" } };
+  assert.match(describeDrainOutcome(onlyDiag, { root: "/p" }).text, /重试可能一直失败/u,
+    "守卫不能把好情况也一起挡了");
+
+  // 撞满次数和平台拒绝要说成两件事。
+  const exhausted = { ...both, permanentKind: "retry_exhausted", permanentReason: "retry_exhausted",
+    diagnosis: null };
+  const exText = describeDrainOutcome(exhausted, { root: "/p" }).text;
+  assert.match(exText, /自动重试预算耗尽/u, "**撞满次数要说成撞满次数**");
+  assert.equal(exText.includes("飞书拒绝"), false, "不许说成平台拒绝 —— 下一步不同");
+
+  // needs_attention 也不许沉默，也要给带 --force 的重试入口。
+  const attention = describeDrainOutcome({ status: "needs_attention", count: 2,
+    rejected: [{ file: "a.json", why: "平台拒绝（err_11310）" },
+      { file: "b.json", why: "自动重试预算耗尽" }] }, { root: "/p" });
+  assert.equal(attention.error, true, "**不许沉默** —— 沉默就是一份假的没有积压");
+  assert.match(attention.text, /a\.json/u);
+  assert.match(attention.text, /--retry-rejected --force/u);
+
+  // outbox 真空时不说话（除非 verbose）—— 守卫不能把好情况变成噪音。
+  assert.equal(describeDrainOutcome({ status: "empty" }, { root: "/p" }), null);
+  assert.match(describeDrainOutcome({ status: "empty" }, { root: "/p", verbose: true }).text,
+    /outbox 为空/u);
 });
 
 summarySealed = true;

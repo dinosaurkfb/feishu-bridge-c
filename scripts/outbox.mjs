@@ -204,14 +204,20 @@ export function recordPublishFailure(rec, {
     rewrite(rec, (next) => { next.publish_attempts = attempts; });
     return { rejected: false, attempts, reason: null };
   }
-  const why = (permanent ? String(reason) : "试了 " + attempts + " 次都没成：" + String(reason))
+  // **撞满次数只证明「自动重试预算耗尽」，不证明「飞书永久拒绝」。**
+  // 两者都表现为"暂停自动重试"，但下一步不同：前者值得人再试一次，
+  // 后者不改内容再试多少次都一样。说混了会把人支去做错的事。
+  const kind = permanent ? "platform_rejected" : "retry_exhausted";
+  const why = (permanent
+    ? "平台拒绝（" + String(reason) + "）"
+    : "自动重试预算耗尽：试了 " + attempts + " 次都没成（" + String(reason) + "）")
     .slice(0, 400) || "未说明";
   rewrite(rec, (next) => {
     next.publish_attempts = attempts;
     next.publish_rejected_at = new Date().toISOString();
     next.publish_rejected_reason = why;
   });
-  return { rejected: true, attempts, reason: why };
+  return { rejected: true, attempts, kind, reason: why };
 }
 
 /**
@@ -231,6 +237,14 @@ export function clearPermanentRejection(rec) {
 export function markSent(rec, messageId) {
   const next = { ...rec, published_at: new Date().toISOString(), feishu_message_id: messageId ?? null };
   delete next._file;
+  delete next._raw;
+  // **发出去了，重试保护就没有意义了 —— 在同一次写里清掉。**
+  //
+  // 显式重试曾经在发布**之前**清标：dry-run 也会改盘，构卡失败或进程中断
+  // 会把记录重新暴露给自动发布。保护要留到确实不需要为止，而不是提前撤。
+  delete next.publish_rejected_at;
+  delete next.publish_rejected_reason;
+  delete next.publish_attempts;
   const tmp = rec._file + ".tmp." + randomUUID();
   fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
   fs.renameSync(tmp, rec._file);
@@ -534,6 +548,32 @@ export function explainabilityGaps(rec) {
   // 而这正是这条线上反复被罚的那件事。
   // 抑制核心的 corruptTargets 保留作纵深防御，但判定从这里开始。
   if (generationTargetState(rec) === "corrupt") gaps.push("target_channel_generation_id");
+
+  // **重试保护那三个字段也要在这一层看见。**
+  //
+  // 评审实测：把它们改成 "five" / "not-a-time" / 一个对象，auditOutbox 仍报 ok:true，
+  // 而 isPermanentlyRejected 判 false —— **一条被永久拒绝的记录靠写坏自己的
+  // 保护字段就重新进入了自动发布队列**。
+  //
+  // 它们不构成第四种状态，但必须是一台**封闭、自洽**的辅助状态机：
+  //   · publish_attempts：缺省，或非负安全整数
+  //   · publish_rejected_at：缺省，或规范时间
+  //   · publish_rejected_reason：跟 publish_rejected_at 同生共死，且非空
+  // 自洽的意思是**两个方向都要查**：有理由没时间同样说不清。
+  const attempts = rec?.publish_attempts;
+  if (attempts !== undefined
+    && (!Number.isSafeInteger(attempts) || attempts < 0)) gaps.push("publish_attempts");
+  const rejectedAt = rec?.publish_rejected_at;
+  const rejectedWhy = rec?.publish_rejected_reason;
+  if (rejectedAt !== undefined && !isCanonicalIso(rejectedAt)) gaps.push("publish_rejected_at");
+  if (rejectedWhy !== undefined
+    && (typeof rejectedWhy !== "string" || rejectedWhy.trim().length === 0)) {
+    gaps.push("publish_rejected_reason");
+  }
+  if ((rejectedAt === undefined) !== (rejectedWhy === undefined)) {
+    // 只有一半的话说不清它到底是不是被拒了 —— 而这个问题的答案决定要不要再发。
+    gaps.push(rejectedAt === undefined ? "publish_rejected_at" : "publish_rejected_reason");
+  }
   return gaps;
 }
 

@@ -15,7 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
-  auditOutbox, clearPermanentRejection, composeDigest, isPermanentlyRejected, listPending,
+  MAX_AUTO_PUBLISH_ATTEMPTS, auditOutbox, composeDigest, isPermanentlyRejected, listPending,
   markSent, outboxMutationBlocker, recordPublishFailure,
 } from "./outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
@@ -143,8 +143,10 @@ const DIAGNOSTIC_PATTERNS = [
   /ErrCode:\s*\d+/gu,
   /ErrMsg:\s*[^;"\n]{1,120}/gu,
   /ErrorValue:\s*[^;"\n]{1,60}/gu,
-  /httpCode:?\s*\d{3}/gu,
-  /errCode:?\s*\d+/gu,
+  // `httpCode 400` 和 `"httpCode": 400` 都要认 —— 两种形态在真实输出里都见过，
+  // 正文承诺了会捞它们，就不能只认其中一种。
+  /httpCode"?\s*:?\s*\d{3}/gu,
+  /errCode"?\s*:?\s*\d+/gu,
   /"code":\s*\d+/gu,
 ];
 
@@ -368,17 +370,18 @@ export function drainProject({
     // 它们仍是 pending（没发出去、也没被停发）—— 只是等人看一眼，
     // 而不是每 30 分钟再撞一次同一堵墙。停发是不可逆的，
     // 「这次发不出去」不该顺手变成「永远别发」。
-    const rejected = retryRejected ? [] : all.filter(isPermanentlyRejected);
-    let pending = all.filter((r) => !isPermanentlyRejected(r));
-    if (retryRejected) {
-      // **重试要给一次干净的机会。**只把它放回队列而不清计数的话，
-      // 人修好起因、重试一次再失败，立刻又撞上限 —— 那不叫给了一次机会。
-      // 锁在手里，改的是同一条记录的语义，跟抑制、资格提升共用这把锁。
-      for (const record of all.filter(isPermanentlyRejected)) {
-        try { clearPermanentRejection(record); } catch { /* 清不掉就照旧跳过它 */ }
-      }
-      pending = listPending({ outboxDir }).filter((r) => !isPermanentlyRejected(r));
-    }
+    const held = all.filter(isPermanentlyRejected);
+    const rejected = retryRejected ? [] : held;
+    // **重试只在内存里放行，不预先改盘。**
+    //
+    // 上一版在这里就把标记清了 —— 而清标发生在 dry-run、构卡、真实发布**之前**：
+    // 评审实测 `dryRun:true + retryRejected:true` 返回 dry_run，
+    // **文件字节却已经变了、保护标记已经没了**；构卡失败或进程中断同样会把记录
+    // 重新暴露给自动发布。**预演不许改盘，保护不许提前撤。**
+    //
+    // 标记的清除移到发布成功之后 —— 而那时 markSent 本来就要重写这条记录，
+    // 所以顺手在同一次写里清掉，连额外的写都不用。
+    const pending = retryRejected ? all : all.filter((r) => !isPermanentlyRejected(r));
     if (pending.length === 0) {
       // **有被拒的就不能报 empty。**报 empty 会让人以为队列干净了，
       // 而其实有内容正等着他处理 —— 一份假的「没有积压」比没有报告更坏。
@@ -443,6 +446,7 @@ export function drainProject({
           ...activity,
         });
       }
+      // 发布成功了才清保护标记 —— markSent 本来就要重写这条记录，同一次写里做完。
       for (const record of item.batch) markSent(record, messageId);
       messageIds.push(messageId);
     }
@@ -484,9 +488,13 @@ export function drainProject({
         status: "error", root, reason: "publish_failed",
         // **报"永久"要以实际打没打标为准**，不是以"认出来了吗"为准 ——
         // 撞满次数上限的那次同样是"不会再自动重试"，说成会重试就是骗人。
+        // **报"永久"要以实际打没打标为准**，不是以"认出来了吗"为准 ——
+        // 撞满次数上限的那次同样是"不会再自动重试"，说成会重试就是骗人。
         permanent: marked.length > 0,
+        permanentKind: marked.length === 0 ? null
+          : (retryability.permanent ? "platform_rejected" : "retry_exhausted"),
         permanentReason: marked.length === 0 ? null
-          : (retryability.permanent ? retryability.reason : "too_many_attempts"),
+          : (retryability.permanent ? retryability.reason : "retry_exhausted"),
         markedRejected: marked,
         // 挑有用的那半：见 publishErrorDetail。**从头截固定长度会把真正的
         // 错误码切掉** —— 这条命令光命令回显就上千字符，前 400 字全是命令。
@@ -502,6 +510,84 @@ export function drainProject({
   } finally {
     releasePublishLock(lockDir);
   }
+}
+
+/**
+ * 把一次排空结果讲成一句话。**分支顺序是这个函数的语义，不是排版。**
+ *
+ * 抽出来的理由：这套 if-chain 里的**顺序本身**就是一条被评审罚过的判据 ——
+ * 同一次失败可以既是永久拒绝、又带跨应用诊断，谁排前面决定人看到哪一个。
+ * 内嵌在 CLI 里的话，唯一能验它的办法是真的跑一次发布（那会打到真实飞书），
+ * 或者去断言源码文本（那种断言改坏了照样绿）。
+ *
+ * @returns {{text:string, error:boolean}|null} null = 不用说话
+ */
+export function describeDrainOutcome(r, { root, verbose = false } = {}) {
+  if (r.status === "published") {
+    return { text: "已发布 " + r.count + " 条 -> " + r.messageId, error: false };
+  }
+  if (r.status === "dry_run") {
+    return { text: "[dry-run] 将发布 " + r.count + " 条：\n---\n" + r.text, error: false };
+  }
+  if (r.status === "error" && r.permanent === true) {
+    // **先看实际落盘状态，诊断只是补充线索。**
+    //
+    // 上一版把 diagnosis 排在前面，于是同时命中两者时它仍然说"重试可能一直失败"
+    // 并推荐**不可逆抑制** —— 把"已经暂停自动重试"和"可恢复的重试入口"一起藏了。
+    //
+    // **撞满次数和平台拒绝要分开说**：前者值得人再试一次，
+    // 后者不改内容再试多少次都一样。
+    return {
+      error: true,
+      text: (r.permanentKind === "retry_exhausted"
+        ? "这一批的自动重试预算耗尽了（试满 " + MAX_AUTO_PUBLISH_ATTEMPTS + " 次），**已暂停自动重试**："
+        : "飞书拒绝了这一批（" + r.permanentReason + "），**已暂停自动重试**：") + "\n" +
+        "  " + r.error + "\n" +
+        (r.markedRejected?.length ? "  已标记：" + r.markedRejected.join("、") + "\n" : "") +
+        (r.diagnosis?.kind === "root_owned_by_other_app"
+          ? "  另外：话题由另一个应用（" + (r.diagnosis.ownerName ?? "未知") + "）创建。\n" : "") +
+        "  修好起因之后要重发：node " + drainCmd() + " --project " + root + " --retry-rejected --force\n" +
+        "  确定不发了（不可逆）：node " + suppressCmd() + " --project " + root,
+    };
+  }
+  if (r.status === "error" && r.diagnosis?.kind === "root_owned_by_other_app") {
+    return {
+      error: true,
+      text: "发布失败：话题由另一个应用（" + (r.diagnosis.ownerName ?? "未知") +
+        "）创建，当前身份大概率回复不进去，重试可能一直失败。\n" +
+        "  要停止重试（不可逆）：node " + suppressCmd() + " --project " + root +
+        " --generation " + (r.diagnosis.generationId ?? "<代际 id>") + " --apply",
+    };
+  }
+  if (r.status === "error" && r.local === true) {
+    // **本地问题要点名。**上一版落进通用分支，打出来是
+    // "排空失败（outbox_unexplainable），进展留在 outbox：undefined" ——
+    // 没有文件名、没有坏在哪，等于没兑现"整批拒绝并点名"。
+    // 渲染只**读守卫的结论**，不重新判断（判据只有一份）。
+    return { text: localOutboxMessage(r), error: true };
+  }
+  if (r.status === "error") {
+    return { text: "排空失败（" + r.reason + "），进展留在 outbox：" + r.error, error: true };
+  }
+  if (r.status === "needs_attention") {
+    // **有被拒的就不能沉默。**落进"outbox 为空"那条等于报了一份假的没有积压。
+    return {
+      error: true,
+      text: r.count + " 条已暂停自动重试，等你看一眼：\n" +
+        (r.rejected ?? []).map((item) => "  " + item.file + " —— " + item.why).join("\n") +
+        // **--force 要带上。**自动发布关掉时不带它会被开关提前挡住 ——
+        // 提示指向的操作做不到它说的事，这个坑踩过不止一次。
+        "\n  修好起因之后要重发：node " + drainCmd() + " --project " + root +
+        " --retry-rejected --force",
+    };
+  }
+  if (r.status === "skipped") {
+    return {
+      text: "暂不发布：" + r.reason + (r.count ? "（" + r.count + " 条留在 outbox）" : ""),
+      error: false,
+    };
+  }
+  return verbose ? { text: "outbox 为空", error: false } : null;
 }
 
 // ---------- CLI ----------
@@ -558,48 +644,10 @@ if (isDirectRun(import.meta.url)) {
       : "";
     const r = drainProject({ root, claudeSessionId, dryRun, force, retryRejected });
 
-    if (r.status === "published") {
-      console.log(tag + "已发布 " + r.count + " 条 -> " + r.messageId);
-    } else if (r.status === "dry_run") {
-      console.log(tag + "[dry-run] 将发布 " + r.count + " 条：\n---\n" + r.text);
-    } else if (r.status === "error" && r.diagnosis?.kind === "root_owned_by_other_app") {
-      console.error(tag + "发布失败：话题由另一个应用（" + (r.diagnosis.ownerName ?? "未知") +
-        "）创建，当前身份大概率回复不进去，重试可能一直失败。\n" +
-        "  要停止重试（不可逆）：node " + suppressCmd() + " --project " + root +
-        " --generation " + (r.diagnosis.generationId ?? "<代际 id>") + " --apply");
-      hadError = true;
-    } else if (r.status === "error" && r.local === true) {
-      // **本地问题要点名。**上一版落进下面那条通用分支，打出来是
-      // "排空失败（outbox_unexplainable），进展留在 outbox：undefined" ——
-      // 没有文件名、没有坏在哪，等于没兑现"整批拒绝并点名"。
-      // 而且"排空失败"会把人支去查飞书。
-      //
-      // 渲染只**读守卫的结论**，不重新判断（判据只有一份）。
-      console.error(tag + localOutboxMessage(r));
-      hadError = true;
-    } else if (r.status === "error" && r.permanent === true) {
-      // **永久拒绝不能说成"会重试"。**通用分支那句"进展留在 outbox"
-      // 让人以为等等就好 —— 而它已经每 30 分钟撞同一堵墙撞了 12 小时。
-      console.error(tag + "飞书永久拒绝了这一批（" + r.permanentReason + "），**不会再自动重试**：\n" +
-        "  " + r.error + "\n" +
-        (r.markedRejected?.length
-          ? "  已标记：" + r.markedRejected.join("、") + "\n" : "") +
-        "  修好起因之后要重发：node " + drainCmd() + " --project " + root + " --retry-rejected\n" +
-        "  确定不发了（不可逆）：node " + suppressCmd() + " --project " + root);
-      hadError = true;
-    } else if (r.status === "error") {
-      console.error(tag + "排空失败（" + r.reason + "），进展留在 outbox：" + r.error);
-      hadError = true;
-    } else if (r.status === "needs_attention") {
-      // **有被拒的就不能沉默。**落进"outbox 为空"那条等于报了一份假的没有积压。
-      console.error(tag + r.count + " 条被飞书永久拒绝过，**不会再自动重试**，等你看一眼：");
-      for (const item of r.rejected ?? []) console.error("  " + item.file + " —— " + item.why);
-      console.error("  修好起因之后要重发：node " + drainCmd() + " --project " + root + " --retry-rejected");
-      hadError = true;
-    } else if (r.status === "skipped") {
-      console.error(tag + "暂不发布：" + r.reason + (r.count ? "（" + r.count + " 条留在 outbox）" : ""));
-    } else if (verbose) {
-      console.log(tag + "outbox 为空");
+    const line = describeDrainOutcome(r, { root, verbose });
+    if (line) {
+      (line.error ? console.error : console.log)(tag + line.text);
+      if (line.error) hadError = true;
     }
   }
   if (hadError) process.exit(1);

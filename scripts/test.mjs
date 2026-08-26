@@ -10926,6 +10926,24 @@ test("发布事务：摘要取材是回调前的锁内事实 —— 归一字节
   assert.equal(r2.status, "error", JSON.stringify(r2));
   assert.equal(r2.reason, "batching_failed", "**改写目标要当场抛** —— 冻结不是装饰");
   assert.equal(sends2, 0, "一张都不许发");
+
+  // ③ composeCard 清空 batch 容器。记录和 target 都冻着，容器若还可变，
+  //    摘要枚举它就盖不到任何记录 —— 评审复现：先构卡再 batch.length = 0，
+  //    旧摘要照过、卡片照发、落标一条没有。批在校验后立即封存，一动就抛。
+  const dir3 = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-planmat3-"));
+  const obDir3 = path.join(dir3, "outbox");
+  fs.mkdirSync(obDir3);
+  fs.writeFileSync(path.join(obDir3, "0001.json"), JSON.stringify(outboxRecord({ text: "一条" })));
+  let sends3 = 0;
+  const r3 = publishOutboxAttempt({
+    outboxDir: obDir3, lockDir: path.join(dir3, "lock"), policy: "all_unpaused",
+    resolveTarget: () => ({ ok: true, rootMessageId: "om" }),
+    batchCards: (x) => [x],
+    composeCard: (batch) => { const card = { n: batch.length }; batch.length = 0; return card; },
+    publishBatch: () => { sends3 += 1; return "om_x"; } });
+  assert.equal(r3.status, "error", JSON.stringify(r3));
+  assert.equal(r3.reason, "batching_failed", "**清空批容器要当场抛** —— 封存不是装饰");
+  assert.equal(sends3, 0, "一张都不许发");
 });
 
 test("抑制锁内重选：select 产出说不清目标的记录也要中止（atRecheck）", () => {

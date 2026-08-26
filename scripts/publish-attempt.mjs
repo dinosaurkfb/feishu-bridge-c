@@ -96,7 +96,7 @@ const PLAN_DIGEST_SHAPE = /^pub-[0-9a-f]{24}$/u;
  * 返回后**立即**冻结并拷进 plan 投影；摘要只读这两份，发布用的 target
  * 也是那个冻结对象 —— 摘要说的和实际发的不可能分叉。
  */
-function planDigestOf(files, targetBatches, baseline) {
+function planDigestOf(files, targetBatches) {
   const h = createHash("sha256");
   h.update("v1\nfiles\n");
   for (const f of [...files].sort()) h.update(String(f) + "\n");
@@ -106,10 +106,9 @@ function planDigestOf(files, targetBatches, baseline) {
     // 根消息变了"。rootMessageId 是 publishBatch 真正要发去的地方。
     h.update("target\u0000" + String(item.plan.key) + "\u0000" +
       item.plan.rootMessageId + "\n");
-    for (const record of item.batch) {
-      const base = baseline.get(record);
-      h.update(path.basename(base.file) + "\u0000");
-      h.update(base.rawHash);
+    for (const rec of item.planRecords) {
+      h.update(rec.name + "\u0000");
+      h.update(rec.rawHash);
       h.update("\n");
     }
   }
@@ -255,6 +254,13 @@ export function publishOutboxAttempt({
         rootMessageId: String(target.rootMessageId ?? "") });
       const remaining = new Set(records);
       for (const batch of batchCards(records)) {
+        // **校验与封存一遍完成**：每个成员只从回调给的容器里读一次，
+        // 校验过的就是封进去的（分两遍读的话，带 getter 的异形数组能在
+        // 两次读之间换人）。评审复现过 composeCard 对原始数组 batch.length = 0：
+        // 记录和 target 都冻着，容器却还可变 —— 摘要枚举它就盖不到任何记录，
+        // 旧摘要照过、卡片照发、落标一条没有。所以之后的一切
+        // （构卡、摘要、发布、落标）只碰这个冻结副本。
+        const members = [];
         for (const member of batch) {
           if (!remaining.has(member)) {
             batchingMismatch = "本代际的批里出现了不属于它的对象（外来、重复、克隆或跨代际攒批）";
@@ -267,9 +273,18 @@ export function publishOutboxAttempt({
               path.basename(base ? base.file : String(member._file ?? "?"));
             break;
           }
+          members.push(member);
         }
         if (batchingMismatch) break;
-        targetBatches.push({ batch, target, plan, card: composeCard(batch, target) });
+        const sealed = Object.freeze(members);
+        // 摘要的记录投影也在这里预生成 —— planDigestOf 不再遍历任何
+        // 回调持有过的数组。
+        const planRecords = Object.freeze(sealed.map((r) => {
+          const base = baseline.get(r);
+          return Object.freeze({ name: path.basename(base.file), rawHash: base.rawHash });
+        }));
+        targetBatches.push({ batch: sealed, target, plan, planRecords,
+          card: composeCard(sealed, target) });
       }
       if (batchingMismatch) break;
       if (remaining.size > 0) {
@@ -295,7 +310,7 @@ export function publishOutboxAttempt({
     // 摘要在锁内、批次校验之后算 —— 预览与落盘用的是同一段代码、同一份快照。
     // 目标解析失败到不了这里（上面直接抛进 batching_failed）：
     // **解析不了目标就没有"正常的计划"可哈希**。
-    const planDigest = planDigestOf(snap.files, targetBatches, baseline);
+    const planDigest = planDigestOf(snap.files, targetBatches);
     if (dryRun) {
       // **预演零改盘** —— 这条在显式重试上被击穿过一次（预先清标），
       // 现在结构上不可能：清标只发生在 markSent 里，而 dry-run 走不到那儿。

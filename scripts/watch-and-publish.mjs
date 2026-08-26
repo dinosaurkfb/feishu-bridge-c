@@ -23,6 +23,7 @@ import { claudeRotationBatchHook } from "./drain-outbox.mjs";
 import { publishOutboxAttempt } from "./publish-attempt.mjs";
 import { boundedBudgetMs } from "./eligibility-recovery.mjs";
 import { postDeliveryBits } from "./stop-note.mjs";
+import { repairCmd } from "./repair-run-claim.mjs";
 import { readClaim, recordClaimState } from "./claim.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
@@ -183,6 +184,15 @@ while (true) {
             releaseRunPublishClaim({ runsDir: RUNS, key, token: claim.token });
             console.error("run 回执损坏（" + receipt.why + "）—— **说不清送没送达，" +
               "本轮不发**。去话题核对后手工处理 " + key.slice(0, 8) + " 的回执文件。");
+          } else if (!claim.ok && claim.reason === "reap_lock_held") {
+            // **恢复信息不许在包装层被吞掉**（评审实测：detail 里有锁路径和
+            // 处置提示，这里原来只打一句泛化话 —— run 永久停发却无路可走）。
+            fs.writeFileSync(path.join(RUNS, key + ".publish-failed.json"),
+              JSON.stringify({ at: new Date().toISOString(), reason: "reap_lock_held",
+                detail: claim.detail ?? null }, null, 2));
+            console.error("run 结果本轮不发：接管互斥锁残留。\n  " +
+              (claim.detail ?? "") + "\n  显式维护（核验持有者已死才删，默认预览）：\n  node " +
+              repairCmd() + " --project " + ROOT + " --apply");
           } else if (!claim.ok) {
             console.error("run 结果本轮不发：" + (claim.reason === "claimed_by_other"
               ? "另一个 watcher 正在发同一条 run（claim 互斥）"

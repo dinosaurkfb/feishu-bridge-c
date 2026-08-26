@@ -52,6 +52,7 @@ import {
   PUBLISH_FAILURE, claimRunPublish, classifyPublishFailure, readRunReceipt,
   releaseRunPublishClaim,
 } from "./outbound.mjs";
+import { repairRunClaims } from "./repair-run-claim.mjs";
 import {
   describeDrainOutcome, drainProject, outboxDirOf, suppressCmd, watcherActive,
 } from "./drain-outbox.mjs";
@@ -14680,6 +14681,60 @@ test("回执时间必须是规范时间：非空字符串冒充不了合法送�
     "**冒充的时间不算送达** —— 否则这条 run 被永久跳过：" + JSON.stringify(r));
   fs.writeFileSync(file, JSON.stringify({ published_at: "2026-08-26T00:00:00.000Z" }));
   assert.equal(readRunReceipt({ runsDir: runs, key }).state, "valid", "规范时间照常放行");
+});
+
+test("reap 锁残留：真实 watcher 要给出锁路径与维护命令，维护入口核验后才清（端到端）", () => {
+  // 评审实测：detail 里有锁路径和处置提示，watcher 包装层只打一句泛化话 ——
+  // run 永久停发却无路可走。闭环三段都要验：报警带路 → 维护核验 → 恢复发布。
+  const h = watcherMatrixRunner.fixture();
+  const runs = path.join(h.dir, ".runtime-data", "inbound", "runs");
+  const key = "2".repeat(64);
+  fs.writeFileSync(path.join(runs, key + ".jsonl"),
+    JSON.stringify({ type: "result", is_error: false, result: "被残留锁拦住那一轮" }) + "\n");
+  const claimFile = path.join(runs, key + ".publish-claim.json");
+  fs.writeFileSync(claimFile,
+    JSON.stringify({ pid: 999999999, at: "2020-01-01T00:00:00.000Z", token: "old" }) + "\n");
+  const reapLock = claimFile + ".reaplock";
+  fs.writeFileSync(reapLock, JSON.stringify({ pid: 999999998, at: "2020-01-01T00:00:00.000Z" }) + "\n");
+  const past = new Date(Date.now() - 3600_000);
+  fs.utimesSync(reapLock, past, past);
+
+  // ① watcher：不发、报警带上锁路径与维护命令、落持久失败记录。
+  const r1 = spawnSync(process.execPath,
+    [path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir],
+    { encoding: "utf-8", env: { ...process.env, HOME: h.dir }, timeout: 60_000 });
+  const said = (r1.stdout ?? "") + (r1.stderr ?? "");
+  const argsFile = path.join(h.dir, "lark-calls.jsonl");
+  const sentEarly = fs.existsSync(argsFile)
+    ? fs.readFileSync(argsFile, "utf-8").split("\n").filter((l) => l.includes("被残留锁拦住那一轮")) : [];
+  assert.equal(sentEarly.length, 0, "残留锁在场不许发");
+  assert.match(said, /reaplock/u, "**锁路径要在输出里** —— 人得知道删哪个：" + said.slice(0, 300));
+  assert.match(said, /repair-run-claim\.mjs/u, "**要指路显式维护命令**");
+  const failRecord = JSON.parse(fs.readFileSync(path.join(runs, key + ".publish-failed.json"), "utf-8"));
+  assert.equal(failRecord.reason, "reap_lock_held", "要落持久失败记录");
+
+  // ② 维护入口：预览零改盘；活持有者不动；死残留 --apply 才清。
+  const live = repairRunClaims({ runsDir: runs, apply: true, now: Date.now() });
+  void live;
+  // 先造一个"活持有者"的 claim 验拒删。
+  const liveKey = "1".repeat(64);
+  fs.writeFileSync(path.join(runs, liveKey + ".publish-claim.json"),
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "t" }) + "\n");
+  const report = repairRunClaims({ runsDir: runs, apply: true });
+  const keptLive = report.actions.find((a) => a.file.startsWith(liveKey));
+  assert.equal(keptLive.action, "kept", "**活持有者一律不动**：" + JSON.stringify(keptLive));
+  assert.equal(fs.existsSync(path.join(runs, liveKey + ".publish-claim.json")), true);
+  assert.equal(fs.existsSync(reapLock), false, "死残留要被清掉");
+  assert.equal(fs.existsSync(claimFile), false);
+
+  // ③ 清理之后 watcher 恢复发布。
+  const r2 = spawnSync(process.execPath,
+    [path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir],
+    { encoding: "utf-8", env: { ...process.env, HOME: h.dir }, timeout: 60_000 });
+  void r2;
+  const sent = fs.readFileSync(argsFile, "utf-8").split("\n")
+    .filter((l) => l.includes("被残留锁拦住那一轮"));
+  assert.equal(sent.length, 1, "**维护后要恢复发布** —— 恢复入口不是摆设");
 });
 
 summarySealed = true;

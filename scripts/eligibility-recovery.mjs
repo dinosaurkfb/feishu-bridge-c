@@ -252,7 +252,10 @@ export function settleOwnEligibility({
     if (recheck.ok) {
       return { ok: true, reason: recheck.reason ?? (recheck.changed ? "promoted" : "unchanged") };
     }
-    return { ok: false, reason: recheck.reason ?? "marker_missing" };
+    // **why 要原样传出去。**丢掉的话，一条畸形 publish_eligible_at 最终只会
+    // 显示 record_unclassified，而底层其实已经知道是哪个字段出的问题。
+    return { ok: false, reason: recheck.reason ?? "marker_missing",
+      ...(recheck.why ? { why: recheck.why } : {}) };
   };
   const { last } = retryUntil({
     deadline: now() + eligibilityBudgetMs(budgetMs), waitMs, now, wait,

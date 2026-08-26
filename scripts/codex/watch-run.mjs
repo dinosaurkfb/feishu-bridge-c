@@ -3,7 +3,7 @@
 
 import { readClaim, recordClaimState } from "../claim.mjs";
 import {
-  eligibilityBudgetMs, recoverEligibilityPending, settleOwnEligibility,
+  eligibilityBudgetMs, settleEligibilityPending, settleOwnEligibility,
 } from "../eligibility-recovery.mjs";
 import { releaseSessionLock } from "../handoff.mjs";
 import {
@@ -43,14 +43,22 @@ const run = {
 const eventKey = codexReplyEventKey({ threadId: task.codex_thread_id, claimKey: key });
 const acceptedClaim = readClaim({ claimsDir: paths.claims, key });
 const targetGenerationId = acceptedClaim?.origin_channel_generation_id ?? null;
-// **上一轮卡住的资格，在这里补上。**
+// **上一轮卡住的资格，在这里补上 —— 而且要等到有结论。**
 //
 // 提升取不到发布锁时（publisher_busy）watcher 只记一个 eligibility_pending 就退了；
 // 没人消费的话那条答复再没有任何路径获得资格。
+//
+// **这里必须用有界的那个消费者，不能只扫一次。**评审实测：只扫一次时，
+// 启动这一刻若撞上 publisher_busy，而随后这一轮**自己**的资格直接拿到了成功，
+// 就再也不会进 settleOwnEligibility 那个分支 —— 旧标记继续留着、旧答复仍无资格，
+// 若没有下一条入站消息，就再无消费者。
+// 共用截止时间只保护"自己刚写的标记"，保护不了历史标记。
+//
 // **必须在拿发布锁之前跑** —— 它内部要拿那把锁，锁内调会自己卡死自己。
-const recovered = recoverEligibilityPending({
+const recovered = settleEligibilityPending({
   claimsDir: paths.claims, outboxDir: paths.outbox,
-  publishLockDir: paths.publishLock, threadId: task.codex_thread_id });
+  publishLockDir: paths.publishLock, threadId: task.codex_thread_id,
+  budgetMs: eligibilityBudgetMs(process.env.FEISHU_BRIDGE_ELIGIBILITY_BUDGET_MS) });
 if (!recovered.ok) {
   // 读不出 claims 目录跟"一条都没有"长得一样，含义却相反 —— 说出来。
   console.error("claims 目录读不出来（" + recovered.reason + "），这一轮没法确认有没有卡住的资格。");

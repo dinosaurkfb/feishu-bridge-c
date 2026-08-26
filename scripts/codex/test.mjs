@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -16,7 +16,7 @@ import {
   plistBody, scanRunnable,
 } from "./drain-service.mjs";
 import {
-  explainabilityGaps, hasPublishAuthorization, outboxMutationBlocker,
+  codexReplyEventKey, explainabilityGaps, hasPublishAuthorization, outboxMutationBlocker,
 } from "../outbox.mjs";
 import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
 import { generationTargetState } from "../topic-generation.mjs";
@@ -6414,6 +6414,84 @@ test("watcher：标记自己看不懂时要说出具体那句，不是只说 mar
     assert.match(risk.text, /文件名不是 claim key 的形状/u, "**具体那句要说出来**");
   } finally {
     releasePublishLock(paths.publishLock);
+  }
+});
+
+test("watcher 启动时的历史标记：撞上锁要等到有结论，不能只扫一次", () => {
+  // 评审实测的接线缺陷：启动扫描只调一次 recoverEligibilityPending，
+  // 若这一刻撞上 publisher_busy，而随后**这一轮自己**的资格直接拿到成功，
+  // 就再也不会进 settleOwnEligibility 那个分支 ——
+  // **旧标记继续留着、旧答复仍无资格**，没有下一条入站消息就再无消费者。
+  //
+  // 共用截止时间只保护"自己刚写的标记"，保护不了历史标记。
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Legacy",
+    rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = false;
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  const paths = taskPaths(task, home);
+  fs.mkdirSync(paths.runs, { recursive: true });
+  fs.mkdirSync(paths.claims, { recursive: true });
+  fs.mkdirSync(paths.outbox, { recursive: true });
+  fs.mkdirSync(paths.sessionLock, { recursive: true });
+
+  // 一条**上一轮遗留**的答复 + 它的恢复标记。
+  const oldKey = "c".repeat(64);
+  const oldEventKey = codexReplyEventKey({ threadId: THREAD_A, claimKey: oldKey });
+  const oldRec = path.join(paths.outbox, "old.json");
+  fs.writeFileSync(oldRec, JSON.stringify({
+    ...outboxRecord({ text: "上一轮那条答复" }),
+    event_key: oldEventKey, run_id: oldKey, publish_eligible_at: null }));
+  fs.writeFileSync(path.join(paths.claims, oldKey + ".eligibility_pending.json"), JSON.stringify({
+    schema_version: "1.0", claim_key: oldKey, state: "eligibility_pending",
+    recorded_at: "2026-08-25T00:00:00.000Z", run_state: "completed",
+    promote_failed: "publisher_busy", event_key: oldEventKey,
+  }));
+
+  // 这一轮自己：run 已终局，资格能直接拿到。
+  const key = "d".repeat(64);
+  fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), [
+    { type: "thread.started", thread_id: THREAD_A }, { type: "turn.started" }, { type: "turn.completed" },
+  ].map(JSON.stringify).join("\n") + "\n");
+  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify({ exit_code: 0 }));
+  fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "这一轮的答复");
+
+  // **启动这一刻锁被别人占着，1.5 秒后放开** —— 只扫一次的实现会在这里放弃。
+  fs.mkdirSync(path.dirname(paths.publishLock), { recursive: true });
+  assert.equal(acquirePublishLock(paths.publishLock).ok, true, "前提：启动时锁被占着");
+  const releaser = spawn("/bin/sh", ["-c",
+    "sleep 1.5; rm -rf " + JSON.stringify(paths.publishLock)], { stdio: "ignore" });
+  releaser.unref();
+  try {
+    const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
+      "--claim-key", key, "--task-key", task.logical_task_key,
+    ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+    assert.equal(r.status, 0, r.stderr);
+
+    // 这一轮自己当然要成功。
+    const mine = fs.readdirSync(paths.outbox)
+      .map((f) => JSON.parse(fs.readFileSync(path.join(paths.outbox, f), "utf-8")))
+      .find((e) => e.event_key === codexReplyEventKey({ threadId: THREAD_A, claimKey: key }));
+    assert.ok(mine, "这一轮的答复要入队");
+
+    // **关键：旧的那条必须由「启动扫描」这一步补回来。**
+    //
+    // 只断言"最终拿到了资格"是不够的：这一轮自己的 settleOwnEligibility 里
+    // 也会扫全目录，顺手把旧标记一起恢复掉 —— **于是启动入口改坏了照样绿**。
+    // 实测过：把启动预算改成 0（退回只扫一次），这条断言仍然通过。
+    // 所以要钉住的是"启动这一步自己扫到了有结论"，它有自己的输出。
+    assert.match(r.stderr ?? "", new RegExp("补回发布资格：" + oldKey, "u"),
+      "**启动扫描必须自己等到有结论** —— 而不是靠后面那一步顺手捡走：\n" + r.stderr);
+    assert.equal(new RegExp("资格仍卡住：" + oldKey, "u").test(r.stderr ?? ""), false,
+      "启动扫描不许以「仍卡住」收场就往下走");
+    assert.match(JSON.parse(fs.readFileSync(oldRec, "utf-8")).publish_eligible_at ?? "",
+      /^\d{4}-\d{2}-\d{2}T/u, "上一轮遗留的答复要拿到资格");
+    assert.equal(fs.existsSync(path.join(paths.claims, oldKey + ".eligibility_pending.json")), false,
+      "有结论了就该撤掉旧标记");
+  } finally {
+    fs.rmSync(paths.publishLock, { recursive: true, force: true });
   }
 });
 

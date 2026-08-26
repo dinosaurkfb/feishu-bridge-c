@@ -12696,6 +12696,19 @@ test("等待预算必须有限：一个配置值不许把有界等待变成无�
   releasePublishLock(g.lockDir);
 });
 
+test("复核给出的具体原因要一路传上来，不能只剩一个 reason", () => {
+  // 底层已经知道是哪个字段出的问题，中间一层把 why 丢了的话，
+  // 人最终只看到 record_unclassified —— 还得自己去猜是哪个字段。
+  const g = eligFixture({ holdLock: false });
+  fs.writeFileSync(path.join(g.outboxDir, "0001.json"),
+    JSON.stringify({ ...g.read(), publish_eligible_at: "not-a-canonical-time" }));
+  assert.equal(fs.existsSync(g.markerFile), false, "前提：走的是标记缺席那条复核路径");
+  const r = settleOwnEligibility({ ...g.args(), claimKey: g.key, waitMs: 1, wait: () => {} });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "record_unclassified");
+  assert.equal(r.why, "publish_eligible_at 不是规范时间", "**具体那句要传上来**");
+});
+
 test("claims 目录读不出来是故障，不是「一条都没有」", () => {
   // 这两件事在输出上长得一模一样，含义却相反：后者意味着可能有一批答复正卡着没人管。
   const g = eligFixture({ holdLock: false });

@@ -21,7 +21,8 @@ import {
 import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
 import { generationTargetState } from "../topic-generation.mjs";
 import {
-  ageText, collectBacklog, describeRecordState, sanitizeForDisplay, suppressCommandFor,
+  ageText, collectBacklog, collectProjectBacklog, describeRecordState, sanitizeForDisplay,
+  suppressCommandFor,
 } from "./feishu-outbox.mjs";
 import { auditSkills } from "./skill-content.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
@@ -36,7 +37,8 @@ import {
 import { sweepEligible } from "./drain-all.mjs";
 
 import {
-  appendEvent, listPending, markPublishEligibleByEventKey, suppressPublishByEventKey,
+  appendEvent, listPending, markPublishEligibleByEventKey, recordPublishFailure,
+  suppressPublishByEventKey,
 } from "../outbox.mjs";
 import { evaluateInbound, REJECT } from "../selector.mjs";
 import {
@@ -6492,6 +6494,254 @@ test("watcher 启动时的历史标记：撞上锁要等到有结论，不能只
       "有结论了就该撤掉旧标记");
   } finally {
     fs.rmSync(paths.publishLock, { recursive: true, force: true });
+  }
+});
+
+test("积压视图：项目级绑定也在视野里，措辞不许超出实际看过的范围", () => {
+  // 评审外的实测：Frank 让人用这个命令看积压，它说"没有积压 —— 所有 task 的
+  // outbox 都读得通，且都是空的"。而 cc2cd 是**项目级绑定**，当时有 3 条积压。
+  // 它不是读不出来，是**压根没往那儿看**，而措辞让人以为看全了。
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-projbacklog-"));
+  const proj = path.join(home, "cc2cd");
+  const obDir = path.join(proj, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const registry = path.join(home, "registry.json");
+  fs.writeFileSync(registry, JSON.stringify({
+    schema_version: "1.0", projects: [{ root: proj, claude_session_id: null }] }));
+
+  const withReg = (fn) => {
+    const before = process.env.FEISHU_BRIDGE_REGISTRY;
+    process.env.FEISHU_BRIDGE_REGISTRY = registry;
+    try { return fn(); } finally {
+      if (before === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY;
+      else process.env.FEISHU_BRIDGE_REGISTRY = before;
+    }
+  };
+
+  // 空的时候确实是空的 —— 守卫不能把好情况也一起报成有事。
+  assert.deepEqual(withReg(() => collectProjectBacklog()),
+    { ok: true, scanned: true, projects: [] }, "真空的时候要说空");
+
+  // 放 3 条进去 —— 这正是 cc2cd 当时的样子。
+  for (let i = 1; i <= 3; i += 1) {
+    fs.writeFileSync(path.join(obDir, "000" + i + ".json"),
+      JSON.stringify(outboxRecord({ text: "项目级积压 " + i })));
+  }
+  const got = withReg(() => collectProjectBacklog());
+  assert.equal(got.ok, true);
+  assert.equal(got.projects.length, 1, "**项目级积压必须被看见**");
+  assert.equal(got.projects[0].records.length, 3, "3 条一条都不许漏");
+  assert.match(got.projects[0].name, /cc2cd/u, "要点名是哪个项目");
+
+  // 被永久拒绝的要单独说 —— 它在等人，不是在排队。
+  const one = listPending({ outboxDir: obDir })[0];
+  recordPublishFailure(one, { permanent: true, reason: "http_400：ErrCode: 11310" });
+  const after = withReg(() => collectProjectBacklog());
+  const stuck = after.projects[0].records.filter((r) => r.rejected);
+  assert.equal(stuck.length, 1, "被拒的要标出来");
+  assert.match(stuck[0].rejectedWhy, /11310/u, "原因要带上");
+
+  // **登记表读不出来是故障，不是「没有项目」。**这两件事在输出上长得一样、含义相反。
+  fs.writeFileSync(registry, "{ 这不是 JSON");
+  const broken = withReg(() => collectProjectBacklog());
+  assert.equal(broken.ok, false, "**读不出来绝不能显示成没有积压**");
+  assert.equal(broken.projects.length, 0);
+
+  // **路径是目录也算读不出来。**上一版用宽松读取器，它把 EISDIR / EACCES
+  // 一律变成"成功的空表" —— 评审实测返回 {ok:true, projects:[]}，
+  // 于是"读不出来"又一次显示成了"没有积压"。
+  fs.rmSync(registry);
+  fs.mkdirSync(registry);
+  const asDir = withReg(() => collectProjectBacklog());
+  assert.equal(asDir.ok, false, "**登记表是目录时不许报成空表**：" + JSON.stringify(asDir));
+  fs.rmSync(registry, { recursive: true });
+
+  // 完全不存在是合法的空 —— 还没接过任何项目。守卫不能把好情况也一起挡了。
+  const none = withReg(() => collectProjectBacklog());
+  assert.equal(none.ok, true, "登记表还没建过是合法的空");
+  assert.deepEqual(none.projects, []);
+});
+
+test("坏的登记项不许静默跳过，全景说不清就不许说没有积压", () => {
+  // 评审实测：登记表是 {"projects":[{"root":42}]} 时上一版直接 continue 掉，
+  // 返回 {ok:true, projects:[]} —— **真实 CLI 随后声称项目级视野为空**。
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-badentry-"));
+  const registry = path.join(home, "registry.json");
+  const withReg = (fn) => {
+    const before = process.env.FEISHU_BRIDGE_REGISTRY;
+    process.env.FEISHU_BRIDGE_REGISTRY = registry;
+    try { return fn(); } finally {
+      if (before === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY;
+      else process.env.FEISHU_BRIDGE_REGISTRY = before;
+    }
+  };
+  const good = { root: path.join(home, "p"), claude_session_id: null };
+  fs.mkdirSync(path.join(home, "p", ".runtime-data", "outbound", "outbox"), { recursive: true });
+
+  for (const [why, entry, expect] of [
+    ["root 是数字", { root: 42 }, /root 不是非空字符串/u],
+    ["root 是纯空白", { root: "   " }, /root 不是非空字符串/u],
+    ["root 缺席", {}, /root 不是非空字符串/u],
+    ["root 是相对路径", { root: "relative/path" }, /root 不是绝对路径/u],
+    ["登记项不是对象", [1, 2], /不是登记项对象/u],
+    ["登记项是 null", null, /不是登记项对象/u],
+    ["session 形状不对", { root: "/abs", claude_session_id: 7 }, /claude_session_id 形状不对/u],
+    ["session 是空串", { root: "/abs", claude_session_id: "" }, /claude_session_id 形状不对/u],
+  ]) {
+    fs.writeFileSync(registry, JSON.stringify({ schema_version: "1.0", projects: [good, entry] }));
+    const got = withReg(() => collectProjectBacklog());
+    assert.equal(got.ok, false, why + "：**说不清却报了 ok** —— " + JSON.stringify(got));
+    assert.equal(got.reason, "registry_entry_malformed", why);
+    assert.match(got.bad?.[0]?.why ?? "", expect, why + "：理由不对 —— " + JSON.stringify(got.bad));
+    assert.match(got.bad?.[0]?.at ?? "", /projects\[1\]/u, why + "：要点名是第几项");
+  }
+
+  // 全都合法时照常放行 —— 守卫不能把好情况也一起挡了。
+  fs.writeFileSync(registry, JSON.stringify({ schema_version: "1.0", projects: [good] }));
+  assert.equal(withReg(() => collectProjectBacklog()).ok, true, "干净时必须照常放行");
+});
+
+test("项目全景要先规范化 root：/p 和 /p/ 不是两个项目", () => {
+  // 评审实测：`/project` 与 `/project/` 被当成两个项目，
+  // **同一条 outbox 记录被统计、展示两次** —— 人看到的条数是假的。
+  const home = temp();
+  const proj = path.join(home, "cc2cd");
+  const obDir = path.join(proj, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(obDir, "0001.json"),
+    JSON.stringify(outboxRecord({ text: "只有这一条" })));
+
+  const registry = path.join(home, "registry.json");
+  fs.writeFileSync(registry, JSON.stringify({ schema_version: "1.0", projects: [
+    { root: proj, claude_session_id: null },
+    { root: proj + "/", claude_session_id: null },       // 同一个项目，写法不同
+  ] }));
+  const before = process.env.FEISHU_BRIDGE_REGISTRY;
+  process.env.FEISHU_BRIDGE_REGISTRY = registry;
+  try {
+    const got = collectProjectBacklog();
+    assert.equal(got.ok, true, JSON.stringify(got));
+    assert.equal(got.projects.length, 1,
+      "**同一个项目不许出现两次** —— 实际 " + got.projects.length + " 次");
+    assert.equal(got.projects[0].records.length, 1, "那一条也不许被数两遍");
+  } finally {
+    if (before === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY;
+    else process.env.FEISHU_BRIDGE_REGISTRY = before;
+  }
+});
+
+test("Codex 全景：成因要到这个消费者，总数要含项目级（真实 CLI）", () => {
+  // 评审两条，都出在同一次输出里：
+  //   · 全景把 retry_exhausted 说成"被飞书永久拒绝" —— 上一轮接通了
+  //     drain → 渲染 → Stop，**漏了这个消费者**
+  //   · "项目 X：待发 1 条" 紧接着 "积压 0 条" —— total 只累加 tasks，
+  //     一份**自己跟自己矛盾**的报告
+  //
+  // 所以这条走真实 CLI，不喂手工构造的结果。
+  const home = temp();
+  const proj = path.join(home, "cc2cd");
+  const obDir = path.join(proj, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(obDir, "0001.json"),
+    JSON.stringify(outboxRecord({ text: "预算耗尽的那条" })));
+  fs.writeFileSync(path.join(obDir, "0002.json"),
+    JSON.stringify(outboxRecord({ text: "被平台拒的那条" })));
+
+  const byText = (t) => listPending({ outboxDir: obDir }).find((r) => r.text === t);
+  // 前 4 次只累计，第 5 次才转 paused —— 走真实记账，不手写字段。
+  for (let i = 1; i <= 5; i += 1) {
+    recordPublishFailure(byText("预算耗尽的那条"),
+      { permanent: false, reason: "no_permanent_signal" });
+  }
+  recordPublishFailure(byText("被平台拒的那条"), { permanent: true, reason: "err_11310" });
+
+  const registry = path.join(home, "registry.json");
+  fs.writeFileSync(registry, JSON.stringify({
+    schema_version: "1.0", projects: [{ root: proj, claude_session_id: null }] }));
+  writeRegistryFixtureUnvalidated([], path.join(home, "registry.json") + ".codex");
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+      FEISHU_BRIDGE_REGISTRY: registry } });
+  const said = (r.stdout ?? "") + (r.stderr ?? "");
+
+  assert.match(said, /预算耗尽的那条|0001\.json/u, "项目级积压要出现：" + said.slice(0, 400));
+  assert.match(said, /重试预算耗尽，值得再试一次/u,
+    "**预算耗尽要说清值得再试** —— 这个消费者上一轮被漏掉了");
+  assert.match(said, /平台拒绝，不改内容再试也一样/u, "平台拒绝要说清再试无用");
+  assert.equal(/被飞书永久拒绝/u.test(said), false,
+    "**不许把两种成因统称为「被飞书永久拒绝」**");
+
+  // **总数不许自相矛盾。**
+  const total = /积压 (\d+) 条/u.exec(said);
+  assert.ok(total, "要给出总数：" + said.slice(0, 400));
+  assert.equal(Number(total[1]) >= 2, true,
+    "**总数要含项目级** —— 同一次输出里说了项目待发 2 条，总数却是 " + total[1]);
+});
+
+test("项目级积压：内容、损坏结论、完整性都要跟 task 那半一样（真实 CLI）", () => {
+  // 评审两条，都是"我另写了一份渲染"造成的：
+  //   · 收集层保存了 unexplainable/blocked，CLI 只看 unclassified ——
+  //     一条损坏记录只显示成"待发 1 条"，没有文件名、没有原因、没有阻断提示
+  //   · 只显示数量不显示内容 —— 而这个命令承诺的是"积压里到底是什么"
+  //   · 有归不了类的文件时仍给出"积压 0 条"这种**看似精确**的数
+  const run = (home, registry) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+      FEISHU_BRIDGE_REGISTRY: registry } });
+  const setup = () => {
+    const home = temp();
+    const proj = path.join(home, "cc2cd");
+    const obDir = path.join(proj, ".runtime-data", "outbound", "outbox");
+    fs.mkdirSync(obDir, { recursive: true });
+    const registry = path.join(home, "registry.json");
+    fs.writeFileSync(registry, JSON.stringify({
+      schema_version: "1.0", projects: [{ root: proj, claude_session_id: null }] }));
+    return { home, obDir, registry };
+  };
+
+  // ① 正文必须看得见。
+  {
+    const { home, obDir, registry } = setup();
+    fs.writeFileSync(path.join(obDir, "0001.json"),
+      JSON.stringify(outboxRecord({ text: "项目级正文必须可见" })));
+    const clean = run(home, registry);
+    // **退出码也是承诺的一部分。**只断言文案的话，把 exit 改成非 0
+    // （或反过来对损坏也 exit 0）测试照样绿，而调用方是按退出码判断的。
+    assert.equal(clean.status, 0, "干净的积压不是故障，不许非 0 退出");
+    const said = clean.stdout ?? "";
+    assert.match(said, /项目级正文必须可见/u,
+      "**只报数量等于没回答「积压里是什么」**：" + said.slice(0, 400));
+    assert.match(said, /0001\.json|\[milestone\]/u, "要给出记录的身份");
+  }
+
+  // ② 解释不了的记录要点名，不能只报一个数。
+  {
+    const { home, obDir, registry } = setup();
+    fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
+      ...outboxRecord({ text: "损坏的" }), publish_attempts: 5 }));   // 缺暂停字段
+    const r = run(home, registry);
+    assert.notEqual(r.status, 0, "**解释不了就得非 0 退出** —— 调用方按它判断");
+    const said = (r.stdout ?? "") + (r.stderr ?? "");
+    assert.match(said, /解释不了|归不了类/u,
+      "**审计的结论不许被丢掉**：" + said.slice(0, 400));
+    assert.match(said, /0001\.json/u, "要点名是哪个文件");
+    assert.match(said, /publish_retry_protection/u, "要说清坏在哪");
+  }
+
+  // ③ 视野不完整时，不许给一个看似精确的数。
+  {
+    const { home, obDir, registry } = setup();
+    fs.writeFileSync(path.join(obDir, "0001.json"), "{ 这不是 JSON");
+    const r = run(home, registry);
+    assert.notEqual(r.status, 0, "**坏 JSON 也得非 0 退出**");
+    const said = (r.stdout ?? "") + (r.stderr ?? "");
+    assert.match(said, /归不了类/u, "坏文件要点名");
+    assert.equal(/积压 0 条。/u.test(said), false,
+      "**「1 个文件归不了类」和「积压 0 条」不许同时出现** —— " +
+      "精确的数字暗示「我全看清了」：" + said.slice(0, 400));
+    assert.match(said, /不完整/u, "要明说这个数不完整");
   }
 });
 

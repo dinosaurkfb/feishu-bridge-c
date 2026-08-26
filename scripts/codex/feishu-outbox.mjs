@@ -40,13 +40,17 @@
 import path from "node:path";
 
 import { isDirectRun, moduleDir } from "../direct-run.mjs";
-import { listPending } from "../outbox.mjs";
+import { isPermanentlyRejected, listPending, pauseKindOf } from "../outbox.mjs";
 import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
 import { generationTargetState } from "../suppress-outbox-core.mjs";
 import { hasPublishAuthorization } from "../outbox.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
 import { auditOutbox } from "./drain-service.mjs";
 import { outboxMutationBlocker } from "../outbox.mjs";
+import { outboxDirOf } from "../drain-outbox.mjs";
+import {
+  loadRegistryStrict as loadClaudeRegistryStrict, normalizeRoot,
+} from "../registry.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
 import {
   bridgeHome, loadRegistry, registryFile, resolveTaskOutboundGeneration, taskPaths,
@@ -245,6 +249,101 @@ export function describeTaskPublishability({ task, home }) {
  * @returns {{ok:true, tasks:Array}|{ok:false, reason:string}}
  * 每个 task 带 `readable`：false 表示 outbox 读不全，**这时候的条数不可信**。
  */
+/**
+ * 项目级绑定的积压。
+ *
+ * 它们不在 Codex 登记表里 —— 那张表管的是 task。项目级绑定登记在 Claude 那张
+ * registry 里，outbox 路径由 outboxDirOf 决定（会话级绑定是 `outbox-<uuid>/`）。
+ * **判据共用**：路径用 outboxDirOf、审计用 auditOutbox，不在这里另写一份。
+ *
+ * @returns {{ok:true, scanned:true, projects:object[]}|{ok:false, reason:string}}
+ *          读不出登记表是**故障**，不是"没有项目" —— 这两件事在输出上长得一样，
+ *          含义却相反。
+ */
+export function collectProjectBacklog() {
+  // **用严格读取器。**宽松那个把 EISDIR / EACCES 一律变成"成功的空表"——
+  // 评审实测：登记表路径是目录时返回 {ok:true, projects:[]}，
+  // 于是"读不出来"又一次显示成了"没有积压"。它还会过滤停用条目，
+  // 而停用绑定的 outbox 里照样可能躺着发不出去的内容，正是要给人看的。
+  const reg = loadClaudeRegistryStrict();
+  if (!reg.ok) return { ok: false, scanned: false, reason: reg.reason ?? "registry_unreadable", projects: [] };
+  const seen = new Set();
+  const projects = [];
+  // **坏的登记项不许静默跳过。**
+  //
+  // 评审实测：登记表是 {"projects":[{"root":42}]} 时，上一版 `continue` 掉它，
+  // 返回 {ok:true, projects:[]} —— **真实 CLI 随后声称项目级视野为空**。
+  // 严格读取器只验根节点和 projects 是不是数组，成员形状得在这一层验。
+  //
+  // 这跟"读不出登记表"是同一条规矩：说不清有哪些项目，就不能说没有积压。
+  const bad = [];
+  const entries = Array.isArray(reg.projects) ? reg.projects : [];
+  for (const [i, project] of entries.entries()) {
+    const at = "projects[" + i + "]";
+    if (project === null || typeof project !== "object" || Array.isArray(project)) {
+      bad.push({ at, why: "不是登记项对象" }); continue;
+    }
+    const root = project.root;
+    // root 要是 trim 后非空的绝对路径 —— 相对路径解析出来是哪儿取决于当前工作目录，
+    // 那意味着同一张表在不同进程里指向不同地方。
+    if (typeof root !== "string" || root.trim().length === 0) {
+      bad.push({ at, why: "root 不是非空字符串" }); continue;
+    }
+    if (!path.isAbsolute(root)) { bad.push({ at, why: "root 不是绝对路径" }); continue; }
+    // **去重之前先规范化。**评审实测：`/project` 和 `/project/` 被当成两个项目，
+    // 同一条 outbox 记录被统计、展示两次 —— 人看到的条数是假的。
+    // 规范化用共用那份，不在这里另写一套（"root 的规范形式只有这一份定义"）。
+    const normalized = normalizeRoot(root);
+    const sid = project.claude_session_id;
+    if (sid !== undefined && sid !== null
+      && (typeof sid !== "string" || sid.trim().length === 0)) {
+      bad.push({ at, why: "claude_session_id 形状不对" }); continue;
+    }
+    const claudeSessionId = sid ?? null;
+    const key = normalized + "\u0000" + (claudeSessionId ?? "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const outboxDir = outboxDirOf(normalized, claudeSessionId);
+    const audit = auditOutbox(outboxDir);
+    const entry = {
+      name: sanitizeForDisplay(path.basename(normalized)) +
+        (claudeSessionId ? "/" + sanitizeForDisplay(String(claudeSessionId).slice(0, 8)) : ""),
+      root: normalized,
+      readable: audit.ok === true,
+      unreadableReason: audit.ok === true ? null : (audit.reason ?? "说不清"),
+      unclassified: audit.ok === true ? (audit.unclassified ?? []) : [],
+      unexplainable: audit.ok === true ? (audit.unexplainable ?? []) : [],
+      blocked: outboxMutationBlocker(audit),
+      records: [],
+    };
+    if (entry.readable) {
+      for (const r of listPending({ outboxDir })) {
+        entry.records.push({
+          file: path.basename(r._file ?? ""),
+          kind: sanitizeForDisplay(r.kind ?? "?"),
+          createdAt: r.created_at ?? null,
+          text: r.text ?? "",
+          // 被永久拒绝过的要单独说 —— 它不会再自动重试，是在等人。
+          rejected: isPermanentlyRejected(r),
+          rejectedKind: pauseKindOf(r),
+          rejectedWhy: isPermanentlyRejected(r)
+            ? sanitizeForDisplay(String(r.publish_rejected_reason ?? "未说明")) : null,
+        });
+      }
+    }
+    if (!entry.readable || entry.unclassified.length > 0
+      || entry.unexplainable.length > 0 || entry.records.length > 0) {
+      projects.push(entry);
+    }
+  }
+  // **有坏项就整体报不完整**，不许拿一份残缺的全景去支撑"没有积压"这个结论。
+  if (bad.length > 0) {
+    return { ok: false, scanned: false, reason: "registry_entry_malformed",
+      bad, projects };
+  }
+  return { ok: true, scanned: true, projects };
+}
+
 export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey = null } = {}) {
   const reg = loadRegistry(registryFile(home));
   // **原样透传受控 reason/detail。**上一版一律改写成 registry_unreadable ——
@@ -262,6 +361,21 @@ export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey =
   if ((threadId !== null || taskKey !== null) && selected.length === 0) {
     return { ok: false, reason: "task_not_found" };
   }
+
+  // **项目级绑定也在视野里。**
+  //
+  // 上一版只遍历 Codex 登记表里的 task，而项目级绑定的 outbox 在
+  // `<项目>/.runtime-data/outbound/outbox/` —— **压根没往那儿看**。
+  // cc2cd 当时有 3 条积压，这个命令说"没有积压"。
+  // 它不是读不出来，是没看；而措辞让人以为看全了。
+  //
+  // 这跟这个文件开头写的设计目标正好相反：**"读不出来"绝不能显示成"没有积压"**。
+  // 现在再加一句：**"没看"更不能**。
+  //
+  // 点名了 thread/task 时不扫项目级：那次问的是"这一条 task 怎么样"。
+  const projects = (threadId === null && taskKey === null)
+    ? collectProjectBacklog()
+    : { ok: true, scanned: false, projects: [] };
 
   const tasks = [];
   for (const task of selected) {
@@ -303,7 +417,7 @@ export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey =
       tasks.push(entry);
     }
   }
-  return { ok: true, tasks };
+  return { ok: true, tasks, projects };
 }
 
 /**
@@ -343,20 +457,102 @@ function main() {
         : "读不出登记表（" + got.reason + "）。");
     process.exit(1);
   }
-  if (got.tasks.length === 0) {
-    say("没有积压 —— 所有 task 的 outbox 都读得通，且都是空的。");
+  let trouble = false;
+  const proj = got.projects ?? { ok: true, scanned: false, projects: [] };
+  // **读不出项目登记表就不许说"没有积压"。**这跟"读不出 task 登记表"是同一条规矩，
+  // 上一版漏了后半边视野，于是连这条规矩也一起漏了。
+  if (proj.ok === false) {
+    warn("项目级绑定的登记表说不清（" + proj.reason + "）—— " +
+      "**这不是「没有积压」**，项目级那半边视野现在是瞎的。");
+    for (const b of proj.bad ?? []) warn("  " + b.at + " —— " + b.why);
+    process.exit(1);
+  }
+
+  if (got.tasks.length === 0 && proj.projects.length === 0) {
+    // **措辞必须跟实际视野一致。**上一版说"所有 task 的 outbox 都读得通且都是空的"，
+    // 字面没错，但读的人会当成"没有任何积压" —— 而项目级绑定压根没被看过。
+    say(proj.scanned
+      ? "没有积压 —— task 级和项目级绑定的 outbox 都读得通，且都是空的。"
+      : "这一条 task 没有积压。**这次只看了点名的那一条**，没有扫项目级绑定。");
     process.exit(0);
   }
 
-  let trouble = false;
+  // **项目级跟 task 级共用同一套渲染结构。**
+  //
+  // 上一版这里是我另写的一份：只看 unclassified、只报数量。于是
+  //   · 审计给的 unexplainable 和 blocked 结论被丢掉 —— 一条损坏记录
+  //     只显示成"待发 1 条"，没有文件名、没有原因、没有阻断提示；
+  //   · 项目级积压**只看得见数量、看不见内容** ——
+  //     而这个命令开头承诺的就是"积压里到底是什么"。
+  //
+  // 同一件事写两份，第二份总会少点什么。这条线上已经因此栽过很多次。
+  const projectSections = [];
+  let projectTotal = 0;
+  let projectComplete = true;
+  for (const entry of proj.projects) {
+    const lines = [];
+    lines.push("【项目 " + entry.name + "】");
+    if (!entry.readable) {
+      trouble = true;
+      projectComplete = false;
+      lines.push("  **outbox 读不出来（" + entry.unreadableReason + "）—— 这里的条数不可信。**");
+      projectSections.push(lines);
+      continue;
+    }
+    if ((entry.unclassified ?? []).length > 0) {
+      trouble = true;
+      projectComplete = false;
+      lines.push("  **有 " + entry.unclassified.length + " 个文件归不了类，整体不可信：**");
+      for (const u of entry.unclassified) lines.push("    " + u.file + " —— " + u.why);
+    }
+    if ((entry.unexplainable ?? []).length > 0) {
+      trouble = true;
+      projectComplete = false;
+      lines.push("  **有 " + entry.unexplainable.length + " 条记录解释不了，不能对它们动手：**");
+      for (const u of entry.unexplainable) lines.push("    " + u.file + " —— " + u.why);
+    }
+    projectTotal += entry.records.length;
+    lines.push("  待发 " + entry.records.length + " 条");
+    for (const [i, r] of entry.records.entries()) {
+      const pause = r.rejected
+        ? "（" + (r.rejectedKind === "retry_exhausted" ? "已暂停：重试预算耗尽，值得再试一次"
+          : r.rejectedKind === "platform_rejected" ? "已暂停：平台拒绝，不改内容再试也一样"
+            : "已暂停：成因不明") + "）"
+        : "";
+      lines.push("  " + String(i + 1).padStart(2) + ". [" + r.kind + "] " +
+        ageText(r.createdAt) + pause);
+      lines.push("      " + oneLine(r.text, { full }));
+      if (r.rejected) lines.push("      " + r.rejectedWhy);
+    }
+    if (entry.blocked) {
+      lines.push("  这个项目的 outbox 有说不清的内容，**抑制会整批拒绝** ——");
+      lines.push("  先确认上面点名的文件是什么。");
+    }
+    projectSections.push(lines);
+  }
+
   const readable = got.tasks.filter((t) => t.readable && t.unclassified.length === 0);
-  const total = readable.reduce((n, t) => n + t.records.length, 0);
+  // **总数要含项目级，而且视野不完整时不许给一个看似精确的数。**
+  //
+  // 上一版只累加 got.tasks —— 同一次输出里先说"项目 X：待发 1 条"、
+  // 紧接着说"积压 0 条"，自己跟自己矛盾。改完之后还剩另一半：
+  // 有一个文件归不了类时，仍然无条件累加已解析的那些，
+  // 于是"1 个文件归不了类"和"积压 0 条"同时出现 ——
+  // **一个精确的数字暗示着「我全看清了」，而那不成立。**
+  const taskTotal = readable.reduce((n, t) => n + t.records.length, 0);
+  const total = taskTotal + projectTotal;
+  const complete = projectComplete && readable.length === got.tasks.length;
   // **这里曾经内嵌过一个 \n** —— 而输出边界的规则正是我自己在同一个文件里定的：
   // 格式串不许带换行。净化器把它换成了 U+FFFD，真实输出首行成了"积压 1 条。<?>"。
   // 空行单独发一次。
-  say("积压 " + total + " 条" +
-    (readable.length === got.tasks.length ? "" : "（另有 task 读不全，见下）") + "。");
+  say(complete
+    ? "积压 " + total + " 条。"
+    : "**至少**积压 " + total + " 条（有读不全的，见下 —— 这个数不完整）。");
   say("");
+  for (const lines of projectSections) {
+    for (const line of lines) say(line);
+    say("");
+  }
 
   for (const t of got.tasks) {
     say("【" + t.name + "】" + (t.taskKey ? t.taskKey : ""));

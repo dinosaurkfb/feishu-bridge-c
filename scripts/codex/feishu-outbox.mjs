@@ -346,7 +346,16 @@ export function collectProjectBacklog() {
     return { ok: false, scanned: false, reason: "registry_entry_malformed",
       bad, projects };
   }
-  return { ok: true, scanned: true, projects };
+  // **completeness 是收集层的结论，不是渲染层的现算**（R5）。
+  // 判定散在渲染层的话，第二个消费者又得自己算一遍 —— 算漏的那个
+  // 就会把残缺视野当完整视野报（"积压 0 条"那类假精确）。
+  const problems = [];
+  for (const entry of projects) {
+    if (!entry.readable) problems.push({ at: entry.name, why: "outbox 读不出来（" + entry.unreadableReason + "）" });
+    for (const u of entry.unclassified ?? []) problems.push({ at: entry.name + "/" + u.file, why: u.why });
+    for (const u of entry.unexplainable ?? []) problems.push({ at: entry.name + "/" + u.file, why: u.why });
+  }
+  return { ok: true, scanned: true, projects, complete: problems.length === 0, problems };
 }
 
 export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey = null } = {}) {
@@ -422,7 +431,16 @@ export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey =
       tasks.push(entry);
     }
   }
-  return { ok: true, tasks, projects };
+  // 两半的 completeness 聚合成一份结论 —— 消费者只读它，不再自己算。
+  const problems = [];
+  for (const t of tasks) {
+    if (!t.readable) problems.push({ at: t.name, why: "outbox 读不出来（" + t.unreadableReason + "）" });
+    for (const u of t.unclassified ?? []) problems.push({ at: t.name + "/" + u.file, why: u.why });
+    for (const u of t.unexplainable ?? []) problems.push({ at: t.name + "/" + u.file, why: u.why });
+  }
+  if (projects.ok && projects.scanned) problems.push(...(projects.problems ?? []));
+  const complete = problems.length === 0 && projects.ok !== false;
+  return { ok: true, tasks, projects, complete, problems };
 }
 
 /**
@@ -546,7 +564,9 @@ function main() {
   // **一个精确的数字暗示着「我全看清了」，而那不成立。**
   const taskTotal = readable.reduce((n, t) => n + t.records.length, 0);
   const total = taskTotal + projectTotal;
-  const complete = projectComplete && readable.length === got.tasks.length;
+  // completeness 读收集层的结论 —— 这里现算就是第二份判据（R5 上移）。
+  const complete = got.complete === true;
+  void projectComplete;
   // **这里曾经内嵌过一个 \n** —— 而输出边界的规则正是我自己在同一个文件里定的：
   // 格式串不许带换行。净化器把它换成了 U+FFFD，真实输出首行成了"积压 1 条。<?>"。
   // 空行单独发一次。

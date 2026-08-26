@@ -6521,7 +6521,8 @@ test("积压视图：项目级绑定也在视野里，措辞不许超出实际�
 
   // 空的时候确实是空的 —— 守卫不能把好情况也一起报成有事。
   assert.deepEqual(withReg(() => collectProjectBacklog()),
-    { ok: true, scanned: true, projects: [] }, "真空的时候要说空");
+    { ok: true, scanned: true, projects: [], complete: true, problems: [] },
+    "真空的时候要说空且完整");
 
   // 放 3 条进去 —— 这正是 cc2cd 当时的样子。
   for (let i = 1; i <= 3; i += 1) {
@@ -7046,6 +7047,67 @@ test("codex drain：只有轮转记账缺口也要非零退出（真实 CLI）",
   assert.match(h.read("送达但账缺的一条").published_at ?? "", /^\d{4}/u, "消息要落标（不重发）");
   assert.match(said, /记账失败/u, "提示要在：" + said.slice(0, 250));
   assert.notEqual(out.status, 0, "**不完整成功不许 exit 0**");
+});
+
+test("R5 completeness：收集层给结论，坏一处就 complete:false 并点名", () => {
+  const home = temp();
+  const proj = path.join(home, "cc2cd");
+  const obDir = path.join(proj, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const registry = path.join(home, "registry.json");
+  fs.writeFileSync(registry, JSON.stringify({
+    schema_version: "1.0", projects: [{ root: proj, claude_session_id: null }] }));
+  const before = process.env.FEISHU_BRIDGE_REGISTRY;
+  process.env.FEISHU_BRIDGE_REGISTRY = registry;
+  try {
+    fs.writeFileSync(path.join(obDir, "good.json"), JSON.stringify(outboxRecord({ text: "好的" })));
+    const clean = collectProjectBacklog();
+    assert.equal(clean.complete, true, "干净时 complete");
+    assert.deepEqual(clean.problems, []);
+
+    fs.writeFileSync(path.join(obDir, "bad.json"), "{ 坏了");
+    const dirty = collectProjectBacklog();
+    assert.equal(dirty.complete, false, "**坏一处就不完整** —— 精确数字的底气就没了");
+    assert.ok(dirty.problems.some((x) => /bad\.json/u.test(x.at)),
+      "problems 要点名：" + JSON.stringify(dirty.problems));
+    // 全景聚合也要变不完整。
+    const whole = collectBacklog({ home });
+    assert.equal(whole.complete, false, "全景聚合要继承项目侧的不完整");
+    assert.ok(whole.problems.some((x) => /bad\.json/u.test(x.at)));
+
+    // **区分场景：task 侧只有 unexplainable**（渲染层若自己现算，
+    // 它那份判据只看 readable/unclassified —— 恰好漏掉这一类，
+    // 于是打出「积压 N 条。」的假精确）。
+    fs.rmSync(path.join(obDir, "bad.json"));
+    const troot = path.join(home, "tproj");
+    fs.mkdirSync(troot, { recursive: true });
+    const ttask = makeTaskEntry({ root: troot, threadId: THREAD_A, name: "T-unexp",
+      rootMessageId: "om_t", token: "t" });
+    writeRegistryFixtureUnvalidated([ttask], path.join(home, "registry.json.codex"));
+    // codex 登记表默认路径就是 home/registry.json —— 上面被项目级用了；
+    // 直接写 codex 自己的默认位置。
+    writeRegistryFixtureUnvalidated([ttask], path.join(home, "registry.json"));
+    const tob = taskPaths(ttask, home).outbox;
+    fs.mkdirSync(tob, { recursive: true });
+    fs.writeFileSync(path.join(tob, "weird.json"), JSON.stringify({
+      ...outboxRecord({ text: "解释不了的" }), publish_attempts: "five" }));
+    // 项目级 registry 换独立文件避免互相踩。
+    const preg2 = path.join(home, "proj-registry.json");
+    fs.writeFileSync(preg2, JSON.stringify({ schema_version: "1.0", projects: [] }));
+    process.env.FEISHU_BRIDGE_REGISTRY = preg2;
+    const r = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
+      { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+        FEISHU_BRIDGE_REGISTRY: preg2 } });
+    const said = (r.stdout ?? "") + (r.stderr ?? "");
+    assert.match(said, /不完整/u,
+      "**task 侧 unexplainable 也要让总数标不完整**：" + said.slice(0, 300));
+    assert.equal(/积压 \d+ 条。/u.test(said), false,
+      "不许给假精确的总数：" + said.slice(0, 200));
+  } finally {
+    if (before === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY;
+    else process.env.FEISHU_BRIDGE_REGISTRY = before;
+  }
 });
 
 summarySealed = true;

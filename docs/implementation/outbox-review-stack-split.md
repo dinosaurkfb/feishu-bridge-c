@@ -15,8 +15,14 @@
 - watcher 的 run 结果定为事务外第二通道：发布前 claim 互斥 + 回执三态 +
   reap 锁串行接管 + 显式维护入口。
 
-**第 4 层剩余**：发布计划摘要与 `--expect-*` 参数（绑"预览所见文件字节集合 +
-解析后目标"的联合摘要，形状照抄第 3 层抑制 CAS）；`atRecheck` 测试补回。
+**第 4 层剩余：已完成**（分支 `fix/codex-manual-drain-cas`）：发布计划摘要
+`planDigestOf` 进发布事务，绑「预览所见文件集合 + 每条选中记录的原始字节 +
+每批**解析后**目标（代际键/根消息）」，`pub-` 前缀区别于抑制的 `sup-`；
+Codex 手工 drain `--apply` 必须带回 `--expect-digest`（manualPlan 前置属于事务，
+CLI 只解析显示）；预览打印完整可执行命令过 shellQuote，真 shell 回归钉住；
+严格参数白名单 + 恰好一个 selector；矩阵新增「手工计划 CAS」场景，其余三份实现
+按 not_applicable 受控申报。`atRecheck` 测试补回 —— 磁盘变坏由审计闸门在更早接住
+（既有测试钉着），该分支现守「锁内重选产出说不清目标的记录」，新测试直驱此路径。
 **第 5 层剩余**：终局证据 → 发布授权的完整链（凭据制品今天还不存在，先做
 二选一决定）；`eligibility_pending` 恢复链之外的 watcher 接线复核。
 
@@ -44,8 +50,8 @@
 |---|---|---|---|
 | 1 | `fix/journal-canonical-time` | 恢复清单时间校验改用 `isCanonicalIso` | 已合 #57 |
 | 2 | `feat/outbox-review-read-model` | 只读视图 + 共用读取语义硬化 | 已合 #58 |
-| 3 | `fix/outbox-suppression-transaction` | 抑制事务（**含统一写锁**） | 待审 |
-| 4 | `fix/codex-manual-drain-cas` | 手工发布计划与目标 CAS | **未开始** |
+| 3 | `fix/outbox-suppression-transaction` | 抑制事务（**含统一写锁**） | 已合 #60 |
+| 4 | `fix/codex-manual-drain-cas` | 手工发布计划与目标 CAS | 本轮（见上「第 4 层剩余：已完成」） |
 | 5 | `fix/codex-auto-publish-lifecycle` | 自动发布生命周期 | **未开始** |
 | 6 | `fix/claude-outbox-fail-closed` | Claude 侧接线 | 已合 #59 |
 

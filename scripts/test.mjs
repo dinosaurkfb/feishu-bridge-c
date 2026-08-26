@@ -10850,6 +10850,138 @@ test("预览和 --apply 不许给出相反结论：损坏记录在预览里就�
     .publish_suppressed_at, undefined, "零抑制");
 });
 
+test("发布事务：manualPlan 落盘缺摘要就拒绝，非法组合当场抛（第 4 层）", () => {
+  // expectPlanDigest 在错误组合下**当场抛**而不是静默忽略 ——
+  // 静默忽略的后果是调用方以为自己有 CAS 保护，而实际一条守卫都没生效。
+  assert.throws(() => publishOutboxAttempt({ policy: "all_unpaused",
+    expectPlanDigest: "pub-" + "0".repeat(24) }), TypeError, "非 manualPlan 给摘要要抛");
+  assert.throws(() => publishOutboxAttempt({ policy: "all_unpaused", manualPlan: true,
+    dryRun: true, expectPlanDigest: "pub-" + "0".repeat(24) }), TypeError, "预览给摘要要抛");
+  // 缺前提在拿锁之前拒绝；验的是形状 —— 纯空白、抑制摘要（sup- 前缀）都不算给了。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-planpre-"));
+  const call = (expectPlanDigest) => publishOutboxAttempt({
+    outboxDir: path.join(dir, "outbox"), lockDir: path.join(dir, "pub.lock"),
+    policy: "all_unpaused", manualPlan: true, expectPlanDigest,
+    batchCards: (x) => [x], resolveTarget: () => ({ ok: true, rootMessageId: "om" }),
+    composeCard: () => ({}), publishBatch: () => "om_x",
+  });
+  for (const bad of [null, "   ", "sup-" + "0".repeat(24), "pub-XYZ"]) {
+    const r = call(bad);
+    assert.equal(r.status, "error", JSON.stringify(bad));
+    assert.equal(r.reason, "plan_expectation_required", JSON.stringify(bad));
+  }
+  // 锁在被拒后没被占住：形状合法的摘要能走到锁内（空 outbox → empty）。
+  fs.mkdirSync(path.join(dir, "outbox"), { recursive: true });
+  assert.equal(call("pub-" + "0".repeat(24)).status, "empty",
+    "前置拒绝不许把锁攥在手里");
+});
+
+test("发布事务：摘要取材是回调前的锁内事实 —— 归一字节、改写目标都翻不了案", () => {
+  // 评审独立复现的两种绕过，各固化一条。
+  // ① batchCards 把 _raw Buffer 原地归一成预览时的字节。
+  //    Object.freeze 冻不住 Buffer 内容 —— 摘要若在回调后读 _raw，
+  //    "磁盘换过内容"这件事就被回调抹掉了，旧摘要照过、发布的是新内容。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-planmat-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir);
+  const recPath = path.join(obDir, "0001.json");
+  fs.writeFileSync(recPath, JSON.stringify(outboxRecord({ text: "AAAA" })));
+  const originalBytes = fs.readFileSync(recPath);
+  const base = {
+    outboxDir: obDir, lockDir: path.join(dir, "lock"), policy: "all_unpaused",
+    resolveTarget: () => ({ ok: true, rootMessageId: "om" }), composeCard: () => ({}),
+  };
+  const pv = publishOutboxAttempt({ ...base, dryRun: true, manualPlan: true,
+    batchCards: (x) => [x], publishBatch: () => "om_x" });
+  assert.equal(pv.status, "dry_run");
+  // 预览之后磁盘换成**同长度**的另一份内容 —— 长度相同，Buffer 才能被原地归一。
+  fs.writeFileSync(recPath, fs.readFileSync(recPath, "utf-8").replace("AAAA", "BBBB"));
+  let sends = 0;
+  const r = publishOutboxAttempt({ ...base, manualPlan: true, expectPlanDigest: pv.planDigest,
+    batchCards: (records) => {
+      // 敌意回调：把快照字节抹回预览时的样子。
+      records[0]._raw.set(originalBytes);
+      return [records];
+    },
+    publishBatch: () => { sends += 1; return "om_x"; } });
+  assert.equal(r.status, "error", JSON.stringify(r));
+  assert.equal(r.reason, "plan_changed", "**归一字节翻不了案** —— 哈希取自回调前");
+  assert.equal(sends, 0, "翻不了案就一张都不许发");
+  assert.equal(JSON.parse(fs.readFileSync(recPath, "utf-8")).published_at, null, "零落标");
+
+  // ② composeCard 改写 target。目标在 resolveTarget 返回后立即冻结 ——
+  //    一动就抛，落进 batching_failed（本地错误，零发送），
+  //    而不是"摘要照过、发去被改写的目标"。
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-planmat2-"));
+  const obDir2 = path.join(dir2, "outbox");
+  fs.mkdirSync(obDir2);
+  fs.writeFileSync(path.join(obDir2, "0001.json"), JSON.stringify(outboxRecord({ text: "一条" })));
+  let sends2 = 0;
+  const r2 = publishOutboxAttempt({
+    outboxDir: obDir2, lockDir: path.join(dir2, "lock"), policy: "all_unpaused",
+    resolveTarget: () => ({ ok: true, rootMessageId: "om_old" }),
+    batchCards: (x) => [x],
+    composeCard: (batch, target) => { target.rootMessageId = "om_evil"; return {}; },
+    publishBatch: () => { sends2 += 1; return "om_x"; } });
+  assert.equal(r2.status, "error", JSON.stringify(r2));
+  assert.equal(r2.reason, "batching_failed", "**改写目标要当场抛** —— 冻结不是装饰");
+  assert.equal(sends2, 0, "一张都不许发");
+
+  // ③ composeCard 清空 batch 容器。记录和 target 都冻着，容器若还可变，
+  //    摘要枚举它就盖不到任何记录 —— 评审复现：先构卡再 batch.length = 0，
+  //    旧摘要照过、卡片照发、落标一条没有。批在校验后立即封存，一动就抛。
+  const dir3 = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-planmat3-"));
+  const obDir3 = path.join(dir3, "outbox");
+  fs.mkdirSync(obDir3);
+  fs.writeFileSync(path.join(obDir3, "0001.json"), JSON.stringify(outboxRecord({ text: "一条" })));
+  let sends3 = 0;
+  const r3 = publishOutboxAttempt({
+    outboxDir: obDir3, lockDir: path.join(dir3, "lock"), policy: "all_unpaused",
+    resolveTarget: () => ({ ok: true, rootMessageId: "om" }),
+    batchCards: (x) => [x],
+    composeCard: (batch) => { const card = { n: batch.length }; batch.length = 0; return card; },
+    publishBatch: () => { sends3 += 1; return "om_x"; } });
+  assert.equal(r3.status, "error", JSON.stringify(r3));
+  assert.equal(r3.reason, "batching_failed", "**清空批容器要当场抛** —— 封存不是装饰");
+  assert.equal(sends3, 0, "一张都不许发");
+});
+
+test("抑制锁内重选：select 产出说不清目标的记录也要中止（atRecheck）", () => {
+  // 磁盘上变坏的记录由审计闸门在更早接住（上一条测试钉着）。这一条守的是
+  // 剩下的口子：**锁内重读后的重新选择**（readState().select 是调用方回调）
+  // 产出目标说不清的记录 —— 文件名集合没变、字节没变，集合 CAS 和摘要
+  // 都拦不住（损坏发生在内存里的重新解释，不在盘上）。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-atrecheck-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const rec = path.join(obDir, "0001.json");
+  // 磁盘干净：旧格式记录（无目标字段），审计放行。
+  fs.writeFileSync(rec, JSON.stringify(outboxRecord({ kind: "milestone", text: "x" })));
+  const pending = [{ ...JSON.parse(fs.readFileSync(rec, "utf-8")), _file: rec }];
+
+  const got = applySuppressionCore({
+    outboxDir: obDir, publishLockDir: path.join(dir, "pub.lock"),
+    generationLockDir: path.join(dir, "gen.lock"),
+    pending,
+    previewDigest: digestFromDisk(obDir),
+    previewGenerationId: "gen-1",
+    readState: () => ({
+      activeGeneration: "gen-1",
+      // 重新选择把目标字段解释坏了：同 _file、同 _raw，目标却说不清。
+      select: (records) => records.map((r) => ({
+        ...r, target_channel_generation_id: "   " })),
+    }),
+    reason: "t",
+  });
+
+  assert.equal(got.ok, false, "说不清目标就必须中止");
+  assert.equal(got.reason, "corrupt_target_generation", JSON.stringify(got));
+  assert.equal(got.atRecheck, true, "**要标明是锁内重判发现的** —— 处置方式不同");
+  assert.deepEqual(got.files, [rec], "要点名是哪一条");
+  assert.equal(JSON.parse(fs.readFileSync(rec, "utf-8")).publish_suppressed_at, undefined,
+    "**零抑制** —— 说不清该发去哪，就不能替它决定不发");
+});
+
 test("锁内重读要重判损坏：文件名一个没变，目标字段变坏也必须中止", () => {
   // 评审实测复现的：锁外判的是**预览快照**。同一个文件的目标代际在预览之后
   // 变坏时，文件名集合一个字节没变，集合 CAS 一路放行 ——

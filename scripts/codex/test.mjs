@@ -36,6 +36,9 @@ import {
   INTENT_TTL_MS, buildIntentParams, consumeIntent, intentDir, issueIntent,
 } from "./intent.mjs";
 import { sweepEligible } from "./drain-all.mjs";
+import {
+  checkArgShape as drainCheckArgShape, parseArgs as drainParseArgs,
+} from "./drain-outbox.mjs";
 
 import {
   appendEvent, listPending, markPublishEligibleByEventKey, recordPublishFailure,
@@ -6879,11 +6882,20 @@ const codexEligibleRunner = {
 
 const codexDrainRunner = {
   // 手工 CLI：有预览（默认 dry-run、--apply 才发）；无人工重试参数。
-  caps: new Set(["publish", "failStates", "auditGate", "dryRun"]),
+  // manualPlan：落盘必须带回预览打印的计划摘要（第 4 层 CAS）。
+  caps: new Set(["publish", "failStates", "auditGate", "dryRun", "manualPlan"]),
   fixture() {
     const g = codexMatrixFixture();
+    const script = path.join(ROOT, "scripts", "codex", "drain-outbox.mjs");
+    const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: g.home };
+    const previewDigest = () => {
+      const pv = spawnSync(process.execPath, [script, "--thread-id", THREAD_A],
+        { encoding: "utf-8", env });
+      return ((pv.stdout ?? "").match(/pub-[0-9a-f]{24}/u) ?? [null])[0];
+    };
     return {
       obDir: g.obDir, home: g.home, task: g.task,
+      planDigest: previewDigest,
       seed(text) {
         g.mark(text);
         codexSeq += 1;
@@ -6903,12 +6915,19 @@ const codexDrainRunner = {
       },
       attempt(behavior, opts = {}) {
         g.setMode(behavior);
-        const args = [path.join(ROOT, "scripts", "codex", "drain-outbox.mjs"),
-          "--thread-id", THREAD_A];
-        if (!opts.dryRun) args.push("--apply");
         const publishCalls = g.callsDelta(() => {
-          spawnSync(process.execPath, args,
-            { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: g.home } });
+          if (opts.dryRun) {
+            spawnSync(process.execPath, [script, "--thread-id", THREAD_A],
+              { encoding: "utf-8", env });
+            return;
+          }
+          // 落盘带回预览摘要；CAS 场景可显式给旧摘要（planDigest）或不给
+          // （withoutPlanDigest）。预览是 dry-run，零出网，不影响调用计数。
+          const digest = opts.withoutPlanDigest === true ? null
+            : ("planDigest" in opts ? opts.planDigest : previewDigest());
+          const args = [script, "--thread-id", THREAD_A, "--apply"];
+          if (digest !== null && digest !== undefined) args.push("--expect-digest", digest);
+          spawnSync(process.execPath, args, { encoding: "utf-8", env });
         });
         return { publishCalls };
       },
@@ -6973,7 +6992,10 @@ test("codex drain：预览与执行给出同一个结论 —— 坏 outbox 不�
 
   // 只有坏 JSON：两条路都要拒绝，不许说为空。
   fs.writeFileSync(path.join(h.obDir, "bad.json"), "{ 坏了");
-  for (const [why, args] of [["dry-run", []], ["--apply", ["--apply"]]]) {
+  // apply 腿带形状合法的哑摘要 —— 审计闸门在摘要核对之前，坏 outbox 要报
+  // 「本地 outbox 有问题」而不是「缺摘要」；不带摘要会被更早的前置拦下，测不到审计。
+  for (const [why, args] of [["dry-run", []],
+    ["--apply", ["--apply", "--expect-digest", "pub-" + "0".repeat(24)]]]) {
     const r = run(args);
     assert.notEqual(r.status, 0, why + "：坏 outbox 必须拒绝");
     const said = (r.stdout ?? "") + (r.stderr ?? "");
@@ -7008,6 +7030,8 @@ test("codex drain：partial 时两类发布后缺口都要说（真实 CLI 组�
   // 只对第二条失败；第一条送达但轮转账因绑定锁 binding_busy 失败。
   // 事件文件名是哈希，谁先发不确定 —— 用"第二次调用才失败"的模式保证一成一败。
   fs.writeFileSync(path.join(h.home, "mode.txt"), "fail-second");
+  // 预览取计划摘要（dry-run 零出网，不动 fail-second 的调用计数）。
+  const digest = h.planDigest();
   const regLock = path.join(h.home, "registry.lock");
   fs.mkdirSync(regLock, { recursive: true });
   fs.writeFileSync(path.join(regLock, "owner.json"),
@@ -7016,7 +7040,7 @@ test("codex drain：partial 时两类发布后缺口都要说（真实 CLI 组�
   try {
     out = spawnSync(process.execPath,
       [path.join(ROOT, "scripts", "codex", "drain-outbox.mjs"),
-        "--thread-id", THREAD_A, "--apply"],
+        "--thread-id", THREAD_A, "--apply", "--expect-digest", digest],
       { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: h.home } });
   } finally {
     fs.rmSync(regLock, { recursive: true, force: true });
@@ -7037,6 +7061,7 @@ test("codex drain：只有轮转记账缺口也要非零退出（真实 CLI）",
   // 只有 reply 产生轮转活动 —— milestone 种下去一次记账都不会发生，测了个寂寞。
   appendEvent({ outboxDir: h.obDir, kind: "reply", text: "送达但账缺的一条",
     eventKey: "gap-1" });
+  const digest = h.planDigest();
   const regLock = path.join(h.home, "registry.lock");
   fs.mkdirSync(regLock, { recursive: true });
   fs.writeFileSync(path.join(regLock, "owner.json"),
@@ -7045,7 +7070,7 @@ test("codex drain：只有轮转记账缺口也要非零退出（真实 CLI）",
   try {
     out = spawnSync(process.execPath,
       [path.join(ROOT, "scripts", "codex", "drain-outbox.mjs"),
-        "--thread-id", THREAD_A, "--apply"],
+        "--thread-id", THREAD_A, "--apply", "--expect-digest", digest],
       { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: h.home } });
   } finally {
     fs.rmSync(regLock, { recursive: true, force: true });
@@ -7054,6 +7079,104 @@ test("codex drain：只有轮转记账缺口也要非零退出（真实 CLI）",
   assert.match(h.read("送达但账缺的一条").published_at ?? "", /^\d{4}/u, "消息要落标（不重发）");
   assert.match(said, /记账失败/u, "提示要在：" + said.slice(0, 250));
   assert.notEqual(out.status, 0, "**不完整成功不许 exit 0**");
+});
+
+test("codex drain：目标轮转后旧摘要作废 —— 文件一个字节没变也要拒绝（真实 CLI）", () => {
+  // **第 4 层的核心场景。**旧格式记录的目标靠当前状态现算：预览时目标是
+  // om_a，轮转到 om_next 后 outbox 一个字节没动 —— 只绑内容的摘要照样相等，
+  // --apply 会把内容发去新话题。人授权的是"发到那个话题"，不只是"发这些字"。
+  const h = codexDrainRunner.fixture();
+  h.seed("要发去旧话题的那条");
+  const digest = h.planDigest();
+  assert.match(digest ?? "", /^pub-[0-9a-f]{24}$/u, "预览要打出计划摘要");
+
+  // 预览之后目标换了：**代际键一个字都没变，键背后的根消息变了** ——
+  // 这正是"只绑内容/只绑键"的摘要都看不出来的那种改变。outbox 零改动。
+  const regFile = path.join(h.home, "registry.json");
+  const rotated = JSON.parse(fs.readFileSync(regFile, "utf-8"));
+  const state = rotated.tasks[0].topic_generation_state;
+  assert.ok(state?.generations?.length, "夹具应当带着代际状态");
+  for (const g of state.generations) g.root_message_id = "om_next";
+  rotated.tasks[0].root_message_id = "om_next";
+  fs.writeFileSync(regFile, JSON.stringify(rotated, null, 2));
+
+  // 带着预览那一刻的摘要落盘 —— 现实里人就是照着预览抄的。
+  const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: h.home };
+  const stale = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-outbox.mjs"),
+      "--thread-id", THREAD_A, "--apply", "--expect-digest", digest],
+    { encoding: "utf-8", env });
+  assert.notEqual(stale.status, 0, "**轮转过就必须拒绝**：" + stale.stdout + stale.stderr);
+  assert.match(stale.stderr, /作废|重新预览/u, "要说清怎么办：" + stale.stderr);
+  assert.equal(h.read("要发去旧话题的那条").published_at, null, "一张都不许发");
+
+  // 重新预览 → 新摘要（跟旧的必须不同）→ 放行，并且发去的是**新**话题。
+  const digest2 = h.planDigest();
+  assert.notEqual(digest2, digest, "**目标变了摘要必须变** —— 相等就是没绑目标");
+  const ok = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-outbox.mjs"),
+      "--thread-id", THREAD_A, "--apply", "--expect-digest", digest2],
+    { encoding: "utf-8", env });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.match(h.read("要发去旧话题的那条").published_at ?? "", /^\d{4}/u);
+  const calls = fs.readFileSync(path.join(h.home, "lark-calls.jsonl"), "utf-8")
+    .split("\n").filter(Boolean);
+  assert.match(calls.at(-1) ?? "", /om_next/u, "重新授权后发去的要是当前话题");
+});
+
+test("codex drain：预览打印的命令原样过真 shell 能落盘（真实 CLI + /bin/sh）", () => {
+  // 工艺要求：提示指向的操作必须做得到它说的事，且要过真 shell ——
+  // 源码断言看不出引号引错、路径断行这类只有 shell 才暴露的问题。
+  const h = codexDrainRunner.fixture();
+  h.seed("照预览命令发出的那条");
+  const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: h.home };
+  const pv = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-outbox.mjs"), "--thread-id", THREAD_A],
+    { encoding: "utf-8", env });
+  assert.equal(pv.status, 0, pv.stderr);
+  const m = /^\s{2}(.+--expect-digest pub-[0-9a-f]{24})\s*$/mu.exec(pv.stdout ?? "");
+  assert.ok(m, "预览要打印完整可执行命令：" + pv.stdout);
+  const sh = spawnSync("/bin/sh", ["-c", m[1]], { encoding: "utf-8", env });
+  assert.equal(sh.status, 0, "**打印的命令必须原样能跑**：" + sh.stdout + sh.stderr);
+  assert.match(h.read("照预览命令发出的那条").published_at ?? "", /^\d{4}/u,
+    "跑完要真的落盘");
+});
+
+test("codex drain：严格参数白名单 —— 拼错、重复、缺值、双目标、错配一律拒绝", () => {
+  // 这个入口会真的发消息：拼错的参数不许被执行成另一种操作。
+  const cases = [
+    [["--taskkey", "x"], "unknown_option"],
+    [["--thread-id", "a", "--thread-id", "b"], "duplicate_option"],
+    [["--task-key", "--apply"], "option_needs_value"],
+    [["positional"], "unexpected_argument"],
+  ];
+  for (const [tokens, reason] of cases) {
+    const r = drainParseArgs(tokens);
+    assert.equal(r.ok, false, tokens.join(" "));
+    assert.equal(r.reason, reason, tokens.join(" "));
+  }
+  const shapes = [
+    [[["task-key", "a"], ["thread-id", "b"]], "target_ambiguous"],
+    [[], "target_missing"],
+    [[["thread-id", "a"], ["expect-digest", "pub-x"]], "expect_digest_without_apply"],
+  ];
+  for (const [pairs, reason] of shapes) {
+    const r = drainCheckArgShape(new Map(pairs));
+    assert.equal(r.ok, false, reason);
+    assert.equal(r.reason, reason);
+  }
+  assert.equal(drainCheckArgShape(new Map([["thread-id", "a"],
+    ["apply", true], ["expect-digest", "pub-x"]])).ok, true, "合法组合要放行");
+  // 真实 CLI：拼错要非零退出、指出白名单，而且一张都不发。
+  const h = codexDrainRunner.fixture();
+  h.seed("不该被发出去的那条");
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-outbox.mjs"),
+      "--thread-id", THREAD_A, "--aply"],
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: h.home } });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /白名单/u, r.stderr);
+  assert.equal(h.read("不该被发出去的那条").published_at, null, "拼错参数不许变成发送");
 });
 
 test("R5 completeness：收集层给结论，坏一处就 complete:false 并点名", () => {

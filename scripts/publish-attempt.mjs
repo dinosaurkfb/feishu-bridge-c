@@ -86,7 +86,17 @@ export const groupByTargetGeneration = (records) => {
  * 算法只有这一份，预览与落盘都在锁内同一次快照上调它。
  */
 const PLAN_DIGEST_SHAPE = /^pub-[0-9a-f]{24}$/u;
-function planDigestOf(files, targetBatches) {
+/**
+ * **取材只认回调前的锁内事实。**评审独立复现过两种翻案：
+ *   · batchCards 把 _raw Buffer 原地归一成预览时的字节 —— Object.freeze
+ *     冻不住 Buffer 内容，摘要若在回调后读 _raw 就会认下被换过的磁盘内容；
+ *   · composeCard 改写可变的 target —— 摘要若在回调后读 target 就会
+ *     认下被改写的目标。
+ * 所以字节哈希在**进入任何回调之前**存进 baseline，目标在 resolveTarget
+ * 返回后**立即**冻结并拷进 plan 投影；摘要只读这两份，发布用的 target
+ * 也是那个冻结对象 —— 摘要说的和实际发的不可能分叉。
+ */
+function planDigestOf(files, targetBatches, baseline) {
   const h = createHash("sha256");
   h.update("v1\nfiles\n");
   for (const f of [...files].sort()) h.update(String(f) + "\n");
@@ -94,11 +104,12 @@ function planDigestOf(files, targetBatches) {
   for (const item of targetBatches) {
     // 目标取**解析后**的值 —— 记录字段只有代际键，防不住"键没变、键背后的
     // 根消息变了"。rootMessageId 是 publishBatch 真正要发去的地方。
-    h.update("target\u0000" + String(item.key) + "\u0000" +
-      String(item.target?.rootMessageId ?? "") + "\n");
+    h.update("target\u0000" + String(item.plan.key) + "\u0000" +
+      item.plan.rootMessageId + "\n");
     for (const record of item.batch) {
-      h.update(path.basename(String(record._file)) + "\u0000");
-      h.update(createHash("sha256").update(record._raw ?? "").digest("hex"));
+      const base = baseline.get(record);
+      h.update(path.basename(base.file) + "\u0000");
+      h.update(base.rawHash);
       h.update("\n");
     }
   }
@@ -226,7 +237,9 @@ export function publishOutboxAttempt({
       return JSON.stringify(rest);
     };
     const baseline = new Map(selected.map((r) => [r, {
-      file: String(r._file), content: contentOf(r) }]));
+      file: String(r._file), content: contentOf(r),
+      // 字节哈希在这里、**进入任何回调之前**算好 —— 摘要只认它。
+      rawHash: createHash("sha256").update(r._raw ?? "").digest("hex") }]));
     for (const r of selected) Object.freeze(r);
 
     let batchingMismatch = null;
@@ -235,6 +248,11 @@ export function publishOutboxAttempt({
     for (const [targetKey, records] of groupByTargetGeneration(selected)) {
       const target = resolveTarget(targetKey === LEGACY_TARGET_KEY ? null : targetKey);
       if (!target.ok) throw new Error("冻结的出站话题代际不可用（" + target.reason + "）");
+      // 解析结果立即冻结（composeCard 一改就抛，落进 batching_failed），
+      // 摘要用的投影同时拷走 —— 之后没人能既过摘要又换目标。
+      Object.freeze(target);
+      const plan = Object.freeze({ key: targetKey,
+        rootMessageId: String(target.rootMessageId ?? "") });
       const remaining = new Set(records);
       for (const batch of batchCards(records)) {
         for (const member of batch) {
@@ -251,7 +269,7 @@ export function publishOutboxAttempt({
           }
         }
         if (batchingMismatch) break;
-        targetBatches.push({ batch, target, key: targetKey, card: composeCard(batch, target) });
+        targetBatches.push({ batch, target, plan, card: composeCard(batch, target) });
       }
       if (batchingMismatch) break;
       if (remaining.size > 0) {
@@ -277,7 +295,7 @@ export function publishOutboxAttempt({
     // 摘要在锁内、批次校验之后算 —— 预览与落盘用的是同一段代码、同一份快照。
     // 目标解析失败到不了这里（上面直接抛进 batching_failed）：
     // **解析不了目标就没有"正常的计划"可哈希**。
-    const planDigest = planDigestOf(snap.files, targetBatches);
+    const planDigest = planDigestOf(snap.files, targetBatches, baseline);
     if (dryRun) {
       // **预演零改盘** —— 这条在显式重试上被击穿过一次（预先清标），
       // 现在结构上不可能：清标只发生在 markSent 里，而 dry-run 走不到那儿。

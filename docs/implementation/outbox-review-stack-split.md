@@ -50,8 +50,8 @@ CLI 只解析显示）；预览打印完整可执行命令过 shellQuote，真 s
 |---|---|---|---|
 | 1 | `fix/journal-canonical-time` | 恢复清单时间校验改用 `isCanonicalIso` | 已合 #57 |
 | 2 | `feat/outbox-review-read-model` | 只读视图 + 共用读取语义硬化 | 已合 #58 |
-| 3 | `fix/outbox-suppression-transaction` | 抑制事务（**含统一写锁**） | 待审 |
-| 4 | `fix/codex-manual-drain-cas` | 手工发布计划与目标 CAS | **未开始** |
+| 3 | `fix/outbox-suppression-transaction` | 抑制事务（**含统一写锁**） | 已合 #60 |
+| 4 | `fix/codex-manual-drain-cas` | 手工发布计划与目标 CAS | 本轮（见上「第 4 层剩余：已完成」） |
 | 5 | `fix/codex-auto-publish-lifecycle` | 自动发布生命周期 | **未开始** |
 | 6 | `fix/claude-outbox-fail-closed` | Claude 侧接线 | 已合 #59 |
 

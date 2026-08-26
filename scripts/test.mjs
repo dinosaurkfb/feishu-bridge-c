@@ -10876,6 +10876,58 @@ test("发布事务：manualPlan 落盘缺摘要就拒绝，非法组合当场抛
     "前置拒绝不许把锁攥在手里");
 });
 
+test("发布事务：摘要取材是回调前的锁内事实 —— 归一字节、改写目标都翻不了案", () => {
+  // 评审独立复现的两种绕过，各固化一条。
+  // ① batchCards 把 _raw Buffer 原地归一成预览时的字节。
+  //    Object.freeze 冻不住 Buffer 内容 —— 摘要若在回调后读 _raw，
+  //    "磁盘换过内容"这件事就被回调抹掉了，旧摘要照过、发布的是新内容。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-planmat-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir);
+  const recPath = path.join(obDir, "0001.json");
+  fs.writeFileSync(recPath, JSON.stringify(outboxRecord({ text: "AAAA" })));
+  const originalBytes = fs.readFileSync(recPath);
+  const base = {
+    outboxDir: obDir, lockDir: path.join(dir, "lock"), policy: "all_unpaused",
+    resolveTarget: () => ({ ok: true, rootMessageId: "om" }), composeCard: () => ({}),
+  };
+  const pv = publishOutboxAttempt({ ...base, dryRun: true, manualPlan: true,
+    batchCards: (x) => [x], publishBatch: () => "om_x" });
+  assert.equal(pv.status, "dry_run");
+  // 预览之后磁盘换成**同长度**的另一份内容 —— 长度相同，Buffer 才能被原地归一。
+  fs.writeFileSync(recPath, fs.readFileSync(recPath, "utf-8").replace("AAAA", "BBBB"));
+  let sends = 0;
+  const r = publishOutboxAttempt({ ...base, manualPlan: true, expectPlanDigest: pv.planDigest,
+    batchCards: (records) => {
+      // 敌意回调：把快照字节抹回预览时的样子。
+      records[0]._raw.set(originalBytes);
+      return [records];
+    },
+    publishBatch: () => { sends += 1; return "om_x"; } });
+  assert.equal(r.status, "error", JSON.stringify(r));
+  assert.equal(r.reason, "plan_changed", "**归一字节翻不了案** —— 哈希取自回调前");
+  assert.equal(sends, 0, "翻不了案就一张都不许发");
+  assert.equal(JSON.parse(fs.readFileSync(recPath, "utf-8")).published_at, null, "零落标");
+
+  // ② composeCard 改写 target。目标在 resolveTarget 返回后立即冻结 ——
+  //    一动就抛，落进 batching_failed（本地错误，零发送），
+  //    而不是"摘要照过、发去被改写的目标"。
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-planmat2-"));
+  const obDir2 = path.join(dir2, "outbox");
+  fs.mkdirSync(obDir2);
+  fs.writeFileSync(path.join(obDir2, "0001.json"), JSON.stringify(outboxRecord({ text: "一条" })));
+  let sends2 = 0;
+  const r2 = publishOutboxAttempt({
+    outboxDir: obDir2, lockDir: path.join(dir2, "lock"), policy: "all_unpaused",
+    resolveTarget: () => ({ ok: true, rootMessageId: "om_old" }),
+    batchCards: (x) => [x],
+    composeCard: (batch, target) => { target.rootMessageId = "om_evil"; return {}; },
+    publishBatch: () => { sends2 += 1; return "om_x"; } });
+  assert.equal(r2.status, "error", JSON.stringify(r2));
+  assert.equal(r2.reason, "batching_failed", "**改写目标要当场抛** —— 冻结不是装饰");
+  assert.equal(sends2, 0, "一张都不许发");
+});
+
 test("抑制锁内重选：select 产出说不清目标的记录也要中止（atRecheck）", () => {
   // 磁盘上变坏的记录由审计闸门在更早接住（上一条测试钉着）。这一条守的是
   // 剩下的口子：**锁内重读后的重新选择**（readState().select 是调用方回调）

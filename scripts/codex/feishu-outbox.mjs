@@ -40,7 +40,7 @@
 import path from "node:path";
 
 import { isDirectRun, moduleDir } from "../direct-run.mjs";
-import { isPermanentlyRejected, listPending, pauseKindOf } from "../outbox.mjs";
+import { listPending, retryProtection } from "../outbox.mjs";
 import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
 import { generationTargetState } from "../suppress-outbox-core.mjs";
 import { hasPublishAuthorization } from "../outbox.mjs";
@@ -324,10 +324,15 @@ export function collectProjectBacklog() {
           createdAt: r.created_at ?? null,
           text: r.text ?? "",
           // 被永久拒绝过的要单独说 —— 它不会再自动重试，是在等人。
-          rejected: isPermanentlyRejected(r),
-          rejectedKind: pauseKindOf(r),
-          rejectedWhy: isPermanentlyRejected(r)
-            ? sanitizeForDisplay(String(r.publish_rejected_reason ?? "未说明")) : null,
+          // 读法只有投影这一份：状态、成因、原因一次取全，不再拼裸字段。
+          ...(() => {
+            const rp = retryProtection(r);
+            return {
+              rejected: rp.status === "paused",
+              rejectedKind: rp.status === "paused" ? rp.kind : null,
+              rejectedWhy: rp.status === "paused" ? sanitizeForDisplay(rp.reason) : null,
+            };
+          })(),
         });
       }
     }

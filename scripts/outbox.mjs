@@ -169,47 +169,77 @@ export const MAX_AUTO_PUBLISH_ATTEMPTS = 5;
  * 所以它必须**落盘**：只在返回值里带着的话，进程一结束，
  * Stop 和积压视图就只能把两者统称为"被飞书拒绝"。
  */
-export const PAUSE_KINDS = ["platform_rejected", "retry_exhausted"];
+export const PAUSE_KINDS = Object.freeze(["platform_rejected", "retry_exhausted"]);
+
+// **校验不依赖导出值。**评审实测：导出数组可变时，进程内 push 一个编造的
+// kind 就能让原本 corrupt 的记录变成合法 paused —— 封闭联合被运行时扩宽。
+// 冻结挡住改写，私有集合保证就算导出面被换掉，判据也不动。
+const PAUSE_KIND_SET = new Set(PAUSE_KINDS);
 
 /**
- * 一条记录的**重试保护状态**。三态，充要。
+ * 一条记录的**重试保护投影** —— 唯一的读法，返回封闭联合：
+ *
+ *     { status: "clean" }
+ *   | { status: "retrying", attempts }
+ *   | { status: "paused",   attempts, at, reason, kind }
+ *   | { status: "corrupt",  reason }
+ *
+ * ■ 为什么是对象不是状态字符串
+ *
+ * 上一版只有状态函数（retryProtectionState → 字符串），于是展示层
+ * 还得**自己去拼裸字段**取 reason —— 评审点名：那就是"每个读者都重新
+ * 解释状态"，正是这条线上反复漏接的根。投影把每个状态携带的数据一并给全，
+ * **任何消费者（含展示层）不再摸字段**。磁盘上仍是四个平铺字段，
+ * 格式不变（零迁移）；对象化只发生在代码层。
+ *
+ * ■ 合法形状（充要，其余一律 corrupt 并说清为什么）
  *
  *   clean    —— 四个字段都不在（绝大多数记录）
- *   retrying —— 只有 attempts（≥1），还在自动重试预算内
- *   paused   —— attempts（≥1）+ at + reason + kind 四件齐全
+ *   retrying —— 只有 attempts，1 <= attempts < 上限
+ *   paused   —— attempts（≥1）+ at + reason + kind 四件齐全且各自合法；
+ *               kind=retry_exhausted 还要求 attempts 已到上限
  *
- * 其余一切形状都是 `corrupt`。**"封闭"的意思就是没有第四种合法形状** ——
- * 评审两次指出这里不够封闭：先是三个字段完全不验，然后是
- * `attempts: 0` 和"有 at/reason 却没 attempts"仍被放行，
- * 而生产写入端根本产不出这两种形状。**审计放行的集合不该比生产能产出的更大。**
+ * **"封闭"的意思就是没有第五种合法形状。**评审三次收紧到这里：
+ * 先是完全不验，然后 attempts:0 与"有 at/reason 没 attempts"被放行，
+ * 最后 attempts:999 仍算 retrying、attempts:1+retry_exhausted 自相矛盾也过 ——
+ * **审计放行的集合不该比生产能产出的集合更大**，次数和状态必须互相印证。
  */
-export function retryProtectionState(rec) {
+export function retryProtection(rec) {
   const attempts = rec?.publish_attempts;
   const at = rec?.publish_rejected_at;
-  const why = rec?.publish_rejected_reason;
+  const reason = rec?.publish_rejected_reason;
   const kind = rec?.publish_rejected_kind;
-  const present = [attempts, at, why, kind].map((v) => v !== undefined);
+  const present = [attempts, at, reason, kind].map((v) => v !== undefined);
 
-  if (!present.some(Boolean)) return "clean";
+  if (!present.some(Boolean)) return { status: "clean" };
   // attempts 是这台状态机的地基：任何非 clean 形状都必须有它，而且至少 1 次
   // （0 次意味着"从没试过却已经在重试状态"，生产写不出来）。
-  if (!Number.isSafeInteger(attempts) || attempts < 1) return "corrupt";
-
-  if (present[1] === false && present[2] === false && present[3] === false) {
-    // **retrying 必须还在预算内。**评审实测：attempts 写成 999 时上一版判 retrying、
-    // 审计报 ok —— 于是一条**早就该暂停**的畸形记录仍然进入自动发布。
-    // 状态机封闭的意思是次数和状态必须互相印证，不是各说各话。
-    return attempts < MAX_AUTO_PUBLISH_ATTEMPTS ? "retrying" : "corrupt";
+  if (!Number.isSafeInteger(attempts) || attempts < 1) {
+    return { status: "corrupt", reason: "publish_attempts 不是正整数" };
   }
-  // 剩下的只能是 paused —— 而 paused 要求另外三个**全部**在场且合法。
-  if (!isCanonicalIso(at)) return "corrupt";
-  if (typeof why !== "string" || why.trim().length === 0) return "corrupt";
-  if (!PAUSE_KINDS.includes(kind)) return "corrupt";
+  if (present[1] === false && present[2] === false && present[3] === false) {
+    // retrying 必须还在预算内 —— 试满了还说在重试，就是自相矛盾。
+    return attempts < MAX_AUTO_PUBLISH_ATTEMPTS
+      ? { status: "retrying", attempts }
+      : { status: "corrupt", reason: "attempts 已到上限却没有暂停记录" };
+  }
+  // 剩下的只能是 paused —— 要求另外三个**全部**在场且合法。
+  if (!isCanonicalIso(at)) return { status: "corrupt", reason: "publish_rejected_at 不是规范时间" };
+  if (typeof reason !== "string" || reason.trim().length === 0) {
+    return { status: "corrupt", reason: "publish_rejected_reason 缺失或为空" };
+  }
+  if (!PAUSE_KIND_SET.has(kind)) {
+    return { status: "corrupt", reason: "publish_rejected_kind 不在受控取值里" };
+  }
   // 成因也要跟次数对得上：**预算耗尽**只可能发生在试满之后。
-  // 反过来 attempts:1 + retry_exhausted 是自相矛盾的形状，生产写不出来。
-  if (kind === "retry_exhausted" && attempts < MAX_AUTO_PUBLISH_ATTEMPTS) return "corrupt";
-  return "paused";
+  if (kind === "retry_exhausted" && attempts < MAX_AUTO_PUBLISH_ATTEMPTS) {
+    return { status: "corrupt", reason: "说预算耗尽但次数没到上限，自相矛盾" };
+  }
+  return { status: "paused", attempts, at, reason, kind };
 }
+
+/** 兼容投影：只要状态名。**实现只有 retryProtection 那一份。** */
+export const retryProtectionState = (rec) => retryProtection(rec).status;
 
 /**
  * 这条记录**已经暂停自动重试**了吗。
@@ -218,11 +248,13 @@ export function retryProtectionState(rec) {
  * **它不改变三态。**记录仍然是 pending（没发出去、也没被停发）——
  * 停发是不可逆的，而「这次发不出去」不该顺手变成「永远别发」。
  */
-export const isPermanentlyRejected = (rec) => retryProtectionState(rec) === "paused";
+export const isPermanentlyRejected = (rec) => retryProtection(rec).status === "paused";
 
 /** 暂停的成因。没暂停就是 null。 */
-export const pauseKindOf = (rec) =>
-  (retryProtectionState(rec) === "paused" ? rec.publish_rejected_kind : null);
+export const pauseKindOf = (rec) => {
+  const rp = retryProtection(rec);
+  return rp.status === "paused" ? rp.kind : null;
+};
 
 const rewrite = (rec, mutate) => {
   const next = { ...rec };

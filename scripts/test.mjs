@@ -41,8 +41,8 @@ import {
   MAX_AUTO_PUBLISH_ATTEMPTS, appendEvent, auditOutbox, classifyOutboxRecord,
   codexReplyEventKey, composeDigest, explainabilityGaps,
   hasPublishAuthorization, isPermanentlyRejected, listPending, markPublishEligibleByEventKey,
-  markSent, outboxMutationBlocker, pauseKindOf, recordPublishFailure, retryProtectionState,
-  suppressPublishByEventKey,
+  markSent, outboxMutationBlocker, PAUSE_KINDS, pauseKindOf, recordPublishFailure,
+  retryProtection, retryProtectionState, suppressPublishByEventKey,
 } from "./outbox.mjs";
 import {
   capMarkdownTables, composeOutboundCard, countMarkdownTables, outboundCardBatches,
@@ -13524,6 +13524,124 @@ test("失败阈值只有一个：写入端不许产出读取端判为损坏的�
   const done = JSON.parse(fs.readFileSync(path.join(obDir, "0001.json"), "utf-8"));
   assert.equal(retryProtectionState(done), "paused");
   assert.deepEqual(explainabilityGaps(done), [], "读写两端必须对得上");
+});
+
+test("重试保护投影：封闭联合，每个状态携带自己的数据", () => {
+  // 上一版只有状态字符串，展示层还得自己拼裸字段取原因 ——
+  // "每个读者都重新解释状态"正是这条线上反复漏接的根。
+  const base = outboxRecord({ text: "一条" });
+  const iso = "2026-08-26T00:00:00.000Z";
+
+  assert.deepEqual(retryProtection(base), { status: "clean" });
+  assert.deepEqual(retryProtection({ ...base, publish_attempts: 2 }),
+    { status: "retrying", attempts: 2 });
+  assert.deepEqual(retryProtection({ ...base, publish_attempts: MAX_AUTO_PUBLISH_ATTEMPTS,
+    publish_rejected_at: iso, publish_rejected_reason: "自动重试预算耗尽：…",
+    publish_rejected_kind: "retry_exhausted" }),
+    { status: "paused", attempts: MAX_AUTO_PUBLISH_ATTEMPTS, at: iso,
+      reason: "自动重试预算耗尽：…", kind: "retry_exhausted" },
+    "**paused 要把 at/reason/kind 一并给全** —— 消费者不许再回去摸字段");
+
+  // corrupt 也要说清为什么 —— 一个裸的 corrupt 逼着人自己去对着四个字段猜。
+  for (const [patch, pattern] of [
+    [{ publish_attempts: 0 }, /不是正整数/u],
+    [{ publish_attempts: 999 }, /已到上限却没有暂停记录/u],
+    [{ publish_attempts: 3, publish_rejected_at: "abc",
+      publish_rejected_reason: "x", publish_rejected_kind: "platform_rejected" },
+      /不是规范时间/u],
+    [{ publish_attempts: 3, publish_rejected_at: iso,
+      publish_rejected_reason: "  ", publish_rejected_kind: "platform_rejected" },
+      /缺失或为空/u],
+    [{ publish_attempts: 3, publish_rejected_at: iso,
+      publish_rejected_reason: "x", publish_rejected_kind: "随便" },
+      /不在受控取值里/u],
+    [{ publish_attempts: 1, publish_rejected_at: iso,
+      publish_rejected_reason: "x", publish_rejected_kind: "retry_exhausted" },
+      /自相矛盾/u],
+  ]) {
+    const rp = retryProtection({ ...base, ...patch });
+    assert.equal(rp.status, "corrupt", JSON.stringify(patch));
+    assert.match(rp.reason, pattern, "corrupt 要说清为什么：" + rp.reason);
+  }
+
+  // 三个派生只许是投影的薄壳 —— 各自另写一份就又是第二份判据。
+  const paused = { ...base, publish_attempts: 1, publish_rejected_at: iso,
+    publish_rejected_reason: "平台拒绝（err_11310）", publish_rejected_kind: "platform_rejected" };
+  assert.equal(retryProtectionState(paused), "paused");
+  assert.equal(isPermanentlyRejected(paused), true);
+  assert.equal(pauseKindOf(paused), "platform_rejected");
+  assert.equal(pauseKindOf({ ...base, publish_attempts: 1 }), null);
+});
+
+test("重试保护字段：唯一的读写处是 outbox.mjs，别处零出现（原始扫描）", () => {
+  // **行为测试证不了模块边界** —— 展示层拼一次裸字段，语义测试照样全绿。
+  // 原始扫描、不解析注释：跟禁用 process.argv[1] 那条守卫同一形状。
+  //
+  // **豁免按精确路径，不按文件名。**评审实测：按文件名豁免时，
+  // 在 scripts/codex/ 下放一个同名 outbox.mjs 直接摸字段，扫描照样零命中 ——
+  // 豁免面比意图宽，守卫就有了一条免检通道。
+  const fields = ["publish_attempts", "publish_rejected_at",
+    "publish_rejected_reason", "publish_rejected_kind"];
+  const scan = (rootDir, exemptRel) => {
+    const offenders = [];
+    let scanned = 0;
+    const walk = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) { walk(full); continue; }
+        if (!entry.name.endsWith(".mjs")) continue;
+        const rel = path.relative(rootDir, full);
+        if (exemptRel.has(rel)) continue;
+        scanned += 1;
+        const text = fs.readFileSync(full, "utf-8");
+        for (const f of fields) if (text.includes(f)) offenders.push(rel + " ← " + f);
+      }
+    };
+    walk(rootDir);
+    return { offenders, scanned };
+  };
+
+  // 先证明扫描器自己是有效的：造一棵夹具树，嵌套同名 outbox.mjs 里放违规。
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-tokenscan-"));
+  fs.mkdirSync(path.join(fixture, "codex"), { recursive: true });
+  fs.writeFileSync(path.join(fixture, "outbox.mjs"), "// 真身，豁免\nconst a = { publish_attempts: 1 };\n");
+  // **四个 token 全部种进夹具，期望值写死。**
+  // 第一版期望用 fields.map 生成 —— 扫描列表缩水时期望跟着缩，
+  // 变异不红：**期望和被测共享同一份输入就是自我引用**，
+  // 跟"测试复制产品判据"同一类错。
+  fs.writeFileSync(path.join(fixture, "codex", "outbox.mjs"),
+    "// 冒名的嵌套同名文件\nconst sneak = [rec.publish_attempts, rec.publish_rejected_at, " +
+    "rec.publish_rejected_reason, rec.publish_rejected_kind];\n");
+  fs.writeFileSync(path.join(fixture, "clean.mjs"), "export const ok = 1;\n");
+  const proof = scan(fixture, new Set(["outbox.mjs"]));
+  assert.deepEqual(proof.offenders, [
+    "codex/outbox.mjs ← publish_attempts",
+    "codex/outbox.mjs ← publish_rejected_at",
+    "codex/outbox.mjs ← publish_rejected_reason",
+    "codex/outbox.mjs ← publish_rejected_kind",
+  ], "**四个字段每一个都必须被抓住**（期望写死，扫描列表缩水这里就红）：" +
+    JSON.stringify(proof));
+
+  // 再扫真的。豁免只有三个精确路径：唯一读写处 + 两份测试（夹具合法写裸字段）。
+  const real = scan(path.resolve("scripts"),
+    new Set(["outbox.mjs", "test.mjs", path.join("codex", "test.mjs")]));
+  assert.deepEqual(real.offenders, [],
+    "这些文件绕过了投影直接摸字段（或在注释里留了字段名）");
+  // 扫描面自检：产品脚本数量有底线，走空目录不算扫过。
+  assert.ok(real.scanned >= 60, "扫描面缩水了：只扫到 " + real.scanned + " 个文件");
+});
+
+test("受控成因枚举不许在运行时被扩宽", () => {
+  // 评审实测：导出数组可变时，PAUSE_KINDS.push("invented_kind") 让原本
+  // corrupt 的记录变成合法 paused —— 封闭联合被进程内代码扩宽。
+  assert.equal(Object.isFrozen(PAUSE_KINDS), true, "导出的枚举必须冻结");
+  const forged = { ...outboxRecord({ text: "一条" }), publish_attempts: 1,
+    publish_rejected_at: "2026-08-26T00:00:00.000Z",
+    publish_rejected_reason: "x", publish_rejected_kind: "invented_kind" };
+  assert.equal(retryProtection(forged).status, "corrupt", "前提：编造的 kind 是 corrupt");
+  try { PAUSE_KINDS.push("invented_kind"); } catch { /* 冻结数组会抛，正好 */ }
+  assert.equal(retryProtection(forged).status, "corrupt",
+    "**就算导出面被动过，判据也不许跟着变宽**");
 });
 
 summarySealed = true;

@@ -13605,12 +13605,22 @@ test("重试保护字段：唯一的读写处是 outbox.mjs，别处零出现（
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-tokenscan-"));
   fs.mkdirSync(path.join(fixture, "codex"), { recursive: true });
   fs.writeFileSync(path.join(fixture, "outbox.mjs"), "// 真身，豁免\nconst a = { publish_attempts: 1 };\n");
+  // **四个 token 全部种进夹具，期望值写死。**
+  // 第一版期望用 fields.map 生成 —— 扫描列表缩水时期望跟着缩，
+  // 变异不红：**期望和被测共享同一份输入就是自我引用**，
+  // 跟"测试复制产品判据"同一类错。
   fs.writeFileSync(path.join(fixture, "codex", "outbox.mjs"),
-    "// 冒名的嵌套同名文件\nconst sneak = rec.publish_attempts;\n");
+    "// 冒名的嵌套同名文件\nconst sneak = [rec.publish_attempts, rec.publish_rejected_at, " +
+    "rec.publish_rejected_reason, rec.publish_rejected_kind];\n");
   fs.writeFileSync(path.join(fixture, "clean.mjs"), "export const ok = 1;\n");
   const proof = scan(fixture, new Set(["outbox.mjs"]));
-  assert.deepEqual(proof.offenders, ["codex/outbox.mjs ← publish_attempts"],
-    "**嵌套同名文件必须被抓住** —— 抓不住就是免检通道：" + JSON.stringify(proof));
+  assert.deepEqual(proof.offenders, [
+    "codex/outbox.mjs ← publish_attempts",
+    "codex/outbox.mjs ← publish_rejected_at",
+    "codex/outbox.mjs ← publish_rejected_reason",
+    "codex/outbox.mjs ← publish_rejected_kind",
+  ], "**四个字段每一个都必须被抓住**（期望写死，扫描列表缩水这里就红）：" +
+    JSON.stringify(proof));
 
   // 再扫真的。豁免只有三个精确路径：唯一读写处 + 两份测试（夹具合法写裸字段）。
   const real = scan(path.resolve("scripts"),

@@ -77,8 +77,10 @@ export function watcherActive(root) {
 export function localOutboxMessage(r) {
   const head = r.reason === "outbox_unreadable" ? "本地 outbox 读不出来"
     : r.reason === "outbox_not_a_directory" ? "本地 outbox 那个路径不是目录"
-      : "本地 outbox 有 " + (r.count ?? 0) + " 处说不清" +
-        ((r.files ?? []).length ? "（" + r.files.join("、") + "）" : "");
+      : r.reason === "batching_mismatch" || r.reason === "batching_failed"
+        ? "切批阶段被拦下（" + (r.detail ?? r.reason) + "）"
+        : "本地 outbox 有 " + (r.count ?? 0) + " 处说不清" +
+          ((r.files ?? []).length ? "（" + r.files.join("、") + "）" : "");
   const why = (r.details ?? []).map((d) => "\n    " + d.file + " —— " + d.why).join("");
   return head + "。\n" +
     "  **这不是发布失败，是本地记录的问题** —— 重试没用，需要人看一眼。整批都没有动。" +

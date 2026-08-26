@@ -84,13 +84,16 @@ export const groupByTargetGeneration = (records) => {
  *
  * @returns
  *   { status:"skipped", reason }                     拿不到锁
- *   { status:"error", local:true, ... }              审计闸门拦下（整批 fail-closed 并点名）
+ *   { status:"error", local:true, ... }              审计闸门/批次守恒拦下（整批 fail-closed 并点名）
  *   { status:"empty" }
  *   { status:"needs_attention", count, rejected }    全是已暂停的 —— 不许报 empty
  *   { status:"dry_run", count, batches, selected }
- *   { status:"published", count, messageId, messageIds }
+ *   { status:"published", count, messageId, messageIds,
+ *     bookkeepingFailures, deliveredUnrecorded }     两类发布后异常，空数组 = 全好
  *   { status:"error", reason:"publish_failed", permanent, permanentKind,
- *     permanentReason, markedRejected, error, failingTarget }
+ *     permanentReason, markedRejected, error, failingTarget,
+ *     partial, publishedRecords, messageIds,         失败前的进度，不许被抹掉
+ *     bookkeepingFailures, deliveredUnrecorded }
  */
 export function publishOutboxAttempt({
   outboxDir, lockDir, policy, dryRun = false,
@@ -154,20 +157,25 @@ export function publishOutboxAttempt({
     }
 
     // **切批不许重选、不许换内容、不许跨代际。**batchCards 只有"怎么分组"的权力。
-    // 三轮评审各击穿一层：返回空数组（假成功）→ 同路径克隆换内容（伪造发布 +
-    // 磁盘被改写）→ 原地改写原对象、以及把 gen-A 的记录攒到 gen-B 那次返回
-    // （全局集合相等，却发去了错误话题）。所以校验做在**每次 batchCards 返回后、
-    // composeCard 之前，按代际逐组**做，三道一起：
-    //   身份 —— 成员必须是本组的同一批对象、各恰好一次（克隆进不来）
-    //   内容 —— 成员当前内容必须仍等于快照字节（原地改写进不来）
-    //   代际 —— 组外对象直接算外来（跨组攒批进不来）
-    let batchingMismatch = null;
+    // 四轮评审各击穿一层：空数组假成功 → 同路径克隆 → 原地改写 + 跨代际攒批 →
+    // **连 _raw/_file 一起改（自证材料也在回调手里）**。所以：
+    //   · 基线（文件路径 + 内容）在**进入任何回调之前**存进外部 Map，
+    //     校验只对基线，不再读 member._raw / member._file 自证
+    //   · 记录对象冻结 —— 原地改写在严格模式下直接抛
+    //   · 校验按代际逐组、在每次 batchCards 返回后立刻做
+    //   · markSent 前再核一次基线 —— composeCard 也是回调，不给"校验后再改"留窗口
     const contentOf = (r) => {
       const { _file, _raw, ...rest } = r;
       void _file; void _raw;
       return JSON.stringify(rest);
     };
+    const baseline = new Map(selected.map((r) => [r, {
+      file: String(r._file), content: contentOf(r) }]));
+    for (const r of selected) Object.freeze(r);
+
+    let batchingMismatch = null;
     const targetBatches = [];
+    try {
     for (const [targetKey, records] of groupByTargetGeneration(selected)) {
       const target = resolveTarget(targetKey === LEGACY_TARGET_KEY ? null : targetKey);
       if (!target.ok) throw new Error("冻结的出站话题代际不可用（" + target.reason + "）");
@@ -179,9 +187,10 @@ export function publishOutboxAttempt({
             break;
           }
           remaining.delete(member);
-          if (contentOf(member) !== JSON.stringify(JSON.parse(member._raw.toString("utf-8")))) {
-            batchingMismatch = "记录内容被原地改写、与快照字节不一致：" +
-              path.basename(String(member._file ?? ""));
+          const base = baseline.get(member);
+          if (!base || contentOf(member) !== base.content || String(member._file) !== base.file) {
+            batchingMismatch = "记录与进回调前的基线不一致（内容或文件路径被改写）：" +
+              path.basename(base ? base.file : String(member._file ?? "?"));
             break;
           }
         }
@@ -193,6 +202,14 @@ export function publishOutboxAttempt({
         batchingMismatch = "本代际有 " + remaining.size + " 条候选被切批丢掉";
         break;
       }
+    }
+    } catch (batchErr) {
+      // **切批阶段一张卡都没发** —— 这里的异常是本地问题，不是发布失败，
+      // 不许进统一 catch 记重试账。冻结记录被原地改写时抛的 TypeError 也落在这。
+      return {
+        status: "error", reason: "batching_failed", local: true,
+        detail: String(batchErr?.message ?? batchErr).slice(0, 300),
+      };
     }
     if (batchingMismatch) {
       return {
@@ -228,6 +245,15 @@ export function publishOutboxAttempt({
           error: String(hookErr?.message ?? hookErr).slice(0, 300) });
       }
       for (const record of item.batch) {
+        // 落标前对基线再核一次：composeCard 之后若有人改了记录（冻结被绕过），
+        // **宁可不落标也不许把伪造内容写回磁盘** —— 记进 deliveredUnrecorded 让人处理。
+        const base = baseline.get(record);
+        if (!base || contentOf(record) !== base.content || String(record._file) !== base.file) {
+          deliveredUnrecorded.push({ messageId,
+            file: path.basename(base ? base.file : String(record._file ?? "?")),
+            error: "记录在校验后被改写，拒绝落标 —— 内容已送达，需要人核对" });
+          continue;
+        }
         try { markSent(record, messageId); publishedRecords += 1; }
         catch (markErr) {
           deliveredUnrecorded.push({ messageId,

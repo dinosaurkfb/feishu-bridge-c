@@ -14002,11 +14002,27 @@ test("矩阵机器：翻 migrated 自动要求完整契约，静默绕过的三�
   assert.match(swallowed.find((r) => { try { r.run(assert); return false; } catch { return true; } }).title,
     /一行都不执行/u);
 
-  // suite 拼错 → 校验行必红（全表校验，谁跑谁都能看见）。
+  // 登记项 suite 拼错 → 校验行必红（全表校验，谁跑谁都能看见）。
+  // 表里要留一份合法认领，否则先撞上"没认领"那道闸。
   const badSuite = matrixRowsFor({
-    registry: { implementations: { "x-entry": { file: "x.mjs", suite: "clade", status: "legacy" } } },
-    suite: "claude", runners: {}, legacySubsets: {} });
-  assert.ok(validationRow(badSuite, /suite 不合法/u), "suite 拼错必须出校验行");
+    registry: { implementations: {
+      "ok-entry": { file: "ok.mjs", suite: "claude", status: "legacy" },
+      "x-entry": { file: "x.mjs", suite: "clade", status: "legacy" },
+    } },
+    suite: "claude", runners: { "ok-entry": able }, legacySubsets: {} });
+  assert.ok(validationRow(badSuite, /suite 不合法/u), "登记项 suite 拼错必须出校验行");
+
+  // **调用方的 suite 拼错 → 当场抛**，不许生成 0 行的"空矩阵"（评审探针）。
+  // 钉到具体文案：光断言"会抛"不够 —— 拼错的 suite 也会撞上"没认领"那道闸
+  // 顺带抛出来，把这道检查删了照样绿。诊断质量本身是契约。
+  assert.throws(() => matrixRowsFor({
+    registry: reg({ status: "legacy" }), suite: "cluade", runners: {}, legacySubsets: {} }),
+    /未知套件/u, "suite 参数拼错要说「未知套件」，不是拐弯撞上别的闸");
+  // 合法套件却一份实现都没认领 → 同样抛（登记表和调用方对不上）。
+  assert.throws(() => matrixRowsFor({
+    registry: { implementations: { "x-entry": { file: "x.mjs", suite: "codex", status: "legacy" } } },
+    suite: "claude", runners: {}, legacySubsets: {} }),
+    TypeError, "没认领任何实现必须抛");
   // not_applicable 申报不存在的场景 / 没给理由 / 不是对象 → 必须出**校验行**。
   // 按校验行标题查，不数 fails() —— able 夹具本来就抛，数总失败会被稀释成恒真。
   assert.ok(validationRow(mk({ status: "migrated", not_applicable: { "编造的": "x" } }, able),
@@ -14120,8 +14136,10 @@ test("发布事务：原地改写与跨代际攒批都进不来（评审第三�
     publishBatch: () => { calls1 += 1; return "om"; },
   });
   assert.equal(r1.status, "error", "原地改写必须拦下");
-  assert.equal(r1.reason, "batching_mismatch");
-  assert.match(r1.detail, /原地改写/u, "要说清是哪种越权");
+  // 记录已冻结：改写在严格模式下当场抛，落进切批阶段的本地错误 ——
+  // **不是 publish_failed，不记重试账**（此刻一张卡都没发）。
+  assert.equal(r1.reason, "batching_failed");
+  assert.equal(r1.local, true);
   assert.equal(calls1, 0, "一条都不许发");
   assert.match(fs.readFileSync(path.join(g1.obDir, "0001.json"), "utf-8"), /原文1/u,
     "**磁盘原文不许被改写**");
@@ -14213,6 +14231,138 @@ test("渲染：落标失败与记账缺口同时发生要同时展示", () => {
   assert.match(said.text, /记账失败/u, "**记账缺口不许被落标失败盖住**");
   assert.match(said.text, /改名失败/u);
   assert.match(said.text, /轮转登记写不进去/u);
+});
+
+test("发布事务：连自证材料一起改、或把 _file 指到别的文件，都进不来", () => {
+  // 评审第四轮的两个探针。基线（路径 + 内容）在进任何回调之前存进外部 Map，
+  // 记录对象冻结 —— 校验不再读 member._raw / member._file 自证。
+  const mk = () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-tamper-"));
+    const obDir = path.join(dir, "outbox");
+    fs.mkdirSync(obDir);
+    fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify(outboxRecord({ text: "原文甲" })));
+    fs.writeFileSync(path.join(obDir, "victim.json"), JSON.stringify(outboxRecord({ text: "受害记录" })));
+    return { dir, obDir };
+  };
+  const run = (g, batchCards) => {
+    let calls = 0;
+    const r = publishOutboxAttempt({
+      outboxDir: g.obDir, lockDir: path.join(g.dir, "lock"), policy: "all_unpaused",
+      batchCards, resolveTarget: () => ({ ok: true }), composeCard: (b) => ({ body: b[0]?.text }),
+      publishBatch: () => { calls += 1; return "om"; },
+    });
+    return { r, calls };
+  };
+  // 探针一：text 和 _raw 一起改成 FORGED（自证材料也在回调手里）。
+  // 冻结让改写在严格模式下当场抛；攻击者吞掉异常的话，记录保持原样 ——
+  // **可接受的结局只有两种：整批拦下，或发布的仍是原文。伪造永远出不去。**
+  const g1 = mk();
+  const sent1 = [];
+  const a1 = (() => {
+    let calls = 0;
+    const r = publishOutboxAttempt({
+      outboxDir: g1.obDir, lockDir: path.join(g1.dir, "lock"), policy: "all_unpaused",
+      batchCards: (records) => {
+        const target = records.find((x) => x.text === "原文甲");
+        try { target.text = "FORGED"; } catch { /* 攻击者吞掉冻结抛错 */ }
+        try { target._raw = Buffer.from("FORGED"); } catch { /* 同上 */ }
+        return records.map((x) => [x]);
+      },
+      resolveTarget: () => ({ ok: true }), composeCard: (b) => ({ body: b[0]?.text }),
+      publishBatch: ({ card }) => { calls += 1; sent1.push(card.body); return "om"; },
+    });
+    return { r, calls };
+  })();
+  assert.equal(sent1.includes("FORGED"), false, "**伪造正文一张都不许出去**");
+  if (a1.calls > 0) {
+    assert.deepEqual([...new Set(sent1)].sort(), ["原文甲", "受害记录"].sort(),
+      "发出去的只能是原文");
+  }
+  assert.match(fs.readFileSync(path.join(g1.obDir, "0001.json"), "utf-8"), /原文甲/u,
+    "磁盘原文不许被改写");
+
+  // 探针二：把 _file 指到另一个文件 —— 上一版正常 published，
+  // 原记录仍 pending、**受害文件被覆盖成已发布**。冻结挡住重定向；
+  // 攻击被吞掉后走正常路，受害文件的字节必须与攻击无关。
+  const g2 = mk();
+  const victimBefore = fs.readFileSync(path.join(g2.obDir, "victim.json"), "utf-8");
+  run(g2, (records) => {
+    const target = records.find((x) => x.text === "原文甲");
+    try { target._file = path.join(g2.obDir, "victim.json"); } catch { /* 冻结会抛 */ }
+    return records.map((x) => [x]);
+  });
+  const victim = JSON.parse(fs.readFileSync(path.join(g2.obDir, "victim.json"), "utf-8"));
+  assert.equal(victim.text, "受害记录", "**受害文件不许被 0001 的落标覆盖**");
+  // 受害文件自己按正常路径落标是合法的；被冒名覆盖不合法 —— 文本仍须是它自己的。
+  void victimBefore;
+});
+
+test("Stop 热入口：发到一半失败要说清两半（真实进程）", () => {
+  // 评审：describeDrainOutcome 会展示 partial，但 Stop 自己另一套分支 ——
+  // partial+transient 落进"发布失败，兜底会重试"，**暗示什么都没发出去**；
+  // 已送达的事实和核对提示全没了。这条走真实 Stop 进程验措辞。
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-stop-partial-"));
+  const project = path.join(home, "proj");
+  const inbound = path.join(project, ".runtime-data", "inbound");
+  const obDir = path.join(project, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+
+  // 假 lark：**第二次调用才失败** —— 事件文件名是哈希，readdir 顺序不保证
+  // 哪条先发；按内容触发会让"第一批"随机变成失败的那批，partial 就测不到了。
+  const bin = path.join(home, "fake-lark.cjs");
+  const counter = path.join(home, "call-count.txt");
+  fs.writeFileSync(bin, [
+    "#!" + process.execPath,
+    "const fsx = require('node:fs');",
+    "let n = 0;",
+    "try { n = Number(fsx.readFileSync(" + JSON.stringify(counter) + ", 'utf-8')) || 0; } catch {}",
+    "n += 1;",
+    "fsx.writeFileSync(" + JSON.stringify(counter) + ", String(n));",
+    "if (n >= 2) { process.stderr.write('boom-opaque'); process.exit(1); }",
+    "process.stdout.write('{\"ok\":true,\"data\":{\"message_id\":\"om_1st\"}}');",
+  ].join("\n") + "\n", { mode: 0o700 });
+
+  const registryFile = path.join(home, "registry.json");
+  fs.writeFileSync(registryFile, JSON.stringify({ projects: [{
+    id: "p", root: project, name: "P", root_message_id: "om_root",
+    expires_at: "2099-01-01T00:00:00Z" }] }));
+  // 凭据目录要像真的：publishDraft 发之前校验 config.json 里的 appId 归属。
+  const larkHome = path.join(home, "larkhome");
+  fs.mkdirSync(larkHome, { recursive: true });
+  fs.writeFileSync(path.join(larkHome, "config.json"), JSON.stringify({
+    apps: [{ name: "claude", appId: TPL.outbound_app_id }] }));
+  const templateFile = path.join(home, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify({
+    ...TPL, lark_cli_bin: bin, lark_cli_home: larkHome }));
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: project, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", lark_cli_bin: bin, lark_cli_profile: "claude" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_root", feishu_root_message_id_reference: "om_root",
+    claude_session_id: null, channel_generation_id: "gen-1",
+    expires_at: "2099-01-01T00:00:00.000Z" }));
+  // 两条 reply → 两张卡（reply 一轮一张）；第一张成、第二张败。
+  appendEvent({ outboxDir: obDir, kind: "reply", text: "先发成的一条", source: "t", eventKey: "e1" });
+  appendEvent({ outboxDir: obDir, kind: "reply", text: "后失败的一条", source: "t", eventKey: "e2" });
+
+  const r = spawnSync(process.execPath, [path.join(path.resolve("scripts"), "stop-hook.mjs")], {
+    input: JSON.stringify({ session_id: "s1", cwd: project, last_assistant_message: "" }),
+    encoding: "utf-8",
+    env: { ...process.env, FEISHU_BRIDGE_REGISTRY: registryFile,
+      FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, HOME: home },
+  });
+  const said = (r.stdout ?? "") + (r.stderr ?? "");
+  // 前提：确实打成了 partial —— 第一条落标、第二条留下。
+  const done = fs.readdirSync(obDir).map((f) => JSON.parse(fs.readFileSync(path.join(obDir, f), "utf-8")));
+  assert.equal(done.filter((x) => x.published_at !== null).length, 1,
+    "前提：恰好一条发成并落标 —— " + said.slice(0, 400));
+  assert.equal(done.filter((x) => x.published_at === null).length, 1,
+    "前提：另一条失败仍 pending");
+  assert.match(said, /发到一半失败/u, "**Stop 要说这是打了一半**：" + said.slice(0, 400));
+  assert.match(said, /已送达 1 张/u, "已送达的事实要在");
+  assert.equal(/进展留在 outbox，兜底定时器会重试。/u.test(said), false,
+    "**不许用整批失败的措辞暗示什么都没发出去**");
 });
 
 summarySealed = true;

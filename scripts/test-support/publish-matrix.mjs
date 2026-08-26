@@ -14,7 +14,7 @@
  *
  * runner 接口：
  *   caps: Set<string>            具备的能力（publish / failStates / dryRun / …）
- *   notApplicable: {场景名: 理由}  migrated 时对不适用场景的显式申报
+ *   （不适用申报**不在 runner 上** —— 在登记表的 not_applicable 里，见上）
  *   fixture() => h：
  *     h.seed(text)               放一条待发记录
  *     h.seedPaused(text)         放一条已暂停（platform_rejected）的记录
@@ -194,6 +194,11 @@ export function validatePublishRegistry(registry) {
  * migrated 缺 runner / status 非法 / 缺能力未申报 / 一行都不执行 → 必红行。
  */
 export function matrixRowsFor({ registry, suite, runners, legacySubsets }) {
+  // **调用方的 suite 也是受控值。**评审探针：suite 传 "cluade" → 0 行全绿，
+  // 整套矩阵静默消失。拼错是调用方代码错误 —— 当场抛，不生成"空矩阵"。
+  if (!["claude", "codex"].includes(suite)) {
+    throw new TypeError("未知套件：" + String(suite) + " —— 只有 claude / codex");
+  }
   const rows = [];
   for (const problem of validatePublishRegistry(registry)) {
     rows.push({ entry: "登记表", status: "invalid", title: problem,
@@ -242,6 +247,10 @@ export function matrixRowsFor({ registry, suite, runners, legacySubsets }) {
         run: (assert) => assert.fail(entry +
           " 把所有场景都申报成不适用 —— migrated 至少要执行一个场景，否则状态是空话") });
     }
+  }
+  // 一个合法套件一份实现都没认领 = 登记表和调用方对不上 —— 同样当场抛。
+  if (!Object.values(registry.implementations ?? {}).some((m) => m?.suite === suite)) {
+    throw new TypeError("套件 " + suite + " 在登记表里一份实现都没认领 —— 矩阵不许静默为空");
   }
   return rows;
 }

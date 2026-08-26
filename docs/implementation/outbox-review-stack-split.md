@@ -1,7 +1,24 @@
 # outbox 审阅栈：六层拆分计划
 
-状态：第 1、2、6 层已合入 `main` 并安装（PR #57 / #58 / #59，运行时 `f20aea68e15f4db6`）。
-第 3、4、5 层未开始。
+状态：第 1、2、3、6 层已合入 `main`（PR #57 / #58 / #59 / #60）；
+运行时 `cccd72e7b2c29f77`（2026-08-26 安装，含第 3 层与 cc2cd 四条修复）。
+
+**2026-08-27 更新：发布路径重构（R 系列）完成，改变了第 4、5 层的剩余范围。**
+详见 `publish-path-refactor.md`。要点：
+- 四份发布策略实现（Claude drain / Claude watcher / Codex drain /
+  Codex publish-eligible）全部收进唯一事务 `publishOutboxAttempt`
+  （锁 → 单快照 → 审计闸门 → 受控策略候选 → 逐代际切批校验 → 记账）。
+- **第 5 层原计划的"授权判据收敛"已结构性完成**：authorized_only 策略只消费
+  `hasPublishAuthorization`，"非空字符串"分叉随事务接入消失。
+- 锁内字节快照（第 4、5 层各自计划里的那条）也已由事务统一提供。
+- 发布写原语（落标 / 失败记账）的**生产调用面**已限制为仅事务（token 扫描守卫）。
+- watcher 的 run 结果定为事务外第二通道：发布前 claim 互斥 + 回执三态 +
+  reap 锁串行接管 + 显式维护入口。
+
+**第 4 层剩余**：发布计划摘要与 `--expect-*` 参数（绑"预览所见文件字节集合 +
+解析后目标"的联合摘要，形状照抄第 3 层抑制 CAS）；`atRecheck` 测试补回。
+**第 5 层剩余**：终局证据 → 发布授权的完整链（凭据制品今天还不存在，先做
+二选一决定）；`eligibility_pending` 恢复链之外的 watcher 接线复核。
 
 集成基准分支：`integration/outbox-review-baseline`（原 `feat/outbox-review`，9 笔提交）。
 它**不作为交付路径**，只作为"这些改动曾经一起跑通过"的参照。

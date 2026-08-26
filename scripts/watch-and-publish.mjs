@@ -22,7 +22,7 @@ import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { claudeRotationBatchHook } from "./drain-outbox.mjs";
 import { publishOutboxAttempt } from "./publish-attempt.mjs";
 import { boundedBudgetMs } from "./eligibility-recovery.mjs";
-import { postDeliveryBits } from "./stop-note.mjs";
+import { postDeliveryBits } from "./publish-outcome.mjs";
 import { repairCmd } from "./repair-run-claim.mjs";
 import { shellQuote } from "./shell-quote.mjs";
 import { readClaim, recordClaimState } from "./claim.mjs";

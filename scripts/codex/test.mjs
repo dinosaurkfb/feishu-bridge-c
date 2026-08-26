@@ -6754,81 +6754,158 @@ test("项目级积压：内容、损坏结论、完整性都要跟 task 那半�
 const PUBLISH_ENTRY_STATUS = JSON.parse(fs.readFileSync(
   path.join(ROOT, "references", "publish-entry-status.json"), "utf-8"));
 
-const codexEligibleRunner = {
-  caps: new Set(["publish"]),
-  notApplicable: {},
-  fixture() {
-    const { home, task, argsFile } = autoPublishFixture();
-    const obDir = taskPaths(task, home).outbox;
-    return {
-      // 这个入口只发**取得授权**的记录 —— seed 造的是"会被它发布的一条"。
-      seed(text) {
-        appendEvent({ outboxDir: obDir, kind: "reply", text,
-          eventKey: "matrix-" + text, publishEligible: true });
-      },
-      seedPaused(text) {
-        appendEvent({ outboxDir: obDir, kind: "reply", text,
-          eventKey: "matrix-" + text, publishEligible: true });
-        recordPublishFailure(listPending({ outboxDir: obDir }).find((r) => r.text === text),
-          { permanent: true, reason: "err_11310" });
-      },
-      attempt(behavior) {
-        assert.equal(behavior, "ok", "codex-eligible 的 legacy 行只申报了成功路径");
-        const before = fs.existsSync(argsFile) ? 1 : 0;
-        publishEligibleTaskEvents({ task, home });
-        return { publishCalls: (fs.existsSync(argsFile) ? 1 : 0) - before };
-      },
-      read(text) {
-        for (const f of fs.readdirSync(obDir)) {
-          try {
-            const rec = JSON.parse(fs.readFileSync(path.join(obDir, f), "utf-8"));
-            if (rec.text === text) return rec;
-          } catch { /* 略过 */ }
-        }
-        throw new Error("codex 矩阵夹具里找不到：" + text);
-      },
-    };
-  },
-};
-
-const codexDrainRunner = {
-  caps: new Set(["publish"]),
-  notApplicable: {},
-  fixture() {
-    const { home, task, argsFile } = autoPublishFixture();
-    const obDir = taskPaths(task, home).outbox;
-    const h = {
-      seed(text) {
-        appendEvent({ outboxDir: obDir, kind: "milestone", text, eventKey: "mx-" + text });
-      },
-      seedPaused(text) {
-        appendEvent({ outboxDir: obDir, kind: "milestone", text, eventKey: "mx-" + text });
-        recordPublishFailure(listPending({ outboxDir: obDir }).find((r) => r.text === text),
-          { permanent: true, reason: "err_11310" });
-      },
-      attempt(behavior) {
-        assert.equal(behavior, "ok", "codex-drain 的 legacy 行只申报了成功路径");
-        const before = fs.existsSync(argsFile) ? fs.statSync(argsFile).size : 0;
-        const r = spawnSync(process.execPath,
-          [path.join(ROOT, "scripts", "codex", "drain-outbox.mjs"),
-            "--thread-id", THREAD_A, "--apply"],
-          { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
-        assert.equal(r.status, 0, "codex drain 要正常退出：" + (r.stderr ?? "").slice(0, 300));
-        const after = fs.existsSync(argsFile) ? fs.statSync(argsFile).size : 0;
-        return { publishCalls: after !== before || (before > 0 && after > 0) ? 1 : 0 };
-      },
-      read: null,
-    };
-    h.read = (text) => {
+/**
+ * codex 侧矩阵夹具：模式文件假 lark（按 marker 命中触发失败行为）+
+ * 真实 task 登记。两个 runner 共用。
+ */
+function codexMatrixFixture() {
+  const home = temp();
+  const root = path.join(home, "project");
+  const configBase = path.join(home, "agents");
+  const credentialDir = path.join(configBase, TEMPLATE.agent_uid);
+  fs.mkdirSync(root, { recursive: true });
+  fs.mkdirSync(credentialDir, { recursive: true });
+  fs.writeFileSync(path.join(credentialDir, "config.json"), JSON.stringify({
+    apps: [{ name: TEMPLATE.lark_cli_profile, appId: TEMPLATE.transport_app_id }],
+  }));
+  const modeFile = path.join(home, "mode.txt");
+  const markersFile = path.join(home, "markers.txt");
+  const argsFile = path.join(home, "lark-calls.jsonl");
+  fs.writeFileSync(modeFile, "ok"); fs.writeFileSync(markersFile, "");
+  const bin = path.join(home, "fake-lark.cjs");
+  fs.writeFileSync(bin, [
+    "#!" + process.execPath,
+    "const fsx = require('node:fs');",
+    "const all = process.argv.slice(2).join(' ');",
+    "fsx.appendFileSync(" + JSON.stringify(argsFile) + ", JSON.stringify(all) + '\\n');",
+    "const mode = fsx.readFileSync(" + JSON.stringify(modeFile) + ", 'utf-8').trim();",
+    "const markers = fsx.readFileSync(" + JSON.stringify(markersFile) + ", 'utf-8')",
+    "  .split('\\n').filter(Boolean);",
+    "let n = 0;",
+    "try { n = Number(fsx.readFileSync(" + JSON.stringify(path.join(home, 'call-n.txt')) + ", 'utf-8')) || 0; } catch {}",
+    "n += 1; fsx.writeFileSync(" + JSON.stringify(path.join(home, 'call-n.txt')) + ", String(n));",
+    "if (mode === 'fail-second' && n >= 2) {",
+    "  process.stderr.write('boom-opaque: 说不清'); process.exit(1);",
+    "}",
+    "if (mode !== 'ok' && mode !== 'fail-second' && markers.some((m) => all.includes(m))) {",
+    "  if (mode === 'fail-opaque') { process.stderr.write('boom-opaque: 说不清'); }",
+    "  if (mode === 'fail-platform') {",
+    "    process.stderr.write('ext=ErrCode: 11310; ErrMsg: card table number over limit');",
+    "  }",
+    "  process.exit(1);",
+    "}",
+    "process.stdout.write('{\"ok\":true,\"data\":{\"message_id\":\"om_sent\"}}');",
+  ].join("\n") + "\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({
+    ...TEMPLATE, lark_cli_bin: bin, lark_cli_config_base: configBase,
+  }));
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Matrix",
+    rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = true;
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  const obDir = taskPaths(task, home).outbox;
+  fs.mkdirSync(obDir, { recursive: true });
+  const markers = [];
+  const shared = {
+    home, task, obDir, markers,
+    mark(text) { markers.push(text); fs.appendFileSync(markersFile, text + "\n"); },
+    setMode(m) { fs.writeFileSync(modeFile, m); },
+    callsDelta(fn) {
+      const before = fs.existsSync(argsFile)
+        ? fs.readFileSync(argsFile, "utf-8").split("\n").filter(Boolean) : [];
+      fn();
+      // 零调用的场景（dry-run、整批被拦）里 argsFile 根本不会被创建。
+      const after = fs.existsSync(argsFile)
+        ? fs.readFileSync(argsFile, "utf-8").split("\n").filter(Boolean) : [];
+      return after.slice(before.length)
+        .filter((l) => markers.some((m) => l.includes(m))).length;
+    },
+    read(text) {
       for (const f of fs.readdirSync(obDir)) {
         try {
           const rec = JSON.parse(fs.readFileSync(path.join(obDir, f), "utf-8"));
           if (rec.text === text) return rec;
         } catch { /* 略过 */ }
       }
-      throw new Error("codex-drain 矩阵夹具里找不到：" + text);
+      throw new Error("codex 矩阵夹具里找不到：" + text);
+    },
+  };
+  return shared;
+}
+
+let codexSeq = 0;
+const codexEligibleRunner = {
+  // 自动路径：没有预览面、没有人工重试参数 —— 由登记表 not_applicable 申报。
+  caps: new Set(["publish", "failStates", "auditGate"]),
+  fixture() {
+    const g = codexMatrixFixture();
+    const seedWith = (text, eligible) => {
+      g.mark(text);
+      codexSeq += 1;
+      appendEvent({ outboxDir: g.obDir, kind: "reply", text,
+        eventKey: "mx-" + codexSeq, publishEligible: eligible });
     };
-    return h;
+    return {
+      obDir: g.obDir, home: g.home, task: g.task,
+      seed: (text) => seedWith(text, true),
+      seedPaused(text) {
+        seedWith(text, true);
+        recordPublishFailure(listPending({ outboxDir: g.obDir }).find((r) => r.text === text),
+          { permanent: true, reason: "err_11310" });
+      },
+      seedCorruptProtection(text) {
+        g.mark(text);
+        fs.writeFileSync(path.join(g.obDir, "corrupt-" + (codexSeq += 1) + ".json"),
+          JSON.stringify({ ...outboxRecord({ text }), publish_attempts: "five" }));
+      },
+      attempt(behavior) {
+        g.setMode(behavior);
+        let publishCalls = 0;
+        publishCalls = g.callsDelta(() => publishEligibleTaskEvents({ task: g.task, home: g.home }));
+        return { publishCalls };
+      },
+      read: g.read,
+    };
+  },
+};
+
+const codexDrainRunner = {
+  // 手工 CLI：有预览（默认 dry-run、--apply 才发）；无人工重试参数。
+  caps: new Set(["publish", "failStates", "auditGate", "dryRun"]),
+  fixture() {
+    const g = codexMatrixFixture();
+    return {
+      obDir: g.obDir, home: g.home, task: g.task,
+      seed(text) {
+        g.mark(text);
+        codexSeq += 1;
+        appendEvent({ outboxDir: g.obDir, kind: "milestone", text, eventKey: "mxd-" + codexSeq });
+      },
+      seedPaused(text) {
+        g.mark(text);
+        codexSeq += 1;
+        appendEvent({ outboxDir: g.obDir, kind: "milestone", text, eventKey: "mxd-" + codexSeq });
+        recordPublishFailure(listPending({ outboxDir: g.obDir }).find((r) => r.text === text),
+          { permanent: true, reason: "err_11310" });
+      },
+      seedCorruptProtection(text) {
+        g.mark(text);
+        fs.writeFileSync(path.join(g.obDir, "corrupt-" + (codexSeq += 1) + ".json"),
+          JSON.stringify({ ...outboxRecord({ text }), publish_attempts: "five" }));
+      },
+      attempt(behavior, opts = {}) {
+        g.setMode(behavior);
+        const args = [path.join(ROOT, "scripts", "codex", "drain-outbox.mjs"),
+          "--thread-id", THREAD_A];
+        if (!opts.dryRun) args.push("--apply");
+        const publishCalls = g.callsDelta(() => {
+          spawnSync(process.execPath, args,
+            { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: g.home } });
+        });
+        return { publishCalls };
+      },
+      read: g.read,
+    };
   },
 };
 
@@ -6836,16 +6913,140 @@ for (const row of matrixRowsFor({
   registry: PUBLISH_ENTRY_STATUS,
   suite: "codex",
   runners: { "codex-drain": codexDrainRunner, "codex-eligible": codexEligibleRunner },
-  legacySubsets: {
-    // **两个入口今天既不跳过已暂停、也不做失败记账**（重构计划 §0 那四个 ✗）。
-    // 子集只申报它们真实满足的"基本发布"。R2b2 接入事务后翻 migrated，
-    // matrixRowsFor 会强制完整契约。
-    "codex-drain": ["基本发布：待发的发出去并落标"],
-    "codex-eligible": ["基本发布：待发的发出去并落标"],
-  },
+  // 两入口已 migrated（R2b2）：不适用场景由登记表 not_applicable 受控申报。
+  legacySubsets: {},
 })) {
   test("矩阵[" + row.entry + "·" + row.status + "] " + row.title, () => row.run(assert));
 }
+
+test("codex 自动发布：没授权的 pending 一张都不许发（策略必须是 authorized_only）", () => {
+  // 事务让授权判据结构性收敛 —— 但"入口传对了策略"要有测试盯着：
+  // 策略换成 all_unpaused 的话，没授权的进展也会被自动发出去。
+  const h = codexEligibleRunner.fixture();
+  h.seed("有授权的一条");
+  appendEvent({ outboxDir: h.obDir, kind: "milestone",
+    text: "没授权的一条", eventKey: "mx-noauth" });
+  const r = publishEligibleTaskEvents({ task: h.task, home: h.home });
+  assert.equal(r.status, "published");
+  assert.match(h.read("有授权的一条").published_at ?? "", /^\d{4}/u);
+  const noauth = h.read("没授权的一条");
+  assert.equal(noauth.published_at, null,
+    "**没授权的一张都不许发** —— 授权由第 5 层的链生产，这个入口只消费");
+});
+
+test("codex 轮转记账 ok:false 也要进 bookkeepingFailures（真实记账函数）", () => {
+  // 与 Claude 侧同款（钩子共用一份实现），但接线各自要验 ——
+  // "共用一个名字不等于共用一份接线"。让 home 只读逼真实记账失败。
+  const h = codexEligibleRunner.fixture();
+  h.seed("发成但记账挂了的");
+  // 占住登记表的绑定锁 —— 记账函数会以 {ok:false, reason:"binding_busy"} 返回，
+  // 而发布器（argsFile 也在 home）不受影响。
+  const regLock = path.join(h.home, "registry.lock");
+  fs.mkdirSync(regLock, { recursive: true });
+  fs.writeFileSync(path.join(regLock, "owner.json"),
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  let r;
+  try { r = publishEligibleTaskEvents({ task: h.task, home: h.home }); }
+  finally { fs.rmSync(regLock, { recursive: true, force: true }); }
+  assert.equal(r.status, "published", JSON.stringify(r).slice(0, 200));
+  assert.ok((r.bookkeepingFailures ?? []).length >= 1,
+    "**ok:false 必须进缺口清单**：" + JSON.stringify(r).slice(0, 200));
+  assert.match(r.bookkeepingFailures[0].error, /轮转活动记账失败/u);
+  assert.match(h.read("发成但记账挂了的").published_at ?? "", /^\d{4}/u, "照样落标防重发");
+});
+
+test("codex drain：预览与执行给出同一个结论 —— 坏 outbox 不许说「为空」（真实 CLI）", () => {
+  // 评审实测旧旁路：只有坏 JSON 时 dry-run 和 --apply 都 exit 0 说"为空"；
+  // 混着坏文件时预览照给、--apply 才被拒 —— 预览正是人做决定的那一步。
+  const h = codexDrainRunner.fixture();
+  const run = (args) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-outbox.mjs"), "--thread-id", THREAD_A, ...args],
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: h.home } });
+
+  // 只有坏 JSON：两条路都要拒绝，不许说为空。
+  fs.writeFileSync(path.join(h.obDir, "bad.json"), "{ 坏了");
+  for (const [why, args] of [["dry-run", []], ["--apply", ["--apply"]]]) {
+    const r = run(args);
+    assert.notEqual(r.status, 0, why + "：坏 outbox 必须拒绝");
+    const said = (r.stdout ?? "") + (r.stderr ?? "");
+    assert.equal(/为空/u.test(said), false, why + "：**不许把读不出来说成为空**");
+    assert.match(said, /本地 outbox 有问题|归不了类|bad\.json/u, why + "：要点名 —— " + said.slice(0, 200));
+  }
+
+  // 混着一条好的：预览也必须拒绝（跟执行同一结论），不许只预览好的那条。
+  h.seed("好的那条");
+  const mixed = run([]);
+  assert.notEqual(mixed.status, 0, "混着坏文件时预览也要拒绝");
+  assert.equal(/好的那条/u.test(mixed.stdout ?? ""), false,
+    "**不许跳过坏的、把其余照常预览** —— 预览与执行必须同一结论");
+
+  // 坏文件清掉后预览恢复，正文可见。
+  fs.rmSync(path.join(h.obDir, "bad.json"));
+  const clean = run([]);
+  assert.equal(clean.status, 0, clean.stderr);
+  assert.match(clean.stdout, /好的那条/u, "干净时预览照常给正文");
+  assert.match(clean.stdout, /dry-run/u);
+});
+
+test("codex drain：partial 时两类发布后缺口都要说（真实 CLI 组合）", () => {
+  // 评审实测：第一批送达但轮转账 binding_busy 失败 + 第二批网络失败 ——
+  // 输出只说"已送达 1 张"，轮转账缺失整个消失。
+  // 两批要用 reply（一轮一张卡）—— 进展类记录会合批成一张，凑不出 partial。
+  const h = codexDrainRunner.fixture();
+  appendEvent({ outboxDir: h.obDir, kind: "reply", text: "先发成的一条",
+    eventKey: "combo-1" });
+  appendEvent({ outboxDir: h.obDir, kind: "reply", text: "后失败的一条",
+    eventKey: "combo-2" });
+  // 只对第二条失败；第一条送达但轮转账因绑定锁 binding_busy 失败。
+  // 事件文件名是哈希，谁先发不确定 —— 用"第二次调用才失败"的模式保证一成一败。
+  fs.writeFileSync(path.join(h.home, "mode.txt"), "fail-second");
+  const regLock = path.join(h.home, "registry.lock");
+  fs.mkdirSync(regLock, { recursive: true });
+  fs.writeFileSync(path.join(regLock, "owner.json"),
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  let out;
+  try {
+    out = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "drain-outbox.mjs"),
+        "--thread-id", THREAD_A, "--apply"],
+      { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: h.home } });
+  } finally {
+    fs.rmSync(regLock, { recursive: true, force: true });
+  }
+  const said = (out.stdout ?? "") + (out.stderr ?? "");
+  // 前提：确实打成 partial（一成一败）。
+  const both = [h.read("先发成的一条"), h.read("后失败的一条")];
+  assert.equal(both.filter((x) => x.published_at !== null).length, 1,
+    "前提：恰好一成一败 —— " + said.slice(0, 300));
+  assert.match(said, /已送达 1 张/u, "前段事实要在：" + said.slice(0, 300));
+  assert.match(said, /记账失败/u, "**轮转账缺失不许被 partial 吞掉**：" + said.slice(0, 300));
+});
+
+test("codex drain：只有轮转记账缺口也要非零退出（真实 CLI）", () => {
+  // 评审实测：消息送达落标、轮转账 binding_busy，提示对了、进程却 exit 0 ——
+  // 调用方把"不完整成功"当成完整成功。任一发布后缺口非空都非零退出。
+  const h = codexDrainRunner.fixture();
+  // 只有 reply 产生轮转活动 —— milestone 种下去一次记账都不会发生，测了个寂寞。
+  appendEvent({ outboxDir: h.obDir, kind: "reply", text: "送达但账缺的一条",
+    eventKey: "gap-1" });
+  const regLock = path.join(h.home, "registry.lock");
+  fs.mkdirSync(regLock, { recursive: true });
+  fs.writeFileSync(path.join(regLock, "owner.json"),
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  let out;
+  try {
+    out = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "drain-outbox.mjs"),
+        "--thread-id", THREAD_A, "--apply"],
+      { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: h.home } });
+  } finally {
+    fs.rmSync(regLock, { recursive: true, force: true });
+  }
+  const said = (out.stdout ?? "") + (out.stderr ?? "");
+  assert.match(h.read("送达但账缺的一条").published_at ?? "", /^\d{4}/u, "消息要落标（不重发）");
+  assert.match(said, /记账失败/u, "提示要在：" + said.slice(0, 250));
+  assert.notEqual(out.status, 0, "**不完整成功不许 exit 0**");
+});
 
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);

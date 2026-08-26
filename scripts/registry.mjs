@@ -226,7 +226,7 @@ export function attributeSession({ projects, cwd, transcriptPath }) {
  * 发布锁：同一个项目的 outbox 同一时刻只许一个发布者排空。
  *
  * 没有它就有真实的重复打扰：会话结束钩子、兜底定时器、一次性守望者可能同时看到
- * 同一批 pending —— listPending 和 markSent 之间有窗口，三方都会各发一条。
+ * 同一批 pending —— 读取与落标之间有窗口，三方都会各发一条。
  *
  * 和 claim 一样用 mkdir 拿原子性；陈旧回收靠 pid 存活 + 墙钟上限，
  * 发布者崩在锁里不能把出站永久堵死。

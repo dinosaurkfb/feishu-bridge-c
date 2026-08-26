@@ -5,7 +5,7 @@ import { composeDigest } from "../outbox.mjs";
 import { publishDraft } from "../outbound.mjs";
 import { publishOutboxAttempt } from "../publish-attempt.mjs";
 import { codexRotationBatchHook } from "./rotation-hook.mjs";
-import { postDeliveryBits } from "../stop-note.mjs";
+import { postDeliveryBits } from "../publish-outcome.mjs";
 import { resolveLarkIdentity } from "../chain-template.mjs";
 import { composeCodexOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import {
@@ -83,9 +83,14 @@ if (r.status === "dry_run") {
   // partial 分支实测漏掉了轮转账缺失）。
   console.log("已由 " + resolved.template.transport_agent_name + " 发布 " + r.count + " 条。" +
     postDeliveryBits(r).replace(/^；/u, "\n"));
-  if ((r.deliveredUnrecorded ?? []).length > 0) process.exitCode = 1;
+  // **任一发布后缺口非空都要非零退出** —— 只查落标缺口的话，
+  // 纯轮转账缺失会被当成完整成功（评审实测 exit 0）。
+  if ((r.deliveredUnrecorded ?? []).length > 0 || (r.bookkeepingFailures ?? []).length > 0) {
+    process.exitCode = 1;
+  }
 } else if (r.status === "empty") {
-  console.log("队列已经由另一个发布动作排空。");
+  // 不推断原因 —— 正常空队列的 dry-run 也走这里，"被别人排空"是猜的。
+  console.log(task.task_display_name + " 的 outbox 为空。");
 } else if (r.status === "needs_attention") {
   console.error(r.count + " 条已暂停自动重试，等人处理：");
   for (const item of r.rejected ?? []) console.error("  " + item.file + " —— " + item.why);

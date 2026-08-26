@@ -7022,6 +7022,32 @@ test("codex drain：partial 时两类发布后缺口都要说（真实 CLI 组�
   assert.match(said, /记账失败/u, "**轮转账缺失不许被 partial 吞掉**：" + said.slice(0, 300));
 });
 
+test("codex drain：只有轮转记账缺口也要非零退出（真实 CLI）", () => {
+  // 评审实测：消息送达落标、轮转账 binding_busy，提示对了、进程却 exit 0 ——
+  // 调用方把"不完整成功"当成完整成功。任一发布后缺口非空都非零退出。
+  const h = codexDrainRunner.fixture();
+  // 只有 reply 产生轮转活动 —— milestone 种下去一次记账都不会发生，测了个寂寞。
+  appendEvent({ outboxDir: h.obDir, kind: "reply", text: "送达但账缺的一条",
+    eventKey: "gap-1" });
+  const regLock = path.join(h.home, "registry.lock");
+  fs.mkdirSync(regLock, { recursive: true });
+  fs.writeFileSync(path.join(regLock, "owner.json"),
+    JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  let out;
+  try {
+    out = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "drain-outbox.mjs"),
+        "--thread-id", THREAD_A, "--apply"],
+      { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: h.home } });
+  } finally {
+    fs.rmSync(regLock, { recursive: true, force: true });
+  }
+  const said = (out.stdout ?? "") + (out.stderr ?? "");
+  assert.match(h.read("送达但账缺的一条").published_at ?? "", /^\d{4}/u, "消息要落标（不重发）");
+  assert.match(said, /记账失败/u, "提示要在：" + said.slice(0, 250));
+  assert.notEqual(out.status, 0, "**不完整成功不许 exit 0**");
+});
+
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (failed > 0) process.exit(1);

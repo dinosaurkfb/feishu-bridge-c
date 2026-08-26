@@ -118,7 +118,8 @@ async function main() {
 
   const { drainProject, localOutboxMessage, watcherActive, outboxDirOf, suppressCmd } =
     await import("./drain-outbox.mjs");
-  const { foreignHint, postDeliveryBits, projectLabel } = await import("./stop-note.mjs");
+  const { foreignHint, projectLabel } = await import("./stop-note.mjs");
+  const { postDeliveryBits } = await import("./publish-outcome.mjs");
   const { resolveProject } = await import("./project-resolve.mjs");
   const { appendEvent, listPending, MAX_REPLY_CHARS } = await import("./outbox.mjs");
   const { checkBinding, bindingWarning } = await import("./binding-health.mjs");

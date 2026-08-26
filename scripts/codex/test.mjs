@@ -6548,6 +6548,11 @@ test("积压视图：项目级绑定也在视野里，措辞不许超出实际�
   const broken = withReg(() => collectProjectBacklog());
   assert.equal(broken.ok, false, "**读不出来绝不能显示成没有积压**");
   assert.equal(broken.projects.length, 0);
+  // **失败分支也要闭合 {complete, problems}**。评审实测：只给 ok/reason 的话，
+  // 全景聚合里坏 JSON 变成 complete:false + problems:[] —— 说"不完整"却点不出名。
+  assert.equal(broken.complete, false);
+  assert.ok((broken.problems ?? []).some((x) => /读不出来/u.test(x.why)),
+    "problems 要说清是登记表坏了：" + JSON.stringify(broken.problems));
 
   // **路径是目录也算读不出来。**上一版用宽松读取器，它把 EISDIR / EACCES
   // 一律变成"成功的空表" —— 评审实测返回 {ok:true, projects:[]}，
@@ -6594,6 +6599,8 @@ test("坏的登记项不许静默跳过，全景说不清就不许说没有积�
     const got = withReg(() => collectProjectBacklog());
     assert.equal(got.ok, false, why + "：**说不清却报了 ok** —— " + JSON.stringify(got));
     assert.equal(got.reason, "registry_entry_malformed", why);
+    assert.equal(got.complete, false, why + "：失败分支也要闭合 complete");
+    assert.ok((got.problems ?? []).length > 0, why + "：坏登记项要出现在 problems 里");
     assert.match(got.bad?.[0]?.why ?? "", expect, why + "：理由不对 —— " + JSON.stringify(got.bad));
     assert.match(got.bad?.[0]?.at ?? "", /projects\[1\]/u, why + "：要点名是第几项");
   }
@@ -7074,6 +7081,31 @@ test("R5 completeness：收集层给结论，坏一处就 complete:false 并点�
     const whole = collectBacklog({ home });
     assert.equal(whole.complete, false, "全景聚合要继承项目侧的不完整");
     assert.ok(whole.problems.some((x) => /bad\.json/u.test(x.at)));
+
+    // **顶层继承必须无条件**：项目登记表整体坏掉（projects.ok:false）时，
+    // 聚合层若只在 ok && scanned 时吸收问题，就得到 complete:false 而
+    // problems:[] —— 结论与点名脱节，第二个消费者还得回去啃 reason/bad。
+    // 项目登记表换独立文件写坏 —— 这个测试里它跟 Codex task 登记表共用一个
+    // 文件，直接写坏会把 task 侧也弄瞎，测的就不再是"单侧瞎了"。
+    const projReg = path.join(home, "proj-reg.json");
+    fs.writeFileSync(projReg, "{ 这不是 JSON");
+    process.env.FEISHU_BRIDGE_REGISTRY = projReg;
+    const orphanWhole = collectBacklog({ home });
+    assert.equal(orphanWhole.ok, true, "task 侧登记表是好的，整体调用不该失败");
+    assert.equal(orphanWhole.complete, false, "项目侧瞎了就不完整");
+    assert.ok(orphanWhole.problems.length > 0,
+      "**complete:false 必须点得出名**：" + JSON.stringify(orphanWhole.problems));
+    assert.ok(orphanWhole.problems.some((x) => /登记表/u.test(x.why)),
+      "要说清是登记表的问题：" + JSON.stringify(orphanWhole.problems));
+    // 坏登记项（而非坏 JSON）也一样要继承。
+    fs.writeFileSync(projReg, JSON.stringify({
+      schema_version: "1.0", projects: [{ root: 42 }] }));
+    const entryWhole = collectBacklog({ home });
+    assert.equal(entryWhole.complete, false);
+    assert.ok(entryWhole.problems.some((x) => /projects\[0\]/u.test(x.at)),
+      "坏在第几条要点名：" + JSON.stringify(entryWhole.problems));
+    // 恢复：项目侧指回共用那份好登记表，后面的区分场景继续用。
+    process.env.FEISHU_BRIDGE_REGISTRY = registry;
 
     // **区分场景：task 侧只有 unexplainable**（渲染层若自己现算，
     // 它那份判据只看 readable/unclassified —— 恰好漏掉这一类，

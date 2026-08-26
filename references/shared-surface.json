@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-08-26T00:25:05.638Z",
+  "generated_at": "2026-08-26T02:07:28.221Z",
   "modules": {
     "automatic-topic-rotation.mjs": [
       "businessActivitiesForPublishedBatch",
@@ -124,6 +124,17 @@
       "moduleDir",
       "moduleRoot"
     ],
+    "drain-outbox.mjs": [
+      "drainCmd",
+      "drainProject",
+      "groupByTargetGeneration",
+      "localOutboxMessage",
+      "outboxDirOf",
+      "publishErrorDetail",
+      "publishRetryability",
+      "suppressCmd",
+      "watcherActive"
+    ],
     "eligibility-recovery.mjs": [
       "ELIGIBILITY_BUDGET_DEFAULT_MS",
       "ELIGIBILITY_BUDGET_MAX_MS",
@@ -207,7 +218,9 @@
       "handleMappingPolicy"
     ],
     "outbound-card.mjs": [
+      "capMarkdownTables",
       "composeOutboundCard",
+      "countMarkdownTables",
       "neutralizeCardMentions",
       "outboundCardBatches",
       "validateOutboundCard"
@@ -224,19 +237,23 @@
     "outbox.mjs": [
       "KINDS",
       "KIND_LABEL",
+      "MAX_AUTO_PUBLISH_ATTEMPTS",
       "MAX_REPLY_CHARS",
       "appendEvent",
       "auditOutbox",
       "classifyOutboxRecord",
+      "clearPermanentRejection",
       "codexReplyEventKey",
       "composeDigest",
       "explainabilityGaps",
       "hasPublishAuthorization",
+      "isPermanentlyRejected",
       "listPending",
       "markPublishEligibleByEventKey",
       "markSent",
       "outboxMutationBlocker",
       "readOutboxSnapshot",
+      "recordPublishFailure",
       "suppressPublishByEventKey"
     ],
     "registry.mjs": [

@@ -15,7 +15,8 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
-  auditOutbox, composeDigest, listPending, markSent, outboxMutationBlocker,
+  auditOutbox, clearPermanentRejection, composeDigest, isPermanentlyRejected, listPending,
+  markSent, outboxMutationBlocker, recordPublishFailure,
 } from "./outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { PUBLISH_FAILURE, classifyPublishFailure, publishDraft } from "./outbound.mjs";
@@ -80,11 +81,112 @@ export function watcherActive(root) {
  */
 const PUBLISH_ERROR_CAP = 400;
 
-/** 长错误留头也留尾 —— **真正的错误码常常在末尾**，只留头等于把它扔了。 */
+/**
+ * 这次失败是**永久拒绝**还是**暂时失败**。
+ *
+ * 分不开的后果是实测过的：cc2cd 三条答复各含 6 个表格，飞书回
+ * `ErrCode: 11310; ErrMsg: card table number over limit`。
+ * 排空对失败一律"留在 outbox，下一轮重试"，于是 **68 条失败行、
+ * 每 30 分钟一次、空转 12 小时**，稳定地制造噪音而没有任何一次能成功。
+ *
+ * ■ 两个信号，都是"认出来"的
+ *
+ *   · httpCode 4xx = 请求本身不被接受（408 / 429 例外：超时和限流
+ *     恰恰是"现在不行、待会儿行"）
+ *   · 已知的永久 ErrCode —— 卡片结构越界这一类，内容不改就永远发不出去
+ *
+ * ■ 但**认出来这条路本身是不可靠的**
+ *
+ * 实测：那次故障的 lark-cli 输出**根本没有 httpCode**，只有 `"code": 230099`，
+ * 真正的 11310 埋在 `ext=` 里。我第一版只按 HTTP 状态码分类，
+ * 在真实数据上会把它判成"暂时" —— **判据看着对，喂真实数据就不成立**。
+ *
+ * 而且错误码表永远追不齐。所以真正兜底的不是这个函数，是
+ * `MAX_AUTO_PUBLISH_ATTEMPTS`：它不需要认识任何错误码。
+ * 这个函数只负责"认出来的就别再等了"，**拿不准一律算暂时** ——
+ * 误判成永久会让一条本该发出去的答复停下来等人，误判成暂时只是多试几次，
+ * 上限还兜着。两种错的代价不对称。
+ */
+const TRANSIENT_HTTP = new Set([408, 429]);
+
+/**
+ * 已知的永久 ErrCode。**这张表注定是不全的** —— 它只是让认得出的那些少走几轮，
+ * 真正保证"不会无限重试"的是次数上限。
+ */
+const PERMANENT_ERR_CODES = new Set([
+  11310,   // card table number over limit —— 卡片表格数超限，内容不改就永远发不出去
+]);
+
+export function publishRetryability(detail) {
+  const text = String(detail ?? "");
+  const errCode = /ErrCode:\s*(\d+)/u.exec(text);
+  if (errCode && PERMANENT_ERR_CODES.has(Number(errCode[1]))) {
+    return { permanent: true, reason: "err_" + errCode[1] };
+  }
+  // `httpCode 400` 和 `"httpCode": 400` 都要认 —— 两种形态都在真实输出里见过。
+  const http = /httpCode"?\s*:?\s*(\d{3})/u.exec(text);
+  if (!http) return { permanent: false, reason: "no_permanent_signal" };
+  const code = Number(http[1]);
+  if (code >= 400 && code < 500 && !TRANSIENT_HTTP.has(code)) {
+    return { permanent: true, reason: "http_" + code };
+  }
+  return { permanent: false, reason: "http_" + code };
+}
+
+/**
+ * 错误里那些**认得出来的诊断片段** —— 截断时一个都不许丢。
+ *
+ * 顺序即优先级：真正说明白"为什么被拒"的是 ext 里那对 ErrCode/ErrMsg，
+ * 外层的 code/httpCode 只说明"被拒了"。
+ */
+const DIAGNOSTIC_PATTERNS = [
+  /ErrCode:\s*\d+/gu,
+  /ErrMsg:\s*[^;"\n]{1,120}/gu,
+  /ErrorValue:\s*[^;"\n]{1,60}/gu,
+  /httpCode:?\s*\d{3}/gu,
+  /errCode:?\s*\d+/gu,
+  /"code":\s*\d+/gu,
+];
+
+/** 被省略段里带诊断码的片段，去重后按出现顺序返回。 */
+function diagnosticsMissingFrom(full, kept) {
+  const found = [];
+  for (const re of DIAGNOSTIC_PATTERNS) {
+    for (const m of String(full).matchAll(re)) {
+      const piece = m[0].trim();
+      if (kept.includes(piece) || found.includes(piece)) continue;
+      found.push(piece);
+      if (found.length >= 6) return found;   // 病态输入不许把日志撑爆
+    }
+  }
+  return found;
+}
+
+/**
+ * 长错误留头也留尾 —— **真正的错误码常常在末尾**，只留头等于把它扔了。
+ *
+ * 但留头留尾也不够，**这一条是付过账的**：飞书返回的是一层嵌套 JSON，
+ * 真正的原因躺在 `error.message` 的中段：
+ *
+ *     "message": "Failed to create card content, ext=ErrCode: 11310;
+ *                 ErrMsg: card table number over limit; ..."
+ *
+ * head 160 落在 message 值中间、tail 200 落进 log_id，**被切掉的正是那对
+ * ErrCode/ErrMsg**。整份 drain.log 里 `11310` 出现 0 次 ——
+ * 答案一直在返回里，一次故障绕了 12 小时只因为日志把它切了。
+ *
+ * 上一版注释自己就写着"上上版发现过这个症状，改法是把 400 放宽，那治不了"。
+ * **同一个错误换了个入口又犯了一遍**：这回不是长度不够、也不是方向不对，
+ * 是**中段**被吃了。所以现在不靠位置猜，而是把认得出来的诊断片段单独捞出来附在后面。
+ */
 function clipBothEnds(text) {
   const t = String(text).trim();
   if (t.length <= PUBLISH_ERROR_CAP) return t;
-  return t.slice(0, 160) + " …（中间省略）… " + t.slice(-200);
+  const kept = t.slice(0, 160) + " …（中间省略）… " + t.slice(-200);
+  const rescued = diagnosticsMissingFrom(t, kept);
+  return rescued.length === 0
+    ? kept
+    : kept + "\n  被省略段里的诊断：" + rescued.join("; ");
 }
 
 /**
@@ -141,6 +243,16 @@ export function localOutboxMessage(r) {
 }
 
 /** 抑制命令的绝对路径：提示里给相对路径，等于让人猜当前工作目录。 */
+/**
+ * 这个脚本自己的路径。
+ *
+ * **不要从进程参数里取** —— 经符号链接执行时那给的是链接本身，
+ * 提示里打出来的命令人照抄会指到别处。有一条守卫直接禁用了那个 API。
+ */
+export function drainCmd() {
+  return path.join(moduleRoot(import.meta.url, ".."), "scripts", "drain-outbox.mjs");
+}
+
 export function suppressCmd() {
   return path.join(moduleRoot(import.meta.url, ".."), "scripts", "feishu-suppress-outbox.mjs");
 }
@@ -163,6 +275,9 @@ export function suppressCmd() {
  */
 export function drainProject({
   root, claudeSessionId, dryRun = false, timeoutMs, force = false,
+  // **人显式下令才会重试被永久拒绝的那些。**默认不重试 ——
+  // 永久拒绝的定义就是"再等不会变好"，自动重试只是稳定地制造噪音。
+  retryRejected = false,
   publish = publishDraft, diagnose = classifyPublishFailure,
 } = {}) {
   const outboxDir = outboxDirOf(root, claudeSessionId);
@@ -200,6 +315,7 @@ export function drainProject({
   }
   const { config: cfg, mapping } = resolved;
 
+  let failingBatch = null;
   // **在 try 之外解析。**上一版把它放在 try 里，而 catch 要用它 —— 于是任何发布失败
   // 都先撞上 ReferenceError，永远走不到诊断。身份从配置推，不认死任何 agent；
   // 发之前 publishDraft 仍会校验凭据归属。
@@ -247,8 +363,33 @@ export function drainProject({
     // 而"两份判据"正是这条线上被反复罚过的东西。
     const blocked = outboxMutationBlocker(auditOutbox(outboxDir));
     if (blocked) return { status: "error", root, ...blocked, local: true };
-    const pending = listPending({ outboxDir });
-    if (pending.length === 0) return { status: "empty", root };
+    const all = listPending({ outboxDir });
+    // **上次被永久拒绝的不再自动重试。**判据跟积压视图共用一份。
+    // 它们仍是 pending（没发出去、也没被停发）—— 只是等人看一眼，
+    // 而不是每 30 分钟再撞一次同一堵墙。停发是不可逆的，
+    // 「这次发不出去」不该顺手变成「永远别发」。
+    const rejected = retryRejected ? [] : all.filter(isPermanentlyRejected);
+    let pending = all.filter((r) => !isPermanentlyRejected(r));
+    if (retryRejected) {
+      // **重试要给一次干净的机会。**只把它放回队列而不清计数的话，
+      // 人修好起因、重试一次再失败，立刻又撞上限 —— 那不叫给了一次机会。
+      // 锁在手里，改的是同一条记录的语义，跟抑制、资格提升共用这把锁。
+      for (const record of all.filter(isPermanentlyRejected)) {
+        try { clearPermanentRejection(record); } catch { /* 清不掉就照旧跳过它 */ }
+      }
+      pending = listPending({ outboxDir }).filter((r) => !isPermanentlyRejected(r));
+    }
+    if (pending.length === 0) {
+      // **有被拒的就不能报 empty。**报 empty 会让人以为队列干净了，
+      // 而其实有内容正等着他处理 —— 一份假的「没有积压」比没有报告更坏。
+      return rejected.length === 0
+        ? { status: "empty", root }
+        : { status: "needs_attention", root, reason: "permanently_rejected",
+            count: rejected.length,
+            rejected: rejected.map((r) => ({
+              file: path.basename(String(r._file ?? "")),
+              why: r.publish_rejected_reason ?? "未说明" })) };
+    }
 
     const targetBatches = groupByTargetGeneration(pending).flatMap(([targetKey, records]) => {
       const target = resolveMappingOutboundGeneration(
@@ -281,6 +422,8 @@ export function drainProject({
       // 记住正在发哪一个目标：失败诊断要查**这一条**的根消息，
       // 而不是 mapping.root_message_id —— 后者可能是别的代际，甚至不存在。
       failingTarget = item.target;
+      // 记住正在发哪一批：永久拒绝要打在**这一批**的记录上，不是全部待发。
+      failingBatch = item.batch;
       const messageId = publish({
         profile: id.profile,
         rootMessageId: item.target.rootMessageId,
@@ -321,11 +464,33 @@ export function drainProject({
         expectedAppId: id?.expectedAppId,
         larkBin: id?.bin, larkHome: id?.configDir, profile: id?.profile,
       });
+      // **永久拒绝要落到记录上**，否则下一轮定时排空照撞不误。
+      // 锁还在手里（catch 在 try 内、finally 之前），改的是同一条记录的语义，
+      // 跟抑制、资格提升共用这把锁 —— 满足统一写锁那条。
+      const detail = publishErrorDetail(err);
+      const retryability = publishRetryability(detail);
+      const marked = [];
+      for (const record of failingBatch ?? []) {
+        try {
+          // 认出来的永久错误立刻停；认不出来的靠次数上限兜底。
+          const outcome = recordPublishFailure(record, {
+            permanent: retryability.permanent,
+            reason: retryability.reason + "：" + detail,
+          });
+          if (outcome.rejected) marked.push(path.basename(String(record._file ?? "")));
+        } catch { /* 记不上不算失败：下一轮还会再撞一次，但不会更坏 */ }
+      }
       return {
         status: "error", root, reason: "publish_failed",
+        // **报"永久"要以实际打没打标为准**，不是以"认出来了吗"为准 ——
+        // 撞满次数上限的那次同样是"不会再自动重试"，说成会重试就是骗人。
+        permanent: marked.length > 0,
+        permanentReason: marked.length === 0 ? null
+          : (retryability.permanent ? retryability.reason : "too_many_attempts"),
+        markedRejected: marked,
         // 挑有用的那半：见 publishErrorDetail。**从头截固定长度会把真正的
         // 错误码切掉** —— 这条命令光命令回显就上千字符，前 400 字全是命令。
-        error: publishErrorDetail(err),
+        error: detail,
         // 诊断只是**线索**，不是判决 —— 调用方拿它给人看，不拿它做有损动作。
         diagnosis: diagnosis.kind === PUBLISH_FAILURE.ROOT_OWNED_BY_OTHER_APP
           ? { kind: diagnosis.kind, ownerName: diagnosis.ownerName ?? null,
@@ -383,13 +548,15 @@ if (isDirectRun(import.meta.url)) {
 
   // 绕过发布开关必须明说。
   const force = process.argv.includes("--force");
+  // 人显式下令才重试被永久拒绝的那些 —— 默认不重试。
+  const retryRejected = process.argv.includes("--retry-rejected");
   let hadError = false;
   for (const { root, claudeSessionId } of targets) {
     const tag = targets.length > 1
       ? path.basename(root) +
         (claudeSessionId ? "/" + String(claudeSessionId).slice(0, 8) : "") + ": "
       : "";
-    const r = drainProject({ root, claudeSessionId, dryRun, force });
+    const r = drainProject({ root, claudeSessionId, dryRun, force, retryRejected });
 
     if (r.status === "published") {
       console.log(tag + "已发布 " + r.count + " 条 -> " + r.messageId);
@@ -410,8 +577,24 @@ if (isDirectRun(import.meta.url)) {
       // 渲染只**读守卫的结论**，不重新判断（判据只有一份）。
       console.error(tag + localOutboxMessage(r));
       hadError = true;
+    } else if (r.status === "error" && r.permanent === true) {
+      // **永久拒绝不能说成"会重试"。**通用分支那句"进展留在 outbox"
+      // 让人以为等等就好 —— 而它已经每 30 分钟撞同一堵墙撞了 12 小时。
+      console.error(tag + "飞书永久拒绝了这一批（" + r.permanentReason + "），**不会再自动重试**：\n" +
+        "  " + r.error + "\n" +
+        (r.markedRejected?.length
+          ? "  已标记：" + r.markedRejected.join("、") + "\n" : "") +
+        "  修好起因之后要重发：node " + drainCmd() + " --project " + root + " --retry-rejected\n" +
+        "  确定不发了（不可逆）：node " + suppressCmd() + " --project " + root);
+      hadError = true;
     } else if (r.status === "error") {
       console.error(tag + "排空失败（" + r.reason + "），进展留在 outbox：" + r.error);
+      hadError = true;
+    } else if (r.status === "needs_attention") {
+      // **有被拒的就不能沉默。**落进"outbox 为空"那条等于报了一份假的没有积压。
+      console.error(tag + r.count + " 条被飞书永久拒绝过，**不会再自动重试**，等你看一眼：");
+      for (const item of r.rejected ?? []) console.error("  " + item.file + " —— " + item.why);
+      console.error("  修好起因之后要重发：node " + drainCmd() + " --project " + root + " --retry-rejected");
       hadError = true;
     } else if (r.status === "skipped") {
       console.error(tag + "暂不发布：" + r.reason + (r.count ? "（" + r.count + " 条留在 outbox）" : ""));

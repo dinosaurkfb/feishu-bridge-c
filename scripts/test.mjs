@@ -37,15 +37,18 @@ import {
   routableProjectsForRoot,
 } from "./registry.mjs";
 import {
-  appendEvent, auditOutbox, codexReplyEventKey, composeDigest, hasPublishAuthorization,
-  listPending, markPublishEligibleByEventKey, markSent, suppressPublishByEventKey,
+  MAX_AUTO_PUBLISH_ATTEMPTS, appendEvent, auditOutbox, classifyOutboxRecord,
+  clearPermanentRejection, codexReplyEventKey, composeDigest, hasPublishAuthorization,
+  isPermanentlyRejected, listPending, markPublishEligibleByEventKey, markSent,
+  outboxMutationBlocker, recordPublishFailure, suppressPublishByEventKey,
 } from "./outbox.mjs";
 import {
-  composeOutboundCard, outboundCardBatches, validateOutboundCard,
+  capMarkdownTables, composeOutboundCard, countMarkdownTables, outboundCardBatches,
+  validateOutboundCard,
 } from "./outbound-card.mjs";
 import { PUBLISH_FAILURE, classifyPublishFailure } from "./outbound.mjs";
 import {
-  drainProject, outboxDirOf, publishErrorDetail, suppressCmd, watcherActive,
+  drainProject, outboxDirOf, publishErrorDetail, publishRetryability, suppressCmd, watcherActive,
 } from "./drain-outbox.mjs";
 import { applySuppression } from "./feishu-suppress-outbox.mjs";
 import { applySuppressionCore, suppressionDigest } from "./suppress-outbox-core.mjs";
@@ -8142,13 +8145,22 @@ test("走真实 CLI 时 --force 必须真的传到 drainProject", () => {
   assert.match(forced.stdout, /将发布 1 条/u, "--force 要真的走到发布准备");
 
   // --all 那条路也得把 force 传下去 —— 两条入口只修一条，另一条照样是坏的。
-  const all = spawnSync(process.execPath, [
-    path.resolve("scripts", "drain-outbox.mjs"), "--all", "--dry-run", "--force",
-  ], { encoding: "utf-8" });
-  assert.equal(all.status === 0 || all.status === 1, true, "--all --force 至少要能跑完");
-  const src = fs.readFileSync(path.resolve("scripts", "drain-outbox.mjs"), "utf-8");
-  assert.match(src, /drainProject\(\{ root, claudeSessionId, dryRun, force \}\)/u,
-    "单项目和 --all 共用同一个调用点，force 必须在那里");
+  //
+  // **上一版这里断言的是源码文本** —— 要求那个调用点逐字长成某个样子。
+  // 那条断言有两个毛病，而且第一个已经发作过：
+  //   · 它挡住了一次合法改动（给调用点多传一个参数），却
+  //   · 挡不住真的坏 —— 把 force 传进去但在函数里忽略掉，它照样绿。
+  // **断言守卫的效果，不是守卫的样子。**现在真的驱动 --all 那条路。
+  const registry = path.join(dir, "registry.json");
+  fs.writeFileSync(registry, JSON.stringify({
+    schema_version: "1.0", projects: [{ root: dir, claude_session_id: null }] }));
+  const viaAll = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "drain-outbox.mjs"), "--all", "--dry-run", ...args,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_REGISTRY: registry } });
+
+  assert.doesNotMatch(viaAll([]).stdout, /将发布/u, "--all 默认也要被开关挡住");
+  assert.match(viaAll(["--force"]).stdout, /将发布 1 条/u,
+    "**--all --force 也必须真的走到发布准备** —— 两条入口只修一条，另一条照样是坏的");
 });
 
 const SYNC_HEX = "0123456789abcdef01234567";
@@ -12771,6 +12783,274 @@ test("停发字段坏掉了不算「已经有结论」：不许撤标记", () =>
     assert.equal(g.read().publish_eligible_at, null, "损坏就不许写" + label);
     assert.equal(fs.existsSync(g.markerFile), true, "损坏不算有结论，标记要留着" + label);
   }
+});
+
+// ---------- A：cc2cd 出站故障的四条 ----------
+
+test("卡片表格数量：本地就要算出来，不许出网去撞", () => {
+  // 付过账的：cc2cd 三条 /feishu-status 回复各含 6 个表格，飞书回
+  // httpCode 400 / ErrCode 11310 card table number over limit。
+  // 上一版 validateOutboundCard 对它们判 ok=true，于是出网、被拒、
+  // 每 30 分钟重试一次，空转 12 小时。
+  const table = (n) => "小节 " + n + "\n\n| 项 | 值 |\n|---|---|\n| a | 1 |\n| b | 2 |";
+  const doc = (n) => Array.from({ length: n }, (_, i) => table(i + 1)).join("\n\n");
+
+  // 数得准 —— 逐个数量都验，别只验分界那一个。
+  for (let n = 0; n <= 8; n += 1) {
+    assert.equal(countMarkdownTables(doc(n)), n, n + " 个表格没数对");
+  }
+  // 一串减号不是表格；表格行前面得有表头。
+  assert.equal(countMarkdownTables("---\n\n只是分割线"), 0, "分割线不是表格");
+  assert.equal(countMarkdownTables("|---|---|\n| a | b |"), 0, "没有表头就不是表格");
+
+  // 降级：超出的改成纯文本，**而且必须说出来**。
+  const capped = capMarkdownTables(doc(6));
+  assert.equal(countMarkdownTables(capped), 5, "降级后必须落到上限之内");
+  assert.match(capped, /超出飞书单卡上限/u, "**有损的改写必须声明** —— 不声明等于替他决定他看到什么");
+  assert.match(capped, /小节 6/u, "内容不许丢，只是不再是表格");
+  assert.match(capped, /a：1/u, "表格行要降级成可读的纯文本");
+  // 没超上限就一个字都不许动。
+  assert.equal(capMarkdownTables(doc(5)), doc(5), "没超上限不许改写");
+
+  // 真实入口：composeOutboundCard 出来的卡片必须自己就是合法的。
+  const card = composeOutboundCard(
+    [outboxRecord({ kind: "reply", text: doc(6) })], { taskName: "T", runtime: "claude" });
+  const v = validateOutboundCard(card);
+  assert.equal(v.ok, true, "**构出来的卡片不许越界**：" + JSON.stringify(v.problems));
+  assert.equal(v.tables <= 5, true, "实际表格数 " + v.tables);
+
+  // 校验器本身也要认这条 —— 将来有别的路径绕过 compose，也得在本地被挡。
+  const overCard = JSON.parse(JSON.stringify(card));
+  overCard.body.elements.at(-1).content = doc(6);
+  const over = validateOutboundCard(overCard);
+  assert.equal(over.ok, false, "6 个表格必须判不合法");
+  assert.ok(over.problems.includes("card_table_over_limit"), JSON.stringify(over.problems));
+  // 正好 5 个是合法的 —— 界线两边都要钉，只钉一边等于没钉。
+  overCard.body.elements.at(-1).content = doc(5);
+  assert.equal(validateOutboundCard(overCard).problems.includes("card_table_over_limit"), false,
+    "5 个是上限之内，不许误伤");
+});
+
+test("发布失败的截断：诊断码在中段也不许被吃掉", () => {
+  // 这一条最贵。飞书返回是嵌套 JSON，真正的原因躺在 error.message 的中段：
+  // head 160 落在 message 值中间、tail 200 落进 log_id，**那对 ErrCode/ErrMsg 正好被切**。
+  // 整份 drain.log 里 11310 出现 0 次 —— 答案一直在返回里，故障却绕了 12 小时。
+  const real = JSON.stringify({
+    ok: false, identity: "bot",
+    error: {
+      type: "api", subtype: "unknown", code: 230099,
+      message: "Failed to create card content, ext=ErrCode: 11310; " +
+        "ErrMsg: card table number over limit; ErrorValue: table; ",
+      troubleshooter: "排查建议查看(Troubleshooting suggestions): https://open.feishu.cn/search" +
+        "?from=openapi&log_id=20260826053955A96B30CF6F91945D9A52&code=230099" +
+        "&method_id=6936075528891236380",
+    },
+  }, null, 2);
+
+  // 前提：这段确实长到会被截 —— 否则这条测试什么都没测。
+  assert.equal(real.length > 400, true, "前提不成立：样本没长到会被截断");
+  const out = publishErrorDetail({ stderr: real, message: "" });
+  assert.match(out, /…（中间省略）…/u, "前提：它确实被截了");
+
+  assert.match(out, /ErrCode: 11310/u, "**被省略段里的错误码必须捞回来**");
+  assert.match(out, /card table number over limit/u, "原因那句也要捞回来");
+  assert.match(out, /被省略段里的诊断/u, "捞回来的部分要标明来历，别混进原文里冒充完整");
+
+  // 短错误一个字都不许动。
+  const short = publishErrorDetail({ stderr: "httpCode 500 boom", message: "" });
+  assert.equal(short, "httpCode 500 boom");
+  // 没有可捞的诊断时不许硬加一行。
+  const noCode = publishErrorDetail({ stderr: "x".repeat(600), message: "" });
+  assert.equal(noCode.includes("被省略段里的诊断"), false, "没有诊断就别加空标题");
+});
+
+test("永久拒绝与暂时失败要分开：拿不准算暂时", () => {
+  // 误判成永久 → 一条本该发出去的答复停下来等人；
+  // 误判成暂时 → 多重试几次。**两种错的代价不对称**，所以拿不准算暂时。
+  // **真实形态里根本没有 httpCode。**我第一版只按 HTTP 状态码分类，
+  // 拿 drain.log 里那条真实返回一喂就发现：它会被判成"暂时"，照样无限重试。
+  // 判据看着对、喂真实数据不成立 —— 所以这一条排在最前面。
+  const realShape = JSON.stringify({ ok: false, identity: "bot", error: {
+    type: "api", subtype: "unknown", code: 230099,
+    message: "Failed to create card content, ext=ErrCode: 11310; " +
+      "ErrMsg: card table number over limit; ErrorValue: table; " } });
+  for (const [detail, permanent, why] of [
+    [realShape, true, "**真实形态（没有 httpCode，只有 ext 里的 11310）必须判成永久**"],
+    ["request failed: httpCode 400, errCode 230099", true, "400 是请求本身不被接受"],
+    ['"httpCode": 400', true, "JSON 形态的 httpCode 也要认"],
+    ["httpCode 403 forbidden", true, "403"],
+    ["httpCode 404 not found", true, "404"],
+    ["httpCode 408 timeout", false, "**408 恰恰是「现在不行、待会儿行」**"],
+    ["httpCode 429 too many requests", false, "**429 限流同理**"],
+    ["httpCode 500 internal", false, "5xx 是对方的问题，会好"],
+    ["httpCode 503", false, "503"],
+    ["connect ETIMEDOUT 1.2.3.4:443", false, "连不上没有状态码 —— 拿不准算暂时"],
+    ["", false, "空的更要算暂时"],
+    ["httpCode 200 但别的地方炸了", false, "2xx 不是拒绝"],
+    ["ErrCode: 99999 没见过的码", false, "**没见过的码不许猜成永久** —— 兜底的是次数上限"],
+  ]) {
+    const got = publishRetryability(detail);
+    assert.equal(got.permanent, permanent, why + " —— " + JSON.stringify(detail).slice(0, 50) +
+      " 判成了 " + JSON.stringify(got));
+  }
+});
+
+test("被永久拒绝的记录：不再自动重试，但也不许当成不存在", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-reject-"));
+  const obDir = path.join(dir, "outbox");
+  fs.mkdirSync(obDir);
+  const file = path.join(obDir, "0001.json");
+  fs.writeFileSync(file, JSON.stringify(outboxRecord({ text: "被拒的那条" })));
+  const rec = listPending({ outboxDir: obDir })[0];
+
+  assert.equal(isPermanentlyRejected(rec), false, "一开始不是被拒状态");
+  const outcome = recordPublishFailure(rec, { permanent: true, reason: "http_400：ErrCode: 11310" });
+  assert.deepEqual({ rejected: outcome.rejected, attempts: outcome.attempts },
+    { rejected: true, attempts: 1 }, "认出来的永久错误第一次就该停");
+  const after = JSON.parse(fs.readFileSync(file, "utf-8"));
+
+  assert.match(after.publish_rejected_at, /^\d{4}-\d{2}-\d{2}T/u, "写的得是规范时间");
+  assert.match(after.publish_rejected_reason, /11310/u, "原因要留下来，否则人还得再查一遍");
+  assert.equal(isPermanentlyRejected(after), true);
+
+  // **三态不许被它改变。**它仍是 pending —— 没发出去、也没被停发。
+  // 停发是不可逆的，「这次发不出去」不该顺手变成「永远别发」。
+  assert.deepEqual(classifyOutboxRecord(after), { state: "pending" },
+    "被拒不是第四种状态，它还是 pending");
+  assert.equal(after.published_at, null);
+  assert.equal(after.publish_suppressed_at, undefined);
+  // 仍然要被 listPending 看见 —— 抑制、审计、积压视图都还得数得到它。
+  assert.equal(listPending({ outboxDir: obDir }).length, 1,
+    "**不许从视野里消失** —— 消失了就没人知道它在等处理");
+  // outbox 仍然说得清（守卫不许因为多了两个字段就整批拦下）。
+  assert.equal(outboxMutationBlocker(auditOutbox(obDir)), null, "多两个字段不该让整批说不清");
+
+  // 人显式下令能撤销 —— 起因修好之后不该只剩「不可逆抑制」一条路。
+  clearPermanentRejection(listPending({ outboxDir: obDir })[0]);
+  const cleared = JSON.parse(fs.readFileSync(file, "utf-8"));
+  assert.equal(cleared.publish_rejected_at, undefined, "撤销要真的把字段删掉，不是置空");
+  assert.equal(cleared.publish_rejected_reason, undefined);
+  assert.equal(isPermanentlyRejected(cleared), false);
+});
+
+test("真实排空：永久拒绝要落到记录上，下一轮不再撞同一堵墙", () => {
+  // **纯函数分对了不等于接线对了。**这条走真实 drainProject：
+  // 第一轮撞 400 → 记录被打标、报 permanent；第二轮**根本不该再调发布**。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-permreject-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", lark_cli_profile: "claude" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_x", feishu_root_message_id_reference: "om_x",
+    claude_session_id: null, channel_generation_id: "gen-1" }));
+  appendEvent({ outboxDir: obDir, kind: "next", text: "会被永久拒的一条", source: "t" });
+
+  const reject = new Error("Command failed: /bin/lark-cli im +messages-reply " + "x".repeat(1500));
+  reject.stderr = JSON.stringify({ ok: false, error: { code: 230099,
+    message: "Failed to create card content, ext=ErrCode: 11310; " +
+      "ErrMsg: card table number over limit; " + "pad".repeat(200) },
+    httpCode: 400 });
+  let publishCalls = 0;
+  const boom = () => { publishCalls += 1; throw reject; };
+  const safeDiagnose = () => ({ kind: PUBLISH_FAILURE.TRANSIENT, reason: "test_stub" });
+
+  const first = drainProject({ root: dir, publish: boom, diagnose: safeDiagnose });
+  assert.equal(publishCalls, 1, "第一轮该试一次");
+  assert.equal(first.status, "error");
+  assert.equal(first.permanent, true, "400 必须判成永久：" + JSON.stringify(first).slice(0, 300));
+  assert.equal(first.permanentReason, "err_11310",
+    "**更具体的信号优先** —— ext 里的 11310 比外层 httpCode 说明白得多");
+  assert.equal(first.markedRejected.length, 1, "要点名打了标的文件");
+  assert.match(first.error, /ErrCode: 11310/u, "**原因要能一眼看到**，不能只剩 230099");
+
+  // 第二轮：**一次都不许再调发布**。这就是那 12 小时空转的根。
+  const second = drainProject({ root: dir, publish: boom, diagnose: safeDiagnose });
+  assert.equal(publishCalls, 1, "**永久拒绝之后不许再自动重试** —— 实际又调了 " +
+    (publishCalls - 1) + " 次");
+  assert.equal(second.status, "needs_attention", "也不许报成 empty：" + JSON.stringify(second));
+  assert.equal(second.count, 1);
+  assert.match(second.rejected[0].why, /11310/u, "报告里要带上原因");
+
+  // 人显式下令才重试 —— 起因修好之后不该只剩不可逆抑制一条路。
+  const forced = drainProject({
+    root: dir, publish: boom, diagnose: safeDiagnose, retryRejected: true });
+  assert.equal(publishCalls, 2, "--retry-rejected 必须真的再试一次");
+  assert.equal(forced.status, "error");
+
+  // 暂时失败不许被打标 —— 否则一次网络抖动就让它停下来等人。
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-transient-"));
+  fs.cpSync(dir, dir2, { recursive: true });
+  for (const f of fs.readdirSync(path.join(dir2, ".runtime-data", "outbound", "outbox"))) {
+    const at = path.join(dir2, ".runtime-data", "outbound", "outbox", f);
+    const rec = JSON.parse(fs.readFileSync(at, "utf-8"));
+    delete rec.publish_rejected_at; delete rec.publish_rejected_reason;
+    fs.writeFileSync(at, JSON.stringify(rec));
+  }
+  fs.rmSync(path.join(dir2, ".runtime-data", "outbound", "publish.lock"), { recursive: true, force: true });
+  const flaky = new Error("Command failed: x");
+  flaky.stderr = "request failed: httpCode 503, service unavailable";
+  const t1 = drainProject({ root: dir2, publish: () => { throw flaky; }, diagnose: safeDiagnose });
+  assert.equal(t1.permanent, false, "503 是暂时失败");
+  assert.deepEqual(t1.markedRejected, [], "**暂时失败一个标都不许打**");
+  let retried = 0;
+  drainProject({ root: dir2, diagnose: safeDiagnose,
+    publish: () => { retried += 1; throw flaky; } });
+  assert.equal(retried, 1, "暂时失败下一轮必须照常重试");
+});
+
+
+test("认不出来的失败也不许无限重试：次数上限才是兜底那道", () => {
+  // **认出错误码这条路本身不可靠。**实测：那次故障的 lark-cli 输出根本没有
+  // httpCode，只有 code 230099；错误码表也永远追不齐，下一个没见过的限制码又会转起来。
+  // 所以真正保证"不会无限重试"的是次数上限 —— 它不需要认识任何错误码。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cap-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const obDir = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true });
+  fs.mkdirSync(obDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: dir, logical_task_key: "k", project_display_name: "P",
+    task_display_name: "P", lark_cli_profile: "claude" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "active", root_message_id: "om_x", feishu_root_message_id_reference: "om_x",
+    claude_session_id: null, channel_generation_id: "gen-1" }));
+  appendEvent({ outboxDir: obDir, kind: "next", text: "一直失败的一条", source: "t" });
+
+  // **认不出来的失败**：没有 httpCode、没有已知 ErrCode。
+  const opaque = new Error("Command failed: x");
+  opaque.stderr = "something went wrong, code 230099";
+  assert.equal(publishRetryability(opaque.stderr).permanent, false, "前提：这个认不出来");
+
+  const safeDiagnose = () => ({ kind: PUBLISH_FAILURE.TRANSIENT, reason: "stub" });
+  let calls = 0;
+  const boom = () => { calls += 1; throw opaque; };
+  let last = null;
+  // 跑到停为止，但**给足余量**：跑不停的话这里会自己爆，而不是无声无息转下去。
+  for (let i = 0; i < MAX_AUTO_PUBLISH_ATTEMPTS + 5; i += 1) {
+    last = drainProject({ root: dir, publish: boom, diagnose: safeDiagnose });
+    if (last.status === "needs_attention") break;
+  }
+  assert.equal(last.status, "needs_attention",
+    "**必须自己停下来** —— 这就是那 12 小时空转的根");
+  assert.equal(calls, MAX_AUTO_PUBLISH_ATTEMPTS,
+    "上限是 " + MAX_AUTO_PUBLISH_ATTEMPTS + " 次，实际试了 " + calls + " 次");
+  assert.match(last.rejected[0].why, /试了 5 次都没成/u, "**要说清是撞了上限，不是平台拒绝**");
+
+  // 再跑一轮：**一次都不许再调**。
+  const before = calls;
+  drainProject({ root: dir, publish: boom, diagnose: safeDiagnose });
+  assert.equal(calls, before, "停了就是停了");
+
+  // 人显式重试：计数也要清 —— 只清标记不清计数的话，再失败一次就立刻又撞上限，
+  // 那不叫给了一次机会。
+  drainProject({ root: dir, publish: boom, diagnose: safeDiagnose, retryRejected: true });
+  assert.equal(calls, before + 1, "--retry-rejected 要真的再试");
+  const rec = listPending({ outboxDir: obDir })[0];
+  assert.equal(rec.publish_attempts, 1, "**计数要从头开始**，实际是 " + rec.publish_attempts);
 });
 
 summarySealed = true;

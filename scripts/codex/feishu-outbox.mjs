@@ -40,13 +40,15 @@
 import path from "node:path";
 
 import { isDirectRun, moduleDir } from "../direct-run.mjs";
-import { listPending } from "../outbox.mjs";
+import { isPermanentlyRejected, listPending } from "../outbox.mjs";
 import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
 import { generationTargetState } from "../suppress-outbox-core.mjs";
 import { hasPublishAuthorization } from "../outbox.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
 import { auditOutbox } from "./drain-service.mjs";
 import { outboxMutationBlocker } from "../outbox.mjs";
+import { outboxDirOf } from "../drain-outbox.mjs";
+import { loadRegistry as loadClaudeRegistry } from "../registry.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
 import {
   bridgeHome, loadRegistry, registryFile, resolveTaskOutboundGeneration, taskPaths,
@@ -245,6 +247,63 @@ export function describeTaskPublishability({ task, home }) {
  * @returns {{ok:true, tasks:Array}|{ok:false, reason:string}}
  * 每个 task 带 `readable`：false 表示 outbox 读不全，**这时候的条数不可信**。
  */
+/**
+ * 项目级绑定的积压。
+ *
+ * 它们不在 Codex 登记表里 —— 那张表管的是 task。项目级绑定登记在 Claude 那张
+ * registry 里，outbox 路径由 outboxDirOf 决定（会话级绑定是 `outbox-<uuid>/`）。
+ * **判据共用**：路径用 outboxDirOf、审计用 auditOutbox，不在这里另写一份。
+ *
+ * @returns {{ok:true, scanned:true, projects:object[]}|{ok:false, reason:string}}
+ *          读不出登记表是**故障**，不是"没有项目" —— 这两件事在输出上长得一样，
+ *          含义却相反。
+ */
+export function collectProjectBacklog() {
+  const reg = loadClaudeRegistry();
+  if (!reg.ok) return { ok: false, scanned: false, reason: reg.reason ?? "registry_unreadable", projects: [] };
+  const seen = new Set();
+  const projects = [];
+  for (const project of reg.projects ?? []) {
+    if (typeof project?.root !== "string" || !project.root) continue;
+    const claudeSessionId = project.claude_session_id ?? null;
+    const key = project.root + "\u0000" + (claudeSessionId ?? "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const outboxDir = outboxDirOf(project.root, claudeSessionId);
+    const audit = auditOutbox(outboxDir);
+    const entry = {
+      name: sanitizeForDisplay(path.basename(project.root)) +
+        (claudeSessionId ? "/" + sanitizeForDisplay(String(claudeSessionId).slice(0, 8)) : ""),
+      root: project.root,
+      readable: audit.ok === true,
+      unreadableReason: audit.ok === true ? null : (audit.reason ?? "说不清"),
+      unclassified: audit.ok === true ? (audit.unclassified ?? []) : [],
+      unexplainable: audit.ok === true ? (audit.unexplainable ?? []) : [],
+      blocked: outboxMutationBlocker(audit),
+      records: [],
+    };
+    if (entry.readable) {
+      for (const r of listPending({ outboxDir })) {
+        entry.records.push({
+          file: path.basename(r._file ?? ""),
+          kind: sanitizeForDisplay(r.kind ?? "?"),
+          createdAt: r.created_at ?? null,
+          text: r.text ?? "",
+          // 被永久拒绝过的要单独说 —— 它不会再自动重试，是在等人。
+          rejected: isPermanentlyRejected(r),
+          rejectedWhy: isPermanentlyRejected(r)
+            ? sanitizeForDisplay(String(r.publish_rejected_reason ?? "未说明")) : null,
+        });
+      }
+    }
+    if (!entry.readable || entry.unclassified.length > 0
+      || entry.unexplainable.length > 0 || entry.records.length > 0) {
+      projects.push(entry);
+    }
+  }
+  return { ok: true, scanned: true, projects };
+}
+
 export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey = null } = {}) {
   const reg = loadRegistry(registryFile(home));
   // **原样透传受控 reason/detail。**上一版一律改写成 registry_unreadable ——
@@ -262,6 +321,21 @@ export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey =
   if ((threadId !== null || taskKey !== null) && selected.length === 0) {
     return { ok: false, reason: "task_not_found" };
   }
+
+  // **项目级绑定也在视野里。**
+  //
+  // 上一版只遍历 Codex 登记表里的 task，而项目级绑定的 outbox 在
+  // `<项目>/.runtime-data/outbound/outbox/` —— **压根没往那儿看**。
+  // cc2cd 当时有 3 条积压，这个命令说"没有积压"。
+  // 它不是读不出来，是没看；而措辞让人以为看全了。
+  //
+  // 这跟这个文件开头写的设计目标正好相反：**"读不出来"绝不能显示成"没有积压"**。
+  // 现在再加一句：**"没看"更不能**。
+  //
+  // 点名了 thread/task 时不扫项目级：那次问的是"这一条 task 怎么样"。
+  const projects = (threadId === null && taskKey === null)
+    ? collectProjectBacklog()
+    : { ok: true, scanned: false, projects: [] };
 
   const tasks = [];
   for (const task of selected) {
@@ -303,7 +377,7 @@ export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey =
       tasks.push(entry);
     }
   }
-  return { ok: true, tasks };
+  return { ok: true, tasks, projects };
 }
 
 /**
@@ -343,12 +417,41 @@ function main() {
         : "读不出登记表（" + got.reason + "）。");
     process.exit(1);
   }
-  if (got.tasks.length === 0) {
-    say("没有积压 —— 所有 task 的 outbox 都读得通，且都是空的。");
+  let trouble = false;
+  const proj = got.projects ?? { ok: true, scanned: false, projects: [] };
+  // **读不出项目登记表就不许说"没有积压"。**这跟"读不出 task 登记表"是同一条规矩，
+  // 上一版漏了后半边视野，于是连这条规矩也一起漏了。
+  if (proj.ok === false) {
+    warn("项目级绑定的登记表读不出来（" + proj.reason + "）—— " +
+      "**这不是「没有积压」**，项目级那半边视野现在是瞎的。");
+    process.exit(1);
+  }
+
+  if (got.tasks.length === 0 && proj.projects.length === 0) {
+    // **措辞必须跟实际视野一致。**上一版说"所有 task 的 outbox 都读得通且都是空的"，
+    // 字面没错，但读的人会当成"没有任何积压" —— 而项目级绑定压根没被看过。
+    say(proj.scanned
+      ? "没有积压 —— task 级和项目级绑定的 outbox 都读得通，且都是空的。"
+      : "这一条 task 没有积压。**这次只看了点名的那一条**，没有扫项目级绑定。");
     process.exit(0);
   }
 
-  let trouble = false;
+  for (const entry of proj.projects) {
+    if (!entry.readable) {
+      warn("项目 " + entry.name + " 的 outbox 读不出来（" + entry.unreadableReason + "）。");
+      trouble = true;
+      continue;
+    }
+    const stuck = entry.records.filter((r) => r.rejected);
+    say("项目 " + entry.name + "：待发 " + entry.records.length + " 条" +
+      (stuck.length > 0 ? "，其中 " + stuck.length + " 条被飞书永久拒绝过、不会再自动重试" : "") + "。");
+    for (const r of stuck) say("  " + r.file + " —— " + r.rejectedWhy);
+    if ((entry.unclassified ?? []).length > 0) {
+      warn("  另有 " + entry.unclassified.length + " 个文件归不了类。");
+      trouble = true;
+    }
+  }
+
   const readable = got.tasks.filter((t) => t.readable && t.unclassified.length === 0);
   const total = readable.reduce((n, t) => n + t.records.length, 0);
   // **这里曾经内嵌过一个 \n** —— 而输出边界的规则正是我自己在同一个文件里定的：

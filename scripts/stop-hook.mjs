@@ -297,6 +297,14 @@ async function main() {
       //
       // 判据只有统一守卫一份 —— 这里只负责把它的结论讲清楚。
       notes.push("飞书出站：" + who + " 的" + localOutboxMessage(r));
+    } else if (r.status === "error" && r.permanent === true) {
+      // **不许说"会重试"。**永久拒绝的定义就是再等不会变好；
+      // 说成会重试，人就会等 —— 而它已经这样空转过 12 小时。
+      notes.push("飞书出站：" + who + " 被飞书永久拒绝（" + r.permanentReason +
+        "），**不会再自动重试**，需要人看一眼。");
+    } else if (r.status === "needs_attention") {
+      notes.push("飞书出站：" + who + " 有 " + r.count +
+        " 条被飞书永久拒绝过，不会再自动重试，等你处理。");
     } else if (r.status === "error") {
       notes.push("飞书出站：" + who + " 发布失败（" + r.reason + "），进展留在 outbox，兜底定时器会重试。");
     } else if (r.status === "skipped" && r.reason === "auto_publish_disabled") {

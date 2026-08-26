@@ -148,6 +148,86 @@ export function listPending({ outboxDir }) {
   return out;
 }
 
+/**
+ * 这条记录**上一次是被永久拒绝的**吗。
+ *
+ * 永久拒绝 = 平台明确说了「这样发不出去」，或者已经试到了次数上限。
+ * 两者的共同点是：**再等 30 分钟不会变好**。
+ *
+ * 判据只有这一份：排空的选择、积压视图、重试命令都走它。
+ *
+ * **它不改变三态。**记录仍然是 pending（没发出去、也没被停发），
+ * 只是不再参与自动重试 —— 停发是不可逆的，而「这次发不出去」不该顺手变成「永远别发」。
+ */
+export const isPermanentlyRejected = (rec) => isCanonicalIso(rec?.publish_rejected_at);
+
+/**
+ * **自动重试的次数上限。**
+ *
+ * 光靠"认出永久错误码"不够，而且这一点是实测出来的：cc2cd 那次故障里，
+ * lark-cli 输出**根本没有 httpCode**，只有 `"code": 230099` ——
+ * 我第一版按 HTTP 状态码分类，在真实数据上会把它判成"暂时"，照样无限重试。
+ *
+ * 错误码表永远追不齐：下一个没见过的限制码又会转起来。
+ * 所以次数上限是**兜底判据**，它不需要认识任何错误码。
+ * 12 小时 / 每 30 分钟 = 24 次，现在最多 5 次。
+ */
+export const MAX_AUTO_PUBLISH_ATTEMPTS = 5;
+
+const rewrite = (rec, mutate) => {
+  const next = { ...rec };
+  mutate(next);
+  delete next._file;
+  delete next._raw;
+  const tmp = rec._file + ".tmp." + randomUUID();
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+  fs.renameSync(tmp, rec._file);
+  return next;
+};
+
+/**
+ * 记一次发布失败，并决定**这条要不要停止自动重试**。
+ *
+ * **必须在持有发布锁时调用** —— 它改的是同一条记录的语义，
+ * 跟抑制、资格提升共用那把锁。
+ *
+ * @returns {{rejected:boolean, attempts:number, reason:string|null}}
+ */
+export function recordPublishFailure(rec, {
+  permanent = false, reason = "未说明", maxAttempts = MAX_AUTO_PUBLISH_ATTEMPTS,
+} = {}) {
+  const prior = Number.isSafeInteger(rec?.publish_attempts) && rec.publish_attempts > 0
+    ? rec.publish_attempts : 0;
+  const attempts = prior + 1;
+  const exhausted = attempts >= maxAttempts;
+  if (!permanent && !exhausted) {
+    rewrite(rec, (next) => { next.publish_attempts = attempts; });
+    return { rejected: false, attempts, reason: null };
+  }
+  const why = (permanent ? String(reason) : "试了 " + attempts + " 次都没成：" + String(reason))
+    .slice(0, 400) || "未说明";
+  rewrite(rec, (next) => {
+    next.publish_attempts = attempts;
+    next.publish_rejected_at = new Date().toISOString();
+    next.publish_rejected_reason = why;
+  });
+  return { rejected: true, attempts, reason: why };
+}
+
+/**
+ * 人显式下令重试：把永久拒绝的标记和失败计数一起清掉。**同样要持有发布锁。**
+ *
+ * **计数也要清。**只清标记不清计数的话，人修好起因、重试一次再失败，
+ * 立刻又撞上上限 —— 那不叫给了一次机会。
+ */
+export function clearPermanentRejection(rec) {
+  return rewrite(rec, (next) => {
+    delete next.publish_rejected_at;
+    delete next.publish_rejected_reason;
+    delete next.publish_attempts;
+  });
+}
+
 export function markSent(rec, messageId) {
   const next = { ...rec, published_at: new Date().toISOString(), feishu_message_id: messageId ?? null };
   delete next._file;

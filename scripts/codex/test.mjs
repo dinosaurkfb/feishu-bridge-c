@@ -21,7 +21,8 @@ import {
 import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
 import { generationTargetState } from "../topic-generation.mjs";
 import {
-  ageText, collectBacklog, describeRecordState, sanitizeForDisplay, suppressCommandFor,
+  ageText, collectBacklog, collectProjectBacklog, describeRecordState, sanitizeForDisplay,
+  suppressCommandFor,
 } from "./feishu-outbox.mjs";
 import { auditSkills } from "./skill-content.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
@@ -36,7 +37,8 @@ import {
 import { sweepEligible } from "./drain-all.mjs";
 
 import {
-  appendEvent, listPending, markPublishEligibleByEventKey, suppressPublishByEventKey,
+  appendEvent, listPending, markPublishEligibleByEventKey, recordPublishFailure,
+  suppressPublishByEventKey,
 } from "../outbox.mjs";
 import { evaluateInbound, REJECT } from "../selector.mjs";
 import {
@@ -6493,6 +6495,57 @@ test("watcher 启动时的历史标记：撞上锁要等到有结论，不能只
   } finally {
     fs.rmSync(paths.publishLock, { recursive: true, force: true });
   }
+});
+
+test("积压视图：项目级绑定也在视野里，措辞不许超出实际看过的范围", () => {
+  // 评审外的实测：Frank 让人用这个命令看积压，它说"没有积压 —— 所有 task 的
+  // outbox 都读得通，且都是空的"。而 cc2cd 是**项目级绑定**，当时有 3 条积压。
+  // 它不是读不出来，是**压根没往那儿看**，而措辞让人以为看全了。
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-projbacklog-"));
+  const proj = path.join(home, "cc2cd");
+  const obDir = path.join(proj, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(obDir, { recursive: true });
+  const registry = path.join(home, "registry.json");
+  fs.writeFileSync(registry, JSON.stringify({
+    schema_version: "1.0", projects: [{ root: proj, claude_session_id: null }] }));
+
+  const withReg = (fn) => {
+    const before = process.env.FEISHU_BRIDGE_REGISTRY;
+    process.env.FEISHU_BRIDGE_REGISTRY = registry;
+    try { return fn(); } finally {
+      if (before === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY;
+      else process.env.FEISHU_BRIDGE_REGISTRY = before;
+    }
+  };
+
+  // 空的时候确实是空的 —— 守卫不能把好情况也一起报成有事。
+  assert.deepEqual(withReg(() => collectProjectBacklog()),
+    { ok: true, scanned: true, projects: [] }, "真空的时候要说空");
+
+  // 放 3 条进去 —— 这正是 cc2cd 当时的样子。
+  for (let i = 1; i <= 3; i += 1) {
+    fs.writeFileSync(path.join(obDir, "000" + i + ".json"),
+      JSON.stringify(outboxRecord({ text: "项目级积压 " + i })));
+  }
+  const got = withReg(() => collectProjectBacklog());
+  assert.equal(got.ok, true);
+  assert.equal(got.projects.length, 1, "**项目级积压必须被看见**");
+  assert.equal(got.projects[0].records.length, 3, "3 条一条都不许漏");
+  assert.match(got.projects[0].name, /cc2cd/u, "要点名是哪个项目");
+
+  // 被永久拒绝的要单独说 —— 它在等人，不是在排队。
+  const one = listPending({ outboxDir: obDir })[0];
+  recordPublishFailure(one, { permanent: true, reason: "http_400：ErrCode: 11310" });
+  const after = withReg(() => collectProjectBacklog());
+  const stuck = after.projects[0].records.filter((r) => r.rejected);
+  assert.equal(stuck.length, 1, "被拒的要标出来");
+  assert.match(stuck[0].rejectedWhy, /11310/u, "原因要带上");
+
+  // **登记表读不出来是故障，不是「没有项目」。**这两件事在输出上长得一样、含义相反。
+  fs.writeFileSync(registry, "{ 这不是 JSON");
+  const broken = withReg(() => collectProjectBacklog());
+  assert.equal(broken.ok, false, "**读不出来绝不能显示成没有积压**");
+  assert.equal(broken.projects.length, 0);
 });
 
 summarySealed = true;

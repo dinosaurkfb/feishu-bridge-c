@@ -37,4 +37,3 @@ export function foreignHint(reported) {
   if (foreign.length === 0) return "";
   return " （标「非当前项目」的是因为本会话提到过它的路径，才被一起排空。）";
 }
-

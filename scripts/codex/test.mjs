@@ -6680,6 +6680,65 @@ test("Codex 全景：成因要到这个消费者，总数要含项目级（真�
     "**总数要含项目级** —— 同一次输出里说了项目待发 2 条，总数却是 " + total[1]);
 });
 
+test("项目级积压：内容、损坏结论、完整性都要跟 task 那半一样（真实 CLI）", () => {
+  // 评审两条，都是"我另写了一份渲染"造成的：
+  //   · 收集层保存了 unexplainable/blocked，CLI 只看 unclassified ——
+  //     一条损坏记录只显示成"待发 1 条"，没有文件名、没有原因、没有阻断提示
+  //   · 只显示数量不显示内容 —— 而这个命令承诺的是"积压里到底是什么"
+  //   · 有归不了类的文件时仍给出"积压 0 条"这种**看似精确**的数
+  const run = (home, registry) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+      FEISHU_BRIDGE_REGISTRY: registry } });
+  const setup = () => {
+    const home = temp();
+    const proj = path.join(home, "cc2cd");
+    const obDir = path.join(proj, ".runtime-data", "outbound", "outbox");
+    fs.mkdirSync(obDir, { recursive: true });
+    const registry = path.join(home, "registry.json");
+    fs.writeFileSync(registry, JSON.stringify({
+      schema_version: "1.0", projects: [{ root: proj, claude_session_id: null }] }));
+    return { home, obDir, registry };
+  };
+
+  // ① 正文必须看得见。
+  {
+    const { home, obDir, registry } = setup();
+    fs.writeFileSync(path.join(obDir, "0001.json"),
+      JSON.stringify(outboxRecord({ text: "项目级正文必须可见" })));
+    const said = run(home, registry).stdout ?? "";
+    assert.match(said, /项目级正文必须可见/u,
+      "**只报数量等于没回答「积压里是什么」**：" + said.slice(0, 400));
+    assert.match(said, /0001\.json|\[milestone\]/u, "要给出记录的身份");
+  }
+
+  // ② 解释不了的记录要点名，不能只报一个数。
+  {
+    const { home, obDir, registry } = setup();
+    fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
+      ...outboxRecord({ text: "损坏的" }), publish_attempts: 5 }));   // 缺暂停字段
+    const r = run(home, registry);
+    const said = (r.stdout ?? "") + (r.stderr ?? "");
+    assert.match(said, /解释不了|归不了类/u,
+      "**审计的结论不许被丢掉**：" + said.slice(0, 400));
+    assert.match(said, /0001\.json/u, "要点名是哪个文件");
+    assert.match(said, /publish_retry_protection/u, "要说清坏在哪");
+  }
+
+  // ③ 视野不完整时，不许给一个看似精确的数。
+  {
+    const { home, obDir, registry } = setup();
+    fs.writeFileSync(path.join(obDir, "0001.json"), "{ 这不是 JSON");
+    const r = run(home, registry);
+    const said = (r.stdout ?? "") + (r.stderr ?? "");
+    assert.match(said, /归不了类/u, "坏文件要点名");
+    assert.equal(/积压 0 条。/u.test(said), false,
+      "**「1 个文件归不了类」和「积压 0 条」不许同时出现** —— " +
+      "精确的数字暗示「我全看清了」：" + said.slice(0, 400));
+    assert.match(said, /不完整/u, "要明说这个数不完整");
+  }
+});
+
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (failed > 0) process.exit(1);

@@ -477,43 +477,82 @@ function main() {
     process.exit(0);
   }
 
+  // **项目级跟 task 级共用同一套渲染结构。**
+  //
+  // 上一版这里是我另写的一份：只看 unclassified、只报数量。于是
+  //   · 审计给的 unexplainable 和 blocked 结论被丢掉 —— 一条损坏记录
+  //     只显示成"待发 1 条"，没有文件名、没有原因、没有阻断提示；
+  //   · 项目级积压**只看得见数量、看不见内容** ——
+  //     而这个命令开头承诺的就是"积压里到底是什么"。
+  //
+  // 同一件事写两份，第二份总会少点什么。这条线上已经因此栽过很多次。
+  const projectSections = [];
+  let projectTotal = 0;
+  let projectComplete = true;
   for (const entry of proj.projects) {
+    const lines = [];
+    lines.push("【项目 " + entry.name + "】");
     if (!entry.readable) {
-      warn("项目 " + entry.name + " 的 outbox 读不出来（" + entry.unreadableReason + "）。");
       trouble = true;
+      projectComplete = false;
+      lines.push("  **outbox 读不出来（" + entry.unreadableReason + "）—— 这里的条数不可信。**");
+      projectSections.push(lines);
       continue;
     }
-    const stuck = entry.records.filter((r) => r.rejected);
-    // **成因也要到这个消费者。**上一轮接通了 drain → 渲染 → Stop，
-    // **漏了这里** —— 于是全景仍把"重试预算耗尽"说成"被飞书永久拒绝"。
-    // 同一条策略又一次少接了一个消费者。
-    say("项目 " + entry.name + "：待发 " + entry.records.length + " 条" +
-      (stuck.length > 0 ? "，其中 " + stuck.length + " 条已暂停自动重试" : "") + "。");
-    for (const r of stuck) {
-      say("  " + r.file + "（" + (r.rejectedKind === "retry_exhausted"
-        ? "重试预算耗尽，值得再试一次"
-        : r.rejectedKind === "platform_rejected" ? "平台拒绝，不改内容再试也一样"
-          : "成因不明") + "）—— " + r.rejectedWhy);
-    }
     if ((entry.unclassified ?? []).length > 0) {
-      warn("  另有 " + entry.unclassified.length + " 个文件归不了类。");
       trouble = true;
+      projectComplete = false;
+      lines.push("  **有 " + entry.unclassified.length + " 个文件归不了类，整体不可信：**");
+      for (const u of entry.unclassified) lines.push("    " + u.file + " —— " + u.why);
     }
+    if ((entry.unexplainable ?? []).length > 0) {
+      trouble = true;
+      projectComplete = false;
+      lines.push("  **有 " + entry.unexplainable.length + " 条记录解释不了，不能对它们动手：**");
+      for (const u of entry.unexplainable) lines.push("    " + u.file + " —— " + u.why);
+    }
+    projectTotal += entry.records.length;
+    lines.push("  待发 " + entry.records.length + " 条");
+    for (const [i, r] of entry.records.entries()) {
+      const pause = r.rejected
+        ? "（" + (r.rejectedKind === "retry_exhausted" ? "已暂停：重试预算耗尽，值得再试一次"
+          : r.rejectedKind === "platform_rejected" ? "已暂停：平台拒绝，不改内容再试也一样"
+            : "已暂停：成因不明") + "）"
+        : "";
+      lines.push("  " + String(i + 1).padStart(2) + ". [" + r.kind + "] " +
+        ageText(r.createdAt) + pause);
+      lines.push("      " + oneLine(r.text, { full }));
+      if (r.rejected) lines.push("      " + r.rejectedWhy);
+    }
+    if (entry.blocked) {
+      lines.push("  这个项目的 outbox 有说不清的内容，**抑制会整批拒绝** ——");
+      lines.push("  先确认上面点名的文件是什么。");
+    }
+    projectSections.push(lines);
   }
 
   const readable = got.tasks.filter((t) => t.readable && t.unclassified.length === 0);
-  // **总数要含项目级。**上一版只累加 got.tasks —— 于是同一次输出里
-  // 先说"项目 X：待发 1 条"，紧接着又说"积压 0 条"，**自己跟自己矛盾**。
-  // 一份自相矛盾的报告比没有报告更坏：人不知道该信哪一句。
+  // **总数要含项目级，而且视野不完整时不许给一个看似精确的数。**
+  //
+  // 上一版只累加 got.tasks —— 同一次输出里先说"项目 X：待发 1 条"、
+  // 紧接着说"积压 0 条"，自己跟自己矛盾。改完之后还剩另一半：
+  // 有一个文件归不了类时，仍然无条件累加已解析的那些，
+  // 于是"1 个文件归不了类"和"积压 0 条"同时出现 ——
+  // **一个精确的数字暗示着「我全看清了」，而那不成立。**
   const taskTotal = readable.reduce((n, t) => n + t.records.length, 0);
-  const projectTotal = proj.projects.reduce((n, e) => n + e.records.length, 0);
   const total = taskTotal + projectTotal;
+  const complete = projectComplete && readable.length === got.tasks.length;
   // **这里曾经内嵌过一个 \n** —— 而输出边界的规则正是我自己在同一个文件里定的：
   // 格式串不许带换行。净化器把它换成了 U+FFFD，真实输出首行成了"积压 1 条。<?>"。
   // 空行单独发一次。
-  say("积压 " + total + " 条" +
-    (readable.length === got.tasks.length ? "" : "（另有 task 读不全，见下）") + "。");
+  say(complete
+    ? "积压 " + total + " 条。"
+    : "**至少**积压 " + total + " 条（有读不全的，见下 —— 这个数不完整）。");
   say("");
+  for (const lines of projectSections) {
+    for (const line of lines) say(line);
+    say("");
+  }
 
   for (const t of got.tasks) {
     say("【" + t.name + "】" + (t.taskKey ? t.taskKey : ""));

@@ -174,7 +174,7 @@ export const PAUSE_KINDS = ["platform_rejected", "retry_exhausted"];
 /**
  * 一条记录的**重试保护状态**。三态，充要。
  *
- *   clean    —— 三个字段都不在（绝大多数记录）
+ *   clean    —— 四个字段都不在（绝大多数记录）
  *   retrying —— 只有 attempts（≥1），还在自动重试预算内
  *   paused   —— attempts（≥1）+ at + reason + kind 四件齐全
  *

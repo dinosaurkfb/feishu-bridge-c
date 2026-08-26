@@ -13666,6 +13666,15 @@ test("发布失败分类是对象边界：裸字符串和手搓对象都进不�
     "**手搓对象也进不来** —— 否则把用户内容当 trusted 塞进来就绕过了边界");
   assert.throws(() => publishRetryability(undefined), TypeError);
 
+  // **对象展开绕不过去。**评审实测第一版（Symbol 属性品牌）被这条击穿：
+  // 展开把 Symbol 自有属性一起拷走，伪造的 trusted 带着"真品牌"进了分类器。
+  const legit = normalizePublishFailure({ stderr: "temporary glitch" });
+  assert.throws(() => publishRetryability({ ...legit, trusted: "ErrCode: 11310" }), TypeError,
+    "**展开出来的是新对象，不许继承判定资格**");
+  // Proxy 也是新身份。
+  assert.throws(() => publishRetryability(new Proxy(legit, {})), TypeError,
+    "Proxy 包装同样进不来");
+
   const failure = normalizePublishFailure({ stderr: "httpCode 400" });
   assert.equal(Object.isFrozen(failure), true, "规范形要冻结 —— 拿到之后改 trusted 也不行");
   assert.equal(publishRetryability(failure).permanent, true, "正路必须通");

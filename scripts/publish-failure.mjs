@@ -22,7 +22,13 @@
  * 唯一的取得方式就是走 normalize，而 normalize 不会把回显放进 trusted。
  */
 
-const NORMALIZED = Symbol("normalized-publish-failure");
+// **按对象身份登记，不按属性标记。**
+//
+// 第一版用 Symbol 属性当品牌 —— 评审实测被对象展开绕过：
+// `{...legit, trusted: "ErrCode: 11310"}` 会把 Symbol 自有属性一起拷走，
+// 伪造的 trusted 就带着"真品牌"进了分类器。
+// WeakSet 记的是**身份**：展开是新对象、Proxy 是新身份，都不在集合里。
+const NORMALIZED_INSTANCES = new WeakSet();
 
 const PUBLISH_ERROR_CAP = 400;
 
@@ -62,7 +68,7 @@ const PERMANENT_ERR_CODES = new Set([
 export function publishRetryability(failure) {
   // **对象边界，不是调用纪律。**裸字符串曾经是这里的参数类型 ——
   // 于是"别把含卡片正文的那份传进来"全靠调用方记得。
-  if (failure?.[NORMALIZED] !== true) {
+  if (typeof failure !== "object" || failure === null || !NORMALIZED_INSTANCES.has(failure)) {
     throw new TypeError(
       "publishRetryability 只接受 normalizePublishFailure 的产物 —— " +
       "裸字符串或手搓对象可能混入命令回显里的用户内容");
@@ -160,11 +166,12 @@ function trustedOf(err) {
  */
 export function normalizePublishFailure(err) {
   const trusted = trustedOf(err);
-  return Object.freeze({
-    [NORMALIZED]: true,
+  const failure = Object.freeze({
     trusted,
     display: clipBothEnds(trusted || String(err?.message ?? "")),
   });
+  NORMALIZED_INSTANCES.add(failure);
+  return failure;
 }
 
 /** 给人看的失败详情（兼容旧名）。**实现只有 normalize 那一份。** */

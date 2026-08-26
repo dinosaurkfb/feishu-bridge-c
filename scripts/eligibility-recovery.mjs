@@ -73,12 +73,19 @@ const REASON_SHAPE = /^[a-z][a-z0-9_]{0,63}$/u;
 export const ELIGIBILITY_BUDGET_DEFAULT_MS = 60_000;
 export const ELIGIBILITY_BUDGET_MAX_MS = 10 * 60_000;
 
-export function eligibilityBudgetMs(raw) {
+/**
+ * 通用的有界预算解析。**判据只有这一份** —— watcher 的发布等待预算
+ * 与资格恢复预算共用同一套"有限安全整数、非负、封顶、不合规回落默认"。
+ */
+export function boundedBudgetMs(raw, { def, max }) {
   const n = typeof raw === "string" ? (/^\d{1,9}$/u.test(raw) ? Number(raw) : NaN) : raw;
-  if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0) {
-    return ELIGIBILITY_BUDGET_DEFAULT_MS;
-  }
-  return Math.min(n, ELIGIBILITY_BUDGET_MAX_MS);
+  if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0) return def;
+  return Math.min(n, max);
+}
+
+export function eligibilityBudgetMs(raw) {
+  return boundedBudgetMs(raw, {
+    def: ELIGIBILITY_BUDGET_DEFAULT_MS, max: ELIGIBILITY_BUDGET_MAX_MS });
 }
 
 /** 同步等一小会儿 —— 这条链上的函数都是同步契约，不能改成 async。 */

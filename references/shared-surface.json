@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-08-26T12:46:41.865Z",
+  "generated_at": "2026-08-26T13:30:38.809Z",
   "modules": {
     "automatic-topic-rotation.mjs": [
       "businessActivitiesForPublishedBatch",
@@ -125,6 +125,7 @@
       "moduleRoot"
     ],
     "drain-outbox.mjs": [
+      "claudeRotationBatchHook",
       "describeDrainOutcome",
       "drainCmd",
       "drainProject",
@@ -137,6 +138,7 @@
     "eligibility-recovery.mjs": [
       "ELIGIBILITY_BUDGET_DEFAULT_MS",
       "ELIGIBILITY_BUDGET_MAX_MS",
+      "boundedBudgetMs",
       "eligibilityBudgetMs",
       "eligibilityOutcomeFor",
       "listEligibilityPending",

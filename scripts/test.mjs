@@ -12957,7 +12957,8 @@ test("矩阵登记表：四份实现都在册，状态与本仓当前接线一�
     "**实现清单是闭的** —— 增删都必须动登记表，矩阵才跟得上");
   // 状态翻转必须是有意识的：R2a 只迁了 claude-drain。
   assert.equal(impl["claude-drain"].status, "migrated");
-  assert.equal(impl["claude-watcher"].status, "legacy");
+  // R2b1：watcher 已接入发布事务。翻回 legacy 必须是有意识的决定。
+  assert.equal(impl["claude-watcher"].status, "migrated");
   assert.equal(impl["codex-drain"].status, "legacy");
   assert.equal(impl["codex-eligible"].status, "legacy");
 });
@@ -13115,6 +13116,7 @@ const watcherMatrixRunner = {
     const markers = [];
     let turn = 0;
     return {
+      dir, obDir,
       seed(text) {
         markers.push(text);
         fs.appendFileSync(markersFile, text + "\n");
@@ -13166,13 +13168,8 @@ for (const row of matrixRowsFor({
   registry: PUBLISH_ENTRY_STATUS,
   suite: "claude",
   runners: { "claude-drain": drainMatrixRunner, "claude-watcher": watcherMatrixRunner },
-  legacySubsets: {
-    // watcher 满足全部**它有能力跑**的场景 —— legacy 只表示"还没走事务"，
-    // 不是"行为缺失"。R2b1 翻 migrated 时这份申报删掉。
-    "claude-watcher": PUBLISH_SCENARIOS
-      .filter((sc) => sc.needs.every((c) => ["publish", "failStates", "auditGate"].includes(c)))
-      .map((sc) => sc.name),
-  },
+  // watcher 已 migrated（R2b1）：不适用场景由登记表 not_applicable 受控申报。
+  legacySubsets: {},
 })) {
   test("矩阵[" + row.entry + "·" + row.status + "] " + row.title, () => row.run(assert));
 }
@@ -14415,6 +14412,45 @@ test("轮转记账以 ok:false 静默失败时，必须进 bookkeepingFailures�
     .find((x) => x.text === "发成但记账挂了的一条");
   assert.match(marked.published_at ?? "", /^\d{4}/u,
     "记账失败不影响落标 —— 防重发压倒一切");
+});
+
+test("watcher 共锁语义：预算耗尽 run 独走、outbox 永不无锁（真实进程）", () => {
+  // R2b1 定稿并测试的等待/失败/延期语义（计划文档验收点）：
+  //   预算内等同一把锁；耗尽后 run 结果按既有契约无锁单发（独立回执，
+  //   零双发风险）；**outbox 那半永不无锁** —— 双发风险全在那半。
+  const h = watcherMatrixRunner.fixture();
+  h.seed("锁被占时不许发的进展");
+  const lockDir = path.join(h.dir, ".runtime-data", "outbound", "publish.lock");
+  fs.mkdirSync(path.dirname(lockDir), { recursive: true });
+  assert.equal(acquirePublishLock(lockDir).ok, true, "前提：别人一直持着锁");
+  try {
+    // 预算压到 1 秒，别让测试等 15 秒。
+    const before = process.env.FEISHU_BRIDGE_PUBLISH_WAIT_MS;
+    process.env.FEISHU_BRIDGE_PUBLISH_WAIT_MS = "1000";
+    try {
+      const argsFile = path.join(h.dir, "lark-calls.jsonl");
+      const linesBefore = fs.existsSync(argsFile)
+        ? fs.readFileSync(argsFile, "utf-8").split("\n").filter(Boolean).length : 0;
+      const { publishCalls } = h.attempt("ok");
+      // run 卡发出去了（独走）；outbox 那条一张都没发。
+      const lines = fs.readFileSync(argsFile, "utf-8").split("\n").filter(Boolean);
+      const fresh = lines.slice(linesBefore);
+      assert.ok(fresh.some((l) => l.includes("第 1 轮")),
+        "**run 结果要无锁单发出去** —— 扣着执行结果的代价大得多：" + fresh.length);
+      assert.equal(publishCalls, 0, "**outbox 永不无锁** —— 含 marker 的调用必须是 0");
+      assert.equal(h.read("锁被占时不许发的进展").published_at, null,
+        "outbox 记录不许被无锁发出");
+    } finally {
+      if (before === undefined) delete process.env.FEISHU_BRIDGE_PUBLISH_WAIT_MS;
+      else process.env.FEISHU_BRIDGE_PUBLISH_WAIT_MS = before;
+    }
+  } finally {
+    releasePublishLock(lockDir);
+  }
+  // 锁放开后下一轮照常把积压发出去 —— 延期语义是"让"，不是"丢"。
+  const after = h.attempt("ok");
+  assert.ok(after.publishCalls >= 1, "锁放开后要补发");
+  assert.match(h.read("锁被占时不许发的进展").published_at ?? "", /^\d{4}/u);
 });
 
 summarySealed = true;

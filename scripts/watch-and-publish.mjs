@@ -15,21 +15,17 @@ import path from "node:path";
 
 import { readRunOutcome } from "./handoff.mjs";
 import { scanRuns, buildDraft, markPublished, publishDraft } from "./outbound.mjs";
-import {
-  auditOutbox, isPermanentlyRejected, listPending, markSent, outboxMutationBlocker,
-  recordPublishFailure,
-} from "./outbox.mjs";
-import { normalizePublishFailure, publishRetryability } from "./publish-failure.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
+import { claudeRotationBatchHook } from "./drain-outbox.mjs";
+import { publishOutboxAttempt } from "./publish-attempt.mjs";
+import { boundedBudgetMs } from "./eligibility-recovery.mjs";
+import { postDeliveryBits } from "./stop-note.mjs";
 import { readClaim, recordClaimState } from "./claim.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
 import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { moduleRoot } from "./direct-run.mjs";
-import {
-  businessActivitiesForPublishedBatch, recordClaudeActivityAndMaybeRotate,
-} from "./automatic-topic-rotation.mjs";
 import { finalizeClaudeDialogueTurn } from "./interaction-policy-store.mjs";
 import { DIALOGUE_POLICY_ID, DIALOGUE_TURN_STATUS } from "./interaction-policy.mjs";
 
@@ -67,27 +63,23 @@ const claudeSessionId = acceptedClaim?.claude_session_id ?? null;
 const OUTBOX = path.join(ROOT, ".runtime-data", "outbound",
   claudeSessionId ? "outbox-" + claudeSessionId : "outbox");
 
-const groupByTargetGeneration = (records) => {
-  const groups = new Map();
-  for (const record of records) {
-    const target = record.target_channel_generation_id ?? "__legacy_active__";
-    if (!groups.has(target)) groups.set(target, []);
-    groups.get(target).push(record);
-  }
-  return [...groups.entries()];
-};
-
 /**
- * 兜底定时器可能正好在排空同一个 outbox。等它一小会儿而不是抢 ——
- * 它只需要几秒，而这边一旦抢跑，同一批进展会被发两遍。
+ * **发布等待预算**：兜底定时器可能正好在排空同一个 outbox，等它而不是抢。
+ * 预算语义与资格恢复共用同一份解析（有限、非负、封顶、不合规回落默认）。
+ * 默认 15s —— 盖得住竞争方持锁做真实网络发布的典型 12s。
  */
-async function waitForPublishLock(tries = 10, gapMs = 1500) {
-  for (let i = 0; i < tries; i += 1) {
+const PUBLISH_WAIT_DEFAULT_MS = 15_000;
+const publishWaitMs = boundedBudgetMs(
+  process.env.FEISHU_BRIDGE_PUBLISH_WAIT_MS, { def: PUBLISH_WAIT_DEFAULT_MS, max: 120_000 });
+
+async function waitForPublishLock() {
+  const deadline = Date.now() + publishWaitMs;
+  for (;;) {
     const r = acquirePublishLock(PUBLISH_LOCK);
     if (r.ok) return r;
-    await sleep(gapMs);
+    if (Date.now() >= deadline) return { ok: false, reason: "publisher_busy" };
+    await sleep(Math.min(1500, Math.max(50, deadline - Date.now())));
   }
-  return { ok: false, reason: "publisher_busy" };
 }
 
 while (true) {
@@ -120,133 +112,111 @@ while (true) {
     const mapping = resolved.mapping;
     const run = scanRuns({ runsDir: RUNS }).find((r) => r.key === key);
 
-    // 排空 outbox 前先拿发布锁：会话结束钩子和兜底定时器都会排空同一个 outbox。
-    // 锁必须罩住 listPending→publish→markSent 整段，否则两边会各读到同一批 pending。
+    // ============ 两条发布通道（R2b1 定稿的显式语义） ============
+    //
+    // **run 结果是事务外的第二条通道**（第 6 层评审给的例外）：
+    // 它不是 outbox 记录，有独立来源（runs 目录）和独立回执（markPublished），
+    // outbox 损坏或锁被占都不该扣着执行结果不发。
+    //
+    // 锁语义（计划文档 R2b1 验收点，在此定稿）：
+    //   · 两条通道**尽力共锁**：预算内（默认 15s，FEISHU_BRIDGE_PUBLISH_WAIT_MS
+    //     可调）等同一把发布锁，拿到后 run 先发、release 后 outbox 走事务。
+    //   · 预算耗尽：**run 无锁单发**（维持既有契约 —— 它有独立回执与独立的
+    //     绑定账本锁，双发风险为零；扣着执行结果的代价大得多）；
+    //     **outbox 永不无锁**（那半是双发风险所在），本轮让给持锁方。
+    const rotationHook = claudeRotationBatchHook({
+      root: ROOT,
+      claudeSessionId: resolved.claudeSessionId ?? mapping.claude_session_id ?? claudeSessionId,
+    });
+    const autoOk = cfg.auto_publish_on_completion !== false;
+
+    // —— 通道一：run 结果 ——
     const publishLock = await waitForPublishLock();
     try {
-      // 本次 run 期间任务记下的进展，和这次的执行结果合并成一条发。
-      // 分两条发意味着 Frank 一次指令要收三条消息（已受理 + 结果 + 进展），太吵。
-      //
-      // 等不到锁就只发执行结果，进展那一半让给正在排空的那一方：
-      // 代价是 Frank 收到两条而不是一条，而扣着执行结果不发的代价大得多。
-      // **outbox 说不清就整批不带，但当轮 run 结果照发。**
-      //
-      // 这是评审明确给的例外：run 结果不是 outbox 记录，它有独立来源和回执 ——
-      // 因为本地 outbox 里躺着一个坏文件就扣着执行结果不发，代价大得多。
-      // 但 outbox 那一半必须**整批拒绝并点名**，不许"跳过坏的、把其余照发"。
-      let failingBatch = null;
-      const outboxBlocked = publishLock.ok
-        ? outboxMutationBlocker(auditOutbox(OUTBOX)) : null;
-      // **被永久拒绝的这里也要跳过。**判据跟排空共用一份。
-      //
-      // 评审实测：watcher 直接把整个 listPending() 塞进发布批次 ——
-      // 于是"不会再自动重试"只对 drainProject 成立，**入站完成后的 watcher 会绕过它**。
-      // 一个共用判据只要还有第二条路绕过去，它就不叫共用。
-      const pendingOutbox = (publishLock.ok && !outboxBlocked)
-        ? listPending({ outboxDir: OUTBOX }).filter((r) => !isPermanentlyRejected(r)) : [];
-      if (outboxBlocked) {
-        // **措辞要收窄。**上一版无条件说"执行结果照常发"，
-        // 而真正发不发还受 run.shouldPublish 和自动发布开关约束 ——
-        // 说死了就会在它其实没发的时候骗人。
-        console.error("本地 outbox 有问题（" + outboxBlocked.reason +
-          ((outboxBlocked.files ?? []).length ? "：" + outboxBlocked.files.join("、") : "") +
-          "）——**这一批 outbox 内容没有发送**（这不是飞书故障，重试没用）。" +
-          "本轮执行结果不受影响，按原有条件处理。");
-      }
-
-      const records = [];
-      if (run?.shouldPublish) {
-        const d = buildDraft(run, { taskName: cfg.task_display_name });
-        if (d) records.push({
-          kind: run.state === "completed" ? "reply" : "risk",
-          text: d,
-          source: "claude-run-watcher",
-          target_channel_generation_id: originGenerationId,
-          run_id: key,
-          _run: true,
-        });
-      }
-      records.push(...pendingOutbox);
-
-      if (records.length > 0 && cfg.auto_publish_on_completion !== false) {
-        try {
-          // 身份从配置推，跟主出站路径走同一个解析；发之前 publishDraft 会校验凭据归属。
-          const ident = resolveLarkIdentity(cfg);
-          const mids = [];
-          for (const [targetKey, targetRecords] of groupByTargetGeneration(records)) {
-            const target = resolveMappingOutboundGeneration(
-              mapping,
-              targetKey === "__legacy_active__" ? null : targetKey,
-            );
+      if (run?.shouldPublish && autoOk) {
+        const draft = buildDraft(run, { taskName: cfg.task_display_name });
+        if (draft) {
+          const runRecord = {
+            kind: run.state === "completed" ? "reply" : "risk",
+            text: draft,
+            source: "claude-run-watcher",
+            target_channel_generation_id: originGenerationId,
+            run_id: key,
+          };
+          if (!publishLock.ok) {
+            console.error("发布锁等了 " + publishWaitMs + "ms 没等到 —— " +
+              "run 结果按既有契约**无锁单发**（独立回执，零双发风险）；" +
+              "outbox 那一半本轮让给持锁方。");
+          }
+          try {
+            const ident = resolveLarkIdentity(cfg);
+            const target = resolveMappingOutboundGeneration(mapping, originGenerationId);
             if (!target.ok) throw new Error("冻结的出站话题代际不可用（" + target.reason + "）");
-            for (const batch of outboundCardBatches(targetRecords)) {
-              // 记住正在发哪一批：失败要**给这一批**记账，不是给全部待发。
-              failingBatch = batch;
-              const mid = publishDraft({
-                profile: ident.profile,
-                rootMessageId: target.rootMessageId,
-                card: composeOutboundCard(batch, { taskName: cfg.task_display_name, runtime: "claude" }),
-                larkBin: ident.bin,
-                larkHome: ident.configDir,
-                expectedAppId: ident.expectedAppId,
-              });
-              for (const activity of businessActivitiesForPublishedBatch(batch, {
-                messageId: mid, runtime: "claude",
-              })) {
-                recordClaudeActivityAndMaybeRotate({
-                  root: ROOT,
-                  claudeSessionId: resolved.claudeSessionId ?? mapping.claude_session_id ?? claudeSessionId,
-                  generationId: target.channelGenerationId,
-                  ...activity,
-                });
-              }
-              // 每张成功后立刻标记。后续卡片失败时，已送达的回合不会在重试中重复发送。
-              if (batch.some((record) => record._run === true)) {
-                markPublished({ runsDir: RUNS, key, messageId: mid });
-              }
-              for (const record of batch.filter((item) => item._file)) markSent(record, mid);
-              mids.push(mid);
+            const mid = publishDraft({
+              profile: ident.profile,
+              rootMessageId: target.rootMessageId,
+              card: composeOutboundCard([runRecord], { taskName: cfg.task_display_name, runtime: "claude" }),
+              larkBin: ident.bin,
+              larkHome: ident.configDir,
+              expectedAppId: ident.expectedAppId,
+            });
+            // 回执先落（防重发压倒一切），轮转记账失败只记缺口不回滚。
+            markPublished({ runsDir: RUNS, key, messageId: mid });
+            try { rotationHook({ batch: [runRecord], target, messageId: mid }); }
+            catch (hookErr) {
+              console.error("run 结果已送达（" + mid + "），但轮转记账失败：" +
+                String(hookErr?.message ?? hookErr).slice(0, 200));
             }
+            console.log("published run " + key.slice(0, 8) + " -> " + mid);
+          } catch (err) {
+            // run 通道失败：留痕、不伪造送达。分类与重试保护不适用 —— 它不是 outbox 记录。
+            fs.writeFileSync(path.join(RUNS, key + ".publish-failed.json"),
+              JSON.stringify({ at: new Date().toISOString(),
+                error: String(err.message).slice(0, 500) }, null, 2));
+            console.error("run 结果发布失败: " + String(err.message).slice(0, 300));
           }
-          console.log("published " + key.slice(0, 8) + " -> " + (mids.at(-1) ?? "none") +
-            " (cards=" + mids.length + ", run=" + (run?.shouldPublish ? "yes" : "no") +
-            ", outbox=" + pendingOutbox.length + ")");
-        } catch (err) {
-          // 当前失败批次不标记；此前已经成功并逐批落标的卡片不会被下一轮重复发送。
-          // 留痕给人工，但绝不伪造已送达。
-          fs.writeFileSync(path.join(RUNS, key + ".publish-failed.json"),
-            JSON.stringify({ at: new Date().toISOString(), error: String(err.message).slice(0, 500) }, null, 2));
-
-          // **失败也要走同一套记账。**
-          //
-          // 上一版 watcher 只写 run 失败回执就完了 —— 评审用真实进程连造 6 次失败，
-          // 失败计数字段仍然不存在。于是"五次上限"**只约束排空、不约束
-          // watcher**，同一条记录照样可以被无限自动重试。
-          // 过滤掉已暂停的只挡住了一半：不记账就永远到不了"已暂停"。
-          //
-          // 锁还在手里（catch 在 try 内、finally 之前），跟抑制、资格提升共用那把锁。
-          // 判定只喂**可信响应** —— 卡片正文会进命令回显，用它判定等于让内容
-          // 决定自己的命运。
-          const failure = normalizePublishFailure(err);
-          const retryability = publishRetryability(failure);
-          const paused = [];
-          for (const record of (failingBatch ?? []).filter((item) => item._file)) {
-            try {
-              const outcome = recordPublishFailure(record, {
-                permanent: retryability.permanent,
-                reason: retryability.reason + "：" + failure.display,
-              });
-              if (outcome.paused) paused.push(path.basename(String(record._file)));
-            } catch { /* 记不上不算失败：下一轮还会再撞一次，但不会更坏 */ }
-          }
-          console.error("publish failed" +
-            (paused.length > 0
-              ? "（这几条已暂停自动重试：" + paused.join("、") + "）"
-              : "（outbox 保留待重试）") + ": " + err.message);
         }
       }
     } finally {
       if (publishLock.ok) releasePublishLock(PUBLISH_LOCK);
+    }
+
+    // —— 通道二：outbox（永不无锁；锁、快照、审计、选择、记账全在事务里） ——
+    if (autoOk) {
+      const r2 = publishOutboxAttempt({
+        outboxDir: OUTBOX,
+        lockDir: PUBLISH_LOCK,
+        policy: "all_unpaused",
+        batchCards: outboundCardBatches,
+        resolveTarget: (generationKey) => resolveMappingOutboundGeneration(mapping, generationKey),
+        composeCard: (batch) => composeOutboundCard(batch, {
+          taskName: cfg.task_display_name, runtime: "claude",
+        }),
+        publishBatch: ({ target, card }) => {
+          const ident = resolveLarkIdentity(cfg);
+          return publishDraft({
+            profile: ident.profile, rootMessageId: target.rootMessageId, card,
+            larkBin: ident.bin, larkHome: ident.configDir, expectedAppId: ident.expectedAppId,
+          });
+        },
+        onBatchPublished: rotationHook,
+      });
+      if (r2.status === "published") {
+        console.log("published outbox " + key.slice(0, 8) + " -> " + r2.messageId +
+          " (cards=" + r2.messageIds.length + ")" + postDeliveryBits(r2));
+      } else if (r2.status === "skipped") {
+        console.error("outbox 这一半没发（" + r2.reason + "）—— 让给持锁方，进展留在 outbox。");
+      } else if (r2.status === "error" && r2.local === true) {
+        console.error("本地 outbox 有问题（" + (r2.reason ?? "说不清") +
+          ((r2.files ?? []).length ? "：" + r2.files.join("、") : "") +
+          "）——**这一批 outbox 内容没有发送**（这不是飞书故障，重试没用）。" +
+          "本轮执行结果不受影响，已按通道一处理。");
+      } else if (r2.status === "error") {
+        console.error("outbox 发布失败" +
+          ((r2.markedRejected ?? []).length > 0
+            ? "（这几条已暂停自动重试：" + r2.markedRejected.join("、") + "）"
+            : "（进展保留待重试）") + ": " + (r2.error ?? r2.reason) + postDeliveryBits(r2));
+      }
     }
     finishUp();
     process.exit(0);

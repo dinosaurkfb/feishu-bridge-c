@@ -185,6 +185,8 @@ export function runRouteSha256({ bindingId, claudeSessionId, originGenerationId,
 
 // runs 目录里受控的条目形状（key + 已知 sidecar；.tmp.* 是原子落盘的中间态）。
 const RUN_ENTRY_RE = /^([0-9a-f]{64})\.(jsonl|published\.json|publish-failed\.json|publish-claim\.json|publish-claim\.json\.reaplock|stderr\.log|watch\.log|forward\.jsonl|forward\.stderr\.log|(?:published\.json|publish-failed\.json)\.tmp\.[^/]+)$/u;
+// 转发型记录（live-session 投递）允许的全部 sidecar；多一样都是冲突。
+const FORWARD_KINDS = new Set(["forward.jsonl", "forward.stderr.log", "terminal"]);
 // delivery-claims 目录里受控的条目形状。
 const CLAIM_ENTRY_RE = /^([0-9a-f]{64})\.(claim|handed_off\.json|failed\.json|notes\.log)$/u;
 
@@ -233,7 +235,19 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
   }
   const runs = [];
   for (const [key, kinds] of byKey) {
+    // **转发型先判、且在 jsonl 判断之外**：只要有 forward 制品，就按封闭集合 {forward.jsonl, forward.stderr.log, terminal}
+    // 核对完整集合 —— 主 run 的 <key>.jsonl 也算集合之外的东西（两种模式并存不可能正常产出，评审探针）。
+    // 只有 stderr 没有主制品 → forward_incomplete；多出任何 kind → forward_run_conflict；恰好子集 → 正常转发型，不进 run 通道。
+    if (kinds.has("forward.jsonl") || kinds.has("forward.stderr.log")) {
+      const extra = [...kinds].filter((k) => !FORWARD_KINDS.has(k));
+      if (!kinds.has("forward.jsonl")) problems.push({ key, reason: "forward_incomplete", why: "转发型主制品缺席，只剩：" + [...kinds].join("、") });
+      else if (extra.length > 0) problems.push({ key, reason: "forward_run_conflict", why: "转发型 key 旁多出别的制品：" + extra.join("、") });
+      continue;
+    }
     if (!kinds.has("jsonl")) {
+      // **转发型 run 不是孤儿**：飞书指令投递给现场活跃会话时（live-session.mjs）只写
+      // <key>.forward.jsonl / .forward.stderr.log，终局由那个会话自己的 Stop 钩子收口 ——
+      // 按设计就没有 <key>.jsonl，也不走 run 通道。真机安装后第五区曾把 19 条这种记录报成孤儿。
       // 没有 run 制品却有它的终局记录 / 回执 / 失败账 —— 孤儿，不能消失。
       const which = [...kinds];
       if (kinds.has("terminal")) problems.push({ key, reason: "orphan_terminal_record", why: "run 制品缺席，只剩：" + which.join("、") });

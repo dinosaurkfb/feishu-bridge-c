@@ -29,6 +29,7 @@ import {
   acquireClaim, claimKey, readClaim, readClaimState, readWatcherExpectEnv,
   recordClaimState, watcherExpectEnv,
 } from "./claim.mjs";
+import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.mjs";
 import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
@@ -15371,11 +15372,16 @@ test("第五区 run 通道：只转述 inspectRunChannel 的结论 —— 未查
   const unresolved = { phase: "unresolved", reason: "not_bound", inventoryOk: true, waiting: { count: 2, oldestMs: null },
     runs: { pending: 2, published: [], skipped: [], stuck: [], deliveredUnrecorded: [], problems: [] } };
   assert.deepEqual(rowsOf(unresolved), [["run 通道", "说不清（not_bound）；账本里有 2 条待处理"], ["runs 账本", "无异常"]]);
+  // 解析不出的项目，盘点里 key 为 null 的问题（不认识的条目 / claims 目录读不出）照样一条不漏（评审探针）。
+  const unresolvedWithProblem = { ...unresolved, waiting: { count: 0, oldestMs: null },
+    runs: { ...unresolved.runs, pending: 0, problems: [{ key: null, reason: "unrecognized_entry", why: "runs/unknown-entry" }] } };
+  assert.deepEqual(rowsOf(unresolvedWithProblem), [["run 通道", "说不清（not_bound）；账本里有 0 条待处理"],
+    ["runs 账本", "说不清 1 处"], ["  --------", "unrecognized_entry：runs/unknown-entry"]]);
   // 绑定暂停：排空不分类 stuck —— 明写"暂停中未分类"，不许显示"卡住 0 条"。
   const paused = { phase: "paused", reason: "mapping_not_active", inventoryOk: true, waiting: { count: 1, oldestMs: null },
     runs: { pending: 1, published: [], skipped: [], stuck: [], deliveredUnrecorded: [], problems: [] } };
   const pausedRows = rowsOf(paused);
-  assert.equal(pausedRows[0][1], "暂停中未分类：1 条待处理（恢复绑定后由排空分类并发出）");
+  assert.equal(pausedRows[0][1], "暂停中未分类：1 条待处理（恢复绑定后由排空分类处理，符合条件的再发出）");
   assert.equal(pausedRows.some((r) => r[0] === "run 卡住"), false, "**暂停时不许伪造\"卡住 0 条\"**");
   // 已分类：待发条数 + 最老一条年龄；卡住逐条带 reason；问题逐条；key 只留 8 位；why 里的 key / 消息 id 脱敏。
   const K = "0123456789abcdef".repeat(4);
@@ -15398,7 +15404,16 @@ test("第五区 run 通道：只转述 inspectRunChannel 的结论 —— 未查
   assert.equal(rendered.includes("f".repeat(64)), false, "**完整 key 不许出现**");
   assert.equal(rendered.includes("om_secret123"), false, "**消息 id 是 locator，不许出现**");
   assert.equal(rendered.includes("om_delivered"), false);
-  assert.equal(redactRunText("x " + K + " y om_abc"), "x 01234567… y om_…");
+  // 净化规则只有一份（display-safe.mjs）：逐类字面期望 —— 每种 locator、64 位摘要、UUID、控制字符、行分隔符、双向控制符。
+  const ESC = String.fromCharCode(27);
+  assert.equal(redactRunText("x " + K + " y om_abcdef"), "x 01234567… y om_…");
+  assert.equal(redactLocators("cli_app123456 oc_chat123456 ou_user123456 on_union123456 session_123456 thread_123456 omt_topic123456 om_x12345"),
+    "cli_… oc_… ou_… on_… session_… thread_… omt_… om_…");
+  assert.equal(redactLocators("01911111-2222-7333-8444-555555555555 " + "A".repeat(64)), "01911111… AAAAAAAA…");
+  assert.equal(redactLocators("om_ab oc_12345"), "om_ab oc_12345", "主体不足 6 位的不是 locator 形状，不动");
+  assert.equal(sanitizeForDisplay("a" + String.fromCharCode(10) + "b" + ESC + "[2Jc" + String.fromCharCode(0x2028) + "d" + String.fromCharCode(0x61c) + "e" + String.fromCharCode(0x9f) + "f"),
+    "a\uFFFDb\uFFFD[2Jc\uFFFDd\uFFFDe\uFFFDf");
+  assert.equal(displaySafe("runs/evil" + ESC + "[2J-" + "b".repeat(64) + ".jsonl"), "runs/evil\uFFFD[2J-bbbbbbbb….jsonl", "未识别文件名：控制符压平 + 摘要脱敏");
   // 渲染进第五区（真实渲染函数）。
   assert.match(text(classified), /待处理事件[\s\S]*run 待发[\s\S]*run 卡住[\s\S]*ffffffff/u);
 });
@@ -15469,6 +15484,16 @@ test("真实 feishu-status：第五区报 run 通道的待发 / 卡住 / 账本�
   try { blind = run(); } finally { fs.chmodSync(runs, 0o700); }
   assert.match(blind.stdout, /run 通道[　 ]+说不清（runs_unreadable/u, blind.stdout);
   assert.doesNotMatch(blind.stdout, /run 待发/u);
+  // 未绑定的项目：解析不出也要把 runs 账本里的问题报出来（评审探针：曾同时显示"0 条待处理"和"账本无异常"）。
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-status-unbound-"));
+  const bareRuns = path.join(bare, ".runtime-data", "inbound", "runs");
+  fs.mkdirSync(bareRuns, { recursive: true });
+  fs.writeFileSync(path.join(bareRuns, "unknown-entry"), "x");
+  const unbound = spawnSync(process.execPath, [path.resolve("scripts", "feishu-status.mjs"), "--project", bare],
+    { encoding: "utf-8", env: { ...env, HOME: bare, FEISHU_BRIDGE_REGISTRY: path.join(bare, "registry.json") }, timeout: 60_000 });
+  assert.equal(unbound.status, 0, unbound.stderr);
+  assert.match(unbound.stdout, /run 通道[　 ]+说不清（not_bound）；账本里有 0 条待处理/u, unbound.stdout);
+  assert.match(unbound.stdout, /runs 账本[　 ]+说不清 1 处[\s\S]*unrecognized_entry：runs\/unknown-entry/u, unbound.stdout);
 });
 
 test("claim 写原语：扩展对象覆盖不了固定身份字段", () => {

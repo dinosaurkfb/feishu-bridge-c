@@ -20,6 +20,7 @@
  *     "未自检"，附带的历史证据措辞上必须停在"过去某刻工作过"，不能滑成"在线"。
  */
 
+import { displaySafe } from "./display-safe.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -225,9 +226,8 @@ const OUTBOUND_ROUTING_TEXT = {
  * 一律脱敏。判据不在这里：这个函数只转述 inspectRunChannel 的结论。
  */
 export function redactRunText(text) {
-  return String(text ?? "")
-    .replace(/[0-9a-f]{64}/gu, (m) => m.slice(0, 8) + "…")
-    .replace(/\bom_[A-Za-z0-9_-]+/gu, "om_…");
+  // 一份规则（display-safe.mjs）：压平控制符 + 脱敏所有 locator 形状 / 64 位摘要 / UUID。
+  return displaySafe(text);
 }
 const shortKey = (key) => (typeof key === "string" && key.length > 0 ? key.slice(0, 8) : "--------");
 
@@ -247,7 +247,7 @@ export function runChannelRows(rc, now = Date.now()) {
   if (rc.phase === "unresolved") {
     rows.push(["run 通道", "说不清（" + String(rc.reason ?? "unresolved") + "）；账本里有 " + (rc.waiting?.count ?? 0) + " 条待处理"]);
   } else if (rc.phase === "paused") {
-    rows.push(["run 通道", "暂停中未分类：" + (rc.waiting?.count ?? 0) + " 条待处理（恢复绑定后由排空分类并发出）"]);
+    rows.push(["run 通道", "暂停中未分类：" + (rc.waiting?.count ?? 0) + " 条待处理（恢复绑定后由排空分类处理，符合条件的再发出）"]);
   } else {
     const oldest = relative(rc.waiting?.oldestMs, now);
     rows.push(["run 待发", (rc.waiting?.count ?? 0) + " 条" + (oldest && rc.waiting.count > 0 ? "（最老 " + oldest + "）" : "")]);
@@ -260,9 +260,10 @@ export function runChannelRows(rc, now = Date.now()) {
       for (const x of du) rows.push(["  " + shortKey(x.key), redactRunText(x.error ?? "")]);
     }
   }
-  const listed = problems.filter((x) => x.key !== null || rc.phase !== "unresolved");
-  rows.push(["runs 账本", listed.length ? "说不清 " + listed.length + " 处" : "无异常"]);
-  for (const x of listed) rows.push(["  " + shortKey(x.key), x.reason + (x.why ? "：" + redactRunText(x.why) : "")]);
+  // 盘点能读（inventoryOk）时，problems 一条不漏 —— 含 key 为 null 的（不认识的条目、claims 目录读不出）；
+  // 评审探针：未绑定的项目里有个未识别文件，曾被同时说成"0 条待处理"和"账本无异常"。
+  rows.push(["runs 账本", problems.length ? "说不清 " + problems.length + " 处" : "无异常"]);
+  for (const x of problems) rows.push(["  " + shortKey(x.key), x.reason + (x.why ? "：" + redactRunText(x.why) : "")]);
   return rows;
 }
 

@@ -230,6 +230,12 @@ export function redactRunText(text) {
   return displaySafe(text);
 }
 const shortKey = (key) => (typeof key === "string" && key.length > 0 ? key.slice(0, 8) : "--------");
+// why 可能是整条失败命令连卡片正文（真机实测一行几百字）：状态页是给手机看的，展示边界截断。
+const WHY_MAX = 120;
+const clipWhy = (text) => {
+  const safe = redactRunText(text);
+  return safe.length > WHY_MAX ? safe.slice(0, WHY_MAX) + "…（已截断）" : safe;
+};
 
 /**
  * 待处理事件第五区里 run 通道那几行 —— **只转述，不判断**：分类来自 inspectRunChannel（与排空同一份判据）。
@@ -253,17 +259,17 @@ export function runChannelRows(rc, now = Date.now()) {
     rows.push(["run 待发", (rc.waiting?.count ?? 0) + " 条" + (oldest && rc.waiting.count > 0 ? "（最老 " + oldest + "）" : "")]);
     const stuck = rc.runs?.stuck ?? [];
     rows.push(["run 卡住", stuck.length + " 条" + (stuck.length ? "（需要人看）" : "")]);
-    for (const x of stuck) rows.push(["  " + shortKey(x.key), x.reason + (x.why ? "：" + redactRunText(x.why) : "")]);
+    for (const x of stuck) rows.push(["  " + shortKey(x.key), x.reason + (x.why ? "：" + clipWhy(x.why) : "")]);
     const du = rc.runs?.deliveredUnrecorded ?? [];
     if (du.length > 0) {
       rows.push(["run 送达未落标", du.length + " 条（下一轮可能重发，先去话题核对）"]);
-      for (const x of du) rows.push(["  " + shortKey(x.key), redactRunText(x.error ?? "")]);
+      for (const x of du) rows.push(["  " + shortKey(x.key), clipWhy(x.error ?? "")]);
     }
   }
   // 盘点能读（inventoryOk）时，problems 一条不漏 —— 含 key 为 null 的（不认识的条目、claims 目录读不出）；
   // 评审探针：未绑定的项目里有个未识别文件，曾被同时说成"0 条待处理"和"账本无异常"。
   rows.push(["runs 账本", problems.length ? "说不清 " + problems.length + " 处" : "无异常"]);
-  for (const x of problems) rows.push(["  " + shortKey(x.key), x.reason + (x.why ? "：" + redactRunText(x.why) : "")]);
+  for (const x of problems) rows.push(["  " + shortKey(x.key), x.reason + (x.why ? "：" + clipWhy(x.why) : "")]);
   return rows;
 }
 

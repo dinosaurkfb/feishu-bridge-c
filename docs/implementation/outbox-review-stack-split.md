@@ -55,7 +55,9 @@ Claude watcher 启动期核当前目的地、run 制品**读不出（非缺席�
 "待发布"（回执 absent），不转交、不另立账本** —— 定时排空充当 run 通道的恢复消费者：
 每轮先看 runs（inventoryRuns 联合盘点：以**第一次目录快照**驱动，对 JSONL / 终局记录 /
 发布回执 / 失败账做 key 并集 —— 孤儿 sidecar、不是 JSON 的终局记录、坏回执都是
-problems，不折叠成空），**只认 watcher 终局记录里明确记载"因绑定暂停而延期发布"的
+problems，不折叠成空；**转发型 run 不是孤儿**：投递给现场活跃会话的指令只写
+`<key>.forward.jsonl`、终局由那个会话的 Stop 钩子收口，按设计没有 `<key>.jsonl`，也不走
+run 通道 —— 真机安装 FR-10 后第五区曾把 19 条这种记录报成孤儿，已修），**只认 watcher 终局记录里明确记载"因绑定暂停而延期发布"的
 run** —— 该记录即授权凭据：终态唯一（handed_off / failed 不许并存）、**语义封闭**
 （handed_off ↔ completed，failed ↔ failed|blocked，observed_by 必须是受控 watcher，
 publish_deferred 恰好 {reason, why, consumer}）、与实际 outcome 相符、绑定 JSONL 字节

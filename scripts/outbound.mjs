@@ -234,6 +234,10 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
   const runs = [];
   for (const [key, kinds] of byKey) {
     if (!kinds.has("jsonl")) {
+      // **转发型 run 不是孤儿**：飞书指令投递给现场活跃会话时（live-session.mjs）只写
+      // <key>.forward.jsonl / .forward.stderr.log，终局由那个会话自己的 Stop 钩子收口 ——
+      // 按设计就没有 <key>.jsonl，也不走 run 通道。真机安装后第五区曾把 19 条这种记录报成孤儿。
+      if (kinds.has("forward.jsonl") || kinds.has("forward.stderr.log")) continue;
       // 没有 run 制品却有它的终局记录 / 回执 / 失败账 —— 孤儿，不能消失。
       const which = [...kinds];
       if (kinds.has("terminal")) problems.push({ key, reason: "orphan_terminal_record", why: "run 制品缺席，只剩：" + which.join("、") });

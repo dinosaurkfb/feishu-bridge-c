@@ -14851,6 +14851,25 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
       assert.equal(r.runs.stuck[0]?.reason, "artifact_mismatch", JSON.stringify(r.runs));
     }
   }
+  // **转发型 run 不是孤儿**：只有 forward.jsonl / forward.stderr.log + 终局记录、没有 <key>.jsonl（live-session 投递按设计如此）→ 零 problems、不进待处理。
+  {
+    const f = mk();
+    const fwd = claimKeyFor("forwarded");
+    fs.writeFileSync(path.join(f.runs, fwd + ".forward.jsonl"), JSON.stringify({ type: "result", result: "sent" }) + "\n");
+    fs.writeFileSync(path.join(f.runs, fwd + ".forward.stderr.log"), "");
+    writeClaimFixture({ claimsDir: f.claims, key: fwd, root: f.h.dir });
+    recordClaimState({ claimsDir: f.claims, key: fwd, state: "handed_off", detail: { mode: "live_session", observed_by: "inbound" } });
+    const inv = inventoryRuns({ runsDir: f.runs, claimsDir: f.claims });
+    assert.deepEqual(inv.problems, [], "**转发型 run 不许被报成孤儿**：" + JSON.stringify(inv.problems));
+    assert.deepEqual(inv.runs, []);
+    const r = f.drain();
+    assert.equal(r.status, "empty", JSON.stringify(r));
+    // 只有终局记录、连 forward 制品都没有的，仍是孤儿。
+    const bare = claimKeyFor("bare-terminal");
+    writeClaimFixture({ claimsDir: f.claims, key: bare, root: f.h.dir });
+    recordClaimState({ claimsDir: f.claims, key: bare, state: "handed_off", detail: { observed_by: "inbound" } });
+    assert.equal(inventoryRuns({ runsDir: f.runs, claimsDir: f.claims }).problems.find((x) => x.key === bare)?.reason, "orphan_terminal_record");
+  }
   // 联合盘点：终局记录坏 JSON（有 run 制品）、只剩发布回执的孤儿、watcher 失败终局的孤儿 —— 都进 problems。
   {
     const f = mk();
@@ -15403,6 +15422,12 @@ test("第五区 run 通道：只转述 inspectRunChannel 的结论 —— 未查
   assert.deepEqual(rows[4], ["run 送达未落标", "1 条（下一轮可能重发，先去话题核对）"]);
   assert.deepEqual(rows[6], ["runs 账本", "说不清 1 处"]);
   assert.deepEqual(rows[7], ["  cccccccc", "terminal_unreadable：cccccccc….handed_off.json：不是 JSON"]);
+  // why 在展示边界截断（真机实测：watcher 失败账把整条 lark 命令连卡片正文带出来，一行几百字）。
+  const longWhy = "Command failed: lark-cli --text " + "正文".repeat(200);
+  const clipped = rowsOf({ ...classified, runs: { ...classified.runs, stuck: [{ key: "a".repeat(64), reason: "watcher_publish_failed", why: longWhy }] } })[2];
+  assert.equal(clipped[1].endsWith("…（已截断）"), true, clipped[1]);
+  assert.ok(clipped[1].length < 160, "**截断后一行要能在手机上读完**：" + clipped[1].length);
+  assert.equal(clipped[1].startsWith("watcher_publish_failed：Command failed: lark-cli --text 正文"), true);
   const rendered = JSON.stringify(rows);
   assert.equal(rendered.includes("f".repeat(64)), false, "**完整 key 不许出现**");
   assert.equal(rendered.includes("om_secret123"), false, "**消息 id 是 locator，不许出现**");

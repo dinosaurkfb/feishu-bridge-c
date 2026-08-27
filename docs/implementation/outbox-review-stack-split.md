@@ -50,9 +50,11 @@ policy 受控组合、来源代际非空、会话 id 为 uuid；**期望身份�
 Claude watcher 启动期核当前目的地、**终局之后重新解析再核**并用新鲜快照发布
 （运行中关开关 / 绑定漂移 → 零发布、failed{binding_drift}；绑定暂停 → 受控不发布：
 本地终局照记、Dialogue 照收口，run 结果转成冻结到原始代际的 outbox 记录（去重键
-claude:run:<key>:result，同键已有记录须核对 run/代际/正文/来源才算入队），并在 run 侧
-落受验的转交回执 `<key>.deferred.json` —— 发布所有权排他转移，scanRuns 与直发入口
-都不再消费它；恢复后由既有排空恰好发一次。终局三个本地动作（转入 / 落盘 / Dialogue
+claude:run:<key>:result，同键已有记录须核对 run/代际/正文/来源才算入队），转交是**两阶段**：
+先以独占创建取得 run 所有权（`<key>.deferred.json` preparing），再写/核对 outbox，
+最后提交 committed —— preparing 与 committed 都挡住直发，回执写失败也不会两头都能发；
+回执封闭 schema、event key 由读方推导、published 与 deferred 并存报冲突；scanRuns 与
+直发入口（`--root=` 可对任意项目运行）共用这一份判据；恢复后由既有排空恰好发一次。终局三个本地动作（转入 / 落盘 / Dialogue
 收口）各自留痕、互不阻断，锁最后放，任一失败非零退出并点名；有效绑定身份的唯一投影
 effectiveBindingId 住在 topic-generation.mjs，claim 写入、期望 env、watcher 复核、
 Dialogue 存储（含锁内重读）、控制面共用；锁按阶段：启动期拒绝留锁交

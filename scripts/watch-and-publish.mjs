@@ -15,8 +15,8 @@ import path from "node:path";
 
 import { readRunOutcome } from "./handoff.mjs";
 import {
-  buildDraft, claimRunPublish, markDeferredToOutbox, markPublished, publishDraft, readRunReceipt,
-  releaseRunPublishClaim, scanRuns,
+  buildDraft, claimRunPublish, commitDeferral, deferralEventKeyFor, markPublished, prepareDeferral,
+  publishDraft, readRunReceipt, releaseRunPublishClaim, scanRuns,
 } from "./outbound.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { claudeRotationBatchHook } from "./drain-outbox.mjs";
@@ -84,14 +84,17 @@ const finishUp = () => fs.rmSync(LOCK, { recursive: true, force: true });
 function outboxEventMatches(outboxDir, eventKey, expect) {
   let names;
   try { names = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json")); } catch { return false; }
+  // **恰好一条完整合法记录** —— 第一条同键就返回的话，再有一条伪造的同键文件也看不见。
+  const hits = [];
   for (const name of names) {
     let rec;
     try { rec = JSON.parse(fs.readFileSync(path.join(outboxDir, name), "utf-8")); } catch { continue; }
-    if (rec?.event_key !== eventKey) continue;
-    return rec.run_id === expect.run_id && rec.source === expect.source && rec.text === expect.text
-      && (rec.target_channel_generation_id ?? null) === expect.target_channel_generation_id;
+    if (rec?.event_key === eventKey) hits.push(rec);
   }
-  return false;
+  if (hits.length !== 1) return false;
+  const rec = hits[0];
+  return rec.run_id === expect.run_id && rec.source === expect.source && rec.text === expect.text
+    && (rec.target_channel_generation_id ?? null) === expect.target_channel_generation_id;
 }
 // **claim 三态：说不清就不猜。**这里的 claim 不只决定来源代际，还决定 outbox 归属
 // （会话级绑定靠 claude_session_id）—— 缺席/损坏时上一版落到项目级 outbox、
@@ -228,27 +231,36 @@ while (true) {
       step("run 结果转入 outbox", () => {
         const draft = buildDraft(run, { taskName: cfg.task_display_name });
         if (!draft) return { ok: true };
-        const eventKey = "claude:run:" + key + ":result";
+        const eventKey = deferralEventKeyFor(key);
         const expectRecord = { run_id: key, target_channel_generation_id: originGenerationId ?? null,
           text: draft, source: "claude-run-watcher-deferred" };
+        const fail = (reason) => {
+          deferred = { reason: "mapping_not_active", why: fresh.pausedWhy, outbox_event_key: eventKey,
+            queued: false, append: reason };
+          return { ok: false, reason };
+        };
+        // **两阶段排他转交**：先独占取得 run 所有权（preparing），再写/核对 outbox，最后提交。
+        // 顺序反过来（先 outbox 再回执）时回执写失败就两头都能发；preparing 就已经挡住直发。
+        const prep = prepareDeferral({ runsDir: RUNS, key, originGenerationId });
+        if (!prep.ok) return fail(prep.reason);
+        if (prep.phase === "committed") {
+          // 幂等重入：所有权早已转交，只核对那条记录仍在且就是它。
+          if (!outboxEventMatches(OUTBOX, eventKey, expectRecord)) return fail("committed_without_record");
+          deferred = { reason: "mapping_not_active", why: fresh.pausedWhy, outbox_event_key: eventKey, queued: true };
+          return { ok: true };
+        }
         const r = appendEvent({ outboxDir: OUTBOX, kind: run.state === "completed" ? "reply" : "risk",
           text: draft, source: expectRecord.source, eventKey,
           targetGenerationId: originGenerationId, runId: key });
         if (!r.ok && r.reason === "duplicate") {
-          // 同键已有记录 —— 只凭"文件在"不算入队：核对它确实是这条 run、这个代际、这份正文。
-          if (!outboxEventMatches(OUTBOX, eventKey, expectRecord)) {
-            deferred = { reason: "mapping_not_active", why: fresh.pausedWhy, outbox_event_key: eventKey,
-              queued: false, append: "duplicate_mismatch" };
-            return { ok: false, reason: "duplicate_mismatch" };
-          }
+          // 同键已有记录 —— 只凭"文件在"不算入队：恰好一条、且确实是这条 run / 代际 / 正文。
+          if (!outboxEventMatches(OUTBOX, eventKey, expectRecord)) return fail("duplicate_mismatch");
         } else if (!r.ok) {
-          deferred = { reason: "mapping_not_active", why: fresh.pausedWhy, outbox_event_key: eventKey,
-            queued: false, append: r.reason };
-          return { ok: false, reason: r.reason };
+          return fail(r.reason);
         }
-        // **所有权排他转移**：outbox 记录确认在，run 侧落转交回执 —— 之后 run 通道与
-        // 直发入口都不再消费这条 run（否则 outbox 发过之后它们会再发一次、还发去当前话题）。
-        markDeferredToOutbox({ runsDir: RUNS, key, eventKey, originGenerationId });
+        const commit = commitDeferral({ runsDir: RUNS, key });
+        // 提交失败：outbox 记录已在，但 preparing 回执仍挡着直发 —— 不双发；留人处理。
+        if (!commit.ok) return fail(commit.reason);
         deferred = { reason: "mapping_not_active", why: fresh.pausedWhy, outbox_event_key: eventKey, queued: true };
         return { ok: true };
       });

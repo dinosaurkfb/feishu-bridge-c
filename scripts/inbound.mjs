@@ -316,7 +316,7 @@ if (!dryRun && dialogueAuthorizationShadowEnabled()) {
       runtimeNamespace: "claude",
       model: buildClaudeSubscriptionProjection(),
       legacyKey: routed.id,
-      privateBindingKey: mapping.binding_id,
+      privateBindingKey: effectiveBindingId(mapping, { root: routed.root }),
       bindingStatus: mapping.status,
       verdict,
     });

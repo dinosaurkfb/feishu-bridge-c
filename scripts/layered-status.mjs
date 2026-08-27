@@ -284,7 +284,7 @@ export function composeLayeredStatus({
   // 另一条链（Codex）的第五区行：调用方按自己的只读投影算好传进来；给了就用它，不再按 run 通道渲染。
   pendingRows = null,
 }) {
-  const fifthRows = () => runChannelRows(runChannel, now);
+  const fifthRows = () => (Array.isArray(pendingRows) ? pendingRows : runChannelRows(runChannel, now));
   // 别的链路里能归层的，直接进对应层；归不了的留给附录。
   const split = otherLinks ? splitByRelation(otherLinks.sections) : { byLayer: null, unsorted: [] };
   // **没绑定不等于没有四层。**第 1、2 层照样有事实可报，只是第 3 层还没绑、

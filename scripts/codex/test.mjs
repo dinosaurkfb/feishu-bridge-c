@@ -1932,6 +1932,43 @@ printf '%s' "$prompt" > "$last"
   }
 });
 
+test("run-resume：Codex 0 退出但没写最终输出 → 非零退出、落下封闭的 artifacts_unreadable 回执（真实进程）", () => {
+  // 评审 P2：读取端有合成测试，写入分支没有真实接线守卫。
+  const dir = temp();
+  const fake = path.join(dir, "fake-codex-no-last.sh");
+  fs.writeFileSync(fake, `#!/bin/sh
+cat > /dev/null
+printf '{"type":"thread.started","thread_id":"%s"}\\n' "$EXPECTED_THREAD"
+printf '{"type":"turn.started"}\\n'
+printf '{"type":"turn.completed"}\\n'
+exit 0
+`, { mode: 0o700 });
+  const key = "b".repeat(64);
+  const runsDir = path.join(dir, "runs");
+  fs.mkdirSync(runsDir);
+  const instruction = path.join(dir, "prompt.txt");
+  fs.writeFileSync(instruction, "x");
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "run-resume.mjs"),
+    "--thread-id", THREAD_A, "--project", dir, "--instruction-file", instruction,
+    "--log", path.join(runsDir, key + ".jsonl"), "--stderr", path.join(runsDir, key + ".stderr.log"),
+    "--last-message", path.join(runsDir, key + ".last-message.txt"),
+    "--exit-receipt", path.join(runsDir, key + ".exit.json"),
+    "--claim-key", key, "--codex-bin", fake,
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), EXPECTED_THREAD: THREAD_A } });
+  assert.notEqual(r.status, 0, "摘要算不出来就不是成功退出");
+  const receipt = JSON.parse(fs.readFileSync(path.join(runsDir, key + ".exit.json"), "utf-8"));
+  assert.ok(isCanonicalIso(receipt.recorded_at));
+  assert.ok(typeof receipt.error === "string" && receipt.error.length > 0, "error 要说清");
+  assert.deepEqual({ ...receipt, recorded_at: "<t>", error: "<e>" }, {
+    artifact_type: "codex_run_exit_receipt", schema_version: "1.0", claim_key: key,
+    recorded_at: "<t>", status: "artifacts_unreadable", exit_code: 0, signal: null, error: "<e>",
+  }, "**不许写成 exited** —— 没有最终输出的 run 永远解释不成完成");
+  // 读取端对这张真实回执的结论。
+  const v = verifyCodexRunCredential({ runsDir, claimKey: key, expectedThreadId: THREAD_A });
+  assert.equal(v.state, "failed");
+  assert.equal(v.reason, "artifacts_unreadable");
+});
+
 test("Codex Stop hook：相同正文的两个 turn 各入队一次，同一 turn 重入不重复", () => {
   const home = temp();
   const root = path.join(home, "project");

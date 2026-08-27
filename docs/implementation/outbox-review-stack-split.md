@@ -23,12 +23,13 @@ CLI 只解析显示）；预览打印完整可执行命令过 shellQuote，真 s
 严格参数白名单 + 恰好一个 selector；矩阵新增「手工计划 CAS」场景，其余三份实现
 按 not_applicable 受控申报。`atRecheck` 测试补回 —— 磁盘变坏由审计闸门在更早接住
 （既有测试钉着），该分支现守「锁内重选产出说不清目标的记录」，新测试直驱此路径。
-**第 5 层剩余 · 步骤 1 进行中**（分支 `fix/codex-auto-publish-lifecycle`）：
+**第 5 层剩余 · 步骤 1 已完成**（分支 `fix/codex-auto-publish-lifecycle`，评审三轮）：
 二选一已由评审定为 **(a) 现有终局证据组成受验复合凭据，不新增完成 marker**
 （见 §4.1 决定块）。已做：runner 退出回执补身份绑定（claim_key、封闭 schema、
 规范时间）；`verifyCodexRunCredential` 成为唯一验真入口（路径只从 runsDir + key
 派生）；watcher 初始路径补 `requireRunId`；恢复消费者下沉到 `scripts/codex/`
 并在授权前验 run 复合凭据（两个制品各自验，AND 不是 OR）。
+内容绑定（成功回执封两份 SHA-256，验真器每份制品只读一次）见 §4.1 更正。
 待做：步骤 2 —— `eligibility_pending` 恢复链之外的 watcher 接线复核。
 
 集成基准分支：`integration/outbox-review-baseline`（原 `feat/outbox-review`，9 笔提交）。

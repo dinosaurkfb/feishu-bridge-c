@@ -14360,6 +14360,9 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
       'if (mode === "rotate") {',
       '  const p = path.join(rt, "active-mapping.json");',
       '  fs.writeFileSync(p, JSON.stringify({ ...JSON.parse(fs.readFileSync(p, "utf-8")), binding_id: "rotated-binding" }));',
+      '} else if (mode === "pause") {',
+      '  const p = path.join(rt, "active-mapping.json");',
+      '  fs.writeFileSync(p, JSON.stringify({ ...JSON.parse(fs.readFileSync(p, "utf-8")), status: "paused" }));',
       '} else {',
       '  const p = path.join(rt, "chain-config.json");',
       '  fs.writeFileSync(p, JSON.stringify({ ...JSON.parse(fs.readFileSync(p, "utf-8")), auto_publish_on_completion: false }));',
@@ -14382,7 +14385,19 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
     "binding_drift");
   assert.equal(fs.existsSync(path.join(rotate.rt, "delivery-claims", rotate.key + ".handed_off.json")), false,
     "终局期核对在 handed_off 之前");
-  assert.equal(fs.existsSync(rotate.lock), true, "锁保留");
+  assert.equal(fs.existsSync(rotate.lock), false, "**终局期 run 已结束，锁要放掉** —— 留着只是一把陈旧锁");
+
+  // 运行中把绑定暂停：受控的"不发布"，跟排空路径同一条规矩 —— 不是漂移。
+  const pause = orchestrate("pause");
+  assert.equal(pause.got.code, 2, "暂停中不发：" + pause.got.out);
+  assert.match(pause.got.out, /mapping_not_active/u, "要报成 mapping_not_active，不是 binding_drift");
+  assert.equal(fs.existsSync(pause.argsFile), false, "**零 lark 调用**");
+  assert.equal(fs.existsSync(path.join(pause.rt, "runs", pause.key + ".published.json")), false, "无发布回执");
+  const pausedRec = JSON.parse(fs.readFileSync(path.join(pause.rt, "delivery-claims", pause.key + ".failed.json"), "utf-8"));
+  assert.equal(pausedRec.reason, "mapping_not_active");
+  assert.equal(pausedRec.pending_publish, true, "待发内容保留、等恢复后处理 —— 要写明");
+  assert.equal(fs.existsSync(path.join(pause.rt, "runs", pause.key + ".jsonl")), true, "run 结果原样保留");
+  assert.equal(fs.existsSync(pause.lock), false, "run 已结束，锁放掉");
 
   const flip = orchestrate("flip");
   assert.equal(flip.got.code, 0, "开关关了不是故障，是不发：" + flip.got.out);

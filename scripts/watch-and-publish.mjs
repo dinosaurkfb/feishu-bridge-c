@@ -127,14 +127,28 @@ function resolveAndCheck(stage) {
   const nowSession = resolved.claudeSessionId ?? mapping?.claude_session_id ?? null;
   if (nowSession !== EXPECT_SESSION_ID) problems.push("当前会话跟期望对不上");
   if (problems.length > 0) return { ok: false, reason: "binding_drift", why: stage + "：" + problems.join("；") };
+  // **暂停绑定是受控的"不发布"**，跟排空路径同一条规矩（mapping_not_active）：
+  // 话题可能已经不再是 Frank 认可的那个。两条发布通道（run 结果 / outbox）都不发，
+  // 待发内容原样保留，恢复后再处理。评审探针：启动时 active、运行中改成暂停、
+  // 再写终局 —— 只看自动发布开关的话照发。
+  if (mapping?.status !== "active") {
+    return { ok: false, reason: "mapping_not_active", why: stage + "：绑定状态 " + String(mapping?.status) };
+  }
   return { ok: true, resolved, cfg, mapping };
 }
-const refuse = (check) => {
+/**
+ * 拒绝并退出。**锁按阶段处理**：启动期 runner 可能仍存活，锁保留交陈旧检测；
+ * 终局期 run 已确认结束，再留锁只会制造一把等下次请求清理的陈旧锁 —— 放掉。
+ */
+const refuse = (check, { terminal = false } = {}) => {
   try {
     recordClaimState({ claimsDir: CLAIMS, key, state: "failed",
-      detail: { reason: check.reason, why: check.why, observed_by: "watch-and-publish" } });
+      detail: { reason: check.reason, why: check.why, observed_by: "watch-and-publish",
+        ...(terminal ? { run_finished: true, pending_publish: check.reason === "mapping_not_active" } : {}) } });
   } catch { /* 记不上不改变结论 */ }
-  console.error("这一轮不发布（" + check.reason + "：" + check.why + "）。session lock 保留。");
+  if (terminal) finishUp();
+  console.error("这一轮不发布（" + check.reason + "：" + check.why + "）。" +
+    (terminal ? "run 已结束，session lock 已释放。" : "session lock 保留。"));
   process.exit(2);
 };
 const startup = resolveAndCheck("启动期");
@@ -171,7 +185,7 @@ while (true) {
     // 启动期那份 cfg/mapping 最长会被复用四小时 —— 评审探针：运行中把
     // auto_publish_on_completion 改成 false，watcher 仍照发。暂停绑定、撤销同理。
     const fresh = resolveAndCheck("终局期");
-    if (!fresh.ok) refuse(fresh);
+    if (!fresh.ok) refuse(fresh, { terminal: true });
     const cfg = fresh.cfg;
     const mapping = fresh.mapping;
     const resolved = fresh.resolved;

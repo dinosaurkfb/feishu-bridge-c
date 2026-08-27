@@ -50,7 +50,7 @@ import {
 } from "./outbound-card.mjs";
 import {
   PUBLISH_FAILURE, claimRunPublish, classifyPublishFailure, readRunReceipt,
-  releaseRunPublishClaim, scanRuns, prepareDeferral, commitDeferral, deferralEventKeyFor, buildDraft } from "./outbound.mjs";
+  releaseRunPublishClaim, scanRuns, prepareDeferral, commitDeferral, deferralEventKeyFor, buildDraft, abandonDeferral, completePendingDeferrals, deferRunToOutbox, parseDirectPublishArgs } from "./outbound.mjs";
 import { repairRunClaims } from "./repair-run-claim.mjs";
 import {
   describeDrainOutcome, drainProject, outboxDirOf, suppressCmd, watcherActive,
@@ -159,6 +159,7 @@ import {
   analyzeDialogueShadowEvidence, readDialogueShadowEvidence,
   renderDialogueShadowReadinessReport, validateDialogueShadowReadinessReport,
 } from "./dialogue-shadow-readiness.mjs";
+import { createHash } from "node:crypto";
 import { CANONICAL_TIME_PATTERN, isCanonicalIso } from "./canonical-time.mjs";
 import {
   ATTESTATION_EVIDENCE_MAX_AGE_LIMIT_MS, ATTESTATION_EVIDENCE_MAX_AGE_MS,
@@ -12856,7 +12857,12 @@ const watcherMatrixRunner = {
       "const mode = fsx.readFileSync(" + JSON.stringify(modeFile) + ", 'utf-8').trim();",
       "const markers = fsx.readFileSync(" + JSON.stringify(markersFile) + ", 'utf-8')",
       "  .split('\\n').filter(Boolean);",
-      "if (mode !== 'ok' && markers.some((m) => all.includes(m))) {",
+      "if (mode === 'barrier') {",
+      "  const b = " + JSON.stringify(path.join(dir, "barrier.txt")) + ";",
+      "  const t0 = Date.now();",
+      "  while (!fsx.existsSync(b) && Date.now() - t0 < 20000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);",
+      "}",
+      "if (mode !== 'ok' && mode !== 'barrier' && markers.some((m) => all.includes(m))) {",
       "  if (mode === 'fail-opaque') { process.stderr.write('boom-opaque: 说不清'); }",
       "  if (mode === 'fail-platform') {",
       "    process.stderr.write('ext=ErrCode: 11310; ErrMsg: card table number over limit');",
@@ -14382,6 +14388,19 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
       assert.equal(r.ok, true);
       fs.copyFileSync(r.file, path.join(outboxDir, "forged-" + key.slice(0, 8) + ".json"));
     }
+    if (mode === "pause-dup3") {
+      // 四字段碰巧匹配、但缺 schema/id/kind/created_at 的"记录"：排空层会判它损坏 ——
+      // 拿它提交 committed 就是永久停发。必须过正式三态与可解释性校验。
+      const tmpRuns = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-dup3-"));
+      fs.writeFileSync(path.join(tmpRuns, key + ".jsonl"),
+        JSON.stringify({ type: "result", is_error: false, result: "运行中改了" }) + "\n");
+      const cfg = JSON.parse(fs.readFileSync(path.join(rt, "chain-config.json"), "utf-8"));
+      const draft = buildDraft(scanRuns({ runsDir: tmpRuns }).find((r) => r.key === key), { taskName: cfg.task_display_name });
+      fs.mkdirSync(outboxDir, { recursive: true });
+      fs.writeFileSync(path.join(outboxDir, "event-" + createHash("sha256").update("event\n" + deferralEventKeyFor(key)).digest("hex").slice(0, 16) + ".json"),
+        JSON.stringify({ event_key: deferralEventKeyFor(key), run_id: key, source: "claude-run-watcher-deferred",
+          text: draft, target_channel_generation_id: "gen-1", published_at: null }));
+    }
     const probe = path.join(h.dir, "commit-fail-probe.mjs");
     if (mode === "pause-commitfail") {
       // 探针：outbox 正常写入，随后**提交回执**的 rename 失败（EACCES）——
@@ -14471,7 +14490,7 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
   const direct = spawnSync(process.execPath, [path.resolve("scripts", "outbound.mjs"), "--root=" + pause.root],
     { encoding: "utf-8", env: { ...process.env, HOME: pause.root }, timeout: 60_000 });
   assert.equal(direct.status, 0, direct.stderr);
-  assert.match(direct.stdout, /已转 outbox（committed）/u, "**直发入口要把它列为已转交**：" + direct.stdout);
+  assert.match(direct.stdout, /已转 outbox/u, "**直发入口要把它列为已转交**：" + direct.stdout);
   assert.match(direct.stdout, /待发布 0 条/u, direct.stdout);
   const queued = listPending({ outboxDir: pause.outbox });
   assert.equal(queued.length, 1, "run 结果要转成恰好一条 outbox 记录");
@@ -14507,24 +14526,51 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
   assert.equal(dupHanded.run_state, "completed", "终局照记");
   assert.equal(dupHanded.publish_deferred?.queued, false, "**只凭同键文件在不算入队**");
   assert.equal(readRunReceipt({ runsDir: dup.runs, key: dup.key }).phase, "preparing", "所有权已取得但未提交");
-  assert.equal(scanRuns({ runsDir: dup.runs }).find((r) => r.key === dup.key).shouldPublish, false,
-    "**preparing 也挡住直发**");
+  const dupScan = scanRuns({ runsDir: dup.runs }).find((r) => r.key === dup.key);
+  assert.equal(dupScan.shouldPublish, false, "**preparing 也挡住直发**");
+  assert.equal(dupScan.deferredToOutbox, false, "preparing 不许显示成已转 outbox");
+  assert.equal(dupScan.deferralPending, true);
+  assert.equal(claimRunPublish({ runsDir: dup.runs, key: dup.key }).ok, true, "失败退出后 claim 已释放");
   assert.equal(fs.existsSync(dup.lock), false, "锁照放");
   assert.equal(fs.existsSync(dup.argsFile), false, "零 lark");
 
   // outbox 不可写：转入抛错不能截断终局落盘与放锁。
   const ro = orchestrate("pause-ro");
   assert.equal(ro.got.code, 1, ro.got.out);
-  assert.match(ro.got.out, /以下环节没完成.*run 结果转入 outbox/u, ro.got.out);
+  assert.match(ro.got.out, /以下环节没完成.*run 结果转入 outbox（outbox_write_failed）/u, ro.got.out);
   assert.equal(JSON.parse(fs.readFileSync(path.join(ro.rt, "delivery-claims", ro.key + ".handed_off.json"), "utf-8"))
     .run_state, "completed", "**outbox 抛了也要把 run 终局记下**");
   assert.equal(readRunReceipt({ runsDir: ro.runs, key: ro.key }).phase, "preparing", "outbox 没写成，所有权停在 preparing");
   assert.equal(fs.existsSync(ro.lock), false, "**锁要放**");
+  // 直发入口把它列为「转交中（未提交）」，不是「已转 outbox」。
+  const roCli = spawnSync(process.execPath, [path.resolve("scripts", "outbound.mjs"), "--root=" + ro.root],
+    { encoding: "utf-8", env: { ...process.env, HOME: ro.root }, timeout: 60_000 });
+  assert.match(roCli.stdout, /转交中（未提交）/u, roCli.stdout);
+  assert.match(roCli.stdout, /待发布 0 条/u);
+  // **恢复消费者**：把 outbox 目录修好，定时排空补写/核对/提交；暂停中不发，恢复后恰好发一次。
+  fs.rmSync(ro.outbox, { force: true }); fs.mkdirSync(ro.outbox, { recursive: true });
+  let roSent = 0;
+  const roDrain = () => drainProject({ root: ro.root, claudeSessionId: null,
+    publish: () => { roSent += 1; return "om_sent"; }, diagnose: () => null });
+  const recovered = roDrain();
+  assert.equal(recovered.reason, "mapping_not_active", JSON.stringify(recovered));
+  assert.equal(readRunReceipt({ runsDir: ro.runs, key: ro.key }).phase, "committed", "**排空要把 preparing 补齐到 committed**");
+  assert.equal(listPending({ outboxDir: ro.outbox }).length, 1);
+  assert.equal(roSent, 0, "暂停中补齐不发");
+  const roMap = path.join(ro.rt, "active-mapping.json");
+  fs.writeFileSync(roMap, JSON.stringify({ ...JSON.parse(fs.readFileSync(roMap, "utf-8")), status: "active" }));
+  assert.equal(roDrain().status, "published"); assert.equal(roSent, 1, "恢复后恰好一次");
+  assert.equal(roDrain().status, "empty"); assert.equal(roSent, 1);
 
   const dup2 = orchestrate("pause-dup2");
   assert.equal(dup2.got.code, 1, dup2.got.out);
   assert.match(dup2.got.out, /duplicate_mismatch/u, "**两条同键不算恰好一条**：" + dup2.got.out);
   assert.equal(readRunReceipt({ runsDir: dup2.runs, key: dup2.key }).phase, "preparing");
+
+  const dup3 = orchestrate("pause-dup3");
+  assert.equal(dup3.got.code, 1, dup3.got.out);
+  assert.match(dup3.got.out, /duplicate_mismatch/u, "**缺 schema/id/kind 的同键记录不算完整合法**：" + dup3.got.out);
+  assert.equal(readRunReceipt({ runsDir: dup3.runs, key: dup3.key }).phase, "preparing");
 
   const cf = orchestrate("pause-commitfail");
   assert.equal(cf.got.code, 1, cf.got.out);
@@ -14563,25 +14609,45 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
   assert.equal(fs.existsSync(path.join(flip.rt, "runs", flip.key + ".published.json")), false);
 });
 
-test("run 转交回执：合法才算 deferred，形状不对说不清 —— 不发也不当已转交", () => {
+test("run 转交回执：与发布共用一笔所有权；合法才算 deferred，形状不对说不清 —— 不发也不当已转交", () => {
   const runs = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-deferred-"));
   const key = "d".repeat(64);
   fs.writeFileSync(path.join(runs, key + ".jsonl"),
     JSON.stringify({ type: "result", is_error: false, result: "x" }) + "\n");
   assert.equal(readRunReceipt({ runsDir: runs, key }).state, "absent");
-  assert.deepEqual(prepareDeferral({ runsDir: runs, key, originGenerationId: "gen-1" }), { ok: true, phase: "preparing", reentered: false });
+  // 来源代际必须可用 —— 写方本来就只会产生可用代际，允许集合不能更宽。
+  assert.equal(prepareDeferral({ runsDir: runs, key, originGenerationId: null }).reason, "origin_generation_required");
+  // 发布方持有 claim 时不许创建 preparing。
+  const held = claimRunPublish({ runsDir: runs, key });
+  assert.equal(held.ok, true);
+  assert.equal(prepareDeferral({ runsDir: runs, key, originGenerationId: "gen-1" }).reason, "publish_claim_held");
+  assert.equal(readRunReceipt({ runsDir: runs, key }).state, "absent", "**被占时零 preparing**");
+  releaseRunPublishClaim({ runsDir: runs, key, token: held.token });
+  const prep = prepareDeferral({ runsDir: runs, key, originGenerationId: "gen-1" });
+  assert.equal(prep.ok, true); assert.equal(prep.phase, "preparing"); assert.equal(prep.reentered, false);
   assert.equal(readRunReceipt({ runsDir: runs, key }).phase, "preparing", "preparing 就已经是 deferred —— 挡直发");
-  assert.equal(scanRuns({ runsDir: runs }).find((r) => r.key === key).shouldPublish, false, "**preparing 就挡住直发**");
-  assert.deepEqual(commitDeferral({ runsDir: runs, key }), { ok: true, phase: "committed", idempotent: false });
+  const s0 = scanRuns({ runsDir: runs }).find((r) => r.key === key);
+  assert.equal(s0.shouldPublish, false, "**preparing 就挡住直发**");
+  assert.equal(s0.deferralPending, true); assert.equal(s0.deferredToOutbox, false, "preparing 不叫已转 outbox");
+  // 持 claim 期间别人拿不到；意图不同的重入被拒；提交要带对的 token。
+  assert.equal(claimRunPublish({ runsDir: runs, key }).ok, false, "转交持有 claim 到提交为止");
+  assert.equal(commitDeferral({ runsDir: runs, key, token: "别人的" }).reason, "publish_claim_lost");
+  assert.deepEqual(commitDeferral({ runsDir: runs, key, token: prep.token }), { ok: true, phase: "committed", idempotent: false });
+  const afterCommit = claimRunPublish({ runsDir: runs, key });
+  assert.equal(afterCommit.ok, true, "提交后 claim 已释放"); releaseRunPublishClaim({ runsDir: runs, key, token: afterCommit.token });
   const ok = readRunReceipt({ runsDir: runs, key });
-  assert.equal(ok.state, "deferred"); assert.equal(ok.eventKey, "claude:run:" + key + ":result");
+  assert.equal(ok.state, "deferred"); assert.equal(ok.phase, "committed"); assert.equal(ok.eventKey, deferralEventKeyFor(key));
   assert.ok(isCanonicalIso(ok.preparedAt), "prepared_at 规范时间"); assert.ok(isCanonicalIso(ok.committedAt), "committed_at 规范时间");
-  const run = scanRuns({ runsDir: runs }).find((r) => r.key === key);
-  assert.equal(run.shouldPublish, false); assert.equal(run.deferredToOutbox, true);
-  assert.equal(readRunReceipt({ runsDir: runs, key }).phase, "committed");
-  assert.deepEqual(commitDeferral({ runsDir: runs, key }), { ok: true, phase: "committed", idempotent: true }, "提交幂等");
-  assert.deepEqual(prepareDeferral({ runsDir: runs, key, originGenerationId: "gen-1" }),
-    { ok: true, phase: "committed", reentered: true }, "**已 committed 的回执只幂等复核，不覆盖**");
+  const s1 = scanRuns({ runsDir: runs }).find((r) => r.key === key);
+  assert.equal(s1.shouldPublish, false); assert.equal(s1.deferredToOutbox, true); assert.equal(s1.deferralPending, false);
+  // 幂等复核：意图一致 → 返回 committed 不覆盖；来源代际不同 → 拒绝。
+  const again = prepareDeferral({ runsDir: runs, key, originGenerationId: "gen-1" });
+  assert.equal(again.ok, true); assert.equal(again.phase, "committed"); assert.equal(again.reentered, true);
+  abandonDeferral({ runsDir: runs, key, token: again.token });
+  const other = prepareDeferral({ runsDir: runs, key, originGenerationId: "gen-other" });
+  assert.equal(other.reason, "deferral_intent_mismatch", "**重入要逐项比对意图，特别是来源代际**");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(runs, key + ".deferred.json"), "utf-8")).origin_channel_generation_id, "gen-1",
+    "回执不许被改写");
   const f = path.join(runs, key + ".deferred.json");
   const committed = JSON.parse(fs.readFileSync(f, "utf-8"));
   const ek = deferralEventKeyFor(key);
@@ -14596,7 +14662,9 @@ test("run 转交回执：合法才算 deferred，形状不对说不清 —— �
     ["缺 committed_at", without("committed_at"), /缺字段：committed_at/u],
     ["多出字段", JSON.stringify({ ...committed, 悄悄加的: 1 }), /多出不认识的字段/u],
     ["时间不规范", JSON.stringify({ ...committed, prepared_at: "刚才" }), /prepared_at 不是规范时间/u],
-    ["来源代际形状不对", JSON.stringify({ ...committed, origin_channel_generation_id: "  " }), /origin_channel_generation_id 形状不对/u],
+    ["committed 早于 prepared", JSON.stringify({ ...committed, committed_at: "2000-01-01T00:00:00.000Z" }), /早于 prepared_at/u],
+    ["来源代际 null", JSON.stringify({ ...committed, origin_channel_generation_id: null }), /不是可用代际/u],
+    ["来源代际空白", JSON.stringify({ ...committed, origin_channel_generation_id: "  " }), /不是可用代际/u],
   ]) {
     fs.writeFileSync(f, content);
     const r = readRunReceipt({ runsDir: runs, key });
@@ -14606,10 +14674,13 @@ test("run 转交回执：合法才算 deferred，形状不对说不清 —— �
     assert.equal(s.shouldPublish, false, why + "：说不清不许发");
     assert.equal(s.deferredToOutbox, false, why + "：也不当已转交");
     assert.ok(s.receiptUnreadable, why + "：要报警");
-    assert.equal(commitDeferral({ runsDir: runs, key }).reason, "deferral_unreadable", why + "：坏回执不许被提交覆盖");
+    assert.equal(prepareDeferral({ runsDir: runs, key, originGenerationId: "gen-1" }).reason, "receipt_unreadable",
+      why + "：坏回执不许被 prepare 绕过");
   }
   fs.rmSync(f);
-  assert.equal(commitDeferral({ runsDir: runs, key }).reason, "deferral_not_prepared");
+  const c = claimRunPublish({ runsDir: runs, key });
+  assert.equal(commitDeferral({ runsDir: runs, key, token: c.token }).reason, "deferral_not_prepared");
+  releaseRunPublishClaim({ runsDir: runs, key, token: c.token });
   assert.equal(readRunReceipt({ runsDir: runs, key: "../escape" }).state, "unreadable");
   fs.writeFileSync(f, JSON.stringify(committed));
   fs.writeFileSync(path.join(runs, key + ".published.json"), JSON.stringify({ published_at: "2026-08-27T00:00:00.000Z" }));
@@ -14618,6 +14689,73 @@ test("run 转交回执：合法才算 deferred，形状不对说不清 —— �
   assert.match(conflict.why, /同时存在/u, "**不许静默优先 published**");
   const sc = scanRuns({ runsDir: runs }).find((r2) => r2.key === key);
   assert.equal(sc.shouldPublish, false); assert.equal(sc.alreadyPublished, false); assert.ok(sc.receiptUnreadable);
+});
+
+test("直发 CLI 参数严格白名单：未知 / 重复 / 缺值 / 位置参数 / 空格形式 / 发布不带 root 一律拒绝", () => {
+  for (const [why, args, reason] of [
+    ["空格形式", ["--root", "/x", "--publish"], "option_needs_value"],
+    ["未知参数", ["--roots=/x"], "unknown_option"],
+    ["重复", ["--root=/x", "--root=/y"], "duplicate_option"],
+    ["位置参数", ["/x"], "unexpected_argument"],
+    ["发布不带 root", ["--publish"], "root_required_for_publish"],
+    ["root 相对", ["--root=rel", "--publish"], "root_not_absolute"],
+    ["发布 key 不精确", ["--root=/x", "--publish", "--key=abcd"], "key_not_exact"],
+    ["publish 带值", ["--publish=1"], "option_takes_no_value"],
+  ]) {
+    const r = parseDirectPublishArgs(args);
+    assert.equal(r.ok, false, why);
+    assert.equal(r.reason, reason, why);
+  }
+  assert.deepEqual(parseDirectPublishArgs(["--root=/x", "--key=ab"]), { ok: true, publish: false, root: "/x", key: "ab" });
+  // 真实入口：空格形式必须在读配置和发送前就退出。
+  const r = spawnSync(process.execPath, [path.resolve("scripts", "outbound.mjs"), "--root", "/nonexistent", "--publish"],
+    { encoding: "utf-8", timeout: 60_000 });
+  assert.equal(r.status, 2, r.stderr);
+  assert.match(r.stderr, /参数不对/u);
+});
+
+test("发布与转交共用一笔所有权：直发 CLI 发布途中转交拿不到 claim，最终只有 published（真实并发）", () => {
+  // 评审探针：CLI 已扫描、发布器尚未返回时并发创建 preparing —— 两边各自独占各自的文件，
+  // 既发出去了又转交了。现在转交要先拿同一把 claim。
+  const h = watcherMatrixRunner.fixture();
+  const rt = path.join(h.dir, ".runtime-data", "inbound");
+  const runs = path.join(rt, "runs");
+  const key = claimKeyFor("race");
+  fs.writeFileSync(path.join(runs, key + ".jsonl"),
+    JSON.stringify({ type: "result", is_error: false, result: "竞态那一轮" }) + "\n");
+  fs.writeFileSync(path.join(h.dir, "mode.txt"), "barrier");   // 假 lark 卡在屏障上直到 barrier.txt 出现
+  const orchestrator = path.join(h.dir, "race.mjs");
+  fs.writeFileSync(orchestrator, [
+    'import { spawn } from "node:child_process";',
+    'import fs from "node:fs";',
+    'import path from "node:path";',
+    'const [cli, dir, key, outboundUrl] = process.argv.slice(2);',
+    'const { prepareDeferral } = await import(outboundUrl);',
+    'const runs = path.join(dir, ".runtime-data", "inbound", "runs");',
+    'const c = spawn(process.execPath, [cli, "--root=" + dir, "--publish", "--key=" + key], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });',
+    'let out = ""; c.stdout.on("data", (d) => { out += d; }); c.stderr.on("data", (d) => { out += d; });',
+    'const closed = new Promise((r) => c.on("close", r));',
+    'const calls = path.join(dir, "lark-calls.jsonl");',
+    'const t0 = Date.now();',
+    'while (!fs.existsSync(calls) && Date.now() - t0 < 15000) await new Promise((r) => setTimeout(r, 30));',
+    'const prep = prepareDeferral({ runsDir: runs, key, originGenerationId: "gen-1" });',
+    'fs.writeFileSync(path.join(dir, "barrier.txt"), "go");',
+    'const code = await closed;',
+    'console.log(JSON.stringify({ code, out, prep }));',
+  ].join("\n"));
+  const r = spawnSync(process.execPath, [orchestrator, path.resolve("scripts", "outbound.mjs"), h.dir, key,
+    pathToFileURL(path.resolve("scripts", "outbound.mjs")).href],
+    { encoding: "utf-8", env: { ...process.env, HOME: h.dir }, timeout: 90_000 });
+  assert.equal(r.status, 0, r.stderr);
+  const got = JSON.parse(r.stdout.trim().split("\n").at(-1));
+  assert.equal(got.prep.ok, false, "**发布方持有 claim 时转交不许创建 preparing**：" + JSON.stringify(got));
+  assert.equal(got.prep.reason, "publish_claim_held");
+  assert.equal(got.code, 0, got.out);
+  assert.match(got.out, /已发布/u);
+  const receipt = readRunReceipt({ runsDir: runs, key });
+  assert.equal(receipt.state, "valid", "**最终只有 published**：" + JSON.stringify(receipt));
+  assert.equal(fs.existsSync(path.join(runs, key + ".deferred.json")), false, "零 deferred");
+  assert.equal(fs.readFileSync(path.join(h.dir, "lark-calls.jsonl"), "utf-8").split("\n").filter(Boolean).length, 1, "恰好发一次");
 });
 
 test("claim 写原语：扩展对象覆盖不了固定身份字段", () => {

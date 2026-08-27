@@ -12,6 +12,8 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "./claim.mjs";
+import { appendEvent, classifyOutboxRecord, explainabilityGaps } from "./outbox.mjs";
+import { usableGeneration } from "./topic-generation.mjs";
 
 import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
 
@@ -59,7 +61,10 @@ export function scanRuns({ runsDir }) {
       // 已转交 outbox 的也不发 —— 所有权在那边，这里再发就是双发（评审探针：直发入口）。
       shouldPublish: pres.publish && receipt.state === "absent",
       alreadyPublished: receipt.state === "valid",
-      deferredToOutbox: receipt.state === "deferred",
+      // 只有 committed 才叫"已转 outbox"；preparing 是"转交中，未提交" —— 同样挡直发，
+      // 但可能还没有合法 outbox 记录，由恢复消费者补齐。
+      deferredToOutbox: receipt.state === "deferred" && receipt.phase === "committed",
+      deferralPending: receipt.state === "deferred" && receipt.phase === "preparing",
       deferralPhase: receipt.state === "deferred" ? receipt.phase : null,
       receiptUnreadable: receipt.state === "unreadable"
         ? (receipt.why ?? "说不清") : null,
@@ -212,21 +217,25 @@ export function releaseRunPublishClaim({ runsDir, key, token } = {}) {
 }
 
 /**
- * ■ run 结果 → outbox 的**排他转交**（两阶段）
+ * ■ run 结果 → outbox 的**排他转交**（两阶段，与发布共用同一笔所有权）
  *
  * 绑定暂停时 run 结果不走 run 通道，而是转成一条冻结到原始代际的 outbox 记录。
- * 转交必须是失败原子的：评审探针让 outbox 正常写入、随后 runs 目录不可写 ——
- * 现场同时存在可被排空的 outbox 记录和 shouldPublish 仍为 true 的 run，两头都能发。
- * 所以先以独占创建（wx）拿到 run 的所有权（preparing），再写/核对 outbox 记录，
- * 最后提交（committed）。**preparing 与 committed 都阻止直发**；重入时核对确定性
- * outbox 记录并完成提交。已存在的回执只做幂等复核，committed 永不被覆盖。
- *
- * 回执受验：封闭 schema（按阶段）、key 形状、run_id === key、outbox_event_key 由读方
- * **推导**后比对（不信自报）、来源代际形状、规范时间。published 与 deferred 同时存在
- * 是冲突 —— 说不清，两头都不许。
+ * 转交必须是失败原子的，而且要跟**发布**共用同一把所有权 claim（`.publish-claim.json`）：
+ * 评审用假 lark 在"直发 CLI 已扫描、发布器尚未返回"处设屏障，并发创建 preparing ——
+ * 两边各自独占各自的文件，结果既发出去了又转交了。所以：
+ *   1. 转交先拿 claim，持有到 committed 或失败退出；
+ *   2. 所有发布入口（run 通道、直发 CLI）也先 claim、再重读回执、最后才发；
+ *   3. 发布方持有 claim 时转交不创建 preparing。
+ * 回执两阶段：preparing（所有权已取得、outbox 未确认）→ committed（已转交）。
+ * **两者都挡住直发**；只有 committed 才叫"已转 outbox"，preparing 是"转交中，未提交"，
+ * 由定时排空里的恢复消费者（completePendingDeferrals）补写/核对/提交。
+ * 回执受验：封闭 schema、key 形状、run_id === 文件名、event key 由读方推导、
+ * 来源代际必须可用（写方本来就只会产生可用代际）、committed_at ≥ prepared_at；
+ * published 与 deferred 同时存在 = 两个所有权主张 —— 说不清，两头都不许。
  */
 const DEFERRAL_ARTIFACT = "claude_run_deferral";
 export const deferralEventKeyFor = (key) => "claude:run:" + key + ":result";
+const DEFERRAL_SOURCE = "claude-run-watcher-deferred";
 const DEFERRAL_KEYS_PREPARING = ["artifact_type", "origin_channel_generation_id", "outbox_event_key",
   "prepared_at", "run_id", "schema_version", "state"].sort();
 const DEFERRAL_KEYS_COMMITTED = [...DEFERRAL_KEYS_PREPARING, "committed_at"].sort();
@@ -244,10 +253,13 @@ function deferralProblem(doc, key) {
   if (!["preparing", "committed"].includes(doc.state)) return "state 不在受控取值里";
   if (doc.run_id !== key) return "run_id 跟文件名对不上";
   if (!isCanonicalIso(doc.prepared_at)) return "prepared_at 不是规范时间";
-  if (doc.state === "committed" && !isCanonicalIso(doc.committed_at)) return "committed_at 不是规范时间";
+  if (doc.state === "committed") {
+    if (!isCanonicalIso(doc.committed_at)) return "committed_at 不是规范时间";
+    if (Date.parse(doc.committed_at) < Date.parse(doc.prepared_at)) return "committed_at 早于 prepared_at";
+  }
   if (doc.outbox_event_key !== deferralEventKeyFor(key)) return "outbox_event_key 不是由 key 推导出来的";
-  const origin = doc.origin_channel_generation_id;
-  if (origin !== null && !(typeof origin === "string" && origin.trim() !== "")) return "origin_channel_generation_id 形状不对";
+  // 写方只会产生可用代际 —— 允许集合不能比写方能产生的更宽。
+  if (!usableGeneration(doc.origin_channel_generation_id)) return "origin_channel_generation_id 不是可用代际";
   return null;
 }
 
@@ -271,38 +283,69 @@ function readDeferredReceipt({ runsDir, key }) {
     committedAt: doc.committed_at ?? null };
 }
 
-/** 阶段一：以独占创建取得 run 的所有权。已有回执 → 只幂等复核，返回它的阶段。 */
+function ownsClaim({ runsDir, key, token }) {
+  try {
+    const owner = JSON.parse(fs.readFileSync(path.join(runsDir, key + ".publish-claim.json"), "utf-8"));
+    return owner?.token === token;
+  } catch { return false; }
+}
+
+/**
+ * 阶段一：先拿**与发布共用的** claim，再重读回执，再以独占创建取得 preparing。
+ * 已有回执只幂等复核（逐项比对本次意图，特别是来源代际），committed 永不覆盖。
+ * 成功时持有 claim（token 返回给调用方）—— 调用方必须以 commitDeferral 或
+ * abandonDeferral 收尾。
+ */
 export function prepareDeferral({ runsDir, key, originGenerationId }) {
-  const existing = readDeferredReceipt({ runsDir, key });
-  if (existing.state === "deferred") return { ok: true, phase: existing.phase, reentered: true };
-  if (existing.state === "unreadable") return { ok: false, reason: "deferral_unreadable", why: existing.why };
+  if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) return { ok: false, reason: "key_malformed" };
+  if (!usableGeneration(originGenerationId)) return { ok: false, reason: "origin_generation_required" };
+  const claim = claimRunPublish({ runsDir, key });
+  if (!claim.ok) return { ok: false, reason: "publish_claim_held", why: claim.reason, detail: claim.detail ?? null };
+  const release = () => releaseRunPublishClaim({ runsDir, key, token: claim.token });
+  // **claim 之下重读回执** —— 发布方刚发完释放 claim，这里能拿到新 claim；回执才是真相。
+  const receipt = readRunReceipt({ runsDir, key });
+  if (receipt.state === "valid") { release(); return { ok: false, reason: "already_published" }; }
+  if (receipt.state === "unreadable") { release(); return { ok: false, reason: "receipt_unreadable", why: receipt.why }; }
+  if (receipt.state === "deferred") {
+    if (receipt.originGenerationId !== originGenerationId) {
+      release();
+      return { ok: false, reason: "deferral_intent_mismatch",
+        why: "已有回执的来源代际（" + receipt.originGenerationId + "）跟本次（" + originGenerationId + "）对不上" };
+    }
+    return { ok: true, phase: receipt.phase, reentered: true, token: claim.token };
+  }
   const file = path.join(runsDir, key + DEFERRED_MARK);
   const doc = {
     artifact_type: DEFERRAL_ARTIFACT, schema_version: "1.0", run_id: key, state: "preparing",
     prepared_at: new Date().toISOString(), outbox_event_key: deferralEventKeyFor(key),
-    origin_channel_generation_id: originGenerationId ?? null,
+    origin_channel_generation_id: originGenerationId,
   };
   try {
     fs.writeFileSync(file, JSON.stringify(doc, null, 2) + "\n", { flag: "wx", mode: 0o600 });
   } catch (err) {
-    if (err.code === "EEXIST") {
-      const again = readDeferredReceipt({ runsDir, key });
-      return again.state === "deferred" ? { ok: true, phase: again.phase, reentered: true }
-        : { ok: false, reason: "deferral_unreadable", why: again.why ?? "并发创建后读不出" };
-    }
+    release();
     return { ok: false, reason: "deferral_prepare_failed", why: String(err.code ?? err.message) };
   }
-  return { ok: true, phase: "preparing", reentered: false };
+  return { ok: true, phase: "preparing", reentered: false, token: claim.token };
 }
 
-/** 阶段三：只从 preparing 过渡到 committed；committed 幂等；没有 preparing 就是错误。 */
-export function commitDeferral({ runsDir, key }) {
+/** 放手：释放 claim；已写的 preparing 留着（它继续挡住直发，等恢复消费者）。 */
+export function abandonDeferral({ runsDir, key, token }) {
+  return releaseRunPublishClaim({ runsDir, key, token });
+}
+
+/** 阶段三：持有 claim 者把 preparing 过渡到 committed；committed 幂等；最后释放 claim。 */
+export function commitDeferral({ runsDir, key, token }) {
+  if (!ownsClaim({ runsDir, key, token })) return { ok: false, reason: "publish_claim_lost" };
   const current = readDeferredReceipt({ runsDir, key });
   if (current.state !== "deferred") {
     return { ok: false, reason: current.state === "absent" ? "deferral_not_prepared" : "deferral_unreadable",
       why: current.why ?? "没有 preparing 回执" };
   }
-  if (current.phase === "committed") return { ok: true, phase: "committed", idempotent: true };
+  if (current.phase === "committed") {
+    releaseRunPublishClaim({ runsDir, key, token });
+    return { ok: true, phase: "committed", idempotent: true };
+  }
   const file = path.join(runsDir, key + DEFERRED_MARK);
   const doc = {
     artifact_type: DEFERRAL_ARTIFACT, schema_version: "1.0", run_id: key, state: "committed",
@@ -317,7 +360,91 @@ export function commitDeferral({ runsDir, key }) {
     try { fs.rmSync(tmp, { force: true }); } catch { /* 尽力 */ }
     return { ok: false, reason: "deferral_commit_failed", why: String(err.code ?? err.message) };
   }
+  releaseRunPublishClaim({ runsDir, key, token });
   return { ok: true, phase: "committed", idempotent: false };
+}
+
+/**
+ * 同键 outbox 记录是不是**这一条、且完整合法**：恰好一条、通过正式三态分类与可解释性
+ * 校验（缺 schema/id/kind/created_at 的记录排空层会判损坏 —— 拿它提交 committed
+ * 就是永久停发）、run / 来源 / 正文 / 代际全对上。
+ */
+function deferralRecordMatches(outboxDir, key, expect) {
+  let names;
+  try { names = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json")); } catch { return false; }
+  const eventKey = deferralEventKeyFor(key);
+  const hits = [];
+  for (const name of names) {
+    let rec;
+    try { rec = JSON.parse(fs.readFileSync(path.join(outboxDir, name), "utf-8")); } catch { continue; }
+    if (rec && typeof rec === "object" && !Array.isArray(rec) && rec.event_key === eventKey) hits.push(rec);
+  }
+  if (hits.length !== 1) return false;
+  const rec = hits[0];
+  if (classifyOutboxRecord(rec).unclassified) return false;
+  if (explainabilityGaps(rec).length > 0) return false;
+  return rec.run_id === key && rec.source === DEFERRAL_SOURCE && rec.text === expect.text
+    && rec.target_channel_generation_id === expect.originGenerationId;
+}
+
+/**
+ * **转交的唯一实现**：watcher（暂停终局）与定时排空里的恢复消费者共用。
+ * prepare（拿 claim + preparing）→ 写/核对 outbox 记录 → commit。
+ * 失败返回 {ok:false, reason, phase}：phase 说明现场停在哪一步（preparing 挡住直发）。
+ */
+export function deferRunToOutbox({ runsDir, outboxDir, run, taskName, originGenerationId }) {
+  const key = run?.key;
+  const text = buildDraft(run, { taskName });
+  if (!text) return { ok: false, reason: "no_draft" };
+  const prep = prepareDeferral({ runsDir, key, originGenerationId });
+  if (!prep.ok) return prep;
+  const expect = { text, originGenerationId };
+  if (prep.phase === "committed") {
+    abandonDeferral({ runsDir, key, token: prep.token });
+    // 幂等重入：所有权早已转交，只核对那条记录仍在且就是它。
+    if (!deferralRecordMatches(outboxDir, key, expect)) return { ok: false, reason: "committed_without_record", phase: "committed" };
+    return { ok: true, phase: "committed", reentered: true, eventKey: deferralEventKeyFor(key) };
+  }
+  let r;
+  try {
+    r = appendEvent({ outboxDir, kind: run.state === "completed" ? "reply" : "risk", text,
+      source: DEFERRAL_SOURCE, eventKey: deferralEventKeyFor(key),
+      targetGenerationId: originGenerationId, runId: key });
+  } catch (err) {
+    abandonDeferral({ runsDir, key, token: prep.token });
+    return { ok: false, reason: "outbox_write_failed", why: String(err?.code ?? err?.message ?? err).slice(0, 200), phase: "preparing" };
+  }
+  if (!r.ok && r.reason !== "duplicate") {
+    abandonDeferral({ runsDir, key, token: prep.token });
+    return { ok: false, reason: r.reason, phase: "preparing" };
+  }
+  if (!deferralRecordMatches(outboxDir, key, expect)) {
+    abandonDeferral({ runsDir, key, token: prep.token });
+    return { ok: false, reason: "duplicate_mismatch", phase: "preparing" };
+  }
+  const commit = commitDeferral({ runsDir, key, token: prep.token });
+  if (!commit.ok) {
+    abandonDeferral({ runsDir, key, token: prep.token });
+    return { ok: false, reason: commit.reason, why: commit.why, phase: "preparing" };
+  }
+  return { ok: true, phase: "committed", reentered: prep.reentered, eventKey: deferralEventKeyFor(key) };
+}
+
+/**
+ * **preparing 的恢复消费者**：定时排空每轮扫一遍 runs，把停在 preparing 的转交补写/核对/提交。
+ * 不发布任何东西 —— 只把 run 结果安全放进 outbox；发布仍由排空的既有路径按绑定状态决定。
+ */
+export function completePendingDeferrals({ runsDir, outboxDir, taskName }) {
+  const completed = [];
+  const stuck = [];
+  for (const run of scanRuns({ runsDir })) {
+    if (!run.deferralPending) continue;
+    const receipt = readRunReceipt({ runsDir, key: run.key });
+    const r = deferRunToOutbox({ runsDir, outboxDir, run, taskName, originGenerationId: receipt.originGenerationId });
+    if (r.ok) completed.push({ key: run.key, eventKey: r.eventKey });
+    else stuck.push({ key: run.key, reason: r.reason, why: r.why ?? null });
+  }
+  return { completed, stuck };
 }
 
 export function markPublished({ runsDir, key, messageId }) {
@@ -514,23 +641,55 @@ export function sendToChat({ profile, chatId, text, idempotencyKey, larkBin, lar
 
 // ---------- CLI ----------
 
+/**
+ * 直发 CLI 的参数：**严格白名单**。它会真的发消息 —— 未知 / 重复 / 缺值 / 位置参数一律拒绝
+ * （评审探针：`--root /x --publish` 写成空格形式时静默回落到仓库自身并真实发布）。
+ * 发布模式要求 --root 显式、绝对，且 --key 必须是精确的完整 key。
+ */
+export function parseDirectPublishArgs(tokens) {
+  const seen = new Map();
+  for (const t of tokens) {
+    if (typeof t !== "string" || !t.startsWith("--")) return { ok: false, reason: "unexpected_argument", detail: t };
+    const eq = t.indexOf("=");
+    const name = eq >= 0 ? t.slice(2, eq) : t.slice(2);
+    const value = eq >= 0 ? t.slice(eq + 1) : true;
+    if (seen.has(name)) return { ok: false, reason: "duplicate_option", detail: t };
+    if (name === "publish") { if (value !== true) return { ok: false, reason: "option_takes_no_value", detail: t }; }
+    else if (name === "root" || name === "key") {
+      if (value === true || value === "") return { ok: false, reason: "option_needs_value", detail: t };
+    } else return { ok: false, reason: "unknown_option", detail: t };
+    seen.set(name, value);
+  }
+  const publish = seen.get("publish") === true;
+  const root = seen.get("root") ?? null;
+  const key = seen.get("key") ?? null;
+  if (root !== null && !path.isAbsolute(root)) return { ok: false, reason: "root_not_absolute", detail: root };
+  if (key !== null && publish && !CLAIM_KEY_SHAPE.test(key)) return { ok: false, reason: "key_not_exact", detail: key };
+  if (publish && root === null) return { ok: false, reason: "root_required_for_publish" };
+  return { ok: true, publish, root, key };
+}
+
 if (isDirectRun(import.meta.url)) {
-  // --root=<dir>：让它能对任意项目（含测试夹具）运行 —— 直发入口也要有真实入口回归。
-  const rootArg = (process.argv.find((a) => a.startsWith("--root=")) ?? "").slice(7);
-  const ROOT = rootArg ? path.resolve(rootArg) : moduleRoot(import.meta.url, "..");
+  const parsed = parseDirectPublishArgs(process.argv.slice(2));
+  if (!parsed.ok) {
+    console.error("参数不对（" + parsed.reason + (parsed.detail ? "：" + parsed.detail : "") +
+      "）—— 白名单：--root=<绝对路径> --key=<key> --publish；发布模式必须给 --root，--key 须是完整 key。");
+    process.exit(2);
+  }
+  const ROOT = parsed.root ?? moduleRoot(import.meta.url, "..");
   const RT = path.join(ROOT, ".runtime-data", "inbound");
   const runsDir = path.join(RT, "runs");
   const cfg = JSON.parse(fs.readFileSync(path.join(RT, "chain-config.json"), "utf-8"));
   const mapping = JSON.parse(fs.readFileSync(path.join(RT, "active-mapping.json"), "utf-8"));
-  const doPublish = process.argv.includes("--publish");
-  const only = (process.argv.find((a) => a.startsWith("--key=")) ?? "").slice(6);
+  const doPublish = parsed.publish;
+  const only = parsed.key ?? "";
 
-  const runs = scanRuns({ runsDir }).filter((r) => !only || r.key.startsWith(only));
+  const runs = scanRuns({ runsDir }).filter((r) => !only || (doPublish ? r.key === only : r.key.startsWith(only)));
 
   for (const r of runs) {
     console.log([r.key.slice(0, 8), r.state.padEnd(9),
       r.shouldPublish ? "待发布" : r.alreadyPublished ? "已发布"
-        : r.deferredToOutbox ? "已转 outbox（" + r.deferralPhase + "）"
+        : r.deferredToOutbox ? "已转 outbox" : r.deferralPending ? "转交中（未提交）"
           : r.receiptUnreadable ? "说不清（" + r.receiptUnreadable + "）" : "不发布",
       "| " + r.truthful].join(" "));
   }
@@ -543,22 +702,35 @@ if (isDirectRun(import.meta.url)) {
       console.log(buildDraft(r, { taskName: cfg.task_display_name }));
     }
   } else {
-    const root = mapping.feishu_root_message_id_reference;
+    // 项目文件映射的字段名是 root_message_id；登记表投影出来的是 feishu_root_message_id_reference。
+    const root = mapping.feishu_root_message_id_reference ?? mapping.root_message_id;
     if (!root) throw new Error("mapping 里没有根话题消息 ID，无法发布");
     const { composeOutboundCard } = await import("./outbound-card.mjs");
     for (const r of pending) {
       const text = buildDraft(r, { taskName: cfg.task_display_name });
       if (!text) continue;
-      const mid = publishDraft({
-        profile: cfg.lark_cli_profile,
-        rootMessageId: root,
-        card: composeOutboundCard([{
-          kind: r.state === "completed" ? "reply" : "risk",
-          text,
-        }], { taskName: cfg.task_display_name, runtime: "claude" }),
-        larkBin: cfg.lark_cli_bin, larkHome: cfg.lark_cli_home });
-      markPublished({ runsDir, key: r.key, messageId: mid });
-      console.log("已发布 " + r.key.slice(0, 8) + " -> " + mid);
+      // **发布前 claim、claim 后重读回执、最后才发** —— 跟 run 通道、转交共用同一笔所有权。
+      const claim = claimRunPublish({ runsDir, key: r.key });
+      if (!claim.ok) { console.error("跳过 " + r.key.slice(0, 8) + "：所有权被占（" + claim.reason + "）" + (claim.detail ? " " + claim.detail : "")); continue; }
+      try {
+        const receipt = readRunReceipt({ runsDir, key: r.key });
+        if (receipt.state !== "absent") {
+          console.error("跳过 " + r.key.slice(0, 8) + "：claim 后重读回执为 " + receipt.state + (receipt.phase ? "（" + receipt.phase + "）" : "") + " —— 不发");
+          continue;
+        }
+        const mid = publishDraft({
+          profile: cfg.lark_cli_profile,
+          rootMessageId: root,
+          card: composeOutboundCard([{
+            kind: r.state === "completed" ? "reply" : "risk",
+            text,
+          }], { taskName: cfg.task_display_name, runtime: "claude" }),
+          larkBin: cfg.lark_cli_bin, larkHome: cfg.lark_cli_home });
+        markPublished({ runsDir, key: r.key, messageId: mid });
+        console.log("已发布 " + r.key.slice(0, 8) + " -> " + mid);
+      } finally {
+        releaseRunPublishClaim({ runsDir, key: r.key, token: claim.token });
+      }
     }
     if (pending.length === 0) console.log("没有待发布内容");
   }

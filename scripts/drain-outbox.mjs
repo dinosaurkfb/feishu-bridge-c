@@ -18,7 +18,7 @@ import {
   MAX_AUTO_PUBLISH_ATTEMPTS, auditOutbox, composeDigest, listPending, outboxMutationBlocker,
 } from "./outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
-import { PUBLISH_FAILURE, classifyPublishFailure, publishDraft } from "./outbound.mjs";
+import { PUBLISH_FAILURE, classifyPublishFailure, publishDraft, scanRuns, completePendingDeferrals } from "./outbound.mjs";
 import { publishOutboxAttempt } from "./publish-attempt.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
@@ -158,7 +158,12 @@ export function drainProject({
   // **"读不出来"被报成"没有东西可发"，是这条线上反复出现的同一个错误。**
   const preflight = outboxMutationBlocker(auditOutbox(outboxDir));
   if (preflight) return { status: "error", root, ...preflight, local: true };
-  if (listPending({ outboxDir }).length === 0) return { status: "empty", root };
+  // **preparing 转交的恢复消费者住在这里**：停在 preparing 的 run 结果要在每轮排空补齐
+  // （watcher 已退出、后续 watcher 只管自己的 key）。它不发布，只把 run 结果安全放进
+  // outbox；所以在"outbox 为空"之前就要看一眼 runs。
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs");
+  const pendingDeferrals = scanRuns({ runsDir }).filter((r) => r.deferralPending);
+  if (listPending({ outboxDir }).length === 0 && pendingDeferrals.length === 0) return { status: "empty", root };
 
   // 项目文件优先，没有就回落到「机器模板 + 登记表那一行」。
   // 已接好的项目走前一条，行为不变；新接的项目目录里一个配置文件都没有。
@@ -181,6 +186,10 @@ export function drainProject({
     };
   }
   const { config: cfg, mapping } = resolved;
+  const deferrals = pendingDeferrals.length > 0
+    ? completePendingDeferrals({ runsDir, outboxDir, taskName: cfg.task_display_name })
+    : { completed: [], stuck: [] };
+  if (listPending({ outboxDir }).length === 0) return { status: "empty", root, deferrals };
 
   let failingBatch = null;
   // **在 try 之外解析。**上一版把它放在 try 里，而 catch 要用它 —— 于是任何发布失败

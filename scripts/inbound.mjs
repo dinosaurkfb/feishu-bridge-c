@@ -17,7 +17,8 @@ import path from "node:path";
 
 import { REJECT } from "./selector.mjs";
 import { fetchTriggerEvent } from "./envelope.mjs";
-import { acquireClaim, recordClaimState, watcherExpectEnv, effectiveBindingId } from "./claim.mjs";
+import { acquireClaim, recordClaimState, watcherExpectEnv } from "./claim.mjs";
+import { effectiveBindingId } from "./topic-generation.mjs";
 import { moduleRoot } from "./direct-run.mjs";
 import {
   MAPPING_DISPOSITION, buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,

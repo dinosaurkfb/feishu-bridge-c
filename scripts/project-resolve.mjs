@@ -22,7 +22,7 @@ import path from "node:path";
 
 import { CHAIN_FIELDS, OPTIONAL_CHAIN_FIELDS, loadChainTemplate, materializeProjectConfig } from "./chain-template.mjs";
 import { loadRegistry } from "./registry.mjs";
-import { applyTopicGenerationToMapping } from "./topic-generation.mjs";
+import { applyTopicGenerationToMapping, effectiveBindingId } from "./topic-generation.mjs";
 
 const readJson = (p) => JSON.parse(fs.readFileSync(p, "utf-8"));
 
@@ -238,7 +238,7 @@ export function resolveProject({ root, claudeSessionId, registryFile, templateFi
   if (mapping && source === "project-files") {
     const evolved = applyTopicGenerationToMapping(mapping, {
       runtime: "claude",
-      bindingId: mapping.binding_id ?? (path.basename(root) + "@project-files"),
+      bindingId: effectiveBindingId(mapping, { root }),
     });
     if (evolved.ok) mapping = evolved.mapping;
     else mapping = { ...mapping, status: "invalid", topic_generation_error: evolved.reason };

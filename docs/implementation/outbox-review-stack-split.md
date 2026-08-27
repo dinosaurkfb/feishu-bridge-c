@@ -50,7 +50,12 @@ policy 受控组合、来源代际非空、会话 id 为 uuid；**期望身份�
 Claude watcher 启动期核当前目的地、**终局之后重新解析再核**并用新鲜快照发布
 （运行中关开关 / 绑定漂移 → 零发布、failed{binding_drift}；绑定暂停 → 受控不发布：
 本地终局照记、Dialogue 照收口，run 结果转成冻结到原始代际的 outbox 记录（去重键
-claude:run:<key>:result），恢复后由既有排空恰好发一次；锁按阶段：启动期拒绝留锁交
+claude:run:<key>:result，同键已有记录须核对 run/代际/正文/来源才算入队），并在 run 侧
+落受验的转交回执 `<key>.deferred.json` —— 发布所有权排他转移，scanRuns 与直发入口
+都不再消费它；恢复后由既有排空恰好发一次。终局三个本地动作（转入 / 落盘 / Dialogue
+收口）各自留痕、互不阻断，锁最后放，任一失败非零退出并点名；有效绑定身份的唯一投影
+effectiveBindingId 住在 topic-generation.mjs，claim 写入、期望 env、watcher 复核、
+Dialogue 存储（含锁内重读）、控制面共用；锁按阶段：启动期拒绝留锁交
 陈旧检测，终局期 run 已结束则放锁）。
 夹具同步补齐像真的 claim（派生 key、期望身份从项目真实解析派生）。
 Codex 侧并发靠 outbox 事务的发布锁互斥，无需 run 通道 claim；失败/超时分支的抑制

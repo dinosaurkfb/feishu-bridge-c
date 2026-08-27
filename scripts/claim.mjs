@@ -12,7 +12,7 @@ import fs from "node:fs";
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { DIALOGUE_POLICY_ID, DIALOGUE_POLICY_VERSION } from "./interaction-policy.mjs";
 import { MAPPING_POLICY_ID, MAPPING_POLICY_VERSION } from "./mapping-policy.mjs";
-import { usableGeneration } from "./topic-generation.mjs";
+import { effectiveBindingId, usableGeneration } from "./topic-generation.mjs";
 import path from "node:path";
 
 export const CLAIM_STATE = {
@@ -191,18 +191,6 @@ export function readClaimState({ claimsDir, key, expect = {} }) {
  */
 const EXPECT_BINDING_VAR = "FEISHU_BRIDGE_EXPECT_BINDING_ID";
 const EXPECT_SESSION_VAR = "FEISHU_BRIDGE_EXPECT_CLAUDE_SESSION_ID";
-/**
- * 一个 mapping 的**有效绑定身份** —— 唯一投影。
- * 旧 project-file 映射没有 mapping.binding_id，resolveProject 兼容它并把有效 id
- * 放进 topic_generation_state.binding_id；直接读可缺省的旧字段会把这类合法映射
- * 编码成空 binding，watcher 启动即拒绝（评审探针）。claim 写入、期望 env、
- * watcher 复核都从这里取。
- */
-export function effectiveBindingId(mapping) {
-  const fromState = mapping?.topic_generation_state?.binding_id;
-  if (nonEmpty(fromState)) return fromState;
-  return nonEmpty(mapping?.binding_id) ? mapping.binding_id : null;
-}
 export function watcherExpectEnv(mapping) {
   return {
     [EXPECT_BINDING_VAR]: effectiveBindingId(mapping) ?? "",

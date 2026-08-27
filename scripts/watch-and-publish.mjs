@@ -15,7 +15,7 @@ import path from "node:path";
 
 import { readRunOutcome } from "./handoff.mjs";
 import {
-  buildDraft, claimRunPublish, markPublished, publishDraft, readRunReceipt,
+  buildDraft, claimRunPublish, markDeferredToOutbox, markPublished, publishDraft, readRunReceipt,
   releaseRunPublishClaim, scanRuns,
 } from "./outbound.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
@@ -27,12 +27,12 @@ import { postDeliveryBits } from "./publish-outcome.mjs";
 import { repairCmd } from "./repair-run-claim.mjs";
 import { shellQuote } from "./shell-quote.mjs";
 import {
-  CLAIM_KEY_SHAPE, effectiveBindingId, readClaimState, readWatcherExpectEnv, recordClaimState,
+  CLAIM_KEY_SHAPE, readClaimState, readWatcherExpectEnv, recordClaimState,
 } from "./claim.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
-import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
+import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { moduleRoot } from "./direct-run.mjs";
 import { finalizeClaudeDialogueTurn } from "./interaction-policy-store.mjs";
 import { DIALOGUE_POLICY_ID, DIALOGUE_TURN_STATUS } from "./interaction-policy.mjs";
@@ -80,6 +80,19 @@ const startedAt = Date.now();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const finishUp = () => fs.rmSync(LOCK, { recursive: true, force: true });
+/** 同键 outbox 记录是不是**这一条**：run、代际、正文、来源都要对上 —— 只凭文件在不算。 */
+function outboxEventMatches(outboxDir, eventKey, expect) {
+  let names;
+  try { names = fs.readdirSync(outboxDir).filter((f) => f.endsWith(".json")); } catch { return false; }
+  for (const name of names) {
+    let rec;
+    try { rec = JSON.parse(fs.readFileSync(path.join(outboxDir, name), "utf-8")); } catch { continue; }
+    if (rec?.event_key !== eventKey) continue;
+    return rec.run_id === expect.run_id && rec.source === expect.source && rec.text === expect.text
+      && (rec.target_channel_generation_id ?? null) === expect.target_channel_generation_id;
+  }
+  return false;
+}
 // **claim 三态：说不清就不猜。**这里的 claim 不只决定来源代际，还决定 outbox 归属
 // （会话级绑定靠 claude_session_id）—— 缺席/损坏时上一版落到项目级 outbox、
 // 现算当前代际，把一轮结果发到了说不清的地方。结果不发布、落 failed 记录、
@@ -196,27 +209,61 @@ while (true) {
     // （outbox 事务对 mapping_not_active 本来就是 skip）。只留 .jsonl 只证明字节没删：
     // 后续 watcher 只处理自己的 key、定时排空只扫 outbox、桥接 run 的 Stop 又不入队 ——
     // 没有这一步，恢复后它永远不会自动发出去（评审探针）。
+    // **三个本地动作各自留痕、互不阻断**：转入 outbox、run 终局落盘、Dialogue 收口。
+    // 任何一个失败都不能拦住其余两个；锁在最后放；有失败就非零退出并点名哪一段没完成
+    // （评审探针：outbox 不可写时直接抛 —— run 状态没记、Dialogue 悬挂、锁也没放）。
+    const terminalFailures = [];
+    const step = (label, fn) => {
+      try {
+        const r = fn();
+        if (r && r.ok === false) { terminalFailures.push(label + "（" + (r.reason ?? "说不清") + "）"); return r; }
+        return r ?? { ok: true };
+      } catch (err) {
+        terminalFailures.push(label + "（" + String(err?.message ?? err).slice(0, 200) + "）");
+        return { ok: false, reason: "threw" };
+      }
+    };
     let deferred = null;
     if (!fresh.publishable && run?.shouldPublish) {
-      const draft = buildDraft(run, { taskName: cfg.task_display_name });
-      if (draft) {
+      step("run 结果转入 outbox", () => {
+        const draft = buildDraft(run, { taskName: cfg.task_display_name });
+        if (!draft) return { ok: true };
         const eventKey = "claude:run:" + key + ":result";
-        const r = appendEvent({
-          outboxDir: OUTBOX, kind: run.state === "completed" ? "reply" : "risk", text: draft,
-          source: "claude-run-watcher-deferred", eventKey,
-          targetGenerationId: originGenerationId, runId: key,
-        });
-        deferred = { reason: "mapping_not_active", why: fresh.pausedWhy, outbox_event_key: eventKey,
-          queued: r.ok === true || r.reason === "duplicate", ...(r.ok ? {} : { append: r.reason }) };
-      }
+        const expectRecord = { run_id: key, target_channel_generation_id: originGenerationId ?? null,
+          text: draft, source: "claude-run-watcher-deferred" };
+        const r = appendEvent({ outboxDir: OUTBOX, kind: run.state === "completed" ? "reply" : "risk",
+          text: draft, source: expectRecord.source, eventKey,
+          targetGenerationId: originGenerationId, runId: key });
+        if (!r.ok && r.reason === "duplicate") {
+          // 同键已有记录 —— 只凭"文件在"不算入队：核对它确实是这条 run、这个代际、这份正文。
+          if (!outboxEventMatches(OUTBOX, eventKey, expectRecord)) {
+            deferred = { reason: "mapping_not_active", why: fresh.pausedWhy, outbox_event_key: eventKey,
+              queued: false, append: "duplicate_mismatch" };
+            return { ok: false, reason: "duplicate_mismatch" };
+          }
+        } else if (!r.ok) {
+          deferred = { reason: "mapping_not_active", why: fresh.pausedWhy, outbox_event_key: eventKey,
+            queued: false, append: r.reason };
+          return { ok: false, reason: r.reason };
+        }
+        // **所有权排他转移**：outbox 记录确认在，run 侧落转交回执 —— 之后 run 通道与
+        // 直发入口都不再消费这条 run（否则 outbox 发过之后它们会再发一次、还发去当前话题）。
+        markDeferredToOutbox({ runsDir: RUNS, key, eventKey, originGenerationId });
+        deferred = { reason: "mapping_not_active", why: fresh.pausedWhy, outbox_event_key: eventKey, queued: true };
+        return { ok: true };
+      });
     }
-    recordClaimState({
-      claimsDir: CLAIMS, key, state: outcome.state === "completed" ? "handed_off" : "failed",
-      detail: { run_state: outcome.state, observed_by: "watch-and-publish",
-        ...(fresh.publishable ? {} : { publish_deferred: deferred ?? { reason: "mapping_not_active", why: fresh.pausedWhy } }) },
+    step("run 终局落盘", () => {
+      recordClaimState({
+        claimsDir: CLAIMS, key, state: outcome.state === "completed" ? "handed_off" : "failed",
+        detail: { run_state: outcome.state, observed_by: "watch-and-publish",
+          ...(fresh.publishable ? {} : { publish_deferred: deferred ??
+            { reason: "mapping_not_active", why: fresh.pausedWhy, queued: false } }) },
+      });
+      return { ok: true };
     });
     if (acceptedClaim?.policy_id === DIALOGUE_POLICY_ID) {
-      finalizeClaudeDialogueTurn({
+      step("Dialogue 收口", () => finalizeClaudeDialogueTurn({
         root: ROOT,
         claudeSessionId,
         runId: key,
@@ -224,15 +271,21 @@ while (true) {
           ? DIALOGUE_TURN_STATUS.COMPLETED
           : DIALOGUE_TURN_STATUS.FAILED,
         reason: outcome.state === "completed" ? null : (outcome.reason ?? outcome.state),
-      });
+      }));
     }
+    const reportTerminalFailures = () => {
+      if (terminalFailures.length === 0) return 0;
+      console.error("**以下环节没完成**：" + terminalFailures.join("；") + " —— 其余环节已各自完成。");
+      return 1;
+    };
 
     if (!fresh.publishable) {
       console.error("绑定暂停中（" + fresh.pausedWhy + "）—— 本地终局已记录" +
         (deferred?.queued ? "，run 结果已转入 outbox（" + deferred.outbox_event_key + "）等恢复后发布" : "") +
         "；两条发布通道都不走。run 已结束，session lock 已释放。");
+      const code = reportTerminalFailures();
       finishUp();
-      process.exit(0);
+      process.exit(code);
     }
 
     // ============ 两条发布通道（R2b1 定稿的显式语义） ============
@@ -293,6 +346,10 @@ while (true) {
           if (claim.ok && receipt.state === "valid") {
             releaseRunPublishClaim({ runsDir: RUNS, key, token: claim.token });
             console.error("run 结果已由另一个 watcher 送达（回执合法），本轮不再发。");
+          } else if (claim.ok && receipt.state === "deferred") {
+            // 所有权已转交 outbox —— 这里再发就是双发。
+            releaseRunPublishClaim({ runsDir: RUNS, key, token: claim.token });
+            console.error("run 结果已转交 outbox（" + receipt.eventKey + "），本轮不再走 run 通道。");
           } else if (claim.ok && receipt.state === "unreadable") {
             // **回执说不清 ≠ 没送达。**这时发可能双发、跳过可能漏发 ——
             // fail-closed：不发、报警、留给人核对。
@@ -392,8 +449,9 @@ while (true) {
             : "（进展保留待重试）") + ": " + (r2.error ?? r2.reason) + postDeliveryBits(r2));
       }
     }
+    const code = reportTerminalFailures();
     finishUp();
-    process.exit(0);
+    process.exit(code);
   }
 
   if (Date.now() - startedAt > MAX_WAIT_MS) {

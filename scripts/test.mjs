@@ -26,9 +26,10 @@ import {
 } from "./envelope.mjs";
 import { resolveProject as resolveProjectForFixture } from "./project-resolve.mjs";
 import {
-  acquireClaim, claimKey, effectiveBindingId, readClaim, readClaimState, readWatcherExpectEnv,
+  acquireClaim, claimKey, readClaim, readClaimState, readWatcherExpectEnv,
   recordClaimState, watcherExpectEnv,
 } from "./claim.mjs";
+import { effectiveBindingId } from "./topic-generation.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
   acquirePublishLock, attributeSession, exactProjectsForRoot, fileContainsAny, isUnder,
@@ -49,8 +50,7 @@ import {
 } from "./outbound-card.mjs";
 import {
   PUBLISH_FAILURE, claimRunPublish, classifyPublishFailure, readRunReceipt,
-  releaseRunPublishClaim,
-} from "./outbound.mjs";
+  releaseRunPublishClaim, scanRuns, markDeferredToOutbox } from "./outbound.mjs";
 import { repairRunClaims } from "./repair-run-claim.mjs";
 import {
   describeDrainOutcome, drainProject, outboxDirOf, suppressCmd, watcherActive,
@@ -14345,12 +14345,8 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
     fs.writeFileSync(path.join(h.dir, "mode.txt"), "ok");
     const key = claimKeyFor("mid-" + mode + (dialogue ? "-dlg" : ""));
     if (dialogue) {
-      // Dialogue 存储读的是 mapping.binding_id（不是 effectiveBindingId 投影）——
-      // 旧形状映射在它那里 binding_id_missing。这是同类缺口的另一处消费者，不在本轮范围，
-      // 夹具先给显式 binding_id；期望身份与 claim 仍从真实解析派生（投影取它）。
-      const mapPath = path.join(rt, "active-mapping.json");
-      fs.writeFileSync(mapPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(mapPath, "utf-8")),
-        binding_id: "b-dialogue" }));
+      // **不给显式 binding_id**：旧形状映射在 Dialogue 存储里也必须能收口 ——
+      // 投影只有 effectiveBindingId 一份，存储的锁内重读也走它。
       const enabled = setClaudeInteractionMode({ root: h.dir, mode: "dialogue", now: Date.now() });
       assert.equal(enabled.ok, true, "开 dialogue：" + JSON.stringify(enabled));
       const reserved = reserveClaudeDialogueTurn({
@@ -14362,6 +14358,18 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
       patch: dialogue ? { policy_id: "dialogue" } : {} });
     const lock = path.join(rt, "session.lock");
     fs.mkdirSync(lock, { recursive: true });
+    const outboxDir = path.join(h.dir, ".runtime-data", "outbound", "outbox");
+    if (mode === "pause-dup") {
+      // 同键记录已在、但不是这条 run 的内容 —— 转入不许只凭"文件在"就算入队。
+      appendEvent({ outboxDir, kind: "reply", text: "别的内容", source: "someone-else",
+        eventKey: "claude:run:" + key + ":result", runId: key });
+    }
+    if (mode === "pause-ro") {
+      // outbox 路径是个文件：appendEvent 的 mkdir 会抛 —— 抛不能拦住终局落盘与放锁。
+      fs.rmSync(outboxDir, { recursive: true, force: true });
+      fs.mkdirSync(path.dirname(outboxDir), { recursive: true });
+      fs.writeFileSync(outboxDir, "这不是目录");
+    }
     const orchestrator = path.join(h.dir, "orchestrate-" + mode + ".mjs");
     fs.writeFileSync(orchestrator, [
       'import { spawn } from "node:child_process";',
@@ -14375,15 +14383,21 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
       'if (mode === "rotate") {',
       '  const p = path.join(rt, "active-mapping.json");',
       '  fs.writeFileSync(p, JSON.stringify({ ...JSON.parse(fs.readFileSync(p, "utf-8")), binding_id: "rotated-binding" }));',
-      '} else if (mode === "pause") {',
+      '} else if (mode.startsWith("pause")) {',
       '  const p = path.join(rt, "active-mapping.json");',
       '  fs.writeFileSync(p, JSON.stringify({ ...JSON.parse(fs.readFileSync(p, "utf-8")), status: "paused" }));',
+      '  if (mode === "pause-busy") {',
+      '    const lock = path.join(rt, "topic-generation.lock");',
+      '    fs.mkdirSync(lock, { recursive: true });',
+      '    fs.writeFileSync(path.join(lock, "owner.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));',
+      '  }',
       '} else {',
       '  const p = path.join(rt, "chain-config.json");',
       '  fs.writeFileSync(p, JSON.stringify({ ...JSON.parse(fs.readFileSync(p, "utf-8")), auto_publish_on_completion: false }));',
       '}',
       'fs.writeFileSync(path.join(rt, "runs", key + ".jsonl"), JSON.stringify({ type: "result", is_error: false, result: "运行中改了" }) + "\\n");',
       'const code = await new Promise((r) => c.on("close", r));',
+      'if (mode === "pause-busy") fs.rmSync(path.join(rt, "topic-generation.lock"), { recursive: true, force: true });',
       'console.log(JSON.stringify({ code, out }));',
     ].join("\n"));
     const r = spawnSync(process.execPath, [orchestrator, path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir, mode],
@@ -14391,7 +14405,7 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
     assert.equal(r.status, 0, r.stderr);
     const got = JSON.parse(r.stdout.trim().split("\n").at(-1));
     return { got, rt, key, argsFile: path.join(h.dir, "lark-calls.jsonl"), lock, root: h.dir,
-      outbox: path.join(h.dir, ".runtime-data", "outbound", "outbox") };
+      outbox: outboxDir, runs: path.join(rt, "runs") };
   };
   const rotate = orchestrate("rotate");
   assert.equal(rotate.got.code, 2, "绑定在运行中漂移了：" + rotate.got.out);
@@ -14415,6 +14429,11 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
   assert.equal(handed.publish_deferred?.reason, "mapping_not_active");
   assert.equal(handed.publish_deferred?.queued, true, "要写明已转入 outbox");
   assert.equal(fs.existsSync(pause.lock), false, "run 已结束，锁放掉");
+  // **所有权排他转移**：run 侧落转交回执，run 通道与直发入口共用的 scanRuns 不再消费它。
+  assert.equal(readRunReceipt({ runsDir: pause.runs, key: pause.key }).state, "deferred");
+  const scanned = scanRuns({ runsDir: pause.runs }).find((r) => r.key === pause.key);
+  assert.equal(scanned.shouldPublish, false, "**直发入口（同用 scanRuns）不许再把它当待发布**");
+  assert.equal(scanned.deferredToOutbox, true);
   const queued = listPending({ outboxDir: pause.outbox });
   assert.equal(queued.length, 1, "run 结果要转成恰好一条 outbox 记录");
   assert.equal(queued[0].target_channel_generation_id, "gen-1", "**冻结到 claim 的原始代际**");
@@ -14435,6 +14454,37 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
   assert.equal(listPending({ outboxDir: pause.outbox }).length, 0, "发完队列为空");
   assert.equal(drain().status, "empty");
   assert.equal(sent, 1, "再排空不许再发");
+  assert.equal(scanRuns({ runsDir: pause.runs }).find((r) => r.key === pause.key).shouldPublish, false,
+    "恢复排空之后 run 通道仍不许再发（转交回执还在）");
+
+  // 转入 outbox 撞上同键但不同内容的记录：不算入队、不落转交回执，但终局照记、锁照放、非零退出点名。
+  const dup = orchestrate("pause-dup");
+  assert.equal(dup.got.code, 1, "有环节没完成要非零退出：" + dup.got.out);
+  assert.match(dup.got.out, /以下环节没完成.*run 结果转入 outbox（duplicate_mismatch）/u, dup.got.out);
+  const dupHanded = JSON.parse(fs.readFileSync(path.join(dup.rt, "delivery-claims", dup.key + ".handed_off.json"), "utf-8"));
+  assert.equal(dupHanded.run_state, "completed", "终局照记");
+  assert.equal(dupHanded.publish_deferred?.queued, false, "**只凭同键文件在不算入队**");
+  assert.equal(readRunReceipt({ runsDir: dup.runs, key: dup.key }).state, "absent", "不许落转交回执");
+  assert.equal(fs.existsSync(dup.lock), false, "锁照放");
+  assert.equal(fs.existsSync(dup.argsFile), false, "零 lark");
+
+  // outbox 不可写：转入抛错不能截断终局落盘与放锁。
+  const ro = orchestrate("pause-ro");
+  assert.equal(ro.got.code, 1, ro.got.out);
+  assert.match(ro.got.out, /以下环节没完成.*run 结果转入 outbox/u, ro.got.out);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(ro.rt, "delivery-claims", ro.key + ".handed_off.json"), "utf-8"))
+    .run_state, "completed", "**outbox 抛了也要把 run 终局记下**");
+  assert.equal(readRunReceipt({ runsDir: ro.runs, key: ro.key }).state, "absent");
+  assert.equal(fs.existsSync(ro.lock), false, "**锁要放**");
+
+  // Dialogue 收口撞上 binding 锁：其余两步照做、锁照放、非零点名 Dialogue。
+  const busy = orchestrate("pause-busy", { dialogue: true });
+  assert.equal(busy.got.code, 1, busy.got.out);
+  assert.match(busy.got.out, /以下环节没完成.*Dialogue 收口/u, busy.got.out);
+  const busyHanded = JSON.parse(fs.readFileSync(path.join(busy.rt, "delivery-claims", busy.key + ".handed_off.json"), "utf-8"));
+  assert.equal(busyHanded.publish_deferred?.queued, true, "转入 outbox 不受 Dialogue 失败影响");
+  assert.equal(readRunReceipt({ runsDir: busy.runs, key: busy.key }).state, "deferred");
+  assert.equal(fs.existsSync(busy.lock), false, "锁照放");
 
   // Dialogue：暂停只管入站和发布，不抹掉已经发生的本地终局 —— 回合要收口。
   const dlg = orchestrate("pause", { dialogue: true });
@@ -14450,6 +14500,32 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
   assert.equal(flip.got.code, 0, "开关关了不是故障，是不发：" + flip.got.out);
   assert.equal(fs.existsSync(flip.argsFile), false, "**运行中关掉自动发布就不许再发**");
   assert.equal(fs.existsSync(path.join(flip.rt, "runs", flip.key + ".published.json")), false);
+});
+
+test("run 转交回执：合法才算 deferred，形状不对说不清 —— 不发也不当已转交", () => {
+  const runs = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-deferred-"));
+  const key = "d".repeat(64);
+  fs.writeFileSync(path.join(runs, key + ".jsonl"),
+    JSON.stringify({ type: "result", is_error: false, result: "x" }) + "\n");
+  assert.equal(readRunReceipt({ runsDir: runs, key }).state, "absent");
+  markDeferredToOutbox({ runsDir: runs, key, eventKey: "claude:run:" + key + ":result", originGenerationId: "gen-1" });
+  const ok = readRunReceipt({ runsDir: runs, key });
+  assert.equal(ok.state, "deferred"); assert.equal(ok.eventKey, "claude:run:" + key + ":result");
+  assert.ok(isCanonicalIso(ok.deferredAt));
+  const run = scanRuns({ runsDir: runs }).find((r) => r.key === key);
+  assert.equal(run.shouldPublish, false); assert.equal(run.deferredToOutbox, true);
+  const f = path.join(runs, key + ".deferred.json");
+  for (const [why, content] of [["不是 JSON", "{ 坏了"], ["缺 event key", JSON.stringify({ run_id: key, deferred_at: "2026-08-27T00:00:00.000Z" })],
+    ["run_id 对不上", JSON.stringify({ run_id: "e".repeat(64), deferred_at: "2026-08-27T00:00:00.000Z", outbox_event_key: "k" })],
+    ["时间不规范", JSON.stringify({ run_id: key, deferred_at: "刚才", outbox_event_key: "k" })]]) {
+    fs.writeFileSync(f, content);
+    const r = readRunReceipt({ runsDir: runs, key });
+    assert.equal(r.state, "unreadable", why);
+    const s = scanRuns({ runsDir: runs }).find((r2) => r2.key === key);
+    assert.equal(s.shouldPublish, false, why + "：说不清不许发");
+    assert.equal(s.deferredToOutbox, false, why + "：也不当已转交");
+    assert.ok(s.receiptUnreadable, why + "：要报警");
+  }
 });
 
 test("claim 写原语：扩展对象覆盖不了固定身份字段", () => {

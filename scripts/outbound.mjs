@@ -20,6 +20,8 @@ import { readRunOutcome } from "./handoff.mjs";
 import { isDirectRun, moduleRoot } from "./direct-run.mjs";
 
 const PUBLISHED_MARK = ".published.json";
+/** run 结果已**转交** outbox 的回执：所有权排他转移，run 通道与直发入口都不再消费它。 */
+const DEFERRED_MARK = ".deferred.json";
 
 /** 每种结局怎么对 Frank 表述。措辞必须让「没干成」一眼可辨。 */
 const PRESENTATION = {
@@ -53,8 +55,10 @@ export function scanRuns({ runsDir }) {
       state: outcome.state,
       label: pres.label,
       // 回执说不清时**两头都不许**：不发（可能双发）、也不当已发（可能漏发）。
+      // 已转交 outbox 的也不发 —— 所有权在那边，这里再发就是双发（评审探针：直发入口）。
       shouldPublish: pres.publish && receipt.state === "absent",
       alreadyPublished: receipt.state === "valid",
+      deferredToOutbox: receipt.state === "deferred",
       receiptUnreadable: receipt.state === "unreadable"
         ? (receipt.why ?? "说不清") : null,
       truthful: pres.truthful,
@@ -168,8 +172,8 @@ export function readRunReceipt({ runsDir, key } = {}) {
   let raw;
   try { raw = fs.readFileSync(file, "utf-8"); }
   catch (err) {
-    return err.code === "ENOENT" ? { state: "absent" }
-      : { state: "unreadable", why: String(err.code ?? err.message) };
+    if (err.code !== "ENOENT") return { state: "unreadable", why: String(err.code ?? err.message) };
+    return readDeferredReceipt({ runsDir, key });
   }
   try {
     const doc = JSON.parse(raw);
@@ -198,6 +202,44 @@ export function releaseRunPublishClaim({ runsDir, key, token } = {}) {
   } catch { return false; }
   fs.rmSync(file, { force: true });
   return true;
+}
+
+/** 转交回执也要受验：形状不对同样说不清 —— 不发、也不当已转交。 */
+function readDeferredReceipt({ runsDir, key }) {
+  const file = path.join(runsDir, key + DEFERRED_MARK);
+  let raw;
+  try { raw = fs.readFileSync(file, "utf-8"); }
+  catch (err) {
+    return err.code === "ENOENT" ? { state: "absent" }
+      : { state: "unreadable", why: String(err.code ?? err.message) };
+  }
+  try {
+    const doc = JSON.parse(raw);
+    if (doc && typeof doc === "object" && !Array.isArray(doc)
+      && isCanonicalIso(doc.deferred_at) && doc.run_id === key
+      && typeof doc.outbox_event_key === "string" && doc.outbox_event_key.length > 0) {
+      return { state: "deferred", deferredAt: doc.deferred_at, eventKey: doc.outbox_event_key,
+        originGenerationId: doc.origin_channel_generation_id ?? null };
+    }
+    return { state: "unreadable", why: "转交回执结构不合法" };
+  } catch {
+    return { state: "unreadable", why: "转交回执不是 JSON" };
+  }
+}
+
+/**
+ * 记下「run 结果的发布所有权已转交 outbox」。**写在 outbox 记录确认入队之后**；
+ * 之后 scanRuns 把它判成 deferredToOutbox，run 通道与直发入口都不再发它。
+ */
+export function markDeferredToOutbox({ runsDir, key, eventKey, originGenerationId }) {
+  const file = path.join(runsDir, key + DEFERRED_MARK);
+  const tmp = file + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify({
+    schema_version: "1.0", run_id: key, deferred_at: new Date().toISOString(),
+    outbox_event_key: eventKey, origin_channel_generation_id: originGenerationId ?? null,
+  }, null, 2) + "\n", { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  return file;
 }
 
 export function markPublished({ runsDir, key, messageId }) {
@@ -407,7 +449,7 @@ if (isDirectRun(import.meta.url)) {
 
   for (const r of runs) {
     console.log([r.key.slice(0, 8), r.state.padEnd(9),
-      r.shouldPublish ? "待发布" : r.alreadyPublished ? "已发布" : "不发布",
+      r.shouldPublish ? "待发布" : r.alreadyPublished ? "已发布" : r.deferredToOutbox ? "已转 outbox" : "不发布",
       "| " + r.truthful].join(" "));
   }
 

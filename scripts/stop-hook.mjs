@@ -17,6 +17,7 @@
  */
 
 import fs from "node:fs";
+import { effectiveBindingId } from "./topic-generation.mjs";
 import os from "node:os";
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
@@ -157,7 +158,7 @@ async function main() {
     // 只结束 active_turn.runtime_target_id 与本会话严格相同的回合，其他会话的 Stop 不得碰它。
     if (!ownedByBridge && speakingSession && bound.ok) {
       const interaction = interactionPolicyStateForLegacy(bound.mapping, {
-        bindingId: bound.mapping?.binding_id,
+        bindingId: effectiveBindingId(bound.mapping, { root: project.root }),
       });
       const activeTurn = interaction.ok ? interaction.state.dialogue?.active_turn : null;
       if (interaction.ok && interaction.state.policy_id === DIALOGUE_POLICY_ID &&

@@ -16,7 +16,8 @@
  * 所以这是独立文件、独立校验域。这里出任何问题都不影响入站。
  */
 
-import { LOCATOR_SHAPED } from "./display-safe.mjs";
+import { LOCATOR_SHAPED, sanitizeForDisplay } from "./display-safe.mjs";
+const PLACEHOLDER = new RegExp(String.fromCharCode(0xFFFD), "gu");
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -77,12 +78,12 @@ const PROVIDER_ID = /^[a-z0-9][a-z0-9_-]{0,31}$/u;
  * 挡不住「把 locator 塞进 group_name」。这里做一道廉价的形状检查 ——
  * 拦得住手滑，拦不住有意为之，后者只能靠登记时的信任审查。
  */
-const CONTROL_CHARS = /[\u0000-\u001F\u007F]/gu;
 
 function cleanName(value) {
   if (!isName(value)) return null;
-  // 控制字符会把终端输出搞乱，也能用来伪装内容。
-  const flat = value.replace(CONTROL_CHARS, " ").trim();
+  // 控制字符会把终端输出搞乱，也能用来伪装内容 —— 规则只有一份（display-safe.mjs：C0/C1/行分隔/双向控制符），
+  // 这里把占位符再压成空格：显示名要的是"能读"，不是"标出原本有东西"。
+  const flat = sanitizeForDisplay(value).replace(PLACEHOLDER, " ").trim();
   if (flat.length === 0 || flat.length > NAME_MAX) return null;
   if (LOCATOR_SHAPED.test(flat)) return null;
   return flat;

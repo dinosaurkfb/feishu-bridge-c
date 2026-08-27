@@ -6976,7 +6976,10 @@ test("provider 报告：只收受控字段，多带一个就整条拒", () => {
   // 挡不住「把 locator 塞进名字」是靠形状检查兜的，明确它管到哪一步。
   assert.equal(validateProviderReport(providerReport({ group_name: "oc_abcdef123456" }), asProvider).reason,
     "connection_group_name_invalid");
-  // 控制字符会把终端输出搞乱，压平而不是拒。
+  // 控制字符会把终端输出搞乱，压平而不是拒 —— 规则与状态页同一份（display-safe），双向控制符 U+061C 也算。
+  assert.equal(
+    validateProviderReport(providerReport({ group_name: "A" + String.fromCharCode(0x61c) + "B" }), asProvider).connections[0].groupName,
+    "A B", "**双向控制符也要压平**");
   assert.equal(
     validateProviderReport(providerReport({ group_name: "A\u0000B" }), asProvider).connections[0].groupName,
     "A B");
@@ -15414,6 +15417,13 @@ test("第五区 run 通道：只转述 inspectRunChannel 的结论 —— 未查
   assert.equal(sanitizeForDisplay("a" + String.fromCharCode(10) + "b" + ESC + "[2Jc" + String.fromCharCode(0x2028) + "d" + String.fromCharCode(0x61c) + "e" + String.fromCharCode(0x9f) + "f"),
     "a\uFFFDb\uFFFD[2Jc\uFFFDd\uFFFDe\uFFFDf");
   assert.equal(displaySafe("runs/evil" + ESC + "[2J-" + "b".repeat(64) + ".jsonl"), "runs/evil\uFFFD[2J-bbbbbbbb….jsonl", "未识别文件名：控制符压平 + 摘要脱敏");
+  // 边界是字符域不是 \b：下划线 / 字母 紧邻的摘要与 UUID 也要脱敏（评审探针 prefix_<摘要>.jsonl）。
+  const U = "01911111-2222-7333-8444-555555555555";
+  assert.equal(redactLocators("prefix_" + K + ".jsonl"), "prefix_01234567….jsonl");
+  assert.equal(redactLocators(K + "_suffix x_" + U + "_y"), "01234567…_suffix x_01911111…_y");
+  assert.equal(redactLocators("z" + K), "z01234567…", "字母紧邻也脱敏");
+  assert.equal(redactLocators("f" + "a".repeat(63) + "."), "faaaaaaa….", "恰好 64 位 hex 就是摘要形状");
+  assert.equal(redactLocators("a".repeat(65)), "a".repeat(65), "65 位 hex 不是 64 位摘要，不动");
   // 渲染进第五区（真实渲染函数）。
   assert.match(text(classified), /待处理事件[\s\S]*run 待发[\s\S]*run 卡住[\s\S]*ffffffff/u);
 });
@@ -15494,6 +15504,17 @@ test("真实 feishu-status：第五区报 run 通道的待发 / 卡住 / 账本�
   assert.equal(unbound.status, 0, unbound.stderr);
   assert.match(unbound.stdout, /run 通道[　 ]+说不清（not_bound）；账本里有 0 条待处理/u, unbound.stdout);
   assert.match(unbound.stdout, /runs 账本[　 ]+说不清 1 处[\s\S]*unrecognized_entry：runs\/unknown-entry/u, unbound.stdout);
+  // 未识别文件名里夹着完整摘要（prefix_<64 位>.jsonl）：经 inventoryRuns → inspectRunChannel → runChannelRows 真实链路，不许泄露。
+  const leakName = "prefix_" + "c".repeat(64) + ".jsonl";
+  fs.writeFileSync(path.join(bareRuns, leakName), "x");
+  const rc2 = inspectRunChannel({ root: bare, claudeSessionId: null });
+  const rows2 = runChannelRows(rc2);
+  assert.equal(JSON.stringify(rows2).includes("c".repeat(64)), false, "**完整摘要不许进第五区**：" + JSON.stringify(rows2));
+  assert.ok(rows2.some((r) => r[1] === "unrecognized_entry：runs/prefix_cccccccc….jsonl"), JSON.stringify(rows2));
+  const leaked = spawnSync(process.execPath, [path.resolve("scripts", "feishu-status.mjs"), "--project", bare],
+    { encoding: "utf-8", env: { ...env, HOME: bare, FEISHU_BRIDGE_REGISTRY: path.join(bare, "registry.json") }, timeout: 60_000 });
+  assert.equal(leaked.stdout.includes("c".repeat(64)), false, leaked.stdout);
+  assert.match(leaked.stdout, /prefix_cccccccc….jsonl/u);
 });
 
 test("claim 写原语：扩展对象覆盖不了固定身份字段", () => {

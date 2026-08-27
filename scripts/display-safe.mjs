@@ -18,8 +18,10 @@ export function sanitizeForDisplay(text) {
 /** locator 的形状：前缀受控，主体 ≥ 6 位。状态提供者的显示名校验与状态页脱敏共用。 */
 export const LOCATOR_SHAPED = /(?:oc_|omt_|om_|ou_|on_|session_|thread_|cli_)[A-Za-z0-9_-]{6,}/u;
 const LOCATOR_ALL = new RegExp(LOCATOR_SHAPED.source, "gu");
-const HEX_DIGEST = /\b[0-9a-fA-F]{64}\b/gu;
-const UUID = /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/gu;
+// **字符域边界，不用 \b**：下划线算 word character，prefix_<摘要>.jsonl 在 \b 下不匹配 ——
+// 真实的 unrecognized_entry 文件名就长这样（评审探针，完整摘要原样进了第五区）。
+const HEX_DIGEST = /(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])/gu;
+const UUID = /(?<![0-9a-fA-F])[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?![0-9a-fA-F])/gu;
 
 export function redactLocators(text) {
   return String(text ?? "")

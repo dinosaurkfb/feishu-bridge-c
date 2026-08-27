@@ -1,6 +1,7 @@
 /** Codex 精确 thread 的非阻塞投递与严格终局解析。 */
 
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { isCanonicalIso } from "../canonical-time.mjs";
@@ -194,12 +195,18 @@ export function isCodexInboundExecution(command) {
  */
 const RECEIPT_KEYS = ["artifact_type", "claim_key", "exit_code", "recorded_at",
   "schema_version", "signal", "status"].sort();
-const RECEIPT_KEYS_SPAWN_FAILED = [...RECEIPT_KEYS, "error"].sort();
+const RECEIPT_KEYS_WITH_ERROR = [...RECEIPT_KEYS, "error"].sort();
+// 成功回执多两份**内容摘要** —— 文件名绑定证明不了旁边两份内容是这个 run 的。
+const RECEIPT_KEYS_EXITED = [...RECEIPT_KEYS, "jsonl_sha256", "last_message_sha256"].sort();
+const SHA256_SHAPE = /^[0-9a-f]{64}$/u;
+const sha256 = (buf) => createHash("sha256").update(buf).digest("hex");
 
 function receiptProblem(doc, claimKey) {
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return "不是回执对象";
   const keys = Object.keys(doc).sort();
-  const want = doc.status === "spawn_failed" ? RECEIPT_KEYS_SPAWN_FAILED : RECEIPT_KEYS;
+  const want = doc.status === "exited" ? RECEIPT_KEYS_EXITED
+    : (doc.status === "spawn_failed" || doc.status === "artifacts_unreadable")
+      ? RECEIPT_KEYS_WITH_ERROR : RECEIPT_KEYS;
   const missing = want.filter((k) => !keys.includes(k));
   if (missing.length > 0) return "缺字段：" + missing.join("、");
   const extra = keys.filter((k) => !want.includes(k));
@@ -213,6 +220,11 @@ function receiptProblem(doc, claimKey) {
   if (doc.status === "exited") {
     if (doc.exit_code !== 0) return "status=exited 却 exit_code≠0";
     if (doc.signal !== null) return "status=exited 却带 signal";
+    if (!SHA256_SHAPE.test(String(doc.jsonl_sha256))) return "jsonl_sha256 不是 sha256 形状";
+    if (!SHA256_SHAPE.test(String(doc.last_message_sha256))) return "last_message_sha256 不是 sha256 形状";
+  } else if (doc.status === "artifacts_unreadable") {
+    if (doc.exit_code !== 0 || doc.signal !== null) return "artifacts_unreadable 的 exit_code/signal 形状不对";
+    if (typeof doc.error !== "string" || doc.error.length === 0) return "error 不是非空字符串";
   } else if (doc.status === "failed") {
     // child close 只会产出两种互斥事实：非零退出码（无信号）或被信号杀（无退出码）。
     // "两边都 null" 或 "两边都有" 都不是 runner 能写出来的东西。
@@ -257,13 +269,36 @@ export function verifyCodexRunCredential({ runsDir, claimKey, expectedThreadId }
   catch { return { state: "failed", reason: "exit_receipt_invalid", why: "不是 JSON" }; }
   const problem = receiptProblem(doc, claimKey);
   if (problem !== null) return { state: "failed", reason: "exit_receipt_invalid", why: problem };
-  // **验过的那份就是用的那份。**评审探针：第一次读到合法回执、第二次路径上换成
-  // 旧形状，内容判定若再从路径读一次，用的就是没验过的第二份（TOCTOU）。
+  // runner 自己说制品读不出来 —— 永远解释不成完成。
+  if (doc.status === "artifacts_unreadable") {
+    return { state: "failed", reason: "artifacts_unreadable", why: doc.error };
+  }
+  // **每份制品只读一次，先核摘要，再从同一份字节解析。**
+  // 核完摘要再按路径读一遍就会重现 TOCTOU；验过的那份就是用的那份 ——
+  // 回执如此（评审探针钉过），JSONL 与最终输出也如此。
+  const logPath = path.join(runsDir, claimKey + ".jsonl");
+  const lastMessagePath = path.join(runsDir, claimKey + ".last-message.txt");
+  let logBytes = null;
+  try { logBytes = fs.readFileSync(logPath); }
+  catch (err) { if (err?.code !== "ENOENT") return { state: "failed", reason: "artifact_unreadable", why: "jsonl" }; }
+  let lastBytes = null;
+  if (doc.status === "exited") {
+    // 成功回执必须配得上旁边两份内容：缺文件或摘要对不上都是"这不是这个 run 的"。
+    if (logBytes === null) return { state: "failed", reason: "artifact_unreadable", why: "jsonl" };
+    if (sha256(logBytes) !== doc.jsonl_sha256) {
+      return { state: "failed", reason: "artifact_digest_mismatch", why: "jsonl" };
+    }
+    try { lastBytes = fs.readFileSync(lastMessagePath); }
+    catch { return { state: "failed", reason: "artifact_unreadable", why: "last_message" }; }
+    if (sha256(lastBytes) !== doc.last_message_sha256) {
+      return { state: "failed", reason: "artifact_digest_mismatch", why: "last_message" };
+    }
+  }
   return readCodexRunOutcome({
-    logPath: path.join(runsDir, claimKey + ".jsonl"),
+    log: logBytes === null ? "" : logBytes.toString("utf-8"),
     exit: doc,
     errPath: path.join(runsDir, claimKey + ".stderr.log"),
-    lastMessagePath: path.join(runsDir, claimKey + ".last-message.txt"),
+    lastMessage: lastBytes === null ? null : lastBytes.toString("utf-8"),
     expectedThreadId,
   });
 }
@@ -273,10 +308,13 @@ export function verifyCodexRunCredential({ runsDir, claimKey, expectedThreadId }
  * 生产路径不直接调它 —— 走 verifyCodexRunCredential，那里先验回执身份、再派生路径。
  */
 export function readCodexRunOutcome({
-  logPath, exitPath, exit: exitDoc, lastMessagePath, errPath, expectedThreadId,
+  logPath, log, exitPath, exit: exitDoc, lastMessagePath, lastMessage, errPath, expectedThreadId,
 }) {
-  let raw = "";
-  try { raw = fs.readFileSync(logPath, "utf-8"); } catch { /* runner 可能刚启动 */ }
+  // 调用方给了字节（验真入口核过摘要的那份）就用那份，不再按路径读。
+  let raw = typeof log === "string" ? log : "";
+  if (typeof log !== "string") {
+    try { raw = fs.readFileSync(logPath, "utf-8"); } catch { /* runner 可能刚启动 */ }
+  }
 
   let observedThreadId = null;
   let turnStarted = false;
@@ -325,6 +363,9 @@ export function readCodexRunOutcome({
   if (exit.status === "spawn_failed") {
     return { state: "failed", reason: "runner_spawn_failed" };
   }
+  if (exit.status === "artifacts_unreadable") {
+    return { state: "failed", reason: "artifacts_unreadable" };
+  }
   if (turnFailed) return { state: "failed", reason: "turn_failed" };
   if (exit.exit_code !== 0) {
     let stderr = "";
@@ -341,7 +382,8 @@ export function readCodexRunOutcome({
   if (!turnCompleted) return { state: "failed", reason: "turn_completed_missing" };
 
   let finalText = null;
-  try { finalText = fs.readFileSync(lastMessagePath, "utf-8").trim(); } catch { /* below */ }
+  if (typeof lastMessage === "string") finalText = lastMessage.trim();
+  else { try { finalText = fs.readFileSync(lastMessagePath, "utf-8").trim(); } catch { /* below */ } }
   if (!finalText) return { state: "failed", reason: "final_message_missing" };
   return { state: "completed", finalText, recoverableErrors, observedThreadId };
 }

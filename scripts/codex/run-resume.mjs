@@ -15,6 +15,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 
 import { CLAIM_KEY_SHAPE } from "../claim.mjs";
@@ -50,10 +51,16 @@ let settled = false;
  *   schema_version  "1.0"
  *   claim_key       与文件名一致的 64 位十六进制
  *   recorded_at     规范 ISO
- *   status          exited | failed | spawn_failed
- *   exit_code       exited ⇒ 0；failed ⇒ 非零整数或 null；spawn_failed ⇒ null
- *   signal          exited ⇒ null；否则字符串或 null
- *   error           仅 spawn_failed 分支有，字符串
+ *   status          exited | failed | spawn_failed | artifacts_unreadable
+ *   exit_code       exited/artifacts_unreadable ⇒ 0；failed ⇒ 非零整数或 null；spawn_failed ⇒ null
+ *   signal          exited/artifacts_unreadable ⇒ null；failed ⇒ 与 exit_code 互斥两档
+ *   error           仅 spawn_failed / artifacts_unreadable 分支有，非空字符串
+ *   jsonl_sha256 / last_message_sha256   仅 exited 分支有 —— **内容绑定**。
+ *
+ * 为什么要内容摘要：三个路径都从 key 派生只能证明"B 的回执放在 B 的文件名下"，
+ * 证明不了旁边两份内容也是 B 的 —— 评审实测：保留 B 的合法回执、把 A 的 JSONL 与
+ * 最终输出覆盖到 B 的文件名，B 的 claim 就授权了 A 的答复。所以成功回执把这两份
+ * 字节的 SHA-256 一起封进去；算不出来就写 artifacts_unreadable，永远解释不成完成。
  */
 function writeExit(payload) {
   if (settled) return;
@@ -91,8 +98,27 @@ child.once("error", (error) => {
 });
 
 child.once("close", (code, signal) => {
-  writeExit({ status: code === 0 ? "exited" : "failed", exit_code: code, signal: signal ?? null });
-  process.exitCode = code === 0 ? 0 : 1;
+  if (code !== 0) {
+    writeExit({ status: "failed", exit_code: code, signal: signal ?? null });
+    process.exitCode = 1;
+    return;
+  }
+  // 先关掉我们自己持有的 fd 再读 —— 子进程已退出，内核写完了，但别留半点悬念。
+  try { fs.closeSync(out); } catch { /* 已关 */ }
+  let digests;
+  try {
+    digests = {
+      jsonl_sha256: createHash("sha256").update(fs.readFileSync(logPath)).digest("hex"),
+      last_message_sha256: createHash("sha256").update(fs.readFileSync(lastMessagePath)).digest("hex"),
+    };
+  } catch (error) {
+    writeExit({ status: "artifacts_unreadable", exit_code: 0, signal: null,
+      error: String(error?.message ?? error).slice(0, 300) || "unreadable" });
+    process.exitCode = 1;
+    return;
+  }
+  writeExit({ status: "exited", exit_code: 0, signal: null, ...digests });
+  process.exitCode = 0;
 });
 
 child.stdin.on("error", (error) => {

@@ -199,7 +199,12 @@ auditOutbox → outboxMutationBlocker → 查看器是否给命令
     是上游 Codex CLI 的可演进协议，采用"所消费字段严格、未知扩展兼容" ——
     全键封闭会让 CLI 增加一个无害字段就令发布链停摆。（偏离 ①）
   - 文件名与 key：watcher 入参先验形状；三个路径全部从 runsDir + key 派生，
-    回执内 `claim_key` 必须等于文件名 key —— 三个各自合法的文件不能跨 run 拼装。
+    回执内 `claim_key` 必须等于文件名 key。**评审第二轮更正**：文件名绑定只证明
+    "B 的回执放在 B 的文件名下"，证明不了旁边两份内容是 B 的（保留 B 的合法回执、
+    把 A 的 JSONL 与最终输出覆盖到 B 的文件名 → B 的 claim 授权了 A 的答复）。
+    所以成功回执再封两份**内容摘要**（`jsonl_sha256` / `last_message_sha256`，
+    runner 在原子写回执前算），验真器每份制品只读一次、先核摘要、再从同一份字节
+    解析；算不出摘要时 runner 写 `artifacts_unreadable`，永远解释不成完成。
   - 规范时间：只验回执 `recorded_at`；不给 JSONL / last-message 人造时间字段。
   - `run_state=completed`：**改为"验真器推导出的状态为 completed"**（exit 成功分支 +
     observed thread 匹配 + turn.started/completed + 无 turn.failed + 无递归 +

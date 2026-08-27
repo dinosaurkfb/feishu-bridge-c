@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -210,8 +211,11 @@ function digestFromDisk(outboxDir, select = (r) => r) {
 
 let recSeq = 0;
 
+const sha256Of = (buf) => createHash("sha256").update(buf).digest("hex");
+
 /**
- * 一张**合法的退出回执** —— 就是 run-resume.mjs 真会写出来的封闭形状。
+ * 一张**合法的退出回执骨架** —— run-resume.mjs 真会写出来的封闭形状，但**不含**
+ * 成功分支的两份内容摘要（那两份要看盘上的制品，见 stampReceipt）。
  * 覆盖字段用 patch；要造"缺字段/多字段"的样本自己动结果对象。
  */
 function exitReceipt(key, patch = {}) {
@@ -222,13 +226,28 @@ function exitReceipt(key, patch = {}) {
   };
 }
 
-/** 一套**完整的 run 终局证据**（jsonl + 退出回执 + 最终输出），全部从 key 派生文件名。 */
-function writeRunArtifacts({ runsDir, key, threadId, text = "答复", receipt = {} }) {
-  fs.writeFileSync(path.join(runsDir, key + ".jsonl"), [
+/** 按盘上**当前**的 jsonl / last-message 算摘要，写出一张成功回执（可再 patch）。 */
+function stampReceipt(runsDir, key, patch = {}) {
+  const doc = exitReceipt(key, {
+    jsonl_sha256: sha256Of(fs.readFileSync(path.join(runsDir, key + ".jsonl"))),
+    last_message_sha256: sha256Of(fs.readFileSync(path.join(runsDir, key + ".last-message.txt"))),
+    ...patch,
+  });
+  fs.writeFileSync(path.join(runsDir, key + ".exit.json"), JSON.stringify(doc));
+  return doc;
+}
+
+/**
+ * 一套**完整的 run 终局证据**（jsonl + 最终输出 + 带内容摘要的退出回执），
+ * 全部从 key 派生文件名。events 可换 JSONL 事件；receipt 只给失败分支用。
+ */
+function writeRunArtifacts({ runsDir, key, threadId, text = "答复", events = null, receipt = null }) {
+  fs.writeFileSync(path.join(runsDir, key + ".jsonl"), (events ?? [
     { type: "thread.started", thread_id: threadId }, { type: "turn.started" }, { type: "turn.completed" },
-  ].map(JSON.stringify).join("\n") + "\n");
-  fs.writeFileSync(path.join(runsDir, key + ".exit.json"), JSON.stringify(exitReceipt(key, receipt)));
+  ]).map(JSON.stringify).join("\n") + "\n");
   fs.writeFileSync(path.join(runsDir, key + ".last-message.txt"), text);
+  if (receipt) fs.writeFileSync(path.join(runsDir, key + ".exit.json"), JSON.stringify(exitReceipt(key, receipt)));
+  else stampReceipt(runsDir, key);
 }
 
 /**
@@ -1888,6 +1907,9 @@ printf '%s' "$prompt" > "$last"
   assert.deepEqual({ ...receipt, recorded_at: "<t>" }, {
     artifact_type: "codex_run_exit_receipt", schema_version: "1.0", claim_key: "a".repeat(64),
     recorded_at: "<t>", status: "exited", exit_code: 0, signal: null,
+    // 内容绑定：runner 在原子写回执前算的两份摘要，必须就是盘上这两份字节。
+    jsonl_sha256: sha256Of(fs.readFileSync(log)),
+    last_message_sha256: sha256Of(fs.readFileSync(last)),
   }, "回执形状必须跟读取端 verifyCodexRunCredential 认的完全一致");
   assert.equal(readCodexRunOutcome({ logPath: log, exitPath: exit, lastMessagePath: last,
     expectedThreadId: THREAD_A }).state, "completed");
@@ -2014,11 +2036,7 @@ test("关闭自动发布时 watcher 只把严格完成的最终答复兜底入�
   fs.mkdirSync(paths.claims, { recursive: true });
   fs.mkdirSync(paths.sessionLock, { recursive: true });
   const key = "a".repeat(64);
-  fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), [
-    { type: "thread.started", thread_id: THREAD_A }, { type: "turn.started" }, { type: "turn.completed" },
-  ].map(JSON.stringify).join("\n") + "\n");
-  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify(exitReceipt(key)));
-  fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "watcher final");
+  writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "watcher final" });
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -2049,11 +2067,7 @@ test("Codex watcher 严格完成后释放 Dialogue 活动回合", () => {
   }));
   fs.mkdirSync(paths.runs, { recursive: true });
   fs.mkdirSync(paths.sessionLock, { recursive: true });
-  fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), [
-    { type: "thread.started", thread_id: THREAD_A }, { type: "turn.started" }, { type: "turn.completed" },
-  ].map(JSON.stringify).join("\n") + "\n");
-  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify(exitReceipt(key)));
-  fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "dialogue final");
+  writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "dialogue final" });
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -2085,8 +2099,8 @@ test("watcher 抑制递归产生的错误答复，只保留风险回执", () => 
     } },
     { type: "turn.completed" },
   ].map(JSON.stringify).join("\n") + "\n");
-  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify(exitReceipt(key)));
   fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "EPERM stack");
+  stampReceipt(paths.runs, key);
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -6456,11 +6470,7 @@ test("watcher：资格一直卡住时要照实说原因，并留下恢复标记"
   fs.mkdirSync(paths.claims, { recursive: true });
   fs.mkdirSync(paths.sessionLock, { recursive: true });
   const key = "b".repeat(64);
-  fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), [
-    { type: "thread.started", thread_id: THREAD_A }, { type: "turn.started" }, { type: "turn.completed" },
-  ].map(JSON.stringify).join("\n") + "\n");
-  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify(exitReceipt(key)));
-  fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "卡住的答复");
+  writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "卡住的答复" });
 
   fs.mkdirSync(path.dirname(paths.publishLock), { recursive: true });
   assert.equal(acquirePublishLock(paths.publishLock).ok, true, "前提：别人正持着发布锁");
@@ -6570,11 +6580,7 @@ test("watcher 启动时的历史标记：撞上锁要等到有结论，不能只
 
   // 这一轮自己：run 已终局，资格能直接拿到。
   const key = "d".repeat(64);
-  fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), [
-    { type: "thread.started", thread_id: THREAD_A }, { type: "turn.started" }, { type: "turn.completed" },
-  ].map(JSON.stringify).join("\n") + "\n");
-  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify(exitReceipt(key)));
-  fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "这一轮的答复");
+  writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "这一轮的答复" });
 
   // **启动这一刻锁被别人占着，1.5 秒后放开** —— 只扫一次的实现会在这里放弃。
   fs.mkdirSync(path.dirname(paths.publishLock), { recursive: true });
@@ -7744,17 +7750,23 @@ test("verifyCodexRunCredential：回执身份与封闭 schema 逐字验，路径
   assert.equal(good.finalText, "完成了");
 
   const receiptPath = path.join(runsDir, key + ".exit.json");
+  // exited 样本要带内容摘要（缺了先撞"缺字段"，测不到目标分支）—— 用盘上真实制品算。
+  const stamped = (patch = {}) => stampReceipt(runsDir, key, patch);
   const bad = [
     ["旧形状（只有 exit_code）", { exit_code: 0 }, /缺字段/u],
-    ["claim_key 是别的 run", exitReceipt("2".repeat(64)), /claim_key 跟文件名对不上/u],
-    ["多出字段", exitReceipt(key, { run_state: "completed" }), /多出不认识的字段：run_state/u],
-    ["缺 signal", (() => { const r = exitReceipt(key); delete r.signal; return r; })(), /缺字段：signal/u],
-    ["recorded_at 不是规范时间", exitReceipt(key, { recorded_at: "刚才" }), /recorded_at 不是规范时间/u],
-    ["exited 却 exit_code=1", exitReceipt(key, { exit_code: 1 }), /exit_code≠0/u],
-    ["exited 却带 signal", exitReceipt(key, { signal: "SIGTERM" }), /带 signal/u],
+    ["exited 却没有内容摘要", exitReceipt(key), /缺字段：jsonl_sha256、last_message_sha256/u],
+    ["claim_key 是别的 run", stamped({ claim_key: "2".repeat(64) }), /claim_key 跟文件名对不上/u],
+    ["多出字段", stamped({ run_state: "completed" }), /多出不认识的字段：run_state/u],
+    ["缺 signal", (() => { const r = stamped(); delete r.signal; return r; })(), /缺字段：signal/u],
+    ["recorded_at 不是规范时间", stamped({ recorded_at: "刚才" }), /recorded_at 不是规范时间/u],
+    ["exited 却 exit_code=1", stamped({ exit_code: 1 }), /exit_code≠0/u],
+    ["exited 却带 signal", stamped({ signal: "SIGTERM" }), /带 signal/u],
+    ["摘要不是 sha256 形状", stamped({ jsonl_sha256: "abc" }), /jsonl_sha256 不是 sha256 形状/u],
+    // status 不认识的样本用骨架（不带摘要键）：键集按 status 分支封，带了摘要先撞键集。
     ["status 不认识", exitReceipt(key, { status: "done" }), /status 不在受控取值里/u],
-    ["artifact_type 不对", exitReceipt(key, { artifact_type: "receipt" }), /artifact_type/u],
-    ["schema 不认识", exitReceipt(key, { schema_version: "9" }), /schema_version 不认识/u],
+    ["artifact_type 不对", stamped({ artifact_type: "receipt" }), /artifact_type/u],
+    ["schema 不认识", stamped({ schema_version: "9" }), /schema_version 不认识/u],
+    ["artifacts_unreadable 缺 error", exitReceipt(key, { status: "artifacts_unreadable" }), /缺字段：error/u],
     ["failed 却 exit_code=0", exitReceipt(key, { status: "failed", exit_code: 0 }), /互斥两档/u],
     ["failed 两边都 null", exitReceipt(key, { status: "failed", exit_code: null }), /互斥两档/u],
     ["failed 两边都有", exitReceipt(key, { status: "failed", exit_code: 1, signal: "SIGTERM" }), /互斥两档/u],
@@ -7780,21 +7792,25 @@ test("verifyCodexRunCredential：回执身份与封闭 schema 逐字验，路径
     { status: "failed", exit_code: null, signal: "SIGKILL" })));
   assert.equal(verify().state, "failed", "被信号杀是合法的失败事实");
   fs.writeFileSync(receiptPath, JSON.stringify(exitReceipt(key,
+    { status: "artifacts_unreadable", error: "EIO" })));
+  assert.equal(verify().reason, "artifacts_unreadable", "runner 自己说读不到制品，永远不是完成");
+  fs.writeFileSync(receiptPath, JSON.stringify(exitReceipt(key,
     { status: "spawn_failed", exit_code: null, error: "ENOENT" })));
   assert.equal(verify().reason, "runner_spawn_failed");
 
   // 上游 JSONL 是可演进协议：**所消费字段严格、未知扩展兼容**（文档记下的偏离）。
-  fs.writeFileSync(receiptPath, JSON.stringify(exitReceipt(key)));
   fs.writeFileSync(path.join(runsDir, key + ".jsonl"), [
     { type: "thread.started", thread_id: THREAD_A, extra_new_field: 1 },
     { type: "some.future.event", payload: { anything: true } },
     { type: "turn.started" }, { type: "turn.completed", usage: { tokens: 1 } },
   ].map(JSON.stringify).join("\n") + "\n");
+  stampReceipt(runsDir, key);
   assert.equal(verify().state, "completed", "无害的未知字段/事件不许让发布链停摆");
   // 但所消费的字段仍严格：thread 对不上就不算。
   fs.writeFileSync(path.join(runsDir, key + ".jsonl"), [
     { type: "thread.started", thread_id: "别的 thread" }, { type: "turn.started" }, { type: "turn.completed" },
   ].map(JSON.stringify).join("\n") + "\n");
+  stampReceipt(runsDir, key);
   assert.equal(verify().reason, "thread_mismatch");
   // 合法 JSON 但不是事件对象：不许抛，计入 invalid_jsonl。
   for (const [why, line] of [["null", "null"], ["数组", "[1,2]"], ["数字", "42"], ["字符串", "\"x\""]]) {
@@ -7802,20 +7818,47 @@ test("verifyCodexRunCredential：回执身份与封闭 schema 逐字验，路径
       JSON.stringify({ type: "thread.started", thread_id: THREAD_A }), line,
       JSON.stringify({ type: "turn.started" }), JSON.stringify({ type: "turn.completed" }),
     ].join("\n") + "\n");
+    stampReceipt(runsDir, key);
     let r;
     assert.doesNotThrow(() => { r = verify(); }, why + "：**验真器对任何磁盘内容都不许抛**");
     assert.equal(r.reason, "invalid_jsonl", why);
   }
 
-  // 跨 run 拼装：把 key A 那套合法制品按 key B 的文件名放进去 —— 回执身份对不上。
+  // 跨 run 拼装 ①：把 A 那套合法制品整套按 B 的文件名放进去 —— 回执身份对不上。
   const other = "3".repeat(64);
-  writeRunArtifacts({ runsDir, key, threadId: THREAD_A });
+  // A 的 JSONL 要跟 B 的**字节不同**（同 thread 的标准三事件会一模一样，
+  // 那样"只换 JSONL"什么都没换，测了个寂寞）—— 给 A 一个无害的区分字段。
+  writeRunArtifacts({ runsDir, key, threadId: THREAD_A, text: "A 的答复", events: [
+    { type: "thread.started", thread_id: THREAD_A }, { type: "turn.started" },
+    { type: "turn.completed", usage: { run: "A" } }] });
   for (const suffix of [".jsonl", ".exit.json", ".last-message.txt"]) {
     fs.copyFileSync(path.join(runsDir, key + suffix), path.join(runsDir, other + suffix));
   }
   const forged = verify(other);
   assert.equal(forged.reason, "exit_receipt_invalid", JSON.stringify(forged));
   assert.match(forged.why, /claim_key 跟文件名对不上/u, "**三个合法文件不许跨 run 拼装**");
+
+  // 跨 run 拼装 ②（评审更正的那条）：**保留 B 自己的合法回执**，只把 A 的 JSONL /
+  // 最终输出覆盖到 B 的文件名 —— 文件名绑定看不出来，内容摘要才能。A/B 同一 thread。
+  writeRunArtifacts({ runsDir, key: other, threadId: THREAD_A, text: "B 的答复" });
+  assert.equal(verify(other).finalText, "B 的答复", "前提：B 自己的一套是完整的");
+  const swap = (suffix) => fs.copyFileSync(path.join(runsDir, key + suffix), path.join(runsDir, other + suffix));
+  for (const [why, suffixes, at] of [
+    ["只换 JSONL", [".jsonl"], "jsonl"],
+    ["只换最终输出", [".last-message.txt"], "last_message"],
+    ["两个都换", [".jsonl", ".last-message.txt"], "jsonl"],
+  ]) {
+    writeRunArtifacts({ runsDir, key: other, threadId: THREAD_A, text: "B 的答复" });
+    for (const s of suffixes) swap(s);
+    const r = verify(other);
+    assert.equal(r.state, "failed", why + "：**B 的 claim 不许授权 A 的答复** " + JSON.stringify(r));
+    assert.equal(r.reason, "artifact_digest_mismatch", why);
+    assert.equal(r.why, at, why);
+  }
+  // 成功回执配不上缺席的制品：也不是"仍在跑"。
+  writeRunArtifacts({ runsDir, key: other, threadId: THREAD_A, text: "B 的答复" });
+  fs.rmSync(path.join(runsDir, other + ".jsonl"));
+  assert.deepEqual(verify(other), { state: "failed", reason: "artifact_unreadable", why: "jsonl" });
 });
 
 test("verifyCodexRunCredential：验过的回执就是用的回执，不再从路径重读（TOCTOU）", () => {
@@ -7858,6 +7901,21 @@ test("verifyCodexRunCredential：验过的回执就是用的回执，不再从�
   const got = JSON.parse(r.stdout);
   assert.equal(got.state, "completed", "**验过的快照说了算**，不是路径上后来那份：" + r.stdout);
   assert.equal(fs.readFileSync(counter, "utf-8"), "1", "回执只许读一次");
+
+  // 最终输出同理：核过摘要的那份字节就是解析出 finalText 的那份。
+  writeRunArtifacts({ runsDir, key, threadId: THREAD_A, text: "完成" });
+  const lastPath = path.join(runsDir, key + ".last-message.txt");
+  fs.writeFileSync(probe, fs.readFileSync(probe, "utf-8")
+    .replace("JSON.stringify({ exit_code: 1 })", "\"篡改后的答复\""));
+  const r2 = spawnSync(process.execPath, ["--import", pathToFileURL(probe).href, driver],
+    { encoding: "utf-8", env: { ...isolatedEnv(), SWAP_TARGET: lastPath, READS: counter,
+      RUNS: runsDir, KEY: key, TH: THREAD_A } });
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.equal(fs.readFileSync(lastPath, "utf-8"), "篡改后的答复", "探针没生效");
+  const got2 = JSON.parse(r2.stdout);
+  assert.equal(got2.state, "completed", r2.stdout);
+  assert.equal(got2.finalText, "完成", "**finalText 来自核过摘要的那份字节**");
+  assert.equal(fs.readFileSync(counter, "utf-8"), "1", "最终输出只许读一次");
 });
 
 test("watcher：历史标记指向的 JSONL 有非对象行，不许在 session lock 保护建立前崩掉（真实 CLI）", () => {
@@ -7886,6 +7944,7 @@ test("watcher：历史标记指向的 JSONL 有非对象行，不许在 session 
   fs.writeFileSync(path.join(paths.runs, oldKey + ".jsonl"),
     JSON.stringify({ type: "thread.started", thread_id: THREAD_A }) + "\nnull\n" +
     JSON.stringify({ type: "turn.started" }) + "\n" + JSON.stringify({ type: "turn.completed" }) + "\n");
+  stampReceipt(paths.runs, oldKey);
   // 这一轮自己正常。
   const key = "6".repeat(64);
   writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "这一轮" });
@@ -8015,7 +8074,7 @@ test("恢复是授权：恢复标记说 completed 也不算，run 复合凭据�
   assert.equal(noRuns.ok, false);
   assert.equal(noRuns.reason, "runs_dir_required");
   // 凭据合法 → 照常恢复。
-  fs.writeFileSync(receipt, JSON.stringify(exitReceipt(g.key)));
+  stampReceipt(g.runsDir, g.key);
   g.marker();
   assert.equal(recoverEligibilityPending(g.args()).recovered.length, 1, "干净时必须照常放行");
 });

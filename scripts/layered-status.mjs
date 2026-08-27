@@ -220,10 +220,58 @@ const OUTBOUND_ROUTING_TEXT = {
   disabled: "**登记表里这条是停用的** —— 出站会跳过它，答复发不出去",
 };
 
+/**
+ * 状态页只给人看 key 的前 8 位；why 里可能夹着文件名（含完整 key）或消息 id（locator）——
+ * 一律脱敏。判据不在这里：这个函数只转述 inspectRunChannel 的结论。
+ */
+export function redactRunText(text) {
+  return String(text ?? "")
+    .replace(/[0-9a-f]{64}/gu, (m) => m.slice(0, 8) + "…")
+    .replace(/\bom_[A-Za-z0-9_-]+/gu, "om_…");
+}
+const shortKey = (key) => (typeof key === "string" && key.length > 0 ? key.slice(0, 8) : "--------");
+
+/**
+ * 待处理事件第五区里 run 通道那几行 —— **只转述，不判断**：分类来自 inspectRunChannel（与排空同一份判据）。
+ * 没查 / 解析不出 / runs 账本打不开 / 绑定暂停未分类，各自明写，不折叠成 0，不伪造成正常。
+ */
+export function runChannelRows(rc, now = Date.now()) {
+  if (rc === undefined || rc === null) return [["run 通道", "未查（本次没读 runs 账本）"]];
+  const rows = [];
+  const problems = rc.runs?.problems ?? [];
+  if (rc.inventoryOk === false) {
+    const p = problems.find((x) => x.key === null) ?? problems[0];
+    rows.push(["run 通道", "说不清（" + (p?.reason ?? "runs 账本读不出") + (p?.why ? "：" + redactRunText(p.why) : "") + "）"]);
+    return rows;
+  }
+  if (rc.phase === "unresolved") {
+    rows.push(["run 通道", "说不清（" + String(rc.reason ?? "unresolved") + "）；账本里有 " + (rc.waiting?.count ?? 0) + " 条待处理"]);
+  } else if (rc.phase === "paused") {
+    rows.push(["run 通道", "暂停中未分类：" + (rc.waiting?.count ?? 0) + " 条待处理（恢复绑定后由排空分类并发出）"]);
+  } else {
+    const oldest = relative(rc.waiting?.oldestMs, now);
+    rows.push(["run 待发", (rc.waiting?.count ?? 0) + " 条" + (oldest && rc.waiting.count > 0 ? "（最老 " + oldest + "）" : "")]);
+    const stuck = rc.runs?.stuck ?? [];
+    rows.push(["run 卡住", stuck.length + " 条" + (stuck.length ? "（需要人看）" : "")]);
+    for (const x of stuck) rows.push(["  " + shortKey(x.key), x.reason + (x.why ? "：" + redactRunText(x.why) : "")]);
+    const du = rc.runs?.deliveredUnrecorded ?? [];
+    if (du.length > 0) {
+      rows.push(["run 送达未落标", du.length + " 条（下一轮可能重发，先去话题核对）"]);
+      for (const x of du) rows.push(["  " + shortKey(x.key), redactRunText(x.error ?? "")]);
+    }
+  }
+  const listed = problems.filter((x) => x.key !== null || rc.phase !== "unresolved");
+  rows.push(["runs 账本", listed.length ? "说不清 " + listed.length + " 处" : "无异常"]);
+  for (const x of listed) rows.push(["  " + shortKey(x.key), x.reason + (x.why ? "：" + redactRunText(x.why) : "")]);
+  return rows;
+}
+
 export function composeLayeredStatus({
   st, others = [], endpoint, subscription, connectivity = null,
   otherLinks = null, outboundRouting = null, now = Date.now(),
   bindHint = "node scripts/bind-project.mjs --apply",
+  // run 通道状态（inspectRunChannel 的结论）。不传 = 没查，第五区明写"未查"，不伪造成 0。
+  runChannel = undefined,
 }) {
   // 别的链路里能归层的，直接进对应层；归不了的留给附录。
   const split = otherLinks ? splitByRelation(otherLinks.sections) : { byLayer: null, unsorted: [] };
@@ -293,7 +341,8 @@ export function composeLayeredStatus({
       // 待处理区也要跟着分开 —— 上一版两种情形共用"不适用（尚未绑定）"，
       // 正是我在第 3 层要求分开的那件事，自己在这里又合回去了。
       pendingEvents: [["待发布答复", st.reason === "not_bound"
-        ? "不适用（尚未绑定）" : "不适用（绑定状态不可读）"]],
+        ? "不适用（尚未绑定）" : "不适用（绑定状态不可读）"],
+        ...runChannelRows(runChannel, now)],
       connectivity,
       suspended: false,
     };
@@ -357,7 +406,8 @@ export function composeLayeredStatus({
 
   for (const c of split.byLayer?.policy ?? []) L4.push(relationRow(c));
 
-  const L5 = [["待发布答复", st.pending + " 条" + (st.pending && st.suspended ? "（恢复后会发出）" : "")]];
+  const L5 = [["待发布答复", st.pending + " 条" + (st.pending && st.suspended ? "（恢复后会发出）" : "")],
+    ...runChannelRows(runChannel, now)];
 
   return {
     layers: [

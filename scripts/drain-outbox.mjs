@@ -168,14 +168,8 @@ export function drainProject({
   // 排空要看一眼 runs —— 用 run 通道自己的账本（claim 互斥 / 回执三态）发，不另立账本。
   // **run 是事务外第二通道**：outbox 损坏不该截断它，所以 outbox 预检的结论先存着，
   // run 通道照常跑，最后两侧结果合在一起返回。runs 账本自己坏了也要作为 problems 报出来。
-  const runsDir = path.join(root, ".runtime-data", "inbound", "runs");
-  const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
-  const inventory = inventoryRuns({ runsDir, claimsDir });
-  const runProblems = inventory.ok ? inventory.problems
-    : [{ key: null, reason: inventory.reason, why: inventory.error ?? null }];
-  const pendingRuns = inventory.ok ? inventory.runs.filter((r) => r.eligible) : [];   // 账本 hold 的也进来，按 stuck 报
-  const runsIdle = () => ({ pending: pendingRuns.length, published: [], skipped: [], stuck: [],
-    deliveredUnrecorded: [], problems: runProblems, dryRun: dryRun === true });
+  const { runsDir, claimsDir, inventory, runProblems, pendingRuns, runsIdle } = runChannelContext({ root, dryRun });
+  void inventory;
   const nothingToDo = pendingRuns.length === 0 && runProblems.length === 0;
   // 所有返回都带 runs 段 —— 消费方不用猜"没有这段"是没跑还是没东西。
   if (preflight && nothingToDo) return { status: "error", root, ...preflight, local: true, runs: runsIdle() };
@@ -349,6 +343,61 @@ function readTerminalRecord({ claimsDir, key }) {
     return { ok: false, reason: "terminal_unbound", why: "终局记录没有绑定路由摘要（route_sha256）" };
   }
   return { ok: true, state, runState: doc.run_state, artifactSha256: doc.artifact_sha256, routeSha256: doc.route_sha256 };
+}
+
+/**
+ * run 通道的准备段 —— drainProject 与 inspectRunChannel **共用**：盘点、待处理集合、空闲形状。
+ * 两边各写一遍就会分叉出第二份判据。
+ */
+function runChannelContext({ root, dryRun }) {
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs");
+  const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
+  const inventory = inventoryRuns({ runsDir, claimsDir });
+  const runProblems = inventory.ok ? inventory.problems
+    : [{ key: null, reason: inventory.reason, why: inventory.error ?? null }];
+  const pendingRuns = inventory.ok ? inventory.runs.filter((r) => r.eligible) : [];   // 账本 hold 的也进来，按 stuck 报
+  const runsIdle = () => ({ pending: pendingRuns.length, published: [], skipped: [], stuck: [],
+    deliveredUnrecorded: [], problems: runProblems, dryRun: dryRun === true });
+  return { runsDir, claimsDir, inventory, runProblems, pendingRuns, runsIdle };
+}
+
+/**
+ * **只读地看 run 通道**（FR-10 状态页用）：判据与 drainProject 是同一段代码 ——
+ * 同一份盘点、同一个 drainRunResults 以 dryRun 跑一遍；不 claim、不改盘、不发布。
+ *   phase  classified —— 绑定 active，stuck / problems 已按排空的判据分类；waiting 是 dry-run 将发的那批
+ *          paused     —— 绑定暂停：排空不会分类 stuck，只报待处理条数与账本问题（不伪造成 0 条卡住）
+ *          unresolved —— 项目 / 配置解析不出来（reason）
+ *   inventoryOk false 时 runs.problems 里就是 runs_unreadable / runs_not_a_directory 那一条。
+ */
+export function inspectRunChannel({ root, claudeSessionId } = {}) {
+  const ctx = runChannelContext({ root, dryRun: true });
+  const oldestOf = (keys) => {
+    const times = ctx.pendingRuns.filter((r) => keys.has(r.key)).map((r) => r.modifiedAt).filter(Number.isFinite);
+    return times.length > 0 ? Math.min(...times) : null;
+  };
+  const resolved = resolveProject({ root, claudeSessionId });
+  if (!resolved.ok) {
+    return { phase: "unresolved", reason: resolved.reason, inventoryOk: ctx.inventory.ok, runs: ctx.runsIdle(),
+      waiting: { count: ctx.pendingRuns.length, oldestMs: oldestOf(new Set(ctx.pendingRuns.map((r) => r.key))) } };
+  }
+  if (!resolved.config) {
+    return { phase: "unresolved", reason: resolved.configError?.reason ?? "config_unreadable", inventoryOk: ctx.inventory.ok,
+      runs: ctx.runsIdle(), waiting: { count: ctx.pendingRuns.length, oldestMs: oldestOf(new Set(ctx.pendingRuns.map((r) => r.key))) } };
+  }
+  const { config: cfg, mapping } = resolved;
+  if (mapping.status !== "active") {
+    return { phase: "paused", reason: "mapping_not_active", inventoryOk: ctx.inventory.ok, runs: ctx.runsIdle(),
+      waiting: { count: ctx.pendingRuns.length, oldestMs: oldestOf(new Set(ctx.pendingRuns.map((r) => r.key))) } };
+  }
+  const runs = drainRunResults({
+    root, runsDir: ctx.runsDir, claimsDir: ctx.claimsDir, pendingRuns: ctx.pendingRuns, problems: ctx.runProblems,
+    mapping, cfg, id: resolveLarkIdentity(cfg), dryRun: true,
+    publish: () => { throw new Error("inspectRunChannel 是只读的：不许发布"); },
+    claudeSessionId: resolved.claudeSessionId ?? mapping.claude_session_id ?? claudeSessionId,
+  });
+  const willPublish = new Set(runs.published.map((p) => p.key));
+  return { phase: "classified", reason: null, inventoryOk: ctx.inventory.ok, runs,
+    waiting: { count: willPublish.size, oldestMs: oldestOf(willPublish) } };
 }
 
 /**

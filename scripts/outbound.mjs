@@ -169,8 +169,10 @@ export function readRunSnapshot({ runsDir, key }) {
   const outcome = parseRunOutcome(bytes.toString("utf-8"));
   const receipt = readRunReceipt({ runsDir, key });
   const ledger = readPublishLedger({ runsDir, key });
+  let modifiedAt = null;   // 制品最后写入时间：状态页算"最老一条等了多久"用；拿不到就 null，不猜
+  try { modifiedAt = fs.statSync(p.jsonl).mtimeMs; } catch { /* 留 null */ }
   return { ok: true, bytes, sha256: createHash("sha256").update(bytes).digest("hex"),
-    run: describeRun({ key, logPath: p.jsonl, outcome, receipt, ledger }), receipt, ledger };
+    run: { ...describeRun({ key, logPath: p.jsonl, outcome, receipt, ledger }), modifiedAt }, receipt, ledger };
 }
 
 /** 终局凭据绑定的**路由投影**摘要：绑定、会话、来源代际、解析后的目标 —— 写方与读方共用。 */

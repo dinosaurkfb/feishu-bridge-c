@@ -21,6 +21,7 @@ import { bindingsForRoot, currentBinding } from "./feishu-control.mjs";
 import { buildClaudeSubscriptionProjection } from "./inbound-route.mjs";
 import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { checkEndpoint } from "./endpoint-self-check.mjs";
+import { inspectRunChannel } from "./drain-outbox.mjs";
 import {
   composeLayeredStatus, endpointFacts, outboundRoutingFact, renderLayeredStatus,
   splitByRelation, subscriptionFacts,
@@ -70,6 +71,8 @@ const outboundRouting = outboundRoutingFact({
 
 console.log(renderLayeredStatus(composeLayeredStatus({
   st,
+  // FR-10：最近 run / publish 的状态 —— 只读 dryRun，判据与排空同一份。
+  runChannel: inspectRunChannel({ root, claudeSessionId }),
   outboundRouting,
   others: bindingsForRoot({ root }),
   endpoint: endpointFacts({

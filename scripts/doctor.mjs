@@ -19,9 +19,11 @@
  * **三态**：每项 ok ∈ {true, false, null}。null = 本地查不出来，既不是通过也不是故障；
  * 汇总 ready（全 true）/ blocked（任一 false）/ incomplete（无 false、有 null），退出码 0 / 1 / 2。
  *
- * **不写任何文件、不装、不发飞书、不给"一键修复"**：每条 fail 的 next 只能是既有显式入口的
- * 命令，且是预览形式（不带 --apply）。沙箱（HOME 被覆盖）里不碰真实 launchctl —— 除非显式注入了
- * FEISHU_BRIDGE_LAUNCHCTL（那是测试隔离点），否则兜底定时器那一项报 unknown 并说明。
+ * **doctor 自己的代码不写任何文件、不装、不发飞书、不给"一键修复"**：每条 fail 的 next 只能是既有
+ * 显式入口的命令，且是预览形式（不带 --apply）。**只读的边界明说**：登记的状态入口脚本是外部代码，
+ * 默认不执行（② 报"未探测"）；加 --probe-providers 才执行，它们的副作用属于登记入口自己的信任边界。
+ * 沙箱（HOME 被覆盖）里不碰真实 launchctl —— 除非显式注入了 FEISHU_BRIDGE_LAUNCHCTL（那是测试隔离点），
+ * 否则兜底定时器那一项报 unknown 并说明。
  */
 
 import fs from "node:fs";
@@ -38,7 +40,7 @@ import { collectConnectivity, loadStatusProviders, statusProvidersPath } from ".
 import { resolveProject } from "./project-resolve.mjs";
 import { pendingGeneration } from "./topic-generation.mjs";
 import { verifyRuntime } from "./runtime-install.mjs";
-import { CLAUDE_DRAIN_LAUNCH_LABEL } from "./drain-schedule.mjs";
+import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode } from "./drain-schedule.mjs";
 import { spawnSync } from "node:child_process";
 import { LAUNCHCTL_ENV, PHASE_TEXT, loadedPhase } from "./launchd-job.mjs";
 
@@ -61,14 +63,40 @@ const list = (items, f) => items.map(f).map(displaySafe).join("；");
  * 跑完整体检。**纯读**：所有输入都来自既有读模型；now / launchctl 注入只为测试。
  * @returns {{overall:"ready"|"blocked"|"incomplete", checks:object[], next:string[]}}
  */
+/**
+ * 一台机器的控制面在哪 —— **所有路径与子进程环境都从同一份 home 派生**。
+ * 环境变量覆盖点（FEISHU_BRIDGE_*、CODEX_HOME）仍然优先：那是既有的隔离契约。
+ */
+export function machineContext({ home = os.homedir() } = {}) {
+  const bridge = path.join(home, ".claude", "feishu-bridge");
+  const codexHome = process.env.CODEX_HOME || path.join(home, ".codex");
+  return {
+    home,
+    registryFile: process.env.FEISHU_BRIDGE_REGISTRY || path.join(bridge, "registry.json"),
+    routesFile: process.env.FEISHU_BRIDGE_ROUTES || path.join(bridge, "routes.json"),
+    providersFile: process.env.FEISHU_BRIDGE_STATUS_PROVIDERS || path.join(bridge, "status-providers.json"),
+    codexEnv: { ...process.env, HOME: home, CODEX_HOME: codexHome,
+      FEISHU_CODEX_BRIDGE_HOME: process.env.FEISHU_CODEX_BRIDGE_HOME || path.join(codexHome, "feishu-bridge") },
+  };
+}
+
+/** 默认不执行状态入口脚本时给 collectConnectivity 的替身：统一报"未探测"。 */
+const NOT_PROBED = () => ({ ok: false, reason: "not_probed" });
+
 export function runDoctor({
   now = Date.now(),
   home = os.homedir(),
-  registryFile = registryPath(),
-  routesFile = routesPath(),
-  providersFile = statusProvidersPath(),
+  registryFile = undefined,
+  routesFile = undefined,
+  providersFile = undefined,
   launchctl = undefined,
+  // **默认不执行状态入口脚本**：它们是外部代码，可能写盘 —— 只有显式要求才跑，副作用属于登记入口自己的信任边界。
+  probeProviders = false,
 } = {}) {
+  const ctx = machineContext({ home });
+  registryFile = registryFile ?? ctx.registryFile;
+  routesFile = routesFile ?? ctx.routesFile;
+  providersFile = providersFile ?? ctx.providersFile;
   const checks = [];
   const add = (id, name, ok, detail, next = null) => checks.push({ id, name, ok, detail: displaySafe(detail), next });
 
@@ -95,10 +123,10 @@ export function runDoctor({
     null);
 
   // ── ① ② 路由 ↔ 状态入口（collectConnectivity 是唯一判据：unregistered / unavailable / disabled）
-  const links = collectConnectivity({ routesFile, providersFile });
+  const links = collectConnectivity({ routesFile, providersFile, ...(probeProviders ? {} : { run: NOT_PROBED }) });
   const tablesUnclear = links.providersProblem !== null || links.routesProblem !== null;
   const unregistered = links.sections.filter((s) => s.state === "unregistered");
-  const unavailable = links.sections.filter((s) => s.state === "unavailable");
+  const unavailable = links.sections.filter((s) => s.state === "unavailable" && s.reason !== "not_probed");
   add("route_without_provider", "① route 有状态入口",
     tablesUnclear ? null : unregistered.length === 0,
     tablesUnclear ? "路由表或状态入口表读不出来，查不清（" + (links.routesProblem ?? links.providersProblem) + "）"
@@ -106,8 +134,9 @@ export function runDoctor({
       : unregistered.length + " 条路由没有状态入口：" + list(unregistered, (s) => s.id),
     unregistered.length > 0 ? PREVIEW.registerProvider : null);
   add("provider_runs", "② 状态入口能跑",
-    tablesUnclear ? null : unavailable.length === 0,
+    tablesUnclear ? null : !probeProviders ? null : unavailable.length === 0,
     tablesUnclear ? "查不清（表读不出来）"
+      : !probeProviders ? "未探测（默认不执行状态入口脚本；加 --probe-providers 才执行，其副作用属于登记入口自己的信任边界）"
       : unavailable.length === 0 ? "登记的状态入口都跑得起来（停用的不算）"
       : unavailable.length + " 个状态入口跑不起来：" + list(unavailable, (s) => s.id + "（" + (s.reason ?? "说不清") + "）"),
     unavailable.length > 0 ? PREVIEW.registerProvider : null);
@@ -152,7 +181,10 @@ export function runDoctor({
     if (typeof root !== "string" || !path.isAbsolute(root)) { unclear.push(name + "（root 不是绝对路径）"); continue; }
     const resolved = resolveProject({ root, claudeSessionId, registryFile });
     if (!resolved.ok) { unclear.push(name + "（" + resolved.reason + "）"); }
-    else {
+    else if (resolved.mapping?.status === "invalid") {
+      // 解析层已经判 invalid（话题代际状态解释不了）：不能从局部可读的日期推出"在有效期内"。
+      unclear.push(name + "（解析层判 invalid：" + String(resolved.mapping.topic_generation_error ?? "说不清") + "）");
+    } else {
       const m = resolved.mapping;
       const exp = Date.parse(m?.expires_at ?? "");
       if (Number.isFinite(exp)) {
@@ -200,10 +232,12 @@ export function runDoctor({
   let claudePhaseWhy = null;
   if (sandboxed && !injected) { claudePhaseWhy = "HOME 被覆盖（沙箱），不碰真实 launchctl"; }
   else {
-    try { claudePhase = loadedPhase(launchctl, null, CLAUDE_DRAIN_LAUNCH_LABEL); }
+    // 核**完整 ProgramArguments**，不只看同名 job 在不在（评审探针：同名 job 跑 /bin/echo 也曾被说成在发）。
+    try { claudePhase = loadedPhase(launchctl, claudeDrainExpectedJob({ home, node: pickClaudeNode() }), CLAUDE_DRAIN_LAUNCH_LABEL); }
     catch (err) { claudePhaseWhy = String(err?.message ?? err).slice(0, 120); }
   }
-  const publisherRunning = claudePhase === "loaded" ? true : claudePhase === "installed_not_loaded" ? false : null;
+  const publisherRunning = claudePhase === "loaded" ? true
+    : (claudePhase === "installed_not_loaded" || claudePhase === "loaded_other") ? false : null;
   const publisherText = claudePhaseWhy ? "兜底定时器状态查不清（" + claudePhaseWhy + "）"
     : "兜底定时器 " + (PHASE_TEXT[claudePhase] ?? claudePhase);
   const backlogText = (backlog > 0 ? "积压 " + backlog + " 条" : "无积压") +
@@ -225,7 +259,7 @@ export function runDoctor({
     add("codex_drain", "⑥ 积压有人发（Codex 侧）", null, "HOME 被覆盖（沙箱），不碰真实 launchctl；Codex 侧查不清", null);
   } else {
     const codexDoctor = path.join(moduleDir(import.meta.url), "codex", "doctor.mjs");
-    const r = spawnSync(process.execPath, [codexDoctor, "--json"], { encoding: "utf-8", timeout: 60_000, env: process.env });
+    const r = spawnSync(process.execPath, [codexDoctor, "--json"], { encoding: "utf-8", timeout: 60_000, env: ctx.codexEnv });
     let codexReport = null;
     try { codexReport = JSON.parse(r.stdout ?? ""); } catch { /* 下面按读不出报 */ }
     const drain = codexReport?.checks?.find?.((c) => c.name === "兜底排空") ?? null;
@@ -266,12 +300,12 @@ export const DOCTOR_EXIT = Object.freeze({ ready: 0, blocked: 1, incomplete: 2 }
 
 if (isDirectRun(import.meta.url)) {
   const args = process.argv.slice(2);
-  const unknown = args.filter((a) => a !== "--json");
+  const unknown = args.filter((a) => a !== "--json" && a !== "--probe-providers");
   if (unknown.length > 0) {
-    console.error("参数不对：" + unknown.join(" ") + " —— 只接受 --json。体检只读，没有别的开关。");
+    console.error("参数不对：" + unknown.join(" ") + " —— 只接受 --json 与 --probe-providers。体检只读，没有别的开关。");
     process.exit(1);
   }
-  const report = runDoctor();
+  const report = runDoctor({ probeProviders: args.includes("--probe-providers") });
   if (args.includes("--json")) process.stdout.write(JSON.stringify(report, null, 2) + "\n");
   else console.log(renderDoctor(report));
   process.exit(DOCTOR_EXIT[report.overall]);

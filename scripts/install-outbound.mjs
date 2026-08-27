@@ -17,7 +17,7 @@
  *   node scripts/install-outbound.mjs --uninstall --apply
  */
 
-import { CLAUDE_DRAIN_LAUNCH_LABEL } from "./drain-schedule.mjs";
+import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode } from "./drain-schedule.mjs";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -52,26 +52,8 @@ const RUNTIME_BRIDGE_ROOT = path.dirname(path.dirname(HOOK_SCRIPT));
 const INBOUND_HOOK_SCRIPT = runtimeScript("inbound-hook.mjs");
 const LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "stop-hook.log");
 
-/**
- * 钩子的环境不保证继承交互 shell 的 PATH，所以 node 要写绝对路径。
- *
- * 但**不能**写 process.execPath —— 它是 realpath 过的，在这台机器上是
- * /opt/homebrew/Cellar/node/26.0.0/bin/node，带版本号。brew 升一次 node 这个路径就没了，
- * 而钩子的失败又是安静的，出站会无声停摆。优先取 brew 那个不带版本的稳定软链。
- */
-function pickNode() {
-  for (const c of ["/opt/homebrew/bin/node", "/usr/local/bin/node"]) {
-    try {
-      fs.accessSync(c, fs.constants.X_OK);
-      return c;
-    } catch {
-      /* 试下一个 */
-    }
-  }
-  return process.execPath;
-}
-
-const NODE_BIN = pickNode();
+// node 的选择只有一份（drain-schedule.mjs）—— 定时器 plist 与 doctor 的期望 job 同源。
+const NODE_BIN = pickClaudeNode();
 
 /** 埋进命令里的显式归属标记：与脚本路径无关，换克隆、换 runtime 都认得出自己那条。 */
 const HOOK_TAG = "FEISHU_BRIDGE_HOOK:";
@@ -375,7 +357,9 @@ const skillAction = skillPlan.some((s) => s.action === "source-missing") ? "sour
 const LAUNCH_LABEL = CLAUDE_DRAIN_LAUNCH_LABEL;
 const PLIST = path.join(os.homedir(), "Library", "LaunchAgents", LAUNCH_LABEL + ".plist");
 const DRAIN_LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "drain.log");
-const DRAIN_SCRIPT = runtimeScript("drain-outbox.mjs");
+// ProgramArguments 只有一份定义（drain-schedule.mjs）—— doctor 核 launchd 时对的就是这三项。
+const DRAIN_JOB = claudeDrainExpectedJob({ home: os.homedir(), node: NODE_BIN });
+const DRAIN_SCRIPT = DRAIN_JOB.args[1];
 
 // --all：兜底要覆盖登记表里所有项目。只排本仓库的话，后接进来的项目就没有兜底了。
 const plistBody = `<?xml version="1.0" encoding="UTF-8"?>
@@ -385,9 +369,7 @@ const plistBody = `<?xml version="1.0" encoding="UTF-8"?>
   <key>Label</key><string>${LAUNCH_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${NODE_BIN}</string>
-    <string>${DRAIN_SCRIPT}</string>
-    <string>--all</string>
+${DRAIN_JOB.args.map((a) => "    <string>" + a + "</string>").join("\n")}
   </array>
   <key>WorkingDirectory</key><string>${RUNTIME_BRIDGE_ROOT}</string>
   <key>StartInterval</key><integer>1800</integer>

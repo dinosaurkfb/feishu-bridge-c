@@ -1,11 +1,17 @@
 /**
- * resnapshot 的落盘地基（FR-2.5 后半段的**第一块**，不是全部）。
+ * FR-2.5 订阅同步的落盘控制面：resnapshot / suspend / migrate 三种动作都在这里落。
  *
- * **写清楚它不是什么**：这里只处理 resnapshot。suspend / migrate 返回
- * unsupported_action —— "被撤销的授权长什么样"是个契约问题，评审已经定了形状
- * （新 revision、status=paused、新增受控原因 subscription_revoked、
- * 同一 operation 内同步暂停 binding 控制状态），但还没实现。
- * 在那之前，**不许把这个模块说成"FR-2.5 落盘链路已完成"**。
+ * ■ suspend（评审定案的形状）
+ *   目标快照 = 沿用现有快照内容、新 revision、status=paused、受控 reason
+ *   （subscription_paused 照抄；订阅撤销 / 不再覆盖 → subscription_revoked）；
+ *   **同一个 operation、同一份恢复清单**里还有第二笔：经注入的 bindingControl 端口把该
+ *   binding 的控制状态翻成 paused（同一个 reason）。两笔各自过 CAS（快照四字段；控制状态
+ *   必须还是 active），任一笔前置不成立整批零写入；中途失败按 prepared/committed 恢复 ——
+ *   不许出现"快照说 paused、控制状态还是 active"或反过来的半成品被记成成功。
+ * ■ migrate
+ *   目标订阅**在锁内从 world.others 重读**并重新物化（计划条目只带 id），目标订阅版本进
+ *   expect（to_subscription_version）与指纹：预览之后目标变了 → plan_stale。
+ * ■ 写入口（CLI）仍未开放 —— FR-2.6 多订阅歧义拒绝未经真实样本验证是另一条前置。
  *
  * 计划器（subscription-sync.mjs）只算不写。这里负责写，而写是有损的 ——
  * 所以整段设计都围着一个问题：**怎么保证写下去的东西，还是当初算出来的那份。**
@@ -40,7 +46,9 @@ import path from "node:path";
 
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import {
-  materializeDialogueBindingAuthorization, validateDialogueBindingAuthorizationSnapshot,
+  BINDING_AUTHORIZATION_REASON, BINDING_AUTHORIZATION_STATUS, PAUSED_REASONS,
+  materializeDialogueBindingAuthorization, materializeSuspendedAuthorization,
+  validateDialogueBindingAuthorizationSnapshot,
 } from "./dialogue-binding-authorization.mjs";
 import { SYNC_ACTION, planSubscriptionSync } from "./subscription-sync.mjs";
 import { isCanonicalIso } from "./canonical-time.mjs";
@@ -66,11 +74,17 @@ const canonicalItem = (it) => ({
   action: it.action ?? null,
   to: it.to ?? null,
   target_snapshot_id: it.target_snapshot_id ?? null,
+  // suspend 那一笔 binding 控制状态也进指纹：写什么（paused + reason）、以什么为前置（当前状态）。
+  control: it.control
+    ? { expect_status: it.control.expect?.status ?? null,
+        target_status: it.control.target?.status ?? null, target_reason: it.control.target?.reason ?? null }
+    : null,
   expect: {
     subscription_id: it.expect?.subscription_id ?? null,
     subscription_version: it.expect?.subscription_version ?? null,
     authorization_revision: it.expect?.authorization_revision ?? null,
     snapshot_id: it.expect?.snapshot_id ?? null,
+    to_subscription_version: it.expect?.to_subscription_version ?? null,
   },
 });
 
@@ -81,7 +95,7 @@ export function fingerprintOf(noop, items) {
     .sort((a, b) => String(a.binding_ref).localeCompare(String(b.binding_ref)));
   if (entries.some((e) => e.target_snapshot_id === null)) return null;
   return digest("sync_plan_", [
-    "subscription-sync-plan/v2", JSON.stringify({ noop: noop === true, entries }),
+    "subscription-sync-plan/v3", JSON.stringify({ noop: noop === true, entries }),
   ]);
 }
 
@@ -91,13 +105,14 @@ export function planId(plan, writes = null) {
   // 上一版只放了动作、目标订阅 id 和旧快照前置条件 ——
   // 两份内容不同的新授权可以算出同一个指纹，那样"计划没变"就成了假话。
   if (writes === null) return null;
-  const byRef = new Map(writes.map((w) => [w.entry.bindingRef, w.target.snapshot_id]));
+  const byRef = new Map(writes.map((w) => [w.entry.bindingRef, w]));
   return fingerprintOf(plan.noop, (plan.plans ?? []).map((p) => ({
     binding_ref: p.bindingRef ?? null,
     action: p.action ?? null,
     to: p.toSubscriptionId ?? null,
-    target_snapshot_id: byRef.get(p.bindingRef) ?? null,
-    expect: expectOf(p),
+    target_snapshot_id: byRef.get(p.bindingRef)?.target?.snapshot_id ?? null,
+    control: byRef.get(p.bindingRef)?.control ?? null,
+    expect: { ...expectOf(p), to_subscription_version: byRef.get(p.bindingRef)?.toSubscriptionVersion ?? null },
   })));
 }
 
@@ -114,6 +129,11 @@ export const APPLY_REJECT = Object.freeze({
   OPERATION_REUSED: "operation_id_reused_for_other_plan",
   WORLD_UNREADABLE: "world_unreadable",
   JOURNAL_WRITE_FAILED: "journal_write_failed",
+  ALREADY_SUSPENDED: "already_suspended",
+  BINDING_CONTROL_PORT_MISSING: "binding_control_port_missing",
+  BINDING_CONTROL_UNREADABLE: "binding_control_unreadable",
+  MIGRATION_TARGET_MISSING: "migration_target_missing",
+  SUSPEND_REASON_UNKNOWN: "suspend_reason_unknown",
 });
 
 /**
@@ -209,7 +229,7 @@ export const JOURNAL_STATUS = Object.freeze({ PREPARED: "prepared", COMMITTED: "
  * prepared 先写、committed 后写：中间崩掉时记录停在 prepared，
  * **那本身就是"没做完"的证据**，而不是靠猜。
  */
-export const JOURNAL_SCHEMA = "subscription-sync-operation/v2";
+export const JOURNAL_SCHEMA = "subscription-sync-operation/v3";
 
 /**
  * **键集合必须恰好相等**，不是"没有多余的"。
@@ -221,6 +241,36 @@ export const JOURNAL_SCHEMA = "subscription-sync-operation/v2";
  */
 const exactKeys = (o, keys) => o && typeof o === "object" && !Array.isArray(o)
   && Object.keys(o).length === keys.length && keys.every((k) => Object.hasOwn(o, k));
+
+/** suspend 落到快照上的 reason：计划器的 subscription_paused 照抄；revoked / no_longer_covered 都是"授权被收回"。 */
+const SUSPEND_REASONS = Object.freeze([
+  BINDING_AUTHORIZATION_REASON.SUBSCRIPTION_PAUSED, BINDING_AUTHORIZATION_REASON.SUBSCRIPTION_REVOKED,
+]);
+// 封闭映射：不认识的计划 reason 不许默认成任何一种收回（评审 P2）。
+const snapshotReasonFor = (planReason) => {
+  switch (planReason) {
+    case "subscription_paused": return BINDING_AUTHORIZATION_REASON.SUBSCRIPTION_PAUSED;
+    case "subscription_revoked":
+    case "no_longer_covered": return BINDING_AUTHORIZATION_REASON.SUBSCRIPTION_REVOKED;
+    default: return null;
+  }
+};
+
+/**
+ * binding 控制状态那一笔的封闭形状：expect.status 是锁内读到的当前状态（只接受 active —— 已经不是 active
+ * 的 binding 说不清是谁、为什么暂停的，不替它决定），target 是 paused + 与快照同一个 reason。
+ */
+export const BINDING_CONTROL_STATUS = Object.freeze({ ACTIVE: "active", PAUSED: "paused" });
+const validControl = (c) => exactKeys(c, ["expect", "target"])
+  && exactKeys(c.expect, ["status", "reason"]) && c.expect.status === BINDING_CONTROL_STATUS.ACTIVE && c.expect.reason === null
+  && exactKeys(c.target, ["status", "reason"]) && c.target.status === BINDING_CONTROL_STATUS.PAUSED
+  && PAUSED_REASONS.includes(c.target.reason);
+/** 控制状态的完整投影相等：status 与 reason 都要对上 —— 只比 status 会把任意 paused 当成目标已落地（评审探针）。 */
+const sameControl = (a, b) => a?.status === b?.status && (a?.reason ?? null) === (b?.reason ?? null);
+
+/** resnapshot / migrate 的目标只许 active，或因底层 binding 暂停而 paused/binding_paused —— 收回态只属于 suspend。 */
+const nonSuspendTarget = (t) => t.status === BINDING_AUTHORIZATION_STATUS.ACTIVE
+  || (t.status === BINDING_AUTHORIZATION_STATUS.PAUSED && t.reason === BINDING_AUTHORIZATION_REASON.BINDING_PAUSED);
 
 /**
  * 恢复清单里的时间必须是**规范时间**，不是"Date.parse 认得的东西"。
@@ -245,8 +295,8 @@ const isIsoTime = (v) => isCanonicalIso(v);
  * 最后那条是关键：只信清单自报的 plan_id，等于把"写什么"的决定权交给了那个文件。
  * 所以这里从清单**重算指纹**再跟它自报的对 —— 对不上就是被动过。
  *
- * schema 升到 v2：把"日志"改成"恢复清单"是不兼容的形状变化，
- * 不能让旧文件在新语义下被当成有效清单。
+ * schema 升过两次：v2 把"日志"改成"恢复清单"；v3 加 control 那一笔与 to_subscription_version ——
+ * 都是不兼容的形状变化，不能让旧文件在新语义下被当成有效清单。
  */
 function validateJournal(j, { operationId = null } = {}) {
   if (!exactKeys(j, ["schema_version", "operation_id", "plan_id", "noop",
@@ -271,7 +321,8 @@ function validateJournal(j, { operationId = null } = {}) {
 
   const seen = new Set();
   for (const w of j.writes) {
-    if (!exactKeys(w, ["binding_ref", "action", "to", "expect", "target"])) return false;
+    // v3：多一笔 control（suspend 时 binding 控制状态），键集合仍恰好相等。
+    if (!exactKeys(w, ["binding_ref", "action", "to", "expect", "target", "control"])) return false;
     // 这一条是**冗余的**：下面 target 必须是合法快照（那里卡了 ref 形状），
     // 且 target.binding_ref === binding_ref，两条合起来已经堵死。
     // 单独去掉它变异不会变红 —— 留着是多一层，不是承重的那一层。承重的是
@@ -284,13 +335,9 @@ function validateJournal(j, { operationId = null } = {}) {
     // 写 action:"bogus" 再重算一个匹配的 plan_id，清单就通过了，
     // 然后恢复过程照样把 target 写下去。指纹管的是"有没有被改过"，
     // **管不了"改成的东西合不合法"**。
-    if (w.action !== SYNC_ACTION.RESNAPSHOT) return false;
-    // 严格等于 null，缺失不算。**这一条和 exactKeys 互为冗余**：
-    // 各自单独都能拦住"删掉 to"，所以单独去掉任一个变异都不会红。
-    // 两个都留是纵深防御 —— 但我不为它们编造独立的承重测试。
-    if (w.to !== null) return false;
+    if (!Object.values(SYNC_ACTION).includes(w.action)) return false;
     if (!exactKeys(w.expect, ["subscription_id", "subscription_version",
-      "authorization_revision", "snapshot_id"])) return false;
+      "authorization_revision", "snapshot_id", "to_subscription_version"])) return false;
     if (typeof w.expect.subscription_id !== "string" || w.expect.subscription_id.length === 0) return false;
     if (typeof w.expect.snapshot_id !== "string" || w.expect.snapshot_id.length === 0) return false;
     if (!Number.isInteger(w.expect.subscription_version) || w.expect.subscription_version <= 0) return false;
@@ -299,25 +346,43 @@ function validateJournal(j, { operationId = null } = {}) {
     if (!validateDialogueBindingAuthorizationSnapshot(w.target).ok) return false;
     // 目标快照必须就是这一项要写的那个文件的内容。
     if (w.target.binding_ref !== w.binding_ref) return false;
-    // **resnapshot 不许换订阅。**上一版只验了目标是合法快照且 binding_ref 相同 ——
-    // 于是可以造一份**另一条订阅**的合法快照、重算指纹、以 action=resnapshot 写入，
-    // **实际完成一次隐式迁移**。而迁移本该由人显式指定目标并逐项校验授权覆盖。
-    // 花整轮力气把迁移关在门外，这里却留了一道后门。
-    if (w.target.subscription_id !== w.expect.subscription_id) return false;
     // **授权 revision 必须严格 +1，不是"往前走就行"。**
     // 正式 materializer 的合法演进就是 +1；写 `>` 的话，可以造一份 revision
     // 从 4 跳到 6 的合法快照，重算 snapshot_id、指纹和 plan_id 之后照样通过 ——
-    // **而那不是这个计划能产生的 resnapshot。**
-    // "往前走"和"就是下一版"是两件事。
+    // **而那不是这个计划能产生的写入。**"往前走"和"就是下一版"是两件事。
     if (w.target.authorization_revision !== w.expect.authorization_revision + 1) return false;
-    // 订阅版本不许倒退。
-    if (w.target.subscription_version < w.expect.subscription_version) return false;
+    // **按动作封闭**：每种动作允许的 to / control / 目标订阅 / 状态 各不相同，一样都不许串。
+    if (w.action === SYNC_ACTION.RESNAPSHOT) {
+      // resnapshot 不许换订阅（上一版曾留下"以 resnapshot 之名做隐式迁移"的后门）；不带 control；
+      // **目标不许是收回态**（评审探针：paused/subscription_revoked 标成 resnapshot 就绕开了 control 那一笔）——
+      // 底层 binding 已暂停时允许的只有 binding_paused。
+      if (w.to !== null || w.control !== null || w.expect.to_subscription_version !== null) return false;
+      if (w.target.subscription_id !== w.expect.subscription_id) return false;
+      if (w.target.subscription_version < w.expect.subscription_version) return false;
+      if (!nonSuspendTarget(w.target)) return false;
+    } else if (w.action === SYNC_ACTION.SUSPEND) {
+      // suspend：同一条订阅、状态翻成 paused、reason 受控；**必须带 control 那一笔**（评审定案：
+      // 同一 operation 内同步暂停 binding 控制状态），且 control 形状封闭。
+      if (w.to !== null || w.expect.to_subscription_version !== null) return false;
+      if (w.target.subscription_id !== w.expect.subscription_id) return false;
+      if (w.target.status !== BINDING_AUTHORIZATION_STATUS.PAUSED) return false;
+      if (!SUSPEND_REASONS.includes(w.target.reason)) return false;
+      if (!validControl(w.control) || w.control.target.reason !== w.target.reason) return false;
+    } else {
+      // migrate：to 是目标订阅 id，目标快照必须属于它，且订阅版本等于锁内重读到的目标版本。
+      if (typeof w.to !== "string" || w.to.length === 0 || w.to === w.expect.subscription_id) return false;
+      if (w.control !== null) return false;
+      if (w.target.subscription_id !== w.to) return false;
+      if (!Number.isInteger(w.expect.to_subscription_version) || w.expect.to_subscription_version <= 0) return false;
+      if (w.target.subscription_version !== w.expect.to_subscription_version) return false;
+      if (!nonSuspendTarget(w.target)) return false;
+    }
   }
 
   // **从清单重算指纹，跟它自报的对。**
   const recomputed = fingerprintOf(j.noop, j.writes.map((w) => ({
     binding_ref: w.binding_ref, action: w.action, to: w.to ?? null,
-    target_snapshot_id: w.target.snapshot_id, expect: w.expect,
+    target_snapshot_id: w.target.snapshot_id, control: w.control, expect: w.expect,
   })));
   return recomputed !== null && recomputed === j.plan_id;
 }
@@ -328,32 +393,61 @@ function validateJournal(j, { operationId = null } = {}) {
  * 每一条都带 target（要写成什么样），这样重试时能分辨"还没写"和"已经写过" ——
  * 见 applySubscriptionSync 里的幂等判定。
  *
- * ■ 只做 resnapshot，另两种显式拒绝
- *
- * suspend 和 migrate 要写的是"这条 binding 的授权被暂停了 / 归属换了"，
- * 而正式快照的 status/reason 是 materializer 从**订阅和 binding 的状态**推出来的，
- * 撤销时那条订阅已经不存在了 —— 没有可以拿来物化的输入。
- *
- * **我不打算为此编一个出来。**"被撤销的授权长什么样"是个契约问题，
- * 编错了会写出一份看着合法、语义错误的快照，而那种错只会在下一条消息被放行或
- * 被拒时才暴露。先让这两种动作明确失败，把问题留在台面上。
+ * ■ 三种动作各自的目标怎么来
+ *   resnapshot —— 变更后的订阅（world.next）+ binding 重新物化；
+ *   suspend    —— 现有快照收回（materializeSuspendedAuthorization），外加 control 那一笔的 CAS 前置；
+ *   migrate    —— 锁内从 world.others 重读的目标订阅 + binding 重新物化。
+ * 任何一条造不出来，整批返回失败，一个文件都不动。
  */
-export function buildWriteSet({ plan, world, shadowDir }) {
+export function buildWriteSet({ plan, world, shadowDir, bindingControl = null }) {
   const writes = [];
   for (const entry of plan.plans ?? []) {
-    if (entry.action !== SYNC_ACTION.RESNAPSHOT) {
-      return { ok: false, reason: APPLY_REJECT.UNSUPPORTED_ACTION,
-        action: entry.action, bindingRef: entry.bindingRef };
+    if (!Object.values(SYNC_ACTION).includes(entry.action)) {
+      return { ok: false, reason: APPLY_REJECT.UNSUPPORTED_ACTION, action: entry.action, bindingRef: entry.bindingRef };
     }
     const file = snapshotFile(shadowDir, entry.bindingRef);
     const loaded = readJson(file);
     if (!loaded.ok) return { ok: false, reason: loaded.reason, bindingRef: entry.bindingRef };
     const current = loaded.value;
 
+    if (entry.action === SYNC_ACTION.SUSPEND) {
+      // 收回授权：沿用现有快照内容、翻成 paused + 受控 reason（撤销时订阅已不存在，没有可物化的输入）。
+      if (current === null) return { ok: false, reason: APPLY_REJECT.SNAPSHOT_MISSING, bindingRef: entry.bindingRef };
+      const reason = snapshotReasonFor(entry.reason);
+      if (reason === null) return { ok: false, reason: APPLY_REJECT.SUSPEND_REASON_UNKNOWN, bindingRef: entry.bindingRef, planReason: entry.reason ?? null };
+      const materialized = materializeSuspendedAuthorization({
+        previousSnapshot: current, reason, capturedAt: world.now,
+      });
+      if (!materialized.ok) return { ok: false, reason: materialized.reason, bindingRef: entry.bindingRef };
+      if (!materialized.changed) return { ok: false, reason: APPLY_REJECT.ALREADY_SUSPENDED, bindingRef: entry.bindingRef };
+      // **同一 operation 内同步暂停 binding 控制状态**：锁内经端口读当前状态作 CAS 前置。
+      if (!bindingControl || typeof bindingControl.read !== "function" || typeof bindingControl.write !== "function") {
+        return { ok: false, reason: APPLY_REJECT.BINDING_CONTROL_PORT_MISSING, bindingRef: entry.bindingRef };
+      }
+      const state = readControl(bindingControl, entry.bindingRef);
+      if (!state.ok) return { ok: false, reason: APPLY_REJECT.BINDING_CONTROL_UNREADABLE, bindingRef: entry.bindingRef, detail: state.detail };
+      if (!sameControl(state, { status: BINDING_CONTROL_STATUS.ACTIVE, reason: null })) {
+        return { ok: false, reason: APPLY_REJECT.EXPECT_MISMATCH, field: "binding_control",
+          want: { status: BINDING_CONTROL_STATUS.ACTIVE, reason: null }, got: { status: state.status, reason: state.reason }, bindingRef: entry.bindingRef };
+      }
+      writes.push({ entry, file, current, target: materialized.snapshot, toSubscriptionVersion: null,
+        control: { expect: { status: BINDING_CONTROL_STATUS.ACTIVE, reason: null },
+          target: { status: BINDING_CONTROL_STATUS.PAUSED, reason: materialized.snapshot.reason } } });
+      continue;
+    }
+
+    // resnapshot 用变更后的订阅；migrate 用**锁内重读到的**目标订阅（计划条目只带 id，不带内容）。
+    let subscription = world.next;
+    let toSubscriptionVersion = null;
+    if (entry.action === SYNC_ACTION.MIGRATE) {
+      subscription = (world.others ?? []).find((o) => o?.subscription_id === entry.toSubscriptionId) ?? null;
+      if (!subscription) return { ok: false, reason: APPLY_REJECT.MIGRATION_TARGET_MISSING, bindingRef: entry.bindingRef, to: entry.toSubscriptionId };
+      toSubscriptionVersion = subscription.version;
+    }
     const materialized = materializeDialogueBindingAuthorization({
       runtimeNamespace: world.runtimeNamespace,
-      endpointId: world.next.endpoint_id,
-      subscription: world.next,
+      endpointId: subscription?.endpoint_id,
+      subscription,
       binding: world.bindings?.[entry.bindingRef],
       previousSnapshot: current,
       capturedAt: world.now,
@@ -364,9 +458,28 @@ export function buildWriteSet({ plan, world, shadowDir }) {
     if (!validateDialogueBindingAuthorizationSnapshot(materialized.snapshot).ok) {
       return { ok: false, reason: "target_snapshot_invalid", bindingRef: entry.bindingRef };
     }
-    writes.push({ entry, file, current, target: materialized.snapshot });
+    writes.push({ entry, file, current, target: materialized.snapshot, toSubscriptionVersion, control: null });
   }
   return { ok: true, writes };
+}
+
+/** 经端口读 binding 控制状态；端口抛错或形状不对都算读不出，不猜。 */
+function readControl(port, bindingRef) {
+  try {
+    const got = port.read(bindingRef);
+    // **完整投影，键集恰好 {status, reason}**：active ⇒ reason 明确为 null；paused ⇒ reason ∈ PAUSED_REASONS。
+    // 缺 reason / undefined 不许被补成 null（评审探针）—— 那是端口没说清，不是说了 null。
+    if (!exactKeys(got, ["status", "reason"]) || !Object.values(BINDING_CONTROL_STATUS).includes(got.status)) {
+      return { ok: false, detail: "binding 控制状态形状不受控" };
+    }
+    const { status, reason } = got;
+    if (status === BINDING_CONTROL_STATUS.ACTIVE ? reason !== null : !PAUSED_REASONS.includes(reason)) {
+      return { ok: false, detail: "binding 控制状态的 reason 不受控" };
+    }
+    return { ok: true, status, reason };
+  } catch (err) {
+    return { ok: false, detail: String(err?.message ?? err).slice(0, 200) };
+  }
 }
 
 /**
@@ -423,7 +536,7 @@ function itemState(current, item) {
  * 同一个 operation 重试时以清单为准，不再规划。
  */
 export function applySubscriptionSync({
-  shadowDir, lockDir, operationId, expectedPlanId, readWorld,
+  shadowDir, lockDir, operationId, expectedPlanId, readWorld, bindingControl = null,
 } = {}) {
   if (typeof shadowDir !== "string" || !path.isAbsolute(shadowDir) ||
       typeof lockDir !== "string" || !path.isAbsolute(lockDir) ||
@@ -474,7 +587,7 @@ export function applySubscriptionSync({
         return { ok: false, reason: APPLY_REJECT.OPERATION_REUSED,
           operationId, committedPlanId: own.journal.plan_id, expected: expectedPlanId };
       }
-      return finish({ shadowDir, mine, journal: own.journal, resumed: true });
+      return finish({ shadowDir, mine, journal: own.journal, resumed: true, bindingControl });
     }
 
     // ④ 新的一笔：锁内重读、重算、物化目标、比指纹。
@@ -486,7 +599,7 @@ export function applySubscriptionSync({
     }
     const plan = planSubscriptionSync(world);
     if (!plan.ok) return { ok: false, reason: plan.reason, plan };
-    const built = buildWriteSet({ plan, world, shadowDir });
+    const built = buildWriteSet({ plan, world, shadowDir, bindingControl });
     if (!built.ok) return built;
     const fresh = planId(plan, built.writes);
     if (fresh !== expectedPlanId) {
@@ -507,8 +620,9 @@ export function applySubscriptionSync({
         binding_ref: w.entry.bindingRef,
         action: w.entry.action,
         to: w.entry.toSubscriptionId ?? null,
-        expect: expectOf(w.entry),
+        expect: { ...expectOf(w.entry), to_subscription_version: w.toSubscriptionVersion ?? null },
         target: w.target,
+        control: w.control ?? null,
       });
     }
 
@@ -528,16 +642,21 @@ export function applySubscriptionSync({
       return { ok: false, reason: APPLY_REJECT.JOURNAL_WRITE_FAILED,
         stage: "prepared", error: String(err.message).slice(0, 200) };
     }
-    return finish({ shadowDir, mine, journal, resumed: false });
+    return finish({ shadowDir, mine, journal, resumed: false, bindingControl });
   } finally {
     releasePublishLock(lockDir);
   }
 }
 
 /** 按恢复清单把剩下的写完并提交。新的一笔和重试走同一段。 */
-function finish({ shadowDir, mine, journal, resumed }) {
+function finish({ shadowDir, mine, journal, resumed, bindingControl }) {
   let written = 0;
   let skipped = 0;
+  // **恢复时端口也必须在**：清单里有 control 那一笔而端口缺席，写一半就停在 prepared —— 不许把它当没有。
+  if (journal.writes.some((w) => w.control) &&
+      (!bindingControl || typeof bindingControl.read !== "function" || typeof bindingControl.write !== "function")) {
+    return { ok: false, reason: APPLY_REJECT.BINDING_CONTROL_PORT_MISSING, written, total: journal.writes.length };
+  }
   for (const item of journal.writes) {
     const file = snapshotFile(shadowDir, item.binding_ref);
     const loaded = readJson(file);
@@ -547,6 +666,16 @@ function finish({ shadowDir, mine, journal, resumed }) {
     }
     const state = itemState(loaded.value, item);
     if (state === "applied") { skipped += 1; continue; }
+    // **suspend 的目标必须就是"从盘上现值收回"得到的那份**：内容原样、只翻状态。清单里一份合法的
+    // paused 快照若换了授权内容，单看 target 合法看不出来 —— 这里拿 source 重算一遍再比 id。
+    if (state === "pending" && item.action === SYNC_ACTION.SUSPEND) {
+      const expected = materializeSuspendedAuthorization({
+        previousSnapshot: loaded.value, reason: item.target.reason, capturedAt: item.target.captured_at });
+      if (!expected.ok || expected.snapshot.snapshot_id !== item.target.snapshot_id) {
+        return { ok: false, reason: APPLY_REJECT.EXPECT_MISMATCH, field: "suspend_target",
+          bindingRef: item.binding_ref, written, total: journal.writes.length };
+      }
+    }
     if (state === "diverged") {
       // **第三种状态一律拒。**既不是原值也不是目标值，说明中间有别人动过；
       // 接着写就是拿一份过期的计划去覆盖别人的结果。
@@ -559,6 +688,43 @@ function finish({ shadowDir, mine, journal, resumed }) {
       return { ok: false, reason: APPLY_REJECT.PARTIAL_WRITE, written,
         total: journal.writes.length, bindingRef: item.binding_ref,
         error: String(err.message).slice(0, 200) };
+    }
+    written += 1;
+  }
+  // **第二笔：binding 控制状态**（只有 suspend 有）。与快照那一笔在同一份清单、同一次 finish 里 ——
+  // 快照写了、这里失败 → PARTIAL_WRITE、清单停在 prepared，重试从这里接着做；两笔都到位才提交。
+  for (const item of journal.writes) {
+    if (!item.control) continue;
+    const state = readControl(bindingControl, item.binding_ref);
+    if (!state.ok) {
+      return { ok: false, reason: APPLY_REJECT.BINDING_CONTROL_UNREADABLE, written,
+        total: journal.writes.length, bindingRef: item.binding_ref, detail: state.detail };
+    }
+    if (sameControl(state, item.control.target)) { skipped += 1; continue; }
+    if (!sameControl(state, item.control.expect)) {
+      // 既不是前置也不是目标（比如别人以别的 reason 暂停了）→ 第三种状态，拒，清单停在 prepared。
+      return { ok: false, reason: APPLY_REJECT.EXPECT_MISMATCH, field: "binding_control",
+        want: item.control.expect, got: { status: state.status, reason: state.reason }, bindingRef: item.binding_ref,
+        written, total: journal.writes.length };
+    }
+    let result;
+    try { result = bindingControl.write(item.binding_ref, { ...item.control.target }); }
+    catch (err) {
+      return { ok: false, reason: APPLY_REJECT.PARTIAL_WRITE, written,
+        total: journal.writes.length, bindingRef: item.binding_ref, stage: "binding_control",
+        error: String(err?.message ?? err).slice(0, 200) };
+    }
+    if (result && typeof result === "object" && result.ok === false) {
+      return { ok: false, reason: APPLY_REJECT.PARTIAL_WRITE, written,
+        total: journal.writes.length, bindingRef: item.binding_ref, stage: "binding_control",
+        error: String(result.reason ?? result.error ?? "端口报告写入失败").slice(0, 200) };
+    }
+    // **写后重读确认**：端口说写了不算，锁内读回来必须就是完整目标 —— 否则仍是没做完，停在 prepared。
+    const after = readControl(bindingControl, item.binding_ref);
+    if (!after.ok || !sameControl(after, item.control.target)) {
+      return { ok: false, reason: APPLY_REJECT.PARTIAL_WRITE, written,
+        total: journal.writes.length, bindingRef: item.binding_ref, stage: "binding_control_verify",
+        error: after.ok ? "写后读回的控制状态不是目标" : after.detail };
     }
     written += 1;
   }

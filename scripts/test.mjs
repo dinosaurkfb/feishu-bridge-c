@@ -147,6 +147,7 @@ import {
   buildLegacyDialogueBoundAuthorizationContext, createDialogueBoundAuthorizationShadow,
   evaluateDialogueBoundAuthorization, materializeDialogueBindingAuthorization,
   validateDialogueBindingAuthorizationSnapshot, validateDialogueBoundAuthorizationShadow,
+  materializeSuspendedAuthorization, PAUSED_REASONS, dialogueBindingAuthorizationSnapshotId,
 } from "./dialogue-binding-authorization.mjs";
 import {
   dialogueAuthorizationShadowEnabled, recordDialogueBoundAuthorizationShadow,
@@ -9317,8 +9318,8 @@ test("落盘：重试按恢复清单走，第三种状态一律拒", () => {
       expect: { subscription_id: w.snap.subscription_id,
         subscription_version: w.snap.subscription_version,
         authorization_revision: w.snap.authorization_revision,
-        snapshot_id: w.snap.snapshot_id },
-      target }],
+        snapshot_id: w.snap.snapshot_id, to_subscription_version: null },
+      target, control: null }],
   };
   const jf = path.join(w.dir, "sync-operations", opId + ".json");
   fs.writeFileSync(jf, JSON.stringify(journal, null, 2));
@@ -9397,8 +9398,8 @@ test("落盘：被改过的恢复清单一律拒 —— 五种改法，写文件
       expect: { subscription_id: w.snap.subscription_id,
         subscription_version: w.snap.subscription_version,
         authorization_revision: w.snap.authorization_revision,
-        snapshot_id: w.snap.snapshot_id },
-      target: built.writes[0].target }],
+        snapshot_id: w.snap.snapshot_id, to_subscription_version: null },
+      target: built.writes[0].target, control: null }],
   };
   const jf = path.join(w.dir, "sync-operations", opId + ".json");
   fs.mkdirSync(path.dirname(jf), { recursive: true });
@@ -9526,6 +9527,8 @@ test("落盘：被改过的恢复清单一律拒 —— 五种改法，写文件
     // 删掉 to 之后指纹不变（`to ?? null` 把缺失和 null 算成一样）——
     // **这份清单连 plan_id 都不用改就还是有效的**，是最阴的一种。
     ["写项缺 to", { ...good, writes: [dropKey(good.writes[0], "to")] }],
+    ["写项缺 control", { ...good, writes: [dropKey(good.writes[0], "control")] }],
+    ["expect 缺 to_subscription_version", { ...good, writes: [{ ...good.writes[0], expect: dropKey(good.writes[0].expect, "to_subscription_version") }] }],
     ["写项缺 target", { ...good, writes: [dropKey(good.writes[0], "target")] }],
     ["顶层缺 prepared_at", dropKey(good, "prepared_at")],
     ["prepared 却带着提交时间", { ...good, committed_at: new Date().toISOString() }],
@@ -9630,8 +9633,8 @@ test("落盘：盘上是残片不算「已写入」—— 不许把没做完的�
       expect: { subscription_id: w.snap.subscription_id,
         subscription_version: w.snap.subscription_version,
         authorization_revision: w.snap.authorization_revision,
-        snapshot_id: w.snap.snapshot_id },
-      target }],
+        snapshot_id: w.snap.snapshot_id, to_subscription_version: null },
+      target, control: null }],
   };
   const jf = path.join(w.dir, "sync-operations", opId + ".json");
   fs.mkdirSync(path.dirname(jf), { recursive: true });
@@ -9737,19 +9740,324 @@ test("落盘：控制面锁被占时不动手；suspend / migrate 明确拒绝�
   assert.equal(w.read().snapshot_id, w.snap.snapshot_id, "拿不到锁就一个字节都不写");
   fs.rmSync(w.lockDir, { recursive: true, force: true });
 
-  // **撤销/迁移还没定"被撤销的授权长什么样"，所以明确失败，不编一个出来。**
-  // 编错了会写出一份看着合法、语义错误的快照，而那种错只在下一条消息被放行或
-  // 被拒时才暴露。
+  // suspend 现在是受控落盘（见下面的专项测试）；但 binding 控制状态那一笔要经注入的端口写 ——
+  // 端口缺席时整批拒绝、零写入，不许只写快照那一半。
   const revoke = { ...w.world, next: null };
   const revokePlan = planSubscriptionSync(revoke);
   assert.equal(revokePlan.counts.suspend, 1);
-  // suspend 连写集都造不出来，给什么指纹都一样 —— 它会先在动作那一关失败。
   const got = applySubscriptionSync({
     shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-revoke-001",
     expectedPlanId: "sync_plan_" + "0".repeat(24), readWorld: () => revoke });
   assert.equal(got.ok, false);
-  assert.equal(got.reason, APPLY_REJECT.UNSUPPORTED_ACTION);
-  assert.equal(got.action, SYNC_ACTION.SUSPEND);
+  assert.equal(got.reason, APPLY_REJECT.BINDING_CONTROL_PORT_MISSING);
+  assert.equal(w.read().snapshot_id, w.snap.snapshot_id, "零写入");
+});
+
+/** binding 控制状态的注入端口：内存里一份，可让 write 抛错以制造"写了一半"。 */
+const controlPort = ({ initial = "active", initialReason = null, failWrites = 0, mode = "throw" } = {}) => {
+  const st = new Map();
+  let fails = failWrites;
+  const port = {
+    reads: 0, writes: [],
+    read: (ref) => { port.reads += 1; return st.get(ref) ?? { status: initial, reason: initial === "active" ? null : initialReason }; },
+    write: (ref, target) => {
+      if (fails > 0) {
+        fails -= 1;
+        if (mode === "throw") throw new Error("控制状态写盘炸了");
+        if (mode === "reject") return { ok: false, reason: "端口拒绝" };   // 明确报失败、状态不变
+        return undefined;                                                    // "假成功"：没报错也没改状态
+      }
+      port.writes.push([ref, target]); st.set(ref, { ...target });
+      return { ok: true };
+    },
+    stateOf: (ref) => st.get(ref) ?? { status: initial, reason: initial === "active" ? null : initialReason },
+  };
+  return port;
+};
+
+test("落盘 suspend：快照收回 + binding 控制状态同一 operation 落地；前置不成立整批零写入", () => {
+  const w = applyWorld();
+  const revoke = { ...w.world, next: null };
+  const plan = planSubscriptionSync(revoke);
+  assert.equal(plan.counts.suspend, 1);
+  assert.equal(plan.plans[0].reason, "subscription_revoked");
+  const port = controlPort();
+  const pid = (() => {
+    const built = buildWriteSet({ plan, world: revoke, shadowDir: w.dir, bindingControl: port });
+    assert.equal(built.ok, true, built.reason ?? "");
+    return planId(plan, built.writes);
+  })();
+  // 期望值不与被测共享输入：预期快照形状按契约手写。
+  const got = applySubscriptionSync({ shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-suspend-001",
+    expectedPlanId: pid, readWorld: () => revoke, bindingControl: port });
+  assert.equal(got.ok, true, JSON.stringify(got));
+  assert.equal(got.written, 2, "快照 + 控制状态 两笔");
+  const after = w.read();
+  assert.equal(after.status, "paused");
+  assert.equal(after.reason, "subscription_revoked");
+  assert.equal(after.authorization_revision, w.snap.authorization_revision + 1);
+  assert.equal(after.subscription_id, w.snap.subscription_id, "收回不换订阅");
+  assert.deepEqual(port.stateOf(w.snap.binding_ref), { status: "paused", reason: "subscription_revoked" });
+  const journal = JSON.parse(fs.readFileSync(path.join(w.dir, "sync-operations", "op-suspend-001.json"), "utf-8"));
+  assert.equal(journal.status, "committed");
+  assert.deepEqual(journal.writes[0].control, { expect: { status: "active", reason: null }, target: { status: "paused", reason: "subscription_revoked" } });
+  assert.equal(journal.writes[0].expect.to_subscription_version, null);
+  // reason 受控：不在 PAUSED_REASONS 里的收回请求拒绝；伪造 reason 的 paused 快照过不了校验。
+  assert.equal(materializeSuspendedAuthorization({ previousSnapshot: w.snap, reason: "bogus_reason" }).ok, false);
+  const forged = { ...after, reason: "bogus_reason" };
+  forged.snapshot_id = dialogueBindingAuthorizationSnapshotId(forged);   // id 对得上，只有 reason 不受控
+  assert.equal(validateDialogueBindingAuthorizationSnapshot(forged).ok, false, "**伪造 reason 的快照不许合法（校验器自己要认枚举）**");
+  assert.deepEqual([...PAUSED_REASONS].sort(), ["binding_paused", "subscription_paused", "subscription_revoked"]);
+  const schema = JSON.parse(fs.readFileSync(path.resolve("references", "dialogue-binding-authorization-v1.schema.json"), "utf-8"));
+  assert.deepEqual(schema.properties.reason.enum.filter((x) => x !== null).sort(), [...PAUSED_REASONS].sort(), "schema 与运行时同一份枚举");
+  // 已经收回过：再来一次是幂等失败（already_suspended），不写第二份。
+  const again = buildWriteSet({ plan, world: revoke, shadowDir: w.dir, bindingControl: controlPort({ initial: "paused", initialReason: "subscription_revoked" }) });
+  assert.equal(again.ok, false); assert.equal(again.reason, APPLY_REJECT.ALREADY_SUSPENDED);
+  // 计划 reason 不认识 → 拒，不默认成任何一种收回。
+  const weirdPlan = { ...plan, plans: [{ ...plan.plans[0], reason: "something_new" }] };
+  const wr = applyWorld({ key: "wr" });
+  const weirdWorld = { ...wr.world, next: null };
+  const weirdPlan2 = { ...planSubscriptionSync(weirdWorld), plans: planSubscriptionSync(weirdWorld).plans.map((p) => ({ ...p, reason: "something_new" })) };
+  void weirdPlan;
+  const bw = buildWriteSet({ plan: weirdPlan2, world: weirdWorld, shadowDir: wr.dir, bindingControl: controlPort() });
+  assert.equal(bw.ok, false); assert.equal(bw.reason, APPLY_REJECT.SUSPEND_REASON_UNKNOWN);
+
+  // **控制状态的 CAS 前置**：binding 已经不是 active（别人先暂停了）→ 整批零写入，连清单都不落。
+  const w2 = applyWorld({ key: "w2" });
+  const revoke2 = { ...w2.world, next: null };
+  const paused = controlPort({ initial: "paused", initialReason: "binding_paused" });
+  const plan2 = planSubscriptionSync(revoke2);
+  const built2 = buildWriteSet({ plan: plan2, world: revoke2, shadowDir: w2.dir, bindingControl: paused });
+  assert.equal(built2.ok, false);
+  assert.equal(built2.reason, APPLY_REJECT.EXPECT_MISMATCH);
+  assert.equal(built2.field, "binding_control");
+  const r2 = applySubscriptionSync({ shadowDir: w2.dir, lockDir: w2.lockDir, operationId: "op-suspend-002",
+    expectedPlanId: "sync_plan_" + "0".repeat(24), readWorld: () => revoke2, bindingControl: paused });
+  assert.equal(r2.ok, false); assert.equal(r2.reason, APPLY_REJECT.EXPECT_MISMATCH);
+  assert.equal(w2.read().snapshot_id, w2.snap.snapshot_id, "零写入");
+  assert.equal(fs.existsSync(path.join(w2.dir, "sync-operations", "op-suspend-002.json")), false, "前置不成立连清单都不落");
+  assert.deepEqual(paused.writes, []);
+
+  // reason 映射：订阅暂停 → subscription_paused；不再覆盖 → subscription_revoked。
+  const w3 = applyWorld({ key: "w3" });
+  const pausedSub = { ...w3.world, next: syncSub({ version: 2, status: "paused" }) };
+  const p3 = planSubscriptionSync(pausedSub);
+  assert.equal(p3.plans[0]?.reason, "subscription_paused", JSON.stringify(p3));
+  const b3 = buildWriteSet({ plan: p3, world: pausedSub, shadowDir: w3.dir, bindingControl: controlPort() });
+  assert.equal(b3.ok, true, b3.reason ?? "");
+  assert.equal(b3.writes[0].target.reason, "subscription_paused");
+  assert.equal(b3.writes[0].control.target.reason, "subscription_paused", "两笔同一个 reason");
+  const w4 = applyWorld({ key: "w4" });
+  const uncovered = { ...w4.world, next: syncSub({ version: 2, scope: { ...syncSub().scope, event_types: ["im.chat.updated"] } }) };
+  const p4 = planSubscriptionSync(uncovered);
+  assert.equal(p4.plans[0]?.action, SYNC_ACTION.SUSPEND, JSON.stringify(p4));
+  assert.equal(p4.plans[0]?.reason, "no_longer_covered");
+  const b4 = buildWriteSet({ plan: p4, world: uncovered, shadowDir: w4.dir, bindingControl: controlPort() });
+  assert.equal(b4.ok, true, b4.reason ?? "");
+  assert.equal(b4.writes[0].target.reason, "subscription_revoked", "不再覆盖 = 授权被收回");
+});
+
+test("落盘 suspend：控制状态写一半 → prepared 不提交；同 operation 重试补完；半成品期间新事务被拒；恢复时端口缺席也拒", () => {
+  const w = applyWorld();
+  const revoke = { ...w.world, next: null };
+  const plan = planSubscriptionSync(revoke);
+  const port = controlPort({ failWrites: 1 });
+  const built = buildWriteSet({ plan, world: revoke, shadowDir: w.dir, bindingControl: port });
+  assert.equal(built.ok, true, built.reason ?? "");
+  const pid = planId(plan, built.writes);
+  const opId = "op-suspend-half";
+  const half = applySubscriptionSync({ shadowDir: w.dir, lockDir: w.lockDir, operationId: opId,
+    expectedPlanId: pid, readWorld: () => revoke, bindingControl: port });
+  assert.equal(half.ok, false, JSON.stringify(half));
+  assert.equal(half.reason, APPLY_REJECT.PARTIAL_WRITE);
+  assert.equal(half.stage, "binding_control");
+  assert.equal(half.written, 1, "快照那一笔已落");
+  assert.equal(w.read().status, "paused", "快照已收回");
+  assert.equal(port.stateOf(w.snap.binding_ref).status, "active", "控制状态还没翻");
+  const jf = path.join(w.dir, "sync-operations", opId + ".json");
+  assert.equal(JSON.parse(fs.readFileSync(jf, "utf-8")).status, "prepared", "**半成品不许记成 committed**");
+  // 半成品期间另开一笔：拒。
+  const other = applySubscriptionSync({ shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-suspend-next",
+    expectedPlanId: pid, readWorld: () => revoke, bindingControl: controlPort() });
+  assert.equal(other.reason, APPLY_REJECT.OPERATION_IN_FLIGHT);
+  // 恢复时端口缺席：拒，清单仍 prepared，控制状态不动。
+  const noPort = applySubscriptionSync({ shadowDir: w.dir, lockDir: w.lockDir, operationId: opId,
+    expectedPlanId: pid, readWorld: () => { throw new Error("重试不该再规划"); } });
+  assert.equal(noPort.ok, false); assert.equal(noPort.reason, APPLY_REJECT.BINDING_CONTROL_PORT_MISSING);
+  assert.equal(JSON.parse(fs.readFileSync(jf, "utf-8")).status, "prepared");
+  // 同 operation 重试（端口正常）：不再规划，快照那笔跳过、控制状态补写、提交。
+  const resumed = applySubscriptionSync({ shadowDir: w.dir, lockDir: w.lockDir, operationId: opId,
+    expectedPlanId: pid, readWorld: () => { throw new Error("重试不该再规划"); }, bindingControl: port });
+  assert.equal(resumed.ok, true, JSON.stringify(resumed));
+  assert.equal(resumed.resumed, true);
+  assert.equal(resumed.written, 1); assert.equal(resumed.skipped, 1);
+  assert.deepEqual(port.stateOf(w.snap.binding_ref), { status: "paused", reason: "subscription_revoked" });
+  assert.equal(JSON.parse(fs.readFileSync(jf, "utf-8")).status, "committed");
+  // 再重试：两笔都已是目标 → 全部跳过、零写。
+  fs.writeFileSync(jf, JSON.stringify({ ...JSON.parse(fs.readFileSync(jf, "utf-8")), status: "prepared", committed_at: null }, null, 2));
+  const again = applySubscriptionSync({ shadowDir: w.dir, lockDir: w.lockDir, operationId: opId,
+    expectedPlanId: pid, readWorld: () => { throw new Error("不该规划"); }, bindingControl: port });
+  assert.equal(again.ok, true); assert.equal(again.written, 0); assert.equal(again.skipped, 2);
+  // 恢复期间控制状态被别人改成第三种（既不是 active 也不是目标）→ 拒。
+  const w5 = applyWorld({ key: "w5" });
+  const revoke5 = { ...w5.world, next: null };
+  const port5 = controlPort({ failWrites: 1 });
+  const plan5 = planSubscriptionSync(revoke5);
+  const pid5 = planId(plan5, buildWriteSet({ plan: plan5, world: revoke5, shadowDir: w5.dir, bindingControl: port5 }).writes);
+  applySubscriptionSync({ shadowDir: w5.dir, lockDir: w5.lockDir, operationId: "op-suspend-div",
+    expectedPlanId: pid5, readWorld: () => revoke5, bindingControl: port5 });
+  const strange = { read: () => ({ status: "paused", reason: "binding_paused" }), write: () => { throw new Error("不该写"); } };
+  const div = applySubscriptionSync({ shadowDir: w5.dir, lockDir: w5.lockDir, operationId: "op-suspend-div",
+    expectedPlanId: pid5, readWorld: () => { throw new Error("不该规划"); }, bindingControl: strange });
+  // **任意 paused 不算目标已落地**：paused/binding_paused 既不是前置（active）也不是目标（paused/subscription_revoked）→ 第三种状态，拒。
+  assert.equal(div.ok, false, JSON.stringify(div));
+  assert.equal(div.reason, APPLY_REJECT.EXPECT_MISMATCH);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(w5.dir, "sync-operations", "op-suspend-div.json"), "utf-8")).status, "prepared");
+  const weird = { read: () => ({ status: "bogus" }), write: () => { throw new Error("不该写"); } };
+  fs.writeFileSync(path.join(w5.dir, "sync-operations", "op-suspend-div.json"), JSON.stringify({
+    ...JSON.parse(fs.readFileSync(path.join(w5.dir, "sync-operations", "op-suspend-div.json"), "utf-8")), status: "prepared", committed_at: null }, null, 2));
+  const bad = applySubscriptionSync({ shadowDir: w5.dir, lockDir: w5.lockDir, operationId: "op-suspend-div",
+    expectedPlanId: pid5, readWorld: () => { throw new Error("不该规划"); }, bindingControl: weird });
+  assert.equal(bad.ok, false); assert.equal(bad.reason, APPLY_REJECT.BINDING_CONTROL_UNREADABLE);
+  // **键集要恰好 {status, reason}**：active 缺 reason / reason 为 undefined 都不许补成 null —— 拒且零写入。
+  for (const [why, got] of [["缺 reason", { status: "active" }], ["reason undefined", { status: "active", reason: undefined }]]) {
+    const wm = applyWorld({ key: "wm-" + why });
+    const rm = { ...wm.world, next: null };
+    const pm = { read: () => got, write: () => { throw new Error("不该写"); } };
+    const bm = buildWriteSet({ plan: planSubscriptionSync(rm), world: rm, shadowDir: wm.dir, bindingControl: pm });
+    assert.equal(bm.ok, false, why); assert.equal(bm.reason, APPLY_REJECT.BINDING_CONTROL_UNREADABLE, why + "：" + JSON.stringify(bm));
+    const am = applySubscriptionSync({ shadowDir: wm.dir, lockDir: wm.lockDir, operationId: "op-suspend-nr",
+      expectedPlanId: "sync_plan_" + "0".repeat(24), readWorld: () => rm, bindingControl: pm });
+    assert.equal(am.reason, APPLY_REJECT.BINDING_CONTROL_UNREADABLE, why);
+    assert.equal(wm.read().snapshot_id, wm.snap.snapshot_id, why + "：零写入");
+    assert.equal(fs.existsSync(path.join(wm.dir, "sync-operations", "op-suspend-nr.json")), false, why + "：清单也不落");
+  }
+  // paused 却没有受控 reason 也是说不清。
+  const noReason = { read: () => ({ status: "paused" }), write: () => { throw new Error("不该写"); } };
+  const bad2 = applySubscriptionSync({ shadowDir: w5.dir, lockDir: w5.lockDir, operationId: "op-suspend-div",
+    expectedPlanId: pid5, readWorld: () => { throw new Error("不该规划"); }, bindingControl: noReason });
+  assert.equal(bad2.reason, APPLY_REJECT.BINDING_CONTROL_UNREADABLE);
+  // **写入成功要被证明**：端口明确返回 ok:false、或"假成功"（没报错但状态没变）→ 都是 PARTIAL_WRITE，清单停在 prepared。
+  for (const [why, mode] of [["端口明确返回失败", "reject"], ["假成功（状态没变）", "silent"]]) {
+    const wx = applyWorld({ key: "wx-" + mode });
+    const rx = { ...wx.world, next: null };
+    const px = controlPort({ failWrites: 1, mode });
+    const planx = planSubscriptionSync(rx);
+    const pidx = planId(planx, buildWriteSet({ plan: planx, world: rx, shadowDir: wx.dir, bindingControl: px }).writes);
+    const gx = applySubscriptionSync({ shadowDir: wx.dir, lockDir: wx.lockDir, operationId: "op-suspend-" + mode,
+      expectedPlanId: pidx, readWorld: () => rx, bindingControl: px });
+    assert.equal(gx.ok, false, why + "：" + JSON.stringify(gx));
+    assert.equal(gx.reason, APPLY_REJECT.PARTIAL_WRITE, why);
+    // 端口明确报失败要按它说的报（stage binding_control）；假成功只能靠写后读回抓（stage binding_control_verify）。
+    assert.equal(gx.stage, mode === "reject" ? "binding_control" : "binding_control_verify", why + "：" + JSON.stringify(gx));
+    assert.equal(px.stateOf(wx.snap.binding_ref).status, "active", why + "：控制状态没变");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(wx.dir, "sync-operations", "op-suspend-" + mode + ".json"), "utf-8")).status, "prepared",
+      why + "：**没被证明落地的第二笔不许提交**");
+    // 端口恢复后重试补完。
+    const fixed = applySubscriptionSync({ shadowDir: wx.dir, lockDir: wx.lockDir, operationId: "op-suspend-" + mode,
+      expectedPlanId: pidx, readWorld: () => { throw new Error("不该规划"); }, bindingControl: px });
+    assert.equal(fixed.ok, true, why + "：" + JSON.stringify(fixed));
+    assert.deepEqual(px.stateOf(wx.snap.binding_ref), { status: "paused", reason: "subscription_revoked" });
+  }
+});
+
+test("落盘 migrate：目标订阅在锁内重读并重新物化，目标版本进 expect 与指纹；目标变了 / 不在了都零写入", () => {
+  const w = applyWorld();
+  const OTHER = "subscription_" + "c".repeat(24);
+  const target = syncSub({ subscription_id: OTHER, version: 3 });
+  const world = { ...w.world, next: null, migrateTo: OTHER, others: [target] };
+  const plan = planSubscriptionSync(world);
+  assert.equal(plan.counts.migrate, 1, JSON.stringify(plan));
+  assert.equal(plan.plans[0].toSubscriptionId, OTHER);
+  const built = buildWriteSet({ plan, world, shadowDir: w.dir });
+  assert.equal(built.ok, true, built.reason ?? "");
+  assert.equal(built.writes[0].toSubscriptionVersion, 3);
+  assert.equal(built.writes[0].control, null, "迁移不动控制状态");
+  const pid = planId(plan, built.writes);
+  // 目标版本进指纹：目标换了版本，指纹必须变。
+  const bumped = { ...world, others: [syncSub({ subscription_id: OTHER, version: 4 })] };
+  const builtBumped = buildWriteSet({ plan: planSubscriptionSync(bumped), world: bumped, shadowDir: w.dir });
+  assert.notEqual(planId(planSubscriptionSync(bumped), builtBumped.writes), pid, "**目标订阅版本要进指纹**");
+  // 预览之后目标在锁内变了 → plan_stale，零写入。
+  const stale = applySubscriptionSync({ shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-migrate-stale",
+    expectedPlanId: pid, readWorld: () => bumped });
+  assert.equal(stale.ok, false); assert.equal(stale.reason, APPLY_REJECT.PLAN_STALE);
+  assert.equal(w.read().snapshot_id, w.snap.snapshot_id, "零写入");
+  // 锁内目标不在了 → 拒，零写入。
+  const gone = applySubscriptionSync({ shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-migrate-gone",
+    expectedPlanId: pid, readWorld: () => ({ ...world, others: [] }) });
+  assert.equal(gone.ok, false);
+  assert.ok([APPLY_REJECT.MIGRATION_TARGET_MISSING, "migration_target_unknown"].includes(gone.reason), gone.reason);
+  assert.equal(w.read().snapshot_id, w.snap.snapshot_id);
+  // 成功：快照归属换成目标订阅、版本等于目标版本、revision +1；清单 to / expect.to_subscription_version 记着。
+  const ok = applySubscriptionSync({ shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-migrate-ok",
+    expectedPlanId: pid, readWorld: () => world });
+  assert.equal(ok.ok, true, JSON.stringify(ok));
+  const after = w.read();
+  assert.equal(after.subscription_id, OTHER);
+  assert.equal(after.subscription_version, 3);
+  assert.equal(after.status, "active"); assert.equal(after.reason, null);
+  assert.equal(after.authorization_revision, w.snap.authorization_revision + 1);
+  const journal = JSON.parse(fs.readFileSync(path.join(w.dir, "sync-operations", "op-migrate-ok.json"), "utf-8"));
+  assert.equal(journal.writes[0].to, OTHER);
+  assert.equal(journal.writes[0].expect.to_subscription_version, 3);
+  assert.equal(journal.writes[0].expect.subscription_id, w.snap.subscription_id, "expect 记的是迁出前的归属");
+});
+
+test("落盘清单 v3：suspend 条目的 control 被改（缺失 / reason 不一致 / expect 不是 active）一律拒，写文件之前就拦", () => {
+  const w = applyWorld();
+  const revoke = { ...w.world, next: null };
+  const plan = planSubscriptionSync(revoke);
+  const port = controlPort();
+  const built = buildWriteSet({ plan, world: revoke, shadowDir: w.dir, bindingControl: port });
+  const pid = planId(plan, built.writes);
+  const good = {
+    schema_version: JOURNAL_SCHEMA, operation_id: "op-ctl-tamper", plan_id: pid, noop: false,
+    status: "prepared", prepared_at: new Date().toISOString(), committed_at: null,
+    writes: [{ binding_ref: w.snap.binding_ref, action: SYNC_ACTION.SUSPEND, to: null,
+      expect: { subscription_id: w.snap.subscription_id, subscription_version: w.snap.subscription_version,
+        authorization_revision: w.snap.authorization_revision, snapshot_id: w.snap.snapshot_id, to_subscription_version: null },
+      target: built.writes[0].target, control: built.writes[0].control }],
+  };
+  const jf = path.join(w.dir, "sync-operations", "op-ctl-tamper.json");
+  fs.mkdirSync(path.dirname(jf), { recursive: true });
+  const resign = (j) => ({ ...j, plan_id: fingerprintOf(j.noop, j.writes.map((x) => ({
+    binding_ref: x.binding_ref, action: x.action, to: x.to, target_snapshot_id: x.target.snapshot_id, control: x.control, expect: x.expect }))) });
+  const run = () => applySubscriptionSync({ shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-ctl-tamper",
+    expectedPlanId: JSON.parse(fs.readFileSync(jf, "utf-8")).plan_id,
+    readWorld: () => { throw new Error("不该规划"); }, bindingControl: port });
+  fs.writeFileSync(jf, JSON.stringify(good, null, 2));
+  assert.equal(run().ok, true, "没改过的清单应当能跑");
+  for (const [why, j] of [
+    ["control 缺失（指纹也改对）", resign({ ...good, writes: [{ ...good.writes[0], control: null }] })],
+    ["control.reason 与快照不一致", resign({ ...good, writes: [{ ...good.writes[0],
+      control: { expect: { status: "active" }, target: { status: "paused", reason: "binding_paused" } } }] })],
+    ["control.expect 不是 active", resign({ ...good, writes: [{ ...good.writes[0],
+      control: { expect: { status: "paused" }, target: { status: "paused", reason: "subscription_revoked" } } }] })],
+    ["control 多键", resign({ ...good, writes: [{ ...good.writes[0],
+      control: { ...good.writes[0].control, extra: 1 } }] })],
+    ["suspend 目标却是 active", resign({ ...good, writes: [{ ...good.writes[0], target: w.snap }] })],
+    // **借 resnapshot 之名执行 suspend 的第一笔**：合法的 paused/subscription_revoked 快照标成 resnapshot、control:null。
+    ["resnapshot 却带收回态目标", resign({ ...good, writes: [{ ...good.writes[0], action: SYNC_ACTION.RESNAPSHOT, control: null }] })],
+  ]) {
+    fs.writeFileSync(jf, JSON.stringify({ ...j, status: "prepared", committed_at: null }, null, 2));
+    const got = run();
+    assert.equal(got.ok, false, why + "：" + JSON.stringify(got));
+    assert.equal(got.reason, APPLY_REJECT.JOURNAL_UNREADABLE, why);
+  }
+  // suspend 目标合法、状态也对，但授权内容被换（多授权一个人）：单看 target 看不出 —— finish 拿盘上现值重算比 id → 拒。
+  const swapped = materializeSuspendedAuthorization({
+    previousSnapshot: { ...w.snap, authorized_human_participant_ids: [...w.snap.authorized_human_participant_ids, "participant_ref_" + "e".repeat(24)].sort(),
+      snapshot_id: dialogueBindingAuthorizationSnapshotId({ ...w.snap, authorized_human_participant_ids: [...w.snap.authorized_human_participant_ids, "participant_ref_" + "e".repeat(24)].sort() }) },
+    reason: "subscription_revoked", capturedAt: built.writes[0].target.captured_at });
+  assert.equal(swapped.ok, true, swapped.reason ?? "");
+  // 盘上先复位到迁出前的那份（前面"没改过的清单应当能跑"已经把它写成了收回态）。
+  fs.writeFileSync(w.file, JSON.stringify(w.snap, null, 2));
+  fs.writeFileSync(jf, JSON.stringify({ ...resign({ ...good, writes: [{ ...good.writes[0], target: swapped.snapshot }] }), status: "prepared", committed_at: null }, null, 2));
+  const gotSwapped = run();
+  assert.equal(gotSwapped.ok, false, "**suspend 目标换了授权内容不许落**：" + JSON.stringify(gotSwapped));
+  assert.equal(gotSwapped.reason, APPLY_REJECT.EXPECT_MISMATCH);
+  assert.equal(gotSwapped.field, "suspend_target");
   assert.equal(w.read().snapshot_id, w.snap.snapshot_id, "零写入");
 });
 

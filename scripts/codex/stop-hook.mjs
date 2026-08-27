@@ -8,7 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { appendEvent, codexReplyEventKey, MAX_REPLY_CHARS } from "../outbox.mjs";
-import { readClaim } from "../claim.mjs";
+import { readClaimState } from "../claim.mjs";
 import { extractReply } from "../stop-hook.mjs";
 import { clearTurnInput, readTurnInput } from "../turn-input.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
@@ -74,9 +74,22 @@ async function main() {
     ? readTurnInput({ dir: paths.turnInputs, key: turnKey })
     : { ok: false };
   const mapping = mappingForTask(found.task, { home: bridgeHome() });
-  const claim = claimKey ? readClaim({ claimsDir: paths.claims, key: claimKey }) : null;
+  // **入站分支消费三态。**上一版两态 readClaim 把坏 claim 折成 null，答复被写成
+  // 无冻结目标的 legacy 记录 —— watcher 那头 fail-closed 了，Stop 这头却已经先入了队。
+  // 说不清来源就不入队；watcher 会留 risk 让人看。
+  let claim = null;
+  if (claimKey) {
+    const state = readClaimState({ claimsDir: paths.claims, key: claimKey,
+      expect: { logicalTaskKey: found.task.logical_task_key, codexThreadId: threadId } });
+    if (state.status !== "valid") {
+      log(found.task.logical_task_key + " claim " + state.status +
+        (state.why ? "（" + state.why + "）" : "") + "; reply not queued");
+      process.exit(0);
+    }
+    claim = state.claim;
+  }
   const targetGenerationId = claimKey
-    ? claim?.origin_channel_generation_id
+    ? claim.origin_channel_generation_id
     : mapping.channel_generation_id;
   const r = appendEvent({
     outboxDir: paths.outbox,

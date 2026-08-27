@@ -9,6 +9,8 @@
 
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { isCanonicalIso } from "./canonical-time.mjs";
+import { usableGeneration } from "./topic-generation.mjs";
 import path from "node:path";
 
 export const CLAIM_STATE = {
@@ -77,6 +79,10 @@ export function acquireClaim({ claimsDir, messageId, logicalTaskKey, meta }) {
  * 完成与否由出站流程独立观察，本模块不做也不允许做这个判断。
  */
 export function recordClaimState({ claimsDir, key, state, detail }) {
+  // 写原语自带形状守卫：评审实测 key="../../escape" 让 failed 记录写到了 claims 目录外。
+  if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) {
+    throw new Error("claim key 形状不对，拒绝写状态记录");
+  }
   const file = path.join(claimsDir, key + "." + state + ".json");
   writeJsonAtomic(file, {
     schema_version: "1.0",
@@ -99,7 +105,42 @@ export function recordClaimState({ claimsDir, key, state, detail }) {
  * 折成 `claim | null`，null 就当 legacy 现算当前代际 —— 说不清来源却猜了个目标，
  * 正是 R2b1 回执三态那一课（第 5 层步骤 2 复核发现）。
  */
-export function readClaimState({ claimsDir, key }) {
+const nonEmpty = (v) => typeof v === "string" && v.length > 0;
+
+/**
+ * 一张 claim 要能被**解释**才算 valid：不只是"claim_key 对得上"。
+ * 评审探针：`{claim_key, origin_channel_generation_id:"wrong-but-nonempty"}` 甚至
+ * 只有 claim_key 的对象都被判 valid，随后两个 watcher 直接信任来源代际。
+ * 固定字段 + 规范时间 + 非空来源代际 + 调用方消费的路由字段都要在；
+ * 未知扩展字段允许（不封键集），缺必需身份事实的不叫 valid。
+ * `expect` 由调用方给：Codex 侧交叉核对 task / thread，Claude 侧核对逻辑 task。
+ */
+function claimProblem(claim, key, expect) {
+  if (claim.schema_version !== "1.0") return "schema_version 不认识";
+  if (claim.state !== CLAIM_STATE.CLAIMED) return "state 不是 claimed";
+  if (claim.claim_key !== key) return "claim_key 跟目录名对不上";
+  if (!nonEmpty(claim.message_id)) return "message_id 缺失或为空";
+  if (!nonEmpty(claim.logical_task_key)) return "logical_task_key 缺失或为空";
+  if (!isCanonicalIso(claim.claimed_at)) return "claimed_at 不是规范时间";
+  if (!nonEmpty(claim.policy_id)) return "policy_id 缺失或为空";
+  if (!usableGeneration(claim.origin_channel_generation_id)) return "origin_channel_generation_id 不是可用代际";
+  if (claim.claude_session_id !== undefined && claim.claude_session_id !== null
+    && !nonEmpty(claim.claude_session_id)) return "claude_session_id 形状不对";
+  if (claim.codex_thread_id !== undefined && !nonEmpty(claim.codex_thread_id)) return "codex_thread_id 形状不对";
+  if (expect.logicalTaskKey !== undefined && claim.logical_task_key !== expect.logicalTaskKey) {
+    return "logical_task_key 跟这个 task 对不上";
+  }
+  if (expect.codexThreadId !== undefined && claim.codex_thread_id !== expect.codexThreadId) {
+    return "codex_thread_id 跟这个 task 对不上";
+  }
+  return null;
+}
+
+export function readClaimState({ claimsDir, key, expect = {} }) {
+  // **key 形状先验，任何路径派生之前** —— 路径型读写核心自带守卫，别指望每个调用方都记得。
+  if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) {
+    return { status: "unreadable", why: "key 不是 claim key 的形状" };
+  }
   const file = path.join(claimsDir, key + ".claim", "claim.json");
   let raw;
   try { raw = fs.readFileSync(file, "utf-8"); }
@@ -113,12 +154,13 @@ export function readClaimState({ claimsDir, key }) {
   if (claim === null || typeof claim !== "object" || Array.isArray(claim)) {
     return { status: "unreadable", why: "不是记录对象" };
   }
-  if (claim.claim_key !== key) return { status: "unreadable", why: "claim_key 跟目录名对不上" };
+  const problem = claimProblem(claim, key, expect);
+  if (problem !== null) return { status: "unreadable", why: problem };
   return { status: "valid", claim };
 }
 
 /** 两态视图（只给不做授权决定的读方）：valid 才给 claim，其余一律 null。 */
-export function readClaim({ claimsDir, key }) {
-  const state = readClaimState({ claimsDir, key });
+export function readClaim({ claimsDir, key, expect = {} }) {
+  const state = readClaimState({ claimsDir, key, expect });
   return state.status === "valid" ? state.claim : null;
 }

@@ -25,7 +25,7 @@ import { boundedBudgetMs } from "./eligibility-recovery.mjs";
 import { postDeliveryBits } from "./publish-outcome.mjs";
 import { repairCmd } from "./repair-run-claim.mjs";
 import { shellQuote } from "./shell-quote.mjs";
-import { readClaimState, recordClaimState } from "./claim.mjs";
+import { CLAIM_KEY_SHAPE, readClaimState, recordClaimState } from "./claim.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
@@ -39,6 +39,12 @@ const SELF = moduleRoot(import.meta.url, "..");
 const key = process.argv[2];
 if (!key) {
   console.error("usage: watch-and-publish.mjs <claim-key> [project-root]");
+  process.exit(2);
+}
+// **key 形状先验，任何路径派生 / I/O 之前。**评审实测 key="../../escape"：
+// failed 记录被写到 .runtime-data/escape.failed.json，跑出了 delivery-claims/。
+if (!CLAIM_KEY_SHAPE.test(key)) {
+  console.error("claim key 不是 claim key 的形状，拒绝");
   process.exit(2);
 }
 
@@ -132,6 +138,16 @@ while (true) {
       throw new Error("读不到这个项目的链路配置（" + (resolved.reason ?? resolved.configError?.reason) + "）");
     }
     const cfg = resolved.config;
+    // claim 说的逻辑 task 要跟这个项目的配置对得上 —— 对不上就是别人的 claim。
+    if (acceptedClaim.logical_task_key !== cfg.logical_task_key) {
+      try {
+        recordClaimState({ claimsDir: CLAIMS, key, state: "failed",
+          detail: { reason: "claim_unreadable", why: "logical_task_key 跟这个项目对不上",
+            observed_by: "watch-and-publish" } });
+      } catch { /* 记不上不改变结论 */ }
+      console.error("这一轮的 claim 说不清（logical_task_key 跟这个项目对不上）—— 结果不发布。session lock 保留。");
+      process.exit(2);
+    }
     const mapping = resolved.mapping;
     const run = scanRuns({ runsDir: RUNS }).find((r) => r.key === key);
 

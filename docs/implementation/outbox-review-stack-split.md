@@ -37,8 +37,13 @@ CLI 只解析显示）；预览打印完整可执行命令过 shellQuote，真 s
 `readClaim` 把「缺席 / 读不出 / claim_key 对不上」折成 `null`，两个 watcher 拿 null 当
 legacy 现算当前代际（Claude 侧还决定 outbox 归属：会话级靠 `claude_session_id`）——
 说不清来源却猜了个目标，正是回执三态那一课。修：`readClaimState` 三态成为唯一判据
-（`readClaim` 变薄包装），两个 watcher 非 valid 即 fail-closed（不发布、落 failed 记录、
-session lock 保留交陈旧检测；Codex 侧另发 risk）。夹具同步补齐像真的 claim。
+（`readClaim` 变薄包装）；**valid 要能解释这张 claim**（固定字段、规范时间、非空来源
+代际、路由字段形状；Codex 侧交叉核对 task / thread，Claude 侧核对逻辑 task），未知
+扩展字段允许；key 形状守在读写核心（评审实测 Claude watcher 的 key 能路径穿越）。
+两个 watcher 与 Codex Stop hook 入站分支非 valid 即 fail-closed（watcher：不发布、
+failed 记录先落、session lock 保留交陈旧检测；Codex 侧另发 risk —— **risk 走 task
+当前话题是有意的 task 级告警**，与失败/超时分支同一语义，不是 run 结果；Stop：不入队）。
+夹具同步补齐像真的 claim。
 Codex 侧并发靠 outbox 事务的发布锁互斥，无需 run 通道 claim；失败/超时分支的抑制
 与 risk 接线未见缺口。
 
@@ -68,7 +73,7 @@ Codex 侧并发靠 outbox 事务的发布锁互斥，无需 run 通道 claim；�
 | 2 | `feat/outbox-review-read-model` | 只读视图 + 共用读取语义硬化 | 已合 #58 |
 | 3 | `fix/outbox-suppression-transaction` | 抑制事务（**含统一写锁**） | 已合 #60 |
 | 4 | `fix/codex-manual-drain-cas` | 手工发布计划与目标 CAS | 本轮（见上「第 4 层剩余：已完成」） |
-| 5 | `fix/codex-auto-publish-lifecycle` | 自动发布生命周期 | **未开始** |
+| 5 | `fix/codex-auto-publish-lifecycle` / `fix/watcher-claim-tristate` | 自动发布生命周期 | 步骤 1 已合 #70；步骤 2 本轮 |
 | 6 | `fix/claude-outbox-fail-closed` | Claude 侧接线 | 已合 #59 |
 
 依赖：3、4、5 都建立在第 2 层给出的读模型上（`auditOutbox` / `outboxMutationBlocker` /

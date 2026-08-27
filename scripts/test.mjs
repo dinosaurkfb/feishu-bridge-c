@@ -297,7 +297,7 @@ function writeClaimFixture({ claimsDir, key, patch = {} }) {
   fs.writeFileSync(file, JSON.stringify({
     schema_version: "1.0", state: "claimed", claim_key: key, message_id: "om_" + key.slice(0, 8),
     logical_task_key: "k", claimed_at: "2026-08-27T00:00:00.000Z",
-    policy_id: "single", origin_channel_generation_id: null, claude_session_id: null, ...patch,
+    policy_id: "single", origin_channel_generation_id: "gen-1", claude_session_id: null, ...patch,
   }));
   return file;
 }
@@ -11854,7 +11854,7 @@ test("watcher 的例外：坏 outbox 整批不发，但 run 结果**真的发出
   fs.writeFileSync(bad, "{ 这不是 JSON");
   const badBefore = fs.readFileSync(bad, "utf-8");
 
-  const key = "k".repeat(64);
+  const key = "c".repeat(64);
   fs.writeFileSync(path.join(runs, key + ".jsonl"),
     JSON.stringify({ type: "result", is_error: false, result: "这一轮的结果" }) + "\n");
 
@@ -12466,17 +12466,40 @@ test("readClaimState：三态 —— 缺席、有效、读不出/对不上各自
   const ok = readClaimState({ claimsDir: dir, key });
   assert.equal(ok.status, "valid");
   assert.equal(ok.claim.origin_channel_generation_id, "gen-1");
+  const full = JSON.parse(fs.readFileSync(f, "utf-8"));
+  const without = (field) => { const d = { ...full }; delete d[field]; return JSON.stringify(d); };
   for (const [why, content, pattern] of [
     ["半截 JSON", "{ 坏了", /不是 JSON/u],
     ["数组", "[1]", /不是记录对象/u],
-    ["claim_key 对不上", JSON.stringify({ claim_key: "d".repeat(64) }), /claim_key 跟目录名对不上/u],
+    ["只有 claim_key", JSON.stringify({ claim_key: key }), /schema_version 不认识/u],
+    ["claim_key 对不上", JSON.stringify({ ...full, claim_key: "d".repeat(64) }), /claim_key 跟目录名对不上/u],
+    ["state 不是 claimed", JSON.stringify({ ...full, state: "handed_off" }), /state 不是 claimed/u],
+    ["缺 message_id", without("message_id"), /message_id 缺失或为空/u],
+    ["缺 logical_task_key", without("logical_task_key"), /logical_task_key 缺失或为空/u],
+    ["claimed_at 不是规范时间", JSON.stringify({ ...full, claimed_at: "刚才" }), /claimed_at 不是规范时间/u],
+    ["policy_id 空", JSON.stringify({ ...full, policy_id: "" }), /policy_id 缺失或为空/u],
+    ["来源代际空白", JSON.stringify({ ...full, origin_channel_generation_id: "   " }), /不是可用代际/u],
+    ["缺来源代际", without("origin_channel_generation_id"), /不是可用代际/u],
+    ["claude_session_id 形状不对", JSON.stringify({ ...full, claude_session_id: 7 }), /claude_session_id 形状不对/u],
   ]) {
     fs.writeFileSync(f, content);
     const r = readClaimState({ claimsDir: dir, key });
-    assert.equal(r.status, "unreadable", why);
-    assert.match(r.why, pattern, why);
+    assert.equal(r.status, "unreadable", why + "：**竟然算 valid**");
+    assert.match(r.why, pattern, why + "：理由不对 —— " + r.why);
     assert.equal(readClaim({ claimsDir: dir, key }), null, why + "：两态视图也不许给出对象");
   }
+  // 未知扩展字段允许；调用方给的 expect 对不上就不算。
+  fs.writeFileSync(f, JSON.stringify({ ...full, 将来加的: 1 }));
+  assert.equal(readClaimState({ claimsDir: dir, key }).status, "valid", "未知扩展字段不许拦");
+  assert.match(readClaimState({ claimsDir: dir, key, expect: { logicalTaskKey: "别的" } }).why,
+    /logical_task_key 跟这个 task 对不上/u);
+  assert.match(readClaimState({ claimsDir: dir, key, expect: { codexThreadId: "th-x" } }).why,
+    /codex_thread_id 跟这个 task 对不上/u);
+  // key 形状守在读写核心：不派生路径、不写盘。
+  assert.match(readClaimState({ claimsDir: dir, key: "../../escape" }).why, /key 不是 claim key 的形状/u);
+  assert.throws(() => recordClaimState({ claimsDir: dir, key: "../../escape", state: "failed",
+    detail: {} }), /claim key 形状不对/u);
+  assert.equal(fs.existsSync(path.join(dir, "..", "escape.failed.json")), false, "目录外零文件");
 });
 
 // ---------- A：cc2cd 出站故障的四条 ----------
@@ -14171,6 +14194,26 @@ test("Claude watcher：claim 说不清就不发布、不猜 outbox 归属、留 
     const failed = JSON.parse(fs.readFileSync(path.join(claims, key + ".failed.json"), "utf-8"));
     assert.equal(failed.reason, "claim_unreadable", why);
   }
+});
+
+test("Claude watcher：key 形状不对在任何路径派生前拒绝 —— 目录外零文件、锁不动（真实进程）", () => {
+  // 评审实测 key="../../escape"：failed 记录被写到 .runtime-data/escape.failed.json。
+  const h = watcherMatrixRunner.fixture();
+  const rt = path.join(h.dir, ".runtime-data", "inbound");
+  const lock = path.join(rt, "session.lock");
+  fs.mkdirSync(lock, { recursive: true });
+  const before = new Set(fs.readdirSync(path.join(h.dir, ".runtime-data")));
+  for (const bad of ["../../escape", "k1", "A".repeat(64)]) {
+    const r = spawnSync(process.execPath,
+      [path.resolve("scripts", "watch-and-publish.mjs"), bad, h.dir],
+      { encoding: "utf-8", env: { ...process.env, HOME: h.dir }, timeout: 60_000 });
+    assert.equal(r.status, 2, JSON.stringify(bad) + "：" + r.stderr);
+    assert.match(r.stderr, /claim key 的形状/u, JSON.stringify(bad));
+  }
+  assert.deepEqual([...fs.readdirSync(path.join(h.dir, ".runtime-data"))].sort(), [...before].sort(),
+    "**目录外零文件**");
+  assert.deepEqual(fs.readdirSync(path.join(rt, "delivery-claims")), [], "claims 目录零文件");
+  assert.equal(fs.existsSync(lock), true, "控制面零改动：锁不动");
 });
 
 test("run 通道并发互斥：两个 watcher 同一 run，只许发出一张（真实进程）", () => {

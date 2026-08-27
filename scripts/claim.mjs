@@ -61,14 +61,15 @@ export function acquireClaim({ claimsDir, messageId, logicalTaskKey, meta }) {
     return { ok: false, reason: "io_error", error: err.message, key, dir };
   }
 
+  // 固定身份字段放在扩展对象**之后** —— meta 覆盖不了 claim_key/state/message_id。
   writeJsonAtomic(path.join(dir, "claim.json"), {
+    ...meta,
     schema_version: "1.0",
     state: CLAIM_STATE.CLAIMED,
     claim_key: key,
     message_id: messageId,
     logical_task_key: logicalTaskKey,
     claimed_at: new Date().toISOString(),
-    ...meta,
   });
 
   return { ok: true, key, dir };
@@ -87,11 +88,11 @@ export function recordClaimState({ claimsDir, key, state, detail }) {
   }
   const file = path.join(claimsDir, key + "." + state + ".json");
   writeJsonAtomic(file, {
+    ...detail,
     schema_version: "1.0",
     claim_key: key,
     state,
     recorded_at: new Date().toISOString(),
-    ...detail,
   });
   return file;
 }
@@ -190,9 +191,21 @@ export function readClaimState({ claimsDir, key, expect = {} }) {
  */
 const EXPECT_BINDING_VAR = "FEISHU_BRIDGE_EXPECT_BINDING_ID";
 const EXPECT_SESSION_VAR = "FEISHU_BRIDGE_EXPECT_CLAUDE_SESSION_ID";
+/**
+ * 一个 mapping 的**有效绑定身份** —— 唯一投影。
+ * 旧 project-file 映射没有 mapping.binding_id，resolveProject 兼容它并把有效 id
+ * 放进 topic_generation_state.binding_id；直接读可缺省的旧字段会把这类合法映射
+ * 编码成空 binding，watcher 启动即拒绝（评审探针）。claim 写入、期望 env、
+ * watcher 复核都从这里取。
+ */
+export function effectiveBindingId(mapping) {
+  const fromState = mapping?.topic_generation_state?.binding_id;
+  if (nonEmpty(fromState)) return fromState;
+  return nonEmpty(mapping?.binding_id) ? mapping.binding_id : null;
+}
 export function watcherExpectEnv(mapping) {
   return {
-    [EXPECT_BINDING_VAR]: String(mapping?.binding_id ?? ""),
+    [EXPECT_BINDING_VAR]: effectiveBindingId(mapping) ?? "",
     [EXPECT_SESSION_VAR]: mapping?.claude_session_id ?? "",
   };
 }

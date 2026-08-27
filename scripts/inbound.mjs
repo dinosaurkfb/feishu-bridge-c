@@ -17,7 +17,7 @@ import path from "node:path";
 
 import { REJECT } from "./selector.mjs";
 import { fetchTriggerEvent } from "./envelope.mjs";
-import { acquireClaim, recordClaimState, watcherExpectEnv } from "./claim.mjs";
+import { acquireClaim, recordClaimState, watcherExpectEnv, effectiveBindingId } from "./claim.mjs";
 import { moduleRoot } from "./direct-run.mjs";
 import {
   MAPPING_DISPOSITION, buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
@@ -358,7 +358,7 @@ if (justBound && verdict.decision === "reject" && verdict.reason === REJECT.EMPT
   });
   writeReceipt("bound-" + event.message_id, {
     status: "bound", message_id: event.message_id, session_id: event.session_id,
-    root: routed.root, binding_id: mapping.binding_id,
+    root: routed.root, binding_id: effectiveBindingId(mapping),
     matched_by: pendingMatchedBy,
     claim_acquired: false, handed_off: false,
     subscription_claim_shadow: subscriptionClaimShadow,
@@ -422,7 +422,7 @@ const claim = acquireClaim({
   logicalTaskKey: verdict.logicalTaskKey,
   meta: {
     session_id: event.session_id,
-    binding_id: mapping.binding_id,
+    binding_id: effectiveBindingId(mapping),
     policy_id: policyEvaluation.policy_id,
     policy_version: policyEvaluation.policy_version,
     local_target_id: mappingContext.localTargetId,

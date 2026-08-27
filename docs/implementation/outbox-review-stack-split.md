@@ -43,7 +43,13 @@ legacy 现算当前代际（Claude 侧还决定 outbox 归属：会话级靠 `cl
 两个 watcher 与 Codex Stop hook 入站分支非 valid 即 fail-closed（watcher：不发布、
 failed 记录先落、session lock 保留交陈旧检测；Codex 侧另发 risk —— **risk 走 task
 当前话题是有意的 task 级告警**，与失败/超时分支同一语义，不是 run 结果；Stop：不入队）。
-夹具同步补齐像真的 claim。
+claim 要能被**解释**才算 valid：key 按 claimKey(message_id, logical_task_key) 重算、
+policy 受控组合、来源代际非空、会话 id 为 uuid；**期望身份由 inbound 独立传入**
+（env 契约 watcherExpectEnv / readWatcherExpectEnv 共享层一份），有效绑定身份只有
+一份投影 effectiveBindingId（旧 project-file 映射的 id 在 topic_generation_state）；
+Claude watcher 启动期核当前目的地、**终局之后重新解析再核**并用新鲜快照发布
+（运行中关开关 / 绑定漂移 → 零发布、留锁、failed{binding_drift}）。
+夹具同步补齐像真的 claim（派生 key、期望身份从项目真实解析派生）。
 Codex 侧并发靠 outbox 事务的发布锁互斥，无需 run 通道 claim；失败/超时分支的抑制
 与 risk 接线未见缺口。
 

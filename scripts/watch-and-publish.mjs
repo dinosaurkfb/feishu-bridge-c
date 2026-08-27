@@ -25,7 +25,9 @@ import { boundedBudgetMs } from "./eligibility-recovery.mjs";
 import { postDeliveryBits } from "./publish-outcome.mjs";
 import { repairCmd } from "./repair-run-claim.mjs";
 import { shellQuote } from "./shell-quote.mjs";
-import { CLAIM_KEY_SHAPE, readClaimState, readWatcherExpectEnv, recordClaimState } from "./claim.mjs";
+import {
+  CLAIM_KEY_SHAPE, effectiveBindingId, readClaimState, readWatcherExpectEnv, recordClaimState,
+} from "./claim.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
@@ -103,22 +105,40 @@ const OUTBOX = path.join(ROOT, ".runtime-data", "outbound",
 // 最终 exit 2，磁盘上却同时留下了 handed_off 与 failed —— 核对发生在副作用之后。
 // 跟出站其余部分共用同一个解析：项目目录里有配置就用它，
 // 没有就回落到「机器模板 + 登记表那一行」。登记表接入的项目这里没有文件可读。
-const resolved = resolveProject({ root: ROOT, claudeSessionId });
-if (!resolved.ok || !resolved.config) {
-  console.error("读不到这个项目的链路配置（" + (resolved.reason ?? resolved.configError?.reason) + "）—— 不跑。session lock 保留。");
-  process.exit(2);
+/**
+ * 解析当前项目并核对**实际投递目的地**与期望身份：绑定、会话、逻辑 task。
+ * 期望身份只绑 claim 不够 —— 评审探针：claim 与 env 都是 old-binding、当前 mapping
+ * 已是 current-binding，watcher 照发到 om_current。"独立期望身份"必须约束最后投给谁。
+ * 启动期跑一次（任何终态落盘之前），终局观察到之后**再跑一次**（新鲜快照）。
+ */
+function resolveAndCheck(stage) {
+  const resolved = resolveProject({ root: ROOT, claudeSessionId });
+  if (!resolved.ok || !resolved.config) {
+    return { ok: false, reason: "config_unresolved",
+      why: String(resolved.reason ?? resolved.configError?.reason ?? "说不清") };
+  }
+  const cfg = resolved.config;
+  const mapping = resolved.mapping;
+  const problems = [];
+  if (acceptedClaim.logical_task_key !== cfg.logical_task_key) problems.push("logical_task_key 跟这个项目对不上");
+  if (effectiveBindingId(mapping) !== EXPECT_BINDING_ID) {
+    problems.push("当前绑定（" + String(effectiveBindingId(mapping)) + "）跟期望（" + EXPECT_BINDING_ID + "）对不上");
+  }
+  const nowSession = resolved.claudeSessionId ?? mapping?.claude_session_id ?? null;
+  if (nowSession !== EXPECT_SESSION_ID) problems.push("当前会话跟期望对不上");
+  if (problems.length > 0) return { ok: false, reason: "binding_drift", why: stage + "：" + problems.join("；") };
+  return { ok: true, resolved, cfg, mapping };
 }
-const cfg = resolved.config;
-const mapping = resolved.mapping;
-if (acceptedClaim.logical_task_key !== cfg.logical_task_key) {
+const refuse = (check) => {
   try {
     recordClaimState({ claimsDir: CLAIMS, key, state: "failed",
-      detail: { reason: "claim_unreadable", why: "logical_task_key 跟这个项目对不上",
-        observed_by: "watch-and-publish" } });
+      detail: { reason: check.reason, why: check.why, observed_by: "watch-and-publish" } });
   } catch { /* 记不上不改变结论 */ }
-  console.error("这一轮的 claim 说不清（logical_task_key 跟这个项目对不上）—— 结果不发布。session lock 保留。");
+  console.error("这一轮不发布（" + check.reason + "：" + check.why + "）。session lock 保留。");
   process.exit(2);
-}
+};
+const startup = resolveAndCheck("启动期");
+if (!startup.ok) refuse(startup);
 
 /**
  * **发布等待预算**：兜底定时器可能正好在排空同一个 outbox，等它而不是抢。
@@ -147,6 +167,14 @@ while (true) {
   const outcome = readRunOutcome(logPath);
 
   if (outcome.state !== "running" && outcome.state !== "missing") {
+    // **终局之后、任何终态落盘和发布之前，重新读取并核对当前绑定与配置。**
+    // 启动期那份 cfg/mapping 最长会被复用四小时 —— 评审探针：运行中把
+    // auto_publish_on_completion 改成 false，watcher 仍照发。暂停绑定、撤销同理。
+    const fresh = resolveAndCheck("终局期");
+    if (!fresh.ok) refuse(fresh);
+    const cfg = fresh.cfg;
+    const mapping = fresh.mapping;
+    const resolved = fresh.resolved;
     recordClaimState({
       claimsDir: CLAIMS, key, state: outcome.state === "completed" ? "handed_off" : "failed",
       detail: { run_state: outcome.state, observed_by: "watch-and-publish" },

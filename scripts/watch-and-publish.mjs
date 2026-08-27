@@ -10,6 +10,7 @@
  * 只能由知道 run 何时结束的这一方来放。
  */
 
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -215,9 +216,13 @@ while (true) {
     // 两阶段转交回执" —— 那是在 run 通道已有的账本（claim 互斥 / 回执三态 / reap 锁）
     // 旁边又立一本，四轮评审各击穿一处（作用域、dryRun 改盘、枚举入口、失败折叠）。
     step("run 终局落盘", () => {
+      // 终局记录现在也是排空恢复消费者的授权凭据：绑定它授权的确切制品（JSONL 字节摘要）
+      // 与实际 outcome —— 排空侧重算比对，记录写完后换掉正文就发不出去。
+      let artifactSha256 = null;
+      try { artifactSha256 = createHash("sha256").update(fs.readFileSync(logPath)).digest("hex"); } catch { /* 留 null，排空侧视为未绑定 */ }
       recordClaimState({
         claimsDir: CLAIMS, key, state: outcome.state === "completed" ? "handed_off" : "failed",
-        detail: { run_state: outcome.state, observed_by: "watch-and-publish",
+        detail: { run_state: outcome.state, observed_by: "watch-and-publish", artifact_sha256: artifactSha256,
           ...(fresh.publishable ? {} : { publish_deferred: { reason: "mapping_not_active", why: fresh.pausedWhy,
             consumer: "drain-outbox run 通道（恢复绑定后经 claimRunPublish 发一次）" } }) },
       });

@@ -36,17 +36,37 @@ const PRESENTATION = {
  * 吞成 []、把损坏回执藏在 receiptUnreadable 里 —— 自动恢复入口用它就会把"账本坏了"
  * 报成"空"（评审实测坏 .published.json → status empty、零报警）。只有 ENOENT 算空。
  */
-export function inventoryRuns({ runsDir }) {
+export function inventoryRuns({ runsDir, claimsDir = null }) {
+  const problems = [];
+  let files;
   try {
     const st = fs.statSync(runsDir);
     if (!st.isDirectory()) return { ok: false, reason: "runs_not_a_directory", runs: [], problems: [] };
+    files = fs.readdirSync(runsDir);   // stat 成功后 readdir 仍可能失败 —— 不许再被 scanRuns 吞成 []
   } catch (err) {
-    if (err.code === "ENOENT") return { ok: true, runs: [], problems: [] };
-    return { ok: false, reason: "runs_unreadable", error: String(err.code ?? err.message), runs: [], problems: [] };
+    if (err.code === "ENOENT") files = null;
+    else return { ok: false, reason: "runs_unreadable", error: String(err.code ?? err.message), runs: [], problems: [] };
   }
-  const runs = scanRuns({ runsDir });
-  const problems = runs.filter((r) => r.receiptUnreadable)
-    .map((r) => ({ key: r.key, reason: "receipt_unreadable", why: r.receiptUnreadable }));
+  const runs = files === null ? [] : scanRuns({ runsDir });
+  for (const r of runs) {
+    if (r.receiptUnreadable) problems.push({ key: r.key, reason: "receipt_unreadable", why: r.receiptUnreadable });
+  }
+  // **从授权记录那侧也枚举**：有"延期发布"终局记录却没有 run 制品的，是孤儿，不能消失。
+  if (claimsDir) {
+    let names = null;
+    try { names = fs.readdirSync(claimsDir); }
+    catch (err) { if (err.code !== "ENOENT") problems.push({ key: null, reason: "claims_unreadable", why: String(err.code ?? err.message) }); }
+    const known = new Set(runs.map((r) => r.key));
+    for (const name of names ?? []) {
+      const m = /^([0-9a-f]{64})\.(handed_off|failed)\.json$/u.exec(name);
+      if (!m || known.has(m[1])) continue;
+      let doc = null;
+      try { doc = JSON.parse(fs.readFileSync(path.join(claimsDir, name), "utf-8")); } catch { /* 坏记录由排空侧单独判 */ }
+      if (doc && typeof doc === "object" && doc.publish_deferred) {
+        problems.push({ key: m[1], reason: "orphan_terminal_record", why: "有延期发布的终局记录，run 制品缺席" });
+      }
+    }
+  }
   return { ok: true, runs, problems };
 }
 

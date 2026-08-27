@@ -319,6 +319,13 @@ function fixtureMappingOf(root) {
   return resolved.mapping;
 }
 const expectEnvFor = (root) => watcherExpectEnv(fixtureMappingOf(root));
+/** watcher 写的终局记录现在是授权凭据：夹具照真的来 —— 绑 JSONL 摘要。 */
+const terminalDetail = (runsDir, key, extra = {}) => ({
+  run_state: "completed", observed_by: "watch-and-publish",
+  artifact_sha256: createHash("sha256").update(fs.readFileSync(path.join(runsDir, key + ".jsonl"))).digest("hex"),
+  ...extra,
+});
+
 function writeClaimFixture({ claimsDir, key, root = null, patch = {} }) {
   const dir = path.join(claimsDir, key + ".claim");
   const file = path.join(dir, "claim.json");
@@ -14532,7 +14539,7 @@ test("run 通道所有权只有一笔：直发 CLI 发布途中，排空的 run 
   writeClaimFixture({ claimsDir: path.join(rt, "delivery-claims"), key, root: h.dir });
   // 排空只认 watcher 明确记载"因暂停而延期"的终局记录 —— 夹具照真的来。
   recordClaimState({ claimsDir: path.join(rt, "delivery-claims"), key, state: "handed_off",
-    detail: { run_state: "completed", observed_by: "watch-and-publish", publish_deferred: { reason: "mapping_not_active" } } });
+    detail: terminalDetail(runs, key, { publish_deferred: { reason: "mapping_not_active" } }) });
   fs.writeFileSync(path.join(h.dir, "mode.txt"), "barrier");   // 假 lark 卡在屏障上直到 barrier.txt 出现
   const orchestrator = path.join(h.dir, "race.mjs");
   fs.writeFileSync(orchestrator, [
@@ -14589,13 +14596,84 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
       if (claim === "corrupt") { fs.mkdirSync(path.join(claims, key + ".claim"), { recursive: true });
         fs.writeFileSync(path.join(claims, key + ".claim", "claim.json"), "{ 坏了"); }
       if (terminal === "deferred") recordClaimState({ claimsDir: claims, key, state: "handed_off",
-        detail: { run_state: "completed", observed_by: "watch-and-publish", publish_deferred: { reason: "mapping_not_active" } } });
+        detail: terminalDetail(runs, key, { publish_deferred: { reason: "mapping_not_active" } }) });
       if (terminal === "drift") recordClaimState({ claimsDir: claims, key, state: "failed",
-        detail: { run_state: "completed", reason: "binding_drift", why: "x" } });
+        detail: terminalDetail(runs, key, { reason: "binding_drift", why: "x" }) });
+      if (terminal === "plain") recordClaimState({ claimsDir: claims, key, state: "handed_off",
+        detail: terminalDetail(runs, key) });
       return key;
     };
     return { h, rt, runs, claims, drain, run, sent: () => sent, lastArgs: () => lastArgs };
   };
+
+  // 授权凭据要绑实际 outcome 与确切制品；终态要唯一；watcher 发过又失败的只可见、不自动重试。
+  {
+    const f = mk();
+    const lied = f.run("lied");            // 终局记录说 failed，实际 completed
+    fs.writeFileSync(path.join(f.claims, lied + ".handed_off.json"), JSON.stringify({
+      ...JSON.parse(fs.readFileSync(path.join(f.claims, lied + ".handed_off.json"), "utf-8")), run_state: "failed" }));
+    const swapped = f.run("swapped");      // 记录写完后正文被换
+    fs.writeFileSync(path.join(f.runs, swapped + ".jsonl"),
+      JSON.stringify({ type: "result", is_error: false, result: "换过的正文" }) + "\n");
+    const twice = f.run("twice");          // handed_off 与 failed 同时存在
+    recordClaimState({ claimsDir: f.claims, key: twice, state: "failed", detail: terminalDetail(f.runs, twice, { reason: "binding_drift" }) });
+    const unbound = f.run("unbound");      // 记录没绑摘要
+    const ub = JSON.parse(fs.readFileSync(path.join(f.claims, unbound + ".handed_off.json"), "utf-8")); delete ub.artifact_sha256;
+    fs.writeFileSync(path.join(f.claims, unbound + ".handed_off.json"), JSON.stringify(ub));
+    const wfail = f.run("wfail", { terminal: "plain" });   // watcher 当时 active、发了但失败：旧形状失败账
+    fs.writeFileSync(path.join(f.runs, wfail + ".publish-failed.json"), JSON.stringify({ at: "2026-08-27T00:00:00.000Z", error: "ETIMEDOUT" }));
+    const r = f.drain();
+    assert.equal(f.sent(), 0, "**以上一条都不许发**：" + JSON.stringify(r.runs));
+    const reasons = Object.fromEntries(r.runs.stuck.map((x) => [x.key, x.reason]));
+    assert.equal(reasons[lied], "outcome_mismatch");
+    assert.equal(reasons[swapped], "artifact_mismatch", "**记录写完后换正文不许发**");
+    assert.equal(reasons[twice], "terminal_ambiguous");
+    assert.equal(reasons[unbound], "terminal_unbound");
+    assert.equal(reasons[wfail], "watcher_publish_failed", "watcher 发过又失败：可见、不自动重试");
+    assert.match(r.runs.stuck.find((x) => x.key === wfail).why, /ETIMEDOUT/u);
+  }
+  // 恢复清单从授权记录那侧也枚举：有延期记录没 run 制品 = 孤儿；stat 过了 readdir 失败也不算空。
+  {
+    const f = mk();
+    const orphan = f.run("orphan");
+    fs.rmSync(path.join(f.runs, orphan + ".jsonl"));
+    const r = f.drain();
+    assert.notEqual(r.status, "empty", "**孤儿授权记录不许让排空报空**：" + JSON.stringify(r));
+    assert.equal(r.runs.problems.find((x) => x.key === orphan)?.reason, "orphan_terminal_record");
+    const g = mk();
+    g.run("unreadable");
+    fs.chmodSync(g.runs, 0o000);
+    let r2;
+    try { r2 = g.drain(); } finally { fs.chmodSync(g.runs, 0o700); }
+    assert.equal(r2.runs?.problems?.[0]?.reason, "runs_unreadable", JSON.stringify(r2));
+    assert.notEqual(r2.status, "empty");
+  }
+  // 重试账本：坏账不许发；预留在 claim 内、发布前；账写不进去不发；释放返回 false 要报。
+  {
+    const f = mk();
+    const bad = f.run("badledger");
+    fs.writeFileSync(path.join(f.runs, bad + ".publish-failed.json"), "{ 坏了");
+    const r = f.drain();
+    assert.equal(f.sent(), 0, "坏账不许自动重试");
+    assert.equal(r.runs.stuck[0]?.reason, "ledger_unreadable");
+    const g = mk();
+    const key = g.run("reserve");
+    let seen = null;
+    g.drain({ publish: () => { seen = JSON.parse(fs.readFileSync(path.join(g.runs, key + ".publish-failed.json"), "utf-8")); return "om_ok"; } });
+    assert.equal(seen?.attempts, 1, "**尝试要在发布之前、claim 之内预留**");
+    assert.equal(seen?.run_id, key);
+    assert.equal(fs.existsSync(path.join(g.runs, key + ".publish-failed.json")), false, "成功后清账");
+    const h2 = mk();
+    const k2 = h2.run("unwritable");
+    fs.mkdirSync(path.join(h2.runs, k2 + ".publish-failed.json"));   // 账本路径是目录：读为 EISDIR 说不清
+    const r2 = h2.drain();
+    assert.equal(h2.sent(), 0, "**账本更新不了就不许自动尝试**");
+    assert.ok(["ledger_unreadable", "ledger_unwritable"].includes(r2.runs.stuck[0]?.reason), JSON.stringify(r2.runs));
+    const h3 = mk();
+    const k3 = h3.run("release");
+    const r3 = h3.drain({ publish: () => { fs.rmSync(path.join(h3.runs, k3 + ".publish-claim.json")); return "om_x"; } });
+    assert.equal(r3.runs.problems.find((x) => x.key === k3)?.reason, "claim_release_failed", "**释放返回 false 不许沉默**");
+  }
 
   // 授权门：历史 run（无 watcher 终局记录）与身份漂移的 failed 记录都不许自动捞起。
   {
@@ -14663,7 +14741,9 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
     } });
     assert.equal(r.runs.deliveredUnrecorded?.[0]?.messageId, "om_delivered", JSON.stringify(r.runs));
     assert.equal(r.runs.stuck.length, 0, "**送达后回执没落不是发布失败**");
-    assert.equal(fs.existsSync(path.join(f.runs, key + ".publish-failed.json")), false, "不许记成失败账");
+    const ledger = JSON.parse(fs.readFileSync(path.join(f.runs, key + ".publish-failed.json"), "utf-8"));
+    assert.match(ledger.error, /delivered_unrecorded/u, "账本要写明是送达未落标，不是发布失败：" + JSON.stringify(ledger));
+    assert.equal(ledger.attempts, 1);
     const said = describeDrainOutcome(r, { root: f.h.dir });
     assert.equal(said.error, true); assert.match(said.text, /可能重发/u);
   }

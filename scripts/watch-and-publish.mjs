@@ -25,7 +25,7 @@ import { boundedBudgetMs } from "./eligibility-recovery.mjs";
 import { postDeliveryBits } from "./publish-outcome.mjs";
 import { repairCmd } from "./repair-run-claim.mjs";
 import { shellQuote } from "./shell-quote.mjs";
-import { readClaim, recordClaimState } from "./claim.mjs";
+import { readClaimState, recordClaimState } from "./claim.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
@@ -62,9 +62,23 @@ const startedAt = Date.now();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const finishUp = () => fs.rmSync(LOCK, { recursive: true, force: true });
-const acceptedClaim = readClaim({ claimsDir: CLAIMS, key });
-const originGenerationId = acceptedClaim?.origin_channel_generation_id ?? null;
-const claudeSessionId = acceptedClaim?.claude_session_id ?? null;
+// **claim 三态：说不清就不猜。**这里的 claim 不只决定来源代际，还决定 outbox 归属
+// （会话级绑定靠 claude_session_id）—— 缺席/损坏时上一版落到项目级 outbox、
+// 现算当前代际，把一轮结果发到了说不清的地方。结果不发布、落 failed 记录、
+// session lock 保留（runner 可能还活着，交给陈旧检测）。
+const claimState = readClaimState({ claimsDir: CLAIMS, key });
+if (claimState.status !== "valid") {
+  const why = claimState.status === "absent" ? "claim 缺席" : "claim 读不出来：" + claimState.why;
+  try {
+    recordClaimState({ claimsDir: CLAIMS, key, state: "failed",
+      detail: { reason: "claim_unreadable", why, observed_by: "watch-and-publish" } });
+  } catch { /* 记不上不改变结论 */ }
+  console.error("这一轮的 claim 说不清（" + why + "）—— 结果不发布：来源代际与 outbox 归属无从判定。session lock 保留。");
+  process.exit(2);
+}
+const acceptedClaim = claimState.claim;
+const originGenerationId = acceptedClaim.origin_channel_generation_id ?? null;
+const claudeSessionId = acceptedClaim.claude_session_id ?? null;
 const OUTBOX = path.join(ROOT, ".runtime-data", "outbound",
   claudeSessionId ? "outbox-" + claudeSessionId : "outbox");
 

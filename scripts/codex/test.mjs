@@ -302,6 +302,24 @@ function eligFixture({ holdLock = true } = {}) {
   };
 }
 
+
+/**
+ * 一张**像真的** Codex claim（acquireClaim 写出来的形状）。已有就不动（Dialogue 测试
+ * 自己写带 policy 的那张）。生产里 claim 先于 watcher 存在；缺了它 watcher 现在会 fail-closed。
+ */
+function writeClaimFixture({ claimsDir, key, patch = {} }) {
+  const dir = path.join(claimsDir, key + ".claim");
+  const file = path.join(dir, "claim.json");
+  if (fs.existsSync(file)) return file;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({
+    schema_version: "1.0", state: "claimed", claim_key: key, message_id: "om_" + key.slice(0, 8),
+    logical_task_key: "k", claimed_at: "2026-08-27T00:00:00.000Z",
+    codex_thread_id: THREAD_A, policy_id: "single", origin_channel_generation_id: null, ...patch,
+  }));
+  return file;
+}
+
 function outboxRecord(extra = {}) {
   recSeq += 1;
   return {
@@ -2074,6 +2092,7 @@ test("关闭自动发布时 watcher 只把严格完成的最终答复兜底入�
   fs.mkdirSync(paths.sessionLock, { recursive: true });
   const key = "a".repeat(64);
   writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "watcher final" });
+  writeClaimFixture({ claimsDir: paths.claims, key });
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -2105,6 +2124,7 @@ test("Codex watcher 严格完成后释放 Dialogue 活动回合", () => {
   fs.mkdirSync(paths.runs, { recursive: true });
   fs.mkdirSync(paths.sessionLock, { recursive: true });
   writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "dialogue final" });
+  writeClaimFixture({ claimsDir: paths.claims, key });
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -2138,6 +2158,7 @@ test("watcher 抑制递归产生的错误答复，只保留风险回执", () => 
   ].map(JSON.stringify).join("\n") + "\n");
   fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "EPERM stack");
   stampReceipt(paths.runs, key);
+  writeClaimFixture({ claimsDir: paths.claims, key });
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -2166,6 +2187,7 @@ test("watcher 对启动前 Git 预检失败给出真实且脱敏的风险回执"
     JSON.stringify(exitReceipt(key, { status: "failed", exit_code: 1 })));
   fs.writeFileSync(path.join(paths.runs, key + ".stderr.log"),
     "Not inside a trusted directory and --skip-git-repo-check was not specified. secret-token\n");
+  writeClaimFixture({ claimsDir: paths.claims, key });
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -6512,6 +6534,7 @@ test("watcher：资格一直卡住时要照实说原因，并留下恢复标记"
   fs.mkdirSync(path.dirname(paths.publishLock), { recursive: true });
   assert.equal(acquirePublishLock(paths.publishLock).ok, true, "前提：别人正持着发布锁");
   try {
+    writeClaimFixture({ claimsDir: paths.claims, key });
     const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
       "--claim-key", key, "--task-key", task.logical_task_key,
     ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
@@ -6573,6 +6596,7 @@ test("watcher：标记自己看不懂时要说出具体那句，不是只说 mar
   }));
   const key = "f".repeat(64);
   writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "答复" });
+  writeClaimFixture({ claimsDir: paths.claims, key });
   const r2 = watch(key);
   assert.equal(r2.status, 0, r2.stderr);
   assert.match(r2.stderr, /恢复标记看不懂，没动：/u);
@@ -6626,6 +6650,7 @@ test("watcher 启动时的历史标记：撞上锁要等到有结论，不能只
     "sleep 1.5; rm -rf " + JSON.stringify(paths.publishLock)], { stdio: "ignore" });
   releaser.unref();
   try {
+    writeClaimFixture({ claimsDir: paths.claims, key });
     const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
       "--claim-key", key, "--task-key", task.logical_task_key,
     ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -7985,6 +8010,7 @@ test("watcher：历史标记指向的 JSONL 有非对象行，不许在 session 
   // 这一轮自己正常。
   const key = "6".repeat(64);
   writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "这一轮" });
+  writeClaimFixture({ claimsDir: paths.claims, key });
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -8029,6 +8055,7 @@ test("watcher：旧形状的退出回执不算终局 —— fail-closed 走失�
   writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "看着像完成了" });
   // 回执换成安装前那种旧形状 —— JSONL 与最终输出都"完成"，只有回执没有身份。
   fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify({ exit_code: 0 }));
+  writeClaimFixture({ claimsDir: paths.claims, key });
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -8063,6 +8090,7 @@ test("watcher：event key 命中的记录 run_id 是别的 claim，初始路径�
   appendEvent({ outboxDir: paths.outbox, kind: "reply", text: "先入队的那条",
     eventKey, runId: "0".repeat(64) });
   writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "先入队的那条" });
+  writeClaimFixture({ claimsDir: paths.claims, key });
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
@@ -8114,6 +8142,49 @@ test("恢复是授权：恢复标记说 completed 也不算，run 复合凭据�
   stampReceipt(g.runsDir, g.key);
   g.marker();
   assert.equal(recoverEligibilityPending(g.args()).recovered.length, 1, "干净时必须照常放行");
+});
+
+
+test("watcher：claim 说不清就 fail-closed —— 不猜来源代际、不入队、发 risk、留 session lock（真实 CLI）", () => {
+  // 上一版 readClaim 把缺席/损坏都折成 null，watcher 拿 null 当 legacy 现算当前代际：
+  // 一张坏 claim 就把这一轮结果发到"现在的"话题，而不是它来自的那个。
+  for (const [why, plant] of [
+    ["缺席", () => {}],
+    ["半截 JSON", (f) => fs.writeFileSync(f, "{ 坏了")],
+    ["claim_key 对不上", (f) => fs.writeFileSync(f, JSON.stringify({ claim_key: "e".repeat(64) }))],
+  ]) {
+    const home = temp();
+    const root = path.join(home, "project");
+    fs.mkdirSync(root, { recursive: true });
+    const task = makeTaskEntry({ root, threadId: THREAD_A, name: "NoClaim",
+      rootMessageId: "om_a", token: "a" });
+    task.auto_publish_on_completion = false;
+    writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+    const paths = taskPaths(task, home);
+    fs.mkdirSync(paths.runs, { recursive: true });
+    fs.mkdirSync(paths.claims, { recursive: true });
+    fs.mkdirSync(paths.sessionLock, { recursive: true });
+    const key = "5".repeat(64);
+    writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "跑完了的结果" });
+    fs.mkdirSync(path.join(paths.claims, key + ".claim"), { recursive: true });
+    plant(path.join(paths.claims, key + ".claim", "claim.json"));
+    const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
+      "--claim-key", key, "--task-key", task.logical_task_key,
+    ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+    assert.equal(r.status, 2, why + "：" + r.stderr);
+    assert.match(r.stderr, /claim 说不清/u, why);
+    const events = fs.readdirSync(paths.outbox)
+      .map((f) => JSON.parse(fs.readFileSync(path.join(paths.outbox, f), "utf-8")));
+    assert.equal(events.some((e) => e.kind === "reply"), false, why + "：**说不清来源就不许把结果入队**");
+    const risk = events.find((e) => e.kind === "risk");
+    assert.ok(risk, why + "：要发一条 risk");
+    assert.match(risk.text, /claim 说不清/u, why);
+    assert.match(risk.text, /不会自动发出去/u, why);
+    assert.equal(fs.existsSync(paths.sessionLock), true, why + "：session lock 要留着");
+    assert.equal(fs.existsSync(path.join(paths.claims, key + ".completed.json")), false, why);
+    const failed = JSON.parse(fs.readFileSync(path.join(paths.claims, key + ".failed.json"), "utf-8"));
+    assert.equal(failed.reason, "claim_unreadable", why);
+  }
 });
 
 test("R5 completeness：收集层给结论，坏一处就 complete:false 并点名", () => {

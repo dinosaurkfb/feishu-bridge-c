@@ -88,11 +88,37 @@ export function recordClaimState({ claimsDir, key, state, detail }) {
   return file;
 }
 
-export function readClaim({ claimsDir, key }) {
+/**
+ * 读一张已取得的 claim —— **三态，不是两态**。
+ *
+ *   absent      文件不在（生产里 acquireClaim 先写再起 watcher，缺席 = 被删/坏盘）
+ *   valid       能读、是对象、claim_key 与目录名一致
+ *   unreadable  读不出 / 不是对象 / claim_key 对不上 —— 说不清
+ *
+ * 两个 watcher 都靠它决定来源代际（Claude 侧还决定 outbox 归属）。上一版把三态
+ * 折成 `claim | null`，null 就当 legacy 现算当前代际 —— 说不清来源却猜了个目标，
+ * 正是 R2b1 回执三态那一课（第 5 层步骤 2 复核发现）。
+ */
+export function readClaimState({ claimsDir, key }) {
   const file = path.join(claimsDir, key + ".claim", "claim.json");
-  try {
-    return JSON.parse(fs.readFileSync(file, "utf-8"));
-  } catch {
-    return null;
+  let raw;
+  try { raw = fs.readFileSync(file, "utf-8"); }
+  catch (err) {
+    if (err?.code === "ENOENT") return { status: "absent" };
+    return { status: "unreadable", why: "读不出来" };
   }
+  let claim;
+  try { claim = JSON.parse(raw); }
+  catch { return { status: "unreadable", why: "不是 JSON" }; }
+  if (claim === null || typeof claim !== "object" || Array.isArray(claim)) {
+    return { status: "unreadable", why: "不是记录对象" };
+  }
+  if (claim.claim_key !== key) return { status: "unreadable", why: "claim_key 跟目录名对不上" };
+  return { status: "valid", claim };
+}
+
+/** 两态视图（只给不做授权决定的读方）：valid 才给 claim，其余一律 null。 */
+export function readClaim({ claimsDir, key }) {
+  const state = readClaimState({ claimsDir, key });
+  return state.status === "valid" ? state.claim : null;
 }

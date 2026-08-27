@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /** 一次性 watcher：确认 Codex run 终局、兜底入队、按发布合同处理并释放 task 锁。 */
 
-import { CLAIM_KEY_SHAPE, readClaim, recordClaimState } from "../claim.mjs";
+import { CLAIM_KEY_SHAPE, readClaimState, recordClaimState } from "../claim.mjs";
 import { eligibilityBudgetMs } from "../eligibility-recovery.mjs";
 import { settleEligibilityPending, settleOwnEligibility } from "./eligibility-recovery.mjs";
 import { releaseSessionLock } from "../handoff.mjs";
@@ -40,8 +40,33 @@ if (!task) {
 const paths = taskPaths(task, home);
 // run 制品路径不在这里拼 —— 由验真入口从 runsDir + key 派生（防跨 run 拼装）。
 const eventKey = codexReplyEventKey({ threadId: task.codex_thread_id, claimKey: key });
-const acceptedClaim = readClaim({ claimsDir: paths.claims, key });
-const targetGenerationId = acceptedClaim?.origin_channel_generation_id ?? null;
+// **claim 三态：说不清来源代际就不猜。**上一版 null 一律当 legacy 现算当前代际 ——
+// 一张缺席/损坏的 claim 会把这一轮结果发到"现在的"话题，而不是它来自的那个。
+// 结果不自动发布、留 risk、session lock 保留（runner 可能还活着，交给陈旧检测）。
+const claimState = readClaimState({ claimsDir: paths.claims, key });
+if (claimState.status !== "valid") {
+  const why = claimState.status === "absent" ? "claim 缺席" : "claim 读不出来：" + claimState.why;
+  console.error("这一轮的 claim 说不清（" + why + "），结果不会自动发布；session lock 保留。");
+  try {
+    appendEvent({
+      outboxDir: paths.outbox, kind: "risk",
+      text: task.task_display_name + " 的这一轮投递 claim 说不清（" + why +
+        "）。**它的结果不会自动发出去**，需要人看一眼。",
+      source: "codex-run-watcher",
+      eventKey: "codex:" + task.codex_thread_id + ":claim:" + key + ":claim-unreadable",
+      publishEligible: task.auto_publish_on_completion === true,
+      runId: key,
+    });
+    publishEligibleTaskEvents({ task, home });
+    recordClaimState({ claimsDir: paths.claims, key, state: "failed",
+      detail: { reason: "claim_unreadable", why } });
+  } catch (err) {
+    console.error("记录 claim 故障时又出错：" + String(err?.message ?? err).slice(0, 200));
+  }
+  process.exit(2);
+}
+const acceptedClaim = claimState.claim;
+const targetGenerationId = acceptedClaim.origin_channel_generation_id ?? null;
 // **上一轮卡住的资格，在这里补上 —— 而且要等到有结论。**
 //
 // 提升取不到发布锁时（publisher_busy）watcher 只记一个 eligibility_pending 就退了；

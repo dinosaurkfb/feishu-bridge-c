@@ -30,7 +30,17 @@ CLI 只解析显示）；预览打印完整可执行命令过 shellQuote，真 s
 派生）；watcher 初始路径补 `requireRunId`；恢复消费者下沉到 `scripts/codex/`
 并在授权前验 run 复合凭据（两个制品各自验，AND 不是 OR）。
 内容绑定（成功回执封两份 SHA-256，验真器每份制品只读一次）见 §4.1 更正。
-待做：步骤 2 —— `eligibility_pending` 恢复链之外的 watcher 接线复核。
+**步骤 2（watcher 接线复核）结论**：逐分支复核 Codex watcher（启动扫描、完成/失败/
+超时分支、session lock 释放、claim 状态记录、Dialogue 收口）并对照 R2b1 第二通道的
+三课（claim 互斥 / 回执三态 / reap 锁）。受控无抛点：启动扫描与验真入口对任何磁盘
+内容都返回受控结果（步骤 1 的 P1-2 修后），循环里无可驱动的抛点。**发现并修一处**：
+`readClaim` 把「缺席 / 读不出 / claim_key 对不上」折成 `null`，两个 watcher 拿 null 当
+legacy 现算当前代际（Claude 侧还决定 outbox 归属：会话级靠 `claude_session_id`）——
+说不清来源却猜了个目标，正是回执三态那一课。修：`readClaimState` 三态成为唯一判据
+（`readClaim` 变薄包装），两个 watcher 非 valid 即 fail-closed（不发布、落 failed 记录、
+session lock 保留交陈旧检测；Codex 侧另发 risk）。夹具同步补齐像真的 claim。
+Codex 侧并发靠 outbox 事务的发布锁互斥，无需 run 通道 claim；失败/超时分支的抑制
+与 risk 接线未见缺口。
 
 集成基准分支：`integration/outbox-review-baseline`（原 `feat/outbox-review`，9 笔提交）。
 它**不作为交付路径**，只作为"这些改动曾经一起跑通过"的参照。

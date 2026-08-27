@@ -326,7 +326,7 @@ auditOutbox → outboxMutationBlocker → 查看器是否给命令
 
 抑制是不可逆写入，"除允许清单外一律不变"在第 3 层比在登记表更值钱。
 
-## 6. 待办：夹具语义全量清理
+## 6. 夹具语义全量清理 —— **已完成**（分支 `test/outbox-fixture-semantics`，2026-08-27）
 
 评审建议、**不并入任何一层**，单独做：
 
@@ -336,3 +336,18 @@ auditOutbox → outboxMutationBlocker → 查看器是否给命令
 
 不建议用源码扫描做这件事：`kind: "progress"` 同时存在于别的协议和刻意构造的
 非法/历史样本中，源码扫描无法区分，而且容易再次变成"守卫长相"的测试。
+
+**做法（两侧同构，`scripts/test.mjs` 与 `scripts/codex/test.mjs` 各一份）**：约束在 helper
+里，不靠调用处记得。`outboxRecord(extra)` 用读模型自己的判据自检（`classifyOutboxRecord`
+可归三态且 `explainabilityGaps` 为空），否则当场抛并指路；`invalidOutboxRecord({ expect,
+omit, ...extra })` 必须声明 `expect.unclassified`（why **原文**）和/或 `expect.gaps`（字段列表，
+**有序逐字**），产出先与读模型对账，没声明的那一项必须干净，声明与实际不符当场抛；
+`rawOutboxFixture({ raw, expect })` 管坏 JSON / 非记录对象。真实入口的测试再断言入口给出的
+理由与声明**逐字相等**（如 `applySuppressionCore` 的 `details[].why`），不是"被挡住了就行"。
+迁移前后测试数一致（Claude 680 → 680 + 1 条 helper 自检；Codex 257 → 257 + 1）。
+
+**边界（明说，不装作全覆盖）**：`retryProtection` / `pauseKindOf` / `retryProtectionState`
+自身的单元测试仍手写记录形状（`{ ...base, publish_attempts: n }`）—— 那些测试测的就是判据本身，
+用判据去验它们的夹具是循环的。另外 helper 挡得住 `outboxRecord({坏字段})`，挡不住
+`{ ...outboxRecord(), 坏字段 }` 这种绕开 helper 的叠补丁 —— 这一轮把两侧现存的全部迁走了，
+之后靠评审看，不加源码扫描（理由同上）。

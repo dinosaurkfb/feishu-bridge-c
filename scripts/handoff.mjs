@@ -155,7 +155,14 @@ export function readRunOutcome(logPath) {
   } catch {
     return { state: "missing" };
   }
+  return parseRunOutcome(raw);
+}
 
+/**
+ * 按**一份已经读到的文本**判终局 —— 核验、正文、摘要必须来自同一份字节快照
+ * （评审探针：第一次读到 A、盘上与第二次读到 B，摘要 B 通过、发出去的却是 A）。
+ */
+export function parseRunOutcome(raw) {
   let finalText = null;
   let isError = null;
   let sawResult = false;

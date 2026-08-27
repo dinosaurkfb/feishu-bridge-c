@@ -11,7 +11,6 @@
  * 那会让进展静默丢失。
  */
 
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -21,7 +20,7 @@ import {
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import {
   PUBLISH_FAILURE, buildDraft, claimRunPublish, classifyPublishFailure, inventoryRuns, markPublished,
-  publishDraft, readRunReceipt, releaseRunPublishClaim,
+  publishDraft, readRunReceipt, readRunSnapshot, releaseRunPublishClaim, runRouteSha256,
 } from "./outbound.mjs";
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { readClaimState } from "./claim.mjs";
@@ -335,16 +334,28 @@ function readTerminalRecord({ claimsDir, key }) {
   if (doc.schema_version !== "1.0" || doc.claim_key !== key || doc.state !== state || !isCanonicalIso(doc.recorded_at)) {
     return { ok: false, reason: "terminal_unreadable", why: "固定字段对不上" };
   }
-  if (!["completed", "failed", "blocked"].includes(doc.run_state)) return { ok: false, reason: "terminal_unreadable", why: "run_state 不受控" };
+  // **终态语义封闭**：handed_off 只对应 completed；failed 只对应 failed|blocked；
+  // 记录必须出自受控的 watcher。
+  const allowed = state === "handed_off" ? ["completed"] : ["failed", "blocked"];
+  if (!allowed.includes(doc.run_state)) return { ok: false, reason: "terminal_unreadable", why: state + " 不该对应 run_state " + String(doc.run_state) };
+  if (doc.observed_by !== "watch-and-publish") return { ok: false, reason: "terminal_unreadable", why: "observed_by 不是受控 watcher" };
   const deferred = doc.publish_deferred;
-  if (deferred === null || typeof deferred !== "object" || Array.isArray(deferred) || deferred.reason !== "mapping_not_active") {
+  if (deferred === undefined) {
     return { ok: false, reason: "publish_not_authorized", why: "终局记录里没有「因绑定暂停而延期发布」的记载 —— 待人工分类" };
   }
-  // 授权凭据要绑定它授权的确切制品：JSONL 字节摘要（watcher 写记录时算的）。
+  if (deferred === null || typeof deferred !== "object" || Array.isArray(deferred)
+    || Object.keys(deferred).sort().join(",") !== "consumer,reason,why"
+    || deferred.reason !== "mapping_not_active" || typeof deferred.why !== "string" || typeof deferred.consumer !== "string") {
+    return { ok: false, reason: "terminal_unreadable", why: "publish_deferred 不是受控形状" };
+  }
+  // 授权凭据要绑定它授权的确切制品与最终投递意图：JSONL 字节摘要 + 路由投影摘要。
   if (!/^[0-9a-f]{64}$/u.test(String(doc.artifact_sha256))) {
     return { ok: false, reason: "terminal_unbound", why: "终局记录没有绑定制品摘要（artifact_sha256）" };
   }
-  return { ok: true, state, runState: doc.run_state, artifactSha256: doc.artifact_sha256 };
+  if (!/^[0-9a-f]{64}$/u.test(String(doc.route_sha256))) {
+    return { ok: false, reason: "terminal_unbound", why: "终局记录没有绑定路由摘要（route_sha256）" };
+  }
+  return { ok: true, state, runState: doc.run_state, artifactSha256: doc.artifact_sha256, routeSha256: doc.route_sha256 };
 }
 
 /**
@@ -363,12 +374,21 @@ function readPublishLedger({ runsDir, key }) {
   try { doc = JSON.parse(raw); } catch { return { state: "unreadable", why: "不是 JSON" }; }
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return { state: "unreadable", why: "不是记录对象" };
   if (doc.schema_version === "1.0") {
-    if (doc.run_id === key && Number.isSafeInteger(doc.attempts) && doc.attempts >= 1 && isCanonicalIso(doc.at)) {
-      return { state: "valid", attempts: doc.attempts, error: doc.error ?? null };
+    // **封闭键集与取值**：这本账决定还许不许自动重试。
+    const keys = Object.keys(doc).sort().join(",");
+    if (keys !== "at,attempts,error,run_id,schema_version,source") return { state: "unreadable", why: "重试账键集不对" };
+    if (doc.run_id === key && Number.isSafeInteger(doc.attempts) && doc.attempts >= 1 && isCanonicalIso(doc.at)
+      && doc.source === "drain-run-channel" && (doc.error === null || typeof doc.error === "string")) {
+      // 预留了尝试却没有闭合（发布途中崩溃 / 送达未落标）：送达状态不确定 —— **禁止自动重试**。
+      if (doc.error === "reserved" || (typeof doc.error === "string" && doc.error.startsWith("delivered_unrecorded"))) {
+        return { state: "reserved", attempts: doc.attempts, error: doc.error };
+      }
+      return { state: "valid", attempts: doc.attempts, error: doc.error };
     }
     return { state: "unreadable", why: "重试账形状不对" };
   }
-  if (typeof doc.at === "string" && typeof doc.error === "string" && !("attempts" in doc)) {
+  if (Object.keys(doc).sort().join(",") === "at,error" && isCanonicalIso(doc.at)
+    && typeof doc.error === "string" && doc.error.length > 0) {
     return { state: "legacy", attempts: 1, error: doc.error };
   }
   return { state: "unreadable", why: "重试账形状不认识" };
@@ -409,8 +429,8 @@ function drainRunResults({ root, runsDir, claimsDir, pendingRuns, problems, mapp
   const out = { pending: pendingRuns.length, published: [], skipped: [], stuck: [],
     deliveredUnrecorded: [], problems: [...(problems ?? [])], dryRun: dryRun === true };
   const expect = { bindingId: effectiveBindingId(mapping, { root }), claudeSessionId: claudeSessionId ?? null };
-  for (const run of pendingRuns) {
-    const key = run.key;
+  for (const listed of pendingRuns) {
+    const key = listed.key;
     const terminal = readTerminalRecord({ claimsDir, key });
     if (!terminal.ok) {
       // 授权联合：延期记录 → 自动消费；watcher 发过又失败（旧形状失败账、终局无延期记载）→
@@ -422,14 +442,16 @@ function drainRunResults({ root, runsDir, claimsDir, pendingRuns, problems, mapp
       }
       out.stuck.push({ key, reason: terminal.reason, why: terminal.why }); continue;
     }
-    // 授权凭据要跟实际 outcome 与确切制品对上 —— 记录写完后换正文、记录声称的状态与实际不符，都不发。
+    // **一次读取的快照**：outcome、正文、摘要来自同一份字节 —— 拿新摘要给旧草稿背书是评审
+    // 实测击穿过的形状。授权凭据要跟实际 outcome 与确切制品对上。
+    const snap = readRunSnapshot({ runsDir, key });
+    if (!snap.ok) { out.stuck.push({ key, reason: "artifact_unreadable", why: snap.why }); continue; }
+    const run = snap.run;
+    if (!run.shouldPublish) { out.skipped.push({ key, reason: "receipt_" + snap.receipt.state, why: snap.receipt.why ?? null }); continue; }
     if (terminal.runState !== run.state) {
       out.stuck.push({ key, reason: "outcome_mismatch", why: "终局记录说 " + terminal.runState + "，实际 " + run.state }); continue;
     }
-    let artifactSha;
-    try { artifactSha = createHash("sha256").update(fs.readFileSync(run.logPath)).digest("hex"); }
-    catch (err) { out.stuck.push({ key, reason: "artifact_unreadable", why: String(err?.code ?? err?.message) }); continue; }
-    if (artifactSha !== terminal.artifactSha256) {
+    if (snap.sha256 !== terminal.artifactSha256) {
       out.stuck.push({ key, reason: "artifact_mismatch", why: "run 制品与终局记录绑定的摘要对不上" }); continue;
     }
     // claim 自身先验：缺席 / 损坏是 stuck；合法但属于别的绑定才是正常跳过。
@@ -440,11 +462,17 @@ function drainRunResults({ root, runsDir, claimsDir, pendingRuns, problems, mapp
     const origin = scoped.claim.origin_channel_generation_id;
     const target = resolveMappingOutboundGeneration(mapping, origin);
     if (!target.ok) { out.stuck.push({ key, reason: "origin_generation_unavailable", why: target.reason }); continue; }
+    // 凭据绑定的是**最终投给谁**：绑定、会话、来源代际、解析后的目标 —— 记录写完后改 claim
+    // 的来源代际，就发去了另一个话题（评审探针 om_new）。
+    const route = runRouteSha256({ bindingId: expect.bindingId, claudeSessionId: expect.claudeSessionId,
+      originGenerationId: origin, rootMessageId: target.rootMessageId });
+    if (route !== terminal.routeSha256) { out.stuck.push({ key, reason: "route_mismatch", why: "最终投递路由与终局记录绑定的对不上" }); continue; }
     const text = buildDraft(run, { taskName: cfg.task_display_name });
     if (!text) { out.skipped.push({ key, reason: "no_draft" }); continue; }
     // 锁外先看一眼账本（省一次 claim 竞争）；有约束力的那次在 claim 内。
     const peek = readPublishLedger({ runsDir, key });
     if (peek.state === "unreadable") { out.stuck.push({ key, reason: "ledger_unreadable", why: peek.why }); continue; }
+    if (peek.state === "reserved") { out.stuck.push({ key, reason: "reservation_unresolved", why: "上次尝试没闭合（" + peek.error + "）—— 送达状态不确定，先去话题核对" }); continue; }
     if (peek.attempts >= RUN_PUBLISH_MAX_ATTEMPTS) {
       out.stuck.push({ key, reason: "retry_exhausted", why: "已失败 " + peek.attempts + " 次，自动重试预算耗尽" }); continue;
     }
@@ -462,6 +490,7 @@ function drainRunResults({ root, runsDir, claimsDir, pendingRuns, problems, mapp
       // 后会执行第 5、6 次；预留写不进去就不发（账本更新不了 = 不许自动尝试）。
       const ledger = readPublishLedger({ runsDir, key });
       if (ledger.state === "unreadable") { out.stuck.push({ key, reason: "ledger_unreadable", why: ledger.why }); continue; }
+      if (ledger.state === "reserved") { out.stuck.push({ key, reason: "reservation_unresolved", why: "上次尝试没闭合（" + ledger.error + "）" }); continue; }
       if (ledger.attempts >= RUN_PUBLISH_MAX_ATTEMPTS) {
         out.stuck.push({ key, reason: "retry_exhausted", why: "已失败 " + ledger.attempts + " 次，自动重试预算耗尽" }); continue;
       }
@@ -487,7 +516,9 @@ function drainRunResults({ root, runsDir, claimsDir, pendingRuns, problems, mapp
       try { markPublished({ runsDir, key, messageId: mid }); }
       catch (markErr) {
         // 账本上写明"送达未落标 + message id"：不是发布失败，但下一轮可能重发 —— 人核对时有据可查。
-        writePublishLedger({ runsDir, key, attempts: ledger.attempts + 1, error: "delivered_unrecorded：" + mid });
+        const noted = writePublishLedger({ runsDir, key, attempts: ledger.attempts + 1, error: "delivered_unrecorded：" + mid });
+        // 已知送达后的证据也没落盘 —— 不许隐瞒；此时盘上只剩 reserved，下一轮按"未闭合"禁止自动重试。
+        if (!noted.ok) out.problems.push({ key, reason: "ledger_unwritable", why: "送达证据（" + mid + "）没落盘：" + noted.why });
         out.deliveredUnrecorded.push({ key, messageId: mid, error: String(markErr?.message ?? markErr).slice(0, 200) });
         continue;
       }

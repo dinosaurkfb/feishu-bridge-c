@@ -10,14 +10,12 @@
  * 只能由知道 run 何时结束的这一方来放。
  */
 
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { readRunOutcome } from "./handoff.mjs";
 import {
-  buildDraft, claimRunPublish, markPublished, publishDraft, readRunReceipt,
-  releaseRunPublishClaim, scanRuns,
+  buildDraft, claimRunPublish, markPublished, publishDraft, readRunReceipt, readRunSnapshot,
+  releaseRunPublishClaim, runRouteSha256,
 } from "./outbound.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { claudeRotationBatchHook } from "./drain-outbox.mjs";
@@ -179,7 +177,10 @@ async function waitForPublishLock() {
 }
 
 while (true) {
-  const outcome = readRunOutcome(logPath);
+  // **一次读取的快照**：outcome、正文、摘要全部来自同一份字节 —— 判终局用它、
+  // 写终局记录用它的摘要、发布用它的正文。分三次读盘曾被评审在读与读之间换正文击穿。
+  const snap = readRunSnapshot({ runsDir: RUNS, key });
+  const outcome = snap.ok ? { state: snap.run.state, reason: snap.run.reason } : { state: "missing" };
 
   if (outcome.state !== "running" && outcome.state !== "missing") {
     // **终局之后、任何终态落盘和发布之前，重新读取并核对当前绑定与配置。**
@@ -190,13 +191,8 @@ while (true) {
     const cfg = fresh.cfg;
     const mapping = fresh.mapping;
     const resolved = fresh.resolved;
-    const run = scanRuns({ runsDir: RUNS }).find((r) => r.key === key);
-    // **暂停时的持久恢复闭环**：run 结果安全转成一条 outbox 记录 —— 冻结到 claim 的
-    // 原始代际、按 event key 去重、run_id 带上；恢复绑定后由既有排空路径恰好发一次
-    // （outbox 事务对 mapping_not_active 本来就是 skip）。只留 .jsonl 只证明字节没删：
-    // 后续 watcher 只处理自己的 key、定时排空只扫 outbox、桥接 run 的 Stop 又不入队 ——
-    // 没有这一步，恢复后它永远不会自动发出去（评审探针）。
-    // **三个本地动作各自留痕、互不阻断**：转入 outbox、run 终局落盘、Dialogue 收口。
+    const run = snap.run;
+    // **两个本地动作各自留痕、互不阻断**：run 终局落盘、Dialogue 收口。
     // 任何一个失败都不能拦住其余两个；锁在最后放；有失败就非零退出并点名哪一段没完成
     // （评审探针：outbox 不可写时直接抛 —— run 状态没记、Dialogue 悬挂、锁也没放）。
     const terminalFailures = [];
@@ -218,11 +214,14 @@ while (true) {
     step("run 终局落盘", () => {
       // 终局记录现在也是排空恢复消费者的授权凭据：绑定它授权的确切制品（JSONL 字节摘要）
       // 与实际 outcome —— 排空侧重算比对，记录写完后换掉正文就发不出去。
-      let artifactSha256 = null;
-      try { artifactSha256 = createHash("sha256").update(fs.readFileSync(logPath)).digest("hex"); } catch { /* 留 null，排空侧视为未绑定 */ }
+      // 制品摘要来自同一份快照；路由摘要绑定这一轮**最终投给谁**（绑定、会话、来源代际、
+      // 解析后的目标）—— 记录写完后改 claim 的来源代际就发不出去（评审探针 om_new）。
+      const routeTarget = resolveMappingOutboundGeneration(mapping, originGenerationId);
       recordClaimState({
         claimsDir: CLAIMS, key, state: outcome.state === "completed" ? "handed_off" : "failed",
-        detail: { run_state: outcome.state, observed_by: "watch-and-publish", artifact_sha256: artifactSha256,
+        detail: { run_state: outcome.state, observed_by: "watch-and-publish", artifact_sha256: snap.sha256,
+          route_sha256: runRouteSha256({ bindingId: EXPECT_BINDING_ID, claudeSessionId: EXPECT_SESSION_ID,
+            originGenerationId, rootMessageId: routeTarget.ok ? routeTarget.rootMessageId : null }),
           ...(fresh.publishable ? {} : { publish_deferred: { reason: "mapping_not_active", why: fresh.pausedWhy,
             consumer: "drain-outbox run 通道（恢复绑定后经 claimRunPublish 发一次）" } }) },
       });

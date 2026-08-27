@@ -9,7 +9,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "./claim.mjs";
 
@@ -17,7 +17,7 @@ import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
 
 import { execFileSync } from "node:child_process";
 
-import { readRunOutcome } from "./handoff.mjs";
+import { parseRunOutcome, readRunOutcome } from "./handoff.mjs";
 import { isDirectRun, moduleRoot } from "./direct-run.mjs";
 
 const PUBLISHED_MARK = ".published.json";
@@ -36,37 +36,104 @@ const PRESENTATION = {
  * 吞成 []、把损坏回执藏在 receiptUnreadable 里 —— 自动恢复入口用它就会把"账本坏了"
  * 报成"空"（评审实测坏 .published.json → status empty、零报警）。只有 ENOENT 算空。
  */
+/** 一条 run 的展示/发布判定 —— scanRuns 与快照读取共用这一份。 */
+function describeRun({ runsDir, key, outcome, receipt }) {
+  const pres = PRESENTATION[outcome.state] ?? PRESENTATION.missing;
+  return {
+    key,
+    logPath: path.join(runsDir, key + ".jsonl"),
+    state: outcome.state,
+    reason: outcome.reason ?? null,
+    label: pres.label,
+    // 回执说不清时**两头都不许**：不发（可能双发）、也不当已发（可能漏发）。
+    shouldPublish: pres.publish && receipt.state === "absent",
+    alreadyPublished: receipt.state === "valid",
+    receiptUnreadable: receipt.state === "unreadable" ? (receipt.why ?? "说不清") : null,
+    truthful: pres.truthful,
+    finalText: outcome.finalText ?? null,
+    deniedTools: outcome.deniedTools ?? null,
+  };
+}
+
+/**
+ * **一次读取的 run 快照**：outcome、正文、摘要全部来自同一份字节。
+ * watcher 终局与排空发布都用它 —— 核验一份、发布另一份是评审实测击穿过的形状。
+ */
+export function readRunSnapshot({ runsDir, key }) {
+  let bytes;
+  try { bytes = fs.readFileSync(path.join(runsDir, key + ".jsonl")); }
+  catch (err) { return { ok: false, reason: err.code === "ENOENT" ? "missing" : "unreadable", why: String(err.code ?? err.message) }; }
+  const outcome = parseRunOutcome(bytes.toString("utf-8"));
+  const receipt = readRunReceipt({ runsDir, key });
+  return { ok: true, bytes, sha256: createHash("sha256").update(bytes).digest("hex"),
+    run: describeRun({ runsDir, key, outcome, receipt }), receipt };
+}
+
+/** 终局凭据绑定的**路由投影**摘要：绑定、会话、来源代际、解析后的目标 —— 写方与读方共用。 */
+export function runRouteSha256({ bindingId, claudeSessionId, originGenerationId, rootMessageId }) {
+  return createHash("sha256").update(JSON.stringify({
+    binding_id: bindingId ?? null, claude_session_id: claudeSessionId ?? null,
+    origin_channel_generation_id: originGenerationId ?? null, root_message_id: rootMessageId ?? null,
+  })).digest("hex");
+}
+
+const SIDECAR_RE = /^([0-9a-f]{64})\.(jsonl|published\.json|publish-failed\.json|publish-claim\.json|stderr\.log|prompt\.txt|runner\.log|watch\.log)$/u;
+const TERMINAL_RE = /^([0-9a-f]{64})\.(handed_off|failed)\.json$/u;
+
+/**
+ * runs 账本的**联合盘点**：以第一次目录快照驱动，对 JSONL、终局记录、发布回执、失败账
+ * 做 key 并集 —— 任何孤儿 sidecar、不可读的终局记录都进 problems。只有 ENOENT 算空。
+ * 评审实测两次踩过：目录读取错误被 scanRuns 吞成 []；没有 JSONL 的坏终局 JSON 被略过。
+ */
 export function inventoryRuns({ runsDir, claimsDir = null }) {
   const problems = [];
-  let files;
+  let entries;
   try {
     const st = fs.statSync(runsDir);
     if (!st.isDirectory()) return { ok: false, reason: "runs_not_a_directory", runs: [], problems: [] };
-    files = fs.readdirSync(runsDir);   // stat 成功后 readdir 仍可能失败 —— 不许再被 scanRuns 吞成 []
+    entries = fs.readdirSync(runsDir);   // 这份快照驱动后面的一切，不再二次读目录
   } catch (err) {
-    if (err.code === "ENOENT") files = null;
+    if (err.code === "ENOENT") entries = [];
     else return { ok: false, reason: "runs_unreadable", error: String(err.code ?? err.message), runs: [], problems: [] };
   }
-  const runs = files === null ? [] : scanRuns({ runsDir });
-  for (const r of runs) {
-    if (r.receiptUnreadable) problems.push({ key: r.key, reason: "receipt_unreadable", why: r.receiptUnreadable });
+  const byKey = new Map();
+  const note = (key, kind) => { if (!byKey.has(key)) byKey.set(key, new Set()); byKey.get(key).add(kind); };
+  for (const name of entries) {
+    const m = SIDECAR_RE.exec(name);
+    if (m) note(m[1], m[2]);
   }
-  // **从授权记录那侧也枚举**：有"延期发布"终局记录却没有 run 制品的，是孤儿，不能消失。
+  const terminals = new Map();
   if (claimsDir) {
-    let names = null;
+    let names = [];
     try { names = fs.readdirSync(claimsDir); }
     catch (err) { if (err.code !== "ENOENT") problems.push({ key: null, reason: "claims_unreadable", why: String(err.code ?? err.message) }); }
-    const known = new Set(runs.map((r) => r.key));
-    for (const name of names ?? []) {
-      const m = /^([0-9a-f]{64})\.(handed_off|failed)\.json$/u.exec(name);
-      if (!m || known.has(m[1])) continue;
+    for (const name of names) {
+      const m = TERMINAL_RE.exec(name);
+      if (!m) continue;
+      note(m[1], "terminal");
       let doc = null;
-      try { doc = JSON.parse(fs.readFileSync(path.join(claimsDir, name), "utf-8")); } catch { /* 坏记录由排空侧单独判 */ }
-      if (doc && typeof doc === "object" && doc.publish_deferred) {
-        problems.push({ key: m[1], reason: "orphan_terminal_record", why: "有延期发布的终局记录，run 制品缺席" });
-      }
+      try { doc = JSON.parse(fs.readFileSync(path.join(claimsDir, name), "utf-8")); }
+      catch (err) { problems.push({ key: m[1], reason: "terminal_unreadable", why: name + "：" + String(err.code ?? "不是 JSON") }); }
+      if (doc) terminals.set(m[1], { ...(terminals.get(m[1]) ?? {}), [m[2]]: doc });
     }
   }
+  const runs = [];
+  for (const [key, kinds] of byKey) {
+    if (!kinds.has("jsonl")) {
+      // 没有 run 制品却有它的 sidecar / 终局记录 —— 孤儿，不能消失。
+      const which = [...kinds].filter((k) => k !== "jsonl");
+      if (which.some((k) => ["terminal", "published.json", "publish-failed.json"].includes(k))) {
+        problems.push({ key, reason: kinds.has("terminal") ? "orphan_terminal_record" : "orphan_sidecar",
+          why: "run 制品缺席，只剩：" + which.join("、") });
+      }
+      continue;
+    }
+    const snap = readRunSnapshot({ runsDir, key });
+    if (!snap.ok) { problems.push({ key, reason: "run_unreadable", why: snap.why }); continue; }
+    if (snap.run.receiptUnreadable) problems.push({ key, reason: "receipt_unreadable", why: snap.run.receiptUnreadable });
+    runs.push(snap.run);
+  }
+  runs.sort((a, b) => (a.key < b.key ? -1 : 1));
   return { ok: true, runs, problems };
 }
 
@@ -77,30 +144,12 @@ export function scanRuns({ runsDir }) {
   } catch {
     return [];
   }
-
   const out = [];
   for (const f of files) {
     const key = f.replace(/\.jsonl$/, "");
-    const logPath = path.join(runsDir, f);
-    const outcome = readRunOutcome(logPath);
-    const pres = PRESENTATION[outcome.state] ?? PRESENTATION.missing;
+    const outcome = readRunOutcome(path.join(runsDir, f));
     const receipt = readRunReceipt({ runsDir, key });
-    const publishedAt = receipt.state === "valid" ? receipt.publishedAt : null;
-
-    out.push({
-      key,
-      logPath,
-      state: outcome.state,
-      label: pres.label,
-      // 回执说不清时**两头都不许**：不发（可能双发）、也不当已发（可能漏发）。
-      shouldPublish: pres.publish && receipt.state === "absent",
-      alreadyPublished: receipt.state === "valid",
-      receiptUnreadable: receipt.state === "unreadable"
-        ? (receipt.why ?? "说不清") : null,
-      truthful: pres.truthful,
-      finalText: outcome.finalText ?? null,
-      deniedTools: outcome.deniedTools ?? null,
-    });
+    out.push(describeRun({ runsDir, key, outcome, receipt }));
   }
   return out;
 }

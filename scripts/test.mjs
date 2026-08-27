@@ -29,7 +29,7 @@ import {
   acquireClaim, claimKey, readClaim, readClaimState, readWatcherExpectEnv,
   recordClaimState, watcherExpectEnv,
 } from "./claim.mjs";
-import { effectiveBindingId } from "./topic-generation.mjs";
+import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
   acquirePublishLock, attributeSession, exactProjectsForRoot, fileContainsAny, isUnder,
@@ -50,7 +50,8 @@ import {
 } from "./outbound-card.mjs";
 import {
   PUBLISH_FAILURE, claimRunPublish, classifyPublishFailure, readRunReceipt,
-  releaseRunPublishClaim, scanRuns, buildDraft, parseDirectPublishArgs, inventoryRuns } from "./outbound.mjs";
+  releaseRunPublishClaim, scanRuns, buildDraft, parseDirectPublishArgs, inventoryRuns, readRunSnapshot,
+  runRouteSha256 } from "./outbound.mjs";
 import { repairRunClaims } from "./repair-run-claim.mjs";
 import {
   describeDrainOutcome, drainProject, outboxDirOf, suppressCmd, watcherActive,
@@ -319,12 +320,24 @@ function fixtureMappingOf(root) {
   return resolved.mapping;
 }
 const expectEnvFor = (root) => watcherExpectEnv(fixtureMappingOf(root));
-/** watcher 写的终局记录现在是授权凭据：夹具照真的来 —— 绑 JSONL 摘要。 */
-const terminalDetail = (runsDir, key, extra = {}) => ({
+/**
+ * watcher 写的终局记录现在是授权凭据：夹具照真的来 —— 绑 JSONL 摘要与路由投影摘要
+ * （绑定、会话、claim 冻结的来源代际 gen-1、解析后的目标根消息）。
+ */
+const fixtureRouteSha256 = (root, { originGenerationId = "gen-1", claudeSessionId = null } = {}) => {
+  const mapping = fixtureMappingOf(root);
+  const target = resolveMappingOutboundGeneration(mapping, originGenerationId);
+  return runRouteSha256({ bindingId: effectiveBindingId(mapping), claudeSessionId, originGenerationId,
+    rootMessageId: target.ok ? target.rootMessageId : null });
+};
+const terminalDetail = (runsDir, key, extra = {}, { root = null } = {}) => ({
   run_state: "completed", observed_by: "watch-and-publish",
   artifact_sha256: createHash("sha256").update(fs.readFileSync(path.join(runsDir, key + ".jsonl"))).digest("hex"),
+  ...(root ? { route_sha256: fixtureRouteSha256(root) } : {}),
   ...extra,
 });
+/** watcher 在绑定暂停时记下的延期发布：封闭形状，照 watch-and-publish 的原样。 */
+const DEFERRED = { reason: "mapping_not_active", why: "夹具暂停", consumer: "drain-outbox run 通道" };
 
 function writeClaimFixture({ claimsDir, key, root = null, patch = {} }) {
   const dir = path.join(claimsDir, key + ".claim");
@@ -436,6 +449,8 @@ function test(name, fn) {
   } catch (err) {
     failed += 1;
     failures.push(`${name}\n    ${err.message.split("\n")[0]}`);
+    // 定位用：TEST_TRACE=1 把完整断言与栈打出来（汇总只留第一行）。
+    if (process.env.TEST_TRACE) console.error("\n✗ " + name + "\n" + (err.stack ?? err.message));
   }
 }
 
@@ -14539,7 +14554,7 @@ test("run 通道所有权只有一笔：直发 CLI 发布途中，排空的 run 
   writeClaimFixture({ claimsDir: path.join(rt, "delivery-claims"), key, root: h.dir });
   // 排空只认 watcher 明确记载"因暂停而延期"的终局记录 —— 夹具照真的来。
   recordClaimState({ claimsDir: path.join(rt, "delivery-claims"), key, state: "handed_off",
-    detail: terminalDetail(runs, key, { publish_deferred: { reason: "mapping_not_active" } }) });
+    detail: terminalDetail(runs, key, { publish_deferred: DEFERRED }, { root: h.dir }) });
   fs.writeFileSync(path.join(h.dir, "mode.txt"), "barrier");   // 假 lark 卡在屏障上直到 barrier.txt 出现
   const orchestrator = path.join(h.dir, "race.mjs");
   fs.writeFileSync(orchestrator, [
@@ -14596,11 +14611,11 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
       if (claim === "corrupt") { fs.mkdirSync(path.join(claims, key + ".claim"), { recursive: true });
         fs.writeFileSync(path.join(claims, key + ".claim", "claim.json"), "{ 坏了"); }
       if (terminal === "deferred") recordClaimState({ claimsDir: claims, key, state: "handed_off",
-        detail: terminalDetail(runs, key, { publish_deferred: { reason: "mapping_not_active" } }) });
+        detail: terminalDetail(runs, key, { publish_deferred: DEFERRED }, { root: h.dir }) });
       if (terminal === "drift") recordClaimState({ claimsDir: claims, key, state: "failed",
-        detail: terminalDetail(runs, key, { reason: "binding_drift", why: "x" }) });
+        detail: terminalDetail(runs, key, { run_state: "failed", reason: "binding_drift", why: "x" }, { root: h.dir }) });
       if (terminal === "plain") recordClaimState({ claimsDir: claims, key, state: "handed_off",
-        detail: terminalDetail(runs, key) });
+        detail: terminalDetail(runs, key, {}, { root: h.dir }) });
       return key;
     };
     return { h, rt, runs, claims, drain, run, sent: () => sent, lastArgs: () => lastArgs };
@@ -14609,14 +14624,18 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
   // 授权凭据要绑实际 outcome 与确切制品；终态要唯一；watcher 发过又失败的只可见、不自动重试。
   {
     const f = mk();
-    const lied = f.run("lied");            // 终局记录说 failed，实际 completed
+    const lied = f.run("lied");            // 终局记录自洽地说 completed，实际制品是失败结果（摘要照真的对上）
+    const liedBytes = Buffer.from(JSON.stringify({ type: "result", is_error: true, result: "其实失败了" }) + "\n");
+    fs.writeFileSync(path.join(f.runs, lied + ".jsonl"), liedBytes);
     fs.writeFileSync(path.join(f.claims, lied + ".handed_off.json"), JSON.stringify({
-      ...JSON.parse(fs.readFileSync(path.join(f.claims, lied + ".handed_off.json"), "utf-8")), run_state: "failed" }));
+      ...JSON.parse(fs.readFileSync(path.join(f.claims, lied + ".handed_off.json"), "utf-8")),
+      artifact_sha256: createHash("sha256").update(liedBytes).digest("hex") }));
     const swapped = f.run("swapped");      // 记录写完后正文被换
     fs.writeFileSync(path.join(f.runs, swapped + ".jsonl"),
       JSON.stringify({ type: "result", is_error: false, result: "换过的正文" }) + "\n");
     const twice = f.run("twice");          // handed_off 与 failed 同时存在
-    recordClaimState({ claimsDir: f.claims, key: twice, state: "failed", detail: terminalDetail(f.runs, twice, { reason: "binding_drift" }) });
+    recordClaimState({ claimsDir: f.claims, key: twice, state: "failed",
+      detail: terminalDetail(f.runs, twice, { run_state: "failed", reason: "binding_drift" }, { root: f.h.dir }) });
     const unbound = f.run("unbound");      // 记录没绑摘要
     const ub = JSON.parse(fs.readFileSync(path.join(f.claims, unbound + ".handed_off.json"), "utf-8")); delete ub.artifact_sha256;
     fs.writeFileSync(path.join(f.claims, unbound + ".handed_off.json"), JSON.stringify(ub));
@@ -14673,6 +14692,143 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
     const k3 = h3.run("release");
     const r3 = h3.drain({ publish: () => { fs.rmSync(path.join(h3.runs, k3 + ".publish-claim.json")); return "om_x"; } });
     assert.equal(r3.runs.problems.find((x) => x.key === k3)?.reason, "claim_release_failed", "**释放返回 false 不许沉默**");
+  }
+
+  // **凭据绑定的是最终投给谁**：路由摘要对不上（绑定 / 会话 / 来源代际 / 解析后目标任一变了）不发；
+  // 终态语义封闭：handed_off 只对 completed、failed 只对 failed|blocked；observed_by 与 publish_deferred 形状受控。
+  {
+    const f = mk();
+    const rewrite = (key, mutate) => {
+      const p = path.join(f.claims, key + ".handed_off.json");
+      const doc = JSON.parse(fs.readFileSync(p, "utf-8")); mutate(doc); fs.writeFileSync(p, JSON.stringify(doc));
+    };
+    const rerouted = f.run("rerouted");
+    rewrite(rerouted, (d) => { d.route_sha256 = fixtureRouteSha256(f.h.dir, { originGenerationId: "gen-其他" }); });
+    const noroute = f.run("noroute");
+    rewrite(noroute, (d) => { delete d.route_sha256; });
+    const badstate = f.run("badstate");             // handed_off 却说 run_state=blocked
+    rewrite(badstate, (d) => { d.run_state = "blocked"; });
+    const observer = f.run("observer");
+    rewrite(observer, (d) => { d.observed_by = "someone-else"; });
+    const partial = f.run("partial");
+    rewrite(partial, (d) => { d.publish_deferred = { reason: "mapping_not_active" }; });
+    const extra = f.run("extra");
+    rewrite(extra, (d) => { d.publish_deferred = { ...DEFERRED, resend_to: "om_别处" }; });
+    const r = f.drain();
+    assert.equal(f.sent(), 0, "**以上一条都不许发**：" + JSON.stringify(r.runs));
+    const reasons = Object.fromEntries(r.runs.stuck.map((x) => [x.key, x.reason]));
+    assert.equal(reasons[rerouted], "route_mismatch", "**路由投影对不上不许发**");
+    assert.equal(reasons[noroute], "terminal_unbound");
+    assert.equal(reasons[badstate], "terminal_unreadable", "handed_off ↔ completed 封闭");
+    assert.equal(reasons[observer], "terminal_unreadable", "observed_by 受控");
+    assert.equal(reasons[partial], "terminal_unreadable", "publish_deferred 形状封闭（少键）");
+    assert.equal(reasons[extra], "terminal_unreadable", "publish_deferred 形状封闭（多键）");
+    // 同一个记录、同一份 claim，路由变的是 claim 的来源代际 —— 也对不上（不是只靠篡改摘要才红）。
+    const g = mk();
+    const moved = g.run("moved");
+    const cp = path.join(g.claims, moved + ".claim", "claim.json");
+    fs.writeFileSync(cp, JSON.stringify({ ...JSON.parse(fs.readFileSync(cp, "utf-8")), origin_channel_generation_id: "gen-2" }));
+    const r2 = g.drain();
+    assert.equal(g.sent(), 0, JSON.stringify(r2.runs));
+    assert.ok(["route_mismatch", "origin_generation_unavailable"].includes(r2.runs.stuck[0]?.reason), JSON.stringify(r2.runs));
+  }
+  // **单快照**：核验、正文、摘要必须来自同一次读取 —— 读到 A 又读到 B 时，要么按 B 的摘要卡住，
+  // 要么发出去的就是被验过的那份 B。评审探针：第一次读 A、第二次读 B，摘要 B 通过、发的却是 A。
+  {
+    const f = mk();
+    const key = f.run("snapshot");
+    const jsonl = path.join(f.runs, key + ".jsonl");
+    const A = fs.readFileSync(jsonl);
+    const B = Buffer.from(JSON.stringify({ type: "result", is_error: false, result: "第二次读到的正文 B" }) + "\n");
+    // 终局记录给 B 背书（模拟 watcher 看到的最终版本是 B）。
+    const p = path.join(f.claims, key + ".handed_off.json");
+    fs.writeFileSync(p, JSON.stringify({ ...JSON.parse(fs.readFileSync(p, "utf-8")),
+      artifact_sha256: createHash("sha256").update(B).digest("hex") }));
+    const real = fs.readFileSync;
+    let reads = 0;
+    fs.readFileSync = function (target, ...rest) {
+      if (String(target) === jsonl) { reads += 1; const bytes = reads % 2 === 1 ? A : B; return rest[0] ? bytes.toString("utf-8") : Buffer.from(bytes); }
+      return real.call(fs, target, ...rest);
+    };
+    let r;
+    try { r = f.drain(); } finally { fs.readFileSync = real; }
+    if (f.sent() === 1) {
+      assert.match(JSON.stringify(f.lastArgs()), /第二次读到的正文 B/u, "**发出去的必须是被验过的那份字节**：" + JSON.stringify(f.lastArgs()));
+    } else {
+      assert.equal(r.runs.stuck[0]?.reason, "artifact_mismatch", JSON.stringify(r.runs));
+    }
+  }
+  // 联合盘点：终局记录坏 JSON（有 run 制品）、只剩发布回执的孤儿、watcher 失败终局的孤儿 —— 都进 problems。
+  {
+    const f = mk();
+    const badterm = f.run("badterm");
+    fs.writeFileSync(path.join(f.claims, badterm + ".handed_off.json"), "{ 坏了");
+    const onlyreceipt = claimKeyFor("onlyreceipt");
+    fs.writeFileSync(path.join(f.runs, onlyreceipt + ".published.json"), JSON.stringify({ at: "2026-08-27T00:00:00.000Z", message_id: "om_x" }));
+    const orphanFailed = f.run("orphanfailed", { terminal: "drift" });
+    fs.rmSync(path.join(f.runs, orphanFailed + ".jsonl"));
+    const r = f.drain();
+    assert.equal(f.sent(), 0);
+    const problems = Object.fromEntries(r.runs.problems.map((x) => [x.key, x.reason]));
+    assert.equal(problems[badterm], "terminal_unreadable", "**终局记录不是 JSON 不许消失**：" + JSON.stringify(r.runs));
+    assert.equal(problems[onlyreceipt], "orphan_sidecar", "只剩回执没有制品：孤儿");
+    assert.equal(problems[orphanFailed], "orphan_terminal_record", "失败终局没有制品：孤儿");
+    assert.equal(describeDrainOutcome(r, { root: f.h.dir }).error, true);
+  }
+  // 未闭合的 reservation（发布途中崩溃）= 送达状态不确定，**禁止自动重试**；
+  // 送达后连失败账都写不进 → problems 点名，且下一轮不许重发。
+  {
+    const f = mk();
+    const key = f.run("reserved");
+    fs.writeFileSync(path.join(f.runs, key + ".publish-failed.json"), JSON.stringify({
+      schema_version: "1.0", run_id: key, attempts: 1, at: "2026-08-27T00:00:00.000Z", source: "drain-run-channel", error: "reserved" }));
+    const r = f.drain();
+    assert.equal(f.sent(), 0, "**上次尝试没闭合就不许再发**：" + JSON.stringify(r.runs));
+    assert.equal(r.runs.stuck[0]?.reason, "reservation_unresolved");
+    assert.match(describeDrainOutcome(r, { root: f.h.dir }).text, /reservation_unresolved/u);
+    const preview = f.drain({ dryRun: true });
+    assert.equal(preview.runs.published.length, 0, "**dry-run 不许把未闭合的 reservation 报成将发布**：" + JSON.stringify(preview.runs));
+    assert.equal(preview.runs.stuck[0]?.reason, "reservation_unresolved");
+    const g = mk();
+    const k2 = g.run("unnoted");
+    const ledgerPath = path.join(g.runs, k2 + ".publish-failed.json");
+    const r2 = g.drain({ publish: () => {
+      fs.mkdirSync(path.join(g.runs, k2 + ".published.json"), { recursive: true });
+      fs.writeFileSync(path.join(g.runs, k2 + ".published.json", "occupied"), "x");
+      // 送达之后账本路径也被占住：delivered_unrecorded 这一笔写不进去。
+      fs.rmSync(ledgerPath); fs.mkdirSync(ledgerPath); fs.writeFileSync(path.join(ledgerPath, "occupied"), "x");
+      return "om_delivered2";
+    } });
+    assert.equal(r2.runs.deliveredUnrecorded?.[0]?.messageId, "om_delivered2", JSON.stringify(r2.runs));
+    assert.equal(r2.runs.problems.find((x) => x.key === k2)?.reason, "ledger_unwritable", "**送达证据写不进去不许沉默**：" + JSON.stringify(r2.runs));
+    // 回执目录清掉（模拟人工处理了回执那一半）：账本那一半仍然说不清 → 不许重发。
+    fs.rmSync(path.join(g.runs, k2 + ".published.json"), { recursive: true });
+    const r3 = g.drain();
+    assert.equal(g.sent(), 0, "**下一轮不许重发**：" + JSON.stringify(r3.runs));
+    assert.equal(r3.runs.stuck[0]?.reason, "ledger_unreadable", JSON.stringify(r3.runs));
+  }
+  // 重试账本键集封闭：多键 / source 不对 / 旧形状 error 为空 → 说不清，不发。
+  {
+    const base = (key) => ({ schema_version: "1.0", run_id: key, attempts: 1, at: "2026-08-27T00:00:00.000Z", source: "drain-run-channel", error: "boom" });
+    for (const [why, docOf] of [
+      ["多键", (key) => ({ ...base(key), retry_after: 0 })],
+      ["source 不对", (key) => ({ ...base(key), source: "someone" })],
+      ["error 类型不对", (key) => ({ ...base(key), error: 1 })],
+      ["旧形状 error 为空", () => ({ at: "2026-08-27T00:00:00.000Z", error: "" })],
+      ["旧形状 at 不规范", () => ({ at: "昨天", error: "boom" })],
+    ]) {
+      const f = mk();
+      const key = f.run("ledger-" + why);
+      fs.writeFileSync(path.join(f.runs, key + ".publish-failed.json"), JSON.stringify(docOf(key)));
+      const r = f.drain();
+      assert.equal(f.sent(), 0, why);
+      assert.equal(r.runs.stuck[0]?.reason, "ledger_unreadable", why + "：" + JSON.stringify(r.runs));
+    }
+    const f = mk();
+    const key = f.run("ledger-legacy-ok");
+    fs.writeFileSync(path.join(f.runs, key + ".publish-failed.json"), JSON.stringify({ at: "2026-08-27T00:00:00.000Z", error: "ETIMEDOUT" }));
+    f.drain();
+    assert.equal(f.sent(), 1, "合法旧形状失败账：算 1 次尝试，可以再试");
   }
 
   // 授权门：历史 run（无 watcher 终局记录）与身份漂移的 failed 记录都不许自动捞起。

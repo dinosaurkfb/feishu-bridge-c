@@ -434,6 +434,8 @@ export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey =
         task, key === null || key === undefined ? null : key);
       for (const r of listPending({ outboxDir })) {
         const state = describeRecordState(r, { resolveTarget });
+        // 被永久拒绝过的要单独说（同项目条目一份投影）—— 它不会再自动重试，是在等人。
+        const rp = retryProtection(r);
         entry.records.push({
           file: path.basename(r._file ?? ""),
           kind: sanitizeForDisplay(r.kind ?? "?"),
@@ -441,6 +443,11 @@ export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey =
           text: r.text ?? "",
           state: state.code,
           why: state.text,
+          rejected: rp.status === "paused",
+          rejectedKind: rp.status === "paused" ? rp.kind : null,
+          rejectedWhy: rp.status === "paused" ? sanitizeForDisplay(rp.reason) : null,
+          retrying: rp.status === "retrying" ? rp.attempts : null,
+          protectionCorrupt: rp.status === "corrupt",
         });
       }
     }

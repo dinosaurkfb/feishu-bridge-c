@@ -4664,6 +4664,75 @@ test("四层 status：Codex 侧报的必须是自己那条链的事实，不是 
   assert.doesNotMatch(r.stdout, /abc123/u, "认领口令不许出现");
 });
 
+test("四层 status 第五区：只转述 outbox 与资格标记的只读投影 —— 各态计数、需要人看逐条、说不清不折叠成 0、零副作用、不泄露 locator（真实进程）", () => {
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "第五区示例", rootMessageId: "om_root", token: "abc123" });
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const paths = taskPaths(task, home);
+  fs.mkdirSync(paths.outbox, { recursive: true });
+  fs.mkdirSync(paths.claims, { recursive: true });
+  const put = (name, body) => fs.writeFileSync(path.join(paths.outbox, name), typeof body === "string" ? body : JSON.stringify(body));
+  put("01-ready.json", outboxRecord({ kind: "reply", text: "就绪的", publish_eligible_at: "2026-08-27T00:00:00.000Z" }));
+  put("02-wait.json", outboxRecord({ kind: "reply", text: "等资格的", publish_eligible_at: null }));
+  put("03-malformed.json", invalidOutboxRecord({ kind: "reply", text: "资格字段坏的", publish_eligible_at: "not-a-canonical-time", expect: { gaps: ["publish_eligible_at"] } }));
+  put("04-corrupt.json", invalidOutboxRecord({ kind: "reply", text: "目标坏的", target_channel_generation_id: "   ", expect: { gaps: ["target_channel_generation_id"] } }));
+  put("05-raw.json", rawOutboxFixture({ raw: "{ 坏了", expect: { unclassified: "读不出来" } }));
+  // 被永久拒绝的：走真实写入口。
+  put("06-paused.json", outboxRecord({ kind: "reply", text: "被拒的", publish_eligible_at: "2026-08-27T00:00:00.000Z" }));
+  recordPublishFailure(listPending({ outboxDir: paths.outbox }).find((r) => r.text === "被拒的"), { permanent: true, reason: "err_11310" });
+  // 资格标记：一张合法（run 跑完等资格提升）、一张坏 JSON。
+  const okKey = realClaimKey("status-ok");
+  recordClaimState({ claimsDir: paths.claims, key: okKey, state: "eligibility_pending",
+    detail: { run_state: "completed", promote_failed: "publisher_busy", event_key: codexReplyEventKey({ threadId: THREAD_A, claimKey: okKey }) } });
+  const badKey = realClaimKey("status-bad");
+  fs.writeFileSync(path.join(paths.claims, badKey + ".eligibility_pending.json"), "{ 坏了");
+  const snapshot = (dir) => fs.readdirSync(dir).sort().map((f) => f + ":" + fs.readFileSync(path.join(dir, f)).toString("base64")).join("\n");
+  const before = snapshot(paths.outbox) + "\n--\n" + snapshot(paths.claims);
+
+  const run = () => spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  const r = run();
+  assert.equal(r.status, 0, r.stderr);
+  const fifth = r.stdout.slice(r.stdout.indexOf("待处理事件"));
+  assert.match(fifth, /就绪待发[　 ]+1 条/u, fifth);
+  assert.match(fifth, /等发布资格[　 ]+1 条/u, fifth);
+  assert.match(fifth, /已暂停重试[　 ]+1 条（被永久拒绝，等人处理）/u, fifth);
+  assert.match(fifth, /06-paused\.json[　 ]+platform_rejected：/u, "被拒的要带 kind 与原因：" + fifth);
+  assert.match(fifth, /需要人看[　 ]+2 条/u, fifth);
+  assert.match(fifth, /03-malformed\.json[　 ]+auth_malformed：/u, fifth);
+  assert.match(fifth, /04-corrupt\.json[　 ]+corrupt：/u, fifth);
+  // 03 / 04 既"需要人看"也是审计的"解释不了"（同一份读模型、两个维度），加上坏 JSON → 3 处。
+  assert.match(fifth, /outbox 账本[　 ]+说不清 3 处/u, "坏 JSON 与解释不了的都要点名：" + fifth);
+  assert.match(fifth, /03-malformed\.json[　 ]+缺少解释这条记录所必需的字段：publish_eligible_at/u, fifth);
+  assert.match(fifth, /05-raw\.json[　 ]+读不出来/u, fifth);
+  assert.match(fifth, /等资格恢复[　 ]+1 条（run 已完成，发布资格待提升）/u, fifth);
+  assert.match(fifth, new RegExp("资格标记[　 ]+说不清 1 处[\\s\\S]*" + badKey.slice(0, 8) + "[　 ]+读不出来", "u"), fifth);
+  // 不泄露 locator：根消息 id、thread id、完整 claim key。
+  assert.doesNotMatch(r.stdout, /om_root/u); assert.doesNotMatch(r.stdout, new RegExp(THREAD_A, "u"));
+  assert.equal(r.stdout.includes(badKey), false, "完整 key 不许出现");
+  // 零副作用：outbox 与 claims 逐文件字节一致（没 claim、没改盘、没发布）。
+  assert.equal(snapshot(paths.outbox) + "\n--\n" + snapshot(paths.claims), before, "**status 一个字节都不许改**");
+  // 与只读投影同源：collectBacklog 说的就是状态页说的。
+  const backlog = collectBacklog({ home, threadId: THREAD_A });
+  assert.equal(backlog.tasks[0].records.filter((x) => x.state === "ready" && !x.rejected).length, 1);
+  assert.equal(backlog.tasks[0].records.filter((x) => x.rejected).length, 1);
+  // outbox 目录读不出：说不清，不给计数。
+  fs.chmodSync(paths.outbox, 0o000);
+  let blind;
+  try { blind = run(); } finally { fs.chmodSync(paths.outbox, 0o700); }
+  assert.match(blind.stdout, /出站记录[　 ]+说不清（/u, blind.stdout);
+  assert.doesNotMatch(blind.stdout, /就绪待发/u, "读不出就不许出计数行");
+  // 没绑定的 thread：不适用，不伪造成 0。
+  const unbound = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_B],
+    { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.equal(unbound.status, 0, unbound.stderr);
+  assert.match(unbound.stdout, /出站记录[　 ]+不适用（尚未绑定）/u, unbound.stdout);
+  assert.doesNotMatch(unbound.stdout, /就绪待发/u);
+});
+
 test("四层 status：这条 task 的登记表状态要单独报，不跟 task 自己的状态混", () => {
   // 第 3 层其余各行读的是 task 自己的状态，而出站走登记表 ——
   // 两套可以不一致，而**那种不一致最难查**：状态页说正常、出站挑不到它。

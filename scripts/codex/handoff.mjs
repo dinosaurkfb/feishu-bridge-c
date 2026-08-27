@@ -3,6 +3,8 @@
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { isCanonicalIso } from "../canonical-time.mjs";
+import { CLAIM_KEY_SHAPE } from "../claim.mjs";
 import { moduleDir } from "../direct-run.mjs";
 
 const HERE = moduleDir(import.meta.url);
@@ -58,6 +60,8 @@ export function handOffCodex({
     "--stderr", errPath,
     "--last-message", lastMessagePath,
     "--exit-receipt", exitPath,
+    // 回执里的身份来自显式参数，不从环境变量隐式取。
+    "--claim-key", key,
     "--codex-bin", codexBin,
   ], {
     cwd: projectDir,
@@ -178,6 +182,88 @@ export function isCodexInboundExecution(command) {
     DIRECT_INBOUND_EXECUTION.test(segment.trim().replace(/^[('"\s]+/u, "")));
 }
 
+/**
+ * 退出回执的**封闭形状**（跟 run-resume.mjs 写的逐字对账）。
+ * 键集按分支封闭，取值域一起封 —— 只封键名的话，status 写成 "exited" 配上
+ * exit_code:1 照样是一张"合法"回执。
+ */
+const RECEIPT_KEYS = ["artifact_type", "claim_key", "exit_code", "recorded_at",
+  "schema_version", "signal", "status"].sort();
+const RECEIPT_KEYS_SPAWN_FAILED = [...RECEIPT_KEYS, "error"].sort();
+
+function receiptProblem(doc, claimKey) {
+  if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return "不是回执对象";
+  const keys = Object.keys(doc).sort();
+  const want = doc.status === "spawn_failed" ? RECEIPT_KEYS_SPAWN_FAILED : RECEIPT_KEYS;
+  const missing = want.filter((k) => !keys.includes(k));
+  if (missing.length > 0) return "缺字段：" + missing.join("、");
+  const extra = keys.filter((k) => !want.includes(k));
+  if (extra.length > 0) return "多出不认识的字段：" + extra.join("、");
+  if (doc.artifact_type !== "codex_run_exit_receipt") return "artifact_type 不是退出回执";
+  if (doc.schema_version !== "1.0") return "schema_version 不认识";
+  // 文件名与内容必须自洽 —— 三件制品的路径都从 key 派生，回执再把 key 写进内容，
+  // 三个合法文件就不能跨 run 拼装。
+  if (doc.claim_key !== claimKey) return "claim_key 跟文件名对不上";
+  if (!isCanonicalIso(doc.recorded_at)) return "recorded_at 不是规范时间";
+  const intOrNull = (v) => v === null || Number.isInteger(v);
+  const strOrNull = (v) => v === null || typeof v === "string";
+  if (doc.status === "exited") {
+    if (doc.exit_code !== 0) return "status=exited 却 exit_code≠0";
+    if (doc.signal !== null) return "status=exited 却带 signal";
+  } else if (doc.status === "failed") {
+    if (!intOrNull(doc.exit_code) || doc.exit_code === 0) return "status=failed 的 exit_code 形状不对";
+    if (!strOrNull(doc.signal)) return "signal 形状不对";
+  } else if (doc.status === "spawn_failed") {
+    if (doc.exit_code !== null || doc.signal !== null) return "spawn_failed 不该有 exit_code/signal";
+    if (typeof doc.error !== "string") return "error 不是字符串";
+  } else {
+    return "status 不在受控取值里";
+  }
+  return null;
+}
+
+/**
+ * **自动发布授权凭据的验真入口**（第 5 层）。三件终局证据合起来是一份复合凭据：
+ * runner 写的退出回执（bridge 自有，封闭 schema 逐字验）、Codex CLI 写的
+ * `.jsonl`（上游可演进协议：所消费字段严格、未知扩展兼容）与 `.last-message.txt`
+ * （非空文本）。"完成"由这里推导，不由任何单一写方自报。
+ *
+ * 三个路径**只从 runsDir + claimKey 派生**，不接调用方自由组合 ——
+ * 否则三个各自合法的文件仍能跨 run 拼装出一份"完成"。
+ *
+ * @returns {{state:"running"}|{state:"completed",...}|{state:"failed",reason,why?}}
+ *          回执缺席 = 仍在跑；回执在但对不上 = fail-closed，不是"仍在跑"。
+ */
+export function verifyCodexRunCredential({ runsDir, claimKey, expectedThreadId }) {
+  if (typeof claimKey !== "string" || !CLAIM_KEY_SHAPE.test(claimKey)) {
+    return { state: "failed", reason: "claim_key_malformed" };
+  }
+  if (typeof runsDir !== "string" || !runsDir) return { state: "failed", reason: "runs_dir_required" };
+  const exitPath = path.join(runsDir, claimKey + ".exit.json");
+  let raw;
+  try { raw = fs.readFileSync(exitPath, "utf-8"); }
+  catch (err) {
+    if (err?.code === "ENOENT") return { state: "running" };
+    return { state: "failed", reason: "exit_receipt_invalid", why: "读不出来" };
+  }
+  let doc;
+  try { doc = JSON.parse(raw); }
+  catch { return { state: "failed", reason: "exit_receipt_invalid", why: "不是 JSON" }; }
+  const problem = receiptProblem(doc, claimKey);
+  if (problem !== null) return { state: "failed", reason: "exit_receipt_invalid", why: problem };
+  return readCodexRunOutcome({
+    logPath: path.join(runsDir, claimKey + ".jsonl"),
+    exitPath,
+    errPath: path.join(runsDir, claimKey + ".stderr.log"),
+    lastMessagePath: path.join(runsDir, claimKey + ".last-message.txt"),
+    expectedThreadId,
+  });
+}
+
+/**
+ * 三件证据的**内容**判定（JSONL 终局、退出码、最终输出）。
+ * 生产路径不直接调它 —— 走 verifyCodexRunCredential，那里先验回执身份、再派生路径。
+ */
 export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, errPath, expectedThreadId }) {
   let raw = "";
   try { raw = fs.readFileSync(logPath, "utf-8"); } catch { /* runner 可能刚启动 */ }

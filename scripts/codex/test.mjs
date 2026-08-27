@@ -36,6 +36,15 @@ import {
   INTENT_TTL_MS, buildIntentParams, consumeIntent, intentDir, issueIntent,
 } from "./intent.mjs";
 import { sweepEligible } from "./drain-all.mjs";
+import { claimKey, recordClaimState } from "../claim.mjs";
+import { isCanonicalIso } from "../canonical-time.mjs";
+import {
+  ELIGIBILITY_BUDGET_DEFAULT_MS, ELIGIBILITY_BUDGET_MAX_MS, eligibilityBudgetMs,
+} from "../eligibility-recovery.mjs";
+import {
+  eligibilityOutcomeFor, listEligibilityPending, recoverEligibilityPending,
+  settleEligibilityPending, settleOwnEligibility,
+} from "./eligibility-recovery.mjs";
 import {
   checkArgShape as drainCheckArgShape, parseArgs as drainParseArgs,
 } from "./drain-outbox.mjs";
@@ -53,6 +62,7 @@ import { readCodexThreadTitle, sanitizeThreadTitle } from "./thread-title.mjs";
 import { updateTextMessage } from "./lark-message.mjs";
 import {
   classifyRunnerDiagnostic, isCodexInboundExecution, readCodexRunOutcome, sanitizeCodexRunEnv,
+  verifyCodexRunCredential,
 } from "./handoff.mjs";
 import {
   composeCodexOutboundCard, neutralizeCardMentions, outboundCardBatches, validateCodexOutboundCard,
@@ -199,6 +209,80 @@ function digestFromDisk(outboxDir, select = (r) => r) {
 }
 
 let recSeq = 0;
+
+/**
+ * 一张**合法的退出回执** —— 就是 run-resume.mjs 真会写出来的封闭形状。
+ * 覆盖字段用 patch；要造"缺字段/多字段"的样本自己动结果对象。
+ */
+function exitReceipt(key, patch = {}) {
+  return {
+    artifact_type: "codex_run_exit_receipt", schema_version: "1.0", claim_key: key,
+    recorded_at: "2026-08-27T00:00:00.000Z", status: "exited", exit_code: 0, signal: null,
+    ...patch,
+  };
+}
+
+/** 一套**完整的 run 终局证据**（jsonl + 退出回执 + 最终输出），全部从 key 派生文件名。 */
+function writeRunArtifacts({ runsDir, key, threadId, text = "答复", receipt = {} }) {
+  fs.writeFileSync(path.join(runsDir, key + ".jsonl"), [
+    { type: "thread.started", thread_id: threadId }, { type: "turn.started" }, { type: "turn.completed" },
+  ].map(JSON.stringify).join("\n") + "\n");
+  fs.writeFileSync(path.join(runsDir, key + ".exit.json"), JSON.stringify(exitReceipt(key, receipt)));
+  fs.writeFileSync(path.join(runsDir, key + ".last-message.txt"), text);
+}
+
+/**
+ * eligibility_pending 恢复链的夹具。
+ *
+ * 默认**占着发布锁** —— 这条链上的每一个缺陷都只在"锁被别人拿着"时才出现，
+ * 夹具默认不占锁的话，一整批测试会在一条根本走不到的路径上全绿。
+ */
+/** 一张**完整**的恢复标记 —— 就是 recordClaimState + watch-run 那份 detail 真会写出来的键集。 */
+function fullMarker(key, patch = {}) {
+  return {
+    schema_version: "1.0", claim_key: key, state: "eligibility_pending",
+    recorded_at: "2026-08-25T00:00:00.000Z",
+    run_state: "completed", promote_failed: "publisher_busy",
+    event_key: codexReplyEventKey({ threadId: "th-1", claimKey: key }),
+    ...patch,
+  };
+}
+
+/**
+ * **夹具要用生产入口造得出来的 key。**
+ *
+ * 之前用的是 "k1" —— `claimKey()` 是 sha256 十六进制摘要，永远造不出这种值。
+ * 夹具比真实数据宽松，等于替被测代码放行了一类现实中不存在的输入。
+ */
+const realClaimKey = (label) => claimKey("om_" + label, "logical-task");
+
+function eligFixture({ holdLock = true } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-elig-"));
+  const outboxDir = path.join(dir, "outbox");
+  const claimsDir = path.join(dir, "claims");
+  const lockDir = path.join(dir, "publish.lock");
+  const runsDir = path.join(dir, "runs");
+  fs.mkdirSync(outboxDir); fs.mkdirSync(claimsDir); fs.mkdirSync(runsDir);
+  const threadId = "th-1";
+  const key = realClaimKey("elig");
+  const ek = codexReplyEventKey({ threadId, claimKey: key });
+  // 第 5 层：恢复是授权，授权前要验这条 claim 的 run 复合凭据 —— 夹具默认给一份真的。
+  writeRunArtifacts({ runsDir, key, threadId, text: "答复" });
+  fs.writeFileSync(path.join(outboxDir, "0001.json"),
+    // 夹具要像真的：appendEvent 写出来的记录一定带 publish_eligible_at（null）。
+    JSON.stringify(outboxRecord({
+      text: "答复", event_key: ek, run_id: key, publish_eligible_at: null })));
+  if (holdLock) assert.equal(acquirePublishLock(lockDir).ok, true, "夹具要先占住锁");
+  const markerFile = path.join(claimsDir, key + ".eligibility_pending.json");
+  return {
+    dir, outboxDir, claimsDir, lockDir, runsDir, threadId, key, ek, markerFile,
+    args: () => ({ claimsDir, outboxDir, publishLockDir: lockDir, threadId, runsDir }),
+    read: () => JSON.parse(fs.readFileSync(path.join(outboxDir, "0001.json"), "utf-8")),
+    marker: () => recordClaimState({ claimsDir, key, state: "eligibility_pending",
+      detail: { run_state: "completed", promote_failed: "publisher_busy", event_key: ek } }),
+  };
+}
+
 function outboxRecord(extra = {}) {
   recSeq += 1;
   return {
@@ -1779,7 +1863,7 @@ printf '%s' "$prompt" > "$last"
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "run-resume.mjs"),
     "--thread-id", THREAD_A, "--project", dir, "--instruction-file", instruction,
     "--log", log, "--stderr", stderr, "--last-message", last, "--exit-receipt", exit,
-    "--codex-bin", fake,
+    "--claim-key", "a".repeat(64), "--codex-bin", fake,
   ], { encoding: "utf-8", env: {
     ...isolatedEnv(),
     EXPECTED_THREAD: THREAD_A,
@@ -1798,9 +1882,32 @@ printf '%s' "$prompt" > "$last"
   assert.equal(fs.readFileSync(envOut, "utf-8"), "unset|unset|codex-run");
   assert.deepEqual(sanitizeCodexRunEnv({ KEEP: "yes", AILY_CLI_RUN_ID: "remove" }), { KEEP: "yes" });
   assert.equal(fs.readFileSync(last, "utf-8"), "精确投递");
-  assert.equal(JSON.parse(fs.readFileSync(exit, "utf-8")).exit_code, 0);
+  // 回执是授权凭据的一部分：**逐字对账封闭形状**，不只看 exit_code。
+  const receipt = JSON.parse(fs.readFileSync(exit, "utf-8"));
+  assert.ok(isCanonicalIso(receipt.recorded_at), "recorded_at 要是规范时间");
+  assert.deepEqual({ ...receipt, recorded_at: "<t>" }, {
+    artifact_type: "codex_run_exit_receipt", schema_version: "1.0", claim_key: "a".repeat(64),
+    recorded_at: "<t>", status: "exited", exit_code: 0, signal: null,
+  }, "回执形状必须跟读取端 verifyCodexRunCredential 认的完全一致");
   assert.equal(readCodexRunOutcome({ logPath: log, exitPath: exit, lastMessagePath: last,
     expectedThreadId: THREAD_A }).state, "completed");
+
+  // 缺 --claim-key / 形状不对：不起 Codex，也不写回执。
+  for (const [why, extra] of [["缺", []], ["形状不对", ["--claim-key", "k1"]]]) {
+    const d2 = temp();
+    const exit2 = path.join(d2, "exit.json");
+    const args2 = path.join(d2, "args.txt");
+    const r2 = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "run-resume.mjs"),
+      "--thread-id", THREAD_A, "--project", d2, "--instruction-file", instruction,
+      "--log", path.join(d2, "run.jsonl"), "--stderr", path.join(d2, "err.log"),
+      "--last-message", path.join(d2, "last.txt"), "--exit-receipt", exit2, ...extra,
+      "--codex-bin", fake,
+    ], { encoding: "utf-8", env: { ...isolatedEnv(), EXPECTED_THREAD: THREAD_A,
+      ARGS_OUT: args2, ENV_OUT: path.join(d2, "env.txt") } });
+    assert.notEqual(r2.status, 0, why + " --claim-key 要拒绝");
+    assert.equal(fs.existsSync(args2), false, why + "：**不许把 Codex 起起来**");
+    assert.equal(fs.existsSync(exit2), false, why + "：不许写回执");
+  }
 });
 
 test("Codex Stop hook：相同正文的两个 turn 各入队一次，同一 turn 重入不重复", () => {
@@ -1910,7 +2017,7 @@ test("关闭自动发布时 watcher 只把严格完成的最终答复兜底入�
   fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), [
     { type: "thread.started", thread_id: THREAD_A }, { type: "turn.started" }, { type: "turn.completed" },
   ].map(JSON.stringify).join("\n") + "\n");
-  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify({ exit_code: 0 }));
+  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify(exitReceipt(key)));
   fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "watcher final");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
@@ -1945,7 +2052,7 @@ test("Codex watcher 严格完成后释放 Dialogue 活动回合", () => {
   fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), [
     { type: "thread.started", thread_id: THREAD_A }, { type: "turn.started" }, { type: "turn.completed" },
   ].map(JSON.stringify).join("\n") + "\n");
-  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify({ exit_code: 0 }));
+  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify(exitReceipt(key)));
   fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "dialogue final");
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
@@ -1978,8 +2085,7 @@ test("watcher 抑制递归产生的错误答复，只保留风险回执", () => 
     } },
     { type: "turn.completed" },
   ].map(JSON.stringify).join("\n") + "\n");
-  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"),
-    JSON.stringify({ status: "exited", exit_code: 0 }));
+  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify(exitReceipt(key)));
   fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "EPERM stack");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
@@ -2006,7 +2112,7 @@ test("watcher 对启动前 Git 预检失败给出真实且脱敏的风险回执"
   const key = "b".repeat(64);
   fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), "");
   fs.writeFileSync(path.join(paths.runs, key + ".exit.json"),
-    JSON.stringify({ status: "failed", exit_code: 1 }));
+    JSON.stringify(exitReceipt(key, { status: "failed", exit_code: 1 })));
   fs.writeFileSync(path.join(paths.runs, key + ".stderr.log"),
     "Not inside a trusted directory and --skip-git-repo-check was not specified. secret-token\n");
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
@@ -6353,7 +6459,7 @@ test("watcher：资格一直卡住时要照实说原因，并留下恢复标记"
   fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), [
     { type: "thread.started", thread_id: THREAD_A }, { type: "turn.started" }, { type: "turn.completed" },
   ].map(JSON.stringify).join("\n") + "\n");
-  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify({ exit_code: 0 }));
+  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify(exitReceipt(key)));
   fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "卡住的答复");
 
   fs.mkdirSync(path.dirname(paths.publishLock), { recursive: true });
@@ -6384,8 +6490,9 @@ test("watcher：资格一直卡住时要照实说原因，并留下恢复标记"
 });
 
 test("watcher：标记自己看不懂时要说出具体那句，不是只说 marker_unusable", () => {
-  // claim key 形状不对 → 写出来的标记文件名不是 claim key 的形状。
-  // 人真正需要知道的是那句具体的，只渲染 reason 的话最终只会说 marker_unusable。
+  // 两半。① --claim-key 形状不对：三件 run 制品的路径全从它派生，形状不对就
+  // 没有可验的凭据 —— 进程入口直接拒绝，不写任何标记（第 5 层）。
+  // ② 历史标记看不懂：启动扫描要把具体那句打出来，只说 marker_unusable 没用。
   const home = temp();
   const root = path.join(home, "project");
   fs.mkdirSync(root, { recursive: true });
@@ -6397,30 +6504,33 @@ test("watcher：标记自己看不懂时要说出具体那句，不是只说 mar
   fs.mkdirSync(paths.runs, { recursive: true });
   fs.mkdirSync(paths.claims, { recursive: true });
   fs.mkdirSync(paths.sessionLock, { recursive: true });
-  const key = "k1";                       // 生产入口造不出这种 key
-  fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), [
-    { type: "thread.started", thread_id: THREAD_A }, { type: "turn.started" }, { type: "turn.completed" },
-  ].map(JSON.stringify).join("\n") + "\n");
-  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify({ exit_code: 0 }));
-  fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "答复");
+  const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home };
+  const watch = (key) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "watch-run.mjs"), "--claim-key", key,
+      "--task-key", task.logical_task_key], { encoding: "utf-8", env });
 
-  fs.mkdirSync(path.dirname(paths.publishLock), { recursive: true });
-  assert.equal(acquirePublishLock(paths.publishLock).ok, true, "前提：别人正持着发布锁");
-  try {
-    const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
-      "--claim-key", key, "--task-key", task.logical_task_key,
-    ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
-      FEISHU_BRIDGE_ELIGIBILITY_BUDGET_MS: "0" } });
-    assert.notEqual(r.status, 0);
-    const risk = fs.readdirSync(paths.outbox)
-      .map((f) => JSON.parse(fs.readFileSync(path.join(paths.outbox, f), "utf-8")))
-      .find((e) => e.kind === "risk");
-    assert.ok(risk, "要发一条 risk");
-    assert.match(risk.text, /marker_unusable/u);
-    assert.match(risk.text, /文件名不是 claim key 的形状/u, "**具体那句要说出来**");
-  } finally {
-    releasePublishLock(paths.publishLock);
-  }
+  // ① 生产入口造不出 "k1" 这种 key。
+  const r1 = watch("k1");
+  assert.equal(r1.status, 2, r1.stderr);
+  assert.match(r1.stderr, /claim key 的形状/u);
+  assert.deepEqual(fs.readdirSync(paths.claims), [], "形状不对的 key 不许留下任何标记");
+  assert.equal(fs.existsSync(paths.sessionLock), true, "入口拒绝时不碰 session lock");
+
+  // ② 一张文件名合法、内容却看不懂的历史标记。
+  const oldKey = "e".repeat(64);
+  const oldMarker = path.join(paths.claims, oldKey + ".eligibility_pending.json");
+  fs.writeFileSync(oldMarker, JSON.stringify({
+    schema_version: "1.0", claim_key: oldKey, state: "eligibility_pending",
+    recorded_at: "2026-08-25T00:00:00.000Z", run_state: "completed",
+    promote_failed: {}, event_key: codexReplyEventKey({ threadId: THREAD_A, claimKey: oldKey }),
+  }));
+  const key = "f".repeat(64);
+  writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "答复" });
+  const r2 = watch(key);
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.match(r2.stderr, /恢复标记看不懂，没动：/u);
+  assert.match(r2.stderr, /promote_failed 不是原因标识/u, "**具体那句要说出来**：" + r2.stderr);
+  assert.equal(fs.existsSync(oldMarker), true, "看不懂就不许删");
 });
 
 test("watcher 启动时的历史标记：撞上锁要等到有结论，不能只扫一次", () => {
@@ -6446,6 +6556,8 @@ test("watcher 启动时的历史标记：撞上锁要等到有结论，不能只
   // 一条**上一轮遗留**的答复 + 它的恢复标记。
   const oldKey = "c".repeat(64);
   const oldEventKey = codexReplyEventKey({ threadId: THREAD_A, claimKey: oldKey });
+  // 恢复是授权：上一轮那条的 run 复合凭据也得在（第 5 层）。
+  writeRunArtifacts({ runsDir: paths.runs, key: oldKey, threadId: THREAD_A, text: "上一轮那条答复" });
   const oldRec = path.join(paths.outbox, "old.json");
   fs.writeFileSync(oldRec, JSON.stringify({
     ...outboxRecord({ text: "上一轮那条答复" }),
@@ -6461,7 +6573,7 @@ test("watcher 启动时的历史标记：撞上锁要等到有结论，不能只
   fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), [
     { type: "thread.started", thread_id: THREAD_A }, { type: "turn.started" }, { type: "turn.completed" },
   ].map(JSON.stringify).join("\n") + "\n");
-  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify({ exit_code: 0 }));
+  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify(exitReceipt(key)));
   fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "这一轮的答复");
 
   // **启动这一刻锁被别人占着，1.5 秒后放开** —— 只扫一次的实现会在这里放弃。
@@ -7177,6 +7289,618 @@ test("codex drain：严格参数白名单 —— 拼错、重复、缺值、双�
   assert.notEqual(r.status, 0);
   assert.match(r.stderr, /白名单/u, r.stderr);
   assert.equal(h.read("不该被发出去的那条").published_at, null, "拼错参数不许变成发送");
+});
+
+// ---------- 资格恢复链（第 3 层引入，第 5 层随 run 凭据验真下沉到适配层） ----------
+
+test("eligibility_pending 要有消费者：卡住的资格必须补回来", () => {
+  // 给资格提升加发布锁之后 publisher_busy 成了真实路径：提升只重试约 720ms，
+  // 而竞争方持锁做真实网络发布，默认可达 12 秒。watcher 记下 eligibility_pending
+  // 就退出了 —— **没人消费的话，那条答复再没有任何路径获得资格**。
+  const g = eligFixture();
+  const blocked = markPublishEligibleByEventKey({
+    outboxDir: g.outboxDir, eventKey: g.ek, publishLockDir: g.lockDir });
+  assert.equal(blocked.ok, false, "锁被占着就该提不上去");
+  assert.equal(blocked.reason, "publisher_busy");
+  const marker = g.marker();
+
+  // 锁还占着的时候恢复器也提不上去 —— 但**绝不能把标记删掉**。
+  const stillHeld = recoverEligibilityPending(g.args());
+  assert.deepEqual(stillHeld.recovered, []);
+  assert.equal(stillHeld.pending[0].reason, "publisher_busy");
+  assert.equal(fs.existsSync(marker), true, "**没恢复成就不许撤标记**，撤了就再没人管了");
+  assert.equal(g.read().publish_eligible_at, null, "没拿到锁就不许写");
+
+  // 锁放开之后必须真的把资格补上，并撤掉标记。
+  releasePublishLock(g.lockDir);
+  const done = recoverEligibilityPending(g.args());
+  assert.equal(done.recovered.length, 1, "锁放开了就该补回来");
+  assert.equal(done.recovered[0].eventKey, g.ek);
+  assert.match(g.read().publish_eligible_at, /^\d{4}-\d{2}-\d{2}T/u, "写的得是规范时间");
+  assert.equal(fs.existsSync(marker), false, "有结论了就撤标记，别让下一轮反复重试");
+});
+
+test("卡住的资格要在本轮就扫到有结论，不能等下一条入站消息", () => {
+  // 只在 watcher 启动时扫一遍是不够的：**那要等到下一条入站消息**才会发生。
+  // 若之后没人再说话，这条答复就永久卡住。所以写下标记的那一轮自己得扫到有结论。
+  const g = eligFixture();
+  g.marker();
+  // 竞争方持锁做真实网络发布 —— 用注入的 wait 扮演"等着等着对方放锁了"。
+  let waited = 0;
+  const settle = settleEligibilityPending({
+    ...g.args(), waitMs: 1, wait: () => { waited += 1; if (waited === 3) releasePublishLock(g.lockDir); },
+  });
+  assert.equal(waited >= 3, true, "锁没放开之前要一直重试，实际等了 " + waited + " 次");
+  assert.equal(settle.recovered.length, 1, "对方放锁之后必须在同一轮里补上");
+  assert.match(g.read().publish_eligible_at, /^\d{4}-\d{2}-\d{2}T/u);
+
+  // 预算用完就得停，并且**照实说仍然卡着** —— 不许拖成沉默。
+  const h = eligFixture();
+  h.marker();
+  const out = settleEligibilityPending({ ...h.args(), budgetMs: 0, waitMs: 1, wait: () => {} });
+  assert.deepEqual(out.recovered, []);
+  assert.equal(out.pending[0].reason, "publisher_busy");
+  assert.equal(fs.existsSync(h.markerFile), true, "预算用完也不许撤标记");
+  releasePublishLock(h.lockDir);
+});
+
+test("只对 publisher_busy 重试：别的失败不许拖成沉默", () => {
+  // 记录不见了、身份对不上、记录损坏 —— 这些多等一会儿不会变好。
+  const g = eligFixture({ holdLock: false });
+  fs.rmSync(path.join(g.outboxDir, "0001.json"));
+  g.marker();
+  let waited = 0;
+  const out = settleEligibilityPending({ ...g.args(), waitMs: 1, wait: () => { waited += 1; } });
+  assert.equal(waited, 0, "event_not_found 不该重试，实际等了 " + waited + " 次");
+  assert.equal(out.pending[0].reason, "event_not_found");
+  assert.equal(fs.existsSync(g.markerFile), true, "说不清就留着标记");
+});
+
+test("恢复标记是发布授权制品：event_key 自己算，不信它自报", () => {
+  // 评审构造的：标记 claim_key 与文件名自洽，但 event_key 指向别人的答复 ——
+  // **这张标记于是替另一条 claim 拿到了发布资格**。
+  const g = eligFixture({ holdLock: false });
+  const victim = realClaimKey("victim");
+  const victimEk = codexReplyEventKey({ threadId: g.threadId, claimKey: victim });
+  fs.writeFileSync(path.join(g.outboxDir, "0002.json"), JSON.stringify(outboxRecord({
+    text: "别人的答复", event_key: victimEk, run_id: victim, publish_eligible_at: null })));
+  // 攻击者的标记：文件名 = claim_key = attacker，但自报 event_key 指向 victim。
+  const attacker = realClaimKey("attacker");
+  fs.writeFileSync(path.join(g.claimsDir, attacker + ".eligibility_pending.json"),
+    JSON.stringify(fullMarker(attacker, { event_key: victimEk })));
+
+  const r = recoverEligibilityPending(g.args());
+  assert.deepEqual(r.recovered, [], "错配的标记一条都不许恢复");
+  assert.equal(r.unusable.length, 1);
+  assert.match(r.unusable[0].unusable, /event_key 跟按 thread 与 claim 算出来的对不上/u);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(g.outboxDir, "0002.json"), "utf-8"))
+    .publish_eligible_at, null, "**不许替另一条 claim 授予发布资格**");
+});
+
+test("恢复标记：命中的记录必须真的属于那个 claim（run_id 对得上）", () => {
+  // 就算 event_key 是自己算出来的，命中的那条记录也可能不属于这个 claim ——
+  // 资格是发布授权，身份对不上就得拦住。
+  const g = eligFixture({ holdLock: false });
+  const rec = g.read();
+  fs.writeFileSync(path.join(g.outboxDir, "0001.json"),
+    JSON.stringify({ ...rec, run_id: "别的-claim" }));
+  g.marker();
+  const r = recoverEligibilityPending(g.args());
+  assert.deepEqual(r.recovered, []);
+  assert.equal(r.pending[0].reason, "run_id_mismatch");
+  assert.equal(g.read().publish_eligible_at, null, "身份对不上就一个字都不许写");
+  assert.equal(fs.existsSync(g.markerFile), true, "也不许撤标记");
+});
+
+test("同一个事件键有两条记录：模棱两可就不许授予资格", () => {
+  const g = eligFixture({ holdLock: false });
+  fs.writeFileSync(path.join(g.outboxDir, "0002.json"), JSON.stringify(g.read()));
+  g.marker();
+  const r = recoverEligibilityPending(g.args());
+  assert.equal(r.pending[0].reason, "event_key_ambiguous");
+  for (const n of ["0001.json", "0002.json"]) {
+    assert.equal(JSON.parse(fs.readFileSync(path.join(g.outboxDir, n), "utf-8"))
+      .publish_eligible_at, null, n + " 不许拿到资格");
+  }
+});
+
+test("恢复器：看不懂的标记一律不动，也不许拿它去提升别人的资格", () => {
+  const g = eligFixture({ holdLock: false });
+  const write = (name, doc) => {
+    const f = path.join(g.claimsDir, name);
+    fs.writeFileSync(f, typeof doc === "string" ? doc : JSON.stringify(doc));
+    return f;
+  };
+  // **每张样本都是完整标记、只坏一处** —— 否则先撞上的是别的分支，
+  // 这条测试就变成"总有个理由"，而不是"这个分支挡住了"。
+  const ek = (k) => codexReplyEventKey({ threadId: g.threadId, claimKey: k });
+  // 文件名就是 claim key，所以样本的文件名也必须是**生产造得出来的**那种。
+  const at = (label, patch) => {
+    const k = realClaimKey(label);
+    return write(k + ".eligibility_pending.json", { ...fullMarker(k, { event_key: ek(k) }), ...patch });
+  };
+  const drop = (label, field) => {
+    const k = realClaimKey(label);
+    const doc = fullMarker(k, { event_key: ek(k) });
+    delete doc[field];
+    return write(k + ".eligibility_pending.json", doc);
+  };
+  const bad = [
+    ["半截文件", write(realClaimKey("a") + ".eligibility_pending.json", "{ 坏了"), /读不出来/u],
+    ["不是对象", write(realClaimKey("b") + ".eligibility_pending.json", [1, 2]), /不是记录对象/u],
+    // **只封键名等于没封**：真实 64 位 key + promote_failed 写成对象，
+    // 评审实测标记照样获授权并被删除。
+    ["promote_failed 是对象", at("q", { promote_failed: {} }), /promote_failed 不是原因标识/u],
+    ["promote_failed 是空串", at("r", { promote_failed: "" }), /promote_failed 不是原因标识/u],
+    ["promote_failed 是自由文本", at("s", { promote_failed: "锁被占着 :(" }),
+      /promote_failed 不是原因标识/u],
+    ["文件名不是 claim key", write("k1.eligibility_pending.json", fullMarker("k1")),
+      /文件名不是 claim key 的形状/u],
+    ["空身份", write(".eligibility_pending.json", fullMarker("")),
+      /文件名不是 claim key 的形状/u],
+    ["claim_key 错配", at("c", { claim_key: realClaimKey("别人") }), /claim_key 跟文件名对不上/u],
+    ["state 不是这个", at("d", { state: "completed" }), /state 不是 eligibility_pending/u],
+    ["schema 不认识", at("e", { schema_version: "9" }), /schema_version 不认识/u],
+    ["recorded_at 不是时间", at("f", { recorded_at: "刚才" }), /recorded_at 不是规范时间/u],
+    ["这一轮没跑完", at("g", { run_state: "running" }), /run_state 不是 completed/u],
+    // **缺字段跟错值一样危险**：评审实测删掉 event_key 后标记照样被接受、
+    // 目标拿到资格、标记被撤 —— 少写一个字段就绕过了对账。
+    ["缺 event_key", drop("h", "event_key"), /缺字段：event_key/u],
+    ["缺 run_state", drop("i", "run_state"), /缺字段：run_state/u],
+    ["缺 recorded_at", drop("j", "recorded_at"), /缺字段：recorded_at/u],
+    ["缺 claim_key", drop("k", "claim_key"), /缺字段：claim_key/u],
+    ["缺 schema_version", drop("l", "schema_version"), /缺字段：schema_version/u],
+    ["缺 state", drop("m", "state"), /缺字段：state/u],
+    ["缺 promote_failed", drop("n", "promote_failed"), /缺字段：promote_failed/u],
+    ["多出不认识的字段", at("o", { 悄悄加的: 1 }), /多出不认识的字段：悄悄加的/u],
+    ["event_key 指向别人", at("p", { event_key: ek(realClaimKey("别人")) }),
+      /event_key 跟按 thread 与 claim 算出来的对不上/u],
+  ];
+  const listed = listEligibilityPending({ claimsDir: g.claimsDir, threadId: g.threadId });
+  assert.equal(listed.ok, true);
+  assert.equal(listed.items.length, bad.length, "结构不对的也要列出来，不许静默跳过");
+  for (const [why, f, pattern] of bad) {
+    const got = listed.items.find((x) => x.file === f);
+    assert.ok(got, why + "：没被列出来");
+    assert.ok(got.unusable, why + "：**竟然被当成有效标记**");
+    assert.match(got.unusable, pattern, why + "：理由说得不对 —— " + got.unusable);
+  }
+
+  const r = recoverEligibilityPending(g.args());
+  assert.deepEqual(r.recovered, []);
+  assert.deepEqual(r.pending, []);
+  assert.equal(r.unusable.length, bad.length);
+  for (const [why, f] of bad) assert.equal(fs.existsSync(f), true, why + "：看不懂就不许删");
+  assert.equal(g.read().publish_eligible_at, null,
+    "**一张看不懂的标记不许给任何记录发资格**");
+  assert.equal(fs.existsSync(g.lockDir), false, "一把锁都不该拿");
+
+  // 守卫不能把好情况也一起挡了：完整无缺的标记必须照常恢复。
+  const h = eligFixture({ holdLock: false });
+  fs.writeFileSync(h.markerFile, JSON.stringify(fullMarker(h.key, { event_key: h.ek })));
+  assert.equal(recoverEligibilityPending(h.args()).recovered.length, 1, "干净时必须照常放行");
+});
+
+test("已有资格的判据要跟发布授权同一份：畸形值不算「已经有结论」", () => {
+  // 评审实测：publish_eligible_at 设成 not-a-canonical-time，恢复器返回
+  // already_eligible 并撤掉标记，而**规范授权判据 hasPublishAuthorization 判它没授权**。
+  // 一份畸形的值同时是"够了，别管了"和"不算数，别发" ——
+  // 于是"一轮已完成、却再也没有恢复路径"，唯一的恢复证据还被销毁了。
+  for (const bad of ["not-a-canonical-time", "", 0, false, {}, "2026-08-25 00:00:00"]) {
+    const g = eligFixture({ holdLock: false });
+    fs.writeFileSync(path.join(g.outboxDir, "0001.json"),
+      JSON.stringify({ ...g.read(), publish_eligible_at: bad }));
+    g.marker();
+    const label = " —— publish_eligible_at=" + JSON.stringify(bad);
+    const rec0 = g.read();
+    // **不能把待实现的行为写成现状**：真实发布筛选（codex/publish-eligible.mjs）
+    // 目前仍接受任意非空字符串，收敛它是第 5 层的事。这里断言的是规范授权判据。
+    assert.equal(hasPublishAuthorization(rec0), false, "前提：规范授权判据不认它" + label);
+    const r = recoverEligibilityPending(g.args());
+    assert.deepEqual(r.recovered, [], "畸形值不算「已经有结论」" + label);
+    assert.equal(r.pending[0].reason, "record_unclassified", "得说是损坏" + label);
+    assert.deepEqual(g.read(), rec0, "一个字都不许改" + label);
+    assert.equal(fs.existsSync(g.markerFile), true, "**不许销毁唯一的恢复证据**" + label);
+  }
+  // 规范时间才算数，而且不许重复写。
+  const ok = eligFixture({ holdLock: false });
+  const stamped = { ...ok.read(), publish_eligible_at: "2026-08-25T00:00:00.000Z" };
+  fs.writeFileSync(path.join(ok.outboxDir, "0001.json"), JSON.stringify(stamped));
+  ok.marker();
+  const r = recoverEligibilityPending(ok.args());
+  assert.equal(r.recovered[0].reason, "already_eligible");
+  assert.equal(ok.read().publish_eligible_at, "2026-08-25T00:00:00.000Z", "不许改写已有的授权时间");
+});
+
+test("报出来的原因要是复查之后的原因，不是最初那个", () => {
+  // watcher 原来只认 recovered：复查时变成 event_not_found / record_unclassified /
+  // claims_unreadable，它仍然照最初那个 publisher_busy 报。
+  // **报错报错了地方，比不报还费时间。**
+  const g = eligFixture({ holdLock: false });
+  const K = g.key;
+  const cases = [
+    ["恢复成功", { ok: true, recovered: [{ key: K, reason: "promoted" }], pending: [], unusable: [] },
+      { ok: true, reason: "promoted" }],
+    ["复查时记录不见了", { ok: true, recovered: [], pending: [{ key: K, reason: "event_not_found" }], unusable: [] },
+      { ok: false, reason: "event_not_found" }],
+    ["复查时记录损坏了", { ok: true, recovered: [], pending: [{ key: K, reason: "record_unclassified" }], unusable: [] },
+      { ok: false, reason: "record_unclassified" }],
+    ["claims 目录读不出来", { ok: false, reason: "claims_unreadable", recovered: [], pending: [], unusable: [] },
+      { ok: false, reason: "claims_unreadable" }],
+    ["标记自己坏了", { ok: true, recovered: [], pending: [], unusable: [{ key: K, unusable: "缺字段：event_key" }] },
+      { ok: false, reason: "marker_unusable", why: "缺字段：event_key" }],
+    ["标记不见了", { ok: true, recovered: [], pending: [], unusable: [] },
+      { ok: false, reason: "marker_missing" }],
+    // 别人的结论不许算到我头上。
+    ["只有别人的结论", { ok: true, recovered: [{ key: "别人", reason: "promoted" }], pending: [], unusable: [] },
+      { ok: false, reason: "marker_missing" }],
+  ];
+  for (const [why, settle, want] of cases) {
+    assert.deepEqual(eligibilityOutcomeFor(settle, K), want, why);
+  }
+});
+
+test("标记不在了是有歧义的：可能是另一个恢复器先做完了", () => {
+  // 评审实测：另一个恢复器先授予资格并撤标之后，本 watcher 得到 marker_missing，
+  // 于是走失败路径 —— **不发布、不写 completed、也不收口 Dialogue**，
+  // 而那条答复其实已经拿到了规范授权。
+  // "本次扫描没看到标记"证明不了失败，只能去问目标记录本身。
+  const done = eligFixture({ holdLock: false });
+  fs.writeFileSync(path.join(done.outboxDir, "0001.json"), JSON.stringify({
+    ...done.read(), publish_eligible_at: "2026-08-25T00:00:00.000Z" }));
+  assert.equal(fs.existsSync(done.markerFile), false, "前提：标记已被别人撤掉");
+  const r = settleOwnEligibility({ ...done.args(), claimKey: done.key, waitMs: 1, wait: () => {} });
+  assert.deepEqual(r, { ok: true, reason: "already_eligible" },
+    "**别人做完了就是成功**，不是 marker_missing");
+
+  // 已发布、已停发同样算有结论。
+  for (const [why, patch, want] of [
+    ["已经发出去了", { published_at: "2026-08-25T00:00:00.000Z" }, "already_published"],
+    ["已经被永久停发", { publish_suppressed_at: "2026-08-25T00:00:00.000Z" }, "already_suppressed"],
+  ]) {
+    const g = eligFixture({ holdLock: false });
+    fs.writeFileSync(path.join(g.outboxDir, "0001.json"), JSON.stringify({ ...g.read(), ...patch }));
+    const got = settleOwnEligibility({ ...g.args(), claimKey: g.key, waitMs: 1, wait: () => {} });
+    assert.deepEqual(got, { ok: true, reason: want }, why);
+  }
+
+  // 标记不在、记录也不在 —— 这才是真的说不清，要照实说。
+  const gone = eligFixture({ holdLock: false });
+  fs.rmSync(path.join(gone.outboxDir, "0001.json"));
+  const missing = settleOwnEligibility({ ...gone.args(), claimKey: gone.key, waitMs: 1, wait: () => {} });
+  assert.equal(missing.ok, false);
+  assert.equal(missing.reason, "event_not_found", "不许用 marker_missing 把它盖过去");
+
+  // 标记不在、记录还待发 —— 那就现在提上去，别让它继续卡着。
+  const pend = eligFixture({ holdLock: false });
+  const got = settleOwnEligibility({ ...pend.args(), claimKey: pend.key, waitMs: 1, wait: () => {} });
+  assert.equal(got.ok, true);
+  assert.match(pend.read().publish_eligible_at, /^\d{4}-\d{2}-\d{2}T/u);
+});
+
+test("标记不在了之后的复核，也要在同一个截止时间内一直重试", () => {
+  // 评审实测：复核只调一次 markPublishEligibleByEventKey（内部固定重试约 720ms），
+  // 传 5 秒预算、锁 1.2 秒后释放，它仍在 625ms 时返回 publisher_busy。
+  // 而这正是真实竞态本身 —— **别的恢复器撤标之后，发布器随即持锁去发**。
+  // 答复可能已经在发了，watcher 却不写 completed、不收口 Dialogue。
+  //
+  // 现有回归全用 holdLock:false，**根本没覆盖这个窗口**。
+  const g = eligFixture();                       // 锁被别人占着
+  fs.writeFileSync(path.join(g.outboxDir, "0001.json"), JSON.stringify({
+    ...g.read(), publish_eligible_at: "2026-08-25T00:00:00.000Z" }));
+  assert.equal(fs.existsSync(g.markerFile), false, "前提：标记已被别人撤掉");
+
+  let waited = 0;
+  const r = settleOwnEligibility({
+    ...g.args(), claimKey: g.key, waitMs: 1,
+    wait: () => { waited += 1; if (waited === 3) releasePublishLock(g.lockDir); },
+  });
+  assert.equal(waited >= 3, true, "复核撞上 publisher_busy 就该接着等，实际等了 " + waited + " 次");
+  assert.deepEqual(r, { ok: true, reason: "already_eligible" },
+    "**别人做完了就是成功** —— 不许因为复核只试了一次就报 publisher_busy");
+
+  // 预算用完仍拿不到锁，就照实说 publisher_busy（不许拖成沉默，也不许假成功）。
+  const h = eligFixture();
+  const out = settleOwnEligibility({
+    ...h.args(), claimKey: h.key, budgetMs: 0, waitMs: 1, wait: () => {} });
+  assert.deepEqual(out, { ok: false, reason: "publisher_busy" });
+  releasePublishLock(h.lockDir);
+});
+
+test("等待预算必须有限：一个配置值不许把有界等待变成无限等待", () => {
+  // 评审实测：/^\d+$/ 放行 400 位数字 → Number() 得到 Infinity → 截止时间也是
+  // Infinity → 锁一直繁忙时循环**永不结束**，watcher 外层那个四小时窗口
+  // 和 session lock 释放全都执行不到。
+  const D = ELIGIBILITY_BUDGET_DEFAULT_MS;
+  const MAX = ELIGIBILITY_BUDGET_MAX_MS;
+  for (const [raw, want, why] of [
+    [undefined, D, "没配就用默认"],
+    ["", D, "空串不是数"],
+    ["0", 0, "零预算是合法的（只试一次）"],
+    ["5000", 5000, "正常值原样用"],
+    ["1".repeat(400), D, "**400 位数字不许变成 Infinity**"],
+    ["999999999999", D, "超过位数上限就回落默认，不是截断"],
+    ["abc", D, "不是数"],
+    ["-1", D, "负数"],
+    ["1e9", D, "科学计数法不认"],
+    ["12.5", D, "小数不认"],
+    [" 5000 ", D, "带空白不认"],
+    ["999999999", MAX, "合法但过大 → 夹到上限"],
+    [Infinity, D, "直接传 Infinity 也不行"],
+    [NaN, D, "NaN"],
+    [-5, D, "负数"],
+    [Number.MAX_SAFE_INTEGER + 2, D, "不是安全整数"],
+    [3000, 3000, "数字原样用"],
+  ]) {
+    assert.equal(eligibilityBudgetMs(raw), want, why + " —— " + JSON.stringify(String(raw)).slice(0, 40));
+  }
+
+  // **守卫也要长在循环那一侧**，不只长在解析那一侧：
+  // 就算有人绕过解析直接传 Infinity 进来，循环也必须停得下来。
+  const g = eligFixture();                       // 锁一直占着，永远 publisher_busy
+  let waited = 0;
+  const started = Date.now();
+  const r = settleOwnEligibility({
+    ...g.args(), claimKey: g.key, budgetMs: Infinity, waitMs: 1,
+    wait: () => { waited += 1; if (waited > 5000) throw new Error("循环没有尽头"); },
+    now: (() => { let t = started; return () => (t += 1000); })(),
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "publisher_busy");
+  assert.equal(waited <= 61, true, "默认预算 60s、间隔 1s 的话最多等 60 次，实际 " + waited);
+  releasePublishLock(g.lockDir);
+});
+
+test("标记还在那条路径上，具体原因同样要一路传上来", () => {
+  // 上一条走的是"标记缺席"路径。**更常见的是标记还在**，
+  // 而那条路上 why 被丢在了三个地方：pending → outcomeFor → watcher 渲染。
+  const g = eligFixture({ holdLock: false });
+  fs.writeFileSync(path.join(g.outboxDir, "0001.json"),
+    JSON.stringify({ ...g.read(), publish_eligible_at: "not-a-canonical-time" }));
+  g.marker();
+  assert.equal(fs.existsSync(g.markerFile), true, "前提：走的是标记还在那条路径");
+
+  const sweep = recoverEligibilityPending(g.args());
+  assert.equal(sweep.pending[0].why, "publish_eligible_at 不是规范时间", "扫描那层不许丢");
+  assert.deepEqual(eligibilityOutcomeFor(sweep, g.key),
+    { ok: false, reason: "record_unclassified", why: "publish_eligible_at 不是规范时间" },
+    "取结论那层也不许丢");
+  const own = settleOwnEligibility({ ...g.args(), claimKey: g.key, waitMs: 1, wait: () => {} });
+  assert.equal(own.why, "publish_eligible_at 不是规范时间", "**一路到顶都得在**");
+});
+
+test("复核给出的具体原因要一路传上来，不能只剩一个 reason", () => {
+  // 底层已经知道是哪个字段出的问题，中间一层把 why 丢了的话，
+  // 人最终只看到 record_unclassified —— 还得自己去猜是哪个字段。
+  const g = eligFixture({ holdLock: false });
+  fs.writeFileSync(path.join(g.outboxDir, "0001.json"),
+    JSON.stringify({ ...g.read(), publish_eligible_at: "not-a-canonical-time" }));
+  assert.equal(fs.existsSync(g.markerFile), false, "前提：走的是标记缺席那条复核路径");
+  const r = settleOwnEligibility({ ...g.args(), claimKey: g.key, waitMs: 1, wait: () => {} });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "record_unclassified");
+  assert.equal(r.why, "publish_eligible_at 不是规范时间", "**具体那句要传上来**");
+});
+
+test("claims 目录读不出来是故障，不是「一条都没有」", () => {
+  // 这两件事在输出上长得一模一样，含义却相反：后者意味着可能有一批答复正卡着没人管。
+  const g = eligFixture({ holdLock: false });
+  fs.rmSync(g.claimsDir, { recursive: true });
+  fs.writeFileSync(g.claimsDir, "这不是目录");
+  const listed = listEligibilityPending({ claimsDir: g.claimsDir, threadId: g.threadId });
+  assert.equal(listed.ok, false);
+  assert.equal(listed.reason, "claims_unreadable");
+  const r = recoverEligibilityPending(g.args());
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "claims_unreadable");
+});
+
+test("停发是终局：恢复器不许把人已经永久停掉的记录重新提上资格", () => {
+  const g = eligFixture({ holdLock: false });
+  fs.writeFileSync(path.join(g.outboxDir, "0001.json"), JSON.stringify({
+    ...g.read(), publish_suppressed_at: "2026-08-25T00:00:00.000Z" }));
+  g.marker();
+  const r = recoverEligibilityPending(g.args());
+  assert.equal(r.recovered[0].reason, "already_suppressed", "结论是「已经有结论」，不是「提上去了」");
+  const rec = g.read();
+  assert.equal(rec.publish_eligible_at, null,
+    "**停掉的记录一个字都不许改** —— 靠下游筛选兜住不算，判据一变人停掉的东西就复活了");
+  assert.equal(rec.publish_suppressed_at, "2026-08-25T00:00:00.000Z");
+  assert.equal(fs.existsSync(g.markerFile), false, "已经有结论了，标记该撤 —— 否则永远重试");
+});
+
+test("停发字段坏掉了不算「已经有结论」：不许撤标记", () => {
+  // 只看"字段非 null"的话，publish_suppressed_at 放 "abc" 也会被当成已停发，
+  // 于是恢复器撤掉标记 —— 一条损坏记录就这样再没人管。
+  for (const bad of ["abc", "", 0, false, {}, [], "2026-08-25 00:00:00", "2026-13-45T00:00:00.000Z"]) {
+    const g = eligFixture({ holdLock: false });
+    fs.writeFileSync(path.join(g.outboxDir, "0001.json"), JSON.stringify({
+      ...g.read(), publish_suppressed_at: bad }));
+    g.marker();
+    const r = recoverEligibilityPending(g.args());
+    const label = " —— publish_suppressed_at=" + JSON.stringify(bad);
+    // **字段在场就得是规范时间**，falsy 也不例外：""、0、false 都不是"没标停发"，
+    // 而是"标了、但标的不是时间"。判据松一点，损坏记录就又被藏起来。
+    assert.deepEqual(r.recovered, [], "损坏值不许当成已停发" + label);
+    assert.equal(r.pending[0].reason, "record_unclassified", "得说是损坏" + label);
+    assert.equal(g.read().publish_eligible_at, null, "损坏就不许写" + label);
+    assert.equal(fs.existsSync(g.markerFile), true, "损坏不算有结论，标记要留着" + label);
+  }
+});
+
+test("verifyCodexRunCredential：回执身份与封闭 schema 逐字验，路径只从 key 派生", () => {
+  const runsDir = temp();
+  const key = "1".repeat(64);
+  const verify = (k = key) => verifyCodexRunCredential({ runsDir, claimKey: k, expectedThreadId: THREAD_A });
+  // 入参形状与 runsDir 先验。
+  assert.equal(verify("k1").reason, "claim_key_malformed");
+  assert.equal(verifyCodexRunCredential({ claimKey: key, expectedThreadId: THREAD_A }).reason,
+    "runs_dir_required");
+  // 回执缺席 = 仍在跑；回执在但对不上 = fail-closed，不是"仍在跑"。
+  assert.deepEqual(verify(), { state: "running" });
+  writeRunArtifacts({ runsDir, key, threadId: THREAD_A, text: "完成了" });
+  const good = verify();
+  assert.equal(good.state, "completed", JSON.stringify(good));
+  assert.equal(good.finalText, "完成了");
+
+  const receiptPath = path.join(runsDir, key + ".exit.json");
+  const bad = [
+    ["旧形状（只有 exit_code）", { exit_code: 0 }, /缺字段/u],
+    ["claim_key 是别的 run", exitReceipt("2".repeat(64)), /claim_key 跟文件名对不上/u],
+    ["多出字段", exitReceipt(key, { run_state: "completed" }), /多出不认识的字段：run_state/u],
+    ["缺 signal", (() => { const r = exitReceipt(key); delete r.signal; return r; })(), /缺字段：signal/u],
+    ["recorded_at 不是规范时间", exitReceipt(key, { recorded_at: "刚才" }), /recorded_at 不是规范时间/u],
+    ["exited 却 exit_code=1", exitReceipt(key, { exit_code: 1 }), /exit_code≠0/u],
+    ["exited 却带 signal", exitReceipt(key, { signal: "SIGTERM" }), /带 signal/u],
+    ["status 不认识", exitReceipt(key, { status: "done" }), /status 不在受控取值里/u],
+    ["artifact_type 不对", exitReceipt(key, { artifact_type: "receipt" }), /artifact_type/u],
+    ["schema 不认识", exitReceipt(key, { schema_version: "9" }), /schema_version 不认识/u],
+    ["failed 却 exit_code=0", exitReceipt(key, { status: "failed", exit_code: 0 }), /exit_code 形状不对/u],
+    ["spawn_failed 缺 error", exitReceipt(key, { status: "spawn_failed", exit_code: null }), /缺字段：error/u],
+    ["不是对象", [1], /不是回执对象/u],
+  ];
+  for (const [why, doc, pattern] of bad) {
+    fs.writeFileSync(receiptPath, JSON.stringify(doc));
+    const r = verify();
+    assert.equal(r.state, "failed", why + "：**竟然放行了** " + JSON.stringify(r));
+    assert.equal(r.reason, "exit_receipt_invalid", why);
+    assert.match(r.why ?? "", pattern, why + "：理由不对 —— " + r.why);
+  }
+  fs.writeFileSync(receiptPath, "{ 坏了");
+  assert.equal(verify().why, "不是 JSON");
+  // 合法的失败回执：形状过、内容判失败 —— 不是 exit_receipt_invalid。
+  fs.writeFileSync(receiptPath, JSON.stringify(exitReceipt(key, { status: "failed", exit_code: 1 })));
+  assert.equal(verify().reason, "nonzero_exit");
+  fs.writeFileSync(receiptPath, JSON.stringify(exitReceipt(key,
+    { status: "spawn_failed", exit_code: null, error: "ENOENT" })));
+  assert.equal(verify().reason, "runner_spawn_failed");
+
+  // 上游 JSONL 是可演进协议：**所消费字段严格、未知扩展兼容**（文档记下的偏离）。
+  fs.writeFileSync(receiptPath, JSON.stringify(exitReceipt(key)));
+  fs.writeFileSync(path.join(runsDir, key + ".jsonl"), [
+    { type: "thread.started", thread_id: THREAD_A, extra_new_field: 1 },
+    { type: "some.future.event", payload: { anything: true } },
+    { type: "turn.started" }, { type: "turn.completed", usage: { tokens: 1 } },
+  ].map(JSON.stringify).join("\n") + "\n");
+  assert.equal(verify().state, "completed", "无害的未知字段/事件不许让发布链停摆");
+  // 但所消费的字段仍严格：thread 对不上就不算。
+  fs.writeFileSync(path.join(runsDir, key + ".jsonl"), [
+    { type: "thread.started", thread_id: "别的 thread" }, { type: "turn.started" }, { type: "turn.completed" },
+  ].map(JSON.stringify).join("\n") + "\n");
+  assert.equal(verify().reason, "thread_mismatch");
+
+  // 跨 run 拼装：把 key A 那套合法制品按 key B 的文件名放进去 —— 回执身份对不上。
+  const other = "3".repeat(64);
+  writeRunArtifacts({ runsDir, key, threadId: THREAD_A });
+  for (const suffix of [".jsonl", ".exit.json", ".last-message.txt"]) {
+    fs.copyFileSync(path.join(runsDir, key + suffix), path.join(runsDir, other + suffix));
+  }
+  const forged = verify(other);
+  assert.equal(forged.reason, "exit_receipt_invalid", JSON.stringify(forged));
+  assert.match(forged.why, /claim_key 跟文件名对不上/u, "**三个合法文件不许跨 run 拼装**");
+});
+
+test("watcher：旧形状的退出回执不算终局 —— fail-closed 走失败路径，不给资格（真实 CLI）", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Legacy",
+    rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = false;
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  const paths = taskPaths(task, home);
+  fs.mkdirSync(paths.runs, { recursive: true });
+  fs.mkdirSync(paths.claims, { recursive: true });
+  fs.mkdirSync(paths.sessionLock, { recursive: true });
+  const key = "9".repeat(64);
+  writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "看着像完成了" });
+  // 回执换成安装前那种旧形状 —— JSONL 与最终输出都"完成"，只有回执没有身份。
+  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify({ exit_code: 0 }));
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
+    "--claim-key", key, "--task-key", task.logical_task_key,
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.equal(r.status, 1, r.stderr);
+  const events = fs.readdirSync(paths.outbox)
+    .map((f) => JSON.parse(fs.readFileSync(path.join(paths.outbox, f), "utf-8")));
+  assert.equal(events.some((e) => e.kind === "reply"), false, "**没有可验凭据就不许把最终输出入队**");
+  const risk = events.find((e) => e.kind === "risk");
+  assert.ok(risk, "要发一条 risk");
+  assert.match(risk.text, /exit_receipt_invalid/u, "要说清是凭据的问题：" + risk.text);
+  assert.equal(fs.existsSync(path.join(paths.claims, key + ".completed.json")), false);
+  assert.equal(fs.existsSync(paths.sessionLock), false, "失败路径照常放 session lock");
+});
+
+test("watcher：event key 命中的记录 run_id 是别的 claim，初始路径也不许发资格（真实 CLI）", () => {
+  // 评审实测的接线缺口：恢复路径带了 requireRunId，初始路径没带 ——
+  // Stop 侧入队时 run_id 写错的记录，照样在初始路径拿到资格。
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "RunId",
+    rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = false;
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  const paths = taskPaths(task, home);
+  fs.mkdirSync(paths.runs, { recursive: true });
+  fs.mkdirSync(paths.claims, { recursive: true });
+  fs.mkdirSync(paths.sessionLock, { recursive: true });
+  const key = "7".repeat(64);
+  const eventKey = codexReplyEventKey({ threadId: THREAD_A, claimKey: key });
+  // Stop 先入了队，但 run_id 是别的 claim。
+  appendEvent({ outboxDir: paths.outbox, kind: "reply", text: "先入队的那条",
+    eventKey, runId: "0".repeat(64) });
+  writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "先入队的那条" });
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
+    "--claim-key", key, "--task-key", task.logical_task_key,
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+    FEISHU_BRIDGE_ELIGIBILITY_BUDGET_MS: "0" } });
+  assert.notEqual(r.status, 0, "身份对不上不许算成功");
+  const events = fs.readdirSync(paths.outbox)
+    .map((f) => JSON.parse(fs.readFileSync(path.join(paths.outbox, f), "utf-8")));
+  const reply = events.find((e) => e.kind === "reply");
+  assert.ok(reply);
+  assert.equal(reply.publish_eligible_at, null, "**run_id 对不上就一个字都不许写**");
+  const risk = events.find((e) => e.kind === "risk");
+  assert.ok(risk, "要发一条 risk");
+  assert.match(risk.text, /run_id_mismatch/u, "要说清原因：" + risk.text);
+  assert.equal(fs.existsSync(path.join(paths.claims, key + ".completed.json")), false,
+    "不许记成 completed");
+});
+
+test("恢复是授权：恢复标记说 completed 也不算，run 复合凭据验不过就不恢复", () => {
+  // 两个制品各自验，AND 不是 OR：标记只记"资格提升待重试"，
+  // 它的 run_state=completed 是自报，不能代替终局证据。
+  const g = eligFixture({ holdLock: false });
+  const receipt = path.join(g.runsDir, g.key + ".exit.json");
+  fs.rmSync(receipt);
+  g.marker();
+  let r = recoverEligibilityPending(g.args());
+  assert.deepEqual(r.recovered, []);
+  assert.equal(r.pending[0].reason, "run_credential_unverified");
+  assert.match(r.pending[0].why, /退出回执缺席/u);
+  assert.equal(g.read().publish_eligible_at, null, "验不过就一个字不许写");
+  assert.equal(fs.existsSync(g.markerFile), true, "验不过也不许撤标记");
+  // 旧形状回执：同样不算。
+  fs.writeFileSync(receipt, JSON.stringify({ exit_code: 0 }));
+  r = recoverEligibilityPending(g.args());
+  assert.equal(r.pending[0].reason, "run_credential_unverified");
+  assert.match(r.pending[0].why, /exit_receipt_invalid：缺字段/u, r.pending[0].why);
+  // 结论要一路传到顶。
+  assert.equal(settleOwnEligibility({ ...g.args(), claimKey: g.key, waitMs: 1, wait: () => {} }).reason,
+    "run_credential_unverified");
+  // 标记缺席的复核路径同样先验凭据。
+  fs.rmSync(g.markerFile);
+  const own = settleOwnEligibility({ ...g.args(), claimKey: g.key, waitMs: 1, wait: () => {} });
+  assert.equal(own.ok, false);
+  assert.equal(own.reason, "run_credential_unverified");
+  // 说不清去哪验就一条都不许恢复。
+  const noRuns = recoverEligibilityPending({ ...g.args(), runsDir: undefined });
+  assert.equal(noRuns.ok, false);
+  assert.equal(noRuns.reason, "runs_dir_required");
+  // 凭据合法 → 照常恢复。
+  fs.writeFileSync(receipt, JSON.stringify(exitReceipt(g.key)));
+  g.marker();
+  assert.equal(recoverEligibilityPending(g.args()).recovered.length, 1, "干净时必须照常放行");
 });
 
 test("R5 completeness：收集层给结论，坏一处就 complete:false 并点名", () => {

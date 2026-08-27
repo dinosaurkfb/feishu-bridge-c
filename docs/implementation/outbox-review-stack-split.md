@@ -23,8 +23,13 @@ CLI 只解析显示）；预览打印完整可执行命令过 shellQuote，真 s
 严格参数白名单 + 恰好一个 selector；矩阵新增「手工计划 CAS」场景，其余三份实现
 按 not_applicable 受控申报。`atRecheck` 测试补回 —— 磁盘变坏由审计闸门在更早接住
 （既有测试钉着），该分支现守「锁内重选产出说不清目标的记录」，新测试直驱此路径。
-**第 5 层剩余**：终局证据 → 发布授权的完整链（凭据制品今天还不存在，先做
-二选一决定）；`eligibility_pending` 恢复链之外的 watcher 接线复核。
+**第 5 层剩余 · 步骤 1 进行中**（分支 `fix/codex-auto-publish-lifecycle`）：
+二选一已由评审定为 **(a) 现有终局证据组成受验复合凭据，不新增完成 marker**
+（见 §4.1 决定块）。已做：runner 退出回执补身份绑定（claim_key、封闭 schema、
+规范时间）；`verifyCodexRunCredential` 成为唯一验真入口（路径只从 runsDir + key
+派生）；watcher 初始路径补 `requireRunId`；恢复消费者下沉到 `scripts/codex/`
+并在授权前验 run 复合凭据（两个制品各自验，AND 不是 OR）。
+待做：步骤 2 —— `eligibility_pending` 恢复链之外的 watcher 接线复核。
 
 集成基准分支：`integration/outbox-review-baseline`（原 `feat/outbox-review`，9 笔提交）。
 它**不作为交付路径**，只作为"这些改动曾经一起跑通过"的参照。
@@ -184,6 +189,29 @@ auditOutbox → outboxMutationBlocker → 查看器是否给命令
   **`event_key` 由 task/thread/claim 推导得出（不能由凭据自带）**、
   outbox 记录的 `run_id === claim_key` 且命中唯一。
   **共用一份要求不等于共用一份校验** —— 两个制品各自都得验。
+
+  **决定（2026-08-27，评审定）：选 (a)。**理由：`.jsonl` / `.last-message.txt`
+  由 Codex CLI 写、`.exit.json` 由 runner 在子进程退出后写，三者与发放资格的
+  watcher 不同源；watcher 自写 marker 是自证，runner 新写 marker 只是把 `.exit.json`
+  复制一份。加强 `.exit.json` 的身份绑定不算 (b)：同一写方、同一时点、同一生命周期。
+  六条要求在 (a) 下的映射，以及**两处有理由的偏离**：
+  - 封闭 schema：**只封 bridge 自有的退出回执**（逐字键集 + 分支取值域）。`.jsonl`
+    是上游 Codex CLI 的可演进协议，采用"所消费字段严格、未知扩展兼容" ——
+    全键封闭会让 CLI 增加一个无害字段就令发布链停摆。（偏离 ①）
+  - 文件名与 key：watcher 入参先验形状；三个路径全部从 runsDir + key 派生，
+    回执内 `claim_key` 必须等于文件名 key —— 三个各自合法的文件不能跨 run 拼装。
+  - 规范时间：只验回执 `recorded_at`；不给 JSONL / last-message 人造时间字段。
+  - `run_state=completed`：**改为"验真器推导出的状态为 completed"**（exit 成功分支 +
+    observed thread 匹配 + turn.started/completed + 无 turn.failed + 无递归 +
+    最终输出非空），不由任何单一写方自报 —— 没有单个写方掌握全部事实，
+    允许 runner 自报 completed 反而把复合事实降级成自证。（偏离 ②）
+  - `event_key`：凭据里不存它，由可信 task 的 thread 与已验真的 key 推导。
+  - `run_id === claim_key` 且唯一：初始 watcher 路径与恢复路径都带 `requireRunId`
+    （初始路径此前漏传，本层修）；检查在写入 `publish_eligible_at` 之前。
+  "两个制品各自校验"指：**run 终局复合凭据**（三个文件、一份逻辑凭据，由
+  `verifyCodexRunCredential` 验）与**恢复标记**（第 3 层契约）。关系是 AND：
+  初始提升验前者；恢复提升两者都验；恢复标记的 `run_state=completed` 不能代替
+  终局证据；发布后的 `completed.json` 不是这两个制品之一，仍只是结果记录。
 - **锁内字节快照**：同第 4 层。
 - **授权判据只有一份**：`publish_eligible_at` 只认规范 ISO（`hasPublishAuthorization`）。
   写端已在第 3 层收敛（原来把任意非空字符串判成 `already_eligible`，于是恢复器撤掉

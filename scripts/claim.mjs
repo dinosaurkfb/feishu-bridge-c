@@ -18,6 +18,13 @@ export const CLAIM_STATE = {
   FAILED: "failed",
 };
 
+/**
+ * claim key 的真实形状：`claimKey()` 是 sha256 的十六进制摘要，恒为 64 位。
+ * **全仓唯一的判据** —— 恢复标记文件名、run 制品文件名、退出回执里的 claim_key、
+ * watcher 的入参都用它验；各写一份正则就会有一份漏掉。
+ */
+export const CLAIM_KEY_SHAPE = /^[0-9a-f]{64}$/u;
+
 export function claimKey(messageId, logicalTaskKey) {
   return createHash("sha256")
     .update(messageId + " " + logicalTaskKey)

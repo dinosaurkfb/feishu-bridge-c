@@ -1,9 +1,23 @@
 #!/usr/bin/env node
-/** 只负责跑一次精确的 Codex thread resume，并把进程终局原子落盘。 */
+/**
+ * 只负责跑一次精确的 Codex thread resume，并把进程终局原子落盘。
+ *
+ * ■ 退出回执是**发布授权凭据的一部分**（第 5 层）
+ *
+ * watcher 判"这一轮真的跑完了"靠三件终局证据：Codex CLI 写的 `.jsonl` 与
+ * `.last-message.txt`，加上这里写的 `.exit.json`。三件都不是 watcher 自己写的 ——
+ * 出证者与发资格者不同源，验它才有独立性。所以回执要**带身份**（claim_key，
+ * 必须与文件名里的 key 一致）、**封闭 schema 连同取值域**、规范时间。
+ *
+ * 回执**不写** run_state=completed：runner 只知道进程退出，说不了 JSONL 终局
+ * 完整、最终输出非空 —— "完成"是验真器把三件证据合起来推导的，不由任何
+ * 单一写方自报。也不写 event_key：那个由可信输入推导，不该是凭据自带的字段。
+ */
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 
+import { CLAIM_KEY_SHAPE } from "../claim.mjs";
 import { sanitizeCodexRunEnv } from "./handoff.mjs";
 
 const arg = (name) => {
@@ -24,15 +38,31 @@ const logPath = required("log");
 const errPath = required("stderr");
 const lastMessagePath = required("last-message");
 const exitPath = required("exit-receipt");
+// 显式参数，不从环境变量隐式取 —— 凭据里的身份必须来自调用方明确给的值。
+const claimKey = required("claim-key");
+if (!CLAIM_KEY_SHAPE.test(claimKey)) throw new Error("--claim-key 不是 claim key 的形状");
 const codexBin = arg("codex-bin") ?? "codex";
 
 let settled = false;
+/**
+ * 回执的封闭形状（读取端 verifyCodexRunCredential 逐字对账，改一边另一边就红）：
+ *   artifact_type   "codex_run_exit_receipt"
+ *   schema_version  "1.0"
+ *   claim_key       与文件名一致的 64 位十六进制
+ *   recorded_at     规范 ISO
+ *   status          exited | failed | spawn_failed
+ *   exit_code       exited ⇒ 0；failed ⇒ 非零整数或 null；spawn_failed ⇒ null
+ *   signal          exited ⇒ null；否则字符串或 null
+ *   error           仅 spawn_failed 分支有，字符串
+ */
 function writeExit(payload) {
   if (settled) return;
   settled = true;
   const tmp = exitPath + ".tmp." + process.pid;
   fs.writeFileSync(tmp, JSON.stringify({
+    artifact_type: "codex_run_exit_receipt",
     schema_version: "1.0",
+    claim_key: claimKey,
     recorded_at: new Date().toISOString(),
     ...payload,
   }, null, 2) + "\n", { mode: 0o600 });

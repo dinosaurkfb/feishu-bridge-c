@@ -1,8 +1,11 @@
 /** Codex 精确 thread 的非阻塞投递与严格终局解析。 */
 
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { isCanonicalIso } from "../canonical-time.mjs";
+import { CLAIM_KEY_SHAPE } from "../claim.mjs";
 import { moduleDir } from "../direct-run.mjs";
 
 const HERE = moduleDir(import.meta.url);
@@ -32,6 +35,11 @@ export function assertCodexAvailable(codexBin = "codex") {
 export function handOffCodex({
   projectDir, threadId, instruction, runsDir, key, taskKey, bridgeHome, codexBin = "codex",
 }) {
+  // **key 先验，在任何可观察动作之前。**评审实测 key="../escaped"：prompt 与
+  // runner log 被写到 runsDir 外面，runner 随后才拒绝 —— 已经太晚。
+  if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) {
+    throw new Error("claim key 形状不对，拒绝投递");
+  }
   assertCodexAvailable(codexBin);
   if (typeof threadId !== "string" ||
       !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(threadId)) {
@@ -58,6 +66,8 @@ export function handOffCodex({
     "--stderr", errPath,
     "--last-message", lastMessagePath,
     "--exit-receipt", exitPath,
+    // 回执里的身份来自显式参数，不从环境变量隐式取。
+    "--claim-key", key,
     "--codex-bin", codexBin,
   ], {
     cwd: projectDir,
@@ -178,9 +188,133 @@ export function isCodexInboundExecution(command) {
     DIRECT_INBOUND_EXECUTION.test(segment.trim().replace(/^[('"\s]+/u, "")));
 }
 
-export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, errPath, expectedThreadId }) {
-  let raw = "";
-  try { raw = fs.readFileSync(logPath, "utf-8"); } catch { /* runner 可能刚启动 */ }
+/**
+ * 退出回执的**封闭形状**（跟 run-resume.mjs 写的逐字对账）。
+ * 键集按分支封闭，取值域一起封 —— 只封键名的话，status 写成 "exited" 配上
+ * exit_code:1 照样是一张"合法"回执。
+ */
+const RECEIPT_KEYS = ["artifact_type", "claim_key", "exit_code", "recorded_at",
+  "schema_version", "signal", "status"].sort();
+const RECEIPT_KEYS_WITH_ERROR = [...RECEIPT_KEYS, "error"].sort();
+// 成功回执多两份**内容摘要** —— 文件名绑定证明不了旁边两份内容是这个 run 的。
+const RECEIPT_KEYS_EXITED = [...RECEIPT_KEYS, "jsonl_sha256", "last_message_sha256"].sort();
+const SHA256_SHAPE = /^[0-9a-f]{64}$/u;
+const sha256 = (buf) => createHash("sha256").update(buf).digest("hex");
+
+function receiptProblem(doc, claimKey) {
+  if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return "不是回执对象";
+  const keys = Object.keys(doc).sort();
+  const want = doc.status === "exited" ? RECEIPT_KEYS_EXITED
+    : (doc.status === "spawn_failed" || doc.status === "artifacts_unreadable")
+      ? RECEIPT_KEYS_WITH_ERROR : RECEIPT_KEYS;
+  const missing = want.filter((k) => !keys.includes(k));
+  if (missing.length > 0) return "缺字段：" + missing.join("、");
+  const extra = keys.filter((k) => !want.includes(k));
+  if (extra.length > 0) return "多出不认识的字段：" + extra.join("、");
+  if (doc.artifact_type !== "codex_run_exit_receipt") return "artifact_type 不是退出回执";
+  if (doc.schema_version !== "1.0") return "schema_version 不认识";
+  // 文件名与内容必须自洽 —— 三件制品的路径都从 key 派生，回执再把 key 写进内容，
+  // 三个合法文件就不能跨 run 拼装。
+  if (doc.claim_key !== claimKey) return "claim_key 跟文件名对不上";
+  if (!isCanonicalIso(doc.recorded_at)) return "recorded_at 不是规范时间";
+  if (doc.status === "exited") {
+    if (doc.exit_code !== 0) return "status=exited 却 exit_code≠0";
+    if (doc.signal !== null) return "status=exited 却带 signal";
+    if (!SHA256_SHAPE.test(String(doc.jsonl_sha256))) return "jsonl_sha256 不是 sha256 形状";
+    if (!SHA256_SHAPE.test(String(doc.last_message_sha256))) return "last_message_sha256 不是 sha256 形状";
+  } else if (doc.status === "artifacts_unreadable") {
+    if (doc.exit_code !== 0 || doc.signal !== null) return "artifacts_unreadable 的 exit_code/signal 形状不对";
+    if (typeof doc.error !== "string" || doc.error.length === 0) return "error 不是非空字符串";
+  } else if (doc.status === "failed") {
+    // child close 只会产出两种互斥事实：非零退出码（无信号）或被信号杀（无退出码）。
+    // "两边都 null" 或 "两边都有" 都不是 runner 能写出来的东西。
+    const byCode = Number.isSafeInteger(doc.exit_code) && doc.exit_code !== 0 && doc.signal === null;
+    const bySignal = doc.exit_code === null && typeof doc.signal === "string" && doc.signal.length > 0;
+    if (!byCode && !bySignal) return "status=failed 的 exit_code/signal 不是互斥两档之一";
+  } else if (doc.status === "spawn_failed") {
+    if (doc.exit_code !== null || doc.signal !== null) return "spawn_failed 不该有 exit_code/signal";
+    if (typeof doc.error !== "string" || doc.error.length === 0) return "error 不是非空字符串";
+  } else {
+    return "status 不在受控取值里";
+  }
+  return null;
+}
+
+/**
+ * **自动发布授权凭据的验真入口**（第 5 层）。三件终局证据合起来是一份复合凭据：
+ * runner 写的退出回执（bridge 自有，封闭 schema 逐字验）、Codex CLI 写的
+ * `.jsonl`（上游可演进协议：所消费字段严格、未知扩展兼容）与 `.last-message.txt`
+ * （非空文本）。"完成"由这里推导，不由任何单一写方自报。
+ *
+ * 三个路径**只从 runsDir + claimKey 派生**，不接调用方自由组合 ——
+ * 否则三个各自合法的文件仍能跨 run 拼装出一份"完成"。
+ *
+ * @returns {{state:"running"}|{state:"completed",...}|{state:"failed",reason,why?}}
+ *          回执缺席 = 仍在跑；回执在但对不上 = fail-closed，不是"仍在跑"。
+ */
+export function verifyCodexRunCredential({ runsDir, claimKey, expectedThreadId }) {
+  if (typeof claimKey !== "string" || !CLAIM_KEY_SHAPE.test(claimKey)) {
+    return { state: "failed", reason: "claim_key_malformed" };
+  }
+  if (typeof runsDir !== "string" || !runsDir) return { state: "failed", reason: "runs_dir_required" };
+  const exitPath = path.join(runsDir, claimKey + ".exit.json");
+  let raw;
+  try { raw = fs.readFileSync(exitPath, "utf-8"); }
+  catch (err) {
+    if (err?.code === "ENOENT") return { state: "running" };
+    return { state: "failed", reason: "exit_receipt_invalid", why: "读不出来" };
+  }
+  let doc;
+  try { doc = JSON.parse(raw); }
+  catch { return { state: "failed", reason: "exit_receipt_invalid", why: "不是 JSON" }; }
+  const problem = receiptProblem(doc, claimKey);
+  if (problem !== null) return { state: "failed", reason: "exit_receipt_invalid", why: problem };
+  // runner 自己说制品读不出来 —— 永远解释不成完成。
+  if (doc.status === "artifacts_unreadable") {
+    return { state: "failed", reason: "artifacts_unreadable", why: doc.error };
+  }
+  // **每份制品只读一次，先核摘要，再从同一份字节解析。**
+  // 核完摘要再按路径读一遍就会重现 TOCTOU；验过的那份就是用的那份 ——
+  // 回执如此（评审探针钉过），JSONL 与最终输出也如此。
+  const logPath = path.join(runsDir, claimKey + ".jsonl");
+  const lastMessagePath = path.join(runsDir, claimKey + ".last-message.txt");
+  let logBytes = null;
+  try { logBytes = fs.readFileSync(logPath); }
+  catch (err) { if (err?.code !== "ENOENT") return { state: "failed", reason: "artifact_unreadable", why: "jsonl" }; }
+  let lastBytes = null;
+  if (doc.status === "exited") {
+    // 成功回执必须配得上旁边两份内容：缺文件或摘要对不上都是"这不是这个 run 的"。
+    if (logBytes === null) return { state: "failed", reason: "artifact_unreadable", why: "jsonl" };
+    if (sha256(logBytes) !== doc.jsonl_sha256) {
+      return { state: "failed", reason: "artifact_digest_mismatch", why: "jsonl" };
+    }
+    try { lastBytes = fs.readFileSync(lastMessagePath); }
+    catch { return { state: "failed", reason: "artifact_unreadable", why: "last_message" }; }
+    if (sha256(lastBytes) !== doc.last_message_sha256) {
+      return { state: "failed", reason: "artifact_digest_mismatch", why: "last_message" };
+    }
+  }
+  return readCodexRunOutcome({
+    log: logBytes === null ? "" : logBytes.toString("utf-8"),
+    exit: doc,
+    errPath: path.join(runsDir, claimKey + ".stderr.log"),
+    lastMessage: lastBytes === null ? null : lastBytes.toString("utf-8"),
+    expectedThreadId,
+  });
+}
+
+/**
+ * 三件证据的**内容**判定（JSONL 终局、退出码、最终输出）。
+ * 生产路径不直接调它 —— 走 verifyCodexRunCredential，那里先验回执身份、再派生路径。
+ */
+export function readCodexRunOutcome({
+  logPath, log, exitPath, exit: exitDoc, lastMessagePath, lastMessage, errPath, expectedThreadId,
+}) {
+  // 调用方给了字节（验真入口核过摘要的那份）就用那份，不再按路径读。
+  let raw = typeof log === "string" ? log : "";
+  if (typeof log !== "string") {
+    try { raw = fs.readFileSync(logPath, "utf-8"); } catch { /* runner 可能刚启动 */ }
+  }
 
   let observedThreadId = null;
   let turnStarted = false;
@@ -194,6 +328,11 @@ export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, errPat
     if (!line.trim()) continue;
     let event;
     try { event = JSON.parse(line); } catch { invalidJsonLines += 1; continue; }
+    // 合法 JSON 但不是事件对象（null / 数组 / 数字）也算坏行 —— 直接 event.type
+    // 会抛，而 watcher 的启动扫描发生在 session-lock 的 try/finally 之前。
+    if (event === null || typeof event !== "object" || Array.isArray(event)) {
+      invalidJsonLines += 1; continue;
+    }
     if (event.type === "thread.started") {
       observedThreadId = event.thread_id ?? null;
       if (observedThreadId !== expectedThreadId) threadMismatch = true;
@@ -206,8 +345,12 @@ export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, errPat
         isCodexInboundExecution(event.item.command)) bridgeRecursion = true;
   }
 
-  let exit = null;
-  try { exit = JSON.parse(fs.readFileSync(exitPath, "utf-8")); } catch { /* 仍在运行 */ }
+  // 调用方已验过的回执优先（verifyCodexRunCredential 只传这个）；
+  // 只有直接按路径调用的老用法才自己读盘。
+  let exit = exitDoc ?? null;
+  if (exit === null) {
+    try { exit = JSON.parse(fs.readFileSync(exitPath, "utf-8")); } catch { /* 仍在运行 */ }
+  }
   if (!exit) return { state: "running", observedThreadId, turnStarted, turnCompleted };
 
   if (invalidJsonLines > 0) return { state: "failed", reason: "invalid_jsonl", invalidJsonLines };
@@ -219,6 +362,9 @@ export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, errPat
   if (bridgeRecursion) return { state: "failed", reason: "bridge_recursion" };
   if (exit.status === "spawn_failed") {
     return { state: "failed", reason: "runner_spawn_failed" };
+  }
+  if (exit.status === "artifacts_unreadable") {
+    return { state: "failed", reason: "artifacts_unreadable" };
   }
   if (turnFailed) return { state: "failed", reason: "turn_failed" };
   if (exit.exit_code !== 0) {
@@ -236,7 +382,8 @@ export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, errPat
   if (!turnCompleted) return { state: "failed", reason: "turn_completed_missing" };
 
   let finalText = null;
-  try { finalText = fs.readFileSync(lastMessagePath, "utf-8").trim(); } catch { /* below */ }
+  if (typeof lastMessage === "string") finalText = lastMessage.trim();
+  else { try { finalText = fs.readFileSync(lastMessagePath, "utf-8").trim(); } catch { /* below */ } }
   if (!finalText) return { state: "failed", reason: "final_message_missing" };
   return { state: "completed", finalText, recoverableErrors, observedThreadId };
 }

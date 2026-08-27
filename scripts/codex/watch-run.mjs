@@ -1,16 +1,15 @@
 #!/usr/bin/env node
 /** 一次性 watcher：确认 Codex run 终局、兜底入队、按发布合同处理并释放 task 锁。 */
 
-import { readClaim, recordClaimState } from "../claim.mjs";
-import {
-  eligibilityBudgetMs, settleEligibilityPending, settleOwnEligibility,
-} from "../eligibility-recovery.mjs";
+import { CLAIM_KEY_SHAPE, readClaim, recordClaimState } from "../claim.mjs";
+import { eligibilityBudgetMs } from "../eligibility-recovery.mjs";
+import { settleEligibilityPending, settleOwnEligibility } from "./eligibility-recovery.mjs";
 import { releaseSessionLock } from "../handoff.mjs";
 import {
   appendEvent, codexReplyEventKey, markPublishEligibleByEventKey, MAX_REPLY_CHARS,
   suppressPublishByEventKey,
 } from "../outbox.mjs";
-import { readCodexRunOutcome } from "./handoff.mjs";
+import { verifyCodexRunCredential } from "./handoff.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
 import { bridgeHome, finalizeTaskDialogueTurn, loadRegistry, taskPaths } from "./state.mjs";
 import { DIALOGUE_POLICY_ID, DIALOGUE_TURN_STATUS } from "../interaction-policy.mjs";
@@ -25,6 +24,11 @@ if (!key || !taskKey) {
   console.error("usage: watch-run.mjs --claim-key <key> --task-key <key>");
   process.exit(2);
 }
+// key 形状先验：三件 run 制品的路径全从它派生，形状不对就没有可验的凭据。
+if (!CLAIM_KEY_SHAPE.test(key)) {
+  console.error("--claim-key 不是 claim key 的形状");
+  process.exit(2);
+}
 
 const home = bridgeHome();
 const reg = loadRegistry();
@@ -34,12 +38,7 @@ if (!task) {
   process.exit(2);
 }
 const paths = taskPaths(task, home);
-const run = {
-  logPath: paths.runs + "/" + key + ".jsonl",
-  exitPath: paths.runs + "/" + key + ".exit.json",
-  errPath: paths.runs + "/" + key + ".stderr.log",
-  lastMessagePath: paths.runs + "/" + key + ".last-message.txt",
-};
+// run 制品路径不在这里拼 —— 由验真入口从 runsDir + key 派生（防跨 run 拼装）。
 const eventKey = codexReplyEventKey({ threadId: task.codex_thread_id, claimKey: key });
 const acceptedClaim = readClaim({ claimsDir: paths.claims, key });
 const targetGenerationId = acceptedClaim?.origin_channel_generation_id ?? null;
@@ -56,7 +55,7 @@ const targetGenerationId = acceptedClaim?.origin_channel_generation_id ?? null;
 //
 // **必须在拿发布锁之前跑** —— 它内部要拿那把锁，锁内调会自己卡死自己。
 const recovered = settleEligibilityPending({
-  claimsDir: paths.claims, outboxDir: paths.outbox,
+  claimsDir: paths.claims, outboxDir: paths.outbox, runsDir: paths.runs,
   publishLockDir: paths.publishLock, threadId: task.codex_thread_id,
   budgetMs: eligibilityBudgetMs(process.env.FEISHU_BRIDGE_ELIGIBILITY_BUDGET_MS) });
 if (!recovered.ok) {
@@ -87,7 +86,9 @@ const failureLabel = (outcome) => {
 
 try {
   while (Date.now() - started <= MAX_WAIT_MS) {
-    const outcome = readCodexRunOutcome({ ...run, expectedThreadId: task.codex_thread_id });
+    // **授权凭据验真**：退出回执身份/封闭 schema + JSONL 终局 + 最终输出，合起来才算完成。
+    const outcome = verifyCodexRunCredential({
+      runsDir: paths.runs, claimKey: key, expectedThreadId: task.codex_thread_id });
     if (outcome.state === "running") {
       await sleep(4000);
       continue;
@@ -112,8 +113,11 @@ try {
       // Stop 只保存入站答复；四项终局证据齐全后，watcher 才允许它自动发布。
       // **锁是必需的**：资格提升跟抑制改的是同一条记录的语义，
       // 不共用一把锁就会出现"抑制读完快照、写回之前资格被改掉"的窗口。
+      // **requireRunId 在初始路径也必须带** —— 评审实测这里漏传：event key 命中的记录
+      // 若 run_id 是别的 claim（Stop 侧入队时写错），资格照样发给了它。
       const promoted = markPublishEligibleByEventKey({
-        outboxDir: paths.outbox, eventKey, publishLockDir: paths.publishLock });
+        outboxDir: paths.outbox, eventKey, publishLockDir: paths.publishLock,
+        requireRunId: key });
       // **自己新加的失败模式，得自己接住 —— 而且要接到有结论为止。**
       //
       // 加锁之后 publisher_busy 成了真实路径：这里只重试约 720ms，
@@ -131,7 +135,7 @@ try {
         // 自己扫到有结论为止。只对 publisher_busy 重试 —— 别的失败多等也不会变好。
         // 标记不在了要去问记录本身：可能是另一个恢复器先做完了。
         const settled_ = settleOwnEligibility({
-          claimsDir: paths.claims, outboxDir: paths.outbox,
+          claimsDir: paths.claims, outboxDir: paths.outbox, runsDir: paths.runs,
           publishLockDir: paths.publishLock, threadId: task.codex_thread_id, claimKey: key,
           // 预算解析只有一份判据 —— 有限安全整数、有上限、不合规回落默认值。
           budgetMs: eligibilityBudgetMs(process.env.FEISHU_BRIDGE_ELIGIBILITY_BUDGET_MS),

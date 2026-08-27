@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -51,7 +51,7 @@ import {
 import {
   PUBLISH_FAILURE, claimRunPublish, classifyPublishFailure, readRunReceipt,
   releaseRunPublishClaim, scanRuns, buildDraft, parseDirectPublishArgs, inventoryRuns, readRunSnapshot,
-  runRouteSha256, markPublished, readPublishLedger, writePublishLedger } from "./outbound.mjs";
+  runRouteSha256, markPublished, readPublishLedger, writePublishLedger, publishHold } from "./outbound.mjs";
 import { parseRunOutcome } from "./handoff.mjs";
 import { repairRunClaims } from "./repair-run-claim.mjs";
 import {
@@ -14807,7 +14807,10 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
     fs.rmSync(path.join(g.runs, k2 + ".published.json"), { recursive: true });
     const r3 = g.drain();
     assert.equal(g.sent(), 0, "**下一轮不许重发**：" + JSON.stringify(r3.runs));
-    assert.equal(r3.runs.stuck[0]?.reason, "ledger_unreadable", JSON.stringify(r3.runs));
+    // markPublished 失败留下的 .published.json.tmp.* 就是"送过但没闭合"的证据：回执说不清，不进待发布。
+    const p3 = r3.runs.problems.find((x) => x.key === k2);
+    assert.equal(p3?.reason, "receipt_unreadable", JSON.stringify(r3.runs));
+    assert.match(p3.why, /写到一半/u);
   }
   // 重试账本键集封闭：多键 / source 不对 / 旧形状 error 为空 → 说不清，不发。
   {
@@ -14900,6 +14903,71 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
     assert.equal(pub2.status, 1, pub2.stdout + pub2.stderr);
     assert.match(pub2.stdout, /待人工（watcher_publish_failed）/u, pub2.stdout);
     assert.equal(fs.existsSync(path.join(f.h.dir, "lark-calls.jsonl")), false, "**零发送**");
+  }
+
+  // **写到一半的临时回执 / 临时账本**：发布返回后、rename 前停住 —— 状态未闭合，任何入口不许再发。
+  {
+    const f = mk();
+    const key = f.run("tmp-receipt");
+    fs.writeFileSync(path.join(f.runs, key + ".published.json.tmp.123"), JSON.stringify({ published_at: "2026-08-27T00:00:00.000Z", feishu_message_id: "om_first" }));
+    const r = f.drain();
+    assert.equal(f.sent(), 0, "**临时回执在场不许再发**：" + JSON.stringify(r.runs));
+    assert.equal(r.runs.pending, 0);
+    assert.match(r.runs.problems.find((x) => x.key === key)?.why ?? "", /回执写到一半/u, JSON.stringify(r.runs));
+    const env = { ...process.env, HOME: f.h.dir };
+    const pub = spawnSync(process.execPath, [path.resolve("scripts", "outbound.mjs"), "--root=" + f.h.dir, "--publish", "--key=" + key], { encoding: "utf-8", env, timeout: 60_000 });
+    assert.equal(pub.status, 1, pub.stdout + pub.stderr);
+    assert.match(pub.stderr, /拒绝发布.*回执说不清.*写到一半/u, pub.stderr);
+    assert.equal(fs.existsSync(path.join(f.h.dir, "lark-calls.jsonl")), false, "**零发送**");
+    assert.equal(fs.existsSync(path.join(f.runs, key + ".published.json")), false, "不许生成新的正式回执");
+    const g = mk();
+    const k2 = g.run("tmp-ledger");
+    fs.writeFileSync(path.join(g.runs, k2 + ".publish-failed.json.tmp.9"), "{}");
+    const r2 = g.drain();
+    assert.equal(g.sent(), 0);
+    assert.equal(r2.runs.stuck[0]?.reason, "ledger_unreadable", JSON.stringify(r2.runs));
+    assert.match(r2.runs.stuck[0].why, /写到一半/u);
+    // 只剩临时回执、没有制品：孤儿。
+    const orphan = claimKeyFor("tmp-orphan");
+    fs.writeFileSync(path.join(g.runs, orphan + ".published.json.tmp.1"), "{}");
+    assert.equal(inventoryRuns({ runsDir: g.runs }).problems.find((x) => x.key === orphan)?.reason, "orphan_sidecar");
+  }
+  // 盘点只验"是不是一条记录"：终局文件是 null / 数组 → terminal_unreadable；账本投影的联合封闭。
+  {
+    const f = mk();
+    const n = f.run("term-null"); fs.writeFileSync(path.join(f.claims, n + ".handed_off.json"), "null\n");
+    const a = f.run("term-array"); fs.writeFileSync(path.join(f.claims, a + ".handed_off.json"), "[]");
+    const r = f.drain();
+    assert.equal(f.sent(), 0);
+    const problems = Object.fromEntries(r.runs.problems.map((x) => [x.key, x.reason]));
+    assert.equal(problems[n], "terminal_unreadable", JSON.stringify(r.runs));
+    assert.equal(problems[a], "terminal_unreadable");
+    assert.equal(publishHold({ state: "future_state", attempts: 0 })?.reason, "ledger_unreadable", "**不认识的账本状态不许默认放行**");
+    assert.equal(publishHold(undefined)?.reason, "ledger_unreadable");
+    assert.equal(publishHold({ state: "valid", attempts: "1" })?.reason, "ledger_unreadable");
+    assert.equal(publishHold({ state: "absent", attempts: 0 }), null);
+    assert.equal(publishHold({ state: "valid", attempts: 4 }), null);
+  }
+  // **claim 之内重读账本**（真实入口，FIFO 时序编排）：启动扫描读到的是可重试的账，拿到 claim 之后
+  // 账本已变成 reserved —— 直发 CLI 必须停手。账本是一个 FIFO：第一次读给 A、第二次读给 B；
+  // 入口若不在 claim 内重读，第二份永远送不出去（编排器超时报 false），而 CLI 会照发。
+  {
+    const f = mk();
+    const key = f.run("fifo-cli");
+    const ledgerPath = path.join(f.runs, key + ".publish-failed.json");
+    execFileSync("mkfifo", [ledgerPath]);
+    const A = JSON.stringify({ schema_version: "1.0", run_id: key, attempts: 1, at: "2026-08-27T00:00:00.000Z", source: "drain-run-channel", error: "boom" });
+    const B = JSON.stringify({ schema_version: "1.0", run_id: key, attempts: 1, at: "2026-08-27T00:00:00.000Z", source: "drain-run-channel", error: "reserved" });
+    const server = fifoLedgerServer({ dir: f.h.dir, fifo: ledgerPath, docs: [A, B] });
+    const env = { ...process.env, HOME: f.h.dir };
+    const pub = spawnSync(process.execPath, [path.resolve("scripts", "outbound.mjs"), "--root=" + f.h.dir, "--publish", "--key=" + key], { encoding: "utf-8", env, timeout: 60_000 });
+    const served = server.finish();
+    assert.deepEqual(served, [true, true], "两份账本都要被读走（第二份就是 claim 内的重读）：" + JSON.stringify(served) + pub.stderr);
+    assert.match(pub.stderr, /claim 后重读账本 reservation_unresolved/u, pub.stdout + pub.stderr);
+    assert.equal(pub.status, 1);
+    assert.equal(fs.existsSync(path.join(f.h.dir, "lark-calls.jsonl")), false, "**claim 内账本已 reserved 不许发**");
+    assert.equal(fs.existsSync(path.join(f.runs, key + ".published.json")), false);
+    assert.equal(fs.existsSync(path.join(f.runs, key + ".publish-claim.json")), false, "claim 要释放");
   }
 
   // 授权门：历史 run（无 watcher 终局记录）与身份漂移的 failed 记录都不许自动捞起。
@@ -15017,6 +15085,58 @@ test("Claude watcher：run 制品读不出（不是缺席）→ 立即受控退�
   assert.equal(failed.reason, "run_unreadable");
   assert.equal(fs.existsSync(lock), true, "runner 可能仍活着：锁保留交陈旧检测");
   assert.equal(fs.existsSync(path.join(h.dir, "lark-calls.jsonl")), false);
+});
+
+/**
+ * FIFO 账本编排器：按顺序把 docs 逐份喂给 fifo（每份一次 open→write→close，对端 readFileSync
+ * 读到 EOF 即得一份）；某份在 20s 内没被读走就记 false。用子进程 `cat > fifo` 承担阻塞的 open。
+ */
+function fifoLedgerServer({ dir, fifo, docs }) {
+  const script = path.join(dir, "fifo-server-" + path.basename(fifo).slice(0, 8) + ".mjs");
+  const outFile = script + ".out";
+  fs.writeFileSync(script, [
+    'import fs from "node:fs";',
+    'import { spawn } from "node:child_process";',
+    'const [outFile, fifo, ...docs] = process.argv.slice(2);',
+    'const serve = (doc) => new Promise((resolve) => {',
+    '  const c = spawn("sh", ["-c", "cat > " + JSON.stringify(fifo)], { stdio: ["pipe", "ignore", "ignore"] });',
+    '  const t = setTimeout(() => { c.kill("SIGKILL"); resolve(false); }, 20000);',
+    '  c.on("close", (code) => { clearTimeout(t); resolve(code === 0); });',
+    '  c.stdin.end(doc);',
+    '});',
+    'const out = []; for (const d of docs) out.push(await serve(d));',
+    // 同步测试基座收不到 stdout（事件循环不转）：结果落文件，基座轮询文件。
+    'fs.writeFileSync(outFile, JSON.stringify(out));',
+  ].join("\n"));
+  const child = spawn(process.execPath, [script, outFile, fifo, ...docs], { stdio: "ignore", detached: false });
+  child.unref();
+  return { finish: () => {
+    const t0 = Date.now();
+    while (!fs.existsSync(outFile) && Date.now() - t0 < 45_000) spawnSync(process.execPath, ["-e", "setTimeout(()=>{},100)"]);
+    try { return JSON.parse(fs.readFileSync(outFile, "utf-8")); } catch { return "编排器没有产出结果"; }
+  } };
+}
+
+test("Claude watcher：claim 之内重读账本 —— 启动快照可重试、claim 后已 reserved → 不发（真实进程，FIFO 时序）", () => {
+  const h = watcherMatrixRunner.fixture();
+  const rt = path.join(h.dir, ".runtime-data", "inbound");
+  const runs = path.join(rt, "runs");
+  const key = claimKeyFor("fifo-watcher");
+  fs.writeFileSync(path.join(runs, key + ".jsonl"), JSON.stringify({ type: "result", is_error: false, result: "claim 之内账本变了那一轮" }) + "\n");
+  writeClaimFixture({ claimsDir: path.join(rt, "delivery-claims"), key, root: h.dir });
+  const ledgerPath = path.join(runs, key + ".publish-failed.json");
+  execFileSync("mkfifo", [ledgerPath]);
+  const A = JSON.stringify({ schema_version: "1.0", run_id: key, attempts: 1, at: "2026-08-27T00:00:00.000Z", source: "drain-run-channel", error: "boom" });
+  const B = JSON.stringify({ schema_version: "1.0", run_id: key, attempts: 1, at: "2026-08-27T00:00:00.000Z", source: "drain-run-channel", error: "reserved" });
+  const server = fifoLedgerServer({ dir: h.dir, fifo: ledgerPath, docs: [A, B] });
+  const r = spawnSync(process.execPath, [path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir],
+    { encoding: "utf-8", env: { ...process.env, ...expectEnvFor(h.dir), HOME: h.dir }, timeout: 60_000 });
+  const served = server.finish();
+  assert.deepEqual(served, [true, true], "两份账本都要被读走（第二份就是 claim 内的重读）：" + JSON.stringify(served) + r.stderr);
+  assert.match(r.stderr, /claim 后重读账本：reservation_unresolved/u, r.stdout + r.stderr);
+  assert.equal(fs.existsSync(path.join(h.dir, "lark-calls.jsonl")), false, "**claim 内账本已 reserved 不许发**");
+  assert.equal(fs.existsSync(path.join(runs, key + ".published.json")), false);
+  assert.equal(fs.existsSync(path.join(runs, key + ".publish-claim.json")), false, "claim 要释放");
 });
 
 test("Claude watcher：发布账本说送达状态不确定（reserved）→ 绑定 active 也不发（真实进程）", () => {

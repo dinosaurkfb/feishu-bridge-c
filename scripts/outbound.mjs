@@ -44,6 +44,17 @@ export function runPaths({ runsDir, key } = {}) {
 }
 
 /**
+ * 原子落盘的**中间态**探测：`<key><suffix>.tmp.*` 在场 = 上一次写到一半（发布返回之后、
+ * rename 之前停住）。评审实测：临时回执被认出后又被忽略，run 被列成待发布再发一次。
+ * 有它就是"状态未闭合"，读方一律 fail-closed。目录读不出也算说不清。
+ */
+function inFlightSidecar({ runsDir, key, suffix }) {
+  const prefix = key + suffix + ".tmp.";
+  try { return { name: fs.readdirSync(runsDir).find((n) => n.startsWith(prefix)) ?? null }; }
+  catch (err) { return err.code === "ENOENT" ? { name: null } : { error: String(err.code ?? err.message) }; }
+}
+
+/**
  * 发布失败的重试账 —— **严格分态**：它决定还许不许自动重试。
  *   absent     —— 没失败过
  *   valid      —— 排空写的账：键集封闭、run_id===key、attempts 安全整数≥1、at 规范、source 受控
@@ -54,6 +65,9 @@ export function runPaths({ runsDir, key } = {}) {
 export function readPublishLedger({ runsDir, key }) {
   const p = runPaths({ runsDir, key });
   if (!p.ok) return { state: "unreadable", why: p.why };
+  const inFlight = inFlightSidecar({ runsDir, key, suffix: ".publish-failed.json" });
+  if (inFlight.error) return { state: "unreadable", why: "runs 目录读不出（" + inFlight.error + "）" };
+  if (inFlight.name) return { state: "unreadable", why: "重试账写到一半（" + inFlight.name + "）—— 状态未闭合" };
   let raw;
   try { raw = fs.readFileSync(p.ledger, "utf-8"); }
   catch (err) { return err.code === "ENOENT" ? { state: "absent", attempts: 0 } : { state: "unreadable", why: String(err.code ?? err.message) }; }
@@ -103,11 +117,16 @@ export function writePublishLedger({ runsDir, key, attempts, error }) {
  * 把送达状态未知的一条列成"待发布"诱导重发）。null = 可以发。
  */
 export function publishHold(ledger) {
-  if (!ledger || ledger.state === "unreadable") return { reason: "ledger_unreadable", why: ledger?.why ?? "说不清" };
-  if (ledger.state === "reserved") return { reason: "reservation_unresolved", why: "上次尝试没闭合（" + ledger.error + "）—— 送达状态不确定，先去话题核对" };
-  if (ledger.state === "legacy") return { reason: "watcher_publish_failed", why: ledger.error };
-  if (ledger.attempts >= RUN_PUBLISH_MAX_ATTEMPTS) return { reason: "retry_exhausted", why: "已失败 " + ledger.attempts + " 次，自动重试预算耗尽" };
-  return null;
+  // **封闭的联合**：只有 absent 与预算未耗尽的 valid 才放行；任何不认识的形状都是说不清 ——
+  // 新增一个状态不会默认掉进"可以发"。
+  if (ledger && ledger.state === "absent") return null;
+  if (ledger && ledger.state === "valid" && Number.isSafeInteger(ledger.attempts)) {
+    if (ledger.attempts >= RUN_PUBLISH_MAX_ATTEMPTS) return { reason: "retry_exhausted", why: "已失败 " + ledger.attempts + " 次，自动重试预算耗尽" };
+    return null;
+  }
+  if (ledger && ledger.state === "reserved") return { reason: "reservation_unresolved", why: "上次尝试没闭合（" + ledger.error + "）—— 送达状态不确定，先去话题核对" };
+  if (ledger && ledger.state === "legacy") return { reason: "watcher_publish_failed", why: ledger.error };
+  return { reason: "ledger_unreadable", why: ledger?.why ?? ("账本状态不认识：" + String(ledger?.state)) };
 }
 
 /** 一条 run 的展示/发布判定 —— 所有读 run 的入口共用这一份。 */
@@ -183,7 +202,6 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
     if (!m) { problems.push({ key: null, reason: "unrecognized_entry", why: "runs/" + name.slice(0, 80) }); continue; }
     note(m[1], m[2]);
   }
-  const terminals = new Map();
   if (claimsDir) {
     let names = [];
     try { names = fs.readdirSync(claimsDir); }
@@ -194,10 +212,13 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
       if (!m) { problems.push({ key: null, reason: "unrecognized_entry", why: "delivery-claims/" + name.slice(0, 80) }); continue; }
       if (m[2] !== "handed_off.json" && m[2] !== "failed.json") continue;   // claim 目录先于 run 存在，不参与孤儿判定
       note(m[1], "terminal");
-      let doc = null;
+      // 盘点只验"是不是一条记录"（非数组对象）；授权语义留给 readTerminalRecord。
+      let doc;
       try { doc = JSON.parse(fs.readFileSync(path.join(claimsDir, name), "utf-8")); }
-      catch (err) { problems.push({ key: m[1], reason: "terminal_unreadable", why: name + "：" + String(err.code ?? "不是 JSON") }); }
-      if (doc) terminals.set(m[1], { ...(terminals.get(m[1]) ?? {}), [m[2]]: doc });
+      catch (err) { problems.push({ key: m[1], reason: "terminal_unreadable", why: name + "：" + String(err.code ?? "不是 JSON") }); continue; }
+      if (doc === null || typeof doc !== "object" || Array.isArray(doc)) {
+        problems.push({ key: m[1], reason: "terminal_unreadable", why: name + "：不是记录对象" });
+      }
     }
   }
   const runs = [];
@@ -206,7 +227,7 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
       // 没有 run 制品却有它的终局记录 / 回执 / 失败账 —— 孤儿，不能消失。
       const which = [...kinds];
       if (kinds.has("terminal")) problems.push({ key, reason: "orphan_terminal_record", why: "run 制品缺席，只剩：" + which.join("、") });
-      else if (kinds.has("published.json") || kinds.has("publish-failed.json")) {
+      else if ([...kinds].some((k) => k.startsWith("published.json") || k.startsWith("publish-failed.json"))) {
         problems.push({ key, reason: "orphan_sidecar", why: "run 制品缺席，只剩：" + which.join("、") });
       }
       continue;
@@ -329,6 +350,10 @@ export function claimRunPublish({ runsDir, key, staleMs = 5 * 60 * 1000, now = D
 export function readRunReceipt({ runsDir, key } = {}) {
   const p = runPaths({ runsDir, key });
   if (!p.ok) return { state: "unreadable", why: p.why };
+  // 发布返回之后、rename 之前停住的临时回执 = 送过但没闭合：既不能当没送、也不能当送达。
+  const inFlight = inFlightSidecar({ runsDir, key, suffix: PUBLISHED_MARK });
+  if (inFlight.error) return { state: "unreadable", why: "runs 目录读不出（" + inFlight.error + "）" };
+  if (inFlight.name) return { state: "unreadable", why: "回执写到一半（" + inFlight.name + "）—— 送达状态未闭合", phase: "in_flight" };
   const file = p.receipt;
   let raw;
   try { raw = fs.readFileSync(file, "utf-8"); }
@@ -620,10 +645,11 @@ if (isDirectRun(import.meta.url)) {
   }
 
   const pending = runs.filter((r) => r.shouldPublish);
-  const held = runs.filter((r) => r.hold);
+  // 普通 --publish 不许覆盖账本或说不清的回执：送达状态未闭合的内容重发要走显式的人工核对，不在这里。
+  const held = runs.filter((r) => r.hold || r.receiptUnreadable);
   if (doPublish && held.length > 0) {
-    // 普通 --publish 不许覆盖账本：送达状态不确定的内容重发要走显式的人工核对，不在这里。
-    console.error("拒绝发布 " + held.map((r) => r.key.slice(0, 8) + "（" + r.hold.reason + "：" + r.hold.why + "）").join("、") +
+    console.error("拒绝发布 " + held.map((r) => r.key.slice(0, 8) + "（" +
+      (r.hold ? r.hold.reason + "：" + r.hold.why : "回执说不清：" + r.receiptUnreadable) + "）").join("、") +
       " —— 先去话题核对送达状态；这个入口不提供覆盖。");
     process.exitCode = 1;
   }
@@ -648,6 +674,14 @@ if (isDirectRun(import.meta.url)) {
         const receipt = readRunReceipt({ runsDir, key: r.key });
         if (receipt.state !== "absent") {
           console.error("跳过 " + r.key.slice(0, 8) + "：claim 后重读回执为 " + receipt.state + (receipt.phase ? "（" + receipt.phase + "）" : "") + " —— 不发");
+          continue;
+        }
+        // **claim 内重读账本**：启动扫描到拿到 claim 之间账本可能已变成 reserved（评审探针）——
+        // 有约束力的判断只认 claim 之内的新鲜快照，与排空同一形状。
+        const hold = publishHold(readPublishLedger({ runsDir, key: r.key }));
+        if (hold) {
+          console.error("跳过 " + r.key.slice(0, 8) + "：claim 后重读账本 " + hold.reason + "（" + hold.why + "）—— 不发");
+          process.exitCode = 1;
           continue;
         }
         const mid = publishDraft({

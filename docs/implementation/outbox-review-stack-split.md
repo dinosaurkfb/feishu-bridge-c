@@ -66,7 +66,8 @@ JSONL，outcome / 正文 / 摘要来自同一份字节（`parseRunOutcome` 按�
 "验 B 发 A"的窗口；**key 边界**：run 制品的所有路径只从 `runPaths` 派生（CLAIM_KEY_SHAPE
 不过就没有路径，七个原语在任何 I/O 前受验 —— 评审实测 `../../secret` 读出了 runsDir 外的
 文件）；盘点对**不认识的条目**报 unrecognized_entry（bad.jsonl / bad.handed_off.json 不许消失）；
-合法 JSON 但非事件对象的行受控成 run 状态 invalid（problems invalid_jsonl，不抛）；
+合法 JSON 但非事件对象的行受控成 run 状态 invalid（problems invalid_jsonl，不抛）；终局记录在
+盘点层至少要是记录对象（null / 数组 → terminal_unreadable），授权语义留给 readTerminalRecord；
 历史 run、身份漂移的 failed 记录待人工分类；
 **watcher 当时发过又失败的只可见（stuck watcher_publish_failed）不自动重试** ——
 那类失败原因未受验，自动重试只是制造噪音，留给人判断；claim 自身缺席/损坏是 stuck、合法但属于
@@ -75,9 +76,15 @@ JSONL，outcome / 正文 / 摘要来自同一份字节（`parseRunOutcome` 按�
 旧形状须规范时间与非空 error，坏账不发，尝试在 claim 内预留、账写不进去不发；
 **未闭合的 reservation**（error 为 reserved / delivered_unrecorded）= 送达状态不确定，
 stuck reservation_unresolved 禁止自动重试，dry-run 也不报成将发布；账本对"还许不许发"的
-投影 `publishHold` 只有一份，**直发 CLI 与 watcher 共用**：直发把这类 run 列成"待人工"、
-普通 --publish 拒绝且不提供覆盖；watcher 对 reserved / 说不清 / 预算耗尽也不发，只对自己
-上一次发布失败的旧账例外 —— 维护后重跑 watcher 正是那条恢复路径），经同一把
+投影 `publishHold` 只有一份且**联合封闭**（只有 absent 与预算未耗尽的 valid 放行，不认识的
+形状一律 ledger_unreadable），**直发 CLI 与 watcher 共用**，且三条入口都在 **claim 之内重读
+账本**（启动扫描到拿到 claim 之间账本可能已变成 reserved —— 评审探针；回归用 FIFO 账本做
+时序编排：第一次读给可重试、第二次读给 reserved）：直发把这类 run 列成"待人工"、普通
+--publish 拒绝且不提供覆盖；watcher 对 reserved / 说不清 / 预算耗尽也不发，只对自己上一次
+发布失败的旧账例外 —— 维护后重跑 watcher 正是那条恢复路径。**写到一半的临时制品**
+（`<key>.published.json.tmp.*` / `.publish-failed.json.tmp.*`：发布返回之后、rename 之前停住）
+由 readRunReceipt / readPublishLedger 自己探测为"状态未闭合"（unreadable），所有读方一致
+fail-closed，普通入口不得选择它），经同一把
 claimRunPublish → claim 下重读回执 → 发 → markPublished（单独接住：送达但回执没落 =
 deliveredUnrecorded，提示可能重发；这一笔账也写不进去 → problems ledger_unwritable）→ 释放；run 通道独立
 于 outbox 预检（outbox 损坏不截断它）；只有 run 通道时状态为 runs_only，不伪造 outbox

@@ -14,8 +14,8 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
-  buildDraft, claimRunPublish, markPublished, publishDraft, readRunReceipt, readRunSnapshot,
-  releaseRunPublishClaim, runRouteSha256,
+  buildDraft, claimRunPublish, markPublished, publishDraft, publishHold, readPublishLedger, readRunReceipt,
+  readRunSnapshot, releaseRunPublishClaim, runRouteSha256,
 } from "./outbound.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { claudeRotationBatchHook } from "./drain-outbox.mjs";
@@ -317,6 +317,10 @@ while (true) {
           // **claim 后复核回执** —— shouldPublish 是并发对手完成之前读的，
           // 对手发完释放 claim 后这里能拿到新 claim；回执才是持久的真相。
           const receipt = claim.ok ? readRunReceipt({ runsDir: RUNS, key }) : null;
+          // **claim 内重读账本**：启动快照到拿到 claim 之间账本可能已变成 reserved（评审探针）。
+          // 自己上一次发布失败的旧账仍是例外（维护后重跑正是恢复路径），其余 hold 一律停手。
+          const freshHold = claim.ok && receipt.state === "absent" ? publishHold(readPublishLedger({ runsDir: RUNS, key })) : null;
+          const ledgerBlocks = freshHold !== null && freshHold.reason !== "watcher_publish_failed";
           if (claim.ok && receipt.state === "valid") {
             releaseRunPublishClaim({ runsDir: RUNS, key, token: claim.token });
             console.error("run 结果已由另一个 watcher 送达（回执合法），本轮不再发。");
@@ -326,6 +330,10 @@ while (true) {
             releaseRunPublishClaim({ runsDir: RUNS, key, token: claim.token });
             console.error("run 回执损坏（" + receipt.why + "）—— **说不清送没送达，" +
               "本轮不发**。去话题核对后手工处理 " + key.slice(0, 8) + " 的回执文件。");
+          } else if (claim.ok && ledgerBlocks) {
+            releaseRunPublishClaim({ runsDir: RUNS, key, token: claim.token });
+            console.error("run 结果本轮不发（claim 后重读账本：" + freshHold.reason + "：" + freshHold.why +
+              "）—— 去话题核对后手工处理 " + key.slice(0, 8) + " 的发布账本。");
           } else if (!claim.ok && claim.reason === "reap_lock_held") {
             // **恢复信息不许在包装层被吞掉**（评审实测：detail 里有锁路径和
             // 处置提示，这里原来只打一句泛化话 —— run 永久停发却无路可走）。

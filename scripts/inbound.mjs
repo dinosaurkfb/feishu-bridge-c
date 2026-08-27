@@ -17,7 +17,7 @@ import path from "node:path";
 
 import { REJECT } from "./selector.mjs";
 import { fetchTriggerEvent } from "./envelope.mjs";
-import { acquireClaim, recordClaimState } from "./claim.mjs";
+import { acquireClaim, recordClaimState, watcherExpectEnv } from "./claim.mjs";
 import { moduleRoot } from "./direct-run.mjs";
 import {
   MAPPING_DISPOSITION, buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
@@ -671,6 +671,8 @@ if (target) {
     const w = spawn(process.execPath,
       [path.join(ROOT, "scripts", "watch-and-publish.mjs"), claim.key, routed.root], {
       cwd: ROOT, detached: true,
+      // 期望身份由这里（接受这条消息的一方）独立给守望者，不让它只信 claim 自报。
+      env: { ...process.env, ...watcherExpectEnv(mapping) },
       stdio: ["ignore",
         fs.openSync(path.join(RUNS, claim.key + ".watch.log"), "a"),
         fs.openSync(path.join(RUNS, claim.key + ".watch.log"), "a")],

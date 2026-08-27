@@ -25,7 +25,7 @@ import { boundedBudgetMs } from "./eligibility-recovery.mjs";
 import { postDeliveryBits } from "./publish-outcome.mjs";
 import { repairCmd } from "./repair-run-claim.mjs";
 import { shellQuote } from "./shell-quote.mjs";
-import { CLAIM_KEY_SHAPE, readClaimState, recordClaimState } from "./claim.mjs";
+import { CLAIM_KEY_SHAPE, readClaimState, readWatcherExpectEnv, recordClaimState } from "./claim.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
@@ -47,6 +47,15 @@ if (!CLAIM_KEY_SHAPE.test(key)) {
   console.error("claim key 不是 claim key 的形状，拒绝");
   process.exit(2);
 }
+// **期望身份由 inbound 在起守望者时独立传入** —— claim 里的 binding / session 字段
+// 彼此自证不算：两个字段一起被改，"交叉核对"就成了自证。缺了就不跑。
+const expected = readWatcherExpectEnv(process.env);
+if (!expected.ok) {
+  console.error("缺少 inbound 传入的期望身份（FEISHU_BRIDGE_EXPECT_BINDING_ID / _CLAUDE_SESSION_ID），拒绝");
+  process.exit(2);
+}
+const EXPECT_BINDING_ID = expected.bindingId;
+const EXPECT_SESSION_ID = expected.claudeSessionId;
 
 // 项目根由调用方传进来。多绑定之后守望者可能在盯任何一个项目的 run，
 // 写死本仓库会让它去读错项目的 run 日志、放错项目的锁、把结果发到错的话题里。
@@ -72,7 +81,8 @@ const finishUp = () => fs.rmSync(LOCK, { recursive: true, force: true });
 // （会话级绑定靠 claude_session_id）—— 缺席/损坏时上一版落到项目级 outbox、
 // 现算当前代际，把一轮结果发到了说不清的地方。结果不发布、落 failed 记录、
 // session lock 保留（runner 可能还活着，交给陈旧检测）。
-const claimState = readClaimState({ claimsDir: CLAIMS, key });
+const claimState = readClaimState({ claimsDir: CLAIMS, key,
+  expect: { bindingId: EXPECT_BINDING_ID, claudeSessionId: EXPECT_SESSION_ID } });
 if (claimState.status !== "valid") {
   const why = claimState.status === "absent" ? "claim 缺席" : "claim 读不出来：" + claimState.why;
   try {
@@ -84,9 +94,31 @@ if (claimState.status !== "valid") {
 }
 const acceptedClaim = claimState.claim;
 const originGenerationId = acceptedClaim.origin_channel_generation_id ?? null;
-const claudeSessionId = acceptedClaim.claude_session_id ?? null;
+// outbox 归属用 inbound 给的期望会话（已与 claim 核对相等），不从 claim 拼路径。
+const claudeSessionId = EXPECT_SESSION_ID;
 const OUTBOX = path.join(ROOT, ".runtime-data", "outbound",
   claudeSessionId ? "outbox-" + claudeSessionId : "outbox");
+
+// **项目解析与身份核对在启动期、任何终态落盘之前。**评审实测：错的 logical task
+// 最终 exit 2，磁盘上却同时留下了 handed_off 与 failed —— 核对发生在副作用之后。
+// 跟出站其余部分共用同一个解析：项目目录里有配置就用它，
+// 没有就回落到「机器模板 + 登记表那一行」。登记表接入的项目这里没有文件可读。
+const resolved = resolveProject({ root: ROOT, claudeSessionId });
+if (!resolved.ok || !resolved.config) {
+  console.error("读不到这个项目的链路配置（" + (resolved.reason ?? resolved.configError?.reason) + "）—— 不跑。session lock 保留。");
+  process.exit(2);
+}
+const cfg = resolved.config;
+const mapping = resolved.mapping;
+if (acceptedClaim.logical_task_key !== cfg.logical_task_key) {
+  try {
+    recordClaimState({ claimsDir: CLAIMS, key, state: "failed",
+      detail: { reason: "claim_unreadable", why: "logical_task_key 跟这个项目对不上",
+        observed_by: "watch-and-publish" } });
+  } catch { /* 记不上不改变结论 */ }
+  console.error("这一轮的 claim 说不清（logical_task_key 跟这个项目对不上）—— 结果不发布。session lock 保留。");
+  process.exit(2);
+}
 
 /**
  * **发布等待预算**：兜底定时器可能正好在排空同一个 outbox，等它而不是抢。
@@ -131,24 +163,6 @@ while (true) {
       });
     }
 
-    // 跟出站其余部分共用同一个解析：项目目录里有配置就用它，
-    // 没有就回落到「机器模板 + 登记表那一行」。登记表接入的项目这里没有文件可读。
-    const resolved = resolveProject({ root: ROOT, claudeSessionId });
-    if (!resolved.ok || !resolved.config) {
-      throw new Error("读不到这个项目的链路配置（" + (resolved.reason ?? resolved.configError?.reason) + "）");
-    }
-    const cfg = resolved.config;
-    // claim 说的逻辑 task 要跟这个项目的配置对得上 —— 对不上就是别人的 claim。
-    if (acceptedClaim.logical_task_key !== cfg.logical_task_key) {
-      try {
-        recordClaimState({ claimsDir: CLAIMS, key, state: "failed",
-          detail: { reason: "claim_unreadable", why: "logical_task_key 跟这个项目对不上",
-            observed_by: "watch-and-publish" } });
-      } catch { /* 记不上不改变结论 */ }
-      console.error("这一轮的 claim 说不清（logical_task_key 跟这个项目对不上）—— 结果不发布。session lock 保留。");
-      process.exit(2);
-    }
-    const mapping = resolved.mapping;
     const run = scanRuns({ runsDir: RUNS }).find((r) => r.key === key);
 
     // ============ 两条发布通道（R2b1 定稿的显式语义） ============

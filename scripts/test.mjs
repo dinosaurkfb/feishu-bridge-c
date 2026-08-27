@@ -24,7 +24,10 @@ import { NOTE_MAX, resolveUntil, validateNote } from "./binding.mjs";
 import {
   ENVELOPE_ENV as ENV_PASS, FETCH_BACKOFF_MS, RECENT_TURNS, buildEventsArgs, fetchTriggerEvent, inheritedEvent,
 } from "./envelope.mjs";
-import { acquireClaim, claimKey, readClaim, readClaimState, recordClaimState } from "./claim.mjs";
+import {
+  acquireClaim, claimKey, readClaim, readClaimState, readWatcherExpectEnv, recordClaimState,
+  watcherExpectEnv,
+} from "./claim.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
   acquirePublishLock, attributeSession, exactProjectsForRoot, fileContainsAny, isUnder,
@@ -289,15 +292,37 @@ let recSeq = 0;
  * 一张**像真的** claim（acquireClaim 写出来的形状）。已有就不动 —— 有的测试自己写了
  * 带 policy 的那张。生产里 claim 先于 watcher 存在；缺了它 watcher 现在会 fail-closed。
  */
+/**
+ * claim key 只能从身份字段推导（claimKey(message_id, logical_task_key)），夹具也不许
+ * 拿任意 64 位 hex 当 key —— 那种 claim 生产造不出来。用 claimKeyFor 造 key 并登记
+ * 它的 message_id，writeClaimFixture 据此写出一张像真的 claim。
+ */
+const KEY_MESSAGE = new Map();
+function claimKeyFor(label, logicalTaskKey = "k") {
+  const messageId = "om_" + label;
+  const key = claimKey(messageId, logicalTaskKey);
+  KEY_MESSAGE.set(key, { messageId, logicalTaskKey });
+  return key;
+}
+/** inbound 起守望者时传入的期望身份 —— 测试里直接起 watcher 也得给，缺了 watcher 拒跑。 */
+const FIXTURE_BINDING_ID = "binding-fixture";
+const WATCHER_EXPECT_ENV = Object.freeze({
+  FEISHU_BRIDGE_EXPECT_BINDING_ID: FIXTURE_BINDING_ID,
+  FEISHU_BRIDGE_EXPECT_CLAUDE_SESSION_ID: "",
+});
 function writeClaimFixture({ claimsDir, key, patch = {} }) {
   const dir = path.join(claimsDir, key + ".claim");
   const file = path.join(dir, "claim.json");
   if (fs.existsSync(file)) return file;
+  const identity = KEY_MESSAGE.get(key);
+  if (!identity) throw new Error("夹具要用 claimKeyFor 造的 key：" + key.slice(0, 8));
   fs.mkdirSync(dir, { recursive: true });
+  const policyId = patch.policy_id ?? "mapping";
   fs.writeFileSync(file, JSON.stringify({
-    schema_version: "1.0", state: "claimed", claim_key: key, message_id: "om_" + key.slice(0, 8),
-    logical_task_key: "k", claimed_at: "2026-08-27T00:00:00.000Z",
-    policy_id: "single", origin_channel_generation_id: "gen-1", claude_session_id: null, ...patch,
+    schema_version: "1.0", state: "claimed", claim_key: key, message_id: identity.messageId,
+    logical_task_key: identity.logicalTaskKey, claimed_at: "2026-08-27T00:00:00.000Z",
+    binding_id: FIXTURE_BINDING_ID, policy_id: policyId, policy_version: "1.0",
+    origin_channel_generation_id: "gen-1", claude_session_id: null, ...patch,
   }));
   return file;
 }
@@ -11854,14 +11879,14 @@ test("watcher 的例外：坏 outbox 整批不发，但 run 结果**真的发出
   fs.writeFileSync(bad, "{ 这不是 JSON");
   const badBefore = fs.readFileSync(bad, "utf-8");
 
-  const key = "c".repeat(64);
+  const key = claimKeyFor("c");
   fs.writeFileSync(path.join(runs, key + ".jsonl"),
     JSON.stringify({ type: "result", is_error: false, result: "这一轮的结果" }) + "\n");
 
   writeClaimFixture({ claimsDir: path.join(dir, ".runtime-data", "inbound", "delivery-claims"), key });
   const r = spawnSync(process.execPath,
     [path.resolve("scripts", "watch-and-publish.mjs"), key, dir],
-    { encoding: "utf-8", env: { ...process.env, HOME: dir }, timeout: 60_000 });
+    { encoding: "utf-8", env: { ...process.env, ...WATCHER_EXPECT_ENV, HOME: dir }, timeout: 60_000 });
   assert.equal(r.status, 0, "进程要正常退出：" + (r.stdout ?? "") + (r.stderr ?? ""));
 
   const all = (r.stdout ?? "") + (r.stderr ?? "");
@@ -12460,7 +12485,7 @@ test("预览只许读一次盘：两次读之间被同名替换，摘要必须�
 
 test("readClaimState：三态 —— 缺席、有效、读不出/对不上各自说清", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-claim3-"));
-  const key = "c".repeat(64);
+  const key = claimKeyFor("unit");
   assert.deepEqual(readClaimState({ claimsDir: dir, key }), { status: "absent" });
   const f = writeClaimFixture({ claimsDir: dir, key, patch: { origin_channel_generation_id: "gen-1" } });
   const ok = readClaimState({ claimsDir: dir, key });
@@ -12477,10 +12502,18 @@ test("readClaimState：三态 —— 缺席、有效、读不出/对不上各自
     ["缺 message_id", without("message_id"), /message_id 缺失或为空/u],
     ["缺 logical_task_key", without("logical_task_key"), /logical_task_key 缺失或为空/u],
     ["claimed_at 不是规范时间", JSON.stringify({ ...full, claimed_at: "刚才" }), /claimed_at 不是规范时间/u],
-    ["policy_id 空", JSON.stringify({ ...full, policy_id: "" }), /policy_id 缺失或为空/u],
+    ["policy_id 空", JSON.stringify({ ...full, policy_id: "" }), /policy_id 不在受控取值里/u],
     ["来源代际空白", JSON.stringify({ ...full, origin_channel_generation_id: "   " }), /不是可用代际/u],
     ["缺来源代际", without("origin_channel_generation_id"), /不是可用代际/u],
-    ["claude_session_id 形状不对", JSON.stringify({ ...full, claude_session_id: 7 }), /claude_session_id 形状不对/u],
+    ["claude_session_id 不是 uuid", JSON.stringify({ ...full, claude_session_id: "../../../../escape" }),
+      /claude_session_id 不是会话 uuid 的形状/u],
+    // **key 要能从身份字段推导出来**：字段齐全但 message_id 换了，key 就不是它的。
+    ["key 与 message/task 无关", JSON.stringify({ ...full, message_id: "om_别人的" }),
+      /claim_key 不是由 message_id 与 logical_task_key 推导出来的/u],
+    ["policy_id 不受控", JSON.stringify({ ...full, policy_id: "single" }), /policy_id 不在受控取值里/u],
+    ["policy_version 对不上", JSON.stringify({ ...full, policy_version: "9" }), /policy_version 跟 policy_id 对不上/u],
+    ["缺 policy_version", without("policy_version"), /policy_version 跟 policy_id 对不上/u],
+    ["binding_id 空", JSON.stringify({ ...full, binding_id: "" }), /binding_id 形状不对/u],
   ]) {
     fs.writeFileSync(f, content);
     const r = readClaimState({ claimsDir: dir, key });
@@ -12495,6 +12528,13 @@ test("readClaimState：三态 —— 缺席、有效、读不出/对不上各自
     /logical_task_key 跟这个 task 对不上/u);
   assert.match(readClaimState({ claimsDir: dir, key, expect: { codexThreadId: "th-x" } }).why,
     /codex_thread_id 跟这个 task 对不上/u);
+  assert.match(readClaimState({ claimsDir: dir, key, expect: { bindingId: "别的 binding" } }).why,
+    /binding_id 跟 inbound 给的期望对不上/u);
+  assert.match(readClaimState({ claimsDir: dir, key,
+    expect: { claudeSessionId: "01911111-2222-7333-8444-555555555555" } }).why,
+    /claude_session_id 跟 inbound 给的期望对不上/u);
+  assert.equal(readClaimState({ claimsDir: dir, key,
+    expect: { bindingId: FIXTURE_BINDING_ID, claudeSessionId: null } }).status, "valid");
   // key 形状守在读写核心：不派生路径、不写盘。
   assert.match(readClaimState({ claimsDir: dir, key: "../../escape" }).why, /key 不是 claim key 的形状/u);
   assert.throws(() => recordClaimState({ claimsDir: dir, key: "../../escape", state: "failed",
@@ -12849,7 +12889,7 @@ const watcherMatrixRunner = {
       attempt(behavior) {
         fs.writeFileSync(modeFile, behavior);
         turn += 1;
-        const key = String(turn % 10).repeat(64).slice(0, 64);
+        const key = claimKeyFor("turn" + turn);
         fs.writeFileSync(path.join(runs, key + ".jsonl"),
           JSON.stringify({ type: "result", is_error: false, result: "第 " + turn + " 轮" }) + "\n");
         const before = fs.existsSync(argsFile)
@@ -12857,7 +12897,7 @@ const watcherMatrixRunner = {
         writeClaimFixture({ claimsDir: path.join(dir, ".runtime-data", "inbound", "delivery-claims"), key });
         const r = spawnSync(process.execPath,
           [path.resolve("scripts", "watch-and-publish.mjs"), key, dir],
-          { encoding: "utf-8", env: { ...process.env, HOME: dir }, timeout: 60_000 });
+          { encoding: "utf-8", env: { ...process.env, ...WATCHER_EXPECT_ENV, HOME: dir }, timeout: 60_000 });
         assert.equal(r.status, 0, "watcher 进程要正常退出：" + (r.stderr ?? "").slice(0, 300));
         const after = fs.readFileSync(argsFile, "utf-8").split("\n").filter(Boolean);
         const fresh = after.slice(before.length);
@@ -14176,7 +14216,7 @@ test("Claude watcher：claim 说不清就不发布、不猜 outbox 归属、留 
     const h = watcherMatrixRunner.fixture();
     const rt = path.join(h.dir, ".runtime-data", "inbound");
     const claims = path.join(rt, "delivery-claims");
-    const key = "f".repeat(64);
+    const key = claimKeyFor("f");
     fs.writeFileSync(path.join(rt, "runs", key + ".jsonl"),
       JSON.stringify({ type: "result", is_error: false, result: "这一轮的结果" }) + "\n");
     fs.mkdirSync(path.join(claims, key + ".claim"), { recursive: true });
@@ -14185,7 +14225,7 @@ test("Claude watcher：claim 说不清就不发布、不猜 outbox 归属、留 
     fs.mkdirSync(lock, { recursive: true });
     const r = spawnSync(process.execPath,
       [path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir],
-      { encoding: "utf-8", env: { ...process.env, HOME: h.dir }, timeout: 60_000 });
+      { encoding: "utf-8", env: { ...process.env, ...WATCHER_EXPECT_ENV, HOME: h.dir }, timeout: 60_000 });
     assert.equal(r.status, 2, why + "：" + r.stderr);
     assert.match(r.stderr, /claim 说不清/u, why);
     assert.equal(fs.existsSync(path.join(rt, "runs", key + ".published.json")), false,
@@ -14206,7 +14246,7 @@ test("Claude watcher：key 形状不对在任何路径派生前拒绝 —— 目
   for (const bad of ["../../escape", "k1", "A".repeat(64)]) {
     const r = spawnSync(process.execPath,
       [path.resolve("scripts", "watch-and-publish.mjs"), bad, h.dir],
-      { encoding: "utf-8", env: { ...process.env, HOME: h.dir }, timeout: 60_000 });
+      { encoding: "utf-8", env: { ...process.env, ...WATCHER_EXPECT_ENV, HOME: h.dir }, timeout: 60_000 });
     assert.equal(r.status, 2, JSON.stringify(bad) + "：" + r.stderr);
     assert.match(r.stderr, /claim key 的形状/u, JSON.stringify(bad));
   }
@@ -14214,6 +14254,63 @@ test("Claude watcher：key 形状不对在任何路径派生前拒绝 —— 目
     "**目录外零文件**");
   assert.deepEqual(fs.readdirSync(path.join(rt, "delivery-claims")), [], "claims 目录零文件");
   assert.equal(fs.existsSync(lock), true, "控制面零改动：锁不动");
+});
+
+test("期望身份的 env 契约只有一份：inbound 写、watcher 读，往返一致；inbound 的起点必须引用它", () => {
+  // 两侧各写一份变量名就会有一边拼错而静默失效 —— 这里钉住往返与两个边界值。
+  for (const [why, mapping, want] of [
+    ["项目级绑定（无会话）", { binding_id: "b-1", claude_session_id: null },
+      { ok: true, bindingId: "b-1", claudeSessionId: null }],
+    ["会话级绑定", { binding_id: "b-2", claude_session_id: "01911111-2222-7333-8444-555555555555" },
+      { ok: true, bindingId: "b-2", claudeSessionId: "01911111-2222-7333-8444-555555555555" }],
+  ]) {
+    assert.deepEqual(readWatcherExpectEnv({ ...process.env, ...watcherExpectEnv(mapping) }), want, why);
+  }
+  assert.equal(readWatcherExpectEnv({}).ok, false, "缺变量 = 没给");
+  assert.equal(readWatcherExpectEnv(watcherExpectEnv({ binding_id: "", claude_session_id: null })).ok, false,
+    "binding 空串也算没给");
+  // **限度说明**：真实 inbound → watcher 的端到端没有夹具（要走 Aily 事件与真实 handoff）。
+  // 这里只能钉住"inbound 起守望者那一处引用了共用契约"—— 是源码断言，不是行为测试。
+  const src = fs.readFileSync(path.resolve("scripts", "inbound.mjs"), "utf-8");
+  const at = src.indexOf('"watch-and-publish.mjs"');
+  assert.ok(at > 0, "inbound 要起 watch-and-publish");
+  assert.ok(src.slice(at, at + 600).includes("watcherExpectEnv(mapping)"),
+    "**inbound 起守望者时必须用共用契约传期望身份** —— 单独拼变量名迟早跟读侧分叉");
+});
+
+test("Claude watcher：期望身份对不上或缺席 → 启动期拒绝，零终态落盘、零 Dialogue 收口（真实进程）", () => {
+  // 评审实测：错的 logical task 最终 exit 2，磁盘上却同时留下 handed_off 与 failed ——
+  // 核对发生在终态副作用之后。现在一切核验在启动期。
+  const cases = [
+    ["binding 对不上", { ...WATCHER_EXPECT_ENV, FEISHU_BRIDGE_EXPECT_BINDING_ID: "别的 binding" }, /binding_id/u],
+    ["session 对不上", { ...WATCHER_EXPECT_ENV,
+      FEISHU_BRIDGE_EXPECT_CLAUDE_SESSION_ID: "01911111-2222-7333-8444-555555555555" }, /claude_session_id/u],
+    ["期望身份缺席", {}, /缺少 inbound 传入的期望身份/u],
+  ];
+  for (const [why, env, pattern] of cases) {
+    const h = watcherMatrixRunner.fixture();
+    const rt = path.join(h.dir, ".runtime-data", "inbound");
+    const claims = path.join(rt, "delivery-claims");
+    const key = claimKeyFor("ident-" + why);
+    fs.writeFileSync(path.join(rt, "runs", key + ".jsonl"),
+      JSON.stringify({ type: "result", is_error: false, result: "这一轮的结果" }) + "\n");
+    writeClaimFixture({ claimsDir: claims, key });
+    const lock = path.join(rt, "session.lock");
+    fs.mkdirSync(lock, { recursive: true });
+    const r = spawnSync(process.execPath,
+      [path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir],
+      { encoding: "utf-8", env: { ...process.env, ...env, HOME: h.dir }, timeout: 60_000 });
+    assert.equal(r.status, 2, why + "：" + r.stderr);
+    assert.match(r.stderr, pattern, why);
+    assert.equal(fs.existsSync(path.join(claims, key + ".handed_off.json")), false,
+      why + "：**核对之前不许落 handed_off**");
+    assert.equal(fs.existsSync(path.join(rt, "runs", key + ".published.json")), false, why + "：不许发");
+    assert.equal(fs.existsSync(lock), true, why + "：锁不动");
+    const files = fs.readdirSync(claims).filter((f) => f.startsWith(key + "."));
+    assert.deepEqual(files.filter((f) => f !== key + ".claim"),
+      why === "期望身份缺席" ? [] : [key + ".failed.json"],
+      why + "：只许留一份 failed 证据（缺期望身份时连它也不写 —— 没做任何路径派生）");
+  }
 });
 
 test("run 通道并发互斥：两个 watcher 同一 run，只许发出一张（真实进程）", () => {
@@ -14228,7 +14325,7 @@ test("run 通道并发互斥：两个 watcher 同一 run，只许发出一张（
   assert.equal(acquirePublishLock(lockDir).ok, true, "锁一直被占：两边都走预算耗尽那条路");
   try {
     const runs = path.join(h.dir, ".runtime-data", "inbound", "runs");
-    const key = "9".repeat(64);
+    const key = claimKeyFor("9");
     fs.writeFileSync(path.join(runs, key + ".jsonl"),
       JSON.stringify({ type: "result", is_error: false, result: "并发那一轮" }) + "\n");
     const orchestrator = path.join(h.dir, "orchestrate.mjs");
@@ -14249,7 +14346,7 @@ test("run 通道并发互斥：两个 watcher 同一 run，只许发出一张（
     writeClaimFixture({ claimsDir: path.join(h.dir, ".runtime-data", "inbound", "delivery-claims"), key });
     const r = spawnSync(process.execPath,
       [orchestrator, path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir],
-      { encoding: "utf-8", env: { ...process.env, HOME: h.dir,
+      { encoding: "utf-8", env: { ...process.env, ...WATCHER_EXPECT_ENV, HOME: h.dir,
         FEISHU_BRIDGE_PUBLISH_WAIT_MS: "500" }, timeout: 90_000 });
     assert.equal(r.status, 0, (r.stderr ?? "").slice(0, 300));
     const parsed = JSON.parse((r.stdout ?? "").trim().split("\n").at(-1));
@@ -14274,7 +14371,7 @@ test("发布锁 io 故障不是竞争：不套「让给持锁方」的话术（�
   h.seed("io 故障时的进展");
   const outbound = path.join(h.dir, ".runtime-data", "outbound");
   const runs = path.join(h.dir, ".runtime-data", "inbound", "runs");
-  const key = "8".repeat(64);
+  const key = claimKeyFor("8");
   fs.writeFileSync(path.join(runs, key + ".jsonl"),
     JSON.stringify({ type: "result", is_error: false, result: "io 故障那一轮" }) + "\n");
   // outbound 目录改只读：acquirePublishLock 的 mkdir 直接 io_error。
@@ -14284,7 +14381,7 @@ test("发布锁 io 故障不是竞争：不套「让给持锁方」的话术（�
     writeClaimFixture({ claimsDir: path.join(h.dir, ".runtime-data", "inbound", "delivery-claims"), key });
     r = spawnSync(process.execPath,
       [path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir],
-      { encoding: "utf-8", env: { ...process.env, HOME: h.dir,
+      { encoding: "utf-8", env: { ...process.env, ...WATCHER_EXPECT_ENV, HOME: h.dir,
         FEISHU_BRIDGE_PUBLISH_WAIT_MS: "500" }, timeout: 60_000 });
   } finally {
     fs.chmodSync(outbound, 0o700);
@@ -14387,14 +14484,14 @@ test("回执三态：损坏回执 fail-closed，不发也不当送达（真实�
   ]) {
     const h = watcherMatrixRunner.fixture();
     const runs = path.join(h.dir, ".runtime-data", "inbound", "runs");
-    const key = "5".repeat(64);
+    const key = claimKeyFor("5");
     fs.writeFileSync(path.join(runs, key + ".jsonl"),
       JSON.stringify({ type: "result", is_error: false, result: "回执坏了那一轮" }) + "\n");
     plant(path.join(runs, key + ".published.json"));
     writeClaimFixture({ claimsDir: path.join(h.dir, ".runtime-data", "inbound", "delivery-claims"), key });
     const r = spawnSync(process.execPath,
       [path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir],
-      { encoding: "utf-8", env: { ...process.env, HOME: h.dir }, timeout: 60_000 });
+      { encoding: "utf-8", env: { ...process.env, ...WATCHER_EXPECT_ENV, HOME: h.dir }, timeout: 60_000 });
     const said = (r.stdout ?? "") + (r.stderr ?? "");
     const argsFile = path.join(h.dir, "lark-calls.jsonl");
     const sent = fs.existsSync(argsFile)
@@ -14452,7 +14549,7 @@ test("reap 锁残留：真实 watcher 要给出锁路径与维护命令，维护
   // run 永久停发却无路可走。闭环三段都要验：报警带路 → 维护核验 → 恢复发布。
   const h = watcherMatrixRunner.fixture();
   const runs = path.join(h.dir, ".runtime-data", "inbound", "runs");
-  const key = "2".repeat(64);
+  const key = claimKeyFor("2");
   fs.writeFileSync(path.join(runs, key + ".jsonl"),
     JSON.stringify({ type: "result", is_error: false, result: "被残留锁拦住那一轮" }) + "\n");
   const claimFile = path.join(runs, key + ".publish-claim.json");
@@ -14467,7 +14564,7 @@ test("reap 锁残留：真实 watcher 要给出锁路径与维护命令，维护
   writeClaimFixture({ claimsDir: path.join(h.dir, ".runtime-data", "inbound", "delivery-claims"), key });
   const r1 = spawnSync(process.execPath,
     [path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir],
-    { encoding: "utf-8", env: { ...process.env, HOME: h.dir }, timeout: 60_000 });
+    { encoding: "utf-8", env: { ...process.env, ...WATCHER_EXPECT_ENV, HOME: h.dir }, timeout: 60_000 });
   const said = (r1.stdout ?? "") + (r1.stderr ?? "");
   const argsFile = path.join(h.dir, "lark-calls.jsonl");
   const sentEarly = fs.existsSync(argsFile)
@@ -14510,7 +14607,7 @@ test("reap 锁残留：真实 watcher 要给出锁路径与维护命令，维护
   writeClaimFixture({ claimsDir: path.join(h.dir, ".runtime-data", "inbound", "delivery-claims"), key });
   const r2 = spawnSync(process.execPath,
     [path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir],
-    { encoding: "utf-8", env: { ...process.env, HOME: h.dir }, timeout: 60_000 });
+    { encoding: "utf-8", env: { ...process.env, ...WATCHER_EXPECT_ENV, HOME: h.dir }, timeout: 60_000 });
   void r2;
   const sent = fs.readFileSync(argsFile, "utf-8").split("\n")
     .filter((l) => l.includes("被残留锁拦住那一轮"));
@@ -14638,7 +14735,7 @@ test("维护提示的命令要经得起真 shell：含空格中文引号的项�
   fs.writeFileSync(path.join(rt, "active-mapping.json"), JSON.stringify({
     status: "active", root_message_id: "om_fixture", claude_session_id: null,
     channel_generation_id: "gen-1", expires_at: "2099-01-01T00:00:00.000Z" }));
-  const key = "0".repeat(64);
+  const key = claimKeyFor("0");
   fs.writeFileSync(path.join(runs, key + ".jsonl"),
     JSON.stringify({ type: "result", is_error: false, result: "路径刁钻那一轮" }) + "\n");
   const claimFile = path.join(runs, key + ".publish-claim.json");
@@ -14652,7 +14749,7 @@ test("维护提示的命令要经得起真 shell：含空格中文引号的项�
   writeClaimFixture({ claimsDir: path.join(root, ".runtime-data", "inbound", "delivery-claims"), key });
   const r1 = spawnSync(process.execPath,
     [path.resolve("scripts", "watch-and-publish.mjs"), key, root],
-    { encoding: "utf-8", env: { ...process.env, HOME: root }, timeout: 60_000 });
+    { encoding: "utf-8", env: { ...process.env, ...WATCHER_EXPECT_ENV, HOME: root }, timeout: 60_000 });
   const said = (r1.stdout ?? "") + (r1.stderr ?? "");
   // detail 行也提到入口名 —— 只认以 node 开头的那行命令。
   const cmdLine = (said.split("\n").map((l) => l.trim())

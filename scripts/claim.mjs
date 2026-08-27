@@ -10,6 +10,8 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { isCanonicalIso } from "./canonical-time.mjs";
+import { DIALOGUE_POLICY_ID, DIALOGUE_POLICY_VERSION } from "./interaction-policy.mjs";
+import { MAPPING_POLICY_ID, MAPPING_POLICY_VERSION } from "./mapping-policy.mjs";
 import { usableGeneration } from "./topic-generation.mjs";
 import path from "node:path";
 
@@ -106,6 +108,13 @@ export function recordClaimState({ claimsDir, key, state, detail }) {
  * 正是 R2b1 回执三态那一课（第 5 层步骤 2 复核发现）。
  */
 const nonEmpty = (v) => typeof v === "string" && v.length > 0;
+/** Claude 会话 id 是 Claude Code 的 uuid —— 它会参与 outbox 路径拼接，形状必须路径安全。 */
+const CLAUDE_SESSION_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+/** 受控的策略 id/version 组合 —— 未知 policy 会绕开 dialogue 专属收口却继续走发布路径，不是无害扩展。 */
+const POLICY_VERSIONS = Object.freeze({
+  [MAPPING_POLICY_ID]: MAPPING_POLICY_VERSION,
+  [DIALOGUE_POLICY_ID]: DIALOGUE_POLICY_VERSION,
+});
 
 /**
  * 一张 claim 要能被**解释**才算 valid：不只是"claim_key 对得上"。
@@ -122,16 +131,31 @@ function claimProblem(claim, key, expect) {
   if (!nonEmpty(claim.message_id)) return "message_id 缺失或为空";
   if (!nonEmpty(claim.logical_task_key)) return "logical_task_key 缺失或为空";
   if (!isCanonicalIso(claim.claimed_at)) return "claimed_at 不是规范时间";
-  if (!nonEmpty(claim.policy_id)) return "policy_id 缺失或为空";
+  // **key 要能从身份字段重新推导出来** —— 只比 claim_key===文件名，一张字段齐全
+  // 但 key 与 message/task 无关的 claim 照样 valid（评审探针）。
+  if (claimKey(claim.message_id, claim.logical_task_key) !== key) {
+    return "claim_key 不是由 message_id 与 logical_task_key 推导出来的";
+  }
+  if (!Object.hasOwn(POLICY_VERSIONS, claim.policy_id)) return "policy_id 不在受控取值里";
+  if (claim.policy_version !== POLICY_VERSIONS[claim.policy_id]) return "policy_version 跟 policy_id 对不上";
   if (!usableGeneration(claim.origin_channel_generation_id)) return "origin_channel_generation_id 不是可用代际";
+  if (claim.binding_id !== undefined && !nonEmpty(claim.binding_id)) return "binding_id 形状不对";
   if (claim.claude_session_id !== undefined && claim.claude_session_id !== null
-    && !nonEmpty(claim.claude_session_id)) return "claude_session_id 形状不对";
+    && !CLAUDE_SESSION_SHAPE.test(claim.claude_session_id)) return "claude_session_id 不是会话 uuid 的形状";
   if (claim.codex_thread_id !== undefined && !nonEmpty(claim.codex_thread_id)) return "codex_thread_id 形状不对";
   if (expect.logicalTaskKey !== undefined && claim.logical_task_key !== expect.logicalTaskKey) {
     return "logical_task_key 跟这个 task 对不上";
   }
   if (expect.codexThreadId !== undefined && claim.codex_thread_id !== expect.codexThreadId) {
     return "codex_thread_id 跟这个 task 对不上";
+  }
+  // Claude 侧的期望身份由 inbound 在起 watcher 时独立传入 —— claim 内字段彼此自证不算。
+  if (expect.bindingId !== undefined && claim.binding_id !== expect.bindingId) {
+    return "binding_id 跟 inbound 给的期望对不上";
+  }
+  if (expect.claudeSessionId !== undefined
+    && (claim.claude_session_id ?? null) !== expect.claudeSessionId) {
+    return "claude_session_id 跟 inbound 给的期望对不上";
   }
   return null;
 }
@@ -157,6 +181,26 @@ export function readClaimState({ claimsDir, key, expect = {} }) {
   const problem = claimProblem(claim, key, expect);
   if (problem !== null) return { status: "unreadable", why: problem };
   return { status: "valid", claim };
+}
+
+/**
+ * inbound 起 Claude 守望者时传入的**期望身份** —— 两侧共用这一份契约，
+ * 各写一份就会有一边漏掉/拼错变量名而静默失效。
+ * 空会话（项目级绑定）编码成空串："" 明确表示"期望没有会话"，缺变量才是"没给"。
+ */
+const EXPECT_BINDING_VAR = "FEISHU_BRIDGE_EXPECT_BINDING_ID";
+const EXPECT_SESSION_VAR = "FEISHU_BRIDGE_EXPECT_CLAUDE_SESSION_ID";
+export function watcherExpectEnv(mapping) {
+  return {
+    [EXPECT_BINDING_VAR]: String(mapping?.binding_id ?? ""),
+    [EXPECT_SESSION_VAR]: mapping?.claude_session_id ?? "",
+  };
+}
+export function readWatcherExpectEnv(env) {
+  const bindingId = env?.[EXPECT_BINDING_VAR];
+  const sessionRaw = env?.[EXPECT_SESSION_VAR];
+  if (!nonEmpty(bindingId) || typeof sessionRaw !== "string") return { ok: false, reason: "expect_identity_missing" };
+  return { ok: true, bindingId, claudeSessionId: sessionRaw === "" ? null : sessionRaw };
 }
 
 /** 两态视图（只给不做授权决定的读方）：valid 才给 claim，其余一律 null。 */

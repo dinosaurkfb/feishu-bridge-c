@@ -4,14 +4,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { isDirectRun } from "../direct-run.mjs";
+import { isDirectRun, moduleDir } from "../direct-run.mjs";
 
 import {
   bridgeHome, findRegisteredTaskForCodexThread, loadCodexTemplate, recordThreadActivity, taskPaths,
 } from "./state.mjs";
 import { storeTurnInput } from "../turn-input.mjs";
 import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
-import { codexRuntimeRoot } from "../runtime-install.mjs";
 import { buildIntentParams, issueIntent } from "./intent.mjs";
 
 /**
@@ -117,9 +116,16 @@ const WRITE_ACTIONS = new Set(["bind", "unbind", "rotate", "mode"]);
 const intentArg = (intentId) =>
   typeof intentId === "string" && intentId ? " --intent " + shellQuote(intentId) : "";
 
-const runtimeScriptsRoot = () =>
-  path.join(codexRuntimeRoot(process.env.CODEX_HOME || path.join(os.homedir(), ".codex")),
-    "current");
+/**
+ * **从钩子自己所在的位置推 runtime 根，不看 CODEX_HOME。**
+ *
+ * 上一版用 codexRuntimeRoot(process.env.CODEX_HOME) 拼：真机上 Aily 现在给每个会话一个专属的
+ * CODEX_HOME（~/.aily-cli/session/<会话>/workdir/.aily-cli/codex-homes/<hash>），那里没装桥 ——
+ * 于是钩子本身从真机 runtime 被加载并执行，注入的命令却指向一个不存在的路径，Codex 把
+ * MODULE_NOT_FOUND 的栈原样当成回复发回了话题（2026-08-28 真机实测）。
+ * 钩子是从哪份代码被加载的，就把同一份代码里的脚本交出去 —— 与 Claude 侧 inbound-hook 同一条规矩。
+ */
+const runtimeScriptsRoot = () => path.resolve(moduleDir(import.meta.url), "..", "..");
 
 export function composeBindingContext({ bridgeRoot, cwd, threadId, chatName, intentId }) {
   const apply = path.join(bridgeRoot, "scripts", "codex", "bind-task.mjs");

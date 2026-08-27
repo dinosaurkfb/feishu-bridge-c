@@ -95,6 +95,7 @@ import {
   validateCodexTemplate, validateRegistryTasks, writeRegistryFixtureUnvalidated,
 } from "./state.mjs";
 import { ROTATION_STATUS, activeGeneration, pendingGeneration } from "../topic-generation.mjs";
+import { applyRuntimeSync, planRuntimeSync } from "../runtime-install.mjs";
 import { DIALOGUE_TURN_STATUS } from "../interaction-policy.mjs";
 import {
   RELAY_DISPOSITION, RELAY_STEP_STATUS, advanceRelayPlan, createParticipantAuthorizationSnapshot,
@@ -1755,8 +1756,24 @@ test("Prompt hook 在 Aily/M5Codex 回合只注入数据面命令，不记录 le
   assert.equal(r.status, 0, r.stderr);
   const injected = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
   assert.equal(injected.includes("inbound.mjs"), true);
+  // **注入的命令指向钩子自己所在的那份代码**，不是从 CODEX_HOME 拼出来的。
+  const ownDispatcher = path.join(ROOT, "scripts", "codex", "aily-inbound.mjs");
+  assert.equal(injected.includes(shellQuote(ownDispatcher)), true, "要指向钩子自己那份 aily-inbound.mjs：" + injected);
   // 单引号：JSON.stringify 产出双引号，挡得住空格但挡不住 $ / 反引号 / 反斜杠。
   assert.equal(injected.includes("FEISHU_CODEX_BRIDGE_HOME=" + shellQuote(home)), true);
+  // 真机实测（2026-08-28）：Aily 给每个会话一个专属 CODEX_HOME，那里没装桥 —— 命令若从 CODEX_HOME 拼，
+  // 就指向不存在的文件，Codex 把 MODULE_NOT_FOUND 原样发回话题。所以 CODEX_HOME 指到空目录时也必须指向自己那份。
+  const sessionHome = path.join(home, "aily-session-codex-home"); fs.mkdirSync(sessionHome, { recursive: true });
+  const r2 = spawnSync(process.execPath, [hook], {
+    input: JSON.stringify({ session_id: THREAD_B, turn_id: "turn_aily2", cwd: "/Users/test/aily_workspaces/m5codex", prompt: "收到" }),
+    encoding: "utf-8",
+    env: { ...isolatedEnv(), CODEX_HOME: sessionHome, FEISHU_CODEX_BRIDGE_HOME: home,
+      AILY_CLI_SESSION_ID: "session_feishu", AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid },
+  });
+  assert.equal(r2.status, 0, r2.stderr);
+  const injected2 = JSON.parse(r2.stdout).hookSpecificOutput.additionalContext;
+  assert.equal(injected2.includes(shellQuote(ownDispatcher)), true, "**CODEX_HOME 换成会话专属目录也要指向钩子自己那份**：" + injected2);
+  assert.equal(injected2.includes(sessionHome), false, "不许从 CODEX_HOME 拼命令路径：" + injected2);
   assert.equal(injected.includes("不得运行 bind-preview.mjs"), true);
   assert.equal(fs.existsSync(path.join(home, "active-threads")), false);
 
@@ -4502,19 +4519,29 @@ test("钩子注入的命令必须跑 runtime/current —— 不许按模板的 b
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({
     ...TEMPLATE, bridge_root: "/Users/someone/old-clone/feishu-bridge-c" }));
 
-  const env = isolatedEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home });
-  const runtimeCurrent = path.join(codexHome, "feishu-bridge", "runtime", "current");
+  // **真的装一份 runtime**，从 runtime/current 里启动钩子 —— 钩子从哪份代码被加载，命令就得指向哪份。
+  const runtimeRoot = path.join(codexHome, "feishu-bridge", "runtime");
+  const plan = planRuntimeSync({ sourceRoot: ROOT, chain: "codex", root: runtimeRoot });
+  assert.equal(plan.ok, true, plan.reason ?? "");
+  assert.equal(applyRuntimeSync(plan, { chain: "codex", root: runtimeRoot }).ok, true);
+  const installedHook = path.join(runtimeRoot, "current", "scripts", "codex", "prompt-hook.mjs");
+  // Aily 真机形状（2026-08-28）：CODEX_HOME 指向一个**没装桥**的会话专属目录，而 hooks.json 仍从真机 runtime 加载钩子。
+  const sessionHome = path.join(dir, "aily-session-codex-home"); fs.mkdirSync(sessionHome, { recursive: true });
+  const env = isolatedEnv({ CODEX_HOME: sessionHome, FEISHU_CODEX_BRIDGE_HOME: home });
 
-  const hook = () => spawnSync(process.execPath,
-    [path.join(ROOT, "scripts", "codex", "prompt-hook.mjs")],
+  const hook = () => spawnSync(process.execPath, [installedHook],
     { encoding: "utf-8", env, input: JSON.stringify({
       prompt: "$feishu-status", cwd: root, session_id: THREAD_A, turn_id: "t1" }) });
 
   const before = hook();
+  assert.equal(before.status, 0, before.stderr);
   const ctxBefore = JSON.parse(before.stdout || "{}")
     ?.hookSpecificOutput?.additionalContext ?? "";
-  assert.ok(ctxBefore.includes(runtimeCurrent),
-    "**注入的命令必须指向 runtime/current**：" + ctxBefore);
+  // import.meta.url 解析过符号链接，指向 versions/<v>/…；那正是"钩子自己那份代码"。
+  assert.ok(ctxBefore.includes(path.join(runtimeRoot, "versions")),
+    "**注入的命令必须指向钩子自己所在的那份 runtime**：" + ctxBefore);
+  assert.equal(ctxBefore.includes(sessionHome), false,
+    "**不许从 CODEX_HOME 拼** —— Aily 的会话专属目录里没装桥：" + ctxBefore);
   assert.equal(ctxBefore.includes("old-clone"), false,
     "**不许按模板的 bridge_root 拼** —— 那个字段会漂：" + ctxBefore);
 });

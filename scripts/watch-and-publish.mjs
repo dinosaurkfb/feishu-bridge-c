@@ -15,8 +15,8 @@ import path from "node:path";
 
 import { readRunOutcome } from "./handoff.mjs";
 import {
-  buildDraft, claimRunPublish, deferRunToOutbox, deferralEventKeyFor, markPublished,
-  publishDraft, readRunReceipt, releaseRunPublishClaim, scanRuns,
+  buildDraft, claimRunPublish, markPublished, publishDraft, readRunReceipt,
+  releaseRunPublishClaim, scanRuns,
 } from "./outbound.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { claudeRotationBatchHook } from "./drain-outbox.mjs";
@@ -209,25 +209,17 @@ while (true) {
         return { ok: false, reason: "threw" };
       }
     };
-    let deferred = null;
-    if (!fresh.publishable && run?.shouldPublish) {
-      step("run 结果转入 outbox", () => {
-        // 唯一实现在 outbound.mjs（与定时排空的恢复消费者共用）：claim → preparing →
-        // 写/核对 outbox → committed。失败时 phase 说明现场停在哪一步。
-        const r = deferRunToOutbox({ runsDir: RUNS, outboxDir: OUTBOX, run,
-          taskName: cfg.task_display_name, originGenerationId });
-        deferred = { reason: "mapping_not_active", why: fresh.pausedWhy,
-          outbox_event_key: deferralEventKeyFor(key), queued: r.ok === true,
-          ...(r.ok ? {} : { append: r.reason, phase: r.phase ?? null }) };
-        return r;
-      });
-    }
+    // **暂停时不转交、不另立账本。**run 结果留在 runs 目录保持"待发布"（回执 absent），
+    // 由定时排空充当 run 通道的恢复消费者：恢复绑定后经同一把 claimRunPublish、
+    // 用 claim 里冻结的原始代际发一次、落同一份回执。曾经尝试过"转成 outbox 记录 +
+    // 两阶段转交回执" —— 那是在 run 通道已有的账本（claim 互斥 / 回执三态 / reap 锁）
+    // 旁边又立一本，四轮评审各击穿一处（作用域、dryRun 改盘、枚举入口、失败折叠）。
     step("run 终局落盘", () => {
       recordClaimState({
         claimsDir: CLAIMS, key, state: outcome.state === "completed" ? "handed_off" : "failed",
         detail: { run_state: outcome.state, observed_by: "watch-and-publish",
-          ...(fresh.publishable ? {} : { publish_deferred: deferred ??
-            { reason: "mapping_not_active", why: fresh.pausedWhy, queued: false } }) },
+          ...(fresh.publishable ? {} : { publish_deferred: { reason: "mapping_not_active", why: fresh.pausedWhy,
+            consumer: "drain-outbox run 通道（恢复绑定后经 claimRunPublish 发一次）" } }) },
       });
       return { ok: true };
     });
@@ -249,9 +241,8 @@ while (true) {
     };
 
     if (!fresh.publishable) {
-      console.error("绑定暂停中（" + fresh.pausedWhy + "）—— 本地终局已记录" +
-        (deferred?.queued ? "，run 结果已转入 outbox（" + deferred.outbox_event_key + "）等恢复后发布" : "") +
-        "；两条发布通道都不走。run 已结束，session lock 已释放。");
+      console.error("绑定暂停中（" + fresh.pausedWhy + "）—— 本地终局已记录；两条发布通道都不走，" +
+        "run 结果保留在 runs 目录等恢复后由定时排空经 run 通道发布。run 已结束，session lock 已释放。");
       const code = reportTerminalFailures();
       finishUp();
       process.exit(code);
@@ -315,12 +306,6 @@ while (true) {
           if (claim.ok && receipt.state === "valid") {
             releaseRunPublishClaim({ runsDir: RUNS, key, token: claim.token });
             console.error("run 结果已由另一个 watcher 送达（回执合法），本轮不再发。");
-          } else if (claim.ok && receipt.state === "deferred") {
-            // 所有权已转交 outbox —— 这里再发就是双发。
-            releaseRunPublishClaim({ runsDir: RUNS, key, token: claim.token });
-            console.error(receipt.phase === "committed"
-              ? "run 结果已转交 outbox（" + receipt.eventKey + "），本轮不再走 run 通道。"
-              : "run 结果转交中（未提交，" + receipt.eventKey + "）—— 所有权在转交侧，本轮不走 run 通道；由定时排空补齐。");
           } else if (claim.ok && receipt.state === "unreadable") {
             // **回执说不清 ≠ 没送达。**这时发可能双发、跳过可能漏发 ——
             // fail-closed：不发、报警、留给人核对。

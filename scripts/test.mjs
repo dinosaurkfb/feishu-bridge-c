@@ -50,7 +50,7 @@ import {
 } from "./outbound-card.mjs";
 import {
   PUBLISH_FAILURE, claimRunPublish, classifyPublishFailure, readRunReceipt,
-  releaseRunPublishClaim, scanRuns, prepareDeferral, commitDeferral, deferralEventKeyFor, buildDraft, abandonDeferral, completePendingDeferrals, deferRunToOutbox, parseDirectPublishArgs } from "./outbound.mjs";
+  releaseRunPublishClaim, scanRuns, buildDraft, parseDirectPublishArgs } from "./outbound.mjs";
 import { repairRunClaims } from "./repair-run-claim.mjs";
 import {
   describeDrainOutcome, drainProject, outboxDirOf, suppressCmd, watcherActive,
@@ -14365,61 +14365,6 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
     const lock = path.join(rt, "session.lock");
     fs.mkdirSync(lock, { recursive: true });
     const outboxDir = path.join(h.dir, ".runtime-data", "outbound", "outbox");
-    if (mode === "pause-dup") {
-      // 同键记录已在、但不是这条 run 的内容 —— 转入不许只凭"文件在"就算入队。
-      appendEvent({ outboxDir, kind: "reply", text: "别的内容", source: "someone-else",
-        eventKey: deferralEventKeyFor(key), runId: key });
-    }
-    if (mode === "pause-dup2") {
-      // 一条**真正对得上**的（正文用 buildDraft 算出，跟 watcher 产出的完全一样）
-      // + 一条伪造的同键文件：必须恰好一条，两条就说不清。正文若对不上，
-      // 这条测试会因别的原因红 —— 那就测了个寂寞。
-      // 草稿在临时目录里算 —— 真实 runs 目录的终局日志由编排器在暂停之后才写，
-      // 提前写会让 watcher 抢在暂停前直接完成。
-      const tmpRuns = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-dup2-"));
-      fs.writeFileSync(path.join(tmpRuns, key + ".jsonl"),
-        JSON.stringify({ type: "result", is_error: false, result: "运行中改了" }) + "\n");
-      const cfg = JSON.parse(fs.readFileSync(path.join(rt, "chain-config.json"), "utf-8"));
-      const draft = buildDraft(scanRuns({ runsDir: tmpRuns }).find((r) => r.key === key),
-        { taskName: cfg.task_display_name });
-      assert.ok(draft, "前提：草稿算得出");
-      const r = appendEvent({ outboxDir, kind: "reply", text: draft, source: "claude-run-watcher-deferred",
-        eventKey: deferralEventKeyFor(key), targetGenerationId: "gen-1", runId: key });
-      assert.equal(r.ok, true);
-      fs.copyFileSync(r.file, path.join(outboxDir, "forged-" + key.slice(0, 8) + ".json"));
-    }
-    if (mode === "pause-dup3") {
-      // 四字段碰巧匹配、但缺 schema/id/kind/created_at 的"记录"：排空层会判它损坏 ——
-      // 拿它提交 committed 就是永久停发。必须过正式三态与可解释性校验。
-      const tmpRuns = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-dup3-"));
-      fs.writeFileSync(path.join(tmpRuns, key + ".jsonl"),
-        JSON.stringify({ type: "result", is_error: false, result: "运行中改了" }) + "\n");
-      const cfg = JSON.parse(fs.readFileSync(path.join(rt, "chain-config.json"), "utf-8"));
-      const draft = buildDraft(scanRuns({ runsDir: tmpRuns }).find((r) => r.key === key), { taskName: cfg.task_display_name });
-      fs.mkdirSync(outboxDir, { recursive: true });
-      fs.writeFileSync(path.join(outboxDir, "event-" + createHash("sha256").update("event\n" + deferralEventKeyFor(key)).digest("hex").slice(0, 16) + ".json"),
-        JSON.stringify({ event_key: deferralEventKeyFor(key), run_id: key, source: "claude-run-watcher-deferred",
-          text: draft, target_channel_generation_id: "gen-1", published_at: null }));
-    }
-    const probe = path.join(h.dir, "commit-fail-probe.mjs");
-    if (mode === "pause-commitfail") {
-      // 探针：outbox 正常写入，随后**提交回执**的 rename 失败（EACCES）——
-      // 评审实测的那种普通写盘失败。preparing 必须已经挡住直发。
-      fs.writeFileSync(probe, [
-        'import fs from "node:fs";',
-        'const real = fs.renameSync;',
-        'fs.renameSync = function (from, to) {',
-        '  if (String(to).endsWith(".deferred.json")) { const e = new Error("EACCES"); e.code = "EACCES"; throw e; }',
-        '  return real.call(this, from, to);',
-        '};',
-      ].join("\n"));
-    }
-    if (mode === "pause-ro") {
-      // outbox 路径是个文件：appendEvent 的 mkdir 会抛 —— 抛不能拦住终局落盘与放锁。
-      fs.rmSync(outboxDir, { recursive: true, force: true });
-      fs.mkdirSync(path.dirname(outboxDir), { recursive: true });
-      fs.writeFileSync(outboxDir, "这不是目录");
-    }
     const orchestrator = path.join(h.dir, "orchestrate-" + mode + ".mjs");
     fs.writeFileSync(orchestrator, [
       'import { spawn } from "node:child_process";',
@@ -14427,9 +14372,9 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
       'import path from "node:path";',
       'const [watcher, key, dir, mode] = process.argv.slice(2);',
       'const rt = path.join(dir, ".runtime-data", "inbound");',
-      'const extra = process.env.WATCHER_PROBE ? ["--import", process.env.WATCHER_PROBE] : [];',
-      'const c = spawn(process.execPath, [...extra, watcher, key, dir], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });',
+      'const c = spawn(process.execPath, [watcher, key, dir], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });',
       'let out = ""; c.stdout.on("data", (d) => { out += d; }); c.stderr.on("data", (d) => { out += d; });',
+      'const closed = new Promise((r) => c.on("close", r));',
       'await new Promise((r) => setTimeout(r, 1500));',
       'if (mode === "rotate") {',
       '  const p = path.join(rt, "active-mapping.json");',
@@ -14447,13 +14392,12 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
       '  fs.writeFileSync(p, JSON.stringify({ ...JSON.parse(fs.readFileSync(p, "utf-8")), auto_publish_on_completion: false }));',
       '}',
       'fs.writeFileSync(path.join(rt, "runs", key + ".jsonl"), JSON.stringify({ type: "result", is_error: false, result: "运行中改了" }) + "\\n");',
-      'const code = await new Promise((r) => c.on("close", r));',
+      'const code = await closed;',
       'if (mode === "pause-busy") fs.rmSync(path.join(rt, "topic-generation.lock"), { recursive: true, force: true });',
       'console.log(JSON.stringify({ code, out }));',
     ].join("\n"));
     const r = spawnSync(process.execPath, [orchestrator, path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir, mode],
-      { encoding: "utf-8", env: { ...process.env, ...expectEnvFor(h.dir), HOME: h.dir,
-        ...(mode === "pause-commitfail" ? { WATCHER_PROBE: pathToFileURL(probe).href } : {}) }, timeout: 90_000 });
+      { encoding: "utf-8", env: { ...process.env, ...expectEnvFor(h.dir), HOME: h.dir }, timeout: 90_000 });
     assert.equal(r.status, 0, r.stderr);
     const got = JSON.parse(r.stdout.trim().split("\n").at(-1));
     return { got, rt, key, argsFile: path.join(h.dir, "lark-calls.jsonl"), lock, root: h.dir,
@@ -14469,128 +14413,68 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
     "终局期核对在 handed_off 之前");
   assert.equal(fs.existsSync(rotate.lock), false, "**终局期 run 已结束，锁要放掉** —— 留着只是一把陈旧锁");
 
-  // 运行中把绑定暂停：受控的"不发布"，跟排空路径同一条规矩 —— 不是漂移，也不是失败：
-  // 本地终局照记，run 结果转入 outbox（冻结到原始代际），恢复后由排空恰好发一次。
+  // 运行中把绑定暂停：受控的"不发布"，跟排空路径同一条规矩 —— 不是漂移，也不是失败。
+  // **不转交、不另立账本**：run 结果留在 runs 目录保持"待发布"，由定时排空经 run 通道
+  // 自己的账本（claim 互斥 / 回执三态）在恢复后发一次。
   const pause = orchestrate("pause");
   assert.equal(pause.got.code, 0, "暂停不是故障，是受控不发布：" + pause.got.out);
   assert.match(pause.got.out, /绑定暂停中/u);
   assert.equal(fs.existsSync(pause.argsFile), false, "**零 lark 调用**");
-  assert.equal(fs.existsSync(path.join(pause.rt, "runs", pause.key + ".published.json")), false, "无发布回执");
+  assert.equal(fs.existsSync(path.join(pause.runs, pause.key + ".published.json")), false, "无发布回执");
   const handed = JSON.parse(fs.readFileSync(path.join(pause.rt, "delivery-claims", pause.key + ".handed_off.json"), "utf-8"));
   assert.equal(handed.run_state, "completed", "**真实 run outcome 照记**");
   assert.equal(handed.publish_deferred?.reason, "mapping_not_active");
-  assert.equal(handed.publish_deferred?.queued, true, "要写明已转入 outbox");
   assert.equal(fs.existsSync(pause.lock), false, "run 已结束，锁放掉");
-  // **所有权排他转移**：run 侧落转交回执，run 通道与直发入口共用的 scanRuns 不再消费它。
-  const receipt = readRunReceipt({ runsDir: pause.runs, key: pause.key });
-  assert.equal(receipt.state, "deferred"); assert.equal(receipt.phase, "committed");
   const scanned = scanRuns({ runsDir: pause.runs }).find((r) => r.key === pause.key);
-  assert.equal(scanned.shouldPublish, false, "**直发入口（同用 scanRuns）不许再把它当待发布**");
-  assert.equal(scanned.deferredToOutbox, true);
-  const direct = spawnSync(process.execPath, [path.resolve("scripts", "outbound.mjs"), "--root=" + pause.root],
-    { encoding: "utf-8", env: { ...process.env, HOME: pause.root }, timeout: 60_000 });
-  assert.equal(direct.status, 0, direct.stderr);
-  assert.match(direct.stdout, /已转 outbox/u, "**直发入口要把它列为已转交**：" + direct.stdout);
-  assert.match(direct.stdout, /待发布 0 条/u, direct.stdout);
-  const queued = listPending({ outboxDir: pause.outbox });
-  assert.equal(queued.length, 1, "run 结果要转成恰好一条 outbox 记录");
-  assert.equal(queued[0].target_channel_generation_id, "gen-1", "**冻结到 claim 的原始代际**");
-  assert.equal(queued[0].run_id, pause.key, "run_id 要带上");
-  assert.equal(queued[0].source, "claude-run-watcher-deferred", "source：" + JSON.stringify(queued[0]));
-  // 暂停期间排空也不发；恢复后恰好发一次；再排空为空。
-  // drainProject 没有发布注入口就会打到真实飞书 —— 这里注入假 publish 并计数。
+  assert.equal(scanned.shouldPublish, true, "run 结果保持待发布（回执 absent）—— 这就是恢复消费者的输入");
+  // drainProject 没有发布注入口就会打到真实飞书 —— 注入假 publish 并计数。
   let sent = 0;
-  const drain = () => drainProject({ root: pause.root, claudeSessionId: null,
-    publish: () => { sent += 1; return "om_sent"; }, diagnose: () => null });
-  assert.equal(drain().reason, "mapping_not_active");
-  assert.equal(sent, 0, "暂停中排空不许发");
+  const drain = (opts = {}) => drainProject({ root: pause.root, claudeSessionId: null,
+    publish: () => { sent += 1; return "om_sent"; }, diagnose: () => null, ...opts });
+  // 暂停中：排空不发；dry-run 也零副作用。
+  const paused = drain();
+  assert.equal(paused.reason, "mapping_not_active", JSON.stringify(paused));
+  assert.equal(paused.runs?.pending, 1, "要报出有 run 结果在等");
+  assert.equal(sent, 0);
   const mapPath = path.join(pause.rt, "active-mapping.json");
   fs.writeFileSync(mapPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(mapPath, "utf-8")), status: "active" }));
+  const preview = drain({ dryRun: true });
+  assert.equal(preview.runs?.dryRun, true);
+  assert.equal(preview.runs?.published?.length, 1, "预览要说将经 run 通道发 1 条：" + JSON.stringify(preview));
+  assert.equal(preview.runs.published[0].target, "om_fixture", "目标是 claim 冻结的原始代际");
+  assert.equal(fs.existsSync(path.join(pause.runs, pause.key + ".published.json")), false, "**dry-run 零副作用**");
+  assert.equal(sent, 0, "dry-run 零发送");
+  // **同 root 的另一个绑定（会话 B）排空：不许抢走别人的 run。**
+  const other = drain({ claudeSessionId: "01911111-2222-7333-8444-555555555555" });
+  assert.equal(sent, 0, "**别的绑定不许发这条 run**：" + JSON.stringify(other));
+  assert.equal(other.runs?.skipped?.[0]?.reason, "claim_unreadable", JSON.stringify(other.runs));
+  assert.equal(fs.existsSync(path.join(pause.runs, pause.key + ".published.json")), false);
+  // 恢复后：恰好发一次到原始代际，落回执；再排空为空、不再发。
   const resumed = drain();
   assert.equal(resumed.status, "published", JSON.stringify(resumed));
+  assert.equal(resumed.runs.published.length, 1);
+  assert.equal(resumed.runs.published[0].target, "om_fixture");
   assert.equal(sent, 1, "**恢复后恰好发布一次**");
-  assert.equal(listPending({ outboxDir: pause.outbox }).length, 0, "发完队列为空");
-  assert.equal(drain().status, "empty");
-  assert.equal(sent, 1, "再排空不许再发");
-  assert.equal(scanRuns({ runsDir: pause.runs }).find((r) => r.key === pause.key).shouldPublish, false,
-    "恢复排空之后 run 通道仍不许再发（转交回执还在）");
-  const direct2 = spawnSync(process.execPath, [path.resolve("scripts", "outbound.mjs"), "--root=" + pause.root],
+  assert.equal(readRunReceipt({ runsDir: pause.runs, key: pause.key }).state, "valid", "落 run 通道自己的回执");
+  assert.equal(drain().status, "empty"); assert.equal(sent, 1, "再排空不许再发");
+  const direct = spawnSync(process.execPath, [path.resolve("scripts", "outbound.mjs"), "--root=" + pause.root],
     { encoding: "utf-8", env: { ...process.env, HOME: pause.root }, timeout: 60_000 });
-  assert.match(direct2.stdout, /待发布 0 条/u, "**恢复排空后直发入口仍 0 条待发布**：" + direct2.stdout);
+  assert.match(direct.stdout, /已发布/u, direct.stdout);
+  assert.match(direct.stdout, /待发布 0 条/u, "**直发入口也看同一份回执**：" + direct.stdout);
+  // 排空结果的渲染要把 run 通道说出来，卡住的要标错。
+  assert.match(describeDrainOutcome(resumed, { root: pause.root }).text, /run 通道已发布 1 条/u);
+  const stuckRender = describeDrainOutcome({ status: "empty", root: pause.root,
+    runs: { pending: 1, published: [], skipped: [], stuck: [{ key: pause.key, reason: "reap_lock_held", why: "x" }] } },
+    { root: pause.root });
+  assert.equal(stuckRender.error, true, "**run 通道卡住不许被折叠成空**");
+  assert.match(stuckRender.text, /卡住.*reap_lock_held/su);
 
-  // 转入 outbox 撞上同键但不同内容的记录：不算入队、不落转交回执，但终局照记、锁照放、非零退出点名。
-  const dup = orchestrate("pause-dup");
-  assert.equal(dup.got.code, 1, "有环节没完成要非零退出：" + dup.got.out);
-  assert.match(dup.got.out, /以下环节没完成.*run 结果转入 outbox（duplicate_mismatch）/u, dup.got.out);
-  const dupHanded = JSON.parse(fs.readFileSync(path.join(dup.rt, "delivery-claims", dup.key + ".handed_off.json"), "utf-8"));
-  assert.equal(dupHanded.run_state, "completed", "终局照记");
-  assert.equal(dupHanded.publish_deferred?.queued, false, "**只凭同键文件在不算入队**");
-  assert.equal(readRunReceipt({ runsDir: dup.runs, key: dup.key }).phase, "preparing", "所有权已取得但未提交");
-  const dupScan = scanRuns({ runsDir: dup.runs }).find((r) => r.key === dup.key);
-  assert.equal(dupScan.shouldPublish, false, "**preparing 也挡住直发**");
-  assert.equal(dupScan.deferredToOutbox, false, "preparing 不许显示成已转 outbox");
-  assert.equal(dupScan.deferralPending, true);
-  assert.equal(claimRunPublish({ runsDir: dup.runs, key: dup.key }).ok, true, "失败退出后 claim 已释放");
-  assert.equal(fs.existsSync(dup.lock), false, "锁照放");
-  assert.equal(fs.existsSync(dup.argsFile), false, "零 lark");
-
-  // outbox 不可写：转入抛错不能截断终局落盘与放锁。
-  const ro = orchestrate("pause-ro");
-  assert.equal(ro.got.code, 1, ro.got.out);
-  assert.match(ro.got.out, /以下环节没完成.*run 结果转入 outbox（outbox_write_failed）/u, ro.got.out);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(ro.rt, "delivery-claims", ro.key + ".handed_off.json"), "utf-8"))
-    .run_state, "completed", "**outbox 抛了也要把 run 终局记下**");
-  assert.equal(readRunReceipt({ runsDir: ro.runs, key: ro.key }).phase, "preparing", "outbox 没写成，所有权停在 preparing");
-  assert.equal(fs.existsSync(ro.lock), false, "**锁要放**");
-  // 直发入口把它列为「转交中（未提交）」，不是「已转 outbox」。
-  const roCli = spawnSync(process.execPath, [path.resolve("scripts", "outbound.mjs"), "--root=" + ro.root],
-    { encoding: "utf-8", env: { ...process.env, HOME: ro.root }, timeout: 60_000 });
-  assert.match(roCli.stdout, /转交中（未提交）/u, roCli.stdout);
-  assert.match(roCli.stdout, /待发布 0 条/u);
-  // **恢复消费者**：把 outbox 目录修好，定时排空补写/核对/提交；暂停中不发，恢复后恰好发一次。
-  fs.rmSync(ro.outbox, { force: true }); fs.mkdirSync(ro.outbox, { recursive: true });
-  let roSent = 0;
-  const roDrain = () => drainProject({ root: ro.root, claudeSessionId: null,
-    publish: () => { roSent += 1; return "om_sent"; }, diagnose: () => null });
-  const recovered = roDrain();
-  assert.equal(recovered.reason, "mapping_not_active", JSON.stringify(recovered));
-  assert.equal(readRunReceipt({ runsDir: ro.runs, key: ro.key }).phase, "committed", "**排空要把 preparing 补齐到 committed**");
-  assert.equal(listPending({ outboxDir: ro.outbox }).length, 1);
-  assert.equal(roSent, 0, "暂停中补齐不发");
-  const roMap = path.join(ro.rt, "active-mapping.json");
-  fs.writeFileSync(roMap, JSON.stringify({ ...JSON.parse(fs.readFileSync(roMap, "utf-8")), status: "active" }));
-  assert.equal(roDrain().status, "published"); assert.equal(roSent, 1, "恢复后恰好一次");
-  assert.equal(roDrain().status, "empty"); assert.equal(roSent, 1);
-
-  const dup2 = orchestrate("pause-dup2");
-  assert.equal(dup2.got.code, 1, dup2.got.out);
-  assert.match(dup2.got.out, /duplicate_mismatch/u, "**两条同键不算恰好一条**：" + dup2.got.out);
-  assert.equal(readRunReceipt({ runsDir: dup2.runs, key: dup2.key }).phase, "preparing");
-
-  const dup3 = orchestrate("pause-dup3");
-  assert.equal(dup3.got.code, 1, dup3.got.out);
-  assert.match(dup3.got.out, /duplicate_mismatch/u, "**缺 schema/id/kind 的同键记录不算完整合法**：" + dup3.got.out);
-  assert.equal(readRunReceipt({ runsDir: dup3.runs, key: dup3.key }).phase, "preparing");
-
-  const cf = orchestrate("pause-commitfail");
-  assert.equal(cf.got.code, 1, cf.got.out);
-  assert.match(cf.got.out, /run 结果转入 outbox（deferral_commit_failed）/u, cf.got.out);
-  assert.equal(listPending({ outboxDir: cf.outbox }).length, 1, "outbox 记录已在");
-  const cfReceipt = readRunReceipt({ runsDir: cf.runs, key: cf.key });
-  assert.equal(cfReceipt.phase, "preparing", JSON.stringify(cfReceipt));
-  assert.equal(scanRuns({ runsDir: cf.runs }).find((r) => r.key === cf.key).shouldPublish, false,
-    "**提交失败也不许两头都能发**");
-  assert.equal(JSON.parse(fs.readFileSync(path.join(cf.rt, "delivery-claims", cf.key + ".handed_off.json"), "utf-8"))
-    .publish_deferred?.queued, false);
-  assert.equal(fs.existsSync(cf.lock), false, "锁照放");
-
-  // Dialogue 收口撞上 binding 锁：其余两步照做、锁照放、非零点名 Dialogue。
+  // Dialogue 收口撞上 binding 锁：终局落盘照做、锁照放、非零点名 Dialogue。
   const busy = orchestrate("pause-busy", { dialogue: true });
   assert.equal(busy.got.code, 1, busy.got.out);
   assert.match(busy.got.out, /以下环节没完成.*Dialogue 收口/u, busy.got.out);
-  const busyHanded = JSON.parse(fs.readFileSync(path.join(busy.rt, "delivery-claims", busy.key + ".handed_off.json"), "utf-8"));
-  assert.equal(busyHanded.publish_deferred?.queued, true, "转入 outbox 不受 Dialogue 失败影响");
-  assert.equal(readRunReceipt({ runsDir: busy.runs, key: busy.key }).state, "deferred");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(busy.rt, "delivery-claims", busy.key + ".handed_off.json"), "utf-8"))
+    .run_state, "completed", "终局照记");
   assert.equal(fs.existsSync(busy.lock), false, "锁照放");
 
   // Dialogue：暂停只管入站和发布，不抹掉已经发生的本地终局 —— 回合要收口。
@@ -14606,89 +14490,7 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
   const flip = orchestrate("flip");
   assert.equal(flip.got.code, 0, "开关关了不是故障，是不发：" + flip.got.out);
   assert.equal(fs.existsSync(flip.argsFile), false, "**运行中关掉自动发布就不许再发**");
-  assert.equal(fs.existsSync(path.join(flip.rt, "runs", flip.key + ".published.json")), false);
-});
-
-test("run 转交回执：与发布共用一笔所有权；合法才算 deferred，形状不对说不清 —— 不发也不当已转交", () => {
-  const runs = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-deferred-"));
-  const key = "d".repeat(64);
-  fs.writeFileSync(path.join(runs, key + ".jsonl"),
-    JSON.stringify({ type: "result", is_error: false, result: "x" }) + "\n");
-  assert.equal(readRunReceipt({ runsDir: runs, key }).state, "absent");
-  // 来源代际必须可用 —— 写方本来就只会产生可用代际，允许集合不能更宽。
-  assert.equal(prepareDeferral({ runsDir: runs, key, originGenerationId: null }).reason, "origin_generation_required");
-  // 发布方持有 claim 时不许创建 preparing。
-  const held = claimRunPublish({ runsDir: runs, key });
-  assert.equal(held.ok, true);
-  assert.equal(prepareDeferral({ runsDir: runs, key, originGenerationId: "gen-1" }).reason, "publish_claim_held");
-  assert.equal(readRunReceipt({ runsDir: runs, key }).state, "absent", "**被占时零 preparing**");
-  releaseRunPublishClaim({ runsDir: runs, key, token: held.token });
-  const prep = prepareDeferral({ runsDir: runs, key, originGenerationId: "gen-1" });
-  assert.equal(prep.ok, true); assert.equal(prep.phase, "preparing"); assert.equal(prep.reentered, false);
-  assert.equal(readRunReceipt({ runsDir: runs, key }).phase, "preparing", "preparing 就已经是 deferred —— 挡直发");
-  const s0 = scanRuns({ runsDir: runs }).find((r) => r.key === key);
-  assert.equal(s0.shouldPublish, false, "**preparing 就挡住直发**");
-  assert.equal(s0.deferralPending, true); assert.equal(s0.deferredToOutbox, false, "preparing 不叫已转 outbox");
-  // 持 claim 期间别人拿不到；意图不同的重入被拒；提交要带对的 token。
-  assert.equal(claimRunPublish({ runsDir: runs, key }).ok, false, "转交持有 claim 到提交为止");
-  assert.equal(commitDeferral({ runsDir: runs, key, token: "别人的" }).reason, "publish_claim_lost");
-  assert.deepEqual(commitDeferral({ runsDir: runs, key, token: prep.token }), { ok: true, phase: "committed", idempotent: false });
-  const afterCommit = claimRunPublish({ runsDir: runs, key });
-  assert.equal(afterCommit.ok, true, "提交后 claim 已释放"); releaseRunPublishClaim({ runsDir: runs, key, token: afterCommit.token });
-  const ok = readRunReceipt({ runsDir: runs, key });
-  assert.equal(ok.state, "deferred"); assert.equal(ok.phase, "committed"); assert.equal(ok.eventKey, deferralEventKeyFor(key));
-  assert.ok(isCanonicalIso(ok.preparedAt), "prepared_at 规范时间"); assert.ok(isCanonicalIso(ok.committedAt), "committed_at 规范时间");
-  const s1 = scanRuns({ runsDir: runs }).find((r) => r.key === key);
-  assert.equal(s1.shouldPublish, false); assert.equal(s1.deferredToOutbox, true); assert.equal(s1.deferralPending, false);
-  // 幂等复核：意图一致 → 返回 committed 不覆盖；来源代际不同 → 拒绝。
-  const again = prepareDeferral({ runsDir: runs, key, originGenerationId: "gen-1" });
-  assert.equal(again.ok, true); assert.equal(again.phase, "committed"); assert.equal(again.reentered, true);
-  abandonDeferral({ runsDir: runs, key, token: again.token });
-  const other = prepareDeferral({ runsDir: runs, key, originGenerationId: "gen-other" });
-  assert.equal(other.reason, "deferral_intent_mismatch", "**重入要逐项比对意图，特别是来源代际**");
-  assert.equal(JSON.parse(fs.readFileSync(path.join(runs, key + ".deferred.json"), "utf-8")).origin_channel_generation_id, "gen-1",
-    "回执不许被改写");
-  const f = path.join(runs, key + ".deferred.json");
-  const committed = JSON.parse(fs.readFileSync(f, "utf-8"));
-  const ek = deferralEventKeyFor(key);
-  const without = (field, base = committed) => { const d = { ...base }; delete d[field]; return JSON.stringify(d); };
-  for (const [why, content, pattern] of [
-    ["不是 JSON", "{ 坏了", /不是 JSON/u],
-    ["旧形状（无 schema）", JSON.stringify({ run_id: key, deferred_at: "2026-08-27T00:00:00.000Z", outbox_event_key: ek }), /缺字段|多出/u],
-    ["event key 不是推导的", JSON.stringify({ ...committed, outbox_event_key: "not-derived-and-no-outbox-record" }), /不是由 key 推导/u],
-    ["artifact_type 不对", JSON.stringify({ ...committed, artifact_type: "x" }), /artifact_type/u],
-    ["state 不受控", without("committed_at", { ...committed, state: "done" }), /state 不在受控取值里/u],
-    ["run_id 对不上", JSON.stringify({ ...committed, run_id: "e".repeat(64) }), /run_id 跟文件名对不上/u],
-    ["缺 committed_at", without("committed_at"), /缺字段：committed_at/u],
-    ["多出字段", JSON.stringify({ ...committed, 悄悄加的: 1 }), /多出不认识的字段/u],
-    ["时间不规范", JSON.stringify({ ...committed, prepared_at: "刚才" }), /prepared_at 不是规范时间/u],
-    ["committed 早于 prepared", JSON.stringify({ ...committed, committed_at: "2000-01-01T00:00:00.000Z" }), /早于 prepared_at/u],
-    ["来源代际 null", JSON.stringify({ ...committed, origin_channel_generation_id: null }), /不是可用代际/u],
-    ["来源代际空白", JSON.stringify({ ...committed, origin_channel_generation_id: "  " }), /不是可用代际/u],
-  ]) {
-    fs.writeFileSync(f, content);
-    const r = readRunReceipt({ runsDir: runs, key });
-    assert.equal(r.state, "unreadable", why + "：**竟然认了** " + JSON.stringify(r));
-    assert.match(r.why, pattern, why + "：理由 —— " + r.why);
-    const s = scanRuns({ runsDir: runs }).find((r2) => r2.key === key);
-    assert.equal(s.shouldPublish, false, why + "：说不清不许发");
-    assert.equal(s.deferredToOutbox, false, why + "：也不当已转交");
-    assert.ok(s.receiptUnreadable, why + "：要报警");
-    assert.equal(prepareDeferral({ runsDir: runs, key, originGenerationId: "gen-1" }).reason, "receipt_unreadable",
-      why + "：坏回执不许被 prepare 绕过");
-  }
-  fs.rmSync(f);
-  const c = claimRunPublish({ runsDir: runs, key });
-  assert.equal(commitDeferral({ runsDir: runs, key, token: c.token }).reason, "deferral_not_prepared");
-  releaseRunPublishClaim({ runsDir: runs, key, token: c.token });
-  assert.equal(readRunReceipt({ runsDir: runs, key: "../escape" }).state, "unreadable");
-  fs.writeFileSync(f, JSON.stringify(committed));
-  fs.writeFileSync(path.join(runs, key + ".published.json"), JSON.stringify({ published_at: "2026-08-27T00:00:00.000Z" }));
-  const conflict = readRunReceipt({ runsDir: runs, key });
-  assert.equal(conflict.state, "unreadable");
-  assert.match(conflict.why, /同时存在/u, "**不许静默优先 published**");
-  const sc = scanRuns({ runsDir: runs }).find((r2) => r2.key === key);
-  assert.equal(sc.shouldPublish, false); assert.equal(sc.alreadyPublished, false); assert.ok(sc.receiptUnreadable);
+  assert.equal(fs.existsSync(path.join(flip.runs, flip.key + ".published.json")), false);
 });
 
 test("直发 CLI 参数严格白名单：未知 / 重复 / 缺值 / 位置参数 / 空格形式 / 发布不带 root 一律拒绝", () => {
@@ -14714,48 +14516,51 @@ test("直发 CLI 参数严格白名单：未知 / 重复 / 缺值 / 位置参数
   assert.match(r.stderr, /参数不对/u);
 });
 
-test("发布与转交共用一笔所有权：直发 CLI 发布途中转交拿不到 claim，最终只有 published（真实并发）", () => {
-  // 评审探针：CLI 已扫描、发布器尚未返回时并发创建 preparing —— 两边各自独占各自的文件，
-  // 既发出去了又转交了。现在转交要先拿同一把 claim。
+test("run 通道所有权只有一笔：直发 CLI 发布途中，排空的 run 通道拿不到 claim，最终恰好一次（真实并发）", () => {
+  // 评审探针的形状：CLI 已扫描、发布器尚未返回时另一个消费者也来发 —— 都得先拿同一把 claim。
   const h = watcherMatrixRunner.fixture();
   const rt = path.join(h.dir, ".runtime-data", "inbound");
   const runs = path.join(rt, "runs");
   const key = claimKeyFor("race");
   fs.writeFileSync(path.join(runs, key + ".jsonl"),
     JSON.stringify({ type: "result", is_error: false, result: "竞态那一轮" }) + "\n");
+  writeClaimFixture({ claimsDir: path.join(rt, "delivery-claims"), key, root: h.dir });
   fs.writeFileSync(path.join(h.dir, "mode.txt"), "barrier");   // 假 lark 卡在屏障上直到 barrier.txt 出现
   const orchestrator = path.join(h.dir, "race.mjs");
   fs.writeFileSync(orchestrator, [
     'import { spawn } from "node:child_process";',
     'import fs from "node:fs";',
     'import path from "node:path";',
-    'const [cli, dir, key, outboundUrl] = process.argv.slice(2);',
-    'const { prepareDeferral } = await import(outboundUrl);',
-    'const runs = path.join(dir, ".runtime-data", "inbound", "runs");',
+    'const [cli, dir, key, drainUrl] = process.argv.slice(2);',
+    'const { drainProject } = await import(drainUrl);',
     'const c = spawn(process.execPath, [cli, "--root=" + dir, "--publish", "--key=" + key], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });',
     'let out = ""; c.stdout.on("data", (d) => { out += d; }); c.stderr.on("data", (d) => { out += d; });',
     'const closed = new Promise((r) => c.on("close", r));',
     'const calls = path.join(dir, "lark-calls.jsonl");',
     'const t0 = Date.now();',
     'while (!fs.existsSync(calls) && Date.now() - t0 < 15000) await new Promise((r) => setTimeout(r, 30));',
-    'const prep = prepareDeferral({ runsDir: runs, key, originGenerationId: "gen-1" });',
+    'let sent = 0;',
+    'const during = drainProject({ root: dir, claudeSessionId: null, publish: () => { sent += 1; return "om_drain"; }, diagnose: () => null });',
     'fs.writeFileSync(path.join(dir, "barrier.txt"), "go");',
     'const code = await closed;',
-    'console.log(JSON.stringify({ code, out, prep }));',
+    'console.log(JSON.stringify({ code, out, during, sent }));',
   ].join("\n"));
   const r = spawnSync(process.execPath, [orchestrator, path.resolve("scripts", "outbound.mjs"), h.dir, key,
-    pathToFileURL(path.resolve("scripts", "outbound.mjs")).href],
+    pathToFileURL(path.resolve("scripts", "drain-outbox.mjs")).href],
     { encoding: "utf-8", env: { ...process.env, HOME: h.dir }, timeout: 90_000 });
   assert.equal(r.status, 0, r.stderr);
   const got = JSON.parse(r.stdout.trim().split("\n").at(-1));
-  assert.equal(got.prep.ok, false, "**发布方持有 claim 时转交不许创建 preparing**：" + JSON.stringify(got));
-  assert.equal(got.prep.reason, "publish_claim_held");
+  assert.equal(got.sent, 0, "**发布方持有 claim 时排空不许再发**：" + JSON.stringify(got.during));
+  assert.equal(got.during.runs?.skipped?.[0]?.reason, "claimed_by_other", JSON.stringify(got.during.runs));
   assert.equal(got.code, 0, got.out);
   assert.match(got.out, /已发布/u);
   const receipt = readRunReceipt({ runsDir: runs, key });
   assert.equal(receipt.state, "valid", "**最终只有 published**：" + JSON.stringify(receipt));
-  assert.equal(fs.existsSync(path.join(runs, key + ".deferred.json")), false, "零 deferred");
   assert.equal(fs.readFileSync(path.join(h.dir, "lark-calls.jsonl"), "utf-8").split("\n").filter(Boolean).length, 1, "恰好发一次");
+  // 发完之后排空再来：回执 valid，跳过、零发送。
+  let sent2 = 0;
+  const after = drainProject({ root: h.dir, claudeSessionId: null, publish: () => { sent2 += 1; return "x"; }, diagnose: () => null });
+  assert.equal(sent2, 0); assert.equal(after.status, "empty", JSON.stringify(after));
 });
 
 test("claim 写原语：扩展对象覆盖不了固定身份字段", () => {

@@ -12485,7 +12485,7 @@ test("抑制的语义差分契约：除允许清单外一律不变", () => {
   assert.equal(listPending({ outboxDir: dir }).length, 0);
 
   // 失败路径：文件字节完全不变。
-  fs.writeFileSync(path.join(dir, "0002.json"), "{ 坏的");
+  fs.writeFileSync(path.join(dir, "0002.json"), rawOutboxFixture({ raw: "{ 坏的", expect: { unclassified: "读不出来" } }));
   const bytes = fs.readdirSync(dir).map((f) => fs.readFileSync(path.join(dir, f), "utf-8"));
   const refused = suppressAll(dir);
   assert.equal(refused.ok, false, "有坏文件就拒绝");
@@ -15121,7 +15121,7 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
     f.run("indep");
     const outboxDir = path.join(f.h.dir, ".runtime-data", "outbound", "outbox");
     fs.mkdirSync(outboxDir, { recursive: true });
-    fs.writeFileSync(path.join(outboxDir, "bad.json"), "{ 坏了");
+    fs.writeFileSync(path.join(outboxDir, "bad.json"), rawOutboxFixture({ raw: "{ 坏了", expect: { unclassified: "读不出来" } }));
     const r = f.drain();
     assert.equal(f.sent(), 1, "**outbox 损坏不许截断 run 通道**：" + JSON.stringify(r));
     assert.equal(r.status, "error"); assert.equal(r.local, true);

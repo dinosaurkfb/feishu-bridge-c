@@ -5956,7 +5956,7 @@ test("坏文件名也要过净化 —— 这个命令的用途就是查看畸形
   const ob = taskPaths(task, home).outbox;
   fs.mkdirSync(ob, { recursive: true });
   // 文件名里带 ESC，内容是坏 JSON —— 它一定会被点名，于是文件名一定会被打印。
-  fs.writeFileSync(path.join(ob, "evil" + ESC + "[2J.json"), "{ 坏的");
+  fs.writeFileSync(path.join(ob, "evil" + ESC + "[2J.json"), rawOutboxFixture({ raw: "{ 坏的", expect: { unclassified: "读不出来" } }));
 
   const r = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
@@ -6096,7 +6096,7 @@ test("净化覆盖全部双向控制符，包括 U+061C", () => {
   writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const ob = taskPaths(task, home).outbox;
   fs.mkdirSync(ob, { recursive: true });
-  fs.writeFileSync(path.join(ob, "evil" + ALM + "name.json"), "{ 坏的");
+  fs.writeFileSync(path.join(ob, "evil" + ALM + "name.json"), rawOutboxFixture({ raw: "{ 坏的", expect: { unclassified: "读不出来" } }));
   const r = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "feishu-outbox.mjs")],
     { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -7328,7 +7328,7 @@ test("codex drain：预览与执行给出同一个结论 —— 坏 outbox 不�
     { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: h.home } });
 
   // 只有坏 JSON：两条路都要拒绝，不许说为空。
-  fs.writeFileSync(path.join(h.obDir, "bad.json"), "{ 坏了");
+  fs.writeFileSync(path.join(h.obDir, "bad.json"), rawOutboxFixture({ raw: "{ 坏了", expect: { unclassified: "读不出来" } }));
   // apply 腿带形状合法的哑摘要 —— 审计闸门在摘要核对之前，坏 outbox 要报
   // 「本地 outbox 有问题」而不是「缺摘要」；不带摘要会被更早的前置拦下，测不到审计。
   for (const [why, args] of [["dry-run", []],
@@ -8443,7 +8443,7 @@ test("R5 completeness：收集层给结论，坏一处就 complete:false 并点�
     assert.equal(clean.complete, true, "干净时 complete");
     assert.deepEqual(clean.problems, []);
 
-    fs.writeFileSync(path.join(obDir, "bad.json"), "{ 坏了");
+    fs.writeFileSync(path.join(obDir, "bad.json"), rawOutboxFixture({ raw: "{ 坏了", expect: { unclassified: "读不出来" } }));
     const dirty = collectProjectBacklog();
     assert.equal(dirty.complete, false, "**坏一处就不完整** —— 精确数字的底气就没了");
     assert.ok(dirty.problems.some((x) => /bad\.json/u.test(x.at)),

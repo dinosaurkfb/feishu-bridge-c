@@ -14875,6 +14875,12 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
     assert.equal(reasons2[half], "forward_incomplete", JSON.stringify(inv2.problems));
     assert.equal(reasons2[fwd], "forward_run_conflict", "**转发型 key 旁多出 run 通道制品不许静默藏掉**：" + JSON.stringify(inv2.problems));
     fs.rmSync(path.join(f.runs, fwd + ".published.json"));
+    // 主 run 与转发型并存：<key>.jsonl 也是集合之外的东西 → 冲突，且不当普通 run 解析。
+    fs.writeFileSync(path.join(f.runs, fwd + ".jsonl"), JSON.stringify({ type: "result", is_error: false, result: "x" }) + "\n");
+    const inv3 = inventoryRuns({ runsDir: f.runs, claimsDir: f.claims });
+    assert.equal(inv3.problems.find((x) => x.key === fwd)?.reason, "forward_run_conflict", "**主 run 与转发型并存要点名**：" + JSON.stringify(inv3.problems));
+    assert.equal(inv3.runs.some((r) => r.key === fwd), false, "冲突的 key 不进 run 列表");
+    fs.rmSync(path.join(f.runs, fwd + ".jsonl"));
     // 只有终局记录、连 forward 制品都没有的，仍是孤儿。
     const bare = claimKeyFor("bare-terminal");
     writeClaimFixture({ claimsDir: f.claims, key: bare, root: f.h.dir });

@@ -29,6 +29,7 @@ import {
   acquireClaim, claimKey, readClaim, readClaimState, readWatcherExpectEnv,
   recordClaimState, watcherExpectEnv,
 } from "./claim.mjs";
+import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.mjs";
 import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
@@ -55,7 +56,7 @@ import {
 import { parseRunOutcome } from "./handoff.mjs";
 import { repairRunClaims } from "./repair-run-claim.mjs";
 import {
-  describeDrainOutcome, drainProject, outboxDirOf, suppressCmd, watcherActive,
+  describeDrainOutcome, drainProject, inspectRunChannel, outboxDirOf, suppressCmd, watcherActive,
 } from "./drain-outbox.mjs";
 import { CANDIDATE_POLICIES, publishOutboxAttempt } from "./publish-attempt.mjs";
 import { PUBLISH_SCENARIOS, matrixRowsFor } from "./test-support/publish-matrix.mjs";
@@ -115,6 +116,7 @@ import { renderSubscriptions, subscriptionDetails } from "./feishu-subscribe.mjs
 import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
 import {
   ENDPOINT_SELF_CHECK, SELF_CHECK_TEXT, composeLayeredStatus, endpointFacts, outboundRoutingFact,
+  redactRunText, runChannelRows,
   lastSuccessfulDispatchAt, renderLayeredStatus, splitByRelation, subscriptionFacts,
 } from "./layered-status.mjs";
 import {
@@ -6974,7 +6976,10 @@ test("provider 报告：只收受控字段，多带一个就整条拒", () => {
   // 挡不住「把 locator 塞进名字」是靠形状检查兜的，明确它管到哪一步。
   assert.equal(validateProviderReport(providerReport({ group_name: "oc_abcdef123456" }), asProvider).reason,
     "connection_group_name_invalid");
-  // 控制字符会把终端输出搞乱，压平而不是拒。
+  // 控制字符会把终端输出搞乱，压平而不是拒 —— 规则与状态页同一份（display-safe），双向控制符 U+061C 也算。
+  assert.equal(
+    validateProviderReport(providerReport({ group_name: "A" + String.fromCharCode(0x61c) + "B" }), asProvider).connections[0].groupName,
+    "A B", "**双向控制符也要压平**");
   assert.equal(
     validateProviderReport(providerReport({ group_name: "A\u0000B" }), asProvider).connections[0].groupName,
     "A B");
@@ -15345,6 +15350,171 @@ test("outbox 夹具 helper 自己守约束：合法产出过审计；坏样本�
   assert.throws(() => rawOutboxFixture({ raw: "{ 坏了" }), /需要 raw 字符串与 expect/u);
   assert.throws(() => rawOutboxFixture({ raw: "{ 坏了", expect: { unclassified: "不是记录对象" } }), /实际 "读不出来"/u);
   assert.throws(() => rawOutboxFixture({ raw: JSON.stringify(outboxRecord()), expect: { unclassified: "读不出来" } }), /实际 null/u, "合法记录不能装成坏的");
+});
+
+test("第五区 run 通道：只转述 inspectRunChannel 的结论 —— 未查 / 说不清 / 暂停未分类 各自明写，不折叠成 0", () => {
+  const now = Date.parse("2026-08-27T12:00:00.000Z");
+  const rowsOf = (rc) => runChannelRows(rc, now);
+  const text = (rc) => {
+    const full = renderLayeredStatus(composeLayeredStatus({
+      st: layeredSt(), runChannel: rc, now,
+      endpoint: { runtime: "Claude Code", agentName: "M5Claude", install: "ok", installReason: null, version: "abc123",
+        selfCheck: ENDPOINT_SELF_CHECK, lastInboundAt: null },
+      subscription: { ok: true, items: [], pendingCount: 0 },
+    }));
+    return full.slice(full.indexOf("待处理事件"));
+  };
+  // 没传 = 没查：不许显示成 0 条。
+  assert.deepEqual(rowsOf(undefined), [["run 通道", "未查（本次没读 runs 账本）"]]);
+  assert.doesNotMatch(text(undefined), /run 待发|run 卡住/u, "没查就不许出计数行");
+  // runs 账本打不开：只说"说不清"，不给任何计数。
+  const unreadable = { phase: "classified", inventoryOk: false, waiting: { count: 0, oldestMs: null },
+    runs: { pending: 0, published: [], skipped: [], stuck: [], deliveredUnrecorded: [], problems: [{ key: null, reason: "runs_unreadable", why: "EACCES" }] } };
+  assert.deepEqual(rowsOf(unreadable), [["run 通道", "说不清（runs_unreadable：EACCES）"]]);
+  // 项目解析不出：说不清 + 账本里的待处理条数照报。
+  const unresolved = { phase: "unresolved", reason: "not_bound", inventoryOk: true, waiting: { count: 2, oldestMs: null },
+    runs: { pending: 2, published: [], skipped: [], stuck: [], deliveredUnrecorded: [], problems: [] } };
+  assert.deepEqual(rowsOf(unresolved), [["run 通道", "说不清（not_bound）；账本里有 2 条待处理"], ["runs 账本", "无异常"]]);
+  // 解析不出的项目，盘点里 key 为 null 的问题（不认识的条目 / claims 目录读不出）照样一条不漏（评审探针）。
+  const unresolvedWithProblem = { ...unresolved, waiting: { count: 0, oldestMs: null },
+    runs: { ...unresolved.runs, pending: 0, problems: [{ key: null, reason: "unrecognized_entry", why: "runs/unknown-entry" }] } };
+  assert.deepEqual(rowsOf(unresolvedWithProblem), [["run 通道", "说不清（not_bound）；账本里有 0 条待处理"],
+    ["runs 账本", "说不清 1 处"], ["  --------", "unrecognized_entry：runs/unknown-entry"]]);
+  // 绑定暂停：排空不分类 stuck —— 明写"暂停中未分类"，不许显示"卡住 0 条"。
+  const paused = { phase: "paused", reason: "mapping_not_active", inventoryOk: true, waiting: { count: 1, oldestMs: null },
+    runs: { pending: 1, published: [], skipped: [], stuck: [], deliveredUnrecorded: [], problems: [] } };
+  const pausedRows = rowsOf(paused);
+  assert.equal(pausedRows[0][1], "暂停中未分类：1 条待处理（恢复绑定后由排空分类处理，符合条件的再发出）");
+  assert.equal(pausedRows.some((r) => r[0] === "run 卡住"), false, "**暂停时不许伪造\"卡住 0 条\"**");
+  // 已分类：待发条数 + 最老一条年龄；卡住逐条带 reason；问题逐条；key 只留 8 位；why 里的 key / 消息 id 脱敏。
+  const K = "0123456789abcdef".repeat(4);
+  const classified = { phase: "classified", reason: null, inventoryOk: true,
+    waiting: { count: 1, oldestMs: now - 90 * 60000 },
+    runs: { pending: 3, published: [{ key: K, target: "om_fixture" }], skipped: [],
+      stuck: [{ key: "f".repeat(64), reason: "route_mismatch", why: "最终投递路由与终局记录绑定的对不上" },
+        { key: "e".repeat(64), reason: "reservation_unresolved", why: "上次尝试没闭合（delivered_unrecorded：om_secret123）" }],
+      deliveredUnrecorded: [{ key: "d".repeat(64), messageId: "om_delivered", error: "EISDIR" }],
+      problems: [{ key: "c".repeat(64), reason: "terminal_unreadable", why: "c".repeat(64) + ".handed_off.json：不是 JSON" }] } };
+  const rows = rowsOf(classified);
+  assert.deepEqual(rows[0], ["run 待发", "1 条（最老 2 小时前）"]);
+  assert.deepEqual(rows[1], ["run 卡住", "2 条（需要人看）"]);
+  assert.deepEqual(rows[2], ["  ffffffff", "route_mismatch：最终投递路由与终局记录绑定的对不上"]);
+  assert.deepEqual(rows[3], ["  eeeeeeee", "reservation_unresolved：上次尝试没闭合（delivered_unrecorded：om_…）"]);
+  assert.deepEqual(rows[4], ["run 送达未落标", "1 条（下一轮可能重发，先去话题核对）"]);
+  assert.deepEqual(rows[6], ["runs 账本", "说不清 1 处"]);
+  assert.deepEqual(rows[7], ["  cccccccc", "terminal_unreadable：cccccccc….handed_off.json：不是 JSON"]);
+  const rendered = JSON.stringify(rows);
+  assert.equal(rendered.includes("f".repeat(64)), false, "**完整 key 不许出现**");
+  assert.equal(rendered.includes("om_secret123"), false, "**消息 id 是 locator，不许出现**");
+  assert.equal(rendered.includes("om_delivered"), false);
+  // 净化规则只有一份（display-safe.mjs）：逐类字面期望 —— 每种 locator、64 位摘要、UUID、控制字符、行分隔符、双向控制符。
+  const ESC = String.fromCharCode(27);
+  assert.equal(redactRunText("x " + K + " y om_abcdef"), "x 01234567… y om_…");
+  assert.equal(redactLocators("cli_app123456 oc_chat123456 ou_user123456 on_union123456 session_123456 thread_123456 omt_topic123456 om_x12345"),
+    "cli_… oc_… ou_… on_… session_… thread_… omt_… om_…");
+  assert.equal(redactLocators("01911111-2222-7333-8444-555555555555 " + "A".repeat(64)), "01911111… AAAAAAAA…");
+  assert.equal(redactLocators("om_ab oc_12345"), "om_ab oc_12345", "主体不足 6 位的不是 locator 形状，不动");
+  assert.equal(sanitizeForDisplay("a" + String.fromCharCode(10) + "b" + ESC + "[2Jc" + String.fromCharCode(0x2028) + "d" + String.fromCharCode(0x61c) + "e" + String.fromCharCode(0x9f) + "f"),
+    "a\uFFFDb\uFFFD[2Jc\uFFFDd\uFFFDe\uFFFDf");
+  assert.equal(displaySafe("runs/evil" + ESC + "[2J-" + "b".repeat(64) + ".jsonl"), "runs/evil\uFFFD[2J-bbbbbbbb….jsonl", "未识别文件名：控制符压平 + 摘要脱敏");
+  // 边界是字符域不是 \b：下划线 / 字母 紧邻的摘要与 UUID 也要脱敏（评审探针 prefix_<摘要>.jsonl）。
+  const U = "01911111-2222-7333-8444-555555555555";
+  assert.equal(redactLocators("prefix_" + K + ".jsonl"), "prefix_01234567….jsonl");
+  assert.equal(redactLocators(K + "_suffix x_" + U + "_y"), "01234567…_suffix x_01911111…_y");
+  assert.equal(redactLocators("z" + K), "z01234567…", "字母紧邻也脱敏");
+  assert.equal(redactLocators("f" + "a".repeat(63) + "."), "faaaaaaa….", "恰好 64 位 hex 就是摘要形状");
+  assert.equal(redactLocators("a".repeat(65)), "a".repeat(65), "65 位 hex 不是 64 位摘要，不动");
+  // 渲染进第五区（真实渲染函数）。
+  assert.match(text(classified), /待处理事件[\s\S]*run 待发[\s\S]*run 卡住[\s\S]*ffffffff/u);
+});
+
+test("真实 feishu-status：第五区报 run 通道的待发 / 卡住 / 账本问题，判据与排空同一份，且零副作用（真实进程）", () => {
+  const h = watcherMatrixRunner.fixture();
+  const rt = path.join(h.dir, ".runtime-data", "inbound");
+  const runs = path.join(rt, "runs");
+  const claims = path.join(rt, "delivery-claims");
+  const mk = (label, { tamper = null } = {}) => {
+    const key = claimKeyFor(label);
+    fs.writeFileSync(path.join(runs, key + ".jsonl"), JSON.stringify({ type: "result", is_error: false, result: "结果 " + label }) + "\n");
+    writeClaimFixture({ claimsDir: claims, key, root: h.dir });
+    recordClaimState({ claimsDir: claims, key, state: "handed_off",
+      detail: terminalDetail(runs, key, { publish_deferred: DEFERRED }, { root: h.dir }) });
+    if (tamper) tamper(key);
+    return key;
+  };
+  const waiting = mk("st-wait");
+  const past = new Date(Date.now() - 3 * 3600_000);
+  fs.utimesSync(path.join(runs, waiting + ".jsonl"), past, past);
+  const rerouted = mk("st-rerouted", { tamper: (key) => {
+    const p = path.join(claims, key + ".handed_off.json");
+    const doc = JSON.parse(fs.readFileSync(p, "utf-8")); doc.route_sha256 = "0".repeat(64); fs.writeFileSync(p, JSON.stringify(doc));
+  } });
+  const badterm = mk("st-badterm", { tamper: (key) => fs.writeFileSync(path.join(claims, key + ".handed_off.json"), "{ 坏了") });
+  const snapshot = (dir) => fs.readdirSync(dir).sort().map((f) => {
+    const p = path.join(dir, f);
+    return f + ":" + (fs.statSync(p).isDirectory() ? "dir:" + fs.readdirSync(p).sort().join(",") : fs.readFileSync(p).toString("base64"));
+  }).join("\n");
+  const before = snapshot(runs) + "\n--\n" + snapshot(claims);
+  const env = { ...process.env, HOME: h.dir, FEISHU_BRIDGE_REGISTRY: path.join(h.dir, "registry.json") };
+  delete env.CLAUDE_CODE_SESSION_ID;
+  const run = () => spawnSync(process.execPath, [path.resolve("scripts", "feishu-status.mjs"), "--project", h.dir], { encoding: "utf-8", env, timeout: 60_000 });
+  const r = run();
+  assert.equal(r.status, 0, r.stderr);
+  const fifth = r.stdout.slice(r.stdout.indexOf("待处理事件"));
+  assert.match(fifth, /run 待发[　 ]+1 条（最老 3 小时前）/u, fifth);
+  // 坏终局记录既是"卡住"（排空拿它当授权凭据读不出）也是"账本问题"（盘点点名）—— 两处都照排空的结论转述。
+  assert.match(fifth, /run 卡住[　 ]+2 条（需要人看）/u, fifth);
+  assert.match(fifth, new RegExp(rerouted.slice(0, 8) + "[　 ]+route_mismatch", "u"), "**卡住的要带 reason**：" + fifth);
+  assert.match(fifth, new RegExp(badterm.slice(0, 8) + "[　 ]+terminal_unreadable", "u"), "**账本问题逐条**：" + fifth);
+  assert.match(fifth, /runs 账本[　 ]+说不清 1 处/u, fifth);
+  assert.equal(r.stdout.includes(rerouted), false, "**完整 key 不许出现在状态页**");
+  assert.equal(r.stdout.includes("om_fixture"), false, "**根消息 id 是 locator**");
+  // 零副作用：目录字节一致、没有 claim、没有 lark 调用、没有回执。
+  assert.equal(snapshot(runs) + "\n--\n" + snapshot(claims), before, "**status 一个字节都不许改**");
+  assert.equal(fs.existsSync(path.join(h.dir, "lark-calls.jsonl")), false, "**零发送**");
+  // **判据同一份**：排空 dry-run 说的就是状态页说的。
+  const drain = drainProject({ root: h.dir, claudeSessionId: null, dryRun: true, publish: () => { throw new Error("dry-run 不许发"); }, diagnose: () => null });
+  assert.deepEqual(drain.runs.stuck.map((x) => [x.key, x.reason]).sort(), [[badterm, "terminal_unreadable"], [rerouted, "route_mismatch"]].sort());
+  assert.deepEqual(drain.runs.published.map((x) => x.key), [waiting]);
+  const rc = inspectRunChannel({ root: h.dir, claudeSessionId: null });
+  assert.equal(rc.phase, "classified");
+  assert.deepEqual(rc.runs.stuck.map((x) => [x.key, x.reason]), drain.runs.stuck.map((x) => [x.key, x.reason]));
+  assert.equal(rc.waiting.count, 1);
+  // 绑定暂停：状态页不许伪造"卡住 0 条"，要说暂停中未分类。
+  const mapPath = path.join(rt, "active-mapping.json");
+  const mapping = JSON.parse(fs.readFileSync(mapPath, "utf-8"));
+  fs.writeFileSync(mapPath, JSON.stringify({ ...mapping, status: "suspended" }));
+  const paused = run();
+  assert.match(paused.stdout, /暂停中未分类：3 条待处理/u, paused.stdout);
+  assert.doesNotMatch(paused.stdout, /run 卡住/u);
+  fs.writeFileSync(mapPath, JSON.stringify(mapping));
+  // runs 目录打不开：说不清，不折叠成 0。
+  fs.chmodSync(runs, 0o000);
+  let blind;
+  try { blind = run(); } finally { fs.chmodSync(runs, 0o700); }
+  assert.match(blind.stdout, /run 通道[　 ]+说不清（runs_unreadable/u, blind.stdout);
+  assert.doesNotMatch(blind.stdout, /run 待发/u);
+  // 未绑定的项目：解析不出也要把 runs 账本里的问题报出来（评审探针：曾同时显示"0 条待处理"和"账本无异常"）。
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-status-unbound-"));
+  const bareRuns = path.join(bare, ".runtime-data", "inbound", "runs");
+  fs.mkdirSync(bareRuns, { recursive: true });
+  fs.writeFileSync(path.join(bareRuns, "unknown-entry"), "x");
+  const unbound = spawnSync(process.execPath, [path.resolve("scripts", "feishu-status.mjs"), "--project", bare],
+    { encoding: "utf-8", env: { ...env, HOME: bare, FEISHU_BRIDGE_REGISTRY: path.join(bare, "registry.json") }, timeout: 60_000 });
+  assert.equal(unbound.status, 0, unbound.stderr);
+  assert.match(unbound.stdout, /run 通道[　 ]+说不清（not_bound）；账本里有 0 条待处理/u, unbound.stdout);
+  assert.match(unbound.stdout, /runs 账本[　 ]+说不清 1 处[\s\S]*unrecognized_entry：runs\/unknown-entry/u, unbound.stdout);
+  // 未识别文件名里夹着完整摘要（prefix_<64 位>.jsonl）：经 inventoryRuns → inspectRunChannel → runChannelRows 真实链路，不许泄露。
+  const leakName = "prefix_" + "c".repeat(64) + ".jsonl";
+  fs.writeFileSync(path.join(bareRuns, leakName), "x");
+  const rc2 = inspectRunChannel({ root: bare, claudeSessionId: null });
+  const rows2 = runChannelRows(rc2);
+  assert.equal(JSON.stringify(rows2).includes("c".repeat(64)), false, "**完整摘要不许进第五区**：" + JSON.stringify(rows2));
+  assert.ok(rows2.some((r) => r[1] === "unrecognized_entry：runs/prefix_cccccccc….jsonl"), JSON.stringify(rows2));
+  const leaked = spawnSync(process.execPath, [path.resolve("scripts", "feishu-status.mjs"), "--project", bare],
+    { encoding: "utf-8", env: { ...env, HOME: bare, FEISHU_BRIDGE_REGISTRY: path.join(bare, "registry.json") }, timeout: 60_000 });
+  assert.equal(leaked.stdout.includes("c".repeat(64)), false, leaked.stdout);
+  assert.match(leaked.stdout, /prefix_cccccccc….jsonl/u);
 });
 
 test("claim 写原语：扩展对象覆盖不了固定身份字段", () => {

@@ -37,6 +37,7 @@
  *   node scripts/codex/feishu-outbox.mjs --full             # 不截断正文
  */
 
+import { sanitizeForDisplay } from "../display-safe.mjs";
 import path from "node:path";
 
 import { isDirectRun, moduleDir } from "../direct-run.mjs";
@@ -119,14 +120,7 @@ export function ageText(iso, now = Date.now()) {
  *
  * 换成可见占位符而不是删掉 —— **"这里原本有东西"本身是信息**。
  */
-export function sanitizeForDisplay(text) {
-  // **双向控制符用 Unicode 属性，不手数码位。**
-  // 上一版手写区间漏了 U+061C（ARABIC LETTER MARK）—— 评审把它放进坏文件名，
-  // 真实 CLI 的 stdout 原样带出来了。手数码位这条路的错误模式就是"漏掉的那个"，
-  // 跟摘要手挑字段是同一类问题：补一个还有下一个。
-  return String(text ?? "").replace(
-    /[\u0000-\u001F\u007F-\u009F\u2028\u2029]|\p{Bidi_Control}/gu, "\uFFFD");
-}
+export { sanitizeForDisplay };
 
 /**
  * **输出边界。**这个文件里所有打印都走这两个 —— 直接 console.log 会漏掉净化。

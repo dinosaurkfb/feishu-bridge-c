@@ -80,8 +80,11 @@ stuck reservation_unresolved 禁止自动重试，dry-run 也不报成将发布�
 形状一律 ledger_unreadable），**直发 CLI 与 watcher 共用**，且三条入口都在 **claim 之内重读
 账本**（启动扫描到拿到 claim 之间账本可能已变成 reserved —— 评审探针；回归用 FIFO 账本做
 时序编排：第一次读给可重试、第二次读给 reserved）：直发把这类 run 列成"待人工"、普通
---publish 拒绝且不提供覆盖；watcher 对 reserved / 说不清 / 预算耗尽也不发，只对自己上一次
-发布失败的旧账例外 —— 维护后重跑 watcher 正是那条恢复路径。**写到一半的临时制品**
+--publish 拒绝且不提供覆盖；watcher 对 reserved / 说不清 / 预算耗尽也不发，唯一例外是
+**精确的** `reap_lock_held` 旧账（维护清锁后重跑 watcher 的恢复路径）。旧账是两个真实写方
+的封闭联合并带 kind：`{at, error}`（publish_error）与 `{at, reason:"reap_lock_held", detail:string|null}`
+（reap_lock_held）；别的 reason、缺 detail、detail 类型不对一律说不清（评审探针：at+reason 的
+账曾被当成 legacy 豁免，watcher 照发）。`absent` 只对应 attempts 0、`valid` 只对应 ≥ 1。**写到一半的临时制品**
 （`<key>.published.json.tmp.*` / `.publish-failed.json.tmp.*`：发布返回之后、rename 之前停住）
 由 readRunReceipt / readPublishLedger 自己探测为"状态未闭合"（unreadable），所有读方一致
 fail-closed，普通入口不得选择它），经同一把

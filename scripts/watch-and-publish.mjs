@@ -284,7 +284,10 @@ while (true) {
       }
       // 账本投影：送达状态不确定（reserved）/ 账本说不清 / 自动预算耗尽 → watcher 也不发；
       // 自己上一次发布失败（legacy）不算 —— 维护后重跑 watcher 正是那条失败的恢复路径。
-      const held = run?.hold && run.hold.reason !== "watcher_publish_failed" ? run.hold : null;
+      // 唯一的例外是**精确的**接管锁残留旧账（维护清锁后重跑 watcher 的恢复路径）；
+      // 自己上一次发布抛错的账也不豁免 —— 失败原因未受验，留给人看。
+      const recoverable = (hold) => hold?.reason === "watcher_publish_failed" && hold.kind === "reap_lock_held";
+      const held = run?.hold && !recoverable(run.hold) ? run.hold : null;
       if (held) {
         console.error("run 结果本轮不发（" + held.reason + "：" + held.why + "）—— 去话题核对后手工处理 " +
           key.slice(0, 8) + " 的发布账本。");
@@ -320,7 +323,7 @@ while (true) {
           // **claim 内重读账本**：启动快照到拿到 claim 之间账本可能已变成 reserved（评审探针）。
           // 自己上一次发布失败的旧账仍是例外（维护后重跑正是恢复路径），其余 hold 一律停手。
           const freshHold = claim.ok && receipt.state === "absent" ? publishHold(readPublishLedger({ runsDir: RUNS, key })) : null;
-          const ledgerBlocks = freshHold !== null && freshHold.reason !== "watcher_publish_failed";
+          const ledgerBlocks = freshHold !== null && !recoverable(freshHold);
           if (claim.ok && receipt.state === "valid") {
             releaseRunPublishClaim({ runsDir: RUNS, key, token: claim.token });
             console.error("run 结果已由另一个 watcher 送达（回执合法），本轮不再发。");

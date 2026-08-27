@@ -86,13 +86,18 @@ export function readPublishLedger({ runsDir, key }) {
     }
     return { state: "unreadable", why: "重试账形状不对" };
   }
-  // watcher 写的两种旧形状（照写方原样，不多不少）：发布抛错 {at, error}；
-  // 接管互斥锁残留 {at, reason: "reap_lock_held", detail}。
+  // watcher 写的两种旧形状 —— **封闭联合，照写方原样，不多不少**：
+  //   publish_error   {at, error}                       error 非空字符串
+  //   reap_lock_held  {at, reason: "reap_lock_held", detail}   detail 字符串或 null
+  // 任何别的 reason、缺 detail、detail 类型不对都不是真实写方的产物 → 说不清。
   const legacyKeys = Object.keys(doc).sort().join(",");
-  if ((legacyKeys === "at,error" && typeof doc.error === "string" && doc.error.length > 0
-    || (legacyKeys === "at,detail,reason" || legacyKeys === "at,reason") && typeof doc.reason === "string" && doc.reason.length > 0)
-    && isCanonicalIso(doc.at)) {
-    return { state: "legacy", attempts: 1, error: doc.error ?? (doc.reason + (typeof doc.detail === "string" ? "：" + doc.detail : "")) };
+  if (!isCanonicalIso(doc.at)) return { state: "unreadable", why: "重试账形状不认识" };
+  if (legacyKeys === "at,error" && typeof doc.error === "string" && doc.error.length > 0) {
+    return { state: "legacy", kind: "publish_error", attempts: 1, error: doc.error };
+  }
+  if (legacyKeys === "at,detail,reason" && doc.reason === "reap_lock_held"
+    && (doc.detail === null || typeof doc.detail === "string")) {
+    return { state: "legacy", kind: "reap_lock_held", attempts: 1, error: "reap_lock_held" + (doc.detail ? "：" + doc.detail : "") };
   }
   return { state: "unreadable", why: "重试账形状不认识" };
 }
@@ -119,13 +124,15 @@ export function writePublishLedger({ runsDir, key, attempts, error }) {
 export function publishHold(ledger) {
   // **封闭的联合**：只有 absent 与预算未耗尽的 valid 才放行；任何不认识的形状都是说不清 ——
   // 新增一个状态不会默认掉进"可以发"。
-  if (ledger && ledger.state === "absent") return null;
-  if (ledger && ledger.state === "valid" && Number.isSafeInteger(ledger.attempts)) {
+  if (ledger && ledger.state === "absent" && ledger.attempts === 0) return null;
+  if (ledger && ledger.state === "valid" && Number.isSafeInteger(ledger.attempts) && ledger.attempts >= 1) {
     if (ledger.attempts >= RUN_PUBLISH_MAX_ATTEMPTS) return { reason: "retry_exhausted", why: "已失败 " + ledger.attempts + " 次，自动重试预算耗尽" };
     return null;
   }
   if (ledger && ledger.state === "reserved") return { reason: "reservation_unresolved", why: "上次尝试没闭合（" + ledger.error + "）—— 送达状态不确定，先去话题核对" };
-  if (ledger && ledger.state === "legacy") return { reason: "watcher_publish_failed", why: ledger.error };
+  if (ledger && ledger.state === "legacy" && (ledger.kind === "publish_error" || ledger.kind === "reap_lock_held")) {
+    return { reason: "watcher_publish_failed", kind: ledger.kind, why: ledger.error };
+  }
   return { reason: "ledger_unreadable", why: ledger?.why ?? ("账本状态不认识：" + String(ledger?.state)) };
 }
 

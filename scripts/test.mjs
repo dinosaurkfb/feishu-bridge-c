@@ -14947,6 +14947,23 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
     assert.equal(publishHold({ state: "valid", attempts: "1" })?.reason, "ledger_unreadable");
     assert.equal(publishHold({ state: "absent", attempts: 0 }), null);
     assert.equal(publishHold({ state: "valid", attempts: 4 }), null);
+    // 不可能的投影也不放行：absent 只对应 attempts 0，valid 只对应 ≥ 1。
+    assert.equal(publishHold({ state: "absent", attempts: 99 })?.reason, "ledger_unreadable");
+    assert.equal(publishHold({ state: "valid", attempts: 0 })?.reason, "ledger_unreadable");
+    assert.equal(publishHold({ state: "valid", attempts: -1 })?.reason, "ledger_unreadable");
+    assert.equal(publishHold({ state: "legacy", attempts: 1, error: "x" })?.reason, "ledger_unreadable", "legacy 没有精确 kind 不放行");
+    // 旧账封闭联合：只认两个真实写方的精确形状。
+    const at = "2026-08-27T00:00:00.000Z";
+    const probe = (doc) => { const g = mk(); const k = g.run("legacy-shape"); fs.writeFileSync(path.join(g.runs, k + ".publish-failed.json"), JSON.stringify(doc)); return readPublishLedger({ runsDir: g.runs, key: k }); };
+    assert.equal(probe({ at, error: "ETIMEDOUT" }).kind, "publish_error");
+    assert.equal(probe({ at, reason: "reap_lock_held", detail: "锁路径" }).kind, "reap_lock_held");
+    assert.equal(probe({ at, reason: "reap_lock_held", detail: null }).kind, "reap_lock_held");
+    for (const [why, doc] of [
+      ["只有 at + reason", { at, reason: "reap_lock_held" }],
+      ["别的 reason", { at, reason: "other", detail: "x" }],
+      ["detail 类型不对", { at, reason: "reap_lock_held", detail: 1 }],
+      ["error 带 reason", { at, error: "x", reason: "reap_lock_held", detail: null }],
+    ]) assert.equal(probe(doc).state, "unreadable", why);
   }
   // **claim 之内重读账本**（真实入口，FIFO 时序编排）：启动扫描读到的是可重试的账，拿到 claim 之后
   // 账本已变成 reserved —— 直发 CLI 必须停手。账本是一个 FIFO：第一次读给 A、第二次读给 B；
@@ -15137,6 +15154,30 @@ test("Claude watcher：claim 之内重读账本 —— 启动快照可重试、c
   assert.equal(fs.existsSync(path.join(h.dir, "lark-calls.jsonl")), false, "**claim 内账本已 reserved 不许发**");
   assert.equal(fs.existsSync(path.join(runs, key + ".published.json")), false);
   assert.equal(fs.existsSync(path.join(runs, key + ".publish-claim.json")), false, "claim 要释放");
+});
+
+test("Claude watcher：旧失败账只豁免精确的 reap_lock_held —— 未知 reason / 缺 detail / detail 类型不对 / 发布抛错账 一律不发（真实进程）", () => {
+  const at = "2026-08-27T00:00:00.000Z";
+  for (const [why, doc] of [
+    ["未知 reason", { at, reason: "something_else", detail: null }],
+    ["缺 detail", { at, reason: "reap_lock_held" }],
+    ["detail 类型不对", { at, reason: "reap_lock_held", detail: 7 }],
+    ["自己上次发布抛错的账", { at, error: "ETIMEDOUT" }],
+  ]) {
+    const h = watcherMatrixRunner.fixture();
+    const rt = path.join(h.dir, ".runtime-data", "inbound");
+    const runs = path.join(rt, "runs");
+    const key = claimKeyFor("legacy-" + why);
+    fs.writeFileSync(path.join(runs, key + ".jsonl"), JSON.stringify({ type: "result", is_error: false, result: "旧账形状那一轮" }) + "\n");
+    fs.writeFileSync(path.join(runs, key + ".publish-failed.json"), JSON.stringify(doc));
+    writeClaimFixture({ claimsDir: path.join(rt, "delivery-claims"), key, root: h.dir });
+    const r = spawnSync(process.execPath, [path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir],
+      { encoding: "utf-8", env: { ...process.env, ...expectEnvFor(h.dir), HOME: h.dir }, timeout: 60_000 });
+    assert.equal(fs.existsSync(path.join(h.dir, "lark-calls.jsonl")), false, why + "：**零发布**：" + r.stdout + r.stderr);
+    assert.equal(fs.existsSync(path.join(runs, key + ".published.json")), false, why + "：零回执");
+    assert.equal(fs.existsSync(path.join(runs, key + ".publish-claim.json")), false, why + "：claim 释放");
+    assert.match(r.stderr, /ledger_unreadable|watcher_publish_failed/u, why + "：" + r.stderr);
+  }
 });
 
 test("Claude watcher：发布账本说送达状态不确定（reserved）→ 绑定 active 也不发（真实进程）", () => {

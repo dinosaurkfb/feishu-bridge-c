@@ -9919,6 +9919,19 @@ test("落盘 suspend：控制状态写一半 → prepared 不提交；同 operat
   const bad = applySubscriptionSync({ shadowDir: w5.dir, lockDir: w5.lockDir, operationId: "op-suspend-div",
     expectedPlanId: pid5, readWorld: () => { throw new Error("不该规划"); }, bindingControl: weird });
   assert.equal(bad.ok, false); assert.equal(bad.reason, APPLY_REJECT.BINDING_CONTROL_UNREADABLE);
+  // **键集要恰好 {status, reason}**：active 缺 reason / reason 为 undefined 都不许补成 null —— 拒且零写入。
+  for (const [why, got] of [["缺 reason", { status: "active" }], ["reason undefined", { status: "active", reason: undefined }]]) {
+    const wm = applyWorld({ key: "wm-" + why });
+    const rm = { ...wm.world, next: null };
+    const pm = { read: () => got, write: () => { throw new Error("不该写"); } };
+    const bm = buildWriteSet({ plan: planSubscriptionSync(rm), world: rm, shadowDir: wm.dir, bindingControl: pm });
+    assert.equal(bm.ok, false, why); assert.equal(bm.reason, APPLY_REJECT.BINDING_CONTROL_UNREADABLE, why + "：" + JSON.stringify(bm));
+    const am = applySubscriptionSync({ shadowDir: wm.dir, lockDir: wm.lockDir, operationId: "op-suspend-nr",
+      expectedPlanId: "sync_plan_" + "0".repeat(24), readWorld: () => rm, bindingControl: pm });
+    assert.equal(am.reason, APPLY_REJECT.BINDING_CONTROL_UNREADABLE, why);
+    assert.equal(wm.read().snapshot_id, wm.snap.snapshot_id, why + "：零写入");
+    assert.equal(fs.existsSync(path.join(wm.dir, "sync-operations", "op-suspend-nr.json")), false, why + "：清单也不落");
+  }
   // paused 却没有受控 reason 也是说不清。
   const noReason = { read: () => ({ status: "paused" }), write: () => { throw new Error("不该写"); } };
   const bad2 = applySubscriptionSync({ shadowDir: w5.dir, lockDir: w5.lockDir, operationId: "op-suspend-div",

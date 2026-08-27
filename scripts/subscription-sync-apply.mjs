@@ -467,15 +467,16 @@ export function buildWriteSet({ plan, world, shadowDir, bindingControl = null })
 function readControl(port, bindingRef) {
   try {
     const got = port.read(bindingRef);
-    // **完整投影**：active ⇒ reason null；paused ⇒ reason ∈ PAUSED_REASONS。别的形状说不清。
-    if (!got || typeof got !== "object" || !Object.values(BINDING_CONTROL_STATUS).includes(got.status)) {
+    // **完整投影，键集恰好 {status, reason}**：active ⇒ reason 明确为 null；paused ⇒ reason ∈ PAUSED_REASONS。
+    // 缺 reason / undefined 不许被补成 null（评审探针）—— 那是端口没说清，不是说了 null。
+    if (!exactKeys(got, ["status", "reason"]) || !Object.values(BINDING_CONTROL_STATUS).includes(got.status)) {
       return { ok: false, detail: "binding 控制状态形状不受控" };
     }
-    const reason = got.reason ?? null;
-    if (got.status === BINDING_CONTROL_STATUS.ACTIVE ? reason !== null : !PAUSED_REASONS.includes(reason)) {
+    const { status, reason } = got;
+    if (status === BINDING_CONTROL_STATUS.ACTIVE ? reason !== null : !PAUSED_REASONS.includes(reason)) {
       return { ok: false, detail: "binding 控制状态的 reason 不受控" };
     }
-    return { ok: true, status: got.status, reason };
+    return { ok: true, status, reason };
   } catch (err) {
     return { ok: false, detail: String(err?.message ?? err).slice(0, 200) };
   }

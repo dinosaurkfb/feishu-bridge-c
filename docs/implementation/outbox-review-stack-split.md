@@ -346,8 +346,11 @@ omit, ...extra })` 必须声明 `expect.unclassified`（why **原文**）和/或
 理由与声明**逐字相等**（如 `applySuppressionCore` 的 `details[].why`），不是"被挡住了就行"。
 迁移前后测试数一致（Claude 680 → 680 + 1 条 helper 自检；Codex 257 → 257 + 1）。
 
-**边界（明说，不装作全覆盖）**：`retryProtection` / `pauseKindOf` / `retryProtectionState`
-自身的单元测试仍手写记录形状（`{ ...base, publish_attempts: n }`）—— 那些测试测的就是判据本身，
-用判据去验它们的夹具是循环的。另外 helper 挡得住 `outboxRecord({坏字段})`，挡不住
-`{ ...outboxRecord(), 坏字段 }` 这种绕开 helper 的叠补丁 —— 这一轮把两侧现存的全部迁走了，
-之后靠评审看，不加源码扫描（理由同上）。
+**边界是一条规则，不是函数清单**：被测对象就是 helper 所调用的读模型（`classifyOutboxRecord`、
+`explainabilityGaps`、`auditOutbox`、`hasPublishAuthorization`、`retryProtection` / `pauseKindOf` /
+`retryProtectionState` 等）或其直接聚合时，允许手写最小记录 —— 用判据去验判据自己的夹具是循环
+证明；**所有下游场景（CLI、状态展示、排空 / 发布 / 抑制事务、backlog 分类）必须用 helper**。
+`expect` 是封闭联合（unclassified 非空字符串 / gaps 非空字符串数组，至少一个，不认识的键拒绝），
+"声明了却什么都没说"的形状不能让合法记录冒充坏样本。helper 挡得住 `outboxRecord({坏字段})`，
+挡不住绕开它手写的对象或 `{ ...outboxRecord(), 坏字段 }` —— 这一轮把两侧现存的全部迁走了
+（评审跨行搜索独立确认），之后靠评审看，不加源码扫描（理由同上）。

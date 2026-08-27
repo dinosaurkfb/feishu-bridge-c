@@ -397,9 +397,22 @@ function outboxRecord(extra = {}) {
  * 声明与实际不符当场抛，"被挡住了就行"不算。omit 列出要删掉的键（造"缺字段"样本）。
  */
 function invalidOutboxRecord({ expect, omit = [], ...extra } = {}) {
-  if (!expect || (expect.unclassified === undefined && expect.gaps === undefined)) {
+  // **expect 是封闭联合**：unclassified 若出现必须是非空字符串；gaps 若出现必须是非空的字符串数组；
+  // 两者至少一个；不认识的键拒绝 —— `expect: { gaps: [] }` / `{ unclassified: null }` 这种
+  // "声明了却什么都没说"的形状曾能让一条完全合法的记录冒充坏样本（评审探针）。
+  const isStr = (v) => typeof v === "string" && v.trim().length > 0;
+  const isStrList = (v) => Array.isArray(v) && v.length > 0 && v.every(isStr);
+  if (expect === null || typeof expect !== "object" || Array.isArray(expect)) {
     throw new Error("invalidOutboxRecord 必须声明预期阻断原因：expect.unclassified 和/或 expect.gaps");
   }
+  const unknown = Object.keys(expect).filter((k) => k !== "unclassified" && k !== "gaps");
+  if (unknown.length > 0) throw new Error("invalidOutboxRecord：expect 里有不认识的键 " + unknown.join("、"));
+  if ("unclassified" in expect && !isStr(expect.unclassified)) throw new Error("invalidOutboxRecord：expect.unclassified 必须是非空字符串");
+  if ("gaps" in expect && !isStrList(expect.gaps)) throw new Error("invalidOutboxRecord：expect.gaps 必须是非空的字符串数组");
+  if (!("unclassified" in expect) && !("gaps" in expect)) {
+    throw new Error("invalidOutboxRecord 必须声明预期阻断原因：expect.unclassified 和/或 expect.gaps");
+  }
+  if (!isStrList(omit) && !(Array.isArray(omit) && omit.length === 0)) throw new Error("invalidOutboxRecord：omit 必须是字符串数组");
   const rec = { ...outboxDefaults(), ...extra };
   for (const k of omit) delete rec[k];
   const verdict = classifyOutboxRecord(rec);
@@ -15291,6 +15304,18 @@ test("outbox 夹具 helper 自己守约束：合法产出过审计；坏样本�
   ]) assert.throws(() => outboxRecord(extra), /invalidOutboxRecord/u, why + "：outboxRecord 不许造出坏样本");
   // ③ invalidOutboxRecord：必须声明；声明要与读模型逐字相符（why 原文、gaps 有序逐字）；没声明的那一项必须干净。
   assert.throws(() => invalidOutboxRecord({ target_channel_generation_id: "   " }), /必须声明预期阻断原因/u, "不声明不行");
+  // expect 是封闭联合："声明了却什么都没说"的形状一律拒绝（评审探针：gaps:[] / unclassified:null 曾放行合法记录）。
+  for (const [why, expect, pattern] of [
+    ["gaps 空数组", { gaps: [] }, /gaps 必须是非空的字符串数组/u],
+    ["gaps 不是数组", { gaps: "kind" }, /gaps 必须是非空的字符串数组/u],
+    ["gaps 含空串", { gaps: ["kind", ""] }, /gaps 必须是非空的字符串数组/u],
+    ["unclassified 为 null", { unclassified: null }, /unclassified 必须是非空字符串/u],
+    ["unclassified 为空串", { unclassified: "" }, /unclassified 必须是非空字符串/u],
+    ["不认识的键", { reason: "x" }, /不认识的键 reason/u],
+    ["expect 是数组", ["kind"], /必须声明预期阻断原因/u],
+    ["expect 为空对象", {}, /必须声明预期阻断原因/u],
+  ]) assert.throws(() => invalidOutboxRecord({ expect }), pattern, why);
+  assert.throws(() => invalidOutboxRecord({ omit: "published_at", expect: { unclassified: "缺 published_at，无法归类" } }), /omit 必须是字符串数组/u);
   assert.throws(() => invalidOutboxRecord({ target_channel_generation_id: "   ", expect: { gaps: ["kind"] } }),
     /声明的解释缺口是 \["kind"\]，实际 \["target_channel_generation_id"\]/u, "gaps 声明错了要抛");
   assert.throws(() => invalidOutboxRecord({ published_at: false, expect: { unclassified: "published_at 不对" } }),

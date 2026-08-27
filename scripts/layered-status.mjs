@@ -234,7 +234,9 @@ const shortKey = (key) => (typeof key === "string" && key.length > 0 ? key.slice
 const WHY_MAX = 120;
 const clipWhy = (text) => {
   const safe = redactRunText(text);
-  return safe.length > WHY_MAX ? safe.slice(0, WHY_MAX) + "…（已截断）" : safe;
+  // 按 code point 截，不按 code unit —— 边界落在 emoji 中间会留下孤立的高代理项（评审探针）。
+  const points = Array.from(safe);
+  return points.length > WHY_MAX ? points.slice(0, WHY_MAX).join("") + "…（已截断）" : safe;
 };
 
 /**

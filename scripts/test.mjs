@@ -14864,6 +14864,17 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
     assert.deepEqual(inv.runs, []);
     const r = f.drain();
     assert.equal(r.status, "empty", JSON.stringify(r));
+    // 封闭投影：只有 stderr 没有主制品 → forward_incomplete；正常两文件旁多出发布回执 → forward_run_conflict。
+    const half = claimKeyFor("forward-half");
+    fs.writeFileSync(path.join(f.runs, half + ".forward.stderr.log"), "");
+    writeClaimFixture({ claimsDir: f.claims, key: half, root: f.h.dir });
+    recordClaimState({ claimsDir: f.claims, key: half, state: "handed_off", detail: { mode: "live_session", observed_by: "inbound" } });
+    fs.writeFileSync(path.join(f.runs, fwd + ".published.json"), JSON.stringify({ published_at: "2026-08-27T00:00:00.000Z", feishu_message_id: "om_x" }));
+    const inv2 = inventoryRuns({ runsDir: f.runs, claimsDir: f.claims });
+    const reasons2 = Object.fromEntries(inv2.problems.map((x) => [x.key, x.reason]));
+    assert.equal(reasons2[half], "forward_incomplete", JSON.stringify(inv2.problems));
+    assert.equal(reasons2[fwd], "forward_run_conflict", "**转发型 key 旁多出 run 通道制品不许静默藏掉**：" + JSON.stringify(inv2.problems));
+    fs.rmSync(path.join(f.runs, fwd + ".published.json"));
     // 只有终局记录、连 forward 制品都没有的，仍是孤儿。
     const bare = claimKeyFor("bare-terminal");
     writeClaimFixture({ claimsDir: f.claims, key: bare, root: f.h.dir });
@@ -15428,6 +15439,14 @@ test("第五区 run 通道：只转述 inspectRunChannel 的结论 —— 未查
   assert.equal(clipped[1].endsWith("…（已截断）"), true, clipped[1]);
   assert.ok(clipped[1].length < 160, "**截断后一行要能在手机上读完**：" + clipped[1].length);
   assert.equal(clipped[1].startsWith("watcher_publish_failed：Command failed: lark-cli --text 正文"), true);
+  // 按 code point 截：边界落在 emoji 中间不许留下孤立代理项。
+  const emoji = String.fromCodePoint(0x1F600);
+  const emojiWhy = "a" + emoji.repeat(200);
+  const clippedEmoji = rowsOf({ ...classified, runs: { ...classified.runs, stuck: [{ key: "a".repeat(64), reason: "x", why: emojiWhy }] } })[2][1];
+  const body = clippedEmoji.slice(0, clippedEmoji.indexOf("…（已截断）"));
+  const last = body.charCodeAt(body.length - 1);
+  assert.equal(last >= 0xD800 && last <= 0xDBFF, false, "**截断不许留下孤立的高代理项**");
+  assert.equal(Array.from(body).length, "x：".length + 120, "按 code point 数满 120");
   const rendered = JSON.stringify(rows);
   assert.equal(rendered.includes("f".repeat(64)), false, "**完整 key 不许出现**");
   assert.equal(rendered.includes("om_secret123"), false, "**消息 id 是 locator，不许出现**");

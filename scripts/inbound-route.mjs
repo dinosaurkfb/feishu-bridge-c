@@ -31,7 +31,7 @@ import {
 } from "./subscription.mjs";
 import {
   activatePendingTopicGeneration, materializeLegacyTopicFields, pendingGeneration,
-  topicGenerationStateForLegacy,
+  topicGenerationStateForLegacy, effectiveBindingId,
 } from "./topic-generation.mjs";
 
 // 幂等列表住在 project-resolve（它是更低层的那个模块），从这里转出去，
@@ -358,7 +358,7 @@ export function promoteBinding({
       catch (err) {
         return { ok: false, reason: "mapping_unreadable", error: String(err.message).slice(0, 200) };
       }
-      const bindingId = mapping.binding_id ?? (path.basename(root) + "@project-files");
+      const bindingId = effectiveBindingId(mapping, { root });
       const loaded = topicGenerationStateForLegacy(mapping, { runtime: "claude", bindingId, now });
       if (!loaded.ok) return loaded;
       const activated = activatePendingTopicGeneration(loaded.state, {

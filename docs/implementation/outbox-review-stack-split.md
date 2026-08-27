@@ -30,7 +30,79 @@ CLI 只解析显示）；预览打印完整可执行命令过 shellQuote，真 s
 派生）；watcher 初始路径补 `requireRunId`；恢复消费者下沉到 `scripts/codex/`
 并在授权前验 run 复合凭据（两个制品各自验，AND 不是 OR）。
 内容绑定（成功回执封两份 SHA-256，验真器每份制品只读一次）见 §4.1 更正。
-待做：步骤 2 —— `eligibility_pending` 恢复链之外的 watcher 接线复核。
+**第 5 层剩余 · 步骤 2 已完成**（分支 `fix/watcher-claim-tristate`，评审十六轮，放行于 81a1ffc）。
+**步骤 2（watcher 接线复核）结论**：逐分支复核 Codex watcher（启动扫描、完成/失败/
+超时分支、session lock 释放、claim 状态记录、Dialogue 收口）并对照 R2b1 第二通道的
+三课（claim 互斥 / 回执三态 / reap 锁）。受控无抛点：启动扫描与验真入口对任何磁盘
+内容都返回受控结果（步骤 1 的 P1-2 修后），循环里无可驱动的抛点。**发现并修一处**：
+`readClaim` 把「缺席 / 读不出 / claim_key 对不上」折成 `null`，两个 watcher 拿 null 当
+legacy 现算当前代际（Claude 侧还决定 outbox 归属：会话级靠 `claude_session_id`）——
+说不清来源却猜了个目标，正是回执三态那一课。修：`readClaimState` 三态成为唯一判据
+（`readClaim` 变薄包装）；**valid 要能解释这张 claim**（固定字段、规范时间、非空来源
+代际、路由字段形状；Codex 侧交叉核对 task / thread，Claude 侧核对逻辑 task），未知
+扩展字段允许；key 形状守在读写核心（评审实测 Claude watcher 的 key 能路径穿越）。
+两个 watcher 与 Codex Stop hook 入站分支非 valid 即 fail-closed（watcher：不发布、
+failed 记录先落、session lock 保留交陈旧检测；Codex 侧另发 risk —— **risk 走 task
+当前话题是有意的 task 级告警**，与失败/超时分支同一语义，不是 run 结果；Stop：不入队）。
+claim 要能被**解释**才算 valid：key 按 claimKey(message_id, logical_task_key) 重算、
+policy 受控组合、来源代际非空、会话 id 为 uuid；**期望身份由 inbound 独立传入**
+（env 契约 watcherExpectEnv / readWatcherExpectEnv 共享层一份），有效绑定身份只有
+一份投影 effectiveBindingId（旧 project-file 映射的 id 在 topic_generation_state）；
+Claude watcher 启动期核当前目的地、run 制品**读不出（非缺席）立即受控退出**（failed
+{run_unreadable}、锁保留，不拖到四小时超时误报）、**终局之后重新解析再核**并用新鲜快照发布
+（运行中关开关 / 绑定漂移 → 零发布、failed{binding_drift}；绑定暂停 → 受控不发布：
+本地终局照记、Dialogue 照收口，两条发布通道都不走；**run 结果留在 runs 目录保持
+"待发布"（回执 absent），不转交、不另立账本** —— 定时排空充当 run 通道的恢复消费者：
+每轮先看 runs（inventoryRuns 联合盘点：以**第一次目录快照**驱动，对 JSONL / 终局记录 /
+发布回执 / 失败账做 key 并集 —— 孤儿 sidecar、不是 JSON 的终局记录、坏回执都是
+problems，不折叠成空），**只认 watcher 终局记录里明确记载"因绑定暂停而延期发布"的
+run** —— 该记录即授权凭据：终态唯一（handed_off / failed 不许并存）、**语义封闭**
+（handed_off ↔ completed，failed ↔ failed|blocked，observed_by 必须是受控 watcher，
+publish_deferred 恰好 {reason, why, consumer}）、与实际 outcome 相符、绑定 JSONL 字节
+摘要（记录写完后换正文发不出去）、**绑定路由投影摘要** route_sha256 =
+sha256({binding_id, claude_session_id, origin_channel_generation_id, 解析后 root_message_id})
+—— 记录写完后改 claim 的来源代际就发不出去（评审探针 om_new）；写方与读方共用
+`runRouteSha256`。**单快照**：watcher 终局与排空发布都经 `readRunSnapshot` 一次读取
+JSONL，outcome / 正文 / 摘要来自同一份字节（`parseRunOutcome` 按文本解析），不再有
+"验 B 发 A"的窗口；**key 边界**：run 制品的所有路径只从 `runPaths` 派生（CLAIM_KEY_SHAPE
+不过就没有路径，七个原语在任何 I/O 前受验 —— 评审实测 `../../secret` 读出了 runsDir 外的
+文件）；盘点对**不认识的条目**报 unrecognized_entry（bad.jsonl / bad.handed_off.json 不许消失）；
+合法 JSON 但非事件对象的行受控成 run 状态 invalid（problems invalid_jsonl，不抛）；终局记录在
+盘点层至少要是记录对象（null / 数组 → terminal_unreadable），授权语义留给 readTerminalRecord；
+历史 run、身份漂移的 failed 记录待人工分类；
+**watcher 当时发过又失败的只可见（stuck watcher_publish_failed）不自动重试** ——
+那类失败原因未受验，自动重试只是制造噪音，留给人判断；claim 自身缺席/损坏是 stuck、合法但属于
+别的绑定才正常跳过（期望身份由本次排空目标给出），目标取 claim 冻结的原始代际，
+重试预算有界（5 次；账本键集封闭 {schema_version, run_id, attempts, at, source, error}，
+旧形状须规范时间与非空 error，坏账不发，尝试在 claim 内预留、账写不进去不发；
+**未闭合的 reservation**（error 为 reserved / delivered_unrecorded）= 送达状态不确定，
+stuck reservation_unresolved 禁止自动重试，dry-run 也不报成将发布；账本对"还许不许发"的
+投影 `publishHold` 只有一份且**联合封闭**（只有 absent 与预算未耗尽的 valid 放行，不认识的
+形状一律 ledger_unreadable），**直发 CLI 与 watcher 共用**，且三条入口都在 **claim 之内重读
+账本**（启动扫描到拿到 claim 之间账本可能已变成 reserved —— 评审探针；回归用 FIFO 账本做
+时序编排：第一次读给可重试、第二次读给 reserved）：直发把这类 run 列成"待人工"、普通
+--publish 拒绝且不提供覆盖；watcher 对 reserved / 说不清 / 预算耗尽也不发，唯一例外是
+**精确的** `reap_lock_held` 旧账（维护清锁后重跑 watcher 的恢复路径）。旧账是两个真实写方
+的封闭联合并带 kind：`{at, error}`（publish_error）与 `{at, reason:"reap_lock_held", detail:string|null}`
+（reap_lock_held）；别的 reason、缺 detail、detail 类型不对一律说不清（评审探针：at+reason 的
+账曾被当成 legacy 豁免，watcher 照发）。`absent` 只对应 attempts 0、`valid` 只对应 ≥ 1。**写到一半的临时制品**
+（`<key>.published.json.tmp.*` / `.publish-failed.json.tmp.*`：发布返回之后、rename 之前停住）
+由 readRunReceipt / readPublishLedger 自己探测为"状态未闭合"（unreadable），所有读方一致
+fail-closed，普通入口不得选择它），经同一把
+claimRunPublish → claim 下重读回执 → 发 → markPublished（单独接住：送达但回执没落 =
+deliveredUnrecorded，提示可能重发；这一笔账也写不进去 → problems ledger_unwritable）→ 释放；run 通道独立
+于 outbox 预检（outbox 损坏不截断它）；只有 run 通道时状态为 runs_only，不伪造 outbox
+段；dry-run 零副作用只报告；结果随排空所有分支输出，Stop hook 与 CLI 都渲染。直发 CLI 也先 claim 再重读
+回执再发（参数严格白名单，`--root=` 绝对路径，发布须显式 root 与精确 `--key=`）。
+**方案变更理由**：此前实现是"run 结果转成 outbox 记录 + 两阶段转交回执"，评审四轮各
+击穿一处（作用域未绑、dryRun 改盘、恢复清单未从回执枚举、失败折叠成空）—— 它是在
+run 通道已有的账本（claim 互斥 / 回执三态 / reap 锁）旁边又立的一本账，属于工艺要求
+里禁止的"第二份判据"；改为复用既有账本后，这些制品与状态机整体删除。
+锁按阶段：启动期拒绝留锁交
+陈旧检测，终局期 run 已结束则放锁）。
+夹具同步补齐像真的 claim（派生 key、期望身份从项目真实解析派生）。
+Codex 侧并发靠 outbox 事务的发布锁互斥，无需 run 通道 claim；失败/超时分支的抑制
+与 risk 接线未见缺口。
 
 集成基准分支：`integration/outbox-review-baseline`（原 `feat/outbox-review`，9 笔提交）。
 它**不作为交付路径**，只作为"这些改动曾经一起跑通过"的参照。
@@ -58,7 +130,7 @@ CLI 只解析显示）；预览打印完整可执行命令过 shellQuote，真 s
 | 2 | `feat/outbox-review-read-model` | 只读视图 + 共用读取语义硬化 | 已合 #58 |
 | 3 | `fix/outbox-suppression-transaction` | 抑制事务（**含统一写锁**） | 已合 #60 |
 | 4 | `fix/codex-manual-drain-cas` | 手工发布计划与目标 CAS | 本轮（见上「第 4 层剩余：已完成」） |
-| 5 | `fix/codex-auto-publish-lifecycle` | 自动发布生命周期 | **未开始** |
+| 5 | `fix/codex-auto-publish-lifecycle` / `fix/watcher-claim-tristate` | 自动发布生命周期 | 步骤 1 已合 #70；步骤 2 评审 16 轮放行（81a1ffc），本轮合并 |
 | 6 | `fix/claude-outbox-fail-closed` | Claude 侧接线 | 已合 #59 |
 
 依赖：3、4、5 都建立在第 2 层给出的读模型上（`auditOutbox` / `outboxMutationBlocker` /

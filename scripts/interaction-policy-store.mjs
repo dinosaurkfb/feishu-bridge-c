@@ -8,6 +8,7 @@ import {
   reserveDialogueTurn, setInteractionPolicyMode,
 } from "./interaction-policy.mjs";
 import { projectMappingPath, resolveProject, selectBindingEntry } from "./project-resolve.mjs";
+import { effectiveBindingId } from "./topic-generation.mjs";
 import { acquirePublishLock, registryPath, releasePublishLock } from "./registry.mjs";
 
 const writeJsonAtomic = (file, value) => {
@@ -36,7 +37,7 @@ export function loadClaudeInteractionPolicy({
 } = {}) {
   const resolved = resolveProject({ root, claudeSessionId, registryFile });
   if (!resolved.ok) return resolved;
-  const bindingId = resolved.mapping?.binding_id;
+  const bindingId = effectiveBindingId(resolved.mapping, { root });
   const loaded = interactionPolicyStateForLegacy(resolved.mapping, { bindingId, now });
   if (!loaded.ok) return loaded;
   return {
@@ -78,7 +79,8 @@ function mutateClaudeInteractionPolicy({
       catch (err) {
         return { ok: false, reason: "mapping_unreadable", error: String(err.message).slice(0, 200) };
       }
-      const bindingId = record.binding_id ?? (path.basename(root) + "@project-files");
+      // 锁内重读的是原始记录，投影仍只有那一份。
+      const bindingId = effectiveBindingId(record, { root });
       const loaded = interactionPolicyStateForLegacy(record, { bindingId, now });
       if (!loaded.ok) return loaded;
       const changed = mutate(loaded.state, record);

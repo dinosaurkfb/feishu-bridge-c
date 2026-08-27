@@ -17,6 +17,7 @@
  */
 
 import fs from "node:fs";
+import { effectiveBindingId } from "./topic-generation.mjs";
 import os from "node:os";
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
@@ -157,7 +158,7 @@ async function main() {
     // 只结束 active_turn.runtime_target_id 与本会话严格相同的回合，其他会话的 Stop 不得碰它。
     if (!ownedByBridge && speakingSession && bound.ok) {
       const interaction = interactionPolicyStateForLegacy(bound.mapping, {
-        bindingId: bound.mapping?.binding_id,
+        bindingId: effectiveBindingId(bound.mapping, { root: project.root }),
       });
       const activeTurn = interaction.ok ? interaction.state.dialogue?.active_turn : null;
       if (interaction.ok && interaction.state.policy_id === DIALOGUE_POLICY_ID &&
@@ -340,6 +341,24 @@ async function main() {
     } else if (r.status === "skipped" && r.reason === "mapping_not_active") {
       // 这条必须说出来：绑定失效时进展会无限期堆在本地，而 Frank 什么都收不到。
       notes.push("飞书出站：" + who + " 的话题绑定已失效，" + r.count + " 条进展发不出去，需要重签绑定。");
+    }
+    // run 通道（暂停期间留下的 run 结果）的结果随每种状态一起说，不许被折叠。
+    const runs = r.runs;
+    if (runs) {
+      if (runs.published.length > 0 && !runs.dryRun) {
+        notes.push("飞书出站：" + who + " 经 run 通道补发了 " + runs.published.length + " 条暂停期间的执行结果。");
+      }
+      if ((runs.deliveredUnrecorded ?? []).length > 0) {
+        notes.push("飞书出站：" + who + " 有 " + runs.deliveredUnrecorded.length +
+          " 条 run 结果送达后回执没落，**下一轮可能重发**，先去话题核对。");
+      }
+      if (runs.stuck.length > 0) {
+        notes.push("飞书出站：" + who + " 有 " + runs.stuck.length + " 条 run 结果卡住（" +
+          [...new Set(runs.stuck.map((x) => x.reason))].join("、") + "），需要人看一眼。");
+      }
+      if ((runs.problems ?? []).length > 0) {
+        notes.push("飞书出站：" + who + " 的 runs 账本有 " + runs.problems.length + " 处说不清，需要人看一眼。");
+      }
     }
     if (notes.length > before) reported.push(project);
   }

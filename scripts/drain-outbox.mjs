@@ -18,12 +18,18 @@ import {
   MAX_AUTO_PUBLISH_ATTEMPTS, auditOutbox, composeDigest, listPending, outboxMutationBlocker,
 } from "./outbox.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
-import { PUBLISH_FAILURE, classifyPublishFailure, publishDraft } from "./outbound.mjs";
+import {
+  PUBLISH_FAILURE, buildDraft, claimRunPublish, classifyPublishFailure, inventoryRuns, markPublished,
+  publishDraft, publishHold, readPublishLedger, readRunReceipt, readRunSnapshot, releaseRunPublishClaim,
+  runRouteSha256, writePublishLedger,
+} from "./outbound.mjs";
+import { isCanonicalIso } from "./canonical-time.mjs";
+import { readClaimState } from "./claim.mjs";
 import { publishOutboxAttempt } from "./publish-attempt.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
 import { isLockStale } from "./handoff.mjs";
-import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
+import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { isDirectRun, moduleRoot } from "./direct-run.mjs";
 import {
   businessActivitiesForPublishedBatch, recordClaudeActivityAndMaybeRotate,
@@ -157,15 +163,30 @@ export function drainProject({
   // outbox 路径是普通文件时也返回 empty；真实 Stop 面对这种 outbox **完全无输出**。
   // **"读不出来"被报成"没有东西可发"，是这条线上反复出现的同一个错误。**
   const preflight = outboxMutationBlocker(auditOutbox(outboxDir));
-  if (preflight) return { status: "error", root, ...preflight, local: true };
-  if (listPending({ outboxDir }).length === 0) return { status: "empty", root };
+  // **run 通道的恢复消费者住在这里**：watcher 在绑定暂停时不发、run 结果留在 runs 目录
+  // 保持"待发布"（回执 absent）；watcher 已退出、后续 watcher 只管自己的 key，所以每轮
+  // 排空要看一眼 runs —— 用 run 通道自己的账本（claim 互斥 / 回执三态）发，不另立账本。
+  // **run 是事务外第二通道**：outbox 损坏不该截断它，所以 outbox 预检的结论先存着，
+  // run 通道照常跑，最后两侧结果合在一起返回。runs 账本自己坏了也要作为 problems 报出来。
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs");
+  const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
+  const inventory = inventoryRuns({ runsDir, claimsDir });
+  const runProblems = inventory.ok ? inventory.problems
+    : [{ key: null, reason: inventory.reason, why: inventory.error ?? null }];
+  const pendingRuns = inventory.ok ? inventory.runs.filter((r) => r.eligible) : [];   // 账本 hold 的也进来，按 stuck 报
+  const runsIdle = () => ({ pending: pendingRuns.length, published: [], skipped: [], stuck: [],
+    deliveredUnrecorded: [], problems: runProblems, dryRun: dryRun === true });
+  const nothingToDo = pendingRuns.length === 0 && runProblems.length === 0;
+  // 所有返回都带 runs 段 —— 消费方不用猜"没有这段"是没跑还是没东西。
+  if (preflight && nothingToDo) return { status: "error", root, ...preflight, local: true, runs: runsIdle() };
+  if (!preflight && listPending({ outboxDir }).length === 0 && nothingToDo) return { status: "empty", root, runs: runsIdle() };
 
   // 项目文件优先，没有就回落到「机器模板 + 登记表那一行」。
   // 已接好的项目走前一条，行为不变；新接的项目目录里一个配置文件都没有。
   const resolved = resolveProject({ root, claudeSessionId });
   if (!resolved.ok) {
     // not_bound 是「有 outbox 但没接桥」—— 会被 CLI 和钩子分别报出来，不静默。
-    return { status: "error", root, reason: resolved.reason, error: resolved.error ?? null };
+    return { status: "error", root, reason: resolved.reason, error: resolved.error ?? null, runs: runsIdle() };
   }
   // 发布真的需要 config（身份、profile、二进制路径），所以到这一步 configError 就是硬错。
   // 到期预警不需要 config，所以那条路径拿到 configError 也照常工作 —— 见 project-resolve.mjs。
@@ -178,6 +199,7 @@ export function drainProject({
       status: "error", root,
       reason: ce.reason ?? "config_unreadable",
       error: parts.filter(Boolean).join("；") || null,
+      runs: runsIdle(),
     };
   }
   const { config: cfg, mapping } = resolved;
@@ -199,14 +221,25 @@ export function drainProject({
   if (!force && cfg.auto_publish_on_completion === false) {
     return {
       status: "skipped", root, reason: "auto_publish_disabled",
-      count: listPending({ outboxDir }).length,
+      count: listPending({ outboxDir }).length, runs: runsIdle(),
     };
   }
 
-  // 绑定失效时不发：话题可能已经不再是 Frank 认可的那个。
+  // 绑定失效时不发：话题可能已经不再是 Frank 认可的那个。run 结果也一并留着。
   if (mapping.status !== "active") {
-    return { status: "skipped", root, reason: "mapping_not_active", count: listPending({ outboxDir }).length };
+    return { status: "skipped", root, reason: "mapping_not_active", count: listPending({ outboxDir }).length,
+      runs: runsIdle() };
   }
+
+  // —— run 通道：暂停期间留下的 run 结果，经 run 通道自己的账本发 ——
+  const runs = drainRunResults({ root, runsDir, claimsDir, pendingRuns, problems: runProblems, mapping, cfg, id,
+    dryRun, publish, timeoutMs,
+    claudeSessionId: resolved.claudeSessionId ?? mapping.claude_session_id ?? claudeSessionId });
+  // outbox 预检不过：run 通道已经跑完，现在才把 outbox 的结论报出来（两侧都在）。
+  if (preflight) return { status: "error", root, ...preflight, local: true, runs };
+  // 只有 run 通道：给它自己的中性状态，别伪造 "published, count:0"（评审实测：
+  // dry-run 打出「已发布 0 条 -> null」）。
+  if (listPending({ outboxDir }).length === 0) return { status: "runs_only", root, runs };
 
   // **锁内的一切交给唯一发布事务。**这里只提供 Claude 侧的四样：
   // 怎么解析目标代际、怎么构卡、用哪个身份发、发完一批记什么账。
@@ -239,11 +272,13 @@ export function drainProject({
   });
 
   // 入口只做入口的事：补上 root、Claude 特有的措辞素材与跨应用诊断。
+  // **run 通道的结果随所有分支一起输出** —— 只挂在某一支上，失败就会被折叠成"空"。
   if (r.status === "dry_run") {
     return {
       status: "dry_run", root, count: r.count,
       cards: r.batches.map((item) => item.card),
       text: composeDigest(r.selected, { taskName: cfg.task_display_name }),
+      runs,
     };
   }
   if (r.status === "error" && r.reason === "publish_failed") {
@@ -255,7 +290,7 @@ export function drainProject({
     });
     const { failingTarget, ...rest } = r;
     return {
-      ...rest, root,
+      ...rest, root, runs,
       diagnosis: diagnosis.kind === PUBLISH_FAILURE.ROOT_OWNED_BY_OTHER_APP
         ? { kind: diagnosis.kind, ownerName: diagnosis.ownerName ?? null,
             generationId: failingTarget?.generationId ?? failingTarget?.channelGenerationId ?? null,
@@ -263,7 +298,163 @@ export function drainProject({
         : null,
     };
   }
-  return { ...r, root };
+  return { ...r, root, runs };
+}
+
+
+/**
+ * watcher 写下的终局记录（handed_off / failed）—— 自动恢复只认它里面**明确记载**的
+ * "延期发布"。没有这条记录的历史 run、身份漂移之类的 failed 记录，一律不自动捞起，
+ * 交人分类（评审实测：合法 claim + 终局制品但无 watcher 标记的历史 run，一次排空就
+ * 真实发布了；安装后现有定时器会把历史 run 全部捞起）。
+ */
+function readTerminalRecord({ claimsDir, key }) {
+  const found = [];
+  for (const state of ["handed_off", "failed"]) {
+    const file = path.join(claimsDir, key + "." + state + ".json");
+    let raw;
+    try { raw = fs.readFileSync(file, "utf-8"); }
+    catch (err) { if (err.code === "ENOENT") continue; return { ok: false, reason: "terminal_unreadable", why: String(err.code ?? err.message) }; }
+    found.push({ state, raw });
+  }
+  if (found.length === 0) return { ok: false, reason: "publish_not_authorized", why: "没有 watcher 的终局记录（历史 run）—— 待人工分类" };
+  // **终态唯一**：handed_off 与 failed 同时存在说不清哪个是真的（评审探针：固定先取前者就发了）。
+  if (found.length > 1) return { ok: false, reason: "terminal_ambiguous", why: "handed_off 与 failed 记录同时存在" };
+  const { state, raw } = found[0];
+  let doc;
+  try { doc = JSON.parse(raw); } catch { return { ok: false, reason: "terminal_unreadable", why: "不是 JSON" }; }
+  if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return { ok: false, reason: "terminal_unreadable", why: "不是记录对象" };
+  if (doc.schema_version !== "1.0" || doc.claim_key !== key || doc.state !== state || !isCanonicalIso(doc.recorded_at)) {
+    return { ok: false, reason: "terminal_unreadable", why: "固定字段对不上" };
+  }
+  if (doc.observed_by !== "watch-and-publish") return { ok: false, reason: "terminal_unreadable", why: "observed_by 不是受控 watcher" };
+  const deferred = doc.publish_deferred;
+  if (deferred === undefined) {
+    // 没有延期记载的终局（watcher 启动/终局期 refuse 写的 failed、历史 run）：待人工分类。
+    return { ok: false, reason: "publish_not_authorized", why: "终局记录里没有「因绑定暂停而延期发布」的记载 —— 待人工分类" };
+  }
+  // **终态语义封闭**：handed_off 只对应 completed；failed 只对应 failed|blocked。
+  const allowed = state === "handed_off" ? ["completed"] : ["failed", "blocked"];
+  if (!allowed.includes(doc.run_state)) return { ok: false, reason: "terminal_unreadable", why: state + " 不该对应 run_state " + String(doc.run_state) };
+  if (deferred === null || typeof deferred !== "object" || Array.isArray(deferred)
+    || Object.keys(deferred).sort().join(",") !== "consumer,reason,why"
+    || deferred.reason !== "mapping_not_active" || typeof deferred.why !== "string" || typeof deferred.consumer !== "string") {
+    return { ok: false, reason: "terminal_unreadable", why: "publish_deferred 不是受控形状" };
+  }
+  // 授权凭据要绑定它授权的确切制品与最终投递意图：JSONL 字节摘要 + 路由投影摘要。
+  if (!/^[0-9a-f]{64}$/u.test(String(doc.artifact_sha256))) {
+    return { ok: false, reason: "terminal_unbound", why: "终局记录没有绑定制品摘要（artifact_sha256）" };
+  }
+  if (!/^[0-9a-f]{64}$/u.test(String(doc.route_sha256))) {
+    return { ok: false, reason: "terminal_unbound", why: "终局记录没有绑定路由摘要（route_sha256）" };
+  }
+  return { ok: true, state, runState: doc.run_state, artifactSha256: doc.artifact_sha256, routeSha256: doc.route_sha256 };
+}
+
+/**
+ * **run 通道排空**：只消费回执 absent、已终局、且 watcher 终局记录明确记载"因绑定暂停而
+ * 延期发布"的 run。每条：终局记录验真 → claim 自身验真（缺席/损坏 = stuck）→ 归属核对
+ * （bindingId / claudeSessionId 由本次排空目标给出，不信 claim 自报；属于别的绑定才
+ * 静默跳过）→ 目标取 claim 冻结的原始代际 → 重试预算 → claimRunPublish → claim 下重读
+ * 回执 → 发 → markPublished（**单独接住**：送达但回执没落 = deliveredUnrecorded，
+ * 不记失败、明确提示可能重发）→ 轮转记账 → 释放。dryRun 零副作用，只报告。
+ */
+function drainRunResults({ root, runsDir, claimsDir, pendingRuns, problems, mapping, cfg, id, dryRun, publish, timeoutMs, claudeSessionId }) {
+  const out = { pending: pendingRuns.length, published: [], skipped: [], stuck: [],
+    deliveredUnrecorded: [], problems: [...(problems ?? [])], dryRun: dryRun === true };
+  const expect = { bindingId: effectiveBindingId(mapping, { root }), claudeSessionId: claudeSessionId ?? null };
+  for (const listed of pendingRuns) {
+    const key = listed.key;
+    // **一次读取的快照**：outcome、正文、摘要、账本来自同一次读取 —— 拿新摘要给旧草稿背书是评审
+    // 实测击穿过的形状。授权凭据要跟实际 outcome 与确切制品对上。
+    const snap = readRunSnapshot({ runsDir, key });
+    if (!snap.ok) { out.stuck.push({ key, reason: "artifact_unreadable", why: snap.why }); continue; }
+    const run = snap.run;
+    // watcher 发过又失败（旧形状失败账）→ **只可见、不自动重试**：那类失败原因未受验
+    // （网络 / 凭据 / 话题归属），自动重试是在制造噪音，留给人判断 —— 不论终局记录写了什么。
+    if (run.ledger.state === "legacy") { out.stuck.push({ key, reason: "watcher_publish_failed", why: run.ledger.error }); continue; }
+    const terminal = readTerminalRecord({ claimsDir, key });
+    if (!terminal.ok) { out.stuck.push({ key, reason: terminal.reason, why: terminal.why }); continue; }
+    if (!run.eligible) { out.skipped.push({ key, reason: "receipt_" + snap.receipt.state, why: snap.receipt.why ?? null }); continue; }
+    if (terminal.runState !== run.state) {
+      out.stuck.push({ key, reason: "outcome_mismatch", why: "终局记录说 " + terminal.runState + "，实际 " + run.state }); continue;
+    }
+    if (snap.sha256 !== terminal.artifactSha256) {
+      out.stuck.push({ key, reason: "artifact_mismatch", why: "run 制品与终局记录绑定的摘要对不上" }); continue;
+    }
+    // claim 自身先验：缺席 / 损坏是 stuck；合法但属于别的绑定才是正常跳过。
+    const own = readClaimState({ claimsDir, key });
+    if (own.status !== "valid") { out.stuck.push({ key, reason: "claim_" + own.status, why: own.why ?? null }); continue; }
+    const scoped = readClaimState({ claimsDir, key, expect });
+    if (scoped.status !== "valid") { out.skipped.push({ key, reason: "other_binding", why: scoped.why ?? null }); continue; }
+    const origin = scoped.claim.origin_channel_generation_id;
+    const target = resolveMappingOutboundGeneration(mapping, origin);
+    if (!target.ok) { out.stuck.push({ key, reason: "origin_generation_unavailable", why: target.reason }); continue; }
+    // 凭据绑定的是**最终投给谁**：绑定、会话、来源代际、解析后的目标 —— 记录写完后改 claim
+    // 的来源代际，就发去了另一个话题（评审探针 om_new）。
+    const route = runRouteSha256({ bindingId: expect.bindingId, claudeSessionId: expect.claudeSessionId,
+      originGenerationId: origin, rootMessageId: target.rootMessageId });
+    if (route !== terminal.routeSha256) { out.stuck.push({ key, reason: "route_mismatch", why: "最终投递路由与终局记录绑定的对不上" }); continue; }
+    const text = buildDraft(run, { taskName: cfg.task_display_name });
+    if (!text) { out.skipped.push({ key, reason: "no_draft" }); continue; }
+    // 锁外先看账本投影（与直发 CLI 同一份判据 publishHold）；有约束力的那次在 claim 内。
+    if (run.hold) { out.stuck.push({ key, reason: run.hold.reason, why: run.hold.why }); continue; }
+    if (dryRun) { out.published.push({ key, dryRun: true, target: target.rootMessageId }); continue; }
+    const owned = claimRunPublish({ runsDir, key });
+    if (!owned.ok) {
+      (owned.reason === "reap_lock_held" || owned.reason === "io_error" ? out.stuck : out.skipped)
+        .push({ key, reason: owned.reason, why: owned.detail ?? owned.error ?? null });
+      continue;
+    }
+    try {
+      const receipt = readRunReceipt({ runsDir, key });
+      if (receipt.state !== "absent") { out.skipped.push({ key, reason: "receipt_" + receipt.state, why: receipt.why ?? null }); continue; }
+      // **账本在 claim 内重读并预留这次尝试** —— 两个并发排空锁外各读到 4，串行拿到 claim
+      // 后会执行第 5、6 次；预留写不进去就不发（账本更新不了 = 不许自动尝试）。
+      const ledger = readPublishLedger({ runsDir, key });
+      const hold = publishHold(ledger);
+      if (hold) { out.stuck.push({ key, reason: hold.reason, why: hold.why }); continue; }
+      const reserved = writePublishLedger({ runsDir, key, attempts: ledger.attempts + 1, error: "reserved" });
+      if (!reserved.ok) { out.stuck.push({ key, reason: "ledger_unwritable", why: reserved.why }); continue; }
+      const runRecord = { kind: run.state === "completed" ? "reply" : "risk", text,
+        source: "claude-run-drain", target_channel_generation_id: origin, run_id: key };
+      let mid;
+      try {
+        mid = publish({
+          profile: id.profile, rootMessageId: target.rootMessageId,
+          card: composeOutboundCard([runRecord], { taskName: cfg.task_display_name, runtime: "claude" }),
+          larkBin: id.bin, larkHome: id.configDir, expectedAppId: id.expectedAppId, timeoutMs,
+        });
+      } catch (err) {
+        const error = String(err?.message ?? err).slice(0, 300);
+        const wrote = writePublishLedger({ runsDir, key, attempts: ledger.attempts + 1, error });
+        out.stuck.push({ key, reason: "publish_failed", why: error, attempts: ledger.attempts + 1,
+          ...(wrote.ok ? {} : { ledger: "unwritable：" + wrote.why }) });
+        continue;
+      }
+      // **过了这一行消息已经送达** —— 回执没落是另一类事故，不许记成发布失败再发一遍。
+      try { markPublished({ runsDir, key, messageId: mid }); }
+      catch (markErr) {
+        // 账本上写明"送达未落标 + message id"：不是发布失败，但下一轮可能重发 —— 人核对时有据可查。
+        const noted = writePublishLedger({ runsDir, key, attempts: ledger.attempts + 1, error: "delivered_unrecorded：" + mid });
+        // 已知送达后的证据也没落盘 —— 不许隐瞒；此时盘上只剩 reserved，下一轮按"未闭合"禁止自动重试。
+        if (!noted.ok) out.problems.push({ key, reason: "ledger_unwritable", why: "送达证据（" + mid + "）没落盘：" + noted.why });
+        out.deliveredUnrecorded.push({ key, messageId: mid, error: String(markErr?.message ?? markErr).slice(0, 200) });
+        continue;
+      }
+      try { fs.rmSync(path.join(runsDir, key + ".publish-failed.json"), { force: true }); } catch { /* 账本留着也无害 */ }
+      try { claudeRotationBatchHook({ root, claudeSessionId })({ batch: [runRecord], target, messageId: mid }); }
+      catch (hookErr) { out.stuck.push({ key, reason: "bookkeeping_failed", why: String(hookErr?.message ?? hookErr).slice(0, 200), messageId: mid }); }
+      out.published.push({ key, messageId: mid, target: target.rootMessageId });
+    } finally {
+      // 释放失败（抛或返回 false）不许把整轮排空炸掉，也不许沉默：记成 problems。
+      let released = false;
+      try { released = releaseRunPublishClaim({ runsDir, key, token: owned.token }) === true; }
+      catch (relErr) { out.problems.push({ key, reason: "claim_release_failed", why: String(relErr?.code ?? relErr?.message ?? relErr).slice(0, 120) }); released = true; }
+      if (!released) out.problems.push({ key, reason: "claim_release_failed", why: "token 不匹配或 owner 不可读" });
+    }
+  }
+  return out;
 }
 
 /**
@@ -277,6 +468,42 @@ export function drainProject({
  * @returns {{text:string, error:boolean}|null} null = 不用说话
  */
 export function describeDrainOutcome(r, { root, verbose = false } = {}) {
+  // 只有 run 通道时不渲染 outbox 那一段 —— 没执行的事不许陈述。
+  const base = r?.status === "runs_only" ? null : describeOutboxOutcome(r, { root, verbose });
+  const runs = r?.runs;
+  if (!runs) return base;
+  const bits = [];
+  let error = base?.error === true;
+  const short = (k) => (typeof k === "string" ? k.slice(0, 8) : "runs 目录");
+  if (runs.published.length > 0) {
+    bits.push((runs.dryRun ? "[dry-run] 将经 run 通道发布 " : "run 通道已发布 ") + runs.published.length + " 条" +
+      (runs.dryRun ? "" : " -> " + runs.published.map((p) => p.messageId).join("、")));
+  }
+  if ((runs.deliveredUnrecorded ?? []).length > 0) {
+    error = true;
+    bits.push("**run 通道有 " + runs.deliveredUnrecorded.length + " 条送达后回执没落，下一轮可能重发** —— 先去话题核对：\n" +
+      runs.deliveredUnrecorded.map((x) => "  " + short(x.key) + "（" + x.messageId + "）—— " + x.error).join("\n"));
+  }
+  if (runs.stuck.length > 0) {
+    error = true;
+    bits.push("**run 通道有 " + runs.stuck.length + " 条卡住，需要人看**：\n" +
+      runs.stuck.map((x) => "  " + short(x.key) + " —— " + x.reason + (x.why ? "：" + x.why : "")).join("\n"));
+  }
+  if ((runs.problems ?? []).length > 0) {
+    error = true;
+    bits.push("**runs 账本说不清（" + runs.problems.length + " 处）**：\n" +
+      runs.problems.map((x) => "  " + short(x.key) + " —— " + x.reason + (x.why ? "：" + x.why : "")).join("\n"));
+  }
+  if (verbose && runs.skipped.length > 0) {
+    bits.push("run 通道跳过 " + runs.skipped.length + " 条：" +
+      runs.skipped.map((x) => short(x.key) + "（" + x.reason + "）").join("、"));
+  }
+  if (bits.length === 0) return base ?? (verbose && r?.status === "runs_only" ? { text: "outbox 为空", error: false } : base);
+  const text = (base?.text ? base.text + "\n" : "") + bits.join("\n");
+  return { text, error };
+}
+
+function describeOutboxOutcome(r, { root, verbose = false } = {}) {
   // 发布后的两类异常各自成段，**同时发生就同时展示** ——
   // 上一版 if/else if 只展示落标失败，轮转账缺口跟着消失（评审点名）。
   const postDeliveryNotes = (rr) => {

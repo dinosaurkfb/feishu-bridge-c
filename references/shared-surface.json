@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-08-27T00:02:23.141Z",
+  "generated_at": "2026-08-27T08:37:14.997Z",
   "modules": {
     "automatic-topic-rotation.mjs": [
       "businessActivitiesForPublishedBatch",
@@ -48,7 +48,10 @@
       "acquireClaim",
       "claimKey",
       "readClaim",
-      "recordClaimState"
+      "readClaimState",
+      "readWatcherExpectEnv",
+      "recordClaimState",
+      "watcherExpectEnv"
     ],
     "crash-receipt.mjs": [
       "composeCrashReceipt",
@@ -167,6 +170,7 @@
       "acquireSessionLock",
       "handOff",
       "isLockStale",
+      "parseRunOutcome",
       "readRunOutcome",
       "releaseSessionLock",
       "stampSessionLock"
@@ -224,15 +228,24 @@
     ],
     "outbound.mjs": [
       "PUBLISH_FAILURE",
+      "RUN_PUBLISH_MAX_ATTEMPTS",
       "buildDraft",
       "claimRunPublish",
       "classifyPublishFailure",
+      "inventoryRuns",
       "markPublished",
+      "parseDirectPublishArgs",
       "publishDraft",
+      "publishHold",
+      "readPublishLedger",
       "readRunReceipt",
+      "readRunSnapshot",
       "releaseRunPublishClaim",
+      "runPaths",
+      "runRouteSha256",
       "scanRuns",
-      "sendToChat"
+      "sendToChat",
+      "writePublishLedger"
     ],
     "outbox.mjs": [
       "KINDS",
@@ -374,6 +387,7 @@
       "applyTopicGenerationToMapping",
       "channelGenerationId",
       "closePendingTopicGeneration",
+      "effectiveBindingId",
       "failTopicRotation",
       "generationById",
       "generationTargetState",

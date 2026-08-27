@@ -155,7 +155,14 @@ export function readRunOutcome(logPath) {
   } catch {
     return { state: "missing" };
   }
+  return parseRunOutcome(raw);
+}
 
+/**
+ * 按**一份已经读到的文本**判终局 —— 核验、正文、摘要必须来自同一份字节快照
+ * （评审探针：第一次读到 A、盘上与第二次读到 B，摘要 B 通过、发出去的却是 A）。
+ */
+export function parseRunOutcome(raw) {
   let finalText = null;
   let isError = null;
   let sawResult = false;
@@ -168,6 +175,11 @@ export function readRunOutcome(logPath) {
       ev = JSON.parse(line);
     } catch {
       continue; // 半截行：进程还在写，跳过而不是判失败
+    }
+    // 合法 JSON 但不是事件对象（null / 数组 / 数字 / 字符串）：不是"还在写"，是日志不可信 ——
+    // 受控地判成 invalid，别让 ev.type 抛 TypeError 把整条盘点打崩（评审探针）。
+    if (ev === null || typeof ev !== "object" || Array.isArray(ev)) {
+      return { state: "invalid", reason: "invalid_jsonl", finalText: null };
     }
     if (ev.type === "result") {
       sawResult = true;

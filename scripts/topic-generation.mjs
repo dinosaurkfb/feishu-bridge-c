@@ -6,6 +6,7 @@
  * 再以同目录临时文件 + rename 一次性替换整份 binding 文档。
  */
 
+import path from "node:path";
 import { stableControlId } from "./subscription.mjs";
 
 /**
@@ -17,6 +18,20 @@ import { stableControlId } from "./subscription.mjs";
  * 绕过全部守卫被永久抑制。**同一个概念一处分清、另一处混回去。**
  */
 export const usableGeneration = (v) => typeof v === "string" && v.trim() !== "";
+
+/**
+ * 一个 mapping 的**有效绑定身份** —— 全仓唯一投影，住在 mapping 归属层。
+ * 旧 project-file 映射没有 mapping.binding_id，投影时用 `<basename>@project-files`
+ * 并写进 topic_generation_state.binding_id；有状态就以状态为准。claim 写入、
+ * 期望 env、watcher 复核、Dialogue 存储（含锁内重读原始记录）、控制面都从这里取 ——
+ * 各自直接读可缺省的旧字段，就会有一处把合法旧映射算成空 binding（评审探针）。
+ */
+export function effectiveBindingId(mapping, { root = null } = {}) {
+  const fromState = mapping?.topic_generation_state?.binding_id;
+  if (usableGeneration(fromState)) return fromState;
+  if (usableGeneration(mapping?.binding_id)) return mapping.binding_id;
+  return root ? path.basename(root) + "@project-files" : null;
+}
 
 export const TOPIC_GENERATION_SCHEMA_VERSION = "1.0";
 export const TOPIC_GENERATION_ARTIFACT_TYPE = "feishu_bridge_topic_generations";

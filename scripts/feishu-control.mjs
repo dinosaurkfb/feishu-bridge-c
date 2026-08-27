@@ -25,7 +25,7 @@ import {
 import { outboxDirOf } from "./drain-outbox.mjs";
 import { listPending } from "./outbox.mjs";
 import { setClaudeTopicBindingStatus } from "./topic-generation-store.mjs";
-import { activeGeneration, pendingGeneration } from "./topic-generation.mjs";
+import { activeGeneration, pendingGeneration, effectiveBindingId } from "./topic-generation.mjs";
 import { interactionPolicyStateForLegacy, interactionPolicySummary } from "./interaction-policy.mjs";
 
 export const SUSPENDED = "suspended";
@@ -48,7 +48,7 @@ export function currentBinding({ root, claudeSessionId, registryFile, templateFi
   const topicState = m.topic_generation_state ?? null;
   const activeTopic = activeGeneration(topicState);
   const pendingTopic = pendingGeneration(topicState);
-  const interaction = interactionPolicyStateForLegacy(m, { bindingId: m.binding_id });
+  const interaction = interactionPolicyStateForLegacy(m, { bindingId: effectiveBindingId(m, { root }) });
   const policy = interaction.ok ? interactionPolicySummary(interaction.state) : interaction;
   return {
     ok: true,

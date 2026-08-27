@@ -302,6 +302,42 @@ function eligFixture({ holdLock = true } = {}) {
   };
 }
 
+
+/**
+ * 一张**像真的** Codex claim（acquireClaim 写出来的形状）。已有就不动（Dialogue 测试
+ * 自己写带 policy 的那张）。生产里 claim 先于 watcher 存在；缺了它 watcher 现在会 fail-closed。
+ */
+/**
+ * claim key 只能从身份字段推导（claimKey(message_id, logical_task_key)），夹具也不许
+ * 拿任意 64 位 hex 当 key。用 claimKeyFor(label, task.logical_task_key) 造 key 并登记
+ * message_id，writeClaimFixture 据此写出一张像真的 claim。
+ */
+const KEY_MESSAGE = new Map();
+function claimKeyFor(label, logicalTaskKey) {
+  const messageId = "om_" + label;
+  const key = claimKey(messageId, logicalTaskKey);
+  KEY_MESSAGE.set(key, { messageId, logicalTaskKey });
+  return key;
+}
+function writeClaimFixture({ claimsDir, key, task, patch = {} }) {
+  const dir = path.join(claimsDir, key + ".claim");
+  const file = path.join(dir, "claim.json");
+  if (fs.existsSync(file)) return file;
+  const identity = KEY_MESSAGE.get(key);
+  if (!identity) throw new Error("夹具要用 claimKeyFor 造的 key：" + key.slice(0, 8));
+  fs.mkdirSync(dir, { recursive: true });
+  const policyId = patch.policy_id ?? "mapping";
+  fs.writeFileSync(file, JSON.stringify({
+    schema_version: "1.0", state: "claimed", claim_key: key, message_id: identity.messageId,
+    logical_task_key: identity.logicalTaskKey, claimed_at: "2026-08-27T00:00:00.000Z",
+    codex_thread_id: task?.codex_thread_id ?? THREAD_A, policy_id: policyId, policy_version: "1.0",
+    // 被接纳的 claim 里来源代际必非空 —— 夹具照真的来。
+    origin_channel_generation_id: task?.channel_generation_id ?? "channel_generation_" + "a".repeat(24),
+    ...patch,
+  }));
+  return file;
+}
+
 function outboxRecord(extra = {}) {
   recSeq += 1;
   return {
@@ -2072,8 +2108,9 @@ test("关闭自动发布时 watcher 只把严格完成的最终答复兜底入�
   fs.mkdirSync(paths.runs, { recursive: true });
   fs.mkdirSync(paths.claims, { recursive: true });
   fs.mkdirSync(paths.sessionLock, { recursive: true });
-  const key = "a".repeat(64);
+  const key = claimKeyFor("a", task.logical_task_key);
   writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "watcher final" });
+  writeClaimFixture({ claimsDir: paths.claims, key, task });
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -2090,7 +2127,7 @@ test("Codex watcher 严格完成后释放 Dialogue 活动回合", () => {
   task.auto_publish_on_completion = false;
   writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   setTaskInteractionMode({ threadId: THREAD_A, mode: "dialogue", home, now: 1_800_000_000_000 });
-  const key = "d".repeat(64);
+  const key = claimKeyFor("d", task.logical_task_key);
   reserveTaskDialogueTurn({
     threadId: THREAD_A, eventId: "om_dialogue_watch", runId: key,
     localTargetId: "local", originChannelGenerationId: task.channel_generation_id,
@@ -2098,13 +2135,11 @@ test("Codex watcher 严格完成后释放 Dialogue 活动回合", () => {
   });
   const current = loadRegistry(path.join(home, "registry.json")).tasks[0];
   const paths = taskPaths(current, home);
-  fs.mkdirSync(path.join(paths.claims, key + ".claim"), { recursive: true });
-  fs.writeFileSync(path.join(paths.claims, key + ".claim", "claim.json"), JSON.stringify({
-    claim_key: key, policy_id: "dialogue", origin_channel_generation_id: task.channel_generation_id,
-  }));
+  writeClaimFixture({ claimsDir: paths.claims, key, task: current, patch: { policy_id: "dialogue" } });
   fs.mkdirSync(paths.runs, { recursive: true });
   fs.mkdirSync(paths.sessionLock, { recursive: true });
   writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "dialogue final" });
+  writeClaimFixture({ claimsDir: paths.claims, key, task });
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -2125,7 +2160,7 @@ test("watcher 抑制递归产生的错误答复，只保留风险回执", () => 
   fs.mkdirSync(paths.runs, { recursive: true });
   fs.mkdirSync(paths.claims, { recursive: true });
   fs.mkdirSync(paths.sessionLock, { recursive: true });
-  const key = "c".repeat(64);
+  const key = claimKeyFor("c", task.logical_task_key);
   const eventKey = "codex:" + THREAD_A + ":claim:" + key + ":reply";
   appendEvent({ outboxDir: paths.outbox, kind: "reply", text: "EPERM stack", eventKey });
   fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), [
@@ -2138,6 +2173,7 @@ test("watcher 抑制递归产生的错误答复，只保留风险回执", () => 
   ].map(JSON.stringify).join("\n") + "\n");
   fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "EPERM stack");
   stampReceipt(paths.runs, key);
+  writeClaimFixture({ claimsDir: paths.claims, key, task });
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -2160,12 +2196,13 @@ test("watcher 对启动前 Git 预检失败给出真实且脱敏的风险回执"
   fs.mkdirSync(paths.runs, { recursive: true });
   fs.mkdirSync(paths.claims, { recursive: true });
   fs.mkdirSync(paths.sessionLock, { recursive: true });
-  const key = "b".repeat(64);
+  const key = claimKeyFor("b", task.logical_task_key);
   fs.writeFileSync(path.join(paths.runs, key + ".jsonl"), "");
   fs.writeFileSync(path.join(paths.runs, key + ".exit.json"),
     JSON.stringify(exitReceipt(key, { status: "failed", exit_code: 1 })));
   fs.writeFileSync(path.join(paths.runs, key + ".stderr.log"),
     "Not inside a trusted directory and --skip-git-repo-check was not specified. secret-token\n");
+  writeClaimFixture({ claimsDir: paths.claims, key, task });
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -6506,12 +6543,13 @@ test("watcher：资格一直卡住时要照实说原因，并留下恢复标记"
   fs.mkdirSync(paths.runs, { recursive: true });
   fs.mkdirSync(paths.claims, { recursive: true });
   fs.mkdirSync(paths.sessionLock, { recursive: true });
-  const key = "b".repeat(64);
+  const key = claimKeyFor("b", task.logical_task_key);
   writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "卡住的答复" });
 
   fs.mkdirSync(path.dirname(paths.publishLock), { recursive: true });
   assert.equal(acquirePublishLock(paths.publishLock).ok, true, "前提：别人正持着发布锁");
   try {
+    writeClaimFixture({ claimsDir: paths.claims, key, task });
     const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
       "--claim-key", key, "--task-key", task.logical_task_key,
     ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
@@ -6571,8 +6609,9 @@ test("watcher：标记自己看不懂时要说出具体那句，不是只说 mar
     recorded_at: "2026-08-25T00:00:00.000Z", run_state: "completed",
     promote_failed: {}, event_key: codexReplyEventKey({ threadId: THREAD_A, claimKey: oldKey }),
   }));
-  const key = "f".repeat(64);
+  const key = claimKeyFor("f", task.logical_task_key);
   writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "答复" });
+  writeClaimFixture({ claimsDir: paths.claims, key, task });
   const r2 = watch(key);
   assert.equal(r2.status, 0, r2.stderr);
   assert.match(r2.stderr, /恢复标记看不懂，没动：/u);
@@ -6616,7 +6655,7 @@ test("watcher 启动时的历史标记：撞上锁要等到有结论，不能只
   }));
 
   // 这一轮自己：run 已终局，资格能直接拿到。
-  const key = "d".repeat(64);
+  const key = claimKeyFor("d", task.logical_task_key);
   writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "这一轮的答复" });
 
   // **启动这一刻锁被别人占着，1.5 秒后放开** —— 只扫一次的实现会在这里放弃。
@@ -6626,6 +6665,7 @@ test("watcher 启动时的历史标记：撞上锁要等到有结论，不能只
     "sleep 1.5; rm -rf " + JSON.stringify(paths.publishLock)], { stdio: "ignore" });
   releaser.unref();
   try {
+    writeClaimFixture({ claimsDir: paths.claims, key, task });
     const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
       "--claim-key", key, "--task-key", task.logical_task_key,
     ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -7983,8 +8023,9 @@ test("watcher：历史标记指向的 JSONL 有非对象行，不许在 session 
     JSON.stringify({ type: "turn.started" }) + "\n" + JSON.stringify({ type: "turn.completed" }) + "\n");
   stampReceipt(paths.runs, oldKey);
   // 这一轮自己正常。
-  const key = "6".repeat(64);
+  const key = claimKeyFor("6", task.logical_task_key);
   writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "这一轮" });
+  writeClaimFixture({ claimsDir: paths.claims, key, task });
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -8025,10 +8066,11 @@ test("watcher：旧形状的退出回执不算终局 —— fail-closed 走失�
   fs.mkdirSync(paths.runs, { recursive: true });
   fs.mkdirSync(paths.claims, { recursive: true });
   fs.mkdirSync(paths.sessionLock, { recursive: true });
-  const key = "9".repeat(64);
+  const key = claimKeyFor("9", task.logical_task_key);
   writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "看着像完成了" });
   // 回执换成安装前那种旧形状 —— JSONL 与最终输出都"完成"，只有回执没有身份。
   fs.writeFileSync(path.join(paths.runs, key + ".exit.json"), JSON.stringify({ exit_code: 0 }));
+  writeClaimFixture({ claimsDir: paths.claims, key, task });
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
@@ -8057,12 +8099,13 @@ test("watcher：event key 命中的记录 run_id 是别的 claim，初始路径�
   fs.mkdirSync(paths.runs, { recursive: true });
   fs.mkdirSync(paths.claims, { recursive: true });
   fs.mkdirSync(paths.sessionLock, { recursive: true });
-  const key = "7".repeat(64);
+  const key = claimKeyFor("7", task.logical_task_key);
   const eventKey = codexReplyEventKey({ threadId: THREAD_A, claimKey: key });
   // Stop 先入了队，但 run_id 是别的 claim。
   appendEvent({ outboxDir: paths.outbox, kind: "reply", text: "先入队的那条",
     eventKey, runId: "0".repeat(64) });
   writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "先入队的那条" });
+  writeClaimFixture({ claimsDir: paths.claims, key, task });
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
     "--claim-key", key, "--task-key", task.logical_task_key,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
@@ -8114,6 +8157,133 @@ test("恢复是授权：恢复标记说 completed 也不算，run 复合凭据�
   stampReceipt(g.runsDir, g.key);
   g.marker();
   assert.equal(recoverEligibilityPending(g.args()).recovered.length, 1, "干净时必须照常放行");
+});
+
+
+test("watcher：claim 说不清就 fail-closed —— 不猜来源代际、不入队、发 risk、留 session lock（真实 CLI）", () => {
+  // 上一版 readClaim 把缺席/损坏都折成 null，watcher 拿 null 当 legacy 现算当前代际：
+  // 一张坏 claim 就把这一轮结果发到"现在的"话题，而不是它来自的那个。
+  for (const [why, plant] of [
+    ["缺席", () => {}],
+    ["半截 JSON", (f) => fs.writeFileSync(f, "{ 坏了")],
+    ["claim_key 对不上", (f) => fs.writeFileSync(f, JSON.stringify({ claim_key: "e".repeat(64) }))],
+  ]) {
+    const home = temp();
+    const root = path.join(home, "project");
+    fs.mkdirSync(root, { recursive: true });
+    const task = makeTaskEntry({ root, threadId: THREAD_A, name: "NoClaim",
+      rootMessageId: "om_a", token: "a" });
+    task.auto_publish_on_completion = false;
+    writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+    const paths = taskPaths(task, home);
+    fs.mkdirSync(paths.runs, { recursive: true });
+    fs.mkdirSync(paths.claims, { recursive: true });
+    fs.mkdirSync(paths.sessionLock, { recursive: true });
+    const key = "5".repeat(64);
+    writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "跑完了的结果" });
+    fs.mkdirSync(path.join(paths.claims, key + ".claim"), { recursive: true });
+    plant(path.join(paths.claims, key + ".claim", "claim.json"));
+    const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
+      "--claim-key", key, "--task-key", task.logical_task_key,
+    ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+    assert.equal(r.status, 2, why + "：" + r.stderr);
+    assert.match(r.stderr, /claim 说不清/u, why);
+    const events = fs.readdirSync(paths.outbox)
+      .map((f) => JSON.parse(fs.readFileSync(path.join(paths.outbox, f), "utf-8")));
+    assert.equal(events.some((e) => e.kind === "reply"), false, why + "：**说不清来源就不许把结果入队**");
+    const risk = events.find((e) => e.kind === "risk");
+    assert.ok(risk, why + "：要发一条 risk");
+    assert.match(risk.text, /claim 说不清/u, why);
+    assert.match(risk.text, /不会自动发出去/u, why);
+    assert.equal(fs.existsSync(paths.sessionLock), true, why + "：session lock 要留着");
+    assert.equal(fs.existsSync(path.join(paths.claims, key + ".completed.json")), false, why);
+    const failed = JSON.parse(fs.readFileSync(path.join(paths.claims, key + ".failed.json"), "utf-8"));
+    assert.equal(failed.reason, "claim_unreadable", why);
+  }
+});
+
+test("Stop → watcher 真实链路：claim 说不清时 Stop 不入队、watcher 不猜；说得清时冻结到 claim 的来源代际", () => {
+  // 评审实测：只起 watcher 能断言"无 reply 入队"，但真实链路里 Stop 已经先入了队 ——
+  // Stop 的入站分支两态 readClaim 把坏 claim 折成 null，写出无冻结目标的 legacy 记录。
+  const mk = () => {
+    const home = temp();
+    const root = path.join(home, "project");
+    fs.mkdirSync(root, { recursive: true });
+    const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Chain", rootMessageId: "om_a", token: "a" });
+    task.auto_publish_on_completion = false;
+    writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+    const paths = taskPaths(task, home);
+    for (const d of [paths.runs, paths.claims, paths.sessionLock]) fs.mkdirSync(d, { recursive: true });
+    return { home, root, task, paths };
+  };
+  const stop = ({ home, root, key }) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "stop-hook.mjs")], {
+      input: JSON.stringify({ session_id: THREAD_A, turn_id: "turn_chain", cwd: root,
+        last_assistant_message: "这一轮的答复" }),
+      encoding: "utf-8",
+      env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home, FEISHU_BRIDGE_CLAIM_KEY: key },
+    });
+  const watch = ({ home, task, key }) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "watch-run.mjs"), "--claim-key", key,
+      "--task-key", task.logical_task_key],
+    { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+
+  // ① 坏 claim（缺 message_id）：Stop 不入队，watcher fail-closed。
+  const bad = mk();
+  bad.key = claimKeyFor("chain-bad", bad.task.logical_task_key);
+  const key = bad.key;
+  const badFile = writeClaimFixture({ claimsDir: bad.paths.claims, key, task: bad.task });
+  const doc = JSON.parse(fs.readFileSync(badFile, "utf-8")); delete doc.message_id;
+  fs.writeFileSync(badFile, JSON.stringify(doc));
+  const s1 = stop(bad);
+  assert.equal(s1.status, 0, "Stop 不许阻塞：" + s1.stderr);
+  assert.equal(listPending({ outboxDir: bad.paths.outbox }).length, 0, "**Stop 不许把答复入队**");
+  writeRunArtifacts({ runsDir: bad.paths.runs, key, threadId: THREAD_A, text: "这一轮的答复" });
+  const w1 = watch(bad);
+  assert.equal(w1.status, 2, w1.stderr);
+  const kinds = fs.readdirSync(bad.paths.outbox)
+    .map((f) => JSON.parse(fs.readFileSync(path.join(bad.paths.outbox, f), "utf-8")).kind);
+  assert.equal(kinds.includes("reply"), false, "watcher 也不许入队");
+  assert.equal(kinds.includes("risk"), true, "要留 risk");
+
+  // ② 好 claim：Stop 入队，且冻结到 claim 的来源代际（不是现算）。
+  const good = mk();
+  good.key = claimKeyFor("chain-good", good.task.logical_task_key);
+  writeClaimFixture({ claimsDir: good.paths.claims, key: good.key, task: good.task });
+  const s2 = stop(good);
+  assert.equal(s2.status, 0, s2.stderr);
+  const queued = listPending({ outboxDir: good.paths.outbox });
+  assert.equal(queued.length, 1, "说得清就入队");
+  assert.equal(queued[0].source, "codex-inbound-reply");
+  assert.equal(queued[0].target_channel_generation_id, good.task.channel_generation_id,
+    "**目标冻结到 claim 的来源代际**");
+  assert.equal(queued[0].run_id, good.key);
+  assert.equal(queued[0].publish_eligible_at, null, "入站答复的资格归 watcher");
+});
+
+test("watcher：claim 说不清时的 risk 走 task 当前话题 —— auto 开着就恰好发一条、零 reply（真实 CLI + 假 lark）", () => {
+  // 评审 P2：这是有意的 task 级告警（跟失败/超时分支同一语义），文档已写明；
+  // 这里钉住"恰好一条 risk 发出、零 reply"。
+  const g = codexMatrixFixture();
+  const paths = taskPaths(g.task, g.home);
+  for (const d of [paths.runs, paths.claims, paths.sessionLock]) fs.mkdirSync(d, { recursive: true });
+  const key = claimKeyFor("3", g.task.logical_task_key);
+  writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "跑完了但 claim 没了" });
+  g.mark("claim 说不清");
+  let r;
+  const calls = g.callsDelta(() => {
+    r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
+      "--claim-key", key, "--task-key", g.task.logical_task_key,
+    ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: g.home } });
+  });
+  assert.equal(r.status, 2, r.stderr);
+  assert.equal(calls, 1, "**恰好一条 risk 发出** —— 实际 " + calls);
+  const events = fs.readdirSync(paths.outbox)
+    .map((f) => JSON.parse(fs.readFileSync(path.join(paths.outbox, f), "utf-8")));
+  assert.equal(events.filter((e) => e.kind === "reply").length, 0, "零 reply");
+  const risks = events.filter((e) => e.kind === "risk");
+  assert.equal(risks.length, 1);
+  assert.match(risks[0].published_at ?? "", /^\d{4}/u, "risk 要真的发出去并落标");
 });
 
 test("R5 completeness：收集层给结论，坏一处就 complete:false 并点名", () => {

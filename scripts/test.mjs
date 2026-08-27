@@ -30,6 +30,7 @@ import {
   recordClaimState, watcherExpectEnv,
 } from "./claim.mjs";
 import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.mjs";
+import { CLAUDE_DRAIN_LAUNCH_LABEL } from "./drain-schedule.mjs";
 import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
@@ -15195,6 +15196,21 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
     recordClaimState({ claimsDir: f.claims, key: bare, state: "handed_off", detail: { observed_by: "inbound" } });
     assert.equal(inventoryRuns({ runsDir: f.runs, claimsDir: f.claims }).problems.find((x) => x.key === bare)?.reason, "orphan_terminal_record");
   }
+  // claims 目录的条目形状从 claim.mjs 的受控状态集派生：rejected / claimed 记录没有 run 制品是正常的（不是孤儿、不是不认识）；
+  // 状态集之外的名字（历史遗留 deliver_failed）照实报 unrecognized_entry。
+  {
+    const f = mk();
+    const rej = claimKeyFor("rejected-msg");
+    recordClaimState({ claimsDir: f.claims, key: rej, state: "rejected", detail: { reason: "not_mentioned" } });
+    const cl = claimKeyFor("claimed-only");
+    writeClaimFixture({ claimsDir: f.claims, key: cl, root: f.h.dir });
+    const inv = inventoryRuns({ runsDir: f.runs, claimsDir: f.claims });
+    assert.deepEqual(inv.problems, [], "**受控状态集内的记录不许报成不认识或孤儿**：" + JSON.stringify(inv.problems));
+    fs.writeFileSync(path.join(f.claims, claimKeyFor("legacy-df") + ".deliver_failed.json"), "{}");
+    const inv2 = inventoryRuns({ runsDir: f.runs, claimsDir: f.claims });
+    assert.equal(inv2.problems.length, 1); assert.equal(inv2.problems[0].reason, "unrecognized_entry");
+    assert.match(inv2.problems[0].why, /deliver_failed/u, "状态集之外的名字照实报，不放宽");
+  }
   // 联合盘点：终局记录坏 JSON（有 run 制品）、只剩发布回执的孤儿、watcher 失败终局的孤儿 —— 都进 problems。
   {
     const f = mk();
@@ -15873,6 +15889,185 @@ test("真实 feishu-status：第五区报 run 通道的待发 / 卡住 / 账本�
     { encoding: "utf-8", env: { ...env, HOME: bare, FEISHU_BRIDGE_REGISTRY: path.join(bare, "registry.json") }, timeout: 60_000 });
   assert.equal(leaked.stdout.includes("c".repeat(64)), false, leaked.stdout);
   assert.match(leaked.stdout, /prefix_cccccccc….jsonl/u);
+});
+
+/**
+ * 机器级体检的夹具：一台"机器"= 隔离 HOME + 三张表 + 若干项目目录。provider 脚本只打印，不写盘。
+ * 返回 run()（真实入口子进程）与 snapshot()（整棵 HOME 的字节快照，钉只读）。
+ */
+function doctorMachine({ installRuntime = false } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-doctor-"));
+  const dir = (...p) => { const d = path.join(home, ...p); fs.mkdirSync(d, { recursive: true }); return d; };
+  if (installRuntime) {
+    const plan = planRuntimeSync({ sourceRoot: path.resolve("."), home, chain: "claude" });
+    assert.equal(plan.ok, true, plan.reason ?? "");
+    const applied = applyRuntimeSync(plan, { home, chain: "claude" });
+    assert.equal(applied.ok, true, applied.reason ?? "");
+  }
+  const okProvider = path.join(home, "provider-ok.mjs");
+  fs.writeFileSync(okProvider, 'process.stdout.write(JSON.stringify({ schema_version: "feishu-bridge-status/v1", provider_id: process.argv[2] ?? "x", connections: [] }));\n');
+  const project = (name, { expiresAt, pendingClaimExpiresAt = null, outboxPending = 0 } = {}) => {
+    const root = dir("projects", name);
+    const inbound = dir("projects", name, ".runtime-data", "inbound");
+    fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({ project_dir: root, logical_task_key: name, project_display_name: name, task_display_name: name }));
+    const state = pendingClaimExpiresAt ? { generations: [
+      { generation: 1, status: "active", root_message_id: "om_root_" + name, channel_generation_id: "gen-1", activity: { message_count: 0, auto_rotate_threshold: 30 } },
+      { generation: 2, status: "pending", root_message_id: "om_pending_" + name, channel_generation_id: "gen-2", claim_expires_at: pendingClaimExpiresAt, activity: { message_count: 0, auto_rotate_threshold: 30 } },
+    ] } : null;
+    fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+      status: "active", root_message_id: "om_root_" + name, claude_session_id: null, channel_generation_id: "gen-1", expires_at: expiresAt,
+      ...(state ? { topic_generation_state: state } : {}) }));
+    if (outboxPending > 0) {
+      const ob = dir("projects", name, ".runtime-data", "outbound", "outbox");
+      for (let i = 1; i <= outboxPending; i += 1) fs.writeFileSync(path.join(ob, "000" + i + ".json"), JSON.stringify(outboxRecord({ text: name + " 积压 " + i })));
+    }
+    return root;
+  };
+  const files = { registry: path.join(home, "registry.json"), routes: path.join(home, "routes.json"), providers: path.join(home, "providers.json") };
+  const writeTables = ({ projects = [], routes = [], sessions = {}, providers = [] }) => {
+    fs.writeFileSync(files.registry, JSON.stringify({ schema_version: "1.0", projects }));
+    fs.writeFileSync(files.routes, JSON.stringify({ routes, sessions }));
+    fs.writeFileSync(files.providers, JSON.stringify({ providers }));
+  };
+  const provider = (id, { script = okProvider, projectRoot = home, enabled = true } = {}) => ({
+    id, protocol: "feishu-bridge-status/v1", executable: process.execPath, script, args: [id], allowed_kinds: ["transport"], project_root: projectRoot, enabled,
+  });
+  const route = (id, handler = okProvider) => ({ id, handler });
+  const snapshot = () => {
+    const out = [];
+    const walk = (d) => { for (const n of fs.readdirSync(d).sort()) { const p = path.join(d, n); const st = fs.lstatSync(p); if (st.isDirectory()) walk(p); else out.push(path.relative(home, p) + ":" + (st.isSymbolicLink() ? "->" + fs.readlinkSync(p) : fs.readFileSync(p).toString("base64"))); } };
+    walk(home); return out.join("\n");
+  };
+  const run = (extraEnv = {}, args = ["--json"]) => spawnSync(process.execPath, [path.resolve("scripts", "doctor.mjs"), ...args], {
+    encoding: "utf-8", timeout: 120_000,
+    env: { ...process.env, HOME: home, FEISHU_BRIDGE_REGISTRY: files.registry, FEISHU_BRIDGE_ROUTES: files.routes,
+      FEISHU_BRIDGE_STATUS_PROVIDERS: files.providers, CODEX_HOME: path.join(home, ".codex"), FEISHU_CODEX_BRIDGE_HOME: path.join(home, ".codex", "feishu-bridge"), ...extraEnv } });
+  return { home, okProvider, project, writeTables, provider, route, snapshot, run, files };
+}
+const doctorReport = (r) => { assert.ok(r.stdout, r.stderr); return JSON.parse(r.stdout); };
+const checkOf = (report, id) => { const c = report.checks.find((x) => x.id === id); assert.ok(c, "缺检查 " + id + "：" + JSON.stringify(report.checks.map((x) => x.id))); return c; };
+
+test("doctor：坏机器 —— 六项各自 fail 且点名，退出码 1，只读，不泄露 locator（真实进程）", () => {
+  const m = doctorMachine();
+  const now = Date.now();
+  const soon = new Date(now + 3 * 86400000).toISOString();
+  const pastClaim = new Date(now - 86400000).toISOString();
+  const good = m.project("good", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  const bad = m.project("bad", { expiresAt: soon, pendingClaimExpiresAt: pastClaim, outboxPending: 2 });
+  const gone = m.project("gone", { expiresAt: new Date(now - 86400000).toISOString() });
+  m.writeTables({
+    projects: [{ id: "good", root: good, root_message_id: "om_root_good", status: "active", expires_at: "2099-01-01T00:00:00.000Z" },
+      { id: "bad", root: bad, root_message_id: "om_root_bad", status: "active", expires_at: soon },
+      { id: "gone", root: gone, root_message_id: "om_root_gone", status: "active", expires_at: new Date(now - 86400000).toISOString() }],
+    routes: [m.route("good"), m.route("lonely"), m.route("brokenroute")],
+    sessions: { "session_aaaaaaaaaaaa": "good", "session_ghostghost": "ghost-route" },
+    providers: [m.provider("good"), m.provider("brokenroute", { script: path.join(m.home, "missing.mjs") }), m.provider("dangling")],
+  });
+  const before = m.snapshot();
+  const r = m.run();
+  const report = doctorReport(r);
+  assert.equal(r.status, 1, "blocked → 退出码 1：" + r.stderr);
+  assert.equal(report.overall, "blocked");
+  assert.equal(checkOf(report, "runtime").ok, false, "没装运行时");
+  assert.equal(checkOf(report, "registry").ok, true);
+  assert.equal(checkOf(report, "route_without_provider").ok, false);
+  assert.match(checkOf(report, "route_without_provider").detail, /lonely/u, "① 要点名没有状态入口的路由");
+  assert.equal(checkOf(report, "provider_runs").ok, false);
+  assert.match(checkOf(report, "provider_runs").detail, /brokenroute/u, "② 要点名跑不起来的状态入口");
+  assert.equal(checkOf(report, "session_route_missing").ok, false);
+  assert.match(checkOf(report, "session_route_missing").detail, /ghost-route/u, "③ 要点名指向不存在路由的话题登记");
+  assert.equal(checkOf(report, "provider_without_route").ok, false);
+  assert.match(checkOf(report, "provider_without_route").detail, /dangling/u, "④ 要点名指向不存在路由的状态入口");
+  assert.equal(checkOf(report, "binding_expiry").ok, false);
+  assert.match(checkOf(report, "binding_expiry").detail, /即将到期：bad（3 天）/u, "⑤ 阈值 7 天内要点名并给天数：" + checkOf(report, "binding_expiry").detail);
+  assert.match(checkOf(report, "binding_expiry").detail, /待认领代际已过期：bad/u);
+  assert.match(checkOf(report, "binding_expiry").detail, /已过期：gone/u, "⑤ 已过期要单独点名，不许折成说不清");
+  assert.doesNotMatch(checkOf(report, "binding_expiry").detail, /查不清：gone/u);
+  assert.doesNotMatch(checkOf(report, "binding_expiry").detail, /good/u, "没问题的项目不点名");
+  const backlog = checkOf(report, "backlog_vs_publisher");
+  assert.equal(backlog.ok, null, "沙箱里查不了 launchctl：有积压时只能 unknown，不许折成 pass 或 fail：" + backlog.detail);
+  assert.match(backlog.detail, /积压 2 条：bad（outbox 2 条）/u, backlog.detail);
+  assert.match(backlog.detail, /沙箱/u);
+  assert.equal(checkOf(report, "codex_drain").ok, null);
+  // next 只给预览形式。
+  assert.ok(report.next.length > 0);
+  for (const n of report.next) assert.equal(/--apply(?!\))/u.test(n.replace(/自行加 --apply/u, "")), false, "**next 不许带 --apply**：" + n);
+  // 不泄露 locator：根消息 id、完整 session id。
+  const text = JSON.stringify(report);
+  assert.equal(text.includes("om_root_bad"), false); assert.equal(text.includes("session_ghostghost"), false, "session id 只留前 8 位");
+  // 只读：整棵 HOME 字节一致。
+  assert.equal(m.snapshot(), before, "**doctor 一个字节都不许改**");
+  // 文本渲染：标记与结论。
+  const t = m.run({}, []);
+  assert.equal(t.status, 1);
+  assert.match(t.stdout, /✗ ① route 有状态入口/u); assert.match(t.stdout, /结论：blocked/u); assert.match(t.stdout, /下一步（都是预览形式/u);
+  // 未知参数拒绝。
+  assert.equal(m.run({}, ["--fix"]).status, 1);
+});
+
+test("doctor：好机器 —— 全部 pass、退出码 0；沙箱里不注入 launchctl 则 incomplete、退出码 2（真实进程）", () => {
+  const m = doctorMachine({ installRuntime: true });
+  const good = m.project("good", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({
+    projects: [{ id: "good", root: good, root_message_id: "om_root_good", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }],
+    routes: [m.route("good")], sessions: { "session_aaaaaaaaaaaa": "good" }, providers: [m.provider("good")],
+  });
+  // 沙箱、没注入 launchctl：兜底定时器两项都 unknown → incomplete、退出码 2，但没有一项 fail。
+  const r2 = m.run();
+  const rep2 = doctorReport(r2);
+  assert.equal(r2.status, 2, "incomplete → 退出码 2：" + r2.stderr);
+  assert.equal(rep2.overall, "incomplete");
+  assert.equal(rep2.checks.some((c) => c.ok === false), false, JSON.stringify(rep2.checks.filter((c) => c.ok === false)));
+  assert.equal(checkOf(rep2, "runtime").ok, true, checkOf(rep2, "runtime").detail);
+  assert.equal(checkOf(rep2, "backlog_vs_publisher").ok, true, "无积压时不依赖发布器状态：" + checkOf(rep2, "backlog_vs_publisher").detail);
+  assert.equal(checkOf(rep2, "codex_drain").ok, null);
+  // 注入 launchctl（测试隔离点）：Claude 兜底已加载；Codex 侧 plist 与 launchd 输出都按其判据造真 → 全 pass、ready、退出码 0。
+  const gen = spawnSync(process.execPath, ["--input-type=module", "-e",
+    'import fs from "node:fs"; import path from "node:path"; const m = await import(process.argv[1]);' +
+    'const home = process.env.HOME; const file = m.plistPath(home); fs.mkdirSync(path.dirname(file), { recursive: true });' +
+    'fs.writeFileSync(file, m.plistBody({ home })); process.stdout.write(JSON.stringify({ expect: m.expectedJob({ home }), label: m.LAUNCH_LABEL }));',
+    pathToFileURL(path.resolve("scripts", "codex", "drain-service.mjs")).href],
+    { encoding: "utf-8", env: { ...process.env, HOME: m.home, CODEX_HOME: path.join(m.home, ".codex") } });
+  assert.equal(gen.status, 0, gen.stderr);
+  const { expect, label } = JSON.parse(gen.stdout);
+  const fake = path.join(m.home, "fake-launchctl.mjs");
+  fs.writeFileSync(fake, [
+    "const [cmd, label] = process.argv.slice(2);",
+    "if (cmd !== \"list\") process.exit(1);",
+    "if (label === " + JSON.stringify(label) + ") { process.stdout.write('{ \"Program\" = \"" + expect.node + "\"; \"ProgramArguments\" = ( " + expect.args.map((a) => '\\"' + a + '\\"').join("; ") + "; ); };'); process.exit(0); }",
+    "if (label === " + JSON.stringify(CLAUDE_DRAIN_LAUNCH_LABEL) + ") { process.stdout.write('{ }'); process.exit(0); }",
+    "process.stderr.write('Could not find service'); process.exit(113);",
+  ].join("\n"));
+  const wrapper = path.join(m.home, "launchctl");
+  fs.writeFileSync(wrapper, "#!/bin/sh\nexec " + JSON.stringify(process.execPath) + " " + JSON.stringify(fake) + " \"$@\"\n", { mode: 0o755 });
+  const before = m.snapshot();
+  const r = m.run({ FEISHU_BRIDGE_LAUNCHCTL: wrapper });
+  const report = doctorReport(r);
+  assert.equal(report.overall, "ready", JSON.stringify(report.checks.filter((c) => c.ok !== true)));
+  assert.equal(r.status, 0);
+  assert.equal(checkOf(report, "codex_drain").ok, true, checkOf(report, "codex_drain").detail);
+  assert.match(checkOf(report, "backlog_vs_publisher").detail, /已加载/u);
+  assert.deepEqual(report.next, []);
+  assert.equal(m.snapshot(), before, "只读");
+  assert.match(m.run({ FEISHU_BRIDGE_LAUNCHCTL: wrapper }, []).stdout, /结论：ready/u);
+  // 注入了 launchctl，但 Codex 侧 plist 不在、launchd 也没它 → Codex 体检说"未启用"（ok null）→ 这里必须也是 unknown，不许折成 pass。
+  fs.rmSync(JSON.parse(gen.stdout).expect ? path.join(m.home, "Library", "LaunchAgents", label + ".plist") : "", { force: true });
+  fs.writeFileSync(fake, fs.readFileSync(fake, "utf-8").replace("if (label === " + JSON.stringify(label) + ")", "if (false)"));
+  const rAbsent = doctorReport(m.run({ FEISHU_BRIDGE_LAUNCHCTL: wrapper }));
+  assert.equal(checkOf(rAbsent, "codex_drain").ok, null, "**Codex 侧未启用 = 查不清，不是 pass**：" + checkOf(rAbsent, "codex_drain").detail);
+  assert.equal(rAbsent.overall, "incomplete");
+  // 同一台机器，兜底定时器没加载 + 有积压 → ⑥ fail（不是 unknown）。
+  const bad = m.project("late", { expiresAt: "2099-01-01T00:00:00.000Z", outboxPending: 1 });
+  m.writeTables({
+    projects: [{ id: "good", root: good, root_message_id: "om_root_good", status: "active", expires_at: "2099-01-01T00:00:00.000Z" },
+      { id: "late", root: bad, root_message_id: "om_root_late", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }],
+    routes: [m.route("good")], sessions: {}, providers: [m.provider("good")],
+  });
+  fs.writeFileSync(fake, fs.readFileSync(fake, "utf-8").replace("process.stdout.write('{ }'); process.exit(0);", "process.stderr.write('Could not find service'); process.exit(113);"));
+  const r3 = doctorReport(m.run({ FEISHU_BRIDGE_LAUNCHCTL: wrapper }));
+  assert.equal(checkOf(r3, "backlog_vs_publisher").ok, false, checkOf(r3, "backlog_vs_publisher").detail);
+  assert.match(checkOf(r3, "backlog_vs_publisher").detail, /积压 1 条：late（outbox 1 条）；兜底定时器 .*没被 launchd 加载/u);
+  assert.equal(r3.overall, "blocked");
 });
 
 test("claim 写原语：扩展对象覆盖不了固定身份字段", () => {

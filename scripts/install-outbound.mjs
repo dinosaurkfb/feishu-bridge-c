@@ -17,6 +17,7 @@
  *   node scripts/install-outbound.mjs --uninstall --apply
  */
 
+import { CLAUDE_DRAIN_LAUNCH_LABEL } from "./drain-schedule.mjs";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -370,7 +371,8 @@ const skillAction = skillPlan.some((s) => s.action === "source-missing") ? "sour
  *
  * 注释承诺了什么，安装器就得装出什么。
  */
-const LAUNCH_LABEL = "com.frank.feishu-bridge-cc.drain";
+// label 只有一份定义（drain-schedule.mjs）—— doctor 查 launchd 用的是同一个。
+const LAUNCH_LABEL = CLAUDE_DRAIN_LAUNCH_LABEL;
 const PLIST = path.join(os.homedir(), "Library", "LaunchAgents", LAUNCH_LABEL + ".plist");
 const DRAIN_LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "drain.log");
 const DRAIN_SCRIPT = runtimeScript("drain-outbox.mjs");

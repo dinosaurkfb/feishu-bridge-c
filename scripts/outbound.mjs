@@ -11,7 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { isCanonicalIso } from "./canonical-time.mjs";
-import { CLAIM_KEY_SHAPE } from "./claim.mjs";
+import { CLAIM_KEY_SHAPE, CLAIM_STATE } from "./claim.mjs";
 
 import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
 
@@ -187,8 +187,13 @@ export function runRouteSha256({ bindingId, claudeSessionId, originGenerationId,
 const RUN_ENTRY_RE = /^([0-9a-f]{64})\.(jsonl|published\.json|publish-failed\.json|publish-claim\.json|publish-claim\.json\.reaplock|stderr\.log|watch\.log|forward\.jsonl|forward\.stderr\.log|(?:published\.json|publish-failed\.json)\.tmp\.[^/]+)$/u;
 // 转发型记录（live-session 投递）允许的全部 sidecar；多一样都是冲突。
 const FORWARD_KINDS = new Set(["forward.jsonl", "forward.stderr.log", "terminal"]);
-// delivery-claims 目录里受控的条目形状。
-const CLAIM_ENTRY_RE = /^([0-9a-f]{64})\.(claim|handed_off\.json|failed\.json|notes\.log)$/u;
+// delivery-claims 目录里受控的条目形状：claim 目录、笔记，以及 **claim.mjs 受控状态集里每一种状态**的记录
+// （rejected 也是入站写的正规记录 —— 真机上曾被硬编码的四种名字报成 unrecognized_entry；
+// 状态集之外的名字（如历史遗留的 deliver_failed，仓库里从未有过写方）仍照实报 unrecognized_entry，不放宽）。
+// 只有 handed_off / failed 是 run 的终局，参与孤儿判定；其余状态的记录不需要 run 制品。
+const CLAIM_ENTRY_RE = new RegExp("^([0-9a-f]{64})\\.(claim|notes\\.log|(?:" +
+  Object.values(CLAIM_STATE).map((st) => st.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")).join("|") + ")\\.json)$", "u");
+const TERMINAL_STATE_FILES = new Set([CLAIM_STATE.HANDED_OFF + ".json", "failed.json"]);
 
 /**
  * runs 账本的**联合盘点**：以第一次目录快照驱动，对 JSONL、终局记录、发布回执、失败账
@@ -222,7 +227,7 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
       if (name.startsWith(".")) continue;
       const m = CLAIM_ENTRY_RE.exec(name);
       if (!m) { problems.push({ key: null, reason: "unrecognized_entry", why: "delivery-claims/" + name.slice(0, 80) }); continue; }
-      if (m[2] !== "handed_off.json" && m[2] !== "failed.json") continue;   // claim 目录先于 run 存在，不参与孤儿判定
+      if (!TERMINAL_STATE_FILES.has(m[2])) continue;   // claim 目录、笔记、非终局状态记录：不参与孤儿判定
       note(m[1], "terminal");
       // 盘点只验"是不是一条记录"（非数组对象）；授权语义留给 readTerminalRecord。
       let doc;

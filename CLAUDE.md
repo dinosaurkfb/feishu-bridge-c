@@ -110,6 +110,7 @@ goal 模式的条件仍然写成**每层收口时停一下**。放开授权是�
 ```bash
 node scripts/test.mjs                        # 本地合成回归，零外部副作用
 node scripts/install-outbound.mjs            # 看看会不会动到 ~/.claude/settings.json
+node scripts/doctor.mjs                      # 可选：机器级体检（只读不修；查跨项目说不通的地方）
 ```
 
 安装器改的是全局 settings（里面还有 .orca 的一整套钩子），**只追加、先备份**。

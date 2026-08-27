@@ -358,7 +358,7 @@ function writeClaimFixture({ claimsDir, key, root = null, patch = {} }) {
   return file;
 }
 
-function outboxRecord(extra = {}) {
+function outboxDefaults() {
   recSeq += 1;
   return {
     id: "evt-" + String(recSeq).padStart(6, "0"),
@@ -366,8 +366,85 @@ function outboxRecord(extra = {}) {
     text: "夹具正文 " + recSeq,
     created_at: new Date(Date.UTC(2026, 7, 24, 0, 0, recSeq % 60)).toISOString(),
     published_at: null,
-    ...extra,
   };
+}
+/** 用**读模型自己的判据**看一条夹具：三态判不出来 / 解释不了 → 返回原因；合法 → null。 */
+function outboxFixtureProblem(rec) {
+  const verdict = classifyOutboxRecord(rec);
+  if (verdict.unclassified) return "unclassified：" + verdict.why;
+  const gaps = explainabilityGaps(rec);
+  if (gaps.length > 0) return "unexplainable：" + gaps.join("、");
+  return null;
+}
+/**
+ * **合法的** outbox 记录夹具。约束在 helper 里：产出必须能被读模型归三态且 explainabilityGaps
+ * 为空，否则当场抛 —— 不靠调用处记得检查。坏样本一律走 invalidOutboxRecord / rawOutboxFixture，
+ * 那两个都要求声明预期阻断原因（评审建议，堆叠文档 §6）。
+ */
+function outboxRecord(extra = {}) {
+  const rec = { ...outboxDefaults(), ...extra };
+  const problem = outboxFixtureProblem(rec);
+  if (problem) {
+    throw new Error("outboxRecord 造出了不合法的样本（" + problem + "）—— 坏样本请用 invalidOutboxRecord 并声明预期阻断原因。extra=" + JSON.stringify(extra));
+  }
+  return rec;
+}
+/**
+ * **刻意非法的**记录夹具。必须声明预期阻断原因，并在这里就与读模型对账：
+ *   expect.unclassified —— classifyOutboxRecord 该给的 why **原文**
+ *   expect.gaps         —— explainabilityGaps 该报的字段列表，**逐字、有序**
+ * 没声明的那一项必须干净（没声明 unclassified ⇒ 三态可归类；没声明 gaps ⇒ gaps 为空）。
+ * 声明与实际不符当场抛，"被挡住了就行"不算。omit 列出要删掉的键（造"缺字段"样本）。
+ */
+function invalidOutboxRecord({ expect, omit = [], ...extra } = {}) {
+  // **expect 是封闭联合**：unclassified 若出现必须是非空字符串；gaps 若出现必须是非空的字符串数组；
+  // 两者至少一个；不认识的键拒绝 —— `expect: { gaps: [] }` / `{ unclassified: null }` 这种
+  // "声明了却什么都没说"的形状曾能让一条完全合法的记录冒充坏样本（评审探针）。
+  const isStr = (v) => typeof v === "string" && v.trim().length > 0;
+  const isStrList = (v) => Array.isArray(v) && v.length > 0 && v.every(isStr);
+  if (expect === null || typeof expect !== "object" || Array.isArray(expect)) {
+    throw new Error("invalidOutboxRecord 必须声明预期阻断原因：expect.unclassified 和/或 expect.gaps");
+  }
+  const unknown = Object.keys(expect).filter((k) => k !== "unclassified" && k !== "gaps");
+  if (unknown.length > 0) throw new Error("invalidOutboxRecord：expect 里有不认识的键 " + unknown.join("、"));
+  if ("unclassified" in expect && !isStr(expect.unclassified)) throw new Error("invalidOutboxRecord：expect.unclassified 必须是非空字符串");
+  if ("gaps" in expect && !isStrList(expect.gaps)) throw new Error("invalidOutboxRecord：expect.gaps 必须是非空的字符串数组");
+  if (!("unclassified" in expect) && !("gaps" in expect)) {
+    throw new Error("invalidOutboxRecord 必须声明预期阻断原因：expect.unclassified 和/或 expect.gaps");
+  }
+  if (!isStrList(omit) && !(Array.isArray(omit) && omit.length === 0)) throw new Error("invalidOutboxRecord：omit 必须是字符串数组");
+  const rec = { ...outboxDefaults(), ...extra };
+  for (const k of omit) delete rec[k];
+  const verdict = classifyOutboxRecord(rec);
+  const gaps = explainabilityGaps(rec);
+  const wantWhy = expect.unclassified ?? null;
+  const gotWhy = verdict.unclassified ? verdict.why : null;
+  if (gotWhy !== wantWhy) {
+    throw new Error("invalidOutboxRecord：声明的三态阻断原因是 " + JSON.stringify(wantWhy) + "，实际 " + JSON.stringify(gotWhy) + "。extra=" + JSON.stringify(extra));
+  }
+  const wantGaps = expect.gaps ?? [];
+  if (JSON.stringify(gaps) !== JSON.stringify(wantGaps)) {
+    throw new Error("invalidOutboxRecord：声明的解释缺口是 " + JSON.stringify(wantGaps) + "，实际 " + JSON.stringify(gaps) + "。extra=" + JSON.stringify(extra));
+  }
+  return rec;
+}
+/**
+ * **原始夹具**（坏 JSON / 不是记录对象）：返回要写盘的字节。expect.unclassified 声明预期原因，
+ * 与读取端（坏 JSON → "读不出来"；非对象 → classifyOutboxRecord 的 why）对账。
+ */
+function rawOutboxFixture({ raw, expect } = {}) {
+  if (typeof raw !== "string" || typeof expect?.unclassified !== "string") {
+    throw new Error("rawOutboxFixture 需要 raw 字符串与 expect.unclassified");
+  }
+  let actual;
+  try {
+    const verdict = classifyOutboxRecord(JSON.parse(raw));
+    actual = verdict.unclassified ? verdict.why : null;
+  } catch { actual = "读不出来"; }
+  if (actual !== expect.unclassified) {
+    throw new Error("rawOutboxFixture：声明的阻断原因是 " + JSON.stringify(expect.unclassified) + "，实际 " + JSON.stringify(actual));
+  }
+  return raw;
 }
 
 /**
@@ -10844,8 +10921,8 @@ test("预览和 --apply 不许给出相反结论：损坏记录在预览里就�
   fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
     status: "active", root_message_id: "om_x", feishu_root_message_id_reference: "om_x",
     claude_session_id: null, channel_generation_id: "gen-1" }));
-  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify(outboxRecord({ kind: "milestone", text: "坏的",
-    target_channel_generation_id: "   " })));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify(invalidOutboxRecord({ text: "坏的",
+    target_channel_generation_id: "   ", expect: { gaps: ["target_channel_generation_id"] } })));
   const cli = (args) => spawnSync(process.execPath, [
     path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir, ...args,
   ], { encoding: "utf-8" });
@@ -11015,8 +11092,8 @@ test("锁内重读要重判损坏：文件名一个没变，目标字段变坏�
   fs.mkdirSync(obDir, { recursive: true });
   const rec = path.join(obDir, "0001.json");
   // **磁盘上已经是坏的**，而预览快照记的是好的 gen-1。
-  fs.writeFileSync(rec, JSON.stringify(outboxRecord({ kind: "milestone", text: "x",
-    target_channel_generation_id: "   " })));
+  fs.writeFileSync(rec, JSON.stringify(invalidOutboxRecord({ text: "x",
+    target_channel_generation_id: "   ", expect: { gaps: ["target_channel_generation_id"] } })));
 
   const got = applySuppressionCore({
     outboxDir: obDir, publishLockDir: path.join(dir, "pub.lock"),
@@ -11111,9 +11188,13 @@ test("空白目标代际是损坏记录：不许当自带代际放行，也不�
   const rec = path.join(obDir, "0001.json");
   const genLock = path.join(dir, "gen.lock");
   const pubLock = path.join(dir, "pub.lock");
-  const call = (target) => {
-    fs.writeFileSync(rec, JSON.stringify(outboxRecord({ text: "x",
-      ...(target === undefined ? {} : { target_channel_generation_id: target }) })));
+  // 调用处**显式声明**这条样本是不是损坏的：损坏的走 invalidOutboxRecord 并声明它该被点名的字段，
+  // 合法的走 outboxRecord 自检 —— 不让夹具自己猜。
+  const call = (target, { corrupt = false } = {}) => {
+    const extra = target === undefined ? {} : { target_channel_generation_id: target };
+    fs.writeFileSync(rec, JSON.stringify(corrupt
+      ? invalidOutboxRecord({ text: "x", ...extra, expect: { gaps: ["target_channel_generation_id"] } })
+      : outboxRecord({ text: "x", ...extra })));
     return applySuppressionCore({
       outboxDir: obDir, publishLockDir: pubLock, generationLockDir: genLock,
       pending: [{ _file: rec, ...(target === undefined ? {} : { target_channel_generation_id: target }) }],
@@ -11125,7 +11206,7 @@ test("空白目标代际是损坏记录：不许当自带代际放行，也不�
 
   // 三态各验一次。
   for (const bad of ["   ", "", 7, {}]) {
-    const got = call(bad);
+    const got = call(bad, { corrupt: true });
     assert.equal(got.ok, false, "损坏目标不许放行：" + JSON.stringify(bad));
     // 判据只有一份：损坏代际由统一守卫（审计层）接住。
     assert.equal(got.reason, "outbox_unexplainable");
@@ -11776,7 +11857,7 @@ test("Claude 排空：损坏记录报成本地问题，一次发布器都不调"
   // 被报成"飞书发布失败"，人会去查网络、查凭据、查话题，
   // 而问题根本不在那边。**报错报错了地方，比不报还费时间。**
   const { dir, obDir } = drainFixture({
-    "0001.json": outboxRecord({ text: "坏的", target_channel_generation_id: "   " }),
+    "0001.json": invalidOutboxRecord({ text: "坏的", target_channel_generation_id: "   ", expect: { gaps: ["target_channel_generation_id"] } }),
   });
   const before = fs.readFileSync(path.join(obDir, "0001.json"), "utf-8");
   let published = 0;
@@ -11835,7 +11916,7 @@ test("Stop 文案：本地损坏不许说成「发布失败」，也不许提兜
   // **内部原因改了而提示没改，等于没改**：人看到的仍是"发布失败"。
   // 这条走**真实 Stop 钩子进程**，不是读源码找字符串。
   const { dir } = drainFixture({
-    "0001.json": outboxRecord({ text: "坏的", target_channel_generation_id: "   " }),
+    "0001.json": invalidOutboxRecord({ text: "坏的", target_channel_generation_id: "   ", expect: { gaps: ["target_channel_generation_id"] } }),
   });
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-l6-home-"));
   const registryFile = path.join(home, "registry.json");
@@ -12191,29 +12272,32 @@ test("能解析但归不了类的记录，同样整批不动 —— 逐个分支
   // 实测过：把快照那侧换成一份宽松判据，整套 606 条一条都不红。
   //
   // 所以这里逐个分支造"能解析、但说不清"的记录。
+  // 每条非法样本**同时声明预期阻断原因**（why 原文），夹具 helper 先与读模型对账，
+  // 真实入口的理由再与声明逐字相等 —— 不是"被挡住了就行"。
   const cases = [
-    ["published_at 放 false", { published_at: false }, /published_at 既不是 null 也不是规范时间/u],
-    ["published_at 放 0", { published_at: 0 }, /published_at 既不是 null 也不是规范时间/u],
-    ["published_at 放空串", { published_at: "" }, /published_at 既不是 null 也不是规范时间/u],
+    ["published_at 放 false", { published_at: false }, "published_at 既不是 null 也不是规范时间"],
+    ["published_at 放 0", { published_at: 0 }, "published_at 既不是 null 也不是规范时间"],
+    ["published_at 放空串", { published_at: "" }, "published_at 既不是 null 也不是规范时间"],
     ["published_at 不是规范时间", { published_at: "2026-08-25 00:00:00" },
-      /published_at 既不是 null 也不是规范时间/u],
-    ["缺 published_at", "缺字段", /缺 published_at/u],
+      "published_at 既不是 null 也不是规范时间"],
+    ["缺 published_at", "缺字段", "缺 published_at，无法归类"],
     ["publish_suppressed_at 不是时间", { publish_suppressed_at: "abc" },
-      /publish_suppressed_at 不是规范时间/u],
+      "publish_suppressed_at 不是规范时间"],
     ["既已发布又已停发", { published_at: "2026-08-25T00:00:00.000Z",
-      publish_suppressed_at: "2026-08-25T00:00:00.000Z" }, /自相矛盾/u],
-    ["不是记录对象", "数组", /不是记录对象/u],
+      publish_suppressed_at: "2026-08-25T00:00:00.000Z" }, "既标了已发布又标了已停发，状态自相矛盾"],
+    ["不是记录对象", "数组", "不是记录对象"],
   ];
-  for (const [why, patch, pattern] of cases) {
+  for (const [why, patch, expected] of cases) {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-l3-sem-"));
     const dir = path.join(base, "outbox");
     fs.mkdirSync(dir);
     fs.writeFileSync(path.join(dir, "0001.json"), JSON.stringify(outboxRecord({
       text: "合法的一条", target_channel_generation_id: "gen-1" })));
-    const bad = outboxRecord({ text: "坏的", target_channel_generation_id: "gen-1" });
-    if (patch === "缺字段") delete bad.published_at;
-    const body = patch === "数组" ? [1, 2] : (patch === "缺字段" ? bad : { ...bad, ...patch });
-    fs.writeFileSync(path.join(dir, "0002.json"), JSON.stringify(body));
+    const body = patch === "数组"
+      ? rawOutboxFixture({ raw: "[1,2]", expect: { unclassified: expected } })
+      : JSON.stringify(invalidOutboxRecord({ text: "坏的", target_channel_generation_id: "gen-1",
+        ...(patch === "缺字段" ? { omit: ["published_at"] } : patch), expect: { unclassified: expected } }));
+    fs.writeFileSync(path.join(dir, "0002.json"), body);
 
     // 前提：它确实能被解析 —— 否则测的就还是 parse 的 catch。
     JSON.parse(fs.readFileSync(path.join(dir, "0002.json"), "utf-8"));
@@ -12227,7 +12311,7 @@ test("能解析但归不了类的记录，同样整批不动 —— 逐个分支
     assert.deepEqual(got.files, ["0002.json"], why + "：要点名");
     const detail = (got.details ?? []).find((d) => d.file === "0002.json");
     assert.ok(detail, why + "：要说清为什么");
-    assert.match(detail.why, pattern, why + "：理由说得不对 —— " + detail.why);
+    assert.equal(detail.why, expected, why + "：理由要与声明的逐字相等 —— " + detail.why);
     assert.deepEqual(fs.readdirSync(dir).map((f) => fs.readFileSync(path.join(dir, f), "utf-8")),
       before, why + "：一个字节都不许改");
   }
@@ -12251,9 +12335,9 @@ test("语义损坏在真实 CLI 预览里也要挡住 —— 不是只有核心�
   }));
   fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify(outboxRecord({
     text: "合法的一条", target_channel_generation_id: "gen-1" })));
-  fs.writeFileSync(path.join(obDir, "0002.json"), JSON.stringify({
-    ...outboxRecord({ text: "坏的", target_channel_generation_id: "gen-1" }),
-    published_at: false }));
+  fs.writeFileSync(path.join(obDir, "0002.json"), JSON.stringify(invalidOutboxRecord({
+    text: "坏的", target_channel_generation_id: "gen-1", published_at: false,
+    expect: { unclassified: "published_at 既不是 null 也不是规范时间" } })));
 
   const r = spawnSync(process.execPath,
     [path.resolve("scripts", "feishu-suppress-outbox.mjs"), "--project", dir],
@@ -12401,7 +12485,7 @@ test("抑制的语义差分契约：除允许清单外一律不变", () => {
   assert.equal(listPending({ outboxDir: dir }).length, 0);
 
   // 失败路径：文件字节完全不变。
-  fs.writeFileSync(path.join(dir, "0002.json"), "{ 坏的");
+  fs.writeFileSync(path.join(dir, "0002.json"), rawOutboxFixture({ raw: "{ 坏的", expect: { unclassified: "读不出来" } }));
   const bytes = fs.readdirSync(dir).map((f) => fs.readFileSync(path.join(dir, f), "utf-8"));
   const refused = suppressAll(dir);
   assert.equal(refused.ok, false, "有坏文件就拒绝");
@@ -12825,8 +12909,7 @@ const drainMatrixRunner = {
         // 坏形状要直接写盘（生产入口造不出来）—— 本文件在 token 豁免名单上。
         markers.push(text);
         const file = path.join(g.obDir, "corrupt-" + markers.length + ".json");
-        fs.writeFileSync(file, JSON.stringify({
-          ...outboxRecord({ text }), publish_attempts: "five" }));
+        fs.writeFileSync(file, JSON.stringify(invalidOutboxRecord({ text, publish_attempts: "five", expect: { gaps: ["publish_retry_protection"] } })));
       },
       attempt(behavior, opts = {}) {
         let publishCalls = 0;
@@ -12922,7 +13005,7 @@ const watcherMatrixRunner = {
         markers.push(text);
         fs.appendFileSync(markersFile, text + "\n");
         fs.writeFileSync(path.join(obDir, "corrupt-" + markers.length + ".json"),
-          JSON.stringify({ ...outboxRecord({ text }), publish_attempts: "five" }));
+          JSON.stringify(invalidOutboxRecord({ text, publish_attempts: "five", expect: { gaps: ["publish_retry_protection"] } })));
       },
       attempt(behavior) {
         fs.writeFileSync(modeFile, behavior);
@@ -13115,17 +13198,17 @@ test("重试保护那三个字段必须自洽，写坏了不许悄悄回到自�
   // 评审实测：把它们改成 "five" / "not-a-time" / 一个对象，auditOutbox 仍 ok:true，
   // 而 isPermanentlyRejected 判 false —— **一条被永久拒绝的记录靠写坏自己的
   // 保护字段就重新进入了自动发布队列**。
-  const good = { ...outboxRecord({ text: "一条" }),
+  const good = outboxRecord({ text: "一条",
     publish_attempts: 3, publish_rejected_at: "2026-08-26T00:00:00.000Z",
-    publish_rejected_reason: "平台拒绝（err_11310）", publish_rejected_kind: "platform_rejected" };
+    publish_rejected_reason: "平台拒绝（err_11310）", publish_rejected_kind: "platform_rejected" });
   assert.deepEqual(explainabilityGaps(good), [], "正常那份不许被误伤：" +
     JSON.stringify(explainabilityGaps(good)));
   // 三个字段都不在也合法 —— 绝大多数记录就是这样。
   assert.deepEqual(explainabilityGaps(outboxRecord({ text: "干净的" })), []);
 
   // retrying 也是合法形状：只有 attempts、还在预算内。
-  assert.deepEqual(explainabilityGaps({ ...outboxRecord({ text: "重试中" }),
-    publish_attempts: 2 }), [], "retrying 形状不许被误伤");
+  assert.deepEqual(explainabilityGaps(outboxRecord({ text: "重试中", publish_attempts: 2 })), [],
+    "retrying 形状不许被误伤");
 
   const paused = { publish_attempts: 3, publish_rejected_at: "2026-08-26T00:00:00.000Z",
     publish_rejected_reason: "平台拒绝（err_11310）", publish_rejected_kind: "platform_rejected" };
@@ -13151,8 +13234,8 @@ test("重试保护那三个字段必须自洽，写坏了不许悄悄回到自�
     ["没有 attempts", (() => { const x = { ...paused }; delete x.publish_attempts; return x; })()],
   ];
   for (const [why, patch] of cases) {
-    const rec = { ...outboxRecord({ text: "一条" }), ...patch };
-    assert.ok(explainabilityGaps(rec).includes("publish_retry_protection"),
+    const rec = invalidOutboxRecord({ text: "一条", ...patch, expect: { gaps: ["publish_retry_protection"] } });
+    assert.deepEqual(explainabilityGaps(rec), ["publish_retry_protection"],
       why + "：**说不清却报了干净** —— " + JSON.stringify(explainabilityGaps(rec)));
     assert.equal(isPermanentlyRejected(rec), false,
       why + "：坏形状不许被当成 paused（那会让它悄悄退出自动队列而无人知晓）");
@@ -13162,8 +13245,8 @@ test("重试保护那三个字段必须自洽，写坏了不许悄悄回到自�
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-fieldshape-"));
   const obDir = path.join(dir, "outbox");
   fs.mkdirSync(obDir);
-  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify({
-    ...outboxRecord({ text: "写坏保护字段的" }), publish_attempts: "five" }));
+  fs.writeFileSync(path.join(obDir, "0001.json"), JSON.stringify(invalidOutboxRecord({
+    text: "写坏保护字段的", publish_attempts: "five", expect: { gaps: ["publish_retry_protection"] } })));
   const blocked = outboxMutationBlocker(auditOutbox(obDir));
   assert.ok(blocked, "**写坏保护字段的记录必须被守卫看见**");
   assert.equal(blocked.reason, "outbox_unexplainable");
@@ -13542,9 +13625,9 @@ test("受控成因枚举不许在运行时被扩宽", () => {
   // 评审实测：导出数组可变时，PAUSE_KINDS.push("invented_kind") 让原本
   // corrupt 的记录变成合法 paused —— 封闭联合被进程内代码扩宽。
   assert.equal(Object.isFrozen(PAUSE_KINDS), true, "导出的枚举必须冻结");
-  const forged = { ...outboxRecord({ text: "一条" }), publish_attempts: 1,
+  const forged = invalidOutboxRecord({ text: "一条", publish_attempts: 1,
     publish_rejected_at: "2026-08-26T00:00:00.000Z",
-    publish_rejected_reason: "x", publish_rejected_kind: "invented_kind" };
+    publish_rejected_reason: "x", publish_rejected_kind: "invented_kind", expect: { gaps: ["publish_retry_protection"] } });
   assert.equal(retryProtection(forged).status, "corrupt", "前提：编造的 kind 是 corrupt");
   try { PAUSE_KINDS.push("invented_kind"); } catch { /* 冻结数组会抛，正好 */ }
   assert.equal(retryProtection(forged).status, "corrupt",
@@ -13618,7 +13701,7 @@ test("发布事务：authorized_only 只消费授权结论，不自己造判据"
   const obDir = path.join(dir, "outbox");
   fs.mkdirSync(obDir);
   const mk = (name, extra) => fs.writeFileSync(path.join(obDir, name),
-    JSON.stringify({ ...outboxRecord({ text: name }), ...extra }));
+    JSON.stringify(outboxRecord({ text: name, ...extra })));
   mk("01-authorized.json", { publish_eligible_at: "2026-08-26T00:00:00.000Z" });
   mk("02-plain.json", {});
 
@@ -13641,7 +13724,10 @@ test("发布事务：authorized_only 只消费授权结论，不自己造判据"
   // 垃圾授权值（非空字符串但不是规范时间）——第 5 层要收敛的那个分叉。
   // **审计闸门在选择之前就把它整批拦下**：说不清的授权是损坏，
   // 不是"跳过它发别的"。写这条时我预设的是静默跳过，实测闸门更强 —— 记下真实语义。
-  mk("03-junk-auth.json", { publish_eligible_at: "not-a-canonical-time" });
+  // 畸形授权 = 损坏样本：声明它该在 explainabilityGaps 里被点名为 publish_eligible_at。
+  fs.writeFileSync(path.join(obDir, "03-junk-auth.json"), JSON.stringify(invalidOutboxRecord({
+    text: "03-junk-auth.json", publish_eligible_at: "not-a-canonical-time",
+    expect: { gaps: ["publish_eligible_at"] } })));
   const blocked = run();
   assert.equal(blocked.r.status, "error", "垃圾授权 = 损坏 = 整批 fail-closed");
   assert.equal(blocked.r.local, true);
@@ -15035,7 +15121,7 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
     f.run("indep");
     const outboxDir = path.join(f.h.dir, ".runtime-data", "outbound", "outbox");
     fs.mkdirSync(outboxDir, { recursive: true });
-    fs.writeFileSync(path.join(outboxDir, "bad.json"), "{ 坏了");
+    fs.writeFileSync(path.join(outboxDir, "bad.json"), rawOutboxFixture({ raw: "{ 坏了", expect: { unclassified: "读不出来" } }));
     const r = f.drain();
     assert.equal(f.sent(), 1, "**outbox 损坏不许截断 run 通道**：" + JSON.stringify(r));
     assert.equal(r.status, "error"); assert.equal(r.local, true);
@@ -15195,6 +15281,70 @@ test("Claude watcher：发布账本说送达状态不确定（reserved）→ 绑
   assert.equal(fs.existsSync(path.join(h.dir, "lark-calls.jsonl")), false, "**送达状态不确定就不许再发**");
   assert.equal(fs.existsSync(path.join(runs, key + ".published.json")), false);
   assert.equal(JSON.parse(fs.readFileSync(path.join(rt, "delivery-claims", key + ".handed_off.json"), "utf-8")).run_state, "completed", "终局照记");
+});
+
+test("outbox 夹具 helper 自己守约束：合法产出过审计；坏样本必须显式声明且声明要与读模型逐字相符", () => {
+  // ① outboxRecord 的默认产出与合法扩展，落盘后审计干净 —— 约束在 helper 里，不靠调用处记得。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-sem-"));
+  fs.writeFileSync(path.join(dir, "0001.json"), JSON.stringify(outboxRecord()));
+  fs.writeFileSync(path.join(dir, "0002.json"), JSON.stringify(outboxRecord({ kind: "reply", text: "x",
+    target_channel_generation_id: "gen-1", publish_eligible_at: "2026-08-26T00:00:00.000Z", publish_attempts: 2 })));
+  assert.deepEqual(auditOutbox(dir), { ok: true, pending: 2, unclassified: [], unexplainable: [], files: ["0001.json", "0002.json"] });
+  // ② outboxRecord 造不出坏样本：每一类坏形状都当场抛，并指路 invalidOutboxRecord。
+  for (const [why, extra] of [
+    ["kind 不在受控取值里", { kind: "progress" }],
+    ["id 纯空白", { id: "   " }],
+    ["正文为空", { text: "  " }],
+    ["created_at 不规范", { created_at: "昨天" }],
+    ["目标代际纯空白", { target_channel_generation_id: "   " }],
+    ["授权字段畸形", { publish_eligible_at: "not-a-canonical-time" }],
+    ["重试保护写坏", { publish_attempts: "five" }],
+    ["published_at 放 false", { published_at: false }],
+    ["既发布又停发", { published_at: "2026-08-24T00:00:00.000Z", publish_suppressed_at: "2026-08-24T00:00:00.000Z" }],
+  ]) assert.throws(() => outboxRecord(extra), /invalidOutboxRecord/u, why + "：outboxRecord 不许造出坏样本");
+  // ③ invalidOutboxRecord：必须声明；声明要与读模型逐字相符（why 原文、gaps 有序逐字）；没声明的那一项必须干净。
+  assert.throws(() => invalidOutboxRecord({ target_channel_generation_id: "   " }), /必须声明预期阻断原因/u, "不声明不行");
+  // expect 是封闭联合："声明了却什么都没说"的形状一律拒绝（评审探针：gaps:[] / unclassified:null 曾放行合法记录）。
+  for (const [why, expect, pattern] of [
+    ["gaps 空数组", { gaps: [] }, /gaps 必须是非空的字符串数组/u],
+    ["gaps 不是数组", { gaps: "kind" }, /gaps 必须是非空的字符串数组/u],
+    ["gaps 含空串", { gaps: ["kind", ""] }, /gaps 必须是非空的字符串数组/u],
+    ["unclassified 为 null", { unclassified: null }, /unclassified 必须是非空字符串/u],
+    ["unclassified 为空串", { unclassified: "" }, /unclassified 必须是非空字符串/u],
+    ["不认识的键", { reason: "x" }, /不认识的键 reason/u],
+    ["expect 是数组", ["kind"], /必须声明预期阻断原因/u],
+    ["expect 为空对象", {}, /必须声明预期阻断原因/u],
+  ]) assert.throws(() => invalidOutboxRecord({ expect }), pattern, why);
+  assert.throws(() => invalidOutboxRecord({ omit: "published_at", expect: { unclassified: "缺 published_at，无法归类" } }), /omit 必须是字符串数组/u);
+  assert.throws(() => invalidOutboxRecord({ target_channel_generation_id: "   ", expect: { gaps: ["kind"] } }),
+    /声明的解释缺口是 \["kind"\]，实际 \["target_channel_generation_id"\]/u, "gaps 声明错了要抛");
+  assert.throws(() => invalidOutboxRecord({ published_at: false, expect: { unclassified: "published_at 不对" } }),
+    /声明的三态阻断原因/u, "why 声明错了要抛（不是子串匹配，是逐字）");
+  assert.throws(() => invalidOutboxRecord({ published_at: false, target_channel_generation_id: "   ",
+    expect: { gaps: ["target_channel_generation_id"] } }), /声明的三态阻断原因是 null/u, "只声明 gaps 而记录还三态判不出来 → 抛");
+  assert.throws(() => invalidOutboxRecord({ published_at: false, target_channel_generation_id: "   ",
+    expect: { unclassified: "published_at 既不是 null 也不是规范时间" } }), /声明的解释缺口是 \[\]/u, "只声明 unclassified 而 gaps 非空 → 抛");
+  assert.throws(() => invalidOutboxRecord({ text: "其实合法", expect: { gaps: ["text"] } }), /实际 \[\]/u, "把合法样本声明成坏的也要抛");
+  // 声明正确：产出落盘后审计给出的就是声明的那个原因。
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-sem2-"));
+  fs.writeFileSync(path.join(dir2, "gap.json"), JSON.stringify(invalidOutboxRecord({
+    target_channel_generation_id: "   ", expect: { gaps: ["target_channel_generation_id"] } })));
+  fs.writeFileSync(path.join(dir2, "cls.json"), JSON.stringify(invalidOutboxRecord({
+    omit: ["published_at"], expect: { unclassified: "缺 published_at，无法归类" } })));
+  fs.writeFileSync(path.join(dir2, "both.json"), JSON.stringify(invalidOutboxRecord({
+    published_at: false, target_channel_generation_id: "   ",
+    expect: { unclassified: "published_at 既不是 null 也不是规范时间", gaps: ["target_channel_generation_id"] } })));
+  fs.writeFileSync(path.join(dir2, "raw.json"), rawOutboxFixture({ raw: "{ 坏了", expect: { unclassified: "读不出来" } }));
+  fs.writeFileSync(path.join(dir2, "arr.json"), rawOutboxFixture({ raw: "[1]", expect: { unclassified: "不是记录对象" } }));
+  const a = auditOutbox(dir2);
+  assert.deepEqual(a.unclassified.map((u) => [u.file, u.why]).sort(), [
+    ["arr.json", "不是记录对象"], ["both.json", "published_at 既不是 null 也不是规范时间"],
+    ["cls.json", "缺 published_at，无法归类"], ["raw.json", "读不出来"]]);
+  assert.deepEqual(a.unexplainable.map((u) => u.file).sort(), ["both.json", "gap.json"]);
+  // ④ rawOutboxFixture 同样要声明且相符。
+  assert.throws(() => rawOutboxFixture({ raw: "{ 坏了" }), /需要 raw 字符串与 expect/u);
+  assert.throws(() => rawOutboxFixture({ raw: "{ 坏了", expect: { unclassified: "不是记录对象" } }), /实际 "读不出来"/u);
+  assert.throws(() => rawOutboxFixture({ raw: JSON.stringify(outboxRecord()), expect: { unclassified: "读不出来" } }), /实际 null/u, "合法记录不能装成坏的");
 });
 
 test("claim 写原语：扩展对象覆盖不了固定身份字段", () => {

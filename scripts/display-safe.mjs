@@ -16,8 +16,9 @@ export function sanitizeForDisplay(text) {
 }
 
 /** locator 的形状：前缀受控，主体 ≥ 6 位。状态提供者的显示名校验与状态页脱敏共用。 */
-// 前缀必须从词边界开始：`generation_state` 里的 `on_` 不是 locator（真机上 topic_generation_state_invalid 曾被脱敏成 "topic_generati on_…"）。
-export const LOCATOR_SHAPED = /(?<![A-Za-z0-9_])(?:oc_|omt_|om_|ou_|on_|session_|thread_|cli_)[A-Za-z0-9_-]{6,}/u;
+// 前缀前面不能紧贴字母数字（`generation_state` 里的 `on_` 不是 locator —— 真机上 topic_generation_state_invalid
+// 曾被脱敏成 "topic_generati on_…"），但 `_` 是分隔符：`prefix_oc_abcdef_suffix` 里的 oc_… 仍然是 locator（评审探针）。
+export const LOCATOR_SHAPED = /(?<![A-Za-z0-9])(?:oc_|omt_|om_|ou_|on_|session_|thread_|cli_)[A-Za-z0-9_-]{6,}/u;
 const LOCATOR_ALL = new RegExp(LOCATOR_SHAPED.source, "gu");
 // **字符域边界，不用 \b**：下划线算 word character，prefix_<摘要>.jsonl 在 \b 下不匹配 ——
 // 真实的 unrecognized_entry 文件名就长这样（评审探针，完整摘要原样进了第五区）。

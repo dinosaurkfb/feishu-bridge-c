@@ -60,7 +60,9 @@ const short = (v) => (typeof v === "string" && v.length > 8 ? v.slice(0, 8) + "�
 const list = (items, f) => items.map(f).map(displaySafe).join("；");
 
 /**
- * 跑完整体检。**纯读**：所有输入都来自既有读模型；now / launchctl 注入只为测试。
+ * 跑完整体检。**默认只读**：所有输入都来自既有读模型，doctor 自己不写任何文件；
+ * probeProviders:true 时会执行登记的状态入口脚本，那一步进入 provider 自身的信任边界。
+ * now / launchctl 注入只为测试。
  * @returns {{overall:"ready"|"blocked"|"incomplete", checks:object[], next:string[]}}
  */
 /**
@@ -226,11 +228,13 @@ export function runDoctor({
     expired.length + expiring.length ? PREVIEW.bindProject : pendingExpired.length ? PREVIEW.rotate : null);
 
   // 发布器在不在跑：Claude launchd 兜底（沙箱里不碰真 launchctl，除非显式注入）
-  const sandboxed = os.homedir() !== os.userInfo().homedir;
+  // **隔离态看的是这次体检的 home**（machineContext），不是进程的环境 HOME —— runDoctor({home}) 传隔离目录时
+  // 也不许去探测当前机器的 launchd（评审探针记录到了真实 launchctl 调用）。
+  const sandboxed = path.resolve(ctx.home) !== path.resolve(os.userInfo().homedir);
   const injected = typeof launchctl === "function" || Boolean(process.env[LAUNCHCTL_ENV]);
   let claudePhase = "unverifiable";
   let claudePhaseWhy = null;
-  if (sandboxed && !injected) { claudePhaseWhy = "HOME 被覆盖（沙箱），不碰真实 launchctl"; }
+  if (sandboxed && !injected) { claudePhaseWhy = "体检的 home 不是当前用户的家目录（沙箱），不碰真实 launchctl"; }
   else {
     // 核**完整 ProgramArguments**，不只看同名 job 在不在（评审探针：同名 job 跑 /bin/echo 也曾被说成在发）。
     try { claudePhase = loadedPhase(launchctl, claudeDrainExpectedJob({ home, node: pickClaudeNode() }), CLAUDE_DRAIN_LAUNCH_LABEL); }
@@ -256,7 +260,7 @@ export function runDoctor({
   // Codex 侧：**引用**既有的 scripts/codex/doctor.mjs（子进程，--json），不重写它的判据。
   // Claude 侧代码不依赖 scripts/codex/（依赖单向），所以只能这样引用。沙箱里同样不碰真 launchctl。
   if (sandboxed && !injected) {
-    add("codex_drain", "⑥ 积压有人发（Codex 侧）", null, "HOME 被覆盖（沙箱），不碰真实 launchctl；Codex 侧查不清", null);
+    add("codex_drain", "⑥ 积压有人发（Codex 侧）", null, "体检的 home 不是当前用户的家目录（沙箱），不碰真实 launchctl；Codex 侧查不清", null);
   } else {
     const codexDoctor = path.join(moduleDir(import.meta.url), "codex", "doctor.mjs");
     const r = spawnSync(process.execPath, [codexDoctor, "--json"], { encoding: "utf-8", timeout: 60_000, env: ctx.codexEnv });

@@ -6979,6 +6979,8 @@ test("provider 报告：只收受控字段，多带一个就整条拒", () => {
   // 挡不住「把 locator 塞进名字」是靠形状检查兜的，明确它管到哪一步。
   assert.equal(validateProviderReport(providerReport({ group_name: "oc_abcdef123456" }), asProvider).reason,
     "connection_group_name_invalid");
+  assert.equal(validateProviderReport(providerReport({ group_name: "group_oc_123456" }), asProvider).reason,
+    "connection_group_name_invalid", "下划线后面的 locator 也不许塞进群名");
   // 控制字符会把终端输出搞乱，压平而不是拒 —— 规则与状态页同一份（display-safe），双向控制符 U+061C 也算。
   assert.equal(
     validateProviderReport(providerReport({ group_name: "A" + String.fromCharCode(0x61c) + "B" }), asProvider).connections[0].groupName,
@@ -15790,6 +15792,7 @@ test("第五区 run 通道：只转述 inspectRunChannel 的结论 —— 未查
   assert.equal(redactLocators("01911111-2222-7333-8444-555555555555 " + "A".repeat(64)), "01911111… AAAAAAAA…");
   assert.equal(redactLocators("om_ab oc_12345"), "om_ab oc_12345", "主体不足 6 位的不是 locator 形状，不动");
   assert.equal(redactLocators("topic_generation_state_invalid reason_on_disk"), "topic_generation_state_invalid reason_on_disk", "词中间的 on_ 不是 locator");
+  assert.equal(redactLocators("prefix_oc_abcdef_suffix group_oc_123456"), "prefix_oc_… group_oc_…", "下划线是分隔符：其后的 locator 照样脱敏");
   assert.equal(sanitizeForDisplay("a" + String.fromCharCode(10) + "b" + ESC + "[2Jc" + String.fromCharCode(0x2028) + "d" + String.fromCharCode(0x61c) + "e" + String.fromCharCode(0x9f) + "f"),
     "a\uFFFDb\uFFFD[2Jc\uFFFDd\uFFFDe\uFFFDf");
   assert.equal(displaySafe("runs/evil" + ESC + "[2J-" + "b".repeat(64) + ".jsonl"), "runs/evil\uFFFD[2J-bbbbbbbb….jsonl", "未识别文件名：控制符压平 + 摘要脱敏");
@@ -16053,6 +16056,18 @@ test("doctor：runDoctor({home}) 的三张表路径与 Codex 子进程环境都�
   finally { for (const [k, v] of Object.entries(saved)) if (v !== undefined) process.env[k] = v; }
   assert.equal(checkOf(report, "registry").detail, "已登记 1 个项目", "登记表要从传入的 home 派生，不是当前机器的");
   assert.equal(checkOf(report, "provider_runs").ok, null, "**进程内调用默认也不执行状态入口脚本**");
+  // 显式 home 不是当前用户的家目录 = 沙箱：没注入 launchctl 就不许探测当前机器的 launchd（两侧都报沙箱）。
+  const late = m.project("late", { expiresAt: "2099-01-01T00:00:00.000Z", outboxPending: 1 });
+  fs.writeFileSync(path.join(bridge, "registry.json"), JSON.stringify({ schema_version: "1.0", projects: [
+    { id: "good", root: good, root_message_id: "om_x", status: "active", expires_at: "2099-01-01T00:00:00.000Z" },
+    { id: "late", root: late, root_message_id: "om_y", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] }));
+  let report2;
+  for (const k of Object.keys(saved)) delete process.env[k];
+  try { report2 = runDoctor({ home: m.home }); }
+  finally { for (const [k, v] of Object.entries(saved)) if (v !== undefined) process.env[k] = v; }
+  assert.equal(checkOf(report2, "backlog_vs_publisher").ok, null, checkOf(report2, "backlog_vs_publisher").detail);
+  assert.match(checkOf(report2, "backlog_vs_publisher").detail, /沙箱/u, "**显式 home 不是家目录就是沙箱，不碰真实 launchctl**：" + checkOf(report2, "backlog_vs_publisher").detail);
+  assert.match(checkOf(report2, "codex_drain").detail, /沙箱/u);
   assert.equal(checkOf(report, "route_without_provider").ok, true);
   assert.deepEqual(machineContext({ home: m.home }).codexEnv.CODEX_HOME, path.join(m.home, ".codex"), "Codex 子进程环境同样从 home 派生");
 });

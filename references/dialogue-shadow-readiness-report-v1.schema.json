@@ -497,6 +497,7 @@
               "stale_event",
               "stale_message",
               "subscription_paused",
+              "subscription_revoked",
               "transport_not_mentioned"
             ]
           },

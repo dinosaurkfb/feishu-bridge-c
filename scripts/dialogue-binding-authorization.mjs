@@ -37,6 +37,8 @@ export const BINDING_AUTHORIZATION_REASON = Object.freeze({
   SUBSCRIPTION_AMBIGUOUS: "binding_authorization_subscription_ambiguous",
   SUBSCRIPTION_PAUSED: "subscription_paused",
   BINDING_PAUSED: "binding_paused",
+  // 订阅被撤销 / 不再覆盖这条 binding：授权被收回（FR-2.5 落盘，评审定案的形状）。
+  SUBSCRIPTION_REVOKED: "subscription_revoked",
   CANONICAL_INVALID: "canonical_event_invalid",
   BINDING_MISMATCH: "binding_ref_mismatch",
   ENDPOINT_MISMATCH: "endpoint_mismatch",
@@ -109,11 +111,21 @@ const snapshotContent = (snapshot) => ({
   freshness_ms: snapshot.freshness_ms,
 });
 
+/** 快照的内容寻址 id（导出给测试造"id 对得上、内容却不受控"的对手用）。 */
+export const dialogueBindingAuthorizationSnapshotId = (snapshot) => snapshotId(snapshot);
+
 const snapshotId = (snapshot) => digestRef("binding_authorization_", [
   "dialogue-binding-authorization-snapshot/v1",
   String(snapshot.authorization_revision),
   snapshot.captured_at,
   JSON.stringify(snapshotContent(snapshot)),
+]);
+
+/** paused 快照允许的 reason —— 与 references/dialogue-binding-authorization-v1.schema.json 的枚举同一份。 */
+export const PAUSED_REASONS = Object.freeze([
+  BINDING_AUTHORIZATION_REASON.SUBSCRIPTION_PAUSED,
+  BINDING_AUTHORIZATION_REASON.BINDING_PAUSED,
+  BINDING_AUTHORIZATION_REASON.SUBSCRIPTION_REVOKED,
 ]);
 
 export function validateDialogueBindingAuthorizationSnapshot(snapshot) {
@@ -153,8 +165,7 @@ export function validateDialogueBindingAuthorizationSnapshot(snapshot) {
   }
   const statusValid = snapshot.status === BINDING_AUTHORIZATION_STATUS.ACTIVE
     ? snapshot.reason === null
-    : [BINDING_AUTHORIZATION_REASON.SUBSCRIPTION_PAUSED,
-      BINDING_AUTHORIZATION_REASON.BINDING_PAUSED].includes(snapshot.reason);
+    : PAUSED_REASONS.includes(snapshot.reason);
   if (!statusValid || snapshot.snapshot_id !== snapshotId(snapshot)) {
     return { ok: false, reason: BINDING_AUTHORIZATION_REASON.INVALID_SNAPSHOT };
   }
@@ -182,6 +193,38 @@ export function legacyDialogueBoundAuthorization({ verdict, localTargetId } = {}
     };
   }
   return reject(verdict?.reason ?? BINDING_AUTHORIZATION_REASON.INVALID_INPUT);
+}
+
+/**
+ * 把一份现有授权快照**收回**：新 revision、status=paused、受控 reason，其余内容原样。
+ *
+ * 为什么不走 materializeDialogueBindingAuthorization：撤销时那条订阅已经不存在（next=null），
+ * 没有可以拿来物化的输入 —— 收回的语义就是"沿用上一份的内容，只把状态翻成 paused"。
+ * reason 只认 PAUSED_REASONS（schema 同一份枚举）；已经是同 reason 的 paused 则幂等返回旧快照。
+ */
+export function materializeSuspendedAuthorization({ previousSnapshot, reason, capturedAt = Date.now() } = {}) {
+  const validPrevious = validateDialogueBindingAuthorizationSnapshot(previousSnapshot);
+  if (!validPrevious.ok) return validPrevious;
+  if (!PAUSED_REASONS.includes(reason)) return { ok: false, reason: BINDING_AUTHORIZATION_REASON.INVALID_INPUT };
+  const captured = typeof capturedAt === "number" ? iso(capturedAt) : capturedAt;
+  if (!Number.isFinite(Date.parse(captured ?? ""))) {
+    return { ok: false, reason: BINDING_AUTHORIZATION_REASON.INVALID_INPUT };
+  }
+  const candidate = {
+    ...clone(previousSnapshot),
+    snapshot_id: "",
+    authorization_revision: previousSnapshot.authorization_revision,
+    captured_at: captured,
+    status: BINDING_AUTHORIZATION_STATUS.PAUSED,
+    reason,
+  };
+  if (equivalentAuthorization(previousSnapshot, candidate)) {
+    return { ok: true, changed: false, snapshot: clone(previousSnapshot) };
+  }
+  candidate.authorization_revision += 1;
+  candidate.snapshot_id = snapshotId(candidate);
+  const valid = validateDialogueBindingAuthorizationSnapshot(candidate);
+  return valid.ok ? { ok: true, changed: true, snapshot: candidate } : valid;
 }
 
 /**

@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-08-27T12:09:57.458Z",
+  "generated_at": "2026-08-27T13:38:19.933Z",
   "modules": {
     "automatic-topic-rotation.mjs": [
       "businessActivitiesForPublishedBatch",
@@ -70,14 +70,17 @@
       "BOUND_AUTHORIZATION_EVALUATOR_VERSION",
       "BOUND_AUTHORIZATION_SHADOW_ARTIFACT_TYPE",
       "BOUND_AUTHORIZATION_SHADOW_SCHEMA_VERSION",
+      "PAUSED_REASONS",
       "buildLegacyDialogueBoundAuthorizationContext",
       "compareDialogueBoundAuthorizationShadow",
       "createDialogueBoundAuthorizationShadow",
       "deriveDialogueChatScopeRef",
+      "dialogueBindingAuthorizationSnapshotId",
       "evaluateDialogueBoundAuthorization",
       "legacyBindingAuthorizationInput",
       "legacyDialogueBoundAuthorization",
       "materializeDialogueBindingAuthorization",
+      "materializeSuspendedAuthorization",
       "validateDialogueBindingAuthorizationSnapshot",
       "validateDialogueBoundAuthorizationShadow"
     ],

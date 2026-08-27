@@ -17,6 +17,7 @@ import path from "node:path";
 import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
 import { codexHomeOf } from "./drain-service.mjs";
 import { taskBindingFacts } from "./task-binding.mjs";
+import { codexPendingEventRows } from "./status-events.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -120,5 +121,7 @@ console.log(renderLayeredStatus(composeLayeredStatus({
       templateChatId: task?.chat_id ?? tpl?.chat_id ?? null }),
   connectivity: layeredConnectivity,
   otherLinks: links,
+  // FR-10：第五区的 run / publish 状态 —— 只转述 collectBacklog 与 listEligibilityPending 的结论。
+  pendingRows: codexPendingEventRows({ home, threadId, task }),
 })));
 process.exit(0);

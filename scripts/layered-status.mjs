@@ -281,7 +281,10 @@ export function composeLayeredStatus({
   bindHint = "node scripts/bind-project.mjs --apply",
   // run 通道状态（inspectRunChannel 的结论）。不传 = 没查，第五区明写"未查"，不伪造成 0。
   runChannel = undefined,
+  // 另一条链（Codex）的第五区行：调用方按自己的只读投影算好传进来；给了就用它，不再按 run 通道渲染。
+  pendingRows = null,
 }) {
+  const fifthRows = () => (Array.isArray(pendingRows) ? pendingRows : runChannelRows(runChannel, now));
   // 别的链路里能归层的，直接进对应层；归不了的留给附录。
   const split = otherLinks ? splitByRelation(otherLinks.sections) : { byLayer: null, unsorted: [] };
   // **没绑定不等于没有四层。**第 1、2 层照样有事实可报，只是第 3 层还没绑、
@@ -351,7 +354,7 @@ export function composeLayeredStatus({
       // 正是我在第 3 层要求分开的那件事，自己在这里又合回去了。
       pendingEvents: [["待发布答复", st.reason === "not_bound"
         ? "不适用（尚未绑定）" : "不适用（绑定状态不可读）"],
-        ...runChannelRows(runChannel, now)],
+        ...fifthRows()],
       connectivity,
       suspended: false,
     };
@@ -416,7 +419,7 @@ export function composeLayeredStatus({
   for (const c of split.byLayer?.policy ?? []) L4.push(relationRow(c));
 
   const L5 = [["待发布答复", st.pending + " 条" + (st.pending && st.suspended ? "（恢复后会发出）" : "")],
-    ...runChannelRows(runChannel, now)];
+    ...fifthRows()];
 
   return {
     layers: [

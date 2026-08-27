@@ -41,12 +41,11 @@ import { sanitizeForDisplay } from "../display-safe.mjs";
 import path from "node:path";
 
 import { isDirectRun, moduleDir } from "../direct-run.mjs";
-import { listPending, retryProtection } from "../outbox.mjs";
+import { readOutboxSnapshot, retryProtection } from "../outbox.mjs";
 import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
 import { generationTargetState } from "../suppress-outbox-core.mjs";
 import { hasPublishAuthorization } from "../outbox.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
-import { auditOutbox } from "./drain-service.mjs";
 import { outboxMutationBlocker } from "../outbox.mjs";
 import { outboxDirOf } from "../drain-outbox.mjs";
 import {
@@ -305,7 +304,10 @@ export function collectProjectBacklog() {
     if (seen.has(key)) continue;
     seen.add(key);
     const outboxDir = outboxDirOf(normalized, claudeSessionId);
-    const audit = auditOutbox(outboxDir);
+    // **一次读盘**：审计与待发记录来自同一份快照。上一版 auditOutbox 之后又 listPending 重读，
+    // 第二次读失败被吞成 []，于是"outbox 读不出"显示成"0 条、无异常"（评审探针）。
+    const snap = readOutboxSnapshot(outboxDir);
+    const audit = snap.ok ? snap.audit : snap;
     const entry = {
       name: sanitizeForDisplay(path.basename(normalized)) +
         (claudeSessionId ? "/" + sanitizeForDisplay(String(claudeSessionId).slice(0, 8)) : ""),
@@ -318,7 +320,7 @@ export function collectProjectBacklog() {
       records: [],
     };
     if (entry.readable) {
-      for (const r of listPending({ outboxDir })) {
+      for (const r of snap.records) {
         entry.records.push({
           file: path.basename(r._file ?? ""),
           kind: sanitizeForDisplay(r.kind ?? "?"),
@@ -413,7 +415,9 @@ export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey =
   const tasks = [];
   for (const task of selected) {
     const outboxDir = taskPaths(task, home).outbox;
-    const audit = auditOutbox(outboxDir);
+    // 同上：一次读盘，审计与记录同源。
+    const snap = readOutboxSnapshot(outboxDir);
+    const audit = snap.ok ? snap.audit : snap;
     const entry = {
       name: sanitizeForDisplay(task.task_display_name ?? task.logical_task_key ?? "(未命名)"),
       taskKey: task.logical_task_key ?? null,
@@ -432,7 +436,7 @@ export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey =
       // **逐记录真解析一次目标代际** —— 只验字段形状会漏掉"冻结到已 retired 的代际"。
       const resolveTarget = (key) => resolveTaskOutboundGeneration(
         task, key === null || key === undefined ? null : key);
-      for (const r of listPending({ outboxDir })) {
+      for (const r of snap.records) {
         const state = describeRecordState(r, { resolveTarget });
         // 被永久拒绝过的要单独说（同项目条目一份投影）—— 它不会再自动重试，是在等人。
         const rp = retryProtection(r);

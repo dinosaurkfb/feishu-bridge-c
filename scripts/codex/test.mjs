@@ -4664,6 +4664,34 @@ test("四层 status：Codex 侧报的必须是自己那条链的事实，不是 
   assert.doesNotMatch(r.stdout, /abc123/u, "认领口令不许出现");
 });
 
+test("collectBacklog 一次读盘：审计与记录同源，一条记录只读一次 —— 第二次读失败不许折叠成 0", () => {
+  const home = temp();
+  const root = path.join(home, "p");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "单读", rootMessageId: "om_root", token: "abc123" });
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  const outboxDir = taskPaths(task, home).outbox;
+  fs.mkdirSync(outboxDir, { recursive: true });
+  const file = path.join(outboxDir, "0001.json");
+  fs.writeFileSync(file, JSON.stringify(outboxRecord({ kind: "reply", text: "还在" })));
+  const original = fs.readFileSync;
+  let reads = 0;
+  fs.readFileSync = function (target, ...rest) {
+    if (String(target) === file) {
+      reads += 1;
+      if (reads === 2) { const err = new Error("second read failed"); err.code = "EIO"; throw err; }
+    }
+    return original.call(this, target, ...rest);
+  };
+  let got;
+  try { got = collectBacklog({ home, threadId: THREAD_A }); } finally { fs.readFileSync = original; }
+  assert.equal(reads, 1, "**一条记录只许读一次**（审计与记录同一份快照）");
+  assert.equal(got.ok, true);
+  assert.equal(got.tasks.length, 1, "记录还在，不许折叠成 0：" + JSON.stringify(got));
+  assert.equal(got.tasks[0].records.length, 1);
+  assert.equal(got.complete, true);
+});
+
 test("四层 status 第五区：只转述 outbox 与资格标记的只读投影 —— 各态计数、需要人看逐条、说不清不折叠成 0、零副作用、不泄露 locator（真实进程）", () => {
   const home = temp();
   const root = path.join(home, "p");
@@ -4708,13 +4736,30 @@ test("四层 status 第五区：只转述 outbox 与资格标记的只读投影 
   assert.match(fifth, /outbox 账本[　 ]+说不清 3 处/u, "坏 JSON 与解释不了的都要点名：" + fifth);
   assert.match(fifth, /03-malformed\.json[　 ]+缺少解释这条记录所必需的字段：publish_eligible_at/u, fifth);
   assert.match(fifth, /05-raw\.json[　 ]+读不出来/u, fifth);
-  assert.match(fifth, /等资格恢复[　 ]+1 条（run 已完成，发布资格待提升）/u, fifth);
+  // 标记自报 completed 但没有 run 制品：只能说"待核验"，不许说"run 已完成"（评审探针）。
+  assert.match(fifth, /等资格恢复[　 ]+0 条/u, fifth);
+  assert.match(fifth, new RegExp("资格待核验[　 ]+1 条（有标记，终局凭据未核验通过）[\\s\\S]*" + okKey.slice(0, 8) + "[　 ]+退出回执缺席", "u"), fifth);
+  assert.doesNotMatch(fifth, /run 已完成/u, "没核验过凭据不许说 run 已完成");
   assert.match(fifth, new RegExp("资格标记[　 ]+说不清 1 处[\\s\\S]*" + badKey.slice(0, 8) + "[　 ]+读不出来", "u"), fifth);
   // 不泄露 locator：根消息 id、thread id、完整 claim key。
   assert.doesNotMatch(r.stdout, /om_root/u); assert.doesNotMatch(r.stdout, new RegExp(THREAD_A, "u"));
   assert.equal(r.stdout.includes(badKey), false, "完整 key 不许出现");
   // 零副作用：outbox 与 claims 逐文件字节一致（没 claim、没改盘、没发布）。
   assert.equal(snapshot(paths.outbox) + "\n--\n" + snapshot(paths.claims), before, "**status 一个字节都不许改**");
+  // 凭据齐了（真实 run 制品 + 退出回执）→ 才说 run 已完成。
+  fs.mkdirSync(paths.runs, { recursive: true });
+  writeRunArtifacts({ runsDir: paths.runs, key: okKey, threadId: THREAD_A, text: "答复" });
+  const verified = run();
+  const fifth2 = verified.stdout.slice(verified.stdout.indexOf("待处理事件"));
+  assert.match(fifth2, /等资格恢复[　 ]+1 条（run 已完成、凭据已核验，发布资格待提升）/u, fifth2);
+  assert.doesNotMatch(fifth2, /资格待核验/u);
+  // 文件名也截断：超长文件名不许原样进第五区。
+  const longName = "x".repeat(150) + ".json";
+  put(longName, invalidOutboxRecord({ kind: "reply", text: "长名", target_channel_generation_id: "   ", expect: { gaps: ["target_channel_generation_id"] } }));
+  const longRun = run();
+  assert.equal(longRun.stdout.includes("x".repeat(150)), false, "**文件名要截断**");
+  assert.match(longRun.stdout, new RegExp("x{120}…（已截断）", "u"));
+  fs.rmSync(path.join(paths.outbox, longName));
   // 与只读投影同源：collectBacklog 说的就是状态页说的。
   const backlog = collectBacklog({ home, threadId: THREAD_A });
   assert.equal(backlog.tasks[0].records.filter((x) => x.state === "ready" && !x.rejected).length, 1);

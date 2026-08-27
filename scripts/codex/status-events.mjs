@@ -11,6 +11,7 @@ import { displaySafe } from "../display-safe.mjs";
 import { collectBacklog } from "./feishu-outbox.mjs";
 import { listEligibilityPending } from "./eligibility-recovery.mjs";
 import { taskPaths } from "./state.mjs";
+import { verifyCodexRunCredential } from "./handoff.mjs";
 
 const WHY_MAX = 120;
 const clip = (text) => {
@@ -45,27 +46,40 @@ export function codexPendingEventRows({ home, threadId, task } = {}) {
       rows.push(["等发布资格", waiting.length + " 条"]);
       if (rejected.length > 0) {
         rows.push(["已暂停重试", rejected.length + " 条（被永久拒绝，等人处理）"]);
-        for (const r of rejected) rows.push(["  " + displaySafe(r.file), (r.rejectedKind ?? "paused") + (r.rejectedWhy ? "：" + clip(r.rejectedWhy) : "")]);
+        for (const r of rejected) rows.push(["  " + clip(r.file), (r.rejectedKind ?? "paused") + (r.rejectedWhy ? "：" + clip(r.rejectedWhy) : "")]);
       }
       if (attention.length > 0) {
         rows.push(["需要人看", attention.length + " 条"]);
-        for (const r of attention) rows.push(["  " + displaySafe(r.file), (r.protectionCorrupt ? "retry_protection_corrupt" : r.state) + "：" + clip(r.why)]);
+        for (const r of attention) rows.push(["  " + clip(r.file), (r.protectionCorrupt ? "retry_protection_corrupt" : r.state) + "：" + clip(r.why)]);
       }
       const problems = [...(entry?.unclassified ?? []), ...(entry?.unexplainable ?? [])];
       rows.push(["outbox 账本", problems.length ? "说不清 " + problems.length + " 处" : "无异常"]);
-      for (const p of problems) rows.push(["  " + displaySafe(p.file), clip(p.why)]);
+      for (const p of problems) rows.push(["  " + clip(p.file), clip(p.why)]);
       if (entry?.taskState && entry.taskState.ok === false) rows.push(["task 可发布", clip(entry.taskState.text)]);
     }
   }
 
-  // ── 发布资格那一半（run 跑完、等资格提升的标记）
-  const eligibility = listEligibilityPending({ claimsDir: taskPaths(task, home).claims, threadId });
+  // ── 发布资格那一半（等资格提升的标记）。标记里的 run_state=completed 是自报 ——
+  // 与恢复消费者同一道门：经 verifyCodexRunCredential 核验过才说"run 已完成"，否则只说"待核验"。
+  const paths = taskPaths(task, home);
+  const eligibility = listEligibilityPending({ claimsDir: paths.claims, threadId });
   if (!eligibility.ok) {
     rows.push(["资格标记", "说不清（" + displaySafe(eligibility.reason ?? "读不出来") + "）"]);
   } else {
-    const usable = eligibility.items.filter((i) => !i.unusable);
+    const verified = [];
+    const unverified = [];
+    for (const i of eligibility.items.filter((x) => !x.unusable)) {
+      const credential = verifyCodexRunCredential({ runsDir: paths.runs, claimKey: i.key, expectedThreadId: threadId });
+      if (credential.state === "completed") verified.push(i);
+      else unverified.push({ ...i, why: credential.state === "running" ? "退出回执缺席"
+        : (credential.reason ?? "说不清") + (credential.why ? "：" + credential.why : "") });
+    }
     const unusable = eligibility.items.filter((i) => i.unusable);
-    rows.push(["等资格恢复", usable.length + " 条" + (usable.length ? "（run 已完成，发布资格待提升）" : "")]);
+    rows.push(["等资格恢复", verified.length + " 条" + (verified.length ? "（run 已完成、凭据已核验，发布资格待提升）" : "")]);
+    if (unverified.length > 0) {
+      rows.push(["资格待核验", unverified.length + " 条（有标记，终局凭据未核验通过）"]);
+      for (const i of unverified) rows.push(["  " + shortKey(i.key), clip(i.why)]);
+    }
     if (unusable.length > 0) {
       rows.push(["资格标记", "说不清 " + unusable.length + " 处"]);
       for (const i of unusable) rows.push(["  " + shortKey(i.key), clip(i.unusable)]);

@@ -30,6 +30,7 @@ CLI 只解析显示）；预览打印完整可执行命令过 shellQuote，真 s
 派生）；watcher 初始路径补 `requireRunId`；恢复消费者下沉到 `scripts/codex/`
 并在授权前验 run 复合凭据（两个制品各自验，AND 不是 OR）。
 内容绑定（成功回执封两份 SHA-256，验真器每份制品只读一次）见 §4.1 更正。
+**第 5 层剩余 · 步骤 2 已完成**（分支 `fix/watcher-claim-tristate`，评审十六轮，放行于 81a1ffc）。
 **步骤 2（watcher 接线复核）结论**：逐分支复核 Codex watcher（启动扫描、完成/失败/
 超时分支、session lock 释放、claim 状态记录、Dialogue 收口）并对照 R2b1 第二通道的
 三课（claim 互斥 / 回执三态 / reap 锁）。受控无抛点：启动扫描与验真入口对任何磁盘
@@ -129,7 +130,7 @@ Codex 侧并发靠 outbox 事务的发布锁互斥，无需 run 通道 claim；�
 | 2 | `feat/outbox-review-read-model` | 只读视图 + 共用读取语义硬化 | 已合 #58 |
 | 3 | `fix/outbox-suppression-transaction` | 抑制事务（**含统一写锁**） | 已合 #60 |
 | 4 | `fix/codex-manual-drain-cas` | 手工发布计划与目标 CAS | 本轮（见上「第 4 层剩余：已完成」） |
-| 5 | `fix/codex-auto-publish-lifecycle` / `fix/watcher-claim-tristate` | 自动发布生命周期 | 步骤 1 已合 #70；步骤 2 本轮 |
+| 5 | `fix/codex-auto-publish-lifecycle` / `fix/watcher-claim-tristate` | 自动发布生命周期 | 步骤 1 已合 #70；步骤 2 评审 16 轮放行（81a1ffc），本轮合并 |
 | 6 | `fix/claude-outbox-fail-closed` | Claude 侧接线 | 已合 #59 |
 
 依赖：3、4、5 都建立在第 2 层给出的读模型上（`auditOutbox` / `outboxMutationBlocker` /

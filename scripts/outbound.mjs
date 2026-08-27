@@ -59,7 +59,8 @@ function inFlightSidecar({ runsDir, key, suffix }) {
  *   absent     —— 没失败过
  *   valid      —— 排空写的账：键集封闭、run_id===key、attempts 安全整数≥1、at 规范、source 受控
  *   reserved   —— 预留了尝试却没闭合（reserved / delivered_unrecorded）：送达状态不确定
- *   legacy     —— watcher 写的旧形状 {at, error}（不带次数）—— "watcher 发过又失败"的证据
+ *   legacy     —— watcher 写的旧形状（不带次数）—— "watcher 发过又失败"的证据，带 kind：
+ *                 publish_error {at, error} / reap_lock_held {at, reason:"reap_lock_held", detail}
  *   unreadable —— 坏 JSON / 目录 / 权限 / 形状不对 —— 说不清
  */
 export function readPublishLedger({ runsDir, key }) {

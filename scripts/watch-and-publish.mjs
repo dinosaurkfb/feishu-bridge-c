@@ -180,6 +180,9 @@ while (true) {
   // **一次读取的快照**：outcome、正文、摘要全部来自同一份字节 —— 判终局用它、
   // 写终局记录用它的摘要、发布用它的正文。分三次读盘曾被评审在读与读之间换正文击穿。
   const snap = readRunSnapshot({ runsDir: RUNS, key });
+  // 缺席（runner 还没写）可以继续等；**读不出来**不是等待能解决的 —— 立即受控落诊断，
+  // 别拖到四小时超时再误报 watch_timeout（评审 P2）。锁保留：runner 可能仍活着。
+  if (!snap.ok && snap.reason !== "missing") refuse({ reason: "run_unreadable", why: snap.why ?? snap.reason });
   const outcome = snap.ok ? { state: snap.run.state, reason: snap.run.reason } : { state: "missing" };
 
   if (outcome.state !== "running" && outcome.state !== "missing") {
@@ -279,7 +282,14 @@ while (true) {
         console.error("run 回执损坏（" + run.receiptUnreadable + "）—— **说不清送没送达，" +
           "本轮不发**。去话题核对后手工处理 " + key.slice(0, 8) + " 的回执文件。");
       }
-      if (run?.shouldPublish && autoOk) {
+      // 账本投影：送达状态不确定（reserved）/ 账本说不清 / 自动预算耗尽 → watcher 也不发；
+      // 自己上一次发布失败（legacy）不算 —— 维护后重跑 watcher 正是那条失败的恢复路径。
+      const held = run?.hold && run.hold.reason !== "watcher_publish_failed" ? run.hold : null;
+      if (held) {
+        console.error("run 结果本轮不发（" + held.reason + "：" + held.why + "）—— 去话题核对后手工处理 " +
+          key.slice(0, 8) + " 的发布账本。");
+      }
+      if (run?.eligible && !held && autoOk) {
         const draft = buildDraft(run, { taskName: cfg.task_display_name });
         if (draft) {
           const runRecord = {

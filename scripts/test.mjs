@@ -51,7 +51,8 @@ import {
 import {
   PUBLISH_FAILURE, claimRunPublish, classifyPublishFailure, readRunReceipt,
   releaseRunPublishClaim, scanRuns, buildDraft, parseDirectPublishArgs, inventoryRuns, readRunSnapshot,
-  runRouteSha256 } from "./outbound.mjs";
+  runRouteSha256, markPublished, readPublishLedger, writePublishLedger } from "./outbound.mjs";
+import { parseRunOutcome } from "./handoff.mjs";
 import { repairRunClaims } from "./repair-run-claim.mjs";
 import {
   describeDrainOutcome, drainProject, outboxDirOf, suppressCmd, watcherActive,
@@ -14612,8 +14613,9 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
         fs.writeFileSync(path.join(claims, key + ".claim", "claim.json"), "{ 坏了"); }
       if (terminal === "deferred") recordClaimState({ claimsDir: claims, key, state: "handed_off",
         detail: terminalDetail(runs, key, { publish_deferred: DEFERRED }, { root: h.dir }) });
+      // 照 watcher refuse() 的真实形状：没有 run_state、没有 publish_deferred。
       if (terminal === "drift") recordClaimState({ claimsDir: claims, key, state: "failed",
-        detail: terminalDetail(runs, key, { run_state: "failed", reason: "binding_drift", why: "x" }, { root: h.dir }) });
+        detail: { reason: "binding_drift", why: "x", observed_by: "watch-and-publish", run_finished: true, pending_publish: false } });
       if (terminal === "plain") recordClaimState({ claimsDir: claims, key, state: "handed_off",
         detail: terminalDetail(runs, key, {}, { root: h.dir }) });
       return key;
@@ -14827,8 +14829,77 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
     const f = mk();
     const key = f.run("ledger-legacy-ok");
     fs.writeFileSync(path.join(f.runs, key + ".publish-failed.json"), JSON.stringify({ at: "2026-08-27T00:00:00.000Z", error: "ETIMEDOUT" }));
-    f.drain();
-    assert.equal(f.sent(), 1, "合法旧形状失败账：算 1 次尝试，可以再试");
+    const rl = f.drain();
+    assert.equal(f.sent(), 0, "合法旧形状失败账 = watcher 发过又失败：**只可见、不自动重试**（不论终局记录写了什么）");
+    assert.equal(rl.runs.stuck[0]?.reason, "watcher_publish_failed", JSON.stringify(rl.runs));
+  }
+
+  // **key 边界**：所有按 key 派生路径的原语在任何 I/O 前受验 —— 穿越 key 读不到 runsDir 外的文件、也造不出文件。
+  {
+    const f = mk();
+    fs.writeFileSync(path.join(f.rt, "secret.jsonl"), JSON.stringify({ type: "result", is_error: false, result: "SECRET" }) + "\n");
+    const before = fs.readdirSync(f.rt).sort();
+    const key = "../secret";
+    const snap = readRunSnapshot({ runsDir: f.runs, key });
+    assert.equal(snap.ok, false); assert.equal(snap.reason, "key_shape", JSON.stringify(snap));
+    assert.equal(JSON.stringify(snap).includes("SECRET"), false, "**穿越 key 一个字节都不许读出来**");
+    assert.equal(readRunReceipt({ runsDir: f.runs, key }).state, "unreadable");
+    assert.equal(readPublishLedger({ runsDir: f.runs, key }).state, "unreadable");
+    assert.equal(claimRunPublish({ runsDir: f.runs, key }).reason, "key_shape");
+    assert.equal(releaseRunPublishClaim({ runsDir: f.runs, key, token: "x" }), false);
+    assert.equal(writePublishLedger({ runsDir: f.runs, key, attempts: 1, error: "x" }).ok, false);
+    assert.throws(() => markPublished({ runsDir: f.runs, key, messageId: "om" }), /key/u);
+    assert.deepEqual(fs.readdirSync(f.rt).sort(), before, "**runsDir 之外不许多出任何文件**");
+  }
+  // 联合盘点对**不认识的条目**不沉默：runs/bad.jsonl、delivery-claims/bad.handed_off.json → problems。
+  {
+    const f = mk();
+    fs.writeFileSync(path.join(f.runs, "bad.jsonl"), JSON.stringify({ type: "result", is_error: false, result: "IGNORED" }) + "\n");
+    fs.writeFileSync(path.join(f.claims, "bad.handed_off.json"), "{bad");
+    const r = f.drain();
+    assert.equal(f.sent(), 0);
+    const un = r.runs.problems.filter((x) => x.reason === "unrecognized_entry").map((x) => x.why).sort();
+    assert.deepEqual(un, ["delivery-claims/bad.handed_off.json", "runs/bad.jsonl"], JSON.stringify(r.runs));
+    assert.notEqual(r.status, "empty", "**不认识的条目不许等价于不存在**");
+    assert.equal(describeDrainOutcome(r, { root: f.h.dir }).error, true);
+  }
+  // 合法 JSON、非法事件形状（null / 数组 / 数字 / 字符串）：受控成 invalid，盘点不抛、不发、进 problems。
+  {
+    for (const line of ["null", "[]", "1", "\"x\""]) {
+      const got = parseRunOutcome(line + "\n" + JSON.stringify({ type: "result", is_error: false, result: "后面还有" }) + "\n");
+      assert.equal(got.state, "invalid", line); assert.equal(got.reason, "invalid_jsonl", line);
+    }
+    const f = mk();
+    const key = f.run("nullline");
+    fs.writeFileSync(path.join(f.runs, key + ".jsonl"), "null\n");
+    let r;
+    assert.doesNotThrow(() => { r = f.drain(); }, "**盘点不许被一行 null 打崩**");
+    assert.equal(f.sent(), 0);
+    assert.equal(r.runs.problems.find((x) => x.key === key)?.reason, "invalid_jsonl", JSON.stringify(r.runs));
+    assert.equal(r.runs.pending, 0);
+  }
+  // 直发 CLI 与排空共用账本投影（真实入口）：reserved 的一条不列成待发布；--publish 拒绝且零发送。
+  {
+    const f = mk();
+    const key = f.run("cli-reserved");
+    fs.writeFileSync(path.join(f.runs, key + ".publish-failed.json"), JSON.stringify({
+      schema_version: "1.0", run_id: key, attempts: 1, at: "2026-08-27T00:00:00.000Z", source: "drain-run-channel", error: "reserved" }));
+    const env = { ...process.env, HOME: f.h.dir };
+    const list = spawnSync(process.execPath, [path.resolve("scripts", "outbound.mjs"), "--root=" + f.h.dir], { encoding: "utf-8", env, timeout: 60_000 });
+    assert.match(list.stdout, /待人工（reservation_unresolved）/u, list.stdout + list.stderr);
+    assert.match(list.stdout, /待发布 0 条/u, "**送达状态不确定的一条不许列成待发布**：" + list.stdout);
+    const pub = spawnSync(process.execPath, [path.resolve("scripts", "outbound.mjs"), "--root=" + f.h.dir, "--publish", "--key=" + key], { encoding: "utf-8", env, timeout: 60_000 });
+    assert.equal(pub.status, 1, pub.stdout + pub.stderr);
+    assert.match(pub.stderr, /拒绝发布.*reservation_unresolved/u, pub.stderr);
+    assert.equal(fs.existsSync(path.join(f.h.dir, "lark-calls.jsonl")), false, "**零发送**");
+    assert.equal(fs.existsSync(path.join(f.runs, key + ".published.json")), false);
+    // watcher 发过又失败（旧形状失败账）：直发 CLI 同样只列成待人工、拒绝普通 --publish。
+    const legacyKey = f.run("cli-legacy");
+    fs.writeFileSync(path.join(f.runs, legacyKey + ".publish-failed.json"), JSON.stringify({ at: "2026-08-27T00:00:00.000Z", error: "ETIMEDOUT" }));
+    const pub2 = spawnSync(process.execPath, [path.resolve("scripts", "outbound.mjs"), "--root=" + f.h.dir, "--publish", "--key=" + legacyKey], { encoding: "utf-8", env, timeout: 60_000 });
+    assert.equal(pub2.status, 1, pub2.stdout + pub2.stderr);
+    assert.match(pub2.stdout, /待人工（watcher_publish_failed）/u, pub2.stdout);
+    assert.equal(fs.existsSync(path.join(f.h.dir, "lark-calls.jsonl")), false, "**零发送**");
   }
 
   // 授权门：历史 run（无 watcher 终局记录）与身份漂移的 failed 记录都不许自动捞起。
@@ -14926,6 +14997,43 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
     f.drain({ timeoutMs: 1234 });
     assert.equal(f.lastArgs()?.timeoutMs, 1234, "**timeoutMs 要传给 run 通道的发布函数**");
   }
+});
+
+test("Claude watcher：run 制品读不出（不是缺席）→ 立即受控退出，不等到超时（真实进程）", () => {
+  // 评审 P2：unreadable 被改写成 missing，本地读错会等到四小时超时再误报 watch_timeout。
+  const h = watcherMatrixRunner.fixture();
+  const rt = path.join(h.dir, ".runtime-data", "inbound");
+  const key = claimKeyFor("unreadable-artifact");
+  fs.mkdirSync(path.join(rt, "runs", key + ".jsonl"));   // 目录占着制品路径：EISDIR，不是 ENOENT
+  writeClaimFixture({ claimsDir: path.join(rt, "delivery-claims"), key, root: h.dir });
+  const lock = path.join(rt, "session.lock"); fs.mkdirSync(lock, { recursive: true });
+  const t0 = Date.now();
+  const r = spawnSync(process.execPath, [path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir],
+    { encoding: "utf-8", env: { ...process.env, ...expectEnvFor(h.dir), HOME: h.dir }, timeout: 60_000 });
+  assert.equal(r.status, 2, r.stderr);
+  assert.ok(Date.now() - t0 < 30_000, "**读不出不是等待能解决的** —— 不许拖到超时");
+  assert.match(r.stderr, /run_unreadable/u, r.stderr);
+  const failed = JSON.parse(fs.readFileSync(path.join(rt, "delivery-claims", key + ".failed.json"), "utf-8"));
+  assert.equal(failed.reason, "run_unreadable");
+  assert.equal(fs.existsSync(lock), true, "runner 可能仍活着：锁保留交陈旧检测");
+  assert.equal(fs.existsSync(path.join(h.dir, "lark-calls.jsonl")), false);
+});
+
+test("Claude watcher：发布账本说送达状态不确定（reserved）→ 绑定 active 也不发（真实进程）", () => {
+  const h = watcherMatrixRunner.fixture();
+  const rt = path.join(h.dir, ".runtime-data", "inbound");
+  const runs = path.join(rt, "runs");
+  const key = claimKeyFor("watcher-reserved");
+  fs.writeFileSync(path.join(runs, key + ".jsonl"), JSON.stringify({ type: "result", is_error: false, result: "不确定送没送达的那一轮" }) + "\n");
+  fs.writeFileSync(path.join(runs, key + ".publish-failed.json"), JSON.stringify({
+    schema_version: "1.0", run_id: key, attempts: 1, at: "2026-08-27T00:00:00.000Z", source: "drain-run-channel", error: "reserved" }));
+  writeClaimFixture({ claimsDir: path.join(rt, "delivery-claims"), key, root: h.dir });
+  const r = spawnSync(process.execPath, [path.resolve("scripts", "watch-and-publish.mjs"), key, h.dir],
+    { encoding: "utf-8", env: { ...process.env, ...expectEnvFor(h.dir), HOME: h.dir }, timeout: 60_000 });
+  assert.match(r.stderr, /reservation_unresolved/u, r.stdout + r.stderr);
+  assert.equal(fs.existsSync(path.join(h.dir, "lark-calls.jsonl")), false, "**送达状态不确定就不许再发**");
+  assert.equal(fs.existsSync(path.join(runs, key + ".published.json")), false);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(rt, "delivery-claims", key + ".handed_off.json"), "utf-8")).run_state, "completed", "终局照记");
 });
 
 test("claim 写原语：扩展对象覆盖不了固定身份字段", () => {

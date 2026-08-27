@@ -47,7 +47,8 @@ claim 要能被**解释**才算 valid：key 按 claimKey(message_id, logical_tas
 policy 受控组合、来源代际非空、会话 id 为 uuid；**期望身份由 inbound 独立传入**
 （env 契约 watcherExpectEnv / readWatcherExpectEnv 共享层一份），有效绑定身份只有
 一份投影 effectiveBindingId（旧 project-file 映射的 id 在 topic_generation_state）；
-Claude watcher 启动期核当前目的地、**终局之后重新解析再核**并用新鲜快照发布
+Claude watcher 启动期核当前目的地、run 制品**读不出（非缺席）立即受控退出**（failed
+{run_unreadable}、锁保留，不拖到四小时超时误报）、**终局之后重新解析再核**并用新鲜快照发布
 （运行中关开关 / 绑定漂移 → 零发布、failed{binding_drift}；绑定暂停 → 受控不发布：
 本地终局照记、Dialogue 照收口，两条发布通道都不走；**run 结果留在 runs 目录保持
 "待发布"（回执 absent），不转交、不另立账本** —— 定时排空充当 run 通道的恢复消费者：
@@ -62,14 +63,21 @@ sha256({binding_id, claude_session_id, origin_channel_generation_id, 解析后 r
 —— 记录写完后改 claim 的来源代际就发不出去（评审探针 om_new）；写方与读方共用
 `runRouteSha256`。**单快照**：watcher 终局与排空发布都经 `readRunSnapshot` 一次读取
 JSONL，outcome / 正文 / 摘要来自同一份字节（`parseRunOutcome` 按文本解析），不再有
-"验 B 发 A"的窗口；历史 run、身份漂移的 failed 记录待人工分类；
+"验 B 发 A"的窗口；**key 边界**：run 制品的所有路径只从 `runPaths` 派生（CLAIM_KEY_SHAPE
+不过就没有路径，七个原语在任何 I/O 前受验 —— 评审实测 `../../secret` 读出了 runsDir 外的
+文件）；盘点对**不认识的条目**报 unrecognized_entry（bad.jsonl / bad.handed_off.json 不许消失）；
+合法 JSON 但非事件对象的行受控成 run 状态 invalid（problems invalid_jsonl，不抛）；
+历史 run、身份漂移的 failed 记录待人工分类；
 **watcher 当时发过又失败的只可见（stuck watcher_publish_failed）不自动重试** ——
 那类失败原因未受验，自动重试只是制造噪音，留给人判断；claim 自身缺席/损坏是 stuck、合法但属于
 别的绑定才正常跳过（期望身份由本次排空目标给出），目标取 claim 冻结的原始代际，
 重试预算有界（5 次；账本键集封闭 {schema_version, run_id, attempts, at, source, error}，
 旧形状须规范时间与非空 error，坏账不发，尝试在 claim 内预留、账写不进去不发；
 **未闭合的 reservation**（error 为 reserved / delivered_unrecorded）= 送达状态不确定，
-stuck reservation_unresolved 禁止自动重试，dry-run 也不报成将发布），经同一把
+stuck reservation_unresolved 禁止自动重试，dry-run 也不报成将发布；账本对"还许不许发"的
+投影 `publishHold` 只有一份，**直发 CLI 与 watcher 共用**：直发把这类 run 列成"待人工"、
+普通 --publish 拒绝且不提供覆盖；watcher 对 reserved / 说不清 / 预算耗尽也不发，只对自己
+上一次发布失败的旧账例外 —— 维护后重跑 watcher 正是那条恢复路径），经同一把
 claimRunPublish → claim 下重读回执 → 发 → markPublished（单独接住：送达但回执没落 =
 deliveredUnrecorded，提示可能重发；这一笔账也写不进去 → problems ledger_unwritable）→ 释放；run 通道独立
 于 outbox 预检（outbox 损坏不截断它）；只有 run 通道时状态为 runs_only，不伪造 outbox

@@ -176,6 +176,11 @@ export function parseRunOutcome(raw) {
     } catch {
       continue; // 半截行：进程还在写，跳过而不是判失败
     }
+    // 合法 JSON 但不是事件对象（null / 数组 / 数字 / 字符串）：不是"还在写"，是日志不可信 ——
+    // 受控地判成 invalid，别让 ev.type 抛 TypeError 把整条盘点打崩（评审探针）。
+    if (ev === null || typeof ev !== "object" || Array.isArray(ev)) {
+      return { state: "invalid", reason: "invalid_jsonl", finalText: null };
+    }
     if (ev.type === "result") {
       sawResult = true;
       isError = ev.is_error === true;

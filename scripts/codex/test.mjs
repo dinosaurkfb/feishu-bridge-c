@@ -61,8 +61,8 @@ import { composeCodexBinding, resolveBindingTarget, validThreadId } from "./bind
 import { readCodexThreadTitle, sanitizeThreadTitle } from "./thread-title.mjs";
 import { updateTextMessage } from "./lark-message.mjs";
 import {
-  classifyRunnerDiagnostic, isCodexInboundExecution, readCodexRunOutcome, sanitizeCodexRunEnv,
-  verifyCodexRunCredential,
+  classifyRunnerDiagnostic, handOffCodex, isCodexInboundExecution, readCodexRunOutcome,
+  sanitizeCodexRunEnv, verifyCodexRunCredential,
 } from "./handoff.mjs";
 import {
   composeCodexOutboundCard, neutralizeCardMentions, outboundCardBatches, validateCodexOutboundCard,
@@ -7755,8 +7755,13 @@ test("verifyCodexRunCredential：回执身份与封闭 schema 逐字验，路径
     ["status 不认识", exitReceipt(key, { status: "done" }), /status 不在受控取值里/u],
     ["artifact_type 不对", exitReceipt(key, { artifact_type: "receipt" }), /artifact_type/u],
     ["schema 不认识", exitReceipt(key, { schema_version: "9" }), /schema_version 不认识/u],
-    ["failed 却 exit_code=0", exitReceipt(key, { status: "failed", exit_code: 0 }), /exit_code 形状不对/u],
+    ["failed 却 exit_code=0", exitReceipt(key, { status: "failed", exit_code: 0 }), /互斥两档/u],
+    ["failed 两边都 null", exitReceipt(key, { status: "failed", exit_code: null }), /互斥两档/u],
+    ["failed 两边都有", exitReceipt(key, { status: "failed", exit_code: 1, signal: "SIGTERM" }), /互斥两档/u],
+    ["failed exit_code 不是整数", exitReceipt(key, { status: "failed", exit_code: 1.5 }), /互斥两档/u],
     ["spawn_failed 缺 error", exitReceipt(key, { status: "spawn_failed", exit_code: null }), /缺字段：error/u],
+    ["spawn_failed error 空串", exitReceipt(key, { status: "spawn_failed", exit_code: null, error: "" }),
+      /error 不是非空字符串/u],
     ["不是对象", [1], /不是回执对象/u],
   ];
   for (const [why, doc, pattern] of bad) {
@@ -7771,6 +7776,9 @@ test("verifyCodexRunCredential：回执身份与封闭 schema 逐字验，路径
   // 合法的失败回执：形状过、内容判失败 —— 不是 exit_receipt_invalid。
   fs.writeFileSync(receiptPath, JSON.stringify(exitReceipt(key, { status: "failed", exit_code: 1 })));
   assert.equal(verify().reason, "nonzero_exit");
+  fs.writeFileSync(receiptPath, JSON.stringify(exitReceipt(key,
+    { status: "failed", exit_code: null, signal: "SIGKILL" })));
+  assert.equal(verify().state, "failed", "被信号杀是合法的失败事实");
   fs.writeFileSync(receiptPath, JSON.stringify(exitReceipt(key,
     { status: "spawn_failed", exit_code: null, error: "ENOENT" })));
   assert.equal(verify().reason, "runner_spawn_failed");
@@ -7788,6 +7796,16 @@ test("verifyCodexRunCredential：回执身份与封闭 schema 逐字验，路径
     { type: "thread.started", thread_id: "别的 thread" }, { type: "turn.started" }, { type: "turn.completed" },
   ].map(JSON.stringify).join("\n") + "\n");
   assert.equal(verify().reason, "thread_mismatch");
+  // 合法 JSON 但不是事件对象：不许抛，计入 invalid_jsonl。
+  for (const [why, line] of [["null", "null"], ["数组", "[1,2]"], ["数字", "42"], ["字符串", "\"x\""]]) {
+    fs.writeFileSync(path.join(runsDir, key + ".jsonl"), [
+      JSON.stringify({ type: "thread.started", thread_id: THREAD_A }), line,
+      JSON.stringify({ type: "turn.started" }), JSON.stringify({ type: "turn.completed" }),
+    ].join("\n") + "\n");
+    let r;
+    assert.doesNotThrow(() => { r = verify(); }, why + "：**验真器对任何磁盘内容都不许抛**");
+    assert.equal(r.reason, "invalid_jsonl", why);
+  }
 
   // 跨 run 拼装：把 key A 那套合法制品按 key B 的文件名放进去 —— 回执身份对不上。
   const other = "3".repeat(64);
@@ -7798,6 +7816,105 @@ test("verifyCodexRunCredential：回执身份与封闭 schema 逐字验，路径
   const forged = verify(other);
   assert.equal(forged.reason, "exit_receipt_invalid", JSON.stringify(forged));
   assert.match(forged.why, /claim_key 跟文件名对不上/u, "**三个合法文件不许跨 run 拼装**");
+});
+
+test("verifyCodexRunCredential：验过的回执就是用的回执，不再从路径重读（TOCTOU）", () => {
+  // 评审探针：第一次读到合法封闭回执、第二次路径上换成旧形状 —— 内容判定
+  // 若再读一次，用的就是没验过的那份。这里换成 exit_code:1：重读会得到 nonzero_exit，
+  // 用验过的快照才是 completed。
+  const runsDir = temp();
+  const key = "5".repeat(64);
+  writeRunArtifacts({ runsDir, key, threadId: THREAD_A, text: "完成" });
+  const exitPath = path.join(runsDir, key + ".exit.json");
+  const probe = path.join(runsDir, "swap-after-first-read.mjs");
+  const counter = path.join(runsDir, "reads.txt");
+  fs.writeFileSync(probe, [
+    'import fs from "node:fs";',
+    'const real = fs.readFileSync;',
+    'const target = process.env.SWAP_TARGET;',
+    'let n = 0;',
+    'fs.readFileSync = function (p, ...rest) {',
+    '  const out = real.call(this, p, ...rest);',
+    '  if (String(p) === target) {',
+    '    n += 1; real.call(this, target); fs.writeFileSync(process.env.READS, String(n));',
+    '    if (n === 1) fs.writeFileSync(target, JSON.stringify({ exit_code: 1 }));',
+    '  }',
+    '  return out;',
+    '};',
+  ].join("\n"));
+  const driver = path.join(runsDir, "driver.mjs");
+  fs.writeFileSync(driver, [
+    'import { verifyCodexRunCredential } from ' + JSON.stringify(pathToFileURL(
+      path.join(ROOT, "scripts", "codex", "handoff.mjs")).href) + ';',
+    'process.stdout.write(JSON.stringify(verifyCodexRunCredential({',
+    '  runsDir: process.env.RUNS, claimKey: process.env.KEY, expectedThreadId: process.env.TH })));',
+  ].join("\n"));
+  const r = spawnSync(process.execPath, ["--import", pathToFileURL(probe).href, driver],
+    { encoding: "utf-8", env: { ...isolatedEnv(), SWAP_TARGET: exitPath, READS: counter,
+      RUNS: runsDir, KEY: key, TH: THREAD_A } });
+  assert.equal(r.status, 0, r.stderr);
+  // 前提：探针真的换了盘上那份。
+  assert.deepEqual(JSON.parse(fs.readFileSync(exitPath, "utf-8")), { exit_code: 1 }, "探针没生效");
+  const got = JSON.parse(r.stdout);
+  assert.equal(got.state, "completed", "**验过的快照说了算**，不是路径上后来那份：" + r.stdout);
+  assert.equal(fs.readFileSync(counter, "utf-8"), "1", "回执只许读一次");
+});
+
+test("watcher：历史标记指向的 JSONL 有非对象行，不许在 session lock 保护建立前崩掉（真实 CLI）", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "NullLine",
+    rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = false;
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  const paths = taskPaths(task, home);
+  fs.mkdirSync(paths.runs, { recursive: true });
+  fs.mkdirSync(paths.claims, { recursive: true });
+  fs.mkdirSync(paths.outbox, { recursive: true });
+  fs.mkdirSync(paths.sessionLock, { recursive: true });
+  // 上一轮遗留：标记 + 答复 + 一份 JSONL 里混着 null 行的 run 制品。
+  const oldKey = "8".repeat(64);
+  const oldEventKey = codexReplyEventKey({ threadId: THREAD_A, claimKey: oldKey });
+  fs.writeFileSync(path.join(paths.outbox, "old.json"), JSON.stringify({
+    ...outboxRecord({ text: "上一轮" }), event_key: oldEventKey, run_id: oldKey, publish_eligible_at: null }));
+  fs.writeFileSync(path.join(paths.claims, oldKey + ".eligibility_pending.json"), JSON.stringify({
+    schema_version: "1.0", claim_key: oldKey, state: "eligibility_pending",
+    recorded_at: "2026-08-25T00:00:00.000Z", run_state: "completed",
+    promote_failed: "publisher_busy", event_key: oldEventKey }));
+  writeRunArtifacts({ runsDir: paths.runs, key: oldKey, threadId: THREAD_A });
+  fs.writeFileSync(path.join(paths.runs, oldKey + ".jsonl"),
+    JSON.stringify({ type: "thread.started", thread_id: THREAD_A }) + "\nnull\n" +
+    JSON.stringify({ type: "turn.started" }) + "\n" + JSON.stringify({ type: "turn.completed" }) + "\n");
+  // 这一轮自己正常。
+  const key = "6".repeat(64);
+  writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "这一轮" });
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
+    "--claim-key", key, "--task-key", task.logical_task_key,
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.equal(r.status, 0, "**不许崩**：" + r.stderr);
+  assert.equal(/TypeError/u.test(r.stderr), false, r.stderr);
+  assert.match(r.stderr, new RegExp("资格仍卡住：" + oldKey + "（run_credential_unverified", "u"),
+    "坏 JSONL 要作为受控结果报出来：" + r.stderr);
+  assert.match(r.stderr, /invalid_jsonl/u);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(paths.outbox, "old.json"), "utf-8"))
+    .publish_eligible_at, null, "凭据验不过不许给资格");
+  assert.equal(fs.existsSync(paths.sessionLock), false, "这一轮照常放 session lock");
+});
+
+test("handOffCodex：key 形状不对在任何可观察动作之前拒绝 —— 零文件、零 spawn", () => {
+  // 评审实测 key="../escaped"：prompt 与 runner log 写到了 runsDir 外面。
+  const dir = temp();
+  const runsDir = path.join(dir, "runs");
+  fs.mkdirSync(runsDir);
+  for (const bad of ["../escaped", "k1", "", "A".repeat(64)]) {
+    assert.throws(() => handOffCodex({
+      projectDir: dir, threadId: THREAD_A, instruction: "x", runsDir, key: bad,
+      taskKey: "t", bridgeHome: dir, codexBin: "/nonexistent/codex",
+    }), /claim key 形状不对/u, JSON.stringify(bad));
+  }
+  assert.deepEqual(fs.readdirSync(runsDir), [], "runsDir 里一个文件都不许有");
+  assert.deepEqual(fs.readdirSync(dir), ["runs"], "runsDir 外面更不许有");
 });
 
 test("watcher：旧形状的退出回执不算终局 —— fail-closed 走失败路径，不给资格（真实 CLI）", () => {

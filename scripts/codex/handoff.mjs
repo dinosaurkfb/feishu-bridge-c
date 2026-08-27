@@ -34,6 +34,11 @@ export function assertCodexAvailable(codexBin = "codex") {
 export function handOffCodex({
   projectDir, threadId, instruction, runsDir, key, taskKey, bridgeHome, codexBin = "codex",
 }) {
+  // **key 先验，在任何可观察动作之前。**评审实测 key="../escaped"：prompt 与
+  // runner log 被写到 runsDir 外面，runner 随后才拒绝 —— 已经太晚。
+  if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) {
+    throw new Error("claim key 形状不对，拒绝投递");
+  }
   assertCodexAvailable(codexBin);
   if (typeof threadId !== "string" ||
       !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(threadId)) {
@@ -205,17 +210,18 @@ function receiptProblem(doc, claimKey) {
   // 三个合法文件就不能跨 run 拼装。
   if (doc.claim_key !== claimKey) return "claim_key 跟文件名对不上";
   if (!isCanonicalIso(doc.recorded_at)) return "recorded_at 不是规范时间";
-  const intOrNull = (v) => v === null || Number.isInteger(v);
-  const strOrNull = (v) => v === null || typeof v === "string";
   if (doc.status === "exited") {
     if (doc.exit_code !== 0) return "status=exited 却 exit_code≠0";
     if (doc.signal !== null) return "status=exited 却带 signal";
   } else if (doc.status === "failed") {
-    if (!intOrNull(doc.exit_code) || doc.exit_code === 0) return "status=failed 的 exit_code 形状不对";
-    if (!strOrNull(doc.signal)) return "signal 形状不对";
+    // child close 只会产出两种互斥事实：非零退出码（无信号）或被信号杀（无退出码）。
+    // "两边都 null" 或 "两边都有" 都不是 runner 能写出来的东西。
+    const byCode = Number.isSafeInteger(doc.exit_code) && doc.exit_code !== 0 && doc.signal === null;
+    const bySignal = doc.exit_code === null && typeof doc.signal === "string" && doc.signal.length > 0;
+    if (!byCode && !bySignal) return "status=failed 的 exit_code/signal 不是互斥两档之一";
   } else if (doc.status === "spawn_failed") {
     if (doc.exit_code !== null || doc.signal !== null) return "spawn_failed 不该有 exit_code/signal";
-    if (typeof doc.error !== "string") return "error 不是字符串";
+    if (typeof doc.error !== "string" || doc.error.length === 0) return "error 不是非空字符串";
   } else {
     return "status 不在受控取值里";
   }
@@ -251,9 +257,11 @@ export function verifyCodexRunCredential({ runsDir, claimKey, expectedThreadId }
   catch { return { state: "failed", reason: "exit_receipt_invalid", why: "不是 JSON" }; }
   const problem = receiptProblem(doc, claimKey);
   if (problem !== null) return { state: "failed", reason: "exit_receipt_invalid", why: problem };
+  // **验过的那份就是用的那份。**评审探针：第一次读到合法回执、第二次路径上换成
+  // 旧形状，内容判定若再从路径读一次，用的就是没验过的第二份（TOCTOU）。
   return readCodexRunOutcome({
     logPath: path.join(runsDir, claimKey + ".jsonl"),
-    exitPath,
+    exit: doc,
     errPath: path.join(runsDir, claimKey + ".stderr.log"),
     lastMessagePath: path.join(runsDir, claimKey + ".last-message.txt"),
     expectedThreadId,
@@ -264,7 +272,9 @@ export function verifyCodexRunCredential({ runsDir, claimKey, expectedThreadId }
  * 三件证据的**内容**判定（JSONL 终局、退出码、最终输出）。
  * 生产路径不直接调它 —— 走 verifyCodexRunCredential，那里先验回执身份、再派生路径。
  */
-export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, errPath, expectedThreadId }) {
+export function readCodexRunOutcome({
+  logPath, exitPath, exit: exitDoc, lastMessagePath, errPath, expectedThreadId,
+}) {
   let raw = "";
   try { raw = fs.readFileSync(logPath, "utf-8"); } catch { /* runner 可能刚启动 */ }
 
@@ -280,6 +290,11 @@ export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, errPat
     if (!line.trim()) continue;
     let event;
     try { event = JSON.parse(line); } catch { invalidJsonLines += 1; continue; }
+    // 合法 JSON 但不是事件对象（null / 数组 / 数字）也算坏行 —— 直接 event.type
+    // 会抛，而 watcher 的启动扫描发生在 session-lock 的 try/finally 之前。
+    if (event === null || typeof event !== "object" || Array.isArray(event)) {
+      invalidJsonLines += 1; continue;
+    }
     if (event.type === "thread.started") {
       observedThreadId = event.thread_id ?? null;
       if (observedThreadId !== expectedThreadId) threadMismatch = true;
@@ -292,8 +307,12 @@ export function readCodexRunOutcome({ logPath, exitPath, lastMessagePath, errPat
         isCodexInboundExecution(event.item.command)) bridgeRecursion = true;
   }
 
-  let exit = null;
-  try { exit = JSON.parse(fs.readFileSync(exitPath, "utf-8")); } catch { /* 仍在运行 */ }
+  // 调用方已验过的回执优先（verifyCodexRunCredential 只传这个）；
+  // 只有直接按路径调用的老用法才自己读盘。
+  let exit = exitDoc ?? null;
+  if (exit === null) {
+    try { exit = JSON.parse(fs.readFileSync(exitPath, "utf-8")); } catch { /* 仍在运行 */ }
+  }
   if (!exit) return { state: "running", observedThreadId, turnStarted, turnCompleted };
 
   if (invalidJsonLines > 0) return { state: "failed", reason: "invalid_jsonl", invalidJsonLines };

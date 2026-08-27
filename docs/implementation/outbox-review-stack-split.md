@@ -51,10 +51,14 @@ Claude watcher 启动期核当前目的地、**终局之后重新解析再核**�
 （运行中关开关 / 绑定漂移 → 零发布、failed{binding_drift}；绑定暂停 → 受控不发布：
 本地终局照记、Dialogue 照收口，两条发布通道都不走；**run 结果留在 runs 目录保持
 "待发布"（回执 absent），不转交、不另立账本** —— 定时排空充当 run 通道的恢复消费者：
-每轮先看 runs，用 readClaimState（期望身份由本次排空目标给出，别的绑定不许抢）
-核对归属，目标取 claim 冻结的原始代际，经同一把 claimRunPublish → claim 下重读回执
-→ 发 → markPublished → 释放；dry-run 零副作用只报告；结果随排空所有分支输出，
-卡住的（reap 锁残留 / 代际说不清 / 发布失败）标错不折叠。直发 CLI 也先 claim 再重读
+每轮先看 runs（inventoryRuns 结构化盘点：账本坏了是 problems，不折叠成空），**只认
+watcher 终局记录里明确记载"因绑定暂停而延期发布"的 run**（历史 run、身份漂移的
+failed 记录一律待人工分类，fail-closed），claim 自身缺席/损坏是 stuck、合法但属于
+别的绑定才正常跳过（期望身份由本次排空目标给出），目标取 claim 冻结的原始代际，
+重试预算有界（5 次），经同一把 claimRunPublish → claim 下重读回执 → 发 → markPublished
+（单独接住：送达但回执没落 = deliveredUnrecorded，提示可能重发）→ 释放；run 通道独立
+于 outbox 预检（outbox 损坏不截断它）；只有 run 通道时状态为 runs_only，不伪造 outbox
+段；dry-run 零副作用只报告；结果随排空所有分支输出，Stop hook 与 CLI 都渲染。直发 CLI 也先 claim 再重读
 回执再发（参数严格白名单，`--root=` 绝对路径，发布须显式 root 与精确 `--key=`）。
 **方案变更理由**：此前实现是"run 结果转成 outbox 记录 + 两阶段转交回执"，评审四轮各
 击穿一处（作用域未绑、dryRun 改盘、恢复清单未从回执枚举、失败折叠成空）—— 它是在

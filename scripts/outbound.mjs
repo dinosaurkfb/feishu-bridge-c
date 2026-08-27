@@ -31,6 +31,25 @@ const PRESENTATION = {
   missing: { label: "无日志", publish: false, truthful: "找不到 run 日志，需人工查证" },
 };
 
+/**
+ * runs 账本的**结构化盘点**：pending 与 problems 同时返回。scanRuns 把目录读取错误
+ * 吞成 []、把损坏回执藏在 receiptUnreadable 里 —— 自动恢复入口用它就会把"账本坏了"
+ * 报成"空"（评审实测坏 .published.json → status empty、零报警）。只有 ENOENT 算空。
+ */
+export function inventoryRuns({ runsDir }) {
+  try {
+    const st = fs.statSync(runsDir);
+    if (!st.isDirectory()) return { ok: false, reason: "runs_not_a_directory", runs: [], problems: [] };
+  } catch (err) {
+    if (err.code === "ENOENT") return { ok: true, runs: [], problems: [] };
+    return { ok: false, reason: "runs_unreadable", error: String(err.code ?? err.message), runs: [], problems: [] };
+  }
+  const runs = scanRuns({ runsDir });
+  const problems = runs.filter((r) => r.receiptUnreadable)
+    .map((r) => ({ key: r.key, reason: "receipt_unreadable", why: r.receiptUnreadable }));
+  return { ok: true, runs, problems };
+}
+
 export function scanRuns({ runsDir }) {
   let files;
   try {

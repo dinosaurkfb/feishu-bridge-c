@@ -20,6 +20,7 @@ import {
 } from "./outbound.mjs";
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { claudeRotationBatchHook } from "./drain-outbox.mjs";
+import { appendEvent } from "./outbox.mjs";
 import { publishOutboxAttempt } from "./publish-attempt.mjs";
 import { boundedBudgetMs } from "./eligibility-recovery.mjs";
 import { postDeliveryBits } from "./publish-outcome.mjs";
@@ -127,14 +128,14 @@ function resolveAndCheck(stage) {
   const nowSession = resolved.claudeSessionId ?? mapping?.claude_session_id ?? null;
   if (nowSession !== EXPECT_SESSION_ID) problems.push("当前会话跟期望对不上");
   if (problems.length > 0) return { ok: false, reason: "binding_drift", why: stage + "：" + problems.join("；") };
-  // **暂停绑定是受控的"不发布"**，跟排空路径同一条规矩（mapping_not_active）：
-  // 话题可能已经不再是 Frank 认可的那个。两条发布通道（run 结果 / outbox）都不发，
-  // 待发内容原样保留，恢复后再处理。评审探针：启动时 active、运行中改成暂停、
-  // 再写终局 —— 只看自动发布开关的话照发。
-  if (mapping?.status !== "active") {
-    return { ok: false, reason: "mapping_not_active", why: stage + "：绑定状态 " + String(mapping?.status) };
-  }
-  return { ok: true, resolved, cfg, mapping };
+  // **"身份仍匹配"和"当前允许发布"是两件事。**暂停绑定是受控的"不发布"，跟排空
+  // 路径同一条规矩（mapping_not_active）—— 但它按契约只管入站和发布，不抹掉已经
+  // 发生的本地终局事实：run 结果照记、Dialogue 回合照收口，只是两条发布通道都不走。
+  // 评审探针：启动时 active、运行中改成暂停、再写终局 —— 只看自动发布开关的话照发；
+  // 而把暂停当成拒绝直接 refuse，又会让已完成的 Dialogue 回合卡在 dispatched。
+  const publishable = mapping?.status === "active";
+  return { ok: true, resolved, cfg, mapping, publishable,
+    pausedWhy: publishable ? null : stage + "：绑定状态 " + String(mapping?.status) };
 }
 /**
  * 拒绝并退出。**锁按阶段处理**：启动期 runner 可能仍存活，锁保留交陈旧检测；
@@ -189,9 +190,30 @@ while (true) {
     const cfg = fresh.cfg;
     const mapping = fresh.mapping;
     const resolved = fresh.resolved;
+    const run = scanRuns({ runsDir: RUNS }).find((r) => r.key === key);
+    // **暂停时的持久恢复闭环**：run 结果安全转成一条 outbox 记录 —— 冻结到 claim 的
+    // 原始代际、按 event key 去重、run_id 带上；恢复绑定后由既有排空路径恰好发一次
+    // （outbox 事务对 mapping_not_active 本来就是 skip）。只留 .jsonl 只证明字节没删：
+    // 后续 watcher 只处理自己的 key、定时排空只扫 outbox、桥接 run 的 Stop 又不入队 ——
+    // 没有这一步，恢复后它永远不会自动发出去（评审探针）。
+    let deferred = null;
+    if (!fresh.publishable && run?.shouldPublish) {
+      const draft = buildDraft(run, { taskName: cfg.task_display_name });
+      if (draft) {
+        const eventKey = "claude:run:" + key + ":result";
+        const r = appendEvent({
+          outboxDir: OUTBOX, kind: run.state === "completed" ? "reply" : "risk", text: draft,
+          source: "claude-run-watcher-deferred", eventKey,
+          targetGenerationId: originGenerationId, runId: key,
+        });
+        deferred = { reason: "mapping_not_active", why: fresh.pausedWhy, outbox_event_key: eventKey,
+          queued: r.ok === true || r.reason === "duplicate", ...(r.ok ? {} : { append: r.reason }) };
+      }
+    }
     recordClaimState({
       claimsDir: CLAIMS, key, state: outcome.state === "completed" ? "handed_off" : "failed",
-      detail: { run_state: outcome.state, observed_by: "watch-and-publish" },
+      detail: { run_state: outcome.state, observed_by: "watch-and-publish",
+        ...(fresh.publishable ? {} : { publish_deferred: deferred ?? { reason: "mapping_not_active", why: fresh.pausedWhy } }) },
     });
     if (acceptedClaim?.policy_id === DIALOGUE_POLICY_ID) {
       finalizeClaudeDialogueTurn({
@@ -205,7 +227,13 @@ while (true) {
       });
     }
 
-    const run = scanRuns({ runsDir: RUNS }).find((r) => r.key === key);
+    if (!fresh.publishable) {
+      console.error("绑定暂停中（" + fresh.pausedWhy + "）—— 本地终局已记录" +
+        (deferred?.queued ? "，run 结果已转入 outbox（" + deferred.outbox_event_key + "）等恢复后发布" : "") +
+        "；两条发布通道都不走。run 已结束，session lock 已释放。");
+      finishUp();
+      process.exit(0);
+    }
 
     // ============ 两条发布通道（R2b1 定稿的显式语义） ============
     //

@@ -48,8 +48,9 @@ policy 受控组合、来源代际非空、会话 id 为 uuid；**期望身份�
 （env 契约 watcherExpectEnv / readWatcherExpectEnv 共享层一份），有效绑定身份只有
 一份投影 effectiveBindingId（旧 project-file 映射的 id 在 topic_generation_state）；
 Claude watcher 启动期核当前目的地、**终局之后重新解析再核**并用新鲜快照发布
-（运行中关开关 / 绑定漂移 → 零发布、failed{binding_drift}；绑定暂停 → 受控不发布
-mapping_not_active，两条通道都不发，待发内容原样保留；锁按阶段：启动期拒绝留锁交
+（运行中关开关 / 绑定漂移 → 零发布、failed{binding_drift}；绑定暂停 → 受控不发布：
+本地终局照记、Dialogue 照收口，run 结果转成冻结到原始代际的 outbox 记录（去重键
+claude:run:<key>:result），恢复后由既有排空恰好发一次；锁按阶段：启动期拒绝留锁交
 陈旧检测，终局期 run 已结束则放锁）。
 夹具同步补齐像真的 claim（派生 key、期望身份从项目真实解析派生）。
 Codex 侧并发靠 outbox 事务的发布锁互斥，无需 run 通道 claim；失败/超时分支的抑制

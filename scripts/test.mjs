@@ -14339,12 +14339,27 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
   // 评审探针：启动期那份 cfg/mapping 被复用最长四小时 —— 运行中把
   // auto_publish_on_completion 改成 false，watcher 仍照发；暂停/撤销同理。
   // test() 基座是同步的 —— 时序编排放进子进程编排器。
-  const orchestrate = (mode) => {
+  const orchestrate = (mode, { dialogue = false } = {}) => {
     const h = watcherMatrixRunner.fixture();
     const rt = path.join(h.dir, ".runtime-data", "inbound");
     fs.writeFileSync(path.join(h.dir, "mode.txt"), "ok");
-    const key = claimKeyFor("mid-" + mode);
-    writeClaimFixture({ claimsDir: path.join(rt, "delivery-claims"), key, root: h.dir });
+    const key = claimKeyFor("mid-" + mode + (dialogue ? "-dlg" : ""));
+    if (dialogue) {
+      // Dialogue 存储读的是 mapping.binding_id（不是 effectiveBindingId 投影）——
+      // 旧形状映射在它那里 binding_id_missing。这是同类缺口的另一处消费者，不在本轮范围，
+      // 夹具先给显式 binding_id；期望身份与 claim 仍从真实解析派生（投影取它）。
+      const mapPath = path.join(rt, "active-mapping.json");
+      fs.writeFileSync(mapPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(mapPath, "utf-8")),
+        binding_id: "b-dialogue" }));
+      const enabled = setClaudeInteractionMode({ root: h.dir, mode: "dialogue", now: Date.now() });
+      assert.equal(enabled.ok, true, "开 dialogue：" + JSON.stringify(enabled));
+      const reserved = reserveClaudeDialogueTurn({
+        root: h.dir, eventId: "om_" + key.slice(0, 8), runId: key, localTargetId: "local_target",
+        originChannelGenerationId: "gen-1", runtimeTargetId: "runtime_target", now: Date.now() });
+      assert.equal(reserved.accepted, true, "前提：Dialogue 回合已预留");
+    }
+    writeClaimFixture({ claimsDir: path.join(rt, "delivery-claims"), key, root: h.dir,
+      patch: dialogue ? { policy_id: "dialogue" } : {} });
     const lock = path.join(rt, "session.lock");
     fs.mkdirSync(lock, { recursive: true });
     const orchestrator = path.join(h.dir, "orchestrate-" + mode + ".mjs");
@@ -14375,7 +14390,8 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
       { encoding: "utf-8", env: { ...process.env, ...expectEnvFor(h.dir), HOME: h.dir }, timeout: 90_000 });
     assert.equal(r.status, 0, r.stderr);
     const got = JSON.parse(r.stdout.trim().split("\n").at(-1));
-    return { got, rt, key, argsFile: path.join(h.dir, "lark-calls.jsonl"), lock };
+    return { got, rt, key, argsFile: path.join(h.dir, "lark-calls.jsonl"), lock, root: h.dir,
+      outbox: path.join(h.dir, ".runtime-data", "outbound", "outbox") };
   };
   const rotate = orchestrate("rotate");
   assert.equal(rotate.got.code, 2, "绑定在运行中漂移了：" + rotate.got.out);
@@ -14387,17 +14403,48 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
     "终局期核对在 handed_off 之前");
   assert.equal(fs.existsSync(rotate.lock), false, "**终局期 run 已结束，锁要放掉** —— 留着只是一把陈旧锁");
 
-  // 运行中把绑定暂停：受控的"不发布"，跟排空路径同一条规矩 —— 不是漂移。
+  // 运行中把绑定暂停：受控的"不发布"，跟排空路径同一条规矩 —— 不是漂移，也不是失败：
+  // 本地终局照记，run 结果转入 outbox（冻结到原始代际），恢复后由排空恰好发一次。
   const pause = orchestrate("pause");
-  assert.equal(pause.got.code, 2, "暂停中不发：" + pause.got.out);
-  assert.match(pause.got.out, /mapping_not_active/u, "要报成 mapping_not_active，不是 binding_drift");
+  assert.equal(pause.got.code, 0, "暂停不是故障，是受控不发布：" + pause.got.out);
+  assert.match(pause.got.out, /绑定暂停中/u);
   assert.equal(fs.existsSync(pause.argsFile), false, "**零 lark 调用**");
   assert.equal(fs.existsSync(path.join(pause.rt, "runs", pause.key + ".published.json")), false, "无发布回执");
-  const pausedRec = JSON.parse(fs.readFileSync(path.join(pause.rt, "delivery-claims", pause.key + ".failed.json"), "utf-8"));
-  assert.equal(pausedRec.reason, "mapping_not_active");
-  assert.equal(pausedRec.pending_publish, true, "待发内容保留、等恢复后处理 —— 要写明");
-  assert.equal(fs.existsSync(path.join(pause.rt, "runs", pause.key + ".jsonl")), true, "run 结果原样保留");
+  const handed = JSON.parse(fs.readFileSync(path.join(pause.rt, "delivery-claims", pause.key + ".handed_off.json"), "utf-8"));
+  assert.equal(handed.run_state, "completed", "**真实 run outcome 照记**");
+  assert.equal(handed.publish_deferred?.reason, "mapping_not_active");
+  assert.equal(handed.publish_deferred?.queued, true, "要写明已转入 outbox");
   assert.equal(fs.existsSync(pause.lock), false, "run 已结束，锁放掉");
+  const queued = listPending({ outboxDir: pause.outbox });
+  assert.equal(queued.length, 1, "run 结果要转成恰好一条 outbox 记录");
+  assert.equal(queued[0].target_channel_generation_id, "gen-1", "**冻结到 claim 的原始代际**");
+  assert.equal(queued[0].run_id, pause.key, "run_id 要带上");
+  assert.equal(queued[0].source, "claude-run-watcher-deferred", "source：" + JSON.stringify(queued[0]));
+  // 暂停期间排空也不发；恢复后恰好发一次；再排空为空。
+  // drainProject 没有发布注入口就会打到真实飞书 —— 这里注入假 publish 并计数。
+  let sent = 0;
+  const drain = () => drainProject({ root: pause.root, claudeSessionId: null,
+    publish: () => { sent += 1; return "om_sent"; }, diagnose: () => null });
+  assert.equal(drain().reason, "mapping_not_active");
+  assert.equal(sent, 0, "暂停中排空不许发");
+  const mapPath = path.join(pause.rt, "active-mapping.json");
+  fs.writeFileSync(mapPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(mapPath, "utf-8")), status: "active" }));
+  const resumed = drain();
+  assert.equal(resumed.status, "published", JSON.stringify(resumed));
+  assert.equal(sent, 1, "**恢复后恰好发布一次**");
+  assert.equal(listPending({ outboxDir: pause.outbox }).length, 0, "发完队列为空");
+  assert.equal(drain().status, "empty");
+  assert.equal(sent, 1, "再排空不许再发");
+
+  // Dialogue：暂停只管入站和发布，不抹掉已经发生的本地终局 —— 回合要收口。
+  const dlg = orchestrate("pause", { dialogue: true });
+  assert.equal(dlg.got.code, 0, dlg.got.out);
+  assert.equal(fs.existsSync(dlg.argsFile), false, "零 lark");
+  const policy = loadClaudeInteractionPolicy({ root: dlg.root });
+  assert.equal(policy.ok, true, JSON.stringify(policy));
+  assert.equal(policy.state.dialogue.active_turn, null, "**已完成的回合不许卡在 dispatched**");
+  assert.equal(policy.state.dialogue.last_turn?.status, "completed", "last turn 要是真实终局");
+  assert.equal(fs.existsSync(dlg.lock), false, "锁释放");
 
   const flip = orchestrate("flip");
   assert.equal(flip.got.code, 0, "开关关了不是故障，是不发：" + flip.got.out);

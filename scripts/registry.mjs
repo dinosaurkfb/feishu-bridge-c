@@ -403,15 +403,53 @@ export function releasePublishLock(lockDir, { waitMs = 500 } = {}) {
 
 /**
  * 显式维护入口：reap 锁残骸（回收者崩在几毫秒的段里）只在这里清，热路径不自愈。
- * 默认只报告；apply 且确实超过 staleMs 才删。不是残骸（还新）一律拒绝 —— 那可能是活的。
+ *
+ *   · 只认**形状合法的 symlink** 残骸（reap 锁从来没有目录形态）：目录、普通文件、畸形 symlink 一律
+ *     unrecognized_artifact，保留现场 —— 维护入口不能成为"什么都能删"的口子（评审探针：带哨兵的旧目录被整体删了）。
+ *   · 维护者之间用独立的维护锁（lockDir.maint，symlink 原语）串行，**不自愈**：它在就 maintenance_busy；
+ *     维护锁自己的残骸是最后一层，只能由人确认没有维护者在跑之后手动删（CLI 会打印路径）。
+ *   · 在维护锁里重读、重判，然后把残骸 **rename 到唯一隔离路径**再删 —— 不对原路径做删除。
+ *     "判断 → 按路径 rm"两步中间出现的新实例（评审探针）在这里碰不到：新实例要等原路径空出来才能出现，
+ *     而那时我们删的已经是隔离路径。
+ * 默认只报告；apply 且确实超过 staleMs 才动。
+ * duringMaintenance / afterQuarantine 只给测试用。
  */
-export function clearStaleReapLock(lockDir, { staleMs = REAP_LOCK_STALE_MS, apply = false } = {}) {
+export function clearStaleReapLock(lockDir, {
+  staleMs = REAP_LOCK_STALE_MS, apply = false, duringMaintenance = null, afterQuarantine = null,
+} = {}) {
   const reapDir = lockDir + ".reap";
-  const r = readLockOwner(reapDir);
-  if (!r.present) return { present: false, stale: false, removed: false, reapDir };
-  const ageMs = Date.now() - r.mtimeMs;
-  const stale = ageMs > staleMs;
-  if (!stale || !apply) return { present: true, stale, ageMs, owner: r.owner, removed: false, reapDir };
-  fs.rmSync(reapDir, { recursive: true, force: true });
-  return { present: true, stale, ageMs, owner: r.owner, removed: true, reapDir };
+  const maintDir = lockDir + ".maint";
+  const inspect = () => {
+    let st;
+    try { st = fs.lstatSync(reapDir); } catch { return { present: false }; }
+    const r = readLockOwner(reapDir);
+    const ageMs = Date.now() - st.mtimeMs;
+    const recognized = st.isSymbolicLink() && r.owner !== null;
+    return { present: true, recognized, owner: r.owner, ageMs, stale: ageMs > staleMs };
+  };
+  const seen = inspect();
+  if (!seen.present) return { present: false, stale: false, removed: false, reapDir };
+  const base = { present: true, stale: seen.stale, ageMs: seen.ageMs, owner: seen.owner, removed: false, reapDir, maintDir };
+  if (!seen.recognized) return { ...base, reason: "unrecognized_artifact" };
+  if (!seen.stale || !apply) return base;
+
+  const token = crypto.randomUUID();
+  const maint = tryLink(maintDir, JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token }));
+  if (!maint.ok) return { ...base, reason: maint.reason === "publisher_busy" ? "maintenance_busy" : "io_error", error: maint.error };
+  try {
+    if (typeof duringMaintenance === "function") duringMaintenance();
+    const again = inspect();
+    if (!again.present) return { ...base, reason: "already_cleared" };
+    if (!again.recognized) return { ...base, reason: "unrecognized_artifact" };
+    if (!again.stale || JSON.stringify(again.owner) !== JSON.stringify(seen.owner)) return { ...base, reason: "instance_changed" };
+    const quarantine = reapDir + ".quarantine-" + token;
+    try { fs.renameSync(reapDir, quarantine); }
+    catch { return { ...base, reason: "already_cleared" }; }
+    if (typeof afterQuarantine === "function") afterQuarantine();
+    fs.unlinkSync(quarantine);
+    return { ...base, removed: true, quarantine };
+  } finally {
+    const cur = readLockOwner(maintDir);
+    if (cur.present && cur.owner && cur.owner.token === token) fs.rmSync(maintDir, { recursive: true, force: true });
+  }
 }

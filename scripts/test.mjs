@@ -3513,6 +3513,117 @@ test("回收窗口：判定陈旧之后、动手之前锁换了主人 → 不许
   assert.equal(releasePublishLock(lockDir).ok, true);
 });
 
+test("维护入口自身也是归属转换：维护锁串行、只清形状合法的残骸、先隔离再删、期间出现的新实例不许碰", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-maint-"));
+  const lockDir = path.join(local, "registry.lock");
+  const reapDir = lockDir + ".reap";
+  const maintDir = lockDir + ".maint";
+  const old = (Date.now() - 120_000) / 1000;
+  const staleReap = () => { fs.rmSync(reapDir, { recursive: true, force: true });
+    fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), reapDir);
+    fs.lutimesSync(reapDir, old, old); };
+  // 1. 形状不合法的制品一律不动：旧目录（带哨兵）、普通文件、畸形 symlink
+  fs.mkdirSync(reapDir); fs.writeFileSync(path.join(reapDir, "sentinel"), "keep");
+  fs.utimesSync(reapDir, old, old);
+  let r = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([r.removed, r.reason], [false, "unrecognized_artifact"], JSON.stringify(r));
+  assert.equal(fs.readFileSync(path.join(reapDir, "sentinel"), "utf-8"), "keep", "带哨兵的旧目录一个字不许动");
+  fs.rmSync(reapDir, { recursive: true, force: true });
+  fs.writeFileSync(reapDir, "plain"); fs.utimesSync(reapDir, old, old);
+  r = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([r.removed, r.reason], [false, "unrecognized_artifact"]);
+  assert.equal(fs.readFileSync(reapDir, "utf-8"), "plain");
+  fs.rmSync(reapDir, { force: true });
+  fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), reapDir); fs.lutimesSync(reapDir, old, old);
+  r = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([r.removed, r.reason], [false, "unrecognized_artifact"]);
+  assert.ok(fs.lstatSync(reapDir).isSymbolicLink());
+  // 2. 维护锁在：maintenance_busy，残骸与维护锁都不动；维护锁不自愈（哪怕很老）
+  staleReap();
+  const otherMaint = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "other-maint" });
+  fs.symlinkSync(otherMaint, maintDir);
+  r = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([r.removed, r.reason], [false, "maintenance_busy"], JSON.stringify(r));
+  assert.ok(fs.lstatSync(reapDir).isSymbolicLink());
+  assert.equal(fs.readlinkSync(maintDir), otherMaint);
+  fs.lutimesSync(maintDir, old, old);
+  r = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([r.removed, r.reason], [false, "maintenance_busy"], "维护锁自己不自愈：" + JSON.stringify(r));
+  assert.equal(fs.readlinkSync(maintDir), otherMaint);
+  fs.rmSync(maintDir, { force: true });
+  // 3. 维护段内第二个维护者进来 → 它拿不到维护锁；段内残骸被换成活实例 → 我发现实例变了、不动
+  let nested = null;
+  r = clearStaleReapLock(lockDir, { apply: true, duringMaintenance: () => { nested = clearStaleReapLock(lockDir, { apply: true }); } });
+  assert.deepEqual([nested.removed, nested.reason], [false, "maintenance_busy"], "第二个维护者要被维护锁挡住");
+  assert.equal(r.removed, true, JSON.stringify(r));
+  assert.throws(() => fs.lstatSync(reapDir));
+  assert.throws(() => fs.lstatSync(maintDir), "维护锁用完要放");
+  staleReap();
+  const live = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "live-reaper" });
+  r = clearStaleReapLock(lockDir, { apply: true, duringMaintenance: () => { fs.rmSync(reapDir, { force: true }); fs.symlinkSync(live, reapDir); } });
+  assert.deepEqual([r.removed, r.reason], [false, "instance_changed"], JSON.stringify(r));
+  assert.equal(fs.readlinkSync(reapDir), live, "换成的活实例不许碰");
+  fs.rmSync(reapDir, { force: true });
+  // 4. 先隔离再删：残骸移走之后原路径上出现的新实例，删的是隔离路径、新实例活着
+  staleReap();
+  r = clearStaleReapLock(lockDir, { apply: true, afterQuarantine: () => { fs.symlinkSync(live, reapDir); } });
+  assert.equal(r.removed, true, JSON.stringify(r));
+  assert.equal(fs.readlinkSync(reapDir), live, "残骸移走后出现的新实例必须还在");
+  assert.deepEqual(fs.readdirSync(local).filter((n) => n.includes("quarantine") || n.endsWith(".maint")), [], "隔离路径与维护锁不留");
+  fs.rmSync(reapDir, { force: true });
+});
+
+test("两个真实 OS 进程同时清同一个 reap 残骸：最多一个 removed，之后出现的新实例不许被删", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-maint-race-"));
+  const worker = path.join(local, "worker.mjs");
+  const driver = path.join(local, "driver.mjs");
+  fs.writeFileSync(worker, [
+    'import fs from "node:fs";',
+    'const { clearStaleReapLock } = await import(' + JSON.stringify(pathToFileURL(path.resolve("scripts", "registry.mjs")).href) + ');',
+    'const [lockDir, go, live] = process.argv.slice(2);',
+    'const w = new Int32Array(new SharedArrayBuffer(4));',
+    'while (Date.now() < Number(go)) Atomics.wait(w, 0, 0, 1);',
+    'const r = clearStaleReapLock(lockDir, { apply: true, afterQuarantine: () => { try { fs.symlinkSync(live, lockDir + ".reap"); } catch {} } });',
+    'process.stdout.write(JSON.stringify({ removed: r.removed, reason: r.reason ?? null }));',
+  ].join("\n"));
+  fs.writeFileSync(driver, [
+    'import fs from "node:fs";',
+    'import path from "node:path";',
+    'import { spawn } from "node:child_process";',
+    'const [worker, lockDir, rounds] = process.argv.slice(2);',
+    'const live = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "live-after" });',
+    'const run = (go) => new Promise((res) => {',
+    '  const c = spawn(process.execPath, [worker, lockDir, String(go), live], { stdio: ["ignore", "pipe", "pipe"] });',
+    '  let out = ""; let err = "";',
+    '  c.stdout.on("data", (d) => { out += d; }); c.stderr.on("data", (d) => { err += d; });',
+    '  c.on("close", (code) => res({ code, out, err }));',
+    '});',
+    'const results = [];',
+    'const old = (Date.now() - 120000) / 1000;',
+    'for (let i = 0; i < Number(rounds); i += 1) {',
+    '  for (const n of fs.readdirSync(path.dirname(lockDir))) if (n.startsWith("registry.lock")) fs.rmSync(path.join(path.dirname(lockDir), n), { recursive: true, force: true });',
+    '  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), lockDir + ".reap");',
+    '  fs.lutimesSync(lockDir + ".reap", old, old);',
+    '  const go = Date.now() + 300;',
+    '  const pair = await Promise.all([run(go), run(go), run(go)]);',
+    '  let after = null; try { after = fs.readlinkSync(lockDir + ".reap"); } catch { after = null; }',
+    '  results.push({ pair, after, live });',
+    '}',
+    'process.stdout.write(JSON.stringify(results));',
+  ].join("\n"));
+  const lockDir = path.join(local, "registry.lock");
+  const r = spawnSync(process.execPath, [driver, worker, lockDir, "4"], { encoding: "utf-8", timeout: 90_000 });
+  assert.equal(r.status, 0, r.stderr);
+  for (const [i, round] of JSON.parse(r.stdout).entries()) {
+    for (const w of round.pair) assert.equal(w.code, 0, w.err);
+    const got = round.pair.map((w) => JSON.parse(w.out));
+    const removed = got.filter((g) => g.removed).length;
+    assert.equal(removed, 1, "第 " + i + " 轮：恰好一个维护者清掉残骸：" + JSON.stringify(got));
+    for (const g of got.filter((x) => !x.removed)) assert.ok(["maintenance_busy", "already_cleared", "instance_changed"].includes(g.reason), JSON.stringify(g));
+    assert.equal(round.after, round.live, "第 " + i + " 轮：清完之后出现的新实例必须还在");
+  }
+});
+
 test("symlink owner 形状封闭：缺 token / pid 不是正整数 / at 不规范 → 当不可读、保留现场；只有目录形状的旧版锁才按 pid 兼容", () => {
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-shape-"));
   const lockDir = path.join(local, "registry.lock");

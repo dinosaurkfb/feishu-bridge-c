@@ -29,6 +29,10 @@ export function parseRepairPublishLockArgs(argv) {
 export function describeReapLockRepair(r, { apply }) {
   if (!r.present) return "没有 reap 残骸：" + r.reapDir;
   const age = Math.round(r.ageMs / 1000) + " 秒";
+  if (r.reason === "unrecognized_artifact") return "reap 路径上的东西不是本协议的残骸（目录 / 普通文件 / 畸形 symlink），不动，请人工查看：" + r.reapDir;
+  if (r.reason === "maintenance_busy") return "另一个维护者正在处理（维护锁在）：" + r.maintDir + "\n若确认没有维护者在跑，手动删除该维护锁后重试。";
+  if (r.reason === "instance_changed" || r.reason === "already_cleared") return "残骸在处理期间已变化或已被清除，未动：" + r.reapDir;
+  if (r.reason === "io_error") return "维护锁取不到（" + (r.error ?? "io_error") + "）：" + r.maintDir;
   if (!r.stale) return "reap 锁还新（" + age + "），可能是活的，不动：" + r.reapDir;
   if (r.removed) return "已清除 reap 残骸（" + age + "）：" + r.reapDir;
   return (apply ? "" : "[预览] ") + "reap 残骸（" + age + "）可清除：" + r.reapDir + "\n加 --apply 执行。";

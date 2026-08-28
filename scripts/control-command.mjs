@@ -9,7 +9,7 @@
  */
 
 import fs from "node:fs";
-import { randomUUID } from "node:crypto";
+import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import path from "node:path";
 import { DIALOGUE_POLICY_ID, MAPPING_POLICY_ID } from "./interaction-policy.mjs";
 import { isCanonicalIso } from "./canonical-time.mjs";
@@ -109,7 +109,7 @@ export const CONSUMED_TMP_RE = /^([0-9a-f]{64})\.consumed\.json\.tmp\.\d+\.\d+$/
 /** 损坏的 failed 记录被隔离后的名字：受控形状，账本按 control_failed_quarantined 报，人工看完再删。 */
 export const CONTROL_QUARANTINE_RE = /^([0-9a-f]{64})\.failed\.quarantined\.\d+\.\d+$/u;
 /** 逐 key 的事务锁（目录，mkdir 原子）：运输层重放、首次执行、维护入口共用同一份所有权。留下没释放的由账本报 control_lock_held。 */
-export const CONTROL_LOCK_RE = /^([0-9a-f]{64})\.control\.lock$/u;
+export const CONTROL_LOCK_RE = /^([0-9a-f]{64})\.control\.lock(?:\.reap(?:\.quarantine-.*)?|\.maint|\.reaped-.*)?$/u;
 const CONTROL_LOCK_SUFFIX = ".control.lock";
 
 /**
@@ -144,53 +144,41 @@ function cleanupConsumedResidue({ claimsDir, key }) {
 }
 
 /**
- * 逐 key 事务锁的完整协议：
- *   · key 先过 CLAIM_KEY_SHAPE，坏 key 不派生任何路径、不跑任何回调；
- *   · mkdir 原子取得 → 立刻写 owner.json { pid, at, token }；owner 写不进去就当场放弃（删目录、不执行）—— 不留没有身份的锁；
- *   · 释放时先读 owner.json 核 token：不是自己的实例（锁曾被清掉又被别人取得）就不删；rm 失败也不吞 ——
- *     两种情况都以 lockUncleared 进入受控结果，由调用方非零退出 / 在回执里说清，账本报 control_lock_held。
+ * 逐 key 事务锁 —— **不另起一套协议**，直接用 registry.mjs 里已评审上线的 symlink 锁（#79）：
+ *   · key 先过 CLAIM_KEY_SHAPE，坏 key 不派生任何路径、不跑任何回调（唯一一道闸）；
+ *   · 取得：symlink 原子创建，payload 即 owner { pid, at, token } —— 没有"先建目录再写 owner"的窗口，也就没有匿名锁；
+ *   · 释放：releasePublishLock 在 reap 锁里核 token 再删，与陈旧回收 / 接管串行 —— 归属转换只在那一把锁里发生，
+ *     "核对 → 按路径 rm"之间不会被合法接管者替换；不是自己的实例（not_owner）、owner 读不出、锁已不在、reap 段忙，
+ *     都以 lockUncleared 附在结果上，不吞；
+ *   · 持有者崩掉：超过 staleMs 由下一个取锁者按同一协议回收；账本盘点时撞见锁条目就报 control_lock_held。
  */
-function acquireControlLock({ claimsDir, key }) {
-  const dir = path.join(claimsDir, key + CONTROL_LOCK_SUFFIX);
-  try { fs.mkdirSync(dir, { recursive: false, mode: 0o700 }); }
-  catch (err) {
-    if (err.code === "EEXIST") {
-      const owner = readRecordFile(path.join(dir, "owner.json"));
-      const who = owner.status === "read" && owner.doc && typeof owner.doc === "object" ? "（pid " + owner.doc.pid + "，自 " + owner.doc.at + "）" : "（持有者不明）";
-      return { ok: false, reason: "control_busy", why: "这一笔已有事务持有者" + who + "；确认它已不在后删除 " + key + CONTROL_LOCK_SUFFIX + " 再试" };
-    }
-    return { ok: false, reason: "control_lock_unavailable", why: String(err.code ?? err.message) };
-  }
-  const token = randomUUID();
-  try { fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token }), { flag: "wx" }); }
-  catch (err) {
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 留下的由账本报 control_lock_held */ }
-    return { ok: false, reason: "control_lock_unavailable", why: "锁的持有者记录写不进去：" + String(err.code ?? err.message) };
-  }
-  const release = () => {
-    const owner = readRecordFile(path.join(dir, "owner.json"));
-    if (owner.status !== "read" || owner.doc?.token !== token) {
-      return { released: false, why: owner.status === "absent" ? "锁已不在（被清理过）" : owner.status === "read" ? "锁已被别的实例持有，未删" : "锁的持有者记录读不出：" + owner.why };
-    }
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (err) { return { released: false, why: String(err.code ?? err.message) }; }
-    return fs.existsSync(dir) ? { released: false, why: "删了仍在" } : { released: true };
-  };
-  return { ok: true, release };
+function describeLockOwner(lockPath) {
+  try {
+    const owner = JSON.parse(fs.readlinkSync(lockPath));
+    return owner && typeof owner === "object" ? "（pid " + owner.pid + "，自 " + owner.at + "）" : "（持有者不明）";
+  } catch { return "（持有者不明）"; }
 }
 /**
  * 在这一笔的事务锁内跑 fn。拿不到锁 → { ok:false, reason: control_busy | control_lock_unavailable }；
- * fn 的结果原样返回，只在释放失败时追加 lockUncleared（原因）—— 事务本身可能已成，但锁没交还，调用方必须说出来。
+ * fn 的结果原样返回，只在锁没有干净交还时追加 lockUncleared（原因）—— 事务本身可能已成，但锁的事必须说出来。
  */
 export function withControlLock({ claimsDir, key }, fn) {
   if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) return { ok: false, reason: "claim_key_invalid", why: "key 形状不对" };
   if (typeof claimsDir !== "string" || !claimsDir) return { ok: false, reason: "claim_key_invalid", why: "claimsDir 缺失" };
-  const lock = acquireControlLock({ claimsDir, key });
-  if (!lock.ok) return { ok: false, reason: lock.reason, why: lock.why };
+  const lockPath = path.join(claimsDir, key + CONTROL_LOCK_SUFFIX);
+  const lock = acquirePublishLock(lockPath);
+  if (!lock.ok) {
+    if (lock.reason === "publisher_busy") {
+      return { ok: false, reason: "control_busy", why: "这一笔已有事务持有者" + describeLockOwner(lockPath) + "；等它结束再试（持有者已死的锁超过 5 分钟会按同一协议回收）" };
+    }
+    return { ok: false, reason: "control_lock_unavailable", why: String(lock.reason) + (lock.error ? "：" + lock.error : "") };
+  }
   let result;
   try { result = fn(); }
   finally {
-    const rel = lock.release();
-    if (!rel.released && result && typeof result === "object") result = { ...result, lockUncleared: rel.why };
+    const rel = releasePublishLock(lockPath);
+    const why = !rel.ok ? String(rel.reason) + (rel.pid ? "（pid " + rel.pid + "）" : "") : rel.absent ? "锁已不在（被清理过）" : null;
+    if (why && result && typeof result === "object") result = { ...result, lockUncleared: why };
   }
   return result;
 }

@@ -7,12 +7,14 @@
  * v2：标识符全部换到 Aily 命名空间（见 selector.mjs 顶部说明）。
  */
 
-import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue } from "./control-command.mjs";
+import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE } from "./control-command.mjs";
 import { describePendingWindow } from "./layered-status.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
+// symlink 锁：existsSync 会跟随到不存在的目标，锁在不在只能用 lstat 判
+const lockPresent = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -18469,16 +18471,16 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   assert.deepEqual([firstFail.ok, firstFail.reason, firstFail.why], [false, "control_failed", "registry_unwritable"]);
   const firstFailSeen = inspectControlClaim({ claimsDir, key: key11 });
   assert.deepEqual([firstFailSeen.state, firstFailSeen.record.error], ["failed", "registry_unwritable"]);
-  assert.ok(!fs.existsSync(path.join(claimsDir, key11 + ".control.lock")), "事务锁在结束时释放");
+  assert.ok(!lockPresent(path.join(claimsDir, key11 + ".control.lock")), "事务锁在结束时释放");
   // ③ 逐 key 事务锁：另一笔持有时，重放 / 维护入口都拿不到、不执行；账本能盘点到没释放的锁
   const key12 = claimKey("msg_c12", logicalTaskKey);
   assert.ok(acquireClaim({ claimsDir, messageId: "msg_c12", logicalTaskKey, meta: { ...protoMeta, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).ok);
-  fs.mkdirSync(path.join(claimsDir, key12 + ".control.lock"));
-  fs.writeFileSync(path.join(claimsDir, key12 + ".control.lock", "owner.json"), JSON.stringify({ pid: 4242, at: "2026-08-29T00:00:00.000Z" }));
+  const lock12 = path.join(claimsDir, key12 + ".control.lock");
+  assert.equal(acquirePublishLock(lock12).ok, true, "另一笔按同一协议持锁");
   executions = 0;
   const busyTx = runControlTransaction({ claimsDir, key: key12, intent: { control: "mode", mode: DIALOGUE_POLICY_ID }, replay: true, execute: () => { executions += 1; return { ok: true, changed: true }; } });
   assert.deepEqual([busyTx.ok, busyTx.reason, executions], [false, "control_busy", 0]);
-  assert.match(busyTx.why, /pid 4242/u);
+  assert.match(busyTx.why, /pid \d+/u);
   const busyRepair = repair("--project", root, "--key", key12, "--apply");
   assert.deepEqual([busyRepair.status, /没有恢复（control_busy/u.test(busyRepair.stdout)], [1, true], busyRepair.stdout);
   assert.equal(policyOf(), MAPPING_POLICY_ID);
@@ -18488,7 +18490,7 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   const lockInv = inventoryRuns({ runsDir: RUNS, claimsDir });
   assert.ok(lockInv.problems.some((p) => p.key === key12 && p.reason === "control_lock_held"), JSON.stringify(lockInv.problems));
   assert.ok(!lockInv.problems.some((p) => p.reason === "unrecognized_entry"));
-  fs.rmSync(path.join(claimsDir, key12 + ".control.lock"), { recursive: true });
+  assert.equal(releasePublishLock(lock12).ok, true);
   // 锁内重判：锁外看是 failed 损坏，动手前被人补成受验 failed → 事务按记录返回失败，不隔离、不执行
   fs.mkdirSync(path.join(claimsDir, key12 + ".failed.json"));
   assert.equal(inspectControlClaim({ claimsDir, key: key12 }).state, "failed_unreadable");
@@ -18496,7 +18498,7 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   const swapped = runControlTransaction({ claimsDir, key: key12, intent: { control: "mode", mode: DIALOGUE_POLICY_ID }, replay: true,
     execute: () => { executions += 1; return { ok: true, changed: true }; } });
   assert.deepEqual([swapped.ok, swapped.quarantined.length, executions], [true, 1, 1], "损坏的 failed 在锁内隔离后续做：" + JSON.stringify(swapped));
-  assert.ok(!fs.existsSync(path.join(claimsDir, key12 + ".control.lock")), "事务锁用完释放");
+  assert.ok(!lockPresent(path.join(claimsDir, key12 + ".control.lock")), "事务锁用完释放");
   fs.rmSync(path.join(claimsDir, key12 + ".failed.json"), { recursive: true, force: true });
   for (const n of fs.readdirSync(claimsDir).filter((n) => n.startsWith(key12 + ".failed.quarantined."))) fs.rmSync(path.join(claimsDir, n), { recursive: true });
   fs.rmSync(path.join(claimsDir, key12 + ".consumed.json"), { force: true });
@@ -18644,28 +18646,31 @@ test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进
   // ③ 释放绑定实例：锁被清掉又被别的实例取得 → 旧持有者不删新实例，并以 lockUncleared 报出
   const lockDir = path.join(claimsDir, lateKey + ".control.lock");
   const swappedRelease = withControlLock({ claimsDir, key: lateKey }, () => {
-    const mine = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf-8"));
-    assert.ok(typeof mine.token === "string" && mine.token.length > 0 && typeof mine.pid === "number", "owner 带 token");
-    fs.rmSync(lockDir, { recursive: true });
-    fs.mkdirSync(lockDir); fs.writeFileSync(path.join(lockDir, "owner.json"), JSON.stringify({ pid: 1, at: "2026-08-29T00:00:00.000Z", token: "someone-else" }));
+    const mine = JSON.parse(fs.readlinkSync(lockDir));
+    assert.ok(typeof mine.token === "string" && mine.token.length > 0 && typeof mine.pid === "number", "owner 就是 symlink 的 payload，原子带 token");
+    fs.rmSync(lockDir);
+    // 活着的别家实例（同 pid 才算活：协议探活用 kill(pid,0)），token 不同
+    fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "someone-else" }), lockDir);
     return { ok: true, changed: true };
   });
-  assert.deepEqual([swappedRelease.ok, swappedRelease.lockUncleared], [true, "锁已被别的实例持有，未删"], JSON.stringify(swappedRelease));
-  assert.equal(JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf-8")).token, "someone-else", "新实例的锁还在");
+  assert.deepEqual([swappedRelease.ok, swappedRelease.lockUncleared], [true, "not_owner（pid " + process.pid + "）"], JSON.stringify(swappedRelease));
+  assert.equal(JSON.parse(fs.readlinkSync(lockDir)).token, "someone-else", "新实例的锁还在");
   assert.equal(runControlTransaction({ claimsDir, key: lateKey, intent: lateIntent, execute: () => ({ ok: true }) }).reason, "control_busy");
-  fs.rmSync(lockDir, { recursive: true });
-  const goneRelease = withControlLock({ claimsDir, key: lateKey }, () => { fs.rmSync(lockDir, { recursive: true }); return { ok: true }; });
+  fs.rmSync(lockDir);
+  const goneRelease = withControlLock({ claimsDir, key: lateKey }, () => { fs.rmSync(lockDir); return { ok: true }; });
   assert.deepEqual([goneRelease.ok, goneRelease.lockUncleared], [true, "锁已不在（被清理过）"]);
   // ④ 释放失败不吞：目录不可写 → rm 失败 → lockUncleared，锁留在原地；正常释放后目录消失
   if (typeof process.getuid !== "function" || process.getuid() !== 0) {
     const stuckRelease = withControlLock({ claimsDir, key: lateKey }, () => { fs.chmodSync(claimsDir, 0o500); return { ok: true, changed: false }; });
     fs.chmodSync(claimsDir, 0o700);
     assert.deepEqual([stuckRelease.ok, typeof stuckRelease.lockUncleared], [true, "string"], JSON.stringify(stuckRelease));
-    assert.ok(fs.existsSync(lockDir), "锁留在原地，账本会报 control_lock_held");
-    fs.rmSync(lockDir, { recursive: true });
+    assert.ok(lockPresent(lockDir), "锁留在原地，账本会报 control_lock_held");
+    fs.rmSync(lockDir);
   }
   assert.deepEqual(withControlLock({ claimsDir, key: lateKey }, () => ({ ok: true })), { ok: true });
-  assert.ok(!fs.existsSync(lockDir));
+  assert.ok(!lockPresent(lockDir));
+  // 账本对锁家族的条目（锁本身、reap 段、rename 走的残骸）都认得
+  for (const n of ["", ".reap", ".maint", ".reaped-abc", ".reap.quarantine-1"]) assert.ok(CONTROL_LOCK_RE.test(lateKey + ".control.lock" + n), n);
   // 维护入口与回执都要把"锁没交还"说出来
   assert.equal(repairExitCode({ seen: { state: "in_flight" }, result: { ok: true, intent: lateIntent, changed: true, residueUncleared: [], residueUnknown: null, lockUncleared: "EACCES" }, apply: true }), 1);
   assert.match(describeControlRepair({ seen: { state: "in_flight" }, result: { ok: true, intent: lateIntent, changed: true, residueUncleared: [], residueUnknown: null, lockUncleared: "EACCES" }, apply: true }), /事务锁没有交还（EACCES）/u);

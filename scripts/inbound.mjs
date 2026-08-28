@@ -426,28 +426,20 @@ const runControl = (replay) => {
     claimsDir: CLAIMS, key: claim.key, intent: control ? { control: control.kind, mode: control.mode } : undefined, replay,
     execute: (mode) => setClaudeInteractionMode({ root: routed.root, claudeSessionId: mapping.claude_session_id ?? null, mode }),
   });
+  // 锁没干净交还的话，不管事务成败都要说出来：之后同一笔会报 control_busy。
+  const lockNote = tx.lockUncleared ? "；另外这一笔的事务锁没有交还（" + tx.lockUncleared + "），之后同一笔会报 control_busy，请人工确认后处理" : "";
+  const receiptBase = { control: control.kind, mode: control.mode, message_id: verdict.messageId, handed_off: false, lock_uncleared: tx.lockUncleared ?? null };
   if (!tx.ok) {
-    if (tx.reason === "ledger_unwritten") {
-      writeReceipt("control-" + verdict.messageId, { status: "error", reason: tx.reason, control: control.kind, mode: control.mode, changed: tx.changed,
-        message_id: verdict.messageId, claim_acquired: true, handed_off: false, error: tx.why });
-      finish("error", { detail: "模式已切换，但终态没记下（" + tx.why + "）；重发不会补齐（新消息是新一笔），请用维护入口 repair-control-claim 处理这一笔" }, { reason: tx.reason });
-    }
-    if (tx.reason === "control_failed_recorded") {
-      writeReceipt("control-" + verdict.messageId, { status: "error", reason: tx.reason, control: control.kind, mode: control.mode, replayed: true,
-        message_id: verdict.messageId, claim_acquired: false, handed_off: false, error: tx.why });
-      finish("error", { detail: "这条控制命令之前执行失败（" + tx.why + "）；本次是同一条消息的重放，没有再次尝试。要再切请重新发一条。" }, { reason: tx.reason });
-    }
-    if (tx.reason === "control_conflict") {
-      writeReceipt("control-" + verdict.messageId, { status: "error", reason: tx.reason, control: control.kind, mode: control.mode,
-        message_id: verdict.messageId, claim_acquired: false, handed_off: false, error: tx.why });
-      finish("error", { detail: "这一笔的终态自相矛盾（" + tx.why + "），没有执行；请用维护入口 repair-control-claim 处理这一笔" }, { reason: tx.reason });
-    }
-    writeReceipt("control-" + verdict.messageId, { status: "error", reason: tx.reason, control: control.kind, mode: control.mode,
-      message_id: verdict.messageId, claim_acquired: true, handed_off: false, error: tx.why });
-    finish("error", { detail: "模式没有切换（" + tx.why + "）" }, { reason: tx.reason });
+    const fail = (detail, extra = {}) => {
+      writeReceipt("control-" + verdict.messageId, { status: "error", reason: tx.reason, ...receiptBase, claim_acquired: !replay, error: tx.why, ...extra });
+      finish("error", { detail: detail + lockNote }, { reason: tx.reason });
+    };
+    if (tx.reason === "ledger_unwritten") fail("模式已切换，但终态没记下（" + tx.why + "）；重发不会补齐（新消息是新一笔），请用维护入口 repair-control-claim 处理这一笔", { changed: tx.changed });
+    if (tx.reason === "control_failed_recorded") fail("这条控制命令之前执行失败（" + tx.why + "）；本次是同一条消息的重放，没有再次尝试。要再切请重新发一条。", { replayed: true });
+    if (tx.reason === "control_conflict") fail("这一笔的终态自相矛盾（" + tx.why + "），没有执行；请用维护入口 repair-control-claim 处理这一笔");
+    fail("模式没有切换（" + tx.why + "）");
   }
-  writeReceipt("control-" + verdict.messageId, { status: "consumed", control: control.kind, mode: control.mode, changed: tx.changed,
-    replayed: tx.replayed, resumed: tx.resumed, lock_uncleared: tx.lockUncleared ?? null, message_id: verdict.messageId, project_root: routed.root, claim_acquired: !replay, handed_off: false });
+  writeReceipt("control-" + verdict.messageId, { status: "consumed", ...receiptBase, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed, project_root: routed.root, claim_acquired: !replay });
   finish("control", { text: controlAckText({ taskName: config.task_display_name, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed, lockUncleared: tx.lockUncleared ?? null }) },
     { control: control.kind, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed });
 };

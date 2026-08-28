@@ -18088,6 +18088,21 @@ test("未路由回复盘点：全枚举，只有完整受验的制品计入，�
     fs.rmSync(fifo, { force: true });
   }
   fs.rmSync(path.join(dir, "1787900000005-sess1abc-aabbccdd.json"), { force: true });
+  // TOCTOU：打开之后路径被换成命名管道 —— 读取绑定在原 fd 上，不受影响、不挂（评审固定时序探针）
+  const swapTarget = path.join(dir, "1787900000000-sess1abc-0a1b2c3d.json");
+  let swapped = false;
+  const raced = spawnSync(process.execPath, ["--input-type=module", "-e",
+    'import fs from "node:fs"; import { spawnSync } from "node:child_process";'
+    + 'const { inventoryUnroutedReplies } = await import(' + JSON.stringify(pathToFileURL(path.resolve("scripts", "drain-outbox.mjs")).href) + ');'
+    + 'const target = ' + JSON.stringify(swapTarget) + ';'
+    + 'const r = inventoryUnroutedReplies({ root: ' + JSON.stringify(root) + ', afterOpen: (p) => { if (p === target) { fs.rmSync(p, { force: true }); spawnSync("mkfifo", [p]); } } });'
+    + 'process.stdout.write(JSON.stringify(r));'],
+    { encoding: "utf-8", timeout: 5000 });
+  assert.equal(raced.status, 0, "换成 FIFO 也不许挂：" + (raced.error?.code ?? raced.stderr));
+  const racedInv = JSON.parse(raced.stdout);
+  assert.equal(racedInv.count, 1, "打开之后路径被换掉，本次仍按原 fd 读到合法制品：" + JSON.stringify(racedInv.problems));
+  swapped = true;
+  if (swapped) { fs.rmSync(swapTarget, { force: true }); fs.writeFileSync(swapTarget, JSON.stringify(valid)); }
   assert.equal(inventoryUnroutedReplies({ root: path.join(local, "nope") }).count, 0, "目录不存在 = 0");
   fs.writeFileSync(path.join(local, "file-not-dir"), "x");
   assert.equal(inventoryUnroutedReplies({ root: path.join(local, "file-not-dir") }).count, 0);

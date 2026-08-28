@@ -373,7 +373,8 @@ function runChannelContext({ root, dryRun }) {
  * 未路由回复（Stop 说不清该回哪个话题、零入队时留下的记录）的只读盘点 —— 状态页第五区与 doctor 都从这里读。
  * 目录不存在 = 0 条；读不出来明说，不折叠成 0。
  */
-export function inventoryUnroutedReplies({ root } = {}) {
+// afterOpen 只给测试用：在拿到 fd 之后、读之前插一个动作，把"路径被换掉也不影响本次读取"写成确定性回归。
+export function inventoryUnroutedReplies({ root, afterOpen = null } = {}) {
   const dir = path.join(root, ".runtime-data", "outbound", "unrouted-replies");
   let names;
   // **枚举全部目录项**，不先按后缀过滤：写方的临时制品（.json.tmp.<pid>）、不认识的条目都要报出来，
@@ -388,15 +389,26 @@ export function inventoryUnroutedReplies({ root } = {}) {
   const NAME = /^\d+-[^.]+-[0-9a-f]{8}\.json$/u;
   for (const n of names) {
     if (!NAME.test(n)) { problems.push({ file: n, reason: /\.tmp\./u.test(n) ? "tmp_artifact" : "unrecognized_entry" }); continue; }
-    // **读内容之前先 lstat，只收普通文件**：目录、符号链接、命名管道一律 unrecognized_entry ——
-    // 名字合规的 FIFO 会让 readFileSync 永远等下去，状态页与 doctor 一起卡死（评审探针）。
-    let st;
-    try { st = fs.lstatSync(path.join(dir, n)); }
-    catch (err) { problems.push({ file: n, reason: "unreadable", error: String(err.code ?? err.message) }); continue; }
-    if (!st.isFile()) { problems.push({ file: n, reason: "unrecognized_entry" }); continue; }
+    // **一次打开、绑定 fd、fstat 只收普通文件、用同一个 fd 读**：目录 / 符号链接（O_NOFOLLOW → ELOOP）/ 命名管道
+    // 一律 unrecognized_entry。lstat(path) 再 read(path) 两步之间路径可被换成 FIFO 让读取永远等下去（评审探针）；
+    // O_NONBLOCK 保证连 open 都不会挂。
+    let fd = null;
     let doc;
-    try { doc = JSON.parse(fs.readFileSync(path.join(dir, n), "utf-8")); }
-    catch (err) { problems.push({ file: n, reason: "unreadable", error: String(err.code ?? "not_json") }); continue; }
+    try {
+      try {
+        fd = fs.openSync(path.join(dir, n), fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW);
+      } catch (err) {
+        problems.push({ file: n, reason: err.code === "ELOOP" ? "unrecognized_entry" : "unreadable", error: String(err.code ?? err.message) });
+        continue;
+      }
+      if (typeof afterOpen === "function") afterOpen(path.join(dir, n));
+      const st = fs.fstatSync(fd);
+      if (!st.isFile()) { problems.push({ file: n, reason: "unrecognized_entry" }); continue; }
+      try { doc = JSON.parse(fs.readFileSync(fd, "utf-8")); }
+      catch (err) { problems.push({ file: n, reason: "unreadable", error: String(err.code ?? "not_json") }); continue; }
+    } finally {
+      if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
+    }
     const shapeOk = doc !== null && typeof doc === "object" && !Array.isArray(doc)
       && doc.schema_version === "1.0" && doc.artifact_type === "feishu_bridge_unrouted_reply"
       && typeof doc.reason === "string" && doc.reason.length > 0

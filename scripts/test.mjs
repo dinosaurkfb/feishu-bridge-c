@@ -18254,7 +18254,7 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   const residue = path.join(claimsDir, key2 + ".consumed.json.tmp.4242.1787900000000");
   fs.writeFileSync(residue, "{}");
   const withResidue = inventoryRuns({ runsDir: path.join(root, ".runtime-data", "inbound", "runs"), claimsDir });
-  assert.ok(withResidue.problems.some((p) => p.key === key2 && p.reason === "consumed_in_flight" && /tmp\./u.test(p.why)), JSON.stringify(withResidue.problems));
+  assert.ok(withResidue.problems.some((p) => p.key === key2 && p.reason === "consumed_in_flight" && /delivery-claims\/[0-9a-f]{64}\.consumed\.json/u.test(p.why)), JSON.stringify(withResidue.problems));
   assert.ok(!withResidue.problems.some((p) => p.reason === "unrecognized_entry"), "残骸是受控形状");
   // 维护入口恢复（不是飞书重发）：续做并写终态；再跑一次说已闭合
   const repaired = repair("--project", root, "--key", key2, "--apply");

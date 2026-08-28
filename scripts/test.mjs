@@ -3492,6 +3492,107 @@ test("回收窗口：判定陈旧之后、动手之前锁换了主人 → 不许
   assert.equal(releasePublishLock(lockDir).ok, true);
 });
 
+test("释放是归属转换：owner 不可读保留现场；reap 锁被占就等、等不到报 release_busy 不动锁；reap 段内被接管不删别人的 reap 锁", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-release-"));
+  const lockDir = path.join(local, "registry.lock");
+  const reapDir = lockDir + ".reap";
+  // 1. owner 不可读：不删（残骸交给陈旧回收，那边看年龄），报 owner_unreadable。
+  fs.symlinkSync("not json", lockDir);
+  const r1 = releasePublishLock(lockDir);
+  assert.deepEqual([r1.ok, r1.reason], [false, "owner_unreadable"]);
+  assert.ok(fs.lstatSync(lockDir).isSymbolicLink(), "现场要留着");
+  assert.equal(acquirePublishLock(lockDir).reason, "publisher_busy", "刚建的残骸几秒内当活锁");
+  const old = (Date.now() - 60_000) / 1000;
+  fs.lutimesSync(lockDir, old, old);
+  const got = acquirePublishLock(lockDir);
+  assert.equal(got.ok, true, "超过宽限由陈旧回收处理");
+  // 2. 别人正拿着 reap 锁：释放等一小会，等不到就 release_busy，锁一个字不动。
+  const other = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "other-reaper" });
+  fs.symlinkSync(other, reapDir);
+  const r2 = releasePublishLock(lockDir, { waitMs: 30 });
+  assert.deepEqual([r2.ok, r2.reason], [false, "release_busy"], JSON.stringify(r2));
+  assert.equal(JSON.parse(fs.readlinkSync(lockDir)).token, got.token, "锁还是我的、没被动");
+  assert.equal(fs.readlinkSync(reapDir), other, "别人的 reap 锁没被动");
+  fs.rmSync(reapDir, { force: true });
+  assert.equal(releasePublishLock(lockDir).ok, true);
+  assert.throws(() => fs.lstatSync(lockDir));
+  // 3. 我在 reap 段内被接管（模拟：段内 reap 锁换成别人的）：我的 finally 不许删别人的 reap 锁。
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "stale" }), lockDir);
+  const taken = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "took-over" });
+  const r3 = acquirePublishLock(lockDir, { duringReap: () => { fs.rmSync(reapDir, { force: true }); fs.symlinkSync(taken, reapDir); } });
+  assert.equal(r3.ok, true, JSON.stringify(r3));
+  assert.equal(fs.readlinkSync(reapDir), taken, "被接管的 reap 锁不是我的，不删");
+  fs.rmSync(reapDir, { force: true });
+  assert.equal(releasePublishLock(lockDir).ok, true);
+});
+
+test("释放与陈旧接管互斥：两个真实 OS 进程 —— 旧持有者释放过期锁的同时新进程接管，新实例不许被删", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-release-race-"));
+  const worker = path.join(local, "worker.mjs");
+  const driver = path.join(local, "driver.mjs");
+  fs.writeFileSync(worker, [
+    'import fs from "node:fs";',
+    'const { acquirePublishLock, releasePublishLock } = await import(' + JSON.stringify(pathToFileURL(path.resolve("scripts", "registry.mjs")).href) + ');',
+    'const [role, lockDir, go, readyFile] = process.argv.slice(2);',
+    'const w = new Int32Array(new SharedArrayBuffer(4));',
+    'let out = {};',
+    'if (role === "old") {',
+    '  const got = acquirePublishLock(lockDir, { now: Date.now() - 10 * 60 * 1000 });', // 拿到手就已经过 staleMs
+    '  fs.writeFileSync(readyFile, "ok");',
+    '  while (Date.now() < Number(go)) Atomics.wait(w, 0, 0, 1);',
+    '  out = { got, release: releasePublishLock(lockDir) };',
+    '} else {',
+    '  while (!fs.existsSync(readyFile)) Atomics.wait(w, 0, 0, 1);',
+    '  while (Date.now() < Number(go)) Atomics.wait(w, 0, 0, 1);',
+    '  out = { got: acquirePublishLock(lockDir) };',
+    '}',
+    'process.stdout.write(JSON.stringify(out));',
+  ].join("\n"));
+  fs.writeFileSync(driver, [
+    'import fs from "node:fs";',
+    'import { spawn } from "node:child_process";',
+    'const [worker, lockDir, rounds] = process.argv.slice(2);',
+    'const run = (role, go, ready) => new Promise((res) => {',
+    '  const c = spawn(process.execPath, [worker, role, lockDir, String(go), ready], { stdio: ["ignore", "pipe", "pipe"] });',
+    '  let out = ""; let err = "";',
+    '  c.stdout.on("data", (d) => { out += d; }); c.stderr.on("data", (d) => { err += d; });',
+    '  c.on("close", (code) => res({ role, code, out, err }));',
+    '});',
+    'const results = [];',
+    'for (let i = 0; i < Number(rounds); i += 1) {',
+    '  fs.rmSync(lockDir, { recursive: true, force: true });',
+    '  const ready = lockDir + ".ready-" + i;',
+    '  const go = Date.now() + 400;',
+    '  const pair = await Promise.all([run("old", go, ready), run("new", go, ready)]);',
+    '  let owner = null;',
+    '  try { owner = JSON.parse(fs.readlinkSync(lockDir)); } catch { owner = null; }',
+    '  results.push({ pair, owner });',
+    '}',
+    'process.stdout.write(JSON.stringify(results));',
+  ].join("\n"));
+  const lockDir = path.join(local, "registry.lock");
+  const r = spawnSync(process.execPath, [driver, worker, lockDir, "6"], { encoding: "utf-8", timeout: 90_000 });
+  assert.equal(r.status, 0, r.stderr);
+  const rounds = JSON.parse(r.stdout);
+  for (const [i, round] of rounds.entries()) {
+    for (const w of round.pair) assert.equal(w.code, 0, w.err);
+    const oldR = JSON.parse(round.pair[0].out);
+    const newR = JSON.parse(round.pair[1].out);
+    assert.equal(oldR.got.ok, true, "第 " + i + " 轮：旧持有者先拿到锁");
+    if (newR.got.ok) {
+      // 不变量：新实例接管成功后必须还在。旧方的释放要么先于接管（ok），要么发现锁已易主（not_owner）—— 两种交错都合法，
+      // 唯一不许的是"接管成功了、旧方随后把新实例删掉"（评审探针抓到的那种）。
+      assert.ok(round.owner && round.owner.token === newR.got.token,
+        "第 " + i + " 轮：新实例接管成功后必须还在 —— " + JSON.stringify({ oldR, newR, owner: round.owner }));
+      assert.ok(oldR.release.ok === true || oldR.release.reason === "not_owner", JSON.stringify(oldR.release));
+    } else {
+      assert.equal(newR.got.reason, "publisher_busy", JSON.stringify(newR));
+      assert.equal(oldR.release.ok, true, "第 " + i + " 轮：新方没接管成功，旧方正常释放：" + JSON.stringify(oldR));
+    }
+  }
+  assert.ok(rounds.some((x) => JSON.parse(x.pair[1].out).got.ok), "6 轮里至少要有一轮是新方接管成功的，否则没测到那条路");
+});
+
 test("陈旧锁回收是互斥的：两个真实 OS 进程同时接管同一把陈旧锁，只有一个成功", () => {
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-race-"));
   const worker = path.join(local, "worker.mjs");

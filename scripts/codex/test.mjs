@@ -8793,6 +8793,17 @@ test("Codex 待认领快过期提醒：进窗口只在待认领话题下发一�
   } finally {
     fs.chmodSync(fx7.home, 0o700);
   }
+
+  // 交互策略写入口（带重试的那条取锁路径）同样不许把 I/O 错误说成 registry_busy（评审探针）
+  const fx8 = codexReminderFixture();
+  fs.chmodSync(fx8.home, 0o500);
+  try {
+    const r = setTaskInteractionMode({ threadId: THREAD_A, mode: "dialogue", home: fx8.home, now });
+    assert.deepEqual([r.ok, r.reason], [false, "lock_io_error"], JSON.stringify(r));
+    assert.match(String(r.error), /EACCES|EPERM/u);
+  } finally {
+    fs.chmodSync(fx8.home, 0o700);
+  }
 });
 
 test("Codex 兜底真入口 drain-all 跑待认领提醒；发不出去要报 publish_failed、退出 1、不记", () => {

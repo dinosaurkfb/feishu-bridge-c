@@ -1234,7 +1234,7 @@ function mutateTaskInteractionPolicy({
     if (lock.ok || lock.reason !== "publisher_busy") break;
     if (attempt < lockRetries) Atomics.wait(wait, 0, 0, 25);
   }
-  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  if (!lock.ok) return lockFailure(lock);
   try {
     const file = registryFile(home);
     const reg = loadRegistry(file);

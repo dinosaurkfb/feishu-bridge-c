@@ -283,8 +283,47 @@ function tryLink(lockDir, payload) {
   }
 }
 
-// beforeReap 只给测试用：在"判定陈旧"与"进 reap 锁重核"之间插一个动作，把并发窗口写成确定性的行为测试。
-export function acquirePublishLock(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now(), beforeReap = null } = {}) {
+/**
+ * 所有会改变锁归属的动作（陈旧回收、释放）都在 reap 锁里做，彼此互斥。
+ * reap 锁自身：同一 symlink 原语；持有超过 REAP_LOCK_STALE_MS 视为残骸可被接管；
+ * 释放按 token 核对（被接管过就不删别人的）。段内只做几次文件操作，不做别的 I/O。
+ * 返回 { ok, run } 或 { ok:false, reason }。busy 时可选择短暂重试（释放要用）。
+ */
+function withReapLock(lockDir, fn, { waitMs = 0, duringReap = null } = {}) {
+  const reapDir = lockDir + ".reap";
+  const token = crypto.randomUUID();
+  const payload = () => JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token });
+  const deadline = Date.now() + waitMs;
+  let held = false;
+  for (;;) {
+    const reap = tryLink(reapDir, payload());
+    if (reap.ok) { held = true; break; }
+    if (reap.reason !== "publisher_busy") return reap;
+    const r = readLockOwner(reapDir);
+    if (r.present && Date.now() - r.mtimeMs > REAP_LOCK_STALE_MS) {
+      // 回收者崩在里面了：rename 走（原子，只有一个接管者成功）再拿。
+      try { fs.renameSync(reapDir, reapDir + ".dead-" + token); fs.rmSync(reapDir + ".dead-" + token, { recursive: true, force: true }); }
+      catch { /* 别人刚接管 */ }
+      continue;
+    }
+    if (Date.now() >= deadline) return { ok: false, reason: "reap_busy" };
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+  }
+  try {
+    if (typeof duringReap === "function") duringReap();
+    return { ok: true, run: fn() };
+  } finally {
+    if (held) {
+      // 按 token 释放 reap 锁：我在段内待太久被接管了的话，那把已经是别人的。
+      const cur = readLockOwner(reapDir);
+      if (cur.present && cur.owner && cur.owner.token === token) fs.rmSync(reapDir, { recursive: true, force: true });
+    }
+  }
+}
+
+// beforeReap / duringReap 只给测试用：在"判定陈旧"与"进 reap 锁重核"之间、以及拿到 reap 锁之后
+// 插一个动作，把并发窗口写成确定性的行为测试。
+export function acquirePublishLock(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now(), beforeReap = null, duringReap = null } = {}) {
   const token = crypto.randomUUID();
   const payload = JSON.stringify({ pid: process.pid, at: new Date(now).toISOString(), token });
   const attempt = () => {
@@ -301,30 +340,19 @@ export function acquirePublishLock(lockDir, { staleMs = 5 * 60 * 1000, now = Dat
   if (typeof beforeReap === "function") beforeReap();
 
   // 回收串行化：reap 锁 → 重读核对 → rename 走 → 放 reap 锁 → 再取。
-  const reapDir = lockDir + ".reap";
-  const reap = tryLink(reapDir, JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token }));
-  if (!reap.ok) {
-    if (reap.reason !== "publisher_busy") return reap;
-    const r = readLockOwner(reapDir);
-    if (!r.present || Date.now() - r.mtimeMs <= REAP_LOCK_STALE_MS) return first; // 别人正在回收，这轮让它
-    try { fs.renameSync(reapDir, reapDir + ".dead-" + token); fs.rmSync(reapDir + ".dead-" + token, { recursive: true, force: true }); }
-    catch { return first; }
-    const again = tryLink(reapDir, JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token }));
-    if (!again.ok) return first;
-  }
-  try {
+  const reaped = withReapLock(lockDir, () => {
     const current = readLockOwner(lockDir);
-    if (!current.present) return attempt(); // 已经被别人收走了
+    if (!current.present) return true; // 已经被别人收走了
     const sameInstance = JSON.stringify(current.owner) === JSON.stringify(seen.owner);
-    if (!sameInstance || !isPublishLockStale(lockDir, { staleMs, now })) return first; // 实例变了：那是活锁
-    const reaped = lockDir + ".reaped-" + token;
-    try { fs.renameSync(lockDir, reaped); }
-    catch { return first; } // 别人刚收走
-    fs.rmSync(reaped, { recursive: true, force: true });
-    return attempt(); // 只重试一次：再失败说明有别人刚抢到，让它去发
-  } finally {
-    fs.rmSync(reapDir, { recursive: true, force: true });
-  }
+    if (!sameInstance || !isPublishLockStale(lockDir, { staleMs, now })) return false; // 实例变了：那是活锁
+    const away = lockDir + ".reaped-" + token;
+    try { fs.renameSync(lockDir, away); }
+    catch { return false; } // 别人刚收走
+    fs.rmSync(away, { recursive: true, force: true });
+    return true;
+  }, { duringReap });
+  if (!reaped.ok) return reaped.reason === "reap_busy" ? first : reaped; // 别人正在回收：这轮让它
+  return reaped.run ? attempt() : first; // 只重试一次：再失败说明有别人刚抢到，让它去发
 }
 
 export function isPublishLockStale(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now() } = {}) {
@@ -335,13 +363,19 @@ export function isPublishLockStale(lockDir, { staleMs = 5 * 60 * 1000, now = Dat
 }
 
 /**
- * 释放前核对所有权：按 token —— 我的锁可能已被回收并被别人（甚至同 pid 的另一实例）拿走，
- * 那时删掉的是别人的活锁。旧版目录锁没有 token，退回按 pid 核对。
+ * 释放是**归属转换**，不是"核对后按路径 rm"两步：在 reap 锁里核对 token 再删，与陈旧回收互斥 ——
+ * 否则我的锁刚过 staleMs 被别人合法接管，我随后的 rm 删掉的是新实例（评审双进程探针）。
+ * owner 不可读**保留现场**（不删）：残骸交给陈旧回收，那边有年龄判断。旧版目录锁没有 token，退回按 pid。
+ * reap 锁被别人占着就等最多 waitMs（回收段只有几毫秒）；等不到返回 release_busy，锁留着由陈旧回收处理。
  */
-export function releasePublishLock(lockDir) {
+export function releasePublishLock(lockDir, { waitMs = 500 } = {}) {
   const mine = HELD.get(lockDir) ?? null;
-  const r = readLockOwner(lockDir);
-  if (r.present && r.owner) {
+  const pre = readLockOwner(lockDir);
+  if (!pre.present) { HELD.delete(lockDir); return { ok: true, absent: true }; }
+  const done = withReapLock(lockDir, () => {
+    const r = readLockOwner(lockDir);
+    if (!r.present) return { ok: true, absent: true };
+    if (!r.owner) return { ok: false, reason: "owner_unreadable" };
     if (typeof r.owner.token === "string") {
       if (r.owner.token !== mine) return { ok: false, reason: "not_owner", pid: r.owner.pid };
     } else if (Number.isFinite(r.owner.pid) && r.owner.pid !== process.pid) {
@@ -349,8 +383,10 @@ export function releasePublishLock(lockDir) {
       try { process.kill(r.owner.pid, 0); } catch { alive = false; }
       if (alive) return { ok: false, reason: "not_owner", pid: r.owner.pid };
     }
-  }
-  fs.rmSync(lockDir, { recursive: true, force: true });
-  HELD.delete(lockDir);
-  return { ok: true };
+    fs.rmSync(lockDir, { recursive: true, force: true });
+    return { ok: true };
+  }, { waitMs });
+  if (!done.ok) return done.reason === "reap_busy" ? { ok: false, reason: "release_busy" } : done;
+  if (done.run.ok) HELD.delete(lockDir);
+  return done.run;
 }

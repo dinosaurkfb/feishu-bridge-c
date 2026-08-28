@@ -115,16 +115,21 @@ export function findBindingForSession({ sessionId, registryFile, templateFile } 
   const listed = listBindings({ registryFile, templateFile });
   if (!listed.ok) return { ok: false, reason: listed.reason, error: listed.error };
 
+  const hits = [];
   for (const b of listed.bindings) {
     if (b.mapping?.status !== "active") continue;
     if (b.mapping?.session_id === sessionId) {
-      return { ok: true, ...b, originGenerationId: b.mapping.channel_generation_id ?? null, originGenerationStatus: "active" };
+      hits.push({ ok: true, ...b, originGenerationId: b.mapping.channel_generation_id ?? null, originGenerationStatus: "active" });
+      continue;
     }
     const historic = generationForSession(b.mapping?.topic_generation_state ?? null, sessionId);
     if (historic && historic.status === "read-only") {
-      return { ok: true, ...b, originGenerationId: historic.channel_generation_id, originGenerationStatus: "read-only" };
+      hits.push({ ok: true, ...b, originGenerationId: historic.channel_generation_id, originGenerationStatus: "read-only" });
     }
   }
+  // 命中多条说不清是谁的：不按登记顺序取第一条（评审探针）。
+  if (hits.length > 1) return { ok: false, reason: "ambiguous_session", candidates: hits.length };
+  if (hits.length === 1) return hits[0];
   return { ok: false, reason: "no_binding_for_session", candidates: listed.bindings.length };
 }
 

@@ -8828,6 +8828,23 @@ test("Codex 兜底真入口 drain-all 跑待认领提醒；发不出去要报 pu
   assert.equal(fx.pendingNow(Date.now()).claim_reminder_at, undefined, "没发出去不许记");
 });
 
+test("Codex：两个 task 持有同一 Aily session → 路由返回歧义，不按登记顺序取第一条", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const a = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  const b = makeTaskEntry({ root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "b" });
+  for (const t of [a, b]) { t.session_id = "aily_dup"; t.inbound_state = "bound"; delete t.topic_generation_state; delete t.channel_generation_id; }
+  assert.throws(() => writeRegistryFixtureUnvalidated([a, b], path.join(home, "registry.json")), /重复绑定字段：session_id/u,
+    "登记表写入层就拒绝重复 session");
+  // 绕过写入层的坏表：路由也不许按登记顺序取第一条
+  fs.writeFileSync(path.join(home, "registry.json"), JSON.stringify({ schema_version: "1.0", tasks: [a, b] }, null, 2));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const r = findTaskForFeishuSession({ sessionId: "aily_dup", home });
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.ok(["ambiguous_session", "duplicate_binding"].includes(r.reason), "坏表被读取层拦下或路由层判歧义，都不许取第一条：" + JSON.stringify(r));
+});
+
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (failed > 0) process.exit(1);

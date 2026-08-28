@@ -18,7 +18,7 @@ import fs from "node:fs";
 import { isDirectRun } from "./direct-run.mjs";
 
 import {
-  claudeTurnInputDir, clearTurnInput, isFeishuStampedInput, storeTurnInput,
+  claudeTurnInputDir, clearInboundTurn, clearTurnInput, feishuStampMessageId, isFeishuStampedInput, storeInboundTurn, storeTurnInput,
 } from "./turn-input.mjs";
 
 /** 只认 `/init` 本身和带参数的 `/init xxx`。别的斜杠命令一概不管。 */
@@ -84,8 +84,13 @@ async function main() {
         const dir = claudeTurnInputDir(project.root, bound.claudeSessionId);
         if (isFeishuStampedInput(prompt)) {
           clearTurnInput({ dir, key: speakingSession });
+          // 记下这一轮是飞书来的哪条消息：Stop 据此反查 claim 里冻结的 origin，回复发回原话题。
+          const messageId = feishuStampMessageId(prompt);
+          if (messageId) storeInboundTurn({ dir, key: speakingSession, messageId });
+          else clearInboundTurn({ dir, key: speakingSession });
         } else {
           storeTurnInput({ dir, key: speakingSession, text: prompt });
+          clearInboundTurn({ dir, key: speakingSession });
         }
       }
     }

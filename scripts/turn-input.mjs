@@ -37,6 +37,53 @@ export function isFeishuStampedInput(value) {
   return /^\s*\[飞书\s*·\s*(?:msg|om)_[^\s·\]]+\s*·/u.test(String(value ?? ""));
 }
 
+/** 飞书戳记里的消息 id（`[飞书 · msg_x · 时间]`）；不是戳记就 null。 */
+export function feishuStampMessageId(value) {
+  const m = /^\s*\[飞书\s*·\s*((?:msg|om)_[^\s·\]]+)\s*·/u.exec(String(value ?? ""));
+  return m ? m[1] : null;
+}
+
+const inboundFile = (dir, key) => path.join(dir, fileKey(key) + ".inbound.json");
+
+/**
+ * 记下"这个会话当前这一轮是飞书来的哪条消息"。Stop 钩子据此反查 claim，拿到入站时冻结的
+ * origin 代际，把回复发回指令所在的那个话题（goal 第 2 层）。与本地回合缓存同目录、同清理规则；
+ * 下一次 UserPromptSubmit 原子覆写或清掉。
+ */
+export function storeInboundTurn({ dir, key, messageId, now = Date.now() } = {}) {
+  if (typeof dir !== "string" || !dir || typeof key !== "string" || !key) return { ok: false, reason: "missing_locator" };
+  if (typeof messageId !== "string" || !messageId) return { ok: false, reason: "message_id_required" };
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  prune(dir, { now });
+  const file = inboundFile(dir, key);
+  const tmp = file + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify({
+    schema_version: "1.0", input_origin: "feishu", message_id: messageId, captured_at: new Date(now).toISOString(),
+  }, null, 2) + "\n", { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  return { ok: true, file };
+}
+
+export function readInboundTurn({ dir, key } = {}) {
+  if (typeof dir !== "string" || !dir || typeof key !== "string" || !key) return { ok: false, reason: "missing_locator" };
+  const file = inboundFile(dir, key);
+  try {
+    const record = JSON.parse(fs.readFileSync(file, "utf-8"));
+    if (record?.input_origin !== "feishu" || typeof record?.message_id !== "string" || !record.message_id) {
+      return { ok: false, reason: "invalid_cache", file };
+    }
+    return { ok: true, file, messageId: record.message_id };
+  } catch (err) {
+    return { ok: false, reason: err.code === "ENOENT" ? "not_found" : "unreadable", file };
+  }
+}
+
+export function clearInboundTurn({ dir, key } = {}) {
+  if (typeof dir !== "string" || !dir || typeof key !== "string" || !key) return { ok: false, reason: "missing_locator" };
+  fs.rmSync(inboundFile(dir, key), { force: true });
+  return { ok: true };
+}
+
 function prune(dir, { now = Date.now() } = {}) {
   let names;
   try { names = fs.readdirSync(dir).filter((name) => name.endsWith(".json")); }

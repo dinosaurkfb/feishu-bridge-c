@@ -263,6 +263,9 @@ export function validateTopicGenerationState(state) {
     }
   }
   if (active > 1) problems.push("multiple_active_generations");
+  // 一个 session 只属于一个代际：路由按 session 找代际，重复就说不清是谁的（评审探针：曾能激活成重复）。
+  const sessions = (state?.generations ?? []).map((g) => g?.session_id).filter((v) => nonEmpty(v));
+  if (new Set(sessions).size !== sessions.length) problems.push("duplicate_session_id");
   if (pending > 1) problems.push("multiple_pending_generations");
   if (state.active_generation_id === null) {
     if (active !== 0) problems.push("active_generation_id_missing");
@@ -460,9 +463,11 @@ export function activeGenerationForSession(state, sessionId) {
  */
 export function generationForSession(state, sessionId) {
   if (!nonEmpty(sessionId) || state?.binding_status !== "active") return null;
-  return state.generations?.find((generation) =>
+  const hits = (state.generations ?? []).filter((generation) =>
     [GENERATION_STATUS.ACTIVE, GENERATION_STATUS.READ_ONLY].includes(generation.status) &&
-    generation.session_id === sessionId) ?? null;
+    generation.session_id === sessionId);
+  // 畸形状态里同一 session 挂在两代上：说不清是谁的，不给"第一条"（校验器会把它报成 duplicate_session_id）。
+  return hits.length === 1 ? hits[0] : null;
 }
 
 /**
@@ -629,6 +634,8 @@ export function activatePendingTopicGeneration(state, {
   const expiry = Date.parse(pending.claim_expires_at ?? "");
   if (Number.isFinite(expiry) && now >= expiry) return { ok: false, reason: "pending_generation_expired" };
   if (!nonEmpty(sessionId)) return { ok: false, reason: "session_id_required" };
+  // 历史代际的 session 不许再分给新代际（否则按 session 路由会同时命中两代）。
+  if (state.generations.some((g) => g.session_id === sessionId)) return { ok: false, reason: "session_already_bound" };
 
   const next = clone(state);
   const previous = activeGeneration(next);

@@ -17,14 +17,14 @@
  */
 
 import fs from "node:fs";
-import { effectiveBindingId } from "./topic-generation.mjs";
+import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
+import { claimKey, readClaim } from "./claim.mjs";
 import os from "node:os";
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
 
 import {
-  claudeTurnInputDir, clearTurnInput, readTurnInput,
-} from "./turn-input.mjs";
+  claudeTurnInputDir, clearTurnInput, readTurnInput, readInboundTurn } from "./turn-input.mjs";
 
 // 会话结束是同步阻塞点：Frank 的终端在等它返回。发不出去就留在 outbox，
 // 兜底定时器 30 分钟内会重试 —— 宁可晚发，不可吊住会话。
@@ -154,6 +154,21 @@ async function main() {
     const boundSession = bound.ok ? bound.claudeSessionId : null;
     const outboxDir = outboxDirOf(project.root, boundSession);
     const inputDir = claudeTurnInputDir(project.root, boundSession);
+    // **回复的目标代际**：默认当前代际；这一轮若是飞书来的（UserPromptSubmit 记了消息 id），
+    // 就反查入站 claim 里冻结的 origin —— 老话题的指令，回复回老话题（goal 第 2 层）。
+    // origin 只在 mapping 里仍能解析成可发布的代际时采用，否则退回当前代际（说不清就不冒险）。
+    let turnOrigin = null;
+    if (!ownedByBridge && speakingSession && bound.ok) {
+      const inbound = readInboundTurn({ dir: inputDir, key: speakingSession });
+      if (inbound.ok && bound.mapping?.logical_task_key) {
+        const claim = readClaim({
+          claimsDir: path.join(project.root, ".runtime-data", "inbound", "delivery-claims"),
+          key: claimKey(inbound.messageId, bound.mapping.logical_task_key),
+        });
+        const origin = claim?.meta?.origin_channel_generation_id ?? claim?.origin_channel_generation_id ?? null;
+        if (typeof origin === "string" && origin && resolveMappingOutboundGeneration(bound.mapping, origin).ok) turnOrigin = origin;
+      }
+    }
     // Dialogue 的现场投递没有后台 watcher；精确目标会话的 Stop 就是该回合的终局观察点。
     // 只结束 active_turn.runtime_target_id 与本会话严格相同的回合，其他会话的 Stop 不得碰它。
     if (!ownedByBridge && speakingSession && bound.ok) {
@@ -163,6 +178,8 @@ async function main() {
       const activeTurn = interaction.ok ? interaction.state.dialogue?.active_turn : null;
       if (interaction.ok && interaction.state.policy_id === DIALOGUE_POLICY_ID &&
           activeTurn?.runtime_target_id === speakingSession) {
+        // 这一回合是飞书来的：回复发回该回合受理时冻结的 origin（老话题的指令回老话题）。
+        if (activeTurn.origin_channel_generation_id) turnOrigin = activeTurn.origin_channel_generation_id;
         const finalized = finalizeClaudeDialogueTurn({
           root: project.root,
           claudeSessionId: boundSession,
@@ -199,7 +216,7 @@ async function main() {
           : undefined,
         inputText: input.ok ? input.text : undefined,
         inputOrigin: input.ok ? input.inputOrigin : undefined,
-        targetGenerationId: bound.ok ? bound.mapping?.channel_generation_id : undefined,
+        targetGenerationId: bound.ok ? (turnOrigin ?? bound.mapping?.channel_generation_id) : undefined,
         runId: input.ok ? input.captureId : undefined,
       });
       // 成功后保留本轮单文件缓存，直到下一次 UserPromptSubmit 原子覆写。这样 Stop hook

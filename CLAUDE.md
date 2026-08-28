@@ -76,18 +76,11 @@ herdr agent read <pane> --source recent-unwrapped --lines 60
 
 安装那条我踩过：本想装进临时 HOME 做验证，命令里先写了真 HOME 那条，
 把一个还没评审的分支装上了线。**跑 `--apply` 前先看一眼 HOME 是哪个。**
-另外发布锁协议 2026-08-28 换过一次（symlink），**新旧 runtime 不能并行持锁**。
-发布入口不止兜底定时器：Claude Stop 钩子（stop-hook.mjs → drainProject）、Codex Stop 钩子、
-Codex watcher（watch-run.mjs）、以及**新入站会当场起 watcher**（inbound.mjs）。现在没有一个能
-挡住所有新发布入口的维护门（那是另一个 goal），所以安装规程只能把窗口压小、并如实承认残余：
-
-1. `launchctl bootout gui/$(id -u)/com.frank.feishu-bridge-cc.drain`（先阻止定时器再启动）
-2. 选没有会话在收尾、Frank 没在飞书发指令的时刻；本机其他 Claude / Codex 会话不要在这几分钟内结束回合
-3. `pgrep -fl 'drain-outbox|drain-all|watch-and-publish|watch-run|stop-hook'` 直到为空
-4. 按 `install-inbound` → `codex/install` → `install-outbound` 的顺序跑 `--apply`
-   （只有最后那个会 bootstrap 回定时器，放最后）
-5. 残余风险：步骤 3 之后仍可能有旧 runtime 的 Stop 钩子 / watcher 起来并持锁；症状是
-   `reap_residue` / 双发。装完看一眼 `doctor.mjs` 与两条链的锁路径。
+另外发布锁协议 2026-08-28 已切到 symlink（#79，线上 a4de736f）—— **新旧协议不能并行持锁**。
+这次切换已经过去，之后不改锁协议的安装照旧。**再改锁协议之前必须先有维护门**：能作用于启动源
+（停定时器、暂停 Aily 入站、临时阻止 Claude / Codex hooks 起旧 runtime、等既有进程退出、装、恢复）。
+人工"看一眼没进程在跑"不算门禁 —— 共用锁的调用面不止发布器，pgrep 之后也挡不住旧进程再起。
+维护门的需求记在 GitHub issue「维护门」里，未实现。
 
 ### push / 开 PR / 合并 main 已放开，由 Codex 放行把关
 

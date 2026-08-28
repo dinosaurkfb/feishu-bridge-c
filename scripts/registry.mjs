@@ -419,35 +419,77 @@ export function clearStaleReapLock(lockDir, {
 } = {}) {
   const reapDir = lockDir + ".reap";
   const maintDir = lockDir + ".maint";
+  const quarantinePrefix = path.basename(reapDir) + ".quarantine-";
+  // 盘点：只有 ENOENT 才是"没有"；别的 lstat 错误是 I/O 故障，要按阶段报出来（评审探针：EACCES 曾被说成 present:false）。
   const inspect = () => {
     let st;
-    try { st = fs.lstatSync(reapDir); } catch { return { present: false }; }
+    try { st = fs.lstatSync(reapDir); }
+    catch (err) {
+      if (err.code === "ENOENT") return { present: false };
+      return { present: false, ioError: { phase: "inspect", error: err.message } };
+    }
     const r = readLockOwner(reapDir);
     const ageMs = Date.now() - st.mtimeMs;
     const recognized = st.isSymbolicLink() && r.owner !== null;
     return { present: true, recognized, owner: r.owner, ageMs, stale: ageMs > staleMs };
   };
+  // 隔离路径的残留（上次隔离成功、unlink 失败）：同一入口要能看见、能清。它们已经离开原路径，
+  // 不涉及归属，但仍只清形状合法且已陈旧的 symlink。
+  const inventoryQuarantine = () => {
+    let names = [];
+    try { names = fs.readdirSync(path.dirname(reapDir)).filter((n) => n.startsWith(quarantinePrefix)); }
+    catch (err) { return { ioError: { phase: "inventory", error: err.message }, entries: [] }; }
+    const entries = [];
+    for (const n of names) {
+      const full = path.join(path.dirname(reapDir), n);
+      let st;
+      try { st = fs.lstatSync(full); } catch { continue; }
+      const r = readLockOwner(full);
+      entries.push({ path: full, recognized: st.isSymbolicLink() && r.owner !== null, ageMs: Date.now() - st.mtimeMs, removed: false });
+    }
+    return { entries };
+  };
   const seen = inspect();
-  if (!seen.present) return { present: false, stale: false, removed: false, reapDir };
-  const base = { present: true, stale: seen.stale, ageMs: seen.ageMs, owner: seen.owner, removed: false, reapDir, maintDir };
-  if (!seen.recognized) return { ...base, reason: "unrecognized_artifact" };
-  if (!seen.stale || !apply) return base;
+  if (seen.ioError) return { present: false, stale: false, removed: false, reapDir, maintDir, reason: "io_error", ...seen.ioError };
+  const inv = inventoryQuarantine();
+  const base = { present: seen.present, stale: seen.stale ?? false, ageMs: seen.ageMs, owner: seen.owner ?? null, removed: false, reapDir, maintDir, quarantine: inv.entries };
+  if (inv.ioError) return { ...base, reason: "io_error", ...inv.ioError };
+  if (seen.present && !seen.recognized) return { ...base, reason: "unrecognized_artifact" };
+  const quarantineWork = inv.entries.some((e) => e.recognized && e.ageMs > staleMs);
+  if (!apply) return base;
+  if (!seen.present && !quarantineWork) return base;
+  if (seen.present && !seen.stale && !quarantineWork) return base;
 
   const token = crypto.randomUUID();
   const maint = tryLink(maintDir, JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token }));
-  if (!maint.ok) return { ...base, reason: maint.reason === "publisher_busy" ? "maintenance_busy" : "io_error", error: maint.error };
+  if (!maint.ok) return { ...base, reason: maint.reason === "publisher_busy" ? "maintenance_busy" : "io_error", phase: "maintenance_lock", error: maint.error };
   try {
     if (typeof duringMaintenance === "function") duringMaintenance();
+    // 先清隔离残留（它们不在原路径上，谁也不会再碰）
+    for (const e of base.quarantine) {
+      if (!(e.recognized && e.ageMs > staleMs)) continue;
+      try { fs.unlinkSync(e.path); e.removed = true; }
+      catch (err) { if (err.code !== "ENOENT") e.error = err.message; else e.removed = true; }
+    }
+    if (!seen.present || !seen.stale) return base;
     const again = inspect();
+    if (again.ioError) return { ...base, reason: "io_error", ...again.ioError };
     if (!again.present) return { ...base, reason: "already_cleared" };
     if (!again.recognized) return { ...base, reason: "unrecognized_artifact" };
     if (!again.stale || JSON.stringify(again.owner) !== JSON.stringify(seen.owner)) return { ...base, reason: "instance_changed" };
     const quarantine = reapDir + ".quarantine-" + token;
     try { fs.renameSync(reapDir, quarantine); }
-    catch { return { ...base, reason: "already_cleared" }; }
+    catch (err) {
+      if (err.code === "ENOENT") return { ...base, reason: "already_cleared" };
+      return { ...base, reason: "io_error", phase: "quarantine", error: err.message };
+    }
     if (typeof afterQuarantine === "function") afterQuarantine();
-    fs.unlinkSync(quarantine);
-    return { ...base, removed: true, quarantine };
+    try { fs.unlinkSync(quarantine); }
+    catch (err) {
+      // 隔离成功、删不掉：原路径已经空了（热路径不再卡），残留在隔离路径上，下次同一入口的盘点会看到它。
+      return { ...base, reason: "quarantine_unremoved", quarantinePath: quarantine, error: err.message };
+    }
+    return { ...base, removed: true, quarantinePath: quarantine };
   } finally {
     const cur = readLockOwner(maintDir);
     if (cur.present && cur.owner && cur.owner.token === token) fs.rmSync(maintDir, { recursive: true, force: true });

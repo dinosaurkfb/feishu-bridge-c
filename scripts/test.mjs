@@ -3573,6 +3573,92 @@ test("维护入口自身也是归属转换：维护锁串行、只清形状合�
   fs.rmSync(reapDir, { force: true });
 });
 
+test("维护入口的异常闭合：盘点 / 隔离的 I/O 错误按阶段报出、残骸不动；隔离后删不掉 → quarantine_unremoved，下次盘点能看见并清", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-maint-io-"));
+  const lockDir = path.join(local, "registry.lock");
+  const reapDir = lockDir + ".reap";
+  const old = (Date.now() - 120_000) / 1000;
+  const staleReap = () => { fs.rmSync(reapDir, { recursive: true, force: true });
+    fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), reapDir);
+    fs.lutimesSync(reapDir, old, old); };
+  const failOn = (name, target, code) => {
+    const orig = fs[name];
+    fs[name] = function (p, ...rest) {
+      if (path.resolve(String(p)) === path.resolve(target) || (target === "*" && String(p).includes(".quarantine-"))) {
+        throw Object.assign(new Error(code + ": injected"), { code });
+      }
+      return orig.call(fs, p, ...rest);
+    };
+    return () => { fs[name] = orig; };
+  };
+  // 1. 盘点 lstat 报 EACCES：不是"没有"，是 io_error（阶段 inspect），残骸不动
+  staleReap();
+  let restore = failOn("lstatSync", reapDir, "EACCES");
+  let r;
+  try { r = clearStaleReapLock(lockDir, { apply: true }); } finally { restore(); }
+  assert.deepEqual([r.removed, r.reason, r.phase], [false, "io_error", "inspect"], JSON.stringify(r));
+  assert.match(String(r.error), /EACCES/u);
+  assert.equal(JSON.parse(fs.readlinkSync(reapDir)).token, "crashed");
+  // 2. rename 报 EIO：io_error（阶段 quarantine），残骸不动、维护锁放掉
+  restore = failOn("renameSync", reapDir, "EIO");
+  try { r = clearStaleReapLock(lockDir, { apply: true }); } finally { restore(); }
+  assert.deepEqual([r.removed, r.reason, r.phase], [false, "io_error", "quarantine"], JSON.stringify(r));
+  assert.equal(JSON.parse(fs.readlinkSync(reapDir)).token, "crashed");
+  assert.throws(() => fs.lstatSync(lockDir + ".maint"), "维护锁要放");
+  // 3. 隔离成功、unlink 报 EIO：受控的 quarantine_unremoved，原路径已空，隔离路径可见
+  restore = failOn("unlinkSync", "*", "EIO");
+  try { r = clearStaleReapLock(lockDir, { apply: true }); } finally { restore(); }
+  assert.deepEqual([r.removed, r.reason], [false, "quarantine_unremoved"], JSON.stringify(r));
+  assert.ok(r.quarantinePath && fs.lstatSync(r.quarantinePath).isSymbolicLink(), "隔离路径要给出来且东西还在");
+  assert.throws(() => fs.lstatSync(reapDir), "原路径已空，热路径不再卡");
+  assert.throws(() => fs.lstatSync(lockDir + ".maint"));
+  // 4. 下次盘点（不 apply）能看见隔离残留；apply 清掉；清完再盘点干净
+  const seen = clearStaleReapLock(lockDir);
+  assert.deepEqual([seen.present, seen.quarantine.length, seen.quarantine[0].removed], [false, 1, false], JSON.stringify(seen));
+  assert.equal(seen.quarantine[0].path, r.quarantinePath);
+  const cleared = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([cleared.present, cleared.quarantine.length, cleared.quarantine[0].removed], [false, 1, true], JSON.stringify(cleared));
+  assert.throws(() => fs.lstatSync(r.quarantinePath));
+  assert.deepEqual(clearStaleReapLock(lockDir).quarantine, []);
+  // 5. 隔离路径上不认识的东西：列出来、不动
+  const junk = reapDir + ".quarantine-junk";
+  fs.mkdirSync(junk); fs.writeFileSync(path.join(junk, "sentinel"), "keep"); fs.utimesSync(junk, old, old);
+  const junkSeen = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([junkSeen.quarantine.length, junkSeen.quarantine[0].recognized, junkSeen.quarantine[0].removed], [1, false, false]);
+  assert.equal(fs.readFileSync(path.join(junk, "sentinel"), "utf-8"), "keep");
+});
+
+test("repair-publish-lock 退出码：只有确实没有 / 已清 / 预览是 0，--apply 没做完一律非零", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-repair-exit-"));
+  const lockDir = path.join(local, "registry.lock");
+  const reapDir = lockDir + ".reap";
+  const cli = (...args) => spawnSync(process.execPath, [path.resolve("scripts", "repair-publish-lock.mjs"), ...args], { encoding: "utf-8" });
+  const old = (Date.now() - 120_000) / 1000;
+  assert.equal(cli("--lock", lockDir).status, 0, "没有残骸 → 0");
+  assert.equal(cli("--lock", lockDir, "--apply").status, 0);
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), reapDir);
+  assert.equal(cli("--lock", lockDir, "--apply").status, 1, "还新、apply 没做 → 非零");
+  fs.lutimesSync(reapDir, old, old);
+  assert.equal(cli("--lock", lockDir).status, 0, "预览 → 0");
+  fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "other" }), lockDir + ".maint");
+  const busy = cli("--lock", lockDir, "--apply");
+  assert.deepEqual([busy.status, /另一个维护者/u.test(busy.stdout)], [1, true]);
+  fs.rmSync(lockDir + ".maint", { force: true });
+  assert.equal(cli("--lock", lockDir, "--apply").status, 0, "清掉 → 0");
+  fs.mkdirSync(reapDir); fs.utimesSync(reapDir, old, old);
+  const unrec = cli("--lock", lockDir, "--apply");
+  assert.deepEqual([unrec.status, /不是本协议的残骸/u.test(unrec.stdout)], [1, true]);
+  fs.rmSync(reapDir, { recursive: true, force: true });
+  const junk = reapDir + ".quarantine-junk";
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "left" }), junk);
+  fs.lutimesSync(junk, old, old);
+  const leftover = cli("--lock", lockDir);
+  assert.deepEqual([leftover.status, /隔离残留可清/u.test(leftover.stdout)], [0, true], leftover.stdout);
+  const cleaned = cli("--lock", lockDir, "--apply");
+  assert.deepEqual([cleaned.status, /已清隔离残留/u.test(cleaned.stdout)], [0, true], cleaned.stdout);
+  assert.throws(() => fs.lstatSync(junk));
+});
+
 test("两个真实 OS 进程同时清同一个 reap 残骸：最多一个 removed，之后出现的新实例不许被删", () => {
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-maint-race-"));
   const worker = path.join(local, "worker.mjs");

@@ -65,7 +65,7 @@ function main() {
     console.error("  task " + (e.key ?? "?") + " 失败：" + e.reason +
       (e.error ? "（" + e.error + "）" : ""));
   }
-  // 待认领话题快过期时提醒一次（判据与文案共用 topic-generation / claim-reminder）。
+  // 待认领话题无人认领的周期提醒（不过期；72 小时一次、之后每 7 天一次；判据与文案共用 topic-generation / claim-reminder）。
   const reminded = remindCodexPendingClaims();
   const said = describeReminderSweep(reminded, { chain: "Codex" });
   if (said) (reminded.ok && reminded.problems.length === 0 ? console.log : console.error)(said);

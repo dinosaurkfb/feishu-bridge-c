@@ -721,7 +721,7 @@ if (isDirectRun(import.meta.url)) {
       if (line.error) hadError = true;
     }
   }
-  // 30 分钟兜底顺带做的事：待认领话题快过期时提醒一次（只在 --all 这条路径上；判据在 topic-generation）。
+  // 30 分钟兜底顺带做的事：待认领话题无人认领的周期提醒（不过期；72 小时一次、之后每 7 天一次；只在 --all 这条路径上；判据在 topic-generation）。
   if (process.argv.includes("--all")) {
     const { remindClaudePendingClaims, describeReminderSweep } = await import("./claim-reminder.mjs");
     const reminded = remindClaudePendingClaims({ dryRun });

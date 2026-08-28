@@ -1,5 +1,5 @@
 /**
- * Codex 侧的待认领快过期提醒 —— 判据、流程（预留 → 发 → 记）与文案共用 claim-reminder.mjs / topic-generation.mjs，
+ * Codex 侧的待认领无人认领提醒（不过期；等满 72 小时一次、之后每 7 天一次）—— 判据、流程（预留 → 发 → 记）与文案共用 claim-reminder.mjs / topic-generation.mjs，
  * 这里只负责按 task 登记表枚举、用 Codex 模板身份发、在 task 状态里预留与记。
  */
 

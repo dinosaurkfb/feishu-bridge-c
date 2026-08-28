@@ -296,7 +296,8 @@ export function shadowClaudeFirstClaim({
  * 还不知道是哪个项目时能守住的闸，一个不少。
  *
  * 三道都来自机器级配置，所以在绑定之前就能判：发送者是不是 Frank、有没有真实 @
- * 运输 agent、消息新不新。加上「全机只有一份待绑定 + 窗口没过」，fail-closed 成立。
+ * 运输 agent、消息新不新。认领哪一份待绑定靠绑定码精确匹配（只有一份时直接命中）；
+ * 待绑定不过期（2026-08-28 起），只有旧登记写了显式截止的才会过期。fail-closed 成立。
  */
 export function evaluatePromotion({ event, template, pending, now = Date.now() }) {
   const reject = (reason, extra = {}) => ({

@@ -8772,6 +8772,15 @@ test("Codex 待认领快过期提醒：进窗口只在待认领话题下发一�
   const pausedSweep = remindCodexPendingClaims({ home: fx5.home, now, publish });
   assert.deepEqual([pausedSweep.reminded, pausedSweep.skipped, calls.length],
     [[], [{ name: "A", reason: "binding_not_active" }], 3]);
+
+  // 模板缺席：算这个 task 的问题、不烧尝试、不终止扫描；dry-run 根本不碰模板
+  const fx6 = codexReminderFixture();
+  fs.rmSync(path.join(fx6.home, "chain-config.json"));
+  const noTpl = remindCodexPendingClaims({ home: fx6.home, now, publish });
+  assert.deepEqual([noTpl.reminded, noTpl.problems.map((p) => [p.name, p.reason]), calls.length], [[], [["A", "template_unavailable"]], 3]);
+  assert.equal(fx6.pendingNow(now).claim_reminder_attempts, undefined, "身份解析失败不烧尝试");
+  const dryNoTpl = remindCodexPendingClaims({ home: fx6.home, now, publish, dryRun: true });
+  assert.deepEqual([dryNoTpl.problems, dryNoTpl.reminded.length], [[], 1]);
 });
 
 test("Codex 兜底真入口 drain-all 跑待认领提醒；发不出去要报 publish_failed、退出 1、不记", () => {

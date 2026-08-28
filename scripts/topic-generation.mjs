@@ -246,14 +246,17 @@ export function validateTopicGenerationState(state) {
       if (generation.session_id !== null) problems.push("generations.pending_shape");
       // 提醒记录：不在场 / null 都行；在场就必须是**规范**时间（评审探针：Date.parse 放过了
       // "…T00:00:00Z" 这种非规范写法）—— 它们决定"还要不要再提醒"。
-      for (const field of ["claim_reminder_at", "claim_reminder_attempted_at"]) {
-        if (generation[field] !== undefined && generation[field] !== null && !isCanonicalIso(generation[field])) {
-          problems.push("generations." + field);
-        }
+      if (generation.claim_reminder_at !== undefined && generation.claim_reminder_at !== null &&
+          !isCanonicalIso(generation.claim_reminder_at)) {
+        problems.push("generations.claim_reminder_at");
       }
-      if (generation.claim_reminder_attempts !== undefined && generation.claim_reminder_attempts !== null &&
-          !(Number.isSafeInteger(generation.claim_reminder_attempts) && generation.claim_reminder_attempts >= 0)) {
-        problems.push("generations.claim_reminder_attempts");
+      // 尝试状态是**封闭形状**：要么两个字段都不在场，要么 attempts 是正整数且 attempted_at 是规范时间。
+      // 只带 attempts 不带时间会绕过 25 分钟间隔，只带时间不带次数会破坏三次上界（评审探针）。
+      const attempts = generation.claim_reminder_attempts ?? null;
+      const attemptedAt = generation.claim_reminder_attempted_at ?? null;
+      if (attempts !== null || attemptedAt !== null) {
+        if (!(Number.isSafeInteger(attempts) && attempts >= 1)) problems.push("generations.claim_reminder_attempts");
+        if (!isCanonicalIso(attemptedAt)) problems.push("generations.claim_reminder_attempted_at");
       }
     }
   }

@@ -231,19 +231,28 @@ export function attributeSession({ projects, cwd, transcriptPath }) {
  * 和 claim 一样用 mkdir 拿原子性；陈旧回收靠 pid 存活 + 墙钟上限，
  * 发布者崩在锁里不能把出站永久堵死。
  */
+// 锁目录在、owner 还读不出来：要么另一进程正处在"目录出现 → owner 落地"之间（旧版两步写法），
+// 要么上次崩在那里。用目录自身的年龄区分：几秒内的当活锁看，超过宽限才算陈旧。
+// 评审双进程探针：原来一律当陈旧删掉，两个扫描器各拿到一次尝试、各发了一条提醒。
+const OWNERLESS_LOCK_GRACE_MS = 10 * 1000;
+
 export function acquirePublishLock(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now() } = {}) {
+  const owner = JSON.stringify({ pid: process.pid, at: new Date(now).toISOString() }, null, 2) + "\n";
   const attempt = () => {
+    let staging = null;
     try {
       fs.mkdirSync(path.dirname(lockDir), { recursive: true, mode: 0o700 });
-      fs.mkdirSync(lockDir, { recursive: false, mode: 0o700 });
-      fs.writeFileSync(
-        path.join(lockDir, "owner.json"),
-        JSON.stringify({ pid: process.pid, at: new Date(now).toISOString() }, null, 2) + "\n",
-        { mode: 0o600 },
-      );
+      if (fs.existsSync(lockDir)) return { ok: false, reason: "publisher_busy" };
+      // **先在旁边把 owner 写好，再一次 rename 进位** —— 锁目录出现的那一刻就带着 owner，
+      // 别的进程看不到"有目录没 owner"的中间态。rename 到已存在的非空目录会失败（ENOTEMPTY/EEXIST），
+      // 那就是别人刚抢到。
+      staging = fs.mkdtempSync(lockDir + ".staging-");
+      fs.writeFileSync(path.join(staging, "owner.json"), owner, { mode: 0o600 });
+      fs.renameSync(staging, lockDir);
       return { ok: true };
     } catch (err) {
-      if (err.code === "EEXIST") return { ok: false, reason: "publisher_busy" };
+      if (staging) fs.rmSync(staging, { recursive: true, force: true });
+      if (["EEXIST", "ENOTEMPTY", "EISDIR", "EPERM"].includes(err.code)) return { ok: false, reason: "publisher_busy" };
       return { ok: false, reason: "io_error", error: err.message };
     }
   };
@@ -263,7 +272,13 @@ export function isPublishLockStale(lockDir, { staleMs = 5 * 60 * 1000, now = Dat
   try {
     owner = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf-8"));
   } catch {
-    return true; // 锁在但 owner 不可读 —— 上次崩在两步之间
+    // owner 不可读：看目录年龄（用真实时钟 —— 目录的 mtime 是真实时钟写的）。
+    try {
+      const age = Date.now() - fs.statSync(lockDir).mtimeMs;
+      return age > OWNERLESS_LOCK_GRACE_MS;
+    } catch {
+      return true; // 目录也没了：不算被占
+    }
   }
 
   const at = Date.parse(owner.at ?? "");
@@ -280,6 +295,18 @@ export function isPublishLockStale(lockDir, { staleMs = 5 * 60 * 1000, now = Dat
   return true;
 }
 
+/**
+ * 释放前核对所有权：我的锁可能已被别人按陈旧回收并重新拿走 —— 那时这里删掉的是**别人的活锁**，
+ * 第三方就又能进来（评审："锁释放也需要核对所有权"）。owner 是别的活进程就不删。
+ */
 export function releasePublishLock(lockDir) {
+  let owner = null;
+  try { owner = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf-8")); } catch { owner = null; }
+  if (owner && Number.isFinite(owner.pid) && owner.pid !== process.pid) {
+    let alive = true;
+    try { process.kill(owner.pid, 0); } catch { alive = false; }
+    if (alive) return { ok: false, reason: "not_owner", pid: owner.pid };
+  }
   fs.rmSync(lockDir, { recursive: true, force: true });
+  return { ok: true };
 }

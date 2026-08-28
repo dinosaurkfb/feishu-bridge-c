@@ -5,7 +5,7 @@
  * 这里在截止前 TOPIC_GENERATION_CLAIM_REMINDER_LEAD_MS 内、且还没人认领时，**在那个待认领话题下**
  * 回复一条提醒。
  *
- * 语义是**至少一次、有上界**，不是"严格一次"（飞书侧没有幂等依据）：
+ * 语义是**最多三次尝试、结果不明时允许重复**，不是"严格一次"（飞书侧没有幂等依据）：
  *   1. 锁外用 claimReminderDue 预筛；
  *   2. 锁内 reserveClaimReminderAttempt 预留这次尝试（attempts+1、attempted_at 持久化）——
  *      并发的第二个扫描器拿到 retry_too_soon，不会再发；
@@ -34,12 +34,20 @@ export function composeClaimReminderText({ name, generation, remainingMs, deadli
     "认领方式：在这条消息下面 @ 一下运输 agent（空消息也行），绑定就完成了。",
     "过期后这个话题作废，需要重新轮转（/feishu-rotate 或 $feishu-rotate）才有新话题。",
     "",
-    "这条提醒不会反复发。",
+    "发送失败时最多重试 3 次；正常情况下你只会收到这一条。",
   ].join("\n");
 }
 
+/** 预留阶段这些原因是**受控的**"这轮不发"：状态在锁内变了、别人正拿着锁。其余（登记表 / 状态 / 写盘错误）都是问题。 */
+const RESERVE_SKIP_REASONS = new Set([
+  "retry_too_soon", "already_reminded", "not_yet", "expired", "no_pending", "binding_not_active", "no_deadline",
+  "pending_generation_mismatch", "binding_busy", "registry_busy",
+]);
+
 /**
- * 一个待认领代际的完整提醒流程：预留 → 发 → 记。两条链共用；差异（怎么预留、怎么记、用谁的身份）由参数注入。
+ * 一个待认领代际的完整提醒流程：判据 → 身份 → 预留 → 发 → 记。两条链共用；
+ * 差异（怎么预留、怎么记、用谁的身份）由参数注入。identity 是**惰性函数**：只在确认要发之后才解析，
+ * 解析抛错算这个代际的问题，不许打断整轮扫描（评审探针：项目侧旧配置能让 path.join 抛 TypeError）。
  * @returns {{outcome:"reminded"|"skipped"|"problem", entry:object}}
  */
 export function remindOnePendingClaim({ name, state, now, dryRun, reserve, publish, mark, identity }) {
@@ -52,17 +60,27 @@ export function remindOnePendingClaim({ name, state, now, dryRun, reserve, publi
   }
   const g = due.generation;
   if (dryRun) return { outcome: "reminded", entry: { name, generation: g.generation, dryRun: true } };
+  let who;
+  try { who = typeof identity === "function" ? identity() : identity; }
+  catch (err) {
+    return { outcome: "problem", entry: { name, reason: err?.reason ?? "identity_unresolvable", error: String(err?.message ?? err).slice(0, 160) } };
+  }
+  if (!who) return { outcome: "problem", entry: { name, reason: "config_unavailable" } };
   const reserved = reserve(g.channel_generation_id);
   if (!reserved.ok) {
-    // 锁内重算没通过：多半是另一个扫描器刚拿走了这次尝试（retry_too_soon）；别的原因也一样只是跳过。
-    return { outcome: "skipped", entry: { name, reason: reserved.reason } };
+    if (reserved.reason === "attempts_exhausted") {
+      return { outcome: "problem", entry: { name, reason: "reminder_abandoned", error: "发送失败 " + reserved.attempts + " 次，已放弃" } };
+    }
+    if (RESERVE_SKIP_REASONS.has(reserved.reason)) return { outcome: "skipped", entry: { name, reason: reserved.reason } };
+    return { outcome: "problem", entry: { name, reason: "reserve_failed",
+      error: String(reserved.reason) + (reserved.error ? "：" + String(reserved.error).slice(0, 120) : "") } };
   }
   const text = composeClaimReminderText({
     name, generation: g.generation, remainingMs: reserved.remainingMs ?? due.remainingMs, deadlineIso: g.claim_expires_at,
   });
   try {
-    publish({ profile: identity.profile, rootMessageId: g.root_message_id, text,
-      larkBin: identity.bin, larkHome: identity.configDir, expectedAppId: identity.expectedAppId });
+    publish({ profile: who.profile, rootMessageId: g.root_message_id, text,
+      larkBin: who.bin, larkHome: who.configDir, expectedAppId: who.expectedAppId });
   } catch (err) {
     return { outcome: "problem", entry: { name, reason: "publish_failed",
       error: "第 " + reserved.attempt + "/" + TOPIC_GENERATION_CLAIM_REMINDER_MAX_ATTEMPTS + " 次：" + String(err?.message ?? err).slice(0, 200) } };
@@ -97,16 +115,18 @@ export function remindClaudePendingClaims({
       if (binding.reason !== "topic_generation_unavailable") out.problems.push({ name, reason: binding.reason });
       continue;
     }
-    if (!binding.config && !out.dryRun && claimReminderDue(binding.state, { now }).due) {
-      out.problems.push({ name, reason: "config_unavailable" });
-      continue;
+    let r;
+    try {
+      r = remindOnePendingClaim({
+        name: binding.config?.task_display_name ?? name, state: binding.state, now, dryRun: out.dryRun,
+        identity: () => (binding.config ? resolveLarkIdentity(binding.config) : null), publish,
+        reserve: (generationId) => reserveClaudeClaimReminder({ root, claudeSessionId, generationId, registryFile, templateFile, now }),
+        mark: (generationId) => markClaudeClaimReminder({ root, claudeSessionId, generationId, registryFile, templateFile, now }),
+      });
+    } catch (err) {
+      // 逐项目的错误边界：一个项目炸了不许终止后面项目的扫描。
+      r = { outcome: "problem", entry: { name, reason: "project_scan_failed", error: String(err?.message ?? err).slice(0, 160) } };
     }
-    const r = remindOnePendingClaim({
-      name: binding.config?.task_display_name ?? name, state: binding.state, now, dryRun: out.dryRun,
-      identity: binding.config ? resolveLarkIdentity(binding.config) : null, publish,
-      reserve: (generationId) => reserveClaudeClaimReminder({ root, claudeSessionId, generationId, registryFile, templateFile, now }),
-      mark: (generationId) => markClaudeClaimReminder({ root, claudeSessionId, generationId, registryFile, templateFile, now }),
-    });
     if (r.outcome === "reminded") {
       out.reminded.push(r.entry);
       if (r.entry.recorded === false) out.problems.push({ name: r.entry.name, reason: "reminder_unrecorded", error: r.entry.error });

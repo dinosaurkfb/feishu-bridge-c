@@ -6,7 +6,6 @@
 import { publishDraft } from "../outbound.mjs";
 import { resolveLarkIdentity } from "../chain-template.mjs";
 import { remindOnePendingClaim } from "../claim-reminder.mjs";
-import { claimReminderDue } from "../topic-generation.mjs";
 import {
   bridgeHome, loadCodexTemplate, loadRegistry, markTaskClaimReminder, registryFile, reserveTaskClaimReminder,
   templateFile as codexTemplateFile, topicStateForTask,
@@ -18,22 +17,29 @@ export function remindCodexPendingClaims({
   const reg = loadRegistry(registryFile(home));
   if (!reg.ok) return { ok: false, reason: reg.reason ?? "registry_unreadable", reminded: [], skipped: [], problems: [], dryRun };
   const out = { ok: true, reminded: [], skipped: [], problems: [], dryRun: dryRun === true };
+  // 身份惰性解析、只解析一次；模板必须跟 home 同源 —— 传了 home 却读默认模板，测试里就是真机凭据（实测抓到过）。
   let identity = null;
+  const resolveIdentity = () => {
+    if (identity !== null) return identity;
+    const tpl = loadCodexTemplate(templateFile ?? codexTemplateFile(home));
+    if (!tpl.ok) throw Object.assign(new Error(String(tpl.reason)), { reason: "template_unavailable" });
+    identity = resolveLarkIdentity(tpl.template);
+    return identity;
+  };
   for (const task of reg.tasks ?? []) {
     const name = String(task?.task_display_name ?? task?.logical_task_key ?? "?");
-    const topic = topicStateForTask(task, { now });
-    if (!topic.ok) { out.problems.push({ name, reason: topic.reason ?? "topic_state_unreadable" }); continue; }
-    if (identity === null && !out.dryRun && claimReminderDue(topic.state, { now }).due) {
-      // 模板必须跟 home 同源 —— 传了 home 却读默认模板，测试里就是真机凭据（实测抓到过）。
-      const tpl = loadCodexTemplate(templateFile ?? codexTemplateFile(home));
-      if (!tpl.ok) { out.problems.push({ name, reason: "template_unavailable", error: tpl.reason }); continue; }
-      identity = resolveLarkIdentity(tpl.template);
+    let r;
+    try {
+      const topic = topicStateForTask(task, { now });
+      if (!topic.ok) { out.problems.push({ name, reason: topic.reason ?? "topic_state_unreadable" }); continue; }
+      r = remindOnePendingClaim({
+        name, state: topic.state, now, dryRun: out.dryRun, identity: resolveIdentity, publish,
+        reserve: (generationId) => reserveTaskClaimReminder({ threadId: task.codex_thread_id, generationId, home, now }),
+        mark: (generationId) => markTaskClaimReminder({ threadId: task.codex_thread_id, generationId, home, now }),
+      });
+    } catch (err) {
+      r = { outcome: "problem", entry: { name, reason: "task_scan_failed", error: String(err?.message ?? err).slice(0, 160) } };
     }
-    const r = remindOnePendingClaim({
-      name, state: topic.state, now, dryRun: out.dryRun, identity, publish,
-      reserve: (generationId) => reserveTaskClaimReminder({ threadId: task.codex_thread_id, generationId, home, now }),
-      mark: (generationId) => markTaskClaimReminder({ threadId: task.codex_thread_id, generationId, home, now }),
-    });
     if (r.outcome === "reminded") {
       out.reminded.push(r.entry);
       if (r.entry.recorded === false) out.problems.push({ name, reason: "reminder_unrecorded", error: r.entry.error });

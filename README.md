@@ -224,7 +224,24 @@ session 绑定。日常还可以使用：
 | unbind | `$feishu-unbind` | `/feishu-unbind` | 可恢复地暂停，不删话题、映射或历史 |
 | bind | `$feishu-bind` | `/feishu-bind` | 首次接入，或恢复已暂停的原话题连接 |
 | rotate | `$feishu-rotate` | `/feishu-rotate` | 为同一 binding 创建下一话题代际；旧话题保留为历史（仍可下指令，回复回原话题） |
+| mode（飞书侧） | 正文恰为 `$feishu-mode dialogue` / `mapping` | 正文恰为 `/feishu-mode dialogue` / `mapping` | 入站路由器当场切换交互模式并回执，不投递给会话（2026-08-28 起） |
 | mode | `$feishu-mode [dialogue\|mapping]` | `/feishu-mode [dialogue\|mapping]` | 无参数只读查看；显式切换当前 binding 的交互策略 |
+
+飞书侧的模式切换是一笔**可恢复的控制事务**：意图随 claim 持久化 → 幂等执行 → 写 `<key>.consumed.json`
+（封闭形状；切换失败则写 `<key>.failed.json`，同样封闭，**不是 run 终态**）。账本盘点会报
+`consumed_unreadable` / `consumed_in_flight` / `consumed_intent_mismatch` / `control_failed_unreadable` / `control_conflict`
+（failed 与 consumed 并存）。同一事件的运输层重放按记录重出回执；飞书重发是新消息，补不了旧账 —— 补账走维护入口
+`node scripts/repair-control-claim.mjs --project <root> --key <key> [--apply]`
+（Codex 侧 `node scripts/codex/repair-control-claim.mjs --thread-id <id> --key <key> [--apply]`）：
+只接受属于当前绑定 / task 的 claim（Claude 侧按 claim 的会话定位选项目级或会话级绑定；身份在写锁内用锁内刚读出的记录重新推导后复核），
+只对 in_flight / 终态损坏 / 失败记录损坏三种态续做；两份终态并存（不论好坏）一律 conflict 交人看；恢复损坏的 failed 前先把它改名隔离成
+`<key>.failed.quarantined.<pid>.<ts>`（账本报 `control_failed_quarantined`，人看完再删）；临时残骸清不掉、或目录枚举不了（说不清）时退出 1，第二次运行也一样。
+每一笔的执行 / 重放 / 维护恢复都在同一把逐 key 事务锁（`<key>.control.lock`，复用 registry.mjs 已上线的 symlink 锁协议：payload 即 owner，释放在 reap 锁里核 token，与陈旧回收串行）里判定与动手，隔离改名也在锁内；
+锁内状态对所有调用者权威（晚到的首次调用者撞见已闭合的记录只重出回执，不再执行）；释放不是自己的实例不删、reap 段忙 / owner 读不出 / 锁已不在都不吞 —— 以 lockUncleared 进入结果（维护入口退出 1，两条链成功与失败回执都写明）；
+运输层重放遇到受验的 failed 按记录重出失败回执、不再执行（要再切就重新发一条）；两份终态并存 → control_conflict，不执行。
+锁原语里的文件操作抛错在 withControlLock 这层兜住：取得阶段 → control_lock_unavailable（回调没跑），释放阶段 → lockUncleared。
+账本按封闭形状分族盘点锁家族：主锁 control_lock_held（不要手删，协议会回收）、reap 段锁 control_reap_lock（残骸交 repair-publish-lock）、
+维护锁 control_maint_lock（人确认后手删）、.reaped-<uuid> / .reap.quarantine-<…> 残骸（可直接删）；别的后缀是 unrecognized_entry。
 
 两边命令同名。差别只在绑定单位：Codex 绑一个精确 task，Claude 默认绑项目、
 也可以用 `bind-session` 让某一条会话单独占一个话题。

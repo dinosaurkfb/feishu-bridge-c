@@ -12,6 +12,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE, CLAIM_STATE } from "./claim.mjs";
+import { CONSUMED_TMP_RE, CONTROL_QUARANTINE_RE, classifyControlLockEntry, inspectControlClaim, readConsumedRecord } from "./control-command.mjs";
 
 import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
 
@@ -225,8 +226,65 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
     catch (err) { if (err.code !== "ENOENT") problems.push({ key: null, reason: "claims_unreadable", why: String(err.code ?? err.message) }); }
     for (const name of names) {
       if (name.startsWith(".")) continue;
+      const residue = CONSUMED_TMP_RE.exec(name);
+      if (residue) {
+        // consumed 的临时制品：受控形状。终态已成则是漏清的残骸，未成则是写到一半 —— 两者都要人看，但不是"不认识"。
+        const seen = inspectControlClaim({ claimsDir, key: residue[1] });
+        problems.push({ key: residue[1], reason: seen.state === "consumed" ? "consumed_residue" : "consumed_in_flight", why: "delivery-claims/" + name.slice(0, 80) });
+        continue;
+      }
+      const lockEntry = classifyControlLockEntry(name);
+      if (lockEntry) {
+        // 逐 key 事务锁家族：先按封闭形状分族，再给各族自己的处置方式（形状不对的不进这里，落到 unrecognized_entry）。
+        const shown = "delivery-claims/" + name;
+        const byFamily = {
+          lock: ["control_lock_held", "事务锁在：" + shown + " —— 正常只存在几毫秒；持有者已死超过 5 分钟会由下一笔按协议回收，不要手删"],
+          reap: ["control_reap_lock", "reap 段锁在：" + shown + " —— 段内只有几毫秒；残骸交显式维护入口 node scripts/repair-publish-lock.mjs --lock <主锁路径>"],
+          maint: ["control_maint_lock", "维护锁在：" + shown + " —— 只能由人确认没有维护者在跑后手动删"],
+          reaped: ["control_lock_reaped_residue", "回收时 rename 走但没删成的残骸：" + shown + " —— 可直接删"],
+          quarantine: ["control_reap_quarantine_residue", "维护入口隔离后没删成的残骸：" + shown + " —— 可直接删"],
+        }[lockEntry.family];
+        problems.push({ key: lockEntry.key, reason: byFamily[0], why: byFamily[1] });
+        continue;
+      }
+      const quarantine = CONTROL_QUARANTINE_RE.exec(name);
+      if (quarantine) {
+        // 维护入口隔离的损坏 failed 制品：不参与状态判定，但必须能盘点到，人看完再删。
+        problems.push({ key: quarantine[1], reason: "control_failed_quarantined", why: "隔离的损坏 failed 制品，人工查看后删除：delivery-claims/" + name.slice(0, 80) });
+        continue;
+      }
       const m = CLAIM_ENTRY_RE.exec(name);
-      if (!m) { problems.push({ key: null, reason: "unrecognized_entry", why: "delivery-claims/" + name.slice(0, 80) }); continue; }
+      // 名字要给全到能分清后缀（key 就占 64 位），不然"不认识"的条目说不清是哪一种不认识。
+      if (!m) { problems.push({ key: null, reason: "unrecognized_entry", why: "delivery-claims/" + name.slice(0, 140) }); continue; }
+      if (m[2] === CLAIM_STATE.CONSUMED + ".json") {
+        // consumed 不是 run 终局、不参与孤儿判定，但要**与它的 claim 交叉核对**：内容坏 → consumed_unreadable；
+        // 没有 claim / claim 读不出 → consumed_orphan；claim 无控制意图或意图不一致 → consumed_intent_mismatch。
+        // 先用与核心同一份封闭联合投影：并存（不论好坏）报 control_conflict；然后才是"内容坏"这一层。
+        const seen = inspectControlClaim({ claimsDir, key: m[1] });
+        if (seen.state === "conflict") { problems.push({ key: m[1], reason: "control_conflict", why: name + "：" + seen.why }); continue; }
+        const raw = readConsumedRecord({ claimsDir, key: m[1] });
+        if (raw.status === "unreadable") { problems.push({ key: m[1], reason: "consumed_unreadable", why: name + "：" + raw.why }); continue; }
+        if (seen.state === "consumed") { /* 完整且一致 */ }
+        else if (seen.state === "consumed_unreadable") problems.push({ key: m[1], reason: "consumed_unreadable", why: name + "：" + seen.why });
+        else if (seen.state === "mismatch") problems.push({ key: m[1], reason: "consumed_intent_mismatch", why: name + "：" + seen.why });
+        else if (seen.state.startsWith("claim_") || seen.state === "not_control") problems.push({ key: m[1], reason: "consumed_orphan", why: name + "：" + seen.state });
+        else problems.push({ key: m[1], reason: "consumed_unreadable", why: name + "：" + seen.state });
+        continue;
+      }
+      if (m[2] === "claim") {
+        // 有控制意图、没终态、也没 failed：事务没闭合 —— 报出来并指路维护入口（同一事件的运输层重放或 repair-control-claim 才能补齐）。
+        const seen = inspectControlClaim({ claimsDir, key: m[1] });
+        if (seen.state === "in_flight") problems.push({ key: m[1], reason: "consumed_in_flight", why: "控制命令已执行但终态未记下 —— node scripts/repair-control-claim.mjs" });
+        continue;
+      }
+      if (m[2] === "failed.json") {
+        // 控制命令的 failed 是"当时没切成"的封闭记录，不是 run 终态、不参与孤儿判定；坏了要报；与 consumed 并存要报。
+        const seen = inspectControlClaim({ claimsDir, key: m[1] });
+        if (seen.state === "failed") continue;
+        if (seen.state === "failed_unreadable") { problems.push({ key: m[1], reason: "control_failed_unreadable", why: name + "：" + seen.why }); continue; }
+        if (seen.state === "conflict") continue;   // 并存由 consumed 那个条目报（consumed_unreadable 或 control_conflict），这里不重复
+        if (seen.state !== "not_control" && !seen.state.startsWith("claim_")) continue; // 其他控制态（consumed 等）在别的分支报过
+      }
       if (!TERMINAL_STATE_FILES.has(m[2])) continue;   // claim 目录、笔记、非终局状态记录：不参与孤儿判定
       note(m[1], "terminal");
       // 盘点只验"是不是一条记录"（非数组对象）；授权语义留给 readTerminalRecord。

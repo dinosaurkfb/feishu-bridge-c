@@ -9,6 +9,7 @@
 
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { controlIntentProblem } from "./control-intent.mjs";
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { DIALOGUE_POLICY_ID, DIALOGUE_POLICY_VERSION } from "./interaction-policy.mjs";
 import { MAPPING_POLICY_ID, MAPPING_POLICY_VERSION } from "./mapping-policy.mjs";
@@ -20,6 +21,8 @@ export const CLAIM_STATE = {
   HANDED_OFF: "handed_off",
   REJECTED: "rejected",
   FAILED: "failed",
+  // 控制命令（如 /feishu-mode）在路由侧当场执行完：不是 run 的终局，不需要 run 制品。
+  CONSUMED: "consumed",
 };
 
 /**
@@ -37,10 +40,14 @@ export function claimKey(messageId, logicalTaskKey) {
 
 function writeJsonAtomic(filePath, payload) {
   // 先写临时文件再 rename：rename 在同一文件系统上是原子的，
-  // 读取方永远不会看到半截 JSON。
+  // 读取方永远不会看到半截 JSON。rename 失败就把临时文件收走 —— 留下的残骸会永久污染账本盘点（评审探针）。
   const tmp = filePath + ".tmp." + process.pid + "." + Date.now();
   fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + "\n", { mode: 0o600 });
-  fs.renameSync(tmp, filePath);
+  try { fs.renameSync(tmp, filePath); }
+  catch (err) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* 连清都清不掉：留着，盘点会报 */ }
+    throw err;
+  }
 }
 
 /**
@@ -144,6 +151,9 @@ function claimProblem(claim, key, expect) {
   if (claim.claude_session_id !== undefined && claim.claude_session_id !== null
     && !CLAUDE_SESSION_SHAPE.test(claim.claude_session_id)) return "claude_session_id 不是会话 uuid 的形状";
   if (claim.codex_thread_id !== undefined && !nonEmpty(claim.codex_thread_id)) return "codex_thread_id 形状不对";
+  // 控制意图（如 /feishu-mode）在 claim 里持久化；判据只有 control-intent.mjs 那一份。
+  const intentProblem = controlIntentProblem(claim.control);
+  if (intentProblem !== null) return intentProblem;
   if (expect.logicalTaskKey !== undefined && claim.logical_task_key !== expect.logicalTaskKey) {
     return "logical_task_key 跟这个 task 对不上";
   }

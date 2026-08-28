@@ -1280,11 +1280,15 @@ function mutateTaskInteractionPolicy({
 }
 
 export function setTaskInteractionMode({
-  threadId, mode, budget, home = bridgeHome(), now = Date.now(),
+  threadId, mode, budget, home = bridgeHome(), now = Date.now(), precondition = null,
 } = {}) {
   return mutateTaskInteractionPolicy({
     threadId, home, now,
-    mutate: (state) => setInteractionPolicyMode(state, { mode, budget, now }),
+    // precondition 在写锁内复核，参数是锁内刚读出的 task（维护入口据此重新核对身份，锁外算好的不作数）。
+    mutate: (state, task) => {
+      if (typeof precondition === "function" && precondition(task) !== true) return { ok: false, reason: "precondition_failed" };
+      return setInteractionPolicyMode(state, { mode, budget, now });
+    },
   });
 }
 

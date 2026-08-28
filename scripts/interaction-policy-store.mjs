@@ -83,7 +83,7 @@ function mutateClaudeInteractionPolicy({
       const bindingId = effectiveBindingId(record, { root });
       const loaded = interactionPolicyStateForLegacy(record, { bindingId, now });
       if (!loaded.ok) return loaded;
-      const changed = mutate(loaded.state, record);
+      const changed = mutate(loaded.state, record, { source: "project-files", bindingId, root });
       if (!changed?.ok) return changed;
       if (changed.changed !== false) {
         const materialized = materializeInteractionPolicy(record, changed.state);
@@ -108,7 +108,7 @@ function mutateClaudeInteractionPolicy({
     const bindingId = (entry.id ?? path.basename(root)) + "@registry";
     const loaded = interactionPolicyStateForLegacy(entry, { bindingId, now });
     if (!loaded.ok) return loaded;
-    const changed = mutate(loaded.state, entry);
+    const changed = mutate(loaded.state, entry, { source: "registry", bindingId, root });
     if (!changed?.ok) return changed;
     if (changed.changed !== false) {
       const materialized = materializeInteractionPolicy(entry, changed.state);
@@ -126,11 +126,16 @@ function mutateClaudeInteractionPolicy({
 }
 
 export function setClaudeInteractionMode({
-  root, claudeSessionId, mode, budget, registryFile, now = Date.now(),
+  root, claudeSessionId, mode, budget, registryFile, now = Date.now(), precondition = null,
 } = {}) {
   return mutateClaudeInteractionPolicy({
     root, claudeSessionId, registryFile, now,
-    mutate: (state) => setInteractionPolicyMode(state, { mode, budget, now }),
+    // precondition 在**写锁内**复核，参数是锁内刚读出的那份记录（项目文件 mapping 或登记表条目）——
+    // 维护入口据此重新推导身份再核对 claim，锁外算好的身份不作数，检查与写入之间不留漂移窗口。
+    mutate: (state, record, meta) => {
+      if (typeof precondition === "function" && precondition(record, meta) !== true) return { ok: false, reason: "precondition_failed" };
+      return setInteractionPolicyMode(state, { mode, budget, now });
+    },
   });
 }
 

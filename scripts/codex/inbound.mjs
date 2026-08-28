@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
-import { acquireClaim, recordClaimState } from "../claim.mjs";
+import { acquireClaim, claimKey, readClaimState, recordClaimState } from "../claim.mjs";
 import { fetchTriggerEvent } from "../envelope.mjs";
 import { moduleRoot } from "../direct-run.mjs";
 import {
@@ -31,9 +31,10 @@ import {
   appendConsumed, bridgeHome, buildCodexSubscriptionProjection, closeTaskTopicRotation,
   evaluatePromotion, findPendingTask,
   finalizeTaskDialogueTurn, findTaskForFeishuSession, interactionPolicyForTask,
-  isThreadBusy, loadCodexTemplate, promoteTask, reserveTaskDialogueTurn,
+  isThreadBusy, loadCodexTemplate, promoteTask, reserveTaskDialogueTurn, setTaskInteractionMode,
   shadowCodexFirstClaim, taskPaths,
 } from "./state.mjs";
+import { controlAckText, parseControlCommand, runControlTransaction } from "../control-command.mjs";
 import { isDirectRun } from "../direct-run.mjs";
 import { composeCrashReceipt } from "../crash-receipt.mjs";
 /**
@@ -97,6 +98,7 @@ function ackText(kind, detail) {
     "绑定完成 · " + detail.taskName,
     "这个话题现在精确通向一个 Codex task。之后在这里 @ M5Codex 即可续接。",
   ].join("\n");
+  if (kind === "control") return detail.text;
   if (kind === "rejected") return [
     "已拒绝 · " + detail.reasonText,
     detail.taskName ? "本话题通向：" + detail.taskName + "。" : null,
@@ -304,11 +306,37 @@ if (!mappingContext.ok) {
   finish("error", { detail: "映射策略上下文不完整" }, { reason: mappingContext.reason });
 }
 
+// 控制命令（$feishu-mode dialogue|mapping）：三道闸之后先解析意图、随 claim 持久化；执行与终态在拿到 claim 之后做（可恢复事务）。
+const control = parseControlCommand(verdict.instruction, { chain: "codex" });
+const runControl = (replay) => {
+  const tx = runControlTransaction({
+    claimsDir: paths.claims, key: claim.key, intent: control ? { control: control.kind, mode: control.mode } : undefined, replay,
+    execute: (mode) => setTaskInteractionMode({ threadId: task.codex_thread_id, mode, home: HOME }),
+  });
+  // 锁没干净交还的话，不管事务成败都要说出来：之后同一笔会报 control_busy。
+  const lockNote = tx.lockUncleared ? "；另外这一笔的事务锁没有交还（" + tx.lockUncleared + "），之后同一笔会报 control_busy，请人工确认后处理" : "";
+  const receiptBase = { control: control.kind, mode: control.mode, message_id: verdict.messageId, handed_off: false, lock_uncleared: tx.lockUncleared ?? null };
+  if (!tx.ok) {
+    const fail = (detail, extra = {}) => {
+      writeReceipt("control-" + verdict.messageId, { status: "error", reason: tx.reason, ...receiptBase, claim_acquired: !replay, error: tx.why, ...extra });
+      finish("error", { detail: detail + lockNote }, { reason: tx.reason });
+    };
+    if (tx.reason === "ledger_unwritten") fail("模式已切换，但终态没记下（" + tx.why + "）；重发不会补齐（新消息是新一笔），请用维护入口 repair-control-claim 处理这一笔", { changed: tx.changed });
+    if (tx.reason === "control_failed_recorded") fail("这条控制命令之前执行失败（" + tx.why + "）；本次是同一条消息的重放，没有再次尝试。要再切请重新发一条。", { replayed: true });
+    if (tx.reason === "control_conflict") fail("这一笔的终态自相矛盾（" + tx.why + "），没有执行；请用维护入口 repair-control-claim 处理这一笔");
+    fail("模式没有切换（" + tx.why + "）");
+  }
+  writeReceipt("control-" + verdict.messageId, { status: "consumed", ...receiptBase, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed, claim_acquired: !replay });
+  finish("control", { text: controlAckText({ taskName: task.task_display_name, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed, lockUncleared: tx.lockUncleared ?? null }) },
+    { control: control.kind, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed });
+};
+
 const claim = acquireClaim({
   claimsDir: paths.claims,
   messageId: verdict.messageId,
   logicalTaskKey: task.logical_task_key,
   meta: {
+    ...(control ? { control: { control: control.kind, mode: control.mode } } : {}),
     session_id: event.session_id,
     codex_thread_id: task.codex_thread_id,
     policy_id: policyEvaluation.policy_id,
@@ -318,6 +346,15 @@ const claim = acquireClaim({
     mapping_admission_shadow_match: verdict.admission_shadow?.match ?? null,
   },
 });
+if (!claim.ok && claim.reason === "duplicate" && control) {
+  const original = readClaimState({ claimsDir: paths.claims, key: claim.key });
+  const intent = original.status === "valid" ? original.claim.control : undefined;
+  if (intent && intent.control === control.kind && intent.mode === control.mode) {
+    claim.key = claim.key ?? claimKey(verdict.messageId, verdict.logicalTaskKey);
+    runControl(true);
+  }
+}
+
 if (!claim.ok) {
   const duplicate = claim.reason === "duplicate";
   const policyOutcome = handlePolicy({ claim, resolvedContext: mappingContext });
@@ -338,6 +375,9 @@ if (!claim.ok) {
     taskName: task.task_display_name,
   }, { reason: claim.reason });
 }
+
+// ---------- 控制命令：拿到 claim 之后当场执行（可恢复事务），不投递 ----------
+if (control) runControl(false);
 
 let policyRun = dialogueMode ? null : handlePolicy({ claim, resolvedContext: mappingContext });
 if (!dialogueMode &&

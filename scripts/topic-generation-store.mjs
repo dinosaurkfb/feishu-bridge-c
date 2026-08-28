@@ -11,6 +11,7 @@ import {
   ROTATION_STATUS, closePendingTopicGeneration, failTopicRotation,
   materializeLegacyTopicFields, prepareTopicRotation, registerPendingTopicGeneration,
   recordTopicGenerationActivity, resolveMappingOutboundGeneration, topicGenerationStateForLegacy,
+  markPendingClaimReminder,
 } from "./topic-generation.mjs";
 
 const writeJsonAtomic = (file, value) => {
@@ -24,9 +25,10 @@ export function loadClaudeTopicBinding({
   root,
   claudeSessionId,
   registryFile = registryPath(),
+  templateFile,
   now = Date.now(),
 } = {}) {
-  const resolved = resolveProject({ root, claudeSessionId, registryFile });
+  const resolved = resolveProject({ root, claudeSessionId, registryFile, templateFile });
   if (!resolved.ok) return resolved;
   const state = resolved.mapping?.topic_generation_state;
   if (!state) return { ok: false, reason: "topic_generation_unavailable" };
@@ -198,6 +200,16 @@ export function recordClaudeTopicActivity({
     mutate: (state) => recordTopicGenerationActivity(state, {
       generationId, eventKey, messageDelta, now, retryMs,
     }),
+  });
+}
+
+/** 原子记下"待认领话题已提醒过"。 */
+export function markClaudeClaimReminder({
+  root, claudeSessionId, generationId, registryFile, now = Date.now(),
+} = {}) {
+  return mutateClaudeTopicBinding({
+    root, claudeSessionId, registryFile, now,
+    mutate: (state) => markPendingClaimReminder(state, { generationId, now }),
   });
 }
 

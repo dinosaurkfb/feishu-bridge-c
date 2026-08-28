@@ -10,7 +10,9 @@
  * 在这里替它填一个默认值，就是让状态页声称一件没查过的事。
  */
 
-import { activeGeneration, pendingGeneration } from "../topic-generation.mjs";
+import { activeGeneration, pendingGeneration,
+  TOPIC_GENERATION_AUTO_ROTATE_MESSAGES,
+} from "../topic-generation.mjs";
 import { interactionPolicySummary } from "../interaction-policy.mjs";
 import { listPending } from "../outbox.mjs";
 import { bridgeHome, interactionPolicyForTask, taskPaths, topicStateForTask } from "./state.mjs";
@@ -54,7 +56,7 @@ export function taskBindingFacts({ task, home = bridgeHome() } = {}) {
     pending,
     activeGeneration: activeTopic?.generation ?? null,
     activeGenerationMessages: activeTopic?.activity?.message_count ?? 0,
-    activeGenerationThreshold: activeTopic?.activity?.auto_rotate_threshold ?? 30,
+    activeGenerationThreshold: activeTopic?.activity?.auto_rotate_threshold ?? TOPIC_GENERATION_AUTO_ROTATE_MESSAGES,
     pendingGeneration: pendingTopic?.generation ?? null,
     pendingGenerationExpiresAt: pendingTopic?.claim_expires_at ?? null,
     readOnlyGenerations: topic.state.generations

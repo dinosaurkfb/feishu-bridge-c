@@ -47,7 +47,9 @@
       "bind-compose.mjs",
       "bind-project.mjs",
       "bind-session.mjs",
+      "claim-reminder.mjs",
       "codex/bind-task.mjs",
+      "codex/claim-reminder.mjs",
       "codex/feishu-rotate.mjs",
       "feishu-rotate.mjs",
       "outbound.mjs"

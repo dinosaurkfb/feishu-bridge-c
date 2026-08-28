@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-08-27T16:31:25.245Z",
+  "generated_at": "2026-08-27T23:51:34.989Z",
   "modules": {
     "automatic-topic-rotation.mjs": [
       "businessActivitiesForPublishedBatch",
@@ -41,6 +41,11 @@
       "resolveLarkIdentity",
       "templatePath",
       "validateChainTemplate"
+    ],
+    "claim-reminder.mjs": [
+      "composeClaimReminderText",
+      "describeReminderSweep",
+      "remindClaudePendingClaims"
     ],
     "claim.mjs": [
       "CLAIM_KEY_SHAPE",
@@ -398,6 +403,7 @@
       "TOPIC_GENERATION_ARTIFACT_TYPE",
       "TOPIC_GENERATION_AUTO_ROTATE_MESSAGES",
       "TOPIC_GENERATION_AUTO_ROTATE_RETRY_MS",
+      "TOPIC_GENERATION_CLAIM_REMINDER_LEAD_MS",
       "TOPIC_GENERATION_PENDING_MS",
       "TOPIC_GENERATION_PREPARING_STALE_MS",
       "TOPIC_GENERATION_SCHEMA_VERSION",
@@ -406,11 +412,13 @@
       "activeGenerationForSession",
       "applyTopicGenerationToMapping",
       "channelGenerationId",
+      "claimReminderDue",
       "closePendingTopicGeneration",
       "effectiveBindingId",
       "failTopicRotation",
       "generationById",
       "generationTargetState",
+      "markPendingClaimReminder",
       "materializeLegacyTopicFields",
       "pendingGeneration",
       "prepareTopicRotation",

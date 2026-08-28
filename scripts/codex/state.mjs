@@ -23,13 +23,16 @@ import {
   activeGenerationForSession, applyTopicGenerationToMapping, closePendingTopicGeneration,
   failTopicRotation, materializeLegacyTopicFields, pendingGeneration, prepareTopicRotation,
   recordTopicGenerationActivity, registerPendingTopicGeneration, topicGenerationStateForLegacy,
+  markPendingClaimReminder,
+  TOPIC_GENERATION_PENDING_MS,
 } from "../topic-generation.mjs";
 import {
   finalizeDialogueTurn, interactionPolicyStateForLegacy, materializeInteractionPolicy,
   reserveDialogueTurn, setInteractionPolicyMode,
 } from "../interaction-policy.mjs";
 
-export const PENDING_WINDOW_MS = 24 * 60 * 60 * 1000;
+// 首次绑定的待认领窗口与话题代际的待认领窗口是同一件事 —— 同一份定义（2026-08-28 起 72 小时）。
+export const PENDING_WINDOW_MS = TOPIC_GENERATION_PENDING_MS;
 export const ACTIVE_LEASE_MAX_MS = 12 * 60 * 60 * 1000;
 export const DEFAULT_INBOUND_PREFIX = null;
 
@@ -1173,6 +1176,16 @@ export function closeTaskTopicRotation({
   return mutateTaskTopicState({
     threadId, home, now,
     mutate: (state) => closePendingTopicGeneration(state, { operationId, reason, now }),
+  });
+}
+
+/** 原子记下"待认领话题已提醒过"。 */
+export function markTaskClaimReminder({
+  threadId, generationId, home = bridgeHome(), now = Date.now(),
+} = {}) {
+  return mutateTaskTopicState({
+    threadId, home, now,
+    mutate: (state) => markPendingClaimReminder(state, { generationId, now }),
   });
 }
 

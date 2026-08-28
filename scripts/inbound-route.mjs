@@ -32,6 +32,7 @@ import {
 import {
   activatePendingTopicGeneration, materializeLegacyTopicFields, pendingGeneration,
   topicGenerationStateForLegacy, effectiveBindingId,
+  TOPIC_GENERATION_PENDING_MS,
 } from "./topic-generation.mjs";
 
 // 幂等列表住在 project-resolve（它是更低层的那个模块），从这里转出去，
@@ -46,7 +47,8 @@ export { appendConsumed, loadConsumed };
  * 给 24 小时：显式触发下你敲完命令就会去 @，24 小时足够覆盖「明天再说」，
  * 又不至于让它无限期埋着。过期了重跑一次接入命令即可（话题已在，幂等键保证不会重建）。
  */
-export const PENDING_WINDOW_MS = 24 * 60 * 60 * 1000;
+// 首次绑定的待认领窗口与话题代际的待认领窗口是同一件事 —— 同一份定义（2026-08-28 起 72 小时）。
+export const PENDING_WINDOW_MS = TOPIC_GENERATION_PENDING_MS;
 
 export const PROMOTE_REJECT = {
   NO_PENDING: "no_pending_binding",

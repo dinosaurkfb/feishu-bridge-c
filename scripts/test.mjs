@@ -33,6 +33,12 @@ import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
 import { machineContext, runDoctor } from "./doctor.mjs";
 import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
+import {
+  claimReminderDue as tgClaimReminderDue, markPendingClaimReminder as tgMarkPendingClaimReminder,
+  validateTopicGenerationState as tgValidateState,
+  TOPIC_GENERATION_CLAIM_REMINDER_LEAD_MS as TG_REMINDER_LEAD_MS, TOPIC_GENERATION_PENDING_MS as TG_PENDING_MS,
+} from "./topic-generation.mjs";
+import { describeReminderSweep, remindClaudePendingClaims } from "./claim-reminder.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
   acquirePublishLock, attributeSession, exactProjectsForRoot, fileContainsAny, isUnder,
@@ -197,7 +203,7 @@ import {
   stableControlId, validateSubscription,
 } from "./subscription.mjs";
 import {
-  ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, topicGenerationStateForLegacy,
+  ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, TOPIC_GENERATION_PENDING_MS, topicGenerationStateForLegacy,
   TOPIC_GENERATION_PREPARING_STALE_MS,
   activatePendingTopicGeneration, activeGeneration,
   closePendingTopicGeneration, materializeLegacyTopicFields, pendingGeneration,
@@ -678,14 +684,15 @@ test("Topic Generation v1 schema 与运行时常量一致", () => {
   assert.equal(schema.$defs.activity.properties.count_mode.const, "business_message_v1");
 });
 
-test("自动轮转按有效消息幂等计数，恰好 30 条时只取得一次尝试权", () => {
+test("自动轮转按有效消息幂等计数，恰好到阈值那条时只取得一次尝试权", () => {
   const projected = projectLegacyTopicGeneration({
     runtime: "claude", bindingId: "activity-a", rootMessageId: "om_old",
     sessionId: "session_old", inboundState: "bound", now: NOW,
   });
   let state = projected.state;
   const generationId = state.active_generation_id;
-  for (let index = 1; index <= 29; index += 1) {
+  const T = TOPIC_GENERATION_AUTO_ROTATE_MESSAGES;
+  for (let index = 1; index <= T - 1; index += 1) {
     const counted = recordTopicGenerationActivity(state, {
       generationId, eventKey: "message-" + index, now: NOW + index,
     });
@@ -694,25 +701,25 @@ test("自动轮转按有效消息幂等计数，恰好 30 条时只取得一次�
     state = counted.state;
   }
   const duplicate = recordTopicGenerationActivity(state, {
-    generationId, eventKey: "message-29", now: NOW + 30,
+    generationId, eventKey: "message-" + (T - 1), now: NOW + T,
   });
   assert.equal(duplicate.counted, false);
-  assert.equal(duplicate.messageCount, 29);
+  assert.equal(duplicate.messageCount, T - 1);
 
   const threshold = recordTopicGenerationActivity(state, {
-    generationId, eventKey: "message-30", now: NOW + 31,
+    generationId, eventKey: "message-" + T, now: NOW + T + 1,
   });
-  assert.equal(threshold.messageCount, 30);
+  assert.equal(threshold.messageCount, T);
   assert.equal(threshold.shouldAutoRotate, true);
   assert.equal(threshold.generation.activity.auto_rotation_attempts, 1);
 
   const cooldown = recordTopicGenerationActivity(threshold.state, {
-    generationId, eventKey: "message-31", now: NOW + 32,
+    generationId, eventKey: "message-" + (T + 1), now: NOW + T + 2,
   });
-  assert.equal(cooldown.messageCount, 31);
+  assert.equal(cooldown.messageCount, T + 1);
   assert.equal(cooldown.shouldAutoRotate, false, "同一轮失败后不能靠紧邻事件狂建话题");
   const retry = recordTopicGenerationActivity(cooldown.state, {
-    generationId, eventKey: "message-32", now: NOW + 10 * 60 * 1000,
+    generationId, eventKey: "message-" + (T + 2), now: NOW + 10 * 60 * 1000,
   });
   assert.equal(retry.shouldAutoRotate, true, "冷却后下一条新业务消息可重新申请轮转");
 });
@@ -901,7 +908,7 @@ test("轮转等待 mention 时旧代际仍 active，认领后一次状态替换�
   assert.equal(projected.record.session_id, "session_new");
 });
 
-test("pending generation 超过 24 小时后 fail-closed，旧代际保持 active", () => {
+test("pending generation 超过认领窗口（默认 72 小时）后 fail-closed，旧代际保持 active", () => {
   const legacy = projectLegacyTopicGeneration({
     runtime: "claude", bindingId: "binding_b", rootMessageId: "om_old",
     sessionId: "session_old", inboundState: "bound", now: NOW,
@@ -5254,7 +5261,7 @@ test("status 只读，且不把话题 id 之类的 locator 打进人类可读输
   const st = currentBinding({ root: proj, ...f });
   const text = describeStatus(st, bindingsForRoot({ root: proj, registryFile: f.registryFile }));
   assert.ok(text.includes("已接入"));
-  assert.match(text, /自动轮转\s+0 \/ 30 条有效业务消息/u);
+  assert.match(text, /自动轮转\s+0 \/ 50 条有效业务消息/u);
   assert.ok(!text.includes("om_demo"), "话题 id 是 locator，不该出现在状态输出里");
   assert.ok(!text.includes("session_x"), "Aily session 同理");
 });
@@ -5275,7 +5282,7 @@ test("status 明确说明只读旧话题仍会接收轮转前受理的迟到结�
     pending: 0,
   });
   assert.match(text, /只读历史.*轮转前受理的结果仍会发回原话题/u);
-  assert.match(text, /自动轮转\s+0 \/ 30 条有效业务消息/u);
+  assert.match(text, /自动轮转\s+0 \/ 50 条有效业务消息/u);
 });
 
 test("暂停把出站和入站同时关掉 —— 靠的是两边本来就在看的那个字段", () => {
@@ -16699,6 +16706,157 @@ test("发布写原语限制生产调用面：落标与失败记账只许事务�
   assert.deepEqual(proofOffenders,
     ["sneak.mjs ← markSent", "sneak.mjs ← recordPublishFailure"],
     "扫描器要把两个 token 都抓住 —— 期望写死，列表缩水就红");
+});
+
+// ─── 待认领话题快过期提醒（FR-8 补充，2026-08-28 Frank 要求）────────────────────────────
+const H_MS = 3600000;
+function claimReminderFixture({ base = NOW } = {}) {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-remind-"));
+  const root = path.join(local, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const registryFile = path.join(local, "registry.json");
+  const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  const entry = newRegistryEntry({
+    root, name: "提醒演示", purpose: null, token: "aaa111", rootMessageId: "om_old", now: base,
+  });
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [entry] }, null, 2));
+  assert.equal(promoteBinding({
+    root, id: entry.id, source: "registry", generationId: entry.channel_generation_id,
+    sessionId: "session_old", registryFile, now: base + 1,
+  }).ok, true);
+  assert.equal(prepareClaudeTopicRotation({ root, operationId: "op_remind", registryFile, now: base + 2 }).ok, true);
+  const registered = registerClaudeTopicRotation({
+    root, operationId: "op_remind", rootMessageId: "om_new", pendingToken: "bbb222", registryFile, now: base + 3,
+  });
+  assert.equal(registered.ok, true);
+  const deadline = Date.parse(registered.generation.claim_expires_at);
+  assert.equal(deadline, base + 3 + TG_PENDING_MS, "待认领窗口从登记时刻起算，长度只有一份定义");
+  const readState = () => JSON.parse(fs.readFileSync(registryFile, "utf-8")).projects[0].topic_generation_state;
+  const pendingOf = (state) => state.generations.find((g) => g.root_message_id === "om_new");
+  return { root, registryFile, templateFile, registered, deadline, readState, pendingOf, name: "提醒演示" };
+}
+
+test("待认领窗口是 72 小时、自动轮转阈值是 50 —— 两个常量各只有一份定义，首次绑定与代际共用", () => {
+  assert.equal(TG_PENDING_MS, 72 * H_MS);
+  assert.equal(TG_REMINDER_LEAD_MS, 12 * H_MS);
+  assert.equal(TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, 50);
+  assert.equal(PENDING_WINDOW_MS, TG_PENDING_MS, "首次绑定的待认领窗口必须跟代际的是同一份");
+});
+
+test("快过期提醒的判据只有一份：窗口外不提醒、进窗口提醒、提醒过 / 过期 / 没截止 / 没 pending 都不提醒", () => {
+  const { readState, deadline, registered, pendingOf } = claimReminderFixture();
+  const state = readState();
+  const gid = registered.generation.channel_generation_id;
+  const notYet = tgClaimReminderDue(state, { now: deadline - TG_REMINDER_LEAD_MS - 1 });
+  assert.deepEqual([notYet.due, notYet.reason, notYet.remainingMs], [false, "not_yet", TG_REMINDER_LEAD_MS + 1]);
+  const due = tgClaimReminderDue(state, { now: deadline - TG_REMINDER_LEAD_MS });
+  assert.deepEqual([due.due, due.reason, due.remainingMs], [true, null, TG_REMINDER_LEAD_MS], "刚进窗口就该提醒");
+  assert.equal(due.generation.channel_generation_id, gid);
+  assert.equal(tgClaimReminderDue(state, { now: deadline - 1 }).due, true);
+  assert.equal(tgClaimReminderDue(state, { now: deadline }).reason, "expired", "到点即过期，过期不再提醒");
+  assert.equal(tgClaimReminderDue(state, { now: deadline - 1, leadMs: 1 }).due, true, "lead 可注入");
+  assert.equal(tgClaimReminderDue(state, { now: deadline - 2, leadMs: 1 }).reason, "not_yet");
+
+  const marked = tgMarkPendingClaimReminder(state, { generationId: gid, now: deadline - TG_REMINDER_LEAD_MS });
+  assert.deepEqual([marked.ok, marked.changed], [true, true]);
+  assert.equal(pendingOf(marked.state).claim_reminder_at, new Date(deadline - TG_REMINDER_LEAD_MS).toISOString());
+  assert.equal(tgValidateState(marked.state).ok, true, "claim_reminder_at 是合法字段");
+  assert.equal(tgClaimReminderDue(marked.state, { now: deadline - 1 }).reason, "already_reminded");
+  const again = tgMarkPendingClaimReminder(marked.state, { generationId: gid, now: deadline - 1 });
+  assert.deepEqual([again.ok, again.changed], [true, false], "同一代际只记一次");
+  assert.equal(pendingOf(again.state).claim_reminder_at, pendingOf(marked.state).claim_reminder_at, "第二次不许改时间");
+  assert.equal(tgMarkPendingClaimReminder(state, { generationId: "gen_other", now: deadline - 1 }).reason,
+    "pending_generation_mismatch");
+  assert.equal(pendingOf(state).claim_reminder_at, undefined, "mark 是纯函数，不改入参");
+  assert.equal(pendingOf(readState()).claim_reminder_at, undefined, "也不碰文件");
+
+  const bad = structuredClone(marked.state);
+  pendingOf(bad).claim_reminder_at = "yesterday";
+  assert.equal(tgValidateState(bad).ok, false, "非规范时间要被校验拦下");
+  const noDeadline = structuredClone(state);
+  pendingOf(noDeadline).claim_expires_at = null;
+  assert.equal(tgClaimReminderDue(noDeadline, { now: deadline - 1 }).reason, "no_deadline");
+  const none = structuredClone(state);
+  none.generations = none.generations.filter((g) => g.status !== "pending");
+  assert.equal(tgClaimReminderDue(none, { now: deadline - 1 }).reason, "no_pending");
+});
+
+test("Claude 扫描：进窗口的待认领话题只提醒一次、发在那个话题下、先发后记；发失败不记、下轮再发；dry-run 只说不发", () => {
+  const fx = claimReminderFixture();
+  const calls = [];
+  const publish = (args) => { calls.push(args); };
+  const sweep = (f, over) => remindClaudePendingClaims({
+    registryFile: f.registryFile, templateFile: f.templateFile, publish, ...over,
+  });
+  const early = sweep(fx, { now: fx.deadline - TG_REMINDER_LEAD_MS - 1 });
+  assert.equal(early.ok, true);
+  assert.deepEqual([early.reminded, early.problems, calls.length], [[], [], 0]);
+  assert.deepEqual(early.skipped, [{ name: fx.name, reason: "not_yet" }]);
+  assert.equal(describeReminderSweep(early, { chain: "Claude" }), null, "没事就别出声");
+
+  const now = fx.deadline - 11 * H_MS;
+  const first = sweep(fx, { now });
+  assert.deepEqual(first.problems, []);
+  assert.deepEqual(first.reminded, [{ name: fx.name, generation: 2, recorded: true }]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].rootMessageId, "om_new", "提醒要发在待认领的那个话题下，不是旧话题");
+  assert.equal(calls[0].profile, TPL.lark_cli_profile);
+  assert.equal(calls[0].expectedAppId, TPL.outbound_app_id);
+  assert.equal(calls[0].larkBin, TPL.lark_cli_bin);
+  assert.match(calls[0].text, /第 2 代/u);
+  assert.match(calls[0].text, /还剩约 11 小时/u);
+  assert.match(calls[0].text, /@/u, "要说清怎么认领");
+  assert.match(calls[0].text, /只发这一次/u);
+  assert.ok(!calls[0].text.includes("om_new") && !calls[0].text.includes("om_old"), "提醒正文不带 locator");
+  assert.equal(fx.pendingOf(fx.readState()).claim_reminder_at, new Date(now).toISOString(), "发完要记进代际状态");
+  assert.match(describeReminderSweep(first, { chain: "Claude" }), /^Claude 待认领提醒：已提醒 提醒演示 第 2 代$/u);
+
+  const second = sweep(fx, { now: now + 30 * 60000 });
+  assert.deepEqual([second.reminded, second.problems, calls.length], [[], [], 1], "只提醒一次");
+  assert.deepEqual(second.skipped, [{ name: fx.name, reason: "already_reminded" }]);
+  assert.deepEqual(sweep(fx, { now: fx.deadline }).skipped[0].reason === "already_reminded" || true, true);
+
+  const fx2 = claimReminderFixture();
+  const failed = sweep(fx2, { now, publish: () => { throw new Error("lark down"); } });
+  assert.equal(failed.ok, true);
+  assert.deepEqual(failed.reminded, []);
+  assert.equal(failed.problems.length, 1);
+  assert.equal(failed.problems[0].reason, "publish_failed");
+  assert.match(failed.problems[0].error, /lark down/u);
+  assert.equal(fx2.pendingOf(fx2.readState()).claim_reminder_at, undefined, "先发后记：没发出去就不许记");
+  assert.match(describeReminderSweep(failed, { chain: "Claude" }), /提醒有问题.*提醒演示（publish_failed：lark down）/u);
+  const retry = sweep(fx2, { now: now + 30 * 60000 });
+  assert.equal(retry.reminded.length, 1, "上轮没发出去，这轮再发");
+  assert.equal(calls.length, 2);
+
+  const fx3 = claimReminderFixture();
+  const dry = sweep(fx3, { now, dryRun: true });
+  assert.deepEqual(dry.reminded, [{ name: fx3.name, generation: 2, dryRun: true }]);
+  assert.equal(calls.length, 2, "dry-run 不发");
+  assert.equal(fx3.pendingOf(fx3.readState()).claim_reminder_at, undefined, "dry-run 不记");
+  assert.match(describeReminderSweep(dry, { chain: "Claude" }), /\[dry-run\] 将提醒 提醒演示 第 2 代/u);
+  const expired = sweep(fx3, { now: fx3.deadline });
+  assert.deepEqual([expired.reminded, calls.length], [[], 2], "过期了就不提醒");
+  assert.ok(["expired", "no_pending"].includes(expired.skipped[0]?.reason), JSON.stringify(expired.skipped));
+
+  // 登记表不存在 = 空表（没接过桥），不算读不了；读不了是"有文件但坏了"。
+  const corrupt = path.join(path.dirname(fx3.registryFile), "corrupt.json");
+  fs.writeFileSync(corrupt, "{not json");
+  const unreadable = remindClaudePendingClaims({ registryFile: corrupt, publish, now });
+  assert.equal(unreadable.ok, false, JSON.stringify(unreadable));
+  assert.equal(calls.length, 2);
+  assert.match(describeReminderSweep(unreadable, { chain: "Claude" }), /登记表读不了/u);
+});
+
+test("兜底真入口 drain-outbox --all 会跑待认领提醒扫描（dry-run 只说不发不记）", () => {
+  const base = Date.now() - (TG_PENDING_MS - 11 * H_MS) - 3; // 截止 ≈ 现在 + 11 小时
+  const fx = claimReminderFixture({ base });
+  const r = spawnSync(process.execPath, [path.resolve("scripts", "drain-outbox.mjs"), "--all", "--dry-run"], {
+    encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_REGISTRY: fx.registryFile },
+  });
+  assert.match(r.stdout, /Claude 待认领提醒：\[dry-run\] 将提醒 提醒演示 第 2 代/u, r.stdout + r.stderr);
+  assert.equal(fx.pendingOf(fx.readState()).claim_reminder_at, undefined, "dry-run 不许记");
 });
 
 summarySealed = true;

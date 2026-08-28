@@ -35,10 +35,15 @@ export function effectiveBindingId(mapping, { root = null } = {}) {
 
 export const TOPIC_GENERATION_SCHEMA_VERSION = "1.0";
 export const TOPIC_GENERATION_ARTIFACT_TYPE = "feishu_bridge_topic_generations";
-export const TOPIC_GENERATION_PENDING_MS = 24 * 60 * 60 * 1000;
+// 待认领窗口：2026-08-28 起从 24 小时放长到 72 小时（Frank 定的，三倍）。已登记的 pending 沿用各自记下的
+// claim_expires_at，新代际按这个默认取。
+export const TOPIC_GENERATION_PENDING_MS = 72 * 60 * 60 * 1000;
+// 快过期提醒的提前量：截止前 12 小时内、且还没人认领时，在待认领话题下提醒一次（明写，不藏在比较式里）。
+export const TOPIC_GENERATION_CLAIM_REMINDER_LEAD_MS = 12 * 60 * 60 * 1000;
 export const TOPIC_GENERATION_ACTIVITY_SCHEMA_VERSION = "1.0";
 export const TOPIC_GENERATION_ACTIVITY_MODE = "business_message_v1";
-export const TOPIC_GENERATION_AUTO_ROTATE_MESSAGES = 30;
+// 自动轮转阈值：2026-08-28 起从 30 条放长到 50 条（Frank 定的）。已有代际沿用各自记下的 auto_rotate_threshold。
+export const TOPIC_GENERATION_AUTO_ROTATE_MESSAGES = 50;
 export const TOPIC_GENERATION_AUTO_ROTATE_RETRY_MS = 5 * 60 * 1000;
 /**
  * PREPARING 停留多久算「上一次尝试没走完」，可以被新的轮转接管。
@@ -233,6 +238,11 @@ export function validateTopicGenerationState(state) {
       // 旧版“全机唯一 pending”记录可能没有短码或显式截止时间；读取迁移必须保留它，
       // 期限由 bound_at 兼容推导。正式 rotation pending 在下面有更严格的形状约束。
       if (generation.session_id !== null) problems.push("generations.pending_shape");
+      // 提醒记录：不在场 / null 都行；在场就必须是规范时间 —— 它决定"还要不要再提醒"。
+      if (generation.claim_reminder_at !== undefined && generation.claim_reminder_at !== null &&
+          !Number.isFinite(Date.parse(generation.claim_reminder_at))) {
+        problems.push("generations.claim_reminder_at");
+      }
     }
   }
   if (active > 1) problems.push("multiple_active_generations");
@@ -306,6 +316,37 @@ export const activeGeneration = (state) => state?.generations?.find((generation)
 
 export const pendingGeneration = (state) => state?.generations?.find((generation) =>
   generation.status === GENERATION_STATUS.PENDING) ?? null;
+
+/**
+ * 快过期提醒该不该发：有 pending、有截止时间、进入截止前 LEAD 窗口、还没过期、还没提醒过。
+ * **只算不写**；何时提醒、提醒后记下来，由各链的扫描器在自己的锁里做。
+ */
+export function claimReminderDue(state, { now = Date.now(), leadMs = TOPIC_GENERATION_CLAIM_REMINDER_LEAD_MS } = {}) {
+  const generation = pendingGeneration(state);
+  if (!generation) return { due: false, reason: "no_pending", generation: null };
+  const deadline = Date.parse(generation.claim_expires_at ?? "");
+  if (!Number.isFinite(deadline)) return { due: false, reason: "no_deadline", generation };
+  if (now >= deadline) return { due: false, reason: "expired", generation };
+  if (generation.claim_reminder_at) return { due: false, reason: "already_reminded", generation };
+  if (deadline - now > leadMs) return { due: false, reason: "not_yet", generation, remainingMs: deadline - now };
+  return { due: true, reason: null, generation, remainingMs: deadline - now };
+}
+
+/** 记下"已经提醒过"。同一代际只记一次；不是 pending 的代际不记（说明状态已经变了）。 */
+export function markPendingClaimReminder(state, { generationId, now = Date.now() } = {}) {
+  const valid = validateTopicGenerationState(state);
+  if (!valid.ok) return { ok: false, reason: "topic_generation_state_invalid", problems: valid.problems };
+  const generation = pendingGeneration(state);
+  if (!generation || generation.channel_generation_id !== generationId) {
+    return { ok: false, reason: "pending_generation_mismatch" };
+  }
+  if (generation.claim_reminder_at) return { ok: true, changed: false, state };
+  const next = clone(state);
+  const target = next.generations.find((g) => g.channel_generation_id === generationId);
+  target.claim_reminder_at = iso(now);
+  next.updated_at = iso(now);
+  return { ok: true, changed: true, state: next };
+}
 
 export function generationById(state, generationId) {
   if (!nonEmpty(generationId)) return null;

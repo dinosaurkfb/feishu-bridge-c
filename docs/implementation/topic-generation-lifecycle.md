@@ -48,7 +48,7 @@ binding
 
 1. 在生命周期锁内确认 binding active、存在唯一 active 且没有 pending，写入唯一 operation id；
 2. 释放锁后调用飞书创建新根话题；创建失败时重新加锁把 operation 标为 failed，旧代际不变；
-3. 创建成功后重新加锁，把新根 locator、短码和 24 小时 `claim_expires_at` 登记为 pending；
+3. 创建成功后重新加锁，把新根 locator、短码和 72 小时 `claim_expires_at` 登记为 pending（2026-08-28 起；截止前 12 小时无人认领由兜底提醒一次，见 claim-reminder.mjs）；
 4. 等待新话题中的真实 mention，等待期间不持锁，旧代际继续 active；
 5. 认领时重新加锁并校验 generation、operation、期限和 session 唯一性；
 6. 在同一 binding 文档的一次临时文件 + `rename` 替换中，将新代际设 active、旧代际设 read-only；
@@ -66,7 +66,7 @@ binding
 第 30 条有效业务消息落账时，取得一次自动轮转尝试权，并在生命周期锁外启动既有 rotate CLI 创建
 pending generation。**自动创建不等于自动切换**：首次真实 mention 前旧话题仍 active；认领成功后
 才原子切换。创建失败不会影响旧 active，至少冷却 5 分钟后由下一条新业务消息取得重试机会。
-已有 binding 不回扫历史消息，安装或升级本身不会创建新话题。24 小时仍只是新话题等待首次真实
+已有 binding 不回扫历史消息，安装或升级本身不会创建新话题。72 小时仍只是新话题等待首次真实
 mention 的认领期限，不是旧话题的消息上限。
 
 话题创建成功但本地 phase 2 写入失败时，不猜测或自动重建：旧代际继续 active，外部新话题作为
@@ -125,7 +125,7 @@ session locator、凭据、claim 或 receipt。
 
 候选必须通过：
 
-- 公共状态机、24 小时过期、取消和旧映射投影测试；
+- 公共状态机、72 小时过期（原 24 小时）、快过期提醒、取消和旧映射投影测试；
 - 30 条阈值、重复事件、2 条配对卡、冷却重试、pending 抑制和 read-only 迟到结果测试；
 - Claude registry/project-file 原子持久化与未知字段保留测试；
 - Codex 精确 task 轮转、取消 CLI 与状态输出测试；

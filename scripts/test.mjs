@@ -7,7 +7,7 @@
  * v2：标识符全部换到 Aily 命名空间（见 selector.mjs 顶部说明）。
  */
 
-import { controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord } from "./control-command.mjs";
+import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord } from "./control-command.mjs";
 import { describePendingWindow } from "./layered-status.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -18078,13 +18078,24 @@ test("claim 终态 consumed：账本盘点认识它（不是 unrecognized_entry�
   const runsDir = path.join(base, "runs");
   const claimsDir = path.join(base, "delivery-claims");
   fs.mkdirSync(runsDir); fs.mkdirSync(claimsDir);
-  const key = "c".repeat(64);
+  const claimed = acquireClaim({ claimsDir, messageId: "msg_consumed_ok", logicalTaskKey: "t",
+    meta: { policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, origin_channel_generation_id: "channel_generation_000000000000000000000000",
+      control: { control: "mode", mode: DIALOGUE_POLICY_ID } } });
+  const key = claimed.key;
   recordClaimState({ claimsDir, key, state: "consumed", detail: { control: "mode", mode: DIALOGUE_POLICY_ID, changed: true } });
   assert.ok(fs.existsSync(path.join(claimsDir, key + ".consumed.json")));
   const inv = inventoryRuns({ runsDir, claimsDir });
   assert.equal(inv.ok, true, JSON.stringify(inv));
-  assert.deepEqual(inv.problems, [], "consumed 是受控状态：既不是不认识的条目，也不是孤儿终局");
+  assert.deepEqual(inv.problems, [], "consumed 与其 claim 意图一致：既不是不认识的条目，也不是孤儿终局");
   assert.equal(CLAIM_STATE.CONSUMED, "consumed");
+  // 没有 claim 的 consumed 是孤儿；意图不一致的 consumed 也要报
+  recordClaimState({ claimsDir, key: "c".repeat(64), state: "consumed", detail: { control: "mode", mode: DIALOGUE_POLICY_ID, changed: true } });
+  const mismatched = acquireClaim({ claimsDir, messageId: "msg_consumed_mismatch", logicalTaskKey: "t",
+    meta: { policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, origin_channel_generation_id: "channel_generation_000000000000000000000000",
+      control: { control: "mode", mode: DIALOGUE_POLICY_ID } } });
+  recordClaimState({ claimsDir, key: mismatched.key, state: "consumed", detail: { control: "mode", mode: MAPPING_POLICY_ID, changed: true } });
+  const inv2 = inventoryRuns({ runsDir, claimsDir });
+  assert.deepEqual(inv2.problems.map((p) => p.reason).sort(), ["consumed_intent_mismatch", "consumed_orphan"], JSON.stringify(inv2.problems));
 });
 
 test("未路由回复盘点：全枚举，只有完整受验的制品计入，临时 / 未知 / 坏 JSON / 畸形都进 problems；runs 账本读不出时状态页照样渲染；doctor 计入", () => {
@@ -18211,7 +18222,7 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   assert.deepEqual([stored.status, stored.claim.control], ["valid", { control: "mode", mode: DIALOGUE_POLICY_ID }], "意图随 claim 持久化");
   const replay = run("/feishu-mode dialogue", "msg_c1");
   assert.equal(replay.status, 0, replay.stdout + replay.stderr);
-  assert.match(replay.stdout, /^已处理过 · 控制演示\n这条控制命令之前已经执行过（当时完成了切换）/u, replay.stdout);
+  assert.match(replay.stdout, /^已处理过 · 控制演示\n这条控制命令之前已经执行过（当时完成了切换）；当时目标模式是 Dialogue.*本次没有再次切换/u, replay.stdout);
   assert.equal(policyOf(), DIALOGUE_POLICY_ID);
 
   // 终态写失败：consumed 路径被目录占住 → 第一次退出 1、如实说"模式已切换但终态没记下"；模式确实已切；清障后重放补齐
@@ -18221,13 +18232,44 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   assert.equal(broken.status, 1, broken.stdout);
   assert.match(broken.stdout, /模式已切换，但终态没记下/u, broken.stdout);
   assert.equal(policyOf(), MAPPING_POLICY_ID, "动作已成");
+  assert.match(broken.stdout, /repair-control-claim/u, "错误回执指路维护入口，不叫他重发");
+  assert.doesNotMatch(broken.stdout, /重发同一条命令可补齐/u);
   const stuck = run("/feishu-mode mapping", "msg_c2");
   assert.equal(stuck.status, 1, "障碍还在：重放仍报终态没记下：" + stuck.stdout);
+  // 障碍（目录）还占着终态路径：盘点报 consumed_unreadable（最具体的原因）；维护入口 --apply 也恢复不了
+  const blockedInv = inventoryRuns({ runsDir: path.join(root, ".runtime-data", "inbound", "runs"), claimsDir });
+  assert.ok(blockedInv.problems.some((p) => p.key === key2 && p.reason === "consumed_unreadable"), JSON.stringify(blockedInv.problems));
+  const repair = (...args) => spawnSync(process.execPath, [path.resolve("scripts", "repair-control-claim.mjs"), ...args], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, HOME: local } });
+  assert.equal(repair().status, 2);
+  assert.equal(repair("--project", root, "--key", "zz").status, 2);
+  const blockedRepair = repair("--project", root, "--key", key2, "--apply");
+  assert.equal(blockedRepair.status, 1, "障碍在，恢复不了：" + blockedRepair.stdout);
   fs.rmSync(path.join(claimsDir, key2 + ".consumed.json"), { recursive: true, force: true });
+  // 障碍清掉、终态仍缺席：事务未闭合 —— 账本报 consumed_in_flight，维护入口预览说清
+  const inflight = inventoryRuns({ runsDir: path.join(root, ".runtime-data", "inbound", "runs"), claimsDir });
+  assert.ok(inflight.problems.some((p) => p.key === key2 && p.reason === "consumed_in_flight"), JSON.stringify(inflight.problems));
+  const preview = repair("--project", root, "--key", key2);
+  assert.deepEqual([preview.status, /\[预览\] 事务未闭合：控制意图 mapping，终态缺席/u.test(preview.stdout)], [0, true], preview.stdout);
+  // 维护入口恢复（不是飞书重发）：续做并写终态；再跑一次说已闭合
+  const repaired = repair("--project", root, "--key", key2, "--apply");
+  assert.deepEqual([repaired.status, /已补齐终态（目标模式 mapping/u.test(repaired.stdout)], [0, true], repaired.stdout);
+  assert.equal(readConsumedRecord({ claimsDir, key: key2, expectedIntent: { control: "mode", mode: MAPPING_POLICY_ID } }).status, "valid");
+  assert.deepEqual(fs.readdirSync(claimsDir).filter((n) => n.includes(".consumed.json.tmp.")), [], "首次失败留下的临时制品在成功后清掉");
+  assert.match(repair("--project", root, "--key", key2, "--apply").stdout, /已闭合，无需恢复/u);
+  assert.deepEqual(inventoryRuns({ runsDir: path.join(root, ".runtime-data", "inbound", "runs"), claimsDir }).problems.filter((p) => p.key === key2), []);
+  // 运输层同一事件重放：按记录重出回执
   const resumed = run("/feishu-mode mapping", "msg_c2");
   assert.equal(resumed.status, 0, resumed.stdout + resumed.stderr);
-  assert.match(resumed.stdout, /^已补齐 · 控制演示\n上次执行后终态没记下，这次已补齐；交互模式是 Mapping/u, resumed.stdout);
+  // 首次尝试已经把模式切了；维护入口续做时是幂等命中 → 记录如实写"当时模式未变"，重放照记录说
+  assert.match(resumed.stdout, /^已处理过 · 控制演示\n这条控制命令之前已经执行过（当时模式未变）；当时目标模式是 Mapping.*本次没有再次切换/u, resumed.stdout);
   assert.equal(readConsumedRecord({ claimsDir, key: key2 }).status, "valid");
+  // 终态与意图不一致（账本被改）：重放拒绝续做、不重出回执
+  const tampered = JSON.parse(fs.readFileSync(path.join(claimsDir, key2 + ".consumed.json"), "utf-8"));
+  fs.writeFileSync(path.join(claimsDir, key2 + ".consumed.json"), JSON.stringify({ ...tampered, mode: DIALOGUE_POLICY_ID }));
+  const conflicted = run("/feishu-mode mapping", "msg_c2");
+  assert.equal(conflicted.status, 1, conflicted.stdout);
+  assert.match(conflicted.stdout, /consumed_intent_mismatch|不一致/u, conflicted.stdout);
+  fs.writeFileSync(path.join(claimsDir, key2 + ".consumed.json"), JSON.stringify(tampered));
   assert.equal(policyOf(), MAPPING_POLICY_ID);
   // 意图不一致的重放（同一消息 id、不同正文）不许续做
   const twisted = run("/feishu-mode dialogue", "msg_c2");
@@ -18246,7 +18288,11 @@ test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进
   const runsDir = path.join(base, "runs");
   const claimsDir = path.join(base, "delivery-claims");
   fs.mkdirSync(runsDir); fs.mkdirSync(claimsDir);
-  const good = "a".repeat(64); const bad = "b".repeat(64); const dir = "c".repeat(64); const shape = "d".repeat(64);
+  const bad = "b".repeat(64); const dir = "c".repeat(64); const shape = "d".repeat(64);
+  const goodClaim = acquireClaim({ claimsDir, messageId: "msg_good", logicalTaskKey: "t",
+    meta: { policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, origin_channel_generation_id: "channel_generation_000000000000000000000000",
+      control: { control: "mode", mode: DIALOGUE_POLICY_ID } } });
+  const good = goodClaim.key;
   recordClaimState({ claimsDir, key: good, state: "consumed", detail: { control: "mode", mode: DIALOGUE_POLICY_ID, changed: true } });
   fs.writeFileSync(path.join(claimsDir, bad + ".consumed.json"), "{not json");
   fs.mkdirSync(path.join(claimsDir, dir + ".consumed.json"));
@@ -18255,6 +18301,17 @@ test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进
   assert.equal(inv.ok, true);
   assert.deepEqual(inv.problems.map((p) => [p.key.slice(0, 1), p.reason]).sort(), [["b", "consumed_unreadable"], ["c", "consumed_unreadable"], ["d", "consumed_unreadable"]], JSON.stringify(inv.problems));
   assert.equal(readConsumedRecord({ claimsDir, key: good }).status, "valid");
+  assert.equal(readConsumedRecord({ claimsDir, key: good, expectedIntent: { control: "mode", mode: MAPPING_POLICY_ID } }).status, "mismatch", "意图逐字段核对");
+  const extra = JSON.parse(fs.readFileSync(path.join(claimsDir, good + ".consumed.json"), "utf-8"));
+  fs.writeFileSync(path.join(claimsDir, good + ".consumed.json"), JSON.stringify({ ...extra, extra_key: 1 }));
+  assert.deepEqual([readConsumedRecord({ claimsDir, key: good }).status, readConsumedRecord({ claimsDir, key: good }).why], ["unreadable", "字段集不对"], "多一个键也不算封闭");
+  fs.writeFileSync(path.join(claimsDir, good + ".consumed.json"), JSON.stringify(extra));
+  // TOCTOU：打开之后路径被换成另一份记录 —— 读的仍是原 fd 上那份
+  const other = { ...extra, mode: MAPPING_POLICY_ID };
+  const raced = readConsumedRecord({ claimsDir, key: good, afterOpen: (file) => { fs.writeFileSync(file + ".swap", JSON.stringify(other)); fs.renameSync(file + ".swap", file); } });
+  assert.deepEqual([raced.status, raced.record.mode], ["valid", DIALOGUE_POLICY_ID], "路径被换掉不影响本次读取");
+  fs.writeFileSync(path.join(claimsDir, good + ".consumed.json"), JSON.stringify(extra));
+  assert.ok(Object.isFrozen(CONTROL_MODES), "枚举冻结");
   assert.equal(readConsumedRecord({ claimsDir, key: "f".repeat(64) }).status, "absent");
   assert.equal(readConsumedRecord({ claimsDir, key: "z".repeat(64) }).status, "unreadable", "key 形状不对也不猜");
   // claim 里的意图形状不对：readClaimState 判不可读（重放时不许据此续做）

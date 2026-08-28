@@ -317,7 +317,7 @@ const runControl = (replay) => {
     if (tx.reason === "ledger_unwritten") {
       writeReceipt("control-" + verdict.messageId, { status: "error", reason: tx.reason, control: control.kind, mode: control.mode, changed: tx.changed,
         message_id: verdict.messageId, claim_acquired: true, handed_off: false, error: tx.why });
-      finish("error", { detail: "模式已切换，但终态没记下（" + tx.why + "）；在飞书里重发同一条命令可补齐" }, { reason: tx.reason });
+      finish("error", { detail: "模式已切换，但终态没记下（" + tx.why + "）；重发不会补齐（新消息是新一笔），请用维护入口 repair-control-claim 处理这一笔" }, { reason: tx.reason });
     }
     if (!replay) recordClaimState({ claimsDir: paths.claims, key: claim.key, state: "failed", detail: { reason: "control_failed", control: control.kind, error: tx.why } });
     writeReceipt("control-" + verdict.messageId, { status: "error", reason: tx.reason, control: control.kind, mode: control.mode,

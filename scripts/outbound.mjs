@@ -12,7 +12,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE, CLAIM_STATE } from "./claim.mjs";
-import { readConsumedRecord } from "./control-command.mjs";
+import { CONSUMED_TMP_RE, inspectControlClaim } from "./control-command.mjs";
 
 import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
 
@@ -226,12 +226,30 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
     catch (err) { if (err.code !== "ENOENT") problems.push({ key: null, reason: "claims_unreadable", why: String(err.code ?? err.message) }); }
     for (const name of names) {
       if (name.startsWith(".")) continue;
+      const residue = CONSUMED_TMP_RE.exec(name);
+      if (residue) {
+        // consumed 的临时制品：受控形状。终态已成则是漏清的残骸，未成则是写到一半 —— 两者都要人看，但不是"不认识"。
+        const seen = inspectControlClaim({ claimsDir, key: residue[1] });
+        problems.push({ key: residue[1], reason: seen.state === "consumed" ? "consumed_residue" : "consumed_in_flight", why: "delivery-claims/" + name.slice(0, 80) });
+        continue;
+      }
       const m = CLAIM_ENTRY_RE.exec(name);
       if (!m) { problems.push({ key: null, reason: "unrecognized_entry", why: "delivery-claims/" + name.slice(0, 80) }); continue; }
       if (m[2] === CLAIM_STATE.CONSUMED + ".json") {
-        // consumed 不是 run 终局、不参与孤儿判定，但**内容坏了要进 problems**（评审探针：坏 JSON 曾被按文件名当健康）。
-        const consumed = readConsumedRecord({ claimsDir, key: m[1] });
-        if (consumed.status !== "valid") problems.push({ key: m[1], reason: "consumed_unreadable", why: name + "：" + (consumed.why ?? consumed.status) });
+        // consumed 不是 run 终局、不参与孤儿判定，但要**与它的 claim 交叉核对**：内容坏 → consumed_unreadable；
+        // 没有 claim / claim 读不出 → consumed_orphan；claim 无控制意图或意图不一致 → consumed_intent_mismatch。
+        const seen = inspectControlClaim({ claimsDir, key: m[1] });
+        if (seen.state === "consumed") { /* 完整且一致 */ }
+        else if (seen.state === "consumed_unreadable") problems.push({ key: m[1], reason: "consumed_unreadable", why: name + "：" + seen.why });
+        else if (seen.state === "mismatch") problems.push({ key: m[1], reason: "consumed_intent_mismatch", why: name + "：" + seen.why });
+        else if (seen.state.startsWith("claim_") || seen.state === "not_control") problems.push({ key: m[1], reason: "consumed_orphan", why: name + "：" + seen.state });
+        else problems.push({ key: m[1], reason: "consumed_unreadable", why: name + "：" + seen.state });
+        continue;
+      }
+      if (m[2] === "claim") {
+        // 有控制意图、没终态、也没 failed：事务没闭合 —— 报出来并指路维护入口（同一事件的运输层重放或 repair-control-claim 才能补齐）。
+        const seen = inspectControlClaim({ claimsDir, key: m[1] });
+        if (seen.state === "in_flight") problems.push({ key: m[1], reason: "consumed_in_flight", why: "控制命令已执行但终态未记下 —— node scripts/repair-control-claim.mjs" });
         continue;
       }
       if (!TERMINAL_STATE_FILES.has(m[2])) continue;   // claim 目录、笔记、非终局状态记录：不参与孤儿判定

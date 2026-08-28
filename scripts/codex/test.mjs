@@ -8998,6 +8998,33 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
   assert.deepEqual([rerun.status, /这笔已闭合，无需恢复.*但有 1 个临时残骸清不掉/u.test(rerun.stdout)], [1, true], rerun.stdout);
   fs.rmSync(rerunResidue, { recursive: true });
   assert.equal(repair("--thread-id", THREAD_A, "--key", key9, "--apply").status, 0);
+
+  // ── 评审第 6 轮 ──
+  // 运输层重放遇到受验的 failed：按记录重出失败回执，不执行
+  const key10 = claimKey("msg_ctl_10", ltk);
+  assert.ok(acquireClaim({ claimsDir: paths.claims, messageId: "msg_ctl_10", logicalTaskKey: ltk, meta: { ...protoMeta, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).ok);
+  recordClaimState({ claimsDir: paths.claims, key: key10, state: "failed", detail: { reason: "control_failed", control: "mode", error: "initial execution failed" } });
+  const modeBefore = policyOf();
+  const failedViaTransport = run("$feishu-mode dialogue", "msg_ctl_10");
+  assert.equal(failedViaTransport.status, 1, failedViaTransport.stdout);
+  assert.match(failedViaTransport.stdout, /之前执行失败（initial execution failed）；本次是同一条消息的重放，没有再次尝试/u, failedViaTransport.stdout);
+  assert.equal(policyOf(), modeBefore, "重放不执行");
+  assert.ok(!fs.existsSync(path.join(paths.claims, key10 + ".consumed.json")), "没有留下并存");
+  // 逐 key 事务锁：另一笔持有时维护入口与重放都拿不到
+  fs.mkdirSync(path.join(paths.claims, key10 + ".control.lock"));
+  const busyRepair = repair("--thread-id", THREAD_A, "--key", key10, "--apply");
+  assert.deepEqual([busyRepair.status, /已记为失败（当时没切成），不恢复/u.test(busyRepair.stdout)], [1, true], "受验 failed 不可续做：" + busyRepair.stdout);
+  fs.rmSync(path.join(paths.claims, key10 + ".failed.json"));
+  const busyRepair2 = repair("--thread-id", THREAD_A, "--key", key10, "--apply");
+  assert.deepEqual([busyRepair2.status, /没有恢复（control_busy/u.test(busyRepair2.stdout)], [1, true], busyRepair2.stdout);
+  const busyVia = run("$feishu-mode dialogue", "msg_ctl_10");
+  assert.deepEqual([busyVia.status, /control_busy|已有事务持有者/u.test(busyVia.stdout)], [1, true], busyVia.stdout);
+  assert.equal(policyOf(), modeBefore);
+  fs.rmSync(path.join(paths.claims, key10 + ".control.lock"), { recursive: true });
+  const afterLock = repair("--thread-id", THREAD_A, "--key", key10, "--apply");
+  assert.deepEqual([afterLock.status, /已补齐终态（目标模式 dialogue/u.test(afterLock.stdout)], [0, true], afterLock.stdout);
+  assert.ok(!fs.existsSync(path.join(paths.claims, key10 + ".control.lock")), "事务锁用完释放");
+  assert.equal(setTaskInteractionMode({ threadId: THREAD_A, mode: MAPPING_POLICY_ID, home }).ok, true);
 });
 
 summarySealed = true;

@@ -105,26 +105,78 @@ export function readControlFailedRecord({ claimsDir, key }) {
 
 /** 同一 key 的 consumed 临时制品（写到一半 / rename 失败留下的）：受控形状，报 consumed_in_flight；成功写出后清掉。 */
 export const CONSUMED_TMP_RE = /^([0-9a-f]{64})\.consumed\.json\.tmp\.\d+\.\d+$/u;
-export function consumedResidue({ claimsDir, key }) {
-  let names = [];
-  try { names = fs.readdirSync(claimsDir); } catch { return []; }
-  return names.filter((n) => { const m = CONSUMED_TMP_RE.exec(n); return m && m[1] === key; });
-}
-/** 清同 key 残骸；清不掉的名字原样返回（调用方要把它带进受控结果，不许吞）。 */
-function cleanupConsumedResidue({ claimsDir, key }) {
-  const left = [];
-  for (const n of consumedResidue({ claimsDir, key })) {
-    try { fs.rmSync(path.join(claimsDir, n), { force: true }); } catch { /* 下面按是否仍在判断 */ }
-    if (fs.existsSync(path.join(claimsDir, n))) left.push(n);
-  }
-  return left;
-}
+/** 损坏的 failed 记录被隔离后的名字：受控形状，账本按 control_failed_quarantined 报，人工看完再删。 */
+export const CONTROL_QUARANTINE_RE = /^([0-9a-f]{64})\.failed\.quarantined\.\d+\.\d+$/u;
+/** 逐 key 的事务锁（目录，mkdir 原子）：运输层重放、首次执行、维护入口共用同一份所有权。留下没释放的由账本报 control_lock_held。 */
+export const CONTROL_LOCK_RE = /^([0-9a-f]{64})\.control\.lock$/u;
+const CONTROL_LOCK_SUFFIX = ".control.lock";
 
 /**
- * **可恢复的控制事务**：意图已在 claim 里（三道闸之后、执行之前持久化）。
- *   · 首次：幂等执行 → 写受验 consumed → 清同 key 的临时残骸（清不掉 → residueUncleared 带回，事务仍算成）。
- *   · 重放 / 维护恢复（replay）：consumed 完整且**意图一致** → 按记录重出回执，不再执行；意图不一致 → 拒（consumed_intent_mismatch）；
- *     缺席 / 坏 → 续做（再执行一次，幂等）并写 consumed。
+ * 列同 key 的临时残骸与隔离制品 —— **三态**：listed（names）/ unlistable（why）。
+ * 目录枚举失败不许折叠成"没有残骸"：记录本身走 fd 读得出来，不代表目录里没有别的东西。
+ */
+export function listControlSidecars({ claimsDir, key }) {
+  let names;
+  try { names = fs.readdirSync(claimsDir); }
+  catch (err) { return { status: "unlistable", why: String(err.code ?? err.message) }; }
+  const pick = (re) => names.filter((n) => { const m = re.exec(n); return m && m[1] === key; });
+  return { status: "listed", residue: pick(CONSUMED_TMP_RE), quarantined: pick(CONTROL_QUARANTINE_RE) };
+}
+export function consumedResidue({ claimsDir, key }) {
+  const l = listControlSidecars({ claimsDir, key });
+  return l.status === "listed" ? { status: "listed", names: l.residue } : l;
+}
+export function quarantinedFailed({ claimsDir, key }) {
+  const l = listControlSidecars({ claimsDir, key });
+  return l.status === "listed" ? { status: "listed", names: l.quarantined } : l;
+}
+/** 清同 key 残骸：{ uncleared: 清不掉的名字, unknown: 枚举不了时的原因 }。两者都要带进受控结果，不许吞。 */
+function cleanupConsumedResidue({ claimsDir, key }) {
+  const l = consumedResidue({ claimsDir, key });
+  if (l.status !== "listed") return { uncleared: [], unknown: l.why };
+  const uncleared = [];
+  for (const n of l.names) {
+    try { fs.rmSync(path.join(claimsDir, n), { force: true }); } catch { /* 下面按是否仍在判断 */ }
+    if (fs.existsSync(path.join(claimsDir, n))) uncleared.push(n);
+  }
+  return { uncleared, unknown: null };
+}
+
+function acquireControlLock({ claimsDir, key }) {
+  const dir = path.join(claimsDir, key + CONTROL_LOCK_SUFFIX);
+  try { fs.mkdirSync(dir, { recursive: false, mode: 0o700 }); }
+  catch (err) {
+    if (err.code === "EEXIST") {
+      let owner = null;
+      try { owner = JSON.parse(fs.readFileSync(path.join(dir, "owner.json"), "utf-8")); } catch { /* 持有事实由目录承载 */ }
+      return { ok: false, reason: "control_busy", why: "这一笔已有事务持有者" + (owner ? "（pid " + owner.pid + "，自 " + owner.at + "）" : "") +
+        "；确认它已不在后删除 " + key + CONTROL_LOCK_SUFFIX + " 再试" };
+    }
+    return { ok: false, reason: "control_lock_unavailable", why: String(err.code ?? err.message) };
+  }
+  try { fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString() })); } catch { /* 同上 */ }
+  return { ok: true, release: () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 留下的由账本报 control_lock_held */ } } };
+}
+/** 在这一笔的事务锁内跑 fn；拿不到锁 → { ok:false, reason: control_busy | control_lock_unavailable }。 */
+export function withControlLock({ claimsDir, key }, fn) {
+  const lock = acquireControlLock({ claimsDir, key });
+  if (!lock.ok) return { ok: false, reason: lock.reason, why: lock.why };
+  try { return fn(); } finally { lock.release(); }
+}
+
+const SIDECAR_WORD = { valid: "完整", mismatch: "完整", unreadable: "损坏" };
+const jointWhy = (failed, consumed) => "failed（" + SIDECAR_WORD[failed.status] + "）与 consumed（" + SIDECAR_WORD[consumed.status] + "）并存";
+
+/**
+ * **可恢复的控制事务**，整体在这一笔的事务锁内：意图已在 claim 里（三道闸之后、执行之前持久化）。
+ *   · 首次：幂等执行 → 写受验 consumed → 清同 key 的临时残骸（清不掉 / 枚举不了 → residueUncleared / residueUnknown 带回，事务仍算成）。
+ *     执行失败 → 在锁内写受验 failed（consumed 不在场时）→ control_failed。
+ *   · 重放 / 维护恢复（replay）先在锁内把两份 sidecar 组成封闭联合：
+ *       两份都在（不论好坏）→ control_conflict，不执行；
+ *       consumed 完整且意图一致 → 按记录重出回执，不执行；意图不一致 → consumed_intent_mismatch；
+ *       failed 受验 → control_failed_recorded：按记录重出失败回执，不执行（重发是新消息才会再试）；
+ *       failed 损坏 → 先在锁内改名隔离（改不动 → failed_unquarantined，不执行）再续做；
+ *       都没有 / 只有损坏的 consumed → 续做（再执行一次，幂等）并写 consumed。
  *   · 写 consumed 失败：动作已成、账本未闭合 —— 如实报 ledger_unwritten。**只有运输层对同一事件的重放，或维护入口
  *     repair-control-claim，才能补齐**；Frank 在飞书重发是新消息 = 新 claim，补不了旧账。不回滚模式（会覆盖期间的合法修改）。
  * execute(mode) 必须幂等，返回 { ok, changed, reason }。
@@ -132,42 +184,54 @@ function cleanupConsumedResidue({ claimsDir, key }) {
 export function runControlTransaction({ claimsDir, key, intent, execute, replay = false }) {
   const problem = controlIntentProblem(intent);
   if (problem || intent === undefined) return { ok: false, reason: "control_intent_invalid", why: problem ?? "缺 control" };
+  return withControlLock({ claimsDir, key }, () => runLockedTransaction({ claimsDir, key, intent, execute, replay }));
+}
+function runLockedTransaction({ claimsDir, key, intent, execute, replay }) {
+  const quarantined = [];
+  const consumed = readConsumedRecord({ claimsDir, key, expectedIntent: intent });
+  const failed = readControlFailedRecord({ claimsDir, key });
   if (replay) {
-    const existing = readConsumedRecord({ claimsDir, key, expectedIntent: intent });
-    if (existing.status === "valid") return { ok: true, changed: existing.record.changed, resumed: false, replayed: true, residueUncleared: [] };
-    if (existing.status === "mismatch") return { ok: false, reason: "consumed_intent_mismatch", why: existing.why };
-    // 缺席或损坏：续做
+    if (consumed.status !== "absent" && failed.status !== "absent") return { ok: false, reason: "control_conflict", why: jointWhy(failed, consumed) };
+    if (consumed.status === "valid") return { ok: true, changed: consumed.record.changed, resumed: false, replayed: true, residueUncleared: [], residueUnknown: null, quarantined };
+    if (consumed.status === "mismatch") return { ok: false, reason: "consumed_intent_mismatch", why: consumed.why };
+    if (failed.status === "valid") return { ok: false, reason: "control_failed_recorded", why: failed.record.error, replayed: true };
+    if (failed.status === "unreadable") {
+      const name = key + ".failed.quarantined." + process.pid + "." + Date.now();
+      try { fs.renameSync(path.join(claimsDir, key + ".failed.json"), path.join(claimsDir, name)); }
+      catch (err) { return { ok: false, reason: "failed_unquarantined", why: String(err.code ?? err.message) }; }
+      quarantined.push(name);
+    }
+    // consumed 缺席或损坏、failed 不在场：续做
   }
   const done = execute(intent.mode);
-  if (!done.ok) return { ok: false, reason: "control_failed", why: done.reason ?? "?" };
+  if (!done.ok) {
+    const why = done.reason ?? "?";
+    if (consumed.status === "absent") {
+      try { recordClaimState({ claimsDir, key, state: "failed", detail: { reason: "control_failed", control: intent.control, error: why } }); }
+      catch (err) { return { ok: false, reason: "control_failed", why, ledger: "failed_unwritten：" + String(err?.code ?? err?.message ?? err), quarantined }; }
+    }
+    return { ok: false, reason: "control_failed", why, quarantined };
+  }
   const changed = done.changed !== false;
   try {
     recordClaimState({ claimsDir, key, state: "consumed", detail: { control: intent.control, mode: intent.mode, changed } });
   } catch (err) {
-    return { ok: false, reason: "ledger_unwritten", why: String(err?.code ?? err?.message ?? err), changed, resumed: replay };
+    return { ok: false, reason: "ledger_unwritten", why: String(err?.code ?? err?.message ?? err), changed, resumed: replay, quarantined };
   }
-  const residueUncleared = cleanupConsumedResidue({ claimsDir, key });
-  return { ok: true, changed, resumed: replay, replayed: false, residueUncleared };
+  const cleaned = cleanupConsumedResidue({ claimsDir, key });
+  return { ok: true, changed, resumed: replay, replayed: false, residueUncleared: cleaned.uncleared, residueUnknown: cleaned.unknown, quarantined };
 }
-
-/** 损坏的 failed 记录被维护入口隔离后的名字：受控形状，账本按 control_failed_quarantined 报，人工看完再删。 */
-export const CONTROL_QUARANTINE_RE = /^([0-9a-f]{64})\.failed\.quarantined\.\d+\.\d+$/u;
-export function quarantinedFailed({ claimsDir, key }) {
-  let names = [];
-  try { names = fs.readdirSync(claimsDir); } catch { return []; }
-  return names.filter((n) => { const m = CONTROL_QUARANTINE_RE.exec(n); return m && m[1] === key; });
-}
-const SIDECAR_WORD = { valid: "完整", unreadable: "损坏" };
 
 /**
- * 维护入口共用：一张 claim 的控制事务处在什么状态。expect 与 readClaimState 同义（维护入口用它把 claim 绑到当前 binding/task）。
+ * 维护入口共用：一张 claim 的控制事务处在什么状态（锁外的观察；真正动手时事务会在锁内重新判一遍）。
+ * expect 与 readClaimState 同义（维护入口用它把 claim 绑到当前 binding/task）。
  * 两份 sidecar（consumed / failed）**先组成封闭联合再定状态**：
  *   · claim_*：claim 缺席 / 读不出 / 身份对不上；not_control：不是控制命令；
  *   · 两份都在（不论各自好坏）→ conflict：人看；
  *   · 只有 consumed：完整且一致 → consumed；意图不一致 → mismatch；损坏 → consumed_unreadable（带意图，可恢复）；
  *   · 只有 failed：受验 → failed（当时没切成，不恢复）；损坏 → failed_unreadable（可恢复，恢复前先隔离）；
  *   · 都没有 → in_flight（可恢复）。
- * residue / quarantined 列出同 key 的临时残骸与隔离制品。
+ * residue / quarantined：同 key 的临时残骸与隔离制品；目录枚举不了时两者为 null 且 listingProblem 说明原因（不折叠成 0）。
  */
 export function inspectControlClaim({ claimsDir, key, expect = {} }) {
   const claim = readClaimState({ claimsDir, key, expect });
@@ -176,10 +240,11 @@ export function inspectControlClaim({ claimsDir, key, expect = {} }) {
   if (intent === undefined) return { state: "not_control" };
   const consumed = readConsumedRecord({ claimsDir, key });
   const failed = readControlFailedRecord({ claimsDir, key });
-  const extras = { residue: consumedResidue({ claimsDir, key }), quarantined: quarantinedFailed({ claimsDir, key }) };
-  if (consumed.status !== "absent" && failed.status !== "absent") {
-    return { state: "conflict", intent, why: "failed（" + SIDECAR_WORD[failed.status] + "）与 consumed（" + SIDECAR_WORD[consumed.status] + "）并存", ...extras };
-  }
+  const listed = listControlSidecars({ claimsDir, key });
+  const extras = listed.status === "listed"
+    ? { residue: listed.residue, quarantined: listed.quarantined, listingProblem: null }
+    : { residue: null, quarantined: null, listingProblem: listed.why };
+  if (consumed.status !== "absent" && failed.status !== "absent") return { state: "conflict", intent, why: jointWhy(failed, consumed), ...extras };
   if (consumed.status === "unreadable") return { state: "consumed_unreadable", intent, why: consumed.why, ...extras };
   if (consumed.status === "valid") {
     return sameControlIntent(intent, { control: consumed.record.control, mode: consumed.record.mode })
@@ -194,27 +259,22 @@ export function inspectControlClaim({ claimsDir, key, expect = {} }) {
 /** 维护入口允许续做的状态 —— 唯一一份，两条链的 CLI 都引用它。 */
 export const RESUMABLE_CONTROL_STATES = Object.freeze(["in_flight", "consumed_unreadable", "failed_unreadable"]);
 /**
- * 维护入口的恢复动作：只对可续做态续做；execute 由链各自注入（应带写锁内的身份前置条件）。
- *   · consumed：不执行，只再清一次残骸（清不掉照样带回）；
- *   · failed_unreadable：先把损坏的 failed 制品改名隔离（改不动 → failed_unquarantined，不执行），再续做 —— 损坏制品不许隐身。
+ * 维护入口的恢复动作：锁外先看一眼状态（拒掉明显不该动的），真正的判定与动作都交给锁内的事务：
+ *   · consumed：不执行，锁内再清一次残骸（清不掉 / 枚举不了照样带回）；
+ *   · 可续做态：走 runControlTransaction(replay)，隔离、执行、记账都在锁内；锁内若发现已被别的事务补上（如 failed 受验），按锁内结果返回。
  */
 export function resumeControlClaim({ claimsDir, key, execute, expect = {} }) {
   const seen = inspectControlClaim({ claimsDir, key, expect });
   if (seen.state === "consumed") {
-    return { ok: true, already: true, changed: seen.record.changed, intent: seen.intent, residueUncleared: cleanupConsumedResidue({ claimsDir, key }), quarantined: seen.quarantined };
+    const locked = withControlLock({ claimsDir, key }, () => cleanupConsumedResidue({ claimsDir, key }));
+    if (locked.ok === false) return { ok: false, reason: locked.reason, why: locked.why };
+    return { ok: true, already: true, changed: seen.record.changed, intent: seen.intent, residueUncleared: locked.uncleared, residueUnknown: locked.unknown, quarantined: seen.quarantined ?? [] };
   }
   if (!RESUMABLE_CONTROL_STATES.includes(seen.state)) return { ok: false, reason: seen.state, why: seen.why ?? null };
-  let quarantined = seen.quarantined;
-  if (seen.state === "failed_unreadable") {
-    const name = key + ".failed.quarantined." + process.pid + "." + Date.now();
-    try { fs.renameSync(path.join(claimsDir, key + ".failed.json"), path.join(claimsDir, name)); }
-    catch (err) { return { ok: false, reason: "failed_unquarantined", why: String(err.code ?? err.message) }; }
-    quarantined = [...quarantined, name];
-  }
   const tx = runControlTransaction({ claimsDir, key, intent: seen.intent, execute, replay: true });
   return tx.ok
-    ? { ok: true, already: false, changed: tx.changed, intent: seen.intent, residueUncleared: tx.residueUncleared ?? [], quarantined }
-    : { ok: false, reason: tx.reason, why: tx.why, quarantined };
+    ? { ok: true, already: false, changed: tx.changed, intent: seen.intent, residueUncleared: tx.residueUncleared ?? [], residueUnknown: tx.residueUnknown ?? null, quarantined: [...(seen.quarantined ?? []), ...(tx.quarantined ?? [])] }
+    : { ok: false, reason: tx.reason, why: tx.why, quarantined: tx.quarantined ?? [] };
 }
 
 const MODE_LABEL = {

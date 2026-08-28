@@ -12,7 +12,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE, CLAIM_STATE } from "./claim.mjs";
-import { CONSUMED_TMP_RE, CONTROL_QUARANTINE_RE, inspectControlClaim, readConsumedRecord } from "./control-command.mjs";
+import { CONSUMED_TMP_RE, CONTROL_LOCK_RE, CONTROL_QUARANTINE_RE, inspectControlClaim, readConsumedRecord } from "./control-command.mjs";
 
 import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
 
@@ -233,6 +233,12 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
         problems.push({ key: residue[1], reason: seen.state === "consumed" ? "consumed_residue" : "consumed_in_flight", why: "delivery-claims/" + name.slice(0, 80) });
         continue;
       }
+      const held = CONTROL_LOCK_RE.exec(name);
+      if (held) {
+        // 逐 key 事务锁：正常只存在几毫秒；盘点时撞见就如实报，人确认没有进程在跑再删。
+        problems.push({ key: held[1], reason: "control_lock_held", why: "事务锁在：delivery-claims/" + name.slice(0, 80) + "（确认没有进程在跑后删除）" });
+        continue;
+      }
       const quarantine = CONTROL_QUARANTINE_RE.exec(name);
       if (quarantine) {
         // 维护入口隔离的损坏 failed 制品：不参与状态判定，但必须能盘点到，人看完再删。
@@ -244,11 +250,12 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
       if (m[2] === CLAIM_STATE.CONSUMED + ".json") {
         // consumed 不是 run 终局、不参与孤儿判定，但要**与它的 claim 交叉核对**：内容坏 → consumed_unreadable；
         // 没有 claim / claim 读不出 → consumed_orphan；claim 无控制意图或意图不一致 → consumed_intent_mismatch。
+        // 先用与核心同一份封闭联合投影：并存（不论好坏）报 control_conflict；然后才是"内容坏"这一层。
+        const seen = inspectControlClaim({ claimsDir, key: m[1] });
+        if (seen.state === "conflict") { problems.push({ key: m[1], reason: "control_conflict", why: name + "：" + seen.why }); continue; }
         const raw = readConsumedRecord({ claimsDir, key: m[1] });
         if (raw.status === "unreadable") { problems.push({ key: m[1], reason: "consumed_unreadable", why: name + "：" + raw.why }); continue; }
-        const seen = inspectControlClaim({ claimsDir, key: m[1] });
         if (seen.state === "consumed") { /* 完整且一致 */ }
-        else if (seen.state === "conflict") problems.push({ key: m[1], reason: "control_conflict", why: name + "：" + seen.why });
         else if (seen.state === "consumed_unreadable") problems.push({ key: m[1], reason: "consumed_unreadable", why: name + "：" + seen.why });
         else if (seen.state === "mismatch") problems.push({ key: m[1], reason: "consumed_intent_mismatch", why: name + "：" + seen.why });
         else if (seen.state.startsWith("claim_") || seen.state === "not_control") problems.push({ key: m[1], reason: "consumed_orphan", why: name + "：" + seen.state });

@@ -319,7 +319,16 @@ const runControl = (replay) => {
         message_id: verdict.messageId, claim_acquired: true, handed_off: false, error: tx.why });
       finish("error", { detail: "模式已切换，但终态没记下（" + tx.why + "）；重发不会补齐（新消息是新一笔），请用维护入口 repair-control-claim 处理这一笔" }, { reason: tx.reason });
     }
-    if (!replay) recordClaimState({ claimsDir: paths.claims, key: claim.key, state: "failed", detail: { reason: "control_failed", control: control.kind, error: tx.why } });
+    if (tx.reason === "control_failed_recorded") {
+      writeReceipt("control-" + verdict.messageId, { status: "error", reason: tx.reason, control: control.kind, mode: control.mode, replayed: true,
+        message_id: verdict.messageId, claim_acquired: false, handed_off: false, error: tx.why });
+      finish("error", { detail: "这条控制命令之前执行失败（" + tx.why + "）；本次是同一条消息的重放，没有再次尝试。要再切请重新发一条。" }, { reason: tx.reason });
+    }
+    if (tx.reason === "control_conflict") {
+      writeReceipt("control-" + verdict.messageId, { status: "error", reason: tx.reason, control: control.kind, mode: control.mode,
+        message_id: verdict.messageId, claim_acquired: false, handed_off: false, error: tx.why });
+      finish("error", { detail: "这一笔的终态自相矛盾（" + tx.why + "），没有执行；请用维护入口 repair-control-claim 处理这一笔" }, { reason: tx.reason });
+    }
     writeReceipt("control-" + verdict.messageId, { status: "error", reason: tx.reason, control: control.kind, mode: control.mode,
       message_id: verdict.messageId, claim_acquired: true, handed_off: false, error: tx.why });
     finish("error", { detail: "模式没有切换（" + tx.why + "）" }, { reason: tx.reason });

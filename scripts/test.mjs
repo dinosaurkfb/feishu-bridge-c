@@ -7,7 +7,7 @@
  * v2：标识符全部换到 Aily 命名空间（见 selector.mjs 顶部说明）。
  */
 
-import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim } from "./control-command.mjs";
+import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue } from "./control-command.mjs";
 import { describePendingWindow } from "./layered-status.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -68,7 +68,7 @@ import {
   runRouteSha256, markPublished, readPublishLedger, writePublishLedger, publishHold } from "./outbound.mjs";
 import { parseRunOutcome } from "./handoff.mjs";
 import { repairRunClaims } from "./repair-run-claim.mjs";
-import { claudeClaimExpectation, controlRepairPrecondition, repairExitCode } from "./repair-control-claim.mjs";
+import { claudeClaimExpectation, controlRepairPrecondition, repairExitCode, expectationFromMapping, describeControlRepair } from "./repair-control-claim.mjs";
 import {
   describeDrainOutcome, drainProject, inspectRunChannel, outboxDirOf, suppressCmd, watcherActive, inventoryUnroutedReplies } from "./drain-outbox.mjs";
 import { CANDIDATE_POLICIES, publishOutboxAttempt } from "./publish-attempt.mjs";
@@ -18433,6 +18433,111 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   assert.equal(repair("--project", root, "--key", key6, "--apply").status, 0);
   assert.equal(policyOf(), MAPPING_POLICY_ID);
 
+  // ── 评审第 6 轮 ──
+  // ① 旧形状项目文件（无 binding_id / topic_generation_state）：期望里的 bindingId 用存储层同一算法带 root 推导，约束不丢
+  {
+    const legacyRoot = path.join(local, "legacy-project");
+    const legacyClaims = path.join(legacyRoot, ".runtime-data", "inbound", "delivery-claims");
+    const mk = (messageId, binding_id) => acquireClaim({ claimsDir: legacyClaims, messageId, logicalTaskKey: "same-logical-task",
+      meta: { ...protoMeta, binding_id, claude_session_id: null, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).key;
+    const foreignKey = mk("message-one", "different-binding");
+    const ownKey = mk("message-two", "legacy-project@project-files");
+    const legacyRecord = { logical_task_key: "same-logical-task", claude_session_id: null };
+    const meta = { source: "project-files", root: legacyRoot, bindingId: "legacy-project@project-files" };
+    assert.equal(expectationFromMapping(legacyRecord, { root: legacyRoot }).bindingId, "legacy-project@project-files");
+    assert.equal(controlRepairPrecondition({ claimsDir: legacyClaims, key: foreignKey })(legacyRecord, meta), false, "别的 binding 的 claim 不许过");
+    assert.equal(controlRepairPrecondition({ claimsDir: legacyClaims, key: ownKey })(legacyRecord, meta), true);
+    assert.equal(controlRepairPrecondition({ claimsDir: legacyClaims, key: foreignKey, root: legacyRoot })(legacyRecord, { source: "project-files" }), false, "meta 没带 root 也用 CLI 的 root");
+  }
+  // ② 运输层重放遇到受验的 failed：按记录重出失败回执，不执行、不留下 failed+consumed 并存
+  const key10 = claimKey("msg_c10", logicalTaskKey);
+  assert.ok(acquireClaim({ claimsDir, messageId: "msg_c10", logicalTaskKey, meta: { ...protoMeta, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).ok);
+  recordClaimState({ claimsDir, key: key10, state: "failed", detail: { reason: "control_failed", control: "mode", error: "initial execution failed" } });
+  let executions = 0;
+  const failedReplay = runControlTransaction({ claimsDir, key: key10, intent: { control: "mode", mode: DIALOGUE_POLICY_ID }, replay: true, execute: () => { executions += 1; return { ok: true, changed: true }; } });
+  assert.deepEqual([failedReplay.ok, failedReplay.reason, failedReplay.why, failedReplay.replayed, executions], [false, "control_failed_recorded", "initial execution failed", true, 0]);
+  assert.equal(inspectControlClaim({ claimsDir, key: key10 }).state, "failed", "没有留下并存");
+  const failedViaTransport = run("/feishu-mode dialogue", "msg_c10");
+  assert.equal(failedViaTransport.status, 1, failedViaTransport.stdout);
+  assert.match(failedViaTransport.stdout, /之前执行失败（initial execution failed）；本次是同一条消息的重放，没有再次尝试/u, failedViaTransport.stdout);
+  assert.equal(policyOf(), MAPPING_POLICY_ID, "重放不执行");
+  assert.equal(inspectControlClaim({ claimsDir, key: key10 }).state, "failed");
+  // 首次执行失败：failed 由事务在锁内写（不再由入站另写）
+  const key11 = claimKey("msg_c11", logicalTaskKey);
+  assert.ok(acquireClaim({ claimsDir, messageId: "msg_c11", logicalTaskKey, meta: { ...protoMeta, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).ok);
+  const firstFail = runControlTransaction({ claimsDir, key: key11, intent: { control: "mode", mode: DIALOGUE_POLICY_ID }, execute: () => ({ ok: false, reason: "registry_unwritable" }) });
+  assert.deepEqual([firstFail.ok, firstFail.reason, firstFail.why], [false, "control_failed", "registry_unwritable"]);
+  const firstFailSeen = inspectControlClaim({ claimsDir, key: key11 });
+  assert.deepEqual([firstFailSeen.state, firstFailSeen.record.error], ["failed", "registry_unwritable"]);
+  assert.ok(!fs.existsSync(path.join(claimsDir, key11 + ".control.lock")), "事务锁在结束时释放");
+  // ③ 逐 key 事务锁：另一笔持有时，重放 / 维护入口都拿不到、不执行；账本能盘点到没释放的锁
+  const key12 = claimKey("msg_c12", logicalTaskKey);
+  assert.ok(acquireClaim({ claimsDir, messageId: "msg_c12", logicalTaskKey, meta: { ...protoMeta, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).ok);
+  fs.mkdirSync(path.join(claimsDir, key12 + ".control.lock"));
+  fs.writeFileSync(path.join(claimsDir, key12 + ".control.lock", "owner.json"), JSON.stringify({ pid: 4242, at: "2026-08-29T00:00:00.000Z" }));
+  executions = 0;
+  const busyTx = runControlTransaction({ claimsDir, key: key12, intent: { control: "mode", mode: DIALOGUE_POLICY_ID }, replay: true, execute: () => { executions += 1; return { ok: true, changed: true }; } });
+  assert.deepEqual([busyTx.ok, busyTx.reason, executions], [false, "control_busy", 0]);
+  assert.match(busyTx.why, /pid 4242/u);
+  const busyRepair = repair("--project", root, "--key", key12, "--apply");
+  assert.deepEqual([busyRepair.status, /没有恢复（control_busy/u.test(busyRepair.stdout)], [1, true], busyRepair.stdout);
+  assert.equal(policyOf(), MAPPING_POLICY_ID);
+  const busyVia = run("/feishu-mode dialogue", "msg_c12");
+  assert.equal(busyVia.status, 1, busyVia.stdout);
+  assert.match(busyVia.stdout, /control_busy|已有事务持有者/u, busyVia.stdout);
+  const lockInv = inventoryRuns({ runsDir: RUNS, claimsDir });
+  assert.ok(lockInv.problems.some((p) => p.key === key12 && p.reason === "control_lock_held"), JSON.stringify(lockInv.problems));
+  assert.ok(!lockInv.problems.some((p) => p.reason === "unrecognized_entry"));
+  fs.rmSync(path.join(claimsDir, key12 + ".control.lock"), { recursive: true });
+  // 锁内重判：锁外看是 failed 损坏，动手前被人补成受验 failed → 事务按记录返回失败，不隔离、不执行
+  fs.mkdirSync(path.join(claimsDir, key12 + ".failed.json"));
+  assert.equal(inspectControlClaim({ claimsDir, key: key12 }).state, "failed_unreadable");
+  executions = 0;
+  const swapped = runControlTransaction({ claimsDir, key: key12, intent: { control: "mode", mode: DIALOGUE_POLICY_ID }, replay: true,
+    execute: () => { executions += 1; return { ok: true, changed: true }; } });
+  assert.deepEqual([swapped.ok, swapped.quarantined.length, executions], [true, 1, 1], "损坏的 failed 在锁内隔离后续做：" + JSON.stringify(swapped));
+  assert.ok(!fs.existsSync(path.join(claimsDir, key12 + ".control.lock")), "事务锁用完释放");
+  fs.rmSync(path.join(claimsDir, key12 + ".failed.json"), { recursive: true, force: true });
+  for (const n of fs.readdirSync(claimsDir).filter((n) => n.startsWith(key12 + ".failed.quarantined."))) fs.rmSync(path.join(claimsDir, n), { recursive: true });
+  fs.rmSync(path.join(claimsDir, key12 + ".consumed.json"), { force: true });
+  // ④ 账本用同一份封闭联合投影：consumed 损坏 + failed 受验 → control_conflict，不是只报 consumed_unreadable
+  const key13 = claimKey("msg_c13", logicalTaskKey);
+  assert.ok(acquireClaim({ claimsDir, messageId: "msg_c13", logicalTaskKey, meta: { ...protoMeta, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).ok);
+  fs.writeFileSync(path.join(claimsDir, key13 + ".consumed.json"), "{broken");
+  recordClaimState({ claimsDir, key: key13, state: "failed", detail: { reason: "control_failed", control: "mode", error: "x" } });
+  const unionInv = inventoryRuns({ runsDir: RUNS, claimsDir });
+  assert.deepEqual(unionInv.problems.filter((p) => p.key === key13).map((p) => [p.reason, /failed（完整）与 consumed（损坏）并存/u.test(p.why)]), [["control_conflict", true]], JSON.stringify(unionInv.problems));
+  // 运输层重放撞上并存：锁内判 control_conflict，不执行
+  const conflictVia = run("/feishu-mode dialogue", "msg_c13");
+  assert.deepEqual([conflictVia.status, /自相矛盾（failed（完整）与 consumed（损坏）并存）/u.test(conflictVia.stdout)], [1, true], conflictVia.stdout);
+  assert.equal(policyOf(), MAPPING_POLICY_ID);
+  fs.rmSync(path.join(claimsDir, key13 + ".failed.json"));
+  assert.deepEqual(inventoryRuns({ runsDir: RUNS, claimsDir }).problems.filter((p) => p.key === key13).map((p) => p.reason), ["consumed_unreadable"]);
+  // ⑤ 目录枚举失败不折叠成"没有残骸"：三态 + fail-closed（记录本身仍读得出）
+  {
+    const key14 = claimKey("msg_c14", logicalTaskKey);
+    assert.ok(acquireClaim({ claimsDir, messageId: "msg_c14", logicalTaskKey, meta: { ...protoMeta, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).ok);
+    recordClaimState({ claimsDir, key: key14, state: "consumed", detail: { control: "mode", mode: DIALOGUE_POLICY_ID, changed: false } });
+    const residue14 = path.join(claimsDir, key14 + ".consumed.json.tmp.7.7");
+    fs.writeFileSync(residue14, "{}");
+    const originalReaddir = fs.readdirSync;
+    fs.readdirSync = (...args) => { const e = new Error("EIO"); e.code = "EIO"; throw e; };
+    try {
+      const seen14 = inspectControlClaim({ claimsDir, key: key14 });
+      assert.deepEqual([seen14.state, seen14.residue, seen14.quarantined, seen14.listingProblem], ["consumed", null, null, "EIO"]);
+      assert.deepEqual([listControlSidecars({ claimsDir, key: key14 }).status, consumedResidue({ claimsDir, key: key14 }).status], ["unlistable", "unlistable"]);
+      assert.equal(repairExitCode({ seen: seen14, result: null, apply: true }), 1);
+      assert.match(describeControlRepair({ seen: seen14, result: null, apply: false }), /同 key 的临时制品说不清（EIO）/u);
+      const resumed14 = resumeControlClaim({ claimsDir, key: key14, execute: () => { throw new Error("must not execute"); } });
+      assert.deepEqual([resumed14.ok, resumed14.already, resumed14.residueUnknown], [true, true, "EIO"]);
+      assert.equal(repairExitCode({ seen: seen14, result: resumed14, apply: true }), 1);
+      assert.match(describeControlRepair({ seen: seen14, result: resumed14, apply: true }), /残骸情况说不清（EIO）/u);
+    } finally { fs.readdirSync = originalReaddir; }
+    assert.ok(fs.existsSync(residue14), "枚举不了时没有乱清");
+    assert.equal(repair("--project", root, "--key", key14, "--apply").status, 0, "恢复枚举后清掉、退出 0");
+    assert.ok(!fs.existsSync(residue14));
+  }
+
   const same = run("/feishu-mode mapping", "msg_c3");
   assert.match(same.stdout, /^模式未变 · 控制演示\n本来就是 Mapping/u, same.stdout);
   const notControl = run("/feishu-mode dialogue 吧", "msg_c4");
@@ -18505,7 +18610,7 @@ test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进
     fs.chmodSync(claimsDir, 0o500);
     try {
       const ro = resumeControlClaim({ claimsDir, key: roKey, execute });
-      assert.deepEqual([ro.ok, ro.reason, executed], [false, "failed_unquarantined", 0], JSON.stringify(ro));
+      assert.deepEqual([ro.ok, ro.reason, executed], [false, "control_lock_unavailable", 0], "目录不可写：连事务锁都建不了，不执行：" + JSON.stringify(ro));
     } finally { fs.chmodSync(claimsDir, 0o700); }
   }
   assert.deepEqual([...RESUMABLE_CONTROL_STATES].sort(), ["consumed_unreadable", "failed_unreadable", "in_flight"]);

@@ -77,15 +77,60 @@ export function readTurnRecord({ dir, key } = {}) {
   try { record = JSON.parse(fs.readFileSync(file, "utf-8")); }
   catch (err) { return { ok: false, reason: err.code === "ENOENT" ? "not_found" : "unreadable", file }; }
   if (record?.schema_version !== "1.0") return { ok: false, reason: "invalid_cache", file };
+  const consumed = typeof record.consumed_at === "string" && record.consumed_at.length > 0;
   if (record.input_origin === "local") {
     if (typeof record.text !== "string" || !record.text.trim()) return { ok: false, reason: "invalid_cache", file };
-    return { ok: true, kind: "local", file, text: record.text, captureId: typeof record.capture_id === "string" && record.capture_id ? record.capture_id : null };
+    return { ok: true, kind: "local", file, consumed, text: record.text, captureId: typeof record.capture_id === "string" && record.capture_id ? record.capture_id : null };
   }
   if (record.input_origin === "feishu") {
     if (typeof record.message_id !== "string" || !record.message_id) return { ok: false, reason: "invalid_cache", file };
-    return { ok: true, kind: "feishu", file, messageId: record.message_id };
+    return { ok: true, kind: "feishu", file, consumed, messageId: record.message_id };
   }
   return { ok: false, reason: "invalid_cache", file };
+}
+
+/**
+ * Stop 用完这份记录就打上 consumed_at（原子覆写）：同一回合 Stop 重入拿到的是"已消费"，零入队；
+ * 上一轮的记录也不可能再授权下一次 Stop —— 每个获准执行的 prompt 都要留下自己的新记录。
+ */
+export function consumeTurnRecord({ dir, key, now = Date.now() } = {}) {
+  if (typeof dir !== "string" || !dir || typeof key !== "string" || !key) return { ok: false, reason: "missing_locator" };
+  const file = cacheFile(dir, key);
+  let record;
+  try { record = JSON.parse(fs.readFileSync(file, "utf-8")); }
+  catch (err) { return { ok: false, reason: err.code === "ENOENT" ? "not_found" : "unreadable", file }; }
+  if (record === null || typeof record !== "object") return { ok: false, reason: "invalid_cache", file };
+  try {
+    const tmp = file + ".tmp." + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify({ ...record, consumed_at: new Date(now).toISOString() }, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return { ok: true, file };
+  } catch (err) {
+    return { ok: false, reason: "unwritable", error: String(err?.code ?? err?.message ?? err) };
+  }
+}
+
+/**
+ * 登记表读不出来、绑定解析不了的时候，init-hook 仍要保证上一轮的记录不会活到这一轮：
+ * 从 cwd 往上找所有 `.runtime-data/outbound/turn-inputs*` 里属于这个会话的记录。
+ */
+export function findTurnRecordDirsUpward({ cwd, key } = {}) {
+  if (typeof cwd !== "string" || !cwd || typeof key !== "string" || !key) return [];
+  const found = [];
+  let dir = path.resolve(cwd);
+  for (;;) {
+    const outbound = path.join(dir, ".runtime-data", "outbound");
+    let names = [];
+    try { names = fs.readdirSync(outbound).filter((n) => n.startsWith("turn-inputs")); } catch { names = []; }
+    for (const n of names) {
+      const candidate = path.join(outbound, n);
+      if (fs.existsSync(cacheFile(candidate, key))) found.push(candidate);
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return found;
 }
 
 /** 只认飞书回合；本地回合返回 local_turn。 */

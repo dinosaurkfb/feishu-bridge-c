@@ -18,7 +18,7 @@ import fs from "node:fs";
 import { isDirectRun } from "./direct-run.mjs";
 
 import {
-  claudeTurnInputDir, clearTurnInput, feishuStampMessageId, isFeishuStampedInput, storeInboundTurn, storeTurnInput,
+  claudeTurnInputDir, clearTurnInput, feishuStampMessageId, findTurnRecordDirsUpward, isFeishuStampedInput, storeInboundTurn, storeTurnInput,
 } from "./turn-input.mjs";
 
 /** 只认 `/init` 本身和带参数的 `/init xxx`。别的斜杠命令一概不管。 */
@@ -76,36 +76,49 @@ async function main() {
   // 标记，但有确定性来源戳。两者都不缓存，后者还会清掉同会话可能遗留的旧输入，避免
   // 下一次 Stop 把一条过期本地 prompt 错配给飞书回复。
   if (!process.env.FEISHU_BRIDGE_ROLE && speakingSession) {
+    const feishu = isFeishuStampedInput(prompt);
+    const messageId = feishu ? feishuStampMessageId(prompt) : null;
+    const refuse = (why) => {
+      process.stderr.write("[飞书桥] 记不下这一轮的来源（" + why + "），为避免回复发错话题，本轮不执行。\n");
+      process.exit(2);
+    };
+    // 每个获准执行的 prompt 都必须留下**自己的**记录；上一轮的记录不能活到这一轮。
+    // 写记录：飞书回合记消息 id，本地回合记正文（空正文则清掉）。任一失败 → 阻止本轮。
+    const writeRecord = (dir) => {
+      if (feishu) {
+        if (!messageId) refuse("stamp_without_message_id");
+        const stored = storeInboundTurn({ dir, key: speakingSession, messageId });
+        if (!stored.ok) refuse(stored.reason + (stored.error ? "：" + stored.error : ""));
+        return;
+      }
+      const stored = storeTurnInput({ dir, key: speakingSession, text: prompt });
+      if (!stored.ok) {
+        const cleared = clearTurnInput({ dir, key: speakingSession });
+        if (!cleared.ok) refuse((stored.error ?? stored.reason) + "；清理旧记录也失败");
+      }
+    };
     const registry = loadRegistry();
+    let covered = [];
     if (registry.ok) {
       for (const project of registry.projects.filter((item) => isUnder(cwd, item.root))) {
         const bound = resolveProject({ root: project.root, claudeSessionId: speakingSession });
-        if (!bound.ok || bound.mapping?.status !== "active") continue;
-        const dir = claudeTurnInputDir(project.root, bound.claudeSessionId);
-        // **本轮来源是一份记录、一次原子覆写**：飞书回合记消息 id，本地回合记正文。
-        // 记不上就不让这一轮跑（退出码 2 = 阻止这条 prompt）—— 否则 Stop 会拿着上一轮的来源发错话题。
-        if (isFeishuStampedInput(prompt)) {
-          const messageId = feishuStampMessageId(prompt);
-          const stored = messageId
-            ? storeInboundTurn({ dir, key: speakingSession, messageId })
-            : { ok: false, reason: "stamp_without_message_id" };
-          if (!stored.ok) {
-            process.stderr.write("[飞书桥] 记不下这一轮的飞书来源（" + stored.reason + (stored.error ? "：" + stored.error : "") +
-              "），为避免回复发错话题，本轮不执行。\n");
-            process.exit(2);
-          }
-        } else {
-          const stored = storeTurnInput({ dir, key: speakingSession, text: prompt });
-          if (!stored.ok && stored.reason !== "empty_input") {
-            // 本地正文记不上：至少把上一轮的来源清掉；连清都清不掉就阻止这一轮。
-            const cleared = clearTurnInput({ dir, key: speakingSession });
-            if (!cleared.ok) {
-              process.stderr.write("[飞书桥] 记不下本轮来源也清不掉上一轮的（" + (stored.error ?? stored.reason) + "），本轮不执行。\n");
-              process.exit(2);
-            }
-          }
+        if (bound.ok && bound.mapping?.status === "active") {
+          const dir = claudeTurnInputDir(project.root, bound.claudeSessionId);
+          writeRecord(dir);
+          covered.push(dir);
+        } else if (feishu) {
+          // 飞书回合但绑定解析不了：登记不了来源，不让这一轮跑。
+          refuse("binding_unresolved：" + String(bound.reason ?? bound.mapping?.status ?? "?"));
         }
       }
+    } else if (feishu) {
+      refuse("registry_unreadable：" + String(registry.reason ?? registry.error ?? "?"));
+    }
+    // 登记表读不出 / 绑定解析不了 / 项目不在登记表里：仍要把上一轮遗留的记录换成这一轮的（或清掉），
+    // 否则 Stop 会拿着旧的飞书来源把本地回复发回老话题（评审探针）。
+    for (const dir of findTurnRecordDirsUpward({ cwd, key: speakingSession })) {
+      if (covered.includes(dir)) continue;
+      writeRecord(dir);
     }
   }
 

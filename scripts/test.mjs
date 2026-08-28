@@ -4703,8 +4703,10 @@ test("Claude UserPromptSubmit 与 Stop 配对本地输入；飞书来源戳的�
   assert.equal(replies.length, 2, "飞书回合反查不到 claim：不知道该回哪个话题，零入队（当前代际不是安全回落值）");
   const unrouted = path.join(project, ".runtime-data", "outbound", "unrouted-replies");
   const diags = fs.readdirSync(unrouted).map((n) => JSON.parse(fs.readFileSync(path.join(unrouted, n), "utf-8")));
-  assert.equal(diags.length, 1);
-  assert.deepEqual([diags[0].reason, diags[0].message_id, diags[0].reply_preview], ["claim_absent", "msg_inbound", "飞书指令已经完成"]);
+  // 两份诊断：上面那次同一回合的 Stop 重入（记录已消费）+ 这次反查不到 claim。完整答复留在记录里，不是预览。
+  assert.deepEqual(diags.map((d) => d.reason).sort(), ["claim_absent", "turn_record_consumed"]);
+  const absent = diags.find((d) => d.reason === "claim_absent");
+  assert.deepEqual([absent.message_id, absent.reply_text, absent.artifact_type], ["msg_inbound", "飞书指令已经完成", "feishu_bridge_unrouted_reply"]);
 });
 
 test("模板缺字段 → 报出缺哪些，不放行", () => {
@@ -17881,13 +17883,55 @@ test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结�
   assert.equal(replies().length, 2);
   assert.equal(diags().at(-1).reason, "turn_record_not_found");
 
+  // claim 必须是这条绑定、这个会话的：binding 缺失 / 错 binding / 错 session 的 claim 形状合法也不算
+  const mkClaim = (messageId, over) => acquireClaim({ claimsDir, messageId, logicalTaskKey: mapping.logical_task_key,
+    meta: { session_id: "session_old", binding_id: effectiveBindingId(mapping, { root: fx.root }), claude_session_id: null,
+      policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, local_target_id: "local_target_x",
+      origin_channel_generation_id: fx.oldGen.channel_generation_id, ...over } });
+  const cases = [
+    ["msg_wrong_binding", { binding_id: "someone-else@registry" }],
+    ["msg_wrong_session", { claude_session_id: "0f1e2d3c-4b5a-4978-8f6e-5d4c3b2a1908" }],
+    ["msg_no_binding", { binding_id: undefined }],
+  ];
+  for (const [mid, over] of cases) {
+    assert.equal(mkClaim(mid, over).ok, true, mid);
+    assert.equal(prompt("[飞书 · " + mid + " · 2026-08-28 10:08Z]\n身份对不上的 claim").status, 0);
+    assert.equal(stop("身份对不上时的回复 " + mid).status, 0);
+    assert.equal(replies().length, 2, mid + "：claim 身份对不上 → 零入队");
+    assert.equal(diags().at(-1).reason, "claim_unreadable", mid + "：" + JSON.stringify(diags().at(-1)));
+    assert.match(String(diags().at(-1).why), /binding|session/u, mid);
+  }
+
+  // 上一轮记录不能活到这一轮：老话题回合留下的飞书记录被 Stop 消费；登记表暂时坏了时本地 prompt 仍要覆写它
+  assert.equal(prompt("[飞书 · msg_old_topic · 2026-08-28 10:09Z]\n再来一次老话题指令").status, 0);
+  assert.equal(stop("老话题第二次回复").status, 0);
+  assert.equal(targetOf("老话题第二次回复"), fx.oldGen.channel_generation_id);
+  const before = replies().length;
+  const goodRegistry = fs.readFileSync(fx.registryFile, "utf-8");
+  fs.writeFileSync(fx.registryFile, "{not json");
+  const localWhileBroken = prompt("登记表坏掉时敲的本地一句");
+  assert.equal(localWhileBroken.status, 0, "本地 prompt 不因登记表坏而被拦：" + localWhileBroken.stderr);
+  const rec = readTurnRecord({ dir: claudeTurnInputDir(fx.root, null), key: session });
+  assert.deepEqual([rec.ok, rec.kind, rec.consumed], [true, "local", false], "登记表坏了也要把上一轮的飞书记录换成本地：" + JSON.stringify(rec));
+  const feishuWhileBroken = prompt("[飞书 · msg_while_broken · 2026-08-28 10:10Z]\n登记表坏掉时的飞书指令");
+  assert.equal(feishuWhileBroken.status, 2, "飞书回合登记不了来源 → 阻止本轮");
+  assert.match(feishuWhileBroken.stderr, /registry_unreadable/u);
+  fs.writeFileSync(fx.registryFile, goodRegistry);
+  assert.equal(stop("登记表恢复后的本地回复").status, 0);
+  assert.equal(replies().length, before + 1);
+  assert.equal(targetOf("登记表恢复后的本地回复"), fx.newGen.channel_generation_id, "本地回复发当前代际，不是老话题");
+  // 同一回合 Stop 重入：记录已消费 → 零入队
+  assert.equal(stop("登记表恢复后的本地回复").status, 0);
+  assert.equal(replies().length, before + 1);
+  assert.equal(diags().at(-1).reason, "turn_record_consumed");
+
   // 来源记不上就不让这一轮跑：把记录目录换成文件，飞书 prompt → 退出码 2；本地 prompt 也清不掉上一轮 → 退出码 2
   const inputDir = claudeTurnInputDir(fx.root, null);
   fs.rmSync(inputDir, { recursive: true, force: true });
   fs.writeFileSync(inputDir, "occupied");
   const blockedFeishu = prompt("[飞书 · msg_blocked · 2026-08-28 10:07Z]\n记不下来源");
   assert.equal(blockedFeishu.status, 2, blockedFeishu.stderr);
-  assert.match(blockedFeishu.stderr, /记不下这一轮的飞书来源/u);
+  assert.match(blockedFeishu.stderr, /记不下这一轮的来源/u);
   const blockedLocal = prompt("本地也记不下");
   assert.equal(blockedLocal.status, 2, blockedLocal.stderr);
   fs.rmSync(inputDir, { force: true });

@@ -16,6 +16,7 @@
  * 崩一次就是所有会话都收到钩子报错。桥断了是桥的事，不能溅到别人的活上。
  */
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { claimKey, readClaimState } from "./claim.mjs";
@@ -24,7 +25,7 @@ import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
 
 import {
-  claudeTurnInputDir, clearTurnInput, readTurnInput, readTurnRecord } from "./turn-input.mjs";
+  claudeTurnInputDir, clearTurnInput, readTurnInput, consumeTurnRecord, readTurnRecord } from "./turn-input.mjs";
 
 // 会话结束是同步阻塞点：Frank 的终端在等它返回。发不出去就留在 outbox，
 // 兜底定时器 30 分钟内会重试 —— 宁可晚发，不可吊住会话。
@@ -165,14 +166,23 @@ async function main() {
       const record = readTurnRecord({ dir: inputDir, key: speakingSession });
       if (!record.ok) {
         turnRoute = { ok: false, reason: "turn_record_" + record.reason };
+      } else if (record.consumed) {
+        // 这份记录已经授权过一次 Stop：重入 / 上一轮遗留都不许再入队。
+        turnRoute = { ok: false, reason: "turn_record_consumed", messageId: record.messageId ?? null };
       } else if (record.kind === "local") {
         turnRoute = { ok: true, kind: "local" };
       } else {
         turnRoute = { ok: false, reason: "claim_unavailable", messageId: record.messageId };
         if (bound.mapping?.logical_task_key) {
+          // **claim 必须是这条绑定、这个会话的**：通用形状合法但 binding / session 对不上的 claim 不算。
           const claimState = readClaimState({
             claimsDir: path.join(project.root, ".runtime-data", "inbound", "delivery-claims"),
             key: claimKey(record.messageId, bound.mapping.logical_task_key),
+            expect: {
+              logicalTaskKey: bound.mapping.logical_task_key,
+              bindingId: effectiveBindingId(bound.mapping, { root: project.root }),
+              claudeSessionId: boundSession ?? null,
+            },
           });
           if (claimState.status !== "valid") {
             turnRoute = { ok: false, reason: "claim_" + claimState.status, why: claimState.why ?? null, messageId: record.messageId };
@@ -229,17 +239,25 @@ async function main() {
     // 弱信号用来触发排空是安全的（那些内容本来就要发），但用它决定
     // 「把整段对话原文发到谁的话题里」不行 —— 一次误判就是把无关对话发给了 Frank。
     if (reply && project.via.includes("cwd") && !turnRoute.ok) {
-      // 零入队 + 可诊断：留一份记录给人看（doctor 之后可以扫这个目录），日志里也说清。
+      // 零入队 + 可诊断：完整答复留在记录里（不是预览），临时文件 + rename 原子落盘，文件名带随机段不会覆盖。
       const unrouted = path.join(project.root, ".runtime-data", "outbound", "unrouted-replies");
       try {
         fs.mkdirSync(unrouted, { recursive: true, mode: 0o700 });
-        fs.writeFileSync(path.join(unrouted, Date.now() + "-" + speakingSession.slice(0, 8) + ".json"), JSON.stringify({
-          schema_version: "1.0", reason: turnRoute.reason, why: turnRoute.why ?? null, message_id: turnRoute.messageId ?? null,
-          origin_channel_generation_id: turnRoute.origin ?? null, session_id: speakingSession, recorded_at: new Date().toISOString(),
-          reply_preview: reply.slice(0, 120),
+        const name = Date.now() + "-" + speakingSession.slice(0, 8) + "-" + crypto.randomUUID().slice(0, 8) + ".json";
+        const file = path.join(unrouted, name);
+        const tmp = file + ".tmp." + process.pid;
+        fs.writeFileSync(tmp, JSON.stringify({
+          schema_version: "1.0", artifact_type: "feishu_bridge_unrouted_reply", reason: turnRoute.reason, why: turnRoute.why ?? null,
+          message_id: turnRoute.messageId ?? null, origin_channel_generation_id: turnRoute.origin ?? null, session_id: speakingSession,
+          binding_id: effectiveBindingId(bound.mapping, { root: project.root }) ?? null, recorded_at: new Date().toISOString(),
+          reply_text: reply,
         }, null, 2) + "\n", { mode: 0o600 });
+        fs.renameSync(tmp, file);
       } catch (err) { log(project.id + " unrouted record unwritable: " + err.message); }
       log(project.id + " reply NOT queued: " + turnRoute.reason + (turnRoute.why ? "（" + turnRoute.why + "）" : ""));
+      if (turnRoute.reason !== "turn_record_consumed" && !String(turnRoute.reason).startsWith("turn_record_")) {
+        consumeTurnRecord({ dir: inputDir, key: speakingSession });
+      }
     } else if (reply && project.via.includes("cwd")) {
       const input = speakingSession
         ? readTurnInput({ dir: inputDir, key: speakingSession })
@@ -261,6 +279,8 @@ async function main() {
         wroteThisTurn.add(project.root);
         log(project.id + " reply queued (" + reply.length + " 字符)");
       }
+      // 这份来源记录已经授权过一次入队：打上消费标记，重入与下一轮都不能再用它。
+      if (turnRoute.kind === "local" || turnRoute.kind === "feishu") consumeTurnRecord({ dir: inputDir, key: speakingSession });
     } else if (!reply && speakingSession && project.via.includes("cwd")) {
       clearTurnInput({ dir: inputDir, key: speakingSession });
     }

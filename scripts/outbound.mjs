@@ -12,7 +12,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE, CLAIM_STATE } from "./claim.mjs";
-import { CONSUMED_TMP_RE, CONTROL_LOCK_RE, CONTROL_QUARANTINE_RE, inspectControlClaim, readConsumedRecord } from "./control-command.mjs";
+import { CONSUMED_TMP_RE, CONTROL_QUARANTINE_RE, classifyControlLockEntry, inspectControlClaim, readConsumedRecord } from "./control-command.mjs";
 
 import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
 
@@ -233,10 +233,18 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
         problems.push({ key: residue[1], reason: seen.state === "consumed" ? "consumed_residue" : "consumed_in_flight", why: "delivery-claims/" + name.slice(0, 80) });
         continue;
       }
-      const held = CONTROL_LOCK_RE.exec(name);
-      if (held) {
-        // 逐 key 事务锁：正常只存在几毫秒；盘点时撞见就如实报，人确认没有进程在跑再删。
-        problems.push({ key: held[1], reason: "control_lock_held", why: "事务锁在：delivery-claims/" + name.slice(0, 80) + "（确认没有进程在跑后删除）" });
+      const lockEntry = classifyControlLockEntry(name);
+      if (lockEntry) {
+        // 逐 key 事务锁家族：先按封闭形状分族，再给各族自己的处置方式（形状不对的不进这里，落到 unrecognized_entry）。
+        const shown = "delivery-claims/" + name;
+        const byFamily = {
+          lock: ["control_lock_held", "事务锁在：" + shown + " —— 正常只存在几毫秒；持有者已死超过 5 分钟会由下一笔按协议回收，不要手删"],
+          reap: ["control_reap_lock", "reap 段锁在：" + shown + " —— 段内只有几毫秒；残骸交显式维护入口 node scripts/repair-publish-lock.mjs --lock <主锁路径>"],
+          maint: ["control_maint_lock", "维护锁在：" + shown + " —— 只能由人确认没有维护者在跑后手动删"],
+          reaped: ["control_lock_reaped_residue", "回收时 rename 走但没删成的残骸：" + shown + " —— 可直接删"],
+          quarantine: ["control_reap_quarantine_residue", "维护入口隔离后没删成的残骸：" + shown + " —— 可直接删"],
+        }[lockEntry.family];
+        problems.push({ key: lockEntry.key, reason: byFamily[0], why: byFamily[1] });
         continue;
       }
       const quarantine = CONTROL_QUARANTINE_RE.exec(name);
@@ -246,7 +254,8 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
         continue;
       }
       const m = CLAIM_ENTRY_RE.exec(name);
-      if (!m) { problems.push({ key: null, reason: "unrecognized_entry", why: "delivery-claims/" + name.slice(0, 80) }); continue; }
+      // 名字要给全到能分清后缀（key 就占 64 位），不然"不认识"的条目说不清是哪一种不认识。
+      if (!m) { problems.push({ key: null, reason: "unrecognized_entry", why: "delivery-claims/" + name.slice(0, 140) }); continue; }
       if (m[2] === CLAIM_STATE.CONSUMED + ".json") {
         // consumed 不是 run 终局、不参与孤儿判定，但要**与它的 claim 交叉核对**：内容坏 → consumed_unreadable；
         // 没有 claim / claim 读不出 → consumed_orphan；claim 无控制意图或意图不一致 → consumed_intent_mismatch。

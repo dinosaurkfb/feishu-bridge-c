@@ -239,6 +239,9 @@ session 绑定。日常还可以使用：
 每一笔的执行 / 重放 / 维护恢复都在同一把逐 key 事务锁（`<key>.control.lock`，复用 registry.mjs 已上线的 symlink 锁协议：payload 即 owner，释放在 reap 锁里核 token，与陈旧回收串行）里判定与动手，隔离改名也在锁内；
 锁内状态对所有调用者权威（晚到的首次调用者撞见已闭合的记录只重出回执，不再执行）；释放不是自己的实例不删、reap 段忙 / owner 读不出 / 锁已不在都不吞 —— 以 lockUncleared 进入结果（维护入口退出 1，两条链成功与失败回执都写明）；
 运输层重放遇到受验的 failed 按记录重出失败回执、不再执行（要再切就重新发一条）；两份终态并存 → control_conflict，不执行。
+锁原语里的文件操作抛错在 withControlLock 这层兜住：取得阶段 → control_lock_unavailable（回调没跑），释放阶段 → lockUncleared。
+账本按封闭形状分族盘点锁家族：主锁 control_lock_held（不要手删，协议会回收）、reap 段锁 control_reap_lock（残骸交 repair-publish-lock）、
+维护锁 control_maint_lock（人确认后手删）、.reaped-<uuid> / .reap.quarantine-<…> 残骸（可直接删）；别的后缀是 unrecognized_entry。
 
 两边命令同名。差别只在绑定单位：Codex 绑一个精确 task，Claude 默认绑项目、
 也可以用 `bind-session` 让某一条会话单独占一个话题。

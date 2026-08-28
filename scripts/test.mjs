@@ -7,7 +7,7 @@
  * v2：标识符全部换到 Aily 命名空间（见 selector.mjs 顶部说明）。
  */
 
-import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE } from "./control-command.mjs";
+import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry } from "./control-command.mjs";
 import { describePendingWindow } from "./layered-status.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -18488,8 +18488,22 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   assert.equal(busyVia.status, 1, busyVia.stdout);
   assert.match(busyVia.stdout, /control_busy|已有事务持有者/u, busyVia.stdout);
   const lockInv = inventoryRuns({ runsDir: RUNS, claimsDir });
-  assert.ok(lockInv.problems.some((p) => p.key === key12 && p.reason === "control_lock_held"), JSON.stringify(lockInv.problems));
+  assert.ok(lockInv.problems.some((p) => p.key === key12 && p.reason === "control_lock_held" && /不要手删/u.test(p.why)), JSON.stringify(lockInv.problems));
   assert.ok(!lockInv.problems.some((p) => p.reason === "unrecognized_entry"));
+  // 锁家族其余成员各按自己的族报，处置方式不同；形状不对的是 unrecognized_entry
+  const familyUuid = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b";
+  const planted = { ".reap": "control_reap_lock", ".maint": "control_maint_lock", [".reaped-" + familyUuid]: "control_lock_reaped_residue", [".reap.quarantine-" + familyUuid]: "control_reap_quarantine_residue" };
+  for (const suffix of Object.keys(planted)) fs.symlinkSync("x", path.join(claimsDir, key12 + ".control.lock" + suffix));
+  fs.symlinkSync("x", path.join(claimsDir, key12 + ".control.lock.reaped-abc"));
+  const familyInv = inventoryRuns({ runsDir: RUNS, claimsDir });
+  for (const [suffix, reason] of Object.entries(planted)) {
+    const hit = familyInv.problems.find((p) => p.key === key12 && p.reason === reason);
+    assert.ok(hit && hit.why.includes(key12 + ".control.lock" + suffix), suffix + "：" + JSON.stringify(familyInv.problems));
+  }
+  assert.ok(familyInv.problems.find((p) => p.reason === "control_reap_lock").why.includes("repair-publish-lock"));
+  assert.ok(familyInv.problems.find((p) => p.reason === "control_lock_reaped_residue").why.includes("可直接删"));
+  assert.ok(familyInv.problems.some((p) => p.reason === "unrecognized_entry" && p.why.includes(".reaped-abc")), "形状不对的不算家族成员");
+  for (const suffix of [...Object.keys(planted), ".reaped-abc"]) fs.rmSync(path.join(claimsDir, key12 + ".control.lock" + suffix));
   assert.equal(releasePublishLock(lock12).ok, true);
   // 锁内重判：锁外看是 failed 损坏，动手前被人补成受验 failed → 事务按记录返回失败，不隔离、不执行
   fs.mkdirSync(path.join(claimsDir, key12 + ".failed.json"));
@@ -18669,8 +18683,49 @@ test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进
   }
   assert.deepEqual(withControlLock({ claimsDir, key: lateKey }, () => ({ ok: true })), { ok: true });
   assert.ok(!lockPresent(lockDir));
-  // 账本对锁家族的条目（锁本身、reap 段、rename 走的残骸）都认得
-  for (const n of ["", ".reap", ".maint", ".reaped-abc", ".reap.quarantine-1"]) assert.ok(CONTROL_LOCK_RE.test(lateKey + ".control.lock" + n), n);
+  // ── 共享锁原语里的文件操作抛错（评审第 8 轮）：在 withControlLock 这层兜住，不许越过控制事务
+  {
+    const ioKey = acquireClaim({ claimsDir, messageId: "msg_io", logicalTaskKey: "t",
+      meta: { policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, origin_channel_generation_id: "channel_generation_000000000000000000000000",
+        control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).key;
+    const ioLock = path.join(claimsDir, ioKey + ".control.lock");
+    const originalRm = fs.rmSync;
+    // 释放阶段抛：动作与 consumed 已完成 → 结果照常返回，lockUncleared 说明原因，锁留在原地
+    fs.rmSync = (target, ...args) => { if (path.resolve(String(target)) === path.resolve(ioLock)) { const e = new Error("release failed"); e.code = "EIO"; throw e; } return originalRm(target, ...args); };
+    let releaseIo;
+    try { releaseIo = runControlTransaction({ claimsDir, key: ioKey, intent: lateIntent, execute: () => ({ ok: true, changed: true }) }); }
+    finally { fs.rmSync = originalRm; }
+    assert.deepEqual([releaseIo.ok, releaseIo.changed, releaseIo.lockUncleared], [true, true, "release_threw：EIO"], JSON.stringify(releaseIo));
+    assert.equal(readConsumedRecord({ claimsDir, key: ioKey }).status, "valid");
+    assert.ok(lockPresent(ioLock), "锁留在原地");
+    fs.rmSync(ioLock);
+    // 取得阶段抛（陈旧锁 rename 走之后删不掉）：control_lock_unavailable，回调没跑，残骸是 .reaped-<uuid>
+    const staleKey = acquireClaim({ claimsDir, messageId: "msg_stale_io", logicalTaskKey: "t",
+      meta: { policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, origin_channel_generation_id: "channel_generation_000000000000000000000000",
+        control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).key;
+    const staleLock = path.join(claimsDir, staleKey + ".control.lock");
+    fs.symlinkSync(JSON.stringify({ pid: 99999999, at: "2020-01-01T00:00:00.000Z", token: "stale-instance" }), staleLock);
+    fs.rmSync = (target, ...args) => { if (String(target).startsWith(staleLock + ".reaped-")) { const e = new Error("reaped cleanup failed"); e.code = "EIO"; throw e; } return originalRm(target, ...args); };
+    let ran = 0; let acquireIo;
+    try { acquireIo = withControlLock({ claimsDir, key: staleKey }, () => { ran += 1; return { ok: true }; }); }
+    finally { fs.rmSync = originalRm; }
+    assert.deepEqual([acquireIo.ok, acquireIo.reason, /EIO/u.test(acquireIo.why), ran], [false, "control_lock_unavailable", true, 0], JSON.stringify(acquireIo));
+    const reaped = fs.readdirSync(claimsDir).filter((n) => n.startsWith(staleKey + ".control.lock.reaped-"));
+    assert.equal(reaped.length, 1);
+    assert.deepEqual(classifyControlLockEntry(reaped[0]), { key: staleKey, family: "reaped" });
+    for (const n of reaped) fs.rmSync(path.join(claimsDir, n));
+    fs.rmSync(path.join(claimsDir, ioKey + ".claim"), { recursive: true }); fs.rmSync(path.join(claimsDir, ioKey + ".consumed.json"));
+    fs.rmSync(path.join(claimsDir, staleKey + ".claim"), { recursive: true });
+  }
+  // 锁家族按封闭形状分族；形状不对的不算家族成员
+  const uuid = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b";
+  assert.deepEqual(classifyControlLockEntry(lateKey + ".control.lock"), { key: lateKey, family: "lock" });
+  assert.deepEqual(classifyControlLockEntry(lateKey + ".control.lock.reap"), { key: lateKey, family: "reap" });
+  assert.deepEqual(classifyControlLockEntry(lateKey + ".control.lock.maint"), { key: lateKey, family: "maint" });
+  assert.deepEqual(classifyControlLockEntry(lateKey + ".control.lock.reaped-" + uuid), { key: lateKey, family: "reaped" });
+  assert.deepEqual(classifyControlLockEntry(lateKey + ".control.lock.reap.quarantine-" + uuid), { key: lateKey, family: "quarantine" });
+  for (const bad of [".reaped-abc", ".reap.quarantine-1", ".reaped-", ".lock", ".reap.reap", ".maint.x"]) assert.equal(classifyControlLockEntry(lateKey + ".control.lock" + bad), null, bad);
+  assert.ok(CONTROL_LOCK_RE.test(lateKey + ".control.lock") && !CONTROL_LOCK_RE.test(lateKey + ".control.lock.reap"));
   // 维护入口与回执都要把"锁没交还"说出来
   assert.equal(repairExitCode({ seen: { state: "in_flight" }, result: { ok: true, intent: lateIntent, changed: true, residueUncleared: [], residueUnknown: null, lockUncleared: "EACCES" }, apply: true }), 1);
   assert.match(describeControlRepair({ seen: { state: "in_flight" }, result: { ok: true, intent: lateIntent, changed: true, residueUncleared: [], residueUnknown: null, lockUncleared: "EACCES" }, apply: true }), /事务锁没有交还（EACCES）/u);

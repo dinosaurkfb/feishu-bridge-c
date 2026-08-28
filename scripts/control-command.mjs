@@ -109,7 +109,29 @@ export const CONSUMED_TMP_RE = /^([0-9a-f]{64})\.consumed\.json\.tmp\.\d+\.\d+$/
 /** 损坏的 failed 记录被隔离后的名字：受控形状，账本按 control_failed_quarantined 报，人工看完再删。 */
 export const CONTROL_QUARANTINE_RE = /^([0-9a-f]{64})\.failed\.quarantined\.\d+\.\d+$/u;
 /** 逐 key 的事务锁（目录，mkdir 原子）：运输层重放、首次执行、维护入口共用同一份所有权。留下没释放的由账本报 control_lock_held。 */
-export const CONTROL_LOCK_RE = /^([0-9a-f]{64})\.control\.lock(?:\.reap(?:\.quarantine-.*)?|\.maint|\.reaped-.*)?$/u;
+export const CONTROL_LOCK_RE = /^([0-9a-f]{64})\.control\.lock$/u;
+const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+/**
+ * 锁家族的封闭形状（与 registry.mjs 的协议逐一对应），每一族的处置方式不同 —— 账本按族报，不给一句笼统的"删了"：
+ *   lock        主锁（symlink）：正常几毫秒；持有者已死超过 staleMs 会由下一笔按协议回收 —— 不要手删
+ *   reap        reap 段锁：段内几毫秒；残骸交显式维护入口 repair-publish-lock --lock <主锁路径>
+ *   maint       维护锁：只能由人确认没有维护者在跑后手动删
+ *   reaped      回收时 rename 走、没删成的残骸（.reaped-<uuid>）：可直接删
+ *   quarantine  维护入口隔离后没删成的残骸（.reap.quarantine-<…>）：可直接删
+ * 别的后缀不是家族成员（按 unrecognized_entry 报）。
+ */
+const LOCK_FAMILY = [
+  ["lock", new RegExp("^([0-9a-f]{64})\\.control\\.lock$", "u")],
+  ["reap", new RegExp("^([0-9a-f]{64})\\.control\\.lock\\.reap$", "u")],
+  ["maint", new RegExp("^([0-9a-f]{64})\\.control\\.lock\\.maint$", "u")],
+  ["reaped", new RegExp("^([0-9a-f]{64})\\.control\\.lock\\.reaped-" + UUID + "$", "u")],
+  ["quarantine", new RegExp("^([0-9a-f]{64})\\.control\\.lock\\.reap\\.quarantine-(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$", "u")],
+];
+export function classifyControlLockEntry(name) {
+  if (typeof name !== "string") return null;
+  for (const [family, re] of LOCK_FAMILY) { const m = re.exec(name); if (m) return { key: m[1], family }; }
+  return null;
+}
 const CONTROL_LOCK_SUFFIX = ".control.lock";
 
 /**
@@ -166,7 +188,11 @@ export function withControlLock({ claimsDir, key }, fn) {
   if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) return { ok: false, reason: "claim_key_invalid", why: "key 形状不对" };
   if (typeof claimsDir !== "string" || !claimsDir) return { ok: false, reason: "claim_key_invalid", why: "claimsDir 缺失" };
   const lockPath = path.join(claimsDir, key + CONTROL_LOCK_SUFFIX);
-  const lock = acquirePublishLock(lockPath);
+  // 共享原语按阶段返回受控结果，但陈旧回收 / 释放里的文件操作本身仍可能抛（EIO 之类）：在这一层全部兜住 ——
+  // 取得阶段抛 → control_lock_unavailable（回调没跑）；释放阶段抛 → lockUncleared（事务结果照常返回，不许把已完成的事务变成一个裸异常）。
+  let lock;
+  try { lock = acquirePublishLock(lockPath); }
+  catch (err) { return { ok: false, reason: "control_lock_unavailable", why: "锁原语抛错：" + String(err?.code ?? err?.message ?? err) }; }
   if (!lock.ok) {
     if (lock.reason === "publisher_busy") {
       return { ok: false, reason: "control_busy", why: "这一笔已有事务持有者" + describeLockOwner(lockPath) + "；等它结束再试（持有者已死的锁超过 5 分钟会按同一协议回收）" };
@@ -176,8 +202,10 @@ export function withControlLock({ claimsDir, key }, fn) {
   let result;
   try { result = fn(); }
   finally {
-    const rel = releasePublishLock(lockPath);
-    const why = !rel.ok ? String(rel.reason) + (rel.pid ? "（pid " + rel.pid + "）" : "") : rel.absent ? "锁已不在（被清理过）" : null;
+    let rel;
+    try { rel = releasePublishLock(lockPath); }
+    catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
+    const why = !rel.ok ? String(rel.reason) + (rel.pid ? "（pid " + rel.pid + "）" : "") + (rel.error ? "：" + rel.error : "") : rel.absent ? "锁已不在（被清理过）" : null;
     if (why && result && typeof result === "object") result = { ...result, lockUncleared: why };
   }
   return result;

@@ -150,12 +150,24 @@ export function runControlTransaction({ claimsDir, key, intent, execute, replay 
   return { ok: true, changed, resumed: replay, replayed: false, residueUncleared };
 }
 
+/** 损坏的 failed 记录被维护入口隔离后的名字：受控形状，账本按 control_failed_quarantined 报，人工看完再删。 */
+export const CONTROL_QUARANTINE_RE = /^([0-9a-f]{64})\.failed\.quarantined\.\d+\.\d+$/u;
+export function quarantinedFailed({ claimsDir, key }) {
+  let names = [];
+  try { names = fs.readdirSync(claimsDir); } catch { return []; }
+  return names.filter((n) => { const m = CONTROL_QUARANTINE_RE.exec(n); return m && m[1] === key; });
+}
+const SIDECAR_WORD = { valid: "完整", unreadable: "损坏" };
+
 /**
  * 维护入口共用：一张 claim 的控制事务处在什么状态。expect 与 readClaimState 同义（维护入口用它把 claim 绑到当前 binding/task）。
+ * 两份 sidecar（consumed / failed）**先组成封闭联合再定状态**：
  *   · claim_*：claim 缺席 / 读不出 / 身份对不上；not_control：不是控制命令；
- *   · consumed：终态完整且与意图一致；mismatch；consumed_unreadable（带意图，可恢复）；
- *   · failed：受验的 control failed（当时没切成，不恢复）；failed_unreadable（可恢复）；conflict：failed 与 consumed 并存；
- *   · in_flight：有意图、没终态（可恢复）。
+ *   · 两份都在（不论各自好坏）→ conflict：人看；
+ *   · 只有 consumed：完整且一致 → consumed；意图不一致 → mismatch；损坏 → consumed_unreadable（带意图，可恢复）；
+ *   · 只有 failed：受验 → failed（当时没切成，不恢复）；损坏 → failed_unreadable（可恢复，恢复前先隔离）；
+ *   · 都没有 → in_flight（可恢复）。
+ * residue / quarantined 列出同 key 的临时残骸与隔离制品。
  */
 export function inspectControlClaim({ claimsDir, key, expect = {} }) {
   const claim = readClaimState({ claimsDir, key, expect });
@@ -164,29 +176,45 @@ export function inspectControlClaim({ claimsDir, key, expect = {} }) {
   if (intent === undefined) return { state: "not_control" };
   const consumed = readConsumedRecord({ claimsDir, key });
   const failed = readControlFailedRecord({ claimsDir, key });
-  if (consumed.status === "unreadable") return { state: "consumed_unreadable", intent, why: consumed.why };
-  if (consumed.status === "valid") {
-    if (failed.status === "valid") return { state: "conflict", intent, why: "failed 与 consumed 并存" };
-    return sameControlIntent(intent, { control: consumed.record.control, mode: consumed.record.mode })
-      ? { state: "consumed", intent, record: consumed.record, residue: consumedResidue({ claimsDir, key }) }
-      : { state: "mismatch", intent, why: "consumed 的意图（" + consumed.record.mode + "）与 claim 的意图（" + intent.mode + "）不一致" };
+  const extras = { residue: consumedResidue({ claimsDir, key }), quarantined: quarantinedFailed({ claimsDir, key }) };
+  if (consumed.status !== "absent" && failed.status !== "absent") {
+    return { state: "conflict", intent, why: "failed（" + SIDECAR_WORD[failed.status] + "）与 consumed（" + SIDECAR_WORD[consumed.status] + "）并存", ...extras };
   }
-  if (failed.status === "valid") return { state: "failed", intent, record: failed.record };
-  if (failed.status === "unreadable") return { state: "failed_unreadable", intent, why: failed.why };
-  return { state: "in_flight", intent, residue: consumedResidue({ claimsDir, key }) };
+  if (consumed.status === "unreadable") return { state: "consumed_unreadable", intent, why: consumed.why, ...extras };
+  if (consumed.status === "valid") {
+    return sameControlIntent(intent, { control: consumed.record.control, mode: consumed.record.mode })
+      ? { state: "consumed", intent, record: consumed.record, ...extras }
+      : { state: "mismatch", intent, why: "consumed 的意图（" + consumed.record.mode + "）与 claim 的意图（" + intent.mode + "）不一致", ...extras };
+  }
+  if (failed.status === "valid") return { state: "failed", intent, record: failed.record, ...extras };
+  if (failed.status === "unreadable") return { state: "failed_unreadable", intent, why: failed.why, ...extras };
+  return { state: "in_flight", intent, ...extras };
 }
 
 /** 维护入口允许续做的状态 —— 唯一一份，两条链的 CLI 都引用它。 */
 export const RESUMABLE_CONTROL_STATES = Object.freeze(["in_flight", "consumed_unreadable", "failed_unreadable"]);
-/** 维护入口的恢复动作：只对可恢复态续做；execute 由链各自注入（应带写锁内的身份前置条件）。 */
+/**
+ * 维护入口的恢复动作：只对可续做态续做；execute 由链各自注入（应带写锁内的身份前置条件）。
+ *   · consumed：不执行，只再清一次残骸（清不掉照样带回）；
+ *   · failed_unreadable：先把损坏的 failed 制品改名隔离（改不动 → failed_unquarantined，不执行），再续做 —— 损坏制品不许隐身。
+ */
 export function resumeControlClaim({ claimsDir, key, execute, expect = {} }) {
   const seen = inspectControlClaim({ claimsDir, key, expect });
-  if (seen.state === "consumed") return { ok: true, already: true, changed: seen.record.changed, intent: seen.intent, residueUncleared: seen.residue ?? [] };
+  if (seen.state === "consumed") {
+    return { ok: true, already: true, changed: seen.record.changed, intent: seen.intent, residueUncleared: cleanupConsumedResidue({ claimsDir, key }), quarantined: seen.quarantined };
+  }
   if (!RESUMABLE_CONTROL_STATES.includes(seen.state)) return { ok: false, reason: seen.state, why: seen.why ?? null };
+  let quarantined = seen.quarantined;
+  if (seen.state === "failed_unreadable") {
+    const name = key + ".failed.quarantined." + process.pid + "." + Date.now();
+    try { fs.renameSync(path.join(claimsDir, key + ".failed.json"), path.join(claimsDir, name)); }
+    catch (err) { return { ok: false, reason: "failed_unquarantined", why: String(err.code ?? err.message) }; }
+    quarantined = [...quarantined, name];
+  }
   const tx = runControlTransaction({ claimsDir, key, intent: seen.intent, execute, replay: true });
   return tx.ok
-    ? { ok: true, already: false, changed: tx.changed, intent: seen.intent, residueUncleared: tx.residueUncleared ?? [] }
-    : { ok: false, reason: tx.reason, why: tx.why };
+    ? { ok: true, already: false, changed: tx.changed, intent: seen.intent, residueUncleared: tx.residueUncleared ?? [], quarantined }
+    : { ok: false, reason: tx.reason, why: tx.why, quarantined };
 }
 
 const MODE_LABEL = {

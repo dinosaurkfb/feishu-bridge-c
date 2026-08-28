@@ -12,7 +12,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE, CLAIM_STATE } from "./claim.mjs";
-import { CONSUMED_TMP_RE, inspectControlClaim, readConsumedRecord } from "./control-command.mjs";
+import { CONSUMED_TMP_RE, CONTROL_QUARANTINE_RE, inspectControlClaim, readConsumedRecord } from "./control-command.mjs";
 
 import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
 
@@ -233,6 +233,12 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
         problems.push({ key: residue[1], reason: seen.state === "consumed" ? "consumed_residue" : "consumed_in_flight", why: "delivery-claims/" + name.slice(0, 80) });
         continue;
       }
+      const quarantine = CONTROL_QUARANTINE_RE.exec(name);
+      if (quarantine) {
+        // 维护入口隔离的损坏 failed 制品：不参与状态判定，但必须能盘点到，人看完再删。
+        problems.push({ key: quarantine[1], reason: "control_failed_quarantined", why: "隔离的损坏 failed 制品，人工查看后删除：delivery-claims/" + name.slice(0, 80) });
+        continue;
+      }
       const m = CLAIM_ENTRY_RE.exec(name);
       if (!m) { problems.push({ key: null, reason: "unrecognized_entry", why: "delivery-claims/" + name.slice(0, 80) }); continue; }
       if (m[2] === CLAIM_STATE.CONSUMED + ".json") {
@@ -260,7 +266,7 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
         const seen = inspectControlClaim({ claimsDir, key: m[1] });
         if (seen.state === "failed") continue;
         if (seen.state === "failed_unreadable") { problems.push({ key: m[1], reason: "control_failed_unreadable", why: name + "：" + seen.why }); continue; }
-        if (seen.state === "conflict") { problems.push({ key: m[1], reason: "control_conflict", why: name + "：" + seen.why }); continue; }
+        if (seen.state === "conflict") continue;   // 并存由 consumed 那个条目报（consumed_unreadable 或 control_conflict），这里不重复
         if (seen.state !== "not_control" && !seen.state.startsWith("claim_")) continue; // 其他控制态（consumed 等）在别的分支报过
       }
       if (!TERMINAL_STATE_FILES.has(m[2])) continue;   // claim 目录、笔记、非终局状态记录：不参与孤儿判定

@@ -39,6 +39,7 @@ import {
 import { sweepEligible } from "./drain-all.mjs";
 import { remindCodexPendingClaims } from "./claim-reminder.mjs";
 import { claimKey, recordClaimState, readClaimState, acquireClaim } from "../claim.mjs";
+import { codexControlRepairPrecondition } from "./repair-control-claim.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
 import {
   ELIGIBILITY_BUDGET_DEFAULT_MS, ELIGIBILITY_BUDGET_MAX_MS, eligibilityBudgetMs,
@@ -8947,7 +8948,7 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
   assert.equal(repair("--thread-id", THREAD_A, "--key", key8, "--apply").status, 1);
   assert.equal(policyOf(), DIALOGUE_POLICY_ID, "failed 不续做");
   recordClaimState({ claimsDir: paths.claims, key: key8, state: "consumed", detail: { control: "mode", mode: MAPPING_POLICY_ID, changed: true } });
-  assert.match(repair("--thread-id", THREAD_A, "--key", key8, "--apply").stdout, /failed 与 consumed 并存/u);
+  assert.match(repair("--thread-id", THREAD_A, "--key", key8, "--apply").stdout, /failed（完整）与 consumed（完整）并存/u);
   fs.rmSync(path.join(paths.claims, key8 + ".consumed.json"));
   fs.rmSync(path.join(paths.claims, key8 + ".failed.json"));
   fs.mkdirSync(path.join(paths.claims, key8 + ".failed.json"));
@@ -8955,7 +8956,8 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
   const fuFixed = repair("--thread-id", THREAD_A, "--key", key8, "--apply");
   assert.deepEqual([fuFixed.status, /已补齐终态（目标模式 mapping，本次完成切换）/u.test(fuFixed.stdout)], [0, true], fuFixed.stdout);
   assert.equal(policyOf(), MAPPING_POLICY_ID);
-  fs.rmSync(path.join(paths.claims, key8 + ".failed.json"), { recursive: true });
+  assert.ok(!fs.existsSync(path.join(paths.claims, key8 + ".failed.json")), "损坏的 failed 已被隔离改名");
+  for (const n of fs.readdirSync(paths.claims).filter((n) => n.startsWith(key8 + ".failed.quarantined."))) fs.rmSync(path.join(paths.claims, n), { recursive: true });
   // 残骸清不掉：终态照写，但维护入口退出 1
   fs.rmSync(path.join(paths.claims, key8 + ".consumed.json"));
   const stuckResidue = path.join(paths.claims, key8 + ".consumed.json.tmp.1.1");
@@ -8965,6 +8967,37 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
   assert.ok(fs.existsSync(path.join(paths.claims, key8 + ".consumed.json")), "终态已写，残骸只是没清");
   fs.rmSync(stuckResidue, { recursive: true });
   assert.equal(repair("--thread-id", THREAD_A, "--key", key8, "--apply").status, 0);
+
+  // ── 评审第 5 轮 ──
+  // 写锁内的前置条件拿到的是锁内刚读出的 task：身份对不上就拒写
+  const vetoedByTask = setTaskInteractionMode({ threadId: THREAD_A, mode: DIALOGUE_POLICY_ID, home, precondition: (task) => task?.logical_task_key === "someone-else" });
+  assert.deepEqual([vetoedByTask.ok, vetoedByTask.reason, policyOf()], [false, "precondition_failed", MAPPING_POLICY_ID]);
+  const passedByTask = setTaskInteractionMode({ threadId: THREAD_A, mode: DIALOGUE_POLICY_ID, home, precondition: (task) => task?.logical_task_key === ltk && task?.codex_thread_id === THREAD_A });
+  assert.deepEqual([passedByTask.ok, policyOf()], [true, DIALOGUE_POLICY_ID]);
+  assert.equal(setTaskInteractionMode({ threadId: THREAD_A, mode: MAPPING_POLICY_ID, home }).ok, true);
+  // 维护入口的锁内前置条件：锁内 task 身份对不上 → 拒；对得上且 claim 仍属于它 → 放
+  const guard = codexControlRepairPrecondition({ claimsDir: paths.claims, key: key5, expect: { logicalTaskKey: ltk, codexThreadId: THREAD_A } });
+  assert.deepEqual([guard({ logical_task_key: "someone-else", codex_thread_id: THREAD_A }), guard({ logical_task_key: ltk, codex_thread_id: "thread-b" }), guard(null), guard({ logical_task_key: ltk, codex_thread_id: THREAD_A })], [false, false, false, true]);
+  // 损坏的 failed：恢复前先隔离，隔离制品留在 claims 目录里；consumed 完整 + failed 损坏 = conflict
+  const key9 = claimKey("msg_ctl_9", ltk);
+  assert.ok(acquireClaim({ claimsDir: paths.claims, messageId: "msg_ctl_9", logicalTaskKey: ltk, meta: { ...protoMeta, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).ok);
+  fs.mkdirSync(path.join(paths.claims, key9 + ".failed.json"));
+  const held = repair("--thread-id", THREAD_A, "--key", key9, "--apply");
+  assert.deepEqual([held.status, /已补齐终态（目标模式 dialogue，本次完成切换）；损坏的 failed 记录已隔离为 [0-9a-f]{64}\.failed\.quarantined\./u.test(held.stdout)], [0, true], held.stdout);
+  assert.ok(!fs.existsSync(path.join(paths.claims, key9 + ".failed.json")));
+  assert.equal(fs.readdirSync(paths.claims).filter((n) => n.startsWith(key9 + ".failed.quarantined.")).length, 1);
+  assert.equal(policyOf(), DIALOGUE_POLICY_ID);
+  fs.mkdirSync(path.join(paths.claims, key9 + ".failed.json"));
+  const joint = repair("--thread-id", THREAD_A, "--key", key9, "--apply");
+  assert.deepEqual([joint.status, /两份终态并存（failed（损坏）与 consumed（完整）并存）/u.test(joint.stdout)], [1, true], joint.stdout);
+  fs.rmSync(path.join(paths.claims, key9 + ".failed.json"), { recursive: true });
+  // 终态已成但残骸仍在：第二次 --apply 也退出 1
+  const rerunResidue = path.join(paths.claims, key9 + ".consumed.json.tmp.2.2");
+  fs.mkdirSync(rerunResidue); fs.writeFileSync(path.join(rerunResidue, "x"), "");
+  const rerun = repair("--thread-id", THREAD_A, "--key", key9, "--apply");
+  assert.deepEqual([rerun.status, /这笔已闭合，无需恢复.*但有 1 个临时残骸清不掉/u.test(rerun.stdout)], [1, true], rerun.stdout);
+  fs.rmSync(rerunResidue, { recursive: true });
+  assert.equal(repair("--thread-id", THREAD_A, "--key", key9, "--apply").status, 0);
 });
 
 summarySealed = true;

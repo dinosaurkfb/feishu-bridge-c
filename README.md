@@ -233,8 +233,9 @@ session 绑定。日常还可以使用：
 （failed 与 consumed 并存）。同一事件的运输层重放按记录重出回执；飞书重发是新消息，补不了旧账 —— 补账走维护入口
 `node scripts/repair-control-claim.mjs --project <root> --key <key> [--apply]`
 （Codex 侧 `node scripts/codex/repair-control-claim.mjs --thread-id <id> --key <key> [--apply]`）：
-只接受属于当前绑定 / task 的 claim（身份在写锁内复核），只对 in_flight / 终态损坏 / 失败记录损坏三种态续做，
-临时残骸清不掉时退出 1。
+只接受属于当前绑定 / task 的 claim（Claude 侧按 claim 的会话定位选项目级或会话级绑定；身份在写锁内用锁内刚读出的记录重新推导后复核），
+只对 in_flight / 终态损坏 / 失败记录损坏三种态续做；两份终态并存（不论好坏）一律 conflict 交人看；恢复损坏的 failed 前先把它改名隔离成
+`<key>.failed.quarantined.<pid>.<ts>`（账本报 `control_failed_quarantined`，人看完再删）；临时残骸清不掉时退出 1，第二次运行也一样。
 
 两边命令同名。差别只在绑定单位：Codex 绑一个精确 task，Claude 默认绑项目、
 也可以用 `bind-session` 让某一条会话单独占一个话题。

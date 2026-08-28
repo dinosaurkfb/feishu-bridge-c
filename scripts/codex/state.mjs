@@ -1284,9 +1284,9 @@ export function setTaskInteractionMode({
 } = {}) {
   return mutateTaskInteractionPolicy({
     threadId, home, now,
-    // precondition 在写锁内复核（维护入口确认 claim 仍属于当前 task）。
-    mutate: (state) => {
-      if (typeof precondition === "function" && precondition() !== true) return { ok: false, reason: "precondition_failed" };
+    // precondition 在写锁内复核，参数是锁内刚读出的 task（维护入口据此重新核对身份，锁外算好的不作数）。
+    mutate: (state, task) => {
+      if (typeof precondition === "function" && precondition(task) !== true) return { ok: false, reason: "precondition_failed" };
       return setInteractionPolicyMode(state, { mode, budget, now });
     },
   });

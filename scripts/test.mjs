@@ -3463,6 +3463,35 @@ test("锁目录不可写是 io_error，不是 publisher_busy —— 别把真错
   }
 });
 
+test("回收窗口：判定陈旧之后、动手之前锁换了主人 → 不许碰那把活锁；别人正在回收 → 这轮让它", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-reap-"));
+  const lockDir = path.join(local, "registry.lock");
+  const stale = () => { fs.rmSync(lockDir, { recursive: true, force: true });
+    fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "stale" }), lockDir); };
+  // 1. A 判定陈旧；在它动手之前 B 已经回收并拿到了锁（活的、另一实例）。A 必须发现实例变了、返回 busy，B 的锁原样在。
+  stale();
+  const live = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "b-live" });
+  const r = acquirePublishLock(lockDir, { beforeReap: () => { fs.rmSync(lockDir, { force: true }); fs.symlinkSync(live, lockDir); } });
+  assert.deepEqual([r.ok, r.reason], [false, "publisher_busy"], JSON.stringify(r));
+  assert.equal(fs.readlinkSync(lockDir), live, "B 的活锁一个字都不许动");
+  // 2. 别人正拿着 reap 锁在回收：这轮不碰、返回 busy，陈旧锁与 reap 锁都原样。
+  stale();
+  const reapDir = lockDir + ".reap";
+  const reaping = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "other-reaper" });
+  fs.symlinkSync(reaping, reapDir);
+  const r2 = acquirePublishLock(lockDir);
+  assert.deepEqual([r2.ok, r2.reason], [false, "publisher_busy"], JSON.stringify(r2));
+  assert.equal(JSON.parse(fs.readlinkSync(lockDir)).token, "stale", "陈旧锁留给正在回收的那一方处理");
+  assert.equal(fs.readlinkSync(reapDir), reaping, "别人的 reap 锁不许动");
+  // 3. reap 锁本身是残骸（60 秒以上）→ 可以接管回收。
+  const old = (Date.now() - 120_000) / 1000;
+  fs.lutimesSync(reapDir, old, old);
+  const r3 = acquirePublishLock(lockDir);
+  assert.equal(r3.ok, true, JSON.stringify(r3));
+  assert.deepEqual(fs.readdirSync(local).filter((n) => n.startsWith("registry.lock.")), [], "reap / reaped 残留不许留");
+  assert.equal(releasePublishLock(lockDir).ok, true);
+});
+
 test("陈旧锁回收是互斥的：两个真实 OS 进程同时接管同一把陈旧锁，只有一个成功", () => {
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-race-"));
   const worker = path.join(local, "worker.mjs");

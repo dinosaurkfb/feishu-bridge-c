@@ -283,7 +283,8 @@ function tryLink(lockDir, payload) {
   }
 }
 
-export function acquirePublishLock(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now() } = {}) {
+// beforeReap 只给测试用：在"判定陈旧"与"进 reap 锁重核"之间插一个动作，把并发窗口写成确定性的行为测试。
+export function acquirePublishLock(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now(), beforeReap = null } = {}) {
   const token = crypto.randomUUID();
   const payload = JSON.stringify({ pid: process.pid, at: new Date(now).toISOString(), token });
   const attempt = () => {
@@ -297,6 +298,7 @@ export function acquirePublishLock(lockDir, { staleMs = 5 * 60 * 1000, now = Dat
 
   const seen = readLockOwner(lockDir);
   if (!isPublishLockStale(lockDir, { staleMs, now })) return first;
+  if (typeof beforeReap === "function") beforeReap();
 
   // 回收串行化：reap 锁 → 重读核对 → rename 走 → 放 reap 锁 → 再取。
   const reapDir = lockDir + ".reap";

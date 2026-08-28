@@ -369,7 +369,64 @@ function runChannelContext({ root, dryRun }) {
  *          unresolved —— 项目 / 配置解析不出来（reason）
  *   inventoryOk false 时 runs.problems 里就是 runs_unreadable / runs_not_a_directory 那一条。
  */
+/**
+ * 未路由回复（Stop 说不清该回哪个话题、零入队时留下的记录）的只读盘点 —— 状态页第五区与 doctor 都从这里读。
+ * 目录不存在 = 0 条；读不出来明说，不折叠成 0。
+ */
+// afterOpen 只给测试用：在拿到 fd 之后、读之前插一个动作，把"路径被换掉也不影响本次读取"写成确定性回归。
+export function inventoryUnroutedReplies({ root, afterOpen = null } = {}) {
+  const dir = path.join(root, ".runtime-data", "outbound", "unrouted-replies");
+  let names;
+  // **枚举全部目录项**，不先按后缀过滤：写方的临时制品（.json.tmp.<pid>）、不认识的条目都要报出来，
+  // 只有目录不存在才等于零（评审探针：三项只报一项，doctor 还说无积压）。
+  try { names = fs.readdirSync(dir).sort(); }
+  catch (err) {
+    if (err.code === "ENOENT") return { ok: true, count: 0, entries: [], problems: [], dir };
+    return { ok: false, reason: "unrouted_unreadable", error: String(err.code ?? err.message), count: 0, entries: [], problems: [], dir };
+  }
+  const entries = [];
+  const problems = [];
+  const NAME = /^\d+-[^.]+-[0-9a-f]{8}\.json$/u;
+  for (const n of names) {
+    if (!NAME.test(n)) { problems.push({ file: n, reason: /\.tmp\./u.test(n) ? "tmp_artifact" : "unrecognized_entry" }); continue; }
+    // **一次打开、绑定 fd、fstat 只收普通文件、用同一个 fd 读**：目录 / 符号链接（O_NOFOLLOW → ELOOP）/ 命名管道
+    // 一律 unrecognized_entry。lstat(path) 再 read(path) 两步之间路径可被换成 FIFO 让读取永远等下去（评审探针）；
+    // O_NONBLOCK 保证连 open 都不会挂。
+    let fd = null;
+    let doc;
+    try {
+      try {
+        fd = fs.openSync(path.join(dir, n), fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW);
+      } catch (err) {
+        problems.push({ file: n, reason: err.code === "ELOOP" ? "unrecognized_entry" : "unreadable", error: String(err.code ?? err.message) });
+        continue;
+      }
+      if (typeof afterOpen === "function") afterOpen(path.join(dir, n));
+      const st = fs.fstatSync(fd);
+      if (!st.isFile()) { problems.push({ file: n, reason: "unrecognized_entry" }); continue; }
+      try { doc = JSON.parse(fs.readFileSync(fd, "utf-8")); }
+      catch (err) { problems.push({ file: n, reason: "unreadable", error: String(err.code ?? "not_json") }); continue; }
+    } finally {
+      if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
+    }
+    const shapeOk = doc !== null && typeof doc === "object" && !Array.isArray(doc)
+      && doc.schema_version === "1.0" && doc.artifact_type === "feishu_bridge_unrouted_reply"
+      && typeof doc.reason === "string" && doc.reason.length > 0
+      && typeof doc.session_id === "string" && doc.session_id.length > 0
+      && typeof doc.reply_text === "string"
+      && isCanonicalIso(doc.recorded_at);
+    if (!shapeOk) { problems.push({ file: n, reason: "malformed" }); continue; }
+    entries.push({ file: n, reason: doc.reason, why: doc.why ?? null, recordedAt: doc.recorded_at });
+  }
+  return { ok: true, count: entries.length, entries, problems, dir };
+}
+
 export function inspectRunChannel({ root, claudeSessionId } = {}) {
+  const rc = inspectRunChannelCore({ root, claudeSessionId });
+  return { ...rc, unrouted: inventoryUnroutedReplies({ root }) };
+}
+
+function inspectRunChannelCore({ root, claudeSessionId } = {}) {
   const ctx = runChannelContext({ root, dryRun: true });
   const oldestOf = (keys) => {
     const times = ctx.pendingRuns.filter((r) => keys.has(r.key)).map((r) => r.modifiedAt).filter(Number.isFinite);

@@ -33,7 +33,7 @@ import {
 import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
 import { machineContext, runDoctor } from "./doctor.mjs";
-import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
+import { activeGenerationForSession, effectiveBindingId, generationForSession, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import {
   claimReminderDue as tgClaimReminderDue, markPendingClaimReminder as tgMarkPendingClaimReminder,
   validateTopicGenerationState as tgValidateState,
@@ -69,8 +69,7 @@ import {
 import { parseRunOutcome } from "./handoff.mjs";
 import { repairRunClaims } from "./repair-run-claim.mjs";
 import {
-  describeDrainOutcome, drainProject, inspectRunChannel, outboxDirOf, suppressCmd, watcherActive,
-} from "./drain-outbox.mjs";
+  describeDrainOutcome, drainProject, inspectRunChannel, outboxDirOf, suppressCmd, watcherActive, inventoryUnroutedReplies } from "./drain-outbox.mjs";
 import { CANDIDATE_POLICIES, publishOutboxAttempt } from "./publish-attempt.mjs";
 import { PUBLISH_SCENARIOS, matrixRowsFor } from "./test-support/publish-matrix.mjs";
 import {
@@ -144,8 +143,7 @@ import {
   DEFAULT_DIALOGUE_BUDGET, DIALOGUE_POLICY_ID, DIALOGUE_REASON, DIALOGUE_STATUS,
   DIALOGUE_TURN_STATUS, applyInteractionPolicyToAdmission, finalizeDialogueTurn,
   handleDialoguePolicy, interactionPolicyStateForLegacy, interactionPolicySummary,
-  materializeInteractionPolicy, reserveDialogueTurn, setInteractionPolicyMode,
-} from "./interaction-policy.mjs";
+  materializeInteractionPolicy, reserveDialogueTurn, setInteractionPolicyMode, DIALOGUE_POLICY_VERSION, validateInteractionPolicyState } from "./interaction-policy.mjs";
 import {
   DEFAULT_RELAY_BUDGET, PARTICIPANT_SNAPSHOT_ARTIFACT_TYPE, RELAY_DISPOSITION,
   RELAY_PLAN_STATUS, RELAY_REASON, RELAY_STEP_STATUS, advanceRelayPlan, cancelRelayPlan,
@@ -187,8 +185,7 @@ import {
 } from "./dialogue-chat-scope-attestation.mjs";
 import {
   MAX_LOCAL_INPUT_CHARS, claudeTurnInputDir, clearTurnInput, isFeishuStampedInput,
-  readTurnInput, storeTurnInput,
-} from "./turn-input.mjs";
+  readTurnInput, storeTurnInput, readTurnRecord } from "./turn-input.mjs";
 import {
   currentSurface, diffSurface, loadSnapshot, sharedModules,
 } from "./shared-surface.mjs";
@@ -4601,7 +4598,7 @@ const TPL = {
   agent_uid: "agent_x",
 };
 
-test("Claude UserPromptSubmit 与 Stop 配对本地输入，飞书来源戳只回写回复", () => {
+test("Claude UserPromptSubmit 与 Stop 配对本地输入；飞书来源戳的回合没有 claim 就不入队、留诊断", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-turn-"));
   const project = path.join(home, "project");
   fs.mkdirSync(project);
@@ -4691,7 +4688,7 @@ test("Claude UserPromptSubmit 与 Stop 配对本地输入，飞书来源戳只�
     env,
   });
   assert.equal(inboundPrompt.status, 0, inboundPrompt.stderr);
-  assert.equal(readTurnInput({ dir: inputDir, key: session }).reason, "not_found");
+  assert.equal(readTurnInput({ dir: inputDir, key: session }).reason, "feishu_turn", "同一份记录被飞书回合原子覆写，本地旧输入不会错配");
 
   const inboundStop = spawnSync(process.execPath, [stopHook], {
     input: JSON.stringify({
@@ -4702,10 +4699,13 @@ test("Claude UserPromptSubmit 与 Stop 配对本地输入，飞书来源戳只�
   });
   assert.equal(inboundStop.status, 0, inboundStop.stderr);
   replies = listPending({ outboxDir: outboxDirOf(project) }).filter((record) => record.kind === "reply");
-  assert.equal(replies.length, 3);
-  const inboundRecord = replies.find((record) => record.text === "飞书指令已经完成");
-  assert.equal(inboundRecord.input_origin, null);
-  assert.equal(inboundRecord.input_text, null);
+  assert.equal(replies.length, 2, "飞书回合反查不到 claim：不知道该回哪个话题，零入队（当前代际不是安全回落值）");
+  const unrouted = path.join(project, ".runtime-data", "outbound", "unrouted-replies");
+  const diags = fs.readdirSync(unrouted).map((n) => JSON.parse(fs.readFileSync(path.join(unrouted, n), "utf-8")));
+  // 只有这一份诊断：同一回合的 Stop 重入是正常幂等，不算"未路由"。完整答复留在记录里，不是预览。
+  assert.deepEqual(diags.map((d) => d.reason), ["claim_absent"]);
+  const absent = diags.find((d) => d.reason === "claim_absent");
+  assert.deepEqual([absent.message_id, absent.reply_text, absent.artifact_type], ["msg_inbound", "飞书指令已经完成", "feishu_bridge_unrouted_reply"]);
 });
 
 test("模板缺字段 → 报出缺哪些，不放行", () => {
@@ -5846,7 +5846,7 @@ test("status 只读，且不把话题 id 之类的 locator 打进人类可读输
   assert.ok(!text.includes("session_x"), "Aily session 同理");
 });
 
-test("status 明确说明只读旧话题仍会接收轮转前受理的迟到结果", () => {
+test("status 明确说明历史话题仍可下指令、回复回原话题", () => {
   const text = describeStatus({
     ok: true,
     displayName: "演示",
@@ -5861,7 +5861,8 @@ test("status 明确说明只读旧话题仍会接收轮转前受理的迟到结�
     expiresAt: null,
     pending: 0,
   });
-  assert.match(text, /只读历史.*轮转前受理的结果仍会发回原话题/u);
+  assert.match(text, /历史话题\s+1 个代际（仍可下指令，回复发回你说话的那个话题）/u);
+  assert.doesNotMatch(text, /只读|不再接收/u);
   assert.match(text, /自动轮转\s+0 \/ 50 条有效业务消息/u);
 });
 
@@ -17740,6 +17741,398 @@ test("订阅投影：没有显式截止的待绑定 claim_expires_at_ms 为 null
   assert.equal(claimable(explicit.pending_bindings[0], NOW), false);
   const bad = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records: [record({})], pendingWindowMs: -1 });
   assert.equal(bad.ok, false, "给了窗口就必须是正数");
+});
+
+// ─── 第 2 层：老话题也能驱动 ─────────────────────────────────────────────────────
+function rotatedRegistryFixture() {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-l2-"));
+  const root = path.join(local, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const registryFile = path.join(local, "registry.json");
+  const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  const entry = newRegistryEntry({ root, name: "老话题", purpose: null, token: "aaa111", rootMessageId: "om_old", now: NOW });
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [entry] }, null, 2));
+  assert.equal(promoteBinding({ root, id: entry.id, source: "registry", generationId: entry.channel_generation_id,
+    sessionId: "session_old", registryFile, now: NOW + 1 }).ok, true);
+  assert.equal(prepareClaudeTopicRotation({ root, operationId: "op_l2", registryFile, now: NOW + 2 }).ok, true);
+  const registered = registerClaudeTopicRotation({ root, operationId: "op_l2", rootMessageId: "om_new", pendingToken: "bbb222", registryFile, now: NOW + 3 });
+  assert.equal(registered.ok, true);
+  assert.equal(promoteBinding({ root, id: entry.id, source: "registry", generationId: registered.generation.channel_generation_id,
+    sessionId: "session_new", registryFile, now: NOW + 4 }).ok, true);
+  const state = () => JSON.parse(fs.readFileSync(registryFile, "utf-8")).projects[0].topic_generation_state;
+  const oldGen = state().generations.find((g) => g.root_message_id === "om_old");
+  const newGen = state().generations.find((g) => g.root_message_id === "om_new");
+  assert.deepEqual([oldGen.status, newGen.status], ["read-only", "active"]);
+  return { local, root, entry, registryFile, templateFile, oldGen, newGen, state };
+}
+
+test("老话题也能驱动：只读代际的 session 路由到同一绑定，origin 是那个老代际；新话题 origin 是当前代际；pending / retired / 非 active 绑定不路由", () => {
+  const fx = rotatedRegistryFixture();
+  const files = { registryFile: fx.registryFile, templateFile: fx.templateFile };
+  const viaOld = findBindingForSession({ sessionId: "session_old", ...files });
+  assert.equal(viaOld.ok, true, JSON.stringify(viaOld));
+  assert.equal(viaOld.root, fx.root);
+  assert.deepEqual([viaOld.originGenerationId, viaOld.originGenerationStatus], [fx.oldGen.channel_generation_id, "read-only"]);
+  const viaNew = findBindingForSession({ sessionId: "session_new", ...files });
+  assert.deepEqual([viaNew.ok, viaNew.originGenerationId, viaNew.originGenerationStatus], [true, fx.newGen.channel_generation_id, "active"]);
+  assert.equal(findBindingForSession({ sessionId: "session_unknown", ...files }).reason, "no_binding_for_session");
+  // 出站按同一个 origin 解析：老话题的回复落回老话题
+  const mapping = resolveProject({ root: fx.root, registryFile: fx.registryFile, templateFile: fx.templateFile }).mapping;
+  const target = resolveMappingOutboundGeneration(mapping, viaOld.originGenerationId);
+  assert.deepEqual([target.ok, target.rootMessageId, target.status], [true, "om_old", "read-only"], "老话题的指令，回复发回老话题");
+  // 映射策略上下文按 session 定 origin：老 session → 老代际；新 session → 当前代际；认不出的 session → 退回当前代际
+  const ctx = (sid) => buildLegacyMappingContext({ runtime: "claude", mapping, event: { session_id: sid } });
+  assert.deepEqual([ctx("session_old").originChannelGenerationId, ctx("session_old").originGenerationStatus], [fx.oldGen.channel_generation_id, "read-only"]);
+  assert.deepEqual([ctx("session_new").originChannelGenerationId, ctx("session_new").originGenerationStatus], [fx.newGen.channel_generation_id, "active"]);
+  assert.equal(ctx("session_other").originChannelGenerationId, mapping.channel_generation_id);
+  // retired 的代际不路由；绑定暂停整体不路由
+  const reg = JSON.parse(fs.readFileSync(fx.registryFile, "utf-8"));
+  const gens = reg.projects[0].topic_generation_state.generations;
+  gens.find((g) => g.root_message_id === "om_old").status = "retired";
+  fs.writeFileSync(fx.registryFile, JSON.stringify(reg, null, 2));
+  assert.equal(findBindingForSession({ sessionId: "session_old", ...files }).reason, "no_binding_for_session", "retired 不再路由");
+  const reg2 = JSON.parse(fs.readFileSync(fx.registryFile, "utf-8"));
+  reg2.projects[0].topic_generation_state.generations.find((g) => g.root_message_id === "om_old").status = "read-only";
+  reg2.projects[0].topic_generation_state.binding_status = "paused";
+  reg2.projects[0].status = SUSPENDED;
+  fs.writeFileSync(fx.registryFile, JSON.stringify(reg2, null, 2));
+  assert.equal(findBindingForSession({ sessionId: "session_old", ...files }).ok, false, "绑定暂停：老话题也不路由");
+});
+
+test("generationForSession：active / read-only 都算，pending 没 session、retired 不算，绑定不 active 一律 null", () => {
+  const fx = rotatedRegistryFixture();
+  const st = fx.state();
+  assert.equal(generationForSession(st, "session_old").channel_generation_id, fx.oldGen.channel_generation_id);
+  assert.equal(generationForSession(st, "session_new").channel_generation_id, fx.newGen.channel_generation_id);
+  assert.equal(generationForSession(st, "session_zzz"), null);
+  assert.equal(generationForSession(st, null), null);
+  const retired = structuredClone(st);
+  retired.generations.find((g) => g.root_message_id === "om_old").status = "retired";
+  assert.equal(generationForSession(retired, "session_old"), null);
+  const paused = structuredClone(st);
+  paused.binding_status = "paused";
+  assert.equal(generationForSession(paused, "session_new"), null);
+  assert.equal(activeGenerationForSession(st, "session_old"), null, "只认 active 的那个查询保持原义");
+});
+
+test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结的 origin（老话题）；本地回合和反查不到 claim 的回合仍发当前代际", () => {
+  const fx = rotatedRegistryFixture();
+  const env = { ...process.env, FEISHU_BRIDGE_REGISTRY: fx.registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: fx.templateFile, HOME: fx.local };
+  const initHook = path.join(path.resolve("scripts"), "init-hook.mjs");
+  const stopHook = path.join(path.resolve("scripts"), "stop-hook.mjs");
+  const session = "claude-live-session";
+  const lock = path.join(fx.root, ".runtime-data", "inbound", "session.lock");
+  fs.mkdirSync(lock, { recursive: true });
+  fs.writeFileSync(path.join(lock, "owner.json"), JSON.stringify({ pid: process.pid, log_path: path.join(fx.local, "running.jsonl"), at: new Date().toISOString() }));
+  const mapping = resolveProject({ root: fx.root, registryFile: fx.registryFile, templateFile: fx.templateFile }).mapping;
+  const claimsDir = path.join(fx.root, ".runtime-data", "inbound", "delivery-claims");
+  const claim = acquireClaim({ claimsDir, messageId: "msg_old_topic", logicalTaskKey: mapping.logical_task_key,
+    meta: { session_id: "session_old", binding_id: effectiveBindingId(mapping, { root: fx.root }), claude_session_id: null,
+      policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, local_target_id: "local_target_x",
+      origin_channel_generation_id: fx.oldGen.channel_generation_id } });
+  assert.ok(readClaim({ claimsDir, key: claim.key }), "前提：这张 claim 是受控形状，Stop 才认");
+  assert.equal(claim.ok, true, JSON.stringify(claim));
+  const prompt = (text) => spawnSync(process.execPath, [initHook], { input: JSON.stringify({ session_id: session, cwd: fx.root, prompt: text }), encoding: "utf-8", env: { ...env, HOME: fx.local } });
+  const stop = (text) => spawnSync(process.execPath, [stopHook], { input: JSON.stringify({ session_id: session, cwd: fx.root, last_assistant_message: text }), encoding: "utf-8", env: { ...env, HOME: fx.local } });
+  const replies = () => listPending({ outboxDir: outboxDirOf(fx.root) }).filter((r) => r.kind === "reply");
+  // 同一秒内入队的记录顺序不稳，按正文找，不按下标（否则变异过了也看不出来）。
+  const targetOf = (text) => { const r = replies().find((x) => x.text === text); assert.ok(r, "找不到回复：" + text); return r.target_channel_generation_id; };
+
+  assert.equal(prompt("[飞书 · msg_old_topic · 2026-08-28 10:00Z]\n老话题里下的指令").status, 0);
+  const inboundStop = stop("老话题的回复");
+  assert.equal(inboundStop.status, 0, inboundStop.stderr);
+  assert.equal(replies().length, 1);
+  assert.equal(targetOf("老话题的回复"), fx.oldGen.channel_generation_id, "老话题的指令，回复冻结回老话题");
+
+  assert.equal(prompt("本地敲的一句").status, 0);
+  assert.equal(stop("本地回合的回复").status, 0);
+  assert.equal(replies().length, 2);
+  assert.equal(targetOf("本地回合的回复"), fx.newGen.channel_generation_id, "本地回合发当前代际");
+
+  const unrouted = path.join(fx.root, ".runtime-data", "outbound", "unrouted-replies");
+  const diags = () => (fs.existsSync(unrouted) ? fs.readdirSync(unrouted).sort() : []).map((n) => JSON.parse(fs.readFileSync(path.join(unrouted, n), "utf-8")));
+  assert.equal(prompt("[飞书 · msg_never_claimed · 2026-08-28 10:05Z]\n没受理过的").status, 0);
+  assert.equal(stop("反查不到 claim 的回复").status, 0);
+  assert.equal(replies().length, 2, "飞书回合反查不到 claim → 零入队，不退回当前代际");
+  assert.deepEqual(diags().map((d) => [d.reason, d.message_id]), [["claim_absent", "msg_never_claimed"]]);
+
+  // claim 里的 origin 形状合法但不是这个 mapping 里能发布的代际（比如已 retired / 别处的 id）→ 退回当前代际
+  const foreign = fx.oldGen.channel_generation_id.slice(0, -4) + "dead";
+  const bogus = acquireClaim({ claimsDir, messageId: "msg_foreign_origin", logicalTaskKey: mapping.logical_task_key,
+    meta: { session_id: "session_old", binding_id: effectiveBindingId(mapping, { root: fx.root }), claude_session_id: null,
+      policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, local_target_id: "local_target_x",
+      origin_channel_generation_id: foreign } });
+  assert.equal(bogus.ok, true);
+  assert.ok(readClaim({ claimsDir, key: bogus.key }), "前提：claim 形状合法");
+  assert.equal(prompt("[飞书 · msg_foreign_origin · 2026-08-28 10:06Z]\n来源代际不可解析").status, 0);
+  assert.equal(stop("来源不可解析的回复").status, 0);
+  assert.equal(replies().length, 2, "origin 解析不了 → 零入队");
+  assert.deepEqual(diags().map((d) => d.reason), ["claim_absent", "origin_unresolvable"]);
+  assert.equal(diags()[1].origin_channel_generation_id, foreign);
+
+  // 记录损坏 / 缺席：同样零入队 + 诊断
+  const recordFile = readTurnRecord({ dir: claudeTurnInputDir(fx.root, null), key: session }).file;
+  fs.writeFileSync(recordFile, "{not json");
+  assert.equal(stop("记录损坏时的回复").status, 0);
+  assert.equal(replies().length, 2);
+  assert.equal(diags().at(-1).reason, "turn_record_unreadable");
+  fs.rmSync(recordFile, { force: true });
+  assert.equal(stop("记录缺席时的回复").status, 0);
+  assert.equal(replies().length, 2);
+  assert.equal(diags().at(-1).reason, "turn_record_not_found");
+
+  // claim 必须是这条绑定、这个会话的：binding 缺失 / 错 binding / 错 session 的 claim 形状合法也不算
+  const mkClaim = (messageId, over) => acquireClaim({ claimsDir, messageId, logicalTaskKey: mapping.logical_task_key,
+    meta: { session_id: "session_old", binding_id: effectiveBindingId(mapping, { root: fx.root }), claude_session_id: null,
+      policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, local_target_id: "local_target_x",
+      origin_channel_generation_id: fx.oldGen.channel_generation_id, ...over } });
+  const cases = [
+    ["msg_wrong_binding", { binding_id: "someone-else@registry" }],
+    ["msg_wrong_session", { claude_session_id: "0f1e2d3c-4b5a-4978-8f6e-5d4c3b2a1908" }],
+    ["msg_no_binding", { binding_id: undefined }],
+  ];
+  for (const [mid, over] of cases) {
+    assert.equal(mkClaim(mid, over).ok, true, mid);
+    assert.equal(prompt("[飞书 · " + mid + " · 2026-08-28 10:08Z]\n身份对不上的 claim").status, 0);
+    assert.equal(stop("身份对不上时的回复 " + mid).status, 0);
+    assert.equal(replies().length, 2, mid + "：claim 身份对不上 → 零入队");
+    assert.equal(diags().at(-1).reason, "claim_unreadable", mid + "：" + JSON.stringify(diags().at(-1)));
+    assert.match(String(diags().at(-1).why), /binding|session/u, mid);
+  }
+
+  // 上一轮记录不能活到这一轮：老话题回合留下的飞书记录被 Stop 消费；登记表暂时坏了时本地 prompt 仍要覆写它
+  // 新的一条老话题消息 = 新 claim = 新回合（同一 claim 再来算重入，不入队）
+  assert.equal(mkClaim("msg_old_topic_2", {}).ok, true);
+  assert.equal(prompt("[飞书 · msg_old_topic_2 · 2026-08-28 10:09Z]\n再来一次老话题指令").status, 0);
+  assert.equal(stop("老话题第二次回复").status, 0);
+  assert.equal(targetOf("老话题第二次回复"), fx.oldGen.channel_generation_id);
+  const before = replies().length;
+  const goodRegistry = fs.readFileSync(fx.registryFile, "utf-8");
+  fs.writeFileSync(fx.registryFile, "{not json");
+  const localWhileBroken = prompt("登记表坏掉时敲的本地一句");
+  assert.equal(localWhileBroken.status, 0, "本地 prompt 不因登记表坏而被拦：" + localWhileBroken.stderr);
+  const rec = readTurnRecord({ dir: claudeTurnInputDir(fx.root, null), key: session });
+  assert.deepEqual([rec.ok, rec.kind, rec.consumed], [true, "local", false], "登记表坏了也要把上一轮的飞书记录换成本地：" + JSON.stringify(rec));
+  const feishuWhileBroken = prompt("[飞书 · msg_while_broken · 2026-08-28 10:10Z]\n登记表坏掉时的飞书指令");
+  assert.equal(feishuWhileBroken.status, 2, "飞书回合登记不了来源 → 阻止本轮");
+  assert.match(feishuWhileBroken.stderr, /registry_unreadable/u);
+  fs.writeFileSync(fx.registryFile, goodRegistry);
+  assert.equal(stop("登记表恢复后的本地回复").status, 0);
+  assert.equal(replies().length, before + 1);
+  assert.equal(targetOf("登记表恢复后的本地回复"), fx.newGen.channel_generation_id, "本地回复发当前代际，不是老话题");
+  // 同一回合 Stop 重入：记录已消费 → 零入队，且不算"未路由"（不写诊断）
+  const diagCount = diags().length;
+  assert.equal(stop("登记表恢复后的本地回复").status, 0);
+  assert.equal(replies().length, before + 1);
+  assert.equal(diags().length, diagCount, "正常重入不写未路由记录");
+
+  // 两条**不同**的飞书回合、回复正文相同：事件键是 claim key，不是正文指纹 —— 两条都要入队、各回各的话题
+  const mkOk = (messageId, origin) => acquireClaim({ claimsDir, messageId, logicalTaskKey: mapping.logical_task_key,
+    meta: { session_id: "session_old", binding_id: effectiveBindingId(mapping, { root: fx.root }), claude_session_id: null,
+      policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, local_target_id: "local_target_x", origin_channel_generation_id: origin } });
+  assert.equal(mkOk("msg_same_text_old", fx.oldGen.channel_generation_id).ok, true);
+  assert.equal(mkOk("msg_same_text_new", fx.newGen.channel_generation_id).ok, true);
+  const beforeSame = replies().length;
+  assert.equal(prompt("[飞书 · msg_same_text_old · 2026-08-28 10:11Z]\n老话题问").status, 0);
+  assert.equal(stop("一模一样的回复").status, 0);
+  assert.equal(prompt("[飞书 · msg_same_text_new · 2026-08-28 10:12Z]\n新话题问").status, 0);
+  assert.equal(stop("一模一样的回复").status, 0);
+  const same = replies().filter((r) => r.text === "一模一样的回复");
+  assert.equal(same.length, 2, "正文相同但回合不同：两条都要入队");
+  assert.equal(replies().length, beforeSame + 2);
+  assert.deepEqual(same.map((r) => r.target_channel_generation_id).sort(), [fx.oldGen.channel_generation_id, fx.newGen.channel_generation_id].sort());
+  assert.ok(same.every((r) => typeof r.event_key === "string" && r.event_key.includes(":claim:")), JSON.stringify(same.map((r) => r.event_key)));
+
+  // 未路由记录有人读：状态页第五区与 doctor 都从同一份盘点拿
+  const inv = inventoryUnroutedReplies({ root: fx.root });
+  assert.equal(inv.ok, true);
+  assert.equal(inv.count, diags().length);
+  const rows = runChannelRows(inspectRunChannel({ root: fx.root, claudeSessionId: null }));
+  const urRow = rows.find((r) => r[0] === "未路由回复");
+  assert.ok(urRow && urRow[1].startsWith(inv.count + " 条（需要人看"), JSON.stringify(rows));
+
+  // 全新项目的第一个本地回合遇到登记表坏：没有任何可写的记录位置 → 也不放行（否则这一轮留不下自己的记录）
+  const freshLocal = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-fresh-"));
+  const freshProject = path.join(freshLocal, "project");
+  fs.mkdirSync(freshProject);
+  const badRegistry = path.join(freshLocal, "registry.json");
+  fs.writeFileSync(badRegistry, "{not json");
+  const freshPrompt = spawnSync(process.execPath, [initHook], { input: JSON.stringify({ session_id: "fresh-session", cwd: freshProject, prompt: "全新项目第一句" }),
+    encoding: "utf-8", env: { ...env, FEISHU_BRIDGE_REGISTRY: badRegistry, HOME: freshLocal } });
+  assert.equal(freshPrompt.status, 2, freshPrompt.stderr);
+  assert.match(freshPrompt.stderr, /registry_unreadable 且没有可写的记录位置/u);
+
+  // 来源记不上就不让这一轮跑：把记录目录换成文件，飞书 prompt → 退出码 2；本地 prompt 也清不掉上一轮 → 退出码 2
+  const inputDir = claudeTurnInputDir(fx.root, null);
+  fs.rmSync(inputDir, { recursive: true, force: true });
+  fs.writeFileSync(inputDir, "occupied");
+  const blockedFeishu = prompt("[飞书 · msg_blocked · 2026-08-28 10:07Z]\n记不下来源");
+  assert.equal(blockedFeishu.status, 2, blockedFeishu.stderr);
+  assert.match(blockedFeishu.stderr, /记不下这一轮的来源/u);
+  const blockedLocal = prompt("本地也记不下");
+  assert.equal(blockedLocal.status, 2, blockedLocal.stderr);
+  fs.rmSync(inputDir, { force: true });
+});
+
+test("老话题的指令（Dialogue 模式）：回合的 origin 是老代际，Stop 终结回合并把回复发回老话题", () => {
+  const fx = rotatedRegistryFixture();
+  const env = { ...process.env, FEISHU_BRIDGE_REGISTRY: fx.registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: fx.templateFile, HOME: fx.local };
+  const stopHook = path.join(path.resolve("scripts"), "stop-hook.mjs");
+  const session = "claude-live-dialogue";
+  const lock = path.join(fx.root, ".runtime-data", "inbound", "session.lock");
+  fs.mkdirSync(lock, { recursive: true });
+  fs.writeFileSync(path.join(lock, "owner.json"), JSON.stringify({ pid: process.pid, log_path: path.join(fx.local, "running.jsonl"), at: new Date().toISOString() }));
+  assert.equal(setClaudeInteractionMode({ root: fx.root, claudeSessionId: null, mode: DIALOGUE_POLICY_ID, registryFile: fx.registryFile }).ok, true);
+  const mapping = resolveProject({ root: fx.root, registryFile: fx.registryFile, templateFile: fx.templateFile }).mapping;
+  const claimsDir = path.join(fx.root, ".runtime-data", "inbound", "delivery-claims");
+  const claim = acquireClaim({ claimsDir, messageId: "msg_old_dialogue", logicalTaskKey: mapping.logical_task_key,
+    meta: { session_id: "session_old", binding_id: effectiveBindingId(mapping, { root: fx.root }), claude_session_id: null,
+      policy_id: DIALOGUE_POLICY_ID, policy_version: DIALOGUE_POLICY_VERSION, local_target_id: "local_target_x",
+      origin_channel_generation_id: fx.oldGen.channel_generation_id } });
+  assert.equal(claim.ok, true);
+  const reserved = reserveClaudeDialogueTurn({
+    root: fx.root, claudeSessionId: null, eventId: "msg_old_dialogue", runId: claim.key, localTargetId: "local_target_x",
+    originChannelGenerationId: fx.oldGen.channel_generation_id, runtimeTargetId: session, registryFile: fx.registryFile,
+  });
+  assert.equal(reserved.ok, true, JSON.stringify(reserved));
+  const r = spawnSync(process.execPath, [stopHook], { input: JSON.stringify({ session_id: session, cwd: fx.root, last_assistant_message: "对话回合的回复" }), encoding: "utf-8", env: { ...env, HOME: fx.local } });
+  assert.equal(r.status, 0, r.stderr);
+  const replies = listPending({ outboxDir: outboxDirOf(fx.root) }).filter((x) => x.kind === "reply");
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].target_channel_generation_id, fx.oldGen.channel_generation_id, "Dialogue 回合的 origin 是老代际 → 回复回老话题");
+  assert.ok(fs.existsSync(path.join(claimsDir, claim.key + ".completed.json")), "回合终局要记账");
+
+  // 回合的 origin 形状不合法 → 策略状态整体无效（校验器钉住），Stop 不按它入队
+  const reg = JSON.parse(fs.readFileSync(fx.registryFile, "utf-8"));
+  const policy = reg.projects[0].interaction_policy_state;
+  assert.equal(policy.dialogue.active_turn, null, "上一回合已终结");
+  const claim2 = acquireClaim({ claimsDir, messageId: "msg_old_dialogue_2", logicalTaskKey: mapping.logical_task_key,
+    meta: { session_id: "session_old", binding_id: effectiveBindingId(mapping, { root: fx.root }), claude_session_id: null,
+      policy_id: DIALOGUE_POLICY_ID, policy_version: DIALOGUE_POLICY_VERSION, local_target_id: "local_target_x",
+      origin_channel_generation_id: fx.oldGen.channel_generation_id } });
+  const reserved2 = reserveClaudeDialogueTurn({
+    root: fx.root, claudeSessionId: null, eventId: "msg_old_dialogue_2", runId: claim2.key, localTargetId: "local_target_x",
+    originChannelGenerationId: fx.oldGen.channel_generation_id, runtimeTargetId: session, registryFile: fx.registryFile,
+  });
+  assert.equal(reserved2.ok, true, JSON.stringify(reserved2));
+  const reg2 = JSON.parse(fs.readFileSync(fx.registryFile, "utf-8"));
+  reg2.projects[0].interaction_policy_state.dialogue.active_turn.origin_channel_generation_id = "";
+  fs.writeFileSync(fx.registryFile, JSON.stringify(reg2, null, 2));
+  assert.equal(validateInteractionPolicyState(reg2.projects[0].interaction_policy_state, { bindingId: reg2.projects[0].interaction_policy_state.binding_id }).ok, false,
+    "active_turn 缺 origin → 策略状态无效");
+  const r2 = spawnSync(process.execPath, [stopHook], { input: JSON.stringify({ session_id: session, cwd: fx.root, last_assistant_message: "origin 被抹掉的回合" }), encoding: "utf-8", env: { ...env, HOME: fx.local } });
+  assert.equal(r2.status, 0, r2.stderr);
+  const after = listPending({ outboxDir: outboxDirOf(fx.root) }).filter((x) => x.kind === "reply");
+  assert.equal(after.length, 1, "策略状态无效、又没有本轮来源记录 → 零入队");
+  const unrouted = path.join(fx.root, ".runtime-data", "outbound", "unrouted-replies");
+  assert.equal(fs.readdirSync(unrouted).length, 1);
+});
+
+test("一个 session 只属于一个代际：校验器拦重复、激活拒绝复用历史 session；跨绑定 / 跨 task 多命中返回歧义", () => {
+  const fx = rotatedRegistryFixture();
+  const st = fx.state();
+  const dup = structuredClone(st);
+  dup.generations.find((g) => g.root_message_id === "om_new").session_id = "session_old";
+  assert.deepEqual(tgValidateState(dup).problems, ["duplicate_session_id"]);
+  assert.equal(generationForSession(dup, "session_old"), null, "畸形状态下不给出'第一条'");
+  // 激活：把历史代际的 session 再分给新 pending → 拒
+  const legacy = projectLegacyTopicGeneration({ runtime: "claude", bindingId: "binding_u", rootMessageId: "om_1", sessionId: "session_1", inboundState: "bound", now: NOW });
+  const prepared = prepareTopicRotation(legacy.state, { operationId: "op_u", now: NOW });
+  const registered = registerPendingTopicGeneration(prepared.state, { operationId: "op_u", rootMessageId: "om_2", pendingToken: "tok", now: NOW });
+  assert.equal(activatePendingTopicGeneration(registered.state, { sessionId: "session_1", now: NOW + 1 }).reason, "session_already_bound");
+  assert.equal(activatePendingTopicGeneration(registered.state, { sessionId: "session_2", now: NOW + 1 }).ok, true);
+  // 跨绑定：两个项目都持有同一 session → 歧义，不按登记顺序选
+  const f = routeFixture([
+    { id: "a", extra: { session_id: "session_dup", inbound_state: "bound" } },
+    { id: "b", extra: { session_id: "session_dup", inbound_state: "bound" } },
+  ]);
+  const amb = findBindingForSession({ sessionId: "session_dup", ...files(f) });
+  assert.deepEqual([amb.ok, amb.reason, amb.candidates], [false, "ambiguous_session", 2]);
+});
+
+test("未路由回复盘点：全枚举，只有完整受验的制品计入，临时 / 未知 / 坏 JSON / 畸形都进 problems；runs 账本读不出时状态页照样渲染；doctor 计入", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-unrouted-"));
+  const root = path.join(local, "project");
+  const dir = path.join(root, ".runtime-data", "outbound", "unrouted-replies");
+  fs.mkdirSync(dir, { recursive: true });
+  const valid = { schema_version: "1.0", artifact_type: "feishu_bridge_unrouted_reply", reason: "claim_absent", why: null,
+    message_id: "msg_x", origin_channel_generation_id: null, session_id: "sess-1", binding_id: "b@registry",
+    recorded_at: "2026-08-28T10:00:00.000Z", reply_text: "完整答复" };
+  fs.writeFileSync(path.join(dir, "1787900000000-sess1abc-0a1b2c3d.json"), JSON.stringify(valid));
+  fs.writeFileSync(path.join(dir, "1787900000001-sess1abc-11223344.json"), "{not json");
+  fs.writeFileSync(path.join(dir, "1787900000002-sess1abc-55667788.json.tmp.4242"), JSON.stringify(valid));
+  fs.writeFileSync(path.join(dir, "README.txt"), "unknown");
+  fs.writeFileSync(path.join(dir, "1787900000003-sess1abc-99aabbcc.json"), JSON.stringify({ ...valid, reply_text: undefined }));
+  fs.mkdirSync(path.join(dir, "1787900000004-sess1abc-deadbeef.json"));
+  const inv = inventoryUnroutedReplies({ root });
+  assert.equal(inv.ok, true);
+  assert.equal(inv.count, 1, "只有完整受验的那份计入");
+  assert.deepEqual(inv.problems.map((x) => x.reason).sort(), ["malformed", "tmp_artifact", "unreadable", "unrecognized_entry", "unrecognized_entry"].sort(), JSON.stringify(inv.problems));
+  // 名字合规的非普通文件：符号链接（哪怕指向合法 JSON）、命名管道 —— 读之前 lstat，一律 unrecognized_entry，不读、不挂
+  fs.symlinkSync(path.join(dir, "1787900000000-sess1abc-0a1b2c3d.json"), path.join(dir, "1787900000005-sess1abc-aabbccdd.json"));
+  const withLink = inventoryUnroutedReplies({ root });
+  assert.equal(withLink.count, 1, "符号链接不算合法制品");
+  assert.ok(withLink.problems.some((p) => p.file === "1787900000005-sess1abc-aabbccdd.json" && p.reason === "unrecognized_entry"), JSON.stringify(withLink.problems));
+  const fifo = path.join(dir, "1787900000006-sess1abc-eeff0011.json");
+  const mk = spawnSync("mkfifo", [fifo], { encoding: "utf-8" });
+  if (mk.status === 0) {
+    const probe = spawnSync(process.execPath, ["--input-type=module", "-e",
+      'const { inventoryUnroutedReplies } = await import(' + JSON.stringify(pathToFileURL(path.resolve("scripts", "drain-outbox.mjs")).href) + ');'
+      + 'process.stdout.write(JSON.stringify(inventoryUnroutedReplies({ root: ' + JSON.stringify(root) + ' })));'],
+      { encoding: "utf-8", timeout: 5000 });
+    assert.equal(probe.status, 0, "命名管道不许让盘点挂住：" + (probe.error?.code ?? probe.stderr));
+    const viaFifo = JSON.parse(probe.stdout);
+    assert.equal(viaFifo.count, 1);
+    assert.ok(viaFifo.problems.some((p) => p.file === path.basename(fifo) && p.reason === "unrecognized_entry"), JSON.stringify(viaFifo.problems));
+    fs.rmSync(fifo, { force: true });
+  }
+  fs.rmSync(path.join(dir, "1787900000005-sess1abc-aabbccdd.json"), { force: true });
+  // TOCTOU：打开之后路径被换成命名管道 —— 读取绑定在原 fd 上，不受影响、不挂（评审固定时序探针）
+  const swapTarget = path.join(dir, "1787900000000-sess1abc-0a1b2c3d.json");
+  let swapped = false;
+  const raced = spawnSync(process.execPath, ["--input-type=module", "-e",
+    'import fs from "node:fs"; import { spawnSync } from "node:child_process";'
+    + 'const { inventoryUnroutedReplies } = await import(' + JSON.stringify(pathToFileURL(path.resolve("scripts", "drain-outbox.mjs")).href) + ');'
+    + 'const target = ' + JSON.stringify(swapTarget) + ';'
+    + 'const r = inventoryUnroutedReplies({ root: ' + JSON.stringify(root) + ', afterOpen: (p) => { if (p === target) { fs.rmSync(p, { force: true }); spawnSync("mkfifo", [p]); } } });'
+    + 'process.stdout.write(JSON.stringify(r));'],
+    { encoding: "utf-8", timeout: 5000 });
+  assert.equal(raced.status, 0, "换成 FIFO 也不许挂：" + (raced.error?.code ?? raced.stderr));
+  const racedInv = JSON.parse(raced.stdout);
+  assert.equal(racedInv.count, 1, "打开之后路径被换掉，本次仍按原 fd 读到合法制品：" + JSON.stringify(racedInv.problems));
+  swapped = true;
+  if (swapped) { fs.rmSync(swapTarget, { force: true }); fs.writeFileSync(swapTarget, JSON.stringify(valid)); }
+  assert.equal(inventoryUnroutedReplies({ root: path.join(local, "nope") }).count, 0, "目录不存在 = 0");
+  fs.writeFileSync(path.join(local, "file-not-dir"), "x");
+  assert.equal(inventoryUnroutedReplies({ root: path.join(local, "file-not-dir") }).count, 0);
+  // 状态页：runs 账本读不出（runs 路径是文件）时，未路由那几行照样渲染，不被提前 return 藏掉
+  const rows = runChannelRows({ inventoryOk: false, runs: { problems: [{ key: null, reason: "runs_not_a_directory" }] }, unrouted: inv });
+  assert.ok(rows.some((r) => r[0] === "run 通道" && /runs_not_a_directory/u.test(r[1])), JSON.stringify(rows));
+  const ur = rows.find((r) => r[0] === "未路由回复");
+  assert.ok(ur && ur[1].startsWith("1 条（需要人看") && /另有 5 个说不清的条目/u.test(ur[1]), JSON.stringify(rows));
+  assert.ok(rows.some((r) => r[1] === "tmp_artifact"), "临时制品要逐条列出");
+  assert.deepEqual(runChannelRows({ inventoryOk: false, runs: { problems: [] }, unrouted: { ok: false, reason: "unrouted_unreadable" } }).find((r) => r[0] === "未路由回复"),
+    ["未路由回复", "说不清（unrouted_unreadable）"]);
+});
+
+test("doctor ⑥：未路由回复及其目录里说不清的条目都算进问题，不报'无积压'", () => {
+  const m = doctorMachine();
+  const good = m.project("good", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "good", root: good, root_message_id: "om_x", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const dir = path.join(good, ".runtime-data", "outbound", "unrouted-replies");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "1787900000001-sess1abc-11223344.json"), "{not json");
+  fs.writeFileSync(path.join(dir, "1787900000002-sess1abc-55667788.json.tmp.4242"), "{}");
+  fs.writeFileSync(path.join(dir, "README.txt"), "unknown");
+  const report = doctorReport(m.run());
+  const drain = checkOf(report, "backlog_vs_publisher");
+  assert.notEqual(drain.ok, true, JSON.stringify(drain));
+  assert.match(String(drain.detail), /未路由目录说不清 3 处/u, drain.detail);
+  fs.writeFileSync(path.join(dir, "1787900000000-sess1abc-0a1b2c3d.json"), JSON.stringify({ schema_version: "1.0", artifact_type: "feishu_bridge_unrouted_reply",
+    reason: "origin_unresolvable", why: "x", message_id: "msg", origin_channel_generation_id: null, session_id: "s", binding_id: "b", recorded_at: "2026-08-28T10:00:00.000Z", reply_text: "t" }));
+  const report2 = doctorReport(m.run());
+  assert.match(String(checkOf(report2, "backlog_vs_publisher").detail), /未路由回复 1 条/u);
 });
 
 summarySealed = true;

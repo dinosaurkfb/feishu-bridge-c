@@ -5,6 +5,7 @@
  * runtime adapter 先在私有映射中解析 locator、只向公共层投影 localTargetId，再消费 runRequest。
  */
 
+import { generationForSession } from "./topic-generation.mjs";
 import { validateCanonicalEvent } from "./canonical-event.mjs";
 import {
   REJECT, evaluateInbound, evaluateInboundEvidence,
@@ -114,15 +115,21 @@ export function buildLegacyMappingContext({ runtime, mapping, canonicalEvent, ev
     return { ok: false, reason: MAPPING_POLICY_REASON.CONTEXT_INVALID };
   }
   const bindingSeed = nonEmpty(mapping?.binding_id) ? mapping.binding_id : logicalTaskKey;
+  // 来源代际按 **这条消息的 session** 定：它落在哪个代际（当前的或某个 read-only 历史话题），
+  // 回复就冻结回那个话题（goal 第 2 层）。找不到对应代际才退回当前代际。
+  const bySession = generationForSession(mapping?.topic_generation_state ?? null, sessionId);
   return {
     ok: true,
     projection: nonEmpty(mapping?.channel_generation_id)
       ? "topic_generation_v1"
       : "legacy_mapping_v1",
     localTargetId: stableControlId("local_target", runtime, logicalTaskKey),
-    originChannelGenerationId: nonEmpty(mapping?.channel_generation_id)
-      ? mapping.channel_generation_id
-      : stableControlId("channel_generation", runtime, bindingSeed, sessionId),
+    originChannelGenerationId: bySession
+      ? bySession.channel_generation_id
+      : nonEmpty(mapping?.channel_generation_id)
+        ? mapping.channel_generation_id
+        : stableControlId("channel_generation", runtime, bindingSeed, sessionId),
+    originGenerationStatus: bySession ? bySession.status : (nonEmpty(mapping?.channel_generation_id) ? "active" : null),
   };
 }
 

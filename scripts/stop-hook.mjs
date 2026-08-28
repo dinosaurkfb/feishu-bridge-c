@@ -16,15 +16,16 @@
  * 崩一次就是所有会话都收到钩子报错。桥断了是桥的事，不能溅到别人的活上。
  */
 
+import crypto from "node:crypto";
 import fs from "node:fs";
-import { effectiveBindingId } from "./topic-generation.mjs";
+import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
+import { claimKey, readClaimState } from "./claim.mjs";
 import os from "node:os";
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
 
 import {
-  claudeTurnInputDir, clearTurnInput, readTurnInput,
-} from "./turn-input.mjs";
+  claudeTurnInputDir, clearTurnInput, readTurnInput, consumeTurnRecord, readTurnRecord } from "./turn-input.mjs";
 
 // 会话结束是同步阻塞点：Frank 的终端在等它返回。发不出去就留在 outbox，
 // 兜底定时器 30 分钟内会重试 —— 宁可晚发，不可吊住会话。
@@ -154,6 +155,49 @@ async function main() {
     const boundSession = bound.ok ? bound.claudeSessionId : null;
     const outboxDir = outboxDirOf(project.root, boundSession);
     const inputDir = claudeTurnInputDir(project.root, boundSession);
+    // **回复的目标代际由本轮来源决定，说不清就不入队**（goal 第 2 层，评审两轮逼出来的语义）：
+    //   · 本地回合 → 当前代际；
+    //   · 飞书回合 → 反查入站 claim（受控形状才认）里冻结的 origin，且它必须能在 mapping 里解析成可发布代际；
+    //   · 记录缺席 / 损坏、claim 缺席 / 不合形状、origin 解析不了 → **零入队**，写一份可诊断记录。
+    //     "退回当前代际"在飞书回合里不是安全回落值，而是另一个话题。
+    let turnOrigin = null;
+    let turnRoute = { ok: true, kind: "unknown" };
+    if (!ownedByBridge && speakingSession && bound.ok) {
+      const record = readTurnRecord({ dir: inputDir, key: speakingSession });
+      if (!record.ok) {
+        turnRoute = { ok: false, reason: "turn_record_" + record.reason };
+      } else if (record.consumed) {
+        // 这份记录已经授权过一次 Stop：重入 / 上一轮遗留都不许再入队。
+        turnRoute = { ok: false, reason: "turn_record_consumed", messageId: record.messageId ?? null };
+      } else if (record.kind === "local") {
+        turnRoute = { ok: true, kind: "local" };
+      } else {
+        turnRoute = { ok: false, reason: "claim_unavailable", messageId: record.messageId };
+        if (bound.mapping?.logical_task_key) {
+          // **claim 必须是这条绑定、这个会话的**：通用形状合法但 binding / session 对不上的 claim 不算。
+          const claimKeyForTurn = claimKey(record.messageId, bound.mapping.logical_task_key);
+          const claimState = readClaimState({
+            claimsDir: path.join(project.root, ".runtime-data", "inbound", "delivery-claims"),
+            key: claimKeyForTurn,
+            expect: {
+              logicalTaskKey: bound.mapping.logical_task_key,
+              bindingId: effectiveBindingId(bound.mapping, { root: project.root }),
+              claudeSessionId: boundSession ?? null,
+            },
+          });
+          if (claimState.status !== "valid") {
+            turnRoute = { ok: false, reason: "claim_" + claimState.status, why: claimState.why ?? null, messageId: record.messageId };
+          } else {
+            const origin = claimState.claim.origin_channel_generation_id ?? null;
+            const target = resolveMappingOutboundGeneration(bound.mapping, origin);
+            turnRoute = target.ok
+              ? { ok: true, kind: "feishu", origin, claimKey: claimKeyForTurn }
+              : { ok: false, reason: "origin_unresolvable", why: target.reason, origin, messageId: record.messageId };
+            if (target.ok) turnOrigin = origin;
+          }
+        }
+      }
+    }
     // Dialogue 的现场投递没有后台 watcher；精确目标会话的 Stop 就是该回合的终局观察点。
     // 只结束 active_turn.runtime_target_id 与本会话严格相同的回合，其他会话的 Stop 不得碰它。
     if (!ownedByBridge && speakingSession && bound.ok) {
@@ -163,6 +207,13 @@ async function main() {
       const activeTurn = interaction.ok ? interaction.state.dialogue?.active_turn : null;
       if (interaction.ok && interaction.state.policy_id === DIALOGUE_POLICY_ID &&
           activeTurn?.runtime_target_id === speakingSession) {
+        // 这一回合是飞书来的：回复发回该回合受理时冻结的 origin（老话题的指令回老话题）；
+        // origin 解析不了同样零入队（校验器已把 origin 形状钉住，这里再守解析）。
+        const turnTarget = resolveMappingOutboundGeneration(bound.mapping, activeTurn.origin_channel_generation_id ?? null);
+        turnRoute = turnTarget.ok
+          ? { ok: true, kind: "dialogue", origin: activeTurn.origin_channel_generation_id, claimKey: activeTurn.run_id }
+          : { ok: false, reason: "dialogue_origin_unresolvable", why: turnTarget.reason, origin: activeTurn.origin_channel_generation_id ?? null };
+        if (turnTarget.ok) turnOrigin = activeTurn.origin_channel_generation_id;
         const finalized = finalizeClaudeDialogueTurn({
           root: project.root,
           claudeSessionId: boundSession,
@@ -188,18 +239,45 @@ async function main() {
     // 答复只发给 **cwd 归属**的项目，不发给「会话记录里提到过路径」的那些。
     // 弱信号用来触发排空是安全的（那些内容本来就要发），但用它决定
     // 「把整段对话原文发到谁的话题里」不行 —— 一次误判就是把无关对话发给了 Frank。
-    if (reply && project.via.includes("cwd")) {
+    if (reply && project.via.includes("cwd") && !turnRoute.ok && turnRoute.reason === "turn_record_consumed") {
+      // 同一回合的 Stop 重入：第一次已经入队，这次幂等跳过 —— 只记日志，不算"未路由"。
+      log(project.id + " reply not re-queued: turn record already consumed");
+    } else if (reply && project.via.includes("cwd") && !turnRoute.ok) {
+      // 零入队 + 可诊断：完整答复留在记录里（不是预览），临时文件 + rename 原子落盘，文件名带随机段不会覆盖。
+      const unrouted = path.join(project.root, ".runtime-data", "outbound", "unrouted-replies");
+      try {
+        fs.mkdirSync(unrouted, { recursive: true, mode: 0o700 });
+        const name = Date.now() + "-" + speakingSession.slice(0, 8) + "-" + crypto.randomUUID().slice(0, 8) + ".json";
+        const file = path.join(unrouted, name);
+        const tmp = file + ".tmp." + process.pid;
+        fs.writeFileSync(tmp, JSON.stringify({
+          schema_version: "1.0", artifact_type: "feishu_bridge_unrouted_reply", reason: turnRoute.reason, why: turnRoute.why ?? null,
+          message_id: turnRoute.messageId ?? null, origin_channel_generation_id: turnRoute.origin ?? null, session_id: speakingSession,
+          binding_id: effectiveBindingId(bound.mapping, { root: project.root }) ?? null, recorded_at: new Date().toISOString(),
+          reply_text: reply,
+        }, null, 2) + "\n", { mode: 0o600 });
+        fs.renameSync(tmp, file);
+      } catch (err) { log(project.id + " unrouted record unwritable: " + err.message); }
+      log(project.id + " reply NOT queued: " + turnRoute.reason + (turnRoute.why ? "（" + turnRoute.why + "）" : ""));
+      if (turnRoute.reason !== "turn_record_consumed" && !String(turnRoute.reason).startsWith("turn_record_")) {
+        consumeTurnRecord({ dir: inputDir, key: speakingSession });
+      }
+    } else if (reply && project.via.includes("cwd")) {
       const input = speakingSession
         ? readTurnInput({ dir: inputDir, key: speakingSession })
         : { ok: false };
       const r = appendEvent({
         outboxDir, kind: "reply", text: reply, source: "session-reply",
-        eventKey: input.ok && input.captureId
-          ? "claude:" + speakingSession + ":capture:" + input.captureId + ":reply"
-          : undefined,
+        // 事件键 = "同一回合重入"，不是"正文碰巧相同"：本地回合用 capture id，飞书 / Dialogue 回合用已验的 claim key
+        //（评审探针：两条不同飞书回合回复正文相同，第二条曾被正文指纹去重掉）。
+        eventKey: turnRoute.claimKey
+          ? "claude:" + speakingSession + ":claim:" + turnRoute.claimKey + ":reply"
+          : input.ok && input.captureId
+            ? "claude:" + speakingSession + ":capture:" + input.captureId + ":reply"
+            : undefined,
         inputText: input.ok ? input.text : undefined,
         inputOrigin: input.ok ? input.inputOrigin : undefined,
-        targetGenerationId: bound.ok ? bound.mapping?.channel_generation_id : undefined,
+        targetGenerationId: bound.ok ? (turnOrigin ?? bound.mapping?.channel_generation_id) : undefined,
         runId: input.ok ? input.captureId : undefined,
       });
       // 成功后保留本轮单文件缓存，直到下一次 UserPromptSubmit 原子覆写。这样 Stop hook
@@ -209,6 +287,8 @@ async function main() {
         wroteThisTurn.add(project.root);
         log(project.id + " reply queued (" + reply.length + " 字符)");
       }
+      // 这份来源记录已经授权过一次入队：打上消费标记，重入与下一轮都不能再用它。
+      if (turnRoute.kind === "local" || turnRoute.kind === "feishu") consumeTurnRecord({ dir: inputDir, key: speakingSession });
     } else if (!reply && speakingSession && project.via.includes("cwd")) {
       clearTurnInput({ dir: inputDir, key: speakingSession });
     }

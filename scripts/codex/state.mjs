@@ -25,7 +25,7 @@ import {
 } from "../subscription.mjs";
 import {
   ROTATION_STATUS, activatePendingTopicGeneration, activeGeneration,
-  activeGenerationForSession, applyTopicGenerationToMapping, closePendingTopicGeneration,
+  applyTopicGenerationToMapping, closePendingTopicGeneration, generationForSession,
   failTopicRotation, materializeLegacyTopicFields, pendingGeneration, prepareTopicRotation,
   recordTopicGenerationActivity, registerPendingTopicGeneration, topicGenerationStateForLegacy,
   markPendingClaimReminder,
@@ -530,11 +530,15 @@ export function findTaskForFeishuSession({ sessionId, home = bridgeHome() } = {}
   if (typeof sessionId !== "string" || !sessionId) return { ok: false, reason: "no_session_id" };
   const reg = loadRegistry(registryFile(home));
   if (!reg.ok) return reg;
-  const task = reg.tasks.find((candidate) => {
+  const hits = reg.tasks.filter((candidate) => {
     if ((candidate.status ?? "active") !== "active") return false;
     const loaded = topicStateForTask(candidate);
-    return loaded.ok && Boolean(activeGenerationForSession(loaded.state, sessionId));
+    // active 与 read-only 历史代际的 session 都路由（goal 第 2 层：老话题也能下指令）
+    return loaded.ok && Boolean(generationForSession(loaded.state, sessionId));
   });
+  // 命中多条说不清是谁的：不按登记顺序取第一条（评审探针）。
+  if (hits.length > 1) return { ok: false, reason: "ambiguous_session", candidates: hits.length };
+  const task = hits[0];
   if (!task) return { ok: false, reason: "no_binding_for_session", candidates: reg.tasks.length };
   const resolved = resolveTask(task, { home });
   return resolved.ok ? { ok: true, ...resolved } : resolved;

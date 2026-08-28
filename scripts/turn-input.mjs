@@ -37,6 +37,109 @@ export function isFeishuStampedInput(value) {
   return /^\s*\[飞书\s*·\s*(?:msg|om)_[^\s·\]]+\s*·/u.test(String(value ?? ""));
 }
 
+/** 飞书戳记里的消息 id（`[飞书 · msg_x · 时间]`）；不是戳记就 null。 */
+export function feishuStampMessageId(value) {
+  const m = /^\s*\[飞书\s*·\s*((?:msg|om)_[^\s·\]]+)\s*·/u.exec(String(value ?? ""));
+  return m ? m[1] : null;
+}
+
+/**
+ * **本轮来源只有一份记录**（同一个文件、原子覆写）：要么本地输入（含正文），要么飞书回合（含消息 id）。
+ * 两种来源分两个文件表达时，切换不是原子的 —— 本地写失败 + 飞书标记没清 = Stop 把本地回复发回老话题
+ * （评审探针）。现在一次 rename 就把上一轮的来源整个换掉。
+ */
+export function storeInboundTurn({ dir, key, messageId, now = Date.now() } = {}) {
+  if (typeof dir !== "string" || !dir || typeof key !== "string" || !key) return { ok: false, reason: "missing_locator" };
+  if (typeof messageId !== "string" || !messageId) return { ok: false, reason: "message_id_required" };
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    prune(dir, { now });
+    const file = cacheFile(dir, key);
+    const tmp = file + ".tmp." + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify({
+      schema_version: "1.0", input_origin: "feishu", message_id: messageId, captured_at: new Date(now).toISOString(),
+    }, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return { ok: true, file };
+  } catch (err) {
+    return { ok: false, reason: "unwritable", error: String(err?.code ?? err?.message ?? err) };
+  }
+}
+
+/**
+ * 读本轮记录（不做来源判断）：{ ok, kind: "local" | "feishu", ... } 或 { ok:false, reason: not_found | unreadable | invalid_cache }。
+ * Stop 只有读到明确的 local，或 feishu + 合法 claim/origin，才允许入队；其余 fail-closed。
+ */
+export function readTurnRecord({ dir, key } = {}) {
+  if (typeof dir !== "string" || !dir || typeof key !== "string" || !key) return { ok: false, reason: "missing_locator" };
+  const file = cacheFile(dir, key);
+  let record;
+  try { record = JSON.parse(fs.readFileSync(file, "utf-8")); }
+  catch (err) { return { ok: false, reason: err.code === "ENOENT" ? "not_found" : "unreadable", file }; }
+  if (record?.schema_version !== "1.0") return { ok: false, reason: "invalid_cache", file };
+  const consumed = typeof record.consumed_at === "string" && record.consumed_at.length > 0;
+  if (record.input_origin === "local") {
+    if (typeof record.text !== "string" || !record.text.trim()) return { ok: false, reason: "invalid_cache", file };
+    return { ok: true, kind: "local", file, consumed, text: record.text, captureId: typeof record.capture_id === "string" && record.capture_id ? record.capture_id : null };
+  }
+  if (record.input_origin === "feishu") {
+    if (typeof record.message_id !== "string" || !record.message_id) return { ok: false, reason: "invalid_cache", file };
+    return { ok: true, kind: "feishu", file, consumed, messageId: record.message_id };
+  }
+  return { ok: false, reason: "invalid_cache", file };
+}
+
+/**
+ * Stop 用完这份记录就打上 consumed_at（原子覆写）：同一回合 Stop 重入拿到的是"已消费"，零入队；
+ * 上一轮的记录也不可能再授权下一次 Stop —— 每个获准执行的 prompt 都要留下自己的新记录。
+ */
+export function consumeTurnRecord({ dir, key, now = Date.now() } = {}) {
+  if (typeof dir !== "string" || !dir || typeof key !== "string" || !key) return { ok: false, reason: "missing_locator" };
+  const file = cacheFile(dir, key);
+  let record;
+  try { record = JSON.parse(fs.readFileSync(file, "utf-8")); }
+  catch (err) { return { ok: false, reason: err.code === "ENOENT" ? "not_found" : "unreadable", file }; }
+  if (record === null || typeof record !== "object") return { ok: false, reason: "invalid_cache", file };
+  try {
+    const tmp = file + ".tmp." + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify({ ...record, consumed_at: new Date(now).toISOString() }, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return { ok: true, file };
+  } catch (err) {
+    return { ok: false, reason: "unwritable", error: String(err?.code ?? err?.message ?? err) };
+  }
+}
+
+/**
+ * 登记表读不出来、绑定解析不了的时候，init-hook 仍要保证上一轮的记录不会活到这一轮：
+ * 从 cwd 往上找所有 `.runtime-data/outbound/turn-inputs*` 里属于这个会话的记录。
+ */
+export function findTurnRecordDirsUpward({ cwd, key } = {}) {
+  if (typeof cwd !== "string" || !cwd || typeof key !== "string" || !key) return [];
+  const found = [];
+  let dir = path.resolve(cwd);
+  for (;;) {
+    const outbound = path.join(dir, ".runtime-data", "outbound");
+    let names = [];
+    try { names = fs.readdirSync(outbound).filter((n) => n.startsWith("turn-inputs")); } catch { names = []; }
+    for (const n of names) {
+      const candidate = path.join(outbound, n);
+      if (fs.existsSync(cacheFile(candidate, key))) found.push(candidate);
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return found;
+}
+
+/** 只认飞书回合；本地回合返回 local_turn。 */
+export function readInboundTurn({ dir, key } = {}) {
+  const r = readTurnRecord({ dir, key });
+  if (!r.ok) return r;
+  return r.kind === "feishu" ? { ok: true, file: r.file, messageId: r.messageId } : { ok: false, reason: "local_turn", file: r.file };
+}
+
 function prune(dir, { now = Date.now() } = {}) {
   let names;
   try { names = fs.readdirSync(dir).filter((name) => name.endsWith(".json")); }
@@ -55,19 +158,23 @@ export function storeTurnInput({ dir, key, text, now = Date.now() } = {}) {
   }
   const normalized = normalizeLocalInput(text);
   if (!normalized) return { ok: false, reason: "empty_input" };
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  prune(dir, { now });
-  const file = cacheFile(dir, key);
-  const tmp = file + ".tmp." + process.pid;
-  fs.writeFileSync(tmp, JSON.stringify({
-    schema_version: "1.0",
-    capture_id: crypto.randomUUID(),
-    input_origin: "local",
-    text: normalized,
-    captured_at: new Date(now).toISOString(),
-  }, null, 2) + "\n", { mode: 0o600 });
-  fs.renameSync(tmp, file);
-  return { ok: true, file };
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    prune(dir, { now });
+    const file = cacheFile(dir, key);
+    const tmp = file + ".tmp." + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify({
+      schema_version: "1.0",
+      capture_id: crypto.randomUUID(),
+      input_origin: "local",
+      text: normalized,
+      captured_at: new Date(now).toISOString(),
+    }, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return { ok: true, file };
+  } catch (err) {
+    return { ok: false, reason: "unwritable", error: String(err?.code ?? err?.message ?? err) };
+  }
 }
 
 export function readTurnInput({ dir, key } = {}) {
@@ -77,6 +184,7 @@ export function readTurnInput({ dir, key } = {}) {
   const file = cacheFile(dir, key);
   try {
     const record = JSON.parse(fs.readFileSync(file, "utf-8"));
+    if (record?.input_origin === "feishu") return { ok: false, reason: "feishu_turn", file };
     if (record?.input_origin !== "local" || typeof record?.text !== "string" || !record.text.trim()) {
       return { ok: false, reason: "invalid_cache", file };
     }
@@ -98,6 +206,7 @@ export function clearTurnInput({ dir, key } = {}) {
   if (typeof dir !== "string" || !dir || typeof key !== "string" || !key) {
     return { ok: false, reason: "missing_locator" };
   }
-  fs.rmSync(cacheFile(dir, key), { force: true });
+  try { fs.rmSync(cacheFile(dir, key), { force: true }); }
+  catch (err) { return { ok: false, reason: "unwritable", error: String(err?.code ?? err?.message ?? err) }; }
   return { ok: true };
 }

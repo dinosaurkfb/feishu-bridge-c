@@ -1043,8 +1043,18 @@ test("Codex adapter 轮转期间旧 session 继续路由，认领后新旧代际
     now: 1500,
   });
   assert.equal(switched.ok, true);
-  assert.equal(findTaskForFeishuSession({ sessionId: "session_old", home }).ok, false);
+  // goal 第 2 层：老话题（read-only 代际）的 session 仍路由到同一 task，origin 按 session 定 → 回复回老话题
+  const viaOld = findTaskForFeishuSession({ sessionId: "session_old", home });
+  assert.equal(viaOld.ok, true, JSON.stringify(viaOld));
   assert.equal(findTaskForFeishuSession({ sessionId: "session_new", home }).ok, true);
+  const oldGen = topicStateForTask(viaOld.task).state.generations.find((g) => g.root_message_id === "om_old");
+  const ctxOld = buildLegacyMappingContext({ runtime: "codex", mapping: viaOld.mapping, event: { session_id: "session_old" } });
+  assert.deepEqual([ctxOld.originChannelGenerationId, ctxOld.originGenerationStatus], [oldGen.channel_generation_id, "read-only"]);
+  const ctxNew = buildLegacyMappingContext({ runtime: "codex", mapping: viaOld.mapping, event: { session_id: "session_new" } });
+  assert.equal(ctxNew.originChannelGenerationId, registered.generation.channel_generation_id);
+  const oldTarget = resolveTaskOutboundGeneration(viaOld.task, ctxOld.originChannelGenerationId);
+  assert.deepEqual([oldTarget.ok, oldTarget.rootMessageId, oldTarget.status], [true, "om_old", "read-only"], "老话题的指令，回复发回老话题");
+  assert.equal(findTaskForFeishuSession({ sessionId: "session_zzz", home }).ok, false);
   const stored = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
   const state = topicStateForTask(stored).state;
   assert.equal(activeGeneration(state).root_message_id, "om_new");
@@ -1057,9 +1067,9 @@ test("Codex adapter 轮转期间旧 session 继续路由，认领后新旧代际
     "--thread-id", THREAD_A,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   assert.equal(status.status, 0, status.stderr);
-  // 迁到四层之后措辞变了，**测的仍是同一件事**：有 1 个只读历史代际。
-  assert.match(status.stdout, /只读历史.*1 个代际/u,
-    "只读历史那条事实必须还在：" + status.stdout);
+  // 迁到四层之后措辞变了，**测的仍是同一件事**：有 1 个历史代际（2026-08-28 起叫"历史话题"，仍可下指令）。
+  assert.match(status.stdout, /历史话题.*1 个代际（仍可下指令，回复回原话题）/u,
+    "历史话题那条事实必须还在：" + status.stdout);
   assert.match(status.stdout, /第 3 层 · 精确通道绑定/u, "而且要出现在第 3 层里");
 });
 
@@ -8816,6 +8826,23 @@ test("Codex 兜底真入口 drain-all 跑待认领提醒；发不出去要报 pu
   assert.equal(r.status, 1, r.stdout + r.stderr);
   assert.match(r.stdout + r.stderr, /Codex 待认领提醒：.*提醒有问题.*A（publish_failed/u, r.stdout + r.stderr);
   assert.equal(fx.pendingNow(Date.now()).claim_reminder_at, undefined, "没发出去不许记");
+});
+
+test("Codex：两个 task 持有同一 Aily session → 路由返回歧义，不按登记顺序取第一条", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const a = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  const b = makeTaskEntry({ root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "b" });
+  for (const t of [a, b]) { t.session_id = "aily_dup"; t.inbound_state = "bound"; delete t.topic_generation_state; delete t.channel_generation_id; }
+  assert.throws(() => writeRegistryFixtureUnvalidated([a, b], path.join(home, "registry.json")), /重复绑定字段：session_id/u,
+    "登记表写入层就拒绝重复 session");
+  // 绕过写入层的坏表：路由也不许按登记顺序取第一条
+  fs.writeFileSync(path.join(home, "registry.json"), JSON.stringify({ schema_version: "1.0", tasks: [a, b] }, null, 2));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const r = findTaskForFeishuSession({ sessionId: "aily_dup", home });
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.ok(["ambiguous_session", "duplicate_binding"].includes(r.reason), "坏表被读取层拦下或路由层判歧义，都不许取第一条：" + JSON.stringify(r));
 });
 
 summarySealed = true;

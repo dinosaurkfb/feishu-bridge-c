@@ -260,6 +260,20 @@ const clipWhy = (text) => {
  * 待处理事件第五区里 run 通道那几行 —— **只转述，不判断**：分类来自 inspectRunChannel（与排空同一份判据）。
  * 没查 / 解析不出 / runs 账本打不开 / 绑定暂停未分类，各自明写，不折叠成 0，不伪造成正常。
  */
+/** 未路由回复那几行 —— 独立于 runs 账本的事实，runs 读不出时也要渲染（评审探针：曾被提前 return 藏掉）。 */
+function unroutedRows(ur) {
+  if (ur === undefined || ur === null) return [];
+  if (ur.ok === false) return [["未路由回复", "说不清（" + String(ur.reason ?? "unrouted_unreadable") + "）"]];
+  const rows = [];
+  const problems = ur.problems ?? [];
+  if (ur.count > 0 || problems.length > 0) {
+    rows.push(["未路由回复", ur.count + " 条（需要人看：" + ur.dir + "）" + (problems.length ? "；另有 " + problems.length + " 个说不清的条目" : "")]);
+    for (const x of ur.entries) rows.push(["  " + clipWhy(x.reason), x.why ? clipWhy(x.why) : (x.recordedAt ?? "")]);
+    for (const p of problems) rows.push(["  " + clipWhy(p.file), p.reason]);
+  }
+  return rows;
+}
+
 export function runChannelRows(rc, now = Date.now()) {
   if (rc === undefined || rc === null) return [["run 通道", "未查（本次没读 runs 账本）"]];
   const rows = [];
@@ -267,6 +281,7 @@ export function runChannelRows(rc, now = Date.now()) {
   if (rc.inventoryOk === false) {
     const p = problems.find((x) => x.key === null) ?? problems[0];
     rows.push(["run 通道", "说不清（" + (p?.reason ?? "runs 账本读不出") + (p?.why ? "：" + redactRunText(p.why) : "") + "）"]);
+    rows.push(...unroutedRows(rc.unrouted));
     return rows;
   }
   if (rc.phase === "unresolved") {
@@ -285,6 +300,7 @@ export function runChannelRows(rc, now = Date.now()) {
       for (const x of du) rows.push(["  " + shortKey(x.key), clipWhy(x.error ?? "")]);
     }
   }
+  rows.push(...unroutedRows(rc.unrouted));
   // 盘点能读（inventoryOk）时，problems 一条不漏 —— 含 key 为 null 的（不认识的条目、claims 目录读不出）；
   // 评审探针：未绑定的项目里有个未识别文件，曾被同时说成"0 条待处理"和"账本无异常"。
   rows.push(["runs 账本", problems.length ? "说不清 " + problems.length + " 处" : "无异常"]);
@@ -401,7 +417,7 @@ export function composeLayeredStatus({
     L3.push(["待认领代际", "第 " + st.pendingGeneration + " 代" + describePendingWindow(st, { now: Date.now() })]);
   }
   if (st.readOnlyGenerations > 0) {
-    L3.push(["只读历史", st.readOnlyGenerations + " 个代际（不再接收新指令）"]);
+    L3.push(["历史话题", st.readOnlyGenerations + " 个代际（仍可下指令，回复回原话题）"]);
   }
   if (st.expiresAt) L3.push(["有效期", String(st.expiresAt).slice(0, 10)]);
   if (others.length > 1) L3.push(["本项目绑定数", others.length + " 条"]);

@@ -44,7 +44,7 @@ import {
 import { describeReminderSweep, remindClaudePendingClaims, remindOnePendingClaim } from "./claim-reminder.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
-  acquirePublishLock, attributeSession, exactProjectsForRoot, fileContainsAny, isUnder,
+  acquirePublishLock, attributeSession, clearStaleReapLock, exactProjectsForRoot, fileContainsAny, isUnder,
   loadRegistry, loadRegistryStrict, normalizeRoot, releasePublishLock,
   routableProjectsForRoot,
 } from "./registry.mjs";
@@ -3483,13 +3483,84 @@ test("回收窗口：判定陈旧之后、动手之前锁换了主人 → 不许
   assert.deepEqual([r2.ok, r2.reason], [false, "publisher_busy"], JSON.stringify(r2));
   assert.equal(JSON.parse(fs.readlinkSync(lockDir)).token, "stale", "陈旧锁留给正在回收的那一方处理");
   assert.equal(fs.readlinkSync(reapDir), reaping, "别人的 reap 锁不许动");
-  // 3. reap 锁本身是残骸（60 秒以上）→ 可以接管回收。
+  // 3. reap 锁本身是残骸（60 秒以上）→ 热路径**不自愈**：报 reap_residue、一个字不动；只有显式维护入口能清。
   const old = (Date.now() - 120_000) / 1000;
   fs.lutimesSync(reapDir, old, old);
   const r3 = acquirePublishLock(lockDir);
-  assert.equal(r3.ok, true, JSON.stringify(r3));
+  assert.deepEqual([r3.ok, r3.reason], [false, "reap_residue"], JSON.stringify(r3));
+  assert.equal(fs.readlinkSync(reapDir), reaping, "残骸也不在热路径上碰（自愈会递归复现同一个窗口）");
+  assert.equal(JSON.parse(fs.readlinkSync(lockDir)).token, "stale");
+  const preview = clearStaleReapLock(lockDir);
+  assert.deepEqual([preview.present, preview.stale, preview.removed], [true, true, false], "默认只报告");
+  assert.equal(fs.readlinkSync(reapDir), reaping);
+  const cleared = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([cleared.stale, cleared.removed], [true, true]);
+  assert.throws(() => fs.lstatSync(reapDir));
+  const r4 = acquirePublishLock(lockDir);
+  assert.equal(r4.ok, true, JSON.stringify(r4));
   assert.deepEqual(fs.readdirSync(local).filter((n) => n.startsWith("registry.lock.")), [], "reap / reaped 残留不许留");
+  // 还新的 reap 锁：维护入口也拒绝清（可能是活的）
+  fs.symlinkSync(reaping, reapDir);
+  const fresh = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([fresh.present, fresh.stale, fresh.removed], [true, false, false]);
+  assert.equal(fs.readlinkSync(reapDir), reaping);
+  // 持锁时 reap 残骸在：释放也报 reap_residue、锁不动
+  fs.lutimesSync(reapDir, old, old);
+  const rel = releasePublishLock(lockDir, { waitMs: 10 });
+  assert.deepEqual([rel.ok, rel.reason], [false, "reap_residue"], JSON.stringify(rel));
+  assert.equal(JSON.parse(fs.readlinkSync(lockDir)).token, r4.token);
+  fs.rmSync(reapDir, { force: true });
   assert.equal(releasePublishLock(lockDir).ok, true);
+});
+
+test("symlink owner 形状封闭：缺 token / pid 不是正整数 / at 不规范 → 当不可读、保留现场；只有目录形状的旧版锁才按 pid 兼容", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-shape-"));
+  const lockDir = path.join(local, "registry.lock");
+  const shapes = [
+    { pid: process.pid, at: new Date().toISOString() },
+    { pid: "x", at: new Date().toISOString(), token: "t" },
+    { pid: process.pid, at: "2026-08-28T00:00:00Z", token: "t" },
+    { pid: process.pid, at: new Date().toISOString(), token: "" },
+    [1, 2],
+  ];
+  for (const owner of shapes) {
+    fs.rmSync(lockDir, { force: true });
+    fs.symlinkSync(JSON.stringify(owner), lockDir);
+    const rel = releasePublishLock(lockDir);
+    assert.deepEqual([rel.ok, rel.reason], [false, "owner_unreadable"], JSON.stringify(owner));
+    assert.ok(fs.lstatSync(lockDir).isSymbolicLink(), "现场要留着：" + JSON.stringify(owner));
+    assert.equal(acquirePublishLock(lockDir).reason, "publisher_busy", "刚建的不可读当活锁：" + JSON.stringify(owner));
+  }
+  const old = (Date.now() - 60_000) / 1000;
+  fs.lutimesSync(lockDir, old, old);
+  assert.equal(acquirePublishLock(lockDir).ok, true, "超过宽限由陈旧回收处理");
+  assert.equal(releasePublishLock(lockDir).ok, true);
+  // 旧版目录锁：pid 是自己 → 可释放（兼容分支只对目录形状开放）
+  fs.mkdirSync(lockDir);
+  fs.writeFileSync(path.join(lockDir, "owner.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  assert.equal(releasePublishLock(lockDir).ok, true);
+  assert.throws(() => fs.lstatSync(lockDir));
+});
+
+test("repair-publish-lock 真入口：默认只报告、--apply 只清残骸、还新的拒绝、参数严格", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-repair-"));
+  const lockDir = path.join(local, "registry.lock");
+  const reapDir = lockDir + ".reap";
+  const cli = (...args) => spawnSync(process.execPath, [path.resolve("scripts", "repair-publish-lock.mjs"), ...args], { encoding: "utf-8" });
+  assert.equal(cli().status, 2);
+  assert.equal(cli("--lock", lockDir, "--bogus").status, 2);
+  assert.equal(cli("--", "--apply").status, 2, "透传参数也拒绝");
+  assert.match(cli("--lock", lockDir).stdout, /没有 reap 残骸/u);
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), reapDir);
+  assert.match(cli("--lock", lockDir, "--apply").stdout, /还新.*不动/u);
+  assert.ok(fs.lstatSync(reapDir).isSymbolicLink());
+  const old = (Date.now() - 120_000) / 1000;
+  fs.lutimesSync(reapDir, old, old);
+  const preview = cli("--lock", lockDir);
+  assert.match(preview.stdout, /\[预览\].*可清除/u);
+  assert.ok(fs.lstatSync(reapDir).isSymbolicLink(), "预览不删");
+  assert.match(cli("--lock", lockDir, "--apply").stdout, /已清除 reap 残骸/u);
+  assert.throws(() => fs.lstatSync(reapDir));
 });
 
 test("释放是归属转换：owner 不可读保留现场；reap 锁被占就等、等不到报 release_busy 不动锁；reap 段内被接管不删别人的 reap 锁", () => {

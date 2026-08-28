@@ -10,6 +10,7 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { isCanonicalIso } from "./canonical-time.mjs";
 import os from "node:os";
 import path from "node:path";
 
@@ -238,6 +239,11 @@ export function attributeSession({ projects, cwd, transcriptPath }) {
  *   · 陈旧回收**串行化**：先拿专用 reap 锁，在里面重读 owner、核对实例没变、仍然陈旧，再把锁
  *     rename 走（原子；两个回收者只有一个能成功），然后再正常取锁。原来"判陈旧 → rm → 重取"三步
  *     不互斥，两个回收者能同时成功。
+ *   · reap 锁**热路径不自愈**：它在就 fail-closed（超过 REAP_LOCK_STALE_MS 报 reap_residue，否则等一小会报 busy）。
+ *     给 reap 再套一层"读年龄 → 按路径 rename"的自愈只会把同一个"判断与修改分离"的窗口递归复现
+ *     （评审第五轮探针）。残骸交显式维护入口：repair-publish-lock.mjs / clearStaleReapLock。
+ *   · symlink owner 形状**封闭**：必须是 {pid: 正整数, at: 规范时间, token: 非空串}，否则按不可读处理、保留现场；
+ *     只有目录形状的旧版锁（legacy）才允许按 pid 兼容。
  *   · 旧版 runtime（mkdir + owner.json 目录锁）与本协议**不能并行**：旧版看到 symlink 会当陈旧删掉。
  *     切换 runtime 时必须没有旧持有者（安装器切 current 之前兜底不在跑）。目录形状的旧锁这里
  *     仍能读、能按陈旧回收，只是不保证与旧进程互斥。
@@ -250,12 +256,21 @@ const REAP_LOCK_STALE_MS = 60 * 1000;
 // 本进程当前持有的锁实例：lockDir → token。释放时据此核对，调用点不用改签名。
 const HELD = new Map();
 
+/** symlink owner 的封闭形状：缺 token、pid 不是正整数、at 不规范 —— 都不是本协议写出来的东西，一律当不可读。 */
+function ownerShapeOk(owner) {
+  return owner !== null && typeof owner === "object" && !Array.isArray(owner)
+    && Number.isSafeInteger(owner.pid) && owner.pid > 0
+    && isCanonicalIso(owner.at)
+    && typeof owner.token === "string" && owner.token.length > 0;
+}
+
 function readLockOwner(lockDir) {
   let st;
   try { st = fs.lstatSync(lockDir); } catch { return { present: false, owner: null }; }
   if (st.isSymbolicLink()) {
-    try { return { present: true, owner: JSON.parse(fs.readlinkSync(lockDir)), mtimeMs: st.mtimeMs }; }
-    catch { return { present: true, owner: null, mtimeMs: st.mtimeMs }; }
+    let owner = null;
+    try { owner = JSON.parse(fs.readlinkSync(lockDir)); } catch { owner = null; }
+    return { present: true, owner: ownerShapeOk(owner) ? owner : null, mtimeMs: st.mtimeMs };
   }
   // 旧版目录锁：owner.json 在目录里。
   try { return { present: true, owner: JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf-8")), mtimeMs: st.mtimeMs, legacy: true }; }
@@ -285,9 +300,9 @@ function tryLink(lockDir, payload) {
 
 /**
  * 所有会改变锁归属的动作（陈旧回收、释放）都在 reap 锁里做，彼此互斥。
- * reap 锁自身：同一 symlink 原语；持有超过 REAP_LOCK_STALE_MS 视为残骸可被接管；
- * 释放按 token 核对（被接管过就不删别人的）。段内只做几次文件操作，不做别的 I/O。
- * 返回 { ok, run } 或 { ok:false, reason }。busy 时可选择短暂重试（释放要用）。
+ * reap 锁自身：同一 symlink 原语；**在就 fail-closed** —— 超过 REAP_LOCK_STALE_MS 报 reap_residue（残骸，
+ * 交显式维护入口），否则等最多 waitMs 后报 reap_busy。释放按 token 核对。段内只做几次文件操作，不做别的 I/O。
+ * 返回 { ok, run } 或 { ok:false, reason }。
  */
 function withReapLock(lockDir, fn, { waitMs = 0, duringReap = null } = {}) {
   const reapDir = lockDir + ".reap";
@@ -300,12 +315,7 @@ function withReapLock(lockDir, fn, { waitMs = 0, duringReap = null } = {}) {
     if (reap.ok) { held = true; break; }
     if (reap.reason !== "publisher_busy") return reap;
     const r = readLockOwner(reapDir);
-    if (r.present && Date.now() - r.mtimeMs > REAP_LOCK_STALE_MS) {
-      // 回收者崩在里面了：rename 走（原子，只有一个接管者成功）再拿。
-      try { fs.renameSync(reapDir, reapDir + ".dead-" + token); fs.rmSync(reapDir + ".dead-" + token, { recursive: true, force: true }); }
-      catch { /* 别人刚接管 */ }
-      continue;
-    }
+    if (r.present && Date.now() - r.mtimeMs > REAP_LOCK_STALE_MS) return { ok: false, reason: "reap_residue" };
     if (Date.now() >= deadline) return { ok: false, reason: "reap_busy" };
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
   }
@@ -376,7 +386,7 @@ export function releasePublishLock(lockDir, { waitMs = 500 } = {}) {
     const r = readLockOwner(lockDir);
     if (!r.present) return { ok: true, absent: true };
     if (!r.owner) return { ok: false, reason: "owner_unreadable" };
-    if (typeof r.owner.token === "string") {
+    if (!r.legacy) {
       if (r.owner.token !== mine) return { ok: false, reason: "not_owner", pid: r.owner.pid };
     } else if (Number.isFinite(r.owner.pid) && r.owner.pid !== process.pid) {
       let alive = true;
@@ -389,4 +399,19 @@ export function releasePublishLock(lockDir, { waitMs = 500 } = {}) {
   if (!done.ok) return done.reason === "reap_busy" ? { ok: false, reason: "release_busy" } : done;
   if (done.run.ok) HELD.delete(lockDir);
   return done.run;
+}
+
+/**
+ * 显式维护入口：reap 锁残骸（回收者崩在几毫秒的段里）只在这里清，热路径不自愈。
+ * 默认只报告；apply 且确实超过 staleMs 才删。不是残骸（还新）一律拒绝 —— 那可能是活的。
+ */
+export function clearStaleReapLock(lockDir, { staleMs = REAP_LOCK_STALE_MS, apply = false } = {}) {
+  const reapDir = lockDir + ".reap";
+  const r = readLockOwner(reapDir);
+  if (!r.present) return { present: false, stale: false, removed: false, reapDir };
+  const ageMs = Date.now() - r.mtimeMs;
+  const stale = ageMs > staleMs;
+  if (!stale || !apply) return { present: true, stale, ageMs, owner: r.owner, removed: false, reapDir };
+  fs.rmSync(reapDir, { recursive: true, force: true });
+  return { present: true, stale, ageMs, owner: r.owner, removed: true, reapDir };
 }

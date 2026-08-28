@@ -29,16 +29,16 @@ import {
   failTopicRotation, materializeLegacyTopicFields, pendingGeneration, prepareTopicRotation,
   recordTopicGenerationActivity, registerPendingTopicGeneration, topicGenerationStateForLegacy,
   markPendingClaimReminder,
+  markPendingClaimReminderAbandoned,
   reserveClaimReminderAttempt,
-  TOPIC_GENERATION_PENDING_MS,
 } from "../topic-generation.mjs";
 import {
   finalizeDialogueTurn, interactionPolicyStateForLegacy, materializeInteractionPolicy,
   reserveDialogueTurn, setInteractionPolicyMode,
 } from "../interaction-policy.mjs";
 
-// 首次绑定的待认领窗口与话题代际的待认领窗口是同一件事 —— 同一份定义（2026-08-28 起 72 小时）。
-export const PENDING_WINDOW_MS = TOPIC_GENERATION_PENDING_MS;
+// 待认领**不过期**（2026-08-28）：只有写了显式截止的才过期。没有"窗口长度"常量了。
+export const PENDING_WINDOW_MS = null;
 export const ACTIVE_LEASE_MAX_MS = 12 * 60 * 60 * 1000;
 export const DEFAULT_INBOUND_PREFIX = null;
 
@@ -582,10 +582,10 @@ export function setTaskConnectionStatus({
     } else {
       task.resumed_at = new Date(now).toISOString();
       delete task.paused_at;
-      // 尚未完成首次 mention 的绑定在恢复时重新获得完整握手窗口。
+      // 尚未完成首次 mention 的绑定在恢复时清掉旧的显式截止 —— 待认领不过期。
       const pending = pendingGeneration(loaded.state);
       if (pending && !activeGeneration(loaded.state)) {
-        pending.claim_expires_at = new Date(now + PENDING_WINDOW_MS).toISOString();
+        pending.claim_expires_at = null;
       }
     }
     const materialized = materializeLegacyTopicFields(task, loaded.state);
@@ -634,7 +634,7 @@ export function refreshPendingTaskBinding({
     if (!pending || activeGeneration(loaded.state)) {
       return { ok: false, reason: "task_not_pending" };
     }
-    pending.claim_expires_at = new Date(now + PENDING_WINDOW_MS).toISOString();
+    pending.claim_expires_at = null; // 刷新 = 清掉旧的显式截止；待认领不过期
     loaded.state.updated_at = new Date(now).toISOString();
     const materialized = materializeLegacyTopicFields(task, loaded.state);
     if (!materialized.ok) return materialized;
@@ -883,11 +883,10 @@ export function enableAutoPublishForAllTasks({ home = bridgeHome(), apply = fals
   }
 }
 
+// 只有写了显式截止的 task 才会过期；没写（或 null）= 不过期。
 const pendingDeadline = (task) => {
   const explicit = Date.parse(task?.pending_expires_at ?? "");
-  if (Number.isFinite(explicit)) return explicit;
-  const bound = Date.parse(task?.bound_at ?? "");
-  return Number.isFinite(bound) ? bound + PENDING_WINDOW_MS : 0;
+  return Number.isFinite(explicit) ? explicit : Infinity;
 };
 
 /**
@@ -1195,6 +1194,16 @@ export function reserveTaskClaimReminder({
   });
 }
 
+/** 本周期尝试用尽：原子记下放弃时间，下个周期重来。 */
+export function markTaskClaimReminderAbandoned({
+  threadId, generationId, home = bridgeHome(), now = Date.now(),
+} = {}) {
+  return mutateTaskTopicState({
+    threadId, home, now,
+    mutate: (state) => markPendingClaimReminderAbandoned(state, { generationId, now }),
+  });
+}
+
 /** 原子记下"待认领话题已提醒过"。 */
 export function markTaskClaimReminder({
   threadId, generationId, home = bridgeHome(), now = Date.now(),
@@ -1347,7 +1356,7 @@ export function makeTaskEntry({
     inbound_prefix: inboundPrefix,
     auto_publish_on_completion: true,
     bound_at: new Date(now).toISOString(),
-    pending_expires_at: new Date(now + PENDING_WINDOW_MS).toISOString(),
+    pending_expires_at: null, // 待认领不过期
     expires_at: new Date(now + 365 * 24 * 60 * 60 * 1000).toISOString(),
   };
   const loaded = topicStateForTask(base, { now });

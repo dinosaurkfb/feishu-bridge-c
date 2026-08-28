@@ -59,6 +59,22 @@ const inboundLogDefault = () =>
  * 查不到：**它此刻在不在线** —— 路由登记只证明配置存在，日志只证明过去某个时刻
  * 工作过。两者都不能升级成"在线"。
  */
+/**
+ * 待认领代际的窗口说明 —— **一份措辞，两处渲染共用**。
+ * 写了显式截止（旧登记）就说截止；否则说"不设期限"并给已等待时长（算出来的，不是判断）。
+ */
+export function describePendingWindow(st, { now = Date.now(), full = false } = {}) {
+  if (st.pendingGenerationExpiresAt) {
+    const s = String(st.pendingGenerationExpiresAt);
+    return "（截止 " + (full ? s : s.slice(0, 10)) + "）";
+  }
+  const created = Date.parse(st.pendingGenerationCreatedAt ?? "");
+  if (!Number.isFinite(created)) return "（不设期限）";
+  const waited = Math.max(0, now - created);
+  const said = waited < 2 * 24 * 3600000 ? Math.max(1, Math.round(waited / 3600000)) + " 小时" : Math.round(waited / 86400000) + " 天";
+  return "（不设期限，已等待约 " + said + "）";
+}
+
 export function endpointFacts({
   runtime = "Claude Code",
   agentName = null,
@@ -381,8 +397,7 @@ export function composeLayeredStatus({
     L3.push(["出站路由", OUTBOUND_ROUTING_TEXT[outboundRouting]]);
   }
   if (st.pendingGeneration !== null && st.pendingGeneration !== undefined) {
-    L3.push(["待认领代际", "第 " + st.pendingGeneration + " 代" +
-      (st.pendingGenerationExpiresAt ? "（截止 " + String(st.pendingGenerationExpiresAt).slice(0, 10) + "）" : "")]);
+    L3.push(["待认领代际", "第 " + st.pendingGeneration + " 代" + describePendingWindow(st, { now: Date.now() })]);
   }
   if (st.readOnlyGenerations > 0) {
     L3.push(["只读历史", st.readOnlyGenerations + " 个代际（不再接收新指令）"]);

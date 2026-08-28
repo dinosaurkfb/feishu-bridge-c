@@ -284,7 +284,7 @@ pending --activate--> active --pause--> paused --resume--> active
 - `paused`：拒绝新入站，保留映射和历史；
 - `rotating` 是 binding 的短期操作状态，不是等待人类期间唯一可用的通道状态；新代际认领完成前，
   旧代际继续 active；
-- `pending` 新代际默认带 72 小时 `claim_expires_at`（2026-08-28 起，此前 24 小时）；超时或显式取消后 fail-closed 地放弃新代际，
+- `pending` 新代际默认 `claim_expires_at: null`（2026-08-28 起不过期；此前 24 → 72 小时）；只有写了显式截止的旧记录才会超时。超时或显式取消后 fail-closed 地放弃新代际，
   旧代际保持 active；
 - `read-only`：不接收新入站，但允许发布在切换前已经冻结到该代际的迟到结果；
 - `retired`：不再恢复，但保留审计索引；
@@ -302,7 +302,7 @@ pending --activate--> active --pause--> paused --resume--> active
    然后释放锁；
 2. 创建新根话题；失败时把 operation 标记 failed，旧 generation 不变；
 3. 再次加锁，在同一 binding 文档中登记新 generation 为 `pending`，写入 topic locator、绑定短码和
-   `claim_expires_at`（默认 72 小时），然后释放锁；
+   `claim_expires_at`（默认 null，不过期），然后释放锁；
 4. 旧 generation 继续 active，系统等待新话题的真实 mention/session 认领；等待过程不持锁；
 5. 认领到达后再次加锁，校验 operation id、期限和 session 唯一性；
 6. 在**同一份 binding 文档的一次原子替换**中，把 `active_generation_id` 指向新 generation，

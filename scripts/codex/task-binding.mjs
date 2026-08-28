@@ -59,6 +59,7 @@ export function taskBindingFacts({ task, home = bridgeHome() } = {}) {
     activeGenerationThreshold: activeTopic?.activity?.auto_rotate_threshold ?? TOPIC_GENERATION_AUTO_ROTATE_MESSAGES,
     pendingGeneration: pendingTopic?.generation ?? null,
     pendingGenerationExpiresAt: pendingTopic?.claim_expires_at ?? null,
+    pendingGenerationCreatedAt: pendingTopic?.created_at ?? null,
     readOnlyGenerations: topic.state.generations
       .filter((generation) => generation.status === "read-only").length,
     policy: interactionPolicySummary(interaction.state),

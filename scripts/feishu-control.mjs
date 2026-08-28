@@ -15,6 +15,7 @@
  * 而待发内容如果一起删，用户会以为"暂停"顺手丢了他还没看到的东西。暂停要能后悔。
  */
 
+import { describePendingWindow } from "./layered-status.mjs";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -75,6 +76,7 @@ export function currentBinding({ root, claudeSessionId, registryFile, templateFi
     activeGenerationThreshold: activeTopic?.activity?.auto_rotate_threshold ?? TOPIC_GENERATION_AUTO_ROTATE_MESSAGES,
     pendingGeneration: pendingTopic?.generation ?? null,
     pendingGenerationExpiresAt: pendingTopic?.claim_expires_at ?? null,
+    pendingGenerationCreatedAt: pendingTopic?.created_at ?? null,
     readOnlyGenerations: topicState?.generations?.filter((generation) =>
       generation.status === "read-only").length ?? 0,
     policy,
@@ -162,7 +164,7 @@ export function bindingsForRoot({ root, registryFile } = {}) {
 }
 
 /** 人类可读的状态摘要。刻意不打印任何 locator（话题 id、session id 全长、凭据）。 */
-export function describeStatus(st, others = []) {
+export function describeStatus(st, others = [], { now = Date.now() } = {}) {
   if (!st.ok) {
     if (st.reason === "not_bound") {
       return ["这个项目还没有接入飞书。",
@@ -191,8 +193,7 @@ export function describeStatus(st, others = []) {
       " 条有效业务消息");
   }
   if (st.pendingGeneration !== null) {
-    lines.push("待认领    第 " + st.pendingGeneration + " 代" +
-      (st.pendingGenerationExpiresAt ? "（截止 " + st.pendingGenerationExpiresAt + "）" : ""));
+    lines.push("待认领    第 " + st.pendingGeneration + " 代" + describePendingWindow(st, { now, full: true }));
   }
   if (st.readOnlyGenerations > 0) {
     lines.push("只读历史  " + st.readOnlyGenerations +

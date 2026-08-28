@@ -253,7 +253,7 @@ v1 只支持一名授权人类和当前精确本地 task 这个主持者，严�
 运行 `rotate` 后，bridge 先创建一个 `pending` 新话题。首次真实 mention 完成认领前，旧话题仍是
 唯一 active；认领成功时，新旧状态在同一份 Git 外 binding 文档的一次原子替换中切换，新话题
 成为 active，旧话题成为 read-only。轮转前已经受理的飞书请求仍回复原话题；本地回合在形成
-outbox 时冻结当时的 active 代际。待认领默认 72 小时过期（截止前 12 小时无人认领会在该话题下提醒），也可用对应 rotate CLI 的
+outbox 时冻结当时的 active 代际。待认领**不过期**（2026-08-28 起）：等满 72 小时无人认领在该话题下提醒一次，之后每 7 天再提醒一次，也可用对应 rotate CLI 的
 `--cancel --apply` 显式取消；两者都不会删除话题历史。实现契约见
 [Topic Generation 生命周期](docs/implementation/topic-generation-lifecycle.md)。
 
@@ -404,7 +404,7 @@ import 当前快照列出的共用模块，底座不反向依赖它（有测试�
 | 理解下一阶段的产品目标、模式和验收标准 | [第三方智能体增强：产品需求文档](docs/requirements/agent-enhancement-requirements.md) |
 | 评审重构边界、实体模型、路由和生命周期 | [第三方智能体增强：架构契约](docs/architecture/agent-enhancement-contract.md) |
 | 评审现有映射模式如何迁移到公共 Policy Handler | [Mapping Policy Handler 迁移](docs/implementation/mapping-policy-handler.md) |
-| 理解话题轮转、代际切换与 72 小时认领期限 | [Topic Generation 生命周期](docs/implementation/topic-generation-lifecycle.md) |
+| 理解话题轮转、代际切换与待认领（不过期、按周期提醒） | [Topic Generation 生命周期](docs/implementation/topic-generation-lifecycle.md) |
 | 理解 Dialogue v1 的串行轮次、预算与停止契约 | [Dialogue Policy v1](docs/implementation/dialogue-policy-v1.md) |
 | 理解多 Agent Dialogue 的参与者授权、串行 planner 与切流门禁 | [Dialogue Participant & Planner 契约](docs/implementation/dialogue-participant-planner-contract.md) |
 | 只读汇总 Dialogue shadow 真实证据与未满足门禁 | [Dialogue Shadow Readiness Audit](docs/implementation/dialogue-shadow-readiness-audit.md) |

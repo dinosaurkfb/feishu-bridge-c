@@ -36,13 +36,14 @@ export function effectiveBindingId(mapping, { root = null } = {}) {
 
 export const TOPIC_GENERATION_SCHEMA_VERSION = "1.0";
 export const TOPIC_GENERATION_ARTIFACT_TYPE = "feishu_bridge_topic_generations";
-// 待认领窗口：2026-08-28 起从 24 小时放长到 72 小时（Frank 定的，三倍）。已登记的 pending 沿用各自记下的
-// claim_expires_at，新代际按这个默认取。
-export const TOPIC_GENERATION_PENDING_MS = 72 * 60 * 60 * 1000;
-// 快过期提醒的提前量：截止前 12 小时内、且还没人认领时，在待认领话题下提醒一次（明写，不藏在比较式里）。
-export const TOPIC_GENERATION_CLAIM_REMINDER_LEAD_MS = 12 * 60 * 60 * 1000;
-// 提醒是"至少一次、有上界"：发送失败最多再试到 MAX_ATTEMPTS 次，两次尝试间隔至少 RETRY_MS
-// （比 30 分钟的兜底周期短一点，下一轮兜底就能重试）。尝试本身在锁内预留并持久化，
+// 待认领**不过期**（2026-08-28 Frank 定的：只有他一个发送者，"误认领陈旧话题"这个风险不值得
+// 让话题作废）。新代际 claim_expires_at 默认 null；已登记时写了显式截止的旧 pending 仍按它过期。
+// 取消是唯一的显式出口：/feishu-rotate cancel。
+// 无人认领的提醒改成按等待时长：等满 AFTER 提醒一次，之后每 REPEAT 再提醒一次（一个"周期"）。
+export const TOPIC_GENERATION_CLAIM_REMINDER_AFTER_MS = 72 * 60 * 60 * 1000;
+export const TOPIC_GENERATION_CLAIM_REMINDER_REPEAT_MS = 7 * 24 * 60 * 60 * 1000;
+// 每个周期内提醒是"最多三次尝试、结果不明时允许重复"：发送失败最多再试到 MAX_ATTEMPTS 次，
+// 两次尝试间隔至少 RETRY_MS（比 30 分钟的兜底周期短一点，下一轮兜底就能重试）。尝试在锁内预留并持久化，
 // 两个扫描器同时跑也只有一个能拿到这次尝试（评审探针：判定在锁外时并发发了两次）。
 export const TOPIC_GENERATION_CLAIM_REMINDER_RETRY_MS = 25 * 60 * 1000;
 export const TOPIC_GENERATION_CLAIM_REMINDER_MAX_ATTEMPTS = 3;
@@ -246,9 +247,10 @@ export function validateTopicGenerationState(state) {
       if (generation.session_id !== null) problems.push("generations.pending_shape");
       // 提醒记录：不在场 / null 都行；在场就必须是**规范**时间（评审探针：Date.parse 放过了
       // "…T00:00:00Z" 这种非规范写法）—— 它们决定"还要不要再提醒"。
-      if (generation.claim_reminder_at !== undefined && generation.claim_reminder_at !== null &&
-          !isCanonicalIso(generation.claim_reminder_at)) {
-        problems.push("generations.claim_reminder_at");
+      for (const field of ["claim_reminder_at", "claim_reminder_abandoned_at"]) {
+        if (generation[field] !== undefined && generation[field] !== null && !isCanonicalIso(generation[field])) {
+          problems.push("generations." + field);
+        }
       }
       // 尝试状态是**封闭形状**：要么两个字段都不在场，要么 attempts 是正整数且 attempted_at 是规范时间。
       // 只带 attempts 不带时间会绕过 25 分钟间隔，只带时间不带次数会破坏三次上界（评审探针）。
@@ -285,7 +287,8 @@ export function validateTopicGenerationState(state) {
   }
   if (state.rotation?.status === ROTATION_STATUS.AWAITING_CLAIM &&
       (!nonEmpty(pendingRecord?.pending_token) ||
-       !Number.isFinite(Date.parse(pendingRecord?.claim_expires_at ?? "")))) {
+       (pendingRecord?.claim_expires_at !== null && pendingRecord?.claim_expires_at !== undefined &&
+        !Number.isFinite(Date.parse(pendingRecord.claim_expires_at))))) {
     problems.push("rotation_pending_shape");
   }
   if (pending === 1 && active === 1 && state.rotation?.status !== ROTATION_STATUS.AWAITING_CLAIM) {
@@ -333,14 +336,16 @@ export const pendingGeneration = (state) => state?.generations?.find((generation
   generation.status === GENERATION_STATUS.PENDING) ?? null;
 
 /**
- * 快过期提醒该不该发：绑定 active、有 pending、有截止时间、还没过期、还没提醒过、
- * 尝试次数没用完、离上次尝试够久、已进入截止前 LEAD 窗口。
- * **只算不写**；这是两条链共用的唯一判据。扫描器先用它做锁外预筛，再在锁内用
+ * 无人认领提醒该不该发 —— 两条链共用的唯一判据，**只算不写**。
+ * 按等待时长分"周期"：第一个周期从 created_at + AFTER 开始，之后每提醒成功一次，下一个周期从
+ * claim_reminder_at + REPEAT 开始。周期内最多 MAX_ATTEMPTS 次尝试、间隔 RETRY；用尽则本周期放弃
+ * （claim_reminder_abandoned_at），下个周期重来。扫描器先用它做锁外预筛，再在锁内用
  * reserveClaimReminderAttempt（它内部再算一次）真正拿到这次尝试。
  */
 export function claimReminderDue(state, {
   now = Date.now(),
-  leadMs = TOPIC_GENERATION_CLAIM_REMINDER_LEAD_MS,
+  afterMs = TOPIC_GENERATION_CLAIM_REMINDER_AFTER_MS,
+  repeatMs = TOPIC_GENERATION_CLAIM_REMINDER_REPEAT_MS,
   retryMs = TOPIC_GENERATION_CLAIM_REMINDER_RETRY_MS,
   maxAttempts = TOPIC_GENERATION_CLAIM_REMINDER_MAX_ATTEMPTS,
 } = {}) {
@@ -349,53 +354,89 @@ export function claimReminderDue(state, {
   // 暂停 / 退役的绑定不出站 —— 跟出站发布同一条语义（评审探针：paused 仍发了提醒）。
   if (state?.binding_status !== "active") return { due: false, reason: "binding_not_active", generation };
   const deadline = Date.parse(generation.claim_expires_at ?? "");
-  if (!Number.isFinite(deadline)) return { due: false, reason: "no_deadline", generation };
-  if (now >= deadline) return { due: false, reason: "expired", generation };
-  if (generation.claim_reminder_at) return { due: false, reason: "already_reminded", generation };
-  const attempts = generation.claim_reminder_attempts ?? 0;
-  if (attempts >= maxAttempts) return { due: false, reason: "attempts_exhausted", generation, attempts };
-  const attemptedAt = Date.parse(generation.claim_reminder_attempted_at ?? "");
-  if (Number.isFinite(attemptedAt) && now - attemptedAt < retryMs) {
-    return { due: false, reason: "retry_too_soon", generation, attempts, remainingMs: deadline - now };
+  if (Number.isFinite(deadline) && now >= deadline) return { due: false, reason: "expired", generation };
+  const createdAt = Date.parse(generation.created_at ?? "");
+  if (!Number.isFinite(createdAt)) return { due: false, reason: "no_created_at", generation };
+  const waitedMs = now - createdAt;
+  // 周期起点：提醒成功或本周期放弃之后，都要再等 REPEAT；否则从 created_at + AFTER 开始。
+  const lastAt = Date.parse(generation.claim_reminder_at ?? "");
+  const abandonedAt = Date.parse(generation.claim_reminder_abandoned_at ?? "");
+  const marks = [lastAt, abandonedAt].filter(Number.isFinite);
+  const latest = marks.length ? Math.max(...marks) : null;
+  const cycleStart = latest === null ? createdAt + afterMs : latest + repeatMs;
+  if (now < cycleStart) {
+    const reason = latest === null ? "not_yet" : (latest === lastAt ? "reminded_recently" : "abandoned_recently");
+    return { due: false, reason, generation, waitedMs, nextAt: cycleStart, remainingMs: cycleStart - now };
   }
-  if (deadline - now > leadMs) return { due: false, reason: "not_yet", generation, remainingMs: deadline - now };
-  return { due: true, reason: null, generation, attempts, remainingMs: deadline - now };
+  // 尝试计数只算本周期的：上个周期剩下的 attempts 不该压住这个周期。
+  const attemptedAt = Date.parse(generation.claim_reminder_attempted_at ?? "");
+  const inCycle = Number.isFinite(attemptedAt) && attemptedAt >= cycleStart;
+  const attempts = inCycle ? (generation.claim_reminder_attempts ?? 0) : 0;
+  if (attempts >= maxAttempts) return { due: false, reason: "attempts_exhausted", generation, attempts, waitedMs, cycleStart };
+  if (inCycle && now - attemptedAt < retryMs) {
+    return { due: false, reason: "retry_too_soon", generation, attempts, waitedMs, cycleStart };
+  }
+  return { due: true, reason: null, generation, attempts, waitedMs, cycleStart };
 }
 
 /**
- * 在锁内**预留**一次提醒尝试：判据再算一次，通过才把 attempts + 1、attempted_at = now 写进代际。
- * 预留是持久化的，所以并发的第二个扫描器（或紧接着的下一轮）会拿到 retry_too_soon，
- * 而不是再发一条。发送成功后另行 markPendingClaimReminder；失败则留着 attempts，到期重试。
+ * 在锁内**预留**一次提醒尝试：判据再算一次，通过才把 attempts + 1、attempted_at = now 写进代际
+ * （新周期的第一次尝试从 1 重新数）。预留是持久化的，所以并发的第二个扫描器（或紧接着的下一轮）
+ * 会拿到 retry_too_soon，而不是再发一条。发送成功后另行 markPendingClaimReminder；失败则留着 attempts，到期重试。
  */
-export function reserveClaimReminderAttempt(state, { generationId, now = Date.now(), leadMs, retryMs, maxAttempts } = {}) {
+export function reserveClaimReminderAttempt(state, { generationId, now = Date.now(), afterMs, repeatMs, retryMs, maxAttempts } = {}) {
   const valid = validateTopicGenerationState(state);
   if (!valid.ok) return { ok: false, reason: "topic_generation_state_invalid", problems: valid.problems };
   const generation = pendingGeneration(state);
   if (!generation || generation.channel_generation_id !== generationId) {
     return { ok: false, reason: "pending_generation_mismatch" };
   }
-  const due = claimReminderDue(state, { now, leadMs, retryMs, maxAttempts });
-  if (!due.due) return { ok: false, reason: due.reason, attempts: due.attempts ?? generation.claim_reminder_attempts ?? 0 };
+  const due = claimReminderDue(state, { now, afterMs, repeatMs, retryMs, maxAttempts });
+  if (!due.due) return { ok: false, reason: due.reason, attempts: due.attempts ?? 0 };
   const next = clone(state);
   const target = next.generations.find((g) => g.channel_generation_id === generationId);
-  target.claim_reminder_attempts = (target.claim_reminder_attempts ?? 0) + 1;
+  target.claim_reminder_attempts = due.attempts + 1;
   target.claim_reminder_attempted_at = iso(now);
   next.updated_at = iso(now);
-  return { ok: true, changed: true, state: next, attempt: target.claim_reminder_attempts, remainingMs: due.remainingMs };
+  return { ok: true, changed: true, state: next, attempt: target.claim_reminder_attempts, waitedMs: due.waitedMs };
 }
 
-/** 记下"已经提醒过"。同一代际只记一次；不是 pending 的代际不记（说明状态已经变了）。 */
-export function markPendingClaimReminder(state, { generationId, now = Date.now() } = {}) {
+/**
+ * 记下"这个周期已经提醒过"：claim_reminder_at = now，本周期的尝试计数清零。
+ * 同一周期只记一次（now 早于下一个周期开始就不再改）；不是 pending 的代际不记（说明状态已经变了）。
+ */
+export function markPendingClaimReminder(state, {
+  generationId, now = Date.now(), repeatMs = TOPIC_GENERATION_CLAIM_REMINDER_REPEAT_MS,
+} = {}) {
   const valid = validateTopicGenerationState(state);
   if (!valid.ok) return { ok: false, reason: "topic_generation_state_invalid", problems: valid.problems };
   const generation = pendingGeneration(state);
   if (!generation || generation.channel_generation_id !== generationId) {
     return { ok: false, reason: "pending_generation_mismatch" };
   }
-  if (generation.claim_reminder_at) return { ok: true, changed: false, state };
+  const lastAt = Date.parse(generation.claim_reminder_at ?? "");
+  if (Number.isFinite(lastAt) && now < lastAt + repeatMs) return { ok: true, changed: false, state };
   const next = clone(state);
   const target = next.generations.find((g) => g.channel_generation_id === generationId);
   target.claim_reminder_at = iso(now);
+  target.claim_reminder_attempts = null;
+  target.claim_reminder_attempted_at = null;
+  target.claim_reminder_abandoned_at = null;
+  next.updated_at = iso(now);
+  return { ok: true, changed: true, state: next };
+}
+
+/** 本周期的尝试用尽：记 claim_reminder_abandoned_at，本周期不再试，下个周期重来。 */
+export function markPendingClaimReminderAbandoned(state, { generationId, now = Date.now() } = {}) {
+  const valid = validateTopicGenerationState(state);
+  if (!valid.ok) return { ok: false, reason: "topic_generation_state_invalid", problems: valid.problems };
+  const generation = pendingGeneration(state);
+  if (!generation || generation.channel_generation_id !== generationId) {
+    return { ok: false, reason: "pending_generation_mismatch" };
+  }
+  const next = clone(state);
+  const target = next.generations.find((g) => g.channel_generation_id === generationId);
+  target.claim_reminder_abandoned_at = iso(now);
   next.updated_at = iso(now);
   return { ok: true, changed: true, state: next };
 }
@@ -530,7 +571,7 @@ export function registerPendingTopicGeneration(state, {
   const next = clone(state);
   const generationNumber = Math.max(...next.generations.map((generation) => generation.generation)) + 1;
   const generationId = channelGenerationId(next.binding_id, generationNumber);
-  const expires = claimExpiresAt ?? iso(now + TOPIC_GENERATION_PENDING_MS);
+  const expires = claimExpiresAt ?? null; // 默认不过期；显式给了才有截止
   const generation = {
     channel_generation_id: generationId,
     generation: generationNumber,

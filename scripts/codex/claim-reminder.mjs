@@ -7,8 +7,8 @@ import { publishDraft } from "../outbound.mjs";
 import { resolveLarkIdentity } from "../chain-template.mjs";
 import { remindOnePendingClaim } from "../claim-reminder.mjs";
 import {
-  bridgeHome, loadCodexTemplate, loadRegistry, markTaskClaimReminder, registryFile, reserveTaskClaimReminder,
-  templateFile as codexTemplateFile, topicStateForTask,
+  bridgeHome, loadCodexTemplate, loadRegistry, markTaskClaimReminder, markTaskClaimReminderAbandoned, registryFile,
+  reserveTaskClaimReminder, templateFile as codexTemplateFile, topicStateForTask,
 } from "./state.mjs";
 
 export function remindCodexPendingClaims({
@@ -33,9 +33,10 @@ export function remindCodexPendingClaims({
       const topic = topicStateForTask(task, { now });
       if (!topic.ok) { out.problems.push({ name, reason: topic.reason ?? "topic_state_unreadable" }); continue; }
       r = remindOnePendingClaim({
-        name, state: topic.state, now, dryRun: out.dryRun, identity: resolveIdentity, publish,
+        name, state: topic.state, now, dryRun: out.dryRun, identity: resolveIdentity, publish, cancelCommand: "$feishu-rotate cancel",
         reserve: (generationId) => reserveTaskClaimReminder({ threadId: task.codex_thread_id, generationId, home, now }),
         mark: (generationId) => markTaskClaimReminder({ threadId: task.codex_thread_id, generationId, home, now }),
+        abandon: (generationId) => markTaskClaimReminderAbandoned({ threadId: task.codex_thread_id, generationId, home, now }),
       });
     } catch (err) {
       r = { outcome: "problem", entry: { name, reason: "task_scan_failed", error: String(err?.message ?? err).slice(0, 160) } };

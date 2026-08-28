@@ -18,7 +18,7 @@ import fs from "node:fs";
 import { isDirectRun } from "./direct-run.mjs";
 
 import {
-  claudeTurnInputDir, clearInboundTurn, clearTurnInput, feishuStampMessageId, isFeishuStampedInput, storeInboundTurn, storeTurnInput,
+  claudeTurnInputDir, clearTurnInput, feishuStampMessageId, isFeishuStampedInput, storeInboundTurn, storeTurnInput,
 } from "./turn-input.mjs";
 
 /** 只认 `/init` 本身和带参数的 `/init xxx`。别的斜杠命令一概不管。 */
@@ -82,15 +82,28 @@ async function main() {
         const bound = resolveProject({ root: project.root, claudeSessionId: speakingSession });
         if (!bound.ok || bound.mapping?.status !== "active") continue;
         const dir = claudeTurnInputDir(project.root, bound.claudeSessionId);
+        // **本轮来源是一份记录、一次原子覆写**：飞书回合记消息 id，本地回合记正文。
+        // 记不上就不让这一轮跑（退出码 2 = 阻止这条 prompt）—— 否则 Stop 会拿着上一轮的来源发错话题。
         if (isFeishuStampedInput(prompt)) {
-          clearTurnInput({ dir, key: speakingSession });
-          // 记下这一轮是飞书来的哪条消息：Stop 据此反查 claim 里冻结的 origin，回复发回原话题。
           const messageId = feishuStampMessageId(prompt);
-          if (messageId) storeInboundTurn({ dir, key: speakingSession, messageId });
-          else clearInboundTurn({ dir, key: speakingSession });
+          const stored = messageId
+            ? storeInboundTurn({ dir, key: speakingSession, messageId })
+            : { ok: false, reason: "stamp_without_message_id" };
+          if (!stored.ok) {
+            process.stderr.write("[飞书桥] 记不下这一轮的飞书来源（" + stored.reason + (stored.error ? "：" + stored.error : "") +
+              "），为避免回复发错话题，本轮不执行。\n");
+            process.exit(2);
+          }
         } else {
-          storeTurnInput({ dir, key: speakingSession, text: prompt });
-          clearInboundTurn({ dir, key: speakingSession });
+          const stored = storeTurnInput({ dir, key: speakingSession, text: prompt });
+          if (!stored.ok && stored.reason !== "empty_input") {
+            // 本地正文记不上：至少把上一轮的来源清掉；连清都清不掉就阻止这一轮。
+            const cleared = clearTurnInput({ dir, key: speakingSession });
+            if (!cleared.ok) {
+              process.stderr.write("[飞书桥] 记不下本轮来源也清不掉上一轮的（" + (stored.error ?? stored.reason) + "），本轮不执行。\n");
+              process.exit(2);
+            }
+          }
         }
       }
     }

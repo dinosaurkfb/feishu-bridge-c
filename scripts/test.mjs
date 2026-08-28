@@ -144,7 +144,7 @@ import {
   DEFAULT_DIALOGUE_BUDGET, DIALOGUE_POLICY_ID, DIALOGUE_REASON, DIALOGUE_STATUS,
   DIALOGUE_TURN_STATUS, applyInteractionPolicyToAdmission, finalizeDialogueTurn,
   handleDialoguePolicy, interactionPolicyStateForLegacy, interactionPolicySummary,
-  materializeInteractionPolicy, reserveDialogueTurn, setInteractionPolicyMode, DIALOGUE_POLICY_VERSION } from "./interaction-policy.mjs";
+  materializeInteractionPolicy, reserveDialogueTurn, setInteractionPolicyMode, DIALOGUE_POLICY_VERSION, validateInteractionPolicyState } from "./interaction-policy.mjs";
 import {
   DEFAULT_RELAY_BUDGET, PARTICIPANT_SNAPSHOT_ARTIFACT_TYPE, RELAY_DISPOSITION,
   RELAY_PLAN_STATUS, RELAY_REASON, RELAY_STEP_STATUS, advanceRelayPlan, cancelRelayPlan,
@@ -186,8 +186,7 @@ import {
 } from "./dialogue-chat-scope-attestation.mjs";
 import {
   MAX_LOCAL_INPUT_CHARS, claudeTurnInputDir, clearTurnInput, isFeishuStampedInput,
-  readTurnInput, storeTurnInput,
-} from "./turn-input.mjs";
+  readTurnInput, storeTurnInput, readTurnRecord } from "./turn-input.mjs";
 import {
   currentSurface, diffSurface, loadSnapshot, sharedModules,
 } from "./shared-surface.mjs";
@@ -4600,7 +4599,7 @@ const TPL = {
   agent_uid: "agent_x",
 };
 
-test("Claude UserPromptSubmit 与 Stop 配对本地输入，飞书来源戳只回写回复", () => {
+test("Claude UserPromptSubmit 与 Stop 配对本地输入；飞书来源戳的回合没有 claim 就不入队、留诊断", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-turn-"));
   const project = path.join(home, "project");
   fs.mkdirSync(project);
@@ -4690,7 +4689,7 @@ test("Claude UserPromptSubmit 与 Stop 配对本地输入，飞书来源戳只�
     env,
   });
   assert.equal(inboundPrompt.status, 0, inboundPrompt.stderr);
-  assert.equal(readTurnInput({ dir: inputDir, key: session }).reason, "not_found");
+  assert.equal(readTurnInput({ dir: inputDir, key: session }).reason, "feishu_turn", "同一份记录被飞书回合原子覆写，本地旧输入不会错配");
 
   const inboundStop = spawnSync(process.execPath, [stopHook], {
     input: JSON.stringify({
@@ -4701,10 +4700,11 @@ test("Claude UserPromptSubmit 与 Stop 配对本地输入，飞书来源戳只�
   });
   assert.equal(inboundStop.status, 0, inboundStop.stderr);
   replies = listPending({ outboxDir: outboxDirOf(project) }).filter((record) => record.kind === "reply");
-  assert.equal(replies.length, 3);
-  const inboundRecord = replies.find((record) => record.text === "飞书指令已经完成");
-  assert.equal(inboundRecord.input_origin, null);
-  assert.equal(inboundRecord.input_text, null);
+  assert.equal(replies.length, 2, "飞书回合反查不到 claim：不知道该回哪个话题，零入队（当前代际不是安全回落值）");
+  const unrouted = path.join(project, ".runtime-data", "outbound", "unrouted-replies");
+  const diags = fs.readdirSync(unrouted).map((n) => JSON.parse(fs.readFileSync(path.join(unrouted, n), "utf-8")));
+  assert.equal(diags.length, 1);
+  assert.deepEqual([diags[0].reason, diags[0].message_id, diags[0].reply_preview], ["claim_absent", "msg_inbound", "飞书指令已经完成"]);
 });
 
 test("模板缺字段 → 报出缺哪些，不放行", () => {
@@ -17849,10 +17849,12 @@ test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结�
   assert.equal(replies().length, 2);
   assert.equal(targetOf("本地回合的回复"), fx.newGen.channel_generation_id, "本地回合发当前代际");
 
+  const unrouted = path.join(fx.root, ".runtime-data", "outbound", "unrouted-replies");
+  const diags = () => (fs.existsSync(unrouted) ? fs.readdirSync(unrouted).sort() : []).map((n) => JSON.parse(fs.readFileSync(path.join(unrouted, n), "utf-8")));
   assert.equal(prompt("[飞书 · msg_never_claimed · 2026-08-28 10:05Z]\n没受理过的").status, 0);
   assert.equal(stop("反查不到 claim 的回复").status, 0);
-  assert.equal(replies().length, 3);
-  assert.equal(targetOf("反查不到 claim 的回复"), fx.newGen.channel_generation_id, "反查不到就退回当前代际，不冒险");
+  assert.equal(replies().length, 2, "飞书回合反查不到 claim → 零入队，不退回当前代际");
+  assert.deepEqual(diags().map((d) => [d.reason, d.message_id]), [["claim_absent", "msg_never_claimed"]]);
 
   // claim 里的 origin 形状合法但不是这个 mapping 里能发布的代际（比如已 retired / 别处的 id）→ 退回当前代际
   const foreign = fx.oldGen.channel_generation_id.slice(0, -4) + "dead";
@@ -17864,8 +17866,31 @@ test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结�
   assert.ok(readClaim({ claimsDir, key: bogus.key }), "前提：claim 形状合法");
   assert.equal(prompt("[飞书 · msg_foreign_origin · 2026-08-28 10:06Z]\n来源代际不可解析").status, 0);
   assert.equal(stop("来源不可解析的回复").status, 0);
-  assert.equal(replies().length, 4);
-  assert.equal(targetOf("来源不可解析的回复"), fx.newGen.channel_generation_id, "origin 解析不了就不冒险，退回当前代际");
+  assert.equal(replies().length, 2, "origin 解析不了 → 零入队");
+  assert.deepEqual(diags().map((d) => d.reason), ["claim_absent", "origin_unresolvable"]);
+  assert.equal(diags()[1].origin_channel_generation_id, foreign);
+
+  // 记录损坏 / 缺席：同样零入队 + 诊断
+  const recordFile = readTurnRecord({ dir: claudeTurnInputDir(fx.root, null), key: session }).file;
+  fs.writeFileSync(recordFile, "{not json");
+  assert.equal(stop("记录损坏时的回复").status, 0);
+  assert.equal(replies().length, 2);
+  assert.equal(diags().at(-1).reason, "turn_record_unreadable");
+  fs.rmSync(recordFile, { force: true });
+  assert.equal(stop("记录缺席时的回复").status, 0);
+  assert.equal(replies().length, 2);
+  assert.equal(diags().at(-1).reason, "turn_record_not_found");
+
+  // 来源记不上就不让这一轮跑：把记录目录换成文件，飞书 prompt → 退出码 2；本地 prompt 也清不掉上一轮 → 退出码 2
+  const inputDir = claudeTurnInputDir(fx.root, null);
+  fs.rmSync(inputDir, { recursive: true, force: true });
+  fs.writeFileSync(inputDir, "occupied");
+  const blockedFeishu = prompt("[飞书 · msg_blocked · 2026-08-28 10:07Z]\n记不下来源");
+  assert.equal(blockedFeishu.status, 2, blockedFeishu.stderr);
+  assert.match(blockedFeishu.stderr, /记不下这一轮的飞书来源/u);
+  const blockedLocal = prompt("本地也记不下");
+  assert.equal(blockedLocal.status, 2, blockedLocal.stderr);
+  fs.rmSync(inputDir, { force: true });
 });
 
 test("老话题的指令（Dialogue 模式）：回合的 origin 是老代际，Stop 终结回合并把回复发回老话题", () => {
@@ -17895,6 +17920,31 @@ test("老话题的指令（Dialogue 模式）：回合的 origin 是老代际，
   assert.equal(replies.length, 1);
   assert.equal(replies[0].target_channel_generation_id, fx.oldGen.channel_generation_id, "Dialogue 回合的 origin 是老代际 → 回复回老话题");
   assert.ok(fs.existsSync(path.join(claimsDir, claim.key + ".completed.json")), "回合终局要记账");
+
+  // 回合的 origin 形状不合法 → 策略状态整体无效（校验器钉住），Stop 不按它入队
+  const reg = JSON.parse(fs.readFileSync(fx.registryFile, "utf-8"));
+  const policy = reg.projects[0].interaction_policy_state;
+  assert.equal(policy.dialogue.active_turn, null, "上一回合已终结");
+  const claim2 = acquireClaim({ claimsDir, messageId: "msg_old_dialogue_2", logicalTaskKey: mapping.logical_task_key,
+    meta: { session_id: "session_old", binding_id: effectiveBindingId(mapping, { root: fx.root }), claude_session_id: null,
+      policy_id: DIALOGUE_POLICY_ID, policy_version: DIALOGUE_POLICY_VERSION, local_target_id: "local_target_x",
+      origin_channel_generation_id: fx.oldGen.channel_generation_id } });
+  const reserved2 = reserveClaudeDialogueTurn({
+    root: fx.root, claudeSessionId: null, eventId: "msg_old_dialogue_2", runId: claim2.key, localTargetId: "local_target_x",
+    originChannelGenerationId: fx.oldGen.channel_generation_id, runtimeTargetId: session, registryFile: fx.registryFile,
+  });
+  assert.equal(reserved2.ok, true, JSON.stringify(reserved2));
+  const reg2 = JSON.parse(fs.readFileSync(fx.registryFile, "utf-8"));
+  reg2.projects[0].interaction_policy_state.dialogue.active_turn.origin_channel_generation_id = "";
+  fs.writeFileSync(fx.registryFile, JSON.stringify(reg2, null, 2));
+  assert.equal(validateInteractionPolicyState(reg2.projects[0].interaction_policy_state, { bindingId: reg2.projects[0].interaction_policy_state.binding_id }).ok, false,
+    "active_turn 缺 origin → 策略状态无效");
+  const r2 = spawnSync(process.execPath, [stopHook], { input: JSON.stringify({ session_id: session, cwd: fx.root, last_assistant_message: "origin 被抹掉的回合" }), encoding: "utf-8", env: { ...env, HOME: fx.local } });
+  assert.equal(r2.status, 0, r2.stderr);
+  const after = listPending({ outboxDir: outboxDirOf(fx.root) }).filter((x) => x.kind === "reply");
+  assert.equal(after.length, 1, "策略状态无效、又没有本轮来源记录 → 零入队");
+  const unrouted = path.join(fx.root, ".runtime-data", "outbound", "unrouted-replies");
+  assert.equal(fs.readdirSync(unrouted).length, 1);
 });
 
 test("一个 session 只属于一个代际：校验器拦重复、激活拒绝复用历史 session；跨绑定 / 跨 task 多命中返回歧义", () => {

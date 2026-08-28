@@ -7,6 +7,7 @@
  */
 
 import { stableControlId } from "./subscription.mjs";
+import { usableGeneration } from "./topic-generation.mjs";
 import {
   MAPPING_POLICY_ID, MAPPING_POLICY_VERSION,
 } from "./mapping-policy.mjs";
@@ -152,7 +153,7 @@ export function validateInteractionPolicyState(state, { bindingId } = {}) {
         turn.dialogue_id !== dialogue.dialogue_id ||
         turn.turn_index >= dialogue.next_turn_index ||
         turn.status !== DIALOGUE_TURN_STATUS.DISPATCHED || !nonEmpty(turn?.local_target_id) ||
-        !eventIds.includes(turn.event_id)) {
+        !eventIds.includes(turn.event_id) || !usableGeneration(turn?.origin_channel_generation_id)) {
       return { ok: false, reason: DIALOGUE_REASON.POLICY_INVALID };
     }
   }

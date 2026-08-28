@@ -18,13 +18,13 @@
 
 import fs from "node:fs";
 import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
-import { claimKey, readClaim } from "./claim.mjs";
+import { claimKey, readClaimState } from "./claim.mjs";
 import os from "node:os";
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
 
 import {
-  claudeTurnInputDir, clearTurnInput, readTurnInput, readInboundTurn } from "./turn-input.mjs";
+  claudeTurnInputDir, clearTurnInput, readTurnInput, readTurnRecord } from "./turn-input.mjs";
 
 // 会话结束是同步阻塞点：Frank 的终端在等它返回。发不出去就留在 outbox，
 // 兜底定时器 30 分钟内会重试 —— 宁可晚发，不可吊住会话。
@@ -154,19 +154,37 @@ async function main() {
     const boundSession = bound.ok ? bound.claudeSessionId : null;
     const outboxDir = outboxDirOf(project.root, boundSession);
     const inputDir = claudeTurnInputDir(project.root, boundSession);
-    // **回复的目标代际**：默认当前代际；这一轮若是飞书来的（UserPromptSubmit 记了消息 id），
-    // 就反查入站 claim 里冻结的 origin —— 老话题的指令，回复回老话题（goal 第 2 层）。
-    // origin 只在 mapping 里仍能解析成可发布的代际时采用，否则退回当前代际（说不清就不冒险）。
+    // **回复的目标代际由本轮来源决定，说不清就不入队**（goal 第 2 层，评审两轮逼出来的语义）：
+    //   · 本地回合 → 当前代际；
+    //   · 飞书回合 → 反查入站 claim（受控形状才认）里冻结的 origin，且它必须能在 mapping 里解析成可发布代际；
+    //   · 记录缺席 / 损坏、claim 缺席 / 不合形状、origin 解析不了 → **零入队**，写一份可诊断记录。
+    //     "退回当前代际"在飞书回合里不是安全回落值，而是另一个话题。
     let turnOrigin = null;
+    let turnRoute = { ok: true, kind: "unknown" };
     if (!ownedByBridge && speakingSession && bound.ok) {
-      const inbound = readInboundTurn({ dir: inputDir, key: speakingSession });
-      if (inbound.ok && bound.mapping?.logical_task_key) {
-        const claim = readClaim({
-          claimsDir: path.join(project.root, ".runtime-data", "inbound", "delivery-claims"),
-          key: claimKey(inbound.messageId, bound.mapping.logical_task_key),
-        });
-        const origin = claim?.meta?.origin_channel_generation_id ?? claim?.origin_channel_generation_id ?? null;
-        if (typeof origin === "string" && origin && resolveMappingOutboundGeneration(bound.mapping, origin).ok) turnOrigin = origin;
+      const record = readTurnRecord({ dir: inputDir, key: speakingSession });
+      if (!record.ok) {
+        turnRoute = { ok: false, reason: "turn_record_" + record.reason };
+      } else if (record.kind === "local") {
+        turnRoute = { ok: true, kind: "local" };
+      } else {
+        turnRoute = { ok: false, reason: "claim_unavailable", messageId: record.messageId };
+        if (bound.mapping?.logical_task_key) {
+          const claimState = readClaimState({
+            claimsDir: path.join(project.root, ".runtime-data", "inbound", "delivery-claims"),
+            key: claimKey(record.messageId, bound.mapping.logical_task_key),
+          });
+          if (claimState.status !== "valid") {
+            turnRoute = { ok: false, reason: "claim_" + claimState.status, why: claimState.why ?? null, messageId: record.messageId };
+          } else {
+            const origin = claimState.claim.origin_channel_generation_id ?? null;
+            const target = resolveMappingOutboundGeneration(bound.mapping, origin);
+            turnRoute = target.ok
+              ? { ok: true, kind: "feishu", origin }
+              : { ok: false, reason: "origin_unresolvable", why: target.reason, origin, messageId: record.messageId };
+            if (target.ok) turnOrigin = origin;
+          }
+        }
       }
     }
     // Dialogue 的现场投递没有后台 watcher；精确目标会话的 Stop 就是该回合的终局观察点。
@@ -178,8 +196,13 @@ async function main() {
       const activeTurn = interaction.ok ? interaction.state.dialogue?.active_turn : null;
       if (interaction.ok && interaction.state.policy_id === DIALOGUE_POLICY_ID &&
           activeTurn?.runtime_target_id === speakingSession) {
-        // 这一回合是飞书来的：回复发回该回合受理时冻结的 origin（老话题的指令回老话题）。
-        if (activeTurn.origin_channel_generation_id) turnOrigin = activeTurn.origin_channel_generation_id;
+        // 这一回合是飞书来的：回复发回该回合受理时冻结的 origin（老话题的指令回老话题）；
+        // origin 解析不了同样零入队（校验器已把 origin 形状钉住，这里再守解析）。
+        const turnTarget = resolveMappingOutboundGeneration(bound.mapping, activeTurn.origin_channel_generation_id ?? null);
+        turnRoute = turnTarget.ok
+          ? { ok: true, kind: "dialogue", origin: activeTurn.origin_channel_generation_id }
+          : { ok: false, reason: "dialogue_origin_unresolvable", why: turnTarget.reason, origin: activeTurn.origin_channel_generation_id ?? null };
+        if (turnTarget.ok) turnOrigin = activeTurn.origin_channel_generation_id;
         const finalized = finalizeClaudeDialogueTurn({
           root: project.root,
           claudeSessionId: boundSession,
@@ -205,7 +228,19 @@ async function main() {
     // 答复只发给 **cwd 归属**的项目，不发给「会话记录里提到过路径」的那些。
     // 弱信号用来触发排空是安全的（那些内容本来就要发），但用它决定
     // 「把整段对话原文发到谁的话题里」不行 —— 一次误判就是把无关对话发给了 Frank。
-    if (reply && project.via.includes("cwd")) {
+    if (reply && project.via.includes("cwd") && !turnRoute.ok) {
+      // 零入队 + 可诊断：留一份记录给人看（doctor 之后可以扫这个目录），日志里也说清。
+      const unrouted = path.join(project.root, ".runtime-data", "outbound", "unrouted-replies");
+      try {
+        fs.mkdirSync(unrouted, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(unrouted, Date.now() + "-" + speakingSession.slice(0, 8) + ".json"), JSON.stringify({
+          schema_version: "1.0", reason: turnRoute.reason, why: turnRoute.why ?? null, message_id: turnRoute.messageId ?? null,
+          origin_channel_generation_id: turnRoute.origin ?? null, session_id: speakingSession, recorded_at: new Date().toISOString(),
+          reply_preview: reply.slice(0, 120),
+        }, null, 2) + "\n", { mode: 0o600 });
+      } catch (err) { log(project.id + " unrouted record unwritable: " + err.message); }
+      log(project.id + " reply NOT queued: " + turnRoute.reason + (turnRoute.why ? "（" + turnRoute.why + "）" : ""));
+    } else if (reply && project.via.includes("cwd")) {
       const input = speakingSession
         ? readTurnInput({ dir: inputDir, key: speakingSession })
         : { ok: false };

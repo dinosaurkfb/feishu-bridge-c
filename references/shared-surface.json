@@ -448,6 +448,7 @@
     "turn-input.mjs": [
       "MAX_LOCAL_INPUT_CHARS",
       "claudeTurnInputDir",
+      "clearInboundTurn",
       "clearTurnInput",
       "consumeTurnRecord",
       "feishuStampMessageId",
@@ -456,7 +457,6 @@
       "normalizeLocalInput",
       "readInboundTurn",
       "readTurnInput",
-      "readTurnRecord",
       "storeInboundTurn",
       "storeTurnInput"
     ]

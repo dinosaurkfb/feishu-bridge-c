@@ -82,7 +82,11 @@ function mutateClaudeTopicBinding({
   // 宁可明说也不要拿一把猜出来的锁去写。
   if (lockDir === null) return { ok: false, reason: "binding_source_unknown" };
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "binding_busy" };
+  // 只有"别人正拿着"才是 busy；锁目录不可写之类的 I/O 错误要原样报出去（评审探针：曾被折叠成 busy 静默跳过）。
+  if (!lock.ok) {
+    return lock.reason === "publisher_busy" ? { ok: false, reason: "binding_busy" }
+      : { ok: false, reason: "lock_io_error", error: lock.error ?? lock.reason };
+  }
   try {
     if (projectBacked) {
       let record;

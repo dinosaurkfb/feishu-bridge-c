@@ -215,7 +215,7 @@ import {
 } from "./topic-generation.mjs";
 import {
   prepareClaudeTopicRotation, recordClaudeTopicActivity, registerClaudeTopicRotation,
-  setClaudeTopicBindingStatus,
+  setClaudeTopicBindingStatus, reserveClaudeClaimReminder,
   topicGenerationLockDir,
 } from "./topic-generation-store.mjs";
 import {
@@ -3381,8 +3381,8 @@ test("活着的发布者挡住第二次取锁（防重复打扰）", () => {
 });
 
 test("持有者进程已死 → 发布锁被判陈旧并回收", () => {
-  fs.writeFileSync(path.join(pubLock, "owner.json"),
-    JSON.stringify({ pid: 999999, at: new Date().toISOString() }));
+  const forge = (owner) => { fs.rmSync(pubLock, { recursive: true, force: true }); fs.symlinkSync(JSON.stringify(owner), pubLock); };
+  forge({ pid: 999999, at: new Date().toISOString(), token: "dead" });
   let alive = true;
   try { process.kill(999999, 0); } catch { alive = false; }
   if (!alive) assert.equal(acquirePublishLock(pubLock).ok, true);
@@ -3392,12 +3392,26 @@ test("持有者还活着但锁太老 → 也判陈旧，不永久堵住出站", 
   releasePublishLock(pubLock);
   assert.equal(acquirePublishLock(pubLock).ok, true);
   const old = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-  fs.writeFileSync(path.join(pubLock, "owner.json"), JSON.stringify({ pid: process.pid, at: old }));
+  fs.rmSync(pubLock, { force: true });
+  fs.symlinkSync(JSON.stringify({ pid: process.pid, at: old, token: "stale" }), pubLock);
   assert.equal(acquirePublishLock(pubLock).ok, true);
+  assert.deepEqual(fs.readdirSync(path.dirname(pubLock)).filter((n) => n.startsWith("publish.lock.")), [], "reap / reaped 残留不许留");
 });
 
-test("锁目录已在但 owner 还没落地（另一进程正在两步之间）→ 几秒内当活锁，不许抢", () => {
-  // 评审双进程探针：原来一律当陈旧删掉，两个扫描器各拿到一次尝试、各发了一条提醒。
+test("取锁是一步原子操作：锁就是 symlink，owner 是链接目标，每次获取带唯一 token", () => {
+  releasePublishLock(pubLock);
+  const got = acquirePublishLock(pubLock);
+  assert.equal(got.ok, true);
+  assert.match(got.token, /^[0-9a-f-]{36}$/u);
+  assert.ok(fs.lstatSync(pubLock).isSymbolicLink(), "没有'目录先出现、owner 后落地'的中间态");
+  const owner = JSON.parse(fs.readlinkSync(pubLock));
+  assert.deepEqual([owner.pid, owner.token], [process.pid, got.token]);
+  const second = acquirePublishLock(pubLock);
+  assert.deepEqual([second.ok, second.reason], [false, "publisher_busy"]);
+  assert.notEqual(second.token, got.token);
+});
+
+test("旧版目录锁：空目录几秒内当活锁不许抢；超过宽限才回收；owner 是活进程照样挡", () => {
   releasePublishLock(pubLock);
   fs.mkdirSync(pubLock, { recursive: true });
   const r = acquirePublishLock(pubLock);
@@ -3405,23 +3419,93 @@ test("锁目录已在但 owner 还没落地（另一进程正在两步之间）�
   assert.ok(fs.existsSync(pubLock), "活锁不许被删");
   const old = (Date.now() - 60_000) / 1000;
   fs.utimesSync(pubLock, old, old);
-  assert.equal(acquirePublishLock(pubLock).ok, true, "超过宽限才算崩在两步之间");
-  assert.ok(fs.existsSync(path.join(pubLock, "owner.json")), "拿到锁的那一刻 owner 就在（rename 进位，没有中间态）");
-  assert.deepEqual(fs.readdirSync(path.dirname(pubLock)).filter((n) => n.includes(".staging-")), [], "暂存目录不留");
+  assert.equal(acquirePublishLock(pubLock).ok, true, "超过宽限才算残骸");
+  assert.ok(fs.lstatSync(pubLock).isSymbolicLink(), "回收后是新协议的锁");
+  releasePublishLock(pubLock);
+  fs.mkdirSync(pubLock, { recursive: true });
+  fs.writeFileSync(path.join(pubLock, "owner.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  assert.equal(acquirePublishLock(pubLock).reason, "publisher_busy", "旧版目录锁、持有者活着 → 挡");
+  fs.rmSync(pubLock, { recursive: true, force: true });
 });
 
-test("释放前核对所有权：锁已被别的活进程拿走 → 不删", () => {
+test("释放按 token 核对：同 pid 的另一实例拿走了锁 → 不删；旧版目录锁退回按 pid", () => {
+  const got = acquirePublishLock(pubLock);
+  assert.equal(got.ok, true);
+  fs.rmSync(pubLock, { force: true });
+  fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "someone-else" }), pubLock);
+  const r = releasePublishLock(pubLock);
+  assert.deepEqual([r.ok, r.reason], [false, "not_owner"], "pid 相同也不算我的：pid 不代表锁实例");
+  assert.ok(fs.lstatSync(pubLock).isSymbolicLink(), "别人的锁还在（symlink 的目标不是路径，existsSync 会说没有）");
+  fs.rmSync(pubLock, { force: true });
+  fs.mkdirSync(pubLock, { recursive: true });
   fs.writeFileSync(path.join(pubLock, "owner.json"), JSON.stringify({ pid: process.ppid, at: new Date().toISOString() }));
   let parentAlive = true;
   try { process.kill(process.ppid, 0); } catch { parentAlive = false; }
   if (parentAlive) {
-    const r = releasePublishLock(pubLock);
-    assert.deepEqual([r.ok, r.reason], [false, "not_owner"]);
+    assert.deepEqual(releasePublishLock(pubLock).reason, "not_owner");
     assert.ok(fs.existsSync(pubLock));
   }
-  fs.writeFileSync(path.join(pubLock, "owner.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  fs.rmSync(pubLock, { recursive: true, force: true });
+  assert.equal(acquirePublishLock(pubLock).ok, true);
   assert.equal(releasePublishLock(pubLock).ok, true);
   assert.ok(!fs.existsSync(pubLock));
+});
+
+test("锁目录不可写是 io_error，不是 publisher_busy —— 别把真错误说成'别人正拿着'", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-ro-"));
+  fs.chmodSync(dir, 0o500);
+  try {
+    const r = acquirePublishLock(path.join(dir, "publish.lock"));
+    assert.deepEqual([r.ok, r.reason], [false, "io_error"], JSON.stringify(r));
+    assert.match(String(r.error), /EACCES|EPERM/u);
+  } finally {
+    fs.chmodSync(dir, 0o700);
+  }
+});
+
+test("陈旧锁回收是互斥的：两个真实 OS 进程同时接管同一把陈旧锁，只有一个成功", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-race-"));
+  const worker = path.join(local, "worker.mjs");
+  const driver = path.join(local, "driver.mjs");
+  fs.writeFileSync(worker, [
+    'const { acquirePublishLock } = await import(' + JSON.stringify(pathToFileURL(path.resolve("scripts", "registry.mjs")).href) + ');',
+    'const [lockDir, go] = process.argv.slice(2);',
+    'const w = new Int32Array(new SharedArrayBuffer(4));',
+    'while (Date.now() < Number(go)) Atomics.wait(w, 0, 0, 1);',
+    'process.stdout.write(JSON.stringify(acquirePublishLock(lockDir)));',
+  ].join("\n"));
+  fs.writeFileSync(driver, [
+    'import fs from "node:fs";',
+    'import { spawn } from "node:child_process";',
+    'const [worker, lockDir, rounds] = process.argv.slice(2);',
+    'const run = (go) => new Promise((res) => {',
+    '  const c = spawn(process.execPath, [worker, lockDir, String(go)], { stdio: ["ignore", "pipe", "pipe"] });',
+    '  let out = ""; let err = "";',
+    '  c.stdout.on("data", (d) => { out += d; }); c.stderr.on("data", (d) => { err += d; });',
+    '  c.on("close", (code) => res({ code, out, err }));',
+    '});',
+    'const results = [];',
+    'for (let i = 0; i < Number(rounds); i += 1) {',
+    '  fs.rmSync(lockDir, { recursive: true, force: true });',
+    '  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "stale" }), lockDir);',
+    '  const go = Date.now() + 300;',
+    '  results.push(await Promise.all([run(go), run(go), run(go)]));',
+    '}',
+    'process.stdout.write(JSON.stringify(results));',
+  ].join("\n"));
+  const lockDir = path.join(local, "registry.lock");
+  const r = spawnSync(process.execPath, [driver, worker, lockDir, "4"], { encoding: "utf-8", timeout: 60_000 });
+  assert.equal(r.status, 0, r.stderr);
+  const rounds = JSON.parse(r.stdout);
+  for (const [i, round] of rounds.entries()) {
+    for (const w of round) assert.equal(w.code, 0, w.err);
+    const got = round.map((w) => JSON.parse(w.out));
+    assert.equal(got.filter((g) => g.ok).length, 1, "第 " + i + " 轮：" + JSON.stringify(got));
+    for (const g of got.filter((x) => !x.ok)) assert.equal(g.reason, "publisher_busy", JSON.stringify(g));
+  }
+  const owner = JSON.parse(fs.readlinkSync(lockDir));
+  assert.notEqual(owner.token, "stale", "最后持锁的是接管者，不是残骸");
+  assert.deepEqual(fs.readdirSync(local).filter((n) => n.startsWith("registry.lock.")), [], "reap / reaped 残留不许留");
 });
 
 releasePublishLock(pubLock);
@@ -9281,7 +9365,7 @@ test("落盘：计划没变就写下去，同一 operation 重放不再写", () 
   const run = () => applySubscriptionSync({
     shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-first-0001",
     expectedPlanId: pid,
-    readWorld: () => { sawLock = fs.existsSync(w.lockDir); return w.world; },
+    readWorld: () => { try { fs.lstatSync(w.lockDir); sawLock = true; } catch { sawLock = false; } return w.world; },
   });
 
   const first = run();
@@ -17057,6 +17141,26 @@ test("Claude 扫描：一个项目的坏配置只算它自己的问题，后面�
   const dry = remindClaudePendingClaims({ registryFile: merged, templateFile: missingTemplate, now, publish: () => { throw new Error("no"); }, dryRun: true });
   assert.deepEqual([dry.problems, dry.reminded], [[], [{ name: "坏配置", generation: 2, dryRun: true }]],
     "dry-run 不碰身份：坏配置那个也只说会提醒；好项目刚已提醒过，不再算");
+});
+
+test("锁目录不可写：预留报 lock_io_error，扫描记成 reserve_failed，不是静默跳过", () => {
+  // 评审探针：适配层曾把任何取锁失败都改写成 binding_busy，而 busy 在跳过白名单里 —— 兜底成功退出、没有问题记录。
+  const fx = claimReminderFixture();
+  const now = fx.deadline - 11 * H_MS;
+  const calls = [];
+  fs.chmodSync(fx.local, 0o500);
+  try {
+    const reserved = reserveClaudeClaimReminder({ root: fx.root, generationId: fx.registered.generation.channel_generation_id,
+      registryFile: fx.registryFile, templateFile: fx.templateFile, now });
+    assert.deepEqual([reserved.ok, reserved.reason], [false, "lock_io_error"], JSON.stringify(reserved));
+    assert.match(String(reserved.error), /EACCES|EPERM/u);
+    const r = remindClaudePendingClaims({ registryFile: fx.registryFile, templateFile: fx.templateFile, now, publish: (a) => { calls.push(a); } });
+    assert.deepEqual([r.ok, r.reminded, r.skipped, calls.length], [true, [], [], 0]);
+    assert.deepEqual(r.problems.map((p) => [p.name, p.reason]), [[fx.name, "reserve_failed"]], JSON.stringify(r.problems));
+    assert.match(r.problems[0].error, /lock_io_error：.*(EACCES|EPERM)/u);
+  } finally {
+    fs.chmodSync(fx.local, 0o700);
+  }
 });
 
 test("两个真实 OS 进程同时扫描同一个待认领话题：只发一条（预留在锁内、锁无中间态）", () => {

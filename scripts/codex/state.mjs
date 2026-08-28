@@ -14,6 +14,11 @@ import path from "node:path";
 import { loadChainTemplate, materializeProjectConfig } from "../chain-template.mjs";
 import { extractMentionIds } from "../selector.mjs";
 import { acquirePublishLock, isUnder, releasePublishLock } from "../registry.mjs";
+
+// 只有"别人正拿着"才是 registry_busy；锁目录不可写之类的 I/O 错误要原样报出去（评审探针：曾被折叠成 busy 静默跳过）。
+const lockFailure = (lock) => (lock.reason === "publisher_busy"
+  ? { ok: false, reason: "registry_busy" }
+  : { ok: false, reason: "lock_io_error", error: lock.error ?? lock.reason });
 import {
   MESSAGE_RECEIVE_EVENT, buildLegacySubscriptionReadModel, compareFirstClaimShadow,
   legacyEndpointId, selectPendingSubscriptionClaim, stableControlId,
@@ -410,7 +415,7 @@ export function writeRegistryFixtureUnvalidated(tasks, file = registryFile()) {
 export function addTask(task, { home = bridgeHome() } = {}) {
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  if (!lock.ok) return lockFailure(lock);
   try {
     const file = registryFile(home);
     const reg = loadRegistry(file);
@@ -558,7 +563,7 @@ export function setTaskConnectionStatus({
   if (!new Set(["active", "paused"]).has(status)) return { ok: false, reason: "invalid_status" };
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  if (!lock.ok) return lockFailure(lock);
   try {
     const file = registryFile(home);
     const reg = loadRegistry(file);
@@ -615,7 +620,7 @@ export function refreshPendingTaskBinding({
   if (typeof threadId !== "string" || !threadId) return { ok: false, reason: "no_thread_id" };
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  if (!lock.ok) return lockFailure(lock);
   try {
     const file = registryFile(home);
     const reg = loadRegistry(file);
@@ -656,7 +661,7 @@ export function setTaskDisplayName({ threadId, name, home = bridgeHome() } = {})
   if (typeof name !== "string" || !name.trim()) return { ok: false, reason: "invalid_name" };
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  if (!lock.ok) return lockFailure(lock);
   try {
     const file = registryFile(home);
     const reg = loadRegistry(file);
@@ -849,7 +854,7 @@ export function enableAutoPublishForAllTasks({ home = bridgeHome(), apply = fals
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  if (!lock.ok) return lockFailure(lock);
   try {
     // 取锁之后才读：锁外读到的那份跟要写的那份不是同一个快照。
     const snap = readRawRegistry(file);
@@ -1045,7 +1050,7 @@ export function promoteTask({
 }) {
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  if (!lock.ok) return lockFailure(lock);
   try {
     const file = registryFile(home);
     const reg = loadRegistry(file);
@@ -1108,7 +1113,7 @@ function mutateTaskTopicState({
   if (typeof threadId !== "string" || !threadId) return { ok: false, reason: "no_thread_id" };
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  if (!lock.ok) return lockFailure(lock);
   try {
     const file = registryFile(home);
     const reg = loadRegistry(file);

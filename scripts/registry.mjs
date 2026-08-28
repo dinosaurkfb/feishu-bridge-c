@@ -8,6 +8,7 @@
  * 三件事都刻意做成确定性的纯文件操作，不调模型、不碰网络。
  */
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -228,85 +229,126 @@ export function attributeSession({ projects, cwd, transcriptPath }) {
  * 没有它就有真实的重复打扰：会话结束钩子、兜底定时器、一次性守望者可能同时看到
  * 同一批 pending —— 读取与落标之间有窗口，三方都会各发一条。
  *
- * 和 claim 一样用 mkdir 拿原子性；陈旧回收靠 pid 存活 + 墙钟上限，
- * 发布者崩在锁里不能把出站永久堵死。
+ * 协议（2026-08-28 重写，评审三轮探针逼出来的）：
+ *   · 锁是一个 **symlink**，链接目标就是 owner（pid / at / token 的 JSON）。symlink 创建是一步原子操作，
+ *     路径上有任何东西（哪怕空目录）都 EEXIST —— 没有"目录先出现、owner 后落地"的中间态，
+ *     也没有 rename 能替换空目录的问题。
+ *   · 每次获取带唯一 token；释放按 token 核对 —— pid 不能代表锁实例（我的锁被回收又被同 pid 的
+ *     别的实例拿走时，按 pid 会误删）。
+ *   · 陈旧回收**串行化**：先拿专用 reap 锁，在里面重读 owner、核对实例没变、仍然陈旧，再把锁
+ *     rename 走（原子；两个回收者只有一个能成功），然后再正常取锁。原来"判陈旧 → rm → 重取"三步
+ *     不互斥，两个回收者能同时成功。
+ *   · 旧版 runtime（mkdir + owner.json 目录锁）与本协议**不能并行**：旧版看到 symlink 会当陈旧删掉。
+ *     切换 runtime 时必须没有旧持有者（安装器切 current 之前兜底不在跑）。目录形状的旧锁这里
+ *     仍能读、能按陈旧回收，只是不保证与旧进程互斥。
  */
-// 锁目录在、owner 还读不出来：要么另一进程正处在"目录出现 → owner 落地"之间（旧版两步写法），
-// 要么上次崩在那里。用目录自身的年龄区分：几秒内的当活锁看，超过宽限才算陈旧。
-// 评审双进程探针：原来一律当陈旧删掉，两个扫描器各拿到一次尝试、各发了一条提醒。
+
+// owner 不可读时按锁自身年龄给的宽限（真实时钟）：几秒内当活锁，超过才算残骸。
 const OWNERLESS_LOCK_GRACE_MS = 10 * 1000;
+// reap 锁只在回收那几毫秒里持有；超过这个年龄就是回收者崩在里面了。
+const REAP_LOCK_STALE_MS = 60 * 1000;
+// 本进程当前持有的锁实例：lockDir → token。释放时据此核对，调用点不用改签名。
+const HELD = new Map();
+
+function readLockOwner(lockDir) {
+  let st;
+  try { st = fs.lstatSync(lockDir); } catch { return { present: false, owner: null }; }
+  if (st.isSymbolicLink()) {
+    try { return { present: true, owner: JSON.parse(fs.readlinkSync(lockDir)), mtimeMs: st.mtimeMs }; }
+    catch { return { present: true, owner: null, mtimeMs: st.mtimeMs }; }
+  }
+  // 旧版目录锁：owner.json 在目录里。
+  try { return { present: true, owner: JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf-8")), mtimeMs: st.mtimeMs, legacy: true }; }
+  catch { return { present: true, owner: null, mtimeMs: st.mtimeMs, legacy: true }; }
+}
+
+function ownerStale(owner, { staleMs, now }) {
+  const at = Date.parse(owner?.at ?? "");
+  if (Number.isFinite(at) && now - at > staleMs) return true;
+  if (Number.isFinite(owner?.pid)) {
+    try { process.kill(owner.pid, 0); return false; } // 只探活，不发真信号
+    catch { return true; }
+  }
+  return true;
+}
+
+function tryLink(lockDir, payload) {
+  try {
+    fs.mkdirSync(path.dirname(lockDir), { recursive: true, mode: 0o700 });
+    fs.symlinkSync(payload, lockDir);
+    return { ok: true };
+  } catch (err) {
+    if (err.code === "EEXIST") return { ok: false, reason: "publisher_busy" };
+    return { ok: false, reason: "io_error", error: err.message };
+  }
+}
 
 export function acquirePublishLock(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now() } = {}) {
-  const owner = JSON.stringify({ pid: process.pid, at: new Date(now).toISOString() }, null, 2) + "\n";
+  const token = crypto.randomUUID();
+  const payload = JSON.stringify({ pid: process.pid, at: new Date(now).toISOString(), token });
   const attempt = () => {
-    let staging = null;
-    try {
-      fs.mkdirSync(path.dirname(lockDir), { recursive: true, mode: 0o700 });
-      if (fs.existsSync(lockDir)) return { ok: false, reason: "publisher_busy" };
-      // **先在旁边把 owner 写好，再一次 rename 进位** —— 锁目录出现的那一刻就带着 owner，
-      // 别的进程看不到"有目录没 owner"的中间态。rename 到已存在的非空目录会失败（ENOTEMPTY/EEXIST），
-      // 那就是别人刚抢到。
-      staging = fs.mkdtempSync(lockDir + ".staging-");
-      fs.writeFileSync(path.join(staging, "owner.json"), owner, { mode: 0o600 });
-      fs.renameSync(staging, lockDir);
-      return { ok: true };
-    } catch (err) {
-      if (staging) fs.rmSync(staging, { recursive: true, force: true });
-      if (["EEXIST", "ENOTEMPTY", "EISDIR", "EPERM"].includes(err.code)) return { ok: false, reason: "publisher_busy" };
-      return { ok: false, reason: "io_error", error: err.message };
-    }
+    const r = tryLink(lockDir, payload);
+    if (r.ok) HELD.set(lockDir, token);
+    return r.ok ? { ok: true, token } : r;
   };
 
   const first = attempt();
   if (first.ok || first.reason !== "publisher_busy") return first;
 
-  if (isPublishLockStale(lockDir, { staleMs, now })) {
-    fs.rmSync(lockDir, { recursive: true, force: true });
-    return attempt(); // 只重试一次：再失败说明有别人刚抢到，让它去发
+  const seen = readLockOwner(lockDir);
+  if (!isPublishLockStale(lockDir, { staleMs, now })) return first;
+
+  // 回收串行化：reap 锁 → 重读核对 → rename 走 → 放 reap 锁 → 再取。
+  const reapDir = lockDir + ".reap";
+  const reap = tryLink(reapDir, JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token }));
+  if (!reap.ok) {
+    if (reap.reason !== "publisher_busy") return reap;
+    const r = readLockOwner(reapDir);
+    if (!r.present || Date.now() - r.mtimeMs <= REAP_LOCK_STALE_MS) return first; // 别人正在回收，这轮让它
+    try { fs.renameSync(reapDir, reapDir + ".dead-" + token); fs.rmSync(reapDir + ".dead-" + token, { recursive: true, force: true }); }
+    catch { return first; }
+    const again = tryLink(reapDir, JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token }));
+    if (!again.ok) return first;
   }
-  return first;
+  try {
+    const current = readLockOwner(lockDir);
+    if (!current.present) return attempt(); // 已经被别人收走了
+    const sameInstance = JSON.stringify(current.owner) === JSON.stringify(seen.owner);
+    if (!sameInstance || !isPublishLockStale(lockDir, { staleMs, now })) return first; // 实例变了：那是活锁
+    const reaped = lockDir + ".reaped-" + token;
+    try { fs.renameSync(lockDir, reaped); }
+    catch { return first; } // 别人刚收走
+    fs.rmSync(reaped, { recursive: true, force: true });
+    return attempt(); // 只重试一次：再失败说明有别人刚抢到，让它去发
+  } finally {
+    fs.rmSync(reapDir, { recursive: true, force: true });
+  }
 }
 
 export function isPublishLockStale(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now() } = {}) {
-  let owner;
-  try {
-    owner = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf-8"));
-  } catch {
-    // owner 不可读：看目录年龄（用真实时钟 —— 目录的 mtime 是真实时钟写的）。
-    try {
-      const age = Date.now() - fs.statSync(lockDir).mtimeMs;
-      return age > OWNERLESS_LOCK_GRACE_MS;
-    } catch {
-      return true; // 目录也没了：不算被占
-    }
-  }
-
-  const at = Date.parse(owner.at ?? "");
-  if (Number.isFinite(at) && now - at > staleMs) return true;
-
-  if (Number.isFinite(owner.pid)) {
-    try {
-      process.kill(owner.pid, 0); // 只探活，不发真信号
-      return false;
-    } catch {
-      return true;
-    }
-  }
-  return true;
+  const r = readLockOwner(lockDir);
+  if (!r.present) return true; // 没锁：不算被占
+  if (r.owner === null) return Date.now() - r.mtimeMs > OWNERLESS_LOCK_GRACE_MS; // 残骸还是刚建：看年龄（真实时钟）
+  return ownerStale(r.owner, { staleMs, now });
 }
 
 /**
- * 释放前核对所有权：我的锁可能已被别人按陈旧回收并重新拿走 —— 那时这里删掉的是**别人的活锁**，
- * 第三方就又能进来（评审："锁释放也需要核对所有权"）。owner 是别的活进程就不删。
+ * 释放前核对所有权：按 token —— 我的锁可能已被回收并被别人（甚至同 pid 的另一实例）拿走，
+ * 那时删掉的是别人的活锁。旧版目录锁没有 token，退回按 pid 核对。
  */
 export function releasePublishLock(lockDir) {
-  let owner = null;
-  try { owner = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf-8")); } catch { owner = null; }
-  if (owner && Number.isFinite(owner.pid) && owner.pid !== process.pid) {
-    let alive = true;
-    try { process.kill(owner.pid, 0); } catch { alive = false; }
-    if (alive) return { ok: false, reason: "not_owner", pid: owner.pid };
+  const mine = HELD.get(lockDir) ?? null;
+  const r = readLockOwner(lockDir);
+  if (r.present && r.owner) {
+    if (typeof r.owner.token === "string") {
+      if (r.owner.token !== mine) return { ok: false, reason: "not_owner", pid: r.owner.pid };
+    } else if (Number.isFinite(r.owner.pid) && r.owner.pid !== process.pid) {
+      let alive = true;
+      try { process.kill(r.owner.pid, 0); } catch { alive = false; }
+      if (alive) return { ok: false, reason: "not_owner", pid: r.owner.pid };
+    }
   }
   fs.rmSync(lockDir, { recursive: true, force: true });
+  HELD.delete(lockDir);
   return { ok: true };
 }

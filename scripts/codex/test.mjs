@@ -8781,6 +8781,18 @@ test("Codex 待认领快过期提醒：进窗口只在待认领话题下发一�
   assert.equal(fx6.pendingNow(now).claim_reminder_attempts, undefined, "身份解析失败不烧尝试");
   const dryNoTpl = remindCodexPendingClaims({ home: fx6.home, now, publish, dryRun: true });
   assert.deepEqual([dryNoTpl.problems, dryNoTpl.reminded.length], [[], 1]);
+
+  // 锁目录不可写：lock_io_error → reserve_failed，不是 registry_busy 静默跳过
+  const fx7 = codexReminderFixture();
+  fs.chmodSync(fx7.home, 0o500);
+  try {
+    const io = remindCodexPendingClaims({ home: fx7.home, now, publish });
+    assert.deepEqual([io.reminded, io.skipped, calls.length], [[], [], 3]);
+    assert.deepEqual(io.problems.map((p) => [p.name, p.reason]), [["A", "reserve_failed"]], JSON.stringify(io.problems));
+    assert.match(io.problems[0].error, /lock_io_error：.*(EACCES|EPERM)/u);
+  } finally {
+    fs.chmodSync(fx7.home, 0o700);
+  }
 });
 
 test("Codex 兜底真入口 drain-all 跑待认领提醒；发不出去要报 publish_failed、退出 1、不记", () => {

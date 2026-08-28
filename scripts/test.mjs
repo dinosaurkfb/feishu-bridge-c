@@ -923,6 +923,14 @@ test("pending generation 默认不过期；只有登记时写了显式截止的�
     operationId: "op_b", rootMessageId: "om_new", pendingToken: "def456", now: NOW,
   });
   assert.equal(pendingGeneration(registered.state).claim_expires_at, null, "默认不设截止");
+  const explicitNull = registerPendingTopicGeneration(prepared.state, {
+    operationId: "op_b", rootMessageId: "om_new", pendingToken: "def456", now: NOW, claimExpiresAt: null,
+  });
+  assert.equal(explicitNull.ok, true, "显式 null 与省略同义：" + JSON.stringify(explicitNull.reason));
+  assert.equal(pendingGeneration(explicitNull.state).claim_expires_at, null);
+  assert.equal(registerPendingTopicGeneration(prepared.state, {
+    operationId: "op_b", rootMessageId: "om_new", pendingToken: "def456", now: NOW, claimExpiresAt: "yesterday",
+  }).reason, "pending_generation_expiry_invalid", "给了值就必须是时间");
   const DAY = 24 * 3600000;
   const late = activatePendingTopicGeneration(registered.state, { sessionId: "session_new", now: NOW + 30 * DAY });
   assert.equal(late.ok, true, "30 天后仍可认领：" + JSON.stringify(late.reason));

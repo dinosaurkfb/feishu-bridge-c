@@ -20,6 +20,7 @@
  *     "未自检"，附带的历史证据措辞上必须停在"过去某刻工作过"，不能滑成"在线"。
  */
 
+import { TOPIC_GENERATION_AUTO_ROTATE_MESSAGES } from "./topic-generation.mjs";
 import { displaySafe } from "./display-safe.mjs";
 import fs from "node:fs";
 import os from "node:os";
@@ -416,7 +417,7 @@ export function composeLayeredStatus({
   }
   if (st.activeGeneration !== null) {
     const used = Number.isInteger(st.activeGenerationMessages) ? st.activeGenerationMessages : 0;
-    const max = Number.isInteger(st.activeGenerationThreshold) ? st.activeGenerationThreshold : 30;
+    const max = Number.isInteger(st.activeGenerationThreshold) ? st.activeGenerationThreshold : TOPIC_GENERATION_AUTO_ROTATE_MESSAGES;
     L4.push(["自动轮转", used + " / " + max + " 条（还剩 " + Math.max(0, max - used) + " 条）"]);
   }
   // **不许无条件声称"每轮自动发布"**，也不许说得比实际行为满。

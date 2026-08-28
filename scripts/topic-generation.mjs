@@ -564,7 +564,8 @@ export function registerPendingTopicGeneration(state, {
   if (!nonEmpty(rootMessageId) || !nonEmpty(pendingToken)) {
     return { ok: false, reason: "pending_generation_incomplete" };
   }
-  if (claimExpiresAt !== undefined && !Number.isFinite(Date.parse(claimExpiresAt))) {
+  // 省略与显式 null 都是"不设截止"；只有给了非空值才要求是可解析的时间。
+  if (claimExpiresAt !== undefined && claimExpiresAt !== null && !Number.isFinite(Date.parse(claimExpiresAt))) {
     return { ok: false, reason: "pending_generation_expiry_invalid" };
   }
   if (pendingGeneration(state)) return { ok: false, reason: "rotation_already_pending" };

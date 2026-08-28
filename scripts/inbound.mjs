@@ -28,8 +28,9 @@ import {
   applyInteractionPolicyToAdmission, handleDialoguePolicy,
 } from "./interaction-policy.mjs";
 import {
-  finalizeClaudeDialogueTurn, loadClaudeInteractionPolicy, reserveClaudeDialogueTurn,
+  finalizeClaudeDialogueTurn, loadClaudeInteractionPolicy, reserveClaudeDialogueTurn, setClaudeInteractionMode,
 } from "./interaction-policy-store.mjs";
+import { controlAckText, parseControlCommand } from "./control-command.mjs";
 import { handOff, acquireSessionLock, releaseSessionLock, stampSessionLock } from "./handoff.mjs";
 import {
   DELIVERY_REJECT, DELIVERY_REJECT_TEXT,
@@ -124,6 +125,7 @@ function ackText(kind, detail) {
       "之后在这条消息下面 @ 一下就是给它下指令；它的进展和每一轮回答也会以卡片发回这里。",
     ].join("\n");
   }
+  if (kind === "control") return detail.text;
   if (kind === "rejected") {
     const lines = ["已拒绝 · " + detail.reasonText];
     // 说清楚这个话题通向谁。同一个群里有多个项目话题之后，最容易犯的错是
@@ -451,6 +453,26 @@ if (!claim.ok) {
     finish("rejected", { reasonText: "这条消息已经处理过（幂等命中）" }, { reason: "duplicate" });
   }
   finish("error", { detail: "无法取得投递权：" + claim.error }, { reason: claim.reason });
+}
+
+// ---------- 控制命令：路由侧当场执行，不投递 ----------
+// 正文恰为 /feishu-mode dialogue|mapping（goal 第 3 层）。已过三道闸并拿到 claim（幂等），
+// 所以重放不会切两次；执行结果记成 consumed 终态（不是 run，不需要 run 制品）。
+const control = parseControlCommand(verdict.instruction, { chain: "claude" });
+if (control) {
+  const switched = setClaudeInteractionMode({ root: routed.root, claudeSessionId: mapping.claude_session_id ?? null, mode: control.mode });
+  if (!switched.ok) {
+    recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { reason: "control_failed", control: control.kind, error: switched.reason } });
+    writeReceipt("control-" + verdict.messageId, { status: "error", reason: switched.reason, control: control.kind, mode: control.mode,
+      message_id: verdict.messageId, claim_acquired: true, handed_off: false });
+    finish("error", { detail: "模式没有切换（" + switched.reason + "）" }, { reason: switched.reason });
+  }
+  const changed = switched.changed !== false;
+  recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "consumed", detail: { control: control.kind, mode: control.mode, changed } });
+  writeReceipt("control-" + verdict.messageId, { status: "consumed", control: control.kind, mode: control.mode, changed,
+    message_id: verdict.messageId, project_root: routed.root, claim_acquired: true, handed_off: false });
+  finish("control", { text: controlAckText({ taskName: config.task_display_name, mode: control.mode, changed }) },
+    { control: control.kind, mode: control.mode, changed });
 }
 
 let policyRun = dialogueMode ? null : handlePolicy({ claim, resolvedContext: mappingContext });

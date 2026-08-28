@@ -224,6 +224,7 @@ session 绑定。日常还可以使用：
 | unbind | `$feishu-unbind` | `/feishu-unbind` | 可恢复地暂停，不删话题、映射或历史 |
 | bind | `$feishu-bind` | `/feishu-bind` | 首次接入，或恢复已暂停的原话题连接 |
 | rotate | `$feishu-rotate` | `/feishu-rotate` | 为同一 binding 创建下一话题代际；旧话题保留为历史（仍可下指令，回复回原话题） |
+| mode（飞书侧） | 正文恰为 `$feishu-mode dialogue` / `mapping` | 正文恰为 `/feishu-mode dialogue` / `mapping` | 入站路由器当场切换交互模式并回执，不投递给会话（2026-08-28 起） |
 | mode | `$feishu-mode [dialogue\|mapping]` | `/feishu-mode [dialogue\|mapping]` | 无参数只读查看；显式切换当前 binding 的交互策略 |
 
 两边命令同名。差别只在绑定单位：Codex 绑一个精确 task，Claude 默认绑项目、

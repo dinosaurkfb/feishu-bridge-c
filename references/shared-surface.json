@@ -60,6 +60,10 @@
       "recordClaimState",
       "watcherExpectEnv"
     ],
+    "control-command.mjs": [
+      "controlAckText",
+      "parseControlCommand"
+    ],
     "crash-receipt.mjs": [
       "composeCrashReceipt",
       "crashReference"

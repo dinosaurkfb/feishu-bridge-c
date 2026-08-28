@@ -7,6 +7,7 @@
  * v2：标识符全部换到 Aily 命名空间（见 selector.mjs 顶部说明）。
  */
 
+import { controlAckText, parseControlCommand } from "./control-command.mjs";
 import { describePendingWindow } from "./layered-status.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -28,8 +29,7 @@ import {
 import { resolveProject as resolveProjectForFixture } from "./project-resolve.mjs";
 import {
   acquireClaim, claimKey, readClaim, readClaimState, readWatcherExpectEnv,
-  recordClaimState, watcherExpectEnv,
-} from "./claim.mjs";
+  recordClaimState, watcherExpectEnv, CLAIM_STATE } from "./claim.mjs";
 import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
 import { machineContext, runDoctor } from "./doctor.mjs";
@@ -17816,6 +17816,7 @@ test("generationForSession：active / read-only 都算，pending 没 session、r
   assert.equal(activeGenerationForSession(st, "session_old"), null, "只认 active 的那个查询保持原义");
 });
 
+<<<<<<< HEAD
 test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结的 origin（老话题）；本地回合和反查不到 claim 的回合仍发当前代际", () => {
   const fx = rotatedRegistryFixture();
   const env = { ...process.env, FEISHU_BRIDGE_REGISTRY: fx.registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: fx.templateFile, HOME: fx.local };
@@ -18049,6 +18050,42 @@ test("一个 session 只属于一个代际：校验器拦重复、激活拒绝�
   ]);
   const amb = findBindingForSession({ sessionId: "session_dup", ...files(f) });
   assert.deepEqual([amb.ok, amb.reason, amb.candidates], [false, "ambiguous_session", 2]);
+=======
+// ─── 第 3 层：飞书正文里的控制命令 ─────────────────────────────────────────────
+test("控制命令只认封闭的精确形状：两条链各两条，多一个字都不算；映射到策略 id", () => {
+  assert.deepEqual(parseControlCommand("/feishu-mode dialogue", { chain: "claude" }), { kind: "mode", mode: DIALOGUE_POLICY_ID });
+  assert.deepEqual(parseControlCommand("/feishu-mode mapping", { chain: "claude" }), { kind: "mode", mode: MAPPING_POLICY_ID });
+  assert.deepEqual(parseControlCommand("$feishu-mode dialogue", { chain: "codex" }), { kind: "mode", mode: DIALOGUE_POLICY_ID });
+  assert.deepEqual(parseControlCommand("$feishu-mode mapping", { chain: "codex" }), { kind: "mode", mode: MAPPING_POLICY_ID });
+  for (const bad of ["/feishu-mode", "/feishu-mode  dialogue", "/feishu-mode dialogue 吧", "请 /feishu-mode dialogue", "/feishu-mode Dialogue",
+    "/FEISHU-MODE dialogue", "/feishu-mode dialogue\n", "$feishu-mode dialogue", "/feishu-rotate", "/feishu-bind", "", null, undefined, 42]) {
+    assert.equal(parseControlCommand(bad, { chain: "claude" }), null, JSON.stringify(bad));
+  }
+  for (const bad of ["$feishu-mode", "/feishu-mode dialogue", "$feishu-mode dialogue extra", "[$feishu-mode](x) dialogue"]) {
+    assert.equal(parseControlCommand(bad, { chain: "codex" }), null, JSON.stringify(bad));
+  }
+  assert.equal(parseControlCommand("/feishu-mode dialogue", { chain: "other" }), null, "链不认识就不认");
+  assert.equal(parseControlCommand("/feishu-mode dialogue", {}), null);
+  const on = controlAckText({ taskName: "演示", mode: DIALOGUE_POLICY_ID, changed: true });
+  assert.match(on, /^已切换 · 演示\n交互模式现在是 Dialogue/u);
+  assert.match(on, /没有被当作指令投递/u);
+  const same = controlAckText({ taskName: "演示", mode: MAPPING_POLICY_ID, changed: false });
+  assert.match(same, /^模式未变 · 演示\n本来就是 Mapping/u);
+});
+
+test("claim 终态 consumed：账本盘点认识它（不是 unrecognized_entry），也不把它当没有 run 制品的孤儿", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-consumed-"));
+  const runsDir = path.join(base, "runs");
+  const claimsDir = path.join(base, "delivery-claims");
+  fs.mkdirSync(runsDir); fs.mkdirSync(claimsDir);
+  const key = "c".repeat(64);
+  recordClaimState({ claimsDir, key, state: "consumed", detail: { control: "mode", mode: DIALOGUE_POLICY_ID, changed: true } });
+  assert.ok(fs.existsSync(path.join(claimsDir, key + ".consumed.json")));
+  const inv = inventoryRuns({ runsDir, claimsDir });
+  assert.equal(inv.ok, true, JSON.stringify(inv));
+  assert.deepEqual(inv.problems, [], "consumed 是受控状态：既不是不认识的条目，也不是孤儿终局");
+  assert.equal(CLAIM_STATE.CONSUMED, "consumed");
+>>>>>>> 44e79f4 (feat: 第 3 层 —— 飞书正文恰为 /feishu-mode dialogue|mapping（Codex：$feishu-mode …）时入站路由器当场切换并回执)
 });
 
 test("未路由回复盘点：全枚举，只有完整受验的制品计入，临时 / 未知 / 坏 JSON / 畸形都进 problems；runs 账本读不出时状态页照样渲染；doctor 计入", () => {

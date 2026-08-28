@@ -20,6 +20,8 @@ export const CLAIM_STATE = {
   HANDED_OFF: "handed_off",
   REJECTED: "rejected",
   FAILED: "failed",
+  // 控制命令（如 /feishu-mode）在路由侧当场执行完：不是 run 的终局，不需要 run 制品。
+  CONSUMED: "consumed",
 };
 
 /**

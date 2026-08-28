@@ -66,7 +66,8 @@ herdr agent read <pane> --source recent-unwrapped --lines 60
   （项目级或工作线级，与出站同一条选择规则）；不许据此去动别的 binding。
 - **控制命令从飞书来的精确形状**（正文**恰为**下列之一，多一个字都不算）：
   `/feishu-bind`、`/feishu-rotate`、`/feishu-rotate cancel`、`/feishu-mode dialogue`、
-  `/feishu-mode mapping`。按对应技能文档跑那条脚本（飞书文本不会触发斜杠命令）。
+  `/feishu-mode mapping`。bind / rotate 两类按对应技能文档跑那条脚本（飞书文本不会触发斜杠命令）；
+  `/feishu-mode …` 两条**不经过你** —— 入站路由器拿到 claim 后当场切换并回执（scripts/control-command.mjs）。
   `/feishu-unbind`、`/feishu-subscribe`、`/feishu-pin-session` **不**从飞书开放。
 - 引用、转发、一大段话里顺带提到的字都不算。**执行侧只看得到正文**：平台把引用块剥掉后
   正文若与原始输入无异，我分不出它是不是转发 —— 所以这条是对 Frank 的约定而不是我能

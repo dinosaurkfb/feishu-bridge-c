@@ -11,7 +11,9 @@ disable-model-invocation: true
 
 # 设置当前 Claude binding 的飞书交互模式
 
-命令必须单独占据整条输入，只允许三种形式：
+命令必须单独占据整条输入，只允许三种形式。**从飞书来的 `/feishu-mode dialogue` / `/feishu-mode mapping`
+不经过你**：入站路由器（M5Claude）在验过发送者、真实 @ 和 claim 之后当场切换并回执（2026-08-28 起）。
+飞书侧不开放无参数查看，查看走状态页。
 
 ```bash
 node {{SCRIPT:feishu-mode.mjs}}

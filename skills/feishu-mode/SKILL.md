@@ -5,7 +5,8 @@ description: 查看或显式切换当前精确 Codex task 的 Mapping/Dialogue �
 
 # 设置当前 Codex task 的飞书交互模式
 
-只执行 UserPromptSubmit hook 为本轮注入的精确命令。不得使用 `--last`，不得直接编辑 registry，
+只执行 UserPromptSubmit hook 为本轮注入的精确命令。**从飞书来的 `$feishu-mode dialogue` / `$feishu-mode mapping`
+不经过模型**：入站路由器在验过发送者、真实 @ 和 claim 之后当场切换并回执（2026-08-28 起）。不得使用 `--last`，不得直接编辑 registry，
 不得从普通自然语言推断模式变更。无参数 `$feishu-mode` 只读查看；`dialogue` 和 `mapping` 是两种
 唯一合法写操作。
 

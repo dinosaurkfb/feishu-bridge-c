@@ -227,8 +227,8 @@ node scripts/bind-project.mjs --project ~/x --apply    # 建话题 + 登记
 而绑定的核心闸就是 session_id。所以绑定必然分两段，第二段就是你 @ 的那一下。
 
 那一下靠三道闸守着（都来自机器级配置，绑定前就能判）：发送者是不是你、
-有没有**真实** `<at>`、消息新不新。再加「全机同时只有一份待绑定」和 **24 小时窗口**。
-超时了重跑一次接入命令即可 —— 话题已在，平台侧幂等键保证不会重建。
+有没有**真实** `<at>`、消息新不新。多份待绑定并存时按根消息引用块里的**绑定码**精确匹配。
+待绑定**不过期**（2026-08-28 起）；不想要了用 `node scripts/feishu-rotate.mjs --cancel --apply` 显式取消。
 
 ### 接入产生了什么
 
@@ -263,8 +263,9 @@ node scripts/bind-project.mjs --project ~/x --apply    # 建话题 + 登记
 `/feishu-mode dialogue` 与 `/feishu-mode mapping` 显式切换交互模式。Dialogue v1 只支持一名授权人类
 与一个主持会话的串行多轮对话，默认 12 轮 / 2 小时 / 12 资源单位；Agent 回复不会自动触发下一轮。
 轮转的新话题在首次真实 mention
-前保持 pending，旧话题继续 active；认领成功后新话题 active、旧话题 read-only。待认领默认
-24 小时过期；显式取消可运行 `node scripts/feishu-rotate.mjs --cancel --apply`，不会删除话题历史。
+前保持 pending，旧话题继续 active；认领成功后新话题 active、旧话题 read-only。待认领**不过期**
+（2026-08-28 起；只有旧登记写了显式截止的才会过期）：等满 72 小时无人认领会在该话题下提醒一次，之后每 7 天再提醒一次；
+显式取消是唯一的取消入口：`node scripts/feishu-rotate.mjs --cancel --apply`，不会删除话题历史。
 
 **续期**：绑定有效期是入站唯一的闸，到期前 30 天和 7 天会自动提醒。
 

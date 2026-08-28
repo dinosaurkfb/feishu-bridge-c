@@ -73,9 +73,12 @@ export function validateSubscription(subscription) {
   return { ok: problems.length === 0, problems };
 }
 
+// 待认领不过期：只有登记行写了显式截止才有 claim_expires_at_ms，否则 null（= 永不过期）。
+// pendingWindowMs 只在调用方**要求**按接入时间推截止时才用（null / 省略 = 不推）。
 const pendingDeadline = (record, pendingWindowMs) => {
   const explicit = Date.parse(record?.pending_expires_at ?? "");
   if (Number.isFinite(explicit)) return explicit;
+  if (typeof pendingWindowMs !== "number") return null;
   const bound = Date.parse(record?.bound_at ?? "");
   return Number.isFinite(bound) ? bound + pendingWindowMs : 0;
 };
@@ -101,7 +104,8 @@ export function buildLegacySubscriptionReadModel({
     problems.push("template.default_freshness_ms");
   }
   if (!Array.isArray(records)) problems.push("records");
-  if (typeof pendingWindowMs !== "number" || !Number.isFinite(pendingWindowMs) || pendingWindowMs <= 0) {
+  if (pendingWindowMs !== undefined && pendingWindowMs !== null &&
+      (typeof pendingWindowMs !== "number" || !Number.isFinite(pendingWindowMs) || pendingWindowMs <= 0)) {
     problems.push("pending_window_ms");
   }
   if (problems.length) return { ok: false, reason: SUBSCRIPTION_REJECT.PROJECTION_INVALID, problems };
@@ -264,7 +268,9 @@ export function selectPendingSubscriptionClaim({ model, evidence, bindingTokens 
     if (pending.length > 1) return reject(SUBSCRIPTION_REJECT.AMBIGUOUS);
     selected = pending[0];
   }
-  if (now >= selected.claim_expires_at_ms) return reject(SUBSCRIPTION_REJECT.PENDING_EXPIRED);
+  if (Number.isFinite(selected.claim_expires_at_ms) && now >= selected.claim_expires_at_ms) {
+    return reject(SUBSCRIPTION_REJECT.PENDING_EXPIRED);
+  }
 
   return {
     ok: true,

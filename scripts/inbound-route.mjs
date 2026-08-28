@@ -31,8 +31,7 @@ import {
 } from "./subscription.mjs";
 import {
   activatePendingTopicGeneration, materializeLegacyTopicFields, pendingGeneration,
-  topicGenerationStateForLegacy, effectiveBindingId,
-  TOPIC_GENERATION_PENDING_MS,
+  topicGenerationStateForLegacy, effectiveBindingId
 } from "./topic-generation.mjs";
 
 // 幂等列表住在 project-resolve（它是更低层的那个模块），从这里转出去，
@@ -40,15 +39,14 @@ import {
 export { appendConsumed, loadConsumed };
 
 /**
- * 待绑定的有效期。
+ * 待绑定**不过期**（2026-08-28，Frank 定的）：登记行 / 代际写了显式截止才按它过期，否则永不过期。
+ * 取消是唯一的显式出口（/feishu-rotate cancel）。
  *
- * 认领靠「全机同时只有一份待绑定」，这个前提只在窗口有限时才安全 —— 一份忘在那儿
- * 一个月的待绑定，会把你下一次在**任何没绑定的地方** @ 运输 agent 都算成它的。
- * 给的窗口与代际待认领窗口同一份（2026-08-28 起 72 小时；此前 24 小时）：显式触发下你敲完命令就会去 @，足够覆盖「明天再说」，
- * 又不至于让它无限期埋着。过期了重跑一次接入命令即可（话题已在，幂等键保证不会重建）。
+ * 以前用有限窗口守的是"一份忘在那儿的待绑定会把下一次在任何地方的 @ 都算成它的"——
+ * 现在靠根消息引用块里的**绑定码精确匹配**（多份并存时）和"只有一份"时的直接命中，
+ * 不再靠时间。这里没有"窗口长度"这个常量了 —— 别再加回来。
  */
-// 首次绑定的待认领窗口与话题代际的待认领窗口是同一件事 —— 同一份定义（2026-08-28 起 72 小时）。
-export const PENDING_WINDOW_MS = TOPIC_GENERATION_PENDING_MS;
+export const PENDING_WINDOW_MS = null;
 
 export const PROMOTE_REJECT = {
   NO_PENDING: "no_pending_binding",
@@ -69,7 +67,7 @@ export const PROMOTE_REJECT_TEXT = {
   [PROMOTE_REJECT.TOKEN_UNKNOWN]: "根消息引用里的绑定码不对应任何等待绑定的项目",
   [PROMOTE_REJECT.TOKEN_AMBIGUOUS]: "根消息引用里出现了多个绑定码，无法确定目标",
   [PROMOTE_REJECT.TOKEN_DUPLICATED]: "多个等待绑定的项目用了同一个绑定码，无法确定目标",
-  [PROMOTE_REJECT.PENDING_EXPIRED]: "等待绑定已超过 " + Math.round(PENDING_WINDOW_MS / 3600000) + " 小时，需要重新接入",
+  [PROMOTE_REJECT.PENDING_EXPIRED]: "这份等待绑定写了截止时间且已过期，需要重新接入",
   [PROMOTE_REJECT.SENDER_NOT_FRANK]: "发送者不是授权用户",
   [PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED]: "没有真实 @ 本链路的运输 agent",
   [PROMOTE_REJECT.STALE_MESSAGE]: "消息超出时效窗口",
@@ -121,13 +119,10 @@ export function findBindingForSession({ sessionId, registryFile, templateFile } 
   return { ok: true, ...hit };
 }
 
+// 只有写了显式截止的登记行才会过期；没写（或 null）= 不过期。
 const pendingDeadline = (entry) => {
   const explicit = Date.parse(entry?.pending_expires_at ?? "");
-  if (Number.isFinite(explicit)) return explicit;
-  // 老的登记行没写这个字段，从接入时间推。推不出来就当它已经过期 —— fail-closed：
-  // 一份不知道什么时候建的待绑定，正是不该拿来认领陌生话题的那种。
-  const bound = Date.parse(entry?.bound_at ?? "");
-  return Number.isFinite(bound) ? bound + PENDING_WINDOW_MS : 0;
+  return Number.isFinite(explicit) ? explicit : Infinity;
 };
 
 /**
@@ -301,7 +296,8 @@ export function shadowClaudeFirstClaim({
  * 还不知道是哪个项目时能守住的闸，一个不少。
  *
  * 三道都来自机器级配置，所以在绑定之前就能判：发送者是不是 Frank、有没有真实 @
- * 运输 agent、消息新不新。加上「全机只有一份待绑定 + 窗口没过」，fail-closed 成立。
+ * 运输 agent、消息新不新。认领哪一份待绑定靠绑定码精确匹配（只有一份时直接命中）；
+ * 待绑定不过期（2026-08-28 起），只有旧登记写了显式截止的才会过期。fail-closed 成立。
  */
 export function evaluatePromotion({ event, template, pending, now = Date.now() }) {
   const reject = (reason, extra = {}) => ({

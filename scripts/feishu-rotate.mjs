@@ -17,6 +17,7 @@ import {
 import {
   ROTATION_STATUS, TOPIC_GENERATION_PREPARING_STALE_MS,
   activeGeneration, pendingGeneration,
+  TOPIC_GENERATION_AUTO_ROTATE_MESSAGES,
 } from "./topic-generation.mjs";
 
 const arg = (name) => {
@@ -60,7 +61,7 @@ if (pending) die("已有等待认领的话题代际；请先完成认领或显�
 const nextNumber = Math.max(...current.state.generations.map((generation) => generation.generation)) + 1;
 const token = bindingToken(current.state.binding_id + "\n" + nextNumber);
 const name = current.config.task_display_name ?? path.basename(root);
-const automaticThreshold = active.activity?.auto_rotate_threshold ?? 30;
+const automaticThreshold = active.activity?.auto_rotate_threshold ?? TOPIC_GENERATION_AUTO_ROTATE_MESSAGES;
 const rootText = composeRootMessage({
   name,
   heading: name + " · 第 " + nextNumber + " 代",

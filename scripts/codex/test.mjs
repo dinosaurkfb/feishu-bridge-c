@@ -96,7 +96,8 @@ import {
   validateCodexTemplate, validateRegistryTasks, writeRegistryFixtureUnvalidated,
 } from "./state.mjs";
 import {
-  ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, TOPIC_GENERATION_PENDING_MS, activeGeneration, pendingGeneration,
+  ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, TOPIC_GENERATION_CLAIM_REMINDER_AFTER_MS,
+  TOPIC_GENERATION_CLAIM_REMINDER_REPEAT_MS, activeGeneration, pendingGeneration,
 } from "../topic-generation.mjs";
 import { applyRuntimeSync, planRuntimeSync } from "../runtime-install.mjs";
 import { DIALOGUE_TURN_STATUS } from "../interaction-policy.mjs";
@@ -981,7 +982,7 @@ test("active 但首次 mention 已过期的 task 可只刷新原话题握手窗�
   fs.mkdirSync(root);
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
   task.bound_at = "2026-01-01T00:00:00.000Z";
-  delete task.pending_expires_at;
+  task.pending_expires_at = "2026-01-02T00:00:00.000Z"; // 旧登记写了显式截止且已过
   delete task.topic_generation_state;
   delete task.channel_generation_id;
   writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
@@ -994,13 +995,10 @@ test("active 但首次 mention 已过期的 task 可只刷新原话题握手窗�
   assert.equal(refreshed.task.inbound_state, "pending");
   assert.equal(refreshed.task.session_id ?? null, null);
   assert.equal(findPendingTask({ home, now }).ok, true);
-  // 首次绑定的待认领窗口跟代际的是同一份定义（2026-08-28 起 72 小时）：24 小时后仍在窗口内，72 小时到点过期。
-  const H = 3600000;
-  assert.equal(findPendingTask({ home, now: Date.parse(task.bound_at) + 48 * H }).ok, true,
-    "没有 pending_expires_at 的旧 task 按 bound_at + 窗口算，48 小时时还没过期");
-  assert.equal(refreshed.task.pending_expires_at, new Date(now + TOPIC_GENERATION_PENDING_MS).toISOString());
-  assert.equal(findPendingTask({ home, now: now + 24 * H + 1 }).ok, true, "24 小时时还在窗口内 —— 窗口已放长");
-  assert.equal(findPendingTask({ home, now: now + 72 * H }).reason, "pending_binding_expired");
+  // 待认领不过期（2026-08-28）：刷新 = 清掉旧的显式截止；之后任何时候都可认领。
+  const DAY = 24 * 3600000;
+  assert.equal(refreshed.task.pending_expires_at, null);
+  assert.equal(findPendingTask({ home, now: now + 400 * DAY }).ok, true, "400 天也不过期");
 });
 
 test("Codex adapter 轮转期间旧 session 继续路由，认领后新旧代际原子切换", () => {
@@ -1234,9 +1232,7 @@ test("bind-task 重跑只续期 active pending，不创建或回复第二个话�
   fs.writeFileSync(path.join(root, "README.md"), "# A\n");
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
   task.bound_at = "2026-01-01T00:00:00.000Z";
-  delete task.pending_expires_at;
-  delete task.topic_generation_state;
-  delete task.channel_generation_id;
+  task.pending_expires_at = "2026-01-02T00:00:00.000Z"; // 旧登记写了显式截止且已过
   delete task.topic_generation_state;
   delete task.channel_generation_id;
   writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
@@ -1251,7 +1247,7 @@ test("bind-task 重跑只续期 active pending，不创建或回复第二个话�
   const after = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
   assert.equal(after.root_message_id, "om_a");
   assert.equal(after.inbound_state, "pending");
-  assert.equal(Number.isFinite(Date.parse(after.pending_expires_at)), true);
+  assert.equal(after.pending_expires_at, null, "续期 = 清掉旧的显式截止，之后不过期");
 });
 
 test("pending 续期不被超过编辑时限的旧话题标题阻断", () => {
@@ -1274,7 +1270,7 @@ test("pending 续期不被超过编辑时限的旧话题标题阻断", () => {
     root, threadId: THREAD_A, name: "Old", rootMessageId: "om_a", token: "a",
   });
   task.bound_at = "2026-01-01T00:00:00.000Z";
-  delete task.pending_expires_at;
+  task.pending_expires_at = "2026-01-02T00:00:00.000Z"; // 旧登记写了显式截止且已过
   writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
 
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
@@ -1287,7 +1283,7 @@ test("pending 续期不被超过编辑时限的旧话题标题阻断", () => {
   assert.match(run.stderr, /不影响.*首次.*握手/u);
   const after = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
   assert.equal(after.task_display_name, "Old");
-  assert.equal(Number.isFinite(Date.parse(after.pending_expires_at)), true);
+  assert.equal(after.pending_expires_at, null, "续期 = 清掉旧的显式截止");
 });
 
 test("task 控制脚本不猜 thread，暂停和恢复都不调用飞书", () => {
@@ -8708,11 +8704,13 @@ function codexReminderFixture({ base = 1000 } = {}) {
     threadId: THREAD_A, operationId: "op_r", rootMessageId: "om_new", pendingToken: "bbb222", home, now: base + 300,
   });
   assert.equal(registered.ok, true);
-  const deadline = Date.parse(registered.generation.claim_expires_at);
-  assert.equal(deadline, base + 300 + 72 * 3600000, "Codex 侧待认领窗口同样是 72 小时");
+  assert.equal(registered.generation.claim_expires_at, null, "Codex 侧新代际同样不设截止");
+  const createdAt = base + 300;
+  const dueAt = createdAt + TOPIC_GENERATION_CLAIM_REMINDER_AFTER_MS;
+  const deadline = dueAt + 11 * 3600000; // 旧写法 `deadline - 11h` 恰为 dueAt
   const pendingNow = (now) => topicStateForTask(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task, { now })
     .state.generations.find((g) => g.root_message_id === "om_new");
-  return { home, deadline, pendingNow };
+  return { home, createdAt, dueAt, deadline, pendingNow };
 }
 
 test("Codex 待认领快过期提醒：进窗口只在待认领话题下发一次，先发后记，发失败不记", () => {
@@ -8732,13 +8730,16 @@ test("Codex 待认领快过期提醒：进窗口只在待认领话题下发一�
   assert.equal(calls[0].profile, TEMPLATE.lark_cli_profile);
   assert.equal(calls[0].expectedAppId, TEMPLATE.outbound_app_id);
   assert.match(calls[0].text, /A · 第 2 代/u);
-  assert.match(calls[0].text, /还剩约 11 小时/u);
+  assert.match(calls[0].text, /已等待约 3 天/u);
+  assert.match(calls[0].text, /不想要这个新话题：\$feishu-rotate cancel/u, "Codex 侧取消命令是 $feishu-rotate cancel");
   assert.ok(!calls[0].text.includes("om_new"), "正文不带 locator");
   assert.equal(fx.pendingNow(now).claim_reminder_at, new Date(now).toISOString());
 
   const second = remindCodexPendingClaims({ home: fx.home, now: now + 1800000, publish });
   assert.deepEqual([second.reminded, calls.length], [[], 1], "只提醒一次");
-  assert.deepEqual(second.skipped, [{ name: "A", reason: "already_reminded" }]);
+  assert.deepEqual(second.skipped, [{ name: "A", reason: "reminded_recently" }]);
+  const weekLater = remindCodexPendingClaims({ home: fx.home, now: now + TOPIC_GENERATION_CLAIM_REMINDER_REPEAT_MS, publish });
+  assert.deepEqual([weekLater.reminded, calls.length], [[{ name: "A", generation: 2, attempt: 1, recorded: true }], 2], "7 天后再提醒一次");
 
   const fx2 = codexReminderFixture();
   const failed = remindCodexPendingClaims({ home: fx2.home, now, publish: () => { throw new Error("lark down"); } });
@@ -8747,12 +8748,12 @@ test("Codex 待认领快过期提醒：进窗口只在待认领话题下发一�
   assert.equal(fx2.pendingNow(now).claim_reminder_at, undefined, "预留 → 发 → 记：没发出去不记");
   assert.equal(fx2.pendingNow(now).claim_reminder_attempts, 1, "尝试要留痕");
   const tooSoon = remindCodexPendingClaims({ home: fx2.home, now: now + 60000, publish });
-  assert.deepEqual([tooSoon.reminded, tooSoon.skipped, calls.length], [[], [{ name: "A", reason: "retry_too_soon" }], 1]);
+  assert.deepEqual([tooSoon.reminded, tooSoon.skipped, calls.length], [[], [{ name: "A", reason: "retry_too_soon" }], 2]);
   const retry = remindCodexPendingClaims({ home: fx2.home, now: now + 30 * 60000, publish });
-  assert.deepEqual([retry.reminded, calls.length], [[{ name: "A", generation: 2, attempt: 2, recorded: true }], 2]);
+  assert.deepEqual([retry.reminded, calls.length], [[{ name: "A", generation: 2, attempt: 2, recorded: true }], 3]);
   const fx3 = codexReminderFixture();
   const dry = remindCodexPendingClaims({ home: fx3.home, now, publish, dryRun: true });
-  assert.deepEqual([dry.reminded, calls.length], [[{ name: "A", generation: 2, dryRun: true }], 2]);
+  assert.deepEqual([dry.reminded, calls.length], [[{ name: "A", generation: 2, dryRun: true }], 3]);
   assert.equal(fx3.pendingNow(now).claim_reminder_at, undefined, "dry-run 不记");
   assert.equal(fx3.pendingNow(now).claim_reminder_attempts ?? 0, 0, "dry-run 也不预留");
 
@@ -8764,20 +8765,20 @@ test("Codex 待认领快过期提醒：进窗口只在待认领话题下发一�
     nested = remindCodexPendingClaims({ home: fx4.home, now, publish: (b) => { calls.push(b); } });
   } });
   assert.deepEqual([outer.reminded.length, nested.reminded, nested.skipped, calls.length],
-    [1, [], [{ name: "A", reason: "retry_too_soon" }], 3], "并发只发一条");
+    [1, [], [{ name: "A", reason: "retry_too_soon" }], 4], "并发只发一条");
 
   // 暂停的 task 不提醒
   const fx5 = codexReminderFixture();
   assert.equal(setTaskConnectionStatus({ threadId: THREAD_A, status: "paused", home: fx5.home, now }).ok, true);
   const pausedSweep = remindCodexPendingClaims({ home: fx5.home, now, publish });
   assert.deepEqual([pausedSweep.reminded, pausedSweep.skipped, calls.length],
-    [[], [{ name: "A", reason: "binding_not_active" }], 3]);
+    [[], [{ name: "A", reason: "binding_not_active" }], 4]);
 
   // 模板缺席：算这个 task 的问题、不烧尝试、不终止扫描；dry-run 根本不碰模板
   const fx6 = codexReminderFixture();
   fs.rmSync(path.join(fx6.home, "chain-config.json"));
   const noTpl = remindCodexPendingClaims({ home: fx6.home, now, publish });
-  assert.deepEqual([noTpl.reminded, noTpl.problems.map((p) => [p.name, p.reason]), calls.length], [[], [["A", "template_unavailable"]], 3]);
+  assert.deepEqual([noTpl.reminded, noTpl.problems.map((p) => [p.name, p.reason]), calls.length], [[], [["A", "template_unavailable"]], 4]);
   assert.equal(fx6.pendingNow(now).claim_reminder_attempts, undefined, "身份解析失败不烧尝试");
   const dryNoTpl = remindCodexPendingClaims({ home: fx6.home, now, publish, dryRun: true });
   assert.deepEqual([dryNoTpl.problems, dryNoTpl.reminded.length], [[], 1]);
@@ -8787,7 +8788,7 @@ test("Codex 待认领快过期提醒：进窗口只在待认领话题下发一�
   fs.chmodSync(fx7.home, 0o500);
   try {
     const io = remindCodexPendingClaims({ home: fx7.home, now, publish });
-    assert.deepEqual([io.reminded, io.skipped, calls.length], [[], [], 3]);
+    assert.deepEqual([io.reminded, io.skipped, calls.length], [[], [], 4]);
     assert.deepEqual(io.problems.map((p) => [p.name, p.reason]), [["A", "reserve_failed"]], JSON.stringify(io.problems));
     assert.match(io.problems[0].error, /lock_io_error：.*(EACCES|EPERM)/u);
   } finally {
@@ -8807,7 +8808,7 @@ test("Codex 待认领快过期提醒：进窗口只在待认领话题下发一�
 });
 
 test("Codex 兜底真入口 drain-all 跑待认领提醒；发不出去要报 publish_failed、退出 1、不记", () => {
-  const base = Date.now() - (72 - 11) * 3600000 - 300; // 截止 ≈ 现在 + 11 小时
+  const base = Date.now() - TOPIC_GENERATION_CLAIM_REMINDER_AFTER_MS - 3600000 - 300; // 已等 73 小时：该提醒了
   const fx = codexReminderFixture({ base });
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "drain-all.mjs")], {
     encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: fx.home },

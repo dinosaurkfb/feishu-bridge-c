@@ -12,6 +12,7 @@ import {
   materializeLegacyTopicFields, prepareTopicRotation, registerPendingTopicGeneration,
   recordTopicGenerationActivity, resolveMappingOutboundGeneration, topicGenerationStateForLegacy,
   markPendingClaimReminder,
+  markPendingClaimReminderAbandoned,
   reserveClaimReminderAttempt,
 } from "./topic-generation.mjs";
 
@@ -216,6 +217,16 @@ export function reserveClaudeClaimReminder({
   return mutateClaudeTopicBinding({
     root, claudeSessionId, registryFile, templateFile, now,
     mutate: (state) => reserveClaimReminderAttempt(state, { generationId, now }),
+  });
+}
+
+/** 本周期尝试用尽：原子记下放弃时间，下个周期重来。 */
+export function markClaudeClaimReminderAbandoned({
+  root, claudeSessionId, generationId, registryFile, templateFile, now = Date.now(),
+} = {}) {
+  return mutateClaudeTopicBinding({
+    root, claudeSessionId, registryFile, templateFile, now,
+    mutate: (state) => markPendingClaimReminderAbandoned(state, { generationId, now }),
   });
 }
 

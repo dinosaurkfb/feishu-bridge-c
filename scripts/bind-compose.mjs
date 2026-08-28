@@ -15,8 +15,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import {
-  materializeLegacyTopicFields, topicGenerationStateForLegacy,
-  TOPIC_GENERATION_PENDING_MS,
+  materializeLegacyTopicFields, topicGenerationStateForLegacy
 } from "./topic-generation.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -194,8 +193,8 @@ export function newRegistryEntry({ root, name, purpose, token, rootMessageId, no
     inbound_state: "pending",
     pending_token: token,
     bound_at: new Date(now).toISOString(),
-    // 待认领窗口只有一份定义（评审探针：这里曾写成 24 天，被物化进 pending 代际后常量改了也不生效）。
-    pending_expires_at: new Date(now + TOPIC_GENERATION_PENDING_MS).toISOString(),
+    // 待认领不过期（2026-08-28）：显式 null。老登记行若写了时间仍按它过期。
+    pending_expires_at: null,
     expires_at: new Date(now + DEFAULT_TERM_MS).toISOString(),
     note: "由 bind-project 接入。续期：node scripts/binding.mjs --renew 1y --apply",
   };

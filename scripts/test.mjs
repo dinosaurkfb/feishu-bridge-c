@@ -7,6 +7,7 @@
  * v2：标识符全部换到 Aily 命名空间（见 selector.mjs 顶部说明）。
  */
 
+import { describePendingWindow } from "./layered-status.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
@@ -36,12 +37,13 @@ import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-ge
 import {
   claimReminderDue as tgClaimReminderDue, markPendingClaimReminder as tgMarkPendingClaimReminder,
   validateTopicGenerationState as tgValidateState,
-  TOPIC_GENERATION_CLAIM_REMINDER_LEAD_MS as TG_REMINDER_LEAD_MS, TOPIC_GENERATION_PENDING_MS as TG_PENDING_MS,
+  TOPIC_GENERATION_CLAIM_REMINDER_AFTER_MS as TG_REMINDER_AFTER_MS, TOPIC_GENERATION_CLAIM_REMINDER_REPEAT_MS as TG_REMINDER_REPEAT_MS,
+  markPendingClaimReminderAbandoned as tgMarkPendingClaimReminderAbandoned,
   TOPIC_GENERATION_CLAIM_REMINDER_RETRY_MS as TG_REMINDER_RETRY_MS,
   TOPIC_GENERATION_CLAIM_REMINDER_MAX_ATTEMPTS as TG_REMINDER_MAX_ATTEMPTS,
   reserveClaimReminderAttempt as tgReserveClaimReminderAttempt,
 } from "./topic-generation.mjs";
-import { describeReminderSweep, remindClaudePendingClaims, remindOnePendingClaim } from "./claim-reminder.mjs";
+import { describeReminderSweep, describeWaited, remindClaudePendingClaims, remindOnePendingClaim } from "./claim-reminder.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
   acquirePublishLock, attributeSession, clearStaleReapLock, exactProjectsForRoot, fileContainsAny, isUnder,
@@ -203,10 +205,9 @@ import {
 import {
   SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION,
   buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId,
-  stableControlId, validateSubscription,
-} from "./subscription.mjs";
+  stableControlId, validateSubscription, claimable } from "./subscription.mjs";
 import {
-  ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, TOPIC_GENERATION_PENDING_MS, topicGenerationStateForLegacy,
+  ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, topicGenerationStateForLegacy,
   TOPIC_GENERATION_PREPARING_STALE_MS,
   activatePendingTopicGeneration, activeGeneration,
   closePendingTopicGeneration, materializeLegacyTopicFields, pendingGeneration,
@@ -912,7 +913,7 @@ test("轮转等待 mention 时旧代际仍 active，认领后一次状态替换�
   assert.equal(projected.record.session_id, "session_new");
 });
 
-test("pending generation 超过认领窗口（默认 72 小时）后 fail-closed，旧代际保持 active", () => {
+test("pending generation 默认不过期；只有登记时写了显式截止的才会过期并 fail-closed，旧代际保持 active", () => {
   const legacy = projectLegacyTopicGeneration({
     runtime: "claude", bindingId: "binding_b", rootMessageId: "om_old",
     sessionId: "session_old", inboundState: "bound", now: NOW,
@@ -921,13 +922,31 @@ test("pending generation 超过认领窗口（默认 72 小时）后 fail-closed
   const registered = registerPendingTopicGeneration(prepared.state, {
     operationId: "op_b", rootMessageId: "om_new", pendingToken: "def456", now: NOW,
   });
-  const tooLate = activatePendingTopicGeneration(registered.state, {
-    sessionId: "session_new", now: NOW + PENDING_WINDOW_MS + 1,
+  assert.equal(pendingGeneration(registered.state).claim_expires_at, null, "默认不设截止");
+  const explicitNull = registerPendingTopicGeneration(prepared.state, {
+    operationId: "op_b", rootMessageId: "om_new", pendingToken: "def456", now: NOW, claimExpiresAt: null,
   });
-  assert.equal(tooLate.reason, "pending_generation_expired");
-  const expired = closePendingTopicGeneration(registered.state, {
-    operationId: "op_b", reason: ROTATION_STATUS.EXPIRED,
-    now: NOW + PENDING_WINDOW_MS + 1,
+  assert.equal(explicitNull.ok, true, "显式 null 与省略同义：" + JSON.stringify(explicitNull.reason));
+  assert.equal(pendingGeneration(explicitNull.state).claim_expires_at, null);
+  assert.equal(registerPendingTopicGeneration(prepared.state, {
+    operationId: "op_b", rootMessageId: "om_new", pendingToken: "def456", now: NOW, claimExpiresAt: "yesterday",
+  }).reason, "pending_generation_expiry_invalid", "给了值就必须是时间");
+  const DAY = 24 * 3600000;
+  const late = activatePendingTopicGeneration(registered.state, { sessionId: "session_new", now: NOW + 30 * DAY });
+  assert.equal(late.ok, true, "30 天后仍可认领：" + JSON.stringify(late.reason));
+  const notExpired = closePendingTopicGeneration(registered.state, {
+    operationId: "op_b", reason: ROTATION_STATUS.EXPIRED, now: NOW + 30 * DAY,
+  });
+  assert.equal(notExpired.reason, "pending_generation_not_expired", "没有截止就不能按过期关掉");
+
+  const explicit = registerPendingTopicGeneration(prepared.state, {
+    operationId: "op_b", rootMessageId: "om_new", pendingToken: "def456", now: NOW,
+    claimExpiresAt: new Date(NOW + 3600000).toISOString(),
+  });
+  const tooLate = activatePendingTopicGeneration(explicit.state, { sessionId: "session_new", now: NOW + 3600000 + 1 });
+  assert.equal(tooLate.reason, "pending_generation_expired", "显式截止仍生效");
+  const expired = closePendingTopicGeneration(explicit.state, {
+    operationId: "op_b", reason: ROTATION_STATUS.EXPIRED, now: NOW + 3600000 + 1,
   });
   assert.equal(expired.ok, true);
   assert.equal(activeGeneration(expired.state).root_message_id, "om_old");
@@ -5177,31 +5196,34 @@ test("同时有两份待绑定 → 拒。认领靠的就是「只有一份」这
   assert.equal(r.reason, PROMOTE_REJECT.MULTIPLE_PENDING);
 });
 
-test("待绑定超过窗口（72 小时）→ 过期，重新接入", () => {
+test("待绑定不过期：没有显式截止的登记行 30 天后仍可认领；写了显式截止且已过 → 过期，重新接入", () => {
   const f = routeFixture([{ id: "a", extra: {} }]);
-  const pending = pendingOf(f, { bound_at: new Date(NOW2 - PENDING_WINDOW_MS - 1000).toISOString() });
-  assert.equal(pending.reason, PROMOTE_REJECT.PENDING_EXPIRED);
+  const DAY = 24 * 3600000;
+  const old = pendingOf(f, { bound_at: new Date(NOW2 - 30 * DAY).toISOString(), pending_expires_at: null });
+  assert.equal(old.ok, true, JSON.stringify(old));
+  const legacyNoField = pendingOf(f, { bound_at: new Date(NOW2 - 30 * DAY).toISOString(), pending_expires_at: undefined });
+  assert.equal(legacyNoField.ok, true, "老登记行没这个字段 = 不过期：" + JSON.stringify(legacyNoField));
+  const explicitPast = pendingOf(f, { bound_at: new Date(NOW2 - 2 * DAY).toISOString(), pending_expires_at: new Date(NOW2 - 1000).toISOString() });
+  assert.equal(explicitPast.reason, PROMOTE_REJECT.PENDING_EXPIRED);
+  const explicitFuture = pendingOf(f, { bound_at: new Date(NOW2 - 2 * DAY).toISOString(), pending_expires_at: new Date(NOW2 + 1000).toISOString() });
+  assert.equal(explicitFuture.ok, true);
 });
 
-test("首次绑定的窗口走真实 newRegistryEntry → pendingDeadline：24 小时后仍可认领，72 小时到点过期", () => {
-  // 评审探针：newRegistryEntry 曾写死 24 天，物化进登记行后常量改了也不生效 —— 所以这里不比常量，比行为。
+test("首次绑定走真实 newRegistryEntry → pendingDeadline：不写截止，任何时候都可认领", () => {
   const f = routeFixture([{ id: "a", extra: {} }]);
+  const DAY = 24 * 3600000;
   const mk = (now) => newRegistryEntry({ root: "/tmp/win", name: "win", purpose: null, token: "aaa111", rootMessageId: "om_win", now });
-  const dayOld = mk(NOW2 - 24 * 3600000 - 1000);
-  assert.equal(dayOld.pending_expires_at, new Date(NOW2 - 24 * 3600000 - 1000 + TG_PENDING_MS).toISOString());
-  const stillOpen = pendingOf(f, { bound_at: dayOld.bound_at, pending_expires_at: dayOld.pending_expires_at });
-  assert.equal(stillOpen.ok, true, JSON.stringify(stillOpen));
-  const justExpired = mk(NOW2 - TG_PENDING_MS);
-  assert.equal(pendingOf(f, { bound_at: justExpired.bound_at, pending_expires_at: justExpired.pending_expires_at }).reason,
-    PROMOTE_REJECT.PENDING_EXPIRED);
-  const almost = mk(NOW2 - TG_PENDING_MS + 1000);
-  assert.equal(pendingOf(f, { bound_at: almost.bound_at, pending_expires_at: almost.pending_expires_at }).ok, true);
+  const fresh = mk(NOW2 - 60_000);
+  assert.equal(fresh.pending_expires_at, null, "登记行显式 null：不过期");
+  assert.equal(pendingOf(f, { bound_at: fresh.bound_at, pending_expires_at: fresh.pending_expires_at }).ok, true);
+  const ancient = mk(NOW2 - 400 * DAY);
+  assert.equal(pendingOf(f, { bound_at: ancient.bound_at, pending_expires_at: ancient.pending_expires_at }).ok, true, "400 天也不过期");
 });
 
-test("待绑定连接入时间都没有 → 当成已过期（fail-closed）", () => {
+test("待绑定不过期：连接入时间都没有的登记行也可认领（bound_at 不再参与截止推导）", () => {
   const f = routeFixture([{ id: "a", extra: {} }]);
   const pending = pendingOf(f, { bound_at: undefined });
-  assert.equal(pending.reason, PROMOTE_REJECT.PENDING_EXPIRED);
+  assert.equal(pending.ok, true, JSON.stringify(pending));
 });
 
 test("机器级配置不全 → 拒，绝不因为「反正是 Frank」放行", () => {
@@ -17278,7 +17300,7 @@ function claimReminderFixture({ base = NOW, name = "提醒演示" } = {}) {
   const entry = newRegistryEntry({
     root, name, purpose: null, token: "aaa111", rootMessageId: "om_old", now: base,
   });
-  assert.equal(entry.pending_expires_at, new Date(base + TG_PENDING_MS).toISOString(), "首次绑定的待认领窗口与代际同一份");
+  assert.equal(entry.pending_expires_at, null, "首次绑定不设截止");
   fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [entry] }, null, 2));
   assert.equal(promoteBinding({
     root, id: entry.id, source: "registry", generationId: entry.channel_generation_id,
@@ -17289,65 +17311,121 @@ function claimReminderFixture({ base = NOW, name = "提醒演示" } = {}) {
     root, operationId: "op_remind", rootMessageId: "om_new", pendingToken: "bbb222", registryFile, now: base + 3,
   });
   assert.equal(registered.ok, true);
-  const deadline = Date.parse(registered.generation.claim_expires_at);
-  assert.equal(deadline, base + 3 + TG_PENDING_MS, "待认领窗口从登记时刻起算，长度只有一份定义");
+  assert.equal(registered.generation.claim_expires_at, null, "新代际不设截止");
+  assert.equal(registered.generation.created_at, new Date(base + 3).toISOString());
+  const createdAt = base + 3;
+  const dueAt = createdAt + TG_REMINDER_AFTER_MS;       // 等满 72 小时：第一次该提醒的时刻
+  const deadline = dueAt + 11 * H_MS;                    // 旧测试写法 `deadline - 11 * H_MS` 恰好等于 dueAt
   const readState = () => JSON.parse(fs.readFileSync(registryFile, "utf-8")).projects[0].topic_generation_state;
   const pendingOf = (state) => state.generations.find((g) => g.root_message_id === "om_new");
-  return { root, local, entry, registryFile, templateFile, registered, deadline, readState, pendingOf, name };
+  return { root, local, entry, registryFile, templateFile, registered, createdAt, dueAt, deadline, readState, pendingOf, name };
 }
 
-test("待认领窗口是 72 小时、自动轮转阈值是 50 —— 两个常量各只有一份定义，首次绑定与代际共用", () => {
-  assert.equal(TG_PENDING_MS, 72 * H_MS);
-  assert.equal(TG_REMINDER_LEAD_MS, 12 * H_MS);
+test("待认领不过期：两条链都没有窗口常量；提醒节奏 72 小时首提醒、每 7 天一次；自动轮转阈值 50", () => {
+  assert.equal(PENDING_WINDOW_MS, null, "首次绑定不再有窗口长度");
+  assert.equal(TG_REMINDER_AFTER_MS, 72 * H_MS);
+  assert.equal(TG_REMINDER_REPEAT_MS, 7 * 24 * H_MS);
   assert.equal(TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, 50);
-  assert.equal(PENDING_WINDOW_MS, TG_PENDING_MS, "首次绑定的待认领窗口必须跟代际的是同一份");
 });
 
-test("快过期提醒的判据只有一份：窗口外不提醒、进窗口提醒、提醒过 / 过期 / 没截止 / 没 pending 都不提醒", () => {
-  const { readState, deadline, registered, pendingOf } = claimReminderFixture();
+test("无人认领提醒的判据只有一份：等满 72 小时才提醒、提醒过再等 7 天、放弃过也再等 7 天；周期内最多 3 次、间隔 25 分钟；暂停 / 过期 / 没 created_at 不提醒", () => {
+  const { readState, registered, pendingOf, createdAt, dueAt } = claimReminderFixture();
   const state = readState();
   const gid = registered.generation.channel_generation_id;
-  const notYet = tgClaimReminderDue(state, { now: deadline - TG_REMINDER_LEAD_MS - 1 });
-  assert.deepEqual([notYet.due, notYet.reason, notYet.remainingMs], [false, "not_yet", TG_REMINDER_LEAD_MS + 1]);
-  const due = tgClaimReminderDue(state, { now: deadline - TG_REMINDER_LEAD_MS });
-  assert.deepEqual([due.due, due.reason, due.remainingMs], [true, null, TG_REMINDER_LEAD_MS], "刚进窗口就该提醒");
+  const REPEAT = TG_REMINDER_REPEAT_MS;
+  const notYet = tgClaimReminderDue(state, { now: dueAt - 1 });
+  assert.deepEqual([notYet.due, notYet.reason, notYet.remainingMs, notYet.waitedMs], [false, "not_yet", 1, TG_REMINDER_AFTER_MS - 1]);
+  const due = tgClaimReminderDue(state, { now: dueAt });
+  assert.deepEqual([due.due, due.reason, due.attempts, due.waitedMs], [true, null, 0, TG_REMINDER_AFTER_MS], "等满 72 小时就该提醒");
   assert.equal(due.generation.channel_generation_id, gid);
-  assert.equal(tgClaimReminderDue(state, { now: deadline - 1 }).due, true);
-  assert.equal(tgClaimReminderDue(state, { now: deadline }).reason, "expired", "到点即过期，过期不再提醒");
-  assert.equal(tgClaimReminderDue(state, { now: deadline - 1, leadMs: 1 }).due, true, "lead 可注入");
-  assert.equal(tgClaimReminderDue(state, { now: deadline - 2, leadMs: 1 }).reason, "not_yet");
+  assert.equal(tgClaimReminderDue(state, { now: dueAt + 30 * 24 * H_MS }).due, true, "不过期：一个月后没提醒过照样该提醒");
+  assert.equal(tgClaimReminderDue(state, { now: dueAt, afterMs: 1 }).due, true, "after 可注入");
 
-  const marked = tgMarkPendingClaimReminder(state, { generationId: gid, now: deadline - TG_REMINDER_LEAD_MS });
+  // 显式截止（旧登记）仍按过期处理
+  const withDeadline = structuredClone(state);
+  pendingOf(withDeadline).claim_expires_at = new Date(dueAt + 1).toISOString();
+  assert.equal(tgClaimReminderDue(withDeadline, { now: dueAt }).due, true);
+  assert.equal(tgClaimReminderDue(withDeadline, { now: dueAt + 1 }).reason, "expired");
+  const noCreated = structuredClone(state);
+  pendingOf(noCreated).created_at = undefined;
+  assert.equal(tgClaimReminderDue(noCreated, { now: dueAt }).reason, "no_created_at", "说不清等了多久就不提醒");
+  const paused = structuredClone(state);
+  paused.binding_status = "paused";
+  assert.equal(tgClaimReminderDue(paused, { now: dueAt }).reason, "binding_not_active");
+  const none = structuredClone(state);
+  none.generations = none.generations.filter((g) => g.status !== "pending");
+  assert.equal(tgClaimReminderDue(none, { now: dueAt }).reason, "no_pending");
+
+  // 提醒成功 → 本周期结束：7 天内 reminded_recently，7 天后再次 due，计数从 0 起
+  const marked = tgMarkPendingClaimReminder(state, { generationId: gid, now: dueAt });
   assert.deepEqual([marked.ok, marked.changed], [true, true]);
-  assert.equal(pendingOf(marked.state).claim_reminder_at, new Date(deadline - TG_REMINDER_LEAD_MS).toISOString());
-  assert.equal(tgValidateState(marked.state).ok, true, "claim_reminder_at 是合法字段");
-  assert.equal(tgClaimReminderDue(marked.state, { now: deadline - 1 }).reason, "already_reminded");
-  const again = tgMarkPendingClaimReminder(marked.state, { generationId: gid, now: deadline - 1 });
-  assert.deepEqual([again.ok, again.changed], [true, false], "同一代际只记一次");
-  assert.equal(pendingOf(again.state).claim_reminder_at, pendingOf(marked.state).claim_reminder_at, "第二次不许改时间");
-  assert.equal(tgMarkPendingClaimReminder(state, { generationId: "gen_other", now: deadline - 1 }).reason,
-    "pending_generation_mismatch");
+  assert.equal(pendingOf(marked.state).claim_reminder_at, new Date(dueAt).toISOString());
+  assert.equal(tgValidateState(marked.state).ok, true);
+  assert.equal(tgClaimReminderDue(marked.state, { now: dueAt + REPEAT - 1 }).reason, "reminded_recently");
+  const again = tgMarkPendingClaimReminder(marked.state, { generationId: gid, now: dueAt + REPEAT - 1 });
+  assert.deepEqual([again.ok, again.changed], [true, false], "同一周期只记一次");
+  const cycle2 = tgClaimReminderDue(marked.state, { now: dueAt + REPEAT });
+  assert.deepEqual([cycle2.due, cycle2.attempts, cycle2.cycleStart], [true, 0, dueAt + REPEAT], "7 天后再提醒一次");
+  assert.equal(tgMarkPendingClaimReminder(state, { generationId: "gen_other", now: dueAt }).reason, "pending_generation_mismatch");
   assert.equal(pendingOf(state).claim_reminder_at, undefined, "mark 是纯函数，不改入参");
   assert.equal(pendingOf(readState()).claim_reminder_at, undefined, "也不碰文件");
 
+  // 锁内预留：拿到一次尝试后，同一周期再算就是 retry_too_soon；间隔够了再拿；拿满就 attempts_exhausted
+  const r1 = tgReserveClaimReminderAttempt(state, { generationId: gid, now: dueAt });
+  assert.deepEqual([r1.ok, r1.changed, r1.attempt, r1.waitedMs], [true, true, 1, TG_REMINDER_AFTER_MS]);
+  assert.equal(pendingOf(r1.state).claim_reminder_attempted_at, new Date(dueAt).toISOString());
+  assert.equal(tgValidateState(r1.state).ok, true);
+  assert.equal(pendingOf(state).claim_reminder_attempts, undefined, "预留是纯函数");
+  assert.equal(tgClaimReminderDue(r1.state, { now: dueAt + TG_REMINDER_RETRY_MS - 1 }).reason, "retry_too_soon");
+  assert.equal(tgReserveClaimReminderAttempt(r1.state, { generationId: gid, now: dueAt + TG_REMINDER_RETRY_MS - 1 }).reason, "retry_too_soon");
+  const r2 = tgReserveClaimReminderAttempt(r1.state, { generationId: gid, now: dueAt + TG_REMINDER_RETRY_MS });
+  assert.deepEqual([r2.ok, r2.attempt], [true, 2]);
+  let cur = r2.state;
+  for (let i = 3; i <= TG_REMINDER_MAX_ATTEMPTS; i += 1) {
+    const r = tgReserveClaimReminderAttempt(cur, { generationId: gid, now: dueAt + i * TG_REMINDER_RETRY_MS });
+    assert.deepEqual([r.ok, r.attempt], [true, i]);
+    cur = r.state;
+  }
+  const exhausted = tgClaimReminderDue(cur, { now: dueAt + 4 * TG_REMINDER_RETRY_MS });
+  assert.deepEqual([exhausted.due, exhausted.reason, exhausted.attempts], [false, "attempts_exhausted", TG_REMINDER_MAX_ATTEMPTS]);
+  assert.equal(tgReserveClaimReminderAttempt(cur, { generationId: gid, now: dueAt + 4 * TG_REMINDER_RETRY_MS }).reason, "attempts_exhausted");
+  assert.equal(tgReserveClaimReminderAttempt(state, { generationId: "gen_other", now: dueAt }).reason, "pending_generation_mismatch");
+  assert.equal(tgReserveClaimReminderAttempt(state, { generationId: gid, now: dueAt - 1 }).reason, "not_yet", "预留在锁内重算判据");
+  // 放弃：本周期不再试，7 天后重来、计数清零
+  const abandonedAt = dueAt + 4 * TG_REMINDER_RETRY_MS;
+  const gaveUp = tgMarkPendingClaimReminderAbandoned(cur, { generationId: gid, now: abandonedAt });
+  assert.deepEqual([gaveUp.ok, gaveUp.changed], [true, true]);
+  assert.equal(pendingOf(gaveUp.state).claim_reminder_abandoned_at, new Date(abandonedAt).toISOString());
+  assert.equal(tgValidateState(gaveUp.state).ok, true);
+  assert.equal(tgClaimReminderDue(gaveUp.state, { now: abandonedAt + REPEAT - 1 }).reason, "abandoned_recently");
+  const afterAbandon = tgClaimReminderDue(gaveUp.state, { now: abandonedAt + REPEAT });
+  assert.deepEqual([afterAbandon.due, afterAbandon.attempts], [true, 0], "上个周期的 3 次不压住这个周期");
+  // 提醒成功后计数与放弃标记清零
+  const sent = tgMarkPendingClaimReminder(gaveUp.state, { generationId: gid, now: abandonedAt + REPEAT });
+  const g = pendingOf(sent.state);
+  assert.deepEqual([g.claim_reminder_attempts, g.claim_reminder_attempted_at, g.claim_reminder_abandoned_at], [null, null, null]);
+  assert.equal(tgValidateState(sent.state).ok, true);
+
+  // 形状：规范时间、封闭的尝试形状
   const bad = structuredClone(marked.state);
   pendingOf(bad).claim_reminder_at = "yesterday";
   assert.equal(tgValidateState(bad).ok, false, "非规范时间要被校验拦下");
   const sloppy = structuredClone(marked.state);
   pendingOf(sloppy).claim_reminder_at = "2026-08-28T00:00:00Z";
-  assert.deepEqual(tgValidateState(sloppy).problems, ["generations.claim_reminder_at"],
-    "Date.parse 能解析但不是规范写法 —— 评审探针抓到的那种，也要拦");
+  assert.deepEqual(tgValidateState(sloppy).problems, ["generations.claim_reminder_at"]);
+  const sloppyAbandon = structuredClone(state);
+  pendingOf(sloppyAbandon).claim_reminder_abandoned_at = "2026-08-28T00:00:00Z";
+  assert.deepEqual(tgValidateState(sloppyAbandon).problems, ["generations.claim_reminder_abandoned_at"]);
   const sloppyAttempt = structuredClone(state);
   pendingOf(sloppyAttempt).claim_reminder_attempted_at = "2026-08-28T00:00:00Z";
   pendingOf(sloppyAttempt).claim_reminder_attempts = -1;
   assert.deepEqual(tgValidateState(sloppyAttempt).problems.sort(),
     ["generations.claim_reminder_attempted_at", "generations.claim_reminder_attempts"]);
-  // 尝试状态是封闭形状：只有次数没有时间（绕过间隔）、只有时间没有次数（破坏上界）、次数为 0 —— 都不合法。
   const countOnly = structuredClone(state);
   pendingOf(countOnly).claim_reminder_attempts = 2;
   assert.deepEqual(tgValidateState(countOnly).problems, ["generations.claim_reminder_attempted_at"]);
   const timeOnly = structuredClone(state);
-  pendingOf(timeOnly).claim_reminder_attempted_at = new Date(deadline - TG_REMINDER_LEAD_MS).toISOString();
+  pendingOf(timeOnly).claim_reminder_attempted_at = new Date(dueAt).toISOString();
   assert.deepEqual(tgValidateState(timeOnly).problems, ["generations.claim_reminder_attempts"]);
   const zero = structuredClone(timeOnly);
   pendingOf(zero).claim_reminder_attempts = 0;
@@ -17356,45 +17434,8 @@ test("快过期提醒的判据只有一份：窗口外不提醒、进窗口提�
   pendingOf(bothNull).claim_reminder_attempts = null;
   pendingOf(bothNull).claim_reminder_attempted_at = null;
   assert.equal(tgValidateState(bothNull).ok, true);
-  assert.equal(tgReserveClaimReminderAttempt(countOnly, { generationId: gid, now: deadline - 1 }).reason,
+  assert.equal(tgReserveClaimReminderAttempt(countOnly, { generationId: gid, now: dueAt }).reason,
     "topic_generation_state_invalid", "预留在锁内校验形状，不让畸形状态绕过间隔");
-
-  // 暂停 / 退役的绑定不提醒 —— 跟出站同一条语义。
-  const paused = structuredClone(state);
-  paused.binding_status = "paused";
-  assert.equal(tgClaimReminderDue(paused, { now: deadline - 1 }).reason, "binding_not_active");
-
-  // 锁内预留：拿到一次尝试后，同一状态再算就是 retry_too_soon；间隔够了再拿；拿满就 attempts_exhausted。
-  const t0 = deadline - TG_REMINDER_LEAD_MS;
-  const r1 = tgReserveClaimReminderAttempt(state, { generationId: gid, now: t0 });
-  assert.deepEqual([r1.ok, r1.changed, r1.attempt], [true, true, 1]);
-  assert.equal(pendingOf(r1.state).claim_reminder_attempted_at, new Date(t0).toISOString());
-  assert.equal(tgValidateState(r1.state).ok, true);
-  assert.equal(pendingOf(state).claim_reminder_attempts, undefined, "预留是纯函数");
-  assert.equal(tgClaimReminderDue(r1.state, { now: t0 + TG_REMINDER_RETRY_MS - 1 }).reason, "retry_too_soon");
-  assert.equal(tgReserveClaimReminderAttempt(r1.state, { generationId: gid, now: t0 + TG_REMINDER_RETRY_MS - 1 }).reason, "retry_too_soon");
-  const r2 = tgReserveClaimReminderAttempt(r1.state, { generationId: gid, now: t0 + TG_REMINDER_RETRY_MS });
-  assert.deepEqual([r2.ok, r2.attempt], [true, 2]);
-  let cur = r2.state;
-  for (let i = 3; i <= TG_REMINDER_MAX_ATTEMPTS; i += 1) {
-    const r = tgReserveClaimReminderAttempt(cur, { generationId: gid, now: t0 + i * TG_REMINDER_RETRY_MS });
-    assert.deepEqual([r.ok, r.attempt], [true, i]);
-    cur = r.state;
-  }
-  const exhausted = tgClaimReminderDue(cur, { now: deadline - 1 });
-  assert.deepEqual([exhausted.due, exhausted.reason, exhausted.attempts], [false, "attempts_exhausted", TG_REMINDER_MAX_ATTEMPTS]);
-  assert.equal(tgReserveClaimReminderAttempt(cur, { generationId: gid, now: deadline - 1 }).reason, "attempts_exhausted");
-  assert.equal(tgReserveClaimReminderAttempt(state, { generationId: "gen_other", now: t0 }).reason, "pending_generation_mismatch");
-  assert.equal(tgReserveClaimReminderAttempt(state, { generationId: gid, now: t0 - 1 }).reason, "not_yet", "预留在锁内重算判据");
-  // 发成功后记下，之后 attempts 再多也不影响"不再提醒"
-  const sent = tgMarkPendingClaimReminder(r1.state, { generationId: gid, now: t0 + 1 });
-  assert.equal(tgClaimReminderDue(sent.state, { now: t0 + TG_REMINDER_RETRY_MS }).reason, "already_reminded");
-  const noDeadline = structuredClone(state);
-  pendingOf(noDeadline).claim_expires_at = null;
-  assert.equal(tgClaimReminderDue(noDeadline, { now: deadline - 1 }).reason, "no_deadline");
-  const none = structuredClone(state);
-  none.generations = none.generations.filter((g) => g.status !== "pending");
-  assert.equal(tgClaimReminderDue(none, { now: deadline - 1 }).reason, "no_pending");
 });
 
 test("Claude 扫描：进窗口的待认领话题只提醒一次、发在那个话题下、先发后记；发失败不记、下轮再发；dry-run 只说不发", () => {
@@ -17404,7 +17445,7 @@ test("Claude 扫描：进窗口的待认领话题只提醒一次、发在那个�
   const sweep = (f, over) => remindClaudePendingClaims({
     registryFile: f.registryFile, templateFile: f.templateFile, publish, ...over,
   });
-  const early = sweep(fx, { now: fx.deadline - TG_REMINDER_LEAD_MS - 1 });
+  const early = sweep(fx, { now: fx.dueAt - 1 });
   assert.equal(early.ok, true);
   assert.deepEqual([early.reminded, early.problems, calls.length], [[], [], 0]);
   assert.deepEqual(early.skipped, [{ name: fx.name, reason: "not_yet" }]);
@@ -17420,20 +17461,26 @@ test("Claude 扫描：进窗口的待认领话题只提醒一次、发在那个�
   assert.equal(calls[0].expectedAppId, TPL.outbound_app_id);
   assert.equal(calls[0].larkBin, TPL.lark_cli_bin);
   assert.match(calls[0].text, /第 2 代/u);
-  assert.match(calls[0].text, /还剩约 11 小时/u);
+  assert.match(calls[0].text, /已等待约 3 天，无人认领。它不会过期/u);
   assert.match(calls[0].text, /@/u, "要说清怎么认领");
-  assert.match(calls[0].text, /最多重试 3 次/u);
+  assert.match(calls[0].text, /不想要这个新话题：\/feishu-rotate cancel/u, "要说清怎么取消");
+  assert.match(calls[0].text, /每 7 天提醒一次；发送失败时最多重试 3 次/u);
   assert.ok(!calls[0].text.includes("om_new") && !calls[0].text.includes("om_old"), "提醒正文不带 locator");
   assert.equal(fx.pendingOf(fx.readState()).claim_reminder_at, new Date(now).toISOString(), "发完要记进代际状态");
-  assert.equal(fx.pendingOf(fx.readState()).claim_reminder_attempts, 1, "尝试在发之前就预留并持久化");
+  assert.equal(fx.pendingOf(fx.readState()).claim_reminder_attempts, null, "提醒成功 = 本周期结束，尝试计数清零");
+  assert.equal(fx.pendingOf(fx.readState()).claim_reminder_attempted_at, null);
   assert.match(describeReminderSweep(first, { chain: "Claude" }), /^Claude 待认领提醒：已提醒 提醒演示 第 2 代$/u);
 
   const second = sweep(fx, { now: now + 30 * 60000 });
   assert.deepEqual([second.reminded, second.problems, calls.length], [[], [], 1], "只提醒一次");
-  assert.deepEqual(second.skipped, [{ name: fx.name, reason: "already_reminded" }]);
-  const late = sweep(fx, { now: fx.deadline });
+  assert.deepEqual(second.skipped, [{ name: fx.name, reason: "reminded_recently" }]);
+  const late = sweep(fx, { now: now + 6 * 24 * H_MS });
   assert.deepEqual([late.reminded, late.problems, calls.length], [[], [], 1]);
-  assert.ok(["expired", "no_pending"].includes(late.skipped[0]?.reason), JSON.stringify(late.skipped));
+  assert.deepEqual(late.skipped, [{ name: fx.name, reason: "reminded_recently" }], "7 天内不再提醒");
+  const weekLater = sweep(fx, { now: now + TG_REMINDER_REPEAT_MS });
+  assert.deepEqual([weekLater.reminded, calls.length], [[{ name: fx.name, generation: 2, attempt: 1, recorded: true }], 2], "7 天后再提醒一次");
+  assert.match(calls[1].text, /已等待约 10 天/u);
+  assert.equal(fx.pendingOf(fx.readState()).claim_reminder_at, new Date(now + TG_REMINDER_REPEAT_MS).toISOString());
 
   const fx2 = claimReminderFixture();
   const failed = sweep(fx2, { now, publish: () => { throw new Error("lark down"); } });
@@ -17450,20 +17497,28 @@ test("Claude 扫描：进窗口的待认领话题只提醒一次、发在那个�
   assert.deepEqual(tooSoon.skipped, [{ name: fx2.name, reason: "retry_too_soon" }], "间隔没到不重试");
   const retry = sweep(fx2, { now: now + 30 * 60000 });
   assert.deepEqual(retry.reminded, [{ name: fx2.name, generation: 2, attempt: 2, recorded: true }], "上轮没发出去，这轮再发");
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
 
   // 连续失败到上限：放弃并报出来，之后不再发
   const fx4 = claimReminderFixture();
   const boom = () => { throw new Error("still down"); };
   for (let i = 1; i <= TG_REMINDER_MAX_ATTEMPTS; i += 1) {
     const r = sweep(fx4, { now: now + i * TG_REMINDER_RETRY_MS, publish: boom });
-    assert.equal(r.problems[0]?.reason, "publish_failed", "第 " + i + " 次");
+    const last = i === TG_REMINDER_MAX_ATTEMPTS;
+    assert.equal(r.problems[0]?.reason, last ? "reminder_abandoned" : "publish_failed", "第 " + i + " 次");
     assert.match(r.problems[0].error, new RegExp("第 " + i + "\\/" + TG_REMINDER_MAX_ATTEMPTS + " 次"));
+    if (last) {
+      assert.match(r.problems[0].error, /本周期放弃，下个周期再试$/u, "放弃要记上（没记上会带括号说明）");
+      assert.equal(fx4.pendingOf(fx4.readState()).claim_reminder_abandoned_at, new Date(now + i * TG_REMINDER_RETRY_MS).toISOString());
+    }
   }
-  const gaveUp = sweep(fx4, { now: now + (TG_REMINDER_MAX_ATTEMPTS + 1) * TG_REMINDER_RETRY_MS });
-  assert.deepEqual([gaveUp.reminded, calls.length], [[], 2], "放弃后不再发");
-  assert.equal(gaveUp.problems[0]?.reason, "reminder_abandoned");
-  assert.match(describeReminderSweep(gaveUp, { chain: "Claude" }), /reminder_abandoned：发送失败 3 次，已放弃/u);
+  const abandonedAt = now + TG_REMINDER_MAX_ATTEMPTS * TG_REMINDER_RETRY_MS;
+  const gaveUp = sweep(fx4, { now: abandonedAt + TG_REMINDER_RETRY_MS });
+  assert.deepEqual([gaveUp.reminded, gaveUp.problems, calls.length], [[], [], 3], "放弃后本周期不再发、也不再报");
+  assert.deepEqual(gaveUp.skipped, [{ name: fx4.name, reason: "abandoned_recently" }]);
+  assert.equal(describeReminderSweep(gaveUp, { chain: "Claude" }), null);
+  const nextCycle = sweep(fx4, { now: abandonedAt + TG_REMINDER_REPEAT_MS });
+  assert.deepEqual([nextCycle.reminded, calls.length], [[{ name: fx4.name, generation: 2, attempt: 1, recorded: true }], 4], "下个周期重来，计数从 1 起");
 
   // 并发：第二个扫描器在"预留之后、记之前"进来 —— 用发布回调里的嵌套扫描模拟。预留已持久化，它拿不到这次尝试。
   const fx5 = claimReminderFixture();
@@ -17476,24 +17531,28 @@ test("Claude 扫描：进窗口的待认领话题只提醒一次、发在那个�
   assert.deepEqual([outer.reminded.length, outer.problems], [1, []]);
   assert.deepEqual([nested.reminded, nested.problems], [[], []], "并发的第二个扫描器不许再发");
   assert.deepEqual(nested.skipped, [{ name: fx5.name, reason: "retry_too_soon" }]);
-  assert.equal(calls.length, 3, "总共只发了一条（外层那条）");
+  assert.equal(calls.length, 5, "总共只多发了一条（外层那条）");
   assert.equal(fx5.pendingOf(fx5.readState()).claim_reminder_at, new Date(now).toISOString());
 
   // 暂停的绑定不提醒（跟出站同一条语义）
   const fx6 = claimReminderFixture();
   assert.equal(setClaudeTopicBindingStatus({ root: fx6.root, status: "paused", registryFile: fx6.registryFile, now }).ok, true);
   const pausedSweep = sweep(fx6, { now });
-  assert.deepEqual([pausedSweep.reminded, pausedSweep.problems, calls.length], [[], [], 3]);
+  assert.deepEqual([pausedSweep.reminded, pausedSweep.problems, calls.length], [[], [], 5]);
   assert.deepEqual(pausedSweep.skipped, [{ name: fx6.name, reason: "binding_not_active" }]);
 
   const fx3 = claimReminderFixture();
   const dry = sweep(fx3, { now, dryRun: true });
   assert.deepEqual(dry.reminded, [{ name: fx3.name, generation: 2, dryRun: true }]);
-  assert.equal(calls.length, 3, "dry-run 不发");
+  assert.equal(calls.length, 5, "dry-run 不发");
   assert.equal(fx3.pendingOf(fx3.readState()).claim_reminder_at, undefined, "dry-run 不记");
   assert.match(describeReminderSweep(dry, { chain: "Claude" }), /\[dry-run\] 将提醒 提醒演示 第 2 代/u);
-  const expired = sweep(fx3, { now: fx3.deadline });
-  assert.deepEqual([expired.reminded, calls.length], [[], 3], "过期了就不提醒");
+  // 旧登记带显式截止且已过：不提醒
+  const reg3 = JSON.parse(fs.readFileSync(fx3.registryFile, "utf-8"));
+  reg3.projects[0].topic_generation_state.generations.find((g) => g.root_message_id === "om_new").claim_expires_at = new Date(now - 1).toISOString();
+  fs.writeFileSync(fx3.registryFile, JSON.stringify(reg3, null, 2));
+  const expired = sweep(fx3, { now });
+  assert.deepEqual([expired.reminded, calls.length], [[], 5], "显式截止已过就不提醒");
   assert.ok(["expired", "no_pending"].includes(expired.skipped[0]?.reason), JSON.stringify(expired.skipped));
 
   // 登记表不存在 = 空表（没接过桥），不算读不了；读不了是"有文件但坏了"。
@@ -17501,7 +17560,7 @@ test("Claude 扫描：进窗口的待认领话题只提醒一次、发在那个�
   fs.writeFileSync(corrupt, "{not json");
   const unreadable = remindClaudePendingClaims({ registryFile: corrupt, publish, now });
   assert.equal(unreadable.ok, false, JSON.stringify(unreadable));
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 5);
   assert.match(describeReminderSweep(unreadable, { chain: "Claude" }), /登记表读不了/u);
 });
 
@@ -17533,7 +17592,7 @@ test("单代际流程：预留阶段只有受控原因算跳过，登记表 / �
   let identityCalls = 0;
   const dry = run({ dryRun: true, identity: () => { identityCalls += 1; return identity; } });
   assert.deepEqual([dry.outcome, dry.entry.dryRun, identityCalls], ["reminded", true, 0], "dry-run 不解析身份");
-  const early = remindOnePendingClaim({ name: "n", state, now: fx.deadline - TG_REMINDER_LEAD_MS - 1, dryRun: false,
+  const early = remindOnePendingClaim({ name: "n", state, now: fx.dueAt - 1, dryRun: false,
     identity: () => { identityCalls += 1; return identity; }, publish: () => {}, reserve: () => ({ ok: true }), mark: () => ({ ok: true }) });
   assert.deepEqual([early.outcome, identityCalls], ["skipped", 0], "不到窗口不解析身份");
 });
@@ -17632,13 +17691,55 @@ test("两个真实 OS 进程同时扫描同一个待认领话题：只发一条�
 });
 
 test("兜底真入口 drain-outbox --all 会跑待认领提醒扫描（dry-run 只说不发不记）", () => {
-  const base = Date.now() - (TG_PENDING_MS - 11 * H_MS) - 3; // 截止 ≈ 现在 + 11 小时
+  const base = Date.now() - TG_REMINDER_AFTER_MS - H_MS - 3; // 已等 73 小时：该提醒了
   const fx = claimReminderFixture({ base });
   const r = spawnSync(process.execPath, [path.resolve("scripts", "drain-outbox.mjs"), "--all", "--dry-run"], {
     encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_REGISTRY: fx.registryFile },
   });
   assert.match(r.stdout, /Claude 待认领提醒：\[dry-run\] 将提醒 提醒演示 第 2 代/u, r.stdout + r.stderr);
   assert.equal(fx.pendingOf(fx.readState()).claim_reminder_at, undefined, "dry-run 不许记");
+});
+
+// ─── 第 1 层：待认领不过期的展示与订阅投影 ───────────────────────────────────────────
+test("状态页：待认领代际不设期限时说'已等待多久'（算出来的），写了显式截止的旧记录仍说截止", () => {
+  const now = Date.parse("2026-09-01T12:00:00.000Z");
+  const base = {
+    ok: true, displayName: "演示", suspended: false, level: "project", claudeSessionId: null,
+    activeGeneration: 7, readOnlyGenerations: 5, inboundBound: true, expiresAt: null, pending: 0,
+  };
+  const noDeadline = describeStatus({ ...base, pendingGeneration: 8, pendingGenerationExpiresAt: null,
+    pendingGenerationCreatedAt: new Date(now - 5 * 24 * 3600000).toISOString() }, [], { now });
+  assert.match(noDeadline, /待认领\s+第 8 代（不设期限，已等待约 5 天）/u);
+  assert.doesNotMatch(noDeadline, /截止/u);
+  assert.equal(describePendingWindow({ pendingGenerationExpiresAt: null, pendingGenerationCreatedAt: new Date(now - 90 * 60000).toISOString() }, { now }),
+    "（不设期限，已等待约 2 小时）", "不足两天说小时");
+  assert.equal(describePendingWindow({ pendingGenerationExpiresAt: null, pendingGenerationCreatedAt: null }, { now }), "（不设期限）", "说不清等了多久就只说不设期限");
+  assert.equal(describePendingWindow({ pendingGenerationExpiresAt: "2026-09-03T00:00:00.000Z" }, { now }), "（截止 2026-09-03）");
+  assert.equal(describePendingWindow({ pendingGenerationExpiresAt: "2026-09-03T00:00:00.000Z" }, { now, full: true }), "（截止 2026-09-03T00:00:00.000Z）");
+  assert.equal(describeWaited(3 * 3600000), "约 3 小时");
+  assert.equal(describeWaited(47 * 3600000), "约 47 小时");
+  assert.equal(describeWaited(48 * 3600000), "约 2 天");
+  assert.equal(describeWaited(10 * 24 * 3600000), "约 10 天");
+});
+
+test("订阅投影：没有显式截止的待绑定 claim_expires_at_ms 为 null，永远可认领；显式截止仍生效", () => {
+  const runtimeNamespace = "claude";
+  const endpointId = legacyEndpointId({ runtime: runtimeNamespace, agentUid: "agent_m5claude" });
+  const template = { agent_uid: "agent_m5claude", transport_open_id: "ou_bot", frank_sender_id: "u_frank", chat_id: "oc_x", default_freshness_ms: 600000 };
+  const record = (over) => ({
+    legacy_key: "k", domain_key: "/p", local_target_id: stableControlId("target", runtimeNamespace, "k"),
+    status: "active", inbound_state: "pending", session_id: null, pending_token: "abc123",
+    bound_at: new Date(NOW - 400 * 24 * 3600000).toISOString(), ...over,
+  });
+  const model = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records: [record({ pending_expires_at: null })] });
+  assert.equal(model.ok, true, JSON.stringify(model.problems));
+  assert.equal(model.pending_bindings[0].claim_expires_at_ms, null);
+  assert.equal(claimable(model.pending_bindings[0], NOW + 1000 * 24 * 3600000), true, "400 天前接的，1000 天后仍可认领");
+  const explicit = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records: [record({ pending_expires_at: new Date(NOW - 1).toISOString() })] });
+  assert.equal(explicit.pending_bindings[0].claim_expires_at_ms, NOW - 1);
+  assert.equal(claimable(explicit.pending_bindings[0], NOW), false);
+  const bad = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records: [record({})], pendingWindowMs: -1 });
+  assert.equal(bad.ok, false, "给了窗口就必须是正数");
 });
 
 summarySealed = true;

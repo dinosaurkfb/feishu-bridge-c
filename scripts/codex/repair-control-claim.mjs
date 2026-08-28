@@ -5,7 +5,7 @@
 
 import { isDirectRun } from "../direct-run.mjs";
 import { describeControlRepair, parseRepairControlArgs, repairExitCode } from "../repair-control-claim.mjs";
-import { inspectControlClaim, resumeControlClaim } from "../control-command.mjs";
+import { RESUMABLE_CONTROL_STATES, inspectControlClaim, resumeControlClaim } from "../control-command.mjs";
 import { readClaimState } from "../claim.mjs";
 import { bridgeHome, findRegisteredTaskForCodexThread, setTaskInteractionMode, taskPaths } from "./state.mjs";
 
@@ -19,7 +19,7 @@ if (isDirectRun(import.meta.url)) {
   const expect = { logicalTaskKey: found.task.logical_task_key, codexThreadId: parsed.root };
   const seen = inspectControlClaim({ claimsDir, key: parsed.key, expect });
   let result = null;
-  if (parsed.apply && ["in_flight", "consumed_unreadable", "failed_unreadable"].includes(seen.state)) {
+  if (parsed.apply && RESUMABLE_CONTROL_STATES.includes(seen.state)) {
     result = resumeControlClaim({ claimsDir, key: parsed.key, expect,
       execute: (mode) => setTaskInteractionMode({ threadId: parsed.root, mode, home,
         precondition: () => readClaimState({ claimsDir, key: parsed.key, expect }).status === "valid" }) });

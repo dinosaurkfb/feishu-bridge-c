@@ -7,7 +7,7 @@
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
 import { CLAIM_KEY_SHAPE, readClaimState } from "./claim.mjs";
-import { inspectControlClaim, resumeControlClaim } from "./control-command.mjs";
+import { RESUMABLE_CONTROL_STATES, inspectControlClaim, resumeControlClaim } from "./control-command.mjs";
 import { setClaudeInteractionMode } from "./interaction-policy-store.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { effectiveBindingId } from "./topic-generation.mjs";
@@ -41,7 +41,7 @@ export function describeControlRepair({ seen, result, apply }) {
     failed: "已记为失败（当时没切成），不恢复", conflict: "failed 与 consumed 并存，请人工查看", not_control: "这张 claim 不是控制命令",
     claim_unreadable: "claim 不属于当前绑定 / 读不出：" + (seen.why ?? ""), claim_absent: "没有这张 claim" }[seen.state]
     ?? ("说不清：" + seen.state + (seen.why ? "：" + seen.why : ""));
-  const resumable = ["in_flight", "consumed_unreadable", "failed_unreadable"].includes(seen.state);
+  const resumable = RESUMABLE_CONTROL_STATES.includes(seen.state);
   return (apply ? "" : "[预览] ") + head + (seen.residue?.length ? "；另有 " + seen.residue.length + " 个临时残骸" : "") +
     (resumable && !apply ? "\n加 --apply 续做。" : "");
 }
@@ -70,7 +70,7 @@ if (isDirectRun(import.meta.url)) {
   const expect = expectation.expect;
   const seen = inspectControlClaim({ claimsDir, key: parsed.key, expect });
   let result = null;
-  if (parsed.apply && ["in_flight", "consumed_unreadable", "failed_unreadable"].includes(seen.state)) {
+  if (parsed.apply && RESUMABLE_CONTROL_STATES.includes(seen.state)) {
     result = resumeControlClaim({ claimsDir, key: parsed.key, expect,
       execute: (mode) => setClaudeInteractionMode({ root, claudeSessionId: expect.claudeSessionId, mode,
         // 写锁内复核：这张 claim 此刻仍属于当前绑定，检查与写入之间不留漂移窗口。

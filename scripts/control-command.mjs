@@ -176,12 +176,13 @@ export function inspectControlClaim({ claimsDir, key, expect = {} }) {
   return { state: "in_flight", intent, residue: consumedResidue({ claimsDir, key }) };
 }
 
-const RESUMABLE = new Set(["in_flight", "consumed_unreadable", "failed_unreadable"]);
+/** 维护入口允许续做的状态 —— 唯一一份，两条链的 CLI 都引用它。 */
+export const RESUMABLE_CONTROL_STATES = Object.freeze(["in_flight", "consumed_unreadable", "failed_unreadable"]);
 /** 维护入口的恢复动作：只对可恢复态续做；execute 由链各自注入（应带写锁内的身份前置条件）。 */
 export function resumeControlClaim({ claimsDir, key, execute, expect = {} }) {
   const seen = inspectControlClaim({ claimsDir, key, expect });
   if (seen.state === "consumed") return { ok: true, already: true, changed: seen.record.changed, intent: seen.intent, residueUncleared: seen.residue ?? [] };
-  if (!RESUMABLE.has(seen.state)) return { ok: false, reason: seen.state, why: seen.why ?? null };
+  if (!RESUMABLE_CONTROL_STATES.includes(seen.state)) return { ok: false, reason: seen.state, why: seen.why ?? null };
   const tx = runControlTransaction({ claimsDir, key, intent: seen.intent, execute, replay: true });
   return tx.ok
     ? { ok: true, already: false, changed: tx.changed, intent: seen.intent, residueUncleared: tx.residueUncleared ?? [] }

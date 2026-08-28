@@ -7,7 +7,7 @@
  * v2：标识符全部换到 Aily 命名空间（见 selector.mjs 顶部说明）。
  */
 
-import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord } from "./control-command.mjs";
+import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim } from "./control-command.mjs";
 import { describePendingWindow } from "./layered-status.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -18408,6 +18408,22 @@ test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进
     meta: { policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, origin_channel_generation_id: "channel_generation_000000000000000000000000",
       control: { control: "mode", mode: MAPPING_POLICY_ID, extra: 1 } } });
   assert.equal(readClaimState({ claimsDir, key: extraIntentClaim.key }).why, "control 字段集不对");
+  // 维护恢复只对三种可续做态动手：受验 failed / conflict / mismatch / not_control 都不执行
+  const failedKey = acquireClaim({ claimsDir, messageId: "msg_failed", logicalTaskKey: "t",
+    meta: { policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, origin_channel_generation_id: "channel_generation_000000000000000000000000",
+      control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).key;
+  recordClaimState({ claimsDir, key: failedKey, state: "failed", detail: { reason: "control_failed", control: "mode", error: "x" } });
+  let executed = 0;
+  const execute = () => { executed += 1; return { ok: true, changed: true }; };
+  assert.deepEqual(resumeControlClaim({ claimsDir, key: failedKey, execute }), { ok: false, reason: "failed", why: null });
+  recordClaimState({ claimsDir, key: failedKey, state: "consumed", detail: { control: "mode", mode: DIALOGUE_POLICY_ID, changed: true } });
+  assert.equal(resumeControlClaim({ claimsDir, key: failedKey, execute }).reason, "conflict");
+  fs.rmSync(path.join(claimsDir, failedKey + ".failed.json"));
+  fs.writeFileSync(path.join(claimsDir, failedKey + ".consumed.json"), JSON.stringify({ ...JSON.parse(fs.readFileSync(path.join(claimsDir, failedKey + ".consumed.json"), "utf-8")), mode: MAPPING_POLICY_ID }));
+  assert.equal(resumeControlClaim({ claimsDir, key: failedKey, execute }).reason, "mismatch");
+  assert.equal(executed, 0, "以上三态都不许执行");
+  assert.deepEqual([...RESUMABLE_CONTROL_STATES].sort(), ["consumed_unreadable", "failed_unreadable", "in_flight"]);
+  assert.ok(Object.isFrozen(RESUMABLE_CONTROL_STATES));
   assert.equal(controlIntentProblem({ control: "mode", mode: MAPPING_POLICY_ID }), null);
   assert.equal(controlIntentProblem(undefined), null, "不在场 = 不是控制命令");
   for (const badIntent of [null, [], { control: "mode" }, { control: "rotate", mode: "mapping" }, { control: "mode", mode: "turbo" }, { control: "mode", mode: "mapping", extra: 1 }]) {

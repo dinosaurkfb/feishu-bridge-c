@@ -95,7 +95,9 @@ import {
   setTaskDisplayName, setTaskInteractionMode, shadowCodexFirstClaim, taskPaths, topicStateForTask,
   validateCodexTemplate, validateRegistryTasks, writeRegistryFixtureUnvalidated,
 } from "./state.mjs";
-import { ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, activeGeneration, pendingGeneration } from "../topic-generation.mjs";
+import {
+  ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, TOPIC_GENERATION_PENDING_MS, activeGeneration, pendingGeneration,
+} from "../topic-generation.mjs";
 import { applyRuntimeSync, planRuntimeSync } from "../runtime-install.mjs";
 import { DIALOGUE_TURN_STATUS } from "../interaction-policy.mjs";
 import {
@@ -992,6 +994,13 @@ test("active 但首次 mention 已过期的 task 可只刷新原话题握手窗�
   assert.equal(refreshed.task.inbound_state, "pending");
   assert.equal(refreshed.task.session_id ?? null, null);
   assert.equal(findPendingTask({ home, now }).ok, true);
+  // 首次绑定的待认领窗口跟代际的是同一份定义（2026-08-28 起 72 小时）：24 小时后仍在窗口内，72 小时到点过期。
+  const H = 3600000;
+  assert.equal(findPendingTask({ home, now: Date.parse(task.bound_at) + 48 * H }).ok, true,
+    "没有 pending_expires_at 的旧 task 按 bound_at + 窗口算，48 小时时还没过期");
+  assert.equal(refreshed.task.pending_expires_at, new Date(now + TOPIC_GENERATION_PENDING_MS).toISOString());
+  assert.equal(findPendingTask({ home, now: now + 24 * H + 1 }).ok, true, "24 小时时还在窗口内 —— 窗口已放长");
+  assert.equal(findPendingTask({ home, now: now + 72 * H }).reason, "pending_binding_expired");
 });
 
 test("Codex adapter 轮转期间旧 session 继续路由，认领后新旧代际原子切换", () => {

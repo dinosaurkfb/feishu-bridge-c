@@ -369,7 +369,36 @@ function runChannelContext({ root, dryRun }) {
  *          unresolved —— 项目 / 配置解析不出来（reason）
  *   inventoryOk false 时 runs.problems 里就是 runs_unreadable / runs_not_a_directory 那一条。
  */
+/**
+ * 未路由回复（Stop 说不清该回哪个话题、零入队时留下的记录）的只读盘点 —— 状态页第五区与 doctor 都从这里读。
+ * 目录不存在 = 0 条；读不出来明说，不折叠成 0。
+ */
+export function inventoryUnroutedReplies({ root } = {}) {
+  const dir = path.join(root, ".runtime-data", "outbound", "unrouted-replies");
+  let names;
+  try { names = fs.readdirSync(dir).filter((n) => n.endsWith(".json")).sort(); }
+  catch (err) {
+    if (err.code === "ENOENT") return { ok: true, count: 0, entries: [], dir };
+    return { ok: false, reason: "unrouted_unreadable", error: String(err.code ?? err.message), count: 0, entries: [], dir };
+  }
+  const entries = [];
+  const problems = [];
+  for (const n of names) {
+    try {
+      const doc = JSON.parse(fs.readFileSync(path.join(dir, n), "utf-8"));
+      if (doc?.artifact_type !== "feishu_bridge_unrouted_reply" || typeof doc.reason !== "string") { problems.push(n); continue; }
+      entries.push({ file: n, reason: doc.reason, why: doc.why ?? null, recordedAt: doc.recorded_at ?? null });
+    } catch { problems.push(n); }
+  }
+  return { ok: true, count: entries.length, entries, unrecognized: problems, dir };
+}
+
 export function inspectRunChannel({ root, claudeSessionId } = {}) {
+  const rc = inspectRunChannelCore({ root, claudeSessionId });
+  return { ...rc, unrouted: inventoryUnroutedReplies({ root }) };
+}
+
+function inspectRunChannelCore({ root, claudeSessionId } = {}) {
   const ctx = runChannelContext({ root, dryRun: true });
   const oldestOf = (keys) => {
     const times = ctx.pendingRuns.filter((r) => keys.has(r.key)).map((r) => r.modifiedAt).filter(Number.isFinite);

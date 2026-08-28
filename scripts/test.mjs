@@ -69,8 +69,7 @@ import {
 import { parseRunOutcome } from "./handoff.mjs";
 import { repairRunClaims } from "./repair-run-claim.mjs";
 import {
-  describeDrainOutcome, drainProject, inspectRunChannel, outboxDirOf, suppressCmd, watcherActive,
-} from "./drain-outbox.mjs";
+  describeDrainOutcome, drainProject, inspectRunChannel, outboxDirOf, suppressCmd, watcherActive, inventoryUnroutedReplies } from "./drain-outbox.mjs";
 import { CANDIDATE_POLICIES, publishOutboxAttempt } from "./publish-attempt.mjs";
 import { PUBLISH_SCENARIOS, matrixRowsFor } from "./test-support/publish-matrix.mjs";
 import {
@@ -4703,8 +4702,8 @@ test("Claude UserPromptSubmit 与 Stop 配对本地输入；飞书来源戳的�
   assert.equal(replies.length, 2, "飞书回合反查不到 claim：不知道该回哪个话题，零入队（当前代际不是安全回落值）");
   const unrouted = path.join(project, ".runtime-data", "outbound", "unrouted-replies");
   const diags = fs.readdirSync(unrouted).map((n) => JSON.parse(fs.readFileSync(path.join(unrouted, n), "utf-8")));
-  // 两份诊断：上面那次同一回合的 Stop 重入（记录已消费）+ 这次反查不到 claim。完整答复留在记录里，不是预览。
-  assert.deepEqual(diags.map((d) => d.reason).sort(), ["claim_absent", "turn_record_consumed"]);
+  // 只有这一份诊断：同一回合的 Stop 重入是正常幂等，不算"未路由"。完整答复留在记录里，不是预览。
+  assert.deepEqual(diags.map((d) => d.reason), ["claim_absent"]);
   const absent = diags.find((d) => d.reason === "claim_absent");
   assert.deepEqual([absent.message_id, absent.reply_text, absent.artifact_type], ["msg_inbound", "飞书指令已经完成", "feishu_bridge_unrouted_reply"]);
 });
@@ -17903,7 +17902,9 @@ test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结�
   }
 
   // 上一轮记录不能活到这一轮：老话题回合留下的飞书记录被 Stop 消费；登记表暂时坏了时本地 prompt 仍要覆写它
-  assert.equal(prompt("[飞书 · msg_old_topic · 2026-08-28 10:09Z]\n再来一次老话题指令").status, 0);
+  // 新的一条老话题消息 = 新 claim = 新回合（同一 claim 再来算重入，不入队）
+  assert.equal(mkClaim("msg_old_topic_2", {}).ok, true);
+  assert.equal(prompt("[飞书 · msg_old_topic_2 · 2026-08-28 10:09Z]\n再来一次老话题指令").status, 0);
   assert.equal(stop("老话题第二次回复").status, 0);
   assert.equal(targetOf("老话题第二次回复"), fx.oldGen.channel_generation_id);
   const before = replies().length;
@@ -17920,10 +17921,47 @@ test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结�
   assert.equal(stop("登记表恢复后的本地回复").status, 0);
   assert.equal(replies().length, before + 1);
   assert.equal(targetOf("登记表恢复后的本地回复"), fx.newGen.channel_generation_id, "本地回复发当前代际，不是老话题");
-  // 同一回合 Stop 重入：记录已消费 → 零入队
+  // 同一回合 Stop 重入：记录已消费 → 零入队，且不算"未路由"（不写诊断）
+  const diagCount = diags().length;
   assert.equal(stop("登记表恢复后的本地回复").status, 0);
   assert.equal(replies().length, before + 1);
-  assert.equal(diags().at(-1).reason, "turn_record_consumed");
+  assert.equal(diags().length, diagCount, "正常重入不写未路由记录");
+
+  // 两条**不同**的飞书回合、回复正文相同：事件键是 claim key，不是正文指纹 —— 两条都要入队、各回各的话题
+  const mkOk = (messageId, origin) => acquireClaim({ claimsDir, messageId, logicalTaskKey: mapping.logical_task_key,
+    meta: { session_id: "session_old", binding_id: effectiveBindingId(mapping, { root: fx.root }), claude_session_id: null,
+      policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, local_target_id: "local_target_x", origin_channel_generation_id: origin } });
+  assert.equal(mkOk("msg_same_text_old", fx.oldGen.channel_generation_id).ok, true);
+  assert.equal(mkOk("msg_same_text_new", fx.newGen.channel_generation_id).ok, true);
+  const beforeSame = replies().length;
+  assert.equal(prompt("[飞书 · msg_same_text_old · 2026-08-28 10:11Z]\n老话题问").status, 0);
+  assert.equal(stop("一模一样的回复").status, 0);
+  assert.equal(prompt("[飞书 · msg_same_text_new · 2026-08-28 10:12Z]\n新话题问").status, 0);
+  assert.equal(stop("一模一样的回复").status, 0);
+  const same = replies().filter((r) => r.text === "一模一样的回复");
+  assert.equal(same.length, 2, "正文相同但回合不同：两条都要入队");
+  assert.equal(replies().length, beforeSame + 2);
+  assert.deepEqual(same.map((r) => r.target_channel_generation_id).sort(), [fx.oldGen.channel_generation_id, fx.newGen.channel_generation_id].sort());
+  assert.ok(same.every((r) => typeof r.event_key === "string" && r.event_key.includes(":claim:")), JSON.stringify(same.map((r) => r.event_key)));
+
+  // 未路由记录有人读：状态页第五区与 doctor 都从同一份盘点拿
+  const inv = inventoryUnroutedReplies({ root: fx.root });
+  assert.equal(inv.ok, true);
+  assert.equal(inv.count, diags().length);
+  const rows = runChannelRows(inspectRunChannel({ root: fx.root, claudeSessionId: null }));
+  const urRow = rows.find((r) => r[0] === "未路由回复");
+  assert.ok(urRow && urRow[1].startsWith(inv.count + " 条（需要人看"), JSON.stringify(rows));
+
+  // 全新项目的第一个本地回合遇到登记表坏：没有任何可写的记录位置 → 也不放行（否则这一轮留不下自己的记录）
+  const freshLocal = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-fresh-"));
+  const freshProject = path.join(freshLocal, "project");
+  fs.mkdirSync(freshProject);
+  const badRegistry = path.join(freshLocal, "registry.json");
+  fs.writeFileSync(badRegistry, "{not json");
+  const freshPrompt = spawnSync(process.execPath, [initHook], { input: JSON.stringify({ session_id: "fresh-session", cwd: freshProject, prompt: "全新项目第一句" }),
+    encoding: "utf-8", env: { ...env, FEISHU_BRIDGE_REGISTRY: badRegistry, HOME: freshLocal } });
+  assert.equal(freshPrompt.status, 2, freshPrompt.stderr);
+  assert.match(freshPrompt.stderr, /registry_unreadable 且没有可写的记录位置/u);
 
   // 来源记不上就不让这一轮跑：把记录目录换成文件，飞书 prompt → 退出码 2；本地 prompt 也清不掉上一轮 → 退出码 2
   const inputDir = claudeTurnInputDir(fx.root, null);

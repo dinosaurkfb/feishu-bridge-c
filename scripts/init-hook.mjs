@@ -116,9 +116,15 @@ async function main() {
     }
     // 登记表读不出 / 绑定解析不了 / 项目不在登记表里：仍要把上一轮遗留的记录换成这一轮的（或清掉），
     // 否则 Stop 会拿着旧的飞书来源把本地回复发回老话题（评审探针）。
-    for (const dir of findTurnRecordDirsUpward({ cwd, key: speakingSession })) {
+    const upward = findTurnRecordDirsUpward({ cwd, key: speakingSession });
+    for (const dir of upward) {
       if (covered.includes(dir)) continue;
       writeRecord(dir);
+    }
+    // 登记表读不出、又没有任何可写的记录位置：这一轮留不下自己的记录（全新项目的第一个本地回合就是这样），
+    // 不放行 —— 登记表是机器级制品，它坏了本来就该响。
+    if (!registry.ok && covered.length === 0 && upward.length === 0) {
+      refuse("registry_unreadable 且没有可写的记录位置：" + String(registry.reason ?? registry.error ?? "?"));
     }
   }
 

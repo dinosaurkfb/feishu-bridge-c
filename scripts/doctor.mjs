@@ -206,6 +206,9 @@ export function runDoctor({
     }
     // run 通道：与状态页同一份结论（inspectRunChannel，只读 dryRun）—— 将发的算积压，卡住 / 账本问题算说不清。
     const rc = inspectRunChannel({ root, claudeSessionId });
+    // 未路由回复：Stop 零入队留下的记录，每条都是"有回复没发出去"，算说不清、要人看。
+    if (rc.unrouted?.ok === false) { backlogProblems += 1; backlogWhere.push(name + "（未路由回复读不出）"); }
+    else if ((rc.unrouted?.count ?? 0) > 0) { backlogProblems += rc.unrouted.count; backlogWhere.push(name + "（未路由回复 " + rc.unrouted.count + " 条）"); }
     if (rc.inventoryOk === false) {
       backlogProblems += 1;
       backlogWhere.push(name + "（runs 账本读不出：" + (rc.runs.problems?.[0]?.reason ?? "说不清") + "）");

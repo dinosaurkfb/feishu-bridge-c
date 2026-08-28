@@ -175,9 +175,10 @@ async function main() {
         turnRoute = { ok: false, reason: "claim_unavailable", messageId: record.messageId };
         if (bound.mapping?.logical_task_key) {
           // **claim 必须是这条绑定、这个会话的**：通用形状合法但 binding / session 对不上的 claim 不算。
+          const claimKeyForTurn = claimKey(record.messageId, bound.mapping.logical_task_key);
           const claimState = readClaimState({
             claimsDir: path.join(project.root, ".runtime-data", "inbound", "delivery-claims"),
-            key: claimKey(record.messageId, bound.mapping.logical_task_key),
+            key: claimKeyForTurn,
             expect: {
               logicalTaskKey: bound.mapping.logical_task_key,
               bindingId: effectiveBindingId(bound.mapping, { root: project.root }),
@@ -190,7 +191,7 @@ async function main() {
             const origin = claimState.claim.origin_channel_generation_id ?? null;
             const target = resolveMappingOutboundGeneration(bound.mapping, origin);
             turnRoute = target.ok
-              ? { ok: true, kind: "feishu", origin }
+              ? { ok: true, kind: "feishu", origin, claimKey: claimKeyForTurn }
               : { ok: false, reason: "origin_unresolvable", why: target.reason, origin, messageId: record.messageId };
             if (target.ok) turnOrigin = origin;
           }
@@ -210,7 +211,7 @@ async function main() {
         // origin 解析不了同样零入队（校验器已把 origin 形状钉住，这里再守解析）。
         const turnTarget = resolveMappingOutboundGeneration(bound.mapping, activeTurn.origin_channel_generation_id ?? null);
         turnRoute = turnTarget.ok
-          ? { ok: true, kind: "dialogue", origin: activeTurn.origin_channel_generation_id }
+          ? { ok: true, kind: "dialogue", origin: activeTurn.origin_channel_generation_id, claimKey: activeTurn.run_id }
           : { ok: false, reason: "dialogue_origin_unresolvable", why: turnTarget.reason, origin: activeTurn.origin_channel_generation_id ?? null };
         if (turnTarget.ok) turnOrigin = activeTurn.origin_channel_generation_id;
         const finalized = finalizeClaudeDialogueTurn({
@@ -238,7 +239,10 @@ async function main() {
     // 答复只发给 **cwd 归属**的项目，不发给「会话记录里提到过路径」的那些。
     // 弱信号用来触发排空是安全的（那些内容本来就要发），但用它决定
     // 「把整段对话原文发到谁的话题里」不行 —— 一次误判就是把无关对话发给了 Frank。
-    if (reply && project.via.includes("cwd") && !turnRoute.ok) {
+    if (reply && project.via.includes("cwd") && !turnRoute.ok && turnRoute.reason === "turn_record_consumed") {
+      // 同一回合的 Stop 重入：第一次已经入队，这次幂等跳过 —— 只记日志，不算"未路由"。
+      log(project.id + " reply not re-queued: turn record already consumed");
+    } else if (reply && project.via.includes("cwd") && !turnRoute.ok) {
       // 零入队 + 可诊断：完整答复留在记录里（不是预览），临时文件 + rename 原子落盘，文件名带随机段不会覆盖。
       const unrouted = path.join(project.root, ".runtime-data", "outbound", "unrouted-replies");
       try {
@@ -264,9 +268,13 @@ async function main() {
         : { ok: false };
       const r = appendEvent({
         outboxDir, kind: "reply", text: reply, source: "session-reply",
-        eventKey: input.ok && input.captureId
-          ? "claude:" + speakingSession + ":capture:" + input.captureId + ":reply"
-          : undefined,
+        // 事件键 = "同一回合重入"，不是"正文碰巧相同"：本地回合用 capture id，飞书 / Dialogue 回合用已验的 claim key
+        //（评审探针：两条不同飞书回合回复正文相同，第二条曾被正文指纹去重掉）。
+        eventKey: turnRoute.claimKey
+          ? "claude:" + speakingSession + ":claim:" + turnRoute.claimKey + ":reply"
+          : input.ok && input.captureId
+            ? "claude:" + speakingSession + ":capture:" + input.captureId + ":reply"
+            : undefined,
         inputText: input.ok ? input.text : undefined,
         inputOrigin: input.ok ? input.inputOrigin : undefined,
         targetGenerationId: bound.ok ? (turnOrigin ?? bound.mapping?.channel_generation_id) : undefined,

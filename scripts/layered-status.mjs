@@ -285,6 +285,15 @@ export function runChannelRows(rc, now = Date.now()) {
       for (const x of du) rows.push(["  " + shortKey(x.key), clipWhy(x.error ?? "")]);
     }
   }
+  // 未路由回复：Stop 说不清该回哪个话题时零入队留下的记录 —— 有就要人看，读不出也明说。
+  const ur = rc.unrouted;
+  if (ur !== undefined && ur !== null) {
+    if (ur.ok === false) rows.push(["未路由回复", "说不清（" + String(ur.reason ?? "unrouted_unreadable") + "）"]);
+    else if (ur.count > 0 || (ur.unrecognized?.length ?? 0) > 0) {
+      rows.push(["未路由回复", ur.count + " 条（需要人看：" + ur.dir + "）" + ((ur.unrecognized?.length ?? 0) ? "；另有 " + ur.unrecognized.length + " 个不认识的文件" : "")]);
+      for (const x of ur.entries) rows.push(["  " + clipWhy(x.reason), x.why ? clipWhy(x.why) : (x.recordedAt ?? "")]);
+    }
+  }
   // 盘点能读（inventoryOk）时，problems 一条不漏 —— 含 key 为 null 的（不认识的条目、claims 目录读不出）；
   // 评审探针：未绑定的项目里有个未识别文件，曾被同时说成"0 条待处理"和"账本无异常"。
   rows.push(["runs 账本", problems.length ? "说不清 " + problems.length + " 处" : "无异常"]);

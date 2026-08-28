@@ -12,6 +12,7 @@ import {
   materializeLegacyTopicFields, prepareTopicRotation, registerPendingTopicGeneration,
   recordTopicGenerationActivity, resolveMappingOutboundGeneration, topicGenerationStateForLegacy,
   markPendingClaimReminder,
+  reserveClaimReminderAttempt,
 } from "./topic-generation.mjs";
 
 const writeJsonAtomic = (file, value) => {
@@ -68,10 +69,11 @@ function mutateClaudeTopicBinding({
   root,
   claudeSessionId,
   registryFile = registryPath(),
+  templateFile,
   now = Date.now(),
   mutate,
 } = {}) {
-  const current = loadClaudeTopicBinding({ root, claudeSessionId, registryFile, now });
+  const current = loadClaudeTopicBinding({ root, claudeSessionId, registryFile, templateFile, now });
   if (!current.ok) return current;
   const projectFile = projectMappingPath(root);
   const projectBacked = current.source === "project-files";
@@ -203,12 +205,22 @@ export function recordClaudeTopicActivity({
   });
 }
 
-/** 原子记下"待认领话题已提醒过"。 */
-export function markClaudeClaimReminder({
-  root, claudeSessionId, generationId, registryFile, now = Date.now(),
+/** 锁内预留一次待认领提醒尝试（判据在锁内重算，并发只有一个能拿到）。 */
+export function reserveClaudeClaimReminder({
+  root, claudeSessionId, generationId, registryFile, templateFile, now = Date.now(),
 } = {}) {
   return mutateClaudeTopicBinding({
-    root, claudeSessionId, registryFile, now,
+    root, claudeSessionId, registryFile, templateFile, now,
+    mutate: (state) => reserveClaimReminderAttempt(state, { generationId, now }),
+  });
+}
+
+/** 原子记下"待认领话题已提醒过"。 */
+export function markClaudeClaimReminder({
+  root, claudeSessionId, generationId, registryFile, templateFile, now = Date.now(),
+} = {}) {
+  return mutateClaudeTopicBinding({
+    root, claudeSessionId, registryFile, templateFile, now,
     mutate: (state) => markPendingClaimReminder(state, { generationId, now }),
   });
 }

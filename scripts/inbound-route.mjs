@@ -44,7 +44,7 @@ export { appendConsumed, loadConsumed };
  *
  * 认领靠「全机同时只有一份待绑定」，这个前提只在窗口有限时才安全 —— 一份忘在那儿
  * 一个月的待绑定，会把你下一次在**任何没绑定的地方** @ 运输 agent 都算成它的。
- * 给 24 小时：显式触发下你敲完命令就会去 @，24 小时足够覆盖「明天再说」，
+ * 给的窗口与代际待认领窗口同一份（2026-08-28 起 72 小时；此前 24 小时）：显式触发下你敲完命令就会去 @，足够覆盖「明天再说」，
  * 又不至于让它无限期埋着。过期了重跑一次接入命令即可（话题已在，幂等键保证不会重建）。
  */
 // 首次绑定的待认领窗口与话题代际的待认领窗口是同一件事 —— 同一份定义（2026-08-28 起 72 小时）。
@@ -69,7 +69,7 @@ export const PROMOTE_REJECT_TEXT = {
   [PROMOTE_REJECT.TOKEN_UNKNOWN]: "根消息引用里的绑定码不对应任何等待绑定的项目",
   [PROMOTE_REJECT.TOKEN_AMBIGUOUS]: "根消息引用里出现了多个绑定码，无法确定目标",
   [PROMOTE_REJECT.TOKEN_DUPLICATED]: "多个等待绑定的项目用了同一个绑定码，无法确定目标",
-  [PROMOTE_REJECT.PENDING_EXPIRED]: "等待绑定已超过 24 小时，需要重新接入",
+  [PROMOTE_REJECT.PENDING_EXPIRED]: "等待绑定已超过 " + Math.round(PENDING_WINDOW_MS / 3600000) + " 小时，需要重新接入",
   [PROMOTE_REJECT.SENDER_NOT_FRANK]: "发送者不是授权用户",
   [PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED]: "没有真实 @ 本链路的运输 agent",
   [PROMOTE_REJECT.STALE_MESSAGE]: "消息超出时效窗口",

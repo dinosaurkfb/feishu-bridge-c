@@ -3,19 +3,25 @@
  *
  * 新话题建好后要等人在里面 @ 一下才算认领；没人认领的话它会在 claim_expires_at 过期并 fail-closed。
  * 这里在截止前 TOPIC_GENERATION_CLAIM_REMINDER_LEAD_MS 内、且还没人认领时，**在那个待认领话题下**
- * 回复一条提醒，**只提醒一次**（提醒后把 claim_reminder_at 记进代际状态）。
+ * 回复一条提醒。
  *
- * 判据只有一份：该不该提醒由 topic-generation.claimReminderDue 决定；本模块只负责发与记。
- * 顺序是**先发后记**：记不上会在下一轮（30 分钟）再发一次 —— 有上界（窗口内最多几次），
- * 而"先记后发"若发失败就永远不提醒；两害相权取前者，并把记不上的情况报出来。
- * publish 可注入 —— 测试不许打到真实飞书。
+ * 语义是**至少一次、有上界**，不是"严格一次"（飞书侧没有幂等依据）：
+ *   1. 锁外用 claimReminderDue 预筛；
+ *   2. 锁内 reserveClaimReminderAttempt 预留这次尝试（attempts+1、attempted_at 持久化）——
+ *      并发的第二个扫描器拿到 retry_too_soon，不会再发；
+ *   3. 发布；
+ *   4. 成功再 markPendingClaimReminder 记 claim_reminder_at，从此不再提醒。
+ * 发布失败：attempts 留着，≥ RETRY_MS 后的下一轮兜底再试，最多 MAX_ATTEMPTS 次，之后报 reminder_abandoned。
+ * 判据只有一份（topic-generation.mjs）；本模块只负责发与记。publish 可注入 —— 测试不许打到真实飞书。
  */
 
 import { publishDraft } from "./outbound.mjs";
 import { loadRegistry, registryPath } from "./registry.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
-import { loadClaudeTopicBinding, markClaudeClaimReminder } from "./topic-generation-store.mjs";
-import { claimReminderDue } from "./topic-generation.mjs";
+import {
+  loadClaudeTopicBinding, markClaudeClaimReminder, reserveClaudeClaimReminder,
+} from "./topic-generation-store.mjs";
+import { TOPIC_GENERATION_CLAIM_REMINDER_MAX_ATTEMPTS, claimReminderDue } from "./topic-generation.mjs";
 
 const hours = (ms) => Math.max(1, Math.round(ms / 3600000));
 
@@ -28,12 +34,46 @@ export function composeClaimReminderText({ name, generation, remainingMs, deadli
     "认领方式：在这条消息下面 @ 一下运输 agent（空消息也行），绑定就完成了。",
     "过期后这个话题作废，需要重新轮转（/feishu-rotate 或 $feishu-rotate）才有新话题。",
     "",
-    "本提醒只发这一次。",
+    "这条提醒不会反复发。",
   ].join("\n");
 }
 
 /**
- * 扫一遍登记表里的 Claude 绑定，给进入提醒窗口的待认领话题各发一次提醒。
+ * 一个待认领代际的完整提醒流程：预留 → 发 → 记。两条链共用；差异（怎么预留、怎么记、用谁的身份）由参数注入。
+ * @returns {{outcome:"reminded"|"skipped"|"problem", entry:object}}
+ */
+export function remindOnePendingClaim({ name, state, now, dryRun, reserve, publish, mark, identity }) {
+  const due = claimReminderDue(state, { now });
+  if (!due.due) {
+    if (due.reason === "attempts_exhausted") {
+      return { outcome: "problem", entry: { name, reason: "reminder_abandoned", error: "发送失败 " + due.attempts + " 次，已放弃" } };
+    }
+    return { outcome: "skipped", entry: { name, reason: due.reason } };
+  }
+  const g = due.generation;
+  if (dryRun) return { outcome: "reminded", entry: { name, generation: g.generation, dryRun: true } };
+  const reserved = reserve(g.channel_generation_id);
+  if (!reserved.ok) {
+    // 锁内重算没通过：多半是另一个扫描器刚拿走了这次尝试（retry_too_soon）；别的原因也一样只是跳过。
+    return { outcome: "skipped", entry: { name, reason: reserved.reason } };
+  }
+  const text = composeClaimReminderText({
+    name, generation: g.generation, remainingMs: reserved.remainingMs ?? due.remainingMs, deadlineIso: g.claim_expires_at,
+  });
+  try {
+    publish({ profile: identity.profile, rootMessageId: g.root_message_id, text,
+      larkBin: identity.bin, larkHome: identity.configDir, expectedAppId: identity.expectedAppId });
+  } catch (err) {
+    return { outcome: "problem", entry: { name, reason: "publish_failed",
+      error: "第 " + reserved.attempt + "/" + TOPIC_GENERATION_CLAIM_REMINDER_MAX_ATTEMPTS + " 次：" + String(err?.message ?? err).slice(0, 200) } };
+  }
+  const marked = mark(g.channel_generation_id);
+  return { outcome: "reminded", entry: { name, generation: g.generation, attempt: reserved.attempt, recorded: marked.ok === true,
+    ...(marked.ok ? {} : { error: "reminder_unrecorded：" + marked.reason }) } };
+}
+
+/**
+ * 扫一遍登记表里的 Claude 绑定，给进入提醒窗口的待认领话题发提醒。
  * @returns {{ok:boolean, reason?:string, reminded:object[], skipped:object[], problems:object[], dryRun:boolean}}
  */
 export function remindClaudePendingClaims({
@@ -57,28 +97,21 @@ export function remindClaudePendingClaims({
       if (binding.reason !== "topic_generation_unavailable") out.problems.push({ name, reason: binding.reason });
       continue;
     }
-    const due = claimReminderDue(binding.state, { now });
-    if (!due.due) { out.skipped.push({ name, reason: due.reason }); continue; }
-    const g = due.generation;
-    if (out.dryRun) { out.reminded.push({ name, generation: g.generation, dryRun: true }); continue; }
-    if (!binding.config) { out.problems.push({ name, reason: "config_unavailable" }); continue; }
-    const text = composeClaimReminderText({
-      name: binding.config.task_display_name ?? name, generation: g.generation,
-      remainingMs: due.remainingMs, deadlineIso: g.claim_expires_at,
-    });
-    let identity;
-    try { identity = resolveLarkIdentity(binding.config); }
-    catch (err) { out.problems.push({ name, reason: "identity_unavailable", error: String(err?.message ?? err).slice(0, 120) }); continue; }
-    try {
-      publish({ profile: identity.profile, rootMessageId: g.root_message_id, text,
-        larkBin: identity.bin, larkHome: identity.configDir, expectedAppId: identity.expectedAppId });
-    } catch (err) {
-      out.problems.push({ name, reason: "publish_failed", error: String(err?.message ?? err).slice(0, 200) });
+    if (!binding.config && !out.dryRun && claimReminderDue(binding.state, { now }).due) {
+      out.problems.push({ name, reason: "config_unavailable" });
       continue;
     }
-    const marked = markClaudeClaimReminder({ root, claudeSessionId, generationId: g.channel_generation_id, registryFile, now });
-    if (!marked.ok) out.problems.push({ name, reason: "reminder_unrecorded", error: marked.reason });
-    out.reminded.push({ name, generation: g.generation, recorded: marked.ok === true });
+    const r = remindOnePendingClaim({
+      name: binding.config?.task_display_name ?? name, state: binding.state, now, dryRun: out.dryRun,
+      identity: binding.config ? resolveLarkIdentity(binding.config) : null, publish,
+      reserve: (generationId) => reserveClaudeClaimReminder({ root, claudeSessionId, generationId, registryFile, templateFile, now }),
+      mark: (generationId) => markClaudeClaimReminder({ root, claudeSessionId, generationId, registryFile, templateFile, now }),
+    });
+    if (r.outcome === "reminded") {
+      out.reminded.push(r.entry);
+      if (r.entry.recorded === false) out.problems.push({ name: r.entry.name, reason: "reminder_unrecorded", error: r.entry.error });
+    } else if (r.outcome === "problem") out.problems.push(r.entry);
+    else out.skipped.push(r.entry);
   }
   return out;
 }

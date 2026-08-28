@@ -240,7 +240,7 @@ Relay 必须显式使用新的 policy version；其预算分别统计 human cycl
 - 轮转后新请求只进入新话题；
 - 新话题等待首次真实 mention 认领时，旧 generation 继续保持 active；pending generation 默认在
   72 小时后过期并 fail-closed（2026-08-28 起，此前 24 小时），用户也可以显式取消；截止前 12 小时内
-  仍无人认领时，由 30 分钟兜底在该待认领话题下**提醒一次**（提醒记进代际状态，只发一次）；
+  仍无人认领时，由 30 分钟兜底在该待认领话题下**提醒**（锁内预留尝试、发送成功即记入代际状态不再提醒；发送失败最多重试到 3 次、间隔 25 分钟；暂停的绑定不提醒）；
 - 新旧 generation 的 active/read-only 切换必须在同一份 binding 状态的单次原子写入中完成；
 - 本地发起且没有飞书来源的回合，在形成 outbox 项时解析并冻结当时的 active generation；若运行
   期间已经完成轮转，则发布到新 generation；

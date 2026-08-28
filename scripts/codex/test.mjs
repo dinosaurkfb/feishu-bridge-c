@@ -8726,7 +8726,7 @@ test("Codex 待认领快过期提醒：进窗口只在待认领话题下发一�
   const now = fx.deadline - 11 * 3600000;
   const first = remindCodexPendingClaims({ home: fx.home, now, publish });
   assert.deepEqual(first.problems, []);
-  assert.deepEqual(first.reminded, [{ name: "A", generation: 2, recorded: true }]);
+  assert.deepEqual(first.reminded, [{ name: "A", generation: 2, attempt: 1, recorded: true }]);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].rootMessageId, "om_new", "发在待认领的那个话题下");
   assert.equal(calls[0].profile, TEMPLATE.lark_cli_profile);
@@ -8744,10 +8744,34 @@ test("Codex 待认领快过期提醒：进窗口只在待认领话题下发一�
   const failed = remindCodexPendingClaims({ home: fx2.home, now, publish: () => { throw new Error("lark down"); } });
   assert.deepEqual(failed.reminded, []);
   assert.equal(failed.problems[0]?.reason, "publish_failed");
-  assert.equal(fx2.pendingNow(now).claim_reminder_at, undefined, "先发后记");
-  const dry = remindCodexPendingClaims({ home: fx2.home, now, publish, dryRun: true });
-  assert.deepEqual([dry.reminded, calls.length], [[{ name: "A", generation: 2, dryRun: true }], 1]);
-  assert.equal(fx2.pendingNow(now).claim_reminder_at, undefined, "dry-run 不记");
+  assert.equal(fx2.pendingNow(now).claim_reminder_at, undefined, "预留 → 发 → 记：没发出去不记");
+  assert.equal(fx2.pendingNow(now).claim_reminder_attempts, 1, "尝试要留痕");
+  const tooSoon = remindCodexPendingClaims({ home: fx2.home, now: now + 60000, publish });
+  assert.deepEqual([tooSoon.reminded, tooSoon.skipped, calls.length], [[], [{ name: "A", reason: "retry_too_soon" }], 1]);
+  const retry = remindCodexPendingClaims({ home: fx2.home, now: now + 30 * 60000, publish });
+  assert.deepEqual([retry.reminded, calls.length], [[{ name: "A", generation: 2, attempt: 2, recorded: true }], 2]);
+  const fx3 = codexReminderFixture();
+  const dry = remindCodexPendingClaims({ home: fx3.home, now, publish, dryRun: true });
+  assert.deepEqual([dry.reminded, calls.length], [[{ name: "A", generation: 2, dryRun: true }], 2]);
+  assert.equal(fx3.pendingNow(now).claim_reminder_at, undefined, "dry-run 不记");
+  assert.equal(fx3.pendingNow(now).claim_reminder_attempts ?? 0, 0, "dry-run 也不预留");
+
+  // 并发：发布回调里嵌套扫描，模拟第二个扫描器在预留之后、记之前进来
+  const fx4 = codexReminderFixture();
+  let nested = null;
+  const outer = remindCodexPendingClaims({ home: fx4.home, now, publish: (a) => {
+    calls.push(a);
+    nested = remindCodexPendingClaims({ home: fx4.home, now, publish: (b) => { calls.push(b); } });
+  } });
+  assert.deepEqual([outer.reminded.length, nested.reminded, nested.skipped, calls.length],
+    [1, [], [{ name: "A", reason: "retry_too_soon" }], 3], "并发只发一条");
+
+  // 暂停的 task 不提醒
+  const fx5 = codexReminderFixture();
+  assert.equal(setTaskConnectionStatus({ threadId: THREAD_A, status: "paused", home: fx5.home, now }).ok, true);
+  const pausedSweep = remindCodexPendingClaims({ home: fx5.home, now, publish });
+  assert.deepEqual([pausedSweep.reminded, pausedSweep.skipped, calls.length],
+    [[], [{ name: "A", reason: "binding_not_active" }], 3]);
 });
 
 test("Codex 兜底真入口 drain-all 跑待认领提醒；发不出去要报 publish_failed、退出 1、不记", () => {

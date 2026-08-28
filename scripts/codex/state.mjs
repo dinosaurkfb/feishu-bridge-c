@@ -24,6 +24,7 @@ import {
   failTopicRotation, materializeLegacyTopicFields, pendingGeneration, prepareTopicRotation,
   recordTopicGenerationActivity, registerPendingTopicGeneration, topicGenerationStateForLegacy,
   markPendingClaimReminder,
+  reserveClaimReminderAttempt,
   TOPIC_GENERATION_PENDING_MS,
 } from "../topic-generation.mjs";
 import {
@@ -1176,6 +1177,16 @@ export function closeTaskTopicRotation({
   return mutateTaskTopicState({
     threadId, home, now,
     mutate: (state) => closePendingTopicGeneration(state, { operationId, reason, now }),
+  });
+}
+
+/** 锁内预留一次待认领提醒尝试（判据在锁内重算，并发只有一个能拿到）。 */
+export function reserveTaskClaimReminder({
+  threadId, generationId, home = bridgeHome(), now = Date.now(),
+} = {}) {
+  return mutateTaskTopicState({
+    threadId, home, now,
+    mutate: (state) => reserveClaimReminderAttempt(state, { generationId, now }),
   });
 }
 

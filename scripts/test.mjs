@@ -7,7 +7,7 @@
  * v2：标识符全部换到 Aily 命名空间（见 selector.mjs 顶部说明）。
  */
 
-import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry } from "./control-command.mjs";
+import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry, normalizeControlText } from "./control-command.mjs";
 import { describePendingWindow } from "./layered-status.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -18060,8 +18060,9 @@ test("控制命令只认封闭的精确形状：两条链各两条，多一个�
   assert.deepEqual(parseControlCommand("/feishu-mode mapping", { chain: "claude" }), { kind: "mode", mode: MAPPING_POLICY_ID });
   assert.deepEqual(parseControlCommand("$feishu-mode dialogue", { chain: "codex" }), { kind: "mode", mode: DIALOGUE_POLICY_ID });
   assert.deepEqual(parseControlCommand("$feishu-mode mapping", { chain: "codex" }), { kind: "mode", mode: MAPPING_POLICY_ID });
-  for (const bad of ["/feishu-mode", "/feishu-mode  dialogue", "/feishu-mode dialogue 吧", "请 /feishu-mode dialogue", "/feishu-mode Dialogue",
-    "/FEISHU-MODE dialogue", "/feishu-mode dialogue\n", "$feishu-mode dialogue", "/feishu-rotate", "/feishu-bind", "", null, undefined, 42]) {
+  // 双空格不再算"多一个字"（2026-08-28 线上实测后改：空白只当分隔符，见 normalizeControlText）
+  for (const bad of ["/feishu-mode", "/feishu-mode dialogue 吧", "请 /feishu-mode dialogue", "/feishu-mode Dialogue",
+    "/FEISHU-MODE dialogue", "$feishu-mode dialogue", "/feishu-rotate", "/feishu-bind", "", null, undefined, 42]) {
     assert.equal(parseControlCommand(bad, { chain: "claude" }), null, JSON.stringify(bad));
   }
   for (const bad of ["$feishu-mode", "/feishu-mode dialogue", "$feishu-mode dialogue extra", "[$feishu-mode](x) dialogue"]) {
@@ -18732,6 +18733,18 @@ test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进
   assert.match(controlAckText({ taskName: "T", mode: DIALOGUE_POLICY_ID, changed: true, lockUncleared: "EACCES" }), /事务锁没有交还（EACCES）/u);
   assert.doesNotMatch(controlAckText({ taskName: "T", mode: DIALOGUE_POLICY_ID, changed: true }), /事务锁/u);
   assert.ok(Object.isFrozen(RESUMABLE_CONTROL_STATES));
+  // 不可见字节不算"字"：飞书客户端塞进来的零宽 / 不换行空格 / 全角空格 / 全角斜杠折叠后仍是控制命令；多一个词照旧不是
+  for (const [label, raw] of [["零宽前缀", "\u200B/feishu-mode dialogue"], ["零宽后缀", "/feishu-mode dialogue\u200B"], ["词间 NBSP", "/feishu-mode\u00A0dialogue"],
+    ["词间全角空格", "/feishu-mode\u3000dialogue"], ["双空格", "/feishu-mode  dialogue"], ["全角斜杠", "／feishu-mode dialogue"], ["BOM", "\uFEFF/feishu-mode mapping"], ["首尾空白", "  /feishu-mode mapping \n"]]) {
+    const got = parseControlCommand(raw, { chain: "claude" });
+    assert.ok(got && got.kind === "mode" && [DIALOGUE_POLICY_ID, MAPPING_POLICY_ID].includes(got.mode), label + "：" + JSON.stringify(raw));
+  }
+  assert.deepEqual(parseControlCommand("＄feishu-mode\u00A0dialogue", { chain: "codex" }), { kind: "mode", mode: DIALOGUE_POLICY_ID }, "Codex 侧全角美元符");
+  for (const [label, raw] of [["多一个词", "/feishu-mode dialogue 吧"], ["多一个字符", "/feishu-mode dialogue!"], ["少一个字", "/feishu-mod dialogue"], ["别的模式词", "/feishu-mode turbo"], ["链不对", "$feishu-mode dialogue"]]) {
+    assert.equal(parseControlCommand(raw, { chain: "claude" }), null, label);
+  }
+  assert.equal(normalizeControlText("\u200B/feishu-mode\u3000\u00A0dialogue\uFEFF "), "/feishu-mode dialogue");
+  assert.equal(normalizeControlText(42), 42);
   assert.equal(controlIntentProblem({ control: "mode", mode: MAPPING_POLICY_ID }), null);
   assert.equal(controlIntentProblem(undefined), null, "不在场 = 不是控制命令");
   for (const badIntent of [null, [], { control: "mode" }, { control: "rotate", mode: "mapping" }, { control: "mode", mode: "turbo" }, { control: "mode", mode: "mapping", extra: 1 }]) {

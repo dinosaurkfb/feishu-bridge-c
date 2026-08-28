@@ -17835,22 +17835,37 @@ test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结�
   const prompt = (text) => spawnSync(process.execPath, [initHook], { input: JSON.stringify({ session_id: session, cwd: fx.root, prompt: text }), encoding: "utf-8", env: { ...env, HOME: fx.local } });
   const stop = (text) => spawnSync(process.execPath, [stopHook], { input: JSON.stringify({ session_id: session, cwd: fx.root, last_assistant_message: text }), encoding: "utf-8", env: { ...env, HOME: fx.local } });
   const replies = () => listPending({ outboxDir: outboxDirOf(fx.root) }).filter((r) => r.kind === "reply");
+  // 同一秒内入队的记录顺序不稳，按正文找，不按下标（否则变异过了也看不出来）。
+  const targetOf = (text) => { const r = replies().find((x) => x.text === text); assert.ok(r, "找不到回复：" + text); return r.target_channel_generation_id; };
 
   assert.equal(prompt("[飞书 · msg_old_topic · 2026-08-28 10:00Z]\n老话题里下的指令").status, 0);
   const inboundStop = stop("老话题的回复");
   assert.equal(inboundStop.status, 0, inboundStop.stderr);
   assert.equal(replies().length, 1);
-  assert.equal(replies()[0].target_channel_generation_id, fx.oldGen.channel_generation_id, "老话题的指令，回复冻结回老话题：" + JSON.stringify(replies()[0]));
+  assert.equal(targetOf("老话题的回复"), fx.oldGen.channel_generation_id, "老话题的指令，回复冻结回老话题");
 
   assert.equal(prompt("本地敲的一句").status, 0);
   assert.equal(stop("本地回合的回复").status, 0);
   assert.equal(replies().length, 2);
-  assert.equal(replies()[1].target_channel_generation_id, fx.newGen.channel_generation_id, "本地回合发当前代际");
+  assert.equal(targetOf("本地回合的回复"), fx.newGen.channel_generation_id, "本地回合发当前代际");
 
   assert.equal(prompt("[飞书 · msg_never_claimed · 2026-08-28 10:05Z]\n没受理过的").status, 0);
   assert.equal(stop("反查不到 claim 的回复").status, 0);
   assert.equal(replies().length, 3);
-  assert.equal(replies()[2].target_channel_generation_id, fx.newGen.channel_generation_id, "反查不到就退回当前代际，不冒险");
+  assert.equal(targetOf("反查不到 claim 的回复"), fx.newGen.channel_generation_id, "反查不到就退回当前代际，不冒险");
+
+  // claim 里的 origin 形状合法但不是这个 mapping 里能发布的代际（比如已 retired / 别处的 id）→ 退回当前代际
+  const foreign = fx.oldGen.channel_generation_id.slice(0, -4) + "dead";
+  const bogus = acquireClaim({ claimsDir, messageId: "msg_foreign_origin", logicalTaskKey: mapping.logical_task_key,
+    meta: { session_id: "session_old", binding_id: effectiveBindingId(mapping, { root: fx.root }), claude_session_id: null,
+      policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, local_target_id: "local_target_x",
+      origin_channel_generation_id: foreign } });
+  assert.equal(bogus.ok, true);
+  assert.ok(readClaim({ claimsDir, key: bogus.key }), "前提：claim 形状合法");
+  assert.equal(prompt("[飞书 · msg_foreign_origin · 2026-08-28 10:06Z]\n来源代际不可解析").status, 0);
+  assert.equal(stop("来源不可解析的回复").status, 0);
+  assert.equal(replies().length, 4);
+  assert.equal(targetOf("来源不可解析的回复"), fx.newGen.channel_generation_id, "origin 解析不了就不冒险，退回当前代际");
 });
 
 test("老话题的指令（Dialogue 模式）：回合的 origin 是老代际，Stop 终结回合并把回复发回老话题", () => {

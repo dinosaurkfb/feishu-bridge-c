@@ -7,7 +7,7 @@
  * v2：标识符全部换到 Aily 命名空间（见 selector.mjs 顶部说明）。
  */
 
-import { controlAckText, parseControlCommand } from "./control-command.mjs";
+import { controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord } from "./control-command.mjs";
 import { describePendingWindow } from "./layered-status.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -18169,6 +18169,99 @@ test("doctor ⑥：未路由回复及其目录里说不清的条目都算进问�
     reason: "origin_unresolvable", why: "x", message_id: "msg", origin_channel_generation_id: null, session_id: "s", binding_id: "b", recorded_at: "2026-08-28T10:00:00.000Z", reply_text: "t" }));
   const report2 = doctorReport(m.run());
   assert.match(String(checkOf(report2, "backlog_vs_publisher").detail), /未路由回复 1 条/u);
+});
+
+test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue → 当场切换并回执；重放按记录重出回执；终态写失败 → 报错但模式已切、重放补齐；多一个字走普通路径", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-ctl-claude-"));
+  const root = path.join(local, "project");
+  const bin = path.join(local, "bin");
+  fs.mkdirSync(root); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json");
+  const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{
+    id: "ctl", root, name: "控制演示", root_message_id: "om_ctl", expires_at: "2099-01-01T00:00:00Z",
+    session_id: "aily_claude_ctl", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z",
+  }] }));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const run = (body, messageId) => {
+    const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> " + body;
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: {
+      id: messageId, sessionID: "aily_claude_ctl", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content,
+    } }) }] });
+    return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], {
+      encoding: "utf-8",
+      env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+        AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_claude_ctl", AILY_CLI_RUN_ID: "run_ctl", FAKE_AILY_ENVELOPE: envelope },
+    });
+  };
+  const policyOf = () => loadClaudeInteractionPolicy({ root, claudeSessionId: null, registryFile }).state.policy_id;
+  const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
+  const logicalTaskKey = resolveProject({ root, registryFile, templateFile }).mapping.logical_task_key;
+  assert.equal(policyOf(), MAPPING_POLICY_ID, "前提：默认 Mapping");
+
+  const on = run("/feishu-mode dialogue", "msg_c1");
+  assert.equal(on.status, 0, on.stdout + on.stderr);
+  assert.match(on.stdout, /^已切换 · 控制演示\n交互模式现在是 Dialogue/u, on.stdout);
+  assert.equal(policyOf(), DIALOGUE_POLICY_ID, "切换要落盘");
+  const key1 = claimKey("msg_c1", logicalTaskKey);
+  assert.ok(fs.existsSync(path.join(claimsDir, key1 + ".consumed.json")), "claim 终态 consumed");
+  assert.equal(fs.readdirSync(claimsDir).filter((n) => n.endsWith(".handed_off.json")).length, 0, "没有投递");
+  const stored = readClaimState({ claimsDir, key: key1 });
+  assert.deepEqual([stored.status, stored.claim.control], ["valid", { control: "mode", mode: DIALOGUE_POLICY_ID }], "意图随 claim 持久化");
+  const replay = run("/feishu-mode dialogue", "msg_c1");
+  assert.equal(replay.status, 0, replay.stdout + replay.stderr);
+  assert.match(replay.stdout, /^已处理过 · 控制演示\n这条控制命令之前已经执行过（当时完成了切换）/u, replay.stdout);
+  assert.equal(policyOf(), DIALOGUE_POLICY_ID);
+
+  // 终态写失败：consumed 路径被目录占住 → 第一次退出 1、如实说"模式已切换但终态没记下"；模式确实已切；清障后重放补齐
+  const key2 = claimKey("msg_c2", logicalTaskKey);
+  fs.mkdirSync(path.join(claimsDir, key2 + ".consumed.json"), { recursive: true });
+  const broken = run("/feishu-mode mapping", "msg_c2");
+  assert.equal(broken.status, 1, broken.stdout);
+  assert.match(broken.stdout, /模式已切换，但终态没记下/u, broken.stdout);
+  assert.equal(policyOf(), MAPPING_POLICY_ID, "动作已成");
+  const stuck = run("/feishu-mode mapping", "msg_c2");
+  assert.equal(stuck.status, 1, "障碍还在：重放仍报终态没记下：" + stuck.stdout);
+  fs.rmSync(path.join(claimsDir, key2 + ".consumed.json"), { recursive: true, force: true });
+  const resumed = run("/feishu-mode mapping", "msg_c2");
+  assert.equal(resumed.status, 0, resumed.stdout + resumed.stderr);
+  assert.match(resumed.stdout, /^已补齐 · 控制演示\n上次执行后终态没记下，这次已补齐；交互模式是 Mapping/u, resumed.stdout);
+  assert.equal(readConsumedRecord({ claimsDir, key: key2 }).status, "valid");
+  assert.equal(policyOf(), MAPPING_POLICY_ID);
+  // 意图不一致的重放（同一消息 id、不同正文）不许续做
+  const twisted = run("/feishu-mode dialogue", "msg_c2");
+  assert.doesNotMatch(twisted.stdout, /已切换|已补齐|已处理过/u, twisted.stdout);
+  assert.equal(policyOf(), MAPPING_POLICY_ID);
+
+  const same = run("/feishu-mode mapping", "msg_c3");
+  assert.match(same.stdout, /^模式未变 · 控制演示\n本来就是 Mapping/u, same.stdout);
+  const notControl = run("/feishu-mode dialogue 吧", "msg_c4");
+  assert.doesNotMatch(notControl.stdout, /已切换|模式未变/u, "多一个字就不是控制命令：" + notControl.stdout);
+  assert.equal(policyOf(), MAPPING_POLICY_ID);
+});
+
+test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进账本 problems（consumed_unreadable），合法的不进", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-consumed2-"));
+  const runsDir = path.join(base, "runs");
+  const claimsDir = path.join(base, "delivery-claims");
+  fs.mkdirSync(runsDir); fs.mkdirSync(claimsDir);
+  const good = "a".repeat(64); const bad = "b".repeat(64); const dir = "c".repeat(64); const shape = "d".repeat(64);
+  recordClaimState({ claimsDir, key: good, state: "consumed", detail: { control: "mode", mode: DIALOGUE_POLICY_ID, changed: true } });
+  fs.writeFileSync(path.join(claimsDir, bad + ".consumed.json"), "{not json");
+  fs.mkdirSync(path.join(claimsDir, dir + ".consumed.json"));
+  recordClaimState({ claimsDir, key: shape, state: "consumed", detail: { control: "mode", mode: "turbo", changed: "yes" } });
+  const inv = inventoryRuns({ runsDir, claimsDir });
+  assert.equal(inv.ok, true);
+  assert.deepEqual(inv.problems.map((p) => [p.key.slice(0, 1), p.reason]).sort(), [["b", "consumed_unreadable"], ["c", "consumed_unreadable"], ["d", "consumed_unreadable"]], JSON.stringify(inv.problems));
+  assert.equal(readConsumedRecord({ claimsDir, key: good }).status, "valid");
+  assert.equal(readConsumedRecord({ claimsDir, key: "f".repeat(64) }).status, "absent");
+  assert.equal(readConsumedRecord({ claimsDir, key: "z".repeat(64) }).status, "unreadable", "key 形状不对也不猜");
+  assert.equal(controlIntentProblem({ control: "mode", mode: MAPPING_POLICY_ID }), null);
+  assert.equal(controlIntentProblem(undefined), null, "不在场 = 不是控制命令");
+  for (const badIntent of [null, [], { control: "mode" }, { control: "rotate", mode: "mapping" }, { control: "mode", mode: "turbo" }, { control: "mode", mode: "mapping", extra: 1 }]) {
+    assert.notEqual(controlIntentProblem(badIntent), null, JSON.stringify(badIntent));
+  }
 });
 
 summarySealed = true;

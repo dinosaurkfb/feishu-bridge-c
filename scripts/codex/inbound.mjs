@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
-import { acquireClaim, recordClaimState } from "../claim.mjs";
+import { acquireClaim, claimKey, readClaimState, recordClaimState } from "../claim.mjs";
 import { fetchTriggerEvent } from "../envelope.mjs";
 import { moduleRoot } from "../direct-run.mjs";
 import {
@@ -34,7 +34,7 @@ import {
   isThreadBusy, loadCodexTemplate, promoteTask, reserveTaskDialogueTurn, setTaskInteractionMode,
   shadowCodexFirstClaim, taskPaths,
 } from "./state.mjs";
-import { controlAckText, parseControlCommand } from "../control-command.mjs";
+import { controlAckText, parseControlCommand, runControlTransaction } from "../control-command.mjs";
 import { isDirectRun } from "../direct-run.mjs";
 import { composeCrashReceipt } from "../crash-receipt.mjs";
 /**
@@ -306,11 +306,36 @@ if (!mappingContext.ok) {
   finish("error", { detail: "映射策略上下文不完整" }, { reason: mappingContext.reason });
 }
 
+// 控制命令（$feishu-mode dialogue|mapping）：三道闸之后先解析意图、随 claim 持久化；执行与终态在拿到 claim 之后做（可恢复事务）。
+const control = parseControlCommand(verdict.instruction, { chain: "codex" });
+const runControl = (replay) => {
+  const tx = runControlTransaction({
+    claimsDir: paths.claims, key: claim.key, intent: control ? { control: control.kind, mode: control.mode } : undefined, replay,
+    execute: (mode) => setTaskInteractionMode({ threadId: task.codex_thread_id, mode, home: HOME }),
+  });
+  if (!tx.ok) {
+    if (tx.reason === "ledger_unwritten") {
+      writeReceipt("control-" + verdict.messageId, { status: "error", reason: tx.reason, control: control.kind, mode: control.mode, changed: tx.changed,
+        message_id: verdict.messageId, claim_acquired: true, handed_off: false, error: tx.why });
+      finish("error", { detail: "模式已切换，但终态没记下（" + tx.why + "）；在飞书里重发同一条命令可补齐" }, { reason: tx.reason });
+    }
+    if (!replay) recordClaimState({ claimsDir: paths.claims, key: claim.key, state: "failed", detail: { reason: "control_failed", control: control.kind, error: tx.why } });
+    writeReceipt("control-" + verdict.messageId, { status: "error", reason: tx.reason, control: control.kind, mode: control.mode,
+      message_id: verdict.messageId, claim_acquired: true, handed_off: false, error: tx.why });
+    finish("error", { detail: "模式没有切换（" + tx.why + "）" }, { reason: tx.reason });
+  }
+  writeReceipt("control-" + verdict.messageId, { status: "consumed", control: control.kind, mode: control.mode, changed: tx.changed,
+    replayed: tx.replayed, resumed: tx.resumed, message_id: verdict.messageId, claim_acquired: !replay, handed_off: false });
+  finish("control", { text: controlAckText({ taskName: task.task_display_name, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed }) },
+    { control: control.kind, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed });
+};
+
 const claim = acquireClaim({
   claimsDir: paths.claims,
   messageId: verdict.messageId,
   logicalTaskKey: task.logical_task_key,
   meta: {
+    ...(control ? { control: { control: control.kind, mode: control.mode } } : {}),
     session_id: event.session_id,
     codex_thread_id: task.codex_thread_id,
     policy_id: policyEvaluation.policy_id,
@@ -320,6 +345,15 @@ const claim = acquireClaim({
     mapping_admission_shadow_match: verdict.admission_shadow?.match ?? null,
   },
 });
+if (!claim.ok && claim.reason === "duplicate" && control) {
+  const original = readClaimState({ claimsDir: paths.claims, key: claim.key });
+  const intent = original.status === "valid" ? original.claim.control : undefined;
+  if (intent && intent.control === control.kind && intent.mode === control.mode) {
+    claim.key = claim.key ?? claimKey(verdict.messageId, verdict.logicalTaskKey);
+    runControl(true);
+  }
+}
+
 if (!claim.ok) {
   const duplicate = claim.reason === "duplicate";
   const policyOutcome = handlePolicy({ claim, resolvedContext: mappingContext });
@@ -341,23 +375,8 @@ if (!claim.ok) {
   }, { reason: claim.reason });
 }
 
-// ---------- 控制命令：路由侧当场执行，不投递（正文恰为 $feishu-mode dialogue|mapping，goal 第 3 层） ----------
-const control = parseControlCommand(verdict.instruction, { chain: "codex" });
-if (control) {
-  const switched = setTaskInteractionMode({ threadId: task.codex_thread_id, mode: control.mode, home: HOME });
-  if (!switched.ok) {
-    recordClaimState({ claimsDir: paths.claims, key: claim.key, state: "failed", detail: { reason: "control_failed", control: control.kind, error: switched.reason } });
-    writeReceipt("control-" + verdict.messageId, { status: "error", reason: switched.reason, control: control.kind, mode: control.mode,
-      message_id: verdict.messageId, claim_acquired: true, handed_off: false });
-    finish("error", { detail: "模式没有切换（" + switched.reason + "）" }, { reason: switched.reason });
-  }
-  const changed = switched.changed !== false;
-  recordClaimState({ claimsDir: paths.claims, key: claim.key, state: "consumed", detail: { control: control.kind, mode: control.mode, changed } });
-  writeReceipt("control-" + verdict.messageId, { status: "consumed", control: control.kind, mode: control.mode, changed,
-    message_id: verdict.messageId, claim_acquired: true, handed_off: false });
-  finish("control", { text: controlAckText({ taskName: task.task_display_name, mode: control.mode, changed }) },
-    { control: control.kind, mode: control.mode, changed });
-}
+// ---------- 控制命令：拿到 claim 之后当场执行（可恢复事务），不投递 ----------
+if (control) runControl(false);
 
 let policyRun = dialogueMode ? null : handlePolicy({ claim, resolvedContext: mappingContext });
 if (!dialogueMode &&

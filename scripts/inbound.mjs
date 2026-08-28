@@ -17,7 +17,7 @@ import path from "node:path";
 
 import { REJECT } from "./selector.mjs";
 import { fetchTriggerEvent } from "./envelope.mjs";
-import { acquireClaim, recordClaimState, watcherExpectEnv } from "./claim.mjs";
+import { acquireClaim, claimKey, readClaimState, recordClaimState, watcherExpectEnv } from "./claim.mjs";
 import { effectiveBindingId } from "./topic-generation.mjs";
 import { moduleRoot } from "./direct-run.mjs";
 import {
@@ -30,7 +30,7 @@ import {
 import {
   finalizeClaudeDialogueTurn, loadClaudeInteractionPolicy, reserveClaudeDialogueTurn, setClaudeInteractionMode,
 } from "./interaction-policy-store.mjs";
-import { controlAckText, parseControlCommand } from "./control-command.mjs";
+import { controlAckText, parseControlCommand, runControlTransaction } from "./control-command.mjs";
 import { handOff, acquireSessionLock, releaseSessionLock, stampSessionLock } from "./handoff.mjs";
 import {
   DELIVERY_REJECT, DELIVERY_REJECT_TEXT,
@@ -418,12 +418,38 @@ if (!mappingContext.ok) {
   finish("error", { detail: "映射策略上下文不完整" }, { reason: mappingContext.reason });
 }
 
+// 控制命令（/feishu-mode dialogue|mapping）：三道闸之后先**解析意图但不执行**，意图随 claim 持久化；
+// 执行与终态在拿到 claim 之后做，重放时按 claim 里的意图续做或按结果重出回执（可恢复事务，goal 第 3 层）。
+const control = parseControlCommand(verdict.instruction, { chain: "claude" });
+const runControl = (replay) => {
+  const tx = runControlTransaction({
+    claimsDir: CLAIMS, key: claim.key, intent: control ? { control: control.kind, mode: control.mode } : undefined, replay,
+    execute: (mode) => setClaudeInteractionMode({ root: routed.root, claudeSessionId: mapping.claude_session_id ?? null, mode }),
+  });
+  if (!tx.ok) {
+    if (tx.reason === "ledger_unwritten") {
+      writeReceipt("control-" + verdict.messageId, { status: "error", reason: tx.reason, control: control.kind, mode: control.mode, changed: tx.changed,
+        message_id: verdict.messageId, claim_acquired: true, handed_off: false, error: tx.why });
+      finish("error", { detail: "模式已切换，但终态没记下（" + tx.why + "）；在飞书里重发同一条命令可补齐" }, { reason: tx.reason });
+    }
+    if (!replay) recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { reason: "control_failed", control: control.kind, error: tx.why } });
+    writeReceipt("control-" + verdict.messageId, { status: "error", reason: tx.reason, control: control.kind, mode: control.mode,
+      message_id: verdict.messageId, claim_acquired: true, handed_off: false, error: tx.why });
+    finish("error", { detail: "模式没有切换（" + tx.why + "）" }, { reason: tx.reason });
+  }
+  writeReceipt("control-" + verdict.messageId, { status: "consumed", control: control.kind, mode: control.mode, changed: tx.changed,
+    replayed: tx.replayed, resumed: tx.resumed, message_id: verdict.messageId, project_root: routed.root, claim_acquired: !replay, handed_off: false });
+  finish("control", { text: controlAckText({ taskName: config.task_display_name, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed }) },
+    { control: control.kind, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed });
+};
+
 // 校验通过才允许 claim。claim 是幂等的唯一保证。
 const claim = acquireClaim({
   claimsDir: CLAIMS,
   messageId: verdict.messageId,
   logicalTaskKey: verdict.logicalTaskKey,
   meta: {
+    ...(control ? { control: { control: control.kind, mode: control.mode } } : {}),
     session_id: event.session_id,
     binding_id: effectiveBindingId(mapping),
     policy_id: policyEvaluation.policy_id,
@@ -434,6 +460,16 @@ const claim = acquireClaim({
     mapping_admission_shadow_match: verdict.admission_shadow?.match ?? null,
   },
 });
+
+if (!claim.ok && claim.reason === "duplicate" && control) {
+  // 控制命令重放：按原 claim 里的意图恢复（意图一致才续做；不一致说明是另一条不同正文的命令撞了同一消息 id，拒）。
+  const original = readClaimState({ claimsDir: CLAIMS, key: claim.key });
+  const intent = original.status === "valid" ? original.claim.control : undefined;
+  if (intent && intent.control === control.kind && intent.mode === control.mode) {
+    claim.key = claim.key ?? claimKey(verdict.messageId, verdict.logicalTaskKey);
+    runControl(true);
+  }
+}
 
 if (!claim.ok) {
   const isDup = claim.reason === "duplicate";
@@ -455,25 +491,8 @@ if (!claim.ok) {
   finish("error", { detail: "无法取得投递权：" + claim.error }, { reason: claim.reason });
 }
 
-// ---------- 控制命令：路由侧当场执行，不投递 ----------
-// 正文恰为 /feishu-mode dialogue|mapping（goal 第 3 层）。已过三道闸并拿到 claim（幂等），
-// 所以重放不会切两次；执行结果记成 consumed 终态（不是 run，不需要 run 制品）。
-const control = parseControlCommand(verdict.instruction, { chain: "claude" });
-if (control) {
-  const switched = setClaudeInteractionMode({ root: routed.root, claudeSessionId: mapping.claude_session_id ?? null, mode: control.mode });
-  if (!switched.ok) {
-    recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { reason: "control_failed", control: control.kind, error: switched.reason } });
-    writeReceipt("control-" + verdict.messageId, { status: "error", reason: switched.reason, control: control.kind, mode: control.mode,
-      message_id: verdict.messageId, claim_acquired: true, handed_off: false });
-    finish("error", { detail: "模式没有切换（" + switched.reason + "）" }, { reason: switched.reason });
-  }
-  const changed = switched.changed !== false;
-  recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "consumed", detail: { control: control.kind, mode: control.mode, changed } });
-  writeReceipt("control-" + verdict.messageId, { status: "consumed", control: control.kind, mode: control.mode, changed,
-    message_id: verdict.messageId, project_root: routed.root, claim_acquired: true, handed_off: false });
-  finish("control", { text: controlAckText({ taskName: config.task_display_name, mode: control.mode, changed }) },
-    { control: control.kind, mode: control.mode, changed });
-}
+// ---------- 控制命令：拿到 claim 之后当场执行（可恢复事务），不投递 ----------
+if (control) runControl(false);
 
 let policyRun = dialogueMode ? null : handlePolicy({ claim, resolvedContext: mappingContext });
 if (!dialogueMode &&

@@ -38,7 +38,7 @@ import {
 } from "./intent.mjs";
 import { sweepEligible } from "./drain-all.mjs";
 import { remindCodexPendingClaims } from "./claim-reminder.mjs";
-import { claimKey, recordClaimState } from "../claim.mjs";
+import { claimKey, recordClaimState, readClaimState } from "../claim.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
 import {
   ELIGIBILITY_BUDGET_DEFAULT_MS, ELIGIBILITY_BUDGET_MAX_MS, eligibilityBudgetMs,
@@ -8882,7 +8882,9 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
   assert.equal(fs.readdirSync(paths.claims).filter((n) => n.endsWith(".handed_off.json")).length, 0, "没有投递");
   assert.equal(fs.readdirSync(paths.receipts).filter((n) => n.startsWith("control-")).length, 1);
   const replay = run("$feishu-mode dialogue", "msg_ctl_1");
-  assert.match(replay.stdout, /已经处理过/u, "同一消息重放：幂等命中，不再切");
+  assert.equal(replay.status, 0, replay.stdout + replay.stderr);
+  assert.match(replay.stdout, /^已处理过 · A\n这条控制命令之前已经执行过（当时完成了切换）/u, "同一消息重放：按 consumed 记录重出回执，不再切：" + replay.stdout);
+  assert.equal(fs.readdirSync(paths.claims).filter((n) => n.endsWith(".consumed.json")).length, 1, "重放不再写第二份 consumed");
   const off = run("$feishu-mode mapping", "msg_ctl_2");
   assert.equal(off.status, 0, off.stdout + off.stderr);
   assert.match(off.stdout, /^已切换 · A\n交互模式现在是 Mapping/u, off.stdout);
@@ -8892,6 +8894,21 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
   const notControl = run("$feishu-mode dialogue 吧", "msg_ctl_4");
   assert.doesNotMatch(notControl.stdout, /已切换|模式未变/u, "多一个字就不是控制命令，走普通指令路径：" + notControl.stdout);
   assert.equal(policyOf(), MAPPING_POLICY_ID);
+
+  // 终态写失败：consumed 路径被目录占住 → 退出 1 且模式已切；清障后重放补齐（可恢复事务）
+  const key5 = claimKey("msg_ctl_5", findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task.logical_task_key);
+  fs.mkdirSync(path.join(paths.claims, key5 + ".consumed.json"), { recursive: true });
+  const broken = run("$feishu-mode dialogue", "msg_ctl_5");
+  assert.equal(broken.status, 1, broken.stdout);
+  assert.match(broken.stdout, /模式已切换，但终态没记下/u, broken.stdout);
+  assert.equal(policyOf(), DIALOGUE_POLICY_ID, "动作已成");
+  fs.rmSync(path.join(paths.claims, key5 + ".consumed.json"), { recursive: true, force: true });
+  const resumed = run("$feishu-mode dialogue", "msg_ctl_5");
+  assert.equal(resumed.status, 0, resumed.stdout + resumed.stderr);
+  assert.match(resumed.stdout, /^已补齐 · A\n上次执行后终态没记下，这次已补齐；交互模式是 Dialogue/u, resumed.stdout);
+  assert.ok(fs.existsSync(path.join(paths.claims, key5 + ".consumed.json")));
+  const stored = readClaimState({ claimsDir: paths.claims, key: key5 });
+  assert.deepEqual([stored.status, stored.claim.control], ["valid", { control: "mode", mode: DIALOGUE_POLICY_ID }], "意图随 claim 持久化");
 });
 
 summarySealed = true;

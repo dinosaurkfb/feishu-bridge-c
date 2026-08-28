@@ -146,6 +146,12 @@ function claimProblem(claim, key, expect) {
   if (claim.claude_session_id !== undefined && claim.claude_session_id !== null
     && !CLAUDE_SESSION_SHAPE.test(claim.claude_session_id)) return "claude_session_id 不是会话 uuid 的形状";
   if (claim.codex_thread_id !== undefined && !nonEmpty(claim.codex_thread_id)) return "codex_thread_id 形状不对";
+  if (claim.control !== undefined) {
+    // 控制意图（如 /feishu-mode）在 claim 里持久化，形状封闭：{ control: "mode", mode: mapping|dialogue }。
+    if (claim.control === null || typeof claim.control !== "object" || Array.isArray(claim.control)) return "control 不是对象";
+    if (Object.keys(claim.control).sort().join(",") !== "control,mode") return "control 字段集不对";
+    if (claim.control.control !== "mode" || !["mapping", "dialogue"].includes(claim.control.mode)) return "control 取值不在受控集合里";
+  }
   if (expect.logicalTaskKey !== undefined && claim.logical_task_key !== expect.logicalTaskKey) {
     return "logical_task_key 跟这个 task 对不上";
   }

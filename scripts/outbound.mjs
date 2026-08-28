@@ -12,6 +12,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE, CLAIM_STATE } from "./claim.mjs";
+import { readConsumedRecord } from "./control-command.mjs";
 
 import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
 
@@ -227,6 +228,12 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
       if (name.startsWith(".")) continue;
       const m = CLAIM_ENTRY_RE.exec(name);
       if (!m) { problems.push({ key: null, reason: "unrecognized_entry", why: "delivery-claims/" + name.slice(0, 80) }); continue; }
+      if (m[2] === CLAIM_STATE.CONSUMED + ".json") {
+        // consumed 不是 run 终局、不参与孤儿判定，但**内容坏了要进 problems**（评审探针：坏 JSON 曾被按文件名当健康）。
+        const consumed = readConsumedRecord({ claimsDir, key: m[1] });
+        if (consumed.status !== "valid") problems.push({ key: m[1], reason: "consumed_unreadable", why: name + "：" + (consumed.why ?? consumed.status) });
+        continue;
+      }
       if (!TERMINAL_STATE_FILES.has(m[2])) continue;   // claim 目录、笔记、非终局状态记录：不参与孤儿判定
       note(m[1], "terminal");
       // 盘点只验"是不是一条记录"（非数组对象）；授权语义留给 readTerminalRecord。

@@ -388,9 +388,15 @@ export function inventoryUnroutedReplies({ root } = {}) {
   const NAME = /^\d+-[^.]+-[0-9a-f]{8}\.json$/u;
   for (const n of names) {
     if (!NAME.test(n)) { problems.push({ file: n, reason: /\.tmp\./u.test(n) ? "tmp_artifact" : "unrecognized_entry" }); continue; }
+    // **读内容之前先 lstat，只收普通文件**：目录、符号链接、命名管道一律 unrecognized_entry ——
+    // 名字合规的 FIFO 会让 readFileSync 永远等下去，状态页与 doctor 一起卡死（评审探针）。
+    let st;
+    try { st = fs.lstatSync(path.join(dir, n)); }
+    catch (err) { problems.push({ file: n, reason: "unreadable", error: String(err.code ?? err.message) }); continue; }
+    if (!st.isFile()) { problems.push({ file: n, reason: "unrecognized_entry" }); continue; }
     let doc;
     try { doc = JSON.parse(fs.readFileSync(path.join(dir, n), "utf-8")); }
-    catch (err) { problems.push({ file: n, reason: err.code === "EISDIR" ? "unrecognized_entry" : "unreadable" }); continue; }
+    catch (err) { problems.push({ file: n, reason: "unreadable", error: String(err.code ?? "not_json") }); continue; }
     const shapeOk = doc !== null && typeof doc === "object" && !Array.isArray(doc)
       && doc.schema_version === "1.0" && doc.artifact_type === "feishu_bridge_unrouted_reply"
       && typeof doc.reason === "string" && doc.reason.length > 0

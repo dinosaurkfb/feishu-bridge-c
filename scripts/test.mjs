@@ -18069,6 +18069,25 @@ test("未路由回复盘点：全枚举，只有完整受验的制品计入，�
   assert.equal(inv.ok, true);
   assert.equal(inv.count, 1, "只有完整受验的那份计入");
   assert.deepEqual(inv.problems.map((x) => x.reason).sort(), ["malformed", "tmp_artifact", "unreadable", "unrecognized_entry", "unrecognized_entry"].sort(), JSON.stringify(inv.problems));
+  // 名字合规的非普通文件：符号链接（哪怕指向合法 JSON）、命名管道 —— 读之前 lstat，一律 unrecognized_entry，不读、不挂
+  fs.symlinkSync(path.join(dir, "1787900000000-sess1abc-0a1b2c3d.json"), path.join(dir, "1787900000005-sess1abc-aabbccdd.json"));
+  const withLink = inventoryUnroutedReplies({ root });
+  assert.equal(withLink.count, 1, "符号链接不算合法制品");
+  assert.ok(withLink.problems.some((p) => p.file === "1787900000005-sess1abc-aabbccdd.json" && p.reason === "unrecognized_entry"), JSON.stringify(withLink.problems));
+  const fifo = path.join(dir, "1787900000006-sess1abc-eeff0011.json");
+  const mk = spawnSync("mkfifo", [fifo], { encoding: "utf-8" });
+  if (mk.status === 0) {
+    const probe = spawnSync(process.execPath, ["--input-type=module", "-e",
+      'const { inventoryUnroutedReplies } = await import(' + JSON.stringify(pathToFileURL(path.resolve("scripts", "drain-outbox.mjs")).href) + ');'
+      + 'process.stdout.write(JSON.stringify(inventoryUnroutedReplies({ root: ' + JSON.stringify(root) + ' })));'],
+      { encoding: "utf-8", timeout: 5000 });
+    assert.equal(probe.status, 0, "命名管道不许让盘点挂住：" + (probe.error?.code ?? probe.stderr));
+    const viaFifo = JSON.parse(probe.stdout);
+    assert.equal(viaFifo.count, 1);
+    assert.ok(viaFifo.problems.some((p) => p.file === path.basename(fifo) && p.reason === "unrecognized_entry"), JSON.stringify(viaFifo.problems));
+    fs.rmSync(fifo, { force: true });
+  }
+  fs.rmSync(path.join(dir, "1787900000005-sess1abc-aabbccdd.json"), { force: true });
   assert.equal(inventoryUnroutedReplies({ root: path.join(local, "nope") }).count, 0, "目录不存在 = 0");
   fs.writeFileSync(path.join(local, "file-not-dir"), "x");
   assert.equal(inventoryUnroutedReplies({ root: path.join(local, "file-not-dir") }).count, 0);

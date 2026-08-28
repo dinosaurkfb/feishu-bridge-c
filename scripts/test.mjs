@@ -18051,6 +18051,56 @@ test("一个 session 只属于一个代际：校验器拦重复、激活拒绝�
   assert.deepEqual([amb.ok, amb.reason, amb.candidates], [false, "ambiguous_session", 2]);
 });
 
+test("未路由回复盘点：全枚举，只有完整受验的制品计入，临时 / 未知 / 坏 JSON / 畸形都进 problems；runs 账本读不出时状态页照样渲染；doctor 计入", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-unrouted-"));
+  const root = path.join(local, "project");
+  const dir = path.join(root, ".runtime-data", "outbound", "unrouted-replies");
+  fs.mkdirSync(dir, { recursive: true });
+  const valid = { schema_version: "1.0", artifact_type: "feishu_bridge_unrouted_reply", reason: "claim_absent", why: null,
+    message_id: "msg_x", origin_channel_generation_id: null, session_id: "sess-1", binding_id: "b@registry",
+    recorded_at: "2026-08-28T10:00:00.000Z", reply_text: "完整答复" };
+  fs.writeFileSync(path.join(dir, "1787900000000-sess1abc-0a1b2c3d.json"), JSON.stringify(valid));
+  fs.writeFileSync(path.join(dir, "1787900000001-sess1abc-11223344.json"), "{not json");
+  fs.writeFileSync(path.join(dir, "1787900000002-sess1abc-55667788.json.tmp.4242"), JSON.stringify(valid));
+  fs.writeFileSync(path.join(dir, "README.txt"), "unknown");
+  fs.writeFileSync(path.join(dir, "1787900000003-sess1abc-99aabbcc.json"), JSON.stringify({ ...valid, reply_text: undefined }));
+  fs.mkdirSync(path.join(dir, "1787900000004-sess1abc-deadbeef.json"));
+  const inv = inventoryUnroutedReplies({ root });
+  assert.equal(inv.ok, true);
+  assert.equal(inv.count, 1, "只有完整受验的那份计入");
+  assert.deepEqual(inv.problems.map((x) => x.reason).sort(), ["malformed", "tmp_artifact", "unreadable", "unrecognized_entry", "unrecognized_entry"].sort(), JSON.stringify(inv.problems));
+  assert.equal(inventoryUnroutedReplies({ root: path.join(local, "nope") }).count, 0, "目录不存在 = 0");
+  fs.writeFileSync(path.join(local, "file-not-dir"), "x");
+  assert.equal(inventoryUnroutedReplies({ root: path.join(local, "file-not-dir") }).count, 0);
+  // 状态页：runs 账本读不出（runs 路径是文件）时，未路由那几行照样渲染，不被提前 return 藏掉
+  const rows = runChannelRows({ inventoryOk: false, runs: { problems: [{ key: null, reason: "runs_not_a_directory" }] }, unrouted: inv });
+  assert.ok(rows.some((r) => r[0] === "run 通道" && /runs_not_a_directory/u.test(r[1])), JSON.stringify(rows));
+  const ur = rows.find((r) => r[0] === "未路由回复");
+  assert.ok(ur && ur[1].startsWith("1 条（需要人看") && /另有 5 个说不清的条目/u.test(ur[1]), JSON.stringify(rows));
+  assert.ok(rows.some((r) => r[1] === "tmp_artifact"), "临时制品要逐条列出");
+  assert.deepEqual(runChannelRows({ inventoryOk: false, runs: { problems: [] }, unrouted: { ok: false, reason: "unrouted_unreadable" } }).find((r) => r[0] === "未路由回复"),
+    ["未路由回复", "说不清（unrouted_unreadable）"]);
+});
+
+test("doctor ⑥：未路由回复及其目录里说不清的条目都算进问题，不报'无积压'", () => {
+  const m = doctorMachine();
+  const good = m.project("good", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "good", root: good, root_message_id: "om_x", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const dir = path.join(good, ".runtime-data", "outbound", "unrouted-replies");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "1787900000001-sess1abc-11223344.json"), "{not json");
+  fs.writeFileSync(path.join(dir, "1787900000002-sess1abc-55667788.json.tmp.4242"), "{}");
+  fs.writeFileSync(path.join(dir, "README.txt"), "unknown");
+  const report = doctorReport(m.run());
+  const drain = checkOf(report, "backlog_vs_publisher");
+  assert.notEqual(drain.ok, true, JSON.stringify(drain));
+  assert.match(String(drain.detail), /未路由目录说不清 3 处/u, drain.detail);
+  fs.writeFileSync(path.join(dir, "1787900000000-sess1abc-0a1b2c3d.json"), JSON.stringify({ schema_version: "1.0", artifact_type: "feishu_bridge_unrouted_reply",
+    reason: "origin_unresolvable", why: "x", message_id: "msg", origin_channel_generation_id: null, session_id: "s", binding_id: "b", recorded_at: "2026-08-28T10:00:00.000Z", reply_text: "t" }));
+  const report2 = doctorReport(m.run());
+  assert.match(String(checkOf(report2, "backlog_vs_publisher").detail), /未路由回复 1 条/u);
+});
+
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (failed > 0) {

@@ -376,21 +376,31 @@ function runChannelContext({ root, dryRun }) {
 export function inventoryUnroutedReplies({ root } = {}) {
   const dir = path.join(root, ".runtime-data", "outbound", "unrouted-replies");
   let names;
-  try { names = fs.readdirSync(dir).filter((n) => n.endsWith(".json")).sort(); }
+  // **枚举全部目录项**，不先按后缀过滤：写方的临时制品（.json.tmp.<pid>）、不认识的条目都要报出来，
+  // 只有目录不存在才等于零（评审探针：三项只报一项，doctor 还说无积压）。
+  try { names = fs.readdirSync(dir).sort(); }
   catch (err) {
-    if (err.code === "ENOENT") return { ok: true, count: 0, entries: [], dir };
-    return { ok: false, reason: "unrouted_unreadable", error: String(err.code ?? err.message), count: 0, entries: [], dir };
+    if (err.code === "ENOENT") return { ok: true, count: 0, entries: [], problems: [], dir };
+    return { ok: false, reason: "unrouted_unreadable", error: String(err.code ?? err.message), count: 0, entries: [], problems: [], dir };
   }
   const entries = [];
   const problems = [];
+  const NAME = /^\d+-[^.]+-[0-9a-f]{8}\.json$/u;
   for (const n of names) {
-    try {
-      const doc = JSON.parse(fs.readFileSync(path.join(dir, n), "utf-8"));
-      if (doc?.artifact_type !== "feishu_bridge_unrouted_reply" || typeof doc.reason !== "string") { problems.push(n); continue; }
-      entries.push({ file: n, reason: doc.reason, why: doc.why ?? null, recordedAt: doc.recorded_at ?? null });
-    } catch { problems.push(n); }
+    if (!NAME.test(n)) { problems.push({ file: n, reason: /\.tmp\./u.test(n) ? "tmp_artifact" : "unrecognized_entry" }); continue; }
+    let doc;
+    try { doc = JSON.parse(fs.readFileSync(path.join(dir, n), "utf-8")); }
+    catch (err) { problems.push({ file: n, reason: err.code === "EISDIR" ? "unrecognized_entry" : "unreadable" }); continue; }
+    const shapeOk = doc !== null && typeof doc === "object" && !Array.isArray(doc)
+      && doc.schema_version === "1.0" && doc.artifact_type === "feishu_bridge_unrouted_reply"
+      && typeof doc.reason === "string" && doc.reason.length > 0
+      && typeof doc.session_id === "string" && doc.session_id.length > 0
+      && typeof doc.reply_text === "string"
+      && isCanonicalIso(doc.recorded_at);
+    if (!shapeOk) { problems.push({ file: n, reason: "malformed" }); continue; }
+    entries.push({ file: n, reason: doc.reason, why: doc.why ?? null, recordedAt: doc.recorded_at });
   }
-  return { ok: true, count: entries.length, entries, unrecognized: problems, dir };
+  return { ok: true, count: entries.length, entries, problems, dir };
 }
 
 export function inspectRunChannel({ root, claudeSessionId } = {}) {

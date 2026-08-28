@@ -42,7 +42,7 @@ function describeQuarantine(r) {
 export function describeReapLockRepair(r, { apply }) {
   const lines = [];
   const age = Number.isFinite(r.ageMs) ? Math.round(r.ageMs / 1000) + " 秒" : "?";
-  if (r.reason === "io_error") lines.push("维护未完成 —— I/O 错误（阶段 " + (r.phase ?? "?") + "：" + (r.error ?? "io_error") + "）：" + (r.phase === "maintenance_lock" ? r.maintDir : r.reapDir));
+  if (r.reason === "io_error") lines.push("维护未完成 —— I/O 错误（阶段 " + (r.phase ?? "?") + "：" + (r.error ?? "io_error") + "）：" + (r.path ?? (r.phase === "maintenance_lock" ? r.maintDir : r.reapDir)));
   else if (r.reason === "unrecognized_artifact") lines.push("reap 路径上的东西不是本协议的残骸（目录 / 普通文件 / 畸形 symlink），不动，请人工查看：" + r.reapDir);
   else if (r.reason === "maintenance_busy") lines.push("另一个维护者正在处理（维护锁在）：" + r.maintDir + "\n若确认没有维护者在跑，手动删除该维护锁后重试。");
   else if (r.reason === "instance_changed" || r.reason === "already_cleared") lines.push("残骸在处理期间已变化或已被清除，未动：" + r.reapDir);

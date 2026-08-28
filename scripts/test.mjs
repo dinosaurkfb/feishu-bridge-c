@@ -3626,6 +3626,29 @@ test("维护入口的异常闭合：盘点 / 隔离的 I/O 错误按阶段报出
   const junkSeen = clearStaleReapLock(lockDir, { apply: true });
   assert.deepEqual([junkSeen.quarantine.length, junkSeen.quarantine[0].recognized, junkSeen.quarantine[0].removed], [1, false, false]);
   assert.equal(fs.readFileSync(path.join(junk, "sentinel"), "utf-8"), "keep");
+  fs.rmSync(junk, { recursive: true, force: true });
+  // 6. 隔离文件身份封闭：owner 合法但后缀不是规范 UUID → recognized:false、列出、不动（评审探针：任意后缀曾被删）
+  const badName = reapDir + ".quarantine-not-a-maintenance-token";
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "x" }), badName);
+  fs.lutimesSync(badName, old, old);
+  const goodName = reapDir + ".quarantine-0f1e2d3c-4b5a-4978-8f6e-5d4c3b2a1908";
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "y" }), goodName);
+  fs.lutimesSync(goodName, old, old);
+  const named = clearStaleReapLock(lockDir, { apply: true });
+  const byPath = Object.fromEntries(named.quarantine.map((e) => [e.path, e]));
+  assert.deepEqual([byPath[badName].recognized, byPath[badName].removed], [false, false], JSON.stringify(named));
+  assert.ok(fs.lstatSync(badName).isSymbolicLink(), "后缀不合规的一字不动");
+  assert.deepEqual([byPath[goodName].recognized, byPath[goodName].removed], [true, true]);
+  assert.throws(() => fs.lstatSync(goodName));
+  fs.rmSync(badName, { force: true });
+  // 7. 逐项 lstat 报 EACCES：不是"没有"，是 io_error（阶段 inventory，带路径），制品不动，apply 不算完成
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "z" }), goodName);
+  fs.lutimesSync(goodName, old, old);
+  restore = failOn("lstatSync", goodName, "EACCES");
+  try { r = clearStaleReapLock(lockDir, { apply: true }); } finally { restore(); }
+  assert.deepEqual([r.reason, r.phase, r.path], ["io_error", "inventory", goodName], JSON.stringify(r));
+  assert.ok(fs.lstatSync(goodName).isSymbolicLink());
+  assert.equal(clearStaleReapLock(lockDir, { apply: true }).quarantine[0].removed, true, "故障消失后同一入口能清");
 });
 
 test("repair-publish-lock 退出码：只有确实没有 / 已清 / 预览是 0，--apply 没做完一律非零", () => {
@@ -3649,14 +3672,20 @@ test("repair-publish-lock 退出码：只有确实没有 / 已清 / 预览是 0�
   const unrec = cli("--lock", lockDir, "--apply");
   assert.deepEqual([unrec.status, /不是本协议的残骸/u.test(unrec.stdout)], [1, true]);
   fs.rmSync(reapDir, { recursive: true, force: true });
-  const junk = reapDir + ".quarantine-junk";
-  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "left" }), junk);
-  fs.lutimesSync(junk, old, old);
+  const left = reapDir + ".quarantine-9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d";
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "left" }), left);
+  fs.lutimesSync(left, old, old);
   const leftover = cli("--lock", lockDir);
   assert.deepEqual([leftover.status, /隔离残留可清/u.test(leftover.stdout)], [0, true], leftover.stdout);
   const cleaned = cli("--lock", lockDir, "--apply");
   assert.deepEqual([cleaned.status, /已清隔离残留/u.test(cleaned.stdout)], [0, true], cleaned.stdout);
-  assert.throws(() => fs.lstatSync(junk));
+  assert.throws(() => fs.lstatSync(left));
+  const badName = reapDir + ".quarantine-not-a-maintenance-token";
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "x" }), badName);
+  fs.lutimesSync(badName, old, old);
+  const bad = cli("--lock", lockDir, "--apply");
+  assert.deepEqual([bad.status, /不认识的东西/u.test(bad.stdout)], [1, true], bad.stdout);
+  assert.ok(fs.lstatSync(badName).isSymbolicLink(), "后缀不合规的不许删");
 });
 
 test("两个真实 OS 进程同时清同一个 reap 残骸：最多一个 removed，之后出现的新实例不许被删", () => {

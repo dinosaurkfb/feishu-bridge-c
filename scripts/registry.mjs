@@ -253,6 +253,8 @@ export function attributeSession({ projects, cwd, transcriptPath }) {
 const OWNERLESS_LOCK_GRACE_MS = 10 * 1000;
 // reap 锁只在回收那几毫秒里持有；超过这个年龄就是回收者崩在里面了。
 const REAP_LOCK_STALE_MS = 60 * 1000;
+// 隔离路径后缀：只有 crypto.randomUUID() 的形状。
+const QUARANTINE_SUFFIX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 // 本进程当前持有的锁实例：lockDir → token。释放时据此核对，调用点不用改签名。
 const HELD = new Map();
 
@@ -434,7 +436,9 @@ export function clearStaleReapLock(lockDir, {
     return { present: true, recognized, owner: r.owner, ageMs, stale: ageMs > staleMs };
   };
   // 隔离路径的残留（上次隔离成功、unlink 失败）：同一入口要能看见、能清。它们已经离开原路径，
-  // 不涉及归属，但仍只清形状合法且已陈旧的 symlink。
+  // 不涉及归属，但身份必须**封闭**：精确前缀 + 规范 UUID 后缀（我们只会生成这种名字）+ 形状合法的 symlink owner。
+  // 前缀像但后缀不合规的东西列出来、标 recognized:false、不动（评审探针：任意后缀曾被当残留删掉）。
+  // 逐项 lstat 只有 ENOENT 算"并发消失"，其余是 I/O 故障，带阶段与路径报出（评审探针：曾被 continue 吞掉）。
   const inventoryQuarantine = () => {
     let names = [];
     try { names = fs.readdirSync(path.dirname(reapDir)).filter((n) => n.startsWith(quarantinePrefix)); }
@@ -443,9 +447,14 @@ export function clearStaleReapLock(lockDir, {
     for (const n of names) {
       const full = path.join(path.dirname(reapDir), n);
       let st;
-      try { st = fs.lstatSync(full); } catch { continue; }
+      try { st = fs.lstatSync(full); }
+      catch (err) {
+        if (err.code === "ENOENT") continue;
+        return { ioError: { phase: "inventory", error: err.message, path: full }, entries };
+      }
+      const nameOk = QUARANTINE_SUFFIX.test(n.slice(quarantinePrefix.length));
       const r = readLockOwner(full);
-      entries.push({ path: full, recognized: st.isSymbolicLink() && r.owner !== null, ageMs: Date.now() - st.mtimeMs, removed: false });
+      entries.push({ path: full, recognized: nameOk && st.isSymbolicLink() && r.owner !== null, ageMs: Date.now() - st.mtimeMs, removed: false });
     }
     return { entries };
   };

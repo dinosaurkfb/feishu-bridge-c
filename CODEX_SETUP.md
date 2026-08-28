@@ -188,7 +188,7 @@ $feishu-status
 | `$feishu-bind` | 接入当前 task；暂停后再次运行会复用原话题恢复 |
 | `$feishu-unbind` | 可恢复地暂停入站和自动发布；不删除话题或历史 |
 | `$feishu-status` | 只读查看当前 task 的接入、绑定和待发布数量 |
-| `$feishu-rotate` | 创建下一话题代际；新话题认领前旧话题继续工作，认领后旧话题只读 |
+| `$feishu-rotate` | 创建下一话题代际；新话题认领前旧话题继续工作，认领后旧话题成为历史话题（仍可下指令，回复回原话题） |
 | `$feishu-mode` | 无参数只读查看；加 `dialogue` 或 `mapping` 显式切换交互策略 |
 | `npm run doctor:codex` | 只读检查机器级依赖和安装状态 |
 | `npm test` | 运行 Claude 基线与 Codex adapter 全套本地回归 |

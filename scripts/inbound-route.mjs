@@ -31,7 +31,8 @@ import {
 } from "./subscription.mjs";
 import {
   activatePendingTopicGeneration, materializeLegacyTopicFields, pendingGeneration,
-  topicGenerationStateForLegacy, effectiveBindingId
+  topicGenerationStateForLegacy, effectiveBindingId,
+  generationForSession,
 } from "./topic-generation.mjs";
 
 // 幂等列表住在 project-resolve（它是更低层的那个模块），从这里转出去，
@@ -104,19 +105,27 @@ export function listBindings({ registryFile, templateFile } = {}) {
 /**
  * session_id → 绑定。
  *
- * 只认 status === "active" 且 session_id 严格相等。null 跟任何真实 session 都不相等，
- * 所以还没绑的项目永远不会在这里被选中 —— 它们只能走 promotion 那条路。
+ * 只认 status === "active"。session 要么是当前代际的（mapping.session_id 严格相等），要么是
+ * 某个 read-only 历史代际的（2026-08-28 goal 第 2 层：老话题也能下指令，回复发回原话题）。
+ * null 跟任何真实 session 都不相等，所以还没绑的项目永远不会在这里被选中 —— 它们只能走 promotion。
+ * 返回里带 originGenerationId / originGenerationStatus：出站据此把回复冻结到来源话题。
  */
 export function findBindingForSession({ sessionId, registryFile, templateFile } = {}) {
   if (typeof sessionId !== "string" || !sessionId) return { ok: false, reason: "no_session_id" };
   const listed = listBindings({ registryFile, templateFile });
   if (!listed.ok) return { ok: false, reason: listed.reason, error: listed.error };
 
-  const hit = listed.bindings.find(
-    (b) => b.mapping?.status === "active" && b.mapping?.session_id === sessionId,
-  );
-  if (!hit) return { ok: false, reason: "no_binding_for_session", candidates: listed.bindings.length };
-  return { ok: true, ...hit };
+  for (const b of listed.bindings) {
+    if (b.mapping?.status !== "active") continue;
+    if (b.mapping?.session_id === sessionId) {
+      return { ok: true, ...b, originGenerationId: b.mapping.channel_generation_id ?? null, originGenerationStatus: "active" };
+    }
+    const historic = generationForSession(b.mapping?.topic_generation_state ?? null, sessionId);
+    if (historic && historic.status === "read-only") {
+      return { ok: true, ...b, originGenerationId: historic.channel_generation_id, originGenerationStatus: "read-only" };
+    }
+  }
+  return { ok: false, reason: "no_binding_for_session", candidates: listed.bindings.length };
 }
 
 // 只有写了显式截止的登记行才会过期；没写（或 null）= 不过期。

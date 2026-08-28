@@ -33,7 +33,7 @@ import {
 import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
 import { machineContext, runDoctor } from "./doctor.mjs";
-import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
+import { activeGenerationForSession, effectiveBindingId, generationForSession, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import {
   claimReminderDue as tgClaimReminderDue, markPendingClaimReminder as tgMarkPendingClaimReminder,
   validateTopicGenerationState as tgValidateState,
@@ -5846,7 +5846,7 @@ test("status 只读，且不把话题 id 之类的 locator 打进人类可读输
   assert.ok(!text.includes("session_x"), "Aily session 同理");
 });
 
-test("status 明确说明只读旧话题仍会接收轮转前受理的迟到结果", () => {
+test("status 明确说明历史话题仍可下指令、回复回原话题", () => {
   const text = describeStatus({
     ok: true,
     displayName: "演示",
@@ -5861,7 +5861,8 @@ test("status 明确说明只读旧话题仍会接收轮转前受理的迟到结�
     expiresAt: null,
     pending: 0,
   });
-  assert.match(text, /只读历史.*轮转前受理的结果仍会发回原话题/u);
+  assert.match(text, /历史话题\s+1 个代际（仍可下指令，回复发回你说话的那个话题）/u);
+  assert.doesNotMatch(text, /只读|不再接收/u);
   assert.match(text, /自动轮转\s+0 \/ 50 条有效业务消息/u);
 });
 
@@ -17740,6 +17741,79 @@ test("订阅投影：没有显式截止的待绑定 claim_expires_at_ms 为 null
   assert.equal(claimable(explicit.pending_bindings[0], NOW), false);
   const bad = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records: [record({})], pendingWindowMs: -1 });
   assert.equal(bad.ok, false, "给了窗口就必须是正数");
+});
+
+// ─── 第 2 层：老话题也能驱动 ─────────────────────────────────────────────────────
+function rotatedRegistryFixture() {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-l2-"));
+  const root = path.join(local, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const registryFile = path.join(local, "registry.json");
+  const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  const entry = newRegistryEntry({ root, name: "老话题", purpose: null, token: "aaa111", rootMessageId: "om_old", now: NOW });
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [entry] }, null, 2));
+  assert.equal(promoteBinding({ root, id: entry.id, source: "registry", generationId: entry.channel_generation_id,
+    sessionId: "session_old", registryFile, now: NOW + 1 }).ok, true);
+  assert.equal(prepareClaudeTopicRotation({ root, operationId: "op_l2", registryFile, now: NOW + 2 }).ok, true);
+  const registered = registerClaudeTopicRotation({ root, operationId: "op_l2", rootMessageId: "om_new", pendingToken: "bbb222", registryFile, now: NOW + 3 });
+  assert.equal(registered.ok, true);
+  assert.equal(promoteBinding({ root, id: entry.id, source: "registry", generationId: registered.generation.channel_generation_id,
+    sessionId: "session_new", registryFile, now: NOW + 4 }).ok, true);
+  const state = () => JSON.parse(fs.readFileSync(registryFile, "utf-8")).projects[0].topic_generation_state;
+  const oldGen = state().generations.find((g) => g.root_message_id === "om_old");
+  const newGen = state().generations.find((g) => g.root_message_id === "om_new");
+  assert.deepEqual([oldGen.status, newGen.status], ["read-only", "active"]);
+  return { local, root, entry, registryFile, templateFile, oldGen, newGen, state };
+}
+
+test("老话题也能驱动：只读代际的 session 路由到同一绑定，origin 是那个老代际；新话题 origin 是当前代际；pending / retired / 非 active 绑定不路由", () => {
+  const fx = rotatedRegistryFixture();
+  const files = { registryFile: fx.registryFile, templateFile: fx.templateFile };
+  const viaOld = findBindingForSession({ sessionId: "session_old", ...files });
+  assert.equal(viaOld.ok, true, JSON.stringify(viaOld));
+  assert.equal(viaOld.root, fx.root);
+  assert.deepEqual([viaOld.originGenerationId, viaOld.originGenerationStatus], [fx.oldGen.channel_generation_id, "read-only"]);
+  const viaNew = findBindingForSession({ sessionId: "session_new", ...files });
+  assert.deepEqual([viaNew.ok, viaNew.originGenerationId, viaNew.originGenerationStatus], [true, fx.newGen.channel_generation_id, "active"]);
+  assert.equal(findBindingForSession({ sessionId: "session_unknown", ...files }).reason, "no_binding_for_session");
+  // 出站按同一个 origin 解析：老话题的回复落回老话题
+  const mapping = resolveProject({ root: fx.root, registryFile: fx.registryFile, templateFile: fx.templateFile }).mapping;
+  const target = resolveMappingOutboundGeneration(mapping, viaOld.originGenerationId);
+  assert.deepEqual([target.ok, target.rootMessageId, target.status], [true, "om_old", "read-only"], "老话题的指令，回复发回老话题");
+  // 映射策略上下文按 session 定 origin：老 session → 老代际；新 session → 当前代际；认不出的 session → 退回当前代际
+  const ctx = (sid) => buildLegacyMappingContext({ runtime: "claude", mapping, event: { session_id: sid } });
+  assert.deepEqual([ctx("session_old").originChannelGenerationId, ctx("session_old").originGenerationStatus], [fx.oldGen.channel_generation_id, "read-only"]);
+  assert.deepEqual([ctx("session_new").originChannelGenerationId, ctx("session_new").originGenerationStatus], [fx.newGen.channel_generation_id, "active"]);
+  assert.equal(ctx("session_other").originChannelGenerationId, mapping.channel_generation_id);
+  // retired 的代际不路由；绑定暂停整体不路由
+  const reg = JSON.parse(fs.readFileSync(fx.registryFile, "utf-8"));
+  const gens = reg.projects[0].topic_generation_state.generations;
+  gens.find((g) => g.root_message_id === "om_old").status = "retired";
+  fs.writeFileSync(fx.registryFile, JSON.stringify(reg, null, 2));
+  assert.equal(findBindingForSession({ sessionId: "session_old", ...files }).reason, "no_binding_for_session", "retired 不再路由");
+  const reg2 = JSON.parse(fs.readFileSync(fx.registryFile, "utf-8"));
+  reg2.projects[0].topic_generation_state.generations.find((g) => g.root_message_id === "om_old").status = "read-only";
+  reg2.projects[0].topic_generation_state.binding_status = "paused";
+  reg2.projects[0].status = SUSPENDED;
+  fs.writeFileSync(fx.registryFile, JSON.stringify(reg2, null, 2));
+  assert.equal(findBindingForSession({ sessionId: "session_old", ...files }).ok, false, "绑定暂停：老话题也不路由");
+});
+
+test("generationForSession：active / read-only 都算，pending 没 session、retired 不算，绑定不 active 一律 null", () => {
+  const fx = rotatedRegistryFixture();
+  const st = fx.state();
+  assert.equal(generationForSession(st, "session_old").channel_generation_id, fx.oldGen.channel_generation_id);
+  assert.equal(generationForSession(st, "session_new").channel_generation_id, fx.newGen.channel_generation_id);
+  assert.equal(generationForSession(st, "session_zzz"), null);
+  assert.equal(generationForSession(st, null), null);
+  const retired = structuredClone(st);
+  retired.generations.find((g) => g.root_message_id === "om_old").status = "retired";
+  assert.equal(generationForSession(retired, "session_old"), null);
+  const paused = structuredClone(st);
+  paused.binding_status = "paused";
+  assert.equal(generationForSession(paused, "session_new"), null);
+  assert.equal(activeGenerationForSession(st, "session_old"), null, "只认 active 的那个查询保持原义");
 });
 
 summarySealed = true;

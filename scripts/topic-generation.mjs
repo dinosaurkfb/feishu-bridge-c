@@ -454,6 +454,18 @@ export function activeGenerationForSession(state, sessionId) {
 }
 
 /**
+ * 一个 Aily session 对应哪个代际 —— **active 与 read-only 都算**（2026-08-28 goal 第 2 层：
+ * 老话题也能下指令）。pending 还没 session，retired 不再路由。绑定不是 active 一律 null。
+ * 路由用它决定"这条消息来自哪个话题"，出站按同一个代际把回复发回原话题。
+ */
+export function generationForSession(state, sessionId) {
+  if (!nonEmpty(sessionId) || state?.binding_status !== "active") return null;
+  return state.generations?.find((generation) =>
+    [GENERATION_STATUS.ACTIVE, GENERATION_STATUS.READ_ONLY].includes(generation.status) &&
+    generation.session_id === sessionId) ?? null;
+}
+
+/**
  * 记录一条已经通过业务闸门、或已经成功发布到飞书的有效消息。
  *
  * eventKey 会先哈希成 opaque key 再落 Git 外状态；重复 hook、publisher 重试或相同消息的二次观察

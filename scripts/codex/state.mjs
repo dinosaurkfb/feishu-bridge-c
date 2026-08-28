@@ -25,7 +25,7 @@ import {
 } from "../subscription.mjs";
 import {
   ROTATION_STATUS, activatePendingTopicGeneration, activeGeneration,
-  activeGenerationForSession, applyTopicGenerationToMapping, closePendingTopicGeneration,
+  applyTopicGenerationToMapping, closePendingTopicGeneration, generationForSession,
   failTopicRotation, materializeLegacyTopicFields, pendingGeneration, prepareTopicRotation,
   recordTopicGenerationActivity, registerPendingTopicGeneration, topicGenerationStateForLegacy,
   markPendingClaimReminder,
@@ -533,7 +533,8 @@ export function findTaskForFeishuSession({ sessionId, home = bridgeHome() } = {}
   const task = reg.tasks.find((candidate) => {
     if ((candidate.status ?? "active") !== "active") return false;
     const loaded = topicStateForTask(candidate);
-    return loaded.ok && Boolean(activeGenerationForSession(loaded.state, sessionId));
+    // active 与 read-only 历史代际的 session 都路由（goal 第 2 层：老话题也能下指令）
+    return loaded.ok && Boolean(generationForSession(loaded.state, sessionId));
   });
   if (!task) return { ok: false, reason: "no_binding_for_session", candidates: reg.tasks.length };
   const resolved = resolveTask(task, { home });

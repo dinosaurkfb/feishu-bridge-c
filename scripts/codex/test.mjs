@@ -1043,8 +1043,18 @@ test("Codex adapter 轮转期间旧 session 继续路由，认领后新旧代际
     now: 1500,
   });
   assert.equal(switched.ok, true);
-  assert.equal(findTaskForFeishuSession({ sessionId: "session_old", home }).ok, false);
+  // goal 第 2 层：老话题（read-only 代际）的 session 仍路由到同一 task，origin 按 session 定 → 回复回老话题
+  const viaOld = findTaskForFeishuSession({ sessionId: "session_old", home });
+  assert.equal(viaOld.ok, true, JSON.stringify(viaOld));
   assert.equal(findTaskForFeishuSession({ sessionId: "session_new", home }).ok, true);
+  const oldGen = topicStateForTask(viaOld.task).state.generations.find((g) => g.root_message_id === "om_old");
+  const ctxOld = buildLegacyMappingContext({ runtime: "codex", mapping: viaOld.mapping, event: { session_id: "session_old" } });
+  assert.deepEqual([ctxOld.originChannelGenerationId, ctxOld.originGenerationStatus], [oldGen.channel_generation_id, "read-only"]);
+  const ctxNew = buildLegacyMappingContext({ runtime: "codex", mapping: viaOld.mapping, event: { session_id: "session_new" } });
+  assert.equal(ctxNew.originChannelGenerationId, registered.generation.channel_generation_id);
+  const oldTarget = resolveTaskOutboundGeneration(viaOld.task, ctxOld.originChannelGenerationId);
+  assert.deepEqual([oldTarget.ok, oldTarget.rootMessageId, oldTarget.status], [true, "om_old", "read-only"], "老话题的指令，回复发回老话题");
+  assert.equal(findTaskForFeishuSession({ sessionId: "session_zzz", home }).ok, false);
   const stored = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
   const state = topicStateForTask(stored).state;
   assert.equal(activeGeneration(state).root_message_id, "om_new");
@@ -1057,9 +1067,9 @@ test("Codex adapter 轮转期间旧 session 继续路由，认领后新旧代际
     "--thread-id", THREAD_A,
   ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
   assert.equal(status.status, 0, status.stderr);
-  // 迁到四层之后措辞变了，**测的仍是同一件事**：有 1 个只读历史代际。
-  assert.match(status.stdout, /只读历史.*1 个代际/u,
-    "只读历史那条事实必须还在：" + status.stdout);
+  // 迁到四层之后措辞变了，**测的仍是同一件事**：有 1 个历史代际（2026-08-28 起叫"历史话题"，仍可下指令）。
+  assert.match(status.stdout, /历史话题.*1 个代际（仍可下指令，回复回原话题）/u,
+    "历史话题那条事实必须还在：" + status.stdout);
   assert.match(status.stdout, /第 3 层 · 精确通道绑定/u, "而且要出现在第 3 层里");
 });
 

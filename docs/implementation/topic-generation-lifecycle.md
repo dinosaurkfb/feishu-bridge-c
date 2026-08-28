@@ -118,7 +118,7 @@ opaque generation id，保证升级前 run 冻结的 `origin_channel_generation_
 | 首次认领切换 | `inbound-route.mjs` | `codex/state.mjs` |
 | 状态展示 | `/feishu-status` | `$feishu-status` |
 
-`status` 只展示代际序号、pending 截止时间和只读历史数量，不打印 generation id、话题 locator、
+`status` 只展示代际序号、pending 等待时长 / 截止和历史话题数量，不打印 generation id、话题 locator、
 session locator、凭据、claim 或 receipt。
 
 ## 7. 验证与回滚
@@ -133,7 +133,7 @@ session locator、凭据、claim 或 receipt。
 - 全量 `npm test`、共享导出面 `npm run contract` 与 `git diff --check`。
 
 真实证据当前覆盖 Codex 的“显式 rotate → 创建 generation 2 → 新话题真实 mention → binding 切换”
-主路径。旧话题对新指令的只读拒绝、轮转前已受理结果回旧话题、显式取消和显式截止过期仍只有
+主路径。旧话题的指令路由到当前会话且回复回原话题（2026-08-28 起，此前只读拒绝）、轮转前已受理结果回旧话题、显式取消和显式截止过期仍只有
 合成测试证据；完成这些测试前不得把它们记为真实链路已验收。Claude 侧真实轮转也应单独验证。
 
 安装与真实链路验收是独立动作。自动轮转候选的代码合并不会修改本机已安装 hooks/skills，也不会

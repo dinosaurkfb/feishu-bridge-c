@@ -91,7 +91,7 @@ claim 成功只代表事件已受理。只有目标运行出现严格完成事�
 - 本地来源 run 没有飞书 origin，在形成 outbox 项时解析并冻结当时的 active generation。若轮转在
   run 完成前发生，它进入新 generation；若轮转发生在 outbox 形成后，目标不再改写。
 
-只读旧 generation 必须允许发布已经冻结到它的迟到结果，但不得接收新的入站指令。
+只读旧 generation 必须允许发布已经冻结到它的迟到结果。**2026-08-28 起旧 generation 也接收登记发送者的新指令**：路由到同一 binding 的当前会话，`origin_channel_generation_id` 取消息所在的那个代际，回复因此发回原话题；旧代际的消息不计入自动轮转计数。
 
 ### INV-10 运行时隔离
 

@@ -235,7 +235,7 @@ Relay 必须显式使用新的 policy version；其预算分别统计 human cycl
 
 - binding 必须有稳定 `binding_id`，每个话题有单调递增的 `generation`；
 - 任一时刻只有一个 generation 接收新入站；
-- 旧 generation 保留为只读历史；
+- 旧 generation 保留为历史话题：不再是新回复的默认去处，但仍可下指令（2026-08-28 起），回复发回指令所在的话题；
 - 轮转前已经受理的请求仍回复到其来源话题；
 - 轮转后新请求只进入新话题；
 - 新话题等待首次真实 mention 认领时，旧 generation 继续保持 active；pending generation 默认在

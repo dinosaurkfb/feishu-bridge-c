@@ -196,8 +196,8 @@ export function describeStatus(st, others = [], { now = Date.now() } = {}) {
     lines.push("待认领    第 " + st.pendingGeneration + " 代" + describePendingWindow(st, { now, full: true }));
   }
   if (st.readOnlyGenerations > 0) {
-    lines.push("只读历史  " + st.readOnlyGenerations +
-      " 个代际（不再接收新指令；轮转前受理的结果仍会发回原话题）");
+    lines.push("历史话题  " + st.readOnlyGenerations +
+      " 个代际（仍可下指令，回复发回你说话的那个话题）");
   }
   lines.push("出站      " + (st.suspended ? "暂停中，进展留在本地不发出" : "正常"));
   lines.push("入站      " + (st.suspended ? "暂停中，话题里的指令一律被拒"

@@ -401,7 +401,7 @@ export function composeLayeredStatus({
     L3.push(["待认领代际", "第 " + st.pendingGeneration + " 代" + describePendingWindow(st, { now: Date.now() })]);
   }
   if (st.readOnlyGenerations > 0) {
-    L3.push(["只读历史", st.readOnlyGenerations + " 个代际（不再接收新指令）"]);
+    L3.push(["历史话题", st.readOnlyGenerations + " 个代际（仍可下指令，回复回原话题）"]);
   }
   if (st.expiresAt) L3.push(["有效期", String(st.expiresAt).slice(0, 10)]);
   if (others.length > 1) L3.push(["本项目绑定数", others.length + " 条"]);

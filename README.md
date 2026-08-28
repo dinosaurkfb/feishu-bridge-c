@@ -227,6 +227,15 @@ session 绑定。日常还可以使用：
 | mode（飞书侧） | 正文恰为 `$feishu-mode dialogue` / `mapping` | 正文恰为 `/feishu-mode dialogue` / `mapping` | 入站路由器当场切换交互模式并回执，不投递给会话（2026-08-28 起） |
 | mode | `$feishu-mode [dialogue\|mapping]` | `/feishu-mode [dialogue\|mapping]` | 无参数只读查看；显式切换当前 binding 的交互策略 |
 
+飞书侧的模式切换是一笔**可恢复的控制事务**：意图随 claim 持久化 → 幂等执行 → 写 `<key>.consumed.json`
+（封闭形状；切换失败则写 `<key>.failed.json`，同样封闭，**不是 run 终态**）。账本盘点会报
+`consumed_unreadable` / `consumed_in_flight` / `consumed_intent_mismatch` / `control_failed_unreadable` / `control_conflict`
+（failed 与 consumed 并存）。同一事件的运输层重放按记录重出回执；飞书重发是新消息，补不了旧账 —— 补账走维护入口
+`node scripts/repair-control-claim.mjs --project <root> --key <key> [--apply]`
+（Codex 侧 `node scripts/codex/repair-control-claim.mjs --thread-id <id> --key <key> [--apply]`）：
+只接受属于当前绑定 / task 的 claim（身份在写锁内复核），只对 in_flight / 终态损坏 / 失败记录损坏三种态续做，
+临时残骸清不掉时退出 1。
+
 两边命令同名。差别只在绑定单位：Codex 绑一个精确 task，Claude 默认绑项目、
 也可以用 `bind-session` 让某一条会话单独占一个话题。
 

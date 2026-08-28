@@ -9,6 +9,8 @@ import { isDirectRun } from "./direct-run.mjs";
 import { CLAIM_KEY_SHAPE, readClaimState } from "./claim.mjs";
 import { inspectControlClaim, resumeControlClaim } from "./control-command.mjs";
 import { setClaudeInteractionMode } from "./interaction-policy-store.mjs";
+import { resolveProject } from "./project-resolve.mjs";
+import { effectiveBindingId } from "./topic-generation.mjs";
 
 export function parseRepairControlArgs(argv, { target = "--project" } = {}) {
   let root = null; let key = null; let apply = false;
@@ -31,31 +33,48 @@ export function parseRepairControlArgs(argv, { target = "--project" } = {}) {
 export function describeControlRepair({ seen, result, apply }) {
   if (result) {
     if (!result.ok) return "没有恢复（" + result.reason + (result.why ? "：" + result.why : "") + "）";
-    return result.already ? "这笔已经闭合，无需恢复" : "已补齐终态（目标模式 " + result.intent.mode + "，" + (result.changed ? "本次完成切换" : "模式本来就是") + "）";
+    const left = result.residueUncleared?.length ? "；但有 " + result.residueUncleared.length + " 个临时残骸清不掉，请人工查看" : "";
+    return (result.already ? "这笔已经闭合，无需恢复" : "已补齐终态（目标模式 " + result.intent.mode + "，" + (result.changed ? "本次完成切换" : "模式本来就是") + "）") + left;
   }
   const head = { in_flight: "事务未闭合：控制意图 " + (seen.intent?.mode ?? "?") + "，终态缺席", consumed: "已闭合，无需恢复", mismatch: "终态与意图不一致：" + (seen.why ?? ""),
-    consumed_unreadable: "终态记录损坏：" + (seen.why ?? ""), failed: "已记为失败（当时没切成），不恢复", not_control: "这张 claim 不是控制命令" }[seen.state]
+    consumed_unreadable: "终态记录损坏（意图 " + (seen.intent?.mode ?? "?") + "）：" + (seen.why ?? ""), failed_unreadable: "失败记录损坏（意图 " + (seen.intent?.mode ?? "?") + "）：" + (seen.why ?? ""),
+    failed: "已记为失败（当时没切成），不恢复", conflict: "failed 与 consumed 并存，请人工查看", not_control: "这张 claim 不是控制命令",
+    claim_unreadable: "claim 不属于当前绑定 / 读不出：" + (seen.why ?? ""), claim_absent: "没有这张 claim" }[seen.state]
     ?? ("说不清：" + seen.state + (seen.why ? "：" + seen.why : ""));
+  const resumable = ["in_flight", "consumed_unreadable", "failed_unreadable"].includes(seen.state);
   return (apply ? "" : "[预览] ") + head + (seen.residue?.length ? "；另有 " + seen.residue.length + " 个临时残骸" : "") +
-    (seen.state === "in_flight" || seen.state === "consumed_unreadable" ? (apply ? "" : "\n加 --apply 续做。") : "");
+    (resumable && !apply ? "\n加 --apply 续做。" : "");
 }
 
 export function repairExitCode({ seen, result, apply }) {
-  if (result) return result.ok ? 0 : 1;
+  if (result) return result.ok && !(result.residueUncleared?.length) ? 0 : 1;
   if (!apply) return 0;
   return seen.state === "consumed" ? 0 : 1;
+}
+
+/** 当前项目绑定的身份期望：claim 必须属于它（logical task、binding、会话）。 */
+export function claudeClaimExpectation({ root, registryFile, templateFile }) {
+  const resolved = resolveProject({ root, registryFile, templateFile });
+  if (!resolved.ok) return { ok: false, reason: resolved.reason };
+  const mapping = resolved.mapping;
+  return { ok: true, expect: { logicalTaskKey: mapping.logical_task_key, bindingId: effectiveBindingId(mapping), claudeSessionId: mapping.claude_session_id ?? null } };
 }
 
 if (isDirectRun(import.meta.url)) {
   const parsed = parseRepairControlArgs(process.argv.slice(2));
   if (!parsed.ok) { process.stderr.write("用法：node repair-control-claim.mjs --project <root> --key <64位hex> [--apply]（" + parsed.reason + "）\n"); process.exit(2); }
-  const claimsDir = path.join(path.resolve(parsed.root), ".runtime-data", "inbound", "delivery-claims");
-  const seen = inspectControlClaim({ claimsDir, key: parsed.key });
+  const root = path.resolve(parsed.root);
+  const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
+  const expectation = claudeClaimExpectation({ root });
+  if (!expectation.ok) { process.stdout.write("当前项目没有可用绑定（" + expectation.reason + "）\n"); process.exit(1); }
+  const expect = expectation.expect;
+  const seen = inspectControlClaim({ claimsDir, key: parsed.key, expect });
   let result = null;
-  if (parsed.apply && (seen.state === "in_flight" || seen.state === "consumed_unreadable")) {
-    const claim = readClaimState({ claimsDir, key: parsed.key }).claim;
-    result = resumeControlClaim({ claimsDir, key: parsed.key,
-      execute: (mode) => setClaudeInteractionMode({ root: path.resolve(parsed.root), claudeSessionId: claim?.claude_session_id ?? null, mode }) });
+  if (parsed.apply && ["in_flight", "consumed_unreadable", "failed_unreadable"].includes(seen.state)) {
+    result = resumeControlClaim({ claimsDir, key: parsed.key, expect,
+      execute: (mode) => setClaudeInteractionMode({ root, claudeSessionId: expect.claudeSessionId, mode,
+        // 写锁内复核：这张 claim 此刻仍属于当前绑定，检查与写入之间不留漂移窗口。
+        precondition: () => readClaimState({ claimsDir, key: parsed.key, expect }).status === "valid" }) });
   }
   process.stdout.write(describeControlRepair({ seen, result, apply: parsed.apply }) + "\n");
   process.exit(repairExitCode({ seen, result, apply: parsed.apply }));

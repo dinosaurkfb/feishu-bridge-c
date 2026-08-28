@@ -12,7 +12,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE, CLAIM_STATE } from "./claim.mjs";
-import { CONSUMED_TMP_RE, inspectControlClaim } from "./control-command.mjs";
+import { CONSUMED_TMP_RE, inspectControlClaim, readConsumedRecord } from "./control-command.mjs";
 
 import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
 
@@ -238,8 +238,11 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
       if (m[2] === CLAIM_STATE.CONSUMED + ".json") {
         // consumed 不是 run 终局、不参与孤儿判定，但要**与它的 claim 交叉核对**：内容坏 → consumed_unreadable；
         // 没有 claim / claim 读不出 → consumed_orphan；claim 无控制意图或意图不一致 → consumed_intent_mismatch。
+        const raw = readConsumedRecord({ claimsDir, key: m[1] });
+        if (raw.status === "unreadable") { problems.push({ key: m[1], reason: "consumed_unreadable", why: name + "：" + raw.why }); continue; }
         const seen = inspectControlClaim({ claimsDir, key: m[1] });
         if (seen.state === "consumed") { /* 完整且一致 */ }
+        else if (seen.state === "conflict") problems.push({ key: m[1], reason: "control_conflict", why: name + "：" + seen.why });
         else if (seen.state === "consumed_unreadable") problems.push({ key: m[1], reason: "consumed_unreadable", why: name + "：" + seen.why });
         else if (seen.state === "mismatch") problems.push({ key: m[1], reason: "consumed_intent_mismatch", why: name + "：" + seen.why });
         else if (seen.state.startsWith("claim_") || seen.state === "not_control") problems.push({ key: m[1], reason: "consumed_orphan", why: name + "：" + seen.state });
@@ -251,6 +254,14 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
         const seen = inspectControlClaim({ claimsDir, key: m[1] });
         if (seen.state === "in_flight") problems.push({ key: m[1], reason: "consumed_in_flight", why: "控制命令已执行但终态未记下 —— node scripts/repair-control-claim.mjs" });
         continue;
+      }
+      if (m[2] === "failed.json") {
+        // 控制命令的 failed 是"当时没切成"的封闭记录，不是 run 终态、不参与孤儿判定；坏了要报；与 consumed 并存要报。
+        const seen = inspectControlClaim({ claimsDir, key: m[1] });
+        if (seen.state === "failed") continue;
+        if (seen.state === "failed_unreadable") { problems.push({ key: m[1], reason: "control_failed_unreadable", why: name + "：" + seen.why }); continue; }
+        if (seen.state === "conflict") { problems.push({ key: m[1], reason: "control_conflict", why: name + "：" + seen.why }); continue; }
+        if (seen.state !== "not_control" && !seen.state.startsWith("claim_")) continue; // 其他控制态（consumed 等）在别的分支报过
       }
       if (!TERMINAL_STATE_FILES.has(m[2])) continue;   // claim 目录、笔记、非终局状态记录：不参与孤儿判定
       note(m[1], "terminal");

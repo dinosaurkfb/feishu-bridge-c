@@ -18283,6 +18283,82 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   assert.doesNotMatch(twisted.stdout, /已切换|已补齐|已处理过/u, twisted.stdout);
   assert.equal(policyOf(), MAPPING_POLICY_ID);
 
+  // ── 评审第 4 轮 ──
+  const RUNS = path.join(root, ".runtime-data", "inbound", "runs");
+  // 终态损坏也能恢复：受验意图从 claim 来，不是从坏掉的终态来
+  fs.writeFileSync(path.join(claimsDir, key2 + ".consumed.json"), "{broken");
+  assert.ok(inventoryRuns({ runsDir: RUNS, claimsDir }).problems.some((p) => p.key === key2 && p.reason === "consumed_unreadable"));
+  const corruptPreview = repair("--project", root, "--key", key2);
+  assert.match(corruptPreview.stdout, /\[预览\] 终态记录损坏（意图 mapping）/u, corruptPreview.stdout);
+  const corruptFixed = repair("--project", root, "--key", key2, "--apply");
+  assert.deepEqual([corruptFixed.status, /已补齐终态（目标模式 mapping/u.test(corruptFixed.stdout)], [0, true], corruptFixed.stdout);
+  assert.equal(readConsumedRecord({ claimsDir, key: key2, expectedIntent: { control: "mode", mode: MAPPING_POLICY_ID } }).status, "valid", "损坏的终态被受验记录替换");
+  assert.equal(policyOf(), MAPPING_POLICY_ID);
+  // 维护入口把 claim 绑到当前绑定：别的 task / 别的 binding 的 claim 在这里恢复不了，也动不了本项目的模式
+  const { schema_version: _sv, state: _st, claim_key: _ck, message_id: _mi, logical_task_key: _lt, ...protoMeta } = readClaimState({ claimsDir, key: key1 }).claim;
+  const foreignTask = acquireClaim({ claimsDir, messageId: "msg_foreign_task", logicalTaskKey: "other-task", meta: { ...protoMeta, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } });
+  const foreignBinding = acquireClaim({ claimsDir, messageId: "msg_foreign_binding", logicalTaskKey, meta: { ...protoMeta, binding_id: "someone-else", control: { control: "mode", mode: DIALOGUE_POLICY_ID } } });
+  assert.ok(foreignTask.ok && foreignBinding.ok);
+  for (const k of [foreignTask.key, foreignBinding.key]) {
+    const refused = repair("--project", root, "--key", k, "--apply");
+    assert.equal(refused.status, 1, refused.stdout);
+    assert.match(refused.stdout, /claim 不属于当前绑定/u, refused.stdout);
+    assert.equal(policyOf(), MAPPING_POLICY_ID, "别人的 claim 不许动本项目的模式");
+    fs.rmSync(path.join(claimsDir, k + ".claim"), { recursive: true, force: true });
+  }
+  // 身份复核在写锁内：前置条件不成立 → 存储层拒写
+  const vetoed = setClaudeInteractionMode({ root, claudeSessionId: null, mode: DIALOGUE_POLICY_ID, registryFile, precondition: () => false });
+  assert.deepEqual([vetoed.ok, vetoed.reason], [false, "precondition_failed"], JSON.stringify(vetoed));
+  assert.equal(policyOf(), MAPPING_POLICY_ID);
+  // control failed 是封闭状态：受验记录不是 run 终态、不算孤儿；与 consumed 并存 → conflict；记录损坏 → 可恢复
+  const key6 = claimKey("msg_c6", logicalTaskKey);
+  assert.ok(acquireClaim({ claimsDir, messageId: "msg_c6", logicalTaskKey, meta: { ...protoMeta, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).ok);
+  recordClaimState({ claimsDir, key: key6, state: "failed", detail: { reason: "control_failed", control: "mode", error: "registry_unwritable" } });
+  assert.deepEqual(inventoryRuns({ runsDir: RUNS, claimsDir }).problems.filter((p) => p.key === key6), [], "受验的 control failed 不是孤儿终态、不是未闭合");
+  assert.match(repair("--project", root, "--key", key6).stdout, /已记为失败（当时没切成），不恢复/u);
+  assert.equal(repair("--project", root, "--key", key6, "--apply").status, 1);
+  assert.equal(policyOf(), MAPPING_POLICY_ID, "failed 不续做");
+  // failed 记录的形状是封闭的：多一个键 / reason 不对 都算损坏（可恢复），不算"已记为失败"
+  const failedDoc = JSON.parse(fs.readFileSync(path.join(claimsDir, key6 + ".failed.json"), "utf-8"));
+  for (const twisted of [{ ...failedDoc, extra: 1 }, { ...failedDoc, reason: "handoff_failed" }, { ...failedDoc, error: 42 }]) {
+    fs.writeFileSync(path.join(claimsDir, key6 + ".failed.json"), JSON.stringify(twisted));
+    assert.ok(inventoryRuns({ runsDir: RUNS, claimsDir }).problems.some((p) => p.key === key6 && p.reason === "control_failed_unreadable"), JSON.stringify(twisted));
+    assert.match(repair("--project", root, "--key", key6).stdout, /失败记录损坏（意图 dialogue）/u);
+  }
+  fs.writeFileSync(path.join(claimsDir, key6 + ".failed.json"), JSON.stringify(failedDoc));
+  assert.deepEqual(inventoryRuns({ runsDir: RUNS, claimsDir }).problems.filter((p) => p.key === key6), []);
+  recordClaimState({ claimsDir, key: key6, state: "consumed", detail: { control: "mode", mode: DIALOGUE_POLICY_ID, changed: true } });
+  const conflictInv = inventoryRuns({ runsDir: RUNS, claimsDir });
+  assert.ok(conflictInv.problems.some((p) => p.key === key6 && p.reason === "control_conflict"), JSON.stringify(conflictInv.problems));
+  assert.match(repair("--project", root, "--key", key6, "--apply").stdout, /failed 与 consumed 并存/u);
+  fs.rmSync(path.join(claimsDir, key6 + ".consumed.json"));
+  fs.rmSync(path.join(claimsDir, key6 + ".failed.json"));
+  fs.mkdirSync(path.join(claimsDir, key6 + ".failed.json"));
+  const fuInv = inventoryRuns({ runsDir: RUNS, claimsDir });
+  assert.ok(fuInv.problems.some((p) => p.key === key6 && p.reason === "control_failed_unreadable"), JSON.stringify(fuInv.problems));
+  assert.ok(!fuInv.problems.some((p) => p.key === key6 && p.reason === "orphan_terminal_record"), "控制命令的 failed 不参与 run 孤儿判定");
+  assert.match(repair("--project", root, "--key", key6).stdout, /失败记录损坏（意图 dialogue）/u);
+  const fuFixed = repair("--project", root, "--key", key6, "--apply");
+  assert.deepEqual([fuFixed.status, /已补齐终态（目标模式 dialogue，本次完成切换）/u.test(fuFixed.stdout)], [0, true], fuFixed.stdout);
+  assert.equal(policyOf(), DIALOGUE_POLICY_ID);
+  fs.rmSync(path.join(claimsDir, key6 + ".failed.json"), { recursive: true });
+  // 没有控制意图的 failed 照旧是 run 终态：run 制品缺席就是孤儿
+  const plainKey = "7".repeat(64);
+  fs.writeFileSync(path.join(claimsDir, plainKey + ".failed.json"), JSON.stringify({ schema_version: "1.0", state: "failed", claim_key: plainKey, reason: "handoff_failed", recorded_at: "2026-08-28T00:00:00.000Z" }));
+  assert.ok(inventoryRuns({ runsDir: RUNS, claimsDir }).problems.some((p) => p.key === plainKey && p.reason === "orphan_terminal_record"));
+  fs.rmSync(path.join(claimsDir, plainKey + ".failed.json"));
+  // 残骸清不掉：终态照写、事务算成，但结果如实带回，维护入口退出 1
+  fs.rmSync(path.join(claimsDir, key6 + ".consumed.json"));
+  const stuckResidue = path.join(claimsDir, key6 + ".consumed.json.tmp.1.1");
+  fs.mkdirSync(stuckResidue); fs.writeFileSync(path.join(stuckResidue, "x"), "");
+  const partial = repair("--project", root, "--key", key6, "--apply");
+  assert.equal(partial.status, 1, partial.stdout);
+  assert.match(partial.stdout, /已补齐终态.*临时残骸清不掉/u, partial.stdout);
+  assert.equal(readConsumedRecord({ claimsDir, key: key6 }).status, "valid", "终态已写，残骸只是没清");
+  fs.rmSync(stuckResidue, { recursive: true });
+  assert.equal(repair("--project", root, "--key", key6, "--apply").status, 0);
+  assert.equal(setClaudeInteractionMode({ root, claudeSessionId: null, mode: MAPPING_POLICY_ID, registryFile }).ok, true);
+
   const same = run("/feishu-mode mapping", "msg_c3");
   assert.match(same.stdout, /^模式未变 · 控制演示\n本来就是 Mapping/u, same.stdout);
   const notControl = run("/feishu-mode dialogue 吧", "msg_c4");

@@ -38,7 +38,7 @@ import {
 } from "./intent.mjs";
 import { sweepEligible } from "./drain-all.mjs";
 import { remindCodexPendingClaims } from "./claim-reminder.mjs";
-import { claimKey, recordClaimState, readClaimState } from "../claim.mjs";
+import { claimKey, recordClaimState, readClaimState, acquireClaim } from "../claim.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
 import {
   ELIGIBILITY_BUDGET_DEFAULT_MS, ELIGIBILITY_BUDGET_MAX_MS, eligibilityBudgetMs,
@@ -8917,6 +8917,54 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
   assert.match(resumed.stdout, /^已处理过 · A/u, resumed.stdout);
   const stored = readClaimState({ claimsDir: paths.claims, key: key5 });
   assert.deepEqual([stored.status, stored.claim.control], ["valid", { control: "mode", mode: DIALOGUE_POLICY_ID }], "意图随 claim 持久化");
+
+  // ── 评审第 4 轮 ──
+  const ltk = stored.claim.logical_task_key;
+  // 终态损坏也能恢复：受验意图从 claim 来
+  fs.writeFileSync(path.join(paths.claims, key5 + ".consumed.json"), "{broken");
+  assert.match(repair("--thread-id", THREAD_A, "--key", key5).stdout, /终态记录损坏（意图 dialogue）/u);
+  const corruptFixed = repair("--thread-id", THREAD_A, "--key", key5, "--apply");
+  assert.deepEqual([corruptFixed.status, /已补齐终态（目标模式 dialogue/u.test(corruptFixed.stdout)], [0, true], corruptFixed.stdout);
+  assert.equal(readClaimState({ claimsDir: paths.claims, key: key5 }).status, "valid");
+  assert.ok(JSON.parse(fs.readFileSync(path.join(paths.claims, key5 + ".consumed.json"), "utf-8")).mode === DIALOGUE_POLICY_ID);
+  // claim 绑到当前 task：别的 task 的 claim 在这里恢复不了，也动不了本 task 的模式
+  const { schema_version: _sv, state: _st, claim_key: _ck, message_id: _mi, logical_task_key: _lt, ...protoMeta } = stored.claim;
+  const foreign = acquireClaim({ claimsDir: paths.claims, messageId: "msg_foreign", logicalTaskKey: "other-task", meta: { ...protoMeta, control: { control: "mode", mode: MAPPING_POLICY_ID } } });
+  assert.ok(foreign.ok);
+  const refused = repair("--thread-id", THREAD_A, "--key", foreign.key, "--apply");
+  assert.deepEqual([refused.status, /claim 不属于当前绑定/u.test(refused.stdout)], [1, true], refused.stdout);
+  assert.equal(policyOf(), DIALOGUE_POLICY_ID, "别人的 claim 不许动本 task 的模式");
+  fs.rmSync(path.join(paths.claims, foreign.key + ".claim"), { recursive: true, force: true });
+  // 身份复核在写锁内：前置条件不成立 → 存储层拒写
+  const vetoed = setTaskInteractionMode({ threadId: THREAD_A, mode: MAPPING_POLICY_ID, home, precondition: () => false });
+  assert.deepEqual([vetoed.ok, vetoed.reason], [false, "precondition_failed"], JSON.stringify(vetoed));
+  assert.equal(policyOf(), DIALOGUE_POLICY_ID);
+  // control failed 是封闭状态：受验的不恢复；与 consumed 并存 → conflict；记录损坏 → 可恢复
+  const key8 = claimKey("msg_ctl_8", ltk);
+  assert.ok(acquireClaim({ claimsDir: paths.claims, messageId: "msg_ctl_8", logicalTaskKey: ltk, meta: { ...protoMeta, control: { control: "mode", mode: MAPPING_POLICY_ID } } }).ok);
+  recordClaimState({ claimsDir: paths.claims, key: key8, state: "failed", detail: { reason: "control_failed", control: "mode", error: "registry_unwritable" } });
+  assert.match(repair("--thread-id", THREAD_A, "--key", key8).stdout, /已记为失败（当时没切成），不恢复/u);
+  assert.equal(repair("--thread-id", THREAD_A, "--key", key8, "--apply").status, 1);
+  assert.equal(policyOf(), DIALOGUE_POLICY_ID, "failed 不续做");
+  recordClaimState({ claimsDir: paths.claims, key: key8, state: "consumed", detail: { control: "mode", mode: MAPPING_POLICY_ID, changed: true } });
+  assert.match(repair("--thread-id", THREAD_A, "--key", key8, "--apply").stdout, /failed 与 consumed 并存/u);
+  fs.rmSync(path.join(paths.claims, key8 + ".consumed.json"));
+  fs.rmSync(path.join(paths.claims, key8 + ".failed.json"));
+  fs.mkdirSync(path.join(paths.claims, key8 + ".failed.json"));
+  assert.match(repair("--thread-id", THREAD_A, "--key", key8).stdout, /失败记录损坏（意图 mapping）/u);
+  const fuFixed = repair("--thread-id", THREAD_A, "--key", key8, "--apply");
+  assert.deepEqual([fuFixed.status, /已补齐终态（目标模式 mapping，本次完成切换）/u.test(fuFixed.stdout)], [0, true], fuFixed.stdout);
+  assert.equal(policyOf(), MAPPING_POLICY_ID);
+  fs.rmSync(path.join(paths.claims, key8 + ".failed.json"), { recursive: true });
+  // 残骸清不掉：终态照写，但维护入口退出 1
+  fs.rmSync(path.join(paths.claims, key8 + ".consumed.json"));
+  const stuckResidue = path.join(paths.claims, key8 + ".consumed.json.tmp.1.1");
+  fs.mkdirSync(stuckResidue); fs.writeFileSync(path.join(stuckResidue, "x"), "");
+  const partial = repair("--thread-id", THREAD_A, "--key", key8, "--apply");
+  assert.deepEqual([partial.status, /已补齐终态.*临时残骸清不掉/u.test(partial.stdout)], [1, true], partial.stdout);
+  assert.ok(fs.existsSync(path.join(paths.claims, key8 + ".consumed.json")), "终态已写，残骸只是没清");
+  fs.rmSync(stuckResidue, { recursive: true });
+  assert.equal(repair("--thread-id", THREAD_A, "--key", key8, "--apply").status, 0);
 });
 
 summarySealed = true;

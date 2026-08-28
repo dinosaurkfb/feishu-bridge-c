@@ -126,11 +126,15 @@ function mutateClaudeInteractionPolicy({
 }
 
 export function setClaudeInteractionMode({
-  root, claudeSessionId, mode, budget, registryFile, now = Date.now(),
+  root, claudeSessionId, mode, budget, registryFile, now = Date.now(), precondition = null,
 } = {}) {
   return mutateClaudeInteractionPolicy({
     root, claudeSessionId, registryFile, now,
-    mutate: (state) => setInteractionPolicyMode(state, { mode, budget, now }),
+    // precondition 在**写锁内**复核（维护入口用它确认 claim 仍属于当前 binding，检查与写入之间不留漂移窗口）。
+    mutate: (state) => {
+      if (typeof precondition === "function" && precondition() !== true) return { ok: false, reason: "precondition_failed" };
+      return setInteractionPolicyMode(state, { mode, budget, now });
+    },
   });
 }
 

@@ -23,11 +23,26 @@ const SHAPES = {
   codex: /^\$feishu-mode (dialogue|mapping)$/u,
 };
 
+/**
+ * 飞书客户端会在 @ 之后 / 词与词之间塞进不换行空格（U+00A0）、全角空格（U+3000）、零宽字符（U+200B…）、
+ * 全角斜杠 / 美元符；这些都**不是字**，精确匹配前先折叠掉 —— "多一个字都不算"守的是词，不是不可见字节。
+ * 线上实测（2026-08-28 msg_4kxxcb0p58a45）：肉眼完全一样的 /feishu-mode dialogue 没被当成控制命令而被当普通指令投递。
+ */
+export function normalizeControlText(instruction) {
+  if (typeof instruction !== "string") return instruction;
+  return instruction
+    .replace(/[\u200B-\u200D\u2060\uFEFF]/gu, "")
+    .replace(/／/gu, "/")
+    .replace(/＄/gu, "$")
+    .replace(/\s+/gu, " ")   // JS 的 \s 已含 U+00A0 / U+3000
+    .trim();
+}
+
 /** @returns {{kind:"mode", mode:string}|null} */
 export function parseControlCommand(instruction, { chain } = {}) {
   const re = SHAPES[chain];
   if (!re || typeof instruction !== "string") return null;
-  const m = re.exec(instruction);
+  const m = re.exec(normalizeControlText(instruction));
   if (!m) return null;
   return { kind: "mode", mode: m[1] === "dialogue" ? DIALOGUE_POLICY_ID : MAPPING_POLICY_ID };
 }

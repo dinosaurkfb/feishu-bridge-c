@@ -8,6 +8,7 @@
 
 import path from "node:path";
 import { stableControlId } from "./subscription.mjs";
+import { isCanonicalIso } from "./canonical-time.mjs";
 
 /**
  * 这个值能不能当作代际 id 用 —— **全仓唯一的判据，住在"代际"这个概念的家里。**
@@ -35,10 +36,20 @@ export function effectiveBindingId(mapping, { root = null } = {}) {
 
 export const TOPIC_GENERATION_SCHEMA_VERSION = "1.0";
 export const TOPIC_GENERATION_ARTIFACT_TYPE = "feishu_bridge_topic_generations";
-export const TOPIC_GENERATION_PENDING_MS = 24 * 60 * 60 * 1000;
+// 待认领窗口：2026-08-28 起从 24 小时放长到 72 小时（Frank 定的，三倍）。已登记的 pending 沿用各自记下的
+// claim_expires_at，新代际按这个默认取。
+export const TOPIC_GENERATION_PENDING_MS = 72 * 60 * 60 * 1000;
+// 快过期提醒的提前量：截止前 12 小时内、且还没人认领时，在待认领话题下提醒一次（明写，不藏在比较式里）。
+export const TOPIC_GENERATION_CLAIM_REMINDER_LEAD_MS = 12 * 60 * 60 * 1000;
+// 提醒是"至少一次、有上界"：发送失败最多再试到 MAX_ATTEMPTS 次，两次尝试间隔至少 RETRY_MS
+// （比 30 分钟的兜底周期短一点，下一轮兜底就能重试）。尝试本身在锁内预留并持久化，
+// 两个扫描器同时跑也只有一个能拿到这次尝试（评审探针：判定在锁外时并发发了两次）。
+export const TOPIC_GENERATION_CLAIM_REMINDER_RETRY_MS = 25 * 60 * 1000;
+export const TOPIC_GENERATION_CLAIM_REMINDER_MAX_ATTEMPTS = 3;
 export const TOPIC_GENERATION_ACTIVITY_SCHEMA_VERSION = "1.0";
 export const TOPIC_GENERATION_ACTIVITY_MODE = "business_message_v1";
-export const TOPIC_GENERATION_AUTO_ROTATE_MESSAGES = 30;
+// 自动轮转阈值：2026-08-28 起从 30 条放长到 50 条（Frank 定的）。已有代际沿用各自记下的 auto_rotate_threshold。
+export const TOPIC_GENERATION_AUTO_ROTATE_MESSAGES = 50;
 export const TOPIC_GENERATION_AUTO_ROTATE_RETRY_MS = 5 * 60 * 1000;
 /**
  * PREPARING 停留多久算「上一次尝试没走完」，可以被新的轮转接管。
@@ -233,6 +244,20 @@ export function validateTopicGenerationState(state) {
       // 旧版“全机唯一 pending”记录可能没有短码或显式截止时间；读取迁移必须保留它，
       // 期限由 bound_at 兼容推导。正式 rotation pending 在下面有更严格的形状约束。
       if (generation.session_id !== null) problems.push("generations.pending_shape");
+      // 提醒记录：不在场 / null 都行；在场就必须是**规范**时间（评审探针：Date.parse 放过了
+      // "…T00:00:00Z" 这种非规范写法）—— 它们决定"还要不要再提醒"。
+      if (generation.claim_reminder_at !== undefined && generation.claim_reminder_at !== null &&
+          !isCanonicalIso(generation.claim_reminder_at)) {
+        problems.push("generations.claim_reminder_at");
+      }
+      // 尝试状态是**封闭形状**：要么两个字段都不在场，要么 attempts 是正整数且 attempted_at 是规范时间。
+      // 只带 attempts 不带时间会绕过 25 分钟间隔，只带时间不带次数会破坏三次上界（评审探针）。
+      const attempts = generation.claim_reminder_attempts ?? null;
+      const attemptedAt = generation.claim_reminder_attempted_at ?? null;
+      if (attempts !== null || attemptedAt !== null) {
+        if (!(Number.isSafeInteger(attempts) && attempts >= 1)) problems.push("generations.claim_reminder_attempts");
+        if (!isCanonicalIso(attemptedAt)) problems.push("generations.claim_reminder_attempted_at");
+      }
     }
   }
   if (active > 1) problems.push("multiple_active_generations");
@@ -306,6 +331,74 @@ export const activeGeneration = (state) => state?.generations?.find((generation)
 
 export const pendingGeneration = (state) => state?.generations?.find((generation) =>
   generation.status === GENERATION_STATUS.PENDING) ?? null;
+
+/**
+ * 快过期提醒该不该发：绑定 active、有 pending、有截止时间、还没过期、还没提醒过、
+ * 尝试次数没用完、离上次尝试够久、已进入截止前 LEAD 窗口。
+ * **只算不写**；这是两条链共用的唯一判据。扫描器先用它做锁外预筛，再在锁内用
+ * reserveClaimReminderAttempt（它内部再算一次）真正拿到这次尝试。
+ */
+export function claimReminderDue(state, {
+  now = Date.now(),
+  leadMs = TOPIC_GENERATION_CLAIM_REMINDER_LEAD_MS,
+  retryMs = TOPIC_GENERATION_CLAIM_REMINDER_RETRY_MS,
+  maxAttempts = TOPIC_GENERATION_CLAIM_REMINDER_MAX_ATTEMPTS,
+} = {}) {
+  const generation = pendingGeneration(state);
+  if (!generation) return { due: false, reason: "no_pending", generation: null };
+  // 暂停 / 退役的绑定不出站 —— 跟出站发布同一条语义（评审探针：paused 仍发了提醒）。
+  if (state?.binding_status !== "active") return { due: false, reason: "binding_not_active", generation };
+  const deadline = Date.parse(generation.claim_expires_at ?? "");
+  if (!Number.isFinite(deadline)) return { due: false, reason: "no_deadline", generation };
+  if (now >= deadline) return { due: false, reason: "expired", generation };
+  if (generation.claim_reminder_at) return { due: false, reason: "already_reminded", generation };
+  const attempts = generation.claim_reminder_attempts ?? 0;
+  if (attempts >= maxAttempts) return { due: false, reason: "attempts_exhausted", generation, attempts };
+  const attemptedAt = Date.parse(generation.claim_reminder_attempted_at ?? "");
+  if (Number.isFinite(attemptedAt) && now - attemptedAt < retryMs) {
+    return { due: false, reason: "retry_too_soon", generation, attempts, remainingMs: deadline - now };
+  }
+  if (deadline - now > leadMs) return { due: false, reason: "not_yet", generation, remainingMs: deadline - now };
+  return { due: true, reason: null, generation, attempts, remainingMs: deadline - now };
+}
+
+/**
+ * 在锁内**预留**一次提醒尝试：判据再算一次，通过才把 attempts + 1、attempted_at = now 写进代际。
+ * 预留是持久化的，所以并发的第二个扫描器（或紧接着的下一轮）会拿到 retry_too_soon，
+ * 而不是再发一条。发送成功后另行 markPendingClaimReminder；失败则留着 attempts，到期重试。
+ */
+export function reserveClaimReminderAttempt(state, { generationId, now = Date.now(), leadMs, retryMs, maxAttempts } = {}) {
+  const valid = validateTopicGenerationState(state);
+  if (!valid.ok) return { ok: false, reason: "topic_generation_state_invalid", problems: valid.problems };
+  const generation = pendingGeneration(state);
+  if (!generation || generation.channel_generation_id !== generationId) {
+    return { ok: false, reason: "pending_generation_mismatch" };
+  }
+  const due = claimReminderDue(state, { now, leadMs, retryMs, maxAttempts });
+  if (!due.due) return { ok: false, reason: due.reason, attempts: due.attempts ?? generation.claim_reminder_attempts ?? 0 };
+  const next = clone(state);
+  const target = next.generations.find((g) => g.channel_generation_id === generationId);
+  target.claim_reminder_attempts = (target.claim_reminder_attempts ?? 0) + 1;
+  target.claim_reminder_attempted_at = iso(now);
+  next.updated_at = iso(now);
+  return { ok: true, changed: true, state: next, attempt: target.claim_reminder_attempts, remainingMs: due.remainingMs };
+}
+
+/** 记下"已经提醒过"。同一代际只记一次；不是 pending 的代际不记（说明状态已经变了）。 */
+export function markPendingClaimReminder(state, { generationId, now = Date.now() } = {}) {
+  const valid = validateTopicGenerationState(state);
+  if (!valid.ok) return { ok: false, reason: "topic_generation_state_invalid", problems: valid.problems };
+  const generation = pendingGeneration(state);
+  if (!generation || generation.channel_generation_id !== generationId) {
+    return { ok: false, reason: "pending_generation_mismatch" };
+  }
+  if (generation.claim_reminder_at) return { ok: true, changed: false, state };
+  const next = clone(state);
+  const target = next.generations.find((g) => g.channel_generation_id === generationId);
+  target.claim_reminder_at = iso(now);
+  next.updated_at = iso(now);
+  return { ok: true, changed: true, state: next };
+}
 
 export function generationById(state, generationId) {
   if (!nonEmpty(generationId)) return null;

@@ -14,6 +14,11 @@ import path from "node:path";
 import { loadChainTemplate, materializeProjectConfig } from "../chain-template.mjs";
 import { extractMentionIds } from "../selector.mjs";
 import { acquirePublishLock, isUnder, releasePublishLock } from "../registry.mjs";
+
+// 只有"别人正拿着"才是 registry_busy；锁目录不可写之类的 I/O 错误要原样报出去（评审探针：曾被折叠成 busy 静默跳过）。
+const lockFailure = (lock) => (lock.reason === "publisher_busy"
+  ? { ok: false, reason: "registry_busy" }
+  : { ok: false, reason: "lock_io_error", error: lock.error ?? lock.reason });
 import {
   MESSAGE_RECEIVE_EVENT, buildLegacySubscriptionReadModel, compareFirstClaimShadow,
   legacyEndpointId, selectPendingSubscriptionClaim, stableControlId,
@@ -23,13 +28,17 @@ import {
   activeGenerationForSession, applyTopicGenerationToMapping, closePendingTopicGeneration,
   failTopicRotation, materializeLegacyTopicFields, pendingGeneration, prepareTopicRotation,
   recordTopicGenerationActivity, registerPendingTopicGeneration, topicGenerationStateForLegacy,
+  markPendingClaimReminder,
+  reserveClaimReminderAttempt,
+  TOPIC_GENERATION_PENDING_MS,
 } from "../topic-generation.mjs";
 import {
   finalizeDialogueTurn, interactionPolicyStateForLegacy, materializeInteractionPolicy,
   reserveDialogueTurn, setInteractionPolicyMode,
 } from "../interaction-policy.mjs";
 
-export const PENDING_WINDOW_MS = 24 * 60 * 60 * 1000;
+// 首次绑定的待认领窗口与话题代际的待认领窗口是同一件事 —— 同一份定义（2026-08-28 起 72 小时）。
+export const PENDING_WINDOW_MS = TOPIC_GENERATION_PENDING_MS;
 export const ACTIVE_LEASE_MAX_MS = 12 * 60 * 60 * 1000;
 export const DEFAULT_INBOUND_PREFIX = null;
 
@@ -406,7 +415,7 @@ export function writeRegistryFixtureUnvalidated(tasks, file = registryFile()) {
 export function addTask(task, { home = bridgeHome() } = {}) {
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  if (!lock.ok) return lockFailure(lock);
   try {
     const file = registryFile(home);
     const reg = loadRegistry(file);
@@ -554,7 +563,7 @@ export function setTaskConnectionStatus({
   if (!new Set(["active", "paused"]).has(status)) return { ok: false, reason: "invalid_status" };
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  if (!lock.ok) return lockFailure(lock);
   try {
     const file = registryFile(home);
     const reg = loadRegistry(file);
@@ -611,7 +620,7 @@ export function refreshPendingTaskBinding({
   if (typeof threadId !== "string" || !threadId) return { ok: false, reason: "no_thread_id" };
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  if (!lock.ok) return lockFailure(lock);
   try {
     const file = registryFile(home);
     const reg = loadRegistry(file);
@@ -652,7 +661,7 @@ export function setTaskDisplayName({ threadId, name, home = bridgeHome() } = {})
   if (typeof name !== "string" || !name.trim()) return { ok: false, reason: "invalid_name" };
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  if (!lock.ok) return lockFailure(lock);
   try {
     const file = registryFile(home);
     const reg = loadRegistry(file);
@@ -845,7 +854,7 @@ export function enableAutoPublishForAllTasks({ home = bridgeHome(), apply = fals
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  if (!lock.ok) return lockFailure(lock);
   try {
     // 取锁之后才读：锁外读到的那份跟要写的那份不是同一个快照。
     const snap = readRawRegistry(file);
@@ -1041,7 +1050,7 @@ export function promoteTask({
 }) {
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  if (!lock.ok) return lockFailure(lock);
   try {
     const file = registryFile(home);
     const reg = loadRegistry(file);
@@ -1104,7 +1113,7 @@ function mutateTaskTopicState({
   if (typeof threadId !== "string" || !threadId) return { ok: false, reason: "no_thread_id" };
   const lockDir = path.join(home, "registry.lock");
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  if (!lock.ok) return lockFailure(lock);
   try {
     const file = registryFile(home);
     const reg = loadRegistry(file);
@@ -1176,6 +1185,26 @@ export function closeTaskTopicRotation({
   });
 }
 
+/** 锁内预留一次待认领提醒尝试（判据在锁内重算，并发只有一个能拿到）。 */
+export function reserveTaskClaimReminder({
+  threadId, generationId, home = bridgeHome(), now = Date.now(),
+} = {}) {
+  return mutateTaskTopicState({
+    threadId, home, now,
+    mutate: (state) => reserveClaimReminderAttempt(state, { generationId, now }),
+  });
+}
+
+/** 原子记下"待认领话题已提醒过"。 */
+export function markTaskClaimReminder({
+  threadId, generationId, home = bridgeHome(), now = Date.now(),
+} = {}) {
+  return mutateTaskTopicState({
+    threadId, home, now,
+    mutate: (state) => markPendingClaimReminder(state, { generationId, now }),
+  });
+}
+
 /** 原子记录 Codex task 当前话题代际的一条有效业务消息。 */
 export function recordTaskTopicActivity({
   threadId, generationId, eventKey, messageDelta = 1,
@@ -1205,7 +1234,7 @@ function mutateTaskInteractionPolicy({
     if (lock.ok || lock.reason !== "publisher_busy") break;
     if (attempt < lockRetries) Atomics.wait(wait, 0, 0, 25);
   }
-  if (!lock.ok) return { ok: false, reason: "registry_busy" };
+  if (!lock.ok) return lockFailure(lock);
   try {
     const file = registryFile(home);
     const reg = loadRegistry(file);

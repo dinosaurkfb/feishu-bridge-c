@@ -37,6 +37,7 @@ import {
   INTENT_TTL_MS, buildIntentParams, consumeIntent, intentDir, issueIntent,
 } from "./intent.mjs";
 import { sweepEligible } from "./drain-all.mjs";
+import { remindCodexPendingClaims } from "./claim-reminder.mjs";
 import { claimKey, recordClaimState } from "../claim.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
 import {
@@ -94,7 +95,9 @@ import {
   setTaskDisplayName, setTaskInteractionMode, shadowCodexFirstClaim, taskPaths, topicStateForTask,
   validateCodexTemplate, validateRegistryTasks, writeRegistryFixtureUnvalidated,
 } from "./state.mjs";
-import { ROTATION_STATUS, activeGeneration, pendingGeneration } from "../topic-generation.mjs";
+import {
+  ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, TOPIC_GENERATION_PENDING_MS, activeGeneration, pendingGeneration,
+} from "../topic-generation.mjs";
 import { applyRuntimeSync, planRuntimeSync } from "../runtime-install.mjs";
 import { DIALOGUE_TURN_STATUS } from "../interaction-policy.mjs";
 import {
@@ -991,6 +994,13 @@ test("active 但首次 mention 已过期的 task 可只刷新原话题握手窗�
   assert.equal(refreshed.task.inbound_state, "pending");
   assert.equal(refreshed.task.session_id ?? null, null);
   assert.equal(findPendingTask({ home, now }).ok, true);
+  // 首次绑定的待认领窗口跟代际的是同一份定义（2026-08-28 起 72 小时）：24 小时后仍在窗口内，72 小时到点过期。
+  const H = 3600000;
+  assert.equal(findPendingTask({ home, now: Date.parse(task.bound_at) + 48 * H }).ok, true,
+    "没有 pending_expires_at 的旧 task 按 bound_at + 窗口算，48 小时时还没过期");
+  assert.equal(refreshed.task.pending_expires_at, new Date(now + TOPIC_GENERATION_PENDING_MS).toISOString());
+  assert.equal(findPendingTask({ home, now: now + 24 * H + 1 }).ok, true, "24 小时时还在窗口内 —— 窗口已放长");
+  assert.equal(findPendingTask({ home, now: now + 72 * H }).reason, "pending_binding_expired");
 });
 
 test("Codex adapter 轮转期间旧 session 继续路由，认领后新旧代际原子切换", () => {
@@ -1299,9 +1309,9 @@ test("task 控制脚本不猜 thread，暂停和恢复都不调用飞书", () =>
   assert.match(status.stdout, /第 3 层 · 精确通道绑定/u, status.stdout);
   assert.match(status.stdout, /入站/u);
   assert.match(status.stdout, /当前代际/u);
-  // 四层里这行在第 4 层，措辞是「0 / 30 条（还剩 30 条）」——
+  // 四层里这行在第 4 层，措辞是「0 / 50 条（还剩 50 条）」——
   // **测的仍是同一件事**：计数 0、阈值 30。
-  assert.match(status.stdout, /自动轮转.*0 \/ 30 条/u, status.stdout);
+  assert.match(status.stdout, /自动轮转.*0 \/ 50 条/u, status.stdout);
   assert.match(status.stdout, /第 4 层 · 交互策略/u);
   assert.equal(status.stdout.includes(THREAD_A), false);
   assert.equal(status.stdout.includes("om_a"), false);
@@ -4113,7 +4123,7 @@ test("接线：走真实决策路径签票 → 真实 CLI 过门禁；代际变�
     spawnImpl: (bin, args) => { launched = args; return { pid: 1, unref() {} }; },
   });
   let decided = null;
-  for (let i = 0; i < 40 && !decided; i += 1) {
+  for (let i = 0; i < TOPIC_GENERATION_AUTO_ROTATE_MESSAGES + 10 && !decided; i += 1) {
     const r = drive(i);
     if (r.shouldAutoRotate) decided = r;
   }
@@ -8679,6 +8689,132 @@ test("R5 completeness：收集层给结论，坏一处就 complete:false 并点�
     if (before === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY;
     else process.env.FEISHU_BRIDGE_REGISTRY = before;
   }
+});
+
+// ─── Codex 侧待认领快过期提醒 ───────────────────────────────────────────────────────────
+function codexReminderFixture({ base = 1000 } = {}) {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_old", token: "aaa111", now: base });
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  assert.equal(promoteTask({
+    logicalTaskKey: task.logical_task_key, generationId: task.channel_generation_id,
+    sessionId: "session_old", home, now: base + 100,
+  }).ok, true);
+  assert.equal(prepareTaskTopicRotation({ threadId: THREAD_A, operationId: "op_r", home, now: base + 200 }).ok, true);
+  const registered = registerTaskTopicRotation({
+    threadId: THREAD_A, operationId: "op_r", rootMessageId: "om_new", pendingToken: "bbb222", home, now: base + 300,
+  });
+  assert.equal(registered.ok, true);
+  const deadline = Date.parse(registered.generation.claim_expires_at);
+  assert.equal(deadline, base + 300 + 72 * 3600000, "Codex 侧待认领窗口同样是 72 小时");
+  const pendingNow = (now) => topicStateForTask(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task, { now })
+    .state.generations.find((g) => g.root_message_id === "om_new");
+  return { home, deadline, pendingNow };
+}
+
+test("Codex 待认领快过期提醒：进窗口只在待认领话题下发一次，先发后记，发失败不记", () => {
+  const fx = codexReminderFixture();
+  const calls = [];
+  const publish = (a) => { calls.push(a); };
+  const early = remindCodexPendingClaims({ home: fx.home, now: fx.deadline - 13 * 3600000, publish });
+  assert.deepEqual([early.ok, early.reminded, early.problems, calls.length], [true, [], [], 0]);
+  assert.deepEqual(early.skipped, [{ name: "A", reason: "not_yet" }]);
+
+  const now = fx.deadline - 11 * 3600000;
+  const first = remindCodexPendingClaims({ home: fx.home, now, publish });
+  assert.deepEqual(first.problems, []);
+  assert.deepEqual(first.reminded, [{ name: "A", generation: 2, attempt: 1, recorded: true }]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].rootMessageId, "om_new", "发在待认领的那个话题下");
+  assert.equal(calls[0].profile, TEMPLATE.lark_cli_profile);
+  assert.equal(calls[0].expectedAppId, TEMPLATE.outbound_app_id);
+  assert.match(calls[0].text, /A · 第 2 代/u);
+  assert.match(calls[0].text, /还剩约 11 小时/u);
+  assert.ok(!calls[0].text.includes("om_new"), "正文不带 locator");
+  assert.equal(fx.pendingNow(now).claim_reminder_at, new Date(now).toISOString());
+
+  const second = remindCodexPendingClaims({ home: fx.home, now: now + 1800000, publish });
+  assert.deepEqual([second.reminded, calls.length], [[], 1], "只提醒一次");
+  assert.deepEqual(second.skipped, [{ name: "A", reason: "already_reminded" }]);
+
+  const fx2 = codexReminderFixture();
+  const failed = remindCodexPendingClaims({ home: fx2.home, now, publish: () => { throw new Error("lark down"); } });
+  assert.deepEqual(failed.reminded, []);
+  assert.equal(failed.problems[0]?.reason, "publish_failed");
+  assert.equal(fx2.pendingNow(now).claim_reminder_at, undefined, "预留 → 发 → 记：没发出去不记");
+  assert.equal(fx2.pendingNow(now).claim_reminder_attempts, 1, "尝试要留痕");
+  const tooSoon = remindCodexPendingClaims({ home: fx2.home, now: now + 60000, publish });
+  assert.deepEqual([tooSoon.reminded, tooSoon.skipped, calls.length], [[], [{ name: "A", reason: "retry_too_soon" }], 1]);
+  const retry = remindCodexPendingClaims({ home: fx2.home, now: now + 30 * 60000, publish });
+  assert.deepEqual([retry.reminded, calls.length], [[{ name: "A", generation: 2, attempt: 2, recorded: true }], 2]);
+  const fx3 = codexReminderFixture();
+  const dry = remindCodexPendingClaims({ home: fx3.home, now, publish, dryRun: true });
+  assert.deepEqual([dry.reminded, calls.length], [[{ name: "A", generation: 2, dryRun: true }], 2]);
+  assert.equal(fx3.pendingNow(now).claim_reminder_at, undefined, "dry-run 不记");
+  assert.equal(fx3.pendingNow(now).claim_reminder_attempts ?? 0, 0, "dry-run 也不预留");
+
+  // 并发：发布回调里嵌套扫描，模拟第二个扫描器在预留之后、记之前进来
+  const fx4 = codexReminderFixture();
+  let nested = null;
+  const outer = remindCodexPendingClaims({ home: fx4.home, now, publish: (a) => {
+    calls.push(a);
+    nested = remindCodexPendingClaims({ home: fx4.home, now, publish: (b) => { calls.push(b); } });
+  } });
+  assert.deepEqual([outer.reminded.length, nested.reminded, nested.skipped, calls.length],
+    [1, [], [{ name: "A", reason: "retry_too_soon" }], 3], "并发只发一条");
+
+  // 暂停的 task 不提醒
+  const fx5 = codexReminderFixture();
+  assert.equal(setTaskConnectionStatus({ threadId: THREAD_A, status: "paused", home: fx5.home, now }).ok, true);
+  const pausedSweep = remindCodexPendingClaims({ home: fx5.home, now, publish });
+  assert.deepEqual([pausedSweep.reminded, pausedSweep.skipped, calls.length],
+    [[], [{ name: "A", reason: "binding_not_active" }], 3]);
+
+  // 模板缺席：算这个 task 的问题、不烧尝试、不终止扫描；dry-run 根本不碰模板
+  const fx6 = codexReminderFixture();
+  fs.rmSync(path.join(fx6.home, "chain-config.json"));
+  const noTpl = remindCodexPendingClaims({ home: fx6.home, now, publish });
+  assert.deepEqual([noTpl.reminded, noTpl.problems.map((p) => [p.name, p.reason]), calls.length], [[], [["A", "template_unavailable"]], 3]);
+  assert.equal(fx6.pendingNow(now).claim_reminder_attempts, undefined, "身份解析失败不烧尝试");
+  const dryNoTpl = remindCodexPendingClaims({ home: fx6.home, now, publish, dryRun: true });
+  assert.deepEqual([dryNoTpl.problems, dryNoTpl.reminded.length], [[], 1]);
+
+  // 锁目录不可写：lock_io_error → reserve_failed，不是 registry_busy 静默跳过
+  const fx7 = codexReminderFixture();
+  fs.chmodSync(fx7.home, 0o500);
+  try {
+    const io = remindCodexPendingClaims({ home: fx7.home, now, publish });
+    assert.deepEqual([io.reminded, io.skipped, calls.length], [[], [], 3]);
+    assert.deepEqual(io.problems.map((p) => [p.name, p.reason]), [["A", "reserve_failed"]], JSON.stringify(io.problems));
+    assert.match(io.problems[0].error, /lock_io_error：.*(EACCES|EPERM)/u);
+  } finally {
+    fs.chmodSync(fx7.home, 0o700);
+  }
+
+  // 交互策略写入口（带重试的那条取锁路径）同样不许把 I/O 错误说成 registry_busy（评审探针）
+  const fx8 = codexReminderFixture();
+  fs.chmodSync(fx8.home, 0o500);
+  try {
+    const r = setTaskInteractionMode({ threadId: THREAD_A, mode: "dialogue", home: fx8.home, now });
+    assert.deepEqual([r.ok, r.reason], [false, "lock_io_error"], JSON.stringify(r));
+    assert.match(String(r.error), /EACCES|EPERM/u);
+  } finally {
+    fs.chmodSync(fx8.home, 0o700);
+  }
+});
+
+test("Codex 兜底真入口 drain-all 跑待认领提醒；发不出去要报 publish_failed、退出 1、不记", () => {
+  const base = Date.now() - (72 - 11) * 3600000 - 300; // 截止 ≈ 现在 + 11 小时
+  const fx = codexReminderFixture({ base });
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "drain-all.mjs")], {
+    encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: fx.home },
+  });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout + r.stderr, /Codex 待认领提醒：.*提醒有问题.*A（publish_failed/u, r.stdout + r.stderr);
+  assert.equal(fx.pendingNow(Date.now()).claim_reminder_at, undefined, "没发出去不许记");
 });
 
 summarySealed = true;

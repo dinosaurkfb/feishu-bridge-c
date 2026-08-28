@@ -31,6 +31,7 @@ import { newRegistryEntry } from "./bind-compose.mjs";
 import { promoteBinding } from "./inbound-route.mjs";
 import {
   TOPIC_GENERATION_AUTO_ROTATE_RETRY_MS, TOPIC_GENERATION_PREPARING_STALE_MS,
+  TOPIC_GENERATION_AUTO_ROTATE_MESSAGES,
 } from "./topic-generation.mjs";
 import { prepareClaudeTopicRotation, recordClaudeTopicActivity } from "./topic-generation-store.mjs";
 import { recordClaudeActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
@@ -38,7 +39,7 @@ import { recordClaudeActivityAndMaybeRotate } from "./automatic-topic-rotation.m
 const NOW = Date.parse("2026-08-23T00:00:00.000Z");
 
 /** 造一条已接好的 Claude 绑定，代际计数停在阈值前一条。 */
-function fixture({ threshold = 30 } = {}) {
+function fixture({ threshold = TOPIC_GENERATION_AUTO_ROTATE_MESSAGES } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rotation-drill-"));
   const root = path.join(dir, "project");
   fs.mkdirSync(root, { recursive: true });

@@ -33,9 +33,18 @@ import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
 import { machineContext, runDoctor } from "./doctor.mjs";
 import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
+import {
+  claimReminderDue as tgClaimReminderDue, markPendingClaimReminder as tgMarkPendingClaimReminder,
+  validateTopicGenerationState as tgValidateState,
+  TOPIC_GENERATION_CLAIM_REMINDER_LEAD_MS as TG_REMINDER_LEAD_MS, TOPIC_GENERATION_PENDING_MS as TG_PENDING_MS,
+  TOPIC_GENERATION_CLAIM_REMINDER_RETRY_MS as TG_REMINDER_RETRY_MS,
+  TOPIC_GENERATION_CLAIM_REMINDER_MAX_ATTEMPTS as TG_REMINDER_MAX_ATTEMPTS,
+  reserveClaimReminderAttempt as tgReserveClaimReminderAttempt,
+} from "./topic-generation.mjs";
+import { describeReminderSweep, remindClaudePendingClaims, remindOnePendingClaim } from "./claim-reminder.mjs";
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
 import {
-  acquirePublishLock, attributeSession, exactProjectsForRoot, fileContainsAny, isUnder,
+  acquirePublishLock, attributeSession, clearStaleReapLock, exactProjectsForRoot, fileContainsAny, isUnder,
   loadRegistry, loadRegistryStrict, normalizeRoot, releasePublishLock,
   routableProjectsForRoot,
 } from "./registry.mjs";
@@ -197,7 +206,7 @@ import {
   stableControlId, validateSubscription,
 } from "./subscription.mjs";
 import {
-  ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, topicGenerationStateForLegacy,
+  ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, TOPIC_GENERATION_PENDING_MS, topicGenerationStateForLegacy,
   TOPIC_GENERATION_PREPARING_STALE_MS,
   activatePendingTopicGeneration, activeGeneration,
   closePendingTopicGeneration, materializeLegacyTopicFields, pendingGeneration,
@@ -206,6 +215,7 @@ import {
 } from "./topic-generation.mjs";
 import {
   prepareClaudeTopicRotation, recordClaudeTopicActivity, registerClaudeTopicRotation,
+  setClaudeTopicBindingStatus, reserveClaudeClaimReminder,
   topicGenerationLockDir,
 } from "./topic-generation-store.mjs";
 import {
@@ -678,14 +688,15 @@ test("Topic Generation v1 schema 与运行时常量一致", () => {
   assert.equal(schema.$defs.activity.properties.count_mode.const, "business_message_v1");
 });
 
-test("自动轮转按有效消息幂等计数，恰好 30 条时只取得一次尝试权", () => {
+test("自动轮转按有效消息幂等计数，恰好到阈值那条时只取得一次尝试权", () => {
   const projected = projectLegacyTopicGeneration({
     runtime: "claude", bindingId: "activity-a", rootMessageId: "om_old",
     sessionId: "session_old", inboundState: "bound", now: NOW,
   });
   let state = projected.state;
   const generationId = state.active_generation_id;
-  for (let index = 1; index <= 29; index += 1) {
+  const T = TOPIC_GENERATION_AUTO_ROTATE_MESSAGES;
+  for (let index = 1; index <= T - 1; index += 1) {
     const counted = recordTopicGenerationActivity(state, {
       generationId, eventKey: "message-" + index, now: NOW + index,
     });
@@ -694,25 +705,25 @@ test("自动轮转按有效消息幂等计数，恰好 30 条时只取得一次�
     state = counted.state;
   }
   const duplicate = recordTopicGenerationActivity(state, {
-    generationId, eventKey: "message-29", now: NOW + 30,
+    generationId, eventKey: "message-" + (T - 1), now: NOW + T,
   });
   assert.equal(duplicate.counted, false);
-  assert.equal(duplicate.messageCount, 29);
+  assert.equal(duplicate.messageCount, T - 1);
 
   const threshold = recordTopicGenerationActivity(state, {
-    generationId, eventKey: "message-30", now: NOW + 31,
+    generationId, eventKey: "message-" + T, now: NOW + T + 1,
   });
-  assert.equal(threshold.messageCount, 30);
+  assert.equal(threshold.messageCount, T);
   assert.equal(threshold.shouldAutoRotate, true);
   assert.equal(threshold.generation.activity.auto_rotation_attempts, 1);
 
   const cooldown = recordTopicGenerationActivity(threshold.state, {
-    generationId, eventKey: "message-31", now: NOW + 32,
+    generationId, eventKey: "message-" + (T + 1), now: NOW + T + 2,
   });
-  assert.equal(cooldown.messageCount, 31);
+  assert.equal(cooldown.messageCount, T + 1);
   assert.equal(cooldown.shouldAutoRotate, false, "同一轮失败后不能靠紧邻事件狂建话题");
   const retry = recordTopicGenerationActivity(cooldown.state, {
-    generationId, eventKey: "message-32", now: NOW + 10 * 60 * 1000,
+    generationId, eventKey: "message-" + (T + 2), now: NOW + 10 * 60 * 1000,
   });
   assert.equal(retry.shouldAutoRotate, true, "冷却后下一条新业务消息可重新申请轮转");
 });
@@ -901,7 +912,7 @@ test("轮转等待 mention 时旧代际仍 active，认领后一次状态替换�
   assert.equal(projected.record.session_id, "session_new");
 });
 
-test("pending generation 超过 24 小时后 fail-closed，旧代际保持 active", () => {
+test("pending generation 超过认领窗口（默认 72 小时）后 fail-closed，旧代际保持 active", () => {
   const legacy = projectLegacyTopicGeneration({
     runtime: "claude", bindingId: "binding_b", rootMessageId: "om_old",
     sessionId: "session_old", inboundState: "bound", now: NOW,
@@ -3370,8 +3381,8 @@ test("活着的发布者挡住第二次取锁（防重复打扰）", () => {
 });
 
 test("持有者进程已死 → 发布锁被判陈旧并回收", () => {
-  fs.writeFileSync(path.join(pubLock, "owner.json"),
-    JSON.stringify({ pid: 999999, at: new Date().toISOString() }));
+  const forge = (owner) => { fs.rmSync(pubLock, { recursive: true, force: true }); fs.symlinkSync(JSON.stringify(owner), pubLock); };
+  forge({ pid: 999999, at: new Date().toISOString(), token: "dead" });
   let alive = true;
   try { process.kill(999999, 0); } catch { alive = false; }
   if (!alive) assert.equal(acquirePublishLock(pubLock).ok, true);
@@ -3381,8 +3392,547 @@ test("持有者还活着但锁太老 → 也判陈旧，不永久堵住出站", 
   releasePublishLock(pubLock);
   assert.equal(acquirePublishLock(pubLock).ok, true);
   const old = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-  fs.writeFileSync(path.join(pubLock, "owner.json"), JSON.stringify({ pid: process.pid, at: old }));
+  fs.rmSync(pubLock, { force: true });
+  fs.symlinkSync(JSON.stringify({ pid: process.pid, at: old, token: "stale" }), pubLock);
   assert.equal(acquirePublishLock(pubLock).ok, true);
+  assert.deepEqual(fs.readdirSync(path.dirname(pubLock)).filter((n) => n.startsWith("publish.lock.")), [], "reap / reaped 残留不许留");
+});
+
+test("取锁是一步原子操作：锁就是 symlink，owner 是链接目标，每次获取带唯一 token", () => {
+  releasePublishLock(pubLock);
+  const got = acquirePublishLock(pubLock);
+  assert.equal(got.ok, true);
+  assert.match(got.token, /^[0-9a-f-]{36}$/u);
+  assert.ok(fs.lstatSync(pubLock).isSymbolicLink(), "没有'目录先出现、owner 后落地'的中间态");
+  const owner = JSON.parse(fs.readlinkSync(pubLock));
+  assert.deepEqual([owner.pid, owner.token], [process.pid, got.token]);
+  const second = acquirePublishLock(pubLock);
+  assert.deepEqual([second.ok, second.reason], [false, "publisher_busy"]);
+  assert.notEqual(second.token, got.token);
+});
+
+test("旧版目录锁：空目录几秒内当活锁不许抢；超过宽限才回收；owner 是活进程照样挡", () => {
+  releasePublishLock(pubLock);
+  fs.mkdirSync(pubLock, { recursive: true });
+  const r = acquirePublishLock(pubLock);
+  assert.deepEqual([r.ok, r.reason], [false, "publisher_busy"]);
+  assert.ok(fs.existsSync(pubLock), "活锁不许被删");
+  const old = (Date.now() - 60_000) / 1000;
+  fs.utimesSync(pubLock, old, old);
+  assert.equal(acquirePublishLock(pubLock).ok, true, "超过宽限才算残骸");
+  assert.ok(fs.lstatSync(pubLock).isSymbolicLink(), "回收后是新协议的锁");
+  releasePublishLock(pubLock);
+  fs.mkdirSync(pubLock, { recursive: true });
+  fs.writeFileSync(path.join(pubLock, "owner.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  assert.equal(acquirePublishLock(pubLock).reason, "publisher_busy", "旧版目录锁、持有者活着 → 挡");
+  fs.rmSync(pubLock, { recursive: true, force: true });
+});
+
+test("释放按 token 核对：同 pid 的另一实例拿走了锁 → 不删；旧版目录锁退回按 pid", () => {
+  const got = acquirePublishLock(pubLock);
+  assert.equal(got.ok, true);
+  fs.rmSync(pubLock, { force: true });
+  fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "someone-else" }), pubLock);
+  const r = releasePublishLock(pubLock);
+  assert.deepEqual([r.ok, r.reason], [false, "not_owner"], "pid 相同也不算我的：pid 不代表锁实例");
+  assert.ok(fs.lstatSync(pubLock).isSymbolicLink(), "别人的锁还在（symlink 的目标不是路径，existsSync 会说没有）");
+  fs.rmSync(pubLock, { force: true });
+  fs.mkdirSync(pubLock, { recursive: true });
+  fs.writeFileSync(path.join(pubLock, "owner.json"), JSON.stringify({ pid: process.ppid, at: new Date().toISOString() }));
+  let parentAlive = true;
+  try { process.kill(process.ppid, 0); } catch { parentAlive = false; }
+  if (parentAlive) {
+    assert.deepEqual(releasePublishLock(pubLock).reason, "not_owner");
+    assert.ok(fs.existsSync(pubLock));
+  }
+  fs.rmSync(pubLock, { recursive: true, force: true });
+  assert.equal(acquirePublishLock(pubLock).ok, true);
+  assert.equal(releasePublishLock(pubLock).ok, true);
+  assert.ok(!fs.existsSync(pubLock));
+});
+
+test("锁目录不可写是 io_error，不是 publisher_busy —— 别把真错误说成'别人正拿着'", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-ro-"));
+  fs.chmodSync(dir, 0o500);
+  try {
+    const r = acquirePublishLock(path.join(dir, "publish.lock"));
+    assert.deepEqual([r.ok, r.reason], [false, "io_error"], JSON.stringify(r));
+    assert.match(String(r.error), /EACCES|EPERM/u);
+  } finally {
+    fs.chmodSync(dir, 0o700);
+  }
+});
+
+test("回收窗口：判定陈旧之后、动手之前锁换了主人 → 不许碰那把活锁；别人正在回收 → 这轮让它", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-reap-"));
+  const lockDir = path.join(local, "registry.lock");
+  const stale = () => { fs.rmSync(lockDir, { recursive: true, force: true });
+    fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "stale" }), lockDir); };
+  // 1. A 判定陈旧；在它动手之前 B 已经回收并拿到了锁（活的、另一实例）。A 必须发现实例变了、返回 busy，B 的锁原样在。
+  stale();
+  const live = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "b-live" });
+  const r = acquirePublishLock(lockDir, { beforeReap: () => { fs.rmSync(lockDir, { force: true }); fs.symlinkSync(live, lockDir); } });
+  assert.deepEqual([r.ok, r.reason], [false, "publisher_busy"], JSON.stringify(r));
+  assert.equal(fs.readlinkSync(lockDir), live, "B 的活锁一个字都不许动");
+  // 2. 别人正拿着 reap 锁在回收：这轮不碰、返回 busy，陈旧锁与 reap 锁都原样。
+  stale();
+  const reapDir = lockDir + ".reap";
+  const reaping = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "other-reaper" });
+  fs.symlinkSync(reaping, reapDir);
+  const r2 = acquirePublishLock(lockDir);
+  assert.deepEqual([r2.ok, r2.reason], [false, "publisher_busy"], JSON.stringify(r2));
+  assert.equal(JSON.parse(fs.readlinkSync(lockDir)).token, "stale", "陈旧锁留给正在回收的那一方处理");
+  assert.equal(fs.readlinkSync(reapDir), reaping, "别人的 reap 锁不许动");
+  // 3. reap 锁本身是残骸（60 秒以上）→ 热路径**不自愈**：报 reap_residue、一个字不动；只有显式维护入口能清。
+  const old = (Date.now() - 120_000) / 1000;
+  fs.lutimesSync(reapDir, old, old);
+  const r3 = acquirePublishLock(lockDir);
+  assert.deepEqual([r3.ok, r3.reason], [false, "reap_residue"], JSON.stringify(r3));
+  assert.equal(fs.readlinkSync(reapDir), reaping, "残骸也不在热路径上碰（自愈会递归复现同一个窗口）");
+  assert.equal(JSON.parse(fs.readlinkSync(lockDir)).token, "stale");
+  const preview = clearStaleReapLock(lockDir);
+  assert.deepEqual([preview.present, preview.stale, preview.removed], [true, true, false], "默认只报告");
+  assert.equal(fs.readlinkSync(reapDir), reaping);
+  const cleared = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([cleared.stale, cleared.removed], [true, true]);
+  assert.throws(() => fs.lstatSync(reapDir));
+  const r4 = acquirePublishLock(lockDir);
+  assert.equal(r4.ok, true, JSON.stringify(r4));
+  assert.deepEqual(fs.readdirSync(local).filter((n) => n.startsWith("registry.lock.")), [], "reap / reaped 残留不许留");
+  // 还新的 reap 锁：维护入口也拒绝清（可能是活的）
+  fs.symlinkSync(reaping, reapDir);
+  const fresh = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([fresh.present, fresh.stale, fresh.removed], [true, false, false]);
+  assert.equal(fs.readlinkSync(reapDir), reaping);
+  // 持锁时 reap 残骸在：释放也报 reap_residue、锁不动
+  fs.lutimesSync(reapDir, old, old);
+  const rel = releasePublishLock(lockDir, { waitMs: 10 });
+  assert.deepEqual([rel.ok, rel.reason], [false, "reap_residue"], JSON.stringify(rel));
+  assert.equal(JSON.parse(fs.readlinkSync(lockDir)).token, r4.token);
+  fs.rmSync(reapDir, { force: true });
+  assert.equal(releasePublishLock(lockDir).ok, true);
+});
+
+test("维护入口自身也是归属转换：维护锁串行、只清形状合法的残骸、先隔离再删、期间出现的新实例不许碰", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-maint-"));
+  const lockDir = path.join(local, "registry.lock");
+  const reapDir = lockDir + ".reap";
+  const maintDir = lockDir + ".maint";
+  const old = (Date.now() - 120_000) / 1000;
+  const staleReap = () => { fs.rmSync(reapDir, { recursive: true, force: true });
+    fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), reapDir);
+    fs.lutimesSync(reapDir, old, old); };
+  // 1. 形状不合法的制品一律不动：旧目录（带哨兵）、普通文件、畸形 symlink
+  fs.mkdirSync(reapDir); fs.writeFileSync(path.join(reapDir, "sentinel"), "keep");
+  fs.utimesSync(reapDir, old, old);
+  let r = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([r.removed, r.reason], [false, "unrecognized_artifact"], JSON.stringify(r));
+  assert.equal(fs.readFileSync(path.join(reapDir, "sentinel"), "utf-8"), "keep", "带哨兵的旧目录一个字不许动");
+  fs.rmSync(reapDir, { recursive: true, force: true });
+  fs.writeFileSync(reapDir, "plain"); fs.utimesSync(reapDir, old, old);
+  r = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([r.removed, r.reason], [false, "unrecognized_artifact"]);
+  assert.equal(fs.readFileSync(reapDir, "utf-8"), "plain");
+  fs.rmSync(reapDir, { force: true });
+  fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), reapDir); fs.lutimesSync(reapDir, old, old);
+  r = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([r.removed, r.reason], [false, "unrecognized_artifact"]);
+  assert.ok(fs.lstatSync(reapDir).isSymbolicLink());
+  // 2. 维护锁在：maintenance_busy，残骸与维护锁都不动；维护锁不自愈（哪怕很老）
+  staleReap();
+  const otherMaint = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "other-maint" });
+  fs.symlinkSync(otherMaint, maintDir);
+  r = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([r.removed, r.reason], [false, "maintenance_busy"], JSON.stringify(r));
+  assert.ok(fs.lstatSync(reapDir).isSymbolicLink());
+  assert.equal(fs.readlinkSync(maintDir), otherMaint);
+  fs.lutimesSync(maintDir, old, old);
+  r = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([r.removed, r.reason], [false, "maintenance_busy"], "维护锁自己不自愈：" + JSON.stringify(r));
+  assert.equal(fs.readlinkSync(maintDir), otherMaint);
+  fs.rmSync(maintDir, { force: true });
+  // 3. 维护段内第二个维护者进来 → 它拿不到维护锁；段内残骸被换成活实例 → 我发现实例变了、不动
+  let nested = null;
+  r = clearStaleReapLock(lockDir, { apply: true, duringMaintenance: () => { nested = clearStaleReapLock(lockDir, { apply: true }); } });
+  assert.deepEqual([nested.removed, nested.reason], [false, "maintenance_busy"], "第二个维护者要被维护锁挡住");
+  assert.equal(r.removed, true, JSON.stringify(r));
+  assert.throws(() => fs.lstatSync(reapDir));
+  assert.throws(() => fs.lstatSync(maintDir), "维护锁用完要放");
+  staleReap();
+  const live = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "live-reaper" });
+  r = clearStaleReapLock(lockDir, { apply: true, duringMaintenance: () => { fs.rmSync(reapDir, { force: true }); fs.symlinkSync(live, reapDir); } });
+  assert.deepEqual([r.removed, r.reason], [false, "instance_changed"], JSON.stringify(r));
+  assert.equal(fs.readlinkSync(reapDir), live, "换成的活实例不许碰");
+  fs.rmSync(reapDir, { force: true });
+  // 4. 先隔离再删：残骸移走之后原路径上出现的新实例，删的是隔离路径、新实例活着
+  staleReap();
+  r = clearStaleReapLock(lockDir, { apply: true, afterQuarantine: () => { fs.symlinkSync(live, reapDir); } });
+  assert.equal(r.removed, true, JSON.stringify(r));
+  assert.equal(fs.readlinkSync(reapDir), live, "残骸移走后出现的新实例必须还在");
+  assert.deepEqual(fs.readdirSync(local).filter((n) => n.includes("quarantine") || n.endsWith(".maint")), [], "隔离路径与维护锁不留");
+  fs.rmSync(reapDir, { force: true });
+});
+
+test("维护入口的异常闭合：盘点 / 隔离的 I/O 错误按阶段报出、残骸不动；隔离后删不掉 → quarantine_unremoved，下次盘点能看见并清", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-maint-io-"));
+  const lockDir = path.join(local, "registry.lock");
+  const reapDir = lockDir + ".reap";
+  const old = (Date.now() - 120_000) / 1000;
+  const staleReap = () => { fs.rmSync(reapDir, { recursive: true, force: true });
+    fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), reapDir);
+    fs.lutimesSync(reapDir, old, old); };
+  const failOn = (name, target, code) => {
+    const orig = fs[name];
+    fs[name] = function (p, ...rest) {
+      if (path.resolve(String(p)) === path.resolve(target) || (target === "*" && String(p).includes(".quarantine-"))) {
+        throw Object.assign(new Error(code + ": injected"), { code });
+      }
+      return orig.call(fs, p, ...rest);
+    };
+    return () => { fs[name] = orig; };
+  };
+  // 1. 盘点 lstat 报 EACCES：不是"没有"，是 io_error（阶段 inspect），残骸不动
+  staleReap();
+  let restore = failOn("lstatSync", reapDir, "EACCES");
+  let r;
+  try { r = clearStaleReapLock(lockDir, { apply: true }); } finally { restore(); }
+  assert.deepEqual([r.removed, r.reason, r.phase], [false, "io_error", "inspect"], JSON.stringify(r));
+  assert.match(String(r.error), /EACCES/u);
+  assert.equal(JSON.parse(fs.readlinkSync(reapDir)).token, "crashed");
+  // 2. rename 报 EIO：io_error（阶段 quarantine），残骸不动、维护锁放掉
+  restore = failOn("renameSync", reapDir, "EIO");
+  try { r = clearStaleReapLock(lockDir, { apply: true }); } finally { restore(); }
+  assert.deepEqual([r.removed, r.reason, r.phase], [false, "io_error", "quarantine"], JSON.stringify(r));
+  assert.equal(JSON.parse(fs.readlinkSync(reapDir)).token, "crashed");
+  assert.throws(() => fs.lstatSync(lockDir + ".maint"), "维护锁要放");
+  // 3. 隔离成功、unlink 报 EIO：受控的 quarantine_unremoved，原路径已空，隔离路径可见
+  restore = failOn("unlinkSync", "*", "EIO");
+  try { r = clearStaleReapLock(lockDir, { apply: true }); } finally { restore(); }
+  assert.deepEqual([r.removed, r.reason], [false, "quarantine_unremoved"], JSON.stringify(r));
+  assert.ok(r.quarantinePath && fs.lstatSync(r.quarantinePath).isSymbolicLink(), "隔离路径要给出来且东西还在");
+  assert.throws(() => fs.lstatSync(reapDir), "原路径已空，热路径不再卡");
+  assert.throws(() => fs.lstatSync(lockDir + ".maint"));
+  // 4. 下次盘点（不 apply）能看见隔离残留；apply 清掉；清完再盘点干净
+  const seen = clearStaleReapLock(lockDir);
+  assert.deepEqual([seen.present, seen.quarantine.length, seen.quarantine[0].removed], [false, 1, false], JSON.stringify(seen));
+  assert.equal(seen.quarantine[0].path, r.quarantinePath);
+  const cleared = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([cleared.present, cleared.quarantine.length, cleared.quarantine[0].removed], [false, 1, true], JSON.stringify(cleared));
+  assert.throws(() => fs.lstatSync(r.quarantinePath));
+  assert.deepEqual(clearStaleReapLock(lockDir).quarantine, []);
+  // 5. 隔离路径上不认识的东西：列出来、不动
+  const junk = reapDir + ".quarantine-junk";
+  fs.mkdirSync(junk); fs.writeFileSync(path.join(junk, "sentinel"), "keep"); fs.utimesSync(junk, old, old);
+  const junkSeen = clearStaleReapLock(lockDir, { apply: true });
+  assert.deepEqual([junkSeen.quarantine.length, junkSeen.quarantine[0].recognized, junkSeen.quarantine[0].removed], [1, false, false]);
+  assert.equal(fs.readFileSync(path.join(junk, "sentinel"), "utf-8"), "keep");
+  fs.rmSync(junk, { recursive: true, force: true });
+  // 6. 隔离文件身份封闭：owner 合法但后缀不是规范 UUID → recognized:false、列出、不动（评审探针：任意后缀曾被删）
+  const badName = reapDir + ".quarantine-not-a-maintenance-token";
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "x" }), badName);
+  fs.lutimesSync(badName, old, old);
+  const goodName = reapDir + ".quarantine-0f1e2d3c-4b5a-4978-8f6e-5d4c3b2a1908";
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "y" }), goodName);
+  fs.lutimesSync(goodName, old, old);
+  const named = clearStaleReapLock(lockDir, { apply: true });
+  const byPath = Object.fromEntries(named.quarantine.map((e) => [e.path, e]));
+  assert.deepEqual([byPath[badName].recognized, byPath[badName].removed], [false, false], JSON.stringify(named));
+  assert.ok(fs.lstatSync(badName).isSymbolicLink(), "后缀不合规的一字不动");
+  assert.deepEqual([byPath[goodName].recognized, byPath[goodName].removed], [true, true]);
+  assert.throws(() => fs.lstatSync(goodName));
+  fs.rmSync(badName, { force: true });
+  // 7. 逐项 lstat 报 EACCES：不是"没有"，是 io_error（阶段 inventory，带路径），制品不动，apply 不算完成
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "z" }), goodName);
+  fs.lutimesSync(goodName, old, old);
+  restore = failOn("lstatSync", goodName, "EACCES");
+  try { r = clearStaleReapLock(lockDir, { apply: true }); } finally { restore(); }
+  assert.deepEqual([r.reason, r.phase, r.path], ["io_error", "inventory", goodName], JSON.stringify(r));
+  assert.ok(fs.lstatSync(goodName).isSymbolicLink());
+  assert.equal(clearStaleReapLock(lockDir, { apply: true }).quarantine[0].removed, true, "故障消失后同一入口能清");
+});
+
+test("repair-publish-lock 退出码：只有确实没有 / 已清 / 预览是 0，--apply 没做完一律非零", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-repair-exit-"));
+  const lockDir = path.join(local, "registry.lock");
+  const reapDir = lockDir + ".reap";
+  const cli = (...args) => spawnSync(process.execPath, [path.resolve("scripts", "repair-publish-lock.mjs"), ...args], { encoding: "utf-8" });
+  const old = (Date.now() - 120_000) / 1000;
+  assert.equal(cli("--lock", lockDir).status, 0, "没有残骸 → 0");
+  assert.equal(cli("--lock", lockDir, "--apply").status, 0);
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), reapDir);
+  assert.equal(cli("--lock", lockDir, "--apply").status, 1, "还新、apply 没做 → 非零");
+  fs.lutimesSync(reapDir, old, old);
+  assert.equal(cli("--lock", lockDir).status, 0, "预览 → 0");
+  fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "other" }), lockDir + ".maint");
+  const busy = cli("--lock", lockDir, "--apply");
+  assert.deepEqual([busy.status, /另一个维护者/u.test(busy.stdout)], [1, true]);
+  fs.rmSync(lockDir + ".maint", { force: true });
+  assert.equal(cli("--lock", lockDir, "--apply").status, 0, "清掉 → 0");
+  fs.mkdirSync(reapDir); fs.utimesSync(reapDir, old, old);
+  const unrec = cli("--lock", lockDir, "--apply");
+  assert.deepEqual([unrec.status, /不是本协议的残骸/u.test(unrec.stdout)], [1, true]);
+  fs.rmSync(reapDir, { recursive: true, force: true });
+  const left = reapDir + ".quarantine-9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d";
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "left" }), left);
+  fs.lutimesSync(left, old, old);
+  const leftover = cli("--lock", lockDir);
+  assert.deepEqual([leftover.status, /隔离残留可清/u.test(leftover.stdout)], [0, true], leftover.stdout);
+  const cleaned = cli("--lock", lockDir, "--apply");
+  assert.deepEqual([cleaned.status, /已清隔离残留/u.test(cleaned.stdout)], [0, true], cleaned.stdout);
+  assert.throws(() => fs.lstatSync(left));
+  const badName = reapDir + ".quarantine-not-a-maintenance-token";
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "x" }), badName);
+  fs.lutimesSync(badName, old, old);
+  const bad = cli("--lock", lockDir, "--apply");
+  assert.deepEqual([bad.status, /不认识的东西/u.test(bad.stdout)], [1, true], bad.stdout);
+  assert.ok(fs.lstatSync(badName).isSymbolicLink(), "后缀不合规的不许删");
+});
+
+test("两个真实 OS 进程同时清同一个 reap 残骸：最多一个 removed，之后出现的新实例不许被删", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-maint-race-"));
+  const worker = path.join(local, "worker.mjs");
+  const driver = path.join(local, "driver.mjs");
+  fs.writeFileSync(worker, [
+    'import fs from "node:fs";',
+    'const { clearStaleReapLock } = await import(' + JSON.stringify(pathToFileURL(path.resolve("scripts", "registry.mjs")).href) + ');',
+    'const [lockDir, go, live] = process.argv.slice(2);',
+    'const w = new Int32Array(new SharedArrayBuffer(4));',
+    'while (Date.now() < Number(go)) Atomics.wait(w, 0, 0, 1);',
+    'const r = clearStaleReapLock(lockDir, { apply: true, afterQuarantine: () => { try { fs.symlinkSync(live, lockDir + ".reap"); } catch {} } });',
+    'process.stdout.write(JSON.stringify({ removed: r.removed, reason: r.reason ?? null }));',
+  ].join("\n"));
+  fs.writeFileSync(driver, [
+    'import fs from "node:fs";',
+    'import path from "node:path";',
+    'import { spawn } from "node:child_process";',
+    'const [worker, lockDir, rounds] = process.argv.slice(2);',
+    'const live = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "live-after" });',
+    'const run = (go) => new Promise((res) => {',
+    '  const c = spawn(process.execPath, [worker, lockDir, String(go), live], { stdio: ["ignore", "pipe", "pipe"] });',
+    '  let out = ""; let err = "";',
+    '  c.stdout.on("data", (d) => { out += d; }); c.stderr.on("data", (d) => { err += d; });',
+    '  c.on("close", (code) => res({ code, out, err }));',
+    '});',
+    'const results = [];',
+    'const old = (Date.now() - 120000) / 1000;',
+    'for (let i = 0; i < Number(rounds); i += 1) {',
+    '  for (const n of fs.readdirSync(path.dirname(lockDir))) if (n.startsWith("registry.lock")) fs.rmSync(path.join(path.dirname(lockDir), n), { recursive: true, force: true });',
+    '  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), lockDir + ".reap");',
+    '  fs.lutimesSync(lockDir + ".reap", old, old);',
+    '  const go = Date.now() + 300;',
+    '  const pair = await Promise.all([run(go), run(go), run(go)]);',
+    '  let after = null; try { after = fs.readlinkSync(lockDir + ".reap"); } catch { after = null; }',
+    '  results.push({ pair, after, live });',
+    '}',
+    'process.stdout.write(JSON.stringify(results));',
+  ].join("\n"));
+  const lockDir = path.join(local, "registry.lock");
+  const r = spawnSync(process.execPath, [driver, worker, lockDir, "4"], { encoding: "utf-8", timeout: 90_000 });
+  assert.equal(r.status, 0, r.stderr);
+  for (const [i, round] of JSON.parse(r.stdout).entries()) {
+    for (const w of round.pair) assert.equal(w.code, 0, w.err);
+    const got = round.pair.map((w) => JSON.parse(w.out));
+    const removed = got.filter((g) => g.removed).length;
+    assert.equal(removed, 1, "第 " + i + " 轮：恰好一个维护者清掉残骸：" + JSON.stringify(got));
+    for (const g of got.filter((x) => !x.removed)) assert.ok(["maintenance_busy", "already_cleared", "instance_changed"].includes(g.reason), JSON.stringify(g));
+    assert.equal(round.after, round.live, "第 " + i + " 轮：清完之后出现的新实例必须还在");
+  }
+});
+
+test("symlink owner 形状封闭：缺 token / pid 不是正整数 / at 不规范 → 当不可读、保留现场；只有目录形状的旧版锁才按 pid 兼容", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-shape-"));
+  const lockDir = path.join(local, "registry.lock");
+  const shapes = [
+    { pid: process.pid, at: new Date().toISOString() },
+    { pid: "x", at: new Date().toISOString(), token: "t" },
+    { pid: process.pid, at: "2026-08-28T00:00:00Z", token: "t" },
+    { pid: process.pid, at: new Date().toISOString(), token: "" },
+    [1, 2],
+  ];
+  for (const owner of shapes) {
+    fs.rmSync(lockDir, { force: true });
+    fs.symlinkSync(JSON.stringify(owner), lockDir);
+    const rel = releasePublishLock(lockDir);
+    assert.deepEqual([rel.ok, rel.reason], [false, "owner_unreadable"], JSON.stringify(owner));
+    assert.ok(fs.lstatSync(lockDir).isSymbolicLink(), "现场要留着：" + JSON.stringify(owner));
+    assert.equal(acquirePublishLock(lockDir).reason, "publisher_busy", "刚建的不可读当活锁：" + JSON.stringify(owner));
+  }
+  const old = (Date.now() - 60_000) / 1000;
+  fs.lutimesSync(lockDir, old, old);
+  assert.equal(acquirePublishLock(lockDir).ok, true, "超过宽限由陈旧回收处理");
+  assert.equal(releasePublishLock(lockDir).ok, true);
+  // 旧版目录锁：pid 是自己 → 可释放（兼容分支只对目录形状开放）
+  fs.mkdirSync(lockDir);
+  fs.writeFileSync(path.join(lockDir, "owner.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  assert.equal(releasePublishLock(lockDir).ok, true);
+  assert.throws(() => fs.lstatSync(lockDir));
+});
+
+test("repair-publish-lock 真入口：默认只报告、--apply 只清残骸、还新的拒绝、参数严格", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-repair-"));
+  const lockDir = path.join(local, "registry.lock");
+  const reapDir = lockDir + ".reap";
+  const cli = (...args) => spawnSync(process.execPath, [path.resolve("scripts", "repair-publish-lock.mjs"), ...args], { encoding: "utf-8" });
+  assert.equal(cli().status, 2);
+  assert.equal(cli("--lock", lockDir, "--bogus").status, 2);
+  assert.equal(cli("--", "--apply").status, 2, "透传参数也拒绝");
+  assert.match(cli("--lock", lockDir).stdout, /没有 reap 残骸/u);
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), reapDir);
+  assert.match(cli("--lock", lockDir, "--apply").stdout, /还新.*不动/u);
+  assert.ok(fs.lstatSync(reapDir).isSymbolicLink());
+  const old = (Date.now() - 120_000) / 1000;
+  fs.lutimesSync(reapDir, old, old);
+  const preview = cli("--lock", lockDir);
+  assert.match(preview.stdout, /\[预览\].*可清除/u);
+  assert.ok(fs.lstatSync(reapDir).isSymbolicLink(), "预览不删");
+  assert.match(cli("--lock", lockDir, "--apply").stdout, /已清除 reap 残骸/u);
+  assert.throws(() => fs.lstatSync(reapDir));
+});
+
+test("释放是归属转换：owner 不可读保留现场；reap 锁被占就等、等不到报 release_busy 不动锁；reap 段内被接管不删别人的 reap 锁", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-release-"));
+  const lockDir = path.join(local, "registry.lock");
+  const reapDir = lockDir + ".reap";
+  // 1. owner 不可读：不删（残骸交给陈旧回收，那边看年龄），报 owner_unreadable。
+  fs.symlinkSync("not json", lockDir);
+  const r1 = releasePublishLock(lockDir);
+  assert.deepEqual([r1.ok, r1.reason], [false, "owner_unreadable"]);
+  assert.ok(fs.lstatSync(lockDir).isSymbolicLink(), "现场要留着");
+  assert.equal(acquirePublishLock(lockDir).reason, "publisher_busy", "刚建的残骸几秒内当活锁");
+  const old = (Date.now() - 60_000) / 1000;
+  fs.lutimesSync(lockDir, old, old);
+  const got = acquirePublishLock(lockDir);
+  assert.equal(got.ok, true, "超过宽限由陈旧回收处理");
+  // 2. 别人正拿着 reap 锁：释放等一小会，等不到就 release_busy，锁一个字不动。
+  const other = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "other-reaper" });
+  fs.symlinkSync(other, reapDir);
+  const r2 = releasePublishLock(lockDir, { waitMs: 30 });
+  assert.deepEqual([r2.ok, r2.reason], [false, "release_busy"], JSON.stringify(r2));
+  assert.equal(JSON.parse(fs.readlinkSync(lockDir)).token, got.token, "锁还是我的、没被动");
+  assert.equal(fs.readlinkSync(reapDir), other, "别人的 reap 锁没被动");
+  fs.rmSync(reapDir, { force: true });
+  assert.equal(releasePublishLock(lockDir).ok, true);
+  assert.throws(() => fs.lstatSync(lockDir));
+  // 3. 我在 reap 段内被接管（模拟：段内 reap 锁换成别人的）：我的 finally 不许删别人的 reap 锁。
+  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "stale" }), lockDir);
+  const taken = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "took-over" });
+  const r3 = acquirePublishLock(lockDir, { duringReap: () => { fs.rmSync(reapDir, { force: true }); fs.symlinkSync(taken, reapDir); } });
+  assert.equal(r3.ok, true, JSON.stringify(r3));
+  assert.equal(fs.readlinkSync(reapDir), taken, "被接管的 reap 锁不是我的，不删");
+  fs.rmSync(reapDir, { force: true });
+  assert.equal(releasePublishLock(lockDir).ok, true);
+});
+
+test("释放与陈旧接管互斥：两个真实 OS 进程 —— 旧持有者释放过期锁的同时新进程接管，新实例不许被删", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-release-race-"));
+  const worker = path.join(local, "worker.mjs");
+  const driver = path.join(local, "driver.mjs");
+  fs.writeFileSync(worker, [
+    'import fs from "node:fs";',
+    'const { acquirePublishLock, releasePublishLock } = await import(' + JSON.stringify(pathToFileURL(path.resolve("scripts", "registry.mjs")).href) + ');',
+    'const [role, lockDir, go, readyFile] = process.argv.slice(2);',
+    'const w = new Int32Array(new SharedArrayBuffer(4));',
+    'let out = {};',
+    'if (role === "old") {',
+    '  const got = acquirePublishLock(lockDir, { now: Date.now() - 10 * 60 * 1000 });', // 拿到手就已经过 staleMs
+    '  fs.writeFileSync(readyFile, "ok");',
+    '  while (Date.now() < Number(go)) Atomics.wait(w, 0, 0, 1);',
+    '  out = { got, release: releasePublishLock(lockDir) };',
+    '} else {',
+    '  while (!fs.existsSync(readyFile)) Atomics.wait(w, 0, 0, 1);',
+    '  while (Date.now() < Number(go)) Atomics.wait(w, 0, 0, 1);',
+    '  out = { got: acquirePublishLock(lockDir) };',
+    '}',
+    'process.stdout.write(JSON.stringify(out));',
+  ].join("\n"));
+  fs.writeFileSync(driver, [
+    'import fs from "node:fs";',
+    'import { spawn } from "node:child_process";',
+    'const [worker, lockDir, rounds] = process.argv.slice(2);',
+    'const run = (role, go, ready) => new Promise((res) => {',
+    '  const c = spawn(process.execPath, [worker, role, lockDir, String(go), ready], { stdio: ["ignore", "pipe", "pipe"] });',
+    '  let out = ""; let err = "";',
+    '  c.stdout.on("data", (d) => { out += d; }); c.stderr.on("data", (d) => { err += d; });',
+    '  c.on("close", (code) => res({ role, code, out, err }));',
+    '});',
+    'const results = [];',
+    'for (let i = 0; i < Number(rounds); i += 1) {',
+    '  fs.rmSync(lockDir, { recursive: true, force: true });',
+    '  const ready = lockDir + ".ready-" + i;',
+    '  const go = Date.now() + 400;',
+    '  const pair = await Promise.all([run("old", go, ready), run("new", go, ready)]);',
+    '  let owner = null;',
+    '  try { owner = JSON.parse(fs.readlinkSync(lockDir)); } catch { owner = null; }',
+    '  results.push({ pair, owner });',
+    '}',
+    'process.stdout.write(JSON.stringify(results));',
+  ].join("\n"));
+  const lockDir = path.join(local, "registry.lock");
+  const r = spawnSync(process.execPath, [driver, worker, lockDir, "6"], { encoding: "utf-8", timeout: 90_000 });
+  assert.equal(r.status, 0, r.stderr);
+  const rounds = JSON.parse(r.stdout);
+  for (const [i, round] of rounds.entries()) {
+    for (const w of round.pair) assert.equal(w.code, 0, w.err);
+    const oldR = JSON.parse(round.pair[0].out);
+    const newR = JSON.parse(round.pair[1].out);
+    assert.equal(oldR.got.ok, true, "第 " + i + " 轮：旧持有者先拿到锁");
+    if (newR.got.ok) {
+      // 不变量：新实例接管成功后必须还在。旧方的释放要么先于接管（ok），要么发现锁已易主（not_owner）—— 两种交错都合法，
+      // 唯一不许的是"接管成功了、旧方随后把新实例删掉"（评审探针抓到的那种）。
+      assert.ok(round.owner && round.owner.token === newR.got.token,
+        "第 " + i + " 轮：新实例接管成功后必须还在 —— " + JSON.stringify({ oldR, newR, owner: round.owner }));
+      assert.ok(oldR.release.ok === true || oldR.release.reason === "not_owner", JSON.stringify(oldR.release));
+    } else {
+      assert.equal(newR.got.reason, "publisher_busy", JSON.stringify(newR));
+      assert.equal(oldR.release.ok, true, "第 " + i + " 轮：新方没接管成功，旧方正常释放：" + JSON.stringify(oldR));
+    }
+  }
+  assert.ok(rounds.some((x) => JSON.parse(x.pair[1].out).got.ok), "6 轮里至少要有一轮是新方接管成功的，否则没测到那条路");
+});
+
+test("陈旧锁回收是互斥的：两个真实 OS 进程同时接管同一把陈旧锁，只有一个成功", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-race-"));
+  const worker = path.join(local, "worker.mjs");
+  const driver = path.join(local, "driver.mjs");
+  fs.writeFileSync(worker, [
+    'const { acquirePublishLock } = await import(' + JSON.stringify(pathToFileURL(path.resolve("scripts", "registry.mjs")).href) + ');',
+    'const [lockDir, go] = process.argv.slice(2);',
+    'const w = new Int32Array(new SharedArrayBuffer(4));',
+    'while (Date.now() < Number(go)) Atomics.wait(w, 0, 0, 1);',
+    'process.stdout.write(JSON.stringify(acquirePublishLock(lockDir)));',
+  ].join("\n"));
+  fs.writeFileSync(driver, [
+    'import fs from "node:fs";',
+    'import { spawn } from "node:child_process";',
+    'const [worker, lockDir, rounds] = process.argv.slice(2);',
+    'const run = (go) => new Promise((res) => {',
+    '  const c = spawn(process.execPath, [worker, lockDir, String(go)], { stdio: ["ignore", "pipe", "pipe"] });',
+    '  let out = ""; let err = "";',
+    '  c.stdout.on("data", (d) => { out += d; }); c.stderr.on("data", (d) => { err += d; });',
+    '  c.on("close", (code) => res({ code, out, err }));',
+    '});',
+    'const results = [];',
+    'for (let i = 0; i < Number(rounds); i += 1) {',
+    '  fs.rmSync(lockDir, { recursive: true, force: true });',
+    '  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "stale" }), lockDir);',
+    '  const go = Date.now() + 300;',
+    '  results.push(await Promise.all([run(go), run(go), run(go)]));',
+    '}',
+    'process.stdout.write(JSON.stringify(results));',
+  ].join("\n"));
+  const lockDir = path.join(local, "registry.lock");
+  const r = spawnSync(process.execPath, [driver, worker, lockDir, "4"], { encoding: "utf-8", timeout: 60_000 });
+  assert.equal(r.status, 0, r.stderr);
+  const rounds = JSON.parse(r.stdout);
+  for (const [i, round] of rounds.entries()) {
+    for (const w of round) assert.equal(w.code, 0, w.err);
+    const got = round.map((w) => JSON.parse(w.out));
+    assert.equal(got.filter((g) => g.ok).length, 1, "第 " + i + " 轮：" + JSON.stringify(got));
+    for (const g of got.filter((x) => !x.ok)) assert.equal(g.reason, "publisher_busy", JSON.stringify(g));
+  }
+  const owner = JSON.parse(fs.readlinkSync(lockDir));
+  assert.notEqual(owner.token, "stale", "最后持锁的是接管者，不是残骸");
+  assert.deepEqual(fs.readdirSync(local).filter((n) => n.startsWith("registry.lock.")), [], "reap / reaped 残留不许留");
 });
 
 releasePublishLock(pubLock);
@@ -4627,10 +5177,25 @@ test("同时有两份待绑定 → 拒。认领靠的就是「只有一份」这
   assert.equal(r.reason, PROMOTE_REJECT.MULTIPLE_PENDING);
 });
 
-test("待绑定超过 24 小时 → 过期，重新接入", () => {
+test("待绑定超过窗口（72 小时）→ 过期，重新接入", () => {
   const f = routeFixture([{ id: "a", extra: {} }]);
   const pending = pendingOf(f, { bound_at: new Date(NOW2 - PENDING_WINDOW_MS - 1000).toISOString() });
   assert.equal(pending.reason, PROMOTE_REJECT.PENDING_EXPIRED);
+});
+
+test("首次绑定的窗口走真实 newRegistryEntry → pendingDeadline：24 小时后仍可认领，72 小时到点过期", () => {
+  // 评审探针：newRegistryEntry 曾写死 24 天，物化进登记行后常量改了也不生效 —— 所以这里不比常量，比行为。
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  const mk = (now) => newRegistryEntry({ root: "/tmp/win", name: "win", purpose: null, token: "aaa111", rootMessageId: "om_win", now });
+  const dayOld = mk(NOW2 - 24 * 3600000 - 1000);
+  assert.equal(dayOld.pending_expires_at, new Date(NOW2 - 24 * 3600000 - 1000 + TG_PENDING_MS).toISOString());
+  const stillOpen = pendingOf(f, { bound_at: dayOld.bound_at, pending_expires_at: dayOld.pending_expires_at });
+  assert.equal(stillOpen.ok, true, JSON.stringify(stillOpen));
+  const justExpired = mk(NOW2 - TG_PENDING_MS);
+  assert.equal(pendingOf(f, { bound_at: justExpired.bound_at, pending_expires_at: justExpired.pending_expires_at }).reason,
+    PROMOTE_REJECT.PENDING_EXPIRED);
+  const almost = mk(NOW2 - TG_PENDING_MS + 1000);
+  assert.equal(pendingOf(f, { bound_at: almost.bound_at, pending_expires_at: almost.pending_expires_at }).ok, true);
 });
 
 test("待绑定连接入时间都没有 → 当成已过期（fail-closed）", () => {
@@ -5254,7 +5819,7 @@ test("status 只读，且不把话题 id 之类的 locator 打进人类可读输
   const st = currentBinding({ root: proj, ...f });
   const text = describeStatus(st, bindingsForRoot({ root: proj, registryFile: f.registryFile }));
   assert.ok(text.includes("已接入"));
-  assert.match(text, /自动轮转\s+0 \/ 30 条有效业务消息/u);
+  assert.match(text, /自动轮转\s+0 \/ 50 条有效业务消息/u);
   assert.ok(!text.includes("om_demo"), "话题 id 是 locator，不该出现在状态输出里");
   assert.ok(!text.includes("session_x"), "Aily session 同理");
 });
@@ -5275,7 +5840,7 @@ test("status 明确说明只读旧话题仍会接收轮转前受理的迟到结�
     pending: 0,
   });
   assert.match(text, /只读历史.*轮转前受理的结果仍会发回原话题/u);
-  assert.match(text, /自动轮转\s+0 \/ 30 条有效业务消息/u);
+  assert.match(text, /自动轮转\s+0 \/ 50 条有效业务消息/u);
 });
 
 test("暂停把出站和入站同时关掉 —— 靠的是两边本来就在看的那个字段", () => {
@@ -9227,7 +9792,7 @@ test("落盘：计划没变就写下去，同一 operation 重放不再写", () 
   const run = () => applySubscriptionSync({
     shadowDir: w.dir, lockDir: w.lockDir, operationId: "op-first-0001",
     expectedPlanId: pid,
-    readWorld: () => { sawLock = fs.existsSync(w.lockDir); return w.world; },
+    readWorld: () => { try { fs.lstatSync(w.lockDir); sawLock = true; } catch { sawLock = false; } return w.world; },
   });
 
   const first = run();
@@ -16699,6 +17264,381 @@ test("发布写原语限制生产调用面：落标与失败记账只许事务�
   assert.deepEqual(proofOffenders,
     ["sneak.mjs ← markSent", "sneak.mjs ← recordPublishFailure"],
     "扫描器要把两个 token 都抓住 —— 期望写死，列表缩水就红");
+});
+
+// ─── 待认领话题快过期提醒（FR-8 补充，2026-08-28 Frank 要求）────────────────────────────
+const H_MS = 3600000;
+function claimReminderFixture({ base = NOW, name = "提醒演示" } = {}) {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-remind-"));
+  const root = path.join(local, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const registryFile = path.join(local, "registry.json");
+  const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  const entry = newRegistryEntry({
+    root, name, purpose: null, token: "aaa111", rootMessageId: "om_old", now: base,
+  });
+  assert.equal(entry.pending_expires_at, new Date(base + TG_PENDING_MS).toISOString(), "首次绑定的待认领窗口与代际同一份");
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [entry] }, null, 2));
+  assert.equal(promoteBinding({
+    root, id: entry.id, source: "registry", generationId: entry.channel_generation_id,
+    sessionId: "session_old", registryFile, now: base + 1,
+  }).ok, true);
+  assert.equal(prepareClaudeTopicRotation({ root, operationId: "op_remind", registryFile, now: base + 2 }).ok, true);
+  const registered = registerClaudeTopicRotation({
+    root, operationId: "op_remind", rootMessageId: "om_new", pendingToken: "bbb222", registryFile, now: base + 3,
+  });
+  assert.equal(registered.ok, true);
+  const deadline = Date.parse(registered.generation.claim_expires_at);
+  assert.equal(deadline, base + 3 + TG_PENDING_MS, "待认领窗口从登记时刻起算，长度只有一份定义");
+  const readState = () => JSON.parse(fs.readFileSync(registryFile, "utf-8")).projects[0].topic_generation_state;
+  const pendingOf = (state) => state.generations.find((g) => g.root_message_id === "om_new");
+  return { root, local, entry, registryFile, templateFile, registered, deadline, readState, pendingOf, name };
+}
+
+test("待认领窗口是 72 小时、自动轮转阈值是 50 —— 两个常量各只有一份定义，首次绑定与代际共用", () => {
+  assert.equal(TG_PENDING_MS, 72 * H_MS);
+  assert.equal(TG_REMINDER_LEAD_MS, 12 * H_MS);
+  assert.equal(TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, 50);
+  assert.equal(PENDING_WINDOW_MS, TG_PENDING_MS, "首次绑定的待认领窗口必须跟代际的是同一份");
+});
+
+test("快过期提醒的判据只有一份：窗口外不提醒、进窗口提醒、提醒过 / 过期 / 没截止 / 没 pending 都不提醒", () => {
+  const { readState, deadline, registered, pendingOf } = claimReminderFixture();
+  const state = readState();
+  const gid = registered.generation.channel_generation_id;
+  const notYet = tgClaimReminderDue(state, { now: deadline - TG_REMINDER_LEAD_MS - 1 });
+  assert.deepEqual([notYet.due, notYet.reason, notYet.remainingMs], [false, "not_yet", TG_REMINDER_LEAD_MS + 1]);
+  const due = tgClaimReminderDue(state, { now: deadline - TG_REMINDER_LEAD_MS });
+  assert.deepEqual([due.due, due.reason, due.remainingMs], [true, null, TG_REMINDER_LEAD_MS], "刚进窗口就该提醒");
+  assert.equal(due.generation.channel_generation_id, gid);
+  assert.equal(tgClaimReminderDue(state, { now: deadline - 1 }).due, true);
+  assert.equal(tgClaimReminderDue(state, { now: deadline }).reason, "expired", "到点即过期，过期不再提醒");
+  assert.equal(tgClaimReminderDue(state, { now: deadline - 1, leadMs: 1 }).due, true, "lead 可注入");
+  assert.equal(tgClaimReminderDue(state, { now: deadline - 2, leadMs: 1 }).reason, "not_yet");
+
+  const marked = tgMarkPendingClaimReminder(state, { generationId: gid, now: deadline - TG_REMINDER_LEAD_MS });
+  assert.deepEqual([marked.ok, marked.changed], [true, true]);
+  assert.equal(pendingOf(marked.state).claim_reminder_at, new Date(deadline - TG_REMINDER_LEAD_MS).toISOString());
+  assert.equal(tgValidateState(marked.state).ok, true, "claim_reminder_at 是合法字段");
+  assert.equal(tgClaimReminderDue(marked.state, { now: deadline - 1 }).reason, "already_reminded");
+  const again = tgMarkPendingClaimReminder(marked.state, { generationId: gid, now: deadline - 1 });
+  assert.deepEqual([again.ok, again.changed], [true, false], "同一代际只记一次");
+  assert.equal(pendingOf(again.state).claim_reminder_at, pendingOf(marked.state).claim_reminder_at, "第二次不许改时间");
+  assert.equal(tgMarkPendingClaimReminder(state, { generationId: "gen_other", now: deadline - 1 }).reason,
+    "pending_generation_mismatch");
+  assert.equal(pendingOf(state).claim_reminder_at, undefined, "mark 是纯函数，不改入参");
+  assert.equal(pendingOf(readState()).claim_reminder_at, undefined, "也不碰文件");
+
+  const bad = structuredClone(marked.state);
+  pendingOf(bad).claim_reminder_at = "yesterday";
+  assert.equal(tgValidateState(bad).ok, false, "非规范时间要被校验拦下");
+  const sloppy = structuredClone(marked.state);
+  pendingOf(sloppy).claim_reminder_at = "2026-08-28T00:00:00Z";
+  assert.deepEqual(tgValidateState(sloppy).problems, ["generations.claim_reminder_at"],
+    "Date.parse 能解析但不是规范写法 —— 评审探针抓到的那种，也要拦");
+  const sloppyAttempt = structuredClone(state);
+  pendingOf(sloppyAttempt).claim_reminder_attempted_at = "2026-08-28T00:00:00Z";
+  pendingOf(sloppyAttempt).claim_reminder_attempts = -1;
+  assert.deepEqual(tgValidateState(sloppyAttempt).problems.sort(),
+    ["generations.claim_reminder_attempted_at", "generations.claim_reminder_attempts"]);
+  // 尝试状态是封闭形状：只有次数没有时间（绕过间隔）、只有时间没有次数（破坏上界）、次数为 0 —— 都不合法。
+  const countOnly = structuredClone(state);
+  pendingOf(countOnly).claim_reminder_attempts = 2;
+  assert.deepEqual(tgValidateState(countOnly).problems, ["generations.claim_reminder_attempted_at"]);
+  const timeOnly = structuredClone(state);
+  pendingOf(timeOnly).claim_reminder_attempted_at = new Date(deadline - TG_REMINDER_LEAD_MS).toISOString();
+  assert.deepEqual(tgValidateState(timeOnly).problems, ["generations.claim_reminder_attempts"]);
+  const zero = structuredClone(timeOnly);
+  pendingOf(zero).claim_reminder_attempts = 0;
+  assert.deepEqual(tgValidateState(zero).problems, ["generations.claim_reminder_attempts"]);
+  const bothNull = structuredClone(state);
+  pendingOf(bothNull).claim_reminder_attempts = null;
+  pendingOf(bothNull).claim_reminder_attempted_at = null;
+  assert.equal(tgValidateState(bothNull).ok, true);
+  assert.equal(tgReserveClaimReminderAttempt(countOnly, { generationId: gid, now: deadline - 1 }).reason,
+    "topic_generation_state_invalid", "预留在锁内校验形状，不让畸形状态绕过间隔");
+
+  // 暂停 / 退役的绑定不提醒 —— 跟出站同一条语义。
+  const paused = structuredClone(state);
+  paused.binding_status = "paused";
+  assert.equal(tgClaimReminderDue(paused, { now: deadline - 1 }).reason, "binding_not_active");
+
+  // 锁内预留：拿到一次尝试后，同一状态再算就是 retry_too_soon；间隔够了再拿；拿满就 attempts_exhausted。
+  const t0 = deadline - TG_REMINDER_LEAD_MS;
+  const r1 = tgReserveClaimReminderAttempt(state, { generationId: gid, now: t0 });
+  assert.deepEqual([r1.ok, r1.changed, r1.attempt], [true, true, 1]);
+  assert.equal(pendingOf(r1.state).claim_reminder_attempted_at, new Date(t0).toISOString());
+  assert.equal(tgValidateState(r1.state).ok, true);
+  assert.equal(pendingOf(state).claim_reminder_attempts, undefined, "预留是纯函数");
+  assert.equal(tgClaimReminderDue(r1.state, { now: t0 + TG_REMINDER_RETRY_MS - 1 }).reason, "retry_too_soon");
+  assert.equal(tgReserveClaimReminderAttempt(r1.state, { generationId: gid, now: t0 + TG_REMINDER_RETRY_MS - 1 }).reason, "retry_too_soon");
+  const r2 = tgReserveClaimReminderAttempt(r1.state, { generationId: gid, now: t0 + TG_REMINDER_RETRY_MS });
+  assert.deepEqual([r2.ok, r2.attempt], [true, 2]);
+  let cur = r2.state;
+  for (let i = 3; i <= TG_REMINDER_MAX_ATTEMPTS; i += 1) {
+    const r = tgReserveClaimReminderAttempt(cur, { generationId: gid, now: t0 + i * TG_REMINDER_RETRY_MS });
+    assert.deepEqual([r.ok, r.attempt], [true, i]);
+    cur = r.state;
+  }
+  const exhausted = tgClaimReminderDue(cur, { now: deadline - 1 });
+  assert.deepEqual([exhausted.due, exhausted.reason, exhausted.attempts], [false, "attempts_exhausted", TG_REMINDER_MAX_ATTEMPTS]);
+  assert.equal(tgReserveClaimReminderAttempt(cur, { generationId: gid, now: deadline - 1 }).reason, "attempts_exhausted");
+  assert.equal(tgReserveClaimReminderAttempt(state, { generationId: "gen_other", now: t0 }).reason, "pending_generation_mismatch");
+  assert.equal(tgReserveClaimReminderAttempt(state, { generationId: gid, now: t0 - 1 }).reason, "not_yet", "预留在锁内重算判据");
+  // 发成功后记下，之后 attempts 再多也不影响"不再提醒"
+  const sent = tgMarkPendingClaimReminder(r1.state, { generationId: gid, now: t0 + 1 });
+  assert.equal(tgClaimReminderDue(sent.state, { now: t0 + TG_REMINDER_RETRY_MS }).reason, "already_reminded");
+  const noDeadline = structuredClone(state);
+  pendingOf(noDeadline).claim_expires_at = null;
+  assert.equal(tgClaimReminderDue(noDeadline, { now: deadline - 1 }).reason, "no_deadline");
+  const none = structuredClone(state);
+  none.generations = none.generations.filter((g) => g.status !== "pending");
+  assert.equal(tgClaimReminderDue(none, { now: deadline - 1 }).reason, "no_pending");
+});
+
+test("Claude 扫描：进窗口的待认领话题只提醒一次、发在那个话题下、先发后记；发失败不记、下轮再发；dry-run 只说不发", () => {
+  const fx = claimReminderFixture();
+  const calls = [];
+  const publish = (args) => { calls.push(args); };
+  const sweep = (f, over) => remindClaudePendingClaims({
+    registryFile: f.registryFile, templateFile: f.templateFile, publish, ...over,
+  });
+  const early = sweep(fx, { now: fx.deadline - TG_REMINDER_LEAD_MS - 1 });
+  assert.equal(early.ok, true);
+  assert.deepEqual([early.reminded, early.problems, calls.length], [[], [], 0]);
+  assert.deepEqual(early.skipped, [{ name: fx.name, reason: "not_yet" }]);
+  assert.equal(describeReminderSweep(early, { chain: "Claude" }), null, "没事就别出声");
+
+  const now = fx.deadline - 11 * H_MS;
+  const first = sweep(fx, { now });
+  assert.deepEqual(first.problems, []);
+  assert.deepEqual(first.reminded, [{ name: fx.name, generation: 2, attempt: 1, recorded: true }]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].rootMessageId, "om_new", "提醒要发在待认领的那个话题下，不是旧话题");
+  assert.equal(calls[0].profile, TPL.lark_cli_profile);
+  assert.equal(calls[0].expectedAppId, TPL.outbound_app_id);
+  assert.equal(calls[0].larkBin, TPL.lark_cli_bin);
+  assert.match(calls[0].text, /第 2 代/u);
+  assert.match(calls[0].text, /还剩约 11 小时/u);
+  assert.match(calls[0].text, /@/u, "要说清怎么认领");
+  assert.match(calls[0].text, /最多重试 3 次/u);
+  assert.ok(!calls[0].text.includes("om_new") && !calls[0].text.includes("om_old"), "提醒正文不带 locator");
+  assert.equal(fx.pendingOf(fx.readState()).claim_reminder_at, new Date(now).toISOString(), "发完要记进代际状态");
+  assert.equal(fx.pendingOf(fx.readState()).claim_reminder_attempts, 1, "尝试在发之前就预留并持久化");
+  assert.match(describeReminderSweep(first, { chain: "Claude" }), /^Claude 待认领提醒：已提醒 提醒演示 第 2 代$/u);
+
+  const second = sweep(fx, { now: now + 30 * 60000 });
+  assert.deepEqual([second.reminded, second.problems, calls.length], [[], [], 1], "只提醒一次");
+  assert.deepEqual(second.skipped, [{ name: fx.name, reason: "already_reminded" }]);
+  const late = sweep(fx, { now: fx.deadline });
+  assert.deepEqual([late.reminded, late.problems, calls.length], [[], [], 1]);
+  assert.ok(["expired", "no_pending"].includes(late.skipped[0]?.reason), JSON.stringify(late.skipped));
+
+  const fx2 = claimReminderFixture();
+  const failed = sweep(fx2, { now, publish: () => { throw new Error("lark down"); } });
+  assert.equal(failed.ok, true);
+  assert.deepEqual(failed.reminded, []);
+  assert.equal(failed.problems.length, 1);
+  assert.equal(failed.problems[0].reason, "publish_failed");
+  assert.match(failed.problems[0].error, /第 1\/3 次：lark down/u);
+  assert.equal(fx2.pendingOf(fx2.readState()).claim_reminder_at, undefined, "预留 → 发 → 记：没发出去就不许记");
+  assert.equal(fx2.pendingOf(fx2.readState()).claim_reminder_attempts, 1, "但这次尝试要留痕");
+  assert.match(describeReminderSweep(failed, { chain: "Claude" }), /提醒有问题.*提醒演示（publish_failed：第 1\/3 次：lark down）/u);
+  const tooSoon = sweep(fx2, { now: now + TG_REMINDER_RETRY_MS - 1 });
+  assert.deepEqual([tooSoon.reminded, tooSoon.problems], [[], []]);
+  assert.deepEqual(tooSoon.skipped, [{ name: fx2.name, reason: "retry_too_soon" }], "间隔没到不重试");
+  const retry = sweep(fx2, { now: now + 30 * 60000 });
+  assert.deepEqual(retry.reminded, [{ name: fx2.name, generation: 2, attempt: 2, recorded: true }], "上轮没发出去，这轮再发");
+  assert.equal(calls.length, 2);
+
+  // 连续失败到上限：放弃并报出来，之后不再发
+  const fx4 = claimReminderFixture();
+  const boom = () => { throw new Error("still down"); };
+  for (let i = 1; i <= TG_REMINDER_MAX_ATTEMPTS; i += 1) {
+    const r = sweep(fx4, { now: now + i * TG_REMINDER_RETRY_MS, publish: boom });
+    assert.equal(r.problems[0]?.reason, "publish_failed", "第 " + i + " 次");
+    assert.match(r.problems[0].error, new RegExp("第 " + i + "\\/" + TG_REMINDER_MAX_ATTEMPTS + " 次"));
+  }
+  const gaveUp = sweep(fx4, { now: now + (TG_REMINDER_MAX_ATTEMPTS + 1) * TG_REMINDER_RETRY_MS });
+  assert.deepEqual([gaveUp.reminded, calls.length], [[], 2], "放弃后不再发");
+  assert.equal(gaveUp.problems[0]?.reason, "reminder_abandoned");
+  assert.match(describeReminderSweep(gaveUp, { chain: "Claude" }), /reminder_abandoned：发送失败 3 次，已放弃/u);
+
+  // 并发：第二个扫描器在"预留之后、记之前"进来 —— 用发布回调里的嵌套扫描模拟。预留已持久化，它拿不到这次尝试。
+  const fx5 = claimReminderFixture();
+  let nested = null;
+  const reentrant = (args) => {
+    calls.push(args);
+    nested = sweep(fx5, { now, publish: (a) => { calls.push(a); } });
+  };
+  const outer = sweep(fx5, { now, publish: reentrant });
+  assert.deepEqual([outer.reminded.length, outer.problems], [1, []]);
+  assert.deepEqual([nested.reminded, nested.problems], [[], []], "并发的第二个扫描器不许再发");
+  assert.deepEqual(nested.skipped, [{ name: fx5.name, reason: "retry_too_soon" }]);
+  assert.equal(calls.length, 3, "总共只发了一条（外层那条）");
+  assert.equal(fx5.pendingOf(fx5.readState()).claim_reminder_at, new Date(now).toISOString());
+
+  // 暂停的绑定不提醒（跟出站同一条语义）
+  const fx6 = claimReminderFixture();
+  assert.equal(setClaudeTopicBindingStatus({ root: fx6.root, status: "paused", registryFile: fx6.registryFile, now }).ok, true);
+  const pausedSweep = sweep(fx6, { now });
+  assert.deepEqual([pausedSweep.reminded, pausedSweep.problems, calls.length], [[], [], 3]);
+  assert.deepEqual(pausedSweep.skipped, [{ name: fx6.name, reason: "binding_not_active" }]);
+
+  const fx3 = claimReminderFixture();
+  const dry = sweep(fx3, { now, dryRun: true });
+  assert.deepEqual(dry.reminded, [{ name: fx3.name, generation: 2, dryRun: true }]);
+  assert.equal(calls.length, 3, "dry-run 不发");
+  assert.equal(fx3.pendingOf(fx3.readState()).claim_reminder_at, undefined, "dry-run 不记");
+  assert.match(describeReminderSweep(dry, { chain: "Claude" }), /\[dry-run\] 将提醒 提醒演示 第 2 代/u);
+  const expired = sweep(fx3, { now: fx3.deadline });
+  assert.deepEqual([expired.reminded, calls.length], [[], 3], "过期了就不提醒");
+  assert.ok(["expired", "no_pending"].includes(expired.skipped[0]?.reason), JSON.stringify(expired.skipped));
+
+  // 登记表不存在 = 空表（没接过桥），不算读不了；读不了是"有文件但坏了"。
+  const corrupt = path.join(path.dirname(fx3.registryFile), "corrupt.json");
+  fs.writeFileSync(corrupt, "{not json");
+  const unreadable = remindClaudePendingClaims({ registryFile: corrupt, publish, now });
+  assert.equal(unreadable.ok, false, JSON.stringify(unreadable));
+  assert.equal(calls.length, 3);
+  assert.match(describeReminderSweep(unreadable, { chain: "Claude" }), /登记表读不了/u);
+});
+
+test("单代际流程：预留阶段只有受控原因算跳过，登记表 / 状态错误必须进 problems；身份在确认要发之后才解析、抛错不外泄", () => {
+  const fx = claimReminderFixture();
+  const now = fx.deadline - 11 * H_MS;
+  const state = fx.readState();
+  const identity = { profile: "p", bin: "/bin/lark", configDir: "/d", expectedAppId: "cli_x" };
+  const run = (over) => remindOnePendingClaim({
+    name: "n", state, now, dryRun: false, identity: () => identity, publish: () => {},
+    reserve: () => ({ ok: true, attempt: 1 }), mark: () => ({ ok: true }), ...over,
+  });
+  assert.deepEqual(run({ reserve: () => ({ ok: false, reason: "binding_busy" }) }),
+    { outcome: "skipped", entry: { name: "n", reason: "binding_busy" } });
+  assert.deepEqual(run({ reserve: () => ({ ok: false, reason: "retry_too_soon" }) }).outcome, "skipped");
+  const invalid = run({ reserve: () => ({ ok: false, reason: "topic_generation_state_invalid", problems: ["x"] }) });
+  assert.deepEqual(invalid, { outcome: "problem", entry: { name: "n", reason: "reserve_failed", error: "topic_generation_state_invalid" } });
+  const unwritable = run({ reserve: () => ({ ok: false, reason: "binding_unwritable", error: "EACCES" }) });
+  assert.deepEqual([unwritable.outcome, unwritable.entry.reason, unwritable.entry.error], ["problem", "reserve_failed", "binding_unwritable：EACCES"]);
+  assert.deepEqual(run({ reserve: () => ({ ok: false, reason: "attempts_exhausted", attempts: 3 }) }).entry.reason, "reminder_abandoned");
+
+  let reserveCalls = 0;
+  const thrown = run({ identity: () => { throw new TypeError("path must be a string"); }, reserve: () => { reserveCalls += 1; return { ok: true, attempt: 1 }; } });
+  assert.deepEqual([thrown.outcome, thrown.entry.reason, reserveCalls], ["problem", "identity_unresolvable", 0], "身份解析失败不许烧掉一次尝试");
+  assert.match(thrown.entry.error, /path must be a string/u);
+  const tagged = run({ identity: () => { throw Object.assign(new Error("no template"), { reason: "template_unavailable" }); } });
+  assert.deepEqual([tagged.outcome, tagged.entry.reason], ["problem", "template_unavailable"]);
+  assert.deepEqual(run({ identity: () => null }).entry.reason, "config_unavailable");
+  let identityCalls = 0;
+  const dry = run({ dryRun: true, identity: () => { identityCalls += 1; return identity; } });
+  assert.deepEqual([dry.outcome, dry.entry.dryRun, identityCalls], ["reminded", true, 0], "dry-run 不解析身份");
+  const early = remindOnePendingClaim({ name: "n", state, now: fx.deadline - TG_REMINDER_LEAD_MS - 1, dryRun: false,
+    identity: () => { identityCalls += 1; return identity; }, publish: () => {}, reserve: () => ({ ok: true }), mark: () => ({ ok: true }) });
+  assert.deepEqual([early.outcome, identityCalls], ["skipped", 0], "不到窗口不解析身份");
+});
+
+test("Claude 扫描：一个项目的坏配置只算它自己的问题，后面的项目照常提醒", () => {
+  // 评审探针：项目侧旧配置不经模板形状校验，resolveLarkIdentity 里的 path.join 会抛 TypeError。
+  const bad = claimReminderFixture({ name: "坏配置" });
+  const good = claimReminderFixture({ name: "好项目" });
+  // 老装法：没有机器模板，项目文件里的配置独自够用 —— 也就没有模板把链路字段压过去。
+  const writeCfg = (fx, over) => {
+    const cfgDir = path.join(fx.root, ".runtime-data", "inbound");
+    fs.mkdirSync(cfgDir, { recursive: true });
+    fs.writeFileSync(path.join(cfgDir, "chain-config.json"), JSON.stringify({
+      ...TPL, project_dir: fx.root, task_display_name: fx.name, project_display_name: fx.name, ...over,
+    }));
+  };
+  writeCfg(bad, { outbound_app_id: "cli_same", transport_app_id: "cli_same", agent_uid: "u", lark_cli_config_base: 42 });
+  writeCfg(good, {});
+  const missingTemplate = path.join(bad.local, "missing-template.json");
+  const merged = path.join(bad.local, "merged-registry.json");
+  const readProjects = (f) => JSON.parse(fs.readFileSync(f, "utf-8")).projects;
+  fs.writeFileSync(merged, JSON.stringify({ schema_version: "1.0", projects: [...readProjects(bad.registryFile), ...readProjects(good.registryFile)] }, null, 2));
+  const calls = [];
+  const now = good.deadline - 11 * H_MS;
+  const r = remindClaudePendingClaims({ registryFile: merged, templateFile: missingTemplate, now, publish: (a) => { calls.push(a); } });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.problems.map((p) => [p.name, p.reason]), [["坏配置", "identity_unresolvable"]], JSON.stringify(r.problems));
+  assert.deepEqual(r.reminded, [{ name: "好项目", generation: 2, attempt: 1, recorded: true }]);
+  assert.equal(calls.length, 1);
+  const badState = readProjects(merged).find((p) => p.name === "坏配置").topic_generation_state;
+  assert.equal(badState.generations.find((g) => g.root_message_id === "om_new").claim_reminder_attempts, undefined, "身份解析失败不烧尝试");
+  const dry = remindClaudePendingClaims({ registryFile: merged, templateFile: missingTemplate, now, publish: () => { throw new Error("no"); }, dryRun: true });
+  assert.deepEqual([dry.problems, dry.reminded], [[], [{ name: "坏配置", generation: 2, dryRun: true }]],
+    "dry-run 不碰身份：坏配置那个也只说会提醒；好项目刚已提醒过，不再算");
+});
+
+test("锁目录不可写：预留报 lock_io_error，扫描记成 reserve_failed，不是静默跳过", () => {
+  // 评审探针：适配层曾把任何取锁失败都改写成 binding_busy，而 busy 在跳过白名单里 —— 兜底成功退出、没有问题记录。
+  const fx = claimReminderFixture();
+  const now = fx.deadline - 11 * H_MS;
+  const calls = [];
+  fs.chmodSync(fx.local, 0o500);
+  try {
+    const reserved = reserveClaudeClaimReminder({ root: fx.root, generationId: fx.registered.generation.channel_generation_id,
+      registryFile: fx.registryFile, templateFile: fx.templateFile, now });
+    assert.deepEqual([reserved.ok, reserved.reason], [false, "lock_io_error"], JSON.stringify(reserved));
+    assert.match(String(reserved.error), /EACCES|EPERM/u);
+    const r = remindClaudePendingClaims({ registryFile: fx.registryFile, templateFile: fx.templateFile, now, publish: (a) => { calls.push(a); } });
+    assert.deepEqual([r.ok, r.reminded, r.skipped, calls.length], [true, [], [], 0]);
+    assert.deepEqual(r.problems.map((p) => [p.name, p.reason]), [[fx.name, "reserve_failed"]], JSON.stringify(r.problems));
+    assert.match(r.problems[0].error, /lock_io_error：.*(EACCES|EPERM)/u);
+  } finally {
+    fs.chmodSync(fx.local, 0o700);
+  }
+});
+
+test("两个真实 OS 进程同时扫描同一个待认领话题：只发一条（预留在锁内、锁无中间态）", () => {
+  const fx = claimReminderFixture();
+  const now = fx.deadline - 11 * H_MS;
+  const log = path.join(fx.local, "publish.log");
+  const worker = path.join(fx.local, "worker.mjs");
+  const driver = path.join(fx.local, "driver.mjs");
+  fs.writeFileSync(worker, [
+    'import fs from "node:fs";',
+    'const { remindClaudePendingClaims } = await import(' + JSON.stringify(pathToFileURL(path.resolve("scripts", "claim-reminder.mjs")).href) + ');',
+    'const [registryFile, templateFile, now, log] = process.argv.slice(2);',
+    'const r = remindClaudePendingClaims({ registryFile, templateFile, now: Number(now), publish: (a) => {',
+    '  fs.appendFileSync(log, process.pid + " " + a.rootMessageId + "\\n");',
+    '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);',
+    '} });',
+    'process.stdout.write(JSON.stringify({ reminded: r.reminded.length, skipped: r.skipped.map((s) => s.reason), problems: r.problems }));',
+  ].join("\n"));
+  fs.writeFileSync(driver, [
+    'import { spawn } from "node:child_process";',
+    'const [worker, ...rest] = process.argv.slice(2);',
+    'const run = () => new Promise((res) => {',
+    '  const c = spawn(process.execPath, [worker, ...rest], { stdio: ["ignore", "pipe", "pipe"] });',
+    '  let out = ""; let err = "";',
+    '  c.stdout.on("data", (d) => { out += d; }); c.stderr.on("data", (d) => { err += d; });',
+    '  c.on("close", (code) => res({ code, out, err }));',
+    '});',
+    'process.stdout.write(JSON.stringify(await Promise.all([run(), run()])));',
+  ].join("\n"));
+  const r = spawnSync(process.execPath, [driver, worker, fx.registryFile, fx.templateFile, String(now), log], { encoding: "utf-8" });
+  assert.equal(r.status, 0, r.stderr);
+  const results = JSON.parse(r.stdout);
+  for (const w of results) assert.equal(w.code, 0, w.err);
+  const parsed = results.map((w) => JSON.parse(w.out));
+  assert.deepEqual(parsed.map((p) => p.problems), [[], []], JSON.stringify(parsed));
+  assert.equal(parsed.reduce((n, p) => n + p.reminded, 0), 1, "两个进程加起来只提醒一次：" + JSON.stringify(parsed));
+  const lines = fs.existsSync(log) ? fs.readFileSync(log, "utf-8").trim().split("\n") : [];
+  assert.equal(lines.length, 1, "只发了一条：" + lines.join(" | "));
+  const other = parsed.find((p) => p.reminded === 0);
+  assert.ok(["retry_too_soon", "binding_busy"].includes(other.skipped[0]), JSON.stringify(other));
+  assert.equal(fx.pendingOf(fx.readState()).claim_reminder_at, new Date(now).toISOString());
+});
+
+test("兜底真入口 drain-outbox --all 会跑待认领提醒扫描（dry-run 只说不发不记）", () => {
+  const base = Date.now() - (TG_PENDING_MS - 11 * H_MS) - 3; // 截止 ≈ 现在 + 11 小时
+  const fx = claimReminderFixture({ base });
+  const r = spawnSync(process.execPath, [path.resolve("scripts", "drain-outbox.mjs"), "--all", "--dry-run"], {
+    encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_REGISTRY: fx.registryFile },
+  });
+  assert.match(r.stdout, /Claude 待认领提醒：\[dry-run\] 将提醒 提醒演示 第 2 代/u, r.stdout + r.stderr);
+  assert.equal(fx.pendingOf(fx.readState()).claim_reminder_at, undefined, "dry-run 不许记");
 });
 
 summarySealed = true;

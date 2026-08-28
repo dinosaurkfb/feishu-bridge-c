@@ -8,7 +8,9 @@
  * 三件事都刻意做成确定性的纯文件操作，不调模型、不碰网络。
  */
 
+import crypto from "node:crypto";
 import fs from "node:fs";
+import { isCanonicalIso } from "./canonical-time.mjs";
 import os from "node:os";
 import path from "node:path";
 
@@ -228,58 +230,277 @@ export function attributeSession({ projects, cwd, transcriptPath }) {
  * 没有它就有真实的重复打扰：会话结束钩子、兜底定时器、一次性守望者可能同时看到
  * 同一批 pending —— 读取与落标之间有窗口，三方都会各发一条。
  *
- * 和 claim 一样用 mkdir 拿原子性；陈旧回收靠 pid 存活 + 墙钟上限，
- * 发布者崩在锁里不能把出站永久堵死。
+ * 协议（2026-08-28 重写，评审三轮探针逼出来的）：
+ *   · 锁是一个 **symlink**，链接目标就是 owner（pid / at / token 的 JSON）。symlink 创建是一步原子操作，
+ *     路径上有任何东西（哪怕空目录）都 EEXIST —— 没有"目录先出现、owner 后落地"的中间态，
+ *     也没有 rename 能替换空目录的问题。
+ *   · 每次获取带唯一 token；释放按 token 核对 —— pid 不能代表锁实例（我的锁被回收又被同 pid 的
+ *     别的实例拿走时，按 pid 会误删）。
+ *   · 陈旧回收**串行化**：先拿专用 reap 锁，在里面重读 owner、核对实例没变、仍然陈旧，再把锁
+ *     rename 走（原子；两个回收者只有一个能成功），然后再正常取锁。原来"判陈旧 → rm → 重取"三步
+ *     不互斥，两个回收者能同时成功。
+ *   · reap 锁**热路径不自愈**：它在就 fail-closed（超过 REAP_LOCK_STALE_MS 报 reap_residue，否则等一小会报 busy）。
+ *     给 reap 再套一层"读年龄 → 按路径 rename"的自愈只会把同一个"判断与修改分离"的窗口递归复现
+ *     （评审第五轮探针）。残骸交显式维护入口：repair-publish-lock.mjs / clearStaleReapLock。
+ *   · symlink owner 形状**封闭**：必须是 {pid: 正整数, at: 规范时间, token: 非空串}，否则按不可读处理、保留现场；
+ *     只有目录形状的旧版锁（legacy）才允许按 pid 兼容。
+ *   · 旧版 runtime（mkdir + owner.json 目录锁）与本协议**不能并行**：旧版看到 symlink 会当陈旧删掉。
+ *     切换 runtime 时必须没有旧持有者（安装器切 current 之前兜底不在跑）。目录形状的旧锁这里
+ *     仍能读、能按陈旧回收，只是不保证与旧进程互斥。
  */
-export function acquirePublishLock(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now() } = {}) {
-  const attempt = () => {
-    try {
-      fs.mkdirSync(path.dirname(lockDir), { recursive: true, mode: 0o700 });
-      fs.mkdirSync(lockDir, { recursive: false, mode: 0o700 });
-      fs.writeFileSync(
-        path.join(lockDir, "owner.json"),
-        JSON.stringify({ pid: process.pid, at: new Date(now).toISOString() }, null, 2) + "\n",
-        { mode: 0o600 },
-      );
-      return { ok: true };
-    } catch (err) {
-      if (err.code === "EEXIST") return { ok: false, reason: "publisher_busy" };
-      return { ok: false, reason: "io_error", error: err.message };
+
+// owner 不可读时按锁自身年龄给的宽限（真实时钟）：几秒内当活锁，超过才算残骸。
+const OWNERLESS_LOCK_GRACE_MS = 10 * 1000;
+// reap 锁只在回收那几毫秒里持有；超过这个年龄就是回收者崩在里面了。
+const REAP_LOCK_STALE_MS = 60 * 1000;
+// 隔离路径后缀：只有 crypto.randomUUID() 的形状。
+const QUARANTINE_SUFFIX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+// 本进程当前持有的锁实例：lockDir → token。释放时据此核对，调用点不用改签名。
+const HELD = new Map();
+
+/** symlink owner 的封闭形状：缺 token、pid 不是正整数、at 不规范 —— 都不是本协议写出来的东西，一律当不可读。 */
+function ownerShapeOk(owner) {
+  return owner !== null && typeof owner === "object" && !Array.isArray(owner)
+    && Number.isSafeInteger(owner.pid) && owner.pid > 0
+    && isCanonicalIso(owner.at)
+    && typeof owner.token === "string" && owner.token.length > 0;
+}
+
+function readLockOwner(lockDir) {
+  let st;
+  try { st = fs.lstatSync(lockDir); } catch { return { present: false, owner: null }; }
+  if (st.isSymbolicLink()) {
+    let owner = null;
+    try { owner = JSON.parse(fs.readlinkSync(lockDir)); } catch { owner = null; }
+    return { present: true, owner: ownerShapeOk(owner) ? owner : null, mtimeMs: st.mtimeMs };
+  }
+  // 旧版目录锁：owner.json 在目录里。
+  try { return { present: true, owner: JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf-8")), mtimeMs: st.mtimeMs, legacy: true }; }
+  catch { return { present: true, owner: null, mtimeMs: st.mtimeMs, legacy: true }; }
+}
+
+function ownerStale(owner, { staleMs, now }) {
+  const at = Date.parse(owner?.at ?? "");
+  if (Number.isFinite(at) && now - at > staleMs) return true;
+  if (Number.isFinite(owner?.pid)) {
+    try { process.kill(owner.pid, 0); return false; } // 只探活，不发真信号
+    catch { return true; }
+  }
+  return true;
+}
+
+function tryLink(lockDir, payload) {
+  try {
+    fs.mkdirSync(path.dirname(lockDir), { recursive: true, mode: 0o700 });
+    fs.symlinkSync(payload, lockDir);
+    return { ok: true };
+  } catch (err) {
+    if (err.code === "EEXIST") return { ok: false, reason: "publisher_busy" };
+    return { ok: false, reason: "io_error", error: err.message };
+  }
+}
+
+/**
+ * 所有会改变锁归属的动作（陈旧回收、释放）都在 reap 锁里做，彼此互斥。
+ * reap 锁自身：同一 symlink 原语；**在就 fail-closed** —— 超过 REAP_LOCK_STALE_MS 报 reap_residue（残骸，
+ * 交显式维护入口），否则等最多 waitMs 后报 reap_busy。释放按 token 核对。段内只做几次文件操作，不做别的 I/O。
+ * 返回 { ok, run } 或 { ok:false, reason }。
+ */
+function withReapLock(lockDir, fn, { waitMs = 0, duringReap = null } = {}) {
+  const reapDir = lockDir + ".reap";
+  const token = crypto.randomUUID();
+  const payload = () => JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token });
+  const deadline = Date.now() + waitMs;
+  let held = false;
+  for (;;) {
+    const reap = tryLink(reapDir, payload());
+    if (reap.ok) { held = true; break; }
+    if (reap.reason !== "publisher_busy") return reap;
+    const r = readLockOwner(reapDir);
+    if (r.present && Date.now() - r.mtimeMs > REAP_LOCK_STALE_MS) return { ok: false, reason: "reap_residue" };
+    if (Date.now() >= deadline) return { ok: false, reason: "reap_busy" };
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+  }
+  try {
+    if (typeof duringReap === "function") duringReap();
+    return { ok: true, run: fn() };
+  } finally {
+    if (held) {
+      // 按 token 释放 reap 锁：我在段内待太久被接管了的话，那把已经是别人的。
+      const cur = readLockOwner(reapDir);
+      if (cur.present && cur.owner && cur.owner.token === token) fs.rmSync(reapDir, { recursive: true, force: true });
     }
+  }
+}
+
+// beforeReap / duringReap 只给测试用：在"判定陈旧"与"进 reap 锁重核"之间、以及拿到 reap 锁之后
+// 插一个动作，把并发窗口写成确定性的行为测试。
+export function acquirePublishLock(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now(), beforeReap = null, duringReap = null } = {}) {
+  const token = crypto.randomUUID();
+  const payload = JSON.stringify({ pid: process.pid, at: new Date(now).toISOString(), token });
+  const attempt = () => {
+    const r = tryLink(lockDir, payload);
+    if (r.ok) HELD.set(lockDir, token);
+    return r.ok ? { ok: true, token } : r;
   };
 
   const first = attempt();
   if (first.ok || first.reason !== "publisher_busy") return first;
 
-  if (isPublishLockStale(lockDir, { staleMs, now })) {
-    fs.rmSync(lockDir, { recursive: true, force: true });
-    return attempt(); // 只重试一次：再失败说明有别人刚抢到，让它去发
-  }
-  return first;
+  const seen = readLockOwner(lockDir);
+  if (!isPublishLockStale(lockDir, { staleMs, now })) return first;
+  if (typeof beforeReap === "function") beforeReap();
+
+  // 回收串行化：reap 锁 → 重读核对 → rename 走 → 放 reap 锁 → 再取。
+  const reaped = withReapLock(lockDir, () => {
+    const current = readLockOwner(lockDir);
+    if (!current.present) return true; // 已经被别人收走了
+    const sameInstance = JSON.stringify(current.owner) === JSON.stringify(seen.owner);
+    if (!sameInstance || !isPublishLockStale(lockDir, { staleMs, now })) return false; // 实例变了：那是活锁
+    const away = lockDir + ".reaped-" + token;
+    try { fs.renameSync(lockDir, away); }
+    catch { return false; } // 别人刚收走
+    fs.rmSync(away, { recursive: true, force: true });
+    return true;
+  }, { duringReap });
+  if (!reaped.ok) return reaped.reason === "reap_busy" ? first : reaped; // 别人正在回收：这轮让它
+  return reaped.run ? attempt() : first; // 只重试一次：再失败说明有别人刚抢到，让它去发
 }
 
 export function isPublishLockStale(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now() } = {}) {
-  let owner;
-  try {
-    owner = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf-8"));
-  } catch {
-    return true; // 锁在但 owner 不可读 —— 上次崩在两步之间
-  }
-
-  const at = Date.parse(owner.at ?? "");
-  if (Number.isFinite(at) && now - at > staleMs) return true;
-
-  if (Number.isFinite(owner.pid)) {
-    try {
-      process.kill(owner.pid, 0); // 只探活，不发真信号
-      return false;
-    } catch {
-      return true;
-    }
-  }
-  return true;
+  const r = readLockOwner(lockDir);
+  if (!r.present) return true; // 没锁：不算被占
+  if (r.owner === null) return Date.now() - r.mtimeMs > OWNERLESS_LOCK_GRACE_MS; // 残骸还是刚建：看年龄（真实时钟）
+  return ownerStale(r.owner, { staleMs, now });
 }
 
-export function releasePublishLock(lockDir) {
-  fs.rmSync(lockDir, { recursive: true, force: true });
+/**
+ * 释放是**归属转换**，不是"核对后按路径 rm"两步：在 reap 锁里核对 token 再删，与陈旧回收互斥 ——
+ * 否则我的锁刚过 staleMs 被别人合法接管，我随后的 rm 删掉的是新实例（评审双进程探针）。
+ * owner 不可读**保留现场**（不删）：残骸交给陈旧回收，那边有年龄判断。旧版目录锁没有 token，退回按 pid。
+ * reap 锁被别人占着就等最多 waitMs（回收段只有几毫秒）；等不到返回 release_busy，锁留着由陈旧回收处理。
+ */
+export function releasePublishLock(lockDir, { waitMs = 500 } = {}) {
+  const mine = HELD.get(lockDir) ?? null;
+  const pre = readLockOwner(lockDir);
+  if (!pre.present) { HELD.delete(lockDir); return { ok: true, absent: true }; }
+  const done = withReapLock(lockDir, () => {
+    const r = readLockOwner(lockDir);
+    if (!r.present) return { ok: true, absent: true };
+    if (!r.owner) return { ok: false, reason: "owner_unreadable" };
+    if (!r.legacy) {
+      if (r.owner.token !== mine) return { ok: false, reason: "not_owner", pid: r.owner.pid };
+    } else if (Number.isFinite(r.owner.pid) && r.owner.pid !== process.pid) {
+      let alive = true;
+      try { process.kill(r.owner.pid, 0); } catch { alive = false; }
+      if (alive) return { ok: false, reason: "not_owner", pid: r.owner.pid };
+    }
+    fs.rmSync(lockDir, { recursive: true, force: true });
+    return { ok: true };
+  }, { waitMs });
+  if (!done.ok) return done.reason === "reap_busy" ? { ok: false, reason: "release_busy" } : done;
+  if (done.run.ok) HELD.delete(lockDir);
+  return done.run;
+}
+
+/**
+ * 显式维护入口：reap 锁残骸（回收者崩在几毫秒的段里）只在这里清，热路径不自愈。
+ *
+ *   · 只认**形状合法的 symlink** 残骸（reap 锁从来没有目录形态）：目录、普通文件、畸形 symlink 一律
+ *     unrecognized_artifact，保留现场 —— 维护入口不能成为"什么都能删"的口子（评审探针：带哨兵的旧目录被整体删了）。
+ *   · 维护者之间用独立的维护锁（lockDir.maint，symlink 原语）串行，**不自愈**：它在就 maintenance_busy；
+ *     维护锁自己的残骸是最后一层，只能由人确认没有维护者在跑之后手动删（CLI 会打印路径）。
+ *   · 在维护锁里重读、重判，然后把残骸 **rename 到唯一隔离路径**再删 —— 不对原路径做删除。
+ *     "判断 → 按路径 rm"两步中间出现的新实例（评审探针）在这里碰不到：新实例要等原路径空出来才能出现，
+ *     而那时我们删的已经是隔离路径。
+ * 默认只报告；apply 且确实超过 staleMs 才动。
+ * duringMaintenance / afterQuarantine 只给测试用。
+ */
+export function clearStaleReapLock(lockDir, {
+  staleMs = REAP_LOCK_STALE_MS, apply = false, duringMaintenance = null, afterQuarantine = null,
+} = {}) {
+  const reapDir = lockDir + ".reap";
+  const maintDir = lockDir + ".maint";
+  const quarantinePrefix = path.basename(reapDir) + ".quarantine-";
+  // 盘点：只有 ENOENT 才是"没有"；别的 lstat 错误是 I/O 故障，要按阶段报出来（评审探针：EACCES 曾被说成 present:false）。
+  const inspect = () => {
+    let st;
+    try { st = fs.lstatSync(reapDir); }
+    catch (err) {
+      if (err.code === "ENOENT") return { present: false };
+      return { present: false, ioError: { phase: "inspect", error: err.message } };
+    }
+    const r = readLockOwner(reapDir);
+    const ageMs = Date.now() - st.mtimeMs;
+    const recognized = st.isSymbolicLink() && r.owner !== null;
+    return { present: true, recognized, owner: r.owner, ageMs, stale: ageMs > staleMs };
+  };
+  // 隔离路径的残留（上次隔离成功、unlink 失败）：同一入口要能看见、能清。它们已经离开原路径，
+  // 不涉及归属，但身份必须**封闭**：精确前缀 + 规范 UUID 后缀（我们只会生成这种名字）+ 形状合法的 symlink owner。
+  // 前缀像但后缀不合规的东西列出来、标 recognized:false、不动（评审探针：任意后缀曾被当残留删掉）。
+  // 逐项 lstat 只有 ENOENT 算"并发消失"，其余是 I/O 故障，带阶段与路径报出（评审探针：曾被 continue 吞掉）。
+  const inventoryQuarantine = () => {
+    let names = [];
+    try { names = fs.readdirSync(path.dirname(reapDir)).filter((n) => n.startsWith(quarantinePrefix)); }
+    catch (err) { return { ioError: { phase: "inventory", error: err.message }, entries: [] }; }
+    const entries = [];
+    for (const n of names) {
+      const full = path.join(path.dirname(reapDir), n);
+      let st;
+      try { st = fs.lstatSync(full); }
+      catch (err) {
+        if (err.code === "ENOENT") continue;
+        return { ioError: { phase: "inventory", error: err.message, path: full }, entries };
+      }
+      const nameOk = QUARANTINE_SUFFIX.test(n.slice(quarantinePrefix.length));
+      const r = readLockOwner(full);
+      entries.push({ path: full, recognized: nameOk && st.isSymbolicLink() && r.owner !== null, ageMs: Date.now() - st.mtimeMs, removed: false });
+    }
+    return { entries };
+  };
+  const seen = inspect();
+  if (seen.ioError) return { present: false, stale: false, removed: false, reapDir, maintDir, reason: "io_error", ...seen.ioError };
+  const inv = inventoryQuarantine();
+  const base = { present: seen.present, stale: seen.stale ?? false, ageMs: seen.ageMs, owner: seen.owner ?? null, removed: false, reapDir, maintDir, quarantine: inv.entries };
+  if (inv.ioError) return { ...base, reason: "io_error", ...inv.ioError };
+  if (seen.present && !seen.recognized) return { ...base, reason: "unrecognized_artifact" };
+  const quarantineWork = inv.entries.some((e) => e.recognized && e.ageMs > staleMs);
+  if (!apply) return base;
+  if (!seen.present && !quarantineWork) return base;
+  if (seen.present && !seen.stale && !quarantineWork) return base;
+
+  const token = crypto.randomUUID();
+  const maint = tryLink(maintDir, JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token }));
+  if (!maint.ok) return { ...base, reason: maint.reason === "publisher_busy" ? "maintenance_busy" : "io_error", phase: "maintenance_lock", error: maint.error };
+  try {
+    if (typeof duringMaintenance === "function") duringMaintenance();
+    // 先清隔离残留（它们不在原路径上，谁也不会再碰）
+    for (const e of base.quarantine) {
+      if (!(e.recognized && e.ageMs > staleMs)) continue;
+      try { fs.unlinkSync(e.path); e.removed = true; }
+      catch (err) { if (err.code !== "ENOENT") e.error = err.message; else e.removed = true; }
+    }
+    if (!seen.present || !seen.stale) return base;
+    const again = inspect();
+    if (again.ioError) return { ...base, reason: "io_error", ...again.ioError };
+    if (!again.present) return { ...base, reason: "already_cleared" };
+    if (!again.recognized) return { ...base, reason: "unrecognized_artifact" };
+    if (!again.stale || JSON.stringify(again.owner) !== JSON.stringify(seen.owner)) return { ...base, reason: "instance_changed" };
+    const quarantine = reapDir + ".quarantine-" + token;
+    try { fs.renameSync(reapDir, quarantine); }
+    catch (err) {
+      if (err.code === "ENOENT") return { ...base, reason: "already_cleared" };
+      return { ...base, reason: "io_error", phase: "quarantine", error: err.message };
+    }
+    if (typeof afterQuarantine === "function") afterQuarantine();
+    try { fs.unlinkSync(quarantine); }
+    catch (err) {
+      // 隔离成功、删不掉：原路径已经空了（热路径不再卡），残留在隔离路径上，下次同一入口的盘点会看到它。
+      return { ...base, reason: "quarantine_unremoved", quarantinePath: quarantine, error: err.message };
+    }
+    return { ...base, removed: true, quarantinePath: quarantine };
+  } finally {
+    const cur = readLockOwner(maintDir);
+    if (cur.present && cur.owner && cur.owner.token === token) fs.rmSync(maintDir, { recursive: true, force: true });
+  }
 }

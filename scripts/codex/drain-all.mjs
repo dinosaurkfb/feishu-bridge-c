@@ -16,6 +16,8 @@
  * 一条坏记录让整轮扫描中断，等于没有兜底。
  */
 
+import { describeReminderSweep } from "../claim-reminder.mjs";
+import { remindCodexPendingClaims } from "./claim-reminder.mjs";
 import { isDirectRun } from "../direct-run.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
 import { bridgeHome, loadRegistry, registryFile } from "./state.mjs";
@@ -63,9 +65,14 @@ function main() {
     console.error("  task " + (e.key ?? "?") + " 失败：" + e.reason +
       (e.error ? "（" + e.error + "）" : ""));
   }
+  // 待认领话题快过期时提醒一次（判据与文案共用 topic-generation / claim-reminder）。
+  const reminded = remindCodexPendingClaims();
+  const said = describeReminderSweep(reminded, { chain: "Codex" });
+  if (said) (reminded.ok && reminded.problems.length === 0 ? console.log : console.error)(said);
+  const reminderFailed = !reminded.ok || reminded.problems.length > 0;
   // **有失败就非零退出。**launchd 的日志里全是 exit 0 的话，
   // "一直在跑"和"一直在空转"长得一模一样。
-  process.exit(swept.errors.length > 0 ? 1 : 0);
+  process.exit(swept.errors.length > 0 || reminderFailed ? 1 : 0);
 }
 
 if (isDirectRun(import.meta.url)) main();

@@ -11,6 +11,8 @@ import {
   ROTATION_STATUS, closePendingTopicGeneration, failTopicRotation,
   materializeLegacyTopicFields, prepareTopicRotation, registerPendingTopicGeneration,
   recordTopicGenerationActivity, resolveMappingOutboundGeneration, topicGenerationStateForLegacy,
+  markPendingClaimReminder,
+  reserveClaimReminderAttempt,
 } from "./topic-generation.mjs";
 
 const writeJsonAtomic = (file, value) => {
@@ -24,9 +26,10 @@ export function loadClaudeTopicBinding({
   root,
   claudeSessionId,
   registryFile = registryPath(),
+  templateFile,
   now = Date.now(),
 } = {}) {
-  const resolved = resolveProject({ root, claudeSessionId, registryFile });
+  const resolved = resolveProject({ root, claudeSessionId, registryFile, templateFile });
   if (!resolved.ok) return resolved;
   const state = resolved.mapping?.topic_generation_state;
   if (!state) return { ok: false, reason: "topic_generation_unavailable" };
@@ -66,10 +69,11 @@ function mutateClaudeTopicBinding({
   root,
   claudeSessionId,
   registryFile = registryPath(),
+  templateFile,
   now = Date.now(),
   mutate,
 } = {}) {
-  const current = loadClaudeTopicBinding({ root, claudeSessionId, registryFile, now });
+  const current = loadClaudeTopicBinding({ root, claudeSessionId, registryFile, templateFile, now });
   if (!current.ok) return current;
   const projectFile = projectMappingPath(root);
   const projectBacked = current.source === "project-files";
@@ -78,7 +82,11 @@ function mutateClaudeTopicBinding({
   // 宁可明说也不要拿一把猜出来的锁去写。
   if (lockDir === null) return { ok: false, reason: "binding_source_unknown" };
   const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "binding_busy" };
+  // 只有"别人正拿着"才是 busy；锁目录不可写之类的 I/O 错误要原样报出去（评审探针：曾被折叠成 busy 静默跳过）。
+  if (!lock.ok) {
+    return lock.reason === "publisher_busy" ? { ok: false, reason: "binding_busy" }
+      : { ok: false, reason: "lock_io_error", error: lock.error ?? lock.reason };
+  }
   try {
     if (projectBacked) {
       let record;
@@ -198,6 +206,26 @@ export function recordClaudeTopicActivity({
     mutate: (state) => recordTopicGenerationActivity(state, {
       generationId, eventKey, messageDelta, now, retryMs,
     }),
+  });
+}
+
+/** 锁内预留一次待认领提醒尝试（判据在锁内重算，并发只有一个能拿到）。 */
+export function reserveClaudeClaimReminder({
+  root, claudeSessionId, generationId, registryFile, templateFile, now = Date.now(),
+} = {}) {
+  return mutateClaudeTopicBinding({
+    root, claudeSessionId, registryFile, templateFile, now,
+    mutate: (state) => reserveClaimReminderAttempt(state, { generationId, now }),
+  });
+}
+
+/** 原子记下"待认领话题已提醒过"。 */
+export function markClaudeClaimReminder({
+  root, claudeSessionId, generationId, registryFile, templateFile, now = Date.now(),
+} = {}) {
+  return mutateClaudeTopicBinding({
+    root, claudeSessionId, registryFile, templateFile, now,
+    mutate: (state) => markPendingClaimReminder(state, { generationId, now }),
   });
 }
 

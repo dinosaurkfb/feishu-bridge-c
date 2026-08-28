@@ -194,7 +194,7 @@ $feishu-status
 | `npm test` | 运行 Claude 基线与 Codex adapter 全套本地回归 |
 
 `$feishu-rotate` 本身就是为当前精确 task 创建下一代话题的一次授权，不再二次确认。新话题建立后，
-在其中真实 `@M5Codex` 一次完成切换。等待认领默认 24 小时；若要取消尚未认领的候选，可在仓库
+在其中真实 `@M5Codex` 一次完成切换。等待认领默认 72 小时（截止前 12 小时无人认领会在该话题下提醒）；若要取消尚未认领的候选，可在仓库
 中运行 `node scripts/codex/feishu-rotate.mjs --thread-id <精确 thread id> --cancel --apply`。
 取消只退休候选代际，不删除飞书话题，也不影响旧 active 话题。
 

@@ -25,7 +25,9 @@ import {
 import { outboxDirOf } from "./drain-outbox.mjs";
 import { listPending } from "./outbox.mjs";
 import { setClaudeTopicBindingStatus } from "./topic-generation-store.mjs";
-import { activeGeneration, pendingGeneration, effectiveBindingId } from "./topic-generation.mjs";
+import { activeGeneration, pendingGeneration, effectiveBindingId,
+  TOPIC_GENERATION_AUTO_ROTATE_MESSAGES,
+} from "./topic-generation.mjs";
 import { interactionPolicyStateForLegacy, interactionPolicySummary } from "./interaction-policy.mjs";
 
 export const SUSPENDED = "suspended";
@@ -70,7 +72,7 @@ export function currentBinding({ root, claudeSessionId, registryFile, templateFi
     pending,
     activeGeneration: activeTopic?.generation ?? null,
     activeGenerationMessages: activeTopic?.activity?.message_count ?? 0,
-    activeGenerationThreshold: activeTopic?.activity?.auto_rotate_threshold ?? 30,
+    activeGenerationThreshold: activeTopic?.activity?.auto_rotate_threshold ?? TOPIC_GENERATION_AUTO_ROTATE_MESSAGES,
     pendingGeneration: pendingTopic?.generation ?? null,
     pendingGenerationExpiresAt: pendingTopic?.claim_expires_at ?? null,
     readOnlyGenerations: topicState?.generations?.filter((generation) =>
@@ -184,7 +186,7 @@ export function describeStatus(st, others = []) {
   }
   if (st.activeGeneration !== null) {
     const messages = Number.isInteger(st.activeGenerationMessages) ? st.activeGenerationMessages : 0;
-    const threshold = Number.isInteger(st.activeGenerationThreshold) ? st.activeGenerationThreshold : 30;
+    const threshold = Number.isInteger(st.activeGenerationThreshold) ? st.activeGenerationThreshold : TOPIC_GENERATION_AUTO_ROTATE_MESSAGES;
     lines.push("自动轮转  " + messages + " / " + threshold +
       " 条有效业务消息");
   }

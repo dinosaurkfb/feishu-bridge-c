@@ -721,5 +721,13 @@ if (isDirectRun(import.meta.url)) {
       if (line.error) hadError = true;
     }
   }
+  // 30 分钟兜底顺带做的事：待认领话题快过期时提醒一次（只在 --all 这条路径上；判据在 topic-generation）。
+  if (process.argv.includes("--all")) {
+    const { remindClaudePendingClaims, describeReminderSweep } = await import("./claim-reminder.mjs");
+    const reminded = remindClaudePendingClaims({ dryRun });
+    const said = describeReminderSweep(reminded, { chain: "Claude" });
+    if (said) (reminded.ok && reminded.problems.length === 0 ? console.log : console.error)(said);
+    if (!reminded.ok || reminded.problems.length > 0) hadError = true;
+  }
   if (hadError) process.exit(1);
 }

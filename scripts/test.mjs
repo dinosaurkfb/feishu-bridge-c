@@ -18250,8 +18250,15 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   assert.ok(inflight.problems.some((p) => p.key === key2 && p.reason === "consumed_in_flight"), JSON.stringify(inflight.problems));
   const preview = repair("--project", root, "--key", key2);
   assert.deepEqual([preview.status, /\[预览\] 事务未闭合：控制意图 mapping，终态缺席/u.test(preview.stdout)], [0, true], preview.stdout);
+  // 种一个写到一半留下的临时残骸：成功前盘点报 consumed_in_flight（受控形状，不是"不认识"），成功后被清掉
+  const residue = path.join(claimsDir, key2 + ".consumed.json.tmp.4242.1787900000000");
+  fs.writeFileSync(residue, "{}");
+  const withResidue = inventoryRuns({ runsDir: path.join(root, ".runtime-data", "inbound", "runs"), claimsDir });
+  assert.ok(withResidue.problems.some((p) => p.key === key2 && p.reason === "consumed_in_flight" && /tmp\./u.test(p.why)), JSON.stringify(withResidue.problems));
+  assert.ok(!withResidue.problems.some((p) => p.reason === "unrecognized_entry"), "残骸是受控形状");
   // 维护入口恢复（不是飞书重发）：续做并写终态；再跑一次说已闭合
   const repaired = repair("--project", root, "--key", key2, "--apply");
+  assert.ok(!fs.existsSync(residue), "成功写出终态后同 key 的临时残骸要清掉");
   assert.deepEqual([repaired.status, /已补齐终态（目标模式 mapping/u.test(repaired.stdout)], [0, true], repaired.stdout);
   assert.equal(readConsumedRecord({ claimsDir, key: key2, expectedIntent: { control: "mode", mode: MAPPING_POLICY_ID } }).status, "valid");
   assert.deepEqual(fs.readdirSync(claimsDir).filter((n) => n.includes(".consumed.json.tmp.")), [], "首次失败留下的临时制品在成功后清掉");

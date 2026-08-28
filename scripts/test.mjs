@@ -18257,6 +18257,17 @@ test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进
   assert.equal(readConsumedRecord({ claimsDir, key: good }).status, "valid");
   assert.equal(readConsumedRecord({ claimsDir, key: "f".repeat(64) }).status, "absent");
   assert.equal(readConsumedRecord({ claimsDir, key: "z".repeat(64) }).status, "unreadable", "key 形状不对也不猜");
+  // claim 里的意图形状不对：readClaimState 判不可读（重放时不许据此续做）
+  const badIntentClaim = acquireClaim({ claimsDir, messageId: "msg_bad_intent", logicalTaskKey: "t",
+    meta: { policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, origin_channel_generation_id: "channel_generation_000000000000000000000000",
+      control: { control: "mode", mode: "turbo" } } });
+  assert.equal(badIntentClaim.ok, true);
+  const badRead = readClaimState({ claimsDir, key: badIntentClaim.key });
+  assert.deepEqual([badRead.status, badRead.why], ["unreadable", "control 取值不在受控集合里"]);
+  const extraIntentClaim = acquireClaim({ claimsDir, messageId: "msg_extra_intent", logicalTaskKey: "t",
+    meta: { policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, origin_channel_generation_id: "channel_generation_000000000000000000000000",
+      control: { control: "mode", mode: MAPPING_POLICY_ID, extra: 1 } } });
+  assert.equal(readClaimState({ claimsDir, key: extraIntentClaim.key }).why, "control 字段集不对");
   assert.equal(controlIntentProblem({ control: "mode", mode: MAPPING_POLICY_ID }), null);
   assert.equal(controlIntentProblem(undefined), null, "不在场 = 不是控制命令");
   for (const badIntent of [null, [], { control: "mode" }, { control: "rotate", mode: "mapping" }, { control: "mode", mode: "turbo" }, { control: "mode", mode: "mapping", extra: 1 }]) {

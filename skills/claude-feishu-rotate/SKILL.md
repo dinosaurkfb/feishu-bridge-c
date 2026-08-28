@@ -13,13 +13,19 @@ disable-model-invocation: true
 
 `/feishu-rotate` 本身就是这次创建下一话题代际的明确授权，不必再次询问确认。命令必须单独占
 一整条输入；讨论、引用、转发或带其他正文的同名 token 都不是授权。
-**从飞书来的也算**（2026-08-28 起）：路由已验过发送者，飞书消息正文恰为 `/feishu-rotate`
-时等同于终端输入 —— 飞书文本不会触发斜杠命令，你要自己跑下面那条。
+**从飞书来的也算**（2026-08-28 起）：路由已验过发送者，飞书消息正文恰为下列之一时等同于
+终端输入 —— 飞书文本不会触发斜杠命令，你要自己跑对应的那条，两者一一对应、不许互换：
 
-只运行：
+| 飞书正文（恰为） | 唯一命令 |
+| --- | --- |
+| `/feishu-rotate` | `node {{SCRIPT:feishu-rotate.mjs}} --apply` |
+| `/feishu-rotate cancel` | `node {{SCRIPT:feishu-rotate.mjs}} --cancel --apply` |
+
+终端里也只运行这两条之一：
 
 ```bash
-node {{SCRIPT:feishu-rotate.mjs}} --apply
+node {{SCRIPT:feishu-rotate.mjs}} --apply            # 创建下一代际
+node {{SCRIPT:feishu-rotate.mjs}} --cancel --apply   # 丢弃尚未认领的那一代；没有 pending 时脚本会拒绝
 ```
 
 命令使用与出站相同的当前上下文选择规则：优先当前工作线的独立绑定，否则使用项目绑定。

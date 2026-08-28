@@ -17816,7 +17816,6 @@ test("generationForSession：active / read-only 都算，pending 没 session、r
   assert.equal(activeGenerationForSession(st, "session_old"), null, "只认 active 的那个查询保持原义");
 });
 
-<<<<<<< HEAD
 test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结的 origin（老话题）；本地回合和反查不到 claim 的回合仍发当前代际", () => {
   const fx = rotatedRegistryFixture();
   const env = { ...process.env, FEISHU_BRIDGE_REGISTRY: fx.registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: fx.templateFile, HOME: fx.local };
@@ -18050,7 +18049,8 @@ test("一个 session 只属于一个代际：校验器拦重复、激活拒绝�
   ]);
   const amb = findBindingForSession({ sessionId: "session_dup", ...files(f) });
   assert.deepEqual([amb.ok, amb.reason, amb.candidates], [false, "ambiguous_session", 2]);
-=======
+});
+
 // ─── 第 3 层：飞书正文里的控制命令 ─────────────────────────────────────────────
 test("控制命令只认封闭的精确形状：两条链各两条，多一个字都不算；映射到策略 id", () => {
   assert.deepEqual(parseControlCommand("/feishu-mode dialogue", { chain: "claude" }), { kind: "mode", mode: DIALOGUE_POLICY_ID });
@@ -18085,7 +18085,6 @@ test("claim 终态 consumed：账本盘点认识它（不是 unrecognized_entry�
   assert.equal(inv.ok, true, JSON.stringify(inv));
   assert.deepEqual(inv.problems, [], "consumed 是受控状态：既不是不认识的条目，也不是孤儿终局");
   assert.equal(CLAIM_STATE.CONSUMED, "consumed");
->>>>>>> 44e79f4 (feat: 第 3 层 —— 飞书正文恰为 /feishu-mode dialogue|mapping（Codex：$feishu-mode …）时入站路由器当场切换并回执)
 });
 
 test("未路由回复盘点：全枚举，只有完整受验的制品计入，临时 / 未知 / 坏 JSON / 畸形都进 problems；runs 账本读不出时状态页照样渲染；doctor 计入", () => {

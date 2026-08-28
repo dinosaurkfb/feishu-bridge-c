@@ -8828,7 +8828,6 @@ test("Codex 兜底真入口 drain-all 跑待认领提醒；发不出去要报 pu
   assert.equal(fx.pendingNow(Date.now()).claim_reminder_at, undefined, "没发出去不许记");
 });
 
-<<<<<<< HEAD
 test("Codex：两个 task 持有同一 Aily session → 路由返回歧义，不按登记顺序取第一条", () => {
   const home = temp();
   const root = path.join(home, "project");
@@ -8844,7 +8843,7 @@ test("Codex：两个 task 持有同一 Aily session → 路由返回歧义，不
   const r = findTaskForFeishuSession({ sessionId: "aily_dup", home });
   assert.equal(r.ok, false, JSON.stringify(r));
   assert.ok(["ambiguous_session", "duplicate_binding"].includes(r.reason), "坏表被读取层拦下或路由层判歧义，都不许取第一条：" + JSON.stringify(r));
-=======
+});
 // ─── 第 3 层：飞书正文里的 $feishu-mode 由入站路由器当场执行 ───────────────────────
 test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialogue → 当场切换并回执，不投递；重放不切两次；再切回 mapping", () => {
   const home = temp();
@@ -8893,7 +8892,6 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
   const notControl = run("$feishu-mode dialogue 吧", "msg_ctl_4");
   assert.doesNotMatch(notControl.stdout, /已切换|模式未变/u, "多一个字就不是控制命令，走普通指令路径：" + notControl.stdout);
   assert.equal(policyOf(), MAPPING_POLICY_ID);
->>>>>>> 44e79f4 (feat: 第 3 层 —— 飞书正文恰为 /feishu-mode dialogue|mapping（Codex：$feishu-mode …）时入站路由器当场切换并回执)
 });
 
 summarySealed = true;

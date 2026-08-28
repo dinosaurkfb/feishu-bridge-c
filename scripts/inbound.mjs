@@ -447,8 +447,8 @@ const runControl = (replay) => {
     finish("error", { detail: "模式没有切换（" + tx.why + "）" }, { reason: tx.reason });
   }
   writeReceipt("control-" + verdict.messageId, { status: "consumed", control: control.kind, mode: control.mode, changed: tx.changed,
-    replayed: tx.replayed, resumed: tx.resumed, message_id: verdict.messageId, project_root: routed.root, claim_acquired: !replay, handed_off: false });
-  finish("control", { text: controlAckText({ taskName: config.task_display_name, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed }) },
+    replayed: tx.replayed, resumed: tx.resumed, lock_uncleared: tx.lockUncleared ?? null, message_id: verdict.messageId, project_root: routed.root, claim_acquired: !replay, handed_off: false });
+  finish("control", { text: controlAckText({ taskName: config.task_display_name, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed, lockUncleared: tx.lockUncleared ?? null }) },
     { control: control.kind, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed });
 };
 

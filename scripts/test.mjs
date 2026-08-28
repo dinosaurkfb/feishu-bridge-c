@@ -18614,6 +18614,63 @@ test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进
     } finally { fs.chmodSync(claimsDir, 0o700); }
   }
   assert.deepEqual([...RESUMABLE_CONTROL_STATES].sort(), ["consumed_unreadable", "failed_unreadable", "in_flight"]);
+  // ── 事务锁协议（评审第 6 轮）──
+  // ① 锁内状态对所有调用者权威：重复投递先闭合，原持有者晚到（自称首次）也不再执行、不覆写记录
+  const lateKey = acquireClaim({ claimsDir, messageId: "msg_late", logicalTaskKey: "t",
+    meta: { policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, origin_channel_generation_id: "channel_generation_000000000000000000000000",
+      control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).key;
+  const lateIntent = { control: "mode", mode: DIALOGUE_POLICY_ID };
+  let lateRuns = 0;
+  const first = runControlTransaction({ claimsDir, key: lateKey, intent: lateIntent, replay: true, execute: () => { lateRuns += 1; return { ok: true, changed: true }; } });
+  assert.deepEqual([first.ok, first.replayed, first.changed, lateRuns], [true, false, true, 1]);
+  const late = runControlTransaction({ claimsDir, key: lateKey, intent: lateIntent, replay: false, execute: () => { lateRuns += 1; return { ok: true, changed: false }; } });
+  assert.deepEqual([late.ok, late.replayed, late.changed, lateRuns], [true, true, true, 1], "晚到的首次调用者按记录重出，不执行、不把 changed 覆写成 false：" + JSON.stringify(late));
+  assert.equal(readConsumedRecord({ claimsDir, key: lateKey }).record.changed, true);
+  const lateFailedKey = acquireClaim({ claimsDir, messageId: "msg_late_failed", logicalTaskKey: "t",
+    meta: { policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, origin_channel_generation_id: "channel_generation_000000000000000000000000",
+      control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).key;
+  recordClaimState({ claimsDir, key: lateFailedKey, state: "failed", detail: { reason: "control_failed", control: "mode", error: "boom" } });
+  const lateFailed = runControlTransaction({ claimsDir, key: lateFailedKey, intent: lateIntent, replay: false, execute: () => { lateRuns += 1; return { ok: true, changed: true }; } });
+  assert.deepEqual([lateFailed.ok, lateFailed.reason, lateFailed.why, lateRuns], [false, "control_failed_recorded", "boom", 1]);
+  // ② 坏 key：不派生路径、不执行、不建锁
+  for (const badKey of ["zz", "../" + "a".repeat(61), "A".repeat(64), 42, null]) {
+    const bad = runControlTransaction({ claimsDir, key: badKey, intent: lateIntent, execute: () => { lateRuns += 1; return { ok: true, changed: true }; } });
+    assert.deepEqual([bad.ok, bad.reason], [false, "claim_key_invalid"], JSON.stringify(badKey));
+    assert.deepEqual(withControlLock({ claimsDir, key: badKey }, () => { lateRuns += 1; return { ok: true }; }).reason, "claim_key_invalid");
+  }
+  assert.equal(lateRuns, 1);
+  assert.deepEqual(fs.readdirSync(claimsDir).filter((n) => n.includes(".control.lock")), [], "坏 key 没留下任何锁目录");
+  assert.ok(!fs.existsSync(path.join(path.dirname(claimsDir), "a".repeat(61) + ".control.lock")));
+  // ③ 释放绑定实例：锁被清掉又被别的实例取得 → 旧持有者不删新实例，并以 lockUncleared 报出
+  const lockDir = path.join(claimsDir, lateKey + ".control.lock");
+  const swappedRelease = withControlLock({ claimsDir, key: lateKey }, () => {
+    const mine = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf-8"));
+    assert.ok(typeof mine.token === "string" && mine.token.length > 0 && typeof mine.pid === "number", "owner 带 token");
+    fs.rmSync(lockDir, { recursive: true });
+    fs.mkdirSync(lockDir); fs.writeFileSync(path.join(lockDir, "owner.json"), JSON.stringify({ pid: 1, at: "2026-08-29T00:00:00.000Z", token: "someone-else" }));
+    return { ok: true, changed: true };
+  });
+  assert.deepEqual([swappedRelease.ok, swappedRelease.lockUncleared], [true, "锁已被别的实例持有，未删"], JSON.stringify(swappedRelease));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf-8")).token, "someone-else", "新实例的锁还在");
+  assert.equal(runControlTransaction({ claimsDir, key: lateKey, intent: lateIntent, execute: () => ({ ok: true }) }).reason, "control_busy");
+  fs.rmSync(lockDir, { recursive: true });
+  const goneRelease = withControlLock({ claimsDir, key: lateKey }, () => { fs.rmSync(lockDir, { recursive: true }); return { ok: true }; });
+  assert.deepEqual([goneRelease.ok, goneRelease.lockUncleared], [true, "锁已不在（被清理过）"]);
+  // ④ 释放失败不吞：目录不可写 → rm 失败 → lockUncleared，锁留在原地；正常释放后目录消失
+  if (typeof process.getuid !== "function" || process.getuid() !== 0) {
+    const stuckRelease = withControlLock({ claimsDir, key: lateKey }, () => { fs.chmodSync(claimsDir, 0o500); return { ok: true, changed: false }; });
+    fs.chmodSync(claimsDir, 0o700);
+    assert.deepEqual([stuckRelease.ok, typeof stuckRelease.lockUncleared], [true, "string"], JSON.stringify(stuckRelease));
+    assert.ok(fs.existsSync(lockDir), "锁留在原地，账本会报 control_lock_held");
+    fs.rmSync(lockDir, { recursive: true });
+  }
+  assert.deepEqual(withControlLock({ claimsDir, key: lateKey }, () => ({ ok: true })), { ok: true });
+  assert.ok(!fs.existsSync(lockDir));
+  // 维护入口与回执都要把"锁没交还"说出来
+  assert.equal(repairExitCode({ seen: { state: "in_flight" }, result: { ok: true, intent: lateIntent, changed: true, residueUncleared: [], residueUnknown: null, lockUncleared: "EACCES" }, apply: true }), 1);
+  assert.match(describeControlRepair({ seen: { state: "in_flight" }, result: { ok: true, intent: lateIntent, changed: true, residueUncleared: [], residueUnknown: null, lockUncleared: "EACCES" }, apply: true }), /事务锁没有交还（EACCES）/u);
+  assert.match(controlAckText({ taskName: "T", mode: DIALOGUE_POLICY_ID, changed: true, lockUncleared: "EACCES" }), /事务锁没有交还（EACCES）/u);
+  assert.doesNotMatch(controlAckText({ taskName: "T", mode: DIALOGUE_POLICY_ID, changed: true }), /事务锁/u);
   assert.ok(Object.isFrozen(RESUMABLE_CONTROL_STATES));
   assert.equal(controlIntentProblem({ control: "mode", mode: MAPPING_POLICY_ID }), null);
   assert.equal(controlIntentProblem(undefined), null, "不在场 = 不是控制命令");

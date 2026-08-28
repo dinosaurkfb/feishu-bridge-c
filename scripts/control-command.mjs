@@ -9,6 +9,7 @@
  */
 
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { DIALOGUE_POLICY_ID, MAPPING_POLICY_ID } from "./interaction-policy.mjs";
 import { isCanonicalIso } from "./canonical-time.mjs";
@@ -142,26 +143,56 @@ function cleanupConsumedResidue({ claimsDir, key }) {
   return { uncleared, unknown: null };
 }
 
+/**
+ * 逐 key 事务锁的完整协议：
+ *   · key 先过 CLAIM_KEY_SHAPE，坏 key 不派生任何路径、不跑任何回调；
+ *   · mkdir 原子取得 → 立刻写 owner.json { pid, at, token }；owner 写不进去就当场放弃（删目录、不执行）—— 不留没有身份的锁；
+ *   · 释放时先读 owner.json 核 token：不是自己的实例（锁曾被清掉又被别人取得）就不删；rm 失败也不吞 ——
+ *     两种情况都以 lockUncleared 进入受控结果，由调用方非零退出 / 在回执里说清，账本报 control_lock_held。
+ */
 function acquireControlLock({ claimsDir, key }) {
   const dir = path.join(claimsDir, key + CONTROL_LOCK_SUFFIX);
   try { fs.mkdirSync(dir, { recursive: false, mode: 0o700 }); }
   catch (err) {
     if (err.code === "EEXIST") {
-      let owner = null;
-      try { owner = JSON.parse(fs.readFileSync(path.join(dir, "owner.json"), "utf-8")); } catch { /* 持有事实由目录承载 */ }
-      return { ok: false, reason: "control_busy", why: "这一笔已有事务持有者" + (owner ? "（pid " + owner.pid + "，自 " + owner.at + "）" : "") +
-        "；确认它已不在后删除 " + key + CONTROL_LOCK_SUFFIX + " 再试" };
+      const owner = readRecordFile(path.join(dir, "owner.json"));
+      const who = owner.status === "read" && owner.doc && typeof owner.doc === "object" ? "（pid " + owner.doc.pid + "，自 " + owner.doc.at + "）" : "（持有者不明）";
+      return { ok: false, reason: "control_busy", why: "这一笔已有事务持有者" + who + "；确认它已不在后删除 " + key + CONTROL_LOCK_SUFFIX + " 再试" };
     }
     return { ok: false, reason: "control_lock_unavailable", why: String(err.code ?? err.message) };
   }
-  try { fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString() })); } catch { /* 同上 */ }
-  return { ok: true, release: () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 留下的由账本报 control_lock_held */ } } };
+  const token = randomUUID();
+  try { fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token }), { flag: "wx" }); }
+  catch (err) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 留下的由账本报 control_lock_held */ }
+    return { ok: false, reason: "control_lock_unavailable", why: "锁的持有者记录写不进去：" + String(err.code ?? err.message) };
+  }
+  const release = () => {
+    const owner = readRecordFile(path.join(dir, "owner.json"));
+    if (owner.status !== "read" || owner.doc?.token !== token) {
+      return { released: false, why: owner.status === "absent" ? "锁已不在（被清理过）" : owner.status === "read" ? "锁已被别的实例持有，未删" : "锁的持有者记录读不出：" + owner.why };
+    }
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (err) { return { released: false, why: String(err.code ?? err.message) }; }
+    return fs.existsSync(dir) ? { released: false, why: "删了仍在" } : { released: true };
+  };
+  return { ok: true, release };
 }
-/** 在这一笔的事务锁内跑 fn；拿不到锁 → { ok:false, reason: control_busy | control_lock_unavailable }。 */
+/**
+ * 在这一笔的事务锁内跑 fn。拿不到锁 → { ok:false, reason: control_busy | control_lock_unavailable }；
+ * fn 的结果原样返回，只在释放失败时追加 lockUncleared（原因）—— 事务本身可能已成，但锁没交还，调用方必须说出来。
+ */
 export function withControlLock({ claimsDir, key }, fn) {
+  if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) return { ok: false, reason: "claim_key_invalid", why: "key 形状不对" };
+  if (typeof claimsDir !== "string" || !claimsDir) return { ok: false, reason: "claim_key_invalid", why: "claimsDir 缺失" };
   const lock = acquireControlLock({ claimsDir, key });
   if (!lock.ok) return { ok: false, reason: lock.reason, why: lock.why };
-  try { return fn(); } finally { lock.release(); }
+  let result;
+  try { result = fn(); }
+  finally {
+    const rel = lock.release();
+    if (!rel.released && result && typeof result === "object") result = { ...result, lockUncleared: rel.why };
+  }
+  return result;
 }
 
 const SIDECAR_WORD = { valid: "完整", mismatch: "完整", unreadable: "损坏" };
@@ -182,27 +213,28 @@ const jointWhy = (failed, consumed) => "failed（" + SIDECAR_WORD[failed.status]
  * execute(mode) 必须幂等，返回 { ok, changed, reason }。
  */
 export function runControlTransaction({ claimsDir, key, intent, execute, replay = false }) {
+  // key 的闸只有一道，在 withControlLock 里：任何路径派生、任何回调之前。
   const problem = controlIntentProblem(intent);
   if (problem || intent === undefined) return { ok: false, reason: "control_intent_invalid", why: problem ?? "缺 control" };
   return withControlLock({ claimsDir, key }, () => runLockedTransaction({ claimsDir, key, intent, execute, replay }));
 }
 function runLockedTransaction({ claimsDir, key, intent, execute, replay }) {
   const quarantined = [];
+  // **锁内状态对所有调用者都是权威的**：不管调用方自称首次还是重放，这一笔已经闭合（consumed / 受验 failed / 并存）就不再执行。
+  // 重复投递先完成、原 claim 持有者晚到 —— 晚到者在这里按记录重出回执（replayed），而不是再切一次并覆写记录。
   const consumed = readConsumedRecord({ claimsDir, key, expectedIntent: intent });
   const failed = readControlFailedRecord({ claimsDir, key });
-  if (replay) {
-    if (consumed.status !== "absent" && failed.status !== "absent") return { ok: false, reason: "control_conflict", why: jointWhy(failed, consumed) };
-    if (consumed.status === "valid") return { ok: true, changed: consumed.record.changed, resumed: false, replayed: true, residueUncleared: [], residueUnknown: null, quarantined };
-    if (consumed.status === "mismatch") return { ok: false, reason: "consumed_intent_mismatch", why: consumed.why };
-    if (failed.status === "valid") return { ok: false, reason: "control_failed_recorded", why: failed.record.error, replayed: true };
-    if (failed.status === "unreadable") {
-      const name = key + ".failed.quarantined." + process.pid + "." + Date.now();
-      try { fs.renameSync(path.join(claimsDir, key + ".failed.json"), path.join(claimsDir, name)); }
-      catch (err) { return { ok: false, reason: "failed_unquarantined", why: String(err.code ?? err.message) }; }
-      quarantined.push(name);
-    }
-    // consumed 缺席或损坏、failed 不在场：续做
+  if (consumed.status !== "absent" && failed.status !== "absent") return { ok: false, reason: "control_conflict", why: jointWhy(failed, consumed) };
+  if (consumed.status === "valid") return { ok: true, changed: consumed.record.changed, resumed: false, replayed: true, residueUncleared: [], residueUnknown: null, quarantined };
+  if (consumed.status === "mismatch") return { ok: false, reason: "consumed_intent_mismatch", why: consumed.why };
+  if (failed.status === "valid") return { ok: false, reason: "control_failed_recorded", why: failed.record.error, replayed: true };
+  if (failed.status === "unreadable") {
+    const name = key + ".failed.quarantined." + process.pid + "." + Date.now();
+    try { fs.renameSync(path.join(claimsDir, key + ".failed.json"), path.join(claimsDir, name)); }
+    catch (err) { return { ok: false, reason: "failed_unquarantined", why: String(err.code ?? err.message) }; }
+    quarantined.push(name);
   }
+  // consumed 缺席或损坏、failed 不在场：执行（首次）或续做（重放）
   const done = execute(intent.mode);
   if (!done.ok) {
     const why = done.reason ?? "?";
@@ -268,13 +300,15 @@ export function resumeControlClaim({ claimsDir, key, execute, expect = {} }) {
   if (seen.state === "consumed") {
     const locked = withControlLock({ claimsDir, key }, () => cleanupConsumedResidue({ claimsDir, key }));
     if (locked.ok === false) return { ok: false, reason: locked.reason, why: locked.why };
-    return { ok: true, already: true, changed: seen.record.changed, intent: seen.intent, residueUncleared: locked.uncleared, residueUnknown: locked.unknown, quarantined: seen.quarantined ?? [] };
+    return { ok: true, already: true, changed: seen.record.changed, intent: seen.intent, residueUncleared: locked.uncleared, residueUnknown: locked.unknown,
+      quarantined: seen.quarantined ?? [], lockUncleared: locked.lockUncleared ?? null };
   }
   if (!RESUMABLE_CONTROL_STATES.includes(seen.state)) return { ok: false, reason: seen.state, why: seen.why ?? null };
   const tx = runControlTransaction({ claimsDir, key, intent: seen.intent, execute, replay: true });
   return tx.ok
-    ? { ok: true, already: false, changed: tx.changed, intent: seen.intent, residueUncleared: tx.residueUncleared ?? [], residueUnknown: tx.residueUnknown ?? null, quarantined: [...(seen.quarantined ?? []), ...(tx.quarantined ?? [])] }
-    : { ok: false, reason: tx.reason, why: tx.why, quarantined: tx.quarantined ?? [] };
+    ? { ok: true, already: false, changed: tx.changed, intent: seen.intent, residueUncleared: tx.residueUncleared ?? [], residueUnknown: tx.residueUnknown ?? null,
+      quarantined: [...(seen.quarantined ?? []), ...(tx.quarantined ?? [])], lockUncleared: tx.lockUncleared ?? null }
+    : { ok: false, reason: tx.reason, why: tx.why, quarantined: tx.quarantined ?? [], lockUncleared: tx.lockUncleared ?? null };
 }
 
 const MODE_LABEL = {
@@ -283,12 +317,13 @@ const MODE_LABEL = {
 };
 
 /** 回执正文：说清切到了什么、是不是本来就是、这条不是指令；重放 / 续做也说清。 */
-export function controlAckText({ taskName, mode, changed, replayed = false, resumed = false }) {
+export function controlAckText({ taskName, mode, changed, replayed = false, resumed = false, lockUncleared = null }) {
   const head = replayed ? "已处理过 · " : resumed ? "已补齐 · " : changed ? "已切换 · " : "模式未变 · ";
   const body = replayed
     ? "这条控制命令之前已经执行过（" + (changed ? "当时完成了切换" : "当时模式未变") + "）；当时目标模式是 " + (MODE_LABEL[mode] ?? mode) + "，本次没有再次切换。"
     : resumed
       ? "上次执行后终态没记下，这次已补齐；交互模式是 " + (MODE_LABEL[mode] ?? mode) + "。"
       : (changed ? "交互模式现在是 " : "本来就是 ") + (MODE_LABEL[mode] ?? mode) + "。";
-  return [head + taskName, body, "本条是控制命令，没有被当作指令投递。"].join("\n");
+  const lockNote = lockUncleared ? "注意：这一笔的事务锁没有交还（" + lockUncleared + "），之后同一笔会报 control_busy；请人工确认后删除锁目录。" : null;
+  return [head + taskName, body, "本条是控制命令，没有被当作指令投递。", ...(lockNote ? [lockNote] : [])].join("\n");
 }

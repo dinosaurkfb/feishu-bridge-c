@@ -236,7 +236,8 @@ session 绑定。日常还可以使用：
 只接受属于当前绑定 / task 的 claim（Claude 侧按 claim 的会话定位选项目级或会话级绑定；身份在写锁内用锁内刚读出的记录重新推导后复核），
 只对 in_flight / 终态损坏 / 失败记录损坏三种态续做；两份终态并存（不论好坏）一律 conflict 交人看；恢复损坏的 failed 前先把它改名隔离成
 `<key>.failed.quarantined.<pid>.<ts>`（账本报 `control_failed_quarantined`，人看完再删）；临时残骸清不掉、或目录枚举不了（说不清）时退出 1，第二次运行也一样。
-每一笔的执行 / 重放 / 维护恢复都在同一把逐 key 事务锁（`<key>.control.lock`，mkdir 原子）里判定与动手，隔离改名也在锁内；
+每一笔的执行 / 重放 / 维护恢复都在同一把逐 key 事务锁（`<key>.control.lock`，mkdir 原子，owner.json 记 pid/时间/token）里判定与动手，隔离改名也在锁内；
+锁内状态对所有调用者权威（晚到的首次调用者撞见已闭合的记录只重出回执，不再执行）；释放前核 token，不是自己的实例不删，删不掉也不吞 —— 以 lockUncleared 进入结果（维护入口退出 1、回执写明）；
 运输层重放遇到受验的 failed 按记录重出失败回执、不再执行（要再切就重新发一条）；两份终态并存 → control_conflict，不执行。
 
 两边命令同名。差别只在绑定单位：Codex 绑一个精确 task，Claude 默认绑项目、

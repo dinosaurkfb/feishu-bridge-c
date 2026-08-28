@@ -36,7 +36,8 @@ export function describeControlRepair({ seen, result, apply }) {
   if (result) {
     if (!result.ok) return "没有恢复（" + result.reason + (result.why ? "：" + result.why : "") + "）";
     const left = (result.residueUncleared?.length ? "；但有 " + result.residueUncleared.length + " 个临时残骸清不掉，请人工查看" : "") +
-      (result.residueUnknown ? "；残骸情况说不清（" + result.residueUnknown + "），请人工查看" : "");
+      (result.residueUnknown ? "；残骸情况说不清（" + result.residueUnknown + "），请人工查看" : "") +
+      (result.lockUncleared ? "；事务锁没有交还（" + result.lockUncleared + "），之后同一笔会报 control_busy，请人工确认后删除锁目录" : "");
     const held = result.quarantined?.length ? "；损坏的 failed 记录已隔离为 " + result.quarantined.join("、") + "，人工查看后删除" : "";
     return (result.already ? "这笔已闭合，无需恢复" : "已补齐终态（目标模式 " + result.intent.mode + "，" + (result.changed ? "本次完成切换" : "模式本来就是") + "）") + held + left;
   }
@@ -54,7 +55,7 @@ export function describeControlRepair({ seen, result, apply }) {
 
 /** 退出码：只要还有没闭合的事、清不掉的残骸，就不许报 0 —— 第二次运行也一样。 */
 export function repairExitCode({ seen, result, apply }) {
-  if (result) return result.ok && !(result.residueUncleared?.length) && !result.residueUnknown ? 0 : 1;
+  if (result) return result.ok && !(result.residueUncleared?.length) && !result.residueUnknown && !result.lockUncleared ? 0 : 1;
   if (!apply) return 0;
   return seen.state === "consumed" && !(seen.residue?.length) && !seen.listingProblem ? 0 : 1;
 }

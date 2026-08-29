@@ -276,9 +276,9 @@ function ledgerDirStillSame(ledgerDir, identity) {
 
 /**
  * 显式维护入口：清 scratch 残骸。账本目录先过 ledgerDirProblem；账本锁内、只认封闭名字 + 普通文件 + 超过 olderThanMs；说不清的不动。
- * 删除走**隔离协议**（评审探针：盘点后按原路径 unlink 会删掉换进来的目录项）：lstat 记身份 → rename 到唯一隔离路径 → 隔离路径上 lstat
- * 核对 dev/ino 一致才 unlink；不一致 = 实例已变（instance_changed），保留在隔离路径、不删；隔离后没删成也保留（quarantine_unremoved）。
- * 隔离名（.quarantine-<uuid>）仍是受验形状，下次 sweep 会再处理。
+ * 删除走**隔离协议**（评审探针：盘点后按原路径 unlink 会删掉换进来的目录项）：盘点时记身份 → rename 到唯一隔离路径（.quarantine-）→ 隔离路径上 lstat
+ * 核对 dev/ino：一致 → 改成 .owned- 再 unlink（.owned- 没删成仍是候选，下次按同一协议重走）；不一致 = 实例已变（instance_changed）→ 改成 .unknown-。
+ * 裸 .quarantine-（改名落标失败、或隔离后中途退出）与 .unknown- 都**不是候选**：自动维护永不再碰，只列进 problems、退出码非零，只人工处置。
  * @returns {{ ok: true, candidates: {name, ageMs, removed, reason, quarantine}[], young: number, problems: string[], lockUncleared?, lockLost? } | { ok: false, reason, why? }}
  */
 export function sweepScratch({ ledgerDir, now = Date.now(), apply = false, olderThanMs = TMP_RESIDUE_AGE_MS }) {
@@ -302,7 +302,7 @@ export function sweepScratch({ ledgerDir, now = Date.now(), apply = false, older
     return { ok: true, candidates, young, problems };
   });
 }
-/** 隔离协议的一次执行（身份来自盘点那一刻）：rename 到唯一隔离路径 → 隔离路径上 lstat 核对 dev/ino → 一致才 unlink。返回 { removed, reason, quarantine }。 */
+/** 隔离协议的一次执行（身份来自盘点那一刻）：rename 到 .quarantine- → lstat 核对 dev/ino → 一致：改 .owned- 再 unlink；不一致：改 .unknown-；改名失败留在 .quarantine-（未确认）。返回 { removed, reason, quarantine }。 */
 function quarantineAndRemove(full, before) {
   const base = full.replace(LAST_MARK, "");
   const q = base + ".quarantine-" + crypto.randomUUID();

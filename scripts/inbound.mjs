@@ -537,9 +537,20 @@ const boundSession = routed.mapping?.claude_session_id ?? null;
 // 指令被投给了后开的那条 —— 他看着自己发出去的指令消失在另一个窗口里。
 // 现在只有一条会话时才投，多条就拒。理由跟下面那段「不回落到项目行为」一样：
 // **投错会话比投不进去更糟** —— 投不进去当场就知道，投错了要等到「它怎么没反应」才知道。
+// 执行边界：reply_only 永远不进现场会话、不续起任何会话；capability 说不清（缺席）按 fail-closed 拒，不折叠成 full。
+const capability = authz.capability;
+if (capability !== "full" && capability !== "reply_only") {
+  recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { reason: "capability_unknown" } });
+  writeReceipt("capability-" + verdict.messageId, { status: "error", reason: "capability_unknown", message_id: verdict.messageId, claim_acquired: true, handed_off: false });
+  finish("error", { detail: "这条消息的执行边界说不清，没有投递" }, { reason: "capability_unknown" });
+}
+const replyOnly = capability === "reply_only";
+
 let ambiguousDelivery = null;
 let target = null;
-if (boundSession) {
+if (replyOnly) {
+  // 只回复不进现场：不枚举现场会话、不选、不钉 delivery pin、不判歧义 —— 这些都只属于 full 分支
+} else if (boundSession) {
   target = findLiveSessionById({ projectRoot: config.project_dir, claudeSessionId: boundSession });
 } else {
   const picked = selectDeliverySession({
@@ -613,15 +624,6 @@ const reserveDialogue = (runtimeTargetId, { beforeReject = null } = {}) => {
 };
 
 let run;
-
-// 执行边界：reply_only 永远不进现场会话、不续起任何会话；capability 说不清（缺席）按 fail-closed 拒，不折叠成 full。
-const capability = authz.capability;
-if (capability !== "full" && capability !== "reply_only") {
-  recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { reason: "capability_unknown" } });
-  writeReceipt("capability-" + verdict.messageId, { status: "error", reason: "capability_unknown", message_id: verdict.messageId, claim_acquired: true, handed_off: false });
-  finish("error", { detail: "这条消息的执行边界说不清，没有投递" }, { reason: "capability_unknown" });
-}
-const replyOnly = capability === "reply_only";
 
 if (target && !replyOnly) {
   // 现场路径不需要会话锁：消息进的是一个活着的会话，它自己会把先后顺序排好。
@@ -705,7 +707,8 @@ if (target && !replyOnly) {
 
   try {
     if (dialogueMode) {
-      policyRun = reserveDialogue(boundSession ?? null, {
+      // reply_only 的回合不在任何真实会话里执行：runtime target 用一个与任何会话 id 都不可能相等的值，owner 会话的 Stop 不会误收它的终局（终局只由守望者收）
+      policyRun = reserveDialogue(replyOnly ? "reply-only:" + claim.key : (boundSession ?? null), {
         beforeReject: () => { if (!replyOnly) releaseSessionLock(LOCK); },
       });
     }

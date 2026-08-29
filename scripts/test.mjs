@@ -90,9 +90,7 @@ import {
   versionFromFiles,
 } from "./runtime-install.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
-import {
-  DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliveryPinPath, findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin,
-} from "./live-session.mjs";
+import { DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliveryPinPath, findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin } from "./live-session.mjs";
 import { extractReply } from "./stop-hook.mjs";
 import { postDeliveryBits } from "./publish-outcome.mjs";
 import { foreignHint, projectLabel } from "./stop-note.mjs";
@@ -19347,7 +19345,7 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
       // Codex 链没有只回复路径：非 owner 本来放行的格子在这条链上暂不开放（no_reply_only_path），owner 不受影响
       const c = authorize({ role, riskClass: r, mode, chain: "codex" });
       if (role === "owner") assert.deepEqual([c.allow, c.capability], [d.allow, d.allow ? "full" : null], "codex owner 与 claude 同");
-      else if (d.allow) { assert.deepEqual([c.allow, c.reason, c.capability], [false, "no_reply_only_path", null]); assert.match(c.text, /在这条链上暂时只对 owner 开放（还没有只回复的执行路径）/u); }
+      else if (d.allow) { assert.deepEqual([c.allow, c.reason, c.capability, c.required], [false, "no_reply_only_path", null, ["owner"]], "链能力收窄后 required 投影成实际要求"); assert.match(c.text, /在这条链上暂时只对 owner 开放（还没有只回复的执行路径）/u); }
       else assert.deepEqual([c.allow, c.reason], [false, d.reason]);
       // 链说不清：按没有只回复路径处理（非 owner 不放行），owner 照旧
       const u = authorize({ role, riskClass: r, mode });
@@ -19426,6 +19424,11 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
   assert.equal(policyOf(), DIALOGUE_POLICY_ID);
   const before = claimCount();
   assert.equal(claudeArgv().length, 0, "此前没有起过 claude（owner 的 Mapping 指令卡在没有长期会话）");
+  // 两条现场会话在场（评审探针）：full 路径会判歧义，reply_only 不进现场 —— 不枚举、不选、不钉 delivery pin、不判歧义
+  const sessionsDir = path.join(local, ".claude", "sessions"); fs.mkdirSync(sessionsDir, { recursive: true });
+  for (const [i, sessionId] of ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"].entries()) {
+    fs.writeFileSync(path.join(sessionsDir, String(i + 1) + ".json"), JSON.stringify({ sessionId, name: "live-" + i, pid: process.pid, kind: "interactive", cwd: root, startedAt: new Date().toISOString() }));
+  }
   const p5 = run("这个问题你怎么看", "333");
   assert.doesNotMatch(p5.stdout, /你的角色是|需要 owner 权限/u, p5.stdout);
   assert.doesNotMatch(p5.stderr, /not_authorized/u, p5.stderr);
@@ -19438,8 +19441,15 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
   assert.match(argv1[0][1], /这个问题你怎么看/u);
   assert.match(argv1[0][1], /\[Dialogue · .+ · turn \d+\]/u, "带 Dialogue 回合戳");
   assert.deepEqual(argv1[0].slice(2), [...REPLY_ONLY_ARGS]);
-  assert.deepEqual([...REPLY_ONLY_ARGS], ["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--output-format", "stream-json", "--verbose"]);
+  assert.deepEqual([...REPLY_ONLY_ARGS], ["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-session-persistence", "--safe-mode", "--output-format", "stream-json", "--verbose"]);
   assert.ok(!argv1[0].includes("--continue") && !argv1[0].includes("--resume"), "只回复不续任何会话");
+  assert.doesNotMatch(p5.stdout, /同时有多个|无法确定目标/u, "两条现场会话不影响只回复：" + p5.stdout);
+  assert.equal(readDeliveryPin(root), null, "只回复不钉 delivery pin");
+  assert.equal(fs.existsSync(path.join(receiptsDir, "ambiguous-msg_authz_" + seq + ".json")), false, "不判歧义");
+  const p5Turn = loadClaudeInteractionPolicy({ root, claudeSessionId: null, registryFile }).state.dialogue?.active_turn;
+  assert.ok(p5Turn, "participant 的回合在活动中");
+  assert.match(p5Turn.runtime_target_id, /^reply-only:[0-9a-f]{64}$/u, "runtime target 不是任何真实会话：" + p5Turn.runtime_target_id);
+  // 同一批现场会话下 owner 的对话仍走 full 路径 → 歧义拒绝（现场选择只属于 full 分支）
   // Dialogue 一次只有一个活动回合（对话策略本身）：把 participant 那一回合收掉（真实里由守望者在 run 结束后收），再让 operator 说
   const p5Key = fs.readdirSync(claimsDir).filter((n) => n.endsWith(".claim")).map((n) => n.slice(0, -".claim".length))
     .find((k) => JSON.parse(fs.readFileSync(path.join(claimsDir, k + ".claim", "claim.json"), "utf-8")).message_id === "msg_authz_" + seq);

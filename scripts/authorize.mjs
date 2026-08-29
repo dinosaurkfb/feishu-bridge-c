@@ -54,7 +54,7 @@ export function authorize({ role, riskClass, mode, chain } = {}) {
   }
   if (role === "owner") return { allow: true, reason: null, required: [...allowed], capability: CAPABILITY.FULL, text: null };
   if (REPLY_ONLY_CAPABLE[chain] !== true) {
-    return { allow: false, reason: "no_reply_only_path", required: [...allowed], capability: null,
+    return { allow: false, reason: "no_reply_only_path", required: [...OWNER], capability: null,
       text: "这个话题处于 " + modeText + " 模式；你的角色是 " + role + "，" + riskText + " 在这条链上暂时只对 owner 开放（还没有只回复的执行路径）" };
   }
   return { allow: true, reason: null, required: [...allowed], capability: CAPABILITY.REPLY_ONLY, text: null };

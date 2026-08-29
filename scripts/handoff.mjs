@@ -164,10 +164,12 @@ export function handOff({ projectDir, instruction, runsDir, key, resumeSessionId
  * 只回复的执行边界（第 2 层 R1，非 owner）：**零工具、无历史**的一次性回合 ——
  *   · 不 --continue / --resume 任何会话（participant 不看 owner 的上下文，也不把话写进 owner 的会话文件）；
  *   · `--tools ""` 禁掉全部内建工具，`--strict-mcp-config --mcp-config '{"mcpServers":{}}'` 禁掉全部 MCP；
+ *   · `--no-session-persistence`：不落会话文件（否则它会成为目录里最新的会话，owner 下一次 --continue 就续进 participant 的话）；
+ *   · `--safe-mode`：关掉全部自定义入口（hooks / skills / plugins）—— 桥自己的 Stop 钩子也不在这个子进程里跑，终局只由守望者收；
  *   · 日志与守望者路径与 handOff 完全一样，结果照旧发回话题。
  * 参数是常量：测试逐字断言，改一个开关就红。
  */
-export const REPLY_ONLY_ARGS = Object.freeze(["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--output-format", "stream-json", "--verbose"]);
+export const REPLY_ONLY_ARGS = Object.freeze(["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-session-persistence", "--safe-mode", "--output-format", "stream-json", "--verbose"]);
 
 export function handOffReplyOnly({ projectDir, instruction, runsDir, key }) {
   assertClaudeAvailable();

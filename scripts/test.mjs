@@ -14,7 +14,7 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import { RISK, classifyRisk } from "./risk-class.mjs";
 import { CHAT_POLICY_ID, CHAT_REPLY_ARGS, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatReplyPathStatus, diagnosticSnippet, chatFailText, CHAT_FAIL_REASONS } from "./chat-reply.mjs";
-import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome, chatRecordProblem, isAdmissionLockEntry, classifyAdmissionLockEntry, inspectAdmissionLocks, inspectScratch, sweepScratch, lockUnclearedText, CHAT_MAX_CONCURRENT, CHAT_MAX_PER_SENDER, TMP_NAME_SHAPE } from "./chat-ledger.mjs";
+import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome, chatRecordProblem, isAdmissionLockEntry, classifyAdmissionLockEntry, inspectAdmissionLocks, inspectScratch, sweepScratch, classifyTmpEntry, lockUnclearedText, CHAT_MAX_CONCURRENT, CHAT_MAX_PER_SENDER, TMP_NAME_SHAPE } from "./chat-ledger.mjs";
 import { parseChatScratchSweepArgs, describeScratchSweep, sweepExitCode } from "./chat-scratch-sweep.mjs";
 import { acquirePublishLock as acquireLedgerLock, releasePublishLock as releaseLedgerLock } from "./registry.mjs";
 import { evaluateChatGates, CHAT_FALLBACK_REASONS } from "./inbound-route.mjs";
@@ -20096,7 +20096,7 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   assert.match(describeScratchSweep(raceSweep, { apply: true }), /没清成（\d+ 秒，instance_changed，留在隔离路径 /u);
   fs.rmSync(raceTmp + ".parked-by-test", { force: true });
   // 归属不明的制品持久标记（评审第 11 轮探针）：.unknown-<uuid>；自动维护永不再碰、准入说不清、doctor / sweep 持续报，只人工删
-  assert.match(path.basename(raceCand.quarantine), /\.quarantine-[0-9a-f-]{36}\.unknown-[0-9a-f-]{36}$/u, "身份对不上的东西改名成持久标记：" + raceCand.quarantine);
+  assert.match(path.basename(raceCand.quarantine), /^[0-9a-f]{64}\.\d+\.\d+\.[0-9a-f-]{36}\.unknown-[0-9a-f-]{36}$/u, "身份对不上的东西改名成持久标记（标记替换、不叠加）：" + raceCand.quarantine);
   assert.deepEqual([chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000 }).why, inspectScratch({ ledgerDir }).inflight, /归属不明的制品：归属不明（隔离时身份对不上），自动维护不碰，请人工核对后删除：/u.test(inspectScratch({ ledgerDir }).problems.join(" "))], [["归属不明的制品（隔离时身份对不上，只能人工处置）" + closedKey.slice(0, 20) + "…"], 0, true], "归属不明 = 准入说不清、doctor 报问题");
   const requarantine = sweepScratch({ ledgerDir: realLedger, apply: true, olderThanMs: 0 });
   assert.deepEqual([requarantine.candidates.length, /归属不明/u.test(requarantine.problems.join(" ")), sweepExitCode(requarantine, { apply: true }), fs.existsSync(raceCand.quarantine)], [0, true, 1, true], "下次 sweep 不碰、持续报：" + JSON.stringify(requarantine));
@@ -20106,14 +20106,38 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   const stuckTmp = path.join(realLedger, closedKey + ".5.6.12345678-1234-1234-1234-123456789abc"); fs.writeFileSync(stuckTmp, "mine");
   fs.utimesSync(stuckTmp, new Date(Date.now() - 2 * 60 * 1000), new Date(Date.now() - 2 * 60 * 1000));
   const originalUnlinkForSweep = fs.unlinkSync; let unlinkBlocked = false;
-  fs.unlinkSync = (target, ...args) => { if (!unlinkBlocked && String(target).includes(".quarantine-")) { unlinkBlocked = true; const e = new Error("forced unlink failure"); e.code = "EIO"; throw e; } return originalUnlinkForSweep(target, ...args); };
+  fs.unlinkSync = (target, ...args) => { if (!unlinkBlocked && String(target).includes(".owned-")) { unlinkBlocked = true; const e = new Error("forced unlink failure"); e.code = "EIO"; throw e; } return originalUnlinkForSweep(target, ...args); };
   let stuckSweep;
   try { stuckSweep = sweepScratch({ ledgerDir: realLedger, apply: true, olderThanMs: 0 }); }
   finally { fs.unlinkSync = originalUnlinkForSweep; }
   const stuckCand = stuckSweep.candidates.find((c2) => c2.name === path.basename(stuckTmp));
-  assert.deepEqual([unlinkBlocked, stuckCand?.removed, /^quarantine_unremoved：EIO$/u.test(stuckCand?.reason ?? ""), /\.quarantine-[0-9a-f-]{36}$/u.test(stuckCand?.quarantine ?? ""), fs.existsSync(stuckCand?.quarantine ?? "")], [true, false, true, true, true], "确认归属但没删成：留在隔离路径：" + JSON.stringify(stuckSweep));
+  assert.deepEqual([unlinkBlocked, stuckCand?.removed, /^quarantine_unremoved：EIO$/u.test(stuckCand?.reason ?? ""), /\.[0-9a-f-]{36}\.owned-[0-9a-f-]{36}$/u.test(stuckCand?.quarantine ?? "") && !String(stuckCand?.quarantine).includes(".quarantine-"), fs.existsSync(stuckCand?.quarantine ?? ""), chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000 }).unresolved], [true, false, true, true, true, 0], "确认归属但没删成：留在 .owned（仍是候选）：" + JSON.stringify(stuckSweep));
   const retrySweep = sweepScratch({ ledgerDir: realLedger, apply: true, olderThanMs: 0 });
-  assert.deepEqual([retrySweep.candidates.map((c2) => c2.removed), fs.existsSync(stuckCand.quarantine), fs.readdirSync(ledgerDir).filter((n2) => n2.includes(".quarantine-")).length], [[true], false, 0], "隔离路径上的候选下次按同一协议清掉：" + JSON.stringify(retrySweep));
+  assert.deepEqual([retrySweep.candidates.map((c2) => c2.removed), fs.existsSync(stuckCand.quarantine), fs.readdirSync(ledgerDir).filter((n2) => n2.includes(".quarantine-")).length], [[true], false, 0], ".owned 下次按同一协议清掉：" + JSON.stringify(retrySweep));
+  // 落标失败（评审第 12 轮探针）：身份对不上、改名 .unknown 抛 EIO → 留在裸 .quarantine = 归属未确认：准入说不清、sweep 只报不碰、doctor 报问题
+  const markTmp = path.join(realLedger, closedKey + ".9.9.12345678-1234-1234-1234-123456789abc"); fs.writeFileSync(markTmp, "mine");
+  fs.utimesSync(markTmp, new Date(Date.now() - 2 * 60 * 1000), new Date(Date.now() - 2 * 60 * 1000));
+  const originalLstatForMark = fs.lstatSync; const originalRenameForMark = fs.renameSync; let markSwapped = false; let markRenameBlocked = false;
+  fs.lstatSync = (target, ...args) => { const st = originalLstatForMark(target, ...args); if (!markSwapped && path.resolve(String(target)) === markTmp && st.isFile()) { markSwapped = true; fs.renameSync(markTmp, markTmp + ".parked-by-test"); fs.writeFileSync(markTmp, "replacement-sentinel"); } return st; };
+  fs.renameSync = (from, to, ...args) => { if (!markRenameBlocked && String(to).includes(".unknown-")) { markRenameBlocked = true; const e = new Error("forced mark failure"); e.code = "EIO"; throw e; } return originalRenameForMark(from, to, ...args); };
+  let markSweep;
+  try { markSweep = sweepScratch({ ledgerDir: realLedger, apply: true }); }
+  finally { fs.lstatSync = originalLstatForMark; fs.renameSync = originalRenameForMark; }
+  const markCand = markSweep.candidates.find((c2) => c2.name === path.basename(markTmp));
+  assert.deepEqual([markSwapped, markRenameBlocked, markCand?.removed, /^instance_changed（改名持久标记失败：EIO，留在未确认态）$/u.test(markCand?.reason ?? ""), /\.quarantine-[0-9a-f-]{36}$/u.test(markCand?.quarantine ?? ""), fs.readFileSync(markCand?.quarantine ?? "", "utf-8")], [true, true, false, true, true, "replacement-sentinel"], "落标失败留在裸 .quarantine：" + JSON.stringify(markSweep));
+  fs.rmSync(markTmp + ".parked-by-test", { force: true });
+  assert.deepEqual([chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000 }).why, /归属未确认（隔离后没核完身份/u.test(inspectScratch({ ledgerDir }).problems.join(" "))], [["归属未确认的制品（隔离后没核完身份，只能人工处置）" + closedKey.slice(0, 20) + "…"], true], "裸 .quarantine = 未确认：准入说不清、doctor 报问题");
+  const unconfirmedSweep = sweepScratch({ ledgerDir: realLedger, apply: true, olderThanMs: 0 });
+  assert.deepEqual([unconfirmedSweep.candidates.length, /归属未确认/u.test(unconfirmedSweep.problems.join(" ")), sweepExitCode(unconfirmedSweep, { apply: true }), fs.existsSync(markCand.quarantine)], [0, true, 1, true], "未确认的不碰：" + JSON.stringify(unconfirmedSweep));
+  fs.unlinkSync(markCand.quarantine);
+  // 中途退出模拟：现场只剩一个裸 .quarantine（隔离后进程死了）→ 同样是未确认，不是候选
+  const crashed = path.join(realLedger, closedKey + ".8.8.12345678-1234-1234-1234-123456789abc.quarantine-12345678-1234-1234-1234-123456789abc"); fs.writeFileSync(crashed, "?");
+  fs.utimesSync(crashed, new Date(Date.now() - 2 * 60 * 1000), new Date(Date.now() - 2 * 60 * 1000));
+  const crashedSweep = sweepScratch({ ledgerDir: realLedger, apply: true, olderThanMs: 0 });
+  assert.deepEqual([crashedSweep.candidates.length, /归属未确认/u.test(crashedSweep.problems.join(" ")), fs.existsSync(crashed), chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000 }).unresolved], [0, true, true, 1], "隔离后中途退出留下的裸 .quarantine 也是未确认：" + JSON.stringify(crashedSweep));
+  fs.unlinkSync(crashed);
+  const U = "12345678-1234-1234-1234-123456789abc"; const B = "c".repeat(64) + ".1.2." + U;
+  assert.deepEqual([B, B + ".owned-" + U, B + ".quarantine-" + U, B + ".unknown-" + U, B + ".quarantine-" + U + ".owned-" + U, "x.chat.json", "c".repeat(64) + ".1.2.nope", "k".repeat(64) + ".1.2." + U].map(classifyTmpEntry), ["candidate", "candidate", "unconfirmed", "unknown", null, null, null, null], "按标记段分类；标记最多一段（叠加的不是我们生成的）；key 必须是 hex");
   // 目录校验绑定到操作（评审第 11 轮探针）：校验通过之后、取锁之前目录被换成指向外部的链接 → 取锁后重核 dev/ino 不同 → 什么都不做
   const outsideB = path.join(local, "outside-ledger-b"); fs.mkdirSync(outsideB, { recursive: true });
   const outsideSentinelB = path.join(outsideB, "a".repeat(64) + ".7.8.12345678-1234-1234-1234-123456789abc"); fs.writeFileSync(outsideSentinelB, "sentinel-b");

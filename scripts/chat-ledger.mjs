@@ -49,10 +49,23 @@ const SENDER_REF_SHAPE = /^sender_[0-9a-f]{16}$/u;
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 /** 临时文件我们只会生成这种名字：<key>.<pid>.<time>.<uuid>（与记录同目录；不参与准入盘点） */
 export const TMP_NAME_SHAPE = new RegExp("^[0-9a-f]{64}\\.\\d+\\.\\d+\\." + UUID + "$", "u");
-/** 临时文件条目的全部合法形状：原名，或 sweep 隔离时追加的 .quarantine-<uuid>（可叠加：隔离后没删成、再次隔离） */
-const TMP_ENTRY_SHAPE = new RegExp("^[0-9a-f]{64}\\.\\d+\\.\\d+\\." + UUID + "(\\.quarantine-" + UUID + ")*$", "u");
-/** 归属不明的制品：隔离后身份对不上（盘点与隔离之间被换过）→ 再改名成 .unknown-<uuid> 持久标记；自动维护永不再碰，准入说不清，只人工处置。 */
-const UNKNOWN_ENTRY_SHAPE = new RegExp("^[0-9a-f]{64}\\.\\d+\\.\\d+\\." + UUID + "(\\.quarantine-" + UUID + ")+\\.unknown-" + UUID + "$", "u");
+/**
+ * 临时文件条目的全部合法形状：原名后面可叠加 sweep 留下的标记段（.quarantine- / .owned- / .unknown-<uuid>），按**最后一段**分类：
+ *   · 无标记 / .owned-   → 候选（归属已核过，允许自动按隔离协议删）；
+ *   · .quarantine-       → 归属未确认（隔离后还没核完身份就中断，或落标失败）—— 自动维护永不再碰，准入说不清，只人工处置；
+ *   · .unknown-          → 归属不明（隔离后身份对不上）—— 同上，只人工处置。
+ * 裸 .quarantine 永远代表"未确认"：身份核验成功才改成 .owned，只有 .owned 允许自动重试删除（评审探针：落标失败让归属不明的东西变回候选）。
+ * 标记段**替换**而不是叠加（最多一段）：文件名有 255 字节上限，叠加几轮就 ENAMETOOLONG。
+ */
+const TMP_ENTRY_SHAPE = new RegExp("^[0-9a-f]{64}\\.\\d+\\.\\d+\\." + UUID + "(\\.(quarantine|owned|unknown)-" + UUID + ")?$", "u");
+const LAST_MARK = new RegExp("\\.(quarantine|owned|unknown)-" + UUID + "$", "u");
+/** 临时条目分类：candidate / unconfirmed / unknown；名字不是临时条目形状 → null。 */
+export function classifyTmpEntry(name) {
+  if (!TMP_ENTRY_SHAPE.test(name)) return null;
+  const m = LAST_MARK.exec(name);
+  if (m === null || m[1] === "owned") return "candidate";
+  return m[1] === "quarantine" ? "unconfirmed" : "unknown";
+}
 const BASE_KEYS = ["chain", "key", "message_id", "pid", "risk_class", "role", "schema_version", "sender_ref", "session_id", "started_at", "state"];
 const ANSWERED_KEYS = [...BASE_KEYS, "elapsed_ms", "recorded_at", "text"].sort().join(",");
 const FAILED_KEYS = Object.freeze({
@@ -169,8 +182,10 @@ export function chatLoad({ ledgerDir, senderId, now = Date.now(), budgetMs }) {
   let running = 0; let bySender = 0; let unresolved = 0; const why = [];
   for (const n of names) {
     if (isAdmissionLockEntry(n)) continue;
-    if (UNKNOWN_ENTRY_SHAPE.test(n)) { unresolved += 1; why.push("归属不明的制品（隔离时身份对不上，只能人工处置）" + n.slice(0, 20) + "…"); continue; }
-    if (TMP_ENTRY_SHAPE.test(n)) {
+    const tmpKind = classifyTmpEntry(n);
+    if (tmpKind === "unknown") { unresolved += 1; why.push("归属不明的制品（隔离时身份对不上，只能人工处置）" + n.slice(0, 20) + "…"); continue; }
+    if (tmpKind === "unconfirmed") { unresolved += 1; why.push("归属未确认的制品（隔离后没核完身份，只能人工处置）" + n.slice(0, 20) + "…"); continue; }
+    if (tmpKind === "candidate") {
       // 只跳过**受验的普通文件**；临时名字上挂着符号链接 / 目录 / 管道就是说不清，不折成可用
       let st = null;
       try { st = fs.lstatSync(path.join(ledgerDir, n)); } catch (err) { if (err?.code === "ENOENT") continue; }
@@ -199,8 +214,10 @@ function scanTmp(ledgerDir, now) {
   catch (err) { return { ok: err?.code === "ENOENT", why: err?.code === "ENOENT" ? null : "目录读不出：" + String(err.code ?? err.message), entries: [] }; }
   const entries = [];
   for (const n of names) {
-    if (UNKNOWN_ENTRY_SHAPE.test(n)) { entries.push({ name: n, kind: "unknown", why: "归属不明（隔离时身份对不上），自动维护不碰，请人工核对后删除：" + path.join(ledgerDir, n) }); continue; }
-    if (!TMP_ENTRY_SHAPE.test(n)) continue;
+    const tmpKind = classifyTmpEntry(n);
+    if (tmpKind === null) continue;
+    if (tmpKind === "unknown") { entries.push({ name: n, kind: "unknown", why: "归属不明（隔离时身份对不上），自动维护不碰，请人工核对后删除：" + path.join(ledgerDir, n) }); continue; }
+    if (tmpKind === "unconfirmed") { entries.push({ name: n, kind: "unknown", why: "归属未确认（隔离后没核完身份 —— 中途退出或落标失败），自动维护不碰，请人工核对后删除：" + path.join(ledgerDir, n) }); continue; }
     let st;
     try { st = fs.lstatSync(path.join(ledgerDir, n)); }
     catch (err) { if (err?.code === "ENOENT") continue; entries.push({ name: n, kind: "unclear", why: "lstat 失败（" + String(err.code ?? err.message) + "）" }); continue; }
@@ -287,22 +304,27 @@ export function sweepScratch({ ledgerDir, now = Date.now(), apply = false, older
 }
 /** 隔离协议的一次执行（身份来自盘点那一刻）：rename 到唯一隔离路径 → 隔离路径上 lstat 核对 dev/ino → 一致才 unlink。返回 { removed, reason, quarantine }。 */
 function quarantineAndRemove(full, before) {
-  const q = full + ".quarantine-" + crypto.randomUUID();
+  const base = full.replace(LAST_MARK, "");
+  const q = base + ".quarantine-" + crypto.randomUUID();
   try { fs.renameSync(full, q); }
   catch (err) { return err?.code === "ENOENT" ? { removed: true, reason: "already_gone", quarantine: null } : { removed: false, reason: "quarantine_failed：" + String(err.code ?? err.message), quarantine: null }; }
   let after;
   try { after = fs.lstatSync(q); }
   catch (err) { return { removed: false, reason: "quarantine_unreadable：" + String(err.code ?? err.message), quarantine: q }; }
   if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino) {
-    // 身份对不上 = 盘点与隔离之间被换过，隔离路径上的东西归属不明：再改名成持久标记，自动维护永不再碰、准入说不清，只人工处置
-    const u = q + ".unknown-" + crypto.randomUUID();
+    // 身份对不上 = 盘点与隔离之间被换过，隔离路径上的东西归属不明：再改名成持久标记；改名失败也没关系 —— 裸 .quarantine 本身就是"未确认"，同样只人工处置
+    const u = base + ".unknown-" + crypto.randomUUID();
     try { fs.renameSync(q, u); return { removed: false, reason: "instance_changed", quarantine: u }; }
-    catch (err) { return { removed: false, reason: "instance_changed（改名持久标记失败：" + String(err.code ?? err.message) + "）", quarantine: q }; }
+    catch (err) { return { removed: false, reason: "instance_changed（改名持久标记失败：" + String(err.code ?? err.message) + "，留在未确认态）", quarantine: q }; }
   }
-  // 身份一致 = 本入口确认归属；这里的 lstat → unlink 仍是两步：协议外、同 UID 的路径替换不在威胁模型内（它能改账本里的任何东西），见契约 §14c
-  try { fs.unlinkSync(q); }
-  catch (err) { return { removed: false, reason: "quarantine_unremoved：" + String(err.code ?? err.message), quarantine: q }; }
-  return { removed: true, reason: null, quarantine: q };
+  // 身份一致 = 本入口确认归属：先改成 .owned（只有这个形状允许自动重试删除），再删。
+  // 这里的 lstat → unlink 仍是两步：协议外、同 UID 的路径替换不在威胁模型内（它能改账本里的任何东西），见契约 §14c
+  const o = base + ".owned-" + crypto.randomUUID();
+  try { fs.renameSync(q, o); }
+  catch (err) { return { removed: false, reason: "owned_mark_failed：" + String(err.code ?? err.message) + "（留在未确认态）", quarantine: q }; }
+  try { fs.unlinkSync(o); }
+  catch (err) { return { removed: false, reason: "quarantine_unremoved：" + String(err.code ?? err.message), quarantine: o }; }
+  return { removed: true, reason: null, quarantine: o };
 }
 
 /**

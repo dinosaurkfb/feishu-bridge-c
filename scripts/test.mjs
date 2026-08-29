@@ -18773,6 +18773,26 @@ test("⑦ 入站默认处理器（issue #88）：分类五态不折叠；doctor 
   write({ routes: [{ id: "self", handler: outside, default: true, note: "shadow probe" }, { id: "cc2cd", handler: outside }] });
   d = defaultRouteHandler({ file, runtimeCurrent });
   assert.deepEqual([d.status, d.id, d.handler, d.note], ["outside", "self", outside, "shadow probe"]);
+  // 评审反例：路径前缀不能假绿 —— runtime 目录下不存在的文件、runtime 目录里指向外部的符号链接、同目录里别的文件（给了 expectedHandler 时）
+  write({ routes: [{ id: "self", handler: path.join(runtimeCurrent, "scripts", "missing.mjs"), default: true }] });
+  d = defaultRouteHandler({ file, runtimeCurrent });
+  assert.deepEqual([d.status, /不是可解析的普通文件/u.test(d.why)], ["outside", true], JSON.stringify(d));
+  fs.symlinkSync(outside, path.join(rt, "versions", "v1", "scripts", "sneaky.mjs"));
+  write({ routes: [{ id: "self", handler: path.join(runtimeCurrent, "scripts", "sneaky.mjs"), default: true }] });
+  d = defaultRouteHandler({ file, runtimeCurrent });
+  assert.deepEqual([d.status, /实际文件在运行时之外/u.test(d.why)], ["outside", true], JSON.stringify(d));
+  fs.writeFileSync(path.join(rt, "versions", "v1", "scripts", "other.mjs"), "// other\n");
+  write({ routes: [{ id: "self", handler: path.join(runtimeCurrent, "scripts", "other.mjs"), default: true }] });
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "runtime", "没给预期处理器：目录内普通文件算 runtime");
+  d = defaultRouteHandler({ file, runtimeCurrent, expectedHandler: viaLink });
+  assert.deepEqual([d.status, /不是这条链预期的处理器/u.test(d.why)], ["outside", true], JSON.stringify(d));
+  assert.equal(defaultRouteHandler({ file: (write({ routes: [{ id: "self", handler: viaReal, default: true }] }), file), runtimeCurrent, expectedHandler: viaLink }).status, "runtime", "预期处理器按 realpath 对账");
+  // 评审反例：空表与分发器语义一致 —— 没有启用路由 = 用运行时自带处理器
+  write({ routes: [] });
+  d = defaultRouteHandler({ file, runtimeCurrent });
+  assert.deepEqual([d.status, d.why], ["no_routes", "路由表里没有启用的路由"]);
+  write({ routes: [{ id: "x", handler: outside, enabled: false }] });
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "no_routes");
   write({ routes: [{ id: "only", handler: viaLink }] });
   assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "runtime");
   write({ routes: [{ id: "a", handler: viaLink }, { id: "b", handler: outside }] });
@@ -18781,7 +18801,7 @@ test("⑦ 入站默认处理器（issue #88）：分类五态不折叠；doctor 
   assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "unreadable");
   assert.equal(defaultRouteHandler({ file }).status, "unreadable", "没给 runtimeCurrent 也不猜");
   assert.match(inboundHandlerText({ status: "runtime", id: "self" }), /runtime\/current（默认路由 self）/u);
-  assert.match(inboundHandlerText({ status: "outside", handler: outside, note: "shadow probe" }), /运行时之外：shadow\.mjs（shadow probe） —— 装的运行时没在处理入站/u);
+  assert.match(inboundHandlerText({ status: "outside", handler: outside, note: "shadow probe" }), /不是装好的运行时：shadow\.mjs（shadow probe） —— 装的运行时没在处理入站/u);
   assert.match(inboundHandlerText({ status: "no_routes" }), /运行时自带默认处理器/u);
   assert.match(inboundHandlerText({ status: "no_default" }), /没有默认路由/u);
   assert.match(inboundHandlerText({ status: "unreadable", why: "EACCES" }), /说不清（EACCES）/u);
@@ -18798,6 +18818,12 @@ test("⑦ 入站默认处理器（issue #88）：分类五态不折叠；doctor 
   const after = JSON.parse(fs.readFileSync(file, "utf-8"));
   assert.deepEqual([after.routes[0].handler, after.routes[0].note, after.routes[0].default, after.routes[1].handler, after.sessions], [viaLink, "runtime/current 默认处理器", true, outside, { s1: "cc2cd" }], "只动默认那条，其余原样");
   assert.deepEqual(restoreDefaultRoute({ handler: viaLink, file }), { ok: true, changed: false, id: "self", handler: viaLink }, "幂等");
+  // 评审反例：handler 已对、只换备注也是一次变更（旧的 shadow-probe 备注不能留在表里）
+  const noteOnly = restoreDefaultRoute({ handler: viaLink, note: "换个备注", file, now: new Date("2026-08-29T00:00:01.000Z") });
+  assert.deepEqual([noteOnly.ok, noteOnly.changed, noteOnly.handlerChanged, noteOnly.noteChanged], [true, true, false, true], JSON.stringify(noteOnly));
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf-8")).routes[0].note, "换个备注");
+  assert.ok(fs.existsSync(noteOnly.backup), "只换备注也先备份");
+  assert.equal(restoreDefaultRoute({ handler: viaLink, note: "换个备注", file }).changed, false, "备注相同才算幂等");
   assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "runtime");
   write({ routes: [{ id: "a", handler: outside }, { id: "b", handler: outside }] });
   assert.equal(restoreDefaultRoute({ handler: viaLink, file }).reason, "no_default_route");
@@ -18809,14 +18835,32 @@ test("⑦ 入站默认处理器（issue #88）：分类五态不折叠；doctor 
   m.writeTables({ projects, routes: [{ ...m.route("good"), default: true, note: "main@7fd5d2d shadow probe" }], sessions: {}, providers: [m.provider("good")] });
   let c = checkOf(doctorReport(m.run()), "default_route_handler");
   assert.equal(c.ok, false, c.detail);
-  assert.match(c.detail, /处理器在运行时之外：.*provider-ok\.mjs（备注：main@7fd5d2d shadow probe） —— 装到 runtime\/current 的代码没在处理入站/u, c.detail);
-  assert.match(c.next, /register-route\.mjs --restore-default/u);
+  assert.match(c.detail, /处理器不是装好的运行时：.*provider-ok\.mjs（备注：main@7fd5d2d shadow probe）；.* —— 装到 runtime\/current 的代码没在处理入站/u, c.detail);
+  assert.match(c.next, /register-route\.mjs --restore-default --routes \S+ --handler \S+/u, c.next);
+  // doctor 给的恢复命令必须真能跑，而且只改它说的那张表
+  const nextArgs = c.next.match(/register-route\.mjs (--restore-default --routes \S+ --handler \S+)/u)[1].split(" ");
+  assert.equal(nextArgs[2], m.files.routes, "--routes 就是 doctor 查的那张表");
+  const otherTable = path.join(m.home, "other-routes.json");
+  fs.writeFileSync(otherTable, JSON.stringify({ routes: [{ id: "other", handler: m.route("good").handler, default: true }] }));
+  const preview = spawnSync(process.execPath, [path.resolve("scripts", "register-route.mjs"), ...nextArgs], { encoding: "utf-8", env: { ...process.env, HOME: m.home } });
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.match(preview.stdout, /\[dry-run\] 什么都没写/u);
+  const applied = spawnSync(process.execPath, [path.resolve("scripts", "register-route.mjs"), ...nextArgs, "--apply"], { encoding: "utf-8", env: { ...process.env, HOME: m.home } });
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(m.files.routes, "utf-8")).routes[0].handler, nextArgs[4], "改的是 doctor 说的那张表");
+  assert.equal(JSON.parse(fs.readFileSync(otherTable, "utf-8")).routes[0].handler, m.route("good").handler, "别的表一个字没动");
+  assert.equal(checkOf(doctorReport(m.run()), "default_route_handler").ok, true, "按 next 恢复后 ⑦ 变绿");
+  const noRoutesArg = spawnSync(process.execPath, [path.resolve("scripts", "register-route.mjs"), "--restore-default", "--handler", nextArgs[4]], { encoding: "utf-8", env: { ...process.env, HOME: m.home } });
+  assert.equal(noRoutesArg.status, 2, "不给 --routes 就拒，不默认落到 Claude 那张表");
   m.writeTables({ projects, routes: [{ id: "a", handler: m.route("good").handler }, { id: "b", handler: m.route("good").handler }], sessions: {}, providers: [m.provider("a"), m.provider("b")] });
   c = checkOf(doctorReport(m.run()), "default_route_handler");
   assert.deepEqual([c.ok, /没有默认路由/u.test(c.detail)], [false, true], c.detail);
   fs.rmSync(m.files.routes);
   c = checkOf(doctorReport(m.run()), "default_route_handler");
   assert.deepEqual([c.ok, /没有路由表，分发器用运行时自带的默认处理器/u.test(c.detail)], [true, true], c.detail);
+  m.writeTables({ projects, routes: [], sessions: {}, providers: [] });
+  c = checkOf(doctorReport(m.run()), "default_route_handler");
+  assert.deepEqual([c.ok, /路由表里没有启用的路由，分发器用运行时自带的默认处理器/u.test(c.detail)], [true, true], "空表 = 运行时默认：" + c.detail);
 });
 
 

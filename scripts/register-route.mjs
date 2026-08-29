@@ -11,6 +11,7 @@
  *   node scripts/register-route.mjs --id cc2cd --handler /abs/path.mjs --session <sid> --apply
  */
 
+import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
 import { registerRouteBinding, loadRoutes, restoreDefaultRoute, routesPath } from "./inbound-routes.mjs";
 
@@ -50,8 +51,13 @@ function main() {
   // --restore-default：把默认路由的处理器改回给定路径（issue #88 的受控入口；切权威路由，Frank 授权后才 --apply）
   if (process.argv.includes("--restore-default")) {
     const handler = arg("handler");
-    if (!handler) { console.error("用法：node scripts/register-route.mjs --restore-default --handler <绝对路径> [--note <说明>] [--apply]"); process.exit(2); }
-    const file = routesPath();
+    const routesArg = arg("routes");
+    // 路由表必须显式给且是绝对路径：两条链各有一张表，默认值只会指向 Claude 那张 —— Codex doctor 抄来的命令不该改错表。
+    if (!handler || !routesArg || !path.isAbsolute(routesArg) || !path.isAbsolute(handler)) {
+      console.error("用法：node scripts/register-route.mjs --restore-default --routes <路由表绝对路径> --handler <处理器绝对路径> [--note <说明>] [--apply]");
+      process.exit(2);
+    }
+    const file = routesArg;
     const table = loadRoutes(file);
     const current = table.ok ? (table.routes.find((r) => r.isDefault) ?? (table.routes.length === 1 ? table.routes[0] : null)) : null;
     console.log("路由表  ：" + file);

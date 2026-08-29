@@ -100,15 +100,17 @@ try { hooks = JSON.parse(fs.readFileSync(hooksFile, "utf-8")); } catch { /* 下�
 const RUNTIME_CURRENT = path.join(RUNTIME_ROOT, "current");
 // 入站默认处理器必须就是装好的运行时（issue #88：装了 ≠ 在跑）—— 与 Claude 侧同一份判据 defaultRouteHandler。
 {
-  const d = defaultRouteHandler({ file: path.join(home, "routes.json"), runtimeCurrent: RUNTIME_CURRENT });
+  const codexRoutes = path.join(home, "routes.json");
+  const expectedHandler = path.join(RUNTIME_CURRENT, "scripts", "codex", "inbound.mjs");
+  const d = defaultRouteHandler({ file: codexRoutes, runtimeCurrent: RUNTIME_CURRENT, expectedHandler });
   add("入站默认处理器",
     d.status === "runtime" || d.status === "no_routes" ? true : d.status === "unreadable" ? null : false,
     d.status === "runtime" ? "默认路由 " + d.id + " → 装好的运行时"
-      : d.status === "no_routes" ? "没有路由表，分发器用运行时自带的默认处理器"
-      : d.status === "outside" ? "默认路由 " + d.id + " 的处理器在运行时之外：" + d.handler + (d.note ? "（备注：" + d.note + "）" : "") + " —— 装到 runtime/current 的代码没在处理入站"
+      : d.status === "no_routes" ? d.why + "，分发器用运行时自带的默认处理器"
+      : d.status === "outside" ? "默认路由 " + d.id + " 的处理器不是装好的运行时：" + d.handler + (d.note ? "（备注：" + d.note + "）" : "") + "；" + d.why + " —— 装到 runtime/current 的代码没在处理入站"
       : d.status === "no_default" ? "没有默认路由（" + d.why + "）—— 未登记话题会被拒"
       : "路由表读不出来，查不清（" + d.why + "）",
-    d.status === "outside" || d.status === "no_default" ? "node scripts/register-route.mjs --restore-default --handler " + path.join(RUNTIME_CURRENT, "scripts", "codex", "inbound.mjs") + "（预览；Frank 授权后加 --apply）" : null);
+    d.status === "outside" || d.status === "no_default" ? "node scripts/register-route.mjs --restore-default --routes " + codexRoutes + " --handler " + expectedHandler + " （预览；切权威路由，Frank 授权后自行加 --apply）" : null);
 }
 
 /**

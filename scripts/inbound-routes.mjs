@@ -306,25 +306,33 @@ export function registerSession({ sessionId, routeId, file = routesPath() }) {
  *   unreadable  表读不出来
  * others 列出非默认路由里处理器在运行时之外的（cc2cd 那种可能是有意的，按备注分辨）。
  */
-export function defaultRouteHandler({ file = routesPath(), runtimeCurrent } = {}) {
+export function defaultRouteHandler({ file = routesPath(), runtimeCurrent, expectedHandler = null } = {}) {
   if (typeof runtimeCurrent !== "string" || !runtimeCurrent) return { status: "unreadable", why: "runtimeCurrent 缺失" };
   const table = loadRoutes(file);
   if (!table.ok) return { status: "unreadable", why: String(table.reason ?? "说不清") + (table.problem ? "：" + table.problem : "") };
-  if (table.reason === "no_routes") return { status: "no_routes", handler: null, others: [] };
-  const under = (handler) => {
-    if (typeof handler !== "string") return false;
-    const want = path.resolve(runtimeCurrent) + path.sep;
-    if (path.resolve(handler).startsWith(want)) return true;
-    try {
-      const real = fs.realpathSync(handler);
-      const realRoot = fs.realpathSync(runtimeCurrent) + path.sep;
-      return real.startsWith(realRoot);
-    } catch { return false; }
+  // 没有表、或表里没有一条启用路由：分发器都用运行时自带的默认处理器（与 inbound-dispatcher 的 routes.length > 0 判据一致）
+  if (table.reason === "no_routes" || table.routes.length === 0) return { status: "no_routes", handler: null, others: [], why: table.reason === "no_routes" ? "没有路由表" : "路由表里没有启用的路由" };
+  // **只认解析得到的普通文件的 realpath。**按路径字符串前缀判会假绿：runtime 目录下不存在的文件、
+  // runtime 目录里一条指向外部的符号链接，都能"以 runtime/current 开头"。
+  const realFile = (p) => {
+    try { const real = fs.realpathSync(p); return fs.statSync(real).isFile() ? real : null; } catch { return null; }
   };
-  const others = table.routes.filter((r) => !r.isDefault && !under(r.handler)).map((r) => ({ id: r.id, handler: r.handler, note: r.note }));
+  let realRoot = null;
+  try { realRoot = fs.realpathSync(runtimeCurrent); } catch { /* 运行时没装：任何 handler 都不可能在它之下 */ }
+  const expectedReal = expectedHandler ? realFile(expectedHandler) : null;
+  const judge = (handler) => {
+    if (typeof handler !== "string") return { under: false, why: "handler 不是字符串" };
+    const real = realFile(handler);
+    if (real === null) return { under: false, why: "不是可解析的普通文件（缺失 / 断链 / 不是文件）" };
+    if (realRoot === null || !real.startsWith(realRoot + path.sep)) return { under: false, why: "实际文件在运行时之外：" + real };
+    if (expectedHandler !== null && real !== expectedReal) return { under: false, why: "在运行时目录里但不是这条链预期的处理器（" + String(expectedHandler) + "）：" + real };
+    return { under: true, why: null };
+  };
+  const others = table.routes.filter((r) => !r.isDefault && !judge(r.handler).under).map((r) => ({ id: r.id, handler: r.handler, note: r.note }));
   const dflt = table.routes.find((r) => r.isDefault) ?? (table.routes.length === 1 ? table.routes[0] : null);
   if (!dflt) return { status: "no_default", handler: null, others, why: table.routes.length + " 条路由都没标 default" };
-  return { status: under(dflt.handler) ? "runtime" : "outside", id: dflt.id, handler: dflt.handler, note: dflt.note, others };
+  const verdict = judge(dflt.handler);
+  return { status: verdict.under ? "runtime" : "outside", id: dflt.id, handler: dflt.handler, note: dflt.note, why: verdict.why, others };
 }
 
 /**
@@ -348,15 +356,17 @@ export function restoreDefaultRoute({ handler, note = null, file = routesPath(),
     const routes = Array.isArray(read.doc.routes) ? read.doc.routes.filter((r) => isPlainObject(r) && r.enabled !== false) : [];
     const dflt = routes.find((r) => r.default === true) ?? (routes.length === 1 ? routes[0] : null);
     if (!dflt) return { ok: false, reason: "no_default_route" };
-    if (dflt.handler === handler) return { ok: true, changed: false, id: dflt.id, handler };
+    const handlerChanged = dflt.handler !== handler;
+    const noteChanged = note !== null && (dflt.note ?? null) !== note;
+    if (!handlerChanged && !noteChanged) return { ok: true, changed: false, id: dflt.id, handler };
     const backup = file + ".bak." + now.toISOString().replace(/[:.]/gu, "-");
     try { fs.copyFileSync(file, backup); } catch (err) { return { ok: false, reason: "backup_failed", error: err.message }; }
     const from = dflt.handler;
     dflt.handler = handler;
-    if (note !== null) dflt.note = note;
+    if (noteChanged) dflt.note = note;
     const wrote = writeRoutesDoc(read.doc, file);
     if (!wrote.ok) return wrote;
-    return { ok: true, changed: true, id: dflt.id, from, handler, backup };
+    return { ok: true, changed: true, handlerChanged, noteChanged, id: dflt.id, from, handler, backup };
   } finally {
     releasePublishLock(lockDir);
   }

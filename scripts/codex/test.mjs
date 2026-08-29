@@ -2911,9 +2911,20 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
   const drifted = JSON.parse(run().stdout);
   const rc = routeCheck(drifted);
   assert.equal(rc?.ok, false, JSON.stringify(rc));
-  assert.match(rc.detail, /处理器在运行时之外：.*dialogue-shadow-handler\.mjs（备注：main@7fd5d2d shadow probe） —— 装到 runtime\/current 的代码没在处理入站/u, rc.detail);
-  assert.match(rc.next, /register-route\.mjs --restore-default --handler .*codex\/inbound\.mjs/u, rc.next);
+  assert.match(rc.detail, /处理器不是装好的运行时：.*dialogue-shadow-handler\.mjs（备注：main@7fd5d2d shadow probe）；.* —— 装到 runtime\/current 的代码没在处理入站/u, rc.detail);
+  assert.match(rc.next, /register-route\.mjs --restore-default --routes \S+ --handler \S+codex\/inbound\.mjs/u, rc.next);
   assert.equal(drifted.checks.some((c) => c.ok === false), true);
+  // Codex doctor 给的恢复命令必须改 Codex 那张表，而不是默认落到 Claude 的表
+  const nextArgs = rc.next.match(/register-route\.mjs (--restore-default --routes \S+ --handler \S+)/u)[1].split(" ");
+  assert.equal(nextArgs[2], path.join(home, "routes.json"));
+  const claudeTable = path.join(dir, "claude-home", ".claude", "feishu-bridge", "routes.json");
+  fs.mkdirSync(path.dirname(claudeTable), { recursive: true });
+  fs.writeFileSync(claudeTable, JSON.stringify({ routes: [{ id: "self", handler: shadow, default: true }] }));
+  const applied = spawnSync(process.execPath, [path.join(ROOT, "scripts", "register-route.mjs"), ...nextArgs, "--apply"], { encoding: "utf-8", env: { ...isolatedEnv(), HOME: path.join(dir, "claude-home"), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(home, "routes.json"), "utf-8")).routes[0].handler, nextArgs[4], "改的是 Codex 的表");
+  assert.equal(JSON.parse(fs.readFileSync(claudeTable, "utf-8")).routes[0].handler, shadow, "Claude 的表一个字没动");
+  assert.equal(routeCheck(JSON.parse(run().stdout))?.ok, true, "按 next 恢复后变绿");
   fs.rmSync(path.join(home, "routes.json"));
   // 查不清的那几项要出现在待办里，不能被藏起来。
   assert.ok(healthy.next.some((n) => /hooks/u.test(n)),

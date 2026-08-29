@@ -293,6 +293,76 @@ export function registerSession({ sessionId, routeId, file = routesPath() }) {
 }
 
 /**
+ * 默认路由的处理器到底是谁 —— 这是"装了 ≠ 在跑"的那个缺口（issue #88）：
+ * 分发器以表里 default 的那条为准，只有表为空时才回退运行时自带的处理器；表是安装器不管理的机器状态。
+ * 2026-08-23 起两条链的默认处理器被换成一个 import 别的克隆的包装脚本，装到 runtime/current 的代码 5 天没接管入站，
+ * 而"路由存在且启用"两项检查全绿。
+ *
+ * 分类（三态以上，不折叠）：
+ *   no_routes   没有路由表 → 分发器用运行时自带默认处理器（正常）
+ *   runtime     默认处理器在 runtimeCurrent 之下（按路径或 realpath 任一命中）
+ *   outside     默认处理器在运行时之外 —— 装的运行时没在处理入站
+ *   no_default  有路由但没有默认路由（多于一条且都没标 default）→ 未登记话题会被拒
+ *   unreadable  表读不出来
+ * others 列出非默认路由里处理器在运行时之外的（cc2cd 那种可能是有意的，按备注分辨）。
+ */
+export function defaultRouteHandler({ file = routesPath(), runtimeCurrent } = {}) {
+  if (typeof runtimeCurrent !== "string" || !runtimeCurrent) return { status: "unreadable", why: "runtimeCurrent 缺失" };
+  const table = loadRoutes(file);
+  if (!table.ok) return { status: "unreadable", why: String(table.reason ?? "说不清") + (table.problem ? "：" + table.problem : "") };
+  if (table.reason === "no_routes") return { status: "no_routes", handler: null, others: [] };
+  const under = (handler) => {
+    if (typeof handler !== "string") return false;
+    const want = path.resolve(runtimeCurrent) + path.sep;
+    if (path.resolve(handler).startsWith(want)) return true;
+    try {
+      const real = fs.realpathSync(handler);
+      const realRoot = fs.realpathSync(runtimeCurrent) + path.sep;
+      return real.startsWith(realRoot);
+    } catch { return false; }
+  };
+  const others = table.routes.filter((r) => !r.isDefault && !under(r.handler)).map((r) => ({ id: r.id, handler: r.handler, note: r.note }));
+  const dflt = table.routes.find((r) => r.isDefault) ?? (table.routes.length === 1 ? table.routes[0] : null);
+  if (!dflt) return { status: "no_default", handler: null, others, why: table.routes.length + " 条路由都没标 default" };
+  return { status: under(dflt.handler) ? "runtime" : "outside", id: dflt.id, handler: dflt.handler, note: dflt.note, others };
+}
+
+/**
+ * 把默认路由的处理器改回给定路径（受控入口，替代手改 JSON）。
+ * 只动默认那一条；先把整张表备份成 <file>.bak.<时间>；同锁、同原子写。
+ * 换默认路由是切权威路由 —— 命令行默认只预览，--apply 才写，且要 Frank 逐次授权。
+ */
+export function restoreDefaultRoute({ handler, note = null, file = routesPath(), now = new Date() } = {}) {
+  if (typeof handler !== "string" || !path.isAbsolute(handler)) return { ok: false, reason: "handler_not_absolute" };
+  let stat;
+  try { stat = fs.statSync(handler); } catch { return { ok: false, reason: "handler_missing", handler }; }
+  if (!stat.isFile()) return { ok: false, reason: "handler_not_a_file", handler };
+  try { fs.accessSync(handler, fs.constants.R_OK); } catch { return { ok: false, reason: "handler_not_readable", handler }; }
+  const lockDir = routesLockDir(file);
+  const lock = acquirePublishLock(lockDir);
+  if (!lock.ok) return { ok: false, reason: "routes_busy" };
+  try {
+    const read = readRoutesDoc(file);
+    if (!read.ok) return { ok: false, reason: read.reason, error: read.error };
+    if (read.doc === null) return { ok: false, reason: "no_routes" };
+    const routes = Array.isArray(read.doc.routes) ? read.doc.routes.filter((r) => isPlainObject(r) && r.enabled !== false) : [];
+    const dflt = routes.find((r) => r.default === true) ?? (routes.length === 1 ? routes[0] : null);
+    if (!dflt) return { ok: false, reason: "no_default_route" };
+    if (dflt.handler === handler) return { ok: true, changed: false, id: dflt.id, handler };
+    const backup = file + ".bak." + now.toISOString().replace(/[:.]/gu, "-");
+    try { fs.copyFileSync(file, backup); } catch (err) { return { ok: false, reason: "backup_failed", error: err.message }; }
+    const from = dflt.handler;
+    dflt.handler = handler;
+    if (note !== null) dflt.note = note;
+    const wrote = writeRoutesDoc(read.doc, file);
+    if (!wrote.ok) return wrote;
+    return { ok: true, changed: true, id: dflt.id, from, handler, backup };
+  } finally {
+    releasePublishLock(lockDir);
+  }
+}
+
+/**
  * 原子写。写到一半被打断会让整张表截断 —— 那不只是某条路由坏了，是入站全挂。
  *
  * 写之前再校验一遍：任何路径都不该把一张解释不了的表落到盘上。

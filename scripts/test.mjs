@@ -8,7 +8,6 @@
  */
 
 import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry, normalizeControlText } from "./control-command.mjs";
-import { describePendingWindow } from "./layered-status.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
@@ -111,10 +110,7 @@ import { composeAsk, isInitPrompt } from "./init-hook.mjs";
 import {
   composeTransportRule, isAilyTransportTurn, isBridgeOwnedTurn,
 } from "./inbound-hook.mjs";
-import {
-  ROUTE_REJECT, loadRoutes, registerRoute, registerRouteBinding, registerSession, selectRoute,
-  validateRoutesDoc,
-} from "./inbound-routes.mjs";
+import { ROUTE_REJECT, loadRoutes, registerRoute, registerRouteBinding, registerSession, selectRoute, validateRoutesDoc, defaultRouteHandler, restoreDefaultRoute } from "./inbound-routes.mjs";
 import {
   CANONICAL_EVENT_ENV, CANONICAL_EVENT_ENV as CANONICAL_PASS, buildCanonicalEvent, inheritedCanonicalEvent, legacyEventFromCanonical, validateCanonicalEvent,
 } from "./canonical-event.mjs";
@@ -129,8 +125,9 @@ import {
 } from "./subscription-sync-apply.mjs";
 import { renderSubscriptions, subscriptionDetails } from "./feishu-subscribe.mjs";
 import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
+import { describePendingWindow } from "./layered-status.mjs";
 import {
-  ENDPOINT_SELF_CHECK, SELF_CHECK_TEXT, composeLayeredStatus, endpointFacts, outboundRoutingFact,
+  ENDPOINT_SELF_CHECK, SELF_CHECK_TEXT, composeLayeredStatus, endpointFacts, inboundHandlerText, outboundRoutingFact,
   redactRunText, runChannelRows,
   lastSuccessfulDispatchAt, renderLayeredStatus, splitByRelation, subscriptionFacts,
 } from "./layered-status.mjs";
@@ -16668,11 +16665,14 @@ test("doctor：好机器 —— 全部 pass、退出码 0；沙箱里不注入 l
   const good = m.project("good", { expiresAt: "2099-01-01T00:00:00.000Z" });
   m.writeTables({
     projects: [{ id: "good", root: good, root_message_id: "om_root_good", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }],
-    routes: [m.route("good")], sessions: { "session_aaaaaaaaaaaa": "good" }, providers: [m.provider("good")],
+    // 好机器的默认路由处理器就是装好的运行时（issue #88 之后 ⑦ 要查这个）
+    routes: [{ ...m.route("good"), handler: path.join(m.home, ".claude", "feishu-bridge", "runtime", "current", "scripts", "inbound.mjs"), default: true }],
+    sessions: { "session_aaaaaaaaaaaa": "good" }, providers: [m.provider("good")],
   });
   // 沙箱、没注入 launchctl：兜底定时器两项都 unknown → incomplete、退出码 2，但没有一项 fail。
   const r2 = m.run();
   const rep2 = doctorReport(r2);
+  assert.equal(checkOf(rep2, "default_route_handler").ok, true, checkOf(rep2, "default_route_handler").detail);
   assert.equal(r2.status, 2, "incomplete → 退出码 2：" + r2.stderr);
   assert.equal(rep2.overall, "incomplete");
   assert.equal(rep2.checks.some((c) => c.ok === false), false, JSON.stringify(rep2.checks.filter((c) => c.ok === false)));
@@ -18751,6 +18751,74 @@ test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进
     assert.notEqual(controlIntentProblem(badIntent), null, JSON.stringify(badIntent));
   }
 });
+
+test("⑦ 入站默认处理器（issue #88）：分类五态不折叠；doctor 与状态页据此报；受控恢复只动默认路由且先备份", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-routes-default-"));
+  const rt = path.join(home, "runtime");
+  fs.mkdirSync(path.join(rt, "versions", "v1", "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(rt, "versions", "v1", "scripts", "inbound.mjs"), "// runtime handler\n");
+  fs.symlinkSync(path.join("versions", "v1"), path.join(rt, "current"));
+  const runtimeCurrent = path.join(rt, "current");
+  const viaLink = path.join(runtimeCurrent, "scripts", "inbound.mjs");
+  const viaReal = path.join(rt, "versions", "v1", "scripts", "inbound.mjs");
+  const outside = path.join(home, "shadow.mjs"); fs.writeFileSync(outside, "// clone wrapper\n");
+  const file = path.join(home, "routes.json");
+  const write = (doc) => fs.writeFileSync(file, JSON.stringify(doc));
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "no_routes");
+  write({ routes: [{ id: "self", handler: viaLink, default: true }, { id: "cc2cd", handler: outside }] });
+  let d = defaultRouteHandler({ file, runtimeCurrent });
+  assert.deepEqual([d.status, d.id, d.others.map((o) => o.id)], ["runtime", "self", ["cc2cd"]]);
+  write({ routes: [{ id: "self", handler: viaReal, default: true }] });
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "runtime", "realpath 命中");
+  write({ routes: [{ id: "self", handler: outside, default: true, note: "shadow probe" }, { id: "cc2cd", handler: outside }] });
+  d = defaultRouteHandler({ file, runtimeCurrent });
+  assert.deepEqual([d.status, d.id, d.handler, d.note], ["outside", "self", outside, "shadow probe"]);
+  write({ routes: [{ id: "only", handler: viaLink }] });
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "runtime");
+  write({ routes: [{ id: "a", handler: viaLink }, { id: "b", handler: outside }] });
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "no_default");
+  fs.writeFileSync(file, "{broken");
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "unreadable");
+  assert.equal(defaultRouteHandler({ file }).status, "unreadable", "没给 runtimeCurrent 也不猜");
+  assert.match(inboundHandlerText({ status: "runtime", id: "self" }), /runtime\/current（默认路由 self）/u);
+  assert.match(inboundHandlerText({ status: "outside", handler: outside, note: "shadow probe" }), /运行时之外：shadow\.mjs（shadow probe） —— 装的运行时没在处理入站/u);
+  assert.match(inboundHandlerText({ status: "no_routes" }), /运行时自带默认处理器/u);
+  assert.match(inboundHandlerText({ status: "no_default" }), /没有默认路由/u);
+  assert.match(inboundHandlerText({ status: "unreadable", why: "EACCES" }), /说不清（EACCES）/u);
+  assert.equal(inboundHandlerText(null), "说不清");
+  write({ routes: [{ id: "self", handler: outside, default: true }] });
+  const facts = endpointFacts({ runtimeDir: rt, routesFile: file, inboundLog: path.join(home, "none.log"), verify: () => ({ ok: true, version: "v1" }) });
+  assert.equal(facts.inboundHandler.status, "outside");
+  write({ routes: [{ id: "self", handler: outside, default: true, note: "shadow" }, { id: "cc2cd", handler: outside }], sessions: { s1: "cc2cd" } });
+  assert.equal(restoreDefaultRoute({ handler: path.join(home, "nope.mjs"), file }).reason, "handler_missing");
+  const restored = restoreDefaultRoute({ handler: viaLink, note: "runtime/current 默认处理器", file, now: new Date("2026-08-29T00:00:00.000Z") });
+  assert.deepEqual([restored.ok, restored.changed, restored.id, restored.from], [true, true, "self", outside], JSON.stringify(restored));
+  assert.equal(restored.backup, file + ".bak.2026-08-29T00-00-00-000Z");
+  assert.equal(JSON.parse(fs.readFileSync(restored.backup, "utf-8")).routes[0].handler, outside, "备份是改前的表");
+  const after = JSON.parse(fs.readFileSync(file, "utf-8"));
+  assert.deepEqual([after.routes[0].handler, after.routes[0].note, after.routes[0].default, after.routes[1].handler, after.sessions], [viaLink, "runtime/current 默认处理器", true, outside, { s1: "cc2cd" }], "只动默认那条，其余原样");
+  assert.deepEqual(restoreDefaultRoute({ handler: viaLink, file }), { ok: true, changed: false, id: "self", handler: viaLink }, "幂等");
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "runtime");
+  write({ routes: [{ id: "a", handler: outside }, { id: "b", handler: outside }] });
+  assert.equal(restoreDefaultRoute({ handler: viaLink, file }).reason, "no_default_route");
+  fs.rmSync(file);
+  assert.equal(restoreDefaultRoute({ handler: viaLink, file }).reason, "no_routes");
+  const m = doctorMachine({ installRuntime: true });
+  const good = m.project("good", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  const projects = [{ id: "good", root: good, root_message_id: "om_root_good", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }];
+  m.writeTables({ projects, routes: [{ ...m.route("good"), default: true, note: "main@7fd5d2d shadow probe" }], sessions: {}, providers: [m.provider("good")] });
+  let c = checkOf(doctorReport(m.run()), "default_route_handler");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /处理器在运行时之外：.*provider-ok\.mjs（备注：main@7fd5d2d shadow probe） —— 装到 runtime\/current 的代码没在处理入站/u, c.detail);
+  assert.match(c.next, /register-route\.mjs --restore-default/u);
+  m.writeTables({ projects, routes: [{ id: "a", handler: m.route("good").handler }, { id: "b", handler: m.route("good").handler }], sessions: {}, providers: [m.provider("a"), m.provider("b")] });
+  c = checkOf(doctorReport(m.run()), "default_route_handler");
+  assert.deepEqual([c.ok, /没有默认路由/u.test(c.detail)], [false, true], c.detail);
+  fs.rmSync(m.files.routes);
+  c = checkOf(doctorReport(m.run()), "default_route_handler");
+  assert.deepEqual([c.ok, /没有路由表，分发器用运行时自带的默认处理器/u.test(c.detail)], [true, true], c.detail);
+});
+
 
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

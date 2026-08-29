@@ -2902,6 +2902,19 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
   assert.equal(healthy.checks.some((c) => c.ok === false), false,
     "**一条真故障都不该有** —— incomplete 是因为有 null，不是因为有 false");
   assert.ok(healthy.checks.some((c) => c.ok === null), "确实存在查不清的项");
+  // issue #88：入站默认处理器 —— 没有路由表时 ✓；默认路由指到运行时之外 → ✗ 且指路受控恢复
+  const routeCheck = (r) => r.checks.find((c) => c.name === "入站默认处理器");
+  assert.equal(routeCheck(healthy)?.ok, true, JSON.stringify(routeCheck(healthy)));
+  const shadow = path.join(home, "dialogue-shadow-handler.mjs");
+  fs.writeFileSync(shadow, "// clone wrapper\n");
+  fs.writeFileSync(path.join(home, "routes.json"), JSON.stringify({ schema_version: "1.0", routes: [{ id: "codex", handler: shadow, default: true, note: "main@7fd5d2d shadow probe" }], sessions: {} }));
+  const drifted = JSON.parse(run().stdout);
+  const rc = routeCheck(drifted);
+  assert.equal(rc?.ok, false, JSON.stringify(rc));
+  assert.match(rc.detail, /处理器在运行时之外：.*dialogue-shadow-handler\.mjs（备注：main@7fd5d2d shadow probe） —— 装到 runtime\/current 的代码没在处理入站/u, rc.detail);
+  assert.match(rc.next, /register-route\.mjs --restore-default --handler .*codex\/inbound\.mjs/u, rc.next);
+  assert.equal(drifted.checks.some((c) => c.ok === false), true);
+  fs.rmSync(path.join(home, "routes.json"));
   // 查不清的那几项要出现在待办里，不能被藏起来。
   assert.ok(healthy.next.some((n) => /hooks/u.test(n)),
     "hook 信任那条必须出现在下一步里：" + JSON.stringify(healthy.next));

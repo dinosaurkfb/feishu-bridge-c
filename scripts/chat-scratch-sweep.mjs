@@ -43,6 +43,7 @@ export function describeScratchSweep(r, { apply }) {
   const lines = [];
   if (!r.ok) {
     if (r.reason === "ledger_dir_unverified") lines.push("账本目录不受验，没动：" + String(r.why ?? ""));
+    else if (r.reason === "ledger_dir_changed") lines.push("账本目录在校验之后被换掉，没动：" + String(r.why ?? ""));
     else if (r.reason === "chat_admission_busy") lines.push("账本锁正被持有（另一笔事务在跑），这次没动；稍后再试");
     else lines.push("没拿到账本锁（" + String(r.reason) + (r.why ? "：" + r.why : "") + "），这次没动");
     return lines.join("\n");

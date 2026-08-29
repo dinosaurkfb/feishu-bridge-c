@@ -51,6 +51,8 @@ const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 export const TMP_NAME_SHAPE = new RegExp("^[0-9a-f]{64}\\.\\d+\\.\\d+\\." + UUID + "$", "u");
 /** 临时文件条目的全部合法形状：原名，或 sweep 隔离时追加的 .quarantine-<uuid>（可叠加：隔离后没删成、再次隔离） */
 const TMP_ENTRY_SHAPE = new RegExp("^[0-9a-f]{64}\\.\\d+\\.\\d+\\." + UUID + "(\\.quarantine-" + UUID + ")*$", "u");
+/** 归属不明的制品：隔离后身份对不上（盘点与隔离之间被换过）→ 再改名成 .unknown-<uuid> 持久标记；自动维护永不再碰，准入说不清，只人工处置。 */
+const UNKNOWN_ENTRY_SHAPE = new RegExp("^[0-9a-f]{64}\\.\\d+\\.\\d+\\." + UUID + "(\\.quarantine-" + UUID + ")+\\.unknown-" + UUID + "$", "u");
 const BASE_KEYS = ["chain", "key", "message_id", "pid", "risk_class", "role", "schema_version", "sender_ref", "session_id", "started_at", "state"];
 const ANSWERED_KEYS = [...BASE_KEYS, "elapsed_ms", "recorded_at", "text"].sort().join(",");
 const FAILED_KEYS = Object.freeze({
@@ -167,6 +169,7 @@ export function chatLoad({ ledgerDir, senderId, now = Date.now(), budgetMs }) {
   let running = 0; let bySender = 0; let unresolved = 0; const why = [];
   for (const n of names) {
     if (isAdmissionLockEntry(n)) continue;
+    if (UNKNOWN_ENTRY_SHAPE.test(n)) { unresolved += 1; why.push("归属不明的制品（隔离时身份对不上，只能人工处置）" + n.slice(0, 20) + "…"); continue; }
     if (TMP_ENTRY_SHAPE.test(n)) {
       // 只跳过**受验的普通文件**；临时名字上挂着符号链接 / 目录 / 管道就是说不清，不折成可用
       let st = null;
@@ -196,6 +199,7 @@ function scanTmp(ledgerDir, now) {
   catch (err) { return { ok: err?.code === "ENOENT", why: err?.code === "ENOENT" ? null : "目录读不出：" + String(err.code ?? err.message), entries: [] }; }
   const entries = [];
   for (const n of names) {
+    if (UNKNOWN_ENTRY_SHAPE.test(n)) { entries.push({ name: n, kind: "unknown", why: "归属不明（隔离时身份对不上），自动维护不碰，请人工核对后删除：" + path.join(ledgerDir, n) }); continue; }
     if (!TMP_ENTRY_SHAPE.test(n)) continue;
     let st;
     try { st = fs.lstatSync(path.join(ledgerDir, n)); }
@@ -216,6 +220,7 @@ export function inspectScratch({ ledgerDir, now = Date.now() }) {
   if (!scan.ok) return { inflight: 0, problems: [scan.why] };
   let inflight = 0; const problems = [];
   for (const e of scan.entries) {
+    if (e.kind === "unknown") { problems.push("归属不明的制品：" + e.why); continue; }
     if (e.kind === "unclear") { problems.push("临时文件位置上说不清的条目（" + e.why + "，不动）：" + e.name.slice(0, 40)); continue; }
     if (e.ageMs <= TMP_RESIDUE_AGE_MS) { inflight += 1; continue; }
     problems.push("scratch 残骸（超过 " + Math.round(TMP_RESIDUE_AGE_MS / 1000) + " 秒仍在）" + e.name.slice(0, 20) + "…：不影响准入，用 node scripts/chat-scratch-sweep.mjs --ledger " + shellQuote(realLedgerPath(ledgerDir)) + " 清（先预览，再加 --apply）");
@@ -228,15 +233,27 @@ export function inspectScratch({ ledgerDir, now = Date.now() }) {
  * @returns {null | string} 通过返回 null，否则返回原因
  */
 export function ledgerDirProblem(ledgerDir) {
-  if (typeof ledgerDir !== "string" || ledgerDir.length === 0) return "账本目录缺失";
-  if (!path.isAbsolute(ledgerDir)) return "账本目录必须是绝对路径";
+  return verifyLedgerDir(ledgerDir).problem;
+}
+/** 同上，但把通过时的目录身份（dev/ino）带回来 —— 取锁之后要用它重核（校验与操作之间目录可能被换）。 */
+function verifyLedgerDir(ledgerDir) {
+  if (typeof ledgerDir !== "string" || ledgerDir.length === 0) return { problem: "账本目录缺失", identity: null };
+  if (!path.isAbsolute(ledgerDir)) return { problem: "账本目录必须是绝对路径", identity: null };
+  let st;
+  try { st = fs.lstatSync(ledgerDir); } catch (err) { return { problem: "账本目录 lstat 失败：" + String(err?.code ?? err?.message ?? err), identity: null }; }
+  if (st.isSymbolicLink()) return { problem: "账本目录是符号链接（别名），不动", identity: null };
+  if (!st.isDirectory()) return { problem: "账本目录不是目录", identity: null };
+  let real;
+  try { real = fs.realpathSync(ledgerDir); } catch (err) { return { problem: "账本目录 realpath 失败：" + String(err?.code ?? err?.message ?? err), identity: null }; }
+  if (real !== ledgerDir) return { problem: "账本目录路径里有符号链接（真实路径不同），请用真实路径", identity: null };
+  return { problem: null, identity: { dev: st.dev, ino: st.ino } };
+}
+/** 取锁之后重核目录身份：还是同一个目录（lstat 非符号链接、dev/ino 一致）才继续操作。 */
+function ledgerDirStillSame(ledgerDir, identity) {
   let st;
   try { st = fs.lstatSync(ledgerDir); } catch (err) { return "账本目录 lstat 失败：" + String(err?.code ?? err?.message ?? err); }
-  if (st.isSymbolicLink()) return "账本目录是符号链接（别名），不动";
-  if (!st.isDirectory()) return "账本目录不是目录";
-  let real;
-  try { real = fs.realpathSync(ledgerDir); } catch (err) { return "账本目录 realpath 失败：" + String(err?.code ?? err?.message ?? err); }
-  if (real !== ledgerDir) return "账本目录路径里有符号链接（真实路径不同），请用真实路径";
+  if (st.isSymbolicLink() || !st.isDirectory()) return "账本目录在校验之后被换掉（不再是目录本身）";
+  if (identity === null || st.dev !== identity.dev || st.ino !== identity.ino) return "账本目录在校验之后被换掉（身份不同）";
   return null;
 }
 
@@ -248,13 +265,17 @@ export function ledgerDirProblem(ledgerDir) {
  * @returns {{ ok: true, candidates: {name, ageMs, removed, reason, quarantine}[], young: number, problems: string[], lockUncleared?, lockLost? } | { ok: false, reason, why? }}
  */
 export function sweepScratch({ ledgerDir, now = Date.now(), apply = false, olderThanMs = TMP_RESIDUE_AGE_MS }) {
-  const dirProblem = ledgerDirProblem(ledgerDir);
-  if (dirProblem !== null) return { ok: false, reason: "ledger_dir_unverified", why: dirProblem };
+  const dir = verifyLedgerDir(ledgerDir);
+  if (dir.problem !== null) return { ok: false, reason: "ledger_dir_unverified", why: dir.problem };
   return withLedgerLock(ledgerDir, ADMIT_LOCK_WAIT_MS, () => {
+    // 校验与取锁之间目录可能被换（评审探针：realpath 返回前换成指向外部的链接）：取锁后按 dev/ino 重核，不同就什么都不做
+    const changed = ledgerDirStillSame(ledgerDir, dir.identity);
+    if (changed !== null) return { ok: false, reason: "ledger_dir_changed", why: changed };
     const scan = scanTmp(ledgerDir, now);
     if (!scan.ok) return { ok: true, candidates: [], young: 0, problems: [scan.why] };
     const candidates = []; const problems = []; let young = 0;
     for (const e of scan.entries) {
+      if (e.kind === "unknown") { problems.push(e.why); continue; }
       if (e.kind === "unclear") { problems.push(e.name.slice(0, 40) + "（" + e.why + "）"); continue; }
       if (e.ageMs <= olderThanMs) { young += 1; continue; }
       const c = { name: e.name, ageMs: e.ageMs, removed: false, reason: null, quarantine: null };
@@ -272,7 +293,13 @@ function quarantineAndRemove(full, before) {
   let after;
   try { after = fs.lstatSync(q); }
   catch (err) { return { removed: false, reason: "quarantine_unreadable：" + String(err.code ?? err.message), quarantine: q }; }
-  if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino) return { removed: false, reason: "instance_changed", quarantine: q };
+  if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino) {
+    // 身份对不上 = 盘点与隔离之间被换过，隔离路径上的东西归属不明：再改名成持久标记，自动维护永不再碰、准入说不清，只人工处置
+    const u = q + ".unknown-" + crypto.randomUUID();
+    try { fs.renameSync(q, u); return { removed: false, reason: "instance_changed", quarantine: u }; }
+    catch (err) { return { removed: false, reason: "instance_changed（改名持久标记失败：" + String(err.code ?? err.message) + "）", quarantine: q }; }
+  }
+  // 身份一致 = 本入口确认归属；这里的 lstat → unlink 仍是两步：协议外、同 UID 的路径替换不在威胁模型内（它能改账本里的任何东西），见契约 §14c
   try { fs.unlinkSync(q); }
   catch (err) { return { removed: false, reason: "quarantine_unremoved：" + String(err.code ?? err.message), quarantine: q }; }
   return { removed: true, reason: null, quarantine: q };

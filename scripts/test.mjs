@@ -20095,9 +20095,37 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   assert.deepEqual([raceSwapped, raceCand?.removed, raceCand?.reason, typeof raceCand?.quarantine === "string" && fs.readFileSync(raceCand.quarantine, "utf-8"), fs.readFileSync(raceTmp + ".parked-by-test", "utf-8"), sweepExitCode(raceSweep, { apply: true })], [true, false, "instance_changed", "replacement-sentinel", "mine", 1], "换进来的不删：" + JSON.stringify(raceSweep));
   assert.match(describeScratchSweep(raceSweep, { apply: true }), /没清成（\d+ 秒，instance_changed，留在隔离路径 /u);
   fs.rmSync(raceTmp + ".parked-by-test", { force: true });
-  assert.deepEqual([chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000 }).unresolved, inspectScratch({ ledgerDir }).inflight], [0, 1], "隔离名仍是受验形状：不算说不清、算进位中（年轻）");
+  // 归属不明的制品持久标记（评审第 11 轮探针）：.unknown-<uuid>；自动维护永不再碰、准入说不清、doctor / sweep 持续报，只人工删
+  assert.match(path.basename(raceCand.quarantine), /\.quarantine-[0-9a-f-]{36}\.unknown-[0-9a-f-]{36}$/u, "身份对不上的东西改名成持久标记：" + raceCand.quarantine);
+  assert.deepEqual([chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000 }).why, inspectScratch({ ledgerDir }).inflight, /归属不明的制品：归属不明（隔离时身份对不上），自动维护不碰，请人工核对后删除：/u.test(inspectScratch({ ledgerDir }).problems.join(" "))], [["归属不明的制品（隔离时身份对不上，只能人工处置）" + closedKey.slice(0, 20) + "…"], 0, true], "归属不明 = 准入说不清、doctor 报问题");
   const requarantine = sweepScratch({ ledgerDir: realLedger, apply: true, olderThanMs: 0 });
-  assert.deepEqual([requarantine.candidates.length, requarantine.candidates.every((c2) => c2.removed), fs.readdirSync(ledgerDir).filter((n2) => n2.includes(".quarantine-")).length], [1, true, 0], "下次 sweep 再处理隔离路径上的东西：" + JSON.stringify(requarantine));
+  assert.deepEqual([requarantine.candidates.length, /归属不明/u.test(requarantine.problems.join(" ")), sweepExitCode(requarantine, { apply: true }), fs.existsSync(raceCand.quarantine)], [0, true, 1, true], "下次 sweep 不碰、持续报：" + JSON.stringify(requarantine));
+  fs.unlinkSync(raceCand.quarantine);
+  assert.deepEqual([chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000 }).unresolved, fs.readdirSync(ledgerDir).filter((n2) => n2.includes(".quarantine-")).length], [0, 0], "人工删掉之后干净");
+  // 本入口确认归属、但 unlink 失败 → 留在 .quarantine-（仍是候选），下次 sweep 按同一协议再处理
+  const stuckTmp = path.join(realLedger, closedKey + ".5.6.12345678-1234-1234-1234-123456789abc"); fs.writeFileSync(stuckTmp, "mine");
+  fs.utimesSync(stuckTmp, new Date(Date.now() - 2 * 60 * 1000), new Date(Date.now() - 2 * 60 * 1000));
+  const originalUnlinkForSweep = fs.unlinkSync; let unlinkBlocked = false;
+  fs.unlinkSync = (target, ...args) => { if (!unlinkBlocked && String(target).includes(".quarantine-")) { unlinkBlocked = true; const e = new Error("forced unlink failure"); e.code = "EIO"; throw e; } return originalUnlinkForSweep(target, ...args); };
+  let stuckSweep;
+  try { stuckSweep = sweepScratch({ ledgerDir: realLedger, apply: true, olderThanMs: 0 }); }
+  finally { fs.unlinkSync = originalUnlinkForSweep; }
+  const stuckCand = stuckSweep.candidates.find((c2) => c2.name === path.basename(stuckTmp));
+  assert.deepEqual([unlinkBlocked, stuckCand?.removed, /^quarantine_unremoved：EIO$/u.test(stuckCand?.reason ?? ""), /\.quarantine-[0-9a-f-]{36}$/u.test(stuckCand?.quarantine ?? ""), fs.existsSync(stuckCand?.quarantine ?? "")], [true, false, true, true, true], "确认归属但没删成：留在隔离路径：" + JSON.stringify(stuckSweep));
+  const retrySweep = sweepScratch({ ledgerDir: realLedger, apply: true, olderThanMs: 0 });
+  assert.deepEqual([retrySweep.candidates.map((c2) => c2.removed), fs.existsSync(stuckCand.quarantine), fs.readdirSync(ledgerDir).filter((n2) => n2.includes(".quarantine-")).length], [[true], false, 0], "隔离路径上的候选下次按同一协议清掉：" + JSON.stringify(retrySweep));
+  // 目录校验绑定到操作（评审第 11 轮探针）：校验通过之后、取锁之前目录被换成指向外部的链接 → 取锁后重核 dev/ino 不同 → 什么都不做
+  const outsideB = path.join(local, "outside-ledger-b"); fs.mkdirSync(outsideB, { recursive: true });
+  const outsideSentinelB = path.join(outsideB, "a".repeat(64) + ".7.8.12345678-1234-1234-1234-123456789abc"); fs.writeFileSync(outsideSentinelB, "sentinel-b");
+  fs.utimesSync(outsideSentinelB, new Date(Date.now() - 2 * 60 * 1000), new Date(Date.now() - 2 * 60 * 1000));
+  const originalRealpath = fs.realpathSync; let dirSwapped = false;
+  fs.realpathSync = (target, ...args) => { const out = originalRealpath(target, ...args); if (!dirSwapped && path.resolve(String(target)) === realLedger) { dirSwapped = true; fs.renameSync(realLedger, realLedger + ".parked-by-test"); fs.symlinkSync(outsideB, realLedger); } return out; };
+  let swappedDirSweep;
+  try { swappedDirSweep = sweepScratch({ ledgerDir: realLedger, apply: true, olderThanMs: 0 }); }
+  finally { fs.realpathSync = originalRealpath; fs.unlinkSync(realLedger); fs.renameSync(realLedger + ".parked-by-test", realLedger); }
+  assert.deepEqual([dirSwapped, swappedDirSweep.ok, swappedDirSweep.reason, /被换掉/u.test(swappedDirSweep.why), fs.existsSync(outsideSentinelB), /账本目录在校验之后被换掉，没动/u.test(describeScratchSweep(swappedDirSweep, { apply: true })), sweepExitCode(swappedDirSweep, { apply: true })], [true, false, "ledger_dir_changed", true, true, true, 1], "校验后被换：取锁后重核不同，什么都不做：" + JSON.stringify(swappedDirSweep));
+  fs.rmSync(outsideB, { recursive: true, force: true });
+  fs.rmSync(path.join(realLedger, "admission.lock"), { force: true });
   // 锁异常进维护入口的结果语义：账本主锁释放抛 EIO → 结果带 lockUncleared，CLI 文案显式说、退出码非零
   const originalRmForSweep = fs.rmSync;
   fs.rmSync = (target, ...args) => { if (path.resolve(String(target)) === path.join(realLedger, "admission.lock")) { const e = new Error("forced lock release failure"); e.code = "EIO"; throw e; } return originalRmForSweep(target, ...args); };

@@ -14,6 +14,8 @@
  */
 
 import fs from "node:fs";
+import { senderRolesProblem } from "./sender-roles.mjs";
+import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import os from "node:os";
 import path from "node:path";
 
@@ -55,7 +57,7 @@ export const CHAIN_FIELDS = [
  * 刻意跟必填分开：往 CHAIN_FIELDS 里加一个字段，等于让所有已经生成好的模板
  * 立刻变成「不完整」而全线拒绝 —— 加字段不该是一次静默的破坏性变更。
  */
-export const OPTIONAL_CHAIN_FIELDS = ["lark_cli_config_base", "bridge_root", "aily_cli_bin"];
+export const OPTIONAL_CHAIN_FIELDS = ["lark_cli_config_base", "bridge_root", "aily_cli_bin", "senders"];
 
 /** 项目级字段：每个项目不同，由 bind-project 现场算出来。 */
 export const PROJECT_FIELDS = [
@@ -87,6 +89,7 @@ const SHAPE = {
   lark_cli_home: (v) => typeof v === "string" && v.startsWith("/"),
   lark_cli_config_base: (v) => typeof v === "string" && v.startsWith("/"),
   default_freshness_ms: (v) => typeof v === "number" && Number.isFinite(v) && v > 0,
+  senders: (v) => Array.isArray(v),
 };
 
 /**
@@ -112,6 +115,9 @@ export function validateChainTemplate(tpl) {
   // 否则 outbound_open_id 就是个填了也没人管的装饰字段，而装饰字段迟早烂成过期的谎话
   // （这个项目今天已经被 inbound_prefix 和 LARKSUITE_CLI_HOME 各咬过一次）。
   const inconsistent = [];
+  // 发送者角色表与 frank_sender_id 的交叉校验（唯一判据在 sender-roles.mjs）。
+  const rolesProblem = senderRolesProblem(tpl);
+  if (rolesProblem !== null) inconsistent.push(rolesProblem);
   if (tpl?.outbound_app_id && tpl.outbound_app_id === tpl.transport_app_id &&
       tpl.outbound_open_id !== tpl.transport_open_id) {
     inconsistent.push("outbound_open_id 与 transport_open_id 不一致，但两者是同一个应用");
@@ -250,4 +256,101 @@ export function identityErrorText(r) {
     default:
       return "出站身份校验失败：" + r.reason;
   }
+}
+
+/**
+ * **模板的唯一写事务** —— 所有改 chain-config.json 的写方（init-chain-template 两条链、Codex 安装器改 bridge_root、
+ * register-sender 改 senders）都走这里；评审反例：register-sender 自己加了锁，安装器与初始化器仍无锁整表重写，
+ * 角色登记规划后被安装器改 bridge_root 的写入覆盖回旧值。
+ *
+ * 流程（整段在 `<file>.lock` 内，锁原语与 routes / registry 同一套 symlink 锁）：
+ *   读现状（缺席 → null；在场但校验不过 → 只有 allowInvalidCurrent 时才继续，给初始化器整表重写用）
+ *   → mutate(current) 得到 { template } / { changed:false } / { ok:false, reason }
+ *   → validateChainTemplate（不过 → result_invalid，零写入）
+ *   → 备份（在场时：backupSuffix 给 ".prev" 之类，否则 .bak.<ISO>）→ 原子写 → 逐字读回。
+ * 取得锁失败按真实原因报（publisher_busy → template_busy；其余 → template_lock_unavailable + reason）；
+ * 释放失败不吞：结果照常返回，附 lockUncleared（调用方要非零退出并指路）。
+ */
+export function withChainTemplateWrite({ file, mutate, backupSuffix = null, allowInvalidCurrent = false, now = new Date() } = {}) {
+  if (typeof file !== "string" || !path.isAbsolute(file)) return { ok: false, reason: "template_required_absolute" };
+  if (typeof mutate !== "function") return { ok: false, reason: "mutate_required" };
+  // 只认普通文件（或缺席）：符号链接会被 rename 换成普通文件、别名路径会派生另一把锁 —— 评审反例：经 symlink 写"成功"，真正的模板一字未变。
+  try {
+    const st = fs.lstatSync(file);
+    if (!st.isFile()) return { ok: false, reason: "template_not_regular_file", detail: st.isSymbolicLink() ? "是符号链接（别名）；请用真实路径" : "不是普通文件" };
+    // 硬链接也是别名：rename 只换本目录项，另一条路径仍指旧 inode，而且两条路径会派生两把不同的锁 —— 同一底层文件被两个事务同时处理。
+    if (st.nlink !== 1) return { ok: false, reason: "template_has_multiple_links", detail: "这个文件有 " + st.nlink + " 个目录项（硬链接别名）；先去掉别名再写" };
+  } catch (err) { if (err.code !== "ENOENT") return { ok: false, reason: "template_unreadable", detail: String(err.code ?? err.message) }; }
+  const lockDir = file + ".lock";
+  let lock;
+  try { lock = acquirePublishLock(lockDir); }
+  catch (err) { return { ok: false, reason: "template_lock_unavailable", detail: "锁原语抛错：" + String(err?.code ?? err?.message ?? err) }; }
+  if (!lock.ok) {
+    return lock.reason === "publisher_busy"
+      ? { ok: false, reason: "template_busy", detail: "另一个写方持有 " + lockDir }
+      : { ok: false, reason: "template_lock_unavailable", detail: String(lock.reason) + (lock.error ? "：" + lock.error : "") };
+  }
+  let result;
+  try {
+    let current = null;
+    if (fs.existsSync(file)) {
+      const loaded = loadChainTemplate(file);
+      if (loaded.ok) current = loaded.template;
+      else if (allowInvalidCurrent) { try { current = JSON.parse(fs.readFileSync(file, "utf-8")); } catch { current = null; } }
+      else return (result = { ok: false, reason: "template_unreadable", detail: loaded.reason });
+    }
+    const next = mutate(current);
+    if (!next || typeof next !== "object") return (result = { ok: false, reason: "mutate_result_invalid" });
+    if (next.ok === false) return (result = next);
+    if (next.changed === false) return (result = { ok: true, changed: false, template: current });
+    const template = next.template;
+    const valid = validateChainTemplate(template);
+    if (!valid.ok) return (result = { ok: false, reason: "result_invalid", detail: valid });
+    const body = JSON.stringify(template, null, 2) + "\n";
+    let backup = null;
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      if (fs.existsSync(file)) {
+        backup = file + (backupSuffix ?? ".bak." + now.toISOString().replace(/[:.]/gu, "-"));
+        fs.copyFileSync(file, backup);
+      }
+    } catch (err) { return (result = { ok: false, reason: "backup_failed", detail: err.message }); }
+    const tmp = file + ".tmp." + process.pid;
+    try {
+      fs.writeFileSync(tmp, body, { mode: 0o600 });
+      fs.renameSync(tmp, file);
+    } catch (err) {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* 已不在 */ }
+      return (result = { ok: false, reason: "template_unwritable", detail: err.message, backup });
+    }
+    let back;
+    try { back = fs.readFileSync(file, "utf-8"); } catch (err) { return (result = { ok: false, reason: "readback_failed", detail: err.message, backup }); }
+    if (back !== body) return (result = { ok: false, reason: "readback_mismatch", backup });
+    return (result = { ok: true, changed: true, template, backup });
+  } finally {
+    let rel;
+    try { rel = releasePublishLock(lockDir); } catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
+    const why = !rel?.ok ? String(rel?.reason) + (rel?.error ? "：" + rel.error : "") : rel.absent ? "锁已不在（被清理过）" : null;
+    if (why && result && typeof result === "object") result.lockUncleared = why;
+  }
+}
+
+/**
+ * 写事务结果的统一文案（四个写方共用）：成功 / 未变 / 失败各一句，**锁没交还时不管成败都单独一行指路** ——
+ * 评审反例：调用方先按 !ok 退出，"规划失败 + 释放失败"时只说了原始失败，锁残留没人知道。
+ * 返回 { lines, exitCode }：锁没交还一律非零。
+ */
+export function describeTemplateWrite(r, file) {
+  const lines = [];
+  const detail = (x) => (x.detail ? "：" + (typeof x.detail === "string" ? x.detail : JSON.stringify(x.detail)) : "") + (x.error ? "：" + x.error : "") + (x.problem ? "：" + x.problem : "");
+  let exitCode = 0;
+  if (!r || typeof r !== "object") { lines.push("没有写成：结果说不清"); exitCode = 1; }
+  else if (!r.ok) { lines.push("没有写成：" + r.reason + detail(r)); exitCode = 1; }
+  else if (!r.changed) lines.push("锁内重读后已经是这样，没动。");
+  else lines.push("已写入（锁内重读重算后）。" + (r.backup ? "备份：" + r.backup : "首次创建，无备份"));
+  if (r && r.lockUncleared) {
+    lines.push("注意：模板写锁没有交还（" + r.lockUncleared + "）；之后所有模板写方都会报 template_busy，请人工确认没有写方在跑后处理 " + file + ".lock");
+    exitCode = 1;
+  }
+  return { lines, exitCode };
 }

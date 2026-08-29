@@ -222,6 +222,7 @@ session 绑定。日常还可以使用：
 |---|---|---|---|
 | status | `$feishu-status` | `/feishu-status` | 只读查看接入、入站绑定和待发状态 |
 | unbind | `$feishu-unbind` | `/feishu-unbind` | 可恢复地暂停，不删话题、映射或历史 |
+| 发送者角色（第 2 层） | `node scripts/register-sender.mjs --template <该链 chain-config.json> --open-id <数字> --role operator\|participant [--apply]` | 同左 | 往链路模板的 `senders` 登记 / 移除一个人（owner 只有一个，就是 `frank_sender_id`，不在这里登记）；默认预览，写入要 owner 逐次授权；`--remove` 移除。第 1 层只登记与显示（`/feishu-subscribe`、状态页第 2 层「发送者角色」只出数量），入站判定仍只放 owner，角色 × 风险 × 模式的判定是第 2 层 |
 | bind | `$feishu-bind` | `/feishu-bind` | 首次接入，或恢复已暂停的原话题连接 |
 | rotate | `$feishu-rotate` | `/feishu-rotate` | 为同一 binding 创建下一话题代际；旧话题保留为历史（仍可下指令，回复回原话题） |
 | mode（飞书侧） | 正文恰为 `$feishu-mode dialogue` / `mapping` | 正文恰为 `/feishu-mode dialogue` / `mapping` | 入站路由器当场切换交互模式并回执，不投递给会话（2026-08-28 起）。"恰为"按词算：不可见字符、不换行/全角空格、全角斜杠先折叠，多一个字仍走普通路径 |
@@ -255,9 +256,9 @@ session 绑定。日常还可以使用：
 本版本实际安装上表五项。`bind` 仍是把当前精确本地 target 接入一个话题的兼容入口：首次
 接入时，它同时物化现有单群配置下的订阅授权快照，但不等同于未来可独立管理的 Subscription。
 架构路线图中的 `$feishu-connect` 已确认**不做**（Aily 侧的连接是被动的，本机没有「发起」这个动作；
-本机那一半归端点自检）。`/feishu-subscribe` **Claude 侧自 2026-08-24 起可用，但只读** ——
-增删订阅仍未开放（缺 FR-2.5 的授权快照同步链路与 FR-2.6 的多订阅歧义拒绝）；Codex 侧待迁移。
-以下关于「尚未开放」的描述仅适用于独立订阅的**写**入口，
+本机那一半归端点自检）。`/feishu-subscribe` / `$feishu-subscribe` **两条链都可用，只读**。
+写入口的现状：发送者角色表可以登记（`register-sender.mjs`，写入需 owner 逐次授权）；独立订阅的增删仍不开放，
+原因只有 FR-2.6（多订阅时首次认领的歧义拒绝未经真实样本验证）—— FR-2.5 的授权快照同步链路已经完成。
 不能把需求文档里的建议命令误认为当前可用能力。详见
 [Agent 增强需求](docs/requirements/agent-enhancement-requirements.md#fr-7-显式控制面)。
 

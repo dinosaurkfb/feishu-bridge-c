@@ -27,7 +27,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
-  CHAIN_FIELDS, DEFAULT_CONFIG_BASE, OPTIONAL_CHAIN_FIELDS, templatePath, validateChainTemplate,
+  CHAIN_FIELDS, DEFAULT_CONFIG_BASE, OPTIONAL_CHAIN_FIELDS, templatePath, validateChainTemplate, withChainTemplateWrite, describeTemplateWrite,
 } from "./chain-template.mjs";
 
 /** 模板认识的全部字段。**派生、命令行覆盖、预览必须用同一个集合**，否则只会改一半。 */
@@ -142,12 +142,12 @@ if (!apply) {
 }
 
 const out = templatePath();
-fs.mkdirSync(path.dirname(out), { recursive: true, mode: 0o700 });
-// 已有模板先留一份：这份文件一旦写错，后面每个新接入的项目都会拿到错的身份。
-if (fs.existsSync(out)) fs.copyFileSync(out, out + ".prev");
-const tmp = out + ".tmp." + process.pid;
-fs.writeFileSync(tmp, JSON.stringify(tpl, null, 2) + "\n", { mode: 0o600 });
-fs.renameSync(tmp, out);
+// 走模板的唯一写事务（锁内、先校验、.prev 备份、原子写、逐字读回）—— 初始化是整表重写，所以允许现状不合法。
+const wrote = withChainTemplateWrite({ file: out, backupSuffix: ".prev", allowInvalidCurrent: true, mutate: () => ({ template: tpl }) });
+{
+  const told = describeTemplateWrite(wrote, out);
+  if (told.exitCode !== 0) { console.error(told.lines.join("\n")); process.exit(told.exitCode); }
+}
 
 console.log("\n已写入 " + out);
 console.log("下一步：node scripts/install-outbound.mjs --apply，然后在项目目录里 /init。");

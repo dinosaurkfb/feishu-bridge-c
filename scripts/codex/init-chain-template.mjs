@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { DEFAULT_CONFIG_BASE, validateChainTemplate } from "../chain-template.mjs";
+import { DEFAULT_CONFIG_BASE, describeTemplateWrite, validateChainTemplate, withChainTemplateWrite } from "../chain-template.mjs";
 import { bridgeHome, templateFile, validateCodexTemplate } from "./state.mjs";
 import { moduleRoot } from "../direct-run.mjs";
 
@@ -71,9 +71,9 @@ if (!apply) {
   process.exit(0);
 }
 const file = templateFile(bridgeHome());
-fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-if (fs.existsSync(file)) fs.copyFileSync(file, file + ".prev");
-const tmp = file + ".tmp." + process.pid;
-fs.writeFileSync(tmp, JSON.stringify(template, null, 2) + "\n", { mode: 0o600 });
-fs.renameSync(tmp, file);
+const wrote = withChainTemplateWrite({ file, backupSuffix: ".prev", allowInvalidCurrent: true, mutate: () => ({ template }) });
+{
+  const told = describeTemplateWrite(wrote, file);
+  if (told.exitCode !== 0) { console.error(told.lines.join("\n")); process.exit(told.exitCode); }
+}
 console.log("已写入 " + file + "。下一步先运行 scripts/codex/install.mjs 预览安装内容。");

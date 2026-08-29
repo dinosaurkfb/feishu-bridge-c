@@ -17,41 +17,117 @@
     "constraints"
   ],
   "properties": {
-    "schema_version": { "const": "1.0" },
-    "artifact_type": { "const": "feishu_bridge_subscription" },
-    "subscription_id": { "type": "string", "minLength": 1 },
-    "version": { "type": "integer", "minimum": 1 },
-    "endpoint_id": { "type": "string", "minLength": 1 },
-    "domain_id": { "type": "string", "minLength": 1 },
-    "status": { "enum": ["active", "paused"] },
+    "schema_version": {
+      "const": "1.0"
+    },
+    "artifact_type": {
+      "const": "feishu_bridge_subscription"
+    },
+    "subscription_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "endpoint_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "domain_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "enum": [
+        "active",
+        "paused"
+      ]
+    },
     "scope": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["agent_uid", "transport_open_id", "chat_id", "sender_ids", "event_types"],
+      "required": [
+        "agent_uid",
+        "transport_open_id",
+        "chat_id",
+        "sender_ids",
+        "event_types"
+      ],
       "properties": {
-        "agent_uid": { "type": "string", "minLength": 1 },
-        "transport_open_id": { "type": "string", "minLength": 1 },
-        "chat_id": { "type": "string", "minLength": 1 },
+        "agent_uid": {
+          "type": "string",
+          "minLength": 1
+        },
+        "transport_open_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "chat_id": {
+          "type": "string",
+          "minLength": 1
+        },
         "sender_ids": {
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "items": { "type": "string", "minLength": 1 }
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
         },
         "event_types": {
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "items": { "const": "im.message.receive" }
+          "items": {
+            "const": "im.message.receive"
+          }
+        },
+        "sender_roles": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "open_id",
+              "role"
+            ],
+            "properties": {
+              "open_id": {
+                "type": "string",
+                "pattern": "^[0-9]+$"
+              },
+              "role": {
+                "enum": [
+                  "owner",
+                  "operator",
+                  "participant"
+                ]
+              },
+              "note": {
+                "type": "string",
+                "maxLength": 80
+              }
+            }
+          },
+          "description": "结构下界：JSON Schema 只表达字段取值域与整项唯一；关系不变量（owner 集合必须等于 sender_ids、open_id 不重复、每个 sender_ids 都在表里且标 owner）只由 scripts/subscription.mjs 的 validateSubscription（唯一语义判据）保证。运行时接受 ⇒ Schema 接受；反之不成立。"
         }
       }
     },
     "constraints": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["freshness_ms"],
+      "required": [
+        "freshness_ms"
+      ],
       "properties": {
-        "freshness_ms": { "type": "number", "exclusiveMinimum": 0 }
+        "freshness_ms": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
       }
     }
   }

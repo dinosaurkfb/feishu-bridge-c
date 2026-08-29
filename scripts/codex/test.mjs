@@ -2882,6 +2882,24 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
       env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
     });
   assert.equal(installed.status, 0, "夹具依赖安装器成功：" + installed.stderr);
+  // 唯一写事务：模板写锁被别的写方持有时，安装器不改 bridge_root、也不动 hooks（评审反例：安装器无锁重写会覆盖并发登记）
+  {
+    const lockPath = path.join(home, "chain-config.json.lock");
+    assert.equal(acquirePublishLock(lockPath).ok, true);
+    const tplBefore = fs.readFileSync(path.join(home, "chain-config.json"), "utf-8");
+    const hooksBefore = fs.readFileSync(path.join(codexHome, "hooks.json"), "utf-8");
+    fs.writeFileSync(path.join(home, "chain-config.json"), tplBefore.replace(/"bridge_root": "[^"]*"/u, '"bridge_root": "/old/clone"'));
+    const blocked = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } });
+    assert.notEqual(blocked.status, 0, "持锁时安装器必须失败：" + blocked.stdout + blocked.stderr);
+    assert.match(blocked.stderr, /template_busy/u, blocked.stderr);
+    assert.match(JSON.parse(fs.readFileSync(path.join(home, "chain-config.json"), "utf-8")).bridge_root, /\/old\/clone$/u, "持锁期间模板没被改");
+    assert.equal(fs.readFileSync(path.join(codexHome, "hooks.json"), "utf-8"), hooksBefore, "hooks 没动");
+    assert.equal(releasePublishLock(lockPath).ok, true);
+    const again = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } });
+    assert.equal(again.status, 0, again.stdout + again.stderr);
+    assert.match(again.stdout, /bridge_root .* → runtime\/current/u, again.stdout);
+    assert.ok(fs.readdirSync(home).some((n) => n.startsWith("chain-config.json.bak.")), "安装器改模板也先备份");
+  }
 
   const run = () => spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "doctor.mjs"), "--json"], {
     encoding: "utf-8",
@@ -3949,7 +3967,8 @@ test("subscribe 命令：读得出订阅，且不泄漏任何 locator", () => {
     assert.fail("投影不可用：" + JSON.stringify(probe).slice(0, 400) + "\n" + r.stdout);
   }
   assert.match(r.stdout, /授权发送者.*只出数量，不出身份/u);
-  assert.match(r.stdout, /写入口还没开/u, "为什么不能写要说清楚");
+  assert.match(r.stdout, /独立订阅增删仍未开放.*FR-2\.6/u, "写入口现状要说清楚");
+  assert.match(r.stdout, /register-sender\.mjs/u);
 
   // **一个 locator 都不许出现。**
   for (const secret of ["om_secret_root", "a1b2c3", THREAD_A,
@@ -4064,6 +4083,19 @@ test("群名优先用 task 自己的覆盖，而不是把知道的说成不知�
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /订阅群.*这条 task 自己的群/u,
     "**已知的 task 群名不许被报成不可用**：" + r.stdout);
+  // 第 1 层角色表：模板带 senders 时 Codex 状态页第 2 层与 $feishu-subscribe 只出角色人数（不出 id）
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({ ...TEMPLATE, senders: [{ open_id: "2222", role: "operator" }, { open_id: "3333", role: "participant" }] }));
+  const withRoles = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A], { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.equal(withRoles.status, 0, withRoles.stderr);
+  assert.match(withRoles.stdout, /发送者角色\s+owner 1 · operator 1 · participant 1（只出数量）/u, withRoles.stdout);
+  assert.doesNotMatch(withRoles.stdout, /2222|3333/u);
+  const sub = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-subscribe.mjs"), "--thread-id", THREAD_A], { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.equal(sub.status, 0, sub.stderr);
+  assert.match(sub.stdout, /发送者角色 owner 1 · operator 1 · participant 1/u, sub.stdout);
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({ ...TEMPLATE, senders: [{ open_id: "9", role: "owner" }] }));
+  const badTpl = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A], { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.doesNotMatch(badTpl.stdout, /发送者角色\s+owner/u, "坏的角色表不显示成健康：" + badTpl.stdout);
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   // 而且不许把模板那个群的名字套上来。
   assert.doesNotMatch(r.stdout, new RegExp(TEMPLATE.chat_name ?? "___", "u"));
 });

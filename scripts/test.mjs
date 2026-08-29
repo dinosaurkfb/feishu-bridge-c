@@ -12,6 +12,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
+import { SENDER_ROLES, roleCounts, roleCountsText, senderRole, senderRolesProblem, senderTable, roleEntriesProblem } from "./sender-roles.mjs";
+import { parseRegisterSenderArgs, planSenderChange, applySenderChange } from "./register-sender.mjs";
 // symlink 锁：existsSync 会跟随到不存在的目标，锁在不在只能用 lstat 判
 const lockPresent = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
 import os from "node:os";
@@ -91,10 +93,7 @@ import {
 import { extractReply } from "./stop-hook.mjs";
 import { postDeliveryBits } from "./publish-outcome.mjs";
 import { foreignHint, projectLabel } from "./stop-note.mjs";
-import {
-  CHAIN_FIELDS, assertPublishIdentity, materializeProjectConfig,
-  resolveLarkIdentity, validateChainTemplate,
-} from "./chain-template.mjs";
+import { CHAIN_FIELDS, assertPublishIdentity, materializeProjectConfig, resolveLarkIdentity, validateChainTemplate, withChainTemplateWrite, describeTemplateWrite } from "./chain-template.mjs";
 import {
   PURPOSE_MAX, bindingToken, composeRootMessage, composeStatusMessage,
   firstSentence, idempotencyKeyFor, newRegistryEntry, readProjectIdentity,
@@ -199,10 +198,7 @@ import {
   buildClaudeSubscriptionProjection, findBindingForSession, findPendingBinding, loadConsumed,
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
-import {
-  SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION,
-  buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId,
-  stableControlId, validateSubscription, claimable } from "./subscription.mjs";
+import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, stableControlId, validateSubscription, claimable } from "./subscription.mjs";
 import {
   ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, topicGenerationStateForLegacy,
   TOPIC_GENERATION_PREPARING_STALE_MS,
@@ -8984,9 +8980,11 @@ test("订阅命令：只读、严格参数、把写为什么没开说清楚", ()
   const ok = run(["--project", process.cwd()]);
   assert.equal(ok.status, 0, ok.stderr);
   // 说清写为什么没开 —— "暂不支持"是排期，"缺这两条前置"才是事实。
-  assert.match(ok.stdout, /FR-2\.5/u);
-  assert.match(ok.stdout, /FR-2\.6/u);
-  assert.match(ok.stdout, /订阅说 A、授权快照仍说 B/u);
+  assert.match(ok.stdout, /FR-2\.5 的落盘控制面已经完成/u);
+  assert.match(ok.stdout, /卡在 FR-2\.6/u);
+  assert.match(ok.stdout, /发送者角色表可以登记.*register-sender\.mjs/u);
+  assert.match(ok.stdout, /独立订阅的增删仍不开放/u);
+  assert.doesNotMatch(ok.stdout, /订阅说 A、授权快照仍说 B|控制面还没有/u, "过时的理由不许再出现");
 });
 
 test("待认领数要用跟热路径同一个判据", () => {
@@ -9025,20 +9023,25 @@ test("群名只能给它确实对应的那条订阅", () => {
   assert.match(text, /群名不可用/u);
 });
 
-test("订阅命令明确是 Claude 侧，三处说法不许互相矛盾", () => {
-  // 仓库里有 Codex 的投影，但没有 CLI / 技能 / 安装入口。
-  // 说成 $feishu-subscribe（两侧同名斜杠命令）会让人在 Codex 里敲一个不存在的命令。
+test("订阅命令的用户可见契约：两条链都有、写入口现状一致，过时说法不许留", () => {
+  // 2026-08-29 之前这里钉的是"仅 Claude 侧 / 待迁移"；Codex 侧早已有 CLI 与技能，那句话成了假话（评审第 1 轮抓出）。
+  // 现在钉的是：角色表登记已开放、独立订阅增删卡在 FR-2.6、FR-2.5 落盘控制面已完成 —— 五处说法一致。
   const readme = fs.readFileSync(path.resolve("README.md"), "utf-8");
-  const reqs = fs.readFileSync(
-    path.resolve("docs", "requirements", "agent-enhancement-requirements.md"), "utf-8");
-  const skill = fs.readFileSync(
-    path.resolve("skills", "claude-feishu-subscribe", "SKILL.md"), "utf-8");
-
-  // README 不能再说它「尚未开放」而需求文档说它可用。
+  const reqs = fs.readFileSync(path.resolve("docs", "requirements", "agent-enhancement-requirements.md"), "utf-8");
+  const claudeSkill = fs.readFileSync(path.resolve("skills", "claude-feishu-subscribe", "SKILL.md"), "utf-8");
+  const codexSkill = fs.readFileSync(path.resolve("skills", "feishu-subscribe", "SKILL.md"), "utf-8");
+  const claudeCli = fs.readFileSync(path.resolve("scripts", "feishu-subscribe.mjs"), "utf-8");
+  const codexCli = fs.readFileSync(path.resolve("scripts", "codex", "feishu-subscribe.mjs"), "utf-8");
   assert.match(readme, /\/feishu-subscribe.*只读/su);
-  assert.match(reqs, /仅 Claude 侧/u);
-  assert.match(skill, /只有 Claude 侧/u);
-  assert.match(skill, /待迁移/u);
+  assert.match(reqs, /两条链都有：Codex `\$feishu-subscribe`/u);
+  // README 与 subscribe 相关段落也进同一套守卫（评审反例：README 仍写"缺 FR-2.5、Codex 侧待迁移"）
+  const readmeSubscribe = readme.slice(readme.indexOf("本版本实际安装上表五项"), readme.indexOf("Agent 增强需求"));
+  for (const [name, text] of [["claude skill", claudeSkill], ["codex skill", codexSkill], ["claude cli", claudeCli], ["codex cli", codexCli], ["readme", readmeSubscribe]]) {
+    assert.match(text, /register-sender/u, name + " 要说角色表登记已开放");
+    assert.match(text, /FR-2\.6/u, name + " 要说独立订阅增删卡在 FR-2.6");
+    assert.match(text, /FR-2\.5[^\n]*(已经完成|已完成)/u, name + " 要说 FR-2.5 落盘控制面已完成");
+    assert.doesNotMatch(text, /仅 Claude 侧|只有 Claude 侧|待迁移|控制面还没有|控制面没闭环|还没实现|未实现|尚未开放|写入口还没开|为什么现在还不能写|缺 FR-2\.5/u, name + " 不许留过时说法");
+  }
 });
 test("端点自检把 FR-1.4 的四种情形分开，各有各的下一步", () => {
   const ready = selfCheck();
@@ -18900,6 +18903,313 @@ test("⑦ 入站默认处理器（issue #88）：分类五态不折叠；doctor 
   m.writeTables({ projects, routes: [], sessions: {}, providers: [] });
   c = checkOf(doctorReport(m.run()), "default_route_handler");
   assert.deepEqual([c.ok, /路由表里没有启用的路由，分发器用运行时自带的默认处理器/u.test(c.detail)], [true, true], "空表 = 运行时默认：" + c.detail);
+});
+
+
+test("发送者角色表（第 1 层）：唯一判据、模板交叉校验、投影 sender_roles 只显示不授权、受控登记入口", () => {
+  // 判据：owner 只有一个且就是 frank_sender_id；别的角色封闭；形状/重复/字段集全拒
+  assert.deepEqual([...SENDER_ROLES], ["owner", "operator", "participant"]);
+  assert.ok(Object.isFrozen(SENDER_ROLES));
+  const base = { ...TPL };
+  assert.equal(senderRolesProblem(base), null, "没有 senders = 只有 owner");
+  assert.deepEqual(senderTable(base), [{ open_id: "12345", role: "owner" }]);
+  assert.deepEqual(senderRole(base, "12345"), "owner");
+  assert.equal(senderRole(base, "999"), null, "未登记 = 零权限");
+  const withRoles = { ...TPL, senders: [{ open_id: "222", role: "operator", note: "同事" }, { open_id: "333", role: "participant" }] };
+  assert.equal(senderRolesProblem(withRoles), null);
+  assert.deepEqual(senderTable(withRoles), [{ open_id: "12345", role: "owner" }, { open_id: "222", role: "operator", note: "同事" }, { open_id: "333", role: "participant" }]);
+  assert.deepEqual([senderRole(withRoles, "222"), senderRole(withRoles, "333"), senderRole(withRoles, "444")], ["operator", "participant", null]);
+  assert.deepEqual(roleCounts(senderTable(withRoles)), { owner: 1, operator: 1, participant: 1 });
+  assert.equal(roleCountsText(roleCounts(senderTable(withRoles))), "owner 1 · operator 1 · participant 1");
+  assert.deepEqual(senderTable({ ...TPL, senders: [{ open_id: "12345", role: "owner" }] }), [{ open_id: "12345", role: "owner" }], "写了 owner 也只出现一次");
+  for (const [label, bad] of [
+    ["不是数组", { a: 1 }], ["不是对象", ["x"]], ["多余字段", [{ open_id: "1", role: "operator", extra: 1 }]],
+    ["open_id 形状", [{ open_id: "ou_x", role: "operator" }]], ["角色不在枚举", [{ open_id: "1", role: "admin" }]],
+    ["note 太长", [{ open_id: "1", role: "operator", note: "x".repeat(81) }]], ["重复", [{ open_id: "1", role: "operator" }, { open_id: "1", role: "participant" }]],
+    ["别人标 owner", [{ open_id: "1", role: "owner" }]], ["frank 标成别的", [{ open_id: "12345", role: "operator" }]],
+  ]) {
+    const problem = senderRolesProblem({ ...TPL, senders: bad });
+    assert.notEqual(problem, null, label);
+    assert.equal(senderTable({ ...TPL, senders: bad }), null, label + "：表不猜");
+    assert.equal(validateChainTemplate({ ...TPL, senders: bad }).ok, false, label + "：模板校验不过");
+  }
+  assert.equal(validateChainTemplate(withRoles).ok, true);
+  // 投影：sender_roles 在场且封闭；sender_ids（授权基准）仍只有 owner
+  const model = buildLegacySubscriptionReadModel({ runtime: "claude", endpointId: "ep", template: withRoles,
+    records: [{ legacy_key: "k", domain_key: "d", local_target_id: "t", status: "active" }] });
+  assert.equal(model.ok, true, JSON.stringify(model));
+  const scope = model.subscriptions[0].scope;
+  assert.deepEqual(scope.sender_ids, ["12345"], "授权基准不变");
+  assert.deepEqual(scope.sender_roles.map((e) => e.role), ["owner", "operator", "participant"]);
+  assert.equal(validateSubscription(model.subscriptions[0]).ok, true);
+  const tampered = JSON.parse(JSON.stringify(model.subscriptions[0]));
+  tampered.scope.sender_roles = [{ open_id: "222", role: "operator" }];
+  assert.ok(validateSubscription(tampered).problems.includes("scope.sender_roles"), "表里必须包含 sender_ids 的每一个 id");
+  tampered.scope.sender_roles = [{ open_id: "12345", role: "boss" }];
+  assert.ok(validateSubscription(tampered).problems.includes("scope.sender_roles"));
+  // 评审反例：订阅制品上同一份核心校验 —— owner 标成 operator / 第二个 owner / 非数字 id / note 是数字 都不合法
+  const probe = (sender_roles) => { const c = JSON.parse(JSON.stringify(model.subscriptions[0])); c.scope.sender_roles = sender_roles; return validateSubscription(c); };
+  for (const [label, roles] of [
+    ["owner 标成 operator", [{ open_id: "12345", role: "operator" }]],
+    ["第二个 owner", [{ open_id: "12345", role: "owner" }, { open_id: "222", role: "owner" }]],
+    ["非数字 id", [{ open_id: "12345", role: "owner" }, { open_id: "ou_x", role: "participant" }]],
+    ["note 是数字", [{ open_id: "12345", role: "owner", note: 42 }]],
+    ["缺 owner", [{ open_id: "222", role: "operator" }]],
+  ]) assert.ok(probe(roles).problems.includes("scope.sender_roles"), label);
+  assert.equal(probe([{ open_id: "12345", role: "owner" }, { open_id: "222", role: "operator", note: "同事" }]).ok, true);
+  // schema 与代码同步：schema 声明了可选 sender_roles，角色枚举与 open_id 形状与 sender-roles.mjs 一致
+  const schema = JSON.parse(fs.readFileSync(path.resolve("references", "subscription-v1.schema.json"), "utf-8"));
+  const sr = schema.properties.scope.properties.sender_roles;
+  assert.deepEqual(sr.items.properties.role.enum, [...SENDER_ROLES]);
+  assert.equal(sr.items.properties.open_id.pattern, "^[0-9]+$");
+  assert.equal(sr.items.additionalProperties, false);
+  assert.equal(schema.properties.scope.required.includes("sender_roles"), false, "可选：旧制品不带也合法");
+  const badTemplate = buildLegacySubscriptionReadModel({ runtime: "claude", endpointId: "ep", template: { ...TPL, senders: [{ open_id: "1", role: "owner" }] },
+    records: [{ legacy_key: "k", domain_key: "d", local_target_id: "t" }] });
+  assert.deepEqual([badTemplate.ok, badTemplate.problems], [false, ["template.senders"]]);
+  // 显示：状态页第 2 层与 subscribe 都只出数量
+  const facts = subscriptionFacts(model, { groupName: "群", templateChatId: "oc_abc" });
+  assert.deepEqual(facts.items[0].roleCounts, { owner: 1, operator: 1, participant: 1 });
+  const legacyModel = JSON.parse(JSON.stringify(model)); delete legacyModel.subscriptions[0].scope.sender_roles;
+  assert.deepEqual(subscriptionFacts(legacyModel, {}).items[0].roleCounts, { owner: 1, operator: 0, participant: 0 }, "旧投影按 sender_ids 都是 owner 算");
+  // 契约只有一份：owner 基准不是数字的旧登记 → 投影不生成 sender_roles（旧制品形态），不放宽 schema
+  const legacyOwner = buildLegacySubscriptionReadModel({ runtime: "claude", endpointId: "ep", template: { ...TPL, frank_sender_id: "u_frank" }, records: [{ legacy_key: "k", domain_key: "d", local_target_id: "t" }] });
+  assert.equal(legacyOwner.ok, true, JSON.stringify(legacyOwner));
+  assert.equal(legacyOwner.subscriptions[0].scope.sender_roles, undefined);
+  assert.equal(validateSubscription(legacyOwner.subscriptions[0]).ok, true);
+  // 运行时判据 vs 真实 schema 文档：同一组样本差分（用按 schema 文档解释的校验器，不是断言 schema 里有某个正则）
+  const schemaDoc = JSON.parse(fs.readFileSync(path.resolve("references", "subscription-v1.schema.json"), "utf-8"));
+  const jsonSchemaProblems = (sch, doc, at = "$") => {
+    const out = [];
+    const t = sch.type;
+    if (sch.const !== undefined && doc !== sch.const) out.push(at + " const");
+    if (sch.enum !== undefined && !sch.enum.includes(doc)) out.push(at + " enum");
+    if (t === "object") {
+      if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return [at + " type"];
+      for (const k of sch.required ?? []) if (!(k in doc)) out.push(at + "." + k + " required");
+      for (const [k, v] of Object.entries(doc)) {
+        if (sch.properties && k in sch.properties) out.push(...jsonSchemaProblems(sch.properties[k], v, at + "." + k));
+        else if (sch.additionalProperties === false) out.push(at + "." + k + " additional");
+      }
+    } else if (t === "array") {
+      if (!Array.isArray(doc)) return [at + " type"];
+      if (sch.minItems !== undefined && doc.length < sch.minItems) out.push(at + " minItems");
+      if (sch.uniqueItems && new Set(doc.map((x) => JSON.stringify(x))).size !== doc.length) out.push(at + " uniqueItems");
+      doc.forEach((x, i) => out.push(...jsonSchemaProblems(sch.items, x, at + "[" + i + "]")));
+    } else if (t === "string") {
+      if (typeof doc !== "string") return [at + " type"];
+      if (sch.minLength !== undefined && Array.from(doc).length < sch.minLength) out.push(at + " minLength");
+      if (sch.maxLength !== undefined && Array.from(doc).length > sch.maxLength) out.push(at + " maxLength");
+      if (sch.pattern !== undefined && !new RegExp(sch.pattern, "u").test(doc)) out.push(at + " pattern");
+    } else if (t === "integer") {
+      if (!Number.isInteger(doc)) return [at + " type"];
+    } else if (t === "number") {
+      if (typeof doc !== "number") return [at + " type"];
+    }
+    return out;
+  };
+  const sample = (sender_roles, sender_ids = ["12345"]) => { const c = JSON.parse(JSON.stringify(model.subscriptions[0])); c.scope.sender_ids = sender_ids; if (sender_roles === undefined) delete c.scope.sender_roles; else c.scope.sender_roles = sender_roles; return c; };
+  const emoji41 = "😀".repeat(41);
+  for (const [label, doc, expectOk] of [
+    ["旧制品不带 sender_roles", sample(undefined), true],
+    ["数字 owner + 数字 operator", sample([{ open_id: "12345", role: "owner" }, { open_id: "222", role: "operator" }]), true],
+    ["41 个 emoji 的 note", sample([{ open_id: "12345", role: "owner", note: emoji41 }]), true],
+    ["81 个字符的 note", sample([{ open_id: "12345", role: "owner", note: "x".repeat(81) }]), false],
+    ["非数字 operator", sample([{ open_id: "12345", role: "owner" }, { open_id: "ou_x", role: "operator" }]), false],
+    ["非数字 owner 基准带表", sample([{ open_id: "u_frank", role: "owner" }], ["u_frank"]), false],
+    ["多余字段", sample([{ open_id: "12345", role: "owner", extra: 1 }]), false],
+    ["角色不在枚举", sample([{ open_id: "12345", role: "boss" }]), false],
+  ]) {
+    const runtime = validateSubscription(doc).ok;
+    const schema = jsonSchemaProblems(schemaDoc, doc).length === 0;
+    assert.equal(runtime, expectOk, label + "：运行时");
+    assert.equal(schema, expectOk, label + "：schema");
+    if (runtime) assert.equal(schema, true, label + "：运行时接受 ⇒ schema 接受");
+  }
+  // 关系不变量只有运行时能守：schema 是结构下界（说明写在 schema 的 description 里），这四种 schema 放过、运行时必须拒
+  assert.match(schemaDoc.properties.scope.properties.sender_roles.description ?? "", /结构下界.*唯一语义判据/u);
+  for (const [label, roles] of [
+    ["owner 标成 operator", [{ open_id: "12345", role: "operator" }]],
+    ["第二个 owner", [{ open_id: "12345", role: "owner" }, { open_id: "222", role: "owner" }]],
+    ["同一 open_id 不同角色重复", [{ open_id: "12345", role: "owner" }, { open_id: "222", role: "operator" }, { open_id: "222", role: "participant" }]],
+    ["缺 sender_ids 里的 owner", [{ open_id: "222", role: "operator" }]],
+  ]) {
+    const doc = sample(roles);
+    assert.equal(jsonSchemaProblems(schemaDoc, doc).length, 0, label + "：schema 放过（结构下界）");
+    assert.equal(validateSubscription(doc).ok, false, label + "：运行时拒");
+  }
+  // 受控登记入口：预览不写、apply 备份+原子写+读回；owner 不可登记；重复幂等；移除
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-sender-roles-"));
+  const tplFile = path.join(home, "chain-config.json");
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  const cli = (...args) => spawnSync(process.execPath, [path.resolve("scripts", "register-sender.mjs"), ...args], { encoding: "utf-8", env: { ...process.env, HOME: home } });
+  assert.equal(cli().status, 2);
+  assert.equal(cli("--template", "relative.json", "--open-id", "222", "--role", "operator").status, 2, "模板必须是绝对路径");
+  assert.equal(cli("--template", tplFile, "--open-id", "222", "--role", "owner").status, 2, "owner 不在这里登记");
+  assert.equal(cli("--template", tplFile, "--open-id", "ou_x", "--role", "operator").status, 2);
+  const preview = cli("--template", tplFile, "--open-id", "222", "--role", "operator", "--note", "同事");
+  assert.equal(preview.status, 0, preview.stdout + preview.stderr);
+  assert.match(preview.stdout, /登记 222 → operator[\s\S]*角色人数：owner 1 · operator 1 · participant 0（改后）[\s\S]*\[dry-run\] 什么都没写/u, preview.stdout);
+  assert.deepEqual(JSON.parse(fs.readFileSync(tplFile, "utf-8")), TPL, "预览不写");
+  const applied = cli("--template", tplFile, "--open-id", "222", "--role", "operator", "--note", "同事", "--apply");
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  assert.match(applied.stdout, /已写入（锁内重读重算后）。备份：/u);
+  const written = JSON.parse(fs.readFileSync(tplFile, "utf-8"));
+  assert.deepEqual(written.senders, [{ open_id: "222", role: "operator", note: "同事" }]);
+  assert.equal(written.frank_sender_id, TPL.frank_sender_id, "其余字段原样");
+  assert.ok(fs.readdirSync(home).some((n) => n.startsWith("chain-config.json.bak.")), "先备份");
+  assert.equal(validateChainTemplate(written).ok, true);
+  const again = cli("--template", tplFile, "--open-id", "222", "--role", "operator", "--note", "同事", "--apply");
+  assert.match(again.stdout, /已经是这样，没动/u);
+  const frankAsOperator = cli("--template", tplFile, "--open-id", TPL.frank_sender_id, "--role", "operator", "--apply");
+  assert.deepEqual([frankAsOperator.status, /owner_immutable/u.test(frankAsOperator.stdout)], [1, true], frankAsOperator.stdout);
+  const changed = cli("--template", tplFile, "--open-id", "222", "--role", "participant", "--apply");
+  assert.equal(changed.status, 0, changed.stdout);
+  assert.equal(JSON.parse(fs.readFileSync(tplFile, "utf-8")).senders[0].role, "participant");
+  const removed = cli("--template", tplFile, "--remove", "--open-id", "222", "--apply");
+  assert.equal(removed.status, 0, removed.stdout);
+  assert.deepEqual(JSON.parse(fs.readFileSync(tplFile, "utf-8")).senders, []);
+  assert.deepEqual([cli("--template", tplFile, "--remove", "--open-id", "222", "--apply").status], [1], "没登记过的移除 → 拒");
+  // 参数封闭：重复参数、移除带 role、重复开关 都拒
+  assert.equal(cli("--template", tplFile, "--open-id", "222", "--role", "operator", "--role", "participant").status, 2);
+  assert.equal(cli("--template", tplFile, "--remove", "--open-id", "222", "--role", "operator").status, 2);
+  assert.equal(cli("--template", tplFile, "--open-id", "222", "--role", "operator", "--apply", "--apply").status, 2);
+  assert.equal(parseRegisterSenderArgs(["--template", "/x.json", "--open-id", "1", "--role", "operator", "--role", "participant"]).reason, "duplicate_argument");
+  assert.equal(parseRegisterSenderArgs(["--template", "/x.json", "--open-id", "1", "--remove", "--note", "x"]).reason, "remove_takes_no_role");
+  // 写原语：锁内重读重算 —— 规划后世界又合法登记了别人，apply 不会把别人覆盖掉（评审反例）
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  const planA = planSenderChange(TPL, { openId: "222", role: "operator" });
+  assert.equal(planA.ok, true);
+  fs.writeFileSync(tplFile, JSON.stringify(planSenderChange(TPL, { openId: "333", role: "participant" }).template));
+  const appliedA = applySenderChange({ file: tplFile, change: { openId: "222", role: "operator" } });
+  assert.equal(appliedA.ok, true, JSON.stringify(appliedA));
+  assert.deepEqual(JSON.parse(fs.readFileSync(tplFile, "utf-8")).senders.map((e) => e.open_id).sort(), ["222", "333"], "333 没被静默覆盖");
+  // 写原语：先校验再写 —— 模板文件本身坏掉时零写入、无备份
+  const brokenBefore = "{\"broken\":true}";
+  fs.writeFileSync(tplFile, brokenBefore);
+  const backupsBefore = fs.readdirSync(home).filter((n) => n.startsWith("chain-config.json.bak.")).length;
+  const onBroken = applySenderChange({ file: tplFile, change: { openId: "444", role: "operator" } });
+  assert.deepEqual([onBroken.ok, onBroken.reason, fs.readFileSync(tplFile, "utf-8")], [false, "template_unreadable", brokenBefore], "坏模板：不写、不备份");
+  assert.equal(fs.readdirSync(home).filter((n) => n.startsWith("chain-config.json.bak.")).length, backupsBefore);
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  // 写原语：读回逐字核对写入目标
+  const exact = applySenderChange({ file: tplFile, change: { openId: "555", role: "participant" }, now: new Date("2026-08-29T01:00:00.000Z") });
+  assert.equal(exact.ok, true, JSON.stringify(exact));
+  assert.equal(fs.readFileSync(tplFile, "utf-8"), JSON.stringify(exact.table && JSON.parse(fs.readFileSync(tplFile, "utf-8")), null, 2) + "\n", "落盘的就是格式化后的那份");
+  assert.equal(exact.backup, tplFile + ".bak.2026-08-29T01-00-00-000Z");
+  assert.equal(applySenderChange({ file: "relative.json", change: { openId: "1", role: "operator" } }).reason, "template_required_absolute");
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  // 纯函数层：结果模板必须过同一份校验
+  assert.equal(planSenderChange(TPL, { openId: "222", role: "operator" }).ok, true);
+  assert.equal(planSenderChange(TPL, { openId: TPL.frank_sender_id, role: "operator" }).reason, "owner_immutable");
+  assert.equal(planSenderChange({ ...TPL, senders: [{ open_id: "1", role: "owner" }] }, { openId: "222", role: "operator" }).reason, "template_senders_invalid");
+  assert.equal(parseRegisterSenderArgs(["--template", "/x.json", "--open-id", "1", "--role", "admin"]).reason, "role_unknown");
+  // 真入口：/feishu-subscribe 与状态页第 2 层显示角色人数（只出数量，不出 id）
+  const registryFile = path.join(home, "registry.json");
+  const root = path.join(home, "project"); fs.mkdirSync(root);
+  fs.writeFileSync(tplFile, JSON.stringify(withRoles));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "roles", root, name: "角色演示", root_message_id: "om_r", expires_at: "2099-01-01T00:00:00Z",
+    session_id: "aily_roles", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z" }] }));
+  const env = { ...process.env, HOME: home, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile };
+  const sub = spawnSync(process.execPath, [path.resolve("scripts", "feishu-subscribe.mjs"), "--project", root], { encoding: "utf-8", env });
+  assert.equal(sub.status, 0, sub.stderr);
+  assert.match(sub.stdout, /发送者角色 owner 1 · operator 1 · participant 1/u, sub.stdout);
+  assert.doesNotMatch(sub.stdout, /222|333/u, "不出身份");
+  const st = spawnSync(process.execPath, [path.resolve("scripts", "feishu-status.mjs"), "--project", root], { encoding: "utf-8", env });
+  assert.equal(st.status, 0, st.stderr);
+  assert.match(st.stdout, /发送者角色\s+owner 1 · operator 1 · participant 1（只出数量）/u, st.stdout);
+  assert.doesNotMatch(st.stdout, /222|333/u);
+  // ── 唯一写事务：所有写方都走它（评审反例：安装器 / 初始化器无锁整表重写会覆盖并发登记）──
+  const lockPath = tplFile + ".lock";
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  const held = acquirePublishLock(lockPath); assert.equal(held.ok, true);
+  const busyCli = cli("--template", tplFile, "--open-id", "222", "--role", "operator", "--apply");
+  assert.deepEqual([busyCli.status, /template_busy/u.test(busyCli.stdout)], [1, true], busyCli.stdout + busyCli.stderr);
+  const initArgs = ["--chain", "claude", "--transport-agent-name", "T", "--transport-app-id", "cli_x", "--transport-open-id", "ou_t", "--outbound-agent-name", "O", "--outbound-app-id", "cli_y", "--outbound-open-id", "ou_o",
+    "--lark-cli-profile", "claude", "--lark-cli-bin", "/bin/lark", "--lark-cli-home", "/home/lark", "--frank-sender-id", "12345", "--chat-name", "群", "--chat-id", "oc_abc", "--default-freshness-ms", "900000", "--agent-uid", "agent_x"];
+  const initBusy = spawnSync(process.execPath, [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--apply"], { encoding: "utf-8", env: { ...process.env, HOME: home, FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile } });
+  assert.notEqual(initBusy.status, 0, "初始化器也走同一把锁：" + initBusy.stdout + initBusy.stderr);
+  assert.match(initBusy.stderr, /template_busy/u, initBusy.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(tplFile, "utf-8")), TPL, "持锁期间没有任何写方改到模板");
+  assert.equal(releasePublishLock(lockPath).ok, true);
+  const initOk = spawnSync(process.execPath, [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--apply"], { encoding: "utf-8", env: { ...process.env, HOME: home, FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile } });
+  assert.equal(initOk.status, 0, initOk.stdout + initOk.stderr);
+  assert.ok(fs.existsSync(tplFile + ".prev"), "初始化器保留 .prev 备份语义");
+  // 取得锁失败按真实原因报：锁路径不可创建（父目录只读）→ template_lock_unavailable，不是 template_busy
+  if (typeof process.getuid !== "function" || process.getuid() !== 0) {
+    const roDir = path.join(home, "ro"); fs.mkdirSync(roDir); const roTpl = path.join(roDir, "chain-config.json"); fs.writeFileSync(roTpl, JSON.stringify(TPL));
+    fs.chmodSync(roDir, 0o500);
+    try {
+      const r = withChainTemplateWrite({ file: roTpl, mutate: (cur) => ({ template: { ...cur, chat_name: "x" } }) });
+      assert.deepEqual([r.ok, r.reason], [false, "template_lock_unavailable"], JSON.stringify(r));
+    } finally { fs.chmodSync(roDir, 0o700); }
+  }
+  // 释放失败不伪装成完整成功：结果带 lockUncleared，CLI 非零退出并指路
+  {
+    const originalRm = fs.rmSync;
+    fs.rmSync = (target, ...args) => { if (path.resolve(String(target)) === path.resolve(lockPath)) { const e = new Error("release failed"); e.code = "EIO"; throw e; } return originalRm(target, ...args); };
+    let partial;
+    try { partial = applySenderChange({ file: tplFile, change: { openId: "777", role: "participant" } }); }
+    finally { fs.rmSync = originalRm; }
+    assert.deepEqual([partial.ok, partial.changed, typeof partial.lockUncleared], [true, true, "string"], JSON.stringify(partial));
+    assert.ok(JSON.parse(fs.readFileSync(tplFile, "utf-8")).senders.some((e) => e.open_id === "777"), "已落盘的变更不回滚，只如实报锁没交还");
+    assert.ok(lockPresent(lockPath), "主锁残留");
+    fs.rmSync(lockPath);
+  }
+  // 符号链接 / 非普通文件一律拒（评审反例：经别名写"成功"，真正的模板一字未变，且别名会派生另一把锁）
+  {
+    const alias = path.join(home, "alias.json");
+    fs.symlinkSync(tplFile, alias);
+    const canonicalBefore = fs.readFileSync(tplFile, "utf-8");
+    const viaAlias = applySenderChange({ file: alias, change: { openId: "888", role: "operator" } });
+    assert.deepEqual([viaAlias.ok, viaAlias.reason, /符号链接/u.test(viaAlias.detail)], [false, "template_not_regular_file", true], JSON.stringify(viaAlias));
+    assert.ok(fs.lstatSync(alias).isSymbolicLink(), "别名没被换成普通文件");
+    assert.equal(fs.readFileSync(tplFile, "utf-8"), canonicalBefore, "真正的模板一字未变");
+    assert.ok(!lockPresent(alias + ".lock") && !lockPresent(tplFile + ".lock"), "没有派生任何锁");
+    const aliasCli = cli("--template", alias, "--open-id", "888", "--role", "operator", "--apply");
+    assert.deepEqual([aliasCli.status, /template_not_regular_file/u.test(aliasCli.stdout)], [1, true], aliasCli.stdout + aliasCli.stderr);
+    const dirTpl = path.join(home, "dir.json"); fs.mkdirSync(dirTpl);
+    assert.equal(withChainTemplateWrite({ file: dirTpl, mutate: () => ({ template: TPL }) }).reason, "template_not_regular_file");
+    fs.rmSync(alias);
+    // 硬链接别名（评审反例）：两个目录项指同一 inode，rename 只换一个 → 拒；两份目录项与内容都不变、不派生锁；真入口同样拒
+    const hard = path.join(home, "hard.json");
+    fs.linkSync(tplFile, hard);
+    const beforeHard = fs.readFileSync(tplFile, "utf-8");
+    const viaHard = applySenderChange({ file: hard, change: { openId: "889", role: "operator" } });
+    assert.deepEqual([viaHard.ok, viaHard.reason, /硬链接/u.test(viaHard.detail)], [false, "template_has_multiple_links", true], JSON.stringify(viaHard));
+    const viaCanonicalWhileLinked = applySenderChange({ file: tplFile, change: { openId: "889", role: "operator" } });
+    assert.equal(viaCanonicalWhileLinked.reason, "template_has_multiple_links", "权威路径自己也有 2 个目录项时同样拒");
+    assert.equal(fs.readFileSync(tplFile, "utf-8"), beforeHard); assert.equal(fs.readFileSync(hard, "utf-8"), beforeHard);
+    assert.equal(fs.statSync(tplFile).ino, fs.statSync(hard).ino, "两份目录项仍指同一 inode");
+    assert.ok(!lockPresent(hard + ".lock") && !lockPresent(tplFile + ".lock"), "没有派生任何锁");
+    const hardCli = cli("--template", hard, "--open-id", "889", "--role", "operator", "--apply");
+    assert.deepEqual([hardCli.status, /template_has_multiple_links/u.test(hardCli.stdout)], [1, true], hardCli.stdout + hardCli.stderr);
+    fs.rmSync(hard);
+    assert.equal(applySenderChange({ file: tplFile, change: { openId: "889", role: "operator" } }).ok, true, "去掉别名后恢复可写");
+  }
+  // 失败叠加释放失败：公共文案两件事都说，退出码非零
+  {
+    const told = describeTemplateWrite({ ok: false, reason: "result_invalid", detail: "x", lockUncleared: "EIO" }, tplFile);
+    assert.deepEqual([told.exitCode, told.lines.length, /没有写成：result_invalid：x/u.test(told.lines[0]), /模板写锁没有交还（EIO）.*chain-config\.json\.lock/u.test(told.lines[1])], [1, 2, true, true], JSON.stringify(told));
+    assert.deepEqual(describeTemplateWrite({ ok: true, changed: false }, tplFile), { lines: ["锁内重读后已经是这样，没动。"], exitCode: 0 });
+    assert.equal(describeTemplateWrite({ ok: true, changed: true, backup: null, lockUncleared: "not_owner" }, tplFile).exitCode, 1);
+    // 真事务：mutate 返回失败 + 释放抛错 → 结果同时带 reason 与 lockUncleared
+    const originalRm = fs.rmSync;
+    fs.rmSync = (target, ...args) => { if (path.resolve(String(target)) === path.resolve(lockPath)) { const e = new Error("release failed"); e.code = "EIO"; throw e; } return originalRm(target, ...args); };
+    let both;
+    try { both = withChainTemplateWrite({ file: tplFile, mutate: () => ({ ok: false, reason: "nope" }) }); }
+    finally { fs.rmSync = originalRm; }
+    assert.deepEqual([both.ok, both.reason, typeof both.lockUncleared], [false, "nope", "string"], JSON.stringify(both));
+    fs.rmSync(lockPath);
+  }
+  // 写事务本身的三种拒绝：模板缺席 / mutate 返回受控失败 / 结果校验不过 —— 都零写入
+  const missing = path.join(home, "none.json");
+  assert.equal(withChainTemplateWrite({ file: missing, mutate: () => ({ template: TPL }) }).ok, true, "缺席时允许创建（初始化语义）");
+  fs.rmSync(missing);
+  assert.equal(withChainTemplateWrite({ file: tplFile, mutate: () => ({ ok: false, reason: "nope" }) }).reason, "nope");
+  const beforeBad = fs.readFileSync(tplFile, "utf-8");
+  assert.equal(withChainTemplateWrite({ file: tplFile, mutate: (cur) => ({ template: { ...cur, chat_id: "bad" } }) }).reason, "result_invalid");
+  assert.equal(fs.readFileSync(tplFile, "utf-8"), beforeBad, "结果校验不过零写入");
 });
 
 

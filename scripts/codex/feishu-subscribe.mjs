@@ -9,24 +9,11 @@
  * 而使用者没法知道哪个才是承诺。这里只换投影来源：
  * Claude 从 projects 建，Codex 从 tasks 建，核心读模型是同一个。
  *
- * ■ 为什么现在还不能写
+ * ■ 写入口的现状（2026-08-29）
  *
- * 跟 Claude 侧同样的两条硬约束，缺一条就会让写入制造出比不写更糟的状态：
- *
- *   FR-2.5 订阅变更必须**同步到依赖它的 binding 授权快照**；暂停或撤销时，
- *          相关 binding 必须被明确暂停或迁移，不能靠日常热路径重新解释配置。
- *          **resnapshot 那一步的落盘地基已经有了**（subscription-sync-apply.mjs），
- *          但控制面没闭环：suspend / migrate 这些动作还没实现。
- *
- *   FR-2.6 首次认领未命中**唯一** subscription 时必须拒绝。这条判据本身在，
- *          但**没有经过多订阅的真实样本验证**。
- *          "现在只有一条所以不会有歧义"是个没被计算过的断言，
- *          不该写死在源码里当理由 —— 加第二条订阅时没人会回来改它。
- *
- * **一个假装能写、实际拒绝的开关比没有开关更糟。**所以这条命令只读，
- * 并如实说明写为什么没开。
- *
- * 用法：node scripts/codex/feishu-subscribe.mjs --thread-id <hook 给的精确 id>
+ * 发送者角色表的登记入口已开放（`register-sender.mjs --template <Codex 的 chain-config.json> …`，写入需 owner 逐次授权）。
+ * 独立订阅的增删仍不开放：FR-2.5 的落盘控制面（subscription-sync-apply.mjs）已经完成，卡在 FR-2.6 ——
+ * 多于一条订阅时首次认领必须能拒绝歧义，该路径未经真实样本验证。
  */
 
 import { isDirectRun } from "../direct-run.mjs";
@@ -61,11 +48,9 @@ export function parseArgs(tokens) {
 
 const WRITE_NOTE = [
   "",
-  "这条命令只读 —— **写入口还没开**，原因写在脚本头部：",
-  "  · 订阅变更要同步到 binding 授权快照：落盘地基已有，但 suspend / migrate 未实现，控制面没闭环；",
-  "  · 首次认领未命中唯一订阅时必须拒绝，而这条没经过多订阅的真实样本验证。",
-  "在同步机制到位之前开放写，等于让人能造出「订阅说 A、授权快照仍说 B」的状态 ——",
-  "那种不一致只会在下一条消息被拒时才暴露。",
+  "这条命令只读 —— 发送者角色表可用 register-sender.mjs 登记（写入需 owner 逐次授权）；独立订阅增删仍未开放（卡在 FR-2.6，FR-2.5 落盘控制面已完成）：",
+  "  · FR-2.5 订阅变更同步到 binding 授权快照：计划器与 resnapshot / suspend / migrate 的落盘都已完成；",
+  "  · FR-2.6 首次认领未命中唯一订阅时必须拒绝：判据在，但没经过多订阅的真实样本验证 —— 这一条才是独立订阅增删没开的原因。",
 ].join("\n");
 
 function main() {

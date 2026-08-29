@@ -27,7 +27,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
-  CHAIN_FIELDS, DEFAULT_CONFIG_BASE, OPTIONAL_CHAIN_FIELDS, templatePath, validateChainTemplate, withChainTemplateWrite,
+  CHAIN_FIELDS, DEFAULT_CONFIG_BASE, OPTIONAL_CHAIN_FIELDS, templatePath, validateChainTemplate, withChainTemplateWrite, describeTemplateWrite,
 } from "./chain-template.mjs";
 
 /** 模板认识的全部字段。**派生、命令行覆盖、预览必须用同一个集合**，否则只会改一半。 */
@@ -144,8 +144,10 @@ if (!apply) {
 const out = templatePath();
 // 走模板的唯一写事务（锁内、先校验、.prev 备份、原子写、逐字读回）—— 初始化是整表重写，所以允许现状不合法。
 const wrote = withChainTemplateWrite({ file: out, backupSuffix: ".prev", allowInvalidCurrent: true, mutate: () => ({ template: tpl }) });
-if (!wrote.ok) { console.error("没有落盘：" + wrote.reason + (wrote.detail ? "：" + (typeof wrote.detail === "string" ? wrote.detail : JSON.stringify(wrote.detail)) : "")); process.exit(1); }
-if (wrote.lockUncleared) { console.error("已写入，但模板写锁没有交还（" + wrote.lockUncleared + "）：请人工确认后处理 " + out + ".lock"); process.exit(1); }
+{
+  const told = describeTemplateWrite(wrote, out);
+  if (told.exitCode !== 0) { console.error(told.lines.join("\n")); process.exit(told.exitCode); }
+}
 
 console.log("\n已写入 " + out);
 console.log("下一步：node scripts/install-outbound.mjs --apply，然后在项目目录里 /init。");

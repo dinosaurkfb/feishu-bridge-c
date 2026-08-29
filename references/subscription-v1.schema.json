@@ -112,7 +112,8 @@
                 "maxLength": 80
               }
             }
-          }
+          },
+          "description": "结构下界：JSON Schema 只表达字段取值域与整项唯一；关系不变量（owner 集合必须等于 sender_ids、open_id 不重复、每个 sender_ids 都在表里且标 owner）只由 scripts/subscription.mjs 的 validateSubscription（唯一语义判据）保证。运行时接受 ⇒ Schema 接受；反之不成立。"
         }
       }
     },

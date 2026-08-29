@@ -14,7 +14,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
-import { loadChainTemplate, validateChainTemplate, withChainTemplateWrite } from "./chain-template.mjs";
+import { describeTemplateWrite, loadChainTemplate, validateChainTemplate, withChainTemplateWrite } from "./chain-template.mjs";
 import { SENDER_ROLES, roleCounts, roleCountsText, senderRolesProblem, senderTable } from "./sender-roles.mjs";
 
 export function parseRegisterSenderArgs(argv) {
@@ -103,13 +103,8 @@ if (isDirectRun(import.meta.url)) {
   if (!plan.changed) { process.stdout.write("已经是这样，没动。\n"); process.exit(0); }
   if (!parsed.apply) { process.stdout.write("\n[dry-run] 什么都没写。写入是改授权面，要 owner 逐次授权后再加 --apply。\n"); process.exit(0); }
   const done = applySenderChange({ file: parsed.template, change: parsed });
-  const detail = (r) => (r.detail ? "：" + (typeof r.detail === "string" ? r.detail : JSON.stringify(r.detail)) : "") + (r.error ? "：" + r.error : "") + (r.problem ? "：" + r.problem : "");
-  if (!done.ok) { process.stdout.write("没有写成：" + done.reason + detail(done) + "\n"); process.exit(1); }
-  if (!done.changed) process.stdout.write("锁内重读后已经是这样，没动。\n");
-  else process.stdout.write("已写入（锁内重读重算后）。备份：" + done.backup + "\n角色人数：" + roleCountsText(roleCounts(done.table)) + "\n");
-  if (done.lockUncleared) {
-    process.stdout.write("注意：模板写锁没有交还（" + done.lockUncleared + "）；之后所有模板写方都会报 template_busy，请人工确认没有写方在跑后处理 " + parsed.template + ".lock\n");
-    process.exit(1);
-  }
-  process.exit(0);
+  const out = describeTemplateWrite(done, parsed.template);
+  if (done.ok && done.changed) out.lines.splice(1, 0, "角色人数：" + roleCountsText(roleCounts(done.table)));
+  process.stdout.write(out.lines.join("\n") + "\n");
+  process.exit(out.exitCode);
 }

@@ -93,7 +93,7 @@ import {
 import { extractReply } from "./stop-hook.mjs";
 import { postDeliveryBits } from "./publish-outcome.mjs";
 import { foreignHint, projectLabel } from "./stop-note.mjs";
-import { CHAIN_FIELDS, assertPublishIdentity, materializeProjectConfig, resolveLarkIdentity, validateChainTemplate, withChainTemplateWrite } from "./chain-template.mjs";
+import { CHAIN_FIELDS, assertPublishIdentity, materializeProjectConfig, resolveLarkIdentity, validateChainTemplate, withChainTemplateWrite, describeTemplateWrite } from "./chain-template.mjs";
 import {
   PURPOSE_MAX, bindingToken, composeRootMessage, composeStatusMessage,
   firstSentence, idempotencyKeyFor, newRegistryEntry, readProjectIdentity,
@@ -19024,6 +19024,19 @@ test("发送者角色表（第 1 层）：唯一判据、模板交叉校验、�
     const schema = jsonSchemaProblems(schemaDoc, doc).length === 0;
     assert.equal(runtime, expectOk, label + "：运行时");
     assert.equal(schema, expectOk, label + "：schema");
+    if (runtime) assert.equal(schema, true, label + "：运行时接受 ⇒ schema 接受");
+  }
+  // 关系不变量只有运行时能守：schema 是结构下界（说明写在 schema 的 description 里），这四种 schema 放过、运行时必须拒
+  assert.match(schemaDoc.properties.scope.properties.sender_roles.description ?? "", /结构下界.*唯一语义判据/u);
+  for (const [label, roles] of [
+    ["owner 标成 operator", [{ open_id: "12345", role: "operator" }]],
+    ["第二个 owner", [{ open_id: "12345", role: "owner" }, { open_id: "222", role: "owner" }]],
+    ["同一 open_id 不同角色重复", [{ open_id: "12345", role: "owner" }, { open_id: "222", role: "operator" }, { open_id: "222", role: "participant" }]],
+    ["缺 sender_ids 里的 owner", [{ open_id: "222", role: "operator" }]],
+  ]) {
+    const doc = sample(roles);
+    assert.equal(jsonSchemaProblems(schemaDoc, doc).length, 0, label + "：schema 放过（结构下界）");
+    assert.equal(validateSubscription(doc).ok, false, label + "：运行时拒");
   }
   // 受控登记入口：预览不写、apply 备份+原子写+读回；owner 不可登记；重复幂等；移除
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-sender-roles-"));
@@ -19141,6 +19154,37 @@ test("发送者角色表（第 1 层）：唯一判据、模板交叉校验、�
     assert.deepEqual([partial.ok, partial.changed, typeof partial.lockUncleared], [true, true, "string"], JSON.stringify(partial));
     assert.ok(JSON.parse(fs.readFileSync(tplFile, "utf-8")).senders.some((e) => e.open_id === "777"), "已落盘的变更不回滚，只如实报锁没交还");
     assert.ok(lockPresent(lockPath), "主锁残留");
+    fs.rmSync(lockPath);
+  }
+  // 符号链接 / 非普通文件一律拒（评审反例：经别名写"成功"，真正的模板一字未变，且别名会派生另一把锁）
+  {
+    const alias = path.join(home, "alias.json");
+    fs.symlinkSync(tplFile, alias);
+    const canonicalBefore = fs.readFileSync(tplFile, "utf-8");
+    const viaAlias = applySenderChange({ file: alias, change: { openId: "888", role: "operator" } });
+    assert.deepEqual([viaAlias.ok, viaAlias.reason, /符号链接/u.test(viaAlias.detail)], [false, "template_not_regular_file", true], JSON.stringify(viaAlias));
+    assert.ok(fs.lstatSync(alias).isSymbolicLink(), "别名没被换成普通文件");
+    assert.equal(fs.readFileSync(tplFile, "utf-8"), canonicalBefore, "真正的模板一字未变");
+    assert.ok(!lockPresent(alias + ".lock") && !lockPresent(tplFile + ".lock"), "没有派生任何锁");
+    const aliasCli = cli("--template", alias, "--open-id", "888", "--role", "operator", "--apply");
+    assert.deepEqual([aliasCli.status, /template_not_regular_file/u.test(aliasCli.stdout)], [1, true], aliasCli.stdout + aliasCli.stderr);
+    const dirTpl = path.join(home, "dir.json"); fs.mkdirSync(dirTpl);
+    assert.equal(withChainTemplateWrite({ file: dirTpl, mutate: () => ({ template: TPL }) }).reason, "template_not_regular_file");
+    fs.rmSync(alias);
+  }
+  // 失败叠加释放失败：公共文案两件事都说，退出码非零
+  {
+    const told = describeTemplateWrite({ ok: false, reason: "result_invalid", detail: "x", lockUncleared: "EIO" }, tplFile);
+    assert.deepEqual([told.exitCode, told.lines.length, /没有写成：result_invalid：x/u.test(told.lines[0]), /模板写锁没有交还（EIO）.*chain-config\.json\.lock/u.test(told.lines[1])], [1, 2, true, true], JSON.stringify(told));
+    assert.deepEqual(describeTemplateWrite({ ok: true, changed: false }, tplFile), { lines: ["锁内重读后已经是这样，没动。"], exitCode: 0 });
+    assert.equal(describeTemplateWrite({ ok: true, changed: true, backup: null, lockUncleared: "not_owner" }, tplFile).exitCode, 1);
+    // 真事务：mutate 返回失败 + 释放抛错 → 结果同时带 reason 与 lockUncleared
+    const originalRm = fs.rmSync;
+    fs.rmSync = (target, ...args) => { if (path.resolve(String(target)) === path.resolve(lockPath)) { const e = new Error("release failed"); e.code = "EIO"; throw e; } return originalRm(target, ...args); };
+    let both;
+    try { both = withChainTemplateWrite({ file: tplFile, mutate: () => ({ ok: false, reason: "nope" }) }); }
+    finally { fs.rmSync = originalRm; }
+    assert.deepEqual([both.ok, both.reason, typeof both.lockUncleared], [false, "nope", "string"], JSON.stringify(both));
     fs.rmSync(lockPath);
   }
   // 写事务本身的三种拒绝：模板缺席 / mutate 返回受控失败 / 结果校验不过 —— 都零写入

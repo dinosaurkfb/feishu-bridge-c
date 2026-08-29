@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { DEFAULT_CONFIG_BASE, validateChainTemplate, withChainTemplateWrite } from "../chain-template.mjs";
+import { DEFAULT_CONFIG_BASE, describeTemplateWrite, validateChainTemplate, withChainTemplateWrite } from "../chain-template.mjs";
 import { bridgeHome, templateFile, validateCodexTemplate } from "./state.mjs";
 import { moduleRoot } from "../direct-run.mjs";
 
@@ -72,6 +72,8 @@ if (!apply) {
 }
 const file = templateFile(bridgeHome());
 const wrote = withChainTemplateWrite({ file, backupSuffix: ".prev", allowInvalidCurrent: true, mutate: () => ({ template }) });
-if (!wrote.ok) { console.error("没有落盘：" + wrote.reason + (wrote.detail ? "：" + (typeof wrote.detail === "string" ? wrote.detail : JSON.stringify(wrote.detail)) : "")); process.exit(1); }
-if (wrote.lockUncleared) { console.error("已写入，但模板写锁没有交还（" + wrote.lockUncleared + "）：请人工确认后处理 " + file + ".lock"); process.exit(1); }
+{
+  const told = describeTemplateWrite(wrote, file);
+  if (told.exitCode !== 0) { console.error(told.lines.join("\n")); process.exit(told.exitCode); }
+}
 console.log("已写入 " + file + "。下一步先运行 scripts/codex/install.mjs 预览安装内容。");

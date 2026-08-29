@@ -274,6 +274,11 @@ export function identityErrorText(r) {
 export function withChainTemplateWrite({ file, mutate, backupSuffix = null, allowInvalidCurrent = false, now = new Date() } = {}) {
   if (typeof file !== "string" || !path.isAbsolute(file)) return { ok: false, reason: "template_required_absolute" };
   if (typeof mutate !== "function") return { ok: false, reason: "mutate_required" };
+  // 只认普通文件（或缺席）：符号链接会被 rename 换成普通文件、别名路径会派生另一把锁 —— 评审反例：经 symlink 写"成功"，真正的模板一字未变。
+  try {
+    const st = fs.lstatSync(file);
+    if (!st.isFile()) return { ok: false, reason: "template_not_regular_file", detail: st.isSymbolicLink() ? "是符号链接（别名）；请用真实路径" : "不是普通文件" };
+  } catch (err) { if (err.code !== "ENOENT") return { ok: false, reason: "template_unreadable", detail: String(err.code ?? err.message) }; }
   const lockDir = file + ".lock";
   let lock;
   try { lock = acquirePublishLock(lockDir); }
@@ -326,4 +331,24 @@ export function withChainTemplateWrite({ file, mutate, backupSuffix = null, allo
     const why = !rel?.ok ? String(rel?.reason) + (rel?.error ? "：" + rel.error : "") : rel.absent ? "锁已不在（被清理过）" : null;
     if (why && result && typeof result === "object") result.lockUncleared = why;
   }
+}
+
+/**
+ * 写事务结果的统一文案（四个写方共用）：成功 / 未变 / 失败各一句，**锁没交还时不管成败都单独一行指路** ——
+ * 评审反例：调用方先按 !ok 退出，"规划失败 + 释放失败"时只说了原始失败，锁残留没人知道。
+ * 返回 { lines, exitCode }：锁没交还一律非零。
+ */
+export function describeTemplateWrite(r, file) {
+  const lines = [];
+  const detail = (x) => (x.detail ? "：" + (typeof x.detail === "string" ? x.detail : JSON.stringify(x.detail)) : "") + (x.error ? "：" + x.error : "") + (x.problem ? "：" + x.problem : "");
+  let exitCode = 0;
+  if (!r || typeof r !== "object") { lines.push("没有写成：结果说不清"); exitCode = 1; }
+  else if (!r.ok) { lines.push("没有写成：" + r.reason + detail(r)); exitCode = 1; }
+  else if (!r.changed) lines.push("锁内重读后已经是这样，没动。");
+  else lines.push("已写入（锁内重读重算后）。" + (r.backup ? "备份：" + r.backup : "首次创建，无备份"));
+  if (r && r.lockUncleared) {
+    lines.push("注意：模板写锁没有交还（" + r.lockUncleared + "）；之后所有模板写方都会报 template_busy，请人工确认没有写方在跑后处理 " + file + ".lock");
+    exitCode = 1;
+  }
+  return { lines, exitCode };
 }

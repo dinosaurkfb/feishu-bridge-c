@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { moduleRoot } from "../direct-run.mjs";
 import { shellQuote } from "../shell-quote.mjs";
-import { withChainTemplateWrite } from "../chain-template.mjs";
+import { describeTemplateWrite, withChainTemplateWrite } from "../chain-template.mjs";
 import { buildHookCommand, ownsHookCommand, pickNode } from "./hook-command.mjs";
 import { SKILLS, expectedSkillContent } from "./skill-content.mjs";
 
@@ -190,9 +190,9 @@ if (!uninstall) {
       before = cur.bridge_root;
       return { template: { ...cur, bridge_root: RUNTIME_CURRENT } };
     } });
-    if (!wrote.ok) { const e = new Error(wrote.reason + (wrote.detail ? "：" + (typeof wrote.detail === "string" ? wrote.detail : JSON.stringify(wrote.detail)) : "")); e.code = wrote.reason; throw e; }
+    const told = describeTemplateWrite(wrote, tplFile);
+    if (told.exitCode !== 0) { console.error("模板      ：" + told.lines.join("\n            ")); const e = new Error(wrote.reason ?? "lock_uncleared"); e.code = wrote.reason ?? "lock_uncleared"; throw e; }
     if (wrote.changed) console.log("模板      ：bridge_root " + (before ?? "(无)") + " → runtime/current");
-    if (wrote.lockUncleared) { console.error("模板写锁没有交还（" + wrote.lockUncleared + "）；请人工确认后处理 " + tplFile + ".lock"); process.exit(1); }
   } catch (err) {
     // 读不出来就说读不出来 —— 不许静默跳过：这个字段错了会让整条链跑旧代码。
     if (err.code !== "ENOENT") {

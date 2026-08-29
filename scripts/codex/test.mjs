@@ -9310,6 +9310,15 @@ test("Codex 链的 chat 默认态：未绑定会话（群 @ 或私聊）不再�
   const unavailable = run("在吗", TEMPLATE.frank_sender_id, { PATH: noClaude + path.delimiter + path.dirname(process.execPath) + path.delimiter + "/usr/bin:/bin" });
   assert.notEqual(unavailable.status, 0);
   assert.match(unavailable.stdout, /这条链的 chat 靠本机 Claude CLI 答话，当前不可用（claude 不在 PATH 上）；没有回答/u, unavailable.stdout + unavailable.stderr);
+  // 已闭合的重放不被路径检查挡住：同一条消息在没有 claude 的 PATH 下重放 → 仍按记录重出
+  const okRun = run("重放我", TEMPLATE.frank_sender_id); assert.match(okRun.stdout, /^回答：重放我/mu, okRun.stdout);
+  const replayId = "msg_chat_" + seq;
+  const replayNoClaude = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], { encoding: "utf-8",
+    env: { ...isolatedEnv(), PATH: noClaude + path.delimiter + path.dirname(process.execPath) + path.delimiter + "/usr/bin:/bin", FEISHU_CODEX_BRIDGE_HOME: home, HOME: home,
+      AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_chat", FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000",
+      FAKE_AILY_ENVELOPE: JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: replayId, sessionID: "aily_dm", role: "user", createdBy: TEMPLATE.frank_sender_id, createdAtMs: Date.now(), content: '<at id="ou_same" type="employee">M5Codex</at> 重放我' } }) }] }) } });
+  assert.equal(replayNoClaude.status, 0, replayNoClaude.stdout + replayNoClaude.stderr);
+  assert.match(replayNoClaude.stdout, /^回答：重放我\n— chat[^\n]*（同一条消息的重放：按记录重出）$/mu, replayNoClaude.stdout);
   // 安装器 dry-run 与 doctor 都核这一项
   const installOut = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs")], { encoding: "utf-8", env: { ...isolatedEnv(), PATH: bin + path.delimiter + process.env.PATH, FEISHU_CODEX_BRIDGE_HOME: home, HOME: home } });
   assert.match(installOut.stdout, /chat 回复  claude CLI 可用（/u, "安装器 dry-run 报 chat 回复路径：" + installOut.stdout.slice(-400) + installOut.stderr.slice(-300));

@@ -14,7 +14,8 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import { RISK, classifyRisk } from "./risk-class.mjs";
 import { CHAT_POLICY_ID, CHAT_REPLY_ARGS, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatReplyPathStatus, diagnosticSnippet } from "./chat-reply.mjs";
-import { chatKey, senderRef, inspectChat, chatBusy, acquireChatClaim, recordChatOutcome, CHAT_MAX_CONCURRENT, CHAT_MAX_PER_SENDER } from "./chat-ledger.mjs";
+import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome, chatClaimProblem, chatOutcomeProblem, CHAT_MAX_CONCURRENT, CHAT_MAX_PER_SENDER } from "./chat-ledger.mjs";
+import { acquirePublishLock as acquireLedgerLock, releasePublishLock as releaseLedgerLock } from "./registry.mjs";
 import { evaluateChatGates, CHAT_FALLBACK_REASONS } from "./inbound-route.mjs";
 import { ZERO_TOOL_ARGS } from "./handoff.mjs";
 import { INTENT, parseInboundIntent, controlRejectText, rejectedControlProjection, shown } from "./inbound-intent.mjs";
@@ -19958,7 +19959,7 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   const failedKey = chatKey({ chain: "claude", messageId: "msg_chat_" + (seq - 2), sessionId: "aily_dm" });
   assert.equal(inspectChat({ ledgerDir, key: failedKey }).state, "failed", "失败也有终态");
   // 并发上界：在取 claim 之前判 —— 别人占满全局上限 → 拒；自己有一条在答 → 拒；被拒的不占账本（同一条消息之后还能再试）
-  const plant = (id, senderId) => { const k = chatKey({ chain: "claude", messageId: id, sessionId: "aily_dm" }); assert.ok(acquireChatClaim({ ledgerDir, key: k, meta: { chain: "claude", message_id: id, session_id: "aily_dm", sender_ref: senderRef(senderId), role: "owner", risk_class: "R1" } }).ok); return k; };
+  const plant = (id, senderId, extra = {}) => { const k = chatKey({ chain: "claude", messageId: id, sessionId: "aily_dm" }); const r = admitChat({ ledgerDir, key: k, senderId, budgetMs: 5000, maxConcurrent: 99, maxPerSender: 99, meta: { chain: "claude", message_id: id, session_id: "aily_dm", sender_ref: senderRef(senderId), role: "owner", risk_class: "R1", ...extra } }); assert.equal(r.ok, true, JSON.stringify(r)); return k; };
   const k1 = plant("busy_1", "999"); const k2 = plant("busy_2", "998");
   assert.equal(CHAT_MAX_CONCURRENT, 2);
   const busyG = run("忙", TPL.frank_sender_id);
@@ -19975,8 +19976,45 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   const staleKey = plant("stale_1", TPL.frank_sender_id);
   fs.writeFileSync(path.join(ledgerDir, staleKey + ".chat", "claim.json"), JSON.stringify({ ...JSON.parse(fs.readFileSync(path.join(ledgerDir, staleKey + ".chat", "claim.json"), "utf-8")), pid: 2 ** 30 }));
   assert.equal(inspectChat({ ledgerDir, key: staleKey }).state, "stale");
-  assert.equal(chatBusy({ ledgerDir, senderId: TPL.frank_sender_id, budgetMs: 5000 }).busy, false, "陈旧的不算占位");
+  assert.deepEqual([chatLoad({ ledgerDir, senderId: TPL.frank_sender_id, budgetMs: 5000 }).running, chatLoad({ ledgerDir, senderId: TPL.frank_sender_id, budgetMs: 5000 }).unresolved], [0, 0], "陈旧的不算占位、也不算说不清");
   fs.rmSync(path.join(ledgerDir, staleKey + ".chat"), { recursive: true, force: true });
+  // ── 账本判据封闭（评审探针：{pid} + {status:"answered",text} 不算已回答）
+  const goodKey = chatKey({ chain: "claude", messageId: "shape_1", sessionId: "aily_dm" });
+  fs.mkdirSync(path.join(ledgerDir, goodKey + ".chat"), { recursive: true });
+  fs.writeFileSync(path.join(ledgerDir, goodKey + ".chat", "claim.json"), JSON.stringify({ pid: process.pid }));
+  fs.writeFileSync(path.join(ledgerDir, goodKey + ".chat", "outcome.json"), JSON.stringify({ status: "answered", text: "伪造" }));
+  assert.match(inspectChat({ ledgerDir, key: goodKey }).why, /^claim：字段集不对/u, "最小记录不算 claim");
+  const goodClaim = { schema_version: "1.0", state: "running", key: goodKey, chain: "claude", message_id: "shape_1", session_id: "aily_dm", sender_ref: senderRef("x"), role: "owner", risk_class: "R1", pid: process.pid, started_at: "2026-08-30T00:00:00.000Z" };
+  assert.equal(chatClaimProblem(goodClaim, goodKey), null);
+  for (const [bad, why] of [[{ ...goodClaim, extra: 1 }, "字段集不对"], [{ ...goodClaim, key: "b".repeat(64) }, "key 跟目录名对不上"], [{ ...goodClaim, message_id: "other" }, "推导"], [{ ...goodClaim, chain: "gemini" }, "chain"], [{ ...goodClaim, sender_ref: "frank" }, "sender_ref"], [{ ...goodClaim, pid: 0 }, "pid"], [{ ...goodClaim, started_at: "昨天" }, "started_at"]]) assert.match(chatClaimProblem(bad, goodKey) ?? "", new RegExp(why, "u"), JSON.stringify(bad));
+  fs.writeFileSync(path.join(ledgerDir, goodKey + ".chat", "claim.json"), JSON.stringify(goodClaim));
+  assert.match(inspectChat({ ledgerDir, key: goodKey }).why, /^outcome：(schema_version 不认识|answered 的字段集不对)/u, "最小终态不算已回答");
+  const goodOutcome = { schema_version: "1.0", key: goodKey, status: "answered", text: "真", elapsed_ms: 12, recorded_at: "2026-08-30T00:00:01.000Z" };
+  assert.equal(chatOutcomeProblem(goodOutcome, goodKey), null);
+  for (const [bad, why] of [[{ ...goodOutcome, key: "c".repeat(64) }, "key"], [{ ...goodOutcome, text: "" }, "没有正文"], [{ ...goodOutcome, status: "done" }, "受控集合"], [{ ...goodOutcome, elapsed_ms: -1 }, "elapsed_ms"], [{ ...goodOutcome, status: "failed" }, "failed 的字段集不对"]]) assert.match(chatOutcomeProblem(bad, goodKey) ?? "", new RegExp(why, "u"), JSON.stringify(bad));
+  fs.writeFileSync(path.join(ledgerDir, goodKey + ".chat", "outcome.json"), JSON.stringify(goodOutcome));
+  assert.equal(inspectChat({ ledgerDir, key: goodKey }).state, "answered");
+  assert.deepEqual(recordChatOutcome({ ledgerDir, key: goodKey, outcome: { status: "answered", text: "", elapsed_ms: 1 } }).reason, "outcome_shape", "记终态先过形状");
+  fs.rmSync(path.join(ledgerDir, goodKey + ".chat"), { recursive: true, force: true });
+  // ── 说不清不折叠成空闲：账本里有读不出 / 认不出的条目 → 准入拒、入口不起模型
+  fs.mkdirSync(path.join(ledgerDir, "zzz.chat"), { recursive: true });
+  const nBefore = argvLog().length;
+  const unresolvedRun = run("账本坏了", TPL.frank_sender_id);
+  assert.notEqual(unresolvedRun.status, 0); assert.match(unresolvedRun.stdout, /chat 账本有 1 处说不清（认不出的条目 zzz.chat）/u, unresolvedRun.stdout);
+  assert.equal(argvLog().length, nBefore, "说不清时不起模型");
+  fs.rmSync(path.join(ledgerDir, "zzz.chat"), { recursive: true, force: true });
+  // ── 准入在一把锁内：锁被别人持有 → 受理忙（不起模型、不占账本）
+  const lockHeld = acquireLedgerLock(path.join(ledgerDir, "admission.lock")); assert.equal(lockHeld.ok, true, JSON.stringify(lockHeld));
+  const lockedRun = run("锁着", TPL.frank_sender_id);
+  assert.match(lockedRun.stdout, /已拒绝 · chat 正在受理另一条消息，稍后再问/u, lockedRun.stdout);
+  assert.equal(inspectChat({ ledgerDir, key: chatKey({ chain: "claude", messageId: "msg_chat_" + seq, sessionId: "aily_dm" }) }).state, "absent");
+  releaseLedgerLock(path.join(ledgerDir, "admission.lock"));
+  // ── 建 claim 是闭合转换：进位后 claim.json 一定在；没有临时目录残留；同 key 再进位 = duplicate
+  const closedKey = plant("closed_1", "777");
+  assert.equal(inspectChat({ ledgerDir, key: closedKey }).state, "running");
+  assert.equal(fs.readdirSync(ledgerDir).filter((n2) => n2.includes(".chat.tmp.")).length, 0, "没有进位前的临时目录残留");
+  assert.equal(admitChat({ ledgerDir, key: closedKey, senderId: "777", budgetMs: 5000, maxConcurrent: 99, maxPerSender: 99, meta: { chain: "claude", message_id: "closed_1", session_id: "aily_dm", sender_ref: senderRef("777"), role: "owner", risk_class: "R1" } }).reason, "duplicate");
+  fs.rmSync(path.join(ledgerDir, closedKey + ".chat"), { recursive: true, force: true });
   // 路由说不清不许降级成 chat：同一 session 命中两条 active 绑定 → 错误；登记表里有读不清的项目 → 错误
   writeRegistry([bound, { ...bound, id: "bound2", root: path.join(local, "project2"), root_message_id: "om_bound2" }]);
   fs.mkdirSync(path.join(local, "project2"), { recursive: true });

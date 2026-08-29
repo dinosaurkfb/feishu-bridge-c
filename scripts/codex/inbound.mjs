@@ -14,7 +14,7 @@ import {
 import { REJECT, normalizeBody } from "../selector.mjs";
 import { evaluateChatGates, CHAT_FALLBACK_REASONS } from "../inbound-route.mjs";
 import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatReplyPathStatus } from "../chat-reply.mjs";
-import { chatKey, senderRef, inspectChat, chatBusy, acquireChatClaim, recordChatOutcome } from "../chat-ledger.mjs";
+import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome } from "../chat-ledger.mjs";
 import {
   MAPPING_DISPOSITION, buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
 } from "../mapping-policy.mjs";
@@ -138,13 +138,7 @@ function chatTurn({ chain, template, event, dryRun, ledgerDir }) {
     process.stderr.write(JSON.stringify({ dryRun: true, mode: CHAT_POLICY_ID, role: gates.role, risk: risk.riskClass }) + "\n");
     process.exit(0);
   }
-// Codex 链的 chat 也靠本机 Claude CLI 答话（不是隐式依赖：安装器 / doctor / 状态页都核这一项）；不可用就明说，不冒充可用
-  const pathStatus = chatReplyPathStatus();
-  if (!pathStatus.available) {
-    writeReceipt("chat-path-" + messageId, { status: "error", reason: "chat_reply_path_unavailable", why: pathStatus.why, ...base });
-    finish("error", { detail: "这条链的 chat 靠本机 Claude CLI 答话，当前不可用（" + pathStatus.why + "）；没有回答" }, { reason: "chat_reply_path_unavailable", mode: CHAT_POLICY_ID });
-  }
-  // 幂等：同一条消息（chain + message_id + session_id）只答一次；重放按记录重出，不再起模型
+  // 幂等：同一条消息（chain + message_id + session_id）只答一次；重放按记录重出，不再起模型 —— 这一步在任何前置核验之前，已闭合的重放不受当前环境影响
   const key = chatKey({ chain, messageId, sessionId: event.session_id ?? "" });
   const seen = inspectChat({ ledgerDir, key });
   if (seen.state === "answered") {
@@ -155,26 +149,35 @@ function chatTurn({ chain, template, event, dryRun, ledgerDir }) {
   if (seen.state === "running") finish("error", { detail: "这条消息还在答，等它答完；不会再起第二个回答" }, { reason: "chat_running", mode: CHAT_POLICY_ID });
   if (seen.state === "stale") finish("error", { detail: "这条消息上次的回答进程没留下结果；同一条消息不会再答，请再发一条新消息" }, { reason: "chat_stale", mode: CHAT_POLICY_ID });
   if (seen.state === "unreadable") finish("error", { detail: "这条消息的 chat 账本读不出（" + seen.why + "），没有回答" }, { reason: "chat_ledger_unreadable", mode: CHAT_POLICY_ID });
-  // 并发上界：在取 claim 之前判，被拒的那条重放时还能再试
-  const busy = chatBusy({ ledgerDir, senderId: event.sender_id, budgetMs: chatReplyTimeoutMs() });
-  if (busy.busy) {
-    writeReceipt("chat-busy-" + messageId, { status: "rejected", reason: busy.reason, load: busy.load, ...base });
-    finish("rejected", { reasonText: busy.text, taskName: null }, { reason: busy.reason, mode: CHAT_POLICY_ID });
+  // Codex 链的 chat 也靠本机 Claude CLI 答话（声明并核验的前置）—— 放在既有状态处理之后、只在要起新模型之前：已闭合的重放不被它挡住
+  const pathStatus = chatReplyPathStatus();
+  if (!pathStatus.available) {
+    writeReceipt("chat-path-" + messageId, { status: "error", reason: "chat_reply_path_unavailable", why: pathStatus.why, ...base });
+    finish("error", { detail: "这条链的 chat 靠本机 Claude CLI 答话，当前不可用（" + pathStatus.why + "）；没有回答" }, { reason: "chat_reply_path_unavailable", mode: CHAT_POLICY_ID });
   }
-  const claim = acquireChatClaim({ ledgerDir, key, meta: { chain, message_id: messageId, session_id: event.session_id ?? null, sender_ref: senderRef(event.sender_id), role: gates.role, risk_class: risk.riskClass } });
-  if (!claim.ok) {
-    if (claim.reason === "duplicate") finish("error", { detail: "这条消息刚被另一个进程接手回答；不会再起第二个回答" }, { reason: "chat_duplicate_race", mode: CHAT_POLICY_ID });
-    finish("error", { detail: "chat 账本写不了（" + claim.error + "），没有回答" }, { reason: "chat_ledger_unwritable", mode: CHAT_POLICY_ID });
+  // 准入 —— 一把锁内：盘点（说不清就拒，不折叠成空闲）→ 上界 → 建 claim（闭合转换）
+  const admitted = admitChat({ ledgerDir, key, senderId: event.sender_id, budgetMs: chatReplyTimeoutMs(),
+    meta: { chain, message_id: messageId, session_id: event.session_id ?? null, sender_ref: senderRef(event.sender_id), role: gates.role, risk_class: risk.riskClass } });
+  if (!admitted.ok) {
+    const lockNote = admitted.lockUncleared ? "；另外准入锁没有交还（" + admitted.lockUncleared + "），请人工确认后处理" : "";
+    if (admitted.reason === "duplicate") finish("error", { detail: "这条消息刚被另一个进程接手回答；不会再起第二个回答" + lockNote }, { reason: "chat_duplicate_race", mode: CHAT_POLICY_ID });
+    if (admitted.reason === "chat_busy_global" || admitted.reason === "chat_busy_sender" || admitted.reason === "chat_admission_busy") {
+      writeReceipt("chat-busy-" + messageId, { status: "rejected", reason: admitted.reason, load: admitted.load ?? null, ...base });
+      finish("rejected", { reasonText: admitted.text + lockNote, taskName: null }, { reason: admitted.reason, mode: CHAT_POLICY_ID });
+    }
+    writeReceipt("chat-ledger-" + messageId, { status: "error", reason: admitted.reason, why: admitted.why ?? admitted.text ?? null, load: admitted.load ?? null, ...base });
+    finish("error", { detail: (admitted.text ?? ("chat 账本不可用（" + admitted.reason + (admitted.why ? "：" + admitted.why : "") + "），没有回答")) + lockNote }, { reason: admitted.reason, mode: CHAT_POLICY_ID });
   }
   const reply = chatReply({ instruction });
   if (!reply.ok) {
-    recordChatOutcome({ ledgerDir, key, outcome: { status: "failed", reason: reply.reason, why: reply.why, diagnostic: reply.diagnostic ?? null, elapsed_ms: reply.elapsedMs } });
-    writeReceipt("chat-failed-" + messageId, { status: "error", reason: "chat_reply_failed", why: reply.reason, detail: reply.why, diagnostic: reply.diagnostic ?? null, elapsed_ms: reply.elapsedMs, ...base, claim_acquired: true });
-    finish("error", { detail: "chat 没答出来（" + reply.why + "）。这里没有接入，无法稍后补发，请再问一次" }, { reason: "chat_reply_failed", why: reply.reason, mode: CHAT_POLICY_ID });
+    const recorded = recordChatOutcome({ ledgerDir, key, outcome: { status: "failed", reason: reply.reason, why: reply.why, diagnostic: reply.diagnostic ?? null, elapsed_ms: reply.elapsedMs } });
+    writeReceipt("chat-failed-" + messageId, { status: "error", reason: "chat_reply_failed", why: reply.reason, detail: reply.why, diagnostic: reply.diagnostic ?? null, elapsed_ms: reply.elapsedMs, ledger: recorded.ok ? "recorded" : recorded.reason, ...base, claim_acquired: true });
+    finish("error", { detail: "chat 没答出来（" + reply.why + "）。这里没有接入，无法稍后补发，请再问一次" + (recorded.ok ? "" : "（账本没记下终态：" + recorded.reason + "）") }, { reason: "chat_reply_failed", why: reply.reason, mode: CHAT_POLICY_ID });
   }
-  recordChatOutcome({ ledgerDir, key, outcome: { status: "answered", text: reply.text, elapsed_ms: reply.elapsedMs } });
-  writeReceipt("chat-" + messageId, { status: "chat", kind: "reply", elapsed_ms: reply.elapsedMs, ...base, claim_acquired: true });
-  finish("chat", { text: reply.text }, { mode: CHAT_POLICY_ID, kind: "reply", elapsed_ms: reply.elapsedMs, role: gates.role, risk_class: risk.riskClass });
+  const recorded = recordChatOutcome({ ledgerDir, key, outcome: { status: "answered", text: reply.text, elapsed_ms: reply.elapsedMs } });
+  writeReceipt("chat-" + messageId, { status: "chat", kind: "reply", elapsed_ms: reply.elapsedMs, ledger: recorded.ok ? "recorded" : recorded.reason, ...base, claim_acquired: true });
+  // 回答已经拿到就要给人；账本没记下只影响重放（会按 stale 处理、不再答），如实标注
+  finish("chat", { text: reply.text, ledgerNote: recorded.ok ? null : "（账本没记下这次回答：" + recorded.reason + "；同一条消息的重放不会再答）" }, { mode: CHAT_POLICY_ID, kind: "reply", elapsed_ms: reply.elapsedMs, role: gates.role, risk_class: risk.riskClass, ledger: recorded.ok ? "recorded" : recorded.reason });
 }
 
 function ackText(kind, detail) {
@@ -183,7 +186,7 @@ function ackText(kind, detail) {
     "已投递到绑定的 Codex task。严格确认完成后会自动回复到本话题；失败会发送风险回执。",
     "消息 " + detail.messageId.slice(-8) + " | claim " + detail.key.slice(0, 8),
   ].join("\n");
-  if (kind === "chat") return detail.text + "\n" + CHAT_FOOTER + (detail.replayed ? "（同一条消息的重放：按记录重出）" : "");
+  if (kind === "chat") return detail.text + "\n" + CHAT_FOOTER + (detail.replayed ? "（同一条消息的重放：按记录重出）" : "") + (detail.ledgerNote ?? "");
   if (kind === "bound") return [
     "绑定完成 · " + detail.taskName,
     "这个话题现在精确通向一个 Codex task。之后在这里 @ M5Codex 即可续接。",

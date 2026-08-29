@@ -21,6 +21,16 @@ export function chatReplyTimeoutMs(env = process.env) {
   return Number.isFinite(n) && n > 0 ? n : CHAT_REPLY_TIMEOUT_MS;
 }
 export const CHAT_REPLY_MAX_CHARS = 4000;
+/** 失败原因的封闭枚举与给人看的文案 —— 账本终态只存 reason，重放时从这张表渲染，不吐存储的任何自由文本。 */
+export const CHAT_FAIL_REASONS = Object.freeze(["timeout", "spawn_failed", "nonzero_exit", "empty_reply"]);
+export function chatFailText(reason, { timeoutMs = CHAT_REPLY_TIMEOUT_MS, exitCode = null } = {}) {
+  return {
+    timeout: "超过 " + Math.round(timeoutMs / 1000) + " 秒没答完",
+    spawn_failed: "回复进程起不来",
+    nonzero_exit: "回复进程异常退出" + (Number.isInteger(exitCode) ? "（退出码 " + exitCode + "）" : ""),
+    empty_reply: "回复进程没有输出",
+  }[reason] ?? "回复失败（" + String(reason) + "）";
+}
 /** 同步回答用 text 输出；边界参数与 REPLY_ONLY_ARGS 共用同一份 ZERO_TOOL_ARGS。 */
 export const CHAT_REPLY_ARGS = Object.freeze([...ZERO_TOOL_ARGS, "--output-format", "text"]);
 export const CHAT_SYSTEM_PROMPT =
@@ -61,12 +71,12 @@ export function chatReply({ instruction, claudeBin = "claude", timeoutMs = chatR
   const elapsedMs = Date.now() - startedAt;
   const diagnostic = run.stderr ? diagnosticSnippet(run.stderr) : null;
   if (run.error) {
-    if (run.error.code === "ETIMEDOUT") return { ok: false, reason: "timeout", why: "超过 " + Math.round(timeoutMs / 1000) + " 秒没答完", diagnostic, elapsedMs };
-    return { ok: false, reason: "spawn_failed", why: run.error.code === "ENOENT" ? "本机没有 claude 命令" : "回复进程起不来", diagnostic: diagnosticSnippet(run.error.code ?? run.error.message, 80), elapsedMs };
+    if (run.error.code === "ETIMEDOUT") return { ok: false, reason: "timeout", why: chatFailText("timeout", { timeoutMs }), diagnostic, elapsedMs };
+    return { ok: false, reason: "spawn_failed", why: chatFailText("spawn_failed"), diagnostic: diagnosticSnippet(run.error.code ?? run.error.message, 80), elapsedMs };
   }
-  if (run.status !== 0) return { ok: false, reason: "nonzero_exit", why: "回复进程异常退出（退出码 " + run.status + "）", diagnostic, elapsedMs };
+  if (run.status !== 0) return { ok: false, reason: "nonzero_exit", why: chatFailText("nonzero_exit", { exitCode: run.status }), diagnostic, elapsedMs };
   const text = String(run.stdout ?? "").trim();
-  if (!text) return { ok: false, reason: "empty_reply", why: "回复进程没有输出", diagnostic, elapsedMs };
+  if (!text) return { ok: false, reason: "empty_reply", why: chatFailText("empty_reply"), diagnostic, elapsedMs };
   return { ok: true, text: Array.from(text).length > CHAT_REPLY_MAX_CHARS ? Array.from(text).slice(0, CHAT_REPLY_MAX_CHARS).join("") + "…" : text, elapsedMs };
 }
 

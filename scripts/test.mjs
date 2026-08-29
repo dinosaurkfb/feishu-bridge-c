@@ -13,7 +13,7 @@ import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import { RISK, classifyRisk } from "./risk-class.mjs";
-import { CHAT_POLICY_ID, CHAT_REPLY_ARGS, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatReplyPathStatus, diagnosticSnippet } from "./chat-reply.mjs";
+import { CHAT_POLICY_ID, CHAT_REPLY_ARGS, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatReplyPathStatus, diagnosticSnippet, chatFailText, CHAT_FAIL_REASONS } from "./chat-reply.mjs";
 import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome, chatClaimProblem, chatOutcomeProblem, CHAT_MAX_CONCURRENT, CHAT_MAX_PER_SENDER } from "./chat-ledger.mjs";
 import { acquirePublishLock as acquireLedgerLock, releasePublishLock as releaseLedgerLock } from "./registry.mjs";
 import { evaluateChatGates, CHAT_FALLBACK_REASONS } from "./inbound-route.mjs";
@@ -20015,6 +20015,53 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   assert.equal(fs.readdirSync(ledgerDir).filter((n2) => n2.includes(".chat.tmp.")).length, 0, "没有进位前的临时目录残留");
   assert.equal(admitChat({ ledgerDir, key: closedKey, senderId: "777", budgetMs: 5000, maxConcurrent: 99, maxPerSender: 99, meta: { chain: "claude", message_id: "closed_1", session_id: "aily_dm", sender_ref: senderRef("777"), role: "owner", risk_class: "R1" } }).reason, "duplicate");
   fs.rmSync(path.join(ledgerDir, closedKey + ".chat"), { recursive: true, force: true });
+  // ── 评审第 3 轮：读记录不许被命名管道卡死、不许跟符号链接；进位残骸在锁内只能是残骸；枚举封闭；失败重放只从表渲染
+  const fifoKey = chatKey({ chain: "claude", messageId: "fifo_1", sessionId: "aily_dm" });
+  fs.mkdirSync(path.join(ledgerDir, fifoKey + ".chat"), { recursive: true });
+  execFileSync("mkfifo", [path.join(ledgerDir, fifoKey + ".chat", "claim.json")]);
+  const t0 = Date.now();
+  assert.match(inspectChat({ ledgerDir, key: fifoKey }).why, /不是普通文件/u, "命名管道不被读、不卡死");
+  assert.ok(Date.now() - t0 < 1000, "没有阻塞");
+  assert.equal(chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000 }).unresolved, 1, "管道算说不清");
+  fs.rmSync(path.join(ledgerDir, fifoKey + ".chat"), { recursive: true, force: true });
+  const linkKey = chatKey({ chain: "claude", messageId: "link_1", sessionId: "aily_dm" });
+  fs.mkdirSync(path.join(ledgerDir, linkKey + ".chat"), { recursive: true });
+  fs.symlinkSync(registryFile, path.join(ledgerDir, linkKey + ".chat", "claim.json"));
+  assert.match(inspectChat({ ledgerDir, key: linkKey }).why, /符号链接/u, "符号链接不跟");
+  fs.rmSync(path.join(ledgerDir, linkKey + ".chat"), { recursive: true, force: true });
+  fs.mkdirSync(path.join(ledgerDir, closedKey + ".chat.tmp.1.1"), { recursive: true });
+  const residueAdmit = admitChat({ ledgerDir, key: closedKey, senderId: "777", budgetMs: 5000, meta: { chain: "claude", message_id: "closed_1", session_id: "aily_dm", sender_ref: senderRef("777"), role: "owner", risk_class: "R1" } });
+  assert.equal(residueAdmit.reason, "chat_ledger_unresolved"); assert.match(residueAdmit.text, /进位残骸（上次建 claim 中断）/u, "锁内看到的临时目录只能是残骸");
+  assert.equal(fs.existsSync(path.join(ledgerDir, closedKey + ".chat")), false, "残骸在场时不建 claim");
+  fs.rmSync(path.join(ledgerDir, closedKey + ".chat.tmp.1.1"), { recursive: true, force: true });
+  assert.match(chatClaimProblem({ ...goodClaim, role: "boss" }, goodKey), /role 不在受控集合里/u);
+  assert.match(chatClaimProblem({ ...goodClaim, risk_class: "R9" }, goodKey), /risk_class 不在受控集合里/u);
+  assert.match(chatOutcomeProblem({ schema_version: "1.0", key: goodKey, status: "failed", reason: "unknown-reason", why: "x", diagnostic: null, elapsed_ms: 1, recorded_at: "2026-08-30T00:00:00.000Z" }, goodKey), /reason 不在受控集合里/u);
+  assert.deepEqual([...CHAT_FAIL_REASONS], ["timeout", "spawn_failed", "nonzero_exit", "empty_reply"]);
+  assert.equal(chatFailText("nonzero_exit", { exitCode: 3 }), "回复进程异常退出（退出码 3）");
+  // 失败重放：存的 why 里有 ESC 与 locator，用户看到的只有表里的文案
+  const failKey = chatKey({ chain: "claude", messageId: "msg_chat_fail", sessionId: "aily_dm" });
+  fs.mkdirSync(path.join(ledgerDir, failKey + ".chat"), { recursive: true });
+  fs.writeFileSync(path.join(ledgerDir, failKey + ".chat", "claim.json"), JSON.stringify({ ...goodClaim, key: failKey, message_id: "msg_chat_fail", sender_ref: senderRef(TPL.frank_sender_id) }));
+  fs.writeFileSync(path.join(ledgerDir, failKey + ".chat", "outcome.json"), JSON.stringify({ schema_version: "1.0", key: failKey, status: "failed", reason: "timeout", why: "raw\u001b[31m om_1234567890abcdef", diagnostic: null, elapsed_ms: 1, recorded_at: "2026-08-30T00:00:00.000Z" }));
+  const failReplay = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
+    env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+      AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_chat", FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000",
+      FAKE_AILY_ENVELOPE: JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_chat_fail", sessionID: "aily_dm", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + "失败重放" } }) }] }) } });
+  assert.notEqual(failReplay.status, 0);
+  assert.match(failReplay.stdout, /这条消息上次就没答出来（超过 60 秒没答完）；同一条消息不会再答/u, failReplay.stdout);
+  assert.doesNotMatch(failReplay.stdout, /raw|\u001b|om_1234567890abcdef/u, "存储的 why 不进用户文案");
+  fs.rmSync(path.join(ledgerDir, failKey + ".chat"), { recursive: true, force: true });
+  // 准入成功但锁没交还：结果带 lockUncleared（入口据此写回执并在尾行说明）
+  const lockPath = path.join(ledgerDir, "admission.lock");
+  const originalRm = fs.rmSync;
+  fs.rmSync = (target, ...args) => { if (path.resolve(String(target)) === path.resolve(lockPath)) { const e = new Error("release failed"); e.code = "EIO"; throw e; } return originalRm(target, ...args); };
+  let unclearedAdmit;
+  try { unclearedAdmit = admitChat({ ledgerDir, key: chatKey({ chain: "claude", messageId: "lock_1", sessionId: "aily_dm" }), senderId: "555", budgetMs: 5000, meta: { chain: "claude", message_id: "lock_1", session_id: "aily_dm", sender_ref: senderRef("555"), role: "owner", risk_class: "R1" } }); }
+  finally { fs.rmSync = originalRm; }
+  assert.deepEqual([unclearedAdmit.ok, typeof unclearedAdmit.lockUncleared], [true, "string"], JSON.stringify(unclearedAdmit));
+  fs.rmSync(lockPath, { recursive: true, force: true });
+  fs.rmSync(path.join(ledgerDir, chatKey({ chain: "claude", messageId: "lock_1", sessionId: "aily_dm" }) + ".chat"), { recursive: true, force: true });
   // 路由说不清不许降级成 chat：同一 session 命中两条 active 绑定 → 错误；登记表里有读不清的项目 → 错误
   writeRegistry([bound, { ...bound, id: "bound2", root: path.join(local, "project2"), root_message_id: "om_bound2" }]);
   fs.mkdirSync(path.join(local, "project2"), { recursive: true });

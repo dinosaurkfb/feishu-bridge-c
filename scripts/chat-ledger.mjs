@@ -18,6 +18,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { isCanonicalIso } from "./canonical-time.mjs";
+import { SENDER_ROLES } from "./sender-roles.mjs";
+import { RISK } from "./risk-class.mjs";
+import { CHAT_FAIL_REASONS } from "./chat-reply.mjs";
 
 export const CHAT_MAX_CONCURRENT = 2;
 export const CHAT_MAX_PER_SENDER = 1;
@@ -47,7 +50,8 @@ export function chatClaimProblem(doc, key) {
   if (doc.session_id !== null && !nonEmpty(doc.session_id)) return "session_id 形状不对";
   if (chatKey({ chain: doc.chain, messageId: doc.message_id, sessionId: doc.session_id ?? "" }) !== key) return "key 不是由 chain / message_id / session_id 推导出来的";
   if (!SENDER_REF_SHAPE.test(String(doc.sender_ref))) return "sender_ref 形状不对";
-  if (!nonEmpty(doc.role) || !nonEmpty(doc.risk_class)) return "role / risk_class 缺失";
+  if (!SENDER_ROLES.includes(doc.role)) return "role 不在受控集合里";
+  if (!Object.values(RISK).includes(doc.risk_class)) return "risk_class 不在受控集合里";
   if (!Number.isInteger(doc.pid) || doc.pid <= 0) return "pid 不是正整数";
   if (!isCanonicalIso(doc.started_at)) return "started_at 不是规范时间";
   return null;
@@ -68,7 +72,8 @@ export function chatOutcomeProblem(doc, key) {
   }
   if (doc.status === "failed") {
     if (keys !== OUTCOME_FAILED_KEYS) return "failed 的字段集不对";
-    if (!nonEmpty(doc.reason) || !nonEmpty(doc.why)) return "failed 缺 reason / why";
+    if (!CHAT_FAIL_REASONS.includes(doc.reason)) return "failed 的 reason 不在受控集合里";
+    if (!nonEmpty(doc.why)) return "failed 缺 why";
     if (doc.diagnostic !== null && typeof doc.diagnostic !== "string") return "diagnostic 形状不对";
     return null;
   }
@@ -76,12 +81,24 @@ export function chatOutcomeProblem(doc, key) {
 }
 
 const claimDir = (ledgerDir, key) => path.join(ledgerDir, key + ".chat");
+/** 读记录：O_NONBLOCK | O_NOFOLLOW 打开、同一 fd fstat 确认普通文件后再读 —— 命名管道会把持锁的盘点卡死，符号链接会读到别处（评审探针）。 */
 const readJson = (file) => {
-  let raw;
-  try { raw = fs.readFileSync(file, "utf-8"); }
-  catch (err) { return err?.code === "ENOENT" ? { status: "absent" } : { status: "unreadable", why: String(err.code ?? err.message) }; }
-  try { return { status: "read", doc: JSON.parse(raw) }; }
-  catch { return { status: "unreadable", why: "不是 JSON" }; }
+  let fd = null;
+  try {
+    try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW); }
+    catch (err) {
+      if (err?.code === "ENOENT") return { status: "absent" };
+      return { status: "unreadable", why: err?.code === "ELOOP" ? "不是普通文件（符号链接）" : String(err.code ?? err.message) };
+    }
+    if (!fs.fstatSync(fd).isFile()) return { status: "unreadable", why: "不是普通文件" };
+    let raw;
+    try { raw = fs.readFileSync(fd, "utf-8"); }
+    catch (err) { return { status: "unreadable", why: String(err.code ?? err.message) }; }
+    try { return { status: "read", doc: JSON.parse(raw) }; }
+    catch { return { status: "unreadable", why: "不是 JSON" }; }
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
+  }
 };
 const writeJsonAtomic = (file, doc) => {
   const tmp = file + ".tmp." + process.pid + "." + Date.now();
@@ -124,7 +141,8 @@ export function chatLoad({ ledgerDir, senderId, now = Date.now(), budgetMs }) {
   let running = 0; let bySender = 0; let unresolved = 0; const why = [];
   for (const n of names) {
     if (n === ADMISSION_LOCK || n.startsWith(ADMISSION_LOCK + ".")) continue;   // 锁与它的回收残骸不是条目
-    if (/\.chat\.tmp\.\d+\.\d+$/u.test(n)) continue;                            // 进位前的临时目录：不是 claim
+    // 进位前的临时目录：盘点在准入锁内做，此刻不可能有另一笔合法进位在跑 —— 它只能是上次建 claim 中断留下的残骸，说不清就不许当不存在
+    if (/\.chat\.tmp\.\d+\.\d+$/u.test(n)) { unresolved += 1; why.push("进位残骸（上次建 claim 中断）" + n.slice(0, 20) + "…，人工删除"); continue; }
     if (!n.endsWith(".chat") || !KEY_SHAPE.test(n.slice(0, -".chat".length))) { unresolved += 1; why.push("认不出的条目 " + n.slice(0, 40)); continue; }
     const key = n.slice(0, -".chat".length);
     const seen = inspectChat({ ledgerDir, key });

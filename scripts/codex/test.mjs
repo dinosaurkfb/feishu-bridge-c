@@ -40,6 +40,7 @@ import { sweepEligible } from "./drain-all.mjs";
 import { remindCodexPendingClaims } from "./claim-reminder.mjs";
 import { claimKey, recordClaimState, readClaimState, acquireClaim } from "../claim.mjs";
 import { codexControlRepairPrecondition } from "./repair-control-claim.mjs";
+import { codexControlPrecondition } from "./control-identity.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
 import {
   ELIGIBILITY_BUDGET_DEFAULT_MS, ELIGIBILITY_BUDGET_MAX_MS, eligibilityBudgetMs,
@@ -9077,6 +9078,15 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
   assert.equal(failedViaTransport.status, 1, failedViaTransport.stdout);
   assert.match(failedViaTransport.stdout, /之前执行失败（initial execution failed）；本次是同一条消息的重放，没有再次尝试/u, failedViaTransport.stdout);
   assert.equal(policyOf(), modeBefore, "重放不执行");
+  // 控制事务绑定当前身份（评审 #94 第 5 轮）：同 key、归属另一 thread 的旧 claim 重放 → 通用幂等命中、不执行、模式不变
+  const foreignCtl = acquireClaim({ claimsDir: paths.claims, messageId: "msg_ctl_x", logicalTaskKey: ltk, meta: { ...protoMeta, codex_thread_id: "01922222-3333-7444-8555-000000000099", control: { control: "mode", mode: DIALOGUE_POLICY_ID } } });
+  assert.ok(foreignCtl.ok);
+  const foreignCtlVia = run("$feishu-mode dialogue", "msg_ctl_x");
+  assert.match(foreignCtlVia.stdout, /已经处理过（幂等命中）/u, foreignCtlVia.stdout);
+  assert.equal(policyOf(), modeBefore, "别的 thread 的 claim 动不了本 task 的模式");
+  assert.equal(fs.existsSync(path.join(paths.claims, foreignCtl.key + ".consumed.json")), false);
+  fs.rmSync(path.join(paths.claims, foreignCtl.key + ".claim"), { recursive: true, force: true });
+  assert.equal(codexControlRepairPrecondition, codexControlPrecondition, "生产入口与维护入口用同一份写锁内前置条件（codex/control-identity.mjs）");
   assert.ok(!fs.existsSync(path.join(paths.claims, key10 + ".consumed.json")), "没有留下并存");
   // 逐 key 事务锁：另一笔持有时维护入口与重放都拿不到
   const lock10 = path.join(paths.claims, key10 + ".control.lock");
@@ -9095,6 +9105,60 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
   assert.throws(() => fs.lstatSync(path.join(paths.claims, key10 + ".control.lock")), "事务锁用完释放");
   assert.equal(setTaskInteractionMode({ threadId: THREAD_A, mode: MAPPING_POLICY_ID, home }).ok, true);
 });
+const DRIFT_HOOK = [
+  'import fs from "node:fs";',
+  'const watch = process.env.DRIFT_AFTER_READ, file = process.env.DRIFT_FILE, transform = new Function("doc", process.env.DRIFT_JS);',
+  'const orig = fs.readFileSync; let fired = false;',
+  'fs.readFileSync = function (p, ...rest) {',
+  '  const out = orig.call(fs, p, ...rest);',
+  '  if (!fired && typeof p === "string" && p === watch) { fired = true; fs.writeFileSync(file, JSON.stringify(transform(JSON.parse(orig.call(fs, file, "utf-8"))))); }',
+  '  return out;',
+  '};',
+].join("\n") + "\n";
+
+test("Codex 控制事务的换绑窗口（评审 #97）：事务锁内核验通过之后、task 写锁取得之前登记表里的 task 换了身份 → 写锁内前置条件拒写、模式不变、不落 consumed、入口非零", () => {
+  const home = temp();
+  const root = path.join(home, "project"); const bin = path.join(home, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_drift", token: "a" });
+  task.session_id = "aily_drift"; task.inbound_state = "bound"; delete task.topic_generation_state; delete task.channel_generation_id;
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const hook = path.join(home, "drift-hook.mjs"); fs.writeFileSync(hook, DRIFT_HOOK);
+  const run = (body, messageId, extraEnv = {}) => {
+    const content = '<at id="ou_same" type="employee">M5Codex</at> ' + body;
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: messageId, sessionID: "aily_drift", role: "user", createdBy: TEMPLATE.frank_sender_id, createdAtMs: Date.now(), content } }) }] });
+    return spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], { encoding: "utf-8",
+      env: { ...isolatedEnv(), PATH: bin + path.delimiter + process.env.PATH, FEISHU_CODEX_BRIDGE_HOME: home,
+        AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "aily_drift", AILY_CLI_RUN_ID: "run_drift", FAKE_AILY_ENVELOPE: envelope, ...extraEnv } });
+  };
+  const policyOf = () => interactionPolicyForTask(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task).state.policy_id;
+  const paths = taskPaths(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task, home);
+  const ltk = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task.logical_task_key;
+  const warm = run("$feishu-mode dialogue", "msg_drift_0");
+  assert.equal(warm.status, 0, warm.stdout + warm.stderr);
+  assert.equal(policyOf(), DIALOGUE_POLICY_ID);
+  assert.equal(run("$feishu-mode mapping", "msg_drift_1").status, 0);
+  assert.equal(policyOf(), MAPPING_POLICY_ID);
+  // 换绑窗口：事务锁内第一次读完 claim.json 之后，登记表里这个 task 的 logical_task_key 换成别的
+  const key = claimKey("msg_drift_2", ltk);
+  // 与评审探针同一种换法：同一 thread 换成另一个根目录的 task（logical task 变了，登记表本身合法）
+  const replacement = makeTaskEntry({ root: path.join(home, "replacement-project"), threadId: THREAD_A, name: "new", rootMessageId: "om_new", token: "newtok" });
+  replacement.session_id = "aily_drift"; replacement.inbound_state = "bound"; delete replacement.topic_generation_state; delete replacement.channel_generation_id;
+  const drift = run("$feishu-mode dialogue", "msg_drift_2", {
+    NODE_OPTIONS: "--import " + pathToFileURL(hook).href,
+    DRIFT_AFTER_READ: path.join(paths.claims, key + ".claim", "claim.json"),
+    DRIFT_FILE: path.join(home, "registry.json"), DRIFT_DOC: JSON.stringify({ schema_version: "1.0", tasks: [replacement] }),
+    DRIFT_JS: "return JSON.parse(process.env.DRIFT_DOC);",
+  });
+  assert.notEqual(drift.status, 0, "换了 task 身份之后旧命令不许成功：" + drift.stdout + drift.stderr);
+  assert.match(drift.stdout, /模式没有切换（precondition_failed）/u, drift.stdout + drift.stderr);
+  assert.equal(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task.logical_task_key, replacement.logical_task_key, "钩子确实在窗口里换了身份");
+  assert.notEqual(replacement.logical_task_key, ltk);
+  assert.equal(policyOf(), MAPPING_POLICY_ID, "新身份的 task 模式没被旧命令改掉");
+  assert.equal(fs.existsSync(path.join(paths.claims, key + ".consumed.json")), false, "不落 consumed");
+});
+
 
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);

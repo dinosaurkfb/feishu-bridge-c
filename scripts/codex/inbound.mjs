@@ -35,6 +35,7 @@ import {
   shadowCodexFirstClaim, taskPaths,
 } from "./state.mjs";
 import { controlAckText, parseControlCommand, runControlTransaction } from "../control-command.mjs";
+import { codexControlPrecondition } from "./control-identity.mjs";
 import { isDirectRun } from "../direct-run.mjs";
 import { composeCrashReceipt } from "../crash-receipt.mjs";
 /**
@@ -308,10 +309,14 @@ if (!mappingContext.ok) {
 
 // 控制命令（$feishu-mode dialogue|mapping）：三道闸之后先解析意图、随 claim 持久化；执行与终态在拿到 claim 之后做（可恢复事务）。
 const control = parseControlCommand(verdict.instruction, { chain: "codex" });
+// 控制事务用的身份期望 —— 与 claim 里写的身份字段同一算法；换绑 / 换线程之后同 key 的旧 claim 对不上，就不替它执行、不重出回执。
+const claimExpect = { logicalTaskKey: task.logical_task_key, codexThreadId: task.codex_thread_id };
 const runControl = (replay) => {
   const tx = runControlTransaction({
-    claimsDir: paths.claims, key: claim.key, intent: control ? { control: control.kind, mode: control.mode } : undefined, replay,
-    execute: (mode) => setTaskInteractionMode({ threadId: task.codex_thread_id, mode, home: HOME }),
+    claimsDir: paths.claims, key: claim.key, intent: control ? { control: control.kind, mode: control.mode } : undefined, replay, expect: claimExpect,
+    // task 写锁内再核一次身份（与维护入口同一份判据）：事务核验与写入之间换了 task，旧命令不许改新对象。
+    execute: (mode) => setTaskInteractionMode({ threadId: task.codex_thread_id, mode, home: HOME,
+      precondition: codexControlPrecondition({ claimsDir: paths.claims, key: claim.key, expect: claimExpect }) }),
   });
   // 锁没干净交还的话，不管事务成败都要说出来：之后同一笔会报 control_busy。
   const lockNote = tx.lockUncleared ? "；另外这一笔的事务锁没有交还（" + tx.lockUncleared + "），之后同一笔会报 control_busy，请人工确认后处理" : "";
@@ -347,7 +352,7 @@ const claim = acquireClaim({
   },
 });
 if (!claim.ok && claim.reason === "duplicate" && control) {
-  const original = readClaimState({ claimsDir: paths.claims, key: claim.key });
+  const original = readClaimState({ claimsDir: paths.claims, key: claim.key, expect: claimExpect });
   const intent = original.status === "valid" ? original.claim.control : undefined;
   if (intent && intent.control === control.kind && intent.mode === control.mode) {
     claim.key = claim.key ?? claimKey(verdict.messageId, verdict.logicalTaskKey);

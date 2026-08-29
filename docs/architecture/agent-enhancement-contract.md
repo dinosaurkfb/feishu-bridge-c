@@ -497,6 +497,8 @@ runtime terminal event
 subscription、binding 和 policy 的每次变更 MUST 生成单调版本或不可变审计事件。run 在开始时
 固定所使用的配置版本；运行中控制面更新不应悄悄改变该 run 的授权和发布目标。
 
+- 控制命令事务（`runControlTransaction`）**锁内先重读 claim**：调用方带当前绑定 / task 的身份期望（Claude：logical task / binding / 会话；Codex：logical task / thread，与 claim 里写的身份字段同一算法），claim 不属于当前身份 → `claim_unreadable`、没有控制意图 → `not_control`、调用方意图与锁内 claim 不一致 → `claim_intent_mismatch` —— 都不执行、不写记录；执行与写终态用锁内 claim 的意图。两条 inbound 的 duplicate 预检与事务调用传同一份期望；维护入口 `resumeControlClaim` 也只把期望带进锁内，不用锁外快照执行。旧 binding / thread 的同 key claim 重放落到通用的幂等命中，改不了当前模式。
+
 ## 13. 并发、失败与恢复
 
 | 场景 | 契约行为 |

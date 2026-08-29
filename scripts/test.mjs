@@ -72,6 +72,7 @@ import {
 import { parseRunOutcome } from "./handoff.mjs";
 import { repairRunClaims } from "./repair-run-claim.mjs";
 import { claudeClaimExpectation, controlRepairPrecondition, repairExitCode, expectationFromMapping, describeControlRepair } from "./repair-control-claim.mjs";
+import { claudeControlPrecondition } from "./control-identity.mjs";
 import {
   describeDrainOutcome, drainProject, inspectRunChannel, outboxDirOf, suppressCmd, watcherActive, inventoryUnroutedReplies } from "./drain-outbox.mjs";
 import { CANDIDATE_POLICIES, publishOutboxAttempt } from "./publish-attempt.mjs";
@@ -18468,6 +18469,36 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   assert.match(failedViaTransport.stdout, /之前执行失败（initial execution failed）；本次是同一条消息的重放，没有再次尝试/u, failedViaTransport.stdout);
   assert.equal(policyOf(), MAPPING_POLICY_ID, "重放不执行");
   assert.equal(inspectControlClaim({ claimsDir, key: key10 }).state, "failed");
+  // ── 控制事务绑定当前身份、锁内重读 claim（评审 #94 第 5 轮）：同 key、归属另一 binding 的旧 claim 重放 → 通用幂等命中，不执行、不写 consumed、模式不变
+  const foreignCtlKey = claimKey("msg_ctl_x", logicalTaskKey);
+  assert.ok(acquireClaim({ claimsDir, messageId: "msg_ctl_x", logicalTaskKey, meta: { ...protoMeta, binding_id: "someone-else", control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).ok);
+  const foreignVia = run("/feishu-mode dialogue", "msg_ctl_x");
+  assert.match(foreignVia.stdout, /已经处理过（幂等命中）/u, foreignVia.stdout);
+  assert.equal(policyOf(), MAPPING_POLICY_ID, "别的 binding 的 claim 动不了本项目的模式");
+  assert.equal(readConsumedRecord({ claimsDir, key: foreignCtlKey }).status, "absent");
+  let foreignRuns = 0;
+  const own = { logicalTaskKey, bindingId: protoMeta.binding_id, claudeSessionId: protoMeta.claude_session_id ?? null };
+  assert.deepEqual([runControlTransaction({ claimsDir, key: foreignCtlKey, intent: { control: "mode", mode: DIALOGUE_POLICY_ID }, expect: own, execute: () => { foreignRuns += 1; return { ok: true }; } }).reason, foreignRuns], ["claim_unreadable", 0], "带当前身份 → 锁内拒");
+  assert.equal(runControlTransaction({ claimsDir, key: foreignCtlKey, intent: { control: "mode", mode: DIALOGUE_POLICY_ID }, execute: () => { foreignRuns += 1; return { ok: true }; } }).ok, true, "不带 expect 才会执行 —— 所以生产入口必须带");
+  foreignRuns = 0;
+  const ownCtlKey = acquireClaim({ claimsDir, messageId: "msg_ctl_y", logicalTaskKey, meta: { ...protoMeta, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).key;
+  assert.deepEqual([runControlTransaction({ claimsDir, key: ownCtlKey, intent: { control: "mode", mode: MAPPING_POLICY_ID }, expect: own, execute: () => { foreignRuns += 1; return { ok: true }; } }).reason, foreignRuns], ["claim_intent_mismatch", 0], "调用方意图与锁内 claim 不一致：不执行");
+  let executedMode = null;
+  const viaInLock = resumeControlClaim({ claimsDir, key: ownCtlKey, expect: own, execute: (mode) => { executedMode = mode; return { ok: true, changed: true }; } });
+  assert.deepEqual([viaInLock.ok, executedMode, viaInLock.intent.mode], [true, DIALOGUE_POLICY_ID, DIALOGUE_POLICY_ID], "维护入口按锁内 claim 的意图执行：" + JSON.stringify(viaInLock));
+  assert.equal(runControlTransaction({ claimsDir, key: claimKey("msg_ctl_none", logicalTaskKey), intent: { control: "mode", mode: DIALOGUE_POLICY_ID }, expect: own, execute: () => ({ ok: true }) }).reason, "claim_absent");
+  assert.equal(controlRepairPrecondition, claudeControlPrecondition, "生产入口与维护入口用同一份写锁内前置条件（control-identity.mjs）");
+  // 维护入口整段在锁内：consumed 分支也先重读 claim —— 身份对不上就不清残骸、不报 already；身份对上才清
+  const resKey = acquireClaim({ claimsDir, messageId: "msg_ctl_res", logicalTaskKey, meta: { ...protoMeta, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).key;
+  recordClaimState({ claimsDir, key: resKey, state: "consumed", detail: { control: "mode", mode: DIALOGUE_POLICY_ID, changed: true } });
+  const resResidue = path.join(claimsDir, resKey + ".consumed.json.tmp.1.1");
+  fs.writeFileSync(resResidue, "{");
+  const wrongId = resumeControlClaim({ claimsDir, key: resKey, expect: { ...own, bindingId: "someone-else" }, execute: () => { throw new Error("must not execute"); } });
+  assert.deepEqual([wrongId.ok, wrongId.reason, fs.existsSync(resResidue)], [false, "claim_unreadable", true], "身份对不上：不清残骸、不报 already：" + JSON.stringify(wrongId));
+  const rightId = resumeControlClaim({ claimsDir, key: resKey, expect: own, execute: () => { throw new Error("must not execute"); } });
+  assert.deepEqual([rightId.ok, rightId.already, rightId.residueUncleared, fs.existsSync(resResidue)], [true, true, [], false], JSON.stringify(rightId));
+  fs.rmSync(path.join(claimsDir, resKey + ".claim"), { recursive: true, force: true }); fs.rmSync(path.join(claimsDir, resKey + ".consumed.json"), { force: true });
+  for (const k of [foreignCtlKey, ownCtlKey]) { fs.rmSync(path.join(claimsDir, k + ".claim"), { recursive: true, force: true }); fs.rmSync(path.join(claimsDir, k + ".consumed.json"), { force: true }); }
   // 首次执行失败：failed 由事务在锁内写（不再由入站另写）
   const key11 = claimKey("msg_c11", logicalTaskKey);
   assert.ok(acquireClaim({ claimsDir, messageId: "msg_c11", logicalTaskKey, meta: { ...protoMeta, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).ok);
@@ -19210,6 +19241,61 @@ test("发送者角色表（第 1 层）：唯一判据、模板交叉校验、�
   const beforeBad = fs.readFileSync(tplFile, "utf-8");
   assert.equal(withChainTemplateWrite({ file: tplFile, mutate: (cur) => ({ template: { ...cur, chat_id: "bad" } }) }).reason, "result_invalid");
   assert.equal(fs.readFileSync(tplFile, "utf-8"), beforeBad, "结果校验不过零写入");
+});
+
+const DRIFT_HOOK = [
+  'import fs from "node:fs";',
+  'const watch = process.env.DRIFT_AFTER_READ, file = process.env.DRIFT_FILE, transform = new Function("doc", process.env.DRIFT_JS);',
+  'const orig = fs.readFileSync; let fired = false;',
+  'fs.readFileSync = function (p, ...rest) {',
+  '  const out = orig.call(fs, p, ...rest);',
+  '  if (!fired && typeof p === "string" && p === watch) { fired = true; fs.writeFileSync(file, JSON.stringify(transform(JSON.parse(orig.call(fs, file, "utf-8"))))); }',
+  '  return out;',
+  '};',
+].join("\n") + "\n";
+
+test("控制事务的换绑窗口（评审 #97）：事务锁内核验通过之后、策略写锁取得之前登记表换了绑定 → 写锁内前置条件拒写、模式不变、不落 consumed、入口非零", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-drift-"));
+  const root = path.join(local, "project"); const bin = path.join(local, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{
+    id: "ctl", root, name: "换绑演示", root_message_id: "om_drift", expires_at: "2099-01-01T00:00:00Z",
+    session_id: "aily_drift", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z" }] }));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const hook = path.join(local, "drift-hook.mjs"); fs.writeFileSync(hook, DRIFT_HOOK);
+  const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
+  const run = (body, messageId, extraEnv = {}) => {
+    const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> " + body;
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: messageId, sessionID: "aily_drift", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content } }) }] });
+    return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
+      env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+        AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_drift", AILY_CLI_RUN_ID: "run_drift", FAKE_AILY_ENVELOPE: envelope, ...extraEnv } });
+  };
+  const policyOf = () => loadClaudeInteractionPolicy({ root, claudeSessionId: null, registryFile }).state.policy_id;
+  // 先跑一条正常的，拿到 logical task key（claim 里写的），并证明这个夹具本身能切换
+  const warm = run("/feishu-mode dialogue", "msg_drift_0");
+  assert.equal(warm.status, 0, warm.stdout + warm.stderr);
+  assert.equal(policyOf(), DIALOGUE_POLICY_ID);
+  const warmKey = fs.readdirSync(claimsDir).find((n) => n.endsWith(".claim")).slice(0, -".claim".length);
+  const logicalTaskKey = JSON.parse(fs.readFileSync(path.join(claimsDir, warmKey + ".claim", "claim.json"), "utf-8")).logical_task_key;
+  assert.equal(run("/feishu-mode mapping", "msg_drift_1").status, 0);
+  assert.equal(policyOf(), MAPPING_POLICY_ID);
+  // 换绑窗口：子进程在事务锁内第一次读完 <key>.claim/claim.json 之后，登记表里的项目 id 从 ctl 换成 ctl2（binding 变成 ctl2@registry）
+  const key = claimKey("msg_drift_2", logicalTaskKey);
+  const drift = run("/feishu-mode dialogue", "msg_drift_2", {
+    NODE_OPTIONS: "--import " + pathToFileURL(hook).href,
+    DRIFT_AFTER_READ: path.join(claimsDir, key + ".claim", "claim.json"),
+    DRIFT_FILE: registryFile,
+    // 与评审探针同一种换法：换成另一个 id 的项目（binding 变成 ctl2@registry），并丢掉旧策略状态 —— 新绑定本身合法、模式是默认 Mapping
+    DRIFT_JS: 'const [{ interaction_policy_state, topic_generation_state, ...plain }] = doc.projects; doc.projects = [{ ...plain, id: "ctl2", name: "new" }]; return doc;',
+  });
+  assert.notEqual(drift.status, 0, "换绑之后旧命令不许成功：" + drift.stdout + drift.stderr);
+  assert.match(drift.stdout, /模式没有切换（precondition_failed）/u, drift.stdout + drift.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(registryFile, "utf-8")).projects[0].id, "ctl2", "钩子确实在窗口里换了绑定");
+  assert.equal(policyOf(), MAPPING_POLICY_ID, "新绑定的模式没被旧命令改掉");
+  assert.equal(readConsumedRecord({ claimsDir, key }).status, "absent", "不落 consumed");
+  assert.equal(inspectControlClaim({ claimsDir, key }).state, "failed", "记成受验 failed（当时没切成）");
 });
 
 

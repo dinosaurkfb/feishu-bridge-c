@@ -15,7 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { REJECT } from "./selector.mjs";
+import { REJECT, normalizeBody } from "./selector.mjs";
 import { fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, claimKey, readClaimState, recordClaimState, watcherExpectEnv } from "./claim.mjs";
 import { effectiveBindingId } from "./topic-generation.mjs";
@@ -34,7 +34,7 @@ import { controlAckText, runControlTransaction } from "./control-command.mjs";
 import { claudeControlPrecondition } from "./control-identity.mjs";
 import { senderRole } from "./sender-roles.mjs";
 import { classifyRisk } from "./risk-class.mjs";
-import { parseInboundIntent, controlRejectText, rejectedControlProjection } from "./inbound-intent.mjs";
+import { INTENT, parseInboundIntent, controlRejectText, rejectedControlProjection } from "./inbound-intent.mjs";
 import { runRejectTransaction } from "./reject-control.mjs";
 import { sameRejectedControl } from "./control-intent.mjs";
 import { authorize } from "./authorize.mjs";
@@ -47,8 +47,9 @@ import {
 import { loadChainTemplate } from "./chain-template.mjs";
 import {
   appendConsumed, buildClaudeSubscriptionProjection, evaluatePromotion, findBindingForSession,
-  findPendingBinding, promoteBinding, shadowClaudeFirstClaim,
+  findPendingBinding, promoteBinding, shadowClaudeFirstClaim, evaluateChatGates, CHAT_FALLBACK_REASONS,
 } from "./inbound-route.mjs";
+import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply } from "./chat-reply.mjs";
 import { closeClaudeTopicRotation } from "./topic-generation-store.mjs";
 import { recordClaudeActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
 import {
@@ -136,6 +137,7 @@ function ackText(kind, detail) {
     ].join("\n");
   }
   if (kind === "control") return detail.text;
+  if (kind === "chat") return detail.text + "\n" + CHAT_FOOTER;
   if (kind === "rejected") {
     const lines = ["已拒绝 · " + detail.reasonText];
     // 说清楚这个话题通向谁。同一个群里有多个项目话题之后，最容易犯的错是
@@ -156,6 +158,50 @@ function finish(kind, detail, result) {
   process.stdout.write(ackText(kind, detail) + "\n");
   process.stderr.write(JSON.stringify({ kind, ...result }) + "\n");
   process.exit(kind === "error" ? 1 : 0);
+}
+
+
+// ---------- chat 默认态（无绑定上下文：刚装桥的群话题、私聊、unbind 之后）----------
+// 绑定没成不等于该拒：三道闸之后按 authorize 的 chat 行判权，路由器**同步**起零工具一次性回合，把回答当回执返回。
+// 这里没有 claim（没有绑定就没有账本），也没有任何异步回投通道（运输 agent 的回复 = 本进程的 stdout）。
+function chatTurn({ chain, template, event, dryRun }) {
+  const messageId = event.message_id ?? ("unknown-" + Date.now());
+  const gates = evaluateChatGates({ event, template });
+  if (!gates.ok) {
+    writeReceipt("chat-rejected-" + messageId, { status: "rejected", mode: CHAT_POLICY_ID, reason: gates.reason, reason_text: gates.reasonText, message_id: messageId, session_id: event.session_id ?? null, claim_acquired: false, handed_off: false });
+    finish("rejected", { reasonText: gates.reasonText, taskName: null }, { reason: gates.reason, mode: CHAT_POLICY_ID });
+  }
+  const instruction = normalizeBody(event.content).trim();
+  const intent = parseInboundIntent({ instruction, chain });
+  const risk = classifyRisk({ intent, mode: CHAT_POLICY_ID });
+  const authz = authorize({ role: gates.role, riskClass: risk.riskClass, mode: CHAT_POLICY_ID, chain });
+  const base = { mode: CHAT_POLICY_ID, role: gates.role, risk_class: risk.riskClass, intent: intent.intent, message_id: messageId, session_id: event.session_id ?? null, claim_acquired: false, handed_off: false };
+  if (!authz.allow) {
+    writeReceipt("chat-authz-" + messageId, { status: "rejected", reason: "not_authorized", authz_reason: authz.reason, required_roles: authz.required, ...base });
+    finish("rejected", { reasonText: authz.text, taskName: null }, { reason: "not_authorized", authz_reason: authz.reason, mode: CHAT_POLICY_ID });
+  }
+  // 命令命名空间在 chat 里：接入指引 / 不开放 / 形状不对，都是确定性文案，不起模型
+  if (intent.intent === INTENT.REJECTED_CONTROL || intent.intent === INTENT.MALFORMED_CONTROL) {
+    writeReceipt("chat-control-" + messageId, { status: "rejected", reason: intent.intent, word: intent.word, problem: intent.problem, ...base });
+    finish("rejected", { reasonText: controlRejectText(intent), taskName: null }, { reason: intent.intent, word: intent.word, mode: CHAT_POLICY_ID });
+  }
+  if (intent.intent === INTENT.MODEL_CONTROL || intent.intent === INTENT.ROUTER_CONTROL || intent.intent === INTENT.READONLY) {
+    const text = intent.word === "feishu-bind" ? CHAT_BIND_GUIDE : "这个话题还没接入本机项目，" + "/" + intent.word + " 在这里无从执行；" + CHAT_BIND_GUIDE;
+    writeReceipt("chat-guide-" + messageId, { status: "chat", kind: "guide", word: intent.word, ...base });
+    finish("chat", { text }, { mode: CHAT_POLICY_ID, kind: "guide", word: intent.word });
+  }
+  if (dryRun) {
+    process.stdout.write("[dry-run] chat · 会以零工具一次性回合回答（角色 " + gates.role + "，" + risk.riskClass + "），不写状态\n");
+    process.stderr.write(JSON.stringify({ dryRun: true, mode: CHAT_POLICY_ID, role: gates.role, risk: risk.riskClass }) + "\n");
+    process.exit(0);
+  }
+  const reply = chatReply({ instruction });
+  if (!reply.ok) {
+    writeReceipt("chat-failed-" + messageId, { status: "error", reason: "chat_reply_failed", why: reply.reason, detail: reply.why, elapsed_ms: reply.elapsedMs, ...base });
+    finish("error", { detail: "chat 没答出来（" + reply.why + "）。这里没有接入，无法稍后补发，请再问一次" }, { reason: "chat_reply_failed", why: reply.reason, mode: CHAT_POLICY_ID });
+  }
+  writeReceipt("chat-" + messageId, { status: "chat", kind: "reply", elapsed_ms: reply.elapsedMs, ...base });
+  finish("chat", { text: reply.text }, { mode: CHAT_POLICY_ID, kind: "reply", elapsed_ms: reply.elapsedMs, role: gates.role, risk_class: risk.riskClass });
 }
 
 // ---------- 主流程 ----------
@@ -250,6 +296,9 @@ if (!routed.ok) {
     legacyPromotion: promo,
     now: promotionNow,
   });
+
+  // 绑定没成不等于该拒：没有 pending / 多份 / 绑定码对不上 / 过期 / 发送者不是 owner → 落进 chat 默认态重新判
+  if (!promo.ok && CHAT_FALLBACK_REASONS.includes(promo.reason)) chatTurn({ chain: "claude", template, event, dryRun });
 
   if (!promo.ok) {
     writeReceipt("unrouted-" + (event.message_id ?? "unknown") + "-" + Date.now(), {

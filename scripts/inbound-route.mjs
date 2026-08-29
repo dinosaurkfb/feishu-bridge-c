@@ -15,6 +15,7 @@
  */
 
 import fs from "node:fs";
+import { senderRole } from "./sender-roles.mjs";
 import path from "node:path";
 
 import { loadChainTemplate } from "./chain-template.mjs";
@@ -344,6 +345,35 @@ export function evaluatePromotion({ event, template, pending, now = Date.now() }
     source: pending.source,
     generationId: pending.generationId,
   };
+}
+
+/**
+ * chat 默认态的三道闸（无绑定上下文；两条链共用）：登记发送者在角色表里、真实 @ 运输 agent、新鲜度。
+ * 与 evaluatePromotion 的区别只有一处：绑定只认 owner，chat 认角色表里的任何角色（谁能干什么由 authorize 的 chat 行决定）。
+ * 这些 reason 是 chat 兜底的对象 —— 绑定没成不等于该拒：没有 pending、多份 pending、绑定码对不上、pending 过期、
+ * 发送者不是 owner，都落进 chat 重新判；@ 没打、消息过期、模板坏了仍是拒绝。
+ */
+export const CHAT_FALLBACK_REASONS = Object.freeze([
+  PROMOTE_REJECT.NO_PENDING, PROMOTE_REJECT.MULTIPLE_PENDING, PROMOTE_REJECT.TOKEN_UNKNOWN,
+  PROMOTE_REJECT.TOKEN_AMBIGUOUS, PROMOTE_REJECT.TOKEN_DUPLICATED, PROMOTE_REJECT.PENDING_EXPIRED,
+  PROMOTE_REJECT.SENDER_NOT_FRANK,
+]);
+export function evaluateChatGates({ event, template, now = Date.now() }) {
+  const reject = (reason) => ({ ok: false, reason, reasonText: PROMOTE_REJECT_TEXT[reason] ?? reason });
+  const frank = template?.frank_sender_id;
+  const transport = template?.transport_open_id;
+  const freshness = template?.default_freshness_ms;
+  if (typeof frank !== "string" || typeof transport !== "string" ||
+      typeof freshness !== "number" || !Number.isFinite(freshness) || freshness <= 0) {
+    return reject(PROMOTE_REJECT.MALFORMED_TEMPLATE);
+  }
+  const role = senderRole({ frank_sender_id: frank, senders: template?.senders }, event?.sender_id);
+  if (role === null) return reject(PROMOTE_REJECT.SENDER_NOT_FRANK);
+  if (!extractMentionIds(event?.content).includes(transport)) return reject(PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
+  const createdMs = Number(event?.created_at_ms);
+  if (!Number.isFinite(createdMs)) return reject(PROMOTE_REJECT.MALFORMED_TEMPLATE);
+  if (now - createdMs > freshness) return reject(PROMOTE_REJECT.STALE_MESSAGE);
+  return { ok: true, role };
 }
 
 /**

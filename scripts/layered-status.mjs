@@ -405,7 +405,7 @@ export function composeLayeredStatus({
         { n: 1, title: "运行端点连接", rows: L1 },
         { n: 2, title: "事件订阅", rows: L2 },
         { n: 3, title: "精确通道绑定", rows: [["绑定状态", why]] },
-        { n: 4, title: "交互策略", rows: [["交互模式", "尚无通道策略（要先有绑定）"]] },
+        { n: 4, title: "交互策略", rows: [["交互模式", "chat（默认态：未接入，只回答；接入后才有 Mapping / Dialogue）"]] },
       ],
       // 待处理区也要跟着分开 —— 上一版两种情形共用"不适用（尚未绑定）"，
       // 正是我在第 3 层要求分开的那件事，自己在这里又合回去了。

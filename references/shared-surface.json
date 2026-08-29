@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-08-29T12:01:32.378Z",
+  "generated_at": "2026-08-29T13:15:15.674Z",
   "modules": {
     "authorize.mjs": [
       "AUTHORIZATION_TABLE",
@@ -49,6 +49,17 @@
       "templatePath",
       "validateChainTemplate",
       "withChainTemplateWrite"
+    ],
+    "chat-reply.mjs": [
+      "CHAT_BIND_GUIDE",
+      "CHAT_FOOTER",
+      "CHAT_POLICY_ID",
+      "CHAT_REPLY_ARGS",
+      "CHAT_REPLY_MAX_CHARS",
+      "CHAT_REPLY_TIMEOUT_MS",
+      "CHAT_SYSTEM_PROMPT",
+      "chatReply",
+      "chatReplyTimeoutMs"
     ],
     "claim-reminder.mjs": [
       "composeClaimReminderText",
@@ -227,6 +238,7 @@
     ],
     "handoff.mjs": [
       "REPLY_ONLY_ARGS",
+      "ZERO_TOOL_ARGS",
       "acquireSessionLock",
       "handOff",
       "handOffReplyOnly",
@@ -247,6 +259,22 @@
       "parseInboundIntent",
       "rejectedControlProjection",
       "shown"
+    ],
+    "inbound-route.mjs": [
+      "CHAT_FALLBACK_REASONS",
+      "PENDING_WINDOW_MS",
+      "PROMOTE_REJECT",
+      "PROMOTE_REJECT_TEXT",
+      "appendConsumed",
+      "buildClaudeSubscriptionProjection",
+      "evaluateChatGates",
+      "evaluatePromotion",
+      "findBindingForSession",
+      "findPendingBinding",
+      "listBindings",
+      "loadConsumed",
+      "promoteBinding",
+      "shadowClaudeFirstClaim"
     ],
     "inbound-routes.mjs": [
       "DEFAULT_ROUTES",

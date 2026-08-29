@@ -13,6 +13,9 @@ import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import { RISK, classifyRisk } from "./risk-class.mjs";
+import { CHAT_POLICY_ID, CHAT_REPLY_ARGS, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs } from "./chat-reply.mjs";
+import { evaluateChatGates, CHAT_FALLBACK_REASONS } from "./inbound-route.mjs";
+import { ZERO_TOOL_ARGS } from "./handoff.mjs";
 import { INTENT, parseInboundIntent, controlRejectText, rejectedControlProjection, shown } from "./inbound-intent.mjs";
 import { rejectedRecordProblem, runRejectTransaction, inspectRejectedClaim, resumeRejectedClaim, describeRejectRepair, rejectRepairExitCode } from "./reject-control.mjs";
 import { REJECTED_CONTROL_INTENTS, rejectedControlProblem } from "./control-intent.mjs";
@@ -8443,7 +8446,7 @@ test("未绑定项目仍要展示四层，且 not_bound 与读不出来分开", 
   // 四层模型在最需要它的时候消失，是上一版的表现。
   for (const n of [1, 2, 3, 4]) assert.match(notBound, new RegExp("第 " + n + " 层", "u"));
   assert.match(notBound, /尚未绑定/u);
-  assert.match(notBound, /尚无通道策略/u);
+  assert.match(notBound, /chat（默认态：未接入，只回答/u, "未接入时第 4 层显示 chat 默认态");
   assert.match(notBound, /不适用（尚未绑定）/u);
   // 第 1、2 层照样报已有事实。
   assert.match(notBound, /M5Claude/u);
@@ -19342,7 +19345,7 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
   // ── 交叉表逐格（Frank 2026-08-29）
   const expect = {
     [MAPPING_POLICY_ID]: { R0: ["owner"], R1: ["owner"], R2: ["owner"], R3: ["owner"], R4: ["owner"] },
-    [DIALOGUE_POLICY_ID]: { R0: ["owner"], R1: ["owner", "operator", "participant"], R2: ["owner"], R3: ["owner"], R4: ["owner"] },
+    [DIALOGUE_POLICY_ID]: { R0: ["owner", "operator"], R1: ["owner", "operator", "participant"], R2: ["owner"], R3: ["owner"], R4: ["owner"] },
   };
   for (const mode of [MAPPING_POLICY_ID, DIALOGUE_POLICY_ID]) for (const r of ["R0", "R1", "R2", "R3", "R4"]) {
     assert.deepEqual([...AUTHORIZATION_TABLE[mode][r]], expect[mode][r], mode + "/" + r);
@@ -19364,7 +19367,7 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
     assert.deepEqual([authorize({ role: null, riskClass: r, mode, chain: "claude" }).reason, authorize({ role: "boss", riskClass: r, mode, chain: "claude" }).reason], ["sender_not_registered", "sender_not_registered"]);
   }
   assert.ok(Object.isFrozen(AUTHORIZATION_TABLE));
-  assert.deepEqual([CAPABILITY, REPLY_ONLY_CAPABLE], [{ FULL: "full", REPLY_ONLY: "reply_only" }, { claude: true, codex: false }]);
+  assert.deepEqual([CAPABILITY, REPLY_ONLY_CAPABLE], [{ FULL: "full", REPLY_ONLY: "reply_only", CHAT_REPLY: "chat_reply" }, { claude: true, codex: false }]);
   assert.equal(authorize({ role: "owner", riskClass: "R2", mode: "turbo" }).reason, "mode_unknown");
   assert.equal(authorize({ role: "owner", riskClass: "R9", mode: MAPPING_POLICY_ID }).reason, "risk_unknown");
   // ── Claude 真入口：模板登记 operator 222 / participant 333
@@ -19485,7 +19488,7 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
   assert.deepEqual(releaseSessionLockIfOwnedBy(lockDir, { logPath: "/mine.jsonl" }).status, "not_owner", "没有戳的锁留给陈旧回收");
   fs.rmSync(lockDir, { recursive: true, force: true });
   // Dialogue 下 participant 的 R0 / R3 仍拒
-  assert.match(run("/feishu-status", "333").stdout, /R0（只读） 需要 owner 权限/u);
+  assert.match(run("/feishu-status", "333").stdout, /R0（只读） 需要 owner \/ operator 权限/u, "R0 开给了 operator，participant 仍不行");
   assert.match(run("/feishu-mode mapping", "333").stdout, /R3（控制） 需要 owner 权限/u);
   // 评审 #93 P1-2：不从飞书开放 / 缺参 / 别链前缀的命令形状，在 Dialogue 下也不许以"对话"身份放行给 participant
   const claimsBeforeNs = claimCount();
@@ -19832,6 +19835,109 @@ test("轮转遇到待认领代际：仍可认领 → 拒绝重复创建；已过
   assert.match(superseded.stdout, /\[dry-run\] 没有创建话题或修改状态/u);
   assert.equal(JSON.parse(fs.readFileSync(registryFile, "utf-8")).projects[0].topic_generation_state.generations.length, 2, "dry-run 不改状态");
   assert.equal(pendingRotationBlocker(JSON.parse(fs.readFileSync(registryFile, "utf-8")).projects[0].topic_generation_state, { now }).kind, "expired", "dry-run 之后 pending 原样还在");
+});
+
+
+test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 chat 行判权，路由器同步起零工具回合把回答当回执；bind 给指引；unbind 后落回 chat（Claude 真入口）", () => {
+  // ── 判据：chat 行、capability、三道闸
+  assert.deepEqual([...AUTHORIZATION_TABLE[CHAT_POLICY_ID].R0, ...AUTHORIZATION_TABLE[CHAT_POLICY_ID].R2], ["owner", "operator"], "chat：R0 owner/operator，R2 对谁都不开");
+  assert.deepEqual([...AUTHORIZATION_TABLE[CHAT_POLICY_ID].R1], ["owner", "operator", "participant"]);
+  for (const role of ["owner", "operator", "participant"]) {
+    for (const chain of ["claude", "codex"]) assert.deepEqual([authorize({ role, riskClass: "R1", mode: CHAT_POLICY_ID, chain }).allow, authorize({ role, riskClass: "R1", mode: CHAT_POLICY_ID, chain }).capability], [true, "chat_reply"], role + "/" + chain + "：chat 两条链都能答，与链的投递路径无关");
+    const r2 = authorize({ role, riskClass: "R2", mode: CHAT_POLICY_ID, chain: "claude" });
+    assert.deepEqual([r2.allow, r2.required], [false, []]); assert.match(r2.text, /没有接入的项目，无从执行；要它干活先在终端里跑 \/feishu-bind/u);
+  }
+  assert.deepEqual([authorize({ role: "participant", riskClass: "R3", mode: CHAT_POLICY_ID, chain: "claude" }).allow, authorize({ role: "owner", riskClass: "R3", mode: CHAT_POLICY_ID, chain: "claude" }).allow], [false, true]);
+  assert.deepEqual([...CHAT_REPLY_ARGS], [...ZERO_TOOL_ARGS, "--output-format", "text"], "chat 与 reply_only 共用同一份零工具边界");
+  assert.deepEqual(classifyRisk({ instruction: "帮我改代码", chain: "claude", mode: CHAT_POLICY_ID }), { riskClass: RISK.R1, kind: "conversation" }, "chat 里普通文本只能是对话");
+  assert.deepEqual([...ZERO_TOOL_ARGS], ["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-session-persistence", "--safe-mode"]);
+  assert.deepEqual([chatReplyTimeoutMs({}), chatReplyTimeoutMs({ FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "500" }), chatReplyTimeoutMs({ FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "-1" })], [60000, 500, 60000]);
+  const tplWithRoles = { ...TPL, senders: [{ open_id: "222", role: "operator" }, { open_id: "333", role: "participant" }] };
+  const ev = (sender, content, ageMs = 0) => ({ sender_id: sender, content, created_at_ms: Date.now() - ageMs });
+  const at = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> ";
+  assert.deepEqual([evaluateChatGates({ event: ev(TPL.frank_sender_id, at + "hi"), template: tplWithRoles }).role, evaluateChatGates({ event: ev("333", at + "hi"), template: tplWithRoles }).role], ["owner", "participant"]);
+  assert.equal(evaluateChatGates({ event: ev("444", at + "hi"), template: tplWithRoles }).reason, "sender_not_frank", "未登记仍零权限");
+  assert.equal(evaluateChatGates({ event: ev("333", "hi 没有 @"), template: tplWithRoles }).reason, "transport_not_mentioned");
+  assert.equal(evaluateChatGates({ event: ev("333", at + "hi", TPL.default_freshness_ms + 1000), template: tplWithRoles }).reason, "stale_message");
+  assert.equal(evaluateChatGates({ event: ev("333", at + "hi"), template: { ...tplWithRoles, transport_open_id: 7 } }).reason, "malformed_template");
+  assert.ok(CHAT_FALLBACK_REASONS.includes("no_pending_binding") && CHAT_FALLBACK_REASONS.includes("multiple_pending_bindings") && CHAT_FALLBACK_REASONS.includes("sender_not_frank") && !CHAT_FALLBACK_REASONS.includes("transport_not_mentioned") && !CHAT_FALLBACK_REASONS.includes("stale_message"));
+  // ── Claude 真入口：登记表里有一个绑给别的 session 的项目；这条消息来自没绑定的 session（群里 @ 或私聊都一样）
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-chat-"));
+  const root = path.join(local, "project"); const bin = path.join(local, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify(tplWithRoles));
+  const writeRegistry = (projects) => fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects }));
+  const bound = { id: "bound", root, name: "已接入项目", root_message_id: "om_bound", expires_at: "2099-01-01T00:00:00Z", session_id: "aily_bound", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z" };
+  writeRegistry([bound]);
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const claudeLog = path.join(local, "claude-argv.jsonl");
+  fs.writeFileSync(path.join(bin, "claude"), ["#!/usr/bin/env node",
+    "const fs = require('node:fs'); fs.appendFileSync(" + JSON.stringify(claudeLog) + ", JSON.stringify(process.argv.slice(2)) + '\\n');",
+    "const ms = Number(process.env.FAKE_CLAUDE_SLEEP_MS || 0); if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);",
+    "if (process.env.FAKE_CLAUDE_FAIL) { process.stderr.write('boom'); process.exit(3); }",
+    "process.stdout.write('回答：' + process.argv[process.argv.indexOf('-p') + 1].slice(0, 40) + '\\n');",
+  ].join("\n") + "\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
+  const argvLog = () => (fs.existsSync(claudeLog) ? fs.readFileSync(claudeLog, "utf-8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
+  let seq = 0;
+  const run = (body, sender, extraEnv = {}, extraArgs = []) => {
+    seq += 1;
+    const content = at + body;
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_chat_" + seq, sessionID: "aily_dm", role: "user", createdBy: sender, createdAtMs: Date.now(), content } }) }] });
+    // dry-run 由分发器自己截住，所以带参数时直接跑 inbound.mjs（同一份环境、同一个假信封）
+    const entry = extraArgs.length ? "inbound.mjs" : "aily-inbound.mjs";
+    return spawnSync(process.execPath, [path.resolve("scripts", entry), ...extraArgs], { encoding: "utf-8",
+      env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+        AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_chat", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", ...extraEnv } });
+  };
+  // owner 在没绑定的上下文里说话 → 不再是"没有等待绑定的项目"，而是 chat 回答
+  const o = run("今天几号", TPL.frank_sender_id);
+  assert.equal(o.status, 0, o.stdout + o.stderr);
+  assert.match(o.stdout, /^回答：今天几号\n— chat · 这里还没接入本机项目，零工具回答；要它干活先在终端里跑 \/feishu-bind$/mu, o.stdout);
+  assert.doesNotMatch(o.stdout, /已拒绝|没有等待绑定的项目/u);
+  const a1 = argvLog(); assert.equal(a1.length, 1);
+  assert.equal(a1[0][0], "-p"); assert.equal(a1[0][1], "今天几号", "正文去掉 @ 后原样给模型");
+  assert.deepEqual(a1[0].slice(2, 4), ["--append-system-prompt", a1[0][3]]); assert.match(a1[0][3], /chat 默认态/u);
+  assert.deepEqual(a1[0].slice(4), [...CHAT_REPLY_ARGS], "零工具、无历史、不落会话、safe-mode、text 输出");
+  assert.equal(JSON.parse(o.stderr.trim().split("\n").at(-1)).mode, "chat");
+  // participant / operator 同样能问；未登记仍拒
+  const p = run("你是谁", "333"); assert.match(p.stdout, /^回答：你是谁/mu, p.stdout);
+  const op = run("在吗", "222"); assert.match(op.stdout, /^回答：在吗/mu, op.stdout);
+  const u = run("你是谁", "444"); assert.match(u.stdout, /已拒绝 · 发送者不是授权用户/u, u.stdout); assert.equal(argvLog().length, 3, "未登记不起模型");
+  // 多份待绑定 + 没带绑定码：以前是歧义拒绝（截图那条），现在是 chat
+  writeRegistry([bound, { id: "p1", root: path.join(local, "p1"), name: "P1", root_message_id: "om_p1", expires_at: "2099-01-01T00:00:00Z", inbound_state: "pending", pending_token: "aaaaaa", status: "active" },
+    { id: "p2", root: path.join(local, "p2"), name: "P2", root_message_id: "om_p2", expires_at: "2099-01-01T00:00:00Z", inbound_state: "pending", pending_token: "bbbbbb", status: "active" }]);
+  const multi = run("移除项目", TPL.frank_sender_id);
+  assert.match(multi.stdout, /^回答：移除项目/mu, "多份待绑定不再拒成歧义：" + multi.stdout);
+  writeRegistry([bound]);
+  // 命令命名空间在 chat 里：bind → 接入指引（确定性文案，不起模型）；unbind → 不从飞书开放；缺参 → 形状不对；status → 无从执行
+  const before = argvLog().length;
+  const b = run("/feishu-bind", TPL.frank_sender_id);
+  assert.match(b.stdout, new RegExp("^" + CHAT_BIND_GUIDE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "mu"), b.stdout);
+  assert.match(run("/feishu-unbind", TPL.frank_sender_id).stdout, /已拒绝 · 这个命令不从飞书开放/u);
+  assert.match(run("/feishu-mode", TPL.frank_sender_id).stdout, /已拒绝 · 命令形状不对/u);
+  assert.match(run("/feishu-status", TPL.frank_sender_id).stdout, /这个话题还没接入本机项目，\/feishu-status 在这里无从执行/u);
+  assert.match(run("/feishu-mode dialogue", "333").stdout, /你的角色是 participant，R3（控制） 需要 owner 权限/u, "chat 里 R3 仍只认 owner");
+  assert.match(run("帮我改代码", "333").stdout, /^回答：帮我改代码/mu, "chat 里普通文本都是 R1（没有 R2），模型自己会说没接入");
+  assert.equal(argvLog().length, before + 1, "命令命名空间与拒绝都不起模型");
+  // 暂停（unbind）之后的话题：绑定不再 active → 落回 chat
+  writeRegistry([{ ...bound, status: "paused" }]);
+  const paused = run("还在吗", TPL.frank_sender_id, {}, []);
+  assert.match(paused.stdout, /^回答：还在吗/mu, "unbind 之后退回 chat：" + paused.stdout);
+  writeRegistry([bound]);
+  // 超时 / 失败：如实说，不冒充回答；非零退出
+  const slow = run("慢", TPL.frank_sender_id, { FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "300", FAKE_CLAUDE_SLEEP_MS: "2000" });
+  assert.notEqual(slow.status, 0); assert.match(slow.stdout, /chat 没答出来（超过 0 秒没答完）。这里没有接入，无法稍后补发，请再问一次/u, slow.stdout);
+  const failed = run("坏", TPL.frank_sender_id, { FAKE_CLAUDE_FAIL: "1" });
+  assert.notEqual(failed.status, 0); assert.match(failed.stdout, /chat 没答出来（退出码 3：boom）/u, failed.stdout);
+  // dry-run：只判，不起模型
+  const n = argvLog().length;
+  const dry = run("dry", TPL.frank_sender_id, {}, ["--dry-run"]);
+  assert.match(dry.stdout, /\[dry-run\] chat · 会以零工具一次性回合回答（角色 owner，R1），不写状态/u, dry.stdout);
+  assert.equal(argvLog().length, n);
+  // 单元：chatReply 直接调
+  const direct = chatReply({ instruction: "直接", claudeBin: path.join(bin, "claude"), timeoutMs: 5000, env: { ...process.env } });
+  assert.deepEqual([direct.ok, direct.text], [true, "回答：直接"]);
 });
 
 

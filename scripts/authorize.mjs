@@ -18,18 +18,24 @@
 import { DIALOGUE_POLICY_ID, MAPPING_POLICY_ID } from "./interaction-policy.mjs";
 import { SENDER_ROLES } from "./sender-roles.mjs";
 import { RISK, RISK_LABEL } from "./risk-class.mjs";
+import { CHAT_POLICY_ID } from "./chat-reply.mjs";
 
 const OWNER = Object.freeze(["owner"]);
+const OWNER_OPERATOR = Object.freeze(["owner", "operator"]);
 const EVERYONE = Object.freeze(["owner", "operator", "participant"]);
+const NOBODY = Object.freeze([]);
 
 /** 交叉表：mode → risk → 允许的角色。 */
 export const AUTHORIZATION_TABLE = Object.freeze({
   [MAPPING_POLICY_ID]: Object.freeze({ [RISK.R0]: OWNER, [RISK.R1]: OWNER, [RISK.R2]: OWNER, [RISK.R3]: OWNER, [RISK.R4]: OWNER }),
-  [DIALOGUE_POLICY_ID]: Object.freeze({ [RISK.R0]: OWNER, [RISK.R1]: EVERYONE, [RISK.R2]: OWNER, [RISK.R3]: OWNER, [RISK.R4]: OWNER }),
+  // Frank 2026-08-30：R0 只读开给 operator（它本来就是"信任的人"的角色位）
+  [DIALOGUE_POLICY_ID]: Object.freeze({ [RISK.R0]: OWNER_OPERATOR, [RISK.R1]: EVERYONE, [RISK.R2]: OWNER, [RISK.R3]: OWNER, [RISK.R4]: OWNER }),
+  // chat 默认态（无绑定上下文：刚装桥的群、私聊、unbind 之后）：只回答，没有目标可执行 —— R2 谁都不行（要执行先接入）；R3 / R4 只认 owner
+  [CHAT_POLICY_ID]: Object.freeze({ [RISK.R0]: OWNER_OPERATOR, [RISK.R1]: EVERYONE, [RISK.R2]: NOBODY, [RISK.R3]: OWNER, [RISK.R4]: OWNER }),
 });
-const MODE_LABEL = { [MAPPING_POLICY_ID]: "Mapping", [DIALOGUE_POLICY_ID]: "Dialogue" };
+const MODE_LABEL = { [MAPPING_POLICY_ID]: "Mapping", [DIALOGUE_POLICY_ID]: "Dialogue", [CHAT_POLICY_ID]: "chat（未接入）" };
 
-export const CAPABILITY = Object.freeze({ FULL: "full", REPLY_ONLY: "reply_only" });
+export const CAPABILITY = Object.freeze({ FULL: "full", REPLY_ONLY: "reply_only", CHAT_REPLY: "chat_reply" });
 /** 哪条链有可验证的只回复执行路径：Claude 有（`claude -p --tools ""`）；Codex 的只读沙箱只是 shell 沙箱，不算。 */
 export const REPLY_ONLY_CAPABLE = Object.freeze({ claude: true, codex: false });
 
@@ -50,8 +56,12 @@ export function authorize({ role, riskClass, mode, chain } = {}) {
   if (!allowed) return { allow: false, reason: "risk_unknown", required: [], capability: null, text: "这条消息的风险等级说不清（" + String(riskClass) + "），不放行" };
   if (!allowed.includes(role)) {
     return { allow: false, reason: "not_authorized", required: [...allowed], capability: null,
-      text: "这个话题处于 " + modeText + " 模式；你的角色是 " + role + "，" + riskText + " 需要 " + allowed.join(" / ") + " 权限" };
+      text: allowed.length === 0
+        ? "这个话题处于 " + modeText + " 模式；" + riskText + " 在这里对谁都不开放 —— 没有接入的项目，无从执行；要它干活先在终端里跑 /feishu-bind"
+        : "这个话题处于 " + modeText + " 模式；你的角色是 " + role + "，" + riskText + " 需要 " + allowed.join(" / ") + " 权限" };
   }
+  // chat 默认态：路由器自己同步起零工具回合回答（两条链都行，不依赖链的投递路径），所以 capability 是 chat_reply，与角色无关
+  if (mode === CHAT_POLICY_ID) return { allow: true, reason: null, required: [...allowed], capability: CAPABILITY.CHAT_REPLY, text: null };
   if (role === "owner") return { allow: true, reason: null, required: [...allowed], capability: CAPABILITY.FULL, text: null };
   if (REPLY_ONLY_CAPABLE[chain] !== true) {
     return { allow: false, reason: "no_reply_only_path", required: [...OWNER], capability: null,

@@ -4,7 +4,7 @@
  * 风险等级是 inbound-intent.mjs 那个封闭意图联合的**投影**：
  *
  *   R0 只读    ：readonly（正文恰为本链的 status / subscribe 命令词）—— 不动本机任何状态
- *   R1 对话    ：ordinary × Dialogue —— 只产生一段回复
+ *   R1 对话    ：ordinary × Dialogue / chat —— 只产生一段回复
  *   R2 执行    ：ordinary × Mapping —— 在本地项目里跑一轮 run（改文件、跑命令）
  *   R3 控制    ：router_control / model_control / rejected_control / malformed_control —— 命令命名空间里的
  *                一切都按控制处理，不折叠成普通文本；哪些真执行、哪些当场拒，入口按 intent 处置
@@ -18,6 +18,7 @@
  */
 import { DIALOGUE_POLICY_ID, MAPPING_POLICY_ID } from "./interaction-policy.mjs";
 import { INTENT, parseInboundIntent } from "./inbound-intent.mjs";
+import { CHAT_POLICY_ID } from "./chat-reply.mjs";
 
 export const RISK = Object.freeze({ R0: "R0", R1: "R1", R2: "R2", R3: "R3", R4: "R4" });
 export const RISK_LABEL = Object.freeze({ R0: "只读", R1: "对话", R2: "执行", R3: "控制", R4: "授权类" });
@@ -36,6 +37,8 @@ export function classifyRisk({ intent = null, instruction, chain, mode } = {}) {
   if (it.intent === INTENT.AUTHORIZATION) return { riskClass: RISK.R4, kind: "authorization" };
   if (it.intent === INTENT.ORDINARY) {
     if (mode === DIALOGUE_POLICY_ID) return { riskClass: RISK.R1, kind: "conversation" };
+    // chat 默认态（无绑定上下文）：普通文本只能是对话 —— 没有目标可执行，R2 在这里根本不存在
+    if (mode === CHAT_POLICY_ID) return { riskClass: RISK.R1, kind: "conversation" };
     if (mode === MAPPING_POLICY_ID) return { riskClass: RISK.R2, kind: "instruction" };
     // 模式说不清：按最高风险的普通文本处理（fail-closed），不折叠成 R1
     return { riskClass: RISK.R2, kind: "instruction" };

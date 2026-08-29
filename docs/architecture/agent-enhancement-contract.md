@@ -560,6 +560,15 @@ bridge-home/
 - 回执里反射的词 / 参数先 `displaySafe` 再按 Unicode 码点截到 40 个；原始值只进 claim / 记录（word、digest）。feishu-mode 的参数词只有一份（control-command.mjs 的 `CONTROL_MODE_WORDS`）：精确形状由它生成，收边文案引用它，命中与否只由 parseControlCommand 判。
 - 两条链共用同一份联合与同一套文案，只有前缀不同。
 
+## 14c. chat 默认态契约（2026-08-30）
+
+- 适用范围：`findBindingForSession` 找不到 active 绑定的上下文 —— 刚装桥的群话题、私聊、`/feishu-unbind` 之后的话题（暂停的绑定不算 active）。绑定认领仍优先（owner + 引用块里的绑定码 / 全机唯一一份待绑定）；认领不成立的原因属于 `CHAT_FALLBACK_REASONS`（没有 pending、多份 pending、绑定码对不上 / 重复、pending 过期、发送者不是 owner）时落进 chat；没有真实 @、消息过期、模板损坏仍是拒绝。
+- 三道闸（`inbound-route.evaluateChatGates`，两条链共用）：登记发送者在角色表里（owner / operator / participant，未登记零权限）、真实 @ 本链运输 agent、新鲜度。
+- 判权：意图联合照旧（`inbound-intent`），风险投影在 chat 下普通文本 = R1；`authorize` 的 chat 行：R0 owner / operator、R1 全部登记角色、R2 无人（文案指路 `/feishu-bind`）、R3 / R4 只认 owner；放行的 capability 是 `chat_reply`，与链无关。顺带：Dialogue 的 R0 也开给 operator。
+- 处置：命令命名空间在 chat 里不起模型 —— `feishu-bind` → 接入指引（`CHAT_BIND_GUIDE`）；其他 router / model / readonly 命令词 → "在这里无从执行 + 指引"；unbind / pin-session → 不从飞书开放；形状不对 → 收边文案。普通文本 / 授权用语 → `chat-reply.chatReply`：**同步** `claude -p <正文> --append-system-prompt <CHAT_SYSTEM_PROMPT> ...ZERO_TOOL_ARGS --output-format text`，cwd 是 HOME（不进任何项目目录），预算 `CHAT_REPLY_TIMEOUT_MS`（60 秒；`FEISHU_BRIDGE_CHAT_TIMEOUT_MS` 可覆盖），回答截到 4000 码点；回执 = 回答 + 尾行 `CHAT_FOOTER`。超时 / 起不来 / 非零退出 / 空输出 → 系统错误，明说"无法稍后补发，请再问一次"，不冒充回答。
+- 为什么同步：无绑定上下文没有话题可回投，运输 agent 的回复就是路由器的 stdout，这是唯一通道；这是对"秒级回执"的有意放宽，只发生在 chat，已绑定话题的投递仍非阻塞。
+- 没有 claim、没有账本（没有绑定就没有 `.runtime-data`）；回执写在机器级 unrouted 回执目录（`chat-*`），不出 locator。
+
 ## 15. 测试契约
 
 ### 必须覆盖的公共契约测试

@@ -3,6 +3,8 @@
 > 2026-08-29 整理。目的：把散在 goal、评审、聊天里的"四层状态 / 多种模式 / 多级权限"收成一份能对着讨论的文档。
 > **"现状"一栏写的是代码今天的行为**（main 8c5cedc + PR #93 / #94 分支），**"提议"一栏是还没拍板的**。两者分开写，不混。
 > 读者：Frank（手机上看）、Codex（评审）、我自己（下一个 goal 的输入）。
+>
+> **2026-08-29 晚更新**：Frank 看完后回「你的建议都同意，实现复杂可提简化方案」—— §6 各行状态已改；简化方案见 §6a；goal 修订稿见 §6b；第 1 层已装（§7）。
 
 ## 1. 先说结论
 
@@ -96,24 +98,44 @@
 
 | # | 问题 | 选项 | 我的建议 | Codex 意见 | 状态 |
 |---|---|---|---|---|---|
-| 1 | **R1 没有执行边界**：三条投递路径（现场转发 → 现场会话、`claude --resume -p`、`codex exec resume`）都是全能力，participant 的"对话"会进到能改文件的宿主 | **A** 非 owner 的 R1 走"只回复"路径（runRequest 带 `capability: reply_only`；Claude 起 `claude -p --resume <会话> --fork-session --tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}'`，不碰现场会话；结果照旧发回话题）；**B** 边界做完前把 Dialogue 的 R1 改回 owner-only（表里一行数据），先合 | A | 选 A；B 只作 A 完成前的临时闭门状态，且不能宣称第 2 层收口 | 卡住 PR #93 |
-| 1a | A 里 Claude 的 R1 是零工具还是放只读工具（Read / Grep / Glob） | 零工具 / 只读工具 | 零工具先做 | 零工具：只读工具也扩大本机信息可见范围 | 待定 |
-| 1b | participant 能不能看到 owner 现场会话的既有上下文 | 能（从会话分叉）/ 不能（独立记录、受限投影） | 不能 | 不能；participant 回合留在飞书、审计与独立 transcript 里，不回灌 owner 会话 | 待定 |
-| 1c | Codex 链怎么办：`-c sandbox_mode=read-only` 只是 shell 沙箱（不写盘不联网，仍能跑只读命令），没有可验证的零工具面 | 先按 B / 另起无工具的独立响应入口 | Codex 链先 B | 只读沙箱不算 R1 | 待定 |
-| 2 | **chat 默认态**：无绑定上下文（A、私聊、unbind 之后）不再拒，按普通问答处理；unbind = 退回 chat；私聊不再走待认领匹配 | 加 / 不加 | 加（改 goal 成四层） | 未评审 | 等 Frank 一句"改 goal，加 chat" |
-| 3 | 保留项第 5 条：暂停（unbind）改单向 —— 只关入站、出站照发 | 改 / 不改 | 若加 chat，此条自然定：unbind = 退回 chat，出站汇报作为 chat 的一个开关（默认继续发） | — | Frank 还在想 |
-| 4 | R0 在 Dialogue 下只给 owner（operator / participant 连 `/feishu-status` 都拒） | 开 / 不开 | 可开给 operator（它本来就是"信任的人"的角色位） | — | 暂按"operator 暂同 participant" |
-| 5 | 装不装：第 1 层 main 8c5cedc（PR #92，已合并、已评审） | 装 / 不装 | 装（只加角色表与登记入口，只有 owner 时行为不变） | 已放行 | 等 Frank |
+| 1 | **R1 没有执行边界**：三条投递路径（现场转发 → 现场会话、`claude --resume -p`、`codex exec resume`）都是全能力，participant 的"对话"会进到能改文件的宿主 | **A** 非 owner 的 R1 走"只回复"路径（runRequest 带 `capability: reply_only`；Claude 起 `claude -p --resume <会话> --fork-session --tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}'`，不碰现场会话；结果照旧发回话题）；**B** 边界做完前把 Dialogue 的 R1 改回 owner-only（表里一行数据），先合 | A | 选 A；B 只作 A 完成前的临时闭门状态，且不能宣称第 2 层收口 | **Frank 同意 A**；实现走 §6a 简化版 |
+| 1a | A 里 Claude 的 R1 是零工具还是放只读工具（Read / Grep / Glob） | 零工具 / 只读工具 | 零工具先做 | 零工具：只读工具也扩大本机信息可见范围 | **同意零工具** |
+| 1b | participant 能不能看到 owner 现场会话的既有上下文 | 能（从会话分叉）/ 不能（独立记录、受限投影） | 不能 | 不能；participant 回合留在飞书、审计与独立 transcript 里，不回灌 owner 会话 | **同意不能** |
+| 1c | Codex 链怎么办：`-c sandbox_mode=read-only` 只是 shell 沙箱（不写盘不联网，仍能跑只读命令），没有可验证的零工具面 | 先按 B / 另起无工具的独立响应入口 | Codex 链先 B | 只读沙箱不算 R1 | **同意 Codex 链先 B** |
+| 2 | **chat 默认态**：无绑定上下文（A、私聊、unbind 之后）不再拒，按普通问答处理；unbind = 退回 chat；私聊不再走待认领匹配 | 加 / 不加 | 加（改 goal 成四层） | 未评审 | **同意加**；goal 修订稿见 §6b |
+| 3 | 保留项第 5 条：暂停（unbind）改单向 —— 只关入站、出站照发 | 改 / 不改 | 若加 chat，此条自然定：unbind = 退回 chat，出站汇报作为 chat 的一个开关（默认继续发） | — | **同意随 chat 定** |
+| 4 | R0 在 Dialogue 下只给 owner（operator / participant 连 `/feishu-status` 都拒） | 开 / 不开 | 可开给 operator（它本来就是「信任的人」的角色位） | — | **同意开给 operator**（交叉表 R0 加 operator，随 chat 那次改） |
+| 5 | 装不装：第 1 层 main 8c5cedc（PR #92，已合并、已评审） | 装 / 不装 | 装（只加角色表与登记入口，只有 owner 时行为不变） | 已放行 | **已装**（Frank「装 8c5cedc」，运行时 942c01acbdbcf86d，两条链） |
 | 6 | FR-2.6 多群独立订阅：没有真实多群样本，`subscribe` 写入口不开 | 找一个真实分发群做样本 / 继续不开 | 等有第二个群再做 | — | 挂起 |
+
+### 6a. R1 执行边界的简化方案（方案 A 简化版）
+
+完整版 A 要分叉会话、管 participant 的独立 transcript、处理现场会话与分叉的并存 —— 三块都不小。既然 1b 已定「participant 不看 owner 上下文」，最简单的确定性边界是：
+
+| 项 | 简化版 | 代价 | 以后可加 |
+|---|---|---|---|
+| 非 owner 的 R1（Claude 链） | 起一个**零工具、无历史**的一次性回合：`claude -p "<正文>" --tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}'`，工作目录仍是项目根（模型知道是哪个项目，但没有工具就读不了文件）；结果走现有 hand-off 守望者发回话题 | participant 的每条消息互相没有记忆（第二句不知道第一句） | 给每个话题 × 发送者一条独立的 participant 会话（`--resume`，仍零工具），就有连续对话 |
+| 现场会话 | 完全不碰：不转发、不分叉 | 你在终端里看不到 participant 说了什么（飞书话题里看得到） | 出站卡片里标「participant 回合」 |
+| runRequest | 带 `capability: reply_only` 或 `full`，投递层只看这个字段；owner 的一切照旧 full | — | — |
+| Codex 链 | R1 改回 owner-only（表里一行）；participant 在 Codex 话题里的对话被拒并回执 | Codex 话题暂时没有 participant 对话 | Codex CLI 出现可验证的零工具面再开 |
+| 测试 | 假 `claude` 二进制逐字断言参数（有 `--tools ""`、无 `--resume` / `--continue`）；真入口断言 participant 的 R1 不再起 forwarder | — | — |
+
+实现量：一个新启动器（约 40 行）+ runRequest 一个字段 + 交叉表 Codex 行一处 + 两条链测试。**不需要**改会话文件、锁协议或安装器。
+
+### 6b. goal 修订稿（chat 默认态 + R1 边界，接在原三层之后）
+
+- 第 4 层 R1 边界：runRequest 带 capability；非 owner 的 R1 走零工具一次性回合（§6a）；Codex 链 R1 owner-only；R0 开给 operator；判据仍只有一份、每条新判据有变异转红、两条链行为一致。
+- 第 5 层 chat 默认态：无绑定上下文（刚装桥、私聊、unbind 之后）不再拒 —— ordinary 按 chat 处理（零工具一次性回合，owner 也一样，因为没有目标会话可投）；`/feishu-bind` 才进绑定流程；unbind = 退回 chat；私聊不再走待认领匹配；交叉表加 chat 行；状态页第 4 层显示 chat。
+- 判据：owner 在任何上下文至少能得到 chat 回复（Frank 的原则）；已绑定话题的行为与今天一致；文档同步（FR-4 / FR-7、contract、README 命令表、这份文档）；每层收口停一下问装不装。
 
 ## 7. 实现状态一览
 
 | 层 / 件 | 分支 / PR | HEAD | 评审 | 合并 | 安装 |
 |---|---|---|---|---|---|
-| 第 1 层 角色表 | PR #92 `feat/sender-roles` | main 8c5cedc | 五轮，放行 | 已合并 | **未装**（线上仍是 07f66d1d / main 687f0ef） |
-| 第 2 层 风险 × 角色 × 模式 | PR #93 `feat/authorize-layer` | cfa55f0 | 两轮；P1-2 / P2 已返修，P1-1（R1 边界）待 Frank | 未合并 | — |
-| 第 3 层 近似命中收边 | PR #94 `feat/malformed-control`（base 是 #93 的分支） | d099e29 | 待送 | 未合并 | — |
-| chat 默认态 | — | — | — | — | 未开工 |
+| 第 1 层 角色表 | PR #92 `feat/sender-roles` | main 8c5cedc | 五轮，放行 | 已合并 | **已装** 942c01acbdbcf86d（两条链，2026-08-29） |
+| 第 2 层 风险 × 角色 × 模式 | PR #93 `feat/authorize-layer` | cfa55f0 | 两轮；P1-2 / P2 已返修，P1-1（R1 边界）按 §6a 做 | 未合并 | — |
+| 第 3 层 近似命中收边 | PR #94 `feat/malformed-control`（base 是 #93 的分支） | a1b0b69 → 第 4 轮返修中 | 三轮：意图联合、拒绝事务可恢复、盘点四态、维护入口已认可；锁内核心唯一 + CLAUDE.md subscribe 措辞在第 4 轮 | 未合并 | — |
+| chat 默认态 | — | — | — | — | Frank 同意，goal 修订稿见 §6b |
 
 ## 8. 名词对照（防止同名异义）
 

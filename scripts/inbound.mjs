@@ -112,10 +112,13 @@ function writeReceipt(name, payload) {
 /** 三种结局的回执文案。拒绝必须带原因 —— 静默丢弃是不可接受的失败模式。 */
 function ackText(kind, detail) {
   if (kind === "accepted") {
-    // 说清楚落到哪条线上：他在终端里看不看得到这条指令，取决于这个。
-    const where = detail.mode === "live_session"
-      ? "已送进你正开着的会话（" + detail.targetName + "）"
-      : "已起一轮后台执行（沿用本项目最近的对话）";
+    // 说清楚落到哪条线上：他在终端里看不看得到这条指令，取决于这个。四种投递方式封闭渲染，说不清的不许冒充其中一种。
+    const where = {
+      live_session: "已送进你正开着的会话（" + detail.targetName + "）",
+      resume: "已续起本话题绑定的那条会话，后台执行",
+      continue: "已起一轮后台执行（沿用本项目最近的对话）",
+      reply_only: "已起一次性回复（零工具、不读任何会话历史，不进 owner 的会话）",
+    }[detail.mode] ?? ("已投递（方式：" + String(detail.mode) + "）");
     return [
       "已受理 · " + detail.taskName,
       where + "。完成后结果会自动发布到本话题。",

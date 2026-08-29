@@ -19444,6 +19444,8 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
   assert.deepEqual([...REPLY_ONLY_ARGS], ["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-session-persistence", "--safe-mode", "--output-format", "stream-json", "--verbose"]);
   assert.ok(!argv1[0].includes("--continue") && !argv1[0].includes("--resume"), "只回复不续任何会话");
   assert.doesNotMatch(p5.stdout, /同时有多个|无法确定目标/u, "两条现场会话不影响只回复：" + p5.stdout);
+  assert.match(p5.stdout, /已起一次性回复（零工具、不读任何会话历史，不进 owner 的会话）/u, "受理文案按投递方式封闭渲染：" + p5.stdout);
+  assert.doesNotMatch(p5.stdout, /沿用本项目最近的对话|正开着的会话/u, "只回复的回执不许说沿用对话 / 送进现场");
   assert.equal(readDeliveryPin(root), null, "只回复不钉 delivery pin");
   assert.equal(fs.existsSync(path.join(receiptsDir, "ambiguous-msg_authz_" + seq + ".json")), false, "不判歧义");
   const p5Turn = loadClaudeInteractionPolicy({ root, claudeSessionId: null, registryFile }).state.dialogue?.active_turn;

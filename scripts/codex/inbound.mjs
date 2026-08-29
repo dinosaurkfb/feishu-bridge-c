@@ -36,6 +36,9 @@ import {
 } from "./state.mjs";
 import { controlAckText, parseControlCommand, runControlTransaction } from "../control-command.mjs";
 import { codexControlPrecondition } from "./control-identity.mjs";
+import { senderRole } from "../sender-roles.mjs";
+import { classifyRisk } from "../risk-class.mjs";
+import { authorize } from "../authorize.mjs";
 import { isDirectRun } from "../direct-run.mjs";
 import { composeCrashReceipt } from "../crash-receipt.mjs";
 /**
@@ -309,6 +312,19 @@ if (!mappingContext.ok) {
 
 // 控制命令（$feishu-mode dialogue|mapping）：三道闸之后先解析意图、随 claim 持久化；执行与终态在拿到 claim 之后做（可恢复事务）。
 const control = parseControlCommand(verdict.instruction, { chain: "codex" });
+
+// ---------- 唯一一处授权判定（角色 × 风险等级 × 模式）：三道闸之后、拿 claim 之前 ----------
+// 拒绝必须说清"哪个模式、哪个角色、缺什么权限"，不投递、不静默；不取 claim（重发不算重放）。
+const senderRoleValue = senderRole({ frank_sender_id: routed.mapping.frank_sender_id, senders: routed.config?.senders }, event.sender_id);
+const risk = classifyRisk({ instruction: verdict.instruction, chain: "codex", mode: policyEvaluation.policy_id, control });
+const authz = authorize({ role: senderRoleValue, riskClass: risk.riskClass, mode: policyEvaluation.policy_id, chain: "codex" });
+if (!authz.allow) {
+  writeReceipt("authz-" + verdict.messageId, {
+    status: "rejected", reason: "not_authorized", authz_reason: authz.reason, role: senderRoleValue, risk_class: risk.riskClass, risk_kind: risk.kind,
+    policy_id: policyEvaluation.policy_id, required_roles: authz.required, message_id: verdict.messageId, logical_task_key: task.logical_task_key, claim_acquired: false, handed_off: false,
+  });
+  finish("rejected", { reasonText: authz.text, taskName: task.task_display_name }, { reason: "not_authorized", authz_reason: authz.reason, risk_class: risk.riskClass });
+}
 // 控制事务用的身份期望 —— 与 claim 里写的身份字段同一算法；换绑 / 换线程之后同 key 的旧 claim 对不上，就不替它执行、不重出回执。
 const claimExpect = { logicalTaskKey: task.logical_task_key, codexThreadId: task.codex_thread_id };
 const runControl = (replay) => {

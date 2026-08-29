@@ -11,6 +11,7 @@
  */
 
 import fs from "node:fs";
+import { releaseSessionLockIfOwnedBy } from "./handoff.mjs";
 import path from "node:path";
 
 import {
@@ -77,7 +78,8 @@ const logPath = path.join(RUNS, key + ".jsonl");
 const startedAt = Date.now();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const finishUp = () => fs.rmSync(LOCK, { recursive: true, force: true });
+// 只放属于这一轮的锁：只回复的 run 不取锁，它的守望者不能把 owner 的锁删掉。
+const finishUp = () => releaseSessionLockIfOwnedBy(LOCK, { logPath });
 // **claim 三态：说不清就不猜。**这里的 claim 不只决定来源代际，还决定 outbox 归属
 // （会话级绑定靠 claude_session_id）—— 缺席/损坏时上一版落到项目级 outbox、
 // 现算当前代际，把一轮结果发到了说不清的地方。结果不发布、落 failed 记录、

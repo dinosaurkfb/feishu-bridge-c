@@ -8,8 +8,9 @@
  *   · open_id 形状与 frank_sender_id 相同（Aily user id：一串数字），不重复。
  * 未登记的 open_id、Agent 转发、引用里的 token：角色为 null = 零权限（与今天一致）。
  *
- * 第 1 层只做"表 + 显示 + 受控登记"：入站闸门仍只放 owner（sender_ids 仍只有 owner），
- * 角色 × 风险 × 模式的判定是第 2 层的事 —— 所以表里只有 owner 时，行为与今天完全一致。
+ * 这里只做"表 + 显示 + 受控登记"：入站闸门放行表里登记的任何角色（selector），谁能干什么由
+ * risk-class × authorize（第 2 层）决定；sender_ids（binding 授权快照的基准）仍只有 owner。
+ * 表里只有 owner 时，闸门与判定的行为都与登记角色表之前完全一致。
  */
 
 export const SENDER_ROLES = Object.freeze(["owner", "operator", "participant"]);

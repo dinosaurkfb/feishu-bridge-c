@@ -542,6 +542,15 @@ bridge-home/
 必须版本化。两份安装不得同时注册为同一 endpoint/session 的默认 owner；dispatcher 路由表必须
 能检测 owner 冲突并拒绝静默覆盖。
 
+## 14a. 入站权限判定契约（2026-08-29）
+
+- 判据各只有一份，两条链共用：角色表 `scripts/sender-roles.mjs`（owner 只有一个 = `frank_sender_id`；operator / participant 由模板 `senders` 登记）、风险等级 `scripts/risk-class.mjs`、交叉表 `scripts/authorize.mjs`。
+- 判定点唯一：三道闸（登记发送者在角色表里、真实 @、新鲜度）之后、控制命令解析之后、拿 claim 之前；`authorize({ role, riskClass, mode })` 不允许 → 写 `authz-<message_id>` 回执（status rejected、reason not_authorized、角色、风险等级、模式、required_roles），回执文案说清"哪个模式、哪个角色、缺什么权限"；**不取 claim、不投递、不静默**（同一消息重发是新一笔，不算重放）。
+- 风险等级：R0 只读（正文恰为本链 status / subscribe 命令词）、R1 对话（Dialogue 下普通文本）、R2 执行（Mapping 下普通文本）、R3 控制（feishu-mode / bind / rotate 精确形状）、R4 授权类（装 / 切路由 的封闭措辞）；模式说不清时普通文本按 R2（fail-closed）。
+- 交叉表（Frank 2026-08-29）：Mapping 只有 owner 可 R2；Dialogue 的 R1 对 owner / operator / participant 都开；R0 只有 owner（operator 暂与 participant 同权）；R3 / R4 只有 owner；未登记零权限。表里没写的格子一律不允许。
+- 首次认领（绑定）仍只认 owner（R3 语义）。
+- 执行边界（2026-08-29 Frank 同意的简化版）：`authorize` 放行时给出 `capability`，随 runRequest 进投递层（投递层只看它，不重判角色；缺席按 fail-closed 拒）。owner → `full`：照旧投给现场会话 / 续起长期会话。其他角色 → `reply_only`：`handOffReplyOnly` 起零工具、无历史的一次性回合（`claude -p <正文> --tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}' --output-format stream-json --verbose`，参数是常量 `REPLY_ONLY_ARGS`），不 `--continue` / `--resume` 任何会话、不进现场会话、不取会话锁、不盖锁；日志与守望者路径与 handOff 相同，结果照旧发回话题。守望者只释放属于本轮的会话锁（`releaseSessionLockIfOwnedBy`：owner.json 的 log_path 一致才删）。`REPLY_ONLY_CAPABLE` 记录哪条链有可验证的只回复路径：Claude 有；Codex 没有（只读沙箱只是 shell 沙箱）—— 该链上非 owner 本来放行的格子暂不开放（reason `no_reply_only_path`，回执说清），而不是退化成全能力投递。Dialogue 仍是一次一个活动回合，reply_only 的回合同样占回合。
+
 ## 15. 测试契约
 
 ### 必须覆盖的公共契约测试

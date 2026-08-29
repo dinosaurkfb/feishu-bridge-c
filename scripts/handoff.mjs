@@ -86,6 +86,23 @@ export function releaseSessionLock(lockDir) {
 }
 
 /**
+ * 只释放**属于这一轮**的会话锁：owner.json 里的 log_path 与这轮的 run 日志一致才删。
+ * 只回复的 run（reply_only）根本不取会话锁；它的守望者若无条件删锁，会把 owner 正在跑的那把锁删掉。
+ * 锁不在 → absent；没有戳 / 读不出 / 属于别的 run → not_owner（留给陈旧回收）；一致 → released。
+ */
+export function releaseSessionLockIfOwnedBy(lockDir, { logPath }) {
+  let owner;
+  try { owner = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf-8")); }
+  catch (err) {
+    if (err?.code === "ENOENT") return fs.existsSync(lockDir) ? { status: "not_owner", why: "锁没有戳" } : { status: "absent" };
+    return { status: "not_owner", why: "戳读不出" };
+  }
+  if (owner?.log_path !== logPath) return { status: "not_owner", why: "锁属于别的 run" };
+  fs.rmSync(lockDir, { recursive: true, force: true });
+  return { status: "released" };
+}
+
+/**
  * 非阻塞投递。返回时子进程刚起来，任务远未完成 —— 这是预期行为，不是缺陷。
  */
 /**
@@ -141,6 +158,32 @@ export function handOff({ projectDir, instruction, runsDir, key, resumeSessionId
     resumedSessionId: resumeSessionId ?? null,
     pid: child.pid, logPath, errPath, startedAt: new Date().toISOString(),
   };
+}
+
+/**
+ * 只回复的执行边界（第 2 层 R1，非 owner）：**零工具、无历史**的一次性回合 ——
+ *   · 不 --continue / --resume 任何会话（participant 不看 owner 的上下文，也不把话写进 owner 的会话文件）；
+ *   · `--tools ""` 禁掉全部内建工具，`--strict-mcp-config --mcp-config '{"mcpServers":{}}'` 禁掉全部 MCP；
+ *   · `--no-session-persistence`：不落会话文件（否则它会成为目录里最新的会话，owner 下一次 --continue 就续进 participant 的话）；
+ *   · `--safe-mode`：关掉全部自定义入口（hooks / skills / plugins）—— 桥自己的 Stop 钩子也不在这个子进程里跑，终局只由守望者收；
+ *   · 日志与守望者路径与 handOff 完全一样，结果照旧发回话题。
+ * 参数是常量：测试逐字断言，改一个开关就红。
+ */
+export const REPLY_ONLY_ARGS = Object.freeze(["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-session-persistence", "--safe-mode", "--output-format", "stream-json", "--verbose"]);
+
+export function handOffReplyOnly({ projectDir, instruction, runsDir, key }) {
+  assertClaudeAvailable();
+  fs.mkdirSync(runsDir, { recursive: true });
+  const logPath = path.join(runsDir, key + ".jsonl");
+  const errPath = path.join(runsDir, key + ".stderr.log");
+  const out = fs.openSync(logPath, "a");
+  const err = fs.openSync(errPath, "a");
+  const child = spawn("claude", ["-p", instruction, ...REPLY_ONLY_ARGS], {
+    cwd: projectDir, detached: true, stdio: ["ignore", out, err],
+    env: { ...process.env, FEISHU_BRIDGE_ROLE: "run" },
+  });
+  child.unref();
+  return { mode: "reply_only", resumedSessionId: null, pid: child.pid, logPath, errPath, startedAt: new Date().toISOString() };
 }
 
 /**

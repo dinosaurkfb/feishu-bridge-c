@@ -32,7 +32,10 @@ import {
 } from "./interaction-policy-store.mjs";
 import { controlAckText, parseControlCommand, runControlTransaction } from "./control-command.mjs";
 import { claudeControlPrecondition } from "./control-identity.mjs";
-import { handOff, acquireSessionLock, releaseSessionLock, stampSessionLock } from "./handoff.mjs";
+import { senderRole } from "./sender-roles.mjs";
+import { classifyRisk } from "./risk-class.mjs";
+import { authorize } from "./authorize.mjs";
+import { handOff, handOffReplyOnly, acquireSessionLock, releaseSessionLock, stampSessionLock } from "./handoff.mjs";
 import {
   DELIVERY_REJECT, DELIVERY_REJECT_TEXT,
   deliverToLiveSession, findLiveSessionById, findLiveSessions, hasPriorSession,
@@ -109,10 +112,13 @@ function writeReceipt(name, payload) {
 /** 三种结局的回执文案。拒绝必须带原因 —— 静默丢弃是不可接受的失败模式。 */
 function ackText(kind, detail) {
   if (kind === "accepted") {
-    // 说清楚落到哪条线上：他在终端里看不看得到这条指令，取决于这个。
-    const where = detail.mode === "live_session"
-      ? "已送进你正开着的会话（" + detail.targetName + "）"
-      : "已起一轮后台执行（沿用本项目最近的对话）";
+    // 说清楚落到哪条线上：他在终端里看不看得到这条指令，取决于这个。四种投递方式封闭渲染，说不清的不许冒充其中一种。
+    const where = {
+      live_session: "已送进你正开着的会话（" + detail.targetName + "）",
+      resume: "已续起本话题绑定的那条会话，后台执行",
+      continue: "已起一轮后台执行（沿用本项目最近的对话）",
+      reply_only: "已起一次性回复（零工具、不读任何会话历史，不进 owner 的会话）",
+    }[detail.mode] ?? ("已投递（方式：" + String(detail.mode) + "）");
     return [
       "已受理 · " + detail.taskName,
       where + "。完成后结果会自动发布到本话题。",
@@ -349,9 +355,11 @@ if (!interaction.ok) {
 }
 const policyEvaluation = applyInteractionPolicyToAdmission(verdict, interaction.state);
 const dialogueMode = policyEvaluation.policy_id === DIALOGUE_POLICY_ID;
+let authz = null;
+// runRequest 带执行边界：authorize 放行时给的 capability（owner full / 其他 reply_only）。这里 authz 还没算出来，所以用惰性读取。
 const handlePolicy = (args = {}) => dialogueMode
-  ? handleDialoguePolicy({ evaluation: policyEvaluation, ...args })
-  : handleMappingPolicy({ evaluation: policyEvaluation, ...args });
+  ? handleDialoguePolicy({ evaluation: policyEvaluation, capability: authz?.capability ?? null, ...args })
+  : handleMappingPolicy({ evaluation: policyEvaluation, capability: authz?.capability ?? null, ...args });
 
 // 光秃秃一个 @（没有正文）是完成绑定的正常方式 —— 那一下的目的就是让 Aily 产生
 // session，好把它写进绑定。这时候回「消息里没有指令正文」是句没用的实话：
@@ -422,6 +430,19 @@ if (!mappingContext.ok) {
 // 控制命令（/feishu-mode dialogue|mapping）：三道闸之后先**解析意图但不执行**，意图随 claim 持久化；
 // 执行与终态在拿到 claim 之后做，重放时按 claim 里的意图续做或按结果重出回执（可恢复事务，goal 第 3 层）。
 const control = parseControlCommand(verdict.instruction, { chain: "claude" });
+
+// ---------- 唯一一处授权判定（角色 × 风险等级 × 模式）：三道闸之后、拿 claim 之前 ----------
+// 拒绝必须说清"哪个模式、哪个角色、缺什么权限"，不投递、不静默；不取 claim（重发不算重放）。
+const senderRoleValue = senderRole({ frank_sender_id: mapping.frank_sender_id, senders: config?.senders }, event.sender_id);
+const risk = classifyRisk({ instruction: verdict.instruction, chain: "claude", mode: policyEvaluation.policy_id, control });
+authz = authorize({ role: senderRoleValue, riskClass: risk.riskClass, mode: policyEvaluation.policy_id, chain: "claude" });
+if (!authz.allow) {
+  writeReceipt("authz-" + verdict.messageId, {
+    status: "rejected", reason: "not_authorized", authz_reason: authz.reason, role: senderRoleValue, risk_class: risk.riskClass, risk_kind: risk.kind,
+    policy_id: policyEvaluation.policy_id, required_roles: authz.required, message_id: verdict.messageId, project_root: routed.root, binding_source: routed.source, claim_acquired: false, handed_off: false,
+  });
+  finish("rejected", { reasonText: authz.text, taskName: config.task_display_name }, { reason: "not_authorized", authz_reason: authz.reason, risk_class: risk.riskClass });
+}
 // 控制事务用的身份期望 —— 与 claim 里写的身份字段同一算法；换绑 / 换线程之后同 key 的旧 claim 对不上，就不替它执行、不重出回执。
 const claimExpect = { logicalTaskKey: verdict.logicalTaskKey, bindingId: effectiveBindingId(mapping), claudeSessionId: mapping.claude_session_id ?? null };
 const runControl = (replay) => {
@@ -519,9 +540,20 @@ const boundSession = routed.mapping?.claude_session_id ?? null;
 // 指令被投给了后开的那条 —— 他看着自己发出去的指令消失在另一个窗口里。
 // 现在只有一条会话时才投，多条就拒。理由跟下面那段「不回落到项目行为」一样：
 // **投错会话比投不进去更糟** —— 投不进去当场就知道，投错了要等到「它怎么没反应」才知道。
+// 执行边界：reply_only 永远不进现场会话、不续起任何会话；capability 说不清（缺席）按 fail-closed 拒，不折叠成 full。
+const capability = authz.capability;
+if (capability !== "full" && capability !== "reply_only") {
+  recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { reason: "capability_unknown" } });
+  writeReceipt("capability-" + verdict.messageId, { status: "error", reason: "capability_unknown", message_id: verdict.messageId, claim_acquired: true, handed_off: false });
+  finish("error", { detail: "这条消息的执行边界说不清，没有投递" }, { reason: "capability_unknown" });
+}
+const replyOnly = capability === "reply_only";
+
 let ambiguousDelivery = null;
 let target = null;
-if (boundSession) {
+if (replyOnly) {
+  // 只回复不进现场：不枚举现场会话、不选、不钉 delivery pin、不判歧义 —— 这些都只属于 full 分支
+} else if (boundSession) {
   target = findLiveSessionById({ projectRoot: config.project_dir, claudeSessionId: boundSession });
 } else {
   const picked = selectDeliverySession({
@@ -596,7 +628,7 @@ const reserveDialogue = (runtimeTargetId, { beforeReject = null } = {}) => {
 
 let run;
 
-if (target) {
+if (target && !replyOnly) {
   // 现场路径不需要会话锁：消息进的是一个活着的会话，它自己会把先后顺序排好。
   // 也不需要守望者 —— 那个会话结束时它自己的 Stop 钩子会把进展发出去。
   try {
@@ -635,7 +667,7 @@ if (target) {
   // 回落会把指令投进一条 Frank 没指定的线 —— 那正是当年那个失败方案的形态。
   // 先试 --resume 精确续起原会话（Claude 的 resume 是精确的，不像 --continue 靠猜）；
   // 连记录都没有才如实拒绝。
-  if (boundSession && !hasPriorSession({ projectRoot: config.project_dir })) {
+  if (!replyOnly && boundSession && !hasPriorSession({ projectRoot: config.project_dir })) {
     recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { reason: "bound_session_gone" } });
     writeReceipt("bound-session-gone-" + verdict.messageId, {
       status: "error", reason: "bound_session_gone", message_id: verdict.messageId,
@@ -647,7 +679,8 @@ if (target) {
     }, { reason: "bound_session_gone" });
   }
 
-  if (!hasPriorSession({ projectRoot: config.project_dir })) {
+  // 只回复不续任何会话，所以不要求项目里有过会话
+  if (!replyOnly && !hasPriorSession({ projectRoot: config.project_dir })) {
     recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { reason: "no_prior_session" } });
     writeReceipt("no-session-" + verdict.messageId, {
       status: "error", reason: "no_prior_session", message_id: verdict.messageId,
@@ -659,7 +692,8 @@ if (target) {
   }
 
   // 同一目录不能并发 --continue，否则两轮会互相踩。用目录锁串行化。
-  const lock = acquireSessionLock(LOCK);
+  // 只回复的 run 不碰任何会话文件，所以不取这把锁：participant 的对话不该把 owner 的 run 挡住，也不该被挡。
+  const lock = replyOnly ? { ok: true, skipped: true } : acquireSessionLock(LOCK);
   if (!lock.ok) {
     const busyOutcome = handlePolicy({ claim, resolvedContext: mappingContext, targetState: "busy" });
     recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed", detail: { reason: lock.reason } });
@@ -676,26 +710,26 @@ if (target) {
 
   try {
     if (dialogueMode) {
-      policyRun = reserveDialogue(boundSession ?? null, {
-        beforeReject: () => releaseSessionLock(LOCK),
+      // reply_only 的回合不在任何真实会话里执行：runtime target 用一个与任何会话 id 都不可能相等的值，owner 会话的 Stop 不会误收它的终局（终局只由守望者收）
+      policyRun = reserveDialogue(replyOnly ? "reply-only:" + claim.key : (boundSession ?? null), {
+        beforeReject: () => { if (!replyOnly) releaseSessionLock(LOCK); },
       });
     }
-    run = handOff({
-      projectDir: config.project_dir,
-      resumeSessionId: boundSession ?? undefined,
-      instruction: stampInstruction({
-        instruction: dialogueMode
-          ? "[Dialogue · " + policyRun.runRequest.policy.dialogue_id + " · turn " +
-            policyRun.runRequest.policy.turn_index + "]\n" + policyRun.runRequest.userInput
-          : policyRun.runRequest.userInput,
-        messageId: verdict.messageId,
-        createdAtMs: event.created_at_ms,
-      }),
-      runsDir: RUNS,
-      key: policyRun.runRequest.runId,
+    const stamped = stampInstruction({
+      instruction: dialogueMode
+        ? "[Dialogue · " + policyRun.runRequest.policy.dialogue_id + " · turn " +
+          policyRun.runRequest.policy.turn_index + "]\n" + policyRun.runRequest.userInput
+        : policyRun.runRequest.userInput,
+      messageId: verdict.messageId,
+      createdAtMs: event.created_at_ms,
     });
+    // 投递层只看 runRequest 里的 capability，不重新判角色
+    if (policyRun.runRequest.capability !== capability) throw new Error("runRequest 的执行边界与授权结果不一致");
+    run = replyOnly
+      ? handOffReplyOnly({ projectDir: config.project_dir, instruction: stamped, runsDir: RUNS, key: policyRun.runRequest.runId })
+      : handOff({ projectDir: config.project_dir, resumeSessionId: boundSession ?? undefined, instruction: stamped, runsDir: RUNS, key: policyRun.runRequest.runId });
   } catch (err) {
-    releaseSessionLock(LOCK);
+    if (!replyOnly) releaseSessionLock(LOCK);
     if (dialogueMode) {
       finalizeClaudeDialogueTurn({
         root: routed.root, claudeSessionId: boundSession, runId: claim.key,
@@ -711,7 +745,7 @@ if (target) {
   }
 
   // 把 run 信息盖进锁：锁要活到 run 结束，靠这份信息做陈旧回收。
-  stampSessionLock(LOCK, { pid: run.pid, logPath: run.logPath });
+  if (!replyOnly) stampSessionLock(LOCK, { pid: run.pid, logPath: run.logPath });
 
   // 起一次性守望者：run 跑完就发布结果并放锁。
   if (dialogueMode || config.auto_publish_on_completion !== false) {

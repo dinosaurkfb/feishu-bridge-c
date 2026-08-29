@@ -1,7 +1,13 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-08-29T08:41:26.522Z",
+  "generated_at": "2026-08-29T10:23:56.726Z",
   "modules": {
+    "authorize.mjs": [
+      "AUTHORIZATION_TABLE",
+      "CAPABILITY",
+      "REPLY_ONLY_CAPABLE",
+      "authorize"
+    ],
     "automatic-topic-rotation.mjs": [
       "businessActivitiesForPublishedBatch",
       "launchAutomaticTopicRotation",
@@ -211,12 +217,15 @@
       "subscriptionDetails"
     ],
     "handoff.mjs": [
+      "REPLY_ONLY_ARGS",
       "acquireSessionLock",
       "handOff",
+      "handOffReplyOnly",
       "isLockStale",
       "parseRunOutcome",
       "readRunOutcome",
       "releaseSessionLock",
+      "releaseSessionLockIfOwnedBy",
       "stampSessionLock"
     ],
     "inbound-dispatcher.mjs": [
@@ -375,6 +384,11 @@
       "parseRepairControlArgs",
       "repairExitCode"
     ],
+    "risk-class.mjs": [
+      "RISK",
+      "RISK_LABEL",
+      "classifyRisk"
+    ],
     "runtime-install.mjs": [
       "CHAIN_HOME_DIR",
       "CURRENT_LINK",
@@ -402,6 +416,15 @@
       "isValidPrefix",
       "isValidQuota",
       "normalizeBody"
+    ],
+    "sender-roles.mjs": [
+      "SENDER_ROLES",
+      "roleCounts",
+      "roleCountsText",
+      "roleEntriesProblem",
+      "senderRole",
+      "senderRolesProblem",
+      "senderTable"
     ],
     "shell-quote.mjs": [
       "nodeCommandPrefix",

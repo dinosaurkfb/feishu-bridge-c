@@ -142,6 +142,7 @@ export function handleMappingPolicy({
   claim,
   resolvedContext,
   targetState = "ready",
+  capability = null,
 } = {}) {
   const base = baseResult();
   const reject = (reason, receiptText, claimId = null) => ({
@@ -213,6 +214,7 @@ export function handleMappingPolicy({
       runId: claim.key,
       localTargetId: resolvedContext.localTargetId,
       userInput: evaluation.instruction,
+      capability,
       origin: {
         kind: "feishu",
         eventId: evaluation.messageId,

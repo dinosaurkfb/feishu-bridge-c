@@ -10,6 +10,7 @@
  *
  * 纯函数，无 IO。fail-closed：任何字段缺失或不匹配一律 reject，绝不猜测。
  */
+import { senderRole } from "./sender-roles.mjs";
 
 /** 关掉次数闸的唯一写法。字面量比对，不做大小写或别名兼容 —— 见下面配额那段的理由。 */
 export const UNLIMITED = "unlimited";
@@ -169,7 +170,9 @@ export function evaluateInboundEvidence({ event, mapping, config, now }) {
     return reject(REJECT.SESSION_MISMATCH);
   }
 
-  if (event.sender_id !== mapping.frank_sender_id) {
+  // 第 2 层起：闸门是"在角色表里"（owner 永远在表里；未登记 = 零权限，理由 id 保持不变）。
+  // 谁能做什么由 authorize.mjs 在控制命令解析之后、拿 claim 之前判。
+  if (senderRole({ frank_sender_id: mapping.frank_sender_id, senders: config?.senders }, event.sender_id) === null) {
     return reject(REJECT.SENDER_NOT_FRANK);
   }
 

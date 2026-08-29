@@ -11,8 +11,8 @@ import { isDirectRun } from "./direct-run.mjs";
 import { CLAIM_KEY_SHAPE, readClaimState } from "./claim.mjs";
 import { RESUMABLE_CONTROL_STATES, inspectControlClaim, resumeControlClaim } from "./control-command.mjs";
 import { setClaudeInteractionMode } from "./interaction-policy-store.mjs";
-import { mappingFromRegistryEntry, resolveProject } from "./project-resolve.mjs";
-import { effectiveBindingId } from "./topic-generation.mjs";
+import { resolveProject } from "./project-resolve.mjs";
+import { expectationFromMapping, claudeControlPrecondition } from "./control-identity.mjs";
 
 export function parseRepairControlArgs(argv, { target = "--project" } = {}) {
   let root = null; let key = null; let apply = false;
@@ -60,33 +60,13 @@ export function repairExitCode({ seen, result, apply }) {
   return seen.state === "consumed" && !(seen.residue?.length) && !seen.listingProblem ? 0 : 1;
 }
 
-/**
- * 由一份 mapping（项目文件那份，或登记表条目合成的那份）推导 claim 必须满足的身份期望。
- * bindingId 用存储层同一算法 effectiveBindingId(mapping, { root })：旧形状的项目文件没有 binding_id / topic_generation_state 时
- * 得到 `<basename>@project-files`，约束不丢 —— claim 里写的是别的 binding（或没写）都对不上，fail-closed。
- */
-export function expectationFromMapping(mapping, { root = null } = {}) {
-  return { logicalTaskKey: mapping.logical_task_key, bindingId: effectiveBindingId(mapping, { root }), claudeSessionId: mapping.claude_session_id ?? null };
-}
+export { expectationFromMapping, claudeControlPrecondition as controlRepairPrecondition } from "./control-identity.mjs";
 
 /** 当前项目里、这张 claim 所属的精确绑定（claim 带会话定位就选会话级，否则项目级）的身份期望。 */
 export function claudeClaimExpectation({ root, claudeSessionId = null, registryFile, templateFile }) {
   const resolved = resolveProject({ root, claudeSessionId, registryFile, templateFile });
   if (!resolved.ok) return { ok: false, reason: resolved.reason };
   return { ok: true, expect: expectationFromMapping(resolved.mapping, { root }) };
-}
-
-/**
- * 写锁内的前置条件：参数是存储层在锁内刚读出的记录。用它**重新**推导身份，再用这份锁内身份读 claim ——
- * 锁外算好的 expect 在这里不作数。锁外到锁内之间绑定换代（claim 的 logical task / binding / 会话任一对不上）就拒。
- * （claim 的 logical_task_key 由 key 推导、不可换，所以"锁内身份 vs claim"这一道核对已经蕴含"锁内身份 vs 锁外身份"。）
- */
-export function controlRepairPrecondition({ claimsDir, key, root = null }) {
-  return (record, meta = {}) => {
-    if (!record || typeof record !== "object") return false;
-    const live = meta.source === "registry" ? mappingFromRegistryEntry(record) : record;
-    return readClaimState({ claimsDir, key, expect: expectationFromMapping(live, { root: meta.root ?? root }) }).status === "valid";
-  };
 }
 
 if (isDirectRun(import.meta.url)) {
@@ -105,7 +85,7 @@ if (isDirectRun(import.meta.url)) {
   if (parsed.apply && (RESUMABLE_CONTROL_STATES.includes(seen.state) || seen.state === "consumed")) {
     result = resumeControlClaim({ claimsDir, key: parsed.key, expect,
       execute: (mode) => setClaudeInteractionMode({ root, claudeSessionId: expect.claudeSessionId, mode,
-        precondition: controlRepairPrecondition({ claimsDir, key: parsed.key, root }) }) });
+        precondition: claudeControlPrecondition({ claimsDir, key: parsed.key, root }) }) });
   }
   process.stdout.write(describeControlRepair({ seen, result, apply: parsed.apply }) + "\n");
   process.exit(repairExitCode({ seen, result, apply: parsed.apply }));

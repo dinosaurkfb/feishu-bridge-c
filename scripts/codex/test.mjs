@@ -40,6 +40,7 @@ import { sweepEligible } from "./drain-all.mjs";
 import { remindCodexPendingClaims } from "./claim-reminder.mjs";
 import { claimKey, recordClaimState, readClaimState, acquireClaim } from "../claim.mjs";
 import { codexControlRepairPrecondition } from "./repair-control-claim.mjs";
+import { codexControlPrecondition } from "./control-identity.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
 import {
   ELIGIBILITY_BUDGET_DEFAULT_MS, ELIGIBILITY_BUDGET_MAX_MS, eligibilityBudgetMs,
@@ -9085,6 +9086,7 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
   assert.equal(policyOf(), modeBefore, "别的 thread 的 claim 动不了本 task 的模式");
   assert.equal(fs.existsSync(path.join(paths.claims, foreignCtl.key + ".consumed.json")), false);
   fs.rmSync(path.join(paths.claims, foreignCtl.key + ".claim"), { recursive: true, force: true });
+  assert.equal(codexControlRepairPrecondition, codexControlPrecondition, "生产入口与维护入口用同一份写锁内前置条件（codex/control-identity.mjs）");
   assert.ok(!fs.existsSync(path.join(paths.claims, key10 + ".consumed.json")), "没有留下并存");
   // 逐 key 事务锁：另一笔持有时维护入口与重放都拿不到
   const lock10 = path.join(paths.claims, key10 + ".control.lock");

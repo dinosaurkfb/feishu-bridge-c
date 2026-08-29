@@ -35,6 +35,7 @@ import {
   shadowCodexFirstClaim, taskPaths,
 } from "./state.mjs";
 import { controlAckText, parseControlCommand, runControlTransaction } from "../control-command.mjs";
+import { codexControlPrecondition } from "./control-identity.mjs";
 import { isDirectRun } from "../direct-run.mjs";
 import { composeCrashReceipt } from "../crash-receipt.mjs";
 /**
@@ -313,7 +314,9 @@ const claimExpect = { logicalTaskKey: task.logical_task_key, codexThreadId: task
 const runControl = (replay) => {
   const tx = runControlTransaction({
     claimsDir: paths.claims, key: claim.key, intent: control ? { control: control.kind, mode: control.mode } : undefined, replay, expect: claimExpect,
-    execute: (mode) => setTaskInteractionMode({ threadId: task.codex_thread_id, mode, home: HOME }),
+    // task 写锁内再核一次身份（与维护入口同一份判据）：事务核验与写入之间换了 task，旧命令不许改新对象。
+    execute: (mode) => setTaskInteractionMode({ threadId: task.codex_thread_id, mode, home: HOME,
+      precondition: codexControlPrecondition({ claimsDir: paths.claims, key: claim.key, expect: claimExpect }) }),
   });
   // 锁没干净交还的话，不管事务成败都要说出来：之后同一笔会报 control_busy。
   const lockNote = tx.lockUncleared ? "；另外这一笔的事务锁没有交还（" + tx.lockUncleared + "），之后同一笔会报 control_busy，请人工确认后处理" : "";

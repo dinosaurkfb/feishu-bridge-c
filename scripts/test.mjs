@@ -72,6 +72,7 @@ import {
 import { parseRunOutcome } from "./handoff.mjs";
 import { repairRunClaims } from "./repair-run-claim.mjs";
 import { claudeClaimExpectation, controlRepairPrecondition, repairExitCode, expectationFromMapping, describeControlRepair } from "./repair-control-claim.mjs";
+import { claudeControlPrecondition } from "./control-identity.mjs";
 import {
   describeDrainOutcome, drainProject, inspectRunChannel, outboxDirOf, suppressCmd, watcherActive, inventoryUnroutedReplies } from "./drain-outbox.mjs";
 import { CANDIDATE_POLICIES, publishOutboxAttempt } from "./publish-attempt.mjs";
@@ -18486,6 +18487,17 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   const viaInLock = resumeControlClaim({ claimsDir, key: ownCtlKey, expect: own, execute: (mode) => { executedMode = mode; return { ok: true, changed: true }; } });
   assert.deepEqual([viaInLock.ok, executedMode, viaInLock.intent.mode], [true, DIALOGUE_POLICY_ID, DIALOGUE_POLICY_ID], "维护入口按锁内 claim 的意图执行：" + JSON.stringify(viaInLock));
   assert.equal(runControlTransaction({ claimsDir, key: claimKey("msg_ctl_none", logicalTaskKey), intent: { control: "mode", mode: DIALOGUE_POLICY_ID }, expect: own, execute: () => ({ ok: true }) }).reason, "claim_absent");
+  assert.equal(controlRepairPrecondition, claudeControlPrecondition, "生产入口与维护入口用同一份写锁内前置条件（control-identity.mjs）");
+  // 维护入口整段在锁内：consumed 分支也先重读 claim —— 身份对不上就不清残骸、不报 already；身份对上才清
+  const resKey = acquireClaim({ claimsDir, messageId: "msg_ctl_res", logicalTaskKey, meta: { ...protoMeta, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).key;
+  recordClaimState({ claimsDir, key: resKey, state: "consumed", detail: { control: "mode", mode: DIALOGUE_POLICY_ID, changed: true } });
+  const resResidue = path.join(claimsDir, resKey + ".consumed.json.tmp.1.1");
+  fs.writeFileSync(resResidue, "{");
+  const wrongId = resumeControlClaim({ claimsDir, key: resKey, expect: { ...own, bindingId: "someone-else" }, execute: () => { throw new Error("must not execute"); } });
+  assert.deepEqual([wrongId.ok, wrongId.reason, fs.existsSync(resResidue)], [false, "claim_unreadable", true], "身份对不上：不清残骸、不报 already：" + JSON.stringify(wrongId));
+  const rightId = resumeControlClaim({ claimsDir, key: resKey, expect: own, execute: () => { throw new Error("must not execute"); } });
+  assert.deepEqual([rightId.ok, rightId.already, rightId.residueUncleared, fs.existsSync(resResidue)], [true, true, [], false], JSON.stringify(rightId));
+  fs.rmSync(path.join(claimsDir, resKey + ".claim"), { recursive: true, force: true }); fs.rmSync(path.join(claimsDir, resKey + ".consumed.json"), { force: true });
   for (const k of [foreignCtlKey, ownCtlKey]) { fs.rmSync(path.join(claimsDir, k + ".claim"), { recursive: true, force: true }); fs.rmSync(path.join(claimsDir, k + ".consumed.json"), { force: true }); }
   // 首次执行失败：failed 由事务在锁内写（不再由入站另写）
   const key11 = claimKey("msg_c11", logicalTaskKey);

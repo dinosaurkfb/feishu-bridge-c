@@ -31,6 +31,7 @@ import {
   finalizeClaudeDialogueTurn, loadClaudeInteractionPolicy, reserveClaudeDialogueTurn, setClaudeInteractionMode,
 } from "./interaction-policy-store.mjs";
 import { controlAckText, parseControlCommand, runControlTransaction } from "./control-command.mjs";
+import { claudeControlPrecondition } from "./control-identity.mjs";
 import { handOff, acquireSessionLock, releaseSessionLock, stampSessionLock } from "./handoff.mjs";
 import {
   DELIVERY_REJECT, DELIVERY_REJECT_TEXT,
@@ -426,7 +427,9 @@ const claimExpect = { logicalTaskKey: verdict.logicalTaskKey, bindingId: effecti
 const runControl = (replay) => {
   const tx = runControlTransaction({
     claimsDir: CLAIMS, key: claim.key, intent: control ? { control: control.kind, mode: control.mode } : undefined, replay, expect: claimExpect,
-    execute: (mode) => setClaudeInteractionMode({ root: routed.root, claudeSessionId: mapping.claude_session_id ?? null, mode }),
+    // 策略存储层写锁内再核一次身份（与维护入口同一份判据）：事务核验与策略写入之间换了绑定，旧命令不许改新对象。
+    execute: (mode) => setClaudeInteractionMode({ root: routed.root, claudeSessionId: mapping.claude_session_id ?? null, mode,
+      precondition: claudeControlPrecondition({ claimsDir: CLAIMS, key: claim.key, root: routed.root }) }),
   });
   // 锁没干净交还的话，不管事务成败都要说出来：之后同一笔会报 control_busy。
   const lockNote = tx.lockUncleared ? "；另外这一笔的事务锁没有交还（" + tx.lockUncleared + "），之后同一笔会报 control_busy，请人工确认后处理" : "";

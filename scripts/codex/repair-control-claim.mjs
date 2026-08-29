@@ -6,17 +6,10 @@
 import { isDirectRun } from "../direct-run.mjs";
 import { describeControlRepair, parseRepairControlArgs, repairExitCode } from "../repair-control-claim.mjs";
 import { RESUMABLE_CONTROL_STATES, inspectControlClaim, resumeControlClaim } from "../control-command.mjs";
-import { readClaimState } from "../claim.mjs";
+import { codexControlPrecondition } from "./control-identity.mjs";
 import { bridgeHome, findRegisteredTaskForCodexThread, setTaskInteractionMode, taskPaths } from "./state.mjs";
 
-/** 写锁内的前置条件：锁内刚读出的 task 必须仍是同一身份，且此刻的 claim 仍属于它。 */
-export function codexControlRepairPrecondition({ claimsDir, key, expect }) {
-  return (task) => {
-    if (!task || typeof task !== "object") return false;
-    if (task.logical_task_key !== expect.logicalTaskKey || task.codex_thread_id !== expect.codexThreadId) return false;
-    return readClaimState({ claimsDir, key, expect }).status === "valid";
-  };
-}
+export { codexControlPrecondition as codexControlRepairPrecondition } from "./control-identity.mjs";
 
 if (isDirectRun(import.meta.url)) {
   const parsed = parseRepairControlArgs(process.argv.slice(2), { target: "--thread-id" });
@@ -31,7 +24,7 @@ if (isDirectRun(import.meta.url)) {
   if (parsed.apply && (RESUMABLE_CONTROL_STATES.includes(seen.state) || seen.state === "consumed")) {
     result = resumeControlClaim({ claimsDir, key: parsed.key, expect,
       execute: (mode) => setTaskInteractionMode({ threadId: parsed.root, mode, home,
-        precondition: codexControlRepairPrecondition({ claimsDir, key: parsed.key, expect }) }) });
+        precondition: codexControlPrecondition({ claimsDir, key: parsed.key, expect }) }) });
   }
   process.stdout.write(describeControlRepair({ seen, result, apply: parsed.apply }) + "\n");
   process.exit(repairExitCode({ seen, result, apply: parsed.apply }));

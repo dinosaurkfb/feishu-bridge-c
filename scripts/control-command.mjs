@@ -342,20 +342,33 @@ export const RESUMABLE_CONTROL_STATES = Object.freeze(["in_flight", "consumed_un
  *   · 可续做态：走 runControlTransaction(replay)，隔离、执行、记账都在锁内；锁内若发现已被别的事务补上（如 failed 受验），按锁内结果返回。
  */
 export function resumeControlClaim({ claimsDir, key, execute, expect = {} }) {
-  const seen = inspectControlClaim({ claimsDir, key, expect });
-  if (seen.state === "consumed") {
-    const locked = withControlLock({ claimsDir, key }, () => cleanupConsumedResidue({ claimsDir, key }));
-    if (locked.ok === false) return { ok: false, reason: locked.reason, why: locked.why };
-    return { ok: true, already: true, changed: seen.record.changed, intent: seen.intent, residueUncleared: locked.uncleared, residueUnknown: locked.unknown,
-      quarantined: seen.quarantined ?? [], lockUncleared: locked.lockUncleared ?? null };
-  }
-  if (!RESUMABLE_CONTROL_STATES.includes(seen.state)) return { ok: false, reason: seen.state, why: seen.why ?? null };
-  // 锁外 seen 只用来拒掉明显不该动的；执行用的意图与身份都在锁内重读（intent: null = 以锁内 claim 为准）。
-  const tx = runControlTransaction({ claimsDir, key, intent: null, execute, replay: true, expect });
-  return tx.ok
-    ? { ok: true, already: false, changed: tx.changed, intent: tx.intent, residueUncleared: tx.residueUncleared ?? [], residueUnknown: tx.residueUnknown ?? null,
-      quarantined: [...(seen.quarantined ?? []), ...(tx.quarantined ?? [])], lockUncleared: tx.lockUncleared ?? null }
-    : { ok: false, reason: tx.reason, why: tx.why, quarantined: tx.quarantined ?? [], lockUncleared: tx.lockUncleared ?? null };
+  // **整段在锁内**，不带任何锁外快照：身份（expect）、控制意图、consumed / failed 联合状态都以锁内刚读出的为准。
+  return withControlLock({ claimsDir, key }, () => {
+    const claim = readClaimState({ claimsDir, key, expect });
+    if (claim.status !== "valid") return { ok: false, reason: "claim_" + claim.status, why: claim.why ?? null };
+    const intent = claim.claim.control;
+    if (intent === undefined) return { ok: false, reason: "not_control", why: null };
+    const consumed = readConsumedRecord({ claimsDir, key });
+    const failed = readControlFailedRecord({ claimsDir, key });
+    const listed = listControlSidecars({ claimsDir, key });
+    const quarantined = listed.status === "listed" ? listed.quarantined : [];
+    if (consumed.status !== "absent" && failed.status !== "absent") return { ok: false, reason: "conflict", why: jointWhy(failed, consumed) };
+    if (consumed.status === "valid") {
+      if (!sameControlIntent(intent, { control: consumed.record.control, mode: consumed.record.mode })) {
+        return { ok: false, reason: "mismatch", why: "consumed 的意图（" + consumed.record.mode + "）与 claim 的意图（" + intent.mode + "）不一致" };
+      }
+      // 已闭合：只清同 key 的临时残骸 —— 也只在锁内确认 claim 仍属于当前身份、consumed 仍完整一致之后才清
+      const cleaned = cleanupConsumedResidue({ claimsDir, key });
+      return { ok: true, already: true, changed: consumed.record.changed, intent, residueUncleared: cleaned.uncleared, residueUnknown: cleaned.unknown, quarantined };
+    }
+    if (failed.status === "valid") return { ok: false, reason: "failed", why: null };
+    // consumed 缺席 / 损坏、failed 缺席 / 损坏：可续做 —— 同一把锁里跑事务核心（不再取锁）
+    const tx = runLockedTransaction({ claimsDir, key, intent: null, execute, replay: true, expect });
+    return tx.ok
+      ? { ok: true, already: false, changed: tx.changed, intent: tx.intent, residueUncleared: tx.residueUncleared ?? [], residueUnknown: tx.residueUnknown ?? null,
+        quarantined: [...quarantined, ...(tx.quarantined ?? [])] }
+      : { ok: false, reason: tx.reason, why: tx.why, quarantined: tx.quarantined ?? [] };
+  });
 }
 
 const MODE_LABEL = {

@@ -14,7 +14,7 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import { RISK, classifyRisk } from "./risk-class.mjs";
 import { INTENT, parseInboundIntent, controlRejectText, rejectedControlProjection, shown } from "./inbound-intent.mjs";
-import { rejectedRecordProblem, runRejectTransaction, inspectRejectedClaim, resumeRejectedClaim, describeRejectRepair, rejectRepairExitCode } from "./reject-control.mjs";
+import { rejectedRecordProblem, runRejectTransaction, rejectTransactionCore, inspectRejectedClaim, resumeRejectedClaim, describeRejectRepair, rejectRepairExitCode } from "./reject-control.mjs";
 import { REJECTED_CONTROL_INTENTS, rejectedControlProblem } from "./control-intent.mjs";
 import { AUTHORIZATION_TABLE, authorize, CAPABILITY, REPLY_ONLY_CAPABLE } from "./authorize.mjs";
 import { SENDER_ROLES, roleCounts, roleCountsText, senderRole, senderRolesProblem, senderTable, roleEntriesProblem } from "./sender-roles.mjs";
@@ -19711,6 +19711,28 @@ test("近似命中收边（第 3 层）：意图联合唯一、风险是它的�
   const other = run("/feishu-unbind", owner, "msg_mal_2");
   assert.match(other.stdout, /已经处理过（幂等命中）/u, other.stdout);
   assert.equal(fs.readFileSync(recFile, "utf-8"), recRaw);
+  // ── 锁内核心唯一（评审 #94 第 3 轮）：写终态只用锁内刚读出的 claim 投影；调用方带的投影与锁内不一致 → 受控拒绝、不写；维护入口整段在锁内
+  const claimFile = path.join(claimsDir, c2.key + ".claim", "claim.json");
+  const claimRaw = fs.readFileSync(claimFile, "utf-8"); const claimDoc = JSON.parse(claimRaw);
+  const projB = rejectedControlProjection(I("/feishu-mode dialog", "claude"));
+  assert.notEqual(projB.digest, claimDoc.rejected_control.digest);
+  fs.rmSync(recFile);
+  fs.writeFileSync(claimFile, JSON.stringify({ ...claimDoc, rejected_control: projB }));   // 锁外看到的是 A，锁内 claim 已是 B
+  const stale = runRejectTransaction({ claimsDir, key: c2.key, projection: claimDoc.rejected_control });
+  assert.deepEqual([stale.ok, stale.reason], [false, "claim_intent_mismatch"], JSON.stringify(stale));
+  assert.equal(fs.existsSync(recFile), false, "与锁内投影不一致就不写");
+  const viaMaint = resumeRejectedClaim({ claimsDir, key: c2.key });
+  assert.equal(viaMaint.ok, true, JSON.stringify(viaMaint));
+  assert.deepEqual(viaMaint.projection, projB, "维护入口按锁内 claim 的投影写");
+  assert.equal(JSON.parse(fs.readFileSync(recFile, "utf-8")).digest, projB.digest);
+  assert.equal(inspectRejectedClaim({ claimsDir, key: c2.key }).state, "rejected");
+  assert.equal(resumeRejectedClaim({ claimsDir, key: c2.key }).already, true);
+  assert.equal(rejectTransactionCore({ claimsDir, key: c2.key, expect: { logicalTaskKey: "别的 task" } }).reason, "claim_unreadable", "锁内用同一份 expect 重读 claim");
+  fs.writeFileSync(claimFile, JSON.stringify({ ...claimDoc, rejected_control: undefined }));
+  assert.equal(rejectTransactionCore({ claimsDir, key: c2.key }).reason, "not_rejected_control");
+  assert.equal(runRejectTransaction({ claimsDir, key: c2.key, projection: projB }).reason, "not_rejected_control");
+  fs.writeFileSync(claimFile, claimRaw); fs.writeFileSync(recFile, recRaw);
+  assert.deepEqual(problemsFor(c2.key), []);
   // participant 发同样的形状：在 authorize 那层就拒（R3 只有 owner），不取 claim、没有收边回执
   const p = run("/feishu-unbind", "333", "msg_mal_p1");
   assert.match(p.stdout, /你的角色是 participant，R3（控制） 需要 owner 权限/u, p.stdout);

@@ -59,29 +59,51 @@ export function readRejectedRecord({ claimsDir, key }) {
 }
 
 /**
- * 拒绝事务：锁内看记录再决定写不写。
- * @returns {{ ok: true, replayed: boolean, resumed: boolean, record?: object } | { ok: false, reason: string, why: string }}
- *   reason ∈ rejected_intent_invalid | control_busy | control_lock_unavailable | claim_key_invalid | rejected_unreadable | rejected_intent_mismatch | ledger_unwritten
+ * **锁内核心 —— 唯一一份**，生产路径（runRejectTransaction）与维护入口（resumeRejectedClaim）都走它。
+ * 锁内先用同一份 expect 重读 claim：不 valid / 没有拒绝投影 → 受控拒绝；调用方带了投影的（生产路径）还要与锁内投影逐字一致，
+ * 否则 claim_intent_mismatch —— **写终态永远用锁内刚读出的投影**，锁外看到的任何快照都不作数（评审探针：锁外 A、锁内已换成 B）。
+ * quarantine=true（维护入口）时损坏的记录先隔离再重写；生产路径不隔离，只受控拒绝并指路。
  */
-export function runRejectTransaction({ claimsDir, key, projection, replay = false }) {
-  const problem = rejectedControlProblem(projection);
-  if (projection === undefined || problem !== null) return { ok: false, reason: "rejected_intent_invalid", why: problem ?? "缺 rejected_control" };
-  return withControlLock({ claimsDir, key }, () => {
-    const rec = readRejectedRecord({ claimsDir, key });
-    if (rec.status === "unreadable") return { ok: false, reason: "rejected_unreadable", why: rec.why };
-    if (rec.status === "valid") {
-      if (!sameRejectedControl(projection, projectionOf(rec.record))) {
-        return { ok: false, reason: "rejected_intent_mismatch", why: "记录的意图（" + rec.record.intent + " · " + rec.record.word + "）与 claim 的（" + projection.intent + " · " + projection.word + "）不一致" };
-      }
-      return { ok: true, replayed: true, resumed: false, record: rec.record };
+export function rejectTransactionCore({ claimsDir, key, expect = {}, projection = null, replay = false, quarantine = false }) {
+  const quarantined = [];
+  const claim = readClaimState({ claimsDir, key, expect });
+  if (claim.status !== "valid") return { ok: false, reason: "claim_" + claim.status, why: claim.why ?? null, quarantined };
+  const inLock = claim.claim.rejected_control;
+  if (inLock === undefined) return { ok: false, reason: "not_rejected_control", why: "锁内读到的 claim 没有拒绝投影", quarantined };
+  if (projection !== null && !sameRejectedControl(projection, inLock)) {
+    return { ok: false, reason: "claim_intent_mismatch", why: "锁内 claim 的投影（" + inLock.intent + " · " + inLock.word + "）与这次的（" + projection.intent + " · " + projection.word + "）不一致", quarantined };
+  }
+  const rec = readRejectedRecord({ claimsDir, key });
+  if (rec.status === "unreadable") {
+    if (!quarantine) return { ok: false, reason: "rejected_unreadable", why: rec.why, quarantined };
+    const name = key + ".rejected.quarantined." + process.pid + "." + Date.now();
+    try { fs.renameSync(path.join(claimsDir, key + ".rejected.json"), path.join(claimsDir, name)); }
+    catch (err) { return { ok: false, reason: "rejected_unquarantined", why: String(err.code ?? err.message), quarantined }; }
+    quarantined.push(name);
+  } else if (rec.status === "valid") {
+    if (!sameRejectedControl(inLock, projectionOf(rec.record))) {
+      return { ok: false, reason: "rejected_intent_mismatch", why: "记录的意图（" + rec.record.intent + " · " + rec.record.word + "）与 claim 的（" + inLock.intent + " · " + inLock.word + "）不一致", quarantined };
     }
-    try { recordClaimState({ claimsDir, key, state: "rejected", detail: { ...projection } }); }
-    catch (err) { return { ok: false, reason: "ledger_unwritten", why: String(err?.code ?? err?.message ?? err) }; }
-    return { ok: true, replayed: false, resumed: replay };
-  });
+    return { ok: true, replayed: true, resumed: false, already: true, projection: inLock, record: rec.record, quarantined };
+  }
+  try { recordClaimState({ claimsDir, key, state: "rejected", detail: { ...inLock } }); }
+  catch (err) { return { ok: false, reason: "ledger_unwritten", why: String(err?.code ?? err?.message ?? err), quarantined }; }
+  return { ok: true, replayed: false, resumed: replay, already: false, projection: inLock, quarantined };
 }
 
-/** 一张 claim 的拒绝事务处在什么状态（锁外观察；动手时事务在锁内重判）。 */
+/**
+ * 生产路径的拒绝事务：调用方带着这次解析出的投影进来，锁内与 claim 的投影核对后按记录决定写不写。
+ * @returns {{ ok: true, replayed: boolean, resumed: boolean, record?: object } | { ok: false, reason: string, why: string }}
+ *   reason ∈ rejected_intent_invalid | control_busy | control_lock_unavailable | claim_key_invalid | claim_absent | claim_unreadable |
+ *            not_rejected_control | claim_intent_mismatch | rejected_unreadable | rejected_intent_mismatch | ledger_unwritten
+ */
+export function runRejectTransaction({ claimsDir, key, projection, replay = false, expect = {} }) {
+  const problem = rejectedControlProblem(projection);
+  if (projection === undefined || projection === null || problem !== null) return { ok: false, reason: "rejected_intent_invalid", why: problem ?? "缺 rejected_control" };
+  return withControlLock({ claimsDir, key }, () => rejectTransactionCore({ claimsDir, key, expect, projection, replay, quarantine: false }));
+}
+
+/** 一张 claim 的拒绝事务处在什么状态（锁外观察，只用来展示；动手时核心在锁内重判）。 */
 export function inspectRejectedClaim({ claimsDir, key, expect = {} }) {
   const claim = readClaimState({ claimsDir, key, expect });
   if (claim.status !== "valid") return { state: "claim_" + claim.status, why: claim.why ?? null };
@@ -97,31 +119,15 @@ export function inspectRejectedClaim({ claimsDir, key, expect = {} }) {
   return { state: "rejected_in_flight", projection };
 }
 
-/** 维护入口允许续做的状态 —— 唯一一份，两条链的 CLI 都引用它。损坏的记录先隔离再按 claim 的投影重写。 */
+/** 维护入口允许续做的状态 —— 唯一一份，两条链的 CLI 都引用它。损坏的记录先隔离再按锁内 claim 的投影重写。 */
 export const RESUMABLE_REJECT_STATES = Object.freeze(["rejected_in_flight", "rejected_unreadable"]);
 
+/**
+ * 维护入口的恢复：**整段在锁内**，不带任何锁外快照 —— 状态判定、隔离、写终态都以锁内刚读出的 claim 为准。
+ * 已闭合 → already；记录与投影不一致 → 不隔离、不写（人看）。
+ */
 export function resumeRejectedClaim({ claimsDir, key, expect = {} }) {
-  const seen = inspectRejectedClaim({ claimsDir, key, expect });
-  if (seen.state === "rejected") return { ok: true, already: true, projection: seen.projection, quarantined: [] };
-  if (!RESUMABLE_REJECT_STATES.includes(seen.state)) return { ok: false, reason: seen.state, why: seen.why ?? null };
-  return withControlLock({ claimsDir, key }, () => {
-    const quarantined = [];
-    const rec = readRejectedRecord({ claimsDir, key });
-    if (rec.status === "unreadable") {
-      const name = key + ".rejected.quarantined." + process.pid + "." + Date.now();
-      try { fs.renameSync(path.join(claimsDir, key + ".rejected.json"), path.join(claimsDir, name)); }
-      catch (err) { return { ok: false, reason: "rejected_unquarantined", why: String(err.code ?? err.message), quarantined }; }
-      quarantined.push(name);
-    } else if (rec.status === "valid") {
-      // 锁外看是缺席 / 损坏，锁内已经有完整记录：别的事务（运输层重放）先补上了 —— 按锁内结果返回
-      return sameRejectedControl(seen.projection, projectionOf(rec.record))
-        ? { ok: true, already: true, projection: seen.projection, quarantined }
-        : { ok: false, reason: "rejected_intent_mismatch", why: "锁内读到的记录与 claim 的投影不一致", quarantined };
-    }
-    try { recordClaimState({ claimsDir, key, state: "rejected", detail: { ...seen.projection } }); }
-    catch (err) { return { ok: false, reason: "ledger_unwritten", why: String(err?.code ?? err?.message ?? err), quarantined }; }
-    return { ok: true, already: false, projection: seen.projection, quarantined };
-  });
+  return withControlLock({ claimsDir, key }, () => rejectTransactionCore({ claimsDir, key, expect, projection: null, replay: true, quarantine: true }));
 }
 
 /** 维护入口的人读文案（两条链共用）。 */

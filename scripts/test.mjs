@@ -14,7 +14,7 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import { RISK, classifyRisk } from "./risk-class.mjs";
 import { CHAT_POLICY_ID, CHAT_REPLY_ARGS, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatReplyPathStatus, diagnosticSnippet, chatFailText, CHAT_FAIL_REASONS } from "./chat-reply.mjs";
-import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome, chatClaimProblem, chatOutcomeProblem, CHAT_MAX_CONCURRENT, CHAT_MAX_PER_SENDER } from "./chat-ledger.mjs";
+import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome, chatClaimProblem, chatOutcomeProblem, isAdmissionLockEntry, CHAT_MAX_CONCURRENT, CHAT_MAX_PER_SENDER } from "./chat-ledger.mjs";
 import { acquirePublishLock as acquireLedgerLock, releasePublishLock as releaseLedgerLock } from "./registry.mjs";
 import { evaluateChatGates, CHAT_FALLBACK_REASONS } from "./inbound-route.mjs";
 import { ZERO_TOOL_ARGS } from "./handoff.mjs";
@@ -19958,6 +19958,7 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   assert.equal(inspectChat({ ledgerDir, key: firstKey }).state, "answered");
   const failedKey = chatKey({ chain: "claude", messageId: "msg_chat_" + (seq - 2), sessionId: "aily_dm" });
   assert.equal(inspectChat({ ledgerDir, key: failedKey }).state, "failed", "失败也有终态");
+  assert.deepEqual([inspectChat({ ledgerDir, key: failedKey }).outcome.reason, inspectChat({ ledgerDir, key: failedKey }).outcome.exit_code], ["nonzero_exit", 3], "非零退出的终态带退出码");
   // 并发上界：在取 claim 之前判 —— 别人占满全局上限 → 拒；自己有一条在答 → 拒；被拒的不占账本（同一条消息之后还能再试）
   const plant = (id, senderId, extra = {}) => { const k = chatKey({ chain: "claude", messageId: id, sessionId: "aily_dm" }); const r = admitChat({ ledgerDir, key: k, senderId, budgetMs: 5000, maxConcurrent: 99, maxPerSender: 99, meta: { chain: "claude", message_id: id, session_id: "aily_dm", sender_ref: senderRef(senderId), role: "owner", risk_class: "R1", ...extra } }); assert.equal(r.ok, true, JSON.stringify(r)); return k; };
   const k1 = plant("busy_1", "999"); const k2 = plant("busy_2", "998");
@@ -19991,7 +19992,7 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   assert.match(inspectChat({ ledgerDir, key: goodKey }).why, /^outcome：(schema_version 不认识|answered 的字段集不对)/u, "最小终态不算已回答");
   const goodOutcome = { schema_version: "1.0", key: goodKey, status: "answered", text: "真", elapsed_ms: 12, recorded_at: "2026-08-30T00:00:01.000Z" };
   assert.equal(chatOutcomeProblem(goodOutcome, goodKey), null);
-  for (const [bad, why] of [[{ ...goodOutcome, key: "c".repeat(64) }, "key"], [{ ...goodOutcome, text: "" }, "没有正文"], [{ ...goodOutcome, extra: 1 }, "answered 的字段集不对"], [{ ...goodOutcome, diagnostic: null }, "answered 的字段集不对"], [{ ...goodOutcome, status: "done" }, "受控集合"], [{ ...goodOutcome, elapsed_ms: -1 }, "elapsed_ms"], [{ ...goodOutcome, status: "failed" }, "failed 的字段集不对"]]) assert.match(chatOutcomeProblem(bad, goodKey) ?? "", new RegExp(why, "u"), JSON.stringify(bad));
+  for (const [bad, why] of [[{ ...goodOutcome, key: "c".repeat(64) }, "key"], [{ ...goodOutcome, text: "" }, "没有正文"], [{ ...goodOutcome, extra: 1 }, "answered 的字段集不对"], [{ ...goodOutcome, diagnostic: null }, "answered 的字段集不对"], [{ ...goodOutcome, status: "done" }, "受控集合"], [{ ...goodOutcome, elapsed_ms: -1 }, "elapsed_ms"], [{ ...goodOutcome, status: "failed" }, "reason 不在受控集合里"]]) assert.match(chatOutcomeProblem(bad, goodKey) ?? "", new RegExp(why, "u"), JSON.stringify(bad));
   fs.writeFileSync(path.join(ledgerDir, goodKey + ".chat", "outcome.json"), JSON.stringify(goodOutcome));
   assert.equal(inspectChat({ ledgerDir, key: goodKey }).state, "answered");
   assert.deepEqual(recordChatOutcome({ ledgerDir, key: goodKey, outcome: { status: "answered", text: "", elapsed_ms: 1 } }).reason, "outcome_shape", "记终态先过形状");
@@ -20000,7 +20001,10 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   fs.mkdirSync(path.join(ledgerDir, "zzz.chat"), { recursive: true });
   const nBefore = argvLog().length;
   const unresolvedRun = run("账本坏了", TPL.frank_sender_id);
-  assert.notEqual(unresolvedRun.status, 0); assert.match(unresolvedRun.stdout, /chat 账本有 1 处说不清（认不出的条目 zzz.chat）/u, unresolvedRun.stdout);
+  assert.notEqual(unresolvedRun.status, 0); assert.match(unresolvedRun.stdout, /chat 账本有 1 处说不清，不起回答；请在本机跑 doctor 查看机器级 chat 账本/u, unresolvedRun.stdout);
+  assert.doesNotMatch(unresolvedRun.stdout, /\/Users\/|chat-claims|zzz/u, "飞书正文不带机器路径与逐条原因");
+  const unresolvedReceipt = JSON.parse(fs.readFileSync(path.join(local, ".claude", "feishu-bridge", "inbound", "receipts", "chat-ledger-msg_chat_" + seq + ".json"), "utf-8"));
+  assert.match(unresolvedReceipt.load.why.join(" "), /认不出的条目 zzz.chat/u, "逐条原因进机器回执"); assert.equal(unresolvedReceipt.ledger_dir, ledgerDir);
   assert.equal(argvLog().length, nBefore, "说不清时不起模型");
   fs.rmSync(path.join(ledgerDir, "zzz.chat"), { recursive: true, force: true });
   // ── 准入在一把锁内：锁被别人持有 → 受理忙（不起模型、不占账本）
@@ -20031,25 +20035,54 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   fs.rmSync(path.join(ledgerDir, linkKey + ".chat"), { recursive: true, force: true });
   fs.mkdirSync(path.join(ledgerDir, closedKey + ".chat.tmp.1.1"), { recursive: true });
   const residueAdmit = admitChat({ ledgerDir, key: closedKey, senderId: "777", budgetMs: 5000, meta: { chain: "claude", message_id: "closed_1", session_id: "aily_dm", sender_ref: senderRef("777"), role: "owner", risk_class: "R1" } });
-  assert.equal(residueAdmit.reason, "chat_ledger_unresolved"); assert.match(residueAdmit.text, /进位残骸（上次建 claim 中断）/u, "锁内看到的临时目录只能是残骸");
+  assert.equal(residueAdmit.reason, "chat_ledger_unresolved"); assert.match(residueAdmit.load.why.join(" "), /进位残骸（上次建 claim 中断）/u, "锁内看到的临时目录只能是残骸");
   assert.equal(fs.existsSync(path.join(ledgerDir, closedKey + ".chat")), false, "残骸在场时不建 claim");
   fs.rmSync(path.join(ledgerDir, closedKey + ".chat.tmp.1.1"), { recursive: true, force: true });
   assert.match(chatClaimProblem({ ...goodClaim, role: "boss" }, goodKey), /role 不在受控集合里/u);
   assert.match(chatClaimProblem({ ...goodClaim, risk_class: "R9" }, goodKey), /risk_class 不在受控集合里/u);
   assert.match(chatOutcomeProblem({ schema_version: "1.0", key: goodKey, status: "failed", reason: "unknown-reason", why: "x", diagnostic: null, elapsed_ms: 1, recorded_at: "2026-08-30T00:00:00.000Z" }, goodKey), /reason 不在受控集合里/u);
+  const failedBase = { schema_version: "1.0", key: goodKey, status: "failed", why: "x", diagnostic: null, elapsed_ms: 1, recorded_at: "2026-08-30T00:00:00.000Z" };
+  assert.equal(chatOutcomeProblem({ ...failedBase, reason: "timeout", timeout_ms: 300 }, goodKey), null);
+  assert.match(chatOutcomeProblem({ ...failedBase, reason: "timeout" }, goodKey), /failed（timeout）的字段集不对/u, "timeout 必须带 timeout_ms");
+  assert.match(chatOutcomeProblem({ ...failedBase, reason: "timeout", timeout_ms: 0 }, goodKey), /timeout_ms 不是正整数/u);
+  assert.equal(chatOutcomeProblem({ ...failedBase, reason: "nonzero_exit", exit_code: 3 }, goodKey), null);
+  assert.match(chatOutcomeProblem({ ...failedBase, reason: "nonzero_exit", exit_code: "3" }, goodKey), /exit_code 不是整数/u);
+  assert.match(chatOutcomeProblem({ ...failedBase, reason: "empty_reply", exit_code: 3 }, goodKey), /failed（empty_reply）的字段集不对/u, "别的 reason 不许带多余字段");
+  // 目录本身受验：符号链接的 claim 目录不跟；目录里不该有的条目（含终态进位残骸）算说不清；锁家族精确分类
+  const aliasTarget = path.join(local, "alias-target"); fs.mkdirSync(aliasTarget, { recursive: true });
+  fs.writeFileSync(path.join(aliasTarget, "claim.json"), JSON.stringify(goodClaim));
+  const aliasKey = chatKey({ chain: "claude", messageId: "alias_1", sessionId: "aily_dm" });
+  fs.symlinkSync(aliasTarget, path.join(ledgerDir, aliasKey + ".chat"));
+  assert.match(inspectChat({ ledgerDir, key: aliasKey }).why, /claim 目录是符号链接（别名）/u);
+  assert.equal(recordChatOutcome({ ledgerDir, key: aliasKey, outcome: { status: "answered", text: "x", elapsed_ms: 1 } }).reason, "claim_dir_unusable", "别名目录不写终态");
+  assert.equal(fs.existsSync(path.join(aliasTarget, "outcome.json")), false, "没写到别处");
+  assert.equal(chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000 }).unresolved, 1);
+  fs.unlinkSync(path.join(ledgerDir, aliasKey + ".chat"));
+  fs.mkdirSync(path.join(ledgerDir, goodKey + ".chat"), { recursive: true });
+  fs.writeFileSync(path.join(ledgerDir, goodKey + ".chat", "claim.json"), JSON.stringify(goodClaim));
+  fs.writeFileSync(path.join(ledgerDir, goodKey + ".chat", "outcome.json.tmp.1.1"), "{");
+  assert.match(inspectChat({ ledgerDir, key: goodKey }).why, /目录里有不该有的条目：outcome.json.tmp.1.1（含终态进位残骸）/u, "终态进位残骸可见");
+  fs.rmSync(path.join(ledgerDir, goodKey + ".chat"), { recursive: true, force: true });
+  fs.mkdirSync(path.join(ledgerDir, "admission.lock.reaped-12345678-1234-1234-1234-123456789abc"), { recursive: true });
+  assert.equal(chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000 }).unresolved, 0, "锁家族的精确名字不算条目");
+  fs.rmSync(path.join(ledgerDir, "admission.lock.reaped-12345678-1234-1234-1234-123456789abc"), { recursive: true, force: true });
+  fs.mkdirSync(path.join(ledgerDir, "admission.lockx"), { recursive: true });
+  assert.equal(chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000 }).unresolved, 1, "相似而不精确的名字算认不出");
+  fs.rmSync(path.join(ledgerDir, "admission.lockx"), { recursive: true, force: true });
+  assert.deepEqual(["admission.lock", "admission.lock.reap", "admission.lock.maint", "admission.lock.reap.quarantine-12345678-1234-1234-1234-123456789abc", "admission.lockx", "admission.lock.reaped-nope"].map(isAdmissionLockEntry), [true, true, true, true, false, false]);
   assert.deepEqual([...CHAT_FAIL_REASONS], ["timeout", "spawn_failed", "nonzero_exit", "empty_reply"]);
   assert.equal(chatFailText("nonzero_exit", { exitCode: 3 }), "回复进程异常退出（退出码 3）");
   // 失败重放：存的 why 里有 ESC 与 locator，用户看到的只有表里的文案
   const failKey = chatKey({ chain: "claude", messageId: "msg_chat_fail", sessionId: "aily_dm" });
   fs.mkdirSync(path.join(ledgerDir, failKey + ".chat"), { recursive: true });
   fs.writeFileSync(path.join(ledgerDir, failKey + ".chat", "claim.json"), JSON.stringify({ ...goodClaim, key: failKey, message_id: "msg_chat_fail", sender_ref: senderRef(TPL.frank_sender_id) }));
-  fs.writeFileSync(path.join(ledgerDir, failKey + ".chat", "outcome.json"), JSON.stringify({ schema_version: "1.0", key: failKey, status: "failed", reason: "timeout", why: "raw\u001b[31m om_1234567890abcdef", diagnostic: null, elapsed_ms: 1, recorded_at: "2026-08-30T00:00:00.000Z" }));
+  fs.writeFileSync(path.join(ledgerDir, failKey + ".chat", "outcome.json"), JSON.stringify({ schema_version: "1.0", key: failKey, status: "failed", reason: "timeout", timeout_ms: 300, why: "raw\u001b[31m om_1234567890abcdef", diagnostic: null, elapsed_ms: 1, recorded_at: "2026-08-30T00:00:00.000Z" }));
   const failReplay = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
     env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
       AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_chat", FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000",
       FAKE_AILY_ENVELOPE: JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_chat_fail", sessionID: "aily_dm", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + "失败重放" } }) }] }) } });
   assert.notEqual(failReplay.status, 0);
-  assert.match(failReplay.stdout, /这条消息上次就没答出来（超过 60 秒没答完）；同一条消息不会再答/u, failReplay.stdout);
+  assert.match(failReplay.stdout, /这条消息上次就没答出来（超过 0 秒没答完）；同一条消息不会再答/u, "重放按终态里的 timeout_ms 渲染，与首次一致：" + failReplay.stdout);
   assert.doesNotMatch(failReplay.stdout, /raw|\u001b|om_1234567890abcdef/u, "存储的 why 不进用户文案");
   fs.rmSync(path.join(ledgerDir, failKey + ".chat"), { recursive: true, force: true });
   // 准入成功但锁没交还：结果带 lockUncleared（入口据此写回执并在尾行说明）

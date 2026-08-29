@@ -147,7 +147,7 @@ function chatTurn({ chain, template, event, dryRun, ledgerDir }) {
     finish("chat", { text: displaySafe(seen.outcome.text), replayed: true }, { mode: CHAT_POLICY_ID, kind: "replay" });
   }
   // 失败重放：文案只从受控 reason 渲染，账本里存的 why 不进用户文案
-  if (seen.state === "failed") finish("error", { detail: "这条消息上次就没答出来（" + chatFailText(seen.outcome.reason) + "）；同一条消息不会再答，请再发一条新消息" }, { reason: "chat_replay_failed", mode: CHAT_POLICY_ID });
+  if (seen.state === "failed") finish("error", { detail: "这条消息上次就没答出来（" + chatFailText(seen.outcome.reason, { timeoutMs: seen.outcome.timeout_ms, exitCode: seen.outcome.exit_code }) + "）；同一条消息不会再答，请再发一条新消息" }, { reason: "chat_replay_failed", mode: CHAT_POLICY_ID });
   if (seen.state === "running") finish("error", { detail: "这条消息还在答，等它答完；不会再起第二个回答" }, { reason: "chat_running", mode: CHAT_POLICY_ID });
   if (seen.state === "stale") finish("error", { detail: "这条消息上次的回答进程没留下结果；同一条消息不会再答，请再发一条新消息" }, { reason: "chat_stale", mode: CHAT_POLICY_ID });
   if (seen.state === "unreadable") finish("error", { detail: "这条消息的 chat 账本读不出（" + seen.why + "），没有回答" }, { reason: "chat_ledger_unreadable", mode: CHAT_POLICY_ID });
@@ -167,14 +167,16 @@ function chatTurn({ chain, template, event, dryRun, ledgerDir }) {
       writeReceipt("chat-busy-" + messageId, { status: "rejected", reason: admitted.reason, load: admitted.load ?? null, ...base });
       finish("rejected", { reasonText: admitted.text + lockNote, taskName: null }, { reason: admitted.reason, mode: CHAT_POLICY_ID });
     }
-    writeReceipt("chat-ledger-" + messageId, { status: "error", reason: admitted.reason, why: admitted.why ?? admitted.text ?? null, load: admitted.load ?? null, ...base });
+    writeReceipt("chat-ledger-" + messageId, { status: "error", reason: admitted.reason, why: admitted.why ?? admitted.text ?? null, load: admitted.load ?? null, ledger_dir: ledgerDir, ...base });
     finish("error", { detail: (admitted.text ?? ("chat 账本不可用（" + admitted.reason + (admitted.why ? "：" + admitted.why : "") + "），没有回答")) + lockNote }, { reason: admitted.reason, mode: CHAT_POLICY_ID });
   }
-  const admitNote = admitted.lockUncleared ? "（准入锁没有交还：" + admitted.lockUncleared + "；之后的 chat 会报受理忙，请人工确认后删除 " + ledgerDir + "/admission.lock）" : "";
-  if (admitted.lockUncleared) writeReceipt("chat-lock-" + messageId, { status: "error", reason: "chat_admission_lock_uncleared", why: admitted.lockUncleared, ...base, claim_acquired: true });
+  // 锁没交还：飞书正文只给状态词与锁协议的指引（主锁不要手删，持有者已死超过 5 分钟由下一笔按协议回收）；路径与原因只进机器回执
+  const admitNote = admitted.lockUncleared ? "（准入锁没有交还；之后的 chat 可能报受理忙，持有者已死超过 5 分钟会按锁协议自动回收，不要手删）" : "";
+  if (admitted.lockUncleared) writeReceipt("chat-lock-" + messageId, { status: "error", reason: "chat_admission_lock_uncleared", why: admitted.lockUncleared, lock_dir: ledgerDir, ...base, claim_acquired: true });
   const reply = chatReply({ instruction });
   if (!reply.ok) {
-    const recorded = recordChatOutcome({ ledgerDir, key, outcome: { status: "failed", reason: reply.reason, why: reply.why, diagnostic: reply.diagnostic ?? null, elapsed_ms: reply.elapsedMs } });
+    const recorded = recordChatOutcome({ ledgerDir, key, outcome: { status: "failed", reason: reply.reason, why: reply.why, diagnostic: reply.diagnostic ?? null, elapsed_ms: reply.elapsedMs,
+      ...(reply.reason === "timeout" ? { timeout_ms: reply.timeoutMs } : {}), ...(reply.reason === "nonzero_exit" ? { exit_code: reply.exitCode } : {}) } });
     writeReceipt("chat-failed-" + messageId, { status: "error", reason: "chat_reply_failed", why: reply.reason, detail: reply.why, diagnostic: reply.diagnostic ?? null, elapsed_ms: reply.elapsedMs, ledger: recorded.ok ? "recorded" : recorded.reason, ...base, claim_acquired: true });
     finish("error", { detail: "chat 没答出来（" + reply.why + "）。这里没有接入，无法稍后补发，请再问一次" + (recorded.ok ? "" : "（账本没记下终态：" + recorded.reason + "）") + admitNote }, { reason: "chat_reply_failed", why: reply.reason, mode: CHAT_POLICY_ID });
   }

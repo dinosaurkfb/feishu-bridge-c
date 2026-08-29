@@ -29,7 +29,21 @@ const KEY_SHAPE = /^[0-9a-f]{64}$/u;
 const SENDER_REF_SHAPE = /^sender_[0-9a-f]{16}$/u;
 const CLAIM_KEYS = "chain,key,message_id,pid,risk_class,role,schema_version,sender_ref,session_id,started_at,state";
 const OUTCOME_ANSWERED_KEYS = "elapsed_ms,key,recorded_at,schema_version,status,text";
-const OUTCOME_FAILED_KEYS = "diagnostic,elapsed_ms,key,reason,recorded_at,schema_version,status,why";
+/** failed 的键集按 reason 封闭：timeout 多一个 timeout_ms、nonzero_exit 多一个 exit_code —— 重放文案由这些受控字段确定，不靠存储的 why。 */
+const OUTCOME_FAILED_KEYS = Object.freeze({
+  timeout: "diagnostic,elapsed_ms,key,reason,recorded_at,schema_version,status,timeout_ms,why",
+  spawn_failed: "diagnostic,elapsed_ms,key,reason,recorded_at,schema_version,status,why",
+  nonzero_exit: "diagnostic,elapsed_ms,exit_code,key,reason,recorded_at,schema_version,status,why",
+  empty_reply: "diagnostic,elapsed_ms,key,reason,recorded_at,schema_version,status,why",
+});
+const CHAT_DIR_ENTRIES = Object.freeze(["claim.json", "outcome.json"]);
+const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+/** 准入锁家族（与 registry.mjs 的 symlink 锁协议逐一对应）：主锁 / reap 段锁 / 维护锁 / 回收残骸 / 隔离残骸 —— 只有这些名字不算条目。 */
+const ADMISSION_LOCK_FAMILY = [
+  /^admission\.lock$/u, /^admission\.lock\.reap$/u, /^admission\.lock\.maint$/u,
+  new RegExp("^admission\\.lock\\.reaped-" + UUID + "$", "u"), new RegExp("^admission\\.lock\\.reap\\.quarantine-" + UUID + "$", "u"),
+];
+export const isAdmissionLockEntry = (name) => ADMISSION_LOCK_FAMILY.some((re) => re.test(name));
 const ADMISSION_LOCK = "admission.lock";
 const nonEmpty = (v) => typeof v === "string" && v.length > 0;
 
@@ -71,10 +85,12 @@ export function chatOutcomeProblem(doc, key) {
     return null;
   }
   if (doc.status === "failed") {
-    if (keys !== OUTCOME_FAILED_KEYS) return "failed 的字段集不对";
     if (!CHAT_FAIL_REASONS.includes(doc.reason)) return "failed 的 reason 不在受控集合里";
+    if (keys !== OUTCOME_FAILED_KEYS[doc.reason]) return "failed（" + doc.reason + "）的字段集不对";
     if (!nonEmpty(doc.why)) return "failed 缺 why";
     if (doc.diagnostic !== null && typeof doc.diagnostic !== "string") return "diagnostic 形状不对";
+    if (doc.reason === "timeout" && !(Number.isInteger(doc.timeout_ms) && doc.timeout_ms > 0)) return "timeout_ms 不是正整数";
+    if (doc.reason === "nonzero_exit" && !Number.isInteger(doc.exit_code)) return "exit_code 不是整数";
     return null;
   }
   return "status 不在受控集合里";
@@ -90,7 +106,9 @@ const readJson = (file) => {
       if (err?.code === "ENOENT") return { status: "absent" };
       return { status: "unreadable", why: err?.code === "ELOOP" ? "不是普通文件（符号链接）" : String(err.code ?? err.message) };
     }
-    if (!fs.fstatSync(fd).isFile()) return { status: "unreadable", why: "不是普通文件" };
+    let st;
+    try { st = fs.fstatSync(fd); } catch (err) { return { status: "unreadable", why: "fstat 失败：" + String(err.code ?? err.message) }; }
+    if (!st.isFile()) return { status: "unreadable", why: "不是普通文件" };
     let raw;
     try { raw = fs.readFileSync(fd, "utf-8"); }
     catch (err) { return { status: "unreadable", why: String(err.code ?? err.message) }; }
@@ -111,11 +129,29 @@ const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (err) 
  * 一条 chat 的状态：
  *   absent / answered / failed / running（claim 在、终态缺席、pid 活着）/ stale（pid 死了）/ unreadable（claim 或终态读不出、形状不对）。
  */
+/** claim 目录本身也要受验：必须是真目录（不是符号链接 / 别名，不是文件）；里面只允许 claim.json / outcome.json。 */
+function inspectChatDir(dir) {
+  let st;
+  try { st = fs.lstatSync(dir); }
+  catch (err) { return err?.code === "ENOENT" ? { status: "absent" } : { status: "unreadable", why: "目录 lstat 失败：" + String(err.code ?? err.message) }; }
+  if (st.isSymbolicLink()) return { status: "unreadable", why: "claim 目录是符号链接（别名）" };
+  if (!st.isDirectory()) return { status: "unreadable", why: "claim 目录不是目录" };
+  let names;
+  try { names = fs.readdirSync(dir); }
+  catch (err) { return { status: "unreadable", why: "目录读不出：" + String(err.code ?? err.message) }; }
+  const foreign = names.filter((n) => !CHAT_DIR_ENTRIES.includes(n));
+  if (foreign.length > 0) return { status: "unreadable", why: "目录里有不该有的条目：" + foreign.slice(0, 3).map((n) => n.slice(0, 40)).join("、") + (/outcome\.json\.tmp\./u.test(foreign.join(" ")) ? "（含终态进位残骸）" : "") };
+  return { status: "ok" };
+}
+
 export function inspectChat({ ledgerDir, key }) {
   if (!KEY_SHAPE.test(String(key))) return { state: "unreadable", why: "key 形状不对" };
   const dir = claimDir(ledgerDir, key);
+  const dirState = inspectChatDir(dir);
+  if (dirState.status === "absent") return { state: "absent" };
+  if (dirState.status === "unreadable") return { state: "unreadable", why: dirState.why };
   const claim = readJson(path.join(dir, "claim.json"));
-  if (claim.status === "absent") return fs.existsSync(dir) ? { state: "unreadable", why: "claim 目录在、claim.json 缺席" } : { state: "absent" };
+  if (claim.status === "absent") return { state: "unreadable", why: "claim 目录在、claim.json 缺席" };
   if (claim.status === "unreadable") return { state: "unreadable", why: "claim：" + claim.why };
   const claimProblem = chatClaimProblem(claim.doc, key);
   if (claimProblem !== null) return { state: "unreadable", why: "claim：" + claimProblem };
@@ -140,7 +176,7 @@ export function chatLoad({ ledgerDir, senderId, now = Date.now(), budgetMs }) {
   const me = senderRef(senderId);
   let running = 0; let bySender = 0; let unresolved = 0; const why = [];
   for (const n of names) {
-    if (n === ADMISSION_LOCK || n.startsWith(ADMISSION_LOCK + ".")) continue;   // 锁与它的回收残骸不是条目
+    if (isAdmissionLockEntry(n)) continue;   // 锁家族（精确形状）不是条目；相似而不精确的名字往下当认不出
     // 进位前的临时目录：盘点在准入锁内做，此刻不可能有另一笔合法进位在跑 —— 它只能是上次建 claim 中断留下的残骸，说不清就不许当不存在
     if (/\.chat\.tmp\.\d+\.\d+$/u.test(n)) { unresolved += 1; why.push("进位残骸（上次建 claim 中断）" + n.slice(0, 20) + "…，人工删除"); continue; }
     if (!n.endsWith(".chat") || !KEY_SHAPE.test(n.slice(0, -".chat".length))) { unresolved += 1; why.push("认不出的条目 " + n.slice(0, 40)); continue; }
@@ -177,7 +213,8 @@ export function admitChat({ ledgerDir, key, meta, senderId, now = Date.now(), bu
   try {
     const load = chatLoad({ ledgerDir, senderId, now, budgetMs });
     if (load.unresolved > 0) {
-      result = { ok: false, reason: "chat_ledger_unresolved", text: "chat 账本有 " + load.unresolved + " 处说不清（" + load.why.slice(0, 2).join("；") + "），不起回答；请人工查看 " + ledgerDir, load };
+      // 飞书正文只给状态与受控指引；机器路径与逐条原因只进回执（load.why）
+      result = { ok: false, reason: "chat_ledger_unresolved", text: "chat 账本有 " + load.unresolved + " 处说不清，不起回答；请在本机跑 doctor 查看机器级 chat 账本", load };
     } else if (load.running >= maxConcurrent) {
       result = { ok: false, reason: "chat_busy_global", text: "chat 正忙（同时在答 " + load.running + " 条，上限 " + maxConcurrent + "），稍后再问", load };
     } else if (load.bySender >= maxPerSender) {
@@ -228,6 +265,8 @@ export function recordChatOutcome({ ledgerDir, key, outcome, now = Date.now() })
   const doc = { ...outcome, schema_version: "1.0", key, recorded_at: new Date(now).toISOString() };
   const problem = chatOutcomeProblem(doc, key);
   if (problem !== null) return { ok: false, reason: "outcome_shape", why: problem };
+  const dirState = inspectChatDir(claimDir(ledgerDir, key));
+  if (dirState.status !== "ok") return { ok: false, reason: "claim_dir_unusable", why: dirState.why ?? dirState.status };
   try { writeJsonAtomic(path.join(claimDir(ledgerDir, key), "outcome.json"), doc); }
   catch (err) { return { ok: false, reason: "ledger_unwritten", why: String(err.code ?? err.message) }; }
   return { ok: true };

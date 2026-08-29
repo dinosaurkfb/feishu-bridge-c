@@ -71,10 +71,10 @@ export function chatReply({ instruction, claudeBin = "claude", timeoutMs = chatR
   const elapsedMs = Date.now() - startedAt;
   const diagnostic = run.stderr ? diagnosticSnippet(run.stderr) : null;
   if (run.error) {
-    if (run.error.code === "ETIMEDOUT") return { ok: false, reason: "timeout", why: chatFailText("timeout", { timeoutMs }), diagnostic, elapsedMs };
+    if (run.error.code === "ETIMEDOUT") return { ok: false, reason: "timeout", why: chatFailText("timeout", { timeoutMs }), timeoutMs, diagnostic, elapsedMs };
     return { ok: false, reason: "spawn_failed", why: chatFailText("spawn_failed"), diagnostic: diagnosticSnippet(run.error.code ?? run.error.message, 80), elapsedMs };
   }
-  if (run.status !== 0) return { ok: false, reason: "nonzero_exit", why: chatFailText("nonzero_exit", { exitCode: run.status }), diagnostic, elapsedMs };
+  if (run.status !== 0) return { ok: false, reason: "nonzero_exit", why: chatFailText("nonzero_exit", { exitCode: run.status }), exitCode: run.status, diagnostic, elapsedMs };
   const text = String(run.stdout ?? "").trim();
   if (!text) return { ok: false, reason: "empty_reply", why: chatFailText("empty_reply"), diagnostic, elapsedMs };
   return { ok: true, text: Array.from(text).length > CHAT_REPLY_MAX_CHARS ? Array.from(text).slice(0, CHAT_REPLY_MAX_CHARS).join("") + "…" : text, elapsedMs };

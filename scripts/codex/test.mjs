@@ -9108,6 +9108,65 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
     assert.match(runAs("写飞书", "2222", "msg_authz_ns_" + (nsIdx++)).stdout, /你的角色是 operator，R4（授权类） 需要 owner 权限/u);
     assert.equal(fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).length, beforeNs, "这些拒绝都不取 claim");
     assert.equal(policyOf(), DIALOGUE_POLICY_ID, "participant 动不了模式");
+    // 第 3 层近似命中收边：owner 发不开放 / 不精确的形状 → 取 claim、拒绝终态、回执差在哪、模式不变、不投递
+    const claimsN = () => fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).length;
+    const malReceipt = (id) => path.join(paths.receipts, "malformed-control-" + id + ".json");
+    let malClaims = claimsN();
+    for (const [body, id, reason, re] of [
+      ["$feishu-unbind", "msg_mal_1", "rejected_control", /这个命令不从飞书开放：暂停接入不从飞书开放，请在终端里跑 \$feishu-unbind。没有执行，也没有投递/u],
+      ["$feishu-mode", "msg_mal_2", "malformed_control", /命令形状不对：\$feishu-mode 缺参数：dialogue 或 mapping（查看当前模式走 \$feishu-status）/u],
+      ["$feishu-mode dialog", "msg_mal_3", "malformed_control", /只认 dialogue \/ mapping，收到「dialog」/u],
+      ["/feishu-mode mapping", "msg_mal_4", "malformed_control", /前缀「\/」是 Claude 链的写法；这个话题是 Codex 链，命令用「\$」开头/u],
+      ["$feishu-status now", "msg_mal_5", "malformed_control", /\$feishu-status 不带参数，多了「now」/u],
+      ["$feishu-unsubscribe", "msg_mal_6", "malformed_control", /没有「\$feishu-unsubscribe」这个命令；飞书里可用：\$feishu-status/u],
+    ]) {
+      const r = runAs(body, TEMPLATE.frank_sender_id, id);
+      assert.equal(r.status, 0, body + "：" + r.stdout + r.stderr);
+      assert.match(r.stdout, re, body + "：" + r.stdout);
+      assert.doesNotMatch(r.stdout + r.stderr, /已切换|正忙|投递失败|handed_off": true/u, body + "：不许进投递或执行路径：" + r.stdout + r.stderr);
+      malClaims += 1;
+      assert.equal(claimsN(), malClaims, body + "：取了 claim");
+      const rec = JSON.parse(fs.readFileSync(malReceipt(id), "utf-8"));
+      assert.deepEqual([rec.status, rec.reason, rec.claim_acquired, rec.handed_off, rec.logical_task_key], ["rejected", reason, true, false, ltk], body);
+      assert.ok(typeof rec.problem === "string" && rec.problem.length > 0);
+      assert.equal(policyOf(), DIALOGUE_POLICY_ID, body + "：模式不变");
+    }
+    // 重放：意图从 claim 恢复，锁内按记录重出回执；删掉终态再重放 → 补齐
+    const malReplay = runAs("$feishu-mode", TEMPLATE.frank_sender_id, "msg_mal_2");
+    assert.match(malReplay.stdout, /缺参数：dialogue 或 mapping.*（同一条消息的重放：按记录重出回执）/u, malReplay.stdout);
+    assert.equal(claimsN(), malClaims, "重放不再取 claim");
+    const malKey = fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).map((n) => n.slice(0, -".claim".length))
+      .find((k) => JSON.parse(fs.readFileSync(path.join(paths.claims, k + ".claim", "claim.json"), "utf-8")).message_id === "msg_mal_2");
+    assert.ok(malKey);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(paths.claims, malKey + ".claim", "claim.json"), "utf-8")).rejected_control.word, "feishu-mode", "投影随 claim 持久化");
+    fs.rmSync(path.join(paths.claims, malKey + ".rejected.json"));
+    const malResumed = runAs("$feishu-mode", TEMPLATE.frank_sender_id, "msg_mal_2");
+    assert.match(malResumed.stdout, /（补齐了上次没记下的拒绝终态）/u, malResumed.stdout);
+    assert.ok(fs.existsSync(path.join(paths.claims, malKey + ".rejected.json")), "终态补齐");
+    assert.equal(JSON.parse(fs.readFileSync(malReceipt("msg_mal_2"), "utf-8")).resumed, true);
+    fs.writeFileSync(path.join(paths.claims, malKey + ".rejected.json"), "{broken");
+    const malBroken = runAs("$feishu-mode", TEMPLATE.frank_sender_id, "msg_mal_2");
+    assert.notEqual(malBroken.status, 0);
+    assert.match(malBroken.stdout, /拒绝记录损坏.*repair-control-claim/u, malBroken.stdout);
+    assert.equal(fs.readFileSync(path.join(paths.claims, malKey + ".rejected.json"), "utf-8"), "{broken", "受控拒绝不碰坏记录");
+    fs.rmSync(path.join(paths.claims, malKey + ".rejected.json"));
+    assert.match(runAs("$feishu-mode", TEMPLATE.frank_sender_id, "msg_mal_2").stdout, /补齐了上次没记下的拒绝终态/u, "坏记录移走后重放又能补齐");
+    // 评审 #94 第 4 轮：同 key 但归属另一 thread 的旧 claim → 不补终态、不重出回执，通用幂等命中
+    const malDoc = JSON.parse(fs.readFileSync(path.join(paths.claims, malKey + ".claim", "claim.json"), "utf-8"));
+    const foreignKey = claimKey("msg_mal_x", ltk);
+    fs.mkdirSync(path.join(paths.claims, foreignKey + ".claim"));
+    fs.writeFileSync(path.join(paths.claims, foreignKey + ".claim", "claim.json"), JSON.stringify({ ...malDoc, message_id: "msg_mal_x", claim_key: foreignKey, codex_thread_id: "01922222-3333-7444-8555-000000000099" }));
+    assert.match(runAs("$feishu-mode", TEMPLATE.frank_sender_id, "msg_mal_x").stdout, /已经处理过（幂等命中）/u);
+    assert.equal(fs.existsSync(path.join(paths.claims, foreignKey + ".rejected.json")), false, "别的 thread 的 claim 不补终态");
+    assert.equal(fs.existsSync(malReceipt("msg_mal_x")), false);
+    fs.rmSync(path.join(paths.claims, foreignKey + ".claim"), { recursive: true });
+    const malP = runAs("$feishu-unbind", "3333", "msg_mal_p1");
+    assert.match(malP.stdout, /你的角色是 participant，R3（控制） 需要 owner 权限/u, malP.stdout);
+    assert.equal(fs.existsSync(malReceipt("msg_mal_p1")), false, "participant 在 authorize 那层就拒，没有收边回执");
+    const mention = runAs("记得 $feishu-mode dialogue 这条命令", TEMPLATE.frank_sender_id, "msg_mal_o1");
+    assert.doesNotMatch(mention.stdout, /命令形状不对|不从飞书开放/u, mention.stdout);
+    assert.equal(fs.existsSync(malReceipt("msg_mal_o1")), false, "顺带提到的不是收边对象");
+    assert.equal(claimsN(), malClaims + 1, "顺带提到的按普通指令取 claim");
     assert.equal(setTaskInteractionMode({ threadId: THREAD_A, mode: MAPPING_POLICY_ID, home }).ok, true);
     fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   }

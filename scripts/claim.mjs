@@ -9,7 +9,7 @@
 
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import { controlIntentProblem } from "./control-intent.mjs";
+import { controlIntentProblem, rejectedControlProblem } from "./control-intent.mjs";
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { DIALOGUE_POLICY_ID, DIALOGUE_POLICY_VERSION } from "./interaction-policy.mjs";
 import { MAPPING_POLICY_ID, MAPPING_POLICY_VERSION } from "./mapping-policy.mjs";
@@ -154,6 +154,10 @@ function claimProblem(claim, key, expect) {
   // 控制意图（如 /feishu-mode）在 claim 里持久化；判据只有 control-intent.mjs 那一份。
   const intentProblem = controlIntentProblem(claim.control);
   if (intentProblem !== null) return intentProblem;
+  // 收边的拒绝投影（第 3 层）也在 claim 里持久化；判据只有 control-intent.mjs 那一份。控制意图与拒绝投影不可能同时成立。
+  const rejectedProblem = rejectedControlProblem(claim.rejected_control);
+  if (rejectedProblem !== null) return rejectedProblem;
+  if (claim.control !== undefined && claim.rejected_control !== undefined) return "control 与 rejected_control 并存";
   if (expect.logicalTaskKey !== undefined && claim.logical_task_key !== expect.logicalTaskKey) {
     return "logical_task_key 跟这个 task 对不上";
   }

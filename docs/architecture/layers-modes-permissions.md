@@ -10,7 +10,7 @@
 
 - 四层各管一件事：**端点**（连没连上）、**订阅**（收得到谁的话）、**通道**（这句话进哪条会话、回哪个话题）、**策略**（进去以后按什么规矩办）。状态页按这四层分区展示，**不出总判断**。
 - 今天的模式只有两种：**Mapping**（普通文本 = 跑一轮 run）和 **Dialogue**（普通文本 = 对话回合）。**没有绑定的上下文没有模式**，路由器一律拒 —— 这违反了 Frank 的原则"owner 在任何状态下的能力不应少于不装这批技能时"。提议补一个 **chat** 默认态。
-- 权限已从"一个 open_id = 全部"改成 **角色 × 风险等级 × 模式**（PR #93，未合并），并把命令命名空间收边（PR #94，叠在 #93 上）。**卡点只有一个**：R1"对话"还没有执行边界 —— participant 的"对话"仍会投进能改文件的宿主。这一条要 Frank 定方案。
+- 权限已从"一个 open_id = 全部"改成 **角色 × 风险等级 × 模式**（PR #93，已合并到 main c0cbf87），R1 的执行边界按 §6a 简化版做了：非 owner 的对话走零工具、无历史的一次性回合，不进 owner 的会话；Codex 链非 owner 的对话暂不开放。命令命名空间收边（PR #94）已 rebase 到 main、待放行。第 1 层已装（942c01ac），**第 2、3 层未安装**。
 
 ## 2. 四层关系模型
 
@@ -41,7 +41,7 @@
 | 模式 | 普通文本的含义 | 风险等级 | 谁能发普通文本 | 进入 | 退出 / 停止 | 状态 |
 |---|---|---|---|---|---|---|
 | Mapping | 在本地项目里跑一轮 run（改文件、跑命令），结果发回话题 | R2 执行 | 只有 owner | 绑定后的默认；`/feishu-mode mapping` | `/feishu-mode dialogue` | 已实现 |
-| Dialogue | 一个对话回合，只产生一段回复（**意图如此，边界未做**） | R1 对话 | owner / operator / participant | `/feishu-mode dialogue` | 预算耗尽（12 轮 / 2 小时 / 12 单位）、run 失败、人工打断、`/feishu-mode mapping` | 已实现（预算与停止条件有测试） |
+| Dialogue | 一个对话回合，只产生一段回复（非 owner：零工具、无历史的一次性回合 reply_only；owner：照旧进现场 / 续起会话） | R1 对话 | owner / operator / participant | `/feishu-mode dialogue` | 预算耗尽（12 轮 / 2 小时 / 12 单位）、run 失败、人工打断、`/feishu-mode mapping` | 已实现（预算与停止条件有测试） |
 | chat（提议） | 普通问答；不取 claim、不跑 run、不动本机任何东西 | R1 对话 | owner / operator / participant | 无绑定上下文的默认（A、私聊、unbind 之后） | `/feishu-bind` 进入绑定 → Mapping | **未实现**，等 Frank 一句"改 goal，加 chat" |
 | 管理（需求 FR-6） | Agent 之间 observe / advise / execute / modify | — | — | — | — | 未实现，与这套权限不是一回事 |
 
@@ -66,7 +66,7 @@
 | R3 控制 | 改绑定 / 策略 | 命令命名空间里的**一切**：router_control（mode）、model_control（bind / rotate）、rejected_control（unbind / pin-session 不从飞书开放）、malformed_control（缺参、错参、多尾巴、没这个词、别链前缀） | `/feishu-mode dialogue`、`/feishu-unbind`、`/feishu-mode`、`$feishu-mode dialogue`（发到 Claude 链） |
 | R4 授权类 | 逐次授权用语的封闭措辞，可带对象 | authorization | `装`、`装 8c5cedc`、`安装 PR #93`、`切路由`、`写飞书` |
 
-归类只看"这条消息想干什么"，不看谁发的；**归类不是执行边界**——"把这份结果发到飞书"这种自由语句在 Dialogue 下就是 R1，模型收到后能不能真去写飞书，由投递层的能力边界决定（今天没有，见 §6）。
+归类只看"这条消息想干什么"，不看谁发的；**归类不是执行边界**——"把这份结果发到飞书"这种自由语句在 Dialogue 下就是 R1，模型收到后能不能真去写飞书，由投递层的能力边界决定（reply_only：零工具、无 MCP、`--no-session-persistence --safe-mode`、不读会话历史，见 §6a）。
 
 ### 5.3 交叉表（Frank 2026-08-29 拍板；唯一一处 `authorize({ role, riskClass, mode })`，三道闸之后、拿 claim 之前）
 
@@ -98,7 +98,7 @@
 
 | # | 问题 | 选项 | 我的建议 | Codex 意见 | 状态 |
 |---|---|---|---|---|---|
-| 1 | **R1 没有执行边界**：三条投递路径（现场转发 → 现场会话、`claude --resume -p`、`codex exec resume`）都是全能力，participant 的"对话"会进到能改文件的宿主 | **A** 非 owner 的 R1 走"只回复"路径（runRequest 带 `capability: reply_only`；Claude 起 `claude -p --resume <会话> --fork-session --tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}'`，不碰现场会话；结果照旧发回话题）；**B** 边界做完前把 Dialogue 的 R1 改回 owner-only（表里一行数据），先合 | A | 选 A；B 只作 A 完成前的临时闭门状态，且不能宣称第 2 层收口 | **Frank 同意 A**；实现走 §6a 简化版 |
+| 1 | **R1 执行边界（已做，#93 已合并）**：非 owner 的对话 → reply_only —— 零工具、无 MCP、`--no-session-persistence --safe-mode`、不进现场会话、不取会话锁、runtime target 不等于任何真实会话；Codex 链非 owner 对话暂不开放（回执说清）。原问题：三条投递路径都是全能力 | **A** 非 owner 的 R1 走"只回复"路径（runRequest 带 `capability: reply_only`；Claude 起 `claude -p --resume <会话> --fork-session --tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}'`，不碰现场会话；结果照旧发回话题）；**B** 边界做完前把 Dialogue 的 R1 改回 owner-only（表里一行数据），先合 | A | 选 A；B 只作 A 完成前的临时闭门状态，且不能宣称第 2 层收口 | **Frank 同意 A**；实现走 §6a 简化版 |
 | 1a | A 里 Claude 的 R1 是零工具还是放只读工具（Read / Grep / Glob） | 零工具 / 只读工具 | 零工具先做 | 零工具：只读工具也扩大本机信息可见范围 | **同意零工具** |
 | 1b | participant 能不能看到 owner 现场会话的既有上下文 | 能（从会话分叉）/ 不能（独立记录、受限投影） | 不能 | 不能；participant 回合留在飞书、审计与独立 transcript 里，不回灌 owner 会话 | **同意不能** |
 | 1c | Codex 链怎么办：`-c sandbox_mode=read-only` 只是 shell 沙箱（不写盘不联网，仍能跑只读命令），没有可验证的零工具面 | 先按 B / 另起无工具的独立响应入口 | Codex 链先 B | 只读沙箱不算 R1 | **同意 Codex 链先 B** |
@@ -133,8 +133,8 @@
 | 层 / 件 | 分支 / PR | HEAD | 评审 | 合并 | 安装 |
 |---|---|---|---|---|---|
 | 第 1 层 角色表 | PR #92 `feat/sender-roles` | main 8c5cedc | 五轮，放行 | 已合并 | **已装** 942c01acbdbcf86d（两条链，2026-08-29） |
-| 第 2 层 风险 × 角色 × 模式 | PR #93 `feat/authorize-layer` | cfa55f0 | 两轮；P1-2 / P2 已返修，P1-1（R1 边界）按 §6a 做 | 未合并 | — |
-| 第 3 层 近似命中收边 | PR #94 `feat/malformed-control`（base 是 #93 的分支） | a1b0b69 → 第 4 轮返修中 | 三轮：意图联合、拒绝事务可恢复、盘点四态、维护入口已认可；锁内核心唯一 + CLAUDE.md subscribe 措辞在第 4 轮 | 未合并 | — |
+| 第 2 层 风险 × 角色 × 模式 + R1 执行边界 | PR #93 `feat/authorize-layer` | 2072c3c | 五轮，放行 | 已合并（main c0cbf87） | **未装** |
+| 第 3 层 近似命中收边 | PR #94 `feat/malformed-control`（base main） | e6c4e0e | 六轮：意图联合、可恢复的拒绝事务、盘点四态、维护入口、锁内核心唯一、生产入口带身份都已认可；前置 #97（控制事务绑定身份）已合入 | 待放行 | — |
 | chat 默认态 | — | — | — | — | Frank 同意，goal 修订稿见 §6b |
 
 ## 8. 名词对照（防止同名异义）

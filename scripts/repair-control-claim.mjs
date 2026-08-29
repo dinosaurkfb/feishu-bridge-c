@@ -10,6 +10,7 @@ import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
 import { CLAIM_KEY_SHAPE, readClaimState } from "./claim.mjs";
 import { RESUMABLE_CONTROL_STATES, inspectControlClaim, resumeControlClaim } from "./control-command.mjs";
+import { RESUMABLE_REJECT_STATES, describeRejectRepair, inspectRejectedClaim, rejectRepairExitCode, resumeRejectedClaim } from "./reject-control.mjs";
 import { setClaudeInteractionMode } from "./interaction-policy-store.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { expectationFromMapping, claudeControlPrecondition } from "./control-identity.mjs";
@@ -86,6 +87,15 @@ if (isDirectRun(import.meta.url)) {
     result = resumeControlClaim({ claimsDir, key: parsed.key, expect,
       execute: (mode) => setClaudeInteractionMode({ root, claudeSessionId: expect.claudeSessionId, mode,
         precondition: claudeControlPrecondition({ claimsDir, key: parsed.key, root }) }) });
+  }
+  // 不是控制命令的 claim 也可能是收边的拒绝（第 3 层）：同一个入口，另一套事务。
+  if (seen.state === "not_control") {
+    const rj = inspectRejectedClaim({ claimsDir, key: parsed.key, expect });
+    if (rj.state !== "not_rejected_control") {
+      const rr = parsed.apply && (RESUMABLE_REJECT_STATES.includes(rj.state) || rj.state === "rejected") ? resumeRejectedClaim({ claimsDir, key: parsed.key, expect }) : null;
+      process.stdout.write(describeRejectRepair({ seen: rj, result: rr, apply: parsed.apply }) + "\n");
+      process.exit(rejectRepairExitCode({ seen: rj, result: rr, apply: parsed.apply }));
+    }
   }
   process.stdout.write(describeControlRepair({ seen, result, apply: parsed.apply }) + "\n");
   process.exit(repairExitCode({ seen, result, apply: parsed.apply }));

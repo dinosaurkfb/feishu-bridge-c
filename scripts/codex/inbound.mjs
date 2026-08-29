@@ -34,10 +34,13 @@ import {
   isThreadBusy, loadCodexTemplate, promoteTask, reserveTaskDialogueTurn, setTaskInteractionMode,
   shadowCodexFirstClaim, taskPaths,
 } from "./state.mjs";
-import { controlAckText, parseControlCommand, runControlTransaction } from "../control-command.mjs";
+import { controlAckText, runControlTransaction } from "../control-command.mjs";
 import { codexControlPrecondition } from "./control-identity.mjs";
 import { senderRole } from "../sender-roles.mjs";
 import { classifyRisk } from "../risk-class.mjs";
+import { parseInboundIntent, controlRejectText, rejectedControlProjection } from "../inbound-intent.mjs";
+import { runRejectTransaction } from "../reject-control.mjs";
+import { sameRejectedControl } from "../control-intent.mjs";
 import { authorize } from "../authorize.mjs";
 import { isDirectRun } from "../direct-run.mjs";
 import { composeCrashReceipt } from "../crash-receipt.mjs";
@@ -311,12 +314,15 @@ if (!mappingContext.ok) {
 }
 
 // 控制命令（$feishu-mode dialogue|mapping）：三道闸之后先解析意图、随 claim 持久化；执行与终态在拿到 claim 之后做（可恢复事务）。
-const control = parseControlCommand(verdict.instruction, { chain: "codex" });
+// 第 3 层：正文先落进封闭的意图联合（inbound-intent.mjs），control 只是其中 router_control 那一支；入口按 intent 做确定性处置。
+const intent = parseInboundIntent({ instruction: verdict.instruction, chain: "codex" });
+const control = intent.control;
+const rejectedProjection = rejectedControlProjection(intent);
 
 // ---------- 唯一一处授权判定（角色 × 风险等级 × 模式）：三道闸之后、拿 claim 之前 ----------
 // 拒绝必须说清"哪个模式、哪个角色、缺什么权限"，不投递、不静默；不取 claim（重发不算重放）。
 const senderRoleValue = senderRole({ frank_sender_id: routed.mapping.frank_sender_id, senders: routed.config?.senders }, event.sender_id);
-const risk = classifyRisk({ instruction: verdict.instruction, chain: "codex", mode: policyEvaluation.policy_id, control });
+const risk = classifyRisk({ intent, mode: policyEvaluation.policy_id });
 const authz = authorize({ role: senderRoleValue, riskClass: risk.riskClass, mode: policyEvaluation.policy_id, chain: "codex" });
 if (!authz.allow) {
   writeReceipt("authz-" + verdict.messageId, {
@@ -327,6 +333,22 @@ if (!authz.allow) {
 }
 // 控制事务用的身份期望 —— 与 claim 里写的身份字段同一算法；换绑 / 换线程之后同 key 的旧 claim 对不上，就不替它执行、不重出回执。
 const claimExpect = { logicalTaskKey: task.logical_task_key, codexThreadId: task.codex_thread_id };
+// ---------- 近似命中收边（第 3 层）：拒绝事务 —— 与控制命令事务同一套形状（锁内记账、重放按记录重出、损坏指路维护入口） ----------
+const rejectControl = (replay) => {
+  const tx = runRejectTransaction({ claimsDir: paths.claims, key: claim.key, projection: rejectedProjection, replay, expect: claimExpect });
+  const lockNote = tx.lockUncleared ? "；另外这一笔的事务锁没有交还（" + tx.lockUncleared + "），之后同一笔会报 control_busy，请人工确认后处理" : "";
+  const base = { reason: intent.intent, word: intent.word, problem: intent.problem, message_id: verdict.messageId, logical_task_key: task.logical_task_key, claim_acquired: !replay, handed_off: false, lock_uncleared: tx.lockUncleared ?? null };
+  if (!tx.ok) {
+    writeReceipt("malformed-control-" + verdict.messageId, { status: "error", ...base, tx_reason: tx.reason, error: tx.why });
+    const broken = tx.reason === "rejected_unreadable" || tx.reason === "rejected_intent_mismatch";
+    finish("error", { detail: (broken
+      ? "这一笔的拒绝记录" + (tx.reason === "rejected_unreadable" ? "损坏" : "与意图不一致") + "（" + tx.why + "）；没有执行也没有投递。请用维护入口 repair-control-claim 处理这一笔"
+      : "拒绝没有记下（" + tx.reason + "：" + tx.why + "）；没有执行也没有投递。同一条消息的运输层重放会补齐") + lockNote }, { reason: tx.reason, intent: intent.intent });
+  }
+  writeReceipt("malformed-control-" + verdict.messageId, { status: "rejected", ...base, replayed: tx.replayed, resumed: tx.resumed });
+  finish("rejected", { reasonText: controlRejectText(intent) + (tx.replayed ? "（同一条消息的重放：按记录重出回执）" : tx.resumed ? "（补齐了上次没记下的拒绝终态）" : "") + lockNote, taskName: task.task_display_name },
+    { reason: intent.intent, word: intent.word, replayed: tx.replayed, resumed: tx.resumed });
+};
 const runControl = (replay) => {
   const tx = runControlTransaction({
     claimsDir: paths.claims, key: claim.key, intent: control ? { control: control.kind, mode: control.mode } : undefined, replay, expect: claimExpect,
@@ -358,6 +380,7 @@ const claim = acquireClaim({
   logicalTaskKey: task.logical_task_key,
   meta: {
     ...(control ? { control: { control: control.kind, mode: control.mode } } : {}),
+    ...(rejectedProjection ? { rejected_control: rejectedProjection } : {}),
     session_id: event.session_id,
     codex_thread_id: task.codex_thread_id,
     policy_id: policyEvaluation.policy_id,
@@ -373,6 +396,14 @@ if (!claim.ok && claim.reason === "duplicate" && control) {
   if (intent && intent.control === control.kind && intent.mode === control.mode) {
     claim.key = claim.key ?? claimKey(verdict.messageId, verdict.logicalTaskKey);
     runControl(true);
+  }
+}
+if (!claim.ok && claim.reason === "duplicate" && rejectedProjection) {
+  // 收边的重放：意图从 claim 里恢复；一致才按事务补齐 / 重出（不一致说明是另一条不同正文的消息撞了同一 id，落到通用的幂等命中）。
+  const original = readClaimState({ claimsDir: paths.claims, key: claim.key, expect: claimExpect });
+  if (original.status === "valid" && sameRejectedControl(original.claim.rejected_control, rejectedProjection)) {
+    claim.key = claim.key ?? claimKey(verdict.messageId, verdict.logicalTaskKey);
+    rejectControl(true);
   }
 }
 
@@ -396,6 +427,10 @@ if (!claim.ok) {
     taskName: task.task_display_name,
   }, { reason: claim.reason });
 }
+
+// ---------- 近似命中收边（第 3 层）：不开放 / 不精确的命令形状，取 claim 后记拒绝终态、回执差在哪，不投递 ----------
+// 能走到这里的只有 owner（非 owner 的 R3 在上面的 authorize 就拒了）；重放同一条消息撞的是 claim 的幂等，不会再记一次。
+if (rejectedProjection) rejectControl(false);
 
 // ---------- 控制命令：拿到 claim 之后当场执行（可恢复事务），不投递 ----------
 if (control) runControl(false);

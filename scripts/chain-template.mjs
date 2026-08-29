@@ -15,6 +15,7 @@
 
 import fs from "node:fs";
 import { senderRolesProblem } from "./sender-roles.mjs";
+import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import os from "node:os";
 import path from "node:path";
 
@@ -254,5 +255,75 @@ export function identityErrorText(r) {
       return "配置里没有可用的凭据目录。";
     default:
       return "出站身份校验失败：" + r.reason;
+  }
+}
+
+/**
+ * **模板的唯一写事务** —— 所有改 chain-config.json 的写方（init-chain-template 两条链、Codex 安装器改 bridge_root、
+ * register-sender 改 senders）都走这里；评审反例：register-sender 自己加了锁，安装器与初始化器仍无锁整表重写，
+ * 角色登记规划后被安装器改 bridge_root 的写入覆盖回旧值。
+ *
+ * 流程（整段在 `<file>.lock` 内，锁原语与 routes / registry 同一套 symlink 锁）：
+ *   读现状（缺席 → null；在场但校验不过 → 只有 allowInvalidCurrent 时才继续，给初始化器整表重写用）
+ *   → mutate(current) 得到 { template } / { changed:false } / { ok:false, reason }
+ *   → validateChainTemplate（不过 → result_invalid，零写入）
+ *   → 备份（在场时：backupSuffix 给 ".prev" 之类，否则 .bak.<ISO>）→ 原子写 → 逐字读回。
+ * 取得锁失败按真实原因报（publisher_busy → template_busy；其余 → template_lock_unavailable + reason）；
+ * 释放失败不吞：结果照常返回，附 lockUncleared（调用方要非零退出并指路）。
+ */
+export function withChainTemplateWrite({ file, mutate, backupSuffix = null, allowInvalidCurrent = false, now = new Date() } = {}) {
+  if (typeof file !== "string" || !path.isAbsolute(file)) return { ok: false, reason: "template_required_absolute" };
+  if (typeof mutate !== "function") return { ok: false, reason: "mutate_required" };
+  const lockDir = file + ".lock";
+  let lock;
+  try { lock = acquirePublishLock(lockDir); }
+  catch (err) { return { ok: false, reason: "template_lock_unavailable", detail: "锁原语抛错：" + String(err?.code ?? err?.message ?? err) }; }
+  if (!lock.ok) {
+    return lock.reason === "publisher_busy"
+      ? { ok: false, reason: "template_busy", detail: "另一个写方持有 " + lockDir }
+      : { ok: false, reason: "template_lock_unavailable", detail: String(lock.reason) + (lock.error ? "：" + lock.error : "") };
+  }
+  let result;
+  try {
+    let current = null;
+    if (fs.existsSync(file)) {
+      const loaded = loadChainTemplate(file);
+      if (loaded.ok) current = loaded.template;
+      else if (allowInvalidCurrent) { try { current = JSON.parse(fs.readFileSync(file, "utf-8")); } catch { current = null; } }
+      else return (result = { ok: false, reason: "template_unreadable", detail: loaded.reason });
+    }
+    const next = mutate(current);
+    if (!next || typeof next !== "object") return (result = { ok: false, reason: "mutate_result_invalid" });
+    if (next.ok === false) return (result = next);
+    if (next.changed === false) return (result = { ok: true, changed: false, template: current });
+    const template = next.template;
+    const valid = validateChainTemplate(template);
+    if (!valid.ok) return (result = { ok: false, reason: "result_invalid", detail: valid });
+    const body = JSON.stringify(template, null, 2) + "\n";
+    let backup = null;
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      if (fs.existsSync(file)) {
+        backup = file + (backupSuffix ?? ".bak." + now.toISOString().replace(/[:.]/gu, "-"));
+        fs.copyFileSync(file, backup);
+      }
+    } catch (err) { return (result = { ok: false, reason: "backup_failed", detail: err.message }); }
+    const tmp = file + ".tmp." + process.pid;
+    try {
+      fs.writeFileSync(tmp, body, { mode: 0o600 });
+      fs.renameSync(tmp, file);
+    } catch (err) {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* 已不在 */ }
+      return (result = { ok: false, reason: "template_unwritable", detail: err.message, backup });
+    }
+    let back;
+    try { back = fs.readFileSync(file, "utf-8"); } catch (err) { return (result = { ok: false, reason: "readback_failed", detail: err.message, backup }); }
+    if (back !== body) return (result = { ok: false, reason: "readback_mismatch", backup });
+    return (result = { ok: true, changed: true, template, backup });
+  } finally {
+    let rel;
+    try { rel = releasePublishLock(lockDir); } catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
+    const why = !rel?.ok ? String(rel?.reason) + (rel?.error ? "：" + rel.error : "") : rel.absent ? "锁已不在（被清理过）" : null;
+    if (why && result && typeof result === "object") result.lockUncleared = why;
   }
 }

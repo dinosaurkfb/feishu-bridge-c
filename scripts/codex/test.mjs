@@ -2882,6 +2882,24 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
       env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
     });
   assert.equal(installed.status, 0, "夹具依赖安装器成功：" + installed.stderr);
+  // 唯一写事务：模板写锁被别的写方持有时，安装器不改 bridge_root、也不动 hooks（评审反例：安装器无锁重写会覆盖并发登记）
+  {
+    const lockPath = path.join(home, "chain-config.json.lock");
+    assert.equal(acquirePublishLock(lockPath).ok, true);
+    const tplBefore = fs.readFileSync(path.join(home, "chain-config.json"), "utf-8");
+    const hooksBefore = fs.readFileSync(path.join(codexHome, "hooks.json"), "utf-8");
+    fs.writeFileSync(path.join(home, "chain-config.json"), tplBefore.replace(/"bridge_root": "[^"]*"/u, '"bridge_root": "/old/clone"'));
+    const blocked = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } });
+    assert.notEqual(blocked.status, 0, "持锁时安装器必须失败：" + blocked.stdout + blocked.stderr);
+    assert.match(blocked.stderr, /template_busy/u, blocked.stderr);
+    assert.match(JSON.parse(fs.readFileSync(path.join(home, "chain-config.json"), "utf-8")).bridge_root, /\/old\/clone$/u, "持锁期间模板没被改");
+    assert.equal(fs.readFileSync(path.join(codexHome, "hooks.json"), "utf-8"), hooksBefore, "hooks 没动");
+    assert.equal(releasePublishLock(lockPath).ok, true);
+    const again = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } });
+    assert.equal(again.status, 0, again.stdout + again.stderr);
+    assert.match(again.stdout, /bridge_root .* → runtime\/current/u, again.stdout);
+    assert.ok(fs.readdirSync(home).some((n) => n.startsWith("chain-config.json.bak.")), "安装器改模板也先备份");
+  }
 
   const run = () => spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "doctor.mjs"), "--json"], {
     encoding: "utf-8",

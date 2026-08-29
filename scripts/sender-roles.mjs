@@ -23,8 +23,9 @@ const OPEN_ID_SHAPE = /^\d+$/u;
  * 返回 null 或一句能定位的问题。
  */
 export function roleEntriesProblem(list, { ownerIds, ownerRequired = false, name = "senders" } = {}) {
-  // owner 基准照单全收（旧登记 / 旧夹具里的 frank_sender_id 不一定是数字；它的形状由模板校验管）；非 owner 条目才要求数字形状。
-  if (!Array.isArray(ownerIds) || ownerIds.length === 0 || ownerIds.some((id) => typeof id !== "string" || id.trim().length === 0)) return name + " 的 owner 基准不成立";
+  // 契约只有一份（与 references/subscription-v1.schema.json 逐字对齐）：表在场 ⇒ 每个 open_id 都是数字，owner 基准也不例外。
+  // 旧登记的 frank_sender_id 不是数字时，投影不生成 sender_roles（旧制品形态），而不是放宽契约。
+  if (!Array.isArray(ownerIds) || ownerIds.length === 0 || ownerIds.some((id) => typeof id !== "string" || !OPEN_ID_SHAPE.test(id))) return name + " 的 owner 基准不是数字 id";
   if (!Array.isArray(list)) return name + " 不是数组";
   const owners = new Set(ownerIds);
   const seen = new Set();
@@ -34,9 +35,10 @@ export function roleEntriesProblem(list, { ownerIds, ownerRequired = false, name
     if (e === null || typeof e !== "object" || Array.isArray(e)) return at + " 不是对象";
     const keys = Object.keys(e).sort().join(",");
     if (keys !== "open_id,role" && keys !== "note,open_id,role") return at + " 字段集不对（只认 open_id / role / note）";
-    if (typeof e.open_id !== "string" || !(OPEN_ID_SHAPE.test(e.open_id) || owners.has(e.open_id))) return at + ".open_id 形状不对（Aily user id 是一串数字）";
+    if (typeof e.open_id !== "string" || !OPEN_ID_SHAPE.test(e.open_id)) return at + ".open_id 形状不对（Aily user id 是一串数字）";
     if (!SENDER_ROLES.includes(e.role)) return at + ".role 不在 owner / operator / participant 里";
-    if (e.note !== undefined && (typeof e.note !== "string" || e.note.length > 80)) return at + ".note 不是 80 字以内的字符串";
+    // 长度按 Unicode 码点数（与 JSON Schema maxLength 同一算法），不按 UTF-16 单元：41 个 emoji 两边都得算 41。
+    if (e.note !== undefined && (typeof e.note !== "string" || Array.from(e.note).length > 80)) return at + ".note 不是 80 字以内的字符串";
     if (seen.has(e.open_id)) return at + ".open_id 重复";
     seen.add(e.open_id);
     if (e.role === "owner" && !owners.has(e.open_id)) return at + " 标了 owner 但不是 owner 基准里的那个";

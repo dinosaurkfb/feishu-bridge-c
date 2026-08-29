@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { moduleRoot } from "../direct-run.mjs";
 import { shellQuote } from "../shell-quote.mjs";
+import { withChainTemplateWrite } from "../chain-template.mjs";
 import { buildHookCommand, ownsHookCommand, pickNode } from "./hook-command.mjs";
 import { SKILLS, expectedSkillContent } from "./skill-content.mjs";
 
@@ -180,14 +181,18 @@ if (!uninstall) {
 if (!uninstall) {
   const tplFile = path.join(home, "chain-config.json");
   try {
-    const raw = fs.readFileSync(tplFile, "utf-8");
-    const doc = JSON.parse(raw);
-    if (doc.bridge_root !== RUNTIME_CURRENT) {
-      const before = doc.bridge_root;
-      doc.bridge_root = RUNTIME_CURRENT;
-      writeAtomic(tplFile, JSON.stringify(doc, null, 2) + "\n");
-      console.log("模板      ：bridge_root " + (before ?? "(无)") + " → runtime/current");
-    }
+    if (!fs.existsSync(tplFile)) { const e = new Error("ENOENT"); e.code = "ENOENT"; throw e; }
+    // 走模板的唯一写事务：锁内重读、只改这一个字段、校验后原子写 —— 不再无锁整表重写（评审反例：会把并发登记的角色覆盖掉）。
+    let before = null;
+    const wrote = withChainTemplateWrite({ file: tplFile, allowInvalidCurrent: true, mutate: (cur) => {
+      if (cur === null) return { ok: false, reason: "template_unreadable" };
+      if (cur.bridge_root === RUNTIME_CURRENT) return { changed: false };
+      before = cur.bridge_root;
+      return { template: { ...cur, bridge_root: RUNTIME_CURRENT } };
+    } });
+    if (!wrote.ok) { const e = new Error(wrote.reason + (wrote.detail ? "：" + (typeof wrote.detail === "string" ? wrote.detail : JSON.stringify(wrote.detail)) : "")); e.code = wrote.reason; throw e; }
+    if (wrote.changed) console.log("模板      ：bridge_root " + (before ?? "(无)") + " → runtime/current");
+    if (wrote.lockUncleared) { console.error("模板写锁没有交还（" + wrote.lockUncleared + "）；请人工确认后处理 " + tplFile + ".lock"); process.exit(1); }
   } catch (err) {
     // 读不出来就说读不出来 —— 不许静默跳过：这个字段错了会让整条链跑旧代码。
     if (err.code !== "ENOENT") {

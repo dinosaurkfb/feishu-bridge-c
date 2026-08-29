@@ -14,8 +14,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
-import { loadChainTemplate, validateChainTemplate } from "./chain-template.mjs";
-import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
+import { loadChainTemplate, validateChainTemplate, withChainTemplateWrite } from "./chain-template.mjs";
 import { SENDER_ROLES, roleCounts, roleCountsText, senderRolesProblem, senderTable } from "./sender-roles.mjs";
 
 export function parseRegisterSenderArgs(argv) {
@@ -70,44 +69,20 @@ export function planSenderChange(template, { openId, role, note = null, remove =
   return { ok: true, changed: true, template: candidate, table: senderTable(candidate), before: existing, after: remove ? null : next.find((e) => e.open_id === openId) };
 }
 
-/**
- * 写盘 —— **整段在模板写锁内**（与 routes / registry 同一把 symlink 锁原语）：重读 → 重规划 → 校验 → 备份 → 原子写 → 逐字读回。
- * 评审反例：锁外规划的旧模板落盘会静默覆盖别人刚登记的人；先写后校验会把坏模板落成正式文件。
- * change 是变更意图（不是算好的模板），所以并发时以锁内读到的世界为准重算。
- */
+/** 写盘：走 chain-template 的唯一写事务（锁内重读 → 重规划 → 校验 → 备份 → 原子写 → 逐字读回）。change 是变更意图，以锁内世界为准重算。 */
 export function applySenderChange({ file, change, now = new Date() }) {
-  if (typeof file !== "string" || !path.isAbsolute(file)) return { ok: false, reason: "template_required_absolute" };
   if (!change || typeof change !== "object") return { ok: false, reason: "change_required" };
-  const lockDir = file + ".lock";
-  const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, reason: "template_busy" };
-  try {
-    const loaded = loadChainTemplate(file);
-    if (!loaded.ok) return { ok: false, reason: "template_unreadable", problem: loaded.reason };
-    const plan = planSenderChange(loaded.template, change);
-    if (!plan.ok) return plan;
-    if (!plan.changed) return { ok: true, changed: false, table: plan.table };
-    // 先校验（planSenderChange 已过 validateChainTemplate；这里再逐字段核一次，确保写的就是校验过的那份）
-    const valid = validateChainTemplate(plan.template);
-    if (!valid.ok) return { ok: false, reason: "result_invalid", problem: JSON.stringify(valid) };
-    const body = JSON.stringify(plan.template, null, 2) + "\n";
-    const backup = file + ".bak." + now.toISOString().replace(/[:.]/gu, "-");
-    try { fs.copyFileSync(file, backup); } catch (err) { return { ok: false, reason: "backup_failed", error: err.message }; }
-    const tmp = file + ".tmp." + process.pid;
-    try {
-      fs.writeFileSync(tmp, body, { mode: 0o600 });
-      fs.renameSync(tmp, file);
-    } catch (err) {
-      try { fs.rmSync(tmp, { force: true }); } catch { /* 已不在 */ }
-      return { ok: false, reason: "template_unwritable", error: err.message, backup };
-    }
-    let back;
-    try { back = fs.readFileSync(file, "utf-8"); } catch (err) { return { ok: false, reason: "readback_failed", error: err.message, backup }; }
-    if (back !== body) return { ok: false, reason: "readback_mismatch", backup };
-    return { ok: true, changed: true, backup, table: plan.table, before: plan.before, after: plan.after };
-  } finally {
-    releasePublishLock(lockDir);
-  }
+  let planned = null;
+  const r = withChainTemplateWrite({ file, now, mutate: (current) => {
+    if (current === null) return { ok: false, reason: "template_unreadable", detail: "模板不存在" };
+    planned = planSenderChange(current, change);
+    if (!planned.ok) return planned;
+    if (!planned.changed) return { changed: false };
+    return { template: planned.template };
+  } });
+  if (!r.ok) return r;
+  return { ok: true, changed: r.changed, backup: r.backup ?? null, table: planned?.table ?? senderTable(r.template), before: planned?.before ?? null, after: planned?.after ?? null,
+    ...(r.lockUncleared ? { lockUncleared: r.lockUncleared } : {}) };
 }
 
 if (isDirectRun(import.meta.url)) {
@@ -128,8 +103,13 @@ if (isDirectRun(import.meta.url)) {
   if (!plan.changed) { process.stdout.write("已经是这样，没动。\n"); process.exit(0); }
   if (!parsed.apply) { process.stdout.write("\n[dry-run] 什么都没写。写入是改授权面，要 owner 逐次授权后再加 --apply。\n"); process.exit(0); }
   const done = applySenderChange({ file: parsed.template, change: parsed });
-  if (!done.ok) { process.stdout.write("没有写成：" + done.reason + (done.error ? "：" + done.error : "") + (done.problem ? "：" + done.problem : "") + "\n"); process.exit(1); }
-  if (!done.changed) { process.stdout.write("锁内重读后已经是这样，没动。\n"); process.exit(0); }
-  process.stdout.write("已写入（锁内重读重算后）。备份：" + done.backup + "\n角色人数：" + roleCountsText(roleCounts(done.table)) + "\n");
+  const detail = (r) => (r.detail ? "：" + (typeof r.detail === "string" ? r.detail : JSON.stringify(r.detail)) : "") + (r.error ? "：" + r.error : "") + (r.problem ? "：" + r.problem : "");
+  if (!done.ok) { process.stdout.write("没有写成：" + done.reason + detail(done) + "\n"); process.exit(1); }
+  if (!done.changed) process.stdout.write("锁内重读后已经是这样，没动。\n");
+  else process.stdout.write("已写入（锁内重读重算后）。备份：" + done.backup + "\n角色人数：" + roleCountsText(roleCounts(done.table)) + "\n");
+  if (done.lockUncleared) {
+    process.stdout.write("注意：模板写锁没有交还（" + done.lockUncleared + "）；之后所有模板写方都会报 template_busy，请人工确认没有写方在跑后处理 " + parsed.template + ".lock\n");
+    process.exit(1);
+  }
   process.exit(0);
 }

@@ -105,7 +105,8 @@ export function buildLegacySubscriptionReadModel({
   if (!nonEmpty(template?.agent_uid)) problems.push("template.agent_uid");
   if (!nonEmpty(template?.transport_open_id)) problems.push("template.transport_open_id");
   if (!nonEmpty(template?.frank_sender_id)) problems.push("template.frank_sender_id");
-  if (nonEmpty(template?.frank_sender_id) && senderRolesProblem(template) !== null) problems.push("template.senders");
+  // senders 在场但不合法 → 投影不可用；owner 基准不是数字（旧登记）且没写 senders → 合法但不生成 sender_roles
+  if (nonEmpty(template?.frank_sender_id) && template?.senders !== undefined && template?.senders !== null && senderRolesProblem(template) !== null) problems.push("template.senders");
   if (!nonEmpty(template?.chat_id)) problems.push("template.chat_id");
   if (typeof template?.default_freshness_ms !== "number" ||
       !Number.isFinite(template.default_freshness_ms) || template.default_freshness_ms <= 0) {
@@ -153,7 +154,7 @@ export function buildLegacySubscriptionReadModel({
           chat_id: chatId,
           sender_ids: uniqueStrings([template.frank_sender_id]),
           // 角色表（第 1 层）：只做显示与登记；授权基准仍是 sender_ids（只有 owner），第 2 层接入判定时才换。
-          sender_roles: senderTable(template) ?? [{ open_id: template.frank_sender_id, role: "owner" }],
+          ...(senderTable(template) !== null ? { sender_roles: senderTable(template) } : {}),
           event_types: [MESSAGE_RECEIVE_EVENT],
         },
         constraints: { freshness_ms: template.default_freshness_ms },

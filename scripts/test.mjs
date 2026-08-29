@@ -41,7 +41,7 @@ import {
 import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
 import { machineContext, runDoctor } from "./doctor.mjs";
-import { activeGenerationForSession, effectiveBindingId, generationForSession, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
+import { activeGenerationForSession, effectiveBindingId, generationForSession, resolveMappingOutboundGeneration, pendingRotationBlocker } from "./topic-generation.mjs";
 import {
   claimReminderDue as tgClaimReminderDue, markPendingClaimReminder as tgMarkPendingClaimReminder,
   validateTopicGenerationState as tgValidateState,
@@ -19762,6 +19762,62 @@ test("近似命中收边（第 3 层）：意图联合唯一、风险是它的�
   const sw = run("/feishu-mode dialogue", owner, "msg_mal_c1");
   assert.match(sw.stdout, /已切换/u, sw.stdout);
   assert.equal(policyOf(), DIALOGUE_POLICY_ID);
+});
+
+
+test("轮转遇到待认领代际：仍可认领 → 拒绝重复创建；已过认领截止 → 作废它、本次直接建下一代（判据一份，两条链共用；Claude 真入口 dry-run）", () => {
+  const build = (claimExpiresAt) => {
+    const legacy = topicGenerationStateForLegacy({ root_message_id: "om_root_rot", status: "active", channel_generation_id: "gen-1" }, { runtime: "claude", bindingId: "rot@registry" });
+    assert.equal(legacy.ok, true, JSON.stringify(legacy));
+    if (claimExpiresAt === undefined) return legacy.state;
+    const prepared = prepareTopicRotation(legacy.state, { operationId: "op-rot" });
+    assert.equal(prepared.ok, true, JSON.stringify(prepared));
+    const registered = registerPendingTopicGeneration(prepared.state, { operationId: "op-rot", rootMessageId: "om_pending_rot", pendingToken: "tok", claimExpiresAt });
+    assert.equal(registered.ok, true, JSON.stringify(registered));
+    return registered.state;
+  };
+  const past = "2026-08-29T00:00:00.000Z"; const future = "2099-01-01T00:00:00.000Z"; const now = Date.parse("2026-08-30T00:00:00.000Z");
+  // ── 判据
+  assert.deepEqual(pendingRotationBlocker(build(undefined), { now }), { kind: "none", pending: null, deadline: null });
+  const blocked = pendingRotationBlocker(build(future), { now });
+  assert.deepEqual([blocked.kind, blocked.pending.generation, blocked.deadline], ["blocked", 2, future]);
+  const noExpiry = pendingRotationBlocker(build(null), { now });
+  assert.deepEqual([noExpiry.kind, noExpiry.deadline], ["blocked", null], "新式不过期的 pending 只认认领或显式取消");
+  const expired = pendingRotationBlocker(build(past), { now });
+  assert.deepEqual([expired.kind, expired.pending.generation, expired.deadline], ["expired", 2, past]);
+  assert.equal(pendingRotationBlocker(build(past), { now: Date.parse(past) - 1 }).kind, "blocked", "截止前一毫秒仍算可认领");
+  assert.equal(pendingRotationBlocker(build(past), { now: Date.parse(past) }).kind, "expired", "到点即过期");
+  // 状态层：按 expired 关闭只对真过期的 pending 成立
+  assert.equal(closePendingTopicGeneration(build(future), { operationId: "op-rot", reason: ROTATION_STATUS.EXPIRED, now }).reason, "pending_generation_not_expired");
+  const closed = closePendingTopicGeneration(build(past), { operationId: "op-rot", reason: ROTATION_STATUS.EXPIRED, now });
+  assert.equal(closed.ok, true, JSON.stringify(closed));
+  assert.equal(pendingRotationBlocker(closed.state, { now }).kind, "none", "作废之后没有 pending 了");
+  // ── Claude 真入口（dry-run，不建话题、不写状态）
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-rotate-"));
+  const root = path.join(local, "project"); fs.mkdirSync(root);
+  const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  const writeRegistry = (state) => fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{
+    id: "rot", root, name: "轮转演示", root_message_id: "om_root_rot", expires_at: "2099-01-01T00:00:00Z",
+    session_id: "aily_rot", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z", topic_generation_state: state }] }));
+  const rotate = (...args) => spawnSync(process.execPath, [path.resolve("scripts", "feishu-rotate.mjs"), "--project", root, ...args], { encoding: "utf-8",
+    env: { ...process.env, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, CLAUDE_CODE_SESSION_ID: "", CLAUDE_SESSION_ID: "" } });
+  writeRegistry(build(future));
+  const refused = rotate();
+  assert.notEqual(refused.status, 0, refused.stdout + refused.stderr);
+  assert.match(refused.stdout + refused.stderr, /已有等待认领的话题代际（第 2 代，认领截止 2099-01-01T00:00:00.000Z）；去新话题 @ 完成认领，或 --cancel --apply 显式取消，不能重复创建/u, refused.stdout + refused.stderr);
+  writeRegistry(build(null));
+  const noExp = rotate();
+  assert.notEqual(noExp.status, 0);
+  assert.match(noExp.stdout + noExp.stderr, /第 2 代，不过期）/u, "不过期的 pending 也拒：" + noExp.stdout + noExp.stderr);
+  writeRegistry(build(past));
+  const superseded = rotate();
+  assert.equal(superseded.status, 0, superseded.stdout + superseded.stderr);
+  assert.match(superseded.stdout, /过期代际  第 2 代（认领截止 2026-08-29T00:00:00.000Z 已过）：本次作废它，话题历史保留/u, superseded.stdout);
+  assert.match(superseded.stdout, /新代际    3（/u, "直接建第 3 代");
+  assert.match(superseded.stdout, /\[dry-run\] 没有创建话题或修改状态/u);
+  assert.equal(JSON.parse(fs.readFileSync(registryFile, "utf-8")).projects[0].topic_generation_state.generations.length, 2, "dry-run 不改状态");
+  assert.equal(pendingRotationBlocker(JSON.parse(fs.readFileSync(registryFile, "utf-8")).projects[0].topic_generation_state, { now }).kind, "expired", "dry-run 之后 pending 原样还在");
 });
 
 

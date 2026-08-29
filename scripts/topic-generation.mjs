@@ -667,6 +667,22 @@ export function activatePendingTopicGeneration(state, {
   };
 }
 
+/**
+ * 轮转前对待认领代际的判定 —— **唯一一份**，两条链的 feishu-rotate 都用它：
+ *   none    ：没有待认领代际，直接建下一代；
+ *   blocked ：有待认领代际且仍可认领（无截止或未到截止）—— 不能重复创建，要么去新话题 @ 认领，要么显式 --cancel；
+ *   expired ：待认领代际已过认领截止 —— 它已经没人能认领了，再拿它挡新的轮转只是把人堵在门外：
+ *             本次轮转先按 expired 作废它（话题历史保留），再建下一代。
+ */
+export function pendingRotationBlocker(state, { now = Date.now() } = {}) {
+  const pending = pendingGeneration(state);
+  if (!pending) return { kind: "none", pending: null, deadline: null };
+  const deadline = pending.claim_expires_at ?? null;
+  const at = Date.parse(deadline ?? "");
+  if (Number.isFinite(at) && now >= at) return { kind: "expired", pending, deadline };
+  return { kind: "blocked", pending, deadline };
+}
+
 export function closePendingTopicGeneration(state, {
   operationId,
   reason = ROTATION_STATUS.CANCELLED,

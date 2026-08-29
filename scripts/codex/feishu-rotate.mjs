@@ -17,9 +17,7 @@ import {
   topicStateForTask,
 } from "./state.mjs";
 import {
-  ROTATION_STATUS, activeGeneration, pendingGeneration,
-  TOPIC_GENERATION_PREPARING_STALE_MS,
-  TOPIC_GENERATION_AUTO_ROTATE_MESSAGES,
+  ROTATION_STATUS, activeGeneration, pendingGeneration, TOPIC_GENERATION_PREPARING_STALE_MS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, pendingRotationBlocker,
 } from "../topic-generation.mjs";
 import { buildIntentParams, requireIntent } from "./intent.mjs";
 
@@ -40,7 +38,7 @@ if (!thread.ok) die("无法确定当前 Codex task（" + thread.reason + "）。
 const found = findRegisteredTaskForCodexThread({ threadId: thread.threadId });
 if (!found.ok) die("当前 Codex task 尚未接入飞书。");
 const task = found.task;
-const loaded = topicStateForTask(task);
+let loaded = topicStateForTask(task);
 if (!loaded.ok) die("当前 task 的 topic generation 状态不可用（" + loaded.reason + "）。");
 const active = activeGeneration(loaded.state);
 if (!active) die("当前 task 没有 active generation，不能开始轮转。");
@@ -97,7 +95,20 @@ if (cancel) {
   console.log("已取消待认领代际；旧话题仍是唯一 active，未删除任何飞书历史。");
   process.exit(0);
 }
-if (pending) die("已有等待认领的话题代际；请先完成认领或显式取消，不能重复创建。");
+const blocker = pendingRotationBlocker(loaded.state);
+if (blocker.kind === "blocked") {
+  die("已有等待认领的话题代际（第 " + blocker.pending.generation + " 代" + (blocker.deadline ? "，认领截止 " + blocker.deadline : "，不过期") +
+    "）；去新话题 @ 完成认领，或 --cancel --apply 显式取消，不能重复创建。");
+}
+if (blocker.kind === "expired") {
+  console.log("过期代际  第 " + blocker.pending.generation + " 代（认领截止 " + blocker.deadline + " 已过）：本次作废它，话题历史保留");
+  if (apply) {
+    const closed = closeTaskTopicRotation({ threadId: thread.threadId, operationId: loaded.state.rotation?.operation_id, reason: ROTATION_STATUS.EXPIRED, home: bridgeHome() });
+    if (!closed.ok) die("作废过期代际失败（" + closed.reason + "）。");
+    loaded = topicStateForTask(task);
+    if (!loaded.ok) die("作废后重读 topic generation 状态失败（" + loaded.reason + "）。");
+  }
+}
 const nextNumber = Math.max(...loaded.state.generations.map((generation) => generation.generation)) + 1;
 const token = bindingToken(loaded.state.binding_id + "\n" + nextNumber);
 const name = task.task_display_name;

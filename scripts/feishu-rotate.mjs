@@ -15,9 +15,7 @@ import {
   registerClaudeTopicRotation,
 } from "./topic-generation-store.mjs";
 import {
-  ROTATION_STATUS, TOPIC_GENERATION_PREPARING_STALE_MS,
-  activeGeneration, pendingGeneration,
-  TOPIC_GENERATION_AUTO_ROTATE_MESSAGES,
+  ROTATION_STATUS, TOPIC_GENERATION_PREPARING_STALE_MS, activeGeneration, pendingGeneration, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, pendingRotationBlocker,
 } from "./topic-generation.mjs";
 
 const arg = (name) => {
@@ -33,7 +31,7 @@ const claudeSessionId = arg("claude-session-id") ??
   process.env.CLAUDE_CODE_SESSION_ID ?? process.env.CLAUDE_SESSION_ID;
 if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) die("项目目录不存在：" + root);
 
-const current = loadClaudeTopicBinding({ root, claudeSessionId });
+let current = loadClaudeTopicBinding({ root, claudeSessionId });
 if (!current.ok || !current.config) die("当前 Claude binding 不可轮转（" + (current.reason ?? "config_unusable") + "）");
 const active = activeGeneration(current.state);
 if (!active) die("当前 binding 没有 active generation，不能开始轮转。");
@@ -57,7 +55,21 @@ if (cancel) {
   console.log("已取消待认领代际；旧话题仍是唯一 active，未删除任何飞书历史。");
   process.exit(0);
 }
-if (pending) die("已有等待认领的话题代际；请先完成认领或显式取消，不能重复创建。");
+const blocker = pendingRotationBlocker(current.state);
+if (blocker.kind === "blocked") {
+  die("已有等待认领的话题代际（第 " + blocker.pending.generation + " 代" + (blocker.deadline ? "，认领截止 " + blocker.deadline : "，不过期") +
+    "）；去新话题 @ 完成认领，或 --cancel --apply 显式取消，不能重复创建。");
+}
+if (blocker.kind === "expired") {
+  // 过期的待认领代际不再挡路：作废它（话题历史保留），本次直接建下一代 —— 不用再单独取消一次
+  console.log("过期代际  第 " + blocker.pending.generation + " 代（认领截止 " + blocker.deadline + " 已过）：本次作废它，话题历史保留");
+  if (apply) {
+    const closed = closeClaudeTopicRotation({ root, claudeSessionId, operationId: current.state.rotation?.operation_id, reason: ROTATION_STATUS.EXPIRED });
+    if (!closed.ok) die("作废过期代际失败（" + closed.reason + "）。");
+    current = loadClaudeTopicBinding({ root, claudeSessionId });
+    if (!current.ok || !current.config) die("作废后重读 binding 失败（" + (current.reason ?? "config_unusable") + "）");
+  }
+}
 const nextNumber = Math.max(...current.state.generations.map((generation) => generation.generation)) + 1;
 const token = bindingToken(current.state.binding_id + "\n" + nextNumber);
 const name = current.config.task_display_name ?? path.basename(root);

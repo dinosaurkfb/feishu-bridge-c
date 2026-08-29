@@ -169,7 +169,9 @@ export function handOff({ projectDir, instruction, runsDir, key, resumeSessionId
  *   · 日志与守望者路径与 handOff 完全一样，结果照旧发回话题。
  * 参数是常量：测试逐字断言，改一个开关就红。
  */
-export const REPLY_ONLY_ARGS = Object.freeze(["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-session-persistence", "--safe-mode", "--output-format", "stream-json", "--verbose"]);
+/** 零工具边界 —— **一份**：Dialogue 的 reply_only 与 chat 默认态都用它。 */
+export const ZERO_TOOL_ARGS = Object.freeze(["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-session-persistence", "--safe-mode"]);
+export const REPLY_ONLY_ARGS = Object.freeze([...ZERO_TOOL_ARGS, "--output-format", "stream-json", "--verbose"]);
 
 export function handOffReplyOnly({ projectDir, instruction, runsDir, key }) {
   assertClaudeAvailable();

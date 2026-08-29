@@ -27,6 +27,8 @@
  */
 
 import fs from "node:fs";
+import { chatReplyPathStatus, chatReplyTimeoutMs } from "./chat-reply.mjs";
+import { chatLoad, inspectAdmissionLocks, inspectScratch } from "./chat-ledger.mjs";
 import os from "node:os";
 import path from "node:path";
 
@@ -302,6 +304,33 @@ export function runDoctor({
       add("codex_drain", "⑥ 积压有人发（Codex 侧）", drain.ok === true ? true : drain.ok === false ? false : null,
         "Codex 侧体检说：" + String(drain.detail ?? ""), drain.ok === false ? PREVIEW.drainCodex : null);
     }
+  }
+
+  // ⑧ chat 回复路径：两条链的 chat 默认态都靠本机 claude CLI 答话；沙箱里也查（它不碰任何状态）
+  {
+    const cp = chatReplyPathStatus();
+    add("chat_reply_path", "⑧ chat 回复路径（两条链共用本机 claude CLI）", cp.available, cp.available ? "claude CLI 可用（" + cp.version + "）" : "不可用：" + cp.why + " —— 未接入的话题 / 私聊会报 chat_reply_path_unavailable", null);
+  }
+
+  // ⑨ chat 账本：两条链各一份机器级账本；说不清的条目（读不出 / 形状不对 / 认不出）在这里点名 —— 入口拒绝 chat 时指的就是这一项；
+  //    准入盘点看不到的也在这里盘：scratch（年轻的 = 进位中、老的 = 残骸可直接删、形状不对 = 说不清）与锁族
+  //    （reap 段锁复用锁协议自己的投影：在途不算问题，超阈值 / 形状说不清才算；maint 残留只挡维护入口；主锁久持 = 有问题）
+  {
+    const codexBridgeHome = ctx.codexEnv.FEISHU_CODEX_BRIDGE_HOME || path.join(ctx.codexEnv.CODEX_HOME, "feishu-bridge");
+    const ledgers = [["Claude", path.join(ctx.home, ".claude", "feishu-bridge", "inbound", "chat-claims")], ["Codex", path.join(codexBridgeHome, "inbound", "chat-claims")]];
+    const parts = []; const problems = []; const notes = [];
+    for (const [chain, dir] of ledgers) {
+      const load = chatLoad({ ledgerDir: dir, senderId: null, now, budgetMs: chatReplyTimeoutMs() });
+      const scratch = inspectScratch({ ledgerDir: dir, now });
+      parts.push(chain + " 正在答 " + load.running + " 条" + (scratch.inflight > 0 ? "（进位中 " + scratch.inflight + " 个临时文件，不算问题）" : ""));
+      for (const why of load.why) problems.push(chain + "：" + why);
+      for (const why of scratch.problems) problems.push(chain + "：" + why);
+      const locks = inspectAdmissionLocks({ ledgerDir: dir, now });
+      for (const why of locks.problems) problems.push(chain + "：" + why);
+      for (const note of locks.notes) notes.push(chain + "：" + note);
+    }
+    const tail = notes.length > 0 ? "；" + notes.join("；") : "";
+    add("chat_ledger", "⑨ chat 账本（两条链）", problems.length === 0, problems.length === 0 ? parts.join("、") + "；没有说不清的条目" + tail : parts.join("、") + "；说不清 " + problems.length + " 处：" + problems.slice(0, 3).join("；") + tail, null);
   }
 
   // ── 汇总：任一 false → blocked；无 false 有 null → incomplete；全 true → ready

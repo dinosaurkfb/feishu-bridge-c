@@ -22,6 +22,10 @@
 
 import { TOPIC_GENERATION_AUTO_ROTATE_MESSAGES } from "./topic-generation.mjs";
 import { displaySafe } from "./display-safe.mjs";
+import { chatReplyPathStatus } from "./chat-reply.mjs";
+
+/** chat 回复路径一行：两条链共用本机 Claude CLI；不可用就说不可用，不说"已装"。 */
+export const chatPathText = (st) => (st.available ? "claude CLI 可用（" + st.version + "）" : "不可用：" + (st.why ?? "unknown"));
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -405,7 +409,10 @@ export function composeLayeredStatus({
         { n: 1, title: "运行端点连接", rows: L1 },
         { n: 2, title: "事件订阅", rows: L2 },
         { n: 3, title: "精确通道绑定", rows: [["绑定状态", why]] },
-        { n: 4, title: "交互策略", rows: [["交互模式", "尚无通道策略（要先有绑定）"]] },
+        // 只有**确定**未接入才是 chat；登记表 / 绑定状态读不清时不许冒充 chat
+        { n: 4, title: "交互策略", rows: st.reason === "not_bound"
+          ? [["交互模式", "chat（默认态：未接入，只回答；接入后才有 Mapping / Dialogue）"], ["chat 回复路径", chatPathText(chatReplyPathStatus())]]
+          : [["交互模式", "说不清（" + (st.reason ?? "unknown") + "）：绑定状态读不出，既不是接入也不是 chat"]] },
       ],
       // 待处理区也要跟着分开 —— 上一版两种情形共用"不适用（尚未绑定）"，
       // 正是我在第 3 层要求分开的那件事，自己在这里又合回去了。

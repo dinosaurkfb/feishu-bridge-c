@@ -9263,6 +9263,68 @@ test("Codex 控制事务的换绑窗口（评审 #97）：事务锁内核验通�
 });
 
 
+test("Codex 链的 chat 默认态：未绑定会话（群 @ 或私聊）不再拒成'没有等待绑定的 Codex task'，三道闸后同步零工具回答；多份待绑定不再歧义；bind 给指引", () => {
+  const home = temp();
+  const root = path.join(home, "project"); const bin = path.join(home, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  task.session_id = "aily_bound"; task.inbound_state = "bound"; delete task.topic_generation_state; delete task.channel_generation_id;
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({ ...TEMPLATE, senders: [{ open_id: "3333", role: "participant" }] }));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const claudeLog = path.join(home, "claude-argv.jsonl");
+  fs.writeFileSync(path.join(bin, "claude"), ["#!/usr/bin/env node",
+    "require('node:fs').appendFileSync(" + JSON.stringify(claudeLog) + ", JSON.stringify(process.argv.slice(2)) + '\\n');",
+    "process.stdout.write('回答：' + process.argv[process.argv.indexOf('-p') + 1].slice(0, 40) + '\\n');"].join("\n") + "\n", { mode: 0o700 });
+  // Codex 链每次 chat 先核 claude --version（回复路径前置），只数带 -p 的真回答
+  const argvLog = () => (fs.existsSync(claudeLog) ? fs.readFileSync(claudeLog, "utf-8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((a) => a.includes("-p")) : []);
+  let seq = 0;
+  const run = (body, sender, extraEnv = {}) => {
+    seq += 1;
+    const content = '<at id="ou_same" type="employee">M5Codex</at> ' + body;
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_chat_" + seq, sessionID: "aily_dm", role: "user", createdBy: sender, createdAtMs: Date.now(), content } }) }] });
+    return spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], { encoding: "utf-8",
+      env: { ...isolatedEnv(), PATH: bin + path.delimiter + process.env.PATH, FEISHU_CODEX_BRIDGE_HOME: home, HOME: home,
+        AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_chat", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", ...extraEnv } });
+  };
+  const o = run("移除项目", TEMPLATE.frank_sender_id);
+  assert.equal(o.status, 0, o.stdout + o.stderr);
+  assert.match(o.stdout, /^回答：移除项目\n— chat · 这里还没接入本机项目，零工具回答；要它干活先在终端里跑 \/feishu-bind$/mu, "私聊'移除项目'不再被拒成待绑定歧义：" + o.stdout);
+  assert.deepEqual(argvLog()[0].slice(4), ["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-session-persistence", "--safe-mode", "--output-format", "text"], "Codex 链的 chat 也用同一份零工具边界（回答由 claude -p 出，与 Codex 的投递路径无关）");
+  assert.match(run("在吗", "3333").stdout, /^回答：在吗/mu, "participant 在未接入的话题里也能问");
+  assert.match(run("在吗", "4444").stdout, /已拒绝 · 发送者不是授权用户/u, "未登记仍零权限");
+  assert.equal(argvLog().length, 2);
+  // 多份待绑定 task、没带绑定码：以前是"同时有多个 Codex task 等待绑定，无法确定目标"（截图那条），现在是 chat
+  const p1 = makeTaskEntry({ root: path.join(home, "p1"), threadId: THREAD_B, name: "P1", rootMessageId: "om_p1", token: "aaaaaa" });
+  const p2 = makeTaskEntry({ root: path.join(home, "p2"), threadId: "01922222-3333-7444-8555-000000000077", name: "P2", rootMessageId: "om_p2", token: "bbbbbb" });
+  writeRegistryFixtureUnvalidated([task, p1, p2], path.join(home, "registry.json"));
+  const multi = run("移除项目", TEMPLATE.frank_sender_id);
+  assert.match(multi.stdout, /^回答：移除项目/mu, "多份待绑定不再拒成歧义：" + multi.stdout + multi.stderr);
+  assert.doesNotMatch(multi.stdout, /无法确定目标/u);
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  assert.match(run("$feishu-bind", TEMPLATE.frank_sender_id).stdout, /这个话题还没接入任何本机项目。接入要在终端里/u);
+  assert.match(run("$feishu-unbind", TEMPLATE.frank_sender_id).stdout, /已拒绝 · 这个命令不从飞书开放/u);
+  assert.match(run("$feishu-status", TEMPLATE.frank_sender_id).stdout, /\$feishu-status 在这里无从执行/u);
+  assert.equal(argvLog().length, 3, "命令与拒绝都不起模型");
+  // Codex 链的 chat 前置：本机 claude CLI 不可用 → 明确报 chat_reply_path_unavailable，不冒充可用
+  const noClaude = path.join(home, "bin-noclaude"); fs.mkdirSync(noClaude); fs.copyFileSync(path.join(bin, "aily-cli"), path.join(noClaude, "aily-cli")); fs.chmodSync(path.join(noClaude, "aily-cli"), 0o700);
+  const unavailable = run("在吗", TEMPLATE.frank_sender_id, { PATH: noClaude + path.delimiter + path.dirname(process.execPath) + path.delimiter + "/usr/bin:/bin" });
+  assert.notEqual(unavailable.status, 0);
+  assert.match(unavailable.stdout, /这条链的 chat 靠本机 Claude CLI 答话，当前不可用（claude 不在 PATH 上）；没有回答/u, unavailable.stdout + unavailable.stderr);
+  // 已闭合的重放不被路径检查挡住：同一条消息在没有 claude 的 PATH 下重放 → 仍按记录重出
+  const okRun = run("重放我", TEMPLATE.frank_sender_id); assert.match(okRun.stdout, /^回答：重放我/mu, okRun.stdout);
+  const replayId = "msg_chat_" + seq;
+  const replayNoClaude = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], { encoding: "utf-8",
+    env: { ...isolatedEnv(), PATH: noClaude + path.delimiter + path.dirname(process.execPath) + path.delimiter + "/usr/bin:/bin", FEISHU_CODEX_BRIDGE_HOME: home, HOME: home,
+      AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_chat", FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000",
+      FAKE_AILY_ENVELOPE: JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: replayId, sessionID: "aily_dm", role: "user", createdBy: TEMPLATE.frank_sender_id, createdAtMs: Date.now(), content: '<at id="ou_same" type="employee">M5Codex</at> 重放我' } }) }] }) } });
+  assert.equal(replayNoClaude.status, 0, replayNoClaude.stdout + replayNoClaude.stderr);
+  assert.match(replayNoClaude.stdout, /^回答：重放我\n— chat[^\n]*（同一条消息的重放：按记录重出）$/mu, replayNoClaude.stdout);
+  // 安装器 dry-run 与 doctor 都核这一项
+  const installOut = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs")], { encoding: "utf-8", env: { ...isolatedEnv(), PATH: bin + path.delimiter + process.env.PATH, FEISHU_CODEX_BRIDGE_HOME: home, HOME: home } });
+  assert.match(installOut.stdout, /chat 回复  claude CLI 可用（/u, "安装器 dry-run 报 chat 回复路径：" + installOut.stdout.slice(-400) + installOut.stderr.slice(-300));
+});
+
+
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (failed > 0) process.exit(1);

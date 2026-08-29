@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-/** M5Codex 唯一入站入口：确定性校验、原子 claim、精确 thread 非阻塞投递、秒级回执。 */
+/** M5Codex 唯一入站入口：确定性校验、原子 claim、精确 thread 非阻塞投递、秒级回执（唯一例外：无绑定上下文的 chat 默认态是有预算的同步回答，contract §14c）。 */
 
 import { spawn } from "node:child_process";
+import { displaySafe } from "../display-safe.mjs";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -11,7 +12,10 @@ import { moduleRoot } from "../direct-run.mjs";
 import {
   acquireSessionLock, releaseSessionLock, stampSessionLock,
 } from "../handoff.mjs";
-import { REJECT } from "../selector.mjs";
+import { REJECT, normalizeBody } from "../selector.mjs";
+import { evaluateChatGates, CHAT_FALLBACK_REASONS } from "../inbound-route.mjs";
+import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatFailText, chatReplyPathStatus } from "../chat-reply.mjs";
+import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome, lockUnclearedText } from "../chat-ledger.mjs";
 import {
   MAPPING_DISPOSITION, buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
 } from "../mapping-policy.mjs";
@@ -38,10 +42,10 @@ import { controlAckText, runControlTransaction } from "../control-command.mjs";
 import { codexControlPrecondition } from "./control-identity.mjs";
 import { senderRole } from "../sender-roles.mjs";
 import { classifyRisk } from "../risk-class.mjs";
-import { parseInboundIntent, controlRejectText, rejectedControlProjection } from "../inbound-intent.mjs";
+import { INTENT, parseInboundIntent, controlRejectText, rejectedControlProjection } from "../inbound-intent.mjs";
 import { runRejectTransaction } from "../reject-control.mjs";
 import { sameRejectedControl } from "../control-intent.mjs";
-import { authorize } from "../authorize.mjs";
+import { authorize, CAPABILITY } from "../authorize.mjs";
 import { isDirectRun } from "../direct-run.mjs";
 import { composeCrashReceipt } from "../crash-receipt.mjs";
 /**
@@ -95,12 +99,102 @@ const REASON_TEXT = {
   malformed_event: "消息信封字段不完整",
 };
 
+
+// ---------- chat 默认态（无绑定上下文：刚装桥的群话题、私聊、unbind 之后）----------
+// 绑定没成不等于该拒：三道闸之后按 authorize 的 chat 行判权，路由器**同步**起零工具一次性回合，把回答当回执返回。
+// 这里没有 claim（没有绑定就没有账本），也没有任何异步回投通道（运输 agent 的回复 = 本进程的 stdout）。
+function chatTurn({ chain, template, event, dryRun, ledgerDir }) {
+  const messageId = event.message_id ?? ("unknown-" + Date.now());
+  const gates = evaluateChatGates({ event, template });
+  if (!gates.ok) {
+    writeReceipt("chat-rejected-" + messageId, { status: "rejected", mode: CHAT_POLICY_ID, reason: gates.reason, reason_text: gates.reasonText, message_id: messageId, session_id: event.session_id ?? null, claim_acquired: false, handed_off: false });
+    finish("rejected", { reasonText: gates.reasonText, taskName: null }, { reason: gates.reason, mode: CHAT_POLICY_ID });
+  }
+  const instruction = normalizeBody(event.content).trim();
+  const intent = parseInboundIntent({ instruction, chain });
+  const risk = classifyRisk({ intent, mode: CHAT_POLICY_ID });
+  const authz = authorize({ role: gates.role, riskClass: risk.riskClass, mode: CHAT_POLICY_ID, chain });
+  const base = { mode: CHAT_POLICY_ID, role: gates.role, risk_class: risk.riskClass, intent: intent.intent, message_id: messageId, session_id: event.session_id ?? null, claim_acquired: false, handed_off: false };
+  if (!authz.allow) {
+    writeReceipt("chat-authz-" + messageId, { status: "rejected", reason: "not_authorized", authz_reason: authz.reason, required_roles: authz.required, ...base });
+    finish("rejected", { reasonText: authz.text, taskName: null }, { reason: "not_authorized", authz_reason: authz.reason, mode: CHAT_POLICY_ID });
+  }
+  // capability 不是装饰字段：chat 只接受 chat_reply，别的值说不清就拒
+  if (authz.capability !== CAPABILITY.CHAT_REPLY) {
+    writeReceipt("chat-capability-" + messageId, { status: "error", reason: "capability_unknown", capability: authz.capability ?? null, ...base });
+    finish("error", { detail: "这条消息的执行边界说不清（" + String(authz.capability) + "），没有回答" }, { reason: "capability_unknown", mode: CHAT_POLICY_ID });
+  }
+  // 命令命名空间在 chat 里：接入指引 / 不开放 / 形状不对，都是确定性文案，不起模型
+  if (intent.intent === INTENT.REJECTED_CONTROL || intent.intent === INTENT.MALFORMED_CONTROL) {
+    writeReceipt("chat-control-" + messageId, { status: "rejected", reason: intent.intent, word: intent.word, problem: intent.problem, ...base });
+    finish("rejected", { reasonText: controlRejectText(intent), taskName: null }, { reason: intent.intent, word: intent.word, mode: CHAT_POLICY_ID });
+  }
+  if (intent.intent === INTENT.MODEL_CONTROL || intent.intent === INTENT.ROUTER_CONTROL || intent.intent === INTENT.READONLY) {
+    const text = intent.word === "feishu-bind" ? CHAT_BIND_GUIDE : "这个话题还没接入本机项目，" + "$" + intent.word + " 在这里无从执行；" + CHAT_BIND_GUIDE;
+    writeReceipt("chat-guide-" + messageId, { status: "chat", kind: "guide", word: intent.word, ...base });
+    finish("chat", { text }, { mode: CHAT_POLICY_ID, kind: "guide", word: intent.word });
+  }
+  if (dryRun) {
+    process.stdout.write("[dry-run] chat · 会以零工具一次性回合回答（角色 " + gates.role + "，" + risk.riskClass + "），不写状态\n");
+    process.stderr.write(JSON.stringify({ dryRun: true, mode: CHAT_POLICY_ID, role: gates.role, risk: risk.riskClass }) + "\n");
+    process.exit(0);
+  }
+  // 幂等：同一条消息（chain + message_id + session_id）只答一次；重放按记录重出，不再起模型 —— 这一步在任何前置核验之前，已闭合的重放不受当前环境影响
+  const key = chatKey({ chain, messageId, sessionId: event.session_id ?? "" });
+  const seen = inspectChat({ ledgerDir, key });
+  if (seen.state === "answered") {
+    writeReceipt("chat-replay-" + messageId, { status: "chat", kind: "replay", ...base });
+    finish("chat", { text: displaySafe(seen.record.text), replayed: true }, { mode: CHAT_POLICY_ID, kind: "replay" });
+  }
+  // 失败重放：文案只从受控 reason 渲染，账本里存的 why 不进用户文案
+  if (seen.state === "failed") finish("error", { detail: "这条消息上次就没答出来（" + chatFailText(seen.record.reason, { timeoutMs: seen.record.timeout_ms, exitCode: seen.record.exit_code, signal: seen.record.signal }) + "）；同一条消息不会再答，请再发一条新消息" }, { reason: "chat_replay_failed", mode: CHAT_POLICY_ID });
+  if (seen.state === "running") finish("error", { detail: "这条消息还在答，等它答完；不会再起第二个回答" }, { reason: "chat_running", mode: CHAT_POLICY_ID });
+  if (seen.state === "stale") finish("error", { detail: "这条消息上次的回答进程没留下结果；同一条消息不会再答，请再发一条新消息" }, { reason: "chat_stale", mode: CHAT_POLICY_ID });
+  if (seen.state === "unreadable") finish("error", { detail: "这条消息的 chat 账本读不出（" + seen.why + "），没有回答" }, { reason: "chat_ledger_unreadable", mode: CHAT_POLICY_ID });
+  // Codex 链的 chat 也靠本机 Claude CLI 答话（声明并核验的前置）—— 放在既有状态处理之后、只在要起新模型之前：已闭合的重放不被它挡住
+  const pathStatus = chatReplyPathStatus();
+  if (!pathStatus.available) {
+    writeReceipt("chat-path-" + messageId, { status: "error", reason: "chat_reply_path_unavailable", why: pathStatus.why, ...base });
+    finish("error", { detail: "这条链的 chat 靠本机 Claude CLI 答话，当前不可用（" + pathStatus.why + "）；没有回答" }, { reason: "chat_reply_path_unavailable", mode: CHAT_POLICY_ID });
+  }
+  // 准入 —— 一把锁内：盘点（说不清就拒，不折叠成空闲）→ 上界 → 建 claim（闭合转换）
+  const admitted = admitChat({ ledgerDir, key, senderId: event.sender_id, budgetMs: chatReplyTimeoutMs(),
+    meta: { chain, message_id: messageId, session_id: event.session_id ?? null, sender_ref: senderRef(event.sender_id), role: gates.role, risk_class: risk.riskClass } });
+  if (!admitted.ok) {
+    const lockNote = admitted.lockUncleared ? "；另外" + lockUnclearedText(admitted.lockUncleared) : "";
+    if (admitted.reason === "duplicate") finish("error", { detail: "这条消息刚被另一个进程接手回答；不会再起第二个回答" + lockNote }, { reason: "chat_duplicate_race", mode: CHAT_POLICY_ID });
+    if (admitted.reason === "chat_busy_global" || admitted.reason === "chat_busy_sender" || admitted.reason === "chat_admission_busy") {
+      writeReceipt("chat-busy-" + messageId, { status: "rejected", reason: admitted.reason, load: admitted.load ?? null, ...base });
+      finish("rejected", { reasonText: admitted.text + lockNote, taskName: null }, { reason: admitted.reason, mode: CHAT_POLICY_ID });
+    }
+    writeReceipt("chat-ledger-" + messageId, { status: "error", reason: admitted.reason, why: admitted.why ?? admitted.text ?? null, load: admitted.load ?? null, ledger_dir: ledgerDir, ...base });
+    finish("error", { detail: (admitted.text ?? ("chat 账本不可用（" + admitted.reason + (admitted.why ? "：" + admitted.why : "") + "），没有回答")) + lockNote }, { reason: admitted.reason, mode: CHAT_POLICY_ID });
+  }
+  // 锁没交还：飞书正文只给状态词与锁协议的指引（主锁不要手删，持有者已死超过 5 分钟由下一笔按协议回收）；路径与原因只进机器回执
+  const admitNote = admitted.lockUncleared ? "（" + lockUnclearedText(admitted.lockUncleared) + "）" : "";
+  if (admitted.lockUncleared) writeReceipt("chat-lock-" + messageId, { status: "error", reason: "chat_admission_lock_uncleared", why: admitted.lockUncleared, lock_dir: ledgerDir, ...base, claim_acquired: true });
+  // 自己的临时文件没清掉（极少见）：不影响这条回答，doctor ⑨ 会点名；只进机器回执
+  if (admitted.tmpResidue) writeReceipt("chat-tmp-" + messageId, { status: "error", reason: "chat_ledger_tmp_residue", tmp: admitted.tmpResidue, ...base, claim_acquired: true });
+  const reply = chatReply({ instruction });
+  if (!reply.ok) {
+    const recorded = recordChatOutcome({ ledgerDir, key, outcome: { status: "failed", reason: reply.reason, why: reply.why, diagnostic: reply.diagnostic ?? null, elapsed_ms: reply.elapsedMs,
+      ...(reply.reason === "timeout" ? { timeout_ms: reply.timeoutMs } : {}), ...(reply.reason === "nonzero_exit" ? { exit_code: reply.exitCode } : {}), ...(reply.reason === "signaled" ? { signal: reply.signal } : {}) } });
+    writeReceipt("chat-failed-" + messageId, { status: "error", reason: "chat_reply_failed", why: reply.reason, detail: reply.why, diagnostic: reply.diagnostic ?? null, elapsed_ms: reply.elapsedMs, ledger: recorded.ok ? "recorded" : recorded.reason, ledger_lock_uncleared: recorded.lockUncleared ?? null, ledger_tmp_residue: recorded.tmpResidue ?? null, ...base, claim_acquired: true });
+    finish("error", { detail: "chat 没答出来（" + reply.why + "）。这里没有接入，无法稍后补发，请再问一次" + (recorded.ok ? "" : "（账本没记下终态：" + recorded.reason + "）") + admitNote }, { reason: "chat_reply_failed", why: reply.reason, mode: CHAT_POLICY_ID });
+  }
+  const recorded = recordChatOutcome({ ledgerDir, key, outcome: { status: "answered", text: reply.text, elapsed_ms: reply.elapsedMs } });
+  writeReceipt("chat-" + messageId, { status: "chat", kind: "reply", elapsed_ms: reply.elapsedMs, ledger: recorded.ok ? "recorded" : recorded.reason, ledger_lock_uncleared: recorded.lockUncleared ?? null, ledger_tmp_residue: recorded.tmpResidue ?? null, ...base, claim_acquired: true });
+  // 回答已经拿到就要给人；账本没记下只影响重放（会按 stale 处理、不再答），如实标注
+  finish("chat", { text: displaySafe(reply.text), ledgerNote: (recorded.ok ? "" : "（账本没记下这次回答：" + recorded.reason + "；同一条消息的重放不会再答）") + admitNote || null }, { mode: CHAT_POLICY_ID, kind: "reply", elapsed_ms: reply.elapsedMs, role: gates.role, risk_class: risk.riskClass, ledger: recorded.ok ? "recorded" : recorded.reason, lock_uncleared: admitted.lockUncleared ?? null });
+}
+
 function ackText(kind, detail) {
   if (kind === "accepted") return [
     "已受理 · " + detail.taskName,
     "已投递到绑定的 Codex task。严格确认完成后会自动回复到本话题；失败会发送风险回执。",
     "消息 " + detail.messageId.slice(-8) + " | claim " + detail.key.slice(0, 8),
   ].join("\n");
+  if (kind === "chat") return detail.text + "\n" + CHAT_FOOTER + (detail.replayed ? "（同一条消息的重放：按记录重出）" : "") + (detail.ledgerNote ?? "");
   if (kind === "bound") return [
     "绑定完成 · " + detail.taskName,
     "这个话题现在精确通向一个 Codex task。之后在这里 @ M5Codex 即可续接。",
@@ -187,6 +281,9 @@ if (!routed.ok) {
     home: HOME,
     now: promotionNow,
   });
+  // 绑定没成不等于该拒：落进 chat 默认态重新判（与 Claude 链同一份判据）
+  if (!promotion.ok && CHAT_FALLBACK_REASONS.includes(promotion.reason)) chatTurn({ chain: "codex", template: template.template, event, dryRun, ledgerDir: path.join(HOME, "inbound", "chat-claims") });
+
   if (!promotion.ok) {
     const reasonText = REASON_TEXT[promotion.reason] ?? promotion.reason;
     writeReceipt("unrouted-" + (event.message_id ?? Date.now()), {

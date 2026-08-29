@@ -73,7 +73,7 @@ Claude/Codex 长期任务，不会另开一个缺少上下文的临时聊天。
 | 角色 | 用户看到的东西 | 在链路中的职责 |
 |---|---|---|
 | 飞书话题群 | 一个开启话题能力的群组 | 承载多个项目话题；每个根话题是独立的路由和沟通边界 |
-| 第三方智能体 | 群成员中的 M5Codex 或 M5Claude（见下方命名说明） | 接收真实 @mention、返回秒级受理消息，并以同一身份发布最终答复 |
+| 第三方智能体 | 群成员中的 M5Codex 或 M5Claude（见下方命名说明） | 接收真实 @mention、返回秒级受理消息，并以同一身份发布最终答复；未接入的话题 / 私聊按 chat 默认态同步回答（有预算，最长 60 秒） |
 | Aily（现也称「豆包工作伙伴」） | 智能体平台及本机 `aily-cli` runtime/daemon | 把飞书事件和可信事件信封交给本机 adapter；维持第三方智能体与本机的在线连接 |
 | 本机 adapter | Aily 的 `codex-local` 或 `claude-code-local` 类型运行环境 | 调起对应的 Codex/Claude 能力和入站技能 |
 | lark-cli | 本机上的飞书 OpenAPI 命令行客户端 | 由 bridge 调用，创建或编辑根话题，并把最终答复精确发布回原话题；当前不能由 `aily-cli` 替代 |
@@ -224,6 +224,7 @@ session 绑定。日常还可以使用：
 | unbind | `$feishu-unbind` | `/feishu-unbind` | 可恢复地暂停，不删话题、映射或历史 |
 | 入站权限判定（第 2 层 × 第 4 层） | —（路由器内部） | —（路由器内部） | 三道闸之后、拿 claim 之前唯一一处 `authorize({ role, riskClass, mode })`：风险等级 R0 只读 / R1 对话 / R2 执行 / R3 控制 / R4 授权类（`risk-class.mjs`），普通文本在 Dialogue 下是 R1、在 Mapping 下是 R2；交叉表（`authorize.mjs`）：Mapping 只有 owner 可 R2，Dialogue 的 R1 对 owner / operator / participant 都开，R3 / R4 只有 owner，operator 暂与 participant 同权，未登记零权限；拒绝回执写明"哪个模式、哪个角色、缺什么权限"，不取 claim、不投递。放行同时给出执行边界 `capability`：owner `full`（现场 / 续起会话）；其他角色 `reply_only`（零工具、无历史的一次性 `claude -p`，不占会话锁、不碰会话文件，结果照旧发回话题）；Codex 链没有可验证的只回复路径，非 owner 的对话在该链暂不开放（回执说清） |
 | 近似命中收边（第 3 层） | —（路由器内部） | —（路由器内部） | 正文先落进封闭的意图联合（`inbound-intent.mjs`）：readonly / router_control / model_control / rejected_control（unbind、pin-session 不从飞书开放）/ malformed_control（缺参、错参、多尾巴、没这个词、别链前缀）/ authorization / ordinary；风险等级是它的投影。owner 发 rejected / malformed 形状：意图随 claim 持久化 → 锁内拒绝事务记 `rejected` 终态（与 claim 交叉核对）→ `malformed-control-<message_id>` 回执写明差在哪 / 去哪做 → 不投递、不执行；重放同一条消息补齐缺的终态 / 回执；记录损坏或与意图不一致 → 受控错误并指路 `repair-control-claim`；自然语言里顺带提到的命令仍按普通指令 |
+| chat 默认态（第 4 层，未接入） | —（路由器内部） | —（路由器内部） | 无绑定上下文（刚装桥的群话题、私聊、unbind 之后的话题）不再一律拒：三道闸（登记发送者、真实 @、新鲜度）之后按 `authorize` 的 chat 行判权（R1 对 owner / operator / participant 都开；R0 owner / operator；R2 对谁都不开；R3 / R4 只认 owner），路由器**同步**起零工具、无历史的一次性 `claude -p`（`chat-reply.mjs`，边界与 reply_only 同一份 `ZERO_TOOL_ARGS`，默认 60 秒预算）把回答当回执返回，尾行标明未接入；机器级 chat 账本（`chat-ledger.mjs`）：同一条消息只答一次、重放按记录重出，正在答的条数有全局 2 / 每人 1 的上限；路由说不清（同一会话命中多条绑定、登记表有读不清的项）报错而不是降级成 chat；Codex 链的 chat 同样靠本机 claude CLI，安装器 / doctor ⑧ / 状态页都核这一项，不可用就报 chat_reply_path_unavailable；`/feishu-bind` 在这里回接入指引，unbind / pin-session 仍不开放，形状不对仍拒；超时 / 失败如实说，不冒充回答；两条链共用（回答由 `claude -p` 出，与链的投递路径无关）。状态页第 4 层对未接入显示 chat |
 | 发送者角色（第 2 层） | `node scripts/register-sender.mjs --template <该链 chain-config.json> --open-id <数字> --role operator\|participant [--apply]` | 同左 | 往链路模板的 `senders` 登记 / 移除一个人（owner 只有一个，就是 `frank_sender_id`，不在这里登记）；默认预览，写入要 owner 逐次授权；`--remove` 移除。第 1 层只登记与显示（`/feishu-subscribe`、状态页第 2 层「发送者角色」只出数量），入站判定按上一行（角色 × 风险 × 模式）决定 |
 | bind | `$feishu-bind` | `/feishu-bind` | 首次接入，或恢复已暂停的原话题连接 |
 | rotate | `$feishu-rotate` | `/feishu-rotate` | 为同一 binding 创建下一话题代际；旧话题保留为历史（仍可下指令，回复回原话题） |

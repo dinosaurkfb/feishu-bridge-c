@@ -42,7 +42,7 @@
 |---|---|---|---|---|---|---|
 | Mapping | 在本地项目里跑一轮 run（改文件、跑命令），结果发回话题 | R2 执行 | 只有 owner | 绑定后的默认；`/feishu-mode mapping` | `/feishu-mode dialogue` | 已实现 |
 | Dialogue | 一个对话回合，只产生一段回复（非 owner：零工具、无历史的一次性回合 reply_only；owner：照旧进现场 / 续起会话） | R1 对话 | owner / operator / participant | `/feishu-mode dialogue` | 预算耗尽（12 轮 / 2 小时 / 12 单位）、run 失败、人工打断、`/feishu-mode mapping` | 已实现（预算与停止条件有测试） |
-| chat（提议） | 普通问答；不取 claim、不跑 run、不动本机任何东西 | R1 对话 | owner / operator / participant | 无绑定上下文的默认（A、私聊、unbind 之后） | `/feishu-bind` 进入绑定 → Mapping | **未实现**，等 Frank 一句"改 goal，加 chat" |
+| chat（已实现） | 普通问答：路由器同步起零工具一次性回合把回答当回执；不取 claim、不跑 run、不动本机任何东西 | R1 对话 | owner / operator / participant | 无绑定上下文的默认（A、私聊、unbind 之后） | `/feishu-bind` 进入绑定 → Mapping | **未实现**，等 Frank 一句"改 goal，加 chat" |
 | 管理（需求 FR-6） | Agent 之间 observe / advise / execute / modify | — | — | — | — | 未实现，与这套权限不是一回事 |
 
 ## 5. 权限分级
@@ -73,8 +73,8 @@
 | 模式 × 等级 | R0 只读 | R1 对话 | R2 执行 | R3 控制 | R4 授权类 |
 |---|---|---|---|---|---|
 | Mapping | owner | owner | owner | owner | owner |
-| Dialogue | owner | owner / operator / participant | owner | owner | owner |
-| chat（提议） | owner | owner / operator / participant | —（没有目标，"要执行请先 bind"） | owner | owner |
+| Dialogue | owner / operator | owner / operator / participant | owner | owner | owner |
+| chat（已实现） | owner / operator | owner / operator / participant | —（没有目标，"要执行请先 bind"） | owner | owner |
 
 表里没写的格子一律不允许；拒绝必须回执"这个话题处于 X 模式；你的角色是 Y，Rn（描述） 需要 Z 权限"，不投递、不静默、不取 claim（重发是新一笔）。
 
@@ -135,7 +135,7 @@
 | 第 1 层 角色表 | PR #92 `feat/sender-roles` | main 8c5cedc | 五轮，放行 | 已合并 | **已装** 942c01acbdbcf86d（两条链，2026-08-29） |
 | 第 2 层 风险 × 角色 × 模式 + R1 执行边界 | PR #93 `feat/authorize-layer` | 2072c3c | 五轮，放行 | 已合并（main c0cbf87） | **未装** |
 | 第 3 层 近似命中收边 | PR #94 `feat/malformed-control`（base main） | e6c4e0e | 六轮：意图联合、可恢复的拒绝事务、盘点四态、维护入口、锁内核心唯一、生产入口带身份都已认可；前置 #97（控制事务绑定身份）已合入 | 待放行 | — |
-| chat 默认态 | — | — | — | — | Frank 同意，goal 修订稿见 §6b |
+| chat 默认态 + R0 开给 operator | PR #__ `feat/chat-default` | 见 PR | 送审中 | 未合并 | — |
 
 ## 8. 名词对照（防止同名异义）
 

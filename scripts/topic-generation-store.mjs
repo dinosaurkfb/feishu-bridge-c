@@ -8,12 +8,7 @@ import {
   acquirePublishLock, registryPath, releasePublishLock,
 } from "./registry.mjs";
 import {
-  ROTATION_STATUS, closePendingTopicGeneration, failTopicRotation,
-  materializeLegacyTopicFields, prepareTopicRotation, registerPendingTopicGeneration,
-  recordTopicGenerationActivity, resolveMappingOutboundGeneration, topicGenerationStateForLegacy,
-  markPendingClaimReminder,
-  markPendingClaimReminderAbandoned,
-  reserveClaimReminderAttempt,
+  ROTATION_STATUS, closePendingTopicGeneration, failTopicRotation, materializeLegacyTopicFields, prepareTopicRotation, registerPendingTopicGeneration, recordTopicGenerationActivity, resolveMappingOutboundGeneration, topicGenerationStateForLegacy, markPendingClaimReminder, markPendingClaimReminderAbandoned, reserveClaimReminderAttempt, supersedeExpiredAndPrepareTopicRotation,
 } from "./topic-generation.mjs";
 
 const writeJsonAtomic = (file, value) => {
@@ -142,11 +137,14 @@ function mutateClaudeTopicBinding({
 }
 
 export function prepareClaudeTopicRotation({
-  root, claudeSessionId, operationId, registryFile, now = Date.now(),
+  root, claudeSessionId, operationId, registryFile, now = Date.now(), supersedeExpired = false,
 } = {}) {
   return mutateClaudeTopicBinding({
     root, claudeSessionId, registryFile, now,
-    mutate: (state) => prepareTopicRotation(state, { operationId, now }),
+    // supersedeExpired：过期的待认领代际在同一笔锁内退休 + 准备 + 冻结下一代编号（返回 nextGeneration / superseded）
+    mutate: (state) => (supersedeExpired
+      ? supersedeExpiredAndPrepareTopicRotation(state, { operationId, now })
+      : prepareTopicRotation(state, { operationId, now })),
   });
 }
 

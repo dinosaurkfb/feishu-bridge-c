@@ -46,13 +46,13 @@ binding
 
 `$feishu-rotate`（Claude 为 `/feishu-rotate`）执行以下流程：
 
-1. 在生命周期锁内确认 binding active、存在唯一 active 且没有 pending，写入唯一 operation id；
+1. 在生命周期锁内确认 binding active、存在唯一 active 且没有**仍可认领**的 pending，写入唯一 operation id 并冻结下一代编号；已过认领截止的旧式 pending 在同一笔转换里退休（`supersedeExpiredAndPrepareTopicRotation`），根消息与短码按冻结的编号生成，不给另一轮 rotate 留插入窗口；
 2. 释放锁后调用飞书创建新根话题；创建失败时重新加锁把 operation 标为 failed，旧代际不变；
 3. 创建成功后重新加锁，把新根 locator、短码登记为 pending，`claim_expires_at` 默认 null（2026-08-28 起不过期；只有写了显式截止的旧记录才会过期）。无人认领由兜底提醒：等满 72 小时一次、之后每 7 天一次（锁内预留、每周期最多 3 次尝试、结果不明时允许重复；发布锁是 symlink 一步原子取锁、带 token、陈旧回收在 reap 锁下串行 —— 与旧版目录锁不能并行），见 claim-reminder.mjs；
 4. 等待新话题中的真实 mention，等待期间不持锁，旧代际继续 active；
 5. 认领时重新加锁并校验 generation、operation、期限和 session 唯一性；
 6. 在同一 binding 文档的一次临时文件 + `rename` 替换中，将新代际设 active、旧代际设 read-only；
-7. 超时后的下一次认领尝试或显式 `--cancel --apply` 会原子退休 pending，旧 active 不变。
+7. 超时后的下一次认领尝试、显式 `--cancel --apply`、或下一次 rotate（对已过截止的旧式 pending）会原子退休 pending，旧 active 不变。
 
 自动轮转 v1 与显式 rotate 命令复用同一套两阶段事务。每个 active generation 从 0 开始独立计数：
 

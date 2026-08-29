@@ -17,9 +17,7 @@ import {
   topicStateForTask,
 } from "./state.mjs";
 import {
-  ROTATION_STATUS, activeGeneration, pendingGeneration,
-  TOPIC_GENERATION_PREPARING_STALE_MS,
-  TOPIC_GENERATION_AUTO_ROTATE_MESSAGES,
+  ROTATION_STATUS, activeGeneration, pendingGeneration, TOPIC_GENERATION_PREPARING_STALE_MS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, pendingRotationBlocker,
 } from "../topic-generation.mjs";
 import { buildIntentParams, requireIntent } from "./intent.mjs";
 
@@ -40,7 +38,7 @@ if (!thread.ok) die("无法确定当前 Codex task（" + thread.reason + "）。
 const found = findRegisteredTaskForCodexThread({ threadId: thread.threadId });
 if (!found.ok) die("当前 Codex task 尚未接入飞书。");
 const task = found.task;
-const loaded = topicStateForTask(task);
+let loaded = topicStateForTask(task);
 if (!loaded.ok) die("当前 task 的 topic generation 状态不可用（" + loaded.reason + "）。");
 const active = activeGeneration(loaded.state);
 if (!active) die("当前 task 没有 active generation，不能开始轮转。");
@@ -97,27 +95,37 @@ if (cancel) {
   console.log("已取消待认领代际；旧话题仍是唯一 active，未删除任何飞书历史。");
   process.exit(0);
 }
-if (pending) die("已有等待认领的话题代际；请先完成认领或显式取消，不能重复创建。");
-const nextNumber = Math.max(...loaded.state.generations.map((generation) => generation.generation)) + 1;
-const token = bindingToken(loaded.state.binding_id + "\n" + nextNumber);
+const blocker = pendingRotationBlocker(loaded.state);
+if (blocker.kind === "blocked") {
+  die("已有等待认领的话题代际（第 " + blocker.pending.generation + " 代" + (blocker.deadline ? "，认领截止 " + blocker.deadline : "，不过期") +
+    "）；去新话题 @ 完成认领，或 --cancel --apply 显式取消，不能重复创建。");
+}
+if (blocker.kind === "expired") {
+  console.log("过期代际  第 " + blocker.pending.generation + " 代（认领截止 " + blocker.deadline + " 已过）：本次在同一笔锁内作废它并建下一代，话题历史保留");
+}
 const name = task.task_display_name;
 const automaticThreshold = active.activity?.auto_rotate_threshold ?? TOPIC_GENERATION_AUTO_ROTATE_MESSAGES;
-const rootText = composeRootMessage({
-  name,
-  heading: name + " · 第 " + nextNumber + " 代",
-  purpose: automatic
-    ? "当前代际已达到 " + automaticThreshold + " 条有效业务消息；这是同一 Codex task 的下一话题代际，旧话题保留为只读历史。"
-    : "同一 Codex task 的新话题代际；旧话题保留为只读历史。",
-  root: task.root,
-  token,
+const plan = (nextNumber) => ({
+  nextNumber,
+  token: bindingToken(loaded.state.binding_id + "\n" + nextNumber),
+  rootText: composeRootMessage({
+    name,
+    heading: name + " · 第 " + nextNumber + " 代",
+    purpose: automatic
+      ? "当前代际已达到 " + automaticThreshold + " 条有效业务消息；这是同一 Codex task 的下一话题代际，旧话题保留为只读历史。"
+      : "同一 Codex task 的新话题代际；旧话题保留为只读历史。",
+    root: task.root,
+    token: bindingToken(loaded.state.binding_id + "\n" + nextNumber),
+  }),
 });
 const statusText = composeStatusMessage({ name });
+const expectedNext = Math.max(...loaded.state.generations.map((generation) => generation.generation)) + 1;
 
 console.log("任务      " + name);
 console.log("当前代际  " + active.generation);
-console.log("新代际    " + nextNumber + "（" +
-  (automatic ? "自动阈值触发；" : "") + "等待首次真实 mention 后才切换）");
-console.log("\n--- 新根消息 ---\n" + rootText);
+console.log("新代际    " + expectedNext + "（" +
+  (automatic ? "自动阈值触发；" : "") + "等待首次真实 mention 后才切换；编号以 --apply 时锁内冻结的为准）");
+console.log("\n--- 新根消息 ---\n" + plan(expectedNext).rootText);
 if (!apply) {
   console.log("\n[dry-run] 没有创建话题或修改状态。加 --apply 才执行两阶段轮转。");
   process.exit(0);
@@ -125,10 +133,11 @@ if (!apply) {
 
 const operationId = "rotation_" + randomUUID();
 const home = bridgeHome();
-const prepared = prepareTaskTopicRotation({
-  threadId: thread.threadId, operationId, home,
-});
+const prepared = prepareTaskTopicRotation({ threadId: thread.threadId, operationId, home, supersedeExpired: true });
 if (!prepared.ok) die("无法开始轮转（" + prepared.reason + "）。");
+if (prepared.superseded) console.log("已作废    第 " + prepared.superseded.generation + " 代（过期的待认领代际）");
+const { nextNumber, token, rootText } = plan(prepared.nextGeneration);
+if (nextNumber !== expectedNext) console.log("注意      锁内冻结的下一代是第 " + nextNumber + " 代（预告为第 " + expectedNext + " 代）：根消息按冻结的编号生成");
 const template = loadCodexTemplate();
 if (!template.ok) {
   failTaskTopicRotation({ threadId: thread.threadId, operationId, reason: template.reason, home });

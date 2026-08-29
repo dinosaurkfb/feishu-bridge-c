@@ -18,9 +18,11 @@ import { controlIntentProblem, sameControlIntent } from "./control-intent.mjs";
 
 export { CONTROL_MODES, controlIntentProblem, sameControlIntent } from "./control-intent.mjs";
 
+/** feishu-mode 的参数词 —— **唯一一份**：精确形状的正则由它生成，收边的"参数只认 …"文案也引用它。 */
+export const CONTROL_MODE_WORDS = Object.freeze(["dialogue", "mapping"]);
 const SHAPES = {
-  claude: /^\/feishu-mode (dialogue|mapping)$/u,
-  codex: /^\$feishu-mode (dialogue|mapping)$/u,
+  claude: new RegExp("^\\/feishu-mode (" + CONTROL_MODE_WORDS.join("|") + ")$", "u"),
+  codex: new RegExp("^\\$feishu-mode (" + CONTROL_MODE_WORDS.join("|") + ")$", "u"),
 };
 
 /**
@@ -122,7 +124,7 @@ export function readControlFailedRecord({ claimsDir, key }) {
 /** 同一 key 的 consumed 临时制品（写到一半 / rename 失败留下的）：受控形状，报 consumed_in_flight；成功写出后清掉。 */
 export const CONSUMED_TMP_RE = /^([0-9a-f]{64})\.consumed\.json\.tmp\.\d+\.\d+$/u;
 /** 损坏的 failed 记录被隔离后的名字：受控形状，账本按 control_failed_quarantined 报，人工看完再删。 */
-export const CONTROL_QUARANTINE_RE = /^([0-9a-f]{64})\.failed\.quarantined\.\d+\.\d+$/u;
+export const CONTROL_QUARANTINE_RE = /^([0-9a-f]{64})\.(?:failed|rejected)\.quarantined\.\d+\.\d+$/u;
 /** 逐 key 的事务锁（目录，mkdir 原子）：运输层重放、首次执行、维护入口共用同一份所有权。留下没释放的由账本报 control_lock_held。 */
 export const CONTROL_LOCK_RE = /^([0-9a-f]{64})\.control\.lock$/u;
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";

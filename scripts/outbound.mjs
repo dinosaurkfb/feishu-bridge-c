@@ -13,6 +13,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE, CLAIM_STATE } from "./claim.mjs";
 import { CONSUMED_TMP_RE, CONTROL_QUARANTINE_RE, classifyControlLockEntry, inspectControlClaim, readConsumedRecord } from "./control-command.mjs";
+import { inspectRejectedClaim } from "./reject-control.mjs";
 
 import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
 
@@ -250,7 +251,7 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
       const quarantine = CONTROL_QUARANTINE_RE.exec(name);
       if (quarantine) {
         // 维护入口隔离的损坏 failed 制品：不参与状态判定，但必须能盘点到，人看完再删。
-        problems.push({ key: quarantine[1], reason: "control_failed_quarantined", why: "隔离的损坏 failed 制品，人工查看后删除：delivery-claims/" + name.slice(0, 80) });
+        problems.push({ key: quarantine[1], reason: "control_failed_quarantined", why: "隔离的损坏 failed / rejected 制品，人工查看后删除：delivery-claims/" + name.slice(0, 80) });
         continue;
       }
       const m = CLAIM_ENTRY_RE.exec(name);
@@ -275,6 +276,20 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
         // 有控制意图、没终态、也没 failed：事务没闭合 —— 报出来并指路维护入口（同一事件的运输层重放或 repair-control-claim 才能补齐）。
         const seen = inspectControlClaim({ claimsDir, key: m[1] });
         if (seen.state === "in_flight") problems.push({ key: m[1], reason: "consumed_in_flight", why: "控制命令已执行但终态未记下 —— node scripts/repair-control-claim.mjs" });
+        // 收边的拒绝：claim 里有投影、终态缺席 → 事务没闭合（同一条消息的运输层重放或维护入口才能补齐）。
+        if (seen.state === "not_control" && inspectRejectedClaim({ claimsDir, key: m[1] }).state === "rejected_in_flight") {
+          problems.push({ key: m[1], reason: "rejected_in_flight", why: "拒绝已认领但终态未记下 —— 同一条消息的运输层重放会补齐，或 node scripts/repair-control-claim.mjs" });
+        }
+        continue;
+      }
+      if (m[2] === CLAIM_STATE.REJECTED + ".json") {
+        // 收边的拒绝终态：与它的 claim 交叉核对 —— 内容坏 → rejected_unreadable；与投影不一致 → rejected_intent_mismatch；
+        // 没有 claim / claim 读不出 / claim 没有投影 → rejected_orphan。完整且一致才算闭合。
+        const seen = inspectRejectedClaim({ claimsDir, key: m[1] });
+        if (seen.state === "rejected") continue;
+        if (seen.state === "rejected_unreadable") problems.push({ key: m[1], reason: "rejected_unreadable", why: name + "：" + seen.why + " —— node scripts/repair-control-claim.mjs" });
+        else if (seen.state === "rejected_intent_mismatch") problems.push({ key: m[1], reason: "rejected_intent_mismatch", why: name + "：" + seen.why });
+        else problems.push({ key: m[1], reason: "rejected_orphan", why: name + "：" + seen.state + (seen.why ? "：" + seen.why : "") });
         continue;
       }
       if (m[2] === "failed.json") {

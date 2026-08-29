@@ -7,13 +7,15 @@
  * v2：标识符全部换到 Aily 命名空间（见 selector.mjs 顶部说明）。
  */
 
-import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry, normalizeControlText } from "./control-command.mjs";
+import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry, normalizeControlText, CONTROL_MODE_WORDS } from "./control-command.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import { RISK, classifyRisk } from "./risk-class.mjs";
-import { INTENT, parseInboundIntent, controlRejectText } from "./inbound-intent.mjs";
+import { INTENT, parseInboundIntent, controlRejectText, rejectedControlProjection, shown } from "./inbound-intent.mjs";
+import { rejectedRecordProblem, runRejectTransaction, inspectRejectedClaim, resumeRejectedClaim, describeRejectRepair, rejectRepairExitCode } from "./reject-control.mjs";
+import { REJECTED_CONTROL_INTENTS, rejectedControlProblem } from "./control-intent.mjs";
 import { AUTHORIZATION_TABLE, authorize, CAPABILITY, REPLY_ONLY_CAPABLE } from "./authorize.mjs";
 import { SENDER_ROLES, roleCounts, roleCountsText, senderRole, senderRolesProblem, senderTable, roleEntriesProblem } from "./sender-roles.mjs";
 import { parseRegisterSenderArgs, planSenderChange, applySenderChange } from "./register-sender.mjs";
@@ -15799,11 +15801,18 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
   {
     const f = mk();
     const rej = claimKeyFor("rejected-msg");
-    recordClaimState({ claimsDir: f.claims, key: rej, state: "rejected", detail: { reason: "not_mentioned" } });
+    const rejProjection = rejectedControlProjection(parseInboundIntent({ instruction: "/feishu-unbind", chain: "claude" }));
+    writeClaimFixture({ claimsDir: f.claims, key: rej, root: f.h.dir, patch: { rejected_control: rejProjection } });
+    assert.equal(runRejectTransaction({ claimsDir: f.claims, key: rej, projection: rejProjection }).ok, true);
     const cl = claimKeyFor("claimed-only");
     writeClaimFixture({ claimsDir: f.claims, key: cl, root: f.h.dir });
     const inv = inventoryRuns({ runsDir: f.runs, claimsDir: f.claims });
     assert.deepEqual(inv.problems, [], "**受控状态集内的记录不许报成不认识或孤儿**：" + JSON.stringify(inv.problems));
+    // 没有 claim 的 rejected 记录不是健康：报 rejected_orphan（受控形状，不是"不认识"）—— 终态要与 claim 交叉核对（评审 #94）
+    const bareRej = claimKeyFor("rejected-bare");
+    recordClaimState({ claimsDir: f.claims, key: bareRej, state: "rejected", detail: { reason: "not_mentioned" } });
+    assert.equal(inventoryRuns({ runsDir: f.runs, claimsDir: f.claims }).problems.find((x) => x.key === bareRej)?.reason, "rejected_orphan");
+    fs.rmSync(path.join(f.claims, bareRej + ".rejected.json"));
     fs.writeFileSync(path.join(f.claims, claimKeyFor("legacy-df") + ".deliver_failed.json"), "{}");
     const inv2 = inventoryRuns({ runsDir: f.runs, claimsDir: f.claims });
     assert.equal(inv2.problems.length, 1); assert.equal(inv2.problems[0].reason, "unrecognized_entry");
@@ -19543,6 +19552,40 @@ test("近似命中收边（第 3 层）：意图联合唯一、风险是它的�
   }
   assert.equal(classifyRisk({ intent: { intent: "sideways" }, mode: DIALOGUE_POLICY_ID }).riskClass, RISK.R3, "联合之外的值按控制（只有 owner 能过）");
   assert.equal(Object.keys(INTENT).length, 7);
+  assert.deepEqual([...REJECTED_CONTROL_INTENTS], [INTENT.REJECTED_CONTROL, INTENT.MALFORMED_CONTROL], "claim 里的拒绝投影与意图联合同名");
+  // ── 评审 #94 P2-1：mode 参数词只有一份 —— 解析由 parseControlCommand 判，文案引用同一份词表
+  assert.deepEqual([...CONTROL_MODE_WORDS], ["dialogue", "mapping"]);
+  for (const w of CONTROL_MODE_WORDS) assert.equal(I("/feishu-mode " + w, "claude").intent, "router_control", w);
+  assert.equal(problem("/feishu-mode"), "/feishu-mode 缺参数：" + CONTROL_MODE_WORDS.join(" 或 ") + "（查看当前模式走 /feishu-status）");
+  assert.equal(problem("/feishu-mode dialog"), "/feishu-mode 的参数只认 " + CONTROL_MODE_WORDS.join(" / ") + "，收到「dialog」");
+  // ── 评审 #94 P2-2：反射的词 / 参数先净化再按码点截断；原始正文只进 digest
+  assert.equal(problem("/feishu-mode dia\u0007log").includes("\u0007"), false, "控制字符不进文案");
+  assert.match(problem("/feishu-mode dia\u0007log"), /收到「dia\ufffdlog」/u);
+  const long = "😀".repeat(45);
+  assert.equal(problem("/feishu-status " + long), "/feishu-status 不带参数，多了「" + "😀".repeat(40) + "…」", "按 Unicode 码点截到 40 个再加省略号");
+  assert.equal(problem("/feishu-" + long), "没有「/" + Array.from("feishu-" + long).slice(0, 40).join("") + "…」这个命令；飞书里可用：/feishu-status、/feishu-subscribe、/feishu-mode dialogue|mapping、/feishu-bind、/feishu-rotate、/feishu-rotate cancel");
+  assert.equal(I("/feishu-" + long, "claude").word, "feishu-" + long, "word 字段保留原始值（进 digest / 账本），只有展示走净化");
+  assert.equal(shown("a\u0000b"), "a\ufffdb");
+  // ── 拒绝投影与终态记录的封闭形状（验证器各一份）
+  const proj = rejectedControlProjection(I("/feishu-unbind", "claude"));
+  assert.deepEqual(Object.keys(proj).sort(), ["digest", "intent", "problem", "word"]);
+  assert.equal(rejectedControlProblem(proj), null);
+  assert.equal(rejectedControlProjection(I("/feishu-bind", "claude")), null, "只有收边对象才有投影");
+  assert.equal(rejectedControlProjection(I("帮我看看", "claude")), null);
+  assert.notEqual(rejectedControlProjection(I("/feishu-unbind", "claude")).digest, rejectedControlProjection(I("/feishu-unbind now", "claude")).digest, "digest 绑定折叠后的正文");
+  assert.equal(rejectedControlProjection(I("／feishu-unbind", "claude")).digest, proj.digest, "折叠后同一正文同一 digest");
+  for (const [bad, why] of [[null, "不是对象"], [{ ...proj, extra: 1 }, "字段集不对"], [{ ...proj, intent: "router_control" }, "intent 不在受控集合里"], [{ ...proj, word: "" }, "word 缺失"], [{ ...proj, problem: "" }, "problem 缺失"], [{ ...proj, digest: "abc" }, "digest 不是 sha256"]]) {
+    assert.match(rejectedControlProblem(bad) ?? "", new RegExp(why, "u"), JSON.stringify(bad));
+  }
+  assert.equal(rejectedControlProblem(undefined), null, "不在场 = 不是收边对象");
+  const KEY0 = "a".repeat(64);
+  const goodRec = { ...proj, claim_key: KEY0, recorded_at: "2026-08-29T00:00:00.000Z", schema_version: "1.0", state: "rejected" };
+  assert.equal(rejectedRecordProblem(goodRec, KEY0), null);
+  for (const [bad, why] of [[[], "不是记录对象"], [{ ...goodRec, x: 1 }, "字段集不对"], [{ ...goodRec, state: "failed" }, "state 不是 rejected"], [{ ...goodRec, claim_key: "b".repeat(64) }, "claim_key 跟文件名对不上"], [{ ...goodRec, recorded_at: "昨天" }, "recorded_at 不是规范时间"], [{ ...goodRec, digest: "zz" }, "digest 不是 sha256"]]) {
+    assert.match(rejectedRecordProblem(bad, KEY0) ?? "", new RegExp(why, "u"), JSON.stringify(bad));
+  }
+  assert.equal(runRejectTransaction({ claimsDir: os.tmpdir(), key: KEY0, projection: { ...proj, digest: "x" } }).reason, "rejected_intent_invalid");
+  assert.equal(runRejectTransaction({ claimsDir: os.tmpdir(), key: "nope", projection: proj }).reason, "claim_key_invalid");
   // ── Claude 真入口：owner 发不开放 / 不精确的形状 → 取 claim、拒绝终态、回执差在哪、模式不变、不投递
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-malformed-"));
   const root = path.join(local, "project"); const bin = path.join(local, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);
@@ -19587,11 +19630,87 @@ test("近似命中收边（第 3 层）：意图联合唯一、风险是它的�
     assert.equal(typeof rec.problem, "string"); assert.ok(rec.problem.length > 0);
     assert.equal(policyOf(), MAPPING_POLICY_ID, body + "：模式不变");
   }
-  // 重放同一条消息：撞 claim 的幂等，不再记一次、不再回执一次
+  // ── 拒绝事务：意图随 claim 持久化（封闭投影 + 折叠正文的摘要），终态与 claim 交叉核对
+  const claimFor = (id) => {
+    for (const n of fs.readdirSync(claimsDir)) {
+      if (!n.endsWith(".claim")) continue;
+      const c = JSON.parse(fs.readFileSync(path.join(claimsDir, n, "claim.json"), "utf-8"));
+      if (c.message_id === id) return { key: n.slice(0, -".claim".length), claim: c };
+    }
+    return null;
+  };
+  const c2 = claimFor("msg_mal_2");
+  assert.ok(c2, "claim 在");
+  assert.deepEqual(Object.keys(c2.claim.rejected_control).sort(), ["digest", "intent", "problem", "word"]);
+  assert.deepEqual([c2.claim.rejected_control.intent, c2.claim.rejected_control.word, c2.claim.control], ["malformed_control", "feishu-mode", undefined]);
+  assert.match(c2.claim.rejected_control.digest, /^[0-9a-f]{64}$/u);
+  assert.equal(inspectRejectedClaim({ claimsDir, key: c2.key }).state, "rejected");
+  const recFile = path.join(claimsDir, c2.key + ".rejected.json");
+  const recRaw = fs.readFileSync(recFile, "utf-8"); const rec = JSON.parse(recRaw);
+  assert.deepEqual(Object.keys(rec).sort(), ["claim_key", "digest", "intent", "problem", "recorded_at", "schema_version", "state", "word"]);
+  assert.equal(rejectedRecordProblem(rec, c2.key), null);
+  assert.deepEqual([rec.intent, rec.word, rec.digest], [c2.claim.rejected_control.intent, c2.claim.rejected_control.word, c2.claim.rejected_control.digest], "终态与 claim 的投影逐字一致");
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const problemsFor = (key) => inventoryRuns({ runsDir, claimsDir }).problems.filter((p) => p.key === key).map((p) => p.reason);
+  assert.deepEqual(problemsFor(c2.key), [], "闭合的拒绝盘点不报");
+  // 重放（记录完整）：锁内按记录重出回执，不再写；回执文件仍只有一张、标 replayed；记录逐字不变
   const replay = run("/feishu-mode", owner, "msg_mal_2");
-  assert.match(replay.stdout, /已经处理过（幂等命中）/u, replay.stdout);
+  assert.equal(replay.status, 0, replay.stdout + replay.stderr);
+  assert.match(replay.stdout, /缺参数：dialogue 或 mapping.*（同一条消息的重放：按记录重出回执）/u, replay.stdout);
   assert.equal(claimCount(), expectClaims);
-  assert.equal(fs.readdirSync(receiptsDir).filter((n) => n.startsWith("malformed-control-msg_mal_2")).length, 1, "重放不再写第二张收边回执");
+  assert.equal(fs.readdirSync(receiptsDir).filter((n) => n.startsWith("malformed-control-msg_mal_2")).length, 1);
+  assert.deepEqual([receipt("msg_mal_2").replayed, receipt("msg_mal_2").claim_acquired], [true, false]);
+  assert.equal(fs.readFileSync(recFile, "utf-8"), recRaw, "重放不改写记录（逐字节）");
+  // 窗口 1：claim 已取得、终态没写（模拟中断）→ 盘点报 rejected_in_flight；重放同一条消息从 claim 恢复意图、补齐终态并回执
+  fs.rmSync(recFile);
+  assert.equal(inspectRejectedClaim({ claimsDir, key: c2.key }).state, "rejected_in_flight");
+  assert.deepEqual(problemsFor(c2.key), ["rejected_in_flight"]);
+  const resumed = run("/feishu-mode", owner, "msg_mal_2");
+  assert.equal(resumed.status, 0, resumed.stdout + resumed.stderr);
+  assert.match(resumed.stdout, /（补齐了上次没记下的拒绝终态）/u, resumed.stdout);
+  assert.equal(inspectRejectedClaim({ claimsDir, key: c2.key }).state, "rejected");
+  assert.equal(receipt("msg_mal_2").resumed, true);
+  assert.deepEqual(problemsFor(c2.key), [], "补齐后盘点不再报");
+  assert.equal(claimCount(), expectClaims, "补齐不新取 claim");
+  // 窗口 2：终态已写、回执丢了 → 重放重出回执
+  fs.rmSync(path.join(receiptsDir, "malformed-control-msg_mal_2.json"));
+  assert.equal(run("/feishu-mode", owner, "msg_mal_2").status, 0);
+  assert.equal(hasReceipt("msg_mal_2"), true, "回执补回来了");
+  // 记录损坏：受控拒绝（非零退出）、指路维护入口；盘点报 rejected_unreadable；维护入口把坏记录隔离后按 claim 的投影重写；隔离制品盘点得到
+  fs.writeFileSync(recFile, "{broken");
+  const broken = run("/feishu-mode", owner, "msg_mal_2");
+  assert.notEqual(broken.status, 0, "损坏是错误，不是拒绝");
+  assert.match(broken.stdout, /拒绝记录损坏（.+）；没有执行也没有投递。请用维护入口 repair-control-claim/u, broken.stdout);
+  assert.deepEqual([receipt("msg_mal_2").status, receipt("msg_mal_2").tx_reason], ["error", "rejected_unreadable"]);
+  assert.equal(fs.readFileSync(recFile, "utf-8"), "{broken", "受控拒绝不碰坏记录");
+  assert.deepEqual(problemsFor(c2.key), ["rejected_unreadable"]);
+  assert.equal(inspectRejectedClaim({ claimsDir, key: c2.key }).state, "rejected_unreadable");
+  assert.match(describeRejectRepair({ seen: inspectRejectedClaim({ claimsDir, key: c2.key }), result: null, apply: false }), /^\[预览\] 拒绝终态记录损坏（malformed_control · feishu-mode）：不是 JSON\n加 --apply 续做。$/u);
+  const repaired = resumeRejectedClaim({ claimsDir, key: c2.key });
+  assert.equal(repaired.ok, true, JSON.stringify(repaired));
+  assert.equal(repaired.quarantined.length, 1);
+  assert.match(describeRejectRepair({ seen: null, result: repaired, apply: true }), /^已补齐拒绝终态（malformed_control · feishu-mode）；损坏的 rejected 记录已隔离为 .+\.rejected\.quarantined\.\d+\.\d+，人工查看后删除$/u);
+  assert.equal(rejectRepairExitCode({ seen: null, result: repaired, apply: true }), 0);
+  assert.equal(inspectRejectedClaim({ claimsDir, key: c2.key }).state, "rejected");
+  assert.deepEqual(problemsFor(c2.key), ["control_failed_quarantined"], "隔离制品盘点得到，人看完再删");
+  for (const n of fs.readdirSync(claimsDir)) if (n.includes(".rejected.quarantined.")) fs.rmSync(path.join(claimsDir, n));
+  assert.deepEqual(problemsFor(c2.key), []);
+  assert.deepEqual(resumeRejectedClaim({ claimsDir, key: c2.key }).already, true, "已闭合的再续做 = 无需恢复");
+  // 终态与投影不一致：盘点报 rejected_intent_mismatch；事务受控拒绝；维护入口不续做（人看）
+  fs.writeFileSync(recFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(recFile, "utf-8")), word: "feishu-whatever" }));
+  assert.equal(inspectRejectedClaim({ claimsDir, key: c2.key }).state, "rejected_intent_mismatch");
+  assert.deepEqual(problemsFor(c2.key), ["rejected_intent_mismatch"]);
+  const mism = run("/feishu-mode", owner, "msg_mal_2");
+  assert.notEqual(mism.status, 0);
+  assert.match(mism.stdout, /拒绝记录与意图不一致（.+）；没有执行也没有投递。请用维护入口 repair-control-claim/u, mism.stdout);
+  assert.equal(resumeRejectedClaim({ claimsDir, key: c2.key }).ok, false);
+  assert.equal(rejectRepairExitCode({ seen: { state: "rejected_intent_mismatch" }, result: null, apply: true }), 1);
+  fs.writeFileSync(recFile, recRaw);
+  assert.deepEqual(problemsFor(c2.key), []);
+  // 同一消息 id、不同正文的重放：投影对不上 → 落到通用的幂等命中，不碰记录
+  const other = run("/feishu-unbind", owner, "msg_mal_2");
+  assert.match(other.stdout, /已经处理过（幂等命中）/u, other.stdout);
+  assert.equal(fs.readFileSync(recFile, "utf-8"), recRaw);
   // participant 发同样的形状：在 authorize 那层就拒（R3 只有 owner），不取 claim、没有收边回执
   const p = run("/feishu-unbind", "333", "msg_mal_p1");
   assert.match(p.stdout, /你的角色是 participant，R3（控制） 需要 owner 权限/u, p.stdout);

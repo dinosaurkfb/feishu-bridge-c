@@ -9131,9 +9131,26 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
       assert.ok(typeof rec.problem === "string" && rec.problem.length > 0);
       assert.equal(policyOf(), DIALOGUE_POLICY_ID, body + "：模式不变");
     }
+    // 重放：意图从 claim 恢复，锁内按记录重出回执；删掉终态再重放 → 补齐
     const malReplay = runAs("$feishu-mode", TEMPLATE.frank_sender_id, "msg_mal_2");
-    assert.match(malReplay.stdout, /已经处理过（幂等命中）/u, malReplay.stdout);
+    assert.match(malReplay.stdout, /缺参数：dialogue 或 mapping.*（同一条消息的重放：按记录重出回执）/u, malReplay.stdout);
     assert.equal(claimsN(), malClaims, "重放不再取 claim");
+    const malKey = fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).map((n) => n.slice(0, -".claim".length))
+      .find((k) => JSON.parse(fs.readFileSync(path.join(paths.claims, k + ".claim", "claim.json"), "utf-8")).message_id === "msg_mal_2");
+    assert.ok(malKey);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(paths.claims, malKey + ".claim", "claim.json"), "utf-8")).rejected_control.word, "feishu-mode", "投影随 claim 持久化");
+    fs.rmSync(path.join(paths.claims, malKey + ".rejected.json"));
+    const malResumed = runAs("$feishu-mode", TEMPLATE.frank_sender_id, "msg_mal_2");
+    assert.match(malResumed.stdout, /（补齐了上次没记下的拒绝终态）/u, malResumed.stdout);
+    assert.ok(fs.existsSync(path.join(paths.claims, malKey + ".rejected.json")), "终态补齐");
+    assert.equal(JSON.parse(fs.readFileSync(malReceipt("msg_mal_2"), "utf-8")).resumed, true);
+    fs.writeFileSync(path.join(paths.claims, malKey + ".rejected.json"), "{broken");
+    const malBroken = runAs("$feishu-mode", TEMPLATE.frank_sender_id, "msg_mal_2");
+    assert.notEqual(malBroken.status, 0);
+    assert.match(malBroken.stdout, /拒绝记录损坏.*repair-control-claim/u, malBroken.stdout);
+    assert.equal(fs.readFileSync(path.join(paths.claims, malKey + ".rejected.json"), "utf-8"), "{broken", "受控拒绝不碰坏记录");
+    fs.rmSync(path.join(paths.claims, malKey + ".rejected.json"));
+    assert.match(runAs("$feishu-mode", TEMPLATE.frank_sender_id, "msg_mal_2").stdout, /补齐了上次没记下的拒绝终态/u, "坏记录移走后重放又能补齐");
     const malP = runAs("$feishu-unbind", "3333", "msg_mal_p1");
     assert.match(malP.stdout, /你的角色是 participant，R3（控制） 需要 owner 权限/u, malP.stdout);
     assert.equal(fs.existsSync(malReceipt("msg_mal_p1")), false, "participant 在 authorize 那层就拒，没有收边回执");

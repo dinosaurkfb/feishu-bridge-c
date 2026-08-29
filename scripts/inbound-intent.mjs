@@ -15,7 +15,10 @@
  * 风险等级（risk-class.mjs）只是这个联合的投影；入口按 intent 做确定性处置。
  * 身份不在这里验：谁能发哪一类由 authorize.mjs 的交叉表决定。
  */
-import { normalizeControlText, parseControlCommand } from "./control-command.mjs";
+import { createHash } from "node:crypto";
+import { CONTROL_MODE_WORDS, normalizeControlText, parseControlCommand } from "./control-command.mjs";
+import { REJECTED_CONTROL_INTENTS } from "./control-intent.mjs";
+import { displaySafe } from "./display-safe.mjs";
 
 export const INTENT = Object.freeze({
   READONLY: "readonly",
@@ -31,7 +34,6 @@ export const CHAIN_PREFIX = Object.freeze({ claude: "/", codex: "$" });
 const CHAIN_NAME = Object.freeze({ "/": "Claude", "$": "Codex" });
 const NAMESPACE = "feishu-";
 const READONLY_WORDS = Object.freeze(["feishu-status", "feishu-subscribe"]);
-const MODE_ARGS = Object.freeze(["dialogue", "mapping"]);
 /** 不从飞书开放的精确命令词 → 回执里告诉他去哪做。 */
 const REJECTED_WORDS = Object.freeze({
   "feishu-unbind": (p) => `暂停接入不从飞书开放，请在终端里跑 ${p}feishu-unbind`,
@@ -41,7 +43,13 @@ const REJECTED_WORDS = Object.freeze({
 const AUTHORIZATION_RE = /^(?:装|安装|切路由|切权威路由|写飞书|发飞书)(?:\s.+)?$/u;
 
 const availableText = (p) =>
-  `${p}feishu-status、${p}feishu-subscribe、${p}feishu-mode dialogue|mapping、${p}feishu-bind、${p}feishu-rotate、${p}feishu-rotate cancel`;
+  `${p}feishu-status、${p}feishu-subscribe、${p}feishu-mode ${CONTROL_MODE_WORDS.join("|")}、${p}feishu-bind、${p}feishu-rotate、${p}feishu-rotate cancel`;
+/** 回执里反射用户给的词 / 参数：先净化（控制字符、locator 形状），再按 Unicode 码点截断 —— 原始正文只留在 digest 里，不直接展示。 */
+const SHOWN_MAX = 40;
+export function shown(text) {
+  const cps = Array.from(displaySafe(String(text ?? "")));
+  return cps.length > SHOWN_MAX ? cps.slice(0, SHOWN_MAX).join("") + "…" : cps.join("");
+}
 
 /**
  * @param {{ instruction: unknown, chain: "claude"|"codex" }} _
@@ -60,6 +68,7 @@ export function parseInboundIntent({ instruction, chain } = {}) {
   }
   const [word, ...rest] = text.slice(1).split(" ");
   const args = rest.join(" ");
+  const w = shown(word); const a = shown(args);
   const malformed = (problem) => ({ intent: INTENT.MALFORMED_CONTROL, ...base, word, problem });
   const own = CHAIN_PREFIX[chain] ?? null;
   if (own === null) return malformed("这条链说不清是 Claude 还是 Codex，命令没有执行");
@@ -67,22 +76,28 @@ export function parseInboundIntent({ instruction, chain } = {}) {
     return malformed(`前缀「${prefix}」是 ${CHAIN_NAME[prefix]} 链的写法；这个话题是 ${CHAIN_NAME[own]} 链，命令用「${own}」开头`);
   }
   const noArgs = (intent, problem = null) =>
-    args ? malformed(`${own}${word} 不带参数，多了「${args}」`) : { intent, ...base, word, problem };
+    args ? malformed(`${own}${w} 不带参数，多了「${a}」`) : { intent, ...base, word, problem };
   if (READONLY_WORDS.includes(word)) return noArgs(INTENT.READONLY);
   if (word === "feishu-mode") {
-    if (!args) return malformed(`${own}feishu-mode 缺参数：dialogue 或 mapping（查看当前模式走 ${own}feishu-status）`);
-    if (!MODE_ARGS.includes(args)) return malformed(`${own}feishu-mode 的参数只认 dialogue / mapping，收到「${args}」`);
+    if (!args) return malformed(`${own}feishu-mode 缺参数：${CONTROL_MODE_WORDS.join(" 或 ")}（查看当前模式走 ${own}feishu-status）`);
+    // 命中与否只由路由侧的精确解析决定（判据一份）；文案引用同一份参数词表
     const control = parseControlCommand(text, { chain });
-    if (!control) return malformed(`${own}feishu-mode ${args} 没对上路由侧的精确形状`);
+    if (!control) return malformed(`${own}feishu-mode 的参数只认 ${CONTROL_MODE_WORDS.join(" / ")}，收到「${a}」`);
     return { intent: INTENT.ROUTER_CONTROL, ...base, word, control };
   }
   if (word === "feishu-rotate") {
     if (!args || args === "cancel") return { intent: INTENT.MODEL_CONTROL, ...base, word };
-    return malformed(`${own}feishu-rotate 只认不带参数或「cancel」，收到「${args}」`);
+    return malformed(`${own}feishu-rotate 只认不带参数或「cancel」，收到「${a}」`);
   }
   if (word === "feishu-bind") return noArgs(INTENT.MODEL_CONTROL);
   if (Object.hasOwn(REJECTED_WORDS, word)) return noArgs(INTENT.REJECTED_CONTROL, REJECTED_WORDS[word](own));
-  return malformed(`没有「${own}${word}」这个命令；飞书里可用：${availableText(own)}`);
+  return malformed(`没有「${own}${w}」这个命令；飞书里可用：${availableText(own)}`);
+}
+
+/** 进 claim 的拒绝投影（封闭形状，验证器在 control-intent.mjs）：只有 rejected_control / malformed_control 才有，其它为 null。 */
+export function rejectedControlProjection(intent) {
+  if (!intent || !REJECTED_CONTROL_INTENTS.includes(intent.intent)) return null;
+  return { intent: intent.intent, word: intent.word, problem: intent.problem, digest: createHash("sha256").update(intent.text, "utf8").digest("hex") };
 }
 
 /** 拒绝回执正文（手机上读）：说清这一条差在哪 / 去哪做，并明说没有执行、没有投递。 */

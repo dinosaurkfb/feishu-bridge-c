@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-08-29T10:34:29.925Z",
+  "generated_at": "2026-08-29T10:34:30.166Z",
   "modules": {
     "authorize.mjs": [
       "AUTHORIZATION_TABLE",
@@ -72,6 +72,7 @@
       "CONSUMED_TMP_RE",
       "CONTROL_LOCK_RE",
       "CONTROL_MODES",
+      "CONTROL_MODE_WORDS",
       "CONTROL_QUARANTINE_RE",
       "RESUMABLE_CONTROL_STATES",
       "classifyControlLockEntry",
@@ -91,6 +92,14 @@
       "runControlTransaction",
       "sameControlIntent",
       "withControlLock"
+    ],
+    "control-intent.mjs": [
+      "CONTROL_MODES",
+      "REJECTED_CONTROL_INTENTS",
+      "controlIntentProblem",
+      "rejectedControlProblem",
+      "sameControlIntent",
+      "sameRejectedControl"
     ],
     "crash-receipt.mjs": [
       "composeCrashReceipt",
@@ -235,7 +244,9 @@
       "CHAIN_PREFIX",
       "INTENT",
       "controlRejectText",
-      "parseInboundIntent"
+      "parseInboundIntent",
+      "rejectedControlProjection",
+      "shown"
     ],
     "inbound-routes.mjs": [
       "DEFAULT_ROUTES",
@@ -381,6 +392,17 @@
       "registryPath",
       "releasePublishLock",
       "routableProjectsForRoot"
+    ],
+    "reject-control.mjs": [
+      "REJECTED_CONTROL_INTENTS",
+      "RESUMABLE_REJECT_STATES",
+      "describeRejectRepair",
+      "inspectRejectedClaim",
+      "readRejectedRecord",
+      "rejectRepairExitCode",
+      "rejectedRecordProblem",
+      "resumeRejectedClaim",
+      "runRejectTransaction"
     ],
     "repair-control-claim.mjs": [
       "claudeClaimExpectation",

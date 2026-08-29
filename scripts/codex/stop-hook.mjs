@@ -13,6 +13,7 @@ import { extractReply } from "../stop-hook.mjs";
 import { clearTurnInput, readTurnInput } from "../turn-input.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
 import { isDirectRun } from "../direct-run.mjs";
+import { gateBlocks } from "../maintenance-gate-core.mjs";
 import {
   bridgeHome, findTaskForCodexThread, hookLogFile, mappingForTask,
   readThreadActivity, recordThreadActivity, taskPaths,
@@ -34,6 +35,7 @@ function readPayload() {
 }
 
 async function main() {
+  if (gateBlocks().blocked) process.exit(0); // 维护门：无输出退出，不记活动、不起 watch-run；这一轮丢弃（at-most-once）
   const payload = readPayload() ?? {};
   const threadId = payload.session_id;
   if (typeof threadId !== "string" || !threadId) process.exit(0);

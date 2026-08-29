@@ -46,6 +46,7 @@ export { auditOutbox };
 import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
 import { bridgeHome, loadRegistry, registryFile, taskPaths } from "./state.mjs";
+import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 
 const CHAIN = "codex";
 export const LAUNCH_LABEL = "com.frank.feishu-bridge-codex.drain";
@@ -287,6 +288,7 @@ function main() {
   const enable = argv.includes("--enable");
   const disable = argv.includes("--disable");
   const apply = argv.includes("--apply");
+  if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
   if (enable && disable) {
     console.error("--enable 和 --disable 只能给一个。");
     process.exit(1);

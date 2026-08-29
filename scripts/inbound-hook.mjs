@@ -26,6 +26,7 @@ import os from "node:os";
 import path from "node:path";
 import { isDirectRun, moduleDir } from "./direct-run.mjs";
 import { nodeCommandPrefix } from "./shell-quote.mjs";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 const LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "inbound-hook.log");
 const LOG_MAX = 1 << 19;
@@ -125,6 +126,10 @@ async function main() {
   const payload = readStdinJson() ?? {};
 
   log("enter cwd=" + (payload.cwd ?? "-") + " " + envShape());
+
+  // 维护门（issue #81）：门在或读不出 → Aily 回合硬阻断（正文不进模型），本地回合无输出放行；都不写桥状态
+  const gate = gateBlocks();
+  if (gate.blocked) { log("gate " + gate.state); exitForGate(isAilyTransportTurn() ? "hook_block" : "hook_silent", gate); }
 
   // 最热的一条路径：本机绝大多数 prompt 不是 Aily 回合，在这里就退。
   if (!isAilyTransportTurn()) { log("skip not_aily_turn"); process.exit(0); }

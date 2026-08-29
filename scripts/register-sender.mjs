@@ -16,6 +16,7 @@ import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
 import { describeTemplateWrite, loadChainTemplate, validateChainTemplate, withChainTemplateWrite } from "./chain-template.mjs";
 import { SENDER_ROLES, roleCounts, roleCountsText, senderRolesProblem, senderTable } from "./sender-roles.mjs";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 export function parseRegisterSenderArgs(argv) {
   const out = { template: null, openId: null, role: null, note: null, remove: false, apply: false };
@@ -102,6 +103,7 @@ if (isDirectRun(import.meta.url)) {
   process.stdout.write("同步    ：不改 sender_ids（binding 授权快照不需重签）；登记后的角色由第 2 层判定：Mapping 只放 owner，Dialogue 的对话对 operator / participant 开，控制与授权类只认 owner。\n");
   if (!plan.changed) { process.stdout.write("已经是这样，没动。\n"); process.exit(0); }
   if (!parsed.apply) { process.stdout.write("\n[dry-run] 什么都没写。写入是改授权面，要 owner 逐次授权后再加 --apply。\n"); process.exit(0); }
+  { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门
   const done = applySenderChange({ file: parsed.template, change: parsed });
   const out = describeTemplateWrite(done, parsed.template);
   if (done.ok && done.changed) out.lines.splice(1, 0, "角色人数：" + roleCountsText(roleCounts(done.table)));

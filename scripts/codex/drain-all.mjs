@@ -21,6 +21,7 @@ import { remindCodexPendingClaims } from "./claim-reminder.mjs";
 import { isDirectRun } from "../direct-run.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
 import { bridgeHome, loadRegistry, registryFile } from "./state.mjs";
+import { gateBlocks } from "../maintenance-gate-core.mjs";
 
 /**
  * 扫一遍全部登记 task。
@@ -53,6 +54,7 @@ export function sweepEligible({
 }
 
 function main() {
+  if (gateBlocks().blocked) process.exit(0); // 维护门：worker 无输出退出
   const swept = sweepEligible();
   if (!swept.ok) {
     console.error("扫描失败（" + swept.reason + "）—— 一个 task 都没处理。");

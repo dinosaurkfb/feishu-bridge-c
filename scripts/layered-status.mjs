@@ -34,6 +34,7 @@ import { verifyRuntime } from "./runtime-install.mjs";
 import { defaultRouteHandler, routesPath } from "./inbound-routes.mjs";
 import { claimable } from "./subscription.mjs";
 import { roleCounts, roleCountsText } from "./sender-roles.mjs";
+import { readGate } from "./maintenance-gate-core.mjs";
 
 /**
  * 自检结论的人读文案。**导出是为了让测试引用它，而不是复制一份字面量** ——
@@ -82,6 +83,12 @@ export function describePendingWindow(st, { now = Date.now(), full = false } = {
   return "（不设期限，已等待约 " + said + "）";
 }
 
+/** 第 1 层「维护门」一行：三态各说各的；读不出不折成"没开"。 */
+export function maintenanceGateText(g) {
+  if (!g || g.state === "absent") return "没开";
+  if (g.state === "active") return "开着：" + g.payload.reason + "（已 " + Math.floor(g.ageMs / 60000) + " 分钟）—— 入站 / 出站 / 控制命令都在等它关";
+  return "读不出（" + g.why + "）—— 按维护中处理，请在本机跑 doctor";
+}
 /** 第 1 层「入站处理器」一行的措辞：每一态各说各的，不把"运行时之外"说成"已安装"。 */
 export function inboundHandlerText(d) {
   if (!d) return "说不清";
@@ -129,6 +136,7 @@ export function endpointFacts({
     agentName,
     install,
     installReason: verified.ok ? null : verified.reason,
+    maintenanceGate: readGate(),
     version,
     linkCandidate,
     selfCheck,
@@ -357,6 +365,7 @@ export function composeLayeredStatus({
     ["运行时版本", endpoint.version
       ?? (endpoint.linkCandidate ? "未通过校验（链接候选 " + endpoint.linkCandidate + "）" : "未安装")],
     ["入站处理器", inboundHandlerText(endpoint.inboundHandler)],
+    ["维护门", maintenanceGateText(endpoint.maintenanceGate)],
     ["安装状态", endpoint.install === "ok" ? "已安装"
       : endpoint.install === "absent" ? "未安装"
       // 损坏、漂移、链接异常都不是"正常"，也不是"没装"。

@@ -8,6 +8,7 @@
 
 import { isDirectRun } from "./direct-run.mjs";
 import { clearStaleReapLock } from "./registry.mjs";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 export function parseRepairPublishLockArgs(argv) {
   let lock = null;
@@ -71,6 +72,7 @@ if (isDirectRun(import.meta.url)) {
     process.stderr.write("用法：node repair-publish-lock.mjs --lock <发布锁路径> [--apply]（" + parsed.reason + "）\n");
     process.exit(2);
   }
+  if (parsed.apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门
   const r = clearStaleReapLock(parsed.lock, { apply: parsed.apply });
   process.stdout.write(describeReapLockRepair(r, { apply: parsed.apply }) + "\n");
   process.exit(repairExitCode(r, { apply: parsed.apply }));

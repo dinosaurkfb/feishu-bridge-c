@@ -110,6 +110,7 @@ import {
 } from "../dialogue-participant-planner.mjs";
 import { CHAT_SCOPE_PROBE_ARTIFACT_TYPE } from "../dialogue-chat-scope-probe.mjs";
 import { shellQuote } from "../shell-quote.mjs";
+import { createGate } from "../maintenance-gate-core.mjs";
 import {
   DIALOGUE_SHADOW_READINESS_ARTIFACT_TYPE, DIALOGUE_SHADOW_READINESS_DECISION,
   analyzeDialogueShadowEvidence,
@@ -9324,6 +9325,29 @@ test("Codex 链的 chat 默认态：未绑定会话（群 @ 或私聊）不再�
   assert.match(installOut.stdout, /chat 回复  claude CLI 可用（/u, "安装器 dry-run 报 chat 回复路径：" + installOut.stdout.slice(-400) + installOut.stderr.slice(-300));
 });
 
+
+test("维护门（issue #81 · PR A）：Codex 链的 hook / 入站 / 排空 / 控制命令在门前受控退出；Aily 回合用顶层 decision:block 硬阻断", () => {
+  const home = temp(); const gateFile = path.join(home, "maintenance.gate");
+  assert.equal(createGate({ file: gateFile, reason: "换锁协议" }).ok, true);
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };
+  const run = (script, { input = "{}", extra = {}, args = [] } = {}) => spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", script), ...args], { input, encoding: "utf-8", env: { ...env, ...extra } });
+  const aily = run("prompt-hook.mjs", { input: JSON.stringify({ session_id: THREAD_A, turn_id: "t1", cwd: "/work", prompt: "飞书正文" }), extra: { AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "s", AILY_CLI_RUN_ID: "r" } });
+  const decision = JSON.parse(aily.stdout);
+  assert.deepEqual([aily.status, decision.decision, /^桥维护中（换锁协议，已 \d+ 分钟）：这条消息没有处理，请稍后重发$/u.test(decision.reason), Object.keys(decision).sort().join(",")], [0, "block", true, "decision,reason"], "Aily 回合硬阻断（顶层形状，Codex 宿主实测认这个）：" + aily.stdout + aily.stderr);
+  const localTurn = run("prompt-hook.mjs", { input: JSON.stringify({ session_id: THREAD_A, turn_id: "t2", cwd: "/work", prompt: "$feishu-bind" }) });
+  assert.deepEqual([localTurn.status, localTurn.stdout], [0, ""], "本地回合无输出放行（不注入、不留状态）：" + localTurn.stderr);
+  const stop = run("stop-hook.mjs", { input: JSON.stringify({ session_id: THREAD_A, turn_id: "t1", cwd: "/work", last_assistant_message: "x" }) });
+  assert.deepEqual([stop.status, stop.stdout, fs.existsSync(path.join(home, "active-threads"))], [0, "", false], "Stop 无输出退、不记活动：" + stop.stderr);
+  const inbound = run("aily-inbound.mjs", { extra: { AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "s", AILY_CLI_RUN_ID: "r" } });
+  assert.deepEqual([inbound.status, /^桥维护中（换锁协议，已 \d+ 分钟）：这条消息没有处理，请稍后重发\n$/u.test(inbound.stdout), fs.existsSync(path.join(home, "receipts"))], [0, true, false], "入站回维护中、不 claim、不写回执：" + inbound.stdout + inbound.stderr);
+  const direct = run("inbound.mjs", { extra: { AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid } });
+  assert.deepEqual([direct.status, /^桥维护中/u.test(direct.stdout)], [0, true]);
+  const drain = run("drain-all.mjs");
+  assert.deepEqual([drain.status, drain.stdout], [0, ""], "worker 无输出退：" + drain.stderr);
+  const rotate = run("feishu-rotate.mjs", { args: ["--apply"] });
+  assert.deepEqual([rotate.status, /^桥维护中（换锁协议，已 \d+ 分钟）\n$/u.test(rotate.stdout)], [2, true], "控制命令 --apply 退 2：" + rotate.stdout + rotate.stderr);
+});
 
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);

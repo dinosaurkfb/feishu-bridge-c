@@ -12,6 +12,7 @@ import {
 import { storeTurnInput } from "../turn-input.mjs";
 import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
 import { buildIntentParams, issueIntent } from "./intent.mjs";
+import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 
 /**
  * 不带参数的控制命令 —— **只有这一份清单**。
@@ -270,6 +271,9 @@ function readPayload() {
 async function main() {
   const payload = readPayload() ?? {};
   const isRoutedCodexRun = process.env.FEISHU_BRIDGE_ROLE === "codex-run";
+  // 维护门（issue #81）：Aily 回合用宿主的顶层 decision:block 硬阻断（Codex 已实测），其它回合无输出放行
+  const gate = gateBlocks();
+  if (gate.blocked) exitForGate(!isRoutedCodexRun && isAilyInvocation() ? "hook_block" : "hook_silent", gate);
   // M5Codex 的飞书回合也是 codex-local，会继承本机 hooks；它属于入站数据面，必须用
   // developer 级上下文盖过历史回合里可能残留的控制面指令。只给配置中的唯一 agent 注入，
   // 其他 Aily agent fail-closed。确定性 sender/session/mention 校验仍全部留在 inbound.mjs。

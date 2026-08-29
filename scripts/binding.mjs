@@ -29,6 +29,7 @@ import { checkBinding, WARN_DAYS } from "./binding-health.mjs";
 import { projectMappingPath, resolveProject } from "./project-resolve.mjs";
 import { registryPath } from "./registry.mjs";
 import { isDirectRun, moduleRoot } from "./direct-run.mjs";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 const SELF = moduleRoot(import.meta.url, "..");
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -83,6 +84,7 @@ const arg = (n) => {
   return i >= 0 ? process.argv[i + 1] : undefined;
 };
 const apply = process.argv.includes("--apply");
+if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
 
 // 绑定现在有两种住处：老项目在自己目录里，新接入的只在登记表里占一行。
 // 两边都要能看、能续 —— 到期预警的文案指向的就是这条命令，它必须对两种都有效。

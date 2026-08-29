@@ -7,6 +7,10 @@ import { runInboundDispatcher } from "../inbound-dispatcher.mjs";
 import { legacyEndpointId } from "../subscription.mjs";
 import { bridgeHome, loadCodexTemplate } from "./state.mjs";
 import { moduleRoot } from "../direct-run.mjs";
+import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
+
+// 维护门（issue #81）：分发器入口先看门，回"维护中"，不取信封、不 claim
+{ const gate = gateBlocks(); if (gate.blocked) exitForGate("inbound", gate); }
 
 const ROOT = moduleRoot(import.meta.url, "../..");
 const HOME = bridgeHome();

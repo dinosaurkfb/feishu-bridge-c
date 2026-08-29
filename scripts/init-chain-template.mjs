@@ -33,6 +33,7 @@ import {
 /** 模板认识的全部字段。**派生、命令行覆盖、预览必须用同一个集合**，否则只会改一半。 */
 const TEMPLATE_FIELDS = [...CHAIN_FIELDS, ...OPTIONAL_CHAIN_FIELDS];
 import { moduleRoot } from "./direct-run.mjs";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
 
@@ -41,6 +42,7 @@ const arg = (n) => {
   return i >= 0 ? process.argv[i + 1] : undefined;
 };
 const apply = process.argv.includes("--apply");
+if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
 
 /** 字段名 → 命令行开关名。用短横线是为了敲起来顺手，映射只此一处。 */
 const flagOf = (field) => field.replace(/_/g, "-");

@@ -13,6 +13,7 @@
  */
 
 import path from "node:path";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 import {
   SUSPENDED, bindingsForRoot, currentBinding, describeStatus, setBindingStatus,
@@ -23,6 +24,7 @@ const arg = (n) => {
   return i >= 0 ? process.argv[i + 1] : undefined;
 };
 const apply = process.argv.includes("--apply");
+if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
 
 const root = path.resolve(arg("project") ?? process.cwd());
 const claudeSessionId = process.env.CLAUDE_CODE_SESSION_ID;

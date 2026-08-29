@@ -3,6 +3,7 @@
 
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 import {
   DIALOGUE_POLICY_ID, MAPPING_POLICY_ID, interactionPolicySummary,
@@ -51,6 +52,7 @@ function main() {
   console.log("将切换为：" + (mode === DIALOGUE_POLICY_ID
     ? "Dialogue（单主持者·串行；默认 12 轮 / 2 小时 / 12 资源单位）"
     : "Mapping（一次输入对应一次运行；若对话仍在进行会立即中止后续编排）"));
+  { const gate = gateBlocks(); if (process.argv.includes("--apply") && gate.blocked) exitForGate("cli", gate); } // 维护门
   if (!process.argv.includes("--apply")) {
     console.log("[dry-run] 什么都没写。加 --apply 才切换。");
     process.exit(0);

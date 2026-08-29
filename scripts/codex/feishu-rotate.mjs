@@ -20,6 +20,7 @@ import {
   ROTATION_STATUS, activeGeneration, pendingGeneration, TOPIC_GENERATION_PREPARING_STALE_MS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, pendingRotationBlocker,
 } from "../topic-generation.mjs";
 import { buildIntentParams, requireIntent } from "./intent.mjs";
+import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -27,6 +28,7 @@ const arg = (name) => {
 };
 const die = (message) => { console.error(message); process.exit(1); };
 const apply = process.argv.includes("--apply");
+if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
 const cancel = process.argv.includes("--cancel");
 const automatic = process.argv.includes("--automatic");
 const root = path.resolve(arg("project") ?? process.cwd());

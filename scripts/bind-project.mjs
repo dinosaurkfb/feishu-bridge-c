@@ -29,6 +29,7 @@ import {
 import { topicGenerationLockDir } from "./topic-generation-store.mjs";
 import { publishDraft, sendToChat } from "./outbound.mjs";
 import { isDirectRun } from "./direct-run.mjs";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import {
   bindingToken, composeRootMessage, composeStatusMessage, idempotencyKeyFor,
   newRegistryEntry, readProjectIdentity,
@@ -43,6 +44,7 @@ const arg = (n) => {
   return i >= 0 ? process.argv[i + 1] : undefined;
 };
 const apply = process.argv.includes("--apply");
+if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
 
 const root = path.resolve(arg("project") ?? process.cwd());
 

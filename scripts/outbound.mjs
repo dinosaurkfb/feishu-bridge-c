@@ -21,6 +21,7 @@ import { execFileSync } from "node:child_process";
 
 import { parseRunOutcome, readRunOutcome } from "./handoff.mjs";
 import { isDirectRun, moduleRoot } from "./direct-run.mjs";
+import { gateBlocks } from "./maintenance-gate-core.mjs";
 
 const PUBLISHED_MARK = ".published.json";
 export const RUN_PUBLISH_MAX_ATTEMPTS = 5;
@@ -719,6 +720,7 @@ export function parseDirectPublishArgs(tokens) {
 }
 
 if (isDirectRun(import.meta.url)) {
+  if (gateBlocks().blocked) process.exit(0); // 维护门：直接发布入口无输出退出
   const parsed = parseDirectPublishArgs(process.argv.slice(2));
   if (!parsed.ok) {
     console.error("参数不对（" + parsed.reason + (parsed.detail ? "：" + parsed.detail : "") +

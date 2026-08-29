@@ -105,6 +105,7 @@ console.log(renderLayeredStatus(composeLayeredStatus({
     // 路由表也是 Claude 默认值 —— 同一类默认值，这次一起找。
     routesFile: path.join(bridgeHome(), "routes.json"),
     expectedHandler: path.join(codexRuntimeRoot(codexHomeOf()), "current", "scripts", "codex", "inbound.mjs"),
+    expectedRouteId: "codex",
     verify: () => verifyRuntime({ root: codexRuntimeRoot(codexHomeOf()) }),
     // **入站日志也是 Claude 默认值。**我上一版只显式给了 runtime/runtimeDir/verify，
     // 漏了这一个 —— 评审用反例证明：只写一条 Claude 的入站日志，

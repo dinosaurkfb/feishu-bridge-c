@@ -25,6 +25,8 @@ const REASON_TEXT = {
   handler_not_readable: "handler 不可读",
   no_session_id: "缺 --session",
   no_default_route: "路由表里没有默认路由，无从恢复",
+  no_expected_route_id: "缺 --id（本链默认路由的 id：Claude 是 self，Codex 是 codex）",
+  default_route_id_mismatch: "表里的默认路由不是 --id 指定的那条；不改别人的路由，请人工核对",
   no_routes: "没有路由表 —— 分发器本来就用运行时自带的默认处理器，不需要恢复",
   backup_failed: "备份没写成，没有动表",
   session_owned_by_other_route: "这个话题已经登记给别的路由",
@@ -52,9 +54,11 @@ function main() {
   if (process.argv.includes("--restore-default")) {
     const handler = arg("handler");
     const routesArg = arg("routes");
-    // 路由表必须显式给且是绝对路径：两条链各有一张表，默认值只会指向 Claude 那张 —— Codex doctor 抄来的命令不该改错表。
-    if (!handler || !routesArg || !path.isAbsolute(routesArg) || !path.isAbsolute(handler)) {
-      console.error("用法：node scripts/register-route.mjs --restore-default --routes <路由表绝对路径> --handler <处理器绝对路径> [--note <说明>] [--apply]");
+    const expectedRouteId = arg("id");
+    // 路由表与默认路由 id 都必须显式给：两条链各有一张表、各有自己的默认 id，默认值只会指向 Claude 那张 —— Codex doctor 抄来的命令不该改错表，
+    // 也不该在别的路由被标成默认时把它的 handler 换掉。
+    if (!handler || !routesArg || !expectedRouteId || !path.isAbsolute(routesArg) || !path.isAbsolute(handler)) {
+      console.error("用法：node scripts/register-route.mjs --restore-default --routes <路由表绝对路径> --handler <处理器绝对路径> --id <本链默认路由 id> [--note <说明>] [--apply]");
       process.exit(2);
     }
     const file = routesArg;
@@ -62,9 +66,10 @@ function main() {
     const current = table.ok ? (table.routes.find((r) => r.isDefault) ?? (table.routes.length === 1 ? table.routes[0] : null)) : null;
     console.log("路由表  ：" + file);
     console.log("默认路由：" + (current ? current.id + " → " + current.handler : "（没有）"));
+    console.log("要求 id ：" + expectedRouteId + (current && current.id !== expectedRouteId ? "（不符，--apply 会拒绝）" : ""));
     console.log("改为    ：" + handler);
     if (!apply) { console.log("\n[dry-run] 什么都没写。加 --apply 才落盘（切权威路由，需要 Frank 逐次授权）。"); process.exit(0); }
-    const r = restoreDefaultRoute({ handler, note: arg("note") ?? null, file });
+    const r = restoreDefaultRoute({ handler, note: arg("note") ?? null, file, expectedRouteId });
     if (!r.ok) { console.error("没有恢复：" + (REASON_TEXT[r.reason] ?? r.reason) + (r.error ? "：" + r.error : "")); process.exit(1); }
     console.log(r.changed ? "已改：" + r.id + " " + r.from + " → " + r.handler + "\n备份：" + r.backup : "已经是这个处理器，没动。");
     process.exit(0);

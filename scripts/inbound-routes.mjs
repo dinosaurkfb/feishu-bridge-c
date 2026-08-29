@@ -306,7 +306,7 @@ export function registerSession({ sessionId, routeId, file = routesPath() }) {
  *   unreadable  表读不出来
  * others 列出非默认路由里处理器在运行时之外的（cc2cd 那种可能是有意的，按备注分辨）。
  */
-export function defaultRouteHandler({ file = routesPath(), runtimeCurrent, expectedHandler = null } = {}) {
+export function defaultRouteHandler({ file = routesPath(), runtimeCurrent, expectedHandler = null, expectedRouteId = null } = {}) {
   if (typeof runtimeCurrent !== "string" || !runtimeCurrent) return { status: "unreadable", why: "runtimeCurrent 缺失" };
   const table = loadRoutes(file);
   if (!table.ok) return { status: "unreadable", why: String(table.reason ?? "说不清") + (table.problem ? "：" + table.problem : "") };
@@ -320,19 +320,31 @@ export function defaultRouteHandler({ file = routesPath(), runtimeCurrent, expec
   let realRoot = null;
   try { realRoot = fs.realpathSync(runtimeCurrent); } catch { /* 运行时没装：任何 handler 都不可能在它之下 */ }
   const expectedReal = expectedHandler ? realFile(expectedHandler) : null;
-  const judge = (handler) => {
+  // 两道判据分开：others 只问"在不在运行时之内"（别的路由用运行时里另一个处理器是正常的）；默认路由才问"是不是这条链预期的那个"。
+  const withinRuntime = (handler) => {
     if (typeof handler !== "string") return { under: false, why: "handler 不是字符串" };
     const real = realFile(handler);
     if (real === null) return { under: false, why: "不是可解析的普通文件（缺失 / 断链 / 不是文件）" };
     if (realRoot === null || !real.startsWith(realRoot + path.sep)) return { under: false, why: "实际文件在运行时之外：" + real };
-    if (expectedHandler !== null && real !== expectedReal) return { under: false, why: "在运行时目录里但不是这条链预期的处理器（" + String(expectedHandler) + "）：" + real };
+    return { under: true, why: null, real };
+  };
+  const matchesExpected = (handler) => {
+    const w = withinRuntime(handler);
+    if (!w.under) return w;
+    if (expectedHandler !== null && w.real !== expectedReal) return { under: false, why: "在运行时目录里但不是这条链预期的处理器（" + String(expectedHandler) + "）：" + w.real };
     return { under: true, why: null };
   };
   // 先定"有效默认路由"（与 selectRoute 同一规则：标了 default 的，或唯一一条），再算 others —— 否则唯一那条会同时被列成默认和"另有非默认"。
   const dflt = table.routes.find((r) => r.isDefault) ?? (table.routes.length === 1 ? table.routes[0] : null);
-  const others = table.routes.filter((r) => r !== dflt && !judge(r.handler).under).map((r) => ({ id: r.id, handler: r.handler, note: r.note }));
+  const others = table.routes.filter((r) => r !== dflt && !withinRuntime(r.handler).under).map((r) => ({ id: r.id, handler: r.handler, note: r.note }));
   if (!dflt) return { status: "no_default", handler: null, others, why: table.routes.length + " 条路由都没标 default" };
-  const verdict = judge(dflt.handler);
+  // 默认路由必须是这条链自己的那条（Claude self / Codex codex）：别的路由被标成默认，"把它的 handler 换成本链处理器"不是修复，是把别人的话题改判 ——
+  // 所以这是独立状态，不给 handler-only 的自动恢复命令。
+  if (expectedRouteId !== null && dflt.id !== expectedRouteId) {
+    return { status: "wrong_default", id: dflt.id, handler: dflt.handler, note: dflt.note, others, expectedRouteId,
+      why: "默认路由是 " + dflt.id + "，不是这条链的 " + expectedRouteId + "；未登记话题会被投给它" };
+  }
+  const verdict = matchesExpected(dflt.handler);
   return { status: verdict.under ? "runtime" : "outside", id: dflt.id, handler: dflt.handler, note: dflt.note, why: verdict.why, others };
 }
 
@@ -341,7 +353,8 @@ export function defaultRouteHandler({ file = routesPath(), runtimeCurrent, expec
  * 只动默认那一条；先把整张表备份成 <file>.bak.<时间>；同锁、同原子写。
  * 换默认路由是切权威路由 —— 命令行默认只预览，--apply 才写，且要 Frank 逐次授权。
  */
-export function restoreDefaultRoute({ handler, note = null, file = routesPath(), now = new Date() } = {}) {
+export function restoreDefaultRoute({ handler, note = null, file = routesPath(), now = new Date(), expectedRouteId = null } = {}) {
+  if (typeof expectedRouteId !== "string" || !expectedRouteId) return { ok: false, reason: "no_expected_route_id" };
   if (typeof handler !== "string" || !path.isAbsolute(handler)) return { ok: false, reason: "handler_not_absolute" };
   let stat;
   try { stat = fs.statSync(handler); } catch { return { ok: false, reason: "handler_missing", handler }; }
@@ -357,6 +370,8 @@ export function restoreDefaultRoute({ handler, note = null, file = routesPath(),
     const routes = Array.isArray(read.doc.routes) ? read.doc.routes.filter((r) => isPlainObject(r) && r.enabled !== false) : [];
     const dflt = routes.find((r) => r.default === true) ?? (routes.length === 1 ? routes[0] : null);
     if (!dflt) return { ok: false, reason: "no_default_route" };
+    // 只改本链自己的默认路由；默认行是别的 id → 零写入（评审探针：cc2cd 被标默认时，改它的 handler 会把登记到它的话题悄悄改送本链处理器）。
+    if (dflt.id !== expectedRouteId) return { ok: false, reason: "default_route_id_mismatch", id: dflt.id, expectedRouteId };
     const handlerChanged = dflt.handler !== handler;
     const noteChanged = note !== null && (dflt.note ?? null) !== note;
     if (!handlerChanged && !noteChanged) return { ok: true, changed: false, id: dflt.id, handler };

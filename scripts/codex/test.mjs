@@ -2912,7 +2912,7 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
   const rc = routeCheck(drifted);
   assert.equal(rc?.ok, false, JSON.stringify(rc));
   assert.match(rc.detail, /处理器不是装好的运行时：.*dialogue-shadow-handler\.mjs（备注：main@7fd5d2d shadow probe）；.* —— 装到 runtime\/current 的代码没在处理入站/u, rc.detail);
-  assert.match(rc.next, /^node scripts\/register-route\.mjs --restore-default --routes '[^']+' --handler '[^']+codex\/inbound\.mjs' （预览/u, rc.next);
+  assert.match(rc.next, /^node scripts\/register-route\.mjs --restore-default --routes '[^']+' --handler '[^']+codex\/inbound\.mjs' --id 'codex' （预览/u, rc.next);
   assert.equal(drifted.checks.some((c) => c.ok === false), true);
   // Codex doctor 给的恢复命令**原样交给 shell**：改的是 Codex 那张表，Claude 的表一个字不动
   const command = rc.next.slice(0, rc.next.indexOf(" （"));
@@ -2933,6 +2933,10 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
   assert.equal(status.status, 0, status.stderr);
   assert.match(status.stdout, /入站处理器\s+runtime\/current（默认路由 codex）/u, "Codex 状态页第 1 层：" + status.stdout);
   writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
+  // 评审探针（第 3 轮）：别的路由被标默认 → wrong_default ✗、不给 next
+  fs.writeFileSync(path.join(home, "routes.json"), JSON.stringify({ schema_version: "1.0", routes: [{ id: "codex", handler: expectedCodexHandler }, { id: "other", handler: shadow, default: true }], sessions: {} }));
+  const wd = routeCheck(JSON.parse(run().stdout));
+  assert.deepEqual([wd?.ok, /默认路由是 other，不是这条链的 codex/u.test(wd?.detail ?? ""), wd?.next], [false, true, null], JSON.stringify(wd));
   fs.rmSync(path.join(home, "routes.json"));
   // 查不清的那几项要出现在待办里，不能被藏起来。
   assert.ok(healthy.next.some((n) => /hooks/u.test(n)),

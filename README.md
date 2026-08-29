@@ -222,6 +222,7 @@ session 绑定。日常还可以使用：
 |---|---|---|---|
 | status | `$feishu-status` | `/feishu-status` | 只读查看接入、入站绑定和待发状态 |
 | unbind | `$feishu-unbind` | `/feishu-unbind` | 可恢复地暂停，不删话题、映射或历史 |
+| 发送者角色（第 2 层） | `node scripts/register-sender.mjs --template <该链 chain-config.json> --open-id <数字> --role operator\|participant [--apply]` | 同左 | 往链路模板的 `senders` 登记 / 移除一个人（owner 只有一个，就是 `frank_sender_id`，不在这里登记）；默认预览，写入要 owner 逐次授权；`--remove` 移除。第 1 层只登记与显示（`/feishu-subscribe`、状态页第 2 层「发送者角色」只出数量），入站判定仍只放 owner，角色 × 风险 × 模式的判定是第 2 层 |
 | bind | `$feishu-bind` | `/feishu-bind` | 首次接入，或恢复已暂停的原话题连接 |
 | rotate | `$feishu-rotate` | `/feishu-rotate` | 为同一 binding 创建下一话题代际；旧话题保留为历史（仍可下指令，回复回原话题） |
 | mode（飞书侧） | 正文恰为 `$feishu-mode dialogue` / `mapping` | 正文恰为 `/feishu-mode dialogue` / `mapping` | 入站路由器当场切换交互模式并回执，不投递给会话（2026-08-28 起）。"恰为"按词算：不可见字符、不换行/全角空格、全角斜杠先折叠，多一个字仍走普通路径 |

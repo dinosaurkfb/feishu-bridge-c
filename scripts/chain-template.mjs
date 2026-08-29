@@ -14,6 +14,7 @@
  */
 
 import fs from "node:fs";
+import { senderRolesProblem } from "./sender-roles.mjs";
 import os from "node:os";
 import path from "node:path";
 
@@ -55,7 +56,7 @@ export const CHAIN_FIELDS = [
  * 刻意跟必填分开：往 CHAIN_FIELDS 里加一个字段，等于让所有已经生成好的模板
  * 立刻变成「不完整」而全线拒绝 —— 加字段不该是一次静默的破坏性变更。
  */
-export const OPTIONAL_CHAIN_FIELDS = ["lark_cli_config_base", "bridge_root", "aily_cli_bin"];
+export const OPTIONAL_CHAIN_FIELDS = ["lark_cli_config_base", "bridge_root", "aily_cli_bin", "senders"];
 
 /** 项目级字段：每个项目不同，由 bind-project 现场算出来。 */
 export const PROJECT_FIELDS = [
@@ -87,6 +88,7 @@ const SHAPE = {
   lark_cli_home: (v) => typeof v === "string" && v.startsWith("/"),
   lark_cli_config_base: (v) => typeof v === "string" && v.startsWith("/"),
   default_freshness_ms: (v) => typeof v === "number" && Number.isFinite(v) && v > 0,
+  senders: (v) => Array.isArray(v),
 };
 
 /**
@@ -112,6 +114,9 @@ export function validateChainTemplate(tpl) {
   // 否则 outbound_open_id 就是个填了也没人管的装饰字段，而装饰字段迟早烂成过期的谎话
   // （这个项目今天已经被 inbound_prefix 和 LARKSUITE_CLI_HOME 各咬过一次）。
   const inconsistent = [];
+  // 发送者角色表与 frank_sender_id 的交叉校验（唯一判据在 sender-roles.mjs）。
+  const rolesProblem = senderRolesProblem(tpl);
+  if (rolesProblem !== null) inconsistent.push(rolesProblem);
   if (tpl?.outbound_app_id && tpl.outbound_app_id === tpl.transport_app_id &&
       tpl.outbound_open_id !== tpl.transport_open_id) {
     inconsistent.push("outbound_open_id 与 transport_open_id 不一致，但两者是同一个应用");

@@ -4064,6 +4064,19 @@ test("群名优先用 task 自己的覆盖，而不是把知道的说成不知�
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /订阅群.*这条 task 自己的群/u,
     "**已知的 task 群名不许被报成不可用**：" + r.stdout);
+  // 第 1 层角色表：模板带 senders 时 Codex 状态页第 2 层与 $feishu-subscribe 只出角色人数（不出 id）
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({ ...TEMPLATE, senders: [{ open_id: "2222", role: "operator" }, { open_id: "3333", role: "participant" }] }));
+  const withRoles = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A], { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.equal(withRoles.status, 0, withRoles.stderr);
+  assert.match(withRoles.stdout, /发送者角色\s+owner 1 · operator 1 · participant 1（只出数量）/u, withRoles.stdout);
+  assert.doesNotMatch(withRoles.stdout, /2222|3333/u);
+  const sub = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-subscribe.mjs"), "--thread-id", THREAD_A], { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.equal(sub.status, 0, sub.stderr);
+  assert.match(sub.stdout, /发送者角色 owner 1 · operator 1 · participant 1/u, sub.stdout);
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({ ...TEMPLATE, senders: [{ open_id: "9", role: "owner" }] }));
+  const badTpl = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A], { encoding: "utf-8", env: isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home }) });
+  assert.doesNotMatch(badTpl.stdout, /发送者角色\s+owner/u, "坏的角色表不显示成健康：" + badTpl.stdout);
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   // 而且不许把模板那个群的名字套上来。
   assert.doesNotMatch(r.stdout, new RegExp(TEMPLATE.chat_name ?? "___", "u"));
 });

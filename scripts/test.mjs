@@ -12,6 +12,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
+import { SENDER_ROLES, roleCounts, roleCountsText, senderRole, senderRolesProblem, senderTable } from "./sender-roles.mjs";
+import { parseRegisterSenderArgs, planSenderChange, applySenderChange } from "./register-sender.mjs";
 // symlink 锁：existsSync 会跟随到不存在的目标，锁在不在只能用 lstat 判
 const lockPresent = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
 import os from "node:os";
@@ -91,10 +93,7 @@ import {
 import { extractReply } from "./stop-hook.mjs";
 import { postDeliveryBits } from "./publish-outcome.mjs";
 import { foreignHint, projectLabel } from "./stop-note.mjs";
-import {
-  CHAIN_FIELDS, assertPublishIdentity, materializeProjectConfig,
-  resolveLarkIdentity, validateChainTemplate,
-} from "./chain-template.mjs";
+import { CHAIN_FIELDS, assertPublishIdentity, materializeProjectConfig, resolveLarkIdentity, validateChainTemplate } from "./chain-template.mjs";
 import {
   PURPOSE_MAX, bindingToken, composeRootMessage, composeStatusMessage,
   firstSentence, idempotencyKeyFor, newRegistryEntry, readProjectIdentity,
@@ -199,10 +198,7 @@ import {
   buildClaudeSubscriptionProjection, findBindingForSession, findPendingBinding, loadConsumed,
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
-import {
-  SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION,
-  buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId,
-  stableControlId, validateSubscription, claimable } from "./subscription.mjs";
+import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, stableControlId, validateSubscription, claimable } from "./subscription.mjs";
 import {
   ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, topicGenerationStateForLegacy,
   TOPIC_GENERATION_PREPARING_STALE_MS,
@@ -18900,6 +18896,110 @@ test("⑦ 入站默认处理器（issue #88）：分类五态不折叠；doctor 
   m.writeTables({ projects, routes: [], sessions: {}, providers: [] });
   c = checkOf(doctorReport(m.run()), "default_route_handler");
   assert.deepEqual([c.ok, /路由表里没有启用的路由，分发器用运行时自带的默认处理器/u.test(c.detail)], [true, true], "空表 = 运行时默认：" + c.detail);
+});
+
+
+test("发送者角色表（第 1 层）：唯一判据、模板交叉校验、投影 sender_roles 只显示不授权、受控登记入口", () => {
+  // 判据：owner 只有一个且就是 frank_sender_id；别的角色封闭；形状/重复/字段集全拒
+  assert.deepEqual([...SENDER_ROLES], ["owner", "operator", "participant"]);
+  assert.ok(Object.isFrozen(SENDER_ROLES));
+  const base = { ...TPL };
+  assert.equal(senderRolesProblem(base), null, "没有 senders = 只有 owner");
+  assert.deepEqual(senderTable(base), [{ open_id: "12345", role: "owner" }]);
+  assert.deepEqual(senderRole(base, "12345"), "owner");
+  assert.equal(senderRole(base, "999"), null, "未登记 = 零权限");
+  const withRoles = { ...TPL, senders: [{ open_id: "222", role: "operator", note: "同事" }, { open_id: "333", role: "participant" }] };
+  assert.equal(senderRolesProblem(withRoles), null);
+  assert.deepEqual(senderTable(withRoles), [{ open_id: "12345", role: "owner" }, { open_id: "222", role: "operator", note: "同事" }, { open_id: "333", role: "participant" }]);
+  assert.deepEqual([senderRole(withRoles, "222"), senderRole(withRoles, "333"), senderRole(withRoles, "444")], ["operator", "participant", null]);
+  assert.deepEqual(roleCounts(senderTable(withRoles)), { owner: 1, operator: 1, participant: 1 });
+  assert.equal(roleCountsText(roleCounts(senderTable(withRoles))), "owner 1 · operator 1 · participant 1");
+  assert.deepEqual(senderTable({ ...TPL, senders: [{ open_id: "12345", role: "owner" }] }), [{ open_id: "12345", role: "owner" }], "写了 owner 也只出现一次");
+  for (const [label, bad] of [
+    ["不是数组", { a: 1 }], ["不是对象", ["x"]], ["多余字段", [{ open_id: "1", role: "operator", extra: 1 }]],
+    ["open_id 形状", [{ open_id: "ou_x", role: "operator" }]], ["角色不在枚举", [{ open_id: "1", role: "admin" }]],
+    ["note 太长", [{ open_id: "1", role: "operator", note: "x".repeat(81) }]], ["重复", [{ open_id: "1", role: "operator" }, { open_id: "1", role: "participant" }]],
+    ["别人标 owner", [{ open_id: "1", role: "owner" }]], ["frank 标成别的", [{ open_id: "12345", role: "operator" }]],
+  ]) {
+    const problem = senderRolesProblem({ ...TPL, senders: bad });
+    assert.notEqual(problem, null, label);
+    assert.equal(senderTable({ ...TPL, senders: bad }), null, label + "：表不猜");
+    assert.equal(validateChainTemplate({ ...TPL, senders: bad }).ok, false, label + "：模板校验不过");
+  }
+  assert.equal(validateChainTemplate(withRoles).ok, true);
+  // 投影：sender_roles 在场且封闭；sender_ids（授权基准）仍只有 owner
+  const model = buildLegacySubscriptionReadModel({ runtime: "claude", endpointId: "ep", template: withRoles,
+    records: [{ legacy_key: "k", domain_key: "d", local_target_id: "t", status: "active" }] });
+  assert.equal(model.ok, true, JSON.stringify(model));
+  const scope = model.subscriptions[0].scope;
+  assert.deepEqual(scope.sender_ids, ["12345"], "授权基准不变");
+  assert.deepEqual(scope.sender_roles.map((e) => e.role), ["owner", "operator", "participant"]);
+  assert.equal(validateSubscription(model.subscriptions[0]).ok, true);
+  const tampered = JSON.parse(JSON.stringify(model.subscriptions[0]));
+  tampered.scope.sender_roles = [{ open_id: "222", role: "operator" }];
+  assert.ok(validateSubscription(tampered).problems.includes("scope.sender_roles"), "表里必须包含 sender_ids 的每一个 id");
+  tampered.scope.sender_roles = [{ open_id: "12345", role: "boss" }];
+  assert.ok(validateSubscription(tampered).problems.includes("scope.sender_roles"));
+  const badTemplate = buildLegacySubscriptionReadModel({ runtime: "claude", endpointId: "ep", template: { ...TPL, senders: [{ open_id: "1", role: "owner" }] },
+    records: [{ legacy_key: "k", domain_key: "d", local_target_id: "t" }] });
+  assert.deepEqual([badTemplate.ok, badTemplate.problems], [false, ["template.senders"]]);
+  // 显示：状态页第 2 层与 subscribe 都只出数量
+  const facts = subscriptionFacts(model, { groupName: "群", templateChatId: "oc_abc" });
+  assert.deepEqual(facts.items[0].roleCounts, { owner: 1, operator: 1, participant: 1 });
+  const legacyModel = JSON.parse(JSON.stringify(model)); delete legacyModel.subscriptions[0].scope.sender_roles;
+  assert.deepEqual(subscriptionFacts(legacyModel, {}).items[0].roleCounts, { owner: 1, operator: 0, participant: 0 }, "旧投影按 sender_ids 都是 owner 算");
+  // 受控登记入口：预览不写、apply 备份+原子写+读回；owner 不可登记；重复幂等；移除
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-sender-roles-"));
+  const tplFile = path.join(home, "chain-config.json");
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  const cli = (...args) => spawnSync(process.execPath, [path.resolve("scripts", "register-sender.mjs"), ...args], { encoding: "utf-8", env: { ...process.env, HOME: home } });
+  assert.equal(cli().status, 2);
+  assert.equal(cli("--template", "relative.json", "--open-id", "222", "--role", "operator").status, 2, "模板必须是绝对路径");
+  assert.equal(cli("--template", tplFile, "--open-id", "222", "--role", "owner").status, 2, "owner 不在这里登记");
+  assert.equal(cli("--template", tplFile, "--open-id", "ou_x", "--role", "operator").status, 2);
+  const preview = cli("--template", tplFile, "--open-id", "222", "--role", "operator", "--note", "同事");
+  assert.equal(preview.status, 0, preview.stdout + preview.stderr);
+  assert.match(preview.stdout, /登记 222 → operator[\s\S]*角色人数：owner 1 · operator 1 · participant 0（改后）[\s\S]*\[dry-run\] 什么都没写/u, preview.stdout);
+  assert.deepEqual(JSON.parse(fs.readFileSync(tplFile, "utf-8")), TPL, "预览不写");
+  const applied = cli("--template", tplFile, "--open-id", "222", "--role", "operator", "--note", "同事", "--apply");
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  assert.match(applied.stdout, /已写入。备份：/u);
+  const written = JSON.parse(fs.readFileSync(tplFile, "utf-8"));
+  assert.deepEqual(written.senders, [{ open_id: "222", role: "operator", note: "同事" }]);
+  assert.equal(written.frank_sender_id, TPL.frank_sender_id, "其余字段原样");
+  assert.ok(fs.readdirSync(home).some((n) => n.startsWith("chain-config.json.bak.")), "先备份");
+  assert.equal(validateChainTemplate(written).ok, true);
+  const again = cli("--template", tplFile, "--open-id", "222", "--role", "operator", "--note", "同事", "--apply");
+  assert.match(again.stdout, /已经是这样，没动/u);
+  const frankAsOperator = cli("--template", tplFile, "--open-id", TPL.frank_sender_id, "--role", "operator", "--apply");
+  assert.deepEqual([frankAsOperator.status, /owner_immutable/u.test(frankAsOperator.stdout)], [1, true], frankAsOperator.stdout);
+  const changed = cli("--template", tplFile, "--open-id", "222", "--role", "participant", "--apply");
+  assert.equal(changed.status, 0, changed.stdout);
+  assert.equal(JSON.parse(fs.readFileSync(tplFile, "utf-8")).senders[0].role, "participant");
+  const removed = cli("--template", tplFile, "--remove", "--open-id", "222", "--apply");
+  assert.equal(removed.status, 0, removed.stdout);
+  assert.deepEqual(JSON.parse(fs.readFileSync(tplFile, "utf-8")).senders, []);
+  assert.deepEqual([cli("--template", tplFile, "--remove", "--open-id", "222", "--apply").status], [1], "没登记过的移除 → 拒");
+  // 纯函数层：结果模板必须过同一份校验；apply 读回失败要报
+  assert.equal(planSenderChange(TPL, { openId: "222", role: "operator" }).ok, true);
+  assert.equal(planSenderChange(TPL, { openId: TPL.frank_sender_id, role: "operator" }).reason, "owner_immutable");
+  assert.equal(planSenderChange({ ...TPL, senders: [{ open_id: "1", role: "owner" }] }, { openId: "222", role: "operator" }).reason, "template_senders_invalid");
+  assert.equal(parseRegisterSenderArgs(["--template", "/x.json", "--open-id", "1", "--role", "admin"]).reason, "role_unknown");
+  // 真入口：/feishu-subscribe 与状态页第 2 层显示角色人数（只出数量，不出 id）
+  const registryFile = path.join(home, "registry.json");
+  const root = path.join(home, "project"); fs.mkdirSync(root);
+  fs.writeFileSync(tplFile, JSON.stringify(withRoles));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "roles", root, name: "角色演示", root_message_id: "om_r", expires_at: "2099-01-01T00:00:00Z",
+    session_id: "aily_roles", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z" }] }));
+  const env = { ...process.env, HOME: home, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile };
+  const sub = spawnSync(process.execPath, [path.resolve("scripts", "feishu-subscribe.mjs"), "--project", root], { encoding: "utf-8", env });
+  assert.equal(sub.status, 0, sub.stderr);
+  assert.match(sub.stdout, /发送者角色 owner 1 · operator 1 · participant 1/u, sub.stdout);
+  assert.doesNotMatch(sub.stdout, /222|333/u, "不出身份");
+  const st = spawnSync(process.execPath, [path.resolve("scripts", "feishu-status.mjs"), "--project", root], { encoding: "utf-8", env });
+  assert.equal(st.status, 0, st.stderr);
+  assert.match(st.stdout, /发送者角色\s+owner 1 · operator 1 · participant 1（只出数量）/u, st.stdout);
+  assert.doesNotMatch(st.stdout, /222|333/u);
 });
 
 

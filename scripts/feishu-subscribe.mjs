@@ -43,6 +43,7 @@
  */
 
 import path from "node:path";
+import { roleCounts, roleCountsText } from "./sender-roles.mjs";
 
 import { isDirectRun } from "./direct-run.mjs";
 import { buildClaudeSubscriptionProjection } from "./inbound-route.mjs";
@@ -94,6 +95,7 @@ export function subscriptionDetails(model, { groupName = null, templateChatId = 
     groupName: (templateChatId !== null && s.scope?.chat_id === templateChatId)
       ? groupName : null,
     senderCount: (s.scope?.sender_ids ?? []).length,
+    roleCounts: roleCounts(s.scope?.sender_roles ?? (s.scope?.sender_ids ?? []).map((id) => ({ open_id: id, role: "owner" }))),
     eventTypes: [...(s.scope?.event_types ?? [])],
     freshnessMs: Number.isFinite(s.constraints?.freshness_ms) ? s.constraints.freshness_ms : null,
     version: s.version ?? null,
@@ -119,6 +121,7 @@ export function renderSubscriptions(view, { source = null } = {}) {
     lines.push("订阅状态  " + s.status + (s.version ? " · v" + s.version : ""));
     lines.push("订阅群    " + (s.groupName ?? "群名不可用（只有群 ID，不拿 ID 顶替）"));
     lines.push("授权发送者 " + s.senderCount + " 个（只出数量，不出身份）");
+    lines.push("发送者角色 " + roleCountsText(s.roleCounts) + "（第 1 层只登记；非 owner 的入站判定在第 2 层接入前仍按今天的规则拒绝）");
     lines.push("事件范围  " + (s.eventTypes.join("、") || "未声明"));
     lines.push("新鲜度    " + (s.freshnessMs === null ? "未声明"
       : Math.round(s.freshnessMs / MINUTE) + " 分钟内的事件才受理"));

@@ -7,6 +7,7 @@
  */
 
 import crypto from "node:crypto";
+import { SENDER_ROLES, senderRolesProblem, senderTable } from "./sender-roles.mjs";
 
 export const SUBSCRIPTION_SCHEMA_VERSION = "1.0";
 export const SUBSCRIPTION_ARTIFACT_TYPE = "feishu_bridge_subscription";
@@ -66,6 +67,17 @@ export function validateSubscription(subscription) {
   if (uniqueStrings(scope?.event_types).length !== scope?.event_types?.length || !scope?.event_types?.length) {
     problems.push("scope.event_types");
   }
+  // sender_roles 可选；在场就必须封闭、不重复、角色在枚举里，且每个 sender_ids 里的 id 都得在表里（sender_ids 是授权基准，表不能少它）
+  if (scope?.sender_roles !== undefined) {
+    const roles = scope.sender_roles;
+    const okShape = Array.isArray(roles) && roles.every((e) => e && typeof e === "object" && !Array.isArray(e) &&
+      typeof e.open_id === "string" && e.open_id.length > 0 && SENDER_ROLES.includes(e.role) &&
+      Object.keys(e).every((k) => ["open_id", "role", "note"].includes(k)));
+    const ids = okShape ? roles.map((e) => e.open_id) : [];
+    if (!okShape || uniqueStrings(ids).length !== ids.length || !(scope.sender_ids ?? []).every((id) => ids.includes(id))) {
+      problems.push("scope.sender_roles");
+    }
+  }
   if (typeof subscription?.constraints?.freshness_ms !== "number" ||
       !Number.isFinite(subscription.constraints.freshness_ms) || subscription.constraints.freshness_ms <= 0) {
     problems.push("constraints.freshness_ms");
@@ -98,6 +110,7 @@ export function buildLegacySubscriptionReadModel({
   if (!nonEmpty(template?.agent_uid)) problems.push("template.agent_uid");
   if (!nonEmpty(template?.transport_open_id)) problems.push("template.transport_open_id");
   if (!nonEmpty(template?.frank_sender_id)) problems.push("template.frank_sender_id");
+  if (nonEmpty(template?.frank_sender_id) && senderRolesProblem(template) !== null) problems.push("template.senders");
   if (!nonEmpty(template?.chat_id)) problems.push("template.chat_id");
   if (typeof template?.default_freshness_ms !== "number" ||
       !Number.isFinite(template.default_freshness_ms) || template.default_freshness_ms <= 0) {
@@ -144,6 +157,8 @@ export function buildLegacySubscriptionReadModel({
           transport_open_id: template.transport_open_id,
           chat_id: chatId,
           sender_ids: uniqueStrings([template.frank_sender_id]),
+          // 角色表（第 1 层）：只做显示与登记；授权基准仍是 sender_ids（只有 owner），第 2 层接入判定时才换。
+          sender_roles: senderTable(template) ?? [{ open_id: template.frank_sender_id, role: "owner" }],
           event_types: [MESSAGE_RECEIVE_EVENT],
         },
         constraints: { freshness_ms: template.default_freshness_ms },

@@ -29,6 +29,7 @@ import path from "node:path";
 import { verifyRuntime } from "./runtime-install.mjs";
 import { defaultRouteHandler, routesPath } from "./inbound-routes.mjs";
 import { claimable } from "./subscription.mjs";
+import { roleCounts, roleCountsText } from "./sender-roles.mjs";
 
 /**
  * 自检结论的人读文案。**导出是为了让测试引用它，而不是复制一份字面量** ——
@@ -174,6 +175,8 @@ export function subscriptionFacts(model, {
     groupName: (templateChatId !== null && s.scope?.chat_id === templateChatId)
       ? groupName : null,
     senderCount: (s.scope?.sender_ids ?? []).length,
+    // 角色人数只出数量：表不在场（旧投影）就按 sender_ids 都是 owner 算 —— 那正是今天的语义。
+    roleCounts: roleCounts(s.scope?.sender_roles ?? (s.scope?.sender_ids ?? []).map((id) => ({ open_id: id, role: "owner" }))),
     eventTypes: [...(s.scope?.event_types ?? [])],
   }));
   // **待认领要用跟热路径同一个判据。**直接取数组长度会把已绑定、暂停、过期的
@@ -380,6 +383,7 @@ export function composeLayeredStatus({
       L2.push(["订阅状态", s.status]);
       L2.push(["订阅群", s.groupName ?? "群名不可用（只有群 ID，不拿 ID 顶替）"]);
       L2.push(["授权发送者", s.senderCount + " 个"]);
+      L2.push(["发送者角色", roleCountsText(s.roleCounts) + "（只出数量）"]);
       L2.push(["事件范围", s.eventTypes.join("、") || "未声明"]);
     }
     if (subscription.pendingCount > 0) {

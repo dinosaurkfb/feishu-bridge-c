@@ -13,6 +13,7 @@ import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import { RISK, classifyRisk } from "./risk-class.mjs";
+import { INTENT, parseInboundIntent, controlRejectText } from "./inbound-intent.mjs";
 import { AUTHORIZATION_TABLE, authorize, CAPABILITY, REPLY_ONLY_CAPABLE } from "./authorize.mjs";
 import { SENDER_ROLES, roleCounts, roleCountsText, senderRole, senderRolesProblem, senderTable, roleEntriesProblem } from "./sender-roles.mjs";
 import { parseRegisterSenderArgs, planSenderChange, applySenderChange } from "./register-sender.mjs";
@@ -19485,6 +19486,127 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
   assert.match(run("安装 PR #93", "333").stdout, /R4（授权类） 需要 owner 权限/u);
   assert.match(run("写飞书", "222").stdout, /你的角色是 operator，R4（授权类） 需要 owner 权限/u);
   assert.equal(claimCount(), claimsBeforeNs, "这些拒绝都不取 claim");
+  assert.equal(policyOf(), DIALOGUE_POLICY_ID);
+});
+
+
+test("近似命中收边（第 3 层）：意图联合唯一、风险是它的投影；真入口对不开放 / 不精确的命令形状取 claim、记拒绝终态、回执差在哪、不投递", () => {
+  const I = (instruction, chain) => parseInboundIntent({ instruction, chain });
+  // ── 封闭联合逐形状（Claude 链）；Codex 链把前缀对调后结论必须一致
+  const cases = [
+    ["/feishu-status", "readonly"], ["/feishu-subscribe", "readonly"],
+    ["/feishu-mode dialogue", "router_control"], ["/feishu-mode mapping", "router_control"],
+    ["/feishu-bind", "model_control"], ["/feishu-rotate", "model_control"], ["/feishu-rotate cancel", "model_control"],
+    ["/feishu-unbind", "rejected_control"], ["/feishu-pin-session", "rejected_control"],
+    ["/feishu-mode", "malformed_control"], ["/feishu-mode dialog", "malformed_control"], ["/feishu-mode dialogue 谢谢", "malformed_control"],
+    ["/feishu-status now", "malformed_control"], ["/feishu-bind foo", "malformed_control"], ["/feishu-rotate now", "malformed_control"],
+    ["/feishu-unbind now", "malformed_control"], ["/feishu-unsubscribe", "malformed_control"], ["/feishu-whatever", "malformed_control"],
+    ["$feishu-mode dialogue", "malformed_control"], ["$feishu-status", "malformed_control"],
+    ["装 8c5cedc", "authorization"], ["写飞书", "authorization"], ["安装 PR #93", "authorization"],
+    ["记得 /feishu-mode dialogue 这条命令", "ordinary"], ["feishu-mode dialogue", "ordinary"], ["帮我看看", "ordinary"], ["", "ordinary"], ["装修一下", "ordinary"],
+  ];
+  const swap = (t) => (t.startsWith("/") ? "$" + t.slice(1) : t.startsWith("$") ? "/" + t.slice(1) : t);
+  for (const [t, expect] of cases) {
+    assert.equal(I(t, "claude").intent, expect, "claude: " + t);
+    assert.equal(I(swap(t), "codex").intent, expect, "codex: " + swap(t));
+  }
+  assert.deepEqual(I("/feishu-mode dialogue", "claude").control, { kind: "mode", mode: DIALOGUE_POLICY_ID }, "router_control 带着路由侧解析结果");
+  assert.deepEqual(I("$feishu-mode mapping", "codex").control, { kind: "mode", mode: MAPPING_POLICY_ID });
+  for (const t of ["/feishu-status", "/feishu-bind", "/feishu-unbind", "/feishu-mode", "装", "帮我看看"]) assert.equal(I(t, "claude").control, null, t + "：只有 router_control 有 control");
+  assert.equal(I("／feishu-mode\u00a0dialogue", "claude").intent, "router_control", "不可见字符 / 全角前缀先折叠（与 parseControlCommand 同一份折叠）");
+  assert.equal(I("/feishu-mode dialogue", "turbo").intent, "malformed_control", "链说不清 → 不折叠成普通文本");
+  assert.equal(I(undefined, "claude").intent, "ordinary");
+  // ── 差在哪 / 去哪做：逐字钉住每一支
+  const problem = (t, chain = "claude") => I(t, chain).problem;
+  assert.match(problem("/feishu-mode"), /缺参数：dialogue 或 mapping/u);
+  assert.match(problem("/feishu-mode dialog"), /只认 dialogue \/ mapping，收到「dialog」/u);
+  assert.match(problem("/feishu-mode dialogue 谢谢"), /只认 dialogue \/ mapping，收到「dialogue 谢谢」/u);
+  assert.match(problem("/feishu-status now"), /\/feishu-status 不带参数，多了「now」/u);
+  assert.match(problem("/feishu-rotate now"), /只认不带参数或「cancel」，收到「now」/u);
+  assert.match(problem("$feishu-mode dialogue"), /前缀「\$」是 Codex 链的写法；这个话题是 Claude 链，命令用「\/」开头/u);
+  assert.match(problem("/feishu-mode dialogue", "codex"), /前缀「\/」是 Claude 链的写法；这个话题是 Codex 链，命令用「\$」开头/u);
+  assert.match(problem("/feishu-unsubscribe"), /没有「\/feishu-unsubscribe」这个命令；飞书里可用：\/feishu-status、\/feishu-subscribe、\/feishu-mode dialogue\|mapping、\/feishu-bind、\/feishu-rotate、\/feishu-rotate cancel/u);
+  assert.match(problem("$feishu-whatever", "codex"), /没有「\$feishu-whatever」这个命令；飞书里可用：\$feishu-status/u);
+  assert.match(problem("/feishu-unbind"), /暂停接入不从飞书开放，请在终端里跑 \/feishu-unbind/u);
+  assert.match(problem("/feishu-pin-session"), /钉会话不从飞书开放，请在终端里跑 \/feishu-pin-session/u);
+  assert.match(problem("$feishu-unbind", "codex"), /请在终端里跑 \$feishu-unbind$/u, "指路按本链前缀");
+  for (const t of ["/feishu-status", "/feishu-mode dialogue", "/feishu-bind", "装", "帮我看看"]) assert.equal(problem(t), null, t + "：没问题就没有 problem");
+  assert.equal(controlRejectText(I("/feishu-unbind", "claude")), "这个命令不从飞书开放：暂停接入不从飞书开放，请在终端里跑 /feishu-unbind。没有执行，也没有投递。");
+  assert.equal(controlRejectText(I("/feishu-mode", "claude")), "命令形状不对：/feishu-mode 缺参数：dialogue 或 mapping（查看当前模式走 /feishu-status）。没有执行，也没有投递。");
+  assert.equal(controlRejectText(I("帮我看看", "claude")), null);
+  // ── 风险等级是意图的投影：两条入口（给 intent / 给 instruction）结论一致，且每一支落在该落的等级
+  const riskOf = { readonly: "R0", router_control: "R3", model_control: "R3", rejected_control: "R3", malformed_control: "R3", authorization: "R4", ordinary: "R1" };
+  for (const [t, expect] of cases) {
+    const viaIntent = classifyRisk({ intent: I(t, "claude"), mode: DIALOGUE_POLICY_ID });
+    assert.deepEqual(viaIntent, classifyRisk({ instruction: t, chain: "claude", mode: DIALOGUE_POLICY_ID }), t + "：两条入口同一结论");
+    assert.equal(viaIntent.riskClass, riskOf[expect], t + " → " + expect);
+  }
+  assert.equal(classifyRisk({ intent: { intent: "sideways" }, mode: DIALOGUE_POLICY_ID }).riskClass, RISK.R3, "联合之外的值按控制（只有 owner 能过）");
+  assert.equal(Object.keys(INTENT).length, 7);
+  // ── Claude 真入口：owner 发不开放 / 不精确的形状 → 取 claim、拒绝终态、回执差在哪、模式不变、不投递
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-malformed-"));
+  const root = path.join(local, "project"); const bin = path.join(local, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, senders: [{ open_id: "333", role: "participant" }] }));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "mal", root, name: "收边演示", root_message_id: "om_mal", expires_at: "2099-01-01T00:00:00Z",
+    session_id: "aily_mal", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z" }] }));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const run = (body, sender, messageId) => {
+    const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> " + body;
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: messageId, sessionID: "aily_mal", role: "user", createdBy: sender, createdAtMs: Date.now(), content } }) }] });
+    return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
+      env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+        AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_mal", AILY_CLI_RUN_ID: "run_mal", FAKE_AILY_ENVELOPE: envelope } });
+  };
+  const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
+  const receiptsDir = path.join(root, ".runtime-data", "inbound", "receipts");
+  const claimCount = () => (fs.existsSync(claimsDir) ? fs.readdirSync(claimsDir).filter((n) => n.endsWith(".claim")).length : 0);
+  const receipt = (id) => JSON.parse(fs.readFileSync(path.join(receiptsDir, "malformed-control-" + id + ".json"), "utf-8"));
+  const hasReceipt = (id) => fs.existsSync(path.join(receiptsDir, "malformed-control-" + id + ".json"));
+  const policyOf = () => loadClaudeInteractionPolicy({ root, claudeSessionId: null, registryFile }).state.policy_id;
+  const owner = TPL.frank_sender_id;
+  assert.equal(policyOf(), MAPPING_POLICY_ID);
+  const shapes = [
+    ["/feishu-unbind", "msg_mal_1", "rejected_control", /这个命令不从飞书开放：暂停接入不从飞书开放，请在终端里跑 \/feishu-unbind。没有执行，也没有投递/u],
+    ["/feishu-mode", "msg_mal_2", "malformed_control", /命令形状不对：\/feishu-mode 缺参数：dialogue 或 mapping/u],
+    ["/feishu-mode dialog", "msg_mal_3", "malformed_control", /只认 dialogue \/ mapping，收到「dialog」/u],
+    ["$feishu-mode dialogue", "msg_mal_4", "malformed_control", /前缀「\$」是 Codex 链的写法/u],
+    ["/feishu-status now", "msg_mal_5", "malformed_control", /不带参数，多了「now」/u],
+    ["/feishu-mode dialogue 谢谢", "msg_mal_6", "malformed_control", /收到「dialogue 谢谢」/u],
+  ];
+  let expectClaims = 0;
+  for (const [body, id, reason, re] of shapes) {
+    const r = run(body, owner, id);
+    assert.equal(r.status, 0, body + "：" + r.stdout + r.stderr);
+    assert.match(r.stdout, re, body + "：" + r.stdout);
+    assert.doesNotMatch(r.stdout + r.stderr, /长期任务会话|投递给现场|handoff|已切换/u, body + "：不许进投递或执行路径");
+    expectClaims += 1;
+    assert.equal(claimCount(), expectClaims, body + "：取了 claim（重放靠它幂等）");
+    const rec = receipt(id);
+    assert.deepEqual([rec.status, rec.reason, rec.claim_acquired, rec.handed_off], ["rejected", reason, true, false], body);
+    assert.equal(typeof rec.problem, "string"); assert.ok(rec.problem.length > 0);
+    assert.equal(policyOf(), MAPPING_POLICY_ID, body + "：模式不变");
+  }
+  // 重放同一条消息：撞 claim 的幂等，不再记一次、不再回执一次
+  const replay = run("/feishu-mode", owner, "msg_mal_2");
+  assert.match(replay.stdout, /已经处理过（幂等命中）/u, replay.stdout);
+  assert.equal(claimCount(), expectClaims);
+  assert.equal(fs.readdirSync(receiptsDir).filter((n) => n.startsWith("malformed-control-msg_mal_2")).length, 1, "重放不再写第二张收边回执");
+  // participant 发同样的形状：在 authorize 那层就拒（R3 只有 owner），不取 claim、没有收边回执
+  const p = run("/feishu-unbind", "333", "msg_mal_p1");
+  assert.match(p.stdout, /你的角色是 participant，R3（控制） 需要 owner 权限/u, p.stdout);
+  assert.equal(claimCount(), expectClaims); assert.equal(hasReceipt("msg_mal_p1"), false);
+  // 自然语言里顺带提到的、以及精确的 model_control（bind）/ readonly：不是收边对象 —— 取 claim、没有收边回执、照常往下走
+  for (const [body, id] of [["记得 /feishu-mode dialogue 这条命令", "msg_mal_o1"], ["/feishu-bind", "msg_mal_o2"], ["/feishu-status", "msg_mal_o3"]]) {
+    const r = run(body, owner, id);
+    assert.doesNotMatch(r.stdout, /命令形状不对|不从飞书开放/u, body + "：" + r.stdout);
+    expectClaims += 1;
+    assert.equal(claimCount(), expectClaims, body + "：照常取 claim");
+    assert.equal(hasReceipt(id), false, body + "：没有收边回执");
+  }
+  // 精确的 router_control 照旧执行
+  const sw = run("/feishu-mode dialogue", owner, "msg_mal_c1");
+  assert.match(sw.stdout, /已切换/u, sw.stdout);
   assert.equal(policyOf(), DIALOGUE_POLICY_ID);
 });
 

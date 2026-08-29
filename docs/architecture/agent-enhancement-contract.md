@@ -551,6 +551,13 @@ bridge-home/
 - 首次认领（绑定）仍只认 owner（R3 语义）。
 - 执行边界（2026-08-29 Frank 同意的简化版）：`authorize` 放行时给出 `capability`，随 runRequest 进投递层（投递层只看它，不重判角色；缺席按 fail-closed 拒）。owner → `full`：照旧投给现场会话 / 续起长期会话。其他角色 → `reply_only`：`handOffReplyOnly` 起零工具、无历史的一次性回合（`claude -p <正文> --tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}' --output-format stream-json --verbose`，参数是常量 `REPLY_ONLY_ARGS`），不 `--continue` / `--resume` 任何会话、不进现场会话、不取会话锁、不盖锁；日志与守望者路径与 handOff 相同，结果照旧发回话题。守望者只释放属于本轮的会话锁（`releaseSessionLockIfOwnedBy`：owner.json 的 log_path 一致才删）。`REPLY_ONLY_CAPABLE` 记录哪条链有可验证的只回复路径：Claude 有；Codex 没有（只读沙箱只是 shell 沙箱）—— 该链上非 owner 本来放行的格子暂不开放（reason `no_reply_only_path`，回执说清），而不是退化成全能力投递。Dialogue 仍是一次一个活动回合，reply_only 的回合同样占回合。
 
+## 14b. 近似命中收边契约（2026-08-29）
+
+- 意图判据只有一份：`scripts/inbound-intent.mjs` 的 `parseInboundIntent({ instruction, chain })` 把折叠后的正文落进封闭联合 readonly / router_control / model_control / rejected_control / malformed_control / authorization / ordinary；`risk-class.mjs` 的风险等级是它的投影（readonly → R0；四种 control → R3；authorization → R4；ordinary 按模式 R1 / R2）。入口只解析一次，`control`（路由侧执行的 feishu-mode）是 router_control 那一支的字段。
+- 命令命名空间（`/feishu-…` / `$feishu-…`）封闭：精确形状之外的一切（缺参、错参、多尾巴、没这个词、别链前缀、链说不清）都是 malformed_control；unbind / pin-session 是 rejected_control（不从飞书开放）。没有前缀的正文（含自然语言里顺带提到的命令）是 ordinary。
+- 处置：rejected / malformed 在拿到 claim 之后、执行控制命令之前 —— `recordClaimState(rejected, { reason, word, problem })` → `malformed-control-<message_id>` 回执（status rejected、reason ∈ rejected_control | malformed_control、word、problem、claim_acquired true、handed_off false）→ 回执正文说清差在哪 / 去哪做并明说没有执行、没有投递。重放同一条消息撞 claim 幂等（「已经处理过」），不再记、不再回执。非 owner 发这些形状在 authorize（R3 只认 owner）就拒，不取 claim。
+- 两条链共用同一份联合与同一套文案，只有前缀不同。
+
 ## 15. 测试契约
 
 ### 必须覆盖的公共契约测试

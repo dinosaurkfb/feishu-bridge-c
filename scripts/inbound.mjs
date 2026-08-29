@@ -30,10 +30,11 @@ import {
 import {
   finalizeClaudeDialogueTurn, loadClaudeInteractionPolicy, reserveClaudeDialogueTurn, setClaudeInteractionMode,
 } from "./interaction-policy-store.mjs";
-import { controlAckText, parseControlCommand, runControlTransaction } from "./control-command.mjs";
+import { controlAckText, runControlTransaction } from "./control-command.mjs";
 import { claudeControlPrecondition } from "./control-identity.mjs";
 import { senderRole } from "./sender-roles.mjs";
 import { classifyRisk } from "./risk-class.mjs";
+import { INTENT, parseInboundIntent, controlRejectText } from "./inbound-intent.mjs";
 import { authorize } from "./authorize.mjs";
 import { handOff, handOffReplyOnly, acquireSessionLock, releaseSessionLock, stampSessionLock } from "./handoff.mjs";
 import {
@@ -429,12 +430,14 @@ if (!mappingContext.ok) {
 
 // 控制命令（/feishu-mode dialogue|mapping）：三道闸之后先**解析意图但不执行**，意图随 claim 持久化；
 // 执行与终态在拿到 claim 之后做，重放时按 claim 里的意图续做或按结果重出回执（可恢复事务，goal 第 3 层）。
-const control = parseControlCommand(verdict.instruction, { chain: "claude" });
+// 第 3 层：正文先落进封闭的意图联合（inbound-intent.mjs），control 只是其中 router_control 那一支；入口按 intent 做确定性处置。
+const intent = parseInboundIntent({ instruction: verdict.instruction, chain: "claude" });
+const control = intent.control;
 
 // ---------- 唯一一处授权判定（角色 × 风险等级 × 模式）：三道闸之后、拿 claim 之前 ----------
 // 拒绝必须说清"哪个模式、哪个角色、缺什么权限"，不投递、不静默；不取 claim（重发不算重放）。
 const senderRoleValue = senderRole({ frank_sender_id: mapping.frank_sender_id, senders: config?.senders }, event.sender_id);
-const risk = classifyRisk({ instruction: verdict.instruction, chain: "claude", mode: policyEvaluation.policy_id, control });
+const risk = classifyRisk({ intent, mode: policyEvaluation.policy_id });
 authz = authorize({ role: senderRoleValue, riskClass: risk.riskClass, mode: policyEvaluation.policy_id, chain: "claude" });
 if (!authz.allow) {
   writeReceipt("authz-" + verdict.messageId, {
@@ -516,6 +519,17 @@ if (!claim.ok) {
     finish("rejected", { reasonText: "这条消息已经处理过（幂等命中）" }, { reason: "duplicate" });
   }
   finish("error", { detail: "无法取得投递权：" + claim.error }, { reason: claim.reason });
+}
+
+// ---------- 近似命中收边（第 3 层）：不开放 / 不精确的命令形状，取 claim 后记拒绝终态、回执差在哪，不投递 ----------
+// 能走到这里的只有 owner（非 owner 的 R3 在上面的 authorize 就拒了）；重放同一条消息撞的是 claim 的幂等，不会再记一次。
+if (intent.intent === INTENT.REJECTED_CONTROL || intent.intent === INTENT.MALFORMED_CONTROL) {
+  recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "rejected", detail: { reason: intent.intent, word: intent.word, problem: intent.problem } });
+  writeReceipt("malformed-control-" + verdict.messageId, {
+    status: "rejected", reason: intent.intent, word: intent.word, problem: intent.problem, message_id: verdict.messageId,
+    project_root: routed.root, binding_source: routed.source, claim_acquired: true, handed_off: false,
+  });
+  finish("rejected", { reasonText: controlRejectText(intent), taskName: config.task_display_name }, { reason: intent.intent, word: intent.word });
 }
 
 // ---------- 控制命令：拿到 claim 之后当场执行（可恢复事务），不投递 ----------

@@ -2912,19 +2912,27 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
   const rc = routeCheck(drifted);
   assert.equal(rc?.ok, false, JSON.stringify(rc));
   assert.match(rc.detail, /处理器不是装好的运行时：.*dialogue-shadow-handler\.mjs（备注：main@7fd5d2d shadow probe）；.* —— 装到 runtime\/current 的代码没在处理入站/u, rc.detail);
-  assert.match(rc.next, /register-route\.mjs --restore-default --routes \S+ --handler \S+codex\/inbound\.mjs/u, rc.next);
+  assert.match(rc.next, /^node scripts\/register-route\.mjs --restore-default --routes '[^']+' --handler '[^']+codex\/inbound\.mjs' （预览/u, rc.next);
   assert.equal(drifted.checks.some((c) => c.ok === false), true);
-  // Codex doctor 给的恢复命令必须改 Codex 那张表，而不是默认落到 Claude 的表
-  const nextArgs = rc.next.match(/register-route\.mjs (--restore-default --routes \S+ --handler \S+)/u)[1].split(" ");
-  assert.equal(nextArgs[2], path.join(home, "routes.json"));
+  // Codex doctor 给的恢复命令**原样交给 shell**：改的是 Codex 那张表，Claude 的表一个字不动
+  const command = rc.next.slice(0, rc.next.indexOf(" （"));
+  assert.ok(command.includes("'" + path.join(home, "routes.json") + "'"), command);
   const claudeTable = path.join(dir, "claude-home", ".claude", "feishu-bridge", "routes.json");
   fs.mkdirSync(path.dirname(claudeTable), { recursive: true });
   fs.writeFileSync(claudeTable, JSON.stringify({ routes: [{ id: "self", handler: shadow, default: true }] }));
-  const applied = spawnSync(process.execPath, [path.join(ROOT, "scripts", "register-route.mjs"), ...nextArgs, "--apply"], { encoding: "utf-8", env: { ...isolatedEnv(), HOME: path.join(dir, "claude-home"), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } });
+  const applied = spawnSync("/bin/sh", ["-c", command + " --apply"], { encoding: "utf-8", cwd: ROOT, env: { ...isolatedEnv(), HOME: path.join(dir, "claude-home"), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } });
   assert.equal(applied.status, 0, applied.stdout + applied.stderr);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(home, "routes.json"), "utf-8")).routes[0].handler, nextArgs[4], "改的是 Codex 的表");
+  const expectedCodexHandler = path.join(codexHome, "feishu-bridge", "runtime", "current", "scripts", "codex", "inbound.mjs");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(home, "routes.json"), "utf-8")).routes[0].handler, expectedCodexHandler, "改的是 Codex 的表");
   assert.equal(JSON.parse(fs.readFileSync(claudeTable, "utf-8")).routes[0].handler, shadow, "Claude 的表一个字没动");
   assert.equal(routeCheck(JSON.parse(run().stdout))?.ok, true, "按 next 恢复后变绿");
+  // 评审反例：Codex 状态页第 1 层要把这个正确的处理器报成 runtime/current，不能因为 runtimeDir 被拼两次 current 而报"运行时之外"
+  const statusRoot = path.join(dir, "status-project"); fs.mkdirSync(statusRoot, { recursive: true });
+  writeRegistryFixtureUnvalidated([makeTaskEntry({ root: statusRoot, threadId: THREAD_A, name: "S", rootMessageId: "om_status", token: "s1" })], path.join(home, "registry.json"));
+  const status = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A], { encoding: "utf-8", env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /入站处理器\s+runtime\/current（默认路由 codex）/u, "Codex 状态页第 1 层：" + status.stdout);
+  writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
   fs.rmSync(path.join(home, "routes.json"));
   // 查不清的那几项要出现在待办里，不能被藏起来。
   assert.ok(healthy.next.some((n) => /hooks/u.test(n)),

@@ -328,8 +328,9 @@ export function defaultRouteHandler({ file = routesPath(), runtimeCurrent, expec
     if (expectedHandler !== null && real !== expectedReal) return { under: false, why: "在运行时目录里但不是这条链预期的处理器（" + String(expectedHandler) + "）：" + real };
     return { under: true, why: null };
   };
-  const others = table.routes.filter((r) => !r.isDefault && !judge(r.handler).under).map((r) => ({ id: r.id, handler: r.handler, note: r.note }));
+  // 先定"有效默认路由"（与 selectRoute 同一规则：标了 default 的，或唯一一条），再算 others —— 否则唯一那条会同时被列成默认和"另有非默认"。
   const dflt = table.routes.find((r) => r.isDefault) ?? (table.routes.length === 1 ? table.routes[0] : null);
+  const others = table.routes.filter((r) => r !== dflt && !judge(r.handler).under).map((r) => ({ id: r.id, handler: r.handler, note: r.note }));
   if (!dflt) return { status: "no_default", handler: null, others, why: table.routes.length + " 条路由都没标 default" };
   const verdict = judge(dflt.handler);
   return { status: verdict.under ? "runtime" : "outside", id: dflt.id, handler: dflt.handler, note: dflt.note, why: verdict.why, others };

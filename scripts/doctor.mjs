@@ -40,6 +40,7 @@ import { collectConnectivity, loadStatusProviders, statusProvidersPath } from ".
 import { resolveProject } from "./project-resolve.mjs";
 import { pendingGeneration } from "./topic-generation.mjs";
 import { verifyRuntime, runtimeRoot } from "./runtime-install.mjs";
+import { shellQuote } from "./shell-quote.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode } from "./drain-schedule.mjs";
 import { spawnSync } from "node:child_process";
 import { LAUNCHCTL_ENV, PHASE_TEXT, loadedPhase } from "./launchd-job.mjs";
@@ -51,7 +52,8 @@ const PREVIEW = {
   installOutbound: "node scripts/install-outbound.mjs（预览；确认后自行加 --apply）",
   registerProvider: "node scripts/register-status-provider.mjs --id <route id> --script <状态脚本>（预览；确认后自行加 --apply）",
   bindProject: "node scripts/bind-project.mjs（预览；确认后自行加 --apply）",
-  restoreDefaultRoute: (routesFile, handler) => "node scripts/register-route.mjs --restore-default --routes " + routesFile + " --handler " + handler + " （预览；切权威路由，Frank 授权后自行加 --apply）",
+  // 这条命令控制权威路由：路径一律 shellQuote，不靠"本机路径恰好没空格"。命令与说明之间留一个空格，整段可复制、也可切出命令。
+  restoreDefaultRoute: (routesFile, handler) => "node scripts/register-route.mjs --restore-default --routes " + shellQuote(routesFile) + " --handler " + shellQuote(handler) + " （预览；切权威路由，Frank 授权后自行加 --apply）",
   rotate: "/feishu-rotate（在对应项目的会话里）",
   drainCodex: "node scripts/codex/drain-service.mjs --enable（预览；确认后自行加 --apply）",
   feishuOutbox: "$feishu-outbox（Codex 侧只读积压视图）/ node scripts/drain-outbox.mjs --dry-run",
@@ -179,9 +181,9 @@ export function runDoctor({
       d.status === "runtime" ? "默认路由 " + d.id + " → 装好的运行时" + othersText
         : d.status === "no_routes" ? d.why + "，分发器用运行时自带的默认处理器"
         : d.status === "outside" ? "默认路由 " + d.id + " 的处理器不是装好的运行时：" + d.handler + (d.note ? "（备注：" + d.note + "）" : "") + "；" + d.why + " —— 装到 runtime/current 的代码没在处理入站" + othersText
-        : d.status === "no_default" ? "没有默认路由（" + d.why + "）—— 未登记话题会被拒，不会回退运行时"
+        : d.status === "no_default" ? "没有默认路由（" + d.why + "）—— 未登记话题会被拒，不会回退运行时；需要人工给其中一条标 default（register-route 不设默认：默认路由是权威路由）"
         : "路由表读不出来，查不清（" + d.why + "）",
-      d.status === "outside" || d.status === "no_default" ? PREVIEW.restoreDefaultRoute(routesFile, expectedHandler) : null);
+      d.status === "outside" ? PREVIEW.restoreDefaultRoute(routesFile, expectedHandler) : null);
   }
 
   // ── ⑤ ⑥ 逐项目：绑定到期、outbox / runs 积压

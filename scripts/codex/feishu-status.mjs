@@ -100,7 +100,8 @@ console.log(renderLayeredStatus(composeLayeredStatus({
     // 不给的话第 1 层会写着"Claude Code"、版本号报的是 Claude 运行时的哈希，
     // 而那正是四层最该分清的东西：这一层问的是"我这条链的端点"。
     runtime: "Codex CLI",
-    runtimeDir: path.join(codexRuntimeRoot(codexHomeOf()), "current"),
+    // runtimeDir 是运行时**根目录**（下面有 current / versions），不是 current 本身 —— 评审反例：传 current 会被再拼一次 current。
+    runtimeDir: codexRuntimeRoot(codexHomeOf()),
     // 路由表也是 Claude 默认值 —— 同一类默认值，这次一起找。
     routesFile: path.join(bridgeHome(), "routes.json"),
     expectedHandler: path.join(codexRuntimeRoot(codexHomeOf()), "current", "scripts", "codex", "inbound.mjs"),

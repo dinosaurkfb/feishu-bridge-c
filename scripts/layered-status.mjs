@@ -81,7 +81,7 @@ export function describePendingWindow(st, { now = Date.now(), full = false } = {
 export function inboundHandlerText(d) {
   if (!d) return "说不清";
   if (d.status === "runtime") return "runtime/current（默认路由 " + d.id + "）";
-  if (d.status === "no_routes") return "运行时自带默认处理器（没有路由表）";
+  if (d.status === "no_routes") return "运行时自带默认处理器（" + (d.why ?? "没有路由表") + "）";
   if (d.status === "outside") return "不是装好的运行时：" + path.basename(String(d.handler)) + (d.note ? "（" + d.note + "）" : "") + " —— 装的运行时没在处理入站";
   if (d.status === "no_default") return "没有默认路由 —— 未登记话题会被拒";
   return "说不清（" + (d.why ?? "路由表读不出来") + "）";

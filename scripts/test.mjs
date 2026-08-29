@@ -18795,6 +18795,10 @@ test("⑦ 入站默认处理器（issue #88）：分类五态不折叠；doctor 
   assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "no_routes");
   write({ routes: [{ id: "only", handler: viaLink }] });
   assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "runtime");
+  // 评审反例：唯一一条不标 default 且在运行时之外 —— 它就是有效默认，不再同时被列成"另有非默认"
+  write({ routes: [{ id: "only", handler: outside }] });
+  d = defaultRouteHandler({ file, runtimeCurrent });
+  assert.deepEqual([d.status, d.id, d.others], ["outside", "only", []]);
   write({ routes: [{ id: "a", handler: viaLink }, { id: "b", handler: outside }] });
   assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "no_default");
   fs.writeFileSync(file, "{broken");
@@ -18802,7 +18806,8 @@ test("⑦ 入站默认处理器（issue #88）：分类五态不折叠；doctor 
   assert.equal(defaultRouteHandler({ file }).status, "unreadable", "没给 runtimeCurrent 也不猜");
   assert.match(inboundHandlerText({ status: "runtime", id: "self" }), /runtime\/current（默认路由 self）/u);
   assert.match(inboundHandlerText({ status: "outside", handler: outside, note: "shadow probe" }), /不是装好的运行时：shadow\.mjs（shadow probe） —— 装的运行时没在处理入站/u);
-  assert.match(inboundHandlerText({ status: "no_routes" }), /运行时自带默认处理器/u);
+  assert.match(inboundHandlerText({ status: "no_routes" }), /运行时自带默认处理器（没有路由表）/u);
+  assert.match(inboundHandlerText({ status: "no_routes", why: "路由表里没有启用的路由" }), /运行时自带默认处理器（路由表里没有启用的路由）/u);
   assert.match(inboundHandlerText({ status: "no_default" }), /没有默认路由/u);
   assert.match(inboundHandlerText({ status: "unreadable", why: "EACCES" }), /说不清（EACCES）/u);
   assert.equal(inboundHandlerText(null), "说不清");
@@ -18836,25 +18841,32 @@ test("⑦ 入站默认处理器（issue #88）：分类五态不折叠；doctor 
   let c = checkOf(doctorReport(m.run()), "default_route_handler");
   assert.equal(c.ok, false, c.detail);
   assert.match(c.detail, /处理器不是装好的运行时：.*provider-ok\.mjs（备注：main@7fd5d2d shadow probe）；.* —— 装到 runtime\/current 的代码没在处理入站/u, c.detail);
-  assert.match(c.next, /register-route\.mjs --restore-default --routes \S+ --handler \S+/u, c.next);
-  // doctor 给的恢复命令必须真能跑，而且只改它说的那张表
-  const nextArgs = c.next.match(/register-route\.mjs (--restore-default --routes \S+ --handler \S+)/u)[1].split(" ");
-  assert.equal(nextArgs[2], m.files.routes, "--routes 就是 doctor 查的那张表");
+  assert.match(c.next, /^node scripts\/register-route\.mjs --restore-default --routes '[^']+' --handler '[^']+' （预览/u, c.next);
+  // doctor 给的恢复命令必须**原样交给 shell** 就能跑，而且只改它说的那张表 —— 表放在带空格的路径下（评审反例：不引号会静默截到第一个空格）
+  const spacedDir = path.join(m.home, "with space"); fs.mkdirSync(spacedDir);
+  const spacedRoutes = path.join(spacedDir, "routes.json");
+  fs.writeFileSync(spacedRoutes, JSON.stringify({ routes: [{ ...m.route("good"), default: true, note: "main@7fd5d2d shadow probe" }], sessions: {} }));
+  const spaced = checkOf(doctorReport(m.run({ FEISHU_BRIDGE_ROUTES: spacedRoutes })), "default_route_handler");
+  assert.equal(spaced.ok, false, spaced.detail);
+  const command = spaced.next.slice(0, spaced.next.indexOf(" （"));
+  const expectedHandlerPath = path.join(m.home, ".claude", "feishu-bridge", "runtime", "current", "scripts", "inbound.mjs");
   const otherTable = path.join(m.home, "other-routes.json");
   fs.writeFileSync(otherTable, JSON.stringify({ routes: [{ id: "other", handler: m.route("good").handler, default: true }] }));
-  const preview = spawnSync(process.execPath, [path.resolve("scripts", "register-route.mjs"), ...nextArgs], { encoding: "utf-8", env: { ...process.env, HOME: m.home } });
-  assert.equal(preview.status, 0, preview.stderr);
-  assert.match(preview.stdout, /\[dry-run\] 什么都没写/u);
-  const applied = spawnSync(process.execPath, [path.resolve("scripts", "register-route.mjs"), ...nextArgs, "--apply"], { encoding: "utf-8", env: { ...process.env, HOME: m.home } });
+  const sh = (cmd) => spawnSync("/bin/sh", ["-c", cmd], { encoding: "utf-8", cwd: path.resolve("."), env: { ...process.env, HOME: m.home } });
+  const preview = sh(command);
+  assert.equal(preview.status, 0, preview.stdout + preview.stderr);
+  assert.ok(preview.stdout.includes("路由表  ：" + spacedRoutes) && /\[dry-run\] 什么都没写/u.test(preview.stdout), "预览的就是那张带空格路径的表：" + preview.stdout);
+  const applied = sh(command + " --apply");
   assert.equal(applied.status, 0, applied.stdout + applied.stderr);
-  assert.equal(JSON.parse(fs.readFileSync(m.files.routes, "utf-8")).routes[0].handler, nextArgs[4], "改的是 doctor 说的那张表");
+  assert.equal(JSON.parse(fs.readFileSync(spacedRoutes, "utf-8")).routes[0].handler, expectedHandlerPath, "改的是 doctor 说的那张表（带空格路径）");
+  assert.equal(JSON.parse(fs.readFileSync(m.files.routes, "utf-8")).routes[0].handler, m.route("good").handler, "默认那张表一个字没动");
   assert.equal(JSON.parse(fs.readFileSync(otherTable, "utf-8")).routes[0].handler, m.route("good").handler, "别的表一个字没动");
-  assert.equal(checkOf(doctorReport(m.run()), "default_route_handler").ok, true, "按 next 恢复后 ⑦ 变绿");
-  const noRoutesArg = spawnSync(process.execPath, [path.resolve("scripts", "register-route.mjs"), "--restore-default", "--handler", nextArgs[4]], { encoding: "utf-8", env: { ...process.env, HOME: m.home } });
+  assert.equal(checkOf(doctorReport(m.run({ FEISHU_BRIDGE_ROUTES: spacedRoutes })), "default_route_handler").ok, true, "按 next 恢复后 ⑦ 变绿");
+  const noRoutesArg = spawnSync(process.execPath, [path.resolve("scripts", "register-route.mjs"), "--restore-default", "--handler", expectedHandlerPath], { encoding: "utf-8", env: { ...process.env, HOME: m.home } });
   assert.equal(noRoutesArg.status, 2, "不给 --routes 就拒，不默认落到 Claude 那张表");
   m.writeTables({ projects, routes: [{ id: "a", handler: m.route("good").handler }, { id: "b", handler: m.route("good").handler }], sessions: {}, providers: [m.provider("a"), m.provider("b")] });
   c = checkOf(doctorReport(m.run()), "default_route_handler");
-  assert.deepEqual([c.ok, /没有默认路由/u.test(c.detail)], [false, true], c.detail);
+  assert.deepEqual([c.ok, /没有默认路由/u.test(c.detail), c.next], [false, true, null], "no_default 不给必败的恢复命令：" + JSON.stringify(c));
   fs.rmSync(m.files.routes);
   c = checkOf(doctorReport(m.run()), "default_route_handler");
   assert.deepEqual([c.ok, /没有路由表，分发器用运行时自带的默认处理器/u.test(c.detail)], [true, true], c.detail);

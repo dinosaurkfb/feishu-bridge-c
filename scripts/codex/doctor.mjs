@@ -7,6 +7,7 @@ import path from "node:path";
 import { moduleRoot } from "../direct-run.mjs";
 import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
 import { defaultRouteHandler } from "../inbound-routes.mjs";
+import { shellQuote } from "../shell-quote.mjs";
 import { acceptsHookCommand, ownsHookCommand, pickNode } from "./hook-command.mjs";
 import { SKILL_NAMES, auditSkills } from "./skill-content.mjs";
 import { PHASE_TEXT, serviceState } from "./drain-service.mjs";
@@ -108,9 +109,9 @@ const RUNTIME_CURRENT = path.join(RUNTIME_ROOT, "current");
     d.status === "runtime" ? "默认路由 " + d.id + " → 装好的运行时"
       : d.status === "no_routes" ? d.why + "，分发器用运行时自带的默认处理器"
       : d.status === "outside" ? "默认路由 " + d.id + " 的处理器不是装好的运行时：" + d.handler + (d.note ? "（备注：" + d.note + "）" : "") + "；" + d.why + " —— 装到 runtime/current 的代码没在处理入站"
-      : d.status === "no_default" ? "没有默认路由（" + d.why + "）—— 未登记话题会被拒"
+      : d.status === "no_default" ? "没有默认路由（" + d.why + "）—— 未登记话题会被拒；需要人工给其中一条标 default（register-route 不设默认：默认路由是权威路由）"
       : "路由表读不出来，查不清（" + d.why + "）",
-    d.status === "outside" || d.status === "no_default" ? "node scripts/register-route.mjs --restore-default --routes " + codexRoutes + " --handler " + expectedHandler + " （预览；切权威路由，Frank 授权后自行加 --apply）" : null);
+    d.status === "outside" ? "node scripts/register-route.mjs --restore-default --routes " + shellQuote(codexRoutes) + " --handler " + shellQuote(expectedHandler) + " （预览；切权威路由，Frank 授权后自行加 --apply）" : null);
 }
 
 /**

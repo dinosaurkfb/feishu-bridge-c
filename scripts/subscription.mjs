@@ -153,7 +153,7 @@ export function buildLegacySubscriptionReadModel({
           transport_open_id: template.transport_open_id,
           chat_id: chatId,
           sender_ids: uniqueStrings([template.frank_sender_id]),
-          // 角色表（第 1 层）：只做显示与登记；授权基准仍是 sender_ids（只有 owner），第 2 层接入判定时才换。
+          // 角色表：sender_ids（binding 授权快照的基准）仍只有 owner；operator / participant 的入站由 risk-class × authorize 判定，不进 sender_ids。
           ...(senderTable(template) !== null ? { sender_roles: senderTable(template) } : {}),
           event_types: [MESSAGE_RECEIVE_EVENT],
         },

@@ -9151,6 +9151,15 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
     assert.equal(fs.readFileSync(path.join(paths.claims, malKey + ".rejected.json"), "utf-8"), "{broken", "受控拒绝不碰坏记录");
     fs.rmSync(path.join(paths.claims, malKey + ".rejected.json"));
     assert.match(runAs("$feishu-mode", TEMPLATE.frank_sender_id, "msg_mal_2").stdout, /补齐了上次没记下的拒绝终态/u, "坏记录移走后重放又能补齐");
+    // 评审 #94 第 4 轮：同 key 但归属另一 thread 的旧 claim → 不补终态、不重出回执，通用幂等命中
+    const malDoc = JSON.parse(fs.readFileSync(path.join(paths.claims, malKey + ".claim", "claim.json"), "utf-8"));
+    const foreignKey = claimKey("msg_mal_x", ltk);
+    fs.mkdirSync(path.join(paths.claims, foreignKey + ".claim"));
+    fs.writeFileSync(path.join(paths.claims, foreignKey + ".claim", "claim.json"), JSON.stringify({ ...malDoc, message_id: "msg_mal_x", claim_key: foreignKey, codex_thread_id: "01922222-3333-7444-8555-000000000099" }));
+    assert.match(runAs("$feishu-mode", TEMPLATE.frank_sender_id, "msg_mal_x").stdout, /已经处理过（幂等命中）/u);
+    assert.equal(fs.existsSync(path.join(paths.claims, foreignKey + ".rejected.json")), false, "别的 thread 的 claim 不补终态");
+    assert.equal(fs.existsSync(malReceipt("msg_mal_x")), false);
+    fs.rmSync(path.join(paths.claims, foreignKey + ".claim"), { recursive: true });
     const malP = runAs("$feishu-unbind", "3333", "msg_mal_p1");
     assert.match(malP.stdout, /你的角色是 participant，R3（控制） 需要 owner 权限/u, malP.stdout);
     assert.equal(fs.existsSync(malReceipt("msg_mal_p1")), false, "participant 在 authorize 那层就拒，没有收边回执");

@@ -436,6 +436,8 @@ if (!mappingContext.ok) {
 const intent = parseInboundIntent({ instruction: verdict.instruction, chain: "claude" });
 const control = intent.control;
 const rejectedProjection = rejectedControlProjection(intent);
+// 拒绝事务锁内重读 claim 用的身份期望 —— 与 claim 里写的身份字段同一算法；换绑 / 换线程之后同 key 的旧 claim 对不上，就不替它补账、也不重出回执。
+const rejectExpect = { logicalTaskKey: verdict.logicalTaskKey, bindingId: effectiveBindingId(mapping), claudeSessionId: mapping.claude_session_id ?? null };
 
 // ---------- 唯一一处授权判定（角色 × 风险等级 × 模式）：三道闸之后、拿 claim 之前 ----------
 // 拒绝必须说清"哪个模式、哪个角色、缺什么权限"，不投递、不静默；不取 claim（重发不算重放）。
@@ -453,7 +455,7 @@ if (!authz.allow) {
 const claimExpect = { logicalTaskKey: verdict.logicalTaskKey, bindingId: effectiveBindingId(mapping), claudeSessionId: mapping.claude_session_id ?? null };
 // ---------- 近似命中收边（第 3 层）：拒绝事务 —— 与控制命令事务同一套形状（锁内记账、重放按记录重出、损坏指路维护入口） ----------
 const rejectControl = (replay) => {
-  const tx = runRejectTransaction({ claimsDir: CLAIMS, key: claim.key, projection: rejectedProjection, replay });
+  const tx = runRejectTransaction({ claimsDir: CLAIMS, key: claim.key, projection: rejectedProjection, replay, expect: rejectExpect });
   const lockNote = tx.lockUncleared ? "；另外这一笔的事务锁没有交还（" + tx.lockUncleared + "），之后同一笔会报 control_busy，请人工确认后处理" : "";
   const base = { reason: intent.intent, word: intent.word, problem: intent.problem, message_id: verdict.messageId, project_root: routed.root, binding_source: routed.source, claim_acquired: !replay, handed_off: false, lock_uncleared: tx.lockUncleared ?? null };
   if (!tx.ok) {
@@ -522,7 +524,7 @@ if (!claim.ok && claim.reason === "duplicate" && control) {
 }
 if (!claim.ok && claim.reason === "duplicate" && rejectedProjection) {
   // 收边的重放：意图从 claim 里恢复；一致才按事务补齐 / 重出（不一致说明是另一条不同正文的消息撞了同一 id，落到通用的幂等命中）。
-  const original = readClaimState({ claimsDir: CLAIMS, key: claim.key });
+  const original = readClaimState({ claimsDir: CLAIMS, key: claim.key, expect: rejectExpect });
   if (original.status === "valid" && sameRejectedControl(original.claim.rejected_control, rejectedProjection)) {
     claim.key = claim.key ?? claimKey(verdict.messageId, verdict.logicalTaskKey);
     rejectControl(true);

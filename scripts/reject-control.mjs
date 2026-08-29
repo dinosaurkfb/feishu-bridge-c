@@ -59,12 +59,12 @@ export function readRejectedRecord({ claimsDir, key }) {
 }
 
 /**
- * **锁内核心 —— 唯一一份**，生产路径（runRejectTransaction）与维护入口（resumeRejectedClaim）都走它。
+ * **锁内核心 —— 唯一一份，不导出**（它自己不取锁，公开出去就是一个能绕开锁的写原语）：生产路径（runRejectTransaction）与维护入口（resumeRejectedClaim）都走它。
  * 锁内先用同一份 expect 重读 claim：不 valid / 没有拒绝投影 → 受控拒绝；调用方带了投影的（生产路径）还要与锁内投影逐字一致，
  * 否则 claim_intent_mismatch —— **写终态永远用锁内刚读出的投影**，锁外看到的任何快照都不作数（评审探针：锁外 A、锁内已换成 B）。
  * quarantine=true（维护入口）时损坏的记录先隔离再重写；生产路径不隔离，只受控拒绝并指路。
  */
-export function rejectTransactionCore({ claimsDir, key, expect = {}, projection = null, replay = false, quarantine = false }) {
+function rejectTransactionCore({ claimsDir, key, expect = {}, projection = null, replay = false, quarantine = false }) {
   const quarantined = [];
   const claim = readClaimState({ claimsDir, key, expect });
   if (claim.status !== "valid") return { ok: false, reason: "claim_" + claim.status, why: claim.why ?? null, quarantined };

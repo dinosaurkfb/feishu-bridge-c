@@ -14,7 +14,7 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import { RISK, classifyRisk } from "./risk-class.mjs";
 import { INTENT, parseInboundIntent, controlRejectText, rejectedControlProjection, shown } from "./inbound-intent.mjs";
-import { rejectedRecordProblem, runRejectTransaction, rejectTransactionCore, inspectRejectedClaim, resumeRejectedClaim, describeRejectRepair, rejectRepairExitCode } from "./reject-control.mjs";
+import { rejectedRecordProblem, runRejectTransaction, inspectRejectedClaim, resumeRejectedClaim, describeRejectRepair, rejectRepairExitCode } from "./reject-control.mjs";
 import { REJECTED_CONTROL_INTENTS, rejectedControlProblem } from "./control-intent.mjs";
 import { AUTHORIZATION_TABLE, authorize, CAPABILITY, REPLY_ONLY_CAPABLE } from "./authorize.mjs";
 import { SENDER_ROLES, roleCounts, roleCountsText, senderRole, senderRolesProblem, senderTable, roleEntriesProblem } from "./sender-roles.mjs";
@@ -19727,12 +19727,25 @@ test("近似命中收边（第 3 层）：意图联合唯一、风险是它的�
   assert.equal(JSON.parse(fs.readFileSync(recFile, "utf-8")).digest, projB.digest);
   assert.equal(inspectRejectedClaim({ claimsDir, key: c2.key }).state, "rejected");
   assert.equal(resumeRejectedClaim({ claimsDir, key: c2.key }).already, true);
-  assert.equal(rejectTransactionCore({ claimsDir, key: c2.key, expect: { logicalTaskKey: "别的 task" } }).reason, "claim_unreadable", "锁内用同一份 expect 重读 claim");
+  assert.equal(runRejectTransaction({ claimsDir, key: c2.key, projection: projB, expect: { logicalTaskKey: "别的 task" } }).reason, "claim_unreadable", "锁内用同一份 expect 重读 claim");
+  assert.equal(resumeRejectedClaim({ claimsDir, key: c2.key, expect: { bindingId: "别的绑定" } }).reason, "claim_unreadable");
   fs.writeFileSync(claimFile, JSON.stringify({ ...claimDoc, rejected_control: undefined }));
-  assert.equal(rejectTransactionCore({ claimsDir, key: c2.key }).reason, "not_rejected_control");
+  assert.equal(resumeRejectedClaim({ claimsDir, key: c2.key }).reason, "not_rejected_control");
   assert.equal(runRejectTransaction({ claimsDir, key: c2.key, projection: projB }).reason, "not_rejected_control");
   fs.writeFileSync(claimFile, claimRaw); fs.writeFileSync(recFile, recRaw);
   assert.deepEqual(problemsFor(c2.key), []);
+  // ── 评审 #94 第 4 轮：生产入口带当前身份 expect —— 同 key 但归属另一 binding 的旧 claim：不替它补终态、不重出回执，落到通用幂等命中
+  const foreignKey = claimKey("msg_mal_x", c2.claim.logical_task_key);
+  fs.mkdirSync(path.join(claimsDir, foreignKey + ".claim"));
+  fs.writeFileSync(path.join(claimsDir, foreignKey + ".claim", "claim.json"), JSON.stringify({ ...claimDoc, message_id: "msg_mal_x", claim_key: foreignKey, binding_id: "someone-else@project-files", rejected_control: claimDoc.rejected_control }));
+  const foreign = run("/feishu-mode", owner, "msg_mal_x");
+  assert.match(foreign.stdout, /已经处理过（幂等命中）/u, foreign.stdout);
+  assert.equal(fs.existsSync(path.join(claimsDir, foreignKey + ".rejected.json")), false, "别的 binding 的 claim 不补终态");
+  assert.equal(hasReceipt("msg_mal_x"), false, "也不重出回执");
+  assert.equal(runRejectTransaction({ claimsDir, key: foreignKey, projection: claimDoc.rejected_control, expect: { bindingId: c2.claim.binding_id } }).reason, "claim_unreadable");
+  assert.equal(runRejectTransaction({ claimsDir, key: foreignKey, projection: claimDoc.rejected_control }).ok, true, "不带 expect 才会接受 —— 所以生产入口必须带");
+  fs.rmSync(path.join(claimsDir, foreignKey + ".rejected.json"));
+  fs.rmSync(path.join(claimsDir, foreignKey + ".claim"), { recursive: true });
   // participant 发同样的形状：在 authorize 那层就拒（R3 只有 owner），不取 claim、没有收边回执
   const p = run("/feishu-unbind", "333", "msg_mal_p1");
   assert.match(p.stdout, /你的角色是 participant，R3（控制） 需要 owner 权限/u, p.stdout);

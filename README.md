@@ -240,6 +240,12 @@ session 绑定。日常还可以使用：
 锁内状态对所有调用者权威（晚到的首次调用者撞见已闭合的记录只重出回执，不再执行）；释放不是自己的实例不删、reap 段忙 / owner 读不出 / 锁已不在都不吞 —— 以 lockUncleared 进入结果（维护入口退出 1，两条链成功与失败回执都写明）；
 运输层重放遇到受验的 failed 按记录重出失败回执、不再执行（要再切就重新发一条）；两份终态并存 → control_conflict，不执行。
 锁原语里的文件操作抛错在 withControlLock 这层兜住：取得阶段 → control_lock_unavailable（回调没跑），释放阶段 → lockUncleared。
+**装了 ≠ 在跑（issue #88）**：入站由机器级路由表 `~/.claude/feishu-bridge/routes.json`（Codex 链 `~/.codex/feishu-bridge/routes.json`）的默认路由决定，
+表非空时分发器不会回退运行时自带的处理器。`doctor` 第 ⑦ 项与状态页第 1 层「入站处理器」都按 `defaultRouteHandler` 五态报
+（runtime / no_routes ✓；outside / no_default ✗；unreadable 说不清）；判定只认能解析成普通文件的 realpath，且要与该链预期的 inbound handler 对账（缺失文件、指向外部的符号链接、同目录别的文件都不算）；
+默认路由的 id 也要对（Claude `self` / Codex `codex`）：别的路由被标成默认是独立状态 `wrong_default`，不给自动恢复；
+改回用 `node scripts/register-route.mjs --restore-default --routes <该链的 routes.json> --handler <runtime/current 下的 inbound.mjs> --id <self|codex> [--apply]`
+（切权威路由，Frank 逐次授权；先备份整张表，只动默认那条）。
 账本按封闭形状分族盘点锁家族：主锁 control_lock_held（不要手删，协议会回收）、reap 段锁 control_reap_lock（残骸交 repair-publish-lock）、
 维护锁 control_maint_lock（人确认后手删）、.reaped-<uuid> / .reap.quarantine-<…> 残骸（可直接删）；别的后缀是 unrecognized_entry。
 

@@ -35,11 +35,12 @@ import { isDirectRun, moduleDir } from "./direct-run.mjs";
 import { auditOutbox } from "./outbox.mjs";
 import { inspectRunChannel, outboxDirOf } from "./drain-outbox.mjs";
 import { loadRegistryStrict, registryPath } from "./registry.mjs";
-import { loadRoutes, routesPath } from "./inbound-routes.mjs";
+import { loadRoutes, routesPath, defaultRouteHandler } from "./inbound-routes.mjs";
 import { collectConnectivity, loadStatusProviders, statusProvidersPath } from "./status-providers.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { pendingGeneration } from "./topic-generation.mjs";
-import { verifyRuntime } from "./runtime-install.mjs";
+import { verifyRuntime, runtimeRoot } from "./runtime-install.mjs";
+import { shellQuote } from "./shell-quote.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode } from "./drain-schedule.mjs";
 import { spawnSync } from "node:child_process";
 import { LAUNCHCTL_ENV, PHASE_TEXT, loadedPhase } from "./launchd-job.mjs";
@@ -51,6 +52,8 @@ const PREVIEW = {
   installOutbound: "node scripts/install-outbound.mjs（预览；确认后自行加 --apply）",
   registerProvider: "node scripts/register-status-provider.mjs --id <route id> --script <状态脚本>（预览；确认后自行加 --apply）",
   bindProject: "node scripts/bind-project.mjs（预览；确认后自行加 --apply）",
+  // 这条命令控制权威路由：路径一律 shellQuote，不靠"本机路径恰好没空格"。命令与说明之间留一个空格，整段可复制、也可切出命令。
+  restoreDefaultRoute: (routesFile, handler, id) => "node scripts/register-route.mjs --restore-default --routes " + shellQuote(routesFile) + " --handler " + shellQuote(handler) + " --id " + shellQuote(id) + " （预览；切权威路由，Frank 授权后自行加 --apply）",
   rotate: "/feishu-rotate（在对应项目的会话里）",
   drainCodex: "node scripts/codex/drain-service.mjs --enable（预览；确认后自行加 --apply）",
   feishuOutbox: "$feishu-outbox（Codex 侧只读积压视图）/ node scripts/drain-outbox.mjs --dry-run",
@@ -165,6 +168,23 @@ export function runDoctor({
       dangling.length > 0 ? PREVIEW.registerProvider : null);
   } else {
     add("provider_without_route", "④ 状态入口表与路由表对得上", null, "两张表有一张读不出来，查不清", null);
+  }
+
+  // ── ⑦ 入站默认处理器必须就是装好的运行时（issue #88：装了 ≠ 在跑）
+  {
+    const runtimeCurrent = path.join(runtimeRoot(home, "claude"), "current");
+    const expectedHandler = path.join(runtimeCurrent, "scripts", "inbound.mjs");
+    const d = defaultRouteHandler({ file: routesFile, runtimeCurrent, expectedHandler, expectedRouteId: "self" });
+    const othersText = d.others?.length ? "；另有 " + d.others.length + " 条非默认路由的处理器在运行时之外（按备注分辨）：" + list(d.others, (o) => o.id + " → " + o.handler) : "";
+    add("default_route_handler", "⑦ 入站默认处理器在 runtime/current 之下",
+      d.status === "runtime" || d.status === "no_routes" ? true : d.status === "unreadable" ? null : false,
+      d.status === "runtime" ? "默认路由 " + d.id + " → 装好的运行时" + othersText
+        : d.status === "no_routes" ? d.why + "，分发器用运行时自带的默认处理器"
+        : d.status === "outside" ? "默认路由 " + d.id + " 的处理器不是装好的运行时：" + d.handler + (d.note ? "（备注：" + d.note + "）" : "") + "；" + d.why + " —— 装到 runtime/current 的代码没在处理入站" + othersText
+        : d.status === "no_default" ? "没有默认路由（" + d.why + "）—— 未登记话题会被拒，不会回退运行时；需要人工给其中一条标 default（register-route 不设默认：默认路由是权威路由）"
+        : d.status === "wrong_default" ? d.why + " —— 不自动改（那是把别人的话题改判）；请人工把 default 标回 self" + othersText
+        : "路由表读不出来，查不清（" + d.why + "）",
+      d.status === "outside" ? PREVIEW.restoreDefaultRoute(routesFile, expectedHandler, "self") : null);
   }
 
   // ── ⑤ ⑥ 逐项目：绑定到期、outbox / runs 积压

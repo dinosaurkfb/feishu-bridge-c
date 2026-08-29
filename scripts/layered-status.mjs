@@ -27,6 +27,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { verifyRuntime } from "./runtime-install.mjs";
+import { defaultRouteHandler, routesPath } from "./inbound-routes.mjs";
 import { claimable } from "./subscription.mjs";
 
 /**
@@ -76,6 +77,17 @@ export function describePendingWindow(st, { now = Date.now(), full = false } = {
   return "（不设期限，已等待约 " + said + "）";
 }
 
+/** 第 1 层「入站处理器」一行的措辞：每一态各说各的，不把"运行时之外"说成"已安装"。 */
+export function inboundHandlerText(d) {
+  if (!d) return "说不清";
+  if (d.status === "runtime") return "runtime/current（默认路由 " + d.id + "）";
+  if (d.status === "no_routes") return "运行时自带默认处理器（" + (d.why ?? "没有路由表") + "）";
+  if (d.status === "outside") return "不是装好的运行时：" + path.basename(String(d.handler)) + (d.note ? "（" + d.note + "）" : "") + " —— 装的运行时没在处理入站";
+  if (d.status === "no_default") return "没有默认路由 —— 未登记话题会被拒";
+  if (d.status === "wrong_default") return "默认路由不是 " + d.expectedRouteId + "（是 " + d.id + "）—— 未登记话题会被投给它";
+  return "说不清（" + (d.why ?? "路由表读不出来") + "）";
+}
+
 export function endpointFacts({
   runtime = "Claude Code",
   agentName = null,
@@ -83,6 +95,9 @@ export function endpointFacts({
   runtimeDir = runtimeDirDefault(),
   inboundLog = inboundLogDefault(),
   verify = () => verifyRuntime(),
+  routesFile = routesPath(),
+  expectedHandler = path.join(runtimeDir, "current", "scripts", "inbound.mjs"),
+  expectedRouteId = "self",
 } = {}) {
   // **能读到符号链接不等于装好了。**上一版只看链接在不在，于是一个指向不存在目录的
   // current 也会显示"已安装"。三种状态要分开：没装 / 装好了 / 装的东西有问题。
@@ -101,6 +116,9 @@ export function endpointFacts({
     linkCandidate = path.basename(fs.readlinkSync(path.join(runtimeDir, "current"))).slice(0, 12);
   } catch { /* 没装或读不到 */ }
 
+  // 入站到底由谁处理 —— 路由表说了算，不是"装了什么"说了算（issue #88）。
+  const inboundHandler = defaultRouteHandler({ file: routesFile, runtimeCurrent: path.join(runtimeDir, "current"), expectedHandler, expectedRouteId });
+
   return {
     runtime,
     agentName,
@@ -109,6 +127,7 @@ export function endpointFacts({
     version,
     linkCandidate,
     selfCheck,
+    inboundHandler,
     lastInboundAt: lastSuccessfulDispatchAt(inboundLog),
   };
 }
@@ -330,6 +349,7 @@ export function composeLayeredStatus({
     // 上一版把版本号跟运行时拼在一行，被读成了 agent id。它是脚本内容哈希。
     ["运行时版本", endpoint.version
       ?? (endpoint.linkCandidate ? "未通过校验（链接候选 " + endpoint.linkCandidate + "）" : "未安装")],
+    ["入站处理器", inboundHandlerText(endpoint.inboundHandler)],
     ["安装状态", endpoint.install === "ok" ? "已安装"
       : endpoint.install === "absent" ? "未安装"
       // 损坏、漂移、链接异常都不是"正常"，也不是"没装"。

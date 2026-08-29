@@ -6,6 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { moduleRoot } from "../direct-run.mjs";
 import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
+import { defaultRouteHandler } from "../inbound-routes.mjs";
+import { shellQuote } from "../shell-quote.mjs";
 import { acceptsHookCommand, ownsHookCommand, pickNode } from "./hook-command.mjs";
 import { SKILL_NAMES, auditSkills } from "./skill-content.mjs";
 import { PHASE_TEXT, serviceState } from "./drain-service.mjs";
@@ -97,6 +99,21 @@ let hooks = null;
 const hooksFile = path.join(CODEX_HOME, "hooks.json");
 try { hooks = JSON.parse(fs.readFileSync(hooksFile, "utf-8")); } catch { /* 下方统一报告 */ }
 const RUNTIME_CURRENT = path.join(RUNTIME_ROOT, "current");
+// 入站默认处理器必须就是装好的运行时（issue #88：装了 ≠ 在跑）—— 与 Claude 侧同一份判据 defaultRouteHandler。
+{
+  const codexRoutes = path.join(home, "routes.json");
+  const expectedHandler = path.join(RUNTIME_CURRENT, "scripts", "codex", "inbound.mjs");
+  const d = defaultRouteHandler({ file: codexRoutes, runtimeCurrent: RUNTIME_CURRENT, expectedHandler, expectedRouteId: "codex" });
+  add("入站默认处理器",
+    d.status === "runtime" || d.status === "no_routes" ? true : d.status === "unreadable" ? null : false,
+    d.status === "runtime" ? "默认路由 " + d.id + " → 装好的运行时"
+      : d.status === "no_routes" ? d.why + "，分发器用运行时自带的默认处理器"
+      : d.status === "outside" ? "默认路由 " + d.id + " 的处理器不是装好的运行时：" + d.handler + (d.note ? "（备注：" + d.note + "）" : "") + "；" + d.why + " —— 装到 runtime/current 的代码没在处理入站"
+      : d.status === "no_default" ? "没有默认路由（" + d.why + "）—— 未登记话题会被拒；需要人工给其中一条标 default（register-route 不设默认：默认路由是权威路由）"
+      : d.status === "wrong_default" ? d.why + " —— 不自动改（那是把别人的话题改判）；请人工把 default 标回 codex"
+      : "路由表读不出来，查不清（" + d.why + "）",
+    d.status === "outside" ? "node scripts/register-route.mjs --restore-default --routes " + shellQuote(codexRoutes) + " --handler " + shellQuote(expectedHandler) + " --id " + shellQuote("codex") + " （预览；切权威路由，Frank 授权后自行加 --apply）" : null);
+}
 
 /**
  * **注入的命令跑的是哪一份代码。**

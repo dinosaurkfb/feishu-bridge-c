@@ -8,7 +8,6 @@
  */
 
 import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry, normalizeControlText } from "./control-command.mjs";
-import { describePendingWindow } from "./layered-status.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
@@ -111,10 +110,7 @@ import { composeAsk, isInitPrompt } from "./init-hook.mjs";
 import {
   composeTransportRule, isAilyTransportTurn, isBridgeOwnedTurn,
 } from "./inbound-hook.mjs";
-import {
-  ROUTE_REJECT, loadRoutes, registerRoute, registerRouteBinding, registerSession, selectRoute,
-  validateRoutesDoc,
-} from "./inbound-routes.mjs";
+import { ROUTE_REJECT, loadRoutes, registerRoute, registerRouteBinding, registerSession, selectRoute, validateRoutesDoc, defaultRouteHandler, restoreDefaultRoute } from "./inbound-routes.mjs";
 import {
   CANONICAL_EVENT_ENV, CANONICAL_EVENT_ENV as CANONICAL_PASS, buildCanonicalEvent, inheritedCanonicalEvent, legacyEventFromCanonical, validateCanonicalEvent,
 } from "./canonical-event.mjs";
@@ -129,8 +125,9 @@ import {
 } from "./subscription-sync-apply.mjs";
 import { renderSubscriptions, subscriptionDetails } from "./feishu-subscribe.mjs";
 import { drillFailureRetry, drillStuckPreparing } from "./rotation-drill.mjs";
+import { describePendingWindow } from "./layered-status.mjs";
 import {
-  ENDPOINT_SELF_CHECK, SELF_CHECK_TEXT, composeLayeredStatus, endpointFacts, outboundRoutingFact,
+  ENDPOINT_SELF_CHECK, SELF_CHECK_TEXT, composeLayeredStatus, endpointFacts, inboundHandlerText, outboundRoutingFact,
   redactRunText, runChannelRows,
   lastSuccessfulDispatchAt, renderLayeredStatus, splitByRelation, subscriptionFacts,
 } from "./layered-status.mjs";
@@ -16668,11 +16665,14 @@ test("doctor：好机器 —— 全部 pass、退出码 0；沙箱里不注入 l
   const good = m.project("good", { expiresAt: "2099-01-01T00:00:00.000Z" });
   m.writeTables({
     projects: [{ id: "good", root: good, root_message_id: "om_root_good", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }],
-    routes: [m.route("good")], sessions: { "session_aaaaaaaaaaaa": "good" }, providers: [m.provider("good")],
+    // 好机器的默认路由处理器就是装好的运行时（issue #88 之后 ⑦ 要查这个）
+    routes: [{ ...m.route("self"), handler: path.join(m.home, ".claude", "feishu-bridge", "runtime", "current", "scripts", "inbound.mjs"), default: true }],
+    sessions: { "session_aaaaaaaaaaaa": "self" }, providers: [m.provider("self")],
   });
   // 沙箱、没注入 launchctl：兜底定时器两项都 unknown → incomplete、退出码 2，但没有一项 fail。
   const r2 = m.run();
   const rep2 = doctorReport(r2);
+  assert.equal(checkOf(rep2, "default_route_handler").ok, true, checkOf(rep2, "default_route_handler").detail);
   assert.equal(r2.status, 2, "incomplete → 退出码 2：" + r2.stderr);
   assert.equal(rep2.overall, "incomplete");
   assert.equal(rep2.checks.some((c) => c.ok === false), false, JSON.stringify(rep2.checks.filter((c) => c.ok === false)));
@@ -18751,6 +18751,157 @@ test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进
     assert.notEqual(controlIntentProblem(badIntent), null, JSON.stringify(badIntent));
   }
 });
+
+test("⑦ 入站默认处理器（issue #88）：分类五态不折叠；doctor 与状态页据此报；受控恢复只动默认路由且先备份", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-routes-default-"));
+  const rt = path.join(home, "runtime");
+  fs.mkdirSync(path.join(rt, "versions", "v1", "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(rt, "versions", "v1", "scripts", "inbound.mjs"), "// runtime handler\n");
+  fs.symlinkSync(path.join("versions", "v1"), path.join(rt, "current"));
+  const runtimeCurrent = path.join(rt, "current");
+  const viaLink = path.join(runtimeCurrent, "scripts", "inbound.mjs");
+  const viaReal = path.join(rt, "versions", "v1", "scripts", "inbound.mjs");
+  const outside = path.join(home, "shadow.mjs"); fs.writeFileSync(outside, "// clone wrapper\n");
+  const file = path.join(home, "routes.json");
+  const write = (doc) => fs.writeFileSync(file, JSON.stringify(doc));
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "no_routes");
+  write({ routes: [{ id: "self", handler: viaLink, default: true }, { id: "cc2cd", handler: outside }] });
+  let d = defaultRouteHandler({ file, runtimeCurrent });
+  assert.deepEqual([d.status, d.id, d.others.map((o) => o.id)], ["runtime", "self", ["cc2cd"]]);
+  write({ routes: [{ id: "self", handler: viaReal, default: true }] });
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "runtime", "realpath 命中");
+  write({ routes: [{ id: "self", handler: outside, default: true, note: "shadow probe" }, { id: "cc2cd", handler: outside }] });
+  d = defaultRouteHandler({ file, runtimeCurrent });
+  assert.deepEqual([d.status, d.id, d.handler, d.note], ["outside", "self", outside, "shadow probe"]);
+  // 评审反例：路径前缀不能假绿 —— runtime 目录下不存在的文件、runtime 目录里指向外部的符号链接、同目录里别的文件（给了 expectedHandler 时）
+  write({ routes: [{ id: "self", handler: path.join(runtimeCurrent, "scripts", "missing.mjs"), default: true }] });
+  d = defaultRouteHandler({ file, runtimeCurrent });
+  assert.deepEqual([d.status, /不是可解析的普通文件/u.test(d.why)], ["outside", true], JSON.stringify(d));
+  fs.symlinkSync(outside, path.join(rt, "versions", "v1", "scripts", "sneaky.mjs"));
+  write({ routes: [{ id: "self", handler: path.join(runtimeCurrent, "scripts", "sneaky.mjs"), default: true }] });
+  d = defaultRouteHandler({ file, runtimeCurrent });
+  assert.deepEqual([d.status, /实际文件在运行时之外/u.test(d.why)], ["outside", true], JSON.stringify(d));
+  fs.writeFileSync(path.join(rt, "versions", "v1", "scripts", "other.mjs"), "// other\n");
+  write({ routes: [{ id: "self", handler: path.join(runtimeCurrent, "scripts", "other.mjs"), default: true }] });
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "runtime", "没给预期处理器：目录内普通文件算 runtime");
+  d = defaultRouteHandler({ file, runtimeCurrent, expectedHandler: viaLink });
+  assert.deepEqual([d.status, /不是这条链预期的处理器/u.test(d.why)], ["outside", true], JSON.stringify(d));
+  assert.equal(defaultRouteHandler({ file: (write({ routes: [{ id: "self", handler: viaReal, default: true }] }), file), runtimeCurrent, expectedHandler: viaLink }).status, "runtime", "预期处理器按 realpath 对账");
+  // 评审反例：空表与分发器语义一致 —— 没有启用路由 = 用运行时自带处理器
+  write({ routes: [] });
+  d = defaultRouteHandler({ file, runtimeCurrent });
+  assert.deepEqual([d.status, d.why], ["no_routes", "路由表里没有启用的路由"]);
+  write({ routes: [{ id: "x", handler: outside, enabled: false }] });
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "no_routes");
+  write({ routes: [{ id: "only", handler: viaLink }] });
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "runtime");
+  // 评审反例（第 3 轮）：默认路由必须是本链自己的 id —— cc2cd 被标默认时是 wrong_default，恢复入口零写入
+  write({ routes: [{ id: "self", handler: viaLink }, { id: "cc2cd", handler: outside, default: true }], sessions: { s1: "cc2cd" } });
+  d = defaultRouteHandler({ file, runtimeCurrent, expectedHandler: viaLink, expectedRouteId: "self" });
+  assert.deepEqual([d.status, d.id, d.expectedRouteId, /默认路由是 cc2cd，不是这条链的 self/u.test(d.why)], ["wrong_default", "cc2cd", "self", true], JSON.stringify(d));
+  const before = fs.readFileSync(file, "utf-8");
+  const refused = restoreDefaultRoute({ handler: viaLink, file, expectedRouteId: "self" });
+  assert.deepEqual([refused.ok, refused.reason, refused.id], [false, "default_route_id_mismatch", "cc2cd"]);
+  assert.equal(fs.readFileSync(file, "utf-8"), before, "零写入");
+  assert.equal(restoreDefaultRoute({ handler: viaLink, file }).reason, "no_expected_route_id", "不给 id 不动表");
+  assert.match(inboundHandlerText(d), /默认路由不是 self（是 cc2cd）/u);
+  // 评审反例（第 3 轮）：others 只问"在不在运行时之内" —— 非默认路由用运行时里另一个处理器是正常的，不列
+  fs.writeFileSync(path.join(rt, "versions", "v1", "scripts", "c2c-inbound.mjs"), "// another runtime handler\n");
+  write({ routes: [{ id: "self", handler: viaLink, default: true }, { id: "cc2cd", handler: path.join(runtimeCurrent, "scripts", "c2c-inbound.mjs") }, { id: "ext", handler: outside }] });
+  d = defaultRouteHandler({ file, runtimeCurrent, expectedHandler: viaLink, expectedRouteId: "self" });
+  assert.deepEqual([d.status, d.others.map((o) => o.id)], ["runtime", ["ext"]], JSON.stringify(d));
+  // 评审反例：唯一一条不标 default 且在运行时之外 —— 它就是有效默认，不再同时被列成"另有非默认"
+  write({ routes: [{ id: "only", handler: outside }] });
+  d = defaultRouteHandler({ file, runtimeCurrent });
+  assert.deepEqual([d.status, d.id, d.others], ["outside", "only", []]);
+  write({ routes: [{ id: "a", handler: viaLink }, { id: "b", handler: outside }] });
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "no_default");
+  fs.writeFileSync(file, "{broken");
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "unreadable");
+  assert.equal(defaultRouteHandler({ file }).status, "unreadable", "没给 runtimeCurrent 也不猜");
+  assert.match(inboundHandlerText({ status: "runtime", id: "self" }), /runtime\/current（默认路由 self）/u);
+  assert.match(inboundHandlerText({ status: "outside", handler: outside, note: "shadow probe" }), /不是装好的运行时：shadow\.mjs（shadow probe） —— 装的运行时没在处理入站/u);
+  assert.match(inboundHandlerText({ status: "no_routes" }), /运行时自带默认处理器（没有路由表）/u);
+  assert.match(inboundHandlerText({ status: "no_routes", why: "路由表里没有启用的路由" }), /运行时自带默认处理器（路由表里没有启用的路由）/u);
+  assert.match(inboundHandlerText({ status: "no_default" }), /没有默认路由/u);
+  assert.match(inboundHandlerText({ status: "unreadable", why: "EACCES" }), /说不清（EACCES）/u);
+  assert.equal(inboundHandlerText(null), "说不清");
+  write({ routes: [{ id: "self", handler: outside, default: true }] });
+  const facts = endpointFacts({ runtimeDir: rt, routesFile: file, inboundLog: path.join(home, "none.log"), verify: () => ({ ok: true, version: "v1" }) });
+  assert.equal(facts.inboundHandler.status, "outside");
+  write({ routes: [{ id: "self", handler: outside, default: true, note: "shadow" }, { id: "cc2cd", handler: outside }], sessions: { s1: "cc2cd" } });
+  assert.equal(restoreDefaultRoute({ handler: path.join(home, "nope.mjs"), file, expectedRouteId: "self" }).reason, "handler_missing");
+  const restored = restoreDefaultRoute({ handler: viaLink, note: "runtime/current 默认处理器", file, now: new Date("2026-08-29T00:00:00.000Z"), expectedRouteId: "self" });
+  assert.deepEqual([restored.ok, restored.changed, restored.id, restored.from], [true, true, "self", outside], JSON.stringify(restored));
+  assert.equal(restored.backup, file + ".bak.2026-08-29T00-00-00-000Z");
+  assert.equal(JSON.parse(fs.readFileSync(restored.backup, "utf-8")).routes[0].handler, outside, "备份是改前的表");
+  const after = JSON.parse(fs.readFileSync(file, "utf-8"));
+  assert.deepEqual([after.routes[0].handler, after.routes[0].note, after.routes[0].default, after.routes[1].handler, after.sessions], [viaLink, "runtime/current 默认处理器", true, outside, { s1: "cc2cd" }], "只动默认那条，其余原样");
+  assert.deepEqual(restoreDefaultRoute({ handler: viaLink, file, expectedRouteId: "self" }), { ok: true, changed: false, id: "self", handler: viaLink }, "幂等");
+  // 评审反例：handler 已对、只换备注也是一次变更（旧的 shadow-probe 备注不能留在表里）
+  const noteOnly = restoreDefaultRoute({ handler: viaLink, note: "换个备注", file, now: new Date("2026-08-29T00:00:01.000Z"), expectedRouteId: "self" });
+  assert.deepEqual([noteOnly.ok, noteOnly.changed, noteOnly.handlerChanged, noteOnly.noteChanged], [true, true, false, true], JSON.stringify(noteOnly));
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf-8")).routes[0].note, "换个备注");
+  assert.ok(fs.existsSync(noteOnly.backup), "只换备注也先备份");
+  assert.equal(restoreDefaultRoute({ handler: viaLink, note: "换个备注", file, expectedRouteId: "self" }).changed, false, "备注相同才算幂等");
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "runtime");
+  write({ routes: [{ id: "a", handler: outside }, { id: "b", handler: outside }] });
+  assert.equal(restoreDefaultRoute({ handler: viaLink, file, expectedRouteId: "self" }).reason, "no_default_route");
+  fs.rmSync(file);
+  assert.equal(restoreDefaultRoute({ handler: viaLink, file, expectedRouteId: "self" }).reason, "no_routes");
+  const m = doctorMachine({ installRuntime: true });
+  const good = m.project("good", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  const projects = [{ id: "good", root: good, root_message_id: "om_root_good", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }];
+  m.writeTables({ projects, routes: [{ ...m.route("self"), default: true, note: "main@7fd5d2d shadow probe" }], sessions: {}, providers: [m.provider("self")] });
+  let c = checkOf(doctorReport(m.run()), "default_route_handler");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /处理器不是装好的运行时：.*provider-ok\.mjs（备注：main@7fd5d2d shadow probe）；.* —— 装到 runtime\/current 的代码没在处理入站/u, c.detail);
+  assert.match(c.next, /^node scripts\/register-route\.mjs --restore-default --routes '[^']+' --handler '[^']+' --id 'self' （预览/u, c.next);
+  // doctor 给的恢复命令必须**原样交给 shell** 就能跑，而且只改它说的那张表 —— 表放在带空格的路径下（评审反例：不引号会静默截到第一个空格）
+  const spacedDir = path.join(m.home, "with space"); fs.mkdirSync(spacedDir);
+  const spacedRoutes = path.join(spacedDir, "routes.json");
+  fs.writeFileSync(spacedRoutes, JSON.stringify({ routes: [{ ...m.route("self"), default: true, note: "main@7fd5d2d shadow probe" }], sessions: {} }));
+  const spaced = checkOf(doctorReport(m.run({ FEISHU_BRIDGE_ROUTES: spacedRoutes })), "default_route_handler");
+  assert.equal(spaced.ok, false, spaced.detail);
+  const command = spaced.next.slice(0, spaced.next.indexOf(" （"));
+  const expectedHandlerPath = path.join(m.home, ".claude", "feishu-bridge", "runtime", "current", "scripts", "inbound.mjs");
+  const otherTable = path.join(m.home, "other-routes.json");
+  fs.writeFileSync(otherTable, JSON.stringify({ routes: [{ id: "other", handler: m.route("good").handler, default: true }] }));
+  const sh = (cmd) => spawnSync("/bin/sh", ["-c", cmd], { encoding: "utf-8", cwd: path.resolve("."), env: { ...process.env, HOME: m.home } });
+  const preview = sh(command);
+  assert.equal(preview.status, 0, preview.stdout + preview.stderr);
+  assert.ok(preview.stdout.includes("路由表  ：" + spacedRoutes) && /\[dry-run\] 什么都没写/u.test(preview.stdout), "预览的就是那张带空格路径的表：" + preview.stdout);
+  const applied = sh(command + " --apply");
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(spacedRoutes, "utf-8")).routes[0].handler, expectedHandlerPath, "改的是 doctor 说的那张表（带空格路径）");
+  assert.equal(JSON.parse(fs.readFileSync(m.files.routes, "utf-8")).routes[0].handler, m.route("good").handler, "默认那张表一个字没动");
+  assert.equal(JSON.parse(fs.readFileSync(otherTable, "utf-8")).routes[0].handler, m.route("good").handler, "别的表一个字没动");
+  assert.equal(checkOf(doctorReport(m.run({ FEISHU_BRIDGE_ROUTES: spacedRoutes })), "default_route_handler").ok, true, "按 next 恢复后 ⑦ 变绿");
+  const noRoutesArg = spawnSync(process.execPath, [path.resolve("scripts", "register-route.mjs"), "--restore-default", "--handler", expectedHandlerPath, "--id", "self"], { encoding: "utf-8", env: { ...process.env, HOME: m.home } });
+  assert.equal(noRoutesArg.status, 2, "不给 --routes 就拒，不默认落到 Claude 那张表");
+  const noIdArg = spawnSync(process.execPath, [path.resolve("scripts", "register-route.mjs"), "--restore-default", "--routes", spacedRoutes, "--handler", expectedHandlerPath], { encoding: "utf-8", env: { ...process.env, HOME: m.home } });
+  assert.equal(noIdArg.status, 2, "不给 --id 就拒");
+  // 评审探针（第 3 轮）：cc2cd 被标默认 + 有会话登记 → wrong_default ✗、不给 next；恢复入口按 --id self 拒绝，表一个字不动
+  const wrongDefault = path.join(m.home, "wrong-default.json");
+  fs.writeFileSync(wrongDefault, JSON.stringify({ routes: [{ id: "self", handler: expectedHandlerPath }, { id: "cc2cd", handler: m.route("good").handler, default: true }], sessions: { session_x: "cc2cd" } }));
+  const wd = checkOf(doctorReport(m.run({ FEISHU_BRIDGE_ROUTES: wrongDefault })), "default_route_handler");
+  assert.deepEqual([wd.ok, /默认路由是 cc2cd，不是这条链的 self/u.test(wd.detail), wd.next], [false, true, null], JSON.stringify(wd));
+  const wdBefore = fs.readFileSync(wrongDefault, "utf-8");
+  const wdApply = spawnSync(process.execPath, [path.resolve("scripts", "register-route.mjs"), "--restore-default", "--routes", wrongDefault, "--handler", expectedHandlerPath, "--id", "self", "--apply"], { encoding: "utf-8", env: { ...process.env, HOME: m.home } });
+  assert.equal(wdApply.status, 1, wdApply.stdout + wdApply.stderr);
+  assert.match(wdApply.stderr, /不是 --id 指定的那条/u);
+  assert.equal(fs.readFileSync(wrongDefault, "utf-8"), wdBefore, "零写入：cc2cd 的 handler 没被换成 self 的处理器");
+  m.writeTables({ projects, routes: [{ id: "a", handler: m.route("good").handler }, { id: "b", handler: m.route("good").handler }], sessions: {}, providers: [m.provider("a"), m.provider("b")] });
+  c = checkOf(doctorReport(m.run()), "default_route_handler");
+  assert.deepEqual([c.ok, /没有默认路由/u.test(c.detail), c.next], [false, true, null], "no_default 不给必败的恢复命令：" + JSON.stringify(c));
+  fs.rmSync(m.files.routes);
+  c = checkOf(doctorReport(m.run()), "default_route_handler");
+  assert.deepEqual([c.ok, /没有路由表，分发器用运行时自带的默认处理器/u.test(c.detail)], [true, true], c.detail);
+  m.writeTables({ projects, routes: [], sessions: {}, providers: [] });
+  c = checkOf(doctorReport(m.run()), "default_route_handler");
+  assert.deepEqual([c.ok, /路由表里没有启用的路由，分发器用运行时自带的默认处理器/u.test(c.detail)], [true, true], "空表 = 运行时默认：" + c.detail);
+});
+
 
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

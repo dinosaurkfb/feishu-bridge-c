@@ -13,7 +13,7 @@ import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import { RISK, classifyRisk } from "./risk-class.mjs";
-import { AUTHORIZATION_TABLE, authorize } from "./authorize.mjs";
+import { AUTHORIZATION_TABLE, authorize, CAPABILITY, REPLY_ONLY_CAPABLE } from "./authorize.mjs";
 import { SENDER_ROLES, roleCounts, roleCountsText, senderRole, senderRolesProblem, senderTable, roleEntriesProblem } from "./sender-roles.mjs";
 import { parseRegisterSenderArgs, planSenderChange, applySenderChange } from "./register-sender.mjs";
 // symlink 锁：existsSync 会跟随到不存在的目标，锁在不在只能用 lstat 判
@@ -49,7 +49,7 @@ import {
   reserveClaimReminderAttempt as tgReserveClaimReminderAttempt,
 } from "./topic-generation.mjs";
 import { describeReminderSweep, describeWaited, remindClaudePendingClaims, remindOnePendingClaim } from "./claim-reminder.mjs";
-import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome } from "./handoff.mjs";
+import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome, REPLY_ONLY_ARGS, releaseSessionLockIfOwnedBy } from "./handoff.mjs";
 import {
   acquirePublishLock, attributeSession, clearStaleReapLock, exactProjectsForRoot, fileContainsAny, isUnder,
   loadRegistry, loadRegistryStrict, normalizeRoot, releasePublishLock,
@@ -15384,6 +15384,8 @@ test("Claude watcher：终局之后重新读取并核对 —— 运行中绑定�
       patch: dialogue ? { policy_id: "dialogue" } : {} });
     const lock = path.join(rt, "session.lock");
     fs.mkdirSync(lock, { recursive: true });
+    // 真实入口起 run 后会给锁盖戳（pid + run 日志）；守望者只放属于这一轮的锁，所以夹具也要盖
+    fs.writeFileSync(path.join(lock, "owner.json"), JSON.stringify({ pid: process.pid, log_path: path.join(rt, "runs", key + ".jsonl"), at: new Date().toISOString() }));
     const outboxDir = path.join(h.dir, ".runtime-data", "outbound", "outbox");
     const orchestrator = path.join(h.dir, "orchestrate-" + mode + ".mjs");
     fs.writeFileSync(orchestrator, [
@@ -19337,13 +19339,24 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
   for (const mode of [MAPPING_POLICY_ID, DIALOGUE_POLICY_ID]) for (const r of ["R0", "R1", "R2", "R3", "R4"]) {
     assert.deepEqual([...AUTHORIZATION_TABLE[mode][r]], expect[mode][r], mode + "/" + r);
     for (const role of ["owner", "operator", "participant"]) {
-      const d = authorize({ role, riskClass: r, mode });
+      const d = authorize({ role, riskClass: r, mode, chain: "claude" });
       assert.equal(d.allow, expect[mode][r].includes(role), mode + "/" + r + "/" + role);
       if (!d.allow) assert.match(d.text, new RegExp("处于 (Mapping|Dialogue) 模式；你的角色是 " + role + "，" + r + "（.+） 需要 " + expect[mode][r].join(" / ") + " 权限", "u"), d.text);
+      // 执行边界：owner full，其他角色 reply_only；拒绝时 capability 为 null
+      assert.equal(d.capability, d.allow ? (role === "owner" ? "full" : "reply_only") : null, mode + "/" + r + "/" + role + " capability");
+      // Codex 链没有只回复路径：非 owner 本来放行的格子在这条链上暂不开放（no_reply_only_path），owner 不受影响
+      const c = authorize({ role, riskClass: r, mode, chain: "codex" });
+      if (role === "owner") assert.deepEqual([c.allow, c.capability], [d.allow, d.allow ? "full" : null], "codex owner 与 claude 同");
+      else if (d.allow) { assert.deepEqual([c.allow, c.reason, c.capability], [false, "no_reply_only_path", null]); assert.match(c.text, /在这条链上暂时只对 owner 开放（还没有只回复的执行路径）/u); }
+      else assert.deepEqual([c.allow, c.reason], [false, d.reason]);
+      // 链说不清：按没有只回复路径处理（非 owner 不放行），owner 照旧
+      const u = authorize({ role, riskClass: r, mode });
+      assert.equal(u.allow, role === "owner" ? d.allow : false, "chain 缺席 fail-closed：" + mode + "/" + r + "/" + role);
     }
-    assert.deepEqual([authorize({ role: null, riskClass: r, mode }).reason, authorize({ role: "boss", riskClass: r, mode }).reason], ["sender_not_registered", "sender_not_registered"]);
+    assert.deepEqual([authorize({ role: null, riskClass: r, mode, chain: "claude" }).reason, authorize({ role: "boss", riskClass: r, mode, chain: "claude" }).reason], ["sender_not_registered", "sender_not_registered"]);
   }
   assert.ok(Object.isFrozen(AUTHORIZATION_TABLE));
+  assert.deepEqual([CAPABILITY, REPLY_ONLY_CAPABLE], [{ FULL: "full", REPLY_ONLY: "reply_only" }, { claude: true, codex: false }]);
   assert.equal(authorize({ role: "owner", riskClass: "R2", mode: "turbo" }).reason, "mode_unknown");
   assert.equal(authorize({ role: "owner", riskClass: "R9", mode: MAPPING_POLICY_ID }).reason, "risk_unknown");
   // ── Claude 真入口：模板登记 operator 222 / participant 333
@@ -19354,6 +19367,17 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
   fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "authz", root, name: "权限演示", root_message_id: "om_authz", expires_at: "2099-01-01T00:00:00Z",
     session_id: "aily_authz", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z" }] }));
   fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  // 假 claude：把 argv 逐行记到日志，立刻退出（只回复路径要逐字核对它收到的参数）；假 lark-cli：任何发布都失败，守望者打不到真飞书
+  const claudeLog = path.join(local, "claude-argv.jsonl");
+  fs.writeFileSync(path.join(bin, "claude"), ["#!/usr/bin/env node", "require('node:fs').appendFileSync(" + JSON.stringify(claudeLog) + ", JSON.stringify(process.argv.slice(2)) + '\\n');"].join("\n") + "\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.stderr.write('fake lark-cli: refusing');", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
+  const claudeArgvNow = () => (fs.existsSync(claudeLog) ? fs.readFileSync(claudeLog, "utf-8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
+  // claude 是 detached 起的：入口进程先退出，子进程随后才写日志 —— 同步等到第 n 行出现（最多 5 秒），不靠运气
+  const claudeArgv = (n = 0) => {
+    const deadline = Date.now() + 5000;
+    while (claudeArgvNow().length < n && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    return claudeArgvNow();
+  };
   let seq = 0;
   const run = (body, sender) => {
     seq += 1;
@@ -19401,12 +19425,43 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
   assert.match(sw.stdout, /已切换/u, sw.stdout);
   assert.equal(policyOf(), DIALOGUE_POLICY_ID);
   const before = claimCount();
+  assert.equal(claudeArgv().length, 0, "此前没有起过 claude（owner 的 Mapping 指令卡在没有长期会话）");
   const p5 = run("这个问题你怎么看", "333");
   assert.doesNotMatch(p5.stdout, /你的角色是|需要 owner 权限/u, p5.stdout);
   assert.doesNotMatch(p5.stderr, /not_authorized/u, p5.stderr);
+  assert.equal(p5.status, 0, p5.stdout + p5.stderr);
   assert.equal(claimCount(), before + 1, "participant 的对话取了 claim");
+  // 执行边界（§6a 简化版）：participant 的 R1 起的是零工具、无历史的一次性回合 —— 不 --continue / --resume、无工具、无 MCP；参数逐字核对
+  const argv1 = claudeArgv(1);
+  assert.equal(argv1.length, 1, "起了且只起了一个 claude 进程：" + JSON.stringify(argv1));
+  assert.equal(argv1[0][0], "-p");
+  assert.match(argv1[0][1], /这个问题你怎么看/u);
+  assert.match(argv1[0][1], /\[Dialogue · .+ · turn \d+\]/u, "带 Dialogue 回合戳");
+  assert.deepEqual(argv1[0].slice(2), [...REPLY_ONLY_ARGS]);
+  assert.deepEqual([...REPLY_ONLY_ARGS], ["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--output-format", "stream-json", "--verbose"]);
+  assert.ok(!argv1[0].includes("--continue") && !argv1[0].includes("--resume"), "只回复不续任何会话");
+  // Dialogue 一次只有一个活动回合（对话策略本身）：把 participant 那一回合收掉（真实里由守望者在 run 结束后收），再让 operator 说
+  const p5Key = fs.readdirSync(claimsDir).filter((n) => n.endsWith(".claim")).map((n) => n.slice(0, -".claim".length))
+    .find((k) => JSON.parse(fs.readFileSync(path.join(claimsDir, k + ".claim", "claim.json"), "utf-8")).message_id === "msg_authz_" + seq);
+  assert.ok(p5Key, "participant 的 claim 在");
+  finalizeClaudeDialogueTurn({ root, claudeSessionId: null, runId: p5Key, status: DIALOGUE_TURN_STATUS.COMPLETED, registryFile });
   const o5 = run("我也问一句", "222");
   assert.doesNotMatch(o5.stdout, /你的角色是|需要 owner 权限/u, o5.stdout);
+  assert.equal(claudeArgv(2).length, 2, "operator 的对话同样走只回复路径（不被上一条只回复的 run 挡住 —— 只回复不占会话锁）：" + o5.stdout + o5.stderr);
+  assert.deepEqual(claudeArgv(2)[1].slice(2), [...REPLY_ONLY_ARGS]);
+  assert.equal(fs.existsSync(path.join(root, ".runtime-data", "inbound", "session.lock")), false, "只回复的 run 不取会话锁");
+  // 守望者只放属于自己的锁：别的 run 的锁、没有戳的锁都不碰
+  const lockDir = path.join(root, ".runtime-data", "inbound", "session.lock");
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(path.join(lockDir, "owner.json"), JSON.stringify({ pid: 1, log_path: "/somewhere/else.jsonl" }));
+  assert.deepEqual(releaseSessionLockIfOwnedBy(lockDir, { logPath: "/mine.jsonl" }).status, "not_owner");
+  assert.ok(fs.existsSync(lockDir), "别的 run 的锁没被删");
+  assert.deepEqual(releaseSessionLockIfOwnedBy(lockDir, { logPath: "/somewhere/else.jsonl" }).status, "released");
+  assert.equal(fs.existsSync(lockDir), false);
+  assert.deepEqual(releaseSessionLockIfOwnedBy(lockDir, { logPath: "/mine.jsonl" }).status, "absent");
+  fs.mkdirSync(lockDir, { recursive: true });
+  assert.deepEqual(releaseSessionLockIfOwnedBy(lockDir, { logPath: "/mine.jsonl" }).status, "not_owner", "没有戳的锁留给陈旧回收");
+  fs.rmSync(lockDir, { recursive: true, force: true });
   // Dialogue 下 participant 的 R0 / R3 仍拒
   assert.match(run("/feishu-status", "333").stdout, /R0（只读） 需要 owner 权限/u);
   assert.match(run("/feishu-mode mapping", "333").stdout, /R3（控制） 需要 owner 权限/u);

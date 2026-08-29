@@ -317,7 +317,7 @@ const control = parseControlCommand(verdict.instruction, { chain: "codex" });
 // 拒绝必须说清"哪个模式、哪个角色、缺什么权限"，不投递、不静默；不取 claim（重发不算重放）。
 const senderRoleValue = senderRole({ frank_sender_id: routed.mapping.frank_sender_id, senders: routed.config?.senders }, event.sender_id);
 const risk = classifyRisk({ instruction: verdict.instruction, chain: "codex", mode: policyEvaluation.policy_id, control });
-const authz = authorize({ role: senderRoleValue, riskClass: risk.riskClass, mode: policyEvaluation.policy_id });
+const authz = authorize({ role: senderRoleValue, riskClass: risk.riskClass, mode: policyEvaluation.policy_id, chain: "codex" });
 if (!authz.allow) {
   writeReceipt("authz-" + verdict.messageId, {
     status: "rejected", reason: "not_authorized", authz_reason: authz.reason, role: senderRoleValue, risk_class: risk.riskClass, risk_kind: risk.kind,

@@ -9092,9 +9092,12 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
     assert.equal(fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).length, claimsBefore + 1, "owner 取了 claim");
     assert.match(runAs("$feishu-mode dialogue", TEMPLATE.frank_sender_id, "msg_authz_5").stdout, /已切换/u);
     const beforeChat = fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).length;   // 控制命令自己也取 claim
+    // Codex 链没有可验证的只回复执行路径（只读沙箱只是 shell 沙箱）：Dialogue 下 participant 的 R1 暂不开放，回执说清；不取 claim（Frank 2026-08-29 同意"Codex 链先 B"）
     const chat = runAs("这个问题你怎么看", "3333", "msg_authz_6");
-    assert.doesNotMatch(chat.stdout, /你的角色是|需要 owner 权限/u, "Dialogue 下 participant 可对话：" + chat.stdout);
-    assert.equal(fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).length, beforeChat + 1, "participant 的对话取了 claim");
+    assert.match(chat.stdout, /处于 Dialogue 模式；你的角色是 participant，R1（对话） 在这条链上暂时只对 owner 开放（还没有只回复的执行路径）/u, chat.stdout);
+    assert.equal(fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).length, beforeChat, "拒绝不取 claim");
+    const chatRec = JSON.parse(fs.readFileSync(path.join(paths.receipts, fs.readdirSync(paths.receipts).find((n) => n === "authz-msg_authz_6.json")), "utf-8"));
+    assert.deepEqual([chatRec.status, chatRec.reason, chatRec.authz_reason], ["rejected", "not_authorized", "no_reply_only_path"]);
     // 评审 #93 P1-2：命令命名空间封闭 —— unbind / pin-session / 缺参 mode / 别链前缀 在 Dialogue 下对 participant 仍是 R3；授权用语（多词对象、写飞书）是 R4
     const beforeNs = fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).length;
     let nsIdx = 0;

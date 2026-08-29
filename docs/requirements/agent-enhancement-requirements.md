@@ -211,7 +211,7 @@ Relay 必须显式使用新的 policy version；其预算分别统计 human cycl
 
 ### FR-7 显式控制面
 
-> 实现状态（2026-08-29）：路由器在三道闸之后、拿 claim 之前做唯一一处 `authorize({ role, riskClass, mode })`。风险等级 R0 只读 / R1 对话 / R2 执行 / R3 控制 / R4 授权类由 `risk-class.mjs` 归类（普通文本：Dialogue → R1，Mapping → R2）；交叉表 Mapping 只有 owner 可 R2、Dialogue 的 R1 对三种角色都开、R3 / R4 只有 owner、operator 暂与 participant 同权；拒绝回执写明模式 / 角色 / 缺的权限，不取 claim、不投递。
+> 实现状态（2026-08-29）：路由器在三道闸之后、拿 claim 之前做唯一一处 `authorize({ role, riskClass, mode })`。风险等级 R0 只读 / R1 对话 / R2 执行 / R3 控制 / R4 授权类由 `risk-class.mjs` 归类（普通文本：Dialogue → R1，Mapping → R2）；交叉表 Mapping 只有 owner 可 R2、Dialogue 的 R1 对三种角色都开、R3 / R4 只有 owner、operator 暂与 participant 同权；拒绝回执写明模式 / 角色 / 缺的权限，不取 claim、不投递。 执行边界：放行同时给出 capability —— owner full；其他角色 reply_only（零工具、无历史的一次性回合，不进任何会话）；Codex 链暂无只回复路径，非 owner 的对话在该链暂不开放。
 
 建议的用户控制入口：
 

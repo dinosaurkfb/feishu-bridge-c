@@ -441,7 +441,7 @@ export function applyInteractionPolicyToAdmission(evaluation, state) {
 
 /** reservation 已由 adapter 原子取得；本函数只生成 runtime-neutral runRequest。 */
 export function handleDialoguePolicy({
-  evaluation, claim, resolvedContext, reservation, targetState = "ready",
+  evaluation, claim, resolvedContext, reservation, targetState = "ready", capability = null,
 } = {}) {
   const base = { policy_id: DIALOGUE_POLICY_ID, policy_version: DIALOGUE_POLICY_VERSION };
   const rejected = (reason, disposition = "rejected") => ({
@@ -473,6 +473,8 @@ export function handleDialoguePolicy({
       runId: claim.key,
       localTargetId: resolvedContext.localTargetId,
       userInput: evaluation.instruction,
+      // 执行边界（authorize 给的）：full = 现场 / 续起会话；reply_only = 零工具无历史的一次性回合。缺席时投递层按 fail-closed 拒。
+      capability,
       origin: {
         kind: "feishu",
         eventId: evaluation.messageId,

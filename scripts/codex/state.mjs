@@ -24,13 +24,7 @@ import {
   legacyEndpointId, selectPendingSubscriptionClaim, stableControlId,
 } from "../subscription.mjs";
 import {
-  ROTATION_STATUS, activatePendingTopicGeneration, activeGeneration,
-  applyTopicGenerationToMapping, closePendingTopicGeneration, generationForSession,
-  failTopicRotation, materializeLegacyTopicFields, pendingGeneration, prepareTopicRotation,
-  recordTopicGenerationActivity, registerPendingTopicGeneration, topicGenerationStateForLegacy,
-  markPendingClaimReminder,
-  markPendingClaimReminderAbandoned,
-  reserveClaimReminderAttempt,
+  ROTATION_STATUS, activatePendingTopicGeneration, activeGeneration, applyTopicGenerationToMapping, closePendingTopicGeneration, generationForSession, failTopicRotation, materializeLegacyTopicFields, pendingGeneration, prepareTopicRotation, recordTopicGenerationActivity, registerPendingTopicGeneration, topicGenerationStateForLegacy, markPendingClaimReminder, markPendingClaimReminderAbandoned, reserveClaimReminderAttempt, supersedeExpiredAndPrepareTopicRotation,
 } from "../topic-generation.mjs";
 import {
   finalizeDialogueTurn, interactionPolicyStateForLegacy, materializeInteractionPolicy,
@@ -1148,11 +1142,13 @@ function mutateTaskTopicState({
 
 /** 轮转 phase 1：只登记 operation，网络调用在锁外由 CLI 完成。 */
 export function prepareTaskTopicRotation({
-  threadId, operationId, home = bridgeHome(), now = Date.now(),
+  threadId, operationId, home = bridgeHome(), now = Date.now(), supersedeExpired = false,
 } = {}) {
   return mutateTaskTopicState({
     threadId, home, now,
-    mutate: (state) => prepareTopicRotation(state, { operationId, now }),
+    mutate: (state) => (supersedeExpired
+      ? supersedeExpiredAndPrepareTopicRotation(state, { operationId, now })
+      : prepareTopicRotation(state, { operationId, now })),
   });
 }
 

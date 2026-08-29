@@ -101,34 +101,31 @@ if (blocker.kind === "blocked") {
     "）；去新话题 @ 完成认领，或 --cancel --apply 显式取消，不能重复创建。");
 }
 if (blocker.kind === "expired") {
-  console.log("过期代际  第 " + blocker.pending.generation + " 代（认领截止 " + blocker.deadline + " 已过）：本次作废它，话题历史保留");
-  if (apply) {
-    const closed = closeTaskTopicRotation({ threadId: thread.threadId, operationId: loaded.state.rotation?.operation_id, reason: ROTATION_STATUS.EXPIRED, home: bridgeHome() });
-    if (!closed.ok) die("作废过期代际失败（" + closed.reason + "）。");
-    loaded = topicStateForTask(task);
-    if (!loaded.ok) die("作废后重读 topic generation 状态失败（" + loaded.reason + "）。");
-  }
+  console.log("过期代际  第 " + blocker.pending.generation + " 代（认领截止 " + blocker.deadline + " 已过）：本次在同一笔锁内作废它并建下一代，话题历史保留");
 }
-const nextNumber = Math.max(...loaded.state.generations.map((generation) => generation.generation)) + 1;
-const token = bindingToken(loaded.state.binding_id + "\n" + nextNumber);
 const name = task.task_display_name;
 const automaticThreshold = active.activity?.auto_rotate_threshold ?? TOPIC_GENERATION_AUTO_ROTATE_MESSAGES;
-const rootText = composeRootMessage({
-  name,
-  heading: name + " · 第 " + nextNumber + " 代",
-  purpose: automatic
-    ? "当前代际已达到 " + automaticThreshold + " 条有效业务消息；这是同一 Codex task 的下一话题代际，旧话题保留为只读历史。"
-    : "同一 Codex task 的新话题代际；旧话题保留为只读历史。",
-  root: task.root,
-  token,
+const plan = (nextNumber) => ({
+  nextNumber,
+  token: bindingToken(loaded.state.binding_id + "\n" + nextNumber),
+  rootText: composeRootMessage({
+    name,
+    heading: name + " · 第 " + nextNumber + " 代",
+    purpose: automatic
+      ? "当前代际已达到 " + automaticThreshold + " 条有效业务消息；这是同一 Codex task 的下一话题代际，旧话题保留为只读历史。"
+      : "同一 Codex task 的新话题代际；旧话题保留为只读历史。",
+    root: task.root,
+    token: bindingToken(loaded.state.binding_id + "\n" + nextNumber),
+  }),
 });
 const statusText = composeStatusMessage({ name });
+const expectedNext = Math.max(...loaded.state.generations.map((generation) => generation.generation)) + 1;
 
 console.log("任务      " + name);
 console.log("当前代际  " + active.generation);
-console.log("新代际    " + nextNumber + "（" +
-  (automatic ? "自动阈值触发；" : "") + "等待首次真实 mention 后才切换）");
-console.log("\n--- 新根消息 ---\n" + rootText);
+console.log("新代际    " + expectedNext + "（" +
+  (automatic ? "自动阈值触发；" : "") + "等待首次真实 mention 后才切换；编号以 --apply 时锁内冻结的为准）");
+console.log("\n--- 新根消息 ---\n" + plan(expectedNext).rootText);
 if (!apply) {
   console.log("\n[dry-run] 没有创建话题或修改状态。加 --apply 才执行两阶段轮转。");
   process.exit(0);
@@ -136,10 +133,11 @@ if (!apply) {
 
 const operationId = "rotation_" + randomUUID();
 const home = bridgeHome();
-const prepared = prepareTaskTopicRotation({
-  threadId: thread.threadId, operationId, home,
-});
+const prepared = prepareTaskTopicRotation({ threadId: thread.threadId, operationId, home, supersedeExpired: true });
 if (!prepared.ok) die("无法开始轮转（" + prepared.reason + "）。");
+if (prepared.superseded) console.log("已作废    第 " + prepared.superseded.generation + " 代（过期的待认领代际）");
+const { nextNumber, token, rootText } = plan(prepared.nextGeneration);
+if (nextNumber !== expectedNext) console.log("注意      锁内冻结的下一代是第 " + nextNumber + " 代（预告为第 " + expectedNext + " 代）：根消息按冻结的编号生成");
 const template = loadCodexTemplate();
 if (!template.ok) {
   failTaskTopicRotation({ threadId: thread.threadId, operationId, reason: template.reason, home });

@@ -683,6 +683,27 @@ export function pendingRotationBlocker(state, { now = Date.now() } = {}) {
   return { kind: "blocked", pending, deadline };
 }
 
+/**
+ * 轮转 phase 1 的**一次原子转换**（在 binding 锁内跑）：待认领代际已过截止 → 退休它 → 写入新的 PREPARING operation →
+ * 冻结下一代编号。之所以合成一步：分开"先关闭、再准备"会留一个窗口，另一轮 rotate 可以插进来，第一轮已经生成的
+ * 根消息写着"第 3 代"、最终却登记成第 4 代（评审探针）。根消息与 token 必须用这里返回的 nextGeneration 生成。
+ * 没有 pending 时等于 prepareTopicRotation；pending 仍可认领 → rotation_already_pending（不动任何东西）。
+ */
+export function supersedeExpiredAndPrepareTopicRotation(state, { operationId, now = Date.now() } = {}) {
+  const blocker = pendingRotationBlocker(state, { now });
+  if (blocker.kind === "blocked") return { ok: false, reason: "rotation_already_pending", pending: blocker.pending, deadline: blocker.deadline };
+  let base = state; let superseded = null;
+  if (blocker.kind === "expired") {
+    const closed = closePendingTopicGeneration(state, { operationId: state.rotation?.operation_id, reason: ROTATION_STATUS.EXPIRED, now });
+    if (!closed.ok) return { ok: false, reason: closed.reason };
+    base = closed.state; superseded = blocker.pending;
+  }
+  const prepared = prepareTopicRotation(base, { operationId, now });
+  if (!prepared.ok) return prepared;
+  const nextGeneration = Math.max(...prepared.state.generations.map((generation) => generation.generation)) + 1;
+  return { ok: true, state: prepared.state, operation: prepared.operation, superseded, nextGeneration };
+}
+
 export function closePendingTopicGeneration(state, {
   operationId,
   reason = ROTATION_STATUS.CANCELLED,

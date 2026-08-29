@@ -41,7 +41,7 @@ import {
 import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
 import { machineContext, runDoctor } from "./doctor.mjs";
-import { activeGenerationForSession, effectiveBindingId, generationForSession, resolveMappingOutboundGeneration, pendingRotationBlocker } from "./topic-generation.mjs";
+import { activeGenerationForSession, effectiveBindingId, generationForSession, resolveMappingOutboundGeneration, pendingRotationBlocker, supersedeExpiredAndPrepareTopicRotation } from "./topic-generation.mjs";
 import {
   claimReminderDue as tgClaimReminderDue, markPendingClaimReminder as tgMarkPendingClaimReminder,
   validateTopicGenerationState as tgValidateState,
@@ -19792,6 +19792,20 @@ test("轮转遇到待认领代际：仍可认领 → 拒绝重复创建；已过
   const closed = closePendingTopicGeneration(build(past), { operationId: "op-rot", reason: ROTATION_STATUS.EXPIRED, now });
   assert.equal(closed.ok, true, JSON.stringify(closed));
   assert.equal(pendingRotationBlocker(closed.state, { now }).kind, "none", "作废之后没有 pending 了");
+  // ── 一次原子转换（评审 #99 探针）：退休过期 pending + PREPARING + 冻结下一代编号，另一轮插不进来；登记出的编号 = 冻结的编号
+  const atomic = supersedeExpiredAndPrepareTopicRotation(build(past), { operationId: "op-a", now });
+  assert.equal(atomic.ok, true, JSON.stringify(atomic));
+  assert.deepEqual([atomic.superseded.generation, atomic.nextGeneration, atomic.state.rotation.operation_id, atomic.state.rotation.status], [2, 3, "op-a", ROTATION_STATUS.PREPARING]);
+  assert.equal(pendingGeneration(atomic.state), null, "过期的那代已退休");
+  const intruder = prepareTopicRotation(atomic.state, { operationId: "op-b", now: now + 1 });
+  assert.deepEqual([intruder.ok, intruder.reason], [false, "rotation_already_pending"], "转换之后另一轮 prepare 插不进来");
+  assert.equal(supersedeExpiredAndPrepareTopicRotation(atomic.state, { operationId: "op-c", now: now + 1 }).reason, "rotation_already_pending");
+  const registeredA = registerPendingTopicGeneration(atomic.state, { operationId: "op-a", rootMessageId: "om_says_" + atomic.nextGeneration, pendingToken: "tok3", now: now + 2 });
+  assert.equal(registeredA.ok, true, JSON.stringify(registeredA));
+  assert.equal(registeredA.generation.generation, atomic.nextGeneration, "登记出的编号就是冻结的编号（根消息、短码、幂等键都按它生成）");
+  assert.deepEqual([supersedeExpiredAndPrepareTopicRotation(build(future), { operationId: "op-x", now }).reason, supersedeExpiredAndPrepareTopicRotation(build(null), { operationId: "op-x", now }).reason], ["rotation_already_pending", "rotation_already_pending"], "仍可认领 / 不过期的 pending 不动");
+  const plain = supersedeExpiredAndPrepareTopicRotation(build(undefined), { operationId: "op-p", now });
+  assert.deepEqual([plain.ok, plain.superseded, plain.nextGeneration], [true, null, 2], "没有 pending 时等于普通 prepare");
   // ── Claude 真入口（dry-run，不建话题、不写状态）
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-rotate-"));
   const root = path.join(local, "project"); fs.mkdirSync(root);
@@ -19813,7 +19827,7 @@ test("轮转遇到待认领代际：仍可认领 → 拒绝重复创建；已过
   writeRegistry(build(past));
   const superseded = rotate();
   assert.equal(superseded.status, 0, superseded.stdout + superseded.stderr);
-  assert.match(superseded.stdout, /过期代际  第 2 代（认领截止 2026-08-29T00:00:00.000Z 已过）：本次作废它，话题历史保留/u, superseded.stdout);
+  assert.match(superseded.stdout, /过期代际  第 2 代（认领截止 2026-08-29T00:00:00.000Z 已过）：本次在同一笔锁内作废它并建下一代，话题历史保留/u, superseded.stdout);
   assert.match(superseded.stdout, /新代际    3（/u, "直接建第 3 代");
   assert.match(superseded.stdout, /\[dry-run\] 没有创建话题或修改状态/u);
   assert.equal(JSON.parse(fs.readFileSync(registryFile, "utf-8")).projects[0].topic_generation_state.generations.length, 2, "dry-run 不改状态");

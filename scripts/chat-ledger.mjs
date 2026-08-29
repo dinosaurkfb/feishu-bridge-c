@@ -1,17 +1,20 @@
 /**
  * chat 默认态的**机器级账本**（两条链共用）—— 没有绑定就没有项目内的 .runtime-data，但 chat 同样是"一个原始事件用事件 id 做幂等"的对象。
  *
- *   · claim：`<ledgerDir>/<key>.chat/`（**闭合转换**：先在临时目录写全 claim.json，再 rename 进位；EEXIST = 同一条消息的重放；
- *     进位前的任何失败只留临时目录，且受控返回，不裸抛）+ 终态 `outcome.json`（answered 记回答全文 / failed 记受控原因），
- *     同样临时文件 + rename；
- *   · 记录形状**封闭**（chatClaimProblem / chatOutcomeProblem）：键集恰好、时间规范、key / chain / message / session / sender_ref / pid
- *     逐一核对，终态与 claim 交叉核对 —— 一个只有 {status, text} 的文件不算"已回答"；
- *   · 准入是**一把锁内**的一次判定（admission.lock，复用 registry.mjs 的 symlink 锁）：盘点正在答的条数 → 上界 → 建 claim，
- *     两个进程不可能都看到 0 再各自取 claim；
- *   · "说不清"不折叠成空闲：目录里有读不出的 claim / 终态、认不出的条目，准入返回 unresolved，入口不起模型；
- *   · 陈旧：pid 死了又没有终态 = 上次没答完，不重跑（说不清上次答到哪），如实报"请再发一条新消息"。
+ *   · 一条 chat = **一个文件** `<ledgerDir>/<key>.chat.json`：claim 与终态在同一份 JSON 里（state = running / answered / failed）。
+ *     不用目录：目录会被"换出再换回"（ABA）绕过任何事后核对；单文件的读写都落在**同一个已打开的文件对象**上 ——
+ *       读：`O_RDONLY | O_NONBLOCK | O_NOFOLLOW` 打开、同一 fd fstat 确认普通文件、从这个 fd 读；
+ *       建 claim：`O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` 独占创建（EEXIST = 同一条消息的重放），内容写进同一个 fd 再 fsync；
+ *       记终态：临时文件（同样 O_EXCL 创建）写全 → rename 覆盖；rename 替换的是路径上的那个目录项本身，
+ *              路径若已被换成符号链接，替换掉的是链接、不是它指向的东西；
+ *   · 记录形状**封闭**（chatRecordProblem）：键集恰好、时间规范、key 由 chain / message / session 推导、sender_ref / role / risk 枚举、pid 正整数；
+ *     终态按 state 与 reason 各自封闭（timeout 带 timeout_ms、nonzero_exit 带 exit_code、signaled 带 signal）；
+ *   · 准入是**一把锁内**的一次判定（admission.lock，复用 registry.mjs 的 symlink 锁）：盘点正在答的条数 → 上界 → 建 claim；
+ *   · "说不清"不折叠成空闲：读不出 / 形状不对的记录、进位残骸（`.tmp.`）、认不出的名字，准入返回 unresolved，入口不起模型；
+ *     锁族（admission.lock 及其 reap / maint / 回收 / 隔离残骸）在准入盘点里不算条目（此刻自己就持着锁），但 doctor 单独盘它们；
+ *   · 陈旧：pid 死了又没有终态 = 上次没答完，不重跑，如实报"请再发一条新消息"。
  *
- * key = sha256(chain \0 message_id \0 session_id)。目录里不出 locator：claim 只记 sender 的 sha256 前缀。
+ * key = sha256(chain \0 message_id \0 session_id)。文件里不出 locator：只记 sender 的 sha256 前缀。
  */
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -25,41 +28,44 @@ import { CHAT_FAIL_REASONS, SIGNAL_SHAPE } from "./chat-reply.mjs";
 export const CHAT_MAX_CONCURRENT = 2;
 export const CHAT_MAX_PER_SENDER = 1;
 export const CHAT_CHAINS = Object.freeze(["claude", "codex"]);
+export const CHAT_RECORD_SUFFIX = ".chat.json";
 const KEY_SHAPE = /^[0-9a-f]{64}$/u;
 const SENDER_REF_SHAPE = /^sender_[0-9a-f]{16}$/u;
-const CLAIM_KEYS = "chain,key,message_id,pid,risk_class,role,schema_version,sender_ref,session_id,started_at,state";
-const OUTCOME_ANSWERED_KEYS = "elapsed_ms,key,recorded_at,schema_version,status,text";
-/** failed 的键集按 reason 封闭：timeout 多一个 timeout_ms、nonzero_exit 多一个 exit_code —— 重放文案由这些受控字段确定，不靠存储的 why。 */
-const OUTCOME_FAILED_KEYS = Object.freeze({
-  timeout: "diagnostic,elapsed_ms,key,reason,recorded_at,schema_version,status,timeout_ms,why",
-  spawn_failed: "diagnostic,elapsed_ms,key,reason,recorded_at,schema_version,status,why",
-  nonzero_exit: "diagnostic,elapsed_ms,exit_code,key,reason,recorded_at,schema_version,status,why",
-  signaled: "diagnostic,elapsed_ms,key,reason,recorded_at,schema_version,signal,status,why",
-  empty_reply: "diagnostic,elapsed_ms,key,reason,recorded_at,schema_version,status,why",
+const BASE_KEYS = ["chain", "key", "message_id", "pid", "risk_class", "role", "schema_version", "sender_ref", "session_id", "started_at", "state"];
+const ANSWERED_KEYS = [...BASE_KEYS, "elapsed_ms", "recorded_at", "text"].sort().join(",");
+const FAILED_KEYS = Object.freeze({
+  timeout: [...BASE_KEYS, "diagnostic", "elapsed_ms", "reason", "recorded_at", "timeout_ms", "why"].sort().join(","),
+  spawn_failed: [...BASE_KEYS, "diagnostic", "elapsed_ms", "reason", "recorded_at", "why"].sort().join(","),
+  nonzero_exit: [...BASE_KEYS, "diagnostic", "elapsed_ms", "exit_code", "reason", "recorded_at", "why"].sort().join(","),
+  signaled: [...BASE_KEYS, "diagnostic", "elapsed_ms", "reason", "recorded_at", "signal", "why"].sort().join(","),
+  empty_reply: [...BASE_KEYS, "diagnostic", "elapsed_ms", "reason", "recorded_at", "why"].sort().join(","),
 });
-const CHAT_DIR_ENTRIES = Object.freeze(["claim.json", "outcome.json"]);
-const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
-/** 准入锁家族（与 registry.mjs 的 symlink 锁协议逐一对应）：主锁 / reap 段锁 / 维护锁 / 回收残骸 / 隔离残骸 —— 只有这些名字不算条目。 */
-const ADMISSION_LOCK_FAMILY = [
-  /^admission\.lock$/u, /^admission\.lock\.reap$/u, /^admission\.lock\.maint$/u,
-  new RegExp("^admission\\.lock\\.reaped-" + UUID + "$", "u"), new RegExp("^admission\\.lock\\.reap\\.quarantine-" + UUID + "$", "u"),
-];
-export const isAdmissionLockEntry = (name) => ADMISSION_LOCK_FAMILY.some((re) => re.test(name));
+const RUNNING_KEYS = BASE_KEYS.slice().sort().join(",");
 const ADMISSION_LOCK = "admission.lock";
+const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+/** 准入锁家族（与 registry.mjs 的 symlink 锁协议逐一对应）：主锁 / reap 段锁 / 维护锁 / 回收残骸 / 隔离残骸 —— 只有这些名字不算记录。 */
+const ADMISSION_LOCK_FAMILY = [
+  ["lock", /^admission\.lock$/u], ["reap", /^admission\.lock\.reap$/u], ["maint", /^admission\.lock\.maint$/u],
+  ["reaped", new RegExp("^admission\\.lock\\.reaped-" + UUID + "$", "u")], ["quarantine", new RegExp("^admission\\.lock\\.reap\\.quarantine-" + UUID + "$", "u")],
+];
+export function classifyAdmissionLockEntry(name) {
+  for (const [family, re] of ADMISSION_LOCK_FAMILY) if (re.test(name)) return family;
+  return null;
+}
+export const isAdmissionLockEntry = (name) => classifyAdmissionLockEntry(name) !== null;
 const nonEmpty = (v) => typeof v === "string" && v.length > 0;
 
 export function chatKey({ chain, messageId, sessionId }) {
   return crypto.createHash("sha256").update([String(chain), String(messageId), String(sessionId ?? "")].join("\0")).digest("hex");
 }
 export const senderRef = (senderId) => "sender_" + crypto.createHash("sha256").update(String(senderId)).digest("hex").slice(0, 16);
+const recordPath = (ledgerDir, key) => path.join(ledgerDir, key + CHAT_RECORD_SUFFIX);
 
-/** claim.json 的封闭形状。 */
-export function chatClaimProblem(doc, key) {
+/** 单文件记录的封闭形状：按 state（与 failed 的 reason）各自封闭键集，并交叉核对 key。 */
+export function chatRecordProblem(doc, key) {
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return "不是记录对象";
-  if (Object.keys(doc).sort().join(",") !== CLAIM_KEYS) return "字段集不对";
   if (doc.schema_version !== "1.0") return "schema_version 不认识";
-  if (doc.state !== "running") return "state 不是 running";
-  if (doc.key !== key) return "key 跟目录名对不上";
+  if (doc.key !== key) return "key 跟文件名对不上";
   if (!CHAT_CHAINS.includes(doc.chain)) return "chain 不在受控集合里";
   if (!nonEmpty(doc.message_id)) return "message_id 缺失";
   if (doc.session_id !== null && !nonEmpty(doc.session_id)) return "session_id 形状不对";
@@ -69,25 +75,20 @@ export function chatClaimProblem(doc, key) {
   if (!Object.values(RISK).includes(doc.risk_class)) return "risk_class 不在受控集合里";
   if (!Number.isInteger(doc.pid) || doc.pid <= 0) return "pid 不是正整数";
   if (!isCanonicalIso(doc.started_at)) return "started_at 不是规范时间";
-  return null;
-}
-
-/** outcome.json 的封闭形状，并与 claim 交叉核对（key）。 */
-export function chatOutcomeProblem(doc, key) {
-  if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return "不是记录对象";
-  if (doc.schema_version !== "1.0") return "schema_version 不认识";
-  if (doc.key !== key) return "key 跟目录名对不上";
-  if (!isCanonicalIso(doc.recorded_at)) return "recorded_at 不是规范时间";
-  if (!Number.isInteger(doc.elapsed_ms) || doc.elapsed_ms < 0) return "elapsed_ms 不是非负整数";
   const keys = Object.keys(doc).sort().join(",");
-  if (doc.status === "answered") {
-    if (keys !== OUTCOME_ANSWERED_KEYS) return "answered 的字段集不对";
+  if (doc.state === "running") return keys === RUNNING_KEYS ? null : "running 的字段集不对";
+  if (doc.state === "answered" || doc.state === "failed") {
+    if (!isCanonicalIso(doc.recorded_at)) return "recorded_at 不是规范时间";
+    if (!Number.isInteger(doc.elapsed_ms) || doc.elapsed_ms < 0) return "elapsed_ms 不是非负整数";
+  }
+  if (doc.state === "answered") {
+    if (keys !== ANSWERED_KEYS) return "answered 的字段集不对";
     if (!nonEmpty(doc.text)) return "answered 没有正文";
     return null;
   }
-  if (doc.status === "failed") {
+  if (doc.state === "failed") {
     if (!CHAT_FAIL_REASONS.includes(doc.reason)) return "failed 的 reason 不在受控集合里";
-    if (keys !== OUTCOME_FAILED_KEYS[doc.reason]) return "failed（" + doc.reason + "）的字段集不对";
+    if (keys !== FAILED_KEYS[doc.reason]) return "failed（" + doc.reason + "）的字段集不对";
     if (!nonEmpty(doc.why)) return "failed 缺 why";
     if (doc.diagnostic !== null && typeof doc.diagnostic !== "string") return "diagnostic 形状不对";
     if (doc.reason === "timeout" && !(Number.isInteger(doc.timeout_ms) && doc.timeout_ms > 0)) return "timeout_ms 不是正整数";
@@ -95,12 +96,11 @@ export function chatOutcomeProblem(doc, key) {
     if (doc.reason === "signaled" && !SIGNAL_SHAPE.test(String(doc.signal))) return "signal 形状不对";
     return null;
   }
-  return "status 不在受控集合里";
+  return "state 不在受控集合里";
 }
 
-const claimDir = (ledgerDir, key) => path.join(ledgerDir, key + ".chat");
-/** 读记录：O_NONBLOCK | O_NOFOLLOW 打开、同一 fd fstat 确认普通文件后再读 —— 命名管道会把持锁的盘点卡死，符号链接会读到别处（评审探针）。 */
-const readJson = (file) => {
+/** 读记录：O_NONBLOCK | O_NOFOLLOW 打开、同一 fd fstat 确认普通文件、从这个 fd 读 —— 命名管道 / 符号链接 / 目录都不认；fstat 抛错也兜成三态。 */
+function readRecord(file) {
   let fd = null;
   try {
     try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW); }
@@ -112,71 +112,31 @@ const readJson = (file) => {
     try { st = fs.fstatSync(fd); } catch (err) { return { status: "unreadable", why: "fstat 失败：" + String(err.code ?? err.message) }; }
     if (!st.isFile()) return { status: "unreadable", why: "不是普通文件" };
     let raw;
-    try { raw = fs.readFileSync(fd, "utf-8"); }
-    catch (err) { return { status: "unreadable", why: String(err.code ?? err.message) }; }
-    try { return { status: "read", doc: JSON.parse(raw) }; }
-    catch { return { status: "unreadable", why: "不是 JSON" }; }
+    try { raw = fs.readFileSync(fd, "utf-8"); } catch (err) { return { status: "unreadable", why: String(err.code ?? err.message) }; }
+    try { return { status: "read", doc: JSON.parse(raw) }; } catch { return { status: "unreadable", why: "不是 JSON" }; }
   } finally {
     if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
   }
-};
-const writeJsonAtomic = (file, doc) => {
-  const tmp = file + ".tmp." + process.pid + "." + Date.now();
-  fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
-  fs.renameSync(tmp, file);
-};
+}
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (err) { return err?.code === "EPERM"; } };
 
 /**
- * 一条 chat 的状态：
- *   absent / answered / failed / running（claim 在、终态缺席、pid 活着）/ stale（pid 死了）/ unreadable（claim 或终态读不出、形状不对）。
+ * 一条 chat 的状态：absent / answered / failed / running（pid 活着）/ stale（pid 死了、没终态）/ unreadable（读不出、形状不对）。
  */
-/** claim 目录本身也要受验：必须是真目录（不是符号链接 / 别名，不是文件）；里面只允许 claim.json / outcome.json。 */
-function inspectChatDir(dir) {
-  let st;
-  try { st = fs.lstatSync(dir); }
-  catch (err) { return err?.code === "ENOENT" ? { status: "absent" } : { status: "unreadable", why: "目录 lstat 失败：" + String(err.code ?? err.message) }; }
-  if (st.isSymbolicLink()) return { status: "unreadable", why: "claim 目录是符号链接（别名）" };
-  if (!st.isDirectory()) return { status: "unreadable", why: "claim 目录不是目录" };
-  let names;
-  try { names = fs.readdirSync(dir); }
-  catch (err) { return { status: "unreadable", why: "目录读不出：" + String(err.code ?? err.message) }; }
-  const foreign = names.filter((n) => !CHAT_DIR_ENTRIES.includes(n));
-  if (foreign.length > 0) return { status: "unreadable", why: "目录里有不该有的条目：" + foreign.slice(0, 3).map((n) => n.slice(0, 40)).join("、") + (/outcome\.json\.tmp\./u.test(foreign.join(" ")) ? "（含终态进位残骸）" : "") };
-  return { status: "ok", identity: { dev: st.dev, ino: st.ino } };
-}
-/** 目录检查与读写之间没有"同一 fd"可用（Node 没有 openat，macOS 的 /dev/fd/N/子路径也不通）：读写完成后再核一次目录身份，被换掉就不认这次结果。 */
-function dirIdentityUnchanged(dir, identity) {
-  try { const st = fs.lstatSync(dir); return st.isDirectory() && st.dev === identity.dev && st.ino === identity.ino; }
-  catch { return false; }
-}
-
 export function inspectChat({ ledgerDir, key }) {
   if (!KEY_SHAPE.test(String(key))) return { state: "unreadable", why: "key 形状不对" };
-  const dir = claimDir(ledgerDir, key);
-  const dirState = inspectChatDir(dir);
-  if (dirState.status === "absent") return { state: "absent" };
-  if (dirState.status === "unreadable") return { state: "unreadable", why: dirState.why };
-  const claim = readJson(path.join(dir, "claim.json"));
-  if (claim.status === "absent") return { state: "unreadable", why: "claim 目录在、claim.json 缺席" };
-  if (claim.status === "unreadable") return { state: "unreadable", why: "claim：" + claim.why };
-  const claimProblem = chatClaimProblem(claim.doc, key);
-  if (claimProblem !== null) return { state: "unreadable", why: "claim：" + claimProblem };
-  const outcome = readJson(path.join(dir, "outcome.json"));
-  if (outcome.status === "unreadable") return { state: "unreadable", why: "outcome：" + outcome.why, claim: claim.doc };
-  // 读完再核一次目录身份：检查与读之间目录被换掉（别名 / 重命名）→ 这次读到的不作数
-  if (!dirIdentityUnchanged(dir, dirState.identity)) return { state: "unreadable", why: "claim 目录在读取期间被替换" };
-  if (outcome.status === "read") {
-    const problem = chatOutcomeProblem(outcome.doc, key);
-    if (problem !== null) return { state: "unreadable", why: "outcome：" + problem, claim: claim.doc };
-    return { state: outcome.doc.status, claim: claim.doc, outcome: outcome.doc };
-  }
-  return alive(claim.doc.pid) ? { state: "running", claim: claim.doc } : { state: "stale", claim: claim.doc };
+  const rec = readRecord(recordPath(ledgerDir, key));
+  if (rec.status === "absent") return { state: "absent" };
+  if (rec.status === "unreadable") return { state: "unreadable", why: rec.why };
+  const problem = chatRecordProblem(rec.doc, key);
+  if (problem !== null) return { state: "unreadable", why: problem };
+  if (rec.doc.state === "answered" || rec.doc.state === "failed") return { state: rec.doc.state, record: rec.doc };
+  return alive(rec.doc.pid) ? { state: "running", record: rec.doc } : { state: "stale", record: rec.doc };
 }
 
 /**
- * 盘点：正在答的条数（全局 / 这个发送者），以及说不清的条目数（读不出的 claim / 终态、认不出的名字）。
- * 正在答 = running 且未超预算 + 30 秒宽限；超过的不算占位（进程可能卡死，但不能因此永久堵住入口）。
+ * 盘点：正在答的条数（全局 / 这个发送者）与说不清的条目（读不出 / 形状不对的记录、进位残骸、认不出的名字）。
+ * 锁族（精确形状）在这里不算条目 —— 准入自己就持着锁；doctor 用 inspectAdmissionLocks 单独盘它们。
  */
 export function chatLoad({ ledgerDir, senderId, now = Date.now(), budgetMs }) {
   let names;
@@ -185,25 +145,43 @@ export function chatLoad({ ledgerDir, senderId, now = Date.now(), budgetMs }) {
   const me = senderRef(senderId);
   let running = 0; let bySender = 0; let unresolved = 0; const why = [];
   for (const n of names) {
-    if (isAdmissionLockEntry(n)) continue;   // 锁家族（精确形状）不是条目；相似而不精确的名字往下当认不出
-    // 进位前的临时目录：盘点在准入锁内做，此刻不可能有另一笔合法进位在跑 —— 它只能是上次建 claim 中断留下的残骸，说不清就不许当不存在
-    if (/\.chat\.tmp\.\d+\.\d+$/u.test(n)) { unresolved += 1; why.push("进位残骸（上次建 claim 中断）" + n.slice(0, 20) + "…，人工删除"); continue; }
-    if (!n.endsWith(".chat") || !KEY_SHAPE.test(n.slice(0, -".chat".length))) { unresolved += 1; why.push("认不出的条目 " + n.slice(0, 40)); continue; }
-    const key = n.slice(0, -".chat".length);
+    if (isAdmissionLockEntry(n)) continue;
+    if (/\.chat\.json\.tmp\.\d+\.\d+$/u.test(n)) { unresolved += 1; why.push("进位残骸（上次记终态中断）" + n.slice(0, 20) + "…，人工删除"); continue; }
+    if (!n.endsWith(CHAT_RECORD_SUFFIX) || !KEY_SHAPE.test(n.slice(0, -CHAT_RECORD_SUFFIX.length))) { unresolved += 1; why.push("认不出的条目 " + n.slice(0, 40)); continue; }
+    const key = n.slice(0, -CHAT_RECORD_SUFFIX.length);
     const seen = inspectChat({ ledgerDir, key });
     if (seen.state === "unreadable") { unresolved += 1; why.push(key.slice(0, 8) + "：" + seen.why); continue; }
     if (seen.state !== "running") continue;
-    const startedAt = Date.parse(seen.claim.started_at);
+    const startedAt = Date.parse(seen.record.started_at);
     if (Number.isFinite(budgetMs) && now - startedAt > budgetMs + 30_000) continue;
     running += 1;
-    if (seen.claim.sender_ref === me) bySender += 1;
+    if (seen.record.sender_ref === me) bySender += 1;
   }
   return { running, bySender, unresolved, why };
 }
 
 /**
- * 准入 —— **一把锁内**：盘点 → 说不清则拒 → 上界则拒 → 建 claim（临时目录写全再 rename 进位）。
- * @returns {{ ok: true, key, dir } | { ok: false, reason: "chat_ledger_unresolved"|"chat_busy_global"|"chat_busy_sender"|"duplicate"|"chat_admission_busy"|"chat_admission_lock_unavailable"|"chat_ledger_unwritable", text?: string, why?: string, load? }}
+ * doctor 用：锁族的状态。reap / maint 残留 → fail-closed（准入会一直忙）；回收 / 隔离残骸 → 可直接删；主锁在场超过 staleMs → 有问题。
+ */
+export function inspectAdmissionLocks({ ledgerDir, now = Date.now(), staleMs = 5 * 60 * 1000 }) {
+  let names;
+  try { names = fs.readdirSync(ledgerDir); } catch (err) { return err?.code === "ENOENT" ? { ok: true, problems: [] } : { ok: false, problems: ["目录读不出：" + String(err.code ?? err.message)] }; }
+  const problems = [];
+  for (const n of names) {
+    const family = classifyAdmissionLockEntry(n);
+    if (family === null) continue;
+    if (family === "reap" || family === "maint") { problems.push("锁族残留 " + n + "（" + (family === "reap" ? "reap 段锁" : "维护锁") + "）：准入会一直报受理忙，请用 repair-publish-lock 处理"); continue; }
+    if (family === "reaped" || family === "quarantine") { problems.push("锁族残骸 " + n.slice(0, 40) + "…：可直接删"); continue; }
+    let st;
+    try { st = fs.lstatSync(path.join(ledgerDir, n)); } catch { problems.push("主锁 lstat 失败"); continue; }
+    if (now - st.mtimeMs > staleMs) problems.push("主锁已持有超过 " + Math.round((now - st.mtimeMs) / 60000) + " 分钟（正常几毫秒）：持有者若已死会由下一笔按协议回收；一直在就是有问题");
+  }
+  return { ok: problems.length === 0, problems };
+}
+
+/**
+ * 准入 —— **一把锁内**：盘点 → 说不清则拒 → 上界则拒 → 建 claim（O_EXCL 独占创建，同一个 fd 写全）。
+ * @returns {{ ok: true, key, file } | { ok: false, reason, text?, why?, load? }}
  */
 export function admitChat({ ledgerDir, key, meta, senderId, now = Date.now(), budgetMs, maxConcurrent = CHAT_MAX_CONCURRENT, maxPerSender = CHAT_MAX_PER_SENDER }) {
   if (!KEY_SHAPE.test(String(key))) return { ok: false, reason: "chat_ledger_unwritable", why: "key 形状不对" };
@@ -241,47 +219,62 @@ export function admitChat({ ledgerDir, key, meta, senderId, now = Date.now(), bu
   return result;
 }
 
-/** 闭合转换：临时目录写全 claim.json → rename 进位；失败只留临时目录并受控返回。 */
+/** 建 claim：独占创建 + 同一 fd 写全 + fsync；失败受控返回，尽量不留半成品。 */
 function createClaim({ ledgerDir, key, meta, now }) {
-  const dir = claimDir(ledgerDir, key);
-  if (fs.existsSync(dir)) return { ok: false, reason: "duplicate", key, dir };
-  const tmp = dir + ".tmp." + process.pid + "." + now;
-  const claim = {
+  const file = recordPath(ledgerDir, key);
+  const doc = {
     schema_version: "1.0", state: "running", key,
     chain: meta.chain, message_id: meta.message_id, session_id: meta.session_id ?? null, sender_ref: meta.sender_ref,
     role: meta.role, risk_class: meta.risk_class, pid: process.pid, started_at: new Date(now).toISOString(),
   };
-  const problem = chatClaimProblem(claim, key);
+  const problem = chatRecordProblem(doc, key);
   if (problem !== null) return { ok: false, reason: "chat_ledger_unwritable", why: "claim 形状不对：" + problem };
+  let fd = null;
   try {
-    fs.mkdirSync(tmp, { recursive: false, mode: 0o700 });
-    fs.writeFileSync(path.join(tmp, "claim.json"), JSON.stringify(claim, null, 2) + "\n", { mode: 0o600 });
-  } catch (err) {
-    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* 留下的临时目录不算 claim */ }
-    return { ok: false, reason: "chat_ledger_unwritable", why: String(err.code ?? err.message) };
+    try { fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600); }
+    catch (err) {
+      if (err?.code === "EEXIST") return { ok: false, reason: "duplicate", key, file };
+      return { ok: false, reason: "chat_ledger_unwritable", why: String(err.code ?? err.message) };
+    }
+    try { fs.writeSync(fd, JSON.stringify(doc, null, 2) + "\n"); fs.fsyncSync(fd); }
+    catch (err) {
+      try { fs.closeSync(fd); } catch { /* 下面按半成品处理 */ }
+      fd = null;
+      try { fs.unlinkSync(file); } catch { /* 留下的半成品会在盘点里按形状不对报出来 */ }
+      return { ok: false, reason: "chat_ledger_unwritable", why: String(err.code ?? err.message) };
+    }
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
   }
-  try { fs.renameSync(tmp, dir); }
-  catch (err) {
-    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* 同上 */ }
-    if (err?.code === "EEXIST" || err?.code === "ENOTEMPTY") return { ok: false, reason: "duplicate", key, dir };
-    return { ok: false, reason: "chat_ledger_unwritable", why: String(err.code ?? err.message) };
-  }
-  return { ok: true, key, dir };
+  return { ok: true, key, file };
 }
 
-/** 记终态：受控返回，不裸抛。 */
+/** 记终态：读当前记录（同一 fd 协议）→ 必须是 running → 合成新记录 → 临时文件（O_EXCL）写全 → rename 覆盖。受控返回，不裸抛。 */
 export function recordChatOutcome({ ledgerDir, key, outcome, now = Date.now() }) {
   if (!KEY_SHAPE.test(String(key))) return { ok: false, reason: "key_shape" };
-  const doc = { ...outcome, schema_version: "1.0", key, recorded_at: new Date(now).toISOString() };
-  const problem = chatOutcomeProblem(doc, key);
+  const file = recordPath(ledgerDir, key);
+  const current = readRecord(file);
+  if (current.status !== "read") return { ok: false, reason: "claim_unreadable", why: current.status === "absent" ? "claim 缺席" : current.why };
+  const currentProblem = chatRecordProblem(current.doc, key);
+  if (currentProblem !== null) return { ok: false, reason: "claim_unreadable", why: currentProblem };
+  if (current.doc.state !== "running") return { ok: false, reason: "already_final", why: "已经是 " + current.doc.state };
+  const doc = { ...current.doc, ...outcome, state: outcome.status, recorded_at: new Date(now).toISOString() };
+  delete doc.status;
+  const problem = chatRecordProblem(doc, key);
   if (problem !== null) return { ok: false, reason: "outcome_shape", why: problem };
-  const dir = claimDir(ledgerDir, key);
-  const dirState = inspectChatDir(dir);
-  if (dirState.status !== "ok") return { ok: false, reason: "claim_dir_unusable", why: dirState.why ?? dirState.status };
-  try { writeJsonAtomic(path.join(dir, "outcome.json"), doc); }
-  catch (err) { return { ok: false, reason: "ledger_unwritten", why: String(err.code ?? err.message) }; }
-  // 写完再核目录身份：检查与写之间目录被换掉 → 终态可能落到了别处，这次写不算数（不去别处删：那正是别名想要的）
-  if (!dirIdentityUnchanged(dir, dirState.identity)) return { ok: false, reason: "ledger_unwritten", why: "claim 目录在写入期间被替换" };
+  const tmp = file + ".tmp." + process.pid + "." + now;
+  let fd = null;
+  try {
+    try { fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600); fs.writeSync(fd, JSON.stringify(doc, null, 2) + "\n"); fs.fsyncSync(fd); }
+    catch (err) { return { ok: false, reason: "ledger_unwritten", why: String(err.code ?? err.message) }; }
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
+  }
+  try { fs.renameSync(tmp, file); }
+  catch (err) {
+    try { fs.unlinkSync(tmp); } catch { /* 留下的临时文件在盘点里按残骸报 */ }
+    return { ok: false, reason: "ledger_unwritten", why: String(err.code ?? err.message) };
+  }
   return { ok: true };
 }
 

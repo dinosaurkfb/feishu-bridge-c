@@ -208,10 +208,10 @@ function chatTurn({ chain, template, event, dryRun, ledgerDir }) {
   const seen = inspectChat({ ledgerDir, key });
   if (seen.state === "answered") {
     writeReceipt("chat-replay-" + messageId, { status: "chat", kind: "replay", ...base });
-    finish("chat", { text: displaySafe(seen.outcome.text), replayed: true }, { mode: CHAT_POLICY_ID, kind: "replay" });
+    finish("chat", { text: displaySafe(seen.record.text), replayed: true }, { mode: CHAT_POLICY_ID, kind: "replay" });
   }
   // 失败重放：文案只从受控 reason 渲染，账本里存的 why 不进用户文案
-  if (seen.state === "failed") finish("error", { detail: "这条消息上次就没答出来（" + chatFailText(seen.outcome.reason, { timeoutMs: seen.outcome.timeout_ms, exitCode: seen.outcome.exit_code, signal: seen.outcome.signal }) + "）；同一条消息不会再答，请再发一条新消息" }, { reason: "chat_replay_failed", mode: CHAT_POLICY_ID });
+  if (seen.state === "failed") finish("error", { detail: "这条消息上次就没答出来（" + chatFailText(seen.record.reason, { timeoutMs: seen.record.timeout_ms, exitCode: seen.record.exit_code, signal: seen.record.signal }) + "）；同一条消息不会再答，请再发一条新消息" }, { reason: "chat_replay_failed", mode: CHAT_POLICY_ID });
   if (seen.state === "running") finish("error", { detail: "这条消息还在答，等它答完；不会再起第二个回答" }, { reason: "chat_running", mode: CHAT_POLICY_ID });
   if (seen.state === "stale") finish("error", { detail: "这条消息上次的回答进程没留下结果；同一条消息不会再答，请再发一条新消息" }, { reason: "chat_stale", mode: CHAT_POLICY_ID });
   if (seen.state === "unreadable") finish("error", { detail: "这条消息的 chat 账本读不出（" + seen.why + "），没有回答" }, { reason: "chat_ledger_unreadable", mode: CHAT_POLICY_ID });

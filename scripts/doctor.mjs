@@ -28,7 +28,7 @@
 
 import fs from "node:fs";
 import { chatReplyPathStatus, chatReplyTimeoutMs } from "./chat-reply.mjs";
-import { chatLoad } from "./chat-ledger.mjs";
+import { chatLoad, inspectAdmissionLocks } from "./chat-ledger.mjs";
 import os from "node:os";
 import path from "node:path";
 
@@ -312,7 +312,8 @@ export function runDoctor({
     add("chat_reply_path", "⑧ chat 回复路径（两条链共用本机 claude CLI）", cp.available, cp.available ? "claude CLI 可用（" + cp.version + "）" : "不可用：" + cp.why + " —— 未接入的话题 / 私聊会报 chat_reply_path_unavailable", null);
   }
 
-  // ⑨ chat 账本：两条链各一份机器级账本；说不清的条目（读不出 / 形状不对 / 残骸 / 认不出）在这里点名 —— 入口拒绝 chat 时指的就是这一项
+  // ⑨ chat 账本：两条链各一份机器级账本；说不清的条目（读不出 / 形状不对 / 残骸 / 认不出）在这里点名 —— 入口拒绝 chat 时指的就是这一项；
+  //    准入锁族也在这里盘（准入盘点时自己持着锁，不看它们）：reap / maint 残留 = 准入会一直忙，主锁久持 = 有问题
   {
     const codexBridgeHome = ctx.codexEnv.FEISHU_CODEX_BRIDGE_HOME || path.join(ctx.codexEnv.CODEX_HOME, "feishu-bridge");
     const ledgers = [["Claude", path.join(ctx.home, ".claude", "feishu-bridge", "inbound", "chat-claims")], ["Codex", path.join(codexBridgeHome, "inbound", "chat-claims")]];
@@ -321,6 +322,7 @@ export function runDoctor({
       const load = chatLoad({ ledgerDir: dir, senderId: null, now, budgetMs: chatReplyTimeoutMs() });
       parts.push(chain + " 正在答 " + load.running + " 条");
       for (const why of load.why) problems.push(chain + "：" + why);
+      for (const why of inspectAdmissionLocks({ ledgerDir: dir, now }).problems) problems.push(chain + "：" + why);
     }
     add("chat_ledger", "⑨ chat 账本（两条链）", problems.length === 0, problems.length === 0 ? parts.join("、") + "；没有说不清的条目" : parts.join("、") + "；说不清 " + problems.length + " 处：" + problems.slice(0, 3).join("；"), null);
   }

@@ -15,11 +15,13 @@ import { displaySafe } from "./display-safe.mjs";
 
 export const CHAT_POLICY_ID = "chat";
 export const CHAT_REPLY_TIMEOUT_MS = 60_000;
+export const CHAT_REPLY_TIMEOUT_MAX_MS = 2 ** 31 - 1;
 /** 预算可由环境覆盖（测试把它调短；生产不设就是 60 秒）。 */
 export function chatReplyTimeoutMs(env = process.env) {
-  // 值域与终态里的 timeout_ms 同一份：正整数毫秒；别的（小数、0、负数、非数字）一律回默认
+  // 值域与终态里的 timeout_ms 同一份：正整数毫秒，且不超过 spawnSync 能接受的上界（2^31-1）；
+  // 别的（小数、0、负数、非数字、超界的大数 —— 那会让 spawnSync 在拿到 claim 之后裸抛 RangeError）一律回默认
   const n = Number(env.FEISHU_BRIDGE_CHAT_TIMEOUT_MS);
-  return Number.isInteger(n) && n > 0 ? n : CHAT_REPLY_TIMEOUT_MS;
+  return Number.isSafeInteger(n) && n > 0 && n <= CHAT_REPLY_TIMEOUT_MAX_MS ? n : CHAT_REPLY_TIMEOUT_MS;
 }
 export const CHAT_REPLY_MAX_CHARS = 4000;
 /** 失败原因的封闭枚举与给人看的文案 —— 账本终态只存 reason，重放时从这张表渲染，不吐存储的任何自由文本。 */
@@ -40,7 +42,6 @@ export const CHAT_SYSTEM_PROMPT =
   "你是飞书桥的 chat 默认态：这个话题 / 私聊没有接入任何本机项目或会话，你没有任何工具，也读不到任何历史，只能凭这一条消息回答。" +
   "回答要短、直接、用中文。对方若要你执行本机操作（改文件、跑命令、看项目状态），如实说明：这里还没接入，接入要在终端里跑 /feishu-bind；你不能替他做。";
 
-/**
 /** 给人看的诊断片段：先净化（控制字符、locator 形状）再按 Unicode 码点截断 —— 子进程 stderr 永远不许原样进飞书。 */
 export function diagnosticSnippet(text, max = 200) {
   const cps = Array.from(displaySafe(String(text ?? "").trim()));
@@ -67,10 +68,16 @@ export function chatReplyPathStatus({ claudeBin = "claude", env = process.env } 
  */
 export function chatReply({ instruction, claudeBin = "claude", timeoutMs = chatReplyTimeoutMs(), cwd = os.homedir(), env = process.env } = {}) {
   const startedAt = Date.now();
-  const run = spawnSync(claudeBin, ["-p", instruction, "--append-system-prompt", CHAT_SYSTEM_PROMPT, ...CHAT_REPLY_ARGS], {
-    cwd, encoding: "utf-8", timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024,
-    env: { ...env, FEISHU_BRIDGE_ROLE: "chat" },
-  });
+  let run;
+  try {
+    run = spawnSync(claudeBin, ["-p", instruction, "--append-system-prompt", CHAT_SYSTEM_PROMPT, ...CHAT_REPLY_ARGS], {
+      cwd, encoding: "utf-8", timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024,
+      env: { ...env, FEISHU_BRIDGE_ROLE: "chat" },
+    });
+  } catch (err) {
+    // spawnSync 同步抛（参数越界、cwd 不可用之类）也是"起不来"：受控返回，让入口能记终态，不裸抛在 claim 之后
+    return { ok: false, reason: "spawn_failed", why: chatFailText("spawn_failed"), diagnostic: diagnosticSnippet(err?.code ?? err?.message ?? err, 80), elapsedMs: Date.now() - startedAt };
+  }
   const elapsedMs = Date.now() - startedAt;
   const diagnostic = run.stderr ? diagnosticSnippet(run.stderr) : null;
   if (run.error) {

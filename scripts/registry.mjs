@@ -404,6 +404,23 @@ export function releasePublishLock(lockDir, { waitMs = 500 } = {}) {
 }
 
 /**
+ * 持锁提交（fencing）：在 reap 锁里核对主锁**仍是我这一实例**（token），再跑 fn —— 与陈旧回收互斥。
+ * 我持锁期间若停顿超过 staleMs 被别人按协议合法回收、锁又被拿走，这里返回 lock_lost，fn 不跑；
+ * "提交之后才发现锁没了"补救不了已落盘的覆盖，所以核对必须在提交之前、且在归属转换互斥段内。
+ * 旧版目录锁没有 token，不给 fencing（lock_lost）。fn 抛错原样抛出（reap 锁在 finally 里释放）。
+ * @returns {{ ok: true, run: any } | { ok: false, reason: "lock_lost"|"reap_busy"|"reap_residue"|"io_error", present?: boolean }}
+ */
+export function commitWhileHeld(lockDir, fn, { waitMs = 200 } = {}) {
+  const mine = HELD.get(lockDir) ?? null;
+  const done = withReapLock(lockDir, () => {
+    const r = readLockOwner(lockDir);
+    if (!r.present || !r.owner || r.legacy || mine === null || r.owner.token !== mine) return { ok: false, reason: "lock_lost", present: r.present };
+    return { ok: true, run: fn() };
+  }, { waitMs });
+  return done.ok ? done.run : done;
+}
+
+/**
  * 显式维护入口：reap 锁残骸（回收者崩在几毫秒的段里）只在这里清，热路径不自愈。
  *
  *   · 只认**形状合法的 symlink** 残骸（reap 锁从来没有目录形态）：目录、普通文件、畸形 symlink 一律

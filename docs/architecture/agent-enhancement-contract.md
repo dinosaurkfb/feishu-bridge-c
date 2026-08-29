@@ -542,6 +542,14 @@ bridge-home/
 必须版本化。两份安装不得同时注册为同一 endpoint/session 的默认 owner；dispatcher 路由表必须
 能检测 owner 冲突并拒绝静默覆盖。
 
+## 14a. 入站权限判定契约（2026-08-29）
+
+- 判据各只有一份，两条链共用：角色表 `scripts/sender-roles.mjs`（owner 只有一个 = `frank_sender_id`；operator / participant 由模板 `senders` 登记）、风险等级 `scripts/risk-class.mjs`、交叉表 `scripts/authorize.mjs`。
+- 判定点唯一：三道闸（登记发送者在角色表里、真实 @、新鲜度）之后、控制命令解析之后、拿 claim 之前；`authorize({ role, riskClass, mode })` 不允许 → 写 `authz-<message_id>` 回执（status rejected、reason not_authorized、角色、风险等级、模式、required_roles），回执文案说清"哪个模式、哪个角色、缺什么权限"；**不取 claim、不投递、不静默**（同一消息重发是新一笔，不算重放）。
+- 风险等级：R0 只读（正文恰为本链 status / subscribe 命令词）、R1 对话（Dialogue 下普通文本）、R2 执行（Mapping 下普通文本）、R3 控制（feishu-mode / bind / rotate 精确形状）、R4 授权类（装 / 切路由 的封闭措辞）；模式说不清时普通文本按 R2（fail-closed）。
+- 交叉表（Frank 2026-08-29）：Mapping 只有 owner 可 R2；Dialogue 的 R1 对 owner / operator / participant 都开；R0 只有 owner（operator 暂与 participant 同权）；R3 / R4 只有 owner；未登记零权限。表里没写的格子一律不允许。
+- 首次认领（绑定）仍只认 owner（R3 语义）。
+
 ## 15. 测试契约
 
 ### 必须覆盖的公共契约测试

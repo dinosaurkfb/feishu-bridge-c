@@ -114,6 +114,8 @@ Agent + 群/租户 + sender + event type ──subscribe──> 项目/业务域
 
 ### FR-2 项目/业务域事件订阅
 
+> 实现状态（2026-08-29）：发送者已从单个 `frank_sender_id` 变成角色表（owner / operator / participant，见 `sender-roles.mjs`）；入站闸门是"在角色表里"，谁能做什么由 FR-7 的权限判定决定。
+
 1. Owner 可以把一个项目订阅到一个或多个飞书群；
 2. subscription 必须声明允许的 Agent、群/租户、发送者集合和事件类型；
 3. 同一群中的不同 Agent 可以订阅不同项目或业务域；
@@ -188,6 +190,8 @@ Relay 必须显式使用新的 policy version；其预算分别统计 human cycl
 
 ### FR-6 管理模式
 
+> 实现状态（2026-08-29）：管理策略档案（项目推进 / 专家 / 带教）与 observe / advise / execute / modify 四级仍未实现；已实现的是**入站权限分级**（角色 × 风险等级 × 第 4 层模式，`authorize.mjs`），它不是这里的四级权限，而是"谁的消息在哪种模式下能触发什么风险等级的动作"。
+
 管理模式用于长期监督与增强，至少包含三种策略档案：
 
 | 档案 | 目的 | 典型输出 |
@@ -206,6 +210,8 @@ Relay 必须显式使用新的 policy version；其预算分别统计 human cycl
 模式名称不能隐含权限；例如“项目推进”不自动获得发消息、改任务或改 Agent 的权限。
 
 ### FR-7 显式控制面
+
+> 实现状态（2026-08-29）：路由器在三道闸之后、拿 claim 之前做唯一一处 `authorize({ role, riskClass, mode })`。风险等级 R0 只读 / R1 对话 / R2 执行 / R3 控制 / R4 授权类由 `risk-class.mjs` 归类（普通文本：Dialogue → R1，Mapping → R2）；交叉表 Mapping 只有 owner 可 R2、Dialogue 的 R1 对三种角色都开、R3 / R4 只有 owner、operator 暂与 participant 同权；拒绝回执写明模式 / 角色 / 缺的权限，不取 claim、不投递。
 
 建议的用户控制入口：
 

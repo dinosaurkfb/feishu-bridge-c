@@ -12,6 +12,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
+import { RISK, classifyRisk } from "./risk-class.mjs";
+import { AUTHORIZATION_TABLE, authorize } from "./authorize.mjs";
 import { SENDER_ROLES, roleCounts, roleCountsText, senderRole, senderRolesProblem, senderTable, roleEntriesProblem } from "./sender-roles.mjs";
 import { parseRegisterSenderArgs, planSenderChange, applySenderChange } from "./register-sender.mjs";
 // symlink 锁：existsSync 会跟随到不存在的目标，锁在不在只能用 lstat 判
@@ -19296,6 +19298,105 @@ test("控制事务的换绑窗口（评审 #97）：事务锁内核验通过之�
   assert.equal(policyOf(), MAPPING_POLICY_ID, "新绑定的模式没被旧命令改掉");
   assert.equal(readConsumedRecord({ claimsDir, key }).status, "absent", "不落 consumed");
   assert.equal(inspectControlClaim({ claimsDir, key }).state, "failed", "记成受验 failed（当时没切成）");
+});
+
+
+test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两条链真入口的拒绝回执与放行", () => {
+  // ── 风险归类：判据只看"这条消息想干什么"
+  const ctl = { kind: "mode", mode: DIALOGUE_POLICY_ID };
+  assert.deepEqual(classifyRisk({ instruction: "/feishu-mode dialogue", chain: "claude", mode: MAPPING_POLICY_ID, control: ctl }), { riskClass: RISK.R3, kind: "control" });
+  assert.deepEqual(classifyRisk({ instruction: "/feishu-status", chain: "claude", mode: MAPPING_POLICY_ID }), { riskClass: RISK.R0, kind: "readonly" });
+  assert.deepEqual(classifyRisk({ instruction: "$feishu-subscribe", chain: "codex", mode: DIALOGUE_POLICY_ID }), { riskClass: RISK.R0, kind: "readonly" });
+  assert.deepEqual(classifyRisk({ instruction: "/feishu-bind", chain: "claude", mode: MAPPING_POLICY_ID }), { riskClass: RISK.R3, kind: "control" });
+  assert.deepEqual(classifyRisk({ instruction: "/feishu-rotate cancel", chain: "claude", mode: DIALOGUE_POLICY_ID }), { riskClass: RISK.R3, kind: "control" });
+  assert.equal(classifyRisk({ instruction: "$feishu-status", chain: "claude", mode: MAPPING_POLICY_ID }).riskClass, RISK.R2, "别的链的前缀不算本链命令");
+  for (const t of ["装", "装 8c5cedc", "安装", "切路由 两条链", "切路由"]) assert.deepEqual(classifyRisk({ instruction: t, chain: "claude", mode: MAPPING_POLICY_ID }), { riskClass: RISK.R4, kind: "authorization" }, t);
+  assert.equal(classifyRisk({ instruction: "装修一下", chain: "claude", mode: MAPPING_POLICY_ID }).riskClass, RISK.R2, "授权用语是封闭形状");
+  assert.deepEqual(classifyRisk({ instruction: "帮我看看这个问题", chain: "claude", mode: DIALOGUE_POLICY_ID }), { riskClass: RISK.R1, kind: "conversation" });
+  assert.deepEqual(classifyRisk({ instruction: "帮我看看这个问题", chain: "claude", mode: MAPPING_POLICY_ID }), { riskClass: RISK.R2, kind: "instruction" });
+  assert.deepEqual(classifyRisk({ instruction: "帮我看看", chain: "claude", mode: "turbo" }), { riskClass: RISK.R2, kind: "instruction" }, "模式说不清按 R2");
+  // ── 交叉表逐格（Frank 2026-08-29）
+  const expect = {
+    [MAPPING_POLICY_ID]: { R0: ["owner"], R1: ["owner"], R2: ["owner"], R3: ["owner"], R4: ["owner"] },
+    [DIALOGUE_POLICY_ID]: { R0: ["owner"], R1: ["owner", "operator", "participant"], R2: ["owner"], R3: ["owner"], R4: ["owner"] },
+  };
+  for (const mode of [MAPPING_POLICY_ID, DIALOGUE_POLICY_ID]) for (const r of ["R0", "R1", "R2", "R3", "R4"]) {
+    assert.deepEqual([...AUTHORIZATION_TABLE[mode][r]], expect[mode][r], mode + "/" + r);
+    for (const role of ["owner", "operator", "participant"]) {
+      const d = authorize({ role, riskClass: r, mode });
+      assert.equal(d.allow, expect[mode][r].includes(role), mode + "/" + r + "/" + role);
+      if (!d.allow) assert.match(d.text, new RegExp("处于 (Mapping|Dialogue) 模式；你的角色是 " + role + "，" + r + "（.+） 需要 " + expect[mode][r].join(" / ") + " 权限", "u"), d.text);
+    }
+    assert.deepEqual([authorize({ role: null, riskClass: r, mode }).reason, authorize({ role: "boss", riskClass: r, mode }).reason], ["sender_not_registered", "sender_not_registered"]);
+  }
+  assert.ok(Object.isFrozen(AUTHORIZATION_TABLE));
+  assert.equal(authorize({ role: "owner", riskClass: "R2", mode: "turbo" }).reason, "mode_unknown");
+  assert.equal(authorize({ role: "owner", riskClass: "R9", mode: MAPPING_POLICY_ID }).reason, "risk_unknown");
+  // ── Claude 真入口：模板登记 operator 222 / participant 333
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-authz-"));
+  const root = path.join(local, "project"); const bin = path.join(local, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, senders: [{ open_id: "222", role: "operator" }, { open_id: "333", role: "participant" }] }));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "authz", root, name: "权限演示", root_message_id: "om_authz", expires_at: "2099-01-01T00:00:00Z",
+    session_id: "aily_authz", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z" }] }));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  let seq = 0;
+  const run = (body, sender) => {
+    seq += 1;
+    const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> " + body;
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_authz_" + seq, sessionID: "aily_authz", role: "user", createdBy: sender, createdAtMs: Date.now(), content } }) }] });
+    return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
+      env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+        AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_authz", AILY_CLI_RUN_ID: "run_authz", FAKE_AILY_ENVELOPE: envelope } });
+  };
+  const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
+  const receiptsDir = path.join(root, ".runtime-data", "inbound", "receipts");
+  const claimCount = () => (fs.existsSync(claimsDir) ? fs.readdirSync(claimsDir).filter((n) => n.endsWith(".claim")).length : 0);
+  const authzReceipts = () => (fs.existsSync(receiptsDir) ? fs.readdirSync(receiptsDir).filter((n) => n.startsWith("authz-")) : []);
+  const policyOf = () => loadClaudeInteractionPolicy({ root, claudeSessionId: null, registryFile }).state.policy_id;
+  assert.equal(policyOf(), MAPPING_POLICY_ID);
+  // Mapping：participant 的普通文本 = R2 → 拒，回执说清模式/角色/权限；不取 claim
+  const p1 = run("帮我改一下代码", "333");
+  assert.equal(p1.status, 0, p1.stdout + p1.stderr);
+  assert.match(p1.stdout, /处于 Mapping 模式；你的角色是 participant，R2（执行） 需要 owner 权限/u, p1.stdout);
+  assert.equal(claimCount(), 0, "拒绝不取 claim");
+  assert.equal(authzReceipts().length, 1);
+  const rec = JSON.parse(fs.readFileSync(path.join(receiptsDir, authzReceipts()[0]), "utf-8"));
+  assert.deepEqual([rec.status, rec.reason, rec.role, rec.risk_class, rec.policy_id, rec.required_roles], ["rejected", "not_authorized", "participant", "R2", MAPPING_POLICY_ID, ["owner"]]);
+  // operator 暂与 participant 同权
+  const o1 = run("帮我改一下代码", "222");
+  assert.match(o1.stdout, /你的角色是 operator，R2（执行） 需要 owner 权限/u, o1.stdout);
+  // R3 / R4 只有 owner：participant 切模式、说"装"都拒，模式没变
+  const p3 = run("/feishu-mode dialogue", "333");
+  assert.match(p3.stdout, /你的角色是 participant，R3（控制） 需要 owner 权限/u, p3.stdout);
+  assert.equal(policyOf(), MAPPING_POLICY_ID, "participant 切不动模式");
+  const p4 = run("装 8c5cedc", "333");
+  assert.match(p4.stdout, /R4（授权类） 需要 owner 权限/u, p4.stdout);
+  // 未登记：仍是今天的拒绝理由（在三道闸那一层）
+  const u1 = run("帮我改一下代码", "444");
+  assert.match(u1.stdout, /发送者不是授权用户/u, u1.stdout);
+  assert.doesNotMatch(u1.stdout, /你的角色是/u);
+  assert.equal(claimCount(), 0);
+  // owner：Mapping 下普通文本照旧放行（拿到 claim，进入投递路径；不是 not_authorized）
+  const ownerMsg = run("帮我改一下代码", TPL.frank_sender_id);
+  assert.doesNotMatch(ownerMsg.stdout, /你的角色是|需要 owner 权限/u, ownerMsg.stdout);
+  assert.doesNotMatch(ownerMsg.stderr, /not_authorized/u, ownerMsg.stderr);
+  assert.equal(claimCount(), 1, "owner 的消息取了 claim");
+  // owner 切到 Dialogue → participant 的普通文本 = R1 → 放行（不是 not_authorized；取 claim）
+  const sw = run("/feishu-mode dialogue", TPL.frank_sender_id);
+  assert.match(sw.stdout, /已切换/u, sw.stdout);
+  assert.equal(policyOf(), DIALOGUE_POLICY_ID);
+  const before = claimCount();
+  const p5 = run("这个问题你怎么看", "333");
+  assert.doesNotMatch(p5.stdout, /你的角色是|需要 owner 权限/u, p5.stdout);
+  assert.doesNotMatch(p5.stderr, /not_authorized/u, p5.stderr);
+  assert.equal(claimCount(), before + 1, "participant 的对话取了 claim");
+  const o5 = run("我也问一句", "222");
+  assert.doesNotMatch(o5.stdout, /你的角色是|需要 owner 权限/u, o5.stdout);
+  // Dialogue 下 participant 的 R0 / R3 仍拒
+  assert.match(run("/feishu-status", "333").stdout, /R0（只读） 需要 owner 权限/u);
+  assert.match(run("/feishu-mode mapping", "333").stdout, /R3（控制） 需要 owner 权限/u);
+  assert.equal(policyOf(), DIALOGUE_POLICY_ID);
 });
 
 

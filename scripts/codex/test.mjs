@@ -9068,6 +9068,37 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
   fs.rmSync(rerunResidue, { recursive: true });
   assert.equal(repair("--thread-id", THREAD_A, "--key", key9, "--apply").status, 0);
 
+  // ── 第 2 层权限判定（Codex 链与 Claude 同一份表）：模板登记 operator 2222 / participant 3333
+  {
+    fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({ ...TEMPLATE, senders: [{ open_id: "2222", role: "operator" }, { open_id: "3333", role: "participant" }] }));
+    const runAs = (body, sender, messageId) => {
+      const content = '<at id="ou_same" type="employee">M5Codex</at> ' + body;
+      const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: messageId, sessionID: "aily_session_a", role: "user", createdBy: sender, createdAtMs: Date.now(), content } }) }] });
+      return spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], { encoding: "utf-8",
+        env: { ...isolatedEnv(), PATH: bin + path.delimiter + process.env.PATH, FEISHU_CODEX_BRIDGE_HOME: home, AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "aily_session_a", AILY_CLI_RUN_ID: "run_authz", FAKE_AILY_ENVELOPE: envelope } });
+    };
+    assert.equal(setTaskInteractionMode({ threadId: THREAD_A, mode: MAPPING_POLICY_ID, home }).ok, true);
+    assert.equal(policyOf(), MAPPING_POLICY_ID);
+    const claimsBefore = fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).length;
+    const denied = runAs("帮我改一下代码", "3333", "msg_authz_1");
+    assert.match(denied.stdout, /处于 Mapping 模式；你的角色是 participant，R2（执行） 需要 owner 权限/u, denied.stdout);
+    assert.equal(fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).length, claimsBefore, "拒绝不取 claim");
+    assert.ok(fs.readdirSync(paths.receipts).some((n) => n.startsWith("authz-")), "写了 authz 回执");
+    assert.match(runAs("$feishu-mode dialogue", "2222", "msg_authz_2").stdout, /你的角色是 operator，R3（控制） 需要 owner 权限/u);
+    assert.equal(policyOf(), MAPPING_POLICY_ID);
+    assert.match(runAs("帮我改一下代码", "4444", "msg_authz_3").stdout, /发送者不是授权用户/u, "未登记仍是三道闸的理由");
+    const ownerOk = runAs("帮我改一下代码", TEMPLATE.frank_sender_id, "msg_authz_4");
+    assert.doesNotMatch(ownerOk.stdout, /你的角色是|需要 owner 权限/u, ownerOk.stdout);
+    assert.equal(fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).length, claimsBefore + 1, "owner 取了 claim");
+    assert.match(runAs("$feishu-mode dialogue", TEMPLATE.frank_sender_id, "msg_authz_5").stdout, /已切换/u);
+    const beforeChat = fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).length;   // 控制命令自己也取 claim
+    const chat = runAs("这个问题你怎么看", "3333", "msg_authz_6");
+    assert.doesNotMatch(chat.stdout, /你的角色是|需要 owner 权限/u, "Dialogue 下 participant 可对话：" + chat.stdout);
+    assert.equal(fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).length, beforeChat + 1, "participant 的对话取了 claim");
+    assert.equal(setTaskInteractionMode({ threadId: THREAD_A, mode: MAPPING_POLICY_ID, home }).ok, true);
+    fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  }
+
   // ── 评审第 6 轮 ──
   // 运输层重放遇到受验的 failed：按记录重出失败回执，不执行
   const key10 = claimKey("msg_ctl_10", ltk);

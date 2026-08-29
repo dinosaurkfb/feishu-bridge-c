@@ -33,6 +33,7 @@ import { isCanonicalIso } from "./canonical-time.mjs";
 import { SENDER_ROLES } from "./sender-roles.mjs";
 import { RISK } from "./risk-class.mjs";
 import { CHAT_FAIL_REASONS, SIGNAL_SHAPE } from "./chat-reply.mjs";
+import { shellQuote } from "./shell-quote.mjs";
 
 export const CHAT_MAX_CONCURRENT = 2;
 export const CHAT_MAX_PER_SENDER = 1;
@@ -48,6 +49,8 @@ const SENDER_REF_SHAPE = /^sender_[0-9a-f]{16}$/u;
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 /** 临时文件我们只会生成这种名字：<key>.<pid>.<time>.<uuid>（与记录同目录；不参与准入盘点） */
 export const TMP_NAME_SHAPE = new RegExp("^[0-9a-f]{64}\\.\\d+\\.\\d+\\." + UUID + "$", "u");
+/** 临时文件条目的全部合法形状：原名，或 sweep 隔离时追加的 .quarantine-<uuid>（可叠加：隔离后没删成、再次隔离） */
+const TMP_ENTRY_SHAPE = new RegExp("^[0-9a-f]{64}\\.\\d+\\.\\d+\\." + UUID + "(\\.quarantine-" + UUID + ")*$", "u");
 const BASE_KEYS = ["chain", "key", "message_id", "pid", "risk_class", "role", "schema_version", "sender_ref", "session_id", "started_at", "state"];
 const ANSWERED_KEYS = [...BASE_KEYS, "elapsed_ms", "recorded_at", "text"].sort().join(",");
 const FAILED_KEYS = Object.freeze({
@@ -163,7 +166,14 @@ export function chatLoad({ ledgerDir, senderId, now = Date.now(), budgetMs }) {
   const me = senderRef(senderId);
   let running = 0; let bySender = 0; let unresolved = 0; const why = [];
   for (const n of names) {
-    if (isAdmissionLockEntry(n) || TMP_NAME_SHAPE.test(n)) continue;
+    if (isAdmissionLockEntry(n)) continue;
+    if (TMP_ENTRY_SHAPE.test(n)) {
+      // 只跳过**受验的普通文件**；临时名字上挂着符号链接 / 目录 / 管道就是说不清，不折成可用
+      let st = null;
+      try { st = fs.lstatSync(path.join(ledgerDir, n)); } catch (err) { if (err?.code === "ENOENT") continue; }
+      if (st === null || !st.isFile()) { unresolved += 1; why.push("临时文件位置上不是普通文件 " + n.slice(0, 20) + "…"); }
+      continue;
+    }
     if (!n.endsWith(CHAT_RECORD_SUFFIX) || !KEY_SHAPE.test(n.slice(0, -CHAT_RECORD_SUFFIX.length))) { unresolved += 1; why.push("认不出的条目 " + n.slice(0, 40)); continue; }
     const key = n.slice(0, -CHAT_RECORD_SUFFIX.length);
     const seen = inspectChat({ ledgerDir, key });
@@ -177,6 +187,8 @@ export function chatLoad({ ledgerDir, senderId, now = Date.now(), budgetMs }) {
   return { running, bySender, unresolved, why };
 }
 
+/** 维护命令里给真实路径（破坏性入口只认真实路径）；解析不了就原样给。 */
+const realLedgerPath = (dir) => { try { return fs.realpathSync(dir); } catch { return dir; } };
 /** 盘点临时文件（封闭名字）：普通文件按年龄分进位中 / 残骸；不是普通文件或 lstat 非 ENOENT 错误 = 说不清。 */
 function scanTmp(ledgerDir, now) {
   let names;
@@ -184,12 +196,13 @@ function scanTmp(ledgerDir, now) {
   catch (err) { return { ok: err?.code === "ENOENT", why: err?.code === "ENOENT" ? null : "目录读不出：" + String(err.code ?? err.message), entries: [] }; }
   const entries = [];
   for (const n of names) {
-    if (!TMP_NAME_SHAPE.test(n)) continue;
+    if (!TMP_ENTRY_SHAPE.test(n)) continue;
     let st;
     try { st = fs.lstatSync(path.join(ledgerDir, n)); }
     catch (err) { if (err?.code === "ENOENT") continue; entries.push({ name: n, kind: "unclear", why: "lstat 失败（" + String(err.code ?? err.message) + "）" }); continue; }
     if (!st.isFile()) { entries.push({ name: n, kind: "unclear", why: "不是普通文件" }); continue; }
-    entries.push({ name: n, kind: "file", ageMs: now - st.mtimeMs });
+    // 身份在盘点这一刻记下：隔离后按它核对 —— 盘点与删除之间被换进来的东西身份不同，不会被删
+    entries.push({ name: n, kind: "file", ageMs: now - st.mtimeMs, dev: st.dev, ino: st.ino });
   }
   return { ok: true, why: null, entries };
 }
@@ -205,17 +218,38 @@ export function inspectScratch({ ledgerDir, now = Date.now() }) {
   for (const e of scan.entries) {
     if (e.kind === "unclear") { problems.push("临时文件位置上说不清的条目（" + e.why + "，不动）：" + e.name.slice(0, 40)); continue; }
     if (e.ageMs <= TMP_RESIDUE_AGE_MS) { inflight += 1; continue; }
-    problems.push("scratch 残骸（超过 " + Math.round(TMP_RESIDUE_AGE_MS / 1000) + " 秒仍在）" + e.name.slice(0, 20) + "…：不影响准入，用 node scripts/chat-scratch-sweep.mjs --ledger " + ledgerDir + " 清（先预览，再加 --apply）");
+    problems.push("scratch 残骸（超过 " + Math.round(TMP_RESIDUE_AGE_MS / 1000) + " 秒仍在）" + e.name.slice(0, 20) + "…：不影响准入，用 node scripts/chat-scratch-sweep.mjs --ledger " + shellQuote(realLedgerPath(ledgerDir)) + " 清（先预览，再加 --apply）");
   }
   return { inflight, problems };
 }
 
 /**
- * 显式维护入口：清 scratch 残骸。账本锁内、只认封闭名字 + 普通文件 + 超过 olderThanMs；说不清的不动。
- * 名字唯一（uuid），协议里没有任何写者会再用同一个名字，所以判断与删除之间不会出现协议内的新实例。
- * @returns {{ ok: true, candidates: {name, ageMs, removed, error}[], young: number, problems: string[] } | { ok: false, reason, why? }}
+ * 破坏性入口的账本目录边界：必须是绝对路径、真实路径（各段都不经符号链接：realpath 与给定路径相等）、本身是目录（lstat，不是符号链接）。
+ * @returns {null | string} 通过返回 null，否则返回原因
+ */
+export function ledgerDirProblem(ledgerDir) {
+  if (typeof ledgerDir !== "string" || ledgerDir.length === 0) return "账本目录缺失";
+  if (!path.isAbsolute(ledgerDir)) return "账本目录必须是绝对路径";
+  let st;
+  try { st = fs.lstatSync(ledgerDir); } catch (err) { return "账本目录 lstat 失败：" + String(err?.code ?? err?.message ?? err); }
+  if (st.isSymbolicLink()) return "账本目录是符号链接（别名），不动";
+  if (!st.isDirectory()) return "账本目录不是目录";
+  let real;
+  try { real = fs.realpathSync(ledgerDir); } catch (err) { return "账本目录 realpath 失败：" + String(err?.code ?? err?.message ?? err); }
+  if (real !== ledgerDir) return "账本目录路径里有符号链接（真实路径不同），请用真实路径";
+  return null;
+}
+
+/**
+ * 显式维护入口：清 scratch 残骸。账本目录先过 ledgerDirProblem；账本锁内、只认封闭名字 + 普通文件 + 超过 olderThanMs；说不清的不动。
+ * 删除走**隔离协议**（评审探针：盘点后按原路径 unlink 会删掉换进来的目录项）：lstat 记身份 → rename 到唯一隔离路径 → 隔离路径上 lstat
+ * 核对 dev/ino 一致才 unlink；不一致 = 实例已变（instance_changed），保留在隔离路径、不删；隔离后没删成也保留（quarantine_unremoved）。
+ * 隔离名（.quarantine-<uuid>）仍是受验形状，下次 sweep 会再处理。
+ * @returns {{ ok: true, candidates: {name, ageMs, removed, reason, quarantine}[], young: number, problems: string[], lockUncleared?, lockLost? } | { ok: false, reason, why? }}
  */
 export function sweepScratch({ ledgerDir, now = Date.now(), apply = false, olderThanMs = TMP_RESIDUE_AGE_MS }) {
+  const dirProblem = ledgerDirProblem(ledgerDir);
+  if (dirProblem !== null) return { ok: false, reason: "ledger_dir_unverified", why: dirProblem };
   return withLedgerLock(ledgerDir, ADMIT_LOCK_WAIT_MS, () => {
     const scan = scanTmp(ledgerDir, now);
     if (!scan.ok) return { ok: true, candidates: [], young: 0, problems: [scan.why] };
@@ -223,15 +257,25 @@ export function sweepScratch({ ledgerDir, now = Date.now(), apply = false, older
     for (const e of scan.entries) {
       if (e.kind === "unclear") { problems.push(e.name.slice(0, 40) + "（" + e.why + "）"); continue; }
       if (e.ageMs <= olderThanMs) { young += 1; continue; }
-      const c = { name: e.name, ageMs: e.ageMs, removed: false, error: null };
-      if (apply) {
-        try { fs.unlinkSync(path.join(ledgerDir, e.name)); c.removed = true; }
-        catch (err) { if (err?.code === "ENOENT") c.removed = true; else c.error = String(err.code ?? err.message); }
-      }
+      const c = { name: e.name, ageMs: e.ageMs, removed: false, reason: null, quarantine: null };
+      if (apply) Object.assign(c, quarantineAndRemove(path.join(ledgerDir, e.name), { dev: e.dev, ino: e.ino }));
       candidates.push(c);
     }
     return { ok: true, candidates, young, problems };
   });
+}
+/** 隔离协议的一次执行（身份来自盘点那一刻）：rename 到唯一隔离路径 → 隔离路径上 lstat 核对 dev/ino → 一致才 unlink。返回 { removed, reason, quarantine }。 */
+function quarantineAndRemove(full, before) {
+  const q = full + ".quarantine-" + crypto.randomUUID();
+  try { fs.renameSync(full, q); }
+  catch (err) { return err?.code === "ENOENT" ? { removed: true, reason: "already_gone", quarantine: null } : { removed: false, reason: "quarantine_failed：" + String(err.code ?? err.message), quarantine: null }; }
+  let after;
+  try { after = fs.lstatSync(q); }
+  catch (err) { return { removed: false, reason: "quarantine_unreadable：" + String(err.code ?? err.message), quarantine: q }; }
+  if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino) return { removed: false, reason: "instance_changed", quarantine: q };
+  try { fs.unlinkSync(q); }
+  catch (err) { return { removed: false, reason: "quarantine_unremoved：" + String(err.code ?? err.message), quarantine: q }; }
+  return { removed: true, reason: null, quarantine: q };
 }
 
 /**

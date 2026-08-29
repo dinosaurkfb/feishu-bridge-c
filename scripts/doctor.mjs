@@ -319,8 +319,9 @@ export function runDoctor({
     const ledgers = [["Claude", path.join(ctx.home, ".claude", "feishu-bridge", "inbound", "chat-claims")], ["Codex", path.join(codexBridgeHome, "inbound", "chat-claims")]];
     const parts = []; const problems = [];
     for (const [chain, dir] of ledgers) {
-      const load = chatLoad({ ledgerDir: dir, senderId: null, now, budgetMs: chatReplyTimeoutMs() });
-      parts.push(chain + " 正在答 " + load.running + " 条");
+      // doctor 不持账本锁：进行中的进位与残骸分不清，只把超过 1 分钟仍在的临时文件算残骸，年轻的报"进位中"
+      const load = chatLoad({ ledgerDir: dir, senderId: null, now, budgetMs: chatReplyTimeoutMs(), locked: false });
+      parts.push(chain + " 正在答 " + load.running + " 条" + (load.inflight > 0 ? "（进位中 " + load.inflight + " 个临时文件，不算问题）" : ""));
       for (const why of load.why) problems.push(chain + "：" + why);
       for (const why of inspectAdmissionLocks({ ledgerDir: dir, now }).problems) problems.push(chain + "：" + why);
     }

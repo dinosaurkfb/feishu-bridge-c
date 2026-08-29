@@ -231,15 +231,17 @@ function chatTurn({ chain, template, event, dryRun, ledgerDir }) {
   // 锁没交还：飞书正文只给状态词与锁协议的指引（主锁不要手删，持有者已死超过 5 分钟由下一笔按协议回收）；路径与原因只进机器回执
   const admitNote = admitted.lockUncleared ? "（" + lockUnclearedText(admitted.lockUncleared) + "）" : "";
   if (admitted.lockUncleared) writeReceipt("chat-lock-" + messageId, { status: "error", reason: "chat_admission_lock_uncleared", why: admitted.lockUncleared, lock_dir: ledgerDir, ...base, claim_acquired: true });
+  // 自己的临时文件没清掉（极少见）：不影响这条回答，doctor ⑨ 会点名；只进机器回执
+  if (admitted.tmpResidue) writeReceipt("chat-tmp-" + messageId, { status: "error", reason: "chat_ledger_tmp_residue", tmp: admitted.tmpResidue, ...base, claim_acquired: true });
   const reply = chatReply({ instruction });
   if (!reply.ok) {
     const recorded = recordChatOutcome({ ledgerDir, key, outcome: { status: "failed", reason: reply.reason, why: reply.why, diagnostic: reply.diagnostic ?? null, elapsed_ms: reply.elapsedMs,
       ...(reply.reason === "timeout" ? { timeout_ms: reply.timeoutMs } : {}), ...(reply.reason === "nonzero_exit" ? { exit_code: reply.exitCode } : {}), ...(reply.reason === "signaled" ? { signal: reply.signal } : {}) } });
-    writeReceipt("chat-failed-" + messageId, { status: "error", reason: "chat_reply_failed", why: reply.reason, detail: reply.why, diagnostic: reply.diagnostic ?? null, elapsed_ms: reply.elapsedMs, ledger: recorded.ok ? "recorded" : recorded.reason, ...base, claim_acquired: true });
+    writeReceipt("chat-failed-" + messageId, { status: "error", reason: "chat_reply_failed", why: reply.reason, detail: reply.why, diagnostic: reply.diagnostic ?? null, elapsed_ms: reply.elapsedMs, ledger: recorded.ok ? "recorded" : recorded.reason, ledger_lock_uncleared: recorded.lockUncleared ?? null, ledger_tmp_residue: recorded.tmpResidue ?? null, ...base, claim_acquired: true });
     finish("error", { detail: "chat 没答出来（" + reply.why + "）。这里没有接入，无法稍后补发，请再问一次" + (recorded.ok ? "" : "（账本没记下终态：" + recorded.reason + "）") + admitNote }, { reason: "chat_reply_failed", why: reply.reason, mode: CHAT_POLICY_ID });
   }
   const recorded = recordChatOutcome({ ledgerDir, key, outcome: { status: "answered", text: reply.text, elapsed_ms: reply.elapsedMs } });
-  writeReceipt("chat-" + messageId, { status: "chat", kind: "reply", elapsed_ms: reply.elapsedMs, ledger: recorded.ok ? "recorded" : recorded.reason, ...base, claim_acquired: true });
+  writeReceipt("chat-" + messageId, { status: "chat", kind: "reply", elapsed_ms: reply.elapsedMs, ledger: recorded.ok ? "recorded" : recorded.reason, ledger_lock_uncleared: recorded.lockUncleared ?? null, ledger_tmp_residue: recorded.tmpResidue ?? null, ...base, claim_acquired: true });
   // 回答已经拿到就要给人；账本没记下只影响重放（会按 stale 处理、不再答），如实标注
   finish("chat", { text: displaySafe(reply.text), ledgerNote: (recorded.ok ? "" : "（账本没记下这次回答：" + recorded.reason + "；同一条消息的重放不会再答）") + admitNote || null }, { mode: CHAT_POLICY_ID, kind: "reply", elapsed_ms: reply.elapsedMs, role: gates.role, risk_class: risk.riskClass, ledger: recorded.ok ? "recorded" : recorded.reason, lock_uncleared: admitted.lockUncleared ?? null });
 }

@@ -20019,11 +20019,43 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   assert.match(lockedRun.stdout, /已拒绝 · chat 正在受理另一条消息，稍后再问/u, lockedRun.stdout);
   assert.equal(inspectChat({ ledgerDir, key: chatKey({ chain: "claude", messageId: "msg_chat_" + seq, sessionId: "aily_dm" }) }).state, "absent");
   releaseLedgerLock(path.join(ledgerDir, "admission.lock"));
-  // ── 建 claim 是闭合转换：O_EXCL 独占创建，写进同一个 fd；没有临时文件；同 key 再进位 = duplicate
-  const closedKey = plant("closed_1", "777");
+  // ── 建 claim 是闭合转换：临时文件写全 → link 发布（从不覆盖）；正式路径上要么没有、要么是完整记录；同 key 再进位 = duplicate
+  const closedKey = chatKey({ chain: "claude", messageId: "closed_1", sessionId: "aily_dm" });
+  const originalLink = fs.linkSync; let duringPublish = null; let tmpDuringPublish = null;
+  fs.linkSync = (from, to) => { duringPublish = inspectChat({ ledgerDir, key: closedKey }); tmpDuringPublish = fs.readdirSync(ledgerDir).filter((n2) => n2.includes(".chat.json.tmp.")); return originalLink(from, to); };
+  let published;
+  try { published = admitChat({ ledgerDir, key: closedKey, senderId: "777", budgetMs: 5000, maxConcurrent: 99, maxPerSender: 99, meta: { chain: "claude", message_id: "closed_1", session_id: "aily_dm", sender_ref: senderRef("777"), role: "owner", risk_class: "R1" } }); }
+  finally { fs.linkSync = originalLink; }
+  assert.deepEqual([published.ok, published.tmpResidue, duringPublish, tmpDuringPublish.length], [true, null, { state: "absent" }, 1], "发布前正式路径缺席（没有空文件窗口）、临时文件已写全：" + JSON.stringify(published));
   assert.equal(inspectChat({ ledgerDir, key: closedKey }).state, "running");
-  assert.equal(fs.readdirSync(ledgerDir).filter((n2) => n2.includes(".tmp.")).length, 0, "没有进位用的临时文件");
+  assert.equal(fs.readdirSync(ledgerDir).filter((n2) => n2.includes(".tmp.")).length, 0, "发布后没有临时文件");
   assert.equal(admitChat({ ledgerDir, key: closedKey, senderId: "777", budgetMs: 5000, maxConcurrent: 99, maxPerSender: 99, meta: { chain: "claude", message_id: "closed_1", session_id: "aily_dm", sender_ref: senderRef("777"), role: "owner", risk_class: "R1" } }).reason, "duplicate");
+  assert.equal(fs.readdirSync(ledgerDir).filter((n2) => n2.includes(".tmp.")).length, 0, "duplicate 也不留临时文件");
+  fs.rmSync(recFile(closedKey), { force: true });
+  // 写临时文件失败：受控 unwritable；正式路径没建、临时文件也清了（只删自己的、按 inode 核对）
+  const originalWriteSync = fs.writeSync;
+  fs.writeSync = () => { const e = new Error("forced write failure"); e.code = "EIO"; throw e; };
+  let failedPublish;
+  try { failedPublish = admitChat({ ledgerDir, key: closedKey, senderId: "777", budgetMs: 5000, maxConcurrent: 99, maxPerSender: 99, meta: { chain: "claude", message_id: "closed_1", session_id: "aily_dm", sender_ref: senderRef("777"), role: "owner", risk_class: "R1" } }); }
+  finally { fs.writeSync = originalWriteSync; }
+  assert.deepEqual([failedPublish.ok, failedPublish.reason, failedPublish.why, fs.existsSync(recFile(closedKey)), fs.readdirSync(ledgerDir).filter((n2) => n2.includes(".tmp.")).length], [false, "chat_ledger_unwritable", "EIO", false, 0], JSON.stringify(failedPublish));
+  // 清理只删自己的临时文件：发布之后、清理之前临时路径被换成别人的东西 → 不删（按 dev/ino 核对），如实报 tmpResidue
+  const originalLstat = fs.lstatSync; let swappedTmp = null;
+  fs.lstatSync = (target, ...args) => { const s = String(target); if (swappedTmp === null && s.includes(".chat.json.tmp.")) { swappedTmp = s; fs.renameSync(s, s + ".parked"); fs.writeFileSync(s, "replacement-sentinel"); } return originalLstat(target, ...args); };
+  let swappedPublish;
+  try { swappedPublish = admitChat({ ledgerDir, key: closedKey, senderId: "777", budgetMs: 5000, maxConcurrent: 99, maxPerSender: 99, meta: { chain: "claude", message_id: "closed_1", session_id: "aily_dm", sender_ref: senderRef("777"), role: "owner", risk_class: "R1" } }); }
+  finally { fs.lstatSync = originalLstat; }
+  assert.deepEqual([swappedPublish.ok, swappedPublish.tmpResidue, fs.readFileSync(swappedTmp, "utf-8"), inspectChat({ ledgerDir, key: closedKey }).state], [true, swappedTmp, "replacement-sentinel", "running"], "换进来的不是我的就不删：" + JSON.stringify(swappedPublish));
+  fs.rmSync(swappedTmp, { force: true }); fs.rmSync(swappedTmp + ".parked", { force: true }); fs.rmSync(recFile(closedKey), { force: true });
+  // 记终态是账本锁内的事务：读 running → 写全 → rename 之间没有第二个写者能插进来（评审第 7 轮探针：嵌套写者）
+  plant("closed_1", "777");
+  const originalOpenForRace = fs.openSync; let nestedWrite = null; let nesting = false;
+  fs.openSync = (target, ...args) => { if (!nesting && String(target).includes(".chat.json.tmp.")) { nesting = true; nestedWrite = recordChatOutcome({ ledgerDir, key: closedKey, outcome: { status: "answered", text: "nested-writer", elapsed_ms: 1 }, lockWaitMs: 60 }); } return originalOpenForRace(target, ...args); };
+  let outerWrite;
+  try { outerWrite = recordChatOutcome({ ledgerDir, key: closedKey, outcome: { status: "answered", text: "outer-writer", elapsed_ms: 1 } }); }
+  finally { fs.openSync = originalOpenForRace; }
+  assert.deepEqual([nestedWrite.ok, nestedWrite.reason, outerWrite.ok, inspectChat({ ledgerDir, key: closedKey }).record.text], [false, "chat_admission_busy", true, "outer-writer"], "两个写者只有一个能记：" + JSON.stringify({ nestedWrite, outerWrite }));
+  assert.equal(recordChatOutcome({ ledgerDir, key: closedKey, outcome: { status: "answered", text: "third", elapsed_ms: 1 } }).reason, "already_final");
   fs.rmSync(recFile(closedKey), { force: true });
   // ── 读记录不许被命名管道卡死、不许跟符号链接；终态进位残骸在锁内只能是残骸；枚举封闭
   const fifoKey = chatKey({ chain: "claude", messageId: "fifo_1", sessionId: "aily_dm" });
@@ -20043,7 +20075,7 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   fs.unlinkSync(recFile(linkKey));
   fs.writeFileSync(recFile(closedKey) + ".tmp.1.1", "{");
   const residueAdmit = admitChat({ ledgerDir, key: closedKey, senderId: "777", budgetMs: 5000, meta: { chain: "claude", message_id: "closed_1", session_id: "aily_dm", sender_ref: senderRef("777"), role: "owner", risk_class: "R1" } });
-  assert.equal(residueAdmit.reason, "chat_ledger_unresolved"); assert.match(residueAdmit.load.why.join(" "), /进位残骸（上次记终态中断）/u, "锁内看到的临时文件只能是残骸");
+  assert.equal(residueAdmit.reason, "chat_ledger_unresolved"); assert.match(residueAdmit.load.why.join(" "), /进位残骸（上次事务中断）/u, "锁内看到的临时文件只能是残骸");
   assert.equal(fs.existsSync(recFile(closedKey)), false, "残骸在场时不建 claim");
   fs.rmSync(recFile(closedKey) + ".tmp.1.1", { force: true });
   const failedBase = { ...goodClaim, state: "failed", why: "x", diagnostic: null, elapsed_ms: 1, recorded_at: "2026-08-30T00:00:00.000Z" };
@@ -20110,6 +20142,25 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   assert.deepEqual([doc9reap.ok, /Claude：锁族残留 admission.lock.reap（reap 段锁）.*repair-publish-lock/u.test(doc9reap.detail)], [false, true], JSON.stringify(doc9reap));
   assert.equal(chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000 }).unresolved, 0, "准入盘点不看锁族（它自己持着锁）—— 所以 doctor 必须单独盘");
   fs.rmdirSync(path.join(ledgerDir, "admission.lock.reap"));
+  // 维护锁孤儿：不挡 chat 准入（准入照常成功），只挡维护入口；处置是"确认没有维护者后手动删"，不是指向 repair-publish-lock（它只会说没有 reap 残骸）
+  fs.mkdirSync(path.join(ledgerDir, "admission.lock.maint"));
+  const maintDoc = runDoctor({ home: local }).checks.find((c) => c.id === "chat_ledger");
+  assert.deepEqual([maintDoc.ok, /Claude：锁族残留 admission.lock.maint（维护锁）：不挡 chat 准入，只挡 repair-publish-lock 的维护入口；确认没有维护者在跑之后手动删除/u.test(maintDoc.detail), /repair-publish-lock 处理/u.test(maintDoc.detail)], [false, true, false], JSON.stringify(maintDoc));
+  const withMaint = plant("maint_1", "778");
+  assert.equal(inspectChat({ ledgerDir, key: withMaint }).state, "running", "维护锁在场，准入照常");
+  fs.rmSync(recFile(withMaint), { force: true });
+  fs.rmdirSync(path.join(ledgerDir, "admission.lock.maint"));
+  // 不持锁的盘点（doctor）：年轻的临时文件是"进位中"、不算问题；超过 60 秒仍在的才是残骸。锁内（准入）一律残骸
+  const youngTmp = recFile(closedKey) + ".tmp.1.2";
+  fs.writeFileSync(youngTmp, "{");
+  const youngDoc = runDoctor({ home: local }).checks.find((c) => c.id === "chat_ledger");
+  assert.deepEqual([youngDoc.ok, /Claude 正在答 0 条（进位中 1 个临时文件，不算问题）/u.test(youngDoc.detail)], [true, true], JSON.stringify(youngDoc));
+  assert.equal(chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000, locked: true }).unresolved, 1, "锁内一律残骸");
+  assert.deepEqual([chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000, locked: false }).unresolved, chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000, locked: false }).inflight], [0, 1]);
+  fs.utimesSync(youngTmp, new Date(Date.now() - 2 * 60 * 1000), new Date(Date.now() - 2 * 60 * 1000));
+  const oldDoc = runDoctor({ home: local }).checks.find((c) => c.id === "chat_ledger");
+  assert.deepEqual([oldDoc.ok, /Claude：进位残骸（超过 60 秒仍在）/u.test(oldDoc.detail)], [false, true], JSON.stringify(oldDoc));
+  fs.rmSync(youngTmp, { force: true });
   fs.mkdirSync(path.join(ledgerDir, "admission.lock.reap.quarantine-12345678-1234-1234-1234-123456789abc"));
   assert.match(inspectAdmissionLocks({ ledgerDir }).problems.join(" "), /^锁族残骸 admission.lock.reap.quarantine-.*可直接删$/u);
   fs.rmdirSync(path.join(ledgerDir, "admission.lock.reap.quarantine-12345678-1234-1234-1234-123456789abc"));

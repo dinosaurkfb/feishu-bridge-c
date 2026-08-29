@@ -14,7 +14,7 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import { RISK, classifyRisk } from "./risk-class.mjs";
 import { CHAT_POLICY_ID, CHAT_REPLY_ARGS, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatReplyPathStatus, diagnosticSnippet, chatFailText, CHAT_FAIL_REASONS } from "./chat-reply.mjs";
-import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome, chatClaimProblem, chatOutcomeProblem, isAdmissionLockEntry, CHAT_MAX_CONCURRENT, CHAT_MAX_PER_SENDER } from "./chat-ledger.mjs";
+import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome, chatClaimProblem, chatOutcomeProblem, isAdmissionLockEntry, lockUnclearedText, CHAT_MAX_CONCURRENT, CHAT_MAX_PER_SENDER } from "./chat-ledger.mjs";
 import { acquirePublishLock as acquireLedgerLock, releasePublishLock as releaseLedgerLock } from "./registry.mjs";
 import { evaluateChatGates, CHAT_FALLBACK_REASONS } from "./inbound-route.mjs";
 import { ZERO_TOOL_ARGS } from "./handoff.mjs";
@@ -19853,7 +19853,7 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   assert.deepEqual([...CHAT_REPLY_ARGS], [...ZERO_TOOL_ARGS, "--output-format", "text"], "chat 与 reply_only 共用同一份零工具边界");
   assert.deepEqual(classifyRisk({ instruction: "帮我改代码", chain: "claude", mode: CHAT_POLICY_ID }), { riskClass: RISK.R1, kind: "conversation" }, "chat 里普通文本只能是对话");
   assert.deepEqual([...ZERO_TOOL_ARGS], ["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-session-persistence", "--safe-mode"]);
-  assert.deepEqual([chatReplyTimeoutMs({}), chatReplyTimeoutMs({ FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "500" }), chatReplyTimeoutMs({ FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "-1" })], [60000, 500, 60000]);
+  assert.deepEqual([chatReplyTimeoutMs({}), chatReplyTimeoutMs({ FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "500" }), chatReplyTimeoutMs({ FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "-1" }), chatReplyTimeoutMs({ FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "0.5" }), chatReplyTimeoutMs({ FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "1e3" })], [60000, 500, 60000, 60000, 1000], "预算值域 = 正整数毫秒（与终态 timeout_ms 同一份）");
   const tplWithRoles = { ...TPL, senders: [{ open_id: "222", role: "operator" }, { open_id: "333", role: "participant" }] };
   const ev = (sender, content, ageMs = 0) => ({ sender_id: sender, content, created_at_ms: Date.now() - ageMs });
   const at = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> ";
@@ -19876,7 +19876,8 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   fs.writeFileSync(path.join(bin, "claude"), ["#!/usr/bin/env node",
     "const fs = require('node:fs'); fs.appendFileSync(" + JSON.stringify(claudeLog) + ", JSON.stringify(process.argv.slice(2)) + '\\n');",
     "const ms = Number(process.env.FAKE_CLAUDE_SLEEP_MS || 0); if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);",
-    "if (process.env.FAKE_CLAUDE_FAIL) { process.stderr.write('boom'); process.exit(3); }",
+    "if (process.env.FAKE_CLAUDE_FAIL) { process.stderr.write(process.env.FAKE_CLAUDE_STDERR || 'boom'); process.exit(3); }",
+    "if (process.env.FAKE_CLAUDE_KILL) { process.kill(process.pid, 'SIGKILL'); }",
     "process.stdout.write('回答：' + process.argv[process.argv.indexOf('-p') + 1].slice(0, 40) + '\\n');",
   ].join("\n") + "\n", { mode: 0o700 });
   fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
@@ -20001,7 +20002,7 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   fs.mkdirSync(path.join(ledgerDir, "zzz.chat"), { recursive: true });
   const nBefore = argvLog().length;
   const unresolvedRun = run("账本坏了", TPL.frank_sender_id);
-  assert.notEqual(unresolvedRun.status, 0); assert.match(unresolvedRun.stdout, /chat 账本有 1 处说不清，不起回答；请在本机跑 doctor 查看机器级 chat 账本/u, unresolvedRun.stdout);
+  assert.notEqual(unresolvedRun.status, 0); assert.match(unresolvedRun.stdout, /chat 账本有 1 处说不清，不起回答；请在本机跑 doctor（第 ⑨ 项）查看/u, unresolvedRun.stdout);
   assert.doesNotMatch(unresolvedRun.stdout, /\/Users\/|chat-claims|zzz/u, "飞书正文不带机器路径与逐条原因");
   const unresolvedReceipt = JSON.parse(fs.readFileSync(path.join(local, ".claude", "feishu-bridge", "inbound", "receipts", "chat-ledger-msg_chat_" + seq + ".json"), "utf-8"));
   assert.match(unresolvedReceipt.load.why.join(" "), /认不出的条目 zzz.chat/u, "逐条原因进机器回执"); assert.equal(unresolvedReceipt.ledger_dir, ledgerDir);
@@ -20070,7 +20071,42 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   assert.equal(chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000 }).unresolved, 1, "相似而不精确的名字算认不出");
   fs.rmSync(path.join(ledgerDir, "admission.lockx"), { recursive: true, force: true });
   assert.deepEqual(["admission.lock", "admission.lock.reap", "admission.lock.maint", "admission.lock.reap.quarantine-12345678-1234-1234-1234-123456789abc", "admission.lockx", "admission.lock.reaped-nope"].map(isAdmissionLockEntry), [true, true, true, true, false, false]);
-  assert.deepEqual([...CHAT_FAIL_REASONS], ["timeout", "spawn_failed", "nonzero_exit", "empty_reply"]);
+  assert.deepEqual([...CHAT_FAIL_REASONS], ["timeout", "spawn_failed", "nonzero_exit", "signaled", "empty_reply"]);
+  assert.equal(chatOutcomeProblem({ ...failedBase, reason: "signaled", signal: "SIGKILL" }, goodKey), null);
+  assert.match(chatOutcomeProblem({ ...failedBase, reason: "signaled", signal: "kill -9" }, goodKey), /signal 形状不对/u);
+  assert.equal(chatFailText("signaled", { signal: "SIGKILL" }), "回复进程被信号结束（SIGKILL）");
+  // 被信号结束的真实失败也有终态（不是 nonzero_exit + null 退出码）
+  const killed = run("杀", TPL.frank_sender_id, { FAKE_CLAUDE_KILL: "1" });
+  assert.notEqual(killed.status, 0); assert.match(killed.stdout, /chat 没答出来（回复进程被信号结束（SIGKILL））/u, killed.stdout);
+  assert.deepEqual([inspectChat({ ledgerDir, key: chatKey({ chain: "claude", messageId: "msg_chat_" + seq, sessionId: "aily_dm" }) }).state, inspectChat({ ledgerDir, key: chatKey({ chain: "claude", messageId: "msg_chat_" + seq, sessionId: "aily_dm" }) }).outcome.signal], ["failed", "SIGKILL"], "信号终态记下了信号");
+  // 目录检查与读写之间被换掉（评审探针）：读到的不作数；写的不算数
+  const raceKey = chatKey({ chain: "claude", messageId: "race_1", sessionId: "aily_dm" });
+  const raceDir = path.join(ledgerDir, raceKey + ".chat"); const raceMoved = raceDir + ".moved-away"; const raceAlias = path.join(local, "race-alias"); fs.mkdirSync(raceAlias, { recursive: true });
+  fs.mkdirSync(raceDir); fs.writeFileSync(path.join(raceDir, "claim.json"), JSON.stringify({ ...goodClaim, key: raceKey, message_id: "race_1" }));
+  fs.writeFileSync(path.join(raceAlias, "claim.json"), JSON.stringify({ ...goodClaim, key: raceKey, message_id: "race_1" }));
+  const originalReaddir = fs.readdirSync; let swapped = false;
+  fs.readdirSync = (target, ...args) => { const out = originalReaddir(target, ...args); if (!swapped && path.resolve(String(target)) === path.resolve(raceDir)) { swapped = true; fs.rmSync(raceMoved, { recursive: true, force: true }); fs.renameSync(raceDir, raceMoved); fs.symlinkSync(raceAlias, raceDir); } return out; };
+  let raced;
+  try { raced = inspectChat({ ledgerDir, key: raceKey }); } finally { fs.readdirSync = originalReaddir; }
+  assert.deepEqual([raced.state, raced.why], ["unreadable", "claim 目录在读取期间被替换"], JSON.stringify(raced));
+  fs.unlinkSync(raceDir); fs.renameSync(raceMoved, raceDir);
+  swapped = false;
+  fs.readdirSync = (target, ...args) => { const out = originalReaddir(target, ...args); if (!swapped && path.resolve(String(target)) === path.resolve(raceDir)) { swapped = true; fs.renameSync(raceDir, raceMoved); fs.symlinkSync(raceAlias, raceDir); } return out; };
+  let racedWrite;
+  try { racedWrite = recordChatOutcome({ ledgerDir, key: raceKey, outcome: { status: "answered", text: "偷写", elapsed_ms: 1 } }); } finally { fs.readdirSync = originalReaddir; }
+  assert.deepEqual([racedWrite.ok, racedWrite.why], [false, "claim 目录在写入期间被替换"], JSON.stringify(racedWrite));
+  fs.unlinkSync(raceDir); fs.rmSync(raceMoved, { recursive: true, force: true }); fs.rmSync(raceAlias, { recursive: true, force: true });
+  // 锁没交还的文案按原因：reap 残骸是 fail-closed，要人工维护；其余按协议回收、不要手删；detail 不进正文
+  assert.match(lockUnclearedText({ reason: "reap_residue", detail: "/Users/x/admission.lock.reap" }), /^准入锁的回收段留有残骸（不会自动恢复）.*repair-publish-lock/u);
+  assert.match(lockUnclearedText({ reason: "release_threw", detail: "EIO" }), /持有者已死超过 5 分钟会按锁协议自动回收，不要手删$/u);
+  assert.doesNotMatch(lockUnclearedText({ reason: "release_threw", detail: "/Users/x/y" }), /\/Users\//u);
+  // doctor ⑨：两条链的 chat 账本进体检；坏条目被点名
+  fs.mkdirSync(path.join(ledgerDir, "zzz.chat"), { recursive: true });
+  const doc9 = runDoctor({ home: local }).checks.find((c) => c.id === "chat_ledger");
+  assert.deepEqual([doc9.ok, /Claude：认不出的条目 zzz.chat/u.test(doc9.detail)], [false, true], JSON.stringify(doc9));
+  fs.rmSync(path.join(ledgerDir, "zzz.chat"), { recursive: true, force: true });
+  const doc9ok = runDoctor({ home: local }).checks.find((c) => c.id === "chat_ledger");
+  assert.deepEqual([doc9ok.ok, /没有说不清的条目/u.test(doc9ok.detail)], [true, true], JSON.stringify(doc9ok));
   assert.equal(chatFailText("nonzero_exit", { exitCode: 3 }), "回复进程异常退出（退出码 3）");
   // 失败重放：存的 why 里有 ESC 与 locator，用户看到的只有表里的文案
   const failKey = chatKey({ chain: "claude", messageId: "msg_chat_fail", sessionId: "aily_dm" });
@@ -20092,7 +20128,7 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   let unclearedAdmit;
   try { unclearedAdmit = admitChat({ ledgerDir, key: chatKey({ chain: "claude", messageId: "lock_1", sessionId: "aily_dm" }), senderId: "555", budgetMs: 5000, meta: { chain: "claude", message_id: "lock_1", session_id: "aily_dm", sender_ref: senderRef("555"), role: "owner", risk_class: "R1" } }); }
   finally { fs.rmSync = originalRm; }
-  assert.deepEqual([unclearedAdmit.ok, typeof unclearedAdmit.lockUncleared], [true, "string"], JSON.stringify(unclearedAdmit));
+  assert.deepEqual([unclearedAdmit.ok, unclearedAdmit.lockUncleared.reason], [true, "release_threw"], JSON.stringify(unclearedAdmit));
   fs.rmSync(lockPath, { recursive: true, force: true });
   fs.rmSync(path.join(ledgerDir, chatKey({ chain: "claude", messageId: "lock_1", sessionId: "aily_dm" }) + ".chat"), { recursive: true, force: true });
   // 路由说不清不许降级成 chat：同一 session 命中两条 active 绑定 → 错误；登记表里有读不清的项目 → 错误

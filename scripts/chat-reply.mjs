@@ -17,17 +17,20 @@ export const CHAT_POLICY_ID = "chat";
 export const CHAT_REPLY_TIMEOUT_MS = 60_000;
 /** 预算可由环境覆盖（测试把它调短；生产不设就是 60 秒）。 */
 export function chatReplyTimeoutMs(env = process.env) {
+  // 值域与终态里的 timeout_ms 同一份：正整数毫秒；别的（小数、0、负数、非数字）一律回默认
   const n = Number(env.FEISHU_BRIDGE_CHAT_TIMEOUT_MS);
-  return Number.isFinite(n) && n > 0 ? n : CHAT_REPLY_TIMEOUT_MS;
+  return Number.isInteger(n) && n > 0 ? n : CHAT_REPLY_TIMEOUT_MS;
 }
 export const CHAT_REPLY_MAX_CHARS = 4000;
 /** 失败原因的封闭枚举与给人看的文案 —— 账本终态只存 reason，重放时从这张表渲染，不吐存储的任何自由文本。 */
-export const CHAT_FAIL_REASONS = Object.freeze(["timeout", "spawn_failed", "nonzero_exit", "empty_reply"]);
-export function chatFailText(reason, { timeoutMs = CHAT_REPLY_TIMEOUT_MS, exitCode = null } = {}) {
+export const CHAT_FAIL_REASONS = Object.freeze(["timeout", "spawn_failed", "nonzero_exit", "signaled", "empty_reply"]);
+export const SIGNAL_SHAPE = /^SIG[A-Z0-9]{1,12}$/u;
+export function chatFailText(reason, { timeoutMs = CHAT_REPLY_TIMEOUT_MS, exitCode = null, signal = null } = {}) {
   return {
     timeout: "超过 " + Math.round(timeoutMs / 1000) + " 秒没答完",
     spawn_failed: "回复进程起不来",
     nonzero_exit: "回复进程异常退出" + (Number.isInteger(exitCode) ? "（退出码 " + exitCode + "）" : ""),
+    signaled: "回复进程被信号结束" + (SIGNAL_SHAPE.test(String(signal)) ? "（" + signal + "）" : ""),
     empty_reply: "回复进程没有输出",
   }[reason] ?? "回复失败（" + String(reason) + "）";
 }
@@ -73,6 +76,11 @@ export function chatReply({ instruction, claudeBin = "claude", timeoutMs = chatR
   if (run.error) {
     if (run.error.code === "ETIMEDOUT") return { ok: false, reason: "timeout", why: chatFailText("timeout", { timeoutMs }), timeoutMs, diagnostic, elapsedMs };
     return { ok: false, reason: "spawn_failed", why: chatFailText("spawn_failed"), diagnostic: diagnosticSnippet(run.error.code ?? run.error.message, 80), elapsedMs };
+  }
+  if (run.status === null) {
+    // 被信号结束（没有退出码）：signal 形状受控；说不清是什么信号也不冒充退出码
+    const signal = SIGNAL_SHAPE.test(String(run.signal)) ? run.signal : "SIGUNKNOWN";
+    return { ok: false, reason: "signaled", why: chatFailText("signaled", { signal }), signal, diagnostic, elapsedMs };
   }
   if (run.status !== 0) return { ok: false, reason: "nonzero_exit", why: chatFailText("nonzero_exit", { exitCode: run.status }), exitCode: run.status, diagnostic, elapsedMs };
   const text = String(run.stdout ?? "").trim();

@@ -8,6 +8,7 @@
  */
 
 import fs from "node:fs";
+import { chatReplyPathStatus } from "../chat-reply.mjs";
 import os from "node:os";
 import path from "node:path";
 import { moduleRoot } from "../direct-run.mjs";
@@ -126,6 +127,11 @@ if (!autoPublishPreview.ok) {
     "可运行 scripts/codex/migrate-auto-publish.mjs 单独查看");
 }
 console.log("hook trust  不自动写信任；安装后由用户审阅并确认");
+{
+  // chat 默认态：Codex 链的 chat 也靠本机 Claude CLI 答话 —— 这是安装前置，装了不等于可用
+  const cp = chatReplyPathStatus();
+  console.log("chat 回复  " + (cp.available ? "claude CLI 可用（" + cp.version + "），未接入的话题 / 私聊会以零工具一次性回合回答" : "不可用（" + cp.why + "）：未接入的话题 / 私聊会明确报 chat_reply_path_unavailable，不冒充可用"));
+}
 if (!uninstall) {
   console.log("运行时      " + RUNTIME_ROOT +
     (runtimePlan?.ok

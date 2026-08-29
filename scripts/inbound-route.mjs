@@ -82,6 +82,7 @@ export function listBindings({ registryFile, templateFile } = {}) {
   if (!reg.ok) return { ok: false, reason: "registry_unreadable", error: reg.error ?? reg.reason, bindings: [] };
 
   const bindings = [];
+  let skipped = 0;
   for (const p of reg.projects) {
     const r = resolveProject({
       root: p.root,
@@ -89,7 +90,8 @@ export function listBindings({ registryFile, templateFile } = {}) {
       registryFile,
       templateFile,
     });
-    if (!r.ok) continue;
+    // 解析不出来的跳过、但**记数**：路由到别的项目照常，可"这个 session 到底有没有绑定"在有跳过项时就说不清了（chat 兜底不许在说不清时进）。
+    if (!r.ok) { skipped += 1; continue; }
     bindings.push({
       root: p.root,
       id: p.id,
@@ -100,7 +102,7 @@ export function listBindings({ registryFile, templateFile } = {}) {
       claudeSessionId: r.claudeSessionId ?? p.claude_session_id ?? null,
     });
   }
-  return { ok: true, bindings };
+  return { ok: true, bindings, skipped };
 }
 
 /**
@@ -131,6 +133,8 @@ export function findBindingForSession({ sessionId, registryFile, templateFile } 
   // 命中多条说不清是谁的：不按登记顺序取第一条（评审探针）。
   if (hits.length > 1) return { ok: false, reason: "ambiguous_session", candidates: hits.length };
   if (hits.length === 1) return hits[0];
+  // 有读不出的登记项时，"没绑定"是说不清的：只有全部候选都读清了、且都对不上，才是确定的未绑定
+  if ((listed.skipped ?? 0) > 0) return { ok: false, reason: "unresolved_bindings", candidates: listed.bindings.length, skipped: listed.skipped };
   return { ok: false, reason: "no_binding_for_session", candidates: listed.bindings.length };
 }
 

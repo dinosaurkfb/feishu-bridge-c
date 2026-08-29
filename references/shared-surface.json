@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-08-29T13:15:15.674Z",
+  "generated_at": "2026-08-29T13:57:15.760Z",
   "modules": {
     "authorize.mjs": [
       "AUTHORIZATION_TABLE",
@@ -50,6 +50,17 @@
       "validateChainTemplate",
       "withChainTemplateWrite"
     ],
+    "chat-ledger.mjs": [
+      "CHAT_MAX_CONCURRENT",
+      "CHAT_MAX_PER_SENDER",
+      "acquireChatClaim",
+      "chatBusy",
+      "chatKey",
+      "chatLoad",
+      "inspectChat",
+      "recordChatOutcome",
+      "senderRef"
+    ],
     "chat-reply.mjs": [
       "CHAT_BIND_GUIDE",
       "CHAT_FOOTER",
@@ -59,7 +70,9 @@
       "CHAT_REPLY_TIMEOUT_MS",
       "CHAT_SYSTEM_PROMPT",
       "chatReply",
-      "chatReplyTimeoutMs"
+      "chatReplyPathStatus",
+      "chatReplyTimeoutMs",
+      "diagnosticSnippet"
     ],
     "claim-reminder.mjs": [
       "composeClaimReminderText",
@@ -321,6 +334,7 @@
     "layered-status.mjs": [
       "ENDPOINT_SELF_CHECK",
       "SELF_CHECK_TEXT",
+      "chatPathText",
       "composeLayeredStatus",
       "describePendingWindow",
       "endpointFacts",

@@ -13,7 +13,8 @@ import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import { RISK, classifyRisk } from "./risk-class.mjs";
-import { CHAT_POLICY_ID, CHAT_REPLY_ARGS, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs } from "./chat-reply.mjs";
+import { CHAT_POLICY_ID, CHAT_REPLY_ARGS, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatReplyPathStatus, diagnosticSnippet } from "./chat-reply.mjs";
+import { chatKey, senderRef, inspectChat, chatBusy, acquireChatClaim, recordChatOutcome, CHAT_MAX_CONCURRENT, CHAT_MAX_PER_SENDER } from "./chat-ledger.mjs";
 import { evaluateChatGates, CHAT_FALLBACK_REASONS } from "./inbound-route.mjs";
 import { ZERO_TOOL_ARGS } from "./handoff.mjs";
 import { INTENT, parseInboundIntent, controlRejectText, rejectedControlProjection, shown } from "./inbound-intent.mjs";
@@ -19929,7 +19930,70 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   const slow = run("慢", TPL.frank_sender_id, { FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "300", FAKE_CLAUDE_SLEEP_MS: "2000" });
   assert.notEqual(slow.status, 0); assert.match(slow.stdout, /chat 没答出来（超过 0 秒没答完）。这里没有接入，无法稍后补发，请再问一次/u, slow.stdout);
   const failed = run("坏", TPL.frank_sender_id, { FAKE_CLAUDE_FAIL: "1" });
-  assert.notEqual(failed.status, 0); assert.match(failed.stdout, /chat 没答出来（退出码 3：boom）/u, failed.stdout);
+  assert.notEqual(failed.status, 0); assert.match(failed.stdout, /chat 没答出来（回复进程异常退出（退出码 3））/u, failed.stdout);
+  // 子进程 stderr 不进飞书文案（评审探针：ESC、本机路径、locator）：用户看到受控类别；脱敏后的片段只进机器级回执
+  const ugly = run("丑", TPL.frank_sender_id, { FAKE_CLAUDE_FAIL: "1", FAKE_CLAUDE_STDERR: "\u001b[31mlocal-path /Users/example/private oc_1234567890abcdef\u001b[0m" });
+  assert.notEqual(ugly.status, 0);
+  assert.doesNotMatch(ugly.stdout, /\u001b|\/Users\/|oc_1234567890abcdef|example/u, "stderr 原文不许进用户文案：" + JSON.stringify(ugly.stdout));
+  assert.match(ugly.stdout, /回复进程异常退出（退出码 3）/u);
+  const uglyReceipt = JSON.parse(fs.readFileSync(path.join(local, ".claude", "feishu-bridge", "inbound", "receipts", fs.readdirSync(path.join(local, ".claude", "feishu-bridge", "inbound", "receipts")).find((n) => n.startsWith("chat-failed-msg_chat_" + seq))), "utf-8"));
+  assert.ok(typeof uglyReceipt.diagnostic === "string" && !uglyReceipt.diagnostic.includes("\u001b") && !uglyReceipt.diagnostic.includes("oc_1234567890abcdef"), "机器级回执里的诊断片段已脱敏：" + uglyReceipt.diagnostic);
+  assert.equal(Array.from(diagnosticSnippet("a\u001bb\n" + "x".repeat(300))).length, 201, "按码点截 200 再加省略号");
+  assert.ok(!diagnosticSnippet("a\u001bb").includes("\u001b"), "控制字符不进片段");
+  // 幂等：同一条消息重放 → 按记录重出，不再起模型；运行中 / 失败 / 陈旧各自说清
+  const ledgerDir = path.join(local, ".claude", "feishu-bridge", "inbound", "chat-claims");
+  const beforeReplay = argvLog().length;
+  const first = run("幂等", TPL.frank_sender_id);
+  assert.match(first.stdout, /^回答：幂等/mu);
+  const firstId = "msg_chat_" + seq;
+  const replay = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
+    env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+      AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_chat", FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000",
+      FAKE_AILY_ENVELOPE: JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: firstId, sessionID: "aily_dm", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + "幂等" } }) }] }) } });
+  assert.equal(replay.status, 0, replay.stdout + replay.stderr);
+  assert.match(replay.stdout, /^回答：幂等\n— chat[^\n]*（同一条消息的重放：按记录重出）$/mu, "重放按记录重出：" + replay.stdout);
+  assert.equal(argvLog().length, beforeReplay + 1, "重放不再起模型");
+  const firstKey = chatKey({ chain: "claude", messageId: firstId, sessionId: "aily_dm" });
+  assert.equal(inspectChat({ ledgerDir, key: firstKey }).state, "answered");
+  const failedKey = chatKey({ chain: "claude", messageId: "msg_chat_" + (seq - 2), sessionId: "aily_dm" });
+  assert.equal(inspectChat({ ledgerDir, key: failedKey }).state, "failed", "失败也有终态");
+  // 并发上界：在取 claim 之前判 —— 别人占满全局上限 → 拒；自己有一条在答 → 拒；被拒的不占账本（同一条消息之后还能再试）
+  const plant = (id, senderId) => { const k = chatKey({ chain: "claude", messageId: id, sessionId: "aily_dm" }); assert.ok(acquireChatClaim({ ledgerDir, key: k, meta: { chain: "claude", message_id: id, session_id: "aily_dm", sender_ref: senderRef(senderId), role: "owner", risk_class: "R1" } }).ok); return k; };
+  const k1 = plant("busy_1", "999"); const k2 = plant("busy_2", "998");
+  assert.equal(CHAT_MAX_CONCURRENT, 2);
+  const busyG = run("忙", TPL.frank_sender_id);
+  assert.match(busyG.stdout, /已拒绝 · chat 正忙（同时在答 2 条，上限 2），稍后再问/u, busyG.stdout);
+  assert.equal(inspectChat({ ledgerDir, key: chatKey({ chain: "claude", messageId: "msg_chat_" + seq, sessionId: "aily_dm" }) }).state, "absent", "被拒的不占账本");
+  fs.rmSync(path.join(ledgerDir, k2 + ".chat"), { recursive: true, force: true });
+  fs.rmSync(path.join(ledgerDir, k1 + ".chat"), { recursive: true, force: true });
+  const mine = plant("busy_mine", TPL.frank_sender_id);
+  assert.equal(CHAT_MAX_PER_SENDER, 1);
+  assert.match(run("再问", TPL.frank_sender_id).stdout, /已拒绝 · 你上一条还在答（每人同时只答 1 条）/u);
+  assert.match(run("别人问", "333").stdout, /^回答：别人问/mu, "别人不受这条影响");
+  fs.rmSync(path.join(ledgerDir, mine + ".chat"), { recursive: true, force: true });
+  // 陈旧：pid 死了又没终态 → 不重跑
+  const staleKey = plant("stale_1", TPL.frank_sender_id);
+  fs.writeFileSync(path.join(ledgerDir, staleKey + ".chat", "claim.json"), JSON.stringify({ ...JSON.parse(fs.readFileSync(path.join(ledgerDir, staleKey + ".chat", "claim.json"), "utf-8")), pid: 2 ** 30 }));
+  assert.equal(inspectChat({ ledgerDir, key: staleKey }).state, "stale");
+  assert.equal(chatBusy({ ledgerDir, senderId: TPL.frank_sender_id, budgetMs: 5000 }).busy, false, "陈旧的不算占位");
+  fs.rmSync(path.join(ledgerDir, staleKey + ".chat"), { recursive: true, force: true });
+  // 路由说不清不许降级成 chat：同一 session 命中两条 active 绑定 → 错误；登记表里有读不清的项目 → 错误
+  writeRegistry([bound, { ...bound, id: "bound2", root: path.join(local, "project2"), root_message_id: "om_bound2" }]);
+  fs.mkdirSync(path.join(local, "project2"), { recursive: true });
+  const amb = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
+    env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+      AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_bound", AILY_CLI_RUN_ID: "run_chat", FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000",
+      FAKE_AILY_ENVELOPE: JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_amb", sessionID: "aily_bound", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + "歧义" } }) }] }) } });
+  assert.notEqual(amb.status, 0); assert.match(amb.stdout, /这个会话对应的绑定说不清（ambiguous_session）/u, amb.stdout);
+  writeRegistry([bound, { id: "broken", root: path.join(local, "nowhere-such-dir"), name: "坏", root_message_id: "om_broken", expires_at: "2099-01-01T00:00:00Z", session_id: "aily_other", inbound_state: "bound", status: "active" }]);
+  const unresolved = run("说不清", TPL.frank_sender_id);
+  if (unresolved.status === 0) { /* 这条登记项若被解析层视为可读，就不算读不清 —— 下面的单元断言才是判据 */ } else assert.match(unresolved.stdout, /这个会话对应的绑定说不清（unresolved_bindings）/u, unresolved.stdout);
+  writeRegistry([bound]);
+  // 状态页 / 安装器 / doctor 都核 chat 回复路径（两条链共用 claude CLI）
+  const st = chatReplyPathStatus({ claudeBin: path.join(bin, "claude") });
+  assert.equal(st.available, true, JSON.stringify(st));
+  const missing = chatReplyPathStatus({ claudeBin: path.join(bin, "no-such-claude") });
+  assert.deepEqual([missing.available, missing.why], [false, "claude 不在 PATH 上"]);
   // dry-run：只判，不起模型
   const n = argvLog().length;
   const dry = run("dry", TPL.frank_sender_id, {}, ["--dry-run"]);

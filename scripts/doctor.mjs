@@ -27,6 +27,7 @@
  */
 
 import fs from "node:fs";
+import { chatReplyPathStatus } from "./chat-reply.mjs";
 import os from "node:os";
 import path from "node:path";
 
@@ -302,6 +303,10 @@ export function runDoctor({
       add("codex_drain", "⑥ 积压有人发（Codex 侧）", drain.ok === true ? true : drain.ok === false ? false : null,
         "Codex 侧体检说：" + String(drain.detail ?? ""), drain.ok === false ? PREVIEW.drainCodex : null);
     }
+  {
+    const cp = chatReplyPathStatus();
+    add("chat_reply_path", "⑧ chat 回复路径（两条链共用本机 claude CLI）", cp.available, cp.available ? "claude CLI 可用（" + cp.version + "）" : "不可用：" + cp.why + " —— 未接入的话题 / 私聊会报 chat_reply_path_unavailable", null);
+  }
   }
 
   // ── 汇总：任一 false → blocked；无 false 有 null → incomplete；全 true → ready

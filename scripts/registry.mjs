@@ -321,17 +321,27 @@ function withReapLock(lockDir, fn, { waitMs = 0, duringReap = null } = {}) {
     if (Date.now() >= deadline) return { ok: false, reason: "reap_busy" };
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
   }
+  let out;
   try {
     if (typeof duringReap === "function") duringReap();
-    return { ok: true, run: fn() };
+    out = { ok: true, run: fn() };
   } finally {
     if (held) {
       // 按 token 释放 reap 锁：我在段内待太久被接管了的话，那把已经是别人的。
-      const cur = readLockOwner(reapDir);
-      if (cur.present && cur.owner && cur.owner.token === token) fs.rmSync(reapDir, { recursive: true, force: true });
+      // 释放失败**不裸抛**（评审探针：段内动作已完成、reap 锁交不还时调用方被当成"事务没完成"）：
+      // 收成 reapUncleared 挂在结果上 —— 段内做的事算数，残骸交显式维护入口。
+      let residue = null;
+      try {
+        const cur = readLockOwner(reapDir);
+        if (cur.present && cur.owner && cur.owner.token === token) fs.rmSync(reapDir, { recursive: true, force: true });
+      } catch (err) { residue = { path: reapDir, error: String(err?.code ?? err?.message ?? err) }; }
+      if (residue !== null && out !== undefined) out = { ...out, reapUncleared: residue };
     }
   }
+  return out;
 }
+/** 把 withReapLock 的 reapUncleared 带到调用方结果上（不改变 ok / reason）。 */
+const carryReapResidue = (done, result) => (done?.reapUncleared && result && typeof result === "object" ? { ...result, reapUncleared: done.reapUncleared } : result);
 
 // beforeReap / duringReap 只给测试用：在"判定陈旧"与"进 reap 锁重核"之间、以及拿到 reap 锁之后
 // 插一个动作，把并发窗口写成确定性的行为测试。
@@ -364,7 +374,7 @@ export function acquirePublishLock(lockDir, { staleMs = 5 * 60 * 1000, now = Dat
     return true;
   }, { duringReap });
   if (!reaped.ok) return reaped.reason === "reap_busy" ? first : reaped; // 别人正在回收：这轮让它
-  return reaped.run ? attempt() : first; // 只重试一次：再失败说明有别人刚抢到，让它去发
+  return carryReapResidue(reaped, reaped.run ? attempt() : first); // 只重试一次：再失败说明有别人刚抢到，让它去发
 }
 
 export function isPublishLockStale(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now() } = {}) {
@@ -400,7 +410,7 @@ export function releasePublishLock(lockDir, { waitMs = 500 } = {}) {
   }, { waitMs });
   if (!done.ok) return done.reason === "reap_busy" ? { ok: false, reason: "release_busy" } : done;
   if (done.run.ok) HELD.delete(lockDir);
-  return done.run;
+  return carryReapResidue(done, done.run);
 }
 
 /**
@@ -408,7 +418,8 @@ export function releasePublishLock(lockDir, { waitMs = 500 } = {}) {
  * 我持锁期间若停顿超过 staleMs 被别人按协议合法回收、锁又被拿走，这里返回 lock_lost，fn 不跑；
  * "提交之后才发现锁没了"补救不了已落盘的覆盖，所以核对必须在提交之前、且在归属转换互斥段内。
  * 旧版目录锁没有 token，不给 fencing（lock_lost）。fn 抛错原样抛出（reap 锁在 finally 里释放）。
- * @returns {{ ok: true, run: any } | { ok: false, reason: "lock_lost"|"reap_busy"|"reap_residue"|"io_error", present?: boolean }}
+ * reap 锁交不还时 fn 已经跑完、结果算数：带 reapUncleared 回去，不裸抛。
+ * @returns {{ ok: true, run: any, reapUncleared?: object } | { ok: false, reason: "lock_lost"|"reap_busy"|"reap_residue"|"io_error", present?: boolean }}
  */
 export function commitWhileHeld(lockDir, fn, { waitMs = 200 } = {}) {
   const mine = HELD.get(lockDir) ?? null;
@@ -417,7 +428,7 @@ export function commitWhileHeld(lockDir, fn, { waitMs = 200 } = {}) {
     if (!r.present || !r.owner || r.legacy || mine === null || r.owner.token !== mine) return { ok: false, reason: "lock_lost", present: r.present };
     return { ok: true, run: fn() };
   }, { waitMs });
-  return done.ok ? done.run : done;
+  return done.ok ? carryReapResidue(done, done.run) : done;
 }
 
 /**

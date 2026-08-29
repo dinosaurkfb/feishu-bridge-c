@@ -4,23 +4,23 @@
  *   · 一条 chat = **一个文件** `<ledgerDir>/<key>.chat.json`：claim 与终态在同一份 JSON 里（state = running / answered / failed）。
  *     不用目录：目录会被"换出再换回"（ABA）绕过任何事后核对；单文件的读写都落在**同一个已打开的文件对象**上 ——
  *       读：`O_RDONLY | O_NONBLOCK | O_NOFOLLOW` 打开、同一 fd fstat 确认普通文件、从这个 fd 读；
- *       建 claim：先把**完整**记录写进 scratch 子目录里唯一命名的临时文件（O_EXCL）并 fsync，再 `link(tmp, final)` 发布 ——
- *              link 从不覆盖既有目录项（EEXIST = 同一条消息的重放），正式路径上要么没有、要么就是完整记录，没有"空文件"窗口；
- *       记终态：临时文件（同样 O_EXCL 创建）写全 → rename 覆盖；rename 替换的是路径上的那个目录项本身，
- *              路径若已被换成符号链接，替换掉的是链接、不是它指向的东西；
- *   · 临时文件都在 `<ledgerDir>/tmp/`（scratch）：它们**从不参与准入盘点**（残留不会把账本弄成"说不清"），只由 doctor 盘点
- *     （年轻的 = 进位中，超过 TMP_RESIDUE_AGE_MS 仍在的 = 残骸，可直接删）。清理只删**自己的**：删之前按 dev/ino 核对路径上还是
- *     我打开的那个 inode，删之后再用仍打开的 fd 看 nlink 是否真的少了一 —— 少了才算清掉，否则如实报 tmpResidue（位置不明）。
- *     正式路径从不按路径删。
+ *       写（claim 与终态同一条路）：先把**完整**记录写进**同一目录**里唯一命名的临时文件（`<key>.<pid>.<time>.<uuid>`，O_EXCL，
+ *              循环写满再 fsync），再 rename 成正式路径 —— 正式路径上要么没有、要么就是完整记录，没有"空文件"窗口；
+ *              rename 替换的是路径上的那个目录项本身，路径若已被换成符号链接，替换掉的是链接、不是它指向的东西；
+ *              临时文件与记录同目录，没有可被替换的父目录（评审探针：scratch 子目录被换成指向外部的链接）。
  *   · 账本的写事务（建 claim、记终态）都在**同一把账本锁**里（admission.lock，复用 registry.mjs 的 symlink 锁），
- *     且提交动作（link / rename）走 `commitWhileHeld`：在与陈旧回收互斥的 reap 段里核对主锁仍是我这一实例（token）再提交 ——
- *     事务停顿超过 staleMs 被合法回收、锁又被别人拿走时，提交返回 lock_lost，不覆盖别人已落盘的终态。
- *     记终态 = 锁内重读（必须还是 running，否则 already_final）→ 写全 → fenced rename；"终态只记一次"由锁 + fencing 给。
+ *     且提交动作（rename）走 `commitWhileHeld`：在与陈旧回收互斥的 reap 段里核对主锁仍是我这一实例（token）再提交 ——
+ *     事务停顿超过 staleMs 被合法回收、锁又被别人拿走时，提交返回 lock_lost，不覆盖别人已落盘的东西。
+ *     建 claim = 锁内盘点 → 上界 → 正式路径缺席（否则 duplicate，不写临时文件）→ 写全 → fenced rename；
+ *     记终态 = 锁内重读（必须还是 running，否则 already_final）→ 写全 → fenced rename。"只发布一次 / 终态只记一次"由锁 + fencing 给。
+ *   · **热路径不删任何东西**：事务半途失败（写失败、提交前锁丢失、rename 失败）留下的临时文件原地保留，结果带 tmpResidue；
+ *     它们**不参与准入盘点**（残留不会把账本弄成"说不清"），只由 doctor 盘点（年轻的 = 进位中，超过 TMP_RESIDUE_AGE_MS 仍在的 = 残骸），
+ *     清理只走显式维护入口 sweepScratch / chat-scratch-sweep.mjs（账本锁内，只认封闭名字 + 普通文件 + 超阈值；名字唯一，协议里没有写者会再用）。
  *   · 记录形状**封闭**（chatRecordProblem）：键集恰好、时间规范、key 由 chain / message / session 推导、sender_ref / role / risk 枚举、pid 正整数；
  *     终态按 state 与 reason 各自封闭（timeout 带 timeout_ms、nonzero_exit 带 exit_code、signaled 带 signal）；
- *   · "说不清"不折叠成空闲：读不出 / 形状不对的记录、认不出的名字（含顶层任何 `.tmp.` 名字），准入返回 unresolved，入口不起模型；
- *     锁族（admission.lock 及其 reap / maint / 回收 / 隔离残骸）与 scratch 目录在准入盘点里不算条目，但 doctor 单独盘它们
- *     （reap 段锁复用锁协议自己的投影：活的 / 还新的是在途，超过阈值或形状说不清才算问题）。
+ *   · "说不清"不折叠成空闲：读不出 / 形状不对的记录、既非记录又非临时文件形状的名字，准入返回 unresolved，入口不起模型；
+ *     锁族（admission.lock 及其 reap / maint / 回收 / 隔离残骸）在准入盘点里不算条目，但 doctor 单独盘它们
+ *     （reap 段锁复用锁协议自己的投影：活的 / 还新的是在途，超过阈值或形状说不清才算问题）；reap 锁交不还时段内已完成的提交算数（lockUncleared，不裸抛）。
  *   · 陈旧：pid 死了又没有终态 = 上次没答完，不重跑，如实报"请再发一条新消息"。
  *
  * key = sha256(chain \0 message_id \0 session_id)。文件里不出 locator：只记 sender 的 sha256 前缀。
@@ -38,8 +38,7 @@ export const CHAT_MAX_CONCURRENT = 2;
 export const CHAT_MAX_PER_SENDER = 1;
 export const CHAT_CHAINS = Object.freeze(["claude", "codex"]);
 export const CHAT_RECORD_SUFFIX = ".chat.json";
-export const SCRATCH_DIR_NAME = "tmp";
-/** scratch 里的临时文件超过这个年龄仍在才算残骸（一次事务只持锁几毫秒）。 */
+/** 临时文件超过这个年龄仍在才算残骸（一次事务只持锁几毫秒）。 */
 export const TMP_RESIDUE_AGE_MS = 60 * 1000;
 /** 准入等锁的上限（别的事务只持锁几毫秒；超过就是真忙）与记终态等锁的上限（终态丢了会让重放变 stale，多等一会）。 */
 export const ADMIT_LOCK_WAIT_MS = 250;
@@ -47,8 +46,8 @@ export const RECORD_LOCK_WAIT_MS = 1000;
 const KEY_SHAPE = /^[0-9a-f]{64}$/u;
 const SENDER_REF_SHAPE = /^sender_[0-9a-f]{16}$/u;
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
-/** scratch 里我们只会生成这种名字：<key>.<pid>.<time>.<uuid> */
-const TMP_NAME_SHAPE = new RegExp("^[0-9a-f]{64}\\.\\d+\\.\\d+\\." + UUID + "$", "u");
+/** 临时文件我们只会生成这种名字：<key>.<pid>.<time>.<uuid>（与记录同目录；不参与准入盘点） */
+export const TMP_NAME_SHAPE = new RegExp("^[0-9a-f]{64}\\.\\d+\\.\\d+\\." + UUID + "$", "u");
 const BASE_KEYS = ["chain", "key", "message_id", "pid", "risk_class", "role", "schema_version", "sender_ref", "session_id", "started_at", "state"];
 const ANSWERED_KEYS = [...BASE_KEYS, "elapsed_ms", "recorded_at", "text"].sort().join(",");
 const FAILED_KEYS = Object.freeze({
@@ -79,7 +78,6 @@ export function chatKey({ chain, messageId, sessionId }) {
 export const senderRef = (senderId) => "sender_" + crypto.createHash("sha256").update(String(senderId)).digest("hex").slice(0, 16);
 const recordPath = (ledgerDir, key) => path.join(ledgerDir, key + CHAT_RECORD_SUFFIX);
 export const admissionLockPath = (ledgerDir) => path.join(ledgerDir, ADMISSION_LOCK);
-export const scratchDir = (ledgerDir) => path.join(ledgerDir, SCRATCH_DIR_NAME);
 
 /** 单文件记录的封闭形状：按 state（与 failed 的 reason）各自封闭键集，并交叉核对 key。 */
 export function chatRecordProblem(doc, key) {
@@ -155,8 +153,8 @@ export function inspectChat({ ledgerDir, key }) {
 }
 
 /**
- * 盘点：正在答的条数（全局 / 这个发送者）与说不清的条目（读不出 / 形状不对的记录、认不出的名字）。
- * 锁族（精确形状）与 scratch 目录在这里不算条目 —— 准入自己就持着锁，scratch 只由 doctor 盘；顶层任何 `.tmp.` 名字都是认不出。
+ * 盘点：正在答的条数（全局 / 这个发送者）与说不清的条目（读不出 / 形状不对的记录、既非记录又非临时文件形状的名字）。
+ * 锁族（精确形状）与临时文件（精确形状）在这里不算条目 —— 准入自己就持着锁，临时文件只由 doctor 盘。
  */
 export function chatLoad({ ledgerDir, senderId, now = Date.now(), budgetMs }) {
   let names;
@@ -165,13 +163,7 @@ export function chatLoad({ ledgerDir, senderId, now = Date.now(), budgetMs }) {
   const me = senderRef(senderId);
   let running = 0; let bySender = 0; let unresolved = 0; const why = [];
   for (const n of names) {
-    if (isAdmissionLockEntry(n)) continue;
-    if (n === SCRATCH_DIR_NAME) {
-      let st = null;
-      try { st = fs.lstatSync(path.join(ledgerDir, n)); } catch { /* 刚不见了也算说不清 */ }
-      if (st === null || !st.isDirectory()) { unresolved += 1; why.push("scratch 位置上不是目录"); }
-      continue;
-    }
+    if (isAdmissionLockEntry(n) || TMP_NAME_SHAPE.test(n)) continue;
     if (!n.endsWith(CHAT_RECORD_SUFFIX) || !KEY_SHAPE.test(n.slice(0, -CHAT_RECORD_SUFFIX.length))) { unresolved += 1; why.push("认不出的条目 " + n.slice(0, 40)); continue; }
     const key = n.slice(0, -CHAT_RECORD_SUFFIX.length);
     const seen = inspectChat({ ledgerDir, key });
@@ -185,25 +177,61 @@ export function chatLoad({ ledgerDir, senderId, now = Date.now(), budgetMs }) {
   return { running, bySender, unresolved, why };
 }
 
+/** 盘点临时文件（封闭名字）：普通文件按年龄分进位中 / 残骸；不是普通文件或 lstat 非 ENOENT 错误 = 说不清。 */
+function scanTmp(ledgerDir, now) {
+  let names;
+  try { names = fs.readdirSync(ledgerDir); }
+  catch (err) { return { ok: err?.code === "ENOENT", why: err?.code === "ENOENT" ? null : "目录读不出：" + String(err.code ?? err.message), entries: [] }; }
+  const entries = [];
+  for (const n of names) {
+    if (!TMP_NAME_SHAPE.test(n)) continue;
+    let st;
+    try { st = fs.lstatSync(path.join(ledgerDir, n)); }
+    catch (err) { if (err?.code === "ENOENT") continue; entries.push({ name: n, kind: "unclear", why: "lstat 失败（" + String(err.code ?? err.message) + "）" }); continue; }
+    if (!st.isFile()) { entries.push({ name: n, kind: "unclear", why: "不是普通文件" }); continue; }
+    entries.push({ name: n, kind: "file", ageMs: now - st.mtimeMs });
+  }
+  return { ok: true, why: null, entries };
+}
+
 /**
- * doctor 用：scratch 目录的状态。名字必须是完整 <key>.<pid>.<time>.<uuid> 且是普通文件；
- * 年轻的（≤ TMP_RESIDUE_AGE_MS）= 进位中（不算问题），老的 = 残骸（可直接删，不影响准入）；形状不对 / lstat 非 ENOENT 错误 = 说不清（问题）。
+ * doctor 用：临时文件的状态。年轻的（≤ TMP_RESIDUE_AGE_MS）= 进位中（不算问题），老的 = 残骸（不影响准入，交 chat-scratch-sweep）；
+ * 名字对但不是普通文件 / lstat 非 ENOENT 错误 = 说不清（问题）。
  */
 export function inspectScratch({ ledgerDir, now = Date.now() }) {
-  const dir = scratchDir(ledgerDir);
-  let names;
-  try { names = fs.readdirSync(dir); }
-  catch (err) { return err?.code === "ENOENT" ? { inflight: 0, problems: [] } : { inflight: 0, problems: ["scratch 目录读不出：" + String(err.code ?? err.message)] }; }
+  const scan = scanTmp(ledgerDir, now);
+  if (!scan.ok) return { inflight: 0, problems: [scan.why] };
   let inflight = 0; const problems = [];
-  for (const n of names) {
-    let st;
-    try { st = fs.lstatSync(path.join(dir, n)); }
-    catch (err) { if (err?.code === "ENOENT") continue; problems.push("scratch 条目 lstat 失败（" + String(err.code ?? err.message) + "）：" + n.slice(0, 40)); continue; }
-    if (!TMP_NAME_SHAPE.test(n) || !st.isFile()) { problems.push("scratch 里说不清的条目（名字或类型不对，不动）：" + n.slice(0, 40)); continue; }
-    if (now - st.mtimeMs <= TMP_RESIDUE_AGE_MS) { inflight += 1; continue; }
-    problems.push("scratch 残骸（超过 " + Math.round(TMP_RESIDUE_AGE_MS / 1000) + " 秒仍在）" + n.slice(0, 20) + "…：可直接删，不影响准入");
+  for (const e of scan.entries) {
+    if (e.kind === "unclear") { problems.push("临时文件位置上说不清的条目（" + e.why + "，不动）：" + e.name.slice(0, 40)); continue; }
+    if (e.ageMs <= TMP_RESIDUE_AGE_MS) { inflight += 1; continue; }
+    problems.push("scratch 残骸（超过 " + Math.round(TMP_RESIDUE_AGE_MS / 1000) + " 秒仍在）" + e.name.slice(0, 20) + "…：不影响准入，用 node scripts/chat-scratch-sweep.mjs --ledger " + ledgerDir + " 清（先预览，再加 --apply）");
   }
   return { inflight, problems };
+}
+
+/**
+ * 显式维护入口：清 scratch 残骸。账本锁内、只认封闭名字 + 普通文件 + 超过 olderThanMs；说不清的不动。
+ * 名字唯一（uuid），协议里没有任何写者会再用同一个名字，所以判断与删除之间不会出现协议内的新实例。
+ * @returns {{ ok: true, candidates: {name, ageMs, removed, error}[], young: number, problems: string[] } | { ok: false, reason, why? }}
+ */
+export function sweepScratch({ ledgerDir, now = Date.now(), apply = false, olderThanMs = TMP_RESIDUE_AGE_MS }) {
+  return withLedgerLock(ledgerDir, ADMIT_LOCK_WAIT_MS, () => {
+    const scan = scanTmp(ledgerDir, now);
+    if (!scan.ok) return { ok: true, candidates: [], young: 0, problems: [scan.why] };
+    const candidates = []; const problems = []; let young = 0;
+    for (const e of scan.entries) {
+      if (e.kind === "unclear") { problems.push(e.name.slice(0, 40) + "（" + e.why + "）"); continue; }
+      if (e.ageMs <= olderThanMs) { young += 1; continue; }
+      const c = { name: e.name, ageMs: e.ageMs, removed: false, error: null };
+      if (apply) {
+        try { fs.unlinkSync(path.join(ledgerDir, e.name)); c.removed = true; }
+        catch (err) { if (err?.code === "ENOENT") c.removed = true; else c.error = String(err.code ?? err.message); }
+      }
+      candidates.push(c);
+    }
+    return { ok: true, candidates, young, problems };
+  });
 }
 
 /**
@@ -250,7 +278,7 @@ export function inspectAdmissionLocks({ ledgerDir, now = Date.now(), staleMs = 5
 }
 
 /**
- * 账本锁：拿到就跑 fn，释放失败挂到结果的 lockUncleared 上（结构化 {reason, detail}，入口按 reason 给受控文案）；
+ * 账本锁：拿到就跑 fn，释放失败挂到结果的 lockUncleared 上（结构化 {reason, detail}，入口按 reason 给受控文案；fn 自己已带的更具体、不覆盖）；
  * 释放时发现锁已不是我的 / 已缺席（被合法回收过）→ lockLost:true。
  * 等锁：别的事务只持锁几毫秒，publisher_busy 时按 5ms 步进最多等 waitMs；超过按 busy 返回。
  */
@@ -273,7 +301,10 @@ function withLedgerLock(ledgerDir, waitMs, fn) {
     try { rel = releasePublishLock(lockPath); }
     catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
     if (result && typeof result === "object") {
-      if (!rel.ok && rel.reason !== "not_owner") result = { ...result, lockUncleared: { reason: String(rel.reason), detail: rel.error ? String(rel.error) : null } };
+      if (!result.lockUncleared) {
+        if (!rel.ok && rel.reason !== "not_owner") result = { ...result, lockUncleared: { reason: String(rel.reason), detail: rel.error ? String(rel.error) : null } };
+        else if (rel.ok && rel.reapUncleared) result = { ...result, lockUncleared: { reason: "reap_residue_uncleared", detail: String(rel.reapUncleared.error ?? "") } };
+      }
       if ((rel.ok && rel.absent) || (!rel.ok && rel.reason === "not_owner")) result = { ...result, lockLost: true };
     }
   }
@@ -281,12 +312,12 @@ function withLedgerLock(ledgerDir, waitMs, fn) {
 }
 
 /**
- * 准入 —— **一把锁内**：盘点 → 说不清则拒 → 上界则拒 → 发布 claim（scratch 临时文件写全 + fenced link，从不覆盖）。
- * @returns {{ ok: true, key, file, tmpResidue: object|null } | { ok: false, reason, text?, why?, load?, tmpResidue? }}
+ * 准入 —— **一把锁内**：盘点 → 说不清则拒 → 上界则拒 → 正式路径缺席（否则 duplicate）→ 写全 → fenced rename。
+ * @returns {{ ok: true, key, file, tmpResidue: null, lockUncleared? } | { ok: false, reason, text?, why?, load?, tmpResidue? }}
  */
 export function admitChat({ ledgerDir, key, meta, senderId, now = Date.now(), budgetMs, maxConcurrent = CHAT_MAX_CONCURRENT, maxPerSender = CHAT_MAX_PER_SENDER, lockWaitMs = ADMIT_LOCK_WAIT_MS }) {
   if (!KEY_SHAPE.test(String(key))) return { ok: false, reason: "chat_ledger_unwritable", why: "key 形状不对" };
-  try { fs.mkdirSync(scratchDir(ledgerDir), { recursive: true, mode: 0o700 }); }
+  try { fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 }); }
   catch (err) { return { ok: false, reason: "chat_ledger_unwritable", why: String(err.code ?? err.message) }; }
   return withLedgerLock(ledgerDir, lockWaitMs, (lockPath) => {
     const load = chatLoad({ ledgerDir, senderId, now, budgetMs });
@@ -300,47 +331,45 @@ export function admitChat({ ledgerDir, key, meta, senderId, now = Date.now(), bu
   });
 }
 
-const identityOf = (fd) => { try { const st = fs.fstatSync(fd); return { id: st.dev + ":" + st.ino, nlink: st.nlink }; } catch { return null; } };
-/**
- * 只删自己的临时文件：删之前按 dev/ino 核对路径上还是我打开的那个 inode，删之后用仍打开的 fd 看 nlink 是否真的少了一。
- * 返回 null（确认清掉）或 residue 说明（{ path, why }）：核对不一致不删；lstat / unlink 失败；删了但 nlink 没变（核对与删除之间被换走，删掉的不是我的、我的位置不明）。
- */
-function unlinkOwnTmp(tmp, fd, mine) {
-  if (mine === null) return { path: tmp, why: "打开时的身份读不出，没删" };
-  let st;
-  try { st = fs.lstatSync(tmp); }
-  catch (err) { return err?.code === "ENOENT" ? { path: tmp, why: "路径上已经没有了（我的临时文件被挪走，位置不明）" } : { path: tmp, why: "lstat 失败：" + String(err.code ?? err.message) }; }
-  if (!st.isFile() || st.dev + ":" + st.ino !== mine.id) return { path: tmp, why: "路径上不是我打开的那个文件，没删" };
-  try { fs.unlinkSync(tmp); }
-  catch (err) { return { path: tmp, why: "unlink 失败：" + String(err.code ?? err.message) }; }
-  const after = identityOf(fd);
-  if (after === null || after.nlink !== mine.nlink - 1) return { path: tmp, why: "核对与删除之间路径被换走：删掉的不是我的，我的临时文件位置不明" };
-  return null;
-}
-/** 把完整内容写进 scratch 里唯一命名的临时文件（O_EXCL | O_NOFOLLOW）并 fsync；fd 留给调用方（发布后核 nlink）。 */
+/** 把完整内容写进同目录里唯一命名的临时文件（O_EXCL | O_NOFOLLOW）：循环写满、fsync、关；写失败**原地保留**（热路径不删），带 tmpResidue。 */
 function writeTmp(ledgerDir, key, content, now) {
-  const tmp = path.join(scratchDir(ledgerDir), key + "." + process.pid + "." + now + "." + crypto.randomUUID());
-  let fd;
-  try { fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600); }
-  catch (err) { return { ok: false, why: "临时文件建不出：" + String(err.code ?? err.message), tmpResidue: null }; }
-  try { fs.writeSync(fd, content); fs.fsyncSync(fd); }
-  catch (err) {
-    const residue = unlinkOwnTmp(tmp, fd, identityOf(fd));
-    try { fs.closeSync(fd); } catch { /* 已关 */ }
-    return { ok: false, why: String(err.code ?? err.message), tmpResidue: residue };
+  const tmp = path.join(ledgerDir, key + "." + process.pid + "." + now + "." + crypto.randomUUID());
+  let fd = null;
+  try {
+    try { fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600); }
+    catch (err) { return { ok: false, why: "临时文件建不出：" + String(err.code ?? err.message), tmpResidue: null }; }
+    try {
+      const buf = Buffer.from(content, "utf-8");
+      let off = 0;
+      while (off < buf.length) {
+        const n = fs.writeSync(fd, buf, off, buf.length - off);
+        if (!(Number.isInteger(n) && n > 0)) throw Object.assign(new Error("short write"), { code: "ESHORTWRITE" });
+        off += n;
+      }
+      fs.fsyncSync(fd);
+    } catch (err) {
+      return { ok: false, why: String(err.code ?? err.message), tmpResidue: residueOf(tmp, "写临时文件失败（" + String(err.code ?? err.message) + "）") };
+    }
+    return { ok: true, tmp };
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
   }
-  return { ok: true, tmp, fd };
 }
-/** 提交（link / rename）之后的临时文件处置：link 之后 tmp 还在，要清；rename 之后 tmp 已经是正式路径，不清。 */
-function finishTmp(w, { unlinkTmp }) {
-  const residue = unlinkTmp ? unlinkOwnTmp(w.tmp, w.fd, identityOf(w.fd)) : null;
-  try { fs.closeSync(w.fd); } catch { /* 已关 */ }
-  return residue;
+const residueOf = (tmp, why) => ({ path: tmp, why: why + "；热路径不删，原地保留，doctor 会点名，用 chat-scratch-sweep 清" });
+/** fenced 提交之后：把 commitWhileHeld 的结果折成 { ok, reason?, why?, lockUncleared? }。 */
+function afterCommit(fenced, tmp, commitErr) {
+  const lockUncleared = fenced.reapUncleared ? { reason: "reap_residue_uncleared", detail: String(fenced.reapUncleared.error ?? "") } : null;
+  if (!fenced.ok) return { ok: false, reason: fenced.reason === "lock_lost" ? "chat_ledger_lock_lost" : "chat_admission_lock_unavailable", why: "提交前核对锁：" + fenced.reason, tmpResidue: residueOf(tmp, "提交前核对锁失败") };
+  if (commitErr !== null) return { ok: false, reason: "commit_failed", why: String(commitErr.code ?? commitErr.message), tmpResidue: residueOf(tmp, "rename 失败（" + String(commitErr.code ?? commitErr.message) + "）"), ...(lockUncleared ? { lockUncleared } : {}) };
+  return { ok: true, tmpResidue: null, ...(lockUncleared ? { lockUncleared } : {}) };
 }
 
-/** 发布 claim（锁内）：scratch 临时文件写全 → fenced link 到正式路径（EEXIST = duplicate；link 从不覆盖）→ 清掉自己的临时文件。 */
+/** 发布 claim（锁内）：正式路径缺席（否则 duplicate，不写临时文件）→ 写全 → fenced rename（段内再核一次缺席）。 */
 function publishClaim({ ledgerDir, key, meta, now, lockPath }) {
   const file = recordPath(ledgerDir, key);
+  const before = readRecord(file);
+  if (before.status === "read") return { ok: false, reason: "duplicate", key, file, tmpResidue: null };
+  if (before.status === "unreadable") return { ok: false, reason: "chat_ledger_unwritable", why: "正式路径上已有说不清的东西：" + before.why };
   const doc = {
     schema_version: "1.0", state: "running", key,
     chain: meta.chain, message_id: meta.message_id, session_id: meta.session_id ?? null, sender_ref: meta.sender_ref,
@@ -350,26 +379,24 @@ function publishClaim({ ledgerDir, key, meta, now, lockPath }) {
   if (problem !== null) return { ok: false, reason: "chat_ledger_unwritable", why: "claim 形状不对：" + problem };
   const w = writeTmp(ledgerDir, key, JSON.stringify(doc, null, 2) + "\n", now);
   if (!w.ok) return { ok: false, reason: "chat_ledger_unwritable", why: w.why, tmpResidue: w.tmpResidue };
-  let linkErr = null;
-  const fenced = commitWhileHeld(lockPath, () => { try { fs.linkSync(w.tmp, file); } catch (err) { linkErr = err; } });
-  const tmpResidue = finishTmp(w, { unlinkTmp: true });
-  if (!fenced.ok) return { ok: false, reason: fenced.reason === "lock_lost" ? "chat_ledger_lock_lost" : "chat_admission_lock_unavailable", why: "提交前核对锁：" + fenced.reason, tmpResidue };
-  if (linkErr !== null) {
-    if (linkErr?.code === "EEXIST") return { ok: false, reason: "duplicate", key, file, tmpResidue };
-    return { ok: false, reason: "chat_ledger_unwritable", why: "发布 claim 失败：" + String(linkErr.code ?? linkErr.message), tmpResidue };
-  }
-  return { ok: true, key, file, tmpResidue };
+  let commitErr = null; let dup = false;
+  const fenced = commitWhileHeld(lockPath, () => {
+    if (readRecord(file).status !== "absent") { dup = true; return; }
+    try { fs.renameSync(w.tmp, file); } catch (err) { commitErr = err; }
+  });
+  if (fenced.ok && dup) return { ok: false, reason: "duplicate", key, file, tmpResidue: residueOf(w.tmp, "提交时正式路径已出现（重放）") };
+  const r = afterCommit(fenced, w.tmp, commitErr);
+  if (!r.ok) return r.reason === "commit_failed" ? { ...r, reason: "chat_ledger_unwritable", why: "发布 claim 失败：" + r.why } : r;
+  return { ...r, key, file };
 }
 
 /**
- * 记终态 —— **账本锁内**：重读当前记录（同一 fd 协议）→ 必须还是 running（否则 already_final）→ 合成新记录过形状 → scratch 临时文件写全 → fenced rename 覆盖。
+ * 记终态 —— **账本锁内**：重读当前记录（同一 fd 协议）→ 必须还是 running（否则 already_final）→ 合成新记录过形状 → 写全 → fenced rename 覆盖。
  * 受控返回，不裸抛：{ ok:true } 或 { ok:false, reason: chat_admission_busy | chat_admission_lock_unavailable | chat_ledger_lock_lost | claim_unreadable | already_final | outcome_shape | ledger_unwritten }。
  */
 export function recordChatOutcome({ ledgerDir, key, outcome, now = Date.now(), lockWaitMs = RECORD_LOCK_WAIT_MS }) {
   if (!KEY_SHAPE.test(String(key))) return { ok: false, reason: "key_shape" };
   const file = recordPath(ledgerDir, key);
-  try { fs.mkdirSync(scratchDir(ledgerDir), { recursive: true, mode: 0o700 }); }
-  catch (err) { return { ok: false, reason: "ledger_unwritten", why: String(err.code ?? err.message) }; }
   return withLedgerLock(ledgerDir, lockWaitMs, (lockPath) => {
     const current = readRecord(file);
     if (current.status !== "read") return { ok: false, reason: "claim_unreadable", why: current.status === "absent" ? "claim 缺席" : current.why };
@@ -382,13 +409,11 @@ export function recordChatOutcome({ ledgerDir, key, outcome, now = Date.now(), l
     if (problem !== null) return { ok: false, reason: "outcome_shape", why: problem };
     const w = writeTmp(ledgerDir, key, JSON.stringify(doc, null, 2) + "\n", now);
     if (!w.ok) return { ok: false, reason: "ledger_unwritten", why: w.why, tmpResidue: w.tmpResidue };
-    let renameErr = null;
-    const fenced = commitWhileHeld(lockPath, () => { try { fs.renameSync(w.tmp, file); } catch (err) { renameErr = err; } });
-    const committed = fenced.ok && renameErr === null;
-    const tmpResidue = finishTmp(w, { unlinkTmp: !committed });
-    if (!fenced.ok) return { ok: false, reason: fenced.reason === "lock_lost" ? "chat_ledger_lock_lost" : "chat_admission_lock_unavailable", why: "提交前核对锁：" + fenced.reason, tmpResidue };
-    if (renameErr !== null) return { ok: false, reason: "ledger_unwritten", why: String(renameErr.code ?? renameErr.message), tmpResidue };
-    return { ok: true };
+    let commitErr = null;
+    const fenced = commitWhileHeld(lockPath, () => { try { fs.renameSync(w.tmp, file); } catch (err) { commitErr = err; } });
+    const r = afterCommit(fenced, w.tmp, commitErr);
+    if (!r.ok) return r.reason === "commit_failed" ? { ...r, reason: "ledger_unwritten" } : r;
+    return r;
   });
 }
 

@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-08-29T18:26:41.331Z",
+  "generated_at": "2026-08-29T18:58:11.446Z",
   "modules": {
     "authorize.mjs": [
       "AUTHORIZATION_TABLE",
@@ -57,7 +57,7 @@
       "CHAT_MAX_PER_SENDER",
       "CHAT_RECORD_SUFFIX",
       "RECORD_LOCK_WAIT_MS",
-      "SCRATCH_DIR_NAME",
+      "TMP_NAME_SHAPE",
       "TMP_RESIDUE_AGE_MS",
       "admissionLockPath",
       "admitChat",
@@ -71,8 +71,8 @@
       "isAdmissionLockEntry",
       "lockUnclearedText",
       "recordChatOutcome",
-      "scratchDir",
-      "senderRef"
+      "senderRef",
+      "sweepScratch"
     ],
     "chat-reply.mjs": [
       "CHAT_BIND_GUIDE",

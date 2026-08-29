@@ -298,13 +298,14 @@ export function registerSession({ sessionId, routeId, file = routesPath() }) {
  * 2026-08-23 起两条链的默认处理器被换成一个 import 别的克隆的包装脚本，装到 runtime/current 的代码 5 天没接管入站，
  * 而"路由存在且启用"两项检查全绿。
  *
- * 分类（三态以上，不折叠）：
- *   no_routes   没有路由表 → 分发器用运行时自带默认处理器（正常）
- *   runtime     默认处理器在 runtimeCurrent 之下（按路径或 realpath 任一命中）
- *   outside     默认处理器在运行时之外 —— 装的运行时没在处理入站
- *   no_default  有路由但没有默认路由（多于一条且都没标 default）→ 未登记话题会被拒
- *   unreadable  表读不出来
- * others 列出非默认路由里处理器在运行时之外的（cc2cd 那种可能是有意的，按备注分辨）。
+ * 分类（六态，不折叠）：
+ *   no_routes      没有路由表、或表里没有启用的路由 → 分发器用运行时自带默认处理器（正常）
+ *   runtime        默认处理器解析成普通文件后的 realpath 在 runtimeCurrent 之下，且（给了 expectedHandler 时）就是这条链预期的那个
+ *   outside        默认处理器不是装好的运行时 —— 缺失 / 断链 / 指向运行时之外 / 运行时里别的文件
+ *   wrong_default  默认路由的 id 不是这条链自己的（Claude self / Codex codex）→ 未登记话题会被投给别的路由；不给自动恢复
+ *   no_default     有路由但没有默认路由（多于一条且都没标 default）→ 未登记话题会被拒
+ *   unreadable     表读不出来
+ * others 列出非默认路由里处理器在运行时之外的（只按"在不在运行时之内"判；cc2cd 那种可能是有意的，按备注分辨）。
  */
 export function defaultRouteHandler({ file = routesPath(), runtimeCurrent, expectedHandler = null, expectedRouteId = null } = {}) {
   if (typeof runtimeCurrent !== "string" || !runtimeCurrent) return { status: "unreadable", why: "runtimeCurrent 缺失" };

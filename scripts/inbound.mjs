@@ -421,9 +421,11 @@ if (!mappingContext.ok) {
 // 控制命令（/feishu-mode dialogue|mapping）：三道闸之后先**解析意图但不执行**，意图随 claim 持久化；
 // 执行与终态在拿到 claim 之后做，重放时按 claim 里的意图续做或按结果重出回执（可恢复事务，goal 第 3 层）。
 const control = parseControlCommand(verdict.instruction, { chain: "claude" });
+// 控制事务用的身份期望 —— 与 claim 里写的身份字段同一算法；换绑 / 换线程之后同 key 的旧 claim 对不上，就不替它执行、不重出回执。
+const claimExpect = { logicalTaskKey: verdict.logicalTaskKey, bindingId: effectiveBindingId(mapping), claudeSessionId: mapping.claude_session_id ?? null };
 const runControl = (replay) => {
   const tx = runControlTransaction({
-    claimsDir: CLAIMS, key: claim.key, intent: control ? { control: control.kind, mode: control.mode } : undefined, replay,
+    claimsDir: CLAIMS, key: claim.key, intent: control ? { control: control.kind, mode: control.mode } : undefined, replay, expect: claimExpect,
     execute: (mode) => setClaudeInteractionMode({ root: routed.root, claudeSessionId: mapping.claude_session_id ?? null, mode }),
   });
   // 锁没干净交还的话，不管事务成败都要说出来：之后同一笔会报 control_busy。
@@ -464,7 +466,7 @@ const claim = acquireClaim({
 
 if (!claim.ok && claim.reason === "duplicate" && control) {
   // 控制命令重放：按原 claim 里的意图恢复（意图一致才续做；不一致说明是另一条不同正文的命令撞了同一消息 id，拒）。
-  const original = readClaimState({ claimsDir: CLAIMS, key: claim.key });
+  const original = readClaimState({ claimsDir: CLAIMS, key: claim.key, expect: claimExpect });
   const intent = original.status === "valid" ? original.claim.control : undefined;
   if (intent && intent.control === control.kind && intent.mode === control.mode) {
     claim.key = claim.key ?? claimKey(verdict.messageId, verdict.logicalTaskKey);

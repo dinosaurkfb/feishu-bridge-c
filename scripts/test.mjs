@@ -18468,6 +18468,25 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   assert.match(failedViaTransport.stdout, /之前执行失败（initial execution failed）；本次是同一条消息的重放，没有再次尝试/u, failedViaTransport.stdout);
   assert.equal(policyOf(), MAPPING_POLICY_ID, "重放不执行");
   assert.equal(inspectControlClaim({ claimsDir, key: key10 }).state, "failed");
+  // ── 控制事务绑定当前身份、锁内重读 claim（评审 #94 第 5 轮）：同 key、归属另一 binding 的旧 claim 重放 → 通用幂等命中，不执行、不写 consumed、模式不变
+  const foreignCtlKey = claimKey("msg_ctl_x", logicalTaskKey);
+  assert.ok(acquireClaim({ claimsDir, messageId: "msg_ctl_x", logicalTaskKey, meta: { ...protoMeta, binding_id: "someone-else", control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).ok);
+  const foreignVia = run("/feishu-mode dialogue", "msg_ctl_x");
+  assert.match(foreignVia.stdout, /已经处理过（幂等命中）/u, foreignVia.stdout);
+  assert.equal(policyOf(), MAPPING_POLICY_ID, "别的 binding 的 claim 动不了本项目的模式");
+  assert.equal(readConsumedRecord({ claimsDir, key: foreignCtlKey }).status, "absent");
+  let foreignRuns = 0;
+  const own = { logicalTaskKey, bindingId: protoMeta.binding_id, claudeSessionId: protoMeta.claude_session_id ?? null };
+  assert.deepEqual([runControlTransaction({ claimsDir, key: foreignCtlKey, intent: { control: "mode", mode: DIALOGUE_POLICY_ID }, expect: own, execute: () => { foreignRuns += 1; return { ok: true }; } }).reason, foreignRuns], ["claim_unreadable", 0], "带当前身份 → 锁内拒");
+  assert.equal(runControlTransaction({ claimsDir, key: foreignCtlKey, intent: { control: "mode", mode: DIALOGUE_POLICY_ID }, execute: () => { foreignRuns += 1; return { ok: true }; } }).ok, true, "不带 expect 才会执行 —— 所以生产入口必须带");
+  foreignRuns = 0;
+  const ownCtlKey = acquireClaim({ claimsDir, messageId: "msg_ctl_y", logicalTaskKey, meta: { ...protoMeta, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).key;
+  assert.deepEqual([runControlTransaction({ claimsDir, key: ownCtlKey, intent: { control: "mode", mode: MAPPING_POLICY_ID }, expect: own, execute: () => { foreignRuns += 1; return { ok: true }; } }).reason, foreignRuns], ["claim_intent_mismatch", 0], "调用方意图与锁内 claim 不一致：不执行");
+  let executedMode = null;
+  const viaInLock = resumeControlClaim({ claimsDir, key: ownCtlKey, expect: own, execute: (mode) => { executedMode = mode; return { ok: true, changed: true }; } });
+  assert.deepEqual([viaInLock.ok, executedMode, viaInLock.intent.mode], [true, DIALOGUE_POLICY_ID, DIALOGUE_POLICY_ID], "维护入口按锁内 claim 的意图执行：" + JSON.stringify(viaInLock));
+  assert.equal(runControlTransaction({ claimsDir, key: claimKey("msg_ctl_none", logicalTaskKey), intent: { control: "mode", mode: DIALOGUE_POLICY_ID }, expect: own, execute: () => ({ ok: true }) }).reason, "claim_absent");
+  for (const k of [foreignCtlKey, ownCtlKey]) { fs.rmSync(path.join(claimsDir, k + ".claim"), { recursive: true, force: true }); fs.rmSync(path.join(claimsDir, k + ".consumed.json"), { force: true }); }
   // 首次执行失败：failed 由事务在锁内写（不再由入站另写）
   const key11 = claimKey("msg_c11", logicalTaskKey);
   assert.ok(acquireClaim({ claimsDir, messageId: "msg_c11", logicalTaskKey, meta: { ...protoMeta, control: { control: "mode", mode: DIALOGUE_POLICY_ID } } }).ok);

@@ -9077,6 +9077,14 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
   assert.equal(failedViaTransport.status, 1, failedViaTransport.stdout);
   assert.match(failedViaTransport.stdout, /之前执行失败（initial execution failed）；本次是同一条消息的重放，没有再次尝试/u, failedViaTransport.stdout);
   assert.equal(policyOf(), modeBefore, "重放不执行");
+  // 控制事务绑定当前身份（评审 #94 第 5 轮）：同 key、归属另一 thread 的旧 claim 重放 → 通用幂等命中、不执行、模式不变
+  const foreignCtl = acquireClaim({ claimsDir: paths.claims, messageId: "msg_ctl_x", logicalTaskKey: ltk, meta: { ...protoMeta, codex_thread_id: "01922222-3333-7444-8555-000000000099", control: { control: "mode", mode: DIALOGUE_POLICY_ID } } });
+  assert.ok(foreignCtl.ok);
+  const foreignCtlVia = run("$feishu-mode dialogue", "msg_ctl_x");
+  assert.match(foreignCtlVia.stdout, /已经处理过（幂等命中）/u, foreignCtlVia.stdout);
+  assert.equal(policyOf(), modeBefore, "别的 thread 的 claim 动不了本 task 的模式");
+  assert.equal(fs.existsSync(path.join(paths.claims, foreignCtl.key + ".consumed.json")), false);
+  fs.rmSync(path.join(paths.claims, foreignCtl.key + ".claim"), { recursive: true, force: true });
   assert.ok(!fs.existsSync(path.join(paths.claims, key10 + ".consumed.json")), "没有留下并存");
   // 逐 key 事务锁：另一笔持有时维护入口与重放都拿不到
   const lock10 = path.join(paths.claims, key10 + ".control.lock");

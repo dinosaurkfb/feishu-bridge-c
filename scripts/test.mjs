@@ -19171,6 +19171,21 @@ test("发送者角色表（第 1 层）：唯一判据、模板交叉校验、�
     const dirTpl = path.join(home, "dir.json"); fs.mkdirSync(dirTpl);
     assert.equal(withChainTemplateWrite({ file: dirTpl, mutate: () => ({ template: TPL }) }).reason, "template_not_regular_file");
     fs.rmSync(alias);
+    // 硬链接别名（评审反例）：两个目录项指同一 inode，rename 只换一个 → 拒；两份目录项与内容都不变、不派生锁；真入口同样拒
+    const hard = path.join(home, "hard.json");
+    fs.linkSync(tplFile, hard);
+    const beforeHard = fs.readFileSync(tplFile, "utf-8");
+    const viaHard = applySenderChange({ file: hard, change: { openId: "889", role: "operator" } });
+    assert.deepEqual([viaHard.ok, viaHard.reason, /硬链接/u.test(viaHard.detail)], [false, "template_has_multiple_links", true], JSON.stringify(viaHard));
+    const viaCanonicalWhileLinked = applySenderChange({ file: tplFile, change: { openId: "889", role: "operator" } });
+    assert.equal(viaCanonicalWhileLinked.reason, "template_has_multiple_links", "权威路径自己也有 2 个目录项时同样拒");
+    assert.equal(fs.readFileSync(tplFile, "utf-8"), beforeHard); assert.equal(fs.readFileSync(hard, "utf-8"), beforeHard);
+    assert.equal(fs.statSync(tplFile).ino, fs.statSync(hard).ino, "两份目录项仍指同一 inode");
+    assert.ok(!lockPresent(hard + ".lock") && !lockPresent(tplFile + ".lock"), "没有派生任何锁");
+    const hardCli = cli("--template", hard, "--open-id", "889", "--role", "operator", "--apply");
+    assert.deepEqual([hardCli.status, /template_has_multiple_links/u.test(hardCli.stdout)], [1, true], hardCli.stdout + hardCli.stderr);
+    fs.rmSync(hard);
+    assert.equal(applySenderChange({ file: tplFile, change: { openId: "889", role: "operator" } }).ok, true, "去掉别名后恢复可写");
   }
   // 失败叠加释放失败：公共文案两件事都说，退出码非零
   {

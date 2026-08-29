@@ -278,6 +278,8 @@ export function withChainTemplateWrite({ file, mutate, backupSuffix = null, allo
   try {
     const st = fs.lstatSync(file);
     if (!st.isFile()) return { ok: false, reason: "template_not_regular_file", detail: st.isSymbolicLink() ? "是符号链接（别名）；请用真实路径" : "不是普通文件" };
+    // 硬链接也是别名：rename 只换本目录项，另一条路径仍指旧 inode，而且两条路径会派生两把不同的锁 —— 同一底层文件被两个事务同时处理。
+    if (st.nlink !== 1) return { ok: false, reason: "template_has_multiple_links", detail: "这个文件有 " + st.nlink + " 个目录项（硬链接别名）；先去掉别名再写" };
   } catch (err) { if (err.code !== "ENOENT") return { ok: false, reason: "template_unreadable", detail: String(err.code ?? err.message) }; }
   const lockDir = file + ".lock";
   let lock;

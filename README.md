@@ -241,8 +241,8 @@ session 绑定。日常还可以使用：
 运输层重放遇到受验的 failed 按记录重出失败回执、不再执行（要再切就重新发一条）；两份终态并存 → control_conflict，不执行。
 锁原语里的文件操作抛错在 withControlLock 这层兜住：取得阶段 → control_lock_unavailable（回调没跑），释放阶段 → lockUncleared。
 **装了 ≠ 在跑（issue #88）**：入站由机器级路由表 `~/.claude/feishu-bridge/routes.json`（Codex 链 `~/.codex/feishu-bridge/routes.json`）的默认路由决定，
-表非空时分发器不会回退运行时自带的处理器。`doctor` 第 ⑦ 项与状态页第 1 层「入站处理器」都按 `defaultRouteHandler` 五态报
-（runtime / no_routes ✓；outside / no_default ✗；unreadable 说不清）；判定只认能解析成普通文件的 realpath，且要与该链预期的 inbound handler 对账（缺失文件、指向外部的符号链接、同目录别的文件都不算）；
+表非空时分发器不会回退运行时自带的处理器。`doctor` 第 ⑦ 项与状态页第 1 层「入站处理器」都按 `defaultRouteHandler` 六态报
+（runtime / no_routes ✓；outside / no_default / wrong_default ✗；unreadable 说不清）；判定只认能解析成普通文件的 realpath，且要与该链预期的 inbound handler 对账（缺失文件、指向外部的符号链接、同目录别的文件都不算）；
 默认路由的 id 也要对（Claude `self` / Codex `codex`）：别的路由被标成默认是独立状态 `wrong_default`，不给自动恢复；
 改回用 `node scripts/register-route.mjs --restore-default --routes <该链的 routes.json> --handler <runtime/current 下的 inbound.mjs> --id <self|codex> [--apply]`
 （切权威路由，Frank 逐次授权；先备份整张表，只动默认那条）。

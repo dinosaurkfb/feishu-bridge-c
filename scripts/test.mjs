@@ -19991,7 +19991,7 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   assert.match(inspectChat({ ledgerDir, key: goodKey }).why, /^outcome：(schema_version 不认识|answered 的字段集不对)/u, "最小终态不算已回答");
   const goodOutcome = { schema_version: "1.0", key: goodKey, status: "answered", text: "真", elapsed_ms: 12, recorded_at: "2026-08-30T00:00:01.000Z" };
   assert.equal(chatOutcomeProblem(goodOutcome, goodKey), null);
-  for (const [bad, why] of [[{ ...goodOutcome, key: "c".repeat(64) }, "key"], [{ ...goodOutcome, text: "" }, "没有正文"], [{ ...goodOutcome, status: "done" }, "受控集合"], [{ ...goodOutcome, elapsed_ms: -1 }, "elapsed_ms"], [{ ...goodOutcome, status: "failed" }, "failed 的字段集不对"]]) assert.match(chatOutcomeProblem(bad, goodKey) ?? "", new RegExp(why, "u"), JSON.stringify(bad));
+  for (const [bad, why] of [[{ ...goodOutcome, key: "c".repeat(64) }, "key"], [{ ...goodOutcome, text: "" }, "没有正文"], [{ ...goodOutcome, extra: 1 }, "answered 的字段集不对"], [{ ...goodOutcome, diagnostic: null }, "answered 的字段集不对"], [{ ...goodOutcome, status: "done" }, "受控集合"], [{ ...goodOutcome, elapsed_ms: -1 }, "elapsed_ms"], [{ ...goodOutcome, status: "failed" }, "failed 的字段集不对"]]) assert.match(chatOutcomeProblem(bad, goodKey) ?? "", new RegExp(why, "u"), JSON.stringify(bad));
   fs.writeFileSync(path.join(ledgerDir, goodKey + ".chat", "outcome.json"), JSON.stringify(goodOutcome));
   assert.equal(inspectChat({ ledgerDir, key: goodKey }).state, "answered");
   assert.deepEqual(recordChatOutcome({ ledgerDir, key: goodKey, outcome: { status: "answered", text: "", elapsed_ms: 1 } }).reason, "outcome_shape", "记终态先过形状");

@@ -55,7 +55,7 @@ herdr agent read <pane> --source recent-unwrapped --lines 60
 **安装（任何 `--apply`）**、写飞书、切权威路由。
 
 **2026-08-28 起，飞书里的授权等同于终端授权。**理由是 Frank 的原话："飞书上的我也是
-真的我。"路由层只放行登记的 `frank_sender_id` 且要求真实 @，身份那一关在入站时已经过了；
+真的我。"路由层只放行角色表里登记的发送者（owner = `frank_sender_id`，另有 operator / participant）且要求真实 @，身份那一关在入站时已经过了；非 owner 能进来的只有 Dialogue 下的对话（R1），控制命令与授权用语一律只认 owner，所以到你手里的授权字只可能来自 Frank；
 逐次授权守的是"不可逆 / 对外可见"，从来不是"怀疑说话的是谁"。措辞纪律照旧，它防的是误触，
 而且**对象必须封闭**：
 

@@ -223,7 +223,7 @@ session 绑定。日常还可以使用：
 | status | `$feishu-status` | `/feishu-status` | 只读查看接入、入站绑定和待发状态 |
 | unbind | `$feishu-unbind` | `/feishu-unbind` | 可恢复地暂停，不删话题、映射或历史 |
 | 入站权限判定（第 2 层 × 第 4 层） | —（路由器内部） | —（路由器内部） | 三道闸之后、拿 claim 之前唯一一处 `authorize({ role, riskClass, mode })`：风险等级 R0 只读 / R1 对话 / R2 执行 / R3 控制 / R4 授权类（`risk-class.mjs`），普通文本在 Dialogue 下是 R1、在 Mapping 下是 R2；交叉表（`authorize.mjs`）：Mapping 只有 owner 可 R2，Dialogue 的 R1 对 owner / operator / participant 都开，R3 / R4 只有 owner，operator 暂与 participant 同权，未登记零权限；拒绝回执写明"哪个模式、哪个角色、缺什么权限"，不取 claim、不投递 |
-| 发送者角色（第 2 层） | `node scripts/register-sender.mjs --template <该链 chain-config.json> --open-id <数字> --role operator\|participant [--apply]` | 同左 | 往链路模板的 `senders` 登记 / 移除一个人（owner 只有一个，就是 `frank_sender_id`，不在这里登记）；默认预览，写入要 owner 逐次授权；`--remove` 移除。第 1 层只登记与显示（`/feishu-subscribe`、状态页第 2 层「发送者角色」只出数量），入站判定仍只放 owner，角色 × 风险 × 模式的判定是第 2 层 |
+| 发送者角色（第 2 层） | `node scripts/register-sender.mjs --template <该链 chain-config.json> --open-id <数字> --role operator\|participant [--apply]` | 同左 | 往链路模板的 `senders` 登记 / 移除一个人（owner 只有一个，就是 `frank_sender_id`，不在这里登记）；默认预览，写入要 owner 逐次授权；`--remove` 移除。第 1 层只登记与显示（`/feishu-subscribe`、状态页第 2 层「发送者角色」只出数量），入站判定按上一行（角色 × 风险 × 模式）决定 |
 | bind | `$feishu-bind` | `/feishu-bind` | 首次接入，或恢复已暂停的原话题连接 |
 | rotate | `$feishu-rotate` | `/feishu-rotate` | 为同一 binding 创建下一话题代际；旧话题保留为历史（仍可下指令，回复回原话题） |
 | mode（飞书侧） | 正文恰为 `$feishu-mode dialogue` / `mapping` | 正文恰为 `/feishu-mode dialogue` / `mapping` | 入站路由器当场切换交互模式并回执，不投递给会话（2026-08-28 起）。"恰为"按词算：不可见字符、不换行/全角空格、全角斜杠先折叠，多一个字仍走普通路径 |

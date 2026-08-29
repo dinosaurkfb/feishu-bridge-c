@@ -19309,9 +19309,23 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
   assert.deepEqual(classifyRisk({ instruction: "$feishu-subscribe", chain: "codex", mode: DIALOGUE_POLICY_ID }), { riskClass: RISK.R0, kind: "readonly" });
   assert.deepEqual(classifyRisk({ instruction: "/feishu-bind", chain: "claude", mode: MAPPING_POLICY_ID }), { riskClass: RISK.R3, kind: "control" });
   assert.deepEqual(classifyRisk({ instruction: "/feishu-rotate cancel", chain: "claude", mode: DIALOGUE_POLICY_ID }), { riskClass: RISK.R3, kind: "control" });
-  assert.equal(classifyRisk({ instruction: "$feishu-status", chain: "claude", mode: MAPPING_POLICY_ID }).riskClass, RISK.R2, "别的链的前缀不算本链命令");
+  assert.equal(classifyRisk({ instruction: "$feishu-status", chain: "claude", mode: MAPPING_POLICY_ID }).riskClass, RISK.R3, "别链前缀不是本链的只读词，但仍在命令命名空间里：按控制，不折叠成普通文本");
   for (const t of ["装", "装 8c5cedc", "安装", "切路由 两条链", "切路由"]) assert.deepEqual(classifyRisk({ instruction: t, chain: "claude", mode: MAPPING_POLICY_ID }), { riskClass: RISK.R4, kind: "authorization" }, t);
   assert.equal(classifyRisk({ instruction: "装修一下", chain: "claude", mode: MAPPING_POLICY_ID }).riskClass, RISK.R2, "授权用语是封闭形状");
+  // 评审 #93 P1-2：命令命名空间封闭 —— 未从飞书开放的（unbind / pin-session）、缺参的（光一个 feishu-mode）、带尾巴的只读词、别链前缀的，一律 R3，不许落成 R1
+  for (const t of ["/feishu-unbind", "/feishu-pin-session", "/feishu-mode", "/feishu-status now", "/feishu-subscribe all", "/feishu-whatever", "$feishu-unbind", "$feishu-mode dialogue", "／feishu-unbind"]) {
+    assert.deepEqual(classifyRisk({ instruction: t, chain: "claude", mode: DIALOGUE_POLICY_ID }), { riskClass: RISK.R3, kind: "control" }, "claude: " + t);
+  }
+  for (const t of ["$feishu-unbind", "$feishu-pin-session", "$feishu-mode", "$feishu-status now", "/feishu-unbind", "/feishu-mode dialogue"]) {
+    assert.deepEqual(classifyRisk({ instruction: t, chain: "codex", mode: DIALOGUE_POLICY_ID }), { riskClass: RISK.R3, kind: "control" }, "codex: " + t);
+  }
+  assert.deepEqual(classifyRisk({ instruction: "$feishu-status", chain: "codex", mode: DIALOGUE_POLICY_ID }), { riskClass: RISK.R0, kind: "readonly" }, "本链的只读词仍是 R0");
+  assert.deepEqual(classifyRisk({ instruction: "feishu-mode dialogue", chain: "claude", mode: DIALOGUE_POLICY_ID }), { riskClass: RISK.R1, kind: "conversation" }, "没有前缀就不是命令命名空间");
+  // 评审 #93 P1-2：授权用语覆盖三类逐次授权动作，且允许多词对象
+  for (const t of ["安装 PR #93", "安装 #93 6699a15", "写飞书", "发飞书 这份结果", "切权威路由 到 runtime/current", "装 PR #93 的 HEAD"]) {
+    assert.deepEqual(classifyRisk({ instruction: t, chain: "codex", mode: DIALOGUE_POLICY_ID }), { riskClass: RISK.R4, kind: "authorization" }, t);
+  }
+  assert.equal(classifyRisk({ instruction: "写飞书文档的经验", chain: "claude", mode: DIALOGUE_POLICY_ID }).riskClass, RISK.R1, "授权用语后面必须是空格分开的对象，不是任意前缀匹配");
   assert.deepEqual(classifyRisk({ instruction: "帮我看看这个问题", chain: "claude", mode: DIALOGUE_POLICY_ID }), { riskClass: RISK.R1, kind: "conversation" });
   assert.deepEqual(classifyRisk({ instruction: "帮我看看这个问题", chain: "claude", mode: MAPPING_POLICY_ID }), { riskClass: RISK.R2, kind: "instruction" });
   assert.deepEqual(classifyRisk({ instruction: "帮我看看", chain: "claude", mode: "turbo" }), { riskClass: RISK.R2, kind: "instruction" }, "模式说不清按 R2");
@@ -19396,6 +19410,14 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
   // Dialogue 下 participant 的 R0 / R3 仍拒
   assert.match(run("/feishu-status", "333").stdout, /R0（只读） 需要 owner 权限/u);
   assert.match(run("/feishu-mode mapping", "333").stdout, /R3（控制） 需要 owner 权限/u);
+  // 评审 #93 P1-2：不从飞书开放 / 缺参 / 别链前缀的命令形状，在 Dialogue 下也不许以"对话"身份放行给 participant
+  const claimsBeforeNs = claimCount();
+  for (const t of ["/feishu-unbind", "/feishu-pin-session", "/feishu-mode", "$feishu-mode dialogue"]) {
+    assert.match(run(t, "333").stdout, /你的角色是 participant，R3（控制） 需要 owner 权限/u, t);
+  }
+  assert.match(run("安装 PR #93", "333").stdout, /R4（授权类） 需要 owner 权限/u);
+  assert.match(run("写飞书", "222").stdout, /你的角色是 operator，R4（授权类） 需要 owner 权限/u);
+  assert.equal(claimCount(), claimsBeforeNs, "这些拒绝都不取 claim");
   assert.equal(policyOf(), DIALOGUE_POLICY_ID);
 });
 

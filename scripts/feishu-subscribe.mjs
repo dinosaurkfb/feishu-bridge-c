@@ -14,7 +14,7 @@
  * ■ 写入口的现状（2026-08-29，逐项说清"有什么、还缺什么"，别再让这段话在事实变了之后留着）
  *
  *   已开放：**发送者角色表**的登记 —— `register-sender.mjs` 改链路模板的 senders（锁内重读重算、先校验后写、
- *          备份 + 逐字读回；写入需 owner 逐次授权）。本层只登记与显示，入站判定仍只放 owner。
+ *          备份 + 逐字读回；写入需 owner 逐次授权）。本层只登记与显示；入站判定在第 2 层按角色 × 风险等级 × 模式决定（risk-class / authorize）。
  *   已完成：FR-2.5 的落盘控制面 —— 同步计划器（subscription-sync.mjs）与 resnapshot / suspend / migrate 的落盘
  *          （subscription-sync-apply.mjs）都在，订阅变更能同步到依赖它的 binding 授权快照。
  *   未开放：**独立订阅的增删**。卡在 FR-2.6：多于一条订阅时首次认领必须能拒绝歧义，这条判据在，
@@ -104,7 +104,7 @@ export function renderSubscriptions(view, { source = null } = {}) {
     lines.push("订阅状态  " + s.status + (s.version ? " · v" + s.version : ""));
     lines.push("订阅群    " + (s.groupName ?? "群名不可用（只有群 ID，不拿 ID 顶替）"));
     lines.push("授权发送者 " + s.senderCount + " 个（只出数量，不出身份）");
-    lines.push("发送者角色 " + roleCountsText(s.roleCounts) + "（第 1 层只登记；非 owner 的入站判定在第 2 层接入前仍按今天的规则拒绝）");
+    lines.push("发送者角色 " + roleCountsText(s.roleCounts) + "（入站判定按角色 × 风险等级 × 模式：Mapping 只放 owner；Dialogue 的对话对 operator / participant 开，控制与授权类只认 owner）");
     lines.push("事件范围  " + (s.eventTypes.join("、") || "未声明"));
     lines.push("新鲜度    " + (s.freshnessMs === null ? "未声明"
       : Math.round(s.freshnessMs / MINUTE) + " 分钟内的事件才受理"));

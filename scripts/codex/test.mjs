@@ -9095,6 +9095,16 @@ test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialog
     const chat = runAs("这个问题你怎么看", "3333", "msg_authz_6");
     assert.doesNotMatch(chat.stdout, /你的角色是|需要 owner 权限/u, "Dialogue 下 participant 可对话：" + chat.stdout);
     assert.equal(fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).length, beforeChat + 1, "participant 的对话取了 claim");
+    // 评审 #93 P1-2：命令命名空间封闭 —— unbind / pin-session / 缺参 mode / 别链前缀 在 Dialogue 下对 participant 仍是 R3；授权用语（多词对象、写飞书）是 R4
+    const beforeNs = fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).length;
+    let nsIdx = 0;
+    for (const t of ["$feishu-unbind", "$feishu-pin-session", "$feishu-mode", "/feishu-mode dialogue"]) {
+      assert.match(runAs(t, "3333", "msg_authz_ns_" + (nsIdx++)).stdout, /你的角色是 participant，R3（控制） 需要 owner 权限/u, t);
+    }
+    assert.match(runAs("安装 PR #93", "3333", "msg_authz_ns_" + (nsIdx++)).stdout, /R4（授权类） 需要 owner 权限/u);
+    assert.match(runAs("写飞书", "2222", "msg_authz_ns_" + (nsIdx++)).stdout, /你的角色是 operator，R4（授权类） 需要 owner 权限/u);
+    assert.equal(fs.readdirSync(paths.claims).filter((n) => n.endsWith(".claim")).length, beforeNs, "这些拒绝都不取 claim");
+    assert.equal(policyOf(), DIALOGUE_POLICY_ID, "participant 动不了模式");
     assert.equal(setTaskInteractionMode({ threadId: THREAD_A, mode: MAPPING_POLICY_ID, home }).ok, true);
     fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   }

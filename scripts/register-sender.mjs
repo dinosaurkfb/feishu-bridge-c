@@ -15,17 +15,20 @@ import fs from "node:fs";
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
 import { loadChainTemplate, validateChainTemplate } from "./chain-template.mjs";
+import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { SENDER_ROLES, roleCounts, roleCountsText, senderRolesProblem, senderTable } from "./sender-roles.mjs";
 
 export function parseRegisterSenderArgs(argv) {
   const out = { template: null, openId: null, role: null, note: null, remove: false, apply: false };
+  const seen = new Set();
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
-    if (a === "--apply") { out.apply = true; continue; }
-    if (a === "--remove") { out.remove = true; continue; }
+    if (seen.has(a)) return { ok: false, reason: "duplicate_argument", argument: a };   // 受控写入口：重复参数不许"以后一个为准"
+    if (a === "--apply" || a === "--remove") { seen.add(a); out[a.slice(2)] = true; continue; }
     if (["--template", "--open-id", "--role", "--note"].includes(a)) {
       const v = argv[i + 1];
       if (typeof v !== "string" || v.startsWith("--") || v.length === 0) return { ok: false, reason: a + "_value_required" };
+      seen.add(a);
       if (a === "--template") out.template = v; else if (a === "--open-id") out.openId = v; else if (a === "--role") out.role = v; else out.note = v;
       i += 1; continue;
     }
@@ -33,7 +36,10 @@ export function parseRegisterSenderArgs(argv) {
   }
   if (!out.template || !path.isAbsolute(out.template)) return { ok: false, reason: "template_required_absolute" };
   if (!out.openId || !/^\d+$/u.test(out.openId)) return { ok: false, reason: "open_id_shape" };
-  if (!out.remove) {
+  // "登记"与"移除"是封闭联合：移除不带 role / note；登记必带合法 role
+  if (out.remove) {
+    if (out.role !== null || out.note !== null) return { ok: false, reason: "remove_takes_no_role" };
+  } else {
     if (!out.role) return { ok: false, reason: "role_required" };
     if (out.role === "owner") return { ok: false, reason: "owner_not_registrable" };
     if (!SENDER_ROLES.includes(out.role)) return { ok: false, reason: "role_unknown" };
@@ -64,21 +70,44 @@ export function planSenderChange(template, { openId, role, note = null, remove =
   return { ok: true, changed: true, template: candidate, table: senderTable(candidate), before: existing, after: remove ? null : next.find((e) => e.open_id === openId) };
 }
 
-/** 写盘：备份 → 原子写 → 读回校验。 */
-export function applySenderChange({ file, template, now = new Date() }) {
-  const backup = file + ".bak." + now.toISOString().replace(/[:.]/gu, "-");
-  try { fs.copyFileSync(file, backup); } catch (err) { return { ok: false, reason: "backup_failed", error: err.message }; }
-  const tmp = file + ".tmp." + process.pid;
+/**
+ * 写盘 —— **整段在模板写锁内**（与 routes / registry 同一把 symlink 锁原语）：重读 → 重规划 → 校验 → 备份 → 原子写 → 逐字读回。
+ * 评审反例：锁外规划的旧模板落盘会静默覆盖别人刚登记的人；先写后校验会把坏模板落成正式文件。
+ * change 是变更意图（不是算好的模板），所以并发时以锁内读到的世界为准重算。
+ */
+export function applySenderChange({ file, change, now = new Date() }) {
+  if (typeof file !== "string" || !path.isAbsolute(file)) return { ok: false, reason: "template_required_absolute" };
+  if (!change || typeof change !== "object") return { ok: false, reason: "change_required" };
+  const lockDir = file + ".lock";
+  const lock = acquirePublishLock(lockDir);
+  if (!lock.ok) return { ok: false, reason: "template_busy" };
   try {
-    fs.writeFileSync(tmp, JSON.stringify(template, null, 2) + "\n", { mode: 0o600 });
-    fs.renameSync(tmp, file);
-  } catch (err) {
-    try { fs.rmSync(tmp, { force: true }); } catch { /* 已不在 */ }
-    return { ok: false, reason: "template_unwritable", error: err.message };
+    const loaded = loadChainTemplate(file);
+    if (!loaded.ok) return { ok: false, reason: "template_unreadable", problem: loaded.reason };
+    const plan = planSenderChange(loaded.template, change);
+    if (!plan.ok) return plan;
+    if (!plan.changed) return { ok: true, changed: false, table: plan.table };
+    // 先校验（planSenderChange 已过 validateChainTemplate；这里再逐字段核一次，确保写的就是校验过的那份）
+    const valid = validateChainTemplate(plan.template);
+    if (!valid.ok) return { ok: false, reason: "result_invalid", problem: JSON.stringify(valid) };
+    const body = JSON.stringify(plan.template, null, 2) + "\n";
+    const backup = file + ".bak." + now.toISOString().replace(/[:.]/gu, "-");
+    try { fs.copyFileSync(file, backup); } catch (err) { return { ok: false, reason: "backup_failed", error: err.message }; }
+    const tmp = file + ".tmp." + process.pid;
+    try {
+      fs.writeFileSync(tmp, body, { mode: 0o600 });
+      fs.renameSync(tmp, file);
+    } catch (err) {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* 已不在 */ }
+      return { ok: false, reason: "template_unwritable", error: err.message, backup };
+    }
+    let back;
+    try { back = fs.readFileSync(file, "utf-8"); } catch (err) { return { ok: false, reason: "readback_failed", error: err.message, backup }; }
+    if (back !== body) return { ok: false, reason: "readback_mismatch", backup };
+    return { ok: true, changed: true, backup, table: plan.table, before: plan.before, after: plan.after };
+  } finally {
+    releasePublishLock(lockDir);
   }
-  const back = loadChainTemplate(file);
-  if (!back.ok) return { ok: false, reason: "readback_failed", problem: back.reason, backup };
-  return { ok: true, backup };
 }
 
 if (isDirectRun(import.meta.url)) {
@@ -98,8 +127,9 @@ if (isDirectRun(import.meta.url)) {
   process.stdout.write("同步    ：第 1 层不改 sender_ids（授权基准仍只有 owner），binding 授权快照不需重签；非 owner 的入站在第 2 层接入前仍被拒。\n");
   if (!plan.changed) { process.stdout.write("已经是这样，没动。\n"); process.exit(0); }
   if (!parsed.apply) { process.stdout.write("\n[dry-run] 什么都没写。写入是改授权面，要 owner 逐次授权后再加 --apply。\n"); process.exit(0); }
-  const done = applySenderChange({ file: parsed.template, template: plan.template });
+  const done = applySenderChange({ file: parsed.template, change: parsed });
   if (!done.ok) { process.stdout.write("没有写成：" + done.reason + (done.error ? "：" + done.error : "") + (done.problem ? "：" + done.problem : "") + "\n"); process.exit(1); }
-  process.stdout.write("已写入。备份：" + done.backup + "\n");
+  if (!done.changed) { process.stdout.write("锁内重读后已经是这样，没动。\n"); process.exit(0); }
+  process.stdout.write("已写入（锁内重读重算后）。备份：" + done.backup + "\n角色人数：" + roleCountsText(roleCounts(done.table)) + "\n");
   process.exit(0);
 }

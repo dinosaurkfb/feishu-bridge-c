@@ -7,7 +7,7 @@
  */
 
 import crypto from "node:crypto";
-import { SENDER_ROLES, senderRolesProblem, senderTable } from "./sender-roles.mjs";
+import { roleEntriesProblem, senderRolesProblem, senderTable } from "./sender-roles.mjs";
 
 export const SUBSCRIPTION_SCHEMA_VERSION = "1.0";
 export const SUBSCRIPTION_ARTIFACT_TYPE = "feishu_bridge_subscription";
@@ -68,15 +68,10 @@ export function validateSubscription(subscription) {
     problems.push("scope.event_types");
   }
   // sender_roles 可选；在场就必须封闭、不重复、角色在枚举里，且每个 sender_ids 里的 id 都得在表里（sender_ids 是授权基准，表不能少它）
-  if (scope?.sender_roles !== undefined) {
-    const roles = scope.sender_roles;
-    const okShape = Array.isArray(roles) && roles.every((e) => e && typeof e === "object" && !Array.isArray(e) &&
-      typeof e.open_id === "string" && e.open_id.length > 0 && SENDER_ROLES.includes(e.role) &&
-      Object.keys(e).every((k) => ["open_id", "role", "note"].includes(k)));
-    const ids = okShape ? roles.map((e) => e.open_id) : [];
-    if (!okShape || uniqueStrings(ids).length !== ids.length || !(scope.sender_ids ?? []).every((id) => ids.includes(id))) {
-      problems.push("scope.sender_roles");
-    }
+  // 与模板同一份核心校验（sender-roles.mjs），owner 基准就是 sender_ids：owner 集合必须精确一致、字段取值域封闭。旧制品不带 sender_roles 仍接受。
+  if (scope?.sender_roles !== undefined &&
+      roleEntriesProblem(scope.sender_roles, { ownerIds: scope?.sender_ids ?? [], ownerRequired: true, name: "scope.sender_roles" }) !== null) {
+    problems.push("scope.sender_roles");
   }
   if (typeof subscription?.constraints?.freshness_ms !== "number" ||
       !Number.isFinite(subscription.constraints.freshness_ms) || subscription.constraints.freshness_ms <= 0) {

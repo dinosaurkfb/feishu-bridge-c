@@ -8980,9 +8980,11 @@ test("订阅命令：只读、严格参数、把写为什么没开说清楚", ()
   const ok = run(["--project", process.cwd()]);
   assert.equal(ok.status, 0, ok.stderr);
   // 说清写为什么没开 —— "暂不支持"是排期，"缺这两条前置"才是事实。
-  assert.match(ok.stdout, /FR-2\.5/u);
-  assert.match(ok.stdout, /FR-2\.6/u);
-  assert.match(ok.stdout, /订阅说 A、授权快照仍说 B/u);
+  assert.match(ok.stdout, /FR-2\.5 的落盘控制面已经完成/u);
+  assert.match(ok.stdout, /卡在 FR-2\.6/u);
+  assert.match(ok.stdout, /发送者角色表可以登记.*register-sender\.mjs/u);
+  assert.match(ok.stdout, /独立订阅的增删仍不开放/u);
+  assert.doesNotMatch(ok.stdout, /订阅说 A、授权快照仍说 B|控制面还没有/u, "过时的理由不许再出现");
 });
 
 test("待认领数要用跟热路径同一个判据", () => {
@@ -9021,20 +9023,23 @@ test("群名只能给它确实对应的那条订阅", () => {
   assert.match(text, /群名不可用/u);
 });
 
-test("订阅命令明确是 Claude 侧，三处说法不许互相矛盾", () => {
-  // 仓库里有 Codex 的投影，但没有 CLI / 技能 / 安装入口。
-  // 说成 $feishu-subscribe（两侧同名斜杠命令）会让人在 Codex 里敲一个不存在的命令。
+test("订阅命令的用户可见契约：两条链都有、写入口现状一致，过时说法不许留", () => {
+  // 2026-08-29 之前这里钉的是"仅 Claude 侧 / 待迁移"；Codex 侧早已有 CLI 与技能，那句话成了假话（评审第 1 轮抓出）。
+  // 现在钉的是：角色表登记已开放、独立订阅增删卡在 FR-2.6、FR-2.5 落盘控制面已完成 —— 五处说法一致。
   const readme = fs.readFileSync(path.resolve("README.md"), "utf-8");
-  const reqs = fs.readFileSync(
-    path.resolve("docs", "requirements", "agent-enhancement-requirements.md"), "utf-8");
-  const skill = fs.readFileSync(
-    path.resolve("skills", "claude-feishu-subscribe", "SKILL.md"), "utf-8");
-
-  // README 不能再说它「尚未开放」而需求文档说它可用。
+  const reqs = fs.readFileSync(path.resolve("docs", "requirements", "agent-enhancement-requirements.md"), "utf-8");
+  const claudeSkill = fs.readFileSync(path.resolve("skills", "claude-feishu-subscribe", "SKILL.md"), "utf-8");
+  const codexSkill = fs.readFileSync(path.resolve("skills", "feishu-subscribe", "SKILL.md"), "utf-8");
+  const claudeCli = fs.readFileSync(path.resolve("scripts", "feishu-subscribe.mjs"), "utf-8");
+  const codexCli = fs.readFileSync(path.resolve("scripts", "codex", "feishu-subscribe.mjs"), "utf-8");
   assert.match(readme, /\/feishu-subscribe.*只读/su);
-  assert.match(reqs, /仅 Claude 侧/u);
-  assert.match(skill, /只有 Claude 侧/u);
-  assert.match(skill, /待迁移/u);
+  assert.match(reqs, /两条链都有：Codex `\$feishu-subscribe`/u);
+  for (const [name, text] of [["claude skill", claudeSkill], ["codex skill", codexSkill], ["claude cli", claudeCli], ["codex cli", codexCli]]) {
+    assert.match(text, /register-sender/u, name + " 要说角色表登记已开放");
+    assert.match(text, /FR-2\.6/u, name + " 要说独立订阅增删卡在 FR-2.6");
+    assert.match(text, /FR-2\.5[^\n]*(已经完成|已完成)/u, name + " 要说 FR-2.5 落盘控制面已完成");
+    assert.doesNotMatch(text, /仅 Claude 侧|只有 Claude 侧|待迁移|控制面还没有|还没实现|写入口还没开|为什么现在还不能写/u, name + " 不许留过时说法");
+  }
 });
 test("端点自检把 FR-1.4 的四种情形分开，各有各的下一步", () => {
   const ready = selfCheck();
@@ -18940,6 +18945,23 @@ test("发送者角色表（第 1 层）：唯一判据、模板交叉校验、�
   assert.ok(validateSubscription(tampered).problems.includes("scope.sender_roles"), "表里必须包含 sender_ids 的每一个 id");
   tampered.scope.sender_roles = [{ open_id: "12345", role: "boss" }];
   assert.ok(validateSubscription(tampered).problems.includes("scope.sender_roles"));
+  // 评审反例：订阅制品上同一份核心校验 —— owner 标成 operator / 第二个 owner / 非数字 id / note 是数字 都不合法
+  const probe = (sender_roles) => { const c = JSON.parse(JSON.stringify(model.subscriptions[0])); c.scope.sender_roles = sender_roles; return validateSubscription(c); };
+  for (const [label, roles] of [
+    ["owner 标成 operator", [{ open_id: "12345", role: "operator" }]],
+    ["第二个 owner", [{ open_id: "12345", role: "owner" }, { open_id: "222", role: "owner" }]],
+    ["非数字 id", [{ open_id: "12345", role: "owner" }, { open_id: "ou_x", role: "participant" }]],
+    ["note 是数字", [{ open_id: "12345", role: "owner", note: 42 }]],
+    ["缺 owner", [{ open_id: "222", role: "operator" }]],
+  ]) assert.ok(probe(roles).problems.includes("scope.sender_roles"), label);
+  assert.equal(probe([{ open_id: "12345", role: "owner" }, { open_id: "222", role: "operator", note: "同事" }]).ok, true);
+  // schema 与代码同步：schema 声明了可选 sender_roles，角色枚举与 open_id 形状与 sender-roles.mjs 一致
+  const schema = JSON.parse(fs.readFileSync(path.resolve("references", "subscription-v1.schema.json"), "utf-8"));
+  const sr = schema.properties.scope.properties.sender_roles;
+  assert.deepEqual(sr.items.properties.role.enum, [...SENDER_ROLES]);
+  assert.equal(sr.items.properties.open_id.pattern, "^[0-9]+$");
+  assert.equal(sr.items.additionalProperties, false);
+  assert.equal(schema.properties.scope.required.includes("sender_roles"), false, "可选：旧制品不带也合法");
   const badTemplate = buildLegacySubscriptionReadModel({ runtime: "claude", endpointId: "ep", template: { ...TPL, senders: [{ open_id: "1", role: "owner" }] },
     records: [{ legacy_key: "k", domain_key: "d", local_target_id: "t" }] });
   assert.deepEqual([badTemplate.ok, badTemplate.problems], [false, ["template.senders"]]);
@@ -18963,7 +18985,7 @@ test("发送者角色表（第 1 层）：唯一判据、模板交叉校验、�
   assert.deepEqual(JSON.parse(fs.readFileSync(tplFile, "utf-8")), TPL, "预览不写");
   const applied = cli("--template", tplFile, "--open-id", "222", "--role", "operator", "--note", "同事", "--apply");
   assert.equal(applied.status, 0, applied.stdout + applied.stderr);
-  assert.match(applied.stdout, /已写入。备份：/u);
+  assert.match(applied.stdout, /已写入（锁内重读重算后）。备份：/u);
   const written = JSON.parse(fs.readFileSync(tplFile, "utf-8"));
   assert.deepEqual(written.senders, [{ open_id: "222", role: "operator", note: "同事" }]);
   assert.equal(written.frank_sender_id, TPL.frank_sender_id, "其余字段原样");
@@ -18980,7 +19002,36 @@ test("发送者角色表（第 1 层）：唯一判据、模板交叉校验、�
   assert.equal(removed.status, 0, removed.stdout);
   assert.deepEqual(JSON.parse(fs.readFileSync(tplFile, "utf-8")).senders, []);
   assert.deepEqual([cli("--template", tplFile, "--remove", "--open-id", "222", "--apply").status], [1], "没登记过的移除 → 拒");
-  // 纯函数层：结果模板必须过同一份校验；apply 读回失败要报
+  // 参数封闭：重复参数、移除带 role、重复开关 都拒
+  assert.equal(cli("--template", tplFile, "--open-id", "222", "--role", "operator", "--role", "participant").status, 2);
+  assert.equal(cli("--template", tplFile, "--remove", "--open-id", "222", "--role", "operator").status, 2);
+  assert.equal(cli("--template", tplFile, "--open-id", "222", "--role", "operator", "--apply", "--apply").status, 2);
+  assert.equal(parseRegisterSenderArgs(["--template", "/x.json", "--open-id", "1", "--role", "operator", "--role", "participant"]).reason, "duplicate_argument");
+  assert.equal(parseRegisterSenderArgs(["--template", "/x.json", "--open-id", "1", "--remove", "--note", "x"]).reason, "remove_takes_no_role");
+  // 写原语：锁内重读重算 —— 规划后世界又合法登记了别人，apply 不会把别人覆盖掉（评审反例）
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  const planA = planSenderChange(TPL, { openId: "222", role: "operator" });
+  assert.equal(planA.ok, true);
+  fs.writeFileSync(tplFile, JSON.stringify(planSenderChange(TPL, { openId: "333", role: "participant" }).template));
+  const appliedA = applySenderChange({ file: tplFile, change: { openId: "222", role: "operator" } });
+  assert.equal(appliedA.ok, true, JSON.stringify(appliedA));
+  assert.deepEqual(JSON.parse(fs.readFileSync(tplFile, "utf-8")).senders.map((e) => e.open_id).sort(), ["222", "333"], "333 没被静默覆盖");
+  // 写原语：先校验再写 —— 模板文件本身坏掉时零写入、无备份
+  const brokenBefore = "{\"broken\":true}";
+  fs.writeFileSync(tplFile, brokenBefore);
+  const backupsBefore = fs.readdirSync(home).filter((n) => n.startsWith("chain-config.json.bak.")).length;
+  const onBroken = applySenderChange({ file: tplFile, change: { openId: "444", role: "operator" } });
+  assert.deepEqual([onBroken.ok, onBroken.reason, fs.readFileSync(tplFile, "utf-8")], [false, "template_unreadable", brokenBefore], "坏模板：不写、不备份");
+  assert.equal(fs.readdirSync(home).filter((n) => n.startsWith("chain-config.json.bak.")).length, backupsBefore);
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  // 写原语：读回逐字核对写入目标
+  const exact = applySenderChange({ file: tplFile, change: { openId: "555", role: "participant" }, now: new Date("2026-08-29T01:00:00.000Z") });
+  assert.equal(exact.ok, true, JSON.stringify(exact));
+  assert.equal(fs.readFileSync(tplFile, "utf-8"), JSON.stringify(exact.table && JSON.parse(fs.readFileSync(tplFile, "utf-8")), null, 2) + "\n", "落盘的就是格式化后的那份");
+  assert.equal(exact.backup, tplFile + ".bak.2026-08-29T01-00-00-000Z");
+  assert.equal(applySenderChange({ file: "relative.json", change: { openId: "1", role: "operator" } }).reason, "template_required_absolute");
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  // 纯函数层：结果模板必须过同一份校验
   assert.equal(planSenderChange(TPL, { openId: "222", role: "operator" }).ok, true);
   assert.equal(planSenderChange(TPL, { openId: TPL.frank_sender_id, role: "operator" }).reason, "owner_immutable");
   assert.equal(planSenderChange({ ...TPL, senders: [{ open_id: "1", role: "owner" }] }, { openId: "222", role: "operator" }).reason, "template_senders_invalid");

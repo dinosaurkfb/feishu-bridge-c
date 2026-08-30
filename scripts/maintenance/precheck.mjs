@@ -44,7 +44,7 @@ export function chainFacts({ chain, home = os.homedir(), codexHome = process.env
       hooksFile: path.join(home, ".claude", "settings.json"),
       routesFile: path.join(home, ".claude", "feishu-bridge", "routes.json"), routeId: "self", inboundHandler: path.join(root, "current", "scripts", "inbound.mjs"),
       timer: { label: CLAUDE_DRAIN_LAUNCH_LABEL, plistFile, wanted: claudeDrainPlist({ home, node }), expect: claudeDrainExpectedJob({ home, node }) },
-      templateFile: templatePath(), extractors: {},
+      templateFile: templatePath(), extractors: {}, otherRoot: codexRuntimeRoot(codexHome),
       entryFilter: (n) => !n.startsWith("codex/"),
     };
   }
@@ -55,7 +55,7 @@ export function chainFacts({ chain, home = os.homedir(), codexHome = process.env
     hooksFile: path.join(codexHome, "hooks.json"),
     routesFile: path.join(codexBridgeHome, "routes.json"), routeId: "codex", inboundHandler: path.join(root, "current", "scripts", "codex", "inbound.mjs"),
     timer: { label: CODEX_DRAIN_LABEL, plistFile: codexPlistPath(home), wanted: codexPlistBody({ home, codexHome }), expect: codexExpectedJob({ home, codexHome }) },
-    templateFile: codexTemplateFile(codexBridgeHome), extractors: { "codex-hooks": codexHooksOwnedEntries },
+    templateFile: codexTemplateFile(codexBridgeHome), extractors: { "codex-hooks": codexHooksOwnedEntries }, otherRoot: runtimeRoot(home, "claude"),
     entryFilter: (n) => n.startsWith("codex/"),
   };
 }
@@ -66,8 +66,33 @@ export function chainAgentUid(facts) {
   return loaded.ok && typeof loaded.template?.agent_uid === "string" && loaded.template.agent_uid.length > 0 ? loaded.template.agent_uid : null;
 }
 
-/** 提到这条链运行时根的 hook 命令，必须全部是桥拥有的条目。 */
-function foreignHookCommands({ chain, text, root, home, node }) {
+/**
+ * hook 命令里的路径参数：'…' / "…" / 裸 token，绝对路径的做 realpath；~ 与 $HOME 展开；别的 $VAR 解析不了。
+ * 返回 { resolved:[realpath|null 的原 token], unresolvable:[token] }。
+ */
+export function commandPathTokens(cmd, { home }) {
+  const tokens = [];
+  const re = /'([^']*)'|"([^"]*)"|(\S+)/gu;
+  for (const m of cmd.matchAll(re)) tokens.push(m[1] ?? m[2] ?? m[3]);
+  const resolved = [], unresolvable = [];
+  for (const raw of tokens) {
+    let t = raw;
+    if (t.startsWith("~/")) t = path.join(home, t.slice(2));
+    if (t.startsWith("$HOME/")) t = path.join(home, t.slice("$HOME/".length));
+    if (/\$\{?[A-Za-z_]/u.test(t)) { unresolvable.push(raw); continue; }
+    if (!path.isAbsolute(t)) continue;
+    const real = realOrNull(t);
+    resolved.push({ raw, real });
+  }
+  return { resolved, unresolvable };
+}
+
+/**
+ * 提到这条链运行时根的 hook 命令，必须全部是桥拥有的条目。"提到"不只看字符串：命令里每个路径参数 realpath 之后
+ * 落在**任一条链**的 runtime 根（current / versions/*）之下也算（评审探针：symlink 别名指向 versions/<v>，字符串里没有运行时根）；
+ * 含解析不了的 $VAR 且又提到 feishu-bridge / runtime 字样的非桥命令 → 不能算已验证的启动源，同样拒。
+ */
+function foreignHookCommands({ chain, text, root, otherRoot, home, node }) {
   if (text === null) return { ok: false, why: "hook 文件读不出" };
   let doc;
   try { doc = JSON.parse(text); } catch { return { ok: false, why: "hook 文件不是 JSON" }; }
@@ -81,13 +106,24 @@ function foreignHookCommands({ chain, text, root, home, node }) {
   }
   const counts = ownedLists.map((l) => (l ?? []).length);
   if (counts.some((c) => c !== 1)) return { ok: false, why: "桥拥有的 hook 条目不是各恰好一条：" + JSON.stringify(counts) };
-  const rootReal = realOrNull(root);
-  const mentions = (cmd) => cmd.includes(root) || (rootReal !== null && cmd.includes(rootReal)) || cmd.includes("feishu-bridge/runtime");
+  const roots = [root, otherRoot].filter((r) => typeof r === "string");
+  const rootReals = roots.map(realOrNull).filter((r) => r !== null);
+  const underRuntime = (real) => real !== null && rootReals.some((rr) => real === rr || real.startsWith(rr + path.sep));
+  const mentions = (cmd) => {
+    if (roots.some((r) => cmd.includes(r)) || rootReals.some((r) => cmd.includes(r)) || cmd.includes("feishu-bridge/runtime")) return "字符串里提到运行时根";
+    const t = commandPathTokens(cmd, { home });
+    const hit = t.resolved.find((x) => underRuntime(x.real));
+    if (hit) return "路径参数 " + hit.raw + " 解析后落在运行时之下（" + hit.real + "）";
+    if (t.unresolvable.length > 0 && /feishu-bridge|runtime/u.test(cmd)) return "含解析不了的变量（" + t.unresolvable.join("、") + "）又提到 feishu-bridge / runtime，无法验证";
+    return null;
+  };
   const foreign = [];
   const hooks = doc?.hooks ?? {};
   for (const [event, entries] of Object.entries(hooks)) for (const entry of Array.isArray(entries) ? entries : []) for (const h of entry?.hooks ?? []) {
     const cmd = typeof h?.command === "string" ? h.command : "";
-    if (mentions(cmd) && !ownedCommands.has(cmd)) foreign.push(event + "：" + cmd.slice(0, 120));
+    if (ownedCommands.has(cmd)) continue;
+    const why = mentions(cmd);
+    if (why !== null) foreign.push(event + "：" + cmd.slice(0, 100) + "（" + why + "）");
   }
   return foreign.length === 0 ? { ok: true } : { ok: false, why: "有提到运行时但不是桥拥有的 hook 命令：" + foreign.join("；") };
 }
@@ -111,7 +147,7 @@ export function precheckChain(facts, { home = os.homedir(), node = pickClaudeNod
     add("receipt", cmp.state === "checked" && cmp.ok === true, cmp.state !== "checked" ? "收据对账做不了：" + String(cmp.why) : cmp.ok ? null : "artifact_mismatch：" + cmp.mismatches.map((m) => m.path + "（预期 " + m.expected.slice(0, 8) + "，实际 " + String(m.actual).slice(0, 24) + "）").join("；"));
   }
   // hooks
-  const hooks = foreignHookCommands({ chain: facts.chain, text: readTextOrNull(facts.hooksFile), root: facts.root, home, node });
+  const hooks = foreignHookCommands({ chain: facts.chain, text: readTextOrNull(facts.hooksFile), root: facts.root, otherRoot: facts.otherRoot ?? null, home, node });
   add("hooks", hooks.ok, hooks.ok ? null : hooks.why);
   // 定时器
   const timer = timerPhase({ ...facts.timer, run: launchctl });

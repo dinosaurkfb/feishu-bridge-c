@@ -71,7 +71,9 @@
 - `prepared` 或 `done` 且现场 == intendedAfter → 做过：回退方向写回 before（用备份原字节 / 原目标），前进方向保留；
 - 现场既不是 before 也不是 after → `rollback_incomplete`（该项留给人，门与账保留）。
 
-阶段：`planned → timer_stopped → stubbed → gated → drained → staged → committed → verified → reopening → done`；失败分支 `rolling_back → rollback_reopening → rolled_back | rollback_incomplete`。
+阶段：`planned → timer_stopped → stubbed → gated → drained → staged → committed → verified → reopening → done | reopening_incomplete`；失败分支 `rolling_back → rollback_reopening → rolled_back | rollback_incomplete`。`*_incomplete` = 动了但没做完（CAS 不成立、撤门后归属转换锁交不还、active 清不掉）：门与账保留，`--exit --apply` 只向前重试。journal 形状按 step kind 封闭（timer / current / stub / gate / artifact / receipt 各自的 before / intended_after / after），phase 与"必须已 done 的 step"一致；备份先写满 fsync，sha256 与长度进账，恢复前核验。
+
+**执行租约**：同一 operation 的 enter / exit / 续跑只许一个执行者 —— `maintenance/<token>.lease`（registry 锁协议，**只按持有者 pid 活性接管，不按时间**，等进程可以很久），journal 每次写入都在租约 reap 段内核对 token（被接管后晚到的写入 lease_lost，不落盘）；写入还核 active 仍指向本 token、阶段前驱合法。
 
 **两个不可逆的重新开放阶段**（旧 runtime 不认识机器门：一旦某条 `current` 从桩指回真实 runtime，那条链就已经重新放行，此后不许再改线上制品）：
 - 成功路径 `reopening`：定时器回到**目标状态**（见下）→ 删桩目录 → token-CAS 删门 → **先把终态 `done` 持久化进 journal** → 最后一个动作 token-CAS 清 `active`；清 active 之后不再写任何 operation 状态。

@@ -217,7 +217,8 @@ import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs"
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus } from "./maintenance/operation.mjs";
-import { clearActive as clearActiveJ, createOperation, journalProblem, readActive, readJournal, updateJournal } from "./maintenance/journal.mjs";
+import { clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, journalProblem, readActive, readJournal, releaseOperationLease, updateJournal } from "./maintenance/journal.mjs";
+import { commandPathTokens } from "./maintenance/precheck.mjs";
 import { buildStubVersion, removeStubVersion, renderStubScript, stubCategory, stubRelTarget } from "./maintenance/stub.mjs";
 import { listBridgeProcesses, parsePs, waitForQuiet } from "./maintenance/inventory.mjs";
 import { parseMaintenanceGateArgs, runMaintenanceGate } from "./maintenance-gate.mjs";
@@ -20898,6 +20899,24 @@ test("维护门 · PR C：预检拒绝五种漂移；进门两阶段记账、桩
     const ids = (r) => (r.items ?? []).map((i) => i.id);
     assert.deepEqual([r1.ok, r1.reason, ids(r1)], [false, "startup_source_unverified", ["claude:hooks"]], "外来 hook 提到运行时必须拒：" + JSON.stringify(r1.items ?? r1));
     fs.writeFileSync(settingsFile, settingsBytes);
+    const aliasDir = path.join(base, "runtime-alias"); fs.symlinkSync(path.join(claudeRoot, "versions", fs.readlinkSync(path.join(claudeRoot, "current")).split("/")[1]), aliasDir);
+    const withAlias = JSON.parse(settingsBytes); withAlias.hooks.Stop.push({ hooks: [{ type: "command", command: "node '" + path.join(aliasDir, "scripts", "stop-hook.mjs") + "'", timeout: 5 }] });
+    withAlias.hooks.Stop.push({ hooks: [{ type: "command", command: "echo unrelated && /usr/bin/true", timeout: 5 }] });
+    fs.writeFileSync(settingsFile, JSON.stringify(withAlias, null, 2) + "\n");
+    const r1b = enterMaintenance(ctx, { reason: "x", apply: true });
+    assert.deepEqual([r1b.ok, ids(r1b), /解析后落在运行时之下/u.test(r1b.items?.[0]?.why ?? ""), (r1b.items?.[0]?.why ?? "").includes("unrelated")], [false, "startup_source_unverified" === r1b.reason ? ["claude:hooks"] : ids(r1b), true, false], "别名 symlink 指向版本目录的 hook 必须拒，无关 hook 不点名：" + JSON.stringify(r1b.items ?? r1b));
+    const withVar = JSON.parse(settingsBytes); withVar.hooks.Stop.push({ hooks: [{ type: "command", command: "node \"$BRIDGE_DIR/runtime/x.mjs\"", timeout: 5 }] });
+    fs.writeFileSync(settingsFile, JSON.stringify(withVar, null, 2) + "\n");
+    const r1c = enterMaintenance(ctx, { reason: "x", apply: true });
+    assert.deepEqual([ids(r1c), /无法验证/u.test(r1c.items?.[0]?.why ?? "")], [["claude:hooks"], true], JSON.stringify(r1c.items ?? r1c));
+    fs.writeFileSync(settingsFile, settingsBytes);
+    const codexHooksFile = path.join(codexHome, "hooks.json"); const codexHooksBytes = fs.readFileSync(codexHooksFile, "utf-8");
+    const codexAlias = path.join(base, "codex-alias"); fs.symlinkSync(path.join(codexRoot, "versions", fs.readlinkSync(path.join(codexRoot, "current")).split("/")[1]), codexAlias);
+    const codexWithAlias = JSON.parse(codexHooksBytes); codexWithAlias.hooks.Stop.push({ hooks: [{ type: "command", command: "node " + path.join(codexAlias, "scripts", "codex", "stop-hook.mjs"), timeout: 5 }] });
+    fs.writeFileSync(codexHooksFile, JSON.stringify(codexWithAlias, null, 2) + "\n");
+    const r1d = enterMaintenance(ctx, { reason: "x", apply: true });
+    assert.deepEqual([ids(r1d), /解析后落在运行时之下/u.test(r1d.items?.[0]?.why ?? "")], [["codex:hooks"], true], JSON.stringify(r1d.items ?? r1d));
+    fs.writeFileSync(codexHooksFile, codexHooksBytes);
     launchd[claudeLabel].args = ["/bin/echo", "x"];
     const r2 = enterMaintenance(ctx, { reason: "x", apply: true });
     assert.deepEqual([r2.ok, ids(r2), /^定时器不在原始三态里：loaded_other/u.test(r2.items?.[0]?.why ?? "")], [false, ["claude:timer"], true], JSON.stringify(r2.items ?? r2));
@@ -20929,9 +20948,10 @@ test("维护门 · PR C：预检拒绝五种漂移；进门两阶段记账、桩
     // ── 进门：第一次盘点有一个桥进程、第二次没有 → drained
     const origClaude = fs.readlinkSync(path.join(claudeRoot, "current")), origCodex = fs.readlinkSync(path.join(codexRoot, "current"));
     psRows.push({ pid: 4242, ppid: 1, command: node + " " + path.join(claudeRoot, "current", "scripts", "watch-and-publish.mjs") + " --x" }, { pid: 4243, ppid: 4242, command: "claude -p" }, { pid: process.pid, ppid: 1, command: "node test" });
-    let tick = 0; const psOnce = () => { const r = fakePs(); if (tick++ === 0) return r; psRows.length = 0; return fakePs(); };
+    let tick = 0; let nested = null;
+    const psOnce = () => { const r = fakePs(); if (tick++ === 0) { nested = exitMaintenance(ctx, { apply: true }); return r; } psRows.length = 0; return fakePs(); };
     const entered = enterMaintenance({ ...ctx, ps: psOnce }, { reason: "改锁协议：symlink 协议 v2", waitMs: 60000, apply: true });
-    assert.deepEqual([entered.ok, entered.phase, typeof entered.token], [true, "drained", "string"], JSON.stringify(entered));
+    assert.deepEqual([entered.ok, entered.phase, typeof entered.token, nested?.ok, nested?.reason], [true, "drained", "string", false, "operation_in_progress"], "等进程期间嵌套的 exit 拿不到租约、零改动；enter 照常 drained：" + JSON.stringify({ entered, nested }));
     const token = entered.token;
     const j1 = readJournal({ dir, token });
     assert.deepEqual([j1.state, j1.doc.phase, j1.doc.steps.map((s) => s.id + ":" + s.state), j1.doc.steps.find((s) => s.id === "timer:claude").before.phase, j1.doc.steps.find((s) => s.id === "timer:codex").intended_after.phase], ["valid", "drained", ["timer:claude:done", "timer:codex:done", "stub:claude:done", "stub:codex:done", "current:claude:done", "current:codex:done", "gate:done"], "loaded", "absent"], JSON.stringify(j1.doc));
@@ -20976,12 +20996,35 @@ test("维护门 · PR C：预检拒绝五种漂移；进门两阶段记账、桩
     assert.throws(() => enterMaintenance(ctx, { reason: "crash", apply: true }), (err) => err?.simulatedCrash === true, "模拟的崩溃要原样穿出（不被当成普通失败回退）");
     crashAt.id = null;
     const a2 = readActive({ dir }); const token2 = a2.token;
+    // 执行者还"活着"（同一个进程）时别人不能接管：exit 被拒 operation_in_progress、零改动；交还租约后才能续跑
+    const blocked = exitMaintenance(ctx, { apply: true });
+    assert.deepEqual([blocked.ok, blocked.reason, fs.readlinkSync(path.join(claudeRoot, "current")), readActive({ dir }).token], [false, "operation_in_progress", stubRelTarget(token2), token2], JSON.stringify(blocked));
+    assert.equal(releaseOperationLease({ path: path.join(dir, token2 + ".lease") }).ok, true);
     const j2 = readJournal({ dir, token: token2 });
     assert.deepEqual([j2.doc.phase, j2.doc.steps.map((s) => s.id + ":" + s.state), fs.readlinkSync(path.join(claudeRoot, "current")), fs.readlinkSync(path.join(codexRoot, "current")), fs.existsSync(gateFile)], ["timer_stopped", ["timer:claude:done", "timer:codex:done", "stub:claude:done", "stub:codex:done", "current:claude:done"], stubRelTarget(token2), origCodex, false]);
     assert.match(renderStatus(maintenanceStatus(ctx)), /阶段 timer_stopped/u);
     const exited2 = exitMaintenance(ctx, { apply: true });
     assert.deepEqual([exited2.ok, exited2.phase, fs.readlinkSync(path.join(claudeRoot, "current")), fs.readlinkSync(path.join(codexRoot, "current")), fs.existsSync(path.join(claudeRoot, stubRelTarget(token2))), fs.existsSync(path.join(codexRoot, stubRelTarget(token2))), launchd[claudeLabel].loaded, readActive({ dir }).state], [true, "rolled_back", origClaude, origCodex, false, false, true, "absent"], JSON.stringify(exited2));
 
+    // ── 备份核不过：篡改 journal 里登记的 plist 备份 → 回退时该项 incomplete（不拿来源不明的字节写线上），修好备份后只向前
+    psRows.length = 0;
+    const enteredB = enterMaintenance(ctx, { reason: "backup", apply: true });
+    assert.equal(enteredB.ok, true, JSON.stringify(enteredB));
+    const backupFile = path.join(dir, enteredB.token + ".claude.plist"); const backupBytes = fs.readFileSync(backupFile);
+    fs.appendFileSync(backupFile, "\n<!-- 篡改 -->");
+    const badBackup = exitMaintenance(ctx, { apply: true });
+    assert.deepEqual([badBackup.ok, badBackup.phase, (badBackup.incomplete ?? []).map((i) => i.id), /备份核不过/u.test(badBackup.incomplete?.[0]?.why ?? ""), launchd[claudeLabel].loaded, readGate({ file: gateFile, now: clock }).state], [false, "rollback_incomplete", ["timer:claude"], true, false, "active"], JSON.stringify(badBackup));
+    fs.writeFileSync(backupFile, backupBytes);
+    const fixedBackup = exitMaintenance(ctx, { apply: true });
+    assert.deepEqual([fixedBackup.ok, fixedBackup.phase, launchd[claudeLabel].loaded, readActive({ dir }).state, fs.readFileSync(claudePlist, "utf-8") === claudeDrainPlist({ home, node })], [true, "rolled_back", true, "absent", true], JSON.stringify(fixedBackup));
+    // ── 撤门残骸：撤门成功但归属转换锁交不还 → 不算已出门（rollback_incomplete、门实际已撤但账保留），CLI 退出码 3；再 exit 只向前
+    const enteredT = enterMaintenance(ctx, { reason: "txn", apply: true });
+    assert.equal(enteredT.ok, true, JSON.stringify(enteredT));
+    const txnCtx = { ...ctx, gateOps: { createGate, removeGate: (o) => ({ ...removeGate(o), txnUncleared: { path: gateFile + ".txn", why: "EIO" } }) } };
+    const outT = []; const codeT = runMaintenanceGate(["--exit", "--apply"], { ctx: txnCtx, out: (t) => outT.push(t) });
+    assert.deepEqual([codeT, /归属转换锁交不还/u.test(outT.join("\n")), readJournal({ dir, token: enteredT.token }).doc.phase, readActive({ dir }).token, readGate({ file: gateFile, now: clock }).state], [3, true, "rollback_incomplete", enteredT.token, "absent"], outT.join("\n"));
+    const afterT = exitMaintenance(ctx, { apply: true });
+    assert.deepEqual([afterT.ok, afterT.phase, readActive({ dir }).state, fs.readlinkSync(path.join(claudeRoot, "current"))], [true, "rolled_back", "absent", origClaude], JSON.stringify(afterT));
     // ── CAS 不成立：进门后有人把 Claude 的 current 切到别处 → --exit 不覆盖，rollback_incomplete，门与账保留；修好后再 --exit 只向前
     psRows.length = 0;
     const entered3 = enterMaintenance(ctx, { reason: "cas", apply: true });
@@ -21023,8 +21066,29 @@ test("维护门 · PR C 单元：journal 三态与两阶段、active 只许一�
   const op = createOperation({ dir, reason: "r", now: Date.parse("2026-08-30T00:00:00.000Z") });
   assert.equal(op.ok, true, JSON.stringify(op));
   assert.deepEqual([createOperation({ dir, reason: "r2" }).reason, readActive({ dir }).token], ["operation_active", op.token]);
-  assert.equal(updateJournal({ dir, token: op.token, mutate: (d) => { d.phase = "nonsense"; return d; } }).reason, "journal_shape", "阶段封闭");
-  assert.deepEqual([journalProblem({}), journalProblem(readJournal({ dir, token: op.token }).doc)], ["schema_version 不认识", null]);
+  assert.equal(updateJournal({ dir, token: op.token, mutate: (d) => { d.phase = "nonsense"; return d; } }).reason, "lease_required", "没有租约不许写");
+  assert.equal(updateJournal({ dir, token: op.token, lease: op.lease, mutate: (d) => { d.phase = "nonsense"; return d; } }).reason, "journal_shape", "阶段封闭");
+  assert.equal(updateJournal({ dir, token: op.token, lease: op.lease, expectPhase: "gated", mutate: (d) => d }).reason, "phase_mismatch", "阶段前驱要对");
+  assert.equal(updateJournal({ dir, token: op.token, lease: op.lease, mutate: (d) => { d.phase = "timer_stopped"; return d; } }).reason, "journal_shape", "阶段要求的 step 没 done 不许进");
+  const good = readJournal({ dir, token: op.token }).doc;
+  assert.deepEqual([journalProblem({}), journalProblem(good)], ["schema_version 不认识", null]);
+  const mkStep = (over) => ({ id: "timer:claude", kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "a".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: good.updated_at, ...over });
+  const withStep = (st) => ({ ...good, steps: [st] });
+  assert.deepEqual([
+    journalProblem(withStep(mkStep({}))),
+    journalProblem(withStep(mkStep({ before: null }))) !== null,
+    journalProblem(withStep(mkStep({ intended_after: 42 }))) !== null,
+    journalProblem(withStep(mkStep({ backup: null }))) !== null,
+    journalProblem(withStep(mkStep({ id: "current:claude", kind: "current", before: { not: "a target" }, intended_after: "versions/x", after: "versions/x", backup: null, backup_sha256: null, backup_bytes: null }))) !== null,
+    journalProblem(withStep(mkStep({ id: "current:claude", kind: "current", before: "versions/a", intended_after: "versions/x", after: "versions/x", backup: null, backup_sha256: null, backup_bytes: null }))),
+    journalProblem(withStep(mkStep({ id: "gate", kind: "gate", before: null, intended_after: { token: good.token }, after: { token: "00000000-0000-4000-8000-000000000000", txnUncleared: null }, backup: null, backup_sha256: null, backup_bytes: null }))) !== null,
+    journalProblem(withStep(mkStep({ state: "done", after: null }))) !== null,
+  ], [null, true, true, true, true, null, true, true], "按 kind 封闭的判别联合");
+  assert.deepEqual([dirFsyncIgnorable("EINVAL"), dirFsyncIgnorable("ENOTSUP"), dirFsyncIgnorable("EIO"), dirFsyncIgnorable(undefined)], [true, true, false, false]);
+  const tok = commandPathTokens("node '/a b/x.mjs' \"$HOME/y.mjs\" ~/z.mjs $OTHER/w.mjs --flag", { home: "/h" });
+  assert.deepEqual([tok.resolved.map((t) => t.raw), tok.unresolvable], [["/a b/x.mjs", "$HOME/y.mjs", "~/z.mjs"], ["$OTHER/w.mjs"]]);
+  assert.deepEqual([parseMaintenanceGateArgs(["--enter", "--reason", "a", "--reason", "b"]).ok, parseMaintenanceGateArgs(["--status", "--apply"]).ok, parseMaintenanceGateArgs(["--exit", "--reason", "x"]).ok, parseMaintenanceGateArgs(["--enter", "--reason", "r", "--wait-ms", "-1"]).ok, parseMaintenanceGateArgs(["--enter", "--reason", "r", "--apply", "--apply"]).ok], [false, false, false, false, false], "参数封闭");
+  releaseOperationLease(op.lease);
   fs.writeFileSync(path.join(dir, op.token + ".json"), "{ 坏");
   assert.equal(readJournal({ dir, token: op.token }).state, "unreadable");
   assert.deepEqual([clearActiveJ({ dir, token: "00000000-0000-4000-8000-000000000000" }).reason, clearActiveJ({ dir, token: op.token }).cleared, readActive({ dir }).state], ["not_owner", true, "absent"]);

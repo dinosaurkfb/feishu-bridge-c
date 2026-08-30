@@ -158,9 +158,9 @@ export function withInstalledSurfaceLock(file, fn, { waitMs = 5000, staleMs = SU
     if (st !== null && !st.isSymbolicLink()) return withResidues({ ok: false, reason: "surface_lock_residue", why: "锁位置上不是本协议的 symlink（保留现场，交人工）", path: lock });
     // 取锁阶段的 I/O 异常同样受控（评审探针：陈旧回收隔离后 rmSync 抛 EIO 穿出来）
     let got;
-    try { got = acquire(lock, { staleMs, reapUnrecognized: false }); }
+    try { got = acquire(lock, { staleMs, reapUnrecognized: false, acceptReapedResidue: true }); } // 收据锁显式接受"取到但旧实例删不掉"，残骸由这里消费
     catch (err) { return withResidues({ ok: false, reason: "io_error", why: "取锁阶段异常：" + errCode(err), path: lock }); }
-    if (got?.reapedUncleared) residues.push({ path: got.reapedUncleared.path, reason: "reaped_uncleared", error: got.reapedUncleared.error });
+    if (got?.reapedUncleared && !residues.some((x) => x.path === got.reapedUncleared.path)) residues.push({ path: got.reapedUncleared.path, reason: "reaped_uncleared", error: got.reapedUncleared.error });
     if (got?.ok) break;
     if (got?.reason === "lock_residue" || got?.reason === "reap_residue") return withResidues({ ok: false, reason: "surface_lock_residue", why: got.reason + "（保留现场，交人工）", path: lock });
     if (got?.reason !== "publisher_busy" && got?.reason !== "reap_busy") return withResidues({ ok: false, reason: "io_error", why: String(got?.reason) + (got?.error ? "：" + got.error : "") });

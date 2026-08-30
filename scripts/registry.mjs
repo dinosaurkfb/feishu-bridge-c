@@ -357,8 +357,11 @@ export function acquirePublishLock(lockDir, opts = {}) {
  * 给维护门内部与安装收据这类"门开着也要能写"的调用面用（PR #102 评审：不要再复制一套简化锁）。
  * reapUnrecognized=false：锁位置上是目录 / 畸形 payload（不是本协议的形状）时**不回收、不删**，返回 lock_residue 交显式维护入口
  *（评审探针：带哨兵的旧目录被热路径整体删了）。发布锁保留默认 true（旧版目录锁的兼容路径）。
+ * acceptReapedResidue（默认 false = **fail-closed**）：陈旧回收把旧实例 rename 走之后删不掉时，默认**不取锁**，返回
+ * { ok:false, reason:"reaped_uncleared", path, error } —— 只判 ok 的既有调用方不会带着残骸继续写；只有显式接受的调用方（安装收据）
+ * 才会继续取锁，并在结果上带 reapedUncleared（取到 → ok:true；被别人抢先 → publisher_busy），由它自己消费残骸。afterReap 只给测试用。
  */
-export function acquireLockUngated(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now(), beforeReap = null, duringReap = null, reapUnrecognized = true } = {}) {
+export function acquireLockUngated(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now(), beforeReap = null, duringReap = null, afterReap = null, reapUnrecognized = true, acceptReapedResidue = false } = {}) {
   const token = crypto.randomUUID();
   const payload = JSON.stringify({ pid: process.pid, at: new Date(now).toISOString(), token });
   const attempt = () => {
@@ -390,8 +393,11 @@ export function acquireLockUngated(lockDir, { staleMs = 5 * 60 * 1000, now = Dat
     catch (err) { return { done: true, reapedUncleared: { path: away, error: String(err?.code ?? err?.message ?? err) } }; }
   }, { duringReap });
   if (!reaped.ok) return reaped.reason === "reap_busy" ? first : reaped; // 别人正在回收：这轮让它
+  const residue = reaped.run.reapedUncleared ?? null;
+  if (residue !== null && !acceptReapedResidue) return carryReapResidue(reaped, { ok: false, reason: "reaped_uncleared", path: residue.path, error: residue.error });
+  if (typeof afterReap === "function") afterReap();
   const next = carryReapResidue(reaped, reaped.run.done ? attempt() : first); // 只重试一次：再失败说明有别人刚抢到，让它去发
-  return reaped.run.reapedUncleared ? { ...next, reapedUncleared: reaped.run.reapedUncleared } : next;
+  return residue !== null ? { ...next, reapedUncleared: residue } : next;
 }
 
 export function isPublishLockStale(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now() } = {}) {

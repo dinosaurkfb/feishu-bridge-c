@@ -201,6 +201,8 @@ export function recordInstalledSurface({ chain, version, artifacts, scripts, fil
   const bad = artifacts.find((a) => !SHA_SHAPE.test(String(a?.sha256)));
   if (bad) return { ok: false, reason: "artifact_sha_unusable", path: bad?.path, sha256: bad?.sha256 };
   if (new Set(artifacts.map((a) => a.path)).size !== artifacts.length) return { ok: false, reason: "entry_shape", why: "本次制品 path 重复" };
+  // 目录在锁外先建好：让"去掉事务锁"这种变异死在并发测试上，而不是死在 ENOENT 上
+  try { fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); } catch (err) { return { ok: false, reason: "io_error", why: errCode(err) }; }
   const locked = withInstalledSurfaceLock(file, () => {
     const current = readInstalledSurface({ file });
     if (current.state === "unreadable") return { ok: false, reason: "surface_unreadable", why: current.why };

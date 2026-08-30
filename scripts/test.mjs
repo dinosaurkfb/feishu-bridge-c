@@ -215,7 +215,14 @@ import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, cla
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
 import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
-import { pickClaudeNode as pickClaudeNodeB } from "./drain-schedule.mjs";
+import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
+import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus } from "./maintenance/operation.mjs";
+import { clearActive as clearActiveJ, createOperation, journalProblem, readActive, readJournal, updateJournal } from "./maintenance/journal.mjs";
+import { buildStubVersion, removeStubVersion, renderStubScript, stubCategory, stubRelTarget } from "./maintenance/stub.mjs";
+import { listBridgeProcesses, parsePs, waitForQuiet } from "./maintenance/inventory.mjs";
+import { parseMaintenanceGateArgs, runMaintenanceGate } from "./maintenance-gate.mjs";
+import { precheckStartupSources } from "./maintenance/precheck.mjs";
+import { switchCurrentTarget } from "./runtime-install.mjs";
 import { applyRuntimeSync as applyRuntimeSyncB } from "./runtime-install.mjs";
 import {
   ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, topicGenerationStateForLegacy,
@@ -20847,6 +20854,193 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   const failed = spawnSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
   assert.deepEqual([failed.status, /安装收据 : \*\*没记下\*\*（surface_unreadable：/u.test(failed.stdout), fs.statSync(surface).isDirectory()], [1, true, true], "收据读不出：非零退出、点名、不动畸形制品：" + failed.stdout.slice(-400));
   fs.rmdirSync(surface);
+});
+
+test("维护门 · PR C：预检拒绝五种漂移；进门两阶段记账、桩行为、门；出门按账回退；崩在中间续跑；CAS 不成立保留门与账；等进程超时回退", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "gate-c-"));
+  const home = path.join(base, "home 带空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
+  fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true }); fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
+  execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env });
+  execFileSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
+  const node = pickClaudeNodeB();
+  const claudeRoot = path.join(home, ".claude", "feishu-bridge", "runtime"), codexRoot = path.join(codexHome, "feishu-bridge", "runtime");
+  const claudeLabel = "com.frank.feishu-bridge-cc.drain", codexLabel = "com.frank.feishu-bridge-codex.drain";
+  const claudePlist = claudeDrainPlistPath(home);
+  // 假 launchd：状态表 + 与真 launchctl 一致的 list 输出形状；bootout / bootstrap 改状态表
+  const expectedArgs = claudeDrainExpectedJobB({ home, node }).args;
+  const launchd = { [claudeLabel]: { loaded: true, args: [...expectedArgs] } };
+  const calls = [];
+  const fakeLaunchctl = (args) => {
+    calls.push(args.join(" "));
+    if (args[0] === "list") { const st = launchd[args[1]]; if (!st?.loaded) return { ok: false, detail: "Could not find service \"" + args[1] + "\" in domain" }; return { ok: true, stdout: "{\n\t\"ProgramArguments\" = (\n" + st.args.map((a) => "\t\t\"" + a + "\";").join("\n") + "\n\t);\n};\n" }; }
+    if (args[0] === "bootout") { const label = args[1].split("/").pop(); const st = launchd[label]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; st.loaded = false; return { ok: true, stdout: "" }; }
+    if (args[0] === "bootstrap") { const xml = fs.readFileSync(args[2], "utf-8"); const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/u.exec(xml)[1]; const arr = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/u.exec(xml)[1]; const args2 = [...arr.matchAll(/<string>([^<]*)<\/string>/gu)].map((m) => m[1]); launchd[label] = { loaded: true, args: args2 }; return { ok: true, stdout: "" }; }
+    return { ok: false, detail: "unknown" };
+  };
+  const psRows = []; // [{pid, ppid, command}]
+  const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" + psRows.map((r) => String(r.pid).padStart(5) + " " + String(r.ppid).padStart(5) + " " + r.command).join("\n") + "\n" });
+  const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
+  let clock = Date.parse("2026-08-30T10:00:00.000Z");
+  const crashAt = { id: null };
+  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => { if (crashAt.id === id) throw Object.assign(new Error("crash"), { simulatedCrash: true }); } });
+  const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
+  try {
+    // ── 预检：干净沙箱通过；五种漂移各自点名拒绝、零改动
+    const dry = enterMaintenance(ctx, { reason: "改锁协议", apply: false });
+    assert.deepEqual([dry.ok, dry.dryRun, dry.plan.chains.claude.timer, dry.plan.chains.codex.timer, dry.plan.chains.claude.entries.length > 10, dry.plan.chains.codex.entries.every((n) => n.startsWith("codex/"))], [true, true, "loaded", "absent", true, true], JSON.stringify(dry.items ?? dry.plan));
+    const settingsFile = path.join(home, ".claude", "settings.json");
+    const settingsBytes = fs.readFileSync(settingsFile, "utf-8");
+    const withForeign = JSON.parse(settingsBytes); withForeign.hooks.Stop.push({ hooks: [{ type: "command", command: "node '" + path.join(claudeRoot, "current", "scripts", "stop-hook.mjs") + "' && echo extra", timeout: 5 }] });
+    fs.writeFileSync(settingsFile, JSON.stringify(withForeign, null, 2) + "\n");
+    const r1 = enterMaintenance(ctx, { reason: "x", apply: true });
+    assert.deepEqual([r1.ok, r1.reason, r1.items.map((i) => i.id)], [false, "startup_source_unverified", ["claude:hooks"]], JSON.stringify(r1.items));
+    fs.writeFileSync(settingsFile, settingsBytes);
+    launchd[claudeLabel].args = ["/bin/echo", "x"];
+    const r2 = enterMaintenance(ctx, { reason: "x", apply: true });
+    assert.deepEqual([r2.ok, r2.items.map((i) => i.id), /^定时器不在原始三态里：loaded_other/u.test(r2.items[0]?.why ?? "")], [false, ["claude:timer"], true], JSON.stringify(r2.items));
+    launchd[claudeLabel].args = [...expectedArgs];
+    const skillFile = path.join(home, ".claude", "skills", "feishu-status", "SKILL.md"); const skillBytes = fs.readFileSync(skillFile);
+    fs.appendFileSync(skillFile, "\n篡改");
+    const r3 = enterMaintenance(ctx, { reason: "x", apply: true });
+    assert.deepEqual([r3.ok, r3.items.map((i) => i.id), /artifact_mismatch/u.test(r3.items[0].why), r3.items[0].why.includes(skillFile)], [false, ["claude:receipt"], true, true], JSON.stringify(r3.items));
+    fs.writeFileSync(skillFile, skillBytes);
+    const routesFile = path.join(home, ".claude", "feishu-bridge", "routes.json");
+    fs.writeFileSync(routesFile, JSON.stringify({ schema_version: "1.0", routes: [{ id: "self", handler: path.join(base, "elsewhere.mjs"), enabled: true, default: true }] }));
+    const r4 = enterMaintenance(ctx, { reason: "x", apply: true });
+    assert.deepEqual([r4.ok, r4.items.map((i) => i.id)], [false, ["claude:routes"]], JSON.stringify(r4.items));
+    fs.unlinkSync(routesFile);
+    const codexReceipt = path.join(codexBridge, "installed-surface.json"); const codexReceiptBytes = fs.readFileSync(codexReceipt);
+    fs.unlinkSync(codexReceipt);
+    const r5 = enterMaintenance(ctx, { reason: "x", apply: true });
+    assert.deepEqual([r5.ok, r5.items.map((i) => i.id), /receipt_absent/u.test(r5.items[0].why)], [false, ["codex:receipt"], true], JSON.stringify(r5.items));
+    fs.writeFileSync(codexReceipt, codexReceiptBytes);
+    assert.deepEqual([readActive({ dir }).state, fs.existsSync(gateFile), fs.readlinkSync(path.join(claudeRoot, "current")).startsWith("versions/maintenance-"), launchd[claudeLabel].loaded], ["absent", false, false, true], "预检拒绝：零改动");
+    assert.equal(enterMaintenance(ctx, { reason: "   ", apply: true }).reason, "reason_required");
+
+    // ── 进门：第一次盘点有一个桥进程、第二次没有 → drained
+    const origClaude = fs.readlinkSync(path.join(claudeRoot, "current")), origCodex = fs.readlinkSync(path.join(codexRoot, "current"));
+    psRows.push({ pid: 4242, ppid: 1, command: node + " " + path.join(claudeRoot, "current", "scripts", "watch-and-publish.mjs") + " --x" }, { pid: 4243, ppid: 4242, command: "claude -p" }, { pid: process.pid, ppid: 1, command: "node test" });
+    let tick = 0; const psOnce = () => { const r = fakePs(); if (tick++ === 0) return r; psRows.length = 0; return fakePs(); };
+    const entered = enterMaintenance({ ...ctx, ps: psOnce }, { reason: "改锁协议：symlink 协议 v2", waitMs: 60000, apply: true });
+    assert.deepEqual([entered.ok, entered.phase, typeof entered.token], [true, "drained", "string"], JSON.stringify(entered));
+    const token = entered.token;
+    const j1 = readJournal({ dir, token });
+    assert.deepEqual([j1.state, j1.doc.phase, j1.doc.steps.map((s) => s.id + ":" + s.state), j1.doc.steps.find((s) => s.id === "timer:claude").before.phase, j1.doc.steps.find((s) => s.id === "timer:codex").intended_after.phase], ["valid", "drained", ["timer:claude:done", "timer:codex:done", "stub:claude:done", "stub:codex:done", "current:claude:done", "current:codex:done", "gate:done"], "loaded", "absent"], JSON.stringify(j1.doc));
+    assert.deepEqual([fs.readlinkSync(path.join(claudeRoot, "current")), fs.readlinkSync(path.join(codexRoot, "current")), launchd[claudeLabel].loaded, calls.filter((c) => c.startsWith("bootout")).length, readGate({ file: gateFile, now: clock }).state, readGate({ file: gateFile, now: clock }).payload.token], [stubRelTarget(token), stubRelTarget(token), false, 1, "active", token]);
+    const stubClaude = path.join(claudeRoot, stubRelTarget(token)), stubCodex = path.join(codexRoot, stubRelTarget(token));
+    for (const n of dry.plan.chains.claude.entries) assert.ok(fs.existsSync(path.join(stubClaude, "scripts", n)), "桩缺 " + n);
+    for (const n of dry.plan.chains.codex.entries) assert.ok(fs.existsSync(path.join(stubCodex, "scripts", ...n.split("/"))), "桩缺 " + n);
+    assert.deepEqual([verifyRuntimeB({ root: claudeRoot }).reason, verifyRuntimeB({ root: claudeRoot }).maintenance.original_current, verifyRuntimeB({ root: codexRoot }).reason], ["maintenance", origClaude, "maintenance"]);
+    // 桩行为（真实 spawn）：silent / prompt_hook（Aily → block；本地 → 放行）/ aily_inbound / status / control
+    const run = (script, extraEnv = {}) => spawnSync(process.execPath, [script], { encoding: "utf-8", env: { ...process.env, HOME: home, ...extraEnv }, input: "{}" }); // 桩不读 HOME，但守卫要求 spawn 钩子时显式换 HOME
+    const stop = run(path.join(stubClaude, "scripts", "stop-hook.mjs"));
+    assert.deepEqual([stop.status, stop.stdout], [0, ""]);
+    const ailyHook = run(path.join(stubClaude, "scripts", "inbound-hook.mjs"), { AILY_CLI_CALLER_AGENT_UID: "agent_x" });
+    assert.deepEqual([ailyHook.status, JSON.parse(ailyHook.stdout)], [0, { decision: "block", reason: "桥维护中（改锁协议：symlink 协议 v2）：这条消息没有处理，请稍后重发" }]);
+    const localHook = run(path.join(stubClaude, "scripts", "inbound-hook.mjs"), { AILY_CLI_CALLER_AGENT_UID: "" });
+    assert.deepEqual([localHook.status, localHook.stdout], [0, ""]);
+    const codexHook = run(path.join(stubCodex, "scripts", "codex", "prompt-hook.mjs"), { AILY_CLI_CALLER_AGENT_UID: "agent_y" });
+    assert.deepEqual([codexHook.status, JSON.parse(codexHook.stdout).decision], [0, "block"]);
+    const inboundStub = run(path.join(stubClaude, "scripts", "aily-inbound.mjs"));
+    assert.deepEqual([inboundStub.status, inboundStub.stdout], [0, "桥维护中（改锁协议：symlink 协议 v2），这条消息没有处理，请稍后重发\n"]);
+    const doctorStub = run(path.join(stubClaude, "scripts", "doctor.mjs"));
+    assert.deepEqual([doctorStub.status, /^维护中（改锁协议：symlink 协议 v2，已 \d+ 分钟，token [0-9a-f]{8}）\n$/u.test(doctorStub.stdout)], [2, true], doctorStub.stdout);
+    const control = run(path.join(stubClaude, "scripts", "bind-preview.mjs"));
+    assert.deepEqual([control.status, control.stdout], [2, "桥维护中（改锁协议：symlink 协议 v2）：控制命令暂不可用，请稍后再试\n"]);
+    const st = maintenanceStatus(ctx);
+    assert.deepEqual([st.gate.state, st.active.token, st.phase, st.pendingReopening, st.chains.claude.isStub, st.chains.claude.stubManifest.doc.original_current, st.chains.claude.timer], ["active", token, "drained", false, true, origClaude, "installed_not_loaded"]);
+    assert.match(renderStatus(st), /门        ：开着（改锁协议：symlink 协议 v2/u);
+    // 已有 operation / 门在 → 再进拒
+    assert.equal(enterMaintenance(ctx, { reason: "x", apply: true }).reason, "startup_source_unverified", "门开着时 runtime 是桩，预检本身就过不了");
+
+    // ── 出门：预览 → 回退；回退后一切回原样，能再进
+    assert.deepEqual([exitMaintenance(ctx, { apply: false }).action, exitMaintenance(ctx, { apply: false }).dryRun], ["rollback", true]);
+    const exited = exitMaintenance(ctx, { apply: true });
+    assert.deepEqual([exited.ok, exited.phase, exited.activeCleared], [true, "rolled_back", true], JSON.stringify(exited));
+    assert.deepEqual([fs.readlinkSync(path.join(claudeRoot, "current")), fs.readlinkSync(path.join(codexRoot, "current")), fs.existsSync(stubClaude), fs.existsSync(stubCodex), launchd[claudeLabel].loaded, launchd[codexLabel]?.loaded ?? false, readGate({ file: gateFile, now: clock }).state, readActive({ dir }).state, readJournal({ dir, token }).doc.phase], [origClaude, origCodex, false, false, true, false, "absent", "absent", "rolled_back"]);
+    assert.equal(fs.readFileSync(claudePlist, "utf-8"), claudeDrainPlist({ home, node }), "plist 字节回原样");
+    assert.equal(enterMaintenance(ctx, { reason: "again", apply: false }).ok, true, "回退之后能再进");
+    assert.equal(exitMaintenance(ctx, { apply: true }).reason, "no_operation");
+
+    // ── 崩在中间：切完 Claude 的 current 就死 → journal 留着；--status 说得清；--exit 只按账回退，Codex 那条没动过就不动
+    crashAt.id = "current:claude";
+    assert.throws(() => enterMaintenance(ctx, { reason: "crash", apply: true }), (err) => err?.simulatedCrash === true, "模拟的崩溃要原样穿出（不被当成普通失败回退）");
+    crashAt.id = null;
+    const a2 = readActive({ dir }); const token2 = a2.token;
+    const j2 = readJournal({ dir, token: token2 });
+    assert.deepEqual([j2.doc.phase, j2.doc.steps.map((s) => s.id + ":" + s.state), fs.readlinkSync(path.join(claudeRoot, "current")), fs.readlinkSync(path.join(codexRoot, "current")), fs.existsSync(gateFile)], ["timer_stopped", ["timer:claude:done", "timer:codex:done", "stub:claude:done", "stub:codex:done", "current:claude:done"], stubRelTarget(token2), origCodex, false]);
+    assert.match(renderStatus(maintenanceStatus(ctx)), /阶段 timer_stopped/u);
+    const exited2 = exitMaintenance(ctx, { apply: true });
+    assert.deepEqual([exited2.ok, exited2.phase, fs.readlinkSync(path.join(claudeRoot, "current")), fs.readlinkSync(path.join(codexRoot, "current")), fs.existsSync(path.join(claudeRoot, stubRelTarget(token2))), fs.existsSync(path.join(codexRoot, stubRelTarget(token2))), launchd[claudeLabel].loaded, readActive({ dir }).state], [true, "rolled_back", origClaude, origCodex, false, false, true, "absent"], JSON.stringify(exited2));
+
+    // ── CAS 不成立：进门后有人把 Claude 的 current 切到别处 → --exit 不覆盖，rollback_incomplete，门与账保留；修好后再 --exit 只向前
+    psRows.length = 0;
+    const entered3 = enterMaintenance(ctx, { reason: "cas", apply: true });
+    assert.equal(entered3.ok, true, JSON.stringify(entered3));
+    const token3 = entered3.token;
+    fs.mkdirSync(path.join(claudeRoot, "versions", "someone-else"), { recursive: true });
+    switchCurrentTarget({ root: claudeRoot, target: "versions/someone-else" });
+    const bad = exitMaintenance(ctx, { apply: true });
+    assert.deepEqual([bad.ok, bad.phase, bad.incomplete.map((i) => i.id), readGate({ file: gateFile, now: clock }).state, readActive({ dir }).token, readJournal({ dir, token: token3 }).doc.phase, fs.readlinkSync(path.join(codexRoot, "current"))], [false, "rollback_incomplete", ["current:claude", "stub:claude"], "active", token3, "rollback_incomplete", origCodex], JSON.stringify(bad));
+    assert.deepEqual([exitMaintenance(ctx, { apply: false }).action], ["rollback_forward"]);
+    switchCurrentTarget({ root: claudeRoot, target: stubRelTarget(token3) });
+    const fixed = exitMaintenance(ctx, { apply: true });
+    assert.deepEqual([fixed.ok, fixed.phase, fs.readlinkSync(path.join(claudeRoot, "current")), readGate({ file: gateFile, now: clock }).state, readActive({ dir }).state, fs.existsSync(path.join(claudeRoot, stubRelTarget(token3)))], [true, "rolled_back", origClaude, "absent", "absent", false], JSON.stringify(fixed));
+    fs.rmSync(path.join(claudeRoot, "versions", "someone-else"), { recursive: true, force: true });
+
+    // ── 等进程超时：一直有桥进程 → 不 kill，进门失败并按账回退到进门前
+    psRows.push({ pid: 5151, ppid: 1, command: node + " " + path.join(codexRoot, "current", "scripts", "codex", "drain-all.mjs") });
+    const timeout = enterMaintenance(ctx, { reason: "busy", waitMs: 12000, apply: true });
+    assert.deepEqual([timeout.ok, timeout.reason, timeout.processes.map((p) => p.pid), timeout.rollback.ok, timeout.rollback.phase, fs.readlinkSync(path.join(claudeRoot, "current")), launchd[claudeLabel].loaded, readGate({ file: gateFile, now: clock }).state, readActive({ dir }).state], [false, "processes_still_running", [5151], true, "rolled_back", origClaude, true, "absent", "absent"], JSON.stringify(timeout));
+    psRows.length = 0;
+    // ps 查不了 → inventory_unverifiable 同样回退
+    const blind = enterMaintenance({ ...ctx, ps: () => ({ ok: false, why: "EIO" }) }, { reason: "blind", apply: true });
+    assert.deepEqual([blind.ok, blind.reason, blind.rollback.phase, readActive({ dir }).state], [false, "inventory_unverifiable", "rolled_back", "absent"], JSON.stringify(blind));
+
+    // ── 命令面：参数封闭；--status 在沙箱 env 下能跑
+    assert.deepEqual([parseMaintenanceGateArgs(["--status"]).mode, parseMaintenanceGateArgs(["--enter"]).ok, parseMaintenanceGateArgs(["--enter", "--reason", "r", "--wait-ms", "10", "--apply"]), parseMaintenanceGateArgs(["--exit", "--force"]).ok, parseMaintenanceGateArgs(["--status", "--exit"]).ok], ["status", false, { ok: true, mode: "enter", reason: "r", waitMs: 10, apply: true }, false, false]);
+    const outLines = []; const code = runMaintenanceGate(["--status"], { ctx, out: (t) => outLines.push(t) });
+    assert.deepEqual([code, /门        ：没开/u.test(outLines.join("\n"))], [0, true], outLines.join("\n"));
+    const codeEnter = runMaintenanceGate(["--enter", "--reason", "cli"], { ctx, out: (t) => outLines.push(t) });
+    assert.deepEqual([codeEnter, /\[预览\] 预检通过/u.test(outLines.at(-1))], [0, true], outLines.at(-1));
+  } finally {
+    if (prevTpl === undefined) delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; else process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = prevTpl;
+  }
+});
+
+test("维护门 · PR C 单元：journal 三态与两阶段、active 只许一个、桩分类与自包含脚本、进程盘点子树与祖先排除", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "gate-c-unit-"));
+  const dir = path.join(base, "maintenance");
+  const op = createOperation({ dir, reason: "r", now: Date.parse("2026-08-30T00:00:00.000Z") });
+  assert.equal(op.ok, true, JSON.stringify(op));
+  assert.deepEqual([createOperation({ dir, reason: "r2" }).reason, readActive({ dir }).token], ["operation_active", op.token]);
+  assert.equal(updateJournal({ dir, token: op.token, mutate: (d) => { d.phase = "nonsense"; return d; } }).reason, "journal_shape", "阶段封闭");
+  assert.deepEqual([journalProblem({}), journalProblem(readJournal({ dir, token: op.token }).doc)], ["schema_version 不认识", null]);
+  fs.writeFileSync(path.join(dir, op.token + ".json"), "{ 坏");
+  assert.equal(readJournal({ dir, token: op.token }).state, "unreadable");
+  assert.deepEqual([clearActiveJ({ dir, token: "00000000-0000-4000-8000-000000000000" }).reason, clearActiveJ({ dir, token: op.token }).cleared, readActive({ dir }).state], ["not_owner", true, "absent"]);
+  fs.symlinkSync("junk", path.join(dir, "active"));
+  assert.deepEqual([readActive({ dir }).state, createOperation({ dir, reason: "r" }).reason], ["unreadable", "active_unreadable"]);
+  fs.unlinkSync(path.join(dir, "active"));
+  assert.deepEqual(["stop-hook.mjs", "inbound-hook.mjs", "codex/prompt-hook.mjs", "aily-inbound.mjs", "codex/inbound.mjs", "doctor.mjs", "codex/feishu-status.mjs", "bind-preview.mjs", "codex/feishu-mode.mjs", "watch-and-publish.mjs", "codex/drain-all.mjs", "something-new.mjs"].map(stubCategory), ["silent", "prompt_hook", "prompt_hook", "aily_inbound", "aily_inbound", "status", "status", "control", "control", "silent", "silent", "control"]);
+  assert.doesNotMatch(renderStubScript({ name: "doctor.mjs", token: op.token, reason: "r", at: "2026-08-30T00:00:00.000Z" }), /import |require\(/u, "桩自包含");
+  const root = path.join(base, "rt"); fs.mkdirSync(path.join(root, "versions"), { recursive: true });
+  const b = buildStubVersion({ root, token: op.token, reason: "r", entries: ["stop-hook.mjs", "codex/prompt-hook.mjs"], agentUid: "agent_a", originalCurrent: "versions/abc" });
+  assert.deepEqual([b.ok, buildStubVersion({ root, token: op.token, reason: "r", entries: ["x.mjs"] }).reason], [true, "stub_exists"]);
+  const hookWithUid = spawnSync(process.execPath, [path.join(b.dir, "scripts", "codex", "prompt-hook.mjs")], { encoding: "utf-8", env: { ...process.env, HOME: base, AILY_CLI_CALLER_AGENT_UID: "agent_b" } });
+  assert.deepEqual([hookWithUid.status, hookWithUid.stdout], [0, ""], "模板 agent_uid 已知：别家 Aily agent 放行");
+  fs.symlinkSync(stubRelTarget(op.token), path.join(root, "current"));
+  assert.equal(removeStubVersion({ root, token: op.token }).reason, "still_current");
+  fs.unlinkSync(path.join(root, "current"));
+  assert.deepEqual([removeStubVersion({ root, token: op.token }).removed, fs.existsSync(b.dir)], [true, false]);
+  assert.deepEqual(parsePs("  PID  PPID COMMAND\n    1     0 launchd\n 4242     1 node /r/current/scripts/x.mjs\n"), [{ pid: 1, ppid: 0, command: "launchd" }, { pid: 4242, ppid: 1, command: "node /r/current/scripts/x.mjs" }]);
+  assert.equal(parsePs("garbage"), null);
+  const ps = () => ({ ok: true, stdout: "PID PPID COMMAND\n1 0 launchd\n10 1 node /r/current/scripts/a.mjs\n11 10 claude -p\n12 1 node /elsewhere/a.mjs\n20 1 node /r/current/scripts/b.mjs\n21 20 sh\n" });
+  const inv = listBridgeProcesses({ roots: ["/r/current/scripts"], ps, selfPid: 21 });
+  assert.deepEqual(inv.processes.map((p) => p.pid), [10, 11], "子树计入；自己（21）与祖先（20）排除：" + JSON.stringify(inv));
+  assert.deepEqual([listBridgeProcesses({ roots: ["/r"], ps: () => ({ ok: false, why: "EIO" }) }).reason, waitForQuiet({ roots: ["/r/current/scripts"], ps, selfPid: 21, waitMs: 20, stepMs: 10, sleep: () => {}, now: (() => { let t = 0; return () => (t += 15); })() }).reason], ["inventory_unverifiable", "processes_still_running"]);
 });
 
 summarySealed = true;

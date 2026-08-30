@@ -11,7 +11,7 @@
 
 | 投影 | 来源 | 用途 |
 | --- | --- | --- |
-| **当前投影** | **机器级安装收据** `<真实 home>/.claude/feishu-bridge/installed-surface.json`（按链 × 版本登记；含门代码的版本安装时经 journal 两阶段写入：每个**桥拥有的封闭条目**的 sha —— settings.json / hooks.json 里带我们标记或指向我们路径的 hook 条目、每个技能文件整份、plist 整份 —— 与引用的脚本；**不是整文件 sha**，无关设置的变化不挡门）。版本目录 `versions/<v>/` 只放静态、与机器无关的模板 manifest。**legacy bootstrap 投影**：现 runtime 没有收据时，按**已知 runtime digest 分支**（新代码里冻结一份对应形状模板：hook 命令模板、技能渲染、plist 模板，按当前路径渲染后逐字段核；今天线上的 95510bdd 是第一个已知 digest）；**未知旧版本拒绝进门**（`legacy_runtime_unknown`）| 进门前预检：线上 hooks / skills / plist / routes 是否与"现在应该装着的"一致 |
+| **当前投影** | **机器级安装收据**，**每条链一份、随该链的隔离点走**：Claude `<真实 home>/.claude/feishu-bridge/installed-surface.json`，Codex `<Codex 桥目录>/installed-surface.json`（PR B 实现时从"两链共用一份"改的：安装器被 HOME / CODEX_HOME 引到沙箱时收据必须跟着进沙箱，不能写真机；journal 里两份收据是**两个制品**，各自两阶段提交与回退）。每份按版本登记；含门代码的版本安装时经 journal 两阶段写入，含门代码的普通安装器 `--apply` 末尾（全部制品写完之后）也直接记（收据事务锁 `<收据>.lock` 串行化多个安装器；这把锁**不受机器门管**，维护门内部写收据也走它）：每个**桥拥有的封闭条目**的 sha —— settings.json / hooks.json 里带我们标记或指向我们路径的 hook 条目、每个技能文件整份、plist 整份 —— 与引用的脚本；**不是整文件 sha**，无关设置的变化不挡门）。版本目录 `versions/<v>/` 只放静态、与机器无关的模板 manifest。**legacy bootstrap 投影**：现 runtime 没有收据时，按**已知 runtime digest 分支**（新代码里冻结一份对应形状模板：hook 命令模板、技能渲染、plist 模板，按当前路径渲染后逐字段核；今天线上的 95510bdd 是第一个已知 digest）；**未知旧版本拒绝进门**（`legacy_runtime_unknown`）| 进门前预检：线上 hooks / skills / plist / routes 是否与"现在应该装着的"一致 |
 | **目标投影** | staged 新版本的 `renderArtifacts()`（纯函数：输入当前制品基线字节 + 路径，输出合并后的全文） | stage / commit：要写成什么 |
 | **桩清单** | `maintenanceEntryManifest` = 当前投影已验引用 ∪ 目标投影引用 ∪ 固定 worker ∪ 状态入口 | 桩目录里的文件、进程盘点认的路径 |
 

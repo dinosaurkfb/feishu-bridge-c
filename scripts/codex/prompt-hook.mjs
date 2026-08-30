@@ -128,8 +128,19 @@ const intentArg = (intentId) =>
  */
 const runtimeScriptsRoot = () => path.resolve(moduleDir(import.meta.url), "..", "..");
 
+/**
+ * prompt-hook 会签发（写进 additionalContext 让 Codex 去跑）的全部 runtime 脚本 —— 封闭常量，维护门的入口清单从这里取
+ *（评审探针：清单漏了 feishu-mode / rotate / subscribe，旧 hook 已注入、命令尚未起就切桩 → ENOENT 而不是受控阻断）。
+ * compose* 只能通过 hookCommandScript 拿路径：名字不在这里就抛，测试盯"签发集合 == 常量"。
+ */
+export const PROMPT_HOOK_COMMAND_SCRIPTS = Object.freeze(["codex/aily-inbound.mjs", "codex/bind-task.mjs", "codex/feishu-mode.mjs", "codex/feishu-rotate.mjs", "codex/feishu-status.mjs", "codex/feishu-subscribe.mjs", "codex/feishu-unbind.mjs"]);
+export function hookCommandScript(bridgeRoot, name) {
+  if (!PROMPT_HOOK_COMMAND_SCRIPTS.includes(name)) throw new Error("prompt-hook 签发了不在 PROMPT_HOOK_COMMAND_SCRIPTS 里的脚本：" + name);
+  return path.join(bridgeRoot, "scripts", ...name.split("/"));
+}
+
 export function composeBindingContext({ bridgeRoot, cwd, threadId, chatName, intentId }) {
-  const apply = path.join(bridgeRoot, "scripts", "codex", "bind-task.mjs");
+  const apply = hookCommandScript(bridgeRoot, "codex/bind-task.mjs");
   return [
     "[Codex 飞书桥] 当前任务的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
     "用户本轮显式运行了 $feishu-bind；该命令本身就是创建根话题并登记当前 task 的授权，无需再次预览或确认。",
@@ -141,7 +152,7 @@ export function composeBindingContext({ bridgeRoot, cwd, threadId, chatName, int
 }
 
 export function composeUnbindContext({ bridgeRoot, threadId, intentId }) {
-  const command = path.join(bridgeRoot, "scripts", "codex", "feishu-unbind.mjs");
+  const command = hookCommandScript(bridgeRoot, "codex/feishu-unbind.mjs");
   return [
     "[Codex 飞书桥·暂停接入] 用户通过 $feishu-unbind 明确要求撤销当前 task 的飞书接入。",
     "当前 task 的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
@@ -152,7 +163,7 @@ export function composeUnbindContext({ bridgeRoot, threadId, intentId }) {
 }
 
 export function composeStatusContext({ bridgeRoot, threadId }) {
-  const command = path.join(bridgeRoot, "scripts", "codex", "feishu-status.mjs");
+  const command = hookCommandScript(bridgeRoot, "codex/feishu-status.mjs");
   return [
     "[Codex 飞书桥·连接状态] 用户要求只读查看当前 task 的飞书状态。",
     "当前 task 的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
@@ -163,7 +174,7 @@ export function composeStatusContext({ bridgeRoot, threadId }) {
 }
 
 export function composeSubscribeContext({ bridgeRoot, threadId }) {
-  const command = path.join(bridgeRoot, "scripts", "codex", "feishu-subscribe.mjs");
+  const command = hookCommandScript(bridgeRoot, "codex/feishu-subscribe.mjs");
   return [
     "[Codex 飞书桥·事件订阅] 用户要求只读查看当前 task 的事件订阅（第 2 层）。",
     "当前 task 的精确 thread id 是 " + threadId + "。不得使用 --last 或猜测别的线程。",
@@ -178,7 +189,7 @@ export function composeSubscribeContext({ bridgeRoot, threadId }) {
 }
 
 export function composeRotateContext({ bridgeRoot, threadId, intentId, op = "create" }) {
-  const command = path.join(bridgeRoot, "scripts", "codex", "feishu-rotate.mjs");
+  const command = hookCommandScript(bridgeRoot, "codex/feishu-rotate.mjs");
   const cancel = op === "cancel";
   return [
     cancel
@@ -195,7 +206,7 @@ export function composeRotateContext({ bridgeRoot, threadId, intentId, op = "cre
 }
 
 export function composeModeContext({ bridgeRoot, threadId, mode = null , intentId }) {
-  const command = path.join(bridgeRoot, "scripts", "codex", "feishu-mode.mjs");
+  const command = hookCommandScript(bridgeRoot, "codex/feishu-mode.mjs");
   const write = mode === "dialogue" || mode === "mapping";
   return [
     "[Codex 飞书桥·交互模式] 用户通过 $feishu-mode" + (write ? " " + mode : "") +
@@ -237,7 +248,7 @@ export function composeInitContext({ connectionStatus = "none" } = {}) {
 }
 
 export function composeAilyInboundContext({ bridgeRoot, home }) {
-  const dispatcher = path.join(bridgeRoot, "scripts", "codex", "aily-inbound.mjs");
+  const dispatcher = hookCommandScript(bridgeRoot, "codex/aily-inbound.mjs");
   // 用 shellQuote 而不是 JSON.stringify。后者产出的是**双引号**，挡得住空格，
   // 但双引号内 `$`、反引号、反斜杠仍会被 shell 解释 —— 路径里带这些字符时，
   // 那就不只是拆词，而是可能执行别的东西。POSIX 里唯一完全字面的是单引号。

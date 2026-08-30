@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { moduleRoot } from "../direct-run.mjs";
 import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
+import { inspectInstalledSurface, installedSurfacePath } from "../installed-surface.mjs";
 import { defaultRouteHandler } from "../inbound-routes.mjs";
 import { shellQuote } from "../shell-quote.mjs";
 import { acceptsHookCommand, ownsHookCommand, pickNode } from "./hook-command.mjs";
@@ -190,6 +191,15 @@ const registry = loadRegistry(registryFile(home));
 const tasks = registry.ok ? registry.tasks : [];
 const active = tasks.filter((task) => (task.status ?? "active") === "active");
 const bound = active.filter((task) => task.inbound_state === "bound");
+{
+  // 安装收据（Codex 链，维护门 PR B）：三态 + 锁 / 临时文件残骸盘点；没有不算病，读不出与残骸只人工处置
+  const file = installedSurfacePath({ chain: "codex", codexBridgeHome: home });
+  const r = inspectInstalledSurface({ file });
+  const entry = r.state === "valid" ? r.doc.chains.codex : null;
+  const residueText = r.residues.length === 0 ? "" : "；残骸 " + r.residues.length + " 处：" + r.residues.slice(0, 3).map((x) => x.path + "（" + x.detail + "）").join("、");
+  add("安装收据", r.state !== "unreadable" && r.residues.length === 0,
+    (r.state === "absent" ? "没有（旧运行时没记；装含收据代码的版本后出现）" : r.state === "valid" ? (entry ? "有：版本 " + entry.version + "，" + entry.artifacts.length + " 个制品" : "有，但没有 Codex 链的条目") : "读不出（" + r.why + "）—— 请人工核对 " + file) + residueText);
+}
 add("task 登记表", registry.ok,
   registry.ok ? "已登记 " + tasks.length + " 个，启用 " + active.length + " 个，入站绑定 " + bound.length + " 个" : registry.reason,
   "安装器会创建空登记表；随后在目标 task 中运行 `$feishu-bind`");

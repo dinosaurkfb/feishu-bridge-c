@@ -214,7 +214,8 @@ export function withControlLock({ claimsDir, key }, fn) {
     if (lock.reason === "publisher_busy") {
       return { ok: false, reason: "control_busy", why: "这一笔已有事务持有者" + describeLockOwner(lockPath) + "；等它结束再试（持有者已死的锁超过 5 分钟会按同一协议回收）" };
     }
-    return { ok: false, reason: "control_lock_unavailable", why: String(lock.reason) + (lock.error ? "：" + lock.error : "") };
+    // 含 reaped_uncleared（陈旧锁隔离后删不掉，原语默认 fail-closed 不取锁）：回调没跑、没有锁要交还，残骸路径点名交显式维护入口
+    return { ok: false, reason: "control_lock_unavailable", why: String(lock.reason) + (lock.error ? "：" + lock.error : "") + (lock.path ? "（" + lock.path + "）" : "") };
   }
   let result;
   try { result = fn(); }

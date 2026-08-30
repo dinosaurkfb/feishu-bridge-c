@@ -27,7 +27,8 @@ import { moduleRoot } from "./direct-run.mjs";
 import {
   applyRuntimeSync, planRuntimeSync, runtimeScript, verifyRuntime,
 } from "./runtime-install.mjs";
-import { nodeCommandPrefix, shellQuote } from "./shell-quote.mjs";
+import { CLAUDE_SKILLS, claudeDrainPlist, claudeDrainPlistPath, referencedRuntimeScripts, renderClaudeSettings, renderClaudeSkill } from "./install-projection.mjs";
+import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "./installed-surface.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
 
@@ -44,120 +45,11 @@ const ROOT = moduleRoot(import.meta.url, "..");
 const SETTINGS = path.join(os.homedir(), ".claude", "settings.json");
 const REGISTRY = path.join(os.homedir(), ".claude", "feishu-bridge", "registry.json");
 
-const HOOK_SCRIPT = runtimeScript("stop-hook.mjs");
-const INIT_HOOK_SCRIPT = runtimeScript("init-hook.mjs");
-const PREVIEW_SCRIPT = runtimeScript("bind-preview.mjs");
 /** 技能与 launchd 引用的「桥根目录」，同样是 runtime 而不是开发克隆。 */
-const RUNTIME_BRIDGE_ROOT = path.dirname(path.dirname(HOOK_SCRIPT));
-const INBOUND_HOOK_SCRIPT = runtimeScript("inbound-hook.mjs");
-const LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "stop-hook.log");
-
+const RUNTIME_BRIDGE_ROOT = path.dirname(path.dirname(runtimeScript("stop-hook.mjs")));
 // node 的选择只有一份（drain-schedule.mjs）—— 定时器 plist 与 doctor 的期望 job 同源。
 const NODE_BIN = pickClaudeNode();
-
-/** 埋进命令里的显式归属标记：与脚本路径无关，换克隆、换 runtime 都认得出自己那条。 */
-const HOOK_TAG = "FEISHU_BRIDGE_HOOK:";
-
-// 外层 if 是为了「node 或脚本不在了」时不把钩子报错弹到本机每一次会话结束上。
-// 但也绝不能真的静默：else 分支往出站日志里留一行，否则出站停摆将无从发现。
-const COMMAND =
-  `if [ -x '${NODE_BIN}' ] && [ -r '${HOOK_SCRIPT}' ]; then '${NODE_BIN}' '${HOOK_SCRIPT}'; ` +
-  `else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1; ` +
-  `printf '%s hook-unavailable node=${NODE_BIN}\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> '${LOG}' 2>/dev/null || :; fi` +
-  ` # ${HOOK_TAG}stop-hook.mjs`;
-
-// /init 钩子跑在本机**每一次提交 prompt** 上，比 Stop 更热。
-// 跟 Stop 那条的区别：这里的 else 分支不往日志里写。UserPromptSubmit 的 stdout 会被
-// 当成上下文注入，每敲一句话就往日志追一行也没有意义 —— 缺 node 时它该彻底闭嘴。
-const INIT_COMMAND =
-  `if [ -x '${NODE_BIN}' ] && [ -r '${INIT_HOOK_SCRIPT}' ]; then '${NODE_BIN}' '${INIT_HOOK_SCRIPT}'; ` +
-  `else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1 || :; fi` +
-  ` # ${HOOK_TAG}init-hook.mjs`;
-
-// 入站钩子：让「任何 Aily 回合先进入运输层」成为硬约束，而不是靠模型记得调技能。
-// 跟 /init 钩子同一个事件（UserPromptSubmit），但判据完全不同、互不干扰：
-// 那个认 prompt 是不是 /init，这个认环境里有没有 daemon 注入的 AILY_CLI_*。
-const INBOUND_HOOK_COMMAND =
-  `if [ -x '${NODE_BIN}' ] && [ -r '${INBOUND_HOOK_SCRIPT}' ]; then '${NODE_BIN}' '${INBOUND_HOOK_SCRIPT}'; ` +
-  `else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1 || :; fi` +
-  ` # ${HOOK_TAG}inbound-hook.mjs`;
-
-/**
- * 钩子归属判定。这里有两条必须同时满足的约束，缺一条都会出事：
- *
- *   宽了会误删。settings 是共享的，`.orca` 的整套钩子就在同一个数组里；而且**一条 entry
- *   里可以有多个 hook**，其中只有一条是我们的。按 entry 整条删，会把同一条里别人的钩子
- *   一起删掉，而且删得很安静。
- *   窄了收敛不掉。旧写法用克隆绝对路径当键（`MARKER = HOOK_SCRIPT`），第二个克隆路径不同
- *   就变成追加而非覆盖 —— 本机两份 Stop 钩子、两份 UserPromptSubmit 钩子就是这么来的。
- *
- * 所以：新装的命令里埋一个**与路径无关的显式标记**，认它；同时对历史遗留的命令按
- * 安装器**当初生成的确切形态**严格解析（不是子串包含），只为迁移那一次。
- */
-/**
- * 历史遗留命令的严格识别。
- *
- * 只锚定开头 + 出现过某个脚本名是不够的：别的工具用同样的 guard 写法、同样的文件名，
- * 一样会被我们认领然后删掉。所以这里把安装器**当初生成的完整模板**拆开验：
- * guard 检查的 node 与脚本，必须和实际执行的 node 与脚本逐字相同；尾部也必须是
- * 当初那两种形态之一。任何一处对不上就不是我们的，不碰。
- */
-const escapeRe = (text) => text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-
-const LEGACY_BODY =
-  /^if \[ -x '([^']+)' \] && \[ -r '([^']+)' \]; then '([^']+)' '([^']+)'; else \{ command -p cat 2>\/dev\/null \|\| cat; \} >\/dev\/null 2>&1(.*)$/u;
-
-const legacyOwns = (command, basename) => {
-  const m = LEGACY_BODY.exec(command);
-  if (!m) return false;
-  const [, guardNode, guardScript, runNode, runScript, tail] = m;
-  // guard 与实际执行必须是同一个 node、同一个脚本 —— 这是安装器生成物的固有性质，
-  // 手写或别的工具生成的命令极少恰好满足。
-  if (guardNode !== runNode || guardScript !== runScript) return false;
-  if (!guardScript.endsWith("/scripts/" + basename)) return false;
-  if (basename === "stop-hook.mjs") {
-    return new RegExp("^; printf '%s hook-unavailable node=" + escapeRe(guardNode) +
-      "\\\\n' \"\\$\\(date -u \\+%Y-%m-%dT%H:%M:%SZ\\)\" >> '[^']*' 2>\\/dev\\/null \\|\\| :; fi$", "u")
-      .test(tail);
-  }
-  return /^ \|\| :; fi$/u.test(tail);
-};
-
-const ownsHook = (hook, basename) => {
-  const command = hook?.command;
-  if (typeof command !== "string") return false;
-  // 新装认**固定的尾部注释**，不是任意位置的 includes —— 后者会把一条只是提到这个
-  // 字符串的命令（比如别人写的清理脚本）也认成自己的。
-  if (command.endsWith(" # " + HOOK_TAG + basename)) return true;
-  return legacyOwns(command, basename);
-};
-
-const countHooks = (list, basename) => (list ?? [])
-  .reduce((n, entry) => n + (entry?.hooks ?? []).filter((h) => ownsHook(h, basename)).length, 0);
-
-/**
- * 收编：摘掉**所有**属于自己的 hook，再放回恰好一条。
- *
- * 两个细节都来自实际教训：
- *   摘"所有"而不是第一条 —— 只处理首个匹配项正是重复条目长期存活的原因，
- *   安装器每次都只看见自己那条，另一条永远没人管。
- *   摘的是 **hook** 而不是 entry —— 同一条 entry 里可能还有别人的钩子，
- *   只有整条都属于我们时才删掉这条 entry。
- */
-const claimSingleHook = (list, basename, entry) => {
-  let removed = 0;
-  for (let i = list.length - 1; i >= 0; i -= 1) {
-    const hooks = list[i]?.hooks;
-    if (!Array.isArray(hooks)) continue;
-    const kept = hooks.filter((h) => !ownsHook(h, basename));
-    if (kept.length === hooks.length) continue;
-    removed += hooks.length - kept.length;
-    if (kept.length === 0) list.splice(i, 1);
-    else list[i].hooks = kept;
-  }
-  if (entry) list.push(entry);
-  return removed;
-};
+// hook 命令模板、归属判定、settings 合并、plist、技能渲染都在 install-projection.mjs（维护门要在不写的情况下问"会写成什么"）。
 
 const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
@@ -174,82 +66,18 @@ if (runtimePlan && !runtimePlan.ok) {
   process.exit(1);
 }
 
-// ---------- settings.json ----------
+// ---------- settings.json（投影在 install-projection.mjs：只动自己的 hook 与预览放行规则）----------
 
 const settingsBefore = fs.readFileSync(SETTINGS, "utf-8");
-const settings = JSON.parse(settingsBefore);
-settings.hooks ??= {};
-const stop = (settings.hooks.Stop ??= []);
-
-const stopBefore = countHooks(stop, "stop-hook.mjs");
-const stopRemoved = claimSingleHook(stop, "stop-hook.mjs",
-  uninstall ? null : { hooks: [{ type: "command", command: COMMAND, timeout: 20 }] });
-const action = uninstall
-  ? (stopRemoved > 0 ? "removed" : "already-absent")
-  : (stopBefore === 0 ? "installed" : stopBefore === 1 ? "updated" : "deduped");
-
-// ---------- UserPromptSubmit：/init 时问一句要不要接飞书 ----------
-//
-// 跟 Stop 用同一套做法：只认脚本路径做幂等、只动自己那一条、绝不重排别人的。
-// .orca 的 UserPromptSubmit 钩子就在这个数组里，覆盖掉它 Frank 的另一套工具会静默失灵。
-
-const prompts = (settings.hooks.UserPromptSubmit ??= []);
-// 两个 UserPromptSubmit 钩子各自按脚本名幂等，互不覆盖。
-const describe = (before, removed) => uninstall
-  ? (removed > 0 ? "removed" : "already-absent")
-  : (before === 0 ? "installed" : before === 1 ? "updated" : "deduped");
-
-const inboundBefore = countHooks(prompts, "inbound-hook.mjs");
-const inboundHookAction = describe(inboundBefore, claimSingleHook(prompts, "inbound-hook.mjs",
-  uninstall ? null : { hooks: [{ type: "command", command: INBOUND_HOOK_COMMAND, timeout: 10 }] }));
-
-const initBefore = countHooks(prompts, "init-hook.mjs");
-const initAction = describe(initBefore, claimSingleHook(prompts, "init-hook.mjs",
-  uninstall ? null : { hooks: [{ type: "command", command: INIT_COMMAND, timeout: 10 }] }));
-
-// ---------- 权限：只放行预览，真发仍逐次确认 ----------
-//
-// /init 之后那句「要不要建话题」必须附一份**脚本自己打印的**文案。拿不到它，模型会去读
-// 源码「还原」一份 —— 那东西看着像预览，其实是算出来的，差一个字就是照着假预览点头，
-// 而根消息发出去改不了。（2026-08-20 实测：dry-run 被 auto 模式分类器拦下，
-// cc2cd 那个会话就是这么还原的。）
-//
-// 放行的是 bind-preview.mjs，**不是** bind-project.mjs：前者的依赖图里没有 outbound，
-// 它做不到发消息这件事是代码事实，不是一个自觉遵守的 --dry-run 开关（有测试盯着）。
-// 真正建话题的那条仍然每次弹权限 —— 往群里发一条撤不掉的消息，本来就该有人点头。
-
-// 放行规则必须与技能正文里那条命令**逐字一致**。技能现在打印的是加了引号的路径，
-// 规则要是还写裸路径，前缀就对不上 —— 预览会每次弹确认，而它本来是免确认的那一条。
-// 两处同源生成，另有测试盯着它们相等。
-const PREVIEW_RULE = "Bash(" + nodeCommandPrefix(PREVIEW_SCRIPT) + ":*)";
-const permissions = (settings.permissions ??= {});
-const allow = (permissions.allow ??= []);
-
-// 权限规则同样要收编：旧克隆各留了一条自己路径的放行规则，只加不减就会越积越多，
-// 而每一条都是一个「某个开发克隆里的脚本可以免确认执行」的长期授权。
-// 一条 allow 规则是一次长期免确认授权，认宽认窄都不能接受。上一版为了容纳引号把
-// 判据放宽成 `[^()]*`，结果两头都坏了：`Bash(node --require '/other/…/bind-preview.mjs':*)`
-// 会被当成自己的删掉；而 HOME 含括号时（`/Users/a(b)/…`）反而认不出自己那条，
-// 重复安装会不断追加。
-//
-// 分成两件事各自用最严的判据：
-//   **当前规则**只认逐字相等 —— 它就是本安装器刚生成的那一条，没有任何模糊空间；
-//   **历史迁移**只认旧版完整模板（裸路径、无引号），且仅为迁移那一次存在。
-const LEGACY_PREVIEW_RULE =
-  /^Bash\(node (\/[^'"\s:]*\/scripts\/bind-preview\.mjs):\*\)$/u;
-const ownsPreview = (rule) => typeof rule === "string" &&
-  (rule === PREVIEW_RULE || LEGACY_PREVIEW_RULE.test(rule));
-const permOwned = allow.filter(ownsPreview);
-const permBefore = permOwned.length;
-// 只数条数不够：路径改指 runtime、或给路径加上 shell 引号之后，条数没变但内容变了。
-// 那时报 already-present 会让人以为什么都没动。
-const permSame = permBefore === 1 && permOwned[0] === PREVIEW_RULE;
-for (let i = allow.length - 1; i >= 0; i -= 1) if (ownsPreview(allow[i])) allow.splice(i, 1);
-if (!uninstall) allow.push(PREVIEW_RULE);
-const permAction = uninstall
-  ? (permBefore > 0 ? "removed" : "already-absent")
-  : (permBefore === 0 ? "installed" : permSame ? "already-present"
-    : permBefore === 1 ? "updated" : "deduped");
+const rendered = renderClaudeSettings({ baseText: settingsBefore, home: os.homedir(), node: NODE_BIN, uninstall });
+const settings = rendered.settings;
+const stop = settings.hooks.Stop;
+const prompts = settings.hooks.UserPromptSubmit;
+const allow = settings.permissions.allow;
+const action = rendered.actions.stop;
+const inboundHookAction = rendered.actions.inbound;
+const initAction = rendered.actions.init;
+const permAction = rendered.actions.perm;
 
 // ---------- 登记表 ----------
 
@@ -296,32 +124,11 @@ const selfBound = selfRegistered && Boolean(registry.projects[selfAt]?.root_mess
  * 已经被 Codex 那份占了 —— 它们装到不同的家目录（~/.codex vs ~/.claude），
  * 运行时不冲突，只有仓库目录会撞。
  */
-const SKILLS = [
-  { src: "claude-longtask-progress", dst: "claude-longtask-progress" },
-  { src: "claude-feishu-bind",       dst: "feishu-bind" },
-  { src: "claude-feishu-status",     dst: "feishu-status" },
-  { src: "claude-feishu-unbind",     dst: "feishu-unbind" },
-  { src: "claude-feishu-rotate",     dst: "feishu-rotate" },
-  { src: "claude-feishu-mode",       dst: "feishu-mode" },
-  { src: "claude-feishu-subscribe",  dst: "feishu-subscribe" },
-  { src: "claude-feishu-pin-session", dst: "feishu-pin-session" },
-];
-
+const SKILLS = CLAUDE_SKILLS;
 const skillSrcOf = (n) => path.join(ROOT, "skills", n, "SKILL.md");
 const skillDstOf = (n) => path.join(os.homedir(), ".claude", "skills", n, "SKILL.md");
-/**
- * 技能里给模型看的命令要指 runtime，而且**路径必须是 shell 安全的**。
- *
- * 指 runtime：否则 Frank 跑 /feishu-bind 时执行的是某个开发克隆的脚本，那个克隆此刻
- * 停在哪条分支没人知道，而这条命令会往群里发一条撤不掉的消息。
- *
- * shell 安全：这些是**给 shell 执行的命令文本**。HOME 里有空格时裸路径会被拆词，
- * 入站直接不可用（实测：argv 调用能跑，交给 /bin/sh -c 就失败）。所以模板写
- * `{{SCRIPT:x.mjs}}`，由这里统一加引号 —— 引用是渲染器的职责，不是模板作者的记性。
- */
-const renderSkill = (src) => src.replaceAll(
-  /\{\{SCRIPT:([A-Za-z0-9_./-]+)\}\}/gu,
-  (_, name) => shellQuote(path.join(RUNTIME_BRIDGE_ROOT, "scripts", name)));
+// 渲染只有一份（install-projection.mjs）：`{{SCRIPT:x.mjs}}` → 加了 shell 引号的 runtime 路径。
+const renderSkill = (src) => renderClaudeSkill(src, { home: os.homedir() });
 
 // 拷贝而不是软链：软链一旦仓库被移动或删除就变成悬空文件，而且各家扫描器
 // 对 readdir 是否跟随软链的处理并不一致（入站技能就在这上面栽过）。
@@ -355,35 +162,9 @@ const skillAction = skillPlan.some((s) => s.action === "source-missing") ? "sour
  */
 // label 只有一份定义（drain-schedule.mjs）—— doctor 查 launchd 用的是同一个。
 const LAUNCH_LABEL = CLAUDE_DRAIN_LAUNCH_LABEL;
-const PLIST = path.join(os.homedir(), "Library", "LaunchAgents", LAUNCH_LABEL + ".plist");
-const DRAIN_LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "drain.log");
-// ProgramArguments 只有一份定义（drain-schedule.mjs）—— doctor 核 launchd 时对的就是这三项。
-const DRAIN_JOB = claudeDrainExpectedJob({ home: os.homedir(), node: NODE_BIN });
-const DRAIN_SCRIPT = DRAIN_JOB.args[1];
-
-// --all：兜底要覆盖登记表里所有项目。只排本仓库的话，后接进来的项目就没有兜底了。
-const plistBody = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>${LAUNCH_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-${DRAIN_JOB.args.map((a) => "    <string>" + a + "</string>").join("\n")}
-  </array>
-  <key>WorkingDirectory</key><string>${RUNTIME_BRIDGE_ROOT}</string>
-  <key>StartInterval</key><integer>1800</integer>
-  <key>RunAtLoad</key><false/>
-  <key>StandardOutPath</key><string>${DRAIN_LOG}</string>
-  <key>StandardErrorPath</key><string>${DRAIN_LOG}</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-    <key>HOME</key><string>${os.homedir()}</string>
-  </dict>
-</dict>
-</plist>
-`;
+const PLIST = claudeDrainPlistPath(os.homedir());
+// plist 正文只有一份（install-projection.mjs），与 doctor 核 launchd 的 expectedJob 同源。
+const plistBody = claudeDrainPlist({ home: os.homedir(), node: NODE_BIN });
 
 let plistAction = "unchanged";
 if (uninstall) {
@@ -570,6 +351,22 @@ if (uninstall) {
     : loaded.ok
       ? "已加载"
       : "**plist 已写入但 launchctl 加载失败 —— 兜底重试目前不生效**";
+}
+
+// 机器级安装收据（维护门 PR B）—— **放在全部制品（settings / 技能 / plist）都写完之后**：记的是已经落盘的东西，不是打算写的。记下这次往线上写了什么（settings 只记桥拥有的封闭条目、plist 与技能整文件）与引用的脚本。
+// 收据读不出（畸形）就不覆盖、只报出来 —— 它是下一次维护预检的"当前投影"，不能被安装器顺手改坏。
+if (!uninstall) {
+  const installedVersion = verifyRuntime().version ?? null;
+  const artifacts = [
+    { path: SETTINGS, kind: "claude-settings", sha256: artifactSha({ kind: "claude-settings", text: settingsAfter, home: os.homedir(), node: NODE_BIN }) },
+    { path: PLIST, kind: "plist", sha256: artifactSha({ kind: "plist", text: plistBody }) },
+    ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => ({ path: sk.dstFile, kind: "skill", sha256: artifactSha({ kind: "skill", text: renderSkill(fs.readFileSync(sk.srcFile, "utf-8")) }) })),
+  ];
+  const scripts = referencedRuntimeScripts([settingsAfter, plistBody, ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => renderSkill(fs.readFileSync(sk.srcFile, "utf-8")))].join("\n"));
+  const receipt = installedVersion ? recordInstalledSurface({ chain: "claude", version: installedVersion, artifacts, scripts, file: installedSurfacePath({ chain: "claude", home: os.homedir() }) }) : { ok: false, reason: "runtime_version_unknown" };
+  const report = receiptReport(receipt, { artifacts: artifacts.length, scripts: scripts.length });
+  console.log("安装收据 : " + report.text);
+  if (report.failed) process.exitCode = 1; // 收据没记下或留下残骸：制品已经写了，但下一次维护预检会拿不到当前投影 —— 不能显示成功
 }
 
 console.log("\n" + (backup ? "settings 已改，备份：" + backup : "settings 无改动，未重写"));

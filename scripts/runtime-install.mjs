@@ -236,6 +236,161 @@ const writeAtomic = (file, content) => {
  *（原地覆盖一个内容寻址的目录本身就是矛盾的）。真正的提交点只有 current 那一次 rename；
  * 它之前的任何失败都不会改变线上正在跑的那份代码。
  */
+/**
+ * 落版本目录（调用方持安装锁）：staging 建好并验通过 → 换到 versions/<v>/。返回 { ok:true } 或受控失败（此刻没碰过 current）。
+ * 已存在且校验通过的版本目录直接算 ok（内容寻址、不可变）。
+ */
+/**
+ * current 此刻是否指向这个版本目录 —— 按**对象身份**比（realpath 相等或 dev+ino 相等），不是 readlink 的词法路径
+ *（评审探针：current → alias → versions/<v> 时词法比较说"不在用"，挪目录的窗口里 current/INSTALLED.json 不可达）。
+ * current 不存在（ENOENT）→ 不在用；存在但身份说不清（悬空、EACCES…）→ unverifiable，调用方 fail-closed 不动目录。
+ */
+function currentIdentity(root, versionDir) {
+  const cur = path.join(root, "current");
+  try { fs.lstatSync(cur); } catch (err) { return err?.code === "ENOENT" ? { inUse: false } : { unverifiable: true, why: String(err?.code ?? err?.message) }; }
+  try {
+    const a = fs.statSync(cur), b = fs.statSync(versionDir);
+    const same = fs.realpathSync(cur) === fs.realpathSync(versionDir) || (a.dev === b.dev && a.ino === b.ino);
+    return { inUse: same };
+  } catch (err) { return { unverifiable: true, why: String(err?.code ?? err?.message) }; }
+}
+
+function stageVersionDirUnlocked(plan, root, versionDir, { replaceInUse = false } = {}) {
+  // 版本目录内容寻址、不可变。"存在但校验不过"只能整体换掉，不能原地补写。
+  //
+  // **顺序是关键**：先把 staging 建好并验通过，再去动线上那个目录。
+  // 反过来（先隔离坏目录、再建 staging）的话，一旦 staging 中途失败 —— 比如
+  // plan 之后源码被改了 —— 坏目录已经被挪走，而 current 还指着它，于是 current 悬空，
+  // 出站入站一起静默停摆。现在最坏情况是"什么都没换成"，线上仍跑着原来那份。
+  if (!verifyVersionDir(versionDir, plan.files).ok) {
+    const staging = path.join(root, "versions", ".staging-" + plan.version + "." + process.pid);
+    fs.rmSync(staging, { recursive: true, force: true });
+    for (const file of plan.files) {
+      const dest = path.join(staging, file.path);
+      fs.mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
+      const content = fs.readFileSync(path.join(plan.sourceRoot, file.path));
+      if (sha256(content) !== file.sha256) {
+        fs.rmSync(staging, { recursive: true, force: true });
+        // 计划到落盘之间源码变了（切了分支、跑了 git checkout）。宁可整次失败，
+        // 也不要装一份"清单与内容不符"的运行时 —— 此刻还没碰过线上任何东西。
+        return { ok: false, reason: "source_changed_during_apply", file: file.path };
+      }
+      writeAtomic(dest, content);
+    }
+    // manifest 放在版本目录**内部**：一个版本完整与否，不依赖任何外部文件就能回答。
+    writeAtomic(path.join(staging, MANIFEST_NAME), JSON.stringify({
+      schema_version: "1.0",
+      version: plan.version,
+      installed_at: new Date().toISOString(),
+      source_root: plan.sourceRoot,
+      source_commit: plan.sourceCommit,
+      files: plan.files,
+    }, null, 2) + "\n");
+
+    const staged = verifyVersionDir(staging, plan.files, { checkDirName: false });
+    if (!staged.ok) {
+      fs.rmSync(staging, { recursive: true, force: true });
+      return { ok: false, reason: "staging_verify_failed", detail: staged.reason };
+    }
+
+    // staging 就绪，现在才动线上那个目录。rename 覆盖不了非空目录，所以先挪开。
+    // **current 正指着这个（坏的）版本目录时，stage 不许动它**（评审探针：挪走 → 换上之间 current 悬空，
+    // verifyRuntime 报 manifest_absent）—— stage 的承诺是"只写不可达缓存"。只有 applyRuntimeSync 这条
+    // 老路径（replaceInUse）保留原地修复的行为，维护流程要先把 current 切到桩再 stage。
+    let quarantine = null;
+    if (fs.existsSync(versionDir) && !replaceInUse) {
+      const id = currentIdentity(root, versionDir);
+      if (id.unverifiable || id.inUse) {
+        fs.rmSync(staging, { recursive: true, force: true });
+        return { ok: false, reason: id.unverifiable ? "current_unverifiable" : "version_in_use", version: plan.version, why: id.why };
+      }
+    }
+    if (fs.existsSync(versionDir)) {
+      quarantine = path.join(root, "versions", ".corrupt-" + plan.version + "." + Date.now());
+      try { fs.renameSync(versionDir, quarantine); }
+      catch {
+        fs.rmSync(staging, { recursive: true, force: true });
+        return { ok: false, reason: "corrupt_version_dir_stuck", version: plan.version };
+      }
+    }
+    try {
+      fs.renameSync(staging, versionDir);
+    } catch {
+      // 换上失败：必须把隔离的那份**放回原位**，否则 current 指向的目录就没了。
+      fs.rmSync(staging, { recursive: true, force: true });
+      if (quarantine) { try { fs.renameSync(quarantine, versionDir); } catch { /* 见下面那道闸 */ } }
+      // 也可能是竞态：另一个安装刚把同版本目录改名过去了。内容寻址，那份和我们这份一样，
+      // 下面那道闸会替我们确认。确认不了就整次失败，不碰 current。
+      if (!verifyVersionDir(versionDir, plan.files).ok) {
+        return { ok: false, reason: "version_dir_swap_failed", version: plan.version };
+      }
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * 只落版本目录、**不切 current**（维护门 issue #81 的 stage 阶段）：`versions/<v>/` 是内容寻址的不可变缓存，
+ * current 不指它就不可达 —— 所以 stage 不算"改了线上"，失败保留也无妨。返回 { ok, version, versionDir, staged:true } 或受控失败。
+ */
+export function stageRuntimeVersion(plan, { home = os.homedir(), chain = "claude", root: rootOverride } = {}) {
+  if (!plan?.ok) return plan ?? { ok: false, reason: "plan_missing" };
+  const root = rootOf({ root: rootOverride, home, chain });
+  const versionDir = path.join(root, "versions", plan.version);
+  const lock = acquireInstallLock(root);
+  if (!lock.ok) return lock;
+  try {
+    const staged = stageVersionDirUnlocked(plan, root, versionDir);
+    return staged.ok ? { ok: true, version: plan.version, versionDir, staged: true } : staged;
+  } catch (err) {
+    return { ok: false, reason: "stage_failed", error: String(err?.message ?? err).slice(0, 200) };
+  } finally {
+    lock.release();
+  }
+}
+
+/**
+ * 把 current 切到一个**已经落好并校验通过**的版本目录（唯一提交点）。不做任何拷贝：目录不在 / 校验不过 → version_not_committable，current 不动。
+ * 维护门的 commit 阶段用它；调用方（maintenance-install-core）负责先核对锁 / journal / current 仍是桩。
+ */
+export function activateRuntimeVersion({ version, home = os.homedir(), chain = "claude", root: rootOverride } = {}) {
+  if (typeof version !== "string" || version.length === 0) return { ok: false, reason: "version_missing" };
+  const root = rootOf({ root: rootOverride, home, chain });
+  const versionDir = path.join(root, "versions", version);
+  const lock = acquireInstallLock(root);
+  if (!lock.ok) return lock;
+  try {
+    const ready = verifyVersionDir(versionDir, null);
+    if (!ready.ok || ready.manifest?.version !== version || path.basename(versionDir) !== version) {
+      return { ok: false, reason: "version_not_committable", version, detail: ready.reason ?? null };
+    }
+    switchCurrentUnlocked(root, version);
+    return { ok: true, version, versionDir };
+  } catch (err) {
+    return { ok: false, reason: "activate_failed", error: String(err?.message ?? err).slice(0, 200) };
+  } finally {
+    lock.release();
+  }
+}
+
+/** 核验某个**已落好**的版本目录（不看 current）：清单与内容一致、目录名与清单版本一致。 */
+export function verifyRuntimeVersion({ version, home = os.homedir(), chain = "claude", root: rootOverride } = {}) {
+  if (typeof version !== "string" || version.length === 0) return { ok: false, reason: "version_missing" };
+  const root = rootOf({ root: rootOverride, home, chain });
+  const versionDir = path.join(root, "versions", version);
+  const checked = verifyVersionDir(versionDir, null);
+  return { ok: checked.ok && checked.manifest?.version === version, reason: checked.ok ? (checked.manifest?.version === version ? null : "manifest_version_mismatch") : checked.reason, version, versionDir, drifted: checked.drifted ?? [], missing: checked.missing ?? [] };
+}
+
+/** 切 current 的那一次 rename（调用方持安装锁）。 */
+function switchCurrentUnlocked(root, version) {
+  const link = path.join(root, CURRENT_LINK);
+  const linkTmp = link + ".tmp." + process.pid;
+  try { fs.unlinkSync(linkTmp); } catch { /* 上次残留 */ }
+  fs.symlinkSync(path.join("versions", version), linkTmp);
+  fs.renameSync(linkTmp, link);
+}
+
 export function applyRuntimeSync(plan, { home = os.homedir(), chain = "claude", root: rootOverride } = {}) {
   if (!plan?.ok) return plan ?? { ok: false, reason: "plan_missing" };
   const root = rootOf({ root: rootOverride, home, chain });
@@ -254,67 +409,10 @@ export function applyRuntimeSync(plan, { home = os.homedir(), chain = "claude", 
     if (already.ok && already.version === plan.version) {
       return { ok: true, version: plan.version, versionDir, noop: true };
     }
+    const staged = stageVersionDirUnlocked(plan, root, versionDir, { replaceInUse: true });
+    if (!staged.ok) return staged;
 
-    // 版本目录内容寻址、不可变。"存在但校验不过"只能整体换掉，不能原地补写。
-    //
-    // **顺序是关键**：先把 staging 建好并验通过，再去动线上那个目录。
-    // 反过来（先隔离坏目录、再建 staging）的话，一旦 staging 中途失败 —— 比如
-    // plan 之后源码被改了 —— 坏目录已经被挪走，而 current 还指着它，于是 current 悬空，
-    // 出站入站一起静默停摆。现在最坏情况是"什么都没换成"，线上仍跑着原来那份。
-    if (!verifyVersionDir(versionDir, plan.files).ok) {
-      const staging = path.join(root, "versions", ".staging-" + plan.version + "." + process.pid);
-      fs.rmSync(staging, { recursive: true, force: true });
-      for (const file of plan.files) {
-        const dest = path.join(staging, file.path);
-        fs.mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
-        const content = fs.readFileSync(path.join(plan.sourceRoot, file.path));
-        if (sha256(content) !== file.sha256) {
-          fs.rmSync(staging, { recursive: true, force: true });
-          // 计划到落盘之间源码变了（切了分支、跑了 git checkout）。宁可整次失败，
-          // 也不要装一份"清单与内容不符"的运行时 —— 此刻还没碰过线上任何东西。
-          return { ok: false, reason: "source_changed_during_apply", file: file.path };
-        }
-        writeAtomic(dest, content);
-      }
-      // manifest 放在版本目录**内部**：一个版本完整与否，不依赖任何外部文件就能回答。
-      writeAtomic(path.join(staging, MANIFEST_NAME), JSON.stringify({
-        schema_version: "1.0",
-        version: plan.version,
-        installed_at: new Date().toISOString(),
-        source_root: plan.sourceRoot,
-        source_commit: plan.sourceCommit,
-        files: plan.files,
-      }, null, 2) + "\n");
 
-      const staged = verifyVersionDir(staging, plan.files, { checkDirName: false });
-      if (!staged.ok) {
-        fs.rmSync(staging, { recursive: true, force: true });
-        return { ok: false, reason: "staging_verify_failed", detail: staged.reason };
-      }
-
-      // staging 就绪，现在才动线上那个目录。rename 覆盖不了非空目录，所以先挪开。
-      let quarantine = null;
-      if (fs.existsSync(versionDir)) {
-        quarantine = path.join(root, "versions", ".corrupt-" + plan.version + "." + Date.now());
-        try { fs.renameSync(versionDir, quarantine); }
-        catch {
-          fs.rmSync(staging, { recursive: true, force: true });
-          return { ok: false, reason: "corrupt_version_dir_stuck", version: plan.version };
-        }
-      }
-      try {
-        fs.renameSync(staging, versionDir);
-      } catch {
-        // 换上失败：必须把隔离的那份**放回原位**，否则 current 指向的目录就没了。
-        fs.rmSync(staging, { recursive: true, force: true });
-        if (quarantine) { try { fs.renameSync(quarantine, versionDir); } catch { /* 见下面那道闸 */ } }
-        // 也可能是竞态：另一个安装刚把同版本目录改名过去了。内容寻址，那份和我们这份一样，
-        // 下面那道闸会替我们确认。确认不了就整次失败，不碰 current。
-        if (!verifyVersionDir(versionDir, plan.files).ok) {
-          return { ok: false, reason: "version_dir_swap_failed", version: plan.version };
-        }
-      }
-    }
 
     // **切 current 之前的最后一道闸。**三方必须逐字一致：目录里那份清单说的版本、
     // 目录名本身、本次计划的版本。任何一处对不上都说明这不是我们要提交的东西 ——
@@ -326,11 +424,7 @@ export function applyRuntimeSync(plan, { home = os.homedir(), chain = "claude", 
     }
 
     // 唯一的提交点。此前任何失败，线上跑的都还是旧版本。
-    const link = path.join(root, CURRENT_LINK);
-    const linkTmp = link + ".tmp." + process.pid;
-    try { fs.unlinkSync(linkTmp); } catch { /* 上次残留 */ }
-    fs.symlinkSync(path.join("versions", plan.version), linkTmp);
-    fs.renameSync(linkTmp, link);
+    switchCurrentUnlocked(root, plan.version);
 
     // 到这里就**提交完了**。刻意不再往根目录写一份"当前指向谁"的指针：
     // 它没有消费者，却凭空多出一份可能与 current 不一致的真相，还要为它单独处理

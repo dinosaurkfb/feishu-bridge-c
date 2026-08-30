@@ -16,7 +16,7 @@ import { RISK, classifyRisk } from "./risk-class.mjs";
 import { CHAT_POLICY_ID, CHAT_REPLY_ARGS, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatReplyPathStatus, diagnosticSnippet, chatFailText, CHAT_FAIL_REASONS } from "./chat-reply.mjs";
 import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome, chatRecordProblem, isAdmissionLockEntry, classifyAdmissionLockEntry, inspectAdmissionLocks, inspectScratch, sweepScratch, classifyTmpEntry, lockUnclearedText, CHAT_MAX_CONCURRENT, CHAT_MAX_PER_SENDER, TMP_NAME_SHAPE } from "./chat-ledger.mjs";
 import { parseChatScratchSweepArgs, describeScratchSweep, sweepExitCode } from "./chat-scratch-sweep.mjs";
-import { acquirePublishLock as acquireLedgerLock, releasePublishLock as releaseLedgerLock } from "./registry.mjs";
+import { acquireLockUngated, acquirePublishLock as acquireLedgerLock, releasePublishLock as releaseLedgerLock } from "./registry.mjs";
 import { evaluateChatGates, CHAT_FALLBACK_REASONS } from "./inbound-route.mjs";
 import { ZERO_TOOL_ARGS } from "./handoff.mjs";
 import { INTENT, parseInboundIntent, controlRejectText, rejectedControlProjection, shown } from "./inbound-intent.mjs";
@@ -211,6 +211,12 @@ import {
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
 import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, stableControlId, validateSubscription, claimable } from "./subscription.mjs";
+import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
+import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
+import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
+import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
+import { pickClaudeNode as pickClaudeNodeB } from "./drain-schedule.mjs";
+import { applyRuntimeSync as applyRuntimeSyncB } from "./runtime-install.mjs";
 import {
   ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, topicGenerationStateForLegacy,
   TOPIC_GENERATION_PREPARING_STALE_MS,
@@ -5960,7 +5966,7 @@ test("状态命令和出站用的是同一条绑定选择规则", () => {
 });
 
 test("五条控制技能都装成跟 Codex 同名的斜杠命令", () => {
-  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8") + "\n" + fs.readFileSync(path.resolve("scripts", "install-projection.mjs"), "utf-8"); // 投影抽到了 install-projection.mjs，两份一起扫
   for (const [repo, installed] of [
     ["claude-feishu-bind", "feishu-bind"],
     ["claude-feishu-status", "feishu-status"],
@@ -6823,7 +6829,7 @@ test("runtime 未就绪时，入站 --apply 必须拒绝而不是装一个指不
 });
 
 test("钩子归属：guard 与实际执行不一致、或别的工具同名脚本，都不认领", () => {
-  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8") + "\n" + fs.readFileSync(path.resolve("scripts", "install-projection.mjs"), "utf-8"); // 投影抽到了 install-projection.mjs，两份一起扫
   // 新标记必须锚在固定尾部，不能是任意位置的 includes —— 否则一条只是提到该字符串的
   // 命令（比如别人写的清理脚本）也会被认成自己的然后删掉。
   assert.match(src, /command\.endsWith\(" # " \+ HOOK_TAG \+ basename\)/u);
@@ -7253,7 +7259,7 @@ test("运行时校验能发现被手改的脚本和被指歪的链接", () => {
 });
 
 test("安装器不再把开发克隆路径写进全局配置", () => {
-  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8") + "\n" + fs.readFileSync(path.resolve("scripts", "install-projection.mjs"), "utf-8"); // 投影抽到了 install-projection.mjs，两份一起扫
   for (const name of ["stop-hook.mjs", "init-hook.mjs", "bind-preview.mjs",
     "inbound-hook.mjs", "drain-outbox.mjs"]) {
     assert.doesNotMatch(src, new RegExp('path\\.join\\(ROOT,\\s*"scripts",\\s*"' + name + '"', "u"),
@@ -20559,6 +20565,288 @@ test("维护门（issue #81 · PR A）：三态读门只认 ENOENT 为没门，�
   // 默认路径由真实用户 home 推导，不跟会话 HOME 走
   const defaultPath = spawnSync(process.execPath, ["-e", 'import("./scripts/maintenance-gate-core.mjs").then((m) => process.stdout.write(m.maintenanceGatePath({})))'], { encoding: "utf-8", env: { ...process.env, HOME: local } }).stdout;
   assert.equal(defaultPath, path.join(os.userInfo().homedir, ".claude", "feishu-bridge", "maintenance.gate"), "会话 HOME 改了也不动：" + defaultPath);
+});
+
+test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据三态 / 合并 / 对账，runtime stage 不切 current、activate 只切已验目录，入口清单不缺且盖住线上引用", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "gate-b-"));
+  const home = path.join(base, "home 带空格");
+  fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+  const settingsFile = path.join(home, ".claude", "settings.json");
+  fs.writeFileSync(settingsFile, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "echo orca # ORCA", timeout: 5 }] }] }, permissions: { allow: ["Bash(git status:*)"] } }, null, 2) + "\n");
+  const node = pickClaudeNodeB();
+  // ── 投影：纯函数、幂等、只动自己的条目
+  const r1 = renderClaudeSettings({ baseText: fs.readFileSync(settingsFile, "utf-8"), home, node });
+  const r2 = renderClaudeSettings({ baseText: r1.text, home, node });
+  assert.deepEqual([r2.text === r1.text, r1.actions.stop, r2.actions.stop, r1.actions.perm, r2.actions.perm], [true, "installed", "updated", "installed", "already-present"], JSON.stringify({ a1: r1.actions, a2: r2.actions }));
+  assert.ok(r1.settings.hooks.Stop.some((e) => e.hooks[0].command.includes("ORCA")) && r1.settings.permissions.allow.includes("Bash(git status:*)"), "别人的 hook 与规则原样保留");
+  const owned = claudeSettingsOwnedEntries(r1.text, { home, node });
+  assert.deepEqual([owned.Stop.length, owned.inbound.length, owned.init.length, owned.allow.length], [1, 1, 1, 1]);
+  // 收据 sha 只算桥拥有的封闭条目：无关设置变了不变，我们的条目变了才变
+  const shaA = artifactSha({ kind: "claude-settings", text: r1.text, home, node });
+  const changed = JSON.parse(r1.text); changed.model = "opus"; changed.permissions.allow.push("Bash(ls:*)");
+  assert.equal(artifactSha({ kind: "claude-settings", text: JSON.stringify(changed, null, 2), home, node }), shaA, "无关设置变化不挡门");
+  const tampered = JSON.parse(r1.text); tampered.hooks.Stop.find((e) => e.hooks[0].command.includes("FEISHU_BRIDGE_HOOK:")).hooks[0].timeout = 99;
+  assert.notEqual(artifactSha({ kind: "claude-settings", text: JSON.stringify(tampered), home, node }), shaA, "我们的 hook 变了要变");
+  assert.deepEqual([artifactSha({ kind: "claude-settings", text: "{ 坏", home, node }), artifactSha({ kind: "codex-hooks", text: "{}" }), artifactSha({ kind: "file", text: null })], ["unparseable", "unparseable", "absent"], "codex-hooks 没注入提取器不折成可算");
+  assert.match(claudeDrainPlist({ home, node }), /com\.frank\.feishu-bridge-cc\.drain/u);
+  const skills = claudeSkillFiles({ repoRoot: path.resolve("."), home });
+  assert.deepEqual([skills.length, skills.filter((f) => f.missing).length, skills.every((f) => f.missing || !f.text.includes("{{"))], [10, 0, true]);
+  assert.deepEqual(referencedRuntimeScripts("x runtime/current/scripts/a.mjs y runtime/current/scripts/codex/b.mjs runtime/current/scripts/a.mjs"), ["a.mjs", "codex/b.mjs"]);
+  // ── 收据：三态 / 同版本按 path 合并 / 版本变了整体换 / 畸形不覆盖 / 对账
+  const surface = path.join(home, ".claude", "feishu-bridge", "installed-surface.json");
+  assert.deepEqual(readInstalledSurface({ file: surface }), { state: "absent" });
+  const v = "0123456789abcdef";
+  const f1 = path.join(home, "a.txt"); fs.writeFileSync(f1, "A");
+  const rec1 = recordInstalledSurface({ chain: "claude", version: v, artifacts: [{ path: f1, kind: "file", sha256: artifactSha({ kind: "file", text: "A" }) }], scripts: ["stop-hook.mjs"], file: surface });
+  assert.equal(rec1.ok, true, JSON.stringify(rec1));
+  const f2 = path.join(home, "b.txt"); fs.writeFileSync(f2, "B");
+  const rec2 = recordInstalledSurface({ chain: "claude", version: v, artifacts: [{ path: f2, kind: "file", sha256: artifactSha({ kind: "file", text: "B" }) }], scripts: ["init-hook.mjs"], file: surface });
+  assert.deepEqual([rec2.entry.artifacts.map((a) => path.basename(a.path)), rec2.entry.scripts], [["a.txt", "b.txt"], ["init-hook.mjs", "stop-hook.mjs"]], "同版本按 path 合并");
+  assert.equal(compareInstalledSurface({ chain: "claude", file: surface }).ok, true);
+  fs.writeFileSync(f2, "changed");
+  const cmp = compareInstalledSurface({ chain: "claude", file: surface });
+  assert.deepEqual([cmp.ok, cmp.mismatches.map((m) => path.basename(m.path))], [false, ["b.txt"]]);
+  assert.deepEqual(recordInstalledSurface({ chain: "claude", version: "fedcba9876543210", artifacts: [], scripts: [], file: surface }).entry.artifacts, [], "版本变了整体换");
+  assert.equal(recordInstalledSurface({ chain: "gemini", version: v, artifacts: [], scripts: [], file: surface }).reason, "chain_unknown");
+  // sha 只认 64 位十六进制：算不出的结果不能被记成预期值；持久化了 unparseable 的收据读成 unreadable 而不是 valid
+  assert.deepEqual(recordInstalledSurface({ chain: "claude", version: v, artifacts: [{ path: f1, kind: "codex-hooks", sha256: artifactSha({ kind: "codex-hooks", text: "{}" }) }], scripts: [], file: surface }).reason, "artifact_sha_unusable");
+  assert.deepEqual(recordInstalledSurface({ chain: "claude", version: v, artifacts: [{ path: f1, kind: "file", sha256: "a".repeat(64) }, { path: f1, kind: "file", sha256: "b".repeat(64) }], scripts: [], file: surface }).reason, "entry_shape", "本次制品 path 重复");
+  const good = JSON.parse(fs.readFileSync(surface, "utf-8"));
+  const poisoned = structuredClone(good); poisoned.chains.claude.artifacts = [{ path: f1, kind: "codex-hooks", sha256: "unparseable" }];
+  fs.writeFileSync(surface, JSON.stringify(poisoned));
+  assert.deepEqual([readInstalledSurface({ file: surface }).state, compareInstalledSurface({ chain: "claude", file: surface }).state], ["unreadable", "unreadable"], "预期值 unparseable 的收据不是 valid，对账不折成通过");
+  const dup = structuredClone(good); dup.chains.claude.artifacts = [{ path: f1, kind: "file", sha256: "a".repeat(64) }, { path: f1, kind: "file", sha256: "a".repeat(64) }];
+  fs.writeFileSync(surface, JSON.stringify(dup));
+  assert.match(readInstalledSurface({ file: surface }).why, /path 重复/u);
+  const badAt = structuredClone(good); badAt.chains.claude.at = "2026-08-30 10:00";
+  fs.writeFileSync(surface, JSON.stringify(badAt));
+  assert.match(readInstalledSurface({ file: surface }).why, /规范化/u);
+  fs.writeFileSync(surface, "{ 坏");
+  assert.deepEqual([readInstalledSurface({ file: surface }).state, recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: [], file: surface }).reason, fs.readFileSync(surface, "utf-8")], ["unreadable", "surface_unreadable", "{ 坏"], "畸形收据不覆盖、不删");
+  fs.unlinkSync(surface);
+  // 对账是 fd 绑定读：符号链接到同内容的外部文件、命名管道、多硬链接都不算"制品还在"
+  const outside = path.join(base, "outside.txt"); fs.writeFileSync(outside, "S");
+  const fLink = path.join(home, "link.txt"); fs.symlinkSync(outside, fLink);
+  const fFifo = path.join(home, "fifo.txt"); execFileSync("mkfifo", [fFifo]);
+  const fHard = path.join(home, "hard.txt"); fs.writeFileSync(fHard, "H"); fs.linkSync(fHard, path.join(home, "hard2.txt"));
+  const shaS = artifactSha({ kind: "file", text: "S" }); const shaH = artifactSha({ kind: "file", text: "H" });
+  assert.equal(recordInstalledSurface({ chain: "claude", version: v, artifacts: [{ path: fLink, kind: "file", sha256: shaS }, { path: fFifo, kind: "file", sha256: shaS }, { path: fHard, kind: "file", sha256: shaH }], scripts: [], file: surface }).ok, true);
+  const fdCmp = compareInstalledSurface({ chain: "claude", file: surface });
+  assert.deepEqual(fdCmp.mismatches.map((x) => [path.basename(x.path), x.actual.split("：")[0]]), [[ "fifo.txt", "unreadable:不是普通文件" ], ["hard.txt", "unreadable:不是单硬链接的普通文件（nlink=2）"], ["link.txt", "unreadable:不是普通文件（符号链接）"]], JSON.stringify(fdCmp.mismatches));
+  const linked = structuredClone(JSON.parse(fs.readFileSync(surface, "utf-8")));
+  fs.unlinkSync(surface); fs.symlinkSync(path.join(base, "elsewhere.json"), surface); fs.writeFileSync(path.join(base, "elsewhere.json"), JSON.stringify(linked));
+  assert.match(readInstalledSurface({ file: surface }).why, /符号链接/u, "收据本身是符号链接也不认");
+  fs.unlinkSync(surface);
+  // 锁位置上的未知制品不回收不删：目录（带哨兵）、畸形 payload 的旧 symlink → surface_lock_residue，现场原样
+  const lockPath = surface + ".lock";
+  fs.mkdirSync(lockPath); fs.writeFileSync(path.join(lockPath, "sentinel"), "哨兵");
+  const oldTime = new Date(Date.now() - 3600 * 1000); fs.utimesSync(lockPath, oldTime, oldTime);
+  const resDir = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: [], file: surface, waitMs: 50 });
+  assert.deepEqual([resDir.reason, fs.existsSync(path.join(lockPath, "sentinel")), fs.existsSync(surface)], ["surface_lock_residue", true, false], JSON.stringify(resDir));
+  fs.rmSync(lockPath, { recursive: true, force: true });
+  fs.symlinkSync("not-a-lock-payload", lockPath); fs.lutimesSync(lockPath, oldTime, oldTime);
+  const resLink = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: [], file: surface, waitMs: 50 });
+  const linkNow = (() => { try { return fs.readlinkSync(lockPath); } catch { return "gone"; } })();
+  assert.deepEqual([resLink.reason, linkNow, fs.existsSync(surface)], ["surface_lock_residue", "not-a-lock-payload", false], "畸形 symlink 不回收不删：" + JSON.stringify(resLink));
+  fs.unlinkSync(lockPath);
+  // 提交 fencing：写满临时文件之后、rename 之前锁被别人合法接管 → lock_lost，不覆盖，不留临时文件
+  const takeover = () => { fs.unlinkSync(lockPath); fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: crypto.randomUUID() }), lockPath); };
+  const lost = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: ["doctor.mjs"], file: surface, testHooks: { beforeCommit: takeover } });
+  assert.deepEqual([lost.reason, fs.existsSync(surface), fs.readdirSync(path.dirname(surface)).filter((n) => n.includes(".installed-surface.")).length, typeof lost.lockUncleared], ["lock_lost", false, 0, "undefined"], JSON.stringify(lost));
+  fs.unlinkSync(lockPath);
+  assert.equal(recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: ["doctor.mjs"], file: surface }).ok, true, "锁空出来之后正常写");
+  // 释放异常受控可见：抛错 → release_threw；返回失败 → 它的 reason；reap 锁交不还 → reap_uncleared。段内写的算数（ok:true），残骸挂在最终结果上
+  const tmpCount = () => fs.readdirSync(path.dirname(surface)).filter((n) => n.startsWith(".installed-surface.") && n.endsWith(".tmp")).length;
+  for (const [release, expect] of [
+    [() => { throw Object.assign(new Error("EIO"), { code: "EIO" }); }, { reason: "release_threw", error: "EIO" }],
+    [() => ({ ok: false, reason: "io_error" }), { reason: "io_error" }],
+    [() => ({ ok: true, reapUncleared: { path: lockPath + ".reap", error: "EIO" } }), { reason: "reap_uncleared", error: "EIO" }],
+  ]) {
+    const r = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: ["doctor.mjs"], file: surface, testHooks: { release } });
+    assert.deepEqual([r.ok, r.lockUncleared?.reason, r.lockUncleared?.error, tmpCount()], [true, expect.reason, expect.error, 0], JSON.stringify(r));
+    assert.equal(receiptReport(r).failed, true, "有残骸就算失败：" + receiptReport(r).text);
+    assert.ok(receiptReport(r).text.includes(r.lockUncleared.path), "点名残骸路径");
+    try { fs.unlinkSync(lockPath); } catch { /* 注入的释放没真释放，这里替它清 */ }
+  }
+  // 临时文件：写 / fsync 失败自己清掉；清不掉 → tmpResidue 点名路径；盘点能看见
+  const wf = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: [], file: surface, testHooks: { afterTmpWrite: () => { throw Object.assign(new Error("EIO"), { code: "EIO" }); } } });
+  assert.deepEqual([wf.ok, wf.reason, wf.why, wf.tmpResidue, tmpCount()], [false, "io_error", "EIO", undefined, 0], JSON.stringify(wf));
+  const surfaceDir = path.dirname(surface);
+  const wr = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: [], file: surface, testHooks: { afterTmpWrite: () => { fs.chmodSync(surfaceDir, 0o500); throw Object.assign(new Error("EIO"), { code: "EIO" }); } } });
+  fs.chmodSync(surfaceDir, 0o700);
+  // 目录只读时释放也做不了（reap 锁建不出来）：锁残骸同样要报出来，不能只报临时文件
+  assert.deepEqual([wr.ok, wr.reason, typeof wr.tmpResidue?.path, wr.tmpResidue?.error, tmpCount(), wr.lockUncleared?.path], [false, "io_error", "string", "EACCES", 1, lockPath], JSON.stringify(wr));
+  assert.ok(receiptReport(wr).text.includes("锁残骸") && receiptReport(wr).text.includes("临时文件残骸"), receiptReport(wr).text);
+  fs.unlinkSync(lockPath); try { fs.unlinkSync(lockPath + ".reap"); } catch { /* 没建出来 */ }
+  assert.equal(receiptReport(wr).failed, true);
+  assert.ok(receiptReport(wr).text.includes(wr.tmpResidue.path), "点名临时文件路径");
+  const inv = inspectInstalledSurface({ file: surface });
+  assert.deepEqual(inv.residues.map((x) => [x.kind, x.path]), [["tmp", wr.tmpResidue.path]], JSON.stringify(inv.residues));
+  fs.unlinkSync(wr.tmpResidue.path);
+  fs.mkdirSync(lockPath); fs.symlinkSync("junk", lockPath + ".reap");
+  const inv2 = inspectInstalledSurface({ file: surface });
+  assert.deepEqual(inv2.residues.map((x) => x.kind + ":" + x.detail), ["unknown:lock 位置上不是本协议的 symlink —— 只人工处置", "unknown:reap 的 payload 畸形 —— 只人工处置"], JSON.stringify(inv2.residues));
+  fs.rmdirSync(lockPath); fs.unlinkSync(lockPath + ".reap");
+  fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date(Date.now() - 120000).toISOString(), token: "t" }), lockPath);
+  assert.match(inspectInstalledSurface({ file: surface }).residues[0]?.detail ?? "", /仍在但已超时 1\d\d 秒/u);
+  fs.unlinkSync(lockPath);
+  assert.deepEqual([inspectInstalledSurface({ file: surface }).residues, inspectInstalledSurface({ file: surface }).inventory], [[], "ok"], "干净时没有残骸");
+  // 取锁阶段：抛错受控；陈旧回收隔离后删不掉（reapedUncleared）进最终结果与文案
+  const acqThrew = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: [], file: surface, testHooks: { acquire: () => { throw Object.assign(new Error("EIO"), { code: "EIO" }); } } });
+  assert.deepEqual([acqThrew.ok, acqThrew.reason, acqThrew.why, tmpCount()], [false, "io_error", "取锁阶段异常：EIO", 0], JSON.stringify(acqThrew));
+  // 原语默认 fail-closed 给出 reaped_uncleared 时：收据锁不取、不写，surface_lock_residue 点名隔离路径（symlink 原语上实际到不了，只验映射；不存在"ok + reapedUncleared"的收据路径）
+  const reapedPath = lockPath + ".reaped-" + crypto.randomUUID();
+  const bytesBeforeClosed = fs.readFileSync(surface);
+  const acqClosed = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: ["doctor.mjs"], file: surface, testHooks: { acquire: () => ({ ok: false, reason: "reaped_uncleared", path: reapedPath, error: "EIO" }) } });
+  assert.deepEqual([acqClosed.ok, acqClosed.reason, acqClosed.path, /EIO/u.test(acqClosed.why), fs.readFileSync(surface).equals(bytesBeforeClosed), tmpCount(), receiptReport(acqClosed).text.includes(reapedPath)], [false, "surface_lock_residue", reapedPath, true, true, 0, true], JSON.stringify(acqClosed));
+  // 共用原语本身：陈旧目录锁隔离后删不掉 → 不裸抛，返回 ok + reapedUncleared 点名隔离路径
+  const dirLock = path.join(base, "dir.lock"); fs.mkdirSync(path.join(dirLock, "sub"), { recursive: true }); fs.writeFileSync(path.join(dirLock, "sub", "f"), ""); fs.chmodSync(path.join(dirLock, "sub"), 0o500);
+  const oldStamp = new Date(Date.now() - 3600 * 1000); fs.utimesSync(dirLock, oldStamp, oldStamp);
+  // 默认 fail-closed：不取锁、reason reaped_uncleared 点名隔离路径、锁位置空着（只判 ok 的调用方不会带残骸继续写）
+  const closed = acquireLockUngated(dirLock, { staleMs: 1 });
+  assert.deepEqual([closed.ok, closed.reason, typeof closed.path, ["EACCES", "ENOTEMPTY"].includes(closed.error), fs.existsSync(dirLock), fs.existsSync(closed.path ?? "/nonexistent")], [false, "reaped_uncleared", "string", true, false, true], JSON.stringify(closed));
+  fs.chmodSync(path.join(closed.path, "sub"), 0o700); fs.rmSync(closed.path, { recursive: true, force: true });
+  // 显式接受：取到 → ok:true + reapedUncleared；被别人抢先 → publisher_busy + reapedUncleared
+  const mkStaleDirLock = () => { fs.mkdirSync(path.join(dirLock, "sub"), { recursive: true }); fs.writeFileSync(path.join(dirLock, "sub", "f"), ""); fs.chmodSync(path.join(dirLock, "sub"), 0o500); fs.utimesSync(dirLock, oldStamp, oldStamp); };
+  mkStaleDirLock();
+  const primitive = acquireLockUngated(dirLock, { staleMs: 1, acceptReapedResidue: true });
+  if (primitive.reapedUncleared) fs.chmodSync(path.join(primitive.reapedUncleared.path, "sub"), 0o700);
+  assert.deepEqual([primitive.ok, typeof primitive.reapedUncleared?.path, ["EACCES", "ENOTEMPTY"].includes(primitive.reapedUncleared?.error), fs.existsSync(primitive.reapedUncleared?.path ?? "/nonexistent")], [true, "string", true, true], "显式接受：取到锁、不裸抛、点名隔离路径：" + JSON.stringify(primitive));
+  releasePublishLock(dirLock); fs.rmSync(primitive.reapedUncleared.path, { recursive: true, force: true });
+  mkStaleDirLock();
+  const raced = acquireLockUngated(dirLock, { staleMs: 1, acceptReapedResidue: true, afterReap: () => fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "other" }), dirLock) });
+  if (raced.reapedUncleared) fs.chmodSync(path.join(raced.reapedUncleared.path, "sub"), 0o700);
+  assert.deepEqual([raced.ok, raced.reason, typeof raced.reapedUncleared?.path], [false, "publisher_busy", "string"], "抢先：busy 也带残骸：" + JSON.stringify(raced));
+  fs.unlinkSync(dirLock); fs.rmSync(raced.reapedUncleared.path, { recursive: true, force: true });
+  // 归属转换锁 .reap 自己交不还：默认与 acceptReapedResidue 两支都 fail-closed —— ok:false、reason reap_uncleared、不建新主锁、.reap 残骸点名
+  for (const accept of [false, true]) {
+    const staleLink = path.join(base, "stale-" + String(accept) + ".lock");
+    fs.symlinkSync(JSON.stringify({ pid: 2147483646, at: new Date(Date.now() - 3600 * 1000).toISOString(), token: "dead" }), staleLink);
+    const originalRm = fs.rmSync;
+    fs.rmSync = (target, ...args) => { if (path.resolve(String(target)) === path.resolve(staleLink + ".reap")) { const e = new Error("reap release failed"); e.code = "EIO"; throw e; } return originalRm(target, ...args); };
+    let got;
+    try { got = acquireLockUngated(staleLink, { staleMs: 1, acceptReapedResidue: accept }); }
+    finally { fs.rmSync = originalRm; }
+    const present = (f) => { try { fs.lstatSync(f); return true; } catch { return false; } }; // .reap 是指向 payload 的悬空 symlink，existsSync 会跟随而说 false
+    assert.deepEqual([got.ok, got.reason, got.path, got.error, present(staleLink), present(staleLink + ".reap")], [false, "reap_uncleared", staleLink + ".reap", "EIO", false, true], "accept=" + accept + "：不建新主锁、.reap 残骸留着点名：" + JSON.stringify(got));
+    fs.unlinkSync(staleLink + ".reap");
+  }
+  // 收据锁收到 reap_uncleared：surface_lock_residue、不写、指路 repair-publish-lock
+  const reapClosed = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: ["doctor.mjs"], file: surface, testHooks: { acquire: () => ({ ok: false, reason: "reap_uncleared", path: lockPath + ".reap", error: "EIO" }) } });
+  assert.deepEqual([reapClosed.ok, reapClosed.reason, reapClosed.path, reapClosed.why.includes("repair-publish-lock.mjs --lock " + lockPath), fs.readFileSync(surface).equals(bytesBeforeClosed)], [false, "surface_lock_residue", lockPath + ".reap", true, true], JSON.stringify(reapClosed));
+
+  // 盘点封闭识别锁家族 + 目录读不出不折成"没有残骸" + 家族各自的处置文案
+  const mk = (n) => { fs.writeFileSync(path.join(surfaceDir, n), ""); return path.join(surfaceDir, n); };
+  const fam = [mk("installed-surface.json.lock.reaped-" + crypto.randomUUID()), mk("installed-surface.json.lock.reaped-junk"), mk("installed-surface.json.lock.reap.quarantine-" + crypto.randomUUID()), mk("installed-surface.json.lock.foo"), mk(".installed-surface.bad.tmp")];
+  const famInv = inspectInstalledSurface({ file: surface });
+  assert.deepEqual(famInv.residues.map((x) => x.kind), ["unknown", "unknown", "reap-quarantine", "reaped", "unknown"], JSON.stringify(famInv.residues));
+  assert.ok(famInv.residues.find((x) => x.kind === "reap-quarantine").detail.includes("repair-publish-lock.mjs --lock " + lockPath), "reap 隔离残骸指路 repair-publish-lock");
+  assert.ok(famInv.residues.find((x) => x.kind === "reaped").detail.includes("人工删"), "reaped 残骸只要人工删");
+  for (const f of fam) fs.unlinkSync(f);
+  const deadOwner = JSON.stringify({ pid: 2147483646, at: new Date(Date.now() - 120000).toISOString(), token: "t" });
+  fs.symlinkSync(deadOwner, lockPath + ".reap"); fs.symlinkSync(deadOwner, lockPath + ".maint"); fs.symlinkSync(deadOwner, lockPath);
+  const famText = Object.fromEntries(inspectInstalledSurface({ file: surface }).residues.map((x) => [x.kind, x.detail]));
+  assert.deepEqual([/按协议回收/u.test(famText.lock), famText.reap.includes("repair-publish-lock.mjs --lock " + lockPath + " --apply"), /不自动恢复.*手动删/u.test(famText.maint)], [true, true, true], JSON.stringify(famText));
+  fs.unlinkSync(lockPath); fs.unlinkSync(lockPath + ".reap"); fs.unlinkSync(lockPath + ".maint");
+  fs.chmodSync(surfaceDir, 0o300);
+  const blindInv = inspectInstalledSurface({ file: surface });
+  fs.chmodSync(surfaceDir, 0o700);
+  assert.deepEqual([blindInv.inventory, blindInv.residues.map((x) => [x.kind, x.path]), /EACCES/u.test(blindInv.residues[0]?.detail ?? "")], ["unreadable", [["inventory", surfaceDir]], true], JSON.stringify(blindInv));
+  assert.deepEqual([receiptReport({ ok: true }, { artifacts: 2, scripts: 3 }), receiptReport({ ok: false, reason: "surface_unreadable", why: "x" }).failed], [{ text: "已记（2 个制品，3 个脚本）", failed: false }, true]);
+  // 形状：version / sha256 必须先是字符串再匹配正则（数组 String() 后能骗过正则）
+  const arrDoc = JSON.parse(fs.readFileSync(surface, "utf-8"));
+  const arrV = structuredClone(arrDoc); arrV.chains.claude.version = [v]; fs.writeFileSync(surface, JSON.stringify(arrV));
+  const arrVRead = readInstalledSurface({ file: surface });
+  assert.deepEqual([arrVRead.state, /version 不是 16 位十六进制字符串/u.test(arrVRead.why ?? "")], ["unreadable", true], "数组 version 不能读成 valid：" + JSON.stringify(arrVRead));
+  const arrS = structuredClone(arrDoc); arrS.chains.claude.artifacts = [{ path: f1, kind: "file", sha256: ["a".repeat(64)] }]; fs.writeFileSync(surface, JSON.stringify(arrS));
+  const arrSRead = readInstalledSurface({ file: surface });
+  assert.deepEqual([arrSRead.state, /sha256 不是 64 位十六进制字符串/u.test(arrSRead.why ?? "")], ["unreadable", true], "数组 sha256 不能读成 valid：" + JSON.stringify(arrSRead));
+  assert.equal(recordInstalledSurface({ chain: "claude", version: v, artifacts: [{ path: f1, kind: "file", sha256: ["a".repeat(64)] }], scripts: [], file: surface }).reason, "artifact_sha_unusable");
+  fs.unlinkSync(surface);
+  // 收据事务锁：持锁期间另一个进程记收据只会 surface_busy（写不进去），放开后才成功 —— 无锁的读改写会丢另一侧的条目
+  const driver = path.join(base, "record-driver.mjs");
+  fs.writeFileSync(driver, "import { recordInstalledSurface } from " + JSON.stringify(pathToFileURL(path.resolve("scripts", "installed-surface.mjs")).href) + ";\n"
+    + "const [file, tag, n, waitMs] = process.argv.slice(2);\n"
+    + "const out = []; for (let i = 0; i < Number(n); i++) out.push(recordInstalledSurface({ chain: 'claude', version: '0123456789abcdef', artifacts: [{ path: file + '.' + tag + '.' + i, kind: 'file', sha256: 'c'.repeat(64) }], scripts: [], file, waitMs: Number(waitMs) }));\n"
+    + "process.stdout.write(JSON.stringify(out.map((r) => r.ok ? 'ok' : r.reason)));\n");
+  const runDriver = (tag, n, waitMs) => JSON.parse(execFileSync(process.execPath, [driver, surface, tag, String(n), String(waitMs)], { encoding: "utf-8" }));
+  const heldResult = withInstalledSurfaceLock(surface, () => runDriver("held", 1, 150), { waitMs: 0 });
+  assert.deepEqual([heldResult.ok, heldResult.run, fs.existsSync(surface)], [true, ["surface_busy"], false], "持锁期间别的写者写不进去");
+  assert.deepEqual(runDriver("after", 1, 150), ["ok"], "放开后写得进去");
+  const pair = path.join(base, "pair-driver.mjs");
+  fs.writeFileSync(pair, "import { spawn } from 'node:child_process';\nconst [driver, file] = process.argv.slice(2);\n"
+    + "const run = (tag) => new Promise((res) => { const c = spawn(process.execPath, [driver, file, tag, '15', '5000'], { stdio: ['ignore', 'pipe', 'inherit'] }); let out = ''; c.stdout.on('data', (d) => { out += d; }); c.on('exit', () => res(JSON.parse(out))); });\n"
+    + "const [a, b] = await Promise.all([run('A'), run('B')]); process.stdout.write(JSON.stringify({ a, b }));\n");
+  const pairOut = JSON.parse(execFileSync(process.execPath, [pair, driver, surface], { encoding: "utf-8" }));
+  assert.deepEqual([pairOut.a.every((x) => x === "ok"), pairOut.b.every((x) => x === "ok"), readInstalledSurface({ file: surface }).doc.chains.claude.artifacts.length], [true, true, 15 + 15 + 1], "两个真实进程并发各记 15 条，一条不丢：" + JSON.stringify(pairOut));
+  fs.unlinkSync(surface);
+
+  // ── runtime：stage 只落目录、不切 current；activate 只切已验目录；篡改后拒
+  const root = path.join(base, "rt");
+  const plan = planRuntimeSyncB({ sourceRoot: path.resolve("."), root });
+  assert.equal(plan.ok, true, JSON.stringify(plan).slice(0, 200));
+  const staged = stageRuntimeVersionB(plan, { root });
+  assert.deepEqual([staged.ok, staged.staged, fs.existsSync(path.join(root, "versions", plan.version, "INSTALLED.json")), fs.existsSync(path.join(root, "current"))], [true, true, true, false], "stage 只落目录：" + JSON.stringify(staged));
+  assert.equal(verifyRuntimeVersionB({ version: plan.version, root }).ok, true);
+  assert.deepEqual([activateRuntimeVersionB({ version: "0000000000000000", root }).reason, fs.existsSync(path.join(root, "current"))], ["version_not_committable", false], "没落过的版本不切");
+  const act = activateRuntimeVersionB({ version: plan.version, root });
+  assert.deepEqual([act.ok, fs.readlinkSync(path.join(root, "current")), verifyRuntimeB({ root }).ok], [true, path.join("versions", plan.version), true], JSON.stringify(act));
+  fs.appendFileSync(path.join(root, "versions", plan.version, "scripts", "doctor.mjs"), "\n// tampered");
+  assert.deepEqual([verifyRuntimeVersionB({ version: plan.version, root }).ok, activateRuntimeVersionB({ version: plan.version, root }).reason], [false, "version_not_committable"], "篡改的目录不切");
+  // current 正指着这个坏目录：stage 不许动它（挪走 → 换上之间 current 会悬空），零改动；applyRuntimeSync 老路径仍能原地修复
+  const inUse = stageRuntimeVersionB(plan, { root });
+  assert.deepEqual([inUse.reason, fs.existsSync(path.join(root, "versions", plan.version, "INSTALLED.json")), fs.readdirSync(path.join(root, "versions")).filter((n) => n.startsWith(".corrupt-") || n.startsWith(".staging-")).length, fs.readlinkSync(path.join(root, "current"))], ["version_in_use", true, 0, path.join("versions", plan.version)], JSON.stringify(inUse));
+  // 在用判定按对象身份：current → alias → versions/<v> 也算在用；current 悬空（身份说不清）→ fail-closed 不动目录
+  const alias = path.join(root, "alias"); fs.symlinkSync(path.join("versions", plan.version), alias);
+  fs.unlinkSync(path.join(root, "current")); fs.symlinkSync("alias", path.join(root, "current"));
+  const viaAlias = stageRuntimeVersionB(plan, { root });
+  assert.deepEqual([viaAlias.reason, fs.existsSync(path.join(root, "versions", plan.version, "INSTALLED.json")), fs.readdirSync(path.join(root, "versions")).filter((n) => n.startsWith(".")).length], ["version_in_use", true, 0], JSON.stringify(viaAlias));
+  fs.unlinkSync(path.join(root, "current")); fs.symlinkSync(path.join("versions", "0000000000000000"), path.join(root, "current"));
+  const dangling = stageRuntimeVersionB(plan, { root });
+  assert.deepEqual([dangling.reason, fs.existsSync(path.join(root, "versions", plan.version, "INSTALLED.json")), fs.readdirSync(path.join(root, "versions")).filter((n) => n.startsWith(".")).length], ["current_unverifiable", true, 0], JSON.stringify(dangling));
+  fs.unlinkSync(path.join(root, "current")); fs.symlinkSync(path.join("versions", plan.version), path.join(root, "current")); fs.unlinkSync(alias);
+  assert.deepEqual([applyRuntimeSyncB(plan, { root }).ok, verifyRuntimeB({ root }).ok], [true, true], "老路径原地修复");
+  // ── 入口清单：不缺、含关键入口
+  const manifest = maintenanceEntryManifest({ repoRoot: path.resolve("."), home, codexHome: path.join(home, ".codex") });
+  assert.deepEqual(manifest.missing, []);
+  for (const n of ["stop-hook.mjs", "inbound-hook.mjs", "init-hook.mjs", "bind-preview.mjs", "feishu-rotate.mjs", "drain-outbox.mjs", "watch-and-publish.mjs", "aily-inbound.mjs", "codex/prompt-hook.mjs", "codex/stop-hook.mjs", "codex/bind-task.mjs", "codex/drain-all.mjs", "doctor.mjs", "codex/doctor.mjs"]) assert.ok(manifest.entries.includes(n), "清单缺 " + n);
+  // ── 沙箱真装（含空格 HOME）：收据在沙箱里、装完立刻对账通过、线上引用的脚本 ⊆ 清单；无关设置变化不挡，我们的 hook 变了才挡
+  const env = { ...process.env, HOME: home };
+  execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
+  execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env });
+  const receipt = readInstalledSurface({ file: surface });
+  assert.equal(receipt.state, "valid", JSON.stringify(receipt));
+  const entry = receipt.doc.chains.claude;
+  assert.deepEqual([entry.artifacts.some((a) => a.kind === "claude-settings"), entry.artifacts.some((a) => a.kind === "plist"), entry.artifacts.filter((a) => a.kind === "skill").length, entry.version.length], [true, true, 10, 16], JSON.stringify(entry.artifacts.map((a) => a.kind)));
+  assert.equal(compareInstalledSurface({ chain: "claude", file: surface, home, node }).ok, true, "装完立刻对账通过：" + JSON.stringify(compareInstalledSurface({ chain: "claude", file: surface, home, node })));
+  for (const n of entry.scripts) assert.ok(manifest.entries.includes(n), "线上引用的脚本不在清单里：" + n);
+  const live = JSON.parse(fs.readFileSync(settingsFile, "utf-8")); live.model = "opus"; fs.writeFileSync(settingsFile, JSON.stringify(live, null, 2) + "\n");
+  assert.equal(compareInstalledSurface({ chain: "claude", file: surface, home, node }).ok, true, "无关设置变化不挡门");
+  live.hooks.Stop.find((e) => e.hooks[0].command.includes("FEISHU_BRIDGE_HOOK:")).hooks[0].timeout = 99; fs.writeFileSync(settingsFile, JSON.stringify(live, null, 2) + "\n");
+  assert.deepEqual(compareInstalledSurface({ chain: "claude", file: surface, home, node }).mismatches.map((m) => path.basename(m.path)), ["settings.json"], "我们的 hook 变了要挡");
+  // 收据记在全部制品写完之后：plist 写失败 → 安装器非零退出、收据一个字节不变
+  const receiptBytes = fs.readFileSync(surface);
+  const plistPath = claudeDrainPlistPath(home); fs.rmSync(plistPath); fs.mkdirSync(plistPath);
+  assert.throws(() => execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env, stdio: "pipe" }), "plist 位置是目录 → 安装失败");
+  assert.equal(fs.readFileSync(surface).equals(receiptBytes), true, "失败的安装不改收据");
+  fs.rmSync(plistPath, { recursive: true, force: true });
+  // doctor ⑪：装完有收据 → ✓；留下临时文件残骸 → ✗ 点名路径；收据位置是目录 → ✗ 读不出；安装器遇收据读不出非零退出、其余制品照写
+  const d1 = runDoctor({ home }).checks.find((c) => c.id === "installed_surface");
+  assert.deepEqual([d1.ok, /^有：版本 [0-9a-f]{16}，\d+ 个制品，/u.test(d1.detail)], [true, true], JSON.stringify(d1));
+  const residueTmp = path.join(path.dirname(surface), ".installed-surface.1.residue.tmp"); fs.writeFileSync(residueTmp, "");
+  const d2 = runDoctor({ home }).checks.find((c) => c.id === "installed_surface");
+  assert.deepEqual([d2.ok, d2.detail.includes(residueTmp)], [false, true], JSON.stringify(d2));
+  fs.unlinkSync(residueTmp);
+  fs.rmSync(surface); fs.mkdirSync(surface);
+  fs.chmodSync(path.dirname(surface), 0o300);
+  const dBlind = runDoctor({ home }).checks.find((c) => c.id === "installed_surface");
+  fs.chmodSync(path.dirname(surface), 0o700);
+  assert.deepEqual([dBlind.ok, dBlind.detail.includes(path.dirname(surface)), /目录盘点失败/u.test(dBlind.detail)], [false, true, true], "目录读不出不假绿：" + JSON.stringify(dBlind));
+  const d3 = runDoctor({ home }).checks.find((c) => c.id === "installed_surface");
+  assert.deepEqual([d3.ok, /^读不出（不是普通文件）/u.test(d3.detail)], [false, true], JSON.stringify(d3));
+  const failed = spawnSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
+  assert.deepEqual([failed.status, /安装收据 : \*\*没记下\*\*（surface_unreadable：/u.test(failed.stdout), fs.statSync(surface).isDirectory()], [1, true, true], "收据读不出：非零退出、点名、不动畸形制品：" + failed.stdout.slice(-400));
+  fs.rmdirSync(surface);
 });
 
 summarySealed = true;

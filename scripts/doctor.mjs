@@ -47,6 +47,7 @@ import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode } fro
 import { spawnSync } from "node:child_process";
 import { LAUNCHCTL_ENV, PHASE_TEXT, loadedPhase } from "./launchd-job.mjs";
 import { readGate, maintenanceGatePath } from "./maintenance-gate-core.mjs";
+import { inspectInstalledSurface, installedSurfacePath } from "./installed-surface.mjs";
 
 /** 到期预警阈值：7 天内到期就点名。**明写**，不藏在比较式里。 */
 export const EXPIRY_WARN_MS = 7 * 24 * 3600 * 1000;
@@ -341,6 +342,18 @@ export function runDoctor({
     else if (g.state === "active") add("maintenance_gate", "⑩ 维护门", false, "开着：" + g.payload.reason + "（已 " + Math.floor(g.ageMs / 60000) + " 分钟，token " + String(g.payload.token).slice(0, 8) + "）" + (g.ageMs > 10 * 60 * 1000 ? " —— 超过 10 分钟，多半是维护中断；维护门 CLI（--status / --exit）随后续 PR 提供，此刻请人工核对 " + maintenanceGatePath() : ""), null);
     else if (g.state === "transitioning") add("maintenance_gate", "⑩ 维护门", false, "正在切换（" + g.why + "）—— 入口都按维护中处理；几毫秒的事，再跑一次仍在就是段里崩了或释放失败，转换锁在 " + maintenanceGatePath() + ".txn", null);
     else add("maintenance_gate", "⑩ 维护门", false, "读不出（" + g.why + "）—— 入口都按维护中处理；畸形制品不自动删，请人工核对 " + (g.detail ?? maintenanceGatePath()), null);
+  }
+
+  // ⑪ 安装收据（Claude 链，维护门 PR B）：三态 + 锁 / 临时文件残骸盘点。没有收据不算病（旧运行时没记）；读不出与残骸只人工处置
+  {
+    const file = installedSurfacePath({ chain: "claude", home });
+    const r = inspectInstalledSurface({ file, now });
+    const residueText = r.residues.length === 0 ? "" : "；残骸 " + r.residues.length + " 处：" + r.residues.slice(0, 3).map((x) => x.path + "（" + x.detail + "）").join("、") + (r.residues.length > 3 ? "…" : "");
+    const entry = r.state === "valid" ? r.doc.chains.claude : null;
+    const body = r.state === "absent" ? "没有（旧运行时没记；装含收据代码的版本后出现）"
+      : r.state === "valid" ? (entry ? "有：版本 " + entry.version + "，" + entry.artifacts.length + " 个制品，" + entry.at : "有，但没有 Claude 链的条目")
+      : "读不出（" + r.why + "）—— 畸形不自动删，请人工核对 " + file;
+    add("installed_surface", "⑪ 安装收据", r.state !== "unreadable" && r.residues.length === 0, body + residueText, null);
   }
 
   // ── 汇总：任一 false → blocked；无 false 有 null → incomplete；全 true → ready

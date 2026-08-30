@@ -37,6 +37,9 @@ import { finalizeClaudeDialogueTurn } from "./interaction-policy-store.mjs";
 import { DIALOGUE_POLICY_ID, DIALOGUE_TURN_STATUS } from "./interaction-policy.mjs";
 import { gateBlocks } from "./maintenance-gate-core.mjs";
 
+// 维护门（issue #81）：**启动期先看一次门**，在读 claim / 记 failed / 取任何锁之前；门在或读不出就无输出退出（run、claim、锁都留着，交陈旧检测）。循环里每轮再复核。
+if (gateBlocks().blocked) process.exit(0);
+
 const SELF = moduleRoot(import.meta.url, "..");
 
 const key = process.argv[2];

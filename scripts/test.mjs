@@ -20402,13 +20402,28 @@ test("维护门（issue #81 · PR A）：三态读门只认 ENOENT 为没门，�
   const made = createGate({ file: gateFile, reason: "  换锁协议 \u001b[31m" + "长".repeat(100) });
   assert.equal(made.ok, true, JSON.stringify(made));
   const active = readGate({ file: gateFile });
-  assert.deepEqual([active.state, active.payload.reason.includes("\u001b"), Array.from(active.payload.reason).length <= GATE_REASON_MAX_CODEPOINTS + 1, active.payload.reason.startsWith("换锁协议")], ["active", false, true, true], JSON.stringify(active));
+  assert.deepEqual([active.state, active.payload.reason.includes("\u001b"), Array.from(active.payload.reason).length, active.payload.reason.startsWith("换锁协议"), active.payload.reason.endsWith("…")], ["active", false, GATE_REASON_MAX_CODEPOINTS, true, true], "reason 含省略号一共不超过 80 码点：" + JSON.stringify(active));
   assert.equal(normalizeGateReason(""), "未说明");
   assert.equal(createGate({ file: gateFile, reason: "再开" }).reason, "gate_exists", "门不覆盖");
   const blocked = gateBlocks({ file: gateFile });
   assert.deepEqual([blocked.blocked, blocked.state, /^桥维护中（换锁协议.*，已 \d+ 分钟）$/u.test(blocked.text), blocked.gate.token], [true, "active", true, made.token], JSON.stringify(blocked));
   assert.deepEqual([removeGate({ file: gateFile, token: "12345678-1234-1234-1234-123456789abc" }).reason, fs.lstatSync(gateFile).isSymbolicLink()], ["not_owner", true], "别人的门不撤");
-  assert.deepEqual([removeGate({ file: gateFile, token: made.token }).removed, readGate({ file: gateFile }).state, removeGate({ file: gateFile, token: made.token }).reason], [true, "absent", "absent"]);
+  // 归属转换锁：.txn 在场 → 建 / 撤都 gate_busy 不动；残骸（超过 60 秒）→ gate_txn_residue；段结束 .txn 释放
+  fs.symlinkSync(JSON.stringify({ pid: 1, at: "2026-08-30T00:00:00.000Z", token: "other" }), gateFile + ".txn");
+  assert.deepEqual([removeGate({ file: gateFile, token: made.token }).reason, createGate({ file: gateFile, reason: "x" }).reason, readGate({ file: gateFile }).state], ["gate_busy", "gate_busy", "active"], "转换段被占：什么都不动");
+  fs.lutimesSync(gateFile + ".txn", new Date(Date.now() - 2 * 60 * 1000), new Date(Date.now() - 2 * 60 * 1000));
+  assert.deepEqual([removeGate({ file: gateFile, token: made.token }).reason, fs.lstatSync(gateFile + ".txn").isSymbolicLink()], ["gate_txn_residue", true], "残骸不自愈、不删");
+  fs.unlinkSync(gateFile + ".txn");
+  assert.deepEqual([removeGate({ file: gateFile, token: made.token }).removed, readGate({ file: gateFile }).state, removeGate({ file: gateFile, token: made.token }).reason, fs.existsSync(gateFile + ".txn")], [true, "absent", "absent", false], "撤门在段内重读后删，段结束 .txn 释放");
+  // 段内重读（评审探针：读 token → unlink 两步之间旧门被撤、新门建起）：在 unlink 之前把门换成别人的 → 不删新门
+  assert.equal(createGate({ file: gateFile, reason: "旧门" }).ok, true);
+  const oldToken = readGate({ file: gateFile }).payload.token;
+  const originalUnlinkForGate = fs.unlinkSync; let innerCreate = null;
+  fs.unlinkSync = (target, ...args) => { if (innerCreate === null && path.resolve(String(target)) === gateFile) { originalUnlinkForGate(gateFile); innerCreate = createGate({ file: gateFile, reason: "新门" }); } return originalUnlinkForGate(target, ...args); };
+  let swappedRemove;
+  try { swappedRemove = removeGate({ file: gateFile, token: oldToken }); }
+  finally { fs.unlinkSync = originalUnlinkForGate; }
+  assert.deepEqual([innerCreate?.reason, readGate({ file: gateFile }).state, swappedRemove.ok], ["gate_busy", "absent", true], "新门要建就得先拿 .txn —— 段内建不起来、也就删不到别人的：" + JSON.stringify({ innerCreate, swappedRemove }));
   // ── 各类入口的受控退出（注入 out / exit）
   const outs = []; const exits = []; const fake = { out: { write: (t) => outs.push(t) }, exit: (c) => exits.push(c) };
   assert.equal(createGate({ file: gateFile, reason: "升级" }).ok, true);
@@ -20445,9 +20460,17 @@ test("维护门（issue #81 · PR A）：三态读门只认 ENOENT 为没门，�
   assert.deepEqual([init.status, init.stdout], [0, ""]);
   const localTurn = runEntry("inbound-hook.mjs", { input: JSON.stringify({ session_id: "s1", cwd: local, prompt: "本地回合" }) });
   assert.deepEqual([localTurn.status, localTurn.stdout], [0, ""], "本地回合无输出放行");
+  // 模板读不出（沙箱里没有链模板）→ 分不清是谁的回合，一律当本链回合挡；且看门前**不写日志**
   const ailyTurn = runEntry("inbound-hook.mjs", { input: JSON.stringify({ session_id: "s1", cwd: local, prompt: "飞书正文" }), extra: { AILY_CLI_CALLER_AGENT_UID: "agent_x", AILY_CLI_SESSION_ID: "aily_s", AILY_CLI_RUN_ID: "run_1" } });
+  assert.equal(fs.existsSync(path.join(local, ".claude", "feishu-bridge", "inbound-hook.log")), false, "看门前不写、不轮转日志");
   const ailyDecision = JSON.parse(ailyTurn.stdout);
   assert.deepEqual([ailyTurn.status, ailyDecision.decision, /^桥维护中（锁，已 \d+ 分钟）：这条消息没有处理，请稍后重发$/u.test(ailyDecision.reason), Object.keys(ailyDecision).sort().join(",")], [0, "block", true, "decision,reason"], "Aily 回合硬阻断：" + ailyTurn.stdout + ailyTurn.stderr);
+  // 模板可读、caller 是别的 Aily agent → 不是我们的回合，无输出放行；caller 是本链 agent → 挡
+  const gateTemplate = path.join(local, "chain-template.json"); fs.writeFileSync(gateTemplate, JSON.stringify(TPL));
+  const foreign = runEntry("inbound-hook.mjs", { input: JSON.stringify({ session_id: "s1", cwd: local, prompt: "别家" }), extra: { FEISHU_BRIDGE_CHAIN_TEMPLATE: gateTemplate, AILY_CLI_CALLER_AGENT_UID: "foreign-agent", AILY_CLI_SESSION_ID: "aily_s", AILY_CLI_RUN_ID: "run_1" } });
+  assert.deepEqual([foreign.status, foreign.stdout], [0, ""], "别的 Aily agent 的回合不挡：" + foreign.stderr);
+  const ours = runEntry("inbound-hook.mjs", { input: JSON.stringify({ session_id: "s1", cwd: local, prompt: "本链" }), extra: { FEISHU_BRIDGE_CHAIN_TEMPLATE: gateTemplate, AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_s", AILY_CLI_RUN_ID: "run_1" } });
+  assert.deepEqual([ours.status, JSON.parse(ours.stdout).decision], [0, "block"], "本链 agent 的回合挡：" + ours.stdout + ours.stderr);
   for (const script of ["aily-inbound.mjs", "inbound.mjs"]) {
     const r = runEntry(script, { extra: { AILY_CLI_CALLER_AGENT_UID: "agent_x", AILY_CLI_SESSION_ID: "aily_s", AILY_CLI_RUN_ID: "run_1" } });
     assert.deepEqual([r.status, /^桥维护中（锁，已 \d+ 分钟）：这条消息没有处理，请稍后重发\n$/u.test(r.stdout)], [0, true], script + "：" + r.stdout + r.stderr);
@@ -20459,10 +20482,18 @@ test("维护门（issue #81 · PR A）：三态读门只认 ENOENT 为没门，�
   assert.deepEqual([rotate.status, /^桥维护中（锁，已 \d+ 分钟）\n$/u.test(rotate.stdout)], [2, true], "控制命令 --apply 退 2：" + rotate.stdout + rotate.stderr);
   const rotatePreview = spawnSync(process.execPath, [path.resolve("scripts", "feishu-rotate.mjs")], { encoding: "utf-8", env, cwd: local });
   assert.doesNotMatch(rotatePreview.stdout, /^桥维护中/u, "预览不看门（不改状态）");
+  // 守望者启动期先看门：在读 claim / 记 failed 之前退，什么都不写
+  const watcherRuns = path.join(local, "wproj", ".runtime-data", "inbound", "runs"); fs.mkdirSync(watcherRuns, { recursive: true });
+  const watcher = spawnSync(process.execPath, [path.resolve("scripts", "watch-and-publish.mjs"), "a".repeat(64), path.join(local, "wproj")], { encoding: "utf-8", env, timeout: 20_000 });
+  assert.deepEqual([watcher.status, watcher.stdout, fs.readdirSync(path.join(local, "wproj", ".runtime-data", "inbound")).sort()], [0, "", ["runs"]], "守望者启动期退、不留 failed：" + watcher.stderr);
+  // repair-run-claim：核心与 CLI 都看门（绕过包装直接调也挡）
+  withGate(() => assert.deepEqual(repairRunClaims({ runsDir: watcherRuns, all: true, apply: true }).reason, "maintenance", "核心自己看门"));
+  const repairCli = spawnSync(process.execPath, [path.resolve("scripts", "repair-run-claim.mjs"), "--project", path.join(local, "wproj"), "--all", "--apply"], { encoding: "utf-8", env });
+  assert.deepEqual([repairCli.status, /^桥维护中/u.test(repairCli.stdout)], [2, true], "CLI --apply 退 2：" + repairCli.stdout + repairCli.stderr);
   // ── doctor ⑩ 与状态页文案：三态各说各的
   withGate(() => {
     const on = runDoctor({ home: local }).checks.find((c) => c.id === "maintenance_gate");
-    assert.deepEqual([on.ok, /^开着：锁（已 \d+ 分钟，token [0-9a-f]{8}）/u.test(on.detail), on.next], [false, true, "node scripts/maintenance-gate.mjs --status"], JSON.stringify(on));
+    assert.deepEqual([on.ok, /^开着：锁（已 \d+ 分钟，token [0-9a-f]{8}）/u.test(on.detail), on.next], [false, true, null], "不指向不存在的命令：" + JSON.stringify(on));
     assert.match(maintenanceGateText(readGate()), /^开着：锁（已 \d+ 分钟）—— 入站 \/ 出站 \/ 控制命令都在等它关$/u);
   });
   assert.equal(removeGate({ file: gateFile, token: readGate({ file: gateFile }).payload.token }).removed, true);

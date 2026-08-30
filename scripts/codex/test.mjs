@@ -9335,6 +9335,8 @@ test("维护门（issue #81 · PR A）：Codex 链的 hook / 入站 / 排空 / �
   const aily = run("prompt-hook.mjs", { input: JSON.stringify({ session_id: THREAD_A, turn_id: "t1", cwd: "/work", prompt: "飞书正文" }), extra: { AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "s", AILY_CLI_RUN_ID: "r" } });
   const decision = JSON.parse(aily.stdout);
   assert.deepEqual([aily.status, decision.decision, /^桥维护中（换锁协议，已 \d+ 分钟）：这条消息没有处理，请稍后重发$/u.test(decision.reason), Object.keys(decision).sort().join(",")], [0, "block", true, "decision,reason"], "Aily 回合硬阻断（顶层形状，Codex 宿主实测认这个）：" + aily.stdout + aily.stderr);
+  const foreign = run("prompt-hook.mjs", { input: JSON.stringify({ session_id: THREAD_A, turn_id: "t1", cwd: "/work", prompt: "别家" }), extra: { AILY_CLI_CALLER_AGENT_UID: "foreign-agent", AILY_CLI_SESSION_ID: "s", AILY_CLI_RUN_ID: "r" } });
+  assert.deepEqual([foreign.status, foreign.stdout], [0, ""], "别的 Aily agent 的回合不挡：" + foreign.stderr);
   const localTurn = run("prompt-hook.mjs", { input: JSON.stringify({ session_id: THREAD_A, turn_id: "t2", cwd: "/work", prompt: "$feishu-bind" }) });
   assert.deepEqual([localTurn.status, localTurn.stdout], [0, ""], "本地回合无输出放行（不注入、不留状态）：" + localTurn.stderr);
   const stop = run("stop-hook.mjs", { input: JSON.stringify({ session_id: THREAD_A, turn_id: "t1", cwd: "/work", last_assistant_message: "x" }) });

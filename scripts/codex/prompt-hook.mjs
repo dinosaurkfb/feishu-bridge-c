@@ -271,9 +271,16 @@ function readPayload() {
 async function main() {
   const payload = readPayload() ?? {};
   const isRoutedCodexRun = process.env.FEISHU_BRIDGE_ROLE === "codex-run";
-  // 维护门（issue #81）：Aily 回合用宿主的顶层 decision:block 硬阻断（Codex 已实测），其它回合无输出放行
+  // 维护门（issue #81）：在任何写之前看门。本链运输 agent 的 Aily 回合用宿主的顶层 decision:block 硬阻断
+  // （Codex 已实测）；别的 Aily agent 的回合不是我们的，放行；模板读不出一律当本链回合挡；其它回合无输出放行。
   const gate = gateBlocks();
-  if (gate.blocked) exitForGate(!isRoutedCodexRun && isAilyInvocation() ? "hook_block" : "hook_silent", gate);
+  const ailyTurn = !isRoutedCodexRun && isAilyInvocation();
+  if (gate.blocked && !ailyTurn) process.exit(0);
+  if (gate.blocked) {
+    const tpl = loadCodexTemplate();
+    if (tpl.ok && process.env.AILY_CLI_CALLER_AGENT_UID !== tpl.template.agent_uid) process.exit(0);
+    exitForGate("hook_block", gate);
+  }
   // M5Codex 的飞书回合也是 codex-local，会继承本机 hooks；它属于入站数据面，必须用
   // developer 级上下文盖过历史回合里可能残留的控制面指令。只给配置中的唯一 agent 注入，
   // 其他 Aily agent fail-closed。确定性 sender/session/mention 校验仍全部留在 inbound.mjs。

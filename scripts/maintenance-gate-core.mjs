@@ -25,22 +25,27 @@ export const GATE_REASON_MAX_CODEPOINTS = 80;
 const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const GATE_KEYS = ["at", "pid", "reason", "schema_version", "token"].join(",");
 
-/** 真实用户 home：passwd 里的那一份，不跟会话 HOME 走；取不到才退回 os.homedir()。 */
+/**
+ * 真实用户 home：passwd 里的那一份，不跟会话 HOME 走。**取不到就是 null**（不退回 os.homedir()：
+ * 那会把"权威门路径说不清"折成"去会话 HOME 读门"—— fail-open；说不清要投影成 unreadable 并阻断）。
+ */
 export function realUserHome() {
-  try { const h = os.userInfo().homedir; if (typeof h === "string" && h.length > 0) return h; } catch { /* 下面兜底 */ }
-  return os.homedir();
+  try { const h = os.userInfo().homedir; if (typeof h === "string" && path.isAbsolute(h)) return h; } catch { /* 说不清 */ }
+  return null;
 }
 
-/** 门的路径：测试隔离点优先，否则真实 home 下的固定位置。 */
+/** 门的路径：测试隔离点优先，否则真实 home 下的固定位置；真实 home 说不清 → null（readGate 报 unreadable）。 */
 export function maintenanceGatePath(env = process.env) {
   const override = env[MAINTENANCE_GATE_ENV];
-  return typeof override === "string" && override.length > 0 ? override : path.join(realUserHome(), ".claude", "feishu-bridge", "maintenance.gate");
+  if (typeof override === "string" && override.length > 0) return override;
+  const home = realUserHome();
+  return home === null ? null : path.join(home, ".claude", "feishu-bridge", "maintenance.gate");
 }
 
-/** reason 的受控形状：displaySafe 后按码点截到上限（存进门里的就是这份）。 */
+/** reason 的受控形状：displaySafe 后按码点截到上限（含省略号一共不超过 GATE_REASON_MAX_CODEPOINTS；存进门里的就是这份）。 */
 export function normalizeGateReason(reason) {
   const cps = Array.from(displaySafe(String(reason ?? "").trim()));
-  const cut = cps.length > GATE_REASON_MAX_CODEPOINTS ? cps.slice(0, GATE_REASON_MAX_CODEPOINTS).join("") + "…" : cps.join("");
+  const cut = cps.length > GATE_REASON_MAX_CODEPOINTS ? cps.slice(0, GATE_REASON_MAX_CODEPOINTS - 1).join("") + "…" : cps.join("");
   return cut.length > 0 ? cut : "未说明";
 }
 
@@ -53,7 +58,7 @@ export function gatePayloadProblem(doc) {
   if (!Number.isInteger(doc.pid) || doc.pid <= 0) return "pid 不是正整数";
   if (!isCanonicalIso(doc.at)) return "at 不是规范时间";
   if (typeof doc.reason !== "string" || doc.reason.length === 0) return "reason 缺失";
-  if (Array.from(doc.reason).length > GATE_REASON_MAX_CODEPOINTS + 1) return "reason 超长";
+  if (Array.from(doc.reason).length > GATE_REASON_MAX_CODEPOINTS) return "reason 超长";
   if (doc.reason !== normalizeGateReason(doc.reason)) return "reason 含未净化字符";
   return null;
 }
@@ -63,6 +68,7 @@ export function gatePayloadProblem(doc) {
  * @returns {{ state: "absent" } | { state: "active", payload: object, ageMs: number } | { state: "unreadable", why: string }}
  */
 export function readGate({ file = maintenanceGatePath(), now = Date.now() } = {}) {
+  if (typeof file !== "string" || file.length === 0) return { state: "unreadable", why: "真实用户 home 说不清，门的位置无从确定" };
   let st;
   try { st = fs.lstatSync(file); }
   catch (err) {
@@ -117,22 +123,52 @@ export function exitForGate(kind, g, { out = process.stdout, exit = (code) => pr
   return true;
 }
 
-/** 建门：symlink 原语，路径上有任何东西都 EEXIST（不覆盖）。返回 { ok, token } 或 { ok:false, reason }。 */
+/** 归属转换锁只持有几毫秒；超过这个年龄的 .txn 就是残骸（持有者崩在段里），fail-closed 交人工。 */
+export const GATE_TXN_STALE_MS = 60 * 1000;
+/**
+ * 门的**归属转换段**（建 / 撤都在里面）：`<门>.txn` symlink 锁，与发布锁同一原语。
+ * 没有它，撤门是"读 token → 按路径 unlink"两步：中间旧门被撤、别的实例建了新门，旧撤门者会删掉新门（评审探针）。
+ * 段内重读再动；.txn 在场 → gate_busy（不等），超过 GATE_TXN_STALE_MS → gate_txn_residue（不自愈，人工处置）。
+ */
+function withGateTxn(file, fn) {
+  const txn = file + ".txn";
+  const token = crypto.randomUUID();
+  try { fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token }), txn); }
+  catch (err) {
+    if (err?.code !== "EEXIST") return { ok: false, reason: "io_error", why: "归属转换锁建不出：" + String(err?.code ?? err?.message ?? err) };
+    let st = null;
+    try { st = fs.lstatSync(txn); } catch { /* 刚被释放 */ }
+    if (st !== null && Date.now() - st.mtimeMs > GATE_TXN_STALE_MS) return { ok: false, reason: "gate_txn_residue", why: "归属转换锁残骸（持有者崩在段里）：" + txn + "，人工核对后删除" };
+    return { ok: false, reason: "gate_busy", why: "另一次建门 / 撤门正在进行" };
+  }
+  try { return fn(); }
+  finally {
+    try { const cur = JSON.parse(fs.readlinkSync(txn)); if (cur?.token === token) fs.unlinkSync(txn); } catch { /* 已不是我的 / 已不在 */ }
+  }
+}
+
+/** 建门（归属转换段内）：symlink 原语，路径上有任何东西都 EEXIST（不覆盖）。返回 { ok, token } 或 { ok:false, reason }。 */
 export function createGate({ file = maintenanceGatePath(), reason, token = crypto.randomUUID(), pid = process.pid, now = Date.now() } = {}) {
+  if (typeof file !== "string" || file.length === 0) return { ok: false, reason: "gate_path_unknown", why: "真实用户 home 说不清" };
   const payload = { schema_version: GATE_SCHEMA_VERSION, pid, at: new Date(now).toISOString(), token, reason: normalizeGateReason(reason) };
   const problem = gatePayloadProblem(payload);
   if (problem !== null) return { ok: false, reason: "payload_shape", why: problem };
-  try { fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); fs.symlinkSync(JSON.stringify(payload), file); }
-  catch (err) { return err?.code === "EEXIST" ? { ok: false, reason: "gate_exists" } : { ok: false, reason: "io_error", why: String(err?.code ?? err?.message ?? err) }; }
-  return { ok: true, token, payload };
+  return withGateTxn(file, () => {
+    try { fs.symlinkSync(JSON.stringify(payload), file); }
+    catch (err) { return err?.code === "EEXIST" ? { ok: false, reason: "gate_exists" } : { ok: false, reason: "io_error", why: String(err?.code ?? err?.message ?? err) }; }
+    return { ok: true, token, payload };
+  });
 }
 
-/** 撤门：只撤 token 一致的门（token-CAS）；unreadable / 别人的门 / 缺席都不动，如实返回。 */
+/** 撤门（归属转换段内，段内重读）：只撤 token 一致的门；unreadable / 别人的门 / 缺席都不动，如实返回。 */
 export function removeGate({ file = maintenanceGatePath(), token } = {}) {
-  const g = readGate({ file });
-  if (g.state === "absent") return { ok: true, removed: false, reason: "absent" };
-  if (g.state === "unreadable") return { ok: false, removed: false, reason: "unreadable", why: g.why };
-  if (g.payload.token !== token) return { ok: false, removed: false, reason: "not_owner" };
-  try { fs.unlinkSync(file); } catch (err) { return err?.code === "ENOENT" ? { ok: true, removed: false, reason: "absent" } : { ok: false, removed: false, reason: "io_error", why: String(err?.code ?? err?.message ?? err) }; }
-  return { ok: true, removed: true, reason: null };
+  if (typeof file !== "string" || file.length === 0) return { ok: false, removed: false, reason: "gate_path_unknown", why: "真实用户 home 说不清" };
+  return withGateTxn(file, () => {
+    const g = readGate({ file });
+    if (g.state === "absent") return { ok: true, removed: false, reason: "absent" };
+    if (g.state === "unreadable") return { ok: false, removed: false, reason: "unreadable", why: g.why };
+    if (g.payload.token !== token) return { ok: false, removed: false, reason: "not_owner" };
+    try { fs.unlinkSync(file); } catch (err) { return err?.code === "ENOENT" ? { ok: true, removed: false, reason: "absent" } : { ok: false, removed: false, reason: "io_error", why: String(err?.code ?? err?.message ?? err) }; }
+    return { ok: true, removed: true, reason: null };
+  });
 }

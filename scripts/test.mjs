@@ -20906,7 +20906,8 @@ test("维护门 · PR C：预检拒绝五种漂移；进门两阶段记账、桩
     fs.writeFileSync(settingsFile, JSON.stringify(withAlias, null, 2) + "\n");
     const r1b = enterMaintenance(ctx, { reason: "x", apply: true });
     assert.deepEqual([r1b.ok, ids(r1b), /解析后落在运行时之下/u.test(r1b.items?.[0]?.why ?? ""), (r1b.items?.[0]?.why ?? "").includes("unrelated")], [false, "startup_source_unverified" === r1b.reason ? ["claude:hooks"] : ids(r1b), true, false], "别名 symlink 指向版本目录的 hook 必须拒，无关 hook 不点名：" + JSON.stringify(r1b.items ?? r1b));
-    for (const [label, cmd] of [["尾分号", "node " + path.join(aliasDir, "scripts", "stop-hook.mjs") + ";"], ["sh -c 内联", "sh -c 'node " + path.join(aliasDir, "scripts", "stop-hook.mjs") + "'"], ["变量路径", "node \"$OLD/scripts/stop-hook.mjs\""], ["命令替换", "node $(cat /tmp/x)"]]) {
+    const aliasHook = path.join(aliasDir, "scripts", "stop-hook.mjs");
+    for (const [label, cmd] of [["尾分号", "node " + aliasHook + ";"], ["sh -c 内联", "sh -c 'node " + aliasHook + "'"], ["bash -lc 内联", "bash -lc 'node " + aliasHook + "'"], ["bash --command", "bash --command 'node " + aliasHook + "'"], ["--import=", "node --import=" + aliasHook + " -e 'x'"], ["-r 路径", "node -r " + aliasHook + " /usr/bin/true"], ["NODE_OPTIONS", "NODE_OPTIONS=--require=" + aliasHook + " node /usr/bin/true"], ["node -e 内联", "node -e 'import(\"/x\")'"], ["python -c", "python3 -c 'print(1)'"], ["相对 -r", "node -r ./x.mjs /usr/bin/true"], ["相对路径", "node ./x.mjs"], ["变量路径", "node \"$OLD/scripts/stop-hook.mjs\""], ["命令替换", "node $(cat /tmp/x)"], ["exec", "exec /usr/bin/true"]]) {
       const doc = JSON.parse(settingsBytes); doc.hooks.Stop.push({ hooks: [{ type: "command", command: cmd, timeout: 5 }] });
       fs.writeFileSync(settingsFile, JSON.stringify(doc, null, 2) + "\n");
       const r = enterMaintenance(ctx, { reason: "x", apply: true });
@@ -20952,8 +20953,8 @@ test("维护门 · PR C：预检拒绝五种漂移；进门两阶段记账、桩
     const origClaude = fs.readlinkSync(path.join(claudeRoot, "current")), origCodex = fs.readlinkSync(path.join(codexRoot, "current"));
     // 别名进程（命令行里没有运行时根，路径 realpath 后落在旧版本目录）也要被盘点认出来
     psRows.push({ pid: 4242, ppid: 1, command: node + " " + path.join(claudeRoot, "current", "scripts", "watch-and-publish.mjs") + " --x" }, { pid: 4243, ppid: 4242, command: "claude -p" }, { pid: process.pid, ppid: 1, command: "node test" });
-    const aliasProc = listBridgeProcesses({ roots: [path.join(claudeRoot, "current", "scripts")], ps: () => ({ ok: true, stdout: "PID PPID COMMAND\n7777 1 node " + path.join(aliasDir, "scripts", "stop-hook.mjs") + "\n" }), selfPid: 1 });
-    assert.deepEqual(aliasProc.processes.map((p) => p.pid), [7777], "别名进程要被认出：" + JSON.stringify(aliasProc));
+    const aliasProc = listBridgeProcesses({ roots: [path.join(claudeRoot, "current", "scripts")], ps: () => ({ ok: true, stdout: "PID PPID COMMAND\n7777 1 node " + path.join(aliasDir, "scripts", "stop-hook.mjs") + "\n7778 1 bash -lc node " + path.join(aliasDir, "scripts", "worker.mjs") + "\n7779 1 node --import=" + path.join(aliasDir, "scripts", "x.mjs") + " -e x\n7780 1 node /elsewhere/y.mjs\n" }), selfPid: 1 });
+    assert.deepEqual(aliasProc.processes.map((p) => p.pid), [7777, 7778, 7779], "别名进程（含 bash -lc、--import=）要被认出：" + JSON.stringify(aliasProc));
     let tick = 0; let nested = null;
     const psOnce = () => { const r = fakePs(); if (tick++ === 0) { nested = exitMaintenance(ctx, { apply: true }); return r; } psRows.length = 0; return fakePs(); };
     const entered = enterMaintenance({ ...ctx, ps: psOnce }, { reason: "改锁协议：symlink 协议 v2", waitMs: 60000, apply: true });
@@ -21128,6 +21129,15 @@ test("维护门 · PR C 单元：journal 三态与两阶段、active 只许一�
   const refs = analyzeCommandRefs("node /x/a.mjs; sh -c 'node /y/b.mjs && echo ok' $HOME/c.mjs ~/d.mjs", { home: "/h" });
   assert.deepEqual([refs.paths.map((p) => p.expanded), refs.unsafe], [["/x/a.mjs", "/bin/sh".startsWith("/") ? "/y/b.mjs" : null, "/h/c.mjs", "/h/d.mjs"].filter((x) => x !== null), []], JSON.stringify(refs));
   assert.deepEqual([analyzeCommandRefs("node $OLD/x.mjs", { home: "/h" }).unsafe, analyzeCommandRefs("node `which x`", { home: "/h" }).unsafe.length > 0, analyzeCommandRefs("eval x", { home: "/h" }).unsafe, analyzeCommandRefs("bash -c", { home: "/h" }).unsafe.length > 0], [["变量 $OLD/x.mjs"], true, ["eval"], true]);
+  assert.deepEqual([
+    analyzeCommandRefs("bash -lc 'node /y/b.mjs'", { home: "/h" }).paths.map((p) => p.expanded),
+    analyzeCommandRefs("zsh -fic 'node /z/c.mjs'", { home: "/h" }).paths.map((p) => p.expanded),
+    analyzeCommandRefs("node --import=/i/m.mjs /s.mjs", { home: "/h" }).paths.map((p) => p.expanded),
+    analyzeCommandRefs("NODE_OPTIONS=--require=/n/o.mjs node /s.mjs", { home: "/h" }).paths.map((p) => p.expanded),
+    analyzeCommandRefs("node -e 'x'", { home: "/h" }).unsafe, analyzeCommandRefs("node --eval=x", { home: "/h" }).unsafe, analyzeCommandRefs("python3 -c 'x'", { home: "/h" }).unsafe,
+    analyzeCommandRefs("node -r ./rel.mjs /s.mjs", { home: "/h" }).unsafe.length > 0, analyzeCommandRefs("node --import=dotenv /s.mjs", { home: "/h" }).unsafe, analyzeCommandRefs("node -r /abs.mjs /s.mjs", { home: "/h" }).unsafe,
+    analyzeCommandRefs("bash '/Users/x/.claude/hooks/herdr-agent-state.sh' session", { home: "/h" }).unsafe,
+  ], [["/y/b.mjs"], ["/z/c.mjs"], ["/i/m.mjs", "/s.mjs"], ["/n/o.mjs", "/s.mjs"], ["node 内联代码（-e）"], ["node 内联代码（--eval=x）"], ["python3 内联代码（-c）"], true, ["node --import=dotenv 不是绝对路径"], [], []], "封闭的执行形状");
   const aliasRoot = path.join(base, "alias-root"); fs.mkdirSync(path.join(aliasRoot, "scripts"), { recursive: true }); fs.writeFileSync(path.join(aliasRoot, "scripts", "x.mjs"), ""); fs.symlinkSync(aliasRoot, path.join(base, "alias-link"));
   const hit = refsUnderRoots(analyzeCommandRefs("node " + path.join(base, "alias-link", "scripts", "x.mjs") + ";", { home: "/h" }), [fs.realpathSync(aliasRoot)]);
   assert.deepEqual([hit?.raw, hit?.real], [path.join(base, "alias-link", "scripts", "x.mjs"), fs.realpathSync(path.join(aliasRoot, "scripts", "x.mjs"))], "尾分号剥掉、别名 realpath 命中");

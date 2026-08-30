@@ -73,7 +73,7 @@ function shapeProblemFor(s) {
     if (!(isObj(s.before) && keysOf(s.before) === "phase,plist" && TIMER_PHASES.includes(s.before.phase) && typeof s.before.plist === "string" && path.isAbsolute(s.before.plist))) return "timer.before 形状不对";
     if (!timerState(s.intended_after)) return "timer.intended_after 形状不对";
     if (!(s.after === null || timerState(s.after))) return "timer.after 形状不对";
-    if (s.before.phase === "loaded" && s.backup === null) return "timer 原来 loaded 必须有 plist 备份";
+    if (isObj(s.before) && s.before.phase === "loaded" && s.backup === null) return "timer 原来 loaded 必须有 plist 备份";
     return null;
   }
   if (kind === "current") {

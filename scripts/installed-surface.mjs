@@ -149,7 +149,7 @@ export function readInstalledSurface({ file } = {}) {
 export function withInstalledSurfaceLock(file, fn, { waitMs = 5000, staleMs = SURFACE_LOCK_STALE_MS, acquire = acquireLockUngated, release = releasePublishLock } = {}) {
   const lock = file + ".lock";
   const deadline = Date.now() + waitMs;
-  const residues = []; // 取锁 / 释放两个阶段的残骸都收在这里：段内做的事算数，残骸点名路径交盘点
+  const residues = []; // 释放阶段（含提交段的 reap 锁）的残骸收在这里：段内做的事算数，残骸点名路径交盘点
   const withResidues = (r) => (residues.length === 0 ? r : { ...r, lockUncleared: residues[0], lockResidues: [...residues] });
   for (;;) {
     let st = null;
@@ -158,10 +158,12 @@ export function withInstalledSurfaceLock(file, fn, { waitMs = 5000, staleMs = SU
     if (st !== null && !st.isSymbolicLink()) return withResidues({ ok: false, reason: "surface_lock_residue", why: "锁位置上不是本协议的 symlink（保留现场，交人工）", path: lock });
     // 取锁阶段的 I/O 异常同样受控（评审探针：陈旧回收隔离后 rmSync 抛 EIO 穿出来）
     let got;
-    try { got = acquire(lock, { staleMs, reapUnrecognized: false, acceptReapedResidue: true }); } // 收据锁显式接受"取到但旧实例删不掉"，残骸由这里消费
+    // 收据锁也走原语的默认 fail-closed：陈旧回收隔离后删不掉（reaped_uncleared）就不取锁、不写 —— 残骸 .reaped-<uuid> 由盘点点名。
+    // （symlink 原语上这一步实际到不了：rename 成功而 unlink 失败要目录权限中途变化；不为到不了的路径留一个没人消费的选项。）
+    try { got = acquire(lock, { staleMs, reapUnrecognized: false }); }
     catch (err) { return withResidues({ ok: false, reason: "io_error", why: "取锁阶段异常：" + errCode(err), path: lock }); }
-    if (got?.reapedUncleared && !residues.some((x) => x.path === got.reapedUncleared.path)) residues.push({ path: got.reapedUncleared.path, reason: "reaped_uncleared", error: got.reapedUncleared.error });
     if (got?.ok) break;
+    if (got?.reason === "reaped_uncleared") return withResidues({ ok: false, reason: "surface_lock_residue", why: "陈旧锁隔离后删不掉：" + String(got.error) + "（" + String(got.path) + "，只人工删）", path: String(got.path) });
     if (got?.reason === "lock_residue" || got?.reason === "reap_residue") return withResidues({ ok: false, reason: "surface_lock_residue", why: got.reason + "（保留现场，交人工）", path: lock });
     if (got?.reason !== "publisher_busy" && got?.reason !== "reap_busy") return withResidues({ ok: false, reason: "io_error", why: String(got?.reason) + (got?.error ? "：" + got.error : "") });
     if (Date.now() >= deadline) return withResidues({ ok: false, reason: "surface_busy" });
@@ -250,7 +252,7 @@ export function recordInstalledSurface({ chain, version, artifacts, scripts, fil
     return { ok: true, file, entry, ...carry };
   }, { waitMs, acquire: testHooks.acquire ?? acquireLockUngated, release: testHooks.release ?? releasePublishLock });
   if (!locked.ok) return locked;
-  // 取锁 / 提交 / 释放三处的残骸都要进最终结果：只返回 locked.run 会把它丢掉（评审探针）
+  // 提交 / 释放两处的残骸都要进最终结果：只返回 locked.run 会把它丢掉（评审探针）
   const all = [...(locked.run.lockResidues ?? (locked.run.lockUncleared ? [locked.run.lockUncleared] : [])), ...(locked.lockResidues ?? [])];
   return all.length === 0 ? locked.run : { ...locked.run, lockUncleared: all[0], lockResidues: all };
 }

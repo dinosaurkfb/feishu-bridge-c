@@ -20694,9 +20694,11 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   // 取锁阶段：抛错受控；陈旧回收隔离后删不掉（reapedUncleared）进最终结果与文案
   const acqThrew = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: [], file: surface, testHooks: { acquire: () => { throw Object.assign(new Error("EIO"), { code: "EIO" }); } } });
   assert.deepEqual([acqThrew.ok, acqThrew.reason, acqThrew.why, tmpCount()], [false, "io_error", "取锁阶段异常：EIO", 0], JSON.stringify(acqThrew));
+  // 原语默认 fail-closed 给出 reaped_uncleared 时：收据锁不取、不写，surface_lock_residue 点名隔离路径（symlink 原语上实际到不了，只验映射）
   const reapedPath = lockPath + ".reaped-" + crypto.randomUUID();
-  const acqResidue = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: ["doctor.mjs"], file: surface, testHooks: { acquire: (l, o) => ({ ...acquireLockUngated(l, o), reapedUncleared: { path: reapedPath, error: "EIO" } }) } });
-  assert.deepEqual([acqResidue.ok, acqResidue.lockUncleared, acqResidue.lockResidues?.length, receiptReport(acqResidue).failed, receiptReport(acqResidue).text.includes(reapedPath)], [true, { path: reapedPath, reason: "reaped_uncleared", error: "EIO" }, 1, true, true], JSON.stringify(acqResidue));
+  const bytesBeforeClosed = fs.readFileSync(surface);
+  const acqClosed = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: ["doctor.mjs"], file: surface, testHooks: { acquire: () => ({ ok: false, reason: "reaped_uncleared", path: reapedPath, error: "EIO" }) } });
+  assert.deepEqual([acqClosed.ok, acqClosed.reason, acqClosed.path, /EIO/u.test(acqClosed.why), fs.readFileSync(surface).equals(bytesBeforeClosed), tmpCount(), receiptReport(acqClosed).text.includes(reapedPath)], [false, "surface_lock_residue", reapedPath, true, true, 0, true], JSON.stringify(acqClosed));
   // 共用原语本身：陈旧目录锁隔离后删不掉 → 不裸抛，返回 ok + reapedUncleared 点名隔离路径
   const dirLock = path.join(base, "dir.lock"); fs.mkdirSync(path.join(dirLock, "sub"), { recursive: true }); fs.writeFileSync(path.join(dirLock, "sub", "f"), ""); fs.chmodSync(path.join(dirLock, "sub"), 0o500);
   const oldStamp = new Date(Date.now() - 3600 * 1000); fs.utimesSync(dirLock, oldStamp, oldStamp);
@@ -20716,10 +20718,7 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   if (raced.reapedUncleared) fs.chmodSync(path.join(raced.reapedUncleared.path, "sub"), 0o700);
   assert.deepEqual([raced.ok, raced.reason, typeof raced.reapedUncleared?.path], [false, "publisher_busy", "string"], "抢先：busy 也带残骸：" + JSON.stringify(raced));
   fs.unlinkSync(dirLock); fs.rmSync(raced.reapedUncleared.path, { recursive: true, force: true });
-  // 收据锁：busy + 残骸再重试成功 → 残骸只记一次
-  let calls = 0; const busyThenOk = (l, o) => { calls += 1; return calls === 1 ? { ok: false, reason: "publisher_busy", reapedUncleared: { path: reapedPath, error: "EIO" } } : { ...acquireLockUngated(l, o), reapedUncleared: { path: reapedPath, error: "EIO" } }; };
-  const retried = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: ["doctor.mjs"], file: surface, testHooks: { acquire: busyThenOk } });
-  assert.deepEqual([retried.ok, calls, retried.lockResidues?.length, retried.lockResidues?.[0]?.path], [true, 2, 1, reapedPath], JSON.stringify(retried));
+
   // 盘点封闭识别锁家族 + 目录读不出不折成"没有残骸" + 家族各自的处置文案
   const mk = (n) => { fs.writeFileSync(path.join(surfaceDir, n), ""); return path.join(surfaceDir, n); };
   const fam = [mk("installed-surface.json.lock.reaped-" + crypto.randomUUID()), mk("installed-surface.json.lock.reaped-junk"), mk("installed-surface.json.lock.reap.quarantine-" + crypto.randomUUID()), mk("installed-surface.json.lock.foo"), mk(".installed-surface.bad.tmp")];

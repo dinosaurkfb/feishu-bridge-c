@@ -54,8 +54,8 @@ export function gatePayloadProblem(doc) {
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return "不是对象";
   if (doc.schema_version !== GATE_SCHEMA_VERSION) return "schema_version 不认识";
   if (Object.keys(doc).sort().join(",") !== GATE_KEYS) return "字段集不对";
-  if (!UUID_SHAPE.test(String(doc.token))) return "token 形状不对";
-  if (!Number.isInteger(doc.pid) || doc.pid <= 0) return "pid 不是正整数";
+  if (typeof doc.token !== "string" || !UUID_SHAPE.test(doc.token)) return "token 形状不对";
+  if (!Number.isSafeInteger(doc.pid) || doc.pid <= 0) return "pid 不是正整数";
   if (!isCanonicalIso(doc.at)) return "at 不是规范时间";
   if (typeof doc.reason !== "string" || doc.reason.length === 0) return "reason 缺失";
   if (Array.from(doc.reason).length > GATE_REASON_MAX_CODEPOINTS) return "reason 超长";
@@ -63,17 +63,44 @@ export function gatePayloadProblem(doc) {
   return null;
 }
 
+/** 归属转换锁只持有几毫秒；超过这个年龄的 .txn 就是残骸（持有者崩在段里），fail-closed 交人工。 */
+export const GATE_TXN_STALE_MS = 60 * 1000;
+const TXN_KEYS = ["at", "pid", "token"].join(",");
 /**
- * 三态读门。
- * @returns {{ state: "absent" } | { state: "active", payload: object, ageMs: number } | { state: "unreadable", why: string }}
+ * 归属转换锁（`<门>.txn`）的三态：absent（只有 ENOENT）/ active（symlink、payload 受验、还新）/ unreadable（残骸、畸形、别的形状、I/O 错误）。
+ * 门的投影必须把它算进去：门缺席但 .txn 在场，不是"没门"。
  */
-export function readGate({ file = maintenanceGatePath(), now = Date.now() } = {}) {
+export function readGateTxn({ file, now = Date.now() }) {
+  const txn = file + ".txn";
+  let st;
+  try { st = fs.lstatSync(txn); }
+  catch (err) { return err?.code === "ENOENT" ? { state: "absent" } : { state: "unreadable", why: "归属转换锁 lstat 失败：" + String(err?.code ?? err?.message ?? err) }; }
+  if (!st.isSymbolicLink()) return { state: "unreadable", why: "归属转换锁位置上不是 symlink" };
+  let doc;
+  try { doc = JSON.parse(fs.readlinkSync(txn)); } catch { return { state: "unreadable", why: "归属转换锁 payload 读不出" }; }
+  if (doc === null || typeof doc !== "object" || Array.isArray(doc) || Object.keys(doc).sort().join(",") !== TXN_KEYS
+    || typeof doc.token !== "string" || !UUID_SHAPE.test(doc.token) || !Number.isSafeInteger(doc.pid) || doc.pid <= 0 || !isCanonicalIso(doc.at)) return { state: "unreadable", why: "归属转换锁 payload 形状不对" };
+  const ageMs = Math.max(0, now - st.mtimeMs);
+  if (ageMs > GATE_TXN_STALE_MS) return { state: "unreadable", why: "归属转换锁残骸（持有者崩在段里，已 " + Math.round(ageMs / 1000) + " 秒）：" + txn + "，人工核对后删除" };
+  return { state: "active", ageMs, payload: doc };
+}
+
+/**
+ * 三态读门（把归属转换锁算进投影）。
+ * @returns {{ state: "absent" } | { state: "active", payload: object, ageMs: number } | { state: "transitioning", why: string } | { state: "unreadable", why: string }}
+ *   transitioning = 门缺席但 .txn 还新（建 / 撤门正在进行）：写入口同样挡；unreadable 含 .txn 残骸 / 畸形。
+ */
+export function readGate({ file = maintenanceGatePath(), now = Date.now(), withinTxn = false } = {}) {
   if (typeof file !== "string" || file.length === 0) return { state: "unreadable", why: "真实用户 home 说不清，门的位置无从确定" };
   let st;
   try { st = fs.lstatSync(file); }
   catch (err) {
-    if (err?.code === "ENOENT") return { state: "absent" };
-    return { state: "unreadable", why: "lstat 失败：" + String(err?.code ?? err?.message ?? err) };
+    if (err?.code !== "ENOENT") return { state: "unreadable", why: "lstat 失败：" + String(err?.code ?? err?.message ?? err) };
+    if (withinTxn) return { state: "absent" }; // 段内自己持着 .txn，不把自己算成"正在切换"
+    const txn = readGateTxn({ file, now });
+    if (txn.state === "absent") return { state: "absent" };
+    if (txn.state === "active") return { state: "transitioning", why: "门正在建 / 撤（归属转换段进行中，已 " + Math.round(txn.ageMs) + " 毫秒）" };
+    return { state: "unreadable", why: txn.why };
   }
   if (!st.isSymbolicLink()) return { state: "unreadable", why: st.isDirectory() ? "门的位置上是目录" : "门的位置上不是 symlink" };
   let raw;
@@ -97,6 +124,7 @@ export function gateBlocks({ file = maintenanceGatePath(), now = Date.now() } = 
     const mins = Math.floor(g.ageMs / 60000);
     return { blocked: true, state: "active", text: "桥维护中（" + g.payload.reason + "，已 " + mins + " 分钟）", gate: { reason: g.payload.reason, at: g.payload.at, token: g.payload.token, ageMs: g.ageMs } };
   }
+  if (g.state === "transitioning") return { blocked: true, state: "transitioning", text: "维护门正在切换（建门或撤门进行中），按维护中处理，请稍后重试", gate: null };
   return { blocked: true, state: "unreadable", text: "维护门读不出（" + g.why + "），按维护中处理，请在本机跑 doctor", gate: null };
 }
 
@@ -123,8 +151,6 @@ export function exitForGate(kind, g, { out = process.stdout, exit = (code) => pr
   return true;
 }
 
-/** 归属转换锁只持有几毫秒；超过这个年龄的 .txn 就是残骸（持有者崩在段里），fail-closed 交人工。 */
-export const GATE_TXN_STALE_MS = 60 * 1000;
 /**
  * 门的**归属转换段**（建 / 撤都在里面）：`<门>.txn` symlink 锁，与发布锁同一原语。
  * 没有它，撤门是"读 token → 按路径 unlink"两步：中间旧门被撤、别的实例建了新门，旧撤门者会删掉新门（评审探针）。
@@ -136,15 +162,21 @@ function withGateTxn(file, fn) {
   try { fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token }), txn); }
   catch (err) {
     if (err?.code !== "EEXIST") return { ok: false, reason: "io_error", why: "归属转换锁建不出：" + String(err?.code ?? err?.message ?? err) };
-    let st = null;
-    try { st = fs.lstatSync(txn); } catch { /* 刚被释放 */ }
-    if (st !== null && Date.now() - st.mtimeMs > GATE_TXN_STALE_MS) return { ok: false, reason: "gate_txn_residue", why: "归属转换锁残骸（持有者崩在段里）：" + txn + "，人工核对后删除" };
+    const cur = readGateTxn({ file });
+    if (cur.state === "unreadable") return { ok: false, reason: "gate_txn_residue", why: cur.why };
     return { ok: false, reason: "gate_busy", why: "另一次建门 / 撤门正在进行" };
   }
-  try { return fn(); }
+  let result;
+  try { result = fn(); }
   finally {
-    try { const cur = JSON.parse(fs.readlinkSync(txn)); if (cur?.token === token) fs.unlinkSync(txn); } catch { /* 已不是我的 / 已不在 */ }
+    // 释放失败**不吞**：段内的动作已经完成（结果照样返回），但 .txn 留在原地会让后续建 / 撤门都 gate_busy、读门都 transitioning，
+    // 必须随结果带回（txnUncleared），让调用方与 doctor 点名，而不是"建门成功"完事。
+    let uncleared = null;
+    try { const cur = JSON.parse(fs.readlinkSync(txn)); if (cur?.token === token) fs.unlinkSync(txn); }
+    catch (err) { if (err?.code !== "ENOENT") uncleared = { path: txn, why: String(err?.code ?? err?.message ?? err) }; }
+    if (uncleared !== null && result && typeof result === "object") result = { ...result, txnUncleared: uncleared };
   }
+  return result;
 }
 
 /** 建门（归属转换段内）：symlink 原语，路径上有任何东西都 EEXIST（不覆盖）。返回 { ok, token } 或 { ok:false, reason }。 */
@@ -164,7 +196,7 @@ export function createGate({ file = maintenanceGatePath(), reason, token = crypt
 export function removeGate({ file = maintenanceGatePath(), token } = {}) {
   if (typeof file !== "string" || file.length === 0) return { ok: false, removed: false, reason: "gate_path_unknown", why: "真实用户 home 说不清" };
   return withGateTxn(file, () => {
-    const g = readGate({ file });
+    const g = readGate({ file, withinTxn: true });
     if (g.state === "absent") return { ok: true, removed: false, reason: "absent" };
     if (g.state === "unreadable") return { ok: false, removed: false, reason: "unreadable", why: g.why };
     if (g.payload.token !== token) return { ok: false, removed: false, reason: "not_owner" };

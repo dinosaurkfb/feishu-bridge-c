@@ -20396,7 +20396,7 @@ test("维护门（issue #81 · PR A）：三态读门只认 ENOENT 为没门，�
   fs.symlinkSync("not json", gateFile); assert.match(readGate({ file: gateFile }).why, /不是 JSON/u); fs.unlinkSync(gateFile);
   const good = { schema_version: "1.0", pid: 1, at: "2026-08-30T00:00:00.000Z", token: "12345678-1234-1234-1234-123456789abc", reason: "换锁协议" };
   assert.equal(gatePayloadProblem(good), null);
-  for (const [bad, why] of [[{ ...good, token: "bad" }, "token"], [{ ...good, pid: 0 }, "pid"], [{ ...good, at: "昨天" }, "at"], [{ ...good, reason: "" }, "reason 缺失"], [{ ...good, extra: 1 }, "字段集"], [{ ...good, schema_version: "2" }, "schema_version"], [{ ...good, reason: "a\u001bb" }, "未净化"], [{ ...good, reason: "长".repeat(90) }, "超长"]]) assert.match(gatePayloadProblem(bad) ?? "", new RegExp(why, "u"), JSON.stringify(bad));
+  for (const [bad, why] of [[{ ...good, token: "bad" }, "token"], [{ ...good, token: [good.token] }, "token"], [{ ...good, pid: 0 }, "pid"], [{ ...good, pid: 2 ** 53 }, "pid"], [{ ...good, at: "昨天" }, "at"], [{ ...good, reason: "" }, "reason 缺失"], [{ ...good, extra: 1 }, "字段集"], [{ ...good, schema_version: "2" }, "schema_version"], [{ ...good, reason: "a\u001bb" }, "未净化"], [{ ...good, reason: "长".repeat(90) }, "超长"]]) assert.match(gatePayloadProblem(bad) ?? "", new RegExp(why, "u"), JSON.stringify(bad));
   fs.symlinkSync(JSON.stringify({ ...good, token: "bad" }), gateFile); assert.match(readGate({ file: gateFile }).why, /token 形状不对/u); fs.unlinkSync(gateFile);
   // ── 建门 / 撤门：reason 净化 + 截断；不覆盖；token-CAS 撤
   const made = createGate({ file: gateFile, reason: "  换锁协议 \u001b[31m" + "长".repeat(100) });
@@ -20409,12 +20409,34 @@ test("维护门（issue #81 · PR A）：三态读门只认 ENOENT 为没门，�
   assert.deepEqual([blocked.blocked, blocked.state, /^桥维护中（换锁协议.*，已 \d+ 分钟）$/u.test(blocked.text), blocked.gate.token], [true, "active", true, made.token], JSON.stringify(blocked));
   assert.deepEqual([removeGate({ file: gateFile, token: "12345678-1234-1234-1234-123456789abc" }).reason, fs.lstatSync(gateFile).isSymbolicLink()], ["not_owner", true], "别人的门不撤");
   // 归属转换锁：.txn 在场 → 建 / 撤都 gate_busy 不动；残骸（超过 60 秒）→ gate_txn_residue；段结束 .txn 释放
-  fs.symlinkSync(JSON.stringify({ pid: 1, at: "2026-08-30T00:00:00.000Z", token: "other" }), gateFile + ".txn");
+  fs.symlinkSync(JSON.stringify({ pid: 1, at: "2026-08-30T00:00:00.000Z", token: "12345678-1234-1234-1234-123456789abc" }), gateFile + ".txn");
   assert.deepEqual([removeGate({ file: gateFile, token: made.token }).reason, createGate({ file: gateFile, reason: "x" }).reason, readGate({ file: gateFile }).state], ["gate_busy", "gate_busy", "active"], "转换段被占：什么都不动");
   fs.lutimesSync(gateFile + ".txn", new Date(Date.now() - 2 * 60 * 1000), new Date(Date.now() - 2 * 60 * 1000));
   assert.deepEqual([removeGate({ file: gateFile, token: made.token }).reason, fs.lstatSync(gateFile + ".txn").isSymbolicLink()], ["gate_txn_residue", true], "残骸不自愈、不删");
   fs.unlinkSync(gateFile + ".txn");
   assert.deepEqual([removeGate({ file: gateFile, token: made.token }).removed, readGate({ file: gateFile }).state, removeGate({ file: gateFile, token: made.token }).reason, fs.existsSync(gateFile + ".txn")], [true, "absent", "absent", false], "撤门在段内重读后删，段结束 .txn 释放");
+  // .txn 进投影（评审第 2 轮探针）：门缺席但 .txn 还新 → transitioning，写入口同样挡；残骸 / 畸形 → unreadable；doctor 与状态页点名
+  const txnGood = { pid: 1, at: "2026-08-30T00:00:00.000Z", token: "12345678-1234-1234-1234-123456789abc" };
+  fs.symlinkSync(JSON.stringify(txnGood), gateFile + ".txn");
+  assert.deepEqual([readGate({ file: gateFile }).state, gateBlocks({ file: gateFile }).blocked, /维护门正在切换/u.test(gateBlocks({ file: gateFile }).text)], ["transitioning", true, true], "门缺席但转换段在场：不是没门");
+  withGate(() => {
+    const d = runDoctor({ home: local }).checks.find((c) => c.id === "maintenance_gate");
+    assert.deepEqual([d.ok, /^正在切换（门正在建 \/ 撤/u.test(d.detail)], [false, true], JSON.stringify(d));
+    assert.match(maintenanceGateText(readGate()), /^正在切换（/u);
+  });
+  fs.lutimesSync(gateFile + ".txn", new Date(Date.now() - 2 * 60 * 1000), new Date(Date.now() - 2 * 60 * 1000));
+  assert.deepEqual([readGate({ file: gateFile }).state, /归属转换锁残骸/u.test(readGate({ file: gateFile }).why), gateBlocks({ file: gateFile }).blocked], ["unreadable", true, true], "残骸 = 说不清，挡");
+  fs.unlinkSync(gateFile + ".txn");
+  fs.mkdirSync(gateFile + ".txn"); assert.match(readGate({ file: gateFile }).why, /归属转换锁位置上不是 symlink/u); fs.rmdirSync(gateFile + ".txn");
+  fs.symlinkSync(JSON.stringify({ ...txnGood, token: [txnGood.token] }), gateFile + ".txn"); assert.match(readGate({ file: gateFile }).why, /形状不对/u); fs.unlinkSync(gateFile + ".txn");
+  assert.deepEqual(readGate({ file: gateFile }), { state: "absent" });
+  // 释放失败不吞：建门成功但 .txn 交不还 → 结果带 txnUncleared；随后读门是 active（门在），撤门 gate_busy（.txn 在）
+  const originalUnlinkForTxn = fs.unlinkSync;
+  fs.unlinkSync = (target, ...args) => { if (String(target).endsWith(".txn")) { const e = new Error("forced"); e.code = "EIO"; throw e; } return originalUnlinkForTxn(target, ...args); };
+  let stuckCreate;
+  try { stuckCreate = createGate({ file: gateFile, reason: "交不还" }); } finally { fs.unlinkSync = originalUnlinkForTxn; }
+  assert.deepEqual([stuckCreate.ok, stuckCreate.txnUncleared?.why, fs.lstatSync(gateFile + ".txn").isSymbolicLink(), readGate({ file: gateFile }).state, removeGate({ file: gateFile, token: stuckCreate.token }).reason], [true, "EIO", true, "active", "gate_busy"], "释放失败随结果返回：" + JSON.stringify(stuckCreate));
+  fs.unlinkSync(gateFile + ".txn"); assert.equal(removeGate({ file: gateFile, token: stuckCreate.token }).removed, true);
   // 段内重读（评审探针：读 token → unlink 两步之间旧门被撤、新门建起）：在 unlink 之前把门换成别人的 → 不删新门
   assert.equal(createGate({ file: gateFile, reason: "旧门" }).ok, true);
   const oldToken = readGate({ file: gateFile }).payload.token;

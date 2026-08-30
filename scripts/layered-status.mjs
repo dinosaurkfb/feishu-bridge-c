@@ -87,6 +87,7 @@ export function describePendingWindow(st, { now = Date.now(), full = false } = {
 export function maintenanceGateText(g) {
   if (!g || g.state === "absent") return "没开";
   if (g.state === "active") return "开着：" + g.payload.reason + "（已 " + Math.floor(g.ageMs / 60000) + " 分钟）—— 入站 / 出站 / 控制命令都在等它关";
+  if (g.state === "transitioning") return "正在切换（" + g.why + "）—— 按维护中处理";
   return "读不出（" + g.why + "）—— 按维护中处理，请在本机跑 doctor";
 }
 /** 第 1 层「入站处理器」一行的措辞：每一态各说各的，不把"运行时之外"说成"已安装"。 */

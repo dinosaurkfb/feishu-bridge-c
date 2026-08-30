@@ -81,27 +81,41 @@ export function readGateTxn({ file, now = Date.now() }) {
   if (doc === null || typeof doc !== "object" || Array.isArray(doc) || Object.keys(doc).sort().join(",") !== TXN_KEYS
     || typeof doc.token !== "string" || !UUID_SHAPE.test(doc.token) || !Number.isSafeInteger(doc.pid) || doc.pid <= 0 || !isCanonicalIso(doc.at)) return { state: "unreadable", why: "归属转换锁 payload 形状不对" };
   const ageMs = Math.max(0, now - st.mtimeMs);
-  if (ageMs > GATE_TXN_STALE_MS) return { state: "unreadable", why: "归属转换锁残骸（持有者崩在段里，已 " + Math.round(ageMs / 1000) + " 秒）：" + txn + "，人工核对后删除" };
+  // why 是受控文案（进飞书正文 / hook reason，不含路径）；detail 只给 doctor（含本机路径）
+  if (ageMs > GATE_TXN_STALE_MS) return { state: "unreadable", why: "归属转换锁残骸（持有者崩在段里，已 " + Math.round(ageMs / 1000) + " 秒），人工核对后删除", detail: txn };
   return { state: "active", ageMs, payload: doc };
 }
 
 /**
- * 三态读门（把归属转换锁算进投影）。
- * @returns {{ state: "absent" } | { state: "active", payload: object, ageMs: number } | { state: "transitioning", why: string } | { state: "unreadable", why: string }}
- *   transitioning = 门缺席但 .txn 还新（建 / 撤门正在进行）：写入口同样挡；unreadable 含 .txn 残骸 / 畸形。
+ * 三态读门（把归属转换锁算进投影 —— **不只在门缺席时**：门 active 旁边挂着 .txn 也要说出来）。
+ * @returns {{ state: "absent" } | { state: "active", payload: object, ageMs: number } | { state: "transitioning", why: string, payload?: object }
+ *          | { state: "unreadable", why: string, detail?: string }}
+ *   transitioning = .txn 还新（建 / 撤门正在进行，或释放失败刚留下）：写入口同样挡；unreadable 含 .txn 残骸 / 畸形。
+ *   why 是受控文案（不含路径）；detail 只给 doctor。
  */
 export function readGate({ file = maintenanceGatePath(), now = Date.now(), withinTxn = false } = {}) {
   if (typeof file !== "string" || file.length === 0) return { state: "unreadable", why: "真实用户 home 说不清，门的位置无从确定" };
+  const txn = withinTxn ? { state: "absent" } : readGateTxn({ file, now }); // 段内自己持着 .txn，不把自己算成"正在切换"
   let st;
   try { st = fs.lstatSync(file); }
   catch (err) {
     if (err?.code !== "ENOENT") return { state: "unreadable", why: "lstat 失败：" + String(err?.code ?? err?.message ?? err) };
-    if (withinTxn) return { state: "absent" }; // 段内自己持着 .txn，不把自己算成"正在切换"
-    const txn = readGateTxn({ file, now });
     if (txn.state === "absent") return { state: "absent" };
     if (txn.state === "active") return { state: "transitioning", why: "门正在建 / 撤（归属转换段进行中，已 " + Math.round(txn.ageMs) + " 毫秒）" };
-    return { state: "unreadable", why: txn.why };
+    return { state: "unreadable", why: txn.why, detail: txn.detail };
   }
+  if (txn.state === "unreadable") return { state: "unreadable", why: "门开着，但" + txn.why, detail: txn.detail };
+  if (txn.state === "active") {
+    const g = readGateFile(file, now);
+    return g.state === "active" ? { state: "transitioning", why: "门开着，且归属转换段还在（建 / 撤门进行中或释放失败，已 " + Math.round(txn.ageMs) + " 毫秒）", payload: g.payload } : g;
+  }
+  return readGateFile(file, now);
+}
+/** 只读门文件本身（不看 .txn）。 */
+function readGateFile(file, now) {
+  let st;
+  try { st = fs.lstatSync(file); }
+  catch (err) { return err?.code === "ENOENT" ? { state: "absent" } : { state: "unreadable", why: "lstat 失败：" + String(err?.code ?? err?.message ?? err) }; }
   if (!st.isSymbolicLink()) return { state: "unreadable", why: st.isDirectory() ? "门的位置上是目录" : "门的位置上不是 symlink" };
   let raw;
   try { raw = fs.readlinkSync(file); }
@@ -124,8 +138,8 @@ export function gateBlocks({ file = maintenanceGatePath(), now = Date.now() } = 
     const mins = Math.floor(g.ageMs / 60000);
     return { blocked: true, state: "active", text: "桥维护中（" + g.payload.reason + "，已 " + mins + " 分钟）", gate: { reason: g.payload.reason, at: g.payload.at, token: g.payload.token, ageMs: g.ageMs } };
   }
-  if (g.state === "transitioning") return { blocked: true, state: "transitioning", text: "维护门正在切换（建门或撤门进行中），按维护中处理，请稍后重试", gate: null };
-  return { blocked: true, state: "unreadable", text: "维护门读不出（" + g.why + "），按维护中处理，请在本机跑 doctor", gate: null };
+  if (g.state === "transitioning") return { blocked: true, state: "transitioning", text: "维护门正在切换（建门或撤门进行中），按维护中处理，请稍后重试", gate: g.payload ? { reason: g.payload.reason, at: g.payload.at, token: g.payload.token } : null };
+  return { blocked: true, state: "unreadable", text: "维护门读不出（" + g.why + "），按维护中处理，请在本机跑 doctor", gate: null, detail: g.detail ?? null };
 }
 
 /** 入站类入口的确定性回复（stdout，给运输 agent 原样回复）：不 claim、不写回执、不重放。 */

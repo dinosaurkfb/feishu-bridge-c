@@ -339,8 +339,8 @@ export function runDoctor({
     const g = readGate({ now });
     if (g.state === "absent") add("maintenance_gate", "⑩ 维护门", true, "没开", null);
     else if (g.state === "active") add("maintenance_gate", "⑩ 维护门", false, "开着：" + g.payload.reason + "（已 " + Math.floor(g.ageMs / 60000) + " 分钟，token " + String(g.payload.token).slice(0, 8) + "）" + (g.ageMs > 10 * 60 * 1000 ? " —— 超过 10 分钟，多半是维护中断；维护门 CLI（--status / --exit）随后续 PR 提供，此刻请人工核对 " + maintenanceGatePath() : ""), null);
-    else if (g.state === "transitioning") add("maintenance_gate", "⑩ 维护门", false, "正在切换（" + g.why + "）—— 入口都按维护中处理；几毫秒的事，再跑一次仍在就是段里崩了", null);
-    else add("maintenance_gate", "⑩ 维护门", false, "读不出（" + g.why + "）—— 入口都按维护中处理；畸形制品不自动删，请人工核对 " + maintenanceGatePath(), null);
+    else if (g.state === "transitioning") add("maintenance_gate", "⑩ 维护门", false, "正在切换（" + g.why + "）—— 入口都按维护中处理；几毫秒的事，再跑一次仍在就是段里崩了或释放失败，转换锁在 " + maintenanceGatePath() + ".txn", null);
+    else add("maintenance_gate", "⑩ 维护门", false, "读不出（" + g.why + "）—— 入口都按维护中处理；畸形制品不自动删，请人工核对 " + (g.detail ?? maintenanceGatePath()), null);
   }
 
   // ── 汇总：任一 false → blocked；无 false 有 null → incomplete；全 true → ready

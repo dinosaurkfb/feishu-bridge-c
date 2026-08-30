@@ -20410,7 +20410,7 @@ test("维护门（issue #81 · PR A）：三态读门只认 ENOENT 为没门，�
   assert.deepEqual([removeGate({ file: gateFile, token: "12345678-1234-1234-1234-123456789abc" }).reason, fs.lstatSync(gateFile).isSymbolicLink()], ["not_owner", true], "别人的门不撤");
   // 归属转换锁：.txn 在场 → 建 / 撤都 gate_busy 不动；残骸（超过 60 秒）→ gate_txn_residue；段结束 .txn 释放
   fs.symlinkSync(JSON.stringify({ pid: 1, at: "2026-08-30T00:00:00.000Z", token: "12345678-1234-1234-1234-123456789abc" }), gateFile + ".txn");
-  assert.deepEqual([removeGate({ file: gateFile, token: made.token }).reason, createGate({ file: gateFile, reason: "x" }).reason, readGate({ file: gateFile }).state], ["gate_busy", "gate_busy", "active"], "转换段被占：什么都不动");
+  assert.deepEqual([removeGate({ file: gateFile, token: made.token }).reason, createGate({ file: gateFile, reason: "x" }).reason, readGate({ file: gateFile }).state, fs.lstatSync(gateFile).isSymbolicLink()], ["gate_busy", "gate_busy", "transitioning", true], "转换段被占：什么都不动，门的投影说'正在切换'");
   fs.lutimesSync(gateFile + ".txn", new Date(Date.now() - 2 * 60 * 1000), new Date(Date.now() - 2 * 60 * 1000));
   assert.deepEqual([removeGate({ file: gateFile, token: made.token }).reason, fs.lstatSync(gateFile + ".txn").isSymbolicLink()], ["gate_txn_residue", true], "残骸不自愈、不删");
   fs.unlinkSync(gateFile + ".txn");
@@ -20425,7 +20425,8 @@ test("维护门（issue #81 · PR A）：三态读门只认 ENOENT 为没门，�
     assert.match(maintenanceGateText(readGate()), /^正在切换（/u);
   });
   fs.lutimesSync(gateFile + ".txn", new Date(Date.now() - 2 * 60 * 1000), new Date(Date.now() - 2 * 60 * 1000));
-  assert.deepEqual([readGate({ file: gateFile }).state, /归属转换锁残骸/u.test(readGate({ file: gateFile }).why), gateBlocks({ file: gateFile }).blocked], ["unreadable", true, true], "残骸 = 说不清，挡");
+  const residue = readGate({ file: gateFile });
+  assert.deepEqual([residue.state, /归属转换锁残骸/u.test(residue.why), residue.why.includes("/"), residue.detail, gateBlocks({ file: gateFile }).blocked, gateBlocks({ file: gateFile }).text.includes(local)], ["unreadable", true, false, gateFile + ".txn", true, false], "残骸 = 说不清，挡；用户文案不带路径，路径只在 detail：" + JSON.stringify(residue));
   fs.unlinkSync(gateFile + ".txn");
   fs.mkdirSync(gateFile + ".txn"); assert.match(readGate({ file: gateFile }).why, /归属转换锁位置上不是 symlink/u); fs.rmdirSync(gateFile + ".txn");
   fs.symlinkSync(JSON.stringify({ ...txnGood, token: [txnGood.token] }), gateFile + ".txn"); assert.match(readGate({ file: gateFile }).why, /形状不对/u); fs.unlinkSync(gateFile + ".txn");
@@ -20435,8 +20436,16 @@ test("维护门（issue #81 · PR A）：三态读门只认 ENOENT 为没门，�
   fs.unlinkSync = (target, ...args) => { if (String(target).endsWith(".txn")) { const e = new Error("forced"); e.code = "EIO"; throw e; } return originalUnlinkForTxn(target, ...args); };
   let stuckCreate;
   try { stuckCreate = createGate({ file: gateFile, reason: "交不还" }); } finally { fs.unlinkSync = originalUnlinkForTxn; }
-  assert.deepEqual([stuckCreate.ok, stuckCreate.txnUncleared?.why, fs.lstatSync(gateFile + ".txn").isSymbolicLink(), readGate({ file: gateFile }).state, removeGate({ file: gateFile, token: stuckCreate.token }).reason], [true, "EIO", true, "active", "gate_busy"], "释放失败随结果返回：" + JSON.stringify(stuckCreate));
-  fs.unlinkSync(gateFile + ".txn"); assert.equal(removeGate({ file: gateFile, token: stuckCreate.token }).removed, true);
+  // 门 active 旁边挂着 .txn（评审第 3 轮探针）：读门不再说"普通 active"，而是 transitioning；doctor / 状态页点名；残骸化后 unreadable
+  assert.deepEqual([stuckCreate.ok, stuckCreate.txnUncleared?.why, fs.lstatSync(gateFile + ".txn").isSymbolicLink(), readGate({ file: gateFile }).state, /门开着，且归属转换段还在/u.test(readGate({ file: gateFile }).why), gateBlocks({ file: gateFile }).blocked, removeGate({ file: gateFile, token: stuckCreate.token }).reason], [true, "EIO", true, "transitioning", true, true, "gate_busy"], "释放失败随结果返回，且门的投影点名：" + JSON.stringify(stuckCreate));
+  withGate(() => {
+    const d = runDoctor({ home: local }).checks.find((c) => c.id === "maintenance_gate");
+    assert.deepEqual([d.ok, /^正在切换（门开着，且归属转换段还在/u.test(d.detail), d.detail.includes(gateFile + ".txn")], [false, true, true], "doctor 点名转换锁：" + JSON.stringify(d));
+    assert.match(maintenanceGateText(readGate()), /^正在切换（门开着，且归属转换段还在/u);
+  });
+  fs.lutimesSync(gateFile + ".txn", new Date(Date.now() - 2 * 60 * 1000), new Date(Date.now() - 2 * 60 * 1000));
+  assert.deepEqual([readGate({ file: gateFile }).state, /^门开着，但归属转换锁残骸/u.test(readGate({ file: gateFile }).why)], ["unreadable", true], "门开着 + 残骸 = 说不清");
+  fs.unlinkSync(gateFile + ".txn"); assert.equal(readGate({ file: gateFile }).state, "active"); assert.equal(removeGate({ file: gateFile, token: stuckCreate.token }).removed, true);
   // 段内重读（评审探针：读 token → unlink 两步之间旧门被撤、新门建起）：在 unlink 之前把门换成别人的 → 不删新门
   assert.equal(createGate({ file: gateFile, reason: "旧门" }).ok, true);
   const oldToken = readGate({ file: gateFile }).payload.token;

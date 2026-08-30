@@ -358,8 +358,9 @@ export function acquirePublishLock(lockDir, opts = {}) {
  * reapUnrecognized=false：锁位置上是目录 / 畸形 payload（不是本协议的形状）时**不回收、不删**，返回 lock_residue 交显式维护入口
  *（评审探针：带哨兵的旧目录被热路径整体删了）。发布锁保留默认 true（旧版目录锁的兼容路径）。
  * acceptReapedResidue（默认 false = **fail-closed**）：陈旧回收把旧实例 rename 走之后删不掉时，默认**不取锁**，返回
- * { ok:false, reason:"reaped_uncleared", path, error } —— 只判 ok 的既有调用方不会带着残骸继续写；只有显式接受的调用方（安装收据）
- * 才会继续取锁，并在结果上带 reapedUncleared（取到 → ok:true；被别人抢先 → publisher_busy），由它自己消费残骸。afterReap 只给测试用。
+ * { ok:false, reason:"reaped_uncleared", path, error } —— 只判 ok 的既有调用方不会带着残骸继续写；显式接受的调用方才会继续取锁，
+ * 并在结果上带 reapedUncleared（取到 → ok:true；被别人抢先 → publisher_busy），由它自己消费残骸。**目前没有生产消费者**（安装收据也走默认
+ * fail-closed），只在原语层保留并有测试盯着。归属转换锁 .reap 自身释放失败（reap_uncleared）不受这个选项影响，一律 fail-closed。afterReap 只给测试用。
  */
 export function acquireLockUngated(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now(), beforeReap = null, duringReap = null, afterReap = null, reapUnrecognized = true, acceptReapedResidue = false } = {}) {
   const token = crypto.randomUUID();
@@ -393,6 +394,9 @@ export function acquireLockUngated(lockDir, { staleMs = 5 * 60 * 1000, now = Dat
     catch (err) { return { done: true, reapedUncleared: { path: away, error: String(err?.code ?? err?.message ?? err) } }; }
   }, { duringReap });
   if (!reaped.ok) return reaped.reason === "reap_busy" ? first : reaped; // 别人正在回收：这轮让它
+  // 归属转换锁 .reap 自己交不还：**一律 fail-closed，不建新主锁**（评审探针：旧锁删掉了、.reap 释放失败，仍 attempt() 成功 → 只判 ok 的调用方
+  // 带着 .reap 残骸继续写；之后所有回收 / 释放都会 reap_residue）。.reap 残骸交 repair-publish-lock --lock。acceptReapedResidue 只管已脱离协议路径的 .reaped-<uuid>。
+  if (reaped.reapUncleared) return { ok: false, reason: "reap_uncleared", path: reaped.reapUncleared.path, error: reaped.reapUncleared.error, ...(reaped.run.reapedUncleared ? { reapedUncleared: reaped.run.reapedUncleared } : {}) };
   const residue = reaped.run.reapedUncleared ?? null;
   if (residue !== null && !acceptReapedResidue) return carryReapResidue(reaped, { ok: false, reason: "reaped_uncleared", path: residue.path, error: residue.error });
   if (typeof afterReap === "function") afterReap();

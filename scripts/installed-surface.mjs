@@ -164,6 +164,7 @@ export function withInstalledSurfaceLock(file, fn, { waitMs = 5000, staleMs = SU
     catch (err) { return withResidues({ ok: false, reason: "io_error", why: "取锁阶段异常：" + errCode(err), path: lock }); }
     if (got?.ok) break;
     if (got?.reason === "reaped_uncleared") return withResidues({ ok: false, reason: "surface_lock_residue", why: "陈旧锁隔离后删不掉：" + String(got.error) + "（" + String(got.path) + "，只人工删）", path: String(got.path) });
+    if (got?.reason === "reap_uncleared") return withResidues({ ok: false, reason: "surface_lock_residue", why: "归属转换锁交不还：" + String(got.error) + "（" + String(got.path) + "，node scripts/repair-publish-lock.mjs --lock " + lock + " --apply 能清）", path: String(got.path) });
     if (got?.reason === "lock_residue" || got?.reason === "reap_residue") return withResidues({ ok: false, reason: "surface_lock_residue", why: got.reason + "（保留现场，交人工）", path: lock });
     if (got?.reason !== "publisher_busy" && got?.reason !== "reap_busy") return withResidues({ ok: false, reason: "io_error", why: String(got?.reason) + (got?.error ? "：" + got.error : "") });
     if (Date.now() >= deadline) return withResidues({ ok: false, reason: "surface_busy" });

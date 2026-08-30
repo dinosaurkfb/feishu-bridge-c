@@ -30,7 +30,7 @@
 
 任一条对不上 → 拒绝进门 `startup_source_unverified`（点名）。
 
-**威胁边界（明写）**：同 UID 人工直接执行克隆或 `versions/<旧版>` 下的脚本不在门的覆盖内；hook 命令引用的**外部脚本正文**（如 `.orca` 的 `.sh`）也不在模型内 —— 预检只解析命令本身（`scripts/maintenance/command-refs.mjs`，进程盘点对 ps 命令行用同一份判据）：token 内所有绝对路径片段（整个 token、`=` / `:` / `,` 之后如 `--import=/x`、`NODE_OPTIONS=--require=/x`）realpath 后不得落在任一条链的运行时之下（文件不在就按目录解析）；shell 只认纯字母短选项簇（`-c` / `-lc` / `-fc`，簇里不能有 o / O）与无参长选项（`--login --norc --noprofile --posix --restricted --command`），含 `c` 的簇或 `--command` 后的内联串递归解析，其余选项形状（`-O extglob`、`-o pipefail`、`+O`、`--rcfile …`）一律"无法验证"；引号外反斜杠转义按 shell 规则处理，未闭合引号 / 尾随反斜杠 = 解析不了；变量（`$HOME` 以外）/ 命令替换 / eval / exec / source / 解释器内联代码（`node -e/-p` **含组合短选项 `-pe`**、`python -c`、`perl -ne` …，内联串里的绝对路径仍捞出来给进程盘点用）/ 相对路径 / `-r`、`--import`、`--loader` 后不是绝对路径 —— 非桥命令出现任一种一律"无法验证"拒绝。
+**威胁边界（明写）**：同 UID 人工直接执行克隆或 `versions/<旧版>` 下的脚本不在门的覆盖内；hook 命令引用的**外部脚本正文**（如 `.orca` 的 `.sh`）也不在模型内 —— 预检只解析命令本身（`scripts/maintenance/command-refs.mjs`，进程盘点对 ps 命令行用同一份判据）：**每个 token 无条件**捞出其中所有绝对路径片段（整个 token、`=` / `:` / `,` 之后、内联代码串里的 `import("/x")`、附着式 `node</x`）realpath 后不得落在任一条链的运行时之下（文件不在就按目录解析）；tokenizer 保留操作符类别 —— 单管道、输入重定向 `<`、here-doc / here-string 一律"无法验证"（右侧 / 解释器可能从 stdin 读代码），`env -S <串>` / `--split-string` 递归解析，`node --input-type` / 脚本位 `-` 算从 stdin 读代码；shell 只认纯字母短选项簇（`-c` / `-lc` / `-fc`，簇里不能有 o / O）与无参长选项（`--login --norc --noprofile --posix --restricted --command`），含 `c` 的簇或 `--command` 后的内联串递归解析，其余选项形状（`-O extglob`、`-o pipefail`、`+O`、`--rcfile …`）一律"无法验证"；引号外反斜杠转义按 shell 规则处理，未闭合引号 / 尾随反斜杠 = 解析不了；变量（`$HOME` 以外）/ 命令替换 / eval / exec / source / 解释器内联代码（`node -e/-p` **含组合短选项 `-pe`**、`python -c`、`perl -ne` …，内联串里的绝对路径仍捞出来给进程盘点用）/ 相对路径 / `-r`、`--import`、`--loader` 后不是绝对路径 —— 非桥命令出现任一种一律"无法验证"拒绝。
 
 ## 机制：两层 + 一本账
 

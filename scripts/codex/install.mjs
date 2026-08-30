@@ -14,7 +14,9 @@ import path from "node:path";
 import { moduleRoot } from "../direct-run.mjs";
 import { shellQuote } from "../shell-quote.mjs";
 import { describeTemplateWrite, withChainTemplateWrite } from "../chain-template.mjs";
-import { buildHookCommand, ownsHookCommand, pickNode } from "./hook-command.mjs";
+import { buildHookCommand, codexHooksOwnedEntries, renderCodexHooks, ownsHookCommand, pickNode } from "./hook-command.mjs";
+import { referencedRuntimeScripts } from "../install-projection.mjs";
+import { artifactSha, installedSurfacePath, recordInstalledSurface } from "../installed-surface.mjs";
 import { SKILLS, expectedSkillContent } from "./skill-content.mjs";
 
 import {
@@ -59,51 +61,19 @@ const autoPublishPreview = enableAutoPublishForAllTasks({ home });
 const runtimePlan = uninstall ? null : planRuntimeSync({ sourceRoot: ROOT, root: RUNTIME_ROOT });
 const autoPublishMigrationCount = autoPublishPreview.ok ? autoPublishPreview.changed : null;
 
-const hookCommand = (script) => buildHookCommand({ node, script, home, log });
-
+// hooks.json 的合并只有一份（codex/hook-command.mjs 的 renderCodexHooks）：让每个事件下恰好只剩一条我们的 hook，只动自己那一条 child。
 let before = "";
-let hooks = { hooks: {} };
-try {
-  before = fs.readFileSync(HOOKS, "utf-8");
-  hooks = JSON.parse(before);
-} catch (err) {
+try { before = fs.readFileSync(HOOKS, "utf-8"); }
+catch (err) {
   if (err.code !== "ENOENT") {
     console.error("hooks.json 读不了：" + err.message);
     process.exit(1);
   }
 }
-hooks.hooks ??= {};
-
-/**
- * 让某个事件下**恰好只剩一条**我们的 hook，且**只动我们自己那一条 child**。
- */
-function updateHook(event, script, timeout) {
-  const basename = path.basename(script);
-  const entries = hooks.hooks[event] ?? [];
-  let dropped = 0;
-  const kept = [];
-  for (const entry of entries) {
-    const children = (entry?.hooks ?? []).filter((h) => {
-      if (!ownsHookCommand(h?.command, basename)) return true;
-      dropped += 1;
-      return false;
-    });
-    // 同一条 entry 里别人的 hook 必须原样留下；整条都是我们的才丢掉这条。
-    if (children.length > 0) kept.push({ ...entry, hooks: children });
-  }
-  if (uninstall) {
-    hooks.hooks[event] = kept;
-    return dropped > 0 ? "removed(" + dropped + ")" : "already-absent";
-  }
-  hooks.hooks[event] = [...kept,
-    { hooks: [{ type: "command", command: hookCommand(script), timeout }] }];
-  if (dropped === 0) return "installed";
-  if (dropped === 1) return "updated";
-  return "converged(清掉 " + dropped + " 条，只留 1 条)";
-}
-
-const promptAction = updateHook("UserPromptSubmit", promptScript, 10);
-const stopAction = updateHook("Stop", stopScript, 20);
+const renderedHooks = renderCodexHooks({ baseText: before === "" ? null : before, promptScript, stopScript, node, home, log, uninstall });
+const hooks = renderedHooks.hooks;
+const promptAction = renderedHooks.actions.UserPromptSubmit;
+const stopAction = renderedHooks.actions.Stop;
 
 const skills = SKILLS;
 const renderedSkill = (file, name) => expectedSkillContent({
@@ -209,7 +179,7 @@ if (!uninstall) {
   }
 }
 
-const after = JSON.stringify(hooks, null, 2) + "\n";
+const after = renderedHooks.text;
 if (after !== before) {
   if (fs.existsSync(HOOKS)) fs.copyFileSync(HOOKS, HOOKS + ".bak." + Date.now());
   writeAtomic(HOOKS, after);
@@ -232,6 +202,21 @@ for (const skill of skills) {
   }
 }
 
+if (!uninstall) {
+  // 机器级安装收据（维护门 PR B）：hooks.json 只记桥拥有的封闭条目（提取器 codexHooksOwnedEntries），技能整文件
+  const installedVersion = verifyRuntime({ root: RUNTIME_ROOT }).version ?? null;
+  const extractors = { "codex-hooks": codexHooksOwnedEntries };
+  const skillArtifacts = []; const skillTexts = [];
+  for (const skill of skills) for (const name of skill.files) {
+    const text = renderedSkill(path.join(ROOT, "skills", skill.name, name), name);
+    skillArtifacts.push({ path: path.join(CODEX_HOME, "skills", skill.name, name), kind: "skill", sha256: artifactSha({ kind: "skill", text }) });
+    skillTexts.push(text.toString("utf-8"));
+  }
+  const artifacts = [{ path: HOOKS, kind: "codex-hooks", sha256: artifactSha({ kind: "codex-hooks", text: after, extractors }) }, ...skillArtifacts];
+  const scripts = referencedRuntimeScripts([after, ...skillTexts].join("\n"));
+  const receipt = installedVersion ? recordInstalledSurface({ chain: "codex", version: installedVersion, artifacts, scripts, file: installedSurfacePath({ chain: "codex", codexBridgeHome: home }) }) : { ok: false, reason: "runtime_version_unknown" };
+  console.log("安装收据    " + (receipt.ok ? "已记（" + artifacts.length + " 个制品，" + scripts.length + " 个脚本）" : "**没记下**（" + receipt.reason + (receipt.why ? "：" + receipt.why : "") + "）"));
+}
 if (!uninstall && !fs.existsSync(registryFile(home))) {
   writeAtomic(registryFile(home), JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks: [] }, null, 2) + "\n");
 }

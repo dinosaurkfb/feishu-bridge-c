@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-08-30T01:24:36.609Z",
+  "generated_at": "2026-08-30T02:00:41.194Z",
   "modules": {
     "authorize.mjs": [
       "AUTHORIZATION_TABLE",
@@ -322,6 +322,35 @@
       "selectRoute",
       "validateRoutesDoc"
     ],
+    "install-projection.mjs": [
+      "CLAUDE_INBOUND_SKILL",
+      "CLAUDE_SKILLS",
+      "HOOK_TAG",
+      "LEGACY_PREVIEW_RULE",
+      "claimSingleHook",
+      "claudeDrainPlist",
+      "claudeDrainPlistPath",
+      "claudeHookCommands",
+      "claudeSettingsOwnedEntries",
+      "claudeSkillFiles",
+      "countHooks",
+      "legacyOwnsHook",
+      "ownsHook",
+      "referencedRuntimeScripts",
+      "renderClaudeSettings",
+      "renderClaudeSkill"
+    ],
+    "installed-surface.mjs": [
+      "ARTIFACT_KINDS",
+      "INSTALLED_SURFACE_ENV",
+      "INSTALLED_SURFACE_SCHEMA",
+      "artifactSha",
+      "compareInstalledSurface",
+      "installedSurfacePath",
+      "installedSurfaceProblem",
+      "readInstalledSurface",
+      "recordInstalledSurface"
+    ],
     "interaction-policy.mjs": [
       "DEFAULT_DIALOGUE_BUDGET",
       "DIALOGUE_POLICY_ID",
@@ -502,13 +531,16 @@
       "CHAIN_HOME_DIR",
       "CURRENT_LINK",
       "MANIFEST_NAME",
+      "activateRuntimeVersion",
       "applyRuntimeSync",
       "codexRuntimeRoot",
       "collectRuntimeFiles",
       "planRuntimeSync",
       "runtimeRoot",
       "runtimeScript",
+      "stageRuntimeVersion",
       "verifyRuntime",
+      "verifyRuntimeVersion",
       "versionFromFiles"
     ],
     "selector.mjs": [

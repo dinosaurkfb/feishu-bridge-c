@@ -211,6 +211,11 @@ import {
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
 import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, stableControlId, validateSubscription, claimable } from "./subscription.mjs";
+import { claudeDrainPlist, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
+import { artifactSha, compareInstalledSurface, readInstalledSurface, recordInstalledSurface } from "./installed-surface.mjs";
+import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
+import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
+import { pickClaudeNode as pickClaudeNodeB } from "./drain-schedule.mjs";
 import {
   ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, topicGenerationStateForLegacy,
   TOPIC_GENERATION_PREPARING_STALE_MS,
@@ -5960,7 +5965,7 @@ test("状态命令和出站用的是同一条绑定选择规则", () => {
 });
 
 test("五条控制技能都装成跟 Codex 同名的斜杠命令", () => {
-  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8") + "\n" + fs.readFileSync(path.resolve("scripts", "install-projection.mjs"), "utf-8"); // 投影抽到了 install-projection.mjs，两份一起扫
   for (const [repo, installed] of [
     ["claude-feishu-bind", "feishu-bind"],
     ["claude-feishu-status", "feishu-status"],
@@ -6823,7 +6828,7 @@ test("runtime 未就绪时，入站 --apply 必须拒绝而不是装一个指不
 });
 
 test("钩子归属：guard 与实际执行不一致、或别的工具同名脚本，都不认领", () => {
-  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8") + "\n" + fs.readFileSync(path.resolve("scripts", "install-projection.mjs"), "utf-8"); // 投影抽到了 install-projection.mjs，两份一起扫
   // 新标记必须锚在固定尾部，不能是任意位置的 includes —— 否则一条只是提到该字符串的
   // 命令（比如别人写的清理脚本）也会被认成自己的然后删掉。
   assert.match(src, /command\.endsWith\(" # " \+ HOOK_TAG \+ basename\)/u);
@@ -7253,7 +7258,7 @@ test("运行时校验能发现被手改的脚本和被指歪的链接", () => {
 });
 
 test("安装器不再把开发克隆路径写进全局配置", () => {
-  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8") + "\n" + fs.readFileSync(path.resolve("scripts", "install-projection.mjs"), "utf-8"); // 投影抽到了 install-projection.mjs，两份一起扫
   for (const name of ["stop-hook.mjs", "init-hook.mjs", "bind-preview.mjs",
     "inbound-hook.mjs", "drain-outbox.mjs"]) {
     assert.doesNotMatch(src, new RegExp('path\\.join\\(ROOT,\\s*"scripts",\\s*"' + name + '"', "u"),
@@ -20559,6 +20564,82 @@ test("维护门（issue #81 · PR A）：三态读门只认 ENOENT 为没门，�
   // 默认路径由真实用户 home 推导，不跟会话 HOME 走
   const defaultPath = spawnSync(process.execPath, ["-e", 'import("./scripts/maintenance-gate-core.mjs").then((m) => process.stdout.write(m.maintenanceGatePath({})))'], { encoding: "utf-8", env: { ...process.env, HOME: local } }).stdout;
   assert.equal(defaultPath, path.join(os.userInfo().homedir, ".claude", "feishu-bridge", "maintenance.gate"), "会话 HOME 改了也不动：" + defaultPath);
+});
+
+test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据三态 / 合并 / 对账，runtime stage 不切 current、activate 只切已验目录，入口清单不缺且盖住线上引用", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "gate-b-"));
+  const home = path.join(base, "home 带空格");
+  fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+  const settingsFile = path.join(home, ".claude", "settings.json");
+  fs.writeFileSync(settingsFile, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "echo orca # ORCA", timeout: 5 }] }] }, permissions: { allow: ["Bash(git status:*)"] } }, null, 2) + "\n");
+  const node = pickClaudeNodeB();
+  // ── 投影：纯函数、幂等、只动自己的条目
+  const r1 = renderClaudeSettings({ baseText: fs.readFileSync(settingsFile, "utf-8"), home, node });
+  const r2 = renderClaudeSettings({ baseText: r1.text, home, node });
+  assert.deepEqual([r2.text === r1.text, r1.actions.stop, r2.actions.stop, r1.actions.perm, r2.actions.perm], [true, "installed", "updated", "installed", "already-present"], JSON.stringify({ a1: r1.actions, a2: r2.actions }));
+  assert.ok(r1.settings.hooks.Stop.some((e) => e.hooks[0].command.includes("ORCA")) && r1.settings.permissions.allow.includes("Bash(git status:*)"), "别人的 hook 与规则原样保留");
+  const owned = claudeSettingsOwnedEntries(r1.text, { home, node });
+  assert.deepEqual([owned.Stop.length, owned.inbound.length, owned.init.length, owned.allow.length], [1, 1, 1, 1]);
+  // 收据 sha 只算桥拥有的封闭条目：无关设置变了不变，我们的条目变了才变
+  const shaA = artifactSha({ kind: "claude-settings", text: r1.text, home, node });
+  const changed = JSON.parse(r1.text); changed.model = "opus"; changed.permissions.allow.push("Bash(ls:*)");
+  assert.equal(artifactSha({ kind: "claude-settings", text: JSON.stringify(changed, null, 2), home, node }), shaA, "无关设置变化不挡门");
+  const tampered = JSON.parse(r1.text); tampered.hooks.Stop.find((e) => e.hooks[0].command.includes("FEISHU_BRIDGE_HOOK:")).hooks[0].timeout = 99;
+  assert.notEqual(artifactSha({ kind: "claude-settings", text: JSON.stringify(tampered), home, node }), shaA, "我们的 hook 变了要变");
+  assert.deepEqual([artifactSha({ kind: "claude-settings", text: "{ 坏", home, node }), artifactSha({ kind: "codex-hooks", text: "{}" }), artifactSha({ kind: "file", text: null })], ["unparseable", "unparseable", "absent"], "codex-hooks 没注入提取器不折成可算");
+  assert.match(claudeDrainPlist({ home, node }), /com\.frank\.feishu-bridge-cc\.drain/u);
+  const skills = claudeSkillFiles({ repoRoot: path.resolve("."), home });
+  assert.deepEqual([skills.length, skills.filter((f) => f.missing).length, skills.every((f) => f.missing || !f.text.includes("{{"))], [10, 0, true]);
+  assert.deepEqual(referencedRuntimeScripts("x runtime/current/scripts/a.mjs y runtime/current/scripts/codex/b.mjs runtime/current/scripts/a.mjs"), ["a.mjs", "codex/b.mjs"]);
+  // ── 收据：三态 / 同版本按 path 合并 / 版本变了整体换 / 畸形不覆盖 / 对账
+  const surface = path.join(home, ".claude", "feishu-bridge", "installed-surface.json");
+  assert.deepEqual(readInstalledSurface({ file: surface }), { state: "absent" });
+  const v = "0123456789abcdef";
+  const f1 = path.join(home, "a.txt"); fs.writeFileSync(f1, "A");
+  const rec1 = recordInstalledSurface({ chain: "claude", version: v, artifacts: [{ path: f1, kind: "file", sha256: artifactSha({ kind: "file", text: "A" }) }], scripts: ["stop-hook.mjs"], file: surface });
+  assert.equal(rec1.ok, true, JSON.stringify(rec1));
+  const f2 = path.join(home, "b.txt"); fs.writeFileSync(f2, "B");
+  const rec2 = recordInstalledSurface({ chain: "claude", version: v, artifacts: [{ path: f2, kind: "file", sha256: artifactSha({ kind: "file", text: "B" }) }], scripts: ["init-hook.mjs"], file: surface });
+  assert.deepEqual([rec2.entry.artifacts.map((a) => path.basename(a.path)), rec2.entry.scripts], [["a.txt", "b.txt"], ["init-hook.mjs", "stop-hook.mjs"]], "同版本按 path 合并");
+  assert.equal(compareInstalledSurface({ chain: "claude", file: surface }).ok, true);
+  fs.writeFileSync(f2, "changed");
+  const cmp = compareInstalledSurface({ chain: "claude", file: surface });
+  assert.deepEqual([cmp.ok, cmp.mismatches.map((m) => path.basename(m.path))], [false, ["b.txt"]]);
+  assert.deepEqual(recordInstalledSurface({ chain: "claude", version: "fedcba9876543210", artifacts: [], scripts: [], file: surface }).entry.artifacts, [], "版本变了整体换");
+  assert.equal(recordInstalledSurface({ chain: "gemini", version: v, artifacts: [], scripts: [], file: surface }).reason, "chain_unknown");
+  fs.writeFileSync(surface, "{ 坏");
+  assert.deepEqual([readInstalledSurface({ file: surface }).state, recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: [], file: surface }).reason, fs.readFileSync(surface, "utf-8")], ["unreadable", "surface_unreadable", "{ 坏"], "畸形收据不覆盖、不删");
+  fs.unlinkSync(surface);
+  // ── runtime：stage 只落目录、不切 current；activate 只切已验目录；篡改后拒
+  const root = path.join(base, "rt");
+  const plan = planRuntimeSyncB({ sourceRoot: path.resolve("."), root });
+  assert.equal(plan.ok, true, JSON.stringify(plan).slice(0, 200));
+  const staged = stageRuntimeVersionB(plan, { root });
+  assert.deepEqual([staged.ok, staged.staged, fs.existsSync(path.join(root, "versions", plan.version, "INSTALLED.json")), fs.existsSync(path.join(root, "current"))], [true, true, true, false], "stage 只落目录：" + JSON.stringify(staged));
+  assert.equal(verifyRuntimeVersionB({ version: plan.version, root }).ok, true);
+  assert.deepEqual([activateRuntimeVersionB({ version: "0000000000000000", root }).reason, fs.existsSync(path.join(root, "current"))], ["version_not_committable", false], "没落过的版本不切");
+  const act = activateRuntimeVersionB({ version: plan.version, root });
+  assert.deepEqual([act.ok, fs.readlinkSync(path.join(root, "current")), verifyRuntimeB({ root }).ok], [true, path.join("versions", plan.version), true], JSON.stringify(act));
+  fs.appendFileSync(path.join(root, "versions", plan.version, "scripts", "doctor.mjs"), "\n// tampered");
+  assert.deepEqual([verifyRuntimeVersionB({ version: plan.version, root }).ok, activateRuntimeVersionB({ version: plan.version, root }).reason], [false, "version_not_committable"], "篡改的目录不切");
+  // ── 入口清单：不缺、含关键入口
+  const manifest = maintenanceEntryManifest({ repoRoot: path.resolve("."), home, codexHome: path.join(home, ".codex") });
+  assert.deepEqual(manifest.missing, []);
+  for (const n of ["stop-hook.mjs", "inbound-hook.mjs", "init-hook.mjs", "bind-preview.mjs", "feishu-rotate.mjs", "drain-outbox.mjs", "watch-and-publish.mjs", "aily-inbound.mjs", "codex/prompt-hook.mjs", "codex/stop-hook.mjs", "codex/bind-task.mjs", "codex/drain-all.mjs", "doctor.mjs", "codex/doctor.mjs"]) assert.ok(manifest.entries.includes(n), "清单缺 " + n);
+  // ── 沙箱真装（含空格 HOME）：收据在沙箱里、装完立刻对账通过、线上引用的脚本 ⊆ 清单；无关设置变化不挡，我们的 hook 变了才挡
+  const env = { ...process.env, HOME: home };
+  execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
+  execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env });
+  const receipt = readInstalledSurface({ file: surface });
+  assert.equal(receipt.state, "valid", JSON.stringify(receipt));
+  const entry = receipt.doc.chains.claude;
+  assert.deepEqual([entry.artifacts.some((a) => a.kind === "claude-settings"), entry.artifacts.some((a) => a.kind === "plist"), entry.artifacts.filter((a) => a.kind === "skill").length, entry.version.length], [true, true, 10, 16], JSON.stringify(entry.artifacts.map((a) => a.kind)));
+  assert.equal(compareInstalledSurface({ chain: "claude", file: surface, home, node }).ok, true, "装完立刻对账通过：" + JSON.stringify(compareInstalledSurface({ chain: "claude", file: surface, home, node })));
+  for (const n of entry.scripts) assert.ok(manifest.entries.includes(n), "线上引用的脚本不在清单里：" + n);
+  const live = JSON.parse(fs.readFileSync(settingsFile, "utf-8")); live.model = "opus"; fs.writeFileSync(settingsFile, JSON.stringify(live, null, 2) + "\n");
+  assert.equal(compareInstalledSurface({ chain: "claude", file: surface, home, node }).ok, true, "无关设置变化不挡门");
+  live.hooks.Stop.find((e) => e.hooks[0].command.includes("FEISHU_BRIDGE_HOOK:")).hooks[0].timeout = 99; fs.writeFileSync(settingsFile, JSON.stringify(live, null, 2) + "\n");
+  assert.deepEqual(compareInstalledSurface({ chain: "claude", file: surface, home, node }).mismatches.map((m) => path.basename(m.path)), ["settings.json"], "我们的 hook 变了要挡");
 });
 
 summarySealed = true;

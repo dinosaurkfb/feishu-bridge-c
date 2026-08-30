@@ -30,7 +30,8 @@ import os from "node:os";
 import path from "node:path";
 
 import { runtimeScript, verifyRuntime } from "./runtime-install.mjs";
-import { shellQuote } from "./shell-quote.mjs";
+import { referencedRuntimeScripts, renderClaudeSkill } from "./install-projection.mjs";
+import { artifactSha, installedSurfacePath, recordInstalledSurface } from "./installed-surface.mjs";
 import { moduleRoot } from "./direct-run.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
@@ -41,11 +42,9 @@ const ROOT = moduleRoot(import.meta.url, "..");
  * 跑的是某条正在开发的分支。SKILL.md 源码里写 `{{BRIDGE_ROOT}}` 占位符，安装时渲染。
  */
 const RUNTIME_BRIDGE_ROOT = path.dirname(path.dirname(runtimeScript("aily-inbound.mjs")));
-// 与出站安装器同一套：模板写 {{SCRIPT:x.mjs}}，由渲染器统一加 shell 引号。
+// 与出站安装器同一套渲染（install-projection.mjs）：模板写 {{SCRIPT:x.mjs}}，由渲染器统一加 shell 引号。
 // HOME 含空格时裸路径会被 shell 拆词，入站直接不可用。
-const renderSkill = (text) => text.replaceAll(
-  /\{\{SCRIPT:([A-Za-z0-9_./-]+)\}\}/gu,
-  (_, name) => shellQuote(path.join(RUNTIME_BRIDGE_ROOT, "scripts", name)));
+const renderSkill = (text) => renderClaudeSkill(text, { home: os.homedir() });
 
 /**
  * 将要装进去的那份文本 —— **计划、写入、装完自检必须共用它**。
@@ -209,6 +208,14 @@ if (uninstall) {
 
 fs.mkdirSync(DST, { recursive: true });
 for (const f of files) fs.writeFileSync(path.join(DST, f), expectedContent(f), { mode: 0o600 });
+{
+  // 机器级安装收据（维护门 PR B）：入站技能也是线上制品，按 path 合并进 claude 链的收据
+  const installedVersion = verifyRuntime().version ?? null;
+  const artifacts = files.map((f) => ({ path: path.join(DST, f), kind: "skill", sha256: artifactSha({ kind: "skill", text: expectedContent(f) }) }));
+  const scripts = referencedRuntimeScripts(files.map((f) => expectedContent(f)).join("\n"));
+  const receipt = installedVersion ? recordInstalledSurface({ chain: "claude", version: installedVersion, artifacts, scripts, file: installedSurfacePath({ chain: "claude", home: os.homedir() }) }) : { ok: false, reason: "runtime_version_unknown" };
+  if (!receipt.ok) console.log("安装收据没记下（" + receipt.reason + (receipt.why ? "：" + receipt.why : "") + "）—— 维护门预检会拿不到当前投影");
+}
 
 // ---------- 装完自检 ----------
 

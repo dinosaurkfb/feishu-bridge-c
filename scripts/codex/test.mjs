@@ -28,9 +28,7 @@ import {
 } from "./feishu-outbox.mjs";
 import { auditSkills } from "./skill-content.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
-import {
-  HOOK_TAG, acceptsHookCommand, buildHookCommand, ownsHookCommand, parseHookCommand, pickNode,
-} from "./hook-command.mjs";
+import { HOOK_TAG, acceptsHookCommand, buildHookCommand, codexHooksOwnedEntries, ownsHookCommand, parseHookCommand, pickNode, renderCodexHooks } from "./hook-command.mjs";
 import { composeSubscribeContext } from "./prompt-hook.mjs";
 import { recordCodexActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
 import {
@@ -111,6 +109,7 @@ import {
 import { CHAT_SCOPE_PROBE_ARTIFACT_TYPE } from "../dialogue-chat-scope-probe.mjs";
 import { shellQuote } from "../shell-quote.mjs";
 import { createGate } from "../maintenance-gate-core.mjs";
+import { compareInstalledSurface, readInstalledSurface } from "../installed-surface.mjs";
 import {
   DIALOGUE_SHADOW_READINESS_ARTIFACT_TYPE, DIALOGUE_SHADOW_READINESS_DECISION,
   analyzeDialogueShadowEvidence,
@@ -9349,6 +9348,27 @@ test("维护门（issue #81 · PR A）：Codex 链的 hook / 入站 / 排空 / �
   assert.deepEqual([drain.status, drain.stdout], [0, ""], "worker 无输出退：" + drain.stderr);
   const rotate = run("feishu-rotate.mjs", { args: ["--apply"] });
   assert.deepEqual([rotate.status, /^桥维护中（换锁协议，已 \d+ 分钟）\n$/u.test(rotate.stdout)], [2, true], "控制命令 --apply 退 2：" + rotate.stdout + rotate.stderr);
+});
+
+test("维护门 · PR B：hooks.json 合并是纯函数（只动自己的 child、幂等），安装写机器级收据到桥目录并能对账；对账要注入提取器", () => {
+  const dir = temp(); const codexHome = path.join(dir, "codex-home"); const home = path.join(dir, "bridge-home");
+  const node = "/usr/bin/node"; const promptScript = "/rt/current/scripts/codex/prompt-hook.mjs"; const stopScript = "/rt/current/scripts/codex/stop-hook.mjs"; const log = path.join(home, "hook.log");
+  const base = JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "echo other", timeout: 3 }, { type: "command", command: buildHookCommand({ node, script: "/old/scripts/codex/stop-hook.mjs", home, log }), timeout: 20 }] }] } });
+  const r = renderCodexHooks({ baseText: base, promptScript, stopScript, node, home, log });
+  assert.deepEqual([r.actions.Stop, r.actions.UserPromptSubmit, r.hooks.hooks.Stop[0].hooks.map((h) => h.command), r.hooks.hooks.Stop.length, r.hooks.hooks.UserPromptSubmit.length], ["updated", "installed", ["echo other"], 2, 1], "别人的 child 留下、旧的自己那条被收编成恰好一条");
+  assert.equal(renderCodexHooks({ baseText: r.text, promptScript, stopScript, node, home, log }).text, r.text, "幂等");
+  assert.deepEqual([codexHooksOwnedEntries(r.text).Stop.length, codexHooksOwnedEntries(r.text).UserPromptSubmit.length, codexHooksOwnedEntries("{ 坏")], [1, 1, null]);
+  assert.deepEqual(renderCodexHooks({ baseText: null, promptScript, stopScript, node, home, log, uninstall: true }).actions, { UserPromptSubmit: "already-absent", Stop: "already-absent" });
+  const inst = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.equal(inst.status, 0, inst.stderr + inst.stdout);
+  assert.match(inst.stdout, /安装收据    已记（/u);
+  const file = path.join(home, "installed-surface.json");
+  const receipt = readInstalledSurface({ file });
+  assert.equal(receipt.state, "valid", JSON.stringify(receipt));
+  const entry = receipt.doc.chains.codex;
+  assert.deepEqual([entry.artifacts.some((a) => a.kind === "codex-hooks"), entry.artifacts.filter((a) => a.kind === "skill").length > 0, entry.scripts.includes("codex/prompt-hook.mjs"), Object.keys(receipt.doc.chains)], [true, true, true, ["codex"]], JSON.stringify(entry.scripts));
+  assert.equal(compareInstalledSurface({ chain: "codex", file, extractors: { "codex-hooks": codexHooksOwnedEntries } }).ok, true, "装完立刻对账通过");
+  assert.equal(compareInstalledSurface({ chain: "codex", file }).ok, false, "没注入提取器 → hooks 制品算不出，不折成通过");
 });
 
 summarySealed = true;

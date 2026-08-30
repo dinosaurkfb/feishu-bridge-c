@@ -123,3 +123,46 @@ export function acceptsHookCommand(command, expected) {
   if (typeof expected === "string") return parsed.script === expected;   // 旧签名
   return command === buildHookCommand(expected);
 }
+
+/**
+ * hooks.json 的目标全文 —— **纯函数**（维护门 PR B）：输入线上基线文本（缺席传 null），输出合并后的 JSON 文本与两条 hook 的动作。
+ * 让某个事件下**恰好只剩一条**我们的 hook，且**只动我们自己那一条 child**；同一条 entry 里别人的 hook 原样留下。
+ * @returns {{ text: string, hooks: object, actions: { UserPromptSubmit: string, Stop: string } }}
+ */
+export function renderCodexHooks({ baseText, promptScript, stopScript, node, home, log, uninstall = false }) {
+  const hooks = baseText === null || baseText === undefined ? { hooks: {} } : JSON.parse(baseText);
+  hooks.hooks ??= {};
+  const actions = {};
+  const update = (event, script, timeout) => {
+    const basename = script.split("/").pop();
+    const entries = hooks.hooks[event] ?? [];
+    let dropped = 0;
+    const kept = [];
+    for (const entry of entries) {
+      const children = (entry?.hooks ?? []).filter((h) => {
+        if (!ownsHookCommand(h?.command, basename)) return true;
+        dropped += 1;
+        return false;
+      });
+      if (children.length > 0) kept.push({ ...entry, hooks: children });
+    }
+    if (uninstall) {
+      hooks.hooks[event] = kept;
+      actions[event] = dropped > 0 ? "removed(" + dropped + ")" : "already-absent";
+      return;
+    }
+    hooks.hooks[event] = [...kept, { hooks: [{ type: "command", command: buildHookCommand({ node, script, home, log }), timeout }] }];
+    actions[event] = dropped === 0 ? "installed" : dropped === 1 ? "updated" : "converged(清掉 " + dropped + " 条，只留 1 条)";
+  };
+  update("UserPromptSubmit", promptScript, 10);
+  update("Stop", stopScript, 20);
+  return { text: JSON.stringify(hooks, null, 2) + "\n", hooks, actions };
+}
+
+/** hooks.json 里**桥拥有的封闭条目**（收据对账用）：带我们标记的 hook 的 command / timeout / type。 */
+export function codexHooksOwnedEntries(text) {
+  let hooks;
+  try { hooks = JSON.parse(text); } catch { return null; }
+  const pick = (event, basename) => (hooks?.hooks?.[event] ?? []).flatMap((e) => (e?.hooks ?? []).filter((h) => ownsHookCommand(h?.command, basename)).map((h) => ({ command: h.command, timeout: h.timeout ?? null, type: h.type ?? null })));
+  return { UserPromptSubmit: pick("UserPromptSubmit", "prompt-hook.mjs"), Stop: pick("Stop", "stop-hook.mjs") };
+}

@@ -20646,7 +20646,8 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   fs.rmSync(lockPath, { recursive: true, force: true });
   fs.symlinkSync("not-a-lock-payload", lockPath); fs.lutimesSync(lockPath, oldTime, oldTime);
   const resLink = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: [], file: surface, waitMs: 50 });
-  assert.deepEqual([resLink.reason, fs.readlinkSync(lockPath), fs.existsSync(surface)], ["surface_lock_residue", "not-a-lock-payload", false], JSON.stringify(resLink));
+  const linkNow = (() => { try { return fs.readlinkSync(lockPath); } catch { return "gone"; } })();
+  assert.deepEqual([resLink.reason, linkNow, fs.existsSync(surface)], ["surface_lock_residue", "not-a-lock-payload", false], "畸形 symlink 不回收不删：" + JSON.stringify(resLink));
   fs.unlinkSync(lockPath);
   // 提交 fencing：写满临时文件之后、rename 之前锁被别人合法接管 → lock_lost，不覆盖，不留临时文件
   const takeover = () => { fs.unlinkSync(lockPath); fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: crypto.randomUUID() }), lockPath); };
@@ -20657,9 +20658,11 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   // 形状：version / sha256 必须先是字符串再匹配正则（数组 String() 后能骗过正则）
   const arrDoc = JSON.parse(fs.readFileSync(surface, "utf-8"));
   const arrV = structuredClone(arrDoc); arrV.chains.claude.version = [v]; fs.writeFileSync(surface, JSON.stringify(arrV));
-  assert.match(readInstalledSurface({ file: surface }).why, /version 不是 16 位十六进制字符串/u);
+  const arrVRead = readInstalledSurface({ file: surface });
+  assert.deepEqual([arrVRead.state, /version 不是 16 位十六进制字符串/u.test(arrVRead.why ?? "")], ["unreadable", true], "数组 version 不能读成 valid：" + JSON.stringify(arrVRead));
   const arrS = structuredClone(arrDoc); arrS.chains.claude.artifacts = [{ path: f1, kind: "file", sha256: ["a".repeat(64)] }]; fs.writeFileSync(surface, JSON.stringify(arrS));
-  assert.match(readInstalledSurface({ file: surface }).why, /sha256 不是 64 位十六进制字符串/u);
+  const arrSRead = readInstalledSurface({ file: surface });
+  assert.deepEqual([arrSRead.state, /sha256 不是 64 位十六进制字符串/u.test(arrSRead.why ?? "")], ["unreadable", true], "数组 sha256 不能读成 valid：" + JSON.stringify(arrSRead));
   assert.equal(recordInstalledSurface({ chain: "claude", version: v, artifacts: [{ path: f1, kind: "file", sha256: ["a".repeat(64)] }], scripts: [], file: surface }).reason, "artifact_sha_unusable");
   fs.unlinkSync(surface);
   // 收据事务锁：持锁期间另一个进程记收据只会 surface_busy（写不进去），放开后才成功 —— 无锁的读改写会丢另一侧的条目

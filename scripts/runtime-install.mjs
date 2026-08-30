@@ -240,7 +240,14 @@ const writeAtomic = (file, content) => {
  * 落版本目录（调用方持安装锁）：staging 建好并验通过 → 换到 versions/<v>/。返回 { ok:true } 或受控失败（此刻没碰过 current）。
  * 已存在且校验通过的版本目录直接算 ok（内容寻址、不可变）。
  */
-function stageVersionDirUnlocked(plan, root, versionDir) {
+/** current 此刻是否指向这个版本目录（符号链接读不出 → 当作不指向；目录不可达就没有"在用"一说）。 */
+function currentPointsAt(root, versionDir) {
+  let link;
+  try { link = fs.readlinkSync(path.join(root, "current")); } catch { return false; }
+  return path.resolve(root, link) === path.resolve(versionDir);
+}
+
+function stageVersionDirUnlocked(plan, root, versionDir, { replaceInUse = false } = {}) {
   // 版本目录内容寻址、不可变。"存在但校验不过"只能整体换掉，不能原地补写。
   //
   // **顺序是关键**：先把 staging 建好并验通过，再去动线上那个目录。
@@ -279,7 +286,14 @@ function stageVersionDirUnlocked(plan, root, versionDir) {
     }
 
     // staging 就绪，现在才动线上那个目录。rename 覆盖不了非空目录，所以先挪开。
+    // **current 正指着这个（坏的）版本目录时，stage 不许动它**（评审探针：挪走 → 换上之间 current 悬空，
+    // verifyRuntime 报 manifest_absent）—— stage 的承诺是"只写不可达缓存"。只有 applyRuntimeSync 这条
+    // 老路径（replaceInUse）保留原地修复的行为，维护流程要先把 current 切到桩再 stage。
     let quarantine = null;
+    if (fs.existsSync(versionDir) && !replaceInUse && currentPointsAt(root, versionDir)) {
+      fs.rmSync(staging, { recursive: true, force: true });
+      return { ok: false, reason: "version_in_use", version: plan.version };
+    }
     if (fs.existsSync(versionDir)) {
       quarantine = path.join(root, "versions", ".corrupt-" + plan.version + "." + Date.now());
       try { fs.renameSync(versionDir, quarantine); }
@@ -384,7 +398,7 @@ export function applyRuntimeSync(plan, { home = os.homedir(), chain = "claude", 
     if (already.ok && already.version === plan.version) {
       return { ok: true, version: plan.version, versionDir, noop: true };
     }
-    const staged = stageVersionDirUnlocked(plan, root, versionDir);
+    const staged = stageVersionDirUnlocked(plan, root, versionDir, { replaceInUse: true });
     if (!staged.ok) return staged;
 
 

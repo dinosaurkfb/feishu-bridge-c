@@ -29,7 +29,6 @@ import {
 import { auditSkills } from "./skill-content.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
 import { HOOK_TAG, acceptsHookCommand, buildHookCommand, codexHooksOwnedEntries, ownsHookCommand, parseHookCommand, pickNode, renderCodexHooks } from "./hook-command.mjs";
-import { composeSubscribeContext } from "./prompt-hook.mjs";
 import { recordCodexActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
 import {
   INTENT_TTL_MS, buildIntentParams, consumeIntent, intentDir, issueIntent,
@@ -79,6 +78,7 @@ import {
   composeInvalidControlContext, composeModeContext, composeRotateContext, composeRoutedCodexContext,
   composeStatusContext, composeUnbindContext,
   isAilyInvocation, isBindingPrompt,
+  PROMPT_HOOK_COMMAND_SCRIPTS, hookCommandScript, composeSubscribeContext,
 } from "./prompt-hook.mjs";
 import {
   buildCodexSubscriptionProjection, enableAutoPublishForAllTasks, evaluatePromotion,
@@ -110,6 +110,8 @@ import { CHAT_SCOPE_PROBE_ARTIFACT_TYPE } from "../dialogue-chat-scope-probe.mjs
 import { shellQuote } from "../shell-quote.mjs";
 import { createGate } from "../maintenance-gate-core.mjs";
 import { compareInstalledSurface, readInstalledSurface } from "../installed-surface.mjs";
+import { referencedRuntimeScripts } from "../install-projection.mjs";
+import { maintenanceEntryManifest } from "../maintenance/maintenance-entries.mjs";
 import {
   DIALOGUE_SHADOW_READINESS_ARTIFACT_TYPE, DIALOGUE_SHADOW_READINESS_DECISION,
   analyzeDialogueShadowEvidence,
@@ -9369,6 +9371,26 @@ test("维护门 · PR B：hooks.json 合并是纯函数（只动自己的 child�
   assert.deepEqual([entry.artifacts.some((a) => a.kind === "codex-hooks"), entry.artifacts.filter((a) => a.kind === "skill").length > 0, entry.scripts.includes("codex/prompt-hook.mjs"), Object.keys(receipt.doc.chains)], [true, true, true, ["codex"]], JSON.stringify(entry.scripts));
   assert.equal(compareInstalledSurface({ chain: "codex", file, extractors: { "codex-hooks": codexHooksOwnedEntries } }).ok, true, "装完立刻对账通过");
   assert.equal(compareInstalledSurface({ chain: "codex", file }).ok, false, "没注入提取器 → hooks 制品算不出，不折成通过");
+});
+
+test("维护门 · PR B：prompt-hook 签发的控制脚本集合 == 封闭常量，且全部在入口清单里；签发名字不在常量里就抛", () => {
+  const bridgeRoot = "/r/runtime/current";
+  const texts = [
+    composeBindingContext({ bridgeRoot, cwd: "/w", threadId: "t1", chatName: "g", intentId: "i1" }),
+    composeUnbindContext({ bridgeRoot, threadId: "t1", intentId: "i1" }),
+    composeStatusContext({ bridgeRoot, threadId: "t1" }),
+    composeSubscribeContext({ bridgeRoot, threadId: "t1" }),
+    composeRotateContext({ bridgeRoot, threadId: "t1", intentId: "i1" }),
+    composeRotateContext({ bridgeRoot, threadId: "t1", intentId: "i1", op: "cancel" }),
+    composeModeContext({ bridgeRoot, threadId: "t1", mode: "dialogue", intentId: "i1" }),
+    composeModeContext({ bridgeRoot, threadId: "t1", intentId: "i1" }),
+    composeAilyInboundContext({ bridgeRoot, home: "/h" }),
+  ].join("\n");
+  assert.deepEqual(referencedRuntimeScripts(texts), [...PROMPT_HOOK_COMMAND_SCRIPTS], "签发集合与常量逐项相等");
+  assert.throws(() => hookCommandScript(bridgeRoot, "codex/feishu-pin-session.mjs"), /不在 PROMPT_HOOK_COMMAND_SCRIPTS/u);
+  const manifest = maintenanceEntryManifest({ repoRoot: ROOT, home: temp(), codexHome: temp() });
+  for (const n of PROMPT_HOOK_COMMAND_SCRIPTS) assert.ok(manifest.entries.includes(n) && manifest.sources[n].includes("codex-prompt-hook"), "清单缺 " + n);
+  assert.deepEqual(manifest.missing, []);
 });
 
 summarySealed = true;

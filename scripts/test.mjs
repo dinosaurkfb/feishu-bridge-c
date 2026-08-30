@@ -211,11 +211,12 @@ import {
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
 import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, stableControlId, validateSubscription, claimable } from "./subscription.mjs";
-import { claudeDrainPlist, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
-import { artifactSha, compareInstalledSurface, readInstalledSurface, recordInstalledSurface } from "./installed-surface.mjs";
+import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
+import { artifactSha, compareInstalledSurface, readInstalledSurface, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
 import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
 import { pickClaudeNode as pickClaudeNodeB } from "./drain-schedule.mjs";
+import { applyRuntimeSync as applyRuntimeSyncB } from "./runtime-install.mjs";
 import {
   ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, topicGenerationStateForLegacy,
   TOPIC_GENERATION_PREPARING_STALE_MS,
@@ -20607,9 +20608,53 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   assert.deepEqual([cmp.ok, cmp.mismatches.map((m) => path.basename(m.path))], [false, ["b.txt"]]);
   assert.deepEqual(recordInstalledSurface({ chain: "claude", version: "fedcba9876543210", artifacts: [], scripts: [], file: surface }).entry.artifacts, [], "版本变了整体换");
   assert.equal(recordInstalledSurface({ chain: "gemini", version: v, artifacts: [], scripts: [], file: surface }).reason, "chain_unknown");
+  // sha 只认 64 位十六进制：算不出的结果不能被记成预期值；持久化了 unparseable 的收据读成 unreadable 而不是 valid
+  assert.deepEqual(recordInstalledSurface({ chain: "claude", version: v, artifacts: [{ path: f1, kind: "codex-hooks", sha256: artifactSha({ kind: "codex-hooks", text: "{}" }) }], scripts: [], file: surface }).reason, "artifact_sha_unusable");
+  assert.deepEqual(recordInstalledSurface({ chain: "claude", version: v, artifacts: [{ path: f1, kind: "file", sha256: "a".repeat(64) }, { path: f1, kind: "file", sha256: "b".repeat(64) }], scripts: [], file: surface }).reason, "entry_shape", "本次制品 path 重复");
+  const good = JSON.parse(fs.readFileSync(surface, "utf-8"));
+  const poisoned = structuredClone(good); poisoned.chains.claude.artifacts = [{ path: f1, kind: "codex-hooks", sha256: "unparseable" }];
+  fs.writeFileSync(surface, JSON.stringify(poisoned));
+  assert.deepEqual([readInstalledSurface({ file: surface }).state, compareInstalledSurface({ chain: "claude", file: surface }).state], ["unreadable", "unreadable"], "预期值 unparseable 的收据不是 valid，对账不折成通过");
+  const dup = structuredClone(good); dup.chains.claude.artifacts = [{ path: f1, kind: "file", sha256: "a".repeat(64) }, { path: f1, kind: "file", sha256: "a".repeat(64) }];
+  fs.writeFileSync(surface, JSON.stringify(dup));
+  assert.match(readInstalledSurface({ file: surface }).why, /path 重复/u);
+  const badAt = structuredClone(good); badAt.chains.claude.at = "2026-08-30 10:00";
+  fs.writeFileSync(surface, JSON.stringify(badAt));
+  assert.match(readInstalledSurface({ file: surface }).why, /规范化/u);
   fs.writeFileSync(surface, "{ 坏");
   assert.deepEqual([readInstalledSurface({ file: surface }).state, recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: [], file: surface }).reason, fs.readFileSync(surface, "utf-8")], ["unreadable", "surface_unreadable", "{ 坏"], "畸形收据不覆盖、不删");
   fs.unlinkSync(surface);
+  // 对账是 fd 绑定读：符号链接到同内容的外部文件、命名管道、多硬链接都不算"制品还在"
+  const outside = path.join(base, "outside.txt"); fs.writeFileSync(outside, "S");
+  const fLink = path.join(home, "link.txt"); fs.symlinkSync(outside, fLink);
+  const fFifo = path.join(home, "fifo.txt"); execFileSync("mkfifo", [fFifo]);
+  const fHard = path.join(home, "hard.txt"); fs.writeFileSync(fHard, "H"); fs.linkSync(fHard, path.join(home, "hard2.txt"));
+  const shaS = artifactSha({ kind: "file", text: "S" }); const shaH = artifactSha({ kind: "file", text: "H" });
+  assert.equal(recordInstalledSurface({ chain: "claude", version: v, artifacts: [{ path: fLink, kind: "file", sha256: shaS }, { path: fFifo, kind: "file", sha256: shaS }, { path: fHard, kind: "file", sha256: shaH }], scripts: [], file: surface }).ok, true);
+  const fdCmp = compareInstalledSurface({ chain: "claude", file: surface });
+  assert.deepEqual(fdCmp.mismatches.map((x) => [path.basename(x.path), x.actual.split("：")[0]]), [[ "fifo.txt", "unreadable:不是普通文件" ], ["hard.txt", "unreadable:不是单硬链接的普通文件（nlink=2）"], ["link.txt", "unreadable:不是普通文件（符号链接）"]], JSON.stringify(fdCmp.mismatches));
+  const linked = structuredClone(JSON.parse(fs.readFileSync(surface, "utf-8")));
+  fs.unlinkSync(surface); fs.symlinkSync(path.join(base, "elsewhere.json"), surface); fs.writeFileSync(path.join(base, "elsewhere.json"), JSON.stringify(linked));
+  assert.match(readInstalledSurface({ file: surface }).why, /符号链接/u, "收据本身是符号链接也不认");
+  fs.unlinkSync(surface);
+  // 收据事务锁：持锁期间另一个进程记收据只会 surface_busy（写不进去），放开后才成功 —— 无锁的读改写会丢另一侧的条目
+  const driver = path.join(base, "record-driver.mjs");
+  fs.writeFileSync(driver, "import { recordInstalledSurface } from " + JSON.stringify(pathToFileURL(path.resolve("scripts", "installed-surface.mjs")).href) + ";\n"
+    + "const [file, tag, n, waitMs] = process.argv.slice(2);\n"
+    + "const out = []; for (let i = 0; i < Number(n); i++) out.push(recordInstalledSurface({ chain: 'claude', version: '0123456789abcdef', artifacts: [{ path: file + '.' + tag + '.' + i, kind: 'file', sha256: 'c'.repeat(64) }], scripts: [], file, waitMs: Number(waitMs) }));\n"
+    + "process.stdout.write(JSON.stringify(out.map((r) => r.ok ? 'ok' : r.reason)));\n");
+  const runDriver = (tag, n, waitMs) => JSON.parse(execFileSync(process.execPath, [driver, surface, tag, String(n), String(waitMs)], { encoding: "utf-8" }));
+  const heldResult = withInstalledSurfaceLock(surface, () => runDriver("held", 1, 150), { waitMs: 0 });
+  assert.deepEqual([heldResult.ok, heldResult.run, fs.existsSync(surface)], [true, ["surface_busy"], false], "持锁期间别的写者写不进去");
+  assert.deepEqual(runDriver("after", 1, 150), ["ok"], "放开后写得进去");
+  const pair = path.join(base, "pair-driver.mjs");
+  fs.writeFileSync(pair, "import { spawn } from 'node:child_process';\nconst [driver, file] = process.argv.slice(2);\n"
+    + "const run = (tag) => new Promise((res) => { const c = spawn(process.execPath, [driver, file, tag, '15', '5000'], { stdio: ['ignore', 'pipe', 'inherit'] }); let out = ''; c.stdout.on('data', (d) => { out += d; }); c.on('exit', () => res(JSON.parse(out))); });\n"
+    + "const [a, b] = await Promise.all([run('A'), run('B')]); process.stdout.write(JSON.stringify({ a, b }));\n");
+  const pairOut = JSON.parse(execFileSync(process.execPath, [pair, driver, surface], { encoding: "utf-8" }));
+  assert.deepEqual([pairOut.a.every((x) => x === "ok"), pairOut.b.every((x) => x === "ok"), readInstalledSurface({ file: surface }).doc.chains.claude.artifacts.length], [true, true, 15 + 15 + 1], "两个真实进程并发各记 15 条，一条不丢：" + JSON.stringify(pairOut));
+  fs.unlinkSync(surface);
+
   // ── runtime：stage 只落目录、不切 current；activate 只切已验目录；篡改后拒
   const root = path.join(base, "rt");
   const plan = planRuntimeSyncB({ sourceRoot: path.resolve("."), root });
@@ -20622,6 +20667,10 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   assert.deepEqual([act.ok, fs.readlinkSync(path.join(root, "current")), verifyRuntimeB({ root }).ok], [true, path.join("versions", plan.version), true], JSON.stringify(act));
   fs.appendFileSync(path.join(root, "versions", plan.version, "scripts", "doctor.mjs"), "\n// tampered");
   assert.deepEqual([verifyRuntimeVersionB({ version: plan.version, root }).ok, activateRuntimeVersionB({ version: plan.version, root }).reason], [false, "version_not_committable"], "篡改的目录不切");
+  // current 正指着这个坏目录：stage 不许动它（挪走 → 换上之间 current 会悬空），零改动；applyRuntimeSync 老路径仍能原地修复
+  const inUse = stageRuntimeVersionB(plan, { root });
+  assert.deepEqual([inUse.reason, fs.existsSync(path.join(root, "versions", plan.version, "INSTALLED.json")), fs.readdirSync(path.join(root, "versions")).filter((n) => n.startsWith(".corrupt-") || n.startsWith(".staging-")).length, fs.readlinkSync(path.join(root, "current"))], ["version_in_use", true, 0, path.join("versions", plan.version)], JSON.stringify(inUse));
+  assert.deepEqual([applyRuntimeSyncB(plan, { root }).ok, verifyRuntimeB({ root }).ok], [true, true], "老路径原地修复");
   // ── 入口清单：不缺、含关键入口
   const manifest = maintenanceEntryManifest({ repoRoot: path.resolve("."), home, codexHome: path.join(home, ".codex") });
   assert.deepEqual(manifest.missing, []);
@@ -20640,6 +20689,11 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   assert.equal(compareInstalledSurface({ chain: "claude", file: surface, home, node }).ok, true, "无关设置变化不挡门");
   live.hooks.Stop.find((e) => e.hooks[0].command.includes("FEISHU_BRIDGE_HOOK:")).hooks[0].timeout = 99; fs.writeFileSync(settingsFile, JSON.stringify(live, null, 2) + "\n");
   assert.deepEqual(compareInstalledSurface({ chain: "claude", file: surface, home, node }).mismatches.map((m) => path.basename(m.path)), ["settings.json"], "我们的 hook 变了要挡");
+  // 收据记在全部制品写完之后：plist 写失败 → 安装器非零退出、收据一个字节不变
+  const receiptBytes = fs.readFileSync(surface);
+  const plistPath = claudeDrainPlistPath(home); fs.rmSync(plistPath); fs.mkdirSync(plistPath);
+  assert.throws(() => execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env, stdio: "pipe" }), "plist 位置是目录 → 安装失败");
+  assert.equal(fs.readFileSync(surface).equals(receiptBytes), true, "失败的安装不改收据");
 });
 
 summarySealed = true;

@@ -300,20 +300,6 @@ for (const sk of skillPlan) {
   }
 }
 
-// 机器级安装收据（维护门 PR B）：记下这次往线上写了什么（settings 只记桥拥有的封闭条目、plist 与技能整文件）与引用的脚本。
-// 收据读不出（畸形）就不覆盖、只报出来 —— 它是下一次维护预检的"当前投影"，不能被安装器顺手改坏。
-if (!uninstall) {
-  const installedVersion = verifyRuntime().version ?? null;
-  const artifacts = [
-    { path: SETTINGS, kind: "claude-settings", sha256: artifactSha({ kind: "claude-settings", text: settingsAfter, home: os.homedir(), node: NODE_BIN }) },
-    { path: PLIST, kind: "plist", sha256: artifactSha({ kind: "plist", text: plistBody }) },
-    ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => ({ path: sk.dstFile, kind: "skill", sha256: artifactSha({ kind: "skill", text: renderSkill(fs.readFileSync(sk.srcFile, "utf-8")) }) })),
-  ];
-  const scripts = referencedRuntimeScripts([settingsAfter, plistBody, ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => renderSkill(fs.readFileSync(sk.srcFile, "utf-8")))].join("\n"));
-  const receipt = installedVersion ? recordInstalledSurface({ chain: "claude", version: installedVersion, artifacts, scripts, file: installedSurfacePath({ chain: "claude", home: os.homedir() }) }) : { ok: false, reason: "runtime_version_unknown" };
-  console.log("安装收据 : " + (receipt.ok ? "已记（" + artifacts.length + " 个制品，" + scripts.length + " 个脚本）" : "**没记下**（" + receipt.reason + (receipt.why ? "：" + receipt.why : "") + "）—— 维护门预检会拿不到当前投影"));
-}
-
 // launchd：先 bootout 再 bootstrap。改了 plist 不重新加载的话，跑的还是旧的那份，
 // 而且看不出来 —— 文件是新的，行为是旧的，是最难查的那种不一致。
 /**
@@ -365,6 +351,20 @@ if (uninstall) {
     : loaded.ok
       ? "已加载"
       : "**plist 已写入但 launchctl 加载失败 —— 兜底重试目前不生效**";
+}
+
+// 机器级安装收据（维护门 PR B）—— **放在全部制品（settings / 技能 / plist）都写完之后**：记的是已经落盘的东西，不是打算写的。记下这次往线上写了什么（settings 只记桥拥有的封闭条目、plist 与技能整文件）与引用的脚本。
+// 收据读不出（畸形）就不覆盖、只报出来 —— 它是下一次维护预检的"当前投影"，不能被安装器顺手改坏。
+if (!uninstall) {
+  const installedVersion = verifyRuntime().version ?? null;
+  const artifacts = [
+    { path: SETTINGS, kind: "claude-settings", sha256: artifactSha({ kind: "claude-settings", text: settingsAfter, home: os.homedir(), node: NODE_BIN }) },
+    { path: PLIST, kind: "plist", sha256: artifactSha({ kind: "plist", text: plistBody }) },
+    ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => ({ path: sk.dstFile, kind: "skill", sha256: artifactSha({ kind: "skill", text: renderSkill(fs.readFileSync(sk.srcFile, "utf-8")) }) })),
+  ];
+  const scripts = referencedRuntimeScripts([settingsAfter, plistBody, ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => renderSkill(fs.readFileSync(sk.srcFile, "utf-8")))].join("\n"));
+  const receipt = installedVersion ? recordInstalledSurface({ chain: "claude", version: installedVersion, artifacts, scripts, file: installedSurfacePath({ chain: "claude", home: os.homedir() }) }) : { ok: false, reason: "runtime_version_unknown" };
+  console.log("安装收据 : " + (receipt.ok ? "已记（" + artifacts.length + " 个制品，" + scripts.length + " 个脚本）" : "**没记下**（" + receipt.reason + (receipt.why ? "：" + receipt.why : "") + "）—— 维护门预检会拿不到当前投影"));
 }
 
 console.log("\n" + (backup ? "settings 已改，备份：" + backup : "settings 无改动，未重写"));

@@ -1,7 +1,7 @@
 /**
  * 维护门的**入口清单**（issue #81 PR B，方案稿"桩清单"）—— 只有这一份，安装器 / 桩生成器 / 预检 / 测试都从这里取。
  *
- * 清单 = 登记的启动源与技能引用到的全部 runtime/current 脚本（从三个安装器的**投影**里解析，不手抄）
+ * 清单 = 登记的启动源与技能引用到的全部 runtime/current 脚本（从三个安装器的**投影**里解析，不手抄）∪ Codex prompt-hook 签发的控制脚本
  * 放在 scripts/maintenance/：机器级维护工具本来就跨两条链（与 doctor 起 Codex 子进程同理），不算 Claude 运行时依赖 codex。
  *      ∪ 固定 worker（入站当场起的、定时器起的）∪ 状态入口（status / doctor 两链）。
  * 测试对照：沙箱里跑三个安装器 → 产出的 settings / hooks.json / skills / plist 引用的每个脚本 ⊆ 清单；清单每项在源码树里存在。
@@ -16,6 +16,7 @@ import { renderCodexHooks, pickNode } from "../codex/hook-command.mjs";
 import { SKILLS as CODEX_SKILLS, expectedSkillContent } from "../codex/skill-content.mjs";
 import { plistBody as codexDrainPlist } from "../codex/drain-service.mjs";
 import { codexRuntimeRoot } from "../runtime-install.mjs";
+import { PROMPT_HOOK_COMMAND_SCRIPTS } from "../codex/prompt-hook.mjs";
 
 /** 入站当场起的 worker 与定时器起的 worker：不从任何配置里引用，得钉死。 */
 export const FIXED_WORKERS = Object.freeze([
@@ -44,6 +45,8 @@ export function maintenanceEntryManifest({ repoRoot, home = os.homedir(), codexH
   const runtimeCurrent = path.join(codexRuntimeRoot(codexHome), "current");
   const hooks = renderCodexHooks({ baseText: null, promptScript: path.join(runtimeCurrent, "scripts", "codex", "prompt-hook.mjs"), stopScript: path.join(runtimeCurrent, "scripts", "codex", "stop-hook.mjs"), node: codexNode, home: bridgeHome, log: path.join(bridgeHome, "hook.log") });
   for (const n of referencedRuntimeScripts(hooks.text)) add(n, "codex-hook");
+  // prompt-hook 不是终点：它往 additionalContext 里签发控制命令，那些脚本也是启动源
+  for (const n of PROMPT_HOOK_COMMAND_SCRIPTS) add(n, "codex-prompt-hook");
   for (const sk of CODEX_SKILLS) for (const file of sk.files) {
     const src = path.join(repoRoot, "skills", sk.name, file);
     if (!fs.existsSync(src)) continue;

@@ -28,6 +28,7 @@ import { codexHooksOwnedEntries } from "../codex/hook-command.mjs";
 import { LAUNCH_LABEL as CODEX_DRAIN_LABEL, expectedJob as codexExpectedJob, plistBody as codexPlistBody, plistPath as codexPlistPath } from "../codex/drain-service.mjs";
 import { bridgeHome as codexBridgeHomeOf, loadCodexTemplate, templateFile as codexTemplateFile } from "../codex/state.mjs";
 import { maintenanceEntryManifest } from "./maintenance-entries.mjs";
+import { analyzeCommandRefs, refsUnderRoots } from "./command-refs.mjs";
 import { ORIGINAL_THREE_STATE, timerPhase } from "./timers.mjs";
 
 const realOrNull = (p) => { try { return fs.realpathSync(p); } catch { return null; } };
@@ -67,27 +68,6 @@ export function chainAgentUid(facts) {
 }
 
 /**
- * hook 命令里的路径参数：'…' / "…" / 裸 token，绝对路径的做 realpath；~ 与 $HOME 展开；别的 $VAR 解析不了。
- * 返回 { resolved:[realpath|null 的原 token], unresolvable:[token] }。
- */
-export function commandPathTokens(cmd, { home }) {
-  const tokens = [];
-  const re = /'([^']*)'|"([^"]*)"|(\S+)/gu;
-  for (const m of cmd.matchAll(re)) tokens.push(m[1] ?? m[2] ?? m[3]);
-  const resolved = [], unresolvable = [];
-  for (const raw of tokens) {
-    let t = raw;
-    if (t.startsWith("~/")) t = path.join(home, t.slice(2));
-    if (t.startsWith("$HOME/")) t = path.join(home, t.slice("$HOME/".length));
-    if (/\$\{?[A-Za-z_]/u.test(t)) { unresolvable.push(raw); continue; }
-    if (!path.isAbsolute(t)) continue;
-    const real = realOrNull(t);
-    resolved.push({ raw, real });
-  }
-  return { resolved, unresolvable };
-}
-
-/**
  * 提到这条链运行时根的 hook 命令，必须全部是桥拥有的条目。"提到"不只看字符串：命令里每个路径参数 realpath 之后
  * 落在**任一条链**的 runtime 根（current / versions/*）之下也算（评审探针：symlink 别名指向 versions/<v>，字符串里没有运行时根）；
  * 含解析不了的 $VAR 且又提到 feishu-bridge / runtime 字样的非桥命令 → 不能算已验证的启动源，同样拒。
@@ -108,13 +88,13 @@ function foreignHookCommands({ chain, text, root, otherRoot, home, node }) {
   if (counts.some((c) => c !== 1)) return { ok: false, why: "桥拥有的 hook 条目不是各恰好一条：" + JSON.stringify(counts) };
   const roots = [root, otherRoot].filter((r) => typeof r === "string");
   const rootReals = roots.map(realOrNull).filter((r) => r !== null);
-  const underRuntime = (real) => real !== null && rootReals.some((rr) => real === rr || real.startsWith(rr + path.sep));
+    // 非桥命令必须能证明安全：字符串里没提运行时根；每个路径参数（含 sh -c 内联串、尾随操作符剥掉之后）realpath 都不在任一条链的运行时之下；没有变量 / 命令替换 / eval
   const mentions = (cmd) => {
     if (roots.some((r) => cmd.includes(r)) || rootReals.some((r) => cmd.includes(r)) || cmd.includes("feishu-bridge/runtime")) return "字符串里提到运行时根";
-    const t = commandPathTokens(cmd, { home });
-    const hit = t.resolved.find((x) => underRuntime(x.real));
+    const refs = analyzeCommandRefs(cmd, { home });
+    const hit = refsUnderRoots(refs, rootReals);
     if (hit) return "路径参数 " + hit.raw + " 解析后落在运行时之下（" + hit.real + "）";
-    if (t.unresolvable.length > 0 && /feishu-bridge|runtime/u.test(cmd)) return "含解析不了的变量（" + t.unresolvable.join("、") + "）又提到 feishu-bridge / runtime，无法验证";
+    if (refs.unsafe.length > 0) return "无法验证（" + refs.unsafe.join("、") + "）";
     return null;
   };
   const foreign = [];

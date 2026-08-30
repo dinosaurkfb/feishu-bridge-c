@@ -46,7 +46,8 @@ export const PHASE_REQUIRES = Object.freeze({
 });
 const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const SHA_SHAPE = /^[0-9a-f]{64}$/u;
-const REL_TARGET = /^versions\/[A-Za-z0-9_.-]+$/u;
+/** current 只许指两种受控形状：正式版本 versions/<16 hex> 或维护桩 versions/maintenance-<uuid>（没有 . / .. / 多段的归一化歧义）。 */
+const REL_TARGET = /^versions\/([0-9a-f]{16}|maintenance-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/u;
 const isCanonicalIso = (s) => typeof s === "string" && !Number.isNaN(Date.parse(s)) && new Date(s).toISOString() === s;
 const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
 const keysOf = (o) => Object.keys(o).sort().join(",");
@@ -95,22 +96,21 @@ function shapeProblemFor(s) {
   if (kind === "gate") {
     if (s.id !== "gate") return "gate 的 id 必须是 gate";
     if (s.before !== null) return "gate.before 必须是 null";
-    if (!(isObj(s.intended_after) && keysOf(s.intended_after) === "token" && UUID_SHAPE.test(String(s.intended_after.token)))) return "gate.intended_after 形状不对";
-    if (!(s.after === null || (isObj(s.after) && keysOf(s.after) === "token,txnUncleared" && UUID_SHAPE.test(String(s.after.token)) && (s.after.txnUncleared === null || (isObj(s.after.txnUncleared) && typeof s.after.txnUncleared.path === "string"))))) return "gate.after 形状不对";
+    const isUuid = (x) => typeof x === "string" && UUID_SHAPE.test(x);
+    if (!(isObj(s.intended_after) && keysOf(s.intended_after) === "token" && isUuid(s.intended_after.token))) return "gate.intended_after 形状不对";
+    const txnOk = (x) => x === null || (isObj(x) && keysOf(x) === "path,why" && typeof x.path === "string" && path.isAbsolute(x.path) && typeof x.why === "string");
+    if (!(s.after === null || (isObj(s.after) && keysOf(s.after) === "token,txnUncleared" && isUuid(s.after.token) && txnOk(s.after.txnUncleared)))) return "gate.after 形状不对";
     if (s.backup !== null) return "gate 不该有备份";
     return null;
   }
-  const fileState = (x) => isObj(x) && keysOf(x) === "exists,sha256" && typeof x.exists === "boolean" && (x.sha256 === null || (typeof x.sha256 === "string" && SHA_SHAPE.test(x.sha256))) && (x.exists || x.sha256 === null);
-  if (kind === "artifact") {
-    if (!idOk || !path.isAbsolute(rest)) return "artifact 的 id 必须是 artifact:<绝对路径>";
-    if (!fileState(s.before) || !fileState(s.intended_after) || !(s.after === null || fileState(s.after))) return "artifact 的 before / intended_after / after 形状不对";
-    if (s.before.exists && s.backup === null) return "artifact 原来存在必须有备份";
-    return null;
-  }
-  if (kind === "receipt") {
-    if (!idOk || !CHAIN_ID.test(rest)) return "receipt 的 id 必须是 receipt:<chain>";
-    if (!fileState(s.before) || !fileState(s.intended_after) || !(s.after === null || fileState(s.after))) return "receipt 的 before / intended_after / after 形状不对";
-    if (s.before.exists && s.backup === null) return "receipt 原来存在必须有备份";
+  // {exists, sha256}：存在必须有 sha，不存在必须 sha 为 null
+  const fileState = (x) => isObj(x) && keysOf(x) === "exists,sha256" && typeof x.exists === "boolean" && (x.exists ? (typeof x.sha256 === "string" && SHA_SHAPE.test(x.sha256)) : x.sha256 === null);
+  if (kind === "artifact" || kind === "receipt") {
+    if (kind === "artifact" && (!idOk || !path.isAbsolute(rest))) return "artifact 的 id 必须是 artifact:<绝对路径>";
+    if (kind === "receipt" && (!idOk || !CHAIN_ID.test(rest))) return "receipt 的 id 必须是 receipt:<chain>";
+    if (!fileState(s.before) || !fileState(s.intended_after) || !(s.after === null || fileState(s.after))) return kind + " 的 before / intended_after / after 形状不对";
+    if (s.before.exists && s.backup === null) return kind + " 原来存在必须有备份";
+    if (!s.before.exists && s.backup !== null) return kind + " 原来不存在不该有备份";
     return null;
   }
   return "kind 不在受控集合里";
@@ -133,7 +133,7 @@ export function journalProblem(doc) {
   if (!isObj(doc)) return "不是对象";
   if (doc.schema_version !== JOURNAL_SCHEMA) return "schema_version 不认识";
   if (keysOf(doc) !== "notes,phase,reason,schema_version,started_at,steps,token,updated_at") return "字段集不对";
-  if (typeof doc.token !== "string" || !UUID_SHAPE.test(doc.token)) return "token 不是 UUID";
+  if (typeof doc.token !== "string" || !UUID_SHAPE.test(doc.token)) return "token 不是 UUID 字符串";
   if (typeof doc.reason !== "string" || [...doc.reason].length > 80) return "reason 不是 ≤ 80 码点的字符串";
   if (!isCanonicalIso(doc.started_at) || !isCanonicalIso(doc.updated_at)) return "时间不是规范化 ISO";
   if (!PHASES.includes(doc.phase)) return "phase 不在封闭集合里：" + String(doc.phase);
@@ -221,8 +221,12 @@ export function acquireOperationLease({ dir, token }) {
 }
 export function releaseOperationLease(lease) {
   if (!lease?.path) return { ok: true, absent: true };
-  try { const r = releasePublishLock(lease.path); return r.ok || r.reason === "not_owner" ? { ok: true } : { ok: false, why: String(r.reason), path: lease.path, reapUncleared: r.reapUncleared ?? null }; }
-  catch (err) { return { ok: false, why: "release_threw：" + errCode(err), path: lease.path }; }
+  try {
+    const r = releasePublishLock(lease.path);
+    // 归属转换锁 .reap 交不还：主租约可能已删，但 .reap 残骸会让后续续跑一律 reap_residue —— 不是成功，点名真实路径
+    if (r.reapUncleared) return { ok: false, why: "reap_uncleared：" + String(r.reapUncleared.error ?? ""), path: r.reapUncleared.path };
+    return r.ok || r.reason === "not_owner" ? { ok: true } : { ok: false, why: String(r.reason), path: lease.path };
+  } catch (err) { return { ok: false, why: "release_threw：" + errCode(err), path: lease.path }; }
 }
 
 /**
@@ -270,7 +274,9 @@ export function updateJournal({ dir, token, lease, expectPhase = null, mutate, n
   const c = commitWhileHeld(lease.path, () => { try { writeDurable(journalPath(dir, token), JSON.stringify(next, null, 2) + "\n"); return null; } catch (err) { return errCode(err); } });
   if (!c.ok) return { ok: false, reason: c.reason === "lock_lost" ? "lease_lost" : "io_error", why: "租约核对：" + String(c.reason) };
   if (c.run !== null) return { ok: false, reason: "io_error", why: c.run };
-  return { ok: true, doc: next, ...(c.reapUncleared ? { leaseReapUncleared: c.reapUncleared } : {}) };
+  // 写已落盘，但租约的归属转换锁交不还：之后的每次写都会 reap_residue —— 立即停，不许再做外部变更（调用方保留 active / journal，退出码 3）
+  if (c.reapUncleared) return { ok: false, reason: "lease_reap_uncleared", why: String(c.reapUncleared.error ?? ""), path: c.reapUncleared.path, written: true, doc: next };
+  return { ok: true, doc: next };
 }
 
 export const setPhase = ({ dir, token, lease, phase, expectPhase = null, note = null, now }) => updateJournal({ dir, token, lease, expectPhase, now, mutate: (d) => { d.phase = phase; if (note !== null) d.notes.push(note); return d; } });
@@ -304,6 +310,31 @@ export function listJournals({ dir } = {}) {
   let names = [];
   try { names = fs.readdirSync(dir); } catch (err) { return { ok: err?.code === "ENOENT", tokens: [], why: err?.code === "ENOENT" ? null : errCode(err) }; }
   return { ok: true, tokens: names.filter((n) => /^[0-9a-f-]{36}\.json$/u.test(n) && UUID_SHAPE.test(n.slice(0, -5))).map((n) => n.slice(0, -5)).sort() };
+}
+
+/**
+ * 维护目录盘点（只读，给 --status / doctor）：孤立 journal（active 没指向它 —— 例如两个 enter 竞争 active 的输家）、非 active 的租约与租约锁家族残骸、
+ * 写 journal 的临时文件、非 active 的 plist 备份。只报告，不清理（能证明是输家的才该按受控协议清，这里不猜）。
+ */
+export function inspectMaintenanceDir({ dir } = {}) {
+  const residues = [];
+  if (typeof dir !== "string" || dir.length === 0) return { inventory: "unknown", residues };
+  let names;
+  try { names = fs.readdirSync(dir); } catch (err) { return err?.code === "ENOENT" ? { inventory: "ok", residues } : { inventory: "unreadable", residues: [{ path: dir, kind: "inventory", detail: "目录读不出：" + errCode(err) }] }; }
+  const active = readActive({ dir });
+  const activeToken = active.state === "active" ? active.token : null;
+  for (const n of names.sort()) {
+    const full = path.join(dir, n);
+    if (n === "active") continue;
+    let m;
+    if ((m = /^([0-9a-f-]{36})\.json$/u.exec(n)) && UUID_SHAPE.test(m[1])) { if (m[1] !== activeToken) { const j = readJournal({ dir, token: m[1] }); residues.push({ path: full, kind: "orphan_journal", detail: j.state === "valid" ? "没有 active 指向的 journal（阶段 " + j.doc.phase + "，" + j.doc.started_at + "）—— 竞争输家或已终结未清理，只人工处置" : "没有 active 指向且读不出的 journal（" + String(j.why) + "）—— 只人工处置" }); } continue; }
+    if ((m = /^([0-9a-f-]{36})\.lease$/u.exec(n)) && UUID_SHAPE.test(m[1])) { const h = leaseHolder({ dir, token: m[1] }); if (m[1] !== activeToken) residues.push({ path: full, kind: "stale_lease", detail: "非 active operation 的租约" + (h.alive ? "（持有者 pid " + h.pid + " 仍在）" : "（持有者已不在）") + " —— 只人工处置" }); else if (h.present && !h.unreadable && !h.alive) residues.push({ path: full, kind: "dead_lease", detail: "active operation 的租约持有者 pid " + h.pid + " 已不在 —— 下一个执行者会接管" }); continue; }
+    if (/^[0-9a-f-]{36}\.lease\.(reap|maint)$/u.test(n) || /^[0-9a-f-]{36}\.lease\.reaped-/u.test(n) || /^[0-9a-f-]{36}\.lease\.reap\.quarantine-/u.test(n)) { residues.push({ path: full, kind: "lease_lock_residue", detail: "租约锁家族残骸 —— node scripts/repair-publish-lock.mjs --lock " + path.join(dir, n.split(".lease")[0] + ".lease") + " 能清（.reap / 隔离），其余只人工处置" }); continue; }
+    if (/^\.journal\.\d+\.[0-9a-f-]{36}\.tmp$/u.test(n)) { residues.push({ path: full, kind: "tmp", detail: "写 journal 的临时文件残骸 —— 人工删即可" }); continue; }
+    if ((m = /^([0-9a-f-]{36})\.(claude|codex)\.plist$/u.exec(n)) && UUID_SHAPE.test(m[1])) { if (m[1] !== activeToken) residues.push({ path: full, kind: "stale_backup", detail: "非 active operation 的 plist 备份 —— 只人工处置" }); continue; }
+    residues.push({ path: full, kind: "unknown", detail: "维护目录里不认识的文件 —— 只人工处置" });
+  }
+  return { inventory: "ok", residues };
 }
 
 /** 租约持有者（只读，给 --status）：{ present, pid, alive } */

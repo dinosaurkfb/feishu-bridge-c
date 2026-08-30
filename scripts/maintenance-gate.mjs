@@ -46,6 +46,7 @@ export function runMaintenanceGate(argv, { ctx = null, out = (s) => process.stdo
     if (!r.ok) {
       if (r.reason === "startup_source_unverified") { out("拒绝进门（startup_source_unverified）：启动源与当前投影对不上，什么都没动\n" + fmtItems(r.items)); return 1; }
       if (r.rollback) { const rb = r.rollback; out("进门失败（" + r.reason + "：" + r.why + "），已按账回退：" + (rb.ok && rb.activeCleared ? rb.phase : "**" + String(rb.phase ?? rb.reason) + "** —— 门与账保留，看 --status") + (r.processes ? "\n残留进程：" + r.processes.map((p) => p.pid + " " + p.command).join("\n") : "") + (rb.incomplete ? "\n" + rb.incomplete.map((i) => "  · " + i.id + "：" + i.why).join("\n") : "") + residue); return rb.ok && rb.activeCleared && !r.leaseUncleared ? 1 : 3; }
+      if (r.reason === "lease_reap_uncleared") { out("进门中途停下（租约的归属转换锁交不还：" + String(r.path) + "）—— 什么都没再动，operation 保留（阶段见 --status）；清掉该残骸后跑 --exit --apply 按账回退" + residue); return 3; }
       if (r.leaseUncleared) { out("进门做完了但租约交不还" + residue); return 3; }
       out("拒绝进门（" + r.reason + (r.why ? "：" + r.why : "") + (r.path ? "，" + r.path : "") + "）"); return 1;
     }
@@ -54,6 +55,7 @@ export function runMaintenanceGate(argv, { ctx = null, out = (s) => process.stdo
   }
   const r = exitMaintenance(c, { apply: parsed.apply });
   if (r.dryRun) { out("[预览] operation " + r.token.slice(0, 8) + " 阶段 " + r.phase + " → 动作：" + r.action + (r.executor ? "（执行者 pid " + r.executor + " 正在跑，此刻 --apply 会被拒）" : "") + "。加 --apply 执行。"); return 0; }
+  if (!r.ok && !r.phase && r.reason === "journal_write_failed" && /lease_reap_uncleared/u.test(String(r.why))) { out("出门中途停下（租约的归属转换锁交不还）—— operation 保留，清掉残骸后再跑 --exit --apply" + (r.why ? "：" + r.why : "")); return 3; }
   if (!r.ok && !r.phase) { out("出门做不了（" + r.reason + (r.why ? "：" + r.why : "") + (r.path ? "，" + r.path : "") + "）"); return 1; }
   const residue = r.leaseUncleared ? "\n租约交不还：" + r.leaseUncleared.path + "（" + r.leaseUncleared.why + "）—— 请人工核对" : "";
   if (r.ok && r.activeCleared && !r.leaseUncleared) { out("已出门：阶段 " + r.phase + "，active 已清"); return 0; }

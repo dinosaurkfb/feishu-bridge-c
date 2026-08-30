@@ -218,7 +218,8 @@ import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as 
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus } from "./maintenance/operation.mjs";
 import { clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, journalProblem, readActive, readJournal, releaseOperationLease, updateJournal } from "./maintenance/journal.mjs";
-import { commandPathTokens } from "./maintenance/precheck.mjs";
+import { analyzeCommandRefs, refsUnderRoots, tokenizeCommand } from "./maintenance/command-refs.mjs";
+import { inspectMaintenanceDir } from "./maintenance/journal.mjs";
 import { buildStubVersion, removeStubVersion, renderStubScript, stubCategory, stubRelTarget } from "./maintenance/stub.mjs";
 import { listBridgeProcesses, parsePs, waitForQuiet } from "./maintenance/inventory.mjs";
 import { parseMaintenanceGateArgs, runMaintenanceGate } from "./maintenance-gate.mjs";
@@ -20905,10 +20906,12 @@ test("维护门 · PR C：预检拒绝五种漂移；进门两阶段记账、桩
     fs.writeFileSync(settingsFile, JSON.stringify(withAlias, null, 2) + "\n");
     const r1b = enterMaintenance(ctx, { reason: "x", apply: true });
     assert.deepEqual([r1b.ok, ids(r1b), /解析后落在运行时之下/u.test(r1b.items?.[0]?.why ?? ""), (r1b.items?.[0]?.why ?? "").includes("unrelated")], [false, "startup_source_unverified" === r1b.reason ? ["claude:hooks"] : ids(r1b), true, false], "别名 symlink 指向版本目录的 hook 必须拒，无关 hook 不点名：" + JSON.stringify(r1b.items ?? r1b));
-    const withVar = JSON.parse(settingsBytes); withVar.hooks.Stop.push({ hooks: [{ type: "command", command: "node \"$BRIDGE_DIR/runtime/x.mjs\"", timeout: 5 }] });
-    fs.writeFileSync(settingsFile, JSON.stringify(withVar, null, 2) + "\n");
-    const r1c = enterMaintenance(ctx, { reason: "x", apply: true });
-    assert.deepEqual([ids(r1c), /无法验证/u.test(r1c.items?.[0]?.why ?? "")], [["claude:hooks"], true], JSON.stringify(r1c.items ?? r1c));
+    for (const [label, cmd] of [["尾分号", "node " + path.join(aliasDir, "scripts", "stop-hook.mjs") + ";"], ["sh -c 内联", "sh -c 'node " + path.join(aliasDir, "scripts", "stop-hook.mjs") + "'"], ["变量路径", "node \"$OLD/scripts/stop-hook.mjs\""], ["命令替换", "node $(cat /tmp/x)"]]) {
+      const doc = JSON.parse(settingsBytes); doc.hooks.Stop.push({ hooks: [{ type: "command", command: cmd, timeout: 5 }] });
+      fs.writeFileSync(settingsFile, JSON.stringify(doc, null, 2) + "\n");
+      const r = enterMaintenance(ctx, { reason: "x", apply: true });
+      assert.deepEqual([ids(r), /解析后落在运行时之下|无法验证/u.test(r.items?.[0]?.why ?? "")], [["claude:hooks"], true], label + "：" + JSON.stringify(r.items ?? r));
+    }
     fs.writeFileSync(settingsFile, settingsBytes);
     const codexHooksFile = path.join(codexHome, "hooks.json"); const codexHooksBytes = fs.readFileSync(codexHooksFile, "utf-8");
     const codexAlias = path.join(base, "codex-alias"); fs.symlinkSync(path.join(codexRoot, "versions", fs.readlinkSync(path.join(codexRoot, "current")).split("/")[1]), codexAlias);
@@ -20947,7 +20950,10 @@ test("维护门 · PR C：预检拒绝五种漂移；进门两阶段记账、桩
 
     // ── 进门：第一次盘点有一个桥进程、第二次没有 → drained
     const origClaude = fs.readlinkSync(path.join(claudeRoot, "current")), origCodex = fs.readlinkSync(path.join(codexRoot, "current"));
+    // 别名进程（命令行里没有运行时根，路径 realpath 后落在旧版本目录）也要被盘点认出来
     psRows.push({ pid: 4242, ppid: 1, command: node + " " + path.join(claudeRoot, "current", "scripts", "watch-and-publish.mjs") + " --x" }, { pid: 4243, ppid: 4242, command: "claude -p" }, { pid: process.pid, ppid: 1, command: "node test" });
+    const aliasProc = listBridgeProcesses({ roots: [path.join(claudeRoot, "current", "scripts")], ps: () => ({ ok: true, stdout: "PID PPID COMMAND\n7777 1 node " + path.join(aliasDir, "scripts", "stop-hook.mjs") + "\n" }), selfPid: 1 });
+    assert.deepEqual(aliasProc.processes.map((p) => p.pid), [7777], "别名进程要被认出：" + JSON.stringify(aliasProc));
     let tick = 0; let nested = null;
     const psOnce = () => { const r = fakePs(); if (tick++ === 0) { nested = exitMaintenance(ctx, { apply: true }); return r; } psRows.length = 0; return fakePs(); };
     const entered = enterMaintenance({ ...ctx, ps: psOnce }, { reason: "改锁协议：symlink 协议 v2", waitMs: 60000, apply: true });
@@ -21025,6 +21031,31 @@ test("维护门 · PR C：预检拒绝五种漂移；进门两阶段记账、桩
     assert.deepEqual([codeT, /归属转换锁交不还/u.test(outT.join("\n")), readJournal({ dir, token: enteredT.token }).doc.phase, readActive({ dir }).token, readGate({ file: gateFile, now: clock }).state], [3, true, "rollback_incomplete", enteredT.token, "absent"], outT.join("\n"));
     const afterT = exitMaintenance(ctx, { apply: true });
     assert.deepEqual([afterT.ok, afterT.phase, readActive({ dir }).state, fs.readlinkSync(path.join(claudeRoot, "current"))], [true, "rolled_back", "absent", origClaude], JSON.stringify(afterT));
+    // ── 租约的归属转换锁交不还（release 分支）：出门已做完（rolled_back、active 清），但结果非成功、点名 .lease.reap，CLI 退出码 3
+    const enteredR = enterMaintenance(ctx, { reason: "reap-release", apply: true });
+    assert.equal(enteredR.ok, true, JSON.stringify(enteredR));
+    const leaseReap = path.join(dir, enteredR.token + ".lease.reap"), leaseMain = path.join(dir, enteredR.token + ".lease");
+    // 只在"主租约已删、接着交还 .reap"那一次注入 EIO（写账的 reap 释放不碰）
+    const origRm = fs.rmSync; let armed = false;
+    fs.rmSync = (target, ...args) => { const t = path.resolve(String(target)); if (t === path.resolve(leaseMain)) { armed = true; return origRm(target, ...args); } if (armed && t === path.resolve(leaseReap)) { armed = false; const e = new Error("reap release failed"); e.code = "EIO"; throw e; } return origRm(target, ...args); };
+    let outR = [], codeR;
+    try { codeR = runMaintenanceGate(["--exit", "--apply"], { ctx, out: (t) => outR.push(t) }); } finally { fs.rmSync = origRm; }
+    const present = (f) => { try { fs.lstatSync(f); return true; } catch { return false; } };
+    assert.deepEqual([codeR, /租约交不还/u.test(outR.join("\n")), outR.join("\n").includes(leaseReap), readJournal({ dir, token: enteredR.token }).doc.phase, readActive({ dir }).state, present(leaseReap)], [3, true, true, "rolled_back", "absent", true], outR.join("\n"));
+    fs.unlinkSync(leaseReap);
+    // ── 租约的归属转换锁交不还（commit 分支）：写账已落盘但 .reap 交不还 → enter 立即停：不做后续外部变更（定时器没停、current 没切、门没建），active / journal 保留；清掉残骸后 --exit --apply 按账回退
+    let hits = 0; armed = true;
+    fs.rmSync = (target, ...args) => { if (armed && /\.lease\.reap$/u.test(String(target)) && hits++ === 0) { const e = new Error("reap release failed"); e.code = "EIO"; throw e; } return origRm(target, ...args); };
+    let stopped;
+    try { stopped = enterMaintenance(ctx, { reason: "reap-commit", apply: true }); } finally { fs.rmSync = origRm; }
+    const stoppedJournal = readJournal({ dir, token: stopped.token });
+    assert.deepEqual([stopped.ok, stopped.reason, stopped.leaseUncleared?.path?.endsWith(".lease.reap"), launchd[claudeLabel].loaded, fs.readlinkSync(path.join(claudeRoot, "current")), readGate({ file: gateFile, now: clock }).state, readActive({ dir }).token, stoppedJournal.doc.phase, stoppedJournal.doc.steps.map((x) => x.id + ":" + x.state)], [false, "lease_reap_uncleared", true, true, origClaude, "absent", stopped.token, "planned", ["timer:claude:prepared"]], JSON.stringify(stopped));
+    const outS = []; assert.equal(runMaintenanceGate(["--exit", "--apply"], { ctx, out: (t) => outS.push(t) }), 1, "残骸没清之前续跑拿不到租约（reap_residue）：" + outS.join("\n"));
+    fs.unlinkSync(path.join(dir, stopped.token + ".lease.reap"));
+    // 真实世界里 enter 进程已经退出、租约按 pid 活性被接管；这里同一个进程还活着，手动交还
+    assert.equal(releaseOperationLease({ path: path.join(dir, stopped.token + ".lease") }).ok, true);
+    const resumed = exitMaintenance(ctx, { apply: true });
+    assert.deepEqual([resumed.ok, resumed.phase, readActive({ dir }).state, launchd[claudeLabel].loaded], [true, "rolled_back", "absent", true], JSON.stringify(resumed));
     // ── CAS 不成立：进门后有人把 Claude 的 current 切到别处 → --exit 不覆盖，rollback_incomplete，门与账保留；修好后再 --exit 只向前
     psRows.length = 0;
     const entered3 = enterMaintenance(ctx, { reason: "cas", apply: true });
@@ -21080,13 +21111,38 @@ test("维护门 · PR C 单元：journal 三态与两阶段、active 只许一�
     journalProblem(withStep(mkStep({ intended_after: 42 }))) !== null,
     journalProblem(withStep(mkStep({ backup: null }))) !== null,
     journalProblem(withStep(mkStep({ id: "current:claude", kind: "current", before: { not: "a target" }, intended_after: "versions/x", after: "versions/x", backup: null, backup_sha256: null, backup_bytes: null }))) !== null,
-    journalProblem(withStep(mkStep({ id: "current:claude", kind: "current", before: "versions/a", intended_after: "versions/x", after: "versions/x", backup: null, backup_sha256: null, backup_bytes: null }))),
+    journalProblem(withStep(mkStep({ id: "current:claude", kind: "current", before: "versions/0123456789abcdef", intended_after: "versions/fedcba9876543210", after: "versions/fedcba9876543210", backup: null, backup_sha256: null, backup_bytes: null }))),
     journalProblem(withStep(mkStep({ id: "gate", kind: "gate", before: null, intended_after: { token: good.token }, after: { token: "00000000-0000-4000-8000-000000000000", txnUncleared: null }, backup: null, backup_sha256: null, backup_bytes: null }))) !== null,
     journalProblem(withStep(mkStep({ state: "done", after: null }))) !== null,
-  ], [null, true, true, true, true, null, true, true], "按 kind 封闭的判别联合");
+    journalProblem({ ...good, token: [good.token] }) !== null,
+    journalProblem(withStep(mkStep({ id: "current:claude", kind: "current", before: "versions/..", intended_after: "versions/x", after: null, state: "prepared", backup: null, backup_sha256: null, backup_bytes: null }))) !== null,
+    journalProblem(withStep(mkStep({ id: "current:claude", kind: "current", before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + good.token, after: null, state: "prepared", backup: null, backup_sha256: null, backup_bytes: null }))),
+    journalProblem(withStep(mkStep({ id: "gate", kind: "gate", before: null, intended_after: { token: good.token }, after: { token: good.token, txnUncleared: { path: "/x", why: "EIO", extra: 1 } }, backup: null, backup_sha256: null, backup_bytes: null }))) !== null,
+    journalProblem(withStep(mkStep({ id: "receipt:claude", kind: "receipt", before: { exists: true, sha256: null }, intended_after: { exists: true, sha256: "a".repeat(64) }, after: null, state: "prepared", backup: "/b", backup_sha256: "a".repeat(64), backup_bytes: 1 }))) !== null,
+    journalProblem(withStep(mkStep({ id: "receipt:claude", kind: "receipt", before: { exists: false, sha256: null }, intended_after: { exists: true, sha256: "a".repeat(64) }, after: null, state: "prepared", backup: "/b", backup_sha256: "a".repeat(64), backup_bytes: 1 }))) !== null,
+  ], [null, true, true, true, true, null, true, true, true, true, null, true, true, true], "按 kind 封闭的判别联合");
   assert.deepEqual([dirFsyncIgnorable("EINVAL"), dirFsyncIgnorable("ENOTSUP"), dirFsyncIgnorable("EIO"), dirFsyncIgnorable(undefined)], [true, true, false, false]);
-  const tok = commandPathTokens("node '/a b/x.mjs' \"$HOME/y.mjs\" ~/z.mjs $OTHER/w.mjs --flag", { home: "/h" });
-  assert.deepEqual([tok.resolved.map((t) => t.raw), tok.unresolvable], [["/a b/x.mjs", "$HOME/y.mjs", "~/z.mjs"], ["$OTHER/w.mjs"]]);
+  // 命令引用解析：引号 / 操作符 / 尾分号 / sh -c 内联 / 变量 / 命令替换
+  const toks = tokenizeCommand("if [ -x '/a b/n' ]; then '/a b/n' \"/c/d.mjs\"; else x>/dev/null 2>&1 || :; fi");
+  assert.deepEqual([toks.filter((t) => t === "/a b/n").length, toks.includes("/c/d.mjs"), toks.some((t) => /[;&|(){}]/u.test(t)), toks.slice(0, 4)], [2, true, false, ["if", "[", "-x", "/a b/n"]], JSON.stringify(toks));
+  const refs = analyzeCommandRefs("node /x/a.mjs; sh -c 'node /y/b.mjs && echo ok' $HOME/c.mjs ~/d.mjs", { home: "/h" });
+  assert.deepEqual([refs.paths.map((p) => p.expanded), refs.unsafe], [["/x/a.mjs", "/bin/sh".startsWith("/") ? "/y/b.mjs" : null, "/h/c.mjs", "/h/d.mjs"].filter((x) => x !== null), []], JSON.stringify(refs));
+  assert.deepEqual([analyzeCommandRefs("node $OLD/x.mjs", { home: "/h" }).unsafe, analyzeCommandRefs("node `which x`", { home: "/h" }).unsafe.length > 0, analyzeCommandRefs("eval x", { home: "/h" }).unsafe, analyzeCommandRefs("bash -c", { home: "/h" }).unsafe.length > 0], [["变量 $OLD/x.mjs"], true, ["eval"], true]);
+  const aliasRoot = path.join(base, "alias-root"); fs.mkdirSync(path.join(aliasRoot, "scripts"), { recursive: true }); fs.writeFileSync(path.join(aliasRoot, "scripts", "x.mjs"), ""); fs.symlinkSync(aliasRoot, path.join(base, "alias-link"));
+  const hit = refsUnderRoots(analyzeCommandRefs("node " + path.join(base, "alias-link", "scripts", "x.mjs") + ";", { home: "/h" }), [fs.realpathSync(aliasRoot)]);
+  assert.deepEqual([hit?.raw, hit?.real], [path.join(base, "alias-link", "scripts", "x.mjs"), fs.realpathSync(path.join(aliasRoot, "scripts", "x.mjs"))], "尾分号剥掉、别名 realpath 命中");
+  // 维护目录盘点（独立目录，不依赖前面的 active 状态）：孤立 journal / 非 active 租约 / 租约锁残骸 / 临时文件 / 旧备份 / 不认识的文件
+  const dir2 = path.join(base, "maintenance2");
+  const orphan = createOperation({ dir: dir2, reason: "orphan" });
+  assert.equal(orphan.ok, true, JSON.stringify(orphan));
+  assert.deepEqual([releaseOperationLease(orphan.lease).ok, clearActiveJ({ dir: dir2, token: orphan.token }).cleared], [true, true]);
+  fs.symlinkSync(JSON.stringify({ pid: 2147483646, at: new Date().toISOString(), token: "t" }), path.join(dir2, "11111111-1111-4111-8111-111111111111.lease"));
+  fs.symlinkSync("junk", path.join(dir2, "11111111-1111-4111-8111-111111111111.lease.reap"));
+  fs.writeFileSync(path.join(dir2, ".journal.1.22222222-2222-4222-8222-222222222222.tmp"), ""); fs.writeFileSync(path.join(dir2, orphan.token + ".claude.plist"), ""); fs.writeFileSync(path.join(dir2, "stray.txt"), "");
+  const mdir = inspectMaintenanceDir({ dir: dir2 });
+  assert.deepEqual([mdir.inventory, mdir.residues.map((r) => r.kind).sort()], ["ok", ["lease_lock_residue", "orphan_journal", "stale_backup", "stale_lease", "tmp", "unknown"]], JSON.stringify(mdir.residues.map((r) => r.kind + " " + path.basename(r.path))));
+  assert.ok(mdir.residues.find((r) => r.kind === "orphan_journal").detail.includes("阶段 planned"));
+  assert.deepEqual(inspectMaintenanceDir({ dir: path.join(base, "nope") }), { inventory: "ok", residues: [] }, "目录不存在 = 没有残骸");
   assert.deepEqual([parseMaintenanceGateArgs(["--enter", "--reason", "a", "--reason", "b"]).ok, parseMaintenanceGateArgs(["--status", "--apply"]).ok, parseMaintenanceGateArgs(["--exit", "--reason", "x"]).ok, parseMaintenanceGateArgs(["--enter", "--reason", "r", "--wait-ms", "-1"]).ok, parseMaintenanceGateArgs(["--enter", "--reason", "r", "--apply", "--apply"]).ok], [false, false, false, false, false], "参数封闭");
   releaseOperationLease(op.lease);
   fs.writeFileSync(path.join(dir, op.token + ".json"), "{ 坏");

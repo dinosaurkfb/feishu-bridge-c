@@ -22,7 +22,7 @@ import { spawnLaunchctl } from "../launchd-job.mjs";
 import { pickClaudeNode } from "../drain-schedule.mjs";
 import { bridgeHome as codexBridgeHomeOf } from "../codex/state.mjs";
 import {
-  FORWARD_ONLY_PHASES, INCOMPLETE_PHASES, TERMINAL_PHASES, acquireOperationLease, addNote, addStepPrepared, clearActive, createOperation, leaseHolder, maintenanceDir,
+  FORWARD_ONLY_PHASES, INCOMPLETE_PHASES, TERMINAL_PHASES, acquireOperationLease, addNote, addStepPrepared, clearActive, createOperation, inspectMaintenanceDir, leaseHolder, maintenanceDir,
   markStepDone, readActive, readJournal, releaseOperationLease, setPhase, verifyBackup, writeBackup,
 } from "./journal.mjs";
 import { buildStubVersion, isStubTarget, readStubManifest, removeStubVersion, stubDirName, stubRelTarget } from "./stub.mjs";
@@ -62,7 +62,8 @@ export function maintenanceStatus(ctx) {
   }
   const phase = journal?.state === "valid" ? journal.doc.phase : null;
   const pendingReopening = phase !== null && FORWARD_ONLY_PHASES.includes(phase) && !TERMINAL_PHASES.includes(phase);
-  return { gate, active, journal, lease, phase, pendingReopening, chains, dir: ctx.dir, gateFile: ctx.gateFile };
+  const residues = inspectMaintenanceDir({ dir: ctx.dir });
+  return { gate, active, journal, lease, phase, pendingReopening, chains, residues, dir: ctx.dir, gateFile: ctx.gateFile };
 }
 
 export function renderStatus(s) {
@@ -80,6 +81,8 @@ export function renderStatus(s) {
     for (const st of s.journal.doc.steps) lines.push("  · " + st.id + " " + st.state + (st.state === "done" ? " → " + JSON.stringify(st.after) : "（prepared，现场核对后决定）"));
     for (const n of s.journal.doc.notes.slice(-3)) lines.push("  ※ " + n);
   }
+  if (s.residues?.inventory === "unreadable") lines.push("维护目录  ：读不出 —— " + s.residues.residues.map((r) => r.detail).join("；"));
+  else if (s.residues?.residues?.length > 0) { lines.push("维护目录残骸 " + s.residues.residues.length + " 处（只报告，不自动清）："); for (const r of s.residues.residues) lines.push("  · " + r.path + "：" + r.detail); }
   return lines.join("\n");
 }
 
@@ -108,7 +111,7 @@ export function enterMaintenance(ctx, { reason, waitMs = 60000, apply = false } 
   const op = createOperation({ dir: ctx.dir, reason: normalized, now: ctx.now() });
   if (!op.ok) return { ok: false, reason: op.reason, why: op.why ?? null, token: op.token ?? null, path: op.path ?? null };
   const token = op.token, lease = op.lease;
-  const J = (r, what) => { if (!r.ok) throw Object.assign(new Error(what + "：" + String(r.reason) + (r.why ? "（" + r.why + "）" : "")), { opReason: r.reason === "lease_lost" || r.reason === "active_mismatch" ? "operation_taken_over" : "journal_write_failed" }); return r; };
+  const J = (r, what) => { if (!r.ok) throw Object.assign(new Error(what + "：" + String(r.reason) + (r.why ? "（" + r.why + "）" : "") + (r.path ? "，" + r.path : "")), { opReason: r.reason === "lease_lost" || r.reason === "active_mismatch" ? "operation_taken_over" : r.reason === "lease_reap_uncleared" ? "lease_reap_uncleared" : "journal_write_failed", residuePath: r.path ?? null }); return r; };
   let out;
   try {
     // ── 定时器：先记账（原始三态 + plist 原字节备份，sha256 / 长度进账）再 bootout
@@ -167,6 +170,8 @@ export function enterMaintenance(ctx, { reason, waitMs = 60000, apply = false } 
   } catch (err) {
     if (err?.simulatedCrash) throw err;
     if (err?.opReason === "operation_taken_over") { releaseOperationLease(lease); return { ok: false, reason: "operation_taken_over", why: String(err?.message ?? err), token }; }
+    // 租约的归属转换锁交不还：之后每次写账都会 reap_residue，回退也写不了账 —— 立即停，什么都不再动；active / journal 保留，修好 .reap 后 --exit --apply 按账续做
+    if (err?.opReason === "lease_reap_uncleared") { const rel = releaseOperationLease(lease); return { ok: false, reason: "lease_reap_uncleared", why: String(err?.message ?? err), token, path: err.residuePath, leaseUncleared: { path: err.residuePath ?? rel.path ?? null, why: "reap_uncleared" }, phase: "stopped" }; }
     const rollback = rollbackOperation(ctx, token, lease);
     out = { ok: false, reason: err?.opReason ?? "enter_failed", why: String(err?.message ?? err), token, processes: err?.processes ?? null, rollback };
   }

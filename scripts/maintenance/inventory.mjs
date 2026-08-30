@@ -6,6 +6,9 @@
  */
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
+
+import { analyzeCommandRefs, refsUnderRoots } from "./command-refs.mjs";
 
 export const PS_ENV = "FEISHU_BRIDGE_PS";
 
@@ -32,6 +35,7 @@ export function parsePs(text) {
 }
 
 const realDir = (p) => { try { return fs.realpathSync(p); } catch { return null; } };
+void path;
 
 /**
  * @param {{ roots: string[], ps?: () => ({ok:boolean, stdout?:string, why?:string}), selfPid?: number }} opts
@@ -40,6 +44,7 @@ const realDir = (p) => { try { return fs.realpathSync(p); } catch { return null;
  */
 export function listBridgeProcesses({ roots, ps = defaultPs, selfPid = process.pid } = {}) {
   const wanted = [...new Set((roots ?? []).flatMap((r) => [r, realDir(r)]).filter((x) => typeof x === "string" && x.length > 0))];
+  const wantedReals = [...new Set((roots ?? []).map(realDir).filter((x) => x !== null))];
   const r = ps();
   if (!r.ok) return { ok: false, reason: "inventory_unverifiable", why: r.why };
   const rows = parsePs(r.stdout);
@@ -50,7 +55,9 @@ export function listBridgeProcesses({ roots, ps = defaultPs, selfPid = process.p
   const matched = new Set();
   for (const row of rows) {
     if (excluded.has(row.pid)) continue;
-    if (wanted.some((w) => row.command.includes(w + "/") || row.command.includes(w + " ") || row.command.endsWith(w))) matched.add(row.pid);
+    // 字符串包含 + 路径参数 realpath（评审探针：node /tmp/runtime-alias/scripts/x.mjs 实际指向旧 runtime，字符串里没有运行时根）
+    if (wanted.some((w) => row.command.includes(w + "/") || row.command.includes(w + " ") || row.command.endsWith(w))) { matched.add(row.pid); continue; }
+    if (refsUnderRoots(analyzeCommandRefs(row.command, { home: null }), wantedReals) !== null) matched.add(row.pid);
   }
   // 子树：被匹配的入口起的子进程（例如 claude -p）也算
   let grew = true;

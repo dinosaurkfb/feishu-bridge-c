@@ -32,6 +32,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { isStubTarget, readStubManifest } from "./maintenance/stub.mjs";
+
 /**
  * 两条链各自的运行时住在哪。
  *
@@ -391,6 +393,21 @@ function switchCurrentUnlocked(root, version) {
   fs.renameSync(linkTmp, link);
 }
 
+/**
+ * 把 current 切到任意相对目标（维护门用：切到桩 `versions/maintenance-<token>`、切回原目标）。symlink 临时名 → rename，原子。
+ * 不做任何校验 —— 调用方（operation journal）先记账再调它，并对 before 做 CAS。返回 { ok, before, after }。
+ */
+export function switchCurrentTarget({ root, target }) {
+  if (typeof root !== "string" || typeof target !== "string" || target.length === 0 || path.isAbsolute(target)) return { ok: false, reason: "target_shape" };
+  const link = path.join(root, CURRENT_LINK);
+  let before = null;
+  try { before = fs.readlinkSync(link); } catch { before = null; }
+  const linkTmp = link + ".tmp." + process.pid + "." + crypto.randomUUID();
+  try { fs.symlinkSync(target, linkTmp); fs.renameSync(linkTmp, link); }
+  catch (err) { try { fs.unlinkSync(linkTmp); } catch { /* 没建出来 */ } return { ok: false, reason: "io_error", why: String(err?.code ?? err?.message ?? err) }; }
+  return { ok: true, before, after: target };
+}
+
 export function applyRuntimeSync(plan, { home = os.homedir(), chain = "claude", root: rootOverride } = {}) {
   if (!plan?.ok) return plan ?? { ok: false, reason: "plan_missing" };
   const root = rootOf({ root: rootOverride, home, chain });
@@ -492,6 +509,11 @@ export function verifyRuntime({ home = os.homedir(), chain = "claude", root: roo
     return { ok: false, reason: "current_absent", linkOk: false, drifted: [], missing: [] };
   }
   const versionDir = path.join(root, linkTarget);
+  // 维护桩（issue #81）：current 指向 versions/maintenance-<token>/ 时不是"坏了"，是维护中 —— 单独一个 reason，status / doctor 据此说"维护中"
+  if (isStubTarget(linkTarget)) {
+    const m = readStubManifest(versionDir);
+    return { ok: false, reason: "maintenance", linkOk: false, linkTarget, drifted: [], missing: [], maintenance: m.state === "valid" ? { token: m.doc.token, at: m.doc.at, reason: m.doc.reason, original_current: m.doc.original_current ?? null } : null, why: m.state === "valid" ? null : "桩清单读不出" };
+  }
   const checked = verifyVersionDir(versionDir, null);
   if (!checked.manifest) {
     return { ok: false, reason: checked.reason, linkOk: false, drifted: [], missing: [] };

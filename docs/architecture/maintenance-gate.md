@@ -11,7 +11,7 @@
 
 | 投影 | 来源 | 用途 |
 | --- | --- | --- |
-| **当前投影** | **机器级安装收据**，**每条链一份、随该链的隔离点走**：Claude `<真实 home>/.claude/feishu-bridge/installed-surface.json`，Codex `<Codex 桥目录>/installed-surface.json`（PR B 实现时从"两链共用一份"改的：安装器被 HOME / CODEX_HOME 引到沙箱时收据必须跟着进沙箱，不能写真机；journal 里两份收据是**两个制品**，各自两阶段提交与回退）。每份按版本登记；含门代码的版本安装时经 journal 两阶段写入，含门代码的普通安装器 `--apply` 末尾（全部制品写完之后）也直接记（收据事务锁 `<收据>.lock` 串行化多个安装器；这把锁**不受机器门管**，维护门内部写收据也走它）：每个**桥拥有的封闭条目**的 sha —— settings.json / hooks.json 里带我们标记或指向我们路径的 hook 条目、每个技能文件整份、plist 整份 —— 与引用的脚本；**不是整文件 sha**，无关设置的变化不挡门）。版本目录 `versions/<v>/` 只放静态、与机器无关的模板 manifest。**legacy bootstrap 投影**：现 runtime 没有收据时，按**已知 runtime digest 分支**（新代码里冻结一份对应形状模板：hook 命令模板、技能渲染、plist 模板，按当前路径渲染后逐字段核；今天线上的 95510bdd 是第一个已知 digest）；**未知旧版本拒绝进门**（`legacy_runtime_unknown`）| 进门前预检：线上 hooks / skills / plist / routes 是否与"现在应该装着的"一致 |
+| **当前投影** | **机器级安装收据**，**每条链一份、随该链的隔离点走**：Claude `<真实 home>/.claude/feishu-bridge/installed-surface.json`，Codex `<Codex 桥目录>/installed-surface.json`（PR B 实现时从"两链共用一份"改的：安装器被 HOME / CODEX_HOME 引到沙箱时收据必须跟着进沙箱，不能写真机；journal 里两份收据是**两个制品**，各自两阶段提交与回退）。每份按版本登记；含门代码的版本安装时经 journal 两阶段写入，含门代码的普通安装器 `--apply` 末尾（全部制品写完之后）也直接记（收据事务锁 `<收据>.lock` 串行化多个安装器；这把锁**不受机器门管**，维护门内部写收据也走它）：每个**桥拥有的封闭条目**的 sha —— settings.json / hooks.json 里带我们标记或指向我们路径的 hook 条目、每个技能文件整份、plist 整份 —— 与引用的脚本；**不是整文件 sha**，无关设置的变化不挡门）。版本目录 `versions/<v>/` 只放静态、与机器无关的模板 manifest。**没有收据的运行时拒绝进门**（`receipt_absent`）：先用普通安装器 `--apply` 装一次含收据代码的版本（PR C 实现时改的：v5 里"按已知 digest 走 legacy 冻结模板"那条不再需要 —— 2026-08-30 两条链线上都已是带收据的 38d07d43，legacy 模板只会是一份没人走的路径）| 进门前预检：线上 hooks / skills / plist / routes 是否与"现在应该装着的"一致 |
 | **目标投影** | staged 新版本的 `renderArtifacts()`（纯函数：输入当前制品基线字节 + 路径，输出合并后的全文） | stage / commit：要写成什么 |
 | **桩清单** | `maintenanceEntryManifest` = 当前投影已验引用 ∪ 目标投影引用 ∪ 固定 worker ∪ 状态入口 | 桩目录里的文件、进程盘点认的路径 |
 
@@ -21,16 +21,16 @@
 
 | 启动源 | 权威配置 | 对账 |
 | --- | --- | --- |
-| Claude hooks（UserPromptSubmit ×2、Stop） | `~/.claude/settings.json` | 收据 sha 相等；legacy：hook 条目完整 command / timeout / type 与冻结模板逐字相等 |
+| Claude hooks（UserPromptSubmit ×2、Stop） | `~/.claude/settings.json` | 收据 sha 相等（桥拥有的封闭条目）；桥拥有的条目各恰好一条；**任何提到运行时根的 hook 命令都必须是桥拥有的**（多一个 shell 动作、第二个 node → 拒） |
 | Codex hooks（Prompt / Stop） | `~/.codex/hooks.json` 里带 `FEISHU_BRIDGE_CODEX_HOOK:` 标记的条目 | 同上（`codex/hook-command.mjs` 的投影） |
-| 技能（两链） | `~/.claude/skills/<n>/…`、`~/.codex/skills/<n>/…` | 收据 sha / legacy 渲染逐字相等 |
+| 技能（两链） | `~/.claude/skills/<n>/…`、`~/.codex/skills/<n>/…` | 收据 sha 逐字相等（fd 绑定读：符号链接 / 管道 / 多硬链接都不算"制品还在"） |
 | launchd（两链） | `launchctl list <label>` + plist | `loadedPhase` ∈ {loaded, installed_not_loaded, absent}（下文统称**原始三态**）且 plist 字节与投影相等；`loaded_other` / `orphan` / `plist_unreadable` / `unverifiable` → 不受验（预检拒了，journal 只会记到原始三态） |
 | 路由表 | `~/.claude/feishu-bridge/routes.json` | 只核**有效默认路由**（`defaultRouteHandler` 判据）的 handler；非默认外部 handler（如 cc2cd）不核、只记账（窗口内一样被分发器桩挡） |
 | 所有脚本路径 | — | `realpath` 后落在两条 `runtime/current/scripts/` 真实路径下，文件名在桩清单里 |
 
 任一条对不上 → 拒绝进门 `startup_source_unverified`（点名）。
 
-**威胁边界（明写）**：同 UID 人工直接执行克隆或 `versions/<旧版>` 下的脚本不在门的覆盖内。
+**威胁边界（明写）**：同 UID 人工直接执行克隆或 `versions/<旧版>` 下的脚本不在门的覆盖内；hook 命令引用的**外部脚本正文**（如 `.orca` 的 `.sh`）也不在模型内 —— 预检只解析命令本身（`scripts/maintenance/command-refs.mjs`，进程盘点对 ps 命令行用同一份判据）：**每个 token 无条件**捞出其中所有绝对路径片段（整个 token、`=` / `:` / `,` 之后、内联代码串里的 `import("/x")`、附着式 `node</x`）realpath 后不得落在任一条链的运行时之下（文件不在就按目录解析）；tokenizer 保留操作符类别 —— 单管道、输入重定向 `<`、here-doc / here-string 一律"无法验证"（右侧 / 解释器可能从 stdin 读代码），`env -S <串>` / `--split-string` 递归解析，`node --input-type` / 脚本位 `-` 算从 stdin 读代码；shell 只认纯字母短选项簇（`-c` / `-lc` / `-fc`，簇里不能有 o / O）与无参长选项（`--login --norc --noprofile --posix --restricted --command`），含 `c` 的簇或 `--command` 后的内联串递归解析，其余选项形状（`-O extglob`、`-o pipefail`、`+O`、`--rcfile …`）一律"无法验证"；引号外反斜杠转义按 shell 规则处理，未闭合引号 / 尾随反斜杠 = 解析不了；变量（`$HOME` 以外）/ 命令替换 / eval / exec / source / 解释器内联代码（`node -e/-p` **含组合短选项 `-pe`**、`python -c`、`perl -ne` …，内联串里的绝对路径仍捞出来给进程盘点用）/ 相对路径 / `-r`、`--import`、`--loader` 后不是绝对路径 —— 非桥命令出现任一种一律"无法验证"拒绝。
 
 ## 机制：两层 + 一本账
 
@@ -71,7 +71,9 @@
 - `prepared` 或 `done` 且现场 == intendedAfter → 做过：回退方向写回 before（用备份原字节 / 原目标），前进方向保留；
 - 现场既不是 before 也不是 after → `rollback_incomplete`（该项留给人，门与账保留）。
 
-阶段：`planned → timer_stopped → stubbed → gated → drained → staged → committed → verified → reopening → done`；失败分支 `rolling_back → rollback_reopening → rolled_back | rollback_incomplete`。
+阶段：`planned → timer_stopped → stubbed → gated → drained → staged → committed → verified → reopening → done | reopening_incomplete`；失败分支 `rolling_back → rollback_reopening → rolled_back | rollback_incomplete`。`*_incomplete` = 动了但没做完（CAS 不成立、撤门后归属转换锁交不还、active 清不掉）：门与账保留，`--exit --apply` 只向前重试。journal 形状按 step kind 封闭（timer / current / stub / gate / artifact / receipt 各自的 before / intended_after / after），phase 与"必须已 done 的 step"一致；备份先写满 fsync，sha256 与长度进账，恢复前核验。
+
+**执行租约**：同一 operation 的 enter / exit / 续跑只许一个执行者 —— `maintenance/<token>.lease`（registry 锁协议，**只按持有者 pid 活性接管，不按时间**，等进程可以很久），journal 每次写入都在租约 reap 段内核对 token（被接管后晚到的写入 lease_lost，不落盘）；写入还核 active 仍指向本 token、阶段前驱合法。
 
 **两个不可逆的重新开放阶段**（旧 runtime 不认识机器门：一旦某条 `current` 从桩指回真实 runtime，那条链就已经重新放行，此后不许再改线上制品）：
 - 成功路径 `reopening`：定时器回到**目标状态**（见下）→ 删桩目录 → token-CAS 删门 → **先把终态 `done` 持久化进 journal** → 最后一个动作 token-CAS 清 `active`；清 active 之后不再写任何 operation 状态。

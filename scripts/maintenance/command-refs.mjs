@@ -82,16 +82,10 @@ const expandHome = (t, home) => {
   if (t === "${HOME}" || t.startsWith("${HOME}/")) return path.join(home ?? "", t.slice("${HOME}".length));
   return t;
 };
-/** token 里所有像绝对路径的片段：整个 token、`=` / `:` / `,` 之后的段（含 ~ / $HOME 展开）。 */
+/** 整个 token 是不是绝对路径（含 ~ / $HOME 前缀展开）。token 内嵌的路径片段由 harvestAbsolutePaths 无条件捞，这里不再重复切 = / : / ,。 */
 export function absolutePathsIn(token, { home }) {
-  const out = [];
   const whole = expandHome(token, home);
-  if (path.isAbsolute(whole)) out.push({ raw: token, expanded: whole });
-  for (const part of token.split(/[=:,]/u).slice(1)) {
-    const e = expandHome(part, home);
-    if (path.isAbsolute(e)) out.push({ raw: token, expanded: e });
-  }
-  return out;
+  return path.isAbsolute(whole) ? [{ raw: token, expanded: whole }] : [];
 }
 /** 任意文本里的绝对路径片段。 */
 export function harvestAbsolutePaths(text) {

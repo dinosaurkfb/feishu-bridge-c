@@ -19,6 +19,7 @@ import { resolveLarkIdentity } from "../chain-template.mjs";
 import { composeCodexOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { isDirectRun, moduleDir } from "../direct-run.mjs";
 import { nodeCommandPrefix, shellQuote } from "../shell-quote.mjs";
+import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 import {
   bridgeHome, findTaskForCodexThread, loadRegistry, resolveTask,
   resolveTaskOutboundGeneration, taskPaths,
@@ -82,6 +83,7 @@ const ARG_ERRORS = {
 
 function main() {
   const parsed = parseArgs(process.argv.slice(2));
+  if (parsed && parsed.seen instanceof Set && parsed.seen.has("apply")) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）
   const shape = parsed.ok ? checkArgShape(parsed.seen) : parsed;
   if (!parsed.ok || !shape.ok) {
     const r = parsed.ok ? shape : parsed;

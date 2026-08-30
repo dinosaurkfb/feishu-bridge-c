@@ -14,6 +14,7 @@ import { RESUMABLE_REJECT_STATES, describeRejectRepair, inspectRejectedClaim, re
 import { setClaudeInteractionMode } from "./interaction-policy-store.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { expectationFromMapping, claudeControlPrecondition } from "./control-identity.mjs";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 export function parseRepairControlArgs(argv, { target = "--project" } = {}) {
   let root = null; let key = null; let apply = false;
@@ -83,6 +84,7 @@ if (isDirectRun(import.meta.url)) {
   const expect = expectation.expect;
   const seen = inspectControlClaim({ claimsDir, key: parsed.key, expect });
   let result = null;
+  if (parsed.apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）
   if (parsed.apply && (RESUMABLE_CONTROL_STATES.includes(seen.state) || seen.state === "consumed")) {
     result = resumeControlClaim({ claimsDir, key: parsed.key, expect,
       execute: (mode) => setClaudeInteractionMode({ root, claudeSessionId: expect.claudeSessionId, mode,

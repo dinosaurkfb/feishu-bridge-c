@@ -11,6 +11,7 @@
 import { isDirectRun } from "./direct-run.mjs";
 import { sweepScratch, TMP_RESIDUE_AGE_MS, lockUnclearedText } from "./chat-ledger.mjs";
 import path from "node:path";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 export function parseChatScratchSweepArgs(argv) {
   let ledger = null;
@@ -77,6 +78,7 @@ if (isDirectRun(import.meta.url)) {
     process.stderr.write("用法：node chat-scratch-sweep.mjs --ledger <账本目录（绝对、真实路径）> [--apply] [--older-than-ms <N>]（" + parsed.reason + (parsed.argument ? "：" + parsed.argument : "") + "）\n");
     process.exit(2);
   }
+  if (parsed.apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门
   const r = sweepScratch({ ledgerDir: parsed.ledger, apply: parsed.apply, olderThanMs: parsed.olderThanMs });
   process.stdout.write(describeScratchSweep(r, { apply: parsed.apply }) + "\n");
   process.exit(sweepExitCode(r, { apply: parsed.apply }));

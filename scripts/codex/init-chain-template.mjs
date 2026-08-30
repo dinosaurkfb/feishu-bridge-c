@@ -8,6 +8,7 @@ import path from "node:path";
 import { DEFAULT_CONFIG_BASE, describeTemplateWrite, validateChainTemplate, withChainTemplateWrite } from "../chain-template.mjs";
 import { bridgeHome, templateFile, validateCodexTemplate } from "./state.mjs";
 import { moduleRoot } from "../direct-run.mjs";
+import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "../..");
 const arg = (name) => {
@@ -15,6 +16,7 @@ const arg = (name) => {
   return at >= 0 ? process.argv[at + 1] : undefined;
 };
 const apply = process.argv.includes("--apply");
+if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
 const transportName = arg("transport-agent-name") ?? "M5Codex";
 const transportApp = arg("transport-app-id");
 const transportOpen = arg("transport-open-id");

@@ -23,6 +23,7 @@ import { claimKey, readClaimState } from "./claim.mjs";
 import os from "node:os";
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
+import { gateBlocks } from "./maintenance-gate-core.mjs";
 
 import {
   claudeTurnInputDir, clearTurnInput, readTurnInput, consumeTurnRecord, readTurnRecord } from "./turn-input.mjs";
@@ -101,6 +102,8 @@ async function main() {
 
   // 钩子自己触发的二次 Stop 不再处理，避免任何形式的自激。
   if (payload.stop_hook_active === true) process.exit(0);
+  // 维护门（issue #81）：门在或读不出 → 无输出退出，不写 outbox、不起守望者；这一轮进展可见地丢弃（at-most-once）
+  if (gateBlocks().blocked) { log("gate: maintenance, turn dropped"); process.exit(0); }
 
   const { loadRegistry, attributeSession } = await import("./registry.mjs");
 

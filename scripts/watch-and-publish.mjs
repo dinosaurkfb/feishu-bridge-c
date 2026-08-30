@@ -35,6 +35,10 @@ import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-ge
 import { moduleRoot } from "./direct-run.mjs";
 import { finalizeClaudeDialogueTurn } from "./interaction-policy-store.mjs";
 import { DIALOGUE_POLICY_ID, DIALOGUE_TURN_STATUS } from "./interaction-policy.mjs";
+import { gateBlocks } from "./maintenance-gate-core.mjs";
+
+// 维护门（issue #81）：**启动期先看一次门**，在读 claim / 记 failed / 取任何锁之前；门在或读不出就无输出退出（run、claim、锁都留着，交陈旧检测）。循环里每轮再复核。
+if (gateBlocks().blocked) process.exit(0);
 
 const SELF = moduleRoot(import.meta.url, "..");
 
@@ -179,6 +183,8 @@ async function waitForPublishLock() {
 }
 
 while (true) {
+  // 维护门（issue #81）：门在或读不出 → 这一轮就退，锁交还、留诊断；run 与 outbox 都留着
+  { const gate = gateBlocks(); if (gate.blocked) refuse({ reason: "maintenance_gate", why: gate.text }); }
   // **一次读取的快照**：outcome、正文、摘要全部来自同一份字节 —— 判终局用它、
   // 写终局记录用它的摘要、发布用它的正文。分三次读盘曾被评审在读与读之间换正文击穿。
   const snap = readRunSnapshot({ runsDir: RUNS, key });

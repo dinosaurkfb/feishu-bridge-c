@@ -21,6 +21,7 @@ import path from "node:path";
 
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { isDirectRun } from "./direct-run.mjs";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import {
   CONNECTION_RELATIONS, PROVIDER_KINDS, PROVIDER_PROTOCOL, statusProvidersPath,
   validateProviderRegistry,
@@ -226,6 +227,7 @@ function main() {
   const has = (name) => parsed.seen.has(name);
 
   const apply = has("apply");
+  if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
   const replace = has("replace");
   const unregister = has("unregister");
   // 歧义命令**不许被解释成破坏性更强的那个**。--replace --unregister 同时给出时，

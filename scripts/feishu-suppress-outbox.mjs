@@ -35,6 +35,7 @@ import { resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { topicGenerationLockDir } from "./topic-generation-store.mjs";
 import { currentBinding } from "./feishu-control.mjs";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import {
   applySuppressionCore, corruptTargets, dependsOnMapping, suppressionDigest,
   generationTargetState, usableGeneration,
@@ -177,6 +178,7 @@ function main() {
     process.exit(1);
   }
   const apply = parsed.seen.has("apply");
+  if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）
   const root = path.resolve(parsed.seen.get("project") ?? process.cwd());
   const session = parsed.seen.get("session") ?? null;
   const reason = parsed.seen.get("reason") ?? "manual_suppress";

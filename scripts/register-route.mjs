@@ -14,6 +14,7 @@
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
 import { registerRouteBinding, loadRoutes, restoreDefaultRoute, routesPath } from "./inbound-routes.mjs";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 const REASON_TEXT = {
   no_route_id: "缺 --id",
@@ -50,6 +51,7 @@ function fail(result) {
 
 function main() {
   const apply = process.argv.includes("--apply");
+  if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
   // --restore-default：把默认路由的处理器改回给定路径（issue #88 的受控入口；切权威路由，Frank 授权后才 --apply）
   if (process.argv.includes("--restore-default")) {
     const handler = arg("handler");

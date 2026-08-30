@@ -31,6 +31,7 @@ import { resolveLarkIdentity } from "./chain-template.mjs";
 import { isLockStale } from "./handoff.mjs";
 import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { isDirectRun, moduleRoot } from "./direct-run.mjs";
+import { gateBlocks } from "./maintenance-gate-core.mjs";
 import {
   businessActivitiesForPublishedBatch, recordClaudeActivityAndMaybeRotate,
 } from "./automatic-topic-rotation.mjs";
@@ -721,6 +722,7 @@ function describeOutboxOutcome(r, { root, verbose = false } = {}) {
 // ---------- CLI ----------
 
 if (isDirectRun(import.meta.url)) {
+  if (gateBlocks().blocked) process.exit(0); // 维护门：兜底排空无输出退出，outbox 留着下次再发
   const arg = (n) => {
     const i = process.argv.indexOf("--" + n);
     return i >= 0 ? process.argv[i + 1] : undefined;

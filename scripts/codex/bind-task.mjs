@@ -15,12 +15,14 @@ import {
   refreshPendingTaskBinding, setTaskConnectionStatus, setTaskDisplayName,
 } from "./state.mjs";
 import { buildIntentParams, requireIntent } from "./intent.mjs";
+import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
   return at >= 0 ? process.argv[at + 1] : undefined;
 };
 const apply = process.argv.includes("--apply");
+if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
 const root = path.resolve(arg("project") ?? process.cwd());
 const die = (message) => { console.error(message); process.exit(1); };
 if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) die("项目目录不存在：" + root);

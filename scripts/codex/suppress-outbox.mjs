@@ -32,6 +32,7 @@ import {
   generationTargetState, usableGeneration,
 } from "../suppress-outbox-core.mjs";
 import { activeGeneration, pendingGeneration } from "../topic-generation.mjs";
+import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 import {
   bridgeHome, findTaskForCodexThread, loadRegistry, registryFile,
   resolveTask, resolveTaskOutboundGeneration, taskPaths, topicStateForTask,
@@ -185,6 +186,7 @@ function main() {
     process.exit(1);
   }
   const apply = parsed.seen.has("apply");
+  if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）
   const generation = parsed.seen.get("generation") ?? null;
   const reason = parsed.seen.get("reason") ?? "manual_suppress";
   const home = bridgeHome();

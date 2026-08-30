@@ -46,6 +46,7 @@ import { shellQuote } from "./shell-quote.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode } from "./drain-schedule.mjs";
 import { spawnSync } from "node:child_process";
 import { LAUNCHCTL_ENV, PHASE_TEXT, loadedPhase } from "./launchd-job.mjs";
+import { readGate, maintenanceGatePath } from "./maintenance-gate-core.mjs";
 
 /** 到期预警阈值：7 天内到期就点名。**明写**，不藏在比较式里。 */
 export const EXPIRY_WARN_MS = 7 * 24 * 3600 * 1000;
@@ -331,6 +332,15 @@ export function runDoctor({
     }
     const tail = notes.length > 0 ? "；" + notes.join("；") : "";
     add("chat_ledger", "⑨ chat 账本（两条链）", problems.length === 0, problems.length === 0 ? parts.join("、") + "；没有说不清的条目" + tail : parts.join("、") + "；说不清 " + problems.length + " 处：" + problems.slice(0, 3).join("；") + tail, null);
+  }
+
+  // ⑩ 维护门（issue #81）：三态 —— 没开 = 正常；开着 = 维护中（点名原因与时长，超过 10 分钟单独点名）；读不出 = 按维护中处理、只人工处置
+  {
+    const g = readGate({ now });
+    if (g.state === "absent") add("maintenance_gate", "⑩ 维护门", true, "没开", null);
+    else if (g.state === "active") add("maintenance_gate", "⑩ 维护门", false, "开着：" + g.payload.reason + "（已 " + Math.floor(g.ageMs / 60000) + " 分钟，token " + String(g.payload.token).slice(0, 8) + "）" + (g.ageMs > 10 * 60 * 1000 ? " —— 超过 10 分钟，多半是维护中断；维护门 CLI（--status / --exit）随后续 PR 提供，此刻请人工核对 " + maintenanceGatePath() : ""), null);
+    else if (g.state === "transitioning") add("maintenance_gate", "⑩ 维护门", false, "正在切换（" + g.why + "）—— 入口都按维护中处理；几毫秒的事，再跑一次仍在就是段里崩了或释放失败，转换锁在 " + maintenanceGatePath() + ".txn", null);
+    else add("maintenance_gate", "⑩ 维护门", false, "读不出（" + g.why + "）—— 入口都按维护中处理；畸形制品不自动删，请人工核对 " + (g.detail ?? maintenanceGatePath()), null);
   }
 
   // ── 汇总：任一 false → blocked；无 false 有 null → incomplete；全 true → ready

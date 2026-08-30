@@ -6,6 +6,7 @@ import {
   bridgeHome, findRegisteredTaskForCodexThread, setTaskConnectionStatus,
 } from "./state.mjs";
 import { requireIntent } from "./intent.mjs";
+import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -13,6 +14,7 @@ const arg = (name) => {
 };
 const threadId = arg("thread-id");
 const apply = process.argv.includes("--apply");
+if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
 if (!validThreadId(threadId)) {
   console.error("缺少 hook 提供的精确 --thread-id；拒绝猜测或使用 --last。");
   process.exit(1);

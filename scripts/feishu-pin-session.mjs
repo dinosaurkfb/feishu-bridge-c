@@ -23,6 +23,7 @@ import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
 import { currentBinding } from "./feishu-control.mjs";
 import { identifySelf } from "./bind-session.mjs";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import {
   clearDeliveryPin, findLiveSessions, readDeliveryPin, writeDeliveryPin,
 } from "./live-session.mjs";
@@ -74,6 +75,7 @@ function main() {
     process.exit(1);
   }
   const apply = parsed.seen.has("apply");
+  if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
   const clear = parsed.seen.has("clear");
   const rootArg = parsed.seen.get("project");
   const root = path.resolve(typeof rootArg === "string" ? rootArg : process.cwd());

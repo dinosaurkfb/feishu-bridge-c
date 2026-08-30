@@ -17,6 +17,7 @@ import { generationTargetState, usableGeneration } from "./topic-generation.mjs"
 import { isCanonicalIso } from "./canonical-time.mjs";
 // registry 不反向依赖 outbox —— 没有环。
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
+import { gateBlocks } from "./maintenance-gate-core.mjs";
 
 /**
  * `reply` 是一轮对话的**原文答复**，由 Stop 钩子从 last_assistant_message 直接取，
@@ -56,6 +57,8 @@ export function appendEvent({
   }
   const body = String(text ?? "").trim();
   if (body.length === 0) return { ok: false, reason: "empty_text" };
+  // 维护门（issue #81）：门在或读不出 → 不写 outbox（调用方按"没记下"如实说）
+  { const gate = gateBlocks(); if (gate.blocked) return { ok: false, reason: "maintenance", gate: gate.state, text: gate.text }; }
 
   fs.mkdirSync(outboxDir, { recursive: true, mode: 0o700 });
 

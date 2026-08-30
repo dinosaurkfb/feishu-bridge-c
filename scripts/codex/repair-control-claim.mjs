@@ -9,6 +9,7 @@ import { RESUMABLE_CONTROL_STATES, inspectControlClaim, resumeControlClaim } fro
 import { codexControlPrecondition } from "./control-identity.mjs";
 import { RESUMABLE_REJECT_STATES, describeRejectRepair, inspectRejectedClaim, rejectRepairExitCode, resumeRejectedClaim } from "../reject-control.mjs";
 import { bridgeHome, findRegisteredTaskForCodexThread, setTaskInteractionMode, taskPaths } from "./state.mjs";
+import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 
 export { codexControlPrecondition as codexControlRepairPrecondition } from "./control-identity.mjs";
 
@@ -22,6 +23,7 @@ if (isDirectRun(import.meta.url)) {
   const expect = { logicalTaskKey: found.task.logical_task_key, codexThreadId: parsed.root };
   const seen = inspectControlClaim({ claimsDir, key: parsed.key, expect });
   let result = null;
+  if (parsed.apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）
   if (parsed.apply && (RESUMABLE_CONTROL_STATES.includes(seen.state) || seen.state === "consumed")) {
     result = resumeControlClaim({ claimsDir, key: parsed.key, expect,
       execute: (mode) => setTaskInteractionMode({ threadId: parsed.root, mode, home,

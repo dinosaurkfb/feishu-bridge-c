@@ -16,6 +16,7 @@
 
 import fs from "node:fs";
 import { isDirectRun } from "./direct-run.mjs";
+import { gateBlocks } from "./maintenance-gate-core.mjs";
 
 import {
   claudeTurnInputDir, clearTurnInput, feishuStampMessageId, findTurnRecordDirsUpward, isFeishuStampedInput, storeInboundTurn, storeTurnInput,
@@ -54,6 +55,7 @@ function readStdinJson() {
 }
 
 async function main() {
+  if (gateBlocks().blocked) process.exit(0); // 维护门：本地回合无输出放行，不留桥状态
   const payload = readStdinJson() ?? {};
   const prompt = payload.prompt;
   const cwd = payload.cwd;

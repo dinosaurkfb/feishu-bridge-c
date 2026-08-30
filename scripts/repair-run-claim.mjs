@@ -23,6 +23,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { isDirectRun, moduleDir } from "./direct-run.mjs";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 const REAP_SUFFIX = ".publish-claim.json.reaplock";
 const KEY_SHAPE = /^[0-9a-f]{64}$/u;
@@ -58,6 +59,11 @@ export function repairRunClaims({ runsDir, key = null, all = false, apply = fals
   if (typeof all !== "boolean" || typeof apply !== "boolean") {
     return { ok: false, reason: "bad_arguments",
       detail: "all 与 apply 必须是布尔值（收到 " + typeof all + " / " + typeof apply + "）" };
+  }
+  // 维护门（issue #81）：核心自己看门 —— 绕过 CLI 包装直接调也挡（apply 才是写）
+  if (apply) {
+    const gate = gateBlocks();
+    if (gate.blocked) return { ok: false, reason: "maintenance", detail: gate.text };
   }
   if (key !== null && (typeof key !== "string" || !KEY_SHAPE.test(key))) {
     return { ok: false, reason: "bad_key" };
@@ -154,6 +160,7 @@ if (isDirectRun(import.meta.url)) {
     process.exit(2);
   }
   const runsDir = path.join(project, ".runtime-data", "inbound", "runs");
+  if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门
   const r = repairRunClaims({ runsDir, key, all: allKeys, apply });
   if (!r.ok && r.reason === "maintenance_lock_held") {
     console.error("维护互斥：" + r.detail);

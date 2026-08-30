@@ -34,6 +34,7 @@ import { SENDER_ROLES } from "./sender-roles.mjs";
 import { RISK } from "./risk-class.mjs";
 import { CHAT_FAIL_REASONS, SIGNAL_SHAPE } from "./chat-reply.mjs";
 import { shellQuote } from "./shell-quote.mjs";
+import { gateBlocks } from "./maintenance-gate-core.mjs";
 
 export const CHAT_MAX_CONCURRENT = 2;
 export const CHAT_MAX_PER_SENDER = 1;
@@ -409,6 +410,7 @@ function withLedgerLock(ledgerDir, waitMs, fn) {
  * @returns {{ ok: true, key, file, tmpResidue: null, lockUncleared? } | { ok: false, reason, text?, why?, load?, tmpResidue? }}
  */
 export function admitChat({ ledgerDir, key, meta, senderId, now = Date.now(), budgetMs, maxConcurrent = CHAT_MAX_CONCURRENT, maxPerSender = CHAT_MAX_PER_SENDER, lockWaitMs = ADMIT_LOCK_WAIT_MS }) {
+  { const gate = gateBlocks(); if (gate.blocked) return { ok: false, reason: "maintenance", text: gate.text, why: gate.state }; } // 维护门
   if (!KEY_SHAPE.test(String(key))) return { ok: false, reason: "chat_ledger_unwritable", why: "key 形状不对" };
   try { fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 }); }
   catch (err) { return { ok: false, reason: "chat_ledger_unwritable", why: String(err.code ?? err.message) }; }
@@ -488,6 +490,7 @@ function publishClaim({ ledgerDir, key, meta, now, lockPath }) {
  * 受控返回，不裸抛：{ ok:true } 或 { ok:false, reason: chat_admission_busy | chat_admission_lock_unavailable | chat_ledger_lock_lost | claim_unreadable | already_final | outcome_shape | ledger_unwritten }。
  */
 export function recordChatOutcome({ ledgerDir, key, outcome, now = Date.now(), lockWaitMs = RECORD_LOCK_WAIT_MS }) {
+  { const gate = gateBlocks(); if (gate.blocked) return { ok: false, reason: "maintenance", why: gate.state }; } // 维护门
   if (!KEY_SHAPE.test(String(key))) return { ok: false, reason: "key_shape" };
   const file = recordPath(ledgerDir, key);
   return withLedgerLock(ledgerDir, lockWaitMs, (lockPath) => {

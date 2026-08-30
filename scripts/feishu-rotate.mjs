@@ -10,6 +10,7 @@ import {
 } from "./bind-compose.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
 import { publishDraft, sendToChat } from "./outbound.mjs";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import {
   closeClaudeTopicRotation, failClaudeTopicRotation, loadClaudeTopicBinding, prepareClaudeTopicRotation,
   registerClaudeTopicRotation,
@@ -24,6 +25,7 @@ const arg = (name) => {
 };
 const die = (message) => { console.error(message); process.exit(1); };
 const apply = process.argv.includes("--apply");
+if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
 const cancel = process.argv.includes("--cancel");
 const automatic = process.argv.includes("--automatic");
 const root = path.resolve(arg("project") ?? process.cwd());

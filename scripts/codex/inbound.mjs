@@ -48,6 +48,7 @@ import { sameRejectedControl } from "../control-intent.mjs";
 import { authorize, CAPABILITY } from "../authorize.mjs";
 import { isDirectRun } from "../direct-run.mjs";
 import { composeCrashReceipt } from "../crash-receipt.mjs";
+import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 /**
  * 整个入站流程包在 main() 里，只有被直接执行时才跑。
  *
@@ -59,6 +60,9 @@ import { composeCrashReceipt } from "../crash-receipt.mjs";
  * 而这次改动的实质只有"加一道守卫"。可读性代价换评审可读性，是有意的取舍。
  */
 async function main() {
+
+// 维护门（issue #81）：确定性回"维护中"，不 claim、不写回执、不重放
+{ const gate = gateBlocks(); if (gate.blocked) exitForGate("inbound", gate); }
 
 const BRIDGE_ROOT = moduleRoot(import.meta.url, "../..");
 const HOME = bridgeHome();

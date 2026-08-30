@@ -26,6 +26,7 @@ import os from "node:os";
 import path from "node:path";
 import { isDirectRun, moduleDir } from "./direct-run.mjs";
 import { nodeCommandPrefix } from "./shell-quote.mjs";
+import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 const LOG = path.join(os.homedir(), ".claude", "feishu-bridge", "inbound-hook.log");
 const LOG_MAX = 1 << 19;
@@ -122,6 +123,8 @@ function readStdinJson() {
 }
 
 async function main() {
+  // 维护门（issue #81）先于一切 —— 连入口日志都不写（见 exitIfMaintenanceGated）。
+  await exitIfMaintenanceGated();
   const payload = readStdinJson() ?? {};
 
   log("enter cwd=" + (payload.cwd ?? "-") + " " + envShape());
@@ -161,6 +164,23 @@ async function main() {
     hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: context },
   }) + "\n");
   process.exit(0);
+}
+
+/**
+ * 维护门（issue #81）—— **看门在任何写之前（连入口日志都不写、不轮转）**：门在或读不出 →
+ * 本地回合 / 桥自己的回合无输出放行；本链运输 agent 的 Aily 回合硬阻断（正文不进模型）；
+ * 别的 Aily agent 的回合不是我们的，放行；模板读不出 → 分不清是谁的，一律当本链回合挡（fail-closed）。
+ * "没触发 / 被挡"的分辨在维护窗口里由维护门自己的账（journal、状态页）承担，这里不留痕。
+ * 定义在 main 之后：入口日志必须排在入站的第一道闸之前，这个函数不是入站的闸。
+ */
+async function exitIfMaintenanceGated() {
+  const gate = gateBlocks();
+  if (!gate.blocked) return;
+  if (!isAilyTransportTurn() || isBridgeOwnedTurn()) process.exit(0);
+  const { loadChainTemplate } = await import("./chain-template.mjs");
+  const tpl = loadChainTemplate();
+  if (tpl.ok && process.env.AILY_CLI_CALLER_AGENT_UID !== tpl.template.agent_uid) process.exit(0);
+  exitForGate("hook_block", gate);
 }
 
 if (isDirectRun(import.meta.url)) {

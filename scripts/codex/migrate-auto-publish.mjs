@@ -14,12 +14,14 @@
  */
 
 import { isDirectRun } from "../direct-run.mjs";
+import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 import {
   AUTO_PUBLISH_MIGRATION_ID, bridgeHome, enableAutoPublishForAllTasks, readMigrationReceipt,
 } from "./state.mjs";
 
 function main() {
   const apply = process.argv.includes("--apply");
+  if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
   const result = enableAutoPublishForAllTasks({ home: bridgeHome(), apply });
 
   if (!result.ok) {

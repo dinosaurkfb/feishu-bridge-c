@@ -31,7 +31,7 @@ import path from "node:path";
 
 import { runtimeScript, verifyRuntime } from "./runtime-install.mjs";
 import { referencedRuntimeScripts, renderClaudeSkill } from "./install-projection.mjs";
-import { artifactSha, installedSurfacePath, recordInstalledSurface } from "./installed-surface.mjs";
+import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "./installed-surface.mjs";
 import { moduleRoot } from "./direct-run.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
@@ -214,7 +214,9 @@ for (const f of files) fs.writeFileSync(path.join(DST, f), expectedContent(f), {
   const artifacts = files.map((f) => ({ path: path.join(DST, f), kind: "skill", sha256: artifactSha({ kind: "skill", text: expectedContent(f) }) }));
   const scripts = referencedRuntimeScripts(files.map((f) => expectedContent(f)).join("\n"));
   const receipt = installedVersion ? recordInstalledSurface({ chain: "claude", version: installedVersion, artifacts, scripts, file: installedSurfacePath({ chain: "claude", home: os.homedir() }) }) : { ok: false, reason: "runtime_version_unknown" };
-  if (!receipt.ok) console.log("安装收据没记下（" + receipt.reason + (receipt.why ? "：" + receipt.why : "") + "）—— 维护门预检会拿不到当前投影");
+  const report = receiptReport(receipt, { artifacts: artifacts.length, scripts: scripts.length });
+  console.log("安装收据：" + report.text);
+  if (report.failed) process.exitCode = 1;
 }
 
 // ---------- 装完自检 ----------

@@ -16,7 +16,7 @@ import { shellQuote } from "../shell-quote.mjs";
 import { describeTemplateWrite, withChainTemplateWrite } from "../chain-template.mjs";
 import { buildHookCommand, codexHooksOwnedEntries, renderCodexHooks, ownsHookCommand, pickNode } from "./hook-command.mjs";
 import { referencedRuntimeScripts } from "../install-projection.mjs";
-import { artifactSha, installedSurfacePath, recordInstalledSurface } from "../installed-surface.mjs";
+import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "../installed-surface.mjs";
 import { SKILLS, expectedSkillContent } from "./skill-content.mjs";
 
 import {
@@ -215,7 +215,9 @@ if (!uninstall) {
   const artifacts = [{ path: HOOKS, kind: "codex-hooks", sha256: artifactSha({ kind: "codex-hooks", text: after, extractors }) }, ...skillArtifacts];
   const scripts = referencedRuntimeScripts([after, ...skillTexts].join("\n"));
   const receipt = installedVersion ? recordInstalledSurface({ chain: "codex", version: installedVersion, artifacts, scripts, file: installedSurfacePath({ chain: "codex", codexBridgeHome: home }) }) : { ok: false, reason: "runtime_version_unknown" };
-  console.log("安装收据    " + (receipt.ok ? "已记（" + artifacts.length + " 个制品，" + scripts.length + " 个脚本）" : "**没记下**（" + receipt.reason + (receipt.why ? "：" + receipt.why : "") + "）"));
+  const report = receiptReport(receipt, { artifacts: artifacts.length, scripts: scripts.length });
+  console.log("安装收据    " + report.text);
+  if (report.failed) process.exitCode = 1;
 }
 if (!uninstall && !fs.existsSync(registryFile(home))) {
   writeAtomic(registryFile(home), JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks: [] }, null, 2) + "\n");

@@ -212,7 +212,7 @@ import {
 } from "./inbound-route.mjs";
 import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, stableControlId, validateSubscription, claimable } from "./subscription.mjs";
 import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
-import { artifactSha, compareInstalledSurface, readInstalledSurface, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
+import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
 import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
 import { pickClaudeNode as pickClaudeNodeB } from "./drain-schedule.mjs";
@@ -20651,10 +20651,47 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   fs.unlinkSync(lockPath);
   // 提交 fencing：写满临时文件之后、rename 之前锁被别人合法接管 → lock_lost，不覆盖，不留临时文件
   const takeover = () => { fs.unlinkSync(lockPath); fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: crypto.randomUUID() }), lockPath); };
-  const lost = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: ["doctor.mjs"], file: surface, beforeCommit: takeover });
+  const lost = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: ["doctor.mjs"], file: surface, testHooks: { beforeCommit: takeover } });
   assert.deepEqual([lost.reason, fs.existsSync(surface), fs.readdirSync(path.dirname(surface)).filter((n) => n.includes(".installed-surface.")).length, typeof lost.lockUncleared], ["lock_lost", false, 0, "undefined"], JSON.stringify(lost));
   fs.unlinkSync(lockPath);
   assert.equal(recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: ["doctor.mjs"], file: surface }).ok, true, "锁空出来之后正常写");
+  // 释放异常受控可见：抛错 → release_threw；返回失败 → 它的 reason；reap 锁交不还 → reap_uncleared。段内写的算数（ok:true），残骸挂在最终结果上
+  const tmpCount = () => fs.readdirSync(path.dirname(surface)).filter((n) => n.startsWith(".installed-surface.") && n.endsWith(".tmp")).length;
+  for (const [release, expect] of [
+    [() => { throw Object.assign(new Error("EIO"), { code: "EIO" }); }, { reason: "release_threw", error: "EIO" }],
+    [() => ({ ok: false, reason: "io_error" }), { reason: "io_error" }],
+    [() => ({ ok: true, reapUncleared: { path: lockPath + ".reap", error: "EIO" } }), { reason: "reap_uncleared", error: "EIO" }],
+  ]) {
+    const r = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: ["doctor.mjs"], file: surface, testHooks: { release } });
+    assert.deepEqual([r.ok, r.lockUncleared?.reason, r.lockUncleared?.error, tmpCount()], [true, expect.reason, expect.error, 0], JSON.stringify(r));
+    assert.equal(receiptReport(r).failed, true, "有残骸就算失败：" + receiptReport(r).text);
+    assert.ok(receiptReport(r).text.includes(r.lockUncleared.path), "点名残骸路径");
+    try { fs.unlinkSync(lockPath); } catch { /* 注入的释放没真释放，这里替它清 */ }
+  }
+  // 临时文件：写 / fsync 失败自己清掉；清不掉 → tmpResidue 点名路径；盘点能看见
+  const wf = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: [], file: surface, testHooks: { afterTmpWrite: () => { throw Object.assign(new Error("EIO"), { code: "EIO" }); } } });
+  assert.deepEqual([wf.ok, wf.reason, wf.why, wf.tmpResidue, tmpCount()], [false, "io_error", "EIO", undefined, 0], JSON.stringify(wf));
+  const surfaceDir = path.dirname(surface);
+  const wr = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: [], file: surface, testHooks: { afterTmpWrite: () => { fs.chmodSync(surfaceDir, 0o500); throw Object.assign(new Error("EIO"), { code: "EIO" }); } } });
+  fs.chmodSync(surfaceDir, 0o700);
+  // 目录只读时释放也做不了（reap 锁建不出来）：锁残骸同样要报出来，不能只报临时文件
+  assert.deepEqual([wr.ok, wr.reason, typeof wr.tmpResidue?.path, wr.tmpResidue?.error, tmpCount(), wr.lockUncleared?.path], [false, "io_error", "string", "EACCES", 1, lockPath], JSON.stringify(wr));
+  assert.ok(receiptReport(wr).text.includes("锁残骸") && receiptReport(wr).text.includes("临时文件残骸"), receiptReport(wr).text);
+  fs.unlinkSync(lockPath); try { fs.unlinkSync(lockPath + ".reap"); } catch { /* 没建出来 */ }
+  assert.equal(receiptReport(wr).failed, true);
+  assert.ok(receiptReport(wr).text.includes(wr.tmpResidue.path), "点名临时文件路径");
+  const inv = inspectInstalledSurface({ file: surface });
+  assert.deepEqual(inv.residues.map((x) => [x.kind, x.path]), [["tmp", wr.tmpResidue.path]], JSON.stringify(inv.residues));
+  fs.unlinkSync(wr.tmpResidue.path);
+  fs.mkdirSync(lockPath); fs.symlinkSync("junk", lockPath + ".reap");
+  const inv2 = inspectInstalledSurface({ file: surface });
+  assert.deepEqual(inv2.residues.map((x) => x.kind + ":" + x.detail), ["lock:不是本协议的 symlink（只人工处置）", "reap:payload 畸形（只人工处置）"], JSON.stringify(inv2.residues));
+  fs.rmdirSync(lockPath); fs.unlinkSync(lockPath + ".reap");
+  fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date(Date.now() - 120000).toISOString(), token: "t" }), lockPath);
+  assert.match(inspectInstalledSurface({ file: surface }).residues[0]?.detail ?? "", /仍在但已超时 1\d\d 秒/u);
+  fs.unlinkSync(lockPath);
+  assert.deepEqual(inspectInstalledSurface({ file: surface }).residues, [], "干净时没有残骸");
+  assert.deepEqual([receiptReport({ ok: true }, { artifacts: 2, scripts: 3 }), receiptReport({ ok: false, reason: "surface_unreadable", why: "x" }).failed], [{ text: "已记（2 个制品，3 个脚本）", failed: false }, true]);
   // 形状：version / sha256 必须先是字符串再匹配正则（数组 String() 后能骗过正则）
   const arrDoc = JSON.parse(fs.readFileSync(surface, "utf-8"));
   const arrV = structuredClone(arrDoc); arrV.chains.claude.version = [v]; fs.writeFileSync(surface, JSON.stringify(arrV));
@@ -20731,6 +20768,20 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   const plistPath = claudeDrainPlistPath(home); fs.rmSync(plistPath); fs.mkdirSync(plistPath);
   assert.throws(() => execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env, stdio: "pipe" }), "plist 位置是目录 → 安装失败");
   assert.equal(fs.readFileSync(surface).equals(receiptBytes), true, "失败的安装不改收据");
+  fs.rmSync(plistPath, { recursive: true, force: true });
+  // doctor ⑪：装完有收据 → ✓；留下临时文件残骸 → ✗ 点名路径；收据位置是目录 → ✗ 读不出；安装器遇收据读不出非零退出、其余制品照写
+  const d1 = runDoctor({ home }).checks.find((c) => c.id === "installed_surface");
+  assert.deepEqual([d1.ok, /^有：版本 [0-9a-f]{16}，\d+ 个制品，/u.test(d1.detail)], [true, true], JSON.stringify(d1));
+  const residueTmp = path.join(path.dirname(surface), ".installed-surface.1.residue.tmp"); fs.writeFileSync(residueTmp, "");
+  const d2 = runDoctor({ home }).checks.find((c) => c.id === "installed_surface");
+  assert.deepEqual([d2.ok, d2.detail.includes(residueTmp)], [false, true], JSON.stringify(d2));
+  fs.unlinkSync(residueTmp);
+  fs.rmSync(surface); fs.mkdirSync(surface);
+  const d3 = runDoctor({ home }).checks.find((c) => c.id === "installed_surface");
+  assert.deepEqual([d3.ok, /^读不出（不是普通文件）/u.test(d3.detail)], [false, true], JSON.stringify(d3));
+  const failed = spawnSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
+  assert.deepEqual([failed.status, /安装收据 : \*\*没记下\*\*（surface_unreadable：/u.test(failed.stdout), fs.statSync(surface).isDirectory()], [1, true, true], "收据读不出：非零退出、点名、不动畸形制品：" + failed.stdout.slice(-400));
+  fs.rmdirSync(surface);
 });
 
 summarySealed = true;

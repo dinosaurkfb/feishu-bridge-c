@@ -28,7 +28,7 @@ import {
   applyRuntimeSync, planRuntimeSync, runtimeScript, verifyRuntime,
 } from "./runtime-install.mjs";
 import { CLAUDE_SKILLS, claudeDrainPlist, claudeDrainPlistPath, referencedRuntimeScripts, renderClaudeSettings, renderClaudeSkill } from "./install-projection.mjs";
-import { artifactSha, installedSurfacePath, recordInstalledSurface } from "./installed-surface.mjs";
+import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "./installed-surface.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
 
@@ -364,7 +364,9 @@ if (!uninstall) {
   ];
   const scripts = referencedRuntimeScripts([settingsAfter, plistBody, ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => renderSkill(fs.readFileSync(sk.srcFile, "utf-8")))].join("\n"));
   const receipt = installedVersion ? recordInstalledSurface({ chain: "claude", version: installedVersion, artifacts, scripts, file: installedSurfacePath({ chain: "claude", home: os.homedir() }) }) : { ok: false, reason: "runtime_version_unknown" };
-  console.log("安装收据 : " + (receipt.ok ? "已记（" + artifacts.length + " 个制品，" + scripts.length + " 个脚本）" : "**没记下**（" + receipt.reason + (receipt.why ? "：" + receipt.why : "") + "）—— 维护门预检会拿不到当前投影"));
+  const report = receiptReport(receipt, { artifacts: artifacts.length, scripts: scripts.length });
+  console.log("安装收据 : " + report.text);
+  if (report.failed) process.exitCode = 1; // 收据没记下或留下残骸：制品已经写了，但下一次维护预检会拿不到当前投影 —— 不能显示成功
 }
 
 console.log("\n" + (backup ? "settings 已改，备份：" + backup : "settings 无改动，未重写"));

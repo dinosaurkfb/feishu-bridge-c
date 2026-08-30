@@ -20637,6 +20637,31 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   fs.unlinkSync(surface); fs.symlinkSync(path.join(base, "elsewhere.json"), surface); fs.writeFileSync(path.join(base, "elsewhere.json"), JSON.stringify(linked));
   assert.match(readInstalledSurface({ file: surface }).why, /符号链接/u, "收据本身是符号链接也不认");
   fs.unlinkSync(surface);
+  // 锁位置上的未知制品不回收不删：目录（带哨兵）、畸形 payload 的旧 symlink → surface_lock_residue，现场原样
+  const lockPath = surface + ".lock";
+  fs.mkdirSync(lockPath); fs.writeFileSync(path.join(lockPath, "sentinel"), "哨兵");
+  const oldTime = new Date(Date.now() - 3600 * 1000); fs.utimesSync(lockPath, oldTime, oldTime);
+  const resDir = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: [], file: surface, waitMs: 50 });
+  assert.deepEqual([resDir.reason, fs.existsSync(path.join(lockPath, "sentinel")), fs.existsSync(surface)], ["surface_lock_residue", true, false], JSON.stringify(resDir));
+  fs.rmSync(lockPath, { recursive: true, force: true });
+  fs.symlinkSync("not-a-lock-payload", lockPath); fs.lutimesSync(lockPath, oldTime, oldTime);
+  const resLink = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: [], file: surface, waitMs: 50 });
+  assert.deepEqual([resLink.reason, fs.readlinkSync(lockPath), fs.existsSync(surface)], ["surface_lock_residue", "not-a-lock-payload", false], JSON.stringify(resLink));
+  fs.unlinkSync(lockPath);
+  // 提交 fencing：写满临时文件之后、rename 之前锁被别人合法接管 → lock_lost，不覆盖，不留临时文件
+  const takeover = () => { fs.unlinkSync(lockPath); fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: crypto.randomUUID() }), lockPath); };
+  const lost = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: ["doctor.mjs"], file: surface, beforeCommit: takeover });
+  assert.deepEqual([lost.reason, fs.existsSync(surface), fs.readdirSync(path.dirname(surface)).filter((n) => n.includes(".installed-surface.")).length, typeof lost.lockUncleared], ["lock_lost", false, 0, "undefined"], JSON.stringify(lost));
+  fs.unlinkSync(lockPath);
+  assert.equal(recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: ["doctor.mjs"], file: surface }).ok, true, "锁空出来之后正常写");
+  // 形状：version / sha256 必须先是字符串再匹配正则（数组 String() 后能骗过正则）
+  const arrDoc = JSON.parse(fs.readFileSync(surface, "utf-8"));
+  const arrV = structuredClone(arrDoc); arrV.chains.claude.version = [v]; fs.writeFileSync(surface, JSON.stringify(arrV));
+  assert.match(readInstalledSurface({ file: surface }).why, /version 不是 16 位十六进制字符串/u);
+  const arrS = structuredClone(arrDoc); arrS.chains.claude.artifacts = [{ path: f1, kind: "file", sha256: ["a".repeat(64)] }]; fs.writeFileSync(surface, JSON.stringify(arrS));
+  assert.match(readInstalledSurface({ file: surface }).why, /sha256 不是 64 位十六进制字符串/u);
+  assert.equal(recordInstalledSurface({ chain: "claude", version: v, artifacts: [{ path: f1, kind: "file", sha256: ["a".repeat(64)] }], scripts: [], file: surface }).reason, "artifact_sha_unusable");
+  fs.unlinkSync(surface);
   // 收据事务锁：持锁期间另一个进程记收据只会 surface_busy（写不进去），放开后才成功 —— 无锁的读改写会丢另一侧的条目
   const driver = path.join(base, "record-driver.mjs");
   fs.writeFileSync(driver, "import { recordInstalledSurface } from " + JSON.stringify(pathToFileURL(path.resolve("scripts", "installed-surface.mjs")).href) + ";\n"
@@ -20670,6 +20695,15 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   // current 正指着这个坏目录：stage 不许动它（挪走 → 换上之间 current 会悬空），零改动；applyRuntimeSync 老路径仍能原地修复
   const inUse = stageRuntimeVersionB(plan, { root });
   assert.deepEqual([inUse.reason, fs.existsSync(path.join(root, "versions", plan.version, "INSTALLED.json")), fs.readdirSync(path.join(root, "versions")).filter((n) => n.startsWith(".corrupt-") || n.startsWith(".staging-")).length, fs.readlinkSync(path.join(root, "current"))], ["version_in_use", true, 0, path.join("versions", plan.version)], JSON.stringify(inUse));
+  // 在用判定按对象身份：current → alias → versions/<v> 也算在用；current 悬空（身份说不清）→ fail-closed 不动目录
+  const alias = path.join(root, "alias"); fs.symlinkSync(path.join("versions", plan.version), alias);
+  fs.unlinkSync(path.join(root, "current")); fs.symlinkSync("alias", path.join(root, "current"));
+  const viaAlias = stageRuntimeVersionB(plan, { root });
+  assert.deepEqual([viaAlias.reason, fs.existsSync(path.join(root, "versions", plan.version, "INSTALLED.json")), fs.readdirSync(path.join(root, "versions")).filter((n) => n.startsWith(".")).length], ["version_in_use", true, 0], JSON.stringify(viaAlias));
+  fs.unlinkSync(path.join(root, "current")); fs.symlinkSync(path.join("versions", "0000000000000000"), path.join(root, "current"));
+  const dangling = stageRuntimeVersionB(plan, { root });
+  assert.deepEqual([dangling.reason, fs.existsSync(path.join(root, "versions", plan.version, "INSTALLED.json")), fs.readdirSync(path.join(root, "versions")).filter((n) => n.startsWith(".")).length], ["current_unverifiable", true, 0], JSON.stringify(dangling));
+  fs.unlinkSync(path.join(root, "current")); fs.symlinkSync(path.join("versions", plan.version), path.join(root, "current")); fs.unlinkSync(alias);
   assert.deepEqual([applyRuntimeSyncB(plan, { root }).ok, verifyRuntimeB({ root }).ok], [true, true], "老路径原地修复");
   // ── 入口清单：不缺、含关键入口
   const manifest = maintenanceEntryManifest({ repoRoot: path.resolve("."), home, codexHome: path.join(home, ".codex") });

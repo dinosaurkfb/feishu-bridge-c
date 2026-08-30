@@ -240,11 +240,19 @@ const writeAtomic = (file, content) => {
  * 落版本目录（调用方持安装锁）：staging 建好并验通过 → 换到 versions/<v>/。返回 { ok:true } 或受控失败（此刻没碰过 current）。
  * 已存在且校验通过的版本目录直接算 ok（内容寻址、不可变）。
  */
-/** current 此刻是否指向这个版本目录（符号链接读不出 → 当作不指向；目录不可达就没有"在用"一说）。 */
-function currentPointsAt(root, versionDir) {
-  let link;
-  try { link = fs.readlinkSync(path.join(root, "current")); } catch { return false; }
-  return path.resolve(root, link) === path.resolve(versionDir);
+/**
+ * current 此刻是否指向这个版本目录 —— 按**对象身份**比（realpath 相等或 dev+ino 相等），不是 readlink 的词法路径
+ *（评审探针：current → alias → versions/<v> 时词法比较说"不在用"，挪目录的窗口里 current/INSTALLED.json 不可达）。
+ * current 不存在（ENOENT）→ 不在用；存在但身份说不清（悬空、EACCES…）→ unverifiable，调用方 fail-closed 不动目录。
+ */
+function currentIdentity(root, versionDir) {
+  const cur = path.join(root, "current");
+  try { fs.lstatSync(cur); } catch (err) { return err?.code === "ENOENT" ? { inUse: false } : { unverifiable: true, why: String(err?.code ?? err?.message) }; }
+  try {
+    const a = fs.statSync(cur), b = fs.statSync(versionDir);
+    const same = fs.realpathSync(cur) === fs.realpathSync(versionDir) || (a.dev === b.dev && a.ino === b.ino);
+    return { inUse: same };
+  } catch (err) { return { unverifiable: true, why: String(err?.code ?? err?.message) }; }
 }
 
 function stageVersionDirUnlocked(plan, root, versionDir, { replaceInUse = false } = {}) {
@@ -290,9 +298,12 @@ function stageVersionDirUnlocked(plan, root, versionDir, { replaceInUse = false 
     // verifyRuntime 报 manifest_absent）—— stage 的承诺是"只写不可达缓存"。只有 applyRuntimeSync 这条
     // 老路径（replaceInUse）保留原地修复的行为，维护流程要先把 current 切到桩再 stage。
     let quarantine = null;
-    if (fs.existsSync(versionDir) && !replaceInUse && currentPointsAt(root, versionDir)) {
-      fs.rmSync(staging, { recursive: true, force: true });
-      return { ok: false, reason: "version_in_use", version: plan.version };
+    if (fs.existsSync(versionDir) && !replaceInUse) {
+      const id = currentIdentity(root, versionDir);
+      if (id.unverifiable || id.inUse) {
+        fs.rmSync(staging, { recursive: true, force: true });
+        return { ok: false, reason: id.unverifiable ? "current_unverifiable" : "version_in_use", version: plan.version, why: id.why };
+      }
     }
     if (fs.existsSync(versionDir)) {
       quarantine = path.join(root, "versions", ".corrupt-" + plan.version + "." + Date.now());

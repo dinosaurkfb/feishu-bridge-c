@@ -346,9 +346,19 @@ const carryReapResidue = (done, result) => (done?.reapUncleared && result && typ
 
 // beforeReap / duringReap 只给测试用：在"判定陈旧"与"进 reap 锁重核"之间、以及拿到 reap 锁之后
 // 插一个动作，把并发窗口写成确定性的行为测试。
-export function acquirePublishLock(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now(), beforeReap = null, duringReap = null } = {}) {
+export function acquirePublishLock(lockDir, opts = {}) {
   // 维护门（issue #81）兜底：18 个调用面都从这里过，门在或读不出 → 取不到锁（reason maintenance），各自按既有"取不到锁"路径受控退出
   { const gate = gateBlocks(); if (gate.blocked) return { ok: false, reason: "maintenance", gate: gate.state, text: gate.text }; }
+  return acquireLockUngated(lockDir, opts);
+}
+
+/**
+ * 同一套锁协议（symlink 原语、陈旧回收走 reap 段串行化、释放 / 提交按 token 归属转换），**不看机器门**：
+ * 给维护门内部与安装收据这类"门开着也要能写"的调用面用（PR #102 评审：不要再复制一套简化锁）。
+ * reapUnrecognized=false：锁位置上是目录 / 畸形 payload（不是本协议的形状）时**不回收、不删**，返回 lock_residue 交显式维护入口
+ *（评审探针：带哨兵的旧目录被热路径整体删了）。发布锁保留默认 true（旧版目录锁的兼容路径）。
+ */
+export function acquireLockUngated(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now(), beforeReap = null, duringReap = null, reapUnrecognized = true } = {}) {
   const token = crypto.randomUUID();
   const payload = JSON.stringify({ pid: process.pid, at: new Date(now).toISOString(), token });
   const attempt = () => {
@@ -361,6 +371,7 @@ export function acquirePublishLock(lockDir, { staleMs = 5 * 60 * 1000, now = Dat
   if (first.ok || first.reason !== "publisher_busy") return first;
 
   const seen = readLockOwner(lockDir);
+  if (!reapUnrecognized && seen.present && (seen.legacy || seen.owner === null)) return { ok: false, reason: "lock_residue", path: lockDir };
   if (!isPublishLockStale(lockDir, { staleMs, now })) return first;
   if (typeof beforeReap === "function") beforeReap();
 

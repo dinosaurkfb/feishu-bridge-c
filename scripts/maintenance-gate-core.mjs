@@ -142,8 +142,8 @@ export function gateBlocks({ file = maintenanceGatePath(), now = Date.now() } = 
   return { blocked: true, state: "unreadable", text: "维护门读不出（" + g.why + "），按维护中处理，请在本机跑 doctor", gate: null, detail: g.detail ?? null };
 }
 
-/** 入站类入口的确定性回复（stdout，给运输 agent 原样回复）：不 claim、不写回执、不重放。 */
-export const gateInboundText = (g) => (g.state === "active" ? g.text + "：这条消息没有处理，请稍后重发" : g.text);
+/** 入站类入口的确定性回复（stdout，给运输 agent 原样回复）：**所有**阻断态都明说"没处理、要重发"—— 不 claim、不写回执、不重放，用户必须知道。 */
+export const gateInboundText = (g) => g.text + "：这条消息没有处理，请稍后重发";
 /** Aily 回合的 UserPromptSubmit 硬阻断（两条宿主都是这个顶层形状；reason 非空）。 */
 export const gateBlockDecision = (g) => JSON.stringify({ decision: "block", reason: gateInboundText(g) });
 

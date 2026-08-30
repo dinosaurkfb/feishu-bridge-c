@@ -20468,8 +20468,14 @@ test("维护门（issue #81 · PR A）：三态读门只认 ENOENT 为没门，�
   fs.unlinkSync(gateFile); fs.mkdirSync(gateFile);
   const unreadable = gateBlocks({ file: gateFile });
   assert.deepEqual([unreadable.blocked, unreadable.state, /^维护门读不出（.*目录.*），按维护中处理，请在本机跑 doctor$/u.test(unreadable.text)], [true, "unreadable", true], JSON.stringify(unreadable));
-  outs.length = 0; exitForGate("inbound", unreadable, fake); assert.match(outs[0], /维护门读不出/u);
+  outs.length = 0; exitForGate("inbound", unreadable, fake); exitForGate("hook_block", unreadable, fake);
+  assert.match(outs[0], /^维护门读不出（.*），按维护中处理，请在本机跑 doctor：这条消息没有处理，请稍后重发\n$/u, "unreadable 也明说没处理、要重发");
+  assert.match(JSON.parse(outs[1]).reason, /：这条消息没有处理，请稍后重发$/u);
   fs.rmdirSync(gateFile);
+  fs.symlinkSync(JSON.stringify({ pid: 1, at: "2026-08-30T00:00:00.000Z", token: "12345678-1234-1234-1234-123456789abc" }), gateFile + ".txn");
+  outs.length = 0; const transitioning = gateBlocks({ file: gateFile }); exitForGate("inbound", transitioning, fake); exitForGate("hook_block", transitioning, fake);
+  assert.deepEqual([transitioning.state, /^维护门正在切换（建门或撤门进行中），按维护中处理，请稍后重试：这条消息没有处理，请稍后重发\n$/u.test(outs[0]), /：这条消息没有处理，请稍后重发$/u.test(JSON.parse(outs[1]).reason)], ["transitioning", true, true], "transitioning 也明说没处理、要重发");
+  fs.unlinkSync(gateFile + ".txn");
   // ── 锁原语兜底 + outbox + chat 账本（进程内，走测试隔离点）
   assert.equal(createGate({ file: gateFile, reason: "锁" }).ok, true);
   withGate(() => {
@@ -20507,6 +20513,17 @@ test("维护门（issue #81 · PR A）：三态读门只认 ENOENT 为没门，�
     assert.deepEqual([r.status, /^桥维护中（锁，已 \d+ 分钟）：这条消息没有处理，请稍后重发\n$/u.test(r.stdout)], [0, true], script + "：" + r.stdout + r.stderr);
   }
   assert.equal(fs.existsSync(path.join(local, ".claude", "feishu-bridge", "inbound")), false, "入站没 claim、没写回执");
+  // 真入口在 transitioning / unreadable 下同样明说"没处理、要重发"（hook decision 与入站 stdout）
+  const gateToken = readGate({ file: gateFile }).payload.token;
+  fs.symlinkSync(JSON.stringify({ pid: 1, at: "2026-08-30T00:00:00.000Z", token: "12345678-1234-1234-1234-123456789abc" }), gateFile + ".txn");
+  const trHook = runEntry("inbound-hook.mjs", { input: "{}", extra: { AILY_CLI_CALLER_AGENT_UID: "agent_x", AILY_CLI_SESSION_ID: "aily_s", AILY_CLI_RUN_ID: "run_1" } });
+  const trInbound = runEntry("inbound.mjs", { extra: { AILY_CLI_CALLER_AGENT_UID: "agent_x" } });
+  assert.deepEqual([JSON.parse(trHook.stdout).decision, /正在切换.*：这条消息没有处理，请稍后重发$/u.test(JSON.parse(trHook.stdout).reason), /正在切换.*：这条消息没有处理，请稍后重发\n$/u.test(trInbound.stdout)], ["block", true, true], "transitioning 真入口：" + trHook.stdout + trInbound.stdout);
+  fs.unlinkSync(gateFile + ".txn"); fs.unlinkSync(gateFile); fs.mkdirSync(gateFile);
+  const unHook = runEntry("inbound-hook.mjs", { input: "{}", extra: { AILY_CLI_CALLER_AGENT_UID: "agent_x", AILY_CLI_SESSION_ID: "aily_s", AILY_CLI_RUN_ID: "run_1" } });
+  const unInbound = runEntry("inbound.mjs", { extra: { AILY_CLI_CALLER_AGENT_UID: "agent_x" } });
+  assert.deepEqual([JSON.parse(unHook.stdout).decision, /读不出.*：这条消息没有处理，请稍后重发$/u.test(JSON.parse(unHook.stdout).reason), /读不出.*：这条消息没有处理，请稍后重发\n$/u.test(unInbound.stdout)], ["block", true, true], "unreadable 真入口：" + unHook.stdout + unInbound.stdout);
+  fs.rmdirSync(gateFile); assert.equal(createGate({ file: gateFile, reason: "锁", token: gateToken }).ok, true);
   const drain = spawnSync(process.execPath, [path.resolve("scripts", "drain-outbox.mjs"), "--all"], { encoding: "utf-8", env });
   assert.deepEqual([drain.status, drain.stdout], [0, ""], "兜底排空无输出退：" + drain.stderr);
   const rotate = spawnSync(process.execPath, [path.resolve("scripts", "feishu-rotate.mjs"), "--apply"], { encoding: "utf-8", env, cwd: local });

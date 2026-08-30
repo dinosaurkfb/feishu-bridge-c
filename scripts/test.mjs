@@ -21154,6 +21154,11 @@ test("维护门 · PR C 单元：journal 三态与两阶段、active 只许一�
     analyzeCommandRefs("node - <<< x", { home: "/h" }).unsafe.length > 0, analyzeCommandRefs("cat <<EOF", { home: "/h" }).unsafe, tokenizeCommandStrict("a || b | c").operators, analyzeCommandRefs("a || b", { home: "/h" }).unsafe,
     analyzeCommandRefs("bash '/Users/x/.orca/agent-hooks/claude-hook.sh' >/dev/null 2>&1 || :", { home: "/h" }).unsafe,
   ], [["/usr/bin/env", "/e/s.mjs"], ["/e/t.mjs"], [], ["管道（右侧可能从 stdin 读代码）", "node 从 stdin 读代码（--input-type=module）"], ["/p/q.mjs"], ["输入重定向"], ["/r/s.mjs"], true, ["here-doc"], ["pipe"], [], []], "env -S / 管道 / 附着式重定向 / here-doc；输出重定向与 || 不算");
+  // 递归与 = 切分对"路径命中"已经冗余（无条件捞），但对内联串里的 unsafe 形状与 $HOME 中缀展开仍必须生效
+  assert.deepEqual([
+    analyzeCommandRefs("env -S 'node -e x'", { home: "/h" }).unsafe, analyzeCommandRefs("bash -lc 'node -e x'", { home: "/h" }).unsafe, analyzeCommandRefs("bash -c 'python3 -c x'", { home: "/h" }).unsafe,
+    analyzeCommandRefs("node --import=$HOME/x.mjs /s.mjs", { home: "/h" }).paths.map((p) => p.expanded), analyzeCommandRefs("node --import=$HOME/x.mjs /s.mjs", { home: "/h" }).unsafe,
+  ], [["node 内联代码（-e）"], ["node 内联代码（-e）"], ["python3 内联代码（-c）"], ["/h/x.mjs", "/s.mjs"], []], "递归看 unsafe，= 切分看 $HOME 中缀");
   const aliasRoot = path.join(base, "alias-root"); fs.mkdirSync(path.join(aliasRoot, "scripts"), { recursive: true }); fs.writeFileSync(path.join(aliasRoot, "scripts", "x.mjs"), ""); fs.symlinkSync(aliasRoot, path.join(base, "alias-link"));
   const hit = refsUnderRoots(analyzeCommandRefs("node " + path.join(base, "alias-link", "scripts", "x.mjs") + ";", { home: "/h" }), [fs.realpathSync(aliasRoot)]);
   assert.deepEqual([hit?.raw, hit?.real], [path.join(base, "alias-link", "scripts", "x.mjs"), fs.realpathSync(path.join(aliasRoot, "scripts", "x.mjs"))], "尾分号剥掉、别名 realpath 命中");

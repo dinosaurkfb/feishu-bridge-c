@@ -115,7 +115,7 @@ export function analyzeCommandRefs(cmd, { home, depth = 0 } = {}) {
   for (const raw of tokens) {
     for (const p of absolutePathsIn(raw, { home })) addPath(p.raw, p.expanded);
     // 先展开 ~ / $HOME 再捞（否则 $HOME/c.mjs 会多出一个假的 /c.mjs）；含别的变量的 token 只标 unsafe，不捞（展开后是什么说不清）
-    if (!/\$\{?[A-Za-z_]/u.test(raw.replace(/\$\{?HOME\}?(?=\/|$)/gu, ""))) for (const h of harvestAbsolutePaths(expandHome(raw, home))) addPath(raw, h);
+    if (!/\$\{?[A-Za-z_]/u.test(raw.replace(/\$\{?HOME\}?(?=\/|$)/gu, ""))) for (const h of harvestAbsolutePaths(expandHome(raw, home).replace(/\$\{?HOME\}?(?=\/|$)/gu, home ?? ""))) addPath(raw, h);
   }
   const recurse = (inner, what) => {
     if (typeof inner !== "string" || inner.length === 0) { unsafe.push(what + " 后面没有可解析的串"); return; }

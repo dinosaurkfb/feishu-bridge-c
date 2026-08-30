@@ -146,34 +146,38 @@ export function readInstalledSurface({ file } = {}) {
  * 在收据事务锁内跑 fn({ commit })。commit(g) 在 reap 段内核对锁仍是本实例再跑 g（fencing）。
  * @returns {{ ok:true, run:any, lockUncleared?:object } | { ok:false, reason:"surface_busy"|"surface_lock_residue"|"io_error", why?:string, path?:string }}
  */
-export function withInstalledSurfaceLock(file, fn, { waitMs = 5000, staleMs = SURFACE_LOCK_STALE_MS, release = releasePublishLock } = {}) {
+export function withInstalledSurfaceLock(file, fn, { waitMs = 5000, staleMs = SURFACE_LOCK_STALE_MS, acquire = acquireLockUngated, release = releasePublishLock } = {}) {
   const lock = file + ".lock";
   const deadline = Date.now() + waitMs;
+  const residues = []; // 取锁 / 释放两个阶段的残骸都收在这里：段内做的事算数，残骸点名路径交盘点
+  const withResidues = (r) => (residues.length === 0 ? r : { ...r, lockUncleared: residues[0], lockResidues: [...residues] });
   for (;;) {
     let st = null;
     try { st = fs.lstatSync(lock); }
-    catch (err) { if (err?.code !== "ENOENT") return { ok: false, reason: "surface_lock_residue", why: "锁位置 lstat 失败：" + errCode(err), path: lock }; }
-    if (st !== null && !st.isSymbolicLink()) return { ok: false, reason: "surface_lock_residue", why: "锁位置上不是本协议的 symlink（保留现场，交人工）", path: lock };
-    const got = acquireLockUngated(lock, { staleMs, reapUnrecognized: false });
-    if (got.ok) break;
-    if (got.reason === "lock_residue" || got.reason === "reap_residue") return { ok: false, reason: "surface_lock_residue", why: got.reason + "（保留现场，交人工）", path: lock };
-    if (got.reason !== "publisher_busy" && got.reason !== "reap_busy") return { ok: false, reason: "io_error", why: got.reason + (got.error ? "：" + got.error : "") };
-    if (Date.now() >= deadline) return { ok: false, reason: "surface_busy" };
+    catch (err) { if (err?.code !== "ENOENT") return withResidues({ ok: false, reason: "surface_lock_residue", why: "锁位置 lstat 失败：" + errCode(err), path: lock }); }
+    if (st !== null && !st.isSymbolicLink()) return withResidues({ ok: false, reason: "surface_lock_residue", why: "锁位置上不是本协议的 symlink（保留现场，交人工）", path: lock });
+    // 取锁阶段的 I/O 异常同样受控（评审探针：陈旧回收隔离后 rmSync 抛 EIO 穿出来）
+    let got;
+    try { got = acquire(lock, { staleMs, reapUnrecognized: false }); }
+    catch (err) { return withResidues({ ok: false, reason: "io_error", why: "取锁阶段异常：" + errCode(err), path: lock }); }
+    if (got?.reapedUncleared) residues.push({ path: got.reapedUncleared.path, reason: "reaped_uncleared", error: got.reapedUncleared.error });
+    if (got?.ok) break;
+    if (got?.reason === "lock_residue" || got?.reason === "reap_residue") return withResidues({ ok: false, reason: "surface_lock_residue", why: got.reason + "（保留现场，交人工）", path: lock });
+    if (got?.reason !== "publisher_busy" && got?.reason !== "reap_busy") return withResidues({ ok: false, reason: "io_error", why: String(got?.reason) + (got?.error ? "：" + got.error : "") });
+    if (Date.now() >= deadline) return withResidues({ ok: false, reason: "surface_busy" });
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
   }
   let out;
   try { out = { ok: true, run: fn({ commit: (g) => commitWhileHeld(lock, g) }) }; }
   finally {
     // 释放是归属转换，失败**不裸抛、不吞**：抛错 → release_threw；reap 锁交不还 → reap_uncleared；其余按它的 reason。
-    // 都投影成 lockUncleared 挂在结果上（段内做的事算数），点名路径，交显式盘点（inspectInstalledSurface / doctor ⑪）。
-    let residue = null;
     try {
       const rel = release(lock);
-      if (rel?.reapUncleared) residue = { path: rel.reapUncleared.path, reason: "reap_uncleared", error: rel.reapUncleared.error };
+      if (rel?.reapUncleared) residues.push({ path: rel.reapUncleared.path, reason: "reap_uncleared", error: rel.reapUncleared.error });
       // not_owner = 锁已被别人按协议合法接管（提交侧已报 lock_lost）：那把不是我的，不算我的残骸
-      else if (!rel?.ok && rel?.reason !== "not_owner") residue = { path: lock, reason: String(rel?.reason ?? "release_failed") };
-    } catch (err) { residue = { path: lock, reason: "release_threw", error: errCode(err) }; }
-    if (residue !== null && out !== undefined) out = { ...out, lockUncleared: residue };
+      else if (!rel?.ok && rel?.reason !== "not_owner") residues.push({ path: lock, reason: String(rel?.reason ?? "release_failed") });
+    } catch (err) { residues.push({ path: lock, reason: "release_threw", error: errCode(err) }); }
+    if (out !== undefined) out = withResidues(out);
   }
   return out;
 }
@@ -244,42 +248,74 @@ export function recordInstalledSurface({ chain, version, artifacts, scripts, fil
     if (!c.ok) { const residue = discardTmp(tmp); return { ok: false, reason: c.reason === "lock_lost" ? "lock_lost" : "io_error", why: "提交前核对锁归属：" + c.reason, ...(residue ? { tmpResidue: residue } : {}), ...carry }; }
     if (c.run !== null) { const residue = discardTmp(tmp); return { ok: false, reason: "io_error", why: c.run, ...(residue ? { tmpResidue: residue } : {}), ...carry }; }
     return { ok: true, file, entry, ...carry };
-  }, { waitMs, release: testHooks.release ?? releasePublishLock });
+  }, { waitMs, acquire: testHooks.acquire ?? acquireLockUngated, release: testHooks.release ?? releasePublishLock });
   if (!locked.ok) return locked;
-  // 释放侧的残骸也要进最终结果：只返回 locked.run 会把它丢掉（评审探针）
-  return locked.lockUncleared && !locked.run.lockUncleared ? { ...locked.run, lockUncleared: locked.lockUncleared } : locked.run;
+  // 取锁 / 提交 / 释放三处的残骸都要进最终结果：只返回 locked.run 会把它丢掉（评审探针）
+  const all = [...(locked.run.lockResidues ?? (locked.run.lockUncleared ? [locked.run.lockUncleared] : [])), ...(locked.lockResidues ?? [])];
+  return all.length === 0 ? locked.run : { ...locked.run, lockUncleared: all[0], lockResidues: all };
 }
 
 /**
- * 盘点（只读，不修）：收据三态 + 锁 / reap / maint 残骸 + 写收据的临时文件残骸。doctor ⑪ 与显式维护入口用。
- * 活着且未超时的持有者不算残骸；持有者不在 / 超时的按协议会被下一次记收据回收，仍列出来让人看见；
- * 不是 symlink / payload 畸形的**只人工处置**（热路径不删）。
- * @returns {{ state, why?, doc?, residues: { path, kind:"lock"|"reap"|"maint"|"tmp", detail }[] }}
+ * 盘点（只读，不修）：收据三态 + 锁家族残骸 + 写收据的临时文件残骸。doctor ⑪ 与显式维护入口用。
+ *   · 锁家族按**封闭名字**识别，处置方式各不相同：主锁 `<收据>.lock`（持有者不在 / 超时 → 下次记收据按协议回收 / 接管）、
+ *     `.lock.reap`（reap 锁残骸 → repair-publish-lock --lock 清）、`.lock.maint`（维护锁残骸 → 不自动恢复，人工确认后手动删）、
+ *     `.lock.reaped-<uuid>`（陈旧回收隔离后删不掉的旧实例 → 已离开原路径，人工删）、`.lock.reap.quarantine-<uuid>`（reap 残骸隔离后删不掉 → repair-publish-lock）；
+ *     不是 symlink / payload 畸形 / 名字像但不合形状 → unknown，只人工处置。
+ *   · 目录读不出（除 ENOENT）→ inventory:"unreadable" 并作为一条残骸点名目录 —— 不能折成"没有残骸"（评审探针：EIO 下 doctor 假绿）。
+ * @returns {{ state, why?, doc?, inventory:"ok"|"unreadable"|"unknown", residues: { path, kind, detail }[] }}
  */
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const TMP_SHAPE = /^\.installed-surface\.\d+\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/u;
 export function inspectInstalledSurface({ file, now = Date.now() } = {}) {
   const r = readInstalledSurface({ file });
   const residues = [];
-  if (typeof file !== "string" || file.length === 0) return { ...r, residues };
-  const lockInfo = (p, kind) => {
+  if (typeof file !== "string" || file.length === 0) return { ...r, inventory: "unknown", residues };
+  const dir = path.dirname(file), lockName = path.basename(file) + ".lock", lockPath = path.join(dir, lockName);
+  const repairHint = "node scripts/repair-publish-lock.mjs --lock " + lockPath + " --apply 能清";
+  const family = {
+    lock: { dead: (o) => "持有者 pid " + o.pid + " 已不在 —— 下次记收据时按协议回收", stale: (o, sec) => "持有者 pid " + o.pid + " 仍在但已超时 " + sec + " 秒 —— 下次记收据时按协议接管（它晚到的提交会 lock_lost）" },
+    reap: { dead: (o) => "reap 锁残骸（回收者 pid " + o.pid + " 崩在段里）—— 记收据会 reap_residue 拒绝；" + repairHint, stale: (o, sec) => "reap 锁被 pid " + o.pid + " 持有已 " + sec + " 秒（段只有几毫秒）—— 记收据会 reap_residue 拒绝；" + repairHint },
+    maint: { dead: (o) => "维护锁残骸（维护者 pid " + o.pid + " 已不在）—— 只挡维护入口（maintenance_busy），不自动恢复；人工确认没有维护者在跑后手动删", stale: (o, sec) => "维护锁被 pid " + o.pid + " 持有已 " + sec + " 秒 —— 只挡维护入口，不自动恢复；人工确认后手动删" },
+  };
+  const lockInfo = (name, kind) => {
+    const p = path.join(dir, name);
     let st;
-    try { st = fs.lstatSync(p); } catch (err) { if (err?.code !== "ENOENT") residues.push({ path: p, kind, detail: "lstat 失败：" + errCode(err) }); return; }
-    if (!st.isSymbolicLink()) { residues.push({ path: p, kind, detail: "不是本协议的 symlink（只人工处置）" }); return; }
+    try { st = fs.lstatSync(p); } catch (err) { if (err?.code !== "ENOENT") residues.push({ path: p, kind, detail: "lstat 失败：" + errCode(err) + " —— 只人工处置" }); return; }
+    if (!st.isSymbolicLink()) { residues.push({ path: p, kind: "unknown", detail: kind + " 位置上不是本协议的 symlink —— 只人工处置" }); return; }
     let owner = null;
     try { owner = JSON.parse(fs.readlinkSync(p)); } catch { owner = null; }
     const shapeOk = owner !== null && typeof owner === "object" && Number.isSafeInteger(owner.pid) && owner.pid > 0 && isCanonicalIso(owner.at) && typeof owner.token === "string" && owner.token.length > 0;
-    if (!shapeOk) { residues.push({ path: p, kind, detail: "payload 畸形（只人工处置）" }); return; }
+    if (!shapeOk) { residues.push({ path: p, kind: "unknown", detail: kind + " 的 payload 畸形 —— 只人工处置" }); return; }
     let alive = true;
     try { process.kill(owner.pid, 0); } catch { alive = false; }
-    const ageMs = now - Date.parse(owner.at);
-    if (!alive) residues.push({ path: p, kind, detail: "持有者 pid " + owner.pid + " 已不在 —— 下次记收据时按协议回收" });
-    else if (ageMs > SURFACE_LOCK_STALE_MS) residues.push({ path: p, kind, detail: "持有者 pid " + owner.pid + " 仍在但已超时 " + Math.floor(ageMs / 1000) + " 秒 —— 下次记收据时按协议回收" });
+    const sec = Math.floor((now - Date.parse(owner.at)) / 1000);
+    if (!alive) residues.push({ path: p, kind, detail: family[kind].dead(owner) });
+    else if (now - Date.parse(owner.at) > SURFACE_LOCK_STALE_MS) residues.push({ path: p, kind, detail: family[kind].stale(owner, sec) });
   };
-  const lock = file + ".lock";
-  lockInfo(lock, "lock"); lockInfo(lock + ".reap", "reap"); lockInfo(lock + ".maint", "maint");
-  let names = [];
-  try { names = fs.readdirSync(path.dirname(file)); } catch { names = []; }
-  for (const n of names) if (n.startsWith(".installed-surface.") && n.endsWith(".tmp")) residues.push({ path: path.join(path.dirname(file), n), kind: "tmp", detail: "写收据的临时文件残骸（写满与提交之间崩了、或删不掉）" });
-  return { ...r, residues };
+  lockInfo(lockName, "lock"); lockInfo(lockName + ".reap", "reap"); lockInfo(lockName + ".maint", "maint");
+  let names;
+  try { names = fs.readdirSync(dir); }
+  catch (err) {
+    if (err?.code === "ENOENT") names = [];
+    else { residues.push({ path: dir, kind: "inventory", detail: "目录盘点失败：" + errCode(err) + " —— 残骸情况说不清，请人工核对" }); return { ...r, inventory: "unreadable", residues }; }
+  }
+  for (const n of names.sort()) {
+    const full = path.join(dir, n);
+    if (n === lockName || n === lockName + ".reap" || n === lockName + ".maint") continue;
+    if (n.startsWith(lockName + ".reaped-")) {
+      const ok = UUID_SHAPE.test(n.slice(lockName.length + ".reaped-".length));
+      residues.push(ok ? { path: full, kind: "reaped", detail: "陈旧回收隔离后删不掉的旧锁实例 —— 已离开原路径、不涉及归属，人工删即可" } : { path: full, kind: "unknown", detail: "像 .reaped-<uuid> 但不合形状 —— 不认识的制品，只人工处置" });
+      continue;
+    }
+    if (n.startsWith(lockName + ".reap.quarantine-")) {
+      const ok = UUID_SHAPE.test(n.slice(lockName.length + ".reap.quarantine-".length));
+      residues.push(ok ? { path: full, kind: "reap-quarantine", detail: "reap 锁残骸隔离后删不掉 —— " + repairHint } : { path: full, kind: "unknown", detail: "像 .reap.quarantine-<uuid> 但不合形状 —— 不认识的制品，只人工处置" });
+      continue;
+    }
+    if (n.startsWith(lockName)) { residues.push({ path: full, kind: "unknown", detail: "锁家族里不认识的制品 —— 只人工处置" }); continue; }
+    if (n.startsWith(".installed-surface.")) residues.push(TMP_SHAPE.test(n) ? { path: full, kind: "tmp", detail: "写收据的临时文件残骸（写满与提交之间崩了、或删不掉）—— 人工删即可" } : { path: full, kind: "unknown", detail: "像写收据的临时文件但不合形状 —— 只人工处置" });
+  }
+  return { ...r, inventory: "ok", residues };
 }
 
 /**
@@ -287,7 +323,7 @@ export function inspectInstalledSurface({ file, now = Date.now() } = {}) {
  */
 export function receiptReport(receipt, { artifacts = 0, scripts = 0 } = {}) {
   const residues = [];
-  if (receipt?.lockUncleared) residues.push("锁残骸 " + receipt.lockUncleared.path + "（" + receipt.lockUncleared.reason + (receipt.lockUncleared.error ? "：" + receipt.lockUncleared.error : "") + "）");
+  for (const l of receipt?.lockResidues ?? (receipt?.lockUncleared ? [receipt.lockUncleared] : [])) residues.push("锁残骸 " + l.path + "（" + l.reason + (l.error ? "：" + l.error : "") + "）");
   if (receipt?.tmpResidue) residues.push("临时文件残骸 " + receipt.tmpResidue.path + "（" + receipt.tmpResidue.error + "）");
   if (receipt?.ok && residues.length === 0) return { text: "已记（" + artifacts + " 个制品，" + scripts + " 个脚本）", failed: false };
   if (receipt?.ok) return { text: "已记（" + artifacts + " 个制品，" + scripts + " 个脚本），**但留下了残骸**：" + residues.join("；") + " —— 请人工处置（doctor ⑪ 能看到）", failed: true };

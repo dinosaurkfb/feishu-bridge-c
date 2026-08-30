@@ -378,17 +378,20 @@ export function acquireLockUngated(lockDir, { staleMs = 5 * 60 * 1000, now = Dat
   // 回收串行化：reap 锁 → 重读核对 → rename 走 → 放 reap 锁 → 再取。
   const reaped = withReapLock(lockDir, () => {
     const current = readLockOwner(lockDir);
-    if (!current.present) return true; // 已经被别人收走了
+    if (!current.present) return { done: true }; // 已经被别人收走了
     const sameInstance = JSON.stringify(current.owner) === JSON.stringify(seen.owner);
-    if (!sameInstance || !isPublishLockStale(lockDir, { staleMs, now })) return false; // 实例变了：那是活锁
+    if (!sameInstance || !isPublishLockStale(lockDir, { staleMs, now })) return { done: false }; // 实例变了：那是活锁
     const away = lockDir + ".reaped-" + token;
     try { fs.renameSync(lockDir, away); }
-    catch { return false; } // 别人刚收走
-    fs.rmSync(away, { recursive: true, force: true });
-    return true;
+    catch { return { done: false }; } // 别人刚收走
+    // 隔离后删不掉**不裸抛**（评审探针：EIO 从取锁阶段穿出去，残骸 .reaped-<uuid> 谁也看不见）：
+    // 旧实例已离开原路径、归属转换已完成，残骸带路径回去交盘点 / 人工删（不涉及归属）。
+    try { fs.rmSync(away, { recursive: true, force: true }); return { done: true }; }
+    catch (err) { return { done: true, reapedUncleared: { path: away, error: String(err?.code ?? err?.message ?? err) } }; }
   }, { duringReap });
   if (!reaped.ok) return reaped.reason === "reap_busy" ? first : reaped; // 别人正在回收：这轮让它
-  return carryReapResidue(reaped, reaped.run ? attempt() : first); // 只重试一次：再失败说明有别人刚抢到，让它去发
+  const next = carryReapResidue(reaped, reaped.run.done ? attempt() : first); // 只重试一次：再失败说明有别人刚抢到，让它去发
+  return reaped.run.reapedUncleared ? { ...next, reapedUncleared: reaped.run.reapedUncleared } : next;
 }
 
 export function isPublishLockStale(lockDir, { staleMs = 5 * 60 * 1000, now = Date.now() } = {}) {

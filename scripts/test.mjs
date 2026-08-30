@@ -16,7 +16,7 @@ import { RISK, classifyRisk } from "./risk-class.mjs";
 import { CHAT_POLICY_ID, CHAT_REPLY_ARGS, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatReplyPathStatus, diagnosticSnippet, chatFailText, CHAT_FAIL_REASONS } from "./chat-reply.mjs";
 import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome, chatRecordProblem, isAdmissionLockEntry, classifyAdmissionLockEntry, inspectAdmissionLocks, inspectScratch, sweepScratch, classifyTmpEntry, lockUnclearedText, CHAT_MAX_CONCURRENT, CHAT_MAX_PER_SENDER, TMP_NAME_SHAPE } from "./chat-ledger.mjs";
 import { parseChatScratchSweepArgs, describeScratchSweep, sweepExitCode } from "./chat-scratch-sweep.mjs";
-import { acquirePublishLock as acquireLedgerLock, releasePublishLock as releaseLedgerLock } from "./registry.mjs";
+import { acquireLockUngated, acquirePublishLock as acquireLedgerLock, releasePublishLock as releaseLedgerLock } from "./registry.mjs";
 import { evaluateChatGates, CHAT_FALLBACK_REASONS } from "./inbound-route.mjs";
 import { ZERO_TOOL_ARGS } from "./handoff.mjs";
 import { INTENT, parseInboundIntent, controlRejectText, rejectedControlProjection, shown } from "./inbound-intent.mjs";
@@ -20685,12 +20685,42 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   fs.unlinkSync(wr.tmpResidue.path);
   fs.mkdirSync(lockPath); fs.symlinkSync("junk", lockPath + ".reap");
   const inv2 = inspectInstalledSurface({ file: surface });
-  assert.deepEqual(inv2.residues.map((x) => x.kind + ":" + x.detail), ["lock:不是本协议的 symlink（只人工处置）", "reap:payload 畸形（只人工处置）"], JSON.stringify(inv2.residues));
+  assert.deepEqual(inv2.residues.map((x) => x.kind + ":" + x.detail), ["unknown:lock 位置上不是本协议的 symlink —— 只人工处置", "unknown:reap 的 payload 畸形 —— 只人工处置"], JSON.stringify(inv2.residues));
   fs.rmdirSync(lockPath); fs.unlinkSync(lockPath + ".reap");
   fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date(Date.now() - 120000).toISOString(), token: "t" }), lockPath);
   assert.match(inspectInstalledSurface({ file: surface }).residues[0]?.detail ?? "", /仍在但已超时 1\d\d 秒/u);
   fs.unlinkSync(lockPath);
-  assert.deepEqual(inspectInstalledSurface({ file: surface }).residues, [], "干净时没有残骸");
+  assert.deepEqual([inspectInstalledSurface({ file: surface }).residues, inspectInstalledSurface({ file: surface }).inventory], [[], "ok"], "干净时没有残骸");
+  // 取锁阶段：抛错受控；陈旧回收隔离后删不掉（reapedUncleared）进最终结果与文案
+  const acqThrew = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: [], file: surface, testHooks: { acquire: () => { throw Object.assign(new Error("EIO"), { code: "EIO" }); } } });
+  assert.deepEqual([acqThrew.ok, acqThrew.reason, acqThrew.why, tmpCount()], [false, "io_error", "取锁阶段异常：EIO", 0], JSON.stringify(acqThrew));
+  const reapedPath = lockPath + ".reaped-" + crypto.randomUUID();
+  const acqResidue = recordInstalledSurface({ chain: "claude", version: v, artifacts: [], scripts: ["doctor.mjs"], file: surface, testHooks: { acquire: (l, o) => ({ ...acquireLockUngated(l, o), reapedUncleared: { path: reapedPath, error: "EIO" } }) } });
+  assert.deepEqual([acqResidue.ok, acqResidue.lockUncleared, acqResidue.lockResidues?.length, receiptReport(acqResidue).failed, receiptReport(acqResidue).text.includes(reapedPath)], [true, { path: reapedPath, reason: "reaped_uncleared", error: "EIO" }, 1, true, true], JSON.stringify(acqResidue));
+  // 共用原语本身：陈旧目录锁隔离后删不掉 → 不裸抛，返回 ok + reapedUncleared 点名隔离路径
+  const dirLock = path.join(base, "dir.lock"); fs.mkdirSync(path.join(dirLock, "sub"), { recursive: true }); fs.writeFileSync(path.join(dirLock, "sub", "f"), ""); fs.chmodSync(path.join(dirLock, "sub"), 0o500);
+  const oldStamp = new Date(Date.now() - 3600 * 1000); fs.utimesSync(dirLock, oldStamp, oldStamp);
+  const primitive = acquireLockUngated(dirLock, { staleMs: 1 });
+  if (primitive.reapedUncleared) fs.chmodSync(path.join(primitive.reapedUncleared.path, "sub"), 0o700);
+  assert.deepEqual([primitive.ok, typeof primitive.reapedUncleared?.path, ["EACCES", "ENOTEMPTY"].includes(primitive.reapedUncleared?.error), fs.existsSync(primitive.reapedUncleared?.path ?? "/nonexistent")], [true, "string", true, true], "隔离后删不掉：不裸抛、点名隔离路径：" + JSON.stringify(primitive));
+  releasePublishLock(dirLock); fs.rmSync(primitive.reapedUncleared.path, { recursive: true, force: true });
+  // 盘点封闭识别锁家族 + 目录读不出不折成"没有残骸" + 家族各自的处置文案
+  const mk = (n) => { fs.writeFileSync(path.join(surfaceDir, n), ""); return path.join(surfaceDir, n); };
+  const fam = [mk("installed-surface.json.lock.reaped-" + crypto.randomUUID()), mk("installed-surface.json.lock.reaped-junk"), mk("installed-surface.json.lock.reap.quarantine-" + crypto.randomUUID()), mk("installed-surface.json.lock.foo"), mk(".installed-surface.bad.tmp")];
+  const famInv = inspectInstalledSurface({ file: surface });
+  assert.deepEqual(famInv.residues.map((x) => x.kind), ["unknown", "unknown", "reap-quarantine", "reaped", "unknown"], JSON.stringify(famInv.residues));
+  assert.ok(famInv.residues.find((x) => x.kind === "reap-quarantine").detail.includes("repair-publish-lock.mjs --lock " + lockPath), "reap 隔离残骸指路 repair-publish-lock");
+  assert.ok(famInv.residues.find((x) => x.kind === "reaped").detail.includes("人工删"), "reaped 残骸只要人工删");
+  for (const f of fam) fs.unlinkSync(f);
+  const deadOwner = JSON.stringify({ pid: 2147483646, at: new Date(Date.now() - 120000).toISOString(), token: "t" });
+  fs.symlinkSync(deadOwner, lockPath + ".reap"); fs.symlinkSync(deadOwner, lockPath + ".maint"); fs.symlinkSync(deadOwner, lockPath);
+  const famText = Object.fromEntries(inspectInstalledSurface({ file: surface }).residues.map((x) => [x.kind, x.detail]));
+  assert.deepEqual([/按协议回收/u.test(famText.lock), famText.reap.includes("repair-publish-lock.mjs --lock " + lockPath + " --apply"), /不自动恢复.*手动删/u.test(famText.maint)], [true, true, true], JSON.stringify(famText));
+  fs.unlinkSync(lockPath); fs.unlinkSync(lockPath + ".reap"); fs.unlinkSync(lockPath + ".maint");
+  fs.chmodSync(surfaceDir, 0o300);
+  const blindInv = inspectInstalledSurface({ file: surface });
+  fs.chmodSync(surfaceDir, 0o700);
+  assert.deepEqual([blindInv.inventory, blindInv.residues.map((x) => [x.kind, x.path]), /EACCES/u.test(blindInv.residues[0]?.detail ?? "")], ["unreadable", [["inventory", surfaceDir]], true], JSON.stringify(blindInv));
   assert.deepEqual([receiptReport({ ok: true }, { artifacts: 2, scripts: 3 }), receiptReport({ ok: false, reason: "surface_unreadable", why: "x" }).failed], [{ text: "已记（2 个制品，3 个脚本）", failed: false }, true]);
   // 形状：version / sha256 必须先是字符串再匹配正则（数组 String() 后能骗过正则）
   const arrDoc = JSON.parse(fs.readFileSync(surface, "utf-8"));
@@ -20777,6 +20807,10 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   assert.deepEqual([d2.ok, d2.detail.includes(residueTmp)], [false, true], JSON.stringify(d2));
   fs.unlinkSync(residueTmp);
   fs.rmSync(surface); fs.mkdirSync(surface);
+  fs.chmodSync(path.dirname(surface), 0o300);
+  const dBlind = runDoctor({ home }).checks.find((c) => c.id === "installed_surface");
+  fs.chmodSync(path.dirname(surface), 0o700);
+  assert.deepEqual([dBlind.ok, dBlind.detail.includes(path.dirname(surface)), /目录盘点失败/u.test(dBlind.detail)], [false, true, true], "目录读不出不假绿：" + JSON.stringify(dBlind));
   const d3 = runDoctor({ home }).checks.find((c) => c.id === "installed_surface");
   assert.deepEqual([d3.ok, /^读不出（不是普通文件）/u.test(d3.detail)], [false, true], JSON.stringify(d3));
   const failed = spawnSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });

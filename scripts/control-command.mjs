@@ -216,6 +216,12 @@ export function withControlLock({ claimsDir, key }, fn) {
     }
     return { ok: false, reason: "control_lock_unavailable", why: String(lock.reason) + (lock.error ? "：" + lock.error : "") };
   }
+  // 陈旧锁隔离后删不掉：原语现在受控返回 reapedUncleared（不再抛）。控制事务保持 fail-closed —— 回调不跑、把锁交还、
+  // 残骸 .reaped-<uuid> 点名交显式维护入口（repair-control-claim 的家族盘点认得它）。
+  if (lock.reapedUncleared) {
+    try { releasePublishLock(lockPath); } catch { /* 交不还也只是残骸，下面已点名 */ }
+    return { ok: false, reason: "control_lock_unavailable", why: "陈旧锁隔离后删不掉：" + lock.reapedUncleared.error + "（" + lock.reapedUncleared.path + "）" };
+  }
   let result;
   try { result = fn(); }
   finally {

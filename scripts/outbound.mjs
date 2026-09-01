@@ -22,6 +22,7 @@ import { execFileSync } from "node:child_process";
 import { parseRunOutcome, readRunOutcome } from "./handoff.mjs";
 import { isDirectRun, moduleRoot } from "./direct-run.mjs";
 import { gateBlocks } from "./maintenance-gate-core.mjs";
+import { readRegularFile } from "./installed-surface.mjs";
 
 const PUBLISHED_MARK = ".published.json";
 export const RUN_PUBLISH_MAX_ATTEMPTS = 5;
@@ -191,12 +192,17 @@ const RUN_ENTRY_RE = /^([0-9a-f]{64})\.(jsonl|published\.json|publish-failed\.js
 // 转发型记录（live-session 投递）允许的全部 sidecar；多一样都是冲突。
 const FORWARD_KINDS = new Set(["forward.jsonl", "forward.stderr.log", "terminal"]);
 // delivery-claims 目录里受控的条目形状：claim 目录、笔记，以及 **claim.mjs 受控状态集里每一种状态**的记录
-// （rejected 也是入站写的正规记录 —— 真机上曾被硬编码的四种名字报成 unrecognized_entry；
-// 状态集之外的名字（如历史遗留的 deliver_failed，仓库里从未有过写方）仍照实报 unrecognized_entry，不放宽）。
+// （rejected 也是入站写的正规记录 —— 真机上曾被硬编码的四种名字报成 unrecognized_entry）。
+// 唯一登记的遗留形状是 deliver_failed（issue #86：旧版运行时写的状态名，本仓历史里没有写方）：
+// 名字封闭（key 形状复用 CLAIM_KEY_SHAPE），只报 legacy_state 交人处置 —— 写方不在仓库历史里、字段集不可考，
+// 不猜字段、不解读内容、不参与孤儿判定、绝不被自动动；除此之外状态集之外的名字（含一切长得像的变体）仍照实报 unrecognized_entry，不放宽。
 // 只有 handed_off / failed 是 run 的终局，参与孤儿判定；其余状态的记录不需要 run 制品。
 const CLAIM_ENTRY_RE = new RegExp("^([0-9a-f]{64})\\.(claim|notes\\.log|(?:" +
   Object.values(CLAIM_STATE).map((st) => st.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")).join("|") + ")\\.json)$", "u");
 const TERMINAL_STATE_FILES = new Set([CLAIM_STATE.HANDED_OFF + ".json", "failed.json"]);
+// 遗留形状的正则收在**名字**这一层：内容永远不参与“是不是 legacy”的判定 —— 判定错了也只是多一句人话，不会自动动任何东西。
+// key 部分与 claim.mjs 的 CLAIM_KEY_SHAPE 同形状（本文件既有 CLAIM_ENTRY_RE 也是这样内联的，不另立判据）。
+const LEGACY_CLAIM_ENTRY_RE = /^([0-9a-f]{64})\.deliver_failed\.json$/u;
 
 /**
  * runs 账本的**联合盘点**：以第一次目录快照驱动，对 JSONL、终局记录、发布回执、失败账
@@ -253,6 +259,31 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
       if (quarantine) {
         // 维护入口隔离的损坏 failed 制品：不参与状态判定，但必须能盘点到，人看完再删。
         problems.push({ key: quarantine[1], reason: "control_failed_quarantined", why: "隔离的损坏 failed / rejected 制品，人工查看后删除：delivery-claims/" + name.slice(0, 80) });
+        continue;
+      }
+      const legacy = LEGACY_CLAIM_ENTRY_RE.exec(name);
+      if (legacy) {
+        // 唯一登记的遗留形状（issue #86）：名字对上才进这里，长得像的变体进不去（落到 unrecognized_entry）。
+        // 写方不在仓库历史里，字段集不可考 —— 不猜字段、不解读内容、不参与孤儿判定、绝不被自动动；
+        // 账本只把它如实报给人，内容读得出读不出也说清，处置方式给到人。
+        // 内容那一眼必须是 **fd 绑定读**（评审探针：readFileSync 会跟符号链接越出目录边界、会被 FIFO 永久挂死）：
+        // O_NOFOLLOW | O_NONBLOCK 打开、同一 fd fstat 只收单硬链接普通文件 —— 名字合法但不是普通文件的，照样报出来、不阻塞。
+        const r = readRegularFile(path.join(claimsDir, name));
+        let contentNote = "";
+        if (r.status === "absent") contentNote = "；内容读不出（已不在）";
+        else if (r.status === "unreadable") contentNote = "；内容读不出（" + r.why + "）";
+        else {
+          try {
+            const doc = JSON.parse(r.buf.toString("utf-8"));
+            if (doc === null || typeof doc !== "object" || Array.isArray(doc)) contentNote = "；内容不是记录对象";
+          } catch { contentNote = "；内容读不出（不是 JSON）"; }
+        }
+        problems.push({
+          key: legacy[1],
+          reason: "legacy_state",
+          // 名字已被封闭正则限死（64 hex + 固定后缀），完整给出 —— 截断的名字对不上"人工删除或归档"的指引（评审探针）。
+          why: "旧版运行时写的投递失败记录（deliver_failed 是历史状态名，不在现受控状态集里，本仓历史里没有写方、字段集不可考，账本不解读内容" + contentNote + "）—— 人工确认内容没有还要用的信息后删除或归档，账本不会自动动它：delivery-claims/" + name,
+        });
         continue;
       }
       const m = CLAIM_ENTRY_RE.exec(name);

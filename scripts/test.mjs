@@ -15823,7 +15823,7 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
     assert.equal(inventoryRuns({ runsDir: f.runs, claimsDir: f.claims }).problems.find((x) => x.key === bare)?.reason, "orphan_terminal_record");
   }
   // claims 目录的条目形状从 claim.mjs 的受控状态集派生：rejected / claimed 记录没有 run 制品是正常的（不是孤儿、不是不认识）；
-  // 状态集之外的名字（历史遗留 deliver_failed）照实报 unrecognized_entry。
+  // 唯一登记的遗留形状是 deliver_failed（issue #86）→ legacy_state 交人处置；其余不认识的名字照实报 unrecognized_entry。
   {
     const f = mk();
     const rej = claimKeyFor("rejected-msg");
@@ -15839,10 +15839,43 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
     recordClaimState({ claimsDir: f.claims, key: bareRej, state: "rejected", detail: { reason: "not_mentioned" } });
     assert.equal(inventoryRuns({ runsDir: f.runs, claimsDir: f.claims }).problems.find((x) => x.key === bareRej)?.reason, "rejected_orphan");
     fs.rmSync(path.join(f.claims, bareRej + ".rejected.json"));
-    fs.writeFileSync(path.join(f.claims, claimKeyFor("legacy-df") + ".deliver_failed.json"), "{}");
+    // 唯一登记的遗留形状（issue #86）：deliver_failed 报 legacy_state + 处置方式 —— 不是"不认识"，
+    // 不参与孤儿判定（连 run 制品都没有也不报孤儿），账本不解读内容、绝不说"可直接删"。
+    const legacyKey = claimKeyFor("legacy-df");
+    fs.writeFileSync(path.join(f.claims, legacyKey + ".deliver_failed.json"), JSON.stringify({ schema_version: "1.0", claim_key: legacyKey, state: "deliver_failed", recorded_at: "2026-08-20T00:00:00.000Z", reason: "publish failed" }));
     const inv2 = inventoryRuns({ runsDir: f.runs, claimsDir: f.claims });
-    assert.equal(inv2.problems.length, 1); assert.equal(inv2.problems[0].reason, "unrecognized_entry");
-    assert.match(inv2.problems[0].why, /deliver_failed/u, "状态集之外的名字照实报，不放宽");
+    assert.equal(inv2.problems.length, 1, JSON.stringify(inv2.problems));
+    assert.deepEqual([inv2.problems[0].reason, inv2.problems[0].key], ["legacy_state", legacyKey], JSON.stringify(inv2.problems));
+    assert.match(inv2.problems[0].why, /deliver_failed/u);
+    assert.match(inv2.problems[0].why, /人工/u, "处置方式要给到人：" + inv2.problems[0].why);
+    assert.doesNotMatch(inv2.problems[0].why, /可直接删/u, "绝不教人直接删：" + inv2.problems[0].why);
+    // 内容读不出也说得出（不消失、不当健康、仍是同一条遗留形状）。
+    fs.rmSync(path.join(f.claims, legacyKey + ".deliver_failed.json"));
+    fs.writeFileSync(path.join(f.claims, legacyKey + ".deliver_failed.json"), "{ 坏了");
+    const invBad = inventoryRuns({ runsDir: f.runs, claimsDir: f.claims });
+    assert.deepEqual([invBad.problems.length, invBad.problems[0].reason], [1, "legacy_state"], JSON.stringify(invBad.problems));
+    assert.match(invBad.problems[0].why, /读不出/u, "内容读不出要明说：" + invBad.problems[0].why);
+    // 名字封闭：长得像的变体（多字母 / 双后缀 / key 形状不对）仍照实报 unrecognized_entry，不放宽。
+    fs.rmSync(path.join(f.claims, legacyKey + ".deliver_failed.json"));
+    fs.writeFileSync(path.join(f.claims, legacyKey + ".deliver_failedx.json"), "{}");
+    fs.writeFileSync(path.join(f.claims, legacyKey + ".deliver_failed.json.bak"), "{}");
+    fs.writeFileSync(path.join(f.claims, "zz.deliver_failed.json"), "{}");
+    const invLike = inventoryRuns({ runsDir: f.runs, claimsDir: f.claims });
+    assert.equal(invLike.problems.filter((p) => p.reason === "unrecognized_entry").length, 3, JSON.stringify(invLike.problems));
+    assert.equal(invLike.problems.some((p) => p.reason === "legacy_state"), false, "变体不许折成 legacy");
+    for (const n of [legacyKey + ".deliver_failedx.json", legacyKey + ".deliver_failed.json.bak", "zz.deliver_failed.json"]) fs.rmSync(path.join(f.claims, n));
+    // 内容那一眼是 fd 绑定读（评审探针）：symlink 指向目录外坏 JSON → 不跟随（why 说"不是普通文件"而不是"不是 JSON"）；
+    // FIFO → 不挂死、照样报出来。FIFO 放 symlink 断言之后：变异回裸 readFileSync 时 symlink 断言先红，测试中止不会走到 FIFO 挂死。
+    const outside = path.join(f.h.dir, "外面的坏.json"); fs.writeFileSync(outside, "{ 坏 JSON");
+    fs.symlinkSync(outside, path.join(f.claims, legacyKey + ".deliver_failed.json"));
+    const invLink = inventoryRuns({ runsDir: f.runs, claimsDir: f.claims });
+    assert.deepEqual([invLink.problems.length, invLink.problems[0].reason, /不是普通文件/u.test(invLink.problems[0].why), /不是 JSON/u.test(invLink.problems[0].why)], [1, "legacy_state", true, false], "symlink 不跟随：" + JSON.stringify(invLink.problems));
+    assert.ok(invLink.problems[0].why.endsWith("delivery-claims/" + legacyKey + ".deliver_failed.json"), "制品名完整给出（含 .json）：" + invLink.problems[0].why);
+    fs.unlinkSync(path.join(f.claims, legacyKey + ".deliver_failed.json"));
+    execFileSync("mkfifo", [path.join(f.claims, legacyKey + ".deliver_failed.json")]);
+    const invFifo = inventoryRuns({ runsDir: f.runs, claimsDir: f.claims });
+    assert.deepEqual([invFifo.problems.length, invFifo.problems[0].reason, /不是普通文件/u.test(invFifo.problems[0].why)], [1, "legacy_state", true], "FIFO 不挂死、照样报：" + JSON.stringify(invFifo.problems));
+    fs.rmSync(path.join(f.claims, legacyKey + ".deliver_failed.json"));
   }
   // 联合盘点：终局记录坏 JSON（有 run 制品）、只剩发布回执的孤儿、watcher 失败终局的孤儿 —— 都进 problems。
   {

@@ -4,3 +4,6 @@ node_modules/
 
 # 个人草稿，不进版本管理
 drafts/
+
+# macOS 目录元数据（评审：untracked=all 的干净树检查不许被它挡住，也不许全局忽略 untracked）
+.DS_Store

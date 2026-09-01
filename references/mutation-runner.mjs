@@ -149,14 +149,39 @@ function main(argv) {
   let picked = TABLE;
   let jobs = 1;
   let assumeGreen = false;
+  let workerToken = null;
+  let workerCommit = null;
   const rest = [...argv];
   while (rest.length > 0 && rest[0].startsWith("--") && rest[0] !== "--ids") {
     const flag = rest.shift();
     if (flag === "--root") { const v = rest.shift(); if (!v || !fs.existsSync(v)) { console.error("--root 要给存在的目录"); return 2; } ROOT = path.resolve(v); continue; }
     if (flag === "--assume-green") { assumeGreen = true; continue; }
+    if (flag === "--worker-token") { workerToken = rest.shift() ?? null; continue; }
+    if (flag === "--commit") { workerCommit = rest.shift() ?? null; continue; }
     if (flag === "--jobs") { const v = Number(rest.shift()); if (!Number.isSafeInteger(v) || v < 1 || v > 8) { console.error("--jobs 要是 1–8 的整数"); return 2; } jobs = v; continue; }
-    console.error("不认识参数：" + flag + "\n用法：node references/mutation-runner.mjs [--root DIR] [--assume-green] [--jobs N] [--ids id …]");
+    console.error("不认识参数：" + flag + "\n用法：node references/mutation-runner.mjs [--jobs N] [--ids id …]");
     return 2;
+  }
+  // ── 证据必须绑定**干净提交**（评审探针：test.mjs 脏时仍报 KILLED/退出 0）：任何套件跑之前，
+  // git 可用、整树 tracked 无未提交改动，冻结 commit SHA —— 并行 worker 的 worktree 也检出这个 SHA 并复核。
+  const rev = spawnSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf-8" });
+  if (rev.status !== 0) { console.error("✗ git rev-parse HEAD 失败（不在 git 仓里？）—— 变异证据必须绑定提交，不跑"); return 2; }
+  const frozenSha = rev.stdout.trim();
+  const dirty = spawnSync("git", ["status", "--porcelain", "-uno"], { cwd: ROOT, encoding: "utf-8" });
+  if (dirty.status !== 0 || dirty.stdout.trim() !== "") {
+    console.error("✗ 工作树有未提交改动（tracked）—— 变异证据必须绑定干净提交，先提交或还原：\n" + (dirty.stdout ?? "").trim());
+    return 2;
+  }
+  // ── --assume-green 是并行 worker 的**内部协议**（评审探针：裸调可无凭据跳过第一层全量基线）：
+  // 必须带父进程的一次性凭据（--worker-token 与 env MUTATION_RUNNER_TOKEN 一致）与父进程冻结的 --commit，且本 worktree 的 HEAD 与之相同。
+  if (assumeGreen) {
+    if (!workerToken || process.env.MUTATION_RUNNER_TOKEN !== workerToken || !workerCommit) {
+      console.error("✗ --assume-green 是 --jobs 并行 worker 的内部协议（要求父进程一次性凭据与冻结 commit）；普通调用请去掉它，让 runner 自己跑全量基线");
+      return 2;
+    }
+    if (frozenSha !== workerCommit) { console.error("✗ worktree HEAD " + frozenSha.slice(0, 12) + " ≠ 父进程冻结的 " + workerCommit.slice(0, 12) + " —— 拒跑"); return 2; }
+  } else {
+    console.log("— 证据绑定 commit " + frozenSha.slice(0, 12) + "（整树 tracked 干净）");
   }
   if (rest[0] === "--ids") {
     const want = rest.slice(1);
@@ -167,7 +192,7 @@ function main(argv) {
     console.error("不认识参数：" + rest.join(" ") + "\n用法：node references/mutation-runner.mjs [--root DIR] [--assume-green] [--jobs N] [--ids id …]");
     return 2;
   }
-  if (jobs > 1) return mainParallel(picked, jobs);
+  if (jobs > 1) return mainParallel(picked, jobs, frozenSha);
 
   // ① 锚点先全体核对（纯字符串，不跑套件）—— 一条都不用跑时不必花那 2.5 分钟基线。
   const ready = [];
@@ -240,47 +265,65 @@ function main(argv) {
   return survived + anomalies.length > 0 ? 1 : 0;
 }
 
-/** 并行编排：锚点核对与全量基线在主根做一次，N 个临时 worktree 分片跑，输出按 worker 归组打印，汇总加总。 */
-async function mainParallel(picked, jobs) {
+/**
+ * 并行编排：锚点核对与全量基线在主根做一次（主根已核过"干净提交"），worktree 检出**冻结的 SHA**（不是运行时再解析 HEAD），
+ * worker 用一次性凭据（env + --worker-token）+ --commit 复核后才许 --assume-green。
+ * 启动失败、worker 崩溃、汇总对不上分片数、worktree 清理失败都计异常、非零退出、点名路径（评审返修：曾被吞成"异常 0"）。
+ */
+async function mainParallel(picked, jobs, frozenSha) {
   const bad = picked.filter((m) => m.missing);
   for (const m of bad) console.log("  ! " + m.id + "：unknown_id：表里没有这个变异");
   const real = picked.filter((m) => !m.missing);
   if (real.length === 0) return 1;
+  console.log("— 证据绑定 commit " + frozenSha.slice(0, 12) + "（整树 tracked 干净）");
   console.log("— 全量基线（未变异，主根一次）：" + SUITE);
   const base = runSuite(null);
   if (base.verdict !== "green") { console.log("✗ 全量基线就没绿（" + base.verdict + "：" + base.why + "），整轮不跑。"); return 1; }
+  const token = (await import("node:crypto")).randomUUID();
   const n = Math.min(jobs, real.length);
   const chunks = Array.from({ length: n }, () => []);
   real.forEach((m, i) => chunks[i % n].push(m));
   const wts = [];
   const results = [];
+  const cleanupFailures = [];
   try {
     for (let i = 0; i < n; i += 1) {
       const wt = fs.mkdtempSync(path.join(os.tmpdir(), "mutation-wt-"));
       fs.rmdirSync(wt); // git worktree add 要求目标不存在
-      const add = spawnSync("git", ["worktree", "add", "--detach", wt, "HEAD"], { cwd: ROOT, encoding: "utf-8" });
+      const add = spawnSync("git", ["worktree", "add", "--detach", wt, frozenSha], { cwd: ROOT, encoding: "utf-8" });
       if (add.status !== 0) { console.log("✗ 建 worktree 失败：" + (add.stderr ?? "").trim()); return 1; }
       wts.push(wt);
     }
     await Promise.all(chunks.map((chunk, i) => new Promise((resolve) => {
-      const args = [path.join(ROOT, "references", "mutation-runner.mjs"), "--root", wts[i], "--assume-green", "--ids", ...chunk.map((m) => m.id)];
-      const child = spawn(process.execPath, args, { cwd: ROOT, env: process.env });
+      const args = [path.join(ROOT, "references", "mutation-runner.mjs"), "--root", wts[i], "--assume-green", "--worker-token", token, "--commit", frozenSha, "--ids", ...chunk.map((m) => m.id)];
+      const child = spawn(process.execPath, args, { cwd: ROOT, env: { ...process.env, MUTATION_RUNNER_TOKEN: token } });
       let out = "";
       child.stdout.on("data", (d) => { out += d; });
       child.stderr.on("data", (d) => { out += d; });
+      child.on("error", (err) => { results[i] = { code: null, out: out + "\n[spawn error] " + String(err?.message ?? err), ids: chunk.map((m) => m.id) }; resolve(); });
       child.on("close", (code) => { results[i] = { code, out, ids: chunk.map((m) => m.id) }; resolve(); });
     })));
   } finally {
-    for (const wt of wts) spawnSync("git", ["worktree", "remove", "--force", wt], { cwd: ROOT, encoding: "utf-8" });
+    for (const wt of wts) {
+      const rm = spawnSync("git", ["worktree", "remove", "--force", wt], { cwd: ROOT, encoding: "utf-8" });
+      if (rm.status !== 0) cleanupFailures.push(wt + "（" + (rm.stderr ?? "").trim().slice(0, 120) + "）");
+    }
   }
   let killed = 0; let survived = 0; let anomalies = bad.length;
   for (let i = 0; i < results.length; i += 1) {
-    const r = results[i];
+    const r = results[i] ?? { code: null, out: "[worker 没有结果]", ids: chunks[i].map((m) => m.id) };
     console.log("\n──── worker " + (i + 1) + "（" + r.ids.join(" ") + "）────");
     process.stdout.write(r.out);
     const sum = lastMatch(/KILLED (\d+) \/ SURVIVED (\d+) \/ 异常 (\d+)/gu, r.out);
-    if (!sum) { console.log("  ! worker " + (i + 1) + " 没打汇总（退出码 " + r.code + "）—— 这一片的结论作废"); anomalies += r.ids.length; continue; }
-    killed += Number(sum[1]); survived += Number(sum[2]); anomalies += Number(sum[3]);
+    // worker 的退出码要与汇总互证；汇总三桶之和要等于分片条数（只验结构不验自洽等于没验）
+    if (!sum || (r.code !== 0 && r.code !== 1)) { console.log("  ! worker " + (i + 1) + (sum ? " 退出码异常（" + r.code + "）" : " 没打汇总（退出码 " + r.code + "）") + " —— 这一片的结论作废"); anomalies += r.ids.length; continue; }
+    const [k, s, a] = [Number(sum[1]), Number(sum[2]), Number(sum[3])];
+    if (k + s + a !== r.ids.length) { console.log("  ! worker " + (i + 1) + " 汇总 " + (k + s + a) + " ≠ 分片 " + r.ids.length + " 条 —— 这一片的结论作废"); anomalies += r.ids.length; continue; }
+    killed += k; survived += s; anomalies += a;
+  }
+  if (cleanupFailures.length > 0) {
+    anomalies += cleanupFailures.length;
+    console.log("  ! worktree 清理失败 " + cleanupFailures.length + " 处（残留请人工 git worktree remove --force）：\n    " + cleanupFailures.join("\n    "));
   }
   console.log("\n═══ 并行总汇 ═══\nKILLED " + killed + " / SURVIVED " + survived + " / 异常 " + anomalies);
   return survived + anomalies > 0 ? 1 : 0;

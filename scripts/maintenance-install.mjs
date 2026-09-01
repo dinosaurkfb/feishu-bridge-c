@@ -11,6 +11,7 @@
 import path from "node:path";
 
 import { isDirectRun, moduleDir } from "./direct-run.mjs";
+import { acquireInstallSurfaceLock } from "./install-surface-lock.mjs";
 import { planRuntimeSync } from "./runtime-install.mjs";
 import { enterMaintenance, maintenanceContext, rollbackOperation } from "./maintenance/operation.mjs";
 import { releaseOperationLease } from "./maintenance/journal.mjs";
@@ -63,6 +64,14 @@ export function runMaintenanceInstall(argv, { ctx = null, out = (s) => process.s
     return 0;
   }
 
+  // ── 安装面锁（评审返修 2）：与三个普通安装器共用一把，**enter 之前**取、持有到 reopening / 回退与租约释放完成 ——
+  // 门检是瞬时的，锁才是原子准入：已过门检的安装器与将要建门的维护流程在这里互斥。
+  const surface = acquireInstallSurfaceLock({ home: c.home });
+  if (!surface.ok) { out("安装面锁拿不到（" + surface.reason + "：" + String(surface.why) + "，" + surface.path + "）—— 什么都没动。"); return surface.reason === "surface_install_busy" ? 1 : 3; }
+  try { return applyUnderSurfaceLock(); }
+  finally { const rel = surface.release(); if (!rel.ok) out("安装面锁交不还（" + String(rel.why) + "，" + String(rel.path) + "）—— 会被下一个写方按 pid 活性接管，请人工核对。"); }
+
+  function applyUnderSurfaceLock() {
   // ── enter：keepLease —— 从进门到 reopening / 回退结束连续持有同一租约（释放再重取会留出 operation 被换掉的窗口）
   const entered = enterMaintenance(c, { reason, waitMs: parsed.waitMs, apply: true, keepLease: true });
   if (!entered.ok) {
@@ -105,6 +114,7 @@ export function runMaintenanceInstall(argv, { ctx = null, out = (s) => process.s
   const rel = releaseOperationLease(lease);
   if (!rel.ok) { out("租约交不还：" + String(rel.path) + "（" + String(rel.why) + "）—— 请人工核对"); return 3; }
   return code;
+  }
 }
 
 if (isDirectRun(import.meta.url)) process.exit(runMaintenanceInstall(process.argv.slice(2)));

@@ -220,6 +220,7 @@ import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatu
 import { acquireOperationLease, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, journalProblem, readActive, readJournal, releaseOperationLease, updateJournal } from "./maintenance/journal.mjs";
 import { commitForInstall, finishInstallReopening, liveBaseline, stageForInstall, stagedChecks, stagedPlanProblem, verifyLiveForInstall, verifyStagedForInstall } from "./maintenance/maintenance-install-core.mjs";
 import { parseMaintenanceInstallArgs, runMaintenanceInstall } from "./maintenance-install.mjs";
+import { acquireInstallSurfaceLock } from "./install-surface-lock.mjs";
 import { analyzeCommandRefs, harvestAbsolutePaths, refsUnderRoots, tokenizeCommand, tokenizeCommandStrict } from "./maintenance/command-refs.mjs";
 import { inspectMaintenanceDir } from "./maintenance/journal.mjs";
 import { buildStubVersion, removeStubVersion, renderStubScript, stubCategory, stubRelTarget } from "./maintenance/stub.mjs";
@@ -21279,8 +21280,26 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
     assert.deepEqual([codeF, /base_changed/u.test(outF.join("\n")), /已回退到进门前/u.test(outF.join("\n")), fs.readlinkSync(path.join(claudeRoot, "current")), readGate({ file: gateFile, now: clock }).state, readActive({ dir }).state, readInstalledSurface({ file: claudeReceiptFile }).doc.chains.claude.version], [1, true, true, "versions/" + v2, "absent", "absent", v2], outF.join("\n"));
     fs.writeFileSync(codexSkillDst, codexSkillBefore);
     fs.unlinkSync(path.join(dir, fs.readdirSync(dir).find((n) => /^[0-9a-f-]{36}\.json$/u.test(n))));
+    // ── 安装面锁互斥（评审返修 2）：任一方持锁，另一方在做任何事之前被拒 —— 门检是瞬时的，锁才是原子准入
+    const gEnvLock = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+    const surf = acquireInstallSurfaceLock({ home });
+    assert.equal(surf.ok, true, JSON.stringify(surf));
+    for (const inst of [["install-outbound.mjs"], ["install-inbound.mjs"], ["codex", "install.mjs"]]) {
+      const r = spawnSync(process.execPath, [path.resolve("scripts", ...inst), "--apply"], { encoding: "utf-8", env: gEnvLock });
+      assert.deepEqual([r.status, /安装面锁拿不到/u.test(r.stderr)], [2, true], inst.join("/") + "：" + r.stdout + r.stderr);
+    }
+    const outB = []; assert.equal(runMaintenanceInstall(["--apply"], { ctx: { ...ctx, repoRoot: srcV3 }, out: (t) => outB.push(t) }), 1, outB.join("\n"));
+    assert.match(outB.join("\n"), /安装面锁拿不到/u);
+    const outG = []; assert.equal(runMaintenanceGate(["--enter", "--reason", "x", "--apply"], { ctx, out: (t) => outG.push(t) }), 1, outG.join("\n"));
+    assert.match(outG.join("\n"), /安装面锁拿不到/u);
+    assert.deepEqual([readActive({ dir }).state, fs.existsSync(gateFile), fs.readlinkSync(path.join(claudeRoot, "current"))], ["absent", false, "versions/" + v2], "锁被持有时两个方向都零改动");
+    assert.equal(surf.release().ok, true);
     // ── base_changed（不变量 6）：stage 之后线上制品被外改 → commit 整次中止，已写项按备份回退，线上等于进门前
     const e2 = enterMaintenance(ctx, { reason: "v3", apply: true }); assert.equal(e2.ok, true, JSON.stringify(e2));
+    // 伪造 / 缺席的租约在任何写之前被拒（评审返修 2）：只有 path 的对象不持实例，stage 零写入
+    const forged = stageForInstall(ctx, { sourceRoot: srcV3, lease: { path: path.join(dir, e2.token + ".lease") } });
+    assert.deepEqual([forged.ok, forged.reason, fs.existsSync(stagedDirPath(ctx, e2.token)), readJournal({ dir, token: e2.token }).doc.phase], [false, "lease_not_held", false, "drained"], "伪造租约路径 → 零写入：" + JSON.stringify(forged));
+    assert.deepEqual([stageForInstall(ctx, { sourceRoot: srcV3 }).reason, fs.existsSync(stagedDirPath(ctx, e2.token))], ["lease_required", false], "缺租约受控拒绝且零写入，不裸抛");
     let lease = acquireOperationLease({ dir, token: e2.token }); assert.equal(lease.ok, true);
     // 维护窗口内三个普通安装器 --apply 一律被门拒（评审返修：消掉"安装写方不受门阻断"这个前提），零改动
     const gEnv = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };

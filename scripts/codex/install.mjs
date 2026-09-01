@@ -18,6 +18,7 @@ import { buildHookCommand, codexHooksOwnedEntries, renderCodexHooks, ownsHookCom
 import { referencedRuntimeScripts } from "../install-projection.mjs";
 import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "../installed-surface.mjs";
 import { gateBlocks } from "../maintenance-gate-core.mjs";
+import { holdInstallSurfaceLockOrExit } from "../install-surface-lock.mjs";
 import { SKILLS, expectedSkillContent } from "./skill-content.mjs";
 
 import {
@@ -119,7 +120,9 @@ if (!apply) {
   process.exit(0);
 }
 
-// 维护门（issue #81）：--apply 是写入口，维护窗口内一律拒（方案稿"所有控制 CLI 的 --apply 分支"看门点）。
+// 安装面锁 + 维护门（issue #81）：先取安装面锁（与维护流程共用一把，持有到本进程退出），**再**看门 ——
+// 门检是瞬时的，锁才是原子准入（评审探针：过检后门才建立，安装器照写不误）。
+holdInstallSurfaceLockOrExit();
 {
   const g = gateBlocks();
   if (g.blocked) { console.error("维护门：" + g.text + " —— 安装被拒，什么都没写。"); process.exit(2); }

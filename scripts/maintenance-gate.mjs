@@ -11,6 +11,7 @@
 import path from "node:path";
 
 import { isDirectRun, moduleDir } from "./direct-run.mjs";
+import { acquireInstallSurfaceLock } from "./install-surface-lock.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus } from "./maintenance/operation.mjs";
 
 /** 参数封闭：每个 flag 至多一次；--status 不带任何别的；--exit 只许 --apply；--enter 必须 --reason，可选 --wait-ms / --apply。 */
@@ -40,6 +41,18 @@ export function runMaintenanceGate(argv, { ctx = null, out = (s) => process.stdo
   if (!parsed.ok) { out("用法：node maintenance-gate.mjs --status | --enter --reason <r> [--wait-ms N] [--apply] | --exit [--apply]（" + parsed.reason + "）"); return 1; }
   const c = ctx ?? maintenanceContext({ repoRoot: path.dirname(moduleDir(import.meta.url)) });
   if (parsed.mode === "status") { out(renderStatus(maintenanceStatus(c))); return 0; }
+  // 安装面锁（评审返修 2）：与三个普通安装器共用一把 —— enter / exit 的 --apply 都是安装面写方，
+  // 在做任何事之前取锁、持有到本次动作结束；拿不到就什么都不动（busy → 1，残骸 → 3）。
+  let surface = null;
+  if (parsed.apply) {
+    surface = acquireInstallSurfaceLock({ home: c.home });
+    if (!surface.ok) { out("安装面锁拿不到（" + surface.reason + "：" + String(surface.why) + "，" + surface.path + "）—— 什么都没动。"); return surface.reason === "surface_install_busy" ? 1 : 3; }
+  }
+  try { return runMaintenanceGateLocked(parsed, c, out); }
+  finally { if (surface !== null) { const rel = surface.release(); if (!rel.ok) out("安装面锁交不还（" + String(rel.why) + "，" + String(rel.path) + "）—— 会被下一个写方按 pid 活性接管，请人工核对。"); } }
+}
+
+function runMaintenanceGateLocked(parsed, c, out) {
   if (parsed.mode === "enter") {
     const r = enterMaintenance(c, { reason: parsed.reason, waitMs: parsed.waitMs, apply: parsed.apply });
     const residue = r.leaseUncleared ? "\n租约交不还：" + r.leaseUncleared.path + "（" + r.leaseUncleared.why + "）—— 下一个执行者会按 pid 活性接管；请人工核对" : "";

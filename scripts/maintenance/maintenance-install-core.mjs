@@ -31,6 +31,7 @@ import { claudeDrainPlistPath, claudeSkillFiles, referencedRuntimeScripts } from
 import { claudeDrainExpectedJob } from "../drain-schedule.mjs";
 import { SKILLS as CODEX_SKILLS } from "../codex/skill-content.mjs";
 import { expectedJob as codexExpectedJob, plistPath as codexPlistPath } from "../codex/drain-service.mjs";
+import { commitWhileHeld } from "../registry.mjs";
 import { addStepPrepared, leasePath, markStepDone, readActive, readJournal, setPhase, writeBackup, writeDurable } from "./journal.mjs";
 import { stubRelTarget } from "./stub.mjs";
 import { chainAgentUid, chainFacts } from "./precheck.mjs";
@@ -65,12 +66,21 @@ const sameState = (a, b) => a.exists === b.exists && a.sha256 === b.sha256;
  * → **租约属于本 operation**（评审探针：拿别的 operation 的租约也曾走通）→ 两条 current == 期望目标
  *（默认本 token 的桩；commit 之后传 expectCurrent:"version"）。expectToken：调用方已知 token 时显式钉住（enter 与后续步骤之间 operation 被换掉 → 拒）。
  */
-export function bindActiveOperation(ctx, { expectPhase, expectCurrent = "stub", version = null, lease = null, expectToken = null } = {}) {
+export function bindActiveOperation(ctx, { expectPhase, expectCurrent = "stub", version = null, lease = null, expectToken = null, requireLease = false } = {}) {
   const active = readActive({ dir: ctx.dir });
   if (active.state !== "active") return { ok: false, reason: active.state === "absent" ? "no_operation" : "active_unreadable", why: active.why ?? null };
   const token = active.token;
   if (expectToken !== null && token !== expectToken) return { ok: false, reason: "operation_changed", why: "active 指向 " + token.slice(0, 8) + "，不是 " + String(expectToken).slice(0, 8), token };
-  if (lease !== null && lease.path !== leasePath(ctx.dir, token)) return { ok: false, reason: "lease_mismatch", why: "租约 " + String(lease?.path) + " 不属于 operation " + token.slice(0, 8), token };
+  // 写步骤必须真的**持有**租约实例（评审返修 2：只比路径的话，伪造 { path } 就能让 stage 在记账前动 staged 目录）：
+  // 缺租约受控拒绝（不裸抛）；路径要属于本 operation；再用锁原语的 fencing 段证明"当前调用方就是持有者"。
+  if (requireLease && (lease === null || typeof lease?.path !== "string")) return { ok: false, reason: "lease_required", why: "这一步必须持有本 operation 的执行租约", token };
+  if (lease !== null) {
+    if (typeof lease?.path !== "string" || lease.path !== leasePath(ctx.dir, token)) return { ok: false, reason: "lease_mismatch", why: "租约 " + String(lease?.path) + " 不属于 operation " + token.slice(0, 8), token };
+    let held;
+    try { held = commitWhileHeld(lease.path, () => "held"); }
+    catch (err) { return { ok: false, reason: "lease_not_held", why: "租约核验抛错：" + String(err?.code ?? err?.message ?? err), token }; }
+    if (!held.ok || held.run !== "held") return { ok: false, reason: "lease_not_held", why: "调用方并不持有该租约实例（" + String(held.reason ?? "未持有") + "）", token };
+  }
   const j = readJournal({ dir: ctx.dir, token });
   if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token };
   const phases = Array.isArray(expectPhase) ? expectPhase : [expectPhase];
@@ -159,7 +169,7 @@ export function readStagedPlan(ctx, token, { expect } = {}) {
  * ① stage：两链落 versions/<v>/ → 目标投影（输入线上基线）→ 写 staged 目录 → plan 锚进 journal → phase staged。不碰线上。
  */
 export function stageForInstall(ctx, { sourceRoot, lease }) {
-  const bound = bindActiveOperation(ctx, { expectPhase: "drained", lease });
+  const bound = bindActiveOperation(ctx, { expectPhase: "drained", lease, requireLease: true });
   if (!bound.ok) return bound;
   const token = bound.token;
   const plans = {};
@@ -267,7 +277,7 @@ export function verifyStagedForInstall(ctx, { lease = null } = {}) {
  * 任一失败即返回（已写项留给 rollbackOperation 按账回退）。
  */
 export function commitForInstall(ctx, { lease }) {
-  const bound = bindActiveOperation(ctx, { expectPhase: "staged", lease });
+  const bound = bindActiveOperation(ctx, { expectPhase: "staged", lease, requireLease: true });
   if (!bound.ok) return bound;
   const token = bound.token;
   const staged = readStagedPlan(ctx, token, { expect: planAnchorOf(bound.doc) });
@@ -374,7 +384,7 @@ export function verifyLiveForInstall(ctx, { lease, spawn = spawnSync }) {
   if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token: active.token };
   const stagedPlan = readStagedPlan(ctx, active.token, { expect: planAnchorOf(j.doc) });
   if (!stagedPlan.ok) return { ...stagedPlan, token: active.token };
-  const bound = bindActiveOperation(ctx, { expectPhase: "committed", expectCurrent: "version", version: stagedPlan.version, lease, expectToken: active.token });
+  const bound = bindActiveOperation(ctx, { expectPhase: "committed", expectCurrent: "version", version: stagedPlan.version, lease, expectToken: active.token, requireLease: true });
   if (!bound.ok) return bound;
   const token = bound.token;
   const bad = [];
@@ -419,7 +429,7 @@ export function finishInstallReopening(ctx, { lease }) {
   if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token: active.token };
   const stagedPlan = readStagedPlan(ctx, active.token, { expect: planAnchorOf(j.doc) });
   if (!stagedPlan.ok) return { ...stagedPlan, token: active.token };
-  const bound = bindActiveOperation(ctx, { expectPhase: "verified", expectCurrent: "version", version: stagedPlan.version, lease, expectToken: active.token });
+  const bound = bindActiveOperation(ctx, { expectPhase: "verified", expectCurrent: "version", version: stagedPlan.version, lease, expectToken: active.token, requireLease: true });
   if (!bound.ok) return bound;
   const p = setPhase({ dir: ctx.dir, token: bound.token, lease, phase: "reopening", expectPhase: "verified", now: ctx.now() });
   if (!p.ok) return { ok: false, reason: p.reason, why: p.why ?? null, path: p.path ?? null, token: bound.token };

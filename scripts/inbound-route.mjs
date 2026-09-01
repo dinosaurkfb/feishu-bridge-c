@@ -50,6 +50,27 @@ export { appendConsumed, loadConsumed };
  */
 export const PENDING_WINDOW_MS = null;
 
+/**
+ * 这条消息是不是**私聊（P2P）**。
+ *
+ * 先说清为什么只能这么判：入站事件里没有 `chat_type`，也没有任何飞书 locator。
+ * 事件视图只有五个字段（`message_id / session_id / sender_id / created_at_ms / content`，
+ * 见 scripts/envelope.mjs 的 attemptFetch）；Canonical Event v1 的 `source.chat_id` 恒为 null，
+ * `extensions.aily_channel.chat_id` 来自 `AILY_CLI_CHANNEL_CHAT_ID` 且带 `verified:false`
+ * （scripts/canonical-event.mjs:107-115，那段注释写了「selector 不能把它们当作授权或路由事实」），
+ * 它能不能当路由事实正是 `docs/implementation/dialogue-chat-scope-probe.md` 在收的证据 —— 还没定论。
+ * 所以这里**不猜字段名**，用分发层已写进文档的那条事实反推：「把智能体拉进群、在群里 @ 它
+ * 或私聊它，平台投 `im.message.receive`」（docs/architecture/layers-modes-permissions.md:20，
+ * 同一行还写着「不核对群 id（envelope 的 chat_id 仍标未核验）」）。
+ * 群消息要 @ 才会投过来，那么**整条消息一个 mention 都没有**时，还能到达本链路的形状只剩私聊。
+ *
+ * 判据故意保守：**有任何 mention 就不算私聊** —— 群里 @ 别的 agent / @ 别人的消息照旧走
+ * 原来的 mention 闸（@ 的必须是本链路运输 agent，否则拒），不因为这次改动多放行任何东西。
+ */
+export function isP2pMessage(event) {
+  return extractMentionIds(event?.content).length === 0;
+}
+
 export const PROMOTE_REJECT = {
   NO_PENDING: "no_pending_binding",
   MULTIPLE_PENDING: "multiple_pending_bindings",
@@ -61,6 +82,8 @@ export const PROMOTE_REJECT = {
   TRANSPORT_NOT_MENTIONED: "transport_not_mentioned",
   STALE_MESSAGE: "stale_message",
   MALFORMED_TEMPLATE: "malformed_template",
+  // 私聊（P2P）：不是「@ 没打」，是**根本没有 @ 这个东西**。见 isP2pMessage 的说明。
+  P2P_NO_MENTION: "p2p_no_mention",
 };
 
 export const PROMOTE_REJECT_TEXT = {
@@ -72,6 +95,8 @@ export const PROMOTE_REJECT_TEXT = {
   [PROMOTE_REJECT.PENDING_EXPIRED]: "这份等待绑定写了截止时间且已过期，需要重新接入",
   [PROMOTE_REJECT.SENDER_NOT_FRANK]: "发送者不是授权用户",
   [PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED]: "没有真实 @ 本链路的运输 agent",
+  // 这条不会到用户眼前（紧接着就落进 chat 默认态重判），只进回执 —— 但必须能读懂为什么不算「@ 没打」
+  [PROMOTE_REJECT.P2P_NO_MENTION]: "私聊不用于认领项目：认领要在待接入话题里真实 @ 运输 agent。这条按 chat 默认态回答",
   [PROMOTE_REJECT.STALE_MESSAGE]: "消息超出时效窗口",
   [PROMOTE_REJECT.MALFORMED_TEMPLATE]: "机器级链路配置不完整",
 };
@@ -332,6 +357,10 @@ export function evaluatePromotion({ event, template, pending, now = Date.now() }
   }
 
   if (event?.sender_id !== frank) return reject(PROMOTE_REJECT.SENDER_NOT_FRANK);
+  // 私聊不进认领评估：绑定必然分两段（在待接入话题里真实 @ 那一下才认得到运输 agent），私聊里没有
+  // mention 结构，硬判只能得到一条把私聊说成群聊的「没有真实 @」。这条落进 chat 默认态重判
+  //（见 CHAT_FALLBACK_REASONS），既不绑定位也不把待绑定拖下水。
+  if (isP2pMessage(event)) return reject(PROMOTE_REJECT.P2P_NO_MENTION);
   if (!extractMentionIds(event?.content).includes(transport)) {
     return reject(PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
   }
@@ -361,6 +390,8 @@ export const CHAT_FALLBACK_REASONS = Object.freeze([
   PROMOTE_REJECT.NO_PENDING, PROMOTE_REJECT.MULTIPLE_PENDING, PROMOTE_REJECT.TOKEN_UNKNOWN,
   PROMOTE_REJECT.TOKEN_AMBIGUOUS, PROMOTE_REJECT.TOKEN_DUPLICATED, PROMOTE_REJECT.PENDING_EXPIRED,
   PROMOTE_REJECT.SENDER_NOT_FRANK,
+  // 私聊压根不该进认领评估（没有 mention 结构），落到 chat 重判；群消息照旧按原闸走
+  PROMOTE_REJECT.P2P_NO_MENTION,
 ]);
 export function evaluateChatGates({ event, template, now = Date.now() }) {
   const reject = (reason) => ({ ok: false, reason, reasonText: PROMOTE_REJECT_TEXT[reason] ?? reason });
@@ -373,7 +404,12 @@ export function evaluateChatGates({ event, template, now = Date.now() }) {
   }
   const role = senderRole({ frank_sender_id: frank, senders: template?.senders }, event?.sender_id);
   if (role === null) return reject(PROMOTE_REJECT.SENDER_NOT_FRANK);
-  if (!extractMentionIds(event?.content).includes(transport)) return reject(PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
+  // @ 这道闸管的是「群里谁都能搭话」；私聊里没有 mention 可言，所以它不参与 ——
+  // 防串话靠第 0 道闸（调用方 agent uid）、角色表与新鲜度，不靠这里。
+  // 只要消息里出现了 mention，仍然必须 @ 到本链路运输 agent（群行为一个不变）。
+  if (!isP2pMessage(event) && !extractMentionIds(event?.content).includes(transport)) {
+    return reject(PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
+  }
   const createdMs = Number(event?.created_at_ms);
   if (!Number.isFinite(createdMs)) return reject(PROMOTE_REJECT.MALFORMED_TEMPLATE);
   if (now - createdMs > freshness) return reject(PROMOTE_REJECT.STALE_MESSAGE);

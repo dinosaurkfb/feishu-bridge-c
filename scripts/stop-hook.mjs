@@ -168,7 +168,15 @@ async function main() {
     if (!ownedByBridge && speakingSession && bound.ok) {
       const record = readTurnRecord({ dir: inputDir, key: speakingSession });
       if (!record.ok) {
-        turnRoute = { ok: false, reason: "turn_record_" + record.reason };
+        // 「这个会话本轮压根没写过来源记录」与「写过，但读不回 / 已被用过」不是同一件事。
+        // init-hook 对每一个获准执行的 prompt 都必须写下自己的记录，飞书回合写不下就直接
+        // exit 2 不让跑（scripts/init-hook.mjs:83-105），所以 not_found 只可能是本地会话里
+        // 自己起的一轮（回合中途的 Stop、续跑、压缩后的补一轮……）—— 没有成对的输入，
+        // 就把答复单发。其余三种照旧零入队 + 留诊断：那里头可能藏着飞书回合的来源，
+        // 退回当前代际等于发错话题。
+        turnRoute = record.reason === "not_found"
+          ? { ok: true, kind: "unpaired" }
+          : { ok: false, reason: "turn_record_" + record.reason };
       } else if (record.consumed) {
         // 这份记录已经授权过一次 Stop：重入 / 上一轮遗留都不许再入队。
         turnRoute = { ok: false, reason: "turn_record_consumed", messageId: record.messageId ?? null };

@@ -206,7 +206,7 @@ import {
 // 于是断言失败也会被记成通过 —— 这个仓库已经栽过一次「报绿而实际红」，不能再来一次。
 const LIVE_SURFACE = await currentSurface();
 import {
-  PENDING_WINDOW_MS, PROMOTE_REJECT, appendConsumed, evaluatePromotion,
+  PENDING_WINDOW_MS, PROMOTE_REJECT, appendConsumed, evaluatePromotion, isP2pMessage,
   buildClaudeSubscriptionProjection, findBindingForSession, findPendingBinding, loadConsumed,
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
@@ -5205,13 +5205,66 @@ test("不是 Frank 发的 → 拒（绑定前这道闸就在）", () => {
   assert.equal(r.reason, PROMOTE_REJECT.SENDER_NOT_FRANK);
 });
 
-test("没有真实 <at> → 拒；手打的 @名字 不算", () => {
+test("消息里出现了 mention 但不是本链路运输 agent → 拒；完全没 mention 是私聊形状，不拿「@ 没打」说事", () => {
   const f = routeFixture([{ id: "a", extra: {} }]);
-  for (const content of ["随便说说", "@T 干活", '<at id="ou_other">别人</at>']) {
+  // 有 mention 就必须 @ 到运输 agent：手打的 @名字 不算（没标签），@ 别人也不算
+  for (const content of ["@T 干活", '<at id="ou_other">别人</at> 干活']) {
     const r = evaluatePromotion({
       event: { ...okEvent, content }, template: TPL, pending: pendingOf(f), now: NOW2 });
     assert.equal(r.reason, PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED, content);
+    assert.equal(CHAT_FALLBACK_REASONS.includes(r.reason), false, content + "：群里的「@ 没打」不进 chat 兑底（照旧是拒）");
   }
+  // 整条消息一个 mention 都没有 → 私聊：不再冒充「没有真实 @」
+  for (const content of ["随便说说", "今天几号"]) {
+    const r = evaluatePromotion({
+      event: { ...okEvent, content }, template: TPL, pending: pendingOf(f), now: NOW2 });
+    assert.equal(r.reason, PROMOTE_REJECT.P2P_NO_MENTION, content);
+    assert.equal(r.ok, false, content + "：私聊不绑定位");
+    assert.equal(CHAT_FALLBACK_REASONS.includes(r.reason), true, content + "：私聊落回 chat 重判");
+  }
+});
+
+test("私聊（P2P）不进认领评估：判据是「没有任何 mention」而不是路由表里那个叫 self 的入口；群行为一个不变", () => {
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  const pending = pendingOf(f, { pending_token: "abcdef" });
+  assert.equal(pending.ok, true, JSON.stringify(pending));
+  // 判据本身：mention 标签才算，手打的 @名字 不算
+  assert.deepEqual([isP2pMessage({ content: "今天几号" }), isP2pMessage({ content: "@T 今天几号" }),
+    isP2pMessage({ content: '<at id="ou_other">别人</at> 干活' }), isP2pMessage({ content: '<at id="ou_t">T</at> 干活' })],
+    [true, true, false, false], "只有「整条消息没有任何 <at>」才算私聊形状");
+
+  // 唯一一份待绑定就在那儿，私聊也不去认它 —— 哪怕引用块里带着绑定码
+  const quoted = "\n\n> **[引用]** 根消息：接入项目 abcdef";
+  for (const content of ["今天几号", "接入项目 abcdef" + quoted]) {
+    const r = evaluatePromotion({ event: { ...okEvent, content }, template: TPL, pending, now: NOW2 });
+    assert.deepEqual([r.ok, r.reason, r.id ?? null], [false, PROMOTE_REJECT.P2P_NO_MENTION, null],
+      JSON.stringify({ content, r }));
+    assert.match(r.reasonText, /私聊不用于认领项目/u, content);
+  }
+  // 同一个 pending，群里真实 @ 运输 agent 照旧能认（群行为不变）
+  const at = '<at id="' + TPL.transport_open_id + '" type="employee">T</at> ';
+  assert.equal(evaluatePromotion({ event: { ...okEvent, content: at + "接入项目 abcdef" + quoted },
+    template: TPL, pending: findPendingBinding({ ...files(f), now: NOW2 }), now: NOW2 }).ok, true,
+    "带上 @ 的认领路径一点没动");
+  // 发送者、新鲜度两道闸排在形状判定之前：未登记的私聊不会先被当成「私聊」而绕过角色表
+  assert.equal(evaluatePromotion({ event: { ...okEvent, sender_id: "9999", content: "今天几号" },
+    template: TPL, pending, now: NOW2 }).reason, PROMOTE_REJECT.SENDER_NOT_FRANK);
+  assert.equal(evaluatePromotion({ event: { ...okEvent, content: "今天几号", created_at_ms: NOW2 - 3600_000 },
+    template: TPL, pending, now: NOW2 }).reason, PROMOTE_REJECT.STALE_MESSAGE);
+
+  // chat 三道闸：私聊里 @ 这一项不参与（没有 mention 可言），其余照旧
+  const tpl = { ...TPL, senders: [{ open_id: "222", role: "operator" }, { open_id: "333", role: "participant" }] };
+  const ev = (sender, content, ageMs = 0) => ({ sender_id: sender, content, created_at_ms: NOW2 - ageMs });
+  assert.deepEqual([evaluateChatGates({ event: ev(TPL.frank_sender_id, "今天几号"), template: tpl, now: NOW2 }).role,
+    evaluateChatGates({ event: ev("333", "今天几号"), template: tpl, now: NOW2 }).role], ["owner", "participant"],
+    "私聊里角色表照旧能辨谁在说话");
+  assert.equal(evaluateChatGates({ event: ev("444", "今天几号"), template: tpl, now: NOW2 }).reason,
+    PROMOTE_REJECT.SENDER_NOT_FRANK, "未登记的私聊仍零权限");
+  assert.equal(evaluateChatGates({ event: ev("333", "今天几号", TPL.default_freshness_ms + 1000), template: tpl, now: NOW2 }).reason,
+    PROMOTE_REJECT.STALE_MESSAGE, "旧消息不因私聊而放行");
+  assert.equal(evaluateChatGates({ event: ev("333", "hi 没有 @ 也没标签", 0), template: tpl, now: NOW2 }).ok, true);
+  assert.equal(evaluateChatGates({ event: ev("333", '<at id="ou_other">别人</at> 干活'), template: tpl, now: NOW2 }).reason,
+    PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED, "有 mention 就必须 @ 到本链路（群闸不变）");
 });
 
 test("消息太旧 → 拒，防重放", () => {

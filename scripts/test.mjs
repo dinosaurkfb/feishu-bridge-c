@@ -218,7 +218,7 @@ import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as 
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
 import { acquireOperationLease, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, journalProblem, readActive, readJournal, releaseOperationLease, updateJournal } from "./maintenance/journal.mjs";
-import { commitForInstall, finishInstallReopening, liveBaseline, stageForInstall, verifyLiveForInstall, verifyStagedForInstall } from "./maintenance/maintenance-install-core.mjs";
+import { commitForInstall, finishInstallReopening, liveBaseline, stageForInstall, stagedChecks, stagedPlanProblem, verifyLiveForInstall, verifyStagedForInstall } from "./maintenance/maintenance-install-core.mjs";
 import { parseMaintenanceInstallArgs, runMaintenanceInstall } from "./maintenance-install.mjs";
 import { analyzeCommandRefs, harvestAbsolutePaths, refsUnderRoots, tokenizeCommand, tokenizeCommandStrict } from "./maintenance/command-refs.mjs";
 import { inspectMaintenanceDir } from "./maintenance/journal.mjs";
@@ -21103,6 +21103,7 @@ test("维护门 · PR C 单元：journal 三态与两阶段、active 只许一�
   assert.equal(op.ok, true, JSON.stringify(op));
   assert.deepEqual([createOperation({ dir, reason: "r2" }).reason, readActive({ dir }).token], ["operation_active", op.token]);
   assert.equal(updateJournal({ dir, token: op.token, mutate: (d) => { d.phase = "nonsense"; return d; } }).reason, "lease_required", "没有租约不许写");
+  assert.equal(updateJournal({ dir, token: op.token, lease: { path: path.join(dir, "22222222-2222-4222-8222-222222222222.lease") }, mutate: (d) => d }).reason, "lease_mismatch", "拿别的 operation 的租约写不进（评审探针）");
   assert.equal(updateJournal({ dir, token: op.token, lease: op.lease, mutate: (d) => { d.phase = "nonsense"; return d; } }).reason, "journal_shape", "阶段封闭");
   assert.equal(updateJournal({ dir, token: op.token, lease: op.lease, expectPhase: "gated", mutate: (d) => d }).reason, "phase_mismatch", "阶段前驱要对");
   assert.equal(updateJournal({ dir, token: op.token, lease: op.lease, mutate: (d) => { d.phase = "timer_stopped"; return d; } }).reason, "journal_shape", "阶段要求的 step 没 done 不许进");
@@ -21281,8 +21282,20 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
     // ── base_changed（不变量 6）：stage 之后线上制品被外改 → commit 整次中止，已写项按备份回退，线上等于进门前
     const e2 = enterMaintenance(ctx, { reason: "v3", apply: true }); assert.equal(e2.ok, true, JSON.stringify(e2));
     let lease = acquireOperationLease({ dir, token: e2.token }); assert.equal(lease.ok, true);
+    // 维护窗口内三个普通安装器 --apply 一律被门拒（评审返修：消掉"安装写方不受门阻断"这个前提），零改动
+    const gEnv = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };
+    const settingsBytesGate = fs.readFileSync(path.join(home, ".claude", "settings.json"));
+    for (const inst of [["install-outbound.mjs"], ["install-inbound.mjs"], ["codex", "install.mjs"]]) {
+      const r = spawnSync(process.execPath, [path.resolve("scripts", ...inst), "--apply"], { encoding: "utf-8", env: gEnv });
+      assert.deepEqual([r.status, /维护门/u.test(r.stderr)], [2, true], inst.join("/") + "：" + r.stdout + r.stderr);
+    }
+    assert.ok(fs.readFileSync(path.join(home, ".claude", "settings.json")).equals(settingsBytesGate), "门拒了就什么都没写");
     const st2 = stageForInstall(ctx, { sourceRoot: srcV3, lease }); assert.deepEqual([st2.ok, st2.version], [true, v3], JSON.stringify(st2));
-    assert.deepEqual([fs.readFileSync(longtaskDst).equals(longtaskBefore), fs.readlinkSync(path.join(claudeRoot, "current")), readJournal({ dir, token: e2.token }).doc.phase, fs.existsSync(stagedDirPath(ctx, e2.token))], [true, stubRelTarget(e2.token), "staged", true], "stage 不碰线上");
+    assert.deepEqual([fs.readFileSync(longtaskDst).equals(longtaskBefore), fs.readlinkSync(path.join(claudeRoot, "current")), readJournal({ dir, token: e2.token }).doc.phase, fs.existsSync(stagedDirPath(ctx, e2.token)), readJournal({ dir, token: e2.token }).doc.steps.find((s) => s.id === "staged_plan")?.state], [true, stubRelTarget(e2.token), "staged", true, "done"], "stage 不碰线上，plan 锚已进 journal");
+    const planFile = path.join(stagedDirPath(ctx, e2.token), "plan.json"); const planBytes2 = fs.readFileSync(planFile);
+    fs.appendFileSync(planFile, " ");
+    assert.equal(verifyStagedForInstall(ctx).reason, "staged_plan_mismatch", "plan 不锚在 journal 上就不认");
+    fs.writeFileSync(planFile, planBytes2);
     const settingsStagedFile = path.join(stagedDirPath(ctx, e2.token), "artifacts", "0"); const settingsStagedBytes = fs.readFileSync(settingsStagedFile);
     fs.appendFileSync(settingsStagedFile, "坏");
     assert.equal(verifyStagedForInstall(ctx).reason, "staged_artifact_drifted", "staged 制品内容寻址，被改就验不过");
@@ -21338,6 +21351,28 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
     assert.deepEqual([rb4b.ok, rb4b.phase, rb4b.activeCleared, fs.readFileSync(longtaskDst).equals(longtaskBefore), fs.readlinkSync(path.join(claudeRoot, "current")), readGate({ file: gateFile, now: clock }).state], [true, "rolled_back", true, true, "versions/" + v2, "absent"], JSON.stringify(rb4b));
     releaseOperationLease(lease);
     fs.unlinkSync(path.join(dir, e4.token + ".json"));
+    // ── 收据锁残骸不吞（评审探针曾见 ok:true + lockUncleared 被丢）：释放收据锁失败 → commit 必须失败、不记 done
+    const e4b = enterMaintenance(ctx, { reason: "receipt-residue", apply: true }); assert.equal(e4b.ok, true, JSON.stringify(e4b));
+    lease = acquireOperationLease({ dir, token: e4b.token }); assert.equal(lease.ok, true);
+    assert.equal(stageForInstall(ctx, { sourceRoot: srcV3, lease }).ok, true);
+    const claudeReceiptLock = claudeReceiptFile + ".lock";
+    const origRm2 = fs.rmSync; let armedLock = true;
+    fs.rmSync = (target, ...args) => { if (armedLock && path.resolve(String(target)) === path.resolve(claudeReceiptLock)) { armedLock = false; const e = new Error("EIO"); e.code = "EIO"; throw e; } return origRm2(target, ...args); };
+    let c4b;
+    try { c4b = commitForInstall(ctx, { lease }); } finally { fs.rmSync = origRm2; }
+    assert.deepEqual([c4b.ok, c4b.reason, /交不还|release/u.test(String(c4b.why)), readJournal({ dir, token: e4b.token }).doc.steps.find((s) => s.id === "receipt:claude").state], [false, "receipt_write_failed", true, "prepared"], JSON.stringify(c4b));
+    try { fs.unlinkSync(claudeReceiptLock); } catch { /* 注入的失败没真的留下锁 */ }
+    // 恢复途中 journal 写不进（第一项之后注入 EIO）→ 立即停：claude 收据已回、current 仍指 v3，没有继续做下一项外部变更
+    const journalFile4b = path.join(dir, e4b.token + ".json");
+    const origRename = fs.renameSync; let renameHits = 0;
+    fs.renameSync = (a, b, ...rest) => { if (path.resolve(String(b)) === path.resolve(journalFile4b) && ++renameHits === 2) { const e = new Error("EIO"); e.code = "EIO"; throw e; } return origRename(a, b, ...rest); };
+    let rb4b1;
+    try { rb4b1 = rollbackOperation(ctx, e4b.token, lease); } finally { fs.renameSync = origRename; }
+    assert.deepEqual([rb4b1.ok, rb4b1.reason, fs.readlinkSync(path.join(claudeRoot, "current")), readInstalledSurface({ file: claudeReceiptFile }).doc.chains.claude.version, readGate({ file: gateFile, now: clock }).state], [false, "journal_write_failed", "versions/" + v3, v2, "active"], "journal 写不进就停在原地：" + JSON.stringify(rb4b1));
+    const rb4b2 = rollbackOperation(ctx, e4b.token, lease);
+    assert.deepEqual([rb4b2.ok, rb4b2.phase, rb4b2.activeCleared, fs.readlinkSync(path.join(claudeRoot, "current")), fs.readFileSync(longtaskDst).equals(longtaskBefore)], [true, "rolled_back", true, "versions/" + v2, true], JSON.stringify(rb4b2));
+    releaseOperationLease(lease);
+    fs.unlinkSync(path.join(dir, e4b.token + ".json"));
     // ── 不变量 8 + 14：删门之后被杀 → 只向前；终态已持久化、active 未清 → --exit 只清 active
     const e5 = enterMaintenance(ctx, { reason: "v3 正装", apply: true }); assert.equal(e5.ok, true, JSON.stringify(e5));
     lease = acquireOperationLease({ dir, token: e5.token }); assert.equal(lease.ok, true);
@@ -21350,10 +21385,22 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
     assert.equal(verifyLiveForInstall(ctx, { lease, spawn: () => ({ status: 0, stdout: "{}\n" }) }).reason, "verify_live_failed", "探针不 block 就不过");
     const v5 = verifyLiveForInstall(ctx, { lease });
     assert.deepEqual([v5.ok, v5.version], [true, v3], "verify live（含真实 Codex 阻断探针）：" + JSON.stringify(v5));
-    const gateCrashCtx = { ...ctx, gateOps: { createGate, removeGate: (o) => { removeGate(o); throw Object.assign(new Error("crash"), { simulatedCrash: true }); } } };
-    assert.throws(() => finishInstallReopening(gateCrashCtx, { lease }), (err) => err?.simulatedCrash === true);
-    assert.deepEqual([readJournal({ dir, token: e5.token }).doc.phase, readGate({ file: gateFile, now: clock }).state, readActive({ dir }).token, fs.readlinkSync(path.join(claudeRoot, "current"))], ["reopening", "absent", e5.token, "versions/" + v3], "门已删、operation 未终结的窗口");
+    // 成功 reopening 的删门前精确复核（评审返修）：制品被外改 → reopening_incomplete，门 / active / staged 都保留
+    const committedLongtask5 = fs.readFileSync(longtaskDst);
+    fs.appendFileSync(longtaskDst, "\n<!-- 漂移 -->\n");
+    const drift = finishInstallReopening(ctx, { lease });
+    assert.deepEqual([drift.ok, drift.phase, drift.incomplete.map((i) => i.id), readGate({ file: gateFile, now: clock }).state, fs.existsSync(stagedDirPath(ctx, e5.token)), readActive({ dir }).token], [false, "reopening_incomplete", ["artifact:" + longtaskDst], "active", true, e5.token], "目标漂移不删门：" + JSON.stringify(drift));
     releaseOperationLease(lease);
+    // 续跑路径（不经过 bind）上再叠一个 current 漂移：reopening 自己的精确核也要抓住
+    switchCurrentTarget({ root: codexRoot, target: "versions/" + v2 });
+    const drift2 = exitMaintenance(ctx, { apply: true });
+    assert.deepEqual([drift2.ok, drift2.phase, drift2.incomplete.map((i) => i.id).sort(), readGate({ file: gateFile, now: clock }).state, fs.existsSync(stagedDirPath(ctx, e5.token))], [false, "reopening_incomplete", ["artifact:" + longtaskDst, "current:codex:install", "stub:codex"], "active", true], "current 漂移同样不删门（同链桩留着）：" + JSON.stringify(drift2));
+    fs.writeFileSync(longtaskDst, committedLongtask5);
+    switchCurrentTarget({ root: codexRoot, target: "versions/" + v3 });
+    const gateCrashCtx = { ...ctx, gateOps: { createGate, removeGate: (o) => { removeGate(o); throw Object.assign(new Error("crash"), { simulatedCrash: true }); } } };
+    assert.throws(() => exitMaintenance(gateCrashCtx, { apply: true }), (err) => err?.simulatedCrash === true);
+    assert.deepEqual([readJournal({ dir, token: e5.token }).doc.phase, readGate({ file: gateFile, now: clock }).state, readActive({ dir }).token, fs.readlinkSync(path.join(claudeRoot, "current"))], ["reopening_incomplete", "absent", e5.token, "versions/" + v3], "门已删、operation 未终结的窗口");
+    releaseOperationLease(leaseOf(e5.token));
     assert.equal(exitMaintenance(ctx, { apply: false }).action, "reopen_forward");
     crashAt.id = "terminal";
     assert.throws(() => exitMaintenance(ctx, { apply: true }), (err) => err?.simulatedCrash === true);
@@ -21381,6 +21428,22 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
     releaseOperationLease(lease);
     const ex6 = exitMaintenance(ctx, { apply: true });
     assert.deepEqual([ex6.ok, ex6.phase, fs.readlinkSync(path.join(claudeRoot, "current")), fs.readlinkSync(path.join(codexRoot, "current")), readGate({ file: gateFile, now: clock }).state, readActive({ dir }).state], [true, "rolled_back", "versions/" + v3, "versions/" + v3, "absent", "absent"], JSON.stringify(ex6));
+    // ── plan 判别联合封闭 + 安装面 allowlist + current CAS 在安装锁内（评审探针：../ file、任意 chain / kind / 目标路径、任意 current 都曾被接受）
+    const goodPlan = { schema_version: "1.0", token: e6.token, version: v2, artifacts: [], receipts: { claude: { artifacts: [], scripts: [] }, codex: { artifacts: [], scripts: [] } } };
+    const art = (over) => ({ file: "artifacts/0", chain: "claude", path: path.join(home, ".claude", "settings.json"), kind: "claude-settings", base: { exists: false, sha256: null }, intendedAfterSha: "a".repeat(64), inReceipt: true, ...over });
+    assert.deepEqual([
+      stagedPlanProblem(goodPlan, e6.token),
+      stagedPlanProblem({ ...goodPlan, artifacts: [art({})] }, e6.token),
+      stagedPlanProblem({ ...goodPlan, artifacts: [art({ file: "../outside-payload" })] }, e6.token) !== null,
+      stagedPlanProblem({ ...goodPlan, artifacts: [art({ chain: "alien" })] }, e6.token) !== null,
+      stagedPlanProblem({ ...goodPlan, artifacts: [art({ kind: "evil" })] }, e6.token) !== null,
+      stagedPlanProblem({ ...goodPlan, artifacts: [art({ inReceipt: 1 })] }, e6.token) !== null,
+      stagedPlanProblem({ ...goodPlan, token: "00000000-0000-4000-8000-000000000000" }, e6.token) !== null,
+    ], [null, null, true, true, true, true, true], "plan 判别联合封闭");
+    const alien = stagedChecks(ctx, e6.token, { version: v2, artifacts: [{ file: "artifacts/0", chain: "claude", path: path.join(base, "evil.txt"), kind: "file", base: { exists: false, sha256: null }, intendedAfterSha: "a".repeat(64), inReceipt: false, bytes: Buffer.from("") }], receipts: { claude: { artifacts: [], scripts: [] }, codex: { artifacts: [], scripts: [] } } });
+    assert.deepEqual([alien.ok, alien.items.some((t) => /allowlist/u.test(t))], [false, true], JSON.stringify(alien));
+    assert.equal(activateRuntimeVersionB({ version: v2, root: claudeRoot, expectBefore: "versions/nope" }).reason, "current_changed", "expectBefore 的 CAS 在安装锁内、不切");
+    assert.equal(fs.readlinkSync(path.join(claudeRoot, "current")), "versions/" + v3, "CAS 拒了就不动 current");
     // ── 参数封闭
     assert.deepEqual([parseMaintenanceInstallArgs([]).ok, parseMaintenanceInstallArgs(["--apply", "--apply"]).ok, parseMaintenanceInstallArgs(["--force"]).ok, parseMaintenanceInstallArgs(["--reason"]).ok, parseMaintenanceInstallArgs(["--wait-ms", "x"]).ok, parseMaintenanceInstallArgs(["--reason", "r", "--wait-ms", "10", "--apply"])], [true, false, false, false, false, { ok: true, reason: "r", waitMs: 10, apply: true }]);
   } finally {

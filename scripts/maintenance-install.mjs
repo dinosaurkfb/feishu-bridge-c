@@ -13,7 +13,7 @@ import path from "node:path";
 import { isDirectRun, moduleDir } from "./direct-run.mjs";
 import { planRuntimeSync } from "./runtime-install.mjs";
 import { enterMaintenance, maintenanceContext, rollbackOperation } from "./maintenance/operation.mjs";
-import { acquireOperationLease, releaseOperationLease } from "./maintenance/journal.mjs";
+import { releaseOperationLease } from "./maintenance/journal.mjs";
 import { commitForInstall, finishInstallReopening, liveBaseline, stageForInstall, verifyLiveForInstall, verifyStagedForInstall } from "./maintenance/maintenance-install-core.mjs";
 import { renderArtifacts } from "./maintenance/render-artifacts.mjs";
 
@@ -63,8 +63,8 @@ export function runMaintenanceInstall(argv, { ctx = null, out = (s) => process.s
     return 0;
   }
 
-  // ── enter
-  const entered = enterMaintenance(c, { reason, waitMs: parsed.waitMs, apply: true });
+  // ── enter：keepLease —— 从进门到 reopening / 回退结束连续持有同一租约（释放再重取会留出 operation 被换掉的窗口）
+  const entered = enterMaintenance(c, { reason, waitMs: parsed.waitMs, apply: true, keepLease: true });
   if (!entered.ok) {
     if (entered.reason === "startup_source_unverified") { out("拒绝进门（startup_source_unverified）：启动源与当前投影对不上，什么都没动\n" + fmtItems(entered.items)); return 1; }
     if (entered.reason === "lease_reap_uncleared") { out("进门中途停下（租约的归属转换锁交不还：" + String(entered.path) + "）—— operation 保留，清掉残骸后跑 maintenance-gate --exit --apply 按账回退"); return 3; }
@@ -72,14 +72,13 @@ export function runMaintenanceInstall(argv, { ctx = null, out = (s) => process.s
     out("拒绝进门（" + fmtFail(entered) + "）"); return 1;
   }
   const token = entered.token;
+  const lease = entered.lease;
   out("已进门：token " + token.slice(0, 8) + "，阶段 " + entered.phase);
-  const lease = acquireOperationLease({ dir: c.dir, token });
-  if (!lease.ok) { out("拿不到执行租约（" + String(lease.reason) + "：" + String(lease.why) + "）—— 门与账保留，看 maintenance-gate --status"); return 3; }
   let fail = null, result = null;
   try {
     for (const [label, step] of [
       ["stage", () => stageForInstall(c, { sourceRoot, lease })],
-      ["verify staged", () => verifyStagedForInstall(c)],
+      ["verify staged", () => verifyStagedForInstall(c, { lease })],
       ["commit", () => commitForInstall(c, { lease })],
       ["verify live", () => verifyLiveForInstall(c, { lease })],
     ]) {

@@ -35,17 +35,18 @@ export const TERMINAL_PHASES = Object.freeze(["done", "rolled_back"]);
 export const INCOMPLETE_PHASES = Object.freeze(["reopening_incomplete", "rollback_incomplete"]);
 /** 进了这些阶段只许向前（某条 current 已从桩指回真实 runtime，那条链已重新放行，不许再改线上制品）。 */
 export const FORWARD_ONLY_PHASES = Object.freeze(["reopening", "rollback_reopening", ...TERMINAL_PHASES, ...INCOMPLETE_PHASES]);
-export const STEP_KINDS = Object.freeze(["timer", "stub", "current", "gate", "artifact", "receipt"]);
+export const STEP_KINDS = Object.freeze(["timer", "stub", "current", "gate", "artifact", "receipt", "staged_plan"]);
 export const TIMER_PHASES = Object.freeze(["loaded", "installed_not_loaded", "absent"]);
-/** 走到某阶段时必须已 done 的 step。install 步（PR C 第 2 步）：commit 之后要求两条 current:<chain>:install 与两条收据。 */
+/** 走到某阶段时必须已 done 的 step。install 步（PR C 第 2 步）：staged 之后要求 plan 锚（staged_plan），commit 之后再要求两条 current:<chain>:install 与两条收据。 */
 const ENTER_DONE = Object.freeze(["timer:claude", "timer:codex", "stub:claude", "stub:codex", "current:claude", "current:codex", "gate"]);
-const INSTALL_DONE = Object.freeze([...ENTER_DONE, "current:claude:install", "current:codex:install", "receipt:claude", "receipt:codex"]);
+const STAGED_DONE = Object.freeze([...ENTER_DONE, "staged_plan"]);
+const INSTALL_DONE = Object.freeze([...STAGED_DONE, "current:claude:install", "current:codex:install", "receipt:claude", "receipt:codex"]);
 export const PHASE_REQUIRES = Object.freeze({
   timer_stopped: ["timer:claude", "timer:codex"],
   stubbed: ["timer:claude", "timer:codex", "stub:claude", "stub:codex", "current:claude", "current:codex"],
   gated: ENTER_DONE,
   drained: ENTER_DONE,
-  staged: ENTER_DONE,
+  staged: STAGED_DONE,
   committed: INSTALL_DONE,
   verified: INSTALL_DONE,
   reopening: INSTALL_DONE,
@@ -110,6 +111,16 @@ function shapeProblemFor(s) {
     const txnOk = (x) => x === null || (isObj(x) && keysOf(x) === "path,why" && typeof x.path === "string" && path.isAbsolute(x.path) && typeof x.why === "string");
     if (!(s.after === null || (isObj(s.after) && keysOf(s.after) === "token,txnUncleared" && isUuid(s.after.token) && txnOk(s.after.txnUncleared)))) return "gate.after 形状不对";
     if (s.backup !== null) return "gate 不该有备份";
+    return null;
+  }
+  if (kind === "staged_plan") {
+    // plan 锚（PR C 第 2 步）：staged/plan.json 的 sha256 + 版本进受租约保护的 journal，commit / verify 只认锚上的 plan
+    if (s.id !== "staged_plan") return "staged_plan 的 id 必须是 staged_plan";
+    if (s.before !== null) return "staged_plan.before 必须是 null";
+    const anchor = (x) => isObj(x) && keysOf(x) === "sha256,version" && typeof x.sha256 === "string" && SHA_SHAPE.test(x.sha256) && typeof x.version === "string" && /^[0-9a-f]{16}$/u.test(x.version);
+    if (!anchor(s.intended_after)) return "staged_plan.intended_after 形状不对";
+    if (!(s.after === null || anchor(s.after))) return "staged_plan.after 形状不对";
+    if (s.backup !== null) return "staged_plan 不该有备份";
     return null;
   }
   // {exists, sha256}：存在必须有 sha，不存在必须 sha 为 null
@@ -270,6 +281,8 @@ export function createOperation({ dir, reason, token = crypto.randomUUID(), now 
  */
 export function updateJournal({ dir, token, lease, expectPhase = null, mutate, now = Date.now() } = {}) {
   if (!lease?.path) return { ok: false, reason: "lease_required" };
+  // 租约必须属于**这个** operation（评审探针：拿 A 的租约改 active B 的 journal 曾返回 ok）
+  if (lease.path !== leasePath(dir, token)) return { ok: false, reason: "lease_mismatch", why: "租约 " + String(lease.path) + " 不属于 operation " + String(token) };
   const active = readActive({ dir });
   if (active.state !== "active" || active.token !== token) return { ok: false, reason: "active_mismatch", why: active.state === "active" ? "active 指向别的 operation：" + active.token : "active " + active.state + (active.why ? "（" + active.why + "）" : "") };
   const r = readJournal({ dir, token });

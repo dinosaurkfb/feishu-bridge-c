@@ -32,6 +32,7 @@ import path from "node:path";
 import { runtimeScript, verifyRuntime } from "./runtime-install.mjs";
 import { referencedRuntimeScripts, renderClaudeSkill } from "./install-projection.mjs";
 import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "./installed-surface.mjs";
+import { gateBlocks } from "./maintenance-gate-core.mjs";
 import { moduleRoot } from "./direct-run.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
@@ -186,6 +187,13 @@ console.log("目标    " + DST);
 for (const [f, act] of changes) console.log("  " + act.padEnd(8) + f);
 if (changes.length === 0) console.log("  （内容一致，无需改动）");
 for (const n of notes) console.log("注意    " + n);
+
+// 维护门（issue #81）：--apply 是写入口，维护窗口内一律拒（方案稿"所有控制 CLI 的 --apply 分支"看门点）。
+// 放在 problems 之前：维护窗口里 runtime 指着桩，"runtime 未就绪"只是门的副作用，权威的答案是"维护中"。
+if (apply) {
+  const g = gateBlocks();
+  if (g.blocked) { console.error("维护门：" + g.text + " —— 安装被拒，什么都没写。"); process.exit(2); }
+}
 
 if (problems.length > 0) {
   console.error("\n装不了：");

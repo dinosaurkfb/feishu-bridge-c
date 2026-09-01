@@ -542,6 +542,20 @@ let failed = 0;
 const failures = [];
 
 /**
+ * `TEST_FILTER` —— 变异测试的**定向击杀**用（见 references/mutation-runner.mjs）。
+ * 逗号分隔多个子串，测试名含任一即跑。**未设置时一个分支都不走**：
+ * 全量语义是变异终检与 CI 的判据，不能被过滤器沾湿。
+ *
+ * 被过滤的运行不许看起来像"全绿全量"，所以：汇总之后另起一行报命中数；
+ * "0 命中"用**退出码 2** —— 1 已被"有测试红"占了，而 runner 把 1 读成 KILLED、
+ * 把 0 读成"定向没红、升级全量"，把 2 读成"过滤器本身没挑中东西"（那是表的错，不是守卫的功劳）。
+ */
+const TEST_FILTER = (process.env.TEST_FILTER ?? "").split(",")
+  .map((s) => s.trim()).filter((s) => s.length > 0);
+let registered = 0;   // 注册进来的条数（含被过滤掉的）—— 汇总里的"总 M"
+let executed = 0;     // 命中并真的跑的 —— "命中 N"
+
+/**
  * 汇总打印之后就封条。之后任何 `test()` 调用立刻响亮失败。
  *
  * 防的是一个真实发生过、而且**报绿**的失败：把新测试追加到文件末尾，
@@ -560,6 +574,10 @@ function test(name, fn) {
     console.error("  把它移到 `console.log(\`\\n通过 …\`)` 之前。");
     process.exit(1);
   }
+  registered += 1;
+  // 没命中的**不调用 fn()**：被跳过的测试不许留下副作用（夹具会往真 tmp 写东西）。
+  if (TEST_FILTER.length > 0 && !TEST_FILTER.some((needle) => name.includes(needle))) return;
+  executed += 1;
   try {
     fn();
     passed += 1;
@@ -21544,7 +21562,15 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
 
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
+if (TEST_FILTER.length > 0) {
+  console.log("TEST_FILTER 命中 " + executed + " / 总 " + registered
+    + "（子串：" + TEST_FILTER.join(" | ") + "）—— 这不是全量，不许当全量绿");
+}
 if (failed > 0) {
   for (const f of failures) console.log("  ✗ " + f);
   process.exit(1);
+}
+if (TEST_FILTER.length > 0 && executed === 0) {
+  console.log("  ✗ 一个测试名都没命中 —— 跑了 0 项不等于全绿（退出码 2 只说这一件事）");
+  process.exit(2);
 }

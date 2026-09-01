@@ -164,6 +164,14 @@ const TEMPLATE = {
 let passed = 0;
 let failed = 0;
 /**
+ * `TEST_FILTER` —— 与 Claude 侧 test.mjs 同一机制（逗号分隔子串，命中任一即跑），
+ * 设计理由与退出码约定全在那一侧写清：未设置时一个分支都走走不到，0 命中走退出码 2。
+ */
+const TEST_FILTER = (process.env.TEST_FILTER ?? "").split(",")
+  .map((s) => s.trim()).filter((s) => s.length > 0);
+let registered = 0;   // 注册进来的条数（含被过滤掉的）
+let executed = 0;     // 命中并真的跑的
+/**
  * 汇总打印之后就封条 —— 与 Claude 侧 test.mjs 同一条保障，理由也相同：
  * 把新测试追加到文件末尾时，它的结果不会计入统计，而套件照样报绿。
  * Claude 侧 2026-08-23 真实发生过一次，一口气三条从未生效。
@@ -174,6 +182,10 @@ const test = (name, fn) => {
     console.error("\n✗ 测试「" + name + "」写在汇总之后 —— 它的结果不会计入统计。");
     process.exit(1);
   }
+  registered += 1;
+  // 没命中的不调用 fn()：被跳过的测试不许留下副作用。
+  if (TEST_FILTER.length > 0 && !TEST_FILTER.some((needle) => name.includes(needle))) return;
+  executed += 1;
   try { fn(); passed += 1; }
   catch (err) { failed += 1; console.error("FAIL " + name + "\n" + (err.stack ?? err)); }
 };
@@ -9395,4 +9407,14 @@ test("维护门 · PR B：prompt-hook 签发的控制脚本集合 == 封闭常�
 
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
+if (TEST_FILTER.length > 0) {
+  console.log("TEST_FILTER 命中 " + executed + " / 总 " + registered
+    + "（子串：" + TEST_FILTER.join(" | ") + "）—— 这不是全量，不许当全量绿");
+}
 if (failed > 0) process.exit(1);
+// 0 命中走退出码 2（跟 Claude 侧同一约定）：1 = 有测试红，runner 那边读成 KILLED；
+// 2 = 过滤器没挑中任何东西，不能当成"没红所以升级全量"。
+if (TEST_FILTER.length > 0 && executed === 0) {
+  console.log("  ✗ 一个测试名都没命中 —— 跑了 0 项不等于全绿（退出码 2 只说这一件事）");
+  process.exit(2);
+}

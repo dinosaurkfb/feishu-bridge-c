@@ -62,8 +62,8 @@ export const MUTATIONS = [
   {"id":"m1561","file":"scripts/outbound.mjs","find":": \" —— 但形态不是本协议的制品（不是 symlink 或 payload 畸形）：先核验再处理，只人工处置，不要直接删\";","replace":": \" —— 可直接删\";","killedBy":"run 通道排空"},
   {"id":"m1562","file":"scripts/outbound.mjs","find":"const a = inspectControlLockArtifact(path.join(claimsDir, name));","replace":"const a = { present: true, shape: \"symlink_owner\" };","killedBy":"run 通道排空"},
   {"id":"m1563","file":"scripts/control-command.mjs","find":"catch (err) {\n    if (err?.code === \"ENOENT\") return { present: false };\n    return { present: true, shape: \"io_error\", why: String(err?.code ?? err?.message ?? err) };\n  }\n  let owner = null;","replace":"catch { raw = null; }\n  let owner = null;","killedBy":"Claude 真入口"},
-  {"id": "m1564", "file": "scripts/outbound.mjs", "find": "if (typeof claim.message_id !== \"string\" || claim.message_id === \"\") return false;", "replace": "if (false) return false;", "killedBy": "run 通道排空"},
-  {"id": "m1565", "file": "scripts/outbound.mjs", "find": "else if (isLegacyCc2cdRejected({ claimsDir, key: m[1] })) {", "replace": "else if (false) {", "killedBy": "run 通道排空"},
-  {"id": "m1566", "file": "scripts/outbound.mjs", "find": "if (seen.state === \"rejected_unreadable\") problems.push({ key: m[1], reason: \"rejected_unreadable\"", "replace": "if (false) problems.push({ key: m[1], reason: \"rejected_unreadable\"", "killedBy": "run 通道排空"},
-  {"id": "m1567", "file": "scripts/doctor.mjs", "find": "if (ledgerNotices.length > 0) backlogWhere.push(", "replace": "if (false) backlogWhere.push(", "killedBy": "真实 feishu-status"},
+  {"id":"m1564", "file": "scripts/outbound.mjs", "find": "if (typeof claim.message_id !== \"string\" || claim.message_id === \"\") return false;", "replace": "if (false) return false;", "killedBy": "issue #98"},
+  {"id":"m1565", "file": "scripts/outbound.mjs", "find": "else if (isLegacyCc2cdRejected({ claimsDir, key: m[1] })) {", "replace": "else if (false) {", "killedBy": "issue #98"},
+  {"id":"m1566", "file": "scripts/outbound.mjs", "find": "if (seen.state === \"rejected_unreadable\") problems.push({ key: m[1], reason: \"rejected_unreadable\"", "replace": "if (false) problems.push({ key: m[1], reason: \"rejected_unreadable\"", "killedBy": "issue #98"},
+  {"id": "m1567", "file": "scripts/doctor.mjs", "find": "if (ledgerNotices.length > 0) backlogWhere.push(", "replace": "if (false) backlogWhere.push(", "killedBy": "doctor ⑥：cc2cd"},
 ];

@@ -15620,6 +15620,117 @@ test("run 通道所有权只有一笔：直发 CLI 发布途中，排空的 run 
   assert.equal(sent2, 0); assert.equal(after.status, "empty", JSON.stringify(after));
 });
 
+const claimPathOf = (claims, key) => path.join(claims, key + ".claim", "claim.json");
+const rejectedPathOf = (claims, key) => path.join(claims, key + ".rejected.json");
+/** 旧版写方（cc2cd 的处理器）调的就是这两个共享原语 —— 夹具照着那条调用序列造，不手写 JSON。 */
+function legacyCc2cdPair() {
+  const h = watcherMatrixRunner.fixture();
+  const rt = path.join(h.dir, ".runtime-data", "inbound");
+  const claims = path.join(rt, "delivery-claims");
+  const acq = acquireClaim({ claimsDir: claims, messageId: "om_cc2cd_empty_instr", logicalTaskKey: "cc2cd_peer",
+    meta: { session_id: "sess-cc2cd", thread_id: "omt-cc2cd" } });
+  assert.equal(acq.ok, true, "夹具造不出旧 claim：" + JSON.stringify(acq));
+  // detail 传的是**字符串**（不是对象）—— 共享写器 `...detail` 把它按索引展开成 17 个键，这才是旧版的真实产物。
+  const rec = recordClaimState({ claimsDir: claims, key: acq.key, state: "rejected", detail: "empty_instruction" });
+  assert.equal(rec, rejectedPathOf(claims, acq.key), "recordClaimState 要写回终态路径：" + rec);
+  assert.ok(fs.existsSync(rec), "夹具没写出旧终态：" + rec);
+  return { h, runs: path.join(rt, "runs"), claims, key: acq.key };
+}
+const patchJson = (file, fn) => { const doc = JSON.parse(fs.readFileSync(file, "utf-8")); fn(doc); fs.writeFileSync(file, JSON.stringify(doc)); };
+
+test("盘点认得 cc2cd 旧版空指令拒绝的**联合**形状 —— 报 info 不报 ✗；差一个字段照旧红（issue #98 B 方向）", () => {
+  // 正向：那份形状 → notices 一条、problems 空，且盘点与排空都不改动两份文件。
+  {
+    const f = legacyCc2cdPair();
+    const before = { claim: fs.readFileSync(claimPathOf(f.claims, f.key)), rej: fs.readFileSync(rejectedPathOf(f.claims, f.key)) };
+    const inv = inventoryRuns({ runsDir: f.runs, claimsDir: f.claims });
+    assert.deepEqual(inv.problems, [], "**认得的旧记录不许再算“说不清”**：" + JSON.stringify(inv.problems));
+    assert.deepEqual(inv.runs, [], "旧记录没有 run 制品，不该被列成 run：" + JSON.stringify(inv.runs));
+    assert.equal(inv.notices.length, 1, "要看得见：" + JSON.stringify(inv.notices));
+    assert.deepEqual([inv.notices[0].key, inv.notices[0].reason], [f.key, "legacy_cc2cd_rejected_v1"], JSON.stringify(inv.notices[0]));
+    assert.match(inv.notices[0].why, /c2c-inbound\.mjs/u, "要说清是谁写的：" + inv.notices[0].why);
+    assert.match(inv.notices[0].why, /不自动删除/u, "处置要明写：" + inv.notices[0].why);
+    assert.ok(inv.notices[0].why.endsWith("delivery-claims/" + f.key + ".rejected.json"), "制品名完整给出：" + inv.notices[0].why);
+    assert.deepEqual([inv.notices[0].why.includes("可直接删"), inv.notices[0].why.includes("安全")], [false, false], "绝不教人删：" + inv.notices[0].why);
+    assert.deepEqual(inventoryRuns({ runsDir: f.runs, claimsDir: f.claims }).notices.length, 1, "盘点是幂等的（不写东西）");
+    let sent = 0;
+    const d = drainProject({ root: f.h.dir, claudeSessionId: null, publish: () => { sent += 1; return "om_x"; }, diagnose: () => null });
+    assert.equal(sent, 0, "**旧记录不许被排空碰一下**");
+    assert.deepEqual(d.runs.problems, [], JSON.stringify(d.runs));
+    assert.equal(fs.readFileSync(rejectedPathOf(f.claims, f.key)).equals(before.rej), true, "排空后旧终态字节不变");
+    assert.equal(fs.readFileSync(claimPathOf(f.claims, f.key)).equals(before.claim), true, "排空后旧 claim 字节不变");
+    assert.equal(inventoryRuns({ runsDir: f.runs, claimsDir: f.claims }).notices.length, 1, "排空之后仍看得见（没被隐掉）");
+  }
+  // 只认这一份形状：任一处差一点、或干脆是猜测的干净形状 —— 都照旧红（rejected_orphan），不降级。
+  const bad = (label, fix) => {
+    const f = legacyCc2cdPair();
+    fix(f);
+    const inv = inventoryRuns({ runsDir: f.runs, claimsDir: f.claims });
+    assert.deepEqual(inv.notices, [], "【" + label + "】不许被说成认得：" + JSON.stringify(inv.notices));
+    assert.equal(inv.problems.length, 1, "【" + label + "】：" + JSON.stringify(inv.problems));
+    assert.deepEqual([inv.problems[0].key, inv.problems[0].reason], [f.key, "rejected_orphan"], "【" + label + "】：" + JSON.stringify(inv.problems[0]));
+  };
+  const claim = (f, fn) => patchJson(claimPathOf(f.claims, f.key), fn);
+  const rej = (f, fn) => patchJson(rejectedPathOf(f.claims, f.key), fn);
+  bad("claim 整个不在", (f) => fs.rmSync(path.join(f.claims, f.key + ".claim"), { recursive: true, force: true }));
+  bad("claim 少一个字段", (f) => claim(f, (d) => { delete d.session_id; }));
+  bad("claim 多一个字段", (f) => claim(f, (d) => { d.policy_id = "mapping"; }));
+  bad("claim 带了 rejected_control 投影", (f) => claim(f, (d) => { d.rejected_control = { intent: "unbind", word: "/feishu-unbind", digest: "a".repeat(64) }; }));
+  bad("claim 的 logical_task_key 不是 cc2cd_peer", (f) => claim(f, (d) => { d.logical_task_key = "cc2cd"; }));
+  bad("claim 的 key 推不出来（message_id 被改）", (f) => claim(f, (d) => { d.message_id = "om_别的消息"; }));
+  bad("claim 的 claimed_at 不是规范时间", (f) => claim(f, (d) => { d.claimed_at = "2026/08/28 10:00"; }));
+  bad("claim 的 session_id 是空串", (f) => claim(f, (d) => { d.session_id = ""; }));
+  // 旧写方拿不到父话题时确实会写出 thread_id:null（c2c-inbound.mjs 的 `?? null`）。判据不给它开后门：
+  // 认错一条真说不清的代价比漏认一条大，这类样本照旧红、交人看。
+  bad("claim 的 thread_id 是 null（旧写方的缺话题变体，仍不认）", (f) => claim(f, (d) => { d.thread_id = null; }));
+  bad("claim 是 symlink（fd 绑定读不跟链接）", (f) => {
+    const file = claimPathOf(f.claims, f.key);
+    const outside = path.join(f.h.dir, "外面的 claim.json");
+    fs.writeFileSync(outside, fs.readFileSync(file));
+    fs.rmSync(file); fs.symlinkSync(outside, file);
+  });
+  bad("终态索引位被改（拼不出 empty_instruction）", (f) => rej(f, (d) => { d["0"] = "x"; }));
+  bad("终态多一个键（新旧形状并存）", (f) => rej(f, (d) => { d.detail = "empty_instruction"; }));
+  bad("终态是猜测的干净形状 {detail:...}", (f) => rej(f, (d) => {
+    for (let i = 0; i <= 16; i += 1) delete d[String(i)];
+    d.detail = "empty_instruction";
+  }));
+  bad("终态索引位塞多字符（拼接结果照样相等）", (f) => rej(f, (d) => {
+    d["0"] = "empty_instruction";
+    for (let i = 1; i <= 16; i += 1) d[String(i)] = "";
+  }));
+  bad("终态 recorded_at 不是规范时间", (f) => rej(f, (d) => { d.recorded_at = "2026/08/28 10:00"; }));
+  bad("终态 claim_key 跟文件名对不上", (f) => rej(f, (d) => { d.claim_key = claimKey("om_别的消息", "cc2cd_peer"); }));
+  bad("终态不是 JSON", (f) => fs.writeFileSync(rejectedPathOf(f.claims, f.key), "{ 坏了"));
+  // 顺序不能反：#94 的新形判据先走，新形记录坏了要红，不许因为“像旧版”回退成 info。
+  {
+    const h = watcherMatrixRunner.fixture();
+    const claims = path.join(h.dir, ".runtime-data", "inbound", "delivery-claims");
+    const key = claimKeyFor("newform-rejected", "cc2cd_peer");
+    const proj = rejectedControlProjection(parseInboundIntent({ instruction: "/feishu-unbind", chain: "claude" }));
+    writeClaimFixture({ claimsDir: claims, key, root: h.dir, patch: { rejected_control: proj } });
+    assert.equal(runRejectTransaction({ claimsDir: claims, key, projection: proj }).ok, true);
+    let inv = inventoryRuns({ runsDir: path.join(h.dir, ".runtime-data", "inbound", "runs"), claimsDir: claims });
+    assert.deepEqual([inv.problems, inv.notices, inv.runs], [[], [], []], "新形闭合的拒绝记录：不红、也不进 notices");
+    patchJson(rejectedPathOf(claims, key), (d) => { d.recorded_at = "2026/08/28 10:00"; });
+    inv = inventoryRuns({ runsDir: path.join(h.dir, ".runtime-data", "inbound", "runs"), claimsDir: claims });
+    assert.deepEqual(inv.notices, [], "**新形坏了不许回退成 legacy**");
+    assert.equal(inv.problems.find((x) => x.key === key)?.reason, "rejected_unreadable", JSON.stringify(inv.problems));
+  }
+  // problems 的既有语义一个都没变：#86 那份遗留形状仍走 problems（legacy_state），不折进 notices。
+  {
+    const h = watcherMatrixRunner.fixture();
+    const rt = path.join(h.dir, ".runtime-data", "inbound");
+    const claims = path.join(rt, "delivery-claims");
+    const key = claimKeyFor("legacy-deliver-failed", "k");
+    fs.writeFileSync(path.join(claims, key + ".deliver_failed.json"), JSON.stringify({
+      schema_version: "1.0", claim_key: key, state: "deliver_failed", recorded_at: "2026-08-20T00:00:00.000Z", reason: "publish failed" }));
+    const inv = inventoryRuns({ runsDir: path.join(rt, "runs"), claimsDir: claims });
+    assert.deepEqual([inv.problems.length, inv.problems[0]?.reason, inv.notices.length], [1, "legacy_state", 0], JSON.stringify(inv));
+  }
+});
+
+
 test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送达未落标、重试预算、独立于 outbox、超时下传", () => {
   const mk = () => {
     const h = watcherMatrixRunner.fixture();
@@ -18259,6 +18370,40 @@ test("doctor ⑥：未路由回复及其目录里说不清的条目都算进问�
     reason: "origin_unresolvable", why: "x", message_id: "msg", origin_channel_generation_id: null, session_id: "s", binding_id: "b", recorded_at: "2026-08-28T10:00:00.000Z", reply_text: "t" }));
   const report2 = doctorReport(m.run());
   assert.match(String(checkOf(report2, "backlog_vs_publisher").detail), /未路由回复 1 条/u);
+});
+
+test("doctor ⑥：认得的 cc2cd 旧版拒绝记录只报数量、不弄红；真说不清的照旧弄红，两笔账分开计（issue #98）", () => {
+  const m = doctorMachine();
+  const root = m.project("legacy", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "legacy", root, root_message_id: "om_x", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const rt = path.join(root, ".runtime-data", "inbound");
+  const claims = path.join(rt, "delivery-claims");
+  fs.mkdirSync(path.join(rt, "runs"), { recursive: true }); fs.mkdirSync(claims, { recursive: true });
+  const mkPair = (label) => {
+    const acq = acquireClaim({ claimsDir: claims, messageId: "om_" + label, logicalTaskKey: "cc2cd_peer", meta: { session_id: "s", thread_id: "t" } });
+    recordClaimState({ claimsDir: claims, key: acq.key, state: "rejected", detail: "empty_instruction" });
+    return acq.key;
+  };
+  mkPair("l1"); mkPair("l2");
+  const inv = inventoryRuns({ runsDir: path.join(rt, "runs"), claimsDir: claims });
+  const check6 = () => checkOf(doctorReport(m.run()), "backlog_vs_publisher");
+  assert.equal(inv.notices.length, 2, JSON.stringify(inv.notices));
+  assert.deepEqual(inv.problems, [], JSON.stringify(inv.problems));
+  const ok6 = check6();
+  const detail = String(ok6.detail);
+  assert.equal(ok6.ok, true, "**认得的旧记录不许把 ⑥ 弄红**：" + detail);
+  assert.match(detail, /认得的旧版拒绝记录 2 条/u, "数量要与 notices 长度一致：" + detail);
+  assert.match(detail, /legacy_cc2cd_rejected_v1/u, "要点名是什么形状：" + detail);
+  assert.doesNotMatch(detail, /账本说不清/u, "认得的东西不许出现在“说不清”那笔账里：" + detail);
+  // 真说不清的照旧弄红，且两笔账分开计数（旧的被隐掉、或新的被算两遍，这里都会红）。
+  fs.writeFileSync(path.join(rt, "runs", "README.txt"), "不认识");
+  const red = checkOf(doctorReport(m.run()), "backlog_vs_publisher");
+  const detail2 = String(red.detail);
+  assert.equal(red.ok, false, JSON.stringify(red));
+  assert.match(detail2, /runs 账本说不清 1 处/u, detail2);
+  assert.match(detail2, /认得的旧版拒绝记录 2 条，不阻塞/u, detail2);
+  assert.equal(inventoryRuns({ runsDir: path.join(rt, "runs"), claimsDir: claims }).notices.length, Number(/认得的旧版拒绝记录 (\d+) 条/u.exec(detail2)[1]),
+    "⑥ 文案里的数量必须是 notices 的长度");
 });
 
 test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue → 当场切换并回执；重放按记录重出回执；终态写失败 → 报错但模式已切、重放补齐；多一个字走普通路径", () => {

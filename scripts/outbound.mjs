@@ -11,7 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { isCanonicalIso } from "./canonical-time.mjs";
-import { CLAIM_KEY_SHAPE, CLAIM_STATE } from "./claim.mjs";
+import { CLAIM_KEY_SHAPE, CLAIM_STATE, claimKey } from "./claim.mjs";
 import { CONSUMED_TMP_RE, CONTROL_QUARANTINE_RE, classifyControlLockEntry, inspectControlClaim, inspectControlLockArtifact, readConsumedRecord } from "./control-command.mjs";
 import { inspectRejectedClaim } from "./reject-control.mjs";
 
@@ -204,21 +204,94 @@ const TERMINAL_STATE_FILES = new Set([CLAIM_STATE.HANDED_OFF + ".json", "failed.
 // key 部分与 claim.mjs 的 CLAIM_KEY_SHAPE 同形状（本文件既有 CLAIM_ENTRY_RE 也是这样内联的，不另立判据）。
 const LEGACY_CLAIM_ENTRY_RE = /^([0-9a-f]{64})\.deliver_failed\.json$/u;
 
+// ── cc2cd 旧版拒绝记录的**永久兼容读取器**（issue #98，B 方向）──────────────────────
+// 真机上邻仓 cc2cd 的处理器（它的 scripts/c2c-inbound.mjs，引用本仓 claim.mjs 的写原语）在
+// “@ 之后没正文”这条分支上写的是**旧形**：claim 里没有 rejected_control 投影，终态也不是封闭投影。
+// #94 要求两者交叉核对，于是每条这样的记录都被 doctor ⑥ 报成 rejected_orphan（红）。
+// 这里只**认出**这一份形状并报 info：不写、不删、不参与孤儿判定、绝不被自动动。
+// A 方向（cc2cd 改写新形）在邻仓排队；本读取器不因为 A 做了就删 —— 老记录不会自己重写。
+//
+// 判据是“已知写方的精确联合形状”，**不是“没有 rejected_control 就算 legacy”**（Codex 定的方向）：
+// 认错的代价是一条真的说不清被说成认得。字段集精确相等也让新形物理上进不来这个分支：
+// 新形 claim 必带 policy_id / policy_version / origin_channel_generation_id，新形终态必带
+// intent / word / problem / digest，两边都对不上这里的两张字段表。
+const LEGACY_CC2CD_TASK_KEY = "cc2cd_peer";
+// cc2cd 用 acquireClaim({ meta: { session_id, thread_id } }) 写 claim —— 固定四字段 + 这两个 meta，不多不少。
+const LEGACY_CC2CD_CLAIM_KEYS = ["schema_version", "state", "claim_key", "message_id",
+  "logical_task_key", "claimed_at", "session_id", "thread_id"].sort().join(",");
+// 旧版把**字符串**当 detail 传给共享写器，`...detail` 把字符串按索引展开：17 个键 "0".."16"。
+// 这不是猜测的形状，是 c2c-inbound.mjs:142 与 claim.mjs 的 recordClaimState 合起来的必然产物。
+const LEGACY_CC2CD_DETAIL = "empty_instruction";
+const LEGACY_CC2CD_REJECTED_KEYS = [...Object.keys(LEGACY_CC2CD_DETAIL),
+  "schema_version", "claim_key", "state", "recorded_at"].sort().join(",");
+const LEGACY_CC2CD_WHY = "已知旧版 cc2cd 的空指令拒绝记录（写方：邻仓 c2c-inbound.mjs 的 empty_instruction 分支）；不参与孤儿判定、不自动删除";
+
+/**
+ * 这张 `<key>.rejected.json` 与它的 claim 是不是 cc2cd 旧版的**联合**形状？两份制品都要 fd 绑定读
+ * （readRegularFile：不跟 symlink、非阻塞、单硬链接普通文件）—— 名字对上不代表内容是人写的。
+ * @returns {{ok: true} | {ok: false, why: string}} why 只用来在异常时给人看，不参与判定。
+ */
+function legacyCc2cdRejectedV1({ claimsDir, key }) {
+  const no = (why) => ({ ok: false, why });
+  if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) return no("key 不是 claim key 的形状");
+  // claim 在 `<key>.claim/claim.json`（与 readClaimState 同一路径），目录里多东西不影响这里。
+  const cr = readRegularFile(path.join(claimsDir, key + ".claim", "claim.json"));
+  if (cr.status !== "read") return no("同 key 的旧 claim " + (cr.status === "absent" ? "不在" : "读不出（" + cr.why + "）"));
+  let claim;
+  try { claim = JSON.parse(cr.buf.toString("utf-8")); } catch { return no("同 key 的旧 claim 不是 JSON"); }
+  if (claim === null || typeof claim !== "object" || Array.isArray(claim)) return no("同 key 的旧 claim 不是记录对象");
+  if (Object.keys(claim).sort().join(",") !== LEGACY_CC2CD_CLAIM_KEYS) return no("旧 claim 的字段集不是那八个");
+  // 字段集精确相等已经把 control / rejected_control 挡在外面；下面两行是**明写意图**，
+  // 以后有人放宽字段集时这两眼还在（它们不可能被“字段集判据改了”一句带过去）。
+  if (Object.hasOwn(claim, "control") || Object.hasOwn(claim, "rejected_control")) return no("旧 claim 里带了控制 / 拒绝投影");
+  if (claim.schema_version !== "1.0") return no("旧 claim 的 schema_version 不认识");
+  if (claim.state !== CLAIM_STATE.CLAIMED) return no("旧 claim 的 state 不是 claimed");
+  if (claim.logical_task_key !== LEGACY_CC2CD_TASK_KEY) return no("旧 claim 的 logical_task_key 不是 cc2cd_peer");
+  // key 用仓里现成的推导函数重新算（不自己拼哈希）：message_id / logical_task_key 对上文件名才算这张 claim 真是它的。
+  if (claim.claim_key !== key || claimKey(claim.message_id, claim.logical_task_key) !== key) return no("旧 claim 的 key 对不上文件名或推不出来");
+  if (!isCanonicalIso(claim.claimed_at)) return no("旧 claim 的 claimed_at 不是规范时间");
+  if (typeof claim.session_id !== "string" || claim.session_id === "") return no("旧 claim 的 session_id 不是非空字符串");
+  if (typeof claim.thread_id !== "string" || claim.thread_id === "") return no("旧 claim 的 thread_id 不是非空字符串");
+
+  const rr = readRegularFile(path.join(claimsDir, key + ".rejected.json"));
+  if (rr.status !== "read") return no("rejected 记录" + (rr.status === "absent" ? "不在" : "读不出（" + rr.why + "）"));
+  let rec;
+  try { rec = JSON.parse(rr.buf.toString("utf-8")); } catch { return no("rejected 记录不是 JSON"); }
+  if (rec === null || typeof rec !== "object" || Array.isArray(rec)) return no("rejected 记录不是记录对象");
+  if (Object.keys(rec).sort().join(",") !== LEGACY_CC2CD_REJECTED_KEYS) return no("rejected 记录的字段集不是 17 个索引键加四个固定字段");
+  if (rec.schema_version !== "1.0") return no("rejected 记录的 schema_version 不认识");
+  if (rec.state !== CLAIM_STATE.REJECTED) return no("rejected 记录的 state 不是 rejected");
+  if (rec.claim_key !== key) return no("rejected 记录的 claim_key 跟文件名对不上");
+  if (!isCanonicalIso(rec.recorded_at)) return no("rejected 记录的 recorded_at 不是规范时间");
+  // 逐字重组必须等于 empty_instruction，且每个索引位都是**单字符**（字符串展开只会这样；
+  // 只比拼接结果会放过“一个键存整串 + 其余存空串”这种手写的假货）。
+  const parts = Object.keys(LEGACY_CC2CD_DETAIL).map((i) => rec[i]);
+  if (parts.some((v) => typeof v !== "string" || v.length !== 1) || parts.join("") !== LEGACY_CC2CD_DETAIL) {
+    return no("索引键拼不出 empty_instruction");
+  }
+  return { ok: true };
+}
+
 /**
  * runs 账本的**联合盘点**：以第一次目录快照驱动，对 JSONL、终局记录、发布回执、失败账
  * 做 key 并集 —— 任何孤儿 sidecar、不可读的终局记录、**不认识的条目**都进 problems
  * （评审实测 bad.jsonl / bad.handed_off.json 直接消失）。只有 ENOENT 算空。
+ *
+ * 与 problems **并列**还有一个 `notices`：只装“账本认得、但不健康”的东西（目前只有
+ * cc2cd 旧版拒绝记录，issue #98）。它与 problems 语义完全不同 —— 不进 backlogProblems、
+ * 不让 doctor ⑥ 变红、不算“说不清”，但必须看得见、要点名。problems 的既有语义与消费方一个都未变。
  */
 export function inventoryRuns({ runsDir, claimsDir = null }) {
   const problems = [];
+  const notices = [];
   let entries;
   try {
     const st = fs.statSync(runsDir);
-    if (!st.isDirectory()) return { ok: false, reason: "runs_not_a_directory", runs: [], problems: [] };
+    if (!st.isDirectory()) return { ok: false, reason: "runs_not_a_directory", runs: [], problems: [], notices: [] };
     entries = fs.readdirSync(runsDir);   // 这份快照驱动后面的一切，不再二次读目录
   } catch (err) {
     if (err.code === "ENOENT") entries = [];
-    else return { ok: false, reason: "runs_unreadable", error: String(err.code ?? err.message), runs: [], problems: [] };
+    else return { ok: false, reason: "runs_unreadable", error: String(err.code ?? err.message), runs: [], problems: [], notices: [] };
   }
   const byKey = new Map();
   const note = (key, kind) => { if (!byKey.has(key)) byKey.set(key, new Set()); byKey.get(key).add(kind); };
@@ -327,6 +400,13 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
         // 收边的拒绝终态：与它的 claim 交叉核对 —— 内容坏 → rejected_unreadable；与投影不一致 → rejected_intent_mismatch；
         // 没有 claim / claim 读不出 / claim 没有投影 → rejected_orphan。完整且一致才算闭合。
         const seen = inspectRejectedClaim({ claimsDir, key: m[1] });
+        // #98：新形判据先走，只有它**没闭合**时才看一眼是不是 cc2cd 旧版的联合形状。
+        // 顺序不能反，也不能把“新形坏了”回退成 legacy：旧版 claim 没有 rejected_control，在新形那眼里
+        // 只能是 claim_unreadable / not_rejected_control，而新形记录坏了仍走下面那条红路径。
+        if (seen.state !== "rejected" && legacyCc2cdRejectedV1({ claimsDir, key: m[1] }).ok) {
+          notices.push({ key: m[1], reason: "legacy_cc2cd_rejected_v1", why: LEGACY_CC2CD_WHY + "：delivery-claims/" + name });
+          continue;
+        }
         if (seen.state === "rejected") continue;
         if (seen.state === "rejected_unreadable") problems.push({ key: m[1], reason: "rejected_unreadable", why: name + "：" + seen.why + " —— node scripts/repair-control-claim.mjs" });
         else if (seen.state === "rejected_intent_mismatch") problems.push({ key: m[1], reason: "rejected_intent_mismatch", why: name + "：" + seen.why });
@@ -382,7 +462,7 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
     runs.push(snap.run);
   }
   runs.sort((a, b) => (a.key < b.key ? -1 : 1));
-  return { ok: true, runs, problems };
+  return { ok: true, runs, problems, notices };
 }
 
 /** 旧入口：只给 runs 列表（目录读不出就是 []）。新代码用 inventoryRuns，problems 不能丢。 */

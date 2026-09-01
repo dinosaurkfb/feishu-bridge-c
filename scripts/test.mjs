@@ -18596,20 +18596,54 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   const lockInv = inventoryRuns({ runsDir: RUNS, claimsDir });
   assert.ok(lockInv.problems.some((p) => p.key === key12 && p.reason === "control_lock_held" && /不要手删/u.test(p.why)), JSON.stringify(lockInv.problems));
   assert.ok(!lockInv.problems.some((p) => p.reason === "unrecognized_entry"));
-  // 锁家族其余成员各按自己的族报，处置方式不同；形状不对的是 unrecognized_entry
+  // 锁家族其余成员各按自己的族报，处置方式不同；形状不对的是 unrecognized_entry。
+  // 残骸两族（reaped / quarantine）的"可直接删"只给形状合法的 symlink（payload 是本协议 owner）——
+  // 与共享维护器 clearStaleReapLock 同一判据（issue #85）：普通文件 / 目录 / payload 畸形只人工处置（issue #85 探针形状）。
   const familyUuid = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b";
+  const ownerPayload = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "inventory-test" });
   const planted = { ".reap": "control_reap_lock", ".maint": "control_maint_lock", [".reaped-" + familyUuid]: "control_lock_reaped_residue", [".reap.quarantine-" + familyUuid]: "control_reap_quarantine_residue" };
-  for (const suffix of Object.keys(planted)) fs.symlinkSync("x", path.join(claimsDir, key12 + ".control.lock" + suffix));
+  for (const [suffix, reason] of Object.entries(planted)) {
+    fs.symlinkSync(reason === "control_lock_reaped_residue" || reason === "control_reap_quarantine_residue" ? ownerPayload : "x", path.join(claimsDir, key12 + ".control.lock" + suffix));
+  }
   fs.symlinkSync("x", path.join(claimsDir, key12 + ".control.lock.reaped-abc"));
   const familyInv = inventoryRuns({ runsDir: RUNS, claimsDir });
   for (const [suffix, reason] of Object.entries(planted)) {
-    const hit = familyInv.problems.find((p) => p.key === key12 && p.reason === reason);
-    assert.ok(hit && hit.why.includes(key12 + ".control.lock" + suffix), suffix + "：" + JSON.stringify(familyInv.problems));
+    const hit = familyInv.problems.find((p) => p.key === key12 && p.reason === reason && p.why.includes(key12 + ".control.lock" + suffix));
+    assert.ok(hit, suffix + "：" + JSON.stringify(familyInv.problems));
   }
   assert.ok(familyInv.problems.find((p) => p.reason === "control_reap_lock").why.includes("repair-publish-lock"));
-  assert.ok(familyInv.problems.find((p) => p.reason === "control_lock_reaped_residue").why.includes("可直接删"));
+  assert.ok(familyInv.problems.find((p) => p.reason === "control_lock_reaped_residue" && p.why.includes(".reaped-" + familyUuid)).why.includes("可直接删"), "形状合法的 symlink 残骸可直接删");
+  assert.ok(familyInv.problems.find((p) => p.reason === "control_reap_quarantine_residue" && p.why.includes(".reap.quarantine-" + familyUuid)).why.includes("可直接删"), "形状合法的隔离残骸可直接删");
   assert.ok(familyInv.problems.some((p) => p.reason === "unrecognized_entry" && p.why.includes(".reaped-abc")), "形状不对的不算家族成员");
   for (const suffix of [...Object.keys(planted), ".reaped-abc"]) fs.rmSync(path.join(claimsDir, key12 + ".control.lock" + suffix));
+  // 名字对得上家族、但不是协议写出来的制品（issue #85 探针）：普通文件 / 带内容的目录 / payload 畸形的 symlink ——
+  // 共享维护器对同一制品判 recognized:false，盘点文案必须收成"只人工处置"，绝不说"可直接删"。
+  const fileUuid = "7f6e5d4c-3b2a-4978-8a9b-0c1d2e3f4a5c";
+  const dirUuid = "6a5b4c3d-2e1f-4878-8a9b-0c1d2e3f4b5d";
+  const badPayloadUuid = "5a4b3c2d-1e0f-4778-8a9b-0c1d2e3f4c5e";
+  const badPayloadUuid2 = "4a3b2c1d-0e9f-4678-8a9b-0c1d2e3f4d5f";
+  fs.writeFileSync(path.join(claimsDir, key12 + ".control.lock.reaped-" + fileUuid), "junk");
+  fs.mkdirSync(path.join(claimsDir, key12 + ".control.lock.reap.quarantine-" + dirUuid));
+  fs.writeFileSync(path.join(claimsDir, key12 + ".control.lock.reap.quarantine-" + dirUuid, "inner"), "payload");
+  fs.symlinkSync("not-json", path.join(claimsDir, key12 + ".control.lock.reaped-" + badPayloadUuid));
+  fs.symlinkSync("not-json", path.join(claimsDir, key12 + ".control.lock.reap.quarantine-" + badPayloadUuid2));
+  const fakeInv = inventoryRuns({ runsDir: RUNS, claimsDir });
+  const fakeReasons = {
+    [".reaped-" + fileUuid]: "control_lock_reaped_residue",
+    [".reap.quarantine-" + dirUuid]: "control_reap_quarantine_residue",
+    [".reaped-" + badPayloadUuid]: "control_lock_reaped_residue",
+    [".reap.quarantine-" + badPayloadUuid2]: "control_reap_quarantine_residue",
+  };
+  for (const [suffix, reason] of Object.entries(fakeReasons)) {
+    const hit = fakeInv.problems.find((p) => p.key === key12 && p.reason === reason && p.why.includes(key12 + ".control.lock" + suffix));
+    assert.ok(hit, "假制品要被盘点到：" + suffix + JSON.stringify(fakeInv.problems));
+    assert.ok(/只人工处置|先核验/u.test(hit.why), "假制品的文案要收成人工处置：" + hit.why);
+    assert.ok(!hit.why.includes("可直接删"), "假制品绝不说可直接删：" + hit.why);
+  }
+  fs.rmSync(path.join(claimsDir, key12 + ".control.lock.reaped-" + fileUuid), { force: true });
+  fs.rmSync(path.join(claimsDir, key12 + ".control.lock.reap.quarantine-" + dirUuid), { recursive: true, force: true });
+  fs.rmSync(path.join(claimsDir, key12 + ".control.lock.reaped-" + badPayloadUuid), { force: true });
+  fs.rmSync(path.join(claimsDir, key12 + ".control.lock.reap.quarantine-" + badPayloadUuid2), { force: true });
   assert.equal(releasePublishLock(lock12).ok, true);
   // 锁内重判：锁外看是 failed 损坏，动手前被人补成受验 failed → 事务按记录返回失败，不隔离、不执行
   fs.mkdirSync(path.join(claimsDir, key12 + ".failed.json"));

@@ -31,7 +31,7 @@ import { preflightTask } from "./publish-eligible.mjs";
 import { HOOK_TAG, acceptsHookCommand, buildHookCommand, codexHooksOwnedEntries, ownsHookCommand, parseHookCommand, pickNode, renderCodexHooks } from "./hook-command.mjs";
 import { recordCodexActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
 import {
-  INTENT_TTL_MS, buildIntentParams, consumeIntent, intentDir, issueIntent,
+  INTENT_TTL_MS, buildIntentParams, consumeIntent, intentDir, intentRejectText, issueIntent,
 } from "./intent.mjs";
 import { sweepEligible } from "./drain-all.mjs";
 import { remindCodexPendingClaims } from "./claim-reminder.mjs";
@@ -9403,6 +9403,16 @@ test("维护门 · PR B：prompt-hook 签发的控制脚本集合 == 封闭常�
   const manifest = maintenanceEntryManifest({ repoRoot: ROOT, home: temp(), codexHome: temp() });
   for (const n of PROMPT_HOOK_COMMAND_SCRIPTS) assert.ok(manifest.entries.includes(n) && manifest.sources[n].includes("codex-prompt-hook"), "清单缺 " + n);
   assert.deepEqual(manifest.missing, []);
+});
+
+// 小债 B：intent_unreadable 提示语要说清原因（凭证未初始化；沙箱 / HOME 重定向）与下一步动作。
+test("intent_unreadable 提示语给人指路：点名沙箱 / HOME 与下一步动作", () => {
+  const text = intentRejectText("intent_unreadable");
+  assert.match(text, /沙箱/u, "要提到沙箱：" + text);
+  assert.match(text, /HOME/u, "要提到 HOME 重定向：" + text);
+  assert.match(text, /绑定预览/u, "要给下一步动作（在真实环境跑绑定预览核对路径）：" + text);
+  // 相邻 reason 的文案不动
+  assert.equal(intentRejectText("intent_corrupt"), "凭证内容读不出来，拒绝执行。");
 });
 
 summarySealed = true;

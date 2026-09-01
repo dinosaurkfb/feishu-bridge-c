@@ -294,7 +294,10 @@ export const INTENT_REJECT_TEXT = {
   intent_thread_mismatch: "凭证属于另一条 thread，拒绝执行。",
   intent_turn_mismatch: "凭证来自另一轮对话，拒绝执行。",
   intent_corrupt: "凭证内容读不出来，拒绝执行。",
-  intent_unreadable: "凭证无法访问，拒绝执行。",
+  intent_unreadable:
+    "凭证读不到，拒绝执行。最常见的两个原因：凭证还没初始化过（没有凭证文件）；" +
+    "这个会话在沙箱里、HOME 被重定向，凭证路径落在了隔离环境里。\n" +
+    "  下一步：在真实环境跑一次绑定预览，核对凭证路径是否对得上。",
 };
 
 export const intentRejectText = (reason) =>

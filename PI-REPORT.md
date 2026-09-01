@@ -67,6 +67,17 @@
 
 `isP2pMessage` 的前提是「群消息没有 @ 就不会投给 agent」。这条写在文档里、也符合线上现象（真机私聊的 envelope 里确实没有 `<at>`，所以才会报 `transport_not_mentioned`），但我没有平台侧的投递日志可查。请 Frank 在真机私聊发一句「在吗」，然后跑 `node scripts/layered-status.mjs --json` 看 chat 计数是否 +1、话题里是否收到单发答复；这条一旦不符，判据要换成平台侧 chat_type（那需要 envelope 先带上来）。
 
+## 请 Codex 定夺的一处文档（我没改）
+
+`docs/architecture/agent-enhancement-contract.md:565` 那句现在与代码不一致：它写的是
+「`CHAT_FALLBACK_REASONS`（没有 pending、多份 pending、绑定码对不上 / 重复、pending 过期、
+发送者不是 owner）时落进 chat；**没有真实 @**、消息过期、模板损坏仍是拒绝」。本票之后
+「没有真实 @」分成两种 —— 整条没有 mention（私聊形状）落 chat；有 mention 却没 @ 到本链路
+仍拒。架构/合同文档归 Codex 写，我只改实现，所以留一句请它补；措辞可以直接用：
+「认领不成立的原因属于 `CHAT_FALLBACK_REASONS`（……、发送者不是 owner、**整条消息没有任何
+ mention 的私聊形状**）时落进 chat；**消息里出现了 mention 却没 @ 到本链路运输 agent**、
+消息过期、模板损坏仍是拒绝。」
+
 ## 自检：把新守卫逐条改坏，要求每条都被咬住
 
 `/tmp/pi-ticket6-probe.py`（临时脚本，未入库）跑 8 个变异，全部 `KILLED`：

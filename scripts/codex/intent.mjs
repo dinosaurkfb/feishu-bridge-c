@@ -294,7 +294,11 @@ export const INTENT_REJECT_TEXT = {
   intent_thread_mismatch: "凭证属于另一条 thread，拒绝执行。",
   intent_turn_mismatch: "凭证来自另一轮对话，拒绝执行。",
   intent_corrupt: "凭证内容读不出来，拒绝执行。",
-  intent_unreadable: "凭证无法访问，拒绝执行。",
+  intent_unreadable:
+    "凭证文件读不到，拒绝执行。最常见的两个原因：\n" +
+    "  ① 这台机器还没签过凭证（未初始化 —— 凭证由 UserPromptSubmit 钩子在你亲自输入完整命令时写下）；\n" +
+    "  ② 这个会话跑在沙箱里、HOME 被重定向 —— 钩子去读的凭证路径落在隔离环境里，真 HOME 下那张它看不到。\n" +
+    "  下一步：在**真实环境**跑一次绑定预览（$feishu-bind 的预览那一步），核对它报的 HOME 与凭证路径对不对。",
 };
 
 export const intentRejectText = (reason) =>

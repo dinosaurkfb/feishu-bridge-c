@@ -136,13 +136,25 @@ export function runDoctor({
   // ── ① ② 路由 ↔ 状态入口（collectConnectivity 是唯一判据：unregistered / unavailable / disabled）
   const links = collectConnectivity({ routesFile, providersFile, ...(probeProviders ? {} : { run: NOT_PROBED }) });
   const tablesUnclear = links.providersProblem !== null || links.routesProblem !== null;
-  const unregistered = links.sections.filter((s) => s.state === "unregistered");
+  // ⑦ 的判据在这里算一次，① 与 ⑦ 共用同一份结论 —— 各自读一遍路由表就可能各说一套话。
+  const runtimeCurrent = path.join(runtimeRoot(home, "claude"), "current");
+  const expectedHandler = path.join(runtimeCurrent, "scripts", "inbound.mjs");
+  const d = defaultRouteHandler({ file: routesFile, runtimeCurrent, expectedHandler, expectedRouteId: "self" });
+  // self 特判：本桥自己的入站路由，状态入口就是这份体检与 feishu-status —— 再给它登记一个外部 provider
+  // 是让桥给自己当外人。判据是 defaultRouteHandler（有效默认路由 + 处理器 realpath 就是 runtime/current 下
+  // 本链那个 inbound.mjs），**不是**"routeId 叫 self 就放过"：名字叫 self 而处理器在别处的路由照旧 ✗，
+  // 而且那时候 ⑦ 本来也是红的 —— ① 只在 ⑦ 绿的条件下才免这一条。
+  const isSelfBridge = (id) => d.status === "runtime" && d.id === id;
+  const unregistered = links.sections.filter((s) => s.state === "unregistered" && !isSelfBridge(s.id));
+  const selfNoProvider = links.sections.filter((s) => s.state === "unregistered" && isSelfBridge(s.id));
   const unavailable = links.sections.filter((s) => s.state === "unavailable" && s.reason !== "not_probed");
+  const selfText = selfNoProvider.length === 0 ? ""
+    : "（" + list(selfNoProvider, (s) => s.id) + " 是本桥自身的入站路由：它的状态入口就是这份体检与 feishu-status，不给自己另登记一个外部 provider）";
   add("route_without_provider", "① route 有状态入口",
     tablesUnclear ? null : unregistered.length === 0,
     tablesUnclear ? "路由表或状态入口表读不出来，查不清（" + (links.routesProblem ?? links.providersProblem) + "）"
-      : unregistered.length === 0 ? "每条启用路由都有获准报告运输状态的状态入口"
-      : unregistered.length + " 条路由没有状态入口：" + list(unregistered, (s) => s.id),
+      : unregistered.length === 0 ? "每条启用路由都有获准报告运输状态的状态入口" + selfText
+      : unregistered.length + " 条路由没有状态入口：" + list(unregistered, (s) => s.id) + selfText,
     unregistered.length > 0 ? PREVIEW.registerProvider : null);
   add("provider_runs", "② 状态入口能跑",
     tablesUnclear ? null : !probeProviders ? null : unavailable.length === 0,
@@ -176,11 +188,8 @@ export function runDoctor({
     add("provider_without_route", "④ 状态入口表与路由表对得上", null, "两张表有一张读不出来，查不清", null);
   }
 
-  // ── ⑦ 入站默认处理器必须就是装好的运行时（issue #88：装了 ≠ 在跑）
+  // ── ⑦ 入站默认处理器必须就是装好的运行时（issue #88：装了 ≠ 在跑；d 在上面① 之前算好，两处同一份判据）
   {
-    const runtimeCurrent = path.join(runtimeRoot(home, "claude"), "current");
-    const expectedHandler = path.join(runtimeCurrent, "scripts", "inbound.mjs");
-    const d = defaultRouteHandler({ file: routesFile, runtimeCurrent, expectedHandler, expectedRouteId: "self" });
     const othersText = d.others?.length ? "；另有 " + d.others.length + " 条非默认路由的处理器在运行时之外（按备注分辨）：" + list(d.others, (o) => o.id + " → " + o.handler) : "";
     add("default_route_handler", "⑦ 入站默认处理器在 runtime/current 之下",
       d.status === "runtime" || d.status === "no_routes" ? true : d.status === "unreadable" ? null : false,

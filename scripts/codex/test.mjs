@@ -31,7 +31,7 @@ import { preflightTask } from "./publish-eligible.mjs";
 import { HOOK_TAG, acceptsHookCommand, buildHookCommand, codexHooksOwnedEntries, ownsHookCommand, parseHookCommand, pickNode, renderCodexHooks } from "./hook-command.mjs";
 import { recordCodexActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
 import {
-  INTENT_TTL_MS, buildIntentParams, consumeIntent, intentDir, issueIntent,
+  INTENT_REJECT_TEXT, INTENT_TTL_MS, buildIntentParams, consumeIntent, intentDir, intentRejectText, issueIntent, requireIntent,
 } from "./intent.mjs";
 import { sweepEligible } from "./drain-all.mjs";
 import { remindCodexPendingClaims } from "./claim-reminder.mjs";
@@ -4500,6 +4500,30 @@ test("只读的 $feishu-mode 不许签出可当写票用的凭证", () => {
   const write = hook("$feishu-mode dialogue");
   assert.match(write, /--intent '[0-9a-f]{32}'/u, "带参数的要签：" + write);
   assert.equal(count(), before + 1);
+});
+
+test("intent_unreadable 的文案说清「为什么读不到」与「下一步做什么」，reason 键名不许漂（小债）", () => {
+  // 真走一遇门禁：凭证目录被换成一个普通文件（HOME 被重定向到沙箱时的典型形状），
+  // rename 不是 ENOENT 而是 ENOTDIR → 必须是 intent_unreadable，而且 text 能让人知道接下来干吗。
+  const home = temp();
+  fs.mkdirSync(path.dirname(intentDir(home)), { recursive: true });
+  fs.writeFileSync(intentDir(home), "不是目录");
+  const r = requireIntent({ apply: true, action: "bind", threadId: THREAD_A, argv: ["--intent", "0".repeat(32)], home });
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.equal(r.reason, "intent_unreadable", JSON.stringify(r));
+  assert.match(r.text, /沙箱/u, "两个成因之一要写出来：" + r.text);
+  assert.match(r.text, /HOME/u, "HOME 被重定向就是这个 reason 最常见的成因：" + r.text);
+  assert.match(r.text, /未初始化/u, "另一个成因：" + r.text);
+  assert.match(r.text, /下一步/u, "不能只说拒绝，要给人做的事：" + r.text);
+  assert.match(r.text, /真实环境/u);
+  assert.match(r.text, /预览/u);
+  // 只改了这一条文案：其余键一个不少（少一个键就掉进 intentRejectText 的兑底句，人看到的是另一套话）
+  for (const k of Object.keys(INTENT_REJECT_TEXT)) {
+    assert.equal(intentRejectText(k), INTENT_REJECT_TEXT[k], k + " 的文案不该走兑底句");
+  }
+  assert.match(intentRejectText("intent_corrupt"), /内容读不出来/u, "「读不出内容」与「读不到文件」仍是两句话");
+  assert.notEqual(INTENT_REJECT_TEXT.intent_unreadable, INTENT_REJECT_TEXT.intent_corrupt);
+  assert.match(intentRejectText("没这个原因"), /凭证校验失败/u, "未知 reason 才走兑底句");
 });
 
 test("意图凭证：重放、串动作、串 thread、过期，四种都要拒", () => {

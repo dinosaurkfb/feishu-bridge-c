@@ -18917,6 +18917,47 @@ test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进
   }
 });
 
+test("doctor ①：本桥自身的 self 路由不要求另登记状态入口 —— 判据是 defaultRouteHandler，不是名字（小债）", () => {
+  const m = doctorMachine({ installRuntime: true });
+  const good = m.project("good", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  const projects = [{ id: "good", root: good, root_message_id: "om_root_good", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }];
+  const selfHandler = path.join(m.home, ".claude", "feishu-bridge", "runtime", "current", "scripts", "inbound.mjs");
+  const one = (id) => checkOf(doctorReport(m.run()), id);
+
+  // 真机上就是这个形状：self 是默认路由、处理器在 runtime/current 之下，而 status-providers.json 里没有 self。
+  // 以前 ① 报 ✗“1 条路由没有状态入口：self”，现在认它是本桥自身。
+  m.writeTables({ projects, routes: [{ id: "self", handler: selfHandler, default: true }], sessions: {}, providers: [] });
+  const selfOnly = one("route_without_provider");
+  assert.equal(selfOnly.ok, true, "本桥自身的入站路由不该要求再登记一个外部 provider：" + selfOnly.detail);
+  assert.match(selfOnly.detail, /本桥自身/u, "放过要有理由，不能默默少一条：" + selfOnly.detail);
+  assert.equal(selfOnly.next, null, "没有真缺入口就不该给出 register-status-provider 那一步");
+  assert.equal(one("default_route_handler").ok, true, "① 放过的条件是 ⑦ 绿：两处用的是同一份判据");
+
+  // 名字叫 self、处理器在运行时之外 → 照旧 ✗，而且不许拿“本桥自身”当借口
+  m.writeTables({ projects, routes: [{ ...m.route("self"), default: true }], sessions: {}, providers: [] });
+  const namedSelf = one("route_without_provider");
+  assert.equal(namedSelf.ok, false, "特判认的是判据，不是路由 id：" + namedSelf.detail);
+  assert.match(namedSelf.detail, /1 条路由没有状态入口：self/u, namedSelf.detail);
+  assert.doesNotMatch(namedSelf.detail, /本桥自身/u, "⑦ 红的时候不许顺手放过");
+  assert.match(namedSelf.next, /register-status-provider/u, "真缺入口才给登记那一步：" + namedSelf.next);
+  assert.equal(one("default_route_handler").ok, false, "同一种机器在 ⑦ 那边也是红 —— 两条检查不互相打脸");
+
+  // 回归：外部路由（cc2cd 形）没有状态入口照旧 ✗，点名的是它，放过的解释也同条说清
+  m.writeTables({ projects, routes: [{ id: "self", handler: selfHandler, default: true }, { id: "cc2cd", handler: m.okProvider }], sessions: {}, providers: [] });
+  const mixed = one("route_without_provider");
+  assert.equal(mixed.ok, false, "别人的路由没有状态入口照旧是故障：" + mixed.detail);
+  assert.match(mixed.detail, /1 条路由没有状态入口：cc2cd/u, mixed.detail);
+  assert.ok(mixed.detail.startsWith("1 条路由没有状态入口：cc2cd"), "self 不该再被算进去：" + mixed.detail);
+  assert.match(mixed.detail, /本桥自身/u, "同一条文案里把放过的那条也说清");
+
+  // 只查判据不查名字的反例：self 那条处理器对、但它不是默认路由（默认在别的 id 上）→ 不放过
+  m.writeTables({ projects, routes: [{ id: "self", handler: selfHandler }, { id: "other", handler: selfHandler, default: true }], sessions: {}, providers: [] });
+  const notDefault = one("route_without_provider");
+  assert.equal(notDefault.ok, false, "默认路由不是 self 时，本桥自身不成立（入站不都走它）：" + notDefault.detail);
+  assert.doesNotMatch(notDefault.detail, /本桥自身/u, notDefault.detail);
+  assert.equal(one("default_route_handler").ok, false, "这种机器 ⑦ 也红");
+});
+
 test("⑦ 入站默认处理器（issue #88）：分类五态不折叠；doctor 与状态页据此报；受控恢复只动默认路由且先备份", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-routes-default-"));
   const rt = path.join(home, "runtime");

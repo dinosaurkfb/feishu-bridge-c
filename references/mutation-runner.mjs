@@ -1,0 +1,217 @@
+/**
+ * 变异测试 runner（票 #3）—— 改坏一处代码，套件必须转红；不红就说明那条守卫没在盯这件事。
+ *
+ * 为什么先跑定向：全量套件约 2.5 分钟，48 个变异要 2 小时；而真能杀掉某个变异的往往只有
+ * 1–2 个测试。定向跑一次不到 1 秒（实测 0.4s 跑两条），杀掉即算红。
+ * **定向只是加速，不是判据**：定向没转红时自动升级跑全量确认，全量也没红才算 SURVIVED。
+ *
+ * 三层防的是"变异表变成一台制造绿字的机器"：
+ *  1. 启动前先在**未变异**的代码上跑一次全量。全量本来就红 → 直接退出：那时任何变异都会
+ *     被读成 KILLED，整轮的结论都是假的。（表里所有变异都在锚点核对阶段就报错时不花这笔时间。）
+ *  2. 每个变异先在未变异代码上跑它自己的定向过滤器。基线就红 → 报 baseline_red 异常，
+ *     **不算击杀**（那是过滤器挑到了本来就红的测试，或那条测试依赖前序测试的副作用）。
+ *  3. 锚点必须恰好命中 1 次；变异体先过 `node --check`，语法坏了报 mutant_broken，
+ *     不算 KILLED（红是红在语法上，不是红在守卫上）。
+ *
+ * 退出码：0 = 全部 KILLED；1 = 有 SURVIVED 或异常。
+ * 用法：`node references/mutation-runner.mjs`（全表）或 `--ids m1 m2`（选跑）。
+ *
+ * 只驱动 Claude 套件（`scripts/test.mjs`）。`killedBy` 在那一侧一个名字都不命中时，套件以
+ * 退出码 2 + "命中 0" 收场，这里读成 filter_misses 异常 —— 所以"Codex 侧才有的守卫"
+ * 不会被静默判成存活，会被判成异常。真要覆盖 codex 套件时给表加 `suite` 字段，别在这儿预留。
+ */
+
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { isDirectRun, moduleDir } from "../scripts/direct-run.mjs";
+
+const ROOT = path.resolve(moduleDir(import.meta.url), "..");
+const SUITE = path.join("scripts", "test.mjs");
+// 定向跑用短窗，全量用长窗；超时的变异**不许**被当成击杀（超时是红在计时器上）。
+const TARGETED_TIMEOUT_MS = 5 * 60 * 1000;
+const FULL_TIMEOUT_MS = 20 * 60 * 1000;
+
+/**
+ * 变异表。`killedBy` 是给 TEST_FILTER 用的**预期击杀测试名子串**（子串匹配、逗号=多个）。
+ *
+ * 下面三条是示例，各自盯 runner 的一条路径；真实的 48 条由主会话之后迁入。
+ *  - m-anchor-targeted：锚点唯一、killedBy 写对 → 定向 0.4 秒即杀。
+ *  - m-upgrade-full：**故意把 killedBy 写成一条无关但会通过的测试** → 定向不红 →
+ *    自动升级全量 → 全量转红 → 记 KILLED（升级）。这条存在的意义就是证明升级这一步真的会发生。
+ *  - m-anchor-missing：锚点在文件里根本不存在 → 报错，不跑任何套件。
+ */
+const MUTATIONS = [
+  {
+    id: "m-anchor-targeted",
+    file: "scripts/outbound.mjs",
+    find: 'name.slice(0, 140)',
+    replace: 'name.slice(0, 20)',
+    // "不认识"的条目要把名字给全到能分清后缀（key 占 64 位）—— 截到 20 位就只剩 hex 前缀。
+    killedBy: "run 通道排空",
+  },
+  {
+    id: "m-upgrade-full",
+    file: "scripts/layered-status.mjs",
+    find: 'key.length > 0 ? key.slice(0, 8) : "--------"',
+    replace: 'key.length > 0 ? key.slice(0, 7) : "--------"',
+    // 故意写错：shortKey 少一位是**状态页**那条用例杀的，这里填的是账本 consumed 的用例，
+    // 它会通过 → runner 必须升级全量，而不是就地算存活。
+    killedBy: "claim 终态 consumed",
+  },
+  {
+    id: "m-anchor-missing",
+    file: "scripts/outbound.mjs",
+    find: "这一段文字在本仓不存在（示例锚点 m-anchor-missing）",
+    replace: "随便改点什么",
+    killedBy: "run 通道排空",
+  },
+];
+
+const gitClean = (rel) => spawnSync("git", ["status", "--porcelain", "--", rel],
+  { cwd: ROOT, encoding: "utf-8" }).stdout.trim() === "";
+
+/** 正则（带 g）最后一次命中的结果 —— 套件输出里可能嵌着别人打印的汇总行。 */
+function lastMatch(re, text) {
+  let found = null;
+  for (const m of text.matchAll(re)) found = m;
+  return found;
+}
+
+/**
+ * 跑一次套件。filter=null 表示全量（显式删掉 TEST_FILTER，别让它从环境里漏进来）。
+ *
+ * 返回 verdict：red 只在"打了汇总行而且失败 > 0"时给。套件没打汇总（崩在中间）、
+ * 退出码 1 但失败 0（汇总之外挂的）都算 crashed —— 不收到 red 里去，否则
+ * "套件自己崩了"会被记成"守卫把它杀了"，那正是变异测试最怕的假信号。
+ */
+function runSuite(filter) {
+  const env = { ...process.env };
+  if (filter === null) delete env.TEST_FILTER; else env.TEST_FILTER = filter;
+  const r = spawnSync(process.execPath, [SUITE], {
+    cwd: ROOT, env, encoding: "utf-8", maxBuffer: 64 * 1024 * 1024,
+    timeout: filter === null ? FULL_TIMEOUT_MS : TARGETED_TIMEOUT_MS,
+  });
+  const out = (r.stdout ?? "") + (r.stderr ?? "");
+  process.stdout.write(out);            // 套件输出一行不吞，人要看得到红在哪
+  if (r.signal) return { verdict: "crashed", why: "被 " + r.signal + " 打断（超时？） —— 不算转红" };
+  if (typeof r.status !== "number") return { verdict: "crashed", why: "套件起不来：" + String(r.error?.message ?? r.status) };
+  const summary = lastMatch(/通过 (\d+) \/ 失败 (\d+)/gu, out);   // 取最后一次：拿第一次会把嵌套运行的结果当本轮的
+  if (!summary) return { verdict: "crashed", why: "没打印汇总行（退出码 " + r.status + "）—— 红绿都不能记" };
+  const failed = Number(summary[2]);
+  if (filter !== null) {
+    const hit = lastMatch(/TEST_FILTER 命中 (\d+) \/ 总 (\d+)/gu, out);
+    if (!hit) return { verdict: "crashed", why: "该跑的是过滤运行却没打 TEST_FILTER 命中行 —— 汇总不可信" };
+    if (Number(hit[1]) === 0) return { verdict: "no_match", why: "命中 0 / 总 " + hit[2] };
+  }
+  if (r.status === 0 && failed === 0) return { verdict: "green", why: "通过 " + summary[1] };
+  if (r.status === 1 && failed > 0) return { verdict: "red", why: "失败 " + failed + " / 共 " + summary[1] };
+  return { verdict: "crashed", why: "退出码 " + r.status + "、失败 " + failed + " —— 对不上（汇总之外挂了）" };
+}
+
+/** 锚点核对 + 落盘变异。只改确实过了核对的文件；失败时文件一个字节都没动。 */
+function apply(m) {
+  const abs = path.resolve(ROOT, m.file);
+  if (!abs.startsWith(ROOT + path.sep)) return { err: "变异目标越出仓外：" + m.file };
+  if (!fs.existsSync(abs)) return { err: "文件不存在：" + m.file };
+  const src = fs.readFileSync(abs, "utf-8");
+  const hits = src.split(m.find).length - 1;
+  if (hits !== 1) return { err: "锚点命中 " + hits + " 次（要求恰好 1 次），不改文件：" + m.file };
+  if (!gitClean(m.file)) return { err: "工作树里 " + m.file + " 有未提交改动 —— 还原会盖掉它，先收干净" };
+  fs.writeFileSync(abs, src.replace(m.find, m.replace));
+  return { abs, src };
+}
+
+function restore(applied) {
+  fs.writeFileSync(applied.abs, applied.src);
+  if (fs.readFileSync(applied.abs, "utf-8") !== applied.src) throw new Error("还原后内容与原文不一致：" + applied.abs);
+}
+
+function syntaxOk(abs) {
+  const r = spawnSync(process.execPath, ["--check", abs], { cwd: ROOT, encoding: "utf-8", timeout: 60_000 });
+  if (r.status !== 0) console.log((r.stderr ?? "").trim());
+  return r.status === 0;
+}
+
+function main(argv) {
+  let picked = MUTATIONS;
+  if (argv[0] === "--ids") {
+    const want = argv.slice(1);
+    if (want.length === 0) { console.error("--ids 后面要给 id（可用：" + MUTATIONS.map((x) => x.id).join(" ") + "）"); return 2; }
+    picked = want.map((id) => MUTATIONS.find((x) => x.id === id)
+      ?? { id, missing: true, file: "-", find: "-", replace: "-", killedBy: "-" });
+  } else if (argv.length > 0) {
+    console.error("不认识参数：" + argv.join(" ") + "\n用法：node references/mutation-runner.mjs [--ids id …]");
+    return 2;
+  }
+
+  // ① 锚点先全体核对（纯字符串，不跑套件）—— 一条都不用跑时不必花那 2.5 分钟基线。
+  const ready = [];
+  const anomalies = [];
+  for (const m of picked) {
+    if (m.missing) { anomalies.push([m.id, "unknown_id：表里没有这个变异"]); continue; }
+    const abs = path.resolve(ROOT, m.file);
+    const hits = fs.existsSync(abs) ? fs.readFileSync(abs, "utf-8").split(m.find).length - 1 : -1;
+    if (hits !== 1) {
+      anomalies.push([m.id, "anchor_error：锚点在 " + m.file + " 里命中 "
+        + (hits === -1 ? "（文件不存在）" : hits + " 次") + "，要求恰好 1 次 —— 一个字节都没改"]);
+      continue;
+    }
+    ready.push(m);
+  }
+
+  let killed = 0; let survived = 0;
+  if (ready.length > 0) {
+    // ② 全量基线：未变异的代码必须全绿，否则后面每个变异都会"被击杀"。
+    console.log("— 全量基线（未变异）：" + SUITE);
+    const base = runSuite(null);
+    if (base.verdict !== "green") {
+      console.log("\n✗ 全量基线就没绿（" + base.verdict + "：" + base.why
+        + "）—— 这时任何变异都会被读成 KILLED，整轮结论都是假的。先把套件修绿。");
+      return 1;
+    }
+    for (const m of ready) {
+      console.log("\n=== " + m.id + "  " + m.file + "  killedBy=" + JSON.stringify(m.killedBy));
+      let applied = null;
+      try {
+        // ③ 定向基线：过滤器在这条变异上到底挑到了谁，未变异时必须过。
+        const t0 = Date.now();
+        const baseline = runSuite(m.killedBy);
+        if (baseline.verdict === "no_match") { anomalies.push([m.id, "filter_misses：TEST_FILTER=" + m.killedBy
+          + " 在 Claude 套件里一个名字都没命中（表的 killedBy 写错了，或这条守卫只有 Codex 侧有）"]); continue; }
+        if (baseline.verdict !== "green") { anomalies.push([m.id, "baseline_" + baseline.verdict + "：未变异的代码上这条过滤器就不干净（" + baseline.why
+          + "）—— 不算击杀，先修表或修套件"]); continue; }
+        console.log("  定向基线绿（" + ((Date.now() - t0) / 1000).toFixed(1) + "s），落变异");
+
+        applied = apply(m);
+        if (applied.err) { anomalies.push([m.id, "apply_error：" + applied.err]); applied = null; continue; }
+        if (!syntaxOk(applied.abs)) { anomalies.push([m.id, "mutant_broken：变异体语法就坏了，红也算不到守卫头上"]); continue; }
+
+        const t1 = Date.now();
+        const targeted = runSuite(m.killedBy);
+        if (targeted.verdict === "red") { killed += 1; console.log("  KILLED（定向，" + ((Date.now() - t1) / 1000).toFixed(1) + "s）"); continue; }
+        if (targeted.verdict !== "green") { anomalies.push([m.id, "targeted_" + targeted.verdict + "：" + targeted.why]); continue; }
+        console.log("  定向没红 → 升级全量确认（判据是全量，不是定向）");
+        const t2 = Date.now();
+        const full = runSuite(null);
+        if (full.verdict === "red") { killed += 1; console.log("  KILLED（升级全量才红，" + ((Date.now() - t2) / 1000).toFixed(0) + "s；红在哪个用例见上面 ✗ 行 —— 顺手核对不是偶发用例）"); continue; }
+        if (full.verdict !== "green") { anomalies.push([m.id, "full_" + full.verdict + "：" + full.why]); continue; }
+        survived += 1;
+        console.log("  SURVIVED：全量也没红 —— 改坏了而没人报警");
+      } catch (err) {
+        anomalies.push([m.id, "error：" + (err?.message ?? String(err))]);
+      } finally {
+        if (applied) {
+          try { restore(applied); console.log("  已还原 " + m.file); }
+          catch (err) { anomalies.push([m.id, "restore_failed：" + (err?.message ?? String(err)) + " —— 手工 git checkout " + m.file]); }
+        }
+      }
+    }
+  }
+
+  console.log("\nKILLED " + killed + " / SURVIVED " + survived + " / 异常 " + anomalies.length);
+  for (const [id, why] of anomalies) console.log("  ! " + id + "：" + why);
+  return survived + anomalies.length > 0 ? 1 : 0;
+}
+
+if (isDirectRun(import.meta.url)) process.exit(main(process.argv.slice(2)));

@@ -21709,7 +21709,8 @@ test("issue #98：cc2cd 旧形 rejected 精确命中进 notices，差一点都�
   // 生成 key 就能对上重推 —— 畸形 claim 会被降成 info；这三组的 key 都按强转值造，专打这条缺口）
   for (const [label, mid] of [["数字", 123], ["空串", ""], ["对象", { x: 1 }]]) {
     clean();
-    const kBad = claimKeyFor(String(mid), "cc2cd_peer");
+    // key 直接按强转值算（claimKeyFor 帮手会加 om_ 前缀，反而让强转永远对不上 —— 那样红例杀不死"去掉类型检查"的变异）
+    const kBad = claimKey(String(mid), "cc2cd_peer");
     fs.mkdirSync(path.join(claims, kBad + ".claim"), { recursive: true });
     fs.writeFileSync(path.join(claims, kBad + ".claim", "claim.json"), JSON.stringify({ schema_version: "1.0", state: "claimed", claim_key: kBad, message_id: mid, logical_task_key: "cc2cd_peer", claimed_at: "2026-08-30T00:00:00.000Z", session_id: "s", thread_id: "t" }));
     fs.writeFileSync(path.join(claims, kBad + ".rejected.json"), JSON.stringify({ ..."empty_instruction", schema_version: "1.0", claim_key: kBad, state: "rejected", recorded_at: "2026-08-30T00:00:01.000Z" }));

@@ -216,6 +216,12 @@ async function main() {
         bindingId: effectiveBindingId(bound.mapping, { root: project.root }),
       });
       const activeTurn = interaction.ok ? interaction.state.dialogue?.active_turn : null;
+      // 策略状态读不出或不合法 → "这一轮到底是不是飞书驱动的"说不清。这时候不许把
+      // not_found 当成未配对的本地一轮单发（票 #6 B 的例外只在证据完整时生效）：
+      // 证据不齐就退回零入队 + 留诊断，而不是赌一个代际。
+      if (!interaction.ok && turnRoute.ok && turnRoute.kind === "unpaired") {
+        turnRoute = { ok: false, reason: "policy_state_unreadable", why: interaction.reason ?? interaction.error ?? null };
+      }
       if (interaction.ok && interaction.state.policy_id === DIALOGUE_POLICY_ID &&
           activeTurn?.runtime_target_id === speakingSession) {
         // 这一回合是飞书来的：回复发回该回合受理时冻结的 origin（老话题的指令回老话题）；

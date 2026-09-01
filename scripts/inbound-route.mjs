@@ -357,17 +357,19 @@ export function evaluatePromotion({ event, template, pending, now = Date.now() }
   }
 
   if (event?.sender_id !== frank) return reject(PROMOTE_REJECT.SENDER_NOT_FRANK);
+
+  const createdMs = Number(event?.created_at_ms);
+  if (!Number.isFinite(createdMs)) return reject(PROMOTE_REJECT.MALFORMED_TEMPLATE);
+  // 新鲜度排在形状判定之前：防重放是更基本的性质，一条旧消息连"该按群还是按私聊判"都不必问。
+  if (now - createdMs > freshness) return reject(PROMOTE_REJECT.STALE_MESSAGE);
+
   // 私聊不进认领评估：绑定必然分两段（在待接入话题里真实 @ 那一下才认得到运输 agent），私聊里没有
   // mention 结构，硬判只能得到一条把私聊说成群聊的「没有真实 @」。这条落进 chat 默认态重判
-  //（见 CHAT_FALLBACK_REASONS），既不绑定位也不把待绑定拖下水。
+  // （见 CHAT_FALLBACK_REASONS），既不绑定位也不把待绑定拖下水。
   if (isP2pMessage(event)) return reject(PROMOTE_REJECT.P2P_NO_MENTION);
   if (!extractMentionIds(event?.content).includes(transport)) {
     return reject(PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
   }
-
-  const createdMs = Number(event?.created_at_ms);
-  if (!Number.isFinite(createdMs)) return reject(PROMOTE_REJECT.MALFORMED_TEMPLATE);
-  if (now - createdMs > freshness) return reject(PROMOTE_REJECT.STALE_MESSAGE);
 
   if (!pending?.ok) return reject(pending?.reason ?? PROMOTE_REJECT.NO_PENDING, { ids: pending?.ids });
 

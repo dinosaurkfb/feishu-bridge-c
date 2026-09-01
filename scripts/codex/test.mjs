@@ -9292,9 +9292,10 @@ test("Codex 链的 chat 默认态：未绑定会话（群 @ 或私聊）不再�
   // Codex 链每次 chat 先核 claude --version（回复路径前置），只数带 -p 的真回答
   const argvLog = () => (fs.existsSync(claudeLog) ? fs.readFileSync(claudeLog, "utf-8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((a) => a.includes("-p")) : []);
   let seq = 0;
-  const run = (body, sender, extraEnv = {}) => {
+  // 第 4 参 raw = 自带整条正文（票 #6 A 的私聊形状要真的没有 <at> 标签）
+  const run = (body, sender, extraEnv = {}, { raw = null } = {}) => {
     seq += 1;
-    const content = '<at id="ou_same" type="employee">M5Codex</at> ' + body;
+    const content = raw ?? '<at id="ou_same" type="employee">M5Codex</at> ' + body;
     const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_chat_" + seq, sessionID: "aily_dm", role: "user", createdBy: sender, createdAtMs: Date.now(), content } }) }] });
     return spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], { encoding: "utf-8",
       env: { ...isolatedEnv(), PATH: bin + path.delimiter + process.env.PATH, FEISHU_CODEX_BRIDGE_HOME: home, HOME: home,
@@ -9306,7 +9307,12 @@ test("Codex 链的 chat 默认态：未绑定会话（群 @ 或私聊）不再�
   assert.deepEqual(argvLog()[0].slice(4), ["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-session-persistence", "--safe-mode", "--output-format", "text"], "Codex 链的 chat 也用同一份零工具边界（回答由 claude -p 出，与 Codex 的投递路径无关）");
   assert.match(run("在吗", "3333").stdout, /^回答：在吗/mu, "participant 在未接入的话题里也能问");
   assert.match(run("在吗", "4444").stdout, /已拒绝 · 发送者不是授权用户/u, "未登记仍零权限");
-  assert.equal(argvLog().length, 2);
+  // 票 #6 A：Codex 链共用同一份判据 —— 整条消息没有任何 <at>（真私聊）也按 chat 答，
+  // 不再报「没有真实 @ M5Codex」；未登记的私聊仍然零权限。
+  assert.match(run("在吗", TEMPLATE.frank_sender_id, {}, { raw: "在吗" }).stdout, /^回答：在吗\n— chat/mu,
+    "Codex 链的私聊落 chat 默认态");
+  assert.match(run("在吗", "4444", {}, { raw: "在吗" }).stdout, /已拒绝 · 发送者不是授权用户/u, "未登记的私聊仍零权限");
+  assert.equal(argvLog().length, 3, "未登记那条不起模型");
   // 多份待绑定 task、没带绑定码：以前是"同时有多个 Codex task 等待绑定，无法确定目标"（截图那条），现在是 chat
   const p1 = makeTaskEntry({ root: path.join(home, "p1"), threadId: THREAD_B, name: "P1", rootMessageId: "om_p1", token: "aaaaaa" });
   const p2 = makeTaskEntry({ root: path.join(home, "p2"), threadId: "01922222-3333-7444-8555-000000000077", name: "P2", rootMessageId: "om_p2", token: "bbbbbb" });
@@ -9318,7 +9324,7 @@ test("Codex 链的 chat 默认态：未绑定会话（群 @ 或私聊）不再�
   assert.match(run("$feishu-bind", TEMPLATE.frank_sender_id).stdout, /这个话题还没接入任何本机项目。接入要在终端里/u);
   assert.match(run("$feishu-unbind", TEMPLATE.frank_sender_id).stdout, /已拒绝 · 这个命令不从飞书开放/u);
   assert.match(run("$feishu-status", TEMPLATE.frank_sender_id).stdout, /\$feishu-status 在这里无从执行/u);
-  assert.equal(argvLog().length, 3, "命令与拒绝都不起模型");
+  assert.equal(argvLog().length, 4, "命令与拒绝都不起模型（4 = 首条 + participant + 未配对前的私聊 + 多份待绑定那条）");
   // Codex 链的 chat 前置：本机 claude CLI 不可用 → 明确报 chat_reply_path_unavailable，不冒充可用
   const noClaude = path.join(home, "bin-noclaude"); fs.mkdirSync(noClaude); fs.copyFileSync(path.join(bin, "aily-cli"), path.join(noClaude, "aily-cli")); fs.chmodSync(path.join(noClaude, "aily-cli"), 0o700);
   const unavailable = run("在吗", TEMPLATE.frank_sender_id, { PATH: noClaude + path.delimiter + path.dirname(process.execPath) + path.delimiter + "/usr/bin:/bin" });

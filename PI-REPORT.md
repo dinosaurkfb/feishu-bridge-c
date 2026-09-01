@@ -1,49 +1,62 @@
-# 票 #6 断点留档（2026-08-31，上下文将满，自动压缩连续两次失败）
+# 票 #6 交付：私聊不再当「@ 没打」；未配对的一轮把答复单发
 
-读者是**全新会话的我**。仓库 `/Users/dk/claude-projects/feishu-bridge-pi-qwen`，分支 `pi-qwen/p2p-chat`，
-基线 `09fe7c4`（origin/main）。已提交并推送 WIP：`466e260`。**未开 PR、未 merge、未 --apply。**
-`PI-TASK.md` 保持未跟踪。
+分支 `pi-qwen/p2p-chat`（基线 origin/main `09fe7c4`）。**未开 PR、未 merge、未 --apply、未碰真运行时。**
 
-## 现在的确切状态：套件红 5 条（`node scripts/test.mjs` → 通过 733 / 失败 5；上一轮是 6，shared-surface 快照已 --update 掉一条）
+## 结论先说
 
-```bash
-cd /Users/dk/claude-projects/feishu-bridge-pi-qwen
-node scripts/test.mjs            # 支持 TEST_FILTER=<测试名子串> 定向跑，TEST_TRACE=1 打完整栈
-```
+线上两个现象都修了，两套全量套件全绿：
 
-## 已确认的结论（都带 file:line，别再重查）
+- Claude：`通过 739 / 失败 0`
+- Codex：`Codex adapter 通过 269 / 失败 0`
+- `node scripts/shared-surface.mjs` → 与快照一致（多了一个导出 `isP2pMessage`，两条链共用，已 `--update`）
+- `node scripts/install-outbound.mjs` → dry-run，什么都没写
+- `git diff --check` → 干净
 
-**A：入站里没有可信的 `chat_type`，所以私聊只能反推。**
-- 事件视图只有五个字段 `message_id / session_id / sender_id / created_at_ms / content`（`scripts/envelope.mjs` 的 `attemptFetch`）。
-- Canonical v1 的 `source.chat_id` 恒为 `null`；`AILY_CLI_CHANNEL_CHAT_ID` 带 `verified:false`，源码注释写着「selector 不能把它们当作授权或路由事实」（`scripts/canonical-event.mjs:107-115`）。probe 文档：`docs/implementation/dialogue-chat-scope-probe.md`。
-- 分发层文档事实：「把智能体拉进群、在群里 @ 它**或私聊它**，平台投 `im.message.receive`」，同一行还写着「**不核对群 id**（envelope 的 chat_id 仍标未核验）」（`docs/architecture/layers-modes-permissions.md:20`）。
-- ⇒ 采用的判据：**整条消息没有任何 `<at>` mention = 私聊形状**（`isP2pMessage`，用 `scripts/selector.mjs:36 extractMentionIds`）。有 mention 就不算私聊，群闸一个不变。代价如实记：手打的 `@名字`（无标签）也算零 mention。
-- 线上 P2P 的两条拒绝都来自 @ 闸（回执只有 `rejected · transport_not_mentioned` 两行，`outbound.mjs:130` 的「（未认领。原因：…）」是**已绑定**分支才加）：`scripts/inbound-route.mjs:237`（promotion）与 `:380`（chat 闸）。两条链路共用这两个函数：`scripts/inbound.mjs:206-208,212`、`scripts/codex/inbound.mjs:287`。
+改动落在**两条链共用的判据层**，所以 Claude / Codex 一次同时生效。
 
-**B：`turn_record_not_found` 才是「没有成对输入」。**
-- `scripts/turn-input.mjs:101-107` 四态分明：`not_found / unreadable / invalid_cache / consumed`。
-- `scripts/init-hook.mjs:91-97`：飞书戳的回合写不下来源记录就 `exit 2` 不让跑 ⇒ 能跑到 Stop 的 `not_found` 只可能是本地会话自己起的一轮。
-- `consumed` 单独保留拒发（`:139-151` 说明「同一轮重入」），未动。
-- `scripts/stop-hook.mjs:303` 注释早就写着「不写输入块 = 单独一行答复」⇒ 答复单发是既有渲染形状，不用改 outbox。
-- 未配对答复没有 eventKey（claimKey/captureId 都不存在）⇒ 走 `outbox.mjs:71-75` 内容指纹去重，同一轮 Stop 重入不会重复发；`targetGenerationId` 取 `bound.mapping.channel_generation_id`（当前代际，与既有「发当前代际」路径同一条表达式）。
+## A：私聊不再走认领评估
 
-## 已改完的代码（在 `466e260` 里）
-- `scripts/inbound-route.mjs`：新增 `PROMOTE_REJECT.P2P_NO_MENTION`（值 `p2p_no_mention`）+ `PROMOTE_REJECT_TEXT` 文案 + `export function isP2pMessage(event)`（放 `PENDING_WINDOW_MS` 之后，注释含全部 file:line 依据）；`evaluatePromotion` 在 @ 闸之前插 P2P 早退；`CHAT_FALLBACK_REASONS` 加入 `P2P_NO_MENTION`；`evaluateChatGates` 的 @ 闸改成 `if (!isP2pMessage(event) && !extractMentionIds(...).includes(transport))`。
-- `scripts/stop-hook.mjs`：`record.reason === "not_found"` ⇒ `turnRoute = { ok: true, kind: "unpaired" }`，其余三种照旧 `turn_record_*` 零入队 + 诊断。
-- `references/shared-surface.json`：`--update`（只多一个 `isP2pMessage` 导出，两条链路共用，是有意的）。
-- `scripts/test.mjs`：改写 `:5207` 那条旧测试 + 新增 `:5227` 「私聊（P2P）不进认领评估…」gate 级测试。**尚未加真入口测试。**
+**没有编造 `chat_type`。** 入站事件里压根没有这个字段，依据：
 
-## 5 条红：逐条该怎么收（下一步计划）
+- 事件视图只有五个字段 `message_id / session_id / sender_id / created_at_ms / content`（`scripts/envelope.mjs` 的 `attemptFetch`）
+- Canonical v1 的 `source.chat_id` 恒为 `null`；`AILY_CLI_CHANNEL_CHAT_ID` 带 `verified:false`，源码注释明写「selector 不能把它们当作授权或路由事实」（`scripts/canonical-event.mjs:107-115`）；要不要提升它们是 `docs/implementation/dialogue-chat-scope-probe.md` 在收的证据，还没定论
+- 分发层文档事实：「把智能体拉进群、在群里 @ 它**或私聊它**，平台投 `im.message.receive`」，同一行还写着「**不核对群 id**（envelope 的 chat_id 仍标未核验）」（`docs/architecture/layers-modes-permissions.md:20`）
 
-1. `test.mjs:5214`（我新写的）：`"@T 干活"` 期望 `transport_not_mentioned`，实际 `p2p_no_mention`。⇒ **我的断言错了**：手打 @ 无标签 = 零 mention = 私聊形状。把 `"@T 干活"` 从「有 mention」那组挪到「零 mention」那组，文案里点明这个取舍。
-2. `test.mjs:5252`（我新写的）：私聊 + 旧消息，期望 `stale_message`，实际 `p2p_no_mention`。原因是 `evaluatePromotion` 顺序：模板 → sender → **P2P** → @ → 新鲜度（`:233-245`）。⇒ **建议把 P2P 早退挪到新鲜度判定之后**（防重放是更基本的性质，旧消息连形状都不该参与判定；chat 侧 `:382-384` 本来就 P2P 让路在 @ 闸、但新鲜度在后，两条一致）。改完这条断言即绿，别反过来弱化测试。
-3. `test.mjs:18031`：`assert.equal(replies().length, 2, "没有缓存的用户输入时仍零入队（不重复投递，也不单发答复）")` + `:18032` 诊断断言。⇒ **这是要改掉旧行为的断言**，按 Frank 批准的例外改成：`replies().length === 3`、卡片含答复正文、**不含**「本轮用户输入」块、`target_generation` 为当前代际 `gen_active`、`diags()` 不再新增。同步改标题与 `:18029` 上方注释（`scripts/test.mjs:18006-18032` 那段说明写的是旧合同）。
-4. `test.mjs:18176`（Dialogue 模式那条）：`AssertionError: 策略状态无效、又没有本轮来源记录 → 零入队`。⇒ **别急着改断言，先读上下文** `scripts/test.mjs:18127-18180`：这条是「control 策略不可读 + 本轮无来源记录」。要判的是：策略说不清时，是否允许一个未配对 Stop 发出去。我倾向**继续零入队**（策略说不清 = 连"该不该转发"都没依据），若如此，修法是在 stop-hook 把「策略无效」也挡在 unpaired 之前（`policyCheck.state !== "ok"` 时不走 unpaired），并在测试标题里写明这是例外 1 的边界。⚠ 这是唯一一处规格没覆盖的判断，改完要在 PI-REPORT 里写清选择与理由。
-5. `test.mjs:20047`：`evaluateChatGates(ev("333","hi 没有 @")).reason === "transport_not_mentioned"`。⇒ 这是**规格明令不许变**的那条（participant 在没 @ 本链路的消息里仍被拒）。它现在红是因为该 fixture 的 content 零 mention ⇒ 落进私聊分支。修法：把 fixture 内容改成**带别人的 `<at>`**（`<at id="ou_other">别人</at> hi`），保持"participant 被 @ 闸挡住"的原意；不许把断言改成 ok。
+**采用的判据**：整条消息**没有任何 `<at>` mention** = 私聊形状。群消息要 @ 才投得过来，所以零 mention 还能到本链路的只剩私聊。
 
-## 还欠的交付
-- A 真入口测试：Claude 链（可仿 `test.mjs:20028` 那条 `run()`，加 `mention:false` 参数造无 @ 信封）+ Codex 链（`scripts/codex/test.mjs:9295` 的 `run`）。要断言：未绑定项目带着 pending 也不被私聊绑上（registry 里 `inbound_state` 仍是 pending、`session_id` 仍空）+ 走 chat 零工具回答；群路径回归（@ 运输 agent 才 promotion、@ 别人仍拒）。
-- B 回归：`unreadable` / `invalid_cache` / `consumed` / claim 三态 / `origin_unresolvable` 仍零入队（现有一部分覆盖，缺 `unreadable`、`invalid_cache` 与「不污染后续本地回合」）。
-- Codex 链：`scripts/codex/test.mjs` 加至少一条（两条链路共用 `evaluatePromotion`/`evaluateChatGates`/`CHAT_FALLBACK_REASONS`，所以共用测试本身已覆盖判据；入口各一条最省）。
-- 收尾门禁：`node scripts/test.mjs` 全绿、`node scripts/codex/test.mjs` 全绿、`node scripts/shared-surface.mjs` 一致、`git diff --check` 干净；commit message 中文、结尾 `Co-Authored-By: pi <noreply@pi.dev>`；push；**不开 PR**（评审交 Codex）。
-- 真实机器验证只能证明「P2P 消息没有任何 `<at>` mention」；`isP2pMessage` 的可靠性最终要靠 Frank 在真机发一条私聊再跑 `node scripts/layered-status.mjs --json` 看 chat 计数。报告里如实写这点。
+实现（`scripts/inbound-route.mjs`）：
+
+- 新增 `export function isP2pMessage(event)`（注释里带上面全部 file:line 依据）
+- 新增 `PROMOTE_REJECT.P2P_NO_MENTION = "p2p_no_mention"` + 回执文案
+- `evaluatePromotion`：模板 → 发送者 → **新鲜度** → 私聊 → @ 闸。私聊在 @ 闸之前早退，防重放仍排在形状判定之前
+- `CHAT_FALLBACK_REASONS` 加入 `p2p_no_mention` → 私聊落进 chat 默认态重判
+- `evaluateChatGates`：@ 闸只对「有 mention 的」生效（`!isP2pMessage(event) && !mentions(transport)`）
+
+**群行为一个不变**：只要消息里出现了 mention，仍然必须 @ 到本链路运输 agent，否则照旧 `transport_not_mentioned`，且它**不**进 chat 兜底。未登记发送者、超龄消息照旧拒（角色表、新鲜度都排在形状判定之前）。
+
+**如实记下的取舍**：判据靠的是 mention 结构，不是会话类型。所以群里一条完全没打 @ 的消息（按文档它本来投不过来）如果哪天真投过来了，会被当私聊形状落到 chat —— 仍然是三道闸 + 零工具，拿不到绑定能力，不会绑错位。另一个已知边角：手打的 `@名字`（无标签）算零 mention，同样落 chat。
+
+## B：未配对的一轮把答复单发
+
+`scripts/stop-hook.mjs`：`readTurnRecord` 返回 `not_found` ⇒ `turnRoute = { ok: true, kind: "unpaired" }` —— 入队一条**不带用户输入块**的答复，目标取当前代际（没有冻结 origin 可取），不留 `unrouted-replies` 诊断，不消费任何记录。
+
+`unreadable` / `invalid_cache` / `consumed` 以及 claim 三态、`origin_unresolvable` **照旧零入队 + 留诊断**。理由是有不变量兜着：`scripts/init-hook.mjs:91-97` 对每个获准执行的 prompt 都必须写下自己的来源，飞书回合写不下就 `exit 2` 不让跑 —— 能跑到 Stop 的 `not_found` 只可能是本地会话自己起的一轮；而「写得出读不回」那几种可能正藏着一个飞书回合的来源，退回当前代际等于发错话题。
+
+**规格没覆盖、我做了判断的一处**：Dialogue 模式下策略状态（interaction policy）读不出或不合法时，"这一轮是不是飞书驱动的"本身就说不清。这时 `not_found` **不许**当成未配对单发 —— `stop-hook.mjs:222-224` 加了 `policy_state_unreadable` 分支退回零入队 + 留诊断。对应测试：`scripts/test.mjs:18203`（断言消息已改写成「说不清就不许单发」，仍要求零入队 + 留下那一份诊断）。
+
+未配对答复没有 eventKey（既无 claimKey 也无 captureId），走 `outbox.mjs:71-75` 的内容指纹判重 ⇒ 同一轮 Stop 重入不会重复发；代价是两轮内容完全相同的未配对答复只会发一条，这点和旧的本地无键入队行为一致。
+
+## 测试（都是行为断言，不是形状断言）
+
+`scripts/test.mjs`：
+
+1. `:5208` 改写：`<at id="ou_other">` 有 mention 却没 @ 本链路 → `transport_not_mentioned` 且不进 chat 兜底；零 mention 的三种写法 → `p2p_no_mention`
+2. `:5229` 新增 gate 级：`isP2pMessage` 四种输入逐一钉住；带 pending、正文里写满绑定码 + 引用块 → 仍不绑（`r.ok === false`、`r.id` 为空）；同一 pending 带上真实 @ 仍能认（群路径回归）；未登记 / 超龄排在形状之前；chat 三道闸在私聊下 role 判对、未登记仍拒、超龄仍拒、@ 别人仍拒
+3. `:20055` 那条真入口测试尾部（`:20541` 起）追加（Claude 链）：登记表里放着 `inbound_state: "pending"` + `pending_token: "abc123"`，私聊发「接入项目 abc123」→ stdout 是 chat 回答、`mode: "chat"`、零工具参数，**registry 里那条仍是 pending、session_id 仍为空**；群里 @ 别人 → `已拒绝 … 没有真实 @ 本链路的运输 agent` 且不起模型；未登记的私聊 → 零权限、不起模型
+4. :17970` 改掉旧断言 + 扩充：`not_found` → 入队 1 条、目标为当前代际、卡片 `input_text === null`、诊断条数不变；紧接着的正常本地回合仍成对发出；`consumed` 重入零入队且不冒充诊断；`invalid_cache` 零入队并留 `turn_record_invalid_cache`；`unreadable` 零入队
+
+`scripts/codex/test.mjs`：`:9313` 起加真入口两条 —— Codex 链的零 mention 私聊落 chat（`回答：在吗\n— chat`）、未登记的私聊仍零权限；并把一处绝对起模型次数改成与新基线对齐。
+
+## 只能真机再确认的一件事
+
+`isP2pMessage` 的前提是「群消息没有 @ 就不会投给 agent」。这条写在文档里、也符合线上现象（真机私聊的 envelope 里确实没有 `<at>`，所以才会报 `transport_not_mentioned`），但我没有平台侧的投递日志可查。请 Frank 在真机私聊发一句「在吗」，然后跑 `node scripts/layered-status.mjs --json` 看 chat 计数是否 +1、话题里是否收到单发答复；这条一旦不符，判据要换成平台侧 chat_type（那需要 envelope 先带上来）。

@@ -5207,15 +5207,17 @@ test("不是 Frank 发的 → 拒（绑定前这道闸就在）", () => {
 
 test("消息里出现了 mention 但不是本链路运输 agent → 拒；完全没 mention 是私聊形状，不拿「@ 没打」说事", () => {
   const f = routeFixture([{ id: "a", extra: {} }]);
-  // 有 mention 就必须 @ 到运输 agent：手打的 @名字 不算（没标签），@ 别人也不算
-  for (const content of ["@T 干活", '<at id="ou_other">别人</at> 干活']) {
+  // 有 mention 标签但不是本链路运输 agent → 仍是「@ 没打」：手打的 @名字 不算 mention
+  for (const content of ['<at id="ou_other">别人</at> 干活', '@T 干活 <at id="ou_other">别人</at>']) {
     const r = evaluatePromotion({
       event: { ...okEvent, content }, template: TPL, pending: pendingOf(f), now: NOW2 });
     assert.equal(r.reason, PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED, content);
-    assert.equal(CHAT_FALLBACK_REASONS.includes(r.reason), false, content + "：群里的「@ 没打」不进 chat 兑底（照旧是拒）");
+    assert.equal(CHAT_FALLBACK_REASONS.includes(r.reason), false, content + "：群里的「@ 没打」不进 chat 兜底（照旧是拒）");
   }
-  // 整条消息一个 mention 都没有 → 私聊：不再冒充「没有真实 @」
-  for (const content of ["随便说说", "今天几号"]) {
+  // 整条消息一个 mention 都没有 → 私聊：不再冒充「没有真实 @」。
+  // 取舍如实记在文案里：手打的 @名字 没有标签，也算零 mention —— 群里真要说「@T 干活」
+  // 而没点选人，会被当成私聊形状落到 chat（仍然三道闸、仍然零工具），不会拿到绑定能力。
+  for (const content of ["随便说说", "今天几号", "@T 干活"]) {
     const r = evaluatePromotion({
       event: { ...okEvent, content }, template: TPL, pending: pendingOf(f), now: NOW2 });
     assert.equal(r.reason, PROMOTE_REJECT.P2P_NO_MENTION, content);
@@ -17965,7 +17967,7 @@ test("generationForSession：active / read-only 都算，pending 没 session、r
   assert.equal(activeGenerationForSession(st, "session_old"), null, "只认 active 的那个查询保持原义");
 });
 
-test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结的 origin（老话题）；本地回合和反查不到 claim 的回合仍发当前代际", () => {
+test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结的 origin（老话题）；本地回合与未配对的一轮发当前代际，反查不到 claim / 记录损坏的回合仍零入队", () => {
   const fx = rotatedRegistryFixture();
   const env = { ...process.env, FEISHU_BRIDGE_REGISTRY: fx.registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: fx.templateFile, HOME: fx.local };
   const initHook = path.join(path.resolve("scripts"), "init-hook.mjs");
@@ -18020,22 +18022,47 @@ test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结�
   assert.deepEqual(diags().map((d) => d.reason), ["claim_absent", "origin_unresolvable"]);
   assert.equal(diags()[1].origin_channel_generation_id, foreign);
 
-  // 记录损坏 / 缺席：同样零入队 + 诊断
+  // 记录**损坏**（写得出读不回）：照旧零入队 + 留诊断 —— 那里可能藏着一个飞书回合的来源
   const recordFile = readTurnRecord({ dir: claudeTurnInputDir(fx.root, null), key: session }).file;
   fs.writeFileSync(recordFile, "{not json");
   assert.equal(stop("记录损坏时的回复").status, 0);
-  assert.equal(replies().length, 2);
+  assert.equal(replies().length, 2, "turn_record_unreadable 仍零入队（不退回当前代际）");
   assert.equal(diags().at(-1).reason, "turn_record_unreadable");
+  // 记录**压根没写过**（not_found）：init-hook 对每一个获准执行的 prompt 都要写下自己的来源，
+  // 飞书回合写不下就直接 exit 2 不让跑 —— 能走到这里的 not_found 只可能是本地会话里自己起的一轮
+  //（回合中途的 Stop、续跑、压缩后补一轮）。按 2026-08-31 Frank 批准的例外：没成对输入就把答复单发。
   fs.rmSync(recordFile, { force: true });
+  const diagBeforeUnpaired = diags().length;
   assert.equal(stop("记录缺席时的回复").status, 0);
-  assert.equal(replies().length, 2);
-  assert.equal(diags().at(-1).reason, "turn_record_not_found");
+  assert.equal(replies().length, 3, "not_found = 未配对的一轮 → 答复单发（票 #6 B）");
+  assert.equal(targetOf("记录缺席时的回复"), fx.newGen.channel_generation_id, "没有冻结的来源 → 发当前代际");
+  assert.equal(replies().find((r) => r.text === "记录缺席时的回复").input_text, null, "没有成对输入 → 卡片里不伪造用户输入块");
+  assert.equal(diags().length, diagBeforeUnpaired, "单发不是「说不清去向」，不再留 unrouted-replies 诊断");
+
+  // 未配对那一轮不消费、也不污染后续：紧接着的正常本地回合仍成对发出
+  assert.equal(prompt("未配对之后本地敲的一句").status, 0);
+  assert.equal(stop("未配对之后的本地回复").status, 0);
+  assert.equal(replies().length, 4);
+  assert.equal(targetOf("未配对之后的本地回复"), fx.newGen.channel_generation_id);
+  assert.match(replies().find((r) => r.text === "未配对之后的本地回复").input_text, /未配对之后本地敲的一句/u,
+    "正常本地回合照样带上成对输入 —— 例外只吃掉了没记录的那一轮");
+  // 同一轮重入（记录已消费）→ 照旧零入队：not_found 的例外不许顺手把幂等闸拆了
+  assert.equal(stop("未配对之后的本地回复").status, 0);
+  assert.equal(replies().length, 4, "consumed 仍零入队（同一轮重入不重发）");
+  assert.equal(diags().map((d) => d.reason).includes("turn_record_consumed"), false, "consumed 走幂等日志，不留诊断");
+  // 缓存读得回来但形状不认识 → 也照旧零入队
+  const back = readTurnRecord({ dir: claudeTurnInputDir(fx.root, null), key: session });
+  fs.writeFileSync(back.file, JSON.stringify({ unexpected: 1 }));
+  assert.equal(stop("缓存形状不认识时的回复").status, 0);
+  assert.equal(replies().length, 4, "invalid_cache 不算未配对，仍零入队");
+  assert.equal(diags().at(-1).reason, "turn_record_invalid_cache");
 
   // claim 必须是这条绑定、这个会话的：binding 缺失 / 错 binding / 错 session 的 claim 形状合法也不算
   const mkClaim = (messageId, over) => acquireClaim({ claimsDir, messageId, logicalTaskKey: mapping.logical_task_key,
     meta: { session_id: "session_old", binding_id: effectiveBindingId(mapping, { root: fx.root }), claude_session_id: null,
       policy_id: MAPPING_POLICY_ID, policy_version: MAPPING_POLICY_VERSION, local_target_id: "local_target_x",
       origin_channel_generation_id: fx.oldGen.channel_generation_id, ...over } });
+  const queued = replies().length;   // 前面各分支留下几条，这一节只查"有没有多出发来的一条"
   const cases = [
     ["msg_wrong_binding", { binding_id: "someone-else@registry" }],
     ["msg_wrong_session", { claude_session_id: "0f1e2d3c-4b5a-4978-8f6e-5d4c3b2a1908" }],
@@ -18045,7 +18072,7 @@ test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结�
     assert.equal(mkClaim(mid, over).ok, true, mid);
     assert.equal(prompt("[飞书 · " + mid + " · 2026-08-28 10:08Z]\n身份对不上的 claim").status, 0);
     assert.equal(stop("身份对不上时的回复 " + mid).status, 0);
-    assert.equal(replies().length, 2, mid + "：claim 身份对不上 → 零入队");
+    assert.equal(replies().length, queued, mid + "：claim 身份对不上 → 零入队");
     assert.equal(diags().at(-1).reason, "claim_unreadable", mid + "：" + JSON.stringify(diags().at(-1)));
     assert.match(String(diags().at(-1).why), /binding|session/u, mid);
   }
@@ -18173,7 +18200,7 @@ test("老话题的指令（Dialogue 模式）：回合的 origin 是老代际，
   const r2 = spawnSync(process.execPath, [stopHook], { input: JSON.stringify({ session_id: session, cwd: fx.root, last_assistant_message: "origin 被抹掉的回合" }), encoding: "utf-8", env: { ...env, HOME: fx.local } });
   assert.equal(r2.status, 0, r2.stderr);
   const after = listPending({ outboxDir: outboxDirOf(fx.root) }).filter((x) => x.kind === "reply");
-  assert.equal(after.length, 1, "策略状态无效、又没有本轮来源记录 → 零入队");
+  assert.equal(after.length, 1, "策略状态无效、又没有本轮来源记录 → 说不清就不许单发（票 #6 B 例外的边界）");
   const unrouted = path.join(fx.root, ".runtime-data", "outbound", "unrouted-replies");
   assert.equal(fs.readdirSync(unrouted).length, 1);
 });
@@ -20044,7 +20071,12 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   const at = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> ";
   assert.deepEqual([evaluateChatGates({ event: ev(TPL.frank_sender_id, at + "hi"), template: tplWithRoles }).role, evaluateChatGates({ event: ev("333", at + "hi"), template: tplWithRoles }).role], ["owner", "participant"]);
   assert.equal(evaluateChatGates({ event: ev("444", at + "hi"), template: tplWithRoles }).reason, "sender_not_frank", "未登记仍零权限");
-  assert.equal(evaluateChatGates({ event: ev("333", "hi 没有 @"), template: tplWithRoles }).reason, "transport_not_mentioned");
+  // 「participant 没 @ 本链路就进不来」管的是**群**：有 mention 就必须 @ 到运输 agent。
+  // 零 mention 是私聊形状，票 #6 A 之后它落进 chat —— 所以这条的耐久形状是「@ 了别人」，不是「没 @」。
+  assert.equal(evaluateChatGates({ event: ev("333", '<at id="ou_other">别人</at> hi'), template: tplWithRoles }).reason,
+    "transport_not_mentioned");
+  assert.equal(evaluateChatGates({ event: ev("333", "hi 整条没有 @ 标签"), template: tplWithRoles }).ok, true,
+    "私聊里的 participant 按 chat 答（这正是线上要修的那条）");
   assert.equal(evaluateChatGates({ event: ev("333", at + "hi", TPL.default_freshness_ms + 1000), template: tplWithRoles }).reason, "stale_message");
   assert.equal(evaluateChatGates({ event: ev("333", at + "hi"), template: { ...tplWithRoles, transport_open_id: 7 } }).reason, "malformed_template");
   assert.ok(CHAT_FALLBACK_REASONS.includes("no_pending_binding") && CHAT_FALLBACK_REASONS.includes("multiple_pending_bindings") && CHAT_FALLBACK_REASONS.includes("sender_not_frank") && !CHAT_FALLBACK_REASONS.includes("transport_not_mentioned") && !CHAT_FALLBACK_REASONS.includes("stale_message"));
@@ -20068,9 +20100,10 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
   const argvLog = () => (fs.existsSync(claudeLog) ? fs.readFileSync(claudeLog, "utf-8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
   let seq = 0;
-  const run = (body, sender, extraEnv = {}, extraArgs = []) => {
+  // { raw } = 整条消息自带形状（私聊那一条要真的没有 <at>，@ 别人那一条要真的没 @ 本链路）
+  const run = (body, sender, extraEnv = {}, extraArgs = [], { raw = null } = {}) => {
     seq += 1;
-    const content = at + body;
+    const content = raw ?? at + body;
     const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_chat_" + seq, sessionID: "aily_dm", role: "user", createdBy: sender, createdAtMs: Date.now(), content } }) }] });
     // dry-run 由分发器自己截住，所以带参数时直接跑 inbound.mjs（同一份环境、同一个假信封）
     const entry = extraArgs.length ? "inbound.mjs" : "aily-inbound.mjs";
@@ -20504,6 +20537,33 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   fs.symlinkSync(path.join(local, "elsewhere-dir"), path.join(ledgerDir, "tmp"));
   assert.deepEqual(chatLoad({ ledgerDir, senderId: "x", budgetMs: 5000 }).why, ["认不出的条目 tmp"], "没有 scratch 子目录这回事：顶层 tmp 是认不出");
   fs.unlinkSync(path.join(ledgerDir, "tmp"));
+
+  // ── 票 #6 A（真入口）：私聊不再走认领评估。判据是「整条消息没有任何 <at>」，
+  // 而入站事件里没有 chat_type 可看（依据逐条写在 inbound-route.mjs 的 isP2pMessage 注释里）。
+  // 登记表里放一份**待绑定**：私聊既不许认它，也不许把它判成失败。
+  writeRegistry([bound, { id: "pending", root, name: "等待接入", root_message_id: "om_pending",
+    expires_at: "2099-01-01T00:00:00Z", inbound_state: "pending", bound_at: new Date().toISOString(),
+    pending_token: "abc123" }]);
+  const beforeP2p = argvLog().length;
+  const p2p = run("接入项目 abc123", TPL.frank_sender_id, {}, [], { raw: "接入项目 abc123" });
+  assert.equal(p2p.status, 0, p2p.stdout + p2p.stderr);
+  assert.match(p2p.stdout, /^回答：接入项目 abc123\n— chat/mu, "私聊带着绑定码也只按 chat 答：" + p2p.stdout);
+  assert.doesNotMatch(p2p.stdout, /已拒绝|没有真实 @/u, "私聊不再冒充「@ 没打」");
+  const regP2p = JSON.parse(fs.readFileSync(registryFile, "utf-8")).projects.find((x) => x.id === "pending");
+  assert.deepEqual([regP2p.inbound_state, regP2p.session_id ?? null], ["pending", null],
+    "私聊不绑定位：待绑定留着等群里那一下真实 @");
+  assert.equal(JSON.parse(p2p.stderr.trim().split("\n").at(-1)).mode, "chat");
+  // 私聊这条路仍然零工具（起的是 chat 回合，不是认领/绑定回合）
+  const p2pArgv = argvLog().slice(beforeP2p);
+  assert.equal(p2pArgv.length, 1, "私聊按 chat 起一轮零工具回合");
+  assert.deepEqual(p2pArgv[0].slice(4), [...CHAT_REPLY_ARGS], "私聊不因为换了形状就拿到工具");
+  // 群行为一个不变：有 mention 但 @ 的是别人 → 照旧拒，且不落 chat、不起模型
+  const grp = run("在吗", TPL.frank_sender_id, {}, [], { raw: '<at id="ou_other">别人</at> 在吗' });
+  assert.match(grp.stdout, /已拒绝[\s\S]*没有真实 @ 本链路的运输 agent/u, grp.stdout + grp.stderr);
+  assert.equal(argvLog().length, beforeP2p + 1, "群里 @ 别人不起模型");
+  // 未登记的私聊照旧零权限（角色表排在形状判定之前）
+  assert.match(run("在吗", "444", {}, [], { raw: "在吗" }).stdout, /已拒绝 · 发送者不是授权用户/u);
+  assert.equal(argvLog().length, beforeP2p + 1, "未登记的私聊仍不起模型");
   fs.mkdirSync(path.join(ledgerDir, "admission.lock.reap.quarantine-12345678-1234-1234-1234-123456789abc"));
   assert.match(inspectAdmissionLocks({ ledgerDir }).problems.join(" "), /^隔离路径上说不清的东西（不动，请人工查看）：.*quarantine-12345678/u, "隔离路径按锁协议的 recognized 判");
   fs.rmdirSync(path.join(ledgerDir, "admission.lock.reap.quarantine-12345678-1234-1234-1234-123456789abc"));

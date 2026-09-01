@@ -220,7 +220,7 @@ import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatu
 import { acquireOperationLease, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, journalProblem, readActive, readJournal, releaseOperationLease, updateJournal } from "./maintenance/journal.mjs";
 import { commitForInstall, finishInstallReopening, liveBaseline, stageForInstall, stagedChecks, stagedPlanProblem, verifyLiveForInstall, verifyStagedForInstall } from "./maintenance/maintenance-install-core.mjs";
 import { parseMaintenanceInstallArgs, runMaintenanceInstall } from "./maintenance-install.mjs";
-import { acquireInstallSurfaceLock } from "./install-surface-lock.mjs";
+import { acquireInstallSurfaceLock, inspectInstallSurfaceLock } from "./install-surface-lock.mjs";
 import { analyzeCommandRefs, harvestAbsolutePaths, refsUnderRoots, tokenizeCommand, tokenizeCommandStrict } from "./maintenance/command-refs.mjs";
 import { inspectMaintenanceDir } from "./maintenance/journal.mjs";
 import { buildStubVersion, removeStubVersion, renderStubScript, stubCategory, stubRelTarget } from "./maintenance/stub.mjs";
@@ -21498,13 +21498,43 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
     assert.deepEqual([codeR2, /安装面锁交不还/u.test(outR2.join("\n"))], [3, true], outR2.join("\n"));
     fs.unlinkSync(surfaceLockFile + ".reap");
     assert.equal(removeGate({ file: gateFile, token: "33333333-3333-4333-8333-333333333333" }).ok, true);
-    // ── 安装面锁的只读盘点（--status / doctor 同源）：残骸点名并指路
-    fs.symlinkSync("junk", surfaceLockFile + ".reap");
+    // ── 安装面锁的只读盘点（--status / doctor 同源）：封闭、fail-closed（评审的六个探针逐个收编）
+    const mkOwner = (o) => JSON.stringify(o);
+    fs.symlinkSync(mkOwner({ pid: process.pid, at: new Date().toISOString() }), surfaceLockFile);
+    assert.equal(maintenanceStatus(ctx).surfaceLock.holder.state, "unknown", "缺 token 不算 held");
+    fs.unlinkSync(surfaceLockFile);
+    fs.symlinkSync(mkOwner({ pid: process.pid, at: new Date().toISOString(), token: ["x"] }), surfaceLockFile);
+    assert.equal(maintenanceStatus(ctx).surfaceLock.holder.state, "unknown", "数组 token 不算 held");
+    fs.unlinkSync(surfaceLockFile);
+    fs.symlinkSync(mkOwner({ pid: process.pid, at: new Date().toISOString(), token: "t" }), surfaceLockFile + ".reap");
+    fs.symlinkSync("junk", surfaceLockFile + ".reap.quarantine-not-a-uuid");
+    fs.symlinkSync(mkOwner({ pid: 999999999, at: new Date(Date.now() - 120000).toISOString(), token: "t" }), surfaceLockFile + ".maint");
+    const slMix = maintenanceStatus(ctx).surfaceLock;
+    assert.deepEqual([slMix.holder.state, slMix.residues.map((r) => r.kind).sort()], ["absent", ["maint", "unknown"]], "在途 .reap（活 pid、新鲜）不是残骸；假 quarantine 只算 unknown：" + JSON.stringify(slMix.residues));
+    fs.unlinkSync(surfaceLockFile + ".reap"); fs.unlinkSync(surfaceLockFile + ".reap.quarantine-not-a-uuid"); fs.unlinkSync(surfaceLockFile + ".maint");
+    fs.symlinkSync(mkOwner({ pid: 999999999, at: new Date(Date.now() - 120000).toISOString(), token: "t" }), surfaceLockFile + ".reap");
     const stLock = maintenanceStatus(ctx);
     assert.deepEqual([stLock.surfaceLock.holder.state, stLock.surfaceLock.residues.map((r) => r.kind)], ["absent", ["reap"]], JSON.stringify(stLock.surfaceLock));
     assert.match(renderStatus(stLock), /安装面锁/u);
     assert.match(renderStatus(stLock), /repair-publish-lock/u);
     fs.unlinkSync(surfaceLockFile + ".reap");
+    // 枚举失败（除 ENOENT）不折成"没有残骸"
+    const homeEacces = path.join(base, "sl-eacces"); fs.mkdirSync(path.join(homeEacces, ".claude", "feishu-bridge"), { recursive: true });
+    fs.chmodSync(path.join(homeEacces, ".claude", "feishu-bridge"), 0o000);
+    const slE = inspectInstallSurfaceLock({ home: homeEacces });
+    fs.chmodSync(path.join(homeEacces, ".claude", "feishu-bridge"), 0o700);
+    assert.deepEqual([slE.inventory, slE.residues.length > 0], ["unreadable", true], JSON.stringify(slE));
+    // release 的归属（评审探针）：主锁缺席 / 被换主都不算成功 —— 写段独占性无法证明
+    const surfA = acquireInstallSurfaceLock({ home });
+    fs.unlinkSync(surfaceLockFile);
+    const relLost = surfA.release();
+    assert.deepEqual([relLost.ok, /lock_lost/u.test(String(relLost.why))], [false, true], JSON.stringify(relLost));
+    const surfB = acquireInstallSurfaceLock({ home });
+    fs.unlinkSync(surfaceLockFile);
+    fs.symlinkSync(mkOwner({ pid: process.pid, at: new Date().toISOString(), token: "someone-else" }), surfaceLockFile);
+    const relRepl = surfB.release();
+    assert.deepEqual([relRepl.ok, /lock_instance_replaced/u.test(String(relRepl.why))], [false, true], JSON.stringify(relRepl));
+    fs.unlinkSync(surfaceLockFile);
     // ── 参数封闭
     assert.deepEqual([parseMaintenanceInstallArgs([]).ok, parseMaintenanceInstallArgs(["--apply", "--apply"]).ok, parseMaintenanceInstallArgs(["--force"]).ok, parseMaintenanceInstallArgs(["--reason"]).ok, parseMaintenanceInstallArgs(["--wait-ms", "x"]).ok, parseMaintenanceInstallArgs(["--reason", "r", "--wait-ms", "10", "--apply"])], [true, false, false, false, false, { ok: true, reason: "r", waitMs: 10, apply: true }]);
   } finally {

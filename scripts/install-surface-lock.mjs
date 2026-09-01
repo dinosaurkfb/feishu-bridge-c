@@ -51,7 +51,11 @@ export function acquireInstallSurfaceLock({ home = os.homedir(), env = process.e
           const rel = releasePublishLock(file);
           // .reap 残骸会让后续每个写方 reap_residue：不是"等着被接管"，要 repair-publish-lock 显式清
           if (rel?.reapUncleared) return { ok: false, why: "reap_uncleared：" + String(rel.reapUncleared.error ?? "") + " —— node scripts/repair-publish-lock.mjs --lock " + file + " --apply 能清", path: rel.reapUncleared.path };
-          return rel.ok || rel.reason === "not_owner" ? { ok: true } : { ok: false, why: String(rel.reason) + " —— 主锁残骸由下一个写方按 pid 活性接管，但请人工核对", path: file };
+          // 主锁缺席 / 已换主 = **我持有期间锁丢了**（评审探针：曾被当成功）：写段可能已被并发写方覆盖，必须非零收场
+          if (rel?.ok && rel.absent) return { ok: false, why: "lock_lost：主锁在持有期间已缺席（被删除或回收）—— 本次写段的独占性无法证明，请人工核对安装面", path: file };
+          if (rel?.ok) return { ok: true };
+          if (rel?.reason === "not_owner") return { ok: false, why: "lock_instance_replaced：锁已被别的实例持有（本次持有期间被接管）—— 本次写段的独占性无法证明，请人工核对安装面", path: file };
+          return { ok: false, why: String(rel?.reason ?? "release_failed"), path: file };
         } catch (err) { return { ok: false, why: "release_threw：" + String(err?.code ?? err?.message ?? err), path: file }; }
       },
     };
@@ -78,43 +82,68 @@ export function holdInstallSurfaceLockOrExit({ home = os.homedir(), env = proces
   return got;
 }
 
-// ── 只读盘点（--status / doctor 用）：主锁三态 + 锁家族残骸按封闭名字识别，处置方式各不相同 ──────
+// ── 只读盘点（--status / doctor 用）—— **封闭、fail-closed 的协议投影**（评审探针：缺 token 曾显示 held、
+// 枚举异常曾折成空、任意 quarantine 后缀曾说可 repair、在途 .reap 曾被误报残骸）──────────────────────
 const isCanonicalIso = (s) => typeof s === "string" && !Number.isNaN(Date.parse(s)) && new Date(s).toISOString() === s;
 const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+export const INSTALL_SURFACE_LOCK_STALE_MS = 60 * 1000;
+/** 一个锁位置的三态投影：owner 形状与 registry 锁协议**逐字段同形**（{pid, at, token} 缺一不可）。 */
+function lockSiteState(p, now) {
+  let st;
+  try { st = fs.lstatSync(p); } catch (err) { return err?.code === "ENOENT" ? { state: "absent" } : { state: "unknown", why: "lstat 失败：" + String(err?.code ?? err?.message) }; }
+  if (!st.isSymbolicLink()) return { state: "unknown", why: "不是本协议的 symlink" };
+  let o = null;
+  try { o = JSON.parse(fs.readlinkSync(p)); } catch { o = null; }
+  const shapeOk = o !== null && typeof o === "object" && !Array.isArray(o) && Number.isSafeInteger(o.pid) && o.pid > 0 && isCanonicalIso(o.at) && typeof o.token === "string" && o.token.length > 0;
+  if (!shapeOk) return { state: "unknown", why: "payload 形状不对（owner 必须是 {pid, at, token} 逐字段受验）" };
+  let alive = true;
+  try { process.kill(o.pid, 0); } catch { alive = false; }
+  return { state: "held", pid: o.pid, alive, at: o.at, ageMs: Math.max(0, now - Date.parse(o.at)) };
+}
 /**
- * @returns {{ holder: {state:"absent"}|{state:"held",pid,alive,at}|{state:"unknown",why}, residues: {path,kind,detail}[] }}
+ * @returns {{ holder, residues: {path,kind,detail}[], inventory: "ok"|"unreadable", path }}
+ *   holder：absent | held{pid,alive,at} | unknown{why}。目录枚举失败（除 ENOENT）→ inventory:"unreadable" 并点名，
+ *   **不折成"没有残骸"**。在途的 .reap / .maint（持有者活着且未超时）不是残骸，不报。
  */
-export function inspectInstallSurfaceLock({ home = os.homedir(), env = process.env } = {}) {
+export function inspectInstallSurfaceLock({ home = os.homedir(), env = process.env, now = Date.now(), staleMs = INSTALL_SURFACE_LOCK_STALE_MS } = {}) {
   const file = installSurfaceLockPath({ home, env });
   const repair = "node scripts/repair-publish-lock.mjs --lock " + file + " --apply 能清";
   const residues = [];
-  let holder = { state: "absent" };
-  let st = null;
-  try { st = fs.lstatSync(file); } catch (err) { if (err?.code !== "ENOENT") holder = { state: "unknown", why: "lstat 失败：" + String(err?.code ?? err?.message) }; }
-  if (st !== null) {
-    if (!st.isSymbolicLink()) holder = { state: "unknown", why: "锁位置上不是本协议的 symlink —— 只人工处置" };
-    else {
-      let owner = null;
-      try { owner = JSON.parse(fs.readlinkSync(file)); } catch { owner = null; }
-      if (!owner || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 || !isCanonicalIso(owner.at ?? "")) holder = { state: "unknown", why: "payload 畸形 —— 只人工处置" };
-      else {
-        let alive = true;
-        try { process.kill(owner.pid, 0); } catch { alive = false; }
-        holder = { state: "held", pid: owner.pid, alive, at: owner.at };
-      }
-    }
+  const raw = lockSiteState(file, now);
+  const holder = raw.state === "held" ? { state: "held", pid: raw.pid, alive: raw.alive, at: raw.at } : raw;
+  let names;
+  try { names = fs.readdirSync(path.dirname(file)); }
+  catch (err) {
+    if (err?.code === "ENOENT") names = [];
+    else return { holder, residues: [{ path: path.dirname(file), kind: "inventory", detail: "目录枚举失败：" + String(err?.code ?? err?.message) + " —— 残骸情况说不清，请人工核对" }], inventory: "unreadable", path: file };
   }
-  let names = [];
-  try { names = fs.readdirSync(path.dirname(file)); } catch { names = []; }
   const base = path.basename(file);
+  const transient = (s) => s.state === "held" && s.alive && s.ageMs <= staleMs; // 在途归属转换 / 维护段，不是残骸
   for (const n of names.sort()) {
     if (n === base || !n.startsWith(base + ".")) continue;
     const full = path.join(path.dirname(file), n);
     const tail = n.slice(base.length);
-    if (tail === ".reap" || tail.startsWith(".reap.quarantine-")) { residues.push({ path: full, kind: "reap", detail: "reap 锁残骸 —— 后续写方一律 reap_residue 被拒；" + repair }); continue; }
-    if (tail === ".maint") { residues.push({ path: full, kind: "maint", detail: "维护锁残骸 —— 不自动恢复，人工确认没有维护者在跑后手动删" }); continue; }
-    if (tail.startsWith(".reaped-") && UUID_SHAPE.test(tail.slice(".reaped-".length))) { residues.push({ path: full, kind: "reaped", detail: "陈旧回收隔离后删不掉的旧锁实例 —— 已离开原路径，人工删即可" }); continue; }
+    if (tail === ".reap") {
+      const s = lockSiteState(full, now);
+      if (transient(s)) continue;
+      residues.push({ path: full, kind: s.state === "held" ? "reap" : "unknown", detail: s.state === "held" ? (s.alive ? "reap 锁被 pid " + s.pid + " 持有已 " + Math.floor(s.ageMs / 1000) + " 秒（段只有几毫秒）" : "reap 锁残骸（回收者 pid " + s.pid + " 已不在）") + " —— 后续写方一律 reap_residue 被拒；" + repair : "reap 位置" + (s.why ?? "形状不对") + " —— 只人工处置" });
+      continue;
+    }
+    if (tail === ".maint") {
+      const s = lockSiteState(full, now);
+      if (transient(s)) continue;
+      residues.push({ path: full, kind: s.state === "held" ? "maint" : "unknown", detail: s.state === "held" ? "维护锁残骸 —— 不自动恢复，人工确认没有维护者在跑后手动删" : "维护锁位置" + (s.why ?? "形状不对") + " —— 只人工处置" });
+      continue;
+    }
+    if (tail.startsWith(".reaped-")) {
+      residues.push(UUID_SHAPE.test(tail.slice(".reaped-".length)) ? { path: full, kind: "reaped", detail: "陈旧回收隔离后删不掉的旧锁实例 —— 已离开原路径，人工删即可" } : { path: full, kind: "unknown", detail: "像 .reaped-<uuid> 但不合形状 —— 只人工处置" });
+      continue;
+    }
+    if (tail.startsWith(".reap.quarantine-")) {
+      residues.push(UUID_SHAPE.test(tail.slice(".reap.quarantine-".length)) ? { path: full, kind: "reap-quarantine", detail: "reap 锁残骸隔离后删不掉 —— " + repair } : { path: full, kind: "unknown", detail: "像 .reap.quarantine-<uuid> 但不合形状 —— 只人工处置" });
+      continue;
+    }
     residues.push({ path: full, kind: "unknown", detail: "锁家族里不认识的制品 —— 只人工处置" });
   }
-  return { holder, residues, path: file };
+  return { holder, residues, inventory: "ok", path: file };
 }

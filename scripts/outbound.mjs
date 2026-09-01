@@ -22,6 +22,7 @@ import { execFileSync } from "node:child_process";
 import { parseRunOutcome, readRunOutcome } from "./handoff.mjs";
 import { isDirectRun, moduleRoot } from "./direct-run.mjs";
 import { gateBlocks } from "./maintenance-gate-core.mjs";
+import { readRegularFile } from "./installed-surface.mjs";
 
 const PUBLISHED_MARK = ".published.json";
 export const RUN_PUBLISH_MAX_ATTEMPTS = 5;
@@ -265,15 +266,23 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
         // 唯一登记的遗留形状（issue #86）：名字对上才进这里，长得像的变体进不去（落到 unrecognized_entry）。
         // 写方不在仓库历史里，字段集不可考 —— 不猜字段、不解读内容、不参与孤儿判定、绝不被自动动；
         // 账本只把它如实报给人，内容读得出读不出也说清，处置方式给到人。
+        // 内容那一眼必须是 **fd 绑定读**（评审探针：readFileSync 会跟符号链接越出目录边界、会被 FIFO 永久挂死）：
+        // O_NOFOLLOW | O_NONBLOCK 打开、同一 fd fstat 只收单硬链接普通文件 —— 名字合法但不是普通文件的，照样报出来、不阻塞。
+        const r = readRegularFile(path.join(claimsDir, name));
         let contentNote = "";
-        try {
-          const doc = JSON.parse(fs.readFileSync(path.join(claimsDir, name), "utf-8"));
-          if (doc === null || typeof doc !== "object" || Array.isArray(doc)) contentNote = "；内容不是记录对象";
-        } catch (err) { contentNote = "；内容读不出（" + String(err.code ?? "不是 JSON") + "）"; }
+        if (r.status === "absent") contentNote = "；内容读不出（已不在）";
+        else if (r.status === "unreadable") contentNote = "；内容读不出（" + r.why + "）";
+        else {
+          try {
+            const doc = JSON.parse(r.buf.toString("utf-8"));
+            if (doc === null || typeof doc !== "object" || Array.isArray(doc)) contentNote = "；内容不是记录对象";
+          } catch { contentNote = "；内容读不出（不是 JSON）"; }
+        }
         problems.push({
           key: legacy[1],
           reason: "legacy_state",
-          why: "旧版运行时写的投递失败记录（deliver_failed 是历史状态名，不在现受控状态集里，本仓历史里没有写方、字段集不可考，账本不解读内容" + contentNote + "）—— 人工确认内容没有还要用的信息后删除或归档，账本不会自动动它：delivery-claims/" + name.slice(0, 80),
+          // 名字已被封闭正则限死（64 hex + 固定后缀），完整给出 —— 截断的名字对不上"人工删除或归档"的指引（评审探针）。
+          why: "旧版运行时写的投递失败记录（deliver_failed 是历史状态名，不在现受控状态集里，本仓历史里没有写方、字段集不可考，账本不解读内容" + contentNote + "）—— 人工确认内容没有还要用的信息后删除或归档，账本不会自动动它：delivery-claims/" + name,
         });
         continue;
       }

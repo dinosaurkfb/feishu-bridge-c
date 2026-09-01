@@ -125,7 +125,7 @@ export function readControlFailedRecord({ claimsDir, key }) {
 export const CONSUMED_TMP_RE = /^([0-9a-f]{64})\.consumed\.json\.tmp\.\d+\.\d+$/u;
 /** 损坏的 failed 记录被隔离后的名字：受控形状，账本按 control_failed_quarantined 报，人工看完再删。 */
 export const CONTROL_QUARANTINE_RE = /^([0-9a-f]{64})\.(?:failed|rejected)\.quarantined\.\d+\.\d+$/u;
-/** 逐 key 的事务锁（目录，mkdir 原子）：运输层重放、首次执行、维护入口共用同一份所有权。留下没释放的由账本报 control_lock_held。 */
+/** 逐 key 的事务锁（registry.mjs 的 symlink 锁协议，payload 即 owner { pid, at, token }）：运输层重放、首次执行、维护入口共用同一份所有权。留下没释放的由账本报 control_lock_held。 */
 export const CONTROL_LOCK_RE = /^([0-9a-f]{64})\.control\.lock$/u;
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 /**
@@ -133,9 +133,10 @@ const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
  *   lock        主锁（symlink）：正常几毫秒；持有者已死超过 staleMs 会由下一笔按协议回收 —— 不要手删
  *   reap        reap 段锁：段内几毫秒；残骸交显式维护入口 repair-publish-lock --lock <主锁路径>
  *   maint       维护锁：只能由人确认没有维护者在跑后手动删
- *   reaped      回收时 rename 走、没删成的残骸（.reaped-<uuid>）：可直接删
- *   quarantine  维护入口隔离后没删成的残骸（.reap.quarantine-<…>）：可直接删
- * 别的后缀不是家族成员（按 unrecognized_entry 报）。
+ *   reaped      回收时 rename 走、没删成的残骸（.reaped-<uuid>）：**形状合法的 symlink** 可直接删
+ *   quarantine  维护入口隔离后没删成的残骸（.reap.quarantine-<…>）：**形状合法的 symlink** 可直接删（已离开原路径、不涉归属，与 reaped 同理）
+ * 别的后缀不是家族成员（按 unrecognized_entry 报）。残骸两族说"可直接删"前先过 inspectControlLockArtifact 的
+ * 形态判别（与共享维护器 clearStaleReapLock 同一判据，issue #85）—— 名字像不等于协议写出来的。
  */
 const LOCK_FAMILY = [
   ["lock", new RegExp("^([0-9a-f]{64})\\.control\\.lock$", "u")],
@@ -148,6 +149,41 @@ export function classifyControlLockEntry(name) {
   if (typeof name !== "string") return null;
   for (const [family, re] of LOCK_FAMILY) { const m = re.exec(name); if (m) return { key: m[1], family }; }
   return null;
+}
+
+/**
+ * 锁家族制品的**受控形态判别**（唯一一份；与 registry.mjs 的 symlink 锁协议同一形状，issue #85）。
+ * 账本盘点（outbound.mjs inventoryRuns）对 reaped / quarantine 两族用它决定文案：只有形状合法的 symlink
+ * —— payload 是本协议 owner（pid 正安全整数、at 规范化 ISO、token 非空字符串，与 registry.mjs 的
+ * ownerShapeOk / installed-surface.mjs inspectInstalledSurface 的 shapeOk 同一形状）—— 才是协议写出的残骸，
+ * 可以给"可直接删 / repair 能清"；普通文件、目录、payload 畸形一律"先核验再处理 / 只人工处置"，绝不说"可直接删"。
+ * 只有 ENOENT 算"不在"；别的 lstat 错误是 I/O 故障，按 io_error 报出来（评审探针：EACCES 曾被说成 present:false）。
+ * @returns { {present:false} | {present:true, shape:"symlink_owner", owner:object} |
+ *            {present:true, shape:"not_symlink"|"malformed_payload"} | {present:true, shape:"io_error", why:string} }
+ */
+export function inspectControlLockArtifact(fullPath) {
+  let st;
+  try { st = fs.lstatSync(fullPath); }
+  catch (err) {
+    if (err?.code === "ENOENT") return { present: false };
+    return { present: true, shape: "io_error", why: String(err?.code ?? err?.message ?? err) };
+  }
+  if (!st.isSymbolicLink()) return { present: true, shape: "not_symlink" };
+  // readlink 自己的失败也要三态（评审探针：EIO 曾被折成 malformed_payload）：并发消失 → 不在；I/O 错 → io_error；
+  // 只有**读出来了**但 JSON / owner 形状不合法，才是 malformed_payload。
+  let raw;
+  try { raw = fs.readlinkSync(fullPath); }
+  catch (err) {
+    if (err?.code === "ENOENT") return { present: false };
+    return { present: true, shape: "io_error", why: String(err?.code ?? err?.message ?? err) };
+  }
+  let owner = null;
+  try { owner = JSON.parse(raw); } catch { owner = null; }
+  const shapeOk = owner !== null && typeof owner === "object" && !Array.isArray(owner)
+    && Number.isSafeInteger(owner.pid) && owner.pid > 0
+    && isCanonicalIso(owner.at)
+    && typeof owner.token === "string" && owner.token.length > 0;
+  return shapeOk ? { present: true, shape: "symlink_owner", owner } : { present: true, shape: "malformed_payload" };
 }
 const CONTROL_LOCK_SUFFIX = ".control.lock";
 

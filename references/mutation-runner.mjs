@@ -21,27 +21,31 @@
  * 不会被静默判成存活，会被判成异常。真要覆盖 codex 套件时给表加 `suite` 字段，别在这儿预留。
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { isDirectRun, moduleDir } from "../scripts/direct-run.mjs";
 
-const ROOT = path.resolve(moduleDir(import.meta.url), "..");
+// --root 覆盖（--jobs 的子进程在临时 worktree 里跑；默认 = 本仓根）
+let ROOT = path.resolve(moduleDir(import.meta.url), "..");
 const SUITE = path.join("scripts", "test.mjs");
 // 定向跑用短窗，全量用长窗；超时的变异**不许**被当成击杀（超时是红在计时器上）。
 const TARGETED_TIMEOUT_MS = 5 * 60 * 1000;
 const FULL_TIMEOUT_MS = 20 * 60 * 1000;
 
 /**
- * 变异表。`killedBy` 是给 TEST_FILTER 用的**预期击杀测试名子串**（子串匹配、逗号=多个）。
+ * 真实变异表在 references/mutation-table.mjs（m1506+，随收口逐条验证过全红）；默认跑它。
  *
- * 下面三条是示例，各自盯 runner 的一条路径；真实的 48 条由主会话之后迁入。
+ * 下面三条是**示例**（DEMOS），各自盯 runner 的一条路径，只有 --ids 显式点名才会跑
+ *（m-upgrade-full 每跑一次要付一轮全量，混进默认全表会白花两分半）：
  *  - m-anchor-targeted：锚点唯一、killedBy 写对 → 定向 0.4 秒即杀。
  *  - m-upgrade-full：**故意把 killedBy 写成一条无关但会通过的测试** → 定向不红 →
  *    自动升级全量 → 全量转红 → 记 KILLED（升级）。这条存在的意义就是证明升级这一步真的会发生。
  *  - m-anchor-missing：锚点在文件里根本不存在 → 报错，不跑任何套件。
  */
-const MUTATIONS = [
+import { MUTATIONS as TABLE } from "./mutation-table.mjs";
+const DEMOS = [
   {
     id: "m-anchor-targeted",
     file: "scripts/outbound.mjs",
@@ -133,17 +137,37 @@ function syntaxOk(abs) {
   return r.status === 0;
 }
 
+/**
+ * 并行模式（--jobs N）：父进程做锚点核对 + **一次**全量基线（不让 N 个 worker 各付 150s），
+ * 然后 `git worktree add --detach` 出 N 份隔离工作树，把变异分片派给 N 个子 runner
+ *（--root <worktree> --assume-green），收集各自输出与汇总后加总；finally 一律 worktree remove。
+ * 每路的套件沙箱（mkdtemp）互不相干；代价只是 CPU 高峰。失败一路不拖累别路。
+ */
 function main(argv) {
-  let picked = MUTATIONS;
-  if (argv[0] === "--ids") {
-    const want = argv.slice(1);
-    if (want.length === 0) { console.error("--ids 后面要给 id（可用：" + MUTATIONS.map((x) => x.id).join(" ") + "）"); return 2; }
-    picked = want.map((id) => MUTATIONS.find((x) => x.id === id)
-      ?? { id, missing: true, file: "-", find: "-", replace: "-", killedBy: "-" });
-  } else if (argv.length > 0) {
-    console.error("不认识参数：" + argv.join(" ") + "\n用法：node references/mutation-runner.mjs [--ids id …]");
+  // 默认跑真实表；DEMOS 三条只有 --ids 显式点名才够得到（它们是 runner 自己的演示，不是仓库守卫）。
+  const ALL = [...TABLE, ...DEMOS];
+  let picked = TABLE;
+  let jobs = 1;
+  let assumeGreen = false;
+  const rest = [...argv];
+  while (rest.length > 0 && rest[0].startsWith("--") && rest[0] !== "--ids") {
+    const flag = rest.shift();
+    if (flag === "--root") { const v = rest.shift(); if (!v || !fs.existsSync(v)) { console.error("--root 要给存在的目录"); return 2; } ROOT = path.resolve(v); continue; }
+    if (flag === "--assume-green") { assumeGreen = true; continue; }
+    if (flag === "--jobs") { const v = Number(rest.shift()); if (!Number.isSafeInteger(v) || v < 1 || v > 8) { console.error("--jobs 要是 1–8 的整数"); return 2; } jobs = v; continue; }
+    console.error("不认识参数：" + flag + "\n用法：node references/mutation-runner.mjs [--root DIR] [--assume-green] [--jobs N] [--ids id …]");
     return 2;
   }
+  if (rest[0] === "--ids") {
+    const want = rest.slice(1);
+    if (want.length === 0) { console.error("--ids 后面要给 id（可用：" + ALL.map((x) => x.id).join(" ") + "）"); return 2; }
+    picked = want.map((id) => ALL.find((x) => x.id === id)
+      ?? { id, missing: true, file: "-", find: "-", replace: "-", killedBy: "-" });
+  } else if (rest.length > 0) {
+    console.error("不认识参数：" + rest.join(" ") + "\n用法：node references/mutation-runner.mjs [--root DIR] [--assume-green] [--jobs N] [--ids id …]");
+    return 2;
+  }
+  if (jobs > 1) return mainParallel(picked, jobs);
 
   // ① 锚点先全体核对（纯字符串，不跑套件）—— 一条都不用跑时不必花那 2.5 分钟基线。
   const ready = [];
@@ -162,13 +186,15 @@ function main(argv) {
 
   let killed = 0; let survived = 0;
   if (ready.length > 0) {
-    // ② 全量基线：未变异的代码必须全绿，否则后面每个变异都会"被击杀"。
-    console.log("— 全量基线（未变异）：" + SUITE);
-    const base = runSuite(null);
-    if (base.verdict !== "green") {
-      console.log("\n✗ 全量基线就没绿（" + base.verdict + "：" + base.why
-        + "）—— 这时任何变异都会被读成 KILLED，整轮结论都是假的。先把套件修绿。");
-      return 1;
+    // ② 全量基线：未变异的代码必须全绿，否则后面每个变异都会"被击杀"。--assume-green（并行子进程）时父进程已验过，跳过。
+    if (!assumeGreen) {
+      console.log("— 全量基线（未变异）：" + SUITE);
+      const base = runSuite(null);
+      if (base.verdict !== "green") {
+        console.log("\n✗ 全量基线就没绿（" + base.verdict + "：" + base.why
+          + "）—— 这时任何变异都会被读成 KILLED，整轮结论都是假的。先把套件修绿。");
+        return 1;
+      }
     }
     for (const m of ready) {
       console.log("\n=== " + m.id + "  " + m.file + "  killedBy=" + JSON.stringify(m.killedBy));
@@ -214,4 +240,50 @@ function main(argv) {
   return survived + anomalies.length > 0 ? 1 : 0;
 }
 
-if (isDirectRun(import.meta.url)) process.exit(main(process.argv.slice(2)));
+/** 并行编排：锚点核对与全量基线在主根做一次，N 个临时 worktree 分片跑，输出按 worker 归组打印，汇总加总。 */
+async function mainParallel(picked, jobs) {
+  const bad = picked.filter((m) => m.missing);
+  for (const m of bad) console.log("  ! " + m.id + "：unknown_id：表里没有这个变异");
+  const real = picked.filter((m) => !m.missing);
+  if (real.length === 0) return 1;
+  console.log("— 全量基线（未变异，主根一次）：" + SUITE);
+  const base = runSuite(null);
+  if (base.verdict !== "green") { console.log("✗ 全量基线就没绿（" + base.verdict + "：" + base.why + "），整轮不跑。"); return 1; }
+  const n = Math.min(jobs, real.length);
+  const chunks = Array.from({ length: n }, () => []);
+  real.forEach((m, i) => chunks[i % n].push(m));
+  const wts = [];
+  const results = [];
+  try {
+    for (let i = 0; i < n; i += 1) {
+      const wt = fs.mkdtempSync(path.join(os.tmpdir(), "mutation-wt-"));
+      fs.rmdirSync(wt); // git worktree add 要求目标不存在
+      const add = spawnSync("git", ["worktree", "add", "--detach", wt, "HEAD"], { cwd: ROOT, encoding: "utf-8" });
+      if (add.status !== 0) { console.log("✗ 建 worktree 失败：" + (add.stderr ?? "").trim()); return 1; }
+      wts.push(wt);
+    }
+    await Promise.all(chunks.map((chunk, i) => new Promise((resolve) => {
+      const args = [path.join(ROOT, "references", "mutation-runner.mjs"), "--root", wts[i], "--assume-green", "--ids", ...chunk.map((m) => m.id)];
+      const child = spawn(process.execPath, args, { cwd: ROOT, env: process.env });
+      let out = "";
+      child.stdout.on("data", (d) => { out += d; });
+      child.stderr.on("data", (d) => { out += d; });
+      child.on("close", (code) => { results[i] = { code, out, ids: chunk.map((m) => m.id) }; resolve(); });
+    })));
+  } finally {
+    for (const wt of wts) spawnSync("git", ["worktree", "remove", "--force", wt], { cwd: ROOT, encoding: "utf-8" });
+  }
+  let killed = 0; let survived = 0; let anomalies = bad.length;
+  for (let i = 0; i < results.length; i += 1) {
+    const r = results[i];
+    console.log("\n──── worker " + (i + 1) + "（" + r.ids.join(" ") + "）────");
+    process.stdout.write(r.out);
+    const sum = lastMatch(/KILLED (\d+) \/ SURVIVED (\d+) \/ 异常 (\d+)/gu, r.out);
+    if (!sum) { console.log("  ! worker " + (i + 1) + " 没打汇总（退出码 " + r.code + "）—— 这一片的结论作废"); anomalies += r.ids.length; continue; }
+    killed += Number(sum[1]); survived += Number(sum[2]); anomalies += Number(sum[3]);
+  }
+  console.log("\n═══ 并行总汇 ═══\nKILLED " + killed + " / SURVIVED " + survived + " / 异常 " + anomalies);
+  return survived + anomalies > 0 ? 1 : 0;
+}
+
+if (isDirectRun(import.meta.url)) Promise.resolve(main(process.argv.slice(2))).then((code) => process.exit(code));

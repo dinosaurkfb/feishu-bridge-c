@@ -200,6 +200,7 @@ export function runDoctor({
   const unclear = [];
   let backlog = 0;
   let backlogProblems = 0;
+  let backlogLegacy = 0;   // 认得的遗留条目：单独成桶，不算"说不清"、不让 ⑥ 变红，但照样点名
   const backlogWhere = [];
   for (const p of projects) {
     const root = p?.root;
@@ -246,8 +247,18 @@ export function runDoctor({
       if (rc.waiting.count > 0) { backlog += rc.waiting.count; backlogWhere.push(name + "（run 通道待发 " + rc.waiting.count + " 条" + (rc.phase === "paused" ? "，绑定暂停中" : "") + "）"); }
       const stuck = rc.runs.stuck ?? [];
       if (stuck.length > 0) { backlogProblems += stuck.length; backlogWhere.push(name + "（run 卡住 " + stuck.length + " 条：" + [...new Set(stuck.map((x) => x.reason))].join("、") + "）"); }
+      // 遗留形状单独成桶：逐字段核对过的旧版记录是"认得、只是要人删"，不应当"说不清"——
+      // 否则 ⑥ 永远红着、没人再看，真说不清的条目会被它藏进噪音里。
+      // 两桶之和恒等于 problems 总数（互补筛选 —— 由测试拿它与 inventoryRuns 的总数核对）。
+      // 这里的 "legacy_state" 字符串写错不会静默放行：那条记录会落回"说不清"把 ⑥ 弄红，测试当场就红。
       const problems = rc.runs.problems ?? [];
-      if (problems.length > 0) { backlogProblems += problems.length; backlogWhere.push(name + "（runs 账本说不清 " + problems.length + " 处：" + [...new Set(problems.map((x) => x.reason))].join("、") + "）"); }
+      const ledgerUnclear = problems.filter((x) => x.reason !== "legacy_state");
+      const ledgerLegacy = problems.filter((x) => x.reason === "legacy_state");
+      if (ledgerUnclear.length > 0) { backlogProblems += ledgerUnclear.length; backlogWhere.push(name + "（runs 账本说不清 " + ledgerUnclear.length + " 处：" + [...new Set(ledgerUnclear.map((x) => x.reason))].join("、") + "）"); }
+      if (ledgerLegacy.length > 0) {
+        backlogLegacy += ledgerLegacy.length;
+        backlogWhere.push(name + "（runs 账本遗留 " + ledgerLegacy.length + " 条：旧版运行时写的 deliver_failed，逐字段核对已过 —— 人工看过内容后删除该文件）");
+      }
     }
   }
   const expiryOk = !registry.ok ? null : (expired.length + expiring.length + pendingExpired.length === 0 ? (unclear.length === 0 ? true : null) : false);
@@ -279,6 +290,7 @@ export function runDoctor({
     : "兜底定时器 " + (PHASE_TEXT[claudePhase] ?? claudePhase);
   const backlogText = (backlog > 0 ? "积压 " + backlog + " 条" : "无积压") +
     (backlogProblems > 0 ? "，账本说不清 " + backlogProblems + " 处" : "") +
+    (backlogLegacy > 0 ? "，另有认得的遗留 " + backlogLegacy + " 条（不阻塞）" : "") +
     (backlogWhere.length ? "：" + backlogWhere.join("、") : "");
   const backlogOk = !registry.ok ? null
     : backlogProblems > 0 ? false

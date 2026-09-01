@@ -15617,6 +15617,100 @@ test("run 通道所有权只有一笔：直发 CLI 发布途中，排空的 run 
   assert.equal(sent2, 0); assert.equal(after.status, "empty", JSON.stringify(after));
 });
 
+/**
+ * 当年写方留下的形状。好的用例一律走**真写原语** recordClaimState（它不校验状态名，
+ * 传 deliver_failed 就写出当年那个文件名），不手写 JSON —— 手写的"像"不算被认得。
+ * detail 传字符串：cc2cd 那句是 `d?.reason ?? "unknown"`，而 deliverToLiveSession 从不返回
+ * reason，所以恒为 "unknown"；字符串铺进对象字面量会展开成 "0".."n-1" 的单字符键。
+ */
+function legacyDeliverFailedFixture({ claimsDir, detail = "unknown", label = "legacy" }) {
+  const key = claimKeyFor(label);
+  recordClaimState({ claimsDir, key, state: "deliver_failed", detail });
+  return { key, file: path.join(claimsDir, key + ".deliver_failed.json") };
+}
+
+test("盘点：旧版运行时的 deliver_failed 是封闭登记的遗留形状（逐字段核对、不参与孤儿判定），差一点或换个名字仍是不认识（issue #86）", () => {
+  const h = watcherMatrixRunner.fixture();
+  const rt = path.join(h.dir, ".runtime-data", "inbound");
+  const runsDir = path.join(rt, "runs");
+  const claimsDir = path.join(rt, "delivery-claims");
+  const inv = () => inventoryRuns({ runsDir, claimsDir });
+  const put = (label, name, text) => {
+    const key = claimKeyFor(label);
+    fs.writeFileSync(path.join(claimsDir, key + "." + name), text);
+    return key;
+  };
+  // ① 合法遗留记录 → legacy_state，点名到 key、给处置方式。
+  const ok1 = legacyDeliverFailedFixture({ claimsDir, label: "legacy-ok" });
+  let probs = inv().problems;
+  assert.equal(probs.length, 1, JSON.stringify(probs));
+  assert.equal(probs[0].reason, "legacy_state");
+  assert.equal(probs[0].key, ok1.key, "遗留记录要能点名到 key");
+  assert.match(probs[0].why, /人工看过这份文件的内容后把它删掉/u, "处置方式要写进文案：" + probs[0].why);
+  // 而且它**不算一条 run、不因"当作终局"而参与孤儿判定**（方案 (b) 的全部含义）。
+  assert.deepEqual(inv().runs, [], "**遗留记录不许被算成一条 run**：" + JSON.stringify(inv().runs));
+  assert.equal(probs.some((x) => x.reason === "orphan_terminal_record"), false,
+    "**遗留记录不许被当终局凭据**（真机上那两份报的是失败，而消息其实送到了）：" + JSON.stringify(probs));
+  // detail 长短不同（当年那句错误文本可变）同样认识。
+  const ok2 = legacyDeliverFailedFixture({ claimsDir, label: "legacy-longer", detail: "转发进程没起来" });
+  assert.equal(inv().problems.filter((x) => x.reason === "legacy_state").length, 2, JSON.stringify(inv().problems));
+  assert.equal(inv().problems.length, 2, "两条都该落在 legacy 这一桶，不该有第三条落点");
+  fs.rmSync(ok2.file);
+  // ② 名字对得上但**字段差一点** —— 每一个都照报 unrecognized_entry。
+  const base = () => JSON.parse(fs.readFileSync(ok1.file, "utf-8"));
+  const variants = {
+    "多一个键": (d) => ({ ...d, reason: "boom" }),
+    "少一个固定字段": (d) => { const { claim_key: _drop, ...rest } = d; return rest; },
+    "claim_key 与文件名不符": (d) => ({ ...d, claim_key: claimKeyFor("legacy-other-key") }),
+    "state 与文件名不符": (d) => ({ ...d, state: "handed_off" }),
+    "schema_version 类型不对": (d) => ({ ...d, schema_version: 1.0 }),
+    "recorded_at 不是规范时间": (d) => ({ ...d, recorded_at: "2026-08-23 18:20" }),
+    "没有 detail": (d) => Object.fromEntries(Object.entries(d).filter(([k]) => !/^(?:0|[1-9][0-9]*)$/u.test(k))),
+    "detail 数字键不连续": (d) => { const { 2: _drop, ...rest } = d; return rest; },
+    "detail 键从 1 开始": (d) => { const { 0: first, ...rest } = d; return { ...rest, 1: first }; },
+    "detail 展开的键不是单字符": (d) => ({ ...d, 0: "un" }),
+    "不是记录对象": () => [],
+  };
+  const complaints = new Set();
+  for (const [label, patch] of Object.entries(variants)) {
+    // 基准 claim_key 得跟着这份文件自己的 key 走，否则"差一点"全都先撞上 claim_key 对不上，
+    // 测的就不是各自那一条了（实测：这么写时 11 种变体只报出 5 种不同说法）。
+    const badKey = claimKeyFor("bad-" + label);
+    fs.writeFileSync(path.join(claimsDir, badKey + ".deliver_failed.json"), JSON.stringify(patch({ ...base(), claim_key: badKey })));
+    const bad = inv().problems.filter((x) => x.reason !== "legacy_state");
+    assert.equal(bad.length, 1, label + " 应当只多一条问题：" + JSON.stringify(bad));
+    assert.equal(bad[0].reason, "unrecognized_entry", "**" + label + " 不许被折成遗留**：" + JSON.stringify(bad));
+    assert.match(bad[0].why, /名字是遗留的 deliver_failed，但/u, "要说清是哪一种不认识：" + bad[0].why);
+    complaints.add(/，但(.+)）$/u.exec(bad[0].why)[1]);
+    fs.rmSync(path.join(claimsDir, bad[0].key + ".deliver_failed.json"));
+  }
+  // 十一种"差一点"各有各的报法 —— 全部塌成同一句话就等于没在核对字段。
+  assert.equal(complaints.size, Object.keys(variants).length, [...complaints].join(" | "));
+  // ③ 登记之外的名字（cc2cd 今天还在写 no_live_session）照旧不认识，也不假称认得 key。
+  const other = put("legacy-name-other", "no_live_session.json", JSON.stringify(base()));
+  probs = inv().problems;
+  assert.equal(probs.length, 2, JSON.stringify(probs));
+  const unregistered = probs.find((x) => x.reason === "unrecognized_entry");
+  assert.ok(unregistered, "**登记之外的名字（cc2cd 今天还在写的 no_live_session）照旧要算不认识**：" + JSON.stringify(probs));
+  assert.equal(unregistered.key, null, "名字没登记就不假称认得 key：" + JSON.stringify(unregistered));
+  assert.equal(probs.filter((x) => x.reason === "legacy_state").length, 1, JSON.stringify(probs));
+  fs.rmSync(path.join(claimsDir, other + ".no_live_session.json"));
+  // ④ 回归：受控状态集的行为一条没变 —— 真终局记录缺制品仍报孤儿，claimed 仍不算问题
+  //（rejected 那条形状更讲究，上面 run 通道那一例已经盯着，这里不重复造）。
+  const plain = claimKeyFor("state-handed-off");
+  writeClaimFixture({ claimsDir, key: plain, root: h.dir });
+  recordClaimState({ claimsDir, key: plain, state: "handed_off", detail: { observed_by: "inbound" } });
+  const claimed = claimKeyFor("state-claimed-only");
+  writeClaimFixture({ claimsDir, key: claimed, root: h.dir });
+  recordClaimState({ claimsDir, key: claimed, state: "claimed", detail: {} });
+  probs = inv().problems;
+  assert.deepEqual(probs.map((x) => [x.key, x.reason]).sort(),
+    [[plain, "orphan_terminal_record"], [ok1.key, "legacy_state"]].sort(), JSON.stringify(probs));
+  // 计数自洽：每一条都落在恰好一个桶里（legacy / 非 legacy 互补，两桶之和 = 总数）。
+  assert.equal(probs.filter((x) => x.reason === "legacy_state").length
+    + probs.filter((x) => x.reason !== "legacy_state").length, probs.length, "桶之和要等于总数");
+});
+
 test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送达未落标、重试预算、独立于 outbox、超时下传", () => {
   const mk = () => {
     const h = watcherMatrixRunner.fixture();
@@ -15820,7 +15914,7 @@ test("run 通道排空：授权门、账本损坏不折叠、claim 三分、送�
     assert.equal(inventoryRuns({ runsDir: f.runs, claimsDir: f.claims }).problems.find((x) => x.key === bare)?.reason, "orphan_terminal_record");
   }
   // claims 目录的条目形状从 claim.mjs 的受控状态集派生：rejected / claimed 记录没有 run 制品是正常的（不是孤儿、不是不认识）；
-  // 状态集之外的名字（历史遗留 deliver_failed）照实报 unrecognized_entry。
+  // 名字是遗留的 deliver_failed 但内容是 {} （四个固定字段全缺）—— 核对不过，照实报 unrecognized_entry，不放宽。
   {
     const f = mk();
     const rej = claimKeyFor("rejected-msg");
@@ -18223,6 +18317,37 @@ test("doctor ⑥：未路由回复及其目录里说不清的条目都算进问�
     reason: "origin_unresolvable", why: "x", message_id: "msg", origin_channel_generation_id: null, session_id: "s", binding_id: "b", recorded_at: "2026-08-28T10:00:00.000Z", reply_text: "t" }));
   const report2 = doctorReport(m.run());
   assert.match(String(checkOf(report2, "backlog_vs_publisher").detail), /未路由回复 1 条/u);
+});
+
+test("doctor ⑥：核对过的遗留记录单独成桶（不红、点名给处置），真说不清的照旧把 ⑥ 弄红（issue #86）", () => {
+  const m = doctorMachine();
+  const root = m.project("legacy", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "legacy", root, root_message_id: "om_x", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
+  fs.mkdirSync(claimsDir, { recursive: true });
+  const inv = () => inventoryRuns({ runsDir: path.join(root, ".runtime-data", "inbound", "runs"), claimsDir });
+  const legacy = legacyDeliverFailedFixture({ claimsDir, label: "doctor-legacy" });
+  let c = checkOf(doctorReport(m.run()), "backlog_vs_publisher");
+  assert.equal(c.ok, true, "**认得的遗留条目不许让 ⑥ 变红**（红久了没人再看，真问题就藏进噪音）：" + c.detail);
+  assert.match(c.detail, /认得的遗留 1 条/u, "要照旧点名到项目并给处置：" + c.detail);
+  assert.doesNotMatch(c.detail, /说不清/u, "**不许还把它算进说不清**：" + c.detail);
+  // 再加一条真不认识的：两桶同时在，⑥ 的红只由那一处说不清的负责。
+  fs.writeFileSync(path.join(claimsDir, "junk.txt"), "x");
+  const probs = inv().problems;
+  const nLegacy = probs.filter((x) => x.reason === "legacy_state").length;
+  const nUnclear = probs.filter((x) => x.reason !== "legacy_state").length;
+  assert.deepEqual([nLegacy, nUnclear], [1, 1], "先钉住盘点说了什么：" + JSON.stringify(probs));
+  assert.equal(nLegacy + nUnclear, probs.length, "桶之和要等于总数");
+  c = checkOf(doctorReport(m.run()), "backlog_vs_publisher");
+  assert.equal(c.ok, false, "**真说不清的条目必须还能把 ⑥ 弄红**：" + c.detail);
+  assert.match(c.detail, /runs 账本说不清 1 处：unrecognized_entry/u, c.detail);
+  assert.match(c.detail, new RegExp("runs 账本遗留 " + nLegacy + " 条"), "⑥ 的数字得来自盘点，不是抄来的：" + c.detail);
+  // 把遗留那份删掉：⑥ 仍因 junk 而红，遗留那一桶清零 —— 处置文案说的"删掉即可"确实到此为止。
+  fs.rmSync(legacy.file);
+  c = checkOf(doctorReport(m.run()), "backlog_vs_publisher");
+  assert.equal(c.ok, false, JSON.stringify(c));
+  assert.doesNotMatch(c.detail, /遗留/u, "文件没了就不该再提遗留：" + c.detail);
+  assert.match(c.detail, /runs 账本说不清 1 处/u, c.detail);
 });
 
 test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue → 当场切换并回执；重放按记录重出回执；终态写失败 → 报错但模式已切、重放补齐；多一个字走普通路径", () => {

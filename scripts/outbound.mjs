@@ -192,11 +192,60 @@ const RUN_ENTRY_RE = /^([0-9a-f]{64})\.(jsonl|published\.json|publish-failed\.js
 const FORWARD_KINDS = new Set(["forward.jsonl", "forward.stderr.log", "terminal"]);
 // delivery-claims 目录里受控的条目形状：claim 目录、笔记，以及 **claim.mjs 受控状态集里每一种状态**的记录
 // （rejected 也是入站写的正规记录 —— 真机上曾被硬编码的四种名字报成 unrecognized_entry；
-// 状态集之外的名字（如历史遗留的 deliver_failed，仓库里从未有过写方）仍照实报 unrecognized_entry，不放宽）。
+// 状态集之外的名字仍照实报 unrecognized_entry，不放宽 —— 唯一的例外是下面那条**封闭登记的遗留形状**，
+// 它照样要逐字段核对，核对不过就还是 unrecognized_entry）。
 // 只有 handed_off / failed 是 run 的终局，参与孤儿判定；其余状态的记录不需要 run 制品。
 const CLAIM_ENTRY_RE = new RegExp("^([0-9a-f]{64})\\.(claim|notes\\.log|(?:" +
   Object.values(CLAIM_STATE).map((st) => st.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")).join("|") + ")\\.json)$", "u");
 const TERMINAL_STATE_FILES = new Set([CLAIM_STATE.HANDED_OFF + ".json", "failed.json"]);
+
+// —— 封闭登记的**遗留状态名**（issue #86）——
+// 名字不在受控状态集里，但写方查清了：本仓 git 历史里从来没有 deliver_failed 的写方（`git log -S` 只查到
+// 注释与测试），真正写它的是**邻仓 cc2cd 的 scripts/c2c-inbound.mjs** —— 它 import 本仓 claim.mjs 的
+// recordClaimState，用 `state: "deliver_failed"` 记投递失败。cc2cd 216a26f（2026-08-23）之前那条判反了：
+// deliverToLiveSession 不返回 ok，于是**每条真送到的消息都被记成 deliver_failed**。
+// 所以它既不是终局凭据、也不参与孤儿判定 —— 只登记成"认得、但不是本仓的状态"，逐字段核对通过才单独报
+// legacy_state 并给处置方式。登记的只有这一个名字：像 legacy 而字段对不上的、以及任何别的名字，照报不认识。
+const LEGACY_CLAIM_ENTRY_RE = /^([0-9a-f]{64})\.(deliver_failed)\.json$/u;
+/** 当年那句 recordClaimState 自己写的四个固定字段（detail 是调用方传的，见下面的数字键）。 */
+const LEGACY_CLAIM_FIXED_FIELDS = new Set(["schema_version", "claim_key", "state", "recorded_at"]);
+const LEGACY_CLAIM_DIGIT_RE = /^(?:0|[1-9][0-9]*)$/u;
+const LEGACY_CLAIM_DISPOSAL = "不是故障，也不需要改代码 —— 人工看过这份文件的内容后把它删掉即可（本仓不提供自动清理）";
+
+/**
+ * 一条遗留 deliver_failed 记录的**逐字段**核对。返回 null 才算"登记过的遗留形状"，返回字符串=差在哪。
+ *
+ * 当年的 payload 是 `{schema_version, claim_key, state, recorded_at, ...detail}`，而 cc2cd 传的 detail 是
+ * **字符串**（`d?.reason ?? "unknown"`，而 deliverToLiveSession 的返回值里根本没有 reason 这个字段 ——
+ * 即恒为 "unknown"）。字符串铺进对象字面量会展开成 "0".."n-1" 的**单字符**键，所以键集会随当年那句错误
+ * 文本的长短变。因此这里写死的是当年那条**展开规则**而不是某个具体长度：固定四字段逐一核对，
+ * 其余只允许连续的数字键且每个值是单个字符。多出任何一个别的键、少任何一个固定字段、类型不对、
+ * claim_key 与文件名不符 —— 都不算遗留。两个版本（...detail 在前 / 在后）的键集相同，故不区分。
+ */
+function legacyDeliverFailedProblem(key, doc) {
+  if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return "不是记录对象";
+  for (const field of LEGACY_CLAIM_FIXED_FIELDS) {
+    if (!Object.hasOwn(doc, field)) return "缺当年写方的固定字段：" + field;
+  }
+  if (doc.schema_version !== "1.0") return 'schema_version 不是当年写方的 "1.0"';
+  if (doc.state !== "deliver_failed") return "state 跟文件名对不上";
+  if (doc.claim_key !== key) return "claim_key 跟文件名对不上";
+  if (!isCanonicalIso(doc.recorded_at)) return "recorded_at 不是规范时间";
+  const digits = [];
+  for (const field of Object.keys(doc)) {
+    if (LEGACY_CLAIM_FIXED_FIELDS.has(field)) continue;
+    if (!LEGACY_CLAIM_DIGIT_RE.test(field)) return "多出当年 detail 之外的键：" + field.slice(0, 40);
+    if (typeof doc[field] !== "string" || Array.from(doc[field]).length !== 1) {
+      return "当年 detail 展开出的第 " + field + " 个键不是单个字符";
+    }
+    digits.push(Number(field));
+  }
+  if (digits.length === 0) return "没有当年的 detail（那句错误原因恒为非空）";
+  digits.sort((a, b) => a - b);
+  if (digits[0] !== 0) return "当年 detail 的数字键不是从 0 开始";
+  if (digits.some((n, i) => n !== i)) return "当年 detail 的数字键不连续（展开应是 0..n-1）";
+  return null;
+}
 
 /**
  * runs 账本的**联合盘点**：以第一次目录快照驱动，对 JSONL、终局记录、发布回执、失败账
@@ -257,7 +306,27 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
       }
       const m = CLAIM_ENTRY_RE.exec(name);
       // 名字要给全到能分清后缀（key 就占 64 位），不然"不认识"的条目说不清是哪一种不认识。
-      if (!m) { problems.push({ key: null, reason: "unrecognized_entry", why: "delivery-claims/" + name.slice(0, 140) }); continue; }
+      if (!m) {
+        const legacy = LEGACY_CLAIM_ENTRY_RE.exec(name);
+        if (legacy) {
+          // 名字在遗留登记里只是入场券，还要逐字段对上才算认识；对不上就照报 unrecognized_entry，
+          // 并明说差在哪（折成"名字像就算"就是这条纪律要防的东西）。
+          let doc = null;
+          let bad = null;
+          try { doc = JSON.parse(fs.readFileSync(path.join(claimsDir, name), "utf-8")); }
+          catch (err) { bad = String(err.code ?? "不是 JSON"); }
+          const problem = bad ?? legacyDeliverFailedProblem(legacy[1], doc);
+          if (problem === null) {
+            problems.push({ key: legacy[1], reason: "legacy_state",
+              why: "旧版运行时写的 " + legacy[2] + " 记录（写方在邻仓 cc2cd，不在本仓受控状态集里，故不参与孤儿判定）：" + LEGACY_CLAIM_DISPOSAL });
+          } else {
+            problems.push({ key: legacy[1], reason: "unrecognized_entry",
+              why: "delivery-claims/" + name.slice(0, 140) + "（名字是遗留的 " + legacy[2] + "，但" + problem + "）" });
+          }
+          continue;
+        }
+        problems.push({ key: null, reason: "unrecognized_entry", why: "delivery-claims/" + name.slice(0, 140) }); continue;
+      }
       if (m[2] === CLAIM_STATE.CONSUMED + ".json") {
         // consumed 不是 run 终局、不参与孤儿判定，但要**与它的 claim 交叉核对**：内容坏 → consumed_unreadable；
         // 没有 claim / claim 读不出 → consumed_orphan；claim 无控制意图或意图不一致 → consumed_intent_mismatch。

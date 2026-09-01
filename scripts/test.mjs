@@ -18640,8 +18640,19 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
     assert.ok(/只人工处置|先核验/u.test(hit.why), "假制品的文案要收成人工处置：" + hit.why);
     assert.ok(!hit.why.includes("可直接删"), "假制品绝不说可直接删：" + hit.why);
   }
-  // 快照后消失（present:false）不是"形态不对"：单元断言三态齐（不存在 / EACCES 是 io_error 不折 absent）
+  // 快照后消失（present:false）不是"形态不对"：单元断言（不存在 → present:false）；
+  // lstat 的别的失败（EACCES）是 io_error，**不折成 absent**（评审探针：EACCES 曾被说成 present:false）
   assert.deepEqual(inspectControlLockArtifact(path.join(claimsDir, "no-such-artifact")), { present: false });
+  const eaccesDir = path.join(claimsDir, "eacces-锁盘点"); fs.mkdirSync(eaccesDir); fs.chmodSync(eaccesDir, 0o000);
+  const ioSeen = inspectControlLockArtifact(path.join(eaccesDir, "x.control.lock.reaped-2a1b0c9d-8e7f-4478-8a9b-0c1d2e3f4f5a"));
+  fs.chmodSync(eaccesDir, 0o700); fs.rmSync(eaccesDir, { recursive: true, force: true });
+  assert.deepEqual([ioSeen.present, ioSeen.shape], [true, "io_error"], JSON.stringify(ioSeen));
+  // owner 缺 token 但其余合法 —— 仍是畸形，不许折成协议残骸说可直接删（形状逐字段缺一不可）
+  const noTokenUuid = "3a2b1c0d-9e8f-4578-8a9b-0c1d2e3f4e5a";
+  fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), path.join(claimsDir, key12 + ".control.lock.reaped-" + noTokenUuid));
+  const noTokenHit = inventoryRuns({ runsDir: RUNS, claimsDir }).problems.find((p) => p.reason === "control_lock_reaped_residue" && p.why.includes(".reaped-" + noTokenUuid));
+  assert.ok(noTokenHit && !noTokenHit.why.includes("可直接删") && /只人工处置|先核验/u.test(noTokenHit.why), "缺 token 的 payload 是畸形：" + JSON.stringify(noTokenHit));
+  fs.rmSync(path.join(claimsDir, key12 + ".control.lock.reaped-" + noTokenUuid), { force: true });
   fs.rmSync(path.join(claimsDir, key12 + ".control.lock.reaped-" + fileUuid), { force: true });
   fs.rmSync(path.join(claimsDir, key12 + ".control.lock.reap.quarantine-" + dirUuid), { recursive: true, force: true });
   fs.rmSync(path.join(claimsDir, key12 + ".control.lock.reaped-" + badPayloadUuid), { force: true });

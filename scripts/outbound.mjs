@@ -11,7 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { isCanonicalIso } from "./canonical-time.mjs";
-import { CLAIM_KEY_SHAPE, CLAIM_STATE } from "./claim.mjs";
+import { CLAIM_KEY_SHAPE, CLAIM_STATE, claimKey } from "./claim.mjs";
 import { CONSUMED_TMP_RE, CONTROL_QUARANTINE_RE, classifyControlLockEntry, inspectControlClaim, inspectControlLockArtifact, readConsumedRecord } from "./control-command.mjs";
 import { inspectRejectedClaim } from "./reject-control.mjs";
 
@@ -204,6 +204,50 @@ const TERMINAL_STATE_FILES = new Set([CLAIM_STATE.HANDED_OFF + ".json", "failed.
 // key 部分与 claim.mjs 的 CLAIM_KEY_SHAPE 同形状（本文件既有 CLAIM_ENTRY_RE 也是这样内联的，不另立判据）。
 const LEGACY_CLAIM_ENTRY_RE = /^([0-9a-f]{64})\.deliver_failed\.json$/u;
 
+// —— issue #98：cc2cd 旧形 rejected 的永久兼容读取器（B 方向）——
+// 写方唯一且已核实：cc2cd 的 c2c-inbound.mjs（TASK_KEY="cc2cd_peer"，claim 的 meta 恰为
+// session_id/thread_id 两字段）调 recordClaimState({ state: "rejected", detail: "empty_instruction" })
+// —— detail 是**字符串**，共享写器 ...detail 把它展开成 "0"–"16" 十七个单字符索引键，
+// 逐字重组恰为 "empty_instruction"。这里只认这条**精确联合形状**（文件名 + 同 key 旧 claim
+// 逐字段 + 记录逐字段），差任何一点都不许进 notices（留在红色 problems）；
+// 绝不许写成"没有 rejected_control 就算 legacy"。
+const CC2CD_TASK_KEY = "cc2cd_peer";
+const CC2CD_EMPTY_INSTRUCTION = "empty_instruction";
+function isLegacyCc2cdRejected({ claimsDir, key }) {
+  const claimRaw = readRegularFile(path.join(claimsDir, key + ".claim", "claim.json"));
+  if (claimRaw.status !== "read") return false;
+  let claim;
+  try { claim = JSON.parse(claimRaw.buf.toString("utf-8")); } catch { return false; }
+  if (claim === null || typeof claim !== "object" || Array.isArray(claim)) return false;
+  // claim 字段集恰好这八个（acquireClaim 的固定身份字段 + cc2cd 的 meta 两字段），多一个少一个都不算。
+  const claimFields = Object.keys(claim).sort();
+  const wantClaim = ["claim_key", "claimed_at", "logical_task_key", "message_id", "schema_version", "session_id", "state", "thread_id"];
+  if (claimFields.length !== wantClaim.length || claimFields.some((f, i) => f !== wantClaim[i])) return false;
+  if (claim.schema_version !== "1.0" || claim.state !== CLAIM_STATE.CLAIMED || claim.logical_task_key !== CC2CD_TASK_KEY) return false;
+  if (claim.claim_key !== key || !isCanonicalIso(claim.claimed_at)) return false;
+  if (typeof claim.session_id !== "string" || claim.session_id === "" || typeof claim.thread_id !== "string" || claim.thread_id === "") return false;
+  // key 用仓里现成的推导函数重推（message_id + " " + logical_task_key），不自己拼哈希。
+  if (claimKey(claim.message_id, claim.logical_task_key) !== key) return false;
+  const recRaw = readRegularFile(path.join(claimsDir, key + "." + CLAIM_STATE.REJECTED + ".json"));
+  if (recRaw.status !== "read") return false;
+  let rec;
+  try { rec = JSON.parse(recRaw.buf.toString("utf-8")); } catch { return false; }
+  if (rec === null || typeof rec !== "object" || Array.isArray(rec)) return false;
+  // 记录字段集恰好固定四键 + "0"–"16" 十七个索引键；索引逐字重组 === "empty_instruction"。
+  const recFields = Object.keys(rec).sort();
+  const wantRec = [...Array(17).keys()].map(String).concat(["claim_key", "recorded_at", "schema_version", "state"]).sort();
+  if (recFields.length !== wantRec.length || recFields.some((f, i) => f !== wantRec[i])) return false;
+  if (rec.schema_version !== "1.0" || rec.state !== CLAIM_STATE.REJECTED || rec.claim_key !== key) return false;
+  if (!isCanonicalIso(rec.recorded_at)) return false;
+  let word = "";
+  for (let i = 0; i < 17; i += 1) {
+    const ch = rec[String(i)];
+    if (typeof ch !== "string" || ch.length !== 1) return false;
+    word += ch;
+  }
+  return word === CC2CD_EMPTY_INSTRUCTION;
+}
+
 /**
  * runs 账本的**联合盘点**：以第一次目录快照驱动，对 JSONL、终局记录、发布回执、失败账
  * 做 key 并集 —— 任何孤儿 sidecar、不可读的终局记录、**不认识的条目**都进 problems
@@ -211,14 +255,15 @@ const LEGACY_CLAIM_ENTRY_RE = /^([0-9a-f]{64})\.deliver_failed\.json$/u;
  */
 export function inventoryRuns({ runsDir, claimsDir = null }) {
   const problems = [];
+  const notices = [];   // issue #98：info 级通道，与 problems 并列；精确命中旧联合形状的 cc2cd 记录进这里
   let entries;
   try {
     const st = fs.statSync(runsDir);
-    if (!st.isDirectory()) return { ok: false, reason: "runs_not_a_directory", runs: [], problems: [] };
+    if (!st.isDirectory()) return { ok: false, reason: "runs_not_a_directory", runs: [], notices: [], problems: [] };
     entries = fs.readdirSync(runsDir);   // 这份快照驱动后面的一切，不再二次读目录
   } catch (err) {
     if (err.code === "ENOENT") entries = [];
-    else return { ok: false, reason: "runs_unreadable", error: String(err.code ?? err.message), runs: [], problems: [] };
+    else return { ok: false, reason: "runs_unreadable", error: String(err.code ?? err.message), runs: [], notices: [], problems: [] };
   }
   const byKey = new Map();
   const note = (key, kind) => { if (!byKey.has(key)) byKey.set(key, new Set()); byKey.get(key).add(kind); };
@@ -330,6 +375,11 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
         if (seen.state === "rejected") continue;
         if (seen.state === "rejected_unreadable") problems.push({ key: m[1], reason: "rejected_unreadable", why: name + "：" + seen.why + " —— node scripts/repair-control-claim.mjs" });
         else if (seen.state === "rejected_intent_mismatch") problems.push({ key: m[1], reason: "rejected_intent_mismatch", why: name + "：" + seen.why });
+        else if (isLegacyCc2cdRejected({ claimsDir, key: m[1] })) {
+          // issue #98：精确命中 cc2cd 旧联合形状 → info 级 notice（problems 语义与既有消费方一个都不变，
+          // doctor ⑥ 不因此变红）。账本不解读、不参与孤儿判定、不自动删除。
+          notices.push({ key: m[1], reason: "legacy_cc2cd_rejected_v1", why: "已知旧版 cc2cd 空指令拒绝记录（写方与字段已逐项核实，shape 封闭）；不自动删除，留人工确认后归档：" + name.slice(0, 80) });
+        }
         else problems.push({ key: m[1], reason: "rejected_orphan", why: name + "：" + seen.state + (seen.why ? "：" + seen.why : "") });
         continue;
       }
@@ -382,7 +432,7 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
     runs.push(snap.run);
   }
   runs.sort((a, b) => (a.key < b.key ? -1 : 1));
-  return { ok: true, runs, problems };
+  return { ok: true, runs, notices, problems };
 }
 
 /** 旧入口：只给 runs 列表（目录读不出就是 []）。新代码用 inventoryRuns，problems 不能丢。 */

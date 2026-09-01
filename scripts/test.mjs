@@ -21653,6 +21653,99 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
   }
 });
 
+// issue #98（B 方向）：cc2cd 旧形 rejected 的永久兼容读取器 —— 只认**精确联合形状**
+//（写方 c2c-inbound.mjs 的 empty_instruction 分支，detail 是字符串被 ...detail 展成 "0"–"16"）。
+// 精确命中 → info 级 notices；claim 缺失 / 任一字段差一点 / 索引拼不出 / 新形损坏 → 全部留在红里。
+test("issue #98：cc2cd 旧形 rejected 精确命中进 notices，差一点都留在红里", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cc2cd-legacy-rejected-"));
+  const claims = path.join(dir, "delivery-claims");
+  const runs = path.join(dir, "runs");   // 不存在 = 空账：rejected 记录本就不参与孤儿判定
+  const key = claimKey("msg-cc2cd-98", "cc2cd_peer");
+  const claimFile = path.join(claims, key + ".claim", "claim.json");
+  const recFile = path.join(claims, key + ".rejected.json");
+  const legalClaim = () => JSON.stringify({
+    schema_version: "1.0", state: "claimed", claim_key: key, message_id: "msg-cc2cd-98",
+    logical_task_key: "cc2cd_peer", claimed_at: "2026-08-30T00:00:00.000Z",
+    session_id: "session_cc2cd_98", thread_id: "om_thread_98" });
+  const legalRec = () => JSON.stringify({
+    ..."empty_instruction", schema_version: "1.0", claim_key: key, state: "rejected",
+    recorded_at: "2026-08-30T00:00:01.000Z" });
+  const plant = ({ claim = legalClaim(), rec = legalRec() } = {}) => {
+    fs.mkdirSync(path.dirname(claimFile), { recursive: true });
+    if (claim !== null) fs.writeFileSync(claimFile, claim);
+    if (rec !== null) fs.writeFileSync(recFile, rec);
+  };
+  const clean = () => fs.rmSync(claims, { recursive: true, force: true });
+  // ① 精确命中：恰一条 notice，problems 空；notice 形状封闭断言
+  plant();
+  let inv = inventoryRuns({ runsDir: runs, claimsDir: claims });
+  assert.deepEqual(inv.problems, [], "精确联合形状不许再报 rejected_orphan：" + JSON.stringify(inv.problems));
+  assert.equal(inv.notices.length, 1, "恰一条 notice：" + JSON.stringify(inv.notices));
+  assert.equal(inv.notices[0].key, key);
+  assert.equal(inv.notices[0].reason, "legacy_cc2cd_rejected_v1");
+  assert.match(inv.notices[0].why, /不自动删除/u);
+  // ② 红的一侧：任何差一点都不许折成 legacy
+  const red = (label, opts) => {
+    clean(); plant(opts);
+    const r = inventoryRuns({ runsDir: runs, claimsDir: claims });
+    assert.deepEqual(r.notices, [], label + " → 不许折成 legacy notice：" + JSON.stringify(r.notices));
+    assert.deepEqual(r.problems.map((p) => [p.key, p.reason]), [[key, "rejected_orphan"]],
+      label + " → 应留在红色 rejected_orphan：" + JSON.stringify(r.problems));
+  };
+  red("claim 缺失", { claim: null });
+  red("claim 少一个字段（无 thread_id）", { claim: JSON.stringify({ schema_version: "1.0", state: "claimed", claim_key: key,
+    message_id: "msg-cc2cd-98", logical_task_key: "cc2cd_peer", claimed_at: "2026-08-30T00:00:00.000Z", session_id: "s" }) });
+  red("claim 多一个字段（binding_id）", { claim: legalClaim().slice(0, -1) + ',"binding_id":"b"}' });
+  red("logical_task_key 不是 cc2cd_peer", { claim: legalClaim().replace("cc2cd_peer", "other_task") });
+  red("session_id 空串", { claim: legalClaim().replace("session_cc2cd_98", "") });
+  red("claimed_at 非规范 ISO", { claim: legalClaim().replace("2026-08-30T00:00:00.000Z", "2026-08-30 00:00:00") });
+  red("message_id 对不上 key 推导", { claim: legalClaim().replace("msg-cc2cd-98", "msg-other") });
+  red("索引键拼不出 empty_instruction", { rec: JSON.stringify({ ..."empty_instructiox", schema_version: "1.0",
+    claim_key: key, state: "rejected", recorded_at: "2026-08-30T00:00:01.000Z" }) });
+  red("记录多一个键（猜的 detail 形不许收）", { rec: legalRec().slice(0, -1) + ',"detail":"empty_instruction"}' });
+  red("recorded_at 非规范 ISO", { rec: legalRec().replace("2026-08-30T00:00:01.000Z", "2026-08-30 00:00:01") });
+  red("记录读不出（JSON 坏）", { rec: "{ 坏了" });
+  // ③ 新形判据先行：claim 带 rejected_control 投影时走 #94 判据，legacy 形记录不许来救。
+  // claim 用仓库自己的夹具（readClaimState 的完整校验对 policy_id 等有受控取值要求，手写会先撞上它）。
+  clean();
+  const proj = rejectedControlProjection(parseInboundIntent({ instruction: "/feishu-unbind", chain: "claude" }));
+  const k98 = claimKeyFor("msg-cc2cd-98-legacy", "cc2cd_peer");
+  writeClaimFixture({ claimsDir: claims, key: k98, patch: { rejected_control: proj } });
+  fs.writeFileSync(path.join(claims, k98 + ".rejected.json"), JSON.stringify({
+    ..."empty_instruction", schema_version: "1.0", claim_key: k98, state: "rejected",
+    recorded_at: "2026-08-30T00:00:01.000Z" }));
+  inv = inventoryRuns({ runsDir: runs, claimsDir: claims });
+  assert.deepEqual(inv.notices, [], "新形 claim 在场时 legacy 不许接管：" + JSON.stringify(inv.notices));
+  assert.deepEqual(inv.problems.map((p) => p.reason), ["rejected_unreadable"],
+    "新形判据先行：投影在场时记录先撞新形字段集校验 → rejected_unreadable，不是 orphan 也不是 legacy：" + JSON.stringify(inv.problems));
+  clean();
+});
+
+test("doctor ⑥：cc2cd 旧形 rejected 精确命中 → 显示数量但不让 ⑥ 变红（issue #98）", () => {
+  const m = doctorMachine();
+  const root = m.project("cc2cd98", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  const claims = path.join(root, ".runtime-data", "inbound", "delivery-claims");
+  const key = claimKey("msg-cc2cd-98", "cc2cd_peer");
+  fs.mkdirSync(path.join(claims, key + ".claim"), { recursive: true });
+  fs.writeFileSync(path.join(claims, key + ".claim", "claim.json"), JSON.stringify({
+    schema_version: "1.0", state: "claimed", claim_key: key, message_id: "msg-cc2cd-98",
+    logical_task_key: "cc2cd_peer", claimed_at: "2026-08-30T00:00:00.000Z",
+    session_id: "session_cc2cd_98", thread_id: "om_thread_98" }));
+  fs.writeFileSync(path.join(claims, key + ".rejected.json"), JSON.stringify({
+    ..."empty_instruction", schema_version: "1.0", claim_key: key, state: "rejected",
+    recorded_at: "2026-08-30T00:00:01.000Z" }));
+  m.writeTables({
+    projects: [{ id: "cc2cd98", root, root_message_id: "om_root_cc2cd98", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }],
+    routes: [{ ...m.route("self"), handler: path.join(m.home, ".claude", "feishu-bridge", "runtime", "current", "scripts", "inbound.mjs"), default: true }],
+    sessions: { "session_aaaaaaaaaaaa": "self" }, providers: [m.provider("self")],
+  });
+  const rep = doctorReport(m.run());
+  const six = checkOf(rep, "backlog_vs_publisher");
+  assert.match(six.detail, /已知旧形记录 1 条：legacy_cc2cd_rejected_v1/u, "⑥ 要显示 notices 数量：" + six.detail);
+  assert.equal(six.ok, true, "info 级不许让 ⑥ 变红：" + six.detail);
+  assert.doesNotMatch(six.detail, /说不清/u, "notices 不许混进 problems 文案：" + six.detail);
+});
+
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (TEST_FILTER.length > 0) {

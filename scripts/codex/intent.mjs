@@ -284,7 +284,10 @@ export const INTENT_REJECT_TEXT = {
     "  **凭证只由 UserPromptSubmit 钩子在你亲自输入完整命令时签发** ——\n" +
     "  agent 之间转述、引用、正文夹带都不会有。请单独输入那条命令。",
   intent_id_malformed: "凭证 id 格式不对，拒绝执行。",
-  intent_not_found: "凭证不存在（可能来自另一轮，或从未签发）。请重新输入那条命令。",
+  intent_not_found:
+    "凭证不存在，拒绝执行。最常见的两个原因：凭证从未签发（这条命令不是这一轮亲自单独输入的，" +
+    "或这台机器还没初始化过）；这个会话在沙箱里、HOME 被重定向，凭证签发落在了隔离环境里。\n" +
+    "  下一步：在真实环境重新单独输入那条完整命令；怀疑 HOME 不对时先跑一次绑定预览核对路径。",
   intent_already_used: "这张凭证已经用过了。**一次输入只授权一次操作**，请重新输入。",
   intent_expired: "凭证已过期。请重新输入那条命令。",
   intent_action_mismatch: "凭证授权的不是这个动作，拒绝执行。",
@@ -295,9 +298,8 @@ export const INTENT_REJECT_TEXT = {
   intent_turn_mismatch: "凭证来自另一轮对话，拒绝执行。",
   intent_corrupt: "凭证内容读不出来，拒绝执行。",
   intent_unreadable:
-    "凭证读不到，拒绝执行。最常见的两个原因：凭证还没初始化过（没有凭证文件）；" +
-    "这个会话在沙箱里、HOME 被重定向，凭证路径落在了隔离环境里。\n" +
-    "  下一步：在真实环境跑一次绑定预览，核对凭证路径是否对得上。",
+    "凭证读不了（权限或 I/O 错误），拒绝执行。文件缺席不走这条（那是 intent_not_found）——\n" +
+    "  查一下凭证目录的权限与磁盘状态。",
 };
 
 export const intentRejectText = (reason) =>

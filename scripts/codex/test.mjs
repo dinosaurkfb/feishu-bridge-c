@@ -32,6 +32,7 @@ import { HOOK_TAG, acceptsHookCommand, buildHookCommand, codexHooksOwnedEntries,
 import { recordCodexActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
 import {
   INTENT_TTL_MS, buildIntentParams, consumeIntent, intentDir, intentRejectText, issueIntent,
+  requireIntent,
 } from "./intent.mjs";
 import { sweepEligible } from "./drain-all.mjs";
 import { remindCodexPendingClaims } from "./claim-reminder.mjs";
@@ -9405,12 +9406,26 @@ test("维护门 · PR B：prompt-hook 签发的控制脚本集合 == 封闭常�
   assert.deepEqual(manifest.missing, []);
 });
 
-// 小债 B：intent_unreadable 提示语要说清原因（凭证未初始化；沙箱 / HOME 重定向）与下一步动作。
-test("intent_unreadable 提示语给人指路：点名沙箱 / HOME 与下一步动作", () => {
-  const text = intentRejectText("intent_unreadable");
-  assert.match(text, /沙箱/u, "要提到沙箱：" + text);
-  assert.match(text, /HOME/u, "要提到 HOME 重定向：" + text);
-  assert.match(text, /绑定预览/u, "要给下一步动作（在真实环境跑绑定预览核对路径）：" + text);
+// 小债 B：未初始化 / 沙箱 HOME 重定向时凭证文件缺席，consumeIntent 的 rename 拿到 ENOENT，
+// 实际投影是 intent_not_found（不是 unreadable）—— 指引必须挂在人真会看到的那条 reason 上。
+// 评审要求经真实调用层验证：requireIntent + 空隔离 HOME + 合法格式 id，断言**最终** reason 与 text。
+test("intent_not_found 给人指路：空 HOME + 合法 id 经 requireIntent 的最终文案点名沙箱 HOME 与下一步", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "intent-nf-"));
+  const r = requireIntent({
+    apply: true, action: "unbind", threadId: "t1",
+    argv: ["node", "x", "--intent", "a".repeat(32)], home,
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "intent_not_found", "文件缺席（ENOENT）的投影是 not_found：" + r.reason);
+  assert.match(r.text, /沙箱/u, "要提到沙箱：" + r.text);
+  assert.match(r.text, /HOME/u, "要提到 HOME 重定向：" + r.text);
+  assert.match(r.text, /从未签发|初始化/u, "要提到未签发 / 未初始化这个原因：" + r.text);
+  assert.match(r.text, /绑定预览/u, "要给下一步动作（真实环境跑绑定预览核对路径）：" + r.text);
+  assert.match(r.text, /重新.{0,6}输入/u, "要给下一步动作（重新单独输入命令）：" + r.text);
+  // unreadable 收窄为权限 / I-O 错误，不再背文件缺席的锅 —— 两条 reason 的分工要能从文案上分辨
+  assert.doesNotMatch(intentRejectText("intent_unreadable"), /沙箱|初始化/u,
+    "unreadable 不该再讲缺席场景的原因：" + intentRejectText("intent_unreadable"));
+  assert.match(intentRejectText("intent_unreadable"), /权限/u, "unreadable 指向权限 / I-O：");
   // 相邻 reason 的文案不动
   assert.equal(intentRejectText("intent_corrupt"), "凭证内容读不出来，拒绝执行。");
 });

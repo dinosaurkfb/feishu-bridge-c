@@ -18647,6 +18647,19 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   const ioSeen = inspectControlLockArtifact(path.join(eaccesDir, "x.control.lock.reaped-2a1b0c9d-8e7f-4478-8a9b-0c1d2e3f4f5a"));
   fs.chmodSync(eaccesDir, 0o700); fs.rmSync(eaccesDir, { recursive: true, force: true });
   assert.deepEqual([ioSeen.present, ioSeen.shape], [true, "io_error"], JSON.stringify(ioSeen));
+  // readlink 自己的失败同样三态（评审探针：EIO 曾折成 malformed_payload；并发消失是 present:false）
+  {
+    const rlPath = path.join(claimsDir, "rl.control.lock.reaped-2a1b0c9d-8e7f-4478-8a9b-0c1d2e3f4f5a");
+    fs.symlinkSync("x", rlPath);
+    const origReadlink = fs.readlinkSync;
+    fs.readlinkSync = (p, ...a) => { if (String(p) === rlPath) { const e = new Error("EIO"); e.code = "EIO"; throw e; } return origReadlink(p, ...a); };
+    let rlIo; try { rlIo = inspectControlLockArtifact(rlPath); } finally { fs.readlinkSync = origReadlink; }
+    assert.deepEqual([rlIo.present, rlIo.shape], [true, "io_error"], "readlink EIO 不折 malformed：" + JSON.stringify(rlIo));
+    fs.readlinkSync = (p, ...a) => { if (String(p) === rlPath) { const e = new Error("ENOENT"); e.code = "ENOENT"; throw e; } return origReadlink(p, ...a); };
+    let rlGone; try { rlGone = inspectControlLockArtifact(rlPath); } finally { fs.readlinkSync = origReadlink; }
+    assert.deepEqual(rlGone, { present: false }, "lstat 后并发消失 → 不在");
+    fs.rmSync(rlPath, { force: true });
+  }
   // owner 缺 token 但其余合法 —— 仍是畸形，不许折成协议残骸说可直接删（形状逐字段缺一不可）
   const noTokenUuid = "3a2b1c0d-9e8f-4578-8a9b-0c1d2e3f4e5a";
   fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), path.join(claimsDir, key12 + ".control.lock.reaped-" + noTokenUuid));

@@ -169,8 +169,16 @@ export function inspectControlLockArtifact(fullPath) {
     return { present: true, shape: "io_error", why: String(err?.code ?? err?.message ?? err) };
   }
   if (!st.isSymbolicLink()) return { present: true, shape: "not_symlink" };
+  // readlink 自己的失败也要三态（评审探针：EIO 曾被折成 malformed_payload）：并发消失 → 不在；I/O 错 → io_error；
+  // 只有**读出来了**但 JSON / owner 形状不合法，才是 malformed_payload。
+  let raw;
+  try { raw = fs.readlinkSync(fullPath); }
+  catch (err) {
+    if (err?.code === "ENOENT") return { present: false };
+    return { present: true, shape: "io_error", why: String(err?.code ?? err?.message ?? err) };
+  }
   let owner = null;
-  try { owner = JSON.parse(fs.readlinkSync(fullPath)); } catch { owner = null; }
+  try { owner = JSON.parse(raw); } catch { owner = null; }
   const shapeOk = owner !== null && typeof owner === "object" && !Array.isArray(owner)
     && Number.isSafeInteger(owner.pid) && owner.pid > 0
     && isCanonicalIso(owner.at)

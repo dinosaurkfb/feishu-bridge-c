@@ -163,6 +163,13 @@ const TEMPLATE = {
 };
 let passed = 0;
 let failed = 0;
+
+// TEST_FILTER（竞速单 #3）：与 Claude 侧 test.mjs 同一设计 —— 逗号分隔子串，命中任一即跑；
+// 未设置时行为完全不变。被过滤的运行在汇总里明说「命中 N / 总 M」；命中 0 保持退出码 0，
+// 理由同 Claude 侧：非零必须在两侧都严格等价于「有测试真的失败」，否则变异 runner 的假 KILLED 风险回来。
+const FILTER_PARTS = (process.env.TEST_FILTER ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+const FILTERED = FILTER_PARTS.length > 0;
+let totalTests = 0;
 /**
  * 汇总打印之后就封条 —— 与 Claude 侧 test.mjs 同一条保障，理由也相同：
  * 把新测试追加到文件末尾时，它的结果不会计入统计，而套件照样报绿。
@@ -174,6 +181,8 @@ const test = (name, fn) => {
     console.error("\n✗ 测试「" + name + "」写在汇总之后 —— 它的结果不会计入统计。");
     process.exit(1);
   }
+  totalTests += 1;
+  if (FILTERED && !FILTER_PARTS.some((part) => name.includes(part))) return;
   try { fn(); passed += 1; }
   catch (err) { failed += 1; console.error("FAIL " + name + "\n" + (err.stack ?? err)); }
 };
@@ -9395,4 +9404,5 @@ test("维护门 · PR B：prompt-hook 签发的控制脚本集合 == 封闭常�
 
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
+if (FILTERED) console.log("TEST_FILTER 命中 " + (passed + failed) + " / 总 " + totalTests);
 if (failed > 0) process.exit(1);

@@ -541,6 +541,14 @@ let passed = 0;
 let failed = 0;
 const failures = [];
 
+// TEST_FILTER（竞速单 #3）：逗号分隔的子串，命中任一即跑；未设置时行为与从前完全一致。
+// 只服务变异测试的定向击杀。被过滤的运行在汇总里明说「命中 N / 总 M」，绝不冒充全量全绿 ——
+// 命中 0 时故意保持退出码 0（配汇总行）：改成非零会让变异 runner 里写错的 killedBy
+// 在「没跑任何测试」时被误读成转红、假 KILLED —— 「非零 = 有测试真的失败」这条语义不能破。
+const FILTER_PARTS = (process.env.TEST_FILTER ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+const FILTERED = FILTER_PARTS.length > 0;
+let totalTests = 0;
+
 /**
  * 汇总打印之后就封条。之后任何 `test()` 调用立刻响亮失败。
  *
@@ -560,6 +568,8 @@ function test(name, fn) {
     console.error("  把它移到 `console.log(\`\\n通过 …\`)` 之前。");
     process.exit(1);
   }
+  totalTests += 1;
+  if (FILTERED && !FILTER_PARTS.some((part) => name.includes(part))) return;
   try {
     fn();
     passed += 1;
@@ -21544,6 +21554,7 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
 
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
+if (FILTERED) console.log(`TEST_FILTER 命中 ${passed + failed} / 总 ${totalTests}\n`);
 if (failed > 0) {
   for (const f of failures) console.log("  ✗ " + f);
   process.exit(1);

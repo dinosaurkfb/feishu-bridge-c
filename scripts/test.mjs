@@ -21758,6 +21758,49 @@ test("doctor ⑥：cc2cd 旧形 rejected 精确命中 → 显示数量但不让 
   assert.doesNotMatch(six.detail, /说不清/u, "notices 不许混进 problems 文案：" + six.detail);
 });
 
+// 小债 A：doctor ① 对 self 路由的特判 —— self 是本桥自身的入站路由，它的状态由本桥自身
+//（feishu-status / doctor）提供，不要求再登记外部状态入口；判据用 defaultRouteHandler
+//（有效默认路由恰为 self 且 handler 实指 runtime/current 的 inbound），名叫 self 但
+// handler 在外的照旧 ✗；外部路由（cc2cd 形）无 provider 的回归照旧 ✗。
+test("doctor ①：self 是本桥自身 → 豁免；叫 self 但 handler 在外 / 外部路由 → 照旧 ✗", () => {
+  const runtimeInbound = (m) => path.join(m.home, ".claude", "feishu-bridge", "runtime", "current", "scripts", "inbound.mjs");
+  const machine = (name) => {
+    const m = doctorMachine({ installRuntime: true });
+    const root = m.project(name, { expiresAt: "2099-01-01T00:00:00.000Z" });
+    return { m, root };
+  };
+  const tables = (m, root, name, routes) => m.writeTables({
+    projects: [{ id: name, root, root_message_id: "om_root_" + name, status: "active", expires_at: "2099-01-01T00:00:00.000Z" }],
+    routes, sessions: { "session_aaaaaaaaaaaa": "self" }, providers: [],
+  });
+  // ① 合法 self（handler 指 runtime/current 的 inbound）、无 provider → ① ok 且文案含"本桥自身"
+  {
+    const { m, root } = machine("selfok");
+    tables(m, root, "selfok", [{ ...m.route("self"), handler: runtimeInbound(m), default: true }]);
+    const one = checkOf(doctorReport(m.run()), "route_without_provider");
+    assert.equal(one.ok, true, "self 是本桥自身，① 不许再红：" + one.detail);
+    assert.match(one.detail, /本桥自身/u, "文案要点明 self 由本桥自身提供：" + one.detail);
+  }
+  // ② 名叫 self 但 handler 指向外部 → 照旧 ✗，不给豁免文案
+  {
+    const { m, root } = machine("selffake");
+    tables(m, root, "selffake", [{ ...m.route("self"), handler: m.okProvider, default: true }]);
+    const one = checkOf(doctorReport(m.run()), "route_without_provider");
+    assert.equal(one.ok, false, "名叫 self 但 handler 在外，照旧 ✗：" + one.detail);
+    assert.match(one.detail, /self/u, "要点名 self：" + one.detail);
+    assert.doesNotMatch(one.detail, /本桥自身/u, "不许给出本桥自身的豁免文案：" + one.detail);
+  }
+  // ③ 外部路由（cc2cd 形）无 provider → 照旧 ✗；self 豁免要说明
+  {
+    const { m, root } = machine("withcc2cd");
+    tables(m, root, "withcc2cd", [{ ...m.route("self"), handler: runtimeInbound(m), default: true }, { ...m.route("cc2cd"), handler: m.okProvider }]);
+    const one = checkOf(doctorReport(m.run()), "route_without_provider");
+    assert.equal(one.ok, false, "外部路由没登记照旧 ✗：" + one.detail);
+    assert.match(one.detail, /1 条路由没有状态入口：cc2cd/u, "只数外部路由：" + one.detail);
+    assert.match(one.detail, /self 是本桥自身.{0,40}不计入/u, "self 豁免要说明：" + one.detail);
+  }
+});
+
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (TEST_FILTER.length > 0) {

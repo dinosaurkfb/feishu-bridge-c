@@ -256,7 +256,8 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
         }[lockEntry.family];
         if (lockEntry.family === "reaped" || lockEntry.family === "quarantine") {
           const a = inspectControlLockArtifact(path.join(claimsDir, name));
-          byFamily[1] += a.shape === "symlink_owner" ? " —— 可直接删"
+          byFamily[1] += a.present === false ? " —— 盘点时已不在（可能刚被清掉），不用处理"
+            : a.shape === "symlink_owner" ? " —— 可直接删"
             : a.shape === "io_error" ? "（盘点失败：" + a.why + "）—— 情况说不清，请人工核对，不要直接删"
             : " —— 但形态不是本协议的制品（不是 symlink 或 payload 畸形）：先核验再处理，只人工处置，不要直接删";
         }

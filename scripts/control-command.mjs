@@ -134,7 +134,7 @@ const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
  *   reap        reap 段锁：段内几毫秒；残骸交显式维护入口 repair-publish-lock --lock <主锁路径>
  *   maint       维护锁：只能由人确认没有维护者在跑后手动删
  *   reaped      回收时 rename 走、没删成的残骸（.reaped-<uuid>）：**形状合法的 symlink** 可直接删
- *   quarantine  维护入口隔离后没删成的残骸（.reap.quarantine-<…>）：**形状合法的 symlink** 交 repair-publish-lock 清
+ *   quarantine  维护入口隔离后没删成的残骸（.reap.quarantine-<…>）：**形状合法的 symlink** 可直接删（已离开原路径、不涉归属，与 reaped 同理）
  * 别的后缀不是家族成员（按 unrecognized_entry 报）。残骸两族说"可直接删"前先过 inspectControlLockArtifact 的
  * 形态判别（与共享维护器 clearStaleReapLock 同一判据，issue #85）—— 名字像不等于协议写出来的。
  */

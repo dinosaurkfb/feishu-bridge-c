@@ -7,7 +7,7 @@
  * v2：标识符全部换到 Aily 命名空间（见 selector.mjs 顶部说明）。
  */
 
-import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry, normalizeControlText, CONTROL_MODE_WORDS } from "./control-command.mjs";
+import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry, inspectControlLockArtifact, normalizeControlText, CONTROL_MODE_WORDS } from "./control-command.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
@@ -18640,6 +18640,8 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
     assert.ok(/只人工处置|先核验/u.test(hit.why), "假制品的文案要收成人工处置：" + hit.why);
     assert.ok(!hit.why.includes("可直接删"), "假制品绝不说可直接删：" + hit.why);
   }
+  // 快照后消失（present:false）不是"形态不对"：单元断言三态齐（不存在 / EACCES 是 io_error 不折 absent）
+  assert.deepEqual(inspectControlLockArtifact(path.join(claimsDir, "no-such-artifact")), { present: false });
   fs.rmSync(path.join(claimsDir, key12 + ".control.lock.reaped-" + fileUuid), { force: true });
   fs.rmSync(path.join(claimsDir, key12 + ".control.lock.reap.quarantine-" + dirUuid), { recursive: true, force: true });
   fs.rmSync(path.join(claimsDir, key12 + ".control.lock.reaped-" + badPayloadUuid), { force: true });

@@ -164,12 +164,17 @@ function main(argv) {
   }
   // ── 证据必须绑定**干净提交**（评审探针：test.mjs 脏时仍报 KILLED/退出 0）：任何套件跑之前，
   // git 可用、整树 tracked 无未提交改动，冻结 commit SHA —— 并行 worker 的 worktree 也检出这个 SHA 并复核。
+  // ROOT 必须是**仓根本身**（评审探针：子目录会由 rev-parse 向上借到父仓的 SHA，证据就绑错了对象）
+  const top = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: ROOT, encoding: "utf-8" });
+  if (top.status !== 0) { console.error("✗ git rev-parse --show-toplevel 失败（不在 git 仓里？）—— 变异证据必须绑定提交，不跑"); return 2; }
+  if (fs.realpathSync(top.stdout.trim()) !== fs.realpathSync(ROOT)) { console.error("✗ --root（" + ROOT + "）不是仓根（" + top.stdout.trim() + "）—— 子目录会借到父仓 SHA，拒跑"); return 2; }
   const rev = spawnSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf-8" });
-  if (rev.status !== 0) { console.error("✗ git rev-parse HEAD 失败（不在 git 仓里？）—— 变异证据必须绑定提交，不跑"); return 2; }
+  if (rev.status !== 0) { console.error("✗ git rev-parse HEAD 失败 —— 变异证据必须绑定提交，不跑"); return 2; }
   const frozenSha = rev.stdout.trim();
-  const dirty = spawnSync("git", ["status", "--porcelain", "-uno"], { cwd: ROOT, encoding: "utf-8" });
+  // untracked 也要空（评审探针：-uno 会放过未跟踪的 scripts/ / skills/ 复制树影响套件）；.DS_Store 这类确定无关项进 .gitignore，不靠忽略 untracked
+  const dirty = spawnSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: ROOT, encoding: "utf-8" });
   if (dirty.status !== 0 || dirty.stdout.trim() !== "") {
-    console.error("✗ 工作树有未提交改动（tracked）—— 变异证据必须绑定干净提交，先提交或还原：\n" + (dirty.stdout ?? "").trim());
+    console.error("✗ 工作树不干净（含未跟踪文件）—— 变异证据必须绑定干净提交，先提交 / 还原 / 清理（确定无关的加 .gitignore）：\n" + (dirty.stdout ?? "").trim());
     return 2;
   }
   // ── --assume-green 是并行 worker 的**内部协议**（评审探针：裸调可无凭据跳过第一层全量基线）：
@@ -315,9 +320,11 @@ async function mainParallel(picked, jobs, frozenSha) {
     console.log("\n──── worker " + (i + 1) + "（" + r.ids.join(" ") + "）────");
     process.stdout.write(r.out);
     const sum = lastMatch(/KILLED (\d+) \/ SURVIVED (\d+) \/ 异常 (\d+)/gu, r.out);
-    // worker 的退出码要与汇总互证；汇总三桶之和要等于分片条数（只验结构不验自洽等于没验）
-    if (!sum || (r.code !== 0 && r.code !== 1)) { console.log("  ! worker " + (i + 1) + (sum ? " 退出码异常（" + r.code + "）" : " 没打汇总（退出码 " + r.code + "）") + " —— 这一片的结论作废"); anomalies += r.ids.length; continue; }
+    // worker 的退出码要与汇总**互证**（评审探针：汇总全绿但退出码 1 曾被照收）；三桶之和要等于分片条数
+    if (!sum) { console.log("  ! worker " + (i + 1) + " 没打汇总（退出码 " + r.code + "）—— 这一片的结论作废"); anomalies += r.ids.length; continue; }
     const [k, s, a] = [Number(sum[1]), Number(sum[2]), Number(sum[3])];
+    const expectCode = s + a > 0 ? 1 : 0;
+    if (r.code !== expectCode) { console.log("  ! worker " + (i + 1) + " 退出码 " + r.code + " 与汇总（应为 " + expectCode + "）对不上 —— 这一片的结论作废"); anomalies += r.ids.length; continue; }
     if (k + s + a !== r.ids.length) { console.log("  ! worker " + (i + 1) + " 汇总 " + (k + s + a) + " ≠ 分片 " + r.ids.length + " 条 —— 这一片的结论作废"); anomalies += r.ids.length; continue; }
     killed += k; survived += s; anomalies += a;
   }

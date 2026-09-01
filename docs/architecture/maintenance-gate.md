@@ -71,7 +71,7 @@
 - `prepared` 或 `done` 且现场 == intendedAfter → 做过：回退方向写回 before（用备份原字节 / 原目标），前进方向保留；
 - 现场既不是 before 也不是 after → `rollback_incomplete`（该项留给人，门与账保留）。
 
-阶段：`planned → timer_stopped → stubbed → gated → drained → staged → committed → verified → reopening → done | reopening_incomplete`；失败分支 `rolling_back → rollback_reopening → rolled_back | rollback_incomplete`。`*_incomplete` = 动了但没做完（CAS 不成立、撤门后归属转换锁交不还、active 清不掉）：门与账保留，`--exit --apply` 只向前重试。journal 形状按 step kind 封闭（timer / current / stub / gate / artifact / receipt 各自的 before / intended_after / after），phase 与"必须已 done 的 step"一致；备份先写满 fsync，sha256 与长度进账，恢复前核验。
+阶段：`planned → timer_stopped → stubbed → gated → drained → staged → committed → verified → reopening → done | reopening_incomplete`；失败分支 `rolling_back → rollback_reopening → rolled_back | rollback_incomplete`。`*_incomplete` = 动了但没做完（CAS 不成立、撤门后归属转换锁交不还、active 清不掉）：门与账保留，`--exit --apply` 只向前重试。`rolling_back` 里恢复 install 写入时有说不清的项 → **停在 `rolling_back`**（同样门与账保留，`--exit --apply` 重试的是恢复本身），全部干净才进不可逆的 `rollback_reopening`。journal 形状按 step kind 封闭（timer / current / stub / gate / artifact / receipt 各自的 before / intended_after / after；current 的 id 是 `current:<chain>`（enter：原目标 → 桩）或 `current:<chain>:install`（commit：桩 → versions/<v>）），phase 与"必须已 done 的 step"一致（committed 及之后要求两条 `current:<chain>:install` 与 `receipt:<chain>` 都 done）；备份先写满 fsync，sha256 与长度进账，恢复前核验。
 
 **执行租约**：同一 operation 的 enter / exit / 续跑只许一个执行者 —— `maintenance/<token>.lease`（registry 锁协议，**只按持有者 pid 活性接管，不按时间**，等进程可以很久），journal 每次写入都在租约 reap 段内核对 token（被接管后晚到的写入 lease_lost，不落盘）；写入还核 active 仍指向本 token、阶段前驱合法。
 
@@ -92,17 +92,17 @@
 
 1. **stage**：
    - 两条链把新版本落到 `versions/<v>/`（`applyRuntimeSync` 拆出的 `stageRuntimeVersion`，只落目录不切 current）。**`versions/<v>/` 是内容寻址的不可变缓存，不是线上状态**：current 不指它就不可达；operation 失败时**保留**（可重用），不算"改了线上"；
-   - 目标投影 `renderArtifacts({ home, codexHome, runtimeVersion:v, base })`：**输入每个制品此刻的基线字节**（`base = { exists, sha, bytes }`，缺席也是一种明确基线），输出 `[{ path, base:{exists,sha}, bytes, intendedAfterSha }]`，写进 `maintenance/<token>/staged/`；同时写目标版本的**安装收据草稿**；
-   - **不碰任何线上配置**。
-2. **verify staged**：`verifyRuntimeVersion({ root, version })` 两链通过；staged 制品引用的脚本都在 `versions/<v>/scripts/` 且在桩清单里。
-3. **commit**（门仍在）：
-   - 两条 `current`：各自 prepared（桩 → `versions/<v>`）→ rename → done；第二条失败 → 第一条按恢复规则切回桩；
-   - 每个制品：**写前 CAS**：现场 `{exists, sha}` 必须 == stage 时的 base，否则整次中止并回退已写项（`base_changed`，点名）；通过 → prepared（备份原字节）→ 原子写 → done；
-   - 全部写完 → 机器级收据 `installed-surface.json` 按同样的两阶段记账写入（before 条目 / intendedAfter 条目）→ `committed`；版本目录不写任何机器相关的东西。
-4. **verify live**：`verifyRuntime` 两链；线上制品 sha == after；launchd 期望 job 与新 runtime 一致；Codex 阻断探针（无模型）通过。
-5. **reopening**（不可逆）：定时器到目标状态（用**目标 plist**；Claude 一律 bootstrap，Codex 按原始三态）→ 删桩目录 → token-CAS 删门 → 持久化 `done` → 最后 token-CAS 清 `active`。
+   - 目标投影 `renderArtifacts({ home, codexHome, codexBridgeHome, runtimeVersion:v, templates, base })`：**输入每个制品此刻的基线字节**（`base(path) → { exists, sha256, bytes }`，fd 绑定读，缺席也是一种明确基线；技能 / 模板从 `templates.<chain>` = `versions/<v>/` 读，不读线上），输出 `[{ chain, path, kind, bytes, base:{exists,sha256}, intendedAfterSha, inReceipt }]` 与两条链的**安装收据草稿**。制品集合与三个安装器逐一对应；**Codex 兜底 plist 只在基线存在时写目标字节且不进收据**（drain-service 才装它，安装器不替人启用）；
+   - 全部写进 `maintenance/<token>.staged/`（`artifacts/<n>` 目标字节 + `plan.json` + 之后 commit 的 `backups/`）；**不碰任何线上配置**。
+2. **verify staged**：`verifyRuntimeVersion({ root, version })` 两链通过；staged 制品与收据草稿引用的脚本都在桩清单里、且在本链 `versions/<v>/scripts/` 下存在（桩清单以 `versions/<v>/` 为源码树重算，missing 为空）。commit 前再跑一遍同一组检查。
+3. **commit**（门仍在；每步先绑定：active token、阶段前驱、门 active 且 token 一致、两条 `current` 仍是本 token 的桩）：
+   - 两条 `current`：各自 prepared（桩 → `versions/<v>`）→ `activateRuntimeVersion`（先验目录再切）→ done；任一条失败 → 整次中止，由回退按恢复规则切回桩。门还开着，新 runtime 的每个写入口都看门，切过去不等于放行；
+   - 每个制品：**写前 CAS**：现场 `{exists, sha}` 必须 == stage 时的 base，否则整次中止并回退已写项（`base_changed`，点名）；通过 → prepared（原字节备份进 `<token>.staged/backups/`）→ 原子持久写 → done；
+   - 两份机器级收据（每链一份）按同样两阶段记账：**确定性**合并出 intended 字节（与 `recordInstalledSurface` 同一合并语义：版本变了整链换）→ prepared（原收据备份）→ **收据事务锁**内重读 CAS 后写入 → done → `committed`；版本目录不写任何机器相关的东西。
+4. **verify live**：`verifyRuntime` 两链 == v；线上制品 sha == after；plist 制品的 ProgramArguments == 期望 job（窗口内定时器本来就停着，装完由 reopening 决定是否 loaded）；**Codex 阻断探针（无模型）**：门还开着，起新 runtime 的 `codex/prompt-hook.mjs`（Aily 环境、门与桥目录经环境注入），必须顶层 `decision:"block"`。
+5. **reopening**（不可逆）：定时器到目标状态（用**目标 plist**；Claude 一律 bootstrap，Codex 按原始三态）→ 删桩目录 → 删 `<token>.staged/` → token-CAS 删门 → 持久化 `done` → 最后 token-CAS 清 `active`。
 
-`maintenance-install --apply` = enter（预检 → journal → 停定时器 → 切桩 → 建门 → 等进程）→ 1–5。1–4 里任一步失败按 journal 回退到进门前（含 `versions/<v>/` 保留这一条例外）。
+`maintenance-install [--reason <r>] [--wait-ms N] --apply` = enter（预检 → journal → 停定时器 → 切桩 → 建门 → 等进程）→ 1–5。1–4 里任一步失败按 journal 回退到进门前（含 `versions/<v>/` 保留这一条例外）：`rolling_back` 先**逆序**恢复 install 写入（收据 → 制品 → `current:<chain>:install` 回桩，各自 CAS；说不清 → 停在 `rolling_back` 可重试），全部干净才进 `rollback_reopening`。`lease_reap_uncleared` → 立即停，什么都不再动。
 
 ## 命令面
 
@@ -110,10 +110,10 @@
 node scripts/maintenance-gate.mjs --status                       # 只读：门 / active / journal / 桩 / 定时器三态，以及 reopening 未完
 node scripts/maintenance-gate.mjs --enter --reason "<≤80 码点>" [--wait-ms 60000]
 node scripts/maintenance-gate.mjs --exit                         # 未到 reopening：按 journal CAS 回退；已到 reopening：只向前继续
-node scripts/maintenance-install.mjs [--apply]                   # enter → stage → verify → commit → verify → reopening
+node scripts/maintenance-install.mjs [--reason "<≤80 码点>"] [--wait-ms N] [--apply]   # enter → stage → verify → commit → verify → reopening；默认只预览
 ```
 
-`--enter` / `--exit` / `--apply` 都是安装类授权（Frank 逐次授权）。不提供 `--force` / `--kill`。没有 stage / commit CLI。
+`--enter` / `--exit` / `--apply` 都是安装类授权（Frank 逐次授权）。不提供 `--force` / `--kill`。没有 stage / commit CLI（`scripts/maintenance/maintenance-install-core.mjs` 只是模块 API，每步绑定 active operation）。退出码同 maintenance-gate：0 完成 / 预览；1 拒绝或失败但已完整回退；3 动了没做完（门与账保留）。
 
 ## 不变量（测试要盯的）
 

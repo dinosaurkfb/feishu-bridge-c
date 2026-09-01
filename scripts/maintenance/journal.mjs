@@ -37,12 +37,20 @@ export const INCOMPLETE_PHASES = Object.freeze(["reopening_incomplete", "rollbac
 export const FORWARD_ONLY_PHASES = Object.freeze(["reopening", "rollback_reopening", ...TERMINAL_PHASES, ...INCOMPLETE_PHASES]);
 export const STEP_KINDS = Object.freeze(["timer", "stub", "current", "gate", "artifact", "receipt"]);
 export const TIMER_PHASES = Object.freeze(["loaded", "installed_not_loaded", "absent"]);
-/** 走到某阶段时必须已 done 的 step。 */
+/** 走到某阶段时必须已 done 的 step。install 步（PR C 第 2 步）：commit 之后要求两条 current:<chain>:install 与两条收据。 */
+const ENTER_DONE = Object.freeze(["timer:claude", "timer:codex", "stub:claude", "stub:codex", "current:claude", "current:codex", "gate"]);
+const INSTALL_DONE = Object.freeze([...ENTER_DONE, "current:claude:install", "current:codex:install", "receipt:claude", "receipt:codex"]);
 export const PHASE_REQUIRES = Object.freeze({
   timer_stopped: ["timer:claude", "timer:codex"],
   stubbed: ["timer:claude", "timer:codex", "stub:claude", "stub:codex", "current:claude", "current:codex"],
-  gated: ["timer:claude", "timer:codex", "stub:claude", "stub:codex", "current:claude", "current:codex", "gate"],
-  drained: ["timer:claude", "timer:codex", "stub:claude", "stub:codex", "current:claude", "current:codex", "gate"],
+  gated: ENTER_DONE,
+  drained: ENTER_DONE,
+  staged: ENTER_DONE,
+  committed: INSTALL_DONE,
+  verified: INSTALL_DONE,
+  reopening: INSTALL_DONE,
+  done: INSTALL_DONE,
+  reopening_incomplete: INSTALL_DONE,
 });
 const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const SHA_SHAPE = /^[0-9a-f]{64}$/u;
@@ -78,7 +86,8 @@ function shapeProblemFor(s) {
     return null;
   }
   if (kind === "current") {
-    if (!idOk || !CHAIN_ID.test(rest)) return "current 的 id 必须是 current:<chain>";
+    // enter 步 current:<chain>（原目标 → 桩）；install 步 current:<chain>:install（桩 → versions/<v>，PR C 第 2 步的 commit）
+    if (!idOk || !/^(claude|codex)(:install)?$/u.test(rest)) return "current 的 id 必须是 current:<chain> 或 current:<chain>:install";
     if (!(s.before === null || (typeof s.before === "string" && REL_TARGET.test(s.before)))) return "current.before 不是 null 或 versions/<x>";
     if (!(typeof s.intended_after === "string" && REL_TARGET.test(s.intended_after))) return "current.intended_after 不是 versions/<x>";
     if (!(s.after === null || (typeof s.after === "string" && REL_TARGET.test(s.after)))) return "current.after 形状不对";
@@ -332,6 +341,7 @@ export function inspectMaintenanceDir({ dir } = {}) {
     if (/^[0-9a-f-]{36}\.lease\.(reap|maint)$/u.test(n) || /^[0-9a-f-]{36}\.lease\.reaped-/u.test(n) || /^[0-9a-f-]{36}\.lease\.reap\.quarantine-/u.test(n)) { residues.push({ path: full, kind: "lease_lock_residue", detail: "租约锁家族残骸 —— node scripts/repair-publish-lock.mjs --lock " + path.join(dir, n.split(".lease")[0] + ".lease") + " 能清（.reap / 隔离），其余只人工处置" }); continue; }
     if (/^\.journal\.\d+\.[0-9a-f-]{36}\.tmp$/u.test(n)) { residues.push({ path: full, kind: "tmp", detail: "写 journal 的临时文件残骸 —— 人工删即可" }); continue; }
     if ((m = /^([0-9a-f-]{36})\.(claude|codex)\.plist$/u.exec(n)) && UUID_SHAPE.test(m[1])) { if (m[1] !== activeToken) residues.push({ path: full, kind: "stale_backup", detail: "非 active operation 的 plist 备份 —— 只人工处置" }); continue; }
+    if ((m = /^([0-9a-f-]{36})\.staged$/u.exec(n)) && UUID_SHAPE.test(m[1])) { if (m[1] !== activeToken) residues.push({ path: full, kind: "stale_staged", detail: "非 active operation 的 staged 目录（目标制品与备份）—— 只人工处置" }); continue; }
     residues.push({ path: full, kind: "unknown", detail: "维护目录里不认识的文件 —— 只人工处置" });
   }
   return { inventory: "ok", residues };

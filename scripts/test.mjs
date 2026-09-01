@@ -21301,6 +21301,14 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
     assert.deepEqual([forged.ok, forged.reason, fs.existsSync(stagedDirPath(ctx, e2.token)), readJournal({ dir, token: e2.token }).doc.phase], [false, "lease_not_held", false, "drained"], "伪造租约路径 → 零写入：" + JSON.stringify(forged));
     assert.deepEqual([stageForInstall(ctx, { sourceRoot: srcV3 }).reason, fs.existsSync(stagedDirPath(ctx, e2.token))], ["lease_required", false], "缺租约受控拒绝且零写入，不裸抛");
     let lease = acquireOperationLease({ dir, token: e2.token }); assert.equal(lease.ok, true);
+    // bind 的 fencing 段归属转换锁交不还 → 立即停，stage 零写入（评审探针：曾被吞掉照写 staged）
+    const versionsBefore = fs.readdirSync(path.join(claudeRoot, "versions")).sort();
+    const origRmB = fs.rmSync; let armB = true;
+    fs.rmSync = (t, ...a) => { if (armB && String(t).endsWith(e2.token + ".lease.reap")) { armB = false; const e = new Error("EIO"); e.code = "EIO"; throw e; } return origRmB(t, ...a); };
+    let reapStage;
+    try { reapStage = stageForInstall(ctx, { sourceRoot: srcV3, lease }); } finally { fs.rmSync = origRmB; }
+    assert.deepEqual([reapStage.ok, reapStage.reason, String(reapStage.path).endsWith(".lease.reap"), fs.existsSync(stagedDirPath(ctx, e2.token)), fs.readdirSync(path.join(claudeRoot, "versions")).sort(), readJournal({ dir, token: e2.token }).doc.phase], [false, "lease_reap_uncleared", true, false, versionsBefore, "drained"], "fencing 残骸 → 版本缓存 / staged / journal 全部零改动：" + JSON.stringify(reapStage));
+    fs.unlinkSync(path.join(dir, e2.token + ".lease.reap"));
     // 维护窗口内三个普通安装器 --apply 一律被门拒（评审返修：消掉"安装写方不受门阻断"这个前提），零改动
     const gEnv = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };
     const settingsBytesGate = fs.readFileSync(path.join(home, ".claude", "settings.json"));
@@ -21463,6 +21471,40 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
     assert.deepEqual([alien.ok, alien.items.some((t) => /allowlist/u.test(t))], [false, true], JSON.stringify(alien));
     assert.equal(activateRuntimeVersionB({ version: v2, root: claudeRoot, expectBefore: "versions/nope" }).reason, "current_changed", "expectBefore 的 CAS 在安装锁内、不切");
     assert.equal(fs.readlinkSync(path.join(claudeRoot, "current")), "versions/" + v3, "CAS 拒了就不动 current");
+    // ── 安装面锁释放失败不许报成功（评审探针：.reap 删除 EIO 时曾照样退 0）
+    const surfaceLockFile = path.join(home, ".claude", "feishu-bridge", "install-surface.lock");
+    const holdProbe = path.join(base, "hold-probe.mjs");
+    fs.writeFileSync(holdProbe, [
+      'import fs from "node:fs";',
+      'import { holdInstallSurfaceLockOrExit } from ' + JSON.stringify(path.resolve("scripts", "install-surface-lock.mjs")) + ";",
+      "holdInstallSurfaceLockOrExit();",
+      "const orig = fs.rmSync;",
+      'fs.rmSync = (t, ...a) => { if (String(t).endsWith("install-surface.lock.reap")) { const e = new Error("EIO"); e.code = "EIO"; throw e; } return orig(t, ...a); };',
+      "", // 自然结束 → exit 钩子释放失败 → exitCode 3
+    ].join("\n"));
+    const probeRun = spawnSync(process.execPath, [holdProbe], { encoding: "utf-8", env: { ...process.env, HOME: home } });
+    assert.deepEqual([probeRun.status, /repair-publish-lock/u.test(probeRun.stderr)], [3, true], "释放失败必须退 3 并指路 repair：" + probeRun.stderr);
+    try { fs.unlinkSync(surfaceLockFile + ".reap"); } catch { /* 没留 */ }
+    try { fs.unlinkSync(surfaceLockFile); } catch { /* 已还 */ }
+    // 两个维护 CLI：业务码之外，释放失败一律压成 3
+    const armReap = () => { const orig = fs.rmSync; let n = 0; fs.rmSync = (t, ...a) => { if (String(t).endsWith("install-surface.lock.reap") && ++n === 1) { const e = new Error("EIO"); e.code = "EIO"; throw e; } return orig(t, ...a); }; return () => { fs.rmSync = orig; }; };
+    let disarm = armReap(); const outR1 = [];
+    let codeR1; try { codeR1 = runMaintenanceGate(["--exit", "--apply"], { ctx, out: (t) => outR1.push(t) }); } finally { disarm(); }
+    assert.deepEqual([codeR1, /安装面锁交不还/u.test(outR1.join("\n"))], [3, true], "业务码 1（no_operation）也要被释放失败压成 3：" + outR1.join("\n"));
+    fs.unlinkSync(surfaceLockFile + ".reap");
+    assert.equal(createGate({ file: gateFile, reason: "挡 enter", token: "33333333-3333-4333-8333-333333333333", now: clock }).ok, true);
+    disarm = armReap(); const outR2 = [];
+    let codeR2; try { codeR2 = runMaintenanceInstall(["--apply"], { ctx: { ...ctx, repoRoot: srcV3 }, out: (t) => outR2.push(t) }); } finally { disarm(); }
+    assert.deepEqual([codeR2, /安装面锁交不还/u.test(outR2.join("\n"))], [3, true], outR2.join("\n"));
+    fs.unlinkSync(surfaceLockFile + ".reap");
+    assert.equal(removeGate({ file: gateFile, token: "33333333-3333-4333-8333-333333333333" }).ok, true);
+    // ── 安装面锁的只读盘点（--status / doctor 同源）：残骸点名并指路
+    fs.symlinkSync("junk", surfaceLockFile + ".reap");
+    const stLock = maintenanceStatus(ctx);
+    assert.deepEqual([stLock.surfaceLock.holder.state, stLock.surfaceLock.residues.map((r) => r.kind)], ["absent", ["reap"]], JSON.stringify(stLock.surfaceLock));
+    assert.match(renderStatus(stLock), /安装面锁/u);
+    assert.match(renderStatus(stLock), /repair-publish-lock/u);
+    fs.unlinkSync(surfaceLockFile + ".reap");
     // ── 参数封闭
     assert.deepEqual([parseMaintenanceInstallArgs([]).ok, parseMaintenanceInstallArgs(["--apply", "--apply"]).ok, parseMaintenanceInstallArgs(["--force"]).ok, parseMaintenanceInstallArgs(["--reason"]).ok, parseMaintenanceInstallArgs(["--wait-ms", "x"]).ok, parseMaintenanceInstallArgs(["--reason", "r", "--wait-ms", "10", "--apply"])], [true, false, false, false, false, { ok: true, reason: "r", waitMs: 10, apply: true }]);
   } finally {

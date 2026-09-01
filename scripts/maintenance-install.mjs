@@ -68,8 +68,14 @@ export function runMaintenanceInstall(argv, { ctx = null, out = (s) => process.s
   // 门检是瞬时的，锁才是原子准入：已过门检的安装器与将要建门的维护流程在这里互斥。
   const surface = acquireInstallSurfaceLock({ home: c.home });
   if (!surface.ok) { out("安装面锁拿不到（" + surface.reason + "：" + String(surface.why) + "，" + surface.path + "）—— 什么都没动。"); return surface.reason === "surface_install_busy" ? 1 : 3; }
-  try { return applyUnderSurfaceLock(); }
-  finally { const rel = surface.release(); if (!rel.ok) out("安装面锁交不还（" + String(rel.why) + "，" + String(rel.path) + "）—— 会被下一个写方按 pid 活性接管，请人工核对。"); }
+  let cliCode;
+  try { cliCode = applyUnderSurfaceLock(); }
+  finally {
+    const rel = surface.release();
+    // 释放失败不许报成功（评审探针）：点名残骸并把整次结果压成 3
+    if (!rel.ok) { out("安装面锁交不还（" + String(rel.why) + "，" + String(rel.path) + "）。"); cliCode = 3; }
+  }
+  return cliCode;
 
   function applyUnderSurfaceLock() {
   // ── enter：keepLease —— 从进门到 reopening / 回退结束连续持有同一租约（释放再重取会留出 operation 被换掉的窗口）

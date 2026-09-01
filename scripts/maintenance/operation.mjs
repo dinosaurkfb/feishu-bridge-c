@@ -18,6 +18,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { createGate, maintenanceGatePath, normalizeGateReason, readGate, removeGate } from "../maintenance-gate-core.mjs";
+import { inspectInstallSurfaceLock } from "../install-surface-lock.mjs";
 import { readRegularFile, withInstalledSurfaceLock } from "../installed-surface.mjs";
 import { switchCurrentTarget } from "../runtime-install.mjs";
 import { spawnLaunchctl } from "../launchd-job.mjs";
@@ -65,7 +66,8 @@ export function maintenanceStatus(ctx) {
   const phase = journal?.state === "valid" ? journal.doc.phase : null;
   const pendingReopening = phase !== null && FORWARD_ONLY_PHASES.includes(phase) && !TERMINAL_PHASES.includes(phase);
   const residues = inspectMaintenanceDir({ dir: ctx.dir });
-  return { gate, active, journal, lease, phase, pendingReopening, chains, residues, dir: ctx.dir, gateFile: ctx.gateFile };
+  const surfaceLock = inspectInstallSurfaceLock({ home: ctx.home });
+  return { gate, active, journal, lease, phase, pendingReopening, chains, residues, surfaceLock, dir: ctx.dir, gateFile: ctx.gateFile };
 }
 
 export function renderStatus(s) {
@@ -85,6 +87,11 @@ export function renderStatus(s) {
   }
   if (s.residues?.inventory === "unreadable") lines.push("维护目录  ：读不出 —— " + s.residues.residues.map((r) => r.detail).join("；"));
   else if (s.residues?.residues?.length > 0) { lines.push("维护目录残骸 " + s.residues.residues.length + " 处（只报告，不自动清）："); for (const r of s.residues.residues) lines.push("  · " + r.path + "：" + r.detail); }
+  if (s.surfaceLock) {
+    const h = s.surfaceLock.holder;
+    lines.push("安装面锁  ：" + (h.state === "absent" ? "没人持有" : h.state === "held" ? "pid " + h.pid + (h.alive ? "（在跑）" : "（已不在，下一个写方会按 pid 活性接管）") : "说不清（" + h.why + "）—— " + s.surfaceLock.path));
+    for (const r of s.surfaceLock.residues) lines.push("  · " + r.path + "：" + r.detail);
+  }
   return lines.join("\n");
 }
 

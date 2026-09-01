@@ -80,6 +80,8 @@ export function bindActiveOperation(ctx, { expectPhase, expectCurrent = "stub", 
     try { held = commitWhileHeld(lease.path, () => "held"); }
     catch (err) { return { ok: false, reason: "lease_not_held", why: "租约核验抛错：" + String(err?.code ?? err?.message ?? err), token }; }
     if (!held.ok || held.run !== "held") return { ok: false, reason: "lease_not_held", why: "调用方并不持有该租约实例（" + String(held.reason ?? "未持有") + "）", token };
+    // fencing 段的归属转换锁交不还（评审探针：曾被吞掉，stage 照写 staged 目录）：之后每次写账都会 reap_residue —— 在做任何写之前立即停
+    if (held.reapUncleared) return { ok: false, reason: "lease_reap_uncleared", why: String(held.reapUncleared.error ?? ""), path: held.reapUncleared.path, token };
   }
   const j = readJournal({ dir: ctx.dir, token });
   if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token };

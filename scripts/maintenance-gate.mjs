@@ -48,8 +48,16 @@ export function runMaintenanceGate(argv, { ctx = null, out = (s) => process.stdo
     surface = acquireInstallSurfaceLock({ home: c.home });
     if (!surface.ok) { out("安装面锁拿不到（" + surface.reason + "：" + String(surface.why) + "，" + surface.path + "）—— 什么都没动。"); return surface.reason === "surface_install_busy" ? 1 : 3; }
   }
-  try { return runMaintenanceGateLocked(parsed, c, out); }
-  finally { if (surface !== null) { const rel = surface.release(); if (!rel.ok) out("安装面锁交不还（" + String(rel.why) + "，" + String(rel.path) + "）—— 会被下一个写方按 pid 活性接管，请人工核对。"); } }
+  let code;
+  try { code = runMaintenanceGateLocked(parsed, c, out); }
+  finally {
+    if (surface !== null) {
+      const rel = surface.release();
+      // 释放失败不许报成功（评审探针：.reap 删除 EIO 时曾保留原返回码）：点名残骸并把整次结果压成 3
+      if (!rel.ok) { out("安装面锁交不还（" + String(rel.why) + "，" + String(rel.path) + "）。"); code = 3; }
+    }
+  }
+  return code;
 }
 
 function runMaintenanceGateLocked(parsed, c, out) {

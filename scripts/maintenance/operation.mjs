@@ -12,18 +12,21 @@
  *
  * 测试注入点（只给测试用）：ctx.launchctl / ctx.ps / ctx.sleep / ctx.now / ctx.afterStep（在某一步 done 之后抛 { simulatedCrash:true } 模拟进程死在中间）/ ctx.gateOps。
  */
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 import { createGate, maintenanceGatePath, normalizeGateReason, readGate, removeGate } from "../maintenance-gate-core.mjs";
+import { inspectInstallSurfaceLock } from "../install-surface-lock.mjs";
+import { readRegularFile, withInstalledSurfaceLock } from "../installed-surface.mjs";
 import { switchCurrentTarget } from "../runtime-install.mjs";
 import { spawnLaunchctl } from "../launchd-job.mjs";
 import { pickClaudeNode } from "../drain-schedule.mjs";
 import { bridgeHome as codexBridgeHomeOf } from "../codex/state.mjs";
 import {
   FORWARD_ONLY_PHASES, INCOMPLETE_PHASES, TERMINAL_PHASES, acquireOperationLease, addNote, addStepPrepared, clearActive, createOperation, inspectMaintenanceDir, leaseHolder, maintenanceDir,
-  markStepDone, readActive, readJournal, releaseOperationLease, setPhase, verifyBackup, writeBackup,
+  markStepDone, readActive, readJournal, releaseOperationLease, setPhase, verifyBackup, writeBackup, writeDurable,
 } from "./journal.mjs";
 import { buildStubVersion, isStubTarget, readStubManifest, removeStubVersion, stubDirName, stubRelTarget } from "./stub.mjs";
 import { defaultPs, waitForQuiet } from "./inventory.mjs";
@@ -63,7 +66,8 @@ export function maintenanceStatus(ctx) {
   const phase = journal?.state === "valid" ? journal.doc.phase : null;
   const pendingReopening = phase !== null && FORWARD_ONLY_PHASES.includes(phase) && !TERMINAL_PHASES.includes(phase);
   const residues = inspectMaintenanceDir({ dir: ctx.dir });
-  return { gate, active, journal, lease, phase, pendingReopening, chains, residues, dir: ctx.dir, gateFile: ctx.gateFile };
+  const surfaceLock = inspectInstallSurfaceLock({ home: ctx.home });
+  return { gate, active, journal, lease, phase, pendingReopening, chains, residues, surfaceLock, dir: ctx.dir, gateFile: ctx.gateFile };
 }
 
 export function renderStatus(s) {
@@ -83,6 +87,11 @@ export function renderStatus(s) {
   }
   if (s.residues?.inventory === "unreadable") lines.push("维护目录  ：读不出 —— " + s.residues.residues.map((r) => r.detail).join("；"));
   else if (s.residues?.residues?.length > 0) { lines.push("维护目录残骸 " + s.residues.residues.length + " 处（只报告，不自动清）："); for (const r of s.residues.residues) lines.push("  · " + r.path + "：" + r.detail); }
+  if (s.surfaceLock) {
+    const h = s.surfaceLock.holder;
+    lines.push("安装面锁  ：" + (h.state === "absent" ? "没人持有" : h.state === "held" ? "pid " + h.pid + (h.alive ? "（在跑）" : "（已不在，下一个写方会按 pid 活性接管）") : "说不清（" + h.why + "）—— " + s.surfaceLock.path));
+    for (const r of s.surfaceLock.residues) lines.push("  · " + r.path + "：" + r.detail);
+  }
   return lines.join("\n");
 }
 
@@ -91,8 +100,10 @@ const withLeaseResidue = (result, rel) => (rel.ok ? result : { ...result, ok: fa
 
 /**
  * 进门。apply=false 只做预检并给计划。返回 { ok, token, phase } 或 { ok:false, reason, ..., rollback }。
+ * keepLease=true（maintenance-install 用）：进门成功时**不释放执行租约**，随结果带回（{ lease }），
+ * 由调用方连续持有到 reopening / 回退结束 —— 释放再重取会留出"旧 operation 被退出、新 operation 建立"的窗口（评审探针）。
  */
-export function enterMaintenance(ctx, { reason, waitMs = 60000, apply = false } = {}) {
+export function enterMaintenance(ctx, { reason, waitMs = 60000, apply = false, keepLease = false } = {}) {
   if (typeof reason !== "string" || reason.trim().length === 0) return { ok: false, reason: "reason_required" };
   const normalized = normalizeGateReason(reason);
   const pre = precheckStartupSources({ home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, repoRoot: ctx.repoRoot, node: ctx.node, launchctl: ctx.launchctl });
@@ -175,23 +186,116 @@ export function enterMaintenance(ctx, { reason, waitMs = 60000, apply = false } 
     const rollback = rollbackOperation(ctx, token, lease);
     out = { ok: false, reason: err?.opReason ?? "enter_failed", why: String(err?.message ?? err), token, processes: err?.processes ?? null, rollback };
   }
+  if (out.ok && keepLease) return { ...out, lease };
   return withLeaseResidue(out, releaseOperationLease(lease));
 }
 
+/** staged 私有目录（stage 写目标制品字节 / plan / 备份的地方；随 reopening 一并删除）。 */
+export const stagedDirPath = (ctx, token) => path.join(ctx.dir, token + ".staged");
+const sha256Of = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
+/** 线上一个文件此刻的 { exists, sha256 }（fd 绑定读）；读不出 → null（既不是 before 也不是 after，说不清）。 */
+const liveFileState = (file) => {
+  const r = readRegularFile(file);
+  if (r.status === "read") return { exists: true, sha256: sha256Of(r.buf) };
+  if (r.status === "absent") return { exists: false, sha256: null };
+  return null;
+};
+const sameFileState = (a, b) => a !== null && b !== null && a.exists === b.exists && a.sha256 === b.sha256;
+
+/** journal 写失败的定性：租约的归属转换锁交不还 / 被接管 → 不许再做任何外部变更（立即停）；其余也停（journal_write_failed）。 */
+const journalFatal = (r) => ({
+  reason: r.reason === "lease_reap_uncleared" ? "lease_reap_uncleared" : r.reason === "lease_lost" || r.reason === "active_mismatch" || r.reason === "lease_mismatch" ? "operation_taken_over" : "journal_write_failed",
+  why: String(r.reason) + (r.why ? "（" + r.why + "）" : ""), path: r.path ?? null,
+});
 /**
- * 回退（未到不可逆阶段时）：rolling_back（此处还没有线上制品要恢复；PR C 第二步的 staged / committed 会在这里先按备份恢复制品并核验）
- * → rollback_reopening（不可逆）→ reopening(mode:"rollback")。调用方持有租约。
+ * rolling_back 里按备份恢复 install 写入（PR C 第 2 步；**此时两条 current 仍是桩或已回桩、门仍在**）——
+ * 逆序处理 receipt / artifact / current:<chain>:install 三类 step，每项恢复规则：
+ *   现场 == before → 没做过 / 已回，跳过；现场 == intended_after → 按备份写回 before（备份先核 sha256 / 长度；before 缺席 → unlink）；
+ *   其余 → 该项 incomplete（不拿来源不明的现场当可覆盖的东西）。收据的写回走收据事务锁（与安装器串行化），
+ * 锁拿不到 / 锁残骸（reap 交不还、释放失败）都算该项 incomplete —— 有残骸就不能记成"已恢复"。
+ * **每次恢复后的 journal note 都受检**：写不进（租约被接管 / 归属转换锁交不还 / I/O）→ 立即停，不再做下一项外部变更（{ fatal }）。
+ */
+function restoreInstallWrites(ctx, doc, { note }) {
+  const incomplete = [];
+  const restoreBytes = (st) => {
+    if (st.before.exists) {
+      const v = verifyBackup({ file: st.backup, sha256: st.backup_sha256, bytes: st.backup_bytes });
+      if (!v.ok) return "备份核不过：" + v.why + "（" + st.backup + "）";
+      try { writeDurable(st.target, v.buf); } catch (err) { return "写回失败：" + errText(err); }
+      return null;
+    }
+    try { fs.unlinkSync(st.target); } catch (err) { return err?.code === "ENOENT" ? null : "删除失败：" + errText(err); }
+    return null;
+  };
+  const noted = (t) => { const n = note(t); return n.ok ? null : journalFatal(n); };
+  for (const st of [...doc.steps].reverse()) {
+    const isInstallCurrent = st.kind === "current" && st.id.endsWith(":install");
+    if (st.kind !== "artifact" && st.kind !== "receipt" && !isInstallCurrent) continue;
+    if (isInstallCurrent) {
+      const chain = st.id.split(":")[1];
+      const facts = factsOf(ctx, chain);
+      const live = readlinkOrNull(facts.current);
+      if (live === st.before) continue;
+      if (live !== st.intended_after) { incomplete.push({ id: st.id, why: "现场 current=" + String(live) + " 既不是桩也不是目标版本，不动" }); continue; }
+      const sw = switchCurrentTarget({ root: facts.root, target: st.before });
+      if (!sw.ok) { incomplete.push({ id: st.id, why: "切回桩失败：" + String(sw.why ?? sw.reason) }); continue; }
+      const f = noted(st.id + " 已切回桩");
+      if (f !== null) return { incomplete, fatal: f };
+      continue;
+    }
+    const live = liveFileState(st.target);
+    if (live === null) { incomplete.push({ id: st.id, why: "线上状态读不出" }); continue; }
+    if (sameFileState(live, st.before)) continue;
+    if (!sameFileState(live, st.intended_after)) { incomplete.push({ id: st.id, why: "现场既不是 before 也不是 intended_after，不动" }); continue; }
+    if (st.kind === "receipt") {
+      const locked = withInstalledSurfaceLock(st.target, ({ commit }) => {
+        if (!sameFileState(liveFileState(st.target), st.intended_after)) return { why: "锁内重读已变，不动" };
+        const c = commit(() => restoreBytes(st));
+        if (!c.ok) return { why: "锁归属核对失败：" + String(c.reason) };
+        return { why: c.run, reap: c.reapUncleared ?? null };
+      });
+      let why = null;
+      if (!locked.ok) why = "收据锁拿不到：" + String(locked.reason) + (locked.why ? "（" + locked.why + "）" : "") + (locked.path ? "，" + locked.path : "");
+      else if (locked.run.reap) why = "收据锁归属转换锁交不还：" + String(locked.run.reap.error ?? "") + "（" + locked.run.reap.path + "）";
+      else if (locked.lockUncleared) why = "收据锁交不还：" + String(locked.lockUncleared.reason) + (locked.lockUncleared.error ? "：" + locked.lockUncleared.error : "") + "（" + locked.lockUncleared.path + "）";
+      else why = locked.run.why;
+      if (why !== null) { incomplete.push({ id: st.id, why }); continue; }
+    } else {
+      const why = restoreBytes(st);
+      if (why !== null) { incomplete.push({ id: st.id, why }); continue; }
+    }
+    const f = noted(st.id + " 已按备份回退");
+    if (f !== null) return { incomplete, fatal: f };
+  }
+  return { incomplete, fatal: null };
+}
+
+/**
+ * 回退（未到不可逆阶段时）：rolling_back —— 先按备份恢复全部 install 写入并核验（此时门仍在），任一项说不清 →
+ * **停在 rolling_back**（门与账保留，--exit --apply 重试恢复），全部干净才进 rollback_reopening（不可逆）→ reopening(mode:"rollback")。
+ * journal 写失败（含租约被接管 / 归属转换锁交不还）→ 立即停，不再做外部变更。
+ * 已在成功侧不可逆阶段（reopening / reopening_incomplete）时只向前走成功路径，不回退。调用方持有租约。
  */
 export function rollbackOperation(ctx, token, lease) {
   const j = readJournal({ dir: ctx.dir, token });
   if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null };
-  if (!FORWARD_ONLY_PHASES.includes(j.doc.phase)) {
+  let phase = j.doc.phase;
+  if (!FORWARD_ONLY_PHASES.includes(phase)) {
     const p = setPhase({ dir: ctx.dir, token, lease, phase: "rolling_back", now: ctx.now() });
-    if (!p.ok) return { ok: false, reason: "journal_write_failed", why: p.why ?? p.reason };
+    if (!p.ok) { const f = journalFatal(p); return { ok: false, reason: f.reason, why: f.why, path: f.path }; }
+    const restored = restoreInstallWrites(ctx, p.doc, { note: (t) => addNote({ dir: ctx.dir, token, lease, note: t, now: ctx.now() }) });
+    if (restored.fatal !== null) return { ok: false, reason: restored.fatal.reason, why: restored.fatal.why, path: restored.fatal.path, phase: "rolling_back" };
+    if (restored.incomplete.length > 0) {
+      addNote({ dir: ctx.dir, token, lease, note: "恢复 install 写入说不清 " + restored.incomplete.length + " 项：" + restored.incomplete.map((i) => i.id + "（" + i.why + "）").join("；"), now: ctx.now() });
+      return { ok: false, phase: "rolling_back", incomplete: restored.incomplete };
+    }
     const p2 = setPhase({ dir: ctx.dir, token, lease, phase: "rollback_reopening", expectPhase: "rolling_back", now: ctx.now() });
-    if (!p2.ok) return { ok: false, reason: "journal_write_failed", why: p2.why ?? p2.reason };
+    if (!p2.ok) { const f = journalFatal(p2); return { ok: false, reason: f.reason, why: f.why, path: f.path }; }
+    phase = "rollback_reopening";
   }
-  return reopening(ctx, token, lease, { mode: "rollback" });
+  // 成功侧的不可逆阶段（current 已指新版本、可能已删门）：只向前走成功路径 —— 回退方向在这里已经不存在
+  const mode = phase === "reopening" || phase === "reopening_incomplete" || phase === "done" ? "success" : "rollback";
+  return reopening(ctx, token, lease, { mode });
 }
 
 /**
@@ -204,13 +308,18 @@ export function reopening(ctx, token, lease, { mode }) {
   const doc = j.doc;
   const incomplete = [];
   const note = (t) => addNote({ dir: ctx.dir, token, lease, note: t, now: ctx.now() });
+  // note 受检：journal 写不进（租约被接管 / 归属转换锁交不还 / I/O）→ 立即停，不再做下一项外部变更
+  const noted = (t) => { const n = note(t); return n.ok ? null : journalFatal(n); };
   const incompletePhase = mode === "rollback" ? "rollback_incomplete" : "reopening_incomplete";
   const bail = (extra) => {
     const p = setPhase({ dir: ctx.dir, token, lease, phase: incompletePhase, now: ctx.now(), note: "说不清 " + incomplete.length + " 项：" + incomplete.map((i) => i.id + "（" + i.why + "）").join("；") });
     return { ok: false, phase: incompletePhase, incomplete, journalWrite: p.ok, ...(p.ok ? {} : { journalWhy: p.why ?? p.reason }), ...extra };
   };
-  // ① current：CAS —— 现场 == intended_after（桩）→ 切回 before；== before → 没做过 / 已回；否则说不清
-  for (const st of doc.steps.filter((s) => s.kind === "current")) {
+  // ① current：CAS —— 现场 == intended_after（桩）→ 切回 before；== before → 没做过 / 已回；否则说不清。
+  // 回退方向逆序：install 步（桩 → 版本）先回到桩，enter 步（原目标 → 桩）再回原目标 —— 正序会把"还指着新版本"误判成说不清。
+  const currentSteps = doc.steps.filter((s) => s.kind === "current");
+  if (mode === "rollback") currentSteps.reverse();
+  for (const st of currentSteps) {
     const chain = st.id.split(":")[1];
     const facts = factsOf(ctx, chain);
     const live = readlinkOrNull(facts.current);
@@ -220,13 +329,22 @@ export function reopening(ctx, token, lease, { mode }) {
         if (st.before === null) { incomplete.push({ id: st.id, why: "原来没有 current，无法回退到「没有」之外的状态" }); continue; }
         const sw = switchCurrentTarget({ root: facts.root, target: st.before });
         if (!sw.ok) { incomplete.push({ id: st.id, why: "切回失败：" + String(sw.why ?? sw.reason) }); continue; }
-        note("current:" + chain + " 已切回 " + st.before);
+        const f = noted("current:" + chain + " 已切回 " + st.before);
+        if (f !== null) return { ok: false, reason: f.reason, why: f.why, path: f.path, phase: doc.phase };
         continue;
       }
       incomplete.push({ id: st.id, why: "现场 current=" + String(live) + " 既不是桩也不是原目标，不动" });
+    } else if (st.id.endsWith(":install")) {
+      // 成功路径：install 步的 current 必须**精确**等于目标版本（评审探针：缺失 / 指向别的正式版本也曾被放过并删门）
+      if (live !== st.intended_after) incomplete.push({ id: st.id, why: "成功路径 reopening 时 current=" + String(live) + " 不是目标 " + st.intended_after + "，不删门" });
     } else if (live !== null && isStubTarget(live)) {
       incomplete.push({ id: st.id, why: "成功路径 reopening 时 current 仍指桩（commit 没完成？）" });
     }
+  }
+  // ①b 成功路径：删门前复核全部 install 写入（制品 / 收据）仍等于 journal 的目标状态 —— 目标漂移就不删门、不记 done
+  if (mode === "success") for (const st of doc.steps.filter((s) => s.kind === "artifact" || s.kind === "receipt")) {
+    const live = liveFileState(st.target);
+    if (live === null || !sameFileState(live, st.intended_after)) incomplete.push({ id: st.id, why: "现场" + (live === null ? "读不出" : "与 journal 的目标状态不符") + "，不删门" });
   }
   // ② 定时器：回原始三态（rollback）—— 只有原来 loaded 才需要 bootstrap；plist 字节先按备份还原（备份先核 sha256 / 长度）
   for (const st of doc.steps.filter((s) => s.kind === "timer")) {
@@ -248,7 +366,8 @@ export function reopening(ctx, token, lease, { mode }) {
     if (cur.phase === "loaded") continue;
     const r = bootstrapTimer({ label: facts.timer.label, plistFile: facts.timer.plistFile, expect: facts.timer.expect, domain: ctx.domain, run: ctx.launchctl });
     if (!r.ok) { incomplete.push({ id: st.id, why: "定时器恢复失败：" + r.why }); continue; }
-    note("timer:" + chain + " 已恢复 loaded");
+    const f = noted("timer:" + chain + " 已恢复 loaded");
+    if (f !== null) return { ok: false, reason: f.reason, why: f.why, path: f.path, phase: doc.phase };
   }
   // ③ 删桩：current 已不指它才删；同链 current 说不清的，桩先留着（人要把 current 指回桩再出门，桩没了就没得回）
   const unclearChains = new Set(incomplete.filter((i) => i.id.startsWith("current:")).map((i) => i.id.split(":")[1]));
@@ -261,6 +380,9 @@ export function reopening(ctx, token, lease, { mode }) {
   }
   // ④ 门：只有全部项都对得上才 token-CAS 删门；有说不清的项 → 门与账保留。撤门成功但归属转换锁交不还 → 门会一直 transitioning，同样算没做完
   if (incomplete.length > 0) return bail({});
+  // ③b 全部对得上才删 staged 私有目录（评审返修：有说不清的项时保留 —— 备份与目标字节都在里面，续跑要用）
+  try { fs.rmSync(stagedDirPath(ctx, token), { recursive: true, force: true }); }
+  catch (err) { incomplete.push({ id: "staged", why: "staged 目录删不掉：" + errText(err) }); return bail({}); }
   if (doc.steps.some((s) => s.kind === "gate")) {
     const g = ctx.gateOps.removeGate({ file: ctx.gateFile, token });
     if (!g.ok && g.reason !== "absent") { incomplete.push({ id: "gate", why: "撤门失败：" + String(g.reason) + (g.why ? "（" + g.why + "）" : "") }); return bail({}); }
@@ -270,6 +392,7 @@ export function reopening(ctx, token, lease, { mode }) {
   const terminal = mode === "rollback" ? "rolled_back" : "done";
   const p = setPhase({ dir: ctx.dir, token, lease, phase: terminal, now: ctx.now() });
   if (!p.ok) return { ok: false, reason: "journal_write_failed", why: p.why ?? p.reason, phase: doc.phase };
+  afterStep(ctx, "terminal"); // 测试注入点：终态已持久化、active 未清（不变量 14）
   const c = clearActive({ dir: ctx.dir, token });
   if (!c.ok) return { ok: false, phase: terminal, activeCleared: false, activeWhy: String(c.reason) + (c.why ? "（" + c.why + "）" : ""), incomplete: [{ id: "active", why: "active 清不掉：" + String(c.reason) }] };
   return { ok: true, phase: terminal, activeCleared: c.cleared === true };

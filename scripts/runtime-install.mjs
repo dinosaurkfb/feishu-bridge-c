@@ -353,15 +353,22 @@ export function stageRuntimeVersion(plan, { home = os.homedir(), chain = "claude
 
 /**
  * 把 current 切到一个**已经落好并校验通过**的版本目录（唯一提交点）。不做任何拷贝：目录不在 / 校验不过 → version_not_committable，current 不动。
- * 维护门的 commit 阶段用它；调用方（maintenance-install-core）负责先核对锁 / journal / current 仍是桩。
+ * 维护门的 commit 阶段用它；调用方（maintenance-install-core）负责先核对 journal / 门。
+ * `expectBefore`：current 的 CAS **在安装锁内**做（与切换共用同一把锁 —— 所有 current 写方都持它，检查与 rename 之间没有窗口）：
+ * 现场 readlink ≠ expectBefore → current_changed，current 不动。
  */
-export function activateRuntimeVersion({ version, home = os.homedir(), chain = "claude", root: rootOverride } = {}) {
+export function activateRuntimeVersion({ version, home = os.homedir(), chain = "claude", root: rootOverride, expectBefore } = {}) {
   if (typeof version !== "string" || version.length === 0) return { ok: false, reason: "version_missing" };
   const root = rootOf({ root: rootOverride, home, chain });
   const versionDir = path.join(root, "versions", version);
   const lock = acquireInstallLock(root);
   if (!lock.ok) return lock;
   try {
+    if (expectBefore !== undefined) {
+      let live = null;
+      try { live = fs.readlinkSync(path.join(root, CURRENT_LINK)); } catch { live = null; }
+      if (live !== expectBefore) return { ok: false, reason: "current_changed", live };
+    }
     const ready = verifyVersionDir(versionDir, null);
     if (!ready.ok || ready.manifest?.version !== version || path.basename(versionDir) !== version) {
       return { ok: false, reason: "version_not_committable", version, detail: ready.reason ?? null };

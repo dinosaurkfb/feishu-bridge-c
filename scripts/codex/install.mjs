@@ -17,6 +17,8 @@ import { describeTemplateWrite, withChainTemplateWrite } from "../chain-template
 import { buildHookCommand, codexHooksOwnedEntries, renderCodexHooks, ownsHookCommand, pickNode } from "./hook-command.mjs";
 import { referencedRuntimeScripts } from "../install-projection.mjs";
 import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "../installed-surface.mjs";
+import { gateBlocks } from "../maintenance-gate-core.mjs";
+import { holdInstallSurfaceLockOrExit } from "../install-surface-lock.mjs";
 import { SKILLS, expectedSkillContent } from "./skill-content.mjs";
 
 import {
@@ -116,6 +118,14 @@ console.log("兜底排空    未启用（默认）—— 单独跑 scripts/codex
 if (!apply) {
   console.log("\n[dry-run] 什么都没写。加 --apply 才安装。");
   process.exit(0);
+}
+
+// 安装面锁 + 维护门（issue #81）：先取安装面锁（与维护流程共用一把，持有到本进程退出），**再**看门 ——
+// 门检是瞬时的，锁才是原子准入（评审探针：过检后门才建立，安装器照写不误）。
+holdInstallSurfaceLockOrExit();
+{
+  const g = gateBlocks();
+  if (g.blocked) { console.error("维护门：" + g.text + " —— 安装被拒，什么都没写。"); process.exit(2); }
 }
 
 const writeAtomic = (file, text) => {

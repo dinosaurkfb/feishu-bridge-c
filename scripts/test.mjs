@@ -216,8 +216,11 @@ import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInst
 import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
-import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus } from "./maintenance/operation.mjs";
-import { clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, journalProblem, readActive, readJournal, releaseOperationLease, updateJournal } from "./maintenance/journal.mjs";
+import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
+import { acquireOperationLease, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, journalProblem, readActive, readJournal, releaseOperationLease, updateJournal } from "./maintenance/journal.mjs";
+import { commitForInstall, finishInstallReopening, liveBaseline, stageForInstall, stagedChecks, stagedPlanProblem, verifyLiveForInstall, verifyStagedForInstall } from "./maintenance/maintenance-install-core.mjs";
+import { parseMaintenanceInstallArgs, runMaintenanceInstall } from "./maintenance-install.mjs";
+import { acquireInstallSurfaceLock, inspectInstallSurfaceLock } from "./install-surface-lock.mjs";
 import { analyzeCommandRefs, harvestAbsolutePaths, refsUnderRoots, tokenizeCommand, tokenizeCommandStrict } from "./maintenance/command-refs.mjs";
 import { inspectMaintenanceDir } from "./maintenance/journal.mjs";
 import { buildStubVersion, removeStubVersion, renderStubScript, stubCategory, stubRelTarget } from "./maintenance/stub.mjs";
@@ -21101,6 +21104,7 @@ test("维护门 · PR C 单元：journal 三态与两阶段、active 只许一�
   assert.equal(op.ok, true, JSON.stringify(op));
   assert.deepEqual([createOperation({ dir, reason: "r2" }).reason, readActive({ dir }).token], ["operation_active", op.token]);
   assert.equal(updateJournal({ dir, token: op.token, mutate: (d) => { d.phase = "nonsense"; return d; } }).reason, "lease_required", "没有租约不许写");
+  assert.equal(updateJournal({ dir, token: op.token, lease: { path: path.join(dir, "22222222-2222-4222-8222-222222222222.lease") }, mutate: (d) => d }).reason, "lease_mismatch", "拿别的 operation 的租约写不进（评审探针）");
   assert.equal(updateJournal({ dir, token: op.token, lease: op.lease, mutate: (d) => { d.phase = "nonsense"; return d; } }).reason, "journal_shape", "阶段封闭");
   assert.equal(updateJournal({ dir, token: op.token, lease: op.lease, expectPhase: "gated", mutate: (d) => d }).reason, "phase_mismatch", "阶段前驱要对");
   assert.equal(updateJournal({ dir, token: op.token, lease: op.lease, mutate: (d) => { d.phase = "timer_stopped"; return d; } }).reason, "journal_shape", "阶段要求的 step 没 done 不许进");
@@ -21199,6 +21203,343 @@ test("维护门 · PR C 单元：journal 三态与两阶段、active 只许一�
   const inv = listBridgeProcesses({ roots: ["/r/current/scripts"], ps, selfPid: 21 });
   assert.deepEqual(inv.processes.map((p) => p.pid), [10, 11], "子树计入；自己（21）与祖先（20）排除：" + JSON.stringify(inv));
   assert.deepEqual([listBridgeProcesses({ roots: ["/r"], ps: () => ({ ok: false, why: "EIO" }) }).reason, waitForQuiet({ roots: ["/r/current/scripts"], ps, selfPid: 21, waitMs: 20, stepMs: 10, sleep: () => {}, now: (() => { let t = 0; return () => (t += 15); })() }).reason], ["inventory_unverifiable", "processes_still_running"]);
+});
+
+test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS → verify（含 Codex 阻断探针）→ reopening 成功路径；base_changed / 崩在写与记账之间 / 回退恢复制品与收据 / 只向前 / 终态先于清 active", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "gate-d-"));
+  const home = path.join(base, "home 带空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
+  fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true }); fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
+  execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env });
+  execFileSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
+  const node = pickClaudeNodeB();
+  const claudeRoot = path.join(home, ".claude", "feishu-bridge", "runtime"), codexRoot = path.join(codexHome, "feishu-bridge", "runtime");
+  const claudeLabel = "com.frank.feishu-bridge-cc.drain";
+  const claudePlist = claudeDrainPlistPath(home);
+  const expectedArgs = claudeDrainExpectedJobB({ home, node }).args;
+  const launchd = { [claudeLabel]: { loaded: true, args: [...expectedArgs] } };
+  const fakeLaunchctl = (args) => {
+    if (args[0] === "list") { const st = launchd[args[1]]; if (!st?.loaded) return { ok: false, detail: "Could not find service \"" + args[1] + "\" in domain" }; return { ok: true, stdout: "{\n\t\"ProgramArguments\" = (\n" + st.args.map((a) => "\t\t\"" + a + "\";").join("\n") + "\n\t);\n};\n" }; }
+    if (args[0] === "bootout") { const label = args[1].split("/").pop(); const st = launchd[label]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; st.loaded = false; return { ok: true, stdout: "" }; }
+    if (args[0] === "bootstrap") { const xml = fs.readFileSync(args[2], "utf-8"); const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/u.exec(xml)[1]; const arr = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/u.exec(xml)[1]; launchd[label] = { loaded: true, args: [...arr.matchAll(/<string>([^<]*)<\/string>/gu)].map((m) => m[1]) }; return { ok: true, stdout: "" }; }
+    return { ok: false, detail: "unknown" };
+  };
+  const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
+  const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
+  let clock = Date.parse("2026-08-31T10:00:00.000Z");
+  const crashAt = { id: null };
+  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => { if (crashAt.id === id) throw Object.assign(new Error("crash"), { simulatedCrash: true }); } });
+  const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
+  const origVersion = verifyRuntimeB({ root: claudeRoot }).version;
+  const claudeReceiptFile = path.join(home, ".claude", "feishu-bridge", "installed-surface.json");
+  const leaseOf = (t) => ({ path: path.join(dir, t + ".lease") });
+  try {
+    // ── 源码树：v2 = 已装版本树 + 脚本标记；v3 = v2 + 技能正文标记（技能制品字节会变）
+    const srcV2 = path.join(base, "src-v2"); fs.cpSync(path.join(claudeRoot, "versions", origVersion), srcV2, { recursive: true });
+    fs.appendFileSync(path.join(srcV2, "scripts", "stop-hook.mjs"), "\n// PR C 第 2 步测试标记 v2\n");
+    const v2 = planRuntimeSyncB({ sourceRoot: srcV2, root: claudeRoot }).version;
+    const srcV3 = path.join(base, "src-v3"); fs.cpSync(srcV2, srcV3, { recursive: true });
+    fs.appendFileSync(path.join(srcV3, "skills", "claude-longtask-progress", "SKILL.md"), "\n<!-- v3 技能标记 -->\n");
+    const v3 = planRuntimeSyncB({ sourceRoot: srcV3, root: claudeRoot }).version;
+    assert.notEqual(v2, origVersion); assert.notEqual(v3, v2);
+    const longtaskDst = path.join(home, ".claude", "skills", "claude-longtask-progress", "SKILL.md");
+    const codexSkillDst = path.join(codexHome, "skills", "feishu-status", "SKILL.md");
+    // ── 不变量 12：没有 operation / 阶段不对 → 模块 API 一律拒
+    assert.equal(stageForInstall(ctx, { sourceRoot: srcV2, lease: null }).reason, "no_operation");
+    // ── CLI 预览（对着源码树 repoRoot）：预检通过、不动任何东西
+    const outP = []; assert.equal(runMaintenanceInstall(["--reason", "预览"], { ctx, out: (t) => outP.push(t) }), 0, outP.join("\n"));
+    assert.match(outP.join("\n"), /\[预览\] 预检通过/u);
+    assert.deepEqual([readActive({ dir }).state, fs.existsSync(gateFile)], ["absent", false]);
+    // ── 快乐路径（CLI --apply，装 v2）：enter → stage → commit → verify（真实探针）→ reopening
+    const out1 = []; const code1 = runMaintenanceInstall(["--apply"], { ctx: { ...ctx, repoRoot: srcV2 }, out: (t) => out1.push(t) });
+    assert.deepEqual([code1, /已装 [0-9a-f]{16} 并重新开放/u.test(out1.join("\n"))], [0, true], out1.join("\n"));
+    const jHappyToken = fs.readdirSync(dir).find((n) => /^[0-9a-f-]{36}\.json$/u.test(n)).slice(0, -5);
+    const jHappy = readJournal({ dir, token: jHappyToken }).doc;
+    assert.deepEqual([
+      fs.readlinkSync(path.join(claudeRoot, "current")), fs.readlinkSync(path.join(codexRoot, "current")),
+      verifyRuntimeB({ root: claudeRoot }).version, verifyRuntimeB({ root: codexRoot }).version,
+      launchd[claudeLabel].loaded, launchd[claudeLabel].args, readGate({ file: gateFile, now: clock }).state, readActive({ dir }).state,
+      jHappy.phase, jHappy.steps.filter((s) => s.id.endsWith(":install") || s.kind === "receipt").map((s) => s.id + ":" + s.state),
+      readInstalledSurface({ file: claudeReceiptFile }).doc.chains.claude.version, readInstalledSurface({ file: path.join(codexBridge, "installed-surface.json") }).doc.chains.codex.version,
+      fs.existsSync(stagedDirPath(ctx, jHappyToken)), fs.readdirSync(path.join(claudeRoot, "versions")).filter((n) => n.startsWith("maintenance-")),
+      fs.readFileSync(claudePlist, "utf-8") === claudeDrainPlist({ home, node }),
+    ], ["versions/" + v2, "versions/" + v2, v2, v2, true, expectedArgs, "absent", "absent", "done",
+      ["current:claude:install:done", "current:codex:install:done", "receipt:claude:done", "receipt:codex:done"], v2, v2, false, [], true], JSON.stringify(jHappy));
+    assert.equal(enterMaintenance(ctx, { reason: "再进", apply: false }).ok, true, "装完收据与线上一致，预检再过（不变量 13）");
+    assert.equal(fs.existsSync(path.join(home, "Library", "LaunchAgents", "com.frank.feishu-bridge-codex.drain.plist")), false, "Codex plist 基线缺席就不写（安装器不替人启用）");
+    assert.notEqual(journalProblem({ ...jHappy, steps: jHappy.steps.filter((s) => s.kind !== "receipt") }), null, "done 要求两条收据步 done");
+    assert.notEqual(journalProblem({ ...jHappy, steps: jHappy.steps.filter((s) => s.id !== "current:claude:install") }), null, "done 要求 install 步 done");
+    const badCur = { ...jHappy.steps.find((s) => s.id === "current:claude:install"), id: "current:claude:hack" };
+    assert.notEqual(journalProblem({ ...jHappy, phase: "planned", steps: [badCur] }), null, "current 的 id 形状封闭");
+    fs.unlinkSync(path.join(dir, jHappyToken + ".json"));
+    const longtaskBefore = fs.readFileSync(longtaskDst); const codexSkillBefore = fs.readFileSync(codexSkillDst);
+    // ── CLI 失败路径：commit 中制品被外改（afterStep 注入）→ base_changed → CLI 自动按账回退，退出码 1
+    const outF = []; const tamperCtx = { ...ctx, repoRoot: srcV3, afterStep: (id) => { if (id === "current:codex:install") fs.appendFileSync(codexSkillDst, "\n<!-- CLI 外改 -->\n"); } };
+    const codeF = runMaintenanceInstall(["--apply"], { ctx: tamperCtx, out: (t) => outF.push(t) });
+    assert.deepEqual([codeF, /base_changed/u.test(outF.join("\n")), /已回退到进门前/u.test(outF.join("\n")), fs.readlinkSync(path.join(claudeRoot, "current")), readGate({ file: gateFile, now: clock }).state, readActive({ dir }).state, readInstalledSurface({ file: claudeReceiptFile }).doc.chains.claude.version], [1, true, true, "versions/" + v2, "absent", "absent", v2], outF.join("\n"));
+    fs.writeFileSync(codexSkillDst, codexSkillBefore);
+    fs.unlinkSync(path.join(dir, fs.readdirSync(dir).find((n) => /^[0-9a-f-]{36}\.json$/u.test(n))));
+    // ── 安装面锁互斥（评审返修 2）：任一方持锁，另一方在做任何事之前被拒 —— 门检是瞬时的，锁才是原子准入
+    const gEnvLock = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+    const surf = acquireInstallSurfaceLock({ home });
+    assert.equal(surf.ok, true, JSON.stringify(surf));
+    for (const inst of [["install-outbound.mjs"], ["install-inbound.mjs"], ["codex", "install.mjs"]]) {
+      const r = spawnSync(process.execPath, [path.resolve("scripts", ...inst), "--apply"], { encoding: "utf-8", env: gEnvLock });
+      assert.deepEqual([r.status, /安装面锁拿不到/u.test(r.stderr)], [2, true], inst.join("/") + "：" + r.stdout + r.stderr);
+    }
+    const outB = []; assert.equal(runMaintenanceInstall(["--apply"], { ctx: { ...ctx, repoRoot: srcV3 }, out: (t) => outB.push(t) }), 1, outB.join("\n"));
+    assert.match(outB.join("\n"), /安装面锁拿不到/u);
+    const outG = []; assert.equal(runMaintenanceGate(["--enter", "--reason", "x", "--apply"], { ctx, out: (t) => outG.push(t) }), 1, outG.join("\n"));
+    assert.match(outG.join("\n"), /安装面锁拿不到/u);
+    assert.deepEqual([readActive({ dir }).state, fs.existsSync(gateFile), fs.readlinkSync(path.join(claudeRoot, "current"))], ["absent", false, "versions/" + v2], "锁被持有时两个方向都零改动");
+    assert.equal(surf.release().ok, true);
+    // ── base_changed（不变量 6）：stage 之后线上制品被外改 → commit 整次中止，已写项按备份回退，线上等于进门前
+    const e2 = enterMaintenance(ctx, { reason: "v3", apply: true }); assert.equal(e2.ok, true, JSON.stringify(e2));
+    // 伪造 / 缺席的租约在任何写之前被拒（评审返修 2）：只有 path 的对象不持实例，stage 零写入
+    const forged = stageForInstall(ctx, { sourceRoot: srcV3, lease: { path: path.join(dir, e2.token + ".lease") } });
+    assert.deepEqual([forged.ok, forged.reason, fs.existsSync(stagedDirPath(ctx, e2.token)), readJournal({ dir, token: e2.token }).doc.phase], [false, "lease_not_held", false, "drained"], "伪造租约路径 → 零写入：" + JSON.stringify(forged));
+    assert.deepEqual([stageForInstall(ctx, { sourceRoot: srcV3 }).reason, fs.existsSync(stagedDirPath(ctx, e2.token))], ["lease_required", false], "缺租约受控拒绝且零写入，不裸抛");
+    let lease = acquireOperationLease({ dir, token: e2.token }); assert.equal(lease.ok, true);
+    // bind 的 fencing 段归属转换锁交不还 → 立即停，stage 零写入（评审探针：曾被吞掉照写 staged）
+    const versionsBefore = fs.readdirSync(path.join(claudeRoot, "versions")).sort();
+    const origRmB = fs.rmSync; let armB = true;
+    fs.rmSync = (t, ...a) => { if (armB && String(t).endsWith(e2.token + ".lease.reap")) { armB = false; const e = new Error("EIO"); e.code = "EIO"; throw e; } return origRmB(t, ...a); };
+    let reapStage;
+    try { reapStage = stageForInstall(ctx, { sourceRoot: srcV3, lease }); } finally { fs.rmSync = origRmB; }
+    assert.deepEqual([reapStage.ok, reapStage.reason, String(reapStage.path).endsWith(".lease.reap"), fs.existsSync(stagedDirPath(ctx, e2.token)), fs.readdirSync(path.join(claudeRoot, "versions")).sort(), readJournal({ dir, token: e2.token }).doc.phase], [false, "lease_reap_uncleared", true, false, versionsBefore, "drained"], "fencing 残骸 → 版本缓存 / staged / journal 全部零改动：" + JSON.stringify(reapStage));
+    fs.unlinkSync(path.join(dir, e2.token + ".lease.reap"));
+    // 维护窗口内三个普通安装器 --apply 一律被门拒（评审返修：消掉"安装写方不受门阻断"这个前提），零改动
+    const gEnv = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };
+    const settingsBytesGate = fs.readFileSync(path.join(home, ".claude", "settings.json"));
+    for (const inst of [["install-outbound.mjs"], ["install-inbound.mjs"], ["codex", "install.mjs"]]) {
+      const r = spawnSync(process.execPath, [path.resolve("scripts", ...inst), "--apply"], { encoding: "utf-8", env: gEnv });
+      assert.deepEqual([r.status, /维护门/u.test(r.stderr)], [2, true], inst.join("/") + "：" + r.stdout + r.stderr);
+    }
+    assert.ok(fs.readFileSync(path.join(home, ".claude", "settings.json")).equals(settingsBytesGate), "门拒了就什么都没写");
+    const st2 = stageForInstall(ctx, { sourceRoot: srcV3, lease }); assert.deepEqual([st2.ok, st2.version], [true, v3], JSON.stringify(st2));
+    assert.deepEqual([fs.readFileSync(longtaskDst).equals(longtaskBefore), fs.readlinkSync(path.join(claudeRoot, "current")), readJournal({ dir, token: e2.token }).doc.phase, fs.existsSync(stagedDirPath(ctx, e2.token)), readJournal({ dir, token: e2.token }).doc.steps.find((s) => s.id === "staged_plan")?.state], [true, stubRelTarget(e2.token), "staged", true, "done"], "stage 不碰线上，plan 锚已进 journal");
+    const planFile = path.join(stagedDirPath(ctx, e2.token), "plan.json"); const planBytes2 = fs.readFileSync(planFile);
+    fs.appendFileSync(planFile, " ");
+    assert.equal(verifyStagedForInstall(ctx).reason, "staged_plan_mismatch", "plan 不锚在 journal 上就不认");
+    fs.writeFileSync(planFile, planBytes2);
+    const settingsStagedFile = path.join(stagedDirPath(ctx, e2.token), "artifacts", "0"); const settingsStagedBytes = fs.readFileSync(settingsStagedFile);
+    fs.appendFileSync(settingsStagedFile, "坏");
+    assert.equal(verifyStagedForInstall(ctx).reason, "staged_artifact_drifted", "staged 制品内容寻址，被改就验不过");
+    fs.writeFileSync(settingsStagedFile, settingsStagedBytes);
+    switchCurrentTarget({ root: claudeRoot, target: "versions/" + v2 });
+    assert.equal(commitForInstall(ctx, { lease }).reason, "current_unbound", "current 不是本 token 的桩 → 绑定拒（不变量 12）");
+    switchCurrentTarget({ root: claudeRoot, target: stubRelTarget(e2.token) });
+    assert.equal(verifyStagedForInstall(ctx).ok, true);
+    fs.appendFileSync(codexSkillDst, "\n<!-- 外改 -->\n");
+    const c2 = commitForInstall(ctx, { lease });
+    assert.deepEqual([c2.ok, c2.reason, c2.path], [false, "base_changed", codexSkillDst], JSON.stringify(c2));
+    assert.deepEqual([fs.readFileSync(longtaskDst).equals(longtaskBefore), fs.readlinkSync(path.join(claudeRoot, "current"))], [false, "versions/" + v3], "外改点之前的制品已写、current 已切");
+    const rb2 = rollbackOperation(ctx, e2.token, lease);
+    assert.deepEqual([rb2.ok, rb2.phase, rb2.activeCleared, fs.readFileSync(longtaskDst).equals(longtaskBefore), /外改/u.test(fs.readFileSync(codexSkillDst, "utf-8")), fs.readlinkSync(path.join(claudeRoot, "current")), fs.readlinkSync(path.join(codexRoot, "current")), readGate({ file: gateFile, now: clock }).state, readInstalledSurface({ file: claudeReceiptFile }).doc.chains.claude.version, fs.existsSync(stagedDirPath(ctx, e2.token)), fs.existsSync(path.join(claudeRoot, "versions", v3))],
+      [true, "rolled_back", true, true, true, "versions/" + v2, "versions/" + v2, "absent", v2, false, true], "已写项回退、外改不覆盖、versions/<v3> 保留：" + JSON.stringify(rb2));
+    releaseOperationLease(lease);
+    fs.writeFileSync(codexSkillDst, codexSkillBefore); fs.unlinkSync(path.join(dir, e2.token + ".json"));
+    // ── 崩在"写成功、done 未记"（不变量 5）：恢复按"现场 == intendedAfter → 做过"回退
+    const e3 = enterMaintenance(ctx, { reason: "crash-mid", apply: true }); assert.equal(e3.ok, true, JSON.stringify(e3));
+    lease = acquireOperationLease({ dir, token: e3.token }); assert.equal(lease.ok, true);
+    assert.equal(stageForInstall(ctx, { sourceRoot: srcV3, lease }).ok, true);
+    crashAt.id = "written:artifact:" + longtaskDst;
+    assert.throws(() => commitForInstall(ctx, { lease }), (err) => err?.simulatedCrash === true);
+    crashAt.id = null;
+    const j3 = readJournal({ dir, token: e3.token }).doc;
+    const step3 = j3.steps.find((s) => s.id === "artifact:" + longtaskDst);
+    assert.deepEqual([step3.state, fs.readFileSync(longtaskDst).equals(longtaskBefore)], ["prepared", false], "prepared 且现场已是 intendedAfter");
+    releaseOperationLease(lease);
+    // 制品备份被篡改 → 恢复不拿来源不明的字节写线上：该项 incomplete、停在 rolling_back、门与账保留
+    const plan3 = JSON.parse(fs.readFileSync(path.join(stagedDirPath(ctx, e3.token), "plan.json"), "utf-8"));
+    const backup3 = path.join(stagedDirPath(ctx, e3.token), "backups", String(plan3.artifacts.findIndex((a) => a.path === longtaskDst)));
+    const backup3Bytes = fs.readFileSync(backup3);
+    fs.appendFileSync(backup3, "坏");
+    const exBad = exitMaintenance(ctx, { apply: true });
+    assert.deepEqual([exBad.ok, exBad.phase, exBad.incomplete.map((i) => i.id), /备份核不过/u.test(exBad.incomplete[0].why), readGate({ file: gateFile, now: clock }).state], [false, "rolling_back", ["artifact:" + longtaskDst], true, "active"], JSON.stringify(exBad));
+    fs.writeFileSync(backup3, backup3Bytes);
+    const ex3 = exitMaintenance(ctx, { apply: true });
+    assert.deepEqual([ex3.ok, ex3.phase, fs.readFileSync(longtaskDst).equals(longtaskBefore), fs.readlinkSync(path.join(claudeRoot, "current")), readActive({ dir }).state], [true, "rolled_back", true, "versions/" + v2, "absent"], JSON.stringify(ex3));
+    fs.unlinkSync(path.join(dir, e3.token + ".json"));
+    // ── commit 全部写完后被外改（不变量 7）：回退不覆盖说不清的现场，停在 rolling_back（门与账保留）；修好后续跑
+    const e4 = enterMaintenance(ctx, { reason: "cas", apply: true }); assert.equal(e4.ok, true, JSON.stringify(e4));
+    lease = acquireOperationLease({ dir, token: e4.token }); assert.equal(lease.ok, true);
+    assert.equal(stageForInstall(ctx, { sourceRoot: srcV3, lease }).ok, true);
+    const c4 = commitForInstall(ctx, { lease }); assert.deepEqual([c4.ok, c4.version], [true, v3], JSON.stringify(c4));
+    assert.equal(readInstalledSurface({ file: claudeReceiptFile }).doc.chains.claude.version, v3, "收据两阶段已写到目标版本");
+    const committedLongtask = fs.readFileSync(longtaskDst);
+    fs.appendFileSync(longtaskDst, "\n<!-- 又外改 -->\n");
+    const rb4 = rollbackOperation(ctx, e4.token, lease);
+    assert.deepEqual([rb4.ok, rb4.phase, rb4.incomplete.map((i) => i.id), readGate({ file: gateFile, now: clock }).state, readActive({ dir }).token, readJournal({ dir, token: e4.token }).doc.phase, readInstalledSurface({ file: claudeReceiptFile }).doc.chains.claude.version],
+      [false, "rolling_back", ["artifact:" + longtaskDst], "active", e4.token, "rolling_back", v2], "说不清的制品不覆盖；收据已回 v2；门与账保留：" + JSON.stringify(rb4));
+    fs.writeFileSync(longtaskDst, committedLongtask);
+    const rb4b = rollbackOperation(ctx, e4.token, lease);
+    assert.deepEqual([rb4b.ok, rb4b.phase, rb4b.activeCleared, fs.readFileSync(longtaskDst).equals(longtaskBefore), fs.readlinkSync(path.join(claudeRoot, "current")), readGate({ file: gateFile, now: clock }).state], [true, "rolled_back", true, true, "versions/" + v2, "absent"], JSON.stringify(rb4b));
+    releaseOperationLease(lease);
+    fs.unlinkSync(path.join(dir, e4.token + ".json"));
+    // ── 收据锁残骸不吞（评审探针曾见 ok:true + lockUncleared 被丢）：释放收据锁失败 → commit 必须失败、不记 done
+    const e4b = enterMaintenance(ctx, { reason: "receipt-residue", apply: true }); assert.equal(e4b.ok, true, JSON.stringify(e4b));
+    lease = acquireOperationLease({ dir, token: e4b.token }); assert.equal(lease.ok, true);
+    assert.equal(stageForInstall(ctx, { sourceRoot: srcV3, lease }).ok, true);
+    const claudeReceiptLock = claudeReceiptFile + ".lock";
+    const origRm2 = fs.rmSync; let armedLock = true;
+    fs.rmSync = (target, ...args) => { if (armedLock && path.resolve(String(target)) === path.resolve(claudeReceiptLock)) { armedLock = false; const e = new Error("EIO"); e.code = "EIO"; throw e; } return origRm2(target, ...args); };
+    let c4b;
+    try { c4b = commitForInstall(ctx, { lease }); } finally { fs.rmSync = origRm2; }
+    assert.deepEqual([c4b.ok, c4b.reason, /交不还|release/u.test(String(c4b.why)), readJournal({ dir, token: e4b.token }).doc.steps.find((s) => s.id === "receipt:claude").state], [false, "receipt_write_failed", true, "prepared"], JSON.stringify(c4b));
+    try { fs.unlinkSync(claudeReceiptLock); } catch { /* 注入的失败没真的留下锁 */ }
+    // 恢复途中 journal 写不进（第一项之后注入 EIO）→ 立即停：claude 收据已回、current 仍指 v3，没有继续做下一项外部变更
+    const journalFile4b = path.join(dir, e4b.token + ".json");
+    const origRename = fs.renameSync; let renameHits = 0;
+    fs.renameSync = (a, b, ...rest) => { if (path.resolve(String(b)) === path.resolve(journalFile4b) && ++renameHits === 2) { const e = new Error("EIO"); e.code = "EIO"; throw e; } return origRename(a, b, ...rest); };
+    let rb4b1;
+    try { rb4b1 = rollbackOperation(ctx, e4b.token, lease); } finally { fs.renameSync = origRename; }
+    assert.deepEqual([rb4b1.ok, rb4b1.reason, fs.readlinkSync(path.join(claudeRoot, "current")), readInstalledSurface({ file: claudeReceiptFile }).doc.chains.claude.version, readGate({ file: gateFile, now: clock }).state], [false, "journal_write_failed", "versions/" + v3, v2, "active"], "journal 写不进就停在原地：" + JSON.stringify(rb4b1));
+    const rb4b2 = rollbackOperation(ctx, e4b.token, lease);
+    assert.deepEqual([rb4b2.ok, rb4b2.phase, rb4b2.activeCleared, fs.readlinkSync(path.join(claudeRoot, "current")), fs.readFileSync(longtaskDst).equals(longtaskBefore)], [true, "rolled_back", true, "versions/" + v2, true], JSON.stringify(rb4b2));
+    releaseOperationLease(lease);
+    fs.unlinkSync(path.join(dir, e4b.token + ".json"));
+    // ── 不变量 8 + 14：删门之后被杀 → 只向前；终态已持久化、active 未清 → --exit 只清 active
+    const e5 = enterMaintenance(ctx, { reason: "v3 正装", apply: true }); assert.equal(e5.ok, true, JSON.stringify(e5));
+    lease = acquireOperationLease({ dir, token: e5.token }); assert.equal(lease.ok, true);
+    assert.equal(stageForInstall(ctx, { sourceRoot: srcV3, lease }).ok, true);
+    assert.equal(commitForInstall(ctx, { lease }).ok, true);
+    assert.equal(verifyStagedForInstall(ctx).reason, "phase_mismatch", "committed 之后 verify staged 的绑定拒（不变量 12）");
+    fs.unlinkSync(gateFile);
+    assert.equal(verifyLiveForInstall(ctx, { lease }).reason, "gate_not_ours", "门不在 → 绑定拒（不变量 12）");
+    assert.equal(createGate({ file: gateFile, reason: "v3 正装", token: e5.token, now: clock }).ok, true);
+    assert.equal(verifyLiveForInstall(ctx, { lease, spawn: () => ({ status: 0, stdout: "{}\n" }) }).reason, "verify_live_failed", "探针不 block 就不过");
+    const v5 = verifyLiveForInstall(ctx, { lease });
+    assert.deepEqual([v5.ok, v5.version], [true, v3], "verify live（含真实 Codex 阻断探针）：" + JSON.stringify(v5));
+    // 成功 reopening 的删门前精确复核（评审返修）：制品被外改 → reopening_incomplete，门 / active / staged 都保留
+    const committedLongtask5 = fs.readFileSync(longtaskDst);
+    fs.appendFileSync(longtaskDst, "\n<!-- 漂移 -->\n");
+    const drift = finishInstallReopening(ctx, { lease });
+    assert.deepEqual([drift.ok, drift.phase, drift.incomplete.map((i) => i.id), readGate({ file: gateFile, now: clock }).state, fs.existsSync(stagedDirPath(ctx, e5.token)), readActive({ dir }).token], [false, "reopening_incomplete", ["artifact:" + longtaskDst], "active", true, e5.token], "目标漂移不删门：" + JSON.stringify(drift));
+    releaseOperationLease(lease);
+    // 续跑路径（不经过 bind）上再叠一个 current 漂移：reopening 自己的精确核也要抓住
+    switchCurrentTarget({ root: codexRoot, target: "versions/" + v2 });
+    const drift2 = exitMaintenance(ctx, { apply: true });
+    assert.deepEqual([drift2.ok, drift2.phase, drift2.incomplete.map((i) => i.id).sort(), readGate({ file: gateFile, now: clock }).state, fs.existsSync(stagedDirPath(ctx, e5.token))], [false, "reopening_incomplete", ["artifact:" + longtaskDst, "current:codex:install", "stub:codex"], "active", true], "current 漂移同样不删门（同链桩留着）：" + JSON.stringify(drift2));
+    fs.writeFileSync(longtaskDst, committedLongtask5);
+    switchCurrentTarget({ root: codexRoot, target: "versions/" + v3 });
+    const gateCrashCtx = { ...ctx, gateOps: { createGate, removeGate: (o) => { removeGate(o); throw Object.assign(new Error("crash"), { simulatedCrash: true }); } } };
+    assert.throws(() => exitMaintenance(gateCrashCtx, { apply: true }), (err) => err?.simulatedCrash === true);
+    assert.deepEqual([readJournal({ dir, token: e5.token }).doc.phase, readGate({ file: gateFile, now: clock }).state, readActive({ dir }).token, fs.readlinkSync(path.join(claudeRoot, "current"))], ["reopening_incomplete", "absent", e5.token, "versions/" + v3], "门已删、operation 未终结的窗口");
+    releaseOperationLease(leaseOf(e5.token));
+    assert.equal(exitMaintenance(ctx, { apply: false }).action, "reopen_forward");
+    crashAt.id = "terminal";
+    assert.throws(() => exitMaintenance(ctx, { apply: true }), (err) => err?.simulatedCrash === true);
+    crashAt.id = null;
+    assert.deepEqual([readJournal({ dir, token: e5.token }).doc.phase, readActive({ dir }).token], ["done", e5.token], "终态先持久化、active 未清（不变量 14）");
+    releaseOperationLease(leaseOf(e5.token));
+    assert.equal(exitMaintenance(ctx, { apply: false }).action, "clear_active");
+    const ex5 = exitMaintenance(ctx, { apply: true });
+    assert.deepEqual([ex5.ok, ex5.activeCleared, readActive({ dir }).state], [true, true, "absent"], JSON.stringify(ex5));
+    assert.deepEqual([
+      verifyRuntimeB({ root: claudeRoot }).version, verifyRuntimeB({ root: codexRoot }).version, launchd[claudeLabel].loaded,
+      fs.readFileSync(longtaskDst, "utf-8").includes("v3 技能标记"), readInstalledSurface({ file: claudeReceiptFile }).doc.chains.claude.version,
+      fs.readdirSync(path.join(claudeRoot, "versions")).filter((n) => n.startsWith("maintenance-")), fs.existsSync(stagedDirPath(ctx, e5.token)),
+    ], [v3, v3, true, true, v3, [], false], "成功路径终态：线上 v3、定时器 loaded、桩与 staged 都清了");
+    assert.equal(enterMaintenance(ctx, { reason: "收尾预检", apply: false }).ok, true, "v3 收据与线上一致，预检通过");
+    // ── 不可逆回退窗口里被外切（不变量 8b 变体）：rollback_reopening 后 current 又被指回目标版本 → 逆序 CAS 一次收敛，install 步先回桩、enter 步再回原目标
+    const e6 = enterMaintenance(ctx, { reason: "adversarial", apply: true }); assert.equal(e6.ok, true, JSON.stringify(e6));
+    lease = acquireOperationLease({ dir, token: e6.token }); assert.equal(lease.ok, true);
+    assert.equal(stageForInstall(ctx, { sourceRoot: srcV2, lease }).ok, true);
+    assert.equal(commitForInstall(ctx, { lease }).ok, true);
+    switchCurrentTarget({ root: claudeRoot, target: stubRelTarget(e6.token) }); switchCurrentTarget({ root: codexRoot, target: stubRelTarget(e6.token) });
+    assert.equal(updateJournal({ dir, token: e6.token, lease, mutate: (d) => { d.phase = "rolling_back"; return d; } }).ok, true);
+    assert.equal(updateJournal({ dir, token: e6.token, lease, mutate: (d) => { d.phase = "rollback_reopening"; return d; } }).ok, true);
+    switchCurrentTarget({ root: claudeRoot, target: "versions/" + v2 });
+    releaseOperationLease(lease);
+    const ex6 = exitMaintenance(ctx, { apply: true });
+    assert.deepEqual([ex6.ok, ex6.phase, fs.readlinkSync(path.join(claudeRoot, "current")), fs.readlinkSync(path.join(codexRoot, "current")), readGate({ file: gateFile, now: clock }).state, readActive({ dir }).state], [true, "rolled_back", "versions/" + v3, "versions/" + v3, "absent", "absent"], JSON.stringify(ex6));
+    // ── plan 判别联合封闭 + 安装面 allowlist + current CAS 在安装锁内（评审探针：../ file、任意 chain / kind / 目标路径、任意 current 都曾被接受）
+    const goodPlan = { schema_version: "1.0", token: e6.token, version: v2, artifacts: [], receipts: { claude: { artifacts: [], scripts: [] }, codex: { artifacts: [], scripts: [] } } };
+    const art = (over) => ({ file: "artifacts/0", chain: "claude", path: path.join(home, ".claude", "settings.json"), kind: "claude-settings", base: { exists: false, sha256: null }, intendedAfterSha: "a".repeat(64), inReceipt: true, ...over });
+    assert.deepEqual([
+      stagedPlanProblem(goodPlan, e6.token),
+      stagedPlanProblem({ ...goodPlan, artifacts: [art({})] }, e6.token),
+      stagedPlanProblem({ ...goodPlan, artifacts: [art({ file: "../outside-payload" })] }, e6.token) !== null,
+      stagedPlanProblem({ ...goodPlan, artifacts: [art({ chain: "alien" })] }, e6.token) !== null,
+      stagedPlanProblem({ ...goodPlan, artifacts: [art({ kind: "evil" })] }, e6.token) !== null,
+      stagedPlanProblem({ ...goodPlan, artifacts: [art({ inReceipt: 1 })] }, e6.token) !== null,
+      stagedPlanProblem({ ...goodPlan, token: "00000000-0000-4000-8000-000000000000" }, e6.token) !== null,
+    ], [null, null, true, true, true, true, true], "plan 判别联合封闭");
+    const alien = stagedChecks(ctx, e6.token, { version: v2, artifacts: [{ file: "artifacts/0", chain: "claude", path: path.join(base, "evil.txt"), kind: "file", base: { exists: false, sha256: null }, intendedAfterSha: "a".repeat(64), inReceipt: false, bytes: Buffer.from("") }], receipts: { claude: { artifacts: [], scripts: [] }, codex: { artifacts: [], scripts: [] } } });
+    assert.deepEqual([alien.ok, alien.items.some((t) => /allowlist/u.test(t))], [false, true], JSON.stringify(alien));
+    assert.equal(activateRuntimeVersionB({ version: v2, root: claudeRoot, expectBefore: "versions/nope" }).reason, "current_changed", "expectBefore 的 CAS 在安装锁内、不切");
+    assert.equal(fs.readlinkSync(path.join(claudeRoot, "current")), "versions/" + v3, "CAS 拒了就不动 current");
+    // ── 安装面锁释放失败不许报成功（评审探针：.reap 删除 EIO 时曾照样退 0）
+    const surfaceLockFile = path.join(home, ".claude", "feishu-bridge", "install-surface.lock");
+    const holdProbe = path.join(base, "hold-probe.mjs");
+    fs.writeFileSync(holdProbe, [
+      'import fs from "node:fs";',
+      'import { holdInstallSurfaceLockOrExit } from ' + JSON.stringify(path.resolve("scripts", "install-surface-lock.mjs")) + ";",
+      "holdInstallSurfaceLockOrExit();",
+      "const orig = fs.rmSync;",
+      'fs.rmSync = (t, ...a) => { if (String(t).endsWith("install-surface.lock.reap")) { const e = new Error("EIO"); e.code = "EIO"; throw e; } return orig(t, ...a); };',
+      "", // 自然结束 → exit 钩子释放失败 → exitCode 3
+    ].join("\n"));
+    const probeRun = spawnSync(process.execPath, [holdProbe], { encoding: "utf-8", env: { ...process.env, HOME: home } });
+    assert.deepEqual([probeRun.status, /repair-publish-lock/u.test(probeRun.stderr)], [3, true], "释放失败必须退 3 并指路 repair：" + probeRun.stderr);
+    try { fs.unlinkSync(surfaceLockFile + ".reap"); } catch { /* 没留 */ }
+    try { fs.unlinkSync(surfaceLockFile); } catch { /* 已还 */ }
+    // 两个维护 CLI：业务码之外，释放失败一律压成 3
+    const armReap = () => { const orig = fs.rmSync; let n = 0; fs.rmSync = (t, ...a) => { if (String(t).endsWith("install-surface.lock.reap") && ++n === 1) { const e = new Error("EIO"); e.code = "EIO"; throw e; } return orig(t, ...a); }; return () => { fs.rmSync = orig; }; };
+    let disarm = armReap(); const outR1 = [];
+    let codeR1; try { codeR1 = runMaintenanceGate(["--exit", "--apply"], { ctx, out: (t) => outR1.push(t) }); } finally { disarm(); }
+    assert.deepEqual([codeR1, /安装面锁交不还/u.test(outR1.join("\n"))], [3, true], "业务码 1（no_operation）也要被释放失败压成 3：" + outR1.join("\n"));
+    fs.unlinkSync(surfaceLockFile + ".reap");
+    assert.equal(createGate({ file: gateFile, reason: "挡 enter", token: "33333333-3333-4333-8333-333333333333", now: clock }).ok, true);
+    disarm = armReap(); const outR2 = [];
+    let codeR2; try { codeR2 = runMaintenanceInstall(["--apply"], { ctx: { ...ctx, repoRoot: srcV3 }, out: (t) => outR2.push(t) }); } finally { disarm(); }
+    assert.deepEqual([codeR2, /安装面锁交不还/u.test(outR2.join("\n"))], [3, true], outR2.join("\n"));
+    fs.unlinkSync(surfaceLockFile + ".reap");
+    assert.equal(removeGate({ file: gateFile, token: "33333333-3333-4333-8333-333333333333" }).ok, true);
+    // ── 安装面锁的只读盘点（--status / doctor 同源）：封闭、fail-closed（评审的六个探针逐个收编）
+    const mkOwner = (o) => JSON.stringify(o);
+    fs.symlinkSync(mkOwner({ pid: process.pid, at: new Date().toISOString() }), surfaceLockFile);
+    assert.equal(maintenanceStatus(ctx).surfaceLock.holder.state, "unknown", "缺 token 不算 held");
+    fs.unlinkSync(surfaceLockFile);
+    fs.symlinkSync(mkOwner({ pid: process.pid, at: new Date().toISOString(), token: ["x"] }), surfaceLockFile);
+    assert.equal(maintenanceStatus(ctx).surfaceLock.holder.state, "unknown", "数组 token 不算 held");
+    fs.unlinkSync(surfaceLockFile);
+    fs.symlinkSync(mkOwner({ pid: process.pid, at: new Date().toISOString(), token: "t" }), surfaceLockFile + ".reap");
+    fs.symlinkSync("junk", surfaceLockFile + ".reap.quarantine-not-a-uuid");
+    fs.symlinkSync(mkOwner({ pid: 999999999, at: new Date(Date.now() - 120000).toISOString(), token: "t" }), surfaceLockFile + ".maint");
+    const slMix = maintenanceStatus(ctx).surfaceLock;
+    assert.deepEqual([slMix.holder.state, slMix.residues.map((r) => r.kind).sort()], ["absent", ["maint", "unknown"]], "在途 .reap（活 pid、新鲜）不是残骸；假 quarantine 只算 unknown：" + JSON.stringify(slMix.residues));
+    fs.unlinkSync(surfaceLockFile + ".reap"); fs.unlinkSync(surfaceLockFile + ".reap.quarantine-not-a-uuid"); fs.unlinkSync(surfaceLockFile + ".maint");
+    fs.symlinkSync(mkOwner({ pid: 999999999, at: new Date(Date.now() - 120000).toISOString(), token: "t" }), surfaceLockFile + ".reap");
+    const stLock = maintenanceStatus(ctx);
+    assert.deepEqual([stLock.surfaceLock.holder.state, stLock.surfaceLock.residues.map((r) => r.kind)], ["absent", ["reap"]], JSON.stringify(stLock.surfaceLock));
+    assert.match(renderStatus(stLock), /安装面锁/u);
+    assert.match(renderStatus(stLock), /repair-publish-lock/u);
+    fs.unlinkSync(surfaceLockFile + ".reap");
+    // 枚举失败（除 ENOENT）不折成"没有残骸"
+    const homeEacces = path.join(base, "sl-eacces"); fs.mkdirSync(path.join(homeEacces, ".claude", "feishu-bridge"), { recursive: true });
+    fs.chmodSync(path.join(homeEacces, ".claude", "feishu-bridge"), 0o000);
+    const slE = inspectInstallSurfaceLock({ home: homeEacces });
+    fs.chmodSync(path.join(homeEacces, ".claude", "feishu-bridge"), 0o700);
+    assert.deepEqual([slE.inventory, slE.residues.length > 0], ["unreadable", true], JSON.stringify(slE));
+    // release 的归属（评审探针）：主锁缺席 / 被换主都不算成功 —— 写段独占性无法证明
+    const surfA = acquireInstallSurfaceLock({ home });
+    fs.unlinkSync(surfaceLockFile);
+    const relLost = surfA.release();
+    assert.deepEqual([relLost.ok, /lock_lost/u.test(String(relLost.why))], [false, true], JSON.stringify(relLost));
+    const surfB = acquireInstallSurfaceLock({ home });
+    fs.unlinkSync(surfaceLockFile);
+    fs.symlinkSync(mkOwner({ pid: process.pid, at: new Date().toISOString(), token: "someone-else" }), surfaceLockFile);
+    const relRepl = surfB.release();
+    assert.deepEqual([relRepl.ok, /lock_instance_replaced/u.test(String(relRepl.why))], [false, true], JSON.stringify(relRepl));
+    fs.unlinkSync(surfaceLockFile);
+    // ── 参数封闭
+    assert.deepEqual([parseMaintenanceInstallArgs([]).ok, parseMaintenanceInstallArgs(["--apply", "--apply"]).ok, parseMaintenanceInstallArgs(["--force"]).ok, parseMaintenanceInstallArgs(["--reason"]).ok, parseMaintenanceInstallArgs(["--wait-ms", "x"]).ok, parseMaintenanceInstallArgs(["--reason", "r", "--wait-ms", "10", "--apply"])], [true, false, false, false, false, { ok: true, reason: "r", waitMs: 10, apply: true }]);
+  } finally {
+    if (prevTpl === undefined) delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; else process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = prevTpl;
+  }
 });
 
 summarySealed = true;

@@ -33,6 +33,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { displaySafe } from "./display-safe.mjs";
+import { inspectInstallSurfaceLock } from "./install-surface-lock.mjs";
 import { isDirectRun, moduleDir } from "./direct-run.mjs";
 import { auditOutbox } from "./outbox.mjs";
 import { inspectRunChannel, outboxDirOf } from "./drain-outbox.mjs";
@@ -336,12 +337,16 @@ export function runDoctor({
     add("chat_ledger", "⑨ chat 账本（两条链）", problems.length === 0, problems.length === 0 ? parts.join("、") + "；没有说不清的条目" + tail : parts.join("、") + "；说不清 " + problems.length + " 处：" + problems.slice(0, 3).join("；") + tail, null);
   }
 
-  // ⑩ 维护门（issue #81）：三态 —— 没开 = 正常；开着 = 维护中（点名原因与时长，超过 10 分钟单独点名）；读不出 = 按维护中处理、只人工处置
+  // ⑩ 维护门（issue #81）：三态 —— 没开 = 正常；开着 = 维护中（点名原因与时长，超过 10 分钟单独点名）；读不出 = 按维护中处理、只人工处置。
+  // 附安装面锁（PR C 第 2 步）：持有者与锁家族残骸只读盘点 —— 残骸会挡后续安装 / 维护，不能只有写方碰壁时才看见。
   {
     const g = readGate({ now });
     const mdir = inspectMaintenanceDir({ dir: maintenanceDir() });
-    const mres = mdir.inventory === "unreadable" ? "；维护目录读不出：" + mdir.residues.map((r) => r.detail).join("；") : mdir.residues.length > 0 ? "；维护目录残骸 " + mdir.residues.length + " 处：" + mdir.residues.slice(0, 3).map((r) => r.path + "（" + r.detail + "）").join("、") : "";
-    if (g.state === "absent") add("maintenance_gate", "⑩ 维护门", mres === "", "没开" + mres, null);
+    const sl = inspectInstallSurfaceLock({ home });
+    const slText = sl.holder.state === "held" ? "；安装面锁 pid " + sl.holder.pid + (sl.holder.alive ? "（在跑）" : "（已不在，下一个写方接管）") : sl.holder.state === "unknown" ? "；安装面锁说不清（" + sl.holder.why + "）" + sl.path : "";
+    const slRes = sl.residues.length > 0 ? "；安装面锁残骸 " + sl.residues.length + " 处：" + sl.residues.slice(0, 3).map((r) => r.path + "（" + r.detail + "）").join("、") : "";
+    const mres = (mdir.inventory === "unreadable" ? "；维护目录读不出：" + mdir.residues.map((r) => r.detail).join("；") : mdir.residues.length > 0 ? "；维护目录残骸 " + mdir.residues.length + " 处：" + mdir.residues.slice(0, 3).map((r) => r.path + "（" + r.detail + "）").join("、") : "") + slText + slRes;
+    if (g.state === "absent") add("maintenance_gate", "⑩ 维护门", mres === "" || (mres === slText && sl.holder.state === "held"), "没开" + mres, null);
     else if (g.state === "active") add("maintenance_gate", "⑩ 维护门", false, "开着：" + g.payload.reason + "（已 " + Math.floor(g.ageMs / 60000) + " 分钟，token " + String(g.payload.token).slice(0, 8) + "）" + (g.ageMs > 10 * 60 * 1000 ? " —— 超过 10 分钟，多半是维护中断；维护门 CLI（--status / --exit）随后续 PR 提供，此刻请人工核对 " + maintenanceGatePath() : ""), null);
     else if (g.state === "transitioning") add("maintenance_gate", "⑩ 维护门", false, "正在切换（" + g.why + "）—— 入口都按维护中处理；几毫秒的事，再跑一次仍在就是段里崩了或释放失败，转换锁在 " + maintenanceGatePath() + ".txn", null);
     else add("maintenance_gate", "⑩ 维护门", false, "读不出（" + g.why + "）—— 入口都按维护中处理；畸形制品不自动删，请人工核对 " + (g.detail ?? maintenanceGatePath()), null);

@@ -29,6 +29,8 @@ import {
 } from "./runtime-install.mjs";
 import { CLAUDE_SKILLS, claudeDrainPlist, claudeDrainPlistPath, referencedRuntimeScripts, renderClaudeSettings, renderClaudeSkill } from "./install-projection.mjs";
 import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "./installed-surface.mjs";
+import { gateBlocks } from "./maintenance-gate-core.mjs";
+import { holdInstallSurfaceLockOrExit } from "./install-surface-lock.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
 
@@ -212,6 +214,15 @@ if (skillAction === "source-missing") {
 if (!apply) {
   console.log("\n[dry-run] 什么都没写。加 --apply 才真的落盘。");
   process.exit(0);
+}
+
+// 安装面锁 + 维护门（issue #81）：先取安装面锁（与维护流程共用一把，持有到本进程退出），**再**看门 ——
+// 门检是瞬时的，锁才是原子准入：过了检查门才建立的竞态被锁互斥挡住（评审探针）。
+// 维护安装自己不走这个 CLI（maintenance-install-core 直接用投影函数），所以这里没有豁免口。
+holdInstallSurfaceLockOrExit();
+{
+  const g = gateBlocks();
+  if (g.blocked) { console.error("维护门：" + g.text + " —— 安装被拒，什么都没写。"); process.exit(2); }
 }
 
 const writeJsonAtomic = (file, obj) => {

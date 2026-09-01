@@ -21705,6 +21705,17 @@ test("issue #98：cc2cd 旧形 rejected 精确命中进 notices，差一点都�
   red("记录多一个键（猜的 detail 形不许收）", { rec: legalRec().slice(0, -1) + ',"detail":"empty_instruction"}' });
   red("recorded_at 非规范 ISO", { rec: legalRec().replace("2026-08-30T00:00:01.000Z", "2026-08-30 00:00:01") });
   red("记录读不出（JSON 坏）", { rec: "{ 坏了" });
+  // message_id 必须是非空字符串（评审探针：claimKey 做字符串强转，数字 / 空串 / 对象只要按转换后的值
+  // 生成 key 就能对上重推 —— 畸形 claim 会被降成 info；这三组的 key 都按强转值造，专打这条缺口）
+  for (const [label, mid] of [["数字", 123], ["空串", ""], ["对象", { x: 1 }]]) {
+    clean();
+    const kBad = claimKeyFor(String(mid), "cc2cd_peer");
+    fs.mkdirSync(path.join(claims, kBad + ".claim"), { recursive: true });
+    fs.writeFileSync(path.join(claims, kBad + ".claim", "claim.json"), JSON.stringify({ schema_version: "1.0", state: "claimed", claim_key: kBad, message_id: mid, logical_task_key: "cc2cd_peer", claimed_at: "2026-08-30T00:00:00.000Z", session_id: "s", thread_id: "t" }));
+    fs.writeFileSync(path.join(claims, kBad + ".rejected.json"), JSON.stringify({ ..."empty_instruction", schema_version: "1.0", claim_key: kBad, state: "rejected", recorded_at: "2026-08-30T00:00:01.000Z" }));
+    const rBad = inventoryRuns({ runsDir: runs, claimsDir: claims });
+    assert.deepEqual([rBad.notices, rBad.problems.map((p) => p.reason)], [[], ["rejected_orphan"]], "message_id " + label + " 不许降级成 info：" + JSON.stringify({ n: rBad.notices, p: rBad.problems }));
+  }
   // ③ 新形判据先行：claim 带 rejected_control 投影时走 #94 判据，legacy 形记录不许来救。
   // claim 用仓库自己的夹具（readClaimState 的完整校验对 policy_id 等有受控取值要求，手写会先撞上它）。
   clean();

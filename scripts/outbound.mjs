@@ -227,6 +227,9 @@ function isLegacyCc2cdRejected({ claimsDir, key }) {
   if (claim.claim_key !== key || !isCanonicalIso(claim.claimed_at)) return false;
   if (typeof claim.session_id !== "string" || claim.session_id === "" || typeof claim.thread_id !== "string" || claim.thread_id === "") return false;
   // key 用仓里现成的推导函数重推（message_id + " " + logical_task_key），不自己拼哈希。
+  // 重推前 message_id 必须是非空字符串（评审探针：claimKey 做字符串强转，数字 / 空串 / 对象
+  // 只要按转换后的值生成 key 就能混进 legacy —— 畸形 claim 会被降成 info，本应留在红色）。
+  if (typeof claim.message_id !== "string" || claim.message_id === "") return false;
   if (claimKey(claim.message_id, claim.logical_task_key) !== key) return false;
   const recRaw = readRegularFile(path.join(claimsDir, key + "." + CLAIM_STATE.REJECTED + ".json"));
   if (recRaw.status !== "read") return false;

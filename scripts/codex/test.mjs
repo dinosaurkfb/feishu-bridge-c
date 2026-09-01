@@ -80,6 +80,7 @@ import {
   isAilyInvocation, isBindingPrompt,
   PROMPT_HOOK_COMMAND_SCRIPTS, hookCommandScript, composeSubscribeContext,
 } from "./prompt-hook.mjs";
+import { CHAT_FALLBACK_REASONS } from "../inbound-route.mjs";
 import {
   buildCodexSubscriptionProjection, enableAutoPublishForAllTasks, evaluatePromotion,
   readMigrationReceipt,
@@ -853,6 +854,30 @@ test("Codex 首次认领 shadow 与现行绑定码选择一致且不写 task reg
   assert.equal(shadow.match, true);
   assert.deepEqual(shadow.scope_unverified, ["chat_id"]);
   assert.equal(fs.readFileSync(path.join(home, "registry.json"), "utf-8"), before);
+});
+
+test("Codex 链自己那份认领评价器：整条没有 <at> 是私聊形状，不报「没有真实 @ M5Codex」；@ 别人照旧拒（票 #6 A）", () => {
+  // 这一份评价器（scripts/codex/state.mjs:evaluatePromotion）不是共用那个 —— 改了
+  // inbound-route.mjs 不等于改了它。两边各测一遍，才不会一条链修好、另一条照旧误伤。
+  const home = temp();
+  const root = path.join(home, "one-pending"); fs.mkdirSync(root);
+  const now = Date.parse("2026-08-22T08:00:00Z");
+  const a = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30", now });
+  writeRegistryFixtureUnvalidated([a], path.join(home, "registry.json"));
+  const pending = findPendingTask({ home, content: "接入项目", now });
+  assert.equal(pending.ok, true, JSON.stringify(pending));
+  const ev = (content, ageMs = 1000) => ({ message_id: "m_p2p", session_id: "s_p2p",
+    sender_id: TEMPLATE.frank_sender_id, created_at_ms: now - ageMs, content });
+  assert.equal(evaluatePromotion({ event: ev("接入项目"), template: TEMPLATE, pending, now }).reason, "p2p_no_mention");
+  assert.equal(CHAT_FALLBACK_REASONS.includes("p2p_no_mention"), true, "私聊这条要能落 chat 兜底");
+  assert.equal(evaluatePromotion({ event: ev('<at id="ou_other">别人</at> 接入项目'), template: TEMPLATE, pending, now }).reason,
+    "transport_not_mentioned", "有 mention 却没 @ 到本链路：群行为一个不变");
+  assert.equal(evaluatePromotion({ event: ev('<at id="ou_same">M5Codex</at> 接入项目'), template: TEMPLATE, pending, now }).ok, true,
+    "群里真实 @ 照旧能认");
+  assert.equal(evaluatePromotion({ event: ev("接入项目", TEMPLATE.default_freshness_ms + 1000), template: TEMPLATE, pending, now }).reason,
+    "stale_message", "超龄排在形状之前：私聊也不给旧消息开口");
+  assert.equal(evaluatePromotion({ event: { ...ev("接入项目"), sender_id: "4444" }, template: TEMPLATE, pending, now }).reason,
+    "sender_not_frank", "未登记的私聊仍按发送者拒（不落到 chat）");
 });
 
 test("完整入站链路用引用绑定码在多个 pending 中只绑定目标 task", () => {
@@ -9320,11 +9345,23 @@ test("Codex 链的 chat 默认态：未绑定会话（群 @ 或私聊）不再�
   const multi = run("移除项目", TEMPLATE.frank_sender_id);
   assert.match(multi.stdout, /^回答：移除项目/mu, "多份待绑定不再拒成歧义：" + multi.stdout + multi.stderr);
   assert.doesNotMatch(multi.stdout, /无法确定目标/u);
+  // 只剩**一份**待绑定：以前这条私聊会得到「已拒绝 · 没有真实 @ M5Codex」（Codex 链自己那份
+  // 评价器 scripts/codex/state.mjs:evaluatePromotion 判的，不是共用那份），现在落 chat，
+  // 并且不许把待绑定认掉、不许改 task registry 一个字节。
+  writeRegistryFixtureUnvalidated([task, p1], path.join(home, "registry.json"));
+  const regBeforeP2p = fs.readFileSync(path.join(home, "registry.json"), "utf-8");
+  const p2pPending = run("接入项目", TEMPLATE.frank_sender_id, {}, { raw: "接入项目" });
+  assert.match(p2pPending.stdout, /^回答：接入项目\n— chat/mu, "全机唯一待绑定也不许被私聊认掉：" + p2pPending.stdout + p2pPending.stderr);
+  assert.doesNotMatch(p2pPending.stdout, /没有真实 @ M5Codex/u);
+  assert.equal(fs.readFileSync(path.join(home, "registry.json"), "utf-8"), regBeforeP2p, "私聊不碰待绑定");
+  // 同一份 pending，群里真实 @ 运输 agent 照旧能认（群行为一个不变）
+  const grpClaim = run("接入项目", TEMPLATE.frank_sender_id);
+  assert.doesNotMatch(grpClaim.stdout, /^回答：/u, "带真实 @ 的那条不再按 chat 答：" + grpClaim.stdout + grpClaim.stderr);
   writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   assert.match(run("$feishu-bind", TEMPLATE.frank_sender_id).stdout, /这个话题还没接入任何本机项目。接入要在终端里/u);
   assert.match(run("$feishu-unbind", TEMPLATE.frank_sender_id).stdout, /已拒绝 · 这个命令不从飞书开放/u);
   assert.match(run("$feishu-status", TEMPLATE.frank_sender_id).stdout, /\$feishu-status 在这里无从执行/u);
-  assert.equal(argvLog().length, 4, "命令与拒绝都不起模型（4 = 首条 + participant + 未配对前的私聊 + 多份待绑定那条）");
+  assert.equal(argvLog().length, 5, "命令与拒绝都不起模型（5 = 首条 + participant + 上面的私聊 + 多份待绑定 + 唯一待绑定那条私聊；带真实 @ 的那条走绑定不答话）");
   // Codex 链的 chat 前置：本机 claude CLI 不可用 → 明确报 chat_reply_path_unavailable，不冒充可用
   const noClaude = path.join(home, "bin-noclaude"); fs.mkdirSync(noClaude); fs.copyFileSync(path.join(bin, "aily-cli"), path.join(noClaude, "aily-cli")); fs.chmodSync(path.join(noClaude, "aily-cli"), 0o700);
   const unavailable = run("在吗", TEMPLATE.frank_sender_id, { PATH: noClaude + path.delimiter + path.dirname(process.execPath) + path.delimiter + "/usr/bin:/bin" });

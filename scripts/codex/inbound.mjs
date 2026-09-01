@@ -99,6 +99,8 @@ const REASON_TEXT = {
   pending_binding_expired: "等待绑定已过期，需要重新执行接入",
   sender_not_frank: "发送者不是授权用户",
   transport_not_mentioned: "没有真实 @ M5Codex",
+  // 正常不会到眼前（它在 CHAT_FALLBACK_REASONS 里，紧接着就落 chat）；写上是不让裸码漏给用户
+  p2p_no_mention: "私聊不用于认领项目：认领要在待接入话题里真实 @ M5Codex。这条按 chat 默认态回答",
   stale_message: "消息超出时效窗口",
   malformed_event: "消息信封字段不完整",
 };

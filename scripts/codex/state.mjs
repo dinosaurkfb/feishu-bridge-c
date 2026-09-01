@@ -13,6 +13,9 @@ import path from "node:path";
 
 import { loadChainTemplate, materializeProjectConfig } from "../chain-template.mjs";
 import { extractMentionIds } from "../selector.mjs";
+// 私聊判据与 Claude 链共用一份（票 #6 A）：这一份评价器是 Codex 入口自己在用的，
+// 改了 inbound-route.mjs 不等于改了它 —— 同一个概念在两处各判一次就是这次要消掉的东西。
+import { isP2pMessage } from "../inbound-route.mjs";
 import { acquirePublishLock, isUnder, releasePublishLock } from "../registry.mjs";
 
 // 只有"别人正拿着"才是 registry_busy；锁目录不可写之类的 I/O 错误要原样报出去（评审探针：曾被折叠成 busy 静默跳过）。
@@ -1036,12 +1039,16 @@ export function shadowCodexFirstClaim({
 export function evaluatePromotion({ event, template, pending, now = Date.now() }) {
   if (!pending?.ok) return { ok: false, reason: pending?.reason ?? "no_pending_binding" };
   if (event?.sender_id !== template?.frank_sender_id) return { ok: false, reason: "sender_not_frank" };
+  const createdAt = Number(event?.created_at_ms);
+  if (!Number.isFinite(createdAt)) return { ok: false, reason: "malformed_event" };
+  // 新鲜度排在形状判定之前（与共用那份同序）：防重放是更基本的性质。
+  if (now - createdAt > template.default_freshness_ms) return { ok: false, reason: "stale_message" };
+  // 私聊不进认领评估：整条消息没有任何 mention 时，硬判只能得到一条把私聊说成群聊的
+  // 「没有真实 @ M5Codex」。这条经 CHAT_FALLBACK_REASONS 落进 chat 默认态重判。
+  if (isP2pMessage(event)) return { ok: false, reason: "p2p_no_mention" };
   if (!extractMentionIds(event?.content).includes(template?.transport_open_id)) {
     return { ok: false, reason: "transport_not_mentioned" };
   }
-  const createdAt = Number(event?.created_at_ms);
-  if (!Number.isFinite(createdAt)) return { ok: false, reason: "malformed_event" };
-  if (now - createdAt > template.default_freshness_ms) return { ok: false, reason: "stale_message" };
   return { ok: true, task: pending.task };
 }
 

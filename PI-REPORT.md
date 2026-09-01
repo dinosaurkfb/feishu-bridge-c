@@ -36,6 +36,12 @@
 
 **如实记下的取舍**：判据靠的是 mention 结构，不是会话类型。所以群里一条完全没打 @ 的消息（按文档它本来投不过来）如果哪天真投过来了，会被当私聊形状落到 chat —— 仍然是三道闸 + 零工具，拿不到绑定能力，不会绑错位。另一个已知边角：手打的 `@名字`（无标签）算零 mention，同样落 chat。
 
+**这条链上有两份认领评价器，改一处不等于改两处。**`scripts/inbound-route.mjs:evaluatePromotion` 是 Claude 入口用的；Codex 入口走的是另一份 `scripts/codex/state.mjs:1036`（`scripts/codex/inbound.mjs:276` 调它），它把 pending / 发送者 / @ / 新鲜度各判一遍。只改共用那份的话，私聊在 Claude 落 chat、在 Codex 仍报「没有真实 @ M5Codex」—— 就是规格要消掉的「同一个概念在两处各判一次」。所以：
+
+- `scripts/codex/state.mjs`：引入共用的 `isP2pMessage`，把顺序整成与共用那份一致（新鲜度 → 私聊形状 → @ 闸），零 mention 返回 `p2p_no_mention`
+- `scripts/codex/inbound.mjs:103` 的 `REASON_TEXT` 补一条 `p2p_no_mention` 文案（正常漏不出来，防裸码到用户眼前）
+- 两边各测一遍：`scripts/codex/test.mjs:859`（gate 级，钉住「唯一 pending + 零 mention 不认」「@ 别人仍拒」「真实 @ 仍能认」「超龄/未登记排在形状之前」）、`:9348`（真入口：唯一待绑定时私聊落 chat 且 task registry 一字节不动；同一份 pending 带真实 @ 照旧走绑定）
+
 ## B：未配对的一轮把答复单发
 
 `scripts/stop-hook.mjs`：`readTurnRecord` 返回 `not_found` ⇒ `turnRoute = { ok: true, kind: "unpaired" }` —— 入队一条**不带用户输入块**的答复，目标取当前代际（没有冻结 origin 可取），不留 `unrouted-replies` 诊断，不消费任何记录。
@@ -58,5 +64,30 @@
 `scripts/codex/test.mjs`：`:9313` 起加真入口两条 —— Codex 链的零 mention 私聊落 chat（`回答：在吗\n— chat`）、未登记的私聊仍零权限；并把一处绝对起模型次数改成与新基线对齐。
 
 ## 只能真机再确认的一件事
+
+`isP2pMessage` 的前提是「群消息没有 @ 就不会投给 agent」。这条写在文档里、也符合线上现象（真机私聊的 envelope 里确实没有 `<at>`，所以才会报 `transport_not_mentioned`），但我没有平台侧的投递日志可查。请 Frank 在真机私聊发一句「在吗」，然后跑 `node scripts/layered-status.mjs --json` 看 chat 计数是否 +1、话题里是否收到单发答复；这条一旦不符，判据要换成平台侧 chat_type（那需要 envelope 先带上来）。
+
+## 自检：把新守卫逐条改坏，要求每条都被咬住
+
+`/tmp/pi-ticket6-probe.py`（临时脚本，未入库）跑 8 个变异，全部 `KILLED`：
+删掉 `evaluatePromotion` 的私聊早退；从 `CHAT_FALLBACK_REASONS` 摘掉 `p2p_no_mention`；
+`evaluateChatGates` 不再豁免私聊；把 `isP2pMessage` 判反；把 `not_found` 改回一律零入队；
+去掉 `policy_state_unreadable` 边界；删掉 Codex 那份评价器的私聊早退；把它的「新鲜度先于形状」顺序拆回去。
+每一个都至少让一条测试变红。
+
+**探针自己咬出的一次事故，记下来**：第一版探针用 `git checkout -- <file>` 复原，而 `state.mjs`
+的改动那时还没提交 —— 一次变异之后它把**未提交的实现整份清掉了**，测试仍报绿只是因为当时
+Codex 的两条新测试也刚被一起回滚。改成「按变异前读到的原文写回」后重跑，才发现 Codex 那份
+评价器其实一直在被保护之外。教训：自检脚本不许用 git 复原未提交的工作。
+
+## 一处复现不出来的红（照实说）
+
+改完 Codex 那份评价器之后，`node scripts/test.mjs` 有一次报 `通过 738 / 失败 1`，红的是
+「维护门 · PR B：…入口清单不缺且盖住线上引用」。单独跑它绿，之后连跑 4 次全量都绿，
+没再复现，也没找到与本票改动的因果路径（那条测试装的是沙箱 HOME）。不排除是这台机器上
+**正在跑的桥**与本会话自身钩子同时写 `~/.claude/feishu-bridge` 造成的时序干扰。
+不写成「已修」，也不写成「无关所以不管」—— 请 Codex 复核时顺手再跑一次全量。
+
+
 
 `isP2pMessage` 的前提是「群消息没有 @ 就不会投给 agent」。这条写在文档里、也符合线上现象（真机私聊的 envelope 里确实没有 `<at>`，所以才会报 `transport_not_mentioned`），但我没有平台侧的投递日志可查。请 Frank 在真机私聊发一句「在吗」，然后跑 `node scripts/layered-status.mjs --json` 看 chat 计数是否 +1、话题里是否收到单发答复；这条一旦不符，判据要换成平台侧 chat_type（那需要 envelope 先带上来）。

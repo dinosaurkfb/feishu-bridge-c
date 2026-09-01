@@ -37,6 +37,7 @@ import { inspectInstallSurfaceLock } from "./install-surface-lock.mjs";
 import { isDirectRun, moduleDir } from "./direct-run.mjs";
 import { auditOutbox } from "./outbox.mjs";
 import { inspectRunChannel, outboxDirOf } from "./drain-outbox.mjs";
+import { inventoryRuns } from "./outbound.mjs";
 import { loadRegistryStrict, registryPath } from "./registry.mjs";
 import { loadRoutes, routesPath, defaultRouteHandler } from "./inbound-routes.mjs";
 import { collectConnectivity, loadStatusProviders, statusProvidersPath } from "./status-providers.mjs";
@@ -249,6 +250,15 @@ export function runDoctor({
       if (stuck.length > 0) { backlogProblems += stuck.length; backlogWhere.push(name + "（run 卡住 " + stuck.length + " 条：" + [...new Set(stuck.map((x) => x.reason))].join("、") + "）"); }
       const problems = rc.runs.problems ?? [];
       if (problems.length > 0) { backlogProblems += problems.length; backlogWhere.push(name + "（runs 账本说不清 " + problems.length + " 处：" + [...new Set(problems.map((x) => x.reason))].join("、") + "）"); }
+      // issue #98：已知旧形记录是 info 不是问题 —— 显示数量但**不进 backlogProblems**（⑥ 不因此变红）。
+      // rc.runs 走 drainRunResults，透不出 notices，只能另盘一次；路径与 drain-outbox.mjs 的
+      // runChannelContext 同一组（本单边界不许改那边）——那边若改路径这里要同改，漂移的最坏后果
+      // 只是这条 info 显示缺位，不影响红绿。
+      const ledgerNotices = inventoryRuns({
+        runsDir: path.join(root, ".runtime-data", "inbound", "runs"),
+        claimsDir: path.join(root, ".runtime-data", "inbound", "delivery-claims"),
+      }).notices ?? [];
+      if (ledgerNotices.length > 0) backlogWhere.push(name + "（runs 账本已知旧形记录 " + ledgerNotices.length + " 条：" + [...new Set(ledgerNotices.map((x) => x.reason))].join("、") + "，不算问题）");
     }
   }
   const expiryOk = !registry.ok ? null : (expired.length + expiring.length + pendingExpired.length === 0 ? (unclear.length === 0 ? true : null) : false);

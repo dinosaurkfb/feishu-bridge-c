@@ -18075,6 +18075,49 @@ test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结�
   assert.equal(diags().length, goneDiags + 1, "要留可诊断记录");
   assert.equal(diags().at(-1).reason, "consumed_claim_absent", JSON.stringify(diags().at(-1)));
 
+  // 重入预检绑来源身份（评审 PR #111 P2 反向）：更早回合的**同文**配对卡不算本回合已入队 ——
+  // 只比正文 + 时间会把这条 mid-turn 回答误丢
+  assert.equal(prompt("换个话头的本地输入").status, 0);
+  assert.equal(stop("换个话头的正式回复").status, 0);
+  const echoBase = replies().length;
+  assert.equal(stop("登记表恢复后的本地回复").status, 0, "mid-turn 回答恰与早回合配对正文相同");
+  assert.equal(replies().length, echoBase + 1,
+    "同文的早回合配对卡不该挡住本回合的 answer-only：来源键不同就要入队");
+
+  // 老形 local consumed 记录（没有 capture_id）：配对键与来源都拼不出 → 零入队 + 诊断
+  const oldShapeFile = readTurnRecord({ dir: claudeTurnInputDir(fx.root, null), key: session }).file;
+  fs.writeFileSync(oldShapeFile, JSON.stringify({ schema_version: "1.0", input_origin: "local",
+    text: "旧形输入", consumed_at: "2026-08-28T10:00:00.000Z" }));
+  const oldShapeBase = replies().length;
+  assert.equal(stop("旧形记录时代的 mid-turn").status, 0);
+  assert.equal(replies().length, oldShapeBase, "老形记录说不清来源 → 零入队");
+  assert.equal(diags().at(-1).reason, "consumed_source_unknown", JSON.stringify(diags().at(-1)));
+
+  // 账本单件说不清就 fail-closed（评审 PR #111 P1）：symlink / FIFO / 坏 JSON 都不算"没入队"，
+  // 一律零入队 + 诊断 —— 裸读会跟随 symlink、被 FIFO 挂死、把读失败当成"可以补发"
+  assert.equal(prompt("恢复正常记录的输入").status, 0);
+  assert.equal(stop("恢复正常记录的回复").status, 0);
+  const outDir = outboxDirOf(fx.root);
+  const bombs = [
+    ["zz-bad.json", () => fs.writeFileSync(path.join(outDir, "zz-bad.json"), "{nope")],
+    ["zz-link.json", () => fs.symlinkSync(path.join(fx.local, "elsewhere.txt"), path.join(outDir, "zz-link.json"))],
+    ["zz-fifo.json", () => execFileSync("mkfifo", [path.join(outDir, "zz-fifo.json")])],
+  ];
+  fs.writeFileSync(path.join(fx.local, "elsewhere.txt"), JSON.stringify({ kind: "reply" }));
+  for (const [name, plant] of bombs) {
+    // 基线在放炸弹**之前**数、断言在拆掉**之后**做：listPending 这类帮手自己也会读 outbox，
+    // 炸弹在场时用它就把测试进程挂死在 FIFO 上（这正是被测的故障形态）
+    const bombBase = replies().length;
+    const bombDiags = diags().length;
+    plant();
+    const bombStop = stop("账本有炸弹时的 mid-turn " + name);
+    fs.rmSync(path.join(outDir, name), { force: true });
+    assert.equal(bombStop.status, 0, name + "：" + bombStop.stderr);
+    assert.equal(replies().length, bombBase, name + "：账本说不清 → 零入队");
+    assert.equal(diags().length, bombDiags + 1, name + "：要留诊断");
+    assert.equal(diags().at(-1).reason, "consumed_ledger_unreadable", name + "：" + JSON.stringify(diags().at(-1)));
+  }
+
   // 两条**不同**的飞书回合、回复正文相同：事件键是 claim key，不是正文指纹 —— 两条都要入队、各回各的话题
   const mkOk = (messageId, origin) => acquireClaim({ claimsDir, messageId, logicalTaskKey: mapping.logical_task_key,
     meta: { session_id: "session_old", binding_id: effectiveBindingId(mapping, { root: fx.root }), claude_session_id: null,

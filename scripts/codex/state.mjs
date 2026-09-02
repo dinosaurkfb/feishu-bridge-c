@@ -13,6 +13,7 @@ import path from "node:path";
 
 import { loadChainTemplate, materializeProjectConfig } from "../chain-template.mjs";
 import { extractMentionIds } from "../selector.mjs";
+import { isOffTemplateChatTurn } from "../inbound-route.mjs";
 import { acquirePublishLock, isUnder, releasePublishLock } from "../registry.mjs";
 
 // 只有"别人正拿着"才是 registry_busy；锁目录不可写之类的 I/O 错误要原样报出去（评审探针：曾被折叠成 busy 静默跳过）。
@@ -1033,11 +1034,14 @@ export function shadowCodexFirstClaim({
   });
 }
 
-export function evaluatePromotion({ event, template, pending, now = Date.now() }) {
+export function evaluatePromotion({ event, template, pending, now = Date.now(), env = process.env }) {
   if (!pending?.ok) return { ok: false, reason: pending?.reason ?? "no_pending_binding" };
   if (event?.sender_id !== template?.frank_sender_id) return { ok: false, reason: "sender_not_frank" };
   if (!extractMentionIds(event?.content).includes(template?.transport_open_id)) {
-    return { ok: false, reason: "transport_not_mentioned" };
+    // 评审 PR #111 P2：unverified locator 的 mismatch 不改判定，只标出来让回执带诊断 hint
+    //（与 Claude 链 evaluatePromotion 同一纪律，判据同一份 isOffTemplateChatTurn）。
+    return { ok: false, reason: "transport_not_mentioned",
+      off_template_hint: isOffTemplateChatTurn({ template, env }) };
   }
   const createdAt = Number(event?.created_at_ms);
   if (!Number.isFinite(createdAt)) return { ok: false, reason: "malformed_event" };

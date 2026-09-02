@@ -96,7 +96,9 @@ export function describeStoreWrite(r, file) {
   let exitCode = 0;
   if (!r || typeof r !== "object") { lines.push("没有写成：结果说不清"); exitCode = 1; }
   else if (!r.ok) {
-    lines.push("没有写成：" + r.reason + detail(r) + (r.stale ? "；待补记已改名留痕为 <store>.audit.pending.stale.<ts>" : ""));
+    // 评审 #115 三轮 P2-1：r.stale 是死字段（apply 早就不返回它）——删；conflict 按 P1-2 新语义指路。
+    lines.push("没有写成：" + r.reason + detail(r));
+    if (r.reason === "audit_pending_conflict") lines.push("这是持续门禁：待补记原地留存，后续 --apply 会继续被拒。处理：用 subscription-store 的 resolveSubscriptionAuditConflict({ file, operationId, discard: true }) 显式点名删除后重试（终端维护动作）。");
     exitCode = 1;
   }
   else if (!r.changed) lines.push("锁内重读后已经是这样，没动。");

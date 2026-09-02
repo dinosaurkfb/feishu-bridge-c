@@ -13,7 +13,7 @@ import {
   acquireSessionLock, releaseSessionLock, stampSessionLock,
 } from "../handoff.mjs";
 import { REJECT, normalizeBody } from "../selector.mjs";
-import { evaluateChatGates, CHAT_FALLBACK_REASONS, OFF_TEMPLATE_HINT, isPrivateChatTurn } from "../inbound-route.mjs";
+import { evaluateChatGates, CHAT_FALLBACK_REASONS, OFF_TEMPLATE_HINT, PENDING_CLAIM_HINT, isPrivateChatTurn } from "../inbound-route.mjs";
 import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatFailText, chatReplyPathStatus } from "../chat-reply.mjs";
 import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome, lockUnclearedText } from "../chat-ledger.mjs";
 import {
@@ -330,7 +330,8 @@ if (!routed.ok) {
     // 评审 PR #111 P2：off-template 的诊断 hint 曾被本地重建文案丢掉 —— 保留 Codex 化的
     // 措辞（如「没有真实 @ M5Codex」），按 promotion 标出的 off_template_hint 把 hint 接上。
     const reasonText = (REASON_TEXT[promotion.reason] ?? promotion.reason) +
-      (promotion.off_template_hint ? OFF_TEMPLATE_HINT : "");
+      (promotion.off_template_hint ? OFF_TEMPLATE_HINT : "") +
+      (promotion.pending_claim_hint ? PENDING_CLAIM_HINT : "");
     writeReceipt("unrouted-" + (event.message_id ?? Date.now()), {
       status: "rejected", reason: promotion.reason, claim_acquired: false, handed_off: false,
       subscription_claim_shadow: subscriptionClaimShadow,

@@ -9120,18 +9120,44 @@ test("Codex 真入口：off-template mismatch + 无 @ → 拒绝回执带诊断 
         AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "aily_unbound_p2p", AILY_CLI_RUN_ID: "run_hint", FAKE_AILY_ENVELOPE: envelope, ...extraEnv },
     });
   };
-  // #12/#R11：mismatch 且白名单未登记（且 thread 有值）的「外部群话题」才走拒 + hint；
+  // #12/#R11/#R14 B1：mismatch 且存在唯一待认领（内容无码）+ thread 有值 → 走拒 + 认领 hint
+  // （PENDING_CLAIM_HINT 接管“诊断” hint —— #R14 B1 起有唯一 pending 就不再出“诊断”）；
   // 白名单内的私聊走 chat 回答（见 #12 Codex 链测试，那里有假 claude）。
   const mism = run({ AILY_CLI_CHANNEL_CHAT_ID: "oc_directx", AILY_CLI_CHANNEL_THREAD_ID: "omt_hint_x" });
   assert.equal(mism.status, 0, mism.stdout + mism.stderr);
   assert.match(mism.stdout, /没有真实 @ M5Codex/u, "Codex 化措辞不变：" + mism.stdout);
-  assert.match(mism.stdout, /诊断：本轮频道与登记群不一致/u, "hint 不许被本地重建文案丢掉：" + mism.stdout);
+  assert.match(mism.stdout, /若还有待认领/u, "唯一待认领时给认领 hint（不许丢）：" + mism.stdout);
+  assert.doesNotMatch(mism.stdout, /诊断：/u, "认领 hint 接管，不再出“诊断” hint：" + mism.stdout);
   const sameChat = run({ AILY_CLI_CHANNEL_CHAT_ID: TEMPLATE.chat_id });
   assert.match(sameChat.stdout, /没有真实 @ M5Codex/u, sameChat.stdout);
-  assert.doesNotMatch(sameChat.stdout, /诊断：/u, "同群没有 mismatch，不许带 hint：" + sameChat.stdout);
+  assert.doesNotMatch(sameChat.stdout, /诊断：/u, "同群没有 mismatch，不许带“诊断” hint：" + sameChat.stdout);
   const noChannel = run({});
   assert.match(noChannel.stdout, /没有真实 @ M5Codex/u, noChannel.stdout);
-  assert.doesNotMatch(noChannel.stdout, /诊断：/u, "env 缺失连 hint 都不加：" + noChannel.stdout);
+  assert.doesNotMatch(noChannel.stdout, /诊断：/u, "env 缺失连“诊断” hint 都不加：" + noChannel.stdout);
+});
+
+// #111 P2 的 off-template 诊断 hint，在**没有待认领**（无 pending 任务）的外部群话题仍要从拒绝回执里出现 ——
+// #R14 B1 把 hint 的归属拆成两半：有唯一 pending → 认领 hint；无 pending → 诊断 hint（走 chat 假回，evaluateChatGates）。
+test("Codex 真入口：无 pending 的外部群 + 无 @ → 回执仍带诊断 hint（#111 P2 不回归）", () => {
+  const home = temp();
+  const bin = path.join(home, "bin");
+  fs.mkdirSync(bin);
+  // 只写 chain-config，不写 registry → 没有任何 pending，落 chat 假回（与 codexChanRun 同一没有 registry 的做法）
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: {
+    id: "msg_hint_np", sessionID: "aily_unbound_p2p", role: "user", createdBy: TEMPLATE.frank_sender_id,
+    createdAtMs: Date.now(), content: "能收到吗（没有 @）",
+  } }) }] });
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], {
+    encoding: "utf-8",
+    env: { ...isolatedEnv(), PATH: bin + path.delimiter + process.env.PATH, FEISHU_CODEX_BRIDGE_HOME: home,
+      AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "aily_unbound_p2p", AILY_CLI_RUN_ID: "run_hint_np", FAKE_AILY_ENVELOPE: envelope,
+      AILY_CLI_CHANNEL_CHAT_ID: "oc_directx", AILY_CLI_CHANNEL_THREAD_ID: "omt_hint_np" },
+  });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /没有真实 @/u, "措辞不变：" + r.stdout);
+  assert.match(r.stdout, /诊断：本轮频道与登记群不一致/u, "无 pending 的外部群仍给“诊断” hint：" + r.stdout);
 });
 
 // ─── 第 3 层：飞书正文里的 $feishu-mode 由入站路由器当场执行 ───────────────────────
@@ -9783,10 +9809,12 @@ test("#12 Codex 链：私聊（已验证登记表正向命中）豁免 @ 闸起 
   // ② 私聊 + 未登记发送者：角色闸照旧拒，不因私聊豁免改变
   const r2 = h.run("你好", { sender: "999", chat: "oc_cxprivate" });
   assert.match(r2.spawn.stdout, /已拒绝 · 发送者不是授权用户/u, r2.spawn.stdout);
-  // ③ 外部群话题（thread 有值）+ 无 @ → 不豁免：照旧拒 + hint（#111 P1 纪律）
+  // ③ 外部群话题（thread 有值）+ 无 @ → 不豁免：照旧拒 + 认领 hint（#111 P1 纪律一行不松；#R14 B1：
+  // 主群里那份唯一待认领存在时，给认领 hint 而非“诊断” hint）
   const r3 = h.run("接着弄", { chat: "oc_cxext", thread: "omt_cx_thread" });
   assert.match(r3.spawn.stdout, /已拒绝 · 没有真实 @/u, r3.spawn.stdout);
-  assert.match(r3.spawn.stdout, /诊断：本轮频道与登记群不一致，未接入的群/u, "外部群话题要带 hint：" + r3.spawn.stdout);
+  assert.match(r3.spawn.stdout, /若还有待认领/u, "外部群话题（唯一待认领）照旧拒 + 认领 hint：" + r3.spawn.stdout);
+  assert.doesNotMatch(r3.spawn.stdout, /诊断：/u, "认领 hint 接管，不再出“诊断” hint：" + r3.spawn.stdout);
   // ④ 群（= 模板 chat）+ 无 @ → 照旧拒且不带 hint（行为一字不变）
   const r4 = h.run("接着弄", { chat: TEMPLATE.chat_id });
   assert.match(r4.spawn.stdout, /已拒绝 · 没有真实 @/u, r4.spawn.stdout);
@@ -9803,6 +9831,36 @@ test("#R11 P1-2（Codex）：promotion 底层不豁免 @ —— 登记表命中�
     env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_cxwhitelisted" } });
   assert.equal(r.ok, false);
   assert.equal(r.reason, "transport_not_mentioned");
+});
+
+// ── #R14 B1（Codex）：pending 话题里回带引用码的回复（无真实 @）也能完成认领 ──
+// Codex 侧判据 = pending.source === "quoted_binding_token"（精确码命中）。source 恒不为此值的场景
+// 照旧强制 @。owner 闸仍在 @ 闸前面。变异防线：改成"有 pending 就豁免"会把 sole_pending 用例转红。
+const cxNow = Date.now();
+const cxPending = (source) => ({ ok: true, source, task: { logical_task_key: "x", task_display_name: "T" } });
+const cxOkEvent = {
+  message_id: "m2", session_id: "aily_dm", sender_id: TEMPLATE.frank_sender_id,
+  created_at_ms: cxNow, content: "接着弄\n\n**[引用]**\n绑定码    aaaaaa",
+};
+
+test("#R14 B1（Codex）：无 @ + source=quoted_binding_token → 认领放行", () => {
+  const r = evaluatePromotion({ event: cxOkEvent, template: TEMPLATE, pending: cxPending("quoted_binding_token"), now: cxNow });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.task.logical_task_key, "x");
+});
+
+test("#R14 B1（Codex）：owner 闸在前 —— 码命中但非 owner → sender_not_frank", () => {
+  const r = evaluatePromotion({ event: { ...cxOkEvent, sender_id: "999" }, template: TEMPLATE, pending: cxPending("quoted_binding_token"), now: cxNow });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "sender_not_frank");
+});
+
+test("#R14 B1（Codex）：sole_pending（无码）+ 无 @ → 拒 + 认领 hint（变异防线：码命中才豁免）", () => {
+  const r = evaluatePromotion({ event: { ...cxOkEvent, content: "接着弄" }, template: TEMPLATE, pending: cxPending("sole_pending"), now: cxNow });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "transport_not_mentioned");
+  assert.equal(r.pending_claim_hint, true, JSON.stringify(r));
+  assert.notEqual(r.off_template_hint, true, "sole_pending 只给认领 hint（off_template_hint 不得为 true），不出“诊断”：" + JSON.stringify(r));
 });
 
 summarySealed = true;

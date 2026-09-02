@@ -5231,6 +5231,60 @@ test("#R11 P1-2：promotion 底层不豁免 @ —— 已验证私聊（登记表
   assert.equal(r.reason, PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
 });
 
+// ── #R14 B1：pending 话题里回一条带引用码的回复（无真实 @）也能完成认领 ──
+// 豁免只认「码精确命中」（matchedBy === "quoted_binding_token"）。私聊没有 pending 根消息，matchedBy
+// 永不为此值，私聊照旧强制 @（#R11 P1-2 在上一段覆盖）。owner 闸仍在 @ 闸前面（变异防线：改成"有 pending
+// 就豁免"会把下面的 only_pending 用例转红）。
+const pendingCodeContent = (body = "接着弄") => body + "\n\n**[引用]**\n绑定码    aaaaaa";
+const codePending = () => {
+  const f = pendingFixture([{ id: "a", token: "aaaaaa" }]);
+  const pending = findPendingBinding({ content: pendingCodeContent(), ...f });
+  assert.equal(pending.ok, true, JSON.stringify(pending));
+  assert.equal(pending.matchedBy, "quoted_binding_token");
+  return pending;
+};
+
+test("#R14 B1：无 @ + 绑定码精确命中（matchedBy=quoted_binding_token）→ 认领放行", () => {
+  const r = evaluatePromotion({
+    event: { ...okEvent, content: pendingCodeContent(), session_id: "aily_dm" },
+    template: TPL, pending: codePending(), now: NOW2,
+  });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.id, "a");
+});
+
+test("#R14 B1：owner 闸仍在 @ 闸前面 —— 码命中但非 owner → sender_not_frank", () => {
+  const r = evaluatePromotion({
+    event: { ...okEvent, content: pendingCodeContent(), sender_id: "9999" },
+    template: TPL, pending: codePending(), now: NOW2,
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, PROMOTE_REJECT.SENDER_NOT_FRANK);
+});
+
+test("#R14 B1：只有一份待绑定（无码）+ 无 @ → 拒；唯一待认领 → 给认领 hint（变异防线：码命中才豁免）", () => {
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  const pending = pendingOf(f);
+  assert.equal(pending.matchedBy, "only_pending", "单份无码 → only_pending");
+  const r = evaluatePromotion({
+    event: { ...okEvent, content: "接着弄" }, template: TPL, pending, now: NOW2 });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
+  assert.match(r.reasonText, /若还有待认领：到新话题里回复任意内容/u, "有唯一待认领时给认领 hint：" + r.reasonText);
+});
+
+test("#R14 B1：无 pending（真正未接入外部群）+ 无 @ → 拒 + 诊断 hint（OFF_TEMPLATE_HINT 路径仍在）", () => {
+  const f = routeFixture([{ id: "a", extra: { session_id: "session_a", inbound_state: "bound" } }]);
+  const pending = findPendingBinding({ ...files(f), now: NOW2 });
+  assert.equal(pending.ok, false);
+  assert.equal(pending.reason, PROMOTE_REJECT.NO_PENDING);
+  const r = evaluatePromotion({
+    event: { ...okEvent, content: "接着弄" }, template: TPL, pending, now: NOW2,
+    env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_exttopic" } });
+  assert.equal(r.reason, PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
+  assert.match(r.reasonText, /诊断：本轮频道与登记群不一致/u, "无 pending 的外部群仍给诊断 hint：" + r.reasonText);
+});
+
 test("消息太旧 → 拒，防重放", () => {
   const f = routeFixture([{ id: "a", extra: {} }]);
   const r = evaluatePromotion({
@@ -22708,21 +22762,23 @@ test("off-template turn #12→#R11：私聊以已验证登记表正向命中豁�
   assert.match(p2pStranger.stdout, /已拒绝 · 发送者不是授权用户/u, p2pStranger.stdout);
   assert.equal(argvLog().length, 1, "未登记不起模型");
 
-  // ② 外部群话题（≠ 模板 chat_id + thread 有值）→ 不豁免 @ 闸：照旧拒 + hint（#111 P1 纪律，一行不松）
+  // ② 外部群话题（≠ 模板 chat_id + thread 有值）→ 不豁免 @ 闸：照旧拒；唯一待认领存在 → 给认领 hint（#R14 B1）
   writeRegistry([pendingEntry]);
-  const extNoAt = run("接着弄" + quoted, TPL.frank_sender_id, { AILY_CLI_CHANNEL_CHAT_ID: "oc_exttopic", AILY_CLI_CHANNEL_THREAD_ID: "omt_ext_thread" });
+  const extNoAt = run("接着弄", TPL.frank_sender_id, { AILY_CLI_CHANNEL_CHAT_ID: "oc_exttopic", AILY_CLI_CHANNEL_THREAD_ID: "omt_ext_thread" });
   assert.match(extNoAt.stdout, /已拒绝 · 没有真实 @/u, extNoAt.stdout);
-  assert.match(extNoAt.stdout, /诊断：本轮频道与登记群不一致，未接入的群/u, "外部群话题要带 hint（只能描述未接入的群）：" + extNoAt.stdout);
+  assert.match(extNoAt.stdout, /若还有待认领：到新话题里回复任意内容/u, "外部群话题（唯一待认领）照旧拒 + 认领 hint：" + extNoAt.stdout);
   assert.equal(argvLog().length, 1, "拒绝不起模型");
 
-  // ③ 群消息（等于 模板 chat_id）行为一字不变：无 @ → 照旧拒且不带 hint；真实 @ + 绑定码 → 照旧认领（dry-run）
+  // ③ 群消息（等于 模板 chat_id）行为一字不变：无 @ → 照旧拒且不带诊断 hint；真实 @ + 绑定码 → 照旧认领（dry-run）
   writeRegistry([pendingEntry]);
-  const groupNoAt = run("接着弄" + quoted, TPL.frank_sender_id);
+  const groupNoAt = run("接着弄", TPL.frank_sender_id);
   assert.match(groupNoAt.stdout, /已拒绝 · 没有真实 @/u, groupNoAt.stdout);
-  assert.doesNotMatch(groupNoAt.stdout, /诊断：/u, "群内无 mismatch 不许带 hint：" + groupNoAt.stdout);
+  assert.match(groupNoAt.stdout, /若还有待认领/u, "群内唯一待认领照旧拒 + 认领 hint：" + groupNoAt.stdout);
+  assert.doesNotMatch(groupNoAt.stdout, /诊断：/u, "群内无 mismatch 不许带诊断 hint：" + groupNoAt.stdout);
   assert.equal(argvLog().length, 1, "拒绝不起模型");
-  const groupExplicit = run("接着弄" + quoted, TPL.frank_sender_id, { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id });
+  const groupExplicit = run("接着弄", TPL.frank_sender_id, { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id });
   assert.match(groupExplicit.stdout, /已拒绝 · 没有真实 @/u, groupExplicit.stdout);
+  assert.match(groupExplicit.stdout, /若还有待认领/u, groupExplicit.stdout);
   assert.doesNotMatch(groupExplicit.stdout, /诊断：/u, groupExplicit.stdout);
   writeRegistry([pendingEntry]);
   const claim = run(at + "接着弄" + quoted, TPL.frank_sender_id, {}, ["--dry-run"]);
@@ -22730,6 +22786,15 @@ test("off-template turn #12→#R11：私聊以已验证登记表正向命中豁�
   assert.match(claim.stdout, /会把这个话题绑给 p1/u, claim.stdout);
   assert.match(claim.stdout, /根消息引用里的绑定码/u, claim.stdout);
   assert.equal(JSON.parse(fs.readFileSync(registryFile, "utf-8")).projects[0].inbound_state, "pending", "dry-run 不写登记表");
+
+  // ④ #R14 B1：pending 话题里回带引用码的回复（无真实 @）→ 只凭码完成认领（dry-run 不写；绑定不是模型调用）
+  writeRegistry([pendingEntry]);
+  const silentClaim = run("接着弄" + quoted, TPL.frank_sender_id, {}, ["--dry-run"]);
+  assert.equal(silentClaim.status, 0, silentClaim.stdout + silentClaim.stderr);
+  assert.match(silentClaim.stdout, /会把这个话题绑给 p1/u, silentClaim.stdout);
+  assert.match(silentClaim.stdout, /根消息引用里的绑定码/u, silentClaim.stdout);
+  assert.equal(JSON.parse(fs.readFileSync(registryFile, "utf-8")).projects[0].inbound_state, "pending", "dry-run 不写登记表");
+  assert.equal(argvLog().length, 1, "绑定不是模型调用");
 });
 
 test("维护门（issue #81 · PR A）：三态读门只认 ENOENT 为没门，各写入口在门前受控退出，锁原语兜底，doctor ⑩ 与状态页各说各的", () => {

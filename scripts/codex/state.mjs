@@ -1038,9 +1038,15 @@ export function evaluatePromotion({ event, template, pending, now = Date.now(), 
   if (!pending?.ok) return { ok: false, reason: pending?.reason ?? "no_pending_binding" };
   if (event?.sender_id !== template?.frank_sender_id) return { ok: false, reason: "sender_not_frank" };
   // #R11 P1-2：Codex 侧 promotion 底层同样不许豁免 @；私聊豁免只放 evaluateChatGates（codex 共用）。
-  if (!extractMentionIds(event?.content).includes(template?.transport_open_id)) {
+  // #R14 B1：唯一例外是**绑定码精确命中**（source === "quoted_binding_token"）——码只出现在 pending
+  // 话题根消息引用块里；私聊没有该项，source 恒不为此值，私聊照旧强制 @。两条判据互斥不混写。
+  const tokenMatched = pending.source === "quoted_binding_token";
+  if (!extractMentionIds(event?.content).includes(template?.transport_open_id) && !tokenMatched) {
+    // 到这里的 pending 必然 ok（no_pending 在函数顶部已被 early-return），也就是 sole_pending（无码唯一一分）。
+    // 与 Claude 链同一条 hint 规则：有唯一待认领 → 只给认领 hint，不出“诊断”（OFF_TEMPLATE_HINT 只属于
+    // 无 pending 的 chat 兜底，那里由 evaluateChatGates 负责）。
     return { ok: false, reason: "transport_not_mentioned",
-      off_template_hint: isOffTemplateChatTurn({ template, env }) };
+      pending_claim_hint: pending.source === "sole_pending" };
   }
   const createdAt = Number(event?.created_at_ms);
   if (!Number.isFinite(createdAt)) return { ok: false, reason: "malformed_event" };

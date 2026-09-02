@@ -16972,6 +16972,22 @@ test("doctor：⑫ 订阅对账 —— store/审计三态 × 对账；未启用�
   assert.equal(m.snapshot(), snap, "doctor 一个字节都不许改");
 });
 
+// 评审 #121 二轮：op id 形状锚定为写方唯一真实格式（大写 T/Z 的 ISO 变体 + 8hex），
+// 与已落盘的旧生产格式逐字兼容；displaySafe 不变量保证 doctor 回显的命令可执行。
+test("审计 op id 形状 —— 旧生产格式（大写 T/Z）过校验；小写化变体拒（防漂移复发）；合法 id 满足 displaySafe(id)===id", () => {
+  const legacyOp = "op-2026-09-02T00-00-00-000Z-deadbeef";
+  const evBase = { schema_version: "1.0", at: "2026-09-02T00:00:01.000Z", action: "add",
+    subscription_id: "subscription_" + "a".repeat(24), version_after: 1,
+    store_bytes_sha256: "b".repeat(16), operation_id: legacyOp };
+  assert.equal(validateSubscriptionAuditEvent(evBase).ok, true, "旧生产格式（大写 T/Z）必须过：向后兼容");
+  assert.equal(validateSubscriptionAuditEvent({ ...evBase, operation_id: legacyOp.toLowerCase() }).ok, false,
+    "小写化变体拒（#R13 曾把生成小写化破坏兼容，防复发）");
+  assert.equal(validateSubscriptionAuditEvent({ ...evBase, operation_id: "op-short" }).ok, false, "非锚定形状拒");
+  assert.equal(displaySafe(legacyOp), legacyOp, "displaySafe 不变量：合法 id 原样通过（doctor 回显可执行）");
+  // 旧 pending 可续做 + 后续 apply 成功（评审三条回归的后两条）：旧格式 op 的 pending 场景
+  // 由既有「窗口①/②/③」补记测试用同格式夹具覆盖（本轮夹具已全部换为该格式）。
+});
+
 test("doctor：⑫ 矩阵补缺与 op 形状 —— store 缺席×审计在场（空/有事件）应红；locator 前缀/控制字符 op 待补记拒且不泄（P1-1/P1-2）", () => {
   const m = doctorMachine();
   const storeFile = path.join(m.home, ".claude", "feishu-bridge", "subscriptions.json");
@@ -20648,7 +20664,7 @@ test("FR-2.6 单 4：审计目录/占用不阻断变更（成功但要人知道�
     { ok: true, absent: true, events: [], problems: [] });
   fs.rmSync(auditFile);
   fs.writeFileSync(auditFile, [
-    JSON.stringify({ schema_version: "1.0", operation_id: "op-w3", at: "2026-09-02T00:00:00.000Z", action: "add", subscription_id: "s1", version_after: 1, store_bytes_sha256: "0123456789abcdef" }),
+    JSON.stringify({ schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-b101e37b", at: "2026-09-02T00:00:00.000Z", action: "add", subscription_id: "s1", version_after: 1, store_bytes_sha256: "0123456789abcdef" }),
     "{not json",
     JSON.stringify({ action: 1 }),
     "",
@@ -20674,7 +20690,7 @@ test("评审 #115 P1-1：审计追加受验 —— 符号链接 / FIFO / 硬链�
   const storeFile = path.join(local, "subs.json");
   const auditFile = storeFile + ".audit.jsonl";
   const at = "2026-09-02T00:00:00.000Z";
-  const ev = () => ({ schema_version: "1.0", operation_id: "op-1", at, action: "add", subscription_id: "s1", version_after: 1, store_bytes_sha256: "0123456789abcdef" });
+  const ev = () => ({ schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-71a0ef71", at, action: "add", subscription_id: "s1", version_after: 1, store_bytes_sha256: "0123456789abcdef" });
 
   // 恢复正常：一次追加一行（写方与读方同构）
   appendSubscriptionAuditLine({ file: storeFile, event: ev() });
@@ -20704,7 +20720,7 @@ test("评审 #115 P1-1：审计追加受验 —— 符号链接 / FIFO / 硬链�
 });
 
 test("评审 #115 P1-2：唯一封闭校验 —— 伪事件矩阵逐项拒（多余键/空 id/坏时间/非枚举 action/坏摘要/version_after 违联合约束）；写方与读方同一把判据", () => {
-  const base = { schema_version: "1.0", operation_id: "op-1", at: "2026-09-02T00:00:00.000Z", action: "add", subscription_id: "s1", version_after: 1, store_bytes_sha256: "0123456789abcdef" };
+  const base = { schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-71a0ef71", at: "2026-09-02T00:00:00.000Z", action: "add", subscription_id: "s1", version_after: 1, store_bytes_sha256: "0123456789abcdef" };
   const cases = [
     ["多余键", { ...base, extra: "leak" }, ["extra:extra"]],
     ["空 id", { ...base, subscription_id: "" }, ["subscription_id_empty"]],
@@ -20723,7 +20739,7 @@ test("评审 #115 P1-2：唯一封闭校验 —— 伪事件矩阵逐项拒（�
   assert.deepEqual(validateSubscriptionAuditEvent(base), { ok: true, problems: [] }, "健康事件通过");
   assert.deepEqual(validateSubscriptionAuditEvent({ ...base, action: "remove", version_after: null }), { ok: true, problems: [] }, "remove version_after=null 通过");
   // 待补记也封闭：健康通过、多余键拒
-  const pend = (o = {}) => ({ schema_version: "1.0", operation_id: "op-1", before_sha256: null, after_sha256: "0123456789abcdef", audit_size_before: 0, audit_sha256_before: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", event: base, ...o });
+  const pend = (o = {}) => ({ schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-71a0ef71", before_sha256: null, after_sha256: "0123456789abcdef", audit_size_before: 0, audit_sha256_before: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", event: base, ...o });
   assert.deepEqual(validateSubscriptionAuditPending(pend()), { ok: true, problems: [] }, "健康 pending 通过");
   assert.equal(validateSubscriptionAuditPending(pend({ extra: "x" })).problems[0], "extra:extra", "pending 多余键拒");
 
@@ -20857,7 +20873,7 @@ test("评审 #115 二轮新增 E：待补记 current==before → 判定未提交
   });
 
   // current==before → dropped：待补记的记录未提交（store 还是当前），丢弃并照常改
-  const w = writeSubscriptionAuditPending({ file: storeFile, pending: mkPending({ op: "op-drop", before: cur, after: "2222222222222222" }) });
+  const w = writeSubscriptionAuditPending({ file: storeFile, pending: mkPending({ op: "op-2026-09-02T00-00-00-000Z-3b3ec50a", before: cur, after: "2222222222222222" }) });
   assert.deepEqual(w, { ok: true }, "伪造 before==current 的 pending");
   const drop = applySubscriptionChange({ file: storeFile, change: { action: "pause", runtime: TPL.chain, template: TPL, domainKey: "/p", chatId: "oc_b" }, now: new Date("2026-09-02T00:00:02.000Z") });
   assert.deepEqual([drop.ok, drop.changed, drop.auditPendingResolved], [true, true, "dropped"], "判定未提交，丢弃并继续改");
@@ -20865,7 +20881,7 @@ test("评审 #115 二轮新增 E：待补记 current==before → 判定未提交
   assert.deepEqual(loadSubscriptionAudit({ file: storeFile }).events.map((e) => e.action), ["add", "pause"], "本次 pause 审计照常记录");
 
   // current 对不上 before/after → conflict：**不改名、原位留存**为持续 blocker（P1-2），store 不变
-  const w2 = writeSubscriptionAuditPending({ file: storeFile, pending: mkPending({ op: "op-conflict", before: "0000000000000000", after: "1111111111111111" }) });
+  const w2 = writeSubscriptionAuditPending({ file: storeFile, pending: mkPending({ op: "op-2026-09-02T00-00-00-000Z-2a997703", before: "0000000000000000", after: "1111111111111111" }) });
   assert.deepEqual(w2, { ok: true }, "伪造对不上 current 的 pending");
   const beforeBytes = fs.readFileSync(storeFile);
   const block = applySubscriptionChange({ file: storeFile, change: { action: "resume", runtime: TPL.chain, template: TPL, domainKey: "/p", chatId: "oc_b" }, now: new Date("2026-09-02T00:00:03.000Z") });
@@ -20883,7 +20899,7 @@ test("评审 #115 二轮新增 E：待补记 current==before → 判定未提交
   // 显式维护入口：点错 operation_id 拒；点名正确 + discard 才清
   const mismatch = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-WRONG", discard: true });
   assert.deepEqual([mismatch.ok, mismatch.reason], [false, "audit_pending_conflict_mismatch"], "点错 operation_id 拒");
-  const okResolve = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-conflict", discard: true });
+  const okResolve = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-2026-09-02T00-00-00-000Z-2a997703", discard: true });
   assert.deepEqual([okResolve.ok, okResolve.resolved], [true, true], "点名正确 + discard 清掉 pending");
   assert.equal(fs.existsSync(subscriptionAuditPendingPath(storeFile)), false, "pending 已清");
 
@@ -21041,7 +21057,7 @@ test("评审 #115 三轮新增 K：审计基线含坏行 / 非法事件 / 重复
   const addLine = fs.readFileSync(auditFile);
   const corruptScenarios = [
     { name: "坏行", content: Buffer.concat([addLine, Buffer.from("{ 这不是 JSON\n", "utf-8")]), match: /不是合法 JSON/u },
-    { name: "非法事件", content: Buffer.concat([addLine, Buffer.from(JSON.stringify({ schema_version: "1.0", operation_id: "op-x", at: "2026-09-02T00:00:01.000Z", subscription_id: "s", version_after: 1, store_bytes_sha256: "aaaaaaaaaaaaaaaa" }) + "\n", "utf-8")]), match: /校验失败/u },
+    { name: "非法事件", content: Buffer.concat([addLine, Buffer.from(JSON.stringify({ schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-0d7bf0e9", at: "2026-09-02T00:00:01.000Z", subscription_id: "s", version_after: 1, store_bytes_sha256: "aaaaaaaaaaaaaaaa" }) + "\n", "utf-8")]), match: /校验失败/u },
     { name: "重复 op id", content: Buffer.concat([addLine, addLine]), match: /重复 operation_id/u },
   ];
   for (const sc of corruptScenarios) {
@@ -21130,9 +21146,9 @@ test("评审 #115 四轮新增 N：resolveSubscriptionAuditConflict 在 store �
   apply("add", "2026-09-02T00:00:00.000Z");
   const cur = createHash("sha256").update(fs.readFileSync(storeFile)).digest("hex").slice(0, 16);
   const auditBuf = fs.readFileSync(auditFile);
-  const pending = { schema_version: "1.0", operation_id: "op-busy", before_sha256: "0000000000000000", after_sha256: "1111111111111111",
+  const pending = { schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-d3d25802", before_sha256: "0000000000000000", after_sha256: "1111111111111111",
     audit_size_before: auditBuf.length, audit_sha256_before: createHash("sha256").update(auditBuf).digest("hex"),
-    event: { schema_version: "1.0", operation_id: "op-busy", at: "2026-09-02T00:00:01.000Z", action: "pause", subscription_id: "s", version_after: 2, store_bytes_sha256: "eeeeeeeeeeeeeeee" } };
+    event: { schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-d3d25802", at: "2026-09-02T00:00:01.000Z", action: "pause", subscription_id: "s", version_after: 2, store_bytes_sha256: "eeeeeeeeeeeeeeee" } };
   assert.deepEqual(writeSubscriptionAuditPending({ file: storeFile, pending }), { ok: true }, "造 pending");
 
   // 持 store 锁 → resolver 必须报 store_busy、pending 原样（绝不取锁就删）
@@ -21140,7 +21156,7 @@ test("评审 #115 四轮新增 N：resolveSubscriptionAuditConflict 在 store �
   const lock = acquireLedgerLock(lockDir);
   assert.equal(lock.ok, true, "持锁：" + JSON.stringify(lock));
   try {
-    const res = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-busy", discard: true });
+    const res = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-2026-09-02T00-00-00-000Z-d3d25802", discard: true });
     assert.deepEqual([res.ok, res.reason, res.pendingStatus], [false, "store_busy", "unchanged"], "锁被持 → store_busy，不删");
     assert.equal(fs.existsSync(subscriptionAuditPendingPath(storeFile)), true, "pending 未动");
   } finally { releaseLedgerLock(lockDir); }
@@ -21162,20 +21178,20 @@ test("评审 #115 四轮新增 O：resolveSubscriptionAuditConflict 对 current=
     event: { schema_version: "1.0", operation_id: op, at: "2026-09-02T00:00:01.000Z", action: "pause", subscription_id: add.entry.subscription_id, version_after: 2, store_bytes_sha256: "eeeeeeeeeeeeeeee" } });
 
   // current==before → dropped：显式 resolver 丢弃并清 pending，不依赖 discard
-  assert.deepEqual(writeSubscriptionAuditPending({ file: storeFile, pending: mkPending("op-drop") }), { ok: true }, "造 dropped pending");
+  assert.deepEqual(writeSubscriptionAuditPending({ file: storeFile, pending: mkPending("op-2026-09-02T00-00-00-000Z-3b3ec50a") }), { ok: true }, "造 dropped pending");
   const beforeStore = fs.readFileSync(storeFile).toString();
-  const res = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-drop", discard: false });
+  const res = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-2026-09-02T00-00-00-000Z-3b3ec50a", discard: false });
   assert.deepEqual([res.ok, res.resolved, res.state], [true, true, "dropped"], "current==before → dropped");
   assert.equal(fs.existsSync(subscriptionAuditPendingPath(storeFile)), false, "pending 已清");
   assert.equal(fs.readFileSync(storeFile).toString(), beforeStore, "store 未动");
 
   // no_conflict：清掉后再点同名 → 拒
-  const none = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-drop", discard: false });
+  const none = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-2026-09-02T00-00-00-000Z-3b3ec50a", discard: false });
   assert.deepEqual([none.ok, none.reason], [false, "audit_pending_no_conflict"], "无 pending → no_conflict");
 
   // mismatch：造一个不同 op 的 pending，点名错的 op → 拒且 pending 不动
-  assert.deepEqual(writeSubscriptionAuditPending({ file: storeFile, pending: mkPending("op-other") }), { ok: true }, "造 other pending");
-  const mm = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-drop", discard: true });
+  assert.deepEqual(writeSubscriptionAuditPending({ file: storeFile, pending: mkPending("op-2026-09-02T00-00-00-000Z-de54fc8d") }), { ok: true }, "造 other pending");
+  const mm = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-2026-09-02T00-00-00-000Z-3b3ec50a", discard: true });
   assert.deepEqual([mm.ok, mm.reason], [false, "audit_pending_conflict_mismatch"], "点名不符 → mismatch");
   assert.equal(fs.existsSync(subscriptionAuditPendingPath(storeFile)), true, "mismatch 不动 pending");
 });
@@ -21249,9 +21265,9 @@ test("评审 #115 四轮新增 Q：register-subscription --resolve-audit-conflic
   // mismatch：再造一份 pending，点名错的 op + --apply → 非零且 pending 不动
   const cur = createHash("sha256").update(fs.readFileSync(storeFile)).digest("hex").slice(0, 16);
   const auditBuf = fs.readFileSync(auditFile);
-  const mmPending = { schema_version: "1.0", operation_id: "op-mm", before_sha256: cur, after_sha256: "2222222222222222",
+  const mmPending = { schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-5ed7ad91", before_sha256: cur, after_sha256: "2222222222222222",
     audit_size_before: auditBuf.length, audit_sha256_before: createHash("sha256").update(auditBuf).digest("hex"),
-    event: { schema_version: "1.0", operation_id: "op-mm", at: "2026-09-02T00:00:02.000Z", action: "pause", subscription_id: "s2", version_after: 3, store_bytes_sha256: "eeeeeeeeeeeeeeee" } };
+    event: { schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-5ed7ad91", at: "2026-09-02T00:00:02.000Z", action: "pause", subscription_id: "s2", version_after: 3, store_bytes_sha256: "eeeeeeeeeeeeeeee" } };
   assert.deepEqual(writeSubscriptionAuditPending({ file: storeFile, pending: mmPending }), { ok: true }, "造 mismatch pending");
   const mm = run([...base, "--resolve-audit-conflict", "op-WRONG", "--apply"]);
   assert.equal(mm.status, 1, "点名错 op + --apply → 非零：" + mm.stdout + mm.stderr);
@@ -21269,9 +21285,9 @@ test("评审 #115 四轮新增 R：释放失败（rm 主锁抛错）→ resolver
   const add = apply("add", "2026-09-02T00:00:00.000Z");
   assert.deepEqual([add.ok, add.changed], [true, true], "add");
   const auditBuf = fs.readFileSync(auditFile);
-  const pending = { schema_version: "1.0", operation_id: "op-rel", before_sha256: "0000000000000000", after_sha256: "1111111111111111",
+  const pending = { schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-c1965002", before_sha256: "0000000000000000", after_sha256: "1111111111111111",
     audit_size_before: auditBuf.length, audit_sha256_before: createHash("sha256").update(auditBuf).digest("hex"),
-    event: { schema_version: "1.0", operation_id: "op-rel", at: "2026-09-02T00:00:01.000Z", action: "pause", subscription_id: add.entry.subscription_id, version_after: 2, store_bytes_sha256: "eeeeeeeeeeeeeeee" } };
+    event: { schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-c1965002", at: "2026-09-02T00:00:01.000Z", action: "pause", subscription_id: add.entry.subscription_id, version_after: 2, store_bytes_sha256: "eeeeeeeeeeeeeeee" } };
   assert.deepEqual(writeSubscriptionAuditPending({ file: storeFile, pending }), { ok: true }, "真冲突 pending");
   const lockDir = storeFile + ".lock";
 
@@ -21279,7 +21295,7 @@ test("评审 #115 四轮新增 R：释放失败（rm 主锁抛错）→ resolver
   const orig = fs.rmSync;
   fs.rmSync = function (p, opt) { if (typeof p === "string" && p === lockDir) throw new Error("injected rm lock fail"); return orig.call(fs, p, opt); };
   let res;
-  try { res = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-rel", discard: true }); }
+  try { res = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-2026-09-02T00-00-00-000Z-c1965002", discard: true }); }
   finally { fs.rmSync = orig; }
 
   assert.deepEqual([res.ok, res.reason], [false, "audit_pending_lock_release_failed"], "释放失败 → 非成功返回");
@@ -21309,19 +21325,19 @@ test("评审 #115 五轮新增 S：合法待补记（before_sha256=null 首次�
   const storeBytes = fs.readFileSync(storeFile);
   const auditBuf = fs.readFileSync(auditFile);
   const pendingPath = subscriptionAuditPendingPath(storeFile);
-  const pending = { schema_version: "1.0", operation_id: "op-sym", before_sha256: null, after_sha256: cur,
+  const pending = { schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-eae86ff1", before_sha256: null, after_sha256: cur,
     audit_size_before: auditBuf.length, audit_sha256_before: createHash("sha256").update(auditBuf).digest("hex"),
-    event: { schema_version: "1.0", operation_id: "op-sym", at: "2026-09-02T00:00:01.000Z", action: "pause", subscription_id: add.entry.subscription_id, version_after: 2, store_bytes_sha256: "eeeeeeeeeeeeeeee" } };
+    event: { schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-eae86ff1", at: "2026-09-02T00:00:01.000Z", action: "pause", subscription_id: add.entry.subscription_id, version_after: 2, store_bytes_sha256: "eeeeeeeeeeeeeeee" } };
   assert.deepEqual(writeSubscriptionAuditPending({ file: storeFile, pending }), { ok: true }, "造首次写待补记（before=null）");
   assert.equal(fs.existsSync(pendingPath), true, "pending 在");
 
   // 评审复现：store 路径改成指向外部文件的符号链接（读不清）；旧逻辑折成 null → dropped → 误清 pending
   fs.unlinkSync(storeFile);
   fs.symlinkSync(path.join(local, "external.json"), storeFile);
-  const cls = classifySubscriptionAuditPending({ file: storeFile, operationId: "op-sym" });
+  const cls = classifySubscriptionAuditPending({ file: storeFile, operationId: "op-2026-09-02T00-00-00-000Z-eae86ff1" });
   assert.deepEqual([cls.ok, cls.state], [true, "store_unreadable"], "symlink store → store_unreadable（不是 dropped）：" + JSON.stringify(cls));
   assert.equal(fs.existsSync(pendingPath), true, "分类不删 pending");
-  const res = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-sym", discard: true });
+  const res = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-2026-09-02T00-00-00-000Z-eae86ff1", discard: true });
   assert.deepEqual([res.ok, res.reason, res.kept], [false, "store_unreadable", true], "resolver 非成功、即使 discard 也不清（读不清不许破对账）");
   assert.equal(fs.existsSync(pendingPath), true, "resolver 不删 pending");
   const applyBlocked = apply("pause", "2026-09-02T00:00:02.000Z");
@@ -21331,9 +21347,9 @@ test("评审 #115 五轮新增 S：合法待补记（before_sha256=null 首次�
   // 恢复真实 store → cur==after → replay：补记并清 pending（不被 store_unreadable 卡死）
   fs.unlinkSync(storeFile);
   fs.writeFileSync(storeFile, storeBytes);
-  const cls2 = classifySubscriptionAuditPending({ file: storeFile, operationId: "op-sym" });
+  const cls2 = classifySubscriptionAuditPending({ file: storeFile, operationId: "op-2026-09-02T00-00-00-000Z-eae86ff1" });
   assert.equal(cls2.state, "replay", "恢复真实 store（cur==after）→ replay，不再 store_unreadable：" + JSON.stringify(cls2));
-  const res2 = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-sym", discard: false });
+  const res2 = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-2026-09-02T00-00-00-000Z-eae86ff1", discard: false });
   assert.deepEqual([res2.ok, res2.resolved, res2.state], [true, true, "replayed"], "恢复后 resolver 补记并清 pending");
   assert.equal(fs.existsSync(pendingPath), false, "恢复后 pending 已清");
   assert.deepEqual(loadSubscriptionAudit({ file: storeFile }).events.map((e) => e.action), ["add", "pause"], "补记了 pause");
@@ -21344,14 +21360,14 @@ test("评审 #115 五轮新增 V：store 真缺席（ENOENT，没有文件）+ b
   const storeFile = path.join(local, "subs", "subscriptions.json");
   assert.equal(fs.existsSync(storeFile), false, "store 真缺席");
   const pendingPath = subscriptionAuditPendingPath(storeFile);
-  const pending = { schema_version: "1.0", operation_id: "op-absent", before_sha256: null, after_sha256: "1111111111111111",
+  const pending = { schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-fa2c5df9", before_sha256: null, after_sha256: "1111111111111111",
     audit_size_before: 0, audit_sha256_before: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    event: { schema_version: "1.0", operation_id: "op-absent", at: "2026-09-02T00:00:01.000Z", action: "pause", subscription_id: "s1", version_after: 2, store_bytes_sha256: "eeeeeeeeeeeeeeee" } };
+    event: { schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-fa2c5df9", at: "2026-09-02T00:00:01.000Z", action: "pause", subscription_id: "s1", version_after: 2, store_bytes_sha256: "eeeeeeeeeeeeeeee" } };
   assert.deepEqual(writeSubscriptionAuditPending({ file: storeFile, pending }), { ok: true }, "absent store 下也造得出 pending（首次写未提交中间态）");
   assert.equal(fs.existsSync(pendingPath), true, "pending 在");
-  const cls = classifySubscriptionAuditPending({ file: storeFile, operationId: "op-absent" });
+  const cls = classifySubscriptionAuditPending({ file: storeFile, operationId: "op-2026-09-02T00-00-00-000Z-fa2c5df9" });
   assert.deepEqual([cls.ok, cls.state], [true, "dropped"], "换行 1：真缺席（ENOENT）→ dropped（首次写未提交），不是 store_unreadable：" + JSON.stringify(cls));
-  const res = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-absent", discard: true });
+  const res = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-2026-09-02T00-00-00-000Z-fa2c5df9", discard: true });
   assert.deepEqual([res.ok, res.resolved, res.state], [true, true, "dropped"], "resolver dropped 并清 pending");
   assert.equal(fs.existsSync(pendingPath), false, "pending 已清");
 });
@@ -21371,14 +21387,14 @@ test("评审 #115 五轮新增 V：store 真缺席（ENOENT，没有文件）+ b
     const cur = createHash("sha256").update(fs.readFileSync(storeFile)).digest("hex").slice(0, 16);
     const auditBuf = fs.readFileSync(auditFile);
     const pendingPath = subscriptionAuditPendingPath(storeFile);
-    const pending = { schema_version: "1.0", operation_id: "op-t", before_sha256: null, after_sha256: cur,
+    const pending = { schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-a5b68e8f", before_sha256: null, after_sha256: cur,
       audit_size_before: auditBuf.length, audit_sha256_before: createHash("sha256").update(auditBuf).digest("hex"),
-      event: { schema_version: "1.0", operation_id: "op-t", at: "2026-09-02T00:00:01.000Z", action: "pause", subscription_id: add.entry.subscription_id, version_after: 2, store_bytes_sha256: "eeeeeeeeeeeeeeee" } };
+      event: { schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-a5b68e8f", at: "2026-09-02T00:00:01.000Z", action: "pause", subscription_id: add.entry.subscription_id, version_after: 2, store_bytes_sha256: "eeeeeeeeeeeeeeee" } };
     assert.deepEqual(writeSubscriptionAuditPending({ file: storeFile, pending }), { ok: true }, label + "：造 pending");
     makeBad(storeFile);
-    const cls = classifySubscriptionAuditPending({ file: storeFile, operationId: "op-t" });
+    const cls = classifySubscriptionAuditPending({ file: storeFile, operationId: "op-2026-09-02T00-00-00-000Z-a5b68e8f" });
     assert.deepEqual([cls.ok, cls.state], [true, "store_unreadable"], label + " → store_unreadable（不是 dropped）：" + JSON.stringify(cls));
-    const res = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-t", discard: true });
+    const res = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-2026-09-02T00-00-00-000Z-a5b68e8f", discard: true });
     assert.deepEqual([res.ok, res.reason, res.kept], [false, "store_unreadable", true], label + " → resolver 非成功、discard 也不清");
     assert.equal(fs.existsSync(pendingPath), true, label + "：pending 原样");
     // apply 入口：fail-closed（lstat 门或 resolver 的 storeHashState），pending 一律原样
@@ -21402,25 +21418,25 @@ test("评审 #115 五轮新增 U：before 非 null + store 读不清 → 分类 
   const auditBuf = fs.readFileSync(auditFile);
   const pendingPath = subscriptionAuditPendingPath(storeFile);
   // before 非 null（=当前 store 哈希）：若 store valid 本应 dropped；store 读不清时必须是 store_unreadable，**不许**掉进 conflict
-  const pending = { schema_version: "1.0", operation_id: "op-u", before_sha256: cur, after_sha256: "2222222222222222",
+  const pending = { schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-a5ae4ada", before_sha256: cur, after_sha256: "2222222222222222",
     audit_size_before: auditBuf.length, audit_sha256_before: createHash("sha256").update(auditBuf).digest("hex"),
-    event: { schema_version: "1.0", operation_id: "op-u", at: "2026-09-02T00:00:01.000Z", action: "pause", subscription_id: add.entry.subscription_id, version_after: 2, store_bytes_sha256: "eeeeeeeeeeeeeeee" } };
+    event: { schema_version: "1.0", operation_id: "op-2026-09-02T00-00-00-000Z-a5ae4ada", at: "2026-09-02T00:00:01.000Z", action: "pause", subscription_id: add.entry.subscription_id, version_after: 2, store_bytes_sha256: "eeeeeeeeeeeeeeee" } };
   assert.deepEqual(writeSubscriptionAuditPending({ file: storeFile, pending }), { ok: true }, "造 before 非 null pending");
   fs.unlinkSync(storeFile);
   fs.symlinkSync(path.join(local, "external-u.json"), storeFile);
-  const cls = classifySubscriptionAuditPending({ file: storeFile, operationId: "op-u" });
+  const cls = classifySubscriptionAuditPending({ file: storeFile, operationId: "op-2026-09-02T00-00-00-000Z-a5ae4ada" });
   assert.deepEqual([cls.ok, cls.state], [true, "store_unreadable"], "before 非 null + 读不清 → store_unreadable（不是 conflict）：" + JSON.stringify(cls));
-  const res = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-u", discard: true });
+  const res = resolveSubscriptionAuditConflict({ file: storeFile, operationId: "op-2026-09-02T00-00-00-000Z-a5ae4ada", discard: true });
   assert.deepEqual([res.ok, res.reason], [false, "store_unreadable"], "resolver 非成功（discard 不可达）");
   assert.equal(fs.existsSync(pendingPath), true, "pending 不动");
 
   // CLI：预览与 --apply 都非零、都指路先修 store、不动 pending（discard 不可达）
   const run = (args) => spawnSync(process.execPath, [path.resolve("scripts", "register-subscription.mjs"), ...args], { encoding: "utf-8", env: { ...process.env, HOME: local } });
   const base = ["--store", storeFile, "--template", templateFile, "--runtime", "claude", "--domain-key", "/p2", "--chat-id", "oc_b"];
-  const prev = run([...base, "--resolve-audit-conflict", "op-u"]);
+  const prev = run([...base, "--resolve-audit-conflict", "op-2026-09-02T00-00-00-000Z-a5ae4ada"]);
   assert.equal(prev.status, 1, "预览非零：" + prev.stdout + prev.stderr);
   assert.match(prev.stdout, /读不清/u, prev.stdout);
-  const ap = run([...base, "--resolve-audit-conflict", "op-u", "--apply"]);
+  const ap = run([...base, "--resolve-audit-conflict", "op-2026-09-02T00-00-00-000Z-a5ae4ada", "--apply"]);
   assert.equal(ap.status, 1, "--apply 也非零：" + ap.stdout + ap.stderr);
   assert.match(ap.stdout, /读不清/u, ap.stdout);
   assert.match(ap.stdout, /不许 discard/u, ap.stdout);

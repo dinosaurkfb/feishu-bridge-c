@@ -147,15 +147,14 @@ const AUDIT_SHA256 = /^[0-9a-f]{64}$/u;
 // 空审计（从未写 / 读不齐当空）的基线哈希：sha256("")。
 const EMPTY_AUDIT_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-// 评审 #115 二轮 → #R13 P1-2（收口）：operation_id 收成封闭形状 —— 小写字母/数字/连字符、
-// 首字符非连字符、总长 ≤ 64，且禁止 locator 前缀（oc_/omt_/om_/ou_/on_ 是 chat_id / thread_id /
-// open_id 形状）。这保证审计行 / 待补记里的 operation_id 不可能携带 locator 或控制字符进入人类
-// 输出；doctor 回显它的命令在形状校验通过后仍过 displaySafe 双保险。
-const OPERATION_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/u;
-const OPERATION_ID_LOCATOR_PREFIX = /^(oc_|omt_|om_|ou_|on_)/u;
+// 评审 #121 二轮（收口）：operation_id 锚定为**写方唯一真实格式**（评审建议的联合形状收到极致）——
+// `op-` + toISOString 的冒号点换连字符（**保留大写 T/Z**，与已落盘的旧生产格式逐字兼容）+ 8 位小写
+// hex。精确锚定天然排除 locator 前缀与控制字符，且任何合法 id 满足 displaySafe(id) === id 不变量
+//（doctor 回显不会被省略成不可执行的命令）。
+const OPERATION_ID_RE = /^op-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[0-9a-f]{8}$/u;
 const operationIdProblem = (v) =>
   typeof v !== "string" || v.trim() === "" ? "empty"
-    : !OPERATION_ID_RE.test(v) || OPERATION_ID_LOCATOR_PREFIX.test(v) ? "shape" : null;
+    : !OPERATION_ID_RE.test(v) ? "shape" : null;
 
 /**
  * 审计行的**唯一封闭校验器**（评审 #115 P1-2）。写方（追加时构造的行）与读方
@@ -892,7 +891,7 @@ export function applySubscriptionChange({ file, change, now = new Date() } = {})
     }
     const beforeSha = beforeSh.state === "absent" ? null : beforeSh.sha256;
     const afterSha = crypto.createHash("sha256").update(Buffer.from(body, "utf-8")).digest("hex").slice(0, 16);
-    const operationId = "op-" + now.toISOString().replace(/[:.]/gu, "-").toLowerCase() + "-" + crypto.randomBytes(4).toString("hex");
+    const operationId = "op-" + now.toISOString().replace(/[:.]/gu, "-") + "-" + crypto.randomBytes(4).toString("hex");
     const auditEvent = buildSubscriptionAuditEvent({
       operationId,
       at: now.toISOString(),

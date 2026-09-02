@@ -10,11 +10,27 @@ import crypto from "node:crypto";
 import { roleEntriesProblem, senderRolesProblem, senderTable } from "./sender-roles.mjs";
 
 export const SUBSCRIPTION_SCHEMA_VERSION = "1.0";
+// 1.1（评审 #112 裁决）：可选 instance_key 进 id 哈希，同四元组多条合法并存；1.0 条目照旧。
+export const SUBSCRIPTION_SCHEMA_VERSION_KEYED = "1.1";
+export const INSTANCE_KEY_SHAPE = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
+
+/**
+ * 订阅身份公式的唯一实现（评审 #112 裁决定形）：
+ *   无 instance_key（1.0 legacy）→ stableControlId("subscription", ep, dom, chat, agent)
+ *   有 instance_key（1.1 keyed）→ 同上再追加 "instance:" + key
+ * 两支都在这里算 —— 写方、校验、寻址不许各抄一份公式。
+ */
+export function subscriptionIdFor({ endpointId, domainId, chatId, agentUid, instanceKey = null }) {
+  return instanceKey == null
+    ? stableControlId("subscription", endpointId, domainId, chatId, agentUid)
+    : stableControlId("subscription", endpointId, domainId, chatId, agentUid, "instance:" + instanceKey);
+}
 export const SUBSCRIPTION_ARTIFACT_TYPE = "feishu_bridge_subscription";
 export const MESSAGE_RECEIVE_EVENT = "im.message.receive";
 
 export const SUBSCRIPTION_REJECT = Object.freeze({
   PROJECTION_INVALID: "subscription_projection_invalid",
+  CONTROL_PLANE_INVALID: "control_plane_invalid",
   ENDPOINT_MISMATCH: "endpoint_mismatch",
   NO_ACTIVE_SUBSCRIPTION: "no_active_subscription",
   AGENT_MISMATCH: "agent_mismatch",
@@ -50,7 +66,26 @@ export function legacyEndpointId({ runtime, agentUid }) {
 
 export function validateSubscription(subscription) {
   const problems = [];
-  if (subscription?.schema_version !== SUBSCRIPTION_SCHEMA_VERSION) problems.push("schema_version");
+  // **封闭形状**（评审 PR #112 P1：这里已是不可信落盘对象的入口，判据要对齐 schema 的
+  // additionalProperties:false —— 多余字段一律说不清，运行时接受的集合不许比 Schema 大）。
+  const closed = (obj, allowed, label) => {
+    if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return;
+    for (const k of Object.keys(obj)) if (!allowed.includes(k)) problems.push(label + "extra:" + k);
+  };
+  closed(subscription, ["schema_version", "artifact_type", "subscription_id", "version",
+    "endpoint_id", "domain_id", "status", "scope", "constraints", "instance_key"], "");
+  closed(subscription?.scope, ["agent_uid", "transport_open_id", "chat_id", "sender_ids",
+    "event_types", "sender_roles"], "scope.");
+  closed(subscription?.constraints, ["freshness_ms"], "constraints.");
+  // 两版并行（评审 #112 裁决）：1.0 legacy 不许带 instance_key；1.1 keyed 可带（形状封闭）。
+  const version11 = subscription?.schema_version === SUBSCRIPTION_SCHEMA_VERSION_KEYED;
+  if (subscription?.schema_version !== SUBSCRIPTION_SCHEMA_VERSION && !version11) problems.push("schema_version");
+  if (subscription?.instance_key !== undefined) {
+    if (!version11) problems.push("instance_key_needs_1.1");
+    else if (typeof subscription.instance_key !== "string" || !INSTANCE_KEY_SHAPE.test(subscription.instance_key)) {
+      problems.push("instance_key");
+    }
+  }
   if (subscription?.artifact_type !== SUBSCRIPTION_ARTIFACT_TYPE) problems.push("artifact_type");
   for (const field of ["subscription_id", "endpoint_id", "domain_id"]) {
     if (!nonEmpty(subscription?.[field])) problems.push(field);
@@ -61,21 +96,42 @@ export function validateSubscription(subscription) {
   if (!nonEmpty(scope?.agent_uid)) problems.push("scope.agent_uid");
   if (!nonEmpty(scope?.transport_open_id)) problems.push("scope.transport_open_id");
   if (!nonEmpty(scope?.chat_id)) problems.push("scope.chat_id");
-  if (uniqueStrings(scope?.sender_ids).length !== scope?.sender_ids?.length || !scope?.sender_ids?.length) {
+  // Array.isArray 先行（评审 #112 二轮：盘上条目 sender_ids:{bad:true} 曾让 loader 裸抛 ——
+  // 不可信落盘对象的入口，任何形状问题都要落 problems，不许抛）。
+  if (!Array.isArray(scope?.sender_ids) || !scope.sender_ids.length ||
+      uniqueStrings(scope.sender_ids).length !== scope.sender_ids.length) {
     problems.push("scope.sender_ids");
   }
-  if (uniqueStrings(scope?.event_types).length !== scope?.event_types?.length || !scope?.event_types?.length) {
+  if (!Array.isArray(scope?.event_types) || !scope.event_types.length ||
+      uniqueStrings(scope.event_types).length !== scope.event_types.length ||
+      !scope.event_types.every((e) => e === MESSAGE_RECEIVE_EVENT)) {
+    // schema 的 const：目前只有 im.message.receive 有消费者；别的事件名一律说不清（评审 PR #112 P1）
     problems.push("scope.event_types");
   }
   // sender_roles 可选；在场就必须封闭、不重复、角色在枚举里，且每个 sender_ids 里的 id 都得在表里（sender_ids 是授权基准，表不能少它）
   // 与模板同一份核心校验（sender-roles.mjs），owner 基准就是 sender_ids：owner 集合必须精确一致、字段取值域封闭。旧制品不带 sender_roles 仍接受。
-  if (scope?.sender_roles !== undefined &&
-      roleEntriesProblem(scope.sender_roles, { ownerIds: scope?.sender_ids ?? [], ownerRequired: true, name: "scope.sender_roles" }) !== null) {
-    problems.push("scope.sender_roles");
+  if (scope?.sender_roles !== undefined) {
+    // ownerIds 必须先确认是数组再进关系校验（同上：形状问题落 problems，不裸抛）
+    const ownerIds = Array.isArray(scope?.sender_ids) ? scope.sender_ids : [];
+    if (roleEntriesProblem(scope.sender_roles, { ownerIds, ownerRequired: true, name: "scope.sender_roles" }) !== null) {
+      problems.push("scope.sender_roles");
+    }
   }
   if (typeof subscription?.constraints?.freshness_ms !== "number" ||
       !Number.isFinite(subscription.constraints.freshness_ms) || subscription.constraints.freshness_ms <= 0) {
     problems.push("constraints.freshness_ms");
+  }
+  // 身份完整性（评审 #112 三轮 + 裁决）：subscription_id 必须等于按公式从条目自身字段重算的值
+  //（keyed 条目走带 instance_key 的分支）。否则「改 chat_id / key 不重算 id」的条目会覆盖原订阅，
+  // 让别群的证据接走原群的 pending binding。endpoint_id / domain_id 自身是哈希、原始输入不在
+  // 条目里，但它们都进这个公式 —— 改任何一个而不重算 id 都在这里现形。
+  if (nonEmpty(subscription?.subscription_id) &&
+      subscription.subscription_id !== subscriptionIdFor({
+        endpointId: subscription?.endpoint_id, domainId: subscription?.domain_id,
+        chatId: scope?.chat_id, agentUid: scope?.agent_uid,
+        instanceKey: typeof subscription?.instance_key === "string" ? subscription.instance_key : null,
+      })) {
+    problems.push("subscription_id_mismatch");
   }
   return { ok: problems.length === 0, problems };
 }
@@ -97,7 +153,7 @@ const pendingDeadline = (record, pendingWindowMs) => {
  * 不得传进来。domain_key 是控制面的项目/业务域 locator，只用于当场派生 domain_id，不进入结果。
  */
 export function buildLegacySubscriptionReadModel({
-  runtime, endpointId, template, records, pendingWindowMs,
+  runtime, endpointId, template, records, pendingWindowMs, controlPlane = null,
 } = {}) {
   const problems = [];
   if (!nonEmpty(runtime)) problems.push("runtime");
@@ -186,7 +242,7 @@ export function buildLegacySubscriptionReadModel({
     if (!valid.ok) problems.push("subscription:" + valid.problems.join(","));
   }
   if (problems.length) return { ok: false, reason: SUBSCRIPTION_REJECT.PROJECTION_INVALID, problems };
-  return {
+  return mergeControlPlaneIntoModel({
     ok: true,
     schema_version: SUBSCRIPTION_SCHEMA_VERSION,
     projection: "legacy-read-only",
@@ -194,7 +250,48 @@ export function buildLegacySubscriptionReadModel({
     endpoint_id: endpointId,
     subscriptions: projected,
     pending_bindings: pendingBindings,
-  };
+  }, controlPlane);
+}
+
+/**
+ * FR-2.6 单 1：控制面订阅与 legacy 投影合并成统一读模型。
+ *
+ * · controlPlane 缺省 / 缺席文件（absent）/ 空 store → **原样返回同一个对象**：
+ *   不装不建文件的机器，输出与没有这个参数时逐字节一致。
+ * · 同 id：控制面覆盖投影（那是显式登记）；控制面新 id：追加（同域第二个群）。
+ *   id 派生两边同一套（subscription-store.mjs 的 subscriptionControlId），自然对齐。
+ * · fail-closed：控制面整体损坏（或合并时发现任一条目校验不过）→ **整份控制面不作数**，
+ *   subscriptions 退回纯 legacy，问题记进 control_plane.problems 可诊断，不静默丢。
+ */
+function mergeControlPlaneIntoModel(model, controlPlane) {
+  if (controlPlane == null) return model;
+  // **文件在场但说不清 ≠ 没装控制面**（评审 PR #112 P1：这里退回纯 legacy 是 fail-open ——
+  // 暂停 / 收紧过的订阅会在文件损坏时重新开放）。权威读取必须拒绝；展示层要 legacy 诊断
+  // 就从 legacy 字段拿，认领器看到 ok:false 一律不认领。缺席（absent）与空 store 才兼容 legacy。
+  const failClosed = (problems) => ({
+    ok: false, reason: SUBSCRIPTION_REJECT.CONTROL_PLANE_INVALID, problems, legacy: model,
+  });
+  if (controlPlane.ok !== true || !Array.isArray(controlPlane.subscriptions)) {
+    return failClosed(controlPlane.problems ?? ["control_plane_invalid"]);
+  }
+  const problems = [];
+  const byId = new Map(model.subscriptions.map((s) => [s.subscription_id, s]));
+  let added = 0;
+  let overridden = 0;
+  let otherEndpoint = 0;
+  for (const entry of controlPlane.subscriptions) {
+    const valid = validateSubscription(entry);
+    if (!valid.ok) { problems.push("subscription:" + (entry?.subscription_id ?? "?") + ":" + valid.problems.join(",")); continue; }
+    // **endpoint 隔离**（评审 PR #112 P1）：store 是机器级共享文件，别的链（endpoint）的条目
+    // 不进本模型 —— 混进来的话 Claude 模型里会出现 Codex 订阅。跳过要计数，可诊断。
+    if (entry.endpoint_id !== model.endpoint_id) { otherEndpoint += 1; continue; }
+    if (byId.has(entry.subscription_id)) overridden += 1; else added += 1;
+    byId.set(entry.subscription_id, entry);
+  }
+  if (problems.length) return failClosed(problems);
+  if (!controlPlane.subscriptions.length) return model;
+  return { ...model, subscriptions: [...byId.values()],
+    control_plane: { ok: true, added, overridden, other_endpoint: otherEndpoint } };
 }
 
 const reject = (reason, extra = {}) => ({ ok: false, reason, ...extra });

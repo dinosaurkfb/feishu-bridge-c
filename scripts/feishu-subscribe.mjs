@@ -3,9 +3,11 @@
  * 查看本项目的事件订阅（第 2 层）。**只读。**两条链各有一条：Claude `/feishu-subscribe`，Codex `$feishu-subscribe`
  * （Codex 那条复用这里的脱敏视图与渲染，只换投影来源）。
  *
- * 写入口的现状（2026-08-29）：**发送者角色表的登记入口已开放**（`register-sender.mjs`，改链路模板的 senders，
- * 写入需 owner 逐次授权）；**独立订阅的增删仍不开放** —— 不是没写代码：FR-2.5 的落盘控制面（`subscription-sync-apply.mjs`）
- * 已经完成，卡在 FR-2.6：多于一条订阅时首次认领必须能拒绝歧义，该路径未经真实样本验证。
+ * 写入口的现状（2026-09-02 更新）：**发送者角色表的登记入口已开放**（`register-sender.mjs`，改链路模板的 senders，
+ * 写入需 owner 逐次授权）；**订阅控制面的登记入口也已开放**（FR-2.6 单 1：`register-subscription.mjs`，
+ * 落盘到独立 store，同样 owner 逐次授权）—— 但 store **尚未接入权威投影与切流**：落盘暂不改变生产
+ * 认领 / 路由（生产调用方仍走纯 legacy 投影；接入是切流单的事，前置是 chat locator 验证与
+ * 多订阅歧义的真实样本）。本命令展示的仍是 legacy 投影。
  *
  * status 第 2 层给的是一行概览；这条命令给全貌 —— 允许哪些发送者、哪些事件类型、
  * 新鲜度约束、有没有待认领的绑定。FR-10 要求 status 能答"subscription 命中范围"，
@@ -132,7 +134,7 @@ function main() {
     { source: currentBinding({ root }).source ?? null },
   ));
   console.log("\n本命令只读。**发送者角色表可以登记**（node scripts/register-sender.mjs，改链路模板的 senders；写入需 owner 逐次授权）。");
-  console.log("**独立订阅的增删仍不开放**：FR-2.5 的落盘控制面已经完成，卡在 FR-2.6 —— 多于一条订阅时首次认领必须能拒绝歧义，该路径未经真实样本验证。");
+  console.log("**订阅控制面的登记入口已开放**（node scripts/register-subscription.mjs，落盘独立 store；写入需 owner 逐次授权），但 store **尚未接入权威投影与切流** —— 落盘暂不改变生产认领 / 路由；本命令展示的仍是 legacy 投影。");
 }
 
 if (isDirectRun(import.meta.url)) main();

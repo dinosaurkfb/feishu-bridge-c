@@ -9,11 +9,12 @@
  * 而使用者没法知道哪个才是承诺。这里只换投影来源：
  * Claude 从 projects 建，Codex 从 tasks 建，核心读模型是同一个。
  *
- * ■ 写入口的现状（2026-08-29）
+ * ■ 写入口的现状（2026-09-02 更新）
  *
  * 发送者角色表的登记入口已开放（`register-sender.mjs --template <Codex 的 chain-config.json> …`，写入需 owner 逐次授权）。
- * 独立订阅的增删仍不开放：FR-2.5 的落盘控制面（subscription-sync-apply.mjs）已经完成，卡在 FR-2.6 ——
- * 多于一条订阅时首次认领必须能拒绝歧义，该路径未经真实样本验证。
+ * 订阅控制面的登记入口也已开放（FR-2.6 单 1：`register-subscription.mjs`，落盘独立 store，owner 逐次授权），
+ * 但 store 尚未接入权威投影与切流 —— 落盘暂不改变生产认领 / 路由（切流前置：chat locator 验证与
+ * 多订阅歧义的真实样本；FR-2.5 的落盘控制面 subscription-sync-apply.mjs 已经完成）。本命令展示的仍是 legacy 投影。
  */
 
 import { isDirectRun } from "../direct-run.mjs";
@@ -48,9 +49,9 @@ export function parseArgs(tokens) {
 
 const WRITE_NOTE = [
   "",
-  "这条命令只读 —— 发送者角色表可用 register-sender.mjs 登记（写入需 owner 逐次授权）；独立订阅增删仍未开放（卡在 FR-2.6，FR-2.5 落盘控制面已完成）：",
-  "  · FR-2.5 订阅变更同步到 binding 授权快照：计划器与 resnapshot / suspend / migrate 的落盘都已完成；",
-  "  · FR-2.6 首次认领未命中唯一订阅时必须拒绝：判据在，但没经过多订阅的真实样本验证 —— 这一条才是独立订阅增删没开的原因。",
+  "这条命令只读 —— 发送者角色表可用 register-sender.mjs 登记（写入需 owner 逐次授权）；订阅控制面的登记入口已开放（register-subscription.mjs，落盘独立 store，同样 owner 逐次授权）：",
+  "  · 但 store 尚未接入权威投影与切流 —— 落盘暂不改变生产认领 / 路由，本命令展示的仍是 legacy 投影；",
+  "  · 接入（切流）的前置：chat locator 验证与多订阅歧义的真实样本。",
 ].join("\n");
 
 function main() {

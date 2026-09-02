@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-09-02T01:02:28.080Z",
+  "generated_at": "2026-09-02T03:08:11.184Z",
   "modules": {
     "authorize.mjs": [
       "AUTHORIZATION_TABLE",
@@ -611,16 +611,19 @@
       "extractReply"
     ],
     "subscription.mjs": [
+      "INSTANCE_KEY_SHAPE",
       "MESSAGE_RECEIVE_EVENT",
       "SUBSCRIPTION_ARTIFACT_TYPE",
       "SUBSCRIPTION_REJECT",
       "SUBSCRIPTION_SCHEMA_VERSION",
+      "SUBSCRIPTION_SCHEMA_VERSION_KEYED",
       "buildLegacySubscriptionReadModel",
       "claimable",
       "compareFirstClaimShadow",
       "legacyEndpointId",
       "selectPendingSubscriptionClaim",
       "stableControlId",
+      "subscriptionIdFor",
       "validateSubscription"
     ],
     "suppress-outbox-core.mjs": [

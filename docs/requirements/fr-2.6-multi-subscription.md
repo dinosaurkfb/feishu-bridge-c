@@ -167,6 +167,13 @@ suspend / migrate）已经完成，卡点是「多于一条订阅时首次认领
 
 ## 3. 数据模型提案（含兼容迁移）
 
+> **2026-09-02 评审修订（PR #112 裁决）**：撤回「schema 字面完全不动」。身份完整性守卫
+>（subscription_id 必须等于按公式重算的值）落地后，「同四元组多条订阅」需要显式区分位 ——
+> schema 升 **1.1** 增加可选 `instance_key`（进 id 哈希：`"instance:"+key`）；1.0 legacy 条目
+>（无 key、原四元组公式）继续合法，两版并行读取。迁移语义随之明确：同 id 版本前进 = resnapshot；
+> 不同 id、四硬边界（endpoint/domain/agent/chat）一致且授权覆盖 = migrate。CLI 的
+> pause/resume/remove 支持 `--subscription-id` / `--instance-key` 精确寻址，四元组下多条时歧义拒绝。
+
 ### 3.1 提案 A（推荐）：Subscription v1 保持单群，多群 = 同域多条订阅
 
 - **不新增 schema**。一条订阅仍然声明一个 `scope.chat_id`（`references/subscription-v1.schema.json:67-72`）；
@@ -232,9 +239,12 @@ suspend / migrate）已经完成，卡点是「多于一条订阅时首次认领
 
 §4 的十条开放问题按归属分三层。**只有这四条需要 Frank 拍板**，其余是工程判断或外部依赖：
 
-1. **提案 A 还是 B**（§4-#4）——推荐 **A**（同域多条订阅，schema 不动）：改动面最小、
-   歧义判据已存在；「一条订阅跨多群共享参数」尚无真实样本，且 `chat_scope_ref` 单值语义
-   已在 v1 快照固化，B 的迁移成本高。即便日后改走 B，A 的第一步（控制面 + shadow）两案共用。
+1. **提案 A 还是 B**（§4-#4）——推荐 **A**（同域多条订阅）：改动面最小、歧义判据已存在；
+   「一条订阅跨多群共享参数」尚无真实样本，且 `chat_scope_ref` 单值语义已在 v1 快照固化，
+   B 的迁移成本高。即便日后改走 B，A 的第一步（控制面 + shadow）两案共用。
+   *（拍板时的理由含「schema 字面不动」；2026-09-02 评审 #112 裁决修订为 schema 升 1.1
+   加可选 `instance_key`、1.0 并行合法 —— 见 §3.1 修订框。A 的核心「一条订阅一个群、
+   多群 = 多条订阅」不变。）*
 2. **订阅管理单位**（§4-#3）——推荐**维持项目根目录派生 domain_id**（现状
    `scripts/subscription.mjs:136`），抽象业务域 ID 等多群真实样本出现后再议。
 3. **写入口是否从飞书开放**（§4-#5 后半）——推荐**不开放**：订阅写与 `register-sender`

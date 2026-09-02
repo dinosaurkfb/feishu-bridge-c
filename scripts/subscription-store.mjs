@@ -71,23 +71,14 @@ export function subscriptionControlId({ runtime, agentUid, domainKey, chatId, in
 export function loadSubscriptionStore({ file } = {}) {
   if (typeof file !== "string" || !path.isAbsolute(file)) return { ok: false, problems: ["file_required_absolute"] };
   // fd 绑定读（评审 PR #112 P1）：O_NOFOLLOW|O_NONBLOCK 打开、同 fd fstat 确认普通**单硬链接**
-  // 文件、从这个 fd 读 —— 符号链接 / FIFO / 目录 / 硬链接别名都说不清。
+  // 文件、从这个 fd 读 —— 符号链接 / FIFO / 目录 / 硬链接别名都说不清。受验开共用一份判据。
+  const opened = openVerifiedSubscriptionFile({ file });
+  if (opened.absent) return { ok: true, absent: true, subscriptions: [] };
+  if (!opened.ok) return { ok: false, problems: [opened.reason] };
   let raw;
-  let fd = null;
-  try {
-    try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW); }
-    catch (err) {
-      if (err.code === "ENOENT") return { ok: true, absent: true, subscriptions: [] };
-      return { ok: false, problems: ["store_unreadable:" + (err.code === "ELOOP" ? "symlink" : String(err.code ?? err.message))] };
-    }
-    let st;
-    try { st = fs.fstatSync(fd); } catch (err) { return { ok: false, problems: ["store_unreadable:fstat:" + String(err.code ?? err.message)] }; }
-    if (!st.isFile()) return { ok: false, problems: ["store_unreadable:不是普通文件"] };
-    if (st.nlink !== 1) return { ok: false, problems: ["store_unreadable:有 " + st.nlink + " 个目录项（硬链接别名）"] };
-    try { raw = fs.readFileSync(fd, "utf-8"); } catch (err) { return { ok: false, problems: ["store_unreadable:" + String(err.code ?? err.message)] }; }
-  } finally {
-    if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
-  }
+  try { raw = fs.readFileSync(opened.fd, "utf-8"); }
+  catch (err) { try { fs.closeSync(opened.fd); } catch { /* 已关 */ } return { ok: false, problems: ["store_unreadable:" + String(err.code ?? err.message)] }; }
+  try { fs.closeSync(opened.fd); } catch { /* 已关 */ }
   let parsed;
   try { parsed = JSON.parse(raw); } catch (err) { return { ok: false, problems: ["store_bad_json:" + err.message] }; }
   const problems = [];
@@ -345,17 +336,44 @@ export function appendSubscriptionAuditLine({ file, event } = {}) {
   } finally { try { fs.closeSync(afd); } catch { /* 已关 */ } }
 }
 
-/** 当前 store 整文件 sha256 前 16 位（受验读）；缺席 / 说不清 → null。 */
-function currentStoreHash({ file }) {
-  let fd;
-  try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); }
-  catch (err) { return null; }
-  try {
-    const st = fs.fstatSync(fd);
-    if (!st.isFile() || st.nlink !== 1) return null;
-    const buf = fs.readFileSync(fd);
-    return crypto.createHash("sha256").update(buf).digest("hex").slice(0, 16);
-  } catch { return null; } finally { try { fs.closeSync(fd); } catch { /* 已关 */ } }
+/** 受验打开订阅 store（fd 绑定读，评审 #112 P1 纪律，与 store 内容解读解耦）：
+ * O_NOFOLLOW|O_NONBLOCK 打开、同 fd fstat 必须是普通**单硬链接**文件。判定结果**封闭三态**：
+ *   - { absent:true }          —— 只有 ENOENT（文件确实不存在，首次写前的状态）；
+ *   - { ok:true, fd }          —— 受验读成功，调用方继续从 fd 读内容（解读/校验交给调用方）；
+ *   - { ok:false, reason }     —— 其余全部（符号链接 / FIFO / 目录 / 硬链接别名 / EACCES / fstat/读错）。
+ * loadSubscriptionStore 与 storeHashState 共用，保证「读不清」这一判据只有一份（评审 #115 五轮 P1）。 */
+function openVerifiedSubscriptionFile({ file }) {
+  let fd = null;
+  try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW); }
+  catch (err) {
+    if (err.code === "ENOENT") return { absent: true };
+    return { ok: false, reason: "store_unreadable:" + (err.code === "ELOOP" ? "symlink" : String(err.code ?? err.message)) };
+  }
+  let st;
+  try { st = fs.fstatSync(fd); }
+  catch (err) { try { fs.closeSync(fd); } catch { /* 已关 */ } return { ok: false, reason: "store_unreadable:fstat:" + String(err.code ?? err.message) }; }
+  if (!st.isFile()) { try { fs.closeSync(fd); } catch { /* 已关 */ } return { ok: false, reason: "store_unreadable:不是普通文件" }; }
+  if (st.nlink !== 1) { try { fs.closeSync(fd); } catch { /* 已关 */ } return { ok: false, reason: "store_unreadable:有 " + st.nlink + " 个目录项（硬链接别名）" }; }
+  return { ok: true, fd };
+}
+
+/** 当前订阅 store 的**封闭三态**哈希判定（评审 #115 五轮 P1，修掉旧 currentStoreHash 的缺洞）：
+ *   - absent      —— 只有 ENOENT（文件确实不存在），调用方按「首次写前」处理（before_sha256:null 照旧）；
+ *   - valid       —— 受验读成功（O_NOFOLLOW|O_NONBLOCK + 同 fd fstat 普通单硬链接），携带 sha256 前 16 位；
+ *   - unreadable  —— 其余全部（符号链接 / FIFO / 目录 / 硬链接别名 / EACCES / I/O 错），带 reason/detail，
+ *      调用方必须 fail-closed；**不许把「读不清」折成 null** —— 旧实现把 ENOENT 与读不清折叠成同一个 null，
+ *      当 before_sha256 也是 null（首次写待补记）时被误判成「首次写未提交」而误清 pending（评审复现场景）。
+ * 返回 { state:"absent" } | { state:"valid", sha256 } | { state:"unreadable", reason, detail }。 */
+function storeHashState({ file }) {
+  const opened = openVerifiedSubscriptionFile({ file });
+  if (opened.absent) return { state: "absent" };
+  if (!opened.ok) return { state: "unreadable", reason: opened.reason, detail: String(opened.reason) };
+  const fd = opened.fd;
+  let buf;
+  try { buf = fs.readFileSync(fd); }
+  catch (err) { try { fs.closeSync(fd); } catch { /* 已关 */ } return { state: "unreadable", reason: "store_unreadable:" + String(err.code ?? err.message), detail: String(err.code ?? err.message) }; }
+  try { fs.closeSync(fd); } catch { /* 已关 */ }
+  return { state: "valid", sha256: crypto.createHash("sha256").update(buf).digest("hex").slice(0, 16) };
 }
 
 /** 审计基线**三态**（评审 #115 三轮 P1-1）：absent | valid | unreadable。
@@ -484,7 +502,12 @@ export function classifySubscriptionAuditPending({ file, operationId } = {}) {
   if (loaded.absent) return { ok: true, state: "no_conflict", reason: "audit_pending_no_conflict", detail: "没有待补记" };
   const pending = loaded.pending;
   if (pending.operation_id !== operationId) return { ok: true, state: "mismatch", reason: "audit_pending_conflict_mismatch", detail: "点名 operation " + operationId + " 与待补记 op " + pending.operation_id + " 不符，拒绝" };
-  const cur = currentStoreHash({ file });
+  // 评审 #115 五轮 P1：store 读不清（符号链接 / FIFO / 目录 / 硬链接别名 / EACCES）→ 单独一态
+  // store_unreadable，**不许**折成 cur=null 套进 before/after 比较 —— 当 before_sha256 也是 null 时
+  // 会被误判为「首次写未提交」而误清 pending（评审复现场景）。unreadable 一律 fail-closed、pending 留存。
+  const sh = storeHashState({ file });
+  if (sh.state === "unreadable") return { ok: true, state: "store_unreadable", reason: "store_unreadable", detail: sh.detail, pending };
+  const cur = sh.state === "absent" ? null : sh.sha256;
   if (cur === pending.before_sha256) return { ok: true, state: "dropped", pending };
   if (cur !== pending.after_sha256) return { ok: true, state: "conflict", pending, reason: "audit_pending_conflict" };
   return { ok: true, state: "replay", pending };
@@ -528,6 +551,8 @@ export function resolveSubscriptionAuditConflict({ file, operationId, discard = 
           if (!clr.ok) return { ok: false, reason: "audit_pending_clear_failed", detail: clr.reason };
           return { ok: true, resolved: true, state: "replayed", operationId, detail: "当前 store 与待补记 after 一致（已提交未写审计），已补记并清 pending" };
         }
+        case "store_unreadable": // 评审 #115 五轮 P1：store 读不清 → 非成功返回、pending 留存；**不许** discard
+          return { ok: false, reason: "store_unreadable", kept: true, operationId, detail: "store 路径读不清（" + (cls.detail ?? "") + "）；先修 " + file + "（去掉符号链接 / 恢复成普通单硬链接文件）再来，不许 discard" };
         default: { // conflict
           if (discard !== true) return { ok: false, reason: "audit_pending_conflict", kept: true, operationId, detail: "当前 store 与待补记 before/after 都不符（真冲突）；discard:true 才清" };
           const clr = clearSubscriptionAuditPending({ file });
@@ -574,7 +599,12 @@ function resolvePendingSubscriptionAudit({ file, now }) {
   if (!loaded.ok) return { ok: false, reason: loaded.reason, detail: loaded.detail ?? (loaded.problems ? loaded.problems.join(",") : null) };
   if (loaded.absent) return { ok: true, action: "noop" };
   const pending = loaded.pending;
-  const cur = currentStoreHash({ file });
+  // 评审 #115 五轮 P1：store 读不清（符号链接 / FIFO / 目录 / 硬链接别名 / EACCES）→ 阻断本次变更，
+  // pending 留存。**不许**折成 cur=null —— 旧逻辑把 ENOENT 与读不清折叠成同一个 null，当 before_sha256
+  // 也是 null（首次写待补记）时被误判成「首次写未提交」而误清 pending。
+  const sh = storeHashState({ file });
+  if (sh.state === "unreadable") return { ok: false, reason: "store_unreadable", detail: sh.detail, pendingStatus: "unchanged" };
+  const cur = sh.state === "absent" ? null : sh.sha256;
   if (cur === pending.before_sha256) {
     const clr = clearSubscriptionAuditPending({ file });
     if (!clr.ok) return { ok: false, reason: "audit_pending_clear_failed", detail: clr.reason };
@@ -843,7 +873,14 @@ export function applySubscriptionChange({ file, change, now = new Date() } = {})
       try { fs.rmSync(tmp, { force: true }); } catch { /* 已不在 */ }
       return (result = { ok: false, reason: "store_unwritable", detail: err.message, backup });
     }
-    const beforeSha = currentStoreHash({ file });
+    // 评审 #115 五轮 P1：提交前生成 beforeSha 也用封闭三态 —— unreadable → **阻断提交**（不产生
+    // before 语义含糊的 pending：读不清别当成「首次写」）；absent → before_sha256:null 照旧。
+    const beforeSh = storeHashState({ file });
+    if (beforeSh.state === "unreadable") {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* 已不在 */ }
+      return (result = { ok: false, reason: "store_unreadable", detail: beforeSh.detail, backup });
+    }
+    const beforeSha = beforeSh.state === "absent" ? null : beforeSh.sha256;
     const afterSha = crypto.createHash("sha256").update(Buffer.from(body, "utf-8")).digest("hex").slice(0, 16);
     const operationId = "op-" + now.toISOString().replace(/[:.]/gu, "-") + "-" + crypto.randomBytes(4).toString("hex");
     const auditEvent = buildSubscriptionAuditEvent({

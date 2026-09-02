@@ -159,6 +159,7 @@ if (isDirectRun(import.meta.url)) {
     const stateText = {
       no_conflict: "没有待补记（无需处理）",
       mismatch: "点名 op 与待补记不符，拒绝",
+      store_unreadable: "store 路径读不清（符号链接 / FIFO / 目录 / 硬链接别名 / 权限）；先修 store，不许处理",
       dropped: "当前 store == 待补记 before（未提交）；--apply 将清理丢弃",
       replay: "当前 store == 待补记 after（已提交未写审计）；--apply 将补记审计并清 pending",
       conflict: "当前 store 与待补记 before/after 都不符（真冲突）；--apply 将丢弃 pending（放弃对账）",
@@ -169,6 +170,12 @@ if (isDirectRun(import.meta.url)) {
     // 判定为「没有可处理的冲突」（no_conflict / mismatch）：预览是正常展示（退出 0）；但显式 --apply
     // 却没东西可处理 → 非零，避免把「你要求处理但没匹配上」误报成成功。
     if (cls.state === "no_conflict" || cls.state === "mismatch") process.exit(parsed.apply ? 1 : 0);
+    // 评审 #115 五轮 P1：store 读不清（符号链接 / FIFO / 目录 / 硬链接别名 / 权限）→ 预览与 --apply 都
+    // 非成功指路（先修 store 路径再来），**绝不**走到下面 discard:true 的处理路径。
+    if (cls.state === "store_unreadable") {
+      process.stdout.write("不能处理：store 读不清（" + (cls.detail ?? "") + "）。先修 " + parsed.store + "（去掉符号链接 / 恢复成普通单硬链接文件）再来；不许 discard。\n");
+      process.exit(1);
+    }
     if (!parsed.apply) { process.stdout.write("\n[dry-run] 什么都没介入。要处理须 owner 逐次授权后再加 --apply。\n"); process.exit(0); }
     { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门
     const done = resolveSubscriptionAuditConflict({ file: parsed.store, operationId: parsed.resolveAuditConflict, discard: true });

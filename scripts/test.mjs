@@ -20052,6 +20052,145 @@ test("FR-2.6 单 2 · 状态维度：paused 订阅被 active 过滤拿掉、其 
   assert.deepEqual([guarded.ok, guarded.reason], [false, SUBSCRIPTION_REJECT.PROJECTION_INVALID], "version=2 → 精确拒 PROJECTION_INVALID");
 });
 
+// ─── FR-2.6 单 3：群名登记与展示（chat_name / --chat-name / 三级群名） ──────────────────
+
+test("FR-2.6 单 3：chat_name 1.0 拒 / 1.1 收、取值域封闭；身份与 chat_name 无关（id 哈希不进群名）；schema 同步 1.1 形状", () => {
+  const template = { chain: "claude", agent_uid: "agent_m5claude", transport_open_id: "ou_bot", frank_sender_id: "u_frank", chat_id: "oc_x", default_freshness_ms: 600000 };
+  const plain = planSubscriptionEntry({ runtime: "claude", template, domainKey: "/p", chatId: "oc_second" });
+  assert.equal(plain.ok, true, plain.reason ?? "");
+  assert.equal(plain.entry.schema_version, SUBSCRIPTION_SCHEMA_VERSION, "不带 1.1 字段照旧 1.0");
+  assert.ok(!("chat_name" in plain.entry), "1.0 条目没有 chat_name 键");
+  const named = planSubscriptionEntry({ runtime: "claude", template, domainKey: "/p", chatId: "oc_second", chatName: "项目二群" });
+  assert.equal(named.ok, true, named.reason ?? "");
+  assert.equal(named.entry.schema_version, SUBSCRIPTION_SCHEMA_VERSION_KEYED, "带 chat_name 即 1.1（与带 instance_key 同款升版）");
+  assert.equal(named.entry.chat_name, "项目二群");
+  // **身份守卫：chat_name 不进 id 哈希。**同四元组带不带群名、带什么群名，id 一致 ——
+  // 改群名不换身份，登记群名的修改走 remove + 重登记，不产生第二条订阅。
+  assert.equal(named.entry.subscription_id, plain.entry.subscription_id);
+  const both = planSubscriptionEntry({ runtime: "claude", template, domainKey: "/p", chatId: "oc_second", instanceKey: "k2", chatName: "二号键群" });
+  assert.equal(both.ok, true, both.reason ?? "");
+  assert.equal(both.entry.schema_version, SUBSCRIPTION_SCHEMA_VERSION_KEYED);
+  assert.equal(both.entry.chat_name, "二号键群");
+  assert.equal(both.entry.subscription_id, subscriptionIdFor({
+    endpointId: legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid }),
+    domainId: stableControlId("domain", "claude", "/p"),
+    chatId: "oc_second", agentUid: template.agent_uid, instanceKey: "k2",
+  }), "keyed + chat_name：id 仍只由四元组 + instance_key 决定");
+  // 取值域：空 / 全空白 / 超 64 / 非字符串 —— 计划器早拒（专用 reason），validateSubscription 写盘前兜底
+  for (const bad of ["", "   ", "x".repeat(65), 123]) {
+    assert.equal(planSubscriptionEntry({ runtime: "claude", template, domainKey: "/p", chatId: "oc_second", chatName: bad }).reason, "chat_name_invalid", JSON.stringify(bad));
+  }
+  for (const bad of ["", "   ", "x".repeat(65), null]) {
+    const v = validateSubscription({ ...named.entry, chat_name: bad });
+    assert.deepEqual([v.ok, v.problems.includes("chat_name")], [false, true], "chat_name " + JSON.stringify(bad) + "：" + JSON.stringify(v));
+  }
+  // 1.0 带群名 → 专用问题码（与 instance_key_needs_1.1 对称）；条目本就合法，这是唯一问题
+  const on10 = validateSubscription({ ...plain.entry, chat_name: "项目群" });
+  assert.deepEqual([on10.ok, on10.problems], [false, ["chat_name_needs_1.1"]], JSON.stringify(on10));
+  // schema 与校验同一形状（1.1 下界）：类型 / 长度上下界进 schema；trim 是关系性约束，只归 validateSubscription（sender_roles 同款分工）
+  const schema = JSON.parse(fs.readFileSync(path.resolve("references", "subscription-v1.schema.json"), "utf-8"));
+  assert.deepEqual(
+    [schema.properties.chat_name.type, schema.properties.chat_name.minLength, schema.properties.chat_name.maxLength],
+    ["string", 1, 64], "schema 的 chat_name 上下界与 validateSubscription 同源");
+  assert.deepEqual(schema.properties.schema_version.enum, [SUBSCRIPTION_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION_KEYED]);
+});
+
+test("FR-2.6 单 3：register-subscription —— dry-run 预览含群名且零副作用、--apply 落盘 chat_name、寻址动作带 --chat-name 拒、同四元组 keyed 第二条不同群名落盘", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-fr26-name-"));
+  const templateFile = path.join(local, "chain-config.json");
+  const TPL26 = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  fs.writeFileSync(templateFile, JSON.stringify(TPL26));
+  const storeFile = path.join(local, "subs", "subscriptions.json");
+  const run = (args) => spawnSync(process.execPath, [path.resolve("scripts", "register-subscription.mjs"), ...args], { encoding: "utf-8", env: { ...process.env, HOME: local } });
+  const base = ["--store", storeFile, "--template", templateFile, "--runtime", "claude", "--domain-key", "/p1"];
+
+  const dry = run([...base, "--chat-id", "oc_second", "--chat-name", "项目二群"]);
+  assert.equal(dry.status, 0, dry.stdout + dry.stderr);
+  assert.match(dry.stdout, /\[dry-run\] 什么都没写/u);
+  assert.match(dry.stdout, /群名      ：项目二群/u, "dry-run 预览含群名");
+  assert.ok(!fs.existsSync(path.join(local, "subs")), "预览零副作用：store 目录都不出现");
+
+  const add = run([...base, "--chat-id", "oc_second", "--chat-name", "项目二群", "--apply"]);
+  assert.equal(add.status, 0, add.stdout + add.stderr);
+  const namedEntry = JSON.parse(fs.readFileSync(storeFile, "utf-8")).subscriptions[0];
+  assert.equal(namedEntry.schema_version, "1.1");
+  assert.equal(namedEntry.chat_name, "项目二群");
+  assert.equal(namedEntry.subscription_id, stableControlId("subscription", legacyEndpointId({ runtime: "claude", agentUid: TPL26.agent_uid }), stableControlId("domain", "claude", "/p1"), "oc_second", TPL26.agent_uid), "chat_name 不进 id：与无群名登记同 id");
+  assert.equal(validateSubscription(namedEntry).ok, true);
+  // 无 --chat-name 的登记照旧 1.0（既有形状一个字节没动）
+  const plainAdd = run([...base, "--chat-id", "oc_plain", "--apply"]);
+  assert.equal(plainAdd.status, 0, plainAdd.stdout + plainAdd.stderr);
+  const plainEntry = JSON.parse(fs.readFileSync(storeFile, "utf-8")).subscriptions.find((s) => s.scope.chat_id === "oc_plain");
+  assert.deepEqual([plainEntry.schema_version, "chat_name" in plainEntry], ["1.0", false]);
+  // 寻址动作带 --chat-name 拒（--freshness-ms 同款先例：参数层就拒，退出 2）
+  const misuse = run([...base, "--chat-id", "oc_second", "--pause", "--chat-name", "改名"]);
+  assert.deepEqual([misuse.status, misuse.stderr.includes("chat_name_only_on_add")], [2, true], misuse.stdout + misuse.stderr);
+  // 同四元组 keyed 第二条带不同群名：两条并存、各带各的群名、id 各自独立
+  const keyed = run([...base, "--chat-id", "oc_second", "--instance-key", "k2", "--chat-name", "二号键群", "--apply"]);
+  assert.equal(keyed.status, 0, keyed.stdout + keyed.stderr);
+  const both = JSON.parse(fs.readFileSync(storeFile, "utf-8")).subscriptions.filter((s) => s.scope.chat_id === "oc_second");
+  assert.deepEqual(both.map((s) => s.chat_name), ["项目二群", "二号键群"]);
+  assert.notEqual(both[0].subscription_id, both[1].subscription_id);
+});
+
+test("FR-2.6 单 3：展示三级群名 —— 条目自带 > 模板匹配 > 群名不可用；store 缺席输出逐字节同今天；store 损坏不崩、退 legacy 并注明", () => {
+  // 视图单元：三级判据一次钉全（模板群名只许给它确实对应的那条）
+  const model = { ok: true, subscriptions: [
+    { status: "active", version: 1, chat_name: "登记名", scope: { chat_id: "oc_a", sender_ids: ["u"], event_types: ["im.message.receive"] }, constraints: { freshness_ms: 600000 } },
+    { status: "active", version: 1, scope: { chat_id: "oc_b", sender_ids: ["u"], event_types: ["im.message.receive"] }, constraints: { freshness_ms: 600000 } },
+    { status: "active", version: 1, scope: { chat_id: "oc_c", sender_ids: ["u"], event_types: ["im.message.receive"] }, constraints: { freshness_ms: 600000 } },
+  ], pending_bindings: [] };
+  const view = subscriptionDetails(model, { groupName: "模板群", templateChatId: "oc_b" });
+  assert.deepEqual(view.items.map((s) => s.groupName), ["登记名", "模板群", null], "条目自带 > 模板匹配 > 不可用");
+  assert.match(renderSubscriptions(view), /群名不可用/u, "第三级落在渲染");
+
+  // 真入口（spawn，沙箱 HOME）：
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-fr26-view-"));
+  const templateFile = path.join(local, "chain-config.json");
+  const TPL26 = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  fs.writeFileSync(templateFile, JSON.stringify(TPL26));
+  const root = path.join(local, "project"); fs.mkdirSync(root);
+  const registryFile = path.join(local, "registry.json");
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "view", root, name: "群名演示", root_message_id: "om_v", expires_at: "2099-01-01T00:00:00Z", session_id: "aily_v", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z" }] }));
+  const run = () => spawnSync(process.execPath, [path.resolve("scripts", "feishu-subscribe.mjs"), "--project", root], { encoding: "utf-8", env: { ...process.env, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile } });
+  const noStore = run();
+  assert.equal(noStore.status, 0, noStore.stderr);
+  // **store 文件缺席 = 今天**：整段 stdout 逐字节比对（root 内插）——装不装 store 由 HOME 环境决定。
+  assert.equal(noStore.stdout, "项目      " + root + "\n" + [
+    "订阅状态  活动 · v1",
+    "订阅群    模板群",
+    "授权发送者 1 个（只出数量，不出身份）",
+    "发送者角色 owner 1 · operator 0 · participant 0（入站判定按角色 × 风险等级 × 模式：Mapping 只放 owner；Dialogue 的对话对 operator / participant 开，控制与授权类只认 owner）",
+    "事件范围  im.message.receive",
+    "新鲜度    10 分钟内的事件才受理",
+    "",
+    "本命令只读。**发送者角色表可以登记**（node scripts/register-sender.mjs，改链路模板的 senders；写入需 owner 逐次授权）。",
+    "**订阅控制面的登记入口已开放**（node scripts/register-subscription.mjs，落盘独立 store；写入需 owner 逐次授权），但 store **尚未接入权威投影与切流** —— 落盘暂不改变生产认领 / 路由；本命令把已登记的条目并进展示（FR-2.6 单 3，只读）。",
+    "",
+  ].join("\n"), "无 store 机器的输出与以前逐字节一致");
+
+  const cli = (args) => spawnSync(process.execPath, [path.resolve("scripts", "register-subscription.mjs"), ...args], { encoding: "utf-8", env: { ...process.env, HOME: local } });
+  const storeFile = path.join(local, ".claude", "feishu-bridge", "subscriptions.json");
+  const base = ["--store", storeFile, "--template", templateFile, "--runtime", "claude", "--domain-key", root];
+  // 第一级：同四元组登记自带群名的条目 → 盖过模板匹配
+  const add = cli([...base, "--chat-id", TPL26.chat_id, "--chat-name", "登记名", "--apply"]);
+  assert.equal(add.status, 0, add.stdout + add.stderr);
+  // 第二级之外：同域另一个群（chat_id ≠ 模板）登记时不带群名 → 群名不可用，模板群名不许套给它
+  const addOther = cli([...base, "--chat-id", "oc_other", "--apply"]);
+  assert.equal(addOther.status, 0, addOther.stdout + addOther.stderr);
+  const withStore = run();
+  assert.equal(withStore.status, 0, withStore.stderr);
+  assert.match(withStore.stdout, /订阅群    登记名/u, "第一级：条目自带的群名盖过模板匹配");
+  assert.match(withStore.stdout, /订阅群    群名不可用/u, "别的群不吃模板群名");
+  assert.doesNotMatch(withStore.stdout, /控制面 store 损坏/u);
+  // 损坏 store：不崩、退 legacy、注明问题数 —— 展示诊断正是 fail-closed 的 legacy 字段存在的目的
+  fs.writeFileSync(storeFile, "{oops");
+  const damaged = run();
+  assert.equal(damaged.status, 0, "展示不崩：" + damaged.stderr);
+  assert.match(damaged.stdout, /订阅群    模板群/u, "退回 legacy（模板匹配那一级还在）");
+  assert.match(damaged.stdout, /控制面 store 损坏（1 个问题），已按 legacy 显示。/u);
+});
+
 test("控制事务的换绑窗口（评审 #97）：事务锁内核验通过之后、策略写锁取得之前登记表换了绑定 → 写锁内前置条件拒写、模式不变、不落 consumed、入口非零", () => {
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-drift-"));
   const root = path.join(local, "project"); const bin = path.join(local, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);

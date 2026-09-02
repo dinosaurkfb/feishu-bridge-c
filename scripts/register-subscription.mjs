@@ -3,7 +3,7 @@
  * 订阅登记（FR-2.6 单 1）：往机器级订阅控制面 store 里 增 / 停 / 恢复 / 删 一条订阅。
  *
  *   node scripts/register-subscription.mjs --store <subscriptions.json 绝对路径> --template <chain-config.json 绝对路径> \
- *     --runtime claude|codex --domain-key <项目根或业务域> --chat-id <oc_…> [--freshness-ms <N>] [--instance-key <key>] [--apply]
+ *     --runtime claude|codex --domain-key <项目根或业务域> --chat-id <oc_…> [--freshness-ms <N>] [--instance-key <key>] [--chat-name <群名>] [--apply]
  *   node scripts/register-subscription.mjs … --pause|--resume|--remove [--instance-key <key> | --subscription-id <id>] [--apply]
  *
  * · 默认只预览；写入是改订阅控制面，**需要 owner（Frank）逐次授权**后才 --apply。
@@ -15,6 +15,8 @@
  * · 暂停 / 恢复 / 删除的寻址：四元组下恰一条直接认；多条时用 `--instance-key <key>` 或
  *   `--subscription-id <id>` 精确点名（歧义会列出候选）；精确寻址仍核对条目属于当前
  *   链 / 域 / 群（subscription_context_mismatch）。
+ * · --chat-name（FR-2.6 单 3）：登记时录入的群名，仅展示用、不进 id 哈希；只在新增时
+ *   可给，寻址动作给了就拒；给了任一 1.1 字段（instance_key 或 chat_name）条目就是 1.1。
  * · --apply 走 store 的唯一写事务（subscription-store.mjs）：锁内重读重算 → 逐条校验 →
  *   备份 → 临时文件 + rename 原子写 → 逐字读回；维护门照 register-sender 的样子在门前。
  * · 不认领、不路由、不碰登记表：本命令只写控制面；切流另有单。
@@ -29,13 +31,13 @@ import {
 } from "./subscription-store.mjs";
 
 export function parseRegisterSubscriptionArgs(argv) {
-  const out = { store: null, template: null, runtime: null, domainKey: null, chatId: null, freshnessMs: null, instanceKey: null, subscriptionId: null, pause: false, resume: false, remove: false, apply: false };
+  const out = { store: null, template: null, runtime: null, domainKey: null, chatId: null, freshnessMs: null, instanceKey: null, subscriptionId: null, chatName: null, pause: false, resume: false, remove: false, apply: false };
   const seen = new Set();
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (seen.has(a)) return { ok: false, reason: "duplicate_argument", argument: a };   // 受控写入口：重复参数不许"以后一个为准"
     if (a === "--apply" || a === "--pause" || a === "--resume" || a === "--remove") { seen.add(a); out[a.slice(2)] = true; continue; }
-    if (["--store", "--template", "--runtime", "--domain-key", "--chat-id", "--freshness-ms", "--instance-key", "--subscription-id"].includes(a)) {
+    if (["--store", "--template", "--runtime", "--domain-key", "--chat-id", "--freshness-ms", "--instance-key", "--subscription-id", "--chat-name"].includes(a)) {
       const v = argv[i + 1];
       if (typeof v !== "string" || v.startsWith("--") || v.length === 0) return { ok: false, reason: a + "_value_required" };
       seen.add(a);
@@ -43,6 +45,7 @@ export function parseRegisterSubscriptionArgs(argv) {
       else if (a === "--runtime") out.runtime = v; else if (a === "--domain-key") out.domainKey = v;
       else if (a === "--chat-id") out.chatId = v;
       else if (a === "--instance-key") out.instanceKey = v;
+      else if (a === "--chat-name") out.chatName = v;
       else if (a === "--subscription-id") out.subscriptionId = v;
       else {
         if (!/^\d+$/u.test(v) || Number(v) <= 0) return { ok: false, reason: "freshness_ms_shape" };
@@ -60,6 +63,9 @@ export function parseRegisterSubscriptionArgs(argv) {
   const actions = ["pause", "resume", "remove"].filter((k) => out[k]);
   if (actions.length > 1) return { ok: false, reason: "one_action_at_a_time", detail: actions.join(",") };
   if (out.freshnessMs !== null && actions.length) return { ok: false, reason: "freshness_only_on_add" };
+  // --chat-name 与 --freshness-ms 同款先例（FR-2.6 单 3）：只在新增时有意义 —— 寻址动作改的是既有
+  // 条目的状态/存在性，不是它的登记群名；改群名请 remove 后重登记（不提供原地改名）。
+  if (out.chatName !== null && actions.length) return { ok: false, reason: "chat_name_only_on_add" };
   out.action = actions[0] ?? "add";
   // 寻址封闭（评审 #112 裁决）：--subscription-id 只用于寻址既有条目（add 的 id 永远重算）；
   // 与 --instance-key 互斥（一次一种寻址方式）。
@@ -77,7 +83,7 @@ export function previewSubscriptionChange({ change }) {
   if (!store.ok) return { ok: false, reason: "store_invalid", problems: store.problems };
   const planned = planSubscriptionChange({ store: { subscriptions: store.subscriptions }, runtime: change.runtime, template,
     domainKey: change.domainKey, chatId: change.chatId, freshnessMs: change.freshnessMs, action: change.action,
-    instanceKey: change.instanceKey, subscriptionId: change.subscriptionId });
+    instanceKey: change.instanceKey, subscriptionId: change.subscriptionId, chatName: change.chatName });
   return { ok: true, template, planned, absent: store.absent };
 }
 
@@ -102,7 +108,7 @@ if (isDirectRun(import.meta.url)) {
   const parsed = parseRegisterSubscriptionArgs(process.argv.slice(2));
   if (!parsed.ok) {
     process.stderr.write("用法：node scripts/register-subscription.mjs --store <绝对路径> --template <绝对路径> --runtime claude|codex \\\n" +
-      "        --domain-key <项目根或业务域> --chat-id <oc_…> [--freshness-ms <N>] [--instance-key <key>] [--apply]\n" +
+      "        --domain-key <项目根或业务域> --chat-id <oc_…> [--freshness-ms <N>] [--instance-key <key>] [--chat-name <群名>] [--apply]\n" +
       "      node scripts/register-subscription.mjs … --pause|--resume|--remove [--instance-key <key> | --subscription-id <id>] [--apply]\n" +
       "      同四元组多条时 pause/resume/remove 必须用 --instance-key 或 --subscription-id 精确点名（" + parsed.reason + (parsed.detail ? "：" + parsed.detail : "") + "）\n");
     process.exit(2);
@@ -127,6 +133,7 @@ if (isDirectRun(import.meta.url)) {
   if (entry?.scope) {
     process.stdout.write("范围      ：chat " + entry.scope.chat_id + " · transport " + entry.scope.transport_open_id +
       " · 发送者 " + entry.scope.sender_ids.join(",") + " · " + entry.scope.event_types.join(",") + "\n");
+    if (entry?.chat_name) process.stdout.write("群名      ：" + entry.chat_name + "\n");
     process.stdout.write("时效      ：" + entry.constraints.freshness_ms + " ms · 状态 " + entry.status + " · v" + entry.version + "\n");
   }
   if (!planned.changed) { process.stdout.write("已经是这样，没动。\n"); process.exit(0); }
@@ -134,7 +141,7 @@ if (isDirectRun(import.meta.url)) {
   { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门
   const done = applySubscriptionChange({
     file: parsed.store,
-    change: { action: parsed.action, runtime: parsed.runtime, template: preview.template, domainKey: parsed.domainKey, chatId: parsed.chatId, freshnessMs: parsed.freshnessMs, instanceKey: parsed.instanceKey, subscriptionId: parsed.subscriptionId },
+    change: { action: parsed.action, runtime: parsed.runtime, template: preview.template, domainKey: parsed.domainKey, chatId: parsed.chatId, freshnessMs: parsed.freshnessMs, instanceKey: parsed.instanceKey, subscriptionId: parsed.subscriptionId, chatName: parsed.chatName },
   });
   const out = describeStoreWrite(done, parsed.store);
   process.stdout.write(out.lines.join("\n") + "\n");

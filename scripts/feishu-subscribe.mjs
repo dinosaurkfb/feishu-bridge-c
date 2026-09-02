@@ -7,7 +7,8 @@
  * 写入需 owner 逐次授权）；**订阅控制面的登记入口也已开放**（FR-2.6 单 1：`register-subscription.mjs`，
  * 落盘到独立 store，同样 owner 逐次授权）—— 但 store **尚未接入权威投影与切流**：落盘暂不改变生产
  * 认领 / 路由（生产调用方仍走纯 legacy 投影；接入是切流单的事，前置是 chat locator 验证与
- * 多订阅歧义的真实样本）。本命令展示的仍是 legacy 投影。
+ * 多订阅歧义的真实样本）。本命令把 store 里已登记的条目并进展示（FR-2.6 单 3，只读；
+ * store 文件缺席的机器输出与以前逐字节一致），生产认领 / 路由仍走纯 legacy 投影。
  *
  * status 第 2 层给的是一行概览；这条命令给全貌 —— 允许哪些发送者、哪些事件类型、
  * 新鲜度约束、有没有待认领的绑定。FR-10 要求 status 能答"subscription 命中范围"，
@@ -27,12 +28,14 @@
  * 用法：node scripts/feishu-subscribe.mjs [--project /abs/dir]
  */
 
+import os from "node:os";
 import path from "node:path";
 import { roleCounts, roleCountsText } from "./sender-roles.mjs";
 
 import { isDirectRun } from "./direct-run.mjs";
 import { buildClaudeSubscriptionProjection } from "./inbound-route.mjs";
-import { claimable } from "./subscription.mjs";
+import { claimable, mergeControlPlaneIntoModel, SUBSCRIPTION_REJECT } from "./subscription.mjs";
+import { loadSubscriptionStore } from "./subscription-store.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
 import { currentBinding } from "./feishu-control.mjs";
 
@@ -74,11 +77,13 @@ export function subscriptionDetails(model, { groupName = null, templateChatId = 
   }
   const items = (model.subscriptions ?? []).map((s) => ({
     status: s.status === "active" ? "活动" : "暂停",
-    // **群名只能用在它确实对应的那条订阅上。**多订阅指向不同群时，
-    // 把模板群名套给每一条，就会把别的群错报成模板群 ——
-    // 那比"群名不可用"糟得多：一个错的名字比没有名字更难发现。
-    groupName: (templateChatId !== null && s.scope?.chat_id === templateChatId)
-      ? groupName : null,
+    // **群名三级（FR-2.6 单 3）：条目自带的 chat_name（1.1 登记时录入，控制面条目才有）>
+    // 模板匹配 > 群名不可用。**多订阅指向不同群时，模板群名只许套给它确实对应的那条 ——
+    // 把模板群名套给每一条，就会把别的群错报成模板群，那比"群名不可用"糟得多：
+    // 一个错的名字比没有名字更难发现。
+    groupName: (typeof s.chat_name === "string" && s.chat_name.trim())
+      ? s.chat_name
+      : ((templateChatId !== null && s.scope?.chat_id === templateChatId) ? groupName : null),
     senderCount: (s.scope?.sender_ids ?? []).length,
     roleCounts: roleCounts(s.scope?.sender_roles ?? (s.scope?.sender_ids ?? []).map((id) => ({ open_id: id, role: "owner" }))),
     eventTypes: [...(s.scope?.event_types ?? [])],
@@ -125,16 +130,29 @@ function main() {
   const loaded = loadChainTemplate();
   const tpl = loaded?.ok ? (loaded.template ?? loaded) : null;
 
+  // FR-2.6 单 3：展示口把 store 的控制面条目并进读模型 —— loadSubscriptionStore 读生产默认路径
+  // （HOME 环境决定，测试沙箱 HOME），合并走 buildLegacySubscriptionReadModel({ controlPlane })
+  // 同一条 mergeControlPlaneIntoModel 路径。**文件缺席 = 今天**：同一对象，输出逐字节一致。
+  // 损坏不崩：合并 fail-closed 时退回它的 legacy 字段（展示诊断正是这个字段存在的目的），
+  // 并附一行说明；热路径（认领 / 路由）一行不碰。
+  const legacy = buildClaudeSubscriptionProjection({ projectRoot: root });
+  const store = loadSubscriptionStore({ file: path.join(os.homedir(), ".claude", "feishu-bridge", "subscriptions.json") });
+  const merged = store.absent ? legacy
+    : mergeControlPlaneIntoModel(legacy, store.ok
+      ? { ok: true, subscriptions: store.subscriptions }
+      : { ok: false, problems: store.problems });
+  const view = merged.ok ? merged : (merged.legacy ?? merged);
+
   console.log("项目      " + root);
   console.log(renderSubscriptions(
-    subscriptionDetails(
-      buildClaudeSubscriptionProjection({ projectRoot: root }),
-      { groupName: tpl?.chat_name ?? null, templateChatId: tpl?.chat_id ?? null },
-    ),
+    subscriptionDetails(view, { groupName: tpl?.chat_name ?? null, templateChatId: tpl?.chat_id ?? null }),
     { source: currentBinding({ root }).source ?? null },
   ));
+  if (!merged.ok && merged.reason === SUBSCRIPTION_REJECT.CONTROL_PLANE_INVALID) {
+    console.log("\n注意：控制面 store 损坏（" + merged.problems.length + " 个问题），已按 legacy 显示。");
+  }
   console.log("\n本命令只读。**发送者角色表可以登记**（node scripts/register-sender.mjs，改链路模板的 senders；写入需 owner 逐次授权）。");
-  console.log("**订阅控制面的登记入口已开放**（node scripts/register-subscription.mjs，落盘独立 store；写入需 owner 逐次授权），但 store **尚未接入权威投影与切流** —— 落盘暂不改变生产认领 / 路由；本命令展示的仍是 legacy 投影。");
+  console.log("**订阅控制面的登记入口已开放**（node scripts/register-subscription.mjs，落盘独立 store；写入需 owner 逐次授权），但 store **尚未接入权威投影与切流** —— 落盘暂不改变生产认领 / 路由；本命令把已登记的条目并进展示（FR-2.6 单 3，只读）。");
 }
 
 if (isDirectRun(import.meta.url)) main();

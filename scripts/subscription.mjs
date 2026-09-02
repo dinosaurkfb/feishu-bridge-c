@@ -11,8 +11,13 @@ import { roleEntriesProblem, senderRolesProblem, senderTable } from "./sender-ro
 
 export const SUBSCRIPTION_SCHEMA_VERSION = "1.0";
 // 1.1（评审 #112 裁决）：可选 instance_key 进 id 哈希，同四元组多条合法并存；1.0 条目照旧。
+// 1.1 另有可选 chat_name（FR-2.6 单 3）：登记时录入的群名，**不进 id 哈希** —— 改群名不换身份，
+// 身份仍由四元组（+ instance_key）决定。
 export const SUBSCRIPTION_SCHEMA_VERSION_KEYED = "1.1";
 export const INSTANCE_KEY_SHAPE = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
+// chat_name 的取值域（FR-2.6 单 3）：非空 string、≤64 字符、trim 后非空；形状上下界给 schema，
+// 关系性约束（trim）只有 validateSubscription 一个判据。
+export const CHAT_NAME_MAX_LENGTH = 64;
 
 /**
  * 订阅身份公式的唯一实现（评审 #112 裁决定形）：
@@ -73,7 +78,7 @@ export function validateSubscription(subscription) {
     for (const k of Object.keys(obj)) if (!allowed.includes(k)) problems.push(label + "extra:" + k);
   };
   closed(subscription, ["schema_version", "artifact_type", "subscription_id", "version",
-    "endpoint_id", "domain_id", "status", "scope", "constraints", "instance_key"], "");
+    "endpoint_id", "domain_id", "status", "scope", "constraints", "instance_key", "chat_name"], "");
   closed(subscription?.scope, ["agent_uid", "transport_open_id", "chat_id", "sender_ids",
     "event_types", "sender_roles"], "scope.");
   closed(subscription?.constraints, ["freshness_ms"], "constraints.");
@@ -84,6 +89,14 @@ export function validateSubscription(subscription) {
     if (!version11) problems.push("instance_key_needs_1.1");
     else if (typeof subscription.instance_key !== "string" || !INSTANCE_KEY_SHAPE.test(subscription.instance_key)) {
       problems.push("instance_key");
+    }
+  }
+  // chat_name 与 instance_key 同款对称（FR-2.6 单 3）：1.0 不许带；1.1 可带，取值域封闭。
+  if (subscription?.chat_name !== undefined) {
+    if (!version11) problems.push("chat_name_needs_1.1");
+    else if (typeof subscription.chat_name !== "string" ||
+        subscription.chat_name.length > CHAT_NAME_MAX_LENGTH || !subscription.chat_name.trim()) {
+      problems.push("chat_name");
     }
   }
   if (subscription?.artifact_type !== SUBSCRIPTION_ARTIFACT_TYPE) problems.push("artifact_type");
@@ -263,7 +276,7 @@ export function buildLegacySubscriptionReadModel({
  * · fail-closed：控制面整体损坏（或合并时发现任一条目校验不过）→ **整份控制面不作数**，
  *   subscriptions 退回纯 legacy，问题记进 control_plane.problems 可诊断，不静默丢。
  */
-function mergeControlPlaneIntoModel(model, controlPlane) {
+export function mergeControlPlaneIntoModel(model, controlPlane) {
   if (controlPlane == null) return model;
   // **文件在场但说不清 ≠ 没装控制面**（评审 PR #112 P1：这里退回纯 legacy 是 fail-open ——
   // 暂停 / 收紧过的订阅会在文件损坏时重新开放）。权威读取必须拒绝；展示层要 legacy 诊断

@@ -24,6 +24,14 @@
  * 锁没交还要在结果里带 lockUncleared）。不复用那个函数本身，因为它把
  * loadChainTemplate / validateChainTemplate 写死在校验位上 —— 这里存的是订阅条目，
  * 校验器是 validateSubscription。锁原语与 routes / registry / template 同一套 symlink 锁。
+ *
+ * FR-2.6 单 4（审计）：每次成功的变更在锁释放前向 `<store>.audit.jsonl` 追加一行
+ * （O_APPEND 单次 write，append-only）：{ schema_version, at, action, subscription_id,
+ * version_after, store_bytes_sha256（写盘后整文件哈希前 16）}。**不夹带敏感值**：
+ * 不写 chat_name / sender_ids 明细，id 与 action 已够对账。审计写失败不回滚 store
+ * （变更已成立），结果带 auditUnwritten，CLI 据此退非零 —— 成功但要人知道，
+ * 不是静默成功。幂等（changed:false）与拒绝不写行；同一事务只写一行。
+ * loadSubscriptionAudit 是只读对账入口（坏行计入 problems 不吞），本单不接展示。
  */
 
 import crypto from "node:crypto";
@@ -134,6 +142,59 @@ export function mergedSubscriptionView({ legacy } = {}) {
   return merged.ok
     ? { view: merged, corrupt: null }
     : { view: merged.legacy ?? legacy, corrupt: merged.problems ?? null };
+}
+
+/**
+ * FR-2.6 单 4：审计 jsonl 的只读对账入口（本单只给函数 + 测试，不接展示；以后 doctor / 展示用）。
+ *
+ * fd 绑定读（open 一次、从 fd 读全部，不在路径上二猜）；与 store 同款纪律：不认符号链接
+ * 与非普通文件。坏行不吞：逐行解析，JSON 不合法 / 形状说不清的行计入 problems
+ * （带行号），好行照常返回 —— 对账时宁可冗余也不静默丢。
+ * 文件缺席 = 还没变更过（absent），与 loadSubscriptionStore 的缺席语义同款。
+ */
+export function loadSubscriptionAudit({ file } = {}) {
+  if (typeof file !== "string" || !path.isAbsolute(file)) return { ok: false, reason: "audit_file_required_absolute" };
+  const auditFile = file + ".audit.jsonl";
+  let afd;
+  try {
+    const st = fs.lstatSync(auditFile);
+    if (!st.isFile()) return { ok: false, reason: "audit_not_regular_file", detail: st.isSymbolicLink() ? "是符号链接（别名）；请用真实路径" : "不是普通文件" };
+    afd = fs.openSync(auditFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch (err) {
+    if (err.code === "ENOENT") return { ok: true, absent: true, events: [], problems: [] };
+    return { ok: false, reason: "audit_unreadable", detail: String(err.code ?? err.message) };
+  }
+  let text;
+  try {
+    const chunks = [];
+    const buf = Buffer.alloc(64 * 1024);
+    for (;;) {
+      const n = fs.readSync(afd, buf, 0, buf.length, null);
+      if (n <= 0) break;
+      chunks.push(Buffer.from(buf.subarray(0, n)));
+    }
+    text = Buffer.concat(chunks).toString("utf-8");
+  } catch (err) {
+    return { ok: false, reason: "audit_unreadable", detail: String(err.code ?? err.message) };
+  } finally { try { fs.closeSync(afd); } catch { /* 已关 */ } }
+  const events = [];
+  const problems = [];
+  const lines = text.split("\n");
+  if (lines.length && lines[lines.length - 1] === "") lines.pop();
+  for (let i = 0; i < lines.length; i += 1) {
+    const raw = lines[i];
+    if (raw.trim() === "") continue;
+    let event = null;
+    try { event = JSON.parse(raw); } catch { problems.push("line:" + (i + 1) + ":json_invalid"); continue; }
+    if (!event || typeof event !== "object" || Array.isArray(event) ||
+        typeof event.action !== "string" || typeof event.subscription_id !== "string" ||
+        typeof event.at !== "string") {
+      problems.push("line:" + (i + 1) + ":shape_invalid");
+      continue;
+    }
+    events.push(event);
+  }
+  return { ok: problems.length === 0, absent: false, events, problems };
 }
 
 /**
@@ -341,7 +402,30 @@ export function applySubscriptionChange({ file, change, now = new Date() } = {})
     let back;
     try { back = fs.readFileSync(file, "utf-8"); } catch (err) { return (result = { ok: false, reason: "readback_failed", detail: err.message, backup }); }
     if (back !== body) return (result = { ok: false, reason: "readback_mismatch", backup });
-    return (result = { ok: true, changed: true, entry: planned.entry ?? null, before: planned.before ?? null, backup });
+    result = { ok: true, changed: true, entry: planned.entry ?? null, before: planned.before ?? null, backup };
+    // FR-2.6 单 4：审计在 rename + 读回校验之后、释放锁之前追加（fd O_APPEND 单次 write）。
+    // 写盘后整文件哈希：body 与读回逐字相等已验，从 body 算即可 —— 行里只放前 16 位，对账够用。
+    // 写失败不回滚 store（变更已成立）：auditUnwritten 带原因，CLI 退非零让人来对账。
+    try {
+      const digest16 = crypto.createHash("sha256").update(Buffer.from(body, "utf-8")).digest("hex").slice(0, 16);
+      const auditLine = JSON.stringify({
+        schema_version: "1.0",
+        at: now.toISOString(),
+        action: change.action,
+        subscription_id: planned.entry?.subscription_id ?? planned.before?.subscription_id ?? null,
+        version_after: planned.entry?.version ?? null,
+        store_bytes_sha256: digest16,
+      }) + "\n";
+      const auditFile = file + ".audit.jsonl";
+      const afd = fs.openSync(auditFile, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND, 0o600);
+      try {
+        fs.writeSync(afd, auditLine);
+        fs.fsyncSync(afd);
+      } finally { try { fs.closeSync(afd); } catch { /* 已关 */ } }
+    } catch (err) {
+      result.auditUnwritten = "audit_append_failed:" + String(err.code ?? err.message);
+    }
+    return result;
   } finally {
     let rel;
     try { rel = releasePublishLock(lockDir); } catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }

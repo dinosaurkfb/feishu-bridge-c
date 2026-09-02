@@ -13,7 +13,7 @@ import path from "node:path";
 
 import { loadChainTemplate, materializeProjectConfig } from "../chain-template.mjs";
 import { extractMentionIds } from "../selector.mjs";
-import { isOffTemplateChatTurn } from "../inbound-route.mjs";
+import { isOffTemplateChatTurn, isPrivateChatTurn } from "../inbound-route.mjs";
 import { acquirePublishLock, isUnder, releasePublishLock } from "../registry.mjs";
 
 // 只有"别人正拿着"才是 registry_busy；锁目录不可写之类的 I/O 错误要原样报出去（评审探针：曾被折叠成 busy 静默跳过）。
@@ -1037,9 +1037,10 @@ export function shadowCodexFirstClaim({
 export function evaluatePromotion({ event, template, pending, now = Date.now(), env = process.env }) {
   if (!pending?.ok) return { ok: false, reason: pending?.reason ?? "no_pending_binding" };
   if (event?.sender_id !== template?.frank_sender_id) return { ok: false, reason: "sender_not_frank" };
-  if (!extractMentionIds(event?.content).includes(template?.transport_open_id)) {
-    // 评审 PR #111 P2：unverified locator 的 mismatch 不改判定，只标出来让回执带诊断 hint
-    //（与 Claude 链 evaluatePromotion 同一纪律，判据同一份 isOffTemplateChatTurn）。
+  if (!extractMentionIds(event?.content).includes(template?.transport_open_id) &&
+      !isPrivateChatTurn({ template, env })) {
+    // 私聊豁免 @ 闸（#12 重开 #111 A 项，真机验证签名）；非私聊 off-template（外部群话题 /
+    // 模板 locator 过期）仍拒 + hint，与 Claude 链同一纪律。
     return { ok: false, reason: "transport_not_mentioned",
       off_template_hint: isOffTemplateChatTurn({ template, env }) };
   }

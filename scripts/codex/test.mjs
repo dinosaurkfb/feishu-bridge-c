@@ -9120,7 +9120,9 @@ test("Codex 真入口：off-template mismatch + 无 @ → 拒绝回执带诊断 
         AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "aily_unbound_p2p", AILY_CLI_RUN_ID: "run_hint", FAKE_AILY_ENVELOPE: envelope, ...extraEnv },
     });
   };
-  const mism = run({ AILY_CLI_CHANNEL_CHAT_ID: "oc_direct_x" });
+  // #12：mismatch 但 thread 缺失的「私聊」不再走拒 + hint，改走私聊 chat 回答（见 #12 Codex 链测试，
+  // 那里有假 claude）。off-template 拒 + hint 现在只作用于「外部群话题」—— mismatch 且 thread 有值。
+  const mism = run({ AILY_CLI_CHANNEL_CHAT_ID: "oc_direct_x", AILY_CLI_CHANNEL_THREAD_ID: "omt_hint_x" });
   assert.equal(mism.status, 0, mism.stdout + mism.stderr);
   assert.match(mism.stdout, /没有真实 @ M5Codex/u, "Codex 化措辞不变：" + mism.stdout);
   assert.match(mism.stdout, /诊断：本轮频道与登记群不一致/u, "hint 不许被本地重建文案丢掉：" + mism.stdout);
@@ -9734,6 +9736,60 @@ test("#R10 Codex 真入口 accepted：成功投递落下 disposition=accepted �
   assert.equal(row.schema_version, "1.0");
   assert.equal(typeof row.message_id, "string", "message_id 落哈希不落明文");
   assert.doesNotMatch(JSON.stringify(row), /oc_|ou_|om_/u, "整行不泄任何 locator 明文前缀");
+});
+
+// ── #12 私聊判据：Codex 链真入口行为（chat≠模板 + thread 缺失 → 豁免 @ 起模型；thread 有值 → 照旧拒 + hint）
+const codexPrivateHarness = (registry = true) => {
+  const home = temp();
+  const root = temp();
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  if (registry) writeRegistryFixtureUnvalidated(
+    [makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" })],
+    path.join(home, "registry.json"));
+  const bin = path.join(home, "bin"); fs.mkdirSync(bin, { recursive: true });
+  const claudeLog = path.join(home, "claude-argv.jsonl");
+  // Codex 链 chatTurn 先判路径可用（--version）再答（-p），两份请求都要能对；Claude 链只答 -p。
+  fs.writeFileSync(path.join(bin, "claude"), ["#!/usr/bin/env node",
+    "const fs = require('node:fs'); fs.appendFileSync(" + JSON.stringify(claudeLog) + ", JSON.stringify(process.argv.slice(2)) + '\\n');",
+    "if (process.argv.includes('--version')) { process.stdout.write('1.2.3'); process.exit(0); }",
+    "process.stdout.write('回答：' + process.argv[process.argv.indexOf('-p') + 1].slice(0, 40) + '\\n');",
+  ].join("\n") + "\n", { mode: 0o700 });
+  const seq = { n: 0 };
+  const run = (content, opts = {}) => {
+    seq.n += 1;
+    const event = { message_id: "msg_cx_private_" + seq.n, session_id: "sess_private", sender_id: opts.sender ?? TEMPLATE.frank_sender_id, created_at_ms: Date.now(), content };
+    const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home, PATH: bin + path.delimiter + process.env.PATH, AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, FEISHU_BRIDGE_ENVELOPE: JSON.stringify(event) };
+    delete env.AILY_CLI_CHANNEL_CHAT_ID; delete env.AILY_CLI_CHANNEL_THREAD_ID;
+    if (opts.chat !== undefined) env.AILY_CLI_CHANNEL_CHAT_ID = opts.chat;
+    if (opts.thread !== undefined) env.AILY_CLI_CHANNEL_THREAD_ID = opts.thread;
+    return { spawn: spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "inbound.mjs")], { encoding: "utf-8", env }), claudeLog };
+  };
+  return { home, run };
+};
+
+// Codex 链 chatReply 用 claude CLI（与 Claude 链同路），两条链在「私聊会话、外面 @」上必须一致；
+// 这里只抽 Codex 链真入口：私聊豁免（无 @ 起模型）、外部群话题拒 + hint、群里拒但不带 hint。
+test("#12 Codex 链：私聊（chat≠模板 + thread 缺失）豁免 @ 闸起 claude 回答；外部群话题照旧拒 + hint；群消息不变", () => {
+  const h = codexPrivateHarness();
+  // ① 私聊（≠ 模板 chat_id + thread 缺失）owner + 无 @ → 先判路径可用（--version）再起模型（-p）
+  const r1 = h.run("帮我看看方案", { chat: "oc_cx_private" });
+  assert.equal(r1.spawn.status, 0, r1.spawn.stdout + r1.spawn.stderr);
+  assert.match(r1.spawn.stdout, /^回答：帮我看看方案/mu, "Codex 私聊走 chat 回答：" + r1.spawn.stdout);
+  assert.doesNotMatch(r1.spawn.stdout, /没有真实 @|已拒绝/u);
+  const log1 = fs.readFileSync(r1.claudeLog, "utf-8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  assert.deepEqual(log1.map((a) => a[0]), ["--version", "-p"], "先判路径可用（--version）再答（-p）");
+  assert.equal(log1[1][1], "帮我看看方案", "私聊正文原样给模型");
+  // ② 私聊 + 未登记发送者：角色闸照旧拒，不因私聊豁免改变
+  const r2 = h.run("你好", { sender: "999", chat: "oc_cx_private" });
+  assert.match(r2.spawn.stdout, /已拒绝 · 发送者不是授权用户/u, r2.spawn.stdout);
+  // ③ 外部群话题（thread 有值）+ 无 @ → 不豁免：照旧拒 + hint（#111 P1 纪律）
+  const r3 = h.run("接着弄", { chat: "oc_cx_ext", thread: "omt_cx_thread" });
+  assert.match(r3.spawn.stdout, /已拒绝 · 没有真实 @/u, r3.spawn.stdout);
+  assert.match(r3.spawn.stdout, /诊断：本轮频道与登记群不一致，未接入的群/u, "外部群话题要带 hint：" + r3.spawn.stdout);
+  // ④ 群（= 模板 chat）+ 无 @ → 照旧拒且不带 hint（行为一字不变）
+  const r4 = h.run("接着弄", { chat: TEMPLATE.chat_id });
+  assert.match(r4.spawn.stdout, /已拒绝 · 没有真实 @/u, r4.spawn.stdout);
+  assert.doesNotMatch(r4.spawn.stdout, /诊断：/u, "群内无 mismatch 不许带 hint：" + r4.spawn.stdout);
 });
 
 summarySealed = true;

@@ -23908,6 +23908,11 @@ test("#R10 判据收紧（P2-1）+ accepted 入枚举（P1-1）+ 值域 fuzz（P
   const good = { schema_version: "1.0", at: "2026-09-02T00:00:00.000Z", chain: "claude", message_id: "a".repeat(16), session_sha16: "b".repeat(16), channel_chat_sha16: "c".repeat(16), channel_thread_sha16: null, matches_template_chat: true, disposition: "bound" };
   assert.equal(channelSampleProblem(good).length, 0, "规范行 0 问题");
   assert.equal(channelSampleProblem({ ...good, disposition: "accepted" }).length, 0, "P1-1：accepted 在枚举内，不再被当坏 disposition");
+  // 评审 #117 三轮：数组经正则隐式转串曾被放行 —— typeof 先卡
+  assert.equal(channelSampleProblem({ ...good, disposition: ["rejected:transport_not_mentioned"] }).includes("disposition"), true,
+    "数组 disposition 必须被拒（隐式转串不许放行）");
+  assert.equal(channelSampleProblem({ ...good, disposition: { toString: () => "chat" } }).includes("disposition"), true,
+    "对象 disposition 同拒");
   // P2-1：缺毫秒的 2026-09-02T00:00:00Z 不再被宽版放行为规范形式
   assert.equal(channelSampleProblem({ ...good, at: "2026-09-02T00:00:00Z" }).some((p) => p === "at"), true, "缺毫秒必须被拒：" + channelSampleProblem({ ...good, at: "2026-09-02T00:00:00Z" }));
   assert.equal(channelSampleProblem({ ...good, at: "2026-09-02T00:00:00.000Z" }).some((p) => p === "at"), false, "带毫秒的规范形式放行");
@@ -23950,6 +23955,20 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
   // 非绝对路径直接拒
   assert.equal(appendChannelSample({ file: "relative.jsonl", event: base.event, disposition: "bound" }).ok, false);
   assert.equal(channelDisposition("accepted", undefined), "accepted");
+  // 短写/零写注入（评审 #117 三轮 P2）：writeSync 返回 0 / 1 都必须受控失败 —— 删掉
+  // written !== buf.length 判据这两支就红
+  const realWriteSync = fs.writeSync;
+  try {
+    const before0 = loadChannelSamples({ file: wf }).rows.length;
+    fs.writeSync = () => 0;
+    const zeroW = appendChannelSample({ ...base, event: { message_id: "om_w3", session_id: "s", created_at_ms: 1750000000000 }, disposition: "chat" });
+    assert.equal(zeroW.ok, false, "零写必须受控失败：" + JSON.stringify(zeroW));
+    fs.writeSync = () => 1;
+    const shortW = appendChannelSample({ ...base, event: { message_id: "om_w4", session_id: "s", created_at_ms: 1750000000000 }, disposition: "chat" });
+    assert.equal(shortW.ok, false, "短写（1 字节）必须受控失败：" + JSON.stringify(shortW));
+    fs.writeSync = realWriteSync;
+    assert.equal(loadChannelSamples({ file: wf }).rows.length, before0, "受控失败不落半行（好行数不变）");
+  } finally { fs.writeSync = realWriteSync; }
 });
 
 summarySealed = true;

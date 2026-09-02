@@ -83,7 +83,10 @@ export function channelSampleProblem(obj) {
   if (!(obj.matches_template_chat === true || obj.matches_template_chat === false || obj.matches_template_chat === null)) {
     problems.push("matches_template_chat");
   }
-  if (!(DISPOSITION_KINDS.includes(obj.disposition) || REASON_PATTERN.test(obj.disposition))) {
+  // typeof 先卡（评审 #117 三轮）：数组 ["rejected:x"] 会被正则隐式转串放行 —— 封闭类型判据
+  // 必须先确认是字符串再看值域。
+  if (!(typeof obj.disposition === "string" &&
+      (DISPOSITION_KINDS.includes(obj.disposition) || REASON_PATTERN.test(obj.disposition)))) {
     problems.push("disposition");
   }
   return problems;

@@ -22418,6 +22418,15 @@ test("#R12 P1：chat-id 形状判据唯一化（p2pChatIdProblem）—— 模板
   assert.equal(validateChainTemplate({ ...TPL, verified_p2p_chat_ids: ["oc_aa", "oc_aa"] }).ok, false, "重复项 → 拒");
   assert.equal(validateChainTemplate({ ...TPL, verified_p2p_chat_ids: [123] }).ok, false, "非字符串 → 拒");
   assert.equal(validateChainTemplate({ ...TPL, verified_p2p_chat_ids: ["oc_aaaa1111bbbb2222cccc3333dddd4444"] }).ok, true, "真实形状（oc_ + 32 小写 hex）合法");
+  // 评审 #120 三轮：总长边界钉死 —— 64 收、65 拒（量词曾写 {1,64} 使总长可到 67）
+  const len64 = "oc_" + "a".repeat(61);
+  const len65 = "oc_" + "a".repeat(62);
+  assert.equal(p2pChatIdProblem(len64), null, "总长 64 接受");
+  assert.notEqual(p2pChatIdProblem(len65), null, "总长 65 拒绝");
+  assert.equal(validateChainTemplate({ ...TPL, verified_p2p_chat_ids: [len64] }).ok, true, "模板层：总长 64 接受");
+  assert.equal(validateChainTemplate({ ...TPL, verified_p2p_chat_ids: [len65] }).ok, false, "模板层：总长 65 拒绝");
+  assert.equal(planP2pChange({ ...TPL, verified_p2p_chat_ids: [] }, { chatId: len65 }).ok, false, "计划器：总长 65 拒绝");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: [len64] }, env: { AILY_CLI_CHANNEL_CHAT_ID: len64 } }), true, "私聊判据：总长 64 命中");
   // ② CLI 参数层：同一批坏值进 --add / --remove 都拒（退出码 2）
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-r12-shape-"));
   const tplFile = path.join(home, "chain-config.json");

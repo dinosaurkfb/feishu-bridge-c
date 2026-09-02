@@ -108,7 +108,8 @@ const SHAPE = {
  * 是评审建议：真实 chat_id = oc_ + 32 位小写 hex，大写 / 下划线从不是合法值；长度上限挡
  * 超长垃圾值，同时不把未来的合法值挡在外面。
  */
-export const P2P_CHAT_ID_RE = /^oc_[a-z0-9]{1,64}$/u;
+// {1,61}：oc_ 三字符 + 后缀 ≤61 = 总长 ≤64（评审 #120 三轮：量词曾写 64 使总长可到 67，与声明不符）
+export const P2P_CHAT_ID_RE = /^oc_[a-z0-9]{1,61}$/u;
 
 /** 共用形状判据：合法返回 null，非法返回一句人话（含原值，控制字符会被 JSON.stringify 转义）。 */
 export function p2pChatIdProblem(chatId) {

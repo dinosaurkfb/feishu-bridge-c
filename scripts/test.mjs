@@ -23851,6 +23851,107 @@ test("#R11 loadChannelSamples + channelSampleProblem：好行收进 rows，探�
   assert.equal(channelSampleSha16(null), null);
 });
 
+// ─── #R10 评审修复：accepted 真入口 + 写侧守卫 + 判据收紧 ───────────────────────────────
+// P1-1 修复后的真入口：bound 项目收到带真实 @ 的业务消息，无 live session → fresh handOff →
+// finish("accepted")。修复前 disposition="accepted" 不在 DISPOSITION_KINDS 里，\
+// channelSampleProblem 拒掉该行 → 成功投递却一行采样都不落。修复后必须落一行 disposition=accepted。
+const chanAcceptHarness = () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-csa-"));
+  const root = path.join(local, "project");
+  const bin = path.join(local, "bin");
+  fs.mkdirSync(root); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json");
+  const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, auto_publish_on_completion: false }));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{
+    id: "ctl", root, name: "演示", root_message_id: "om_ctl", expires_at: "2099-01-01T00:00:00Z",
+    session_id: "aily_cc1", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z",
+  }] }));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, "claude"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  // handOff 要求 hasPriorSession：先在 transcriptDirFor(root) 种一个 .jsonl
+  const projectsDir = path.join(local, ".claude", "projects", root.replace(/\//g, "-"));
+  fs.mkdirSync(projectsDir, { recursive: true });
+  fs.writeFileSync(path.join(projectsDir, "prior.jsonl"), "{}\n");
+  const run = (messageId) => {
+    const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> 请帮我写一小段测试代码";
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: {
+      id: messageId, sessionID: "aily_cc1", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content,
+    } }) }] });
+    return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
+      env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local,
+        FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+        AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_cc1", AILY_CLI_RUN_ID: "run_acc", FAKE_AILY_ENVELOPE: envelope } });
+  };
+  return { run, sampleFile: path.join(local, ".claude", "feishu-bridge", "inbound", "channel-samples.jsonl") };
+};
+
+test("#R10 Claude 真入口 accepted：成功投递落下 disposition=accepted 采样行，不泄明文", () => {
+  const { run, sampleFile } = chanAcceptHarness();
+  const r = run("msg_acc_c1");
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^已受理 · 演示/u, r.stdout);
+  assert.equal(fs.existsSync(sampleFile), true, "accepted 成功投递后应落采样文件");
+  const rows = fs.readFileSync(sampleFile, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.equal(rows.length, 1, "一行采样");
+  const [row] = rows;
+  assert.equal(row.disposition, "accepted", "P1-1：accepted 必须被枚举接受（" + row.disposition + "）");
+  assert.equal(row.chain, "claude");
+  assert.equal(row.schema_version, "1.0");
+  assert.equal(typeof row.message_id, "string", "message_id 落哈希不落明文");
+  assert.equal(channelSampleSha16("msg_acc_c1"), row.message_id, "message_id 是 msg_acc_c1 的 sha16");
+  assert.doesNotMatch(JSON.stringify(row), /oc_|ou_|om_/u, "整行不泄任何 locator 明文前缀");
+  assert.equal(channelSampleProblem(row).length, 0, "行过封闭校验器");
+});
+
+test("#R10 判据收紧（P2-1）+ accepted 入枚举（P1-1）+ 值域 fuzz（P1-2）", () => {
+  const good = { schema_version: "1.0", at: "2026-09-02T00:00:00.000Z", chain: "claude", message_id: "a".repeat(16), session_sha16: "b".repeat(16), channel_chat_sha16: "c".repeat(16), channel_thread_sha16: null, matches_template_chat: true, disposition: "bound" };
+  assert.equal(channelSampleProblem(good).length, 0, "规范行 0 问题");
+  assert.equal(channelSampleProblem({ ...good, disposition: "accepted" }).length, 0, "P1-1：accepted 在枚举内，不再被当坏 disposition");
+  // P2-1：缺毫秒的 2026-09-02T00:00:00Z 不再被宽版放行为规范形式
+  assert.equal(channelSampleProblem({ ...good, at: "2026-09-02T00:00:00Z" }).some((p) => p === "at"), true, "缺毫秒必须被拒：" + channelSampleProblem({ ...good, at: "2026-09-02T00:00:00Z" }));
+  assert.equal(channelSampleProblem({ ...good, at: "2026-09-02T00:00:00.000Z" }).some((p) => p === "at"), false, "带毫秒的规范形式放行");
+  // P1-2：越界/非法 created_at_ms 与畸形对象，appendChannelSample 绝不抛
+  const fuzzDir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-fuzz-"));
+  const fz = path.join(fuzzDir, "cs.jsonl");
+  const badEvents = [
+    { message_id: "om_f1", session_id: "s", created_at_ms: 1e20 },
+    { message_id: "om_f2", session_id: "s", created_at_ms: NaN },
+    { message_id: "om_f3", session_id: "s", created_at_ms: -1 },
+    { message_id: "om_f4", session_id: "s", created_at_ms: null },
+    "not-an-object",
+    [1, 2, 3],
+    null,
+    undefined,
+  ];
+  for (const ev of badEvents) {
+    let out;
+    assert.doesNotThrow(() => { out = appendChannelSample({ file: fz, event: ev, canonical: null, template: TPL, chain: "claude", disposition: "bound" }); }, "坏输入不应抛：" + JSON.stringify(ev));
+    assert.ok(out && typeof out === "object", "总返回对象，不裸抛");
+  }
+});
+
+test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链接别名被拒、正常路径回读干净", () => {
+  const wDir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-w-"));
+  const wf = path.join(wDir, "cs.jsonl");
+  const base = { file: wf, event: { message_id: "om_w", session_id: "s", created_at_ms: 1750000000000 }, canonical: null, template: TPL, chain: "claude", env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id } };
+  const goodW = appendChannelSample({ ...base, disposition: "accepted" });
+  assert.equal(goodW.ok, true);
+  assert.equal(goodW.row.disposition, "accepted");
+  assert.equal(loadChannelSamples({ file: wf }).rows.length, 1, "字节精确写入 → 回读干净 1 行");
+  // 硬链接别名：写侧同 fd fstat 见 nlink!==1 → 受控失败，不假装成功
+  const wLink = wf + ".hl";
+  try { fs.linkSync(wf, wLink); } catch { /* 环境不支持硬链接 */ }
+  if (fs.existsSync(wLink)) {
+    const hlW = appendChannelSample({ ...base, event: { message_id: "om_w2", session_id: "s", created_at_ms: 1750000000000 }, disposition: "bound" });
+    assert.equal(hlW.ok, false);
+    assert.equal(hlW.reason, "channel_sample_not_regular_file", "硬链接别名在写侧被拒");
+  }
+  // 非绝对路径直接拒
+  assert.equal(appendChannelSample({ file: "relative.jsonl", event: base.event, disposition: "bound" }).ok, false);
+  assert.equal(channelDisposition("accepted", undefined), "accepted");
+});
+
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (TEST_FILTER.length > 0) {

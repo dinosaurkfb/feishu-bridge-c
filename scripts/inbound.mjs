@@ -169,7 +169,9 @@ function ackText(kind, detail) {
 let sampleCtx = null; // { event, canonical, template, chain }
 function recordChannelSample(kind, reason) {
   if (!sampleCtx) return;
-  // appendChannelSample 全包 try/catch，失败只打一行 stderr，绝不阻断主流程。
+  // appendChannelSample 全包 try/catch，失败静默返回 { ok:false, reason }，绝不阻断主流程，
+  // 也绝不污染进程输出（Aily 会把 stdout+stderr 合并进模型上下文）—— 原因只落机器级诊断文件
+  // <dir>/channel-samples.diag.log（见 channel-samples.mjs）。
   appendChannelSample({
     file: CHANNEL_SAMPLES_FILE,
     event: sampleCtx.event,

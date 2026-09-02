@@ -28,6 +28,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { isCanonicalIso } from "./canonical-time.mjs";
 
 const SCHEMA_VERSION = "1.0";
 const CHAINS = Object.freeze(["claude", "codex"]);
@@ -36,8 +37,9 @@ const KEYS = Object.freeze([
   "schema_version", "at", "chain", "message_id", "session_sha16",
   "channel_chat_sha16", "channel_thread_sha16", "matches_template_chat", "disposition",
 ]);
-// 非 rejected 的终态枚举。
-const DISPOSITION_KINDS = Object.freeze(["chat", "control", "bound", "error"]);
+// 非 rejected 的终态枚举。**accepted 必在列**：入站成功投递的收口是 finish("accepted", …)，
+// 缺它会让真正的成功路径产出的行被 channelSampleProblem 拒掉、静默丢行（#R10 评审 P1-1）。
+const DISPOSITION_KINDS = Object.freeze(["chat", "control", "bound", "accepted", "error"]);
 // rejected 的原因词：用形状封闭（snake_case、首字符字母、长度 ≤ 64）而非从判定逻辑里引
 // PROMOTE_REJECT 词表——引词表会让本旁路耦合到判定代码、且未来词表增删就全绿→红。形状足够。
 const REASON_PATTERN = /^rejected:[a-z][a-z0-9_]{0,63}$/;
@@ -87,11 +89,10 @@ export function channelSampleProblem(obj) {
   return problems;
 }
 
-// 规范 ISO：与 toISOString() 同形（以 Z 结尾、长度有界、Date.parse 可观）。拒 not-a-time。
-function isCanonicalIso(s) {
-  return typeof s === "string" && s.length >= 20 && s.length <= 40 &&
-    s.endsWith("Z") && Number.isFinite(Date.parse(s));
-}
+// #R10 评审 P2-1：复用 canonical-time.mjs 的 isCanonicalIso —— 原来的宽版只要求形如
+// “…Z 且 Date.parse 可观”，会把缺毫秒的 2026-09-02T00:00:00Z 当规范形式放行；而规范形式
+// 与 toISOString() 同形（毫秒 .\d{3}Z、四位数年份、往返相等）。两处判据已写成同一处实现。
+// （本地 isCanonicalIso 已被 import 的替换，删掉以免再漂移。）
 
 /** 读入站消息频道对照所需字段；缺哪个补哪个，都缺就 null。 */
 function channelView({ event, canonical, template, env }) {
@@ -152,41 +153,65 @@ export function appendChannelSample({
   if (typeof file !== "string" || !path.isAbsolute(file)) {
     return { ok: false, reason: "channel_sample_required_absolute" };
   }
-  const v = channelView({ event, canonical, template, env });
-  const row = {
-    schema_version: SCHEMA_VERSION,
-    at: v.at,
-    chain,
-    message_id: channelSampleSha16(v.messageId),
-    session_sha16: channelSampleSha16(v.sessionId),
-    channel_chat_sha16: channelSampleSha16(v.chatId),
-    channel_thread_sha16: channelSampleSha16(v.threadId),
-    matches_template_chat: v.matches,
-    disposition,
-  };
-  const problems = channelSampleProblem(row);
+  // #R10 评审 P1-2：row 投影（channelView）+ 校验（channelSampleProblem）必须包进最外层
+  // try/catch —— event.created_at_ms 越界（如 1e20）会让 new Date(...).toISOString() 抛
+  // RangeError，而它们原来在 try 之外，坏输入会一路向上打穿入站主流程。采样线不承重，收口。
+  let row;
+  let problems;
+  try {
+    const v = channelView({ event, canonical, template, env });
+    row = {
+      schema_version: SCHEMA_VERSION,
+      at: v.at,
+      chain,
+      message_id: channelSampleSha16(v.messageId),
+      session_sha16: channelSampleSha16(v.sessionId),
+      channel_chat_sha16: channelSampleSha16(v.chatId),
+      channel_thread_sha16: channelSampleSha16(v.threadId),
+      matches_template_chat: v.matches,
+      disposition,
+    };
+    problems = channelSampleProblem(row);
+  } catch (err) {
+    diagWrite(file, "channel_sample_write_failed " + (err?.code ?? err?.message ?? err));
+    return { ok: false, reason: "channel_sample_write_failed" };
+  }
   if (problems.length) {
     diagWrite(file, "channel_sample_invalid " + problems.join(","));
     return { ok: false, reason: "channel_sample_invalid", problems };
   }
+  // #R10 评审 P1-3：写侧同 fd fstat 确认普通文件且单硬链接 nlink===1（拒符号链接/别名），
+  // 用 Buffer 写、校验写全字节（短写/零写 = 受控失败，不静默丢、也不假装成功）。
+  const buf = Buffer.from(JSON.stringify(row) + "\n", "utf-8");
+  let fd = null;
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    let fd = null;
-    try {
-      fd = fs.openSync(
-        file,
-        fs.constants.O_APPEND | fs.constants.O_WRONLY | fs.constants.O_CREAT |
-        fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
-        0o600,
-      );
-      fs.writeSync(fd, JSON.stringify(row) + "\n");
-    } finally {
-      if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
+    fd = fs.openSync(
+      file,
+      fs.constants.O_APPEND | fs.constants.O_WRONLY | fs.constants.O_CREAT |
+      fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+      0o600,
+    );
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) {
+      diagWrite(file, "channel_sample_not_regular_file");
+      return { ok: false, reason: "channel_sample_not_regular_file" };
+    }
+    if (st.nlink !== 1) {
+      diagWrite(file, "channel_sample_not_regular_file nlink=" + st.nlink);
+      return { ok: false, reason: "channel_sample_not_regular_file", detail: "nlink=" + st.nlink };
+    }
+    const written = fs.writeSync(fd, buf);
+    if (written !== buf.length) {
+      diagWrite(file, "channel_sample_short_write " + written + "/" + buf.length);
+      return { ok: false, reason: "channel_sample_short_write", detail: written + "/" + buf.length };
     }
     return { ok: true, row };
   } catch (err) {
-    diagWrite(file, "channel_sample_write_failed " + (typeof err?.code === "string" ? err.code : String(err?.message ?? err)));
+    diagWrite(file, "channel_sample_write_failed " + (err?.code ?? err?.message ?? err));
     return { ok: false, reason: "channel_sample_write_failed" };
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
   }
 }
 

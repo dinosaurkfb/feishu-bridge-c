@@ -9693,6 +9693,49 @@ test("#R11 Codex 采样失败不影响主流程（EISDIR 隔离）：文件是�
   assert.equal(diag.split("\n").length, 1, "只落一行诊断（" + diag + "）");
 });
 
+// #R10 评审 P1-1：Codex 链成功投递的收口是 finish("accepted")，而 DISPOSITION_KINDS 原来
+// 缺 "accepted"，channelSampleProblem 拒掉该行 → 成功投递一行采样都不落。修复后必须落一行。
+const codexChanAccept = () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  const bin = path.join(home, "bin");
+  fs.mkdirSync(root); fs.mkdirSync(bin);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "abc123" });
+  task.session_id = "aily_sess_a";
+  task.inbound_state = "bound";
+  delete task.topic_generation_state; delete task.channel_generation_id;
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, "codex"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  const run = (messageId) => {
+    const content = '<at id="ou_same" type="employee">M5Codex</at> 请继续推进公共策略迁移';
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: {
+      id: messageId, sessionID: "aily_sess_a", role: "user", createdBy: TEMPLATE.frank_sender_id, createdAtMs: Date.now(), content,
+    } }) }] });
+    return spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], { encoding: "utf-8",
+      env: { ...isolatedEnv(), PATH: bin + path.delimiter + process.env.PATH, FEISHU_CODEX_BRIDGE_HOME: home,
+        AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "aily_sess_a", AILY_CLI_RUN_ID: "run_acc", FAKE_AILY_ENVELOPE: envelope } });
+  };
+  return { run, sampleFile: path.join(home, "inbound", "channel-samples.jsonl") };
+};
+
+test("#R10 Codex 真入口 accepted：成功投递落下 disposition=accepted 采样行，不泄明文", () => {
+  const { run, sampleFile } = codexChanAccept();
+  const r = run("msg_acc_cx");
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^已受理 · A/u, r.stdout);
+  assert.equal(fs.existsSync(sampleFile), true, "accepted 成功投递后应落采样文件");
+  const rows = fs.readFileSync(sampleFile, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.equal(rows.length, 1, "一行采样");
+  const [row] = rows;
+  assert.equal(row.disposition, "accepted", "P1-1：accepted 必须被枚举接受（" + row.disposition + "）");
+  assert.equal(row.chain, "codex");
+  assert.equal(row.schema_version, "1.0");
+  assert.equal(typeof row.message_id, "string", "message_id 落哈希不落明文");
+  assert.doesNotMatch(JSON.stringify(row), /oc_|ou_|om_/u, "整行不泄任何 locator 明文前缀");
+});
+
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (TEST_FILTER.length > 0) {

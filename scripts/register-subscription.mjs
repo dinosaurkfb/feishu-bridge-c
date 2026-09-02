@@ -95,6 +95,11 @@ export function describeStoreWrite(r, file) {
     (x.error ? "：" + x.error : "") + (x.problems ? "：" + x.problems.join(",") : "");
   let exitCode = 0;
   if (!r || typeof r !== "object") { lines.push("没有写成：结果说不清"); exitCode = 1; }
+  else if (!r.ok && r.reason === "audit_pending_blocked") {
+    lines.push("没有写成：待补记结算被阻断（" + r.detail + (r.detailText ? "：" + r.detailText : "") + (r.problems ? "：" + r.problems.join(",") : "") + "）");
+    lines.push("有一份待补记（或其留痕）说不清：先人工对账 <store>.audit.pending.json 与同名 .stale.* 文件，处理完再重跑 --apply。");
+    exitCode = 1;
+  }
   else if (!r.ok) { lines.push("没有写成：" + r.reason + detail(r)); exitCode = 1; }
   else if (!r.changed) lines.push("锁内重读后已经是这样，没动。");
   else lines.push("已写入（锁内重读重算后）。" + (r.backup ? "备份：" + r.backup : "首次创建，无备份"));
@@ -103,9 +108,11 @@ export function describeStoreWrite(r, file) {
     lines.push("注意：变更已写入，但审计行没写成（" + r.auditUnwritten + "）；已落待补记 <store>.audit.pending.json，下次 --apply 会先补记。请先对账 " + file + ".audit.jsonl 的权限 / 占用。");
     exitCode = 1;
   }
-  // 评审 #115 P1-3：进锁补记到一半——要么失败（审计却没补上，退非零让人知道），要么判 stale（改名留痕，不删不吞）。
-  if (r && r.ok && r.auditPendingReplay) { lines.push("注意：进锁时补记上一次审计失败（" + r.auditPendingReplay + "），待补记已留存；下次 --apply 会再试。"); exitCode = 1; }
-  if (r && r.ok && r.auditPendingStale) { lines.push("注意：发现一份对不上当前 store 的待补记，已改名留痕为 <store>.audit.pending.stale.<ts>。"); }
+  // 评审 #115 二轮 P1-2/P1-5：结算旗标各说各话——补记成功是干净收尾；before 命中丢弃留痕；
+  // 审计写成但 pending 清不掉要非零（下次 apply 状态机会按前缀收敛）。
+  if (r && r.ok && r.auditRecovered) lines.push("进锁时补记了上一笔没写成的审计行（幂等结算），pending 已清。");
+  if (r && r.ok && r.auditPendingDiscarded) lines.push("进锁时发现一份 before 命中当前 store 的待补记：那笔事务没提交过，已改名留痕 " + r.auditPendingDiscarded.path + "，丢弃后本次变更照常。");
+  if (r && r.ok && r.auditPendingUncleared) { lines.push("注意：审计行已写成，但待补记文件清不掉（" + r.auditPendingUncleared + "）；下次 --apply 会自动收敛，也请看看权限。"); exitCode = 1; }
   if (r && r.lockUncleared) {
     lines.push("注意：订阅写锁没有交还（" + r.lockUncleared + "）；之后所有订阅写方都会报 store_busy，请人工确认没有写方在跑后处理 " + file + ".lock");
     exitCode = 1;
@@ -145,7 +152,8 @@ if (isDirectRun(import.meta.url)) {
     if (entry?.chat_name) process.stdout.write("群名      ：" + displaySafe(entry.chat_name) + "\n");
     process.stdout.write("时效      ：" + entry.constraints.freshness_ms + " ms · 状态 " + entry.status + " · v" + entry.version + "\n");
   }
-  if (!planned.changed) { process.stdout.write("已经是这样，没动。\n"); process.exit(0); }
+  if (!planned.changed && !fs.existsSync(parsed.store + ".audit.pending.json")) { process.stdout.write("已经是这样，没动。\n"); process.exit(0); }
+  if (!planned.changed) process.stdout.write("已经是这样，没动；但有一份待补记要结算。\n");
   if (!parsed.apply) { process.stdout.write("\n[dry-run] 什么都没写。写入是改订阅控制面，要 owner 逐次授权后再加 --apply。\n"); process.exit(0); }
   { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门
   const done = applySubscriptionChange({

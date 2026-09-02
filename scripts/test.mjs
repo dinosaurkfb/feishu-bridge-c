@@ -212,7 +212,7 @@ import {
 } from "./inbound-route.mjs";
 import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION_KEYED, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, selectPendingSubscriptionClaim, stableControlId, subscriptionIdFor, validateSubscription, claimable } from "./subscription.mjs";
 import { applySubscriptionChange, appendSubscriptionAuditLine, buildSubscriptionAuditEvent, clearSubscriptionAuditPending, loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, mergedSubscriptionView, planSubscriptionChange, planSubscriptionEntry, staleSubscriptionAuditPending, subscriptionAuditPendingPath, subscriptionStorePath, SUBSCRIPTION_STORE_ARTIFACT_TYPE, SUBSCRIPTION_STORE_SCHEMA_VERSION, validateSubscriptionAuditEvent, validateSubscriptionAuditPending, writeSubscriptionAuditPending } from "./subscription-store.mjs";
-import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
+import { describeStoreWrite, parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
 import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
@@ -20413,7 +20413,7 @@ test("FR-2.6 单 4：审计目录/占用不阻断变更（成功但要人知道�
     { ok: true, absent: true, events: [], problems: [] });
   fs.rmdirSync(auditFile);
   fs.writeFileSync(auditFile, [
-    JSON.stringify({ schema_version: "1.0", at: "2026-09-02T00:00:00.000Z", action: "add", subscription_id: "s1", version_after: 1, store_bytes_sha256: "0123456789abcdef" }),
+    JSON.stringify({ schema_version: "1.0", at: "2026-09-02T00:00:00.000Z", action: "add", operation_id: "op-fixture", subscription_id: "s1", version_after: 1, store_bytes_sha256: "0123456789abcdef" }),
     "{not json",
     JSON.stringify({ action: 1 }),
     "",
@@ -20421,7 +20421,7 @@ test("FR-2.6 单 4：审计目录/占用不阻断变更（成功但要人知道�
   const bad = loadSubscriptionAudit({ file: storeFile });
   assert.equal(bad.ok, false, "有坏行 ok:false，不吞");
   assert.deepEqual(bad.events.length, 1, "好行照常返回");
-  assert.deepEqual(bad.problems, ["line:2:json_invalid", "line:3:missing:schema_version,missing:at,missing:subscription_id,missing:version_after,missing:store_bytes_sha256,action:1"], JSON.stringify(bad.problems));
+  assert.deepEqual(bad.problems, ["line:2:json_invalid", "line:3:missing:schema_version,missing:at,missing:operation_id,missing:subscription_id,missing:version_after,missing:store_bytes_sha256,action:1"], JSON.stringify(bad.problems));
   fs.rmSync(auditFile);
   fs.symlinkSync(templateFile, auditFile);
   assert.equal(loadSubscriptionAudit({ file: storeFile }).reason, "audit_not_regular_file", "审计读不认符号链接（与 store 同款纪律）");
@@ -20439,7 +20439,7 @@ test("评审 #115 P1-1：审计追加受验 —— 符号链接 / FIFO / 硬链�
   const storeFile = path.join(local, "subs.json");
   const auditFile = storeFile + ".audit.jsonl";
   const at = "2026-09-02T00:00:00.000Z";
-  const ev = () => ({ schema_version: "1.0", at, action: "add", subscription_id: "s1", version_after: 1, store_bytes_sha256: "0123456789abcdef" });
+  const ev = () => ({ schema_version: "1.0", at, action: "add", operation_id: "op-ev", subscription_id: "s1", version_after: 1, store_bytes_sha256: "0123456789abcdef" });
 
   // 恢复正常：一次追加一行（写方与读方同构）
   appendSubscriptionAuditLine({ file: storeFile, event: ev() });
@@ -20466,13 +20466,20 @@ test("评审 #115 P1-1：审计追加受验 —— 符号链接 / FIFO / 硬链�
   const originalWriteSync = fs.writeSync; fs.writeSync = () => 0;
   try { assert.throws(() => appendSubscriptionAuditLine({ file: storeFile, event: ev() }), (e) => /ESHORTWRITE/u.test(String(e.message)), "短写受控失败"); }
   finally { fs.writeSync = originalWriteSync; }
+
+  // 评审 #115 二轮 P2-1：共享导出也强制唯一校验器——坏事件在打开文件**之前**就拒，一个字节不落盘
+  fs.rmSync(auditFile);
+  assert.throws(() => appendSubscriptionAuditLine({ file: storeFile, event: { ...ev(), operation_id: "" } }), (e) => /audit_line_invalid:operation_id/u.test(String(e.message)), "空 operation_id 拒");
+  assert.ok(!fs.existsSync(auditFile), "坏事件零字节落盘");
 });
 
 test("评审 #115 P1-2：唯一封闭校验 —— 伪事件矩阵逐项拒（多余键/空 id/坏时间/非枚举 action/坏摘要/version_after 违联合约束）；写方与读方同一把判据", () => {
-  const base = { schema_version: "1.0", at: "2026-09-02T00:00:00.000Z", action: "add", subscription_id: "s1", version_after: 1, store_bytes_sha256: "0123456789abcdef" };
+  const base = { schema_version: "1.0", at: "2026-09-02T00:00:00.000Z", action: "add", operation_id: "op-base", subscription_id: "s1", version_after: 1, store_bytes_sha256: "0123456789abcdef" };
   const cases = [
     ["多余键", { ...base, extra: "leak" }, ["extra:extra"]],
     ["空 id", { ...base, subscription_id: "" }, ["subscription_id_empty"]],
+    ["空 operation_id", { ...base, operation_id: "" }, ["operation_id"]],
+    ["缺 operation_id", { schema_version: "1.0", at: base.at, action: "add", subscription_id: "s1", version_after: 1, store_bytes_sha256: base.store_bytes_sha256 }, ["missing:operation_id"]],
     ["坏时间", { ...base, at: "not-time" }, ["at_not_canonical"]],
     ["非枚举 action", { ...base, action: "evil" }, ["action:evil"]],
     ["坏摘要", { ...base, store_bytes_sha256: "xyz" }, ["store_bytes_sha256"]],
@@ -20487,10 +20494,13 @@ test("评审 #115 P1-2：唯一封闭校验 —— 伪事件矩阵逐项拒（�
   }
   assert.deepEqual(validateSubscriptionAuditEvent(base), { ok: true, problems: [] }, "健康事件通过");
   assert.deepEqual(validateSubscriptionAuditEvent({ ...base, action: "remove", version_after: null }), { ok: true, problems: [] }, "remove version_after=null 通过");
-  // 待补记也封闭：健康通过、多余键拒
-  const pend = (o = {}) => ({ schema_version: "1.0", operation_id: "op-1", before_sha256: null, after_sha256: "0123456789abcdef", event: base, ...o });
+  // 待补记也封闭：健康通过、多余键拒、event 与 pending 的 operation_id 必须同一、追加前审计大小/哈希成对
+  const pend = (o = {}) => ({ schema_version: "1.0", operation_id: "op-base", before_sha256: null, after_sha256: "0123456789abcdef", event: base, audit_size_before: null, audit_sha256_before: null, ...o });
   assert.deepEqual(validateSubscriptionAuditPending(pend()), { ok: true, problems: [] }, "健康 pending 通过");
   assert.equal(validateSubscriptionAuditPending(pend({ extra: "x" })).problems[0], "extra:extra", "pending 多余键拒");
+  assert.equal(validateSubscriptionAuditPending(pend({ operation_id: "op-other" })).problems[0], "event_operation_id_mismatch", "event 与 pending 的 operation_id 不同源拒");
+  assert.equal(validateSubscriptionAuditPending(pend({ audit_size_before: 5, audit_sha256_before: null })).problems[0], "audit_before_pair", "大小/哈希只记一半拒");
+  assert.equal(validateSubscriptionAuditPending(pend({ audit_size_before: -1, audit_sha256_before: "0123456789abcdef" })).problems[0], "audit_size_before", "负大小拒");
 
   // 读方同一把：坏行带行号 + 精确 problems，好行照常返回
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-p12-"));
@@ -20525,7 +20535,7 @@ test("评审 #115 P1-3 窗口①：rename→审计之间崩溃（store 已提交
 
   fs.chmodSync(auditFile, 0o644);
   const replay = applySubscriptionChange({ file: storeFile, change: pause, now: new Date("2026-09-02T00:00:02.000Z") });
-  assert.deepEqual([replay.ok, replay.changed, replay.auditUnwritten, replay.auditPendingStale, replay.auditPendingReplay], [true, false, undefined, undefined, undefined], "no-op 路径也先补记（早退漏洞已堵）");
+  assert.deepEqual([replay.ok, replay.changed, replay.auditUnwritten, replay.auditRecovered], [true, false, undefined, true], "no-op 路径也先补记（早退漏洞已堵，二轮状态机仍覆盖）");
   const audit = loadSubscriptionAudit({ file: storeFile });
   assert.deepEqual(audit.events.map((e) => e.action), ["add", "pause"], "缺的 pause 审计被补上");
   assert.equal(audit.ok, true);
@@ -20542,8 +20552,8 @@ test("评审 #115 P1-3 窗口②：审计已写但 pending 没删（审计→回
   applySubscriptionChange({ file: storeFile, change: { action: "add", runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" }, now: new Date("2026-09-02T00:00:00.000Z") });
   const addEvent = loadSubscriptionAudit({ file: storeFile }).events[0];
   const curHash = createHash("sha256").update(fs.readFileSync(storeFile)).digest("hex").slice(0, 16);
-  // 人为制造「审计已写、pending 没删」：after 哈希对得上、事件已在审计里
-  writeSubscriptionAuditPending({ file: storeFile, pending: { schema_version: "1.0", operation_id: "op-manual", before_sha256: null, after_sha256: curHash, event: addEvent } });
+  // 人为制造「审计已写、pending 没删」：after 哈希对得上、事件已在审计里（v2 形状：审计当时不存在 → 大小/哈希记 null）
+  writeSubscriptionAuditPending({ file: storeFile, pending: { schema_version: "1.0", operation_id: addEvent.operation_id, before_sha256: null, after_sha256: curHash, event: addEvent, audit_size_before: null, audit_sha256_before: null } });
 
   const replay = applySubscriptionChange({ file: storeFile, change: { action: "pause", runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" }, now: new Date("2026-09-02T00:00:01.000Z") });
   assert.deepEqual([replay.ok, replay.changed], [true, true], "本次变更正常处理");
@@ -20571,6 +20581,227 @@ test("评审 #115 P1-3 窗口③：首次写即审计失败（EISDIR 注入）�
   assert.deepEqual([replay.ok, replay.changed], [true, true], "恢复后本次变更正常处理");
   assert.deepEqual(loadSubscriptionAudit({ file: storeFile }).events.map((e) => e.action), ["add", "pause"], "首次 add 审计被补上");
   assert.equal(fs.existsSync(subscriptionAuditPendingPath(storeFile)), false, "pending 已清");
+});
+
+test("评审 #115 二轮 P1-1：add→remove→add 第二次 add 审计失败 → 重放按 operation_id 补记，不再命中旧 store 哈希误清", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-r5-opid-"));
+  const templateFile = path.join(local, "chain-config.json");
+  const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  const storeFile = path.join(local, "subs", "subscriptions.json");
+  const auditFile = storeFile + ".audit.jsonl";
+  const ch = (action) => ({ action, runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" });
+  const t = (s) => new Date("2026-09-02T00:00:0" + s + ".000Z");
+  const hash = () => createHash("sha256").update(fs.readFileSync(storeFile)).digest("hex").slice(0, 16);
+  assert.equal(applySubscriptionChange({ file: storeFile, change: ch("add"), now: t(0) }).ok, true, "add1 成功");
+  const add1Hash = hash();
+  assert.equal(applySubscriptionChange({ file: storeFile, change: ch("remove"), now: t(1) }).ok, true, "remove 成功");
+  fs.chmodSync(auditFile, 0o444);
+  const add2 = applySubscriptionChange({ file: storeFile, change: ch("add"), now: t(2) });
+  fs.chmodSync(auditFile, 0o644);
+  assert.deepEqual([add2.ok, add2.changed, add2.auditUnwritten], [true, true, "audit_append_failed:EACCES"], "第二次 add 审计失败但 store 已提交");
+  assert.equal(hash(), add1Hash, "两次 add 的 store 字节相同 —— 评审实测误清场景的前提");
+  // 旧行为：重放按 after 哈希去重 → 命中 add1 的行 → 清 pending → 第二次 add 永久丢失。
+  // 新行为：pending.operation_id 只在第二次 add 里出现 → 补记。
+  const replay = applySubscriptionChange({ file: storeFile, change: ch("pause"), now: t(3) });
+  assert.deepEqual([replay.ok, replay.changed, replay.auditRecovered], [true, true, true], replay.reason ?? "");
+  const audit = loadSubscriptionAudit({ file: storeFile });
+  assert.ok(audit.ok, JSON.stringify(audit.problems));
+  assert.deepEqual(audit.events.map((e) => e.action), ["add", "remove", "add", "pause"], "四行齐：第二次 add 没被旧哈希吞掉");
+  const ops = audit.events.map((e) => e.operation_id);
+  assert.equal(new Set(ops).size, ops.length, "operation_id 两两不同（操作身份唯一）");
+});
+
+test("评审 #115 二轮 P1-2：审计持续失败 → pending 未决阻断下一次变更：拒绝、pending 未被覆盖、store 未提交", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-r5-block-"));
+  const templateFile = path.join(local, "chain-config.json");
+  const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  const storeFile = path.join(local, "subs", "subscriptions.json");
+  const auditFile = storeFile + ".audit.jsonl";
+  const pendingPath = subscriptionAuditPendingPath(storeFile);
+  const ch = (action) => ({ action, runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" });
+  const t = (s) => new Date("2026-09-02T00:00:0" + s + ".000Z");
+  const hash = () => createHash("sha256").update(fs.readFileSync(storeFile)).digest("hex").slice(0, 16);
+  assert.equal(applySubscriptionChange({ file: storeFile, change: ch("add"), now: t(0) }).ok, true, "add 成功");
+  fs.chmodSync(auditFile, 0o444);
+  const crash = applySubscriptionChange({ file: storeFile, change: ch("pause"), now: t(1) });
+  assert.deepEqual([crash.ok, crash.changed, crash.auditUnwritten], [true, true, "audit_append_failed:EACCES"], "pause 提交但审计失败，pending 留守");
+  const pendBefore = fs.readFileSync(pendingPath, "utf-8");
+  const hashBefore = hash();
+  // 下一次变更：状态机在规划之前阻断（审计还读不了 → 补记说不清）
+  const second = applySubscriptionChange({ file: storeFile, change: ch("resume"), now: t(2) });
+  assert.deepEqual([second.ok, second.reason], [false, "audit_pending_blocked"], JSON.stringify(second));
+  assert.equal(second.detail, "audit_unwritable", "阻断在补记写不进（审计 EACCES，0444 只挡写）：" + second.detail);
+  assert.equal(fs.readFileSync(pendingPath, "utf-8"), pendBefore, "pending 未被覆盖");
+  assert.equal(hash(), hashBefore, "store 未提交第二次变更");
+  // 恢复后：先补记上一笔（pause 行），本次 resume 照常成立
+  fs.chmodSync(auditFile, 0o644);
+  const after = applySubscriptionChange({ file: storeFile, change: ch("resume"), now: t(3) });
+  assert.deepEqual([after.ok, after.changed, after.auditRecovered], [true, true, true], after.reason ?? "");
+  assert.deepEqual(loadSubscriptionAudit({ file: storeFile }).events.map((e) => e.action), ["add", "pause", "resume"], "补记 + 本次逐笔齐");
+  assert.ok(!fs.existsSync(pendingPath), "pending 已清");
+});
+
+test("评审 #115 二轮 P1-3：崩溃留半行 → 恢复按 pending 记录的前缀大小/哈希判定、截掉未提交尾巴、补记完整行、审计整体闭合全绿", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-r5-tail-"));
+  const templateFile = path.join(local, "chain-config.json");
+  const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  const storeFile = path.join(local, "subs", "subscriptions.json");
+  const auditFile = storeFile + ".audit.jsonl";
+  const pendingPath = subscriptionAuditPendingPath(storeFile);
+  const ch = (action) => ({ action, runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" });
+  const t = (s) => new Date("2026-09-02T00:00:0" + s + ".000Z");
+  const hash = () => createHash("sha256").update(fs.readFileSync(storeFile)).digest("hex").slice(0, 16);
+  assert.equal(applySubscriptionChange({ file: storeFile, change: ch("add"), now: t(0) }).ok, true, "add 成功");
+  assert.equal(applySubscriptionChange({ file: storeFile, change: ch("pause"), now: t(1) }).ok, true, "pause 成功");
+  const lines = fs.readFileSync(auditFile, "utf-8").split("\n").filter((l) => l.trim());
+  assert.equal(lines.length, 2, "夹具两行");
+  const addLine = lines[0] + "\n";
+  const pauseEvent = JSON.parse(lines[1]);
+  const pauseLine = JSON.stringify(pauseEvent) + "\n";
+  // 盘面回放成「pause 追加写到一半崩溃」：审计 = 完整 add 行 + 半个 pause 行；pending 还在（模拟 rename 前已写）
+  const half = pauseLine.slice(0, Math.floor(pauseLine.length / 2));
+  fs.writeFileSync(auditFile, addLine + half);
+  fs.writeFileSync(pendingPath, JSON.stringify({ schema_version: "1.0", operation_id: pauseEvent.operation_id, before_sha256: null, after_sha256: hash(), event: pauseEvent, audit_size_before: addLine.length, audit_sha256_before: createHash("sha256").update(addLine).digest("hex").slice(0, 16) }, null, 2) + "\n");
+  const replay = applySubscriptionChange({ file: storeFile, change: ch("resume"), now: t(2) });
+  assert.deepEqual([replay.ok, replay.changed, replay.auditRecovered], [true, true, true], replay.reason ?? JSON.stringify(replay));
+  const audit = loadSubscriptionAudit({ file: storeFile });
+  assert.deepEqual([audit.ok, audit.problems, audit.events.length], [true, [], 3], "整体闭合全绿：半行被截掉、完整行补上");
+  assert.deepEqual(audit.events.map((e) => e.action), ["add", "pause", "resume"]);
+  assert.deepEqual(audit.events[1], pauseEvent, "补的行与崩溃前的事件逐字一致");
+  assert.ok(!fs.existsSync(pendingPath), "pending 已清");
+});
+
+test("评审 #115 二轮 P1-4：pending 为符号链接 / FIFO → loader 受控拒 + 状态机阻断新变更，不跟随不挂死", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-r5-pdl-"));
+  const templateFile = path.join(local, "chain-config.json");
+  const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  const storeFile = path.join(local, "subs", "subscriptions.json");
+  const pendingPath = subscriptionAuditPendingPath(storeFile);
+  const ch = (action) => ({ action, runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" });
+  const t = (s) => new Date("2026-09-02T00:00:0" + s + ".000Z");
+  assert.equal(applySubscriptionChange({ file: storeFile, change: ch("add"), now: t(0) }).ok, true, "add 成功");
+  // 符号链接：loader 不跟随（ELOOP），状态机阻断
+  const outside = path.join(local, "outside.json");
+  fs.writeFileSync(outside, "keep");
+  fs.symlinkSync(outside, pendingPath);
+  const viaLink = applySubscriptionChange({ file: storeFile, change: ch("pause"), now: t(1) });
+  assert.deepEqual([viaLink.ok, viaLink.reason], [false, "audit_pending_blocked"], JSON.stringify(viaLink));
+  assert.match(String(viaLink.detailText ?? ""), /符号链接/u, "拒因指向别名：" + viaLink.detailText);
+  assert.equal(fs.readFileSync(outside, "utf-8"), "keep", "外部文件没被碰");
+  fs.unlinkSync(pendingPath);
+  // FIFO：O_NONBLOCK 打开即回 + fstat 拒，状态机阻断，不吊住对账方
+  execFileSync("mkfifo", [pendingPath]);
+  const t0 = Date.now();
+  const viaFifo = applySubscriptionChange({ file: storeFile, change: ch("pause"), now: t(2) });
+  assert.ok(Date.now() - t0 < 5000, "pending 是 FIFO 时不挂死");
+  assert.deepEqual([viaFifo.ok, viaFifo.reason], [false, "audit_pending_blocked"], JSON.stringify(viaFifo));
+  assert.match(String(viaFifo.detailText ?? ""), /不是普通文件/u, "拒因指向非普通文件：" + viaFifo.detailText);
+  fs.rmSync(pendingPath, { force: true });
+});
+
+test("评审 #115 二轮 P1-2：before/after 三态各走各路——未提交留痕丢弃照常写、已提交补记清 pending、冲突留痕且阻断", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-r5-3st-"));
+  const templateFile = path.join(local, "chain-config.json");
+  const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  const storeFile = path.join(local, "subs", "subscriptions.json");
+  const auditFile = storeFile + ".audit.jsonl";
+  const pendingPath = subscriptionAuditPendingPath(storeFile);
+  const ch = (action) => ({ action, runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" });
+  const t = (s) => new Date("2026-09-02T00:00:0" + s + ".000Z");
+  const hash = () => createHash("sha256").update(fs.readFileSync(storeFile)).digest("hex").slice(0, 16);
+  const sha16Of = (s) => createHash("sha256").update(s).digest("hex").slice(0, 16);
+  const evOf = (action, at, op) => ({ schema_version: "1.0", at, action, operation_id: op, subscription_id: "s_x", version_after: 1, store_bytes_sha256: "0123456789abcdef" });
+  assert.equal(applySubscriptionChange({ file: storeFile, change: ch("add"), now: t(0) }).ok, true, "add 成功");
+  // ① before 命中 = 事务没提交 → 留痕丢弃，本次变更照常
+  fs.writeFileSync(pendingPath, JSON.stringify({ schema_version: "1.0", operation_id: "op-uncommitted", before_sha256: hash(), after_sha256: "ffffffffffffffff", event: evOf("add", "2026-09-02T00:00:01.000Z", "op-uncommitted"), audit_size_before: null, audit_sha256_before: null }, null, 2) + "\n");
+  const d = applySubscriptionChange({ file: storeFile, change: ch("pause"), now: t(1) });
+  assert.deepEqual([d.ok, d.changed], [true, true], d.reason ?? "");
+  assert.match(String(d.auditPendingDiscarded?.path ?? ""), /audit\.pending\.json\.stale\./u, "留痕路径带回");
+  assert.ok(fs.existsSync(d.auditPendingDiscarded.path) && !fs.existsSync(pendingPath), "留痕在、pending 没了");
+  const pauseEvent = loadSubscriptionAudit({ file: storeFile }).events.at(-1);
+  // ② after 命中 = 事务已提交 → 补记 + 清 pending
+  const afterHash = hash();
+  const auditText = fs.readFileSync(auditFile, "utf-8");
+  fs.writeFileSync(pendingPath, JSON.stringify({ schema_version: "1.0", operation_id: "op-committed", before_sha256: "1111111111111111", after_sha256: afterHash, event: evOf("resume", "2026-09-02T00:00:02.000Z", "op-committed"), audit_size_before: auditText.length, audit_sha256_before: sha16Of(auditText) }, null, 2) + "\n");
+  const r = applySubscriptionChange({ file: storeFile, change: ch("resume"), now: t(2) });
+  assert.deepEqual([r.ok, r.changed, r.auditRecovered], [true, true, true], r.reason ?? JSON.stringify(r));
+  const evs = loadSubscriptionAudit({ file: storeFile }).events;
+  assert.equal(evs.filter((e) => e.operation_id === "op-committed").length, 1, "补记恰一条");
+  assert.ok(!fs.existsSync(pendingPath), "pending 已清");
+  // ③ 三者都对不上 = 冲突 → 留痕 + 阻断本次变更，store 未提交
+  const hashBefore = hash();
+  const auditBeforeConflict = fs.readFileSync(auditFile, "utf-8");
+  fs.writeFileSync(pendingPath, JSON.stringify({ schema_version: "1.0", operation_id: "op-conflict", before_sha256: "1111111111111111", after_sha256: "2222222222222222", event: evOf("pause", "2026-09-02T00:00:03.000Z", "op-conflict"), audit_size_before: null, audit_sha256_before: null }, null, 2) + "\n");
+  const c = applySubscriptionChange({ file: storeFile, change: ch("resume"), now: t(3) });
+  assert.deepEqual([c.ok, c.reason], [false, "audit_pending_blocked"], JSON.stringify(c));
+  assert.equal(c.detail, "audit_pending_conflict", "拒因短码是冲突：" + c.detail);
+  assert.equal(hash(), hashBefore, "store 未提交冲突下的新变更");
+  const staleNow = fs.readdirSync(path.dirname(pendingPath)).find((n) => n.startsWith(path.basename(pendingPath) + ".stale."));
+  assert.ok(staleNow, "冲突的 pending 已改名留痕");
+  fs.rmSync(path.join(path.dirname(pendingPath), staleNow), { force: true });
+  assert.equal(fs.readFileSync(auditFile, "utf-8"), auditBeforeConflict, "冲突路径审计一个字节没动");
+});
+
+test("评审 #115 二轮 P1-2/P1-5：正式 pending 不覆盖发布（已存在即冲突）；发布路径 fsync 文件 + 父目录，tmp 不留残骸", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-r5-excl-"));
+  const storeFile = path.join(local, "subs", "subscriptions.json");
+  const base = { schema_version: "1.0", at: "2026-09-02T00:00:00.000Z", action: "add", operation_id: "op-a", subscription_id: "s1", version_after: 1, store_bytes_sha256: "0123456789abcdef" };
+  const pend = (op) => ({ schema_version: "1.0", operation_id: op, before_sha256: null, after_sha256: "0123456789abcdef", event: { ...base, operation_id: op }, audit_size_before: null, audit_sha256_before: null });
+  const fsyncCalls = [];
+  const origFsync = fs.fsyncSync;
+  fs.fsyncSync = (fd) => { fsyncCalls.push(fd); return origFsync(fd); };
+  let first;
+  try { first = writeSubscriptionAuditPending({ file: storeFile, pending: pend("op-a") }); }
+  finally { fs.fsyncSync = origFsync; }
+  assert.deepEqual(first, { ok: true }, JSON.stringify(first));
+  assert.ok(fsyncCalls.length >= 2, "发布路径至少 fsync 两次（pending 文件 + 父目录屏障），实测 " + fsyncCalls.length);
+  assert.equal(fs.readdirSync(path.dirname(storeFile)).filter((n) => n.includes(".tmp.")).length, 0, "tmp 无残骸");
+  // 已存在即冲突：第二个 pending 拒发布，旧内容一字不动
+  const before = fs.readFileSync(subscriptionAuditPendingPath(storeFile), "utf-8");
+  const second = writeSubscriptionAuditPending({ file: storeFile, pending: pend("op-b") });
+  assert.deepEqual([second.ok, second.reason], [false, "audit_pending_conflict"], JSON.stringify(second));
+  assert.equal(fs.readFileSync(subscriptionAuditPendingPath(storeFile), "utf-8"), before, "已发布的 pending 未被覆盖");
+});
+
+test("评审 #115 二轮：CLI 出口——preview no-op 早退洞堵住（有 pending 必进状态机结算）；describeStoreWrite 对 blocked / recovered / discarded / uncleared 各说各话", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-r5-cli-"));
+  const templateFile = path.join(local, "chain-config.json");
+  const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  const storeFile = path.join(local, "subs", "subscriptions.json");
+  const auditFile = storeFile + ".audit.jsonl";
+  const run = (args) => spawnSync(process.execPath, [path.resolve("scripts", "register-subscription.mjs"), ...args], { encoding: "utf-8", env: { ...process.env, HOME: local } });
+  const base = ["--store", storeFile, "--template", templateFile, "--runtime", "claude", "--domain-key", "/p", "--chat-id", "oc_b"];
+  assert.equal(run([...base, "--apply"]).status, 0, "夹具 add 成功");
+  // EISDIR 注入：store 提交、审计失败、pending 留守、CLI 非零
+  fs.rmSync(auditFile); fs.mkdirSync(auditFile);
+  const fail = run([...base, "--pause", "--apply"]);
+  assert.equal(fail.status, 1, fail.stdout + fail.stderr);
+  assert.match(fail.stdout, /变更已写入，但审计行没写成（audit_append_failed:EISDIR）/u, fail.stdout);
+  fs.rmdirSync(auditFile);
+  // preview 会判成 no-op 早退的盘面 —— CLI 必须进锁结算：补记 + pending 清掉 + 退 0
+  const replay = run([...base, "--pause", "--apply"]);
+  assert.equal(replay.status, 0, replay.stdout + replay.stderr);
+  assert.match(replay.stdout, /进锁时补记了上一笔没写成的审计行/u, replay.stdout);
+  assert.ok(!fs.existsSync(subscriptionAuditPendingPath(storeFile)), "pending 已清");
+  const auditActions = loadSubscriptionAudit({ file: storeFile }).events.map((e) => e.action);
+  assert.deepEqual(auditActions, ["pause"], "补记恰一行（add 行已被注入步骤删除，只验补记）+ 本次无新变更，实际：" + JSON.stringify(auditActions));
+  // describeStoreWrite 分支单元
+  const blocked = describeStoreWrite({ ok: false, reason: "audit_pending_blocked", detail: "audit_pending_conflict", detailText: "store 哈希对不上" }, storeFile);
+  assert.equal(blocked.exitCode, 1, "blocked 非零");
+  assert.ok(blocked.lines.some((l) => l.includes("audit_pending_conflict") && l.includes("待补记结算被阻断")), JSON.stringify(blocked.lines));
+  assert.ok(blocked.lines.some((l) => l.includes("人工对账")), "带人工对账指路");
+  const discarded = describeStoreWrite({ ok: true, changed: true, auditPendingDiscarded: { path: storeFile + ".audit.pending.json.stale.x" } }, storeFile);
+  assert.equal(discarded.exitCode, 0, "留痕丢弃不是故障");
+  assert.ok(discarded.lines.some((l) => l.includes(".stale.x")), JSON.stringify(discarded.lines));
+  const uncleared = describeStoreWrite({ ok: true, changed: true, auditPendingUncleared: "EACCES" }, storeFile);
+  assert.equal(uncleared.exitCode, 1, "清不掉 pending 非零（不静默）");
+  assert.ok(uncleared.lines.some((l) => l.includes("清不掉")), JSON.stringify(uncleared.lines));
 });
 
 test("控制事务的换绑窗口（评审 #97）：事务锁内核验通过之后、策略写锁取得之前登记表换了绑定 → 写锁内前置条件拒写、模式不变、不落 consumed、入口非零", () => {

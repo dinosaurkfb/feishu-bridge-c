@@ -211,7 +211,7 @@ import {
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
 import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION_KEYED, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, selectPendingSubscriptionClaim, stableControlId, subscriptionIdFor, validateSubscription, claimable } from "./subscription.mjs";
-import { applySubscriptionChange, loadSubscriptionStore, mergedSubscriptionView, planSubscriptionChange, planSubscriptionEntry, subscriptionStorePath } from "./subscription-store.mjs";
+import { applySubscriptionChange, loadSubscriptionStore, mergedSubscriptionView, planSubscriptionChange, planSubscriptionEntry, subscriptionStorePath, SUBSCRIPTION_STORE_SCHEMA_VERSION, SUBSCRIPTION_STORE_ARTIFACT_TYPE } from "./subscription-store.mjs";
 import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
@@ -20269,6 +20269,125 @@ test("评审 #114 P2-1：控制符 chat_name 落盘原文保留、每个展示�
   function modelView(subscriptions) {
     return { ok: true, schema_version: "1.0", subscriptions, pending_bindings: [] };
   }
+});
+
+// ─── 评审 #114 二轮：P1 legacy 失败守卫（六格矩阵 + Codex 真入口）、P2 注释同步 ───────────────
+const R3_THREAD = "01922222-3333-7444-8555-000000000000";
+const R3_CX_TPL = {"chain": "codex", "inbound_prefix": null, "transport_agent_name": "T", "transport_app_id": "cli_x", "transport_open_id": "ou_t", "outbound_agent_name": "T", "outbound_app_id": "cli_x", "outbound_open_id": "ou_t", "lark_cli_profile": "claude", "lark_cli_bin": "/bin/lark", "lark_cli_home": "/home/lark", "frank_sender_id": "123456", "chat_name": "模板群", "chat_id": "oc_t", "default_freshness_ms": 600000, "agent_uid": "agent_cx"};
+const R3_CX_SUBSCRIBE_UNBOUND = "当前 Codex task 尚未接入飞书，没有对应的事件订阅。\n\n这条命令只读 —— 发送者角色表可用 register-sender.mjs 登记（写入需 owner 逐次授权）；订阅控制面的登记入口已开放（register-subscription.mjs，落盘独立 store，同样 owner 逐次授权）：\n  · 但 store 尚未接入权威投影与切流 —— 落盘暂不改变生产认领 / 路由，本命令把已登记的条目并进展示（只读）；\n  · 接入（切流）的前置：chat locator 验证与多订阅歧义的真实样本。\n";
+
+test("评审 #114 二轮 P1：legacy 投影失败 × store 缺席/合法/损坏 六格矩阵 —— 失败投影原样保留不裸抛，store 损坏仍独立报告", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-r3-guard-"));
+  // mergedSubscriptionView 读生产默认路径（os.homedir()），进程内换 HOME 指沙箱（测完还原）。
+  const realHome = process.env.HOME;
+  process.env.HOME = local;
+  try {
+    const legacyBad = { ok: false, reason: "registry_unreadable", problems: ["registry_bad_json"] };
+    const endpoint = legacyEndpointId({ runtime: "claude", agentUid: "agent_m5claude" });
+    const legacyOk = { ok: true, endpoint_id: endpoint, subscriptions: [
+      { subscription_id: "legacy1", endpoint_id: endpoint, status: "active", version: 1, scope: { chat_id: "oc_l", sender_ids: ["u"], event_types: ["im.message.receive"] }, constraints: { freshness_ms: 600000 } },
+    ], pending_bindings: [] };
+    const template = { chain: "claude", agent_uid: "agent_m5claude", transport_open_id: "ou_bot", frank_sender_id: "u_frank", chat_id: "oc_x", default_freshness_ms: 600000 };
+    const entry = planSubscriptionEntry({ runtime: "claude", template, domainKey: "/p", chatId: "oc_u", chatName: "登记名" }).entry;
+    assert.ok(entry, "夹具条目必须合法（planSubscriptionEntry 造，与登记 CLI 同一计划器）");
+    const writeStore = (content) => {
+      fs.mkdirSync(path.join(local, ".claude", "feishu-bridge"), { recursive: true });
+      fs.writeFileSync(path.join(local, ".claude", "feishu-bridge", "subscriptions.json"), content);
+    };
+    const validStore = JSON.stringify({ schema_version: SUBSCRIPTION_STORE_SCHEMA_VERSION, artifact_type: SUBSCRIPTION_STORE_ARTIFACT_TYPE, subscriptions: [entry] });
+    // 上半：legacy 失败 × 三种 store —— 三格都不抛、失败投影原样（同一对象引用）、reason 不变。
+    const absentBad = mergedSubscriptionView({ legacy: legacyBad });
+    assert.equal(absentBad.view, legacyBad, "失败 × 缺席：返回的就是传入的失败投影");
+    assert.equal(absentBad.corrupt, null, "缺席：没有 store 就没有损坏可报");
+    writeStore(validStore);
+    const validBad = mergedSubscriptionView({ legacy: legacyBad });
+    assert.equal(validBad.view, legacyBad, "失败 × 合法 store：不进合并器，失败投影原样（守卫前这里是裸 TypeError）");
+    assert.equal(validBad.view.reason, "registry_unreadable", "reason 不被改写");
+    assert.equal(validBad.corrupt, null, "store 本身合法 → 不报损坏");
+    writeStore("{oops");
+    const damagedBad = mergedSubscriptionView({ legacy: legacyBad });
+    assert.equal(damagedBad.view, legacyBad, "失败 × 损坏 store：仍原样返回失败投影，不抛");
+    assert.ok(Array.isArray(damagedBad.corrupt) && damagedBad.corrupt.length >= 1, "store 损坏仍独立报告：" + JSON.stringify(damagedBad.corrupt));
+    fs.rmSync(path.join(local, ".claude", "feishu-bridge", "subscriptions.json"));
+    // 下半：legacy 合法 × 三种 store —— 现行为不变。
+    const absentOk = mergedSubscriptionView({ legacy: legacyOk });
+    assert.equal(absentOk.view, legacyOk, "合法 × 缺席：同一引用");
+    assert.equal(absentOk.corrupt, null);
+    writeStore(validStore);
+    const validOk = mergedSubscriptionView({ legacy: legacyOk });
+    assert.equal(validOk.corrupt, null);
+    assert.deepEqual(validOk.view.subscriptions.map((s) => [s.chat_name ?? null, s.endpoint_id === endpoint]), [[null, true], ["登记名", true]], "合并行为不变：legacy 条目保留、本端点条目带登记名并进");
+    writeStore("{oops");
+    const damagedOk = mergedSubscriptionView({ legacy: legacyOk });
+    assert.equal(damagedOk.view, legacyOk, "合法 × 损坏：fail-closed 退 legacy");
+    assert.ok(Array.isArray(damagedOk.corrupt) && damagedOk.corrupt.length >= 1);
+  } finally {
+    process.env.HOME = realHome;
+  }
+});
+
+test("评审 #114 二轮 P1 真入口（Codex）：投影失败 + 合法 store 在场 → status/subscribe 受控文案、退出码不变、有/无 store 输出逐字节一致", () => {
+  const mk = (withStore) => {
+    const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-r3-entry-"));
+    fs.mkdirSync(path.join(local, "bridge-home"));
+    fs.mkdirSync(path.join(local, "codex-home"));
+    fs.writeFileSync(path.join(local, "bridge-home", "chain-config.json"), JSON.stringify(R3_CX_TPL));
+    // registry 损坏 → buildCodexSubscriptionProjection 走 ok:false（正是守卫前会裸抛的形态）
+    fs.writeFileSync(path.join(local, "bridge-home", "registry.json"), "{bad registry");
+    fs.writeFileSync(path.join(local, "routes.json"), JSON.stringify({ routes: [{ id: "r3" + (withStore ? "b" : "a"), handler: "/bin/true" }], sessions: {} }));
+    if (withStore) {
+      const cli = spawnSync(process.execPath, [path.resolve("scripts", "register-subscription.mjs"), "--store", path.join(local, ".claude", "feishu-bridge", "subscriptions.json"), "--template", path.join(local, "bridge-home", "chain-config.json"), "--runtime", "codex", "--domain-key", "/p", "--chat-id", "oc_real", "--apply"], { encoding: "utf-8", env: { ...process.env, HOME: local } });
+      assert.equal(cli.status, 0, cli.stdout + cli.stderr);
+    }
+    return local;
+  };
+  const noStore = mk(false);
+  const withStore = mk(true);
+  const env = (local) => ({ ...process.env, HOME: local, CODEX_HOME: path.join(local, "codex-home"), FEISHU_CODEX_BRIDGE_HOME: path.join(local, "bridge-home"), FEISHU_BRIDGE_ROUTES: path.join(local, "routes.json"), FEISHU_BRIDGE_STATUS_PROVIDERS: path.join(local, "none.json") });
+  const statusRun = (local) => spawnSync(process.execPath, [path.resolve("scripts", "codex", "feishu-status.mjs"), "--thread-id", R3_THREAD], { encoding: "utf-8", env: env(local) });
+  const subRun = (local) => spawnSync(process.execPath, [path.resolve("scripts", "codex", "feishu-subscribe.mjs"), "--thread-id", R3_THREAD], { encoding: "utf-8", env: env(local) });
+  const stA = statusRun(noStore);
+  const stB = statusRun(withStore);
+  assert.equal(stA.status, 0, stA.stderr);
+  assert.equal(stB.status, 0, "守卫后不裸抛：" + stB.stderr);
+  assert.equal(stB.stdout, stA.stdout, "投影失败时 store 在场与否输出逐字节一致");
+  assert.match(stB.stdout, /读不到（registry_unreadable）/u, "受控「不可用」文案");
+  assert.doesNotMatch(stB.stdout, /TypeError/u);
+  assert.doesNotMatch(stB.stdout, /控制面 store 损坏/u, "store 合法 → 不注明损坏");
+  const subA = subRun(noStore);
+  const subB = subRun(withStore);
+  assert.equal(subA.status, 1, subA.stderr);
+  assert.equal(subB.status, 1, "退出码不变：" + subB.stderr);
+  assert.equal(subB.stdout, subA.stdout, "subscribe 有/无 store stdout 逐字节一致");
+  assert.equal(subB.stderr, subA.stderr, "错误文案逐字节一致（在 stderr）");
+  assert.match(subB.stderr, /无法读取这条 task：registry_unreadable/u);
+  assert.doesNotMatch(subB.stderr, /TypeError/u);
+});
+
+test("评审 #114 二轮 P1 真入口（Codex 未绑定 thread）：合法 store 在场 → subscribe 逐字节同今天、status 正常合并出登记展示、均不裸抛", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-r3-unbound-"));
+  fs.mkdirSync(path.join(local, "bridge-home"));
+  fs.mkdirSync(path.join(local, "codex-home"));
+  fs.writeFileSync(path.join(local, "bridge-home", "chain-config.json"), JSON.stringify(R3_CX_TPL));
+  fs.writeFileSync(path.join(local, "bridge-home", "registry.json"), JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks: [] }));
+  fs.writeFileSync(path.join(local, "routes.json"), JSON.stringify({ routes: [{ id: "r3u", handler: "/bin/true" }], sessions: {} }));
+  const cli = spawnSync(process.execPath, [path.resolve("scripts", "register-subscription.mjs"), "--store", path.join(local, ".claude", "feishu-bridge", "subscriptions.json"), "--template", path.join(local, "bridge-home", "chain-config.json"), "--runtime", "codex", "--domain-key", "/p", "--chat-id", "oc_real", "--apply"], { encoding: "utf-8", env: { ...process.env, HOME: local } });
+  assert.equal(cli.status, 0, cli.stdout + cli.stderr);
+  const env = { ...process.env, HOME: local, CODEX_HOME: path.join(local, "codex-home"), FEISHU_CODEX_BRIDGE_HOME: path.join(local, "bridge-home"), FEISHU_BRIDGE_ROUTES: path.join(local, "routes.json"), FEISHU_BRIDGE_STATUS_PROVIDERS: path.join(local, "none.json") };
+  const sub = spawnSync(process.execPath, [path.resolve("scripts", "codex", "feishu-subscribe.mjs"), "--thread-id", R3_THREAD], { encoding: "utf-8", env });
+  assert.equal(sub.status, 0, sub.stderr);
+  assert.equal(sub.stdout, R3_CX_SUBSCRIBE_UNBOUND, "未绑定 + store 在场：与无 store 今天的文案逐字节一致");
+  const st = spawnSync(process.execPath, [path.resolve("scripts", "codex", "feishu-status.mjs"), "--thread-id", R3_THREAD], { encoding: "utf-8", env });
+  assert.equal(st.status, 0, st.stderr);
+  assert.match(st.stdout, /订阅状态　　  活动/u, "未绑定 thread + store 在场：合并层照常工作（R2 特性不回退）");
+  assert.doesNotMatch(st.stdout, /控制面 store 损坏/u);
+});
+
+test("评审 #114 二轮 P2：layered-status 订阅区注释与三级群名逻辑一致 —— 过时的「只有模板」说法撤掉", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "layered-status.mjs"), "utf-8");
+  assert.doesNotMatch(src, /群名由调用方从链路模板传进来/u, "过时说法不许留在守卫边上");
+  assert.doesNotMatch(src, /订阅投影自己只有 chat_id/u);
+  assert.match(src, /条目自带的 chat_name（displaySafe 后）> 调用方从链路模板\n \* 传入的匹配名 > 不可用/u, "三级：条目 chat_name > 模板 > 不可用");
 });
 
 test("控制事务的换绑窗口（评审 #97）：事务锁内核验通过之后、策略写锁取得之前登记表换了绑定 → 写锁内前置条件拒写、模式不变、不落 consumed、入口非零", () => {

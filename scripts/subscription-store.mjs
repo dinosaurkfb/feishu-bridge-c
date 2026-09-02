@@ -122,6 +122,13 @@ export function subscriptionStorePath() {
 export function mergedSubscriptionView({ legacy } = {}) {
   const store = loadSubscriptionStore({ file: subscriptionStorePath() });
   if (store.absent) return { view: legacy, corrupt: null };
+  // 评审 #114 二轮 P1：legacy 投影自身失败（registry 读不到 / 模板不可用）时**不进合并器** ——
+  // mergeControlPlaneIntoModel 要 map model.subscriptions，失败投影没有这个字段，机器只要
+  // 有合法 store，受控的「读不到」就会变成裸 TypeError。fail-closed：失败投影原样保留，
+  // store 是否损坏仍独立报告（对失败投影没有合并价值，只有诊断价值）。
+  if (legacy?.ok !== true) {
+    return { view: legacy, corrupt: store.ok ? null : (store.problems ?? null) };
+  }
   const merged = mergeControlPlaneIntoModel(legacy,
     store.ok ? { ok: true, subscriptions: store.subscriptions } : { ok: false, problems: store.problems });
   return merged.ok

@@ -95,7 +95,10 @@ export function describeStoreWrite(r, file) {
     (x.error ? "：" + x.error : "") + (x.problems ? "：" + x.problems.join(",") : "");
   let exitCode = 0;
   if (!r || typeof r !== "object") { lines.push("没有写成：结果说不清"); exitCode = 1; }
-  else if (!r.ok) { lines.push("没有写成：" + r.reason + detail(r)); exitCode = 1; }
+  else if (!r.ok) {
+    lines.push("没有写成：" + r.reason + detail(r) + (r.stale ? "；待补记已改名留痕为 <store>.audit.pending.stale.<ts>" : ""));
+    exitCode = 1;
+  }
   else if (!r.changed) lines.push("锁内重读后已经是这样，没动。");
   else lines.push("已写入（锁内重读重算后）。" + (r.backup ? "备份：" + r.backup : "首次创建，无备份"));
   // FR-2.6 单 4：store 写成 + 审计丢了 = 「成功但要人知道」，退非零 —— 不是静默成功。
@@ -103,9 +106,12 @@ export function describeStoreWrite(r, file) {
     lines.push("注意：变更已写入，但审计行没写成（" + r.auditUnwritten + "）；已落待补记 <store>.audit.pending.json，下次 --apply 会先补记。请先对账 " + file + ".audit.jsonl 的权限 / 占用。");
     exitCode = 1;
   }
-  // 评审 #115 P1-3：进锁补记到一半——要么失败（审计却没补上，退非零让人知道），要么判 stale（改名留痕，不删不吞）。
-  if (r && r.ok && r.auditPendingReplay) { lines.push("注意：进锁时补记上一次审计失败（" + r.auditPendingReplay + "），待补记已留存；下次 --apply 会再试。"); exitCode = 1; }
-  if (r && r.ok && r.auditPendingStale) { lines.push("注意：发现一份对不上当前 store 的待补记，已改名留痕为 <store>.audit.pending.stale.<ts>。"); }
+  // 评审 #115 二轮：进锁时补记了上一次「store 已提交、审计未写」的待补记（replayed / dropped），本轮继续。
+  if (r && r.ok && r.auditPendingResolved) {
+    lines.push(r.auditPendingResolved === "dropped"
+      ? "注意：进锁时发现一份对不上当前 store 的待补记（当前 == 变更前），判定未提交，已丢弃并继续。"
+      : "注意：进锁时补记了上一次「store 已提交、审计未写」的待补记（已写回审计并清 pending），本轮已继续。");
+  }
   if (r && r.lockUncleared) {
     lines.push("注意：订阅写锁没有交还（" + r.lockUncleared + "）；之后所有订阅写方都会报 store_busy，请人工确认没有写方在跑后处理 " + file + ".lock");
     exitCode = 1;

@@ -210,7 +210,7 @@ import {
   buildClaudeSubscriptionProjection, findBindingForSession, findPendingBinding, loadConsumed,
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
-import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, stableControlId, validateSubscription, claimable } from "./subscription.mjs";
+import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, selectPendingSubscriptionClaim, stableControlId, validateSubscription, claimable } from "./subscription.mjs";
 import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
 import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
@@ -19402,6 +19402,244 @@ const DRIFT_HOOK = [
   '  return out;',
   '};',
 ].join("\n") + "\n";
+
+// ─── FR-2.6 单 2：首次认领的多订阅歧义矩阵（行为测试；只读 selector，零生产改动） ──────────
+// 多订阅世界 = 同 endpoint 下多条订阅（FR-2.6 提案 A：同域不同群）。判据过滤顺序是
+// 语义的一部分：endpoint → active → agent → sender → event → mention → freshness →
+// chat → pending join → token（各步 file:line 见 PI-REPORT.md 矩阵表）。
+
+test("FR-2.6 单 2 · chat 维度：多订阅下 chat 证据命中唯一；谁都不中 SOURCE_SCOPE_MISMATCH；缺失则继续算且 scope_unverified 记 chat_id（shadow 语义）", () => {
+  const NOW26 = 1_757_000_000_000;
+  const subOf = (id, chatId, over = {}) => {
+    const { scope: scopeOver = {}, ...rest } = over;
+    return {
+      schema_version: "1.0", artifact_type: "feishu_bridge_subscription",
+      subscription_id: id, version: 1, endpoint_id: "ep_f26", domain_id: "dom_f26",
+      status: "active",
+      scope: { agent_uid: "agent_m5claude", transport_open_id: "ou_bot", chat_id: chatId, sender_ids: ["u_frank"], event_types: ["im.message.receive"], ...scopeOver },
+      constraints: { freshness_ms: 600000 }, ...rest,
+    };
+  };
+  const pendOf = (subId, over = {}) => ({
+    subscription_id: subId, legacy_key: "key-" + subId, local_target_id: "tgt-" + subId,
+    status: "active", inbound_state: "pending", session_bound: false,
+    pending_token: null, claim_expires_at_ms: null, ...over,
+  });
+  const evidenceOf = (over = {}) => ({
+    endpoint_id: "ep_f26", caller_agent_uid: "agent_m5claude", sender_id: "u_frank",
+    mention_ids: ["ou_bot"], event_type: "im.message.receive", chat_id: null,
+    created_at_ms: NOW26, ...over,
+  });
+  const model = { ok: true, schema_version: "1.0", subscriptions: [subOf("sub_a", "oc_a"), subOf("sub_b", "oc_b")], pending_bindings: [pendOf("sub_a"), pendOf("sub_b")] };
+  const evidence = evidenceOf();
+
+  // 命中唯一：两条订阅各挂一份 pending，chat=A 把候选收敛到 A（pending join 只看幸存候选）
+  const narrowed = selectPendingSubscriptionClaim({ model, evidence: { ...evidence, chat_id: "oc_a" }, now: NOW26 + 1000 });
+  assert.deepEqual(
+    [narrowed.ok, narrowed.subscription_id, narrowed.matched_by, narrowed.scope_unverified],
+    [true, "sub_a", "sole_pending", []],
+    "chat=A 受理且绑对订阅；chat 在场 → scope_unverified 空",
+  );
+
+  // 谁都不中：chat=C 两边都不匹配 → 精确拒 SOURCE_SCOPE_MISMATCH（反向 = 上面 chat=A 受理）
+  const stranger = selectPendingSubscriptionClaim({ model, evidence: { ...evidence, chat_id: "oc_c" }, now: NOW26 + 1000 });
+  assert.deepEqual([stranger.ok, stranger.reason], [false, SUBSCRIPTION_REJECT.SOURCE_SCOPE_MISMATCH], "chat=C 精确拒 SOURCE_SCOPE_MISMATCH");
+
+  // chat 缺失：继续算（不被拦），受理路径的 scope_unverified 含 "chat_id"（shadow 语义）
+  const unverified = selectPendingSubscriptionClaim({
+    model: { ...model, pending_bindings: [pendOf("sub_a")] },
+    evidence, now: NOW26 + 1000,
+  });
+  assert.deepEqual(
+    [unverified.ok, unverified.subscription_id, unverified.scope_unverified],
+    [true, "sub_a", ["chat_id"]],
+    "chat 缺失 → 继续算，scope_unverified 记 chat_id",
+  );
+});
+
+test("FR-2.6 单 2 · pending 维度：两订阅各一份 pending、无绑定码、chat 缺失 → AMBIGUOUS；chat 收敛解歧后受理；收敛到没挂 pending 的订阅 → NO_PENDING_BINDING", () => {
+  const NOW26 = 1_757_000_000_000;
+  const subOf = (id, chatId) => ({
+    schema_version: "1.0", artifact_type: "feishu_bridge_subscription",
+    subscription_id: id, version: 1, endpoint_id: "ep_f26", domain_id: "dom_f26",
+    status: "active",
+    scope: { agent_uid: "agent_m5claude", transport_open_id: "ou_bot", chat_id: chatId, sender_ids: ["u_frank"], event_types: ["im.message.receive"] },
+    constraints: { freshness_ms: 600000 },
+  });
+  const pendOf = (subId) => ({
+    subscription_id: subId, legacy_key: "key-" + subId, local_target_id: "tgt-" + subId,
+    status: "active", inbound_state: "pending", session_bound: false,
+    pending_token: null, claim_expires_at_ms: null,
+  });
+  const model = { ok: true, schema_version: "1.0", subscriptions: [subOf("sub_a", "oc_a"), subOf("sub_b", "oc_b")], pending_bindings: [pendOf("sub_a"), pendOf("sub_b")] };
+  const evidence = { endpoint_id: "ep_f26", caller_agent_uid: "agent_m5claude", sender_id: "u_frank", mention_ids: ["ou_bot"], event_type: "im.message.receive", created_at_ms: NOW26 };
+
+  // 正向：无绑定码 + 两份 pending + chat 缺失 → 精确拒 AMBIGUOUS
+  const ambiguous = selectPendingSubscriptionClaim({ model, evidence, now: NOW26 + 1000 });
+  assert.deepEqual([ambiguous.ok, ambiguous.reason], [false, SUBSCRIPTION_REJECT.AMBIGUOUS], "两份 pending 无码无 chat → 精确拒 AMBIGUOUS");
+
+  // 反向：chat 把候选收敛到一条 → 歧义被 chat 维度解掉，受理且绑对
+  const resolved = selectPendingSubscriptionClaim({ model, evidence: { ...evidence, chat_id: "oc_b" }, now: NOW26 + 1000 });
+  assert.deepEqual(
+    [resolved.ok, resolved.subscription_id, resolved.legacy_key, resolved.matched_by],
+    [true, "sub_b", "key-sub_b", "sole_pending"],
+    "chat 收敛解歧 → 受理绑对 sub_b",
+  );
+
+  // 反向（另一侧）：单份 pending 天然无歧义；chat 收敛到没挂 pending 的那条 → 精确拒 NO_PENDING_BINDING
+  const bare = { ...model, pending_bindings: [pendOf("sub_b")] };
+  const okSole = selectPendingSubscriptionClaim({ model: bare, evidence, now: NOW26 + 1000 });
+  assert.deepEqual([okSole.ok, okSole.subscription_id], [true, "sub_b"], "单份 pending 对照：受理");
+  const bareA = selectPendingSubscriptionClaim({ model: bare, evidence: { ...evidence, chat_id: "oc_a" }, now: NOW26 + 1000 });
+  assert.deepEqual([bareA.ok, bareA.reason], [false, SUBSCRIPTION_REJECT.NO_PENDING_BINDING], "chat 收敛到没挂 pending 的订阅 → 精确拒 NO_PENDING_BINDING");
+});
+
+test("FR-2.6 单 2 · 绑定码维度：跨订阅精确选中；两码 TOKEN_AMBIGUOUS（chat 收敛也救不了）；同码两份 TOKEN_DUPLICATED；未知码/被 chat 排除的码 TOKEN_UNKNOWN", () => {
+  const NOW26 = 1_757_000_000_000;
+  const subOf = (id, chatId) => ({
+    schema_version: "1.0", artifact_type: "feishu_bridge_subscription",
+    subscription_id: id, version: 1, endpoint_id: "ep_f26", domain_id: "dom_f26",
+    status: "active",
+    scope: { agent_uid: "agent_m5claude", transport_open_id: "ou_bot", chat_id: chatId, sender_ids: ["u_frank"], event_types: ["im.message.receive"] },
+    constraints: { freshness_ms: 600000 },
+  });
+  const pendOf = (subId, token) => ({
+    subscription_id: subId, legacy_key: "key-" + subId, local_target_id: "tgt-" + subId,
+    status: "active", inbound_state: "pending", session_bound: false,
+    pending_token: token, claim_expires_at_ms: null,
+  });
+  const model = {
+    ok: true, schema_version: "1.0",
+    subscriptions: [subOf("sub_a", "oc_a"), subOf("sub_b", "oc_b")],
+    pending_bindings: [pendOf("sub_a", "aaaaaa"), pendOf("sub_b", "bbbbbb")],
+  };
+  const evidence = { endpoint_id: "ep_f26", caller_agent_uid: "agent_m5claude", sender_id: "u_frank", mention_ids: ["ou_bot"], event_type: "im.message.receive", created_at_ms: NOW26 };
+
+  // 跨订阅：无 chat，token 指向 B 的码 → 精确选中 B（pending join 横跨两条订阅）
+  const cross = selectPendingSubscriptionClaim({ model, evidence, bindingTokens: ["bbbbbb"], now: NOW26 + 1000 });
+  assert.deepEqual(
+    [cross.ok, cross.subscription_id, cross.legacy_key, cross.matched_by],
+    [true, "sub_b", "key-sub_b", "quoted_binding_token"],
+    "绑定码跨订阅精确选中目标",
+  );
+
+  // 两码 → 精确拒 TOKEN_AMBIGUOUS；chat 收敛到 A 也救不了（token 检查不依赖 pending 集合）
+  const twoTokens = selectPendingSubscriptionClaim({ model, evidence: { ...evidence, chat_id: "oc_a" }, bindingTokens: ["aaaaaa", "bbbbbb"], now: NOW26 + 1000 });
+  assert.deepEqual([twoTokens.ok, twoTokens.reason], [false, SUBSCRIPTION_REJECT.TOKEN_AMBIGUOUS], "两码 → 精确拒 TOKEN_AMBIGUOUS");
+  // 成对反向：同一 setup 单码 → 受理
+  const oneToken = selectPendingSubscriptionClaim({ model, evidence: { ...evidence, chat_id: "oc_a" }, bindingTokens: ["aaaaaa"], now: NOW26 + 1000 });
+  assert.deepEqual([oneToken.ok, oneToken.subscription_id], [true, "sub_a"], "单码对照：受理");
+
+  // 同码两份（两条订阅各持同码）→ 精确拒 TOKEN_DUPLICATED；只留一份 → 受理（成对）
+  const dup = selectPendingSubscriptionClaim({
+    model: { ...model, pending_bindings: [pendOf("sub_a", "cccccc"), pendOf("sub_b", "cccccc")] },
+    evidence, bindingTokens: ["cccccc"], now: NOW26 + 1000,
+  });
+  assert.deepEqual([dup.ok, dup.reason], [false, SUBSCRIPTION_REJECT.TOKEN_DUPLICATED], "同码两份 → 精确拒 TOKEN_DUPLICATED");
+  const single = selectPendingSubscriptionClaim({
+    model: { ...model, pending_bindings: [pendOf("sub_a", "cccccc")] },
+    evidence, bindingTokens: ["cccccc"], now: NOW26 + 1000,
+  });
+  assert.deepEqual([single.ok, single.subscription_id], [true, "sub_a"], "同码一份对照：受理");
+
+  // 未知码 → 精确拒 TOKEN_UNKNOWN；chat 排除后的码也不可见（pending join 在 token 查找之前，钉顺序）
+  const unknown = selectPendingSubscriptionClaim({ model, evidence, bindingTokens: ["ffffff"], now: NOW26 + 1000 });
+  assert.deepEqual([unknown.ok, unknown.reason], [false, SUBSCRIPTION_REJECT.TOKEN_UNKNOWN], "未知码 → 精确拒 TOKEN_UNKNOWN");
+  const excluded = selectPendingSubscriptionClaim({ model, evidence: { ...evidence, chat_id: "oc_a" }, bindingTokens: ["bbbbbb"], now: NOW26 + 1000 });
+  assert.deepEqual([excluded.ok, excluded.reason], [false, SUBSCRIPTION_REJECT.TOKEN_UNKNOWN], "chat 收敛后别家码 → TOKEN_UNKNOWN（钉过滤顺序）");
+
+  // 证据码大小写归一：存小写、给大写照样命中
+  const upper = selectPendingSubscriptionClaim({ model, evidence, bindingTokens: ["BBBBBB"], now: NOW26 + 1000 });
+  assert.deepEqual([upper.ok, upper.subscription_id], [true, "sub_b"], "证据码大小写归一");
+});
+
+test("FR-2.6 单 2 · 状态维度：paused 订阅被 active 过滤拿掉、其 pending 不参与；chat 指向 paused → SOURCE_SCOPE_MISMATCH（状态先于 chat）；全 paused → NO_ACTIVE_SUBSCRIPTION；binding 级 status 由 claimable 过滤；version 守卫成对", () => {
+  const NOW26 = 1_757_000_000_000;
+  const subOf = (id, chatId, status = "active") => ({
+    schema_version: "1.0", artifact_type: "feishu_bridge_subscription",
+    subscription_id: id, version: 1, endpoint_id: "ep_f26", domain_id: "dom_f26",
+    status,
+    scope: { agent_uid: "agent_m5claude", transport_open_id: "ou_bot", chat_id: chatId, sender_ids: ["u_frank"], event_types: ["im.message.receive"] },
+    constraints: { freshness_ms: 600000 },
+  });
+  const pendOf = (subId, over = {}) => ({
+    subscription_id: subId, legacy_key: "key-" + subId, local_target_id: "tgt-" + subId,
+    status: "active", inbound_state: "pending", session_bound: false,
+    pending_token: null, claim_expires_at_ms: null, ...over,
+  });
+  const subA = subOf("sub_a", "oc_a", "active");
+  const subBPaused = subOf("sub_b", "oc_b", "paused");
+  const evidence = { endpoint_id: "ep_f26", caller_agent_uid: "agent_m5claude", sender_id: "u_frank", mention_ids: ["ou_bot"], event_type: "im.message.receive", created_at_ms: NOW26 };
+
+  // 钉今天的行为：paused 订阅的 pending 不参与 —— B 挂着 pending、A 没挂，无 chat 证据 →
+  // 不会落到 B 的 pending 上，而是 NO_PENDING_BINDING（active 过滤先把 B 拿掉，
+  // pending join 只看幸存候选的 subscription_id）。
+  const pausedB = selectPendingSubscriptionClaim({
+    model: { ok: true, schema_version: "1.0", subscriptions: [subA, subBPaused], pending_bindings: [pendOf("sub_b")] },
+    evidence, now: NOW26 + 1000,
+  });
+  assert.deepEqual([pausedB.ok, pausedB.reason], [false, SUBSCRIPTION_REJECT.NO_PENDING_BINDING], "paused 订阅的 pending 不参与（订阅级过滤存在）");
+
+  // 过滤顺序：chat 指向 paused 的 B → 不是 NO_ACTIVE_SUBSCRIPTION 而是 SOURCE_SCOPE_MISMATCH
+  //（B 在 active 过滤已被拿掉，chat 过滤作用在只剩 A 的候选上）。钉顺序，不钉巧合。
+  const chatPaused = selectPendingSubscriptionClaim({
+    model: { ok: true, schema_version: "1.0", subscriptions: [subA, subBPaused], pending_bindings: [pendOf("sub_b")] },
+    evidence: { ...evidence, chat_id: "oc_b" }, now: NOW26 + 1000,
+  });
+  assert.deepEqual([chatPaused.ok, chatPaused.reason], [false, SUBSCRIPTION_REJECT.SOURCE_SCOPE_MISMATCH], "状态过滤先于 chat 过滤");
+
+  // 全 paused → 精确拒 NO_ACTIVE_SUBSCRIPTION（该过滤存在的直接正证；反向 = 上面 pausedB 场景换 active A 有 pending 即受理）
+  const allPaused = selectPendingSubscriptionClaim({
+    model: { ok: true, schema_version: "1.0", subscriptions: [subBPaused, subOf("sub_c", "oc_c", "paused")], pending_bindings: [pendOf("sub_b")] },
+    evidence, now: NOW26 + 1000,
+  });
+  assert.deepEqual([allPaused.ok, allPaused.reason], [false, SUBSCRIPTION_REJECT.NO_ACTIVE_SUBSCRIPTION], "全 paused → 精确拒 NO_ACTIVE_SUBSCRIPTION");
+  const notAllPaused = selectPendingSubscriptionClaim({
+    model: { ok: true, schema_version: "1.0", subscriptions: [subA, subBPaused], pending_bindings: [pendOf("sub_a")] },
+    evidence, now: NOW26 + 1000,
+  });
+  assert.deepEqual([notAllPaused.ok, notAllPaused.subscription_id], [true, "sub_a"], "存在 active 订阅对照：受理");
+
+  // binding 级 status **由 claimable 过滤**（subscription.mjs:215 `binding.status !== "active"`，
+  // 另有 inbound_state :216、session_bound :217）。投影可产出「订阅 active + binding paused」
+  // （同一订阅先 paused 后重新 pending，同 subscriptionId 的新旧 binding 并存）—— 此时旧 paused
+  // binding 不参与认领：它的码查不到（TOKEN_UNKNOWN），也不计入 AMBIGUOUS。两格都钉。
+  const mixedBindings = selectPendingSubscriptionClaim({
+    model: {
+      ok: true, schema_version: "1.0", subscriptions: [subA],
+      pending_bindings: [pendOf("sub_a", { status: "paused", legacy_key: "key-paused", pending_token: "dddddd" }), pendOf("sub_a", { pending_token: "eeeeee" })],
+    },
+    evidence, bindingTokens: ["dddddd"], now: NOW26 + 1000,
+  });
+  assert.deepEqual(
+    [mixedBindings.ok, mixedBindings.reason],
+    [false, SUBSCRIPTION_REJECT.TOKEN_UNKNOWN],
+    "paused binding 的码查不到（claimable 先过滤）",
+  );
+  const mixedNoToken = selectPendingSubscriptionClaim({
+    model: {
+      ok: true, schema_version: "1.0", subscriptions: [subA],
+      pending_bindings: [pendOf("sub_a", { status: "paused", legacy_key: "key-paused", pending_token: "dddddd" }), pendOf("sub_a", { pending_token: "eeeeee" })],
+    },
+    evidence, now: NOW26 + 1000,
+  });
+  assert.deepEqual(
+    [mixedNoToken.ok, mixedNoToken.subscription_id, mixedNoToken.legacy_key, mixedNoToken.matched_by],
+    [true, "sub_a", "key-sub_a", "sole_pending"],
+    "paused binding 不计入 AMBIGUOUS：只剩 active那份 → 受理绑对",
+  );
+
+  // version 卫兵成对：v1 模型照常受理；同模型 version=2 → 精确拒 PROJECTION_INVALID
+  //（前向兼容卫兵；本矩阵所有夹具因此全用 version 1，与写路径版本前进的衔接是切流单的事）
+  const v1Model = {
+    ok: true, schema_version: "1.0", subscriptions: [subA],
+    pending_bindings: [pendOf("sub_a", { pending_token: "eeeeee" })],
+  };
+  const v1Ok = selectPendingSubscriptionClaim({ model: v1Model, evidence, bindingTokens: ["eeeeee"], now: NOW26 + 1000 });
+  assert.deepEqual([v1Ok.ok, v1Ok.subscription_id], [true, "sub_a"], "version=1 对照：受理");
+  const guarded = selectPendingSubscriptionClaim({ model: { ...v1Model, subscriptions: [{ ...subA, version: 2 }] }, evidence, bindingTokens: ["eeeeee"], now: NOW26 + 1000 });
+  assert.deepEqual([guarded.ok, guarded.reason], [false, SUBSCRIPTION_REJECT.PROJECTION_INVALID], "version=2 → 精确拒 PROJECTION_INVALID");
+});
 
 test("控制事务的换绑窗口（评审 #97）：事务锁内核验通过之后、策略写锁取得之前登记表换了绑定 → 写锁内前置条件拒写、模式不变、不落 consumed、入口非零", () => {
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-drift-"));

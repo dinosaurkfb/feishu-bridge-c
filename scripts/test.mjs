@@ -211,7 +211,7 @@ import {
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
 import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION_KEYED, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, selectPendingSubscriptionClaim, stableControlId, subscriptionIdFor, validateSubscription, claimable } from "./subscription.mjs";
-import { applySubscriptionChange, loadSubscriptionStore, planSubscriptionChange, planSubscriptionEntry } from "./subscription-store.mjs";
+import { applySubscriptionChange, loadSubscriptionAudit, loadSubscriptionStore, planSubscriptionChange, planSubscriptionEntry } from "./subscription-store.mjs";
 import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
@@ -20191,6 +20191,110 @@ test("FR-2.6 单 3：展示三级群名 —— 条目自带 > 模板匹配 > 群
   assert.match(damaged.stdout, /控制面 store 损坏（1 个问题），已按 legacy 显示。/u);
 });
 
+// ─── FR-2.6 单 4：订阅审计记录（<store>.audit.jsonl，append-only，事务内写） ─────────────
+
+test("FR-2.6 单 4：四动作各一行字段齐、store_bytes_sha256 与盘上文件实测一致、没动/拒绝零行、append-only 顺序稳定；dry-run 零副作用照旧", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-fr26-audit-"));
+  const templateFile = path.join(local, "chain-config.json");
+  const TPL26 = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  fs.writeFileSync(templateFile, JSON.stringify(TPL26));
+  const storeFile = path.join(local, "subs", "subscriptions.json");
+  const auditFile = storeFile + ".audit.jsonl";
+  const run = (args) => spawnSync(process.execPath, [path.resolve("scripts", "register-subscription.mjs"), ...args], { encoding: "utf-8", env: { ...process.env, HOME: local } });
+  const base = ["--store", storeFile, "--template", templateFile, "--runtime", "claude", "--domain-key", "/p1"];
+  const lines = () => fs.readFileSync(auditFile, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+  const diskHash = () => createHash("sha256").update(fs.readFileSync(storeFile)).digest("hex").slice(0, 16);
+
+  // dry-run 零副作用照旧：store 与审计文件都不出现
+  assert.equal(run([...base, "--chat-id", "oc_second", "--chat-name", "项目二群"]).status, 0);
+  assert.ok(!fs.existsSync(storeFile) && !fs.existsSync(auditFile), "dry-run：store 与审计文件都不出现");
+
+  // add → pause → resume 各一行；每行的哈希与**那一笔写盘之后**的文件实测哈希一致（行为断言，不是复述字段）
+  const expectedId = stableControlId("subscription", legacyEndpointId({ runtime: "claude", agentUid: TPL26.agent_uid }), stableControlId("domain", "claude", "/p1"), "oc_second", TPL26.agent_uid);
+  for (const [action, versionAfter] of [["add", 1], ["pause", 2], ["resume", 3]]) {
+    const args = action === "add"
+      ? [...base, "--chat-id", "oc_second", "--chat-name", "项目二群", "--apply"]
+      : [...base, "--chat-id", "oc_second", "--" + action, "--apply"];
+    const r = run(args);
+    assert.equal(r.status, 0, action + "：" + r.stdout + r.stderr);
+    const audit = lines();
+    assert.equal(audit.length, { add: 1, pause: 2, resume: 3 }[action], action + " 后累计行数（append-only）");
+    const last = audit[audit.length - 1];
+    assert.deepEqual(
+      [last.schema_version, last.action, last.subscription_id, last.version_after, last.store_bytes_sha256],
+      ["1.0", action, expectedId, versionAfter, diskHash()],
+      action + " 行字段齐且哈希与盘上文件一致：" + JSON.stringify(last));
+    assert.ok(!Number.isNaN(Date.parse(last.at)), "at 是 ISO 时间");
+    assert.ok(!("chat_name" in last) && !("sender_ids" in last), "审计行不夹带敏感值");
+  }
+
+  // 没动（幂等）与拒绝（同 id 重复登记）都不写行
+  const before = lines().length;
+  const noop = run([...base, "--chat-id", "oc_second", "--resume", "--apply"]);
+  assert.deepEqual([noop.status, /没动/u.test(noop.stdout)], [0, true], noop.stdout);
+  const dup = run([...base, "--chat-id", "oc_second", "--apply"]);
+  assert.deepEqual([dup.status, /subscription_exists/u.test(dup.stdout)], [1, true], dup.stdout);
+  assert.equal(lines().length, before, "没动/拒绝零审计行");
+
+  // remove：version_after 为 null、行仍追加；顺序稳定 add → pause → resume → remove
+  const rm = run([...base, "--chat-id", "oc_second", "--remove", "--apply"]);
+  assert.equal(rm.status, 0, rm.stdout + rm.stderr);
+  const audit = lines();
+  assert.deepEqual(audit.map((e) => e.action), ["add", "pause", "resume", "remove"]);
+  assert.deepEqual(audit[3].version_after, null, "remove 无变更后条目，version_after = null");
+  assert.equal(audit[3].store_bytes_sha256, diskHash());
+  assert.deepEqual(JSON.parse(fs.readFileSync(storeFile, "utf-8")).subscriptions, [], "remove 后 store 空表，审计仍完整（append-only 不随删条目回滚）");
+  const readback = loadSubscriptionAudit({ file: storeFile });
+  assert.deepEqual([readback.ok, readback.absent, readback.events.length, readback.problems], [true, false, 4, []]);
+});
+
+test("FR-2.6 单 4：审计目录/占用不阻断变更（成功但要人知道：auditUnwritten + CLI 非零）；loadSubscriptionAudit 坏行不吞、缺席与符号链接语义；不建 store 的机器零审计文件", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-fr26-auditbad-"));
+  const templateFile = path.join(local, "chain-config.json");
+  const TPL26 = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  fs.writeFileSync(templateFile, JSON.stringify(TPL26));
+  const storeFile = path.join(local, "subs", "subscriptions.json");
+  const auditFile = storeFile + ".audit.jsonl";
+  const run = (args) => spawnSync(process.execPath, [path.resolve("scripts", "register-subscription.mjs"), ...args], { encoding: "utf-8", env: { ...process.env, HOME: local } });
+  const base = ["--store", storeFile, "--template", templateFile, "--runtime", "claude", "--domain-key", "/p1"];
+
+  // 失败注入：.audit.jsonl 预置为目录 → 追加必失败。store 变更成立 + auditUnwritten + CLI 非零
+  const add = run([...base, "--chat-id", "oc_second", "--apply"]);
+  assert.equal(add.status, 0, add.stdout + add.stderr);
+  fs.rmSync(auditFile);
+  fs.mkdirSync(auditFile);
+  const pause = run([...base, "--chat-id", "oc_second", "--pause", "--apply"]);
+  assert.equal(pause.status, 1, "store 写成 + 审计丢了 = 成功但要人知道，非零退出：" + pause.stdout + pause.stderr);
+  assert.match(pause.stdout, /变更已写入，但审计行没写成（audit_append_failed:EISDIR）/u, pause.stdout);
+  const entry = JSON.parse(fs.readFileSync(storeFile, "utf-8")).subscriptions[0];
+  assert.deepEqual([entry.status, entry.version], ["paused", 2], "store 变更成立不回滚，字节正确");
+  assert.ok(fs.lstatSync(auditFile).isDirectory(), "注入的目录没被改写");
+
+  // loadSubscriptionAudit：缺席 = 没变更过；坏行不吞（JSON 坏 / 形状说不清都报行号）；符号链接拒
+  assert.deepEqual(loadSubscriptionAudit({ file: path.join(local, "none", "subs.json") }),
+    { ok: true, absent: true, events: [], problems: [] });
+  fs.rmdirSync(auditFile);
+  fs.writeFileSync(auditFile, [
+    JSON.stringify({ schema_version: "1.0", at: "2026-09-02T00:00:00.000Z", action: "add", subscription_id: "s1", version_after: 1, store_bytes_sha256: "0123456789abcdef" }),
+    "{not json",
+    JSON.stringify({ action: 1 }),
+    "",
+  ].join("\n") + "\n");
+  const bad = loadSubscriptionAudit({ file: storeFile });
+  assert.equal(bad.ok, false, "有坏行 ok:false，不吞");
+  assert.deepEqual(bad.events.length, 1, "好行照常返回");
+  assert.deepEqual(bad.problems, ["line:2:json_invalid", "line:3:shape_invalid"], JSON.stringify(bad.problems));
+  fs.rmSync(auditFile);
+  fs.symlinkSync(templateFile, auditFile);
+  assert.equal(loadSubscriptionAudit({ file: storeFile }).reason, "audit_not_regular_file", "审计读不认符号链接（与 store 同款纪律）");
+  fs.rmSync(auditFile);
+
+  // 不建 store 的机器零审计文件：动作被拒（store 没建成）时审计也不出现
+  const fresh = path.join(local, "elsewhere", "subs.json");
+  const ghost = run(["--store", fresh, "--template", templateFile, "--runtime", "claude", "--domain-key", "/p2", "--chat-id", "oc_x", "--pause", "--apply"]);
+  assert.equal(ghost.status, 1, ghost.stdout + ghost.stderr);
+  assert.ok(!fs.existsSync(fresh) && !fs.existsSync(fresh + ".audit.jsonl"), "拒绝路径零落盘：store 与审计都不出现");
+});
 test("控制事务的换绑窗口（评审 #97）：事务锁内核验通过之后、策略写锁取得之前登记表换了绑定 → 写锁内前置条件拒写、模式不变、不落 consumed、入口非零", () => {
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-drift-"));
   const root = path.join(local, "project"); const bin = path.join(local, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);

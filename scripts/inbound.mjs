@@ -47,6 +47,7 @@ import {
   pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction,
 } from "./live-session.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
+import { appendChannelSample, channelDisposition } from "./channel-samples.mjs";
 import {
   appendConsumed, buildClaudeSubscriptionProjection, evaluatePromotion, findBindingForSession,
   findPendingBinding, promoteBinding, shadowClaudeFirstClaim, evaluateChatGates, CHAT_FALLBACK_REASONS,
@@ -95,6 +96,8 @@ let CLAIMS = path.join(RT, "delivery-claims");
 let RECEIPTS = path.join(RT, "receipts");
 let RUNS = path.join(RT, "runs");
 let LOCK = path.join(RT, "session.lock");
+// 采样旁路文件：机器级 inbound 目录（UNROUTED_RT），主链路换项目（useProject）也不换地方。
+const CHANNEL_SAMPLES_FILE = path.join(UNROUTED_RT, "channel-samples.jsonl");
 
 function useProject(root) {
   RT = rtOf(root);
@@ -161,7 +164,27 @@ function ackText(kind, detail) {
   ].join("\n");
 }
 
+// ---------- 频道定位采样旁路（不承重）----------
+// 取到事件之前 sampleCtx 为 null：那几条是系统错误 / 模板不可用 / 信封失败，不是入站消息，不入样本。
+let sampleCtx = null; // { event, canonical, template, chain }
+function recordChannelSample(kind, reason) {
+  if (!sampleCtx) return;
+  // appendChannelSample 全包 try/catch，失败静默返回 { ok:false, reason }，绝不阻断主流程，
+  // 也绝不污染进程输出（Aily 会把 stdout+stderr 合并进模型上下文）—— 原因只落机器级诊断文件
+  // <dir>/channel-samples.diag.log（见 channel-samples.mjs）。
+  appendChannelSample({
+    file: CHANNEL_SAMPLES_FILE,
+    event: sampleCtx.event,
+    canonical: sampleCtx.canonical,
+    template: sampleCtx.template,
+    chain: sampleCtx.chain,
+    env: process.env,
+    disposition: channelDisposition(kind, reason),
+  });
+}
+
 function finish(kind, detail, result) {
+  recordChannelSample(kind, result?.reason);
   process.stdout.write(ackText(kind, detail) + "\n");
   process.stderr.write(JSON.stringify({ kind, ...result }) + "\n");
   process.exit(kind === "error" ? 1 : 0);
@@ -304,6 +327,13 @@ if (!fetched.ok) {
   finish("error", { detail: "取不到本次消息信封（" + fetched.reason + "）" }, { reason: fetched.reason });
 }
 const event = fetched.event;
+// 采样的上下文在事件可取之后才成立；早于事件的那几条 finish 记录不到（不是入站消息）。
+sampleCtx = {
+  event,
+  canonical: fetched.canonical_event ?? null,
+  template: bootTpl.ok ? bootTpl.template : null,
+  chain: "claude",
+};
 const dryRun = process.argv.includes("--dry-run");
 
 // ---------- 路由：这条消息属于哪个项目 ----------

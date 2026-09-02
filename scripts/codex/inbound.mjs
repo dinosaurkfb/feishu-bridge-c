@@ -49,6 +49,7 @@ import { authorize, CAPABILITY } from "../authorize.mjs";
 import { isDirectRun } from "../direct-run.mjs";
 import { composeCrashReceipt } from "../crash-receipt.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
+import { appendChannelSample, channelDisposition } from "../channel-samples.mjs";
 /**
  * 整个入站流程包在 main() 里，只有被直接执行时才跑。
  *
@@ -67,6 +68,8 @@ async function main() {
 const BRIDGE_ROOT = moduleRoot(import.meta.url, "../..");
 const HOME = bridgeHome();
 let receiptDir = path.join(HOME, "receipts");
+// 采样旁路文件：机器级 codex inbound 目录（跟随 FEISHU_CODEX_BRIDGE_HOME）。
+const CHANNEL_SAMPLES_FILE = path.join(HOME, "inbound", "channel-samples.jsonl");
 
 function writeReceipt(name, payload) {
   try {
@@ -212,7 +215,27 @@ function ackText(kind, detail) {
   return "系统错误 · " + detail.detail + "\n本条指令没有被投递，请勿视为已受理。";
 }
 
+// ---------- 频道定位采样旁路（不承重）----------
+// 取到事件之前 sampleCtx 为 null：那几条是系统错误 / 模板不可用 / 信封失败，不是入站消息，不入样本。
+let sampleCtx = null; // { event, canonical, template, chain }
+function recordChannelSample(kind, reason) {
+  if (!sampleCtx) return;
+  // appendChannelSample 全包 try/catch，失败静默返回 { ok:false, reason }，绝不阻断主流程，
+  // 也绝不污染进程输出（Aily 会把 stdout+stderr 合并进模型上下文）—— 原因只落机器级诊断文件
+  // <dir>/channel-samples.diag.log（见 channel-samples.mjs）。
+  appendChannelSample({
+    file: CHANNEL_SAMPLES_FILE,
+    event: sampleCtx.event,
+    canonical: sampleCtx.canonical,
+    template: sampleCtx.template,
+    chain: sampleCtx.chain,
+    env: process.env,
+    disposition: channelDisposition(kind, reason),
+  });
+}
+
 function finish(kind, detail, _result) {
+  recordChannelSample(kind, _result?.reason);
   process.stdout.write(ackText(kind, detail) + "\n");
   // Aily 的 exec_command 会把 stdout 与 stderr 合并进模型可见输出。结构化诊断若写到
   // stderr，就会被 M5Codex 原样带回飞书并泄露 task locator。机器证据已写入 Git 外
@@ -247,6 +270,13 @@ if (!fetched.ok) {
   finish("error", { detail: "取不到本次消息信封（" + fetched.reason + "）" }, { reason: fetched.reason });
 }
 const event = fetched.event;
+// 采样的上下文在事件可取之后才成立；早于事件的那几条 finish 记录不到（不是入站消息）。
+sampleCtx = {
+  event,
+  canonical: fetched.canonical_event ?? null,
+  template: template.ok ? template.template : null,
+  chain: "codex",
+};
 
 let routed = findTaskForFeishuSession({ sessionId: event.session_id, home: HOME });
 let justBound = false;

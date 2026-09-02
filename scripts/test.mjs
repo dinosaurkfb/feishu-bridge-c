@@ -18,6 +18,7 @@ import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome
 import { parseChatScratchSweepArgs, describeScratchSweep, sweepExitCode } from "./chat-scratch-sweep.mjs";
 import { acquireLockUngated, acquirePublishLock as acquireLedgerLock, releasePublishLock as releaseLedgerLock } from "./registry.mjs";
 import { evaluateChatGates, CHAT_FALLBACK_REASONS, isOffTemplateChatTurn } from "./inbound-route.mjs";
+import { appendChannelSample, channelDisposition, channelSampleProblem, channelSampleSha16, loadChannelSamples } from "./channel-samples.mjs";
 import { ZERO_TOOL_ARGS } from "./handoff.mjs";
 import { INTENT, parseInboundIntent, controlRejectText, rejectedControlProjection, shown } from "./inbound-intent.mjs";
 import { rejectedRecordProblem, runRejectTransaction, inspectRejectedClaim, resumeRejectedClaim, describeRejectRepair, rejectRepairExitCode } from "./reject-control.mjs";
@@ -23692,6 +23693,283 @@ test("doctor ①：self 是本桥自身 → 豁免；叫 self 但 handler 在外
     assert.match(one.detail, /1 条路由没有状态入口：cc2cd/u, "只数外部路由：" + one.detail);
     assert.match(one.detail, /self 是本桥自身.{0,40}不计入/u, "self 豁免要说明：" + one.detail);
   }
+});
+
+// ---------- #R11 频道定位采样旁路 ----------
+// 建一个「无真实 @ 运输 agent」的消息（content 里没有 <at>），让入站链在取到事件后走到
+// transport_not_mentioned 硬拒绝 —— 最便宜的终态，且 event 已取、sampleCtx 已就位。
+const chanRunHarness = (projects = []) => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-cs-"));
+  const bin = path.join(local, "bin"); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json");
+  const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects }));
+  fs.writeFileSync(path.join(bin, "aily-cli"),
+    ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n",
+    { mode: 0o700 });
+  const run = ({ messageId, envChat, envThread, projectSession }) => {
+    const sessionId = projectSession ?? "sess_cs";
+    const content = "hello 没有 @ 运输 agent";
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({
+      message: { id: messageId, sessionID: sessionId, role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content },
+    }) }] });
+    const extra = {};
+    if (envChat !== undefined) extra.AILY_CLI_CHANNEL_CHAT_ID = envChat;
+    if (envThread !== undefined) extra.AILY_CLI_CHANNEL_THREAD_ID = envThread;
+    return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
+      env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local,
+        FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+        AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: sessionId, AILY_CLI_RUN_ID: "run_cs",
+        FAKE_AILY_ENVELOPE: envelope, ...extra } });
+  };
+  return { local, sampleFile: path.join(local, ".claude", "feishu-bridge", "inbound", "channel-samples.jsonl"), run };
+};
+
+// 三态：env==群chat → true；env==其他 → false；env缺失 → null（channel_chat/thread 都缺）
+test("#R11 Claude 链采样三态：频道==登记群 → true；不一致 → false；locator 缺失 → null 且不泄明文", () => {
+  const { run, sampleFile } = chanRunHarness();
+  const r1 = run({ messageId: "om_cs_grp", envChat: TPL.chat_id, envThread: "om_cs_thread" });
+  assert.equal(r1.status, 0, r1.stderr);
+  const r2 = run({ messageId: "om_cs_dm", envChat: "oc_p2p_direct" });
+  assert.equal(r2.status, 0, r2.stderr);
+  const r3 = run({ messageId: "om_cs_miss" });
+  assert.equal(r3.status, 0, r3.stderr);
+  assert.equal(fs.existsSync(sampleFile), true, "采样文件应已生成");
+  const lines = fs.readFileSync(sampleFile, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.equal(lines.length, 3, "每条入站消息各一行");
+  const [a, b, c] = lines;
+  assert.equal(a.matches_template_chat, true, "频道==登记群 → true");
+  assert.equal(b.matches_template_chat, false, "频道≠登记群 → false");
+  assert.equal(c.matches_template_chat, null, "locator 缺失 → null");
+  assert.equal(typeof a.channel_chat_sha16, "string", "频道存在时只能落哈希");
+  assert.equal(typeof b.channel_chat_sha16, "string", "不一致频道也只落哈希");
+  assert.equal(a.channel_chat_sha16 === b.channel_chat_sha16, false, "不同频道不同哈希");
+  assert.equal(c.channel_chat_sha16, null, "locator 缺失 → 频道哈希 null");
+  assert.equal(a.channel_thread_sha16, channelSampleSha16("om_cs_thread"), "线程同规则哈希");
+  assert.equal(b.channel_thread_sha16, null);
+  assert.equal(a.chain, "claude");
+  assert.match(a.disposition, /^rejected:[a-z][a-z0-9_]*$/u, "无 @ → rejected:<snake 原因>：" + a.disposition);
+  for (const row of lines) {
+    assert.equal(row.schema_version, "1.0");
+    assert.equal(typeof row.message_id, "string", "message_id 不落明文");
+    assert.equal(typeof row.session_sha16, "string", "session 不落明文");
+    assert.doesNotMatch(JSON.stringify(row), /oc_|ou_|om_/u, "整行不许出现任何 locator 明文前缀");
+  }
+});
+
+// 采样失败不得影响主流程：把采样文件做成目录 → EISDIR，链照常拒绝、退出 0、目录仍在。
+// #R9：失败一个字都不往进程输出写（Aily 会把 stdout+stderr 合并进模型上下文），只落机器级诊断文件。
+test("#R11 采样失败不影响主流程（EISDIR 隔离）：文件是目录 → 输出干净、diag 一行、不替换目录", () => {
+  const { run, sampleFile } = chanRunHarness();
+  fs.mkdirSync(path.dirname(sampleFile), { recursive: true });
+  fs.mkdirSync(sampleFile); // 把采样文件位做成目录
+  const r = run({ messageId: "om_cs_eisdir", envChat: TPL.chat_id });
+  assert.equal(r.status, 0, "主流程退出码不受采样失败影响：" + r.stderr);
+  assert.match(r.stdout, /已拒绝/u, "正常拒绝回执仍在：" + r.stdout);
+  assert.doesNotMatch(r.stdout, /采样|channel-samples|diag/u, "stdout 不许出现采样失败字样：" + r.stdout);
+  assert.doesNotMatch(r.stderr, /采样|channel-samples|diag/u, "stderr 不许出现采样失败字样（会进模型上下文）：" + r.stderr);
+  assert.equal(fs.statSync(sampleFile).isDirectory(), true, "目录不被采样替换");
+  const diagFile = path.join(path.dirname(sampleFile), "channel-samples.diag.log");
+  assert.equal(fs.existsSync(diagFile), true, "机器级诊断文件应产生");
+  const diag = fs.readFileSync(diagFile, "utf-8").trim();
+  assert.match(diag, /channel_sample_write_failed|EISDIR/u, "诊断记下失败根因：" + diag);
+  assert.equal(diag.split("\n").length, 1, "只落一行诊断（" + diag + "）");
+});
+
+// loadChannelSamples + 唯一封闭校验器 channelSampleProblem：
+// #R9 评审 P1 —— 探针写入含 extra key/明文 oc_/坏时间/伪哈希/越界 disposition 的行，
+// loadChannelSamples 必须各拒（不把不符写方封闭 shape 的行当干净证据），写方同判据写不出坏行。
+test("#R11 loadChannelSamples + channelSampleProblem：好行收进 rows，探针坏行矩阵各拒，nlink/尾换行与 subscription-store 同款", () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-csl-")), "channel-samples.jsonl");
+  const good = { schema_version: "1.0", at: "2026-09-02T00:00:00.000Z", chain: "claude", message_id: "a".repeat(16), session_sha16: "b".repeat(16), channel_chat_sha16: "c".repeat(16), channel_thread_sha16: null, matches_template_chat: true, disposition: "bound" };
+  const withAdd = (patch) => JSON.stringify({ ...good, ...patch });
+  const probeRows = [
+    [withAdd({ raw_locator: "oc_secret" }), /extra_keys:raw_locator/u],      // 多余键
+    [withAdd({ session_sha16: "oc_secret" }), /session_sha16:bad_hash/u],    // 明文 oc_（非法哈希）
+    [withAdd({ at: "not-a-time" }), /at$/u],                                // 坏时间
+    [withAdd({ channel_chat_sha16: "a" }), /channel_chat_sha16:bad_hash/u],  // 伪哈希（1 字符）
+    [withAdd({ disposition: "garbage" }), /:disposition/u],                  // 越界 disposition
+    [withAdd({ channel_thread_sha16: "x" }), /channel_thread_sha16:bad_hash/u],
+    [JSON.stringify({ schema_version: "2.0", at: "2026-09-02T00:00:00.000Z", chain: "nope", message_id: "a".repeat(16), session_sha16: "b".repeat(16), channel_chat_sha16: "c".repeat(16), channel_thread_sha16: null, matches_template_chat: true, disposition: "bound" }), /schema_version|:chain,/u],
+    ["{not json", /json_invalid/u],
+  ];
+  const missingKey = { ...good }; delete missingKey.session_sha16;
+  probeRows.push([JSON.stringify(missingKey), /missing_keys:session_sha16/u]);
+  // 好行 + 各探针行 + 尾无换行（截断风险）
+  fs.writeFileSync(f, JSON.stringify(good) + "\n" + probeRows.map((r) => r[0]).join("\n"));
+  const loaded = loadChannelSamples({ file: f });
+  assert.equal(loaded.ok, true);
+  assert.equal(loaded.absent, false);
+  assert.equal(loaded.rows.length, 1, "只有干净好行进 rows");
+  assert.deepEqual(loaded.rows[0].message_id, "a".repeat(16));
+  assert.equal(loaded.problems.length, probeRows.length + 1, "每个探针行各一条 + 尾换行一条（" + loaded.problems.join(", ") + "）");
+  for (let i = 0; i < probeRows.length; i++) {
+    const [rowText, rx] = probeRows[i];
+    const idx = loaded.problems.findIndex((p) => p.startsWith("line:" + (i + 2)));
+    assert.ok(idx !== -1, "第 " + (i + 2) + " 行应被判坏（" + rowText + "）");
+    assert.match(loaded.problems[idx], rx, "第 " + (i + 2) + " 行判坏原因：" + loaded.problems[idx]);
+  }
+  assert.ok(loaded.problems.some((p) => /tail_no_newline/u.test(p)), "尾无换行 → 文件级 problem（" + loaded.problems.join(", ") + "）");
+  // 尾换行干净文件 → 无 tail_no_newline
+  const f2 = path.join(path.dirname(f), "clean.jsonl");
+  fs.writeFileSync(f2, JSON.stringify(good) + "\n");
+  assert.equal(loadChannelSamples({ file: f2 }).problems.length, 0, "干净文件无 problem");
+  // absent
+  const missing = loadChannelSamples({ file: f + ".nope" });
+  assert.equal(missing.ok, true);
+  assert.equal(missing.absent, true);
+  // 目录
+  const dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-csd-")), "sub"); fs.mkdirSync(dir);
+  const asDir = loadChannelSamples({ file: dir });
+  assert.equal(asDir.ok, false);
+  assert.equal(asDir.reason, "channel_samples_not_regular_file");
+  // 硬链接别名（nlink>1）
+  const hlink = f + ".hl";
+  try { fs.linkSync(f, hlink); } catch { /* 可能不支持硬链接，跳过 */ }
+  if (fs.existsSync(hlink)) {
+    const asLink = loadChannelSamples({ file: hlink });
+    assert.equal(asLink.ok, false);
+    assert.equal(asLink.reason, "channel_samples_not_regular_file");
+    assert.match(asLink.detail || "", /硬链接/u, "硬链接别名被拒：" + JSON.stringify(asLink));
+  }
+  // 写方同判据写不出坏行：越界 disposition → append 返回 invalid、文件不落
+  const badOut = appendChannelSample({ file: f + ".bad", event: { message_id: "om_x", session_id: "s", created_at_ms: 1750000000000 }, canonical: null, template: TPL, chain: "claude", env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id }, disposition: "garbage" });
+  assert.equal(badOut.ok, false);
+  assert.equal(badOut.reason, "channel_sample_invalid");
+  assert.match((badOut.problems || []).join(","), /disposition/u);
+  assert.equal(fs.existsSync(f + ".bad"), false, "坏行写不出去");
+  // 好行经 append → load 回读 problems:[]
+  const goodOut = appendChannelSample({ file: f + ".ok", event: { message_id: "om_y", session_id: "s", created_at_ms: 1750000000000 }, canonical: null, template: TPL, chain: "claude", env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id }, disposition: "rejected:transport_not_mentioned" });
+  assert.equal(goodOut.ok, true);
+  assert.equal(loadChannelSamples({ file: f + ".ok" }).rows.length, 1);
+  assert.equal(channelSampleProblem(good).length, 0, "干净行 0 问题");
+  assert.equal(channelDisposition("rejected", "transport_not_mentioned"), "rejected:transport_not_mentioned");
+  assert.equal(channelDisposition("bound", "x"), "bound");
+  assert.equal(channelSampleSha16("oo"), createHash("sha256").update("oo").digest("hex").slice(0, 16));
+  assert.equal(channelSampleSha16(""), null);
+  assert.equal(channelSampleSha16(null), null);
+});
+
+// ─── #R10 评审修复：accepted 真入口 + 写侧守卫 + 判据收紧 ───────────────────────────────
+// P1-1 修复后的真入口：bound 项目收到带真实 @ 的业务消息，无 live session → fresh handOff →
+// finish("accepted")。修复前 disposition="accepted" 不在 DISPOSITION_KINDS 里，\
+// channelSampleProblem 拒掉该行 → 成功投递却一行采样都不落。修复后必须落一行 disposition=accepted。
+const chanAcceptHarness = () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-csa-"));
+  const root = path.join(local, "project");
+  const bin = path.join(local, "bin");
+  fs.mkdirSync(root); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json");
+  const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, auto_publish_on_completion: false }));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{
+    id: "ctl", root, name: "演示", root_message_id: "om_ctl", expires_at: "2099-01-01T00:00:00Z",
+    session_id: "aily_cc1", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z",
+  }] }));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, "claude"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  // handOff 要求 hasPriorSession：先在 transcriptDirFor(root) 种一个 .jsonl
+  const projectsDir = path.join(local, ".claude", "projects", root.replace(/\//g, "-"));
+  fs.mkdirSync(projectsDir, { recursive: true });
+  fs.writeFileSync(path.join(projectsDir, "prior.jsonl"), "{}\n");
+  const run = (messageId) => {
+    const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> 请帮我写一小段测试代码";
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: {
+      id: messageId, sessionID: "aily_cc1", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content,
+    } }) }] });
+    return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
+      env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local,
+        FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+        AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_cc1", AILY_CLI_RUN_ID: "run_acc", FAKE_AILY_ENVELOPE: envelope } });
+  };
+  return { run, sampleFile: path.join(local, ".claude", "feishu-bridge", "inbound", "channel-samples.jsonl") };
+};
+
+test("#R10 Claude 真入口 accepted：成功投递落下 disposition=accepted 采样行，不泄明文", () => {
+  const { run, sampleFile } = chanAcceptHarness();
+  const r = run("msg_acc_c1");
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^已受理 · 演示/u, r.stdout);
+  assert.equal(fs.existsSync(sampleFile), true, "accepted 成功投递后应落采样文件");
+  const rows = fs.readFileSync(sampleFile, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.equal(rows.length, 1, "一行采样");
+  const [row] = rows;
+  assert.equal(row.disposition, "accepted", "P1-1：accepted 必须被枚举接受（" + row.disposition + "）");
+  assert.equal(row.chain, "claude");
+  assert.equal(row.schema_version, "1.0");
+  assert.equal(typeof row.message_id, "string", "message_id 落哈希不落明文");
+  assert.equal(channelSampleSha16("msg_acc_c1"), row.message_id, "message_id 是 msg_acc_c1 的 sha16");
+  assert.doesNotMatch(JSON.stringify(row), /oc_|ou_|om_/u, "整行不泄任何 locator 明文前缀");
+  assert.equal(channelSampleProblem(row).length, 0, "行过封闭校验器");
+});
+
+test("#R10 判据收紧（P2-1）+ accepted 入枚举（P1-1）+ 值域 fuzz（P1-2）", () => {
+  const good = { schema_version: "1.0", at: "2026-09-02T00:00:00.000Z", chain: "claude", message_id: "a".repeat(16), session_sha16: "b".repeat(16), channel_chat_sha16: "c".repeat(16), channel_thread_sha16: null, matches_template_chat: true, disposition: "bound" };
+  assert.equal(channelSampleProblem(good).length, 0, "规范行 0 问题");
+  assert.equal(channelSampleProblem({ ...good, disposition: "accepted" }).length, 0, "P1-1：accepted 在枚举内，不再被当坏 disposition");
+  // 评审 #117 三轮：数组经正则隐式转串曾被放行 —— typeof 先卡
+  assert.equal(channelSampleProblem({ ...good, disposition: ["rejected:transport_not_mentioned"] }).includes("disposition"), true,
+    "数组 disposition 必须被拒（隐式转串不许放行）");
+  assert.equal(channelSampleProblem({ ...good, disposition: { toString: () => "chat" } }).includes("disposition"), true,
+    "对象 disposition 同拒");
+  // P2-1：缺毫秒的 2026-09-02T00:00:00Z 不再被宽版放行为规范形式
+  assert.equal(channelSampleProblem({ ...good, at: "2026-09-02T00:00:00Z" }).some((p) => p === "at"), true, "缺毫秒必须被拒：" + channelSampleProblem({ ...good, at: "2026-09-02T00:00:00Z" }));
+  assert.equal(channelSampleProblem({ ...good, at: "2026-09-02T00:00:00.000Z" }).some((p) => p === "at"), false, "带毫秒的规范形式放行");
+  // P1-2：越界/非法 created_at_ms 与畸形对象，appendChannelSample 绝不抛
+  const fuzzDir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-fuzz-"));
+  const fz = path.join(fuzzDir, "cs.jsonl");
+  const badEvents = [
+    { message_id: "om_f1", session_id: "s", created_at_ms: 1e20 },
+    { message_id: "om_f2", session_id: "s", created_at_ms: NaN },
+    { message_id: "om_f3", session_id: "s", created_at_ms: -1 },
+    { message_id: "om_f4", session_id: "s", created_at_ms: null },
+    "not-an-object",
+    [1, 2, 3],
+    null,
+    undefined,
+  ];
+  for (const ev of badEvents) {
+    let out;
+    assert.doesNotThrow(() => { out = appendChannelSample({ file: fz, event: ev, canonical: null, template: TPL, chain: "claude", disposition: "bound" }); }, "坏输入不应抛：" + JSON.stringify(ev));
+    assert.ok(out && typeof out === "object", "总返回对象，不裸抛");
+  }
+});
+
+test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链接别名被拒、正常路径回读干净", () => {
+  const wDir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-w-"));
+  const wf = path.join(wDir, "cs.jsonl");
+  const base = { file: wf, event: { message_id: "om_w", session_id: "s", created_at_ms: 1750000000000 }, canonical: null, template: TPL, chain: "claude", env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id } };
+  const goodW = appendChannelSample({ ...base, disposition: "accepted" });
+  assert.equal(goodW.ok, true);
+  assert.equal(goodW.row.disposition, "accepted");
+  assert.equal(loadChannelSamples({ file: wf }).rows.length, 1, "字节精确写入 → 回读干净 1 行");
+  // 硬链接别名：写侧同 fd fstat 见 nlink!==1 → 受控失败，不假装成功
+  const wLink = wf + ".hl";
+  try { fs.linkSync(wf, wLink); } catch { /* 环境不支持硬链接 */ }
+  if (fs.existsSync(wLink)) {
+    const hlW = appendChannelSample({ ...base, event: { message_id: "om_w2", session_id: "s", created_at_ms: 1750000000000 }, disposition: "bound" });
+    assert.equal(hlW.ok, false);
+    assert.equal(hlW.reason, "channel_sample_not_regular_file", "硬链接别名在写侧被拒");
+  }
+  // 非绝对路径直接拒
+  assert.equal(appendChannelSample({ file: "relative.jsonl", event: base.event, disposition: "bound" }).ok, false);
+  assert.equal(channelDisposition("accepted", undefined), "accepted");
+  // 短写/零写注入（评审 #117 三轮 P2）：writeSync 返回 0 / 1 都必须受控失败 —— 删掉
+  // written !== buf.length 判据这两支就红
+  const realWriteSync = fs.writeSync;
+  try {
+    fs.rmSync(wLink, { force: true }); // 上一段的硬链接别名先拆掉，loader 的 nlink 检查才放行
+    const before0 = loadChannelSamples({ file: wf }).rows.length;
+    fs.writeSync = () => 0;
+    const zeroW = appendChannelSample({ ...base, event: { message_id: "om_w3", session_id: "s", created_at_ms: 1750000000000 }, disposition: "chat" });
+    assert.equal(zeroW.ok, false, "零写必须受控失败：" + JSON.stringify(zeroW));
+    fs.writeSync = () => 1;
+    const shortW = appendChannelSample({ ...base, event: { message_id: "om_w4", session_id: "s", created_at_ms: 1750000000000 }, disposition: "chat" });
+    assert.equal(shortW.ok, false, "短写（1 字节）必须受控失败：" + JSON.stringify(shortW));
+    fs.writeSync = realWriteSync;
+    assert.equal(loadChannelSamples({ file: wf }).rows.length, before0, "受控失败不落半行（好行数不变）");
+  } finally { fs.writeSync = realWriteSync; }
 });
 
 summarySealed = true;

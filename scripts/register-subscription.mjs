@@ -28,17 +28,17 @@ import { isDirectRun } from "./direct-run.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import {
-  SUBSCRIPTION_RUNTIMES, applySubscriptionChange, loadSubscriptionStore, planSubscriptionChange,
+  SUBSCRIPTION_RUNTIMES, applySubscriptionChange, classifySubscriptionAuditPending, loadSubscriptionStore, planSubscriptionChange, resolveSubscriptionAuditConflict,
 } from "./subscription-store.mjs";
 
 export function parseRegisterSubscriptionArgs(argv) {
-  const out = { store: null, template: null, runtime: null, domainKey: null, chatId: null, freshnessMs: null, instanceKey: null, subscriptionId: null, chatName: null, pause: false, resume: false, remove: false, apply: false };
+  const out = { store: null, template: null, runtime: null, domainKey: null, chatId: null, freshnessMs: null, instanceKey: null, subscriptionId: null, chatName: null, resolveAuditConflict: null, pause: false, resume: false, remove: false, apply: false };
   const seen = new Set();
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
-    if (seen.has(a)) return { ok: false, reason: "duplicate_argument", argument: a };   // 受控写入口：重复参数不许"以后一个为准"
+    if (seen.has(a)) return { ok: false, reason: "duplicate_argument", argument: a };   // 受控写入口：重复参数不许“以后一个为准”
     if (a === "--apply" || a === "--pause" || a === "--resume" || a === "--remove") { seen.add(a); out[a.slice(2)] = true; continue; }
-    if (["--store", "--template", "--runtime", "--domain-key", "--chat-id", "--freshness-ms", "--instance-key", "--subscription-id", "--chat-name"].includes(a)) {
+    if (["--store", "--template", "--runtime", "--domain-key", "--chat-id", "--freshness-ms", "--instance-key", "--subscription-id", "--chat-name", "--resolve-audit-conflict"].includes(a)) {
       const v = argv[i + 1];
       if (typeof v !== "string" || v.startsWith("--") || v.length === 0) return { ok: false, reason: a + "_value_required" };
       seen.add(a);
@@ -48,6 +48,7 @@ export function parseRegisterSubscriptionArgs(argv) {
       else if (a === "--instance-key") out.instanceKey = v;
       else if (a === "--chat-name") out.chatName = v;
       else if (a === "--subscription-id") out.subscriptionId = v;
+      else if (a === "--resolve-audit-conflict") out.resolveAuditConflict = v;
       else {
         if (!/^\d+$/u.test(v) || Number(v) <= 0) return { ok: false, reason: "freshness_ms_shape" };
         out.freshnessMs = Number(v);
@@ -63,11 +64,18 @@ export function parseRegisterSubscriptionArgs(argv) {
   if (!out.chatId) return { ok: false, reason: "chat_id_required" };
   const actions = ["pause", "resume", "remove"].filter((k) => out[k]);
   if (actions.length > 1) return { ok: false, reason: "one_action_at_a_time", detail: actions.join(",") };
-  if (out.freshnessMs !== null && actions.length) return { ok: false, reason: "freshness_only_on_add" };
-  // --chat-name 与 --freshness-ms 同款先例（FR-2.6 单 3）：只在新增时有意义 —— 寻址动作改的是既有
-  // 条目的状态/存在性，不是它的登记群名；改群名请 remove 后重登记（不提供原地改名）。
-  if (out.chatName !== null && actions.length) return { ok: false, reason: "chat_name_only_on_add" };
-  out.action = actions[0] ?? "add";
+  // --resolve-audit-conflict 是独立维护动作（P2-2）：不与 pause/resume/remove 混用，也不带寻址/新鲜度字段。
+  if (out.resolveAuditConflict !== null) {
+    if (actions.length) return { ok: false, reason: "one_action_at_a_time", detail: "resolve_audit_conflict" };
+    if (out.freshnessMs !== null || out.chatName !== null || out.instanceKey !== null || out.subscriptionId !== null) return { ok: false, reason: "resolve_conflict_only" };
+    out.action = "resolve_audit_conflict";
+  } else {
+    if (out.freshnessMs !== null && actions.length) return { ok: false, reason: "freshness_only_on_add" };
+    // --chat-name 与 --freshness-ms 同款先例（FR-2.6 单 3）：只在新增时有意义 —— 寻址动作改的是既有
+    // 条目的状态/存在性，不是它的登记群名；改群名请 remove 后重登记（不提供原地改名）。
+    if (out.chatName !== null && actions.length) return { ok: false, reason: "chat_name_only_on_add" };
+    out.action = actions[0] ?? "add";
+  }
   // 寻址封闭（评审 #112 裁决）：--subscription-id 只用于寻址既有条目（add 的 id 永远重算）；
   // 与 --instance-key 互斥（一次一种寻址方式）。
   if (out.subscriptionId !== null && out.action === "add") return { ok: false, reason: "subscription_id_not_for_add" };
@@ -95,13 +103,43 @@ export function describeStoreWrite(r, file) {
     (x.error ? "：" + x.error : "") + (x.problems ? "：" + x.problems.join(",") : "");
   let exitCode = 0;
   if (!r || typeof r !== "object") { lines.push("没有写成：结果说不清"); exitCode = 1; }
-  else if (!r.ok) { lines.push("没有写成：" + r.reason + detail(r)); exitCode = 1; }
+  else if (!r.ok) {
+    lines.push("没有写成：" + r.reason + detail(r));
+    // 评审 #115 三轮 P1-2/P2-1：冲突是持续 blocker，不是一次性的改名留痕（去掉死字段 r.stale）。
+    if (r.reason === "audit_pending_conflict") {
+      lines.push("待补记 <store>.audit.pending.json 与当前 store 冲突，会持续阻断后续写入；请用 register-subscription.mjs --resolve-audit-conflict <operation_id> --store <绝对路径> --apply 显式处理（终端维护动作，owner 逐次授权）。");
+    }
+    exitCode = 1;
+  }
   else if (!r.changed) lines.push("锁内重读后已经是这样，没动。");
   else lines.push("已写入（锁内重读重算后）。" + (r.backup ? "备份：" + r.backup : "首次创建，无备份"));
+  // FR-2.6 单 4：store 写成 + 审计丢了 = 「成功但要人知道」，退非零 —— 不是静默成功。
+  if (r && r.ok && r.auditUnwritten) {
+    lines.push("注意：变更已写入，但审计行没写成（" + r.auditUnwritten + "）；已落待补记 <store>.audit.pending.json，下次 --apply 会先补记。请先对账 " + file + ".audit.jsonl 的权限 / 占用。");
+    exitCode = 1;
+  }
+  // 评审 #115 二轮：进锁时补记了上一次「store 已提交、审计未写」的待补记（replayed / dropped），本轮继续。
+  if (r && r.ok && r.auditPendingResolved) {
+    lines.push(r.auditPendingResolved === "dropped"
+      ? "注意：进锁时发现一份对不上当前 store 的待补记（当前 == 变更前），判定未提交，已丢弃并继续。"
+      : "注意：进锁时补记了上一次「store 已提交、审计未写」的待补记（已写回审计并清 pending），本轮已继续。");
+  }
   if (r && r.lockUncleared) {
     lines.push("注意：订阅写锁没有交还（" + r.lockUncleared + "）；之后所有订阅写方都会报 store_busy，请人工确认没有写方在跑后处理 " + file + ".lock");
     exitCode = 1;
   }
+  return { lines, exitCode };
+}
+
+/** P2-2：--resolve-audit-conflict 的判定/结果呈现（与 apply 的 describeStoreWrite 分开——它没有"变更"语义）。 */
+export function describeResolveAuditConflict(r, file) {
+  const lines = [];
+  let exitCode = 0;
+  const stateText = { dropped: "已清理丢弃（当前 == before，未提交）", replayed: "已补记审计并清 pending（当前 == after，已提交未写审计）", conflict: "已按放弃处理清 pending（当前与 before/after 都不符）" };
+  if (!r || typeof r !== "object") { lines.push("没有处理：结果说不清"); exitCode = 1; }
+  else if (!r.ok) { lines.push("没有处理：" + r.reason + (r.detail ? "：" + r.detail : "")); exitCode = 1; }
+  else lines.push("已处理（锁内重读重算后）：" + (r.state ?? "ok") + " —— " + (stateText[r.state] ?? ""));
+  if (r && r.lockUncleared) { lines.push("注意：订阅写锁没有交还（" + r.lockUncleared + "）；之后所有订阅写方都会报 store_busy，请人工确认没有写方在跑后处理 " + file + ".lock"); exitCode = 1; }
   return { lines, exitCode };
 }
 
@@ -111,8 +149,39 @@ if (isDirectRun(import.meta.url)) {
     process.stderr.write("用法：node scripts/register-subscription.mjs --store <绝对路径> --template <绝对路径> --runtime claude|codex \\\n" +
       "        --domain-key <项目根或业务域> --chat-id <oc_…> [--freshness-ms <N>] [--instance-key <key>] [--chat-name <群名>] [--apply]\n" +
       "      node scripts/register-subscription.mjs … --pause|--resume|--remove [--instance-key <key> | --subscription-id <id>] [--apply]\n" +
+      "      node scripts/register-subscription.mjs … --resolve-audit-conflict <operation_id> [--apply]   （清理持续阻断的待补记冲突，owner 逐次授权）\n" +
       "      同四元组多条时 pause/resume/remove 必须用 --instance-key 或 --subscription-id 精确点名（" + parsed.reason + (parsed.detail ? "：" + parsed.detail : "") + "）\n");
     process.exit(2);
+  }
+  if (parsed.action === "resolve_audit_conflict") {
+    const cls = classifySubscriptionAuditPending({ file: parsed.store, operationId: parsed.resolveAuditConflict });
+    if (!cls.ok) { process.stdout.write("没有解析：" + cls.reason + (cls.detail ? "：" + cls.detail : "") + "\n"); process.exit(1); }
+    const stateText = {
+      no_conflict: "没有待补记（无需处理）",
+      mismatch: "点名 op 与待补记不符，拒绝",
+      store_unreadable: "store 路径读不清（符号链接 / FIFO / 目录 / 硬链接别名 / 权限）；先修 store，不许处理",
+      dropped: "当前 store == 待补记 before（未提交）；--apply 将清理丢弃",
+      replay: "当前 store == 待补记 after（已提交未写审计）；--apply 将补记审计并清 pending",
+      conflict: "当前 store 与待补记 before/after 都不符（真冲突）；--apply 将丢弃 pending（放弃对账）",
+    }[cls.state] ?? cls.state;
+    process.stdout.write("订阅 store：" + parsed.store + "\n");
+    process.stdout.write("待补记    ：" + (cls.pending ? "op=" + cls.pending.operation_id + "（before " + (cls.pending.before_sha256 ? cls.pending.before_sha256.slice(0, 8) : "null") + "… after " + (cls.pending.after_sha256 ? cls.pending.after_sha256.slice(0, 8) : "null") + "…）" : "(无)") + "\n");
+    process.stdout.write("判定      ：" + cls.state + "（" + stateText + "）\n");
+    // 判定为「没有可处理的冲突」（no_conflict / mismatch）：预览是正常展示（退出 0）；但显式 --apply
+    // 却没东西可处理 → 非零，避免把「你要求处理但没匹配上」误报成成功。
+    if (cls.state === "no_conflict" || cls.state === "mismatch") process.exit(parsed.apply ? 1 : 0);
+    // 评审 #115 五轮 P1：store 读不清（符号链接 / FIFO / 目录 / 硬链接别名 / 权限）→ 预览与 --apply 都
+    // 非成功指路（先修 store 路径再来），**绝不**走到下面 discard:true 的处理路径。
+    if (cls.state === "store_unreadable") {
+      process.stdout.write("不能处理：store 读不清（" + (cls.detail ?? "") + "）。先修 " + parsed.store + "（去掉符号链接 / 恢复成普通单硬链接文件）再来；不许 discard。\n");
+      process.exit(1);
+    }
+    if (!parsed.apply) { process.stdout.write("\n[dry-run] 什么都没介入。要处理须 owner 逐次授权后再加 --apply。\n"); process.exit(0); }
+    { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门
+    const done = resolveSubscriptionAuditConflict({ file: parsed.store, operationId: parsed.resolveAuditConflict, discard: true });
+    const out = describeResolveAuditConflict(done, parsed.store);
+    process.stdout.write(out.lines.join("\n") + "\n");
+    process.exit(out.exitCode);
   }
   const preview = previewSubscriptionChange({ change: parsed });
   if (!preview.ok) {

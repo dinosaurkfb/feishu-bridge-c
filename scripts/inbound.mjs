@@ -326,6 +326,10 @@ if (!routed.ok) {
   // 绑定必然分两段：建话题时 Aily session 还不存在（它是第一条消息流进来才产生的）。
   const tpl = loadChainTemplate();
   const template = tpl.ok ? tpl.template : null;
+  // 评审定案（PR #111 P1）：AILY_CLI_CHANNEL_CHAT_ID 是 unverified locator——「不等于模板群」
+  // 只能证明 locator 不同，证明不了是私聊（也可能是外部群、模板 locator 过期）。在独立验证过的
+  // direct/private 事实出现之前，它不得绕过 @ 这道准入闸，只作拒绝回执里的诊断 hint
+  //（见 evaluateChatGates 的 transport_not_mentioned 分支）。
   // 把正文传进去：绑定码就藏在飞书自动附加的引用块里，Frank 不用打任何东西。
   const promotionNow = Date.now();
   const pending = findPendingBinding({ content: event.content, now: promotionNow });

@@ -82,6 +82,32 @@ export function extractReply(payload, { maxChars }) {
   return text.length <= maxChars ? text : text.slice(0, maxChars) + "\n…（本条已截断，全文在终端）";
 }
 
+/**
+ * outbox 单件的 fd 绑定读（评审 PR #111 P1，纪律同 chat-ledger）：
+ * O_RDONLY | O_NONBLOCK | O_NOFOLLOW 打开、同一 fd fstat 确认普通文件、从这个 fd 读 ——
+ * 符号链接 / 命名管道 / 目录都不认；ENOENT（并发发走）是 absent，其余一律 unreadable。
+ */
+function readOutboxEventSafe(file) {
+  let fd = null;
+  try {
+    try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW); }
+    catch (err) {
+      if (err?.code === "ENOENT") return { status: "absent" };
+      return { status: "unreadable", why: err?.code === "ELOOP" ? "不是普通文件（符号链接）" : String(err.code ?? err.message) };
+    }
+    let st;
+    try { st = fs.fstatSync(fd); } catch (err) { return { status: "unreadable", why: "fstat 失败：" + String(err.code ?? err.message) }; }
+    if (!st.isFile()) return { status: "unreadable", why: "不是普通文件" };
+    let raw;
+    try { raw = fs.readFileSync(fd, "utf-8"); } catch (err) { return { status: "unreadable", why: String(err.code ?? err.message) }; }
+    // 只负责安全取字节 + 解析；记录形状是否可解释交给账本自己的判据
+    //（explainabilityGaps / classifyOutboxRecord，调用点做）—— 不在 Stop 里养第三份判据。
+    try { return { status: "read", doc: JSON.parse(raw) }; } catch { return { status: "unreadable", why: "不是 JSON" }; }
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
+  }
+}
+
 function readStdinJson() {
   try {
     const raw = fs.readFileSync(0, "utf-8");
@@ -126,7 +152,7 @@ async function main() {
   const { foreignHint, projectLabel } = await import("./stop-note.mjs");
   const { postDeliveryBits } = await import("./publish-outcome.mjs");
   const { resolveProject } = await import("./project-resolve.mjs");
-  const { appendEvent, listPending, MAX_REPLY_CHARS } = await import("./outbox.mjs");
+  const { appendEvent, listPending, MAX_REPLY_CHARS, explainabilityGaps, classifyOutboxRecord } = await import("./outbox.mjs");
   const { checkBinding, bindingWarning } = await import("./binding-health.mjs");
   const { isBridgeOwnedSession } = await import("./live-session.mjs");
   const { finalizeClaudeDialogueTurn } = await import("./interaction-policy-store.mjs");
@@ -170,8 +196,10 @@ async function main() {
       if (!record.ok) {
         turnRoute = { ok: false, reason: "turn_record_" + record.reason };
       } else if (record.consumed) {
-        // 这份记录已经授权过一次 Stop：重入 / 上一轮遗留都不许再入队。
-        turnRoute = { ok: false, reason: "turn_record_consumed", messageId: record.messageId ?? null };
+        // 这份记录已经授权过一次 Stop：配对入队不许重来。answer-only 分支（下面）要按
+        // 来源决定目标，所以 kind / captureId / messageId 都带出去（评审 PR #111 P1）。
+        turnRoute = { ok: false, reason: "turn_record_consumed", recordKind: record.kind,
+          captureId: record.captureId ?? null, messageId: record.messageId ?? null, consumedAt: record.consumedAt };
       } else if (record.kind === "local") {
         turnRoute = { ok: true, kind: "local" };
       } else {
@@ -242,9 +270,112 @@ async function main() {
     // 答复只发给 **cwd 归属**的项目，不发给「会话记录里提到过路径」的那些。
     // 弱信号用来触发排空是安全的（那些内容本来就要发），但用它决定
     // 「把整段对话原文发到谁的话题里」不行 —— 一次误判就是把无关对话发给了 Frank。
-    if (reply && project.via.includes("cwd") && !turnRoute.ok && turnRoute.reason === "turn_record_consumed") {
-      // 同一回合的 Stop 重入：第一次已经入队，这次幂等跳过 —— 只记日志，不算"未路由"。
-      log(project.id + " reply not re-queued: turn record already consumed");
+    // mid-turn answer-only 的目标解析（评审 PR #111 P1）：目标必须**继承已消费记录的来源**——
+    // local → 当前代际；feishu → 与正常路径同一套 claim 反查恢复冻结 origin（老代际回合的
+    // mid-turn 答复回老话题，发当前代际就是跨话题误投）；来源 / claim / origin 说不清 →
+    // 改写 reason 落进下面的零入队 + unrouted 诊断分支。事件键绑来源身份再附正文指纹；
+    // pairedKey 是**这份记录的原配对事件键**，重入预检只认它（评审 P2：比正文 + 时间会把
+    // 更早回合的同文答复错当重入，误丢当前回答）。
+    let answerOnly = null; // { target, ident, pairedKey } —— 非 null 才允许 answer-only 入队
+    if (reply && bound.ok && !turnRoute.ok && turnRoute.reason === "turn_record_consumed") {
+      if (turnRoute.recordKind === "local" && typeof turnRoute.captureId === "string" && turnRoute.captureId) {
+        answerOnly = { target: bound.mapping?.channel_generation_id, ident: "cap-" + turnRoute.captureId,
+          pairedKey: "claude:" + speakingSession + ":capture:" + turnRoute.captureId + ":reply" };
+      } else if (turnRoute.recordKind === "feishu" && typeof turnRoute.messageId === "string" &&
+                 turnRoute.messageId && bound.mapping?.logical_task_key) {
+        const claimKeyForTurn = claimKey(turnRoute.messageId, bound.mapping.logical_task_key);
+        const claimState = readClaimState({
+          claimsDir: path.join(project.root, ".runtime-data", "inbound", "delivery-claims"),
+          key: claimKeyForTurn,
+          expect: {
+            logicalTaskKey: bound.mapping.logical_task_key,
+            bindingId: effectiveBindingId(bound.mapping, { root: project.root }),
+            claudeSessionId: boundSession ?? null,
+          },
+        });
+        if (claimState.status !== "valid") {
+          turnRoute = { ...turnRoute, reason: "consumed_claim_" + claimState.status, why: claimState.why ?? null };
+        } else {
+          const origin = claimState.claim.origin_channel_generation_id ?? null;
+          const target = resolveMappingOutboundGeneration(bound.mapping, origin);
+          if (target.ok) {
+            answerOnly = { target: origin ?? bound.mapping?.channel_generation_id, ident: "msg-" + turnRoute.messageId,
+              pairedKey: "claude:" + speakingSession + ":claim:" + claimKeyForTurn + ":reply" };
+          } else {
+            turnRoute = { ...turnRoute, reason: "consumed_origin_unresolvable", why: target.reason, origin };
+          }
+        }
+      } else {
+        // 老形记录没有 capture id / message_id，配对键与来源都拼不出：宁可不发，也不猜话题。
+        turnRoute = { ...turnRoute, reason: "consumed_source_unknown" };
+      }
+      // 同回合重入预检：只认**这份记录的原配对事件**（键 === pairedKey 且正文相同）。
+      // 账本读取用 fd 绑定读（评审 P1：裸 readFileSync 会跟随 symlink、被 FIFO 挂死，
+      // 读失败当"没入队"会补发重复）——任何一件说不清就 fail-closed 零入队。
+      if (answerOnly) {
+        let names = [];
+        try { names = fs.readdirSync(outboxDir); }
+        catch (err) {
+          // 只有 ENOENT（还没建过 outbox）是空账本；普通文件 / EACCES / 其他盘点失败都说不清，
+          // 折成空目录就等于放行补发 —— 同样 fail-closed（评审 PR #111 第三轮）。
+          if (err?.code !== "ENOENT") {
+            turnRoute = { ...turnRoute, reason: "consumed_ledger_unreadable",
+              why: "outbox 枚举失败：" + String(err?.code ?? err?.message) };
+            answerOnly = null;
+          }
+        }
+        for (const n of (answerOnly ? names : [])) {
+          if (!n.endsWith(".json")) continue;
+          const r = readOutboxEventSafe(path.join(outboxDir, n));
+          if (r.status === "unreadable") {
+            turnRoute = { ...turnRoute, reason: "consumed_ledger_unreadable", why: n + "：" + r.why };
+            answerOnly = null;
+            break;
+          }
+          if (r.status !== "read") continue; // absent：并发发走了
+          // 形状判据复用账本自己的（评审 PR #111 第五轮：不在 Stop 里养第三份判据）：
+          // explainabilityGaps 对齐生产写方能产出的集合，classifyOutboxRecord 守发布三态；
+          // event_key 额外做兼容校验 —— 缺席 / null / 非空字符串都是合法形态，空串是损坏。
+          const gaps = explainabilityGaps(r.doc);
+          const cls = classifyOutboxRecord(r.doc);
+          const keyOk = r.doc?.event_key === null || r.doc?.event_key === undefined ||
+            (typeof r.doc?.event_key === "string" && r.doc.event_key.length > 0);
+          if (gaps.length > 0 || cls.unclassified || !keyOk) {
+            turnRoute = { ...turnRoute, reason: "consumed_ledger_unreadable",
+              why: n + "：" + (gaps.length ? "字段说不清（" + gaps.join(",") + "）" : cls.unclassified ? cls.why : "event_key 形状不对") };
+            answerOnly = null;
+            break;
+          }
+          if (r.doc.event_key === answerOnly.pairedKey && r.doc.text === reply) {
+            answerOnly.queuedThisTurn = true;
+            break;
+          }
+        }
+      }
+    }
+    if (reply && project.via.includes("cwd") && !turnRoute.ok &&
+        turnRoute.reason === "turn_record_consumed" && answerOnly) {
+      // mid-turn 插入的消息不经 UserPromptSubmit（没有新记录）：上一轮的记录已消费，
+      // 这一轮拿不到配对输入 —— 但回答半张是真实的，不再整轮丢弃：只发回答半张，
+      // 目标、事件键与重入预检都按上面解析出的来源（发布落标只在原文件补 published_at
+      // 不删卡，已发布的配对事件也挡得住重入）。不携带任何输入半张 —— 飞书来源输入
+      // 不重复的约定不受影响：已消费回合的输入早在它自己的回合里发过。
+      if (answerOnly.queuedThisTurn) {
+        log(project.id + " reply not re-queued: paired event for this turn record already queued");
+      } else {
+        const r = appendEvent({
+          outboxDir, kind: "reply", text: reply, source: "session-reply",
+          eventKey: "claude:" + speakingSession + ":unpaired:" + answerOnly.ident + ":" +
+            crypto.createHash("sha256").update(reply).digest("hex").slice(0, 16) + ":reply",
+          targetGenerationId: answerOnly.target,
+        });
+        if (r.ok) {
+          wroteThisTurn.add(project.root);
+          log(project.id + " reply queued without paired input (turn_record_consumed; answer-only; " + answerOnly.ident + ")");
+        } else {
+          log(project.id + " answer-only reply not queued: " + r.reason);
+        }
+      }
     } else if (reply && project.via.includes("cwd") && !turnRoute.ok) {
       // 零入队 + 可诊断：完整答复留在记录里（不是预览），临时文件 + rename 原子落盘，文件名带随机段不会覆盖。
       const unrouted = path.join(project.root, ".runtime-data", "outbound", "unrouted-replies");

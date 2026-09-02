@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-09-01T11:30:52.113Z",
+  "generated_at": "2026-09-02T01:02:28.080Z",
   "modules": {
     "authorize.mjs": [
       "AUTHORIZATION_TABLE",
@@ -295,6 +295,7 @@
     ],
     "inbound-route.mjs": [
       "CHAT_FALLBACK_REASONS",
+      "OFF_TEMPLATE_HINT",
       "PENDING_WINDOW_MS",
       "PROMOTE_REJECT",
       "PROMOTE_REJECT_TEXT",
@@ -304,6 +305,7 @@
       "evaluatePromotion",
       "findBindingForSession",
       "findPendingBinding",
+      "isOffTemplateChatTurn",
       "listBindings",
       "loadConsumed",
       "promoteBinding",

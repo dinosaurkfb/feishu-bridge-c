@@ -318,7 +318,7 @@ export function shadowClaudeFirstClaim({
  * 运输 agent、消息新不新。认领哪一份待绑定靠绑定码精确匹配（只有一份时直接命中）；
  * 待绑定不过期（2026-08-28 起），只有旧登记写了显式截止的才会过期。fail-closed 成立。
  */
-export function evaluatePromotion({ event, template, pending, now = Date.now() }) {
+export function evaluatePromotion({ event, template, pending, now = Date.now(), env = process.env }) {
   const reject = (reason, extra = {}) => ({
     ok: false, reason, reasonText: PROMOTE_REJECT_TEXT[reason] ?? reason, ...extra,
   });
@@ -333,7 +333,11 @@ export function evaluatePromotion({ event, template, pending, now = Date.now() }
 
   if (event?.sender_id !== frank) return reject(PROMOTE_REJECT.SENDER_NOT_FRANK);
   if (!extractMentionIds(event?.content).includes(transport)) {
-    return reject(PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
+    const r = reject(PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
+    // 评审定案（PR #111 P1）：unverified locator 的 mismatch 不许豁免 @ 闸，只作诊断 hint。
+    // 真机私聊挂着待认领代际时走的就是这条闸 —— hint 让私聊里的 Frank 看懂发生了什么。
+    if (isOffTemplateChatTurn({ template, env })) r.reasonText += OFF_TEMPLATE_HINT;
+    return r;
   }
 
   const createdMs = Number(event?.created_at_ms);
@@ -362,7 +366,28 @@ export const CHAT_FALLBACK_REASONS = Object.freeze([
   PROMOTE_REJECT.TOKEN_AMBIGUOUS, PROMOTE_REJECT.TOKEN_DUPLICATED, PROMOTE_REJECT.PENDING_EXPIRED,
   PROMOTE_REJECT.SENDER_NOT_FRANK,
 ]);
-export function evaluateChatGates({ event, template, now = Date.now() }) {
+/**
+ * off-template 观察（**诊断用，不是路由事实**——评审 PR #111 P1 定案）：本轮 Aily turn 的
+ * 频道 locator 与链模板登记的群 chat 不一致。
+ *
+ * 事件链里没有 chat_type 字段（canonical event、CHAIN_FIELDS、AILY_CLI_* 变量全集都没有）；
+ * 这里读 daemon 注入的 AILY_CLI_CHANNEL_CHAT_ID（dispatcher 只删 SESSION / RUN 两个键，
+ * child 原样继承；canonical.extensions.aily_channel 同源、标注 unverified）对照模板 chat_id。
+ * 「不一致」只能证明 locator 不同 —— 可能是私聊，也可能是外部群或模板 locator 过期，
+ * 所以它**不豁免任何闸**，只用于往 transport_not_mentioned 的拒绝回执里追加 OFF_TEMPLATE_HINT。
+ * env 缺失或模板没有 chat_id → false（连 hint 都不加）。
+ */
+// 两道 @ 闸（promotion / chat）共用同一句 hint —— 只解释，不改变任何判定。
+export const OFF_TEMPLATE_HINT =
+  "（诊断：本轮频道与登记群不一致，可能是私聊或未接入的群；私聊在频道 locator 完成验证前暂不开放，请到绑定话题里 @ 我）";
+
+export function isOffTemplateChatTurn({ template, env = process.env } = {}) {
+  const chatId = typeof env?.AILY_CLI_CHANNEL_CHAT_ID === "string" ? env.AILY_CLI_CHANNEL_CHAT_ID : "";
+  const templateChatId = typeof template?.chat_id === "string" ? template.chat_id : "";
+  return chatId.length > 0 && templateChatId.length > 0 && chatId !== templateChatId;
+}
+
+export function evaluateChatGates({ event, template, now = Date.now(), env = process.env }) {
   const reject = (reason) => ({ ok: false, reason, reasonText: PROMOTE_REJECT_TEXT[reason] ?? reason });
   const frank = template?.frank_sender_id;
   const transport = template?.transport_open_id;
@@ -373,7 +398,14 @@ export function evaluateChatGates({ event, template, now = Date.now() }) {
   }
   const role = senderRole({ frank_sender_id: frank, senders: template?.senders }, event?.sender_id);
   if (role === null) return reject(PROMOTE_REJECT.SENDER_NOT_FRANK);
-  if (!extractMentionIds(event?.content).includes(transport)) return reject(PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
+  if (!extractMentionIds(event?.content).includes(transport)) {
+    const r = reject(PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
+    // 评审定案（PR #111 P1）：unverified locator 的 mismatch 不许豁免 @ 闸，只作诊断 hint ——
+    // 「频道 ≠ 登记群」证明不了私聊（可能是外部群 / 模板 locator 过期），但足以让这条拒绝
+    // 对着私聊里的 Frank 说清楚发生了什么。
+    if (isOffTemplateChatTurn({ template, env })) r.reasonText += OFF_TEMPLATE_HINT;
+    return r;
+  }
   const createdMs = Number(event?.created_at_ms);
   if (!Number.isFinite(createdMs)) return reject(PROMOTE_REJECT.MALFORMED_TEMPLATE);
   if (now - createdMs > freshness) return reject(PROMOTE_REJECT.STALE_MESSAGE);

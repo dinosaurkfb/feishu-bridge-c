@@ -8929,6 +8929,42 @@ test("Codex：两个 task 持有同一 Aily session → 路由返回歧义，不
   assert.equal(r.ok, false, JSON.stringify(r));
   assert.ok(["ambiguous_session", "duplicate_binding"].includes(r.reason), "坏表被读取层拦下或路由层判歧义，都不许取第一条：" + JSON.stringify(r));
 });
+// 评审 PR #111 P2：promotion 拒绝的回执要保留 evaluatePromotion 拼进 reasonText 尾部的
+// off-template 诊断 hint（本地重建文案曾把它丢掉）；Codex 化措辞（M5Codex）保持不变。
+test("Codex 真入口：off-template mismatch + 无 @ → 拒绝回执带诊断 hint；同群 / 无 channel → 干净拒", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  const bin = path.join(home, "bin");
+  fs.mkdirSync(root); fs.mkdirSync(bin);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "abc123" });
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  let seq = 0;
+  const run = (extraEnv) => {
+    seq += 1;
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: {
+      id: "msg_hint_" + seq, sessionID: "aily_unbound_p2p", role: "user", createdBy: TEMPLATE.frank_sender_id,
+      createdAtMs: Date.now(), content: "能收到吗（没有 @）",
+    } }) }] });
+    return spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], {
+      encoding: "utf-8",
+      env: { ...isolatedEnv(), PATH: bin + path.delimiter + process.env.PATH, FEISHU_CODEX_BRIDGE_HOME: home,
+        AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "aily_unbound_p2p", AILY_CLI_RUN_ID: "run_hint", FAKE_AILY_ENVELOPE: envelope, ...extraEnv },
+    });
+  };
+  const mism = run({ AILY_CLI_CHANNEL_CHAT_ID: "oc_direct_x" });
+  assert.equal(mism.status, 0, mism.stdout + mism.stderr);
+  assert.match(mism.stdout, /没有真实 @ M5Codex/u, "Codex 化措辞不变：" + mism.stdout);
+  assert.match(mism.stdout, /诊断：本轮频道与登记群不一致/u, "hint 不许被本地重建文案丢掉：" + mism.stdout);
+  const sameChat = run({ AILY_CLI_CHANNEL_CHAT_ID: TEMPLATE.chat_id });
+  assert.match(sameChat.stdout, /没有真实 @ M5Codex/u, sameChat.stdout);
+  assert.doesNotMatch(sameChat.stdout, /诊断：/u, "同群没有 mismatch，不许带 hint：" + sameChat.stdout);
+  const noChannel = run({});
+  assert.match(noChannel.stdout, /没有真实 @ M5Codex/u, noChannel.stdout);
+  assert.doesNotMatch(noChannel.stdout, /诊断：/u, "env 缺失连 hint 都不加：" + noChannel.stdout);
+});
+
 // ─── 第 3 层：飞书正文里的 $feishu-mode 由入站路由器当场执行 ───────────────────────
 test("完整入站链路：已绑定 task 收到正文恰为 $feishu-mode dialogue → 当场切换并回执，不投递；重放不切两次；再切回 mapping", () => {
   const home = temp();

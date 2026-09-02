@@ -17,7 +17,7 @@ import { CHAT_POLICY_ID, CHAT_REPLY_ARGS, CHAT_FOOTER, CHAT_BIND_GUIDE, chatRepl
 import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome, chatRecordProblem, isAdmissionLockEntry, classifyAdmissionLockEntry, inspectAdmissionLocks, inspectScratch, sweepScratch, classifyTmpEntry, lockUnclearedText, CHAT_MAX_CONCURRENT, CHAT_MAX_PER_SENDER, TMP_NAME_SHAPE } from "./chat-ledger.mjs";
 import { parseChatScratchSweepArgs, describeScratchSweep, sweepExitCode } from "./chat-scratch-sweep.mjs";
 import { acquireLockUngated, acquirePublishLock as acquireLedgerLock, releasePublishLock as releaseLedgerLock } from "./registry.mjs";
-import { evaluateChatGates, CHAT_FALLBACK_REASONS } from "./inbound-route.mjs";
+import { evaluateChatGates, CHAT_FALLBACK_REASONS, isOffTemplateChatTurn } from "./inbound-route.mjs";
 import { ZERO_TOOL_ARGS } from "./handoff.mjs";
 import { INTENT, parseInboundIntent, controlRejectText, rejectedControlProjection, shown } from "./inbound-intent.mjs";
 import { rejectedRecordProblem, runRejectTransaction, inspectRejectedClaim, resumeRejectedClaim, describeRejectRepair, rejectRepairExitCode } from "./reject-control.mjs";
@@ -18017,11 +18017,138 @@ test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结�
   assert.equal(stop("登记表恢复后的本地回复").status, 0);
   assert.equal(replies().length, before + 1);
   assert.equal(targetOf("登记表恢复后的本地回复"), fx.newGen.channel_generation_id, "本地回复发当前代际，不是老话题");
-  // 同一回合 Stop 重入：记录已消费 → 零入队，且不算"未路由"（不写诊断）
+  // 同一回合 Stop 重入（记录已消费）：回答半张的 unpaired 事件键同键幂等 → 不重复入队，也不算"未路由"（不写诊断）
   const diagCount = diags().length;
   assert.equal(stop("登记表恢复后的本地回复").status, 0);
   assert.equal(replies().length, before + 1);
   assert.equal(diags().length, diagCount, "正常重入不写未路由记录");
+
+  // mid-turn 插入（不经 UserPromptSubmit，记录还是上一轮已消费的那份）：不再整轮丢弃 ——
+  // 只发回答半张、发当前代际、不写诊断；事件键带 :unpaired: 段，同一回合重入同键幂等
+  const unpairedBase = replies().length;
+  const unpairedDiags = diags().length;
+  assert.equal(stop("mid-turn 插入的回答").status, 0);
+  assert.equal(replies().length, unpairedBase + 1, "无配对输入只发回答半张，不丢");
+  assert.equal(targetOf("mid-turn 插入的回答"), fx.newGen.channel_generation_id, "无配对输入发当前代际");
+  const unpairedReply = replies().find((x) => x.text === "mid-turn 插入的回答");
+  assert.equal(unpairedReply.input_text ?? null, null, "回答半张不带任何输入（飞书来源输入不重复的约定不破）");
+  assert.match(String(unpairedReply.event_key), /:unpaired:/u, JSON.stringify(unpairedReply.event_key));
+  assert.equal(diags().length, unpairedDiags, "不算未路由（没有东西丢失）");
+  assert.equal(stop("mid-turn 插入的回答").status, 0);
+  assert.equal(replies().length, unpairedBase + 1, "同一回合重入同键幂等");
+  assert.equal(stop("mid-turn 插入的第二条").status, 0);
+  assert.equal(replies().length, unpairedBase + 2, "不同回合不同键，第二条不丢");
+
+  // mid-turn 的目标必须继承已消费记录的来源（评审 PR #111 P1）：老话题的飞书回合里插入的
+  // mid-turn 回答要回老话题 —— 无条件发当前代际就是跨话题误投
+  assert.equal(mkClaim("msg_midturn_src", {}).ok, true);
+  assert.equal(prompt("[飞书 · msg_midturn_src · 2026-08-28 10:11Z]\n老话题里的新指令").status, 0);
+  assert.equal(stop("老话题回合的正式回复").status, 0);
+  assert.equal(targetOf("老话题回合的正式回复"), fx.oldGen.channel_generation_id);
+  const midBase = replies().length;
+  assert.equal(stop("老话题回合里 mid-turn 插入的补充").status, 0);
+  assert.equal(replies().length, midBase + 1, "feishu consumed 的 mid-turn 不丢");
+  assert.equal(targetOf("老话题回合里 mid-turn 插入的补充"), fx.oldGen.channel_generation_id,
+    "目标继承已消费记录的来源：老代际，不是当前代际");
+  const midReply = replies().find((x) => x.text === "老话题回合里 mid-turn 插入的补充");
+  assert.match(String(midReply.event_key), /:unpaired:msg-msg_midturn_src:/u,
+    "事件键绑来源身份再附正文指纹：" + midReply.event_key);
+
+  // 发布之后（markSent 原文件补 published_at，不删卡）同回合再重入：事件键仍在，照样挡住
+  markSent(midReply, "om_midturn_sent");
+  const sentDiags = diags().length;
+  const pendingAfterSent = replies().length;
+  assert.equal(stop("老话题回合里 mid-turn 插入的补充").status, 0);
+  assert.equal(replies().length, pendingAfterSent, "已发布的卡仍挡同回合重入：pending 不新增");
+  assert.equal(diags().length, sentDiags, "重入不算未路由");
+
+  // 来源说不清就不猜话题：claim 消失后的 mid-turn 回答零入队 + 可诊断
+  assert.equal(mkClaim("msg_midturn_gone", {}).ok, true);
+  assert.equal(prompt("[飞书 · msg_midturn_gone · 2026-08-28 10:12Z]\n即将失去 claim 的指令").status, 0);
+  assert.equal(stop("claim 还在时的正式回复").status, 0);
+  fs.rmSync(path.join(claimsDir, claimKey("msg_midturn_gone", mapping.logical_task_key) + ".claim"),
+    { recursive: true, force: true });
+  const goneBase = replies().length;
+  const goneDiags = diags().length;
+  assert.equal(stop("claim 消失后的 mid-turn 回答").status, 0);
+  assert.equal(replies().length, goneBase, "来源反查不到 → 零入队，不许退回当前代际");
+  assert.equal(diags().length, goneDiags + 1, "要留可诊断记录");
+  assert.equal(diags().at(-1).reason, "consumed_claim_absent", JSON.stringify(diags().at(-1)));
+
+  // 重入预检绑来源身份（评审 PR #111 P2 反向）：更早回合的**同文**配对卡不算本回合已入队 ——
+  // 只比正文 + 时间会把这条 mid-turn 回答误丢
+  assert.equal(prompt("换个话头的本地输入").status, 0);
+  assert.equal(stop("换个话头的正式回复").status, 0);
+  const echoBase = replies().length;
+  assert.equal(stop("登记表恢复后的本地回复").status, 0, "mid-turn 回答恰与早回合配对正文相同");
+  assert.equal(replies().length, echoBase + 1,
+    "同文的早回合配对卡不该挡住本回合的 answer-only：来源键不同就要入队");
+
+  // 老形 local consumed 记录（没有 capture_id）：配对键与来源都拼不出 → 零入队 + 诊断
+  const oldShapeFile = readTurnRecord({ dir: claudeTurnInputDir(fx.root, null), key: session }).file;
+  fs.writeFileSync(oldShapeFile, JSON.stringify({ schema_version: "1.0", input_origin: "local",
+    text: "旧形输入", consumed_at: "2026-08-28T10:00:00.000Z" }));
+  const oldShapeBase = replies().length;
+  assert.equal(stop("旧形记录时代的 mid-turn").status, 0);
+  assert.equal(replies().length, oldShapeBase, "老形记录说不清来源 → 零入队");
+  assert.equal(diags().at(-1).reason, "consumed_source_unknown", JSON.stringify(diags().at(-1)));
+
+  // 账本单件说不清就 fail-closed（评审 PR #111 P1）：symlink / FIFO / 坏 JSON 都不算"没入队"，
+  // 一律零入队 + 诊断 —— 裸读会跟随 symlink、被 FIFO 挂死、把读失败当成"可以补发"
+  assert.equal(prompt("恢复正常记录的输入").status, 0);
+  assert.equal(stop("恢复正常记录的回复").status, 0);
+  const outDir = outboxDirOf(fx.root);
+  const bombs = [
+    ["zz-bad.json", () => fs.writeFileSync(path.join(outDir, "zz-bad.json"), "{nope")],
+    ["zz-link.json", () => fs.symlinkSync(path.join(fx.local, "elsewhere.txt"), path.join(outDir, "zz-link.json"))],
+    ["zz-fifo.json", () => execFileSync("mkfifo", [path.join(outDir, "zz-fifo.json")])],
+    // 合法 JSON 但不是可解释的 outbox 记录（评审三/五轮）：{} / 数组 / 空正文 /
+    // 缺 id、kind、created_at、published_at 的对象 —— 判据是账本自己的，比生产写方松一分都不行
+    ["zz-empty.json", () => fs.writeFileSync(path.join(outDir, "zz-empty.json"), "{}")],
+    ["zz-arr.json", () => fs.writeFileSync(path.join(outDir, "zz-arr.json"), "[]")],
+    ["zz-blank-text.json", () => fs.writeFileSync(path.join(outDir, "zz-blank-text.json"), JSON.stringify({ text: "", event_key: null }))],
+    ["zz-bare-obj.json", () => fs.writeFileSync(path.join(outDir, "zz-bare-obj.json"), JSON.stringify({ text: "x", event_key: null }))],
+  ];
+  fs.writeFileSync(path.join(fx.local, "elsewhere.txt"), JSON.stringify({ kind: "reply" }));
+  for (const [name, plant] of bombs) {
+    // 基线在放炸弹**之前**数、断言在拆掉**之后**做：listPending 这类帮手自己也会读 outbox，
+    // 炸弹在场时用它就把测试进程挂死在 FIFO 上（这正是被测的故障形态）
+    const bombBase = replies().length;
+    const bombDiags = diags().length;
+    plant();
+    const bombStop = stop("账本有炸弹时的 mid-turn " + name);
+    fs.rmSync(path.join(outDir, name), { force: true });
+    assert.equal(bombStop.status, 0, name + "：" + bombStop.stderr);
+    assert.equal(replies().length, bombBase, name + "：账本说不清 → 零入队");
+    assert.equal(diags().length, bombDiags + 1, name + "：要留诊断");
+    assert.equal(diags().at(-1).reason, "consumed_ledger_unreadable", name + "：" + JSON.stringify(diags().at(-1)));
+  }
+
+  // 无键卡是**合法**记录（appendEvent 允许不传事件键 → event_key: null，binding-health
+  // 预警就是这形状）：读取判据不许比写方契约严，answer-only 必须照常入队（评审第四轮）
+  assert.equal(appendEvent({ outboxDir: outDir, kind: "risk", text: "无键预警卡", source: "binding-health" }).ok, true);
+  const nokeyBase = replies().length;
+  assert.equal(stop("无键卡在场时的 mid-turn").status, 0);
+  assert.equal(replies().length, nokeyBase + 1, "合法无键卡不许把 answer-only 拒成账本损坏");
+
+  // 枚举层的说不清同样 fail-closed（评审第三轮）：outbox 不是目录 / 无权限都不算空账本。
+  // 现有的卡先挪走再挪回来，不动后续场景的计数基线。
+  fs.renameSync(outDir, outDir + ".save");
+  fs.writeFileSync(outDir, "not a dir");
+  const notDirDiags = diags().length;
+  assert.equal(stop("outbox 变成普通文件时的 mid-turn").status, 0);
+  assert.equal(diags().length, notDirDiags + 1, "非目录要留诊断");
+  assert.equal(diags().at(-1).reason, "consumed_ledger_unreadable", JSON.stringify(diags().at(-1)));
+  assert.match(String(diags().at(-1).why), /枚举失败/u, JSON.stringify(diags().at(-1)));
+  fs.rmSync(outDir, { force: true });
+  fs.renameSync(outDir + ".save", outDir);
+  fs.chmodSync(outDir, 0o000);
+  const noPermDiags = diags().length;
+  const noPermStop = stop("outbox 无权限时的 mid-turn");
+  fs.chmodSync(outDir, 0o700);
+  assert.equal(noPermStop.status, 0, noPermStop.stderr);
+  assert.equal(diags().length, noPermDiags + 1, "EACCES 要留诊断");
+  assert.equal(diags().at(-1).reason, "consumed_ledger_unreadable", JSON.stringify(diags().at(-1)));
 
   // 两条**不同**的飞书回合、回复正文相同：事件键是 claim key，不是正文指纹 —— 两条都要入队、各回各的话题
   const mkOk = (messageId, origin) => acquireClaim({ claimsDir, messageId, logicalTaskKey: mapping.logical_task_key,
@@ -20513,6 +20640,74 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   assert.deepEqual([outOfRange.ok, outOfRange.reason, /ERR_OUT_OF_RANGE/u.test(outOfRange.diagnostic)], [false, "spawn_failed", true], JSON.stringify(outOfRange));
 });
 
+
+test("off-template turn（评审 PR #111 P1 定案）：unverified locator 不豁免 @ 闸，只给拒绝回执加诊断 hint；群消息行为一个不变", () => {
+  // 判据：事件链没有 chat_type 字段，用 daemon 注入的 AILY_CLI_CHANNEL_CHAT_ID 对照模板
+  // chat_id。评审定案：「不等于模板群」只能证明 locator 不同，证明不了是私聊（可能是外部群 /
+  // 模板 locator 过期），unverified 事实不得绕过 @ 准入闸 —— mismatch 只作诊断 hint。
+  assert.equal(isOffTemplateChatTurn({ template: TPL, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p_direct" } }), true, "channel ≠ 模板 chat_id → off-template");
+  assert.equal(isOffTemplateChatTurn({ template: TPL, env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id } }), false, "同一个群 → 照旧要求 @");
+  assert.equal(isOffTemplateChatTurn({ template: TPL, env: {} }), false, "env 缺失按群处理");
+  assert.equal(isOffTemplateChatTurn({ template: { ...TPL, chat_id: "" }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_x" } }), false, "模板没有 chat_id 时不豁免");
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-p2p-"));
+  const bin = path.join(local, "bin"); fs.mkdirSync(bin);
+  const p1root = path.join(local, "p1"); fs.mkdirSync(p1root);
+  const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  const writeRegistry = (projects) => fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects }));
+  const pendingEntry = { id: "p1", root: p1root, name: "P1", root_message_id: "om_p1", expires_at: "2099-01-01T00:00:00Z",
+    inbound_state: "pending", pending_token: "aaaaaa", status: "active" };
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const claudeLog = path.join(local, "claude-argv.jsonl");
+  fs.writeFileSync(path.join(bin, "claude"), ["#!/usr/bin/env node",
+    "const fs = require('node:fs'); fs.appendFileSync(" + JSON.stringify(claudeLog) + ", JSON.stringify(process.argv.slice(2)) + '\\n');",
+    "process.stdout.write('回答：' + process.argv[process.argv.indexOf('-p') + 1].slice(0, 40) + '\\n');",
+  ].join("\n") + "\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
+  const argvLog = () => (fs.existsSync(claudeLog) ? fs.readFileSync(claudeLog, "utf-8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
+  let seq = 0;
+  const run = (content, sender, extraEnv = {}, extraArgs = []) => {
+    seq += 1;
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_p2p_" + seq, sessionID: "aily_dm", role: "user", createdBy: sender, createdAtMs: Date.now(), content } }) }] });
+    const entry = extraArgs.length ? "inbound.mjs" : "aily-inbound.mjs";
+    return spawnSync(process.execPath, [path.resolve("scripts", entry), ...extraArgs], { encoding: "utf-8",
+      env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+        AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_p2p", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", ...extraEnv } });
+  };
+  const at = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> ";
+  const quoted = "\n\n**[引用]**\n绑定码    aaaaaa";
+
+  // ① 仅 unverified mismatch（channel ≠ 模板 chat_id）+ 无 @ → **仍要求 @**（评审钉住的反向），
+  //    但拒绝回执带诊断 hint：私聊里的 Frank 至少能看懂发生了什么
+  writeRegistry([pendingEntry]);
+  const p2p = run("能收到吗", TPL.frank_sender_id, { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p_direct" });
+  assert.match(p2p.stdout, /已拒绝 · 没有真实 @/u, p2p.stdout);
+  assert.match(p2p.stdout, /诊断：本轮频道与登记群不一致/u, "mismatch 要给诊断 hint：" + p2p.stdout);
+  assert.match(p2p.stdout, /locator 完成验证前暂不开放/u, p2p.stdout);
+  assert.equal(argvLog().length, 0, "拒绝不起模型");
+  // mismatch + 未登记发送者：角色闸在 @ 闸前面，照旧按发送者拒，不因 mismatch 改变
+  const p2pStranger = run("能收到吗", "444", { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p_direct" });
+  assert.match(p2pStranger.stdout, /已拒绝 · 发送者不是授权用户/u, p2pStranger.stdout);
+  assert.equal(argvLog().length, 0, "未登记不起模型");
+
+  // ② 群消息 + 待认领 + 无 @ → 照旧拒，且**不带**诊断 hint（hint 只属于 mismatch）；
+  //    显式群 channel（= 模板 chat_id）同样干净拒
+  writeRegistry([pendingEntry]);
+  const groupNoAt = run("接着弄" + quoted, TPL.frank_sender_id);
+  assert.match(groupNoAt.stdout, /已拒绝 · 没有真实 @/u, groupNoAt.stdout);
+  assert.doesNotMatch(groupNoAt.stdout, /诊断：/u, "群内无 mismatch 不许带 hint：" + groupNoAt.stdout);
+  assert.equal(argvLog().length, 0, "拒绝不起模型");
+  const groupExplicit = run("接着弄" + quoted, TPL.frank_sender_id, { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id });
+  assert.match(groupExplicit.stdout, /已拒绝 · 没有真实 @/u, groupExplicit.stdout);
+  assert.doesNotMatch(groupExplicit.stdout, /诊断：/u, groupExplicit.stdout);
+
+  // ③ 群消息 + 真实 @ + 引用块绑定码 → 照旧认领（dry-run 直跑入口，打印的就是认领结论）
+  const claim = run(at + "接着弄" + quoted, TPL.frank_sender_id, {}, ["--dry-run"]);
+  assert.equal(claim.status, 0, claim.stdout + claim.stderr);
+  assert.match(claim.stdout, /会把这个话题绑给 p1/u, claim.stdout);
+  assert.match(claim.stdout, /根消息引用里的绑定码/u, claim.stdout);
+  assert.equal(JSON.parse(fs.readFileSync(registryFile, "utf-8")).projects[0].inbound_state, "pending", "dry-run 不写登记表");
+});
 
 test("维护门（issue #81 · PR A）：三态读门只认 ENOENT 为没门，各写入口在门前受控退出，锁原语兜底，doctor ⑩ 与状态页各说各的", () => {
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-gate-"));

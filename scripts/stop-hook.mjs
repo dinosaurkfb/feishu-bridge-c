@@ -100,19 +100,9 @@ function readOutboxEventSafe(file) {
     if (!st.isFile()) return { status: "unreadable", why: "不是普通文件" };
     let raw;
     try { raw = fs.readFileSync(fd, "utf-8"); } catch (err) { return { status: "unreadable", why: String(err.code ?? err.message) }; }
-    let doc;
-    try { doc = JSON.parse(raw); } catch { return { status: "unreadable", why: "不是 JSON" }; }
-    // 合法 JSON 但不是可解释的 outbox 记录（{} / 数组 / 字段形状不对）同样说不清。
-    // 判据与写方契约（appendEvent）共用：text 恒为非空字符串；event_key 允许 null ——
-    // 调用方可以不传事件键（binding-health 预警就没有），也兼容历史记录的字段缺席。
-    // 空字符串键写方造不出来，仍算损坏。pairedKey 匹配只可能命中字符串键，null 天然不碰。
-    if (typeof doc !== "object" || doc === null || Array.isArray(doc) ||
-        typeof doc.text !== "string" ||
-        !(doc.event_key === null || doc.event_key === undefined ||
-          (typeof doc.event_key === "string" && doc.event_key.length > 0))) {
-      return { status: "unreadable", why: "不是可解释的 outbox 记录" };
-    }
-    return { status: "read", doc };
+    // 只负责安全取字节 + 解析；记录形状是否可解释交给账本自己的判据
+    //（explainabilityGaps / classifyOutboxRecord，调用点做）—— 不在 Stop 里养第三份判据。
+    try { return { status: "read", doc: JSON.parse(raw) }; } catch { return { status: "unreadable", why: "不是 JSON" }; }
   } finally {
     if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
   }
@@ -162,7 +152,7 @@ async function main() {
   const { foreignHint, projectLabel } = await import("./stop-note.mjs");
   const { postDeliveryBits } = await import("./publish-outcome.mjs");
   const { resolveProject } = await import("./project-resolve.mjs");
-  const { appendEvent, listPending, MAX_REPLY_CHARS } = await import("./outbox.mjs");
+  const { appendEvent, listPending, MAX_REPLY_CHARS, explainabilityGaps, classifyOutboxRecord } = await import("./outbox.mjs");
   const { checkBinding, bindingWarning } = await import("./binding-health.mjs");
   const { isBridgeOwnedSession } = await import("./live-session.mjs");
   const { finalizeClaudeDialogueTurn } = await import("./interaction-policy-store.mjs");
@@ -342,7 +332,21 @@ async function main() {
             answerOnly = null;
             break;
           }
-          if (r.status === "read" && r.doc?.event_key === answerOnly.pairedKey && r.doc?.text === reply) {
+          if (r.status !== "read") continue; // absent：并发发走了
+          // 形状判据复用账本自己的（评审 PR #111 第五轮：不在 Stop 里养第三份判据）：
+          // explainabilityGaps 对齐生产写方能产出的集合，classifyOutboxRecord 守发布三态；
+          // event_key 额外做兼容校验 —— 缺席 / null / 非空字符串都是合法形态，空串是损坏。
+          const gaps = explainabilityGaps(r.doc);
+          const cls = classifyOutboxRecord(r.doc);
+          const keyOk = r.doc?.event_key === null || r.doc?.event_key === undefined ||
+            (typeof r.doc?.event_key === "string" && r.doc.event_key.length > 0);
+          if (gaps.length > 0 || cls.unclassified || !keyOk) {
+            turnRoute = { ...turnRoute, reason: "consumed_ledger_unreadable",
+              why: n + "：" + (gaps.length ? "字段说不清（" + gaps.join(",") + "）" : cls.unclassified ? cls.why : "event_key 形状不对") };
+            answerOnly = null;
+            break;
+          }
+          if (r.doc.event_key === answerOnly.pairedKey && r.doc.text === reply) {
             answerOnly.queuedThisTurn = true;
             break;
           }

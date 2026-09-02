@@ -18102,9 +18102,12 @@ test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结�
     ["zz-bad.json", () => fs.writeFileSync(path.join(outDir, "zz-bad.json"), "{nope")],
     ["zz-link.json", () => fs.symlinkSync(path.join(fx.local, "elsewhere.txt"), path.join(outDir, "zz-link.json"))],
     ["zz-fifo.json", () => execFileSync("mkfifo", [path.join(outDir, "zz-fifo.json")])],
-    // 合法 JSON 但不是可解释的 outbox 记录（评审第三轮）：{} 与数组都说不清
+    // 合法 JSON 但不是可解释的 outbox 记录（评审三/五轮）：{} / 数组 / 空正文 /
+    // 缺 id、kind、created_at、published_at 的对象 —— 判据是账本自己的，比生产写方松一分都不行
     ["zz-empty.json", () => fs.writeFileSync(path.join(outDir, "zz-empty.json"), "{}")],
     ["zz-arr.json", () => fs.writeFileSync(path.join(outDir, "zz-arr.json"), "[]")],
+    ["zz-blank-text.json", () => fs.writeFileSync(path.join(outDir, "zz-blank-text.json"), JSON.stringify({ text: "", event_key: null }))],
+    ["zz-bare-obj.json", () => fs.writeFileSync(path.join(outDir, "zz-bare-obj.json"), JSON.stringify({ text: "x", event_key: null }))],
   ];
   fs.writeFileSync(path.join(fx.local, "elsewhere.txt"), JSON.stringify({ kind: "reply" }));
   for (const [name, plant] of bombs) {

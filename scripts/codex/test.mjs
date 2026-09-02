@@ -9863,6 +9863,66 @@ test("#R14 B1（Codex）：sole_pending（无码）+ 无 @ → 拒 + 认领 hint
   assert.notEqual(r.off_template_hint, true, "sole_pending 只给认领 hint（off_template_hint 不得为 true），不出“诊断”：" + JSON.stringify(r));
 });
 
+// ── #R15 P1-1（Codex）：binding-only 握手 —— 无 @ 码命中的认领绑完即终结 ──
+// 与 Claude 链同一语义：mentionWaived 透传（单元）+ 真入口握手（e2e）。带 @ 码命中的照旧继续
+// 指令由上方「完整入站链路」e2e 回归（shadow legacy_disposition === "accepted"）。
+
+test("#R15（Codex）：mentionWaived 透传 —— 无 @ 码命中 true；带 @ 码命中 false", () => {
+  const noAt = evaluatePromotion({ event: cxOkEvent, template: TEMPLATE, pending: cxPending("quoted_binding_token"), now: cxNow });
+  assert.equal(noAt.ok, true, JSON.stringify(noAt));
+  assert.equal(noAt.mentionWaived, true, JSON.stringify(noAt));
+  const withAt = evaluatePromotion({
+    event: { ...cxOkEvent, content: '<at id="ou_same" type="employee">M5Codex</at> ' + cxOkEvent.content },
+    template: TEMPLATE, pending: cxPending("quoted_binding_token"), now: cxNow });
+  assert.equal(withAt.ok, true, JSON.stringify(withAt));
+  assert.equal(withAt.mentionWaived, false, JSON.stringify(withAt));
+});
+
+test("#R15 Codex 真入口：无 @ 引用码回复 → binding-only 握手（绑定落盘 + bound 回执），不投递", () => {
+  const home = temp();
+  const root = path.join(home, "same-project");
+  const bin = path.join(home, "bin");
+  fs.mkdirSync(root); fs.mkdirSync(bin);
+  const a = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30" });
+  const b = makeTaskEntry({ root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "62ca4f" });
+  writeRegistryFixtureUnvalidated([a, b], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const content = [
+    "接着弄",
+    "",
+    "> **[引用]**",
+    "> 🌉 hv-meeting",
+    ">",
+    "> 绑定码    62ca4f",
+  ].join("\n");
+  const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({
+    message: { id: "msg_r15_cx", sessionID: "session_r15_cx", role: "user", createdBy: TEMPLATE.frank_sender_id, createdAtMs: Date.now(), content } }) }] });
+  const result = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], {
+    encoding: "utf-8",
+    env: { ...isolatedEnv(), PATH: bin + path.delimiter + process.env.PATH, FEISHU_CODEX_BRIDGE_HOME: home,
+      AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "session_r15_cx",
+      AILY_CLI_RUN_ID: "run_r15_cx", FAKE_AILY_ENVELOPE: envelope } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /绑定完成 · B/u, result.stdout);
+  assert.match(result.stdout, /已认领；这条消息未当作指令执行，@ 我继续/u, "握手文案要说清没当指令：" + result.stdout);
+  const tasks = loadRegistry(path.join(home, "registry.json")).tasks;
+  const afterB = tasks.find((task) => task.codex_thread_id === THREAD_B);
+  const afterA = tasks.find((task) => task.codex_thread_id === THREAD_A);
+  assert.equal(afterB.inbound_state, "bound", "绑定落盘");
+  assert.equal(afterB.session_id, "session_r15_cx");
+  assert.equal(afterA.inbound_state, "pending", "另一个 pending 不受影响");
+  const receiptsDir = taskPaths(afterB, home).receipts;
+  const names = fs.readdirSync(receiptsDir);
+  const boundReceipts = names.filter((n) => n.startsWith("bound-"));
+  assert.equal(boundReceipts.length, 1, names.join(","));
+  const receipt = JSON.parse(fs.readFileSync(path.join(receiptsDir, boundReceipts[0]), "utf-8"));
+  assert.equal(receipt.handback, true, JSON.stringify(receipt));
+  assert.equal(receipt.claim_acquired, false, "握手不 claim");
+  assert.equal(receipt.handed_off, false, "握手不投递");
+  assert.equal(names.filter((n) => !n.startsWith("bound-")).length, 0, "没有 accepted/claim 类制品（终结在握手）：" + names.join(","));
+});
+
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (TEST_FILTER.length > 0) {

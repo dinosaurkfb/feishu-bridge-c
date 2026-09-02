@@ -1051,7 +1051,9 @@ export function evaluatePromotion({ event, template, pending, now = Date.now(), 
   const createdAt = Number(event?.created_at_ms);
   if (!Number.isFinite(createdAt)) return { ok: false, reason: "malformed_event" };
   if (now - createdAt > template.default_freshness_ms) return { ok: false, reason: "stale_message" };
-  return { ok: true, task: pending.task };
+  return { ok: true, task: pending.task,
+    // #R15 P1-1：binding-only 握手判定透传 —— 无 @ 且靠码命中豁免放行的认领，绑完即终结。
+    mentionWaived: tokenMatched && !extractMentionIds(event?.content).includes(template?.transport_open_id) };
 }
 
 export function promoteTask({

@@ -357,6 +357,8 @@ export function evaluatePromotion({ event, template, pending, now = Date.now(), 
     id: pending.id,
     source: pending.source,
     generationId: pending.generationId,
+    // #R15 P1-1：binding-only 握手要用 —— 无 @ 且靠码命中豁免放行的认领，绑完即终结，不把正文继续当指令。
+    mentionWaived: tokenMatched && !extractMentionIds(event?.content).includes(transport),
   };
 }
 

@@ -5285,6 +5285,94 @@ test("#R14 B1：无 pending（真正未接入外部群）+ 无 @ → 拒 + 诊�
   assert.match(r.reasonText, /诊断：本轮频道与登记群不一致/u, "无 pending 的外部群仍给诊断 hint：" + r.reasonText);
 });
 
+// ── #R15 P1-1：binding-only 握手 —— 无 @ 码命中的认领绑完即终结，不把正文继续当指令 ──
+// 修复前：认领成功后同一条消息继续走 mapping 准入，无 @ 撞 @ 闸 → registry 已变、回执却是「已拒绝」。
+
+test("#R15：mentionWaived 判定透传 —— 无 @ 码命中 true；带 @ 码命中 false（带 @ 认领照旧继续指令）", () => {
+  const noAt = evaluatePromotion({
+    event: { ...okEvent, content: pendingCodeContent(), session_id: "aily_dm" },
+    template: TPL, pending: codePending(), now: NOW2 });
+  assert.equal(noAt.ok, true, JSON.stringify(noAt));
+  assert.equal(noAt.mentionWaived, true, JSON.stringify(noAt));
+  const withAt = evaluatePromotion({
+    event: { ...okEvent, content: '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> " + pendingCodeContent(), session_id: "aily_dm" },
+    template: TPL, pending: codePending(), now: NOW2 });
+  assert.equal(withAt.ok, true, JSON.stringify(withAt));
+  assert.equal(withAt.mentionWaived, false, JSON.stringify(withAt));
+});
+
+test("#R15 Claude 真入口：无 @ 引用码回复 → binding-only 握手（绑定落盘 + bound 回执），不 claim、不投递、不起模型", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-r15-"));
+  const root = path.join(local, "project"); fs.mkdirSync(root);
+  const bin = path.join(local, "bin"); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json");
+  const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{
+    id: "p1", root, name: "P1", root_message_id: "om_p1", expires_at: "2099-01-01T00:00:00Z",
+    inbound_state: "pending", pending_token: "aaaaaa", status: "active" }] }));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const claudeLog = path.join(local, "claude-argv.jsonl");
+  fs.writeFileSync(path.join(bin, "claude"), ["#!/usr/bin/env node",
+    "const fs = require('node:fs'); fs.appendFileSync(" + JSON.stringify(claudeLog) + ", JSON.stringify(process.argv.slice(2)) + '\\n');",
+  ].join("\n") + "\n", { mode: 0o700 });
+  const content = "接着弄\n\n**[引用]**\n绑定码    aaaaaa";
+  const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: {
+    id: "msg_r15_hb", sessionID: "aily_r15", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content } }) }] });
+  const r = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
+    env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local,
+      FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+      AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_r15", AILY_CLI_RUN_ID: "run_r15", FAKE_AILY_ENVELOPE: envelope } });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^绑定完成 · P1/u, r.stdout);
+  assert.match(r.stdout, /已认领；这条消息未当作指令执行，@ 我继续/u, "握手文案要说清没当指令：" + r.stdout);
+  const reg = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
+  assert.equal(reg.projects[0].inbound_state, "bound", "绑定落盘");
+  assert.equal(reg.projects[0].session_id, "aily_r15");
+  const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
+  assert.ok(!fs.existsSync(claimsDir) || fs.readdirSync(claimsDir).length === 0, "握手不 claim：" + (fs.existsSync(claimsDir) ? fs.readdirSync(claimsDir).join(",") : "absent"));
+  assert.ok(!fs.existsSync(claudeLog) || fs.readFileSync(claudeLog, "utf-8").trim() === "", "不起模型");
+  const receiptsDir = path.join(root, ".runtime-data", "inbound", "receipts");
+  const boundReceipts = fs.readdirSync(receiptsDir).filter((n) => n.startsWith("bound-"));
+  assert.equal(boundReceipts.length, 1, fs.readdirSync(receiptsDir).join(","));
+  const receipt = JSON.parse(fs.readFileSync(path.join(receiptsDir, boundReceipts[0]), "utf-8"));
+  assert.equal(receipt.handback, true, JSON.stringify(receipt));
+  assert.equal(receipt.claim_acquired, false);
+  assert.equal(receipt.handed_off, false);
+});
+
+test("#R15 Claude 真入口回归：带 @ + 引用码 → 照旧绑定且指令继续执行（认领 + 投递全链，不是握手）", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-r15b-"));
+  const root = path.join(local, "project"); fs.mkdirSync(root);
+  const bin = path.join(local, "bin"); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json");
+  const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, auto_publish_on_completion: false }));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{
+    id: "p1", root, name: "P1", root_message_id: "om_p1", expires_at: "2099-01-01T00:00:00Z",
+    inbound_state: "pending", pending_token: "aaaaaa", status: "active" }] }));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, "claude"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  // handOff 要求 hasPriorSession：先在 transcriptDirFor(root) 种一个 .jsonl（与 #R10 accepted 真入口同一做法）
+  const projectsDir = path.join(local, ".claude", "projects", root.replace(/\//g, "-"));
+  fs.mkdirSync(projectsDir, { recursive: true });
+  fs.writeFileSync(path.join(projectsDir, "prior.jsonl"), "{}\n");
+  const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> 接着弄\n\n**[引用]**\n绑定码    aaaaaa";
+  const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: {
+    id: "msg_r15_at", sessionID: "aily_r15b", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content } }) }] });
+  const r = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
+    env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local,
+      FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+      AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_r15b", AILY_CLI_RUN_ID: "run_r15b", FAKE_AILY_ENVELOPE: envelope } });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /^已受理 · P1/u, "带 @ 认领照旧继续指令（已受理，不是握手终结）：" + r.stdout);
+  const reg = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
+  assert.equal(reg.projects[0].inbound_state, "bound", "绑定落盘");
+  const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
+  assert.ok(fs.existsSync(claimsDir) && fs.readdirSync(claimsDir).filter((n) => n.endsWith(".handed_off.json")).length === 1,
+    "指令照旧投递（handOff 落终态）：" + (fs.existsSync(claimsDir) ? fs.readdirSync(claimsDir).join(",") : "absent"));
+});
+
 test("消息太旧 → 拒，防重放", () => {
   const f = routeFixture([{ id: "a", extra: {} }]);
   const r = evaluatePromotion({

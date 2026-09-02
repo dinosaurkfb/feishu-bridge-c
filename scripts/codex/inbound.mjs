@@ -204,7 +204,9 @@ function ackText(kind, detail) {
   if (kind === "chat") return detail.text + "\n" + CHAT_FOOTER + (detail.replayed ? "（同一条消息的重放：按记录重出）" : "") + (detail.ledgerNote ?? "");
   if (kind === "bound") return [
     "绑定完成 · " + detail.taskName,
-    "这个话题现在精确通向一个 Codex task。之后在这里 @ M5Codex 即可续接。",
+    detail.handback
+      ? "已认领；这条消息未当作指令执行，@ 我继续。"
+      : "这个话题现在精确通向一个 Codex task。之后在这里 @ M5Codex 即可续接。",
   ].join("\n");
   if (kind === "control") return detail.text;
   if (kind === "rejected") return [
@@ -280,6 +282,8 @@ sampleCtx = {
 
 let routed = findTaskForFeishuSession({ sessionId: event.session_id, home: HOME });
 let justBound = false;
+// #R15 P1-1：无 @ 靠引用码命中的认领，绑完即握手终结（见下方 justBound 特判）。
+let justBoundWithoutMention = false;
 let subscriptionClaimShadow = null;
 if (!routed.ok) {
   if (routed.reason !== "no_binding_for_session") {
@@ -360,6 +364,7 @@ if (!routed.ok) {
     finish("error", { detail: "绑定没写成（" + promoted.reason + "）" }, { reason: promoted.reason });
   }
   justBound = true;
+  justBoundWithoutMention = promotion.mentionWaived === true;
   routed = findTaskForFeishuSession({ sessionId: event.session_id, home: HOME });
   if (!routed.ok) finish("error", { detail: "绑定写完却读不回来" }, { reason: routed.reason });
 }
@@ -412,14 +417,20 @@ const handlePolicy = (args = {}) => dialogueMode
   ? handleDialoguePolicy({ evaluation: policyEvaluation, ...args })
   : handleMappingPolicy({ evaluation: policyEvaluation, ...args });
 
-if (justBound && verdict.decision === "reject" && verdict.reason === REJECT.EMPTY_INSTRUCTION) {
+// #R15 P1-1：binding-only 握手（与 Claude 链同一语义）：无 @ 靠引用码认领的那条路，
+// 绑完即终结，不把正文继续当指令走 mapping 准入（registry 已变、回执却会是「已拒绝」）。
+// 带 @ 的认领（mentionWaived=false）照旧继续执行指令；空正文特判行为不变。
+if (justBound && (justBoundWithoutMention ||
+    (verdict.decision === "reject" && verdict.reason === REJECT.EMPTY_INSTRUCTION))) {
   appendConsumed(task, event.message_id, { home: HOME });
   writeReceipt("bound-" + event.message_id, {
     status: "bound", message_id: event.message_id, logical_task_key: task.logical_task_key,
+    handback: justBoundWithoutMention || undefined,
     claim_acquired: false, handed_off: false,
     subscription_claim_shadow: subscriptionClaimShadow,
   });
-  finish("bound", { taskName: task.task_display_name }, { bound: true, logical_task_key: task.logical_task_key });
+  finish("bound", { taskName: task.task_display_name, handback: justBoundWithoutMention },
+    { bound: true, logical_task_key: task.logical_task_key });
 }
 
 if (dryRun) {

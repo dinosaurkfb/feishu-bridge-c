@@ -144,7 +144,9 @@ function ackText(kind, detail) {
     return [
       "绑定完成 · " + detail.taskName,
       "这个话题现在通向 " + detail.root + "。",
-      "之后在这条消息下面 @ 一下就是给它下指令；它的进展和每一轮回答也会以卡片发回这里。",
+      detail.handback
+        ? "已认领；这条消息未当作指令执行，@ 我继续。"
+        : "之后在这条消息下面 @ 一下就是给它下指令；它的进展和每一轮回答也会以卡片发回这里。",
     ].join("\n");
   }
   if (kind === "control") return detail.text;
@@ -345,6 +347,8 @@ const dryRun = process.argv.includes("--dry-run");
 let routed = findBindingForSession({ sessionId: event.session_id });
 let justBound = false;
 let pendingMatchedBy = null;
+// #R15 P1-1：无 @ 靠引用码命中的认领，绑完即握手终结（见下方 justBound 特判）。
+let justBoundWithoutMention = false;
 let subscriptionClaimShadow = null;
 
 if (!routed.ok) {
@@ -431,6 +435,7 @@ if (!routed.ok) {
 
   justBound = true;
   pendingMatchedBy = pending.matchedBy ?? null;
+  justBoundWithoutMention = promo.mentionWaived === true;
   routed = findBindingForSession({ sessionId: event.session_id });
   if (!routed.ok) {
     // 刚写完就读不回来，说明登记表被并发改了。不猜，如实报。
@@ -506,7 +511,12 @@ const handlePolicy = (args = {}) => dialogueMode
 // 光秃秃一个 @（没有正文）是完成绑定的正常方式 —— 那一下的目的就是让 Aily 产生
 // session，好把它写进绑定。这时候回「消息里没有指令正文」是句没用的实话：
 // 它描述了现象，却把一次成功说成了失败。
-if (justBound && verdict.decision === "reject" && verdict.reason === REJECT.EMPTY_INSTRUCTION) {
+// #R15 P1-1：binding-only 握手。无 @ 靠引用码认领的那条路（#14），绑定本身就是这一轮的全部目的；
+// 若把「接着弄」等正文继续当指令走 mapping 准入，registry 已变、回执却是「已拒绝」。
+// 绑完即终结：认领成功回执 bound（文案说明本条未当指令），不 claim、不投递、不起模型。
+// 带 @ 的认领（mentionWaived=false）照旧继续执行指令；空正文特判行为不变。
+if (justBound && (justBoundWithoutMention ||
+    (verdict.decision === "reject" && verdict.reason === REJECT.EMPTY_INSTRUCTION))) {
   appendConsumed(routed.root, event.message_id, {
     claudeSessionId: routed.mapping?.claude_session_id ?? null,
   });
@@ -514,6 +524,7 @@ if (justBound && verdict.decision === "reject" && verdict.reason === REJECT.EMPT
     status: "bound", message_id: event.message_id, session_id: event.session_id,
     root: routed.root, binding_id: effectiveBindingId(mapping),
     matched_by: pendingMatchedBy,
+    handback: justBoundWithoutMention || undefined,
     claim_acquired: false, handed_off: false,
     subscription_claim_shadow: subscriptionClaimShadow,
     // 为将来的确定性匹配攒证据：根消息里那个绑定码有没有随引用块回来。
@@ -521,7 +532,7 @@ if (justBound && verdict.decision === "reject" && verdict.reason === REJECT.EMPT
     pending_token_seen: typeof mapping.pending_token === "string" && mapping.pending_token.length > 0
       ? String(event.content ?? "").includes(mapping.pending_token) : null,
   });
-  finish("bound", { taskName: config.task_display_name, root: routed.root },
+  finish("bound", { taskName: config.task_display_name, root: routed.root, handback: justBoundWithoutMention },
     { bound: true, root: routed.root });
 }
 

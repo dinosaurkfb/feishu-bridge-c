@@ -18039,6 +18039,42 @@ test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结�
   assert.equal(stop("mid-turn 插入的第二条").status, 0);
   assert.equal(replies().length, unpairedBase + 2, "不同回合不同键，第二条不丢");
 
+  // mid-turn 的目标必须继承已消费记录的来源（评审 PR #111 P1）：老话题的飞书回合里插入的
+  // mid-turn 回答要回老话题 —— 无条件发当前代际就是跨话题误投
+  assert.equal(mkClaim("msg_midturn_src", {}).ok, true);
+  assert.equal(prompt("[飞书 · msg_midturn_src · 2026-08-28 10:11Z]\n老话题里的新指令").status, 0);
+  assert.equal(stop("老话题回合的正式回复").status, 0);
+  assert.equal(targetOf("老话题回合的正式回复"), fx.oldGen.channel_generation_id);
+  const midBase = replies().length;
+  assert.equal(stop("老话题回合里 mid-turn 插入的补充").status, 0);
+  assert.equal(replies().length, midBase + 1, "feishu consumed 的 mid-turn 不丢");
+  assert.equal(targetOf("老话题回合里 mid-turn 插入的补充"), fx.oldGen.channel_generation_id,
+    "目标继承已消费记录的来源：老代际，不是当前代际");
+  const midReply = replies().find((x) => x.text === "老话题回合里 mid-turn 插入的补充");
+  assert.match(String(midReply.event_key), /:unpaired:msg-msg_midturn_src:/u,
+    "事件键绑来源身份再附正文指纹：" + midReply.event_key);
+
+  // 发布之后（markSent 原文件补 published_at，不删卡）同回合再重入：事件键仍在，照样挡住
+  markSent(midReply, "om_midturn_sent");
+  const sentDiags = diags().length;
+  const pendingAfterSent = replies().length;
+  assert.equal(stop("老话题回合里 mid-turn 插入的补充").status, 0);
+  assert.equal(replies().length, pendingAfterSent, "已发布的卡仍挡同回合重入：pending 不新增");
+  assert.equal(diags().length, sentDiags, "重入不算未路由");
+
+  // 来源说不清就不猜话题：claim 消失后的 mid-turn 回答零入队 + 可诊断
+  assert.equal(mkClaim("msg_midturn_gone", {}).ok, true);
+  assert.equal(prompt("[飞书 · msg_midturn_gone · 2026-08-28 10:12Z]\n即将失去 claim 的指令").status, 0);
+  assert.equal(stop("claim 还在时的正式回复").status, 0);
+  fs.rmSync(path.join(claimsDir, claimKey("msg_midturn_gone", mapping.logical_task_key) + ".claim"),
+    { recursive: true, force: true });
+  const goneBase = replies().length;
+  const goneDiags = diags().length;
+  assert.equal(stop("claim 消失后的 mid-turn 回答").status, 0);
+  assert.equal(replies().length, goneBase, "来源反查不到 → 零入队，不许退回当前代际");
+  assert.equal(diags().length, goneDiags + 1, "要留可诊断记录");
+  assert.equal(diags().at(-1).reason, "consumed_claim_absent", JSON.stringify(diags().at(-1)));
+
   // 两条**不同**的飞书回合、回复正文相同：事件键是 claim key，不是正文指纹 —— 两条都要入队、各回各的话题
   const mkOk = (messageId, origin) => acquireClaim({ claimsDir, messageId, logicalTaskKey: mapping.logical_task_key,
     meta: { session_id: "session_old", binding_id: effectiveBindingId(mapping, { root: fx.root }), claude_session_id: null,
@@ -20530,9 +20566,10 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
 });
 
 
-test("P2P / 平台直投：turn 不在模板登记的群 chat 里 → 不进认领评估一律 chat；群消息行为一个不变", () => {
+test("off-template turn（评审 PR #111 P1 定案）：unverified locator 不豁免 @ 闸，只给拒绝回执加诊断 hint；群消息行为一个不变", () => {
   // 判据：事件链没有 chat_type 字段，用 daemon 注入的 AILY_CLI_CHANNEL_CHAT_ID 对照模板
-  // chat_id（不同 = 私聊 / 平台直投）；env 缺失按群处理（fail-safe，要求 @，既有行为不变）
+  // chat_id。评审定案：「不等于模板群」只能证明 locator 不同，证明不了是私聊（可能是外部群 /
+  // 模板 locator 过期），unverified 事实不得绕过 @ 准入闸 —— mismatch 只作诊断 hint。
   assert.equal(isOffTemplateChatTurn({ template: TPL, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p_direct" } }), true, "channel ≠ 模板 chat_id → off-template");
   assert.equal(isOffTemplateChatTurn({ template: TPL, env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id } }), false, "同一个群 → 照旧要求 @");
   assert.equal(isOffTemplateChatTurn({ template: TPL, env: {} }), false, "env 缺失按群处理");
@@ -20565,26 +20602,29 @@ test("P2P / 平台直投：turn 不在模板登记的群 chat 里 → 不进认�
   const at = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> ";
   const quoted = "\n\n**[引用]**\n绑定码    aaaaaa";
 
-  // ① P2P（channel ≠ 模板 chat_id）+ 待认领代际 + 不带 @：不再 transport_not_mentioned，走 chat 默认态
+  // ① 仅 unverified mismatch（channel ≠ 模板 chat_id）+ 无 @ → **仍要求 @**（评审钉住的反向），
+  //    但拒绝回执带诊断 hint：私聊里的 Frank 至少能看懂发生了什么
   writeRegistry([pendingEntry]);
   const p2p = run("能收到吗", TPL.frank_sender_id, { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p_direct" });
-  assert.equal(p2p.status, 0, p2p.stdout + p2p.stderr);
-  assert.match(p2p.stdout, /^回答：能收到吗/mu, p2p.stdout);
-  assert.doesNotMatch(p2p.stdout, /已拒绝|没有真实 @/u);
-  assert.equal(argvLog().length, 1);
-  assert.equal(argvLog()[0][1], "能收到吗", "正文原样给模型（私聊本来就没有 @）");
-  // 未登记发送者在 P2P 里照旧拒：豁免的只有 @ 闸，角色闸保留（权限不扩大）
+  assert.match(p2p.stdout, /已拒绝 · 没有真实 @/u, p2p.stdout);
+  assert.match(p2p.stdout, /诊断：本轮频道与登记群不一致/u, "mismatch 要给诊断 hint：" + p2p.stdout);
+  assert.match(p2p.stdout, /locator 完成验证前暂不开放/u, p2p.stdout);
+  assert.equal(argvLog().length, 0, "拒绝不起模型");
+  // mismatch + 未登记发送者：角色闸在 @ 闸前面，照旧按发送者拒，不因 mismatch 改变
   const p2pStranger = run("能收到吗", "444", { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p_direct" });
   assert.match(p2pStranger.stdout, /已拒绝 · 发送者不是授权用户/u, p2pStranger.stdout);
-  assert.equal(argvLog().length, 1, "未登记不起模型");
+  assert.equal(argvLog().length, 0, "未登记不起模型");
 
-  // ② 群消息 + 待认领 + 无 @ → 照旧拒：env 缺失按群处理；显式群 channel（= 模板 chat_id）一样拒
+  // ② 群消息 + 待认领 + 无 @ → 照旧拒，且**不带**诊断 hint（hint 只属于 mismatch）；
+  //    显式群 channel（= 模板 chat_id）同样干净拒
   writeRegistry([pendingEntry]);
   const groupNoAt = run("接着弄" + quoted, TPL.frank_sender_id);
   assert.match(groupNoAt.stdout, /已拒绝 · 没有真实 @/u, groupNoAt.stdout);
-  assert.equal(argvLog().length, 1, "拒绝不起模型");
+  assert.doesNotMatch(groupNoAt.stdout, /诊断：/u, "群内无 mismatch 不许带 hint：" + groupNoAt.stdout);
+  assert.equal(argvLog().length, 0, "拒绝不起模型");
   const groupExplicit = run("接着弄" + quoted, TPL.frank_sender_id, { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id });
   assert.match(groupExplicit.stdout, /已拒绝 · 没有真实 @/u, groupExplicit.stdout);
+  assert.doesNotMatch(groupExplicit.stdout, /诊断：/u, groupExplicit.stdout);
 
   // ③ 群消息 + 真实 @ + 引用块绑定码 → 照旧认领（dry-run 直跑入口，打印的就是认领结论）
   const claim = run(at + "接着弄" + quoted, TPL.frank_sender_id, {}, ["--dry-run"]);

@@ -170,8 +170,10 @@ async function main() {
       if (!record.ok) {
         turnRoute = { ok: false, reason: "turn_record_" + record.reason };
       } else if (record.consumed) {
-        // 这份记录已经授权过一次 Stop：重入 / 上一轮遗留都不许再入队。
-        turnRoute = { ok: false, reason: "turn_record_consumed", messageId: record.messageId ?? null, consumedAt: record.consumedAt };
+        // 这份记录已经授权过一次 Stop：配对入队不许重来。answer-only 分支（下面）要按
+        // 来源决定目标，所以 kind / captureId / messageId 都带出去（评审 PR #111 P1）。
+        turnRoute = { ok: false, reason: "turn_record_consumed", recordKind: record.kind,
+          captureId: record.captureId ?? null, messageId: record.messageId ?? null, consumedAt: record.consumedAt };
       } else if (record.kind === "local") {
         turnRoute = { ok: true, kind: "local" };
       } else {
@@ -242,17 +244,52 @@ async function main() {
     // 答复只发给 **cwd 归属**的项目，不发给「会话记录里提到过路径」的那些。
     // 弱信号用来触发排空是安全的（那些内容本来就要发），但用它决定
     // 「把整段对话原文发到谁的话题里」不行 —— 一次误判就是把无关对话发给了 Frank。
-    if (reply && project.via.includes("cwd") && !turnRoute.ok && turnRoute.reason === "turn_record_consumed") {
+    // mid-turn answer-only 的目标解析（评审 PR #111 P1）：目标必须**继承已消费记录的来源**——
+    // local → 当前代际；feishu → 与正常路径同一套 claim 反查恢复冻结 origin（老代际回合的
+    // mid-turn 答复回老话题，发当前代际就是跨话题误投）；来源 / claim / origin 说不清 →
+    // 改写 reason 落进下面的零入队 + unrouted 诊断分支。事件键绑来源身份再附正文指纹。
+    let answerOnly = null; // { target, ident } —— 非 null 才允许 answer-only 入队
+    if (reply && bound.ok && !turnRoute.ok && turnRoute.reason === "turn_record_consumed") {
+      if (turnRoute.recordKind === "local") {
+        answerOnly = { target: bound.mapping?.channel_generation_id, ident: "cap-" + (turnRoute.captureId ?? "none") };
+      } else if (turnRoute.recordKind === "feishu" && typeof turnRoute.messageId === "string" &&
+                 turnRoute.messageId && bound.mapping?.logical_task_key) {
+        const claimKeyForTurn = claimKey(turnRoute.messageId, bound.mapping.logical_task_key);
+        const claimState = readClaimState({
+          claimsDir: path.join(project.root, ".runtime-data", "inbound", "delivery-claims"),
+          key: claimKeyForTurn,
+          expect: {
+            logicalTaskKey: bound.mapping.logical_task_key,
+            bindingId: effectiveBindingId(bound.mapping, { root: project.root }),
+            claudeSessionId: boundSession ?? null,
+          },
+        });
+        if (claimState.status !== "valid") {
+          turnRoute = { ...turnRoute, reason: "consumed_claim_" + claimState.status, why: claimState.why ?? null };
+        } else {
+          const origin = claimState.claim.origin_channel_generation_id ?? null;
+          const target = resolveMappingOutboundGeneration(bound.mapping, origin);
+          if (target.ok) {
+            answerOnly = { target: origin ?? bound.mapping?.channel_generation_id, ident: "msg-" + turnRoute.messageId };
+          } else {
+            turnRoute = { ...turnRoute, reason: "consumed_origin_unresolvable", why: target.reason, origin };
+          }
+        }
+      } else {
+        // 老形记录没有 kind / message_id 拼不出 claim key：宁可不发，也不猜话题。
+        turnRoute = { ...turnRoute, reason: "consumed_source_unknown" };
+      }
+    }
+    if (reply && project.via.includes("cwd") && !turnRoute.ok &&
+        turnRoute.reason === "turn_record_consumed" && answerOnly) {
       // mid-turn 插入的消息不经 UserPromptSubmit（没有新记录）：上一轮的记录已消费，
-      // 这一轮拿不到配对输入 —— 但回答半张是真实的，不再整轮丢弃：只发回答半张。
-      // 同一回合的重入用「同正文且不晚于消费点的 session-reply 已存在」识别
-      // （配对队列发生在消费戳之前，同 stop 内先入队后打 consumed_at，
-      // <= 无竞态）；不同回合不同正文 → 新键入队，不丢。逐字相同的两条
-      // 回答靠事件键去重兜底，不会双发。事件键用正文哈希而不是记录身份：
-      // 已消费记录的 capture / claim 键属于上一回合，复用会被它的旧事件吞掉。
-      // 不携带任何输入半张 —— 飞书来源输入不重复的约定不受影响：已消费回合
-      // 的输入早在它自己的回合里发过。已知残留：消费窗内两条逐字相同的回答
-      // 只发第一条（无配对输入时回合本身不可区分，只能靠正文）。
+      // 这一轮拿不到配对输入 —— 但回答半张是真实的，不再整轮丢弃：只发回答半张，
+      // 目标与事件键按上面解析出的来源。同一回合的重入用「同正文且不晚于消费点的
+      // session-reply 已存在」识别（配对队列发生在消费戳之前，同 stop 内先入队后打
+      // consumed_at，<= 无竞态；发布落标只在原文件补 published_at 不删卡，已发布的
+      // 也挡得住）。不携带任何输入半张 —— 飞书来源输入不重复的约定不受影响：已消费
+      // 回合的输入早在它自己的回合里发过。已知残留：消费窗内两条逐字相同的回答只发
+      // 第一条（无配对输入时回合本身不可区分，只能靠正文）。
       let queuedThisTurn = false;
       let names = [];
       try { names = fs.readdirSync(outboxDir); } catch { names = []; }
@@ -270,13 +307,13 @@ async function main() {
       } else {
         const r = appendEvent({
           outboxDir, kind: "reply", text: reply, source: "session-reply",
-          eventKey: "claude:" + speakingSession + ":unpaired:" +
+          eventKey: "claude:" + speakingSession + ":unpaired:" + answerOnly.ident + ":" +
             crypto.createHash("sha256").update(reply).digest("hex").slice(0, 16) + ":reply",
-          targetGenerationId: bound.ok ? bound.mapping?.channel_generation_id : undefined,
+          targetGenerationId: answerOnly.target,
         });
         if (r.ok) {
           wroteThisTurn.add(project.root);
-          log(project.id + " reply queued without paired input (turn_record_consumed; answer-only)");
+          log(project.id + " reply queued without paired input (turn_record_consumed; answer-only; " + answerOnly.ident + ")");
         } else {
           log(project.id + " answer-only reply not queued: " + r.reason);
         }

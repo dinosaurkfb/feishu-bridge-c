@@ -18121,6 +18121,13 @@ test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结�
     assert.equal(diags().at(-1).reason, "consumed_ledger_unreadable", name + "：" + JSON.stringify(diags().at(-1)));
   }
 
+  // 无键卡是**合法**记录（appendEvent 允许不传事件键 → event_key: null，binding-health
+  // 预警就是这形状）：读取判据不许比写方契约严，answer-only 必须照常入队（评审第四轮）
+  assert.equal(appendEvent({ outboxDir: outDir, kind: "risk", text: "无键预警卡", source: "binding-health" }).ok, true);
+  const nokeyBase = replies().length;
+  assert.equal(stop("无键卡在场时的 mid-turn").status, 0);
+  assert.equal(replies().length, nokeyBase + 1, "合法无键卡不许把 answer-only 拒成账本损坏");
+
   // 枚举层的说不清同样 fail-closed（评审第三轮）：outbox 不是目录 / 无权限都不算空账本。
   // 现有的卡先挪走再挪回来，不动后续场景的计数基线。
   fs.renameSync(outDir, outDir + ".save");

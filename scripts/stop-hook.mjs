@@ -102,10 +102,14 @@ function readOutboxEventSafe(file) {
     try { raw = fs.readFileSync(fd, "utf-8"); } catch (err) { return { status: "unreadable", why: String(err.code ?? err.message) }; }
     let doc;
     try { doc = JSON.parse(raw); } catch { return { status: "unreadable", why: "不是 JSON" }; }
-    // 合法 JSON 但不是可解释的 outbox 记录（{} / 数组 / 缺 event_key、text）同样说不清：
-    // appendEvent 落盘的每一张卡 event_key 与 text 恒为非空字符串，缺了就不是这本账的记录。
+    // 合法 JSON 但不是可解释的 outbox 记录（{} / 数组 / 字段形状不对）同样说不清。
+    // 判据与写方契约（appendEvent）共用：text 恒为非空字符串；event_key 允许 null ——
+    // 调用方可以不传事件键（binding-health 预警就没有），也兼容历史记录的字段缺席。
+    // 空字符串键写方造不出来，仍算损坏。pairedKey 匹配只可能命中字符串键，null 天然不碰。
     if (typeof doc !== "object" || doc === null || Array.isArray(doc) ||
-        typeof doc.event_key !== "string" || doc.event_key.length === 0 || typeof doc.text !== "string") {
+        typeof doc.text !== "string" ||
+        !(doc.event_key === null || doc.event_key === undefined ||
+          (typeof doc.event_key === "string" && doc.event_key.length > 0))) {
       return { status: "unreadable", why: "不是可解释的 outbox 记录" };
     }
     return { status: "read", doc };

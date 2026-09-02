@@ -96,7 +96,11 @@ export function describeStoreWrite(r, file) {
   let exitCode = 0;
   if (!r || typeof r !== "object") { lines.push("没有写成：结果说不清"); exitCode = 1; }
   else if (!r.ok) {
-    lines.push("没有写成：" + r.reason + detail(r) + (r.stale ? "；待补记已改名留痕为 <store>.audit.pending.stale.<ts>" : ""));
+    lines.push("没有写成：" + r.reason + detail(r));
+    // 评审 #115 三轮 P1-2/P2-1：冲突是持续 blocker，不是一次性的改名留痕（去掉死字段 r.stale）。
+    if (r.reason === "audit_pending_conflict") {
+      lines.push("待补记 <store>.audit.pending.json 与当前 store 冲突，会持续阻断后续写入；请用 resolveSubscriptionAuditConflict({ file, operationId, discard: true }) 显式处理（终端维护动作，CLI 不接线）。");
+    }
     exitCode = 1;
   }
   else if (!r.changed) lines.push("锁内重读后已经是这样，没动。");

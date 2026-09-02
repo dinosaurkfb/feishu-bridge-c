@@ -313,20 +313,41 @@ function currentStoreHash({ file }) {
   } catch { return null; } finally { try { fs.closeSync(fd); } catch { /* 已关 */ } }
 }
 
-/** 审计文件当前内容快照（受验读）：返回 { size, sha256 }（size 为字节长，sha256 为整内容 64 位哈希）。
- * 缺席 / 读不齐（目录 / 符号链接 / FIFO）当“空基线”返回 { size:0, sha256:EMPTY_AUDIT_SHA256 }
- * —— 保守：宁可记为“没有已知前缀”，让恢复时按前缀核验决定成败，也不在写 pending 时阻断变更。 */
-function auditSnapshot({ file }) {
+/** 审计基线**三态**（评审 #115 三轮 P1-1）：absent | valid | unreadable。
+ * 只有 ENOENT 投影为空（absent）；非普通文件 / I/O 错误 / 坏行 / 非法事件 / 重复 operation id /
+ * 非空但不以 \n 结尾都判 unreadable（audit_baseline_unreadable / audit_baseline_invalid）。
+ * 该判定必须在 **store 提交前**做：unreadable → 阻断本次变更（fail-closed），valid 才记 size/sha256
+ * 供 pending 记录基线 —— 不再把「读不齐」折成空基线（旧逻辑会把换行已被截掉的审计误当空，恢复时整段截掉）。
+ * 返回 { state, size?, sha256? } 或 { state:"unreadable", reason, detail }。 */
+function auditBaselineState({ file }) {
   const auditFile = file + ".audit.jsonl";
   let fd;
   try { fd = fs.openSync(auditFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); }
-  catch (err) { return { size: 0, sha256: EMPTY_AUDIT_SHA256 }; }
+  catch (err) {
+    if (err.code === "ENOENT") return { state: "absent", size: 0, sha256: EMPTY_AUDIT_SHA256 };
+    return { state: "unreadable", reason: "audit_baseline_unreadable", detail: err.code === "ELOOP" ? "审计路径是符号链接（别名）；请用真实路径" : (err.code === "EISDIR" ? "审计路径是目录" : String(err.code ?? err.message)) };
+  }
   try {
     const st = fs.fstatSync(fd);
-    if (!st.isFile() || st.nlink !== 1) return { size: 0, sha256: EMPTY_AUDIT_SHA256 };
+    if (!st.isFile()) return { state: "unreadable", reason: "audit_baseline_unreadable", detail: "审计不是普通文件" };
+    if (st.nlink !== 1) return { state: "unreadable", reason: "audit_baseline_unreadable", detail: "审计有 " + st.nlink + " 个目录项（硬链接别名）" };
     const buf = fs.readFileSync(fd);
-    return { size: buf.length, sha256: crypto.createHash("sha256").update(buf).digest("hex") };
-  } catch { return { size: 0, sha256: EMPTY_AUDIT_SHA256 }; } finally { try { fs.closeSync(fd); } catch { /* 已关 */ } }
+    if (buf.length > 0 && buf[buf.length - 1] !== 0x0a) return { state: "unreadable", reason: "audit_baseline_invalid", detail: "审计不以换行结尾（可能被拼行截断）" };
+    const lines = buf.toString("utf-8").split("\n");
+    const seen = new Set();
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      let ev;
+      try { ev = JSON.parse(line); } catch { return { state: "unreadable", reason: "audit_baseline_invalid", detail: "第 " + (i + 1) + " 行不是合法 JSON" }; }
+      const v = validateSubscriptionAuditEvent(ev);
+      if (!v.ok) return { state: "unreadable", reason: "audit_baseline_invalid", detail: "第 " + (i + 1) + " 行校验失败：" + v.problems.join(",") };
+      if (seen.has(ev.operation_id)) return { state: "unreadable", reason: "audit_baseline_invalid", detail: "重复 operation_id：" + ev.operation_id };
+      seen.add(ev.operation_id);
+    }
+    return { state: "valid", size: buf.length, sha256: crypto.createHash("sha256").update(buf).digest("hex") };
+  } catch (err) { return { state: "unreadable", reason: "audit_baseline_unreadable", detail: String(err.code ?? err.message) }; }
+  finally { try { fs.closeSync(fd); } catch { /* 已关 */ } }
 }
 
 /** fsync 目录项（评审 #115 二轮 P1-5 屏障）：打开目录 O_RDONLY、fsync、关。失败抛错由调用方接。 */
@@ -335,12 +356,13 @@ function fsyncDir(dirPath) {
   try { fs.fsyncSync(dfd); } finally { try { fs.closeSync(dfd); } catch { /* 已关 */ } }
 }
 
-/** 把审计内容按行解析成事件（去重扫描用）。坏行跳过（前缀已由基线哈希背书，正常不会坏）。 */
+/** 把审计内容按行解析成事件（去重扫描用）。P2-2：坏行 / 非法事件用**封闭校验器**当判据过滤，
+ * 不再只靠 JSON.parse + typeof —— 与「前缀已由基线哈希背书」的前提解耦，把前提变成代码判据。 */
 function parseAuditEvents(buf) {
   const events = [];
   for (const line of buf.toString("utf-8").split("\n")) {
     if (!line.trim()) continue;
-    try { const ev = JSON.parse(line); if (ev && typeof ev === "object") events.push(ev); } catch { /* 跳过 */ }
+    try { const ev = JSON.parse(line); if (validateSubscriptionAuditEvent(ev).ok) events.push(ev); } catch { /* 跳过 */ }
   }
   return events;
 }
@@ -410,24 +432,33 @@ export function clearSubscriptionAuditPending({ file } = {}) {
   catch (err) { return { ok: false, reason: String(err.code ?? err.message) }; }
 }
 
-/** 待补记判定为 stale：改名留痕为 <store>.audit.pending.stale.<ts>，不删不吞。返回 { ok, detail }。 */
-export function staleSubscriptionAuditPending({ file, now = new Date() } = {}) {
-  const pendingPath = subscriptionAuditPendingPath(file);
-  const stalePath = pendingPath + ".stale." + now.toISOString().replace(/[:.]/gu, "-");
-  try { fs.renameSync(pendingPath, stalePath); return { ok: true }; }
-  catch (err) { return { ok: false, detail: String(err.code ?? err.message) }; }
+/** 显式处理冲突待补记（评审 #115 三轮 P1-2 的维护入口，CLI 不接线）。
+ * 冲突时 pending **不改名、原地留存**作为持续 blocker（fail-closed）；只有本入口显式点名 + discard 才清除。
+ * 只删与给定 operationId **完全匹配**的 pending；点名错（mismatch）/ 缺席（no_conflict）都拒。
+ * discard 必须为 true 才删，否则只是确认（pending 保留）。返回 { ok, resolved?, kept? }。 */
+export function resolveSubscriptionAuditConflict({ file, operationId, discard = false } = {}) {
+  if (typeof file !== "string" || !path.isAbsolute(file)) return { ok: false, reason: "audit_pending_required_absolute" };
+  if (typeof operationId !== "string" || !operationId) return { ok: false, reason: "operation_id_required" };
+  const loaded = loadSubscriptionAuditPending({ file });
+  if (!loaded.ok) return { ok: false, reason: loaded.reason, detail: loaded.detail ?? (loaded.problems ? loaded.problems.join(",") : null) };
+  if (loaded.absent) return { ok: false, reason: "audit_pending_no_conflict", detail: "没有待补记" };
+  if (loaded.pending.operation_id !== operationId) return { ok: false, reason: "audit_pending_conflict_mismatch", detail: "点名 operation " + operationId + " 与待补记 op " + loaded.pending.operation_id + " 不符，拒绝" };
+  if (discard !== true) return { ok: true, kept: true, operationId };
+  const clr = clearSubscriptionAuditPending({ file });
+  if (!clr.ok) return { ok: false, reason: "audit_pending_clear_failed", detail: clr.reason };
+  return { ok: true, resolved: true, operationId };
 }
 
 /**
- * 进锁后的待补记重放 —— **封闭状态机**（评审 #115 二轮 P1-1/2/3/4/5）。返回 {
+ * 进锁后的待补记重放 —— **封闭状态机**（评审 #115 二轮 P1-1/2/3/4/5，三轮 P1-2 改为持续门禁）。返回 {
  *   ok:true, action:"noop"|"dropped"|"replayed"    —— 可继续规划新变更；
- *   ok:false, reason, detail, stale?               —— 未决，**阻断**本次新变更（fail-closed）。
+ *   ok:false, reason, detail                      —— 未决，**阻断**本次新变更（fail-closed）。
  * 三态判定（P1-2）：
  *   - pending 缺席 → noop；
  *   - current == before → 未提交（丢弃 pending，proceed）；
  *   - current == after → 补记：先核验审计闭合（前缀一致才截未提交尾巴，P1-3）、按 operation_id
  *     去重（同 id 异文 / 重复 id 都 fail-closed，P1-1）、追加、确认完整事件存在、才清 pending；
- *   - 其它 → 冲突：改名留痕 + 阻断（fail-closed）。
+ *   - 其它 → 冲突：**不改名留痕**，pending 原地留存作为持续 blocker（fail-closed，三轮 P1-2）。
  * 任何一步失败 / 清理失败都阻断并带回 reason（不静默，P1-5）。 */
 function resolvePendingSubscriptionAudit({ file, now }) {
   const loaded = loadSubscriptionAuditPending({ file });
@@ -437,21 +468,24 @@ function resolvePendingSubscriptionAudit({ file, now }) {
   const cur = currentStoreHash({ file });
   if (cur === pending.before_sha256) {
     const clr = clearSubscriptionAuditPending({ file });
-    if (!clr.ok) return { ok: false, reason: "audit_pending_clear_failed", detail: clr.reason, stale: true };
+    if (!clr.ok) return { ok: false, reason: "audit_pending_clear_failed", detail: clr.reason };
     return { ok: true, action: "dropped" };
   }
   if (cur !== pending.after_sha256) {
-    const stale = staleSubscriptionAuditPending({ file, now });
-    return { ok: false, reason: "audit_pending_conflict", detail: "当前 store 与 pending 的 before/after 都对不上", stale: stale.ok ? true : undefined, staleDetail: stale.ok ? null : stale.detail };
+    // 评审 #115 三轮 P1-2：冲突**不改名**，pending 原地留存作为持续 blocker（fail-closed）。
+    // 后续每次 apply 都在状态机入口再次撞上它并阻断，直到显式维护入口点名处理。
+    return { ok: false, reason: "audit_pending_conflict", detail: "当前 store 与待补记的 before/after 都对不上（pending op=" + pending.operation_id + "）；该 pending 会持续阻断后续写入，请用 resolveSubscriptionAuditConflict({ file, operationId, discard:true }) 显式处理" };
   }
   const rec = recoverAndAppendPendingAudit({ file, pending });
-  if (!rec.ok) return { ok: false, reason: rec.reason, detail: rec.detail, stale: false };
+  if (!rec.ok) return { ok: false, reason: rec.reason, detail: rec.detail };
   const clr = clearSubscriptionAuditPending({ file });
-  if (!clr.ok) return { ok: false, reason: "audit_pending_clear_failed", detail: clr.reason, stale: false };
+  if (!clr.ok) return { ok: false, reason: "audit_pending_clear_failed", detail: clr.reason };
   return { ok: true, action: "replayed" };
 }
 
-/** current==after 的补记主体：核前缀、截未提交尾巴、按 operation_id 去重并追加。返回 { ok, reason?, detail? }。 */
+/** current==after 的补记主体：按 pending 记录的基线核前缀、截未提交尾巴（P1-1：只在「基线 valid
+ * 且内容以基线为前缀」时截；基线为空时审计也必须为空，否则外部写入 → 冲突）、按 operation_id 去重、
+ * append + fsyncDir（P1-3 屏障）、复核后清 pending。返回 { ok, reason?, detail? }。 */
 function recoverAndAppendPendingAudit({ file, pending }) {
   const auditFile = file + ".audit.jsonl";
   const targetSize = pending.audit_size_before;
@@ -462,33 +496,39 @@ function recoverAndAppendPendingAudit({ file, pending }) {
     if (err.code === "ENOENT") { afd = null; }
     else return { ok: false, reason: "audit_replay_failed", detail: "audit_not_regular_file:" + (err.code === "EISDIR" ? "是目录" : err.code) };
   }
-  let content, prefix;
-  if (afd === null) {
-    if (targetSize !== 0 || targetSha !== EMPTY_AUDIT_SHA256) return { ok: false, reason: "audit_pending_conflict", detail: "审计缺席但 pending 记录的非空追加前基线" };
-    content = Buffer.alloc(0); prefix = Buffer.alloc(0);
-  } else {
-    try {
+  let committed = Buffer.alloc(0);
+  try {
+    if (afd !== null) {
       const st = fs.fstatSync(afd);
       if (!st.isFile()) return { ok: false, reason: "audit_replay_failed", detail: "audit_not_regular_file" };
       if (st.nlink !== 1) return { ok: false, reason: "audit_replay_failed", detail: "multiple_links:" + st.nlink };
       const chunks = []; const buf = Buffer.alloc(64 * 1024);
       for (;;) { const n = fs.readSync(afd, buf, 0, buf.length, null); if (n <= 0) break; chunks.push(Buffer.from(buf.subarray(0, n))); }
-      content = Buffer.concat(chunks);
-      if (content.length < targetSize) return { ok: false, reason: "audit_pending_conflict", detail: "审计文件比 pending 记录的追加前基线还短（前缀不一致）" };
-      prefix = content.subarray(0, targetSize);
-      if (crypto.createHash("sha256").update(prefix).digest("hex") !== targetSha) return { ok: false, reason: "audit_pending_conflict", detail: "审计前缀哈希与 pending 记录的基线不符" };
-      if (content.length > targetSize) { fs.ftruncateSync(afd, targetSize); fs.fsyncSync(afd); } // 截掉未提交尾巴（P1-3）
-    } catch (err) { return { ok: false, reason: "audit_replay_failed", detail: String(err.code ?? err.message) }; }
-    finally { try { fs.closeSync(afd); } catch { /* 已关 */ } }
-  }
-  const found = parseAuditEvents(prefix).filter((e) => e.operation_id === pending.event.operation_id);
+      const content = Buffer.concat(chunks);
+      if (targetSize === 0) {
+        // 基线为缺席/空：恢复要求审计也为空。非空 = 外部写入（换行截断 / 他者 append 等）→ **冲突不截**（P1-1）。
+        if (content.length !== 0) return { ok: false, reason: "audit_pending_conflict", detail: "待补记基线为空但审计有内容（外部写入），不覆盖" };
+      } else {
+        if (content.length < targetSize) return { ok: false, reason: "audit_pending_conflict", detail: "审计文件比基线还短（前缀不一致）" };
+        committed = content.subarray(0, targetSize);
+        if (crypto.createHash("sha256").update(committed).digest("hex") !== targetSha) return { ok: false, reason: "audit_pending_conflict", detail: "审计前缀哈希与基线不符" };
+        if (content.length > targetSize) { fs.ftruncateSync(afd, targetSize); fs.fsyncSync(afd); } // 只在基线 valid 且内容以基线为前缀时才截（P1-1）
+      }
+    } else {
+      if (targetSize !== 0) return { ok: false, reason: "audit_pending_conflict", detail: "审计缺席但基线非空（审计被外部删/移）" };
+    }
+  } catch (err) { return { ok: false, reason: "audit_replay_failed", detail: String(err.code ?? err.message) }; }
+  finally { try { fs.closeSync(afd); } catch { /* 已关 */ } }
+  const found = parseAuditEvents(committed).filter((e) => e.operation_id === pending.event.operation_id);
   if (found.length === 1) {
     if (JSON.stringify(found[0]) !== JSON.stringify(pending.event)) return { ok: false, reason: "audit_pending_conflict", detail: "同 operation_id 但内容不一致（同 id 异文，fail-closed）" };
     return { ok: true, committed: true };
   }
   if (found.length > 1) return { ok: false, reason: "audit_pending_conflict", detail: "审计中出现重复 operation_id（fail-closed）" };
-  try { appendSubscriptionAuditLine({ file, event: pending.event }); }
-  catch (err) { return { ok: false, reason: "audit_replay_failed", detail: "audit_append_failed:" + String(err.code ?? err.message) }; }
+  try {
+    appendSubscriptionAuditLine({ file, event: pending.event });
+    fsyncDir(path.dirname(auditFile)); // 评审 #115 三轮 P1-3：补记 append 成功先 fsync 父目录，再复核/清 pending。
+  } catch (err) { return { ok: false, reason: "audit_replay_failed", detail: "audit_append_failed:" + String(err.code ?? err.message) }; }
   const verify = loadSubscriptionAudit({ file });
   if (!verify.ok || !verify.events.some((e) => e.operation_id === pending.event.operation_id && JSON.stringify(e) === JSON.stringify(pending.event))) {
     return { ok: false, reason: "audit_replay_failed", detail: "补记后确认不到该 operation 的完整事件" };
@@ -655,7 +695,7 @@ export function applySubscriptionChange({ file, change, now = new Date() } = {})
       const resolved = resolvePendingSubscriptionAudit({ file, now });
       if (!resolved.ok) {
         // 评审 #115 二轮 P1-2/P1-4：待补记未决（冲突 / 不是普通文件 / 清不掉）→ 阻断本次新变更，fail-closed。
-        return (result = { ok: false, reason: resolved.reason, detail: resolved.detail ?? null, ...(resolved.stale ? { auditPendingStale: true } : {}) });
+        return (result = { ok: false, reason: resolved.reason, detail: resolved.detail ?? null });
       }
       if (resolved.action !== "noop") resolvedNote = resolved.action;
     }
@@ -709,7 +749,13 @@ export function applySubscriptionChange({ file, change, now = new Date() } = {})
     if (!evCheck.ok) { try { fs.rmSync(tmp, { force: true }); } catch { /* 已不在 */ } return (result = { ok: false, reason: "audit_invalid", problems: evCheck.problems, backup }); }
     // 评审 #115 P1-3：rename **前**把预期审计事件落成 pending —— 若「store 已提交、审计未写」，崩溃后可在下次 apply 补记。
     // 写不下 pending 就不提交 store（fail-closed：不落到不可恢复的中间态）。
-    const preAudit = auditSnapshot({ file });
+    const preAudit = auditBaselineState({ file });
+    // 评审 #115 三轮 P1-1：审计基线 unreadable（非普通文件 / 坏行 / 非法事件 / 重复 op id / 缺换行）→
+    // 在 store 提交**之前**阻断（fail-closed），不产生可被「恢复即截」的 pending。valid 才记 size/hash。
+    if (preAudit.state === "unreadable") {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* 已不在 */ }
+      return (result = { ok: false, reason: preAudit.reason, detail: preAudit.detail, backup });
+    }
     const pendWrite = writeSubscriptionAuditPending({
       file,
       pending: {

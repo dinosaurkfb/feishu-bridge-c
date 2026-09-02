@@ -97,7 +97,7 @@ const pendingDeadline = (record, pendingWindowMs) => {
  * 不得传进来。domain_key 是控制面的项目/业务域 locator，只用于当场派生 domain_id，不进入结果。
  */
 export function buildLegacySubscriptionReadModel({
-  runtime, endpointId, template, records, pendingWindowMs,
+  runtime, endpointId, template, records, pendingWindowMs, controlPlane = null,
 } = {}) {
   const problems = [];
   if (!nonEmpty(runtime)) problems.push("runtime");
@@ -186,7 +186,7 @@ export function buildLegacySubscriptionReadModel({
     if (!valid.ok) problems.push("subscription:" + valid.problems.join(","));
   }
   if (problems.length) return { ok: false, reason: SUBSCRIPTION_REJECT.PROJECTION_INVALID, problems };
-  return {
+  return mergeControlPlaneIntoModel({
     ok: true,
     schema_version: SUBSCRIPTION_SCHEMA_VERSION,
     projection: "legacy-read-only",
@@ -194,7 +194,37 @@ export function buildLegacySubscriptionReadModel({
     endpoint_id: endpointId,
     subscriptions: projected,
     pending_bindings: pendingBindings,
-  };
+  }, controlPlane);
+}
+
+/**
+ * FR-2.6 单 1：控制面订阅与 legacy 投影合并成统一读模型。
+ *
+ * · controlPlane 缺省 / 缺席文件（absent）/ 空 store → **原样返回同一个对象**：
+ *   不装不建文件的机器，输出与没有这个参数时逐字节一致。
+ * · 同 id：控制面覆盖投影（那是显式登记）；控制面新 id：追加（同域第二个群）。
+ *   id 派生两边同一套（subscription-store.mjs 的 subscriptionControlId），自然对齐。
+ * · fail-closed：控制面整体损坏（或合并时发现任一条目校验不过）→ **整份控制面不作数**，
+ *   subscriptions 退回纯 legacy，问题记进 control_plane.problems 可诊断，不静默丢。
+ */
+function mergeControlPlaneIntoModel(model, controlPlane) {
+  if (controlPlane == null) return model;
+  if (controlPlane.ok !== true || !Array.isArray(controlPlane.subscriptions)) {
+    return { ...model, control_plane: { ok: false, problems: controlPlane.problems ?? ["control_plane_invalid"] } };
+  }
+  const problems = [];
+  const byId = new Map(model.subscriptions.map((s) => [s.subscription_id, s]));
+  let added = 0;
+  let overridden = 0;
+  for (const entry of controlPlane.subscriptions) {
+    const valid = validateSubscription(entry);
+    if (!valid.ok) { problems.push("subscription:" + (entry?.subscription_id ?? "?") + ":" + valid.problems.join(",")); continue; }
+    if (byId.has(entry.subscription_id)) overridden += 1; else added += 1;
+    byId.set(entry.subscription_id, entry);
+  }
+  if (problems.length) return { ...model, control_plane: { ok: false, problems } };
+  if (!controlPlane.subscriptions.length) return model;
+  return { ...model, subscriptions: [...byId.values()], control_plane: { ok: true, added, overridden } };
 }
 
 const reject = (reason, extra = {}) => ({ ok: false, reason, ...extra });

@@ -332,11 +332,13 @@ export function evaluatePromotion({ event, template, pending, now = Date.now(), 
   }
 
   if (event?.sender_id !== frank) return reject(PROMOTE_REJECT.SENDER_NOT_FRANK);
-  // #R11 P1-2：promotion 底层**不许豁免 @**。私聊豁免只放在 evaluateChatGates（chat 默认态）；
-  // 认领 pending 必须带真实 @——否则早分流漏接时，私聊能凭「无 @」从私聊认领 pending。
-  if (!extractMentionIds(event?.content).includes(transport)) {
+  // #R11 P1-2：promotion 不豁免**私聊**（私聊豁免只放 evaluateChatGates）；#14：绑定码精确命中
+  // 豁免 @ —— 码只存在于 pending 话题根消息，是被引用的话题身份强证明，与「私聊」是完全不同
+  // 的正向证据，两个条件不混写。sender 闸在前，豁免只对 owner 生效。
+  if (!extractMentionIds(event?.content).includes(transport) && pending?.matchedBy !== "quoted_binding_token") {
     const r = reject(PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
     if (isOffTemplateChatTurn({ template, env })) r.reasonText += OFF_TEMPLATE_HINT;
+    else if (pending?.ok === true && pending.matchedBy === "only_pending") r.reasonText += PENDING_REPLY_HINT;
     return r;
   }
 
@@ -403,6 +405,10 @@ export function isPrivateChatTurn({ template, env = process.env } = {}) {
 // 私聊已开通（真机验证），hint 只描述「未接入的群」这一场景。
 export const OFF_TEMPLATE_HINT =
   "（诊断：本轮频道与登记群不一致，未接入的群消息暂不自动应答；请到已绑定话题里 @ 我）";
+
+// #14：无 @ 也无引用码被拒、且存在唯一待认领代际时的 hint —— 告诉 Frank 路径 B 已通。
+export const PENDING_REPLY_HINT =
+  "（检测到有待认领的新话题：到新话题里回复任意内容，或 @ 我完成认领）";
 
 /**
  * off-template 观察（**诊断用，不是路由事实**——评审 PR #111 P1 定案）：本轮 Aily turn 的

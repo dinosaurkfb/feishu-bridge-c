@@ -799,6 +799,97 @@ test("没有引用码时保留唯一 pending 的兼容路径", () => {
   assert.equal(selected.source, "sole_pending");
 });
 
+// ---------- #14 路径 B（Codex 链）：绑定码精确命中豁免 @（owner-only） ----------
+
+test("#14 Codex：pending 话题回复（引用块绑定码精确命中、无 @、owner）→ evaluatePromotion 放行", () => {
+  const home = temp();
+  const entry = makeTaskEntry({ root: path.join(home, "proj"), threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30" });
+  writeRegistryFixtureUnvalidated([entry], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const event = {
+    message_id: "msg_reply_claim", session_id: "session_reply_claim",
+    sender_id: TEMPLATE.frank_sender_id, created_at_ms: Date.now() - 1000,
+    content: "收到，来认领\n\n> **[引用]**\n> 绑定码    5fba30",
+  };
+  const pending = findPendingTask({ home, content: event.content });
+  assert.equal(pending.ok, true, JSON.stringify(pending).slice(0, 300));
+  assert.equal(pending.source, "quoted_binding_token");
+  const r = evaluatePromotion({ event, template: TEMPLATE, pending, now: Date.now() });
+  assert.equal(r.ok, true, JSON.stringify(r).slice(0, 300));
+  assert.equal(r.task.logical_task_key, entry.logical_task_key);
+});
+
+test("#14 Codex：非 owner 带码 → sender 闸在前，仍拒", () => {
+  const home = temp();
+  const entry = makeTaskEntry({ root: path.join(home, "proj"), threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30" });
+  writeRegistryFixtureUnvalidated([entry], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const event = {
+    message_id: "msg_not_owner", session_id: "session_not_owner",
+    sender_id: "9999", created_at_ms: Date.now() - 1000,
+    content: "我也能认领吗\n\n> **[引用]**\n> 绑定码    5fba30",
+  };
+  const pending = findPendingTask({ home, content: event.content });
+  const r = evaluatePromotion({ event, template: TEMPLATE, pending, now: Date.now() });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "sender_not_frank");
+});
+
+test("#14 Codex：码命中只豁免 @，其余闸照旧 —— 消息过期仍拒", () => {
+  const home = temp();
+  const entry = makeTaskEntry({ root: path.join(home, "proj"), threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30" });
+  writeRegistryFixtureUnvalidated([entry], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const now = Date.now();
+  const event = {
+    message_id: "msg_stale", session_id: "session_stale",
+    sender_id: TEMPLATE.frank_sender_id, created_at_ms: now - 60 * 60 * 1000,
+    content: "晚了\n\n> **[引用]**\n> 绑定码    5fba30",
+  };
+  const pending = findPendingTask({ home, content: event.content, now });
+  const r = evaluatePromotion({ event, template: TEMPLATE, pending, now });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "stale_message");
+});
+
+test("#14 Codex：无码无 @ 仍拒 + pending_reply_hint（变异防线：豁免放宽成「有 pending 就免 @」此支转红）", () => {
+  const home = temp();
+  const entry = makeTaskEntry({ root: path.join(home, "proj"), threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30" });
+  writeRegistryFixtureUnvalidated([entry], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const now = Date.now();
+  const event = {
+    message_id: "msg_plain", session_id: "session_plain",
+    sender_id: TEMPLATE.frank_sender_id, created_at_ms: now - 1000, content: "随便说说",
+  };
+  const pending = findPendingTask({ home, content: event.content, now });
+  assert.equal(pending.ok, true, "唯一 pending 无码也认得出（sole_pending）");
+  assert.equal(pending.source, "sole_pending");
+  const r = evaluatePromotion({ event, template: TEMPLATE, pending, now });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "transport_not_mentioned");
+  assert.equal(r.pending_reply_hint, true, JSON.stringify(r));
+});
+
+test("#14 Codex：未知码不豁免（pending 闸在前，拒绝原因指向码本身），无 hint 字段", () => {
+  const home = temp();
+  const entry = makeTaskEntry({ root: path.join(home, "proj"), threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30" });
+  writeRegistryFixtureUnvalidated([entry], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const event = {
+    message_id: "msg_bad_token", session_id: "session_bad_token",
+    sender_id: TEMPLATE.frank_sender_id, created_at_ms: Date.now() - 1000,
+    content: "认领\n\n> **[引用]**\n> 绑定码    ffffff",
+  };
+  const pending = findPendingTask({ home, content: event.content });
+  assert.equal(pending.ok, false);
+  assert.equal(pending.reason, "pending_binding_token_unknown");
+  const r = evaluatePromotion({ event, template: TEMPLATE, pending, now: Date.now() });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "pending_binding_token_unknown");
+  assert.equal(r.pending_reply_hint, undefined, JSON.stringify(r));
+});
+
 test("Codex 旧 task 登记只读投影成一份订阅和两个本地目标", () => {
   const home = temp();
   const root = path.join(home, "same-project");

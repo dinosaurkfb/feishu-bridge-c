@@ -1037,10 +1037,13 @@ export function shadowCodexFirstClaim({
 export function evaluatePromotion({ event, template, pending, now = Date.now(), env = process.env }) {
   if (!pending?.ok) return { ok: false, reason: pending?.reason ?? "no_pending_binding" };
   if (event?.sender_id !== template?.frank_sender_id) return { ok: false, reason: "sender_not_frank" };
-  // #R11 P1-2：Codex 侧 promotion 底层同样不许豁免 @；私聊豁免只放 evaluateChatGates（codex 共用）。
-  if (!extractMentionIds(event?.content).includes(template?.transport_open_id)) {
+  // #R11 P1-2：不豁免**私聊**（私聊豁免只放 evaluateChatGates）；#14：绑定码精确命中
+  // 豁免 @ —— 码只存在于 pending 话题根消息，是被引用的话题身份强证明，与「私聊」是完全
+  // 不同的正向证据，两个条件不混写。sender 闸在前，豁免只对 owner 生效。
+  if (!extractMentionIds(event?.content).includes(template?.transport_open_id) && pending?.source !== "quoted_binding_token") {
     return { ok: false, reason: "transport_not_mentioned",
-      off_template_hint: isOffTemplateChatTurn({ template, env }) };
+      off_template_hint: isOffTemplateChatTurn({ template, env }),
+      pending_reply_hint: pending?.source === "sole_pending" };
   }
   const createdAt = Number(event?.created_at_ms);
   if (!Number.isFinite(createdAt)) return { ok: false, reason: "malformed_event" };

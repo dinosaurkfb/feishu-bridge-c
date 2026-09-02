@@ -78,13 +78,14 @@ export function readTurnRecord({ dir, key } = {}) {
   catch (err) { return { ok: false, reason: err.code === "ENOENT" ? "not_found" : "unreadable", file }; }
   if (record?.schema_version !== "1.0") return { ok: false, reason: "invalid_cache", file };
   const consumed = typeof record.consumed_at === "string" && record.consumed_at.length > 0;
+  const consumedAt = consumed ? record.consumed_at : null;
   if (record.input_origin === "local") {
     if (typeof record.text !== "string" || !record.text.trim()) return { ok: false, reason: "invalid_cache", file };
-    return { ok: true, kind: "local", file, consumed, text: record.text, captureId: typeof record.capture_id === "string" && record.capture_id ? record.capture_id : null };
+    return { ok: true, kind: "local", file, consumed, consumedAt, text: record.text, captureId: typeof record.capture_id === "string" && record.capture_id ? record.capture_id : null };
   }
   if (record.input_origin === "feishu") {
     if (typeof record.message_id !== "string" || !record.message_id) return { ok: false, reason: "invalid_cache", file };
-    return { ok: true, kind: "feishu", file, consumed, messageId: record.message_id };
+    return { ok: true, kind: "feishu", file, consumed, consumedAt, messageId: record.message_id };
   }
   return { ok: false, reason: "invalid_cache", file };
 }

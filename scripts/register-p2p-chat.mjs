@@ -15,10 +15,8 @@
  */
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
-import { describeTemplateWrite, loadChainTemplate, validateChainTemplate, withChainTemplateWrite } from "./chain-template.mjs";
+import { describeTemplateWrite, loadChainTemplate, p2pChatIdProblem, validateChainTemplate, withChainTemplateWrite } from "./chain-template.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
-
-const OC_RE = /^oc_[A-Za-z0-9_]+$/u;
 
 export function p2pIdsProblem(template) {
   if (template?.verified_p2p_chat_ids === undefined) return null; // 缺省合法（= 没登记任何私聊放行）
@@ -26,8 +24,8 @@ export function p2pIdsProblem(template) {
   if (!Array.isArray(list)) return "verified_p2p_chat_ids 必须是数组";
   if (new Set(list).size !== list.length) return "verified_p2p_chat_ids 有重复";
   for (const x of list) {
-    if (typeof x !== "string" || x.length === 0) return "verified_p2p_chat_ids 含非字符串或空串";
-    if (!OC_RE.test(x)) return "verified_p2p_chat_ids 含非 oc_ 形状：" + x;
+    const problem = p2pChatIdProblem(x);
+    if (problem !== null) return "verified_p2p_chat_ids 含非法项：" + problem;
   }
   return null;
 }
@@ -50,7 +48,9 @@ export function parseRegisterP2pArgs(argv) {
     return { ok: false, reason: "unknown_argument", argument: a };
   }
   if (!out.template || !path.isAbsolute(out.template)) return { ok: false, reason: "template_required_absolute" };
-  if (!out.chatId || !OC_RE.test(out.chatId)) return { ok: false, reason: "chat_id_shape_oc" };
+  // 形状校验用同一份 p2pChatIdProblem（#R12 P1）：与模板校验 / plan 层同判，不再本地正则。
+  const chatProblem = p2pChatIdProblem(out.chatId);
+  if (chatProblem !== null) return { ok: false, reason: "chat_id_shape_oc", problem: chatProblem };
   // 登记（--add）与移除（--remove）是封闭联合：互斥。
   if (seen.has("--add") && seen.has("--remove")) return { ok: false, reason: "add_remove_mutually_exclusive" };
   return { ok: true, ...out };
@@ -58,6 +58,10 @@ export function parseRegisterP2pArgs(argv) {
 
 /** 纯函数：算出新模板。不写盘。 */
 export function planP2pChange(template, { chatId, remove = false }) {
+  // 传入的 chatId 先过同一份形状判据（#R12 P1 评审探针）：以前只靠 CLI 参数层拦，
+  // 底层写 API 直接调 planP2pChange 能把 "oc_x\n" 这类值推进白名单。
+  const chatProblem = p2pChatIdProblem(chatId);
+  if (chatProblem !== null) return { ok: false, reason: "chat_id_shape_oc", problem: chatProblem };
   const problem = p2pIdsProblem(template);
   if (problem !== null) return { ok: false, reason: "template_p2p_invalid", problem };
   if (chatId === template.chat_id) return { ok: false, reason: "group_chat_not_private", problem: "登记群不是私聊" };

@@ -18,7 +18,7 @@ import fs from "node:fs";
 import { senderRole } from "./sender-roles.mjs";
 import path from "node:path";
 
-import { loadChainTemplate } from "./chain-template.mjs";
+import { loadChainTemplate, p2pChatIdProblem } from "./chain-template.mjs";
 import {
   acquirePublishLock, loadRegistry, registryPath, releasePublishLock,
 } from "./registry.mjs";
@@ -380,14 +380,18 @@ export const CHAT_FALLBACK_REASONS = Object.freeze([
  */
 export function isPrivateChatTurn({ template, env = process.env } = {}) {
   const chatId = typeof env?.AILY_CLI_CHANNEL_CHAT_ID === "string" ? env.AILY_CLI_CHANNEL_CHAT_ID : "";
-  if (chatId.length === 0) return false;
+  // 形状判据用同一份 p2pChatIdProblem（#R12 P1）：env 值是 unverified locator，形状不合法
+  // 直接不放行 —— 逐字 includes 本来也拦得住，但显式走同一份判据，四个使用点不会漂移。
+  if (chatId.length === 0 || p2pChatIdProblem(chatId) !== null) return false;
   // 主判据：正向验过的私聊登记表。缺 / 非数组 / 空 → false（没登记就没有私聊放行）。
   const whitelist = template?.verified_p2p_chat_ids;
   if (!Array.isArray(whitelist) || whitelist.length === 0) return false;
   if (!whitelist.includes(chatId)) return false;
   // 群里（= 模板登记的群 chat）语义上不是私聊——即便被误登记进白名单也按群处理。
+  // 模板 chat_id 缺失 / 坏形状时跳过这条群判，白名单照常判定（登记表本身已被
+  // validateChainTemplate 守过；这里坏的是群 id，不是放行白名单）。
   const templateChatId = typeof template?.chat_id === "string" ? template.chat_id : "";
-  if (templateChatId.length > 0 && chatId === templateChatId) return false;
+  if (templateChatId.length > 0 && p2pChatIdProblem(templateChatId) === null && chatId === templateChatId) return false;
   // 纵深防御：thread 形态异常（非字符串）或 thread 有值 → 外部群话题/群内线程，不是私聊。
   const rawThread = env?.AILY_CLI_CHANNEL_THREAD_ID;
   if (rawThread !== undefined && rawThread !== null && typeof rawThread !== "string") return false;

@@ -92,10 +92,30 @@ const SHAPE = {
   senders: (v) => Array.isArray(v),
   // 已验证私聊 chat 白名单（#R11 P1-1，Frank 拍板 b 选项）：非空字符串、唯一、oc_ 形状。
   // 空数组合法（= 没登记任何私聊放行）；缺省走 OPTIONAL_CHAIN_FIELDS 不报错，旧模板仍合法。
+  // 形状判据是 p2pChatIdProblem（#R12 P1 统一）：CLI 参数、planP2pChange、模板校验共用同一份。
   verified_p2p_chat_ids: (v) => Array.isArray(v) &&
     new Set(v).size === v.length &&
-    v.every((x) => typeof x === "string" && x.length > 0 && x.startsWith("oc_")),
+    v.every((x) => p2pChatIdProblem(x) === null),
 };
+
+/**
+ * chat-id 形状的唯一判据（#R12 P1）：oc_ 前缀 + 小写字母数字，总长 ≤ 64。
+ *
+ * 放 chain-template 层的理由：模板校验器是四个使用点（validateChainTemplate / CLI 参数 /
+ * planP2pChange / isPrivateChatTurn）的共同上游，且 CLI 与 plan 本来就 import 本模块，
+ * inbound-route 也已 import —— 放这里零新增依赖，也不给 register-p2p-chat 留第二份正则的机会
+ * （评审探针：两处判据已经漂移过一次，宽松版放过 "oc_" 裸前缀和控制字符）。收紧到 [a-z0-9]
+ * 是评审建议：真实 chat_id = oc_ + 32 位小写 hex，大写 / 下划线从不是合法值；长度上限挡
+ * 超长垃圾值，同时不把未来的合法值挡在外面。
+ */
+export const P2P_CHAT_ID_RE = /^oc_[a-z0-9]{1,64}$/u;
+
+/** 共用形状判据：合法返回 null，非法返回一句人话（含原值，控制字符会被 JSON.stringify 转义）。 */
+export function p2pChatIdProblem(chatId) {
+  if (typeof chatId !== "string" || chatId.length === 0) return "chat id 必须是非空字符串";
+  if (!P2P_CHAT_ID_RE.test(chatId)) return "chat id 必须是 oc_ 前缀 + 小写字母数字（总长 ≤ 64）：" + JSON.stringify(chatId);
+  return null;
+}
 
 /**
  * 校验模板。返回缺的和形状不对的，不抛 —— 调用方要把两类问题一次全说出来，

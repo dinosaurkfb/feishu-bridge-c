@@ -210,7 +210,7 @@ import {
   buildClaudeSubscriptionProjection, findBindingForSession, findPendingBinding, loadConsumed,
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
-import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, stableControlId, validateSubscription, claimable } from "./subscription.mjs";
+import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, stableControlId, validateSubscription, claimable, selectPendingSubscriptionClaim } from "./subscription.mjs";
 import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
 import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
@@ -5384,6 +5384,218 @@ test("shadow 总 match 不掩盖同为拒绝但 reason 不同", () => {
   assert.equal(shadow.reason_match, false);
   assert.equal(shadow.match, false);
 });
+
+// ---------- FR-2.6 单 2：首次认领的多订阅歧义矩阵（S–M，纯行为测试，零生产代码改动） ----------
+// 直接手工构造多订阅读模型喂给 selectPendingSubscriptionClaim。订阅一律 version:1，
+// 不撞 selector 的前向兼容卫兵（subscription.mjs:224-227）。锁定的是歧义判据（chat /
+// pending / token / paused）与 scope_unverified 的 shadow 语义，不是写路径。
+
+const CLAIM_ENDPOINT = "endpoint_claude_agent";
+const CLAIM_AGENT = "agent_x";
+const CLAIM_TRANSPORT = "ou_t";
+const CLAIM_SENDER = "frank_sender";
+const CLAIM_EVENT_TYPE = "im.message.receive";
+const CLAIM_FRESH_MS = 10 * 60 * 1000;
+const claimChat = { A: "oc_A", B: "oc_B", C: "oc_C" };
+
+function claimSub({ id, chatId, status = "active" }) {
+  const domainId = "domain_" + id;
+  const subscriptionId = stableControlId("subscription", CLAIM_ENDPOINT, domainId, chatId, CLAIM_AGENT);
+  const subObj = {
+    schema_version: SUBSCRIPTION_SCHEMA_VERSION, artifact_type: SUBSCRIPTION_ARTIFACT_TYPE, subscription_id: subscriptionId,
+    version: 1, endpoint_id: CLAIM_ENDPOINT, domain_id: domainId, status,
+    scope: { agent_uid: CLAIM_AGENT, transport_open_id: CLAIM_TRANSPORT, chat_id: chatId,
+             sender_ids: [CLAIM_SENDER], event_types: [CLAIM_EVENT_TYPE] },
+    constraints: { freshness_ms: CLAIM_FRESH_MS },
+  };
+  assert.equal(validateSubscription(subObj).ok, true, "fixture 订阅必须能过 validateSubscription");
+  return subObj;
+}
+
+function claimPending({ sub, token = null, status = "active", expires = null, legacyKey = "legacy_" + sub.subscription_id.slice(-4) }) {
+  return {
+    subscription_id: sub.subscription_id, legacy_key: legacyKey,
+    local_target_id: "target_" + sub.subscription_id.slice(-4),
+    status, inbound_state: "pending", session_bound: false,
+    pending_token: token === null ? null : String(token).toLowerCase(),
+    claim_expires_at_ms: expires,
+  };
+}
+
+function claimModel(subs, pendingBindings) {
+  return { ok: true, schema_version: SUBSCRIPTION_SCHEMA_VERSION, endpoint_id: CLAIM_ENDPOINT,
+    subscriptions: subs, pending_bindings: pendingBindings };
+}
+
+function claimEvidence({ chatId = null } = {}) {
+  return { endpoint_id: CLAIM_ENDPOINT, caller_agent_uid: CLAIM_AGENT, sender_id: CLAIM_SENDER,
+    mention_ids: [CLAIM_TRANSPORT], event_type: CLAIM_EVENT_TYPE,
+    created_at_ms: NOW2 - 3000, chat_id: chatId };
+}
+
+const claimSelect = (model, evidence, bindingTokens = []) =>
+  selectPendingSubscriptionClaim({ model, evidence, bindingTokens, now: NOW2 });
+
+test("FR-2.6 单2 歧义矩阵：同域两条订阅，chat=A 命中唯一 → 受理且绑对订阅", () => {
+  const subA = claimSub({ id: "A", chatId: claimChat.A });
+  const subB = claimSub({ id: "B", chatId: claimChat.B });
+  const pA = claimPending({ sub: subA });
+  const pB = claimPending({ sub: subB });
+  const r = claimSelect(claimModel([subA, subB], [pA, pB]), claimEvidence({ chatId: claimChat.A }));
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.disposition, "accepted");
+  assert.equal(r.subscription_id, subA.subscription_id, "chat 维度把候选收敛到群 A 的订阅");
+  assert.equal(r.local_target_id, pA.local_target_id);
+  assert.equal(r.matched_by, "sole_pending");
+  assert.deepEqual(r.scope_unverified, [], "chat 可核验且命中 → 不记 unverified");
+});
+
+test("FR-2.6 单2 歧义矩阵：chat=C 谁都不中 → SOURCE_SCOPE_MISMATCH（正向）", () => {
+  const subA = claimSub({ id: "A", chatId: claimChat.A });
+  const subB = claimSub({ id: "B", chatId: claimChat.B });
+  const pA = claimPending({ sub: subA });
+  const pB = claimPending({ sub: subB });
+  const r = claimSelect(claimModel([subA, subB], [pA, pB]), claimEvidence({ chatId: claimChat.C }));
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, SUBSCRIPTION_REJECT.SOURCE_SCOPE_MISMATCH);
+});
+
+test("FR-2.6 单2 歧义矩阵：chat 缺失 → 继续认领但 scope_unverified 记 chat_id（shadow 语义）", () => {
+  const subA = claimSub({ id: "A", chatId: claimChat.A });
+  const subB = claimSub({ id: "B", chatId: claimChat.B });
+  // 只挂一份 pending：chat 缺失不参与收敛，但唯一 pending 足以受理
+  const pA = claimPending({ sub: subA });
+  const r = claimSelect(claimModel([subA, subB], [pA]), claimEvidence());
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.subscription_id, subA.subscription_id);
+  assert.deepEqual(r.scope_unverified, ["chat_id"], "chat 未核验 → 只进 shadow，不能当权威");
+});
+
+test("FR-2.6 单2 歧义矩阵：两条订阅各挂一份、无码、chat 缺失 → AMBIGUOUS（正向）", () => {
+  const subA = claimSub({ id: "A", chatId: claimChat.A });
+  const subB = claimSub({ id: "B", chatId: claimChat.B });
+  const pA = claimPending({ sub: subA });
+  const pB = claimPending({ sub: subB });
+  const r = claimSelect(claimModel([subA, subB], [pA, pB]), claimEvidence());
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, SUBSCRIPTION_REJECT.AMBIGUOUS);
+});
+
+test("FR-2.6 单2 歧义矩阵：chat 证据把候选收敛到一条 → 歧义被 chat 维度解掉（AMBIGUOUS 反向）", () => {
+  const subA = claimSub({ id: "A", chatId: claimChat.A });
+  const subB = claimSub({ id: "B", chatId: claimChat.B });
+  const pA = claimPending({ sub: subA });
+  const pB = claimPending({ sub: subB });
+  // 同样的两条待绑定，chat=A 时不再 AMBIGUOUS
+  const r = claimSelect(claimModel([subA, subB], [pA, pB]), claimEvidence({ chatId: claimChat.A }));
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.subscription_id, subA.subscription_id);
+});
+
+test("FR-2.6 单2 歧义矩阵：绑定码跨订阅精确选中目标（含跨订阅）", () => {
+  const subA = claimSub({ id: "A", chatId: claimChat.A });
+  const subB = claimSub({ id: "B", chatId: claimChat.B });
+  const pA = claimPending({ sub: subA, token: "aaaaaa" });
+  const pB = claimPending({ sub: subB, token: "bbbbbb" });
+  const r = claimSelect(claimModel([subA, subB], [pA, pB]), claimEvidence(), ["bbbbbb"]);
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.subscription_id, subB.subscription_id, "绑定码选中群 B 的待认领目标");
+  assert.equal(r.local_target_id, pB.local_target_id);
+  assert.equal(r.matched_by, "quoted_binding_token");
+});
+
+test("FR-2.6 单2 歧义矩阵：两个绑定码 → TOKEN_AMBIGUOUS（正向）", () => {
+  const subA = claimSub({ id: "A", chatId: claimChat.A });
+  const subB = claimSub({ id: "B", chatId: claimChat.B });
+  const pA = claimPending({ sub: subA, token: "aaaaaa" });
+  const pB = claimPending({ sub: subB, token: "bbbbbb" });
+  const r = claimSelect(claimModel([subA, subB], [pA, pB]), claimEvidence(), ["aaaaaa", "bbbbbb"]);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, SUBSCRIPTION_REJECT.TOKEN_AMBIGUOUS);
+});
+
+test("FR-2.6 单2 歧义矩阵：未知绑定码 → TOKEN_UNKNOWN（正向）", () => {
+  const subA = claimSub({ id: "A", chatId: claimChat.A });
+  const subB = claimSub({ id: "B", chatId: claimChat.B });
+  const pA = claimPending({ sub: subA, token: "aaaaaa" });
+  const pB = claimPending({ sub: subB, token: "bbbbbb" });
+  const r = claimSelect(claimModel([subA, subB], [pA, pB]), claimEvidence(), ["ffffff"]);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, SUBSCRIPTION_REJECT.TOKEN_UNKNOWN);
+});
+
+test("FR-2.6 单2 歧义矩阵：同一绑定码落在两份待绑定 → TOKEN_DUPLICATED（正向）", () => {
+  const subA = claimSub({ id: "A", chatId: claimChat.A });
+  const subB = claimSub({ id: "B", chatId: claimChat.B });
+  const pA = claimPending({ sub: subA, token: "aaaaaa" });
+  const pB = claimPending({ sub: subB, token: "aaaaaa" });
+  const r = claimSelect(claimModel([subA, subB], [pA, pB]), claimEvidence(), ["aaaaaa"]);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, SUBSCRIPTION_REJECT.TOKEN_DUPLICATED);
+});
+
+test("FR-2.6 单2 歧义矩阵：唯一绑定码命中 → 不因订阅并存而歧义（TOKEN_AMBIGUOUS 反向）", () => {
+  const subA = claimSub({ id: "A", chatId: claimChat.A });
+  const subB = claimSub({ id: "B", chatId: claimChat.B });
+  const pA = claimPending({ sub: subA, token: "aaaaaa" });
+  const pB = claimPending({ sub: subB, token: "bbbbbb" });
+  const r = claimSelect(claimModel([subA, subB], [pA, pB]), claimEvidence(), ["aaaaaa"]);
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.subscription_id, subA.subscription_id);
+  assert.equal(r.matched_by, "quoted_binding_token");
+});
+
+test("FR-2.6 单2 歧义矩阵：paused 订阅的 pending 不参与今天的认领（状态维度，钉现状）", () => {
+  const subA = claimSub({ id: "A", chatId: claimChat.A });
+  const subB = claimSub({ id: "B", chatId: claimChat.B, status: "paused" });
+  const pA = claimPending({ sub: subA });
+  const pB = claimPending({ sub: subB });
+  // 注意：今天 selector 在 status 维度先筛掉 paused 订阅（subscription.mjs:240），
+  // 所以 paused 订阅的 pending 根本进不了候选 subscription_ids（:266-267）。
+  const r = claimSelect(claimModel([subA, subB], [pA, pB]), claimEvidence());
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.subscription_id, subA.subscription_id, "只有 active 订阅的待认领参与");
+});
+
+test("FR-2.6 单2 歧义矩阵：两条都 paused → NO_ACTIVE_SUBSCRIPTION（状态维度反向）", () => {
+  const subA = claimSub({ id: "A", chatId: claimChat.A, status: "paused" });
+  const subB = claimSub({ id: "B", chatId: claimChat.B, status: "paused" });
+  const pA = claimPending({ sub: subA });
+  const pB = claimPending({ sub: subB });
+  const r = claimSelect(claimModel([subA, subB], [pA, pB]), claimEvidence());
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, SUBSCRIPTION_REJECT.NO_ACTIVE_SUBSCRIPTION);
+});
+
+test("FR-2.6 单2 歧义矩阵：同域两条订阅都 active、但只有一份待认领 → 唯一 pending 受理（AMBIGUOUS 边界）", () => {
+  const subA = claimSub({ id: "A", chatId: claimChat.A });
+  const subB = claimSub({ id: "B", chatId: claimChat.B });
+  const pA = claimPending({ sub: subA });
+  // subB 没有 pending_binding：虽然候选订阅有两条，但 pending.length===1
+  const r = claimSelect(claimModel([subA, subB], [pA]), claimEvidence());
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.subscription_id, subA.subscription_id);
+  assert.equal(r.matched_by, "sole_pending");
+});
+
+test("FR-2.6 单2 歧义矩阵：订阅并存但无任何待认领 → NO_PENDING_BINDING（正向）", () => {
+  const subA = claimSub({ id: "A", chatId: claimChat.A });
+  const subB = claimSub({ id: "B", chatId: claimChat.B });
+  const r = claimSelect(claimModel([subA, subB], []), claimEvidence());
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, SUBSCRIPTION_REJECT.NO_PENDING_BINDING);
+});
+
+test("FR-2.6 单2 歧义矩阵：version!==1 → PROJECTION_INVALID（前向兼容卫兵）", () => {
+  const subA = claimSub({ id: "A", chatId: claimChat.A });
+  const pA = claimPending({ sub: subA });
+  // 构造一条 version:2 的订阅：卫兵在 selector 入口（subscription.mjs:224-227）就必须挡下。
+  const model = claimModel([{ ...subA, version: 2 }], [pA]);
+  const r = claimSelect(model, claimEvidence());
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, SUBSCRIPTION_REJECT.PROJECTION_INVALID);
+});
+
 
 test("绑定写回登记表之后，同一个 session 就能被路由到了", () => {
   const f = routeFixture([{ id: "a", extra: {} }]);

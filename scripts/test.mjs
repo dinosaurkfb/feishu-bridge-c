@@ -210,7 +210,9 @@ import {
   buildClaudeSubscriptionProjection, findBindingForSession, findPendingBinding, loadConsumed,
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
-import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, stableControlId, validateSubscription, claimable } from "./subscription.mjs";
+import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, selectPendingSubscriptionClaim, stableControlId, validateSubscription, claimable } from "./subscription.mjs";
+import { loadSubscriptionStore, planSubscriptionEntry } from "./subscription-store.mjs";
+import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
 import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
@@ -19402,6 +19404,149 @@ const DRIFT_HOOK = [
   '  return out;',
   '};',
 ].join("\n") + "\n";
+
+// ─── FR-2.6 单 1：订阅控制面落盘 + register-subscription 写入口 ────────────────────────
+
+test("FR-2.6 单 1：无 store 的机器投影逐字节不变（缺席/空 store 同字）；损坏或条目不过校验的 store fail-closed 退回纯 legacy 且可诊断", () => {
+  const runtimeNamespace = "claude";
+  const endpointId = legacyEndpointId({ runtime: runtimeNamespace, agentUid: "agent_m5claude" });
+  const template = { agent_uid: "agent_m5claude", transport_open_id: "ou_bot", frank_sender_id: "u_frank", chat_id: "oc_x", default_freshness_ms: 600000 };
+  const records = [{ legacy_key: "k", domain_key: "/p", local_target_id: stableControlId("target", runtimeNamespace, "k"), status: "active", inbound_state: "bound", session_id: "s1", pending_token: null, bound_at: new Date(NOW).toISOString() }];
+  const noStore = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records });
+  assert.equal(noStore.ok, true);
+  assert.ok(!("control_plane" in noStore), "不传参数 = 今天，无新字段");
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-fr26-"));
+  const absentStore = loadSubscriptionStore({ file: path.join(sandbox, "nope.json") });
+  assert.deepEqual([absentStore.ok, absentStore.absent, absentStore.subscriptions], [true, true, []], "文件缺席不是问题");
+  const withAbsent = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records, controlPlane: absentStore });
+  assert.equal(JSON.stringify(withAbsent), JSON.stringify(noStore), "缺席文件与不传参数逐字节一致");
+  const withEmpty = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records, controlPlane: { ok: true, absent: false, subscriptions: [] } });
+  assert.equal(JSON.stringify(withEmpty), JSON.stringify(noStore), "空 store 同字");
+  const corrupt = { ok: false, problems: ["store_bad_json:Unexpected token o"] };
+  const withCorrupt = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records, controlPlane: corrupt });
+  assert.equal(withCorrupt.ok, true, "投影本体不因控制面损坏而失败");
+  assert.deepEqual(withCorrupt.subscriptions, noStore.subscriptions, "退回纯 legacy");
+  assert.deepEqual(withCorrupt.control_plane, { ok: false, problems: corrupt.problems }, "问题可诊断，不静默丢");
+  fs.writeFileSync(path.join(sandbox, "bad.json"), "{oops");
+  const bad = loadSubscriptionStore({ file: path.join(sandbox, "bad.json") });
+  assert.deepEqual([bad.ok, bad.problems.some((p) => String(p).startsWith("store_bad_json"))], [false, true], "盘上坏文件 → problems");
+  const halfBad = { ok: true, absent: false, subscriptions: [{ schema_version: "9.9" }] };
+  const withHalfBad = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records, controlPlane: halfBad });
+  assert.deepEqual(withHalfBad.subscriptions, noStore.subscriptions, "有一条不过校验 → 整份控制面不作数");
+  assert.equal(withHalfBad.control_plane.ok, false);
+});
+
+test("FR-2.6 单 1：register-subscription 预览零副作用；--apply 新增同域第二个群（chat_id ≠ 模板）、同 id 重复登记拒绝、freshness 缺省继承模板且可覆盖", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-fr26-cli-"));
+  const templateFile = path.join(local, "chain-config.json");
+  const TPL26 = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  fs.writeFileSync(templateFile, JSON.stringify(TPL26));
+  const storeFile = path.join(local, "subs", "subscriptions.json");
+  const run = (args) => spawnSync(process.execPath, [path.resolve("scripts", "register-subscription.mjs"), ...args], { encoding: "utf-8", env: { ...process.env, HOME: local } });
+  const base = ["--store", storeFile, "--template", templateFile, "--runtime", "claude", "--domain-key", "/p1"];
+  const dirNow = () => (fs.existsSync(path.join(local, "subs")) ? fs.readdirSync(path.join(local, "subs")).sort() : []);
+
+  const dry = run([...base, "--chat-id", "oc_second"]);
+  assert.equal(dry.status, 0, dry.stdout + dry.stderr);
+  assert.match(dry.stdout, /\[dry-run\] 什么都没写/u);
+  assert.match(dry.stdout, /oc_second/u);
+  assert.deepEqual(dirNow(), [], "预览零副作用：store/锁/备份/临时文件都不出现");
+
+  const add = run([...base, "--chat-id", "oc_second", "--apply"]);
+  assert.equal(add.status, 0, add.stdout + add.stderr);
+  assert.match(add.stdout, /已写入/u);
+  const expectedId = stableControlId("subscription", legacyEndpointId({ runtime: "claude", agentUid: TPL26.agent_uid }), stableControlId("domain", "claude", "/p1"), "oc_second", TPL26.agent_uid);
+  const entry = JSON.parse(fs.readFileSync(storeFile, "utf-8")).subscriptions[0];
+  assert.equal(entry.subscription_id, expectedId, "id 派生与投影同一套");
+  assert.equal(entry.scope.chat_id, "oc_second", "群维度：允许与模板不同");
+  assert.notEqual(entry.scope.chat_id, TPL26.chat_id);
+  assert.equal(validateSubscription(entry).ok, true, "条目过校验");
+  assert.deepEqual(entry.scope.sender_ids, [TPL26.frank_sender_id]);
+  assert.deepEqual(entry.scope.event_types, ["im.message.receive"]);
+  assert.equal(entry.constraints.freshness_ms, TPL26.default_freshness_ms, "新鲜度缺省继承模板");
+  assert.ok(fs.readFileSync(storeFile, "utf-8").endsWith("}\n"), "写盘以换行收尾（readback 在事务里逐字验过，这里钉形状）");
+
+  const rawBefore = fs.readFileSync(storeFile, "utf-8");
+  const dup = run([...base, "--chat-id", "oc_second", "--apply"]);
+  assert.deepEqual([dup.status, /subscription_exists/u.test(dup.stdout)], [1, true], dup.stdout);
+  assert.equal(fs.readFileSync(storeFile, "utf-8"), rawBefore, "拒绝登记不写字节");
+  assert.deepEqual(dirNow().filter((n) => n.endsWith(".lock")), [], "锁不留残");
+
+  const customFresh = run([...base, "--chat-id", "oc_third", "--freshness-ms", "120000", "--apply"]);
+  assert.equal(customFresh.status, 0, customFresh.stdout + customFresh.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(storeFile, "utf-8")).subscriptions.find((s) => s.scope.chat_id === "oc_third").constraints.freshness_ms, 120000);
+  assert.deepEqual([run([...base, "--chat-id", "oc_fourth", "--freshness-ms", "0", "--apply"]).status], [2], "freshness 非法在参数层拒");
+
+  const pause = run([...base, "--chat-id", "oc_second", "--pause", "--apply"]);
+  assert.equal(pause.status, 0, pause.stdout + pause.stderr);
+  const paused = JSON.parse(fs.readFileSync(storeFile, "utf-8")).subscriptions.find((s) => s.subscription_id === expectedId);
+  assert.deepEqual([paused.status, paused.version], ["paused", 2], "状态翻转 + 版本前进");
+  assert.equal(run([...base, "--chat-id", "oc_second", "--resume", "--apply"]).status, 0);
+  assert.equal(JSON.parse(fs.readFileSync(storeFile, "utf-8")).subscriptions.find((s) => s.subscription_id === expectedId).version, 3);
+  const resumeAgain = run([...base, "--chat-id", "oc_second", "--resume", "--apply"]);
+  assert.deepEqual([resumeAgain.status, /没动/u.test(resumeAgain.stdout)], [0, true], "幂等：已是 active → 没动");
+
+  const ghost = run([...base, "--chat-id", "oc_ghost", "--pause", "--apply"]);
+  assert.deepEqual([ghost.status, /subscription_not_found/u.test(ghost.stdout)], [1, true], ghost.stdout);
+
+  fs.writeFileSync(storeFile, "{broken");
+  const brokenRaw = fs.readFileSync(storeFile, "utf-8");
+  const bakCountBefore = dirNow().filter((n) => n.includes(".bak.")).length;
+  const brokenAdd = run([...base, "--chat-id", "oc_fifth", "--apply"]);
+  assert.deepEqual([brokenAdd.status, /store_invalid/u.test(brokenAdd.stdout)], [1, true], brokenAdd.stdout);
+  assert.equal(fs.readFileSync(storeFile, "utf-8"), brokenRaw, "损坏的 store 拒写（fail-closed）");
+  assert.equal(dirNow().filter((n) => n.includes(".bak.")).length, bakCountBefore, "拒写不产生新备份");
+
+  fs.writeFileSync(storeFile, rawBefore);
+  const rm = run([...base, "--chat-id", "oc_second", "--remove", "--apply"]);
+  assert.equal(rm.status, 0, rm.stdout + rm.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(storeFile, "utf-8")).subscriptions, [], "删除后 store 仍是合法空表");
+  const rmAgain = run([...base, "--chat-id", "oc_second", "--remove", "--apply"]);
+  assert.deepEqual([rmAgain.status, /subscription_not_found/u.test(rmAgain.stdout)], [1, true], rmAgain.stdout);
+  const closed = parseRegisterSubscriptionArgs(["--store", "/s.json", "--template", "/t.json", "--runtime", "claude", "--domain-key", "/p", "--chat-id", "c", "--pause", "--resume"]);
+  assert.equal(closed.reason, "one_action_at_a_time", "参数封闭：一次一个动作");
+});
+
+test("FR-2.6 单 1：合并读模型 —— 控制面新 id 追加（pending_bindings 不动）；同 id 覆盖投影（显式登记），暂停的订阅让首次认领拿不到 active 候选", () => {
+  const runtimeNamespace = "claude";
+  const agentUid = "agent_m5claude";
+  const endpointId = legacyEndpointId({ runtime: runtimeNamespace, agentUid });
+  const template = { agent_uid: agentUid, transport_open_id: "ou_bot", frank_sender_id: "u_frank", chat_id: "oc_x", default_freshness_ms: 600000 };
+  const record = (over) => ({
+    legacy_key: "k", domain_key: "/p", local_target_id: stableControlId("target", runtimeNamespace, "k"),
+    status: "active", inbound_state: "pending", session_id: null, pending_token: "abc123",
+    bound_at: new Date(NOW).toISOString(), ...over,
+  });
+  const legacy = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records: [record({})] });
+  assert.equal(legacy.ok, true);
+  const legacySub = legacy.subscriptions[0];
+  assert.equal(legacySub.scope.chat_id, "oc_x", "投影：chat_id 缺省继承模板");
+
+  const secondEntry = planSubscriptionEntry({ runtime: "claude", template, domainKey: "/p", chatId: "oc_second" });
+  assert.equal(secondEntry.ok, true, secondEntry.reason ?? "");
+  const overrideEntry = { ...legacySub, status: "paused", version: 5 };
+  const model = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records: [record({})], controlPlane: { ok: true, absent: false, subscriptions: [secondEntry.entry, overrideEntry] } });
+  assert.equal(model.ok, true);
+  assert.deepEqual(model.control_plane, { ok: true, added: 1, overridden: 1 });
+  assert.equal(model.subscriptions.length, 2);
+  const mergedSecond = model.subscriptions.find((s) => s.subscription_id === secondEntry.entry.subscription_id);
+  assert.equal(mergedSecond?.scope.chat_id, "oc_second", "控制面新 id 进读模型（同域第二个群）");
+  assert.deepEqual(model.pending_bindings, legacy.pending_bindings, "pending_bindings 来自登记表，合并不动");
+  const mergedOverride = model.subscriptions.find((s) => s.subscription_id === legacySub.subscription_id);
+  assert.deepEqual([mergedOverride.status, mergedOverride.version], ["paused", 5], "同 id：控制面覆盖投影（合并不钉 version，写路径的版本前进照样能进来）");
+
+  // 认领行为对照：认领器今天把 version 钉在 1（subscription.mjs:257 的前向兼容卫兵），
+  // 所以行为断言用 version=1 的暂停覆盖条目 —— 挡认领的是 status 过滤，不是版本。
+  // 写路径会把暂停推进到 v2+；那个卫兵与版本前进的衔接是切流单的事（本单红线不碰认领逻辑），
+  // 残留已写进 PI-REPORT.md。
+  const pausedOverride = { ...legacySub, status: "paused" };
+  const pausedModel = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records: [record({})], controlPlane: { ok: true, absent: false, subscriptions: [pausedOverride] } });
+  const evidence = { endpoint_id: endpointId, caller_agent_uid: agentUid, sender_id: "u_frank", mention_ids: ["ou_bot"], event_type: "im.message.receive", chat_id: null, created_at_ms: NOW };
+  const claim = selectPendingSubscriptionClaim({ model: pausedModel, evidence, now: NOW });
+  assert.deepEqual([claim.ok, claim.reason], [false, SUBSCRIPTION_REJECT.NO_ACTIVE_SUBSCRIPTION], "覆盖不是摆设：暂停的订阅挡住认领");
+  const claimLegacy = selectPendingSubscriptionClaim({ model: legacy, evidence, now: NOW });
+  assert.deepEqual([claimLegacy.ok, claimLegacy.matched_by], [true, "sole_pending"], "对照：纯 legacy 下同一事件认领成功");
+});
 
 test("控制事务的换绑窗口（评审 #97）：事务锁内核验通过之后、策略写锁取得之前登记表换了绑定 → 写锁内前置条件拒写、模式不变、不落 consumed、入口非零", () => {
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-drift-"));

@@ -4072,6 +4072,101 @@ test("评审 #114 P1：Codex status 把 store 的登记名并进展示；损坏 
   assert.match(damaged.stdout, /控制面 store 损坏（1 个问题），订阅区已按 legacy 显示。/u);
 });
 
+test("评审 #114 二轮 P1：未绑定 Codex thread + 合法 store 在场 —— subscribe/status 不裸抛、输出与无 store 逐字节一致", () => {
+  const dir = temp();
+  const home = path.join(dir, "bridge");
+  const noStoreHome = path.join(dir, "nostore");
+  const withStoreHome = path.join(dir, "withstore");
+  const codexHome = path.join(dir, "codex-home");
+  for (const d of [home, noStoreHome, withStoreHome]) fs.mkdirSync(d, { recursive: true });
+  // 登记一条 task（threadId=A）用来生成**合法** store；被测的是另一条**没登记**的 thread。
+  const taskA = makeTaskEntry({ root: path.join(dir, "p"), threadId: THREAD_A, name: "S",
+    rootMessageId: "om_r3ub", token: "a1b2c3" });
+  writeRegistryFixtureUnvalidated([taskA], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const UNBOUND = "00000000-0000-0000-0000-000000000000"; // 合法 UUID 形状，但绝不在 registry 里
+
+  // 往 withStoreHome 放一份合法 store。
+  const storeFile = path.join(withStoreHome, ".claude", "feishu-bridge", "subscriptions.json");
+  const regEnv = { ...isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home, HOME: withStoreHome, CODEX_HOME: codexHome }) };
+  const reg = spawnSync(process.execPath, [path.join(ROOT, "scripts", "register-subscription.mjs"),
+    "--store", storeFile, "--template", path.join(home, "chain-config.json"), "--runtime", "codex",
+    "--domain-key", taskA.root, "--chat-id", TEMPLATE.chat_id, "--chat-name", "登记名", "--apply"],
+    { encoding: "utf-8", env: regEnv });
+  assert.equal(reg.status, 0, reg.stdout + reg.stderr);
+  assert.ok(fs.existsSync(storeFile), "store 已写入");
+
+  const subRun = (whichHome) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-subscribe.mjs"), "--thread-id", UNBOUND],
+    { encoding: "utf-8", env: { ...isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home, HOME: whichHome, CODEX_HOME: codexHome }) } });
+  const stRun = (whichHome) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", UNBOUND],
+    { encoding: "utf-8", env: { ...isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home, HOME: whichHome, CODEX_HOME: codexHome }) } });
+
+  // —— subscribe：未绑定早期退出，store 在场与否输出逐字节一致、退出码一致、不崩 ——
+  const subNo = subRun(noStoreHome);
+  const subWith = subRun(withStoreHome);
+  assert.equal(subNo.status, 0, subNo.stderr);
+  assert.equal(subWith.status, subNo.status, "subscribe 退出码与无 store 一致");
+  assert.equal(subWith.stdout, subNo.stdout, "subscribe 输出与无 store 逐字节一致");
+  assert.match(subWith.stdout, /尚未接入飞书/u, "subscribe 未绑定文案：" + subWith.stdout);
+  assert.equal(subWith.stderr, "", "subscribe 不因 store 在场而报错：" + subWith.stderr);
+
+  // —— status：未绑定在健康 registry 下投影合法（空订阅），store 会按 R2 行为并入控制面条目 ——
+  // —— 守卫在这里是 no-op（legacy.ok===true），验收点是：**不裸抛、退出码不变、Layer 3 收受控未绑定文案**。
+  const stNo = stRun(noStoreHome);
+  const stWith = stRun(withStoreHome);
+  assert.equal(stNo.status, 0, stNo.stderr);
+  assert.equal(stWith.status, stNo.status, "status 退出码与无 store 一致");
+  assert.equal(stWith.stderr, "", "status 不因 store 在场而报错（无裸抛）：" + stWith.stderr);
+  assert.doesNotMatch(stNo.stdout + stWith.stdout, /TypeError|stack|\bat /u, "无裸异常栈：" + stWith.stdout);
+  assert.match(stWith.stdout, /尚未绑定/u, "status Layer 3 收受控未绑定文案：" + stWith.stdout);
+});
+
+test("评审 #114 二轮 P1：投影自身失败（模板不可用）+ 合法 store 在场 —— subscribe/status 不裸抛、Exit 不变、收受控不可用文案", () => {
+  const dir = temp();
+  const home = path.join(dir, "bridge");
+  const withStoreHome = path.join(dir, "withstore");
+  const codexHome = path.join(dir, "codex-home");
+  for (const d of [home, withStoreHome]) fs.mkdirSync(d, { recursive: true });
+  // 先带模板登记一条 task + 一份合法 store（buildCodexSubscriptionProjection 要模板才读得出）。
+  const taskA = makeTaskEntry({ root: path.join(dir, "p"), threadId: THREAD_A, name: "S",
+    rootMessageId: "om_r3tp", token: "a1b2c3" });
+  writeRegistryFixtureUnvalidated([taskA], path.join(home, "registry.json"));
+  const templateFile = path.join(home, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify(TEMPLATE));
+  const storeFile = path.join(withStoreHome, ".claude", "feishu-bridge", "subscriptions.json");
+  const regEnv = { ...isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home, HOME: withStoreHome, CODEX_HOME: codexHome }) };
+  const reg = spawnSync(process.execPath, [path.join(ROOT, "scripts", "register-subscription.mjs"),
+    "--store", storeFile, "--template", templateFile, "--runtime", "codex",
+    "--domain-key", taskA.root, "--chat-id", TEMPLATE.chat_id, "--chat-name", "登记名", "--apply"],
+    { encoding: "utf-8", env: regEnv });
+  assert.equal(reg.status, 0, reg.stdout + reg.stderr);
+  assert.ok(fs.existsSync(storeFile), "store 已写入");
+  // 现在抽掉模板 —— buildCodexSubscriptionProjection 读模板 → template_unusable → legacy ok:false。
+  // 这正是二轮 P1 的触发前提：**投影失败 × store 在场**（无守卫时合并器 .map 裸抛）。
+  fs.unlinkSync(templateFile);
+
+  const subRun = () => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-subscribe.mjs"), "--thread-id", THREAD_A],
+    { encoding: "utf-8", env: { ...isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home, HOME: withStoreHome, CODEX_HOME: codexHome }) } });
+  const stRun = () => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A],
+    { encoding: "utf-8", env: { ...isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home, HOME: withStoreHome, CODEX_HOME: codexHome }) } });
+
+  const sub = subRun();
+  assert.equal(sub.status, 0, "subscribe 投影失败 × store 在场不裸抛：" + sub.stderr);
+  assert.equal(sub.stderr, "", "subscribe 无 stderr：" + sub.stderr);
+  assert.match(sub.stdout, /读不到订阅\s*（template_unusable）/u, "subscribe 收受控不可用文案：" + sub.stdout);
+  assert.doesNotMatch(sub.stdout, /TypeError|\bat /u, "subscribe 无异常栈：" + sub.stdout);
+
+  const st = stRun();
+  assert.equal(st.status, 0, "status 投影失败 × store 在场不裸抛：" + st.stderr);
+  assert.equal(st.stderr, "", "status 无 stderr：" + st.stderr);
+  assert.match(st.stdout, /订阅状态\s+读不到（template_unusable）/u, "status 收受控不可用文案：" + st.stdout);
+  assert.doesNotMatch(st.stdout, /TypeError|\bat /u, "status 无异常栈：" + st.stdout);
+});
+
 test("status 不许执行别的项目的 provider —— 不显示还不够，必须不跑", () => {
   // **评审用 marker 文件证明的：输出里看不见，marker 却建出来了。**
   // 机器级 collectConnectivity 会把所有 provider 都跑一遍再按归属过滤显示 ——

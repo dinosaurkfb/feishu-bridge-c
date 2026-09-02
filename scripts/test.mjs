@@ -211,7 +211,7 @@ import {
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
 import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION_KEYED, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, selectPendingSubscriptionClaim, stableControlId, subscriptionIdFor, validateSubscription, claimable } from "./subscription.mjs";
-import { applySubscriptionChange, loadSubscriptionStore, mergedSubscriptionView, planSubscriptionChange, planSubscriptionEntry, subscriptionStorePath } from "./subscription-store.mjs";
+import { applySubscriptionChange, loadSubscriptionStore, mergedSubscriptionView, planSubscriptionChange, planSubscriptionEntry, subscriptionStorePath, SUBSCRIPTION_STORE_ARTIFACT_TYPE, SUBSCRIPTION_STORE_SCHEMA_VERSION } from "./subscription-store.mjs";
 import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
@@ -20268,6 +20268,64 @@ test("评审 #114 P2-1：控制符 chat_name 落盘原文保留、每个展示�
 
   function modelView(subscriptions) {
     return { ok: true, schema_version: "1.0", subscriptions, pending_bindings: [] };
+  }
+});
+
+test("评审 #114 二轮 P1：mergedSubscriptionView fail-closed —— legacy 失败 × store 三格原样返回不抛；legacy 合法 × 三格现行为不变（2×3 矩阵）", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-r3-matrix-"));
+  const home = path.join(local, "home");
+  fs.mkdirSync(path.join(home, ".claude", "feishu-bridge"), { recursive: true });
+  const storeFile = path.join(home, ".claude", "feishu-bridge", "subscriptions.json");
+  const origHome = process.env.HOME;
+  process.env.HOME = home; // os.homedir() 动态读 HOME；矩阵格子靠它隔离 store 路径
+  try {
+    // 构一条合法控制面条目（走 planSubscriptionEntry 保证 validateSubscription 过）。
+    const tpl = { chain: "claude", agent_uid: "agent_m5claude", transport_open_id: "ou_t", frank_sender_id: "123456", chat_id: "oc_a", default_freshness_ms: 600000 };
+    const entry = planSubscriptionEntry({ runtime: "claude", template: tpl, domainKey: "/p", chatId: "oc_a" }).entry;
+    assert.ok(validateSubscription(entry).ok, "条目合法：" + JSON.stringify(validateSubscription(entry)));
+    const writeStore = (state) => {
+      if (state === "absent") { try { fs.unlinkSync(storeFile); } catch { /* 已不在 */ } }
+      else if (state === "valid") fs.writeFileSync(storeFile, JSON.stringify({ schema_version: SUBSCRIPTION_STORE_SCHEMA_VERSION, artifact_type: SUBSCRIPTION_STORE_ARTIFACT_TYPE, subscriptions: [entry] }));
+      else fs.writeFileSync(storeFile, "{oops"); // 损坏
+    };
+    const legacyOk = { ok: true, schema_version: "1.0", endpoint_id: entry.endpoint_id, subscriptions: [] };
+    const legacyFail = { ok: false, reason: "projection_failed", problems: ["no_subscriptions"] };
+
+    // —— legacy 失败 × 三格：原样返回失败投影、不抛、corrupt 只在 store 损坏时非 null ——
+    for (const store of ["absent", "valid", "corrupt"]) {
+      writeStore(store);
+      let threw = false; let out;
+      try { out = mergedSubscriptionView({ legacy: legacyFail }); } catch (e) { threw = true; assert.fail("legacy 失败 × store=" + store + " 不裸抛，却抛了：" + e.stack); }
+      assert.equal(threw, false);
+      assert.strictEqual(out.view, legacyFail, "legacy 失败 × store=" + store + "：view 原样（同对象）");
+      assert.equal(out.view.ok, false, "shape 不变：仍 ok:false");
+      assert.equal(out.view.reason, "projection_failed", "reason 不变");
+      if (store === "corrupt") {
+        assert.ok(Array.isArray(out.corrupt) && out.corrupt.length > 0, "store 损坏时 corrupt 仍报：" + JSON.stringify(out.corrupt));
+      } else {
+        assert.equal(out.corrupt, null, "store=" + store + " 时 corrupt 为 null");
+      }
+    }
+
+    // —— legacy 合法 × 三格：现行为不变 ——
+    writeStore("absent");
+    let out = mergedSubscriptionView({ legacy: legacyOk });
+    assert.strictEqual(out.view, legacyOk, "legacy 合法 × store 缺席：view = legacy");
+    assert.equal(out.corrupt, null);
+
+    writeStore("valid");
+    out = mergedSubscriptionView({ legacy: legacyOk });
+    assert.equal(out.view.ok, true, "legacy 合法 × store 合法：合并成功");
+    assert.equal(out.corrupt, null);
+    assert.equal(out.view.subscriptions.length, 1, "合并进来 store 的条目");
+
+    writeStore("corrupt");
+    out = mergedSubscriptionView({ legacy: legacyOk });
+    assert.strictEqual(out.view, legacyOk, "legacy 合法 × store 损坏：退 legacy 原对象");
+    assert.ok(Array.isArray(out.corrupt) && out.corrupt.length > 0, "corrupt 报问题数：" + JSON.stringify(out.corrupt));
+  } finally {
+    if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
+    try { fs.rmSync(home, { recursive: true, force: true }); } catch { /* 清理尽力 */ }
   }
 });
 

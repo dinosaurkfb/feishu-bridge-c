@@ -121,6 +121,13 @@ export function subscriptionStorePath() {
  */
 export function mergedSubscriptionView({ legacy } = {}) {
   const store = loadSubscriptionStore({ file: subscriptionStorePath() });
+  // 评审 #114 二轮 P1：legacy 投影自身失败（legacy.ok !== true —— 未绑定 / 登记表损坏 / 投影失败）时，
+  // **不能用控制面单独重建模型**：合并器对 model.subscriptions.map 会裸抛。fail-closed ——
+  // 保留失败投影原样（view 仍是该失败投影、reason 不变），只在 store 损坏时连带 corrupt 供展示注明；
+  // store 缺席 / 合法时 corrupt 为 null。legacy 合法时走下面的合并 / 损坏-fail-closed 路径，行为不变。
+  if (legacy?.ok !== true) {
+    return { view: legacy, corrupt: (!store.absent && !store.ok) ? (store.problems ?? null) : null };
+  }
   if (store.absent) return { view: legacy, corrupt: null };
   const merged = mergeControlPlaneIntoModel(legacy,
     store.ok ? { ok: true, subscriptions: store.subscriptions } : { ok: false, problems: store.problems });

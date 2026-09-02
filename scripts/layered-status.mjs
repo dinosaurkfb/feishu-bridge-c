@@ -170,8 +170,10 @@ export function lastSuccessfulDispatchAt(file) {
  * agent_uid / transport_open_id / chat_id / sender_ids / local_target_id /
  * legacy_key / pending_token 一个都不出。
  *
- * 群名由调用方从链路模板传进来（模板里本来就有 chat_name，绑定命令一直在打印它）。
- * 订阅投影自己只有 chat_id —— 取不到名字时显示"不可用"，**不拿 ID 顶替**。
+ * 群名三级（评审 #114 二轮 P2）：**条目自带的 chat_name**（控制面条目登记时录入的）>
+ * **模板匹配**（调用方从链路模板传进来的 groupName —— 模板里本来就有 chat_name，绑定命令一直在打印
+ * 它）> **不可用**。订阅投影不再"自己只有 chat_id"：控制面条目能带 chat_name；取不到名字时显示
+ * "不可用"，**不拿 ID 顶替**。
  */
 export function subscriptionFacts(model, {
   groupName = null, templateChatId = null, now = Date.now(),

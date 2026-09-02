@@ -190,6 +190,12 @@ dispatcher 获取 Aily/飞书信封后，应规范化为概念上等价于以下
 `AILY_CLI_CHANNEL_THREAD_ID`。在确认它们与飞书 topic/root/session locator 的值形状、稳定性和权限
 边界之前，不能假设它们可以替代现有绑定短码；该能力验证属于迁移前置调查，不属于本契约事实。
 
+`channel-locator-verdict.md`（2026-09-02 真机对照）已把该项调查收口：`AILY_CLI_CHANNEL_CHAT_ID` 就是
+飞书 chat_id、可升级为路由判据（附 fail-safe，§4）；`AILY_CLI_CHANNEL_THREAD_ID` 是 **Aily 命名空间
+的 thread 标识**，**不是**飞书 `omt_` locator（§2-2），不能用于飞书 API 寻址，只作「同话题归属」的相对
+判据。因此：私聊路由改为**白名单正向命中**（模板 `verified_p2p_chat_ids`，见 `register-p2p-chat.mjs`），
+绑定短码保留用于飞书寻址，不因一次观测而设契约。
+
 ## 7. 入站数据面契约
 
 ### 7.1 Hook

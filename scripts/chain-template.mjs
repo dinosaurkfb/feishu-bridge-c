@@ -57,7 +57,7 @@ export const CHAIN_FIELDS = [
  * 刻意跟必填分开：往 CHAIN_FIELDS 里加一个字段，等于让所有已经生成好的模板
  * 立刻变成「不完整」而全线拒绝 —— 加字段不该是一次静默的破坏性变更。
  */
-export const OPTIONAL_CHAIN_FIELDS = ["lark_cli_config_base", "bridge_root", "aily_cli_bin", "senders"];
+export const OPTIONAL_CHAIN_FIELDS = ["lark_cli_config_base", "bridge_root", "aily_cli_bin", "senders", "verified_p2p_chat_ids"];
 
 /** 项目级字段：每个项目不同，由 bind-project 现场算出来。 */
 export const PROJECT_FIELDS = [
@@ -90,6 +90,11 @@ const SHAPE = {
   lark_cli_config_base: (v) => typeof v === "string" && v.startsWith("/"),
   default_freshness_ms: (v) => typeof v === "number" && Number.isFinite(v) && v > 0,
   senders: (v) => Array.isArray(v),
+  // 已验证私聊 chat 白名单（#R11 P1-1，Frank 拍板 b 选项）：非空字符串、唯一、oc_ 形状。
+  // 空数组合法（= 没登记任何私聊放行）；缺省走 OPTIONAL_CHAIN_FIELDS 不报错，旧模板仍合法。
+  verified_p2p_chat_ids: (v) => Array.isArray(v) &&
+    new Set(v).size === v.length &&
+    v.every((x) => typeof x === "string" && x.length > 0 && x.startsWith("oc_")),
 };
 
 /**
@@ -118,6 +123,11 @@ export function validateChainTemplate(tpl) {
   // 发送者角色表与 frank_sender_id 的交叉校验（唯一判据在 sender-roles.mjs）。
   const rolesProblem = senderRolesProblem(tpl);
   if (rolesProblem !== null) inconsistent.push(rolesProblem);
+  // 登记群不是私聊：把模板自己的 chat_id 登进私聊白名单是误配（群消息会被当私聊早分流）。
+  if (Array.isArray(tpl?.verified_p2p_chat_ids) && tpl?.chat_id &&
+      tpl.verified_p2p_chat_ids.includes(tpl.chat_id)) {
+    inconsistent.push("verified_p2p_chat_ids 不能包含登记群 chat_id（它是群，不是私聊）");
+  }
   if (tpl?.outbound_app_id && tpl.outbound_app_id === tpl.transport_app_id &&
       tpl.outbound_open_id !== tpl.transport_open_id) {
     inconsistent.push("outbound_open_id 与 transport_open_id 不一致，但两者是同一个应用");

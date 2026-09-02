@@ -26,6 +26,7 @@ import { REJECTED_CONTROL_INTENTS, rejectedControlProblem } from "./control-inte
 import { AUTHORIZATION_TABLE, authorize, CAPABILITY, REPLY_ONLY_CAPABLE } from "./authorize.mjs";
 import { SENDER_ROLES, roleCounts, roleCountsText, senderRole, senderRolesProblem, senderTable, roleEntriesProblem } from "./sender-roles.mjs";
 import { parseRegisterSenderArgs, planSenderChange, applySenderChange } from "./register-sender.mjs";
+import { parseRegisterP2pArgs, planP2pChange, applyP2pChange } from "./register-p2p-chat.mjs";
 // symlink 锁：existsSync 会跟随到不存在的目标，锁在不在只能用 lstat 判
 const lockPresent = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
 import os from "node:os";
@@ -5215,6 +5216,19 @@ test("没有真实 <at> → 拒；手打的 @名字 不算", () => {
       event: { ...okEvent, content }, template: TPL, pending: pendingOf(f), now: NOW2 });
     assert.equal(r.reason, PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED, content);
   }
+});
+
+test("#R11 P1-2：promotion 底层不豁免 @ —— 已验证私聊（登记表命中）在认领路径仍必须真实 @，无 @ 一律 transport_not_mentioned", () => {
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  const whitelist = { ...TPL, verified_p2p_chat_ids: ["oc_p2p_verified"] };
+  // 私聊 env（chat≠模板 + thread 缺失）且已在白名单里，恰好落在"私聊豁免 @"那类误判的点上；
+  // 认领必须看真实 @ —— 早分流漏接时，私聊不能凭"无 @"从私聊认领 pending。
+  const priv = { sender_id: TPL.frank_sender_id, content: "能收到吗", created_at_ms: NOW2 };
+  const r = evaluatePromotion({
+    event: priv, template: whitelist, pending: pendingOf(f), now: NOW2,
+    env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p_verified" } });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
 });
 
 test("消息太旧 → 拒，防重放", () => {
@@ -19550,6 +19564,56 @@ test("发送者角色表（第 1 层）：唯一判据、模板交叉校验、�
   assert.equal(fs.readFileSync(tplFile, "utf-8"), beforeBad, "结果校验不过零写入");
 });
 
+test("#R11 私聊白名单登记（register-p2p-chat）：预览不写、apply 备份+原子写+读回；登记群拒；重复 add / 未登记 remove 清晰拒", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-p2p-cli-"));
+  const tplFile = path.join(home, "chain-config.json");
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  const cli = (...args) => spawnSync(process.execPath, [path.resolve("scripts", "register-p2p-chat.mjs"), ...args], { encoding: "utf-8", env: { ...process.env, HOME: home } });
+  // 参数封闭：缺参 / 模板不绝对 / 非 oc_ 形状 / add+remove 互斥 / 重复参数 都拒
+  assert.equal(cli().status, 2);
+  assert.equal(cli("--template", "relative.json", "--add", "oc_p2p").status, 2, "模板必须是绝对路径");
+  assert.equal(cli("--template", tplFile, "--add", "not_oc").status, 2, "私聊 chat 必须是 oc_ 形状");
+  assert.equal(cli("--template", tplFile, "--add", "oc_aa", "--remove", "oc_bb").status, 2, "add/remove 互斥");
+  assert.equal(parseRegisterP2pArgs(["--template", tplFile, "--add", "oc_aa", "--add", "oc_bb"]).reason, "duplicate_argument");
+  assert.equal(parseRegisterP2pArgs(["--template", "relative.json", "--add", "oc_aa"]).reason, "template_required_absolute");
+  assert.equal(parseRegisterP2pArgs(["--template", tplFile, "--add", "bad"]).reason, "chat_id_shape_oc");
+  // 预览不写：dry-run 显示动作与后果，模板一字不动
+  const preview = cli("--template", tplFile, "--add", "oc_p2p_direct");
+  assert.equal(preview.status, 0, preview.stdout + preview.stderr);
+  assert.match(preview.stdout, /登记 oc_p2p_direct[\s\S]*白名单  ：1 个（改后）[\s\S]*\[dry-run\] 什么都没写/u, preview.stdout);
+  assert.deepEqual(JSON.parse(fs.readFileSync(tplFile, "utf-8")), TPL, "预览不写");
+  // apply：备份 + 原子写 + 读回，模板过同一份校验
+  const applied = cli("--template", tplFile, "--add", "oc_p2p_direct", "--apply");
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  assert.match(applied.stdout, /已写入（锁内重读重算后）。备份：/u);
+  const written = JSON.parse(fs.readFileSync(tplFile, "utf-8"));
+  assert.deepEqual(written.verified_p2p_chat_ids, ["oc_p2p_direct"]);
+  assert.equal(written.chat_id, TPL.chat_id, "其余字段原样");
+  assert.ok(fs.readdirSync(home).some((n) => n.startsWith("chain-config.json.bak.")), "先备份");
+  assert.equal(validateChainTemplate(written).ok, true);
+  // 重复 add → 清晰拒（不静默幂等）
+  const again = cli("--template", tplFile, "--add", "oc_p2p_direct", "--apply");
+  assert.deepEqual([again.status, /already_registered/u.test(again.stdout)], [1, true], again.stdout);
+  // 移除
+  const removed = cli("--template", tplFile, "--remove", "oc_p2p_direct", "--apply");
+  assert.equal(removed.status, 0, removed.stdout);
+  assert.deepEqual(JSON.parse(fs.readFileSync(tplFile, "utf-8")).verified_p2p_chat_ids, []);
+  const notReg = cli("--template", tplFile, "--remove", "oc_p2p_direct", "--apply");
+  assert.deepEqual([notReg.status, /not_registered/u.test(notReg.stdout)], [1, true], notReg.stdout);
+  // 登记群拒（它本来就不是私聊）
+  const groupAdd = cli("--template", tplFile, "--add", TPL.chat_id, "--apply");
+  assert.deepEqual([groupAdd.status, /group_chat_not_private/u.test(groupAdd.stdout)], [1, true], groupAdd.stdout);
+  // 纯函数层：结果必须过同一份校验；坏模板（p2p 非数组）拒
+  assert.equal(planP2pChange(TPL, { chatId: "oc_x" }).ok, true);
+  assert.equal(planP2pChange({ ...TPL, verified_p2p_chat_ids: ["oc_x", "oc_x"] }, { chatId: "oc_y" }).reason, "template_p2p_invalid");
+  assert.equal(planP2pChange({ ...TPL, verified_p2p_chat_ids: "oc_x" }, { chatId: "oc_y" }).reason, "template_p2p_invalid");
+  assert.equal(planP2pChange(TPL, { chatId: TPL.chat_id }).reason, "group_chat_not_private");
+  // validateChainTemplate 交叉校验：白名单里出现登记群 → inconsistent
+  const cross = validateChainTemplate({ ...TPL, verified_p2p_chat_ids: [TPL.chat_id] });
+  assert.equal(cross.ok, false);
+  assert.ok(cross.inconsistent.some((s) => /登记群 chat_id/u.test(s)), JSON.stringify(cross.inconsistent));
+});
+
 const DRIFT_HOOK = [
   'import fs from "node:fs";',
   'const watch = process.env.DRIFT_AFTER_READ, file = process.env.DRIFT_FILE, transform = new Function("doc", process.env.DRIFT_JS);',
@@ -22340,32 +22404,36 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
 });
 
 
-test("off-template turn #12：私聊（chat≠模板 + thread 缺失）豁免 @ 闸直接 chat 回答；外部群话题（thread 有值）照旧拒 + hint；群消息行为一个不变", () => {
+test("off-template turn #12→#R11：私聊以已验证登记表正向命中豁免 @ 闸直接 chat 回答；未登记私聊形状/外部群话题（thread 有值）照旧拒 + hint；群消息行为一个不变", () => {
   // 判据：事件链没有 chat_type，用 daemon 注入的 AILY_CLI_CHANNEL_CHAT_ID 对照模板 chat_id。
-  // #12 重开 #111 A 项（真机验证 verdict §2-3）：私聊的结构签名 = chat 有值 && ≈≠ 模板 &&
-  // thread 缺失/空。仅此一形豁免 @ 闸；「不等于模板群」但 thread 有值的外部群话题仍不得绕过 @，
-  // 只作诊断 hint（#111 P1 对「外部群/过期 locator」的纪律依旧）。isOffTemplateChatTurn（诊断用）
-  // 与 isPrivateChatTurn（区分私聊/外部群）并存，前者不变。
+  // #12 重开 #111 A 项；#R11 P1-1（Frank 拍板 b）把判据从「结构签名」换成正向白名单
+  // verified_p2p_chat_ids（register-p2p-chat.mjs 维护）。thread 条件降为纵深防御：
+  // 表缺失/空/不含 → 恒 false（没登记就没放行，fail-safe）；表含 + thread 有值 → 纵深拒。
+  // isOffTemplateChatTurn（诊断用）与 isPrivateChatTurn（私聊白名单）并存，前者不变。
   const at = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> ";
   const quoted = "\n\n**[引用]**\n绑定码    aaaaaa";
+  const TPLWP = { ...TPL, verified_p2p_chat_ids: ["oc_p2p_direct"] };
 
-  // ── 判据四态 + fail-safe 三态
+  // ── 白名单四态 + 纵深拒 + fail-safe（#R11 P1-1）
   assert.equal(isOffTemplateChatTurn({ template: TPL, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p_direct" } }), true, "isOffTemplateChatTurn：channel ≠ 模板 chat_id → off-template（诊断用，不变）");
   assert.equal(isOffTemplateChatTurn({ template: TPL, env: {} }), false, "isOffTemplateChatTurn：env 缺失按群处理");
-  assert.equal(isPrivateChatTurn({ template: TPL, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p" } }), true, "私聊（≠模板 + thread 缺失）→ 命中");
-  assert.equal(isPrivateChatTurn({ template: TPL, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p", AILY_CLI_CHANNEL_THREAD_ID: "" } }), true, "thread 空串同样算私聊（thread 缺失/空）");
-  assert.equal(isPrivateChatTurn({ template: TPL, env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id } }), false, "群里（= 模板 chat）不是私聊");
-  assert.equal(isPrivateChatTurn({ template: TPL, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_ext", AILY_CLI_CHANNEL_THREAD_ID: "omt_ext_thread" } }), false, "外部群话题（thread 有值）不是私聊 —— 变异防线：删掉 thread 条件这条会转红");
+  assert.equal(isPrivateChatTurn({ template: TPL, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p" } }), false, "表缺失（没登记）→ 恒 false，不妄判私聊（fail-safe）");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: [] }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p" } }), false, "空表 → false");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: ["oc_p2p"] }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p" } }), true, "表含 chatId（逐字）+ thread 缺失 → 命中私聊");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: ["oc_p2p"] }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p", AILY_CLI_CHANNEL_THREAD_ID: "" } }), true, "thread 空串同样放行（thread 缺失/空）");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: ["oc_p2p"] }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p", AILY_CLI_CHANNEL_THREAD_ID: "omt_ext_thread" } }), false, "表含但 thread 有值 → 纵深拒（外部群话题）：删除 thread 条件该条会转红");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: ["oc_p2p"] }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_not_listed" } }), false, "表不含 → 拒");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: [TPL.chat_id] }, env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id } }), false, "群 chat（= 模板 chat_id）即便被误登记也按群处理，不进私聊");
   // fail-safe：要素缺失 / 形态异常 → 全部回落 false（按群/未知处理，不盲信）
-  assert.equal(isPrivateChatTurn({ template: TPL, env: {} }), false, "env 全缺 → 不妄判私聊");
-  assert.equal(isPrivateChatTurn({ template: { ...TPL, chat_id: "" }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_x" } }), false, "模板没有 chat_id → 无法与模板比照 → 不判私聊");
-  assert.equal(isPrivateChatTurn({ template: TPL, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p", AILY_CLI_CHANNEL_THREAD_ID: 123 } }), false, "thread 形态异常（非字符串）→ 不判私聊");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: ["oc_p2p"] }, env: {} }), false, "env 全缺 → 不妄判私聊");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: "oc_x" }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_x" } }), false, "白名单非数组（形态异常）→ false");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: ["oc_p2p"] }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p", AILY_CLI_CHANNEL_THREAD_ID: 123 } }), false, "thread 形态异常（非字符串）→ 不判私聊");
 
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-p2p-"));
   const bin = path.join(local, "bin"); fs.mkdirSync(bin);
   const p1root = path.join(local, "p1"); fs.mkdirSync(p1root);
   const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
-  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  fs.writeFileSync(templateFile, JSON.stringify(TPLWP));
   const writeRegistry = (projects) => fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects }));
   const pendingEntry = { id: "p1", root: p1root, name: "P1", root_message_id: "om_p1", expires_at: "2099-01-01T00:00:00Z",
     inbound_state: "pending", pending_token: "aaaaaa", status: "active" };

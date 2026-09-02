@@ -285,11 +285,11 @@ if (!routed.ok) {
   if (routed.reason !== "no_binding_for_session") {
     finish("error", { detail: "Codex task registry 无法路由（" + routed.reason + "）" }, { reason: routed.reason });
   }
-  // 私聊（真机验证的结构签名）早分流：#12 重开 #111 A 项。命中 isPrivateChatTurn 的轮次不进
-  // 认领评估 —— 认领本来就该在群话题里真实 @ 完成，私聊没有 @ 可打，留着只有一条
-  // transport_not_mentioned 的错拒绝。chatTurn 自带三道闸（角色阈值/新鲜度/@ 闸已对私聊豁免），
-  // 所有出口都 finish，不会落到下面的认领路径；channel/模板 env 缺失时恒 false，按群处理。
-  // 与 Claude 链同一份判据。
+  // 私聊（已验证登记表正向命中）早分流：#R11 P1-1 把判据换成模板里的 verified_p2p_chat_ids。
+  // 命中 isPrivateChatTurn 的轮次不进认领评估 —— 认领本来就该在群话题里真实 @ 完成，私聊没有 @
+  // 可打，留着只有一条 transport_not_mentioned 的错拒绝。chatTurn 自带三道闸（角色阈值/新鲜度/@
+  // 闸已对私聊豁免），所有出口都 finish，不会落到下面的认领路径；登记表缺失/空或 chat 未登记时恒
+  // false，按群处理。与 Claude 链同一份判据。
   if (isPrivateChatTurn({ template: template.template, env: process.env })) {
     chatTurn({ chain: "codex", template: template.template, event, dryRun, ledgerDir: path.join(HOME, "inbound", "chat-claims") });
   }

@@ -20,6 +20,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { displaySafe } from "./display-safe.mjs";
 import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { bindingsForRoot, currentBinding, describeStatus, setBindingStatus } from "./feishu-control.mjs";
 import {
@@ -305,7 +306,7 @@ const statusText = composeStatusMessage({ name });
 
 console.log("项目    " + name + "  " + root);
 console.log("名字来源" + "  " + (arg("name") ? "命令行 --name" : identity.source === "dirname" ? "目录名（没找到 CLAUDE.md 标题）" : identity.source));
-console.log("群      " + template.chat_name + "  " + template.chat_id);
+console.log("群      " + displaySafe(template.chat_name) + "  " + template.chat_id);
 console.log("身份    " + template.outbound_agent_name + "（profile " + template.lark_cli_profile + "）");
 console.log("\n--- 根消息 ---\n" + rootText);
 console.log("\n--- 底下第一条 ---\n" + statusText);

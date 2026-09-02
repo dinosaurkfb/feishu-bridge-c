@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-09-02T03:08:11.184Z",
+  "generated_at": "2026-09-02T05:50:53.328Z",
   "modules": {
     "authorize.mjs": [
       "AUTHORIZATION_TABLE",
@@ -610,7 +610,21 @@
     "stop-hook.mjs": [
       "extractReply"
     ],
+    "subscription-store.mjs": [
+      "SUBSCRIPTION_RUNTIMES",
+      "SUBSCRIPTION_STORE_ARTIFACT_TYPE",
+      "SUBSCRIPTION_STORE_SCHEMA_VERSION",
+      "applySubscriptionChange",
+      "describeLockRelease",
+      "loadSubscriptionStore",
+      "mergedSubscriptionView",
+      "planSubscriptionChange",
+      "planSubscriptionEntry",
+      "subscriptionControlId",
+      "subscriptionStorePath"
+    ],
     "subscription.mjs": [
+      "CHAT_NAME_MAX_LENGTH",
       "INSTANCE_KEY_SHAPE",
       "MESSAGE_RECEIVE_EVENT",
       "SUBSCRIPTION_ARTIFACT_TYPE",
@@ -621,6 +635,7 @@
       "claimable",
       "compareFirstClaimShadow",
       "legacyEndpointId",
+      "mergeControlPlaneIntoModel",
       "selectPendingSubscriptionClaim",
       "stableControlId",
       "subscriptionIdFor",

@@ -27,6 +27,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { displaySafe } from "./display-safe.mjs";
 import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { registryPath } from "./registry.mjs";
 import { publishDraft, sendToChat } from "./outbound.mjs";
@@ -152,7 +153,7 @@ const statusText = composeStatusMessage({ name });
 
 console.log("会话    " + me.name + "  (" + me.sessionId.slice(0, 8) + ")");
 console.log("项目    " + root);
-console.log("群      " + template.chat_name + "  " + template.chat_id);
+console.log("群      " + displaySafe(template.chat_name) + "  " + template.chat_id);
 console.log("\n--- 根消息 ---\n" + rootText);
 console.log("\n--- 底下第一条 ---\n" + statusText);
 console.log("\n只写一处：" + regFile + "（项目目录里不写任何文件）");

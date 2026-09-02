@@ -170,8 +170,10 @@ export function lastSuccessfulDispatchAt(file) {
  * agent_uid / transport_open_id / chat_id / sender_ids / local_target_id /
  * legacy_key / pending_token 一个都不出。
  *
- * 群名由调用方从链路模板传进来（模板里本来就有 chat_name，绑定命令一直在打印它）。
- * 订阅投影自己只有 chat_id —— 取不到名字时显示"不可用"，**不拿 ID 顶替**。
+ * 群名三级（评审 #114 二轮 P2）：**条目自带的 chat_name**（控制面条目登记时录入的）>
+ * **模板匹配**（调用方从链路模板传进来的 groupName —— 模板里本来就有 chat_name，绑定命令一直在打印
+ * 它）> **不可用**。订阅投影不再"自己只有 chat_id"：控制面条目能带 chat_name；取不到名字时显示
+ * "不可用"，**不拿 ID 顶替**。
  */
 export function subscriptionFacts(model, {
   groupName = null, templateChatId = null, now = Date.now(),
@@ -181,12 +183,14 @@ export function subscriptionFacts(model, {
   }
   const items = (model.subscriptions ?? []).map((s) => ({
     status: s.status === "active" ? "活动" : "暂停",
-    // **群名只能用在它确实对应的那条订阅上。**投影里只有 chat_id，群名在模板里；
-    // 无条件套上去的话，指向别的群的订阅会被错报成模板群 ——
+    // **群名三级（评审 #114 P1）：控制面条目名优先；条目无名时才按 chat_id 匹配模板名，
+    // 都没有则「群名不可用」。**群名只能用在它确实对应的那条订阅上 ——
+    // 无条件套模板名的话，指向别的群的订阅会被错报成模板群，
     // **一个错的名字比没有名字更难发现**。核对不上就报不可用。
     // feishu-subscribe 那条命令一直是这么做的，这里是向它看齐。
-    groupName: (templateChatId !== null && s.scope?.chat_id === templateChatId)
-      ? groupName : null,
+    groupName: (typeof s.chat_name === "string" && s.chat_name.trim())
+      ? s.chat_name
+      : ((templateChatId !== null && s.scope?.chat_id === templateChatId) ? groupName : null),
     senderCount: (s.scope?.sender_ids ?? []).length,
     // 角色人数只出数量：表不在场（旧投影）就按 sender_ids 都是 owner 算 —— 那正是今天的语义。
     roleCounts: roleCounts(s.scope?.sender_roles ?? (s.scope?.sender_ids ?? []).map((id) => ({ open_id: id, role: "owner" }))),
@@ -395,7 +399,7 @@ export function composeLayeredStatus({
   } else {
     for (const s of subscription.items) {
       L2.push(["订阅状态", s.status]);
-      L2.push(["订阅群", s.groupName ?? "群名不可用（只有群 ID，不拿 ID 顶替）"]);
+      L2.push(["订阅群", s.groupName == null ? "群名不可用（只有群 ID，不拿 ID 顶替）" : displaySafe(s.groupName)]);
       L2.push(["授权发送者", s.senderCount + " 个"]);
       L2.push(["发送者角色", roleCountsText(s.roleCounts) + "（只出数量）"]);
       L2.push(["事件范围", s.eventTypes.join("、") || "未声明"]);

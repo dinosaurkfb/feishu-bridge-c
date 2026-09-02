@@ -28,13 +28,14 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { acquirePublishLock, commitWhileHeld, releasePublishLock } from "./registry.mjs";
 import { senderTable } from "./sender-roles.mjs";
 import {
-  INSTANCE_KEY_SHAPE, MESSAGE_RECEIVE_EVENT, SUBSCRIPTION_ARTIFACT_TYPE,
+  CHAT_NAME_MAX_LENGTH, INSTANCE_KEY_SHAPE, MESSAGE_RECEIVE_EVENT, SUBSCRIPTION_ARTIFACT_TYPE,
   SUBSCRIPTION_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION_KEYED,
-  legacyEndpointId, stableControlId, subscriptionIdFor, validateSubscription,
+  legacyEndpointId, mergeControlPlaneIntoModel, stableControlId, subscriptionIdFor, validateSubscription,
 } from "./subscription.mjs";
 
 export const SUBSCRIPTION_STORE_SCHEMA_VERSION = "1.0";
@@ -103,10 +104,43 @@ export function loadSubscriptionStore({ file } = {}) {
 }
 
 /**
+ * 生产默认 store 路径。四条展示入口（两条链 subscribe + 两条链 status）共用；
+ * 有 HOME 沙箱的测试里 os.homedir() 指向沙箱，落盘位置随之走。
+ */
+export function subscriptionStorePath() {
+  return path.join(os.homedir(), ".claude", "feishu-bridge", "subscriptions.json");
+}
+
+/**
+ * **展示层的共用合并帮手**（评审 #114 P1：四个入口曾各写一份「读 store + 合并 + 损坏退 legacy」）。
+ * 输入已建好的 legacy 读取模型（用哪条链的 builder 由调用方决定），内部读生产默认 store，
+ * 走 mergeControlPlaneIntoModel 同一条合并路径（含 endpoint 隔离与损坏 fail-closed）。
+ * 文件缺席 = 今天：返回 { view: legacy, corrupt: null }，输出与 legacy 模型逐字节一致。
+ * 损坏不崩：返回 { view: legacy, corrupt: problems }，调用方据此注明「已按 legacy 显示」。
+ * 热路径（认领 / 路由）一行不碰 —— 它永远只吃原模型，不进这里。
+ */
+export function mergedSubscriptionView({ legacy } = {}) {
+  const store = loadSubscriptionStore({ file: subscriptionStorePath() });
+  // 评审 #114 二轮 P1：legacy 投影自身失败（legacy.ok !== true —— 未绑定 / 登记表损坏 / 投影失败）时，
+  // **不能用控制面单独重建模型**：合并器对 model.subscriptions.map 会裸抛。fail-closed ——
+  // 保留失败投影原样（view 仍是该失败投影、reason 不变），只在 store 损坏时连带 corrupt 供展示注明；
+  // store 缺席 / 合法时 corrupt 为 null。legacy 合法时走下面的合并 / 损坏-fail-closed 路径，行为不变。
+  if (legacy?.ok !== true) {
+    return { view: legacy, corrupt: (!store.absent && !store.ok) ? (store.problems ?? null) : null };
+  }
+  if (store.absent) return { view: legacy, corrupt: null };
+  const merged = mergeControlPlaneIntoModel(legacy,
+    store.ok ? { ok: true, subscriptions: store.subscriptions } : { ok: false, problems: store.problems });
+  return merged.ok
+    ? { view: merged, corrupt: null }
+    : { view: merged.legacy ?? legacy, corrupt: merged.problems ?? null };
+}
+
+/**
  * 纯函数：从模板算出一条新的控制面订阅。群参数按订阅声明：chat_id 必须给
  * （允许与模板不同 —— 这正是多群的意义），新鲜度缺省继承模板。
  */
-export function planSubscriptionEntry({ runtime, template, domainKey, chatId, freshnessMs, instanceKey = null } = {}) {
+export function planSubscriptionEntry({ runtime, template, domainKey, chatId, freshnessMs, instanceKey = null, chatName = null } = {}) {
   if (!SUBSCRIPTION_RUNTIMES.includes(runtime)) return { ok: false, reason: "runtime_unknown" };
   // 链核对在**最底层**（评审 #112 二轮：只在 change 计划器里核，直接调用这里的仍能
   // 用 Claude 模板配 runtime:"codex" 造出归错链的条目）。
@@ -116,6 +150,12 @@ export function planSubscriptionEntry({ runtime, template, domainKey, chatId, fr
   if (instanceKey != null && (typeof instanceKey !== "string" || !INSTANCE_KEY_SHAPE.test(instanceKey))) {
     return { ok: false, reason: "instance_key_shape" };
   }
+  // chat_name（FR-2.6 单 3）：给了就必须合法；这里的早拒带专用 reason，validateSubscription 是写盘前的第二道。
+  if (chatName != null && (typeof chatName !== "string" ||
+      // 长度按码点，不是 UTF-16 单位（与 validateSubscription、JSON Schema maxLength 同判）。
+      Array.from(chatName).length > CHAT_NAME_MAX_LENGTH || !chatName.trim())) {
+    return { ok: false, reason: "chat_name_invalid" };
+  }
   let freshness = template?.default_freshness_ms;
   if (freshnessMs != null) { // 显式给的才覆盖；null / undefined 都算没给（CLI 未传时是 null）
     if (typeof freshnessMs !== "number" || !Number.isFinite(freshnessMs) || freshnessMs <= 0) {
@@ -124,11 +164,14 @@ export function planSubscriptionEntry({ runtime, template, domainKey, chatId, fr
     freshness = freshnessMs;
   }
   const entry = {
-    // keyed 条目升 1.1（评审 #112 裁决：不静默改宣称固定的 1.0）；无 key 照旧 1.0，id 与 legacy 一致
-    schema_version: instanceKey == null ? SUBSCRIPTION_SCHEMA_VERSION : SUBSCRIPTION_SCHEMA_VERSION_KEYED,
+    // 版本按「有无 1.1 字段」定（FR-2.6 单 3）：instance_key 或 chat_name 任一在 → 1.1；
+    // 两个都不在 → 照旧 1.0，id 与 legacy 一致。1.0 封闭形状不认识 chat_name，不能带。
+    schema_version: (instanceKey == null && chatName == null)
+      ? SUBSCRIPTION_SCHEMA_VERSION : SUBSCRIPTION_SCHEMA_VERSION_KEYED,
     artifact_type: SUBSCRIPTION_ARTIFACT_TYPE,
     subscription_id: subscriptionControlId({ runtime, agentUid: template.agent_uid, domainKey, chatId, instanceKey }),
     ...(instanceKey == null ? {} : { instance_key: instanceKey }),
+    ...(chatName == null ? {} : { chat_name: chatName }),
     version: 1,
     endpoint_id: legacyEndpointId({ runtime, agentUid: template.agent_uid }),
     domain_id: stableControlId("domain", runtime, domainKey),
@@ -156,7 +199,7 @@ export function planSubscriptionEntry({ runtime, template, domainKey, chatId, fr
  * domain + chat 定位 —— subscriptionId 精确寻址优先；否则四元组 + instanceKey 重算 id；
  * 都没给时四元组下恰一条才认，多条歧义拒绝（列出候选 id 让人挑）。
  */
-export function planSubscriptionChange({ store, runtime, template, domainKey, chatId, freshnessMs, action = "add", instanceKey = null, subscriptionId = null } = {}) {
+export function planSubscriptionChange({ store, runtime, template, domainKey, chatId, freshnessMs, action = "add", instanceKey = null, subscriptionId = null, chatName = null } = {}) {
   if (!["add", "pause", "resume", "remove"].includes(action)) return { ok: false, reason: "action_unknown" };
   if (!store || !Array.isArray(store.subscriptions)) return { ok: false, reason: "store_invalid" };
   // 链核对（评审 PR #112 P2）：Claude 模板配 runtime:"codex" 会生成一条合法但归错链的订阅 ——
@@ -165,7 +208,7 @@ export function planSubscriptionChange({ store, runtime, template, domainKey, ch
   if (action === "add") {
     const id = subscriptionControlId({ runtime, agentUid: template?.agent_uid, domainKey, chatId, instanceKey });
     if (store.subscriptions.some((s) => s.subscription_id === id)) return { ok: false, reason: "subscription_exists", subscription_id: id };
-    const planned = planSubscriptionEntry({ runtime, template, domainKey, chatId, freshnessMs, instanceKey });
+    const planned = planSubscriptionEntry({ runtime, template, domainKey, chatId, freshnessMs, instanceKey, chatName });
     if (!planned.ok) return planned;
     return { ok: true, changed: true, store: { ...store, subscriptions: [...store.subscriptions, planned.entry] }, entry: planned.entry };
   }

@@ -15,6 +15,7 @@ import { checkEndpoint } from "../endpoint-self-check.mjs";
 import { resolveLarkIdentity } from "../chain-template.mjs";
 import path from "node:path";
 import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
+import { mergedSubscriptionView } from "../subscription-store.mjs";
 import { codexHomeOf } from "./drain-service.mjs";
 import { taskBindingFacts } from "./task-binding.mjs";
 import { codexPendingEventRows } from "./status-events.mjs";
@@ -87,6 +88,9 @@ const outboundRouting = outboundRoutingFact({
   bound: st.ok === true,
 });
 
+// 评审 #114 P1：订阅区把 store 的控制面条目并进读模型 —— 与 Claude 侧共用 mergedSubscriptionView。
+const { view: subscriptionModel, corrupt: subscriptionCorrupt } = mergedSubscriptionView({ legacy: buildCodexSubscriptionProjection({ home, threadId }) });
+
 console.log(renderLayeredStatus(composeLayeredStatus({
   st,
   // Codex 侧的接入办法是 $feishu-bind，不是 Claude 那条脚本命令。
@@ -117,8 +121,7 @@ console.log(renderLayeredStatus(composeLayeredStatus({
     // **没查就是没查**，不许因为代码存在就当成查过了。
     selfCheck: tpl ? checkEndpoint({ template: tpl, identity: resolveLarkIdentity(tpl) }) : null,
   }),
-  subscription: subscriptionFacts(
-    buildCodexSubscriptionProjection({ home, threadId }),
+  subscription: subscriptionFacts(subscriptionModel,
     // **优先用这条 task 自己的群事实。**task 支持覆盖 chat_id/chat_name；
     // 只传模板的话，一个已知群名的 task 会被报成"群名不可用"——
     // 上一轮我修掉了"错报模板群名"，却把"把知道的说成不知道"留下了。
@@ -129,4 +132,5 @@ console.log(renderLayeredStatus(composeLayeredStatus({
   // FR-10：第五区的 run / publish 状态 —— 只转述 collectBacklog 与 listEligibilityPending 的结论。
   pendingRows: codexPendingEventRows({ home, threadId, task }),
 })));
+if (subscriptionCorrupt) console.log("\n注意：控制面 store 损坏（" + subscriptionCorrupt.length + " 个问题），订阅区已按 legacy 显示。");
 process.exit(0);

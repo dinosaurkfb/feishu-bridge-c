@@ -211,7 +211,7 @@ import {
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
 import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, selectPendingSubscriptionClaim, stableControlId, validateSubscription, claimable } from "./subscription.mjs";
-import { loadSubscriptionStore, planSubscriptionEntry } from "./subscription-store.mjs";
+import { applySubscriptionChange, loadSubscriptionStore, planSubscriptionChange, planSubscriptionEntry } from "./subscription-store.mjs";
 import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
@@ -9626,7 +9626,10 @@ test("迁移目标的授权必须逐项覆盖，差一样都不许迁", () => {
     ["agent_participant_id", { scope: { ...base, transport_open_id: "ou_other" } }],
     ["chat_scope_ref", { scope: { ...base, chat_id: "oc_other" } }],
     ["authorized_human_participant_ids", { scope: { ...base, sender_ids: ["u_someone_else"] } }],
-    ["event_types", { scope: { ...base, event_types: ["im.chat.updated"] } }],
+    // event_types 维度：schema 的事件 const（评审 #112 收进运行时判据）后，合法输入域里
+    // 只有 [im.message.receive]，「事件集不覆盖」在合法域中造不出来 —— sync 层的逐项比对
+    // 保留（防未来 schema 放开事件枚举），这里改为断言守卫上移：非法事件名的目标进不了
+    // others（OTHERS_INVALID），见循环后的独立断言。
     // 新窗口更严 → 收不下这份快照原本受理的事件，那不是覆盖。
     ["freshness_ms", { constraints: { freshness_ms: 60000 } }],
     ["status", { status: "paused" }],
@@ -9642,9 +9645,14 @@ test("迁移目标的授权必须逐项覆盖，差一样都不许迁", () => {
       .plans[0].migrationCandidates, 0, missing + "：授权不覆盖就不是候选");
   }
 
-  // 目标授权更宽（多授权一个人、多收一种事件、窗口更松）→ 覆盖得住，可以迁。
+  // 守卫上移的证据（评审 #112）：schema 非法的事件名连 others 都进不了
+  const evilTarget = syncSub({ subscription_id: otherId, scope: { ...base, event_types: ["im.chat.updated"] } });
+  assert.equal(plan({ previous: syncSub(), next: null, snapshots: [snap], others: [evilTarget], migrateTo: otherId })
+    .reason, SYNC_REJECT.OTHERS_INVALID, "非法事件名的目标在校验层就该拦下");
+
+  // 目标授权更宽（多授权一个人、窗口更松；事件集在 const 下恒同）→ 覆盖得住，可以迁。
   const wider = syncSub({ subscription_id: otherId,
-    scope: { ...base, sender_ids: ["u_frank", "u_two"], event_types: ["im.message.receive", "im.chat.updated"] },
+    scope: { ...base, sender_ids: ["u_frank", "u_two"] },
     constraints: { freshness_ms: 1800000 } });
   assert.equal(plan({ previous: syncSub(), next: null, snapshots: [snap],
     others: [wider], migrateTo: otherId }).counts.migrate, 1, "更宽的授权是覆盖，不该被挡");
@@ -10493,7 +10501,9 @@ test("落盘 suspend：快照收回 + binding 控制状态同一 operation 落�
   assert.equal(b3.writes[0].target.reason, "subscription_paused");
   assert.equal(b3.writes[0].control.target.reason, "subscription_paused", "两笔同一个 reason");
   const w4 = applyWorld({ key: "w4" });
-  const uncovered = { ...w4.world, next: syncSub({ version: 2, scope: { ...syncSub().scope, event_types: ["im.chat.updated"] } }) };
+  // 「改范围到不再覆盖」原来用换事件名表达；事件 const（评审 #112）后合法域里改用
+  // sender 收窄 —— 新范围不再授权快照里的 u_frank，同样是 no_longer_covered。
+  const uncovered = { ...w4.world, next: syncSub({ version: 2, scope: { ...syncSub().scope, sender_ids: ["u_someone_else"] } }) };
   const p4 = planSubscriptionSync(uncovered);
   assert.equal(p4.plans[0]?.action, SYNC_ACTION.SUSPEND, JSON.stringify(p4));
   assert.equal(p4.plans[0]?.reason, "no_longer_covered");
@@ -19534,7 +19544,7 @@ const DRIFT_HOOK = [
 
 // ─── FR-2.6 单 1：订阅控制面落盘 + register-subscription 写入口 ────────────────────────
 
-test("FR-2.6 单 1：无 store 的机器投影逐字节不变（缺席/空 store 同字）；损坏或条目不过校验的 store fail-closed 退回纯 legacy 且可诊断", () => {
+test("FR-2.6 单 1：无 store 的机器投影逐字节不变（缺席/空 store 同字）；损坏或条目不过校验的 store → 权威读取拒绝（评审 #112：退回 legacy 是 fail-open），legacy 只作诊断附带", () => {
   const runtimeNamespace = "claude";
   const endpointId = legacyEndpointId({ runtime: runtimeNamespace, agentUid: "agent_m5claude" });
   const template = { agent_uid: "agent_m5claude", transport_open_id: "ou_bot", frank_sender_id: "u_frank", chat_id: "oc_x", default_freshness_ms: 600000 };
@@ -19551,16 +19561,21 @@ test("FR-2.6 单 1：无 store 的机器投影逐字节不变（缺席/空 store
   assert.equal(JSON.stringify(withEmpty), JSON.stringify(noStore), "空 store 同字");
   const corrupt = { ok: false, problems: ["store_bad_json:Unexpected token o"] };
   const withCorrupt = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records, controlPlane: corrupt });
-  assert.equal(withCorrupt.ok, true, "投影本体不因控制面损坏而失败");
-  assert.deepEqual(withCorrupt.subscriptions, noStore.subscriptions, "退回纯 legacy");
-  assert.deepEqual(withCorrupt.control_plane, { ok: false, problems: corrupt.problems }, "问题可诊断，不静默丢");
+  assert.equal(withCorrupt.ok, false, "文件在场但说不清 ≠ 没装控制面：权威读取必须拒绝（暂停过的订阅不许因文件损坏重新开放）");
+  assert.equal(withCorrupt.reason, "control_plane_invalid");
+  assert.deepEqual(withCorrupt.problems, corrupt.problems, "问题可诊断，不静默丢");
+  assert.deepEqual(withCorrupt.legacy?.subscriptions, noStore.subscriptions, "展示层要 legacy 诊断从 legacy 字段拿，不从 subscriptions");
   fs.writeFileSync(path.join(sandbox, "bad.json"), "{oops");
   const bad = loadSubscriptionStore({ file: path.join(sandbox, "bad.json") });
   assert.deepEqual([bad.ok, bad.problems.some((p) => String(p).startsWith("store_bad_json"))], [false, true], "盘上坏文件 → problems");
   const halfBad = { ok: true, absent: false, subscriptions: [{ schema_version: "9.9" }] };
   const withHalfBad = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records, controlPlane: halfBad });
-  assert.deepEqual(withHalfBad.subscriptions, noStore.subscriptions, "有一条不过校验 → 整份控制面不作数");
-  assert.equal(withHalfBad.control_plane.ok, false);
+  assert.equal(withHalfBad.ok, false, "有一条不过校验 → 整份拒绝，不退回 legacy");
+  assert.equal(withHalfBad.reason, "control_plane_invalid");
+  assert.deepEqual(withHalfBad.legacy?.subscriptions, noStore.subscriptions);
+  // 认领器对拒绝态的行为：ok:false 的模型给 selector 就是 PROJECTION 不可用，绝不认领
+  assert.equal(selectPendingSubscriptionClaim({ model: withCorrupt, evidence: { agent_uid: "agent_m5claude", sender_id: "u_frank" }, now: NOW }).ok, false,
+    "损坏控制面下不许发生任何认领");
 });
 
 test("FR-2.6 单 1：register-subscription 预览零副作用；--apply 新增同域第二个群（chat_id ≠ 模板）、同 id 重复登记拒绝、freshness 缺省继承模板且可覆盖", () => {
@@ -19652,10 +19667,15 @@ test("FR-2.6 单 1：合并读模型 —— 控制面新 id 追加（pending_bin
   const secondEntry = planSubscriptionEntry({ runtime: "claude", template, domainKey: "/p", chatId: "oc_second" });
   assert.equal(secondEntry.ok, true, secondEntry.reason ?? "");
   const overrideEntry = { ...legacySub, status: "paused", version: 5 };
-  const model = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records: [record({})], controlPlane: { ok: true, absent: false, subscriptions: [secondEntry.entry, overrideEntry] } });
+  // endpoint 隔离（评审 #112 P1）：机器级共享 store 里别的链（Codex endpoint）的合法条目
+  // 不进 Claude 模型 —— 跳过并计数
+  const codexEntry = planSubscriptionEntry({ runtime: "codex", template: { ...template, agent_uid: "agent_codex" }, domainKey: "/p", chatId: "oc_z" });
+  assert.equal(codexEntry.ok, true, codexEntry.reason ?? "");
+  const model = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records: [record({})], controlPlane: { ok: true, absent: false, subscriptions: [secondEntry.entry, overrideEntry, codexEntry.entry] } });
   assert.equal(model.ok, true);
-  assert.deepEqual(model.control_plane, { ok: true, added: 1, overridden: 1 });
+  assert.deepEqual(model.control_plane, { ok: true, added: 1, overridden: 1, other_endpoint: 1 });
   assert.equal(model.subscriptions.length, 2);
+  assert.ok(!model.subscriptions.some((s) => s.endpoint_id !== endpointId), "别的 endpoint 的条目一条都不许混进来");
   const mergedSecond = model.subscriptions.find((s) => s.subscription_id === secondEntry.entry.subscription_id);
   assert.equal(mergedSecond?.scope.chat_id, "oc_second", "控制面新 id 进读模型（同域第二个群）");
   assert.deepEqual(model.pending_bindings, legacy.pending_bindings, "pending_bindings 来自登记表，合并不动");
@@ -19673,6 +19693,32 @@ test("FR-2.6 单 1：合并读模型 —— 控制面新 id 追加（pending_bin
   assert.deepEqual([claim.ok, claim.reason], [false, SUBSCRIPTION_REJECT.NO_ACTIVE_SUBSCRIPTION], "覆盖不是摆设：暂停的订阅挡住认领");
   const claimLegacy = selectPendingSubscriptionClaim({ model: legacy, evidence, now: NOW });
   assert.deepEqual([claimLegacy.ok, claimLegacy.matched_by], [true, "sole_pending"], "对照：纯 legacy 下同一事件认领成功");
+});
+
+// 评审 PR #112 返修：不可信落盘对象的入口要封闭 —— schema additionalProperties:false 与事件
+// const 落到运行时判据；store 顶层封闭形状 + fd 绑定单硬链接读；链核对进唯一计划器。
+test("FR-2.6 单 1 评审返修：条目与 store 形状封闭（多余字段 / evil 事件名 / 顶层多键拒）、store 读写不认 symlink 与 FIFO、chain 核对在计划器", () => {
+  const template = { chain: "claude", agent_uid: "agent_m5claude", transport_open_id: "ou_bot", frank_sender_id: "u_frank", chat_id: "oc_x", default_freshness_ms: 600000 };
+  const good = planSubscriptionEntry({ runtime: "claude", template, domainKey: "/p", chatId: "oc_a" });
+  assert.equal(good.ok, true, good.reason ?? "");
+  assert.equal(validateSubscription(good.entry).ok, true, "写方自产条目本身过校验（收紧不许误杀写方）");
+  assert.match(validateSubscription({ ...good.entry, evil: 1 }).problems.join(","), /extra:evil/u, "根级多余字段拒");
+  assert.match(validateSubscription({ ...good.entry, scope: { ...good.entry.scope, x: 1 } }).problems.join(","), /scope\.extra:x/u, "scope 多余字段拒");
+  assert.match(validateSubscription({ ...good.entry, constraints: { freshness_ms: 1000, y: 2 } }).problems.join(","), /constraints\.extra:y/u, "constraints 多余字段拒");
+  assert.match(validateSubscription({ ...good.entry, scope: { ...good.entry.scope, event_types: ["evil.event"] } }).problems.join(","), /scope\.event_types/u, "事件名 const：只有 im.message.receive");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fr26-review-"));
+  const extraTop = path.join(dir, "extra.json");
+  fs.writeFileSync(extraTop, JSON.stringify({ schema_version: "1.0", artifact_type: "feishu_bridge_subscription_store", subscriptions: [], sneak: 1 }));
+  assert.match(loadSubscriptionStore({ file: extraTop }).problems.join(","), /extra:sneak/u, "store 顶层封闭");
+  fs.writeFileSync(path.join(dir, "target.json"), "{}");
+  fs.symlinkSync(path.join(dir, "target.json"), path.join(dir, "link.json"));
+  assert.match(loadSubscriptionStore({ file: path.join(dir, "link.json") }).problems.join(","), /symlink/u, "读不认 symlink");
+  execFileSync("mkfifo", [path.join(dir, "fifo.json")]);
+  assert.match(loadSubscriptionStore({ file: path.join(dir, "fifo.json") }).problems.join(","), /不是普通文件/u, "读不认 FIFO（O_NONBLOCK 不挂）");
+  assert.equal(planSubscriptionChange({ store: { subscriptions: [] }, runtime: "codex", template, domainKey: "/p", chatId: "oc_a" }).reason,
+    "chain_mismatch", "Claude 模板配 runtime codex 在唯一计划器里拒，不靠 CLI");
+  const w = applySubscriptionChange({ file: path.join(dir, "link.json"), change: { action: "add", runtime: "claude", template, domainKey: "/p", chatId: "oc_b" } });
+  assert.equal(w.reason, "store_not_regular_file", "写路径 lstat 拒 symlink store：" + JSON.stringify(w));
 });
 
 test("控制事务的换绑窗口（评审 #97）：事务锁内核验通过之后、策略写锁取得之前登记表换了绑定 → 写锁内前置条件拒写、模式不变、不落 consumed、入口非零", () => {

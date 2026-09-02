@@ -15,6 +15,7 @@ export const MESSAGE_RECEIVE_EVENT = "im.message.receive";
 
 export const SUBSCRIPTION_REJECT = Object.freeze({
   PROJECTION_INVALID: "subscription_projection_invalid",
+  CONTROL_PLANE_INVALID: "control_plane_invalid",
   ENDPOINT_MISMATCH: "endpoint_mismatch",
   NO_ACTIVE_SUBSCRIPTION: "no_active_subscription",
   AGENT_MISMATCH: "agent_mismatch",
@@ -50,6 +51,17 @@ export function legacyEndpointId({ runtime, agentUid }) {
 
 export function validateSubscription(subscription) {
   const problems = [];
+  // **封闭形状**（评审 PR #112 P1：这里已是不可信落盘对象的入口，判据要对齐 schema 的
+  // additionalProperties:false —— 多余字段一律说不清，运行时接受的集合不许比 Schema 大）。
+  const closed = (obj, allowed, label) => {
+    if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return;
+    for (const k of Object.keys(obj)) if (!allowed.includes(k)) problems.push(label + "extra:" + k);
+  };
+  closed(subscription, ["schema_version", "artifact_type", "subscription_id", "version",
+    "endpoint_id", "domain_id", "status", "scope", "constraints"], "");
+  closed(subscription?.scope, ["agent_uid", "transport_open_id", "chat_id", "sender_ids",
+    "event_types", "sender_roles"], "scope.");
+  closed(subscription?.constraints, ["freshness_ms"], "constraints.");
   if (subscription?.schema_version !== SUBSCRIPTION_SCHEMA_VERSION) problems.push("schema_version");
   if (subscription?.artifact_type !== SUBSCRIPTION_ARTIFACT_TYPE) problems.push("artifact_type");
   for (const field of ["subscription_id", "endpoint_id", "domain_id"]) {
@@ -64,7 +76,10 @@ export function validateSubscription(subscription) {
   if (uniqueStrings(scope?.sender_ids).length !== scope?.sender_ids?.length || !scope?.sender_ids?.length) {
     problems.push("scope.sender_ids");
   }
-  if (uniqueStrings(scope?.event_types).length !== scope?.event_types?.length || !scope?.event_types?.length) {
+  if (!Array.isArray(scope?.event_types) || !scope.event_types.length ||
+      uniqueStrings(scope.event_types).length !== scope.event_types.length ||
+      !scope.event_types.every((e) => e === MESSAGE_RECEIVE_EVENT)) {
+    // schema 的 const：目前只有 im.message.receive 有消费者；别的事件名一律说不清（评审 PR #112 P1）
     problems.push("scope.event_types");
   }
   // sender_roles 可选；在场就必须封闭、不重复、角色在枚举里，且每个 sender_ids 里的 id 都得在表里（sender_ids 是授权基准，表不能少它）
@@ -209,22 +224,33 @@ export function buildLegacySubscriptionReadModel({
  */
 function mergeControlPlaneIntoModel(model, controlPlane) {
   if (controlPlane == null) return model;
+  // **文件在场但说不清 ≠ 没装控制面**（评审 PR #112 P1：这里退回纯 legacy 是 fail-open ——
+  // 暂停 / 收紧过的订阅会在文件损坏时重新开放）。权威读取必须拒绝；展示层要 legacy 诊断
+  // 就从 legacy 字段拿，认领器看到 ok:false 一律不认领。缺席（absent）与空 store 才兼容 legacy。
+  const failClosed = (problems) => ({
+    ok: false, reason: SUBSCRIPTION_REJECT.CONTROL_PLANE_INVALID, problems, legacy: model,
+  });
   if (controlPlane.ok !== true || !Array.isArray(controlPlane.subscriptions)) {
-    return { ...model, control_plane: { ok: false, problems: controlPlane.problems ?? ["control_plane_invalid"] } };
+    return failClosed(controlPlane.problems ?? ["control_plane_invalid"]);
   }
   const problems = [];
   const byId = new Map(model.subscriptions.map((s) => [s.subscription_id, s]));
   let added = 0;
   let overridden = 0;
+  let otherEndpoint = 0;
   for (const entry of controlPlane.subscriptions) {
     const valid = validateSubscription(entry);
     if (!valid.ok) { problems.push("subscription:" + (entry?.subscription_id ?? "?") + ":" + valid.problems.join(",")); continue; }
+    // **endpoint 隔离**（评审 PR #112 P1）：store 是机器级共享文件，别的链（endpoint）的条目
+    // 不进本模型 —— 混进来的话 Claude 模型里会出现 Codex 订阅。跳过要计数，可诊断。
+    if (entry.endpoint_id !== model.endpoint_id) { otherEndpoint += 1; continue; }
     if (byId.has(entry.subscription_id)) overridden += 1; else added += 1;
     byId.set(entry.subscription_id, entry);
   }
-  if (problems.length) return { ...model, control_plane: { ok: false, problems } };
+  if (problems.length) return failClosed(problems);
   if (!controlPlane.subscriptions.length) return model;
-  return { ...model, subscriptions: [...byId.values()], control_plane: { ok: true, added, overridden } };
+  return { ...model, subscriptions: [...byId.values()],
+    control_plane: { ok: true, added, overridden, other_endpoint: otherEndpoint } };
 }
 
 const reject = (reason, extra = {}) => ({ ok: false, reason, ...extra });

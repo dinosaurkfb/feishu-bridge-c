@@ -24,9 +24,10 @@
  * 校验器是 validateSubscription。锁原语与 routes / registry / template 同一套 symlink 锁。
  */
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
+import { acquirePublishLock, commitWhileHeld, releasePublishLock } from "./registry.mjs";
 import { senderTable } from "./sender-roles.mjs";
 import {
   MESSAGE_RECEIVE_EVENT, SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_SCHEMA_VERSION,
@@ -55,16 +56,32 @@ export function subscriptionControlId({ runtime, agentUid, domainKey, chatId }) 
  */
 export function loadSubscriptionStore({ file } = {}) {
   if (typeof file !== "string" || !path.isAbsolute(file)) return { ok: false, problems: ["file_required_absolute"] };
+  // fd 绑定读（评审 PR #112 P1）：O_NOFOLLOW|O_NONBLOCK 打开、同 fd fstat 确认普通**单硬链接**
+  // 文件、从这个 fd 读 —— 符号链接 / FIFO / 目录 / 硬链接别名都说不清。
   let raw;
+  let fd = null;
   try {
-    raw = fs.readFileSync(file, "utf-8");
-  } catch (err) {
-    if (err.code === "ENOENT") return { ok: true, absent: true, subscriptions: [] };
-    return { ok: false, problems: ["store_unreadable:" + String(err.code ?? err.message)] };
+    try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW); }
+    catch (err) {
+      if (err.code === "ENOENT") return { ok: true, absent: true, subscriptions: [] };
+      return { ok: false, problems: ["store_unreadable:" + (err.code === "ELOOP" ? "symlink" : String(err.code ?? err.message))] };
+    }
+    let st;
+    try { st = fs.fstatSync(fd); } catch (err) { return { ok: false, problems: ["store_unreadable:fstat:" + String(err.code ?? err.message)] }; }
+    if (!st.isFile()) return { ok: false, problems: ["store_unreadable:不是普通文件"] };
+    if (st.nlink !== 1) return { ok: false, problems: ["store_unreadable:有 " + st.nlink + " 个目录项（硬链接别名）"] };
+    try { raw = fs.readFileSync(fd, "utf-8"); } catch (err) { return { ok: false, problems: ["store_unreadable:" + String(err.code ?? err.message)] }; }
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
   }
   let parsed;
   try { parsed = JSON.parse(raw); } catch (err) { return { ok: false, problems: ["store_bad_json:" + err.message] }; }
   const problems = [];
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return { ok: false, problems: ["store_not_object"] };
+  // 顶层封闭形状（评审 PR #112 P1）：多余的键说不清 —— 落盘对象的入口不许比写方能产出的集合大
+  for (const k of Object.keys(parsed)) {
+    if (!["schema_version", "artifact_type", "subscriptions"].includes(k)) problems.push("extra:" + k);
+  }
   if (parsed?.schema_version !== SUBSCRIPTION_STORE_SCHEMA_VERSION) problems.push("schema_version");
   if (parsed?.artifact_type !== SUBSCRIPTION_STORE_ARTIFACT_TYPE) problems.push("artifact_type");
   if (!Array.isArray(parsed?.subscriptions)) problems.push("subscriptions");
@@ -125,6 +142,9 @@ export function planSubscriptionEntry({ runtime, template, domainKey, chatId, fr
 export function planSubscriptionChange({ store, runtime, template, domainKey, chatId, freshnessMs, action = "add" } = {}) {
   if (!["add", "pause", "resume", "remove"].includes(action)) return { ok: false, reason: "action_unknown" };
   if (!store || !Array.isArray(store.subscriptions)) return { ok: false, reason: "store_invalid" };
+  // 链核对（评审 PR #112 P2）：Claude 模板配 runtime:"codex" 会生成一条合法但归错链的订阅 ——
+  // 在唯一计划器里拒，不只靠 CLI 传对参数。
+  if (template?.chain !== runtime) return { ok: false, reason: "chain_mismatch", detail: "模板 chain=" + String(template?.chain) + " ≠ runtime=" + String(runtime) };
   const id = subscriptionControlId({ runtime, agentUid: template?.agent_uid, domainKey, chatId });
   if (action === "add") {
     if (store.subscriptions.some((s) => s.subscription_id === id)) return { ok: false, reason: "subscription_exists", subscription_id: id };
@@ -189,13 +209,35 @@ export function applySubscriptionChange({ file, change, now = new Date() } = {})
         fs.copyFileSync(file, backup);
       }
     } catch (err) { return (result = { ok: false, reason: "backup_failed", detail: err.message }); }
-    const tmp = file + ".tmp." + process.pid;
+    // 唯一临时名 + O_EXCL|O_NOFOLLOW + fsync；rename 放进 commitWhileHeld —— 锁被换 / 丢
+    // 就不提交（评审 PR #112 P1：固定 tmp 名可被预置 symlink 把外部文件写穿；rename 前
+    // 失去锁的旧写方不许覆盖新写方的成果）。
+    const tmp = file + ".tmp." + process.pid + "." + crypto.randomBytes(6).toString("hex");
     try {
-      fs.writeFileSync(tmp, body, { mode: 0o600 });
-      fs.renameSync(tmp, file);
+      const wfd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+      try {
+        const buf = Buffer.from(body, "utf-8");
+        let off = 0;
+        while (off < buf.length) off += fs.writeSync(wfd, buf, off);
+        fs.fsyncSync(wfd);
+      } finally { try { fs.closeSync(wfd); } catch { /* 已关 */ } }
     } catch (err) {
       try { fs.rmSync(tmp, { force: true }); } catch { /* 已不在 */ }
       return (result = { ok: false, reason: "store_unwritable", detail: err.message, backup });
+    }
+    let commitErr = null;
+    const fenced = commitWhileHeld(lockDir, () => {
+      try { fs.renameSync(tmp, file); } catch (err) { commitErr = err; }
+      return { done: true };
+    });
+    // fenced：锁被换 / 丢 → { ok:false, reason:"lock_lost" }（不提交）；成功 → fn 的返回值
+    if (!fenced || fenced.ok === false) {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* 已不在 */ }
+      return (result = { ok: false, reason: "store_commit_refused", detail: String(fenced?.reason ?? "commit_failed"), backup });
+    }
+    if (commitErr) {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* 已不在 */ }
+      return (result = { ok: false, reason: "store_unwritable", detail: commitErr.message, backup });
     }
     let back;
     try { back = fs.readFileSync(file, "utf-8"); } catch (err) { return (result = { ok: false, reason: "readback_failed", detail: err.message, backup }); }

@@ -126,5 +126,8 @@ if (isDirectRun(import.meta.url)) {
   });
   const out = describeStoreWrite(done, parsed.store);
   process.stdout.write(out.lines.join("\n") + "\n");
+  if (out.exitCode === 0) {
+    process.stdout.write("注意：store 尚未接入权威投影与切流 —— 这次落盘暂不改变生产认领 / 路由（接入是切流单的事）。\n");
+  }
   process.exit(out.exitCode);
 }

@@ -51,7 +51,7 @@ import { LAUNCHCTL_ENV, PHASE_TEXT, loadedPhase } from "./launchd-job.mjs";
 import { readGate, maintenanceGatePath } from "./maintenance-gate-core.mjs";
 import { inspectInstalledSurface, installedSurfacePath } from "./installed-surface.mjs";
 import { inspectMaintenanceDir, maintenanceDir } from "./maintenance/journal.mjs";
-import { loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, storeHashState, subscriptionAuditPendingPath, subscriptionStorePath } from "./subscription-store.mjs";
+import { loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, storeHashState, subscriptionAuditPendingPath, subscriptionStorePath, auditOperationIdProblem } from "./subscription-store.mjs";
 
 /** 到期预警阈值：7 天内到期就点名。**明写**，不藏在比较式里。 */
 export const EXPIRY_WARN_MS = 7 * 24 * 3600 * 1000;
@@ -404,21 +404,28 @@ export function runDoctor({
     let ok, detail, next = null;
     if (store.ok === false) {
       ok = false;
-      detail = "订阅 store 读不出来（" + (store.problems ?? []).slice(0, 3).join("；") + "）—— store 损坏会退回纯 legacy，被暂停/收紧的订阅可能重新开放，请人工核对 " + file;
+      // #R13 P2-1：真实语义是 fail-closed —— 订阅判定一律按不在白名单拒绝，不会退回 legacy 放行；
+      // 但控制面失明、无法对账，照旧红。
+      detail = "订阅 store 读不出来（" + (store.problems ?? []).slice(0, 3).join("；") + "）—— 订阅判定 fail-closed（一律拒绝，不会退回放行），但控制面失明且无法对账，请人工核对 " + file;
     } else if (pending.ok === false) {
       ok = false;
       detail = "待补记读不出来（" + ((pending.problems ?? []).slice(0, 2).join("；") || pending.detail || pending.reason || "说不清") + "）—— 它持续阻断后续写入，请人工核对 " + subscriptionAuditPendingPath(file);
     } else if (!pending.absent && pending.pending) {
       ok = false;
-      detail = "有待补记（op " + short(pending.pending.operation_id) + "）—— 上次变更的审计没写成，会持续阻断后续写入；对账先看它";
-      next = "node scripts/register-subscription.mjs --resolve-audit-conflict " + shellQuote(pending.pending.operation_id) + " --store " + shellQuote(file) + " （预览；确认后自行加 --apply）";
+      // #R13 P1-2 双保险：形状判据（auditOperationIdProblem）+ displaySafe 不改写才回显；
+      // 说不清的一律不回显原值，next 也不给（不把不可信值拼进命令）。
+      const op = pending.pending.operation_id;
+      const opEcho = auditOperationIdProblem(op) === null && displaySafe(op) === op;
+      detail = "有待补记" + (opEcho ? "（op " + op + "）" : "（operation_id 说不清，原值不回显，见 " + subscriptionAuditPendingPath(file) + "）") + " —— 上次变更的审计没写成，会持续阻断后续写入；对账先看它";
+      next = opEcho ? "node scripts/register-subscription.mjs --resolve-audit-conflict " + shellQuote(op) + " --store " + shellQuote(file) + " （预览；确认后自行加 --apply）" : null;
     } else if (audit.ok === false) {
       ok = false;
       detail = "订阅审计读不出来（" + ((audit.problems ?? []).slice(0, 2).join("；") || audit.detail || audit.reason || "说不清") + "）—— 对账靠它，读不出只能按说不清处理，请人工核对 " + file + ".audit.jsonl";
-    } else if (store.absent && audit.events.length > 0) {
+    } else if (store.absent && !audit.absent) {
+      // #R13 P1-1：审计制品在场（含空文件）而 store 缺席 —— 不算未启用，红。
       ok = false;
-      detail = "订阅审计有 " + audit.events.length + " 条记录但 store 缺席（store 被删或路径漂移），对账对不上，请人工核对 " + file;
-    } else if (store.absent) {
+      detail = "store 缺席但订阅审计在场（" + audit.events.length + " 条记录）—— store 被删或路径漂移，对账对不上，请人工核对 " + file;
+    } else if (store.absent && audit.absent) {
       ok = true;
       detail = "未启用订阅控制面（store 与审计都不在）";
     } else if (audit.absent || audit.events.length === 0) {

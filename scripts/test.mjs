@@ -213,7 +213,7 @@ import {
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
 import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION_KEYED, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, selectPendingSubscriptionClaim, stableControlId, subscriptionIdFor, validateSubscription, claimable } from "./subscription.mjs";
-import { applySubscriptionChange, appendSubscriptionAuditLine, buildSubscriptionAuditEvent, classifySubscriptionAuditPending, clearSubscriptionAuditPending, loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, mergedSubscriptionView, planSubscriptionChange, planSubscriptionEntry, resolveSubscriptionAuditConflict, subscriptionAuditPendingPath, subscriptionStorePath, SUBSCRIPTION_STORE_ARTIFACT_TYPE, SUBSCRIPTION_STORE_SCHEMA_VERSION, validateSubscriptionAuditEvent, validateSubscriptionAuditPending, writeSubscriptionAuditPending } from "./subscription-store.mjs";
+import { applySubscriptionChange, appendSubscriptionAuditLine, auditOperationIdProblem, buildSubscriptionAuditEvent, classifySubscriptionAuditPending, clearSubscriptionAuditPending, loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, mergedSubscriptionView, planSubscriptionChange, planSubscriptionEntry, resolveSubscriptionAuditConflict, subscriptionAuditPendingPath, subscriptionStorePath, SUBSCRIPTION_STORE_ARTIFACT_TYPE, SUBSCRIPTION_STORE_SCHEMA_VERSION, validateSubscriptionAuditEvent, validateSubscriptionAuditPending, writeSubscriptionAuditPending } from "./subscription-store.mjs";
 import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
@@ -16887,10 +16887,12 @@ test("doctor：⑫ 订阅对账 —— store/审计三态 × 对账；未启用�
     return applySubscriptionChange({ file: storeFile, change: { action: "add", runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" }, now: new Date(at) });
   };
 
-  // 未启用：store / 审计 / 待补记都不在 → 绿，不红（回归：未启用机器全段不红）。
+  // 未启用：store / 审计 / 待补记都不在 → ⑫ 自身绿（真实契约：不把 overall 染红 + 新增段自身绿；
+  // #R13 P2-2：doctor 输出天然多了 ⑫ 段，「逐字节不变」本就不成立，不断那个）。
   let r = doctorReport(m.run());
   assert.equal(checkOf(r, "subscription_audit").ok, true, "未启用不红：" + checkOf(r, "subscription_audit").detail);
   assert.match(checkOf(r, "subscription_audit").detail, /未启用/u);
+  assert.equal(r.checks.some((x) => x.id === "subscription_audit" && x.ok === false), false, "⑫ 不给 overall 贡献红项：" + checkOf(r, "subscription_audit").detail);
 
   // 健康：store 1 条 active + 审计 1 行，对账一致 → 绿；不泄 chat_id / open_id / agent_uid。
   assert.equal(seed("2026-09-03T00:00:00.000Z").ok, true, "seed add");
@@ -16959,6 +16961,88 @@ test("doctor：⑫ 订阅对账 —— store/审计三态 × 对账；未启用�
   assert.equal(m.snapshot(), snap, "doctor 一个字节都不许改");
 });
 
+test("#R13 doctor ⑫ 返修：2×2 缺席矩阵补格（审计制品在场 + store 缺 = 红，含空审计）；op id 封闭形状（oc_/换行/大写拒，validate 唯一判据）+ doctor 双保险不回显", () => {
+  const m = doctorMachine();
+  const storeFile = path.join(m.home, ".claude", "feishu-bridge", "subscriptions.json");
+  const auditFile = storeFile + ".audit.jsonl";
+  const pendingFile = subscriptionAuditPendingPath(storeFile);
+  fs.mkdirSync(path.dirname(storeFile), { recursive: true });
+  const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  const c = (rep) => checkOf(rep, "subscription_audit");
+  const OP_LOCATOR = "oc_abcdef1234567890abcdef1234567890";
+
+  // ── 判据单元：auditOperationIdProblem 分支逐字（触发条件 / 正向 / 反向）——这是变异防线，
+  // 砍掉收紧（校验器或判据）这里先红。
+  assert.equal(auditOperationIdProblem("op-1"), null);
+  assert.equal(auditOperationIdProblem("op-2026-09-02t15-37-24-961z-a1b2c3d4"), null, "apply 小写化后的真实形状");
+  assert.match(auditOperationIdProblem(123), /operation_id 不是字符串/u);
+  assert.match(auditOperationIdProblem(null), /operation_id 不是字符串/u);
+  assert.match(auditOperationIdProblem(""), /operation_id 不能为空/u);
+  assert.match(auditOperationIdProblem("OP-1"), /只能是小写字母\/数字\/连字符/u, "大写拒");
+  assert.match(auditOperationIdProblem("op_1"), /只能是小写字母\/数字\/连字符/u, "下划线拒");
+  assert.match(auditOperationIdProblem("op-1\ny"), /不许控制字符/u, "换行拒");
+  assert.match(auditOperationIdProblem("o".repeat(65)), /1-64 位/u, "超长拒");
+  for (const bad of [OP_LOCATOR, "om_12345", "omt_12345", "ou_12345"]) {
+    assert.match(auditOperationIdProblem(bad), /不许用 locator 形状前缀（oc_\/om_\/omt_\/ou_/u, bad);
+  }
+
+  // ── validate 层（唯一校验器）：事件行与待补记都过同一判据。
+  const evOk = buildSubscriptionAuditEvent({ at: "2026-09-03T00:00:00.000Z", action: "add", subscriptionId: "sub_x", versionAfter: 1, storeBytesSha256: "0123456789abcdef", operationId: "op-1" });
+  assert.equal(validateSubscriptionAuditEvent(evOk).ok, true, JSON.stringify(validateSubscriptionAuditEvent(evOk)));
+  assert.match(validateSubscriptionAuditEvent({ ...evOk, operation_id: OP_LOCATOR }).problems.join(","), /operation_id/u, "oc_ 形事件拒");
+  assert.match(validateSubscriptionAuditEvent({ ...evOk, operation_id: "op-1\ny" }).problems.join(","), /operation_id/u, "换行事件拒");
+  const badPending = { schema_version: "1.0", operation_id: OP_LOCATOR, before_sha256: null, after_sha256: "0123456789abcdef",
+    audit_size_before: 0, audit_sha256_before: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", event: { ...evOk, operation_id: OP_LOCATOR } };
+  assert.match(validateSubscriptionAuditPending(badPending).problems.join(","), /operation_id/u, "oc_ 形待补记拒");
+
+  // 写方一致性：apply 真生成的 op id 必过新形状（现有合法值不许被收紧误杀）。
+  assert.equal(applySubscriptionChange({ file: storeFile, change: { action: "add", runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" }, now: new Date("2026-09-03T00:00:00.000Z") }).ok, true, "seed add");
+  const realOp = loadSubscriptionAudit({ file: storeFile }).events[0].operation_id;
+  assert.equal(auditOperationIdProblem(realOp), null, "apply 生成的 op id " + realOp);
+
+  // 读方防线：手写审计行带 oc_ op id → 行级 problems（好行照常返回），不静默吞。
+  fs.appendFileSync(auditFile, JSON.stringify({ ...evOk, operation_id: OP_LOCATOR }) + "\n");
+  const mixed = loadSubscriptionAudit({ file: storeFile });
+  assert.equal(mixed.ok, false, "含坏行 → ok=false");
+  assert.match(mixed.problems.join(","), /operation_id/u, mixed.problems.join(","));
+
+  // ── 矩阵缺格（#R13 P1-1）：审计制品在场 + store 缺席 = 红，**含空审计文件** ——
+  // 变异防线：把判据改回 audit.events.length > 0，下面第一支就转红。
+  fs.writeFileSync(auditFile, "");
+  fs.rmSync(storeFile, { force: true });
+  let r = doctorReport(m.run());
+  assert.equal(c(r).ok, false, c(r).detail);
+  assert.match(c(r).detail, /store 缺席但订阅审计在场（0 条记录）/u, c(r).detail);
+  // 有记录 + store 缺 → 红（点名条数）。
+  fs.writeFileSync(auditFile, JSON.stringify(evOk) + "\n");
+  r = doctorReport(m.run());
+  assert.equal(c(r).ok, false, c(r).detail);
+  assert.match(c(r).detail, /store 缺席但订阅审计在场（1 条记录）/u, c(r).detail);
+  // 双缺（另一角）仍绿未启用，不因收紧误伤。
+  fs.rmSync(auditFile, { force: true });
+  r = doctorReport(m.run());
+  assert.equal(c(r).ok, true, c(r).detail);
+  assert.match(c(r).detail, /未启用/u);
+
+  // ── op id 泄露两支（#R13 P1-2）：形状收紧后 oc_ 形 / 换行 op 的待补记在 load 层判损坏 →
+  // 「待补记读不出来」红，全 report 不含明文、不生成 next。
+  for (const opBad of [OP_LOCATOR, "op-x\ny"]) {
+    fs.writeFileSync(pendingFile, JSON.stringify({ ...badPending, operation_id: opBad, event: { ...evOk, operation_id: opBad } }));
+    r = doctorReport(m.run());
+    const cc = c(r);
+    assert.equal(cc.ok, false, cc.detail);
+    assert.match(cc.detail, /待补记读不出来（operation_id/u, "点名 operation_id 问题码，不带原值：" + cc.detail);
+    assert.equal(cc.next, null, "说不清不给 next：" + cc.next);
+    assert.equal(JSON.stringify(r).includes(opBad), false, "全 report 不含原值：" + opBad);
+  }
+  fs.rmSync(pendingFile, { force: true });
+
+  // ── #R13 P2-1：store 损坏文案 = fail-closed 真实语义（不复活「退回 legacy 放行」的旧说法）。
+  fs.writeFileSync(storeFile, "{ 非法");
+  r = doctorReport(m.run());
+  assert.match(c(r).detail, /fail-closed（一律拒绝，不会退回放行）/u, c(r).detail);
+  assert.doesNotMatch(c(r).detail, /退回纯 legacy|重新开放/u, c(r).detail);
+});
 test("claim 写原语：扩展对象覆盖不了固定身份字段", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-claimfix-"));
   const r = acquireClaim({ claimsDir: dir, messageId: "om_1", logicalTaskKey: "k",

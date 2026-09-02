@@ -146,6 +146,21 @@ const STORE_HASH16 = /^[0-9a-f]{16}$/u;
 const AUDIT_SHA256 = /^[0-9a-f]{64}$/u;
 // 空审计（从未写 / 读不齐当空）的基线哈希：sha256("")。
 const EMPTY_AUDIT_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+/** 审计操作 id 封闭形状（#R13 P1-2：只要求非空字符串时，oc_… 形状的 op id 被原样回显即完整
+ * 泄露 chat_id locator；控制字符也能进人类输出）。字符集不含下划线，天然排除 oc_/om_/omt_/ou_
+ * 系 locator，但前缀仍显式拒 —— 防判据漂移时给清楚文案。 */
+export const SUBSCRIPTION_AUDIT_OPERATION_ID_RE = /^[a-z0-9-]{1,64}$/u;
+const AUDIT_OPERATION_ID_FORBIDDEN_PREFIXES = ["oc_", "om_", "omt_", "ou_"];
+/** operation_id 判据唯一入口：合法返回 null，非法返回人话（含 JSON.stringify 原值）。
+ * 写方（apply / buildSubscriptionAuditEvent）与读方（事件行 / 待补记）共用，不许第二份正则。 */
+export function auditOperationIdProblem(id) {
+  if (typeof id !== "string") return "operation_id 不是字符串（" + JSON.stringify(id ?? null) + "）";
+  if (id === "") return "operation_id 不能为空";
+  // 前缀判据在字符集之前：oc_ 系 locator 含下划线，若先撞字符集分支这分支永远不可达。
+  if (AUDIT_OPERATION_ID_FORBIDDEN_PREFIXES.some((p) => id.startsWith(p))) return "operation_id 不许用 locator 形状前缀（oc_/om_/omt_/ou_，原值 " + JSON.stringify(id) + "）";
+  if (!SUBSCRIPTION_AUDIT_OPERATION_ID_RE.test(id)) return "operation_id 只能是小写字母/数字/连字符、1-64 位，不许控制字符（原值 " + JSON.stringify(id) + "）";
+  return null;
+}
 
 /**
  * 审计行的**唯一封闭校验器**（评审 #115 P1-2）。写方（追加时构造的行）与读方
@@ -164,7 +179,7 @@ export function validateSubscriptionAuditEvent(event) {
   if (has("schema_version") && event.schema_version !== SUBSCRIPTION_AUDIT_SCHEMA_VERSION) problems.push("schema_version");
   if (has("at") && !isCanonicalIso(event.at)) problems.push("at_not_canonical");
   if (has("action") && !SUBSCRIPTION_AUDIT_ACTIONS.includes(event.action)) problems.push("action:" + String(event.action));
-  if (has("operation_id") && (typeof event.operation_id !== "string" || event.operation_id.trim() === "")) problems.push("operation_id_empty");
+  if (has("operation_id") && auditOperationIdProblem(event.operation_id) !== null) problems.push("operation_id");
   if (has("subscription_id") && (typeof event.subscription_id !== "string" || event.subscription_id.trim() === "")) problems.push("subscription_id_empty");
   if (has("store_bytes_sha256") && (typeof event.store_bytes_sha256 !== "string" || !STORE_HASH16.test(event.store_bytes_sha256))) problems.push("store_bytes_sha256");
   if (has("version_after")) {
@@ -199,7 +214,7 @@ function validateAuditPending(p) {
   for (const k of SUBSCRIPTION_AUDIT_PENDING_KEYS) if (!Object.hasOwn(p, k)) problems.push("missing:" + k);
   const has = (k) => Object.hasOwn(p, k);
   if (has("schema_version") && p.schema_version !== SUBSCRIPTION_AUDIT_PENDING_SCHEMA) problems.push("schema_version");
-  if (has("operation_id") && (typeof p.operation_id !== "string" || !p.operation_id)) problems.push("operation_id");
+  if (has("operation_id") && auditOperationIdProblem(p.operation_id) !== null) problems.push("operation_id");
   if (has("operation_id") && has("event") && typeof p.event === "object" && p.event !== null && !Array.isArray(p.event) && p.operation_id !== p.event.operation_id) problems.push("operation_id_mismatch");
   if (has("after_sha256") && (typeof p.after_sha256 !== "string" || !STORE_HASH16.test(p.after_sha256))) problems.push("after_sha256");
   if (has("before_sha256") && p.before_sha256 !== null && (typeof p.before_sha256 !== "string" || !STORE_HASH16.test(p.before_sha256))) problems.push("before_sha256");
@@ -882,7 +897,8 @@ export function applySubscriptionChange({ file, change, now = new Date() } = {})
     }
     const beforeSha = beforeSh.state === "absent" ? null : beforeSh.sha256;
     const afterSha = crypto.createHash("sha256").update(Buffer.from(body, "utf-8")).digest("hex").slice(0, 16);
-    const operationId = "op-" + now.toISOString().replace(/[:.]/gu, "-") + "-" + crypto.randomBytes(4).toString("hex");
+    // #R13 P1-2：op id 进审计与人类输出，小写化保证过 auditOperationIdProblem（ISO 的大写 T/Z 也不许）。
+    const operationId = ("op-" + now.toISOString().replace(/[:.]/gu, "-") + "-" + crypto.randomBytes(4).toString("hex")).toLowerCase();
     const auditEvent = buildSubscriptionAuditEvent({
       operationId,
       at: now.toISOString(),

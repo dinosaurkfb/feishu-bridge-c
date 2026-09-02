@@ -16876,8 +16876,21 @@ test("doctor：好机器 —— 全部 pass、退出码 0；沙箱里不注入 l
   assert.equal(r3.overall, "blocked");
 });
 
-test("doctor：⑫ 订阅对账 —— store/审计三态 × 对账；未启用不红；待补记指路；只读；不泄 locator（真实进程）", () => {
+test("doctor：⑫ 订阅对账 —— store/审计三态 × 对账；未启用段自身绿、不把整体染红；待补记指路；只读；不泄 locator（真实进程）", () => {
   const m = doctorMachine();
+  // 未启用契约（P2-2 真实契约，不硬造逐字节断言）：在一台其它检查全绿的机器上，订阅关闭 → 段自身绿，
+  // 且不把整体染红（保持 incomplete，不是 blocked）。复用「好机器」装配：installRuntime + 项目 + 路由 + provider；
+  // 不注入 launchctl → codex_drain/兜底 unknown → incomplete（无任何 fail）。
+  const good = doctorMachine({ installRuntime: true });
+  const goodProj = good.project("good", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  good.writeTables({
+    projects: [{ id: "good", root: goodProj, root_message_id: "om_root_good", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }],
+    routes: [{ ...good.route("self"), handler: path.join(good.home, ".claude", "feishu-bridge", "runtime", "current", "scripts", "inbound.mjs"), default: true }],
+    sessions: { "session_aaaaaaaaaaaa": "self" }, providers: [good.provider("self")],
+  });
+  const goodReport = doctorReport(good.run());
+  assert.equal(checkOf(goodReport, "subscription_audit").ok, true, "未启用段自身绿：" + checkOf(goodReport, "subscription_audit").detail);
+  assert.equal(goodReport.overall, "incomplete", "未启用不把整体染红（无 false）：" + JSON.stringify(goodReport.checks.filter((c) => c.ok === false).map((c) => c.id)));
   const storeFile = path.join(m.home, ".claude", "feishu-bridge", "subscriptions.json");
   const auditFile = storeFile + ".audit.jsonl";
   const pendingFile = subscriptionAuditPendingPath(storeFile);
@@ -16957,6 +16970,77 @@ test("doctor：⑫ 订阅对账 —— store/审计三态 × 对账；未启用�
   const snap = m.snapshot();
   doctorReport(m.run());
   assert.equal(m.snapshot(), snap, "doctor 一个字节都不许改");
+});
+
+test("doctor：⑫ 矩阵补缺与 op 形状 —— store 缺席×审计在场（空/有事件）应红；locator 前缀/控制字符 op 待补记拒且不泄（P1-1/P1-2）", () => {
+  const m = doctorMachine();
+  const storeFile = path.join(m.home, ".claude", "feishu-bridge", "subscriptions.json");
+  const auditFile = storeFile + ".audit.jsonl";
+  const pendingFile = subscriptionAuditPendingPath(storeFile);
+  const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  const seed = (at) => {
+    fs.rmSync(storeFile, { force: true }); fs.rmSync(auditFile, { force: true }); fs.rmSync(pendingFile, { force: true }); fs.rmSync(storeFile + ".lock", { recursive: true, force: true });
+    return applySubscriptionChange({ file: storeFile, change: { action: "add", runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" }, now: new Date(at) });
+  };
+
+  // P1-1 矩阵：审计空文件在场 + store 缺席 → 红（不是「未启用」）。
+  fs.mkdirSync(path.dirname(auditFile), { recursive: true });
+  fs.writeFileSync(auditFile, "");
+  let r = doctorReport(m.run());
+  let c = checkOf(r, "subscription_audit");
+  assert.equal(c.ok, false, "审计空文件在场、store 缺席 → 红：" + c.detail);
+  assert.match(c.detail, /store 缺席/u);
+
+  // P1-1 矩阵：审计有事件 + store 缺席 → 红。
+  fs.rmSync(auditFile, { force: true });
+  assert.equal(seed("2026-09-03T00:00:00.000Z").ok, true, "seed add");
+  fs.rmSync(storeFile, { force: true });
+  r = doctorReport(m.run());
+  c = checkOf(r, "subscription_audit");
+  assert.equal(c.ok, false, "审计有事件、store 缺席 → 红：" + c.detail);
+  assert.match(c.detail, /store 缺席/u);
+
+  // 回归：store 在 & 审计缺席 → null（提示，不是红）。
+  assert.equal(seed("2026-09-03T01:00:00.000Z").ok, true, "seed add");
+  fs.rmSync(auditFile, { force: true });
+  r = doctorReport(m.run());
+  c = checkOf(r, "subscription_audit");
+  assert.equal(c.ok, null, "store 在、审计缺席 → null：" + c.detail);
+  assert.match(c.detail, /审计缺席/u);
+
+  // P1-2：locator 前缀 op 的待补记被封闭校验拒 → 红且不泄；next 为空。
+  assert.equal(seed("2026-09-03T02:00:00.000Z").ok, true, "seed add");
+  const addEvent = loadSubscriptionAudit({ file: storeFile }).events[0];
+  const pendBase = { schema_version: "1.0", before_sha256: null, after_sha256: "0123456789abcdef", audit_size_before: 0, audit_sha256_before: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" };
+  const writeBadPending = (op) => { fs.rmSync(pendingFile, { force: true }); fs.writeFileSync(pendingFile, JSON.stringify({ ...pendBase, operation_id: op, event: { ...addEvent, operation_id: op } }) + "\n"); };
+  writeBadPending("oc_evil");
+  assert.equal(loadSubscriptionAuditPending({ file: storeFile }).ok, false, "locator 前缀 op 待补记拒");
+  assert.ok(loadSubscriptionAuditPending({ file: storeFile }).problems.some((p) => p.includes("operation_id_shape")), "点名形状：" + JSON.stringify(loadSubscriptionAuditPending({ file: storeFile }).problems));
+  r = doctorReport(m.run());
+  c = checkOf(r, "subscription_audit");
+  assert.equal(c.ok, false, "locator op 待补记 → 红：" + c.detail);
+  assert.equal(c.next, null, "待补记读不出 → 无命令（不泄 op）：" + c.next);
+  assert.equal(JSON.stringify(r).includes("oc_evil"), false, "不泄 locator op");
+
+  // P1-2：控制字符 op（带换行）→ 拒、红、人类输出无明文。
+  writeBadPending("op-1\nEVIL");
+  assert.equal(loadSubscriptionAuditPending({ file: storeFile }).ok, false, "含换行 op 待补记拒");
+  r = doctorReport(m.run());
+  c = checkOf(r, "subscription_audit");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /待补记读不出来/u);
+  assert.equal(JSON.stringify(r).includes("EVIL"), false, "不泄换行里的明文");
+
+  // 回归：合法 op（seed 生成、小写）的待补记仍认可并指路。
+  fs.rmSync(pendingFile, { force: true });
+  const curHash = createHash("sha256").update(fs.readFileSync(storeFile)).digest("hex").slice(0, 16);
+  const auditBuf = fs.readFileSync(auditFile);
+  assert.deepEqual(writeSubscriptionAuditPending({ file: storeFile, pending: { schema_version: "1.0", operation_id: addEvent.operation_id, before_sha256: null, after_sha256: curHash, audit_size_before: auditBuf.length, audit_sha256_before: createHash("sha256").update(auditBuf).digest("hex"), event: addEvent } }), { ok: true }, "合法 op 待补记仍写");
+  r = doctorReport(m.run());
+  c = checkOf(r, "subscription_audit");
+  assert.equal(c.ok, false, "合法 op 待补记 → 红（有待补记）：" + c.detail);
+  assert.match(c.detail, /有待补记/u);
+  assert.match(c.next, /--resolve-audit-conflict/u);
 });
 
 test("claim 写原语：扩展对象覆盖不了固定身份字段", () => {

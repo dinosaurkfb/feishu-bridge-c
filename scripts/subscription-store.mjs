@@ -147,6 +147,16 @@ const AUDIT_SHA256 = /^[0-9a-f]{64}$/u;
 // 空审计（从未写 / 读不齐当空）的基线哈希：sha256("")。
 const EMPTY_AUDIT_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+// 评审 #115 二轮 → #R13 P1-2（收口）：operation_id 收成封闭形状 —— 小写字母/数字/连字符、
+// 首字符非连字符、总长 ≤ 64，且禁止 locator 前缀（oc_/omt_/om_/ou_/on_ 是 chat_id / thread_id /
+// open_id 形状）。这保证审计行 / 待补记里的 operation_id 不可能携带 locator 或控制字符进入人类
+// 输出；doctor 回显它的命令在形状校验通过后仍过 displaySafe 双保险。
+const OPERATION_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/u;
+const OPERATION_ID_LOCATOR_PREFIX = /^(oc_|omt_|om_|ou_|on_)/u;
+const operationIdProblem = (v) =>
+  typeof v !== "string" || v.trim() === "" ? "empty"
+    : !OPERATION_ID_RE.test(v) || OPERATION_ID_LOCATOR_PREFIX.test(v) ? "shape" : null;
+
 /**
  * 审计行的**唯一封闭校验器**（评审 #115 P1-2）。写方（追加时构造的行）与读方
  * （loadSubscriptionAudit 逐行）用同一把判据 —— 不许两份：写前自校验、读时逐行校验，
@@ -164,7 +174,7 @@ export function validateSubscriptionAuditEvent(event) {
   if (has("schema_version") && event.schema_version !== SUBSCRIPTION_AUDIT_SCHEMA_VERSION) problems.push("schema_version");
   if (has("at") && !isCanonicalIso(event.at)) problems.push("at_not_canonical");
   if (has("action") && !SUBSCRIPTION_AUDIT_ACTIONS.includes(event.action)) problems.push("action:" + String(event.action));
-  if (has("operation_id") && (typeof event.operation_id !== "string" || event.operation_id.trim() === "")) problems.push("operation_id_empty");
+  if (has("operation_id")) { const opProblem = operationIdProblem(event.operation_id); if (opProblem) problems.push(opProblem === "empty" ? "operation_id_empty" : "operation_id_shape"); }
   if (has("subscription_id") && (typeof event.subscription_id !== "string" || event.subscription_id.trim() === "")) problems.push("subscription_id_empty");
   if (has("store_bytes_sha256") && (typeof event.store_bytes_sha256 !== "string" || !STORE_HASH16.test(event.store_bytes_sha256))) problems.push("store_bytes_sha256");
   if (has("version_after")) {
@@ -199,7 +209,7 @@ function validateAuditPending(p) {
   for (const k of SUBSCRIPTION_AUDIT_PENDING_KEYS) if (!Object.hasOwn(p, k)) problems.push("missing:" + k);
   const has = (k) => Object.hasOwn(p, k);
   if (has("schema_version") && p.schema_version !== SUBSCRIPTION_AUDIT_PENDING_SCHEMA) problems.push("schema_version");
-  if (has("operation_id") && (typeof p.operation_id !== "string" || !p.operation_id)) problems.push("operation_id");
+  if (has("operation_id")) { const opProblem = operationIdProblem(p.operation_id); if (opProblem) problems.push(opProblem === "empty" ? "operation_id" : "operation_id_shape"); }
   if (has("operation_id") && has("event") && typeof p.event === "object" && p.event !== null && !Array.isArray(p.event) && p.operation_id !== p.event.operation_id) problems.push("operation_id_mismatch");
   if (has("after_sha256") && (typeof p.after_sha256 !== "string" || !STORE_HASH16.test(p.after_sha256))) problems.push("after_sha256");
   if (has("before_sha256") && p.before_sha256 !== null && (typeof p.before_sha256 !== "string" || !STORE_HASH16.test(p.before_sha256))) problems.push("before_sha256");
@@ -882,7 +892,7 @@ export function applySubscriptionChange({ file, change, now = new Date() } = {})
     }
     const beforeSha = beforeSh.state === "absent" ? null : beforeSh.sha256;
     const afterSha = crypto.createHash("sha256").update(Buffer.from(body, "utf-8")).digest("hex").slice(0, 16);
-    const operationId = "op-" + now.toISOString().replace(/[:.]/gu, "-") + "-" + crypto.randomBytes(4).toString("hex");
+    const operationId = "op-" + now.toISOString().replace(/[:.]/gu, "-").toLowerCase() + "-" + crypto.randomBytes(4).toString("hex");
     const auditEvent = buildSubscriptionAuditEvent({
       operationId,
       at: now.toISOString(),

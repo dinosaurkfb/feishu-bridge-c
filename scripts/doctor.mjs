@@ -389,8 +389,10 @@ export function runDoctor({
 
   // ⑫ 订阅控制面 store 与审计对账（FR-2.6 单 4）：store / 审计 / 待补记都只读判三态，再对账
   // 「审计末条的 store_bytes_sha256 vs 当前 store 实际哈希」—— 最后一次审计之后 store 被绕过
-  // 写入或审计缺笔，这里点名。**未启用（store 与审计都不在）不红**。全只读，不算 store 里的敏感值
-  // （chat_id / sender 明细不出现 —— 审计行本来就只有哈希）。store 路径可显示。
+  // 写入或审计缺笔，这里点名。**未启用只在 store 与审计都不在时成立**；审计制品存在而 store 缺席
+  // 是「对不上」不是「未启用」→ 红；store 在而审计缺席 → null（提示，不把别的检查染红）。
+  // 全只读，不算 store 里的敏感值（chat_id / sender 明细不出现 —— 审计行本来就只有哈希）。
+  // store 路径可显示；回显 operation_id 的 next 先过形状校验（P1-2），再 displaySafe 双保险。
   {
     const file = subscriptionStorePath({ home });
     const store = loadSubscriptionStore({ file });
@@ -404,23 +406,26 @@ export function runDoctor({
     let ok, detail, next = null;
     if (store.ok === false) {
       ok = false;
-      detail = "订阅 store 读不出来（" + (store.problems ?? []).slice(0, 3).join("；") + "）—— store 损坏会退回纯 legacy，被暂停/收紧的订阅可能重新开放，请人工核对 " + file;
+      detail = "订阅 store 读不出来（" + (store.problems ?? []).slice(0, 3).join("；") + "）—— 受验读失败，订阅控制面对账说不清（fail-closed，不臆断订阅是开是关），请人工核对 " + file;
     } else if (pending.ok === false) {
       ok = false;
       detail = "待补记读不出来（" + ((pending.problems ?? []).slice(0, 2).join("；") || pending.detail || pending.reason || "说不清") + "）—— 它持续阻断后续写入，请人工核对 " + subscriptionAuditPendingPath(file);
     } else if (!pending.absent && pending.pending) {
       ok = false;
-      detail = "有待补记（op " + short(pending.pending.operation_id) + "）—— 上次变更的审计没写成，会持续阻断后续写入；对账先看它";
-      next = "node scripts/register-subscription.mjs --resolve-audit-conflict " + shellQuote(pending.pending.operation_id) + " --store " + shellQuote(file) + " （预览；确认后自行加 --apply）";
+      const op = displaySafe(pending.pending.operation_id);
+      detail = "有待补记（op " + short(op) + "）—— 上次变更的审计没写成，会持续阻断后续写入；对账先看它";
+      next = "node scripts/register-subscription.mjs --resolve-audit-conflict " + shellQuote(op) + " --store " + shellQuote(file) + " （预览；确认后自行加 --apply）";
     } else if (audit.ok === false) {
       ok = false;
       detail = "订阅审计读不出来（" + ((audit.problems ?? []).slice(0, 2).join("；") || audit.detail || audit.reason || "说不清") + "）—— 对账靠它，读不出只能按说不清处理，请人工核对 " + file + ".audit.jsonl";
-    } else if (store.absent && audit.events.length > 0) {
-      ok = false;
-      detail = "订阅审计有 " + audit.events.length + " 条记录但 store 缺席（store 被删或路径漂移），对账对不上，请人工核对 " + file;
-    } else if (store.absent) {
+    } else if (store.absent && audit.absent) {
       ok = true;
       detail = "未启用订阅控制面（store 与审计都不在）";
+    } else if (store.absent) {
+      // 审计制品存在（哪怕为空）而 store 缺席 —— 不是「都不在」，不能判未启用；对账对不上 → 红。
+      ok = false;
+      const auditNote = audit.events.length > 0 ? "有 " + audit.events.length + " 条记录" : "存在但为空";
+      detail = "订阅审计" + auditNote + "而 store 缺席（store 被删或路径漂移），对账对不上，请人工核对 " + file;
     } else if (audit.absent || audit.events.length === 0) {
       ok = null;
       detail = statusText + "；审计缺席/为空（无写入记录，无法对账）—— store 在而审计不在，说明从没变更过或审计被清，先手动核对 " + file + ".audit.jsonl";

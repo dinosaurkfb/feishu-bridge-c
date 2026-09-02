@@ -10,6 +10,21 @@ import crypto from "node:crypto";
 import { roleEntriesProblem, senderRolesProblem, senderTable } from "./sender-roles.mjs";
 
 export const SUBSCRIPTION_SCHEMA_VERSION = "1.0";
+// 1.1（评审 #112 裁决）：可选 instance_key 进 id 哈希，同四元组多条合法并存；1.0 条目照旧。
+export const SUBSCRIPTION_SCHEMA_VERSION_KEYED = "1.1";
+export const INSTANCE_KEY_SHAPE = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
+
+/**
+ * 订阅身份公式的唯一实现（评审 #112 裁决定形）：
+ *   无 instance_key（1.0 legacy）→ stableControlId("subscription", ep, dom, chat, agent)
+ *   有 instance_key（1.1 keyed）→ 同上再追加 "instance:" + key
+ * 两支都在这里算 —— 写方、校验、寻址不许各抄一份公式。
+ */
+export function subscriptionIdFor({ endpointId, domainId, chatId, agentUid, instanceKey = null }) {
+  return instanceKey == null
+    ? stableControlId("subscription", endpointId, domainId, chatId, agentUid)
+    : stableControlId("subscription", endpointId, domainId, chatId, agentUid, "instance:" + instanceKey);
+}
 export const SUBSCRIPTION_ARTIFACT_TYPE = "feishu_bridge_subscription";
 export const MESSAGE_RECEIVE_EVENT = "im.message.receive";
 
@@ -58,11 +73,19 @@ export function validateSubscription(subscription) {
     for (const k of Object.keys(obj)) if (!allowed.includes(k)) problems.push(label + "extra:" + k);
   };
   closed(subscription, ["schema_version", "artifact_type", "subscription_id", "version",
-    "endpoint_id", "domain_id", "status", "scope", "constraints"], "");
+    "endpoint_id", "domain_id", "status", "scope", "constraints", "instance_key"], "");
   closed(subscription?.scope, ["agent_uid", "transport_open_id", "chat_id", "sender_ids",
     "event_types", "sender_roles"], "scope.");
   closed(subscription?.constraints, ["freshness_ms"], "constraints.");
-  if (subscription?.schema_version !== SUBSCRIPTION_SCHEMA_VERSION) problems.push("schema_version");
+  // 两版并行（评审 #112 裁决）：1.0 legacy 不许带 instance_key；1.1 keyed 可带（形状封闭）。
+  const version11 = subscription?.schema_version === SUBSCRIPTION_SCHEMA_VERSION_KEYED;
+  if (subscription?.schema_version !== SUBSCRIPTION_SCHEMA_VERSION && !version11) problems.push("schema_version");
+  if (subscription?.instance_key !== undefined) {
+    if (!version11) problems.push("instance_key_needs_1.1");
+    else if (typeof subscription.instance_key !== "string" || !INSTANCE_KEY_SHAPE.test(subscription.instance_key)) {
+      problems.push("instance_key");
+    }
+  }
   if (subscription?.artifact_type !== SUBSCRIPTION_ARTIFACT_TYPE) problems.push("artifact_type");
   for (const field of ["subscription_id", "endpoint_id", "domain_id"]) {
     if (!nonEmpty(subscription?.[field])) problems.push(field);
@@ -97,6 +120,18 @@ export function validateSubscription(subscription) {
   if (typeof subscription?.constraints?.freshness_ms !== "number" ||
       !Number.isFinite(subscription.constraints.freshness_ms) || subscription.constraints.freshness_ms <= 0) {
     problems.push("constraints.freshness_ms");
+  }
+  // 身份完整性（评审 #112 三轮 + 裁决）：subscription_id 必须等于按公式从条目自身字段重算的值
+  //（keyed 条目走带 instance_key 的分支）。否则「改 chat_id / key 不重算 id」的条目会覆盖原订阅，
+  // 让别群的证据接走原群的 pending binding。endpoint_id / domain_id 自身是哈希、原始输入不在
+  // 条目里，但它们都进这个公式 —— 改任何一个而不重算 id 都在这里现形。
+  if (nonEmpty(subscription?.subscription_id) &&
+      subscription.subscription_id !== subscriptionIdFor({
+        endpointId: subscription?.endpoint_id, domainId: subscription?.domain_id,
+        chatId: scope?.chat_id, agentUid: scope?.agent_uid,
+        instanceKey: typeof subscription?.instance_key === "string" ? subscription.instance_key : null,
+      })) {
+    problems.push("subscription_id_mismatch");
   }
   return { ok: problems.length === 0, problems };
 }

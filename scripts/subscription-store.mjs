@@ -31,8 +31,9 @@ import path from "node:path";
 import { acquirePublishLock, commitWhileHeld, releasePublishLock } from "./registry.mjs";
 import { senderTable } from "./sender-roles.mjs";
 import {
-  MESSAGE_RECEIVE_EVENT, SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_SCHEMA_VERSION,
-  legacyEndpointId, stableControlId, validateSubscription,
+  INSTANCE_KEY_SHAPE, MESSAGE_RECEIVE_EVENT, SUBSCRIPTION_ARTIFACT_TYPE,
+  SUBSCRIPTION_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION_KEYED,
+  legacyEndpointId, stableControlId, subscriptionIdFor, validateSubscription,
 } from "./subscription.mjs";
 
 export const SUBSCRIPTION_STORE_SCHEMA_VERSION = "1.0";
@@ -45,10 +46,10 @@ export const SUBSCRIPTION_RUNTIMES = ["claude", "codex"];
  * subscription_id = stableControlId("subscription", endpointId, domainId, chatId, agent_uid)）。
  * 同一 (链, 域, 群, agent) 在两边算出同一个 id，合并时按 id 对齐。
  */
-export function subscriptionControlId({ runtime, agentUid, domainKey, chatId }) {
+export function subscriptionControlId({ runtime, agentUid, domainKey, chatId, instanceKey = null }) {
   const endpointId = legacyEndpointId({ runtime, agentUid });
   const domainId = stableControlId("domain", runtime, domainKey);
-  return stableControlId("subscription", endpointId, domainId, chatId, agentUid);
+  return subscriptionIdFor({ endpointId, domainId, chatId, agentUid, instanceKey });
 }
 
 /**
@@ -104,13 +105,16 @@ export function loadSubscriptionStore({ file } = {}) {
  * 纯函数：从模板算出一条新的控制面订阅。群参数按订阅声明：chat_id 必须给
  * （允许与模板不同 —— 这正是多群的意义），新鲜度缺省继承模板。
  */
-export function planSubscriptionEntry({ runtime, template, domainKey, chatId, freshnessMs } = {}) {
+export function planSubscriptionEntry({ runtime, template, domainKey, chatId, freshnessMs, instanceKey = null } = {}) {
   if (!SUBSCRIPTION_RUNTIMES.includes(runtime)) return { ok: false, reason: "runtime_unknown" };
   // 链核对在**最底层**（评审 #112 二轮：只在 change 计划器里核，直接调用这里的仍能
   // 用 Claude 模板配 runtime:"codex" 造出归错链的条目）。
   if (template?.chain !== runtime) return { ok: false, reason: "chain_mismatch", detail: "模板 chain=" + String(template?.chain) + " ≠ runtime=" + String(runtime) };
   if (typeof domainKey !== "string" || !domainKey.trim()) return { ok: false, reason: "domain_key_required" };
   if (typeof chatId !== "string" || !chatId.trim()) return { ok: false, reason: "chat_id_required" };
+  if (instanceKey != null && (typeof instanceKey !== "string" || !INSTANCE_KEY_SHAPE.test(instanceKey))) {
+    return { ok: false, reason: "instance_key_shape" };
+  }
   let freshness = template?.default_freshness_ms;
   if (freshnessMs != null) { // 显式给的才覆盖；null / undefined 都算没给（CLI 未传时是 null）
     if (typeof freshnessMs !== "number" || !Number.isFinite(freshnessMs) || freshnessMs <= 0) {
@@ -119,9 +123,11 @@ export function planSubscriptionEntry({ runtime, template, domainKey, chatId, fr
     freshness = freshnessMs;
   }
   const entry = {
-    schema_version: SUBSCRIPTION_SCHEMA_VERSION,
+    // keyed 条目升 1.1（评审 #112 裁决：不静默改宣称固定的 1.0）；无 key 照旧 1.0，id 与 legacy 一致
+    schema_version: instanceKey == null ? SUBSCRIPTION_SCHEMA_VERSION : SUBSCRIPTION_SCHEMA_VERSION_KEYED,
     artifact_type: SUBSCRIPTION_ARTIFACT_TYPE,
-    subscription_id: subscriptionControlId({ runtime, agentUid: template.agent_uid, domainKey, chatId }),
+    subscription_id: subscriptionControlId({ runtime, agentUid: template.agent_uid, domainKey, chatId, instanceKey }),
+    ...(instanceKey == null ? {} : { instance_key: instanceKey }),
     version: 1,
     endpoint_id: legacyEndpointId({ runtime, agentUid: template.agent_uid }),
     domain_id: stableControlId("domain", runtime, domainKey),
@@ -142,22 +148,51 @@ export function planSubscriptionEntry({ runtime, template, domainKey, chatId, fr
   return { ok: true, entry };
 }
 
-/** 纯函数：算出变更后的 store。不写盘。action ∈ add|pause|resume|remove。 */
-export function planSubscriptionChange({ store, runtime, template, domainKey, chatId, freshnessMs, action = "add" } = {}) {
+/**
+ * 纯函数：算出变更后的 store。不写盘。action ∈ add|pause|resume|remove。
+ *
+ * 寻址（评审 #112 裁决）：同四元组可能多条（keyed），pause/resume/remove 不能只凭
+ * domain + chat 定位 —— subscriptionId 精确寻址优先；否则四元组 + instanceKey 重算 id；
+ * 都没给时四元组下恰一条才认，多条歧义拒绝（列出候选 id 让人挑）。
+ */
+export function planSubscriptionChange({ store, runtime, template, domainKey, chatId, freshnessMs, action = "add", instanceKey = null, subscriptionId = null } = {}) {
   if (!["add", "pause", "resume", "remove"].includes(action)) return { ok: false, reason: "action_unknown" };
   if (!store || !Array.isArray(store.subscriptions)) return { ok: false, reason: "store_invalid" };
   // 链核对（评审 PR #112 P2）：Claude 模板配 runtime:"codex" 会生成一条合法但归错链的订阅 ——
   // 在唯一计划器里拒，不只靠 CLI 传对参数。
   if (template?.chain !== runtime) return { ok: false, reason: "chain_mismatch", detail: "模板 chain=" + String(template?.chain) + " ≠ runtime=" + String(runtime) };
-  const id = subscriptionControlId({ runtime, agentUid: template?.agent_uid, domainKey, chatId });
   if (action === "add") {
+    const id = subscriptionControlId({ runtime, agentUid: template?.agent_uid, domainKey, chatId, instanceKey });
     if (store.subscriptions.some((s) => s.subscription_id === id)) return { ok: false, reason: "subscription_exists", subscription_id: id };
-    const planned = planSubscriptionEntry({ runtime, template, domainKey, chatId, freshnessMs });
+    const planned = planSubscriptionEntry({ runtime, template, domainKey, chatId, freshnessMs, instanceKey });
     if (!planned.ok) return planned;
     return { ok: true, changed: true, store: { ...store, subscriptions: [...store.subscriptions, planned.entry] }, entry: planned.entry };
   }
-  const existing = store.subscriptions.find((s) => s.subscription_id === id) ?? null;
-  if (!existing) return { ok: false, reason: "subscription_not_found", subscription_id: id };
+  let existing = null;
+  if (subscriptionId != null) {
+    existing = store.subscriptions.find((s) => s.subscription_id === subscriptionId) ?? null;
+    if (!existing) return { ok: false, reason: "subscription_not_found", subscription_id: subscriptionId };
+  } else if (instanceKey != null) {
+    const id = subscriptionControlId({ runtime, agentUid: template?.agent_uid, domainKey, chatId, instanceKey });
+    existing = store.subscriptions.find((s) => s.subscription_id === id) ?? null;
+    if (!existing) return { ok: false, reason: "subscription_not_found", subscription_id: id };
+  } else {
+    // 四元组寻址：命中同四元组的全部条目（legacy 的 + keyed 的）——恰一条才动，多条必须点名
+    const quad = store.subscriptions.filter((s) =>
+      s.endpoint_id === legacyEndpointId({ runtime, agentUid: template?.agent_uid }) &&
+      s.domain_id === stableControlId("domain", runtime, domainKey) &&
+      s.scope?.chat_id === chatId);
+    if (!quad.length) {
+      return { ok: false, reason: "subscription_not_found",
+        subscription_id: subscriptionControlId({ runtime, agentUid: template?.agent_uid, domainKey, chatId }) };
+    }
+    if (quad.length > 1) {
+      return { ok: false, reason: "subscription_ambiguous",
+        candidates: quad.map((s) => s.subscription_id + (s.instance_key ? "（key=" + s.instance_key + "）" : "（legacy）")) };
+    }
+    existing = quad[0];
+  }
+  const id = existing.subscription_id;
   if (action === "remove") {
     return { ok: true, changed: true, store: { ...store, subscriptions: store.subscriptions.filter((s) => s.subscription_id !== id) }, before: existing };
   }
@@ -183,6 +218,7 @@ export function planSubscriptionChange({ store, runtime, template, domainKey, ch
 export function applySubscriptionChange({ file, change, now = new Date() } = {}) {
   if (typeof file !== "string" || !path.isAbsolute(file)) return { ok: false, reason: "store_required_absolute" };
   if (!change || typeof change !== "object") return { ok: false, reason: "change_required" };
+  let commitResidue = null; // 提交段 commitWhileHeld 带回的 .reap 残骸，与释放段统一投影（评审 #112 三轮）
   try {
     const st = fs.lstatSync(file);
     if (!st.isFile()) return { ok: false, reason: "store_not_regular_file", detail: st.isSymbolicLink() ? "是符号链接（别名）；请用真实路径" : "不是普通文件" };
@@ -222,7 +258,12 @@ export function applySubscriptionChange({ file, change, now = new Date() } = {})
       try {
         const buf = Buffer.from(body, "utf-8");
         let off = 0;
-        while (off < buf.length) off += fs.writeSync(wfd, buf, off);
+        while (off < buf.length) {
+          const n = fs.writeSync(wfd, buf, off);
+          // writeSync 返回 0 不是错误码但也不是进展 —— 当短写受控失败，不许无限循环（评审 #112 三轮）
+          if (n <= 0) throw new Error("ESHORTWRITE：writeSync 返回 " + n);
+          off += n;
+        }
         fs.fsyncSync(wfd);
       } finally { try { fs.closeSync(wfd); } catch { /* 已关 */ } }
     } catch (err) {
@@ -234,6 +275,7 @@ export function applySubscriptionChange({ file, change, now = new Date() } = {})
       try { fs.renameSync(tmp, file); } catch (err) { commitErr = err; }
       return { done: true };
     });
+    commitResidue = fenced?.reapUncleared ?? null;
     // fenced：锁被换 / 丢 → { ok:false, reason:"lock_lost" }（不提交）；成功 → fn 的返回值
     if (!fenced || fenced.ok === false) {
       try { fs.rmSync(tmp, { force: true }); } catch { /* 已不在 */ }
@@ -250,7 +292,7 @@ export function applySubscriptionChange({ file, change, now = new Date() } = {})
   } finally {
     let rel;
     try { rel = releasePublishLock(lockDir); } catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
-    const why = describeLockRelease(rel);
+    const why = describeLockRelease(rel, commitResidue);
     if (why && result && typeof result === "object") result.lockUncleared = why;
   }
 }
@@ -260,13 +302,17 @@ export function applySubscriptionChange({ file, change, now = new Date() } = {})
  * 释放主锁成功但 .reap 残骸清不掉时，后续所有写方都会报锁不可用 —— 这必须让本次 CLI 非零并指路，
  * 不能报成功）。三态：释放失败 / 锁已不在 / reap 残骸；都带 repair 指路的原始信息。
  */
-export function describeLockRelease(rel) {
-  if (!rel?.ok) return String(rel?.reason) + (rel?.error ? "：" + rel.error : "");
-  if (rel.reapUncleared) {
-    return "reap_residue：" + String(rel.reapUncleared.path ?? "") +
-      (rel.reapUncleared.error ? "：" + rel.reapUncleared.error : "") +
-      "（回收段残骸不会自动恢复，请在本机用 repair-publish-lock 处理）";
+export function describeLockRelease(rel, commitResidue = null) {
+  const residueText = (r) => "reap_residue：" + String(r.path ?? "") +
+    (r.error ? "：" + r.error : "") + "（回收段残骸不会自动恢复，请在本机用 repair-publish-lock 处理）";
+  if (!rel?.ok) {
+    return String(rel?.reason) + (rel?.error ? "：" + rel.error : "") +
+      (commitResidue ? "；另有提交段 " + residueText(commitResidue) : "");
   }
+  // 提交段与释放段的残骸统一投影（评审 #112 三轮：提交段的 fenced.reapUncleared 曾被丢弃，
+  // 只剩一句 release_busy，路径 / EIO / repair 指引全丢）
+  const residue = rel.reapUncleared ?? commitResidue;
+  if (residue) return residueText(residue);
   if (rel.absent) return "锁已不在（被清理过）";
   return null;
 }

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/dinosaurkfb/feishu-bridge-c/references/subscription-v1.schema.json",
   "title": "Feishu Bridge Subscription v1",
-  "description": "A versioned control-plane subscription. Runtime-specific task/session locators are deliberately excluded.",
+  "description": "A versioned control-plane subscription. Runtime-specific task/session locators are deliberately excluded. 1.1 (review PR #112) adds optional instance_key: same-quad entries may coexist when keyed; the id formula appends 'instance:'+key. 1.0 entries (no instance_key) keep the original quad formula and remain valid.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -18,7 +18,14 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "1.0"
+      "enum": ["1.0", "1.1"]
+    },
+    "instance_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9_-]*$",
+      "description": "1.1 only. Distinguishes same-quad subscriptions; enters the id hash as 'instance:'+key."
     },
     "artifact_type": {
       "const": "feishu_bridge_subscription"

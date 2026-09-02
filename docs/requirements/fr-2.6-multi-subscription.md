@@ -167,6 +167,13 @@ suspend / migrate）已经完成，卡点是「多于一条订阅时首次认领
 
 ## 3. 数据模型提案（含兼容迁移）
 
+> **2026-09-02 评审修订（PR #112 裁决）**：撤回「schema 字面完全不动」。身份完整性守卫
+>（subscription_id 必须等于按公式重算的值）落地后，「同四元组多条订阅」需要显式区分位 ——
+> schema 升 **1.1** 增加可选 `instance_key`（进 id 哈希：`"instance:"+key`）；1.0 legacy 条目
+>（无 key、原四元组公式）继续合法，两版并行读取。迁移语义随之明确：同 id 版本前进 = resnapshot；
+> 不同 id、四硬边界（endpoint/domain/agent/chat）一致且授权覆盖 = migrate。CLI 的
+> pause/resume/remove 支持 `--subscription-id` / `--instance-key` 精确寻址，四元组下多条时歧义拒绝。
+
 ### 3.1 提案 A（推荐）：Subscription v1 保持单群，多群 = 同域多条订阅
 
 - **不新增 schema**。一条订阅仍然声明一个 `scope.chat_id`（`references/subscription-v1.schema.json:67-72`）；

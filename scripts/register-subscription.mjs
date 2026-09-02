@@ -25,19 +25,21 @@ import {
 } from "./subscription-store.mjs";
 
 export function parseRegisterSubscriptionArgs(argv) {
-  const out = { store: null, template: null, runtime: null, domainKey: null, chatId: null, freshnessMs: null, pause: false, resume: false, remove: false, apply: false };
+  const out = { store: null, template: null, runtime: null, domainKey: null, chatId: null, freshnessMs: null, instanceKey: null, subscriptionId: null, pause: false, resume: false, remove: false, apply: false };
   const seen = new Set();
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (seen.has(a)) return { ok: false, reason: "duplicate_argument", argument: a };   // 受控写入口：重复参数不许"以后一个为准"
     if (a === "--apply" || a === "--pause" || a === "--resume" || a === "--remove") { seen.add(a); out[a.slice(2)] = true; continue; }
-    if (["--store", "--template", "--runtime", "--domain-key", "--chat-id", "--freshness-ms"].includes(a)) {
+    if (["--store", "--template", "--runtime", "--domain-key", "--chat-id", "--freshness-ms", "--instance-key", "--subscription-id"].includes(a)) {
       const v = argv[i + 1];
       if (typeof v !== "string" || v.startsWith("--") || v.length === 0) return { ok: false, reason: a + "_value_required" };
       seen.add(a);
       if (a === "--store") out.store = v; else if (a === "--template") out.template = v;
       else if (a === "--runtime") out.runtime = v; else if (a === "--domain-key") out.domainKey = v;
       else if (a === "--chat-id") out.chatId = v;
+      else if (a === "--instance-key") out.instanceKey = v;
+      else if (a === "--subscription-id") out.subscriptionId = v;
       else {
         if (!/^\d+$/u.test(v) || Number(v) <= 0) return { ok: false, reason: "freshness_ms_shape" };
         out.freshnessMs = Number(v);
@@ -55,6 +57,10 @@ export function parseRegisterSubscriptionArgs(argv) {
   if (actions.length > 1) return { ok: false, reason: "one_action_at_a_time", detail: actions.join(",") };
   if (out.freshnessMs !== null && actions.length) return { ok: false, reason: "freshness_only_on_add" };
   out.action = actions[0] ?? "add";
+  // 寻址封闭（评审 #112 裁决）：--subscription-id 只用于寻址既有条目（add 的 id 永远重算）；
+  // 与 --instance-key 互斥（一次一种寻址方式）。
+  if (out.subscriptionId !== null && out.action === "add") return { ok: false, reason: "subscription_id_not_for_add" };
+  if (out.subscriptionId !== null && out.instanceKey !== null) return { ok: false, reason: "one_addressing_at_a_time" };
   return { ok: true, ...out };
 }
 
@@ -66,7 +72,8 @@ export function previewSubscriptionChange({ change }) {
   const store = loadSubscriptionStore({ file: change.store });
   if (!store.ok) return { ok: false, reason: "store_invalid", problems: store.problems };
   const planned = planSubscriptionChange({ store: { subscriptions: store.subscriptions }, runtime: change.runtime, template,
-    domainKey: change.domainKey, chatId: change.chatId, freshnessMs: change.freshnessMs, action: change.action });
+    domainKey: change.domainKey, chatId: change.chatId, freshnessMs: change.freshnessMs, action: change.action,
+    instanceKey: change.instanceKey, subscriptionId: change.subscriptionId });
   return { ok: true, template, planned, absent: store.absent };
 }
 
@@ -122,7 +129,7 @@ if (isDirectRun(import.meta.url)) {
   { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门
   const done = applySubscriptionChange({
     file: parsed.store,
-    change: { action: parsed.action, runtime: parsed.runtime, template: preview.template, domainKey: parsed.domainKey, chatId: parsed.chatId, freshnessMs: parsed.freshnessMs },
+    change: { action: parsed.action, runtime: parsed.runtime, template: preview.template, domainKey: parsed.domainKey, chatId: parsed.chatId, freshnessMs: parsed.freshnessMs, instanceKey: parsed.instanceKey, subscriptionId: parsed.subscriptionId },
   });
   const out = describeStoreWrite(done, parsed.store);
   process.stdout.write(out.lines.join("\n") + "\n");

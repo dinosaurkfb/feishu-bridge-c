@@ -108,8 +108,8 @@ export function loadSubscriptionStore({ file } = {}) {
  * 生产默认 store 路径。四条展示入口（两条链 subscribe + 两条链 status）共用；
  * 有 HOME 沙箱的测试里 os.homedir() 指向沙箱，落盘位置随之走。
  */
-export function subscriptionStorePath() {
-  return path.join(os.homedir(), ".claude", "feishu-bridge", "subscriptions.json");
+export function subscriptionStorePath({ home = os.homedir() } = {}) {
+  return path.join(home, ".claude", "feishu-bridge", "subscriptions.json");
 }
 
 /**
@@ -364,7 +364,7 @@ function openVerifiedSubscriptionFile({ file }) {
  *      调用方必须 fail-closed；**不许把「读不清」折成 null** —— 旧实现把 ENOENT 与读不清折叠成同一个 null，
  *      当 before_sha256 也是 null（首次写待补记）时被误判成「首次写未提交」而误清 pending（评审复现场景）。
  * 返回 { state:"absent" } | { state:"valid", sha256 } | { state:"unreadable", reason, detail }。 */
-function storeHashState({ file }) {
+export function storeHashState({ file }) {
   const opened = openVerifiedSubscriptionFile({ file });
   if (opened.absent) return { state: "absent" };
   if (!opened.ok) return { state: "unreadable", reason: opened.reason, detail: String(opened.reason) };

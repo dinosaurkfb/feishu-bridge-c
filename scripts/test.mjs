@@ -16862,6 +16862,89 @@ test("doctor：好机器 —— 全部 pass、退出码 0；沙箱里不注入 l
   assert.equal(r3.overall, "blocked");
 });
 
+test("doctor：⑫ 订阅对账 —— store/审计三态 × 对账；未启用不红；待补记指路；只读；不泄 locator（真实进程）", () => {
+  const m = doctorMachine();
+  const storeFile = path.join(m.home, ".claude", "feishu-bridge", "subscriptions.json");
+  const auditFile = storeFile + ".audit.jsonl";
+  const pendingFile = subscriptionAuditPendingPath(storeFile);
+  const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  const seed = (at) => {
+    fs.rmSync(storeFile, { force: true }); fs.rmSync(auditFile, { force: true }); fs.rmSync(pendingFile, { force: true }); fs.rmSync(storeFile + ".lock", { recursive: true, force: true });
+    return applySubscriptionChange({ file: storeFile, change: { action: "add", runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" }, now: new Date(at) });
+  };
+
+  // 未启用：store / 审计 / 待补记都不在 → 绿，不红（回归：未启用机器全段不红）。
+  let r = doctorReport(m.run());
+  assert.equal(checkOf(r, "subscription_audit").ok, true, "未启用不红：" + checkOf(r, "subscription_audit").detail);
+  assert.match(checkOf(r, "subscription_audit").detail, /未启用/u);
+
+  // 健康：store 1 条 active + 审计 1 行，对账一致 → 绿；不泄 chat_id / open_id / agent_uid。
+  assert.equal(seed("2026-09-03T00:00:00.000Z").ok, true, "seed add");
+  r = doctorReport(m.run());
+  let c = checkOf(r, "subscription_audit");
+  assert.equal(c.ok, true, c.detail);
+  assert.match(c.detail, /1 条订阅（active 1，paused 0）/u);
+  assert.match(c.detail, /审计 1 行，末条 add @ 2026-09-03/u);
+  assert.match(c.detail, /对账一致/u);
+  assert.doesNotMatch(c.detail, /oc_b|oc_template|ou_t|agent_m5claude/u, "不泄 chat_id / open_id / agent_uid");
+
+  // store 损坏：覆盖为非法 JSON → 红。
+  fs.writeFileSync(storeFile, "{ 非法");
+  r = doctorReport(m.run());
+  c = checkOf(r, "subscription_audit");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /store 读不出来/u);
+  assert.match(c.detail, /store_bad_json/u);
+
+  // store 在而审计缺席 → null（提示，不染红其他检查）。
+  assert.equal(seed("2026-09-03T01:00:00.000Z").ok, true);
+  fs.rmSync(auditFile, { force: true });
+  r = doctorReport(m.run());
+  c = checkOf(r, "subscription_audit");
+  assert.equal(c.ok, null, c.detail);
+  assert.match(c.detail, /审计缺席/u);
+
+  // 审计损坏：追一行非法 → 红。
+  assert.equal(seed("2026-09-03T02:00:00.000Z").ok, true);
+  fs.appendFileSync(auditFile, "{ 非法\n");
+  r = doctorReport(m.run());
+  c = checkOf(r, "subscription_audit");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /审计读不出来/u);
+
+  // 哈希不一致：绕过写 store（version+1，审计不动）→ 红。
+  assert.equal(seed("2026-09-03T03:00:00.000Z").ok, true);
+  const store = JSON.parse(fs.readFileSync(storeFile, "utf-8"));
+  store.subscriptions[0].version += 1;
+  fs.writeFileSync(storeFile, JSON.stringify(store, null, 2) + "\n");
+  r = doctorReport(m.run());
+  c = checkOf(r, "subscription_audit");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /被绕过写入或审计缺笔/u);
+
+  // 待补记在场 → 红 + 指路 --resolve-audit-conflict（预览形式，无 --apply）。
+  assert.equal(seed("2026-09-03T04:00:00.000Z").ok, true);
+  const addEvent = loadSubscriptionAudit({ file: storeFile }).events[0];
+  const curHash = createHash("sha256").update(fs.readFileSync(storeFile)).digest("hex").slice(0, 16);
+  const auditBuf = fs.readFileSync(auditFile);
+  assert.deepEqual(writeSubscriptionAuditPending({ file: storeFile, pending: { schema_version: "1.0", operation_id: addEvent.operation_id, before_sha256: null, after_sha256: curHash, audit_size_before: auditBuf.length, audit_sha256_before: createHash("sha256").update(auditBuf).digest("hex"), event: addEvent } }), { ok: true }, "造待补记");
+  r = doctorReport(m.run());
+  c = checkOf(r, "subscription_audit");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /有待补记/u);
+  assert.ok(c.next, "待补记要有下一步：" + c.detail);
+  assert.match(c.next, /--resolve-audit-conflict/u);
+  assert.match(c.next, /--store/u);
+  assert.equal(/--apply(?![)])/u.test(c.next.replace(/自行加 --apply/u, "")), false, "next 不许带 --apply：" + c.next);
+  assert.equal(JSON.stringify(r).includes("oc_template"), false, "不泄 chat_id");
+  assert.equal(JSON.stringify(r).includes("oc_b"), false, "不泄 chat_id");
+
+  // 只读：seed/造 pending 阶段写好，doctor 阶段零写入（整棵 HOME 字节一致）。
+  const snap = m.snapshot();
+  doctorReport(m.run());
+  assert.equal(m.snapshot(), snap, "doctor 一个字节都不许改");
+});
+
 test("claim 写原语：扩展对象覆盖不了固定身份字段", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-claimfix-"));
   const r = acquireClaim({ claimsDir: dir, messageId: "om_1", logicalTaskKey: "k",

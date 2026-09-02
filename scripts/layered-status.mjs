@@ -183,9 +183,9 @@ export function subscriptionFacts(model, {
   }
   const items = (model.subscriptions ?? []).map((s) => ({
     status: s.status === "active" ? "活动" : "暂停",
-    // **群名三级（评审 #114 P1）：登记时录入的 chat_name（控制面条目才有）>
-    // 模板匹配 > 群名不可用。**群名只能用在它确实对应的那条订阅上 —— 投影里只有
-    // chat_id，群名在模板/登记里；无条件套上去的话，指向别的群的订阅会被错报成模板群，
+    // **群名三级（评审 #114 P1）：控制面条目名优先；条目无名时才按 chat_id 匹配模板名，
+    // 都没有则「群名不可用」。**群名只能用在它确实对应的那条订阅上 ——
+    // 无条件套模板名的话，指向别的群的订阅会被错报成模板群，
     // **一个错的名字比没有名字更难发现**。核对不上就报不可用。
     // feishu-subscribe 那条命令一直是这么做的，这里是向它看齐。
     groupName: (typeof s.chat_name === "string" && s.chat_name.trim())

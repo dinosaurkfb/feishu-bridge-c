@@ -23959,6 +23959,7 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
   // written !== buf.length 判据这两支就红
   const realWriteSync = fs.writeSync;
   try {
+    fs.rmSync(wLink, { force: true }); // 上一段的硬链接别名先拆掉，loader 的 nlink 检查才放行
     const before0 = loadChannelSamples({ file: wf }).rows.length;
     fs.writeSync = () => 0;
     const zeroW = appendChannelSample({ ...base, event: { message_id: "om_w3", session_id: "s", created_at_ms: 1750000000000 }, disposition: "chat" });

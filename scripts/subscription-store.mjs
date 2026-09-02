@@ -3,8 +3,9 @@
  *
  * 为什么要有独立存储：今天「订阅」只是投影（buildLegacySubscriptionReadModel，
  * scripts/subscription.mjs:99-190），从模板 + 登记表算出来，控制面没有
- * 「创建 / 暂停 / 删除订阅」的落盘对象。提案 A（2026-09-01 拍板）：Subscription v1
- * schema 不动，多群 = 同域多条订阅；本模块只做控制面存储与受控写入口，
+ * 「创建 / 暂停 / 删除订阅」的落盘对象。提案 A（2026-09-01 拍板；2026-09-02 评审 #112
+ * 裁决修订：schema 升 1.1 加可选 instance_key，1.0 legacy 并行合法）：多群 = 同域多条订阅，
+ * 同四元组多条用 instance_key 区分；本模块只做控制面存储与受控写入口，
  * 不做认领 / 路由切流 —— 热路径（inbound-route / inbound 的 selector 逻辑）不碰，
  * 生产调用方也还没把 store 接进投影（那是切流单的事）。
  *
@@ -41,10 +42,10 @@ export const SUBSCRIPTION_STORE_ARTIFACT_TYPE = "feishu_bridge_subscription_stor
 export const SUBSCRIPTION_RUNTIMES = ["claude", "codex"];
 
 /**
- * 订阅的控制面 id：与投影同一套派生（scripts/subscription.mjs:136-140 ——
- * domain_id = stableControlId("domain", runtime, domain_key)，
- * subscription_id = stableControlId("subscription", endpointId, domainId, chatId, agent_uid)）。
- * 同一 (链, 域, 群, agent) 在两边算出同一个 id，合并时按 id 对齐。
+ * 订阅的控制面 id：与投影同一套派生，公式唯一实现在 subscriptionIdFor（subscription.mjs）——
+ * 无 instance_key（1.0 legacy）= ("subscription", endpointId, domainId, chatId, agent_uid)；
+ * 有 instance_key（1.1 keyed）追加 "instance:"+key（评审 #112 裁决：同四元组多条并存的区分位）。
+ * 同一 (链, 域, 群, agent[, key]) 在两边算出同一个 id，合并时按 id 对齐。
  */
 export function subscriptionControlId({ runtime, agentUid, domainKey, chatId, instanceKey = null }) {
   const endpointId = legacyEndpointId({ runtime, agentUid });
@@ -172,6 +173,15 @@ export function planSubscriptionChange({ store, runtime, template, domainKey, ch
   if (subscriptionId != null) {
     existing = store.subscriptions.find((s) => s.subscription_id === subscriptionId) ?? null;
     if (!existing) return { ok: false, reason: "subscription_not_found", subscription_id: subscriptionId };
+    // 精确寻址不豁免上下文（评审 #112 四轮）：拿着 Codex 订阅的 id 配 Claude 模板照样能改 ——
+    // 查到条目后仍核对它属于当前 runtime / template / domainKey / chatId，任一不符零变更。
+    if (existing.endpoint_id !== legacyEndpointId({ runtime, agentUid: template?.agent_uid }) ||
+        existing.domain_id !== stableControlId("domain", runtime, domainKey) ||
+        existing.scope?.agent_uid !== template?.agent_uid ||
+        existing.scope?.chat_id !== chatId ||
+        existing.scope?.transport_open_id !== template?.transport_open_id) {
+      return { ok: false, reason: "subscription_context_mismatch", subscription_id: subscriptionId };
+    }
   } else if (instanceKey != null) {
     const id = subscriptionControlId({ runtime, agentUid: template?.agent_uid, domainKey, chatId, instanceKey });
     existing = store.subscriptions.find((s) => s.subscription_id === id) ?? null;

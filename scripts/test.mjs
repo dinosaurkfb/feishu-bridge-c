@@ -19768,6 +19768,20 @@ test("FR-2.6 单 1 评审返修：条目与 store 形状封闭（多余字段 / 
     "按 key 精确删一条，同四元组另一条不受影响");
   const byId = planSubscriptionChange({ store: two, runtime: "claude", template, domainKey: "/p", chatId: "oc_a", action: "pause", subscriptionId: k2.entry.subscription_id });
   assert.deepEqual([byId.ok, byId.entry.status, byId.entry.version], [true, "paused", 2], "按 subscription_id 精确寻址");
+  // 精确寻址不豁免上下文（评审 #112 四轮）：拿别的链 / 域 / 群的 id 配当前上下文，三动作全拒零变更
+  const codexTpl = { ...template, chain: "codex", agent_uid: "agent_codex" };
+  const codexEnt = planSubscriptionEntry({ runtime: "codex", template: codexTpl, domainKey: "/p", chatId: "oc_a", instanceKey: "one" });
+  assert.equal(codexEnt.ok, true, codexEnt.reason ?? "");
+  const mixed = { subscriptions: [codexEnt.entry] };
+  for (const action of ["pause", "resume", "remove"]) {
+    const cross = planSubscriptionChange({ store: mixed, runtime: "claude", template, domainKey: "/p", chatId: "oc_a", action, subscriptionId: codexEnt.entry.subscription_id });
+    assert.deepEqual([cross.ok, cross.reason], [false, "subscription_context_mismatch"],
+      action + "：Claude 上下文拿 Codex 订阅的 id 不许动：" + JSON.stringify(cross));
+  }
+  const wrongDomain = planSubscriptionChange({ store: two, runtime: "claude", template, domainKey: "/other", chatId: "oc_a", action: "pause", subscriptionId: k1.entry.subscription_id });
+  assert.equal(wrongDomain.reason, "subscription_context_mismatch", "同链错 domain 也拒");
+  const wrongChat = planSubscriptionChange({ store: two, runtime: "claude", template, domainKey: "/p", chatId: "oc_elsewhere", action: "remove", subscriptionId: k1.entry.subscription_id });
+  assert.equal(wrongChat.reason, "subscription_context_mismatch", "同链错 chat 也拒");
   // chain 判据在最底层（评审 #112 二轮）：直接调 entry planner 也拒
   assert.equal(planSubscriptionEntry({ runtime: "codex", template, domainKey: "/p", chatId: "oc_a" }).reason, "chain_mismatch");
   // 畸形 sender_ids / sender_roles：形状问题落 problems，不裸抛（评审 #112 二轮的 TypeError 反例）

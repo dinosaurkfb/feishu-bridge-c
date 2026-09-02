@@ -3,14 +3,18 @@
  * 订阅登记（FR-2.6 单 1）：往机器级订阅控制面 store 里 增 / 停 / 恢复 / 删 一条订阅。
  *
  *   node scripts/register-subscription.mjs --store <subscriptions.json 绝对路径> --template <chain-config.json 绝对路径> \
- *     --runtime claude|codex --domain-key <项目根或业务域> --chat-id <oc_…> [--freshness-ms <N>] [--apply]
- *   node scripts/register-subscription.mjs … --pause|--resume|--remove [--apply]
+ *     --runtime claude|codex --domain-key <项目根或业务域> --chat-id <oc_…> [--freshness-ms <N>] [--instance-key <key>] [--apply]
+ *   node scripts/register-subscription.mjs … --pause|--resume|--remove [--instance-key <key> | --subscription-id <id>] [--apply]
  *
  * · 默认只预览；写入是改订阅控制面，**需要 owner（Frank）逐次授权**后才 --apply。
- * · 提案 A（2026-09-01 拍板）：Subscription v1 schema 不动，多群 = 同域多条订阅；
- *   新订阅的 chat_id 允许与模板不同 —— 这正是多群的意义。
- * · 订阅 id 派生与投影同一套（subscriptionControlId → stableControlId("subscription",
- *   endpoint, domain, chat, agent)），控制面对象与 legacy 投影同 id 对齐。
+ * · 提案 A（2026-09-01 拍板；2026-09-02 评审 #112 裁决修订：schema 升 1.1 加可选
+ *   instance_key，1.0 legacy 并行合法）：多群 = 同域多条订阅，新订阅的 chat_id 允许与
+ *   模板不同 —— 这正是多群的意义；同四元组第二条要 `--instance-key <key>` 区分。
+ * · 订阅 id 派生与投影同一套（subscriptionIdFor：无 key = ("subscription", endpoint,
+ *   domain, chat, agent)；有 key 追加 "instance:"+key），控制面对象与 legacy 投影同 id 对齐。
+ * · 暂停 / 恢复 / 删除的寻址：四元组下恰一条直接认；多条时用 `--instance-key <key>` 或
+ *   `--subscription-id <id>` 精确点名（歧义会列出候选）；精确寻址仍核对条目属于当前
+ *   链 / 域 / 群（subscription_context_mismatch）。
  * · --apply 走 store 的唯一写事务（subscription-store.mjs）：锁内重读重算 → 逐条校验 →
  *   备份 → 临时文件 + rename 原子写 → 逐字读回；维护门照 register-sender 的样子在门前。
  * · 不认领、不路由、不碰登记表：本命令只写控制面；切流另有单。
@@ -98,8 +102,9 @@ if (isDirectRun(import.meta.url)) {
   const parsed = parseRegisterSubscriptionArgs(process.argv.slice(2));
   if (!parsed.ok) {
     process.stderr.write("用法：node scripts/register-subscription.mjs --store <绝对路径> --template <绝对路径> --runtime claude|codex \\\n" +
-      "        --domain-key <项目根或业务域> --chat-id <oc_…> [--freshness-ms <N>] [--apply]\n" +
-      "      node scripts/register-subscription.mjs … --pause|--resume|--remove [--apply]（" + parsed.reason + (parsed.detail ? "：" + parsed.detail : "") + "）\n");
+      "        --domain-key <项目根或业务域> --chat-id <oc_…> [--freshness-ms <N>] [--instance-key <key>] [--apply]\n" +
+      "      node scripts/register-subscription.mjs … --pause|--resume|--remove [--instance-key <key> | --subscription-id <id>] [--apply]\n" +
+      "      同四元组多条时 pause/resume/remove 必须用 --instance-key 或 --subscription-id 精确点名（" + parsed.reason + (parsed.detail ? "：" + parsed.detail : "") + "）\n");
     process.exit(2);
   }
   const preview = previewSubscriptionChange({ change: parsed });

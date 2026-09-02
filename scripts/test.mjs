@@ -9029,12 +9029,11 @@ test("订阅命令：只读、严格参数、把写为什么没开说清楚", ()
 
   const ok = run(["--project", process.cwd()]);
   assert.equal(ok.status, 0, ok.stderr);
-  // 说清写为什么没开 —— "暂不支持"是排期，"缺这两条前置"才是事实。
-  assert.match(ok.stdout, /FR-2\.5 的落盘控制面已经完成/u);
-  assert.match(ok.stdout, /卡在 FR-2\.6/u);
+  // 说清写入口的现状 —— "暂不支持"是排期，事实是：登记已开放、尚未接入切流（评审 #112 统一钉法）。
   assert.match(ok.stdout, /发送者角色表可以登记.*register-sender\.mjs/u);
-  assert.match(ok.stdout, /独立订阅的增删仍不开放/u);
-  assert.doesNotMatch(ok.stdout, /订阅说 A、授权快照仍说 B|控制面还没有/u, "过时的理由不许再出现");
+  assert.match(ok.stdout, /登记入口已开放.*register-subscription\.mjs/u);
+  assert.match(ok.stdout, /尚未接入权威投影与切流/u);
+  assert.doesNotMatch(ok.stdout, /仍不开放|仍未开放|订阅说 A、授权快照仍说 B|控制面还没有/u, "过时的理由不许再出现");
 });
 
 test("待认领数要用跟热路径同一个判据", () => {
@@ -9075,7 +9074,8 @@ test("群名只能给它确实对应的那条订阅", () => {
 
 test("订阅命令的用户可见契约：两条链都有、写入口现状一致，过时说法不许留", () => {
   // 2026-08-29 之前这里钉的是"仅 Claude 侧 / 待迁移"；Codex 侧早已有 CLI 与技能，那句话成了假话（评审第 1 轮抓出）。
-  // 现在钉的是：角色表登记已开放、独立订阅增删卡在 FR-2.6、FR-2.5 落盘控制面已完成 —— 五处说法一致。
+  // 现在钉的是（评审 #112 统一）：角色表登记已开放、订阅控制面登记入口已开放（FR-2.6 单 1）、
+  // store 尚未接入权威投影与切流、FR-2.5 落盘控制面已完成 —— 五处说法一致。
   const readme = fs.readFileSync(path.resolve("README.md"), "utf-8");
   const reqs = fs.readFileSync(path.resolve("docs", "requirements", "agent-enhancement-requirements.md"), "utf-8");
   const claudeSkill = fs.readFileSync(path.resolve("skills", "claude-feishu-subscribe", "SKILL.md"), "utf-8");
@@ -9088,9 +9088,9 @@ test("订阅命令的用户可见契约：两条链都有、写入口现状一�
   const readmeSubscribe = readme.slice(readme.indexOf("本版本实际安装上表五项"), readme.indexOf("Agent 增强需求"));
   for (const [name, text] of [["claude skill", claudeSkill], ["codex skill", codexSkill], ["claude cli", claudeCli], ["codex cli", codexCli], ["readme", readmeSubscribe]]) {
     assert.match(text, /register-sender/u, name + " 要说角色表登记已开放");
-    assert.match(text, /FR-2\.6/u, name + " 要说独立订阅增删卡在 FR-2.6");
-    assert.match(text, /FR-2\.5[^\n]*(已经完成|已完成)/u, name + " 要说 FR-2.5 落盘控制面已完成");
-    assert.doesNotMatch(text, /仅 Claude 侧|只有 Claude 侧|待迁移|控制面还没有|控制面没闭环|还没实现|未实现|尚未开放|写入口还没开|为什么现在还不能写|缺 FR-2\.5/u, name + " 不许留过时说法");
+    assert.match(text, /register-subscription/u, name + " 要说订阅控制面登记入口已开放（FR-2.6 单 1）");
+    assert.match(text, /尚未接入权威投影与切流/u, name + " 要说 store 尚未接入切流（落盘不改变生产路由）");
+    assert.doesNotMatch(text, /仅 Claude 侧|只有 Claude 侧|待迁移|控制面还没有|控制面没闭环|还没实现|未实现|仍不开放|仍未开放|写入口还没开|为什么现在还不能写|缺 FR-2\.5/u, name + " 不许留过时说法");
   }
 });
 test("端点自检把 FR-1.4 的四种情形分开，各有各的下一步", () => {
@@ -19653,7 +19653,7 @@ test("FR-2.6 单 1：合并读模型 —— 控制面新 id 追加（pending_bin
   const runtimeNamespace = "claude";
   const agentUid = "agent_m5claude";
   const endpointId = legacyEndpointId({ runtime: runtimeNamespace, agentUid });
-  const template = { agent_uid: agentUid, transport_open_id: "ou_bot", frank_sender_id: "u_frank", chat_id: "oc_x", default_freshness_ms: 600000 };
+  const template = { chain: "claude", agent_uid: agentUid, transport_open_id: "ou_bot", frank_sender_id: "u_frank", chat_id: "oc_x", default_freshness_ms: 600000 };
   const record = (over) => ({
     legacy_key: "k", domain_key: "/p", local_target_id: stableControlId("target", runtimeNamespace, "k"),
     status: "active", inbound_state: "pending", session_id: null, pending_token: "abc123",
@@ -19669,7 +19669,7 @@ test("FR-2.6 单 1：合并读模型 —— 控制面新 id 追加（pending_bin
   const overrideEntry = { ...legacySub, status: "paused", version: 5 };
   // endpoint 隔离（评审 #112 P1）：机器级共享 store 里别的链（Codex endpoint）的合法条目
   // 不进 Claude 模型 —— 跳过并计数
-  const codexEntry = planSubscriptionEntry({ runtime: "codex", template: { ...template, agent_uid: "agent_codex" }, domainKey: "/p", chatId: "oc_z" });
+  const codexEntry = planSubscriptionEntry({ runtime: "codex", template: { ...template, chain: "codex", agent_uid: "agent_codex" }, domainKey: "/p", chatId: "oc_z" });
   assert.equal(codexEntry.ok, true, codexEntry.reason ?? "");
   const model = buildLegacySubscriptionReadModel({ runtime: runtimeNamespace, endpointId, template, records: [record({})], controlPlane: { ok: true, absent: false, subscriptions: [secondEntry.entry, overrideEntry, codexEntry.entry] } });
   assert.equal(model.ok, true);
@@ -19719,6 +19719,23 @@ test("FR-2.6 单 1 评审返修：条目与 store 形状封闭（多余字段 / 
     "chain_mismatch", "Claude 模板配 runtime codex 在唯一计划器里拒，不靠 CLI");
   const w = applySubscriptionChange({ file: path.join(dir, "link.json"), change: { action: "add", runtime: "claude", template, domainKey: "/p", chatId: "oc_b" } });
   assert.equal(w.reason, "store_not_regular_file", "写路径 lstat 拒 symlink store：" + JSON.stringify(w));
+  // chain 判据在最底层（评审 #112 二轮）：直接调 entry planner 也拒
+  assert.equal(planSubscriptionEntry({ runtime: "codex", template, domainKey: "/p", chatId: "oc_a" }).reason, "chain_mismatch");
+  // 畸形 sender_ids / sender_roles：形状问题落 problems，不裸抛（评审 #112 二轮的 TypeError 反例）
+  for (const [label, bad] of [["对象", { bad: true }], ["字符串", "u_frank"], ["数组嵌对象", [{ id: "x" }]]]) {
+    const v = validateSubscription({ ...good.entry, scope: { ...good.entry.scope, sender_ids: bad } });
+    assert.deepEqual([v.ok, v.problems.includes("scope.sender_ids")], [false, true], "sender_ids " + label + "：" + JSON.stringify(v));
+    const vr = validateSubscription({ ...good.entry, scope: { ...good.entry.scope, sender_ids: bad, sender_roles: [{ open_id: "u_frank", role: "owner" }] } });
+    assert.equal(vr.ok, false, "sender_roles 关系校验在畸形 ownerIds 下也不许抛：" + label);
+  }
+  // 产品陈述统一守卫（评审 #112 二轮）：两条 CLI 的写入口说明必须钉「已开放 + 尚未接入切流」
+  const claudeSubscribe = fs.readFileSync(path.resolve("scripts", "feishu-subscribe.mjs"), "utf-8");
+  const codexSubscribe = fs.readFileSync(path.resolve("scripts", "codex", "feishu-subscribe.mjs"), "utf-8");
+  for (const [name, text] of [["claude", claudeSubscribe], ["codex", codexSubscribe]]) {
+    assert.ok(text.includes("登记入口已开放"), name + " 侧要说登记入口已开放");
+    assert.ok(text.includes("尚未接入权威投影与切流"), name + " 侧要说尚未接入切流");
+    assert.ok(!text.includes("仍未开放") && !text.includes("仍不开放"), name + " 侧不许残留旧陈述");
+  }
 });
 
 test("控制事务的换绑窗口（评审 #97）：事务锁内核验通过之后、策略写锁取得之前登记表换了绑定 → 写锁内前置条件拒写、模式不变、不落 consumed、入口非零", () => {

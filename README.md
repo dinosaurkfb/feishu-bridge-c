@@ -260,8 +260,10 @@ session 绑定。日常还可以使用：
 接入时，它同时物化现有单群配置下的订阅授权快照，但不等同于未来可独立管理的 Subscription。
 架构路线图中的 `$feishu-connect` 已确认**不做**（Aily 侧的连接是被动的，本机没有「发起」这个动作；
 本机那一半归端点自检）。`/feishu-subscribe` / `$feishu-subscribe` **两条链都可用，只读**。
-写入口的现状：发送者角色表可以登记（`register-sender.mjs`，写入需 owner 逐次授权）；独立订阅的增删仍不开放，
-原因只有 FR-2.6（多订阅时首次认领的歧义拒绝未经真实样本验证）—— FR-2.5 的授权快照同步链路已经完成。
+写入口的现状：发送者角色表可以登记（`register-sender.mjs`，写入需 owner 逐次授权）；订阅控制面的
+登记入口已开放（FR-2.6 单 1：`register-subscription.mjs`，落盘独立 store，同样 owner 逐次授权），
+但 store 尚未接入权威投影与切流 —— 落盘暂不改变生产认领 / 路由（切流前置：chat locator 验证与
+多订阅歧义的真实样本；FR-2.5 的授权快照同步链路已经完成）。
 不能把需求文档里的建议命令误认为当前可用能力。详见
 [Agent 增强需求](docs/requirements/agent-enhancement-requirements.md#fr-7-显式控制面)。
 

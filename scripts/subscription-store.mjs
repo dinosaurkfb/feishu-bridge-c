@@ -13,9 +13,10 @@
  * 条目就是 Subscription v1 对象本身（validateSubscription 逐条守），不加包装字段 ——
  * 这样「控制面对象与 legacy 投影同 id 对齐」（§3.3-1）之后可以直接互换。
  *
- * 读取方合并必须 fail-closed：文件损坏 → loadSubscriptionStore 报 problems，
- * 投影合并退回纯 legacy 并把问题记进 control_plane 字段，不静默丢
- * （buildLegacySubscriptionReadModel 的 controlPlane 参数）。
+ * 读取方合并必须 fail-closed（评审 #112 定案）：文件损坏 → loadSubscriptionStore 报 problems，
+ * 投影合并**拒绝整个读模型**（ok:false / control_plane_invalid，legacy 只作展示诊断附带）——
+ * 退回纯 legacy 是 fail-open：暂停 / 收紧过的订阅会在文件损坏时重新开放。
+ * 缺席（还没装订阅管理）与空 store 才兼容 legacy（buildLegacySubscriptionReadModel 的 controlPlane 参数）。
  *
  * 写事务完全镜像 withChainTemplateWrite（scripts/chain-template.mjs:274-322，模板唯一
  * 写事务的纪律：锁内重读重算 → 校验 → 备份 → 临时文件 + rename 原子写 → 逐字读回；
@@ -105,6 +106,9 @@ export function loadSubscriptionStore({ file } = {}) {
  */
 export function planSubscriptionEntry({ runtime, template, domainKey, chatId, freshnessMs } = {}) {
   if (!SUBSCRIPTION_RUNTIMES.includes(runtime)) return { ok: false, reason: "runtime_unknown" };
+  // 链核对在**最底层**（评审 #112 二轮：只在 change 计划器里核，直接调用这里的仍能
+  // 用 Claude 模板配 runtime:"codex" 造出归错链的条目）。
+  if (template?.chain !== runtime) return { ok: false, reason: "chain_mismatch", detail: "模板 chain=" + String(template?.chain) + " ≠ runtime=" + String(runtime) };
   if (typeof domainKey !== "string" || !domainKey.trim()) return { ok: false, reason: "domain_key_required" };
   if (typeof chatId !== "string" || !chatId.trim()) return { ok: false, reason: "chat_id_required" };
   let freshness = template?.default_freshness_ms;
@@ -246,7 +250,23 @@ export function applySubscriptionChange({ file, change, now = new Date() } = {})
   } finally {
     let rel;
     try { rel = releasePublishLock(lockDir); } catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
-    const why = !rel?.ok ? String(rel?.reason) + (rel?.error ? "：" + rel.error : "") : rel.absent ? "锁已不在（被清理过）" : null;
+    const why = describeLockRelease(rel);
     if (why && result && typeof result === "object") result.lockUncleared = why;
   }
+}
+
+/**
+ * 释放结果 → lockUncleared 文案（null = 干净交还）。**reap 残骸不许吞**（评审 #112 二轮：
+ * 释放主锁成功但 .reap 残骸清不掉时，后续所有写方都会报锁不可用 —— 这必须让本次 CLI 非零并指路，
+ * 不能报成功）。三态：释放失败 / 锁已不在 / reap 残骸；都带 repair 指路的原始信息。
+ */
+export function describeLockRelease(rel) {
+  if (!rel?.ok) return String(rel?.reason) + (rel?.error ? "：" + rel.error : "");
+  if (rel.reapUncleared) {
+    return "reap_residue：" + String(rel.reapUncleared.path ?? "") +
+      (rel.reapUncleared.error ? "：" + rel.reapUncleared.error : "") +
+      "（回收段残骸不会自动恢复，请在本机用 repair-publish-lock 处理）";
+  }
+  if (rel.absent) return "锁已不在（被清理过）";
+  return null;
 }

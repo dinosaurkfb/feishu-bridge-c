@@ -134,7 +134,7 @@ function main() {
     { source: currentBinding({ root }).source ?? null },
   ));
   console.log("\n本命令只读。**发送者角色表可以登记**（node scripts/register-sender.mjs，改链路模板的 senders；写入需 owner 逐次授权）。");
-  console.log("**独立订阅的增删仍不开放**：FR-2.5 的落盘控制面已经完成，卡在 FR-2.6 —— 多于一条订阅时首次认领必须能拒绝歧义，该路径未经真实样本验证。");
+  console.log("**订阅控制面的登记入口已开放**（node scripts/register-subscription.mjs，落盘独立 store；写入需 owner 逐次授权），但 store **尚未接入权威投影与切流** —— 落盘暂不改变生产认领 / 路由；本命令展示的仍是 legacy 投影。");
 }
 
 if (isDirectRun(import.meta.url)) main();

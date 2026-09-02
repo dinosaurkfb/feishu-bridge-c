@@ -3983,7 +3983,8 @@ test("subscribe 命令：读得出订阅，且不泄漏任何 locator", () => {
     assert.fail("投影不可用：" + JSON.stringify(probe).slice(0, 400) + "\n" + r.stdout);
   }
   assert.match(r.stdout, /授权发送者.*只出数量，不出身份/u);
-  assert.match(r.stdout, /独立订阅增删仍未开放.*FR-2\.6/u, "写入口现状要说清楚");
+  assert.match(r.stdout, /登记入口已开放.*register-subscription\.mjs/u, "写入口现状要说清楚：登记已开放");
+  assert.match(r.stdout, /尚未接入权威投影与切流/u, "写入口现状要说清楚：落盘不改变生产路由");
   assert.match(r.stdout, /register-sender\.mjs/u);
 
   // **一个 locator 都不许出现。**

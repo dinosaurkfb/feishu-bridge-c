@@ -73,7 +73,10 @@ export function validateSubscription(subscription) {
   if (!nonEmpty(scope?.agent_uid)) problems.push("scope.agent_uid");
   if (!nonEmpty(scope?.transport_open_id)) problems.push("scope.transport_open_id");
   if (!nonEmpty(scope?.chat_id)) problems.push("scope.chat_id");
-  if (uniqueStrings(scope?.sender_ids).length !== scope?.sender_ids?.length || !scope?.sender_ids?.length) {
+  // Array.isArray 先行（评审 #112 二轮：盘上条目 sender_ids:{bad:true} 曾让 loader 裸抛 ——
+  // 不可信落盘对象的入口，任何形状问题都要落 problems，不许抛）。
+  if (!Array.isArray(scope?.sender_ids) || !scope.sender_ids.length ||
+      uniqueStrings(scope.sender_ids).length !== scope.sender_ids.length) {
     problems.push("scope.sender_ids");
   }
   if (!Array.isArray(scope?.event_types) || !scope.event_types.length ||
@@ -84,9 +87,12 @@ export function validateSubscription(subscription) {
   }
   // sender_roles 可选；在场就必须封闭、不重复、角色在枚举里，且每个 sender_ids 里的 id 都得在表里（sender_ids 是授权基准，表不能少它）
   // 与模板同一份核心校验（sender-roles.mjs），owner 基准就是 sender_ids：owner 集合必须精确一致、字段取值域封闭。旧制品不带 sender_roles 仍接受。
-  if (scope?.sender_roles !== undefined &&
-      roleEntriesProblem(scope.sender_roles, { ownerIds: scope?.sender_ids ?? [], ownerRequired: true, name: "scope.sender_roles" }) !== null) {
-    problems.push("scope.sender_roles");
+  if (scope?.sender_roles !== undefined) {
+    // ownerIds 必须先确认是数组再进关系校验（同上：形状问题落 problems，不裸抛）
+    const ownerIds = Array.isArray(scope?.sender_ids) ? scope.sender_ids : [];
+    if (roleEntriesProblem(scope.sender_roles, { ownerIds, ownerRequired: true, name: "scope.sender_roles" }) !== null) {
+      problems.push("scope.sender_roles");
+    }
   }
   if (typeof subscription?.constraints?.freshness_ms !== "number" ||
       !Number.isFinite(subscription.constraints.freshness_ms) || subscription.constraints.freshness_ms <= 0) {

@@ -100,7 +100,15 @@ function readOutboxEventSafe(file) {
     if (!st.isFile()) return { status: "unreadable", why: "不是普通文件" };
     let raw;
     try { raw = fs.readFileSync(fd, "utf-8"); } catch (err) { return { status: "unreadable", why: String(err.code ?? err.message) }; }
-    try { return { status: "read", doc: JSON.parse(raw) }; } catch { return { status: "unreadable", why: "不是 JSON" }; }
+    let doc;
+    try { doc = JSON.parse(raw); } catch { return { status: "unreadable", why: "不是 JSON" }; }
+    // 合法 JSON 但不是可解释的 outbox 记录（{} / 数组 / 缺 event_key、text）同样说不清：
+    // appendEvent 落盘的每一张卡 event_key 与 text 恒为非空字符串，缺了就不是这本账的记录。
+    if (typeof doc !== "object" || doc === null || Array.isArray(doc) ||
+        typeof doc.event_key !== "string" || doc.event_key.length === 0 || typeof doc.text !== "string") {
+      return { status: "unreadable", why: "不是可解释的 outbox 记录" };
+    }
+    return { status: "read", doc };
   } finally {
     if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
   }
@@ -312,8 +320,17 @@ async function main() {
       // 读失败当"没入队"会补发重复）——任何一件说不清就 fail-closed 零入队。
       if (answerOnly) {
         let names = [];
-        try { names = fs.readdirSync(outboxDir); } catch { names = []; }
-        for (const n of names) {
+        try { names = fs.readdirSync(outboxDir); }
+        catch (err) {
+          // 只有 ENOENT（还没建过 outbox）是空账本；普通文件 / EACCES / 其他盘点失败都说不清，
+          // 折成空目录就等于放行补发 —— 同样 fail-closed（评审 PR #111 第三轮）。
+          if (err?.code !== "ENOENT") {
+            turnRoute = { ...turnRoute, reason: "consumed_ledger_unreadable",
+              why: "outbox 枚举失败：" + String(err?.code ?? err?.message) };
+            answerOnly = null;
+          }
+        }
+        for (const n of (answerOnly ? names : [])) {
           if (!n.endsWith(".json")) continue;
           const r = readOutboxEventSafe(path.join(outboxDir, n));
           if (r.status === "unreadable") {

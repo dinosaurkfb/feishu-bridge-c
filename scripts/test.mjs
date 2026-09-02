@@ -18102,6 +18102,9 @@ test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结�
     ["zz-bad.json", () => fs.writeFileSync(path.join(outDir, "zz-bad.json"), "{nope")],
     ["zz-link.json", () => fs.symlinkSync(path.join(fx.local, "elsewhere.txt"), path.join(outDir, "zz-link.json"))],
     ["zz-fifo.json", () => execFileSync("mkfifo", [path.join(outDir, "zz-fifo.json")])],
+    // 合法 JSON 但不是可解释的 outbox 记录（评审第三轮）：{} 与数组都说不清
+    ["zz-empty.json", () => fs.writeFileSync(path.join(outDir, "zz-empty.json"), "{}")],
+    ["zz-arr.json", () => fs.writeFileSync(path.join(outDir, "zz-arr.json"), "[]")],
   ];
   fs.writeFileSync(path.join(fx.local, "elsewhere.txt"), JSON.stringify({ kind: "reply" }));
   for (const [name, plant] of bombs) {
@@ -18117,6 +18120,25 @@ test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结�
     assert.equal(diags().length, bombDiags + 1, name + "：要留诊断");
     assert.equal(diags().at(-1).reason, "consumed_ledger_unreadable", name + "：" + JSON.stringify(diags().at(-1)));
   }
+
+  // 枚举层的说不清同样 fail-closed（评审第三轮）：outbox 不是目录 / 无权限都不算空账本。
+  // 现有的卡先挪走再挪回来，不动后续场景的计数基线。
+  fs.renameSync(outDir, outDir + ".save");
+  fs.writeFileSync(outDir, "not a dir");
+  const notDirDiags = diags().length;
+  assert.equal(stop("outbox 变成普通文件时的 mid-turn").status, 0);
+  assert.equal(diags().length, notDirDiags + 1, "非目录要留诊断");
+  assert.equal(diags().at(-1).reason, "consumed_ledger_unreadable", JSON.stringify(diags().at(-1)));
+  assert.match(String(diags().at(-1).why), /枚举失败/u, JSON.stringify(diags().at(-1)));
+  fs.rmSync(outDir, { force: true });
+  fs.renameSync(outDir + ".save", outDir);
+  fs.chmodSync(outDir, 0o000);
+  const noPermDiags = diags().length;
+  const noPermStop = stop("outbox 无权限时的 mid-turn");
+  fs.chmodSync(outDir, 0o700);
+  assert.equal(noPermStop.status, 0, noPermStop.stderr);
+  assert.equal(diags().length, noPermDiags + 1, "EACCES 要留诊断");
+  assert.equal(diags().at(-1).reason, "consumed_ledger_unreadable", JSON.stringify(diags().at(-1)));
 
   // 两条**不同**的飞书回合、回复正文相同：事件键是 claim key，不是正文指纹 —— 两条都要入队、各回各的话题
   const mkOk = (messageId, origin) => acquireClaim({ claimsDir, messageId, logicalTaskKey: mapping.logical_task_key,

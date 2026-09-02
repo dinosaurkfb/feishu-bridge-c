@@ -226,6 +226,7 @@ session 绑定。日常还可以使用：
 | 近似命中收边（第 3 层） | —（路由器内部） | —（路由器内部） | 正文先落进封闭的意图联合（`inbound-intent.mjs`）：readonly / router_control / model_control / rejected_control（unbind、pin-session 不从飞书开放）/ malformed_control（缺参、错参、多尾巴、没这个词、别链前缀）/ authorization / ordinary；风险等级是它的投影。owner 发 rejected / malformed 形状：意图随 claim 持久化 → 锁内拒绝事务记 `rejected` 终态（与 claim 交叉核对）→ `malformed-control-<message_id>` 回执写明差在哪 / 去哪做 → 不投递、不执行；重放同一条消息补齐缺的终态 / 回执；记录损坏或与意图不一致 → 受控错误并指路 `repair-control-claim`；自然语言里顺带提到的命令仍按普通指令 |
 | chat 默认态（第 4 层，未接入） | —（路由器内部） | —（路由器内部） | 无绑定上下文（刚装桥的群话题、私聊、unbind 之后的话题）不再一律拒：三道闸（登记发送者、真实 @、新鲜度）之后按 `authorize` 的 chat 行判权（R1 对 owner / operator / participant 都开；R0 owner / operator；R2 对谁都不开；R3 / R4 只认 owner），路由器**同步**起零工具、无历史的一次性 `claude -p`（`chat-reply.mjs`，边界与 reply_only 同一份 `ZERO_TOOL_ARGS`，默认 60 秒预算）把回答当回执返回，尾行标明未接入；机器级 chat 账本（`chat-ledger.mjs`）：同一条消息只答一次、重放按记录重出，正在答的条数有全局 2 / 每人 1 的上限；路由说不清（同一会话命中多条绑定、登记表有读不清的项）报错而不是降级成 chat；Codex 链的 chat 同样靠本机 claude CLI，安装器 / doctor ⑧ / 状态页都核这一项，不可用就报 chat_reply_path_unavailable；`/feishu-bind` 在这里回接入指引，unbind / pin-session 仍不开放，形状不对仍拒；超时 / 失败如实说，不冒充回答；两条链共用（回答由 `claude -p` 出，与链的投递路径无关）。状态页第 4 层对未接入显示 chat |
 | 发送者角色（第 2 层） | `node scripts/register-sender.mjs --template <该链 chain-config.json> --open-id <数字> --role operator\|participant [--apply]` | 同左 | 往链路模板的 `senders` 登记 / 移除一个人（owner 只有一个，就是 `frank_sender_id`，不在这里登记）；默认预览，写入要 owner 逐次授权；`--remove` 移除。第 1 层只登记与显示（`/feishu-subscribe`、状态页第 2 层「发送者角色」只出数量），入站判定按上一行（角色 × 风险 × 模式）决定 |
+| 已验证私聊白名单 | `node scripts/register-p2p-chat.mjs --template <该链 chain-config.json> --add\|--remove <oc_…> [--apply]` | 同左 | 往链路模板的 `verified_p2p_chat_ids` 登记 / 移除一个私聊 chat id；未登记的私聊一律按群处理（拒绝 + hint）。**`--add` 是 owner 对「这个 chat_id 已线下验证为私聊」的信任声明**——脚本只校验 oc_ 形状（小写字母数字、≤ 64）并拒登记群，不在线验证 chat 类型；默认预览，写入要 owner 逐次授权（写入走维护门 + 备份 + 原子写） |
 | bind | `$feishu-bind` | `/feishu-bind` | 首次接入，或恢复已暂停的原话题连接 |
 | rotate | `$feishu-rotate` | `/feishu-rotate` | 为同一 binding 创建下一话题代际；旧话题保留为历史（仍可下指令，回复回原话题） |
 | mode（飞书侧） | 正文恰为 `$feishu-mode dialogue` / `mapping` | 正文恰为 `/feishu-mode dialogue` / `mapping` | 入站路由器当场切换交互模式并回执，不投递给会话（2026-08-28 起）。"恰为"按词算：不可见字符、不换行/全角空格、全角斜杠先折叠，多一个字仍走普通路径 |
@@ -260,7 +261,7 @@ session 绑定。日常还可以使用：
 接入时，它同时物化现有单群配置下的订阅授权快照，但不等同于未来可独立管理的 Subscription。
 架构路线图中的 `$feishu-connect` 已确认**不做**（Aily 侧的连接是被动的，本机没有「发起」这个动作；
 本机那一半归端点自检）。`/feishu-subscribe` / `$feishu-subscribe` **两条链都可用，只读**。
-写入口的现状：发送者角色表可以登记（`register-sender.mjs`，写入需 owner 逐次授权）；订阅控制面的
+写入口的现状：发送者角色表可以登记（`register-sender.mjs`，写入需 owner 逐次授权）；已验证私聊白名单可以登记（`register-p2p-chat.mjs`，同上：`--add` 是对线下验证过私聊的信任声明，写入需 owner 逐次授权）；订阅控制面的
 登记入口已开放（FR-2.6 单 1：`register-subscription.mjs`，落盘独立 store，同样 owner 逐次授权），
 但 store 尚未接入权威投影与切流 —— 落盘暂不改变生产认领 / 路由（切流前置：chat locator 验证与
 多订阅歧义的真实样本；FR-2.5 的授权快照同步链路已经完成）。

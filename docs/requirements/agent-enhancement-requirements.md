@@ -366,5 +366,8 @@ Relay 必须显式使用新的 policy version；其预算分别统计 human cycl
   版本；
 - 管理模式中哪些 execute 动作可以预授权，哪些始终逐次授权；
 - 多人场景的角色模型与飞书组织身份如何映射。
-- 重新验证 Aily daemon 注入的 `AILY_CLI_CHANNEL_THREAD_ID` 与真实飞书 topic/root/session locator 的
-  对应关系、稳定性和安全性；验证完成前继续保留绑定短码，不把一次观测固化为契约。
+- `channel-locator-verdict.md`（2026-09-02 真机对照）已把该项收口：`AILY_CLI_CHANNEL_THREAD_ID` 是
+  **Aily 命名空间的 thread 标识**，不是飞书 `omt_` locator（§2-2），不能用于飞书寻址，只作「同话题归属」
+  的相对判据 → 绑定短码保留用于飞书寻址，不把一次观测固化为契约。`AILY_CLI_CHANNEL_CHAT_ID` 则已证
+  实为飞书 chat_id、可升级为路由判据（§2-1/§4，fail-safe 不盲信）：私聊路由改为**白名单正向命中**
+  （模板 `verified_p2p_chat_ids`，见 `register-p2p-chat.mjs`）。判据仍留 fail-safe 与跨版本复验边界。

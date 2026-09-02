@@ -52,6 +52,12 @@ Git 外日志路径。共享 dispatcher 只负责 endpoint 校验、一次取信
 `extensions.aily_channel`，并固定标记 `verified: false`。它们不会进入 `source.chat_id/topic_id`，
 也不能被 selector 当作路由或授权事实。
 
+本契约的 Canonical 数据面保持上述 `verified: false`；**仅**在 legacy aily-inbound handler（直接读
+环境量、不经 Canonical selector 的那条路径）里，`AILY_CLI_CHANNEL_CHAT_ID` 才被读作私聊判据，
+且须**正向命中**模板 `verified_p2p_chat_ids` 白名单才成立（`channel-locator-verdict.md` §2-1/§4，
+登记表里的 chat_id 已线下验证过，fail-safe 不盲信）。`AILY_CLI_CHANNEL_THREAD_ID` 是 **Aily 命名空间的 thread 标
+识符**，不是飞书 `omt_` locator（verdict §2-2）：只作「同话题归属」的相对判据，从不用于飞书寻址。
+
 现有 handler 暂时通过 `legacyEventFromCanonical()` 取得原事件视图。这样可以先统一运输契约，后续
 `refactor/mapping-policy-handler` 再让公共 ingress kernel 直接消费 Canonical Event，避免在一个 PR
 同时改变运输、权限和业务路由。

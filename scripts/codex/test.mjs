@@ -4255,7 +4255,7 @@ test("群名优先用 task 自己的覆盖，而不是把知道的说成不知�
   const task = makeTaskEntry({ root, threadId: THREAD_A, name: "S",
     rootMessageId: "om_root", token: "a1b2c3" });
   // **task 自己覆盖了群**（不是模板那个群）。
-  task.chat_id = "oc_task_own_group";
+  task.chat_id = "oc_taskowngroup";
   task.chat_name = "这条 task 自己的群";
   writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
@@ -9120,7 +9120,9 @@ test("Codex 真入口：off-template mismatch + 无 @ → 拒绝回执带诊断 
         AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "aily_unbound_p2p", AILY_CLI_RUN_ID: "run_hint", FAKE_AILY_ENVELOPE: envelope, ...extraEnv },
     });
   };
-  const mism = run({ AILY_CLI_CHANNEL_CHAT_ID: "oc_direct_x" });
+  // #12/#R11：mismatch 且白名单未登记（且 thread 有值）的「外部群话题」才走拒 + hint；
+  // 白名单内的私聊走 chat 回答（见 #12 Codex 链测试，那里有假 claude）。
+  const mism = run({ AILY_CLI_CHANNEL_CHAT_ID: "oc_directx", AILY_CLI_CHANNEL_THREAD_ID: "omt_hint_x" });
   assert.equal(mism.status, 0, mism.stdout + mism.stderr);
   assert.match(mism.stdout, /没有真实 @ M5Codex/u, "Codex 化措辞不变：" + mism.stdout);
   assert.match(mism.stdout, /诊断：本轮频道与登记群不一致/u, "hint 不许被本地重建文案丢掉：" + mism.stdout);
@@ -9654,7 +9656,7 @@ test("#R11 Codex 链采样三态：频道==登记群 → true；不一致 → fa
   const { sampleFile, run } = codexChanRun();
   const r1 = run({ messageId: "om_cx_grp", envChat: TEMPLATE.chat_id, envThread: "om_cx_thread" });
   assert.equal(r1.status, 0, r1.stderr);
-  const r2 = run({ messageId: "om_cx_dm", envChat: "oc_p2p_direct" });
+  const r2 = run({ messageId: "om_cx_dm", envChat: "oc_p2pdirect" });
   assert.equal(r2.status, 0, r2.stderr);
   const r3 = run({ messageId: "om_cx_miss" });
   assert.equal(r3.status, 0, r3.stderr);
@@ -9734,6 +9736,73 @@ test("#R10 Codex 真入口 accepted：成功投递落下 disposition=accepted �
   assert.equal(row.schema_version, "1.0");
   assert.equal(typeof row.message_id, "string", "message_id 落哈希不落明文");
   assert.doesNotMatch(JSON.stringify(row), /oc_|ou_|om_/u, "整行不泄任何 locator 明文前缀");
+});
+
+// ── #12 私聊判据：Codex 链真入口行为（chat≠模板 + thread 缺失 → 豁免 @ 起模型；thread 有值 → 照旧拒 + hint）
+const codexPrivateHarness = (registry = true) => {
+  const home = temp();
+  const root = temp();
+  // #R11 P1-1：私聊以已验证登记表正向命中（verified_p2p_chat_ids），不再是结构签名。
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({ ...TEMPLATE, verified_p2p_chat_ids: ["oc_cxprivate"] }));
+  if (registry) writeRegistryFixtureUnvalidated(
+    [makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" })],
+    path.join(home, "registry.json"));
+  const bin = path.join(home, "bin"); fs.mkdirSync(bin, { recursive: true });
+  const claudeLog = path.join(home, "claude-argv.jsonl");
+  // Codex 链 chatTurn 先判路径可用（--version）再答（-p），两份请求都要能对；Claude 链只答 -p。
+  fs.writeFileSync(path.join(bin, "claude"), ["#!/usr/bin/env node",
+    "const fs = require('node:fs'); fs.appendFileSync(" + JSON.stringify(claudeLog) + ", JSON.stringify(process.argv.slice(2)) + '\\n');",
+    "if (process.argv.includes('--version')) { process.stdout.write('1.2.3'); process.exit(0); }",
+    "process.stdout.write('回答：' + process.argv[process.argv.indexOf('-p') + 1].slice(0, 40) + '\\n');",
+  ].join("\n") + "\n", { mode: 0o700 });
+  const seq = { n: 0 };
+  const run = (content, opts = {}) => {
+    seq.n += 1;
+    const event = { message_id: "msg_cx_private_" + seq.n, session_id: "sess_private", sender_id: opts.sender ?? TEMPLATE.frank_sender_id, created_at_ms: Date.now(), content };
+    const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home, PATH: bin + path.delimiter + process.env.PATH, AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, FEISHU_BRIDGE_ENVELOPE: JSON.stringify(event) };
+    delete env.AILY_CLI_CHANNEL_CHAT_ID; delete env.AILY_CLI_CHANNEL_THREAD_ID;
+    if (opts.chat !== undefined) env.AILY_CLI_CHANNEL_CHAT_ID = opts.chat;
+    if (opts.thread !== undefined) env.AILY_CLI_CHANNEL_THREAD_ID = opts.thread;
+    return { spawn: spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "inbound.mjs")], { encoding: "utf-8", env }), claudeLog };
+  };
+  return { home, run };
+};
+
+// Codex 链 chatReply 用 claude CLI（与 Claude 链同路），两条链在「私聊会话、外面 @」上必须一致；
+// 这里只抽 Codex 链真入口：私聊白名单命中（无 @ 起模型）、外部群话题拒 + hint、群里拒但不带 hint。
+test("#12 Codex 链：私聊（已验证登记表正向命中）豁免 @ 闸起 claude 回答；外部群话题照旧拒 + hint；群消息不变", () => {
+  const h = codexPrivateHarness();
+  // ① 私聊（登记表含 oc_cxprivate + thread 缺失）owner + 无 @ → 先判路径可用（--version）再起模型（-p）
+  const r1 = h.run("帮我看看方案", { chat: "oc_cxprivate" });
+  assert.equal(r1.spawn.status, 0, r1.spawn.stdout + r1.spawn.stderr);
+  assert.match(r1.spawn.stdout, /^回答：帮我看看方案/mu, "Codex 私聊走 chat 回答：" + r1.spawn.stdout);
+  assert.doesNotMatch(r1.spawn.stdout, /没有真实 @|已拒绝/u);
+  const log1 = fs.readFileSync(r1.claudeLog, "utf-8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  assert.deepEqual(log1.map((a) => a[0]), ["--version", "-p"], "先判路径可用（--version）再答（-p）");
+  assert.equal(log1[1][1], "帮我看看方案", "私聊正文原样给模型");
+  // ② 私聊 + 未登记发送者：角色闸照旧拒，不因私聊豁免改变
+  const r2 = h.run("你好", { sender: "999", chat: "oc_cxprivate" });
+  assert.match(r2.spawn.stdout, /已拒绝 · 发送者不是授权用户/u, r2.spawn.stdout);
+  // ③ 外部群话题（thread 有值）+ 无 @ → 不豁免：照旧拒 + hint（#111 P1 纪律）
+  const r3 = h.run("接着弄", { chat: "oc_cxext", thread: "omt_cx_thread" });
+  assert.match(r3.spawn.stdout, /已拒绝 · 没有真实 @/u, r3.spawn.stdout);
+  assert.match(r3.spawn.stdout, /诊断：本轮频道与登记群不一致，未接入的群/u, "外部群话题要带 hint：" + r3.spawn.stdout);
+  // ④ 群（= 模板 chat）+ 无 @ → 照旧拒且不带 hint（行为一字不变）
+  const r4 = h.run("接着弄", { chat: TEMPLATE.chat_id });
+  assert.match(r4.spawn.stdout, /已拒绝 · 没有真实 @/u, r4.spawn.stdout);
+  assert.doesNotMatch(r4.spawn.stdout, /诊断：/u, "群内无 mismatch 不许带 hint：" + r4.spawn.stdout);
+});
+
+// #R11 P1-2（Codex 侧）：promotion 底层不豁免 @ —— 已验证私聊（登记表命中）在认领路径仍必须真实 @。
+test("#R11 P1-2（Codex）：promotion 底层不豁免 @ —— 登记表命中的私聊 + 无 @ + 有效 pending → transport_not_mentioned", () => {
+  const now = Date.now();
+  const whitelist = { ...TEMPLATE, verified_p2p_chat_ids: ["oc_cxwhitelisted"] };
+  const priv = { message_id: "m1", session_id: "s1", sender_id: TEMPLATE.frank_sender_id, created_at_ms: now, content: "能收到吗（没有 @）" };
+  const r = evaluatePromotion({
+    event: priv, template: whitelist, pending: { ok: true, task: { logical_task_key: "x" } }, now,
+    env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_cxwhitelisted" } });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "transport_not_mentioned");
 });
 
 summarySealed = true;

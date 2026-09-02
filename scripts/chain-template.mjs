@@ -57,7 +57,7 @@ export const CHAIN_FIELDS = [
  * 刻意跟必填分开：往 CHAIN_FIELDS 里加一个字段，等于让所有已经生成好的模板
  * 立刻变成「不完整」而全线拒绝 —— 加字段不该是一次静默的破坏性变更。
  */
-export const OPTIONAL_CHAIN_FIELDS = ["lark_cli_config_base", "bridge_root", "aily_cli_bin", "senders"];
+export const OPTIONAL_CHAIN_FIELDS = ["lark_cli_config_base", "bridge_root", "aily_cli_bin", "senders", "verified_p2p_chat_ids"];
 
 /** 项目级字段：每个项目不同，由 bind-project 现场算出来。 */
 export const PROJECT_FIELDS = [
@@ -90,7 +90,33 @@ const SHAPE = {
   lark_cli_config_base: (v) => typeof v === "string" && v.startsWith("/"),
   default_freshness_ms: (v) => typeof v === "number" && Number.isFinite(v) && v > 0,
   senders: (v) => Array.isArray(v),
+  // 已验证私聊 chat 白名单（#R11 P1-1，Frank 拍板 b 选项）：非空字符串、唯一、oc_ 形状。
+  // 空数组合法（= 没登记任何私聊放行）；缺省走 OPTIONAL_CHAIN_FIELDS 不报错，旧模板仍合法。
+  // 形状判据是 p2pChatIdProblem（#R12 P1 统一）：CLI 参数、planP2pChange、模板校验共用同一份。
+  verified_p2p_chat_ids: (v) => Array.isArray(v) &&
+    new Set(v).size === v.length &&
+    v.every((x) => p2pChatIdProblem(x) === null),
 };
+
+/**
+ * chat-id 形状的唯一判据（#R12 P1）：oc_ 前缀 + 小写字母数字，总长 ≤ 64。
+ *
+ * 放 chain-template 层的理由：模板校验器是四个使用点（validateChainTemplate / CLI 参数 /
+ * planP2pChange / isPrivateChatTurn）的共同上游，且 CLI 与 plan 本来就 import 本模块，
+ * inbound-route 也已 import —— 放这里零新增依赖，也不给 register-p2p-chat 留第二份正则的机会
+ * （评审探针：两处判据已经漂移过一次，宽松版放过 "oc_" 裸前缀和控制字符）。收紧到 [a-z0-9]
+ * 是评审建议：真实 chat_id = oc_ + 32 位小写 hex，大写 / 下划线从不是合法值；长度上限挡
+ * 超长垃圾值，同时不把未来的合法值挡在外面。
+ */
+// {1,61}：oc_ 三字符 + 后缀 ≤61 = 总长 ≤64（评审 #120 三轮：量词曾写 64 使总长可到 67，与声明不符）
+export const P2P_CHAT_ID_RE = /^oc_[a-z0-9]{1,61}$/u;
+
+/** 共用形状判据：合法返回 null，非法返回一句人话（含原值，控制字符会被 JSON.stringify 转义）。 */
+export function p2pChatIdProblem(chatId) {
+  if (typeof chatId !== "string" || chatId.length === 0) return "chat id 必须是非空字符串";
+  if (!P2P_CHAT_ID_RE.test(chatId)) return "chat id 必须是 oc_ 前缀 + 小写字母数字（总长 ≤ 64）：" + JSON.stringify(chatId);
+  return null;
+}
 
 /**
  * 校验模板。返回缺的和形状不对的，不抛 —— 调用方要把两类问题一次全说出来，
@@ -118,6 +144,11 @@ export function validateChainTemplate(tpl) {
   // 发送者角色表与 frank_sender_id 的交叉校验（唯一判据在 sender-roles.mjs）。
   const rolesProblem = senderRolesProblem(tpl);
   if (rolesProblem !== null) inconsistent.push(rolesProblem);
+  // 登记群不是私聊：把模板自己的 chat_id 登进私聊白名单是误配（群消息会被当私聊早分流）。
+  if (Array.isArray(tpl?.verified_p2p_chat_ids) && tpl?.chat_id &&
+      tpl.verified_p2p_chat_ids.includes(tpl.chat_id)) {
+    inconsistent.push("verified_p2p_chat_ids 不能包含登记群 chat_id（它是群，不是私聊）");
+  }
   if (tpl?.outbound_app_id && tpl.outbound_app_id === tpl.transport_app_id &&
       tpl.outbound_open_id !== tpl.transport_open_id) {
     inconsistent.push("outbound_open_id 与 transport_open_id 不一致，但两者是同一个应用");

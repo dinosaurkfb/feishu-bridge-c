@@ -18,7 +18,7 @@ import fs from "node:fs";
 import { senderRole } from "./sender-roles.mjs";
 import path from "node:path";
 
-import { loadChainTemplate } from "./chain-template.mjs";
+import { loadChainTemplate, p2pChatIdProblem } from "./chain-template.mjs";
 import {
   acquirePublishLock, loadRegistry, registryPath, releasePublishLock,
 } from "./registry.mjs";
@@ -332,10 +332,10 @@ export function evaluatePromotion({ event, template, pending, now = Date.now(), 
   }
 
   if (event?.sender_id !== frank) return reject(PROMOTE_REJECT.SENDER_NOT_FRANK);
+  // #R11 P1-2：promotion 底层**不许豁免 @**。私聊豁免只放在 evaluateChatGates（chat 默认态）；
+  // 认领 pending 必须带真实 @——否则早分流漏接时，私聊能凭「无 @」从私聊认领 pending。
   if (!extractMentionIds(event?.content).includes(transport)) {
     const r = reject(PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
-    // 评审定案（PR #111 P1）：unverified locator 的 mismatch 不许豁免 @ 闸，只作诊断 hint。
-    // 真机私聊挂着待认领代际时走的就是这条闸 —— hint 让私聊里的 Frank 看懂发生了什么。
     if (isOffTemplateChatTurn({ template, env })) r.reasonText += OFF_TEMPLATE_HINT;
     return r;
   }
@@ -367,20 +367,52 @@ export const CHAT_FALLBACK_REASONS = Object.freeze([
   PROMOTE_REJECT.SENDER_NOT_FRANK,
 ]);
 /**
+ * 私聊判据（#R11 P1-1 定案，Frank 拍板 b 选项）：**正向白名单**，不是结构签名。
+ *
+ * 评审 P1-1 指出 #12 的结构签名把「thread 缺失」当正证据——但那也可能是「Aily 没注入 thread」，
+ * 无法与「私聊本来没 thread」区分；且违反 verdict §4 的 fail-safe（要素缺失应回落，不是当正据）。
+ * 所以主判据换成模板里的 `verified_p2p_chat_ids`（已验证私聊 chat 登记表，register-p2p-chat.mjs 维护）：
+ *   表缺失 / 非数组 / 空表 → false（没登记就是没放行，完全 fail-safe）
+ *   表不含 chatId → false
+ *   表含 chatId（逐字）&& chatId ≠ 模板登记群 && thread 缺失/空 → true
+ * `thread 缺失/空` 在这里只是**纵深防御**（外部群话题的 thread 有值，白名单里的 chat 也拒），
+ * 不再是主判据；chatId ≠ 模板群二者之一是私聊的语义前提（群消息即便被误登记也按群处理）。
+ */
+export function isPrivateChatTurn({ template, env = process.env } = {}) {
+  const chatId = typeof env?.AILY_CLI_CHANNEL_CHAT_ID === "string" ? env.AILY_CLI_CHANNEL_CHAT_ID : "";
+  // 形状判据用同一份 p2pChatIdProblem（#R12 P1）：env 值是 unverified locator，形状不合法
+  // 直接不放行 —— 逐字 includes 本来也拦得住，但显式走同一份判据，四个使用点不会漂移。
+  if (chatId.length === 0 || p2pChatIdProblem(chatId) !== null) return false;
+  // 主判据：正向验过的私聊登记表。缺 / 非数组 / 空 → false（没登记就没有私聊放行）。
+  const whitelist = template?.verified_p2p_chat_ids;
+  if (!Array.isArray(whitelist) || whitelist.length === 0) return false;
+  if (!whitelist.includes(chatId)) return false;
+  // 群里（= 模板登记的群 chat）语义上不是私聊——即便被误登记进白名单也按群处理。
+  // 模板 chat_id 缺失 / 坏形状时跳过这条群判，白名单照常判定（登记表本身已被
+  // validateChainTemplate 守过；这里坏的是群 id，不是放行白名单）。
+  const templateChatId = typeof template?.chat_id === "string" ? template.chat_id : "";
+  if (templateChatId.length > 0 && p2pChatIdProblem(templateChatId) === null && chatId === templateChatId) return false;
+  // 纵深防御：thread 形态异常（非字符串）或 thread 有值 → 外部群话题/群内线程，不是私聊。
+  const rawThread = env?.AILY_CLI_CHANNEL_THREAD_ID;
+  if (rawThread !== undefined && rawThread !== null && typeof rawThread !== "string") return false;
+  if (typeof rawThread === "string" && rawThread.length > 0) return false;
+  return true;
+}
+
+// 两道 @ 闸（promotion / chat）共用同一句 hint —— 只解释，不改变任何判定。
+// 私聊已开通（真机验证），hint 只描述「未接入的群」这一场景。
+export const OFF_TEMPLATE_HINT =
+  "（诊断：本轮频道与登记群不一致，未接入的群消息暂不自动应答；请到已绑定话题里 @ 我）";
+
+/**
  * off-template 观察（**诊断用，不是路由事实**——评审 PR #111 P1 定案）：本轮 Aily turn 的
  * 频道 locator 与链模板登记的群 chat 不一致。
  *
- * 事件链里没有 chat_type 字段（canonical event、CHAIN_FIELDS、AILY_CLI_* 变量全集都没有）；
  * 这里读 daemon 注入的 AILY_CLI_CHANNEL_CHAT_ID（dispatcher 只删 SESSION / RUN 两个键，
- * child 原样继承；canonical.extensions.aily_channel 同源、标注 unverified）对照模板 chat_id。
- * 「不一致」只能证明 locator 不同 —— 可能是私聊，也可能是外部群或模板 locator 过期，
- * 所以它**不豁免任何闸**，只用于往 transport_not_mentioned 的拒绝回执里追加 OFF_TEMPLATE_HINT。
- * env 缺失或模板没有 chat_id → false（连 hint 都不加）。
+ * child 原样继承）对照模板 chat_id。「不一致」只能证明 locator 不同——可能是私聊，也可能是
+ * 外部群或模板 locator 过期，所以它**不豁免任何闸**，只用于往 transport_not_mentioned 的
+ * 拒绝回执里追加 OFF_TEMPLATE_HINT。env 缺失或模板没有 chat_id → false（连 hint 都不加）。
  */
-// 两道 @ 闸（promotion / chat）共用同一句 hint —— 只解释，不改变任何判定。
-export const OFF_TEMPLATE_HINT =
-  "（诊断：本轮频道与登记群不一致，可能是私聊或未接入的群；私聊在频道 locator 完成验证前暂不开放，请到绑定话题里 @ 我）";
-
 export function isOffTemplateChatTurn({ template, env = process.env } = {}) {
   const chatId = typeof env?.AILY_CLI_CHANNEL_CHAT_ID === "string" ? env.AILY_CLI_CHANNEL_CHAT_ID : "";
   const templateChatId = typeof template?.chat_id === "string" ? template.chat_id : "";
@@ -398,11 +430,11 @@ export function evaluateChatGates({ event, template, now = Date.now(), env = pro
   }
   const role = senderRole({ frank_sender_id: frank, senders: template?.senders }, event?.sender_id);
   if (role === null) return reject(PROMOTE_REJECT.SENDER_NOT_FRANK);
-  if (!extractMentionIds(event?.content).includes(transport)) {
+  if (!extractMentionIds(event?.content).includes(transport) &&
+      !isPrivateChatTurn({ template, env })) {
+    // #R11 P1-1：私聊豁免 @ 闸只放在 chat 默认态这里，判据 = 已验证私聊登记表正向命中（thread 纵深防御）。
+    // 非白名单的 off-template（外部群话题 / 模板 locator 过期 / 未登记私聊）仍拒 + hint。
     const r = reject(PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
-    // 评审定案（PR #111 P1）：unverified locator 的 mismatch 不许豁免 @ 闸，只作诊断 hint ——
-    // 「频道 ≠ 登记群」证明不了私聊（可能是外部群 / 模板 locator 过期），但足以让这条拒绝
-    // 对着私聊里的 Frank 说清楚发生了什么。
     if (isOffTemplateChatTurn({ template, env })) r.reasonText += OFF_TEMPLATE_HINT;
     return r;
   }

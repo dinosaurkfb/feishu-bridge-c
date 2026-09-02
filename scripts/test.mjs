@@ -17,7 +17,7 @@ import { CHAT_POLICY_ID, CHAT_REPLY_ARGS, CHAT_FOOTER, CHAT_BIND_GUIDE, chatRepl
 import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome, chatRecordProblem, isAdmissionLockEntry, classifyAdmissionLockEntry, inspectAdmissionLocks, inspectScratch, sweepScratch, classifyTmpEntry, lockUnclearedText, CHAT_MAX_CONCURRENT, CHAT_MAX_PER_SENDER, TMP_NAME_SHAPE } from "./chat-ledger.mjs";
 import { parseChatScratchSweepArgs, describeScratchSweep, sweepExitCode } from "./chat-scratch-sweep.mjs";
 import { acquireLockUngated, acquirePublishLock as acquireLedgerLock, releasePublishLock as releaseLedgerLock } from "./registry.mjs";
-import { evaluateChatGates, CHAT_FALLBACK_REASONS, isOffTemplateChatTurn } from "./inbound-route.mjs";
+import { evaluateChatGates, CHAT_FALLBACK_REASONS, isOffTemplateChatTurn, isPrivateChatTurn } from "./inbound-route.mjs";
 import { appendChannelSample, channelDisposition, channelSampleProblem, channelSampleSha16, loadChannelSamples } from "./channel-samples.mjs";
 import { ZERO_TOOL_ARGS } from "./handoff.mjs";
 import { INTENT, parseInboundIntent, controlRejectText, rejectedControlProjection, shown } from "./inbound-intent.mjs";
@@ -26,6 +26,7 @@ import { REJECTED_CONTROL_INTENTS, rejectedControlProblem } from "./control-inte
 import { AUTHORIZATION_TABLE, authorize, CAPABILITY, REPLY_ONLY_CAPABLE } from "./authorize.mjs";
 import { SENDER_ROLES, roleCounts, roleCountsText, senderRole, senderRolesProblem, senderTable, roleEntriesProblem } from "./sender-roles.mjs";
 import { parseRegisterSenderArgs, planSenderChange, applySenderChange } from "./register-sender.mjs";
+import { parseRegisterP2pArgs, planP2pChange, applyP2pChange } from "./register-p2p-chat.mjs";
 // symlink 锁：existsSync 会跟随到不存在的目标，锁在不在只能用 lstat 判
 const lockPresent = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
 import os from "node:os";
@@ -104,7 +105,7 @@ import { DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliveryPinPat
 import { extractReply } from "./stop-hook.mjs";
 import { postDeliveryBits } from "./publish-outcome.mjs";
 import { foreignHint, projectLabel } from "./stop-note.mjs";
-import { CHAIN_FIELDS, assertPublishIdentity, materializeProjectConfig, resolveLarkIdentity, validateChainTemplate, withChainTemplateWrite, describeTemplateWrite } from "./chain-template.mjs";
+import { CHAIN_FIELDS, assertPublishIdentity, materializeProjectConfig, resolveLarkIdentity, validateChainTemplate, withChainTemplateWrite, describeTemplateWrite, p2pChatIdProblem } from "./chain-template.mjs";
 import {
   PURPOSE_MAX, bindingToken, composeRootMessage, composeStatusMessage,
   firstSentence, idempotencyKeyFor, newRegistryEntry, readProjectIdentity,
@@ -640,7 +641,7 @@ const dialogueAuthorizationFixture = () => {
     agent_uid: "agent_m5claude",
     transport_open_id: M5CLAUDE,
     frank_sender_id: FRANK,
-    chat_id: "oc_private_dialogue",
+    chat_id: "oc_privatedialogue",
     default_freshness_ms: 10 * 60 * 1000,
   };
   const model = buildLegacySubscriptionReadModel({
@@ -1193,7 +1194,7 @@ test("chat scope probe 只记录脱敏 presence 与一致性，不提升 canonic
   assert.equal(absent.probe.chat_scope_match, null);
 
   const mismatch = structuredClone(matching);
-  mismatch.extensions.aily_channel.chat_id = "oc_other_private";
+  mismatch.extensions.aily_channel.chat_id = "oc_otherprivate";
   const mismatched = createDialogueChatScopeProbe({
     snapshot: synced.snapshot, canonicalEvent: mismatch, observedAt: NOW,
   });
@@ -1203,7 +1204,7 @@ test("chat scope probe 只记录脱敏 presence 与一致性，不提升 canonic
   assert.equal(sameDialogueChatScopeProbeObservation(created.probe, mismatched.probe), false);
 
   const serialized = JSON.stringify([created.probe, absent.probe, mismatched.probe]);
-  for (const secret of [fixture.template.chat_id, "opaque-runtime-thread", "oc_other_private",
+  for (const secret of [fixture.template.chat_id, "opaque-runtime-thread", "oc_otherprivate",
     fixture.template.frank_sender_id, fixture.privateBindingKey]) {
     assert.equal(serialized.includes(secret), false, "scope probe 泄露私有输入：" + secret);
   }
@@ -1955,7 +1956,7 @@ test("Chat scope attestation 对任何一条损坏或互相矛盾的证据整体
   assert.equal(withCorrupted.attestation.sample_count, 0, "损坏证据不能保留部分计数凑数");
 
   const conflictingOne = buildProbe({ suffix: "z" });
-  const conflictingTwo = buildProbe({ suffix: "z", chatId: "oc_other_private" });
+  const conflictingTwo = buildProbe({ suffix: "z", chatId: "oc_otherprivate" });
   assert.equal(conflictingOne.probe_id, conflictingTwo.probe_id,
     "同一 snapshot/event 的观测必须落在同一冲突域");
   assert.notEqual(conflictingOne.evidence_hash, conflictingTwo.evidence_hash);
@@ -2214,7 +2215,7 @@ test("Chat scope attestation 要求全部样本 locator 存在且 chat scope 一
   const mismatch = evaluateDialogueChatScopeAttestation({
     snapshot,
     probes: [buildProbe({ suffix: "4" }), buildProbe({ suffix: "5" }),
-      buildProbe({ suffix: "6", chatId: "oc_other_private" })],
+      buildProbe({ suffix: "6", chatId: "oc_otherprivate" })],
     now: NOW,
   });
   assert.equal(mismatch.attestation.status, CHAT_SCOPE_ATTESTATION_STATUS.UNVERIFIED);
@@ -2238,7 +2239,7 @@ test("Chat scope attestation 在足够、独立、新鲜且一致的真实观测
   assert.equal(validateDialogueChatScopeAttestation(result.attestation).ok, true);
 
   const serialized = JSON.stringify(result.attestation);
-  assert.equal(serialized.includes("oc_private_dialogue"), false,
+  assert.equal(serialized.includes("oc_privatedialogue"), false,
     "attestation 不得包含原始 chat_id");
   assert.equal(serialized.includes("opaque-runtime-thread"), false,
     "attestation 不得包含原始 thread locator");
@@ -5215,6 +5216,19 @@ test("没有真实 <at> → 拒；手打的 @名字 不算", () => {
       event: { ...okEvent, content }, template: TPL, pending: pendingOf(f), now: NOW2 });
     assert.equal(r.reason, PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED, content);
   }
+});
+
+test("#R11 P1-2：promotion 底层不豁免 @ —— 已验证私聊（登记表命中）在认领路径仍必须真实 @，无 @ 一律 transport_not_mentioned", () => {
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  const whitelist = { ...TPL, verified_p2p_chat_ids: ["oc_p2pverified"] };
+  // 私聊 env（chat≠模板 + thread 缺失）且已在白名单里，恰好落在"私聊豁免 @"那类误判的点上；
+  // 认领必须看真实 @ —— 早分流漏接时，私聊不能凭"无 @"从私聊认领 pending。
+  const priv = { sender_id: TPL.frank_sender_id, content: "能收到吗", created_at_ms: NOW2 };
+  const r = evaluatePromotion({
+    event: priv, template: whitelist, pending: pendingOf(f), now: NOW2,
+    env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2pverified" } });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
 });
 
 test("消息太旧 → 拒，防重放", () => {
@@ -16504,7 +16518,7 @@ test("第五区 run 通道：只转述 inspectRunChannel 的结论 —— 未查
   assert.equal(redactLocators("01911111-2222-7333-8444-555555555555 " + "A".repeat(64)), "01911111… AAAAAAAA…");
   assert.equal(redactLocators("om_ab oc_12345"), "om_ab oc_12345", "主体不足 6 位的不是 locator 形状，不动");
   assert.equal(redactLocators("topic_generation_state_invalid reason_on_disk"), "topic_generation_state_invalid reason_on_disk", "词中间的 on_ 不是 locator");
-  assert.equal(redactLocators("prefix_oc_abcdef_suffix group_oc_123456"), "prefix_oc_… group_oc_…", "下划线是分隔符：其后的 locator 照样脱敏");
+  assert.equal(redactLocators("prefix_oc_abcdefsuffix group_oc_123456"), "prefix_oc_… group_oc_…", "下划线是分隔符：其后的 locator 照样脱敏");
   assert.equal(sanitizeForDisplay("a" + String.fromCharCode(10) + "b" + ESC + "[2Jc" + String.fromCharCode(0x2028) + "d" + String.fromCharCode(0x61c) + "e" + String.fromCharCode(0x9f) + "f"),
     "a\uFFFDb\uFFFD[2Jc\uFFFDd\uFFFDe\uFFFDf");
   assert.equal(displaySafe("runs/evil" + ESC + "[2J-" + "b".repeat(64) + ".jsonl"), "runs/evil\uFFFD[2J-bbbbbbbb….jsonl", "未识别文件名：控制符压平 + 摘要脱敏");
@@ -19550,6 +19564,56 @@ test("发送者角色表（第 1 层）：唯一判据、模板交叉校验、�
   assert.equal(fs.readFileSync(tplFile, "utf-8"), beforeBad, "结果校验不过零写入");
 });
 
+test("#R11 私聊白名单登记（register-p2p-chat）：预览不写、apply 备份+原子写+读回；登记群拒；重复 add / 未登记 remove 清晰拒", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-p2p-cli-"));
+  const tplFile = path.join(home, "chain-config.json");
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  const cli = (...args) => spawnSync(process.execPath, [path.resolve("scripts", "register-p2p-chat.mjs"), ...args], { encoding: "utf-8", env: { ...process.env, HOME: home } });
+  // 参数封闭：缺参 / 模板不绝对 / 非 oc_ 形状 / add+remove 互斥 / 重复参数 都拒
+  assert.equal(cli().status, 2);
+  assert.equal(cli("--template", "relative.json", "--add", "oc_p2p").status, 2, "模板必须是绝对路径");
+  assert.equal(cli("--template", tplFile, "--add", "not_oc").status, 2, "私聊 chat 必须是 oc_ 形状");
+  assert.equal(cli("--template", tplFile, "--add", "oc_aa", "--remove", "oc_bb").status, 2, "add/remove 互斥");
+  assert.equal(parseRegisterP2pArgs(["--template", tplFile, "--add", "oc_aa", "--add", "oc_bb"]).reason, "duplicate_argument");
+  assert.equal(parseRegisterP2pArgs(["--template", "relative.json", "--add", "oc_aa"]).reason, "template_required_absolute");
+  assert.equal(parseRegisterP2pArgs(["--template", tplFile, "--add", "bad"]).reason, "chat_id_shape_oc");
+  // 预览不写：dry-run 显示动作与后果，模板一字不动
+  const preview = cli("--template", tplFile, "--add", "oc_p2pdirect");
+  assert.equal(preview.status, 0, preview.stdout + preview.stderr);
+  assert.match(preview.stdout, /登记 oc_p2pdirect[\s\S]*白名单  ：1 个（改后）[\s\S]*\[dry-run\] 什么都没写/u, preview.stdout);
+  assert.deepEqual(JSON.parse(fs.readFileSync(tplFile, "utf-8")), TPL, "预览不写");
+  // apply：备份 + 原子写 + 读回，模板过同一份校验
+  const applied = cli("--template", tplFile, "--add", "oc_p2pdirect", "--apply");
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  assert.match(applied.stdout, /已写入（锁内重读重算后）。备份：/u);
+  const written = JSON.parse(fs.readFileSync(tplFile, "utf-8"));
+  assert.deepEqual(written.verified_p2p_chat_ids, ["oc_p2pdirect"]);
+  assert.equal(written.chat_id, TPL.chat_id, "其余字段原样");
+  assert.ok(fs.readdirSync(home).some((n) => n.startsWith("chain-config.json.bak.")), "先备份");
+  assert.equal(validateChainTemplate(written).ok, true);
+  // 重复 add → 清晰拒（不静默幂等）
+  const again = cli("--template", tplFile, "--add", "oc_p2pdirect", "--apply");
+  assert.deepEqual([again.status, /already_registered/u.test(again.stdout)], [1, true], again.stdout);
+  // 移除
+  const removed = cli("--template", tplFile, "--remove", "oc_p2pdirect", "--apply");
+  assert.equal(removed.status, 0, removed.stdout);
+  assert.deepEqual(JSON.parse(fs.readFileSync(tplFile, "utf-8")).verified_p2p_chat_ids, []);
+  const notReg = cli("--template", tplFile, "--remove", "oc_p2pdirect", "--apply");
+  assert.deepEqual([notReg.status, /not_registered/u.test(notReg.stdout)], [1, true], notReg.stdout);
+  // 登记群拒（它本来就不是私聊）
+  const groupAdd = cli("--template", tplFile, "--add", TPL.chat_id, "--apply");
+  assert.deepEqual([groupAdd.status, /group_chat_not_private/u.test(groupAdd.stdout)], [1, true], groupAdd.stdout);
+  // 纯函数层：结果必须过同一份校验；坏模板（p2p 非数组）拒
+  assert.equal(planP2pChange(TPL, { chatId: "oc_x" }).ok, true);
+  assert.equal(planP2pChange({ ...TPL, verified_p2p_chat_ids: ["oc_x", "oc_x"] }, { chatId: "oc_y" }).reason, "template_p2p_invalid");
+  assert.equal(planP2pChange({ ...TPL, verified_p2p_chat_ids: "oc_x" }, { chatId: "oc_y" }).reason, "template_p2p_invalid");
+  assert.equal(planP2pChange(TPL, { chatId: TPL.chat_id }).reason, "group_chat_not_private");
+  // validateChainTemplate 交叉校验：白名单里出现登记群 → inconsistent
+  const cross = validateChainTemplate({ ...TPL, verified_p2p_chat_ids: [TPL.chat_id] });
+  assert.equal(cross.ok, false);
+  assert.ok(cross.inconsistent.some((s) => /登记群 chat_id/u.test(s)), JSON.stringify(cross.inconsistent));
+});
+
 const DRIFT_HOOK = [
   'import fs from "node:fs";',
   'const watch = process.env.DRIFT_AFTER_READ, file = process.env.DRIFT_FILE, transform = new Function("doc", process.env.DRIFT_JS);',
@@ -22340,19 +22404,88 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
 });
 
 
-test("off-template turn（评审 PR #111 P1 定案）：unverified locator 不豁免 @ 闸，只给拒绝回执加诊断 hint；群消息行为一个不变", () => {
-  // 判据：事件链没有 chat_type 字段，用 daemon 注入的 AILY_CLI_CHANNEL_CHAT_ID 对照模板
-  // chat_id。评审定案：「不等于模板群」只能证明 locator 不同，证明不了是私聊（可能是外部群 /
-  // 模板 locator 过期），unverified 事实不得绕过 @ 准入闸 —— mismatch 只作诊断 hint。
-  assert.equal(isOffTemplateChatTurn({ template: TPL, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p_direct" } }), true, "channel ≠ 模板 chat_id → off-template");
-  assert.equal(isOffTemplateChatTurn({ template: TPL, env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id } }), false, "同一个群 → 照旧要求 @");
-  assert.equal(isOffTemplateChatTurn({ template: TPL, env: {} }), false, "env 缺失按群处理");
-  assert.equal(isOffTemplateChatTurn({ template: { ...TPL, chat_id: "" }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_x" } }), false, "模板没有 chat_id 时不豁免");
+test("#R12 P1：chat-id 形状判据唯一化（p2pChatIdProblem）—— 模板校验 / CLI 参数 / planP2pChange / isPrivateChatTurn 四点共用，反例矩阵全拒，判据退化为 startsWith 会转红", () => {
+  // 评审探针复现：旧版两处判据漂移（chain-template 宽松 startsWith、CLI 严格正则），
+  // 底层写 API planP2pChange 能把 "oc_x\n" 推进白名单。#R12 把判据抽成 chain-template
+  // 导出的一份（P2P_CHAT_ID_RE：oc_ + 小写字母数字，总长 ≤ 64），四个使用点全部走它。
+  const badIds = ["oc_", "oc_x\n", "OC_AAA", "oc_a_b", "oc_" + "a".repeat(70), "not_oc", "", 123];
+  // ① 模板校验层：白名单含任意坏值 → 拒；重复项 → 拒；非字符串 → 拒
+  for (const bad of badIds) {
+    const r = validateChainTemplate({ ...TPL, verified_p2p_chat_ids: [bad] });
+    assert.equal(r.ok, false, "validateChainTemplate 拒 " + JSON.stringify(String(bad).slice(0, 12)));
+    assert.ok(r.malformed.includes("verified_p2p_chat_ids"), JSON.stringify(r.malformed));
+  }
+  assert.equal(validateChainTemplate({ ...TPL, verified_p2p_chat_ids: ["oc_aa", "oc_aa"] }).ok, false, "重复项 → 拒");
+  assert.equal(validateChainTemplate({ ...TPL, verified_p2p_chat_ids: [123] }).ok, false, "非字符串 → 拒");
+  assert.equal(validateChainTemplate({ ...TPL, verified_p2p_chat_ids: ["oc_aaaa1111bbbb2222cccc3333dddd4444"] }).ok, true, "真实形状（oc_ + 32 小写 hex）合法");
+  // 评审 #120 三轮：总长边界钉死 —— 64 收、65 拒（量词曾写 {1,64} 使总长可到 67）
+  const len64 = "oc_" + "a".repeat(61);
+  const len65 = "oc_" + "a".repeat(62);
+  assert.equal(p2pChatIdProblem(len64), null, "总长 64 接受");
+  assert.notEqual(p2pChatIdProblem(len65), null, "总长 65 拒绝");
+  assert.equal(validateChainTemplate({ ...TPL, verified_p2p_chat_ids: [len64] }).ok, true, "模板层：总长 64 接受");
+  assert.equal(validateChainTemplate({ ...TPL, verified_p2p_chat_ids: [len65] }).ok, false, "模板层：总长 65 拒绝");
+  assert.equal(planP2pChange({ ...TPL, verified_p2p_chat_ids: [] }, { chatId: len65 }).ok, false, "计划器：总长 65 拒绝");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: [len64] }, env: { AILY_CLI_CHANNEL_CHAT_ID: len64 } }), true, "私聊判据：总长 64 命中");
+  // ② CLI 参数层：同一批坏值进 --add / --remove 都拒（退出码 2）
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-r12-shape-"));
+  const tplFile = path.join(home, "chain-config.json");
+  fs.writeFileSync(tplFile, JSON.stringify(TPL));
+  const cli = (...args) => spawnSync(process.execPath, [path.resolve("scripts", "register-p2p-chat.mjs"), ...args], { encoding: "utf-8", env: { ...process.env, HOME: home } });
+  for (const bad of badIds) {
+    assert.equal(cli("--template", tplFile, "--add", String(bad)).status, 2, "CLI --add 拒 " + JSON.stringify(String(bad).slice(0, 12)));
+    assert.equal(cli("--template", tplFile, "--remove", String(bad)).status, 2, "CLI --remove 拒 " + JSON.stringify(String(bad).slice(0, 12)));
+  }
+  assert.equal(cli("--template", tplFile, "--add", "oc_p2p").status, 0, "合法形状照常放行（预览）");
+  assert.deepEqual(JSON.parse(fs.readFileSync(tplFile, "utf-8")), TPL, "CLI 拒坏值时零写入");
+  // ③ planP2pChange：底层写 API 也过同一份判据（旧探针在这里放行 "oc_x\n"）
+  for (const bad of badIds) {
+    assert.equal(planP2pChange(TPL, { chatId: bad }).reason, "chat_id_shape_oc", "plan 拒 " + JSON.stringify(String(bad).slice(0, 12)));
+  }
+  assert.equal(planP2pChange(TPL, { chatId: "oc_aaaa1111bbbb2222cccc3333dddd4444" }).ok, true, "plan 对合法形状照常放行");
+  // ④ isPrivateChatTurn：env 值形状不合法 → 恒 false（判据统一后显式拦；退化为纯 includes 时，
+  //    坏形状值只要不逐字命中登记表也拒 —— 但模板 chat_id 缺失 / 坏形状时群判要跳过、白名单照常判定）
+  const wlTpl = { ...TPL, verified_p2p_chat_ids: ["oc_aaaa1111bbbb2222cccc3333dddd4444"] };
+  assert.equal(isPrivateChatTurn({ template: wlTpl, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_x\n" } }), false, "env 值带控制字符 → false");
+  assert.equal(isPrivateChatTurn({ template: wlTpl, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_" } }), false, "env 值裸前缀 → false");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: ["oc_x\n"] }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_x\n" } }), false, "登记表被底层 API 弄脏（坏形状项）→ 判据层仍拒");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, chat_id: undefined, verified_p2p_chat_ids: ["oc_p2p"] }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p" } }), true, "template.chat_id 缺失 → 跳过群判，白名单照常判定");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, chat_id: "oc_x\n", verified_p2p_chat_ids: ["oc_p2p"] }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p" } }), true, "template.chat_id 坏形状 → 跳过群判（坏的是群 id，不是白名单）");
+  // 变异防线：把共用判据换成 startsWith("oc_") 会放行 "oc_" / "oc_x\n" / 大写 / 超长 ——
+  // 上面的断言全部转红，判据本体（P2P_CHAT_ID_RE）没有第二条路径可绕。
+  assert.equal(p2pChatIdProblem("oc_x\n") !== null, true, "判据本体拒控制字符");
+  assert.equal(p2pChatIdProblem("oc_aaaa1111bbbb2222cccc3333dddd4444"), null, "判据本体放行真实形状");
+});
+test("off-template turn #12→#R11：私聊以已验证登记表正向命中豁免 @ 闸直接 chat 回答；未登记私聊形状/外部群话题（thread 有值）照旧拒 + hint；群消息行为一个不变", () => {
+  // 判据：事件链没有 chat_type，用 daemon 注入的 AILY_CLI_CHANNEL_CHAT_ID 对照模板 chat_id。
+  // #12 重开 #111 A 项；#R11 P1-1（Frank 拍板 b）把判据从「结构签名」换成正向白名单
+  // verified_p2p_chat_ids（register-p2p-chat.mjs 维护）。thread 条件降为纵深防御：
+  // 表缺失/空/不含 → 恒 false（没登记就没放行，fail-safe）；表含 + thread 有值 → 纵深拒。
+  // isOffTemplateChatTurn（诊断用）与 isPrivateChatTurn（私聊白名单）并存，前者不变。
+  const at = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> ";
+  const quoted = "\n\n**[引用]**\n绑定码    aaaaaa";
+  const TPLWP = { ...TPL, verified_p2p_chat_ids: ["oc_p2pdirect"] };
+
+  // ── 白名单四态 + 纵深拒 + fail-safe（#R11 P1-1）
+  assert.equal(isOffTemplateChatTurn({ template: TPL, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2pdirect" } }), true, "isOffTemplateChatTurn：channel ≠ 模板 chat_id → off-template（诊断用，不变）");
+  assert.equal(isOffTemplateChatTurn({ template: TPL, env: {} }), false, "isOffTemplateChatTurn：env 缺失按群处理");
+  assert.equal(isPrivateChatTurn({ template: TPL, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p" } }), false, "表缺失（没登记）→ 恒 false，不妄判私聊（fail-safe）");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: [] }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p" } }), false, "空表 → false");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: ["oc_p2p"] }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p" } }), true, "表含 chatId（逐字）+ thread 缺失 → 命中私聊");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: ["oc_p2p"] }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p", AILY_CLI_CHANNEL_THREAD_ID: "" } }), true, "thread 空串同样放行（thread 缺失/空）");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: ["oc_p2p"] }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p", AILY_CLI_CHANNEL_THREAD_ID: "omt_ext_thread" } }), false, "表含但 thread 有值 → 纵深拒（外部群话题）：删除 thread 条件该条会转红");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: ["oc_p2p"] }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_notlisted" } }), false, "表不含 → 拒");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: [TPL.chat_id] }, env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id } }), false, "群 chat（= 模板 chat_id）即便被误登记也按群处理，不进私聊");
+  // fail-safe：要素缺失 / 形态异常 → 全部回落 false（按群/未知处理，不盲信）
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: ["oc_p2p"] }, env: {} }), false, "env 全缺 → 不妄判私聊");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: "oc_x" }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_x" } }), false, "白名单非数组（形态异常）→ false");
+  assert.equal(isPrivateChatTurn({ template: { ...TPL, verified_p2p_chat_ids: ["oc_p2p"] }, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p", AILY_CLI_CHANNEL_THREAD_ID: 123 } }), false, "thread 形态异常（非字符串）→ 不判私聊");
+
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-p2p-"));
   const bin = path.join(local, "bin"); fs.mkdirSync(bin);
   const p1root = path.join(local, "p1"); fs.mkdirSync(p1root);
   const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
-  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  fs.writeFileSync(templateFile, JSON.stringify(TPLWP));
   const writeRegistry = (projects) => fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects }));
   const pendingEntry = { id: "p1", root: p1root, name: "P1", root_message_id: "om_p1", expires_at: "2099-01-01T00:00:00Z",
     inbound_state: "pending", pending_token: "aaaaaa", status: "active" };
@@ -22369,38 +22502,46 @@ test("off-template turn（评审 PR #111 P1 定案）：unverified locator 不�
     seq += 1;
     const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_p2p_" + seq, sessionID: "aily_dm", role: "user", createdBy: sender, createdAtMs: Date.now(), content } }) }] });
     const entry = extraArgs.length ? "inbound.mjs" : "aily-inbound.mjs";
-    return spawnSync(process.execPath, [path.resolve("scripts", entry), ...extraArgs], { encoding: "utf-8",
-      env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
-        AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_p2p", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", ...extraEnv } });
+    const env = { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+      AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_p2p", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", ...extraEnv };
+    // 逐轮显式声明频道/线程 env：父进程（测试 runnter）里若残留会带进子进程（私聊判据依赖「未设置」
+    // 这一事实），所以先在 base 里剥掉，再用 extraEnv 显式改写，绝不让 extraEnv 的值二次被删。
+    delete env.AILY_CLI_CHANNEL_CHAT_ID; delete env.AILY_CLI_CHANNEL_THREAD_ID;
+    if (extraEnv.AILY_CLI_CHANNEL_CHAT_ID !== undefined) env.AILY_CLI_CHANNEL_CHAT_ID = extraEnv.AILY_CLI_CHANNEL_CHAT_ID;
+    if (extraEnv.AILY_CLI_CHANNEL_THREAD_ID !== undefined) env.AILY_CLI_CHANNEL_THREAD_ID = extraEnv.AILY_CLI_CHANNEL_THREAD_ID;
+    return spawnSync(process.execPath, [path.resolve("scripts", entry), ...extraArgs], { encoding: "utf-8", env });
   };
-  const at = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> ";
-  const quoted = "\n\n**[引用]**\n绑定码    aaaaaa";
 
-  // ① 仅 unverified mismatch（channel ≠ 模板 chat_id）+ 无 @ → **仍要求 @**（评审钉住的反向），
-  //    但拒绝回执带诊断 hint：私聊里的 Frank 至少能看懂发生了什么
+  // ① 私聊（≠ 模板 chat_id + thread 缺失）→ 豁免 @ 闸，直接 chat 回答（owner 角色），且不认领挂着的待绑定项目
   writeRegistry([pendingEntry]);
-  const p2p = run("能收到吗", TPL.frank_sender_id, { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p_direct" });
-  assert.match(p2p.stdout, /已拒绝 · 没有真实 @/u, p2p.stdout);
-  assert.match(p2p.stdout, /诊断：本轮频道与登记群不一致/u, "mismatch 要给诊断 hint：" + p2p.stdout);
-  assert.match(p2p.stdout, /locator 完成验证前暂不开放/u, p2p.stdout);
-  assert.equal(argvLog().length, 0, "拒绝不起模型");
-  // mismatch + 未登记发送者：角色闸在 @ 闸前面，照旧按发送者拒，不因 mismatch 改变
-  const p2pStranger = run("能收到吗", "444", { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2p_direct" });
+  const p2p = run("能收到吗", TPL.frank_sender_id, { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2pdirect" });
+  assert.equal(p2p.status, 0, p2p.stdout + p2p.stderr);
+  assert.match(p2p.stdout, /^回答：能收到吗/mu, "私聊不再拒成 transport_not_mentioned：" + p2p.stdout);
+  assert.doesNotMatch(p2p.stdout, /已拒绝|没有真实 @/u, "私聊豁免 @ 闸：" + p2p.stdout);
+  assert.equal(argvLog().length, 1, "私聊起模型回答（@ 豁免后走到 chatReply）");
+  assert.equal(JSON.parse(fs.readFileSync(registryFile, "utf-8")).projects[0].inbound_state, "pending", "私聊早分流，不认领挂着的待绑定项目");
+  // 私聊 + 未登记发送者：角色闸在 @ 闸前面，照旧按发送者拒，不因私聊豁免改变
+  const p2pStranger = run("能收到吗", "444", { AILY_CLI_CHANNEL_CHAT_ID: "oc_p2pdirect" });
   assert.match(p2pStranger.stdout, /已拒绝 · 发送者不是授权用户/u, p2pStranger.stdout);
-  assert.equal(argvLog().length, 0, "未登记不起模型");
+  assert.equal(argvLog().length, 1, "未登记不起模型");
 
-  // ② 群消息 + 待认领 + 无 @ → 照旧拒，且**不带**诊断 hint（hint 只属于 mismatch）；
-  //    显式群 channel（= 模板 chat_id）同样干净拒
+  // ② 外部群话题（≠ 模板 chat_id + thread 有值）→ 不豁免 @ 闸：照旧拒 + hint（#111 P1 纪律，一行不松）
+  writeRegistry([pendingEntry]);
+  const extNoAt = run("接着弄" + quoted, TPL.frank_sender_id, { AILY_CLI_CHANNEL_CHAT_ID: "oc_exttopic", AILY_CLI_CHANNEL_THREAD_ID: "omt_ext_thread" });
+  assert.match(extNoAt.stdout, /已拒绝 · 没有真实 @/u, extNoAt.stdout);
+  assert.match(extNoAt.stdout, /诊断：本轮频道与登记群不一致，未接入的群/u, "外部群话题要带 hint（只能描述未接入的群）：" + extNoAt.stdout);
+  assert.equal(argvLog().length, 1, "拒绝不起模型");
+
+  // ③ 群消息（等于 模板 chat_id）行为一字不变：无 @ → 照旧拒且不带 hint；真实 @ + 绑定码 → 照旧认领（dry-run）
   writeRegistry([pendingEntry]);
   const groupNoAt = run("接着弄" + quoted, TPL.frank_sender_id);
   assert.match(groupNoAt.stdout, /已拒绝 · 没有真实 @/u, groupNoAt.stdout);
   assert.doesNotMatch(groupNoAt.stdout, /诊断：/u, "群内无 mismatch 不许带 hint：" + groupNoAt.stdout);
-  assert.equal(argvLog().length, 0, "拒绝不起模型");
+  assert.equal(argvLog().length, 1, "拒绝不起模型");
   const groupExplicit = run("接着弄" + quoted, TPL.frank_sender_id, { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id });
   assert.match(groupExplicit.stdout, /已拒绝 · 没有真实 @/u, groupExplicit.stdout);
   assert.doesNotMatch(groupExplicit.stdout, /诊断：/u, groupExplicit.stdout);
-
-  // ③ 群消息 + 真实 @ + 引用块绑定码 → 照旧认领（dry-run 直跑入口，打印的就是认领结论）
+  writeRegistry([pendingEntry]);
   const claim = run(at + "接着弄" + quoted, TPL.frank_sender_id, {}, ["--dry-run"]);
   assert.equal(claim.status, 0, claim.stdout + claim.stderr);
   assert.match(claim.stdout, /会把这个话题绑给 p1/u, claim.stdout);
@@ -23708,6 +23849,13 @@ const chanRunHarness = (projects = []) => {
   fs.writeFileSync(path.join(bin, "aily-cli"),
     ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n",
     { mode: 0o700 });
+  // #12：频道≠登记群 + thread 缺失的消息现在走私聊 chat 回答（不再是 off-template 拒绝），
+  // 需要一处能对 -p 给出回答的假 claude，绝不落到真模型；群/定位缺失的那两条仍拒，不碰它。
+  fs.writeFileSync(path.join(bin, "claude"),
+    ["#!/usr/bin/env node",
+     "require('node:fs').appendFileSync(" + JSON.stringify(path.join(local, "claude-argv.jsonl")) + ", JSON.stringify(process.argv.slice(2)) + '\\n');",
+     "process.stdout.write('回答：' + process.argv[process.argv.indexOf('-p') + 1] + '\\n');",
+    ].join("\n") + "\n", { mode: 0o700 });
   const run = ({ messageId, envChat, envThread, projectSession }) => {
     const sessionId = projectSession ?? "sess_cs";
     const content = "hello 没有 @ 运输 agent";
@@ -23731,7 +23879,7 @@ test("#R11 Claude 链采样三态：频道==登记群 → true；不一致 → f
   const { run, sampleFile } = chanRunHarness();
   const r1 = run({ messageId: "om_cs_grp", envChat: TPL.chat_id, envThread: "om_cs_thread" });
   assert.equal(r1.status, 0, r1.stderr);
-  const r2 = run({ messageId: "om_cs_dm", envChat: "oc_p2p_direct" });
+  const r2 = run({ messageId: "om_cs_dm", envChat: "oc_p2pdirect" });
   assert.equal(r2.status, 0, r2.stderr);
   const r3 = run({ messageId: "om_cs_miss" });
   assert.equal(r3.status, 0, r3.stderr);

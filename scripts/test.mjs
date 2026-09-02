@@ -18,6 +18,7 @@ import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome
 import { parseChatScratchSweepArgs, describeScratchSweep, sweepExitCode } from "./chat-scratch-sweep.mjs";
 import { acquireLockUngated, acquirePublishLock as acquireLedgerLock, releasePublishLock as releaseLedgerLock } from "./registry.mjs";
 import { evaluateChatGates, CHAT_FALLBACK_REASONS, isOffTemplateChatTurn } from "./inbound-route.mjs";
+import { appendChannelSample, channelDisposition, channelSampleSha16, loadChannelSamples } from "./channel-samples.mjs";
 import { ZERO_TOOL_ARGS } from "./handoff.mjs";
 import { INTENT, parseInboundIntent, controlRejectText, rejectedControlProjection, shown } from "./inbound-intent.mjs";
 import { rejectedRecordProblem, runRejectTransaction, inspectRejectedClaim, resumeRejectedClaim, describeRejectRepair, rejectRepairExitCode } from "./reject-control.mjs";
@@ -23692,6 +23693,111 @@ test("doctor ①：self 是本桥自身 → 豁免；叫 self 但 handler 在外
     assert.match(one.detail, /1 条路由没有状态入口：cc2cd/u, "只数外部路由：" + one.detail);
     assert.match(one.detail, /self 是本桥自身.{0,40}不计入/u, "self 豁免要说明：" + one.detail);
   }
+});
+
+// ---------- #R11 频道定位采样旁路 ----------
+// 建一个「无真实 @ 运输 agent」的消息（content 里没有 <at>），让入站链在取到事件后走到
+// transport_not_mentioned 硬拒绝 —— 最便宜的终态，且 event 已取、sampleCtx 已就位。
+const chanRunHarness = (projects = []) => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-cs-"));
+  const bin = path.join(local, "bin"); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json");
+  const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects }));
+  fs.writeFileSync(path.join(bin, "aily-cli"),
+    ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n",
+    { mode: 0o700 });
+  const run = ({ messageId, envChat, envThread, projectSession }) => {
+    const sessionId = projectSession ?? "sess_cs";
+    const content = "hello 没有 @ 运输 agent";
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({
+      message: { id: messageId, sessionID: sessionId, role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content },
+    }) }] });
+    const extra = {};
+    if (envChat !== undefined) extra.AILY_CLI_CHANNEL_CHAT_ID = envChat;
+    if (envThread !== undefined) extra.AILY_CLI_CHANNEL_THREAD_ID = envThread;
+    return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
+      env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local,
+        FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+        AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: sessionId, AILY_CLI_RUN_ID: "run_cs",
+        FAKE_AILY_ENVELOPE: envelope, ...extra } });
+  };
+  return { local, sampleFile: path.join(local, ".claude", "feishu-bridge", "inbound", "channel-samples.jsonl"), run };
+};
+
+// 三态：env==群chat → true；env==其他 → false；env缺失 → null（channel_chat/thread 都缺）
+test("#R11 Claude 链采样三态：频道==登记群 → true；不一致 → false；locator 缺失 → null 且不泄明文", () => {
+  const { run, sampleFile } = chanRunHarness();
+  const r1 = run({ messageId: "om_cs_grp", envChat: TPL.chat_id, envThread: "om_cs_thread" });
+  assert.equal(r1.status, 0, r1.stderr);
+  const r2 = run({ messageId: "om_cs_dm", envChat: "oc_p2p_direct" });
+  assert.equal(r2.status, 0, r2.stderr);
+  const r3 = run({ messageId: "om_cs_miss" });
+  assert.equal(r3.status, 0, r3.stderr);
+  assert.equal(fs.existsSync(sampleFile), true, "采样文件应已生成");
+  const lines = fs.readFileSync(sampleFile, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.equal(lines.length, 3, "每条入站消息各一行");
+  const [a, b, c] = lines;
+  assert.equal(a.matches_template_chat, true, "频道==登记群 → true");
+  assert.equal(b.matches_template_chat, false, "频道≠登记群 → false");
+  assert.equal(c.matches_template_chat, null, "locator 缺失 → null");
+  assert.equal(typeof a.channel_chat_sha16, "string", "频道存在时只能落哈希");
+  assert.equal(typeof b.channel_chat_sha16, "string", "不一致频道也只落哈希");
+  assert.equal(a.channel_chat_sha16 === b.channel_chat_sha16, false, "不同频道不同哈希");
+  assert.equal(c.channel_chat_sha16, null, "locator 缺失 → 频道哈希 null");
+  assert.equal(a.channel_thread_sha16, channelSampleSha16("om_cs_thread"), "线程同规则哈希");
+  assert.equal(b.channel_thread_sha16, null);
+  assert.equal(a.chain, "claude");
+  assert.match(a.disposition, /^rejected:/, "无 @ → rejected:<reason>");
+  for (const row of lines) {
+    assert.equal(row.schema_version, "1.0");
+    assert.equal(typeof row.message_id, "string", "message_id 不落明文");
+    assert.equal(typeof row.session_sha16, "string", "session 不落明文");
+    assert.doesNotMatch(JSON.stringify(row), /oc_|ou_|om_/u, "整行不许出现任何 locator 明文前缀");
+  }
+});
+
+// 采样失败不得影响主流程：把采样文件做成目录 → EISDIR，链照常拒绝、退出 0、目录仍在。
+test("#R11 采样失败不影响主流程（EISDIR 隔离）：文件是目录 → 只 log、不阻断、不替换目录", () => {
+  const { run, sampleFile } = chanRunHarness();
+  fs.mkdirSync(path.dirname(sampleFile), { recursive: true });
+  fs.mkdirSync(sampleFile); // 把采样文件位做成目录
+  const r = run({ messageId: "om_cs_eisdir", envChat: TPL.chat_id });
+  assert.equal(r.status, 0, "主流程退出码不受采样失败影响：" + r.stderr);
+  assert.match(r.stdout, /已拒绝/u, "正常拒绝回执仍在：" + r.stdout);
+  assert.match(r.stderr, /采样旁路失败/u, "失败被记住并只打一行日志：" + r.stderr);
+  assert.match(r.stderr, /EISDIR/u, "暴露失败根因（不遮）：" + r.stderr);
+  assert.equal(fs.statSync(sampleFile).isDirectory(), true, "目录不被采样替换");
+});
+
+// loadChannelSamples：好行收、坏行进 problems、文件不存在→absent、目录→not_regular。
+test("#R11 loadChannelSamples：好行收进 rows、坏结构/坏 JSON 进 problems、不存在→absent、目录→not_regular", () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-csl-")), "channel-samples.jsonl");
+  const good = JSON.stringify({ schema_version: "1.0", at: "2026-09-02T00:00:00.000Z", chain: "claude", message_id: "aakey", session_sha16: "bbkey", channel_chat_sha16: "cckey", channel_thread_sha16: null, matches_template_chat: true, disposition: "bound" });
+  const badJson = "{not json";
+  const badSchema = JSON.stringify({ schema_version: "2.0", at: "x", chain: "nope", message_id: null, session_sha16: null, channel_chat_sha16: null, channel_thread_sha16: null, matches_template_chat: true, disposition: "bound" });
+  fs.writeFileSync(f, good + "\n" + badJson + "\n" + badSchema + "\n");
+  const loaded = loadChannelSamples({ file: f });
+  assert.equal(loaded.ok, true);
+  assert.equal(loaded.absent, false);
+  assert.equal(loaded.rows.length, 1, "好行收进 rows");
+  assert.deepEqual(loaded.rows[0].message_id, "aakey");
+  assert.equal(loaded.problems.length, 2, "坏 JSON + 坏 schema 各一条 problems（" + loaded.problems.join(", ") + "）");
+  assert.match(loaded.problems[0], /json_invalid/u);
+  assert.match(loaded.problems[1], /schema_version/u);
+  const missing = loadChannelSamples({ file: f + ".nope" });
+  assert.equal(missing.ok, true);
+  assert.equal(missing.absent, true);
+  const dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-csd-")), "sub"); fs.mkdirSync(dir);
+  const asDir = loadChannelSamples({ file: dir });
+  assert.equal(asDir.ok, false);
+  assert.equal(asDir.reason, "channel_samples_not_regular_file");
+  assert.equal(channelDisposition("rejected", "transport_not_mentioned"), "rejected:transport_not_mentioned");
+  assert.equal(channelDisposition("bound", "x"), "bound");
+  assert.equal(channelSampleSha16("oo"), createHash("sha256").update("oo").digest("hex").slice(0, 16));
+  assert.equal(channelSampleSha16(""), null);
+  assert.equal(channelSampleSha16(null), null);
 });
 
 summarySealed = true;

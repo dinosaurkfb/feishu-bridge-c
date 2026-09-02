@@ -9633,6 +9633,61 @@ test("intent_not_found 给人指路：空 HOME + 合法 id 经 requireIntent 的
   assert.equal(intentRejectText("intent_corrupt"), "凭证内容读不出来，拒绝执行。");
 });
 
+// ---------- #R11 频道定位采样旁路（Codex 链）----------
+// 复用「无真实 @」的消息 → chatTurn 三闸的 @ 闸 → transport_not_mentioned 硬拒绝，最便宜且 event 已取。
+const codexChanRun = (extra = {}) => {
+  const home = temp();
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const run = ({ messageId, envChat, envThread }) => {
+    const event = { message_id: messageId, session_id: "sess_codex", sender_id: TEMPLATE.frank_sender_id, created_at_ms: Date.now(), content: "hello 没有 @ 运输 agent" };
+    const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home, AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, FEISHU_BRIDGE_ENVELOPE: JSON.stringify(event), ...extra };
+    delete env.AILY_CLI_CHANNEL_CHAT_ID;
+    delete env.AILY_CLI_CHANNEL_THREAD_ID;
+    if (envChat !== undefined) env.AILY_CLI_CHANNEL_CHAT_ID = envChat;
+    if (envThread !== undefined) env.AILY_CLI_CHANNEL_THREAD_ID = envThread;
+    return spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "inbound.mjs")], { encoding: "utf-8", env });
+  };
+  return { home, sampleFile: path.join(home, "inbound", "channel-samples.jsonl"), run };
+};
+
+test("#R11 Codex 链采样三态：频道==登记群 → true；不一致 → false；locator 缺失 → null 且不泄明文", () => {
+  const { sampleFile, run } = codexChanRun();
+  const r1 = run({ messageId: "om_cx_grp", envChat: TEMPLATE.chat_id, envThread: "om_cx_thread" });
+  assert.equal(r1.status, 0, r1.stderr);
+  const r2 = run({ messageId: "om_cx_dm", envChat: "oc_p2p_direct" });
+  assert.equal(r2.status, 0, r2.stderr);
+  const r3 = run({ messageId: "om_cx_miss" });
+  assert.equal(r3.status, 0, r3.stderr);
+  assert.equal(fs.existsSync(sampleFile), true, "采样文件应已生成");
+  const lines = fs.readFileSync(sampleFile, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.equal(lines.length, 3, "每条入站消息各一行");
+  const [a, b, c] = lines;
+  assert.equal(a.matches_template_chat, true);
+  assert.equal(b.matches_template_chat, false);
+  assert.equal(c.matches_template_chat, null);
+  assert.equal(a.channel_chat_sha16 === b.channel_chat_sha16, false, "不同频道不同哈希");
+  assert.equal(c.channel_chat_sha16, null);
+  assert.equal(a.channel_thread_sha16, sha256Of("om_cx_thread").slice(0, 16), "线程同规则哈希");
+  assert.equal(a.chain, "codex");
+  assert.match(a.disposition, /^rejected:/);
+  for (const row of lines) {
+    assert.equal(row.schema_version, "1.0");
+    assert.doesNotMatch(JSON.stringify(row), /oc_|ou_|om_/u, "整行不许出现任何 locator 明文前缀");
+  }
+});
+
+test("#R11 Codex 采样失败不影响主流程（EISDIR 隔离）：文件是目录 → 只 log、不阻断、不替换", () => {
+  const { sampleFile, run } = codexChanRun();
+  fs.mkdirSync(path.dirname(sampleFile), { recursive: true });
+  fs.mkdirSync(sampleFile);
+  const r = run({ messageId: "om_cx_eisdir", envChat: TEMPLATE.chat_id });
+  assert.equal(r.status, 0, "主流程退出码不受采样失败影响：" + r.stderr);
+  assert.match(r.stdout, /已拒绝/u, "正常拒绝回执仍在：" + r.stdout);
+  assert.match(r.stderr, /采样旁路失败/u, "失败被记住并只打一行日志：" + r.stderr);
+  assert.match(r.stderr, /EISDIR/u, "暴露失败根因（不遮）：" + r.stderr);
+  assert.equal(fs.statSync(sampleFile).isDirectory(), true, "目录不被采样替换");
+});
+
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (TEST_FILTER.length > 0) {

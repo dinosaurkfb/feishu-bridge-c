@@ -108,8 +108,8 @@ export function loadSubscriptionStore({ file } = {}) {
  * 生产默认 store 路径。四条展示入口（两条链 subscribe + 两条链 status）共用；
  * 有 HOME 沙箱的测试里 os.homedir() 指向沙箱，落盘位置随之走。
  */
-export function subscriptionStorePath() {
-  return path.join(os.homedir(), ".claude", "feishu-bridge", "subscriptions.json");
+export function subscriptionStorePath({ home = os.homedir() } = {}) {
+  return path.join(home, ".claude", "feishu-bridge", "subscriptions.json");
 }
 
 /**
@@ -147,6 +147,15 @@ const AUDIT_SHA256 = /^[0-9a-f]{64}$/u;
 // 空审计（从未写 / 读不齐当空）的基线哈希：sha256("")。
 const EMPTY_AUDIT_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+// 评审 #121 二轮（收口）：operation_id 锚定为**写方唯一真实格式**（评审建议的联合形状收到极致）——
+// `op-` + toISOString 的冒号点换连字符（**保留大写 T/Z**，与已落盘的旧生产格式逐字兼容）+ 8 位小写
+// hex。精确锚定天然排除 locator 前缀与控制字符，且任何合法 id 满足 displaySafe(id) === id 不变量
+//（doctor 回显不会被省略成不可执行的命令）。
+const OPERATION_ID_RE = /^op-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[0-9a-f]{8}$/u;
+const operationIdProblem = (v) =>
+  typeof v !== "string" || v.trim() === "" ? "empty"
+    : !OPERATION_ID_RE.test(v) ? "shape" : null;
+
 /**
  * 审计行的**唯一封闭校验器**（评审 #115 P1-2）。写方（追加时构造的行）与读方
  * （loadSubscriptionAudit 逐行）用同一把判据 —— 不许两份：写前自校验、读时逐行校验，
@@ -164,7 +173,7 @@ export function validateSubscriptionAuditEvent(event) {
   if (has("schema_version") && event.schema_version !== SUBSCRIPTION_AUDIT_SCHEMA_VERSION) problems.push("schema_version");
   if (has("at") && !isCanonicalIso(event.at)) problems.push("at_not_canonical");
   if (has("action") && !SUBSCRIPTION_AUDIT_ACTIONS.includes(event.action)) problems.push("action:" + String(event.action));
-  if (has("operation_id") && (typeof event.operation_id !== "string" || event.operation_id.trim() === "")) problems.push("operation_id_empty");
+  if (has("operation_id")) { const opProblem = operationIdProblem(event.operation_id); if (opProblem) problems.push(opProblem === "empty" ? "operation_id_empty" : "operation_id_shape"); }
   if (has("subscription_id") && (typeof event.subscription_id !== "string" || event.subscription_id.trim() === "")) problems.push("subscription_id_empty");
   if (has("store_bytes_sha256") && (typeof event.store_bytes_sha256 !== "string" || !STORE_HASH16.test(event.store_bytes_sha256))) problems.push("store_bytes_sha256");
   if (has("version_after")) {
@@ -199,7 +208,7 @@ function validateAuditPending(p) {
   for (const k of SUBSCRIPTION_AUDIT_PENDING_KEYS) if (!Object.hasOwn(p, k)) problems.push("missing:" + k);
   const has = (k) => Object.hasOwn(p, k);
   if (has("schema_version") && p.schema_version !== SUBSCRIPTION_AUDIT_PENDING_SCHEMA) problems.push("schema_version");
-  if (has("operation_id") && (typeof p.operation_id !== "string" || !p.operation_id)) problems.push("operation_id");
+  if (has("operation_id")) { const opProblem = operationIdProblem(p.operation_id); if (opProblem) problems.push(opProblem === "empty" ? "operation_id" : "operation_id_shape"); }
   if (has("operation_id") && has("event") && typeof p.event === "object" && p.event !== null && !Array.isArray(p.event) && p.operation_id !== p.event.operation_id) problems.push("operation_id_mismatch");
   if (has("after_sha256") && (typeof p.after_sha256 !== "string" || !STORE_HASH16.test(p.after_sha256))) problems.push("after_sha256");
   if (has("before_sha256") && p.before_sha256 !== null && (typeof p.before_sha256 !== "string" || !STORE_HASH16.test(p.before_sha256))) problems.push("before_sha256");
@@ -364,7 +373,7 @@ function openVerifiedSubscriptionFile({ file }) {
  *      调用方必须 fail-closed；**不许把「读不清」折成 null** —— 旧实现把 ENOENT 与读不清折叠成同一个 null，
  *      当 before_sha256 也是 null（首次写待补记）时被误判成「首次写未提交」而误清 pending（评审复现场景）。
  * 返回 { state:"absent" } | { state:"valid", sha256 } | { state:"unreadable", reason, detail }。 */
-function storeHashState({ file }) {
+export function storeHashState({ file }) {
   const opened = openVerifiedSubscriptionFile({ file });
   if (opened.absent) return { state: "absent" };
   if (!opened.ok) return { state: "unreadable", reason: opened.reason, detail: String(opened.reason) };

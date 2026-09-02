@@ -97,6 +97,11 @@ export function describeStoreWrite(r, file) {
   else if (!r.ok) { lines.push("没有写成：" + r.reason + detail(r)); exitCode = 1; }
   else if (!r.changed) lines.push("锁内重读后已经是这样，没动。");
   else lines.push("已写入（锁内重读重算后）。" + (r.backup ? "备份：" + r.backup : "首次创建，无备份"));
+  // FR-2.6 单 4：store 写成 + 审计丢了是「成功但要人知道」，不是静默成功 —— 这块必须上屏 + 非零。
+  if (r && r.auditUnwritten) {
+    lines.push("注意：审计记录没写上（" + r.auditUnwritten + "）；store 已写入，但这次变更没留下可对账的审计，请人工核对 " + file + ".audit.jsonl");
+    exitCode = 1;
+  }
   if (r && r.lockUncleared) {
     lines.push("注意：订阅写锁没有交还（" + r.lockUncleared + "）；之后所有订阅写方都会报 store_busy，请人工确认没有写方在跑后处理 " + file + ".lock");
     exitCode = 1;

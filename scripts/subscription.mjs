@@ -95,7 +95,8 @@ export function validateSubscription(subscription) {
   if (subscription?.chat_name !== undefined) {
     if (!version11) problems.push("chat_name_needs_1.1");
     else if (typeof subscription.chat_name !== "string" ||
-        subscription.chat_name.length > CHAT_NAME_MAX_LENGTH || !subscription.chat_name.trim()) {
+        // 长度按码点，不是 UTF-16 单位（JSON Schema maxLength 按码点；32 个 emoji = 64 units 会误拒）。
+        Array.from(subscription.chat_name).length > CHAT_NAME_MAX_LENGTH || !subscription.chat_name.trim()) {
       problems.push("chat_name");
     }
   }

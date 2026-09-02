@@ -4001,6 +4001,77 @@ test("subscribe 命令：读得出订阅，且不泄漏任何 locator", () => {
   assert.notEqual(typo.status, 0, "**拼错的参数不许被当成对的**");
 });
 
+test("评审 #114 P1：Codex subscribe 把 store 的登记名并进展示；损坏 store 不崩、退 legacy + 注明", () => {
+  const dir = temp();
+  const home = path.join(dir, "bridge");
+  const fakehome = path.join(dir, "fakehome");
+  for (const d of [home, fakehome]) fs.mkdirSync(d, { recursive: true });
+  const task = makeTaskEntry({ root: path.join(dir, "p"), threadId: THREAD_A, name: "S",
+    rootMessageId: "om_r2cs", token: "a1b2c3" });
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const storeFile = path.join(fakehome, ".claude", "feishu-bridge", "subscriptions.json");
+  const env = { ...isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home, HOME: fakehome }) };
+  const subRun = () => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-subscribe.mjs"), "--thread-id", THREAD_A],
+    { encoding: "utf-8", env });
+
+  // 文件缺席 = 今天：legacy 投影、无任何合并提示。
+  const noStore = subRun();
+  assert.equal(noStore.status, 0, noStore.stderr);
+  assert.doesNotMatch(noStore.stdout, /控制面 store 损坏/u, "无 store：没有损坏提示");
+
+  // 登记一个自带群名的条目 → Codex subscribe 显示登记名（盖过模板匹配）。
+  const reg = spawnSync(process.execPath, [path.join(ROOT, "scripts", "register-subscription.mjs"),
+    "--store", storeFile, "--template", path.join(home, "chain-config.json"), "--runtime", "codex",
+    "--domain-key", task.root, "--chat-id", TEMPLATE.chat_id, "--chat-name", "登记名", "--apply"],
+    { encoding: "utf-8", env });
+  assert.equal(reg.status, 0, reg.stdout + reg.stderr);
+  const withStore = subRun();
+  assert.equal(withStore.status, 0, withStore.stderr);
+  assert.match(withStore.stdout, /订阅群\s+登记名/u, "Codex subscribe 显示登记名：" + withStore.stdout);
+  assert.doesNotMatch(withStore.stdout, /控制面 store 损坏/u);
+
+  // 损坏 store：不崩、退 legacy、注明问题数。
+  fs.writeFileSync(storeFile, "{oops");
+  const damaged = subRun();
+  assert.equal(damaged.status, 0, "Codex subscribe 不崩：" + damaged.stderr);
+  assert.match(damaged.stdout, /控制面 store 损坏（1 个问题），已按 legacy 显示。/u);
+});
+
+test("评审 #114 P1：Codex status 把 store 的登记名并进展示；损坏 store 不崩、退 legacy + 注明", () => {
+  const dir = temp();
+  const home = path.join(dir, "bridge");
+  const fakehome = path.join(dir, "fakehome");
+  const codexHome = path.join(dir, "codex-home");
+  fs.mkdirSync(home, { recursive: true }); fs.mkdirSync(fakehome, { recursive: true });
+  const task = makeTaskEntry({ root: path.join(dir, "p"), threadId: THREAD_A, name: "S",
+    rootMessageId: "om_r2st", token: "a1b2c3" });
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const storeFile = path.join(fakehome, ".claude", "feishu-bridge", "subscriptions.json");
+  const env = { ...isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home, HOME: fakehome, CODEX_HOME: codexHome }) };
+  const stRun = () => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"), "--thread-id", THREAD_A],
+    { encoding: "utf-8", env });
+
+  // 登记一个自带群名的条目 → Codex status 第 2 层显示登记名。
+  const reg = spawnSync(process.execPath, [path.join(ROOT, "scripts", "register-subscription.mjs"),
+    "--store", storeFile, "--template", path.join(home, "chain-config.json"), "--runtime", "codex",
+    "--domain-key", task.root, "--chat-id", TEMPLATE.chat_id, "--chat-name", "登记名", "--apply"],
+    { encoding: "utf-8", env });
+  assert.equal(reg.status, 0, reg.stdout + reg.stderr);
+  const withStore = stRun();
+  assert.equal(withStore.status, 0, withStore.stderr);
+  assert.match(withStore.stdout, /订阅群\s+登记名/u, "Codex status 显示登记名：" + withStore.stdout);
+
+  // 损坏 store：不崩、退 legacy、注明问题数。
+  fs.writeFileSync(storeFile, "{oops");
+  const damaged = stRun();
+  assert.equal(damaged.status, 0, "Codex status 不崩：" + damaged.stderr);
+  assert.match(damaged.stdout, /控制面 store 损坏（1 个问题），订阅区已按 legacy 显示。/u);
+});
+
 test("status 不许执行别的项目的 provider —— 不显示还不够，必须不跑", () => {
   // **评审用 marker 文件证明的：输出里看不见，marker 却建出来了。**
   // 机器级 collectConnectivity 会把所有 provider 都跑一遍再按归属过滤显示 ——

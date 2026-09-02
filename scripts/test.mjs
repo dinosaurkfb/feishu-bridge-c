@@ -211,7 +211,7 @@ import {
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
 import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION_KEYED, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, selectPendingSubscriptionClaim, stableControlId, subscriptionIdFor, validateSubscription, claimable } from "./subscription.mjs";
-import { applySubscriptionChange, loadSubscriptionStore, planSubscriptionChange, planSubscriptionEntry } from "./subscription-store.mjs";
+import { applySubscriptionChange, loadSubscriptionStore, mergedSubscriptionView, planSubscriptionChange, planSubscriptionEntry, subscriptionStorePath } from "./subscription-store.mjs";
 import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
@@ -20178,17 +20178,97 @@ test("FR-2.6 单 3：展示三级群名 —— 条目自带 > 模板匹配 > 群
   // 第二级之外：同域另一个群（chat_id ≠ 模板）登记时不带群名 → 群名不可用，模板群名不许套给它
   const addOther = cli([...base, "--chat-id", "oc_other", "--apply"]);
   assert.equal(addOther.status, 0, addOther.stdout + addOther.stderr);
+  // 评审 #114 P1：状态页第 2 层（Claude 侧）同样走 mergedSubscriptionView，把 store 的登记名并进展示。
+  const stRun = () => spawnSync(process.execPath, [path.resolve("scripts", "feishu-status.mjs"), "--project", root], { encoding: "utf-8", env: { ...process.env, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile } });
   const withStore = run();
   assert.equal(withStore.status, 0, withStore.stderr);
   assert.match(withStore.stdout, /订阅群    登记名/u, "第一级：条目自带的群名盖过模板匹配");
   assert.match(withStore.stdout, /订阅群    群名不可用/u, "别的群不吃模板群名");
   assert.doesNotMatch(withStore.stdout, /控制面 store 损坏/u);
+  const stHealthy = stRun();
+  assert.equal(stHealthy.status, 0, stHealthy.stderr);
+  assert.match(stHealthy.stdout, /订阅群\s+登记名/u, "状态页第一级：登记名");
+  assert.match(stHealthy.stdout, /订阅群\s+群名不可用/u, "状态页第三级：别的群不吃模板群名");
+  assert.doesNotMatch(stHealthy.stdout, /控制面 store 损坏/u);
   // 损坏 store：不崩、退 legacy、注明问题数 —— 展示诊断正是 fail-closed 的 legacy 字段存在的目的
   fs.writeFileSync(storeFile, "{oops");
   const damaged = run();
   assert.equal(damaged.status, 0, "展示不崩：" + damaged.stderr);
   assert.match(damaged.stdout, /订阅群    模板群/u, "退回 legacy（模板匹配那一级还在）");
   assert.match(damaged.stdout, /控制面 store 损坏（1 个问题），已按 legacy 显示。/u);
+  const stDamaged = stRun();
+  assert.equal(stDamaged.status, 0, "状态页不崩：" + stDamaged.stderr);
+  assert.match(stDamaged.stdout, /控制面 store 损坏（1 个问题），订阅区已按 legacy 显示。/u);
+});
+
+// ─── 评审 #114：群名展示——P1 共用合并、P2-1 控制符、P2-2 码点、P2-3 文案 ───────────────
+
+test("评审 #114 P2-2：码点上限 —— 64 个非 BMP 字符过、65 个拒（planSubscriptionEntry 与 validateSubscription 两层同判）", () => {
+  const template = { chain: "claude", agent_uid: "agent_m5claude", transport_open_id: "ou_bot", frank_sender_id: "u_frank", chat_id: "oc_x", default_freshness_ms: 600000 };
+  const emoji = "😀";
+  assert.equal(Array.from(emoji).length, 1, "1 个码点");
+  assert.equal(emoji.length, 2, "非 BMP：UTF-16 长度是码点的两倍 —— 只按 length 会误收 65 个");
+  const close64 = planSubscriptionEntry({ runtime: "claude", template, domainKey: "/p", chatId: "oc_second", chatName: emoji.repeat(64) });
+  assert.equal(close64.ok, true, "64 个码点应收：" + JSON.stringify(close64));
+  const over = planSubscriptionEntry({ runtime: "claude", template, domainKey: "/p", chatId: "oc_second", chatName: emoji.repeat(65) });
+  assert.equal(over.reason, "chat_name_invalid", "65 个码点应拒（UTF-16 单位 130 —— 只按 length 会当 130 拒但 64 个字符也不对）");
+  // 写盘前兜底与计划器同判：validateSubscription 按码点，65 个非 BMP 也要拒
+  for (const n of [64, 65]) {
+    const v = validateSubscription({ ...close64.entry, chat_name: emoji.repeat(n) });
+    assert.deepEqual([v.ok, v.problems.includes("chat_name")], [n === 64, n !== 64], "validateSubscription 码点 " + n + "：" + JSON.stringify(v));
+  }
+});
+
+test("评审 #114 P1：订阅模型三级群名 —— 条目自带 chat_name > 模板匹配 > 不可用（subscriptionDetails 与 subscriptionFacts 同判）", () => {
+  const mk = (id, chatId, chatName) => ({ subscription_id: id, status: "active", version: 1,
+    endpoint_id: "ep", domain_id: "d", schema_version: "1.1", artifact_type: "subscription",
+    scope: { chat_id: chatId, sender_ids: ["u"], event_types: ["im.message.receive"] }, ...(chatName ? { chat_name: chatName } : {}) });
+  const model = { ok: true, schema_version: "1.0", subscriptions: [
+    mk("s_a", "oc_b", "登记名"),        // 条目自带群名
+    mk("s_b", "oc_template", null),     // 无自带群名 → 模板匹配
+    mk("s_c", "oc_other", null),        // 无自带群名、chat_id ≠ 模板 → 不可用
+  ], pending_bindings: [] };
+  // status 的 subscriptionFacts
+  const facts = subscriptionFacts(model, { groupName: "模板群", templateChatId: "oc_template" });
+  assert.deepEqual(facts.items.map((s) => s.groupName), ["登记名", "模板群", null], "subscriptionFacts 三级");
+  // subscribe 的 subscriptionDetails
+  const view = subscriptionDetails(model, { groupName: "模板群", templateChatId: "oc_template" });
+  assert.deepEqual(view.items.map((s) => s.groupName), ["登记名", "模板群", null], "subscriptionDetails 三级");
+  // 三级落在渲染：不可用那一行不显示模板群名，也不显示 null
+  assert.match(renderSubscriptions(view), /群名不可用/u);
+});
+
+test("评审 #114 P2-1：控制符 chat_name 落盘原文保留、每个展示口输出不含控制符；register 预览过 displaySafe", () => {
+  const raw = "A\u001bB\nC";
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-r2-ctl-"));
+  const templateFile = path.join(local, "chain-config.json");
+  const TPLR = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  fs.writeFileSync(templateFile, JSON.stringify(TPLR));
+  const root = path.join(local, "project"); fs.mkdirSync(root);
+  const registryFile = path.join(local, "registry.json");
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "ctl", root, name: "控制符演示", root_message_id: "om_c", expires_at: "2099-01-01T00:00:00Z", session_id: "aily_c", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z" }] }));
+  const cli = (args) => spawnSync(process.execPath, [path.resolve("scripts", "register-subscription.mjs"), ...args], { encoding: "utf-8", env: { ...process.env, HOME: local } });
+  const storeFile = path.join(local, ".claude", "feishu-bridge", "subscriptions.json");
+  const add = cli(["--store", storeFile, "--template", templateFile, "--runtime", "claude", "--domain-key", root, "--chat-id", "oc_ctl", "--chat-name", raw, "--apply"]);
+  assert.equal(add.status, 0, add.stdout + add.stderr);
+  // 落盘原文保留：不净化、不替换、不丢弃控制符
+  const loaded = loadSubscriptionStore({ file: storeFile });
+  assert.equal(loaded.ok, true, JSON.stringify(loaded));
+  assert.equal(loaded.subscriptions[0].chat_name, raw, "存储保留控制符原文");
+  // displaySafe 清掉控制符：ESC / LF / 其它 C0 / DEL 都不保留（换成 U+FFFD）—— 这就是"面向人的输出都过 displaySafe"的证据
+  const safe = displaySafe(raw);
+  assert.ok(!Array.from(safe).some((ch) => { const c = ch.codePointAt(0); return c < 0x20 || c === 0x7f; }), "displaySafe 后无任何 C0/DEL 控制字符（原样是 ESC+LF）：" + JSON.stringify(safe));
+  // 展示口渲染：subscribe 对 groupName 过 displaySafe，输出不许夹 ESC（ANSI 逃逸注入不了）
+  const rendered = renderSubscriptions(subscriptionDetails(modelView(loaded.subscriptions), { groupName: null, templateChatId: null }));
+  assert.ok(!/\u001b/u.test(rendered), "subscribe 渲染无 ESC");
+  // 真入口：register 预览（dry-run）把 chat_name 过 displaySafe，stdout 不含 ESC
+  const preview = cli(["--store", storeFile, "--template", templateFile, "--runtime", "claude", "--domain-key", root, "--chat-id", "oc_ctl2", "--chat-name", raw]);
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.ok(!/\u001b/u.test(preview.stdout), "register 预览输出无 ESC：" + JSON.stringify(preview.stdout));
+
+  function modelView(subscriptions) {
+    return { ok: true, schema_version: "1.0", subscriptions, pending_bindings: [] };
+  }
 });
 
 test("控制事务的换绑窗口（评审 #97）：事务锁内核验通过之后、策略写锁取得之前登记表换了绑定 → 写锁内前置条件拒写、模式不变、不落 consumed、入口非零", () => {

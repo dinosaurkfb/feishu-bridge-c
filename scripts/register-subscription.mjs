@@ -23,6 +23,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { displaySafe } from "./display-safe.mjs";
 import { isDirectRun } from "./direct-run.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
@@ -133,7 +134,7 @@ if (isDirectRun(import.meta.url)) {
   if (entry?.scope) {
     process.stdout.write("范围      ：chat " + entry.scope.chat_id + " · transport " + entry.scope.transport_open_id +
       " · 发送者 " + entry.scope.sender_ids.join(",") + " · " + entry.scope.event_types.join(",") + "\n");
-    if (entry?.chat_name) process.stdout.write("群名      ：" + entry.chat_name + "\n");
+    if (entry?.chat_name) process.stdout.write("群名      ：" + displaySafe(entry.chat_name) + "\n");
     process.stdout.write("时效      ：" + entry.constraints.freshness_ms + " ms · 状态 " + entry.status + " · v" + entry.version + "\n");
   }
   if (!planned.changed) { process.stdout.write("已经是这样，没动。\n"); process.exit(0); }

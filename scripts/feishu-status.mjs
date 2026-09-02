@@ -22,6 +22,7 @@ import { buildClaudeSubscriptionProjection } from "./inbound-route.mjs";
 import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { checkEndpoint } from "./endpoint-self-check.mjs";
 import { inspectRunChannel } from "./drain-outbox.mjs";
+import { mergedSubscriptionView } from "./subscription-store.mjs";
 import {
   composeLayeredStatus, endpointFacts, outboundRoutingFact, renderLayeredStatus,
   splitByRelation, subscriptionFacts,
@@ -69,6 +70,9 @@ const outboundRouting = outboundRoutingFact({
   bound: st.ok === true,
 });
 
+// 评审 #114 P1：订阅区同样把 store 的控制面条目并进读模型 —— 与 subscribe 共用 mergedSubscriptionView。
+const { view: subscriptionModel, corrupt: subscriptionCorrupt } = mergedSubscriptionView({ legacy: buildClaudeSubscriptionProjection({ projectRoot: root }) });
+
 console.log(renderLayeredStatus(composeLayeredStatus({
   st,
   // FR-10：最近 run / publish 的状态 —— 只读 dryRun，判据与排空同一份。
@@ -80,11 +84,12 @@ console.log(renderLayeredStatus(composeLayeredStatus({
     // 端点自检（FR-1.4）。只读、限时、不修不启。
     selfCheck: tpl ? checkEndpoint({ template: tpl, identity: resolveLarkIdentity(tpl) }) : null,
   }),
-  subscription: subscriptionFacts(buildClaudeSubscriptionProjection({ projectRoot: root }),
+  subscription: subscriptionFacts(subscriptionModel,
       // chat_id 也要给：**群名只能用在它确实对应的那条订阅上** ——
       // 无条件套上去的话，指向别的群的订阅会被错报成模板群。
       { groupName: tpl?.chat_name ?? null, templateChatId: tpl?.chat_id ?? null }),
   connectivity: layeredConnectivity,
   otherLinks: projectLinks,
 })));
+if (subscriptionCorrupt) console.log("\n注意：控制面 store 损坏（" + subscriptionCorrupt.length + " 个问题），订阅区已按 legacy 显示。");
 process.exit(0);

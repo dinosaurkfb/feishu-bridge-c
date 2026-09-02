@@ -14,28 +14,30 @@
  * 新鲜度约束、有没有待认领的绑定。FR-10 要求 status 能答"subscription 命中范围"，
  * 这是那个范围的详细版。
  *
- * ■ 写入口的现状（2026-08-29，逐项说清"有什么、还缺什么"，别再让这段话在事实变了之后留着）
+ * ■ 写入口的现状（2026-09-02，逐项说清“有什么、还缺什么”，别再让这段话在事实变了之后留着）
  *
  *   已开放：**发送者角色表**的登记 —— `register-sender.mjs` 改链路模板的 senders（锁内重读重算、先校验后写、
  *          备份 + 逐字读回；写入需 owner 逐次授权）。本层只登记与显示；入站判定在第 2 层按角色 × 风险等级 × 模式决定（risk-class / authorize）。
+ *   已开放：**独立订阅的登记** —— `register-subscription.mjs` 落盘到独立 store（锁内重读重算、先校验后写、备份 + 逐字读回；
+ *          写入需 owner 逐次授权）。本层只登记与显示。
  *   已完成：FR-2.5 的落盘控制面 —— 同步计划器（subscription-sync.mjs）与 resnapshot / suspend / migrate 的落盘
  *          （subscription-sync-apply.mjs）都在，订阅变更能同步到依赖它的 binding 授权快照。
- *   未开放：**独立订阅的增删**。卡在 FR-2.6：多于一条订阅时首次认领必须能拒绝歧义，这条判据在，
- *          但没有经过多订阅的真实样本验证；"全机器只有一条订阅所以没有歧义"是没被计算过的断言，不写死当理由。
+ *   未接入：**store 尚未接入权威投影与切流** —— 落盘暂不改变生产认领 / 路由（接入是切流单的事，前置是 chat locator
+ *          验证与多订阅歧义的真实样本）。生产调用方仍走纯 legacy 投影，本命令把已登记的条目并进展示。
  *
- * 所以这条命令只读，并如实说明哪些写入口开了、哪些没开 —— 一个假装能写、实际拒绝的开关比没有开关更糟。
+ * 所以这条命令只读，并如实说明哪些写入口开了、哪些还没接 —— 一个假装能写、实际拒绝的开关比没有开关更糟。
  *
  * 用法：node scripts/feishu-subscribe.mjs [--project /abs/dir]
  */
 
-import os from "node:os";
 import path from "node:path";
+import { displaySafe } from "./display-safe.mjs";
 import { roleCounts, roleCountsText } from "./sender-roles.mjs";
 
 import { isDirectRun } from "./direct-run.mjs";
 import { buildClaudeSubscriptionProjection } from "./inbound-route.mjs";
-import { claimable, mergeControlPlaneIntoModel, SUBSCRIPTION_REJECT } from "./subscription.mjs";
-import { loadSubscriptionStore } from "./subscription-store.mjs";
+import { claimable } from "./subscription.mjs";
+import { mergedSubscriptionView } from "./subscription-store.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
 import { currentBinding } from "./feishu-control.mjs";
 
@@ -109,7 +111,7 @@ export function renderSubscriptions(view, { source = null } = {}) {
   const lines = [];
   for (const s of view.items) {
     lines.push("订阅状态  " + s.status + (s.version ? " · v" + s.version : ""));
-    lines.push("订阅群    " + (s.groupName ?? "群名不可用（只有群 ID，不拿 ID 顶替）"));
+    lines.push("订阅群    " + (s.groupName == null ? "群名不可用（只有群 ID，不拿 ID 顶替）" : displaySafe(s.groupName)));
     lines.push("授权发送者 " + s.senderCount + " 个（只出数量，不出身份）");
     lines.push("发送者角色 " + roleCountsText(s.roleCounts) + "（入站判定按角色 × 风险等级 × 模式：Mapping 只放 owner；Dialogue 的对话对 operator / participant 开，控制与授权类只认 owner）");
     lines.push("事件范围  " + (s.eventTypes.join("、") || "未声明"));
@@ -130,26 +132,19 @@ function main() {
   const loaded = loadChainTemplate();
   const tpl = loaded?.ok ? (loaded.template ?? loaded) : null;
 
-  // FR-2.6 单 3：展示口把 store 的控制面条目并进读模型 —— loadSubscriptionStore 读生产默认路径
-  // （HOME 环境决定，测试沙箱 HOME），合并走 buildLegacySubscriptionReadModel({ controlPlane })
-  // 同一条 mergeControlPlaneIntoModel 路径。**文件缺席 = 今天**：同一对象，输出逐字节一致。
-  // 损坏不崩：合并 fail-closed 时退回它的 legacy 字段（展示诊断正是这个字段存在的目的），
-  // 并附一行说明；热路径（认领 / 路由）一行不碰。
-  const legacy = buildClaudeSubscriptionProjection({ projectRoot: root });
-  const store = loadSubscriptionStore({ file: path.join(os.homedir(), ".claude", "feishu-bridge", "subscriptions.json") });
-  const merged = store.absent ? legacy
-    : mergeControlPlaneIntoModel(legacy, store.ok
-      ? { ok: true, subscriptions: store.subscriptions }
-      : { ok: false, problems: store.problems });
-  const view = merged.ok ? merged : (merged.legacy ?? merged);
+  // FR-2.6 单 3 / 评审 #114 P1：展示口把 store 的控制面条目并进读模型。**四条入口共用**
+  // mergedSubscriptionView 一条合并路径（读生产默认 store + mergeControlPlaneIntoModel 同一条
+  // 路径，含 endpoint 隔离与损坏 fail-closed）。**文件缺席 = 今天**：输出逐字节一致。
+  // 损坏不崩：退回 legacy 字段并注明；热路径（认领 / 路由）一行不碰。
+  const { view, corrupt } = mergedSubscriptionView({ legacy: buildClaudeSubscriptionProjection({ projectRoot: root }) });
 
   console.log("项目      " + root);
   console.log(renderSubscriptions(
     subscriptionDetails(view, { groupName: tpl?.chat_name ?? null, templateChatId: tpl?.chat_id ?? null }),
     { source: currentBinding({ root }).source ?? null },
   ));
-  if (!merged.ok && merged.reason === SUBSCRIPTION_REJECT.CONTROL_PLANE_INVALID) {
-    console.log("\n注意：控制面 store 损坏（" + merged.problems.length + " 个问题），已按 legacy 显示。");
+  if (corrupt) {
+    console.log("\n注意：控制面 store 损坏（" + corrupt.length + " 个问题），已按 legacy 显示。");
   }
   console.log("\n本命令只读。**发送者角色表可以登记**（node scripts/register-sender.mjs，改链路模板的 senders；写入需 owner 逐次授权）。");
   console.log("**订阅控制面的登记入口已开放**（node scripts/register-subscription.mjs，落盘独立 store；写入需 owner 逐次授权），但 store **尚未接入权威投影与切流** —— 落盘暂不改变生产认领 / 路由；本命令把已登记的条目并进展示（FR-2.6 单 3，只读）。");

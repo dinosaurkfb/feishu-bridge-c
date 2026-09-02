@@ -28,13 +28,14 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { acquirePublishLock, commitWhileHeld, releasePublishLock } from "./registry.mjs";
 import { senderTable } from "./sender-roles.mjs";
 import {
   CHAT_NAME_MAX_LENGTH, INSTANCE_KEY_SHAPE, MESSAGE_RECEIVE_EVENT, SUBSCRIPTION_ARTIFACT_TYPE,
   SUBSCRIPTION_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION_KEYED,
-  legacyEndpointId, stableControlId, subscriptionIdFor, validateSubscription,
+  legacyEndpointId, mergeControlPlaneIntoModel, stableControlId, subscriptionIdFor, validateSubscription,
 } from "./subscription.mjs";
 
 export const SUBSCRIPTION_STORE_SCHEMA_VERSION = "1.0";
@@ -103,6 +104,32 @@ export function loadSubscriptionStore({ file } = {}) {
 }
 
 /**
+ * 生产默认 store 路径。四条展示入口（两条链 subscribe + 两条链 status）共用；
+ * 有 HOME 沙箱的测试里 os.homedir() 指向沙箱，落盘位置随之走。
+ */
+export function subscriptionStorePath() {
+  return path.join(os.homedir(), ".claude", "feishu-bridge", "subscriptions.json");
+}
+
+/**
+ * **展示层的共用合并帮手**（评审 #114 P1：四个入口曾各写一份「读 store + 合并 + 损坏退 legacy」）。
+ * 输入已建好的 legacy 读取模型（用哪条链的 builder 由调用方决定），内部读生产默认 store，
+ * 走 mergeControlPlaneIntoModel 同一条合并路径（含 endpoint 隔离与损坏 fail-closed）。
+ * 文件缺席 = 今天：返回 { view: legacy, corrupt: null }，输出与 legacy 模型逐字节一致。
+ * 损坏不崩：返回 { view: legacy, corrupt: problems }，调用方据此注明「已按 legacy 显示」。
+ * 热路径（认领 / 路由）一行不碰 —— 它永远只吃原模型，不进这里。
+ */
+export function mergedSubscriptionView({ legacy } = {}) {
+  const store = loadSubscriptionStore({ file: subscriptionStorePath() });
+  if (store.absent) return { view: legacy, corrupt: null };
+  const merged = mergeControlPlaneIntoModel(legacy,
+    store.ok ? { ok: true, subscriptions: store.subscriptions } : { ok: false, problems: store.problems });
+  return merged.ok
+    ? { view: merged, corrupt: null }
+    : { view: merged.legacy ?? legacy, corrupt: merged.problems ?? null };
+}
+
+/**
  * 纯函数：从模板算出一条新的控制面订阅。群参数按订阅声明：chat_id 必须给
  * （允许与模板不同 —— 这正是多群的意义），新鲜度缺省继承模板。
  */
@@ -117,7 +144,9 @@ export function planSubscriptionEntry({ runtime, template, domainKey, chatId, fr
     return { ok: false, reason: "instance_key_shape" };
   }
   // chat_name（FR-2.6 单 3）：给了就必须合法；这里的早拒带专用 reason，validateSubscription 是写盘前的第二道。
-  if (chatName != null && (typeof chatName !== "string" || chatName.length > CHAT_NAME_MAX_LENGTH || !chatName.trim())) {
+  if (chatName != null && (typeof chatName !== "string" ||
+      // 长度按码点，不是 UTF-16 单位（与 validateSubscription、JSON Schema maxLength 同判）。
+      Array.from(chatName).length > CHAT_NAME_MAX_LENGTH || !chatName.trim())) {
     return { ok: false, reason: "chat_name_invalid" };
   }
   let freshness = template?.default_freshness_ms;

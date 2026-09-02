@@ -32,7 +32,7 @@ import path from "node:path";
 import { acquirePublishLock, commitWhileHeld, releasePublishLock } from "./registry.mjs";
 import { senderTable } from "./sender-roles.mjs";
 import {
-  INSTANCE_KEY_SHAPE, MESSAGE_RECEIVE_EVENT, SUBSCRIPTION_ARTIFACT_TYPE,
+  CHAT_NAME_MAX_LENGTH, INSTANCE_KEY_SHAPE, MESSAGE_RECEIVE_EVENT, SUBSCRIPTION_ARTIFACT_TYPE,
   SUBSCRIPTION_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION_KEYED,
   legacyEndpointId, stableControlId, subscriptionIdFor, validateSubscription,
 } from "./subscription.mjs";
@@ -106,7 +106,7 @@ export function loadSubscriptionStore({ file } = {}) {
  * 纯函数：从模板算出一条新的控制面订阅。群参数按订阅声明：chat_id 必须给
  * （允许与模板不同 —— 这正是多群的意义），新鲜度缺省继承模板。
  */
-export function planSubscriptionEntry({ runtime, template, domainKey, chatId, freshnessMs, instanceKey = null } = {}) {
+export function planSubscriptionEntry({ runtime, template, domainKey, chatId, freshnessMs, instanceKey = null, chatName = null } = {}) {
   if (!SUBSCRIPTION_RUNTIMES.includes(runtime)) return { ok: false, reason: "runtime_unknown" };
   // 链核对在**最底层**（评审 #112 二轮：只在 change 计划器里核，直接调用这里的仍能
   // 用 Claude 模板配 runtime:"codex" 造出归错链的条目）。
@@ -116,6 +116,10 @@ export function planSubscriptionEntry({ runtime, template, domainKey, chatId, fr
   if (instanceKey != null && (typeof instanceKey !== "string" || !INSTANCE_KEY_SHAPE.test(instanceKey))) {
     return { ok: false, reason: "instance_key_shape" };
   }
+  // chat_name（FR-2.6 单 3）：给了就必须合法；这里的早拒带专用 reason，validateSubscription 是写盘前的第二道。
+  if (chatName != null && (typeof chatName !== "string" || chatName.length > CHAT_NAME_MAX_LENGTH || !chatName.trim())) {
+    return { ok: false, reason: "chat_name_invalid" };
+  }
   let freshness = template?.default_freshness_ms;
   if (freshnessMs != null) { // 显式给的才覆盖；null / undefined 都算没给（CLI 未传时是 null）
     if (typeof freshnessMs !== "number" || !Number.isFinite(freshnessMs) || freshnessMs <= 0) {
@@ -124,11 +128,14 @@ export function planSubscriptionEntry({ runtime, template, domainKey, chatId, fr
     freshness = freshnessMs;
   }
   const entry = {
-    // keyed 条目升 1.1（评审 #112 裁决：不静默改宣称固定的 1.0）；无 key 照旧 1.0，id 与 legacy 一致
-    schema_version: instanceKey == null ? SUBSCRIPTION_SCHEMA_VERSION : SUBSCRIPTION_SCHEMA_VERSION_KEYED,
+    // 版本按「有无 1.1 字段」定（FR-2.6 单 3）：instance_key 或 chat_name 任一在 → 1.1；
+    // 两个都不在 → 照旧 1.0，id 与 legacy 一致。1.0 封闭形状不认识 chat_name，不能带。
+    schema_version: (instanceKey == null && chatName == null)
+      ? SUBSCRIPTION_SCHEMA_VERSION : SUBSCRIPTION_SCHEMA_VERSION_KEYED,
     artifact_type: SUBSCRIPTION_ARTIFACT_TYPE,
     subscription_id: subscriptionControlId({ runtime, agentUid: template.agent_uid, domainKey, chatId, instanceKey }),
     ...(instanceKey == null ? {} : { instance_key: instanceKey }),
+    ...(chatName == null ? {} : { chat_name: chatName }),
     version: 1,
     endpoint_id: legacyEndpointId({ runtime, agentUid: template.agent_uid }),
     domain_id: stableControlId("domain", runtime, domainKey),
@@ -156,7 +163,7 @@ export function planSubscriptionEntry({ runtime, template, domainKey, chatId, fr
  * domain + chat 定位 —— subscriptionId 精确寻址优先；否则四元组 + instanceKey 重算 id；
  * 都没给时四元组下恰一条才认，多条歧义拒绝（列出候选 id 让人挑）。
  */
-export function planSubscriptionChange({ store, runtime, template, domainKey, chatId, freshnessMs, action = "add", instanceKey = null, subscriptionId = null } = {}) {
+export function planSubscriptionChange({ store, runtime, template, domainKey, chatId, freshnessMs, action = "add", instanceKey = null, subscriptionId = null, chatName = null } = {}) {
   if (!["add", "pause", "resume", "remove"].includes(action)) return { ok: false, reason: "action_unknown" };
   if (!store || !Array.isArray(store.subscriptions)) return { ok: false, reason: "store_invalid" };
   // 链核对（评审 PR #112 P2）：Claude 模板配 runtime:"codex" 会生成一条合法但归错链的订阅 ——
@@ -165,7 +172,7 @@ export function planSubscriptionChange({ store, runtime, template, domainKey, ch
   if (action === "add") {
     const id = subscriptionControlId({ runtime, agentUid: template?.agent_uid, domainKey, chatId, instanceKey });
     if (store.subscriptions.some((s) => s.subscription_id === id)) return { ok: false, reason: "subscription_exists", subscription_id: id };
-    const planned = planSubscriptionEntry({ runtime, template, domainKey, chatId, freshnessMs, instanceKey });
+    const planned = planSubscriptionEntry({ runtime, template, domainKey, chatId, freshnessMs, instanceKey, chatName });
     if (!planned.ok) return planned;
     return { ok: true, changed: true, store: { ...store, subscriptions: [...store.subscriptions, planned.entry] }, entry: planned.entry };
   }

@@ -362,7 +362,24 @@ export const CHAT_FALLBACK_REASONS = Object.freeze([
   PROMOTE_REJECT.TOKEN_AMBIGUOUS, PROMOTE_REJECT.TOKEN_DUPLICATED, PROMOTE_REJECT.PENDING_EXPIRED,
   PROMOTE_REJECT.SENDER_NOT_FRANK,
 ]);
-export function evaluateChatGates({ event, template, now = Date.now() }) {
+/**
+ * P2P / 平台直投判据：本轮 Aily turn 发生在链模板登记的那个群 chat 之外。
+ *
+ * 事件链里没有 chat_type 字段（canonical event、CHAIN_FIELDS、AILY_CLI_* 变量全集都没有），
+ * 不猜字段名；等价判据用 daemon 注入的 AILY_CLI_CHANNEL_CHAT_ID（dispatcher 只删
+ * SESSION / RUN 两个键，child 原样继承；canonical.extensions.aily_channel 同源、标注
+ * unverified）对照模板登记的 chat_id：不同 = 这条消息不是从那个共享群话题里来的
+ * （实际即私聊）。@ 的语义是共享群内消歧，平台已经把私聊寻址给本链 agent，正文里
+ * 不可能有 @。env 缺失或模板没有 chat_id → false（按群处理、要求 @，fail-safe 与
+ * 既有行为一致）。外部群属 FR-2.6，未支持，不走这条豁免。
+ */
+export function isOffTemplateChatTurn({ template, env = process.env } = {}) {
+  const chatId = typeof env?.AILY_CLI_CHANNEL_CHAT_ID === "string" ? env.AILY_CLI_CHANNEL_CHAT_ID : "";
+  const templateChatId = typeof template?.chat_id === "string" ? template.chat_id : "";
+  return chatId.length > 0 && templateChatId.length > 0 && chatId !== templateChatId;
+}
+
+export function evaluateChatGates({ event, template, now = Date.now(), env = process.env }) {
   const reject = (reason) => ({ ok: false, reason, reasonText: PROMOTE_REJECT_TEXT[reason] ?? reason });
   const frank = template?.frank_sender_id;
   const transport = template?.transport_open_id;
@@ -373,7 +390,8 @@ export function evaluateChatGates({ event, template, now = Date.now() }) {
   }
   const role = senderRole({ frank_sender_id: frank, senders: template?.senders }, event?.sender_id);
   if (role === null) return reject(PROMOTE_REJECT.SENDER_NOT_FRANK);
-  if (!extractMentionIds(event?.content).includes(transport)) return reject(PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
+  if (!isOffTemplateChatTurn({ template, env }) &&
+      !extractMentionIds(event?.content).includes(transport)) return reject(PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED);
   const createdMs = Number(event?.created_at_ms);
   if (!Number.isFinite(createdMs)) return reject(PROMOTE_REJECT.MALFORMED_TEMPLATE);
   if (now - createdMs > freshness) return reject(PROMOTE_REJECT.STALE_MESSAGE);

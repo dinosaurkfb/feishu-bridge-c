@@ -13,7 +13,7 @@ import {
   acquireSessionLock, releaseSessionLock, stampSessionLock,
 } from "../handoff.mjs";
 import { REJECT, normalizeBody } from "../selector.mjs";
-import { evaluateChatGates, CHAT_FALLBACK_REASONS } from "../inbound-route.mjs";
+import { evaluateChatGates, CHAT_FALLBACK_REASONS, isOffTemplateChatTurn } from "../inbound-route.mjs";
 import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatFailText, chatReplyPathStatus } from "../chat-reply.mjs";
 import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome, lockUnclearedText } from "../chat-ledger.mjs";
 import {
@@ -254,6 +254,11 @@ let subscriptionClaimShadow = null;
 if (!routed.ok) {
   if (routed.reason !== "no_binding_for_session") {
     finish("error", { detail: "Codex task registry 无法路由（" + routed.reason + "）" }, { reason: routed.reason });
+  }
+  // P2P / 平台直投（本轮 turn 不在模板登记的群 chat 里）：不进认领评估，与 Claude 链同一份判据。
+  // chatTurn 自带三道闸与控制命名空间，所有出口都 finish，不会落到下面的认领路径。
+  if (isOffTemplateChatTurn({ template: template.template })) {
+    chatTurn({ chain: "codex", template: template.template, event, dryRun, ledgerDir: path.join(HOME, "inbound", "chat-claims") });
   }
   const promotionNow = Date.now();
   const pending = findPendingTask({ home: HOME, content: event.content, now: promotionNow });

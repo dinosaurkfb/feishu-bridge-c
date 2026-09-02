@@ -171,7 +171,7 @@ async function main() {
         turnRoute = { ok: false, reason: "turn_record_" + record.reason };
       } else if (record.consumed) {
         // 这份记录已经授权过一次 Stop：重入 / 上一轮遗留都不许再入队。
-        turnRoute = { ok: false, reason: "turn_record_consumed", messageId: record.messageId ?? null };
+        turnRoute = { ok: false, reason: "turn_record_consumed", messageId: record.messageId ?? null, consumedAt: record.consumedAt };
       } else if (record.kind === "local") {
         turnRoute = { ok: true, kind: "local" };
       } else {
@@ -243,8 +243,44 @@ async function main() {
     // 弱信号用来触发排空是安全的（那些内容本来就要发），但用它决定
     // 「把整段对话原文发到谁的话题里」不行 —— 一次误判就是把无关对话发给了 Frank。
     if (reply && project.via.includes("cwd") && !turnRoute.ok && turnRoute.reason === "turn_record_consumed") {
-      // 同一回合的 Stop 重入：第一次已经入队，这次幂等跳过 —— 只记日志，不算"未路由"。
-      log(project.id + " reply not re-queued: turn record already consumed");
+      // mid-turn 插入的消息不经 UserPromptSubmit（没有新记录）：上一轮的记录已消费，
+      // 这一轮拿不到配对输入 —— 但回答半张是真实的，不再整轮丢弃：只发回答半张。
+      // 同一回合的重入用「同正文且不晚于消费点的 session-reply 已存在」识别
+      // （配对队列发生在消费戳之前，同 stop 内先入队后打 consumed_at，
+      // <= 无竞态）；不同回合不同正文 → 新键入队，不丢。逐字相同的两条
+      // 回答靠事件键去重兜底，不会双发。事件键用正文哈希而不是记录身份：
+      // 已消费记录的 capture / claim 键属于上一回合，复用会被它的旧事件吞掉。
+      // 不携带任何输入半张 —— 飞书来源输入不重复的约定不受影响：已消费回合
+      // 的输入早在它自己的回合里发过。已知残留：消费窗内两条逐字相同的回答
+      // 只发第一条（无配对输入时回合本身不可区分，只能靠正文）。
+      let queuedThisTurn = false;
+      let names = [];
+      try { names = fs.readdirSync(outboxDir); } catch { names = []; }
+      for (const n of names) {
+        if (!n.endsWith(".json")) continue;
+        try {
+          const ev = JSON.parse(fs.readFileSync(path.join(outboxDir, n), "utf-8"));
+          if (ev.kind === "reply" && ev.source === "session-reply" && ev.text === reply &&
+              typeof ev.created_at === "string" &&
+              (!turnRoute.consumedAt || ev.created_at <= turnRoute.consumedAt)) { queuedThisTurn = true; break; }
+        } catch { /* 读不出的单件不当作已入队 */ }
+      }
+      if (queuedThisTurn) {
+        log(project.id + " reply not re-queued: already queued this turn (same reply after consumption point)");
+      } else {
+        const r = appendEvent({
+          outboxDir, kind: "reply", text: reply, source: "session-reply",
+          eventKey: "claude:" + speakingSession + ":unpaired:" +
+            crypto.createHash("sha256").update(reply).digest("hex").slice(0, 16) + ":reply",
+          targetGenerationId: bound.ok ? bound.mapping?.channel_generation_id : undefined,
+        });
+        if (r.ok) {
+          wroteThisTurn.add(project.root);
+          log(project.id + " reply queued without paired input (turn_record_consumed; answer-only)");
+        } else {
+          log(project.id + " answer-only reply not queued: " + r.reason);
+        }
+      }
     } else if (reply && project.via.includes("cwd") && !turnRoute.ok) {
       // 零入队 + 可诊断：完整答复留在记录里（不是预览），临时文件 + rename 原子落盘，文件名带随机段不会覆盖。
       const unrouted = path.join(project.root, ".runtime-data", "outbound", "unrouted-replies");

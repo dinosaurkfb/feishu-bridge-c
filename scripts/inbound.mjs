@@ -50,6 +50,7 @@ import { loadChainTemplate } from "./chain-template.mjs";
 import {
   appendConsumed, buildClaudeSubscriptionProjection, evaluatePromotion, findBindingForSession,
   findPendingBinding, promoteBinding, shadowClaudeFirstClaim, evaluateChatGates, CHAT_FALLBACK_REASONS,
+  isOffTemplateChatTurn,
 } from "./inbound-route.mjs";
 import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatFailText } from "./chat-reply.mjs";
 import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome, lockUnclearedText } from "./chat-ledger.mjs";
@@ -326,6 +327,13 @@ if (!routed.ok) {
   // 绑定必然分两段：建话题时 Aily session 还不存在（它是第一条消息流进来才产生的）。
   const tpl = loadChainTemplate();
   const template = tpl.ok ? tpl.template : null;
+  // P2P / 平台直投（本轮 turn 不在模板登记的群 chat 里）：不进认领评估 —— 认领本来就该
+  // 在群话题里真实 @ 完成，私聊没有 @ 可打，留着只有一条 transport_not_mentioned 的错拒绝。
+  // chatTurn 自带三道闸与控制命名空间，所有出口都 finish，不会落到下面的认领路径。
+  // channel env 缺失时 isOffTemplateChatTurn 恒 false，按群处理，既有行为不变。
+  if (isOffTemplateChatTurn({ template })) {
+    chatTurn({ chain: "claude", template, event, dryRun, ledgerDir: path.join(UNROUTED_RT, "chat-claims") });
+  }
   // 把正文传进去：绑定码就藏在飞书自动附加的引用块里，Frank 不用打任何东西。
   const promotionNow = Date.now();
   const pending = findPendingBinding({ content: event.content, now: promotionNow });

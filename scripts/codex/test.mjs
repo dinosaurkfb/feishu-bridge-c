@@ -9669,23 +9669,28 @@ test("#R11 Codex 链采样三态：频道==登记群 → true；不一致 → fa
   assert.equal(c.channel_chat_sha16, null);
   assert.equal(a.channel_thread_sha16, sha256Of("om_cx_thread").slice(0, 16), "线程同规则哈希");
   assert.equal(a.chain, "codex");
-  assert.match(a.disposition, /^rejected:/);
+  assert.match(a.disposition, /^rejected:[a-z][a-z0-9_]*$/u, "无 @ → rejected:<snake 原因>：" + a.disposition);
   for (const row of lines) {
     assert.equal(row.schema_version, "1.0");
     assert.doesNotMatch(JSON.stringify(row), /oc_|ou_|om_/u, "整行不许出现任何 locator 明文前缀");
   }
 });
 
-test("#R11 Codex 采样失败不影响主流程（EISDIR 隔离）：文件是目录 → 只 log、不阻断、不替换", () => {
+test("#R11 Codex 采样失败不影响主流程（EISDIR 隔离）：文件是目录 → 输出干净、diag 一行、不替换", () => {
   const { sampleFile, run } = codexChanRun();
   fs.mkdirSync(path.dirname(sampleFile), { recursive: true });
   fs.mkdirSync(sampleFile);
   const r = run({ messageId: "om_cx_eisdir", envChat: TEMPLATE.chat_id });
   assert.equal(r.status, 0, "主流程退出码不受采样失败影响：" + r.stderr);
   assert.match(r.stdout, /已拒绝/u, "正常拒绝回执仍在：" + r.stdout);
-  assert.match(r.stderr, /采样旁路失败/u, "失败被记住并只打一行日志：" + r.stderr);
-  assert.match(r.stderr, /EISDIR/u, "暴露失败根因（不遮）：" + r.stderr);
+  assert.doesNotMatch(r.stdout, /采样|channel-samples|diag/u, "stdout 不许出现采样失败字样：" + r.stdout);
+  assert.doesNotMatch(r.stderr, /采样|channel-samples|diag/u, "stderr 不许出现采样失败字样（会进模型上下文）：" + r.stderr);
   assert.equal(fs.statSync(sampleFile).isDirectory(), true, "目录不被采样替换");
+  const diagFile = path.join(path.dirname(sampleFile), "channel-samples.diag.log");
+  assert.equal(fs.existsSync(diagFile), true, "机器级诊断文件应产生");
+  const diag = fs.readFileSync(diagFile, "utf-8").trim();
+  assert.match(diag, /channel_sample_write_failed|EISDIR/u, "诊断记下失败根因：" + diag);
+  assert.equal(diag.split("\n").length, 1, "只落一行诊断（" + diag + "）");
 });
 
 summarySealed = true;

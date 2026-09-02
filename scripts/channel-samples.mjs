@@ -6,13 +6,18 @@
  * 记到 <bridgeHome>/inbound/channel-samples.jsonl，供后来人肉核验
  * AILY_CLI_CHANNEL_CHAT_ID 到底映射的是群还是私聊。
  *
- * 纪律（与主流程严格隔离）：
- *  - 采样失败绝不阻断 / 不回退入站流程。appendChannelSample 全包 try/catch，
- *    失败只往 stderr 打一行，返回 { ok:false }，调用方当没听见。
- *  - locator 不外泄：session / channel chat / channel thread / message_id 一律
- *    sha256 前 16 位落行。Aily 的 message_id 本身就是 om_ 前缀，写明文会漏。
- *    matches_template_chat 用布尔表达（true = 频道 == 模板群，false = 不一致，
- *    null = 频道或模板 chat_id 缺失，连比较都不做）。
+ * 纪律（与主流程严格隔离，#R9 修订版）：
+ *  - 采样失败绝不阻断 / 不回退入站流程；也**绝不污染模型可见输出**——Aily 会把
+ *    stdout+stderr 合并进模型上下文，所以失败一个字都不往进程输出写。
+ *    appendChannelSample 全包 try/catch，失败静默返回 { ok:false, reason }，调用方当没听见；
+ *    失败原因**追加到机器级诊断文件** <dir>/channel-samples.diag.log（同样全包 try/catch，
+ *    写不进就彻底放弃——诊断的诊断不再递归）。注意：诊断文件也不进进程输出，是落盘。
+ *  - 写方与读方共用唯一封闭校验器 channelSampleProblem：精确键集、规范 ISO、哈希
+ *    null|^[0-9a-f]{16}$、chain/disposition 封闭且有界。**坏行写不出去、读不进来**——
+ *    本批数据要用来判断 locator 能否提升为可信事实，不能把不符写方封闭 shape 的行当干净证据。
+ *  - locator 不外泄：session / channel chat / channel thread / message_id 一律 sha256 前
+ *    16 位落行。Aily 的 message_id 本身就是 om_ 前缀，写明文会漏。matches_template_chat
+ *    用布尔表达（true = 频道 == 模板群，false = 不一致，null = 频道或模板 chat_id 缺失）。
  *  - 只写 machine 级目录（UNROUTED_RT / FEISHU_CODEX_BRIDGE_HOME 的 inbound/），
  *    绝不写项目 runtime，避免每装一版就换地方。
  *
@@ -26,6 +31,16 @@ import crypto from "node:crypto";
 
 const SCHEMA_VERSION = "1.0";
 const CHAINS = Object.freeze(["claude", "codex"]);
+// 精确键集：行允许的键一个不多一个不少（缺键或多余的 raw_locator 一律拒）。
+const KEYS = Object.freeze([
+  "schema_version", "at", "chain", "message_id", "session_sha16",
+  "channel_chat_sha16", "channel_thread_sha16", "matches_template_chat", "disposition",
+]);
+// 非 rejected 的终态枚举。
+const DISPOSITION_KINDS = Object.freeze(["chat", "control", "bound", "error"]);
+// rejected 的原因词：用形状封闭（snake_case、首字符字母、长度 ≤ 64）而非从判定逻辑里引
+// PROMOTE_REJECT 词表——引词表会让本旁路耦合到判定代码、且未来词表增删就全绿→红。形状足够。
+const REASON_PATTERN = /^rejected:[a-z][a-z0-9_]{0,63}$/;
 
 /** sha256 前 16 位；空串 / 非字符串 → null（缺字段就是缺，不造假）。 */
 export function channelSampleSha16(value) {
@@ -39,6 +54,43 @@ export function channelSampleSha16(value) {
  */
 export function channelDisposition(kind, reason) {
   return kind === "rejected" ? "rejected:" + (reason ?? "") : kind;
+}
+
+/**
+ * 唯一封闭校验器：写前（appendChannelSample）与读时（loadChannelSamples）共用。
+ * 返回问题数组；空数组 = 干净行。坏行两个方向都进不来。
+ * 封闭判据：精确键集 + 规范 ISO at + 哈希 null|^[0-9a-f]{16}$ + matches 三值 +
+ * chain 枚举 + disposition 枚举/形状（rejected:<reason> 有界）。
+ */
+export function channelSampleProblem(obj) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return ["not_object"];
+  const problems = [];
+  const keys = Object.keys(obj);
+  const extra = keys.filter((k) => !KEYS.includes(k));
+  const missing = KEYS.filter((k) => !keys.includes(k));
+  if (extra.length) problems.push("extra_keys:" + extra.join(","));
+  if (missing.length) problems.push("missing_keys:" + missing.join(","));
+  if (obj.schema_version !== SCHEMA_VERSION) problems.push("schema_version");
+  if (!isCanonicalIso(obj.at)) problems.push("at");
+  if (typeof obj.chain !== "string" || !CHAINS.includes(obj.chain)) problems.push("chain");
+  for (const k of ["message_id", "session_sha16", "channel_chat_sha16", "channel_thread_sha16"]) {
+    if (obj[k] !== null && !(typeof obj[k] === "string" && /^[0-9a-f]{16}$/.test(obj[k]))) {
+      problems.push(k + ":bad_hash");
+    }
+  }
+  if (!(obj.matches_template_chat === true || obj.matches_template_chat === false || obj.matches_template_chat === null)) {
+    problems.push("matches_template_chat");
+  }
+  if (!(DISPOSITION_KINDS.includes(obj.disposition) || REASON_PATTERN.test(obj.disposition))) {
+    problems.push("disposition");
+  }
+  return problems;
+}
+
+// 规范 ISO：与 toISOString() 同形（以 Z 结尾、长度有界、Date.parse 可观）。拒 not-a-time。
+function isCanonicalIso(s) {
+  return typeof s === "string" && s.length >= 20 && s.length <= 40 &&
+    s.endsWith("Z") && Number.isFinite(Date.parse(s));
 }
 
 /** 读入站消息频道对照所需字段；缺哪个补哪个，都缺就 null。 */
@@ -67,29 +119,57 @@ function channelView({ event, canonical, template, env }) {
   };
 }
 
+// 机器级诊断：只落 <dir>/channel-samples.diag.log，绝不进 stdout/stderr（Aily 会合并）。
+// 再全包 try/catch，写不进就彻底放弃——诊断的诊断不再递归。
+function diagWrite(file, msg) {
+  try {
+    if (typeof file !== "string" || file.length === 0) return;
+    const diagFile = path.join(path.dirname(file), "channel-samples.diag.log");
+    let fd = null;
+    try {
+      fd = fs.openSync(
+        diagFile,
+        fs.constants.O_APPEND | fs.constants.O_WRONLY | fs.constants.O_CREAT |
+        fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+        0o600,
+      );
+      fs.writeSync(fd, new Date().toISOString() + " " + msg + "\n");
+    } finally {
+      if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
+    }
+  } catch { /* 诊断都不再递归，放弃 */ }
+}
+
 /**
  * 追加一行采样。**全包不抛**：任何失败（目录不可写、文件被做成目录、有符号链接、OOM…）
- * 都只往 stderr 打一行，返回 { ok:false, reason }，绝不让采样线拖垮主流程。
+ * 都静默返回 { ok:false, reason }，绝不让采样线拖垮主流程，也绝不污染进程输出（Aily 会把
+ * stdout+stderr 合并进模型上下文）。失败原因写进机器级诊断文件（见 diagWrite）。
+ * 写前先过 channelSampleProblem 自校验，坏行写不出去（P1）。
  */
 export function appendChannelSample({
   file, event, canonical, template, chain, env = process.env, disposition,
 } = {}) {
+  if (typeof file !== "string" || !path.isAbsolute(file)) {
+    return { ok: false, reason: "channel_sample_required_absolute" };
+  }
+  const v = channelView({ event, canonical, template, env });
+  const row = {
+    schema_version: SCHEMA_VERSION,
+    at: v.at,
+    chain,
+    message_id: channelSampleSha16(v.messageId),
+    session_sha16: channelSampleSha16(v.sessionId),
+    channel_chat_sha16: channelSampleSha16(v.chatId),
+    channel_thread_sha16: channelSampleSha16(v.threadId),
+    matches_template_chat: v.matches,
+    disposition,
+  };
+  const problems = channelSampleProblem(row);
+  if (problems.length) {
+    diagWrite(file, "channel_sample_invalid " + problems.join(","));
+    return { ok: false, reason: "channel_sample_invalid", problems };
+  }
   try {
-    if (typeof file !== "string" || !path.isAbsolute(file)) {
-      return { ok: false, reason: "channel_sample_required_absolute" };
-    }
-    const v = channelView({ event, canonical, template, env });
-    const row = {
-      schema_version: SCHEMA_VERSION,
-      at: v.at,
-      chain,
-      message_id: channelSampleSha16(v.messageId),
-      session_sha16: channelSampleSha16(v.sessionId),
-      channel_chat_sha16: channelSampleSha16(v.chatId),
-      channel_thread_sha16: channelSampleSha16(v.threadId),
-      matches_template_chat: v.matches,
-      disposition,
-    };
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     let fd = null;
     try {
@@ -105,35 +185,16 @@ export function appendChannelSample({
     }
     return { ok: true, row };
   } catch (err) {
-    try {
-      process.stderr.write("[channel-samples] 采样旁路失败（不阻断主流程）：" +
-        (typeof err?.code === "string" ? err.code : String(err?.message ?? err)) + "\n");
-    } catch { /* 连 stderr 都写不了就算了 */ }
+    diagWrite(file, "channel_sample_write_failed " + (typeof err?.code === "string" ? err.code : String(err?.message ?? err)));
     return { ok: false, reason: "channel_sample_write_failed" };
   }
 }
 
-/** 单行 shape 校验：结构合法才收；坏项进 problems。 */
-function validateChannelSample(obj) {
-  const problems = [];
-  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return ["not_object"];
-  if (obj.schema_version !== SCHEMA_VERSION) problems.push("schema_version");
-  if (typeof obj.at !== "string" || obj.at.length === 0) problems.push("at");
-  if (typeof obj.chain !== "string" || !CHAINS.includes(obj.chain)) problems.push("chain");
-  for (const k of ["message_id", "session_sha16", "channel_chat_sha16", "channel_thread_sha16"]) {
-    if (obj[k] !== null && typeof obj[k] !== "string") problems.push(k);
-  }
-  if (!(obj.matches_template_chat === true || obj.matches_template_chat === false || obj.matches_template_chat === null)) {
-    problems.push("matches_template_chat");
-  }
-  if (typeof obj.disposition !== "string" || obj.disposition.length === 0) problems.push("disposition");
-  return problems;
-}
-
 /**
- * 只读视图：subscription-store 同款 fd 读纪律（O_NOFOLLOW | O_NONBLOCK 打开、
- * 同 fd fstat 确认普通文件、读完即关），坏行进 problems，不隐没。
- * 不加载、不写任何东西。
+ * 只读视图：subscription-store 同款 fd 读纪律（O_NOFOLLOW | O_NONBLOCK 打开、同 fd fstat
+ * 确认普通文件且**单硬链接 nlink===1**、读完即关），坏行进 problems，不隐没。文件不以换行
+ * 结尾（截断风险）→ 报文件级 problem。
+ * 读方用同一 channelSampleProblem：与写方同判据，坏行不进来当干净证据。不加载、不写任何东西。
  */
 export function loadChannelSamples({ file } = {}) {
   if (typeof file !== "string" || !path.isAbsolute(file)) {
@@ -156,6 +217,10 @@ export function loadChannelSamples({ file } = {}) {
     try { fs.closeSync(fd); } catch { /* 已关 */ }
     return { ok: false, reason: "channel_samples_not_regular_file", detail: "不是普通文件" };
   }
+  if (st.nlink !== 1) {
+    try { fs.closeSync(fd); } catch { /* 已关 */ }
+    return { ok: false, reason: "channel_samples_not_regular_file", detail: "是硬链接别名（nlink=" + st.nlink + "）；对照样本请用真实路径" };
+  }
   let raw;
   try { raw = fs.readFileSync(fd, "utf-8"); } catch (err) {
     try { fs.closeSync(fd); } catch { /* 已关 */ }
@@ -165,6 +230,7 @@ export function loadChannelSamples({ file } = {}) {
 
   const rows = [];
   const problems = [];
+  if (raw.length > 0 && !raw.endsWith("\n")) problems.push("tail_no_newline");
   const lines = raw.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -174,7 +240,7 @@ export function loadChannelSamples({ file } = {}) {
       problems.push("line:" + (i + 1) + ":json_invalid");
       continue;
     }
-    const p = validateChannelSample(obj);
+    const p = channelSampleProblem(obj);
     if (p.length) { problems.push("line:" + (i + 1) + ":" + p.join(",")); continue; }
     rows.push(obj);
   }

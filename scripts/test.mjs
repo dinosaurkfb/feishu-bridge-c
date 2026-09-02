@@ -18,7 +18,7 @@ import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome
 import { parseChatScratchSweepArgs, describeScratchSweep, sweepExitCode } from "./chat-scratch-sweep.mjs";
 import { acquireLockUngated, acquirePublishLock as acquireLedgerLock, releasePublishLock as releaseLedgerLock } from "./registry.mjs";
 import { evaluateChatGates, CHAT_FALLBACK_REASONS, isOffTemplateChatTurn } from "./inbound-route.mjs";
-import { appendChannelSample, channelDisposition, channelSampleSha16, loadChannelSamples } from "./channel-samples.mjs";
+import { appendChannelSample, channelDisposition, channelSampleProblem, channelSampleSha16, loadChannelSamples } from "./channel-samples.mjs";
 import { ZERO_TOOL_ARGS } from "./handoff.mjs";
 import { INTENT, parseInboundIntent, controlRejectText, rejectedControlProjection, shown } from "./inbound-intent.mjs";
 import { rejectedRecordProblem, runRejectTransaction, inspectRejectedClaim, resumeRejectedClaim, describeRejectRepair, rejectRepairExitCode } from "./reject-control.mjs";
@@ -23749,7 +23749,7 @@ test("#R11 Claude 链采样三态：频道==登记群 → true；不一致 → f
   assert.equal(a.channel_thread_sha16, channelSampleSha16("om_cs_thread"), "线程同规则哈希");
   assert.equal(b.channel_thread_sha16, null);
   assert.equal(a.chain, "claude");
-  assert.match(a.disposition, /^rejected:/, "无 @ → rejected:<reason>");
+  assert.match(a.disposition, /^rejected:[a-z][a-z0-9_]*$/u, "无 @ → rejected:<snake 原因>：" + a.disposition);
   for (const row of lines) {
     assert.equal(row.schema_version, "1.0");
     assert.equal(typeof row.message_id, "string", "message_id 不落明文");
@@ -23759,40 +23759,91 @@ test("#R11 Claude 链采样三态：频道==登记群 → true；不一致 → f
 });
 
 // 采样失败不得影响主流程：把采样文件做成目录 → EISDIR，链照常拒绝、退出 0、目录仍在。
-test("#R11 采样失败不影响主流程（EISDIR 隔离）：文件是目录 → 只 log、不阻断、不替换目录", () => {
+// #R9：失败一个字都不往进程输出写（Aily 会把 stdout+stderr 合并进模型上下文），只落机器级诊断文件。
+test("#R11 采样失败不影响主流程（EISDIR 隔离）：文件是目录 → 输出干净、diag 一行、不替换目录", () => {
   const { run, sampleFile } = chanRunHarness();
   fs.mkdirSync(path.dirname(sampleFile), { recursive: true });
   fs.mkdirSync(sampleFile); // 把采样文件位做成目录
   const r = run({ messageId: "om_cs_eisdir", envChat: TPL.chat_id });
   assert.equal(r.status, 0, "主流程退出码不受采样失败影响：" + r.stderr);
   assert.match(r.stdout, /已拒绝/u, "正常拒绝回执仍在：" + r.stdout);
-  assert.match(r.stderr, /采样旁路失败/u, "失败被记住并只打一行日志：" + r.stderr);
-  assert.match(r.stderr, /EISDIR/u, "暴露失败根因（不遮）：" + r.stderr);
+  assert.doesNotMatch(r.stdout, /采样|channel-samples|diag/u, "stdout 不许出现采样失败字样：" + r.stdout);
+  assert.doesNotMatch(r.stderr, /采样|channel-samples|diag/u, "stderr 不许出现采样失败字样（会进模型上下文）：" + r.stderr);
   assert.equal(fs.statSync(sampleFile).isDirectory(), true, "目录不被采样替换");
+  const diagFile = path.join(path.dirname(sampleFile), "channel-samples.diag.log");
+  assert.equal(fs.existsSync(diagFile), true, "机器级诊断文件应产生");
+  const diag = fs.readFileSync(diagFile, "utf-8").trim();
+  assert.match(diag, /channel_sample_write_failed|EISDIR/u, "诊断记下失败根因：" + diag);
+  assert.equal(diag.split("\n").length, 1, "只落一行诊断（" + diag + "）");
 });
 
-// loadChannelSamples：好行收、坏行进 problems、文件不存在→absent、目录→not_regular。
-test("#R11 loadChannelSamples：好行收进 rows、坏结构/坏 JSON 进 problems、不存在→absent、目录→not_regular", () => {
+// loadChannelSamples + 唯一封闭校验器 channelSampleProblem：
+// #R9 评审 P1 —— 探针写入含 extra key/明文 oc_/坏时间/伪哈希/越界 disposition 的行，
+// loadChannelSamples 必须各拒（不把不符写方封闭 shape 的行当干净证据），写方同判据写不出坏行。
+test("#R11 loadChannelSamples + channelSampleProblem：好行收进 rows，探针坏行矩阵各拒，nlink/尾换行与 subscription-store 同款", () => {
   const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-csl-")), "channel-samples.jsonl");
-  const good = JSON.stringify({ schema_version: "1.0", at: "2026-09-02T00:00:00.000Z", chain: "claude", message_id: "aakey", session_sha16: "bbkey", channel_chat_sha16: "cckey", channel_thread_sha16: null, matches_template_chat: true, disposition: "bound" });
-  const badJson = "{not json";
-  const badSchema = JSON.stringify({ schema_version: "2.0", at: "x", chain: "nope", message_id: null, session_sha16: null, channel_chat_sha16: null, channel_thread_sha16: null, matches_template_chat: true, disposition: "bound" });
-  fs.writeFileSync(f, good + "\n" + badJson + "\n" + badSchema + "\n");
+  const good = { schema_version: "1.0", at: "2026-09-02T00:00:00.000Z", chain: "claude", message_id: "a".repeat(16), session_sha16: "b".repeat(16), channel_chat_sha16: "c".repeat(16), channel_thread_sha16: null, matches_template_chat: true, disposition: "bound" };
+  const withAdd = (patch) => JSON.stringify({ ...good, ...patch });
+  const probeRows = [
+    [withAdd({ raw_locator: "oc_secret" }), /extra_keys:raw_locator/u],      // 多余键
+    [withAdd({ session_sha16: "oc_secret" }), /session_sha16:bad_hash/u],    // 明文 oc_（非法哈希）
+    [withAdd({ at: "not-a-time" }), /at$/u],                                // 坏时间
+    [withAdd({ channel_chat_sha16: "a" }), /channel_chat_sha16:bad_hash/u],  // 伪哈希（1 字符）
+    [withAdd({ disposition: "garbage" }), /:disposition/u],                  // 越界 disposition
+    [withAdd({ channel_thread_sha16: "x" }), /channel_thread_sha16:bad_hash/u],
+    [JSON.stringify({ schema_version: "2.0", at: "2026-09-02T00:00:00.000Z", chain: "nope", message_id: "a".repeat(16), session_sha16: "b".repeat(16), channel_chat_sha16: "c".repeat(16), channel_thread_sha16: null, matches_template_chat: true, disposition: "bound" }), /schema_version|:chain,/u],
+    ["{not json", /json_invalid/u],
+  ];
+  const missingKey = { ...good }; delete missingKey.session_sha16;
+  probeRows.push([JSON.stringify(missingKey), /missing_keys:session_sha16/u]);
+  // 好行 + 各探针行 + 尾无换行（截断风险）
+  fs.writeFileSync(f, JSON.stringify(good) + "\n" + probeRows.map((r) => r[0]).join("\n"));
   const loaded = loadChannelSamples({ file: f });
   assert.equal(loaded.ok, true);
   assert.equal(loaded.absent, false);
-  assert.equal(loaded.rows.length, 1, "好行收进 rows");
-  assert.deepEqual(loaded.rows[0].message_id, "aakey");
-  assert.equal(loaded.problems.length, 2, "坏 JSON + 坏 schema 各一条 problems（" + loaded.problems.join(", ") + "）");
-  assert.match(loaded.problems[0], /json_invalid/u);
-  assert.match(loaded.problems[1], /schema_version/u);
+  assert.equal(loaded.rows.length, 1, "只有干净好行进 rows");
+  assert.deepEqual(loaded.rows[0].message_id, "a".repeat(16));
+  assert.equal(loaded.problems.length, probeRows.length + 1, "每个探针行各一条 + 尾换行一条（" + loaded.problems.join(", ") + "）");
+  for (let i = 0; i < probeRows.length; i++) {
+    const [rowText, rx] = probeRows[i];
+    const idx = loaded.problems.findIndex((p) => p.startsWith("line:" + (i + 2)));
+    assert.ok(idx !== -1, "第 " + (i + 2) + " 行应被判坏（" + rowText + "）");
+    assert.match(loaded.problems[idx], rx, "第 " + (i + 2) + " 行判坏原因：" + loaded.problems[idx]);
+  }
+  assert.ok(loaded.problems.some((p) => /tail_no_newline/u.test(p)), "尾无换行 → 文件级 problem（" + loaded.problems.join(", ") + "）");
+  // 尾换行干净文件 → 无 tail_no_newline
+  const f2 = path.join(path.dirname(f), "clean.jsonl");
+  fs.writeFileSync(f2, JSON.stringify(good) + "\n");
+  assert.equal(loadChannelSamples({ file: f2 }).problems.length, 0, "干净文件无 problem");
+  // absent
   const missing = loadChannelSamples({ file: f + ".nope" });
   assert.equal(missing.ok, true);
   assert.equal(missing.absent, true);
+  // 目录
   const dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-csd-")), "sub"); fs.mkdirSync(dir);
   const asDir = loadChannelSamples({ file: dir });
   assert.equal(asDir.ok, false);
   assert.equal(asDir.reason, "channel_samples_not_regular_file");
+  // 硬链接别名（nlink>1）
+  const hlink = f + ".hl";
+  try { fs.linkSync(f, hlink); } catch { /* 可能不支持硬链接，跳过 */ }
+  if (fs.existsSync(hlink)) {
+    const asLink = loadChannelSamples({ file: hlink });
+    assert.equal(asLink.ok, false);
+    assert.equal(asLink.reason, "channel_samples_not_regular_file");
+    assert.match(asLink.detail || "", /硬链接/u, "硬链接别名被拒：" + JSON.stringify(asLink));
+  }
+  // 写方同判据写不出坏行：越界 disposition → append 返回 invalid、文件不落
+  const badOut = appendChannelSample({ file: f + ".bad", event: { message_id: "om_x", session_id: "s", created_at_ms: 1750000000000 }, canonical: null, template: TPL, chain: "claude", env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id }, disposition: "garbage" });
+  assert.equal(badOut.ok, false);
+  assert.equal(badOut.reason, "channel_sample_invalid");
+  assert.match((badOut.problems || []).join(","), /disposition/u);
+  assert.equal(fs.existsSync(f + ".bad"), false, "坏行写不出去");
+  // 好行经 append → load 回读 problems:[]
+  const goodOut = appendChannelSample({ file: f + ".ok", event: { message_id: "om_y", session_id: "s", created_at_ms: 1750000000000 }, canonical: null, template: TPL, chain: "claude", env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id }, disposition: "rejected:transport_not_mentioned" });
+  assert.equal(goodOut.ok, true);
+  assert.equal(loadChannelSamples({ file: f + ".ok" }).rows.length, 1);
+  assert.equal(channelSampleProblem(good).length, 0, "干净行 0 问题");
   assert.equal(channelDisposition("rejected", "transport_not_mentioned"), "rejected:transport_not_mentioned");
   assert.equal(channelDisposition("bound", "x"), "bound");
   assert.equal(channelSampleSha16("oo"), createHash("sha256").update("oo").digest("hex").slice(0, 16));

@@ -211,7 +211,7 @@ import {
   promoteBinding, shadowClaudeFirstClaim,
 } from "./inbound-route.mjs";
 import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION_KEYED, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, selectPendingSubscriptionClaim, stableControlId, subscriptionIdFor, validateSubscription, claimable } from "./subscription.mjs";
-import { applySubscriptionChange, loadSubscriptionAudit, loadSubscriptionStore, mergedSubscriptionView, planSubscriptionChange, planSubscriptionEntry, subscriptionStorePath, SUBSCRIPTION_STORE_ARTIFACT_TYPE, SUBSCRIPTION_STORE_SCHEMA_VERSION } from "./subscription-store.mjs";
+import { applySubscriptionChange, appendSubscriptionAuditLine, buildSubscriptionAuditEvent, clearSubscriptionAuditPending, loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, mergedSubscriptionView, planSubscriptionChange, planSubscriptionEntry, staleSubscriptionAuditPending, subscriptionAuditPendingPath, subscriptionStorePath, SUBSCRIPTION_STORE_ARTIFACT_TYPE, SUBSCRIPTION_STORE_SCHEMA_VERSION, validateSubscriptionAuditEvent, validateSubscriptionAuditPending, writeSubscriptionAuditPending } from "./subscription-store.mjs";
 import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
@@ -20421,7 +20421,7 @@ test("FR-2.6 单 4：审计目录/占用不阻断变更（成功但要人知道�
   const bad = loadSubscriptionAudit({ file: storeFile });
   assert.equal(bad.ok, false, "有坏行 ok:false，不吞");
   assert.deepEqual(bad.events.length, 1, "好行照常返回");
-  assert.deepEqual(bad.problems, ["line:2:json_invalid", "line:3:shape_invalid"], JSON.stringify(bad.problems));
+  assert.deepEqual(bad.problems, ["line:2:json_invalid", "line:3:missing:schema_version,missing:at,missing:subscription_id,missing:version_after,missing:store_bytes_sha256,action:1"], JSON.stringify(bad.problems));
   fs.rmSync(auditFile);
   fs.symlinkSync(templateFile, auditFile);
   assert.equal(loadSubscriptionAudit({ file: storeFile }).reason, "audit_not_regular_file", "审计读不认符号链接（与 store 同款纪律）");
@@ -20433,6 +20433,146 @@ test("FR-2.6 单 4：审计目录/占用不阻断变更（成功但要人知道�
   assert.equal(ghost.status, 1, ghost.stdout + ghost.stderr);
   assert.ok(!fs.existsSync(fresh) && !fs.existsSync(fresh + ".audit.jsonl"), "拒绝路径零落盘：store 与审计都不出现");
 });
+
+test("评审 #115 P1-1：审计追加受验 —— 符号链接 / FIFO / 硬链接别名各拒；短写循环补满不无限；恢复正常一次一行", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-p11-"));
+  const storeFile = path.join(local, "subs.json");
+  const auditFile = storeFile + ".audit.jsonl";
+  const at = "2026-09-02T00:00:00.000Z";
+  const ev = () => ({ schema_version: "1.0", at, action: "add", subscription_id: "s1", version_after: 1, store_bytes_sha256: "0123456789abcdef" });
+
+  // 恢复正常：一次追加一行（写方与读方同构）
+  appendSubscriptionAuditLine({ file: storeFile, event: ev() });
+  assert.equal(fs.readFileSync(auditFile, "utf-8").trim(), JSON.stringify(ev()));
+
+  // 符号链接 → ELOOP（O_NOFOLLOW 拒，不跟随）；读方同样拒
+  fs.rmSync(auditFile); fs.writeFileSync(path.join(local, "tgt"), "x"); fs.symlinkSync(path.join(local, "tgt"), auditFile);
+  assert.throws(() => appendSubscriptionAuditLine({ file: storeFile, event: ev() }), (e) => e.code === "ELOOP", "写不跟随符号链接");
+  assert.equal(loadSubscriptionAudit({ file: storeFile }).reason, "audit_not_regular_file", "读也不认符号链接");
+  fs.rmSync(auditFile);
+
+  // FIFO → 非普通文件拒（O_NONBLOCK 打开、fstat.isFile() 为假，不挂死）；读方同样拒
+  execFileSync("mkfifo", [auditFile]);
+  assert.throws(() => appendSubscriptionAuditLine({ file: storeFile, event: ev() }), (e) => e.code === "ENXIO" || /not_a_regular_file/u.test(String(e.message)), "写不认 FIFO、不挂死");
+  assert.equal(loadSubscriptionAudit({ file: storeFile }).reason, "audit_not_regular_file", "读不认 FIFO、不挂死");
+  fs.rmSync(auditFile);
+
+  // 硬链接别名（nlink === 2）→ multiple_links 拒
+  fs.writeFileSync(auditFile, ""); fs.linkSync(auditFile, auditFile + ".hard");
+  assert.throws(() => appendSubscriptionAuditLine({ file: storeFile, event: ev() }), (e) => /multiple_links/u.test(String(e.message)), "硬链接别名拒");
+  fs.rmSync(auditFile); fs.rmSync(auditFile + ".hard");
+
+  // 短写（writeSync 首次返回 0 → 非进展）→ ESHORTWRITE，不无限循环
+  const originalWriteSync = fs.writeSync; fs.writeSync = () => 0;
+  try { assert.throws(() => appendSubscriptionAuditLine({ file: storeFile, event: ev() }), (e) => /ESHORTWRITE/u.test(String(e.message)), "短写受控失败"); }
+  finally { fs.writeSync = originalWriteSync; }
+});
+
+test("评审 #115 P1-2：唯一封闭校验 —— 伪事件矩阵逐项拒（多余键/空 id/坏时间/非枚举 action/坏摘要/version_after 违联合约束）；写方与读方同一把判据", () => {
+  const base = { schema_version: "1.0", at: "2026-09-02T00:00:00.000Z", action: "add", subscription_id: "s1", version_after: 1, store_bytes_sha256: "0123456789abcdef" };
+  const cases = [
+    ["多余键", { ...base, extra: "leak" }, ["extra:extra"]],
+    ["空 id", { ...base, subscription_id: "" }, ["subscription_id_empty"]],
+    ["坏时间", { ...base, at: "not-time" }, ["at_not_canonical"]],
+    ["非枚举 action", { ...base, action: "evil" }, ["action:evil"]],
+    ["坏摘要", { ...base, store_bytes_sha256: "xyz" }, ["store_bytes_sha256"]],
+    ["remove 带 version_after", { ...base, action: "remove", version_after: 1 }, ["version_after_not_null"]],
+    ["version_after 非正整数", { ...base, action: "pause", version_after: 0 }, ["version_after_not_positive"]],
+    ["评审伪事件（完整键 + 多坏值 + 多余键）", { ...base, action: "evil", subscription_id: "", at: "not-time", extra: "leak", store_bytes_sha256: "bad" }, ["extra:extra", "at_not_canonical", "action:evil", "subscription_id_empty", "store_bytes_sha256"]],
+  ];
+  for (const [label, ev, want] of cases) {
+    const v = validateSubscriptionAuditEvent(ev);
+    assert.equal(v.ok, false, label + " 应拒绝");
+    assert.deepEqual(v.problems, want, label + " problems");
+  }
+  assert.deepEqual(validateSubscriptionAuditEvent(base), { ok: true, problems: [] }, "健康事件通过");
+  assert.deepEqual(validateSubscriptionAuditEvent({ ...base, action: "remove", version_after: null }), { ok: true, problems: [] }, "remove version_after=null 通过");
+  // 待补记也封闭：健康通过、多余键拒
+  const pend = (o = {}) => ({ schema_version: "1.0", operation_id: "op-1", before_sha256: null, after_sha256: "0123456789abcdef", event: base, ...o });
+  assert.deepEqual(validateSubscriptionAuditPending(pend()), { ok: true, problems: [] }, "健康 pending 通过");
+  assert.equal(validateSubscriptionAuditPending(pend({ extra: "x" })).problems[0], "extra:extra", "pending 多余键拒");
+
+  // 读方同一把：坏行带行号 + 精确 problems，好行照常返回
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-p12-"));
+  const storeFile = path.join(local, "subs.json");
+  const auditFile = storeFile + ".audit.jsonl";
+  fs.writeFileSync(auditFile, [JSON.stringify(base), "{not json", JSON.stringify({ ...base, action: "evil", subscription_id: "", at: "not-time", extra: "leak", store_bytes_sha256: "bad" }), ""].join("\n") + "\n");
+  const loaded = loadSubscriptionAudit({ file: storeFile });
+  assert.equal(loaded.ok, false, "坏行 ok:false");
+  assert.deepEqual(loaded.events.length, 1, "好行照常返回");
+  assert.deepEqual(loaded.problems, ["line:2:json_invalid", "line:3:extra:extra,at_not_canonical,action:evil,subscription_id_empty,store_bytes_sha256"], JSON.stringify(loaded.problems));
+});
+
+test("评审 #115 P1-3 窗口①：rename→审计之间崩溃（store 已提交、审计未写）→ 下次 apply 幂等 no-op 也先补记并清 pending，不重复", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-p13a-"));
+  const templateFile = path.join(local, "chain-config.json");
+  const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  const storeFile = path.join(local, "subs", "subscriptions.json");
+  const auditFile = storeFile + ".audit.jsonl";
+  const pause = { action: "pause", runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" };
+
+  const first = applySubscriptionChange({ file: storeFile, change: { action: "add", runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" }, now: new Date("2026-09-02T00:00:00.000Z") });
+  assert.deepEqual([first.ok, first.changed, first.auditUnwritten], [true, true, undefined], "基线 add 成功");
+  assert.equal(loadSubscriptionAudit({ file: storeFile }).events.length, 1);
+  assert.equal(fs.existsSync(subscriptionAuditPendingPath(storeFile)), false, "基线无 pending");
+
+  // 注入：审计文件只读 → append 失败（历史不被抹掉）；store 提交成立，pending 留存
+  fs.chmodSync(auditFile, 0o444);
+  const crash = applySubscriptionChange({ file: storeFile, change: pause, now: new Date("2026-09-02T00:00:01.000Z") });
+  assert.deepEqual([crash.ok, crash.changed, crash.auditUnwritten], [true, true, "audit_append_failed:EACCES"], "store 提交成立但审计没写");
+  assert.ok(fs.existsSync(subscriptionAuditPendingPath(storeFile)), "pending 留存（模拟 rename→审计崩溃的中间态）");
+
+  fs.chmodSync(auditFile, 0o644);
+  const replay = applySubscriptionChange({ file: storeFile, change: pause, now: new Date("2026-09-02T00:00:02.000Z") });
+  assert.deepEqual([replay.ok, replay.changed, replay.auditUnwritten, replay.auditPendingStale, replay.auditPendingReplay], [true, false, undefined, undefined, undefined], "no-op 路径也先补记（早退漏洞已堵）");
+  const audit = loadSubscriptionAudit({ file: storeFile });
+  assert.deepEqual(audit.events.map((e) => e.action), ["add", "pause"], "缺的 pause 审计被补上");
+  assert.equal(audit.ok, true);
+  assert.equal(fs.existsSync(subscriptionAuditPendingPath(storeFile)), false, "pending 已清");
+});
+
+test("评审 #115 P1-3 窗口②：审计已写但 pending 没删（审计→回执之间崩溃）→ 补记去重：不重复、只清 pending", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-p13b-"));
+  const templateFile = path.join(local, "chain-config.json");
+  const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  const storeFile = path.join(local, "subs", "subscriptions.json");
+
+  applySubscriptionChange({ file: storeFile, change: { action: "add", runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" }, now: new Date("2026-09-02T00:00:00.000Z") });
+  const addEvent = loadSubscriptionAudit({ file: storeFile }).events[0];
+  const curHash = createHash("sha256").update(fs.readFileSync(storeFile)).digest("hex").slice(0, 16);
+  // 人为制造「审计已写、pending 没删」：after 哈希对得上、事件已在审计里
+  writeSubscriptionAuditPending({ file: storeFile, pending: { schema_version: "1.0", operation_id: "op-manual", before_sha256: null, after_sha256: curHash, event: addEvent } });
+
+  const replay = applySubscriptionChange({ file: storeFile, change: { action: "pause", runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" }, now: new Date("2026-09-02T00:00:01.000Z") });
+  assert.deepEqual([replay.ok, replay.changed], [true, true], "本次变更正常处理");
+  const audit = loadSubscriptionAudit({ file: storeFile });
+  assert.deepEqual(audit.events.map((e) => e.action), ["add", "pause"], "补记去重：add 只有原本那条，不重复");
+  assert.equal(fs.existsSync(subscriptionAuditPendingPath(storeFile)), false, "pending 已清");
+});
+
+test("评审 #115 P1-3 窗口③：首次写即审计失败（EISDIR 注入）→ 恢复后下次 apply 补记首次事件（before_sha256=null 的首次写也够得着）", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-p13c-"));
+  const templateFile = path.join(local, "chain-config.json");
+  const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "123456", chat_name: "模板群", chat_id: "oc_template", default_freshness_ms: 600000, agent_uid: "agent_m5claude" };
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  const storeFile = path.join(local, "subs", "subscriptions.json");
+  const auditFile = storeFile + ".audit.jsonl";
+  fs.mkdirSync(path.dirname(auditFile), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(auditFile);
+
+  const first = applySubscriptionChange({ file: storeFile, change: { action: "add", runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" }, now: new Date("2026-09-02T00:00:00.000Z") });
+  assert.deepEqual([first.ok, first.changed, first.auditUnwritten], [true, true, "audit_append_failed:EISDIR"], "首次写 store 提交成立 + 审计失败");
+  assert.ok(fs.existsSync(subscriptionAuditPendingPath(storeFile)), "首次写也落 pending");
+
+  fs.rmdirSync(auditFile);
+  const replay = applySubscriptionChange({ file: storeFile, change: { action: "pause", runtime: "claude", template: TPL, domainKey: "/p", chatId: "oc_b" }, now: new Date("2026-09-02T00:00:01.000Z") });
+  assert.deepEqual([replay.ok, replay.changed], [true, true], "恢复后本次变更正常处理");
+  assert.deepEqual(loadSubscriptionAudit({ file: storeFile }).events.map((e) => e.action), ["add", "pause"], "首次 add 审计被补上");
+  assert.equal(fs.existsSync(subscriptionAuditPendingPath(storeFile)), false, "pending 已清");
+});
+
 test("控制事务的换绑窗口（评审 #97）：事务锁内核验通过之后、策略写锁取得之前登记表换了绑定 → 写锁内前置条件拒写、模式不变、不落 consumed、入口非零", () => {
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-drift-"));
   const root = path.join(local, "project"); const bin = path.join(local, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);

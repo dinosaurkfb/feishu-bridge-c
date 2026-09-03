@@ -5,8 +5,9 @@
 > 评审返修。适用范围限定**群话题**；私聊不进此模型。现状记录仍在
 > `layers-modes-permissions.md`（不动，全部步骤定稿后一次性订正）。维护约定：
 > 本文件是权威源（git 管理、agent 读），飞书版是发布视图，定稿后逐次授权同步。
-> **状态：第一步定稿（Codex 五轮评审放行，2026-09-04，无 P1/P2）；「历史代际能力」
-> 待 Frank 拍板（§8-1）；M1 账本实现（文件结构、锁、CAS、tombstone、事务）另行送审。**
+> **状态：第一步定稿（Codex 五轮评审放行，无 P1/P2）；§8 全部拍板项 Frank 已定
+> （历史代际=a 保留能力、#123=关、F4=user 身份，2026-09-04）；M1 账本实现（文件
+> 结构、锁、CAS、tombstone、事务）另行送审。**
 
 ## 0. 一句话
 
@@ -103,7 +104,7 @@
 | B1 | pending | absent | present | absent | pending | 等配对@ |
 | B3 | active | present | present | present | current | 已绑定·全通 |
 | B3′ | dormant | present | present | present | current | chat（暂停的当前代际，恢复回 B3） |
-| B4 | active | present | present | present | historical | 已绑定（历史；按 §8-1 a 默认，拍 b 则此行改 dormant） |
+| B4 | active | present | present | present | historical | 已绑定（历史，Frank 拍板 a：保留现行能力，能下指令回原话题，不承接常规出站/不计数/不轮转） |
 
 要点（评审 R4-P1-2 定案）：
 
@@ -136,8 +137,8 @@
 - **恢复事务**（评审 R5-P1）：B3′ → B3，binding dormant→active，核 current
   唯一性（谱系无其他 current），保留原有双 proof 不重签；A4 的恢复由 attach
   事务覆盖，不另立。
-- **unbind 事务**：A2/A3 → A4；B3 → B3′；**B4 的 unbind/暂停迁移随 §8-1 一并
-  确定**（评审 R4-P2，避免与"只有这几笔"冲突）。
+- **unbind 事务**：A2/A3 → A4；B3 → B3′；B4 → A4（Frank 拍板 a 后 B4=active，
+  与 A2/A3 同笔覆盖，退回 chat/dormant）。
 
 active 且 anchor=present 且 link_proof=absent 不在任何族里，合法事务也产不出它
 （F4 对账与锚定同笔产出 anchor+link）；损坏时的处置顺序见 §3.4。
@@ -301,15 +302,17 @@ M0 关 #123 → M1 建权威账本 + attach + deliver 回报（运行态=已绑�
 机制全程在线）→ M2 F4 历史读就绪：封闭配对协议 + 锚定上线 → M3 按 §4 顺序退役
 （负 diff）→ M4 文档收口。步步可逆。
 
-## 8. 拍板项（Frank）
+## 8. 拍板项
 
-1. **历史代际能力（评审 R1-P1-5，必须单独裁决）**：现行实现里旧代际（read-only
-   历史话题）仍能下指令、回复冻结回来源话题。
-   **a. 保留现行能力（评审与我都倾向）**：historical 实体仍 binding=active
-   （能下指令、回原话题），只是不承接常规出站、不计数、不轮转；
-   **b. 明确降级**：旧代际退成 chat，需一并定存量话题、冻结来源的 outbox/run、
-   用户文案与迁移方案。
-2. 同项目多话题 attach 冲突语义（推荐先拒绝）。
-3. deliver 三类用途先授权哪几类（M1 只需要①）。
-4. #123 关闭不合（评审已同意，等你点头执行）。
-5. F4 历史读权限补齐（开放平台「获取群组中所有消息」档 + 版本发布）。
+1. **历史代际能力 —— 已拍板 a（Frank 2026-09-04）**：historical 实体保留现行能力，
+   即 B4 = binding=active（能下指令、回复冻结回来源话题），只是不承接常规出站、
+   不计数、不参与轮转。§3.3 族表 B4 行按此定稿（active，不改 dormant）；B4 的
+   unbind 与其余已绑定态一致（A2/A3/B3 那笔 unbind 事务覆盖 B4，退回 chat/dormant）。
+2. **#123 关闭 —— 已拍板关（Frank 2026-09-04）**：目标架构即将退役 bearer 捷径，
+   评审同意无必要合入；关闭 ≠ 删除线上既有码路径（线上按 §4 顺序退役）。
+3. 同项目多话题 attach 冲突语义（推荐先拒绝）—— M1 开工前定。
+4. deliver 三类用途先授权哪几类（M1 只需要①）—— M1 开工前定。
+5. F4 读权限：**已定走 user 身份**（Frank 2026-09-04），user token 权限已齐
+   （`im:message.group_msg:get_as_user`，实测通）；bot 变体读群历史 230027 待查
+   数据范围，非阻塞，M2 前可选补齐。**运维约束**：user token 定期过期
+   （refresh 约 7 天到期需重新授权），M2 加到期提醒。

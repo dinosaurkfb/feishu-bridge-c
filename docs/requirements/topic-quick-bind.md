@@ -72,3 +72,25 @@
 | B1 回复即认领 | S | @ 闸对绑定码命中场景豁免 + 回归测试（群无码无 @ 照旧拒） |
 | A1 引用式绑定 | M | CLI 参数 + binding 级群参数 + pending-inbound 复用 + 跨链 registry 只读 |
 | A2 技能层定位 | S | 两条链 feishu-bind 技能文档更新（自然语言→预览→确认的流程与红线） |
+
+## 6. 2026-09-03 转折：Aily 主动投递通道实测成立（回信地址问题换解法）
+
+背景：§2 的复杂度大半来自「任意话题的回信地址」——出站 reply-in-thread 需要 om_ 根消息，
+而入站的 msg_ 形态 ID 是 Aily 命名空间、反查不出 om_（mget 实测拒：must start with om_）。
+Frank 转发与「项目推进官Codex云」的对话后循线核查，发现并实测了第三条出站通道：
+
+- `aily-cli deliver --session-id <id> --content <text>`（surface 门控 `agent-lite`；
+  agent 身份从 `AILY_CLI_CALLER_AGENT_UID` 读）——走 Gateway delivery.CreateAndNotify，
+  **任意时刻**向指定 session 投递 assistant 消息，不依赖活跃 Run。
+- 实测（Frank 终端授权执行，2026-09-03 10:35）：向当前话题 session 投递
+  → gateway `accepted` → 消息以 post 形态落进话题，发送身份与话题既有头像一致
+  （单头像方案不破）。
+- **回信地址 = session_id**：恰是入站每轮都拿得到的现行话题主键（话题=session），
+  任意话题第一次 @ 就有。不需要 om_、不需要飞书消息读权限、绑定码不再承担寻址
+  （只剩「关联到哪个本地项目」的判别职责）。
+- 已知限制：a) markdown 不渲染（`**` 原样落地，纯文本；弱于现有出站卡片）；
+  b) 云端智能体提示部分运行上下文会被 `Agent delivery blocked`（本机未复现，待边界测试）；
+  c) 仅实测了同 agent 名下活跃 session，旧代际/其他话题 session 未测。
+
+影响面（待 Frank 定向后重估）：P1-2 bearer a/b/c 裁决、A1 引用式绑定的 om_ 互引设计、
+以及出站发布器是否新增 deliver 通道（锁/幂等/回执体系如何对接）。

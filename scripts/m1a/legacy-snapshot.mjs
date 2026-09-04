@@ -1,18 +1,22 @@
 /**
- * M1a 只读对账 · legacy 快照适配器（规格 docs/architecture/m1a-reconciliation.md v6 §1）。
+ * M1a 只读对账 · legacy 快照适配器（规格 docs/architecture/m1a-reconciliation.md §1）。
  *
  * 对账 legacy 侧**只能**经这两个封闭适配器产生：
  *   · collectClaudeLegacySnapshot({ registryFile, templateFile, now })
  *   · collectCodexLegacySnapshot({ home, now })
  *
  * 铁律（本模块全部导出的共同前提）：
- *   · **严格只读**——只经 readRegularFile（fd 受验）读文件，不写任何路径；
+ *   · **严格只读**——不写任何路径；
+ *   · **一次受验读绑定**——每个来源文件在整个采集过程中恰好读一次（fetch 缓存），
+ *     业务解析、snapshot_identity、digest 都从同一次读入的 buffer 派生；评审 P1-1：
+ *     "旧业务投影 + 新身份"的假一致在结构上不可能发生；
  *   · **严格读取**——任一在场文件读不出 / JSON 坏 / 代际状态校验不过 → legacy_unreadable，
- *     绝不把读不出当成"没有"；
+ *     绝不把读不出当成"没有"；realpath 说不清也是 unreadable（不折 path.resolve）；
  *   · **严格 target 采集**——binding_target 全字段受验，缺任一只标记 complete:false
  *     （判别层落 target_incomplete 待修），**绝不临时选值或填默认**；
  *   · enabled:false 的项目**仍进快照**（§4 enabled 行）；项目文件（active-mapping.json）
- *     在场即优先，registry 内联字段只在项目文件缺席时生效，registry 不产第二份投影。
+ *     在场即优先，registry 内联字段只在项目文件缺席时生效，registry 不产第二份投影；
+ *     项目文件在场时 enabled 按其 binding_id 回指的唯一 registry 条目带入（评审 P1-2）。
  */
 
 import fs from "node:fs";
@@ -21,14 +25,14 @@ import path from "node:path";
 import { readRegularFile } from "../installed-surface.mjs";
 import { sha256, canonKey } from "../topic-agent-ledger.mjs";
 import { normalizeRoot } from "../registry.mjs";
-import { loadChainTemplate } from "../chain-template.mjs";
+import { parseChainTemplateRaw } from "../chain-template.mjs";
 import {
   applyTopicGenerationToMapping, effectiveBindingId, validateTopicGenerationState,
 } from "../topic-generation.mjs";
 import { mappingFromRegistryEntry, projectMappingPath } from "../project-resolve.mjs";
 import {
-  loadCodexTemplate, mappingForTask, registryFile as codexRegistryFile,
-  templateFile as codexTemplateFile, validateRegistryDocument,
+  validateCodexTemplate, validateRegistryDocument, DEFAULT_INBOUND_PREFIX,
+  registryFile as codexRegistryFile, templateFile as codexTemplateFile,
 } from "../codex/state.mjs";
 
 /* 与账本侧同源的受验形状（topic-agent-ledger.mjs 内部常量，这里按规格 §3 复述——
@@ -41,49 +45,73 @@ const CODEX_ID_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u;
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
-/** 快照身份条目的实际形状（§1 封闭格式）。 */
-const identityOf = (files) => {
-  const seen = new Map();
-  for (const file of files) {
-    const r = readRegularFile(file);
-    let entry;
-    if (r.status === "read") {
-      // 在场：身份对文件本身 realpath（symlink 解掉，身份跟内容走）+ 内容 SHA。
-      let real = null;
-      try { real = fs.realpathSync(file); } catch { real = path.resolve(file); }
-      entry = { path: real, sha256: sha256(r.buf) };
-    } else if (r.status === "absent") {
-      // 缺席：显式 null；身份 = 受验真实父目录（realpath）+ basename —— 父目录被换则身份变。
-      let parent = null;
-      try { parent = fs.realpathSync(path.dirname(file)); } catch { parent = path.resolve(path.dirname(file)); }
-      entry = { path: path.join(parent, path.basename(file)), sha256: null };
-    } else {
-      return { ok: false, path: file, why: r.why };
-    }
-    // 同一文件可能被多个来源引用（同 root 多条登记）——按路径去重，路径唯一。
-    const prev = seen.get(entry.path);
-    if (prev === undefined) seen.set(entry.path, entry);
-    else if (prev.sha256 !== entry.sha256) return { ok: false, path: entry.path, why: "同一路径两次读出不同内容" };
-  }
-  return { ok: true, identity: [...seen.values()].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)) };
-};
-
-/** 逐条受验读一个 JSON 文件；absent → null，坏 → { error }。绝不把"读不出"当"没有"。 */
-const readJsonStrict = (file) => {
-  const r = readRegularFile(file);
-  if (r.status === "absent") return { absent: true };
-  if (r.status !== "read") return { error: r.why };
-  try { return { value: JSON.parse(r.buf.toString("utf-8")) }; }
-  catch (err) { return { error: "JSON 坏：" + String(err.message).slice(0, 120) }; }
-};
-
 const unreadable = (source, why) => ({ ok: false, reason: "legacy_unreadable", source, why });
 const conflict = (why) => ({ ok: false, reason: "legacy_conflict", why });
+
+/**
+ * 一次受验读绑定（评审 P1-1）：同一路径在整个采集过程只真正读一次盘，
+ * 之后解析 / 身份 / digest 全部消费缓存。read 状态缓存 {real, sha256, buf}；
+ * absent 缓存受验父目录 realpath + basename；realpath 说不清 → error（fail-closed）。
+ */
+const makeFetcher = () => {
+  const cache = new Map();
+  const fetch = (file) => {
+    let e = cache.get(file);
+    if (e !== undefined) return e;
+    const r = readRegularFile(file);
+    if (r.status === "read") {
+      let real = null;
+      try { real = fs.realpathSync(file); } catch (err) {
+        e = { status: "error", why: "路径身份说不清（realpath 失败：" + String(err?.message ?? err).slice(0, 60) + "）" };
+        cache.set(file, e); return e;
+      }
+      e = { status: "read", real, sha256: sha256(r.buf), buf: r.buf };
+    } else if (r.status === "absent") {
+      let parent = null;
+      try { parent = fs.realpathSync(path.dirname(file)); } catch (err) {
+        // 父目录缺席（ENOENT）是确定的缺席证据，身份取词法路径即可（文件真出现时身份会带真实
+        // realpath，第二轮 snapshot_identity 变化会以 snapshot_moved 暴露）；其他错误 fail-closed。
+        if (err?.code === "ENOENT") parent = path.resolve(path.dirname(file));
+        else {
+          e = { status: "error", why: "父目录身份说不清（realpath 失败：" + String(err?.message ?? err).slice(0, 60) + "）" };
+          cache.set(file, e); return e;
+        }
+      }
+      e = { status: "absent", real: path.join(parent, path.basename(file)) };
+    } else {
+      e = { status: "error", why: r.why };
+    }
+    cache.set(file, e);
+    return e;
+  };
+  /** 逐条受验读一个 JSON 文件；absent → null，坏 → { error }。绝不把"读不出"当"没有"。 */
+  const readJsonStrict = (file) => {
+    const e = fetch(file);
+    if (e.status === "absent") return { absent: true };
+    if (e.status === "error") return { error: e.why };
+    try { return { value: JSON.parse(e.buf.toString("utf-8")) }; }
+    catch (err) { return { error: "JSON 坏：" + String(err.message).slice(0, 120) }; }
+  };
+  /** §1 封闭身份清单：从缓存派生（不再读盘）。同一路径可能被多个来源引用——按真实路径去重。 */
+  const identityOf = (files) => {
+    const seen = new Map();
+    for (const file of files) {
+      const e = fetch(file);
+      if (e.status === "error") return { ok: false, path: file, why: e.why };
+      const entry = { path: e.real, sha256: e.status === "read" ? e.sha256 : null };
+      const prev = seen.get(entry.path);
+      if (prev === undefined) seen.set(entry.path, entry);
+      else if (prev.sha256 !== entry.sha256) return { ok: false, path: entry.path, why: "同一路径身份冲突" };
+    }
+    return { ok: true, identity: [...seen.values()].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)) };
+  };
+  return { fetch, readJsonStrict, identityOf };
+};
 
 /** 由已物化的 mapping 组装一条 binding 证据（§1 产出；投影 C 的全部输入都在这里）。 */
 const bindingEvidence = ({ bindingId, enabled, root, sessionId, chatId, target, state, generationSource, sourceFiles }) => ({
   binding_id: bindingId,
-  enabled: enabled === false ? false : undefined, // 只在 registry 条目真给 false 时带（文件优先分支 runtime 不读 enabled）
+  enabled: enabled === false ? false : undefined, // 只在来源真给 false 时带（undefined = 未声明）
   root,
   chat_id: chatId,
   state,
@@ -103,18 +131,23 @@ export function collectClaudeLegacySnapshot({ registryFile, templateFile, now = 
   if (typeof registryFile !== "string" || typeof templateFile !== "string") {
     return unreadable("args", "registryFile/templateFile 必须是路径串");
   }
+  const io = makeFetcher();
   // 模板是 chat_id 唯一权威；读不出 = 整份快照没有任何合法 chat_id 可言 → fail-closed。
-  const tpl = loadChainTemplate(templateFile);
+  const tplE = io.fetch(templateFile);
+  if (tplE.status !== "read") {
+    return unreadable("chain-template", tplE.status === "absent" ? "链模板缺席" : "链模板读不出（" + tplE.why + "）");
+  }
+  const tpl = parseChainTemplateRaw(tplE.buf.toString("utf-8"), templateFile);
   if (!tpl.ok) return unreadable("chain-template", "链模板读不出/不完整（" + tpl.reason + "）");
   const chatId = tpl.template.chat_id;
   if (typeof chatId !== "string" || !CHAT_SHAPE.test(chatId)) {
     return unreadable("chain-template", "模板 chat_id 形状不对（账本受验形状 oc_[A-Za-z0-9]{1,120}）");
   }
 
-  const reg = readJsonStrict(registryFile);
+  const reg = io.readJsonStrict(registryFile);
   if (reg.absent) {
     // registry 缺席 = 空表（loadRegistryStrict 同语义：只有"文件不存在"算空）。
-    const id = identityOf([registryFile, templateFile]);
+    const id = io.identityOf([registryFile, templateFile]);
     if (!id.ok) return unreadable("snapshot-identity", id.why);
     return { ok: true, chain: "claude", snapshot_identity: id.identity, chat_id: chatId, bindings: [] };
   }
@@ -143,7 +176,7 @@ export function collectClaudeLegacySnapshot({ registryFile, templateFile, now = 
   for (const [root, group] of byRoot) {
     const mapPath = projectMappingPath(root);
     mappingFiles.push(mapPath);
-    const file = readJsonStrict(mapPath);
+    const file = io.readJsonStrict(mapPath);
     if (file.error) return unreadable("project-mapping", "项目 mapping 文件读不出：" + file.error);
     if (!file.absent) {
       // 项目文件在场 → 本组**一份**投影（registry 不产第二份）；binding_id 取 effectiveBindingId
@@ -151,11 +184,25 @@ export function collectClaudeLegacySnapshot({ registryFile, templateFile, now = 
       if (!isObj(file.value)) return unreadable("project-mapping", "项目 mapping 根节点不是对象");
       const mapping = file.value;
       const bindingId = effectiveBindingId(mapping, { root });
+      // enabled 回指（评审 P1-2）：项目文件不记 enabled，registry 才记；按 binding_id 回指唯一条目。
+      const rid = typeof bindingId === "string" && bindingId.endsWith("@registry")
+        ? bindingId.slice(0, bindingId.length - "@registry".length) : null;
+      let owner = null;
+      if (rid !== null) {
+        const hits = group.filter((g) => g.entryId === rid);
+        if (hits.length !== 1) return conflict("项目文件的 registry 回指不唯一（命中 " + hits.length + " 条同 id 登记）");
+        owner = hits[0].entry;
+      } else if (group.length > 1) {
+        return conflict("同 root 多条 registry 登记且项目文件未回指，enabled 无法唯一判定");
+      } else {
+        owner = group[0].entry;
+      }
       const evolved = applyTopicGenerationToMapping(mapping, { runtime: "claude", bindingId, now });
       if (!evolved.ok) return unreadable("topic-generation-state", "项目 mapping 的代际状态校验不过（" + evolved.reason + "）");
       const sid = evolved.mapping.claude_session_id;
       bindings.push(bindingEvidence({
         bindingId,
+        enabled: owner?.enabled,
         root,
         chatId,
         state: evolved.state,
@@ -196,10 +243,10 @@ export function collectClaudeLegacySnapshot({ registryFile, templateFile, now = 
   // 双投影（同一 binding_id 两次）→ legacy_conflict。
   const seen = new Set();
   for (const b of bindings) {
-    if (seen.has(b.binding_id)) return conflict("binding_id 双投影：" + b.binding_id);
+    if (seen.has(b.binding_id)) return conflict("binding_id 双投影（同 id 两条投影，无法定谁作数）");
     seen.add(b.binding_id);
   }
-  const id = identityOf([registryFile, templateFile, ...mappingFiles]);
+  const id = io.identityOf([registryFile, templateFile, ...mappingFiles]);
   if (!id.ok) return unreadable("snapshot-identity", id.why);
   return { ok: true, chain: "claude", snapshot_identity: id.identity, chat_id: chatId, bindings };
 }
@@ -207,21 +254,70 @@ export function collectClaudeLegacySnapshot({ registryFile, templateFile, now = 
 /* ─────────────────────────── Codex 侧 ─────────────────────────── */
 
 /**
- * Codex legacy 快照：只读 task registry（mappingForTask 物化语义）；binding_id = <taskId>@codex-registry；
+ * Codex task → mapping 物化，**不读盘**（与 codex/state.mjs mappingForTask 同构，评审 P1-1：
+ * mappingForTask 内部 loadConsumed 会裸读 consumed 文件，而 consumed_message_ids 不进投影 C）。
+ * 同构性由行为测试守住：同一 task 两侧产出的 topic_generation_state 必须一致。
+ */
+const codexMappingFromTask = (task) => {
+  const mapping = {
+    schema_version: "1.0",
+    binding_id: task.id + "@codex-registry",
+    binding_mode: "codex_thread_binding",
+    status: task.status ?? "active",
+    session_id: task.session_id ?? null,
+    inbound_state: task.inbound_state ?? "pending",
+    pending_token: task.pending_token ?? null,
+    pending_expires_at: task.pending_expires_at ?? null,
+    channel_generation_id: task.channel_generation_id ?? null,
+    topic_generation_state: task.topic_generation_state ?? null,
+    interaction_policy_state: task.interaction_policy_state ?? null,
+    inbound_prefix: Object.hasOwn(task, "inbound_prefix") ? task.inbound_prefix : DEFAULT_INBOUND_PREFIX,
+    logical_task_key: task.logical_task_key,
+    codex_thread_id: task.codex_thread_id,
+    codex_workdir: task.root,
+    feishu_root_message_id_reference: task.root_message_id,
+    expires_at: task.expires_at,
+    max_inbound_messages: "unlimited",
+    freshness_ms: task.freshness_ms ?? null,
+    consumed_message_ids: [],
+    created_at: task.bound_at ?? null,
+    _source: "codex-registry",
+  };
+  const evolved = applyTopicGenerationToMapping(mapping, {
+    runtime: "codex",
+    bindingId: mapping.binding_id,
+  });
+  // 持久化的新状态一旦损坏必须 fail-closed，不能悄悄回落到旧字段继续收消息。
+  return evolved.ok ? evolved.mapping : {
+    ...mapping,
+    status: "invalid",
+    topic_generation_error: evolved.reason,
+  };
+};
+
+/**
+ * Codex legacy 快照：只读 task registry；binding_id = <taskId>@codex-registry；
  * chat_id 按 task 覆盖优先、模板群兜底；disabled（enabled:false）任务**仍进快照**（§4 enabled 行）。
  */
 export function collectCodexLegacySnapshot({ home, now = Date.now() } = {}) {
   if (typeof home !== "string") return unreadable("args", "home 必须是路径串");
   const regFile = codexRegistryFile(home);
   const tplFile = codexTemplateFile(home);
-  const tpl = loadCodexTemplate(tplFile);
-  if (!tpl.ok) return unreadable("chain-template", "Codex 链模板读不出/不完整（" + tpl.reason + "）");
-  const templateChatId = tpl.template.chat_id;
+  const io = makeFetcher();
+  const tplE = io.fetch(tplFile);
+  if (tplE.status !== "read") {
+    return unreadable("chain-template", tplE.status === "absent" ? "Codex 链模板缺席" : "Codex 链模板读不出（" + tplE.why + "）");
+  }
+  const parsed = parseChainTemplateRaw(tplE.buf.toString("utf-8"), tplFile);
+  if (!parsed.ok) return unreadable("chain-template", "Codex 链模板读不出/不完整（" + parsed.reason + "）");
+  const cv = validateCodexTemplate(parsed.template);
+  if (!cv.ok) return unreadable("chain-template", "Codex 链模板不是单 m5codex 形状（" + cv.reason + "）");
+  const templateChatId = parsed.template.chat_id;
   if (typeof templateChatId !== "string" || !CHAT_SHAPE.test(templateChatId)) {
     return unreadable("chain-template", "模板 chat_id 形状不对");
   }
 
-  const raw = readJsonStrict(regFile);
+  const raw = io.readJsonStrict(regFile);
   let tasks = [];
   if (!raw.absent) {
     if (raw.error) return unreadable("codex-registry", raw.error);
@@ -237,10 +333,8 @@ export function collectCodexLegacySnapshot({ home, now = Date.now() } = {}) {
     const disabled = task.enabled === false;
     const hasKey = typeof task.logical_task_key === "string" && task.logical_task_key !== "";
     if (disabled && !hasKey) continue; // validateRegistryDocument 同语义：无身份的停用条目跟谁都撞不上
-    // mappingForTask 物化（binding_id = id@codex-registry；内部 applyTopicGenerationToMapping，
-    // 状态损坏时给 status:"invalid" + topic_generation_error —— 这里一律 fail-closed）。
     // registry JSON 里的 task 可能无 id（validateRegistryDocument 同语义：缺失时以 logical_task_key 为准）。
-    const mapping = mappingForTask({ ...task, id: task.id ?? task.logical_task_key }, { home });
+    const mapping = codexMappingFromTask({ ...task, id: task.id ?? task.logical_task_key });
     if (mapping.status === "invalid") {
       return unreadable("codex-task-state", "task 代际状态校验不过（" + mapping.topic_generation_error + "）");
     }
@@ -272,10 +366,10 @@ export function collectCodexLegacySnapshot({ home, now = Date.now() } = {}) {
 
   const seen = new Set();
   for (const b of bindings) {
-    if (seen.has(b.binding_id)) return conflict("binding_id 双投影：" + b.binding_id);
+    if (seen.has(b.binding_id)) return conflict("binding_id 双投影（同 id 两条投影，无法定谁作数）");
     seen.add(b.binding_id);
   }
-  const id = identityOf([regFile, tplFile]);
+  const id = io.identityOf([regFile, tplFile]);
   if (!id.ok) return unreadable("snapshot-identity", id.why);
   return { ok: true, chain: "codex", snapshot_identity: id.identity, chat_id: templateChatId, bindings };
 }
@@ -283,12 +377,27 @@ export function collectCodexLegacySnapshot({ home, now = Date.now() } = {}) {
 /* ─────────────────────────── 逐记录来源摘要（§3 legacy_source_digest，供 T3b 用） ─────────────────────────── */
 
 /**
- * legacy_source_digest（v6 §3 封闭公式）：对账/迁移的逐记录来源证明。
- * 本单（T3a）只产出不消费；快照子集取该 binding 的相关源文件 {path,sha256}。
+ * 从 snapshot_identity 里选出与 source_files 对应的子集。按真实路径匹配；
+ * realpath 说不清 → fail-closed（评审 P1-1）。不读文件内容。
  */
-export function legacySourceDigest({ binding, generation }) {
-  const sub = identityOf(binding.source_files ?? []);
-  if (!sub.ok) return { ok: false, why: sub.why };
+export function identitySubset(snapshotIdentity, files) {
+  if (!Array.isArray(snapshotIdentity)) return { ok: false, why: "snapshot_identity 形状不对" };
+  const want = new Set();
+  for (const f of files ?? []) {
+    let r = null;
+    try { r = fs.realpathSync(f); } catch (err) { return { ok: false, why: "来源路径身份说不清（realpath 失败）" }; }
+    want.add(r);
+  }
+  return { ok: true, subset: snapshotIdentity.filter((e) => e !== null && typeof e.path === "string" && want.has(e.path)) };
+}
+
+/**
+ * legacy_source_digest（§3 封闭公式）：对账/迁移的逐记录来源证明。
+ * 本单（T3a）只产出不消费；digest 输入里的 snapshot 是调用方传入的**冻结身份子集**
+ * （identitySubset 的产出）——本函数不读盘（评审 P1-1），来源变化由外层 snapshot_moved 兜住。
+ */
+export function legacySourceDigest({ binding, generation, identity }) {
+  if (!Array.isArray(identity)) return { ok: false, why: "identity 必须是冻结身份子集数组" };
   return { ok: true, digest: sha256(canonKey({
     digest_version: "lsd-1",
     binding_id: binding.binding_id,
@@ -300,7 +409,7 @@ export function legacySourceDigest({ binding, generation }) {
     binding_target: binding.binding_target.complete
       ? Object.fromEntries(Object.entries(binding.binding_target).filter(([k]) => k !== "complete"))
       : null,
-    snapshot: sub.identity,
+    snapshot: identity,
   })) };
 }
 

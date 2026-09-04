@@ -89,6 +89,22 @@ shadow 账本跑 G1–G15，再仅对 **live B 族子集**双射；M1a 期间入
 channel_generation_id, generation_status, binding_status, enabled,
 effective_binding_status, root_om, aily_session, binding_target,
 snapshot: 相关源文件 {path,sha256} 子集 }))`（七轮 P2-1：enabled 与有效状态显式入摘要）。
+digest 不读盘：输入里的 `snapshot` 是调用方从已冻结的 snapshot_identity 里按
+binding.source_files 的真实路径选出的子集（`identitySubset`），来源变化由外层
+snapshot_moved 兑底。
+
+**family → facts 全表（封闭，六轮 P2-2）**：`facts` 五元组只取以下四组值之一，
+无第五组；组内字段集固定 `{binding, session, anchor, locator_link_proof, generation}`：
+
+| family | binding | session | anchor | locator_link_proof | generation |
+| --- | --- | --- | --- | --- | --- |
+| B1（初次绑定 / 轮转待认领，b1 与 b2 同表）| pending | absent | present | absent | pending |
+| B3（c2）| active | present | present | present | current |
+| B3′（c3，paused+active 代）| dormant | present | present | present | current |
+| B4（d2）| active | present | present | present | historical |
+
+§2 其余待修分支（b3/c1/c4/d1/d3/d4/0b）不产出记录、只产出 cutover_blockers。
+>>>>>>> c046abe (R19 评审修复：受验读一次绑定 + enabled 回指 + doctor ⑭ 红路收紧（6 P1 + 4 P2）)
 
 ### 3.1 迁移证明：独立不可变来源证明 + 生命周期组合表
 
@@ -320,10 +336,7 @@ digestE = sha256(canonKey(C_from_legacy));  digestS = sha256(canonKey(C_from_sha
 ok ⇔ digestE === digestS ∧ 逐项双射成立（配对键 = topic_agent_id）
 ```
 
-proof 不进 C（引用完整性 = G13-mig/G13-repair 独立判据）。mismatch 全清单
-（E 多 / S 多 / 逐字段不等）。**快照一致性**：投影前后各取一次 §1 snapshot_identity + 账本
-revision，不一致 → `{ ok:null, reason:"snapshot_moved" }`（inconclusive；cutover 视同不通过
-重试；doctor 整体 incomplete、**不得生成或复用 readiness/cutover 凭据**）。
+**结果联合（封闭，逐支字段固定，八轮 P2-1）**：
 
 **结果联合（封闭；此为 T3a/doctor 的对账安全接口，成功支携带 §4.1-4e 的安全字段集，
 不含字节明文）**：`{ ok:true, digest, snapshot_identity, ledger:{revision,sha256},
@@ -331,6 +344,17 @@ sidecars:{expiry:{sha256},pending_claims:{sha256},policy:{sha256}} }` |
 `{ ok:null, reason:"snapshot_moved", why }` |
 `{ ok:false, reason, why, mismatches:[{ code, topic_agent_id|null, field|null, detail }] }`；
 **T4 只认 §4.1-4e 的 cutover plan 判别联合**（本联合的窄成功支不足以 cutover）。
+
+reconciler 逐支细化（六轮 P2-1，与安全接口叠加）：`ok:false` 的 `reason` 封闭集：
+`bijection_mismatch`（mismatches 全清单，元素 `{code, topic_agent_id|null, field|null,
+detail}`；code ∈ extra_in_legacy | extra_in_shadow | field_mismatch）、`not_shadow`
+（账本非 shadow；M1a 双射只适用影子期）、`chain_mismatch`、`ledger_<载入失败码>`、
+`legacy_unreadable`（附 `source`：适配器来源域）、`legacy_unreconcilable`（附
+`global:"rotation_preparing"`）。`why` 仅供日志，不进 doctor 正文（输出纪律 §7）。
+cutover_blockers = §2 待修项完整输出（任一存在 → cutover 拒；doctor 只报不拒；
+cutover_blockers 可非空如 0b binding_retired，此时 doctor 报确定性红 cutover_blocked）；
+`{ ok:null }` 为 inconclusive，cutover 视同不通过重试，doctor 整体 incomplete、
+**不得生成或复用 readiness/cutover 凭据**。
 
 ## 7. doctor 输出纪律
 

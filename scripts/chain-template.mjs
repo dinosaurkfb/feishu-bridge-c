@@ -160,13 +160,8 @@ export function validateChainTemplate(tpl) {
   };
 }
 
-export function loadChainTemplate(file = templatePath()) {
-  let raw;
-  try {
-    raw = fs.readFileSync(file, "utf-8");
-  } catch {
-    return { ok: false, reason: "no_template", file };
-  }
+/** 纯解析（不读盘）：M1a 适配器等受验读场景用它从同一次读入的 buffer 派生模板。 */
+export function parseChainTemplateRaw(raw, file = "(buffer)") {
   let tpl;
   try {
     tpl = JSON.parse(raw);
@@ -176,6 +171,16 @@ export function loadChainTemplate(file = templatePath()) {
   const v = validateChainTemplate(tpl);
   if (!v.ok) return { ok: false, reason: "incomplete", file, ...v };
   return { ok: true, file, template: tpl };
+}
+
+export function loadChainTemplate(file = templatePath()) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf-8");
+  } catch {
+    return { ok: false, reason: "no_template", file };
+  }
+  return parseChainTemplateRaw(raw, file);
 }
 
 /**

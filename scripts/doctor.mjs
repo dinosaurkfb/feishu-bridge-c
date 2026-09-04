@@ -517,12 +517,20 @@ export function runDoctor({
           // endpoint 全集 = 有收据 ∪ 有 prepared WAL ∪ 账本目录（账本在场无收据也是矛盾态）。
           const ledgerDirs = [];
           const root = ledgerRootFor();
+          let rootUnreadable = null;
           if (root !== null) {
             try {
               for (const de of fs.readdirSync(root, { withFileTypes: true })) {
                 if (de.isDirectory() && ENDPOINT_SHAPE.test(de.name)) ledgerDirs.push(de.name);
               }
-            } catch { /* root 不存在 = 无任何账本，照常处理 */ }
+            } catch (err) {
+              // 只有 ENOENT 折空（= 无任何账本）；I/O / 权限 / 形状错不能假装"未接入"（评审 P1-3）。
+              if (err?.code !== "ENOENT") rootUnreadable = err?.code ?? String(err?.message ?? err).slice(0, 40);
+            }
+          }
+          if (rootUnreadable !== null) {
+            findings.push({ endpoint: null, ok: false, code: "ledger_inventory_unreadable",
+              detail: "ledger_inventory_unreadable：账本根盘点读不出（code " + rootUnreadable + "）—— 无法盘点 shadow 账本，禁止当成未接入" });
           }
           const endpoints = [...new Set([...receiptBy.keys(), ...preparedBy.keys(), ...ledgerDirs])].sort();
           for (const ep of endpoints) {
@@ -555,6 +563,12 @@ export function runDoctor({
                 detail: "账本在场但无完成初始化收据 —— 无法证明来历" });
               continue;
             }
+            // 收据 ok ∧ 账本可读 ∧ 已切权威 → M1a 影子对账不适用（评审 P1-5）：切权威后账本合法
+            // 演进、legacy 冻结，双射只会永久误红；只确认权威态，不跑对账。
+            if (receipt.cutoverDone) {
+              parts.push(ep + "=cutover 已收口（M1a 影子对账不适用）");
+              continue;
+            }
             // 收据 ok ∧ 账本可读 → 旁路对账（严格只读）。
             const chain = L.doc.chain;
             const collectLegacy = chain === "claude"
@@ -565,10 +579,17 @@ export function runDoctor({
               : () => collectCodexLegacySnapshot({ home: ctx.codexEnv.FEISHU_CODEX_BRIDGE_HOME });
             const r = reconcileLegacyEndpoint({ endpointId: ep, chain, collectLegacy, loadLedgerFn: () => loadByEndpoint(ep) });
             if (r.ok === true) {
-              parts.push(ep + "=" + (r.cutover_blockers.length > 0 ? "一致（待修 " + r.cutover_blockers.length + "）" : "一致"));
-            } else if (r.ok === null || r.global === "rotation_preparing") {
+              // 对账一致但 cutover 受阻是**确定的红**，不是"一致（待修）"（评审 P1-4）。
+              if (r.cutover_blockers.length > 0) {
+                findings.push({ endpoint: ep, ok: false, code: "cutover_blocked",
+                  detail: "cutover_blocked：对账一致但 cutover_blockers=" + r.cutover_blockers.length
+                    + "（" + r.cutover_blockers.slice(0, 3).map((b) => b.code).join("、") + "）—— 任一 blocker 则 cutover 拒" });
+              } else {
+                parts.push(ep + "=一致");
+              }
+            } else if (r.ok === null) {
               findings.push({ endpoint: ep, ok: null, code: r.reason,
-                detail: "对账不可判（" + (r.why ?? r.reason) + "）—— 下轮体检再看" });
+                detail: "对账不可判（snapshot_moved）—— 下轮体检再看" });
             } else {
               const bits = [];
               if (r.reason === "bijection_mismatch") {
@@ -579,7 +600,9 @@ export function runDoctor({
                   bits.push(m.code + "（ta:" + m.topic_agent_id.slice(0, 8) + "…" + (m.field ? "，" + m.field : "") + "）");
                 }
               } else {
-                bits.push(r.reason + (r.source ? "（" + r.source + "）" : "") + (r.why ? "：" + r.why : ""));
+                // 不透适配器/reconciler 的 why 原文（评审 P1-6：legacy why 可能携带项目名/task key 等非
+                // opaque 身份）；只出问题码 + 来源域（封闭枚举）。
+                bits.push(r.reason + (r.source ? "（" + r.source + "）" : ""));
               }
               if (r.cutover_blockers.length > 0) {
                 bits.push("待修 " + r.cutover_blockers.length + "：" + r.cutover_blockers.slice(0, 3).map((b) => b.code).join("、"));

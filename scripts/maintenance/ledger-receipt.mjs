@@ -163,5 +163,11 @@ export function preparedLedgerInits({ dir } = {}) {
     const ep = endpointOf(j.doc);
     if (ep !== null) prepared.push({ endpointId: ep, token, phase: j.doc.phase });
   }
+  // 同 endpoint 多笔未收口 init WAL 本身就是矛盾态（评审 P2-4）：fail-closed，不静默取末条。
+  const counts = new Map();
+  for (const p of prepared) counts.set(p.endpointId, (counts.get(p.endpointId) ?? 0) + 1);
+  for (const [ep, n] of counts) {
+    if (n > 1) return { ok: false, why: "endpoint " + ep.slice(0, 8) + "… 有 " + n + " 笔未收口 init WAL（prepared_conflict）—— 人工按 B-2 裁决" };
+  }
   return { ok: true, prepared };
 }

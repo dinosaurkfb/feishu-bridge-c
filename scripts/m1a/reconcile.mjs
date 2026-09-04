@@ -182,7 +182,12 @@ function fieldMismatches(id, e, s) {
 export function reconcileLegacyEndpoint({ endpointId, chain, collectLegacy, loadLedgerFn }) {
   const L1 = loadLedgerFn();
   if (!L1.ok) return { ok: false, reason: "ledger_" + L1.reason, why: L1.why ?? null, mismatches: [], cutover_blockers: [] };
-  if (L1.doc.chain !== chain) return { ok: false, reason: "chain_mismatch", why: "账本 chain=" + L1.doc.chain + " 与对账链 " + chain + " 不符", mismatches: [], cutover_blockers: [] };
+  // shadow 前提（评审 P1-5）：对账只在影子期有意义；authoritative 账本合法演进、legacy 冻结，
+  // 拿 M1a 双射去套只会永久误红。后续 cutover 调用方误用也在这里 fail-closed。
+  if (L1.doc.authority_mode !== "shadow") {
+    return { ok: false, reason: "not_shadow", why: null, mismatches: [], cutover_blockers: [] };
+  }
+  if (L1.doc.chain !== chain) return { ok: false, reason: "chain_mismatch", why: "账本 chain 与对账链不符", mismatches: [], cutover_blockers: [] };
   const S1 = collectLegacy();
   if (!S1.ok) return { ok: false, reason: S1.reason, source: S1.source, why: S1.why, mismatches: [], cutover_blockers: [] };
 

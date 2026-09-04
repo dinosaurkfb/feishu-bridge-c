@@ -1,11 +1,11 @@
-# M1a 双射对账：legacy 权威 ↔ shadow 账本（v12，自包含实现合同）
+# M1a 双射对账：legacy 权威 ↔ shadow 账本（v13，自包含实现合同）
 
 > 地位：`layers-v2-ledger.md` §8『legacy 全集双射对账』的实现合同——约束 T3a（只读对账 +
 > doctor，**Codex 已放行实现**）、T3b（migrate_seed / 双写 / repair）、T4（cutover 复合事务）。
 > 字段事实来源：`project-resolve.mjs` / `interaction-policy-store.mjs` / `topic-generation.mjs`
 > / `codex/state.mjs` / `selector.mjs`。
 > **本文件自包含**（五轮 P1-1）：不引用任何已被覆盖的历史版本；全部定稿正文在此。
-> 演进：v0→v12 经 Codex 十二轮评审逐轮收闭；上游合同（layers-v2-ledger.md / maintenance-gate.md）随轮真实回带。
+> 演进：v0→v13 经 Codex 十三轮评审逐轮收闭；上游合同（layers-v2-ledger.md / maintenance-gate.md）随轮真实回带。
 
 ## 1. legacy 快照：两个封闭适配器
 
@@ -183,6 +183,12 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
      **updated_at = 固定哨兵 "1970-01-01T00:00:00.000Z"**（不得取执行时钟）；
      **同 lineage 多条 B 记录投同一 subject：条目逐字相等则去重，否则
      policy_subject_conflict 拒**（不依赖覆盖顺序）。
+     **条目校验唯一权威 = 新落的封闭校验器 `interactionPolicyStateProblem`（版本 ipsp-1，
+     十三轮 P1-2 取 b）**：六根键精确、`updated_at` 必规范 ISO、`dialogue` 为 null 或**递归
+     封闭键集**（实现时从现行 validDialogueContract/store 写路径冻结全键集枚举，超/缺键拒）；
+     本规格引用该函数名+版本，T3b/T4 实现与三个新权威文件的读取端共用这一个校验器，不养第二份。
+     **交叉不变量**：迁移产出的条目 kind 必为 lineage 且 `条目.binding_id === subject 派生
+     输入的 lineage id`（= legacy binding_id 受验原值）；默认 Mapping 条目的 binding_id 同上。
    **两个接口分离（十二轮 P1-2）**：
    - **对账安全结果（T3a/doctor 用，§6 的联合）**：`{ ok:true, digest, snapshot_identity,
      ledger:{revision,sha256}, sidecars:{expiry:{sha256}, pending_claims:{sha256},
@@ -195,6 +201,20 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
      journal/日志）；恢复只读 staged blob（十二轮 P1-1：不得重渲染、不得凭 SHA 还原）；
      blob 写不下或读回核不过 → **不得进入 forward-only**；B-4 3b 负责删除。
      plan 任一字段缺失 → 不得 cutover。
+   **plan 锚与崩溃恢复（十三轮 P1-1）**：plan.json（安全元数据，无明文）与三 blob 同批
+   O_EXCL+fsync 写入 `<token>.staged/intended/`；其 SHA 锚进 cutover ledger step 的
+   `plan_sha256` 字段——重启后一切引用凭 journal 锚复核，进程内状态不作数。
+   **崩在 blob 写后、阶段提交前（journal 仍 drained）**：同 operation 重试先验 manifest+四文件
+   （逐一受验 SHA），全符 → **复用**（不重 O_EXCL、不生成第二份 plan）；部分在场/不符 → 拒并
+   要求安全退出；**安全退出（回退路径）必须删除 staged/intended 目录**；非 active operation
+   的该目录 = 敏感残骸，doctor 点名（不自动清）。
+   **门内第二次 reconciler 调用 = 按已锚 plan 验证**（同快照同 revision 重验四件相等），
+   **不得重新 staging、不得产出另一份 plan**。
+4e-2. **三份 sidecar 权威文件的读取端 validator 合同（十三轮 P2）**：根键集精确 =
+   `{schema_version, endpoint_id, entries}` 三键（各自 schema_version 串如上）；entries 数量
+   上限 512、单文件字节上限 1 MiB（超限 → 对应 sidecar_unreadable fail-closed）；读取端一律
+   fd 绑定读（O_NOFOLLOW、普通文件、单硬链接、0600；目录 0700），任一不符 fail-closed；
+   条目值域如 4e 各 schema 所列。
 4f. **endpoint 交叉绑定不变量（十一轮 P1-2 取 b：只用可复核事实，不引用 result/瞬时
    intent）**：账本顶层 `endpoint_id`、cutover **fingerprint 输入的 endpoint_id**、ledger
    step 的 endpoint（id/target）、三条 sidecar 的 id `<ep>` 与重算 target ——**五源必全部
@@ -314,4 +334,4 @@ sidecars:{expiry:{sha256},pending_claims:{sha256},policy:{sha256}} }` |
 
 - **新前置块 = v2 policy store 抽取**（§4；T3 之后、M1b 之前；含读写方迁移与 cutover step 接线）；
 - cutover 复合事务（§4.1）扩展 R16 编排——归 T4/M1b；
-- T3a（§1/§2/§3 投影/§6/§7）已开 #R19 实现；T3b（§3.1/§5）与 T4（§4.1）以本 v12 为合同。
+- T3a（§1/§2/§3 投影/§6/§7）已开 #R19 实现；T3b（§3.1/§5）与 T4（§4.1）以本 v13 为合同。

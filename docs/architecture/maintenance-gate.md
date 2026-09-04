@@ -200,15 +200,23 @@ rollback 记 `rolled_back`）。
 `maintenance_gate`/`maintenance_install` kind **禁 `ledger` step**。
 
 **sidecar step（M1a v8 回带，`m1a-reconciliation.md` §4.1；八轮 P1-3 封闭联合）**：
-新 step kind `sidecar`，仅 `ledger_cutover` 允许（**`ledger_init` 禁 sidecar**）：
+新 step kind `sidecar`，仅 `ledger_cutover` 允许（**`ledger_init` 禁 sidecar**）。
+**plan 锚（十三轮 P1-1）**：cutover 的 **ledger step** 键集扩一字段 `plan_sha256`
+（before 为 null、intended_after/after 为 `<token>.staged/intended/plan.json` 的 SHA）——
+plan.json = 对账安全元数据（digest、snapshot_identity、ledger{revision,sha256}、三 sidecar
+sha256；**无字节明文**），与三个 intended blob 同批 O_EXCL 写入并 fsync；重启后凭 journal
+锚验证同一份原始 plan，进程内引用不作数：
 - id = `sidecar:<name>:<ep>`（name ∈ {expiry, pending-claims, policy}）；**按 phase 计数
   （九轮 P1-4）**：`drained → ledger_cutting_over` 的阶段推进与三条 prepared sidecar step
   **同一次 journal 提交**写入；此前任何阶段 **禁 sidecar step**；进入 ledger_cutting_over 起
   **恰三条**（各自 prepared 或 done）；`ledger_reopening` 起三条**全部 done**；
-- **prepared/done 两个精确键集（九轮 P1-3）**：prepared =
-  {at, backup, backup_bytes, backup_sha256, before, id, intended_after, kind, state, target}
-  且 **after 键缺席**；done = 前者 ∪ {after} 且 after === intended_after（逐字段）且
-  **after 必来自写后受验读回**；
+- **prepared/done 两个精确键集（九轮 P1-3 / 十三轮 P1-1 扩）**：prepared =
+  {at, backup, backup_bytes, backup_sha256, before, id, **intended_blob**, intended_after,
+  kind, state, target} 且 **after 键缺席**；done = 前者 ∪ {after} 且 after === intended_after
+  （逐字段）且 **after 必来自写后受验读回**；`intended_blob` =
+  `{ path, bytes, sha256 }`——path **必等于重算的** `<token>.staged/intended/<name>` 规范路径、
+  校验时受验为**普通单硬链接 0600 文件**、`sha256 === intended_after.sha256` 且长度等于
+  bytes；恢复只从该 blob 读 intended 字节；
 - `target` 由 endpoint+name 内部派生（`ledger/<ep>/<name>.json` 规范路径，校验器重算比对，
   不信任 journal 中任意路径）；before/intended_after/after = `{ exists, sha256 }` 联合
   （absent 显式 `{exists:false, sha256:null}`）；**cutover 三个 intended_after.exists 必为

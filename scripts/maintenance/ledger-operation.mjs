@@ -30,56 +30,54 @@ import { switchCurrentTarget } from "../runtime-install.mjs";
 import { chainFacts } from "./precheck.mjs";
 import { removeStubVersion } from "./stub.mjs";
 import { bootstrapTimer, timerPhase } from "./timers.mjs";
-import { TERMINAL_PHASES, acquireOperationLease, addNote, addStepPrepared, clearActive, markStepDone, readActive, readJournal, releaseOperationLease, setPhase, verifyBackup } from "./journal.mjs";
+import { TERMINAL_PHASES, acquireOperationLease, addNote, clearActive, enterLedgerForward, markStepDone, readActive, readJournal, releaseOperationLease, setPhase, verifyBackup } from "./journal.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
-import { authorityCutover, cutoverPlan, initPlan, initializeShadow, loadLedger, resolveEndpointDir } from "../topic-agent-ledger.mjs";
+import { authorityCutover, cutoverPlan, initPlan, initializeShadow, loadLedger, reconcileShadow, resolveEndpointDir } from "../topic-agent-ledger.mjs";
+import { endpointReceipt } from "./ledger-receipt.mjs";
 
 const CHAINS = ["claude", "codex"];
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
 const ENDPOINT_RE = /^ledger:(endpoint_[0-9a-f]{24}):(init|cutover)$/u;
-const NOTE_RX = /^ledger_op chain=(claude|codex)$/u;
 const LEDGER_FORWARD_PHASES = Object.freeze(["ledger_initializing", "ledger_cutting_over", "ledger_reopening", "reopening_incomplete"]);
 
-const readlinkOrNull = (p) => { try { return fs.readlinkSync(p); } catch { return null; } };
+// 评审 P1-8：readlink 三态——只有 ENOENT 算“absent”（原本就没有）；EACCES / 其他 IO 是“unclear”（持有状态说不清，不许当“没有”）。
+const readlinkOrNull = (p) => { try { return { state: "value", value: fs.readlinkSync(p) }; } catch (err) { return err?.code === "ENOENT" ? { state: "absent", value: null } : { state: "unclear", value: null, why: String(err?.code ?? err?.message) }; } };
 const errText = (err) => String(err?.code ?? err?.message ?? err);
 const factsOf = (ctx, chain) => chainFacts({ chain, home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, node: ctx.node });
 // capability 只携带身份（token/kind/endpointId）；维护目录 / 门位置由 verifier 从 env 派生（评审 F1），不写自述路径
 const capabilityOf = (ctx, token, kind, endpointId) => ({ token, kind, endpointId });
-const releaseSurface = (surface) => { try { if (typeof surface?.release === "function") return surface.release(); } catch { /* 忽略 */ } return { ok: true }; };
+// 评审 P1-8：释放失败不许静默吞（release() 自身已包 try/catch，这里只兜“非函数 / 意外抛错”，失败如实报出）。
+const releaseSurface = (surface) => {
+  if (typeof surface?.release !== "function") return { ok: true };
+  try { return surface.release(); } catch (err) { return { ok: false, why: "release_threw：" + String(err?.message ?? err), path: surface.path ?? null }; }
+};
 const afterStep = (ctx, id) => { if (typeof ctx.afterStep === "function") ctx.afterStep(id); };
 const resolveDir = (ctx, endpointId, env) => resolveEndpointDir(endpointId, { env });
 
-/** 门内双射对账（§8/§5 cutover 前置）：M1a 未接真对账，fail-closed 恒拒 reconciler_absent。 */
-function reconcileShadowFn(reconciler, endpointId, shadowDoc) {
-  if (typeof reconciler === "function") {
-    const r = reconciler({ endpointId, shadowDoc });
-    if (r?.ok && typeof r.digest === "string" && r.digest.length > 0) return { ok: true, digest: r.digest };
-    return { ok: false, reason: "reconciler_rejected", why: r?.why ?? "对账器未给合法 digest" };
-  }
-  return { ok: false, reason: "reconciler_absent", why: "双射对账器未接入，cutover fail-closed" };
-}
-
-/** 蓝图（幂等）：init 直接构造 revision=1；cutover 从现场 shadow 构造。request_key = operation token（设计）。 */
-function planOf({ kind, endpointId, chain, token, ledgerDir, reconciler }) {
+/** 蓝图（幂等）：init 直接构造 revision=1；cutover 从现场 shadow 构造。request_key = operation token（设计）。
+ *  评审 P1-4：cutover 不接调用方注入 reconciler——`reconcileShadow` 本身 fail-closed 恒拒 reconciler_absent，
+ *  真对账接入时在 topic-agent-ledger 的 reconcileShadow 接，且必须经 capability 门。
+ */
+function planOf({ kind, endpointId, chain, token, ledgerDir }) {
   const requestKey = token;
   if (kind === "init") return initPlan({ endpointId, chain, requestKey, operationId: token });
   const L = loadLedger(ledgerDir, { endpointId });
   if (!L.ok) return { ok: false, reason: L.reason, why: L.why ?? null };
   if (L.doc.authority_mode !== "shadow") return { ok: false, reason: "not_shadow", why: "切权威前置要求 shadow（实际 " + L.doc.authority_mode + "）" };
-  const rec = reconcileShadowFn(reconciler, endpointId, L.doc);
+  const rec = reconcileShadow({ endpointId, shadowDoc: L.doc });
   if (!rec.ok) return rec;
   return cutoverPlan({ endpointId, chain, requestKey, operationId: token, shadowDoc: L.doc, shadowSha: L.sha256, digest: rec.digest });
 }
 
-/** 写入：走受验窄事务（capability 门 + 蓝图）。返回 {ok} 或结构化拒。 */
-function doWrite(ctx, { token, kind, endpointId, chain, ledgerDir, reconciler, env }) {
+/** 写入：走受验窄事务（capability 门 + 蓝图；plan 由 verifier 从 journal ledger step 重建，不接受调用方 plan）。 */
+function doWrite(ctx, { token, kind, endpointId, chain, ledgerDir, env, _inject = null }) {
   const requestKey = token;
-  const plan = planOf({ kind, endpointId, chain, token, ledgerDir, reconciler });
+  const plan = planOf({ kind, endpointId, chain, token, ledgerDir });
   if (!plan.ok) return plan;
   const cap = capabilityOf(ctx, token, kind === "init" ? "initialize_shadow" : "authority_cutover", endpointId);
   return kind === "init"
-    ? initializeShadow({ endpointId, capability: cap, requestKey, chain, plan, env })
-    : authorityCutover({ endpointId, capability: cap, requestKey, chain, plan, reconciler, env });
+    ? initializeShadow({ endpointId, capability: cap, requestKey, chain, env, _inject })
+    : authorityCutover({ endpointId, capability: cap, requestKey, chain, env, _inject });
 }
 
 const ledgerStep = (plan, sub, endpointId) => ({ id: "ledger:" + endpointId + ":" + sub, kind: "ledger", target: endpointId, before: plan.before, backup: null, intended_after: plan.intendedAfter });
@@ -100,37 +98,40 @@ function compareScene(dir, endpointId, step) {
   return { scene: "corrupt", why: "现场既非 before 也非 intended_after" };
 }
 
-/** 从 journal notes 恢复 ledger operation 的 chain（request_key = operation token，字段集封闭只能靠 note）。 */
-function ledgerChain(doc) {
-  for (const n of doc.notes) { const m = NOTE_RX.exec(n); if (m) return m[1]; }
-  return null;
-}
-
 /**
  * 向前引擎（幂等、只向前）。从当前阶段出发，把 ledger operation 推进到 done + 清 active（B-2 收敛 + B-4 重开）。
- * `intent`（{kind, endpointId, chain}）只在"drained 进 forward-only 边界"那一刻需要；崩溃重跑自 journal 重建。
+ * `intent`（{kind, endpointId, chain}）只在"drained 进 forward-only 边界"那一刻需要；崩溃重跑自 journal ledger step 重建（P1-1）。
  */
-export function ledgerForward(ctx, { token, lease, intent = null, reconciler = null, env = process.env } = {}) {
+export function ledgerForward(ctx, { token, lease, intent = null, env = process.env, _inject = null } = {}) {
   const j = readJournal({ dir: ctx.dir, token });
   if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token };
-  const doc = j.doc;
+  let doc = j.doc;
   let phase = doc.phase;
   const sub = doc.operation_kind === "ledger_init" ? "init" : doc.operation_kind === "ledger_cutover" ? "cutover" : null;
   if (!sub) return { ok: false, reason: "bad_operation_kind", phase };
 
-  // 1. drained → 落 forward-only 边界（只有首次 ledgerEnter 会到；崩溃重跑在 drained 由 ledgerExit 转回退）
+  // 1. drained → 落不可逆前向边界（只有首次 ledgerEnter 会到；崩溃重跑在 drained 由 ledgerExit 转回退）
   let planPre = null;
   if (phase === "drained") {
     if (!intent || intent.kind !== sub) return { ok: false, reason: "intent_required", phase, why: "drained 进 forward-only 需要 init/cutover 意图" };
     const dPre = resolveDir(ctx, intent.endpointId, env);
     if (!dPre.ok) return { ok: false, reason: dPre.reason, phase, why: dPre.why };
-    // 前置条件在 drained 就验（如 cutover 的 reconciler_absent），避免把失败留成 forward-only 维护态
-    planPre = planOf({ kind: sub, endpointId: intent.endpointId, chain: intent.chain, token, ledgerDir: dPre.dir, reconciler });
+    // 评审 P1-2：只读前置（收据 / 已初始化 / 已切权威）在 drained 就验，失败留在 drained（rollbackSafe），
+    // 不把判定失败留成 forward-only 维护态。cutover 的 reconciler_absent 也在此 fail-closed（P1-4）。
+    const receipt = endpointReceipt(ctx.dir, intent.endpointId, { token });
+    if (!receipt.ok) return { ok: false, reason: receipt.state, why: receipt.why ?? null, phase, rollbackSafe: true };
+    if (sub === "init" && (receipt.initDone || receipt.cutoverDone)) return { ok: false, reason: "already_initialized", why: "该 endpoint 已被初始化或已切权威", phase, rollbackSafe: true };
+    if (sub === "cutover" && receipt.cutoverDone) return { ok: false, reason: "already_cutover", why: "该 endpoint 已切权威", phase, rollbackSafe: true };
+    planPre = planOf({ kind: sub, endpointId: intent.endpointId, chain: intent.chain, token, ledgerDir: dPre.dir });
     if (!planPre.ok) return { ok: false, reason: planPre.reason, why: planPre.why ?? null, phase, rollbackSafe: true };
     const fwd = sub === "init" ? "ledger_initializing" : "ledger_cutting_over";
-    const pw = setPhase({ dir: ctx.dir, token, lease, phase: fwd, expectPhase: "drained", now: ctx.now() });
+    // 评审 P1-1：phase 推进 + ledger step（含 chain）合并成一次原子写，杜绝"phase=fwd 但无 step/无 chain"的恢复死窗。
+    const pw = enterLedgerForward({ dir: ctx.dir, token, lease, phase: fwd, step: ledgerStep(planPre, sub, intent.endpointId), chain: intent.chain, expectPhase: "drained", now: ctx.now() });
     if (!pw.ok) return { ok: false, reason: pw.reason, why: pw.why ?? null, phase };
     phase = fwd;
+    const j2 = readJournal({ dir: ctx.dir, token });
+    if (j2.state !== "valid") return { ok: false, reason: "journal_" + j2.state, why: j2.why ?? null, phase };
+    doc = j2.doc;
   }
 
   // 2. 收敛 ledger step（B-2 恢复矩阵：intended_after → 补 markStepDone；before → 重试写）
@@ -138,8 +139,8 @@ export function ledgerForward(ctx, { token, lease, intent = null, reconciler = n
     const ls = doc.steps.find((s) => s.kind === "ledger");
     const endpointId = ls ? (ENDPOINT_RE.exec(ls.id)?.[1] ?? null) : (intent?.endpointId ?? null);
     if (!endpointId) return { ok: false, reason: "endpoint_unknown", phase };
-    const chain = (ls ? ledgerChain(doc) : null) ?? intent?.chain ?? null;
-    if (!chain) return { ok: false, reason: "chain_unknown", phase };
+    const chain = ls ? ls.chain : (intent?.chain ?? null); // P1-1：链从 ledger step 读（不赖 note）
+    if (!chain) return { ok: false, reason: "chain_unknown", phase, why: "ledger step 无 chain 且无 intent" };
     const d = resolveDir(ctx, endpointId, env);
     if (!d.ok) return { ok: false, reason: d.reason, phase, why: d.why };
 
@@ -151,29 +152,18 @@ export function ledgerForward(ctx, { token, lease, intent = null, reconciler = n
         return { ok: false, reason: "ledger_corrupt", phase, why: scene.why };
       }
       if (scene.scene === "before") {
-        const wr = doWrite(ctx, { token, kind: sub, endpointId, chain, ledgerDir: d.dir, reconciler, env });
-        if (!wr.ok) return { ok: false, reason: wr.reason, why: wr.why ?? null, phase };
+        const wr = doWrite(ctx, { token, kind: sub, endpointId, chain, ledgerDir: d.dir, env, _inject });
+        if (!wr.ok) return { ok: false, reason: wr.reason, why: wr.why ?? null, phase, commit: wr.commit ?? "not_committed", residue: wr.residue ?? null, lockUncleared: wr.lockUncleared ?? null };
+        // 评审 P1-5：只有 committed_clean 才视为可推进；committed_with_residue / committed_durability_uncertain 保留门+active，退出码 3。
+        if (wr.commit !== "committed_clean") return { ok: false, reason: "commit_residue", phase, commit: wr.commit, residue: wr.residue ?? null, lockUncleared: wr.lockUncleared ?? null, why: wr.why ?? null };
         afterStep(ctx, "written:" + ls.id);
       }
       const m = markStepDone({ dir: ctx.dir, token, lease, id: ls.id, after: ls.intended_after, now: ctx.now() });
       if (!m.ok) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
       afterStep(ctx, ls.id);
     } else {
-      // 无 ledger step（窄窗口：setPhase(fwd) 刚落、addStepPrepared 未落）→ 补记计划并写
-      const plan = planPre ?? planOf({ kind: sub, endpointId, chain, token, ledgerDir: d.dir, reconciler });
-      if (!plan.ok) return { ok: false, reason: plan.reason, why: plan.why ?? null, phase, rollbackSafe: true };
-      // 链先记账再记步：崩溃在 step 之后时，ledgerChain 能从 note 重建链
-      const n = addNote({ dir: ctx.dir, token, lease, note: "ledger_op chain=" + chain, now: ctx.now() });
-      if (!n.ok) return { ok: false, reason: n.reason, why: n.why ?? null, phase, rollbackSafe: true };
-      const a = addStepPrepared({ dir: ctx.dir, token, lease, step: ledgerStep(plan, sub, endpointId), now: ctx.now() });
-      if (!a.ok) return { ok: false, reason: a.reason, why: a.why ?? null, phase };
-      afterStep(ctx, "ledger:" + endpointId + ":" + sub);
-      const wr = doWrite(ctx, { token, kind: sub, endpointId, chain, ledgerDir: d.dir, reconciler, env });
-      if (!wr.ok) return { ok: false, reason: wr.reason, why: wr.why ?? null, phase };
-      afterStep(ctx, "written:ledger:" + endpointId + ":" + sub);
-      const m = markStepDone({ dir: ctx.dir, token, lease, id: "ledger:" + endpointId + ":" + sub, after: plan.intendedAfter, now: ctx.now() });
-      if (!m.ok) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
-      afterStep(ctx, "ledger:" + endpointId + ":" + sub);
+      // P1-1：正常前向已由 enterLedgerForward 原子写入 phase+step；forward 态无 ledger step 只可能是旧种崩溃 journal，fail-closed。
+      return { ok: false, reason: "ledger_step_absent", phase, why: "forward 态却无 ledger step（不应出现；需重建 journal）" };
     }
     const np = setPhase({ dir: ctx.dir, token, lease, phase: "ledger_reopening", expectPhase: phase, now: ctx.now() });
     if (!np.ok) return { ok: false, reason: np.reason, why: np.why ?? null, phase };
@@ -206,13 +196,20 @@ export function ledgerReopening(ctx, token, lease) {
     const p = setPhase({ dir: ctx.dir, token, lease, phase: "reopening_incomplete", expectPhase: "ledger_reopening", now: ctx.now(), note: "说不清 " + incomplete.length + " 项：" + incomplete.map((i) => i.id + "（" + i.why + "）").join("；") });
     return { ok: false, phase: "reopening_incomplete", incomplete, journalWrite: p.ok, ...(p.ok ? {} : { journalWhy: p.why ?? p.reason }), ...extra };
   };
-  // ① current：回原目标（enter 步 before；账本 operation 无 :install 步）
+  // ① current：回原目标（enter 步 before；账本 operation 无 :install 步）—— 读回三态（P1-8：EACCES 说不清不许当“没有”）
   for (const st of doc.steps.filter((s) => s.kind === "current")) {
     const chain = st.id.split(":")[1];
     const facts = factsOf(ctx, chain);
     const live = readlinkOrNull(facts.current);
-    if (live === st.before) continue;
-    if (live === st.intended_after) {
+    if (live.state === "absent") {
+      // 原来就没有 current → 回退到“没有”，对上了；原来有 current 但现场丢了 → 说不清（fail-closed，桩先留着）
+      if (st.before === null) continue;
+      incomplete.push({ id: st.id, why: "现场没有 current，但原来有（" + st.before + "），说不清" });
+      continue;
+    }
+    if (live.state === "unclear") { incomplete.push({ id: st.id, why: "current 读不出（" + live.why + "），不动" }); continue; }
+    if (live.value === st.before) continue;
+    if (live.value === st.intended_after) {
       if (st.before === null) { incomplete.push({ id: st.id, why: "原来没有 current，无法回退到「没有」之外的状态" }); continue; }
       const sw = switchCurrentTarget({ root: facts.root, target: st.before });
       if (!sw.ok) { incomplete.push({ id: st.id, why: "切回失败：" + String(sw.why ?? sw.reason) }); continue; }
@@ -220,11 +217,14 @@ export function ledgerReopening(ctx, token, lease) {
       if (f !== null) return { ok: false, reason: f.reason, why: f.why, path: f.path, phase: doc.phase };
       continue;
     }
-    incomplete.push({ id: st.id, why: "现场 current=" + String(live) + " 既不是桩也不是原目标，不动" });
+    incomplete.push({ id: st.id, why: "现场 current=" + live.value + " 既不是桩也不是原目标，不动" });
   }
+  // 评审 P1-8：同链 current 说不清的链**不得恢复该链定时器**（否则 bootstrap 可能启动指向未知 current 的定时器）。
+  const unclearChains = new Set(incomplete.filter((i) => i.id.startsWith("current:")).map((i) => i.id.split(":")[1]));
   // ② 定时器：回原始三态（只有原来 loaded 才需 bootstrap；plist 字节先按备份还原并核 sha256 / 长度）
   for (const st of doc.steps.filter((s) => s.kind === "timer")) {
     const chain = st.id.split(":")[1];
+    if (unclearChains.has(chain)) continue; // P1-8：current 说不清，不动该链定时器
     const facts = factsOf(ctx, chain);
     const wantLoaded = st.before.phase === "loaded";
     if (!wantLoaded) continue;
@@ -246,7 +246,6 @@ export function ledgerReopening(ctx, token, lease) {
     if (f !== null) return { ok: false, reason: f.reason, why: f.why, path: f.path, phase: doc.phase };
   }
   // ③ 删桩：current 已不指它才删；同链 current 说不清的，桩先留着
-  const unclearChains = new Set(incomplete.filter((i) => i.id.startsWith("current:")).map((i) => i.id.split(":")[1]));
   for (const st of doc.steps.filter((s) => s.kind === "stub")) {
     const chain = st.id.split(":")[1];
     if (unclearChains.has(chain)) { incomplete.push({ id: st.id, why: "同链 current 说不清，桩先留着" }); continue; }
@@ -270,9 +269,10 @@ export function ledgerReopening(ctx, token, lease) {
 }
 
 /** `ledger_init` / `ledger_cutover` 维护 operation 进门。apply=false 只出 dry-run 计划。 */
-export function ledgerEnter(ctx, { kind, endpointId, chain, waitMs = 60000, apply = false, reason = null, reconciler = null, env = process.env } = {}) {
+export function ledgerEnter(ctx, { kind, endpointId, chain, waitMs = 60000, apply = false, reason = null, env = process.env } = {}) {
   if (kind !== "init" && kind !== "cutover") return { ok: false, reason: "bad_kind" };
-  if (!ENDPOINT_SHAPE.test(endpointId)) return { ok: false, reason: "bad_endpoint" };
+  // 评审 P2-2：endpointId 显式类型守卫（避免 undefined/null 被 ENDPOINT_SHAPE.test 偷偷放行）
+  if (typeof endpointId !== "string" || !ENDPOINT_SHAPE.test(endpointId)) return { ok: false, reason: "bad_endpoint" };
   if (!CHAINS.includes(chain)) return { ok: false, reason: "bad_chain" };
   const operationKind = kind === "init" ? "ledger_init" : "ledger_cutover";
   const reasonText = reason ?? (kind === "init" ? "账本初始化（shadow）" : "账本切权威（cutover）");
@@ -281,7 +281,7 @@ export function ledgerEnter(ctx, { kind, endpointId, chain, waitMs = 60000, appl
   if (!surface.ok) return { ok: false, reason: surface.reason, why: surface.why, path: surface.path };
   const ent = enterMaintenance(ctx, { reason: reasonText, waitMs, apply: true, keepLease: true, operationKind });
   if (!ent.ok || !ent.lease) { releaseSurface(surface); return ent; }
-  const out = ledgerForward(ctx, { token: ent.token, lease: ent.lease, intent: { kind, endpointId, chain }, reconciler, env });
+  const out = ledgerForward(ctx, { token: ent.token, lease: ent.lease, intent: { kind, endpointId, chain }, env });
   let rollbackResult = null;
   if (out.ok === false && out.rollbackSafe === true) {
     // 前置条件失败（如 reconciler_absent：账本步未准备、未写盘）→ 回退清场（桩/current/门/active 与进入前一致），不留下维护态
@@ -295,22 +295,33 @@ export function ledgerEnter(ctx, { kind, endpointId, chain, waitMs = 60000, appl
 
 /** `ledger_init` / `ledger_cutover` 出门（含崩溃恢复；按 phase 分派：回退 / 只向前 / 只清 active）。 */
 export function ledgerExit(ctx, { apply = false, env = process.env } = {}) {
-  const active = readActive({ dir: ctx.dir });
-  if (active.state === "absent") return { ok: false, reason: "no_operation" };
-  if (active.state === "unreadable") return { ok: false, reason: "active_unreadable", why: active.why };
-  const token = active.token;
-  const j = readJournal({ dir: ctx.dir, token });
-  if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token };
-  const phase = j.doc.phase;
-  const action = TERMINAL_PHASES.includes(phase) ? "clear_active" : LEDGER_FORWARD_PHASES.includes(phase) ? "ledger_forward" : "rollback";
-  if (!apply) return { ok: true, dryRun: true, token, phase, action };
+  const readOp = (dir) => {
+    const active = readActive({ dir });
+    if (active.state === "absent") return { ok: false, reason: "no_operation" };
+    if (active.state === "unreadable") return { ok: false, reason: "active_unreadable", why: active.why };
+    const token = active.token;
+    const j = readJournal({ dir, token });
+    if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token };
+    const phase = j.doc.phase;
+    const action = TERMINAL_PHASES.includes(phase) ? "clear_active" : LEDGER_FORWARD_PHASES.includes(phase) ? "ledger_forward" : "rollback";
+    return { ok: true, token, phase, action };
+  };
+  // 干跑：只读、不带锁（只看有没有 operation / 什么动作）。
+  const dry = readOp(ctx.dir);
+  if (!dry.ok) return dry;
+  if (!apply) return { ok: true, dryRun: true, token: dry.token, phase: dry.phase, action: dry.action };
+  // 评审 P1-8：apply 必须先拿安装面锁，再锁内重读并绑定 active/journal（不许锁前读、锁后沿用；锁间隙改面也不许）。
+  const surface = acquireInstallSurfaceLock({ home: ctx.home, env });
+  if (!surface.ok) return { ok: false, reason: surface.reason, why: surface.why, path: surface.path, token: dry.token, phase: dry.phase, action: dry.action };
+  const op = readOp(ctx.dir);
+  if (!op.ok) { releaseSurface(surface); return op; }
+  const { token, phase, action } = op;
   let out;
   if (action === "clear_active") {
     const c = clearActive({ dir: ctx.dir, token });
-    out = { ok: c.ok, token, phase, action, activeCleared: c.cleared === true, why: c.ok ? null : String(c.reason) };
+    const surfaceRel = releaseSurface(surface);
+    out = { ok: c.ok, token, phase, action, activeCleared: c.cleared === true, why: c.ok ? null : String(c.reason), surfaceRelease: surfaceRel.ok ? null : { path: surfaceRel.path ?? null, why: surfaceRel.why ?? surfaceRel.reason } };
   } else if (action === "ledger_forward") {
-    const surface = acquireInstallSurfaceLock({ home: ctx.home, env });
-    if (!surface.ok) return { ok: false, reason: surface.reason, why: surface.why, path: surface.path, token, phase, action };
     const lease = acquireOperationLease({ dir: ctx.dir, token });
     if (!lease.ok) { releaseSurface(surface); return { ok: false, reason: lease.reason, why: lease.why, token, phase, action, path: lease.path }; }
     const f = ledgerForward(ctx, { token, lease, env });
@@ -318,8 +329,6 @@ export function ledgerExit(ctx, { apply = false, env = process.env } = {}) {
     const surfaceRel = releaseSurface(surface);
     out = { token, action, ...f, leaseRelease: leaseRel.ok ? null : { path: leaseRel.path ?? null, why: leaseRel.why ?? leaseRel.reason }, surfaceRelease: surfaceRel.ok ? null : { path: surfaceRel.path ?? null, why: surfaceRel.why ?? surfaceRel.reason } };
   } else {
-    const surface = acquireInstallSurfaceLock({ home: ctx.home, env });
-    if (!surface.ok) return { ok: false, reason: surface.reason, why: surface.why, path: surface.path, token, phase, action };
     const lease = acquireOperationLease({ dir: ctx.dir, token });
     if (!lease.ok) { releaseSurface(surface); return { ok: false, reason: lease.reason, why: lease.why, token, phase, action, path: lease.path }; }
     const r = rollbackOperation(ctx, token, lease);

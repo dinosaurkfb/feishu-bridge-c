@@ -19,7 +19,7 @@ import { maintenanceContext, renderStatus, maintenanceStatus } from "./maintenan
 import { readActive, readJournal } from "./maintenance/journal.mjs";
 import { aggregateEndpointReceipts, endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import * as LEDGER_OP from "./maintenance/ledger-operation.mjs";
-import { loadByEndpoint } from "./topic-agent-ledger.mjs";
+import { loadByEndpoint, reconcileShadow } from "./topic-agent-ledger.mjs";
 
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
 const LEDGER_KINDS = Object.freeze(["init", "cutover"]);
@@ -51,14 +51,15 @@ export function parseMaintenanceLedgerArgs(argv) {
 
 /**
  * 单 endpoint 的 chain（仅 --cutover 用；--init 必须在参数层显式 --chain，不经过这里）。
- * 有既有账本用它，没有则默认 claude。⚠ "证明 opaque endpoint 究竟属哪条链" 的真机制（design
- * `docs/architecture/maintenance-gate.md` B 节）归 M1b 设计 —— 这里只从既有账本读链或听操作者声明，
- * **不伪造证明**；若 endpoint 可跨链需要真实映射时由 M1b 补上。
+ *  ⚠ 评审 P2-1 fail-closed：链**必须**从既有账本读出；读不出（账本缺席/损坏/chain 非法）一律 null，**不许默认 claude**——
+ *  否则一条「收据在但账本丢了」的 endpoint，cutover 会在一条链证明不出来的情形下继续。
+ *  ⚠ "证明 opaque endpoint 究竟属哪条链" 的真机制（design `docs/architecture/maintenance-gate.md` B 节）归 M1b 设计——
+ *  这里只读既有账本的 chain 字段，**不伪造证明**；若 endpoint 可跨链需要真实映射时由 M1b 补上。
  */
 function resolveChain(endpointId, { env }) {
   const L = loadByEndpoint(endpointId, { env });
   if (L.ok && (L.doc.chain === "claude" || L.doc.chain === "codex")) return L.doc.chain;
-  return "claude";
+  return null;
 }
 
 /** 只读状态：活动账本 operation + B-3 endpoint 收据投影。 */
@@ -104,12 +105,22 @@ export function runMaintenanceLedger(argv, { ctx = null, out = (s) => process.st
   if (!receipt.ok) { out("账本 " + kind + " 拒：收据 fail-closed：" + receipt.why + "（什么都不动）"); return 1; }
   if (kind === "init" && (receipt.initDone || receipt.cutoverDone)) { out("账本 init 拒：该 endpoint 已初始化或已切权威，不能重新 init（什么都不动）"); return 1; }
   if (kind === "cutover" && receipt.cutoverDone) { out("账本 cutover 拒：该 endpoint 已切权威，不能重复切（什么都不动）"); return 1; }
-  // init 的 chain 由操作者显式声明（参数层已校验成封闭枚举）；cutover 不收 --chain，链从既有账本读。
+  if (kind === "cutover" && !receipt.initDone) { out("账本 cutover 拒：该 endpoint 未初始化，没有 shadow 账本可切（什么都不动）"); return 1; }
+  // init 的 chain 由操作者显式声明（参数层已校验成封闭枚举）；cutover 不收 --chain，链**必须**从既有账本读（P2-1 fail-closed）。
   const chain = parsed.mode === "init" ? parsed.chain : resolveChain(parsed.endpoint, { env });
+  if (parsed.mode === "cutover" && chain === null) { out("账本 cutover 拒：读不出该 endpoint 的链（账本缺席/损坏/chain 非法），fail-closed（什么都不动）"); return 1; }
   const r = LEDGER_OP.ledgerEnter(c, { kind, endpointId: parsed.endpoint, chain, waitMs: parsed.waitMs, apply: parsed.apply, env });
   if (r.dryRun) {
     const verb = kind === "init" ? "init→shadow revision1" : "cutover→authoritative";
-    out("[预览] 预检通过，账本 " + verb + "（" + parsed.endpoint + "）：停两链定时器 → 两链 current 切维护桩 → 建门 → 等既有进程退出最多 " + (r.plan?.waitMs ?? parsed.waitMs) + " ms → 门内写账本。加 --apply 执行。");
+    // P2-2：干跑必须复用只读计划器如实反映对账状态，不许只报"预检通过"。init 的 virgin/收据检查已由上方 receipt 预检覆盖；
+    // cutover 的 shadow/chain 已由 resolveChain 覆盖，这里补对账器实况——M1a 未接 → reconciler_absent 如实说出（免得干跑通过、--apply 却拒）。
+    let reconNote = "";
+    if (kind === "cutover") {
+      const L = loadByEndpoint(parsed.endpoint, { env });
+      const rec = L.ok ? reconcileShadow({ endpointId: parsed.endpoint, shadowDoc: L.doc }) : { ok: false, why: "账本读不出" };
+      if (!rec.ok) reconNote = "；但" + (rec.why ?? rec.reason ?? "对账未接") + " —— 加了 --apply 也会被拒（M1a 未落地），当前只能 --init";
+    }
+    out("[预览] 预检通过，账本 " + verb + "（" + parsed.endpoint + "）：停两链定时器 → 两链 current 切维护桩 → 建门 → 等既有进程退出最多 " + (r.plan?.waitMs ?? parsed.waitMs) + " ms → 门内写账本。加 --apply 执行。" + reconNote);
     return 0;
   }
   // 动了没做完 / 释放失败 → 3

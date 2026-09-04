@@ -25093,6 +25093,13 @@ test("账本维护 CLI + B-3 收据聚合 + inspect 收据不染红 + doctor ⑬
     assert.equal(readGate({ file: gateFile }).state, "absent", "cutover 拒后门撤掉");
     assert.ok(TAL.loadLedger(epDir(EPcut), { endpointId: EPcut }).doc.authority_mode === "shadow", "cutover 拒后仍是 shadow");
 
+    // 6a) P2-2：CLI --cutover 干跑必须复用只读计划器、如实说明对账器未接（不许只报"预检通过"）—— 先红：干跑只走通用 enter 预检，对账状态不在预览里
+    const cutDryLen = lines.length;
+    assert.equal(runCli(["--cutover", "--endpoint", EPcut]), 0, "cutover 干跑 exit 0：" + lines.slice(cutDryLen).join("\n"));
+    const cutDryOut = lines.slice(cutDryLen).join("\n");
+    assert.match(cutDryOut, /预检通过/u, "干跑有预览：" + cutDryOut);
+    assert.match(cutDryOut, /reconciler_absent|对账器未接|M1a 未落地/u, "cutover 干跑要如实说明对账器未接（不是只报预检通过）：" + cutDryOut);
+
     // 6b) P2-1：cutover 不做 --chain，链必须从既有账本读；账本 chain 非法/缺席 → resolveChain 返回 null → 干净拒绝（exit 1 零改动）
     const EPcorrupt = mkEp("agent_ledger_cli_p21"); epDir(EPcorrupt);
     assert.ok(LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPcorrupt, chain: CH, apply: true }).ok, "P2-1 前置 init：" + all());

@@ -19,7 +19,7 @@ import { maintenanceContext, renderStatus, maintenanceStatus } from "./maintenan
 import { readActive, readJournal } from "./maintenance/journal.mjs";
 import { aggregateEndpointReceipts, endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import * as LEDGER_OP from "./maintenance/ledger-operation.mjs";
-import { loadByEndpoint } from "./topic-agent-ledger.mjs";
+import { loadByEndpoint, reconcileShadow } from "./topic-agent-ledger.mjs";
 
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
 const LEDGER_KINDS = Object.freeze(["init", "cutover"]);
@@ -112,7 +112,15 @@ export function runMaintenanceLedger(argv, { ctx = null, out = (s) => process.st
   const r = LEDGER_OP.ledgerEnter(c, { kind, endpointId: parsed.endpoint, chain, waitMs: parsed.waitMs, apply: parsed.apply, env });
   if (r.dryRun) {
     const verb = kind === "init" ? "init→shadow revision1" : "cutover→authoritative";
-    out("[预览] 预检通过，账本 " + verb + "（" + parsed.endpoint + "）：停两链定时器 → 两链 current 切维护桩 → 建门 → 等既有进程退出最多 " + (r.plan?.waitMs ?? parsed.waitMs) + " ms → 门内写账本。加 --apply 执行。");
+    // P2-2：干跑必须复用只读计划器如实反映对账状态，不许只报"预检通过"。init 的 virgin/收据检查已由上方 receipt 预检覆盖；
+    // cutover 的 shadow/chain 已由 resolveChain 覆盖，这里补对账器实况——M1a 未接 → reconciler_absent 如实说出（免得干跑通过、--apply 却拒）。
+    let reconNote = "";
+    if (kind === "cutover") {
+      const L = loadByEndpoint(parsed.endpoint, { env });
+      const rec = L.ok ? reconcileShadow({ endpointId: parsed.endpoint, shadowDoc: L.doc }) : { ok: false, why: "账本读不出" };
+      if (!rec.ok) reconNote = "；但" + (rec.why ?? rec.reason ?? "对账未接") + " —— 加了 --apply 也会被拒（M1a 未落地），当前只能 --init";
+    }
+    out("[预览] 预检通过，账本 " + verb + "（" + parsed.endpoint + "）：停两链定时器 → 两链 current 切维护桩 → 建门 → 等既有进程退出最多 " + (r.plan?.waitMs ?? parsed.waitMs) + " ms → 门内写账本。加 --apply 执行。" + reconNote);
     return 0;
   }
   // 动了没做完 / 释放失败 → 3

@@ -98,11 +98,19 @@ export const ledgerRootFor = (env = process.env) => ledgerRoot(env);
 export function validateLedgerRoot({ env = process.env, mustExistRoot = true } = {}) {
   const root = ledgerRoot(env);
   if (!root || !path.isAbsolute(root)) return { ok: false, reason: "no_root" };
-  try { if (fs.lstatSync(root).isSymbolicLink()) return { ok: false, reason: "root_symlink" }; } catch (err) { if (err?.code !== "ENOENT") return { ok: false, reason: "root_unresolvable", why: String(err.code ?? err.message) }; }
+  let firstSeen = false; // 首次 lstat 是否看到 root 在场（#R27 P1）
+  try {
+    const st0 = fs.lstatSync(root);
+    firstSeen = true;
+    if (st0.isSymbolicLink()) return { ok: false, reason: "root_symlink" };
+  } catch (err) { if (err?.code !== "ENOENT") return { ok: false, reason: "root_unresolvable", why: String(err.code ?? err.message) }; }
   let realRoot, rootResolved = true;
   try { realRoot = fs.realpathSync(root); }
   catch (err) {
     if (err?.code !== "ENOENT") return { ok: false, reason: "root_unresolvable", why: String(err.code ?? err.message) };
+    // #R27 P1：首次 lstat 在场而 realpath ENOENT = “在场→缺席”相邻竞态（现场在变化），
+    // 与复核处同折 root_unresolvable，不得当成合法缺席走父链盘点。
+    if (firstSeen) return { ok: false, reason: "root_unresolvable", why: "根在首次核验后消失（lstat 在场→realpath 缺席）" };
     // #R24 P1-2：realpath ENOENT 只证明末级不存在，父链里可能藏着 symlink（<tmp>/link/missing）。
     // 逐级先 lstatSync（#R26 P1-1：statSync 会跟随 symlink，悬空别名指向永不存在的目标时
     // ENOENT 会被当成“分量也不存在”继续向上，漏掉别名本身）：词法分量在场且是 symlink

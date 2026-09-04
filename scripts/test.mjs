@@ -24673,6 +24673,17 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
         const vn = TAL.validateLedgerRoot({ env: { FEISHU_BRIDGE_LEDGER_DIR: ok700 } });
         assert.deepEqual([vn.ok, vn.reason], [false, "root_unresolvable"], "复核后并发消失 → root_unresolvable：" + JSON.stringify(vn));
       } finally { fs.lstatSync = origLstat26; }
+      // #R27 P1：首次 lstat 在场 → realpath 并发 ENOENT = "在场→缺席"相邻竞态，
+      // 两支都折 root_unresolvable（不得当成合法缺席走父链盘点）。
+      // mock：root 真实在场（lstat 透传），realpathSync 定点 ENOENT（模拟核验间隙被删）。
+      const origReal26 = fs.realpathSync;
+      try {
+        fs.realpathSync = (p2, ...a) => { if (p2 === ok700) { const e = new Error("gone mid-flight"); e.code = "ENOENT"; throw e; } return origReal26(p2, ...a); };
+        const vr1 = TAL.validateLedgerRoot({ env: { FEISHU_BRIDGE_LEDGER_DIR: ok700 }, mustExistRoot: true });
+        assert.deepEqual([vr1.ok, vr1.reason], [false, "root_unresolvable"], "在场→realpath 缺席(true) → 拒：" + JSON.stringify(vr1));
+        const vr2 = TAL.validateLedgerRoot({ env: { FEISHU_BRIDGE_LEDGER_DIR: ok700 }, mustExistRoot: false });
+        assert.deepEqual([vr2.ok, vr2.reason], [false, "root_unresolvable"], "在场→realpath 缺席(false) → 同拒：" + JSON.stringify(vr2));
+      } finally { fs.realpathSync = origReal26; }
       // 真缺席 + 规范父链：true → root_absent；false → 放行（末级允许不存在）。
       const envAbsent = { FEISHU_BRIDGE_LEDGER_DIR: path.join(base, "really-missing") };
       const vt = TAL.validateLedgerRoot({ env: envAbsent, mustExistRoot: true });
@@ -26631,6 +26642,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
         const ok700 = path.join(outer24, "ok700"); fs.mkdirSync(ok700, { mode: 0o700 });
         process.env.FEISHU_BRIDGE_LEDGER_DIR = ok700;
         const origLstat26 = fs.lstatSync;
+        const origReal27 = fs.realpathSync;
         try {
           let n = 0;
           fs.lstatSync = (p2, ...a) => { if (p2 === ok700 && ++n >= 2) { const e = new Error("input/output error"); e.code = "EIO"; throw e; } return origLstat26(p2, ...a); };
@@ -26642,7 +26654,13 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
           const d4 = d14();
           assert.equal(d4.ok, false, "复核后并发消失 → 红：" + JSON.stringify(d4));
           assert.match(d4.detail, /root_unresolvable/u, "点名 root_unresolvable（ENOENT）：" + d4.detail);
-        } finally { fs.lstatSync = origLstat26; }
+          // #R27 P1：首次 lstat 在场 → realpath ENOENT（核验间隙被删）→ root_unresolvable（非缺席）。
+          n = 0; // 重置计数器：本例 lstat 须透传（首次在场），只让 realpath ENOENT
+          fs.realpathSync = (p2, ...a) => { if (p2 === ok700) { const e = new Error("gone mid-flight"); e.code = "ENOENT"; throw e; } return origReal27(p2, ...a); };
+          const d5 = d14();
+          assert.equal(d5.ok, false, "在场→realpath 缺席 → 红：" + JSON.stringify(d5));
+          assert.match(d5.detail, /root_unresolvable/u, "点名 root_unresolvable（相邻竞态）：" + d5.detail);
+        } finally { fs.lstatSync = origLstat26; fs.realpathSync = origReal27; }
       } finally {
         fs.rmSync(outer24, { recursive: true, force: true });
         process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;

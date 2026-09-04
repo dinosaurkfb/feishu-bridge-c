@@ -1,11 +1,11 @@
-# M1a 双射对账：legacy 权威 ↔ shadow 账本（v7，自包含实现合同）
+# M1a 双射对账：legacy 权威 ↔ shadow 账本（v9，自包含实现合同）
 
 > 地位：`layers-v2-ledger.md` §8『legacy 全集双射对账』的实现合同——约束 T3a（只读对账 +
 > doctor，**Codex 已放行实现**）、T3b（migrate_seed / 双写 / repair）、T4（cutover 复合事务）。
 > 字段事实来源：`project-resolve.mjs` / `interaction-policy-store.mjs` / `topic-generation.mjs`
 > / `codex/state.mjs` / `selector.mjs`。
 > **本文件自包含**（五轮 P1-1）：不引用任何已被覆盖的历史版本；全部定稿正文在此。
-> 演进：v0→v7 经 Codex 七轮评审逐轮收闭；上游合同（layers-v2-ledger.md / maintenance-gate.md）已随 v7 真实回带。
+> 演进：v0→v9 经 Codex 九轮评审逐轮收闭；上游合同（layers-v2-ledger.md / maintenance-gate.md）随轮真实回带。
 
 ## 1. legacy 快照：两个封闭适配器
 
@@ -272,4 +272,4 @@ revision，不一致 → `{ ok:null, reason:"snapshot_moved" }`（inconclusive�
 
 - **新前置块 = v2 policy store 抽取**（§4；T3 之后、M1b 之前；含读写方迁移与 cutover step 接线）；
 - cutover 复合事务（§4.1）扩展 R16 编排——归 T4/M1b；
-- T3a（§1/§2/§3 投影/§6/§7）已开 #R19 实现；T3b（§3.1/§5）与 T4（§4.1）以本 v7 为合同。
+- T3a（§1/§2/§3 投影/§6/§7）已开 #R19 实现；T3b（§3.1/§5）与 T4（§4.1）以本 v9 为合同。

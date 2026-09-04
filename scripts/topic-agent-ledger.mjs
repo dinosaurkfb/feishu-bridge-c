@@ -104,16 +104,22 @@ export function validateLedgerRoot({ env = process.env, mustExistRoot = true } =
   catch (err) {
     if (err?.code !== "ENOENT") return { ok: false, reason: "root_unresolvable", why: String(err.code ?? err.message) };
     // #R24 P1-2：realpath ENOENT 只证明末级不存在，父链里可能藏着 symlink（<tmp>/link/missing）。
-    // 向上找最深现存祖先，其 realpath 必须与词法 resolve 一致——任何一环别名在这里暴露。
+    // 逐级先 lstatSync（#R26 P1-1：statSync 会跟随 symlink，悬空别名指向永不存在的目标时
+    // ENOENT 会被当成“分量也不存在”继续向上，漏掉别名本身）：词法分量在场且是 symlink
+    // → 立即 root_not_canonical；只有分量确实 ENOENT 才继续向上。
     let probe = path.dirname(root);
     for (;;) {
-      try { fs.statSync(probe); break; }
+      let pst;
+      try { pst = fs.lstatSync(probe); }
       catch (e2) {
         if (e2?.code !== "ENOENT") return { ok: false, reason: "root_unresolvable", why: String(e2.code ?? e2.message) };
         const parent = path.dirname(probe);
         if (parent === probe) return { ok: false, reason: "root_unresolvable", why: "父链全不存在" };
         probe = parent;
+        continue;
       }
+      if (pst.isSymbolicLink()) return { ok: false, reason: "root_not_canonical" };
+      break; // 现存非 symlink 分量 = 最深现存祖先
     }
     let realParent;
     try { realParent = fs.realpathSync(probe); }
@@ -124,11 +130,14 @@ export function validateLedgerRoot({ env = process.env, mustExistRoot = true } =
     realRoot = root; rootResolved = false;
   }
   if (rootResolved && realRoot !== path.resolve(root)) return { ok: false, reason: "root_not_canonical" };
-  try {
-    const st = fs.lstatSync(realRoot);
-    if (!st.isDirectory()) return { ok: false, reason: "root_not_dir" };
-    if ((st.mode & 0o777) !== 0o700) return { ok: false, reason: "root_perms" }; // #R24 P1-1：现存根精确 0700
-  } catch { /* 不存在已在上面处理 */ }
+  if (!rootResolved) return { ok: true, root: realRoot }; // mustExistRoot:false 的合法缺席：末级不存在，无复核对象
+  // 复核（#R26 P1-2）：realpath 已成功再 lstat 失败 = 现场在变化（EIO/EACCES/并发消失），
+  // 全部受控折 root_unresolvable 带错误码——不得吞成 ok:true，也不得折 root_absent（它刚才还在）。
+  let st;
+  try { st = fs.lstatSync(realRoot); }
+  catch (e4) { return { ok: false, reason: "root_unresolvable", why: "根复核 lstat：" + String(e4.code ?? e4.message) }; }
+  if (!st.isDirectory()) return { ok: false, reason: "root_not_dir" };
+  if ((st.mode & 0o777) !== 0o700) return { ok: false, reason: "root_perms" }; // #R24 P1-1：现存根精确 0700
   return { ok: true, root: realRoot };
 }
 

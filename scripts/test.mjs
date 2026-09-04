@@ -24652,6 +24652,27 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
       assert.deepEqual([va.ok, va.reason], [false, "root_not_canonical"], "缺席+父层别名(true) → 拒：" + JSON.stringify(va));
       const vf = TAL.validateLedgerRoot({ env: envAlias, mustExistRoot: false });
       assert.deepEqual([vf.ok, vf.reason], [false, "root_not_canonical"], "缺席+父层别名(false) → 同拒：" + JSON.stringify(vf));
+      // #R26 P1-1：悬空父级 symlink（目标永不出现）——statSync 时代 statSync 跟随 symlink
+      // 折 ENOENT 继续向上会漏掉别名本身；lstat 先行当场抓 root_not_canonical。
+      fs.symlinkSync(path.join(base, "never-exists"), path.join(base, "dang"));
+      const vd1 = TAL.validateLedgerRoot({ env: { FEISHU_BRIDGE_LEDGER_DIR: path.join(base, "dang", "missing") }, mustExistRoot: true });
+      assert.deepEqual([vd1.ok, vd1.reason], [false, "root_not_canonical"], "悬空父级(true) → 拒：" + JSON.stringify(vd1));
+      const vd2 = TAL.validateLedgerRoot({ env: { FEISHU_BRIDGE_LEDGER_DIR: path.join(base, "dang", "missing") }, mustExistRoot: false });
+      assert.deepEqual([vd2.ok, vd2.reason], [false, "root_not_canonical"], "悬空父级(false) → 同拒：" + JSON.stringify(vd2));
+      // #R26 P1-2：复核 lstat 异常受控——EIO → root_unresolvable；realpath 成功后再 ENOENT
+      // = 现场在变化，同样折 root_unresolvable（不吞成 ok:true，也不折 root_absent）。
+      const ok700 = path.join(base, "ok700"); fs.mkdirSync(ok700, { mode: 0o700 });
+      const origLstat26 = fs.lstatSync;
+      try {
+        let n = 0;
+        fs.lstatSync = (p2, ...a) => { if (p2 === ok700 && ++n >= 2) { const e = new Error("input/output error"); e.code = "EIO"; throw e; } return origLstat26(p2, ...a); };
+        const ve = TAL.validateLedgerRoot({ env: { FEISHU_BRIDGE_LEDGER_DIR: ok700 } });
+        assert.deepEqual([ve.ok, ve.reason], [false, "root_unresolvable"], "复核 EIO → root_unresolvable：" + JSON.stringify(ve));
+        n = 0;
+        fs.lstatSync = (p2, ...a) => { if (p2 === ok700 && ++n >= 2) { const e = new Error("gone"); e.code = "ENOENT"; throw e; } return origLstat26(p2, ...a); };
+        const vn = TAL.validateLedgerRoot({ env: { FEISHU_BRIDGE_LEDGER_DIR: ok700 } });
+        assert.deepEqual([vn.ok, vn.reason], [false, "root_unresolvable"], "复核后并发消失 → root_unresolvable：" + JSON.stringify(vn));
+      } finally { fs.lstatSync = origLstat26; }
       // 真缺席 + 规范父链：true → root_absent；false → 放行（末级允许不存在）。
       const envAbsent = { FEISHU_BRIDGE_LEDGER_DIR: path.join(base, "really-missing") };
       const vt = TAL.validateLedgerRoot({ env: envAbsent, mustExistRoot: true });
@@ -26595,6 +26616,33 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
         const e3 = d14();
         assert.equal(e3.ok, false, "现存 0755 根 → 红：" + JSON.stringify(e3));
         assert.match(e3.detail, /root_perms/u, "点名 root_perms：" + e3.detail);
+        // #R26 P1-1 反例一：悬空 symlink 作 root 本体 → root_symlink（入口 lstat 就抓）。
+        fs.symlinkSync(path.join(outer24, "never-exists"), path.join(outer24, "dang"));
+        process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(outer24, "dang");
+        const d1 = d14();
+        assert.equal(d1.ok, false, "悬空 symlink 根 → 红：" + JSON.stringify(d1));
+        assert.match(d1.detail, /root_symlink/u, "点名 root_symlink：" + d1.detail);
+        // #R26 P1-1 反例二：悬空父级下的缺席末级 → root_not_canonical（不折合法缺席）。
+        process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(outer24, "dang", "missing-ledger");
+        const d2 = d14();
+        assert.equal(d2.ok, false, "悬空父级 + 缺席 → 红：" + JSON.stringify(d2));
+        assert.match(d2.detail, /root_not_canonical/u, "点名 root_not_canonical：" + d2.detail);
+        // #R26 P1-2 反例三：复核 lstat 注入 EIO / 并发 ENOENT → root_unresolvable（不折 ok/absent）。
+        const ok700 = path.join(outer24, "ok700"); fs.mkdirSync(ok700, { mode: 0o700 });
+        process.env.FEISHU_BRIDGE_LEDGER_DIR = ok700;
+        const origLstat26 = fs.lstatSync;
+        try {
+          let n = 0;
+          fs.lstatSync = (p2, ...a) => { if (p2 === ok700 && ++n >= 2) { const e = new Error("input/output error"); e.code = "EIO"; throw e; } return origLstat26(p2, ...a); };
+          const d3 = d14();
+          assert.equal(d3.ok, false, "复核 EIO → 红：" + JSON.stringify(d3));
+          assert.match(d3.detail, /root_unresolvable/u, "点名 root_unresolvable（EIO）：" + d3.detail);
+          n = 0;
+          fs.lstatSync = (p2, ...a) => { if (p2 === ok700 && ++n >= 2) { const e = new Error("gone"); e.code = "ENOENT"; throw e; } return origLstat26(p2, ...a); };
+          const d4 = d14();
+          assert.equal(d4.ok, false, "复核后并发消失 → 红：" + JSON.stringify(d4));
+          assert.match(d4.detail, /root_unresolvable/u, "点名 root_unresolvable（ENOENT）：" + d4.detail);
+        } finally { fs.lstatSync = origLstat26; }
       } finally {
         fs.rmSync(outer24, { recursive: true, force: true });
         process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;

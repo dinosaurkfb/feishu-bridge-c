@@ -188,7 +188,7 @@ rollback 记 `rolled_back`）。
 | phase | 必需且 done 的 step | 说明 |
 | --- | --- | --- |
 | `ledger_initializing` | `ENTER_DONE`；`ledger:<ep>:init` 可尚不存在或 `prepared`；**禁 sidecar** | forward-only 段 |
-| `ledger_cutting_over` | `ENTER_DONE`；ledger step 可 `prepared`；**恰三条 sidecar step（prepared/done，与阶段推进同一次提交写入）** | forward-only 段（v10） |
+| `ledger_cutting_over` | `ENTER_DONE`；ledger step 可 `prepared`；**恰三条 sidecar step——进入该阶段的同一次 journal 提交中三条必须全部 `prepared`（不得有无来源的 done），此后才允许逐条转 done** | forward-only 段（v10/v12） |
 | `ledger_reopening` | `ENTER_DONE` ∪ {`ledger:<ep>:init`\|`cutover`} 且 ledger step `done`；**（cutover）三条 sidecar 全 `done`** | 进入前必 done；B-4 逐步 |
 | `done`（成功重开后）| 同 `ledger_reopening` | — |
 | `reopening_incomplete`（ledger kind）| 同 `ledger_reopening`（**不**要求 install step）| 重开残步未清（含 3b 备份删除失败）：步骤 1–3/3b 失败时门**尚未撤**、撤门（4）失败时门**可能已部分撤**——都进这里 |

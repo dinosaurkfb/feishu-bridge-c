@@ -1,11 +1,11 @@
-# M1a 双射对账：legacy 权威 ↔ shadow 账本（v9，自包含实现合同）
+# M1a 双射对账：legacy 权威 ↔ shadow 账本（v12，自包含实现合同）
 
 > 地位：`layers-v2-ledger.md` §8『legacy 全集双射对账』的实现合同——约束 T3a（只读对账 +
 > doctor，**Codex 已放行实现**）、T3b（migrate_seed / 双写 / repair）、T4（cutover 复合事务）。
 > 字段事实来源：`project-resolve.mjs` / `interaction-policy-store.mjs` / `topic-generation.mjs`
 > / `codex/state.mjs` / `selector.mjs`。
 > **本文件自包含**（五轮 P1-1）：不引用任何已被覆盖的历史版本；全部定稿正文在此。
-> 演进：v0→v9 经 Codex 九轮评审逐轮收闭；上游合同（layers-v2-ledger.md / maintenance-gate.md）随轮真实回带。
+> 演进：v0→v12 经 Codex 十二轮评审逐轮收闭；上游合同（layers-v2-ledger.md / maintenance-gate.md）随轮真实回带。
 
 ## 1. legacy 快照：两个封闭适配器
 
@@ -158,30 +158,43 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
    - cutover fingerprint/result 与上述固定值逐字一致；
    - `bijection_digest` 来自**同一 pre-cutover ledger revision/snapshot** 的 reconciler 结果
      （revision 记进 prepared ledger step，提交前 CAS 复核）。
-   **执行顺序（九轮 P2-1）**：门内、三条 sidecar 全 done 后**重新调用 reconciler**；只接受
-   同一 ledger before revision/SHA 上的 `{ok:true, digest}`；snapshot_moved 或 digest 改变
-   均不得翻转 authority_mode。
-4e. **sidecar 封闭 schema 与确定性 renderer（十一轮 P1-1，正文即合同）**：
+   **执行顺序（九轮 P2-1 / 十二轮 P1-2 统一）**：门内、三条 sidecar 全 done 后**重新调用
+   reconciler**；只接受同一 ledger before revision/SHA 上的**完整 cutover plan 联合**
+   （4e 定义；仅 {ok:true,digest} 的窄结果不足以翻转）；snapshot_moved 或 digest 改变均不得
+   翻转 authority_mode。
+4e. **sidecar 封闭 schema 与确定性 renderer（十二轮 P1 定稿）**：
    三个 renderer 共同输入 = **同一冻结 legacy snapshot + §3 期望集 E**；输出 = 规范字节
-   `JSON.stringify(stable(doc), null, 2) + "\n"`（stable = canonKey 同源键排序递归）——
-   同快照重算必得同字节；intended SHA **只能**由 renderer 产出。
+   `JSON.stringify(stable(doc), null, 2) + "\n"`（stable = canonKey 同源键排序递归）；
+   intended 字节/SHA **只能**由 renderer 在冻结快照上产出一次。
    - **expiry-1**：`{ schema_version:"expiry-1", endpoint_id, entries:
-     { <topic_agent_id>: <expires_at 规范 ISO> } }`——E 中每条 live B 记录一项，值 = 其
-     binding 的 legacy expires_at；registry 条目缺 expires_at → legacy_unreadable（现行
-     schema 必有）；空集 = `entries:{}`。
+     { <topic_agent_id>: <规范 ISO> } }`——E 中每条 live B 记录一项，值 = 其 binding 的
+     expires_at **经规范化**（Date.parse→toISOString；不可解析 → legacy_unreadable）；
+     空集 = `entries:{}`。
    - **pending-claims-1**：`{ schema_version:"pending-claims-1", endpoint_id, entries:
-     { <B1 topic_agent_id>: { token: string|null, claim_expires_at: 规范 ISO|null } } }`——
-     仅 E 中 B1 记录；值取 legacy pending_token / claim_expires_at，缺席显式 null。
+     { <B1 id>: { token: /^[0-9a-f]{6}$/ | null, claim_expires_at: 规范 ISO | null } } }`——
+     仅 E 中 B1；**token===null ⇒ claim_expires_at===null**；token 形状不合 →
+     legacy_unreadable；时间同上规范化。
    - **policy-1**：`{ schema_version:"policy-1", endpoint_id, entries:
-     { <policy_subject_id>: <interaction_policy_state 既有封闭 schema 原样
-     （schema_version/binding_id/policy_id/policy_version/updated_at/dialogue）> } }`——
-     按 §4 subject 规则重键；legacy 无 policy 字段的 binding 按
-     interactionPolicyStateForLegacy 兼容投影（Mapping 默认）；updated_at 取快照值（确定性）。
-   **reconciler 成功结果收成（journal prepared 只能消费这份）**：
-   `{ ok:true, digest, snapshot_identity, ledger:{ revision, sha256 },
-   sidecars:{ expiry:{bytes,sha256}, pending_claims:{bytes,sha256}, policy:{bytes,sha256} } }`
-   ——`ok:true` 即同时证明四件：ledger 双射（§6 C）∧ 三个 sidecar 投影相等（renderer 重算
-   字节 vs 现场/intended 逐字节）；空文件或错误内容即使 SHA 自洽也过不了。
+     { <policy_subject_id>: <条目> } }`——条目 = **原样搬运**快照中该 binding 的
+     interaction_policy_state（stable 键排序；根键集必恰为
+     schema_version/binding_id/policy_id/policy_version/updated_at/dialogue 六键、并过现行
+     合法性校验，超/缺键 → legacy_unreadable）；**binding_id 保留 legacy 原值**（出处字段，
+     subject 只作外键）；缺席 policy 字段的 binding → Mapping 默认条目且
+     **updated_at = 固定哨兵 "1970-01-01T00:00:00.000Z"**（不得取执行时钟）；
+     **同 lineage 多条 B 记录投同一 subject：条目逐字相等则去重，否则
+     policy_subject_conflict 拒**（不依赖覆盖顺序）。
+   **两个接口分离（十二轮 P1-2）**：
+   - **对账安全结果（T3a/doctor 用，§6 的联合）**：`{ ok:true, digest, snapshot_identity,
+     ledger:{revision,sha256}, sidecars:{expiry:{sha256}, pending_claims:{sha256},
+     policy:{sha256}} }`——**不含任何字节明文**；bytes/locator 路径/snapshot 细节不进
+     doctor/CLI 输出。
+   - **cutover plan（T4 私有判别联合，4c/4e/journal 消费方唯一指向）**：对账安全结果 ∪
+     三个 **staged intended blob 的受验引用**——推进 ledger_cutting_over **前**，renderer
+     产出的三个 intended 字节以 0600、O_EXCL、fd 绑定写入 `<token>.staged/intended/<name>`
+     并 fsync，prepared step 登记受验路径+长度+SHA；**journal 不存明文**（bearer token 不进
+     journal/日志）；恢复只读 staged blob（十二轮 P1-1：不得重渲染、不得凭 SHA 还原）；
+     blob 写不下或读回核不过 → **不得进入 forward-only**；B-4 3b 负责删除。
+     plan 任一字段缺失 → 不得 cutover。
 4f. **endpoint 交叉绑定不变量（十一轮 P1-2 取 b：只用可复核事实，不引用 result/瞬时
    intent）**：账本顶层 `endpoint_id`、cutover **fingerprint 输入的 endpoint_id**、ledger
    step 的 endpoint（id/target）、三条 sidecar 的 id `<ep>` 与重算 target ——**五源必全部
@@ -275,8 +288,12 @@ proof 不进 C（引用完整性 = G13-mig/G13-repair 独立判据）。mismatch
 revision，不一致 → `{ ok:null, reason:"snapshot_moved" }`（inconclusive；cutover 视同不通过
 重试；doctor 整体 incomplete、**不得生成或复用 readiness/cutover 凭据**）。
 
-**结果联合（封闭）**：`{ ok:true, digest }` | `{ ok:null, reason:"snapshot_moved", why }` |
-`{ ok:false, reason, why, mismatches:[{ code, topic_agent_id|null, field|null, detail }] }`。
+**结果联合（封闭；此为 T3a/doctor 的对账安全接口，成功支携带 §4.1-4e 的安全字段集，
+不含字节明文）**：`{ ok:true, digest, snapshot_identity, ledger:{revision,sha256},
+sidecars:{expiry:{sha256},pending_claims:{sha256},policy:{sha256}} }` |
+`{ ok:null, reason:"snapshot_moved", why }` |
+`{ ok:false, reason, why, mismatches:[{ code, topic_agent_id|null, field|null, detail }] }`；
+**T4 只认 §4.1-4e 的 cutover plan 判别联合**（本联合的窄成功支不足以 cutover）。
 
 ## 7. doctor 输出纪律
 
@@ -297,4 +314,4 @@ revision，不一致 → `{ ok:null, reason:"snapshot_moved" }`（inconclusive�
 
 - **新前置块 = v2 policy store 抽取**（§4；T3 之后、M1b 之前；含读写方迁移与 cutover step 接线）；
 - cutover 复合事务（§4.1）扩展 R16 编排——归 T4/M1b；
-- T3a（§1/§2/§3 投影/§6/§7）已开 #R19 实现；T3b（§3.1/§5）与 T4（§4.1）以本 v9 为合同。
+- T3a（§1/§2/§3 投影/§6/§7）已开 #R19 实现；T3b（§3.1/§5）与 T4（§4.1）以本 v12 为合同。

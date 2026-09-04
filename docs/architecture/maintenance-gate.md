@@ -1,6 +1,13 @@
-# 维护门（issue #81）—— 方案稿 v5
+# 维护门（issue #81）—— 方案稿 v6
 
-> 状态：方案，未实现。v1 → Codex 5 P1 → v2 → 4 P1 → v3 → 3 P1 + 2 P2 → v4 → 4 P1 + 2 P2 → v5（2026-08-30）。评审：Codex（架构）；拍板：Frank（切桩、丢回合、不 claim 已同意）。
+> 状态：v5 机制**已实现并有测试覆盖**（`scripts/maintenance-gate-core.mjs` +
+> `scripts/maintenance/*` + `scripts/maintenance-gate.mjs` / `maintenance-install.mjs`，
+> `--status` 可用，test.mjs 中 187 处相关断言）；端到端 enter→install→reopening
+> 是否已在真机跑过一次，未在本稿断言。**v6（2026-09-04）新增"账本接入（M1）"一节**
+> —— 把 v2 第三步的权威账本接进维护门（账本 §3/§5.2/§8 与 Codex Q1/Q2 要求）。
+> **Codex 五轮评审逐条返修后放行（2026-09-04，无 P1）。**
+> v1 → Codex 5 P1 → v2 → 4 P1 → v3 → 3 P1 + 2 P2 → v4 → 4 P1 + 2 P2 → v5（2026-08-30）
+> → v6（2026-09-04 账本接入）。评审：Codex（架构）；拍板：Frank（切桩、丢回合、不 claim 已同意）。
 > Codex 已在本机实测：**Codex CLI 0.150.1 的 UserPromptSubmit hook 返回顶层 `{"decision":"block","reason":"<非空>"}` 能阻止正文进模型**（模型 0 token，无 agent 内容、无工具调用）。协议不在公开文档里，所以**进门前按当前 Codex 版本跑一次无模型探针**，不只钉版本号。
 
 ## 要解决什么
@@ -134,6 +141,238 @@ node scripts/maintenance-install.mjs [--reason "<≤80 码点>"] [--wait-ms N] [
 12. stage / activate 的模块 API 在没有 active operation、token 不符、阶段不对、current 不是本 token 的桩时一律拒绝。
 13. 含门代码的版本安装时经 journal 写机器级收据；下一次预检用收据里桥拥有条目的 sha 对账（settings.json 里无关设置改了不挡门）；没有收据一律拒绝进门（`receipt_absent`，先用普通安装器 `--apply` 装一次含收据代码的版本）；verify 失败回退后收据里没有目标版本的条目。
 14. 终态先于清 active：在"终态已持久化、active 未清"处被杀 → `--status` 仍能看到 operation 且报已终结；`--exit` 只清 active。
+
+## 账本接入（M1，2026-09-04；v6，Codex 首轮 4×P1/2×P2 返修）
+
+v2 第三步的权威账本（`layers-v2-ledger.md`）是新的生产写入面，Codex（该步 Q1/Q2）
+裁定：**启用前必须纳入维护门**，且 `authority_mode` 的 `shadow→authoritative`
+切换**必须在门内一次提交**。本节把账本接进已有的两层 + 一本账，不新造机制。
+
+### A. 账本写面纳入看门（普通写，门外的常态）
+
+- 账本的常规写（入站路由器 / bind·rotate 控制入口）经 `acquirePublishLock`
+  （账本 §3），**已经看门**（§第 2 层：`acquirePublishLock` 兜底返回 `maintenance`）
+  ——门开着时账本写取不到锁、受控退出，回执路径回"维护中请重发"、**不先发回执再
+  延后写账本**（账本 §9、Q2）。**M1a 的 shadow 写也走这条 gated 写**（评审 P2-1：
+  shadow 账本照常经 gated ledger write 写入同批事实，只是**生产路由仍以 legacy
+  registry 为权威**——不是"shadow 不写"）。
+- 看门点清单（§第 2 层）**补上账本写入口** `withLedgerWrite` 的提交段。**doctor
+  的账本读是"诊断接线"、不是看门点**（评审 P2-2：维护期间恰恰要靠它诊断 ledger /
+  journal / 锁，绝不能被门挡）。
+- **启动源无新增**：账本由现有 runtime/current/scripts 下的入站入口写，进程盘点与
+  桩清单（realpath ⊆ `current/scripts`）已覆盖；账本数据目录 `ledger/<endpoint_id>/`
+  是**数据**、不是启动源，不进桩清单、不进预检对账。§预检 / §桩清单两张表**不因
+  账本而变**。
+
+### B. 两类独立的账本维护 operation（评审 P1-1：拍死独立 operation、封闭 kind）
+
+现有 journal 无 `operation_kind`、`PHASE_REQUIRES` 是一套固定要求，无法同时表达
+"普通 enter/exit 不要 ledger step / runtime install 要 install steps / 账本 init /
+cutover 各要自己的步骤"。故**引入封闭 `operation_kind`**，账本接入用两个新种、
+**不塞进 maintenance-install**（放弃双实现）：
+
+| operation_kind | 阶段序列（forward-only 段加粗）| 必需 step | terminal | success reopening |
+| --- | --- | --- | --- | --- |
+| `ledger_init` | …drained → **ledger_initializing** → `ledger_reopening` → done \| reopening_incomplete | `ledger:<ep>:init` | done | 见 B-4 |
+| `ledger_cutover` | …drained → **ledger_cutting_over** → `ledger_reopening` → done \| reopening_incomplete | `ledger:<ep>:cutover` | done | 见 B-4 |
+
+**关键差异（评审 P1-1）**：账本 operation **不切 runtime、不装新 plist**——它只是为了
+"门内安静地写账本一笔"而临时切桩，做完把 `current` **切回原目标 runtime**、定时器
+**回进门前原始三态**（不像 install 的 reopening 指向新版本、用目标 plist，也不像
+rollback 记 `rolled_back`）。
+
+**`PHASE_REQUIRES` 逐 kind 封闭（三轮 P1-2：terminal 还必须要求进门步骤全 done，
+不能只凭一条 ledger step 认作 done）**——`ENTER_DONE` = {`timer:<chain>`、
+`stub:<chain>`、`current:<chain>`（两链）、`gate`} 全部 `done`：
+
+| phase | 必需且 done 的 step | 说明 |
+| --- | --- | --- |
+| `ledger_initializing` / `ledger_cutting_over` | `ENTER_DONE`；`ledger:<ep>:*` 可尚不存在或 `prepared` | forward-only 段 |
+| `ledger_reopening` | `ENTER_DONE` ∪ {`ledger:<ep>:init`\|`cutover`}，且 ledger step 必须 `done` | 进入前 ledger step 必 done；B-4 逐步 |
+| `done`（成功重开后）| 同 `ledger_reopening` | — |
+| `reopening_incomplete`（ledger kind）| 同 `ledger_reopening`（**不**要求 install 的 artifact/receipt/current:install step）| 重开残步未清：步骤 1–3 失败时门**尚未撤**、撤门（4）失败时门**可能已部分撤**——两种都进这里 |
+
+`--exit` 按 `operation_kind` **分派**到 ledger 的 success reopening（`ledger_reopening`），
+**不复用 install 的 reopening**（三轮 P1-2 / 四轮 P1）。
+
+`ledger_*` kind **禁 install 的 `artifact`/`receipt`/`staged_plan` step**；
+`maintenance_gate`/`maintenance_install` kind **禁 `ledger` step**。
+
+**schema 判别联合（三轮 P1-2 / 二轮 P2-1，写死枚举、旧版单独分支不猜）**：
+- **旧 schema 1.1**：保持原封闭字段集、**不含** `operation_kind`；用**独立的旧版解析
+  分支**读（不猜它是 gate 还是 install），只作历史 journal，不参与 B-3 的 endpoint
+  收据索引；
+- **新 schema（1.2）**：**必须含** `operation_kind ∈ {maintenance_gate,
+  maintenance_install, ledger_init, ledger_cutover}`（具体字符串），各 kind 的
+  step/phase 按上表与既有 install/gate 定义封闭。
+
+**锁面（评审 P1-1：账本 operation 也是安装面写方——它停定时器、切桩、开门、reopening）**：
+`--init/--cutover --apply` 必须在**预检与 createOperation 之前**取机器级**安装面锁**
+（`install-surface.lock`，registry 锁协议、staleMs=∞ 按持有者 pid 活性接管），持有到
+reopening 与 operation lease 释放完成；释放失败压成退出码 3。**封闭锁顺序**：
+安装面锁 → operation 租约 / active / 门 → 账本锁（`acquireLockUngated` 只在这条
+受验维护路径内允许）。这样普通安装器无法在 ledger operation 进门窗口改 current 或
+安装面（与 v5 已解决的"过检后才建门"竞态同一把锁挡住）。
+
+### B-1. 不可逆边界进阶段机（评审 P1-2）
+
+`ledger_initializing` / `ledger_cutting_over` 是 **forward-only 阶段**：**任何账本
+提交之前**先把它 setPhase 持久化；一旦进入，`--exit` **只能向前完成或停门待修，绝不
+进 `rolling_back`**。这堵死"账本已切 authoritative / 已建 revision=1，但 journal 没
+推进，`--exit` 走普通 rollback 把旧 runtime 重新开放"的窗口。崩在"账本提交成功、
+`markStepDone` 未记"窗口时，先按**账本精确身份**（下 B-2）收敛，再决定 reopening；
+不按 mode/revision 猜。
+
+### B-2. ledger step 的身份状态与两个判据（评审 P1-4 / 二轮 P1-2）
+
+`ledger` step 的 `before/intended_after/after` 按 `init | cutover` 各自**封闭键集**
+（值域可直译校验器），**absent 用显式 null、单一状态源 = `step.state`**（不设嵌套
+`receipt_state`）：
+
+| 字段 | init.before | init.intended_after/after | cutover.before | cutover.intended_after/after |
+| --- | --- | --- | --- | --- |
+| `endpoint_id` | `<ep>` | `<ep>` | `<ep>` | `<ep>` |
+| `operation_id` | 本 op | 本 op | 本 op | 本 op |
+| `fingerprint` | 本 op（layers-v2-ledger.md §5.1）| 同 | 本 op | 同 |
+| `authority_mode` | `null`（账本不存在）| `"shadow"` | `"shadow"` | `"authoritative"` |
+| `revision` | `null` | `1` | 切换前 revision | `before.revision + 1` |
+| `ledger_sha256` | `null` | 提交那一刻整文件 SHA | 切换前 SHA | 提交那一刻 SHA |
+| `bijection_digest` | —（不适用）| — | `null` | 账本 §8 双射对账摘要 |
+
+**两个不同判据（二轮 P1-2：整文件 SHA 只在恢复窗口用，不能长期比）**：
+
+- **prepared 恢复窗口**（门仍开、step=prepared、提交成功但 done 未记）：现场账本必须
+  与 `intended_after` **完整逐字段、逐 SHA 相等** → 补 `markStepDone`。
+- **done 永久收据**（初始化/切换早已完成，其后 M1a shadow 写 / authoritative 写会
+  合法推进 revision 与整文件 SHA）：判据**不是**整文件 SHA 相等，而是「**当前账本合法，
+  且其 `operations` 表含本 `operation_id` 对应的不可变 init/cutover 事务，
+  `fingerprint`/`result_revision` 精确相符，当前 `revision ≥ result_revision`**」——
+  **允许后续合法事务改变整文件 SHA**。doctor 的 cutover 对账同理：核**不可变事务祖先
+  + `authority_mode`**，不要求当前 SHA == 切换当时 SHA。
+
+**恢复矩阵（三轮 P1-1：按 step kind 通用 before/intended，同时覆盖 init 与 cutover）**
+——`before` 投影随 kind 不同：**init.before = 账本 absent（显式 null 身份）；
+cutover.before = shadow 身份（切换前的 authority_mode/revision/SHA）**：
+
+| journal step 状态 × 账本现场 | 处置 |
+| --- | --- |
+| `prepared` + 现场 == **before**（init：absent；cutover：shadow before） | 尚未提交 → 执行/重试 |
+| `prepared` + 现场 == **intended_after**（逐字段逐 SHA） | 已提交 → 补 `markStepDone` |
+| `prepared` + 账本 absent 但 before≠absent（即 cutover 现场丢失） | **账本丢失**（fail-closed）|
+| `prepared` + unreadable / 既非 before 也非 intended | 损坏、人工介入 |
+| `done` + 账本 absent/unreadable | **账本丢失**（fail-closed、不重初始化，账本 §8）|
+| `done` + 当前账本含精确 init/cutover 事务（"done 永久收据"判据）| 有效，允许其后存在合法事务 |
+
+### B-3. 每 endpoint 永久收据的聚合读取协议（评审 P1-3 / 二轮 P2-2）
+
+已 done 的 `ledger_init` **与** `ledger_cutover` operation journal **都永久充当该
+endpoint 的维护审计收据**（二轮 P2-2：两者都保留、都不算 orphan），不删——它们要在
+**账本丢失后仍能证明"这个 endpoint 曾初始化 / 曾切权威"**（账本丢了，其内部
+`operations` 表也没了；永久标记必须在账本之外）。现有 `inspectMaintenanceDir` 把
+"不被 `active` 指向的 journal"一律当 orphan——正常完成的 init/cutover 会永久染红。
+故定**机器级 endpoint 收据投影**：
+
+- **封闭枚举**维护目录下全部 journal，取 `operation_kind ∈ {ledger_init,
+  ledger_cutover}` 且 terminal `done` 的，按 `endpoint_id` 建**唯一索引**（init 一份、
+  cutover 至多一份）；
+- 判据：**从未初始化**（无 init 记录）/ **恰一份 init（可另有一份 cutover）** /
+  **重复或矛盾**（多份 init、或与"done 永久收据"判据不符）/ **某 journal 读不出**
+  → 后两者一律 **fail-closed**（拒绝新 `ledger_init`/`ledger_cutover`、doctor 红）；
+- **盘点区分**：`ledger_init(done)` / `ledger_cutover(done)` 的 journal 是**合法永久
+  收据**、不是 orphan；`inspectMaintenanceDir` 据 `operation_kind`+terminal 区分，
+  合法收据不染红。
+- **schema 版本兼容（二轮 P2-1）**：journal schema 升版加 `operation_kind`（完整域
+  = 现有 gate/install 的既有种 + `ledger_init` + `ledger_cutover`）；**旧 1.1
+  journal 无该字段 → 按既有种（gate/install）读，不当 unreadable**——否则升级后旧
+  journal 全成 unreadable、被 B-3 全局 fail-closed 卡死。
+
+### B-4. success reopening 的封闭顺序（二轮 P1-4：账本 operation 不装新 plist）
+
+账本 operation 的成功重新开放，**逐步封闭、每步 CAS**（与 install reopening 的
+"目标态"不同——这里回**原始态**）：
+
+1. 两条 `current` **CAS 回原目标 runtime**；
+2. 定时器恢复**原 plist 字节 + 原 loaded 三态**（不是 install 的目标态）；
+3. 删除**已不再被 current 引用**的桩；
+4. token-CAS 撤门；
+5. 持久化 `done`；
+6. 最后 token-CAS 清 `active`；
+7. **释放次序：先 operation 租约，最后安装面锁**（与"安装面锁持有到租约释放完成"逐字
+   一致）。
+
+整段在 `ledger_reopening` 阶段（进入前 ledger step 必 `done`）；`--exit` 按
+`operation_kind` 分派到这里，不复用 install。**失败封闭（三轮 P1-3 / 四轮）**：
+- 步骤 1–3 **任一失败**（current 说不清 / 原 plist 备份核不过 / 定时器恢复失败 /
+  桩删不掉）→ **保留门与 active、不执行 4–6**，进 ledger 的 `reopening_incomplete`
+  （门、active 保留；**ledger operation 没有 staged 制品**，不提 staged），该链留给人、
+  `--exit` 只向前重试；
+- 撤门（4）异常或 `.txn` 交不还 → 同样 `reopening_incomplete`（门可能已部分撤，
+  active 保留）；
+- **门撤后 `done`（5）未写下**：恢复**只继续终态收口**，**不再拿当前账本 SHA 重判
+  ledger 提交**——此时正常写可能已恢复并推进 SHA（用"done 永久收据"的不可变事务
+  判据，不用整文件 SHA）；`done` 写不下 → **不得清 active**；
+- **清 active（6）/ 释放（7）分开看**：active 仍由本 operation 持有 → 可 `--exit`
+  续跑；若**终态已落、active 已清**，只是租约 / 安装面锁释放失败 → **operation 已
+  完成、命令退 3**，由 status/doctor 点名锁残骸，**不存在可 `--exit` 续跑的 active
+  operation**。
+
+任一 `current` 说不清时，不恢复**该链**定时器、不删**同链**桩、不撤门。
+
+### C. 编排与命令面
+
+- **M1a（种子 + shadow 对账）不进门**：shadow 账本照常经 gated ledger write 写入
+  （A 节），生产路由仍以 legacy registry 为权威（账本 §8）；doctor 旁路对账。
+  **只有 `ledger_init`（首建 shadow 账本）与 `ledger_cutover`（切权威）两个 operation
+  进门**。
+- 二者是**独立 operation**（B 节；`--enter/--exit --apply` 同安装类授权），与 runtime
+  安装正交、回退面更清。
+- **doctor 增账本对账**（诊断接线、非看门点）：endpoint 收据投影（B-3）唯一且一致；
+  cutover 对账核**账本 operations 表里的不可变 cutover 事务祖先 + `authority_mode`**
+  （B-2"done 永久收据"判据，**不**要求当前 SHA == 切换当时 SHA，账本 G14）；账本自身
+  G1–G15。
+
+命令面新增：
+
+```
+node scripts/maintenance-ledger.mjs --status
+node scripts/maintenance-ledger.mjs --init   --endpoint <id> [--wait-ms N] --apply   # ledger_init
+node scripts/maintenance-ledger.mjs --cutover --endpoint <id> [--wait-ms N] --apply   # ledger_cutover
+```
+
+（沿用 maintenance-gate 的租约/门/journal/退出码；`--apply` 逐次授权；无 `--force`/`--kill`。）
+
+### D. 账本接入的新增不变量（测试要盯）
+
+- L1 门开着时账本常规写（含 M1a shadow 写）取不到锁（`maintenance`）、回执回"维护中"、
+  **账本零写入**；门关掉后重发能正常写。
+- L2 **prepared 恢复**：写账本成功、`markStepDone` 未记处被杀 → 恢复按**完整身份**
+  （含 `ledger_sha256`）判"现场 == intended_after → 做过"补 done；同 mode/revision 的
+  错误内容**不**被误当完成。
+- L2b **done 永久收据（二轮 P1-2）**：init/cutover 完成后 M1a shadow 写 / authoritative
+  写合法推进 revision 与整文件 SHA → 收据判据用"当前账本含本 operation_id 的不可变
+  事务、fingerprint/result_revision 相符、revision≥它"，**不**因整文件 SHA 变了而报矛盾。
+- L3 WAL 恢复矩阵（B-2 表）逐格成立；`done + 账本 absent/unreadable` **不**重初始化
+  （账本 §8 fail-closed、绝不回退 registry）。
+- L4 forward-only：进入 `ledger_initializing`/`ledger_cutting_over` 后 `--exit`
+  **绝不进 rolling_back**，只向前或停门待修；cutover 后普通写改不回 shadow、重放不新增
+  第二笔（账本 G14）。
+- L5 operation_kind 封闭：`ledger_*` operation 不要 install 的 artifact/receipt/
+  staged_plan step；enter/install 不要 ledger step；旧 1.1 journal 无 operation_kind
+  按既有种读、不 unreadable（二轮 P2-1）。
+- L5b **安装面锁（二轮 P1-1）**：`--init/--cutover --apply` 在预检/createOperation 前
+  取 install-surface.lock、持有到 reopening + 租约释放；锁序 = 安装面锁 → 租约/门 →
+  账本锁；普通安装器在 ledger operation 进门窗口改不了 current / 安装面。
+- L5c **reopening 顺序与失败封闭（二轮 P1-4 / 四轮）**：成功重开按 B-4 顺序（current
+  先回原目标 → 定时器回**原始三态**（不用 install 目标态）→ 删无引用桩 → 撤门 → done
+  → 清 active → 先租约后安装面锁）；**逐类失败各测一条**——current 说不清 / 定时器
+  恢复失败 / 桩删不掉（步骤 1–3，门不撤、进 ledger `reopening_incomplete`）、撤门失败
+  （门部分撤、同 incomplete）、`done` 写不下（不清 active）、终态已落仅释放失败
+  （operation 完成、退 3、无可续跑 active）。
+- L6 endpoint 收据聚合：`ledger_init(done)` 与 `ledger_cutover(done)` 的 journal 都是
+  合法永久收据、不被盘点当 orphan、不染红；同 endpoint 重复/矛盾/某 journal 读不出
+  → fail-closed。
+- L7 账本数据目录不在桩清单/预检；接入账本未改变 §预检 / §桩清单两张表判据；doctor
+  账本读不被门阻断。
 
 ## 不做的 / 明说的代价
 

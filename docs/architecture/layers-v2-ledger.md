@@ -46,10 +46,14 @@ current；⑥ tombstone 封闭、禁自指/环/悬空、幂等/冲突 fail-close
 一段，故父目录逐层 realpath 核对到受验根、拒绝同 UID 目录被替换（威胁边界入合同）。
 单文件（迁移跨记录、一次 rename 即原子）。顶层：
 
+`endpoint_id` 是 `legacyEndpointId` = `stableControlId("endpoint", runtime, agentUid)` = **不透明的
+`endpoint_<24hex>`**，**链（claude/codex）无法从中还原**，故顶层另存封闭 `chain` 字段（实现落定；
+维护层核验时另须证明该 opaque endpoint 确属该 chain，不只信账本自述）：
+
 ```json
 { "schema_version":"1.0", "artifact_type":"feishu_bridge_topic_agent_ledger",
-  "endpoint_id":"<legacyEndpointId>", "authority_mode":"shadow"|"authoritative",
-  "revision":42,
+  "endpoint_id":"<endpoint_24hex>", "chain":"claude"|"codex",
+  "authority_mode":"shadow"|"authoritative", "revision":42,
   "operations": { "<operation_id>": <§5.1 逐 op 封闭> },
   "records": { "<topic_agent_id>": { "kind":"...", ... } } }
 ```
@@ -230,35 +234,51 @@ proof 保持 null；active/dormant 记录写 retarget proof）。
 | 恢复 B3′→B3 | =B3′∧谱系无其他 current | dormant→active、保留原双 proof |
 | unbind A2/A3→A4、B3→B3′、B4→A4 | owner 终端命令 | binding→dormant；B4→A4 同笔 generation historical→n/a、清 generation_lineage_id |
 
-**幂等/冲突**：重放要求 **op_type + fingerprint 同时相等**（fingerprint 规范输入
-含 `op_type` 域分隔——否则 restore/unbind 同以 topic_agent_id 为输入会撞同一指纹，
-评审五 P1-5）；`operations[op_id]` 存在且二者皆等→幂等返回其 result/result_revision；
-任一不同→冲突 fail-closed。
+**幂等/冲突**：写端按 **`request_key`（全局唯一，G12）** 查历史 op——同 key 且 fingerprint
+相等→幂等返回原 result/result_revision；同 key 但 fingerprint 不等→`request_conflict`
+fail-closed（详见 §5.1 重放/冲突判定）。fingerprint 规范输入含 `op_type` 域分隔且首字段为
+`request_key`——否则 restore/unbind 同以 topic_agent_id 为输入会撞同一指纹（评审五 P1-5），
+而 request_key 相同的两次不同载荷也才能被判成冲突而非静默追加（评审六 P1-1）。
 
 ### 5.1 operations 逐 op 规范表（评审四 P1-2；实现合同锚点）
 
-`operations[op_id] = { op_type, terminal_kind, fingerprint, result_revision, result }`。
-逐 op 钉死 **fingerprint 输入字段（首字段恒为 `op_type` 域分隔，缺席字段用显式
-null 哨兵编码，再规范 JSON→sha256）** 与 **result 精确键集/ID 顺序/null 规则**
-（下表 fingerprint 输入列均隐含前置 `op_type`）：
+`operations[op_id] = { op_type, terminal_kind, request_key, fingerprint, result_revision, result }`
+（**`request_key` 是独立顶层字段**，评审六 P1-1）。逐 op 钉死 **fingerprint 输入字段** 与
+**result 精确键集/ID 顺序/null 规则**。fingerprint = sha256(规范 JSON)，**输入首字段恒为
+`op_type`（域分隔），第二字段恒为 `request_key`（外部请求身份 = 控制 claim key / message id）**
+——**可重复动作（unbind↔restore、往返 retarget）靠 request_key 区分"另一次请求"与"同一请求
+重放"，不能用动作参数相同代替（评审四 P1-2）**；缺席证据字段用**显式 null**（同一 op_type
+只有一种输入形状，评审四 P1-4）。**请求身份必须状态无关**：fingerprint 输入只取调用方字面参数，
+不取账本当前状态派生量（评审六 P1-1：否则 seed 的第二次调用 toInsert 收缩、retarget 往返的
+lineage 相同，都会把合法新请求误判成旧重放）：
 
-| op_type / terminal_kind | fingerprint 输入 | result 键集 |
+| op_type / terminal_kind | fingerprint 输入（隐含前置 op_type, request_key）| result 键集 |
 |---|---|---|
 | create_a1 | chat_id, session_locator | { created_id } |
 | create_b1 | chat_id, root_om, lineage_id, predetermined_target | { created_id } |
 | activate | b1_id, a1_id, matched_om | { surviving_id, tombstoned_id, demoted_historical_id\|null } |
 | void | b1_id, reason | { voided_id } |
-| attach_a2 / attach_a3 | topic_agent_id, target, claim_key | { affected_id, terminal_family } |
-| anchor | topic_agent_id, matched_om | { affected_id } |
+| attach_a2 / attach_a3 | topic_agent_id, target, claim_key, root_om\|null, matched_om\|null（无 F4 时两者 null；F4 时填）| { affected_id, terminal_family } |
+| anchor | topic_agent_id, root_om, matched_om | { affected_id } |
 | restore | topic_agent_id | { affected_id } |
 | unbind | topic_agent_id | { affected_id, terminal_family } |
-| retarget | lineage_id\|topic_agent_id, old_target, new_target | { affected_ids:[有序], unit:"record"\|"lineage", old_target, new_target }（明文，评审七 P2 可核验）|
-| seed | 规范投影摘要 | { seeded_ids:[有序] } |
-| initialize_shadow | endpoint_id | { revision:1 } |
+| retarget | topic_agent_id, old_target, new_target（**只取调用方字面 id 与 old/new target；lineage 是状态派生量，只进 result/affected，不进请求身份**，评审六 P1-1）| { affected_ids:[有序], unit:"record"\|"lineage", old_target, new_target } |
+| seed | candidates（**调用方给的全量候选集**，逐条 canonKey 后按串排序；不是 toInsert，评审六 P1-1）| { seeded_ids:[有序] } |
+| initialize_shadow | endpoint_id, chain | { revision:1 } |
 | authority_cutover | endpoint_id, bijection_digest | { revision_at_cutover } |
 
-fingerprint 只用于**重放同一请求判等**（op_type+fingerprint 双等，§5），不作授权；
-`result` 保证 create→归并后仍能按 op_id 找回创建 ID / 存活 ID（评审四 P1-2）。
+**重放/冲突判定（评审六 P1-1 / 七 P1-2）**：`request_key` **全局唯一**（G12），写端按 request_key 全局查——
+- 无同 key 的历史 op → 正常执行；**成功的空操作也落一笔 op 占用 request_key**（seed 全存在→写 `seeded_ids:[]` 的 seed op；不存在"成功但免写"的状态式 noop）。仅**失败**（bad_input / conflict / retarget `no_change` 等）不落 op、不占用 key；
+- 有同 key 且 **fingerprint 相等**（同请求重放）→ 返回原 `result` / `result_revision`，**不新增第二笔**；
+- 有同 key 但 **fingerprint 不等**（同 key 换了载荷，调用方 bug）→ `request_conflict`，拒，不写。
+
+**retarget 边界**：要求 `new_target ≠ 当前 target`（CAS 过后仍相等）→ `no_change` **拒**（失败、不落 op、不占用 request_key）——不是状态式成功 noop（评审七 P2）。
+
+fingerprint 只用于**同一 request_key 内判等**，不作授权；`result` 保证 create→归并后仍能按
+op_id 找回创建 ID / 存活 ID（评审四 P1-2）。
+（`initialize_shadow`/`authority_cutover` 属维护层入口，**第 1 块生产恒拒、正文已删**，只留恒拒外壳；
+其 request_key、virgin 盘点、§5.2 WAL、门内双射对账都由第 2 块维护层提供，且必须校验并使用调用方原
+request_key、不 fallback，评审六 P1-1。）
 
 **值域（评审五 P2，可直译校验器）**：`op_type` 与 `terminal_kind` 一一对应（表左列
 即对应关系，两者同名）；`terminal_family` **逐 op 精确值域**（评审六 P2）：`attach_a2`→仅 A2；`attach_a3`

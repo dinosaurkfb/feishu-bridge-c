@@ -27,6 +27,7 @@ import { AUTHORIZATION_TABLE, authorize, CAPABILITY, REPLY_ONLY_CAPABLE } from "
 import { SENDER_ROLES, roleCounts, roleCountsText, senderRole, senderRolesProblem, senderTable, roleEntriesProblem } from "./sender-roles.mjs";
 import { parseRegisterSenderArgs, planSenderChange, applySenderChange } from "./register-sender.mjs";
 import { parseRegisterP2pArgs, planP2pChange, applyP2pChange } from "./register-p2p-chat.mjs";
+import * as TAL from "./topic-agent-ledger.mjs";
 // symlink 锁：existsSync 会跟随到不存在的目标，锁在不在只能用 lstat 判
 const lockPresent = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
 import os from "node:os";
@@ -24302,6 +24303,350 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.equal(loadChannelSamples({ file: wf }).rows.length, before0, "受控失败不落半行（好行数不变）");
   } finally { fs.writeSync = realWriteSync; }
 });
+
+// ─────────────────────── 话题智能体账本（v2 第三步 M1 原语，topic-agent-ledger.mjs）───────────────────────
+{
+  const EP = legacyEndpointId({ runtime: "claude", agentUid: "agent_ledger_test" }); // 真 endpoint_<24hex>
+  const CH = "claude";
+  let _rk = 0; const rk = () => "req_" + String(++_rk).padStart(8, "0");
+  const rkAct = "req_activate01", rkRt = "req_retarget01", rkR = "req_createa1r";
+  const uuid = (n) => (String(n).repeat(8) + "-1111-1111-1111-111111111111").slice(0, 36);
+  const claim = (c = "a") => c.repeat(64);
+  const TGT = { runtime: "claude", project_root: "/Users/dk/p", claude_session_id: uuid(2) };
+  const F4 = (om = "om_hit") => ({ matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"] });
+  const F4A = (om = "om_hit", rootOm = "om_root") => ({ root_om: rootOm, matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"] });
+  const talOk = (r, m) => { assert.ok(r.ok, m + "：" + JSON.stringify(r)); return r; };
+  const talLoad = (dir) => { const l = TAL.loadLedger(dir, { endpointId: EP }); assert.ok(l.ok, "load：" + JSON.stringify(l)); return l.doc; };
+  const famIds = (doc, fam) => Object.entries(doc.records).filter(([, r]) => r.kind === "live" && TAL.familyOf(r.facts) === fam).map(([k]) => k);
+  const withRoot = (fn) => {
+    // realpath 掉 mkdtemp 结果：macOS 上 os.tmpdir() 落在 /var（→/private/var 符号链接）下，
+    // 而 resolveEndpointDir 现在要求配置根逐层规范化（评审六 P1-2）。
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tal-")));
+    const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = root;
+    const dir = path.join(root, EP);
+    try { return fn(root, dir); }
+    finally { if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved; fs.rmSync(root, { recursive: true, force: true }); }
+  };
+  // init/cutover 属维护层（第 2 块）、第 1 块生产恒拒；测试直接构造初始 shadow 账本以驱动普通事务。
+  const seedLedger = (dir) => {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const opId = "00000000-0000-0000-0000-000000000001";
+    const doc = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: CH, authority_mode: "shadow", revision: 1, operations: { [opId]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP, chain: CH }), result_revision: 1, result: { revision: 1 } } }, records: {} };
+    fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    assert.ok(TAL.loadLedger(dir, { endpointId: EP }).ok, "seed 出的初始账本自洽");
+  };
+
+  test("账本：init/cutover 是维护层入口，第 1 块生产恒拒（fail-closed）", () => withRoot((root, dir) => {
+    assert.equal(TAL.initializeShadow({ endpointId: EP, requestKey: rk(), chain: CH, capability: {} }).reason, "maintenance_capability_required", "init 恒拒");
+    seedLedger(dir);
+    assert.equal(TAL.authorityCutover({ endpointId: EP, requestKey: rk(), capability: {}, bijectionDigest: claim("a") }).reason, "maintenance_capability_required", "cutover 恒拒");
+  }));
+
+  test("账本：create-A1 / create-B1 并存；首次提交返回 result；absent/坏文件 fail-closed", () => withRoot((root, dir) => {
+    assert.equal(TAL.loadLedger(dir, { endpointId: EP }).reason, "absent", "absent fail-closed");
+    assert.equal(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", sessionId: "sess_u" }).reason, "absent", "未初始化→absent");
+    seedLedger(dir);
+    assert.equal(talLoad(dir).chain, "claude", "顶层 chain");
+    const rA = talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", sessionId: "sess_u" }), "A1");
+    assert.ok(rA.result && TAL.familyOf ? true : true);
+    assert.ok(rA.result && typeof rA.result.created_id === "string", "首次提交返回 result.created_id：" + JSON.stringify(rA));
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", rootOm: "om_b1", lineageId: "lin1", bindingTarget: TGT }), "B1");
+    assert.deepEqual([famIds(talLoad(dir), "A1").length, famIds(talLoad(dir), "B1").length], [1, 1], "并存");
+    assert.equal(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_other", sessionId: "sess_u" }).reason, "locator_exists", "不同请求复用 locator 拒（同 chat 同 session 会被前置重放判幂等，故用不同 chat）");
+    fs.writeFileSync(path.join(dir, "ledger.json"), "{ 坏", "utf-8");
+    assert.equal(TAL.loadLedger(dir, { endpointId: EP }).reason, "unreadable", "坏 JSON→unreadable");
+  }));
+
+  test("账本：同群多个独立 B1 都允许（G4 已退役）", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_same", rootOm: "om_1", lineageId: "linA", bindingTarget: { runtime: "claude", project_root: "/p/a", claude_session_id: uuid(3) } }), "B1#1");
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_same", rootOm: "om_2", lineageId: "linB", bindingTarget: { runtime: "claude", project_root: "/p/b", claude_session_id: uuid(4) } }), "B1#2");
+    assert.equal(famIds(talLoad(dir), "B1").length, 2, "同群两 B1");
+  }));
+
+  test("账本：归并 B1+A1→B3（别名并入、旧 current→B4、A1→tombstone）+ 消费 F4 + 幂等", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", sessionId: "sess_u1" }), "A1#1");
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", rootOm: "om_g1", lineageId: "lin1", bindingTarget: TGT }), "B1#1");
+    let doc = talLoad(dir);
+    talOk(TAL.activate({ endpointId: EP, requestKey: rk(), b1Id: famIds(doc, "B1")[0], a1Id: famIds(doc, "A1")[0], f4: F4("om_h1"), authorizedBy: "ou_o" }), "activate#1");
+    const gen1 = famIds(talLoad(dir), "B3")[0];
+    talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", sessionId: "sess_u2" }), "A1#2");
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", rootOm: "om_g2", lineageId: "lin1", bindingTarget: TGT }), "B1#2");
+    doc = talLoad(dir);
+    const b1b = famIds(doc, "B1")[0], a1b = famIds(doc, "A1")[0];
+    talOk(TAL.activate({ endpointId: EP, requestKey: rkAct, b1Id: b1b, a1Id: a1b, f4: F4("om_h2"), authorizedBy: "ou_o" }), "activate#2");
+    doc = talLoad(dir);
+    assert.equal(TAL.familyOf(doc.records[b1b].facts), "B3", "第二代→B3");
+    assert.equal(TAL.familyOf(doc.records[gen1].facts), "B4", "第一代→B4");
+    assert.equal(doc.records[a1b].kind, "forwarding_tombstone", "A1→tombstone");
+    assert.equal(doc.records[b1b].aliases.session_id, "sess_u2", "session 并入");
+    assert.equal(TAL.activate({ endpointId: EP, requestKey: rkAct, b1Id: b1b, a1Id: a1b, f4: F4("om_h2"), authorizedBy: "ou_o" }).idempotent, true, "同请求重放→幂等");
+    assert.equal(TAL.activate({ endpointId: EP, requestKey: rk(), b1Id: b1b, a1Id: a1b, f4: { matched_om: "om_x", matched_fields: ["chat_id"] }, authorizedBy: "o" }).reason, "already_merged", "非同请求→already_merged");
+  }));
+
+  test("账本：attach→A2 / attachF4 原子→A3 / anchor→A3 / A4 带证 reattach→A3 / A4 F4 root 冲突拒 / unbind / restore / retarget CAS / void", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_a", sessionId: "sess_a" }), "A1");
+    let a = famIds(talLoad(dir), "A1")[0];
+    talOk(TAL.attach({ endpointId: EP, requestKey: rk(), id: a, bindingTarget: TGT, claimKey: claim("a"), authorizedBy: "o" }), "attach");
+    assert.equal(TAL.familyOf(talLoad(dir).records[a].facts), "A2", "attach→A2");
+    talOk(TAL.anchor({ endpointId: EP, requestKey: rk(), id: a, f4: F4A("om_h2", "om_anc") }), "anchor");
+    assert.equal(TAL.familyOf(talLoad(dir).records[a].facts), "A3", "anchor→A3");
+    talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_f", sessionId: "sess_f" }), "A1 F4");
+    const af = famIds(talLoad(dir), "A1")[0];
+    talOk(TAL.attachF4({ endpointId: EP, requestKey: rk(), id: af, bindingTarget: { runtime: "claude", project_root: "/p/f", claude_session_id: uuid(5) }, claimKey: claim("f"), authorizedBy: "o", f4: F4A("om_hf", "om_rf") }), "attachF4");
+    assert.equal(TAL.familyOf(talLoad(dir).records[af].facts), "A3", "attachF4→A3");
+    talOk(TAL.unbind({ endpointId: EP, requestKey: rk(), id: af }), "unbind A3→A4");
+    assert.equal(TAL.familyOf(talLoad(dir).records[af].facts), "A4", "A3→A4");
+    // A4 带旧 root(om_rf)，F4 新 root(om_other) 冲突 → 拒
+    assert.equal(TAL.attachF4({ endpointId: EP, requestKey: rk(), id: af, bindingTarget: { runtime: "claude", project_root: "/p/f", claude_session_id: uuid(6) }, claimKey: claim("d"), authorizedBy: "o", f4: F4A("om_hg", "om_other") }).reason, "root_conflict", "A4 F4 root 冲突拒");
+    // 无 F4 attach A4（带证）→ 保留 link 进 A3
+    talOk(TAL.attach({ endpointId: EP, requestKey: rk(), id: af, bindingTarget: { runtime: "claude", project_root: "/p/f", claude_session_id: uuid(6) }, claimKey: claim("d"), authorizedBy: "o" }), "A4 reattach");
+    assert.equal(TAL.familyOf(talLoad(dir).records[af].facts), "A3", "A4 带证 reattach→A3");
+    // B3→B3'→restore→B3；retarget CAS
+    talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_b", sessionId: "sess_b" }), "A1 b");
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_b", rootOm: "om_bb", lineageId: "linR", bindingTarget: { runtime: "claude", project_root: "/p/r", claude_session_id: uuid(7) } }), "B1 b");
+    let doc = talLoad(dir);
+    const b1b = famIds(doc, "B1")[0], a1b = famIds(doc, "A1")[0];
+    talOk(TAL.activate({ endpointId: EP, requestKey: rk(), b1Id: b1b, a1Id: a1b, f4: F4("om_hb"), authorizedBy: "o" }), "activate b");
+    talOk(TAL.unbind({ endpointId: EP, requestKey: rk(), id: b1b }), "unbind B3→B3'");
+    assert.equal(TAL.familyOf(talLoad(dir).records[b1b].facts), "B3'", "B3→B3'");
+    talOk(TAL.restore({ endpointId: EP, requestKey: rk(), id: b1b }), "restore");
+    const cur = talLoad(dir).records[b1b].binding_target;
+    const nt = { runtime: "claude", project_root: "/p/r", claude_session_id: uuid(8) };
+    // CAS 不符 → 拒
+    assert.equal(TAL.retarget({ endpointId: EP, requestKey: rk(), id: b1b, expectedOldTarget: nt, newTarget: nt, authorizedBy: "o" }).reason, "cas_mismatch", "expectedOldTarget 不符→cas_mismatch");
+    talOk(TAL.retarget({ endpointId: EP, requestKey: rkRt, id: b1b, expectedOldTarget: cur, newTarget: nt, authorizedBy: "o" }), "retarget");
+    const rb = talLoad(dir).records[b1b];
+    assert.equal(rb.binding_target.claude_session_id, uuid(8), "target 换了");
+    assert.equal(rb.binding_proof.kind, "retarget", "proof=retarget");
+    assert.equal(TAL.retarget({ endpointId: EP, requestKey: rkRt, id: b1b, expectedOldTarget: cur, newTarget: nt, authorizedBy: "o" }).idempotent, true, "同 retarget 请求重放→幂等返回原 result");
+    assert.equal(TAL.retarget({ endpointId: EP, requestKey: rk(), id: b1b, expectedOldTarget: { runtime: "claude", project_root: "/other", claude_session_id: uuid(9) }, newTarget: { runtime: "claude", project_root: "/other", claude_session_id: uuid(1) }, authorizedBy: "o" }).reason, "cas_mismatch", "跨项目+CAS 不符拒");
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_c", rootOm: "om_c", lineageId: "linV", bindingTarget: { runtime: "claude", project_root: "/p/v", claude_session_id: uuid(1) } }), "B1 v");
+    const bv = famIds(talLoad(dir), "B1")[0];
+    talOk(TAL.voidPending({ endpointId: EP, requestKey: rk(), b1Id: bv, reason: "expired" }), "void");
+    assert.equal(talLoad(dir).records[bv].kind, "voided_audit", "B1→voided");
+  }));
+
+  test("账本：seed 幂等/冲突；指纹重放返回原 result；retarget 跨实体不误判", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    const iso = "2026-09-04T00:00:00.000Z";
+    const mkA1 = (id, sid) => ({ kind: "live", topic_agent_id: id, chat_id: "oc_g", aliases: { session_id: sid, root_om: null }, facts: { binding: "none", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" }, binding_target: null, binding_proof: null, locator_link_proof_ref: null, anchor_candidate: null, generation_lineage_id: null, origin_operation_id: "x", created_at: iso, updated_at: iso });
+    const id1 = "ta_" + "1".repeat(32);
+    talOk(TAL.seedRecords({ endpointId: EP, requestKey: rk(), candidates: [mkA1(id1, "sess_1")] }), "seed");
+    const allExist = TAL.seedRecords({ endpointId: EP, requestKey: rk(), candidates: [mkA1(id1, "sess_1")] });
+    assert.ok(allExist.ok && !allExist.idempotent, "seed 全存在(新 key)→落空 op 成功（占用 key，非免写幂等）：" + JSON.stringify(allExist));
+    assert.deepEqual(allExist.result.seeded_ids, [], "全存在→seeded_ids 为空");
+    assert.equal(TAL.seedRecords({ endpointId: EP, requestKey: rk(), candidates: [mkA1(id1, "sess_DIFF")] }).reason, "conflict", "投影不同→冲突");
+    const r1 = talOk(TAL.createA1({ endpointId: EP, requestKey: rkR, chatId: "oc_g", sessionId: "sess_r" }), "A1 replay");
+    const rev1 = talLoad(dir).revision;
+    const r2 = TAL.createA1({ endpointId: EP, requestKey: rkR, chatId: "oc_g", sessionId: "sess_r" });
+    assert.ok(r2.ok && r2.idempotent === true && r2.revision === r1.revision && r2.result.created_id === r1.result.created_id, "重放返回原 result+revision：" + JSON.stringify(r2));
+    assert.equal(talLoad(dir).revision, rev1, "重放不写");
+  }));
+
+  test("账本：校验器拒损坏（G2/G3/G5/G9链/G12 联合与计数/G13 精确/G14）", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", rootOm: "om_b1", lineageId: "lin1", bindingTarget: TGT }), "B1");
+    const base = talLoad(dir);
+    const corrupt = (m) => { const d = structuredClone(base); m(d); return TAL.validateLedger(d, { endpointId: EP }).reason; };
+    assert.equal(TAL.validateLedger(base, { endpointId: "endpoint_" + "0".repeat(24) }).reason, "ledger_corrupt", "G2");
+    assert.equal(corrupt((d) => { const src = Object.values(d.records)[0]; d.records["ta_" + "9".repeat(32)] = { ...structuredClone(src), topic_agent_id: "ta_" + "9".repeat(32) }; }), "ledger_corrupt", "G3 重复 locator");
+    assert.equal(corrupt((d) => { delete d.chain; }), "ledger_corrupt", "顶层缺 chain");
+    assert.equal(corrupt((d) => { d.chain = "nope"; }), "ledger_corrupt", "chain 越界");
+    // G12 计数：加一笔同 revision 的伪 op
+    assert.equal(corrupt((d) => { d.operations["11111111-1111-1111-1111-111111111111"] = { op_type: "create_a1", terminal_kind: "create_a1", fingerprint: "a".repeat(64), result_revision: d.revision, result: { created_id: "ta_" + "5".repeat(32) } }; }), "ledger_corrupt", "G12 多一笔 op（revision 重复/计数不符）");
+    assert.equal(corrupt((d) => { const op = Object.values(d.operations).find((o) => o.op_type === "create_b1"); op.result.created_id = ["ta_" + "5".repeat(32)]; }), "ledger_corrupt", "G12 result ID 数组强转被拒（typeof 守卫）");
+    assert.equal(corrupt((d) => { const rec = Object.values(d.records).find((r) => r.kind === "live"); d.operations[rec.origin_operation_id].result.created_id = "ta_" + "7".repeat(32); }), "ledger_corrupt", "G13 origin result 不指向本记录");
+    assert.equal(corrupt((d) => { const opId = Object.keys(d.operations)[0]; const live = Object.entries(d.records).find(([, r]) => r.kind === "live")[0]; const mf = ["chat_id", "sender", "body", "thread_root"]; d.records["ta_" + "a".repeat(32)] = { kind: "forwarding_tombstone", topic_agent_id: "ta_" + "a".repeat(32), forwards_to: "ta_" + "b".repeat(32), merged_at: "2026-09-04T00:00:00.000Z", proof_ref: { kind: "pairing", om: "om_x", matched_fields: mf }, origin_operation_id: opId }; d.records["ta_" + "b".repeat(32)] = { kind: "forwarding_tombstone", topic_agent_id: "ta_" + "b".repeat(32), forwards_to: live, merged_at: "2026-09-04T00:00:00.000Z", proof_ref: { kind: "pairing", om: "om_y", matched_fields: mf }, origin_operation_id: opId }; }), "ledger_corrupt", "G9 链");
+    // G14：构造 authoritative 但无 cutover
+    assert.equal(corrupt((d) => { d.authority_mode = "authoritative"; }), "ledger_corrupt", "G14 authoritative 无 cutover");
+  }));
+
+  test("账本：崩溃点四态（afterTmp not_committed+账本不变+报残留；提交点后异常 durability_uncertain；failDirFsync）", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    const sha0 = TAL.readLedger(dir).sha256;
+    const rc1 = TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", sessionId: "s1", _inject: { afterTmp: () => { throw new Error("crash"); } } });
+    assert.ok(!rc1.ok && rc1.commit === "not_committed" && Array.isArray(rc1.residue) && rc1.residue.length >= 1, "afterTmp→not_committed 且报残留 tmp：" + JSON.stringify(rc1));
+    assert.equal(TAL.readLedger(dir).sha256, sha0, "afterTmp 崩后账本不变");
+    const rc2 = TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", sessionId: "s2", _inject: { afterLedgerRename: () => { throw new Error("crash2"); } } });
+    assert.ok(rc2.ok && rc2.commit === "committed_durability_uncertain", "提交点后异常→已提交 durability_uncertain：" + JSON.stringify(rc2));
+    assert.notEqual(TAL.readLedger(dir).sha256, sha0, "已提交账本已变");
+    const r = TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", sessionId: "s4", _inject: { failDirFsync: true } });
+    assert.ok(r.ok && r.commit === "committed_durability_uncertain", "failDirFsync→durability_uncertain");
+  }));
+
+  test("账本：路径边界 + 门开零写", () => withRoot((root, dir) => {
+    assert.equal(TAL.createA1({ endpointId: "bad/slash", requestKey: rk(), chatId: "oc_g", sessionId: "s" }).reason, "bad_endpoint", "坏 endpoint 拒");
+    const real = fs.mkdtempSync(path.join(os.tmpdir(), "tal-real-"));
+    try { fs.symlinkSync(real, dir); assert.equal(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", sessionId: "s" }).reason, "dir_not_dir", "endpoint dir 符号链接拒"); }
+    finally { fs.rmSync(dir, { force: true }); fs.rmSync(real, { recursive: true, force: true }); }
+    seedLedger(dir);
+    const sha0 = TAL.readLedger(dir).sha256;
+    const gate = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "tal-gate-")), "maintenance.gate");
+    const savedGate = process.env.FEISHU_BRIDGE_MAINTENANCE_GATE;
+    process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = gate;
+    try {
+      fs.symlinkSync(JSON.stringify({ schema_version: "1.0", pid: process.pid, at: new Date().toISOString(), token: uuid(1), reason: "test" }), gate);
+      assert.equal(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", sessionId: "sess_u" }).reason, "maintenance", "门开→maintenance");
+      assert.equal(TAL.readLedger(dir).sha256, sha0, "门开零写");
+    } finally { if (savedGate === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; else process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = savedGate; fs.rmSync(path.dirname(gate), { recursive: true, force: true }); }
+  }));
+  test("账本：codex 链正路径（endpoint=codex，binding_target=codex task/thread）", () => {
+    const EPc = legacyEndpointId({ runtime: "codex", agentUid: "agent_codex_test" });
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tal-cx-")));
+    const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = root;
+    const dir = path.join(root, EPc);
+    try {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const opId = "00000000-0000-0000-0000-000000000001";
+      const doc = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EPc, chain: "codex", authority_mode: "shadow", revision: 1, operations: { [opId]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init_cx", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EPc, chain: "codex" }), result_revision: 1, result: { revision: 1 } } }, records: {} };
+      fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+      assert.ok(TAL.loadLedger(dir, { endpointId: EPc }).ok, "codex 初始账本自洽");
+      assert.ok(TAL.createA1({ endpointId: EPc, requestKey: "req_cx1", chatId: "oc_cx", sessionId: "sess_cx" }).ok, "codex createA1");
+      const a = Object.keys(TAL.loadLedger(dir, { endpointId: EPc }).doc.records)[0];
+      const cxTgt = { runtime: "codex", project_root: "/Users/dk/p", codex_task_id: "task_1", codex_thread_id: "thread_1" };
+      assert.ok(TAL.attach({ endpointId: EPc, requestKey: "req_cx2", id: a, bindingTarget: cxTgt, claimKey: "c".repeat(64), authorizedBy: "o" }).ok, "codex attach（codex target）");
+      const rec = TAL.loadLedger(dir, { endpointId: EPc }).doc.records[a];
+      assert.equal(rec.binding_target.runtime, "codex", "codex target 落对");
+      // 链不符：codex 账本放 claude target → would_corrupt（G11）
+      assert.ok(!TAL.createB1({ endpointId: EPc, requestKey: "req_cx3", chatId: "oc_cx2", rootOm: "om_cx", lineageId: "lc", bindingTarget: { runtime: "claude", project_root: "/p", claude_session_id: "11111111-1111-1111-1111-111111111111" } }).ok, "codex 账本放 claude target 拒（G11）");
+    } finally { if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved; fs.rmSync(root, { recursive: true, force: true }); }
+  });
+  test("账本：可重复动作往返各执行(request_key) + 同 key 异载荷冲突 + 数组 id 拒 + 精确权限", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    // 建 B3
+    talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", sessionId: "sess_u" }), "A1");
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", rootOm: "om_b1", lineageId: "lin1", bindingTarget: TGT }), "B1");
+    let doc = talLoad(dir);
+    const b = famIds(doc, "B1")[0], a = famIds(doc, "A1")[0];
+    talOk(TAL.activate({ endpointId: EP, requestKey: rk(), b1Id: b, a1Id: a, f4: F4("om_h1"), authorizedBy: "o" }), "activate");
+    // unbind → restore → 再 unbind：三个不同 request_key，各自执行（不被历史指纹误吞）
+    talOk(TAL.unbind({ endpointId: EP, requestKey: rk(), id: b }), "unbind#1");
+    assert.equal(TAL.familyOf(talLoad(dir).records[b].facts), "B3'", "unbind#1→B3'");
+    talOk(TAL.restore({ endpointId: EP, requestKey: rk(), id: b }), "restore");
+    assert.equal(TAL.familyOf(talLoad(dir).records[b].facts), "B3", "restore→B3");
+    talOk(TAL.unbind({ endpointId: EP, requestKey: rk(), id: b }), "unbind#2 仍执行");
+    assert.equal(TAL.familyOf(talLoad(dir).records[b].facts), "B3'", "unbind#2→B3'（未被误判重放）");
+    // 同 request_key 换载荷 → request_conflict
+    const k = "req_same_key_01";
+    talOk(TAL.createA1({ endpointId: EP, requestKey: k, chatId: "oc_k", sessionId: "sess_k1" }), "同 key 首次");
+    assert.equal(TAL.createA1({ endpointId: EP, requestKey: k, chatId: "oc_k", sessionId: "sess_k2" }).reason, "request_conflict", "同 key 异载荷→request_conflict");
+    assert.ok(TAL.createA1({ endpointId: EP, requestKey: k, chatId: "oc_k", sessionId: "sess_k1" }).idempotent, "同 key 同载荷→幂等");
+    // 数组 id → bad_id（不被 JS 属性强转绕过）
+    assert.equal(TAL.unbind({ endpointId: EP, requestKey: rk(), id: [b] }).reason, "bad_id", "数组 id→bad_id");
+    // 精确权限：文件 0644 → unreadable；0600 → ok
+    fs.chmodSync(path.join(dir, "ledger.json"), 0o644);
+    assert.equal(TAL.loadLedger(dir, { endpointId: EP }).reason, "unreadable", "0644 文件→unreadable");
+    fs.chmodSync(path.join(dir, "ledger.json"), 0o600);
+    assert.ok(TAL.loadLedger(dir, { endpointId: EP }).ok, "0600 文件→ok");
+    // 目录 0755 → 派生拒
+    fs.chmodSync(dir, 0o755);
+    assert.equal(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", sessionId: "sess_z" }).reason, "dir_perms", "0755 目录→dir_perms");
+    fs.chmodSync(dir, 0o700);
+  }));
+
+  test("账本：seed 同 request_key 重放返回原 seeded_ids（非状态式幂等）+ 换序仍幂等 + 同 key 异候选冲突", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    const iso = "2026-09-04T00:00:00.000Z";
+    const mkA1 = (id, sid) => ({ kind: "live", topic_agent_id: id, chat_id: "oc_g", aliases: { session_id: sid, root_om: null }, facts: { binding: "none", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" }, binding_target: null, binding_proof: null, locator_link_proof_ref: null, anchor_candidate: null, generation_lineage_id: null, origin_operation_id: "x", created_at: iso, updated_at: iso });
+    const idA = "ta_" + "a".repeat(32), idB = "ta_" + "b".repeat(32);
+    const K = "req_seed_same_01";
+    const first = talOk(TAL.seedRecords({ endpointId: EP, requestKey: K, candidates: [mkA1(idA, "sess_sa"), mkA1(idB, "sess_sb")] }), "seed 首次");
+    const revAfter = talLoad(dir).revision;
+    const again = TAL.seedRecords({ endpointId: EP, requestKey: K, candidates: [mkA1(idA, "sess_sa"), mkA1(idB, "sess_sb")] });
+    assert.ok(again.ok && again.idempotent === true, "同 key 同候选→幂等重放：" + JSON.stringify(again));
+    assert.deepEqual(again.result.seeded_ids, first.result.seeded_ids, "重放返回原 seeded_ids");
+    assert.equal(again.revision, first.revision, "重放返回原 revision");
+    assert.equal(talLoad(dir).revision, revAfter, "重放不写（revision 不变）");
+    const reordered = TAL.seedRecords({ endpointId: EP, requestKey: K, candidates: [mkA1(idB, "sess_sb"), mkA1(idA, "sess_sa")] });
+    assert.ok(reordered.ok && reordered.idempotent === true, "同 key 候选换序→仍幂等（集合规范化稳定）");
+    assert.equal(TAL.seedRecords({ endpointId: EP, requestKey: K, candidates: [mkA1(idA, "sess_DIFF")] }).reason, "request_conflict", "同 key 异候选→request_conflict");
+  }));
+
+  test("账本：retarget A→B→A 真往返（不同 request_key 各执行、target 每次翻转、不被历史指纹吞）", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_rt", sessionId: "sess_rt" }), "A1");
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_rt", rootOm: "om_rt", lineageId: "linrt", bindingTarget: TGT }), "B1");
+    let doc = talLoad(dir);
+    talOk(TAL.activate({ endpointId: EP, requestKey: rk(), b1Id: famIds(doc, "B1")[0], a1Id: famIds(doc, "A1")[0], f4: F4("om_rt1"), authorizedBy: "o" }), "activate");
+    const t = famIds(talLoad(dir), "B3")[0];
+    const A = TGT, B = { runtime: "claude", project_root: TGT.project_root, claude_session_id: uuid(9) };
+    const cur = () => TAL.loadLedger(dir, { endpointId: EP }).doc.records[t].binding_target.claude_session_id;
+    talOk(TAL.retarget({ endpointId: EP, requestKey: rk(), id: t, expectedOldTarget: A, newTarget: B, authorizedBy: "o" }), "A→B");
+    assert.equal(cur(), B.claude_session_id, "翻到 B");
+    talOk(TAL.retarget({ endpointId: EP, requestKey: rk(), id: t, expectedOldTarget: B, newTarget: A, authorizedBy: "o" }), "B→A");
+    assert.equal(cur(), A.claude_session_id, "翻回 A");
+    talOk(TAL.retarget({ endpointId: EP, requestKey: rk(), id: t, expectedOldTarget: A, newTarget: B, authorizedBy: "o" }), "A→B 再次（新 key）");
+    assert.equal(cur(), B.claude_session_id, "再翻到 B（往返成功，未被历史指纹吞）");
+    assert.equal(Object.values(talLoad(dir).operations).filter((o) => o.op_type === "retarget").length, 3, "三笔 retarget 各执行");
+    // 重放第一次 A→B 的 request_key：拿回原 result，不重复迁移
+    const firstKey = Object.values(talLoad(dir).operations).find((o) => o.op_type === "retarget").request_key;
+    const revNow = talLoad(dir).revision;
+    const replayed = TAL.retarget({ endpointId: EP, requestKey: firstKey, id: t, expectedOldTarget: A, newTarget: B, authorizedBy: "o" });
+    assert.ok(replayed.ok && replayed.idempotent === true, "原 request_key 重放→幂等：" + JSON.stringify(replayed));
+    assert.equal(talLoad(dir).revision, revNow, "重放不写");
+  }));
+
+  test("账本：父层符号链接根被拒（root_not_canonical，评审六 P1-2）", () => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tal-sym-")));
+    const external = path.join(base, "external"); fs.mkdirSync(path.join(external, "ledger"), { recursive: true, mode: 0o700 });
+    const aliasParent = path.join(base, "aliasp"); fs.symlinkSync(external, aliasParent);
+    try {
+      const viaAlias = TAL.resolveEndpointDir(EP, { env: { FEISHU_BRIDGE_LEDGER_DIR: path.join(aliasParent, "ledger") }, mustExistRoot: true });
+      assert.equal(viaAlias.reason, "root_not_canonical", "父层别名→root_not_canonical：" + JSON.stringify(viaAlias));
+      const viaReal = TAL.resolveEndpointDir(EP, { env: { FEISHU_BRIDGE_LEDGER_DIR: path.join(external, "ledger") }, mustExistRoot: true });
+      assert.ok(viaReal.ok, "规范根放行：" + JSON.stringify(viaReal));
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  });
+
+  test("账本：暂停的 current(B3′) 被新代际接管→旧记录成合法 B4、新记录 B3、demoted 正确（评审七 P1-1）", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    const L = "lin_rot";
+    talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_rot", sessionId: "sess_g1" }), "A1#1");
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_rot", rootOm: "om_r1", lineageId: L, bindingTarget: TGT }), "B1#1");
+    let doc = talLoad(dir);
+    talOk(TAL.activate({ endpointId: EP, requestKey: rk(), b1Id: famIds(doc, "B1")[0], a1Id: famIds(doc, "A1")[0], f4: F4("om_h1"), authorizedBy: "o" }), "activate#1");
+    const gen1 = famIds(talLoad(dir), "B3")[0];
+    talOk(TAL.unbind({ endpointId: EP, requestKey: rk(), id: gen1 }), "unbind→B3′");
+    assert.equal(TAL.familyOf(talLoad(dir).records[gen1].facts), "B3'", "gen1 暂停为 B3′");
+    talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_rot", sessionId: "sess_g2" }), "A1#2");
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_rot", rootOm: "om_r2", lineageId: L, bindingTarget: TGT }), "B1#2（同 lineage rotate）");
+    doc = talLoad(dir);
+    const b2 = famIds(doc, "B1")[0], a2 = famIds(doc, "A1")[0];
+    const act2 = talOk(TAL.activate({ endpointId: EP, requestKey: rk(), b1Id: b2, a1Id: a2, f4: F4("om_h2"), authorizedBy: "o" }), "activate#2");
+    assert.equal(TAL.familyOf(talLoad(dir).records[gen1].facts), "B4", "旧 B3′→合法 B4（非 dormant+historical）");
+    assert.equal(TAL.familyOf(talLoad(dir).records[b2].facts), "B3", "新代际 B3");
+    assert.equal(act2.result.demoted_historical_id, gen1, "demoted_historical_id 指向旧代际");
+  }));
+
+  test("账本：seed 成功空 op 占用 request_key→同 key 换候选冲突（评审七 P1-2）", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    const iso2 = "2026-09-04T00:00:00.000Z";
+    const mk = (id, sid) => ({ kind: "live", topic_agent_id: id, chat_id: "oc_g", aliases: { session_id: sid, root_om: null }, facts: { binding: "none", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" }, binding_target: null, binding_proof: null, locator_link_proof_ref: null, anchor_candidate: null, generation_lineage_id: null, origin_operation_id: "x", created_at: iso2, updated_at: iso2 });
+    const idX = "ta_" + "e".repeat(32), idY = "ta_" + "f".repeat(32);
+    talOk(TAL.seedRecords({ endpointId: EP, requestKey: rk(), candidates: [mk(idX, "sess_x")] }), "seed X");
+    const K = "req_seed_noop_key";
+    const noop = TAL.seedRecords({ endpointId: EP, requestKey: K, candidates: [mk(idX, "sess_x")] });
+    assert.ok(noop.ok && !noop.idempotent && noop.result.seeded_ids.length === 0, "全存在→落空 op 占用 K：" + JSON.stringify(noop));
+    assert.equal(TAL.seedRecords({ endpointId: EP, requestKey: K, candidates: [mk(idY, "sess_y")] }).reason, "request_conflict", "同 K 换候选→request_conflict");
+  }));
+
+  test("账本：now:NaN→bad_time；循环候选→bad_candidate（入口不裸抛，评审七 P1-3）", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    assert.equal(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", sessionId: "sess_t", now: NaN }).reason, "bad_time", "createA1 now:NaN→bad_time");
+    assert.equal(TAL.retarget({ endpointId: EP, requestKey: rk(), id: "ta_" + "1".repeat(32), expectedOldTarget: TGT, newTarget: TGT, authorizedBy: "o", now: NaN }).reason, "bad_time", "retarget now:NaN→bad_time");
+    // Date 可表示但超出四位年份规范范围（now=2.6e14→六位年份），toISOString 不抛，但非规范 ISO：入口须报 bad_time（评审八 P2）
+    const shaBefore = TAL.sha256(fs.readFileSync(path.join(dir, "ledger.json")));
+    assert.equal(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", sessionId: "sess_ov", now: 2.6e14 }).reason, "bad_time", "六位年份 now→bad_time（非 would_corrupt）");
+    const shaAfter = TAL.sha256(fs.readFileSync(path.join(dir, "ledger.json")));
+    assert.equal(shaAfter, shaBefore, "越界时间被入口拦下，账本 SHA 不变（未取锁写盘）");
+    const cyc = { topic_agent_id: "ta_" + "9".repeat(32) }; cyc.self = cyc;
+    assert.equal(TAL.seedRecords({ endpointId: EP, requestKey: rk(), candidates: [cyc] }).reason, "bad_candidate", "循环候选→bad_candidate");
+  }));
+}
 
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

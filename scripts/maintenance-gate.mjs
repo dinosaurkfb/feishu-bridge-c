@@ -83,6 +83,8 @@ function runMaintenanceGateLocked(parsed, c, out, surface) {
   const leak = r.leaseUncleared ?? r.leaseRelease ?? null;
   const residue = leak ? "\n租约交不还：" + leak.path + "（" + leak.why + "）—— 请人工核对" : "";
   if (r.ok && r.activeCleared && !leak) { out("已出门：阶段 " + r.phase + "，active 已清"); return 0; }
+  // P2-1：终态已写 + active/门已清，只剩锁残骸 → 业务收口已完成，不许说“门与账保留、再跑 --exit”。
+  if (r.ok && r.activeCleared) { out("业务收口已完成、锁残骸未清：阶段 " + String(r.phase) + "、active 已清" + residue + "\n只清锁残骸即可，无需再跑 --exit --apply。"); return 3; }
   out("出门没做完：阶段 " + String(r.phase) + (r.activeCleared === false ? "（active 未清" + (r.activeWhy ? "：" + r.activeWhy : "") + "）" : "") + "\n" + (r.incomplete ?? []).map((i) => "  · " + i.id + "：" + i.why).join("\n") + residue + "\n门与账保留，处置后再跑 --exit --apply 只向前继续。"); return 3;
 }
 

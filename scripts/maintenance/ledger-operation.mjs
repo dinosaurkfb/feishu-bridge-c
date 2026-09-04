@@ -292,7 +292,9 @@ export function ledgerEnter(ctx, { kind, endpointId, chain, waitMs = 60000, appl
   if (out.ok === false && out.rollbackSafe === true) {
     // 前置条件失败（如 reconciler_absent：账本步未准备、未写盘）→ 回退清场（桩/current/门/active 与进入前一致），不留下维护态
     const rb = rollbackOperation(ctx, ent.token, ent.lease);
-    rollbackResult = { ok: rb.phase === "rolled_back", phase: rb.phase ?? null, why: rb.why ?? null };
+    // P1-1：保留完整 rb（含 ok/activeCleared/incomplete）——只用 phase 重建会把“回退已到 rolled_back 但 active 没清掉”
+    // 二次判定成成功（exit 1 + “已按账回退还清”），active 其实还留着。只有 rb.ok===true ∧ activeCleared===true 才算回退做完。
+    rollbackResult = rb;
   }
   const leaseRel = releaseOperationLease(ent.lease);
   const surfaceRel = releaseSurface(surface);

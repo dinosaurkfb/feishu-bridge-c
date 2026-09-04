@@ -91,10 +91,14 @@ export function renderLedgerStatus(st) {
 const fmtFail = (r) => String(r.reason) + (r.why ? "：" + r.why : "") + (r.path ? "，" + r.path : "");
 // P2：释放残骸要逐项列出（旧码 leaseRelease ?? surfaceRelease 只显示第一项，第二处残骸被吞）——
 // exitCodeFor 仍按“任一存在即 3”判断，这里只负责把每处残骸都写进输出。
+// P2-2：还把账本主锁 lockUncleared（ledger-operation 的写残骸投影）与 tmp/durability residue 逐项列出，不许吞。
 const releaseRows = (r) => {
   const rows = [];
-  if (r.leaseRelease) rows.push("租约交不还：" + r.leaseRelease.path + "（" + r.leaseRelease.why + "）");
-  if (r.surfaceRelease) rows.push("安装面锁交不还：" + r.surfaceRelease.path + "（" + r.surfaceRelease.why + "）");
+  const whyOf = (x) => String(x?.why ?? x?.reason ?? "");
+  if (r.leaseRelease) rows.push("租约交不还：" + r.leaseRelease.path + "（" + whyOf(r.leaseRelease) + "）");
+  if (r.surfaceRelease) rows.push("安装面锁交不还：" + r.surfaceRelease.path + "（" + whyOf(r.surfaceRelease) + "）");
+  if (r.lockUncleared) rows.push("账本主锁交不还：" + r.lockUncleared.path + "（" + whyOf(r.lockUncleared) + "）");
+  for (const p of r.residue ?? []) rows.push("写后残骸：" + p);
   return rows;
 };
 

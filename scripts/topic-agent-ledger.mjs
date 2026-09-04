@@ -607,9 +607,14 @@ function writeLedger({ dir, endpointId, gated, requestKey = null, replay = null,
   }
 }
 
-/** 释放锁，把结果收成 { ok, reason }，不抛。 */
+/** 释放锁，把结果收成 { ok, reason }，不抛。
+ *  P2-2：非干净释放（not_owner / exception / busy）仍要带上**账本锁路径**——不然 lockUncleared.path 拿到 null，
+ *  维护 CLI 只报“交不还”却说不出是哪儿。干净释放（okk / absent）保持原样。 */
 function safeRelease(lockDir) {
-  try { return releasePublishLock(lockDir); } catch (err) { return { ok: false, reason: "release_exception", why: String(err?.message ?? err) }; }
+  let r;
+  try { r = releasePublishLock(lockDir); } catch (err) { r = { ok: false, reason: "release_exception", why: String(err?.message ?? err) }; }
+  if (r.ok !== true && r.path == null) r = { ...r, path: lockDir };
+  return r;
 }
 
 /** 把释放结果折进四态（评审 P1-5）：只有**干净释放**才不折——absent（持有期锁消失）/not_owner/reapUncleared/异常都折成残骸；已提交则 with_residue/lock_state_unclear，不谎报 clean。 */
@@ -862,7 +867,9 @@ export function initializeShadow({ endpointId, capability, requestKey, chain, en
   const reread = readLedger(d.dir);
   if (reread.status !== "read" || reread.sha256 !== plan.sha256) return { ok: false, commit: res.commit, reason: "written_mismatch", why: "落盘 SHA 与蓝图不符" };
 
-  return { ok: true, commit: res.commit, revision: 1, result: res.result, sha256: plan.sha256, plan };
+  // P2-2：写提交即便成功，释放残骸/写后残骸也要**透传**——否则 ledger-operation 的 commit_residue 分支
+  // 拿到的 wr.lockUncleared/residue 是 null，releaseRows 点名不出账本主锁路径。
+  return { ok: true, commit: res.commit, revision: 1, result: res.result, sha256: plan.sha256, plan, lockUncleared: res?.lockUncleared ?? null, residue: res?.residue ?? null };
 }
 
 /** authority_cutover（§5/§8）：shadow→authoritative 同一不可逆提交；前置 = 门内双射对账通过（fail-closed）+ G14 无已切权威。 */
@@ -909,7 +916,8 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
   if (res.result?.revision_at_cutover !== plan.intendedAfter.revision) return { ok: false, commit: res.commit, reason: "written_refused", why: "写回 revision 与蓝图不符" };
   const reread = readLedger(d.dir);
   if (reread.status !== "read" || reread.sha256 !== plan.sha256) return { ok: false, commit: res.commit, reason: "written_mismatch", why: "落盘 SHA 与蓝图不符" };
-  return { ok: true, commit: res.commit, revision: plan.intendedAfter.revision, result: res.result, sha256: plan.sha256, plan };
+  // P2-2：同上，把 lockUncleared/residue 透传，cutover 的 commit_residue 分支也能点名账本主锁。
+  return { ok: true, commit: res.commit, revision: plan.intendedAfter.revision, result: res.result, sha256: plan.sha256, plan, lockUncleared: res?.lockUncleared ?? null, residue: res?.residue ?? null };
 }
 
 /* ─────────────────────────── 普通（gated）事务 ─────────────────────────── */

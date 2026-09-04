@@ -51,7 +51,9 @@ const REQUEST_KEY_SHAPE = /^[A-Za-z0-9_.:@+-]{1,256}$/u; // 外部请求身份�
 const AUTHORIZED_BY_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u; // 授权者 sender id（有界、无控制字符，评审六 P2）
 const REASON_ENUM = ["expired", "superseded", "manual"];
 const MATCHED_FIELDS = ["chat_id", "sender", "body", "thread_root"];
-const OP_TYPES = ["initialize_shadow", "create_a1", "create_b1", "seed", "activate", "void", "attach_a2", "attach_a3", "anchor", "restore", "unbind", "retarget", "authority_cutover"];
+const OP_TYPES = ["initialize_shadow", "create_a1", "create_b1", "seed", "activate", "void", "attach_a2", "attach_a3", "anchor", "restore", "unbind", "retarget", "authority_cutover", "migrate_seed", "migrate_repair"];
+// migrate_repair 的 from_family / to_family 值域（§5.1 判别联合：B1→B1；{B3,B3',B4}→{B3,B3',B4}）
+const MIGRATE_FAMILIES = ["B1", "B3", "B3'", "B4"];
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const keysOf = (o) => Object.keys(o).sort().join(",");
@@ -169,12 +171,22 @@ const bindingProofProblem = (p) => {
   } else if (p.kind === "retarget") {
     if (keysOf(p) !== "authorized_at,authorized_by,kind,new_target,old_target") return "retarget proof 字段集不对";
     if (targetProblem(p.old_target) || targetProblem(p.new_target)) return "retarget old/new_target 形状不对";
-  } else return "binding_proof.kind 不在 {attach,pairing,retarget}";
+  } else if (p.kind === "migrated") {
+    if (keysOf(p) !== "authorized_at,authorized_by,kind,legacy_source_digest,migration_operation_id") return "migrated proof 字段集不对";
+    if (typeof p.migration_operation_id !== "string" || !OP_ID_SHAPE.test(p.migration_operation_id)) return "migrated.migration_operation_id 形状不对";
+    if (typeof p.legacy_source_digest !== "string" || !SHA_SHAPE.test(p.legacy_source_digest)) return "migrated.legacy_source_digest 形状不对";
+  } else return "binding_proof.kind 不在 {attach,pairing,retarget,migrated}";
   return null;
 };
 
 const linkProofProblem = (r) => {
   if (!isObj(r)) return "locator_link_proof_ref 不是对象";
+  if (r.kind === "migrated") {
+    if (keysOf(r) !== "kind,legacy_source_digest,migration_operation_id") return "link migrated 字段集不对";
+    if (typeof r.migration_operation_id !== "string" || !OP_ID_SHAPE.test(r.migration_operation_id)) return "link migrated.migration_operation_id 形状不对";
+    if (typeof r.legacy_source_digest !== "string" || !SHA_SHAPE.test(r.legacy_source_digest)) return "link migrated.legacy_source_digest 形状不对";
+    return null;
+  }
   if (keysOf(r) !== "by_identity,kind,matched_at,matched_fields,matched_om") return "link proof 字段集不对";
   if (r.kind !== "pairing_merge" && r.kind !== "f4_anchor") return "link proof.kind 不对";
   if (typeof r.matched_om !== "string" || !OM_SHAPE.test(r.matched_om)) return "link matched_om 形状不对";
@@ -211,15 +223,15 @@ export function liveProblem(rec, id) {
     const bp = bindingProofProblem(rec.binding_proof); if (bp) return bp;
     const kind = rec.binding_proof.kind;
     const okKind = (fam === "A2" || fam === "A3") ? (kind === "attach" || kind === "retarget")
-      : (fam === "B3" || fam === "B3'" || fam === "B4") ? (kind === "pairing" || kind === "retarget")
-        : (fam === "A4") ? (kind === "attach" || kind === "pairing" || kind === "retarget") : false;
+      : (fam === "B3" || fam === "B3'" || fam === "B4") ? (kind === "pairing" || kind === "retarget" || kind === "migrated")
+        : (fam === "A4") ? (kind === "attach" || kind === "pairing" || kind === "retarget" || kind === "migrated") : false;
     if (!okKind) return "binding_proof.kind 与族不匹配";
   }
   if ((f.locator_link_proof === "present") !== (rec.locator_link_proof_ref !== null)) return "locator_link_proof 与 ref 不一致";
   if (rec.locator_link_proof_ref !== null) {
     if (!(f.session === "present" && f.anchor === "present")) return "link=present 必须 session∧anchor present";
     const lp = linkProofProblem(rec.locator_link_proof_ref); if (lp) return lp;
-    if ((fam === "B3" || fam === "B3'" || fam === "B4") && rec.locator_link_proof_ref.kind !== "pairing_merge") return "B3/B3'/B4 的 link 必须 pairing_merge";
+    if ((fam === "B3" || fam === "B3'" || fam === "B4") && rec.locator_link_proof_ref.kind !== "pairing_merge" && rec.locator_link_proof_ref.kind !== "migrated") return "B3/B3'/B4 的 link 必须 pairing_merge/migrated";
   }
   const genNotNa = f.generation !== "n/a";
   if (genNotNa !== (rec.generation_lineage_id !== null)) return "generation≠n/a ⇔ lineage_id≠null 不成立";
@@ -285,6 +297,8 @@ const RESULT_SHAPE = Object.freeze({
   restore: (r) => keysOf(r) === "affected_id" && isId(r.affected_id),
   unbind: (r) => keysOf(r) === "affected_id,terminal_family" && isId(r.affected_id) && (r.terminal_family === "A4" || r.terminal_family === "B3'"),
   retarget: (r) => keysOf(r) === "affected_ids,new_target,old_target,unit" && idArrayOk(r.affected_ids) && (r.unit === "record" || r.unit === "lineage") && !targetProblem(r.old_target) && !targetProblem(r.new_target) && canonKey(r.old_target) !== canonKey(r.new_target),
+  migrate_seed: (r) => keysOf(r) === "authorized_at,authorized_by,seeded" && typeof r.authorized_by === "string" && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at) && Array.isArray(r.seeded) && r.seeded.every((s) => isObj(s) && isId(s.topic_agent_id) && typeof s.legacy_source_digest === "string" && SHA_SHAPE.test(s.legacy_source_digest)) && r.seeded.every((s, i) => i === 0 || r.seeded[i - 1].topic_agent_id < s.topic_agent_id),
+  migrate_repair: (r) => keysOf(r) === "authorized_at,authorized_by,expected_projection_digest,from_family,legacy_source_digest,next_projection_digest,repaired_id,to_family" && isId(r.repaired_id) && typeof r.authorized_by === "string" && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at) && [r.expected_projection_digest, r.next_projection_digest, r.legacy_source_digest].every((s) => typeof s === "string" && SHA_SHAPE.test(s)) && MIGRATE_FAMILIES.includes(r.from_family) && MIGRATE_FAMILIES.includes(r.to_family) && (r.from_family === "B1" ? r.to_family === "B1" : r.to_family !== "B1"),
   authority_cutover: (r) => keysOf(r) === "revision_at_cutover" && Number.isInteger(r.revision_at_cutover) && r.revision_at_cutover >= 1,
 });
 
@@ -325,6 +339,31 @@ function opConsistentWithRecord(op, id, rec) {
       if (canonKey(rec.binding_target) !== canonKey(r.new_target)) return false; // 当前 target 必等 result.new_target
       if (rec.facts.binding === "pending") return rec.binding_proof === null; // B1：proof 仍 null
       return rec.binding_proof !== null && rec.binding_proof.kind === "retarget" && canonKey(rec.binding_proof.new_target) === canonKey(r.new_target) && canonKey(rec.binding_proof.old_target) === canonKey(r.old_target);
+    }
+    case "migrate_seed": {
+      if (rec.kind !== "live" || !r.seeded.some((s) => s.topic_agent_id === id)) return false;
+      // B1：proof 全 null；B3/B3'/B4：migrated 双证引用本笔 seed op，同 op 同 digest，且与 result.seeded 逐字匹配
+      if (fam === "B1") return rec.binding_proof === null && rec.locator_link_proof_ref === null;
+      if (fam !== "B3" && fam !== "B3'" && fam !== "B4") return false;
+      if (rec.binding_proof?.kind !== "migrated" || rec.locator_link_proof_ref?.kind !== "migrated") return false;
+      const bp = rec.binding_proof, lp = rec.locator_link_proof_ref;
+      const opId = rec.origin_operation_id;
+      if (bp.migration_operation_id !== opId || lp.migration_operation_id !== opId) return false;
+      if (bp.legacy_source_digest !== lp.legacy_source_digest) return false;
+      const seed = r.seeded.find((s) => s.topic_agent_id === id);
+      if (!seed || seed.legacy_source_digest !== bp.legacy_source_digest) return false;
+      return bp.authorized_by === r.authorized_by && bp.authorized_at === r.authorized_at;
+    }
+    case "migrate_repair": {
+      if (rec.kind !== "live" || r.repaired_id !== id || fam !== r.to_family) return false;
+      if (fam === "B1") return rec.binding_proof === null && rec.locator_link_proof_ref === null;
+      if (fam !== "B3" && fam !== "B3'" && fam !== "B4") return false;
+      if (rec.binding_proof?.kind !== "migrated" || rec.locator_link_proof_ref?.kind !== "migrated") return false;
+      const bp = rec.binding_proof, lp = rec.locator_link_proof_ref;
+      const opId = rec.origin_operation_id;
+      if (bp.migration_operation_id !== opId || lp.migration_operation_id !== opId) return false;
+      if (bp.legacy_source_digest !== lp.legacy_source_digest || r.legacy_source_digest !== bp.legacy_source_digest) return false;
+      return bp.authorized_by === r.authorized_by && bp.authorized_at === r.authorized_at;
     }
     default: return false;
   }
@@ -385,6 +424,36 @@ export function validateLedger(doc, { endpointId } = {}) {
     }
   }
   if (liveCount > MAX_LIVE) return bad("live 记录超上限");
+
+  // G13-mig / G13-repair（§5.1 唯一权威）：任一 migrated proof ⇒ 交叉不变量。
+  //   G13-mig：migration_operation_id 指向 op_type∈{migrate_seed,migrate_repair} 的存在 op；seed 的 result.seeded 含本 id 且 digest 逐字相等
+  //   （repair 则 result.repaired_id===本 id 且 digest 逐字相等）；binding migrated 的 authorized_by/at 必与 op result 逐字相等；
+  //   link 与 binding 的 migrated 引用同一 op 与同一 digest。
+  //   G13-repair：origin 指向 repair ⇒ ① 现投影 digest 重算===result.next；② 指纹与 result 两投影 digest 重算一致；③ repaired_id===id。
+  for (const [id, rec] of live) {
+    const bp = rec.binding_proof, lp = rec.locator_link_proof_ref;
+    const hasMigB = bp?.kind === "migrated";
+    const hasMigL = lp?.kind === "migrated";
+    if (!hasMigB && !hasMigL) continue;
+    const migOpId = hasMigB ? bp.migration_operation_id : lp.migration_operation_id;
+    if (hasMigB && hasMigL && (bp.migration_operation_id !== lp.migration_operation_id || bp.legacy_source_digest !== lp.legacy_source_digest)) return bad(id + "：binding 与 link 的 migrated 引用不同 op/不同 digest（G13-mig）");
+    const mop = doc.operations[migOpId];
+    if (!mop) return bad(id + "：migration_operation_id 不在 operations（G13-mig）");
+    if (mop.op_type !== "migrate_seed" && mop.op_type !== "migrate_repair") return bad(id + "：migration_operation_id 指向非 migrate 交易（G13-mig）");
+    const digest = hasMigB ? bp.legacy_source_digest : lp.legacy_source_digest;
+    const mr = mop.result;
+    if (mop.op_type === "migrate_seed") {
+      const seed = mr.seeded.find((s) => s.topic_agent_id === id);
+      if (!seed || seed.legacy_source_digest !== digest) return bad(id + "：migrate_seed 的 result.seeded digest 与 proof 不一致（G13-mig）");
+    } else {
+      if (mr.repaired_id !== id || mr.legacy_source_digest !== digest) return bad(id + "：migrate_repair 的 result digest 与 proof 不一致（G13-mig）");
+    }
+    if (hasMigB && (bp.authorized_by !== mr.authorized_by || bp.authorized_at !== mr.authorized_at)) return bad(id + "：binding migrated 授权与 op result 不一致（G13-mig）");
+    if (rec.origin_operation_id === migOpId && mop.op_type === "migrate_repair") {
+      if (migrateProjectionDigest(rec) !== mr.next_projection_digest) return bad(id + "：repair 后投影 digest 与 result.next 不一致（G13-repair）");
+      if (fingerprintOf("migrate_repair", { request_key: mop.request_key, topic_agent_id: id, expected_projection_digest: mr.expected_projection_digest, next_projection_digest: mr.next_projection_digest }) !== mop.fingerprint) return bad(id + "：repair 指纹与 result 两投影 digest 不一致（G13-repair）");
+    }
+  }
 
   // G9：tombstone 直指存活 live（**一跳**，不允许链）
   for (const [id, rec] of Object.entries(doc.records)) {
@@ -821,6 +890,11 @@ const liveBase = (id, chatId, iso, opId) => ({
 });
 const liveLocatorInUse = (doc, loc) => loc != null && Object.values(doc.records).some((r) => r.kind === "live" && (r.aliases.session_id === loc || r.aliases.root_om === loc));
 const projectionOf = (rec) => { const { origin_operation_id, created_at, updated_at, ...rest } = rec; void origin_operation_id; void created_at; void updated_at; return canonKey(rest); };
+// §6 的 C 记录（proof 不进双射比较）：migrate_seed 的“已存在”判定与 migrate_repair 的投影摘要都以此为准——
+// proof 是来源证明，会嵌 opId 且不进双射；用 C 记录让投影摘要确定性派生，不依赖随机 opId。
+const cRecordOf = (rec) => ({ topic_agent_id: rec.topic_agent_id, chat_id: rec.chat_id, aliases: rec.aliases, facts: rec.facts, generation_lineage_id: rec.generation_lineage_id, binding_target: rec.binding_target });
+export const cRecordKey = (rec) => canonKey(cRecordOf(rec));
+export const migrateProjectionDigest = (rec) => sha256(Buffer.from(cRecordKey(rec), "utf-8"));
 const badTx = (d) => ({ ok: false, commit: "not_committed", reason: d.reason, why: d.why });
 /** 写回残骸投影（P2-2 第 5 轮）：成功与失败出口**都要**透传 writeLedger 的 lockUncleared / residue，
  *  否则 ledger-operation 的 commit_residue 分支 sees null，releaseRows 点不出账本主锁路径。 */
@@ -1200,6 +1274,109 @@ export function retarget({ endpointId, requestKey, id, expectedOldTarget, newTar
       const proof = { kind: "retarget", authorized_by: authorizedBy, authorized_at: iso, old_target: oldTarget, new_target: newTarget };
       return { ok: true, next: stampAndBuild(doc, { opType: "retarget", inputs: reqInputs, result: { affected_ids: [...affected].sort(), unit: lineage === null ? "record" : "lineage", old_target: oldTarget, new_target: newTarget }, mutateRecords: (n, opId) => {
         for (const k of affected) { const r = n.records[k]; r.binding_target = newTarget; r.updated_at = iso; r.origin_operation_id = opId; if (r.facts.binding === "pending") continue; r.binding_proof = { ...proof }; }
+      } }) };
+    },
+  });
+}
+
+/** migrate_seed（§3.1，gated、仅 shadow）：把 legacy 证据迁成 B 族（B1：proof 全 null；B3/B3'/B4：migrated 双证引用本笔 seed op）。
+ *  fingerprint = { request_key, candidates: 逐条 legacy 证据元组 canonKey 排序 }（与账本当前状态无关，评审六 P1-1）。
+ *  result = { authorized_by, authorized_at, seeded: [按 id 严格升序的 {topic_agent_id, legacy_source_digest}] }。
+ *  同 id 已存在但 C 投影（不含 proof）不同 → conflict；已存在且 C 投影相同 → 跳过（同 key 幂等）；A 族不从 legacy 迁 → migrate_scope。 */
+export function migrateSeed({ endpointId, requestKey, candidates, authorizedBy, now = Date.now(), env = process.env, _inject } = {}) {
+  const iso = isoOrNull(now); if (iso === null) return BAD_TIME;
+  let reqInputs;
+  try { reqInputs = { request_key: requestKey, candidates: Array.isArray(candidates) ? candidates.map(canonKey).sort() : candidates }; }
+  catch { return { ok: false, commit: "not_committed", reason: "bad_candidate" }; }
+  return gatedTx({
+    endpointId, requestKey, env, _inject, replay: () => [{ opType: "migrate_seed", inputs: reqInputs }],
+    mutate: (doc) => {
+      if (doc === null) return { ok: false, reason: "absent" };
+      if (!Array.isArray(candidates) || candidates.length === 0) return { ok: false, reason: "bad_input" };
+      if (doc.authority_mode !== "shadow") return { ok: false, reason: "not_shadow" };
+      if (typeof authorizedBy !== "string" || !AUTHORIZED_BY_SHAPE.test(authorizedBy)) return { ok: false, reason: "bad_input" };
+      const locatorOwner = new Map();
+      for (const [id, r] of Object.entries(doc.records)) { if (r.kind !== "live") continue; for (const loc of [r.aliases.session_id, r.aliases.root_om]) if (typeof loc === "string" && loc) locatorOwner.set(loc, id); }
+      const toInsert = [];
+      for (const cand of candidates) {
+        if (!isObj(cand) || typeof cand.topic_agent_id !== "string" || !isId(cand.topic_agent_id)) return { ok: false, reason: "bad_candidate", why: "id" };
+        const id = cand.topic_agent_id;
+        const legacyDigest = cand.legacy_source_digest;
+        if (typeof legacyDigest !== "string" || !SHA_SHAPE.test(legacyDigest)) return { ok: false, reason: "bad_candidate", why: id + "：缺合法 legacy_source_digest" };
+        const fam = familyOf(cand.facts);
+        if (fam === null) return { ok: false, reason: "bad_candidate", why: id + "：facts 不构成合法族" };
+        if (fam === "A1" || fam === "A2" || fam === "A3" || fam === "A4") return { ok: false, reason: "migrate_scope", why: "migrate_seed 只做 B 族（A 族不从 legacy 迁）" };
+        const staged = { ...cand, origin_operation_id: "00000000-0000-0000-0000-000000000000", created_at: iso, updated_at: iso };
+        delete staged.legacy_source_digest;
+        if (fam === "B1") { staged.binding_proof = null; staged.locator_link_proof_ref = null; }
+        else { staged.binding_proof = { kind: "migrated", authorized_by: authorizedBy, authorized_at: iso, migration_operation_id: "00000000-0000-0000-0000-000000000000", legacy_source_digest: legacyDigest }; staged.locator_link_proof_ref = { kind: "migrated", migration_operation_id: "00000000-0000-0000-0000-000000000000", legacy_source_digest: legacyDigest }; }
+        const p = liveProblem(staged, id);
+        if (p !== null) return { ok: false, reason: "bad_candidate", why: id + "：" + p };
+        const existing = doc.records[id];
+        if (existing) {
+          if (existing.kind !== "live") return { ok: false, reason: "conflict", why: id + " 已是非 live" };
+          if (cRecordKey(existing) !== cRecordKey(staged)) return { ok: false, reason: "conflict", why: id + " C 投影不同" };
+          continue;
+        }
+        for (const loc of [cand.aliases?.session_id, cand.aliases?.root_om]) if (typeof loc === "string" && loc && locatorOwner.has(loc) && locatorOwner.get(loc) !== id) return { ok: false, reason: "conflict", why: "locator " + loc + " 被 " + locatorOwner.get(loc) + " 占用" };
+        toInsert.push(id);
+      }
+      const byId = new Map(candidates.map((c) => [c.topic_agent_id, c]));
+      const seeded = toInsert.map((id) => ({ topic_agent_id: id, legacy_source_digest: byId.get(id).legacy_source_digest })).sort((a, b) => a.topic_agent_id < b.topic_agent_id ? -1 : 1);
+      return { ok: true, next: stampAndBuild(doc, { opType: "migrate_seed", inputs: reqInputs, result: { authorized_by: authorizedBy, authorized_at: iso, seeded }, mutateRecords: (n, opId) => {
+        for (const id of toInsert) {
+          const cand = byId.get(id);
+          const fam = familyOf(cand.facts);
+          const r = { ...cand, origin_operation_id: opId, created_at: iso, updated_at: iso };
+          delete r.legacy_source_digest;
+          r.binding_proof = fam !== "B1" ? { kind: "migrated", authorized_by: authorizedBy, authorized_at: iso, migration_operation_id: opId, legacy_source_digest: cand.legacy_source_digest } : null;
+          r.locator_link_proof_ref = fam !== "B1" ? { kind: "migrated", migration_operation_id: opId, legacy_source_digest: cand.legacy_source_digest } : null;
+          n.records[id] = r;
+        }
+      } }) };
+    },
+  });
+}
+
+/** migrate_repair（§5.1，gated、仅 shadow、owner 逐次授权）：按 legacy 证据对**已迁移**记录做同族内容对齐。
+ *  两分支判别联合：B1→B1（proof 全 null，只改 C 投影）；{B3,B3',B4}→同族（migrated 双证由本笔 repair op 重签）。
+ *  其余（A 族、真实生命周期 proof、表外组合、跨族）一律 repair_scope。
+ *  fingerprint = { request_key, topic_agent_id, expected_projection_digest, next_projection_digest }（两者皆调用方字面证据，与当前状态无关）。
+ *  CAS：现 C 投影 digest≠expected → repair_cas_mismatch；调用方给的 facts/aliases/target 必须产出 next → 否则 bad_input。
+ *  result = { repaired_id, from_family, to_family, expected_projection_digest, next_projection_digest, legacy_source_digest, authorized_by, authorized_at }。 */
+export function migrateRepair({ endpointId, requestKey, id, expectedProjectionDigest, nextProjectionDigest, facts, aliases, bindingTarget, legacySourceDigest, authorizedBy, now = Date.now(), env = process.env, _inject } = {}) {
+  const iso = isoOrNull(now); if (iso === null) return BAD_TIME;
+  if (!isId(id)) return { ok: false, commit: "not_committed", reason: "bad_id" };
+  const reqInputs = { request_key: requestKey, topic_agent_id: id, expected_projection_digest: expectedProjectionDigest, next_projection_digest: nextProjectionDigest };
+  return gatedTx({
+    endpointId, requestKey, env, _inject, replay: () => [{ opType: "migrate_repair", inputs: reqInputs }],
+    mutate: (doc) => {
+      if (doc === null) return { ok: false, reason: "absent" };
+      if (doc.authority_mode !== "shadow") return { ok: false, reason: "not_shadow" };
+      if (![expectedProjectionDigest, nextProjectionDigest, legacySourceDigest].every((s) => typeof s === "string" && SHA_SHAPE.test(s))) return { ok: false, reason: "bad_input", why: "digest 不是 64-hex" };
+      if (typeof authorizedBy !== "string" || !AUTHORIZED_BY_SHAPE.test(authorizedBy)) return { ok: false, reason: "bad_input" };
+      const rec = doc.records[id];
+      if (!rec || rec.kind !== "live") return { ok: false, reason: "not_live" };
+      const fromFam = familyOf(rec.facts);
+      if (fromFam === null || (fromFam !== "B1" && fromFam !== "B3" && fromFam !== "B3'" && fromFam !== "B4")) return { ok: false, reason: "repair_scope", why: "只修 B1/B3/B3'/B4" };
+      const bp = rec.binding_proof, lp = rec.locator_link_proof_ref;
+      const realLife = (bp?.kind && bp.kind !== "migrated") || (lp?.kind && lp.kind !== "migrated");
+      if (realLife) return { ok: false, reason: "repair_scope", why: "真实生命周期 proof 不可 repair" };
+      if (fromFam === "B1") { if (bp !== null || lp !== null) return { ok: false, reason: "repair_scope", why: "B1 必须 proof 全 null" }; }
+      else if (bp?.kind !== "migrated" || lp?.kind !== "migrated") return { ok: false, reason: "repair_scope", why: "B3/B3'/B4 必须是 migrated 双证" };
+      if (migrateProjectionDigest(rec) !== expectedProjectionDigest) return { ok: false, reason: "repair_cas_mismatch", why: "现 C 投影 digest 与 expected 不符" };
+      if (!isObj(facts) || !isObj(aliases)) return { ok: false, reason: "bad_input", why: "facts/aliases" };
+      const toFam = familyOf(facts);
+      if (toFam === null) return { ok: false, reason: "bad_input", why: "repair 后 facts 不构成合法族" };
+      const allowedTo = fromFam === "B1" ? toFam === "B1" : (toFam === "B3" || toFam === "B3'" || toFam === "B4");
+      if (!allowedTo) return { ok: false, reason: "repair_scope", why: "repair 只在同支内：B1→B1 或 {B3,B3',B4}→{B3,B3',B4}" };
+      const nextCRec = { topic_agent_id: id, chat_id: rec.chat_id, aliases, facts, generation_lineage_id: rec.generation_lineage_id, binding_target: bindingTarget };
+      if (sha256(Buffer.from(canonKey(nextCRec), "utf-8")) !== nextProjectionDigest) return { ok: false, reason: "bad_input", why: "调用方 next 投影 digest 与所给内容不符" };
+      return { ok: true, next: stampAndBuild(doc, { opType: "migrate_repair", inputs: reqInputs, result: { repaired_id: id, from_family: fromFam, to_family: toFam, expected_projection_digest: expectedProjectionDigest, next_projection_digest: nextProjectionDigest, legacy_source_digest: legacySourceDigest, authorized_by: authorizedBy, authorized_at: iso }, mutateRecords: (n, opId) => {
+        const r = n.records[id];
+        r.facts = facts; r.aliases = aliases; r.binding_target = bindingTarget;
+        if (toFam !== "B1") { r.binding_proof = { kind: "migrated", authorized_by: authorizedBy, authorized_at: iso, migration_operation_id: opId, legacy_source_digest: legacySourceDigest }; r.locator_link_proof_ref = { kind: "migrated", migration_operation_id: opId, legacy_source_digest: legacySourceDigest }; }
+        r.updated_at = iso; r.origin_operation_id = opId;
       } }) };
     },
   });

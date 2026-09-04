@@ -28,6 +28,7 @@ import { SENDER_ROLES, roleCounts, roleCountsText, senderRole, senderRolesProble
 import { parseRegisterSenderArgs, planSenderChange, applySenderChange } from "./register-sender.mjs";
 import { parseRegisterP2pArgs, planP2pChange, applyP2pChange } from "./register-p2p-chat.mjs";
 import * as TAL from "./topic-agent-ledger.mjs";
+import * as DW from "./m1a/dual-write.mjs";
 // symlink 锁：existsSync 会跟随到不存在的目标，锁在不在只能用 lstat 判
 const lockPresent = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
 import os from "node:os";
@@ -24683,6 +24684,179 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.equal(shaAfter, shaBefore, "越界时间被入口拦下，账本 SHA 不变（未取锁写盘）");
     const cyc = { topic_agent_id: "ta_" + "9".repeat(32) }; cyc.self = cyc;
     assert.equal(TAL.seedRecords({ endpointId: EP, requestKey: rk(), candidates: [cyc] }).reason, "bad_candidate", "循环候选→bad_candidate");
+  }));
+
+  // 工具：构造一个合法 B 族候选元组（record 形，proof/origin/created/updated 不在其中，但带 legacy_source_digest）。
+  const tid = (c) => "ta_" + c.repeat(32);
+  const TGT2 = { runtime: "claude", project_root: "/Users/dk/p1", claude_session_id: uuid(3) };
+  const bFacts = (binding, generation) => ({ anchor: "present", binding, generation, locator_link_proof: binding === "pending" ? "absent" : "present", session: binding === "pending" ? "absent" : "present" });
+  const cand = ({ id, chat, om, sid, facts, lineage, digest, tgt = TGT }) => ({ topic_agent_id: id, kind: "live", chat_id: chat, aliases: { root_om: om, session_id: sid }, anchor_candidate: null, binding_target: facts.binding === "none" ? null : tgt, facts, generation_lineage_id: lineage, legacy_source_digest: digest });
+
+  test("账本 T3b：migrate_seed 迁 B 族（B3 双 migrated 证 / B1 全 null）→ proof 引用本笔 op、result.seeded 有序；重放/换候选冲突/已存在跳过/冲突；A 族 migrate_scope；now:NaN bad_time", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    const b3 = cand({ id: tid("b"), chat: "oc_mig", om: "om_b3", sid: "sess_b3", facts: bFacts("active", "current"), lineage: "lin_3", digest: claim("b") });
+    const rkSeed = rk();
+    const s1 = talOk(TAL.migrateSeed({ endpointId: EP, requestKey: rkSeed, candidates: [b3], authorizedBy: "ou_o", now: 1700000000000 }), "可重复动作：B3 迁入");
+    assert.deepEqual(s1.result.seeded.map((x) => x.topic_agent_id), [tid("b")], "seeded 含该 id");
+    let doc = talLoad(dir); // 校验器必须放行（G13-mig 交叉不变量通过）
+    const rec = doc.records[tid("b")];
+    assert.equal(TAL.familyOf(rec.facts), "B3", "迁成 B3");
+    assert.equal(rec.binding_proof.kind, "migrated", "binding 双证");
+    assert.equal(rec.locator_link_proof_ref.kind, "migrated", "link 双证");
+    assert.equal(rec.binding_proof.migration_operation_id, rec.origin_operation_id, "binding 证引用本笔 seed op");
+    assert.equal(rec.locator_link_proof_ref.migration_operation_id, rec.origin_operation_id, "link 证引用本笔 seed op");
+    assert.equal(rec.binding_proof.legacy_source_digest, claim("b"), "binding digest=legacy");
+    assert.equal(rec.binding_proof.legacy_source_digest, rec.locator_link_proof_ref.legacy_source_digest, "两证同 digest");
+    assert.equal(rec.binding_proof.authorized_by, "ou_o", "au 透传");
+    // 重放：同 key 同候选 → 幂等（返回原 result，不新增记录）
+    const rpl = TAL.migrateSeed({ endpointId: EP, requestKey: rkSeed, candidates: [b3], authorizedBy: "ou_o", now: 1700000000000 });
+    assert.ok(rpl.ok && rpl.idempotent, "同 key 同候选→幂等重放");
+    // 同 key 换候选 digest → request_conflict
+    const b3x = { ...b3, legacy_source_digest: claim("e") };
+    assert.equal(TAL.migrateSeed({ endpointId: EP, requestKey: rkSeed, candidates: [b3x], authorizedBy: "ou_o" }).reason, "request_conflict", "同 key 换候选 digest→request_conflict");
+    // 换 key 同候选重跑 → ok（不同 request_key 是不同请求）
+    assert.equal(TAL.migrateSeed({ endpointId: EP, requestKey: rk(), candidates: [b3], authorizedBy: "ou_o" }).ok, true, "换 key 同候选重跑也不炸");
+    // B1 全 null 证
+    const b1 = cand({ id: tid("c"), chat: "oc_mig", om: "om_c1", sid: null, facts: bFacts("pending", "pending"), lineage: "lin_4", digest: claim("c"), tgt: TGT2 });
+    talOk(TAL.migrateSeed({ endpointId: EP, requestKey: rk(), candidates: [b1], authorizedBy: "ou_o", now: 1700000000000 }), "B1 迁入");
+    doc = talLoad(dir);
+    const c1 = doc.records[tid("c")];
+    assert.equal(TAL.familyOf(c1.facts), "B1", "B1 族");
+    assert.equal(c1.binding_proof, null, "B1 proof null");
+    assert.equal(c1.locator_link_proof_ref, null, "B1 link null");
+    // A 族候选 → migrate_scope
+    const a1c = cand({ id: tid("a"), chat: "oc_mig", om: "om_a1", sid: "sess_a1", facts: { anchor: "absent", binding: "none", generation: "n/a", locator_link_proof: "absent", session: "present" }, lineage: null, digest: claim("a") });
+    // liveBase A1：binding none 则 target null
+    const a1c2 = { ...a1c, binding_target: null, generation_lineage_id: null, aliases: { root_om: null, session_id: "sess_a1" }, facts: { anchor: "absent", binding: "none", generation: "n/a", locator_link_proof: "absent", session: "present" } };
+    assert.equal(TAL.migrateSeed({ endpointId: EP, requestKey: rk(), candidates: [a1c2], authorizedBy: "ou_o" }).reason, "migrate_scope", "A 族→migrate_scope");
+    // 已存在：同 C 投影（只差 proof 已被上面的实际 op 生成）→ 新 key 重跑跳过（seeded 空）；不同 C 投影 → conflict
+    const b3same = cand({ id: tid("b"), chat: "oc_mig", om: "om_b3", sid: "sess_b3", facts: bFacts("active", "current"), lineage: "lin_3", digest: claim("b") });
+    const r2 = TAL.migrateSeed({ endpointId: EP, requestKey: rk(), candidates: [b3same], authorizedBy: "ou_o", now: 1700000000000 });
+    assert.ok(r2.ok, "同 C 投影已存在→跳过");
+    assert.deepEqual(r2.result.seeded, [], "已存在→seeded 空（跳过）");
+    const b3diff = { ...b3same, chat_id: "oc_mig2" };
+    assert.equal(TAL.migrateSeed({ endpointId: EP, requestKey: rk(), candidates: [b3diff], authorizedBy: "ou_o" }).reason, "conflict", "同 id 不同 C 投影→conflict");
+    assert.equal(TAL.migrateSeed({ endpointId: EP, requestKey: rk(), candidates: [b3], authorizedBy: "ou_o", now: NaN }).reason, "bad_time", "now:NaN→bad_time");
+  }));
+
+  test("账本 T3b：migrate_repair 同支内改内容（B3→B3' 重签证 / B1→B1 全 null）；CAS mismatch；跨支 repair_scope；G13-repair/comb 交叠", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    const b3 = cand({ id: tid("b"), chat: "oc_mig", om: "om_b3", sid: "sess_b3", facts: bFacts("active", "current"), lineage: "lin_3", digest: claim("b") });
+    talOk(TAL.migrateSeed({ endpointId: EP, requestKey: rk(), candidates: [b3], authorizedBy: "ou_o", now: 1700000000000 }), "迁入 B3");
+    let doc = talLoad(dir);
+    const rec = doc.records[tid("b")];
+    const expected = TAL.migrateProjectionDigest(rec);
+    const nextFacts = bFacts("dormant", "current"); // B3'
+    const nextAliases = { root_om: "om_b3", session_id: "sess_b3" };
+    const nextTarget = TGT;
+    const nextCRec = { topic_agent_id: tid("b"), chat_id: rec.chat_id, aliases: nextAliases, facts: nextFacts, generation_lineage_id: rec.generation_lineage_id, binding_target: nextTarget };
+    const next = TAL.sha256(Buffer.from(TAL.canonKey(nextCRec), "utf-8"));
+    const rr = talOk(TAL.migrateRepair({ endpointId: EP, requestKey: rk(), id: tid("b"), expectedProjectionDigest: expected, nextProjectionDigest: next, facts: nextFacts, aliases: nextAliases, bindingTarget: nextTarget, legacySourceDigest: claim("d"), authorizedBy: "ou_o", now: 1700000001000 }), "B3→B3' repair");
+    assert.equal(rr.result.from_family, "B3", "from_family");
+    assert.equal(rr.result.to_family, "B3'", "to_family");
+    doc = talLoad(dir); // 校验器放行（含 G13-repair cross invariant）
+    const rec2 = doc.records[tid("b")];
+    assert.equal(TAL.familyOf(rec2.facts), "B3'", "repair 改族");
+    assert.equal(rec2.binding_proof.kind, "migrated", "repair 后 binding 仍是 migrated");
+    assert.equal(rec2.binding_proof.migration_operation_id, rec2.origin_operation_id, "repair 重签 opId");
+    assert.equal(rec2.binding_proof.legacy_source_digest, claim("d"), "repair 证 digest=调用方 evidence");
+    // CAS mismatch
+    assert.equal(TAL.migrateRepair({ endpointId: EP, requestKey: rk(), id: tid("b"), expectedProjectionDigest: claim("0"), nextProjectionDigest: next, facts: nextFacts, aliases: nextAliases, bindingTarget: nextTarget, legacySourceDigest: claim("d"), authorizedBy: "ou_o" }).reason, "repair_cas_mismatch", "现 digest≠expected→repair_cas_mismatch");
+    // 跨支：B1 起点，给 B3 facts → repair_scope
+    const b1 = cand({ id: tid("c"), chat: "oc_mig", om: "om_c1", sid: null, facts: bFacts("pending", "pending"), lineage: "lin_4", digest: claim("c"), tgt: TGT2 });
+    talOk(TAL.migrateSeed({ endpointId: EP, requestKey: rk(), candidates: [b1], authorizedBy: "ou_o", now: 1700000000000 }), "迁入 B1");
+    doc = talLoad(dir);
+    const rec1 = doc.records[tid("c")];
+    const e1 = TAL.migrateProjectionDigest(rec1);
+    const nFactsB3 = bFacts("active", "current");
+    const nAliases = { root_om: "om_b3", session_id: "sess_b3" };
+    const nCRec = { topic_agent_id: tid("c"), chat_id: rec1.chat_id, aliases: nAliases, facts: nFactsB3, generation_lineage_id: rec1.generation_lineage_id, binding_target: TGT };
+    const n1 = TAL.sha256(Buffer.from(TAL.canonKey(nCRec), "utf-8"));
+    assert.equal(TAL.migrateRepair({ endpointId: EP, requestKey: rk(), id: tid("c"), expectedProjectionDigest: e1, nextProjectionDigest: n1, facts: nFactsB3, aliases: nAliases, bindingTarget: TGT, legacySourceDigest: claim("f"), authorizedBy: "ou_o" }).reason, "repair_scope", "B1 起点→B3 目标→repair_scope");
+  }));
+
+  test("账本 T3b：G13-mig / G13-repair 交叉不变量拒绝篡改；migrated 被真实生命周期 op 覆盖（retarget 后 binding 证变 retarget、link 证仍 migrated）", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    const p = path.join(dir, "ledger.json");
+    const reSeed = () => { // 重建一个干净 B3 记录（迁入 B3）
+      const b3 = cand({ id: tid("b"), chat: "oc_mig", om: "om_b3", sid: "sess_b3", facts: bFacts("active", "current"), lineage: "lin_3", digest: claim("b") });
+      talOk(TAL.migrateSeed({ endpointId: EP, requestKey: rk(), candidates: [b3], authorizedBy: "ou_o", now: 1700000000000 }), "迁入");
+    };
+    const goodBytes = () => fs.readFileSync(p);
+    // G13-mig：篡改 migrated binding 证 digest → 校验器拒
+    reSeed();
+    let doc = talLoad(dir);
+    const gb1 = goodBytes();
+    doc.records[tid("b")].binding_proof.legacy_source_digest = claim("9");
+    fs.writeFileSync(p, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    assert.equal(TAL.loadLedger(dir, { endpointId: EP }).reason, "ledger_corrupt", "G13-mig 拒绝篡改 digest");
+    fs.writeFileSync(p, gb1, { mode: 0o600 }); // 还原
+    assert.ok(TAL.loadLedger(dir, { endpointId: EP }).ok, "还原后可加载");
+    // 生命周期：迁入 B3（改族为 B3' 再做 retarget），retarget 覆盖 binding 证、link 证仍 migrated、账本合法
+    doc = talLoad(dir);
+    const rec = doc.records[tid("b")];
+    const expected = TAL.migrateProjectionDigest(rec);
+    const nextFacts = bFacts("dormant", "current"); // B3'
+    const nextAliases = { root_om: "om_b3", session_id: "sess_b3" };
+    const nextCRec = { topic_agent_id: tid("b"), chat_id: rec.chat_id, aliases: nextAliases, facts: nextFacts, generation_lineage_id: rec.generation_lineage_id, binding_target: TGT };
+    const next = TAL.sha256(Buffer.from(TAL.canonKey(nextCRec), "utf-8"));
+    talOk(TAL.migrateRepair({ endpointId: EP, requestKey: rk(), id: tid("b"), expectedProjectionDigest: expected, nextProjectionDigest: next, facts: nextFacts, aliases: nextAliases, bindingTarget: TGT, legacySourceDigest: claim("6"), authorizedBy: "ou_o", now: 1700000001000 }), "repair");
+    // G13-repair：篡改 repaired 记录的 session_id（在 C 投影里、不改族）→ 校验器拒（① 现投影≠result.next）
+    doc = talLoad(dir);
+    const gb2 = goodBytes();
+    doc.records[tid("b")].aliases.session_id = "sess_x";
+    fs.writeFileSync(p, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    assert.equal(TAL.loadLedger(dir, { endpointId: EP }).reason, "ledger_corrupt", "G13-repair 拒绝篡改投影");
+    fs.writeFileSync(p, gb2, { mode: 0o600 }); // 还原
+    // 生命周期覆盖：迁一个干净 B3（active，不同 target/lineage），retarget → binding 证被 retarget 覆盖、link 证仍 migrated、账本合法
+    const b3d = cand({ id: tid("d"), chat: "oc_mig", om: "om_d3", sid: "sess_d3", facts: bFacts("active", "current"), lineage: "lin_5", digest: claim("d"), tgt: { runtime: "claude", project_root: "/Users/dk/p2", claude_session_id: uuid(4) } });
+    talOk(TAL.migrateSeed({ endpointId: EP, requestKey: rk(), candidates: [b3d], authorizedBy: "ou_o", now: 1700000000000 }), "迁入 B3（lifecycle）");
+    talOk(TAL.retarget({ endpointId: EP, requestKey: rk(), id: tid("d"), expectedOldTarget: b3d.binding_target, newTarget: { runtime: "claude", project_root: "/Users/dk/p2", claude_session_id: uuid(5) }, authorizedBy: "ou_o", now: 1700000002000 }), "retarget");
+    doc = talLoad(dir);
+    const rec3 = doc.records[tid("d")];
+    assert.equal(rec3.binding_proof.kind, "retarget", "retarget 覆盖 binding migrated 证");
+    assert.equal(rec3.locator_link_proof_ref.kind, "migrated", "link 证仍是 migrated");
+    assert.equal(TAL.familyOf(rec3.facts), "B3", "族仍 B3");
+  }));
+
+  test("m1a 双写库：request_key 派生确定性/形状/拒错；m1a-order 锁取放+并发 binding_busy；固定序列崩溃续跑跳过已执行（T3b 只 drop 库不接线）", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    const rkA = DW.requestKeyFor({ opType: "create_a1", externalRequestId: "req_dual1", entityId: "sess_x" });
+    const rkB = DW.requestKeyFor({ opType: "create_a1", externalRequestId: "req_dual1", entityId: "sess_x" });
+    assert.ok(rkA.ok && rkB.ok && rkA.request_key === rkB.request_key, "确定性派生");
+    assert.ok(/^m1a_[0-9a-f]{40}$/u.test(rkA.request_key), "m1a_ + 40hex 形状");
+    assert.notEqual(DW.requestKeyFor({ opType: "create_a1", externalRequestId: "req_dual1", entityId: "sess_x" }).request_key, DW.requestKeyFor({ opType: "create_a1", externalRequestId: "req_dual2", entityId: "sess_x" }).request_key, "ext 不同→key 不同");
+    assert.equal(DW.requestKeyFor({ opType: "create_a1", externalRequestId: "", entityId: "s" }).reason, "bad_external_request_id");
+    assert.equal(DW.requestKeyFor({ opType: "create-a1!", externalRequestId: "r", entityId: "s" }).reason, "bad_op_type");
+    assert.deepEqual(DW.sequenceFor("bind_claim"), ["create_a1", "activate"], "固定顺序");
+    assert.equal(DW.sequenceFor("nonsense"), null, "表外→null");
+    // 锁取放
+    const acq = DW.acquireOrderLock(EP, process.env);
+    assert.ok(acq.ok, "取到 m1a-order 锁：" + JSON.stringify(acq));
+    assert.equal(DW.acquireOrderLock(EP, process.env).reason, "binding_busy", "并发取第二笔→binding_busy");
+    assert.ok(DW.releaseOrderLock(EP, process.env).ok, "释放");
+    assert.ok(DW.acquireOrderLock(EP, process.env).ok, "释放后可再取");
+    assert.ok(DW.releaseOrderLock(EP, process.env).ok, "再释放");
+    // 崩溃续跑：isExecuted 命中已执行→跳过；否则 execute
+    const k1 = DW.requestKeyFor({ opType: "create_a1", externalRequestId: "req_seq1", entityId: "sess_s1" }).request_key;
+    let calls = [];
+    // 第一跑：全跑
+    const s1 = DW.runFixedSequence({ endpointId: EP, env: process.env, steps: [
+      { opType: "create_a1", externalRequestId: "req_seq1", entityId: "sess_s1", execute: (k) => { calls.push(k); return { ok: true, result: "a" }; } },
+      { opType: "activate", externalRequestId: "req_seq1", entityId: "ta_c", execute: (k) => { calls.push(k); return { ok: true, result: "b" }; } },
+    ], isExecuted: () => false });
+    assert.ok(s1.ok && s1.executed.length === 2 && calls.length === 2, "全跑");
+    // 第二跑：第一步 key 已在 → 跳过，第二步照跑
+    const done = new Set([k1]);
+    calls = [];
+    const s2 = DW.runFixedSequence({ endpointId: EP, env: process.env, steps: [
+      { opType: "create_a1", externalRequestId: "req_seq1", entityId: "sess_s1", execute: (k) => { calls.push(k); return { ok: true }; } },
+      { opType: "activate", externalRequestId: "req_seq1", entityId: "ta_c", execute: (k) => { calls.push(k); return { ok: true }; } },
+    ], isExecuted: (k) => done.has(k) });
+    assert.ok(s2.ok && s2.executed.length === 2, "两步都记录");
+    assert.equal(s2.executed[0].skipped, true, "第一步命中已执行→跳过");
+    assert.equal(s2.executed[1].skipped, false, "第二步照常执行");
+    assert.equal(calls.length, 1, "只有第二步真的 execute");
   }));
 }
 

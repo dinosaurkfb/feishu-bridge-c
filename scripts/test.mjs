@@ -24889,10 +24889,17 @@ test("maintenance-ledger CLI：参数封闭矩阵（动作互斥、endpoint 形�
   assert.equal(parseMaintenanceLedgerArgs(["--init", "--endpoint", ep, "--kill"]).ok, false, "未知 --kill");
   assert.equal(parseMaintenanceLedgerArgs(["--init", "--endpoint", ep, "--apply", "--apply"]).ok, false, "--apply 重复");
   assert.equal(parseMaintenanceLedgerArgs(["--wait-ms", "5"]).ok, false, "没有动作");
-  const init = parseMaintenanceLedgerArgs(["--init", "--endpoint", ep, "--apply"]);
-  assert.equal(init.ok && init.mode === "init" && init.endpoint === ep && init.apply === true, true, JSON.stringify(init));
+  // F2 返修：--init 必须显式 --chain（封闭枚举）；--cutover 不收 --chain；--status 不收 --chain
+  assert.equal(parseMaintenanceLedgerArgs(["--init", "--endpoint", ep, "--apply"]).ok, false, "init 缺 --chain → 拒");
+  assert.equal(parseMaintenanceLedgerArgs(["--init", "--endpoint", ep, "--chain", "foo"]).ok, false, "--chain 非 claude|codex → 拒");
+  assert.equal(parseMaintenanceLedgerArgs(["--status", "--chain", "claude"]).ok, false, "--status 不收 --chain");
+  assert.equal(parseMaintenanceLedgerArgs(["--cutover", "--endpoint", ep, "--chain", "claude"]).ok, false, "--cutover 带 --chain → 拒");
+  const init = parseMaintenanceLedgerArgs(["--init", "--endpoint", ep, "--chain", "claude", "--apply"]);
+  assert.equal(init.ok && init.mode === "init" && init.endpoint === ep && init.apply === true && init.chain === "claude", true, JSON.stringify(init));
+  const initCodex = parseMaintenanceLedgerArgs(["--init", "--endpoint", ep, "--chain", "codex"]);
+  assert.equal(initCodex.ok && initCodex.chain === "codex", true, "--init --chain codex → chain=codex：" + JSON.stringify(initCodex));
   const cut = parseMaintenanceLedgerArgs(["--cutover", "--endpoint", ep, "--wait-ms", "3000", "--apply"]);
-  assert.equal(cut.ok && cut.mode === "cutover" && cut.waitMs === 3000 && cut.apply === true, true, JSON.stringify(cut));
+  assert.equal(cut.ok && cut.mode === "cutover" && cut.waitMs === 3000 && cut.apply === true && cut.chain === null, true, JSON.stringify(cut));
 });
 
 test("maintenance-ledger 退出码映射：0 完成/预览、1 干净拒绝、3 动了没做完", () => {
@@ -24961,12 +24968,12 @@ test("账本维护 CLI + B-3 收据聚合 + inspect 收据不染红 + doctor ⑬
     // 1) CLI --init 干跑：exit 0 + 预览 + 零改动
     const EPcl = mkEp("agent_ledger_cli_a");
     const preShot0 = snapState();
-    assert.equal(runCli(["--init", "--endpoint", EPcl]), 0, all());
+    assert.equal(runCli(["--init", "--endpoint", EPcl, "--chain", CH]), 0, all());
     assert.match(all(), /\[预览\]/u, all());
     assert.equal(snapState(), preShot0, "dry-run 零改动（dir/ledgerRoot/gate SHA 不变）");
     // 2) CLI --init --apply：exit 0 + 收据 done + 账本 shadow/rev1 + active/门清
     epDir(EPcl);
-    assert.equal(runCli(["--init", "--endpoint", EPcl, "--apply"]), 0, all());
+    assert.equal(runCli(["--init", "--endpoint", EPcl, "--chain", CH, "--apply"]), 0, all());
     assert.match(all(), /已做账本 init/u, all());
     assert.equal(readActive({ dir }).state, "absent", "init 后 active 清掉");
     assert.equal(readGate({ file: gateFile }).state, "absent", "init 后门撤掉");
@@ -24974,9 +24981,18 @@ test("账本维护 CLI + B-3 收据聚合 + inspect 收据不染红 + doctor ⑬
     assert.ok(LCl.ok && LCl.doc.authority_mode === "shadow" && LCl.doc.revision === 1, "init 后 shadow/rev1：" + JSON.stringify(LCl));
     // 3) CLI --init 已初始化 → exit 1 零改动
     const preShot2 = snapState();
-    assert.equal(runCli(["--init", "--endpoint", EPcl, "--apply"]), 1, all());
+    assert.equal(runCli(["--init", "--endpoint", EPcl, "--chain", CH, "--apply"]), 1, all());
     assert.match(all(), /已初始化/u, all());
     assert.equal(snapState(), preShot2, "已 init 再 init 零改动");
+
+    // 3b) F2：--init 必须显式 --chain；--init --chain codex 落 codex 链账本；缺 --chain → exit 1
+    const EPcx = mkEp("agent_ledger_cli_codex"); epDir(EPcx);
+    assert.equal(runCli(["--init", "--endpoint", EPcx, "--chain", "codex", "--apply"]), 0, all());
+    assert.match(all(), /已做账本 init/u, all());
+    const LCx = TAL.loadLedger(epDir(EPcx), { endpointId: EPcx });
+    assert.ok(LCx.ok && LCx.doc.chain === "codex" && LCx.doc.authority_mode === "shadow" && LCx.doc.revision === 1, "init --chain codex 落 codex 链 shadow/rev1：" + JSON.stringify(LCx));
+    assert.equal(runCli(["--init", "--endpoint", EPcx]), 1, all());
+    assert.match(all(), /需要 --chain/u, all());
 
     // 4) B-3 聚合四态：never_initialized / ok(init-only) / 1.1 兼容 / duplicate fail-closed / unreadable fail-closed
     const neverEp = mkEp("agent_ledger_never");
@@ -25010,6 +25026,30 @@ test("账本维护 CLI + B-3 收据聚合 + inspect 收据不染红 + doctor ⑬
     assert.equal(aggBad.ok, false, "坏 journal → 聚合 fail-closed");
     assert.match(String(aggBad.unreadable?.[0]?.why ?? ""), /不是 JSON/u, "点名坏 journal：" + JSON.stringify(aggBad));
     fs.unlinkSync(path.join(dir, badTok + ".json"));
+
+    // 4b) F1 顺序矛盾：cutover.started_at 早于 init.started_at → duplicate_or_conflict / conflict
+    //     （修复前 Math.min(...[ISO 串]) 恒 NaN，顺序分支是死代码；ISO 规范化串字典序即时间序）
+    const EPord = mkEp("agent_ledger_ord"); epDir(EPord);
+    const eOrd = LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPord, chain: CH, apply: true });
+    assert.ok(eOrd.ok, "ordering 前置 init：" + all());
+    const ordInitTok = eOrd.token;
+    const ordCutTok = "99999999-9999-4999-8999-999999999999";
+    const ordCut = JSON.parse(JSON.stringify(journalOf(ordInitTok)).split(ordInitTok).join(ordCutTok));
+    ordCut.operation_kind = "ledger_cutover";
+    const ordLs = ordCut.steps.find((s) => s.kind === "ledger");
+    ordLs.id = ordLs.id.replace(/:init$/u, ":cutover");
+    const opId = ordLs.intended_after.operation_id, fp = ordLs.intended_after.fingerprint, sha = "a".repeat(64);
+    ordLs.before = { authority_mode: "shadow", bijection_digest: null, endpoint_id: EPord, fingerprint: fp, ledger_sha256: sha, operation_id: opId, revision: 1 };
+    ordLs.intended_after = { authority_mode: "authoritative", bijection_digest: sha, endpoint_id: EPord, fingerprint: fp, ledger_sha256: sha, operation_id: opId, revision: 2 };
+    ordLs.after = { ...ordLs.intended_after };
+    ordCut.started_at = new Date(Date.parse(journalOf(ordInitTok).started_at) - 60000).toISOString();
+    fs.writeFileSync(path.join(dir, ordCutTok + ".json"), JSON.stringify(ordCut));
+    const ordRec = endpointReceipt(dir, EPord);
+    assert.deepEqual([ordRec.ok, ordRec.state], [false, "duplicate_or_conflict"], "cutover 早于 init → 顺序矛盾：" + JSON.stringify(ordRec));
+    const aggOrd = aggregateEndpointReceipts({ dir });
+    assert.equal(aggOrd.ok, false, "顺序矛盾 → 聚合 fail-closed");
+    assert.ok(aggOrd.endpoints.find((x) => x.endpointId === EPord)?.state === "conflict", "聚合给 EPord 标 conflict");
+    fs.unlinkSync(path.join(dir, ordCutTok + ".json"));
 
     // 5) inspectMaintenanceDir：done ledger 收据不染红；非 ledger journal 无 active → orphan 染红
     const insp = inspectMaintenanceDir({ dir });

@@ -2,8 +2,8 @@
  * 账本维护命令面（M1 第 2 块 stage4；design `docs/architecture/maintenance-gate.md` C 节）。
  *
  *   node scripts/maintenance-ledger.mjs --status                                                只读：活动账本 operation + B-3 endpoint 收据投影
- *   node scripts/maintenance-ledger.mjs --init    --endpoint <id> [--wait-ms N] [--apply]        账本初始化（shadow，revision=1）
- *   node scripts/maintenance-ledger.mjs --cutover --endpoint <id> [--wait-ms N] [--apply]        账本切权威（shadow→authoritative）
+ *   node scripts/maintenance-ledger.mjs --init    --endpoint <id> --chain <claude|codex> [--wait-ms N] [--apply]   账本初始化（shadow，revision=1）
+ *   node scripts/maintenance-ledger.mjs --cutover --endpoint <id> [--wait-ms N] [--apply]                          账本切权威（shadow→authoritative，链从既有账本读）
  *
  * --init / --cutover 默认只预览（预检 + 计划，零改动），--apply 才动；都是**安装类授权**（Frank 逐次授权）。
  * 不提供 --force / --kill；`--exit` 不在本单（沿用 maintenance-gate --exit 按 operation_kind 分派，R16 已接）。
@@ -26,7 +26,7 @@ const LEDGER_KINDS = Object.freeze(["init", "cutover"]);
 
 /** 参数封闭：每个 flag 至多一次；--status 不带别的；--init/--cutover 必须 --endpoint，可选 --wait-ms / --apply。 */
 export function parseMaintenanceLedgerArgs(argv) {
-  let mode = null, endpoint = null, waitMs = 60000, apply = false;
+  let mode = null, endpoint = null, waitMs = 60000, apply = false, chain = null;
   const seen = new Set();
   const once = (flag) => { if (seen.has(flag)) return false; seen.add(flag); return true; };
   for (let i = 0; i < argv.length; i += 1) {
@@ -34,6 +34,7 @@ export function parseMaintenanceLedgerArgs(argv) {
     if (a === "--status" || a === "--init" || a === "--cutover") { if (mode !== null) return { ok: false, reason: "只能给一个动作" }; mode = a.slice(2); continue; }
     if (a === "--endpoint") { if (!once(a)) return { ok: false, reason: "--endpoint 重复" }; const v = argv[i + 1]; if (typeof v !== "string" || !ENDPOINT_SHAPE.test(v)) return { ok: false, reason: "--endpoint 要是 endpoint_<24hex>" }; endpoint = v; i += 1; continue; }
     if (a === "--wait-ms") { if (!once(a)) return { ok: false, reason: "--wait-ms 重复" }; const raw = argv[i + 1]; const v = Number(raw); if (typeof raw !== "string" || !/^\d+$/u.test(raw) || !Number.isSafeInteger(v) || v > 3600000) return { ok: false, reason: "--wait-ms 要是 0–3600000 的整数" }; waitMs = v; i += 1; continue; }
+    if (a === "--chain") { if (!once(a)) return { ok: false, reason: "--chain 重复" }; const v = argv[i + 1]; if (v !== "claude" && v !== "codex") return { ok: false, reason: "--chain 要是 claude|codex" }; chain = v; i += 1; continue; }
     if (a === "--apply") { if (!once(a)) return { ok: false, reason: "--apply 重复" }; apply = true; continue; }
     return { ok: false, reason: "不认识的参数：" + a };
   }
@@ -43,10 +44,17 @@ export function parseMaintenanceLedgerArgs(argv) {
     if (endpoint === null) return { ok: false, reason: "--" + mode + " 需要 --endpoint" };
     if (seen.has("--endpoint") && !ENDPOINT_SHAPE.test(endpoint)) return { ok: false, reason: "--endpoint 形状不对" };
   }
-  return { ok: true, mode, endpoint, waitMs, apply };
+  if (mode === "init" && chain === null) return { ok: false, reason: "--init 需要 --chain claude|codex" };
+  if (mode === "cutover" && chain !== null) return { ok: false, reason: "不认识的参数：--chain（--cutover 从既有账本读链，不收 --chain）" };
+  return { ok: true, mode, endpoint, waitMs, apply, chain };
 }
 
-/** 单 endpoint 的 chain：有既有账本用它，否则默认 claude（本机维护 CLI 一处保持一致；ponytail: 若 endpoint 可跨链需真实映射）。 */
+/**
+ * 单 endpoint 的 chain（仅 --cutover 用；--init 必须在参数层显式 --chain，不经过这里）。
+ * 有既有账本用它，没有则默认 claude。⚠ "证明 opaque endpoint 究竟属哪条链" 的真机制（design
+ * `docs/architecture/maintenance-gate.md` B 节）归 M1b 设计 —— 这里只从既有账本读链或听操作者声明，
+ * **不伪造证明**；若 endpoint 可跨链需要真实映射时由 M1b 补上。
+ */
 function resolveChain(endpointId, { env }) {
   const L = loadByEndpoint(endpointId, { env });
   if (L.ok && (L.doc.chain === "claude" || L.doc.chain === "codex")) return L.doc.chain;
@@ -83,7 +91,7 @@ const fmtFail = (r) => String(r.reason) + (r.why ? "：" + r.why : "") + (r.path
 
 export function runMaintenanceLedger(argv, { ctx = null, out = (s) => process.stdout.write(s + "\n"), env = process.env } = {}) {
   const parsed = parseMaintenanceLedgerArgs(argv);
-  if (!parsed.ok) { out("用法：node maintenance-ledger.mjs --status | --init --endpoint <id> [--wait-ms N] [--apply] | --cutover --endpoint <id> [--wait-ms N] [--apply]（" + parsed.reason + "）"); return 1; }
+  if (!parsed.ok) { out("用法：node maintenance-ledger.mjs --status | --init --endpoint <id> --chain <claude|codex> [--wait-ms N] [--apply] | --cutover --endpoint <id> [--wait-ms N] [--apply]（" + parsed.reason + "）"); return 1; }
   const c = ctx ?? maintenanceContext({ repoRoot: path.dirname(moduleDir(import.meta.url)) });
   if (parsed.mode === "status") {
     out(renderStatus(maintenanceStatus(c)));
@@ -96,7 +104,8 @@ export function runMaintenanceLedger(argv, { ctx = null, out = (s) => process.st
   if (!receipt.ok) { out("账本 " + kind + " 拒：收据 fail-closed：" + receipt.why + "（什么都不动）"); return 1; }
   if (kind === "init" && (receipt.initDone || receipt.cutoverDone)) { out("账本 init 拒：该 endpoint 已初始化或已切权威，不能重新 init（什么都不动）"); return 1; }
   if (kind === "cutover" && receipt.cutoverDone) { out("账本 cutover 拒：该 endpoint 已切权威，不能重复切（什么都不动）"); return 1; }
-  const chain = resolveChain(parsed.endpoint, { env });
+  // init 的 chain 由操作者显式声明（参数层已校验成封闭枚举）；cutover 不收 --chain，链从既有账本读。
+  const chain = parsed.mode === "init" ? parsed.chain : resolveChain(parsed.endpoint, { env });
   const r = LEDGER_OP.ledgerEnter(c, { kind, endpointId: parsed.endpoint, chain, waitMs: parsed.waitMs, apply: parsed.apply, env });
   if (r.dryRun) {
     const verb = kind === "init" ? "init→shadow revision1" : "cutover→authoritative";

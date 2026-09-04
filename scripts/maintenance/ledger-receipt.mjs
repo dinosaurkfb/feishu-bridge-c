@@ -18,6 +18,11 @@ import { JOURNAL_SCHEMA, LEGACY_JOURNAL_SCHEMA, listJournals, readJournal } from
 const LEDGER_KINDS = Object.freeze(["ledger_init", "ledger_cutover"]);
 const KIND_IS_INIT = Object.freeze({ ledger_init: true, ledger_cutover: false });
 
+/** 规范化 ISO 串按字典序即按时间序（journalProblem 已验证 started_at 是规范化 ISO）；reduce 取最小串。 */
+function earliestIso(list) {
+  return list.reduce((m, x) => (x.startedAt < m ? x.startedAt : m), list[0].startedAt);
+}
+
 /** 从 done ledger journal 提取 endpoint_id：唯一 ledger step 的 target。 */
 function endpointOf(doc) {
   const ls = doc.steps.find((s) => s.kind === "ledger");
@@ -42,7 +47,7 @@ export function endpointReceipt(dir, endpointId) {
   const initDone = init.length === 1, cutoverDone = cutover.length === 1;
   const conflict = init.length > 1 || cutover.length > 1;
   const ordering = !conflict && init.length === 1 && cutover.length >= 1
-    ? init[0].startedAt > Math.min(...cutover.map((x) => x.startedAt))
+    ? init[0].startedAt > earliestIso(cutover)
     : false; // init 不在 cutover 之前 → 矛盾（切了又初始化 / 先切后初始化）
   if (conflict || ordering) return { ok: false, state: "duplicate_or_conflict", why: "收据矛盾：init " + init.length + " 份 / cutover " + cutover.length + " 份" + (ordering ? "（init 不在 cutover 之前）" : ""), initDone, cutoverDone, initCount: init.length, cutoverCount: cutover.length };
   return { ok: true, state: initDone ? "ok" : "never_initialized", initDone, cutoverDone, initCount: init.length, cutoverCount: cutover.length };
@@ -74,7 +79,7 @@ export function aggregateEndpointReceipts({ dir } = {}) {
     const initDone = init.length === 1, cutoverDone = cutover.length === 1;
     const conflict = init.length > 1 || cutover.length > 1;
     const ordering = !conflict && init.length === 1 && cutover.length >= 1
-      ? init[0].startedAt > Math.min(...cutover.map((x) => x.startedAt))
+      ? init[0].startedAt > earliestIso(cutover)
       : false;
     const state = conflict || ordering ? "conflict" : init.length === 0 ? "never_initialized" : "ok";
     if (state === "conflict") conflictWhy ??= endpointId;

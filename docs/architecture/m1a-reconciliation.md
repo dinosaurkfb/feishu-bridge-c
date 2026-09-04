@@ -1,4 +1,4 @@
-# M1a 双射对账：legacy 权威 ↔ shadow 账本（v5，自包含实现合同）
+# M1a 双射对账：legacy 权威 ↔ shadow 账本（v6，自包含实现合同）
 
 > 地位：`layers-v2-ledger.md` §8『legacy 全集双射对账』的实现合同——约束 T3a（只读对账 +
 > doctor，**Codex 已放行实现**）、T3b（migrate_seed / 双写 / repair）、T4（cutover 复合事务）。
@@ -38,8 +38,15 @@ shadow 账本跑 G1–G15，再仅对 **live B 族子集**双射；M1a 期间入
 
 ## 2. 判别函数（有优先级、互斥、封闭）
 
+**有效绑定状态（六轮 P1-2 封闭公式）**：
+`effective_binding_status = binding_status==="retired" ? "retired"
+: (enabled===false ? "paused" : binding_status)`（retired 优先，不被 disabled 覆盖）；
+§2 全文的 binding 一律读 effective_binding_status。
+
 ```
 0. topic_generation_state 整体校验不过（validateTopicGenerationState）→ legacy_unreadable
+0b. binding 级前置（在逐代际之前）：effective_binding_status==="retired"（或全部代际 retired）
+    → binding 级 blocker（binding_retired）——不逐条排除后无声通过
 1. rotation.status === "preparing"                     → 全局拒（cutover_blocked:rotation_preparing）
 2. 逐代际 g（命中即止）：
    a. g.status === "retired"                           → 不投影（排除）
@@ -102,7 +109,7 @@ link migrated = `{ kind, migration_operation_id, legacy_source_digest }`。
 | migrate_seed（B3/B3′/B4）| migrated | migrated | 成对 |
 | unbind / restore | 保持原样 | 保持原样 | origin 更新；A4 继承 migrated 合法 |
 | retarget | → retarget | 保持原样 | (retarget, migrated) 合法 |
-| A4 双证齐无 F4 重接 → A3 | → attach | 保留旧 link（含 migrated）| **(attach, migrated) A3 仅限继承**；可执行判据（五轮 P2-1）：origin 指向 attach_a3 op 且其 result.affected_id===本记录 id ∧ link 的 G13-mig ①② 成立；seed/migrate_seed **不得直接产出**该组合 |
+| A4 双证齐无 F4 重接 → A3 | → attach | 保留旧 link（含 migrated）| **(attach, migrated) A3 仅限继承**；可执行判据（五轮 P2-1 / 六轮 P2-1 收紧）：**当前 family===A3 ∧ binding_proof.kind==="attach"** ∧ origin 指向 attach_a3 op 且其 result.affected_id===本记录 id ∧ link 的 G13-mig ①② 成立；seed/migrate_seed/migrate_repair **不得直接产出**该组合 |
 | 重新配对 activate / attach+F4 | → pairing/attach | → pairing_merge/f4_anchor | migrated 被覆盖 |
 | 新代际接管（旧 current→B4）| 保持原样 | 保持原样 | |
 
@@ -120,11 +127,15 @@ proof（同笔闭合）；fingerprint = `{ request_key, candidates: 逐条 legac
 | `pending_token`/`claim_expires_at` | 迁入 sidecar | `ledger/<ep>/pending-claims.json`（**bearer 凭证库**：0700/0600、fd 读、锁、内容不进诊断正文只给计数与 opaque id）；M1b 后认领=核凭证+activate；**无 token 初始 B1 合法**（owner 配对 @ 可认领），非 blocker |
 | rotation 过程态 + operation identity | cutover 前清零 | 自动轮转 **M2 前禁用**（M1b 授权时向 Frank 明示）；手动轮转走 v2 事务 |
 | activity / 提醒 / 轮转计数 | 退役 | 消费者禁用，随 legacy 冻结 |
-| `interaction_policy_state` | 抽独立 v2 policy store（**M1b 前置块**） | `ledger/<ep>/policy.json`：封闭 schema、锁、0700/0600、fd 读；**主键 = `policy_subject_id`** = `"ps_" + sha256(canonKey({ domain:"policy_subject_v1", kind:"lineage"|"topic_agent", endpoint_id, id })).slice(0,32)`——B 谱系记录 kind=lineage、id=generation_lineage_id（=legacy effectiveBindingId 同键，轮转天然共享）；非谱系 A 记录 kind=topic_agent、id=自身。**保留/脱离规则（五轮 P1-4）**：activate 归并→subject=lineage（A1 tombstone 的自身 subject 随归并终结）；B4→A4（unbind 清 lineage）→subject 切自身 id、**初始化为空**（不继承谱系状态）；A4 reattach→保持自身。/feishu-mode 与 reserve/finalize 先解析 subject 再改。切换点=cutover sidecar step |
+| `interaction_policy_state` | 抽独立 v2 policy store（**M1b 前置块**） | `ledger/<ep>/policy.json`：封闭 schema、锁、0700/0600、fd 读；**主键 = `policy_subject_id`** = `"ps_" + sha256(canonKey({ domain:"policy_subject_v1", kind:"lineage"|"topic_agent", endpoint_id, id })).slice(0,32)`——B 谱系记录 kind=lineage、id=generation_lineage_id（=legacy effectiveBindingId 同键，轮转天然共享）；非谱系 A 记录 kind=topic_agent、id=自身。**保留/脱离规则（五轮 P1-4）**：activate 归并→subject=lineage（A1 tombstone 的自身 subject 随归并终结）；B4→A4（unbind 清 lineage）→subject 切自身 id、**初始化为空**（不继承谱系状态）；A4 reattach→保持自身。/feishu-mode 与 reserve/finalize 先解析 subject 再改。**权威切换三段（六轮 P1-3）**：
+① **shadow 段**：runtime 读写 **legacy（权威）**，v2 policy store 旁路双写（同 §5 外层锁纪律：
+policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=policy mismatch（非业务失败）；
+② **cutover**：policy intended 状态作为 journal sidecar step 固定（§4.1）；
+③ **authoritative**：只读写 v2 policy store，legacy policy 字段冻结。切换点=cutover 提交 |
 | `status` ≠ active（非 paused 语义） | cutover 前规范化或退役 | selector 拒非 active，不得投影后放行 |
 | Codex task `chat_id` 覆盖（值不变时） | 迁入 | chat_id 逐记录 |
 | `inbound_state` | cutover 前清零 | drained 语义覆盖 |
-| `enabled` 翻转（五轮 P1-2 定案） | **disabled 仍进快照、映为 paused 语义（B3′）**——快照/双射两侧一致；恢复 enabled=restore | 与 legacy「disabled 不路由」等价（B3′ 不路由）；不再有"disabled 不产快照"条款 |
+| `enabled` 翻转（五轮 P1-2 定案 / 六轮公式化） | **disabled 仍进快照**，经 effective_binding_status 映为 paused（current→B3′）；恢复 enabled=restore。**disabled ∧ read-only 历史代际 → 照常落 paused_readonly 待修**（不豁免——disabled 不使双射自动成立） | 与 legacy「disabled 不路由」等价 |
 | binding retire（五轮 P1-2）| **cutover blocker**（M1a 不映射；先由 owner 恢复或等 M1b 后走 v2 生命周期清理） | — |
 
 处置表外字段承担路由语义 → `legacy_field_unmapped` 拒。
@@ -135,6 +146,11 @@ proof（同笔闭合）；fingerprint = `{ request_key, candidates: 逐条 legac
 2. 逐个写 + fsync + 读回核 SHA → markStepDone；全部 done 才进 3；
 3. **唯一提交点 = authority_cutover 账本写**；
 4. 崩溃恢复逐 step 三分（before/intended/其它）；
+4b. **sidecar step 进维护 journal 合同（六轮 P2-2）**：`sidecar` 为新 step kind，
+   id=`sidecar:<name>:<ep>`、before/intended_after=内容 SHA 联合（absent 显式 null）、
+   ledger_cutover 的 PHASE_REQUIRES 在 ledger_reopening/done 增列全部 sidecar steps done；
+   恢复时 **pre_cutover_ledger_sha 与各 intended SHA 一律从首次 prepared journal 重放**，
+   不得按变化后现场重算（maintenance-gate.md『账本接入』节同步此扩展）。
 5. **cutover op 联合（五轮 P1-4 定案，与上游账本合同一致）**：
    result = `{ revision_at_cutover, bijection_digest, pre_cutover_ledger_sha, expiry_sha256,
    pending_claims_sha256, policy_sha256 }`（**保留**上游 revision_at_cutover）；
@@ -176,13 +192,20 @@ op_type, entity_id })).slice(0,40)`；每行的 ext/entity 如上表——**无�
 控制 claim / operation id，禁止临时随机 fallback**。多笔序列固定顺序、崩溃续跑逐笔重派生 key
 命中重放跳过执行缺失后缀；legacy 重试 no-op 仍走完 shadow 序列。
 
-**migrate_repair**（gated、shadow-only、owner 逐次授权）：fingerprint =
+**migrate_repair = 重新受验迁移（六轮 P1-1 定案，取 b）**（gated、shadow-only、owner 逐次
+授权）：语义 = "按当前 legacy 证据重新迁移这一条记录"——**连同 proof 一起更新**：
+facts/aliases/target 改到与 legacy 投影一致，migrated 双 proof 以本笔 repair op 重签
+（migration_operation_id = 本 repair opId、legacy_source_digest = 当前证据重算）。
+**适用范围封闭**：仅限双 proof 均为 migrated 的记录或 proof 全 null 的 B1；带真实生命周期
+proof（pairing/attach/retarget/f4）的记录**拒**（repair_scope，走真实生命周期事务修）——
+repair 不得降级真实证据。fingerprint =
 `{ request_key, topic_agent_id, expected_projection_digest, next_projection_digest }`；
-CAS：现投影 digest ≠ expected → repair_cas_mismatch；**只改 facts/aliases/target、绝不改
-proof**（需 proof 变化走真实生命周期事务）；result = `{ repaired_id, from_family, to_family,
-expected_projection_digest, next_projection_digest }`；**G13-repair**：origin 指向 repair ⇒
-① 现投影 digest 重算===result.next；② result 两 digest 与 fingerprint 逐字相等；
-③ repaired_id===本记录 id。
+CAS：现投影 digest ≠ expected → repair_cas_mismatch；result = `{ repaired_id, from_family,
+to_family, expected_projection_digest, next_projection_digest }`；
+**G13-mig 扩**：migration_operation_id 可指向 `op_type ∈ {migrate_seed, migrate_repair}`
+（migrate_seed 用 result.seeded_ids 含本 id；migrate_repair 用 result.repaired_id===本 id）；
+**G13-repair**：origin 指向 repair ⇒ ① 现投影 digest 重算===result.next；② result 两 digest
+与 fingerprint 逐字相等；③ repaired_id===本记录 id。
 
 ## 6. reconciler 判据与 digest（T3a 已放行）
 
@@ -207,8 +230,12 @@ revision，不一致 → `{ ok:null, reason:"snapshot_moved" }`（inconclusive�
 ## 7. doctor 输出纪律
 
 问题码 + opaque id/字段名/哈希；**不得原样输出 locator/session/thread/项目路径**；上限
-10 条 + "另 N 条"；完整清单进 0600 机器级诊断制品。shadow 账本 absent → 如实"尚未初始化，
-跳过"（不红）。
+10 条 + "另 N 条"；完整清单进 0600 机器级诊断制品。
+**shadow 账本 absent 按初始化收据分支（六轮 P1-4，与账本规格 WAL/永久收据一致）**：
+- 收据 never_initialized ∧ ledger absent → 未初始化，跳过（不红）；
+- 收据 prepared（未完成 init WAL）→ 按 B-2 恢复矩阵报告（只允许同 token 恢复）；
+- 收据 initialized/cutover ∧ ledger absent/unreadable → **ledger_missing 红**、禁止重初始化；
+- 收据 unreadable/conflict → fail-closed 红。
 
 ## 8. owner 待修流程
 

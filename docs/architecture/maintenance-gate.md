@@ -273,6 +273,7 @@ sidecar 写后读回核 SHA === prepared intended SHA 才算 done（九轮 P1-5�
 | `revision` | `null` | `1` | 切换前 revision | `before.revision + 1` |
 | `ledger_sha256` | `null` | 提交那一刻整文件 SHA | 切换前 SHA | 提交那一刻 SHA |
 | `bijection_digest` | —（不适用）| — | `null` | 账本 §8 双射对账摘要 |
+| `plan_sha256`（十四轮 P1-1：**属三个状态对象**，非 step 顶层）| —（init 不适用，无此键）| — | `null` | `<token>.staged/intended/plan.json` 受验原始字节 SHA |
 
 **两个不同判据（二轮 P1-2：整文件 SHA 只在恢复窗口用，不能长期比）**：
 

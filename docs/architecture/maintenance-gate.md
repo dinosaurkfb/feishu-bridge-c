@@ -188,7 +188,7 @@ rollback 记 `rolled_back`）。
 | phase | 必需且 done 的 step | 说明 |
 | --- | --- | --- |
 | `ledger_initializing` | `ENTER_DONE`；`ledger:<ep>:init` 可尚不存在或 `prepared`；**禁 sidecar** | forward-only 段 |
-| `ledger_cutting_over` | `ENTER_DONE`；ledger step 可 `prepared`；**恰三条 sidecar step——进入该阶段的同一次 journal 提交中三条必须全部 `prepared`（不得有无来源的 done），此后才允许逐条转 done** | forward-only 段（v10/v12） |
+| `ledger_cutting_over` | `ENTER_DONE`；**进段原子合同（十六轮 P1）：drained → 本阶段的同一次 journal 提交里原子加入 ① `ledger:<ep>:cutover` step（`prepared`，其 before/intended 已含 `plan_sha256`）② 三条 sidecar step（全部 `prepared`）③ phase 翻转——三者缺一即该提交非法**；本阶段**全程不得缺 ledger step**；sidecar 未全 done 时 ledger step 只能 `prepared`；sidecar 全 done ∧ 按已锚 plan 二次验证通过后才允许提交账本并把 ledger step 转 `done`（done 时三条 sidecar 必已全 done），随后只可推进 `ledger_reopening` | forward-only 段（v14） |
 | `ledger_reopening` | `ENTER_DONE` ∪ {`ledger:<ep>:init`\|`cutover`} 且 ledger step `done`；**（cutover）三条 sidecar 全 `done`** | 进入前必 done；B-4 逐步 |
 | `done`（成功重开后）| 同 `ledger_reopening` | — |
 | `reopening_incomplete`（ledger kind）| 同 `ledger_reopening`（**不**要求 install step）| 重开残步未清（含 3b 备份删除失败）：步骤 1–3/3b 失败时门**尚未撤**、撤门（4）失败时门**可能已部分撤**——都进这里 |

@@ -214,13 +214,16 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
    intended_blob.sha256 === intended_after.sha256；③ ledger{revision,sha256} === 首次
    reconciler 结果；④ digest 与 snapshot_identity === 首次 reconciler 结果；⑤ journal 的
    plan_sha256 === 受验读取的 manifest 原始字节 SHA。
-   **plan 锚与崩溃恢复（十三轮 P1-1）**：plan.json 与三 blob 同批逐个 O_EXCL 写满 fsync、
-   **再 fsync intended/ 目录**（目录 fsync 失败不得进 forward-only）；其 SHA 锚进 cutover
-   ledger step 状态对象的 `plan_sha256`——重启后一切引用凭 journal 锚复核，进程内状态不作数。
+   **plan 锚与崩溃恢复（十三轮 P1-1 / 十六轮 P2 持久链）**：`<token>.staged/` 与 `intended/`
+   若为新建，**逐层 0700 创建并 fsync 各自父目录**；四文件逐个 O_EXCL 写满 fsync、再 fsync
+   `intended/` 目录——**全部屏障成功后**才允许写进段原子 journal 提交（见 gate 阶段表）；其
+   SHA 锚进 cutover ledger step 状态对象的 `plan_sha256`——重启后一切引用凭 journal 锚复核，
+   进程内状态不作数。
    **崩在 blob 写后、阶段提交前（journal 仍 drained）**：同 operation 重试先验 manifest+四文件
    （逐一受验 SHA），全符 → **复用**（不重 O_EXCL、不生成第二份 plan）；部分在场/不符 → 拒并
-   要求安全退出；**安全退出（回退路径）必须删除 staged/intended 目录**——**删除失败 =
-   未完成终态：保留门与 active、退出码 3，不得继续普通 rollback reopening**（十四轮 P2）；
+   要求安全退出；**安全退出（回退路径）必须删除 staged/intended 目录**——**删除失败：
+   journal 保持 `drained`、记 `cleanup_pending` 诊断（非 terminal），保留门与 active、
+   退出码 3；后续 `--exit` 必先重试清理，清理成功后才进入普通安全回退**（十四/十六轮 P2）；
    非 active operation 的该目录 = 敏感残骸，doctor 点名（不自动清）。
    **门内第二次 reconciler 调用 = 按已锚 plan 验证**（同快照同 revision 重验四件相等），
    **不得重新 staging、不得产出另一份 plan**。

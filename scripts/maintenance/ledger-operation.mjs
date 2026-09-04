@@ -282,7 +282,11 @@ export function ledgerEnter(ctx, { kind, endpointId, chain, waitMs = 60000, appl
   const surface = acquireInstallSurfaceLock({ home: ctx.home, env });
   if (!surface.ok) return { ok: false, reason: surface.reason, why: surface.why, path: surface.path };
   const ent = enterMaintenance(ctx, { reason: reasonText, waitMs, apply: true, keepLease: true, operationKind });
-  if (!ent.ok || !ent.lease) { releaseSurface(surface); return ent; }
+  if (!ent.ok || !ent.lease) {
+    // P1-2：早退分支（!ent.ok / !ent.lease）也必须投影 surfaceRelease——自己拿到锁、自己释放，释放失败不许吞。
+    const rel = releaseSurface(surface);
+    return { ...ent, surfaceRelease: rel.ok ? null : { path: rel.path ?? null, why: rel.why ?? rel.reason } };
+  }
   const out = ledgerForward(ctx, { token: ent.token, lease: ent.lease, intent: { kind, endpointId, chain }, env });
   let rollbackResult = null;
   if (out.ok === false && out.rollbackSafe === true) {

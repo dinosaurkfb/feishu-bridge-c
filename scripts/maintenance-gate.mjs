@@ -78,8 +78,11 @@ function runMaintenanceGateLocked(parsed, c, out, surface) {
   if (r.dryRun) { out("[预览] operation " + r.token.slice(0, 8) + " 阶段 " + r.phase + " → 动作：" + r.action + (r.executor ? "（执行者 pid " + r.executor + " 正在跑，此刻 --apply 会被拒）" : "") + "。加 --apply 执行。"); return 0; }
   if (!r.ok && !r.phase && r.reason === "journal_write_failed" && /lease_reap_uncleared/u.test(String(r.why))) { out("出门中途停下（租约的归属转换锁交不还）—— operation 保留，清掉残骸后再跑 --exit --apply" + (r.why ? "：" + r.why : "")); return 3; }
   if (!r.ok && !r.phase) { out("出门做不了（" + r.reason + (r.why ? "：" + r.why : "") + (r.path ? "，" + r.path : "") + "）"); return 1; }
-  const residue = r.leaseUncleared ? "\n租约交不还：" + r.leaseUncleared.path + "（" + r.leaseUncleared.why + "）—— 请人工核对" : "";
-  if (r.ok && r.activeCleared && !r.leaseUncleared) { out("已出门：阶段 " + r.phase + "，active 已清"); return 0; }
+  // P1-1：ledgerExit 从 releaseOperationLease 投影的是 leaseRelease，非 ledger 退出路径走 withLeaseResidue 投影 leaseUncleared——
+  // 两者都必须算残骸，且“已出门”成功条件要两者皆无（旧码只看 leaseUncleared，漏 leaseRelease 报已出门 0）。
+  const leak = r.leaseUncleared ?? r.leaseRelease ?? null;
+  const residue = leak ? "\n租约交不还：" + leak.path + "（" + leak.why + "）—— 请人工核对" : "";
+  if (r.ok && r.activeCleared && !leak) { out("已出门：阶段 " + r.phase + "，active 已清"); return 0; }
   out("出门没做完：阶段 " + String(r.phase) + (r.activeCleared === false ? "（active 未清" + (r.activeWhy ? "：" + r.activeWhy : "") + "）" : "") + "\n" + (r.incomplete ?? []).map((i) => "  · " + i.id + "：" + i.why).join("\n") + residue + "\n门与账保留，处置后再跑 --exit --apply 只向前继续。"); return 3;
 }
 

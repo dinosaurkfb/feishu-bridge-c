@@ -47,7 +47,13 @@ export function endpointReceipt(dir, endpointId, { token = null } = {}) {
     if (endpointOf(j.doc) !== endpointId) continue;
     const isInit = KIND_IS_INIT[j.doc.operation_kind];
     if (j.doc.phase === "done") (isInit ? init : cutover).push({ token: tok, startedAt: j.doc.started_at });
-    else if (isInProgressWAL(j.doc)) inProgress.push({ token: tok, isInit });
+    else if (isInProgressWAL(j.doc)) {
+      const ls = j.doc.steps.find((s) => s.kind === "ledger");
+      const committed = ls !== undefined && ls.state === "done";
+      inProgress.push({ token: tok, isInit });
+      // P1-3：step 已 done 但 phase 未前进的进行中 WAL，账本事实已落盘——计入某方向的“已做”，不许当 never_initialized。
+      if (committed) (isInit ? init : cutover).push({ token: tok, startedAt: j.doc.started_at });
+    }
   }
   const initDone = init.length === 1, cutoverDone = cutover.length === 1;
   // 评审 P1-5：全部进行中 WAL 都要看到——多余（>1）一律 fail-closed，不挑第一份放行；同 token 才 ok_in_progress。
@@ -66,11 +72,13 @@ export function endpointReceipt(dir, endpointId, { token = null } = {}) {
   return { ok: true, state: initDone ? "ok" : "never_initialized", initDone, cutoverDone, initCount: init.length, cutoverCount: cutover.length };
 }
 
-/** P1-6：正在前的账本 WAL——phase 进了前向段且 ledger step 已 prepared（还没 done）。 */
+/** P1-6：正在前的账本 WAL——phase 进了前向段且 ledger step 已 prepared；P1-3：step 已 done 但 phase 未前进（崩溃态）也算，
+ *  且 reopen 段（ledger_reopening / reopening_incomplete）带着 done ledger step（已切权威后只向前清 active）也算进行中。 */
 function isInProgressWAL(doc) {
-  if (!(doc.phase === "ledger_initializing" || doc.phase === "ledger_cutting_over")) return false;
   const ls = doc.steps.find((s) => s.kind === "ledger");
-  return ls !== undefined && ls.state === "prepared";
+  if (doc.phase === "ledger_initializing" || doc.phase === "ledger_cutting_over") return ls !== undefined && (ls.state === "prepared" || ls.state === "done");
+  if (doc.phase === "ledger_reopening" || doc.phase === "reopening_incomplete") return ls !== undefined && ls.state === "done";
+  return false;
 }
 
 /**

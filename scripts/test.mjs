@@ -25386,6 +25386,157 @@ test("账本维护 R20 二轮：P1-4 阶段矩阵、P1-5 收据聚合、P1-1 顶
   }
 });
 
+test("账本维护 R21 三轮：P1-1 gate 出口吞租约释放失败仍报已出门、P1-2 ledgerEnter 早退吞安装面锁释放、P1-3 收据聚合漏 step done 崩溃态、P1-4 phase×step 未封闭 rollback 家族、P2 双残骸只显示一项，全红→绿", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "r21-"));
+  const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
+  fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
+    execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
+  }
+  const node = pickClaudeNodeB();
+  const claudeRoot = path.join(home, ".claude", "feishu-bridge", "runtime");
+  const origCurrent = fs.readlinkSync(path.join(claudeRoot, "current"));
+  const claudeLabel = "com.frank.feishu-bridge-cc.drain";
+  const expectedArgs = claudeDrainExpectedJobB({ home, node }).args;
+  const launchd = { [claudeLabel]: { loaded: true, args: [...expectedArgs] } };
+  const fakeLaunchctl = (args) => {
+    if (args[0] === "list") { const st = launchd[args[1]]; if (!st?.loaded) return { ok: false, detail: "Could not find service \"" + args[1] + "\" in domain" }; return { ok: true, stdout: "{\n\t\"ProgramArguments\" = (\n" + st.args.map((a) => "\t\t\"" + a + "\";").join("\n") + "\n\t);\n};\n" }; }
+    if (args[0] === "bootout") { const label = args[1].split("/").pop(); const st = launchd[label]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; st.loaded = false; return { ok: true, stdout: "" }; }
+    if (args[0] === "bootstrap") { const xml = fs.readFileSync(args[2], "utf-8"); const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/u.exec(xml)[1]; const arr = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/u.exec(xml)[1]; const args2 = [...arr.matchAll(/<string>([^<]*)<\/string>/gu)].map((m) => m[1]); launchd[label] = { loaded: true, args: args2 }; return { ok: true, stdout: "" }; }
+    return { ok: false, detail: "unknown" };
+  };
+  const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
+  const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
+  let clock = Date.parse("2026-08-31T12:00:00.000Z");
+  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
+  const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
+  const ledgerRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r21-ledger-")));
+  const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
+  const savedGateEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile;
+  const savedMaintDirEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = dir;
+  const CH = "claude";
+  const mkEp = (uid) => legacyEndpointId({ runtime: "claude", agentUid: uid });
+  const epDir = (ep) => { const d = path.join(ledgerRoot, ep); fs.mkdirSync(d, { recursive: true, mode: 0o700 }); return d; };
+  const journalOf = (token) => readJournal({ dir, token }).doc;
+  const tok = "da88566e-d8d3-48ba-914e-7f96f4dfaeaa";
+  const at = "2026-08-31T12:00:00.000Z";
+  const baseDoc = { schema_version: "1.2", operation_kind: "maintenance_gate", token: tok, reason: "r", started_at: at, updated_at: at, phase: "planned", steps: [], notes: [] };
+  const ep = "endpoint_" + "a".repeat(24), sha = "b".repeat(64);
+  const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+  const timerDone = (chain) => ({ id: "timer:" + chain, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+  const stubDone = (chain, opTok = tok) => ({ id: "stub:" + chain, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + opTok, after: "versions/maintenance-" + opTok, state: "done", at, chain: null });
+  const curDone = (chain) => ({ id: "current:" + chain, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+  const gateDone = (opTok = tok) => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: opTok }, after: { token: opTok, txnUncleared: null }, state: "done", at, chain: null });
+  const mkEnterDone = (opTok = tok) => [timerDone("claude"), timerDone("codex"), stubDone("claude", opTok), stubDone("codex", opTok), curDone("claude"), curDone("codex"), gateDone(opTok)];
+  const mkInitStep = (opId, over = {}) => ({ id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState({ operation_id: opId }), intended_after: initState({ operation_id: opId, authority_mode: "shadow", revision: 1, ledger_sha256: sha }), after: null, state: "prepared", at, chain: "claude", ...over });
+  const jp = (d) => journalProblem(d);
+  const ROLLBACK_PHASES = ["rolling_back", "rollback_reopening", "rolled_back", "rollback_incomplete"];
+
+  try {
+    // ── P1-4：rollback 家族（rolling_back/rollback_reopening/rolled_back/rollback_incomplete）不得含 ledger step（旧码只封 forward，漏 rollback → 探针 null）──
+    for (const phase of ROLLBACK_PHASES) {
+      const msg = jp({ ...baseDoc, operation_kind: "ledger_init", phase, steps: [...mkEnterDone(), mkInitStep(tok)] });
+      assert.ok(String(msg).startsWith("回退阶段 " + phase + " 不得含 ledger step"), "P1-4：" + phase + " + ledger step 应拒，得：" + msg);
+    }
+    // P1-4 反向：rollback 家族无 ledger step → 合法（其他约束通过）
+    for (const phase of ROLLBACK_PHASES) {
+      assert.equal(jp({ ...baseDoc, operation_kind: "ledger_init", phase, steps: mkEnterDone() }), null, "P1-4 反向：" + phase + " 无 ledger step → 合法（" + jp({ ...baseDoc, operation_kind: "ledger_init", phase, steps: mkEnterDone() }) + "）");
+    }
+
+    // ── P1-3：进行中 WAL 的 ledger step 已是 done（phase 未前进）→ 收据聚合必须计入 initDone/cutoverDone（旧码只认 prepared，漏掉 done，报 never_initialized ok:true）──
+    {
+      const mdir = fs.mkdtempSync(path.join(os.tmpdir(), "r21-p13-"));
+      try {
+        const initWAL = { ...baseDoc, operation_kind: "ledger_init", phase: "ledger_initializing", steps: [...mkEnterDone(tok), mkInitStep(tok, { state: "done", after: initState({ operation_id: tok, authority_mode: "shadow", revision: 1, ledger_sha256: sha }) })] };
+        fs.writeFileSync(path.join(mdir, tok + ".json"), JSON.stringify(initWAL));
+        const r = endpointReceipt(mdir, ep, { token: null });
+        assert.equal(r.ok, false, "P1-3：step done 且 phase 未前进 → 不算 never_initialized，必须 ok:false（旧码 " + JSON.stringify(r) + "）");
+        assert.notEqual(r.state, "never_initialized", "P1-3：state 不许是 never_initialized（" + r.state + "）");
+        assert.equal(r.initDone, true, "P1-3：done step 计入 initDone（initCount=" + r.initCount + "）");
+        const cutAfter10 = { endpoint_id: ep, operation_id: "ffffffff-ffff-4fff-8fff-ffffffffffff", fingerprint: sha, authority_mode: "authoritative", revision: 2, ledger_sha256: sha, bijection_digest: "c".repeat(64) };
+        const cutWAL = { ...baseDoc, token: "ffffffff-ffff-4fff-8fff-ffffffffffff", operation_kind: "ledger_cutover", phase: "ledger_cutting_over", steps: [...mkEnterDone("ffffffff-ffff-4fff-8fff-ffffffffffff"), { id: "ledger:" + ep + ":cutover", kind: "ledger", target: ep, chain: "claude", backup: null, backup_sha256: null, backup_bytes: null, before: { endpoint_id: ep, operation_id: "ffffffff-ffff-4fff-8fff-ffffffffffff", fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha, bijection_digest: null }, intended_after: cutAfter10, after: cutAfter10, state: "done", at }]};
+        const m2 = fs.mkdtempSync(path.join(os.tmpdir(), "r21-p13b-"));
+        try {
+          fs.writeFileSync(path.join(m2, "ffffffff-ffff-4fff-8fff-ffffffffffff.json"), JSON.stringify(cutWAL));
+          const rc = endpointReceipt(m2, ep, { token: null });
+          assert.equal(rc.ok, false, "P1-3(cutover)：step done 且 phase 未前进 → ok:false（" + JSON.stringify(rc) + "）");
+          assert.equal(rc.cutoverDone, true, "P1-3(cutover)：done step 计入 cutoverDone（cutoverCount=" + rc.cutoverCount + "）");
+        } finally { fs.rmSync(m2, { recursive: true, force: true }); }
+      } finally { fs.rmSync(mdir, { recursive: true, force: true }); }
+    }
+
+    // ── 场景辅助：往前推一个 forward-only ledger_init WAL ──
+    const makeFwd = (suffix) => {
+      exitMaintenance(ctx, { apply: true });
+      const EP = mkEp(suffix); const d = epDir(EP);
+      const ent = enterMaintenance(ctx, { reason: "R21 fwd", apply: true, keepLease: true, operationKind: "ledger_init" });
+      assert.ok(ent.ok && ent.lease, "r21 fwd enter：" + JSON.stringify(ent));
+      const plan = TAL.initPlan({ endpointId: EP, chain: CH, requestKey: ent.token, operationId: ent.token });
+      assert.ok(plan.ok, "r21 fwd initPlan：" + JSON.stringify(plan));
+      const pw = enterLedgerForward({ dir, token: ent.token, lease: ent.lease, phase: "ledger_initializing", step: { id: "ledger:" + EP + ":init", kind: "ledger", target: EP, chain: CH, before: plan.before, backup: null, intended_after: plan.intendedAfter }, chain: CH, expectPhase: "drained", now: clock });
+      assert.ok(pw.ok, "r21 fwd enterLedgerForward：" + JSON.stringify(pw));
+      return { EP, d, ent, plan };
+    };
+
+    // ── P1-1：gate --exit --apply 收敛但主 .lease 交不还 → 必须报 3 且点名租约残骸（旧码只看 leaseUncleared，漏 leaseRelease，报已出门 0）──
+    {
+      const s = makeFwd("r21_p11");
+      assert.equal(releaseOperationLease(s.ent.lease).ok, true, "P1-1: 预释放租约让 --exit 能自取");
+      const origRm = fs.rmSync; let armed = true;
+      fs.rmSync = (t, ...a) => { if (armed && /\/[0-9a-f-]{36}\.lease$/u.test(String(t))) { armed = false; const e = new Error("EIO"); e.code = "EIO"; throw e; } return origRm(t, ...a); };
+      const outF = []; let codeF;
+      try { codeF = runMaintenanceGate(["--exit", "--apply"], { ctx, out: (t) => outF.push(t) }); } finally { fs.rmSync = origRm; }
+      assert.equal(codeF, 3, "P1-1：租约交不还 → --exit --apply 必须 3（旧码漏报 0）：" + outF.join("\n"));
+      assert.match(outF.join("\n"), /租约交不还/u, "P1-1：输出点名租约残骸");
+      assert.match(outF.join("\n"), /[0-9a-f-]{36}\.lease/u, "P1-1：输出带租约路径");
+      assert.ok(!/已出门/u.test(outF.join("\n")), "P1-1：不许报'已出门'（" + outF.join("\n") + "）");
+    }
+
+    // ── P1-2：ledgerEnter 早退（gate 在场，enterMaintenance 失败）且安装面锁 .reap 交不还 → 必须投影 surfaceRelease（旧码 releaseSurface 结果被缩掉）──
+    {
+      const g = createGate({ file: gateFile, reason: "r21 p12" });
+      assert.equal(g.ok, true, "P1-2: 建 gate（" + JSON.stringify(g) + "）");
+      const origRm = fs.rmSync; let armed = true;
+      fs.rmSync = (t, ...a) => { if (armed && String(t).endsWith("install-surface.lock.reap")) { armed = false; const e = new Error("EIO"); e.code = "EIO"; throw e; } return origRm(t, ...a); };
+      const EP = mkEp("r21_p12");
+      let r, residue;
+      try { r = LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EP, chain: CH, apply: true }); } finally { fs.rmSync = origRm; }
+      assert.equal(r.ok, false, "P1-2：gate 在场 → ledgerEnter 早退 ok:false（" + JSON.stringify(r) + "）");
+      assert.ok(r.surfaceRelease, "P1-2：!ent.ok 早退分支也必须投影 surfaceRelease（旧码缩到没有）：" + JSON.stringify(r));
+      assert.match(String(r.surfaceRelease.why ?? ""), /reap_uncleared/u, "P1-2：surfaceRelease.why 点名 reap_uncleared（" + r.surfaceRelease.why + "）");
+      residue = r.surfaceRelease.path;
+      removeGate({ file: gateFile, token: g.token });
+      if (residue) fs.rmSync(residue, { recursive: true, force: true });
+      assert.equal(readGate({ file: gateFile }).state, "absent", "P1-2: 撤门");
+    }
+
+    // ── P2：--init --apply 收敛但主 .lease + 主 install-surface.lock 同时交不还 → 输出必须逐项列出两处残骸（旧码 .lease??.surfaceRelease 只显示第一项）──
+    {
+      const EP = mkEp("r21_p2"); epDir(EP);
+      const origRm = fs.rmSync; const fired = new Set();
+      fs.rmSync = (t, ...a) => {
+        const s = String(t);
+        if (/\/[0-9a-f-]{36}\.lease$/u.test(s) && !fired.has("lease")) { fired.add("lease"); const e = new Error("EIO"); e.code = "EIO"; throw e; }
+        if (s.endsWith(path.sep + "install-surface.lock") && !fired.has("surface")) { fired.add("surface"); const e = new Error("EIO"); e.code = "EIO"; throw e; }
+        return origRm(t, ...a);
+      };
+      const outP = []; let codeP;
+      try { codeP = runMaintenanceLedger(["--init", "--endpoint", EP, "--chain", CH, "--apply"], { ctx, out: (t) => outP.push(t), env }); } finally { fs.rmSync = origRm; }
+      assert.equal(codeP, 3, "P2：双残骸 → 3（" + outP.join("\n") + "）");
+      assert.match(outP.join("\n"), /租约交不还/u, "P2：输出点名租约残骸");
+      assert.match(outP.join("\n"), /安装面锁交不还/u, "P2：输出点名安装面锁残骸（旧码只显示一项）");
+    }
+  } finally {
+    if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedgerDir;
+    if (savedGateEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; else process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = savedGateEnv;
+    if (savedMaintDirEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = savedMaintDirEnv;
+    if (prevTpl === undefined) delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; else process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = prevTpl;
+    fs.rmSync(base, { recursive: true, force: true }); fs.rmSync(ledgerRoot, { recursive: true, force: true });
+  }
+});
+
 summarySealed = true;
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (TEST_FILTER.length > 0) {

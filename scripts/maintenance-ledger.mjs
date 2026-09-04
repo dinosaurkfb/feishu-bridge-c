@@ -89,6 +89,14 @@ export function renderLedgerStatus(st) {
 }
 
 const fmtFail = (r) => String(r.reason) + (r.why ? "：" + r.why : "") + (r.path ? "，" + r.path : "");
+// P2：释放残骸要逐项列出（旧码 leaseRelease ?? surfaceRelease 只显示第一项，第二处残骸被吞）——
+// exitCodeFor 仍按“任一存在即 3”判断，这里只负责把每处残骸都写进输出。
+const releaseRows = (r) => {
+  const rows = [];
+  if (r.leaseRelease) rows.push("租约交不还：" + r.leaseRelease.path + "（" + r.leaseRelease.why + "）");
+  if (r.surfaceRelease) rows.push("安装面锁交不还：" + r.surfaceRelease.path + "（" + r.surfaceRelease.why + "）");
+  return rows;
+};
 
 export function runMaintenanceLedger(argv, { ctx = null, out = (s) => process.stdout.write(s + "\n"), env = process.env } = {}) {
   const parsed = parseMaintenanceLedgerArgs(argv);
@@ -124,19 +132,19 @@ export function runMaintenanceLedger(argv, { ctx = null, out = (s) => process.st
     return 0;
   }
   // 动了没做完 / 释放失败 → 3
-  const releaseIssue = r.leaseRelease ?? r.surfaceRelease ?? null;
+  const rows = releaseRows(r);
   const code = exitCodeFor(r);
 
   if (!r.ok) {
     if (r.reason === "startup_source_unverified") { out("拒绝进门（startup_source_unverified）：启动源与当前投影对不上，什么都没动\n" + fmtItems(r.items)); return 1; }
-    out("账本 " + kind + " 没做成（" + fmtFail(r) + "）" + (r.rollback ? (r.rollback.ok ? "；已按账回退还清" : "；回退没做全（" + String(r.rollback.why ?? r.rollback.phase) + "，门与账保留，看 --status）") : "") + (releaseIssue ? "；且" + (r.leaseRelease ? "租约交不还" : "安装面锁交不还") + "—— 只人工核对：" + releaseIssue.path : "") + "\n旁路指示：先看 --status。");
+    out("账本 " + kind + " 没做成（" + fmtFail(r) + "）" + (r.rollback ? (r.rollback.ok ? "；已按账回退还清" : "；回退没做全（" + String(r.rollback.why ?? r.rollback.phase) + "，门与账保留，看 --status）") : "") + (rows.length ? "；且" + rows.join("；且") + "—— 只人工核对" : "") + "\n旁路指示：先看 --status。");
     return code;
   }
   if (r.phase === "done" && r.activeCleared === true) {
-    out("已做账本 " + kind + "：阶段 " + r.phase + "，active 已清" + (releaseIssue ? "；但" + (r.leaseRelease ? "租约交不还" : "安装面锁交不还") + "：" + releaseIssue.path + "—— 人工核对" : ""));
+    out("已做账本 " + kind + "：阶段 " + r.phase + "，active 已清" + (rows.length ? "；但" + rows.join("；且") + "—— 人工核对" : ""));
     return code;
   }
-  out("账本 " + kind + " 没做完：阶段 " + String(r.phase) + (r.activeCleared === false ? "（active 未清）" : "") + (r.incomplete?.length ? "\n" + r.incomplete.map((i) => "  · " + i.id + "：" + i.why).join("\n") : "") + (releaseIssue ? "\n且" + (r.leaseRelease ? "租约交不还" : "安装面锁交不还") + "：" + releaseIssue.path : "") + "\n门与账保留，处置后再跑 --status 看只向前续跑。");
+  out("账本 " + kind + " 没做完：阶段 " + String(r.phase) + (r.activeCleared === false ? "（active 未清）" : "") + (r.incomplete?.length ? "\n" + r.incomplete.map((i) => "  · " + i.id + "：" + i.why).join("\n") : "") + (rows.length ? "\n且" + rows.join("\n且") : "") + "\n门与账保留，处置后再跑 --status 看只向前续跑。");
   return code;
 }
 

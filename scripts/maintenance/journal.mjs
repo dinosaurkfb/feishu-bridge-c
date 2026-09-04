@@ -272,6 +272,8 @@ export function journalProblem(doc) {
     } else if (doc.phase === "ledger_initializing" || doc.phase === "ledger_cutting_over") {
       const ls = doc.steps.find((s) => s.kind === "ledger");
       if (lsCount !== 1 || !ls || (ls.state !== "prepared" && ls.state !== "done")) return "前向阶段 " + doc.phase + " 要求恰一条 prepared/done 的 ledger step";
+    } else if (doc.phase === "rolling_back" || doc.phase === "rollback_reopening" || doc.phase === "rolled_back" || doc.phase === "rollback_incomplete") {
+      if (lsCount !== 0) return "回退阶段 " + doc.phase + " 不得含 ledger step";
     }
   }
   if (!Array.isArray(doc.notes) || doc.notes.some((n) => typeof n !== "string")) return "notes 不是字符串数组";

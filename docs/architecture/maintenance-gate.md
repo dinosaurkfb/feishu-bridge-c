@@ -200,37 +200,42 @@ rollback 记 `rolled_back`）。
 
 **sidecar step（M1a v8 回带，`m1a-reconciliation.md` §4.1；八轮 P1-3 封闭联合）**：
 新 step kind `sidecar`，仅 `ledger_cutover` 允许（**`ledger_init` 禁 sidecar**）：
-- **journal schema 升 1.3**（八轮 P2-1）：1.3 = 1.2 + sidecar step kind；**1.2 独立兼容分支**
-  （不认识 sidecar，读到即 unreadable——旧 runtime 遇到 1.3 journal fail-closed，不误解释）；
-- id = `sidecar:<name>:<ep>`（name ∈ {expiry, pending-claims, policy}），**三个固定 id 恰好
-  各一条**（多/少/重复 → journal 非法）；
-- step 完整键集 = 通用 11 键（after,at,backup,backup_bytes,backup_sha256,before,id,
-  intended_after,kind,state,target）；`target` **由 endpoint+name 内部派生**
-  （`ledger/<ep>/<name>.json` 的规范路径，校验器重算比对，不信任 journal 中任意路径）；
-- before/intended_after/after = `{ exists, sha256 }` 联合（absent 显式
-  `{exists:false, sha256:null}`）；**prepared 不得有 after；done 必须
-  after === intended_after（逐字段）**；
-- 原文件存在（before.exists）必有备份：backup 绝对路径 + backup_sha256/bytes 齐；恢复前
-  **受验读取备份并核长度/SHA**，核不过 → 该项 incomplete（不盲写回）；
+- id = `sidecar:<name>:<ep>`（name ∈ {expiry, pending-claims, policy}）；**按 phase 计数
+  （九轮 P1-4）**：`drained → ledger_cutting_over` 的阶段推进与三条 prepared sidecar step
+  **同一次 journal 提交**写入；此前任何阶段 **禁 sidecar step**；进入 ledger_cutting_over 起
+  **恰三条**（各自 prepared 或 done）；`ledger_reopening` 起三条**全部 done**；
+- **prepared/done 两个精确键集（九轮 P1-3）**：prepared =
+  {at, backup, backup_bytes, backup_sha256, before, id, intended_after, kind, state, target}
+  且 **after 键缺席**；done = 前者 ∪ {after} 且 after === intended_after（逐字段）且
+  **after 必来自写后受验读回**；
+- `target` 由 endpoint+name 内部派生（`ledger/<ep>/<name>.json` 规范路径，校验器重算比对，
+  不信任 journal 中任意路径）；before/intended_after/after = `{ exists, sha256 }` 联合
+  （absent 显式 `{exists:false, sha256:null}`）；**cutover 三个 intended_after.exists 必为
+  true**；
+- 备份：before.exists=true → backup 绝对路径（**必须落在本 operation 私有目录**
+  `<token>.staged/` 下）+ backup_sha256/bytes 齐；before.exists=false → **三个 backup 字段
+  全 null**；恢复前受验读取备份并核长度/SHA，核不过 → 该项 incomplete（不盲写回）；
 - `ledger_cutover` 的 `ledger_reopening`/`done`/`reopening_incomplete` 阶段要求 =
   ENTER_DONE ∪ {ledger step} ∪ **全部三条 sidecar steps 均 done**；恢复时
   pre_cutover_ledger_sha 与各 sidecar intended SHA **一律从首次 prepared journal 重放**，
   不得按变化后现场重算。
 
-**schema 判别联合（三轮 P1-2 / 二轮 P2-1，写死枚举、旧版单独分支不猜）**：
-- **旧 schema 1.1**：保持原封闭字段集、**不含** `operation_kind`；用**独立的旧版解析
-  分支**读（不猜它是 gate 还是 install），只作历史 journal，不参与 B-3 的 endpoint
-  收据索引；
-- **新 schema（1.2）**：**必须含** `operation_kind ∈ {maintenance_gate,
-  maintenance_install, ledger_init, ledger_cutover}`（具体字符串），各 kind 的
-  step/phase 按上表与既有 install/gate 定义封闭。
+**schema 判别联合（九轮 P1-2 收为三支，写死枚举、各自独立分支不猜）**：
+- **1.1**：无 `operation_kind`；独立旧版分支读，只作历史 journal，不参与收据索引；
+- **1.2**：必含 `operation_kind ∈ {maintenance_gate, maintenance_install, ledger_init,
+  ledger_cutover}`；**禁 sidecar step**（读到 sidecar 即 unreadable）；
+- **1.3**：= 1.2 + `ledger_cutover` 的 sidecar step（仅此 kind 此用途）；
+- **未终结的 1.2 ledger_cutover 不得直接续跑成 1.3 cutover**（重开新 operation，旧 journal
+  按 1.2 恢复矩阵收敛）。
 
 **锁面（评审 P1-1：账本 operation 也是安装面写方——它停定时器、切桩、开门、reopening）**：
 `--init/--cutover --apply` 必须在**预检与 createOperation 之前**取机器级**安装面锁**
 （`install-surface.lock`，registry 锁协议、staleMs=∞ 按持有者 pid 活性接管），持有到
 reopening 与 operation lease 释放完成；释放失败压成退出码 3。**封闭锁顺序**：
-安装面锁 → operation 租约 / active / 门 → 账本锁（`acquireLockUngated` 只在这条
-受验维护路径内允许）。这样普通安装器无法在 ledger operation 进门窗口改 current 或
+安装面锁 → operation 租约 / active / 门 → **（ledger_cutover）三把 sidecar 文件锁逐个
+取得、提交并干净释放** → 账本锁（`acquireLockUngated` 只在这条受验维护路径内允许）。
+sidecar 段任一 not_owner / reap 残骸 / 释放异常 → **停在 authority cutover 之前**；每个
+sidecar 写后读回核 SHA === prepared intended SHA 才算 done（九轮 P1-5）。这样普通安装器无法在 ledger operation 进门窗口改 current 或
 安装面（与 v5 已解决的"过检后才建门"竞态同一把锁挡住）。
 
 ### B-1. 不可逆边界进阶段机（评审 P1-2）

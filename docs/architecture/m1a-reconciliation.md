@@ -94,12 +94,7 @@ snapshot: 相关源文件 {path,sha256} 子集 }))`（七轮 P2-1：enabled 与�
 
 migrated proof **不与当前终态 origin 绑定**——来源证明，永远为真。
 
-**G13-mig（seed/repair 判别联合，七轮 P1-1 统一）**：任一 proof 为 migrated ⇒
-① migration_operation_id 指向存在的 op 且 `op_type ∈ {"migrate_seed","migrate_repair"}`；
-② migrate_seed：该 op `result.seeded` 含 `{topic_agent_id:本 id, legacy_source_digest}` 且
-digest 与 proof **逐字相等**；migrate_repair：`result.repaired_id===本 id` 且
-`result.legacy_source_digest` 与 proof 逐字相等（七轮 P1-2：digest 锚定不可变 op result）；
-③ 双 migrated 时二者 migration_operation_id 与 legacy_source_digest 分别相等。
+**G13-mig：唯一权威定义在 §5.1（九轮 P1-1：全文只此一套判别联合，此处不复述）**。
 
 **键集**：binding migrated = `{ kind, authorized_by, authorized_at, migration_operation_id,
 legacy_source_digest }`（authorized_by=角色表 owner，读不出 → owner_unresolvable 整批拒）；
@@ -163,6 +158,9 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
    - cutover fingerprint/result 与上述固定值逐字一致；
    - `bijection_digest` 来自**同一 pre-cutover ledger revision/snapshot** 的 reconciler 结果
      （revision 记进 prepared ledger step，提交前 CAS 复核）。
+   **执行顺序（九轮 P2-1）**：门内、三条 sidecar 全 done 后**重新调用 reconciler**；只接受
+   同一 ledger before revision/SHA 上的 `{ok:true, digest}`；snapshot_moved 或 digest 改变
+   均不得翻转 authority_mode。
 4d. **sidecar 的维护窄写路径（八轮 P1-5）**：三个 sidecar 在门内的写**不走** gated（会被门挡）
    也**不开通用 ungated API**——各定义一个维护窄 writer：绑定 operation token + lease + gate +
    journal prepared step（与账本 capability 同一纪律：读实文件核验后才写），fenced commit；
@@ -226,7 +224,7 @@ fingerprint = `{ request_key, topic_agent_id, expected_projection_digest,
 next_projection_digest }`；CAS：现投影 digest ≠ expected → repair_cas_mismatch；
 result = `{ repaired_id, from_family, to_family, expected_projection_digest,
 next_projection_digest, legacy_source_digest, authorized_by, authorized_at }`；
-**G13-mig（统一判别联合，八轮 P1-2）**：任一 proof 为 migrated ⇒
+**G13-mig（唯一权威定义，九轮 P1-1）**：任一 proof 为 migrated ⇒
 migration_operation_id 指向 op_type ∈ {migrate_seed, migrate_repair} 的存在 op；
 migrate_seed：`result.seeded` 含 `{topic_agent_id:本 id, legacy_source_digest}` 且与 proof
 digest 逐字相等；migrate_repair：`result.repaired_id===本 id` 且 `result.legacy_source_digest`

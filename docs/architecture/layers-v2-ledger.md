@@ -329,10 +329,12 @@ P1-2）**：该 op result 的 `old/new_target` 与本记录 binding_proof 逐字
 binding_target 必 === 该 op result 的 new_target**；**G14（双向，评审五 P1-4）** `authority_mode`=shadow ⇔ operations 中**无**
 authority_cutover；=authoritative ⇔ **恰有一笔**有效 authority_cutover（cutover 与
 mode 翻转是同一不可逆提交，禁止 shadow 已含 cutover 的状态）；**G15** `matched_fields`
-恰为完整有序四项。**G13-mig（M1a）**：任一 proof 为 migrated ⇒ migration_operation_id 指向
-op_type ∈ {migrate_seed, migrate_repair} 的存在 op，且 proof 的 legacy_source_digest 与该 op
-result 中对应本记录的 digest **逐字相等**（seed 用 result.seeded 项、repair 用
-result.repaired_id + result.legacy_source_digest）；双 migrated 时二者引用分别相等。
+恰为完整有序四项。**G13-mig（M1a，九轮 P1-1 与 m1a-reconciliation.md §5.1 同一定义）**：任一 proof 为
+migrated ⇒ migration_operation_id 指向 op_type ∈ {migrate_seed, migrate_repair} 的存在 op；
+proof 的 legacy_source_digest 与该 op result 中对应本记录的 digest **逐字相等**（seed 用
+result.seeded 项、repair 用 result.repaired_id + result.legacy_source_digest）；**binding
+migrated proof 的 authorized_by/authorized_at 与该 op result 逐字相等**；link 与 binding
+引用同一 op 同一 digest；双 migrated 时二者引用分别相等。
 **G13-repair**：origin 指向 migrate_repair ⇒ 现记录投影 digest 重算 === result.next、result
 两投影 digest 与 fingerprint 逐字相等、repaired_id === 本记录 id。（完整合同：
 `m1a-reconciliation.md` §3.1/§5.1。）禁止跨 endpoint forwarding（Q4）。

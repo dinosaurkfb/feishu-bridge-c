@@ -25100,6 +25100,11 @@ test("账本维护 CLI + B-3 收据聚合 + inspect 收据不染红 + doctor ⑬
     assert.match(cutDryOut, /预检通过/u, "干跑有预览：" + cutDryOut);
     assert.match(cutDryOut, /reconciler_absent|对账器未接|M1a 未落地/u, "cutover 干跑要如实说明对账器未接（不是只报预检通过）：" + cutDryOut);
 
+    // 6a2) P2-2(b)：ledgerEnter 的 endpoint 参数显式类型守卫（防非字符串被 ENDPOINT_SHAPE.test 强转放行）
+    assert.equal(LEDGER_OP.ledgerEnter(ctx, { kind: "init", chain: CH }).reason, "bad_endpoint", "缺 endpoint → bad_endpoint");
+    assert.equal(LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: undefined, chain: CH }).reason, "bad_endpoint", "undefined endpoint → bad_endpoint");
+    assert.equal(LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: /endpoint_/, chain: CH }).reason, "bad_endpoint", "正则对象 → bad_endpoint（typeof 守卫，不强转）");
+
     // 6b) P2-1：cutover 不做 --chain，链必须从既有账本读；账本 chain 非法/缺席 → resolveChain 返回 null → 干净拒绝（exit 1 零改动）
     const EPcorrupt = mkEp("agent_ledger_cli_p21"); epDir(EPcorrupt);
     assert.ok(LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPcorrupt, chain: CH, apply: true }).ok, "P2-1 前置 init：" + all());

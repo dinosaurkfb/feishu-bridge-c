@@ -208,6 +208,8 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
 op_type, entity_id })).slice(0,40)`；每行的 ext/entity 如上表——**无外部消息的动作一律用持久
 控制 claim / operation id，禁止临时随机 fallback**。多笔序列固定顺序、崩溃续跑逐笔重派生 key
 命中重放跳过执行缺失后缀；legacy 重试 no-op 仍走完 shadow 序列。
+**清单封闭**：表外 legacy 写方影响投影 = 设计缺口，先补表再上线；**实现测试须反向证明表内
+所有 legacy 写入口都先取得 m1a-order.lock**（八轮 P2-2）。
 
 **migrate_repair = 重新受验迁移（六轮 P1-1 定案，取 b）**（gated、shadow-only、owner 逐次
 授权）：语义 = "按当前 legacy 证据重新迁移这一条记录"——**连同 proof 一起更新**：

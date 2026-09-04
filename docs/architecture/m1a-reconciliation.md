@@ -1,11 +1,11 @@
-# M1a 双射对账：legacy 权威 ↔ shadow 账本（v6，自包含实现合同）
+# M1a 双射对账：legacy 权威 ↔ shadow 账本（v7，自包含实现合同）
 
 > 地位：`layers-v2-ledger.md` §8『legacy 全集双射对账』的实现合同——约束 T3a（只读对账 +
 > doctor，**Codex 已放行实现**）、T3b（migrate_seed / 双写 / repair）、T4（cutover 复合事务）。
 > 字段事实来源：`project-resolve.mjs` / `interaction-policy-store.mjs` / `topic-generation.mjs`
 > / `codex/state.mjs` / `selector.mjs`。
 > **本文件自包含**（五轮 P1-1）：不引用任何已被覆盖的历史版本；全部定稿正文在此。
-> 演进：v0→v5 经 Codex 五轮评审（7+5+5+5+4 项 P1 逐轮收闭）。
+> 演进：v0→v7 经 Codex 七轮评审逐轮收闭；上游合同（layers-v2-ledger.md / maintenance-gate.md）已随 v7 真实回带。
 
 ## 1. legacy 快照：两个封闭适配器
 
@@ -85,17 +85,21 @@ shadow 账本跑 G1–G15，再仅对 **live B 族子集**双射；M1a 期间入
 | `anchor_candidate` | null |
 | 不进双射比较 | created_at / updated_at / origin_operation_id |
 
-**`legacy_source_digest`（逐记录）** = `sha256(canonKey({ digest_version:"lsd-1", binding_id,
-channel_generation_id, generation_status, binding_status, root_om, aily_session,
-binding_target, snapshot: 相关源文件 {path,sha256} 子集 }))`。
+**`legacy_source_digest`（逐记录）** = `sha256(canonKey({ digest_version:"lsd-2", binding_id,
+channel_generation_id, generation_status, binding_status, enabled,
+effective_binding_status, root_om, aily_session, binding_target,
+snapshot: 相关源文件 {path,sha256} 子集 }))`（七轮 P2-1：enabled 与有效状态显式入摘要）。
 
 ### 3.1 迁移证明：独立不可变来源证明 + 生命周期组合表
 
 migrated proof **不与当前终态 origin 绑定**——来源证明，永远为真。
 
-**G13-mig**：任一 proof 为 migrated ⇒ ① migration_operation_id 指向存在的
-`op_type==="migrate_seed"` op；② 该 op `result.seeded_ids` 含本记录 id；③ 双 migrated 时二者
-migration_operation_id 与 legacy_source_digest 分别相等。
+**G13-mig（seed/repair 判别联合，七轮 P1-1 统一）**：任一 proof 为 migrated ⇒
+① migration_operation_id 指向存在的 op 且 `op_type ∈ {"migrate_seed","migrate_repair"}`；
+② migrate_seed：该 op `result.seeded` 含 `{topic_agent_id:本 id, legacy_source_digest}` 且
+digest 与 proof **逐字相等**；migrate_repair：`result.repaired_id===本 id` 且
+`result.legacy_source_digest` 与 proof 逐字相等（七轮 P1-2：digest 锚定不可变 op result）；
+③ 双 migrated 时二者 migration_operation_id 与 legacy_source_digest 分别相等。
 
 **键集**：binding migrated = `{ kind, authorized_by, authorized_at, migration_operation_id,
 legacy_source_digest }`（authorized_by=角色表 owner，读不出 → owner_unresolvable 整批拒）；
@@ -117,7 +121,9 @@ link migrated = `{ kind, migration_operation_id, legacy_source_digest }`。
 
 **migrate_seed**（gated、仅 `authority_mode==="shadow"`）：mutate 拿到本笔 opId 后构造记录与
 proof（同笔闭合）；fingerprint = `{ request_key, candidates: 逐条 legacy 证据元组 canonKey
-排序 }`；result = `{ seeded_ids:[有序] }`。
+排序 }`；result = `{ authorized_by, authorized_at, seeded: [按 id 排序的
+{ topic_agent_id, legacy_source_digest }] }`（七轮 P1-2：digest 与授权一并锚定进不可变
+result，G13-mig ② 逐字核对）。
 
 ## 4. legacy 字段处置表（每行四选一 + M1b 合同）
 
@@ -201,7 +207,8 @@ proof（pairing/attach/retarget/f4）的记录**拒**（repair_scope，走真实
 repair 不得降级真实证据。fingerprint =
 `{ request_key, topic_agent_id, expected_projection_digest, next_projection_digest }`；
 CAS：现投影 digest ≠ expected → repair_cas_mismatch；result = `{ repaired_id, from_family,
-to_family, expected_projection_digest, next_projection_digest }`；
+to_family, expected_projection_digest, next_projection_digest, legacy_source_digest,
+authorized_by, authorized_at }`（七轮 P1-2）；
 **G13-mig 扩**：migration_operation_id 可指向 `op_type ∈ {migrate_seed, migrate_repair}`
 （migrate_seed 用 result.seeded_ids 含本 id；migrate_repair 用 result.repaired_id===本 id）；
 **G13-repair**：origin 指向 repair ⇒ ① 现投影 digest 重算===result.next；② result 两 digest
@@ -246,4 +253,4 @@ revision，不一致 → `{ ok:null, reason:"snapshot_moved" }`（inconclusive�
 
 - **新前置块 = v2 policy store 抽取**（§4；T3 之后、M1b 之前；含读写方迁移与 cutover step 接线）；
 - cutover 复合事务（§4.1）扩展 R16 编排——归 T4/M1b；
-- T3a（§1/§2/§3 投影/§6/§7）已开 #R19 实现；T3b（§3.1/§5）与 T4（§4.1）以本 v5 为合同。
+- T3a（§1/§2/§3 投影/§6/§7）已开 #R19 实现；T3b（§3.1/§5）与 T4（§4.1）以本 v7 为合同。

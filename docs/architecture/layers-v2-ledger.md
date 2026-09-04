@@ -137,16 +137,19 @@ binding_target =
 
 `binding=none` ⇔ null；`∈{pending,active,dormant}` ⇔ 非 null。
 
-**`binding_proof`（三支各自封闭；retarget 支为 A′ 而增，评审四 P1-3）**：
+**`binding_proof`（四支各自封闭；retarget 支为 A′ 而增，评审四 P1-3；migrated 支为 M1a 迁移
+而增，`m1a-reconciliation.md` §3.1）**：
 
 ```
 binding_proof =
   | { kind:"attach",   authorized_by, authorized_at, claim_key }
   | { kind:"pairing",  authorized_by, authorized_at, matched_om, matched_fields:[完整四项] }
   | { kind:"retarget", authorized_by, authorized_at, old_target, new_target }   // 自身即"owner 授权把 old_target 换成 new_target"的完整证明；不引用前一 proof（评审六 P1-1）。old/new 明文亦入 retarget result（§5.1），便于给定候选时核验历史
+  | { kind:"migrated", authorized_by, authorized_at, migration_operation_id, legacy_source_digest }  // 迁移来源证明（不可变，不随生命周期改变）；G13-mig 判据见 §7
 ```
 
-**`locator_link_proof_ref`（封闭）**：
+**`locator_link_proof_ref`（封闭；M1a 增 migrated 支 `{ kind:"migrated",
+migration_operation_id, legacy_source_digest }`，同上）**：
 
 ```json
 { "kind":"pairing_merge"|"f4_anchor", "matched_om":"<om_>", "matched_at":"<iso>",
@@ -170,10 +173,13 @@ binding_proof =
 
 | 族 | binding_proof.kind | locator_link_proof_ref.kind（present 时）|
 |---|---|---|
-| B3 / B3′ / B4 | pairing **或** retarget | pairing_merge |
+| B3 / B3′ / B4 | pairing / retarget / **migrated** | pairing_merge / **migrated** |
 | A2 | attach **或** retarget | —（无 link）|
-| A3 | attach **或** retarget | **f4_anchor 或（从 A4 合法继承的）pairing_merge**（评审四 P1-4）|
-| A4 | attach / pairing / retarget（取决前态）| 保留前态 kind |
+| A3 | attach **或** retarget | **f4_anchor 或（从 A4 合法继承的）pairing_merge 或（从 migrated A4 合法继承的）migrated**（评审四 P1-4；M1a 七轮 P2-1：(attach,migrated) 仅限继承，判据=family===A3 ∧ binding=attach ∧ origin 指向 attach_a3 且 result.affected_id===本 id ∧ G13-mig 成立）|
+| A4 | attach / pairing / retarget / **migrated**（取决前态）| 保留前态 kind（含 migrated）|
+
+（migrated 组合的完整生命周期表与"A1/A2/A3 不得以 migrated 被创建"约束见
+`m1a-reconciliation.md` §3.1。）
 
 ## 5. 事务（六生命周期迁移 + 创建/种子/初始化/切换/retarget 存储事务）
 
@@ -264,8 +270,10 @@ lineage 相同，都会把合法新请求误判成旧重放）：
 | unbind | topic_agent_id | { affected_id, terminal_family } |
 | retarget | topic_agent_id, old_target, new_target（**只取调用方字面 id 与 old/new target；lineage 是状态派生量，只进 result/affected，不进请求身份**，评审六 P1-1）| { affected_ids:[有序], unit:"record"\|"lineage", old_target, new_target } |
 | seed | candidates（**调用方给的全量候选集**，逐条 canonKey 后按串排序；不是 toInsert，评审六 P1-1）| { seeded_ids:[有序] } |
+| migrate_seed（M1a）| candidates（逐条 legacy 证据元组 canonKey 排序）| { authorized_by, authorized_at, seeded:[按 id 排序的 { topic_agent_id, legacy_source_digest }] } |
+| migrate_repair（M1a）| topic_agent_id, expected_projection_digest, next_projection_digest | { repaired_id, from_family, to_family, expected_projection_digest, next_projection_digest, legacy_source_digest, authorized_by, authorized_at } |
 | initialize_shadow | endpoint_id, chain | { revision:1 } |
-| authority_cutover | endpoint_id, bijection_digest | { revision_at_cutover } |
+| authority_cutover | endpoint_id, bijection_digest, pre_cutover_ledger_sha, expiry_sha256, pending_claims_sha256, policy_sha256（M1a 七轮：sidecar intended SHA 入指纹，同 key 换任一 SHA=request_conflict）| { revision_at_cutover, bijection_digest, pre_cutover_ledger_sha, expiry_sha256, pending_claims_sha256, policy_sha256 } |
 
 **重放/冲突判定（评审六 P1-1 / 七 P1-2）**：`request_key` **全局唯一**（G12），写端按 request_key 全局查——
 - 无同 key 的历史 op → 正常执行；**成功的空操作也落一笔 op 占用 request_key**（seed 全存在→写 `seeded_ids:[]` 的 seed op；不存在"成功但免写"的状态式 noop）。仅**失败**（bad_input / conflict / retarget `no_change` 等）不落 op、不占用 key；
@@ -321,7 +329,13 @@ P1-2）**：该 op result 的 `old/new_target` 与本记录 binding_proof 逐字
 binding_target 必 === 该 op result 的 new_target**；**G14（双向，评审五 P1-4）** `authority_mode`=shadow ⇔ operations 中**无**
 authority_cutover；=authoritative ⇔ **恰有一笔**有效 authority_cutover（cutover 与
 mode 翻转是同一不可逆提交，禁止 shadow 已含 cutover 的状态）；**G15** `matched_fields`
-恰为完整有序四项。禁止跨 endpoint forwarding（Q4）。
+恰为完整有序四项。**G13-mig（M1a）**：任一 proof 为 migrated ⇒ migration_operation_id 指向
+op_type ∈ {migrate_seed, migrate_repair} 的存在 op，且 proof 的 legacy_source_digest 与该 op
+result 中对应本记录的 digest **逐字相等**（seed 用 result.seeded 项、repair 用
+result.repaired_id + result.legacy_source_digest）；双 migrated 时二者引用分别相等。
+**G13-repair**：origin 指向 migrate_repair ⇒ 现记录投影 digest 重算 === result.next、result
+两投影 digest 与 fingerprint 逐字相等、repaired_id === 本记录 id。（完整合同：
+`m1a-reconciliation.md` §3.1/§5.1。）禁止跨 endpoint forwarding（Q4）。
 
 ## 8. 迁移期权威：authority_mode 端点级原子切换
 

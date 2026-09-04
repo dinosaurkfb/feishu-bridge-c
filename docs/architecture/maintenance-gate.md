@@ -198,6 +198,15 @@ rollback 记 `rolled_back`）。
 `ledger_*` kind **禁 install 的 `artifact`/`receipt`/`staged_plan` step**；
 `maintenance_gate`/`maintenance_install` kind **禁 `ledger` step**。
 
+**sidecar step（M1a v7 回带，`m1a-reconciliation.md` §4.1-4b）**：新 step kind `sidecar`，
+仅 `ledger_cutover` 允许（**`ledger_init` 禁 sidecar**）；id = `sidecar:<name>:<ep>`
+（name ∈ {expiry, pending-claims, policy}）；before/intended_after =
+`{ exists, sha256 }` 联合（absent 显式 `{exists:false, sha256:null}`）；原文件存在必有备份。
+`ledger_cutover` 的 `ledger_reopening`/`done`/`reopening_incomplete` 阶段要求 =
+ENTER_DONE ∪ {ledger step} ∪ **全部 sidecar steps 均 done**。恢复时
+pre_cutover_ledger_sha 与各 sidecar intended SHA **一律从首次 prepared journal 重放**，
+不得按变化后现场重算。
+
 **schema 判别联合（三轮 P1-2 / 二轮 P2-1，写死枚举、旧版单独分支不猜）**：
 - **旧 schema 1.1**：保持原封闭字段集、**不含** `operation_kind`；用**独立的旧版解析
   分支**读（不猜它是 gate 还是 install），只作历史 journal，不参与 B-3 的 endpoint

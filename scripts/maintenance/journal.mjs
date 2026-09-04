@@ -237,16 +237,19 @@ export function journalProblem(doc) {
     if (s.kind === "gate" && s.after.token !== doc.token) return "gate 的 token 与 operation 不一致";
     if (s.kind === "stub" && !s.intended_after.endsWith("maintenance-" + doc.token)) return "桩目标与 operation token 不一致";
   }
-  // P1-2（第 5 轮）：非 install 的 `current:<chain>` 绑到**本 operation** 的维护目录，且与同链桩一致——
-  // 否则 ledger-operation 重开会把**别的** operation 的桩当本 operation 执行。无同链桩时无从对上，留给 stepProblem 形状检查。
-  for (const s of doc.steps) if (s.kind === "current" && s.state === "done" && !s.id.endsWith(":install")) {
+  // P1-2（第 5/6 轮）：非 install 的 `current:<chain>` 必须关联**同链且 done** 的本 operation 桩，
+  //  且 current.intended_after === stub.intended_after === versions/maintenance-<doc.token>；
+  //  三形封闭：① prepared current 指别 operation 桩 ② done current 而同链桩缺失 ③ done current.after !== intended_after，
+  //  任一不成立 → journal 非法，不得进恢复——否则 ledger-operation 重开会把别的 operation 的桩当本 operation 执行。
+  for (const s of doc.steps) if (s.kind === "current" && !s.id.endsWith(":install")) {
     const chain = s.id.split(":")[1];
     if (typeof chain !== "string" || chain.length === 0) continue;
     const stub = doc.steps.find((x) => x.kind === "stub" && x.id === "stub:" + chain);
-    if (stub === undefined) continue;
+    if (stub === undefined || stub.state !== "done") return "current 无同链已 done 的桩";
     const want = "maintenance-" + doc.token;
     if (!(s.intended_after ?? "").endsWith(want)) return "current 目标与 operation token 不一致";
     if (s.intended_after !== stub.intended_after) return "current 目标与桩不一致";
+    if (s.state === "done" && s.after !== s.intended_after) return "current 的 after 与 intended_after 不一致";
   }
   // step 类型 × operation_kind 封闭（M1 账本接入 B，设计"ledger_* 禁 install 步 / gate·install 禁 ledger 步"）：
   if (is12) {

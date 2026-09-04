@@ -23486,16 +23486,16 @@ test("维护门 · PR C 单元：journal 三态与两阶段、active 只许一�
     journalProblem(withStep(mkStep({ intended_after: 42 }))) !== null,
     journalProblem(withStep(mkStep({ backup: null }))) !== null,
     journalProblem(withStep(mkStep({ id: "current:claude", kind: "current", before: { not: "a target" }, intended_after: "versions/x", after: "versions/x", backup: null, backup_sha256: null, backup_bytes: null }))) !== null,
-    journalProblem(withStep(mkStep({ id: "current:claude", kind: "current", before: "versions/0123456789abcdef", intended_after: "versions/fedcba9876543210", after: "versions/fedcba9876543210", backup: null, backup_sha256: null, backup_bytes: null }))),
+    journalProblem(withStep(mkStep({ id: "current:claude", kind: "current", before: "versions/0123456789abcdef", intended_after: "versions/fedcba9876543210", after: "versions/fedcba9876543210", backup: null, backup_sha256: null, backup_bytes: null }))) !== null,
     journalProblem(withStep(mkStep({ id: "gate", kind: "gate", before: null, intended_after: { token: good.token }, after: { token: "00000000-0000-4000-8000-000000000000", txnUncleared: null }, backup: null, backup_sha256: null, backup_bytes: null }))) !== null,
     journalProblem(withStep(mkStep({ state: "done", after: null }))) !== null,
     journalProblem({ ...good, token: [good.token] }) !== null,
     journalProblem(withStep(mkStep({ id: "current:claude", kind: "current", before: "versions/..", intended_after: "versions/x", after: null, state: "prepared", backup: null, backup_sha256: null, backup_bytes: null }))) !== null,
-    journalProblem(withStep(mkStep({ id: "current:claude", kind: "current", before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + good.token, after: null, state: "prepared", backup: null, backup_sha256: null, backup_bytes: null }))),
+    journalProblem(withStep(mkStep({ id: "current:claude", kind: "current", before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + good.token, after: null, state: "prepared", backup: null, backup_sha256: null, backup_bytes: null }))) !== null,
     journalProblem(withStep(mkStep({ id: "gate", kind: "gate", before: null, intended_after: { token: good.token }, after: { token: good.token, txnUncleared: { path: "/x", why: "EIO", extra: 1 } }, backup: null, backup_sha256: null, backup_bytes: null }))) !== null,
     journalProblem(withStep(mkStep({ id: "receipt:claude", kind: "receipt", before: { exists: true, sha256: null }, intended_after: { exists: true, sha256: "a".repeat(64) }, after: null, state: "prepared", backup: "/b", backup_sha256: "a".repeat(64), backup_bytes: 1 }))) !== null,
     journalProblem(withStep(mkStep({ id: "receipt:claude", kind: "receipt", before: { exists: false, sha256: null }, intended_after: { exists: true, sha256: "a".repeat(64) }, after: null, state: "prepared", backup: "/b", backup_sha256: "a".repeat(64), backup_bytes: 1 }))) !== null,
-  ], [null, true, true, true, true, null, true, true, true, true, null, true, true, true], "按 kind 封闭的判别联合");
+  ], [null, true, true, true, true, true, true, true, true, true, true, true, true, true], "按 kind 封闭的判别联合");
   assert.deepEqual([dirFsyncIgnorable("EINVAL"), dirFsyncIgnorable("ENOTSUP"), dirFsyncIgnorable("EIO"), dirFsyncIgnorable(undefined)], [true, true, false, false]);
   // 命令引用解析：引号 / 操作符 / 尾分号 / sh -c 内联 / 变量 / 命令替换
   const toks = tokenizeCommand("if [ -x '/a b/n' ]; then '/a b/n' \"/c/d.mjs\"; else x>/dev/null 2>&1 || :; fi");
@@ -25523,7 +25523,7 @@ test("账本维护 R21 三轮：P1-1 gate 出口吞租约释放失败仍报已�
         return origRm(t, ...a);
       };
       const outP = []; let codeP;
-      try { codeP = runMaintenanceLedger(["--init", "--endpoint", EP, "--chain", CH, "--apply"], { ctx, out: (t) => outP.push(t), env }); } finally { fs.rmSync = origRm; }
+      try { codeP = runMaintenanceLedger(["--init", "--endpoint", EP, "--chain", CH, "--apply"], { ctx, out: (t) => outP.push(t), env: process.env }); } finally { fs.rmSync = origRm; }
       assert.equal(codeP, 3, "P2：双残骸 → 3（" + outP.join("\n") + "）");
       assert.match(outP.join("\n"), /租约交不还/u, "P2：输出点名租约残骸");
       assert.match(outP.join("\n"), /安装面锁交不还/u, "P2：输出点名安装面锁残骸（旧码只显示一项）");
@@ -25839,6 +25839,140 @@ test("账本维护 R23 五轮：P1-1 聚合漂移（进行中 WAL 被滤掉仍�
     fs.rmSync(base, { recursive: true, force: true }); fs.rmSync(ledgerRoot, { recursive: true, force: true });
   }
 });
+
+
+test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepared 指错桩 / done 无同链桩 / done.after 不一致）、P2 authorityCutover 侧残骸实例 + 真实 --init/--cutover CLI 残骸，全红→绿", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "r25-"));
+  const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
+  fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
+    execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
+  }
+  const node = pickClaudeNodeB();
+  const claudeRoot = path.join(home, ".claude", "feishu-bridge", "runtime");
+  const origCurrent = fs.readlinkSync(path.join(claudeRoot, "current"));
+  const claudeLabel = "com.frank.feishu-bridge-cc.drain";
+  const expectedArgs = claudeDrainExpectedJobB({ home, node }).args;
+  const launchd = { [claudeLabel]: { loaded: true, args: [...expectedArgs] } };
+  const fakeLaunchctl = (args) => {
+    if (args[0] === "list") { const st = launchd[args[1]]; if (!st?.loaded) return { ok: false, detail: "Could not find service \"" + args[1] + "\" in domain" }; return { ok: true, stdout: "{\n\t\"ProgramArguments\" = (\n" + st.args.map((a) => "\t\t\"" + a + "\";").join("\n") + "\n\t);\n};\n" }; }
+    if (args[0] === "bootout") { const label = args[1].split("/").pop(); const st = launchd[label]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; st.loaded = false; return { ok: true, stdout: "" }; }
+    if (args[0] === "bootstrap") { const xml = fs.readFileSync(args[2], "utf-8"); const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/u.exec(xml)[1]; const arr = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/u.exec(xml)[1]; const args2 = [...arr.matchAll(/<string>([^<]*)<\/string>/gu)].map((m) => m[1]); launchd[label] = { loaded: true, args: args2 }; return { ok: true, stdout: "" }; }
+    return { ok: false, detail: "unknown" };
+  };
+  const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
+  const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
+  let clock = Date.parse("2026-08-31T12:00:00.000Z");
+  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
+  const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
+  const ledgerRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r25-ledger-")));
+  const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
+  const savedGateEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile;
+  const savedMaintDirEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = dir;
+  const CH = "claude";
+  const mkEp = (uid) => legacyEndpointId({ runtime: "claude", agentUid: uid });
+  const epDir = (ep) => { const d = path.join(ledgerRoot, ep); fs.mkdirSync(d, { recursive: true, mode: 0o700 }); return d; };
+  const journalOf = (token) => readJournal({ dir, token }).doc;
+  const tok = "da88566e-d8d3-48ba-914e-7f96f4dfaeaa";
+  const at = "2026-08-31T12:00:00.000Z";
+  const baseDoc = { schema_version: "1.2", operation_kind: "maintenance_gate", token: tok, reason: "r", started_at: at, updated_at: at, phase: "planned", steps: [], notes: [] };
+  const ep = "endpoint_" + "a".repeat(24), sha = "b".repeat(64);
+  const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+  const timerDone = (chain) => ({ id: "timer:" + chain, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+  const stubDone = (chain, opTok = tok) => ({ id: "stub:" + chain, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + opTok, after: "versions/maintenance-" + opTok, state: "done", at, chain: null });
+  const curDone = (chain, opTok = tok) => ({ id: "current:" + chain, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + opTok, after: "versions/maintenance-" + opTok, state: "done", at, chain: null });
+  // R25：prepared 形态的 current（allowed：prepared current 停在半途，尚未 done）——同样的 current↔桩绑定封闭适用。
+  const curPrep = (chain, opTok = tok) => ({ id: "current:" + chain, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + opTok, after: null, state: "prepared", at, chain: null });
+  const gateDone = (opTok = tok) => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: opTok }, after: { token: opTok, txnUncleared: null }, state: "done", at, chain: null });
+  const mkEnterDone = (opTok = tok) => [timerDone("claude"), timerDone("codex"), stubDone("claude", opTok), stubDone("codex", opTok), curDone("claude", opTok), curDone("codex", opTok), gateDone(opTok)];
+  const jp = (d) => journalProblem(d);
+
+  try {
+    // ── P1-①：prepared current 指向**别的 operation** 的桩目录（同链桩仍在 → 本 op 桩目录）→ 必须拒。
+    //      旧码只对 current state==="done" 绑桩，prepared current 逃逸 → journal-legal，恢复会拿错桩。──
+    {
+      const jtok = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const badTok = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      const d = { ...baseDoc, token: jtok, operation_kind: "ledger_init", phase: "timer_stopped",
+        steps: [timerDone("claude"), timerDone("codex"), stubDone("claude", jtok), stubDone("codex", jtok), curPrep("claude", badTok), curPrep("codex", badTok)] };
+      const msg = jp(d);
+      assert.ok(msg !== null && /current 目标与 operation token 不一致|current 目标与桩不一致/u.test(msg), "P1-①：prepared current 指别 operation 桩 → 必须拒（旧码 null 漏）：" + msg);
+      // 反向（只紧不松）：prepared current 绑回本 op（与桩同 token）→ 合法。
+      const goodPrep = { ...baseDoc, token: jtok, operation_kind: "ledger_init", phase: "timer_stopped",
+        steps: [timerDone("claude"), timerDone("codex"), stubDone("claude", jtok), stubDone("codex", jtok), curPrep("claude", jtok), curPrep("codex", jtok)] };
+      assert.equal(jp(goodPrep), null, "P1-① 反向：prepared current 绑回本 op → 合法（" + jp(goodPrep) + "）");
+    }
+    // ── P1-②：done current 但**同链** stub 缺失 → 必须拒（旧码 stub===undefined 直接 continue，漏）。──
+    {
+      const jtok = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const d = { ...baseDoc, token: jtok, operation_kind: "ledger_init", phase: "timer_stopped",
+        steps: [timerDone("claude"), timerDone("codex"), stubDone("codex", jtok), curDone("claude", jtok), curDone("codex", jtok)] };
+      const msg = jp(d);
+      assert.ok(msg !== null && /current 无同链已 done 的桩/u.test(msg), "P1-②：done current 缺失同链 stub → 必须拒（旧码 null 漏）：" + msg);
+      // 反向：补上同链 stub → 合法。
+      const goodMiss = { ...baseDoc, token: jtok, operation_kind: "ledger_init", phase: "timer_stopped",
+        steps: [timerDone("claude"), timerDone("codex"), stubDone("claude", jtok), stubDone("codex", jtok), curDone("claude", jtok), curDone("codex", jtok)] };
+      assert.equal(jp(goodMiss), null, "P1-② 反向：补上同链 stub → 合法（" + jp(goodMiss) + "）");
+    }
+    // ── P1-③：done current 的 after !== intended_after（桩/目标都对，只是落盘 after 走了样）→ 必须拒。
+    //      旧码只校验 intended_after，未校验 done 态的 after 与目标一致。──
+    {
+      const jtok = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const steps = mkEnterDone(jtok).map((s) => s.id === "current:claude" ? { ...curDone("claude", jtok), after: "versions/ffffffffffffffff", intended_after: "versions/maintenance-" + jtok } : s);
+      const d = { ...baseDoc, token: jtok, operation_kind: "ledger_init", phase: "stubbed", steps };
+      const msg = jp(d);
+      assert.ok(msg !== null && /current 的 after 与 intended_after 不一致/u.test(msg), "P1-③：done current.after !== intended_after → 必须拒（旧码 null 漏）：" + msg);
+      // 反向：after 与目标一致 → 合法。
+      assert.equal(jp({ ...baseDoc, token: jtok, operation_kind: "ledger_init", phase: "stubbed", steps: mkEnterDone(jtok) }), null, "P1-③ 反向：after 与目标一致 → 合法（" + jp({ ...baseDoc, token: jtok, operation_kind: "ledger_init", phase: "stubbed", steps: mkEnterDone(jtok) }) + "）");
+    }
+    // ── P2 端到端：真实 maintenance-ledger --init --apply 写入提交但账本主锁（ledger.lock）交不还 →
+    //      非零退出码 + 退出路径点名（这是 R23 回执谎称"两组 CLI"补上的**真实命令面**断言，不含直调）。──
+    {
+      const EP = mkEp("r25_cli_init"); const d = epDir(EP);
+      const lockPath = path.join(d, "ledger.lock");
+      const origRm = fs.rmSync; let armed = true;
+      fs.rmSync = (t, ...a) => { if (armed && path.resolve(String(t)) === path.resolve(lockPath)) { armed = false; const e = new Error("EIO"); e.code = "EIO"; throw e; } return origRm(t, ...a); };
+      const outP = []; let codeP;
+      try { codeP = runMaintenanceLedger(["--init", "--endpoint", EP, "--chain", CH, "--apply"], { ctx, out: (t) => outP.push(t), env: process.env }); } finally { fs.rmSync = origRm; }
+      assert.equal(codeP, 3, "R25 --init：账本主锁交不还 → --init --apply 必须 3（旧码 0）：" + outP.join("\n"));
+      assert.match(outP.join("\n"), /账本主锁交不还/u, "R25 --init：输出点名账本主锁：" + outP.join("\n"));
+      assert.match(outP.join("\n"), /ledger\.lock/u, "R25 --init：输出带 ledger.lock 路径：" + outP.join("\n"));
+      let lockPresent = false; try { lockPresent = fs.lstatSync(lockPath).isSymbolicLink(); } catch {}
+      assert.equal(lockPresent, true, "R25 --init：ledger.lock 残骸留在原地");
+    }
+    // ── P2 端到端：真实 maintenance-ledger --cutover --apply 的**切权威侧残骸**。cutover 硬关门：
+    //      reconcileShadow 未接（恒 reconciler_absent，P1-4）→ authorityCutover 在 writeLedger 之前 fail-closed，
+    //      于是写入锁残骸（账本主锁交不还）在 cutover 侧不可达；真实可达的 cutover 残骸是**回退残骸**：
+    //      切权威 fail-closed 后回退，清 active 时 unlink EIO → 退出码 3 + 点名 active（R22 P1-1 同形，但本轮补上、可验证）。──
+    {
+      exitMaintenance(ctx, { apply: true });
+      const EP = mkEp("r25_cli_cut"); epDir(EP);
+      const outC = [];
+      const runCliCut = (argv) => runMaintenanceLedger(argv, { ctx, out: (t) => outC.push(t), env: process.env });
+      assert.equal(runCliCut(["--init", "--endpoint", EP, "--chain", CH, "--apply"]), 0, "R25 --cutover 前置 init：" + outC.join("\n"));
+      assert.equal(readActive({ dir }).state, "absent", "R25 --cutover 前置：init 后 active 清掉");
+      const activeP = path.join(dir, "active");
+      const origUn = fs.unlinkSync; let armedCut = true;
+      fs.unlinkSync = (p) => { if (armedCut && path.resolve(String(p)) === path.resolve(activeP)) { armedCut = false; const e = new Error("EIO"); e.code = "EIO"; throw e; } return origUn(p); };
+      let codeC;
+      try { codeC = runCliCut(["--cutover", "--endpoint", EP, "--apply"]); } finally { fs.unlinkSync = origUn; }
+      const cutOut = outC.join("\n");
+      assert.equal(codeC, 3, "R25 --cutover：active 清不掉 → --cutover --apply 必须 3（旧码 1）：" + cutOut);
+      assert.match(cutOut, /回退没做全/u, "R25 --cutover：要报'回退没做全（...)'：" + cutOut);
+      assert.match(cutOut, /active/u, "R25 --cutover：点名 active 清不掉（残骸路径文案）：" + cutOut);
+      assert.notEqual(readActive({ dir }).state, "absent", "R25 --cutover：active 未被清空（回退没做全）：" + readActive({ dir }).state);
+    }
+  } finally {
+    if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedgerDir;
+    if (savedGateEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; else process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = savedGateEnv;
+    if (savedMaintDirEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = savedMaintDirEnv;
+    if (prevTpl === undefined) delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; else process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = prevTpl;
+    fs.rmSync(base, { recursive: true, force: true }); fs.rmSync(ledgerRoot, { recursive: true, force: true });
+  }
+});
+
 
 summarySealed = true;
 

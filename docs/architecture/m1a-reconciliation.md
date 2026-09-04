@@ -335,7 +335,8 @@ sidecars:{expiry:{sha256},pending_claims:{sha256},policy:{sha256}} }` |
 ## 7. doctor 输出纪律
 
 问题码 + opaque id/字段名/哈希；**不得原样输出 locator/session/thread/项目路径**；上限
-10 条 + "另 N 条"；完整清单进 0600 机器级诊断制品。
+10 条 + "另 N 条"；完整清单由维护写入口（T3b）随 op 落 0600 制品，doctor 纯体检
+**零写入**（与全局体检纪律一致：一个字节都不改），只给正文摘要。
 **shadow 账本 absent 按初始化收据分支（六轮 P1-4，与账本规格 WAL/永久收据一致）**：
 - 收据 never_initialized ∧ ledger absent → 未初始化，跳过（不红）；
 - 收据 prepared（未完成 init WAL）→ 按 B-2 恢复矩阵报告（只允许同 token 恢复）；

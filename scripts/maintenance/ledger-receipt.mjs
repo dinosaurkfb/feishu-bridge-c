@@ -18,7 +18,7 @@
  * never_initialized ok:true 放行，doctor ⑬ 跳过）；且"进行中 WAL + 既有终态同种并存"在 same-token 分支被
  * 提前放行成 ok_in_progress（fail-open）。这里抽出**单一判据核心** `judgeLedgerReceipt`，两个入口共用。
  */
-import { JOURNAL_SCHEMA, LEGACY_JOURNAL_SCHEMA, listJournals, readJournal } from "./journal.mjs";
+import { JOURNAL_SCHEMA, LEGACY_JOURNAL_SCHEMA, listJournals, readJournal, TERMINAL_PHASES } from "./journal.mjs";
 
 const LEDGER_KINDS = Object.freeze(["ledger_init", "ledger_cutover"]);
 const KIND_IS_INIT = Object.freeze({ ledger_init: true, ledger_cutover: false });
@@ -142,4 +142,26 @@ export function aggregateEndpointReceipts({ dir } = {}) {
   }
   const badUnreadable = c.unreadable.length > 0;
   return { ok: !badUnreadable && conflictWhy === null, unreadable: c.unreadable, endpoints, why: conflictWhy !== null ? ("收据矛盾：" + conflictWhy) : (badUnreadable ? c.why ?? null : null) };
+}
+
+/**
+ * 未完成 init WAL（M1a v6 §7 的 "prepared" 态）：operation_kind=ledger_init 且 phase 非终态
+ * （终态 = done / rolled_back）的 journal，按 endpoint 归并。rolled_back 是回退清场的归档收据，
+ * **不算** prepared —— 回退后账本缺席应走 never_initialized 分支，而不是报「恢复」。
+ * 任一 journal 读不出 → fail-closed（ok:false）。返回 { ok:true, prepared:[{endpointId, token, phase}] }。
+ */
+export function preparedLedgerInits({ dir } = {}) {
+  const list = listJournals({ dir });
+  if (!list.ok) return { ok: false, why: list.why ?? "维护目录读不出" };
+  const prepared = [];
+  for (const token of list.tokens) {
+    const j = readJournal({ dir, token });
+    if (j.state !== "valid") return { ok: false, why: "journal " + token.slice(0, 8) + " 读不出（" + (j.why ?? j.state) + "）—— prepared 判定 fail-closed" };
+    if (j.doc.schema_version !== JOURNAL_SCHEMA) continue; // 旧 1.1 非账本种
+    if (j.doc.operation_kind !== "ledger_init") continue;
+    if (TERMINAL_PHASES.includes(j.doc.phase)) continue;
+    const ep = endpointOf(j.doc);
+    if (ep !== null) prepared.push({ endpointId: ep, token, phase: j.doc.phase });
+  }
+  return { ok: true, prepared };
 }

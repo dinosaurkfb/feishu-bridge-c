@@ -40,6 +40,7 @@ const SHA_SHAPE = /^[0-9a-f]{64}$/u;
 // 生产权威形状（评审二 P1-1/P1-6）：endpoint = legacyEndpointId = stableControlId("endpoint",…) = endpoint_<24hex>；
 // 链不可从 opaque endpoint 还原，另存顶层 chain。om_/oc_/session-UUID 各按真实前缀；claim key 复用 CLAIM_KEY_SHAPE。
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
+export { ENDPOINT_SHAPE }; // 只读导出（doctor ⑭ 枚举账本目录用）：同一形状只住一处
 const CHAIN = ["claude", "codex"];
 const OM_SHAPE = /^om_[A-Za-z0-9]{1,120}$/u;                 // 根消息 / matched om
 const CHAT_SHAPE = /^oc_[A-Za-z0-9]{1,120}$/u;               // 受验群 chat_id
@@ -82,6 +83,8 @@ function ledgerRoot(env = process.env) {
   const home = realUserHome();
   return home ? path.join(home, ".claude", "feishu-bridge", "ledger") : null;
 }
+/** 只读派生同源导出（doctor ⑭ 枚举账本目录用）：同一概念只住一处，不许第二份路径派生。 */
+export const ledgerRootFor = (env = process.env) => ledgerRoot(env);
 
 /**
  * 由 endpointId 派生受验目录：root 必须存在且是真目录（realpath 自洽），dir=root/endpoint；

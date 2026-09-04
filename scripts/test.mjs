@@ -224,6 +224,8 @@ import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrai
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
 import { acquireOperationLease, addNote as addNoteJ, addStepPrepared as addStepPreparedJ, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, enterLedgerForward, journalProblem, readActive, readJournal, releaseOperationLease, setPhase as setPhaseJ, updateJournal } from "./maintenance/journal.mjs";
 import * as LEDGER_OP from "./maintenance/ledger-operation.mjs";
+import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot, legacySourceDigest } from "./m1a/legacy-snapshot.mjs";
+import { topicAgentIdForLegacy, discriminateGeneration, effectiveBindingStatus, projectLegacySnapshot, projectShadowBFamily, reconcileLegacyEndpoint, isBFamily } from "./m1a/reconcile.mjs";
 import { commitForInstall, finishInstallReopening, liveBaseline, stageForInstall, stagedChecks, stagedPlanProblem, verifyLiveForInstall, verifyStagedForInstall } from "./maintenance/maintenance-install-core.mjs";
 import { parseMaintenanceInstallArgs, runMaintenanceInstall } from "./maintenance-install.mjs";
 import { acquireInstallSurfaceLock, inspectInstallSurfaceLock } from "./install-surface-lock.mjs";
@@ -25973,6 +25975,476 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
   }
 });
 
+// ── R19：M1a 只读对账半区（规格 docs/architecture/m1a-reconciliation.md v6）行为回归 ──
+// 适配器（§1）/ 判别（§2）/ 投影（§3）/ reconciler（§6）严格只读；doctor ⑭（§7）按初始化收据分支。
+{
+  const UUID1 = "22222222-2222-4222-8222-222222222222";
+  const OM1 = "om_" + "b".repeat(10);
+  const CHAT1 = "oc_" + "a".repeat(32);
+  const EP1 = "endpoint_" + "1".repeat(24);
+  const m1aTemp = () => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "m1a-")));
+  const writeTpl = (home, over = {}) => {
+    const dir = path.join(home, ".claude", "feishu-bridge");
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const tpl = { chain: "claude", transport_agent_name: "t", transport_app_id: "cli_a", transport_open_id: "ou_a",
+      outbound_agent_name: "o", outbound_app_id: "cli_b", outbound_open_id: "ou_b", lark_cli_profile: "p",
+      lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "1", chat_name: "n",
+      chat_id: CHAT1, default_freshness_ms: 1000, agent_uid: "agent_r19", ...over };
+    const file = path.join(dir, "chain-config.json");
+    fs.writeFileSync(file, JSON.stringify(tpl, null, 2) + "\n", { mode: 0o600 });
+    return { tpl, file };
+  };
+  const writeRegistry = (home, projects) => {
+    const file = path.join(home, ".claude", "feishu-bridge", "registry.json");
+    fs.writeFileSync(file, JSON.stringify({ projects }, null, 2) + "\n", { mode: 0o600 });
+    return file;
+  };
+  const GEN = (over = {}) => ({ channel_generation_id: "g1", generation: 1, status: "active", root_message_id: OM1,
+    session_id: "sess_u1", created_at: "2026-08-01T00:00:00.000Z", pending_token: null, claim_expires_at: null, ...over });
+  const STATE = (over = {}) => ({ schema_version: "1.0", artifact_type: "feishu_bridge_topic_generations",
+    binding_id: "p1@registry", binding_status: "active", active_generation_id: "g1", rotation: null,
+    generations: [GEN()], ...over });
+  const MAPPING = (over = {}) => ({ binding_id: "p1@registry", status: "active", root_message_id: OM1,
+    session_id: "sess_u1", channel_generation_id: "g1", claude_session_id: UUID1,
+    topic_generation_state: STATE(), ...over });
+  const writeMapping = (proj, mapping) => {
+    const dir = path.join(proj, ".runtime-data", "inbound");
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const file = path.join(dir, "active-mapping.json");
+    fs.writeFileSync(file, JSON.stringify(mapping, null, 2) + "\n", { mode: 0o600 });
+    return file;
+  };
+  const claudeSandbox = () => {
+    const home = m1aTemp();
+    const proj = path.join(home, "proj");
+    fs.mkdirSync(proj, { recursive: true, mode: 0o700 });
+    const tpl = writeTpl(home);
+    const registryFile = writeRegistry(home, [{ root: proj, id: "p1", claude_session_id: UUID1 }]);
+    return { home, proj, tplFile: tpl.file, chatId: tpl.tpl.chat_id, registryFile };
+  };
+  const collect = (s) => collectClaudeLegacySnapshot({ registryFile: s.registryFile, templateFile: s.tplFile });
+  // 手工合法 shadow 账本种子（同 R17 块的 seedLedger 形状，不依赖维护 capability）。
+  const seedShadow = (dir, ep) => {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const opId = "00000000-0000-0000-0000-000000000001";
+    const doc = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: ep, chain: "claude",
+      authority_mode: "shadow", revision: 1,
+      operations: { [opId]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init",
+        fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: ep, chain: "claude" }), result_revision: 1, result: { revision: 1 } } },
+      records: {} };
+    fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    const l = TAL.loadLedger(dir, { endpointId: ep });
+    assert.ok(l.ok, "种子账本自洽：" + JSON.stringify(l));
+    return l.doc;
+  };
+  const walkSha = (dir) => {
+    const out = [];
+    const walk = (d) => {
+      let items = [];
+      try { items = fs.readdirSync(d, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)); } catch { return; }
+      for (const e of items) {
+        const full = path.join(d, e.name);
+        if (e.isDirectory()) walk(full);
+        else if (e.isSymbolicLink()) {
+          // symlink（如 runtime/current → versions/<hash>）：follow 后按目标类型走，断链记作独立身份。
+          let st = null; try { st = fs.statSync(full); } catch { out.push(full + ":broken-link"); continue; }
+          if (st.isDirectory()) walk(full);
+          else { const r = fs.readFileSync(full); out.push(full + ":" + TAL.sha256(r) + ":" + r.length); }
+        }
+        else { const r = fs.readFileSync(full); out.push(full + ":" + TAL.sha256(r) + ":" + r.length); }
+      }
+    };
+    walk(dir);
+    return out;
+  };
+
+  test("R19 §1 Claude 适配器：项目文件优先 / 内联 fallback / enabled:false 仍进快照", () => {
+    const s = claudeSandbox();
+    try {
+      // 文件优先：registry 条目给 enabled:false，mapping 文件的 state 生效（generation_source=stored_v1）。
+      writeRegistry(s.home, [{ root: s.proj, id: "p1", claude_session_id: UUID1, enabled: false, status: "retired" }]);
+      writeMapping(s.proj, MAPPING());
+      const snap = collect(s);
+      assert.ok(snap.ok, "快照成立：" + JSON.stringify(snap));
+      assert.equal(snap.bindings.length, 1, "文件优先 → 单投影（registry 不产第二份）");
+      assert.deepEqual([snap.bindings[0].binding_id, snap.bindings[0].generation_source, snap.bindings[0].state.binding_status],
+        ["p1@registry", "stored_v1", "active"], "binding/state 取项目文件");
+      assert.equal(snap.bindings[0].enabled, undefined, "文件优先时 runtime 不读 enabled（无 enabled 字段）");
+      assert.ok(snap.bindings[0].binding_target.complete, "受验 session 齐 → target complete");
+      assert.equal(snap.chat_id, CHAT1, "chat_id 来自链模板");
+      // 内联 fallback：mapping 缺席 → registry 条目投影；enabled:false 仍进快照。
+      // 条目形状对齐 bind 登记时的真实形状（绑定信息就住在这一行：root_message_id / session_id / status）。
+      fs.rmSync(path.join(s.proj, ".runtime-data"), { recursive: true, force: true });
+      writeRegistry(s.home, [{ root: s.proj, id: "p1", claude_session_id: UUID1, enabled: false, status: "active",
+        root_message_id: OM1, session_id: "sess_u1", created_at: "2026-08-01T00:00:00.000Z" }]);
+      const snap2 = collect(s);
+      assert.ok(snap2.ok, "fallback 快照成立：" + JSON.stringify(snap2));
+      assert.deepEqual([snap2.bindings.length, snap2.bindings[0].generation_source, snap2.bindings[0].enabled],
+        [1, "stored_v1", false], "内联投影（物化前置在 mappingFromRegistryEntry）+ disabled 仍进快照（§4 enabled 行）：" + JSON.stringify(snap2.bindings[0]));
+      assert.equal(effectiveBindingStatus(snap2.bindings[0]), "paused", "enabled:false → effective paused");
+    } finally { fs.rmSync(s.home, { recursive: true, force: true }); }
+  });
+
+  test("R19 §1 严格读取 fail-closed：坏 JSON / 坏 state / 双投影 / target 缺不选值", () => {
+    const s = claudeSandbox();
+    try {
+      const mapFile = writeMapping(s.proj, MAPPING());
+      assert.equal(collect(s).ok, true, "基线成立");
+      fs.writeFileSync(mapFile, "{ 坏", "utf-8");
+      let r = collect(s);
+      assert.deepEqual([r.ok, r.reason, r.source], [false, "legacy_unreadable", "project-mapping"], "项目文件 JSON 坏 → unreadable");
+      fs.writeFileSync(mapFile, JSON.stringify(MAPPING({ topic_generation_state: STATE({ schema_version: "9.9" }) })));
+      r = collect(s);
+      assert.deepEqual([r.ok, r.reason, r.source], [false, "legacy_unreadable", "topic-generation-state"], "state 校验不过 → unreadable");
+      writeMapping(s.proj, MAPPING());
+      const other = path.join(s.home, "other");
+      fs.mkdirSync(other, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(other, ".marker"), "x");
+      // 第二条目也给全字段（bind 登记形状）——否则先在物化层 unreadable，轮不到 conflict。
+      writeRegistry(s.home, [{ root: s.proj, id: "p1", claude_session_id: UUID1 },
+        { root: other, id: "p1", status: "active", root_message_id: OM1, session_id: "sess_u1", created_at: "2026-08-01T00:00:00.000Z" }]);
+      r = collect(s);
+      assert.deepEqual([r.ok, r.reason], [false, "legacy_conflict"], "双投影 binding_id → conflict：" + JSON.stringify(r));
+      // target 缺：绝不临时选值 —— complete=false 交给判别层待修。
+      // 走 fallback（删 mapping）：registry 条目给 legacy 字段但不给 claude_session_id。
+      fs.rmSync(path.join(s.proj, ".runtime-data"), { recursive: true, force: true });
+      writeRegistry(s.home, [{ root: s.proj, id: "p1", status: "active", root_message_id: OM1, session_id: "sess_u1", created_at: "2026-08-01T00:00:00.000Z" }]);
+      r = collect(s);
+      assert.ok(r.ok, "无 session 快照仍成立");
+      assert.deepEqual([r.bindings[0].binding_target.complete, r.bindings[0].binding_target.claude_session_id],
+        [false, null], "缺 claude_session_id → complete:false + null（不选值）");
+      const p = projectLegacySnapshot({ endpointId: EP1, chain: "claude", snapshot: r });
+      assert.ok(p.ok && p.blockers.some((b) => b.code === "target_incomplete"), "判别层落 target_incomplete 待修");
+      // 模板缺席 = chat_id 无权威 → unreadable。
+      fs.rmSync(s.tplFile, { force: true });
+      r = collect(s);
+      assert.deepEqual([r.ok, r.reason, r.source], [false, "legacy_unreadable", "chain-template"], "模板读不出 → unreadable");
+    } finally { fs.rmSync(s.home, { recursive: true, force: true }); }
+  });
+
+  test("R19 §1 Codex 适配器：task 覆盖优先 / 模板兜底 / disabled 进快照 / 覆盖形状坏 fail-closed", () => {
+    const home = m1aTemp();
+    try {
+      const proj = path.join(home, "cproj");
+      fs.mkdirSync(proj, { recursive: true, mode: 0o700 });
+      // collectCodexLegacySnapshot 的 home 参数 = bridge home（registry.json / chain-config.json 都在它下面）。
+      const bridge = path.join(home, "codex-bridge");
+      fs.mkdirSync(bridge, { recursive: true, mode: 0o700 });
+      const tplFile = path.join(bridge, "chain-config.json");
+      // Codex 模板要过 loadChainTemplate 完整性 + validateCodexTemplate（chain=codex、inbound_prefix=null、单身份三组相同）。
+      const tpl = { chain: "codex", inbound_prefix: null, transport_agent_name: "m5codex", transport_app_id: "cli_a",
+        transport_open_id: "ou_a", outbound_agent_name: "m5codex", outbound_app_id: "cli_a", outbound_open_id: "ou_a",
+        lark_cli_profile: "p", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "1",
+        chat_name: "n", chat_id: CHAT1, default_freshness_ms: 1000, agent_uid: "agent_r19c" };
+      fs.writeFileSync(tplFile, JSON.stringify(tpl, null, 2) + "\n", { mode: 0o600 });
+      const regFile = path.join(bridge, "registry.json");
+      const tasks = (t) => { fs.writeFileSync(regFile, JSON.stringify({ tasks: t }, null, 2), { mode: 0o600 }); };
+      const snapOf = () => collectCodexLegacySnapshot({ home: bridge });
+      // Codex registry 的 task 字段与 scripts/codex/state.mjs validateRegistryDocument 对齐：
+      // key 字符集、id 与 key 一致（缺失才由物化补）、root 绝对路径；enabled:false 仍进快照；task 级 chat_id 覆盖优先。
+      tasks([{ logical_task_key: "k1", root: proj, codex_thread_id: "th_1", enabled: false,
+        status: "active", root_message_id: "om_" + "c".repeat(10), session_id: "sess_c1", created_at: "2026-08-01T00:00:00.000Z",
+        chat_id: "oc_" + "f".repeat(32) }]);
+      let r = snapOf();
+      assert.ok(r.ok, "codex 快照成立：" + JSON.stringify(r));
+      assert.deepEqual([r.bindings.length, r.bindings[0].binding_id, r.bindings[0].enabled],
+        [1, "k1@codex-registry", false], "binding_id（物化补 id）/ disabled 进快照");
+      assert.equal(r.bindings[0].chat_id, "oc_" + "f".repeat(32), "task 覆盖优先");
+      assert.equal(r.bindings[0].binding_target.complete, true, "thread/root 齐 → target complete");
+      assert.equal(r.bindings[0].binding_target.codex_task_id, "k1", "codex_task_id 采集");
+      tasks([{ logical_task_key: "k1", root: proj, codex_thread_id: "th_1",
+        status: "active", root_message_id: "om_" + "c".repeat(10), session_id: "sess_c1", created_at: "2026-08-01T00:00:00.000Z" }]);
+      r = snapOf();
+      assert.ok(r.ok, "兜底快照成立：" + JSON.stringify(r));
+      assert.equal(r.bindings[0].chat_id, CHAT1, "无覆盖 → 模板群兜底");
+      // 覆盖值形状坏 = 采集失败（不静默兜底）。
+      tasks([{ logical_task_key: "k1", root: proj, codex_thread_id: "th_1", chat_id: "oc_坏!",
+        status: "active", root_message_id: "om_" + "c".repeat(10), session_id: "sess_c1", created_at: "2026-08-01T00:00:00.000Z" }]);
+      r = snapOf();
+      assert.deepEqual([r.ok, r.reason, r.source], [false, "legacy_unreadable", "codex-registry:0"], "覆盖值形状坏 → fail-closed");
+      // thread 缺 → target 不全（判别层待修），不是 unreadable。
+      tasks([{ logical_task_key: "k1", root: proj,
+        status: "active", root_message_id: "om_" + "c".repeat(10), session_id: "sess_c1", created_at: "2026-08-01T00:00:00.000Z" }]);
+      r = snapOf();
+      assert.ok(r.ok && r.bindings[0].binding_target.complete === false, "thread 缺 → complete:false");
+      // registry JSON 坏 → unreadable。
+      fs.writeFileSync(regFile, "{ 坏", "utf-8");
+      r = snapOf();
+      assert.deepEqual([r.ok, r.reason], [false, "legacy_unreadable"], "codex registry 坏 → unreadable");
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("R19 §1 snapshot_identity：字典序 / 缺席=null+父 realpath / registry 变→身份变", () => {
+    const s = claudeSandbox();
+    try {
+      writeMapping(s.proj, MAPPING());
+      const snap = collect(s);
+      assert.ok(snap.ok, "快照成立");
+      const id1 = snap.snapshot_identity;
+      const sorted = [...id1].sort((a, b) => (a.path < b.path ? -1 : 1));
+      assert.deepEqual(id1, sorted, "按路径字典序");
+      assert.ok(id1.every((e) => e.sha256 !== null), "在场文件都有 sha");
+      const regFile = s.registryFile;
+      // registry 内容变 → 身份变（项目集合变化的载体）。
+      fs.writeFileSync(regFile, fs.readFileSync(regFile, "utf-8") + " ", { mode: 0o600 });
+      const snap2 = collect(s);
+      assert.ok(snap2.ok, "二次快照成立");
+      assert.notDeepEqual(snap2.snapshot_identity, id1, "registry 内容变 → 身份变");
+      // 缺席文件：sha=null，身份=受验真实父目录 + basename。
+      fs.rmSync(regFile, { force: true });
+      const snap3 = collect(s);
+      assert.ok(snap3.ok, "registry 缺席快照仍成立");
+      const absent = snap3.snapshot_identity.find((e) => e.path.endsWith("registry.json"));
+      assert.ok(absent && absent.sha256 === null && absent.path.includes(path.basename(s.home)),
+        "缺席 = null + 父 realpath：" + JSON.stringify(absent));
+    } finally { fs.rmSync(s.home, { recursive: true, force: true }); }
+  });
+
+  test("R19 §2 判别矩阵：b1/b2/b3/c1-c4/d1-d4/retired/0b/preparing 全支", () => {
+    const d = (generation, eff, rotation = null) => discriminateGeneration(generation, { eff, rotation });
+    assert.deepEqual(d(GEN({ status: "retired" }), "active"), { exclude: true }, "retired 代际 → exclude");
+    assert.deepEqual(d(GEN({ status: "pending", session_id: null }), "active"), { family: "B1" }, "b1 初绑");
+    assert.deepEqual(d(GEN({ status: "pending", session_id: null }), "active", { status: "awaiting_claim", pending_generation_id: "g1" }),
+      { family: "B1" }, "b2 轮转待认领");
+    assert.deepEqual(d(GEN({ status: "pending", session_id: null }), "active", { status: "awaiting_claim", pending_generation_id: "g9" }),
+      { blocker: "pending_unresolvable" }, "b3 待认领别家");
+    assert.deepEqual(d(GEN({ status: "pending", session_id: null }), "paused"), { blocker: "pending_unresolvable" }, "b3 暂停+pending");
+    assert.deepEqual(d(GEN({ session_id: null }), "active"), { blocker: "session_missing" }, "c1 active 无 session");
+    assert.deepEqual(d(GEN(), "active"), { family: "B3" }, "c2 → B3");
+    assert.deepEqual(d(GEN(), "paused"), { family: "B3prime" }, "c3 disabled → B3prime");
+    assert.deepEqual(d(GEN({ session_id: null, status: "read-only" }), "active"), { blocker: "session_missing" }, "d1 read-only 无 session");
+    assert.deepEqual(d(GEN({ status: "read-only" }), "active"), { family: "B4" }, "d2 → B4");
+    assert.deepEqual(d(GEN({ status: "read-only" }), "paused"), { blocker: "paused_readonly" }, "d3 不静默映 B4");
+    assert.deepEqual(d(GEN({ status: "read-only" }), "retired"), { blocker: "binding_retired_readonly" }, "read-only × retired binding（纵深）");
+    assert.deepEqual(d(GEN({ status: "nope" }), "active"), { blocker: "legacy_state_unmapped" }, "未命中唯一分支");
+    // 0b（project 层）：retired binding / 全代际 retired → binding 级 blocker。
+    const proj = (state, enabled) => projectLegacySnapshot({ endpointId: EP1, chain: "claude",
+      snapshot: { ok: true, chain: "claude", snapshot_identity: [], chat_id: CHAT1, bindings: [{ binding_id: "p1@registry", enabled, root: "/p", chat_id: CHAT1, state, generation_source: "stored_v1", binding_target: { runtime: "claude", project_root: "/p", claude_session_id: UUID1, complete: true }, source_files: [] }] } });
+    let p = proj(STATE({ binding_status: "retired", generations: [GEN({ status: "retired" })], active_generation_id: null }), undefined);
+    assert.deepEqual([p.ok, p.blockers.map((b) => b.code)], [true, ["binding_retired"]], "eff retired → 一条 binding 级 blocker");
+    p = proj(STATE({ generations: [GEN({ status: "retired" })], active_generation_id: null }), undefined);
+    assert.deepEqual([p.ok, p.blockers.map((b) => b.code)], [true, ["binding_retired"]], "全代际 retired（binding 未标）也 → binding_retired");
+    p = proj(STATE({ generations: [GEN({ status: "retired", session_id: null }), GEN({ channel_generation_id: "g2", generation: 2 })], active_generation_id: "g2" }), undefined);
+    assert.deepEqual([p.ok, p.blockers.length, p.records.size], [true, 0, 1], "部分 retired → 只排除该代际（纵深），不报 blocker");
+    // preparing → 全局拒。
+    p = proj(STATE({ rotation: { status: "preparing", operation_id: "op1" } }), undefined);
+    assert.deepEqual([p.ok, p.reason, p.global], [false, "legacy_unreconcilable", "rotation_preparing"], "cutover_blocked:rotation_preparing");
+  });
+
+  test("R19 §3 投影封闭：C 字段集 / facts 封闭值 / ta id 公式 / legacy_source_digest", () => {
+    const s = claudeSandbox();
+    try {
+      writeMapping(s.proj, MAPPING());
+      const snap = collect(s);
+      const mk = (state, enabled) => projectLegacySnapshot({ endpointId: EP1, chain: "claude",
+        snapshot: { ...snap, bindings: [{ ...snap.bindings[0], state, enabled }] } });
+      const recOf = (state, enabled) => { const p = mk(state, enabled); assert.ok(p.ok, "投影成立：" + JSON.stringify(p)); return [...p.records.values()][0]; };
+      const rec = recOf(STATE());
+      assert.deepEqual(Object.keys(rec).sort(),
+        ["aliases", "binding_target", "chat_id", "facts", "generation_lineage_id", "topic_agent_id"], "C 字段集封闭");
+      assert.deepEqual(rec.facts, { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" }, "B3 facts");
+      assert.equal(rec.topic_agent_id, topicAgentIdForLegacy(EP1, "p1@registry", "g1"), "ta id 公式");
+      assert.notEqual(topicAgentIdForLegacy(EP1 + "x", "p1@registry", "g1"), rec.topic_agent_id, "endpoint 进公式");
+      assert.deepEqual(recOf(STATE({ generations: [GEN({ status: "pending", session_id: null })], active_generation_id: null })).facts,
+        { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }, "B1 facts");
+      assert.deepEqual(recOf(STATE({ generations: [GEN({ status: "read-only" })], active_generation_id: null })).facts,
+        { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "historical" }, "B4 facts");
+      const recP = recOf(STATE(), false);
+      assert.deepEqual([recP.facts.binding, recP.aliases.session_id], ["dormant", "sess_u1"], "paused → B3prime facts + session 并入");
+      // legacy_source_digest：同输入同值；源变 → 值变。
+      const b = snap.bindings[0];
+      const d1 = legacySourceDigest({ binding: b, generation: b.state.generations[0] });
+      assert.ok(d1.ok && d1.digest.length === 64 && /^[0-9a-f]{64}$/.test(d1.digest), "digest 是 64hex");
+      const d2 = legacySourceDigest({ binding: b, generation: b.state.generations[0] });
+      assert.equal(d1.digest, d2.digest, "同输入同 digest");
+      writeRegistry(s.home, [{ root: s.proj, id: "p1", claude_session_id: UUID1, note: "changed" }]);
+      const snapX = collect(s);
+      const d3 = legacySourceDigest({ binding: snapX.bindings[0], generation: snapX.bindings[0].state.generations[0] });
+      assert.notEqual(d1.digest, d3.digest, "源文件变 → digest 变");
+    } finally { fs.rmSync(s.home, { recursive: true, force: true }); }
+  });
+
+  test("R19 §6 双射：一致 / E 多 / S 多 / 字段不等 / snapshot_moved / 账本态 fail-closed", () => {
+    const s = claudeSandbox();
+    try {
+      writeMapping(s.proj, MAPPING());
+      const snap = collect(s);
+      const proj = projectLegacySnapshot({ endpointId: EP1, chain: "claude", snapshot: snap });
+      assert.ok(proj.ok, "投影成立");
+      const [id, rec] = [...proj.records][0];
+      const shadowRec = { kind: "live", topic_agent_id: id, chat_id: rec.chat_id, aliases: { ...rec.aliases },
+        facts: { ...rec.facts }, binding_target: { ...rec.binding_target }, binding_proof: null, locator_link_proof_ref: null,
+        anchor_candidate: null, generation_lineage_id: rec.generation_lineage_id,
+        origin_operation_id: "00000000-0000-0000-0000-000000000000", created_at: "2026-08-01T00:00:00.000Z", updated_at: "2026-08-01T00:00:00.000Z" };
+      const mkLedger = (doc) => ({ ok: true, doc, sha256: "s".repeat(64) });
+      const run = (records, over = {}) => reconcileLegacyEndpoint({ endpointId: EP1, chain: "claude",
+        collectLegacy: () => snap, loadLedgerFn: () => mkLedger({ chain: "claude", revision: 7, records, operations: {}, ...over }) });
+      const r1 = run({ [id]: shadowRec });
+      assert.ok(r1.ok === true && /^[0-9a-f]{64}$/.test(r1.digest) && r1.cutover_blockers.length === 0, "一致 → digest：" + JSON.stringify(r1));
+      assert.deepEqual(r1.snapshot_identity, snap.snapshot_identity, "返回 snapshot_identity（doctor 制品用）");
+      let r2 = run({});
+      assert.deepEqual([r2.ok, r2.reason, r2.mismatches.map((m) => m.code)], [false, "bijection_mismatch", ["extra_in_legacy"]], "E 多");
+      const alien = { ...shadowRec, topic_agent_id: "ta_" + "f".repeat(32) };
+      r2 = run({ [alien.topic_agent_id]: alien });
+      assert.deepEqual([r2.ok, r2.mismatches.map((m) => m.code)], [false, ["extra_in_legacy", "extra_in_shadow"]], "双方各多（mismatch 排序确定）");
+      r2 = run({ [id]: { ...shadowRec, chat_id: "oc_" + "c".repeat(32) } });
+      assert.deepEqual([r2.ok, r2.mismatches[0].code, r2.mismatches[0].field], [false, "field_mismatch", "chat_id"], "字段不等点名字段");
+      // 账本态 fail-closed。
+      r2 = reconcileLegacyEndpoint({ endpointId: EP1, chain: "claude", collectLegacy: () => snap, loadLedgerFn: () => ({ ok: false, reason: "absent", why: null }) });
+      assert.deepEqual([r2.ok, r2.reason], [false, "ledger_absent"], "账本缺席 fail-closed");
+      r2 = run({}, { chain: "codex" });
+      assert.deepEqual([r2.ok, r2.reason], [false, "chain_mismatch"], "链不符 fail-closed");
+      // 快照一致性：revision 变 / identity 变 → inconclusive。
+      let calls = 0;
+      r2 = reconcileLegacyEndpoint({ endpointId: EP1, chain: "claude", collectLegacy: () => snap,
+        loadLedgerFn: () => (calls++ < 1 ? mkLedger({ chain: "claude", revision: 7, records: { [id]: shadowRec } }) : mkLedger({ chain: "claude", revision: 8, records: { [id]: shadowRec } })) });
+      assert.deepEqual([r2.ok, r2.reason], [null, "snapshot_moved"], "账本 revision 变 → snapshot_moved");
+      let lcalls = 0;
+      r2 = reconcileLegacyEndpoint({ endpointId: EP1, chain: "claude",
+        collectLegacy: () => (lcalls++ < 1 ? snap : { ...snap, snapshot_identity: [{ ...snap.snapshot_identity[0], sha256: "x" }] }),
+        loadLedgerFn: () => mkLedger({ chain: "claude", revision: 7, records: { [id]: shadowRec } }) });
+      assert.deepEqual([r2.ok, r2.reason], [null, "snapshot_moved"], "legacy 身份变 → snapshot_moved");
+      // S 侧投影只取 live B 族。
+      assert.equal(projectShadowBFamily({ records: { [id]: shadowRec } }).size, 1, "live B 族入 S");
+      assert.equal(projectShadowBFamily({ records: { a: { ...shadowRec, facts: { binding: "none", session: "absent", anchor: "absent", locator_link_proof: "absent", generation: "n/a" } } } }).size, 0, "A 族不参与双射");
+      assert.equal(isBFamily({ generation: "current" }), true, "isBFamily B 族");
+      assert.equal(isBFamily({ generation: "n/a" }), false, "isBFamily A 族");
+    } finally { fs.rmSync(s.home, { recursive: true, force: true }); }
+  });
+
+  test("R19 零写入：适配器 + 对账前后 legacy 与账本逐文件 SHA 全等", () => {
+    const s = claudeSandbox();
+    const savedLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    try {
+      writeMapping(s.proj, MAPPING());
+      const ledgerRoot = path.join(s.home, "ledger");
+      process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
+      seedShadow(path.join(ledgerRoot, EP1), EP1);
+      const before = [...walkSha(s.home), ...walkSha(ledgerRoot)];
+      const snap = collect(s);
+      assert.ok(snap.ok, "适配器成立");
+      const r = reconcileLegacyEndpoint({ endpointId: EP1, chain: "claude", collectLegacy: () => collect(s),
+        loadLedgerFn: () => TAL.loadLedger(path.join(ledgerRoot, EP1), { endpointId: EP1 }) });
+      assert.ok(r.ok !== undefined, "对账跑完（账本无 B 族记录 → mismatch 属正常）：" + JSON.stringify(r.ok) + " " + (r.reason ?? ""));
+      const after = [...walkSha(s.home), ...walkSha(ledgerRoot)];
+      assert.deepEqual(after, before, "对账区间内 legacy + 账本逐文件 SHA 全等（诊断制品不在断言目录内）");
+    } finally {
+      if (savedLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedger;
+      fs.rmSync(s.home, { recursive: true, force: true });
+    }
+  });
+
+  test("R19 §7 doctor ⑭：四分支 + 输出纪律 + 诊断制品 0600", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "m1a-doctor-"));
+    const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
+    fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+    const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+    for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
+      execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
+    }
+    const node = pickClaudeNodeB();
+    const claudeRoot = path.join(home, ".claude", "feishu-bridge", "runtime");
+    const claudeLabel = "com.frank.feishu-bridge-cc.drain";
+    const launchd = { [claudeLabel]: { loaded: true, args: [...claudeDrainExpectedJobB({ home, node }).args] } };
+    const fakeLaunchctl = (args) => {
+      if (args[0] === "list") { const st = launchd[args[1]]; if (!st?.loaded) return { ok: false, detail: "Could not find service \"" + args[1] + "\" in domain" }; return { ok: true, stdout: "{\n\t\"ProgramArguments\" = (\n" + st.args.map((a) => "\t\t\"" + a + "\";").join("\n") + "\n\t);\n};\n" }; }
+      if (args[0] === "bootout") { const label = args[1].split("/").pop(); const st = launchd[label]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; st.loaded = false; return { ok: true, stdout: "" }; }
+      if (args[0] === "bootstrap") { const xml = fs.readFileSync(args[2], "utf-8"); const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/u.exec(xml)[1]; const arr = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/u.exec(xml)[1]; const a2 = [...arr.matchAll(/<string>([^<]*)<\/string>/gu)].map((m) => m[1]); launchd[label] = { loaded: true, args: a2 }; return { ok: true, stdout: "" }; }
+      return { ok: false, detail: "unknown" };
+    };
+    const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
+    const gateFile = path.join(base, "maintenance.gate"); const dir = path.join(base, "maintenance");
+    let clock = Date.parse("2026-08-31T12:00:00.000Z");
+    const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node,
+      launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000 });
+    const ledgerRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "m1a-doctor-ledger-")));
+    const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
+    const savedLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
+    const savedGate = process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile;
+    const savedMaintDir = process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = dir;
+    const savedRegistry = process.env.FEISHU_BRIDGE_REGISTRY;
+    const d14 = () => { const rep = runDoctor({ home }); const c = rep.checks.find((x) => x.id === "m1a_shadow_reconcile"); assert.ok(c, "⑭ 在场"); return c; };
+    try {
+      // 分支 a：never_initialized（无任何 journal/账本）→ 跳过不红。
+      assert.equal(d14().ok, true, "无账本无收据 → 绿（未接入）");
+      // legacy 沙盘（与账本对齐）：模板 + registry + 项目 mapping。
+      const proj = path.join(home, "r19-proj");
+      fs.mkdirSync(proj, { recursive: true, mode: 0o700 });
+      const tpl = writeTpl(home);
+      process.env.FEISHU_BRIDGE_REGISTRY = writeRegistry(home, [{ root: proj, id: "p1", claude_session_id: UUID1 }]);
+      writeMapping(proj, MAPPING());
+      const EPd = legacyEndpointId({ runtime: "claude", agentUid: "agent_r14d" });
+      const epDirD = path.join(ledgerRoot, EPd);
+      const led = LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPd, chain: "claude", apply: true });
+      assert.ok(led.ok, "真 init 收据 + shadow 账本：" + JSON.stringify(led).slice(0, 800));
+      // 账本里已有 legacy 种子的 B3（migrate_seed 语义，seedRecords 真事务，过 G 校验）：
+      // topic_agent_id 用 legacy 投影同一公式——这是双射能配对的前提。
+      const talOk = (x, m) => assert.ok(x.ok, m + "：" + JSON.stringify(x));
+      const iso = "2026-08-01T00:00:00.000Z";
+      const seed = () => TAL.seedRecords({ endpointId: EPd, requestKey: "req_r19_seed", candidates: [{
+        kind: "live",
+        topic_agent_id: topicAgentIdForLegacy(EPd, "p1@registry", "g1"), chat_id: CHAT1,
+        aliases: { session_id: "sess_u1", root_om: OM1 },
+        facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+        binding_target: { runtime: "claude", project_root: proj, claude_session_id: UUID1 },
+        binding_proof: { kind: "pairing", authorized_by: "ou_o", authorized_at: iso, matched_om: OM1, matched_fields: ["chat_id", "sender", "body", "thread_root"] },
+        locator_link_proof_ref: { kind: "pairing_merge", by_identity: "user", matched_at: iso, matched_om: OM1, matched_fields: ["chat_id", "sender", "body", "thread_root"] },
+        anchor_candidate: null, generation_lineage_id: "p1@registry" }] });
+      // 分支 d 先验红路（mismatch 输出纪律）：改绑定 id → legacy 多 / shadow 多。
+      process.env.FEISHU_BRIDGE_REGISTRY = writeRegistry(home, [{ root: proj, id: "p2", claude_session_id: UUID1 }]);
+      writeMapping(proj, MAPPING({ binding_id: "p2@registry", topic_generation_state: STATE({ binding_id: "p2@registry" }) }));
+      const red = d14();
+      assert.equal(red.ok, false, "对账不一致 → ⑭ 红：" + JSON.stringify(red));
+      assert.match(red.detail, /双射不成立/u, "点名 mismatch：" + red.detail);
+      // 输出纪律：红路正文也不得出现项目路径 / session / root_om 原文；体检零写入（整棵 HOME 字节不变）。
+      const shaBefore = walkSha(home);
+      assert.doesNotMatch(red.detail, new RegExp(proj.replaceAll("/", "\\/"), "u"), "红路正文无项目路径：" + red.detail);
+      assert.doesNotMatch(red.detail, /sess_u1/u, "红路正文无 session 原文：" + red.detail);
+      assert.doesNotMatch(red.detail, new RegExp(OM1, "u"), "红路正文无 root_om 原文：" + red.detail);
+      assert.deepEqual(walkSha(home), shaBefore, "⑭ 体检零写入（规格 §7：完整清单由维护写入口落盘）");
+      // 分支 d：收据 ok + 账本可读 + 对账一致 → ⑭ 绿。
+      process.env.FEISHU_BRIDGE_REGISTRY = writeRegistry(home, [{ root: proj, id: "p1", claude_session_id: UUID1 }]);
+      writeMapping(proj, MAPPING());
+      talOk(seed(), "seed B3（过 G 校验）");
+      const green = d14();
+      assert.equal(green.ok, true, "对账一致 → ⑭ 绿：" + JSON.stringify(green));
+      assert.match(green.detail, /一致/u, "点名一致：" + green.detail);
+      // 输出纪律：正文不得出现项目路径 / session / root_om 原文。
+      assert.doesNotMatch(green.detail, new RegExp(proj.replaceAll("/", "\\/"), "u"), "正文无项目路径：" + green.detail);
+      assert.doesNotMatch(green.detail, /sess_u1/u, "正文无 session 原文");
+      assert.doesNotMatch(green.detail, new RegExp(OM1, "u"), "正文无 root_om 原文");
+      // 分支 c：收据 ok + 账本缺席 → ledger_missing 红（禁止重初始化）。
+      fs.rmSync(epDirD, { recursive: true, force: true });
+      const missing = d14();
+      assert.equal(missing.ok, false, "收据在账本丢 → 红：" + JSON.stringify(missing));
+      assert.match(missing.detail, /有初始化收据但账本缺席/u, "点名 ledger_missing：" + missing.detail);
+      assert.match(missing.detail, /禁止重初始化/u, "点名禁止重初始化");
+      // 分支 b：prepared init WAL → 按 B-2 恢复矩阵报告。
+      const EPp = legacyEndpointId({ runtime: "claude", agentUid: "agent_r14p" });
+      const op = createOperation({ dir, reason: "R19 测试 prepared", operationKind: "ledger_init" });
+      assert.ok(op.ok, "prepared journal 落盘");
+      const epOfPrepared = "endpoint_" + "9".repeat(24);
+      assert.equal(updateJournal({ dir, token: op.token, lease: op.lease, mutate: (dd) => {
+        dd.steps = [{ id: "ledger:" + epOfPrepared + ":init", kind: "ledger", target: epOfPrepared, backup: null, backup_sha256: null, backup_bytes: null,
+          before: { endpoint_id: epOfPrepared, operation_id: op.token, fingerprint: "f".repeat(64), authority_mode: null, revision: null, ledger_sha256: null },
+          intended_after: { endpoint_id: epOfPrepared, operation_id: op.token, fingerprint: "f".repeat(64), authority_mode: "shadow", revision: 1, ledger_sha256: "f".repeat(64) },
+          after: null, state: "prepared", at: new Date(clock).toISOString() }];
+        return dd; } }).ok, true, "塞 prepared ledger step");
+      const prepared = d14();
+      assert.equal(prepared.ok, false, "prepared WAL → 红：" + JSON.stringify(prepared));
+      assert.match(prepared.detail, /初始化 WAL 未完成/u, "点名 WAL：" + prepared.detail);
+      assert.match(prepared.detail, /同 token 恢复/u, "点名 B-2 恢复矩阵");
+    } finally {
+      if (prevTpl === undefined) delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; else process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = prevTpl;
+      if (savedLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedger;
+      if (savedGate === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; else process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = savedGate;
+      if (savedMaintDir === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = savedMaintDir;
+      if (savedRegistry === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY; else process.env.FEISHU_BRIDGE_REGISTRY = savedRegistry;
+      fs.rmSync(base, { recursive: true, force: true }); fs.rmSync(ledgerRoot, { recursive: true, force: true });
+    }
+  });
+}
 
 summarySealed = true;
 

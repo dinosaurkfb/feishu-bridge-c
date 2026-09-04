@@ -345,16 +345,20 @@ sidecars:{expiry:{sha256},pending_claims:{sha256},policy:{sha256}} }` |
 `{ ok:false, reason, why, mismatches:[{ code, topic_agent_id|null, field|null, detail }] }`；
 **T4 只认 §4.1-4e 的 cutover plan 判别联合**（本联合的窄成功支不足以 cutover）。
 
-reconciler 逐支细化（六轮 P2-1，与安全接口叠加）：`ok:false` 的 `reason` 封闭集：
-`bijection_mismatch`（mismatches 全清单，元素 `{code, topic_agent_id|null, field|null,
-detail}`；code ∈ extra_in_legacy | extra_in_shadow | field_mismatch）、`not_shadow`
-（账本非 shadow；M1a 双射只适用影子期）、`chain_mismatch`、`ledger_<载入失败码>`、
-`legacy_unreadable`（附 `source`：适配器来源域）、`legacy_unreconcilable`（附
-`global:"rotation_preparing"`）。`why` 仅供日志，不进 doctor 正文（输出纪律 §7）。
-cutover_blockers = §2 待修项完整输出（任一存在 → cutover 拒；doctor 只报不拒；
-cutover_blockers 可非空如 0b binding_retired，此时 doctor 报确定性红 cutover_blocked）；
-`{ ok:null }` 为 inconclusive，cutover 视同不通过重试，doctor 整体 incomplete、
-**不得生成或复用 readiness/cutover 凭据**。
+- `{ ok:true, digest, cutover_blockers, snapshot_identity }` —— 双射成立；cutover_blockers
+  可非空（如 0b binding_retired），任一存在则 cutover 拒但 doctor 报确定性红（cutover_blocked）；
+- `{ ok:null, reason:"snapshot_moved", why }` —— inconclusive；cutover 视同不通过重试；
+  doctor 整体 incomplete、**不得生成或复用 readiness/cutover 凭据**；
+- `{ ok:false, reason, mismatches, cutover_blockers, snapshot_identity }` —— **仅 bijection_mismatch
+  带 snapshot_identity**（S1 已取得；复评 P2-3：其它失败支不伪造身份）。
+- `{ ok:false, reason, cutover_blockers }` —— S1 取得前的失败支（无 snapshot_identity 字段）：
+  `reason` ∈ `not_shadow`（账本非 shadow；M1a 双射只适用影子期）、`chain_mismatch`、
+  `ledger_<载入失败码>`、`legacy_unreadable`（附 `source`：适配器来源域）、
+  `legacy_unreconcilable`（附 `global:"rotation_preparing"`）。
+  bijection_mismatch 的 mismatches 是全清单，元素 `{code, topic_agent_id|null, field|null, detail}`，
+  code ∈ extra_in_legacy | extra_in_shadow | field_mismatch。
+  `why` 仅供日志，不进 doctor 正文（输出纪律 §7）。
+
 
 ## 7. doctor 输出纪律
 

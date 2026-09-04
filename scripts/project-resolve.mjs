@@ -101,7 +101,7 @@ export function selectBindingEntry(entries, claudeSessionId) {
  * 字段名和形状跟磁盘上那份**完全一致** —— 读取方拿到哪一种都不用分辨。
  * 这条是这次能少写两个配置文件的全部原因：读取方看不出区别，就不必为两种存放方式各写一遍。
  */
-export function mappingFromRegistryEntry(entry, { consumed = [] } = {}) {
+export function mappingFromRegistryEntry(entry, { consumed = [], now = undefined, materialize = true } = {}) {
   const mapping = {
     schema_version: "1.0",
     binding_id: entry.id + "@registry",
@@ -132,9 +132,13 @@ export function mappingFromRegistryEntry(entry, { consumed = [] } = {}) {
     created_at: entry.bound_at ?? null,
     _source: "registry",
   };
+  // materialize:false 供 M1a 只读适配器用（复评 P2-1）：跳过内部物化，让调用方用同一注入
+  // now 一次性物化，generation_source 才能报到 legacy_v1 而不是物化后的恒 stored_v1。
+  if (!materialize) return mapping;
   const evolved = applyTopicGenerationToMapping(mapping, {
     runtime: "claude",
     bindingId: mapping.binding_id,
+    now,
   });
   return evolved.ok ? evolved.mapping : {
     ...mapping,

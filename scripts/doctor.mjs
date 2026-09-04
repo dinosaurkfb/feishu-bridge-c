@@ -521,7 +521,14 @@ export function runDoctor({
           if (root !== null) {
             try {
               for (const de of fs.readdirSync(root, { withFileTypes: true })) {
-                if (de.isDirectory() && ENDPOINT_SHAPE.test(de.name)) ledgerDirs.push(de.name);
+                // 封闭枚举（复评 P1-4）：endpoint 名下的非真目录（文件/symlink）不算缺席也不算未接入；
+                // 陌生名字同样不静默。名字本身是 opaque id，只戴帽展示。
+                if (ENDPOINT_SHAPE.test(de.name)) {
+                  if (de.isDirectory()) ledgerDirs.push(de.name);
+                  else rootUnreadable ??= "endpoint 名下有非目录制品（" + de.name.slice(0, 12) + "…）";
+                } else if (de.name !== "receipts") {
+                  rootUnreadable ??= "账本根有未登记条目（" + de.name.slice(0, 12) + "…）";
+                }
               }
             } catch (err) {
               // 只有 ENOENT 折空（= 无任何账本）；I/O / 权限 / 形状错不能假装"未接入"（评审 P1-3）。
@@ -530,7 +537,7 @@ export function runDoctor({
           }
           if (rootUnreadable !== null) {
             findings.push({ endpoint: null, ok: false, code: "ledger_inventory_unreadable",
-              detail: "ledger_inventory_unreadable：账本根盘点读不出（code " + rootUnreadable + "）—— 无法盘点 shadow 账本，禁止当成未接入" });
+              detail: "ledger_inventory_unreadable：账本根盘点读不出（" + rootUnreadable + "）—— 无法盘点 shadow 账本，禁止当成未接入" });
           }
           const endpoints = [...new Set([...receiptBy.keys(), ...preparedBy.keys(), ...ledgerDirs])].sort();
           for (const ep of endpoints) {
@@ -543,9 +550,10 @@ export function runDoctor({
               continue;
             }
             if (L.ok === false) {
+              // 只出封闭的 L.reason（复评 P1-3）：校验器 why 原文可能带重复 locator 明文（session/root om_）。
               if (receipt?.state === "ok" || receipt?.cutoverDone) {
                 findings.push({ endpoint: ep, ok: false, code: "ledger_missing",
-                  detail: (L.reason === "absent" ? "有初始化收据但账本缺席" : "有初始化收据但账本读不出（" + (L.why ?? L.reason) + "）") + " —— 禁止重初始化，需人工恢复" });
+                  detail: (L.reason === "absent" ? "有初始化收据但账本缺席" : "有初始化收据但账本读不出（" + L.reason + "）") + " —— 禁止重初始化，需人工恢复" });
               } else if (receipt === null) {
                 findings.push({ endpoint: ep, ok: false, code: "ledger_without_receipt",
                   detail: "账本" + (L.reason === "absent" ? "目录在但读不出内容" : "读不出") + "且无初始化收据 —— 无法证明来历" });
@@ -553,7 +561,7 @@ export function runDoctor({
               // receipt never_initialized + 账本读不出：按 ledger_missing 同义（有迹象但无收据时已由上一支接住）。
               else {
                 findings.push({ endpoint: ep, ok: false, code: "ledger_missing",
-                  detail: "无完成收据且账本读不出（" + (L.why ?? L.reason) + "）—— 不得重初始化" });
+                  detail: "无完成收据且账本读不出（" + L.reason + "）—— 不得重初始化" });
               }
               continue;
             }

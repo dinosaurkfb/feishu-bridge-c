@@ -9737,13 +9737,17 @@ test("#R19 同构守卫：M1a codex 快照的 state 物化 ≡ mappingForTask（
     const task = { id: "k1", logical_task_key: "k1", root: proj, codex_thread_id: "th_1", status: "active",
       root_message_id: "om_" + "c".repeat(10), session_id: "sess_c1", created_at: "2026-08-01T00:00:00.000Z" };
     fs.writeFileSync(path.join(home, "registry.json"), JSON.stringify({ tasks: [task] }, null, 2), { mode: 0o600 });
-    const snap = collectCodexLegacySnapshot({ home });
+    // 注入同一 now（复评 P2-1）：两侧时间戳都从它派生，逐字段相等不需要归一掩盖。
+    const now = Date.parse("2020-01-01T00:00:00.000Z");
+    const snap = collectCodexLegacySnapshot({ home, now });
     assert.ok(snap.ok, "快照成立：" + JSON.stringify(snap).slice(0, 200));
-    const mf = mappingForTask(task, { home });
-    // 时间戳字段随 clock 漂移（两侧各取一次 now），归一成占位符再比；其余逐字段相等。
-    const canon = (v) => JSON.parse(JSON.stringify(v ?? null).replaceAll(/"\d{4}-\d{2}-\d{2}T[^"]*"/gu, '"T"'));
-    assert.deepEqual(canon(snap.bindings[0].state), canon(mf.topic_generation_state),
-      "collect 的 task→state 物化 ≡ 运行时 mappingForTask");
+    const mf = mappingForTask(task, { home, now });
+    assert.deepEqual(snap.bindings[0].state, mf.topic_generation_state,
+      "collect 的 task→state 物化 ≡ 运行时 mappingForTask（同一注入 now，无归一）");
+    assert.equal(snap.bindings[0].generation_source, "legacy_v1", "gs 取真实物化来源（不是恒 stored_v1）");
+    const isos = JSON.stringify(snap.bindings[0].state).match(/"\d{4}-\d{2}-\d{2}T[^"]*"/gu) ?? [];
+    assert.ok(isos.length > 0 && isos.every((x) => x === '"2020-01-01T00:00:00.000Z"'),
+      "全部时间戳 = 注入 now（复评 P2-1）：" + isos.join("、"));
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
 

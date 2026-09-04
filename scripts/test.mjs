@@ -25054,6 +25054,17 @@ test("账本维护 CLI + B-3 收据聚合 + inspect 收据不染红 + doctor ⑬
     assert.equal(aggDup.ok, false, "重复 init → 聚合 fail-closed");
     assert.ok(aggDup.endpoints.find((x) => x.endpointId === EPdup)?.state === "conflict", "聚合给 EPdup 标 conflict");
     fs.unlinkSync(path.join(dir, dupTok + ".json"));
+    // 复评 P2-2：init=0 ∧ cutover≥1 也是矛盾（未初始化却切了权威）→ duplicate_or_conflict，不是可新建 init。
+    const EPcut0 = mkEp("agent_ledger_cut_only");
+    const iCut0 = LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPcut0, chain: CH, apply: true });
+    assert.ok(iCut0.ok, "cutover-only 前置 init：" + JSON.stringify(iCut0).slice(0, 200));
+    const cCut0 = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPcut0, chain: CH, apply: true, reconciler: ({ endpointId }) => ({ ok: true, digest: TAL.sha256(Buffer.from("b:" + endpointId)) }) });
+    assert.ok(cCut0.ok, "真 cutover 完成：" + JSON.stringify(cCut0).slice(0, 200));
+    fs.unlinkSync(path.join(dir, iCut0.token + ".json")); // 手术：删 init journal，只留 cutover
+    const cutOnly = endpointReceipt(dir, EPcut0);
+    assert.deepEqual([cutOnly.ok, cutOnly.state], [false, "duplicate_or_conflict"], "init=0 ∧ cutover=1 → 矛盾：" + JSON.stringify(cutOnly));
+    assert.equal(aggregateEndpointReceipts({ dir }).ok, false, "cutover-only → 聚合 fail-closed");
+    fs.unlinkSync(path.join(dir, cCut0.token + ".json"));
     const badTok = "88888888-8888-4888-8888-888888888888";
     fs.writeFileSync(path.join(dir, badTok + ".json"), "{ 不是 JSON ");
     assert.equal(endpointReceipt(dir, EPok).ok, false, "坏 journal → endpointReceipt fail-closed");
@@ -26081,7 +26092,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       const snap2 = collect(s);
       assert.ok(snap2.ok, "fallback 快照成立：" + JSON.stringify(snap2));
       assert.deepEqual([snap2.bindings.length, snap2.bindings[0].generation_source, snap2.bindings[0].enabled],
-        [1, "stored_v1", false], "内联投影（物化前置在 mappingFromRegistryEntry）+ disabled 仍进快照（§4 enabled 行）：" + JSON.stringify(snap2.bindings[0]));
+        [1, "legacy_v1", false], "内联投影（物化在 collect 注入 now 一次完成，gs=legacy_v1，复评 P2-1）+ disabled 仍进快照（§4 enabled 行）：" + JSON.stringify(snap2.bindings[0]));
       assert.equal(effectiveBindingStatus(snap2.bindings[0]), "paused", "enabled:false → effective paused");
     } finally { fs.rmSync(s.home, { recursive: true, force: true }); }
   });
@@ -26163,6 +26174,16 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
         status: "active", root_message_id: "om_" + "c".repeat(10), session_id: "sess_c1", created_at: "2026-08-01T00:00:00.000Z" }]);
       r = snapOf();
       assert.deepEqual([r.ok, r.reason, r.source], [false, "legacy_unreadable", "codex-registry:0"], "覆盖值形状坏 → fail-closed");
+      // 覆盖值不是字符串（数字/数组）＝形状坏，不是"覆盖缺席"——必须拒，不静默回模板群（复评 P1-2）。
+      tasks([{ logical_task_key: "k1", root: proj, codex_thread_id: "th_1", chat_id: 123,
+        status: "active", root_message_id: "om_" + "c".repeat(10), session_id: "sess_c1", created_at: "2026-08-01T00:00:00.000Z" }]);
+      r = snapOf();
+      assert.deepEqual([r.ok, r.reason, r.source], [false, "legacy_unreadable", "codex-registry:0"], "chat_id 覆盖为数字 → fail-closed");
+      // null = 明确的覆盖缺席 → 模板兜底（与 undefined 同语义）。
+      tasks([{ logical_task_key: "k1", root: proj, codex_thread_id: "th_1", chat_id: null,
+        status: "active", root_message_id: "om_" + "c".repeat(10), session_id: "sess_c1", created_at: "2026-08-01T00:00:00.000Z" }]);
+      r = snapOf();
+      assert.ok(r.ok && r.bindings[0].chat_id === CHAT1, "chat_id:null → 模板兜底");
       // thread 缺 → target 不全（判别层待修），不是 unreadable。
       tasks([{ logical_task_key: "k1", root: proj,
         status: "active", root_message_id: "om_" + "c".repeat(10), session_id: "sess_c1", created_at: "2026-08-01T00:00:00.000Z" }]);
@@ -26183,6 +26204,20 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       assert.ok(r.ok, "consumed 是 FIFO → 适配器不读它：" + JSON.stringify(r).slice(0, 200));
       fs.rmSync(consumedFile, { force: true });
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("R19 §1 权威来源判别：chain 不是 claude 的模板 → 拒（复评 P1-2）", () => {
+    const s = claudeSandbox();
+    try {
+      writeMapping(s.proj, MAPPING());
+      const badTpl = JSON.parse(fs.readFileSync(s.tplFile, "utf-8"));
+      badTpl.chain = "codex";
+      fs.writeFileSync(s.tplFile, JSON.stringify(badTpl, null, 2) + "\n", { mode: 0o600 });
+      const r = collect(s);
+      assert.deepEqual([r.ok, r.reason, r.source], [false, "legacy_unreadable", "chain-template"],
+        "Codex 链模板喂 Claude 适配器 → fail-closed：" + JSON.stringify(r));
+      // enabled:false 条目进快照的既有契约不受影响（正常模板恢复后）。
+    } finally { fs.rmSync(s.home, { recursive: true, force: true }); }
   });
 
   test("R19 §1 snapshot_identity：字典序 / 缺席=null+父 realpath / registry 变→身份变", () => {
@@ -26282,17 +26317,34 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       assert.deepEqual([recP.facts.binding, recP.aliases.session_id], ["dormant", "sess_u1"], "paused → B3prime facts + session 并入");
       // legacy_source_digest：同输入同值；源变 → 值变。
       const b = snap.bindings[0];
-      const sub = identitySubset(snap.snapshot_identity, b.source_files);
+      // 冻结身份子集（复评 P1-1）：纯内存匹配（binding.source_identity × snapshot_identity）。
+      const sub = identitySubset(snap.snapshot_identity, b);
       assert.ok(sub.ok && sub.subset.length >= 1, "identity 子集选出");
+      const fake = { ...b, source_identity: [{ source: "/gone/registry.json", path: "/gone/registry.json", sha256: null }] };
+      assert.equal(identitySubset(snap.snapshot_identity, fake).ok, false, "冻结身份没命中 → fail-closed");
       const d1 = legacySourceDigest({ binding: b, generation: b.state.generations[0], identity: sub.subset });
       assert.ok(d1.ok && d1.digest.length === 64 && /^[0-9a-f]{64}$/.test(d1.digest), "digest 是 64hex");
       const d2 = legacySourceDigest({ binding: b, generation: b.state.generations[0], identity: sub.subset });
       assert.equal(d1.digest, d2.digest, "同输入同 digest");
       writeRegistry(s.home, [{ root: s.proj, id: "p1", claude_session_id: UUID1, note: "changed" }]);
       const snapX = collect(s);
-      const subX = identitySubset(snapX.snapshot_identity, snapX.bindings[0].source_files);
+      const subX = identitySubset(snapX.snapshot_identity, snapX.bindings[0]);
       const d3 = legacySourceDigest({ binding: snapX.bindings[0], generation: snapX.bindings[0].state.generations[0], identity: subX.subset });
       assert.notEqual(d1.digest, d3.digest, "源文件变 → digest 变");
+      // 注入时钟贯穿物化（复评 P2-1）：now=2020 → state 里所有时间戳都从 2020 派生（确切断言，不归一）。
+      // 走 registry 条目分支（物化分支）才测得到 now 派生；mapping 须先移走。
+      fs.rmSync(path.join(s.proj, ".runtime-data"), { recursive: true, force: true });
+      writeRegistry(s.home, [{ root: s.proj, id: "p1", claude_session_id: UUID1, root_message_id: OM1 }]);
+      const collectOld = collectClaudeLegacySnapshot({ registryFile: s.registryFile, templateFile: s.tplFile, now: Date.parse("2020-01-01T00:00:00.000Z") });
+      assert.ok(collectOld.ok, "2020 快照成立：" + JSON.stringify(collectOld).slice(0, 160));
+      assert.equal(collectOld.bindings[0].generation_source, "legacy_v1", "无 stored state → legacy_v1（不是恒 stored_v1）");
+      const isos = JSON.stringify(collectOld.bindings[0].state).match(/"\d{4}-\d{2}-\d{2}T[^"]*"/gu) ?? [];
+      assert.ok(isos.length > 0, "state 里有时间戳");
+      assert.ok(isos.every((x) => x === '"2020-01-01T00:00:00.000Z"'), "全部时间戳 = 注入 now：" + isos.join("、"));
+      // 删盘上来源文件 → 子集不变（零次读现场；放在 fixture 消费完之后）。
+      for (const f of b.source_files) fs.rmSync(f, { force: true });
+      const subAfter = identitySubset(snap.snapshot_identity, b);
+      assert.deepEqual(subAfter, sub, "来源文件事后被删 → 子集不变（零次读现场）");
     } finally { fs.rmSync(s.home, { recursive: true, force: true }); }
   });
 
@@ -26451,6 +26503,28 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       assert.doesNotMatch(green.detail, new RegExp(proj.replaceAll("/", "\\/"), "u"), "正文无项目路径：" + green.detail);
       assert.doesNotMatch(green.detail, /sess_u1/u, "正文无 session 原文");
       assert.doesNotMatch(green.detail, new RegExp(OM1, "u"), "正文无 root_om 原文");
+      // 复评 P1-4：账本根里 endpoint 名下的非目录制品（文件/symlink）不算缺席也不算未接入 → inventory 红。
+      const EPfile = "endpoint_" + "a".repeat(24);
+      fs.writeFileSync(path.join(ledgerRoot, EPfile), "{}\n");
+      const fileD = d14();
+      assert.equal(fileD.ok, false, "endpoint 名文件 → 红：" + JSON.stringify(fileD).slice(0, 300));
+      assert.match(fileD.detail, /ledger_inventory_unreadable/u, "点名 inventory：" + fileD.detail);
+      assert.ok(fileD.detail.includes("endpoint 名下有非目录制品"), "点名非目录制品：" + fileD.detail);
+      fs.unlinkSync(path.join(ledgerRoot, EPfile));
+      // 复评 P1-3：有效收据 + 坏账本（G3 locator 重复，why 带 locator 原文）→ 正文只出 reason，不泄露 om_/sess_ 原文。
+      const ledgerPath = path.join(epDirD, "ledger.json");
+      const goodBytes = fs.readFileSync(ledgerPath);
+      const doc = JSON.parse(goodBytes.toString("utf-8"));
+      const [recId, rec0] = Object.entries(doc.records).find(([, r]) => r.kind === "live");
+      doc.records[recId + "_x"] = JSON.parse(JSON.stringify(rec0)); // 同 seed op、同 locator → G3
+      fs.writeFileSync(ledgerPath, JSON.stringify(doc));
+      assert.equal(TAL.loadLedger(epDirD, { endpointId: EPd }).ok, false, "账本手术成立（G3 fail）");
+      const g3D = d14();
+      assert.equal(g3D.ok, false, "坏账本 → 红：" + JSON.stringify(g3D).slice(0, 300));
+      assert.doesNotMatch(g3D.detail, new RegExp(OM1, "u"), "正文无 root_om 原文（只出 reason）：" + g3D.detail);
+      assert.doesNotMatch(g3D.detail, /sess_u1/u, "正文无 session 原文");
+      fs.writeFileSync(ledgerPath, goodBytes); // 内容级恢复
+      assert.ok(TAL.loadLedger(epDirD, { endpointId: EPd }).ok, "恢复后账本回到绿");
       // 分支 e：cutoverDone 收据 → M1a 影子对账不适用（authoritative 账本合法演进，双射会永久误红，评审 P1-5）。
       const EPcut = legacyEndpointId({ runtime: "claude", agentUid: "agent_r14cut" });
       assert.ok(LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPcut, chain: "claude", apply: true }).ok, "e 场景 init");

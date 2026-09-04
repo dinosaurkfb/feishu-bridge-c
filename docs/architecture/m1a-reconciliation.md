@@ -161,6 +161,15 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
    **执行顺序（九轮 P2-1）**：门内、三条 sidecar 全 done 后**重新调用 reconciler**；只接受
    同一 ledger before revision/SHA 上的 `{ok:true, digest}`；snapshot_moved 或 digest 改变
    均不得翻转 authority_mode。
+4e. **sidecar 内容正确性（十轮 P1-1：SHA 一致不等于内容正确）**：三类 sidecar 各定义
+   **封闭 schema + 确定性 renderer**（`renderExpiry/renderPendingClaims/renderPolicy`：输入 =
+   同一**冻结 legacy snapshot** + 账本投影，输出 = 规范字节；intended SHA 只能由 renderer
+   在该快照上重算得出）。**reconciler 的 `ok:true` 必须同时证明四件**：ledger 双射（§6 C）∧
+   expiry 投影相等 ∧ pending-claims 投影相等 ∧ policy subject 投影相等（三者各自
+   digest 比对 renderer 重算 vs 现场/intended 字节）——空文件或错误内容即使 SHA 自洽也过不了。
+4f. **endpoint 交叉绑定不变量（十轮 P1-2）**：三条 sidecar id 中的 `<ep>`、其重算 target、
+   ledger step 的 endpoint、cutover op 的 fingerprint/result endpoint、operation intent 的
+   endpoint **必全部相等**（校验器逐项比对，任一不等 → journal 非法）。
 4d. **sidecar 的维护窄写路径（八轮 P1-5）**：三个 sidecar 在门内的写**不走** gated（会被门挡）
    也**不开通用 ungated API**——各定义一个维护窄 writer：绑定 operation token + lease + gate +
    journal prepared step（与账本 capability 同一纪律：读实文件核验后才写），fenced commit；

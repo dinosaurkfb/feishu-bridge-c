@@ -187,10 +187,11 @@ rollback 记 `rolled_back`）。
 
 | phase | 必需且 done 的 step | 说明 |
 | --- | --- | --- |
-| `ledger_initializing` / `ledger_cutting_over` | `ENTER_DONE`；`ledger:<ep>:*` 可尚不存在或 `prepared` | forward-only 段 |
-| `ledger_reopening` | `ENTER_DONE` ∪ {`ledger:<ep>:init`\|`cutover`}，且 ledger step 必须 `done` | 进入前 ledger step 必 done；B-4 逐步 |
+| `ledger_initializing` | `ENTER_DONE`；`ledger:<ep>:init` 可尚不存在或 `prepared`；**禁 sidecar** | forward-only 段 |
+| `ledger_cutting_over` | `ENTER_DONE`；ledger step 可 `prepared`；**恰三条 sidecar step（prepared/done，与阶段推进同一次提交写入）** | forward-only 段（v10） |
+| `ledger_reopening` | `ENTER_DONE` ∪ {`ledger:<ep>:init`\|`cutover`} 且 ledger step `done`；**（cutover）三条 sidecar 全 `done`** | 进入前必 done；B-4 逐步 |
 | `done`（成功重开后）| 同 `ledger_reopening` | — |
-| `reopening_incomplete`（ledger kind）| 同 `ledger_reopening`（**不**要求 install 的 artifact/receipt/current:install step）| 重开残步未清：步骤 1–3 失败时门**尚未撤**、撤门（4）失败时门**可能已部分撤**——两种都进这里 |
+| `reopening_incomplete`（ledger kind）| 同 `ledger_reopening`（**不**要求 install step）| 重开残步未清（含 3b 备份删除失败）：步骤 1–3/3b 失败时门**尚未撤**、撤门（4）失败时门**可能已部分撤**——都进这里 |
 
 `--exit` 按 `operation_kind` **分派**到 ledger 的 success reopening（`ledger_reopening`），
 **不复用 install 的 reopening**（三轮 P1-2 / 四轮 P1）。
@@ -225,8 +226,10 @@ rollback 记 `rolled_back`）。
 - **1.2**：必含 `operation_kind ∈ {maintenance_gate, maintenance_install, ledger_init,
   ledger_cutover}`；**禁 sidecar step**（读到 sidecar 即 unreadable）；
 - **1.3**：= 1.2 + `ledger_cutover` 的 sidecar step（仅此 kind 此用途）；
-- **未终结的 1.2 ledger_cutover 不得直接续跑成 1.3 cutover**（重开新 operation，旧 journal
-  按 1.2 恢复矩阵收敛）。
+- **未终结的 1.2 ledger_cutover 不得直接续跑成 1.3 cutover**（十轮 P2-2 展开）：
+  旧 journal 处于 forward-only **之前**（≤drained）→ 按 1.2 矩阵安全回退；
+  已进 forward-only / 现场已提交 → **fail-closed 人工处置**（绝不用 1.3 语义猜测续跑）；
+  之后才允许重开新 1.3 operation。
 
 **锁面（评审 P1-1：账本 operation 也是安装面写方——它停定时器、切桩、开门、reopening）**：
 `--init/--cutover --apply` 必须在**预检与 createOperation 之前**取机器级**安装面锁**
@@ -318,6 +321,10 @@ endpoint 的维护审计收据**（二轮 P2-2：两者都保留、都不算 orp
 1. 两条 `current` **CAS 回原目标 runtime**；
 2. 定时器恢复**原 plist 字节 + 原 loaded 三态**（不是 install 的目标态）；
 3. 删除**已不再被 current 引用**的桩；
+3b. **删除本 operation 的受验 staged/backup 目录**（十轮 P1-3：内含 bearer claim / policy
+   内容，不得永久残留；仅限 `<token>.staged/` 规范路径、逐项受验后整目录删）——删除失败 →
+   `reopening_incomplete`（门与 active 保留）；status/doctor 区分 active operation 的备份
+   （合法在场）与 orphan 残骸（染红点名）；
 4. token-CAS 撤门；
 5. 持久化 `done`；
 6. 最后 token-CAS 清 `active`；
@@ -328,7 +335,8 @@ endpoint 的维护审计收据**（二轮 P2-2：两者都保留、都不算 orp
 `operation_kind` 分派到这里，不复用 install。**失败封闭（三轮 P1-3 / 四轮）**：
 - 步骤 1–3 **任一失败**（current 说不清 / 原 plist 备份核不过 / 定时器恢复失败 /
   桩删不掉）→ **保留门与 active、不执行 4–6**，进 ledger 的 `reopening_incomplete`
-  （门、active 保留；**ledger operation 没有 staged 制品**，不提 staged），该链留给人、
+  （门、active 保留；**ledger_init 无 staged 制品；ledger_cutover 仅有 sidecar 备份目录**
+  `<token>.staged/`，其删除步见下），该链留给人、
   `--exit` 只向前重试；
 - 撤门（4）异常或 `.txn` 交不还 → 同样 `reopening_incomplete`（门可能已部分撤，
   active 保留）；

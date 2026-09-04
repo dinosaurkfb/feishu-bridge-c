@@ -24630,6 +24630,37 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.equal(talLoad(dir).revision, revNow, "重放不写");
   }));
 
+  test("账本根：validateLedgerRoot 根 0700 精确 + 缺席末级父链受验（#R24 P1-1/P1-2）", () => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tal-root24-")));
+    try {
+      // P1-1：现存根必须精确 0700 —— validator / resolveEndpointDir 同红（doctor ⑭ 例见 R19 §7）。
+      const loose = path.join(base, "loose");
+      fs.mkdirSync(loose, { mode: 0o755 });
+      const env755 = { FEISHU_BRIDGE_LEDGER_DIR: loose };
+      const v755 = TAL.validateLedgerRoot({ env: env755 });
+      assert.deepEqual([v755.ok, v755.reason], [false, "root_perms"], "validator 0755 → root_perms：" + JSON.stringify(v755));
+      const r755 = TAL.resolveEndpointDir(EP, { env: env755 });
+      assert.equal(r755.reason, "root_perms", "resolveEndpointDir 0755 → root_perms：" + JSON.stringify(r755));
+      // 规范 0700 根放行（回归）。
+      fs.chmodSync(loose, 0o700);
+      assert.ok(TAL.validateLedgerRoot({ env: env755 }).ok, "0700 根放行");
+      // P1-2：末级缺席 + 父层 symlink → root_not_canonical（mustExistRoot:false 同样拒）。
+      const external = path.join(base, "external"); fs.mkdirSync(external, { recursive: true, mode: 0o700 });
+      fs.symlinkSync(external, path.join(base, "aliasp"));
+      const envAlias = { FEISHU_BRIDGE_LEDGER_DIR: path.join(base, "aliasp", "missing-ledger") };
+      const va = TAL.validateLedgerRoot({ env: envAlias, mustExistRoot: true });
+      assert.deepEqual([va.ok, va.reason], [false, "root_not_canonical"], "缺席+父层别名(true) → 拒：" + JSON.stringify(va));
+      const vf = TAL.validateLedgerRoot({ env: envAlias, mustExistRoot: false });
+      assert.deepEqual([vf.ok, vf.reason], [false, "root_not_canonical"], "缺席+父层别名(false) → 同拒：" + JSON.stringify(vf));
+      // 真缺席 + 规范父链：true → root_absent；false → 放行（末级允许不存在）。
+      const envAbsent = { FEISHU_BRIDGE_LEDGER_DIR: path.join(base, "really-missing") };
+      const vt = TAL.validateLedgerRoot({ env: envAbsent, mustExistRoot: true });
+      assert.deepEqual([vt.ok, vt.reason], [false, "root_absent"], "真缺席+规范父(true) → root_absent：" + JSON.stringify(vt));
+      const vff = TAL.validateLedgerRoot({ env: envAbsent, mustExistRoot: false });
+      assert.ok(vff.ok, "真缺席+规范父(false) → 放行：" + JSON.stringify(vff));
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  });
+
   test("账本：父层符号链接根被拒（root_not_canonical，评审六 P1-2）", () => {
     const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tal-sym-")));
     const external = path.join(base, "external"); fs.mkdirSync(path.join(external, "ledger"), { recursive: true, mode: 0o700 });
@@ -26537,6 +26568,37 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     try {
       // 分支 a：never_initialized（无任何 journal/账本）→ 跳过不红。
       assert.equal(d14().ok, true, "无账本无收据 → 绿（未接入）");
+      // #R24 P2-1 根协议四例（三例 ⑭ + 一例 validator 单元见「账本根」测试）。
+      // 全部在空 maintenance 现场：无收据，红只能来自根协议本身——这是四轮假阳性（残留
+      // EPd 收据让"有收据账本缺席"顶替根协议红）的教训。tmp 全部 realpathSync 规范化，
+      // 否则 /var 前缀下经由 symlink 的访问在本机被折 ENOENT，反例测不真切。
+      const outer24 = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "m1a-r24-root-")));
+      try {
+        // 例 1：真缺席 + 规范父链 → ⑭ 绿（未接入）。
+        const absentRoot = path.join(outer24, "no-ledger-yet");
+        process.env.FEISHU_BRIDGE_LEDGER_DIR = absentRoot;
+        const e1 = d14();
+        assert.equal(e1.ok, true, "真缺席+规范父 → 绿：" + JSON.stringify(e1));
+        assert.match(e1.detail, /未接入/u, "点名未接入：" + e1.detail);
+        // 例 2：末级缺席 + 父层 symlink（link→real，root=link/missing-ledger）→ ⑭ 红
+        // root_not_canonical（#R24 P1-2：父链受验，缺席不得伪装合法 absent）。
+        fs.mkdirSync(path.join(outer24, "real"), { mode: 0o700 });
+        fs.symlinkSync(path.join(outer24, "real"), path.join(outer24, "link"), "dir");
+        process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(outer24, "link", "missing-ledger");
+        const e2 = d14();
+        assert.equal(e2.ok, false, "缺席+父层 symlink → 红：" + JSON.stringify(e2));
+        assert.match(e2.detail, /root_not_canonical/u, "点名 root_not_canonical：" + e2.detail);
+        // 例 3：现存 0755 根 → ⑭ 红 root_perms（#R24 P1-1：校验器要求精确 0700，不装未接入）。
+        const looseRoot = path.join(outer24, "loose-root");
+        fs.mkdirSync(looseRoot, { mode: 0o755 });
+        process.env.FEISHU_BRIDGE_LEDGER_DIR = looseRoot;
+        const e3 = d14();
+        assert.equal(e3.ok, false, "现存 0755 根 → 红：" + JSON.stringify(e3));
+        assert.match(e3.detail, /root_perms/u, "点名 root_perms：" + e3.detail);
+      } finally {
+        fs.rmSync(outer24, { recursive: true, force: true });
+        process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
+      }
       // legacy 沙盘（与账本对齐）：模板 + registry + 项目 mapping。
       const proj = path.join(home, "r19-proj");
       fs.mkdirSync(proj, { recursive: true, mode: 0o700 });
@@ -26616,27 +26678,6 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
         assert.match(recD.detail, /1 个未登记条目/u, "receipts 无例外：" + recD.detail);
         fs.rmSync(ledgerRoot, { recursive: true, force: true });
         fs.rmSync(inner, { recursive: true, force: true });
-        // 父层 symlink 反例（#R19 四轮 P1）：root 本体是真目录，但其上层一环 symlink——
-        // lstat(root) 通过，realpath ≠ 词法 resolve → 校验器 root_not_canonical（不进盘点、不装未接入）。
-        const outer = fs.mkdtempSync(path.join(os.tmpdir(), "m1a-parent-link-"));
-        try {
-          fs.mkdirSync(path.join(outer, "real"));
-          fs.symlinkSync(path.join(outer, "real"), path.join(outer, "link"), "dir");
-          const prevLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR;
-          try {
-            process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(outer, "link", "real");
-            const rootOnly = TAL.validateLedgerRoot({});
-            // 行为钉死：父层一环 symlink 的根绝不通过核验（本机沙箱拦经由 symlink 的访问折
-            // root_absent；无沙箱环境是 realpath≠词法 → root_not_canonical）。两码都必须红。
-            assert.deepEqual([rootOnly.ok, ["root_absent", "root_not_canonical"].includes(rootOnly.reason)],
-              [false, true], "父层 symlink → 校验器拒：" + JSON.stringify(rootOnly));
-            const parentD = d14();
-            assert.equal(parentD.ok, false, "父层 symlink → ⑭ 红");
-            assert.match(parentD.detail, new RegExp(rootOnly.reason, "u"), "点名理由码：" + parentD.detail);
-          } finally {
-            if (prevLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = prevLedger;
-          }
-        } finally { fs.rmSync(outer, { recursive: true, force: true }); }
       } finally { fs.renameSync(ledgerRoot + ".treebak", ledgerRoot); }
       assert.ok(TAL.loadLedger(path.join(ledgerRoot, EPd), { endpointId: EPd }).ok, "整树还原后 EPd 账本完好");
       // 复评 P1-3：有效收据 + 坏账本（G3 locator 重复，why 带 locator 原文）→ 正文只出 reason，不泄露 om_/sess_ 原文。

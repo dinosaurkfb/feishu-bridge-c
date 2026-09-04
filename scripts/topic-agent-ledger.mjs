@@ -89,7 +89,10 @@ export const ledgerRootFor = (env = process.env) => ledgerRoot(env);
 /**
  * 账本根受验核验（唯一校验器，#R19 四轮 P1：doctor ⑭ 根协议复用它，不再手写第二份）：
  * root 在场时必须——非 symlink、realpath 可解、逐层 realpath 边界（realpath === 词法 resolve，
- * 即路径任一层都不是符号链接，父层别名会被拒）、真目录。
+ * 即路径任一层都不是符号链接，父层别名会被拒）、真目录、权限精确 0700（#R24 P1-1）。
+ * 末级缺席 ≠ 合法缺席（#R24 P1-2）：向上找最深现存父目录并核 realpath 与词法一致，
+ * 父层别名 → root_not_canonical；父链受验且目标确实缺席才允许 root_absent
+ * （mustExistRoot:false 同样拒父层 symlink，只是允许末级本身不存在）。
  * 返回 { ok:true, root: realRoot } 或 { ok:false, reason, why? }。
  */
 export function validateLedgerRoot({ env = process.env, mustExistRoot = true } = {}) {
@@ -98,9 +101,34 @@ export function validateLedgerRoot({ env = process.env, mustExistRoot = true } =
   try { if (fs.lstatSync(root).isSymbolicLink()) return { ok: false, reason: "root_symlink" }; } catch (err) { if (err?.code !== "ENOENT") return { ok: false, reason: "root_unresolvable", why: String(err.code ?? err.message) }; }
   let realRoot, rootResolved = true;
   try { realRoot = fs.realpathSync(root); }
-  catch (err) { if (err?.code === "ENOENT") { if (mustExistRoot) return { ok: false, reason: "root_absent" }; realRoot = root; rootResolved = false; } else return { ok: false, reason: "root_unresolvable", why: String(err.code ?? err.message) }; }
+  catch (err) {
+    if (err?.code !== "ENOENT") return { ok: false, reason: "root_unresolvable", why: String(err.code ?? err.message) };
+    // #R24 P1-2：realpath ENOENT 只证明末级不存在，父链里可能藏着 symlink（<tmp>/link/missing）。
+    // 向上找最深现存祖先，其 realpath 必须与词法 resolve 一致——任何一环别名在这里暴露。
+    let probe = path.dirname(root);
+    for (;;) {
+      try { fs.statSync(probe); break; }
+      catch (e2) {
+        if (e2?.code !== "ENOENT") return { ok: false, reason: "root_unresolvable", why: String(e2.code ?? e2.message) };
+        const parent = path.dirname(probe);
+        if (parent === probe) return { ok: false, reason: "root_unresolvable", why: "父链全不存在" };
+        probe = parent;
+      }
+    }
+    let realParent;
+    try { realParent = fs.realpathSync(probe); }
+    catch (e3) { return { ok: false, reason: "root_unresolvable", why: String(e3.code ?? e3.message) };
+    }
+    if (realParent !== path.resolve(probe)) return { ok: false, reason: "root_not_canonical" };
+    if (mustExistRoot) return { ok: false, reason: "root_absent" };
+    realRoot = root; rootResolved = false;
+  }
   if (rootResolved && realRoot !== path.resolve(root)) return { ok: false, reason: "root_not_canonical" };
-  try { const st = fs.lstatSync(realRoot); if (!st.isDirectory()) return { ok: false, reason: "root_not_dir" }; } catch { /* 不存在已在上面处理 */ }
+  try {
+    const st = fs.lstatSync(realRoot);
+    if (!st.isDirectory()) return { ok: false, reason: "root_not_dir" };
+    if ((st.mode & 0o777) !== 0o700) return { ok: false, reason: "root_perms" }; // #R24 P1-1：现存根精确 0700
+  } catch { /* 不存在已在上面处理 */ }
   return { ok: true, root: realRoot };
 }
 

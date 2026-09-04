@@ -5,10 +5,15 @@
  * shadow 账本先过 G1–G15（loadLedger 内含 validateLedger），再仅对 live B 族子集双射。
  * 本模块**严格只读**：不写账本、不写 legacy、不写任何 sidecar。
  *
- * 结果联合（§6 封闭）：
- *   { ok:true, digest, cutover_blockers, snapshot_identity }
- *   { ok:null, reason:"snapshot_moved", why }
- *   { ok:false, reason, why, mismatches:[{code, topic_agent_id|null, field|null, detail}], cutover_blockers }
+ * 结果联合（§6 封闭，逐支精确键集，#R24 P2-2）：
+ *   ok:true  → { ok, digest, cutover_blockers, snapshot_identity }
+ *   ok:null  → { ok:null, reason:"snapshot_moved", why }
+ *   S1 取得后 → { ok:false, reason:"bijection_mismatch", mismatches, cutover_blockers, snapshot_identity }
+ *     （mismatches 全清单，元素 {code, topic_agent_id|null, field|null, detail}；无 why）
+ *   S1 取得前 → ledger_<码> { ok, reason, why }；not_shadow/chain_mismatch { ok, reason }；
+ *     legacy_unreadable { ok, reason, source, why }；legacy_unreconcilable
+ *     { ok, reason, source, why, cutover_blockers, global:"rotation_preparing" }
+ *     （均不携带 snapshot_identity/mismatches；source 是封闭来源域，出界折 invalid-source）。
  * cutover_blockers = §2 待修项完整输出（任一存在 → cutover 拒；doctor 只报不拒）。
  */
 

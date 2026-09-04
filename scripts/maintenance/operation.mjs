@@ -103,7 +103,7 @@ const withLeaseResidue = (result, rel) => (rel.ok ? result : { ...result, ok: fa
  * keepLease=true（maintenance-install 用）：进门成功时**不释放执行租约**，随结果带回（{ lease }），
  * 由调用方连续持有到 reopening / 回退结束 —— 释放再重取会留出"旧 operation 被退出、新 operation 建立"的窗口（评审探针）。
  */
-export function enterMaintenance(ctx, { reason, waitMs = 60000, apply = false, keepLease = false } = {}) {
+export function enterMaintenance(ctx, { reason, waitMs = 60000, apply = false, keepLease = false, operationKind = "maintenance_gate" } = {}) {
   if (typeof reason !== "string" || reason.trim().length === 0) return { ok: false, reason: "reason_required" };
   const normalized = normalizeGateReason(reason);
   const pre = precheckStartupSources({ home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, repoRoot: ctx.repoRoot, node: ctx.node, launchctl: ctx.launchctl });
@@ -119,7 +119,7 @@ export function enterMaintenance(ctx, { reason, waitMs = 60000, apply = false, k
   }
   if (!apply) return { ok: true, dryRun: true, plan, precheck: pre };
 
-  const op = createOperation({ dir: ctx.dir, reason: normalized, now: ctx.now() });
+  const op = createOperation({ dir: ctx.dir, reason: normalized, operationKind, now: ctx.now() });
   if (!op.ok) return { ok: false, reason: op.reason, why: op.why ?? null, token: op.token ?? null, path: op.path ?? null };
   const token = op.token, lease = op.lease;
   const J = (r, what) => { if (!r.ok) throw Object.assign(new Error(what + "：" + String(r.reason) + (r.why ? "（" + r.why + "）" : "") + (r.path ? "，" + r.path : "")), { opReason: r.reason === "lease_lost" || r.reason === "active_mismatch" ? "operation_taken_over" : r.reason === "lease_reap_uncleared" ? "lease_reap_uncleared" : "journal_write_failed", residuePath: r.path ?? null }); return r; };

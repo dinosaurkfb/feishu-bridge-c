@@ -25,7 +25,11 @@ import { readRegularFile } from "../installed-surface.mjs";
 import { acquireLockUngated, commitWhileHeld, releasePublishLock } from "../registry.mjs";
 
 export const MAINTENANCE_DIR_ENV = "FEISHU_BRIDGE_MAINTENANCE_DIR";
-export const JOURNAL_SCHEMA = "1.1";
+export const JOURNAL_SCHEMA = "1.2";
+// 旧 schema 1.1（无 operation_kind）：独立分支读，只作历史 journal（M1 账本接入 B-3 / 评审 P2-1）。
+export const LEGACY_JOURNAL_SCHEMA = "1.1";
+// 封闭 operation_kind（M1 账本接入 B）：新 1.2 必含；gate/install 是既有种，ledger_* 两个账本维护种（阶段/step 见 stage 2）。
+export const OPERATION_KINDS = Object.freeze(["maintenance_gate", "maintenance_install", "ledger_init", "ledger_cutover"]);
 export const PHASES = Object.freeze([
   "planned", "timer_stopped", "stubbed", "gated", "drained", "staged", "committed", "verified", "reopening", "done", "reopening_incomplete",
   "rolling_back", "rollback_reopening", "rolled_back", "rollback_incomplete",
@@ -151,8 +155,14 @@ function stepProblem(s) {
 }
 export function journalProblem(doc) {
   if (!isObj(doc)) return "不是对象";
-  if (doc.schema_version !== JOURNAL_SCHEMA) return "schema_version 不认识";
-  if (keysOf(doc) !== "notes,phase,reason,schema_version,started_at,steps,token,updated_at") return "字段集不对";
+  // schema 判别（M1 账本接入 B / 评审 P2-1）：1.2 必含 operation_kind；旧 1.1 无该字段、按既有种读（不当 unreadable）。
+  if (doc.schema_version !== JOURNAL_SCHEMA && doc.schema_version !== LEGACY_JOURNAL_SCHEMA) return "schema_version 不认识";
+  const is12 = doc.schema_version === JOURNAL_SCHEMA;
+  const fieldset = is12
+    ? "notes,operation_kind,phase,reason,schema_version,started_at,steps,token,updated_at"
+    : "notes,phase,reason,schema_version,started_at,steps,token,updated_at";
+  if (keysOf(doc) !== fieldset) return "字段集不对";
+  if (is12 && !OPERATION_KINDS.includes(doc.operation_kind)) return "operation_kind 不在封闭集合里：" + String(doc.operation_kind);
   if (typeof doc.token !== "string" || !UUID_SHAPE.test(doc.token)) return "token 不是 UUID 字符串";
   if (typeof doc.reason !== "string" || [...doc.reason].length > 80) return "reason 不是 ≤ 80 码点的字符串";
   if (!isCanonicalIso(doc.started_at) || !isCanonicalIso(doc.updated_at)) return "时间不是规范化 ISO";
@@ -253,8 +263,9 @@ export function releaseOperationLease(lease) {
  * 开一次 operation：先拿租约 → journal（planned）落盘 → O_EXCL 建 active。active 在 / 读不出 → 拒绝；两个人同时开只有一个赢。
  * 返回 { ok, token, lease, doc }；调用方持有 lease 到 enter 结束，最后 releaseOperationLease。
  */
-export function createOperation({ dir, reason, token = crypto.randomUUID(), now = Date.now() } = {}) {
+export function createOperation({ dir, reason, operationKind = "maintenance_gate", token = crypto.randomUUID(), now = Date.now() } = {}) {
   if (typeof dir !== "string" || dir.length === 0) return { ok: false, reason: "maintenance_dir_unknown", why: "真实用户 home 取不到" };
+  if (!OPERATION_KINDS.includes(operationKind)) return { ok: false, reason: "bad_operation_kind", why: String(operationKind) };
   try { fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch (err) { return { ok: false, reason: "io_error", why: errCode(err) }; }
   const active = readActive({ dir });
   if (active.state === "active") return { ok: false, reason: "operation_active", token: active.token };
@@ -262,7 +273,7 @@ export function createOperation({ dir, reason, token = crypto.randomUUID(), now 
   const lease = acquireOperationLease({ dir, token });
   if (!lease.ok) return { ok: false, reason: lease.reason, why: lease.why, path: lease.path };
   const at = new Date(now).toISOString();
-  const doc = { schema_version: JOURNAL_SCHEMA, token, reason, started_at: at, updated_at: at, phase: "planned", steps: [], notes: [] };
+  const doc = { schema_version: JOURNAL_SCHEMA, operation_kind: operationKind, token, reason, started_at: at, updated_at: at, phase: "planned", steps: [], notes: [] };
   const problem = journalProblem(doc);
   if (problem !== null) { releaseOperationLease(lease); return { ok: false, reason: "journal_shape", why: problem }; }
   try { writeDurable(journalPath(dir, token), JSON.stringify(doc, null, 2) + "\n"); } catch (err) { releaseOperationLease(lease); return { ok: false, reason: "io_error", why: "写 journal：" + errCode(err) }; }

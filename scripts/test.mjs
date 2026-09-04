@@ -23440,6 +23440,12 @@ test("维护门 · PR C 单元：journal 三态与两阶段、active 只许一�
   assert.equal(updateJournal({ dir, token: op.token, lease: op.lease, mutate: (d) => { d.phase = "timer_stopped"; return d; } }).reason, "journal_shape", "阶段要求的 step 没 done 不许进");
   const good = readJournal({ dir, token: op.token }).doc;
   assert.deepEqual([journalProblem({}), journalProblem(good)], ["schema_version 不认识", null]);
+  // M1 账本接入 stage1：createOperation 盖 schema 1.2 + operation_kind（默认 maintenance_gate）；1.2 坏 kind 拒；旧 1.1（无 operation_kind）仍受；operationKind 可指定；坏 kind 拒。
+  assert.deepEqual([good.schema_version, good.operation_kind], ["1.2", "maintenance_gate"], "createOperation 盖 1.2 + operation_kind");
+  assert.equal(journalProblem({ ...good, operation_kind: "nope" }), "operation_kind 不在封闭集合里：nope", "1.2 坏 operation_kind 拒");
+  { const { operation_kind, ...legacy } = good; assert.equal(journalProblem({ ...legacy, schema_version: "1.1" }), null, "旧 1.1（无 operation_kind）仍受"); }
+  { const op2 = createOperation({ dir: path.join(base, "m2"), reason: "r", operationKind: "ledger_init" }); assert.deepEqual([op2.ok, op2.doc.operation_kind], [true, "ledger_init"], "operationKind 盖对"); }
+  assert.equal(createOperation({ dir: path.join(base, "m3"), reason: "r", operationKind: "bogus" }).reason, "bad_operation_kind", "坏 operationKind 拒");
   const mkStep = (over) => ({ id: "timer:claude", kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "a".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: good.updated_at, ...over });
   const withStep = (st) => ({ ...good, steps: [st] });
   assert.deepEqual([

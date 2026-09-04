@@ -87,7 +87,7 @@
 | 变量 | 取值 | 说明 |
 |---|---|---|
 | `session` | absent / present | 由任何人的首条 @ 触发（F5，不由我们控制） |
-| `binding` | none / pending / active / dormant | 本地端。active 必带 **binding_proof**（owner 授权的 session↔本地项目关联证明：attach 命令或配对事务的受验记录）；pending=桥建话题预定目标；dormant=unbind 留档 |
+| `binding` | none / pending / active / dormant | 本地端。active 必带 **binding_proof**（owner 授权的 session↔**精确本地目标**关联证明：attach 命令或配对事务的受验记录）；pending=桥建话题预定目标；dormant=unbind 留档 |
 | `anchor` | absent / present(root om_) | 富卡片出站锚：桥建话题天生带；attach 路径靠 F4 反查补 |
 | `locator_link_proof` | absent / present | session 与 root om_ 属于同一话题的证明（F4 对账产物，或桥路径配对事务本身）。**与 binding_proof 是两回事**：attach 无 F4 时只有 binding_proof |
 | `generation` | n/a / pending / current / historical | 桥建谱系专用。pending=rotate/bind 刚建、尚未接管的新代际。**voided 不是 live 取值**——作废只存在于顶层 `voided_audit` 记录（§3.1，评审 R5-P2-1） |
@@ -130,8 +130,13 @@
   current→historical——任何时刻不存在两个 current。
 - **作废事务**：B1 → 记录转 voided_audit（live 实体消失；话题里若已有 A1 chat
   记录，它不受影响地继续存在）。
-- **attach 事务**：A1/A4 → A2 或 A3。无 F4：→ A2，权威 anchor=absent（任何候选
-  根只进 anchor_candidate）；F4 成功：→ A3，同笔原子写 anchor + link_proof。
+- **attach 事务**：A1/A4 → A2 或 A3。无 F4：A1 → A2，权威 anchor=absent（任何
+  候选根只进 anchor_candidate）；F4 成功：→ A3，同笔原子写 anchor + link_proof。
+  **A4 带旧证重接（Frank 2026-09-04 拍板，第三步 §12-2）**：休眠记录若仍存有效
+  双证，无 F4 也**保留 locator link proof 直接 → A3**（该 proof 记的是"session 与
+  root 同话题"的历史事实，不因 unbind/休眠/轮转而失效；"根暂时发不通"属 health）；
+  旧证全无 → A2；旧证损坏 / 与当前 locator 冲突 / F4 复核读到正面矛盾 → attach 失败
+  报冲突。实现协议见第三步 `layers-v2-ledger.md` §5。
 - **锚定事务**（评审 R5-P1）：A2 → A3，同笔原子写 anchor、locator_link_proof
   及匹配证明（attach 时尝试一次，其后每次入站重试，成功即此事务）。
 - **恢复事务**（评审 R5-P1）：B3′ → B3，binding dormant→active，核 current
@@ -171,7 +176,7 @@ health 信号，进状态页与 doctor，**不改变**上述事实。投影表�
 纵深防御**（合法族里它等价于 A2），不赋予损坏记录任何投递能力——损坏在第 2 步
 已经拦死（评审 R4-P1-3：fail-closed 与降级不得并存于同一条记录）。
 
-「物理上有 om_ 能发」属于 T出 能力；「某个本地项目获准向这里出站」才是 L出——
+「物理上有 om_ 能发」属于 T出 能力；「某个精确本地目标获准向这里出站」才是 L出——
 两者不混（评审 R2-P1-3）。等配对@ 的根锚是 **outbound_candidate**（具备根锚、
 尚未授权为项目出站），不是 L出。
 
@@ -228,12 +233,17 @@ session=absent。这就是"T入打开 ≠ 配对完成"的最终形状：两个�
 | 原语 | 定义 | 入口 |
 |---|---|---|
 | **create** | 实体在账本物化，必带一个别名 | 用户首次 @（带 session locator）／桥建话题（带 root om_ locator + pending 本地端） |
-| **bind** | 建立 binding_proof（owner 授权的 session↔本地项目关联），binding→active；锚与 link_proof 可暂缺，补齐是独立小步 | attach（显式）／owner 配对 @ + F4 对账（隐式，同时产出 link_proof 并归并别名）——同一操作的两个入口，都只认 owner |
+| **bind** | 建立 binding_proof（owner 授权的 session↔**精确本地目标**关联——精确到一个 Claude 会话或一个 Codex task/thread，不止是"项目"；Frank 2026-09-04 拍板，第三步 §12-1），binding→active；锚与 link_proof 可暂缺，补齐是独立小步 | attach（显式）／owner 配对 @ + F4 对账（隐式，同时产出 link_proof 并归并别名）——同一操作的两个入口，都只认 owner |
 | **unbind** | binding→dormant（持久留档），投影退回 chat | 终端命令 |
 
 镜像结构：用户主导 = create 带 session 别名、bind 建关联（锚后补）；桥主导 =
 create 带 om_ 别名与 pending、bind 由 owner 配对 @ 完成（关联与 link_proof 同时
 产出）。rotate = create 新代际（generation=pending）+ 配对事务接管（不变量 6）。
+
+**retarget（bind 的运维子操作，Frank 2026-09-04 拍板，第三步 §12-1）**：已绑定
+实体的精确本地目标可由 owner **显式授权**从 old 换成 new（旧目标精确匹配、新目标
+受验、项目边界不变；谱系内则整条一起改）——**不自动漂移**，目标不可用只报 health、
+不猜。它不是第四个原语，是 bind 关系的目标维护；实现见第三步 §5。
 
 **首次 @ 的存在必要性（机制级）**：session 只能由话题内首条 @ 创造（F5）——
 "等配对@"不是设计选择，是 Aily 给的。F4 消灭的是它的**仪式**（码、歧义矩阵、

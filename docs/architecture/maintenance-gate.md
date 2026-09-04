@@ -391,15 +391,17 @@ node scripts/maintenance-ledger.mjs --cutover --endpoint <id> [--wait-ms N] --ap
 - L5 operation_kind 封闭：`ledger_*` operation 不要 install 的 artifact/receipt/
   staged_plan step；enter/install 不要 ledger step；旧 1.1 journal 无 operation_kind
   按既有种读、不 unreadable（二轮 P2-1）。
-- L5b **安装面锁（二轮 P1-1）**：`--init/--cutover --apply` 在预检/createOperation 前
-  取 install-surface.lock、持有到 reopening + 租约释放；锁序 = 安装面锁 → 租约/门 →
-  账本锁；普通安装器在 ledger operation 进门窗口改不了 current / 安装面。
-- L5c **reopening 顺序与失败封闭（二轮 P1-4 / 四轮）**：成功重开按 B-4 顺序（current
-  先回原目标 → 定时器回**原始三态**（不用 install 目标态）→ 删无引用桩 → 撤门 → done
-  → 清 active → 先租约后安装面锁）；**逐类失败各测一条**——current 说不清 / 定时器
-  恢复失败 / 桩删不掉（步骤 1–3，门不撤、进 ledger `reopening_incomplete`）、撤门失败
-  （门部分撤、同 incomplete）、`done` 写不下（不清 active）、终态已落仅释放失败
-  （operation 完成、退 3、无可续跑 active）。
+- L5b **安装面锁（二轮 P1-1 / 十一轮 P2 同步）**：`--init/--cutover --apply` 在预检/
+  createOperation 前取 install-surface.lock、持有到 reopening + 租约释放；锁序 = 安装面锁 →
+  租约/门 → **（cutover）三把 sidecar 文件锁逐取逐交清释放** → 账本锁；sidecar 段任一
+  not_owner/reap 残骸/释放异常停在 cutover 前；普通安装器在 ledger operation 进门窗口改不了
+  current / 安装面。
+- L5c **reopening 顺序与失败封闭（二轮 P1-4 / 四轮 / 十一轮 P2 同步）**：成功重开按 B-4
+  顺序（current 先回原目标 → 定时器回**原始三态** → 删无引用桩 → **3b 删除受验
+  staged/backup 目录** → 撤门 → done → 清 active → 先租约后安装面锁）；**逐类失败各测一条**
+  ——current 说不清 / 定时器恢复失败 / 桩删不掉 / **3b 备份删不掉**（步骤 1–3/3b，门不撤、
+  进 ledger `reopening_incomplete`）、撤门失败（门部分撤、同 incomplete）、`done` 写不下
+  （不清 active）、终态已落仅释放失败（operation 完成、退 3、无可续跑 active）。
 - L6 endpoint 收据聚合：`ledger_init(done)` 与 `ledger_cutover(done)` 的 journal 都是
   合法永久收据、不被盘点当 orphan、不染红；同 endpoint 重复/矛盾/某 journal 读不出
   → fail-closed。

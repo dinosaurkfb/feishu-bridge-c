@@ -161,15 +161,31 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
    **执行顺序（九轮 P2-1）**：门内、三条 sidecar 全 done 后**重新调用 reconciler**；只接受
    同一 ledger before revision/SHA 上的 `{ok:true, digest}`；snapshot_moved 或 digest 改变
    均不得翻转 authority_mode。
-4e. **sidecar 内容正确性（十轮 P1-1：SHA 一致不等于内容正确）**：三类 sidecar 各定义
-   **封闭 schema + 确定性 renderer**（`renderExpiry/renderPendingClaims/renderPolicy`：输入 =
-   同一**冻结 legacy snapshot** + 账本投影，输出 = 规范字节；intended SHA 只能由 renderer
-   在该快照上重算得出）。**reconciler 的 `ok:true` 必须同时证明四件**：ledger 双射（§6 C）∧
-   expiry 投影相等 ∧ pending-claims 投影相等 ∧ policy subject 投影相等（三者各自
-   digest 比对 renderer 重算 vs 现场/intended 字节）——空文件或错误内容即使 SHA 自洽也过不了。
-4f. **endpoint 交叉绑定不变量（十轮 P1-2）**：三条 sidecar id 中的 `<ep>`、其重算 target、
-   ledger step 的 endpoint、cutover op 的 fingerprint/result endpoint、operation intent 的
-   endpoint **必全部相等**（校验器逐项比对，任一不等 → journal 非法）。
+4e. **sidecar 封闭 schema 与确定性 renderer（十一轮 P1-1，正文即合同）**：
+   三个 renderer 共同输入 = **同一冻结 legacy snapshot + §3 期望集 E**；输出 = 规范字节
+   `JSON.stringify(stable(doc), null, 2) + "\n"`（stable = canonKey 同源键排序递归）——
+   同快照重算必得同字节；intended SHA **只能**由 renderer 产出。
+   - **expiry-1**：`{ schema_version:"expiry-1", endpoint_id, entries:
+     { <topic_agent_id>: <expires_at 规范 ISO> } }`——E 中每条 live B 记录一项，值 = 其
+     binding 的 legacy expires_at；registry 条目缺 expires_at → legacy_unreadable（现行
+     schema 必有）；空集 = `entries:{}`。
+   - **pending-claims-1**：`{ schema_version:"pending-claims-1", endpoint_id, entries:
+     { <B1 topic_agent_id>: { token: string|null, claim_expires_at: 规范 ISO|null } } }`——
+     仅 E 中 B1 记录；值取 legacy pending_token / claim_expires_at，缺席显式 null。
+   - **policy-1**：`{ schema_version:"policy-1", endpoint_id, entries:
+     { <policy_subject_id>: <interaction_policy_state 既有封闭 schema 原样
+     （schema_version/binding_id/policy_id/policy_version/updated_at/dialogue）> } }`——
+     按 §4 subject 规则重键；legacy 无 policy 字段的 binding 按
+     interactionPolicyStateForLegacy 兼容投影（Mapping 默认）；updated_at 取快照值（确定性）。
+   **reconciler 成功结果收成（journal prepared 只能消费这份）**：
+   `{ ok:true, digest, snapshot_identity, ledger:{ revision, sha256 },
+   sidecars:{ expiry:{bytes,sha256}, pending_claims:{bytes,sha256}, policy:{bytes,sha256} } }`
+   ——`ok:true` 即同时证明四件：ledger 双射（§6 C）∧ 三个 sidecar 投影相等（renderer 重算
+   字节 vs 现场/intended 逐字节）；空文件或错误内容即使 SHA 自洽也过不了。
+4f. **endpoint 交叉绑定不变量（十一轮 P1-2 取 b：只用可复核事实，不引用 result/瞬时
+   intent）**：账本顶层 `endpoint_id`、cutover **fingerprint 输入的 endpoint_id**、ledger
+   step 的 endpoint（id/target）、三条 sidecar 的 id `<ep>` 与重算 target ——**五源必全部
+   相等**（校验器逐项比对，任一不等 → journal 非法）；cutover result 不加 endpoint 字段。
 4d. **sidecar 的维护窄写路径（八轮 P1-5）**：三个 sidecar 在门内的写**不走** gated（会被门挡）
    也**不开通用 ungated API**——各定义一个维护窄 writer：绑定 operation token + lease + gate +
    journal prepared step（与账本 capability 同一纪律：读实文件核验后才写），fenced commit；

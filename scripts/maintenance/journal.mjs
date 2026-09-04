@@ -408,7 +408,14 @@ export function listJournals({ dir } = {}) {
 /**
  * 维护目录盘点（只读，给 --status / doctor）：孤立 journal（active 没指向它 —— 例如两个 enter 竞争 active 的输家）、非 active 的租约与租约锁家族残骸、
  * 写 journal 的临时文件、非 active 的 plist 备份。只报告，不清理（能证明是输家的才该按受控协议清，这里不猜）。
+ *
+ * 例外（M1 账本接入 B-3）：`ledger_init(done)` / `ledger_cutover(done)` 的 journal 是**合法永久收据**、不是 orphan，不染红。
  */
+export function isLedgerReceipt(doc) {
+  return doc?.schema_version === JOURNAL_SCHEMA
+    && (doc.operation_kind === "ledger_init" || doc.operation_kind === "ledger_cutover")
+    && doc.phase === "done";
+}
 export function inspectMaintenanceDir({ dir } = {}) {
   const residues = [];
   if (typeof dir !== "string" || dir.length === 0) return { inventory: "unknown", residues };
@@ -420,7 +427,7 @@ export function inspectMaintenanceDir({ dir } = {}) {
     const full = path.join(dir, n);
     if (n === "active") continue;
     let m;
-    if ((m = /^([0-9a-f-]{36})\.json$/u.exec(n)) && UUID_SHAPE.test(m[1])) { if (m[1] !== activeToken) { const j = readJournal({ dir, token: m[1] }); residues.push({ path: full, kind: "orphan_journal", detail: j.state === "valid" ? "没有 active 指向的 journal（阶段 " + j.doc.phase + "，" + j.doc.started_at + "）—— 竞争输家或已终结未清理，只人工处置" : "没有 active 指向且读不出的 journal（" + String(j.why) + "）—— 只人工处置" }); } continue; }
+    if ((m = /^([0-9a-f-]{36})\.json$/u.exec(n)) && UUID_SHAPE.test(m[1])) { if (m[1] !== activeToken) { const j = readJournal({ dir, token: m[1] }); if (j.state === "valid" && isLedgerReceipt(j.doc)) continue; residues.push({ path: full, kind: "orphan_journal", detail: j.state === "valid" ? "没有 active 指向的 journal（阶段 " + j.doc.phase + "，" + j.doc.started_at + "）—— 竞争输家或已终结未清理，只人工处置" : "没有 active 指向且读不出的 journal（" + String(j.why) + "）—— 只人工处置" }); } continue; }
     if ((m = /^([0-9a-f-]{36})\.lease$/u.exec(n)) && UUID_SHAPE.test(m[1])) { const h = leaseHolder({ dir, token: m[1] }); if (m[1] !== activeToken) residues.push({ path: full, kind: "stale_lease", detail: "非 active operation 的租约" + (h.alive ? "（持有者 pid " + h.pid + " 仍在）" : "（持有者已不在）") + " —— 只人工处置" }); else if (h.present && !h.unreadable && !h.alive) residues.push({ path: full, kind: "dead_lease", detail: "active operation 的租约持有者 pid " + h.pid + " 已不在 —— 下一个执行者会接管" }); continue; }
     if (/^[0-9a-f-]{36}\.lease\.(reap|maint)$/u.test(n) || /^[0-9a-f-]{36}\.lease\.reaped-/u.test(n) || /^[0-9a-f-]{36}\.lease\.reap\.quarantine-/u.test(n)) { residues.push({ path: full, kind: "lease_lock_residue", detail: "租约锁家族残骸 —— node scripts/repair-publish-lock.mjs --lock " + path.join(dir, n.split(".lease")[0] + ".lease") + " 能清（.reap / 隔离），其余只人工处置" }); continue; }
     if (/^\.journal\.\d+\.[0-9a-f-]{36}\.tmp$/u.test(n)) { residues.push({ path: full, kind: "tmp", detail: "写 journal 的临时文件残骸 —— 人工删即可" }); continue; }

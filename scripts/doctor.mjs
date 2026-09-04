@@ -51,6 +51,8 @@ import { LAUNCHCTL_ENV, PHASE_TEXT, loadedPhase } from "./launchd-job.mjs";
 import { readGate, maintenanceGatePath } from "./maintenance-gate-core.mjs";
 import { inspectInstalledSurface, installedSurfacePath } from "./installed-surface.mjs";
 import { inspectMaintenanceDir, maintenanceDir } from "./maintenance/journal.mjs";
+import { aggregateEndpointReceipts } from "./maintenance/ledger-receipt.mjs";
+import { loadByEndpoint } from "./topic-agent-ledger.mjs";
 import { loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, storeHashState, subscriptionAuditPendingPath, subscriptionStorePath } from "./subscription-store.mjs";
 
 /** 到期预警阈值：7 天内到期就点名。**明写**，不藏在比较式里。 */
@@ -440,6 +442,50 @@ export function runDoctor({
       }
     }
     add("subscription_audit", "⑫ 订阅控制面 store 与审计对账", ok, detail, next);
+  }
+
+  // ⑬ 账本维护对账（B-3）：每个 endpoint 的永久收据投影唯一且一致；cutover 收据在账本里有不可变事务祖先（operations[token]）
+  // + authority_mode=authoritative + revision>=result_revision（**不比较当前 SHA**，账本自身合法性 loadLedger 即含 G1–G15）。
+  // 没有收据的 endpoint（never_initialized）不算病；收据读不出 / 重复 / 矛盾 → fail-closed 染红；init 有收据却写不出账本 → 染红。
+  {
+    const dir = maintenanceDir();
+    if (dir === null) {
+      add("ledger_receipt", "⑬ 账本维护收据", null, "家目录查不出来，收据目录未知", null);
+    } else {
+      const agg = aggregateEndpointReceipts({ dir });
+      if (!agg.ok) {
+        const body = agg.unreadable.length > 0
+          ? "目录 " + dir + " 里 " + agg.unreadable.length + " 个 journal 读不出（如 " + agg.unreadable[0].token.slice(0, 8) + "：" + agg.unreadable[0].why + "）—— 收据 fail-closed，请人工核对"
+          : "收据矛盾：" + agg.why + " —— 重复 / 顺序不符，请人工核对 " + dir;
+        add("ledger_receipt", "⑬ 账本维护收据", false, body, null);
+      } else {
+        const problems = [];
+        const parts = [];
+        for (const ep of agg.endpoints) {
+          if (ep.state === "never_initialized") continue; // 未接入账本，不算病
+          const L = loadByEndpoint(ep.endpointId);
+          if (L.ok === false) {
+            problems.push(ep.endpointId + "：" + (L.reason === "absent" ? "有收据但账本丢了（ledger 不存在）—— 收据能证明曾初始化，但路由目录无证" : "账本读不出（G1–G15 有疑）：" + (L.why ?? L.reason)));
+            continue;
+          }
+          const doc = L.doc;
+          if (ep.cutoverDone) {
+            for (const tok of ep.cutoverTokens) {
+              const op = doc.operations[tok];
+              if (!op || op.op_type !== "authority_cutover") { problems.push(ep.endpointId + "：cutover 收据 " + tok.slice(0, 8) + " 在账本 operations 表里没有不可变事务祖先"); continue; }
+              if (doc.authority_mode !== "authoritative") { problems.push(ep.endpointId + "：切过权威但账本 authority_mode=" + doc.authority_mode + "（应为 authoritative）"); break; }
+              if (doc.revision < op.result_revision) { problems.push(ep.endpointId + "：账本 revision=" + doc.revision + " 落后于 cutover 收据 result_revision=" + op.result_revision); break; }
+            }
+          } else if (doc.authority_mode !== "shadow") {
+            problems.push(ep.endpointId + "：只有 init 收据但账本 authority_mode=" + doc.authority_mode + "（应为 shadow，或该补 cutover）");
+          }
+          parts.push(ep.endpointId + "=" + ep.state + (ep.initDone ? "（init" + ep.initCount + "）" : "") + (ep.cutoverDone ? "（cutover" + ep.cutoverCount + "）" : ""));
+        }
+        const body = parts.length === 0 ? "没有 endpoint 收据（接入账本后出现）"
+          : parts.join("、") + "；" + (problems.length === 0 ? "对得上" : "说不清 " + problems.length + " 处：" + problems.slice(0, 3).join("；"));
+        add("ledger_receipt", "⑬ 账本维护收据", problems.length === 0, body, null);
+      }
+    }
   }
 
   // ── 汇总：任一 false → blocked；无 false 有 null → incomplete；全 true → ready

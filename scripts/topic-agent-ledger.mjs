@@ -21,7 +21,8 @@ import path from "node:path";
 import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhileHeld } from "./registry.mjs";
 import { isCanonicalIso, canonicalIso, isCanonicalMs } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "./claim.mjs";
-import { JOURNAL_SCHEMA, OPERATION_KINDS, journalProblem, leaseHolder, listJournals, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
+import { JOURNAL_SCHEMA, OPERATION_KINDS, journalProblem, leaseHolder, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
+import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { maintenanceGatePath, readGate } from "./maintenance-gate-core.mjs";
 
 export const SCHEMA_VERSION = "1.0";
@@ -701,23 +702,6 @@ function virginInventory(dir) {
 }
 
 /** 机器级初始化收据（B-3 的最小投影：aggregate 全量收据属第 2 块另一分支）：扫描维护目录 journal，看该 endpoint 是否已被初始化 / 已切权威。 */
-function endpointReceipt(dir, endpointId) {
-  const list = listJournals({ dir });
-  if (!list.ok) return { unreadable: true, why: list.why ?? "维护目录读不出" };
-  let initDone = false, cutoverDone = false;
-  for (const token of list.tokens) {
-    const j = readJournal({ dir, token });
-    if (j.state !== "valid") return { unreadable: true, why: "journal " + j.state + (j.why ? "：" + j.why : "") }; // fail-closed（评审 F3）：维护目录里混进坏 journal → 拒
-    if (j.doc.schema_version !== JOURNAL_SCHEMA) continue; // 旧 1.1 合法收据，跳过
-    if (j.doc.operation_kind !== "ledger_init" && j.doc.operation_kind !== "ledger_cutover") continue;
-    if (j.doc.phase !== "done") continue;
-    const ls = j.doc.steps.find((s) => s.kind === "ledger");
-    if (!ls || ls.target !== endpointId) continue;
-    if (j.doc.operation_kind === "ledger_init") initDone = true; else cutoverDone = true;
-  }
-  return { initDone, cutoverDone };
-}
-
 /** 门内双射对账接口（§8/§5 cutover 前置）——M1a 未接真对账，fail-closed 恒拒 reconciler_absent；`reconciler` 是测试/后续接入处。 */
 export function reconcileShadow({ endpointId, shadowDoc, reconciler = null } = {}) {
   if (typeof reconciler === "function") return reconciler({ endpointId, shadowDoc });
@@ -807,7 +791,7 @@ export function initializeShadow({ endpointId, capability, requestKey, chain, pl
   if (typeof requestKey !== "string" || !REQUEST_KEY_SHAPE.test(requestKey)) return { ok: false, commit: "not_committed", reason: "bad_request_key" };
   if (!CHAIN.includes(chain)) return { ok: false, commit: "not_committed", reason: "bad_chain" };
   const receipt = endpointReceipt(cap.maintenanceDir, endpointId);
-  if (receipt.unreadable) return { ok: false, commit: "not_committed", reason: "already_initialized", why: receipt.why };
+  if (!receipt.ok) return { ok: false, commit: "not_committed", reason: "already_initialized", why: receipt.why };
   if (receipt.initDone || receipt.cutoverDone) return { ok: false, commit: "not_committed", reason: "already_initialized", why: "该 endpoint 已被初始化或已切权威" };
   const plan = planIn ?? initPlan({ endpointId, chain, requestKey, operationId: capability.token });
   if (!plan.ok) return { ok: false, commit: "not_committed", reason: plan.reason, why: plan.why ?? null };
@@ -838,7 +822,7 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, pl
   if (!cap.ok) return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: cap.reason + (cap.why ? "：" + cap.why : "") };
   if (typeof requestKey !== "string" || !REQUEST_KEY_SHAPE.test(requestKey)) return { ok: false, commit: "not_committed", reason: "bad_request_key" };
   const receipt = endpointReceipt(cap.maintenanceDir, endpointId);
-  if (receipt.unreadable) return { ok: false, commit: "not_committed", reason: "receipt_problem", why: receipt.why };
+  if (!receipt.ok) return { ok: false, commit: "not_committed", reason: "receipt_problem", why: receipt.why };
   if (receipt.cutoverDone) return { ok: false, commit: "not_committed", reason: "already_cutover", why: "该 endpoint 已切权威" };
   const d = resolveEndpointDir(endpointId, { env });
   if (!d.ok) return badTx(d);

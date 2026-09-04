@@ -11,7 +11,8 @@
 
 对账 legacy 侧**只能**经这两个适配器产生：
 
-**`collectClaudeLegacySnapshot({ registryFile, now })`**：
+**`collectClaudeLegacySnapshot({ registryFile, templateFile, now })`**（`templateFile` 必填，
+模板是链级权威来源之一，进每条 binding 的冻结来源集合）：
 - 枚举 `registry.json` 的 `projects[]`（项目集合唯一来源；`enabled:false` 的项目**仍进快照**，
   见 §5.1 enabled 行）；
 - 每项目：`<root>/.runtime-data/inbound/active-mapping.json` **在场即优先**（binding /
@@ -89,9 +90,10 @@ shadow 账本跑 G1–G15，再仅对 **live B 族子集**双射；M1a 期间入
 channel_generation_id, generation_status, binding_status, enabled,
 effective_binding_status, root_om, aily_session, binding_target,
 snapshot: 相关源文件 {path,sha256} 子集 }))`（七轮 P2-1：enabled 与有效状态显式入摘要）。
-digest 不读盘：输入里的 `snapshot` 是调用方从已冻结的 snapshot_identity 里按
-binding.source_files 的真实路径选出的子集（`identitySubset`），来源变化由外层
-snapshot_moved 兑底。
+digest 不读盘：输入里的 `snapshot` 是调用方从已冻结的 snapshot_identity 里选出的子集
+（`identitySubset` 按 `binding.source_identity` 逐条**纯内存**精确匹配，零文件系统调用；
+逐 source 必须恰命中一项否则 fail-closed），来源变化由外层 snapshot_moved 兑底。
+
 
 **family → facts 全表（封闭，六轮 P2-2）**：`facts` 五元组只取以下四组值之一，
 无第五组；组内字段集固定 `{binding, session, anchor, locator_link_proof, generation}`：
@@ -104,7 +106,6 @@ snapshot_moved 兑底。
 | B4（d2）| active | present | present | present | historical |
 
 §2 其余待修分支（b3/c1/c4/d1/d3/d4/0b）不产出记录、只产出 cutover_blockers。
->>>>>>> c046abe (R19 评审修复：受验读一次绑定 + enabled 回指 + doctor ⑭ 红路收紧（6 P1 + 4 P2）)
 
 ### 3.1 迁移证明：独立不可变来源证明 + 生命周期组合表
 
@@ -349,15 +350,18 @@ sidecars:{expiry:{sha256},pending_claims:{sha256},policy:{sha256}} }` |
   可非空（如 0b binding_retired），任一存在则 cutover 拒但 doctor 报确定性红（cutover_blocked）；
 - `{ ok:null, reason:"snapshot_moved", why }` —— inconclusive；cutover 视同不通过重试；
   doctor 整体 incomplete、**不得生成或复用 readiness/cutover 凭据**；
-- `{ ok:false, reason, mismatches, cutover_blockers, snapshot_identity }` —— **仅 bijection_mismatch
-  带 snapshot_identity**（S1 已取得；复评 P2-3：其它失败支不伪造身份）。
-- `{ ok:false, reason, cutover_blockers }` —— S1 取得前的失败支（无 snapshot_identity 字段）：
-  `reason` ∈ `not_shadow`（账本非 shadow；M1a 双射只适用影子期）、`chain_mismatch`、
-  `ledger_<载入失败码>`、`legacy_unreadable`（附 `source`：适配器来源域）、
-  `legacy_unreconcilable`（附 `global:"rotation_preparing"`）。
-  bijection_mismatch 的 mismatches 是全清单，元素 `{code, topic_agent_id|null, field|null, detail}`，
-  code ∈ extra_in_legacy | extra_in_shadow | field_mismatch。
-  `why` 仅供日志，不进 doctor 正文（输出纪律 §7）。
+结果**判别联合**（复评 P2-1/P2-3：每支只带该支的键，精确键集如下，不统一塞 mismatches:[]）：
+
+- `ok:true` → `{ ok, digest, cutover_blockers, snapshot_identity }`。
+- `ok:null`（snapshot_moved，S1/L1 已取得）→ `{ ok:null, reason:"snapshot_moved", why }`。
+- S1 取得后的失败 → `{ ok:false, reason:"bijection_mismatch", mismatches, cutover_blockers, snapshot_identity }`
+  （mismatches 是全清单，元素 `{code, topic_agent_id|null, field|null, detail}`，
+  code ∈ extra_in_legacy | extra_in_shadow | field_mismatch）。
+- S1 取得前的失败（不携带 snapshot_identity / mismatches，不伪造身份）：
+  - `ledger_<载入失败码>` → `{ ok:false, reason, why }`（why 仅供日志，不进 doctor 正文）；
+  - `not_shadow` / `chain_mismatch` → `{ ok:false, reason }`；
+  - `legacy_unreadable` → `{ ok:false, reason, source, why }`（source：适配器来源域）；
+  - `legacy_unreconcilable` → `{ ok:false, reason, source, why, cutover_blockers, global:"rotation_preparing" }`。
 
 
 ## 7. doctor 输出纪律

@@ -180,21 +180,25 @@ function fieldMismatches(id, e, s) {
  * collectLegacy / loadLedgerFn 各被调用两次（投影前后复核 snapshot_identity + 账本 revision）。
  */
 export function reconcileLegacyEndpoint({ endpointId, chain, collectLegacy, loadLedgerFn }) {
+  // 复评 P2-1：§6 是判别联合——每支**只带该支的键**，不再统一塞 mismatches:[]/why。
+  // 键集：ledger_*={ok,reason,why}；not_shadow/chain_mismatch={ok,reason}；legacy_*={ok,reason,source,why}；
+  // 投影失败={ok,reason,source,why?,cutover_blockers,global?}；bijection_mismatch={ok,reason,mismatches,cutover_blockers,snapshot_identity}；
+  // snapshot_moved={ok:null,reason,why}。
   const L1 = loadLedgerFn();
-  if (!L1.ok) return { ok: false, reason: "ledger_" + L1.reason, why: L1.why ?? null, mismatches: [], cutover_blockers: [] };
+  if (!L1.ok) return { ok: false, reason: "ledger_" + L1.reason, why: L1.why ?? null };
   // shadow 前提（评审 P1-5）：对账只在影子期有意义；authoritative 账本合法演进、legacy 冻结，
   // 拿 M1a 双射去套只会永久误红。后续 cutover 调用方误用也在这里 fail-closed。
-  if (L1.doc.authority_mode !== "shadow") {
-    return { ok: false, reason: "not_shadow", why: null, mismatches: [], cutover_blockers: [] };
-  }
-  if (L1.doc.chain !== chain) return { ok: false, reason: "chain_mismatch", why: "账本 chain 与对账链不符", mismatches: [], cutover_blockers: [] };
+  if (L1.doc.authority_mode !== "shadow") return { ok: false, reason: "not_shadow" };
+  if (L1.doc.chain !== chain) return { ok: false, reason: "chain_mismatch" };
   const S1 = collectLegacy();
-  if (!S1.ok) return { ok: false, reason: S1.reason, source: S1.source, why: S1.why, mismatches: [], cutover_blockers: [] };
+  if (!S1.ok) return { ok: false, reason: S1.reason, source: S1.source, why: S1.why ?? null };
 
   const proj = projectLegacySnapshot({ endpointId, chain, snapshot: S1 });
   if (!proj.ok) {
-    return { ok: false, reason: proj.reason, source: proj.source, why: proj.why,
-      mismatches: [], cutover_blockers: proj.blockers, global: proj.global ?? null };
+    return {
+      ok: false, reason: proj.reason, source: proj.source, why: proj.why ?? null,
+      cutover_blockers: proj.blockers, ...(proj.global !== undefined ? { global: proj.global } : {}),
+    };
   }
   const S = projectShadowBFamily(L1.doc);
   const E = proj.records;
@@ -230,5 +234,5 @@ export function reconcileLegacyEndpoint({ endpointId, chain, collectLegacy, load
 
   const ok = digestE === digestS && mismatches.length === 0;
   if (ok) return { ok: true, digest: digestE, cutover_blockers: proj.blockers, snapshot_identity: S1.snapshot_identity };
-  return { ok: false, reason: "bijection_mismatch", why: "digestE≠digestS 或双射不成立", mismatches, cutover_blockers: proj.blockers, snapshot_identity: S1.snapshot_identity };
+  return { ok: false, reason: "bijection_mismatch", mismatches, cutover_blockers: proj.blockers, snapshot_identity: S1.snapshot_identity };
 }

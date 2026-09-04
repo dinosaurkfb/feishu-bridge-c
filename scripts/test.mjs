@@ -26206,6 +26206,29 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 
+  test("R19 §1 模板进冻结来源：只改模板群 → legacy_source_digest 必变（复评 P1-2）", () => {
+    const s = claudeSandbox();
+    try {
+      writeMapping(s.proj, MAPPING());
+      const snap = collect(s);
+      const b = snap.bindings[0];
+      const sub = identitySubset(snap.snapshot_identity, b);
+      assert.ok(sub.ok, "子集选出：" + JSON.stringify(sub).slice(0, 200));
+      assert.ok(sub.subset.some((e) => e.path.endsWith("chain-config.json")), "模板在冻结来源里");
+      const d1 = legacySourceDigest({ binding: b, generation: b.state.generations[0], identity: sub.subset });
+      // 只改模板群（chat_id），registry / mapping 不动。
+      const tpl = JSON.parse(fs.readFileSync(s.tplFile, "utf-8"));
+      tpl.chat_id = "oc_" + "f".repeat(32);
+      fs.writeFileSync(s.tplFile, JSON.stringify(tpl, null, 2) + "\n", { mode: 0o600 });
+      const snapX = collect(s);
+      assert.ok(snapX.ok, "改群后快照成立");
+      assert.equal(snapX.bindings[0].chat_id, "oc_" + "f".repeat(32), "投影 chat_id 已变");
+      const subX = identitySubset(snapX.snapshot_identity, snapX.bindings[0]);
+      const d2 = legacySourceDigest({ binding: snapX.bindings[0], generation: snapX.bindings[0].state.generations[0], identity: subX.subset });
+      assert.notEqual(d1.digest, d2.digest, "只改模板群 → digest 变（ migrated proof 携带的群事实有证明）");
+    } finally { fs.rmSync(s.home, { recursive: true, force: true }); }
+  });
+
   test("R19 §1 权威来源判别：chain 不是 claude 的模板 → 拒（复评 P1-2）", () => {
     const s = claudeSandbox();
     try {
@@ -26217,6 +26240,39 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       assert.deepEqual([r.ok, r.reason, r.source], [false, "legacy_unreadable", "chain-template"],
         "Codex 链模板喂 Claude 适配器 → fail-closed：" + JSON.stringify(r));
       // enabled:false 条目进快照的既有契约不受影响（正常模板恢复后）。
+    } finally { fs.rmSync(s.home, { recursive: true, force: true }); }
+  });
+
+  test("R19 §1 受验读复核：stat 注入 EIO → unreadable（不裸抛）/ 读后 symlink 形状 → 拒（复评 P1-1）", () => {
+    const s = claudeSandbox();
+    try {
+      writeMapping(s.proj, MAPPING());
+      const origLstat = fs.lstatSync;
+      try {
+        // EIO 注入（评审探针同形）：定点只对 registry 路径抛，其余透传。
+        fs.lstatSync = (p, ...a) => {
+          if (typeof p === "string" && p === s.registryFile) {
+            const e = new Error("input/output error"); e.code = "EIO"; throw e;
+          }
+          return origLstat(p, ...a);
+        };
+        const r = collect(s);
+        assert.deepEqual([r.ok, r.reason, r.source], [false, "legacy_unreadable", "registry"], "EIO → fail-closed 不裸抛：" + JSON.stringify(r));
+      } finally { fs.lstatSync = origLstat; }
+      // 读后换 symlink（评审探针同形）：lstat 返回 symlink 形状（isFile false）→ 拒。
+      const origLstat2 = fs.lstatSync;
+      try {
+        fs.lstatSync = (p, ...a) => {
+          if (typeof p === "string" && p === s.registryFile) {
+            return { isFile: () => false, isDirectory: () => false, isSymbolicLink: () => true, nlink: 1, ino: 1, dev: 1, mode: 0o755 };
+          }
+          return origLstat2(p, ...a);
+        };
+        const r2 = collect(s);
+        assert.deepEqual([r2.ok, r2.reason], [false, "legacy_unreadable"], "读后 symlink 形状 → 拒：" + JSON.stringify(r2));
+      } finally { fs.lstatSync = origLstat2; }
+      const r3 = collect(s);
+      assert.ok(r3.ok, "还原后恢复正常：" + JSON.stringify(r3).slice(0, 120));
     } finally { fs.rmSync(s.home, { recursive: true, force: true }); }
   });
 
@@ -26382,6 +26438,25 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       assert.deepEqual([r2.ok, r2.reason], [false, "ledger_absent"], "账本缺席 fail-closed");
       r2 = run({}, { chain: "codex" });
       assert.deepEqual([r2.ok, r2.reason], [false, "chain_mismatch"], "链不符 fail-closed");
+      // 判别联合键集精确断言（复评 P2-1）：每支只带该支的键。
+      const keyOf = (x) => Object.keys(x).sort().join(",");
+      assert.equal(keyOf(rAuth), "ok,reason", "not_shadow 键集");
+      assert.equal(keyOf(run({}, { chain: "codex" })), "ok,reason", "chain_mismatch 键集");
+      const rLedger = reconcileLegacyEndpoint({ endpointId: EP1, chain: "claude", collectLegacy: () => snap,
+        loadLedgerFn: () => ({ ok: false, reason: "absent", why: "x" }) });
+      assert.equal(keyOf(rLedger), "ok,reason,why", "ledger_* 键集");
+      const rSnapBad = reconcileLegacyEndpoint({ endpointId: EP1, chain: "claude",
+        collectLegacy: () => ({ ok: false, reason: "legacy_unreadable", source: "chain-template" }),
+        loadLedgerFn: () => mkLedger({ chain: "claude", authority_mode: "shadow", revision: 7, records: {} }) });
+      assert.equal(keyOf(rSnapBad), "ok,reason,source,why", "legacy_* 键集");
+      r2 = run({});
+      assert.equal(keyOf(r2), "cutover_blockers,mismatches,ok,reason,snapshot_identity", "bijection 键集（无 why）");
+      // L1 必须在场（ok）而 L2 读不出 → snapshot_moved 支；用调用计数区分。
+      let lCalls = 0;
+      const rMoved = reconcileLegacyEndpoint({ endpointId: EP1, chain: "claude", collectLegacy: () => snap,
+        loadLedgerFn: () => (lCalls++ < 1 ? mkLedger({ chain: "claude", authority_mode: "shadow", revision: 7, records: {} }) : { ok: false, reason: "unreadable", why: "x" }) });
+      assert.equal(keyOf(rMoved), "ok,reason,why", "snapshot_moved 键集");
+      assert.equal(rMoved.ok, null, "moved ok=null");
       // 快照一致性：revision 变 / identity 变 → inconclusive。
       let calls = 0;
       r2 = reconcileLegacyEndpoint({ endpointId: EP1, chain: "claude", collectLegacy: () => snap,
@@ -26509,8 +26584,34 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       const fileD = d14();
       assert.equal(fileD.ok, false, "endpoint 名文件 → 红：" + JSON.stringify(fileD).slice(0, 300));
       assert.match(fileD.detail, /ledger_inventory_unreadable/u, "点名 inventory：" + fileD.detail);
-      assert.ok(fileD.detail.includes("endpoint 名下有非目录制品"), "点名非目录制品：" + fileD.detail);
+      assert.match(fileD.detail, /1 个未登记条目/u, "陌生制品计数制（不输出原文）：" + fileD.detail);
+      // om_ 开头的陌生文件名不得把 locator 前缀带进正文（复评 P1-3 泄点）。
+      fs.writeFileSync(path.join(ledgerRoot, OM1 + ".stray"), "{}\n");
+      const omD = d14();
+      assert.equal(omD.ok, false, "om_ 陌生文件 → 红");
+      assert.doesNotMatch(omD.detail, new RegExp(OM1, "u"), "正文无 om_ 原文：" + omD.detail);
+      assert.match(omD.detail, /2 个未登记条目/u, "两个陌生制品计数：" + omD.detail);
+      fs.unlinkSync(path.join(ledgerRoot, OM1 + ".stray"));
       fs.unlinkSync(path.join(ledgerRoot, EPfile));
+      // 账本根协议核验（rename 整树备份，测完还原，EPd 账本不动）：
+      // 根换成 symlink → 红；普通文件名 receipts → 同红（无此协议例外）。
+      fs.renameSync(ledgerRoot, ledgerRoot + ".treebak");
+      try {
+        const inner = fs.mkdtempSync(path.join(os.tmpdir(), "m1a-root-target-"));
+        fs.symlinkSync(inner, ledgerRoot, "dir");
+        const symD = d14();
+        assert.equal(symD.ok, false, "根 symlink → 红：" + JSON.stringify(symD).slice(0, 240));
+        assert.match(symD.detail, /不是受验目录/u, "点名根 symlink：" + symD.detail);
+        fs.unlinkSync(ledgerRoot);
+        fs.mkdirSync(ledgerRoot, { mode: 0o700 });
+        fs.writeFileSync(path.join(ledgerRoot, "receipts"), "{}\n");
+        const recD = d14();
+        assert.equal(recD.ok, false, "陌生名 receipts 文件 → 红（无协议例外）：" + JSON.stringify(recD).slice(0, 240));
+        assert.match(recD.detail, /1 个未登记条目/u, "receipts 无例外：" + recD.detail);
+        fs.rmSync(ledgerRoot, { recursive: true, force: true });
+        fs.rmSync(inner, { recursive: true, force: true });
+      } finally { fs.renameSync(ledgerRoot + ".treebak", ledgerRoot); }
+      assert.ok(TAL.loadLedger(path.join(ledgerRoot, EPd), { endpointId: EPd }).ok, "整树还原后 EPd 账本完好");
       // 复评 P1-3：有效收据 + 坏账本（G3 locator 重复，why 带 locator 原文）→ 正文只出 reason，不泄露 om_/sess_ 原文。
       const ledgerPath = path.join(epDirD, "ledger.json");
       const goodBytes = fs.readFileSync(ledgerPath);

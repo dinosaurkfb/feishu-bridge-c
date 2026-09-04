@@ -519,20 +519,38 @@ export function runDoctor({
           const root = ledgerRootFor();
           let rootUnreadable = null;
           if (root !== null) {
-            try {
-              for (const de of fs.readdirSync(root, { withFileTypes: true })) {
-                // 封闭枚举（复评 P1-4）：endpoint 名下的非真目录（文件/symlink）不算缺席也不算未接入；
-                // 陌生名字同样不静默。名字本身是 opaque id，只戴帽展示。
-                if (ENDPOINT_SHAPE.test(de.name)) {
-                  if (de.isDirectory()) ledgerDirs.push(de.name);
-                  else rootUnreadable ??= "endpoint 名下有非目录制品（" + de.name.slice(0, 12) + "…）";
-                } else if (de.name !== "receipts") {
-                  rootUnreadable ??= "账本根有未登记条目（" + de.name.slice(0, 12) + "…）";
+            // 账本根协议核验（复评 P1-3）：只有 ENOENT 算空（未接入）；
+            // symlink/普通文件/权限非 0700/realpath 说不清都是受验目录协议不达 → 红，不装未接入。
+            let st = undefined;
+            try { st = fs.lstatSync(root, { throwIfNoEntry: false }); } catch (err) { rootUnreadable = "lstat：" + (err?.code ?? String(err?.message ?? err).slice(0, 40)); }
+            if (st === undefined) {
+              // ENOENT = 无账本（允许空）；其它 lstat 错误已折 rootUnreadable。
+            } else if (!st.isDirectory() || st.isSymbolicLink()) {
+              rootUnreadable = "账本根不是受验目录（symlink/非目录）";
+            } else if ((st.mode & 0o777) !== 0o700) {
+              rootUnreadable = "账本根权限不是 0700（实际 " + ((st.mode & 0o777).toString(8)) + "）";
+            } else {
+              let real = null;
+              try { real = fs.realpathSync(root); } catch (err) { rootUnreadable = "realpath：" + String(err?.message ?? err).slice(0, 40); }
+              if (real !== null) {
+                let strangers = 0;
+                try {
+                  for (const de of fs.readdirSync(root, { withFileTypes: true })) {
+                    // 封闭枚举（复评 P1-3）：endpoint 名下非真目录（文件/symlink）与陌生名字都不静默；
+                    // 陌生名字只报计数，不输出原文（om_ 开头的文件名会泄 locator 前缀）；
+                    // 也不再给未定义协议的 receipts 例外面子。
+                    if (ENDPOINT_SHAPE.test(de.name)) {
+                      if (de.isDirectory()) ledgerDirs.push(de.name);
+                      else strangers += 1;
+                    } else {
+                      strangers += 1;
+                    }
+                  }
+                  if (strangers > 0) rootUnreadable = "账本根有 " + strangers + " 个未登记条目（计数制，不展示原文）";
+                } catch (err) {
+                  if (err?.code !== "ENOENT") rootUnreadable = "readdir：" + (err?.code ?? String(err?.message ?? err).slice(0, 40));
                 }
               }
-            } catch (err) {
-              // 只有 ENOENT 折空（= 无任何账本）；I/O / 权限 / 形状错不能假装"未接入"（评审 P1-3）。
-              if (err?.code !== "ENOENT") rootUnreadable = err?.code ?? String(err?.message ?? err).slice(0, 40);
             }
           }
           if (rootUnreadable !== null) {
@@ -612,7 +630,8 @@ export function runDoctor({
                 // opaque 身份）；只出问题码 + 来源域（封闭枚举）。
                 bits.push(r.reason + (r.source ? "（" + r.source + "）" : ""));
               }
-              if (r.cutover_blockers.length > 0) {
+              // 判别联合（复评 P2-1）：bijection 支才有 cutover_blockers；其它失败支不带。
+              if ((r.cutover_blockers?.length ?? 0) > 0) {
                 bits.push("待修 " + r.cutover_blockers.length + "：" + r.cutover_blockers.slice(0, 3).map((b) => b.code).join("、"));
               }
               findings.push({ endpoint: ep, ok: false, code: r.reason, detail: bits.join("；") });
@@ -622,7 +641,11 @@ export function runDoctor({
             : findings.some((f) => f.ok === null) ? null : true;
           const shown = findings.slice(0, 10).map((f) => f.endpoint + "：" + f.detail);
           const overflow = findings.length > 10 ? "；另 " + (findings.length - 10) + " 条（完整清单由维护写入口随 op 落盘，体检零写入）" : "";
-          const body = (endpoints.length === 0 ? "无任何 shadow 账本 / 收据（未接入）"
+          const body = (findings.some((f) => f.ok === false)
+            // findings 优先于“无 endpoint”文案（复评 P1-3）：账本根有陌生制品时
+            // 正文不能同时说“无任何 shadow 账本 / 收据（未接入）”——那会引导误判。
+            ? (findings.length + " 处说不清：" + shown.join("；")) + overflow
+            : endpoints.length === 0 ? "无任何 shadow 账本 / 收据（未接入）"
             : (parts.length > 0 ? parts.join("、") + "；" : "")
               + (findings.length === 0 ? "对账一致" : findings.length + " 处说不清：" + shown.join("；")) + overflow);
           add("m1a_shadow_reconcile", "⑭ M1a 影子对账", okAll, body, null);

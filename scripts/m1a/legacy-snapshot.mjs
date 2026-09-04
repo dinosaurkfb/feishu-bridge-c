@@ -58,20 +58,32 @@ const makeFetcher = () => {
   const fetch = (file) => {
     let e = cache.get(file);
     if (e !== undefined) return e;
+    // 读前身份基准（复评 P1-1）：与读后 realpath 对比，路径中途被换向能当场报错。
+    // ENOENT 不预折——文件缺席是合法分支，交给读后的 absent 判定。
+    let preReal = null;
+    try { preReal = fs.realpathSync(file); } catch (err) {
+      if (err?.code !== "ENOENT") {
+        e = { status: "error", why: "读前路径身份说不清（realpath 失败：" + String(err?.message ?? err).slice(0, 60) + "）" };
+        cache.set(file, e); return e;
+      }
+    }
     const r = readRegularFile(file);
     if (r.status === "read") {
-      // inode 一致性核对（复评 P1-1）：读到 buf 与路径身份必须同一对象——
-      // open 后文件被替换（重命名/换向）的话 statSync 看到的 inode 与 fstat(fd) 不同 → fail-closed。
-      const post = fs.statSync(file, { throwIfNoEntry: false });
-      if (post === undefined || post.ino !== r.ino || post.dev !== r.dev) {
-        e = { status: "error", why: "文件在读期间被替换（读取与路径身份不是同一 inode）" };
+      // inode 一致性核对（复评 P1-1）：读到 buf 与路径身份必须同一对象。
+      // lstat 不跟随 symlink：路径读后被换成指向同 inode 的 symlink 也当场拒。
+      // 全部受控捕获：stat 自身炸（如 EIO）也折 unreadable，不裸抛出 collect。
+      let post = undefined, postErr = null;
+      try { post = fs.lstatSync(file, { throwIfNoEntry: false }); } catch (err) { postErr = err; }
+      if (postErr === null && post !== undefined) {
+        try { const real = fs.realpathSync(file); if (real !== preReal) postErr = new Error("读前读后 realpath 不一致"); } catch (err) { postErr = err; }
+      }
+      if (postErr !== null || post === undefined || !post.isFile() || post.nlink !== 1
+        || post.ino !== r.ino || post.dev !== r.dev) {
+        e = { status: "error", why: "文件在读期间被替换或身份说不清（lstat/realpath 复核失败："
+          + (postErr !== null ? String(postErr?.message ?? postErr).slice(0, 60) : post === undefined ? "路径消失" : "身份不等") + "）" };
         cache.set(file, e); return e;
       }
-      let real = null;
-      try { real = fs.realpathSync(file); } catch (err) {
-        e = { status: "error", why: "路径身份说不清（realpath 失败：" + String(err?.message ?? err).slice(0, 60) + "）" };
-        cache.set(file, e); return e;
-      }
+      const real = preReal;
       e = { status: "read", real, sha256: sha256(r.buf), buf: r.buf };
     } else if (r.status === "absent") {
       let parent = null;
@@ -235,8 +247,8 @@ export function collectClaudeLegacySnapshot({ registryFile, templateFile, now = 
           claude_session_id: typeof sid === "string" ? sid : null,
           complete: typeof sid === "string" && UUID_SHAPE.test(sid),
         },
-        sourceFiles: [registryFile, mapPath],
-        sourceIdentity: frozenSourceIdentity(io, [registryFile, mapPath]),
+        sourceFiles: [registryFile, templateFile, mapPath],
+        sourceIdentity: frozenSourceIdentity(io, [registryFile, templateFile, mapPath]),
       }));
       continue;
     }
@@ -259,8 +271,8 @@ export function collectClaudeLegacySnapshot({ registryFile, templateFile, now = 
           claude_session_id: typeof sid === "string" ? sid : null,
           complete: typeof sid === "string" && UUID_SHAPE.test(sid),
         },
-        sourceFiles: [registryFile],
-        sourceIdentity: frozenSourceIdentity(io, [registryFile]),
+        sourceFiles: [registryFile, templateFile],
+        sourceIdentity: frozenSourceIdentity(io, [registryFile, templateFile]),
       }));
     }
   }

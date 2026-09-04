@@ -51,14 +51,15 @@ export function parseMaintenanceLedgerArgs(argv) {
 
 /**
  * 单 endpoint 的 chain（仅 --cutover 用；--init 必须在参数层显式 --chain，不经过这里）。
- * 有既有账本用它，没有则默认 claude。⚠ "证明 opaque endpoint 究竟属哪条链" 的真机制（design
- * `docs/architecture/maintenance-gate.md` B 节）归 M1b 设计 —— 这里只从既有账本读链或听操作者声明，
- * **不伪造证明**；若 endpoint 可跨链需要真实映射时由 M1b 补上。
+ *  ⚠ 评审 P2-1 fail-closed：链**必须**从既有账本读出；读不出（账本缺席/损坏/chain 非法）一律 null，**不许默认 claude**——
+ *  否则一条「收据在但账本丢了」的 endpoint，cutover 会在一条链证明不出来的情形下继续。
+ *  ⚠ "证明 opaque endpoint 究竟属哪条链" 的真机制（design `docs/architecture/maintenance-gate.md` B 节）归 M1b 设计——
+ *  这里只读既有账本的 chain 字段，**不伪造证明**；若 endpoint 可跨链需要真实映射时由 M1b 补上。
  */
 function resolveChain(endpointId, { env }) {
   const L = loadByEndpoint(endpointId, { env });
   if (L.ok && (L.doc.chain === "claude" || L.doc.chain === "codex")) return L.doc.chain;
-  return "claude";
+  return null;
 }
 
 /** 只读状态：活动账本 operation + B-3 endpoint 收据投影。 */
@@ -104,8 +105,10 @@ export function runMaintenanceLedger(argv, { ctx = null, out = (s) => process.st
   if (!receipt.ok) { out("账本 " + kind + " 拒：收据 fail-closed：" + receipt.why + "（什么都不动）"); return 1; }
   if (kind === "init" && (receipt.initDone || receipt.cutoverDone)) { out("账本 init 拒：该 endpoint 已初始化或已切权威，不能重新 init（什么都不动）"); return 1; }
   if (kind === "cutover" && receipt.cutoverDone) { out("账本 cutover 拒：该 endpoint 已切权威，不能重复切（什么都不动）"); return 1; }
-  // init 的 chain 由操作者显式声明（参数层已校验成封闭枚举）；cutover 不收 --chain，链从既有账本读。
+  if (kind === "cutover" && !receipt.initDone) { out("账本 cutover 拒：该 endpoint 未初始化，没有 shadow 账本可切（什么都不动）"); return 1; }
+  // init 的 chain 由操作者显式声明（参数层已校验成封闭枚举）；cutover 不收 --chain，链**必须**从既有账本读（P2-1 fail-closed）。
   const chain = parsed.mode === "init" ? parsed.chain : resolveChain(parsed.endpoint, { env });
+  if (parsed.mode === "cutover" && chain === null) { out("账本 cutover 拒：读不出该 endpoint 的链（账本缺席/损坏/chain 非法），fail-closed（什么都不动）"); return 1; }
   const r = LEDGER_OP.ledgerEnter(c, { kind, endpointId: parsed.endpoint, chain, waitMs: parsed.waitMs, apply: parsed.apply, env });
   if (r.dryRun) {
     const verb = kind === "init" ? "init→shadow revision1" : "cutover→authoritative";

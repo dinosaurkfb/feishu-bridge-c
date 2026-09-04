@@ -30,19 +30,28 @@ function endpointOf(doc) {
   return ls.target;
 }
 
-/** 单 endpoint 收据判据（B-3，init / cutover 前置检查用）。目录里任一 journal 读不出 → fail-closed。 */
-export function endpointReceipt(dir, endpointId) {
+/** 单 endpoint 收据判据（B-3，init / cutover 前置检查用）。目录里任一 journal 读不出 → fail-closed。
+ *  P1-6：正在前的 ledger init/cutover WAL（phase=ledger_initializing/ledger_cutting_over 且已有 prepared ledger step）
+ *  不算 never_initialized——同 token 恢复由 `token` 认为 ok_in_progress，他人 token 一律 in_progress_foreign fail-closed。
+ */
+export function endpointReceipt(dir, endpointId, { token = null } = {}) {
   const list = listJournals({ dir });
   if (!list.ok) return { ok: false, state: "unreadable", why: list.why ?? "维护目录读不出", initDone: false, cutoverDone: false };
   let init = [], cutover = [];
-  for (const token of list.tokens) {
-    const j = readJournal({ dir, token });
+  let inProgress = null;
+  for (const tok of list.tokens) {
+    const j = readJournal({ dir, token: tok });
     if (j.state !== "valid") return { ok: false, state: "unreadable", why: "journal " + j.state + (j.why ? "：" + j.why : ""), initDone: false, cutoverDone: false };
     if (j.doc.schema_version !== JOURNAL_SCHEMA) continue; // 旧 1.1，按既有种读、不参与索引（评审 P2-1）
     if (!LEDGER_KINDS.includes(j.doc.operation_kind)) continue;
-    if (j.doc.phase !== "done") continue; // 只有 terminal `done` 才算永久收据
     if (endpointOf(j.doc) !== endpointId) continue;
-    (KIND_IS_INIT[j.doc.operation_kind] ? init : cutover).push({ token, startedAt: j.doc.started_at });
+    const isInit = KIND_IS_INIT[j.doc.operation_kind];
+    if (j.doc.phase === "done") (isInit ? init : cutover).push({ token: tok, startedAt: j.doc.started_at });
+    else if (isInProgressWAL(j.doc)) inProgress ??= { token: tok, isInit };
+  }
+  if (inProgress !== null) {
+    if (typeof token === "string" && inProgress.token === token) return { ok: true, state: "ok_in_progress", why: "同一 operation 正在前（same-token 恢复放行）", initDone: false, cutoverDone: false, initCount: init.length, cutoverCount: cutover.length, inProgress: true, inProgressToken: token, inProgressKind: inProgress.isInit ? "init" : "cutover" };
+    return { ok: false, state: "in_progress_foreign", why: "存在未完成的账本 " + (inProgress.isInit ? "初始化" : "切权威") + " WAL（token " + inProgress.token + "，他 token 一律 fail-closed）", initDone: init.length === 1, cutoverDone: cutover.length === 1, initCount: init.length, cutoverCount: cutover.length, inProgress: true, inProgressToken: inProgress.token };
   }
   const initDone = init.length === 1, cutoverDone = cutover.length === 1;
   const conflict = init.length > 1 || cutover.length > 1;
@@ -50,7 +59,15 @@ export function endpointReceipt(dir, endpointId) {
     ? init[0].startedAt > earliestIso(cutover)
     : false; // init 不在 cutover 之前 → 矛盾（切了又初始化 / 先切后初始化）
   if (conflict || ordering) return { ok: false, state: "duplicate_or_conflict", why: "收据矛盾：init " + init.length + " 份 / cutover " + cutover.length + " 份" + (ordering ? "（init 不在 cutover 之前）" : ""), initDone, cutoverDone, initCount: init.length, cutoverCount: cutover.length };
+  if (cutover.length > 0 && init.length !== 1) return { ok: false, state: "duplicate_or_conflict", why: "cutover>0 但 init≠1（收了切没初始化或重复初始化）", initDone, cutoverDone, initCount: init.length, cutoverCount: cutover.length };
   return { ok: true, state: initDone ? "ok" : "never_initialized", initDone, cutoverDone, initCount: init.length, cutoverCount: cutover.length };
+}
+
+/** P1-6：正在前的账本 WAL——phase 进了前向段且 ledger step 已 prepared（还没 done）。 */
+function isInProgressWAL(doc) {
+  if (!(doc.phase === "ledger_initializing" || doc.phase === "ledger_cutting_over")) return false;
+  const ls = doc.steps.find((s) => s.kind === "ledger");
+  return ls !== undefined && ls.state === "prepared";
 }
 
 /**

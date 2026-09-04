@@ -21,7 +21,7 @@ import path from "node:path";
 import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhileHeld } from "./registry.mjs";
 import { isCanonicalIso, canonicalIso, isCanonicalMs } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "./claim.mjs";
-import { JOURNAL_SCHEMA, OPERATION_KINDS, journalProblem, leaseHolder, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
+import { JOURNAL_SCHEMA, OPERATION_KINDS, journalProblem, leaseHolder, leasePath, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
 import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { maintenanceGatePath, readGate } from "./maintenance-gate-core.mjs";
 
@@ -680,6 +680,7 @@ function _maintenanceVerifier(capability, endpointId, opType, env = process.env)
   if (ls.state !== "prepared") return fail("ledger_step_not_prepared", "ledger step 状态 " + ls.state);
   const m = /^ledger:(endpoint_[0-9a-f]{24}):(init|cutover)$/u.exec(ls.id);
   if (!m || m[2] !== wantSub || m[1] !== endpointId) return fail("ledger_step_identity", "ledger step 身份与 endpoint/kind 不符");
+  if (!CHAIN.includes(ls.chain)) return fail("ledger_chain_bad", "ledger step 缺 chain 或非法");
   // 门在且 token 与 journal 的 gate step intended_after 一致
   const gate = readGate({ file: gateFile, now: Date.now() });
   if (gate.state !== "active") return fail("gate_not_active", "门 " + gate.state + (gate.why ? "：" + gate.why : ""));
@@ -689,7 +690,42 @@ function _maintenanceVerifier(capability, endpointId, opType, env = process.env)
   if (!holder.present) return fail("lease_absent", "operation 租约不存在");
   if (holder.unreadable) return fail("lease_unreadable", "租约读不出：" + holder.why);
   if (!holder.alive) return fail("lease_dead", "租约持有者 pid " + holder.pid + " 已不在");
-  return { ok: true, maintenanceDir: maintDir, doc: j.doc, ledgerStep: ls };
+  if (holder.at !== null && !isCanonicalIso(holder.at)) return fail("lease_payload_bad", "租约 owner.at 不是规范化 ISO");
+  // 评审 P1-3：capability 必须证明**当前进程确实持有**该 operation 租约实例（commitWhileHeld 的 token fencing），
+  // 且 plan 必须由 journal 里已落盘的 ledger step 重建，不得接受调用方任意 planIn。重建后逐字段绑定 before/intended_after。
+  const lpath = leasePath(maintDir, token);
+  const binding = commitWhileHeld(lpath, () => {
+    const ld = resolveEndpointDir(endpointId, { env });
+    if (!ld.ok) return ld;
+    const plan = rebuildPlanFromStep({ endpointId, chain: ls.chain, token, ledgerDir: ld.dir, step: ls });
+    if (!plan.ok) return plan;
+    const bindProblem = bindPlanToStep(plan, ls);
+    if (bindProblem !== null) return { ok: false, reason: "plan_binding_mismatch", why: bindProblem };
+    return { ok: true, plan };
+  });
+  if (!binding.ok || !binding.run) return fail("lease_lost", "本过程不再持有 operation 租约实例（commitWhileHeld：" + (binding?.reason ?? "lock_lost") + "）");
+  if (!binding.run.ok) return fail("plan_rebuild", binding.run.reason + (binding.run.why !== undefined ? "：" + binding.run.why : ""));
+  return { ok: true, maintenanceDir: maintDir, doc: j.doc, ledgerStep: ls, plan: binding.run.plan };
+}
+
+/** 由 journal 里已落盘的 ledger step 幂等重建 WAL 蓝图（P1-3：不接受调用方任意 planIn）。 */
+function rebuildPlanFromStep({ endpointId, chain, token, ledgerDir, step }) {
+  const sub = step.id.endsWith(":init") ? "init" : "cutover";
+  if (sub === "init") return initPlan({ endpointId, chain, requestKey: token, operationId: token });
+  const L = loadLedger(ledgerDir, { endpointId });
+  if (!L.ok) return { ok: false, reason: L.reason, why: L.why ?? null };
+  if (L.doc.authority_mode !== "shadow") return { ok: false, reason: "mode_not_shadow", why: "重建 cutover plan 需 shadow" };
+  const digest = step.intended_after?.bijection_digest;
+  if (typeof digest !== "string" || !SHA_SHAPE.test(digest)) return { ok: false, reason: "bad_digest", why: "ledger step 的 intended_after.bijection_digest 缺失或非法" };
+  return cutoverPlan({ endpointId, chain, requestKey: token, operationId: token, shadowDoc: L.doc, shadowSha: L.sha256, digest });
+}
+
+/** 逐字段绑定 plan.before / plan.intended_after 与 ledger step（P1-3：字段名相同、键序无关、值全等才放行）。 */
+function bindPlanToStep(plan, ls) {
+  const eq = (a, b) => { const ka = Object.keys(a).sort(), kb = Object.keys(b).sort(); return ka.length === kb.length && ka.every((k, i) => k === kb[i]) && ka.every((k) => a[k] === b[k]); };
+  if (!eq(plan.before, ls.before)) return "plan.before 与 ledger step 的 before 不一致";
+  if (!eq(plan.intendedAfter, ls.intended_after)) return "plan.intended_after 与 ledger step 的 intended_after 不一致";
+  return null;
 }
 
 /** 锁内封闭盘点：目录里除 ledger.lock 外不得有任何制品（v1 首笔无 .prev / 无 tmp / 无 reap 家族 / 无未知）。 */
@@ -702,9 +738,10 @@ function virginInventory(dir) {
 }
 
 /** 机器级初始化收据（B-3 的最小投影：aggregate 全量收据属第 2 块另一分支）：扫描维护目录 journal，看该 endpoint 是否已被初始化 / 已切权威。 */
-/** 门内双射对账接口（§8/§5 cutover 前置）——M1a 未接真对账，fail-closed 恒拒 reconciler_absent；`reconciler` 是测试/后续接入处。 */
-export function reconcileShadow({ endpointId, shadowDoc, reconciler = null } = {}) {
-  if (typeof reconciler === "function") return reconciler({ endpointId, shadowDoc });
+/** 门内双射对账接口（§8/§5 cutover 前置）——M1a 未接真对账，fail-closed 恒拒 reconciler_absent。
+ *  评审 P1-4：不接受调用方注入的 reconciler（否则旁路可自行对账），真对账接入时在此接，且必须经 capability 门。
+ */
+export function reconcileShadow({ endpointId, shadowDoc } = {}) {
   return { ok: false, reason: "reconciler_absent", why: "双射对账器未接入，cutover fail-closed" };
 }
 
@@ -784,18 +821,19 @@ function gatedTx({ endpointId, requestKey, env, replay, _inject, mutate }) {
 // 只经这两个窄事务写（virgin 盘点 / §5.2 WAL / 初始化收据 / 门内双射对账都在维护层）。
 
 /** initialize_shadow（§5/§5.2）：受验 capability（active maintenance op / gate token / lease / ledger step）+ 原 request_key + virgin 盘点 + 机器级初始化收据，写 revision=1。 */
-export function initializeShadow({ endpointId, capability, requestKey, chain, plan: planIn = null, env = process.env, _inject = null } = {}) {
+export function initializeShadow({ endpointId, capability, requestKey, chain, env = process.env, _inject = null } = {}) {
   if (!capability || capability.kind !== "initialize_shadow") return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "kind 不符或缺失" };
   const cap = _maintenanceVerifier(capability, endpointId, "initialize_shadow", env);
   if (!cap.ok) return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: cap.reason + (cap.why ? "：" + cap.why : "") };
   if (typeof requestKey !== "string" || !REQUEST_KEY_SHAPE.test(requestKey)) return { ok: false, commit: "not_committed", reason: "bad_request_key" };
   if (!CHAIN.includes(chain)) return { ok: false, commit: "not_committed", reason: "bad_chain" };
-  const receipt = endpointReceipt(cap.maintenanceDir, endpointId);
+  if (chain !== cap.ledgerStep.chain) return { ok: false, commit: "not_committed", reason: "chain_mismatch", why: "入参 chain 与 ledger step 不一致" };
+  const plan = cap.plan;
+  if (plan.requestKey !== requestKey) return { ok: false, commit: "not_committed", reason: "bad_request_key", why: "重进的 requestKey 与 operation requestKey 不符" };
+  if (plan.intendedAfter.endpoint_id !== endpointId) return { ok: false, commit: "not_committed", reason: "plan_mismatch", why: "重进 plan 与该 endpoint 不符" };
+  const receipt = endpointReceipt(cap.maintenanceDir, endpointId, { token: capability.token });
   if (!receipt.ok) return { ok: false, commit: "not_committed", reason: "already_initialized", why: receipt.why };
   if (receipt.initDone || receipt.cutoverDone) return { ok: false, commit: "not_committed", reason: "already_initialized", why: "该 endpoint 已被初始化或已切权威" };
-  const plan = planIn ?? initPlan({ endpointId, chain, requestKey, operationId: capability.token });
-  if (!plan.ok) return { ok: false, commit: "not_committed", reason: plan.reason, why: plan.why ?? null };
-  if (plan.intendedAfter.endpoint_id !== endpointId || plan.requestKey !== requestKey) return { ok: false, commit: "not_committed", reason: "plan_mismatch", why: "plan 与入参不一致" };
   const d = resolveEndpointDir(endpointId, { env });
   if (!d.ok) return badTx(d);
   const res = writeLedger({
@@ -812,30 +850,35 @@ export function initializeShadow({ endpointId, capability, requestKey, chain, pl
   if (res.result?.revision !== 1) return { ok: false, commit: res.commit, reason: "written_refused", why: "写回 revision 不是 1" };
   const reread = readLedger(d.dir);
   if (reread.status !== "read" || reread.sha256 !== plan.sha256) return { ok: false, commit: res.commit, reason: "written_mismatch", why: "落盘 SHA 与蓝图不符" };
+
   return { ok: true, commit: res.commit, revision: 1, result: res.result, sha256: plan.sha256, plan };
 }
 
 /** authority_cutover（§5/§8）：shadow→authoritative 同一不可逆提交；前置 = 门内双射对账通过（fail-closed）+ G14 无已切权威。 */
-export function authorityCutover({ endpointId, capability, requestKey, chain, plan: planIn = null, shadowDoc: shadowDocIn = null, reconciler = null, env = process.env, _inject = null } = {}) {
+export function authorityCutover({ endpointId, capability, requestKey, chain, env = process.env, _inject = null } = {}) {
   if (!capability || capability.kind !== "authority_cutover") return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "kind 不符或缺失" };
   const cap = _maintenanceVerifier(capability, endpointId, "authority_cutover", env);
   if (!cap.ok) return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: cap.reason + (cap.why ? "：" + cap.why : "") };
   if (typeof requestKey !== "string" || !REQUEST_KEY_SHAPE.test(requestKey)) return { ok: false, commit: "not_committed", reason: "bad_request_key" };
-  const receipt = endpointReceipt(cap.maintenanceDir, endpointId);
+  if (!CHAIN.includes(chain)) return { ok: false, commit: "not_committed", reason: "bad_chain" };
+  if (chain !== cap.ledgerStep.chain) return { ok: false, commit: "not_committed", reason: "chain_mismatch", why: "入参 chain 与 ledger step 不一致" };
+  const plan = cap.plan;
+  if (plan.requestKey !== requestKey) return { ok: false, commit: "not_committed", reason: "bad_request_key", why: "重进的 requestKey 与 operation requestKey 不符" };
+  if (plan.intendedAfter.endpoint_id !== endpointId) return { ok: false, commit: "not_committed", reason: "plan_mismatch", why: "重进 plan 与该 endpoint 不符" };
+  const receipt = endpointReceipt(cap.maintenanceDir, endpointId, { token: capability.token });
   if (!receipt.ok) return { ok: false, commit: "not_committed", reason: "receipt_problem", why: receipt.why };
   if (receipt.cutoverDone) return { ok: false, commit: "not_committed", reason: "already_cutover", why: "该 endpoint 已切权威" };
   const d = resolveEndpointDir(endpointId, { env });
   if (!d.ok) return badTx(d);
-  const loaded = shadowDocIn ?? loadLedger(d.dir, { endpointId });
+  const loaded = loadLedger(d.dir, { endpointId });
   if (!loaded.ok) return { ok: false, commit: "not_committed", reason: loaded.reason, why: loaded.why ?? null };
   if (loaded.doc.authority_mode !== "shadow") return { ok: false, commit: "not_committed", reason: "mode_not_shadow", why: "authority_mode=" + loaded.doc.authority_mode };
   if (loaded.doc.chain !== chain) return { ok: false, commit: "not_committed", reason: "chain_mismatch", why: "账本 chain 与入参不符" };
-  const rec = reconcileShadow({ endpointId, shadowDoc: loaded.doc, reconciler });
+  // 评审 P1-4：cutover 不接调用方注入的 reconciler——真对账未接，恒 fail-closed（reconciler_absent），不许测试/旁路自行对账。
+  const rec = reconcileShadow({ endpointId, shadowDoc: loaded.doc });
   if (!rec.ok) return { ok: false, commit: "not_committed", reason: "reconciler_absent", why: rec.why };
   const digest = rec.digest;
   if (typeof digest !== "string" || !SHA_SHAPE.test(digest)) return { ok: false, commit: "not_committed", reason: "reconciler_absent", why: "对账器未给合法 digest" };
-  const plan = planIn ?? cutoverPlan({ endpointId, chain, requestKey, operationId: capability.token, shadowDoc: loaded.doc, shadowSha: loaded.sha256, digest });
-  if (!plan.ok) return { ok: false, commit: "not_committed", reason: plan.reason, why: plan.why ?? null };
   if (plan.intendedAfter.bijection_digest !== digest || plan.intendedAfter.endpoint_id !== endpointId) return { ok: false, commit: "not_committed", reason: "plan_mismatch", why: "plan 与对账结果不一致" };
   const res = writeLedger({
     dir: d.dir, endpointId, gated: false, requestKey, _inject,

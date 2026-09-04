@@ -36,6 +36,14 @@ export const PHASES = Object.freeze([
   // 账本接入（M1 B-1）：init/cutover 的不可逆前向段 + 账本 operation 的成功重开段。
   "ledger_initializing", "ledger_cutting_over", "ledger_reopening",
 ]);
+// P1-7：阶段 × operation_kind 封闭（每 operation_kind 只许各自的阶段集；1.1 冻结为非账本阶段）。
+// 1.1 历史 journal（无 operation_kind）：允许全部非账本阶段（旧 gate+install 种）。
+const INSTALL_PHASES = Object.freeze(["planned", "timer_stopped", "stubbed", "gated", "drained", "staged", "committed", "verified", "reopening", "done", "reopening_incomplete", "rolling_back", "rollback_reopening", "rolled_back", "rollback_incomplete"]);
+// maintenance_gate（只进门+回退，不装任何东西）：禁 install 阶段（staged/committed/verified）与 install 步。
+const GATE_ONLY_PHASES = Object.freeze(["planned", "timer_stopped", "stubbed", "gated", "drained", "rolling_back", "rollback_reopening", "rolled_back", "rollback_incomplete"]);
+const LEDGER_BASE_PHASES = Object.freeze(["planned", "timer_stopped", "stubbed", "gated", "drained", "ledger_reopening", "done", "reopening_incomplete", "rolling_back", "rollback_reopening", "rolled_back", "rollback_incomplete"]);
+const LEDGER_INIT_PHASES = Object.freeze([...LEDGER_BASE_PHASES, "ledger_initializing"]);
+const LEDGER_CUTOVER_PHASES = Object.freeze([...LEDGER_BASE_PHASES, "ledger_cutting_over"]);
 export const TERMINAL_PHASES = Object.freeze(["done", "rolled_back"]);
 /** 没做完的终态：门与账保留，--exit --apply 只向前重试。 */
 export const INCOMPLETE_PHASES = Object.freeze(["reopening_incomplete", "rollback_incomplete"]);
@@ -85,6 +93,8 @@ function timerState(x) { return isObj(x) && keysOf(x) === "phase" && TIMER_PHASE
 function shapeProblemFor(s) {
   const [kind, rest] = [s.kind, s.id.slice(s.kind.length + 1)];
   const idOk = s.id.startsWith(kind + ":") || s.id === kind;
+  // P1-1：chain 只许 ledger step 携带（closed field），其余 kind 由 stepProblem 验 chain===null；非 ledger 仍走下面各自形状。
+  if (kind === "ledger" && !CHAIN_ID.test(s.chain)) return "ledger step 的 chain 必须是 claude|codex";
   if (kind === "timer") {
     if (!idOk || !CHAIN_ID.test(rest)) return "timer 的 id 必须是 timer:<chain>";
     if (!(isObj(s.before) && keysOf(s.before) === "phase,plist" && TIMER_PHASES.includes(s.before.phase) && typeof s.before.plist === "string" && path.isAbsolute(s.before.plist))) return "timer.before 形状不对";
@@ -174,9 +184,10 @@ function shapeProblemFor(s) {
 }
 function stepProblem(s) {
   if (!isObj(s)) return "step 不是对象";
-  if (keysOf(s) !== "after,at,backup,backup_bytes,backup_sha256,before,id,intended_after,kind,state,target") return "step 字段集不对";
+  if (keysOf(s) !== "after,at,backup,backup_bytes,backup_sha256,before,chain,id,intended_after,kind,state,target") return "step 字段集不对";
   if (typeof s.id !== "string" || s.id.length === 0) return "step id 不是字符串";
   if (!STEP_KINDS.includes(s.kind)) return "step kind 不在受控集合里";
+  if (s.kind !== "ledger" && s.chain !== null) return "非 ledger step 不该有 chain";
   if (typeof s.target !== "string" || s.target.length === 0) return "step target 不是字符串";
   if (!(s.backup === null || (typeof s.backup === "string" && path.isAbsolute(s.backup)))) return "step backup 不是 null 或绝对路径";
   if (s.backup === null ? (s.backup_sha256 !== null || s.backup_bytes !== null) : !(typeof s.backup_sha256 === "string" && SHA_SHAPE.test(s.backup_sha256) && Number.isSafeInteger(s.backup_bytes) && s.backup_bytes >= 0)) return "备份的 sha256 / 长度与 backup 不一致";
@@ -211,7 +222,14 @@ export function journalProblem(doc) {
   if (typeof doc.token !== "string" || !UUID_SHAPE.test(doc.token)) return "token 不是 UUID 字符串";
   if (typeof doc.reason !== "string" || [...doc.reason].length > 80) return "reason 不是 ≤ 80 码点的字符串";
   if (!isCanonicalIso(doc.started_at) || !isCanonicalIso(doc.updated_at)) return "时间不是规范化 ISO";
-  if (!PHASES.includes(doc.phase)) return "phase 不在封闭集合里：" + String(doc.phase);
+  // P1-7：阶段 × operation_kind 封闭（1.1 冻结为非账本阶段；ledger_init 不得进入 ledger_cutting_over，反之亦然）。
+  const isLedgerKind = is12 && (doc.operation_kind === "ledger_init" || doc.operation_kind === "ledger_cutover");
+  const allowed = !is12 ? INSTALL_PHASES
+    : doc.operation_kind === "ledger_init" ? LEDGER_INIT_PHASES
+    : doc.operation_kind === "ledger_cutover" ? LEDGER_CUTOVER_PHASES
+    : doc.operation_kind === "maintenance_gate" ? GATE_ONLY_PHASES
+    : INSTALL_PHASES;
+  if (!allowed.includes(doc.phase)) return (is12 ? "operation_kind " + doc.operation_kind : "旧 1.1") + " 不得处于阶段 " + doc.phase;
   if (!Array.isArray(doc.steps)) return "steps 不是数组";
   const ids = new Set();
   for (const s of doc.steps) { const p = stepProblem(s); if (p !== null) return p; if (ids.has(s.id)) return "step id 重复：" + s.id; ids.add(s.id); }
@@ -232,10 +250,19 @@ export function journalProblem(doc) {
         if (!s.id.endsWith(":" + wantSub)) return "ledger step 的 init/cutover 与 operation_kind 不一致";
         if (s.before.operation_id !== doc.token || s.intended_after.operation_id !== doc.token) return "ledger step 的 operation_id 与 operation token 不一致";
       }
+    } else if (doc.operation_kind === "maintenance_gate") {
+      // P1-7：gate 不做安装，禁 install 专属步（staged_plan / current:<chain>:install / artifact / receipt）。
+      if (doc.steps.some((s) => s.kind === "artifact" || s.kind === "receipt" || s.kind === "staged_plan" || (s.kind === "current" && s.id.endsWith(":install")))) return "maintenance_gate 不得含 install step";
     }
+  } else {
+    // 1.1 冻结（P1-7）：旧种（gate/install）不得含账本步、不得处于账本阶段——已由上方的 phase 封闭拦截。
+    if (doc.steps.some((s) => s.kind === "ledger")) return "旧 1.1 不得含 ledger step";
   }
   const required = requiredStepIds(doc);
   if (required) for (const id of required) { const s = doc.steps.find((x) => x.id === id); if (!s || s.state !== "done") return "阶段 " + doc.phase + " 要求 " + id + " 已 done"; }
+  // 评审 P1-1：前向 ledger 阶段必须已有 ledger step（进前向态与 ledger step 落盘是 enterLedgerForward 的**一次**原子更新，
+  // 拿不到 step 的 ledger_initializing/cutting_over 只可能是旧种崩溃残留，fail-closed——EXIT 不再放行恢复死窗）。
+  if (isLedgerKind && (doc.phase === "ledger_initializing" || doc.phase === "ledger_cutting_over") && !doc.steps.some((s) => s.kind === "ledger")) return "前向阶段 " + doc.phase + " 必须已有 ledger step";
   if (!Array.isArray(doc.notes) || doc.notes.some((n) => typeof n !== "string")) return "notes 不是字符串数组";
   return null;
 }
@@ -310,12 +337,15 @@ export function acquireOperationLease({ dir, token }) {
   return { ok: false, reason: r.reason === "lock_residue" || r.reason === "reap_residue" || r.reason === "reap_uncleared" || r.reason === "reaped_uncleared" ? "lease_residue" : "io_error", path: r.path ?? file, why: String(r.reason) + (r.error ? "：" + r.error : "") };
 }
 export function releaseOperationLease(lease) {
-  if (!lease?.path) return { ok: true, absent: true };
+  if (!lease?.path) return { ok: false, who: "absent", why: "releaseOperationLease 没有 lease.path" };
   try {
     const r = releasePublishLock(lease.path);
     // 归属转换锁 .reap 交不还：主租约可能已删，但 .reap 残骸会让后续续跑一律 reap_residue —— 不是成功，点名真实路径
     if (r.reapUncleared) return { ok: false, why: "reap_uncleared：" + String(r.reapUncleared.error ?? ""), path: r.reapUncleared.path };
-    return r.ok || r.reason === "not_owner" ? { ok: true } : { ok: false, why: String(r.reason), path: lease.path };
+    // P1-8：释放是归属转换。租约已被接管（not_owner）或干脆不在（absent）都不是成功——调用方必须把残留带进结果。
+    if (r.reason === "not_owner") return { ok: false, who: "not_owner", why: "租约已不属于本执行者（被接管）", path: lease.path };
+    if (r.absent) return { ok: false, who: "absent", why: "租约不在（已被接管或从未存在）", path: lease.path };
+    return r.ok ? { ok: true } : { ok: false, why: String(r.reason), path: lease.path };
   } catch (err) { return { ok: false, why: "release_threw：" + errCode(err), path: lease.path }; }
 }
 
@@ -377,7 +407,7 @@ export const addNote = ({ dir, token, lease, note, now }) => updateJournal({ dir
 /** 两阶段第一步：把 before / backup{sha256,bytes} / intended_after 落盘之后才允许做外部变更。 */
 export const addStepPrepared = ({ dir, token, lease, step, now = Date.now() }) => updateJournal({ dir, token, lease, now, mutate: (d) => {
   if (d.steps.some((s) => s.id === step.id)) return null;
-  d.steps.push({ id: step.id, kind: step.kind, target: step.target, before: step.before ?? null, backup: step.backup ?? null, backup_sha256: step.backup_sha256 ?? null, backup_bytes: step.backup_bytes ?? null, intended_after: step.intended_after ?? null, state: "prepared", after: null, at: new Date(now).toISOString() });
+  d.steps.push({ id: step.id, kind: step.kind, target: step.target, before: step.before ?? null, backup: step.backup ?? null, backup_sha256: step.backup_sha256 ?? null, backup_bytes: step.backup_bytes ?? null, intended_after: step.intended_after ?? null, chain: step.chain ?? null, state: "prepared", after: null, at: new Date(now).toISOString() });
   return d;
 } });
 /** 两阶段第二步：记实际 after。 */
@@ -385,6 +415,18 @@ export const markStepDone = ({ dir, token, lease, id, after, now = Date.now() })
   const s = d.steps.find((x) => x.id === id);
   if (!s) return null;
   s.state = "done"; s.after = after; s.at = new Date(now).toISOString();
+  return d;
+} });
+
+/** P1-1：把 phase 推进（forward）与 ledger step 落盘合并成**一次**原子更新。
+ *  原实现是 setPhase(fwd)+addNote(chain)+addStepPrepared 三步，中间崩溃会留下 「phase=fwd 但无 ledger step / 无 chain 来源」的窗口；
+ *  现在 phase 与 step（含 chain）同一写落盘，窗口消失，收敛路径（phase=fwd 且有 prepared ledger step）恒能由 step 重建链。
+ */
+export const enterLedgerForward = ({ dir, token, lease, phase, step, chain, expectPhase = "drained", now = Date.now() }) => updateJournal({ dir, token, lease, expectPhase, now, mutate: (d) => {
+  const existing = d.steps.find((s) => s.id === step.id);
+  if (existing) return d; // 幂等：恢复再进同一 forward 不重推（否则 journalProblem 会撞「step id 重复」）
+  d.phase = phase;
+  d.steps.push({ id: step.id, kind: step.kind, target: step.target, before: step.before ?? null, backup: step.backup ?? null, backup_sha256: step.backup_sha256 ?? null, backup_bytes: step.backup_bytes ?? null, intended_after: step.intended_after ?? null, chain: chain ?? null, state: "prepared", after: null, at: new Date(now).toISOString() });
   return d;
 } });
 

@@ -222,7 +222,7 @@ import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs"
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
-import { acquireOperationLease, addNote as addNoteJ, addStepPrepared as addStepPreparedJ, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, journalProblem, readActive, readJournal, releaseOperationLease, setPhase as setPhaseJ, updateJournal } from "./maintenance/journal.mjs";
+import { acquireOperationLease, addNote as addNoteJ, addStepPrepared as addStepPreparedJ, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, enterLedgerForward, journalProblem, readActive, readJournal, releaseOperationLease, setPhase as setPhaseJ, updateJournal } from "./maintenance/journal.mjs";
 import * as LEDGER_OP from "./maintenance/ledger-operation.mjs";
 import { commitForInstall, finishInstallReopening, liveBaseline, stageForInstall, stagedChecks, stagedPlanProblem, verifyLiveForInstall, verifyStagedForInstall } from "./maintenance/maintenance-install-core.mjs";
 import { parseMaintenanceInstallArgs, runMaintenanceInstall } from "./maintenance-install.mjs";
@@ -23457,7 +23457,7 @@ test("维护门 · PR C 单元：journal 三态与两阶段、active 只许一�
       before: sub === "init" ? initState() : { endpoint_id: ep, operation_id: good.token, fingerprint: sha, authority_mode: "shadow", revision: 3, ledger_sha256: sha, bijection_digest: null },
       intended_after: sub === "init" ? { endpoint_id: ep, operation_id: good.token, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha }
                                      : { endpoint_id: ep, operation_id: good.token, fingerprint: sha, authority_mode: "authoritative", revision: 4, ledger_sha256: sha, bijection_digest: sha },
-      after: null, state: "prepared", at: good.updated_at, ...over });
+      after: null, state: "prepared", at: good.updated_at, chain: "claude", ...over });
     const jInit = { ...good, operation_kind: "ledger_init", steps: [mkLedger("init")] };
     assert.equal(journalProblem(jInit), null, "合法 ledger_init（planned + prepared init step）");
     assert.equal(journalProblem({ ...good, operation_kind: "ledger_cutover", steps: [mkLedger("cutover")] }), null, "合法 ledger_cutover step");
@@ -23466,10 +23466,10 @@ test("维护门 · PR C 单元：journal 三态与两阶段、active 只许一�
     assert.equal(journalProblem({ ...jInit, steps: [mkLedger("init", { before: initState({ operation_id: "00000000-0000-4000-8000-000000000000" }) })] }), "ledger step 的 operation_id 与 operation token 不一致", "operation_id 必须 = token");
     assert.notEqual(journalProblem({ ...jInit, steps: [mkLedger("init", { before: initState({ authority_mode: "shadow" }) })] }), null, "init.before authority_mode 非 null 拒");
     assert.notEqual(journalProblem({ ...jInit, phase: "ledger_reopening" }), null, "ledger_reopening 要求 ledger step done + ENTER_DONE（prepared/无 enter 步不够）");
-    const someInstallStep = { id: "staged_plan", kind: "staged_plan", target: "x", backup: null, backup_sha256: null, backup_bytes: null, before: null, intended_after: { sha256: sha, version: "0".repeat(16) }, after: null, state: "prepared", at: good.updated_at };
+    const someInstallStep = { id: "staged_plan", kind: "staged_plan", target: "x", backup: null, backup_sha256: null, backup_bytes: null, before: null, intended_after: { sha256: sha, version: "0".repeat(16) }, after: null, state: "prepared", at: good.updated_at, chain: null };
     assert.equal(journalProblem({ ...jInit, steps: [mkLedger("init"), someInstallStep] }), "账本 operation 不得含 install step", "账本 op 禁 install step");
   }
-  const mkStep = (over) => ({ id: "timer:claude", kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "a".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: good.updated_at, ...over });
+  const mkStep = (over) => ({ id: "timer:claude", kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "a".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: good.updated_at, chain: null, ...over });
   const withStep = (st) => ({ ...good, steps: [st] });
   assert.deepEqual([
     journalProblem(withStep(mkStep({}))),
@@ -23654,7 +23654,7 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
     assert.deepEqual([readActive({ dir }).state, fs.existsSync(gateFile), fs.readlinkSync(path.join(claudeRoot, "current"))], ["absent", false, "versions/" + v2], "锁被持有时两个方向都零改动");
     assert.equal(surf.release().ok, true);
     // ── base_changed（不变量 6）：stage 之后线上制品被外改 → commit 整次中止，已写项按备份回退，线上等于进门前
-    const e2 = enterMaintenance(ctx, { reason: "v3", apply: true }); assert.equal(e2.ok, true, JSON.stringify(e2));
+    const e2 = enterMaintenance(ctx, { reason: "v3", apply: true, operationKind: "maintenance_install" }); assert.equal(e2.ok, true, JSON.stringify(e2));
     // 伪造 / 缺席的租约在任何写之前被拒（评审返修 2）：只有 path 的对象不持实例，stage 零写入
     const forged = stageForInstall(ctx, { sourceRoot: srcV3, lease: { path: path.join(dir, e2.token + ".lease") } });
     assert.deepEqual([forged.ok, forged.reason, fs.existsSync(stagedDirPath(ctx, e2.token)), readJournal({ dir, token: e2.token }).doc.phase], [false, "lease_not_held", false, "drained"], "伪造租约路径 → 零写入：" + JSON.stringify(forged));
@@ -23700,7 +23700,7 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
     releaseOperationLease(lease);
     fs.writeFileSync(codexSkillDst, codexSkillBefore); fs.unlinkSync(path.join(dir, e2.token + ".json"));
     // ── 崩在"写成功、done 未记"（不变量 5）：恢复按"现场 == intendedAfter → 做过"回退
-    const e3 = enterMaintenance(ctx, { reason: "crash-mid", apply: true }); assert.equal(e3.ok, true, JSON.stringify(e3));
+    const e3 = enterMaintenance(ctx, { reason: "crash-mid", apply: true, operationKind: "maintenance_install" }); assert.equal(e3.ok, true, JSON.stringify(e3));
     lease = acquireOperationLease({ dir, token: e3.token }); assert.equal(lease.ok, true);
     assert.equal(stageForInstall(ctx, { sourceRoot: srcV3, lease }).ok, true);
     crashAt.id = "written:artifact:" + longtaskDst;
@@ -23722,7 +23722,7 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
     assert.deepEqual([ex3.ok, ex3.phase, fs.readFileSync(longtaskDst).equals(longtaskBefore), fs.readlinkSync(path.join(claudeRoot, "current")), readActive({ dir }).state], [true, "rolled_back", true, "versions/" + v2, "absent"], JSON.stringify(ex3));
     fs.unlinkSync(path.join(dir, e3.token + ".json"));
     // ── commit 全部写完后被外改（不变量 7）：回退不覆盖说不清的现场，停在 rolling_back（门与账保留）；修好后续跑
-    const e4 = enterMaintenance(ctx, { reason: "cas", apply: true }); assert.equal(e4.ok, true, JSON.stringify(e4));
+    const e4 = enterMaintenance(ctx, { reason: "cas", apply: true, operationKind: "maintenance_install" }); assert.equal(e4.ok, true, JSON.stringify(e4));
     lease = acquireOperationLease({ dir, token: e4.token }); assert.equal(lease.ok, true);
     assert.equal(stageForInstall(ctx, { sourceRoot: srcV3, lease }).ok, true);
     const c4 = commitForInstall(ctx, { lease }); assert.deepEqual([c4.ok, c4.version], [true, v3], JSON.stringify(c4));
@@ -23738,7 +23738,7 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
     releaseOperationLease(lease);
     fs.unlinkSync(path.join(dir, e4.token + ".json"));
     // ── 收据锁残骸不吞（评审探针曾见 ok:true + lockUncleared 被丢）：释放收据锁失败 → commit 必须失败、不记 done
-    const e4b = enterMaintenance(ctx, { reason: "receipt-residue", apply: true }); assert.equal(e4b.ok, true, JSON.stringify(e4b));
+    const e4b = enterMaintenance(ctx, { reason: "receipt-residue", apply: true, operationKind: "maintenance_install" }); assert.equal(e4b.ok, true, JSON.stringify(e4b));
     lease = acquireOperationLease({ dir, token: e4b.token }); assert.equal(lease.ok, true);
     assert.equal(stageForInstall(ctx, { sourceRoot: srcV3, lease }).ok, true);
     const claudeReceiptLock = claudeReceiptFile + ".lock";
@@ -23760,7 +23760,7 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
     releaseOperationLease(lease);
     fs.unlinkSync(path.join(dir, e4b.token + ".json"));
     // ── 不变量 8 + 14：删门之后被杀 → 只向前；终态已持久化、active 未清 → --exit 只清 active
-    const e5 = enterMaintenance(ctx, { reason: "v3 正装", apply: true }); assert.equal(e5.ok, true, JSON.stringify(e5));
+    const e5 = enterMaintenance(ctx, { reason: "v3 正装", apply: true, operationKind: "maintenance_install" }); assert.equal(e5.ok, true, JSON.stringify(e5));
     lease = acquireOperationLease({ dir, token: e5.token }); assert.equal(lease.ok, true);
     assert.equal(stageForInstall(ctx, { sourceRoot: srcV3, lease }).ok, true);
     assert.equal(commitForInstall(ctx, { lease }).ok, true);
@@ -23803,7 +23803,7 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
     ], [v3, v3, true, true, v3, [], false], "成功路径终态：线上 v3、定时器 loaded、桩与 staged 都清了");
     assert.equal(enterMaintenance(ctx, { reason: "收尾预检", apply: false }).ok, true, "v3 收据与线上一致，预检通过");
     // ── 不可逆回退窗口里被外切（不变量 8b 变体）：rollback_reopening 后 current 又被指回目标版本 → 逆序 CAS 一次收敛，install 步先回桩、enter 步再回原目标
-    const e6 = enterMaintenance(ctx, { reason: "adversarial", apply: true }); assert.equal(e6.ok, true, JSON.stringify(e6));
+    const e6 = enterMaintenance(ctx, { reason: "adversarial", apply: true, operationKind: "maintenance_install" }); assert.equal(e6.ok, true, JSON.stringify(e6));
     lease = acquireOperationLease({ dir, token: e6.token }); assert.equal(lease.ok, true);
     assert.equal(stageForInstall(ctx, { sourceRoot: srcV2, lease }).ok, true);
     assert.equal(commitForInstall(ctx, { lease }).ok, true);
@@ -24730,13 +24730,18 @@ test("账本维护 operation：init 进门→shadow→B-4 重开→done；崩写
     assert.equal(readGate({ file: gateFile, now: clock }).state, "absent", "init 后门撤掉");
     assert.equal(launchd[claudeLabel].loaded, true, "init 后定时器恢复 loaded");
 
-    // ── 2. cutover 快乐路径（需对账）+ 无对账 fail-closed
+    // ── 2. cutover：评审 P1-4 —— 调用方不能注入 reconciler；reconcileShadow 未接入（fail-closed 恒 reconciler_absent），带不带都拒，且账本保持 shadow
     const EPc = mkEp("agent_ledger_op_cut"); const dC = epDir(EPc);
     assert.ok(LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPc, chain: CH, apply: true }).phase === "done", "cutover 前置 init");
     const cut = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPc, chain: CH, apply: true, reconciler: REC });
-    assert.ok(cut.ok && cut.phase === "done", "cutover：" + JSON.stringify(cut));
+    assert.ok(cut.ok === false && cut.reason === "reconciler_absent", "cutover 带 reconciler 也拒（不得注入）：" + JSON.stringify(cut));
+    assert.equal(cut.rollbackSafe, true, "cutover 拒在 drained（rollbackSafe）：" + JSON.stringify(cut));
     const LC = TAL.loadLedger(dC, { endpointId: EPc });
-    assert.ok(LC.ok && LC.doc.authority_mode === "authoritative" && LC.doc.revision === 2, "cutover 后 authoritative/rev2：" + JSON.stringify(LC));
+    assert.ok(LC.ok && LC.doc.authority_mode === "shadow" && LC.doc.revision === 1, "cutover 被拒后仍是 shadow（未切权威）：" + JSON.stringify(LC));
+    // P1-4 低层：cutover 机器本身完好，缺的只是对账 gate——直接给合法 digest 应能构造出 authoritative/rev+1 蓝图
+    const lp = TAL.loadLedger(dC, { endpointId: EPc });
+    const planC = TAL.cutoverPlan({ endpointId: EPc, chain: CH, requestKey: cut.token ?? "req_c", operationId: cut.token ?? "12345678-1234-4234-8234-123456789abc", shadowDoc: lp.doc, shadowSha: lp.sha256, digest: TAL.sha256(Buffer.from("bijection:" + EPc)) });
+    assert.ok(planC.ok && planC.intendedAfter.authority_mode === "authoritative" && planC.intendedAfter.revision === 2, "cutover 蓝图（给 digest 时）authoritative/rev2：" + JSON.stringify(planC));
     const EPc2 = mkEp("agent_ledger_op_cut_no"); const dC2 = epDir(EPc2);
     assert.ok(LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPc2, chain: CH, apply: true }).phase === "done", "无对账 cutover 前置 init");
     const cutNo = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPc2, chain: CH, apply: true });
@@ -24777,10 +24782,8 @@ test("账本维护 operation：init 进门→shadow→B-4 重开→done；崩写
     assert.ok(entF.ok && entF.lease, "F2 enter：" + JSON.stringify(entF));
     const planF = TAL.initPlan({ endpointId: EPf, chain: CH, requestKey: entF.token, operationId: entF.token });
     assert.ok(planF.ok, "F2 initPlan：" + JSON.stringify(planF));
-    const pwF = setPhaseJ({ dir, token: entF.token, lease: entF.lease, phase: "ledger_initializing", expectPhase: "drained", now: clock });
-    assert.ok(pwF.ok, "F2 setPhase fwd：" + JSON.stringify(pwF));
-    assert.equal(addNoteJ({ dir, token: entF.token, lease: entF.lease, note: "ledger_op chain=" + CH, now: clock }).ok, true, "F2 addNote");
-    assert.equal(addStepPreparedJ({ dir, token: entF.token, lease: entF.lease, step: { id: "ledger:" + EPf + ":init", kind: "ledger", target: EPf, before: planF.before, backup: null, intended_after: planF.intendedAfter }, now: clock }).ok, true, "F2 addStepPrepared");
+    const pwF = enterLedgerForward({ dir, token: entF.token, lease: entF.lease, phase: "ledger_initializing", step: { id: "ledger:" + EPf + ":init", kind: "ledger", target: EPf, chain: CH, before: planF.before, backup: null, intended_after: planF.intendedAfter }, chain: CH, expectPhase: "drained", now: clock });
+    assert.ok(pwF.ok, "F2 enterLedgerForward：" + JSON.stringify(pwF));
     assert.ok(releaseOperationLease(entF.lease).ok, "F2 释放旧租约（否则 await 前持同一 pid 租约→operation_in_progress）");
     const xF = exitMaintenance(ctx, { apply: true });
     assert.ok(xF.ok && xF.phase === "done", "F2 通用 --exit 对 ledger op→只向前 done（若误回退会非 done）：" + JSON.stringify(xF));
@@ -24792,18 +24795,41 @@ test("账本维护 operation：init 进门→shadow→B-4 重开→done；崩写
     assert.equal(readActive({ dir }).state, "absent", "F2 后 active 清掉");
     assert.equal(readGate({ file: gateFile, now: clock }).state, "absent", "F2 后门撤掉");
 
+    // ── 5b. P1-5：写已提交但残留（committed_durability_uncertain）→ 门+active 保留、日志停在前向、退出码 3（不推进、不清残留）
+    const EPh = mkEp("agent_ledger_op_p1_5"); const dH = epDir(EPh);
+    const entH = enterMaintenance(ctx, { reason: "P1-5 残留", apply: true, keepLease: true, operationKind: "ledger_init" });
+    assert.ok(entH.ok && entH.lease, "P1-5 enter：" + JSON.stringify(entH));
+    const planH = TAL.initPlan({ endpointId: EPh, chain: CH, requestKey: entH.token, operationId: entH.token });
+    assert.ok(planH.ok, "P1-5 initPlan：" + JSON.stringify(planH));
+    assert.ok(enterLedgerForward({ dir, token: entH.token, lease: entH.lease, phase: "ledger_initializing", step: { id: "ledger:" + EPh + ":init", kind: "ledger", target: EPh, chain: CH, before: planH.before, backup: null, intended_after: planH.intendedAfter }, chain: CH, expectPhase: "drained", now: clock }).ok, "P1-5 enterLedgerForward");
+    const gH = LEDGER_OP.ledgerForward(ctx, { token: entH.token, lease: entH.lease, intent: { kind: "init", endpointId: EPh, chain: CH }, _inject: { afterLedgerRename: () => { throw new Error("p1-5 提交后异常"); } } });
+    assert.equal(gH.ok, false, "P1-5 门判应拒：" + JSON.stringify(gH));
+    assert.equal(gH.reason, "commit_residue", "P1-5 残留门判：" + JSON.stringify(gH));
+    assert.equal(gH.phase, "ledger_initializing", "P1-5 停在前向阶段");
+    assert.equal(gH.commit, "committed_durability_uncertain", "P1-5 残留标记");
+    assert.equal(readActive({ dir }).state, "active", "P1-5 active 保留（拒不清）");
+    assert.equal(readGate({ file: gateFile, now: clock }).state, "active", "P1-5 门保留（拒不清）");
+    const jH = journalOf(entH.token);
+    assert.equal(jH.phase, "ledger_initializing", "P1-5 journal 仍前向");
+    assert.equal(jH.steps.find((s) => s.id === "ledger:" + EPh + ":init")?.state, "prepared", "P1-5 ledger step 仍 prepared");
+    assert.equal(exitCodeFor(gH), 3, "P1-5 退出码 = 3（动了没做完）");
+    assert.equal(releaseOperationLease(entH.lease).ok, true, "P1-5 释放租约");
+    // 清理：不带 inject 的恢复应收敛 done（账本已 shadow/rev1 → 只向前补 markStepDone + B-4 重开）
+    const rH = LEDGER_OP.ledgerExit(ctx, { apply: true });
+    assert.ok(rH.ok && rH.phase === "done", "P1-5 恢复收敛 done：" + JSON.stringify(rH));
+    assert.equal(readActive({ dir }).state, "absent", "P1-5 恢复后 active 清掉");
+    assert.equal(readGate({ file: gateFile, now: clock }).state, "absent", "P1-5 恢复后门撤掉");
+
     // ── 6. F3：维护目录混进坏 journal → endpointReceipt fail-closed，init 拒 already_initialized
     const EPg = mkEp("agent_ledger_op_f3"); const dG = epDir(EPg);
     const entG = enterMaintenance(ctx, { reason: "F3 bad journal", apply: true, keepLease: true, operationKind: "ledger_init" });
     assert.ok(entG.ok && entG.lease, "F3 enter：" + JSON.stringify(entG));
     const planG = TAL.initPlan({ endpointId: EPg, chain: CH, requestKey: entG.token, operationId: entG.token });
     assert.ok(planG.ok, "F3 initPlan：" + JSON.stringify(planG));
-    assert.ok(setPhaseJ({ dir, token: entG.token, lease: entG.lease, phase: "ledger_initializing", expectPhase: "drained", now: clock }).ok, "F3 setPhase fwd");
-    assert.equal(addNoteJ({ dir, token: entG.token, lease: entG.lease, note: "ledger_op chain=" + CH, now: clock }).ok, true, "F3 addNote");
-    assert.equal(addStepPreparedJ({ dir, token: entG.token, lease: entG.lease, step: { id: "ledger:" + EPg + ":init", kind: "ledger", target: EPg, before: planG.before, backup: null, intended_after: planG.intendedAfter }, now: clock }).ok, true, "F3 addStepPrepared");
+    assert.ok(enterLedgerForward({ dir, token: entG.token, lease: entG.lease, phase: "ledger_initializing", step: { id: "ledger:" + EPg + ":init", kind: "ledger", target: EPg, chain: CH, before: planG.before, backup: null, intended_after: planG.intendedAfter }, chain: CH, expectPhase: "drained", now: clock }).ok, "F3 enterLedgerForward");
     const badTok = "99999999-9999-4999-8999-999999999999";
     fs.writeFileSync(path.join(dir, badTok + ".json"), "{ bad json !!! ");
-    const f3 = TAL.initializeShadow({ endpointId: EPg, capability: { token: entG.token, kind: "initialize_shadow", endpointId: EPg }, requestKey: "req_f3", chain: CH });
+    const f3 = TAL.initializeShadow({ endpointId: EPg, capability: { token: entG.token, kind: "initialize_shadow", endpointId: EPg }, requestKey: entG.token, chain: CH });
     assert.equal(f3.ok, false); assert.equal(f3.reason, "already_initialized"); assert.match(f3.why, /不是 JSON|unreadable|journal/u, "F3 坏 journal→fail-closed：" + f3.why);
     assert.equal(fs.existsSync(path.join(dG, "ledger.json")), false, "F3 被拒后没写账本");
     // 清坏 journal + 把 entG 收敛 done（恢复 dir 干净供 scene 7）
@@ -24835,11 +24861,9 @@ test("账本维护 operation：init 进门→shadow→B-4 重开→done；崩写
     // token 错配（此时租约还活，token 检查先于租约）
     const negTok = TAL.initializeShadow({ endpointId: EPn, capability: { ...baseCap, token: "12345678-1234-1234-1234-123456789abc" }, requestKey: "req_neg_tok", chain: CH });
     assert.equal(negTok.ok, false); assert.equal(negTok.reason, "maintenance_capability_required"); assert.match(negTok.why, /operation_token_mismatch/u, "token 错配→拒：" + negTok.why);
-    // 推进到 ledger_initializing（让 verifier 走到租约检查），再撤租约 → lease_absent
-    const pwN = setPhaseJ({ dir, token: entN.token, lease: entN.lease, phase: "ledger_initializing", expectPhase: "drained", now: clock });
-    assert.ok(pwN.ok, "setPhase fwd：" + JSON.stringify(pwN));
-    const prepN = addStepPreparedJ({ dir, token: entN.token, lease: entN.lease, step: { id: "ledger:" + EPn + ":init", kind: "ledger", target: EPn, before: planN.before, backup: null, intended_after: planN.intendedAfter }, now: clock });
-    assert.ok(prepN.ok, "addStepPrepared：" + JSON.stringify(prepN));
+    // 推进到 ledger_initializing（进入前向 + ledger step 一次原子写，让 verifier 走到租约检查），再撤租约 → lease_absent
+    const pwN = enterLedgerForward({ dir, token: entN.token, lease: entN.lease, phase: "ledger_initializing", step: { id: "ledger:" + EPn + ":init", kind: "ledger", target: EPn, chain: CH, before: planN.before, backup: null, intended_after: planN.intendedAfter }, chain: CH, expectPhase: "drained", now: clock });
+    assert.ok(pwN.ok, "enterLedgerForward fwd：" + JSON.stringify(pwN));
     assert.equal(releaseOperationLease(entN.lease).ok, true);
     const negLease = TAL.initializeShadow({ endpointId: EPn, capability: baseCap, requestKey: "req_neg_lease", chain: CH });
     assert.equal(negLease.ok, false); assert.equal(negLease.reason, "maintenance_capability_required"); assert.match(negLease.why, /lease_absent/u, "租约缺席→拒：" + negLease.why);
@@ -25069,6 +25093,20 @@ test("账本维护 CLI + B-3 收据聚合 + inspect 收据不染红 + doctor ⑬
     assert.equal(readGate({ file: gateFile }).state, "absent", "cutover 拒后门撤掉");
     assert.ok(TAL.loadLedger(epDir(EPcut), { endpointId: EPcut }).doc.authority_mode === "shadow", "cutover 拒后仍是 shadow");
 
+    // 6b) P2-1：cutover 不做 --chain，链必须从既有账本读；账本 chain 非法/缺席 → resolveChain 返回 null → 干净拒绝（exit 1 零改动）
+    const EPcorrupt = mkEp("agent_ledger_cli_p21"); epDir(EPcorrupt);
+    assert.ok(LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPcorrupt, chain: CH, apply: true }).ok, "P2-1 前置 init：" + all());
+    const ledgerP21 = path.join(epDir(EPcorrupt), "ledger.json");
+    const corpDoc = JSON.parse(fs.readFileSync(ledgerP21, "utf-8"));
+    corpDoc.chain = "bogus";
+    fs.writeFileSync(ledgerP21, JSON.stringify(corpDoc));
+    const preP21 = snapState();
+    assert.equal(runCli(["--cutover", "--endpoint", EPcorrupt, "--apply"]), 1, all());
+    assert.match(all(), /读不出该 endpoint 的链/u, "点名读不出链：" + all());
+    assert.equal(snapState(), preP21, "P2-1 cutover 零改动");
+    assert.equal(readActive({ dir }).state, "absent", "P2-1 active 未留下");
+    assert.equal(readGate({ file: gateFile }).state, "absent", "P2-1 门未留下");
+
     // 7) B-3 状态投影 + CLI --status
     const st = ledgerStatus(ctx, { env: process.env });
     assert.equal(st.activeOp, null, "没有活动账本 operation");
@@ -25094,6 +25132,57 @@ test("账本维护 CLI + B-3 收据聚合 + inspect 收据不染红 + doctor ⑬
     if (prevTpl === undefined) delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; else process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = prevTpl;
     fs.rmSync(base, { recursive: true, force: true }); fs.rmSync(ledgerRoot, { recursive: true, force: true });
   }
+});
+
+test("账本维护 R18 验收：P1-7 phase×kind 反例、P1-1 前向原子窗口、P1-6 进行中 WAL 收据、P1-8 租约释放 fail-closed", () => {
+  // 自包含 fixture（与 23433 同构，但独立建以便单测跑）
+  const at = "2026-08-31T12:00:00.000Z";
+  const tok = "da88566e-d8d3-48ba-914e-7f96f4dfaeaa";
+  const base = { schema_version: "1.2", operation_kind: "maintenance_gate", token: tok, reason: "r", started_at: at, updated_at: at, phase: "planned", steps: [], notes: [] };
+  const ep = "endpoint_" + "a".repeat(24), sha = "b".repeat(64);
+  const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+  const timerDone = (chain) => ({ id: "timer:" + chain, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+  const stubDone = (chain) => ({ id: "stub:" + chain, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+  const curDone = (chain) => ({ id: "current:" + chain, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+  const gateDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+  const mkEnterDone = () => [timerDone("claude"), timerDone("codex"), stubDone("claude"), stubDone("codex"), curDone("claude"), curDone("codex"), gateDone()];
+  const mkLedgerInit = (over = {}) => ({ id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha }), after: null, state: "prepared", at, chain: "claude", ...over });
+  const ssp = { id: "staged_plan", kind: "staged_plan", target: "x", backup: null, backup_sha256: null, backup_bytes: null, before: null, intended_after: { sha256: sha, version: "0".repeat(16) }, after: null, state: "prepared", at, chain: null };
+  const jp = (d) => journalProblem(d);
+
+  // P1-7①：1.1（无 operation_kind）不得处于账本阶段
+  { const { operation_kind, ...legacy } = base; assert.notEqual(jp({ ...legacy, schema_version: "1.1", phase: "ledger_initializing", steps: [] }), null, "1.1 + ledger_initializing → 拒"); }
+  // P1-7②：maintenance_gate 不得含 install step（prepared staged_plan）
+  assert.equal(jp({ ...base, phase: "planned", steps: [ssp] }), "maintenance_gate 不得含 install step", "gate 禁 staged_plan（P1-7）");
+  // P1-7③：ledger_init 不得进入 ledger_cutting_over
+  assert.equal(jp({ ...base, operation_kind: "ledger_init", phase: "ledger_cutting_over", steps: [mkLedgerInit()] }), "operation_kind ledger_init 不得处于阶段 ledger_cutting_over", "ledger_init 禁 cutting_over（P1-7）");
+  // P1-7④：maintenance_gate 不得处于 install 专有阶段 staged/committed/verified
+  assert.equal(jp({ ...base, phase: "staged", steps: mkEnterDone() }), "operation_kind maintenance_gate 不得处于阶段 staged", "gate 禁 staged 阶段（P1-7）");
+
+  // P1-1：前向账本阶段必须已有 ledger step（enterLedgerForward 一次原子写 → 校验层同样拒绝无 step 的死窗）
+  assert.equal(jp({ ...base, operation_kind: "ledger_init", phase: "ledger_initializing", steps: mkEnterDone() }), "前向阶段 ledger_initializing 必须已有 ledger step", "无 ledger step 的 ledger_initializing 拒（P1-1 窗口关闭）");
+  assert.equal(jp({ ...base, operation_kind: "ledger_cutover", phase: "ledger_cutting_over", steps: mkEnterDone() }), "前向阶段 ledger_cutting_over 必须已有 ledger step", "cutover 前向阶段无 step 同样拒");
+  assert.equal(jp({ ...base, operation_kind: "ledger_init", phase: "ledger_initializing", steps: [...mkEnterDone(), mkLedgerInit()] }), null, "合法 with-step WAL 通过");
+
+  // P1-6：进行中的账本 WAL —— 同 token 放行（ok_in_progress），他 token 一律 fail-closed（in_progress_foreign）
+  {
+    const mdir = fs.mkdtempSync(path.join(os.tmpdir(), "r18-inprogress-"));
+    try {
+      fs.writeFileSync(path.join(mdir, tok + ".json"), JSON.stringify({ ...base, operation_kind: "ledger_init", phase: "ledger_initializing", steps: [...mkEnterDone(), mkLedgerInit()] }));
+      assert.deepEqual([endpointReceipt(mdir, ep, { token: tok }).state, endpointReceipt(mdir, ep, { token: tok }).ok], ["ok_in_progress", true], "同 token 恢复放行 ok_in_progress");
+      const foreign = endpointReceipt(mdir, ep, { token: "ffffffff-ffff-4fff-8fff-ffffffffffff" });
+      assert.deepEqual([foreign.state, foreign.ok, foreign.inProgressToken], ["in_progress_foreign", false, tok], "他 token 一律 in_progress_foreign fail-closed");
+      // 没传 token（空参）也应 fail-closed
+      assert.equal(endpointReceipt(mdir, ep).state, "in_progress_foreign", "无 token 参数也 fail-closed");
+      // 前向阶段缺 ledger step 视为可恢复？不——写坏 journal 仍是 unreadable
+      fs.writeFileSync(path.join(mdir, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee.json"), "{ 坏 JSON ");
+      assert.equal(endpointReceipt(mdir, ep).ok, false, "坏 journal → fail-closed");
+    } finally { fs.rmSync(mdir, { recursive: true, force: true }); }
+  }
+
+  // P1-8：移交后/不存在的租约交不还 → releaseOperationLease 报错（不是静默成功）
+  assert.deepEqual([releaseOperationLease({}).ok, releaseOperationLease({}).who], [false, "absent"], "无 lease.path → absent");
+  assert.deepEqual([releaseOperationLease({ path: "/tmp/r18-nonexistent-xyz.lease" }).ok, releaseOperationLease({ path: "/tmp/r18-nonexistent-xyz.lease" }).who], [false, "absent"], "租约不在 → absent（fail-closed）");
 });
 
 summarySealed = true;

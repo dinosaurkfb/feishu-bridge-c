@@ -219,9 +219,12 @@ export function ledgerReopening(ctx, token, lease) {
     }
     incomplete.push({ id: st.id, why: "现场 current=" + live.value + " 既不是桩也不是原目标，不动" });
   }
+  // 评审 P1-8：同链 current 说不清的链**不得恢复该链定时器**（否则 bootstrap 可能启动指向未知 current 的定时器）。
+  const unclearChains = new Set(incomplete.filter((i) => i.id.startsWith("current:")).map((i) => i.id.split(":")[1]));
   // ② 定时器：回原始三态（只有原来 loaded 才需 bootstrap；plist 字节先按备份还原并核 sha256 / 长度）
   for (const st of doc.steps.filter((s) => s.kind === "timer")) {
     const chain = st.id.split(":")[1];
+    if (unclearChains.has(chain)) continue; // P1-8：current 说不清，不动该链定时器
     const facts = factsOf(ctx, chain);
     const wantLoaded = st.before.phase === "loaded";
     if (!wantLoaded) continue;
@@ -243,7 +246,6 @@ export function ledgerReopening(ctx, token, lease) {
     if (f !== null) return { ok: false, reason: f.reason, why: f.why, path: f.path, phase: doc.phase };
   }
   // ③ 删桩：current 已不指它才删；同链 current 说不清的，桩先留着
-  const unclearChains = new Set(incomplete.filter((i) => i.id.startsWith("current:")).map((i) => i.id.split(":")[1]));
   for (const st of doc.steps.filter((s) => s.kind === "stub")) {
     const chain = st.id.split(":")[1];
     if (unclearChains.has(chain)) { incomplete.push({ id: st.id, why: "同链 current 说不清，桩先留着" }); continue; }
@@ -293,22 +295,33 @@ export function ledgerEnter(ctx, { kind, endpointId, chain, waitMs = 60000, appl
 
 /** `ledger_init` / `ledger_cutover` 出门（含崩溃恢复；按 phase 分派：回退 / 只向前 / 只清 active）。 */
 export function ledgerExit(ctx, { apply = false, env = process.env } = {}) {
-  const active = readActive({ dir: ctx.dir });
-  if (active.state === "absent") return { ok: false, reason: "no_operation" };
-  if (active.state === "unreadable") return { ok: false, reason: "active_unreadable", why: active.why };
-  const token = active.token;
-  const j = readJournal({ dir: ctx.dir, token });
-  if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token };
-  const phase = j.doc.phase;
-  const action = TERMINAL_PHASES.includes(phase) ? "clear_active" : LEDGER_FORWARD_PHASES.includes(phase) ? "ledger_forward" : "rollback";
-  if (!apply) return { ok: true, dryRun: true, token, phase, action };
+  const readOp = (dir) => {
+    const active = readActive({ dir });
+    if (active.state === "absent") return { ok: false, reason: "no_operation" };
+    if (active.state === "unreadable") return { ok: false, reason: "active_unreadable", why: active.why };
+    const token = active.token;
+    const j = readJournal({ dir, token });
+    if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token };
+    const phase = j.doc.phase;
+    const action = TERMINAL_PHASES.includes(phase) ? "clear_active" : LEDGER_FORWARD_PHASES.includes(phase) ? "ledger_forward" : "rollback";
+    return { ok: true, token, phase, action };
+  };
+  // 干跑：只读、不带锁（只看有没有 operation / 什么动作）。
+  const dry = readOp(ctx.dir);
+  if (!dry.ok) return dry;
+  if (!apply) return { ok: true, dryRun: true, token: dry.token, phase: dry.phase, action: dry.action };
+  // 评审 P1-8：apply 必须先拿安装面锁，再锁内重读并绑定 active/journal（不许锁前读、锁后沿用；锁间隙改面也不许）。
+  const surface = acquireInstallSurfaceLock({ home: ctx.home, env });
+  if (!surface.ok) return { ok: false, reason: surface.reason, why: surface.why, path: surface.path, token: dry.token, phase: dry.phase, action: dry.action };
+  const op = readOp(ctx.dir);
+  if (!op.ok) { releaseSurface(surface); return op; }
+  const { token, phase, action } = op;
   let out;
   if (action === "clear_active") {
     const c = clearActive({ dir: ctx.dir, token });
-    out = { ok: c.ok, token, phase, action, activeCleared: c.cleared === true, why: c.ok ? null : String(c.reason) };
+    const surfaceRel = releaseSurface(surface);
+    out = { ok: c.ok, token, phase, action, activeCleared: c.cleared === true, why: c.ok ? null : String(c.reason), surfaceRelease: surfaceRel.ok ? null : { path: surfaceRel.path ?? null, why: surfaceRel.why ?? surfaceRel.reason } };
   } else if (action === "ledger_forward") {
-    const surface = acquireInstallSurfaceLock({ home: ctx.home, env });
-    if (!surface.ok) return { ok: false, reason: surface.reason, why: surface.why, path: surface.path, token, phase, action };
     const lease = acquireOperationLease({ dir: ctx.dir, token });
     if (!lease.ok) { releaseSurface(surface); return { ok: false, reason: lease.reason, why: lease.why, token, phase, action, path: lease.path }; }
     const f = ledgerForward(ctx, { token, lease, env });
@@ -316,8 +329,6 @@ export function ledgerExit(ctx, { apply = false, env = process.env } = {}) {
     const surfaceRel = releaseSurface(surface);
     out = { token, action, ...f, leaseRelease: leaseRel.ok ? null : { path: leaseRel.path ?? null, why: leaseRel.why ?? leaseRel.reason }, surfaceRelease: surfaceRel.ok ? null : { path: surfaceRel.path ?? null, why: surfaceRel.why ?? surfaceRel.reason } };
   } else {
-    const surface = acquireInstallSurfaceLock({ home: ctx.home, env });
-    if (!surface.ok) return { ok: false, reason: surface.reason, why: surface.why, path: surface.path, token, phase, action };
     const lease = acquireOperationLease({ dir: ctx.dir, token });
     if (!lease.ok) { releaseSurface(surface); return { ok: false, reason: lease.reason, why: lease.why, token, phase, action, path: lease.path }; }
     const r = rollbackOperation(ctx, token, lease);

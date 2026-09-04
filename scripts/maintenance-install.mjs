@@ -79,7 +79,7 @@ export function runMaintenanceInstall(argv, { ctx = null, out = (s) => process.s
 
   function applyUnderSurfaceLock() {
   // ── enter：keepLease —— 从进门到 reopening / 回退结束连续持有同一租约（释放再重取会留出 operation 被换掉的窗口）
-  const entered = enterMaintenance(c, { reason, waitMs: parsed.waitMs, apply: true, keepLease: true });
+  const entered = enterMaintenance(c, { reason, waitMs: parsed.waitMs, apply: true, keepLease: true, operationKind: "maintenance_install" });
   if (!entered.ok) {
     if (entered.reason === "startup_source_unverified") { out("拒绝进门（startup_source_unverified）：启动源与当前投影对不上，什么都没动\n" + fmtItems(entered.items)); return 1; }
     if (entered.reason === "lease_reap_uncleared") { out("进门中途停下（租约的归属转换锁交不还：" + String(entered.path) + "）—— operation 保留，清掉残骸后跑 maintenance-gate --exit --apply 按账回退"); return 3; }

@@ -187,10 +187,11 @@ rollback 记 `rolled_back`）。
 
 | phase | 必需且 done 的 step | 说明 |
 | --- | --- | --- |
-| `ledger_initializing` / `ledger_cutting_over` | `ENTER_DONE`；`ledger:<ep>:*` 可尚不存在或 `prepared` | forward-only 段 |
-| `ledger_reopening` | `ENTER_DONE` ∪ {`ledger:<ep>:init`\|`cutover`}，且 ledger step 必须 `done` | 进入前 ledger step 必 done；B-4 逐步 |
+| `ledger_initializing` | `ENTER_DONE`；`ledger:<ep>:init` 可尚不存在或 `prepared`；**禁 sidecar** | forward-only 段 |
+| `ledger_cutting_over` | `ENTER_DONE`；**进段原子合同（十六轮 P1）：drained → 本阶段的同一次 journal 提交里原子加入 ① `ledger:<ep>:cutover` step（`prepared`，其 before/intended 已含 `plan_sha256`）② 三条 sidecar step（全部 `prepared`）③ phase 翻转——三者缺一即该提交非法**；本阶段**全程不得缺 ledger step**；sidecar 未全 done 时 ledger step 只能 `prepared`；sidecar 全 done ∧ 按已锚 plan 二次验证通过后才允许提交账本并把 ledger step 转 `done`（done 时三条 sidecar 必已全 done），随后只可推进 `ledger_reopening` | forward-only 段（v14） |
+| `ledger_reopening` | `ENTER_DONE` ∪ {`ledger:<ep>:init`\|`cutover`} 且 ledger step `done`；**（cutover）三条 sidecar 全 `done`** | 进入前必 done；B-4 逐步 |
 | `done`（成功重开后）| 同 `ledger_reopening` | — |
-| `reopening_incomplete`（ledger kind）| 同 `ledger_reopening`（**不**要求 install 的 artifact/receipt/current:install step）| 重开残步未清：步骤 1–3 失败时门**尚未撤**、撤门（4）失败时门**可能已部分撤**——两种都进这里 |
+| `reopening_incomplete`（ledger kind）| 同 `ledger_reopening`（**不**要求 install step）| 重开残步未清（含 3b 备份删除失败）：步骤 1–3/3b 失败时门**尚未撤**、撤门（4）失败时门**可能已部分撤**——都进这里 |
 
 `--exit` 按 `operation_kind` **分派**到 ledger 的 success reopening（`ledger_reopening`），
 **不复用 install 的 reopening**（三轮 P1-2 / 四轮 P1）。
@@ -198,20 +199,54 @@ rollback 记 `rolled_back`）。
 `ledger_*` kind **禁 install 的 `artifact`/`receipt`/`staged_plan` step**；
 `maintenance_gate`/`maintenance_install` kind **禁 `ledger` step**。
 
-**schema 判别联合（三轮 P1-2 / 二轮 P2-1，写死枚举、旧版单独分支不猜）**：
-- **旧 schema 1.1**：保持原封闭字段集、**不含** `operation_kind`；用**独立的旧版解析
-  分支**读（不猜它是 gate 还是 install），只作历史 journal，不参与 B-3 的 endpoint
-  收据索引；
-- **新 schema（1.2）**：**必须含** `operation_kind ∈ {maintenance_gate,
-  maintenance_install, ledger_init, ledger_cutover}`（具体字符串），各 kind 的
-  step/phase 按上表与既有 install/gate 定义封闭。
+**sidecar step（M1a v8 回带，`m1a-reconciliation.md` §4.1；八轮 P1-3 封闭联合）**：
+新 step kind `sidecar`，仅 `ledger_cutover` 允许（**`ledger_init` 禁 sidecar**）。
+**plan 锚（十三/十四轮 P1-1）**：`plan_sha256` 是 **cutover ledger step 三个状态对象
+（before/intended_after/after）的字段**（B-2 表已列四格；init 状态对象无此键）。plan.json
+精确 schema = `m1a-reconciliation.md` §4.1-4e 的 m1a-cutover-plan-1。四个文件（plan.json +
+三 blob）逐个 O_EXCL 写满 fsync 后**必须再 fsync `intended/` 目录**，目录 fsync 失败不得
+推进 forward-only；重启后凭 journal 锚验证同一份原始 plan，进程内引用不作数：
+- id = `sidecar:<name>:<ep>`（name ∈ {expiry, pending-claims, policy}）；**按 phase 计数
+  （九轮 P1-4）**：`drained → ledger_cutting_over` 的阶段推进与三条 prepared sidecar step
+  **同一次 journal 提交**写入；此前任何阶段 **禁 sidecar step**；进入 ledger_cutting_over 起
+  **恰三条**（各自 prepared 或 done）；`ledger_reopening` 起三条**全部 done**；
+- **prepared/done 两个精确键集（九轮 P1-3 / 十三轮 P1-1 扩）**：prepared =
+  {at, backup, backup_bytes, backup_sha256, before, id, **intended_blob**, intended_after,
+  kind, state, target} 且 **after 键缺席**；done = 前者 ∪ {after} 且 after === intended_after
+  （逐字段）且 **after 必来自写后受验读回**；`intended_blob` =
+  `{ path, bytes, sha256 }`——path **必等于重算的** `<token>.staged/intended/<name>` 规范路径、
+  校验时受验为**普通单硬链接 0600 文件**、`sha256 === intended_after.sha256` 且长度等于
+  bytes；恢复只从该 blob 读 intended 字节；
+- `target` 由 endpoint+name 内部派生（`ledger/<ep>/<name>.json` 规范路径，校验器重算比对，
+  不信任 journal 中任意路径）；before/intended_after/after = `{ exists, sha256 }` 联合
+  （absent 显式 `{exists:false, sha256:null}`）；**cutover 三个 intended_after.exists 必为
+  true**；
+- 备份：before.exists=true → backup 绝对路径（**必须落在本 operation 私有目录**
+  `<token>.staged/` 下）+ backup_sha256/bytes 齐；before.exists=false → **三个 backup 字段
+  全 null**；恢复前受验读取备份并核长度/SHA，核不过 → 该项 incomplete（不盲写回）；
+- `ledger_cutover` 的 `ledger_reopening`/`done`/`reopening_incomplete` 阶段要求 =
+  ENTER_DONE ∪ {ledger step} ∪ **全部三条 sidecar steps 均 done**；恢复时
+  pre_cutover_ledger_sha 与各 sidecar intended SHA **一律从首次 prepared journal 重放**，
+  不得按变化后现场重算。
+
+**schema 判别联合（九轮 P1-2 收为三支，写死枚举、各自独立分支不猜）**：
+- **1.1**：无 `operation_kind`；独立旧版分支读，只作历史 journal，不参与收据索引；
+- **1.2**：必含 `operation_kind ∈ {maintenance_gate, maintenance_install, ledger_init,
+  ledger_cutover}`；**禁 sidecar step**（读到 sidecar 即 unreadable）；
+- **1.3**：= 1.2 + `ledger_cutover` 的 sidecar step（仅此 kind 此用途）；
+- **未终结的 1.2 ledger_cutover 不得直接续跑成 1.3 cutover**（十轮 P2-2 展开）：
+  旧 journal 处于 forward-only **之前**（≤drained）→ 按 1.2 矩阵安全回退；
+  已进 forward-only / 现场已提交 → **fail-closed 人工处置**（绝不用 1.3 语义猜测续跑）；
+  之后才允许重开新 1.3 operation。
 
 **锁面（评审 P1-1：账本 operation 也是安装面写方——它停定时器、切桩、开门、reopening）**：
 `--init/--cutover --apply` 必须在**预检与 createOperation 之前**取机器级**安装面锁**
 （`install-surface.lock`，registry 锁协议、staleMs=∞ 按持有者 pid 活性接管），持有到
 reopening 与 operation lease 释放完成；释放失败压成退出码 3。**封闭锁顺序**：
-安装面锁 → operation 租约 / active / 门 → 账本锁（`acquireLockUngated` 只在这条
-受验维护路径内允许）。这样普通安装器无法在 ledger operation 进门窗口改 current 或
+安装面锁 → operation 租约 / active / 门 → **（ledger_cutover）三把 sidecar 文件锁逐个
+取得、提交并干净释放** → 账本锁（`acquireLockUngated` 只在这条受验维护路径内允许）。
+sidecar 段任一 not_owner / reap 残骸 / 释放异常 → **停在 authority cutover 之前**；每个
+sidecar 写后读回核 SHA === prepared intended SHA 才算 done（九轮 P1-5）。这样普通安装器无法在 ledger operation 进门窗口改 current 或
 安装面（与 v5 已解决的"过检后才建门"竞态同一把锁挡住）。
 
 ### B-1. 不可逆边界进阶段机（评审 P1-2）
@@ -238,6 +273,7 @@ reopening 与 operation lease 释放完成；释放失败压成退出码 3。**�
 | `revision` | `null` | `1` | 切换前 revision | `before.revision + 1` |
 | `ledger_sha256` | `null` | 提交那一刻整文件 SHA | 切换前 SHA | 提交那一刻 SHA |
 | `bijection_digest` | —（不适用）| — | `null` | 账本 §8 双射对账摘要 |
+| `plan_sha256`（十四轮 P1-1：**属三个状态对象**，非 step 顶层）| —（init 不适用，无此键）| — | `null` | `<token>.staged/intended/plan.json` 受验原始字节 SHA |
 
 **两个不同判据（二轮 P1-2：整文件 SHA 只在恢复窗口用，不能长期比）**：
 
@@ -294,6 +330,10 @@ endpoint 的维护审计收据**（二轮 P2-2：两者都保留、都不算 orp
 1. 两条 `current` **CAS 回原目标 runtime**；
 2. 定时器恢复**原 plist 字节 + 原 loaded 三态**（不是 install 的目标态）；
 3. 删除**已不再被 current 引用**的桩；
+3b. **删除本 operation 的受验 staged/backup 目录**（十轮 P1-3：内含 bearer claim / policy
+   内容，不得永久残留；仅限 `<token>.staged/` 规范路径、逐项受验后整目录删）——删除失败 →
+   `reopening_incomplete`（门与 active 保留）；status/doctor 区分 active operation 的备份
+   （合法在场）与 orphan 残骸（染红点名）；
 4. token-CAS 撤门；
 5. 持久化 `done`；
 6. 最后 token-CAS 清 `active`；
@@ -304,7 +344,9 @@ endpoint 的维护审计收据**（二轮 P2-2：两者都保留、都不算 orp
 `operation_kind` 分派到这里，不复用 install。**失败封闭（三轮 P1-3 / 四轮）**：
 - 步骤 1–3 **任一失败**（current 说不清 / 原 plist 备份核不过 / 定时器恢复失败 /
   桩删不掉）→ **保留门与 active、不执行 4–6**，进 ledger 的 `reopening_incomplete`
-  （门、active 保留；**ledger operation 没有 staged 制品**，不提 staged），该链留给人、
+  （门、active 保留；**ledger_init 无 staged 制品；ledger_cutover 有受验 staged 目录
+  （intended/plan.json + bearer/policy blob + backups）** `<token>.staged/`，其删除步见下），
+  该链留给人、
   `--exit` 只向前重试；
 - 撤门（4）异常或 `.txn` 交不还 → 同样 `reopening_incomplete`（门可能已部分撤，
   active 保留）；
@@ -359,15 +401,17 @@ node scripts/maintenance-ledger.mjs --cutover --endpoint <id> [--wait-ms N] --ap
 - L5 operation_kind 封闭：`ledger_*` operation 不要 install 的 artifact/receipt/
   staged_plan step；enter/install 不要 ledger step；旧 1.1 journal 无 operation_kind
   按既有种读、不 unreadable（二轮 P2-1）。
-- L5b **安装面锁（二轮 P1-1）**：`--init/--cutover --apply` 在预检/createOperation 前
-  取 install-surface.lock、持有到 reopening + 租约释放；锁序 = 安装面锁 → 租约/门 →
-  账本锁；普通安装器在 ledger operation 进门窗口改不了 current / 安装面。
-- L5c **reopening 顺序与失败封闭（二轮 P1-4 / 四轮）**：成功重开按 B-4 顺序（current
-  先回原目标 → 定时器回**原始三态**（不用 install 目标态）→ 删无引用桩 → 撤门 → done
-  → 清 active → 先租约后安装面锁）；**逐类失败各测一条**——current 说不清 / 定时器
-  恢复失败 / 桩删不掉（步骤 1–3，门不撤、进 ledger `reopening_incomplete`）、撤门失败
-  （门部分撤、同 incomplete）、`done` 写不下（不清 active）、终态已落仅释放失败
-  （operation 完成、退 3、无可续跑 active）。
+- L5b **安装面锁（二轮 P1-1 / 十一轮 P2 同步）**：`--init/--cutover --apply` 在预检/
+  createOperation 前取 install-surface.lock、持有到 reopening + 租约释放；锁序 = 安装面锁 →
+  租约/门 → **（cutover）三把 sidecar 文件锁逐取逐交清释放** → 账本锁；sidecar 段任一
+  not_owner/reap 残骸/释放异常停在 cutover 前；普通安装器在 ledger operation 进门窗口改不了
+  current / 安装面。
+- L5c **reopening 顺序与失败封闭（二轮 P1-4 / 四轮 / 十一轮 P2 同步）**：成功重开按 B-4
+  顺序（current 先回原目标 → 定时器回**原始三态** → 删无引用桩 → **3b 删除受验
+  staged/backup 目录** → 撤门 → done → 清 active → 先租约后安装面锁）；**逐类失败各测一条**
+  ——current 说不清 / 定时器恢复失败 / 桩删不掉 / **3b 备份删不掉**（步骤 1–3/3b，门不撤、
+  进 ledger `reopening_incomplete`）、撤门失败（门部分撤、同 incomplete）、`done` 写不下
+  （不清 active）、终态已落仅释放失败（operation 完成、退 3、无可续跑 active）。
 - L6 endpoint 收据聚合：`ledger_init(done)` 与 `ledger_cutover(done)` 的 journal 都是
   合法永久收据、不被盘点当 orphan、不染红；同 endpoint 重复/矛盾/某 journal 读不出
   → fail-closed。

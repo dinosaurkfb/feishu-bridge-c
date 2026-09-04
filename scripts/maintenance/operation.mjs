@@ -32,6 +32,7 @@ import { buildStubVersion, isStubTarget, readStubManifest, removeStubVersion, st
 import { defaultPs, waitForQuiet } from "./inventory.mjs";
 import { bootoutTimer, bootstrapTimer, guiDomain, timerPhase } from "./timers.mjs";
 import { chainFacts, precheckStartupSources } from "./precheck.mjs";
+import { ledgerExit } from "./ledger-operation.mjs";
 
 const CHAINS = ["claude", "codex"];
 const readlinkOrNull = (p) => { try { return fs.readlinkSync(p); } catch { return null; } };
@@ -103,7 +104,7 @@ const withLeaseResidue = (result, rel) => (rel.ok ? result : { ...result, ok: fa
  * keepLease=true（maintenance-install 用）：进门成功时**不释放执行租约**，随结果带回（{ lease }），
  * 由调用方连续持有到 reopening / 回退结束 —— 释放再重取会留出"旧 operation 被退出、新 operation 建立"的窗口（评审探针）。
  */
-export function enterMaintenance(ctx, { reason, waitMs = 60000, apply = false, keepLease = false } = {}) {
+export function enterMaintenance(ctx, { reason, waitMs = 60000, apply = false, keepLease = false, operationKind = "maintenance_gate" } = {}) {
   if (typeof reason !== "string" || reason.trim().length === 0) return { ok: false, reason: "reason_required" };
   const normalized = normalizeGateReason(reason);
   const pre = precheckStartupSources({ home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, repoRoot: ctx.repoRoot, node: ctx.node, launchctl: ctx.launchctl });
@@ -119,7 +120,7 @@ export function enterMaintenance(ctx, { reason, waitMs = 60000, apply = false, k
   }
   if (!apply) return { ok: true, dryRun: true, plan, precheck: pre };
 
-  const op = createOperation({ dir: ctx.dir, reason: normalized, now: ctx.now() });
+  const op = createOperation({ dir: ctx.dir, reason: normalized, operationKind, now: ctx.now() });
   if (!op.ok) return { ok: false, reason: op.reason, why: op.why ?? null, token: op.token ?? null, path: op.path ?? null };
   const token = op.token, lease = op.lease;
   const J = (r, what) => { if (!r.ok) throw Object.assign(new Error(what + "：" + String(r.reason) + (r.why ? "（" + r.why + "）" : "") + (r.path ? "，" + r.path : "")), { opReason: r.reason === "lease_lost" || r.reason === "active_mismatch" ? "operation_taken_over" : r.reason === "lease_reap_uncleared" ? "lease_reap_uncleared" : "journal_write_failed", residuePath: r.path ?? null }); return r; };
@@ -401,13 +402,15 @@ export function reopening(ctx, token, lease, { mode }) {
 /**
  * 出门：没有 operation → 拒；别的执行者在跑 → 拒；未到不可逆阶段 → 回退；已到 → 只向前；已终结但 active 没清 → 只清 active。
  */
-export function exitMaintenance(ctx, { apply = false } = {}) {
+export function exitMaintenance(ctx, { apply = false, env = process.env, surface = null } = {}) {
   const active = readActive({ dir: ctx.dir });
   if (active.state === "absent") return { ok: false, reason: "no_operation" };
   if (active.state === "unreadable") return { ok: false, reason: "active_unreadable", why: active.why };
   const token = active.token;
   const j = readJournal({ dir: ctx.dir, token });
   if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token };
+  // 账本 operation 走专用只向前分派（评审 F2）：ledger_initializing / ledger_cutting_over / ledger_reopening 不被这里误判成 rollback
+  if (j.doc.operation_kind === "ledger_init" || j.doc.operation_kind === "ledger_cutover") return ledgerExit(ctx, { apply, env, surface });
   const phase = j.doc.phase;
   const action = TERMINAL_PHASES.includes(phase) ? "clear_active" : phase === "rollback_incomplete" || phase === "rollback_reopening" ? "rollback_forward" : phase === "reopening" || phase === "reopening_incomplete" ? "reopen_forward" : "rollback";
   if (!apply) { const holder = leaseHolder({ dir: ctx.dir, token }); return { ok: true, dryRun: true, token, phase, action, executor: holder.present && holder.alive ? holder.pid : null }; }

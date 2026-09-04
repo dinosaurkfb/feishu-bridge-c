@@ -184,6 +184,10 @@ export function reconcileLegacyEndpoint({ endpointId, chain, collectLegacy, load
   // 键集：ledger_*={ok,reason,why}；not_shadow/chain_mismatch={ok,reason}；legacy_*={ok,reason,source,why}；
   // 投影失败={ok,reason,source,why?,cutover_blockers,global?}；bijection_mismatch={ok,reason,mismatches,cutover_blockers,snapshot_identity}；
   // snapshot_moved={ok:null,reason,why}。
+  // source 在 JSON 边界收口（#R19 四轮 P2）：只认适配器的封闭来源域，出界值折 invalid-source
+  // ——doctor 正文会拼 source（输出纪律 §7），带索引/野值不得静默穿过联合出口。
+  const SOURCE_DOMAINS = new Set(["args", "chain-template", "codex-registry", "codex-task-state", "project-mapping", "registry", "snapshot-identity", "topic-generation-state"]);
+  const boundSource = (src) => (SOURCE_DOMAINS.has(src) ? src : "invalid-source");
   const L1 = loadLedgerFn();
   if (!L1.ok) return { ok: false, reason: "ledger_" + L1.reason, why: L1.why ?? null };
   // shadow 前提（评审 P1-5）：对账只在影子期有意义；authoritative 账本合法演进、legacy 冻结，
@@ -191,12 +195,12 @@ export function reconcileLegacyEndpoint({ endpointId, chain, collectLegacy, load
   if (L1.doc.authority_mode !== "shadow") return { ok: false, reason: "not_shadow" };
   if (L1.doc.chain !== chain) return { ok: false, reason: "chain_mismatch" };
   const S1 = collectLegacy();
-  if (!S1.ok) return { ok: false, reason: S1.reason, source: S1.source, why: S1.why ?? null };
+  if (!S1.ok) return { ok: false, reason: S1.reason, source: boundSource(S1.source), why: S1.why ?? null };
 
   const proj = projectLegacySnapshot({ endpointId, chain, snapshot: S1 });
   if (!proj.ok) {
     return {
-      ok: false, reason: proj.reason, source: proj.source, why: proj.why ?? null,
+      ok: false, reason: proj.reason, source: boundSource(proj.source), why: proj.why ?? null,
       cutover_blockers: proj.blockers, ...(proj.global !== undefined ? { global: proj.global } : {}),
     };
   }

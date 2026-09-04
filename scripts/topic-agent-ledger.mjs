@@ -87,22 +87,34 @@ function ledgerRoot(env = process.env) {
 export const ledgerRootFor = (env = process.env) => ledgerRoot(env);
 
 /**
- * 由 endpointId 派生受验目录：root 必须存在且是真目录（realpath 自洽），dir=root/endpoint；
- * dir 若已存在必是真目录（非符号链接）且 realpath 落在 realpath(root) 下。首次 init 时 dir 尚不存在（允许）。
- * 返回 { ok, dir, root } 或 { ok:false, reason }。
+ * 账本根受验核验（唯一校验器，#R19 四轮 P1：doctor ⑭ 根协议复用它，不再手写第二份）：
+ * root 在场时必须——非 symlink、realpath 可解、逐层 realpath 边界（realpath === 词法 resolve，
+ * 即路径任一层都不是符号链接，父层别名会被拒）、真目录。
+ * 返回 { ok:true, root: realRoot } 或 { ok:false, reason, why? }。
  */
-export function resolveEndpointDir(endpointId, { env = process.env, mustExistRoot = true } = {}) {
-  if (typeof endpointId !== "string" || !ENDPOINT_SHAPE.test(endpointId)) return { ok: false, reason: "bad_endpoint" };
+export function validateLedgerRoot({ env = process.env, mustExistRoot = true } = {}) {
   const root = ledgerRoot(env);
   if (!root || !path.isAbsolute(root)) return { ok: false, reason: "no_root" };
   try { if (fs.lstatSync(root).isSymbolicLink()) return { ok: false, reason: "root_symlink" }; } catch (err) { if (err?.code !== "ENOENT") return { ok: false, reason: "root_unresolvable", why: String(err.code ?? err.message) }; }
   let realRoot, rootResolved = true;
   try { realRoot = fs.realpathSync(root); }
   catch (err) { if (err?.code === "ENOENT") { if (mustExistRoot) return { ok: false, reason: "root_absent" }; realRoot = root; rootResolved = false; } else return { ok: false, reason: "root_unresolvable", why: String(err.code ?? err.message) }; }
-  // 逐层 realpath 边界（评审六 P1-2）：配置根必须已规范化——realpath 等于词法 resolve，
-  // 即路径任一层都不是符号链接。否则父层别名（alias-parent→external-parent）能把根吸收到外部目录。
   if (rootResolved && realRoot !== path.resolve(root)) return { ok: false, reason: "root_not_canonical" };
   try { const st = fs.lstatSync(realRoot); if (!st.isDirectory()) return { ok: false, reason: "root_not_dir" }; } catch { /* 不存在已在上面处理 */ }
+  return { ok: true, root: realRoot };
+}
+
+/**
+ * 由 endpointId 派生受验目录：root 必须存在且是真目录（realpath 自洽），dir=root/endpoint；
+ * dir 若已存在必是真目录（非符号链接）且 realpath 落在 realpath(root) 下。首次 init 时 dir 尚不存在（允许）。
+ * 返回 { ok, dir, root } 或 { ok:false, reason }。
+ */
+export function resolveEndpointDir(endpointId, { env = process.env, mustExistRoot = true } = {}) {
+  if (typeof endpointId !== "string" || !ENDPOINT_SHAPE.test(endpointId)) return { ok: false, reason: "bad_endpoint" };
+  // 根段核验唯一化（#R19 四轮 P1）：同一份协议只住 validateLedgerRoot。
+  const r = validateLedgerRoot({ env, mustExistRoot });
+  if (!r.ok) return r;
+  const realRoot = r.root;
   const dir = path.join(realRoot, endpointId);
   try {
     const lst = fs.lstatSync(dir);

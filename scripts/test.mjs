@@ -26449,6 +26449,12 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
         collectLegacy: () => ({ ok: false, reason: "legacy_unreadable", source: "chain-template" }),
         loadLedgerFn: () => mkLedger({ chain: "claude", authority_mode: "shadow", revision: 7, records: {} }) });
       assert.equal(keyOf(rSnapBad), "ok,reason,source,why", "legacy_* 键集");
+      assert.equal(rSnapBad.source, "chain-template", "封闭域内 source 原样");
+      // JSON 边界收口（#R19 四轮 P2）：带索引/野值 source 出口折 invalid-source（doctor 正文不泄）。
+      const rWild = reconcileLegacyEndpoint({ endpointId: EP1, chain: "claude",
+        collectLegacy: () => ({ ok: false, reason: "legacy_unreadable", source: "registry:3+om_secret", why: "x" }),
+        loadLedgerFn: () => mkLedger({ chain: "claude", authority_mode: "shadow", revision: 7, records: {} }) });
+      assert.equal(rWild.source, "invalid-source", "野 source 折封闭值：" + JSON.stringify(rWild));
       r2 = run({});
       assert.equal(keyOf(r2), "cutover_blockers,mismatches,ok,reason,snapshot_identity", "bijection 键集（无 why）");
       // L1 必须在场（ok）而 L2 读不出 → snapshot_moved 支；用调用计数区分。
@@ -26601,7 +26607,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
         fs.symlinkSync(inner, ledgerRoot, "dir");
         const symD = d14();
         assert.equal(symD.ok, false, "根 symlink → 红：" + JSON.stringify(symD).slice(0, 240));
-        assert.match(symD.detail, /不是受验目录/u, "点名根 symlink：" + symD.detail);
+        assert.match(symD.detail, /root_symlink/u, "点名校验器理由码：" + symD.detail);
         fs.unlinkSync(ledgerRoot);
         fs.mkdirSync(ledgerRoot, { mode: 0o700 });
         fs.writeFileSync(path.join(ledgerRoot, "receipts"), "{}\n");
@@ -26610,6 +26616,27 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
         assert.match(recD.detail, /1 个未登记条目/u, "receipts 无例外：" + recD.detail);
         fs.rmSync(ledgerRoot, { recursive: true, force: true });
         fs.rmSync(inner, { recursive: true, force: true });
+        // 父层 symlink 反例（#R19 四轮 P1）：root 本体是真目录，但其上层一环 symlink——
+        // lstat(root) 通过，realpath ≠ 词法 resolve → 校验器 root_not_canonical（不进盘点、不装未接入）。
+        const outer = fs.mkdtempSync(path.join(os.tmpdir(), "m1a-parent-link-"));
+        try {
+          fs.mkdirSync(path.join(outer, "real"));
+          fs.symlinkSync(path.join(outer, "real"), path.join(outer, "link"), "dir");
+          const prevLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+          try {
+            process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(outer, "link", "real");
+            const rootOnly = TAL.validateLedgerRoot({});
+            // 行为钉死：父层一环 symlink 的根绝不通过核验（本机沙箱拦经由 symlink 的访问折
+            // root_absent；无沙箱环境是 realpath≠词法 → root_not_canonical）。两码都必须红。
+            assert.deepEqual([rootOnly.ok, ["root_absent", "root_not_canonical"].includes(rootOnly.reason)],
+              [false, true], "父层 symlink → 校验器拒：" + JSON.stringify(rootOnly));
+            const parentD = d14();
+            assert.equal(parentD.ok, false, "父层 symlink → ⑭ 红");
+            assert.match(parentD.detail, new RegExp(rootOnly.reason, "u"), "点名理由码：" + parentD.detail);
+          } finally {
+            if (prevLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = prevLedger;
+          }
+        } finally { fs.rmSync(outer, { recursive: true, force: true }); }
       } finally { fs.renameSync(ledgerRoot + ".treebak", ledgerRoot); }
       assert.ok(TAL.loadLedger(path.join(ledgerRoot, EPd), { endpointId: EPd }).ok, "整树还原后 EPd 账本完好");
       // 复评 P1-3：有效收据 + 坏账本（G3 locator 重复，why 带 locator 原文）→ 正文只出 reason，不泄露 om_/sess_ 原文。

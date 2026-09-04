@@ -360,7 +360,10 @@ sidecars:{expiry:{sha256},pending_claims:{sha256},policy:{sha256}} }` |
 - S1 取得前的失败（不携带 snapshot_identity / mismatches，不伪造身份）：
   - `ledger_<载入失败码>` → `{ ok:false, reason, why }`（why 仅供日志，不进 doctor 正文）；
   - `not_shadow` / `chain_mismatch` → `{ ok:false, reason }`；
-  - `legacy_unreadable` → `{ ok:false, reason, source, why }`（source：适配器来源域）；
+  - `legacy_unreadable` → `{ ok:false, reason, source, why }`（source 是**封闭来源域**：
+    args | chain-template | codex-registry | codex-task-state | project-mapping | registry |
+    snapshot-identity | topic-generation-state；出界值在出口折 `invalid-source`，
+    不许带索引/野值穿过结果联合的 JSON 边界进 doctor 正文）；
   - `legacy_unreconcilable` → `{ ok:false, reason, source, why, cutover_blockers, global:"rotation_preparing" }`。
 
 

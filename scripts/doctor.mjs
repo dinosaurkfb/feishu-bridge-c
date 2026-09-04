@@ -48,7 +48,7 @@ import { shellQuote } from "./shell-quote.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode } from "./drain-schedule.mjs";
 import { spawnSync } from "node:child_process";
 import {
-  loadByEndpoint, ledgerRootFor, ENDPOINT_SHAPE,
+  loadByEndpoint, ENDPOINT_SHAPE, validateLedgerRoot,
 } from "./topic-agent-ledger.mjs";
 import { aggregateEndpointReceipts, preparedLedgerInits } from "./maintenance/ledger-receipt.mjs";
 import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot } from "./m1a/legacy-snapshot.mjs";
@@ -516,42 +516,31 @@ export function runDoctor({
           const receiptBy = new Map(agg.endpoints.map((e) => [e.endpointId, e]));
           // endpoint 全集 = 有收据 ∪ 有 prepared WAL ∪ 账本目录（账本在场无收据也是矛盾态）。
           const ledgerDirs = [];
-          const root = ledgerRootFor();
           let rootUnreadable = null;
-          if (root !== null) {
-            // 账本根协议核验（复评 P1-3）：只有 ENOENT 算空（未接入）；
-            // symlink/普通文件/权限非 0700/realpath 说不清都是受验目录协议不达 → 红，不装未接入。
-            let st = undefined;
-            try { st = fs.lstatSync(root, { throwIfNoEntry: false }); } catch (err) { rootUnreadable = "lstat：" + (err?.code ?? String(err?.message ?? err).slice(0, 40)); }
-            if (st === undefined) {
-              // ENOENT = 无账本（允许空）；其它 lstat 错误已折 rootUnreadable。
-            } else if (!st.isDirectory() || st.isSymbolicLink()) {
-              rootUnreadable = "账本根不是受验目录（symlink/非目录）";
-            } else if ((st.mode & 0o777) !== 0o700) {
-              rootUnreadable = "账本根权限不是 0700（实际 " + ((st.mode & 0o777).toString(8)) + "）";
-            } else {
-              let real = null;
-              try { real = fs.realpathSync(root); } catch (err) { rootUnreadable = "realpath：" + String(err?.message ?? err).slice(0, 40); }
-              if (real !== null) {
-                let strangers = 0;
-                try {
-                  for (const de of fs.readdirSync(root, { withFileTypes: true })) {
-                    // 封闭枚举（复评 P1-3）：endpoint 名下非真目录（文件/symlink）与陌生名字都不静默；
-                    // 陌生名字只报计数，不输出原文（om_ 开头的文件名会泄 locator 前缀）；
-                    // 也不再给未定义协议的 receipts 例外面子。
-                    if (ENDPOINT_SHAPE.test(de.name)) {
-                      if (de.isDirectory()) ledgerDirs.push(de.name);
-                      else strangers += 1;
-                    } else {
-                      strangers += 1;
-                    }
-                  }
-                  if (strangers > 0) rootUnreadable = "账本根有 " + strangers + " 个未登记条目（计数制，不展示原文）";
-                } catch (err) {
-                  if (err?.code !== "ENOENT") rootUnreadable = "readdir：" + (err?.code ?? String(err?.message ?? err).slice(0, 40));
+          // 账本根协议核验唯一化（#R19 四轮 P1）：复用账本模块 validateLedgerRoot（同一份协议，
+          // 非目录/symlink/父层别名 root_not_canonical 都在其中），doctor 只加盘点层（readdir 封闭枚举）。
+          const rootV = validateLedgerRoot({});
+          if (rootV.ok) {
+            let strangers = 0;
+            try {
+              for (const de of fs.readdirSync(rootV.root, { withFileTypes: true })) {
+                // 封闭枚举：endpoint 名下非真目录（文件/symlink）与陌生名字都不静默；
+                // 陌生名字只报计数，不输出原文（om_ 开头的文件名会泄 locator 前缀）；
+                // 不给未定义协议的 receipts 例外面子。
+                if (ENDPOINT_SHAPE.test(de.name)) {
+                  if (de.isDirectory()) ledgerDirs.push(de.name);
+                  else strangers += 1;
+                } else {
+                  strangers += 1;
                 }
               }
+              if (strangers > 0) rootUnreadable = "账本根有 " + strangers + " 个未登记条目（计数制，不展示原文）";
+            } catch (err) {
+              if (err?.code !== "ENOENT") rootUnreadable = "readdir：" + (err?.code ?? String(err?.message ?? err).slice(0, 40));
             }
+          } else if (rootV.reason !== "root_absent") {
+            // root_absent = 未接入（允许空）；其余协议理由码原样进 detail（封闭枚举，评审四轮 P1）。
+            rootUnreadable = rootV.reason;
           }
           if (rootUnreadable !== null) {
             findings.push({ endpoint: null, ok: false, code: "ledger_inventory_unreadable",

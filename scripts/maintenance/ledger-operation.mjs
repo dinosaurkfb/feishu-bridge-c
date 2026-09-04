@@ -122,6 +122,8 @@ export function ledgerForward(ctx, { token, lease, intent = null, env = process.
     if (!receipt.ok) return { ok: false, reason: receipt.state, why: receipt.why ?? null, phase, rollbackSafe: true };
     if (sub === "init" && (receipt.initDone || receipt.cutoverDone)) return { ok: false, reason: "already_initialized", why: "该 endpoint 已被初始化或已切权威", phase, rollbackSafe: true };
     if (sub === "cutover" && receipt.cutoverDone) return { ok: false, reason: "already_cutover", why: "该 endpoint 已切权威", phase, rollbackSafe: true };
+    // 评审 P1-5：cutover 前置要求恰一份 done init 收据（没有 init 就切权威 → fail-closed，留在 drained）。
+    if (sub === "cutover" && !receipt.initDone) return { ok: false, reason: "init_receipt_missing", why: "切权威要求恰一份已 done 的 init 收据（收据 initDone=false）", phase, rollbackSafe: true };
     planPre = planOf({ kind: sub, endpointId: intent.endpointId, chain: intent.chain, token, ledgerDir: dPre.dir });
     if (!planPre.ok) return { ok: false, reason: planPre.reason, why: planPre.why ?? null, phase, rollbackSafe: true };
     const fwd = sub === "init" ? "ledger_initializing" : "ledger_cutting_over";
@@ -293,8 +295,10 @@ export function ledgerEnter(ctx, { kind, endpointId, chain, waitMs = 60000, appl
   return { token: ent.token, ...out, rollback: rollbackResult, leaseRelease: leaseRel.ok ? null : { path: leaseRel.path ?? null, why: leaseRel.why ?? leaseRel.reason }, surfaceRelease: surfaceRel.ok ? null : { path: surfaceRel.path ?? null, why: surfaceRel.why ?? surfaceRel.reason } };
 }
 
-/** `ledger_init` / `ledger_cutover` 出门（含崩溃恢复；按 phase 分派：回退 / 只向前 / 只清 active）。 */
-export function ledgerExit(ctx, { apply = false, env = process.env } = {}) {
+/** `ledger_init` / `ledger_cutover` 出门（含崩溃恢复；按 phase 分派：回退 / 只向前 / 只清 active）。
+ *  P1-1：调用方（runMaintenanceGate --apply）已持安装面锁时传入 `surface` 复用，不重取（非重入锁同 pid 也 busy）。
+ *  P1-2：所有释放统一投影 surfaceRelease——早退分支（!op.ok / !lease.ok）也吞不掉。 */
+export function ledgerExit(ctx, { apply = false, env = process.env, surface: held = null } = {}) {
   const readOp = (dir) => {
     const active = readActive({ dir });
     if (active.state === "absent") return { ok: false, reason: "no_operation" };
@@ -310,31 +314,32 @@ export function ledgerExit(ctx, { apply = false, env = process.env } = {}) {
   const dry = readOp(ctx.dir);
   if (!dry.ok) return dry;
   if (!apply) return { ok: true, dryRun: true, token: dry.token, phase: dry.phase, action: dry.action };
-  // 评审 P1-8：apply 必须先拿安装面锁，再锁内重读并绑定 active/journal（不许锁前读、锁后沿用；锁间隙改面也不许）。
-  const surface = acquireInstallSurfaceLock({ home: ctx.home, env });
+  // 评审 P1-1：复用调用方持有的安装面锁；没传才自取。
+  const owns = held === null;
+  const surface = held ?? acquireInstallSurfaceLock({ home: ctx.home, env });
   if (!surface.ok) return { ok: false, reason: surface.reason, why: surface.why, path: surface.path, token: dry.token, phase: dry.phase, action: dry.action };
+  // 评审 P1-2：统一经 finalize 投影 surfaceRelease（自己没有锁就不投影，交给调用方负责释放）。
+  const releaseHeld = (r) => {
+    if (!owns) return r;
+    const rel = releaseSurface(surface);
+    return { ...r, surfaceRelease: rel.ok ? null : { path: rel.path ?? null, why: rel.why ?? rel.reason } };
+  };
+  // 评审 P1-8：apply 必须先拿安装面锁，再锁内重读并绑定 active/journal（不许锁前读、锁后沿用；锁间隙改面也不许）。
   const op = readOp(ctx.dir);
-  if (!op.ok) { releaseSurface(surface); return op; }
+  if (!op.ok) return releaseHeld(op);
   const { token, phase, action } = op;
-  let out;
   if (action === "clear_active") {
     const c = clearActive({ dir: ctx.dir, token });
-    const surfaceRel = releaseSurface(surface);
-    out = { ok: c.ok, token, phase, action, activeCleared: c.cleared === true, why: c.ok ? null : String(c.reason), surfaceRelease: surfaceRel.ok ? null : { path: surfaceRel.path ?? null, why: surfaceRel.why ?? surfaceRel.reason } };
-  } else if (action === "ledger_forward") {
-    const lease = acquireOperationLease({ dir: ctx.dir, token });
-    if (!lease.ok) { releaseSurface(surface); return { ok: false, reason: lease.reason, why: lease.why, token, phase, action, path: lease.path }; }
+    return releaseHeld({ ok: c.ok, token, phase, action, activeCleared: c.cleared === true, why: c.ok ? null : String(c.reason) });
+  }
+  const lease = acquireOperationLease({ dir: ctx.dir, token });
+  if (!lease.ok) return releaseHeld({ ok: false, reason: lease.reason, why: lease.why, token, phase, action, path: lease.path });
+  if (action === "ledger_forward") {
     const f = ledgerForward(ctx, { token, lease, env });
     const leaseRel = releaseOperationLease(lease);
-    const surfaceRel = releaseSurface(surface);
-    out = { token, action, ...f, leaseRelease: leaseRel.ok ? null : { path: leaseRel.path ?? null, why: leaseRel.why ?? leaseRel.reason }, surfaceRelease: surfaceRel.ok ? null : { path: surfaceRel.path ?? null, why: surfaceRel.why ?? surfaceRel.reason } };
-  } else {
-    const lease = acquireOperationLease({ dir: ctx.dir, token });
-    if (!lease.ok) { releaseSurface(surface); return { ok: false, reason: lease.reason, why: lease.why, token, phase, action, path: lease.path }; }
-    const r = rollbackOperation(ctx, token, lease);
-    const leaseRel = releaseOperationLease(lease);
-    const surfaceRel = releaseSurface(surface);
-    out = { token, action, ...r, leaseRelease: leaseRel.ok ? null : { path: leaseRel.path ?? null, why: leaseRel.why ?? leaseRel.reason }, surfaceRelease: surfaceRel.ok ? null : { path: surfaceRel.path ?? null, why: surfaceRel.why ?? surfaceRel.reason } };
+    return releaseHeld({ token, action, ...f, leaseRelease: leaseRel.ok ? null : { path: leaseRel.path ?? null, why: leaseRel.why ?? leaseRel.reason } });
   }
-  return out;
+  const r = rollbackOperation(ctx, token, lease);
+  const leaseRel = releaseOperationLease(lease);
+  return releaseHeld({ token, action, ...r, leaseRelease: leaseRel.ok ? null : { path: leaseRel.path ?? null, why: leaseRel.why ?? leaseRel.reason } });
 }

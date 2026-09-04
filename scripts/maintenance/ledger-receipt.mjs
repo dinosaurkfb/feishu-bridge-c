@@ -38,7 +38,7 @@ export function endpointReceipt(dir, endpointId, { token = null } = {}) {
   const list = listJournals({ dir });
   if (!list.ok) return { ok: false, state: "unreadable", why: list.why ?? "维护目录读不出", initDone: false, cutoverDone: false };
   let init = [], cutover = [];
-  let inProgress = null;
+  const inProgress = [];
   for (const tok of list.tokens) {
     const j = readJournal({ dir, token: tok });
     if (j.state !== "valid") return { ok: false, state: "unreadable", why: "journal " + j.state + (j.why ? "：" + j.why : ""), initDone: false, cutoverDone: false };
@@ -47,13 +47,16 @@ export function endpointReceipt(dir, endpointId, { token = null } = {}) {
     if (endpointOf(j.doc) !== endpointId) continue;
     const isInit = KIND_IS_INIT[j.doc.operation_kind];
     if (j.doc.phase === "done") (isInit ? init : cutover).push({ token: tok, startedAt: j.doc.started_at });
-    else if (isInProgressWAL(j.doc)) inProgress ??= { token: tok, isInit };
-  }
-  if (inProgress !== null) {
-    if (typeof token === "string" && inProgress.token === token) return { ok: true, state: "ok_in_progress", why: "同一 operation 正在前（same-token 恢复放行）", initDone: false, cutoverDone: false, initCount: init.length, cutoverCount: cutover.length, inProgress: true, inProgressToken: token, inProgressKind: inProgress.isInit ? "init" : "cutover" };
-    return { ok: false, state: "in_progress_foreign", why: "存在未完成的账本 " + (inProgress.isInit ? "初始化" : "切权威") + " WAL（token " + inProgress.token + "，他 token 一律 fail-closed）", initDone: init.length === 1, cutoverDone: cutover.length === 1, initCount: init.length, cutoverCount: cutover.length, inProgress: true, inProgressToken: inProgress.token };
+    else if (isInProgressWAL(j.doc)) inProgress.push({ token: tok, isInit });
   }
   const initDone = init.length === 1, cutoverDone = cutover.length === 1;
+  // 评审 P1-5：全部进行中 WAL 都要看到——多余（>1）一律 fail-closed，不挑第一份放行；同 token 才 ok_in_progress。
+  if (inProgress.length > 1) return { ok: false, state: "in_progress_conflict", why: "同一 endpoint 有 " + inProgress.length + " 份进行中的账本 WAL（token " + inProgress.map((i) => i.token).join(", ") + "）—— fail-closed", initDone, cutoverDone, initCount: init.length, cutoverCount: cutover.length, inProgress: true, inProgressTokens: inProgress.map((i) => i.token), inProgressKinds: inProgress.map((i) => i.isInit ? "init" : "cutover") };
+  if (inProgress.length === 1) {
+    const ip = inProgress[0];
+    if (typeof token === "string" && ip.token === token) return { ok: true, state: "ok_in_progress", why: "同一 operation 正在前（same-token 恢复放行）", initDone, cutoverDone, initCount: init.length, cutoverCount: cutover.length, inProgress: true, inProgressToken: token, inProgressKind: ip.isInit ? "init" : "cutover" };
+    return { ok: false, state: "in_progress_foreign", why: "存在未完成的账本 " + (ip.isInit ? "初始化" : "切权威") + " WAL（token " + ip.token + "，他 token 一律 fail-closed）", initDone, cutoverDone, initCount: init.length, cutoverCount: cutover.length, inProgress: true, inProgressToken: ip.token };
+  }
   const conflict = init.length > 1 || cutover.length > 1;
   const ordering = !conflict && init.length === 1 && cutover.length >= 1
     ? init[0].startedAt > earliestIso(cutover)

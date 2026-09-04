@@ -49,7 +49,7 @@ export function runMaintenanceGate(argv, { ctx = null, out = (s) => process.stdo
     if (!surface.ok) { out("安装面锁拿不到（" + surface.reason + "：" + String(surface.why) + "，" + surface.path + "）—— 什么都没动。"); return surface.reason === "surface_install_busy" ? 1 : 3; }
   }
   let code;
-  try { code = runMaintenanceGateLocked(parsed, c, out); }
+  try { code = runMaintenanceGateLocked(parsed, c, out, surface); }
   finally {
     if (surface !== null) {
       const rel = surface.release();
@@ -60,7 +60,7 @@ export function runMaintenanceGate(argv, { ctx = null, out = (s) => process.stdo
   return code;
 }
 
-function runMaintenanceGateLocked(parsed, c, out) {
+function runMaintenanceGateLocked(parsed, c, out, surface) {
   if (parsed.mode === "enter") {
     const r = enterMaintenance(c, { reason: parsed.reason, waitMs: parsed.waitMs, apply: parsed.apply });
     const residue = r.leaseUncleared ? "\n租约交不还：" + r.leaseUncleared.path + "（" + r.leaseUncleared.why + "）—— 下一个执行者会按 pid 活性接管；请人工核对" : "";
@@ -74,7 +74,7 @@ function runMaintenanceGateLocked(parsed, c, out) {
     if (r.dryRun) { out("[预览] 预检通过，进门会：停两链定时器（" + r.plan.chains.claude.timer + " / " + r.plan.chains.codex.timer + "）→ 两链 current 切到维护桩（" + r.plan.chains.claude.entries.length + " + " + r.plan.chains.codex.entries.length + " 个入口）→ 建门（" + r.plan.reason + "）→ 等既有进程退出最多 " + r.plan.waitMs + " ms。加 --apply 执行。"); return 0; }
     out("已进门：token " + r.token.slice(0, 8) + "，阶段 " + r.phase + "。出门：--exit --apply"); return 0;
   }
-  const r = exitMaintenance(c, { apply: parsed.apply });
+  const r = exitMaintenance(c, { apply: parsed.apply, surface });
   if (r.dryRun) { out("[预览] operation " + r.token.slice(0, 8) + " 阶段 " + r.phase + " → 动作：" + r.action + (r.executor ? "（执行者 pid " + r.executor + " 正在跑，此刻 --apply 会被拒）" : "") + "。加 --apply 执行。"); return 0; }
   if (!r.ok && !r.phase && r.reason === "journal_write_failed" && /lease_reap_uncleared/u.test(String(r.why))) { out("出门中途停下（租约的归属转换锁交不还）—— operation 保留，清掉残骸后再跑 --exit --apply" + (r.why ? "：" + r.why : "")); return 3; }
   if (!r.ok && !r.phase) { out("出门做不了（" + r.reason + (r.why ? "：" + r.why : "") + (r.path ? "，" + r.path : "") + "）"); return 1; }

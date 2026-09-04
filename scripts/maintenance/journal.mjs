@@ -263,6 +263,17 @@ export function journalProblem(doc) {
   // 评审 P1-1：前向 ledger 阶段必须已有 ledger step（进前向态与 ledger step 落盘是 enterLedgerForward 的**一次**原子更新，
   // 拿不到 step 的 ledger_initializing/cutting_over 只可能是旧种崩溃残留，fail-closed——EXIT 不再放行恢复死窗）。
   if (isLedgerKind && (doc.phase === "ledger_initializing" || doc.phase === "ledger_cutting_over") && !doc.steps.some((s) => s.kind === "ledger")) return "前向阶段 " + doc.phase + " 必须已有 ledger step";
+  // 评审 P1-4：phase × ledger step 状态封闭——进前向前的阶段（planned..drained）ledger step 必须为零；
+  // 前向阶段（ledger_initializing / ledger_cutting_over）恰一条且状态仅 prepared 或 done（已 done 未推 phase 的崩溃态放行）。
+  if (isLedgerKind) {
+    const lsCount = doc.steps.filter((s) => s.kind === "ledger").length;
+    if (doc.phase === "planned" || doc.phase === "timer_stopped" || doc.phase === "stubbed" || doc.phase === "gated" || doc.phase === "drained") {
+      if (lsCount !== 0) return "进前向前的阶段 " + doc.phase + " 不得含 ledger step";
+    } else if (doc.phase === "ledger_initializing" || doc.phase === "ledger_cutting_over") {
+      const ls = doc.steps.find((s) => s.kind === "ledger");
+      if (lsCount !== 1 || !ls || (ls.state !== "prepared" && ls.state !== "done")) return "前向阶段 " + doc.phase + " 要求恰一条 prepared/done 的 ledger step";
+    }
+  }
   if (!Array.isArray(doc.notes) || doc.notes.some((n) => typeof n !== "string")) return "notes 不是字符串数组";
   return null;
 }
@@ -424,7 +435,17 @@ export const markStepDone = ({ dir, token, lease, id, after, now = Date.now() })
  */
 export const enterLedgerForward = ({ dir, token, lease, phase, step, chain, expectPhase = "drained", now = Date.now() }) => updateJournal({ dir, token, lease, expectPhase, now, mutate: (d) => {
   const existing = d.steps.find((s) => s.id === step.id);
-  if (existing) return d; // 幂等：恢复再进同一 forward 不重推（否则 journalProblem 会撞「step id 重复」）
+  if (existing) {
+    // 幂等：恢复再进同一 forward 不重推（否则 journalProblem 会撞「step id 重复」）；评审 P1-4：返回前必须核**阶段 + 内容**完全一致，
+    // 同 id 但 phase 未同步 / content 不同都拒（return null → mutate_returned_nothing），不许把「同 id 不同物」当成功静默返回。
+    if (d.phase !== phase) return null;
+    const same = existing.kind === step.kind && existing.target === step.target
+      && existing.chain === (chain ?? null)
+      && JSON.stringify(existing.before ?? null) === JSON.stringify(step.before ?? null)
+      && JSON.stringify(existing.intended_after ?? null) === JSON.stringify(step.intended_after ?? null);
+    if (!same) return null;
+    return d;
+  }
   d.phase = phase;
   d.steps.push({ id: step.id, kind: step.kind, target: step.target, before: step.before ?? null, backup: step.backup ?? null, backup_sha256: step.backup_sha256 ?? null, backup_bytes: step.backup_bytes ?? null, intended_after: step.intended_after ?? null, chain: chain ?? null, state: "prepared", after: null, at: new Date(now).toISOString() });
   return d;

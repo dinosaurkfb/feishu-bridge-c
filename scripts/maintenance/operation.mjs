@@ -402,7 +402,7 @@ export function reopening(ctx, token, lease, { mode }) {
 /**
  * 出门：没有 operation → 拒；别的执行者在跑 → 拒；未到不可逆阶段 → 回退；已到 → 只向前；已终结但 active 没清 → 只清 active。
  */
-export function exitMaintenance(ctx, { apply = false, env = process.env } = {}) {
+export function exitMaintenance(ctx, { apply = false, env = process.env, surface = null } = {}) {
   const active = readActive({ dir: ctx.dir });
   if (active.state === "absent") return { ok: false, reason: "no_operation" };
   if (active.state === "unreadable") return { ok: false, reason: "active_unreadable", why: active.why };
@@ -410,7 +410,7 @@ export function exitMaintenance(ctx, { apply = false, env = process.env } = {}) 
   const j = readJournal({ dir: ctx.dir, token });
   if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token };
   // 账本 operation 走专用只向前分派（评审 F2）：ledger_initializing / ledger_cutting_over / ledger_reopening 不被这里误判成 rollback
-  if (j.doc.operation_kind === "ledger_init" || j.doc.operation_kind === "ledger_cutover") return ledgerExit(ctx, { apply, env });
+  if (j.doc.operation_kind === "ledger_init" || j.doc.operation_kind === "ledger_cutover") return ledgerExit(ctx, { apply, env, surface });
   const phase = j.doc.phase;
   const action = TERMINAL_PHASES.includes(phase) ? "clear_active" : phase === "rollback_incomplete" || phase === "rollback_reopening" ? "rollback_forward" : phase === "reopening" || phase === "reopening_incomplete" ? "reopen_forward" : "rollback";
   if (!apply) { const holder = leaseHolder({ dir: ctx.dir, token }); return { ok: true, dryRun: true, token, phase, action, executor: holder.present && holder.alive ? holder.pid : null }; }

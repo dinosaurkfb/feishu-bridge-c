@@ -704,6 +704,8 @@ function _maintenanceVerifier(capability, endpointId, opType, env = process.env)
     return { ok: true, plan };
   });
   if (!binding.ok || !binding.run) return fail("lease_lost", "本过程不再持有 operation 租约实例（commitWhileHeld：" + (binding?.reason ?? "lock_lost") + "）");
+  // 评审 P1-3：WAL 所有权转换后 reap 锁残骸没收干净（收成 reapUncleared 挂在 binding 上）→ fail-closed 拒写，不许带着残骸继续落盘。
+  if (binding.reapUncleared) return fail("lease_reap_uncleared", "WAL 所有权转换后 reap 残骸未清（" + (binding.reapUncleared.path ?? "?") + "）");
   if (!binding.run.ok) return fail("plan_rebuild", binding.run.reason + (binding.run.why !== undefined ? "：" + binding.run.why : ""));
   return { ok: true, maintenanceDir: maintDir, doc: j.doc, ledgerStep: ls, plan: binding.run.plan };
 }
@@ -743,6 +745,15 @@ function virginInventory(dir) {
  */
 export function reconcileShadow({ endpointId, shadowDoc } = {}) {
   return { ok: false, reason: "reconciler_absent", why: "双射对账器未接入，cutover fail-closed" };
+}
+
+/** 评审 P2：T4 切权威计划对账验证——校验 cutover 蓝图是否把对账 digest 封闭绑定到 intended_after
+ *  （bijection_digest + endpoint_id 两字段全等才放行）。与 T3a(reconcileShadow：对账门) 明确分开，
+ *  不许同一个函数既对账又验证蓝图；T4 只消费对账结果，不自行对账。 */
+export function cutoverPlanVerifier(plan, digest, endpointId) {
+  if (typeof digest !== "string" || !SHA_SHAPE.test(digest)) return { ok: false, reason: "reconciler_absent", why: "对账器未给合法 digest" };
+  if (plan.intendedAfter.bijection_digest !== digest || plan.intendedAfter.endpoint_id !== endpointId) return { ok: false, reason: "plan_mismatch", why: "plan 与对账结果不一致" };
+  return { ok: true, digest };
 }
 
 /* ─────────────────────────── 维护 WAL 蓝图（幂等构造，给 B-2 步的 intended_after 用） ─────────────────────────── */
@@ -868,6 +879,8 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
   const receipt = endpointReceipt(cap.maintenanceDir, endpointId, { token: capability.token });
   if (!receipt.ok) return { ok: false, commit: "not_committed", reason: "receipt_problem", why: receipt.why };
   if (receipt.cutoverDone) return { ok: false, commit: "not_committed", reason: "already_cutover", why: "该 endpoint 已切权威" };
+  // 评审 P1-5：cutover 窄入口也要求恰一份 done init 收据（没有 init 就切权威 → fail-closed）。
+  if (!receipt.initDone) return { ok: false, commit: "not_committed", reason: "init_receipt_missing", why: "切权威要求恰一份已 done 的 init 收据（收据 initDone=false）" };
   const d = resolveEndpointDir(endpointId, { env });
   if (!d.ok) return badTx(d);
   const loaded = loadLedger(d.dir, { endpointId });
@@ -877,9 +890,10 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
   // 评审 P1-4：cutover 不接调用方注入的 reconciler——真对账未接，恒 fail-closed（reconciler_absent），不许测试/旁路自行对账。
   const rec = reconcileShadow({ endpointId, shadowDoc: loaded.doc });
   if (!rec.ok) return { ok: false, commit: "not_committed", reason: "reconciler_absent", why: rec.why };
+  // 评审 P2：T4 蓝图验证独立于 T3a 对账门——一个函数只做一件事，不再把 digest 形状检查与 plan 绑定混在手写块里。
+  const t4 = cutoverPlanVerifier(plan, rec.digest, endpointId);
+  if (!t4.ok) return { ok: false, commit: "not_committed", reason: t4.reason, why: t4.why };
   const digest = rec.digest;
-  if (typeof digest !== "string" || !SHA_SHAPE.test(digest)) return { ok: false, commit: "not_committed", reason: "reconciler_absent", why: "对账器未给合法 digest" };
-  if (plan.intendedAfter.bijection_digest !== digest || plan.intendedAfter.endpoint_id !== endpointId) return { ok: false, commit: "not_committed", reason: "plan_mismatch", why: "plan 与对账结果不一致" };
   const res = writeLedger({
     dir: d.dir, endpointId, gated: false, requestKey, _inject,
     replay: () => [{ opType: "authority_cutover", inputs: { request_key: requestKey, endpoint_id: endpointId, bijection_digest: digest } }],

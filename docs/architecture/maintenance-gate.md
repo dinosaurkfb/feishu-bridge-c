@@ -201,11 +201,11 @@ rollback 记 `rolled_back`）。
 
 **sidecar step（M1a v8 回带，`m1a-reconciliation.md` §4.1；八轮 P1-3 封闭联合）**：
 新 step kind `sidecar`，仅 `ledger_cutover` 允许（**`ledger_init` 禁 sidecar**）。
-**plan 锚（十三轮 P1-1）**：cutover 的 **ledger step** 键集扩一字段 `plan_sha256`
-（before 为 null、intended_after/after 为 `<token>.staged/intended/plan.json` 的 SHA）——
-plan.json = 对账安全元数据（digest、snapshot_identity、ledger{revision,sha256}、三 sidecar
-sha256；**无字节明文**），与三个 intended blob 同批 O_EXCL 写入并 fsync；重启后凭 journal
-锚验证同一份原始 plan，进程内引用不作数：
+**plan 锚（十三/十四轮 P1-1）**：`plan_sha256` 是 **cutover ledger step 三个状态对象
+（before/intended_after/after）的字段**（B-2 表已列四格；init 状态对象无此键）。plan.json
+精确 schema = `m1a-reconciliation.md` §4.1-4e 的 m1a-cutover-plan-1。四个文件（plan.json +
+三 blob）逐个 O_EXCL 写满 fsync 后**必须再 fsync `intended/` 目录**，目录 fsync 失败不得
+推进 forward-only；重启后凭 journal 锚验证同一份原始 plan，进程内引用不作数：
 - id = `sidecar:<name>:<ep>`（name ∈ {expiry, pending-claims, policy}）；**按 phase 计数
   （九轮 P1-4）**：`drained → ledger_cutting_over` 的阶段推进与三条 prepared sidecar step
   **同一次 journal 提交**写入；此前任何阶段 **禁 sidecar step**；进入 ledger_cutting_over 起
@@ -344,8 +344,9 @@ endpoint 的维护审计收据**（二轮 P2-2：两者都保留、都不算 orp
 `operation_kind` 分派到这里，不复用 install。**失败封闭（三轮 P1-3 / 四轮）**：
 - 步骤 1–3 **任一失败**（current 说不清 / 原 plist 备份核不过 / 定时器恢复失败 /
   桩删不掉）→ **保留门与 active、不执行 4–6**，进 ledger 的 `reopening_incomplete`
-  （门、active 保留；**ledger_init 无 staged 制品；ledger_cutover 仅有 sidecar 备份目录**
-  `<token>.staged/`，其删除步见下），该链留给人、
+  （门、active 保留；**ledger_init 无 staged 制品；ledger_cutover 有受验 staged 目录
+  （intended/plan.json + bearer/policy blob + backups）** `<token>.staged/`，其删除步见下），
+  该链留给人、
   `--exit` 只向前重试；
 - 撤门（4）异常或 `.txn` 交不还 → 同样 `reopening_incomplete`（门可能已部分撤，
   active 保留）；

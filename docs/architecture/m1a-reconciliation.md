@@ -183,10 +183,14 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
      **updated_at = 固定哨兵 "1970-01-01T00:00:00.000Z"**（不得取执行时钟）；
      **同 lineage 多条 B 记录投同一 subject：条目逐字相等则去重，否则
      policy_subject_conflict 拒**（不依赖覆盖顺序）。
-     **条目校验唯一权威 = 新落的封闭校验器 `interactionPolicyStateProblem`（版本 ipsp-1，
-     十三轮 P1-2 取 b）**：六根键精确、`updated_at` 必规范 ISO、`dialogue` 为 null 或**递归
-     封闭键集**（实现时从现行 validDialogueContract/store 写路径冻结全键集枚举，超/缺键拒）；
-     本规格引用该函数名+版本，T3b/T4 实现与三个新权威文件的读取端共用这一个校验器，不养第二份。
+     **条目校验唯一权威 = 封闭校验器 `interactionPolicyStateProblem`（ipsp-1）——
+     现状：待落地硬前置（仓库尚无该实现，十四轮 P1-2/十五轮 P2 如实标注）**：定为
+     **policy store 前置块（§9，排期 T3 后、M1b 前）的第一交付物**——六根键精确、updated_at
+     规范 ISO、dialogue 为 null 或按状态机逐支封闭（active/completed/failed/cancelled ×
+     active_turn/last_turn/事件字段逐键必有/可空/禁止写死）；其行为测试至少覆盖：根/嵌套
+     多余键、各状态缺键、非法可空组合、非规范时间、错误 binding_id、同 subject 冲突、
+     T3b 写端/T4 renderer/权威读取端**共用同一导出**的接线断言。**T4 的 policy-1 收口以该块
+     落地为前置**；落地后本规格引用其确定导出与版本。
      **交叉不变量**：迁移产出的条目 kind 必为 lineage 且 `条目.binding_id === subject 派生
      输入的 lineage id`（= legacy binding_id 受验原值）；默认 Mapping 条目的 binding_id 同上。
    **两个接口分离（十二轮 P1-2）**：
@@ -201,13 +205,23 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
      journal/日志）；恢复只读 staged blob（十二轮 P1-1：不得重渲染、不得凭 SHA 还原）；
      blob 写不下或读回核不过 → **不得进入 forward-only**；B-4 3b 负责删除。
      plan 任一字段缺失 → 不得 cutover。
-   **plan 锚与崩溃恢复（十三轮 P1-1）**：plan.json（安全元数据，无明文）与三 blob 同批
-   O_EXCL+fsync 写入 `<token>.staged/intended/`；其 SHA 锚进 cutover ledger step 的
-   `plan_sha256` 字段——重启后一切引用凭 journal 锚复核，进程内状态不作数。
+   **plan.json 精确联合（十四轮 P1-1）= `m1a-cutover-plan-1`**：
+   `{ schema_version:"m1a-cutover-plan-1", operation_token, endpoint_id, digest,
+   snapshot_identity, ledger:{ revision, sha256 }, sidecars:{ expiry:{sha256},
+   pending_claims:{sha256}, policy:{sha256} } }`（恰此键集；无字节明文）。
+   **交叉等式（校验器逐条核，任一不等拒）**：① operation_token/endpoint_id === 当前
+   operation 的 token/endpoint；② 三个 sidecars.sha256 分别 === 对应 step 的
+   intended_blob.sha256 === intended_after.sha256；③ ledger{revision,sha256} === 首次
+   reconciler 结果；④ digest 与 snapshot_identity === 首次 reconciler 结果；⑤ journal 的
+   plan_sha256 === 受验读取的 manifest 原始字节 SHA。
+   **plan 锚与崩溃恢复（十三轮 P1-1）**：plan.json 与三 blob 同批逐个 O_EXCL 写满 fsync、
+   **再 fsync intended/ 目录**（目录 fsync 失败不得进 forward-only）；其 SHA 锚进 cutover
+   ledger step 状态对象的 `plan_sha256`——重启后一切引用凭 journal 锚复核，进程内状态不作数。
    **崩在 blob 写后、阶段提交前（journal 仍 drained）**：同 operation 重试先验 manifest+四文件
    （逐一受验 SHA），全符 → **复用**（不重 O_EXCL、不生成第二份 plan）；部分在场/不符 → 拒并
-   要求安全退出；**安全退出（回退路径）必须删除 staged/intended 目录**；非 active operation
-   的该目录 = 敏感残骸，doctor 点名（不自动清）。
+   要求安全退出；**安全退出（回退路径）必须删除 staged/intended 目录**——**删除失败 =
+   未完成终态：保留门与 active、退出码 3，不得继续普通 rollback reopening**（十四轮 P2）；
+   非 active operation 的该目录 = 敏感残骸，doctor 点名（不自动清）。
    **门内第二次 reconciler 调用 = 按已锚 plan 验证**（同快照同 revision 重验四件相等），
    **不得重新 staging、不得产出另一份 plan**。
 4e-2. **三份 sidecar 权威文件的读取端 validator 合同（十三轮 P2）**：根键集精确 =

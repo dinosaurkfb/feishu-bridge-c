@@ -23446,6 +23446,26 @@ test("维护门 · PR C 单元：journal 三态与两阶段、active 只许一�
   { const { operation_kind, ...legacy } = good; assert.equal(journalProblem({ ...legacy, schema_version: "1.1" }), null, "旧 1.1（无 operation_kind）仍受"); }
   { const op2 = createOperation({ dir: path.join(base, "m2"), reason: "r", operationKind: "ledger_init" }); assert.deepEqual([op2.ok, op2.doc.operation_kind], [true, "ledger_init"], "operationKind 盖对"); }
   assert.equal(createOperation({ dir: path.join(base, "m3"), reason: "r", operationKind: "bogus" }).reason, "bad_operation_kind", "坏 operationKind 拒");
+  // M1 账本接入 stage2：ledger journal 校验（阶段 / step 形状 / step×kind 交叉核 / PHASE_REQUIRES 分派）
+  {
+    const ep = "endpoint_" + "a".repeat(24), sha = "b".repeat(64);
+    const initState = (over = {}) => ({ endpoint_id: ep, operation_id: good.token, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+    const mkLedger = (sub, over = {}) => ({ id: "ledger:" + ep + ":" + sub, kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null,
+      before: sub === "init" ? initState() : { endpoint_id: ep, operation_id: good.token, fingerprint: sha, authority_mode: "shadow", revision: 3, ledger_sha256: sha, bijection_digest: null },
+      intended_after: sub === "init" ? { endpoint_id: ep, operation_id: good.token, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha }
+                                     : { endpoint_id: ep, operation_id: good.token, fingerprint: sha, authority_mode: "authoritative", revision: 4, ledger_sha256: sha, bijection_digest: sha },
+      after: null, state: "prepared", at: good.updated_at, ...over });
+    const jInit = { ...good, operation_kind: "ledger_init", steps: [mkLedger("init")] };
+    assert.equal(journalProblem(jInit), null, "合法 ledger_init（planned + prepared init step）");
+    assert.equal(journalProblem({ ...good, operation_kind: "ledger_cutover", steps: [mkLedger("cutover")] }), null, "合法 ledger_cutover step");
+    assert.equal(journalProblem({ ...good, operation_kind: "maintenance_gate", steps: [mkLedger("init")] }), "maintenance_gate 不得含 ledger step", "gate 禁 ledger step");
+    assert.equal(journalProblem({ ...good, operation_kind: "ledger_cutover", steps: [mkLedger("init")] }), "ledger step 的 init/cutover 与 operation_kind 不一致", "suffix 与 kind 不符");
+    assert.equal(journalProblem({ ...jInit, steps: [mkLedger("init", { before: initState({ operation_id: "00000000-0000-4000-8000-000000000000" }) })] }), "ledger step 的 operation_id 与 operation token 不一致", "operation_id 必须 = token");
+    assert.notEqual(journalProblem({ ...jInit, steps: [mkLedger("init", { before: initState({ authority_mode: "shadow" }) })] }), null, "init.before authority_mode 非 null 拒");
+    assert.notEqual(journalProblem({ ...jInit, phase: "ledger_reopening" }), null, "ledger_reopening 要求 ledger step done + ENTER_DONE（prepared/无 enter 步不够）");
+    const someInstallStep = { id: "staged_plan", kind: "staged_plan", target: "x", backup: null, backup_sha256: null, backup_bytes: null, before: null, intended_after: { sha256: sha, version: "0".repeat(16) }, after: null, state: "prepared", at: good.updated_at };
+    assert.equal(journalProblem({ ...jInit, steps: [mkLedger("init"), someInstallStep] }), "账本 operation 不得含 install step", "账本 op 禁 install step");
+  }
   const mkStep = (over) => ({ id: "timer:claude", kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "a".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: good.updated_at, ...over });
   const withStep = (st) => ({ ...good, steps: [st] });
   assert.deepEqual([

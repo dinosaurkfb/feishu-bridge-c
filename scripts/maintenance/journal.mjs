@@ -33,13 +33,16 @@ export const OPERATION_KINDS = Object.freeze(["maintenance_gate", "maintenance_i
 export const PHASES = Object.freeze([
   "planned", "timer_stopped", "stubbed", "gated", "drained", "staged", "committed", "verified", "reopening", "done", "reopening_incomplete",
   "rolling_back", "rollback_reopening", "rolled_back", "rollback_incomplete",
+  // 账本接入（M1 B-1）：init/cutover 的不可逆前向段 + 账本 operation 的成功重开段。
+  "ledger_initializing", "ledger_cutting_over", "ledger_reopening",
 ]);
 export const TERMINAL_PHASES = Object.freeze(["done", "rolled_back"]);
 /** 没做完的终态：门与账保留，--exit --apply 只向前重试。 */
 export const INCOMPLETE_PHASES = Object.freeze(["reopening_incomplete", "rollback_incomplete"]);
-/** 进了这些阶段只许向前（某条 current 已从桩指回真实 runtime，那条链已重新放行，不许再改线上制品）。 */
-export const FORWARD_ONLY_PHASES = Object.freeze(["reopening", "rollback_reopening", ...TERMINAL_PHASES, ...INCOMPLETE_PHASES]);
-export const STEP_KINDS = Object.freeze(["timer", "stub", "current", "gate", "artifact", "receipt", "staged_plan"]);
+/** 进了这些阶段只许向前（某条 current 已从桩指回真实 runtime，那条链已重新放行，不许再改线上制品；账本已提交亦然，B-1）。 */
+export const FORWARD_ONLY_PHASES = Object.freeze(["reopening", "rollback_reopening", "ledger_initializing", "ledger_cutting_over", "ledger_reopening", ...TERMINAL_PHASES, ...INCOMPLETE_PHASES]);
+export const STEP_KINDS = Object.freeze(["timer", "stub", "current", "gate", "artifact", "receipt", "staged_plan", "ledger"]);
+const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u; // 账本 endpoint_id（layers-v2-ledger.md §2）
 export const TIMER_PHASES = Object.freeze(["loaded", "installed_not_loaded", "absent"]);
 /** 走到某阶段时必须已 done 的 step。install 步（PR C 第 2 步）：staged 之后要求 plan 锚（staged_plan），commit 之后再要求两条 current:<chain>:install 与两条收据。 */
 const ENTER_DONE = Object.freeze(["timer:claude", "timer:codex", "stub:claude", "stub:codex", "current:claude", "current:codex", "gate"]);
@@ -127,6 +130,36 @@ function shapeProblemFor(s) {
     if (s.backup !== null) return "staged_plan 不该有备份";
     return null;
   }
+  if (kind === "ledger") {
+    // 账本 step（M1 B-2）：id = ledger:<endpoint>:init|cutover；before/intended_after/after 各按 init|cutover 封闭键集。
+    const m = /^(endpoint_[0-9a-f]{24}):(init|cutover)$/u.exec(rest);
+    if (!idOk || !m) return "ledger 的 id 必须是 ledger:<endpoint>:init|cutover";
+    const [, ep, sub] = m;
+    if (s.target !== ep) return "ledger step 的 target 必须是 endpoint_id";
+    if (s.backup !== null) return "ledger step 不该有备份（账本自带 .prev）";
+    const keyset = sub === "cutover"
+      ? "authority_mode,bijection_digest,endpoint_id,fingerprint,ledger_sha256,operation_id,revision"
+      : "authority_mode,endpoint_id,fingerprint,ledger_sha256,operation_id,revision";
+    const shaOrNull = (x) => x === null || (typeof x === "string" && SHA_SHAPE.test(x));
+    const stateShape = (x) => isObj(x) && keysOf(x) === keyset && x.endpoint_id === ep
+      && typeof x.operation_id === "string" && UUID_SHAPE.test(x.operation_id)
+      && typeof x.fingerprint === "string" && SHA_SHAPE.test(x.fingerprint)
+      && shaOrNull(x.ledger_sha256) && (sub !== "cutover" || shaOrNull(x.bijection_digest));
+    if (!stateShape(s.before)) return "ledger.before 形状不对";
+    if (!stateShape(s.intended_after)) return "ledger.intended_after 形状不对";
+    if (!(s.after === null || stateShape(s.after))) return "ledger.after 形状不对";
+    const isInt1 = (r) => Number.isSafeInteger(r) && r >= 1;
+    if (sub === "init") {
+      if (!(s.before.authority_mode === null && s.before.revision === null && s.before.ledger_sha256 === null)) return "init.before 必须是账本 absent（authority_mode/revision/sha 全 null）";
+      if (!(s.intended_after.authority_mode === "shadow" && s.intended_after.revision === 1 && typeof s.intended_after.ledger_sha256 === "string")) return "init.intended_after 必须 shadow / revision=1 / 有 sha";
+    } else {
+      if (!(s.before.authority_mode === "shadow" && isInt1(s.before.revision) && typeof s.before.ledger_sha256 === "string" && s.before.bijection_digest === null)) return "cutover.before 必须 shadow / revision≥1 / 有 sha / bijection null";
+      if (!(s.intended_after.authority_mode === "authoritative" && s.intended_after.revision === s.before.revision + 1 && typeof s.intended_after.ledger_sha256 === "string" && typeof s.intended_after.bijection_digest === "string")) return "cutover.intended_after 必须 authoritative / revision+1 / 有 sha / 有 bijection";
+    }
+    // 单次原子提交：after（done 时）必须逐字段等于 intended_after（B-2 恢复窗口判据同源）。
+    if (s.after !== null && (keysOf(s.after) !== keysOf(s.intended_after) || Object.keys(s.after).some((k) => s.after[k] !== s.intended_after[k]))) return "ledger.after 必须逐字段等于 intended_after";
+    return null;
+  }
   // {exists, sha256}：存在必须有 sha，不存在必须 sha 为 null
   const fileState = (x) => isObj(x) && keysOf(x) === "exists,sha256" && typeof x.exists === "boolean" && (x.exists ? (typeof x.sha256 === "string" && SHA_SHAPE.test(x.sha256)) : x.sha256 === null);
   if (kind === "artifact" || kind === "receipt") {
@@ -153,6 +186,18 @@ function stepProblem(s) {
   if (!isCanonicalIso(s.at)) return "step at 不是规范化 ISO 时间";
   return shapeProblemFor(s);
 }
+/** 阶段要求的 step id（按 operation_kind 分派，M1 账本接入 B）：ledger 阶段用 ENTER_DONE + 账本 step；其余用 PHASE_REQUIRES。 */
+function requiredStepIds(doc) {
+  const isLedger = doc.schema_version === JOURNAL_SCHEMA && (doc.operation_kind === "ledger_init" || doc.operation_kind === "ledger_cutover");
+  if (isLedger) {
+    if (doc.phase === "ledger_initializing" || doc.phase === "ledger_cutting_over") return ENTER_DONE;
+    if (doc.phase === "ledger_reopening" || doc.phase === "done" || doc.phase === "reopening_incomplete") {
+      const ls = doc.steps.find((s) => s.kind === "ledger");
+      return [...ENTER_DONE, ls ? ls.id : "ledger:missing"];
+    }
+  }
+  return PHASE_REQUIRES[doc.phase];
+}
 export function journalProblem(doc) {
   if (!isObj(doc)) return "不是对象";
   // schema 判别（M1 账本接入 B / 评审 P2-1）：1.2 必含 operation_kind；旧 1.1 无该字段、按既有种读（不当 unreadable）。
@@ -174,7 +219,22 @@ export function journalProblem(doc) {
     if (s.kind === "gate" && s.after.token !== doc.token) return "gate 的 token 与 operation 不一致";
     if (s.kind === "stub" && !s.intended_after.endsWith("maintenance-" + doc.token)) return "桩目标与 operation token 不一致";
   }
-  const required = PHASE_REQUIRES[doc.phase];
+  // step 类型 × operation_kind 封闭（M1 账本接入 B，设计"ledger_* 禁 install 步 / gate·install 禁 ledger 步"）：
+  if (is12) {
+    const isLedger = doc.operation_kind === "ledger_init" || doc.operation_kind === "ledger_cutover";
+    const ledgerSteps = doc.steps.filter((s) => s.kind === "ledger");
+    if (!isLedger && ledgerSteps.length > 0) return doc.operation_kind + " 不得含 ledger step";
+    if (isLedger) {
+      if (doc.steps.some((s) => s.kind === "artifact" || s.kind === "receipt" || s.kind === "staged_plan" || (s.kind === "current" && s.id.endsWith(":install")))) return "账本 operation 不得含 install step";
+      if (ledgerSteps.length > 1) return "账本 operation 至多一个 ledger step";
+      const wantSub = doc.operation_kind === "ledger_init" ? "init" : "cutover";
+      for (const s of ledgerSteps) {
+        if (!s.id.endsWith(":" + wantSub)) return "ledger step 的 init/cutover 与 operation_kind 不一致";
+        if (s.before.operation_id !== doc.token || s.intended_after.operation_id !== doc.token) return "ledger step 的 operation_id 与 operation token 不一致";
+      }
+    }
+  }
+  const required = requiredStepIds(doc);
   if (required) for (const id of required) { const s = doc.steps.find((x) => x.id === id); if (!s || s.state !== "done") return "阶段 " + doc.phase + " 要求 " + id + " 已 done"; }
   if (!Array.isArray(doc.notes) || doc.notes.some((n) => typeof n !== "string")) return "notes 不是字符串数组";
   return null;

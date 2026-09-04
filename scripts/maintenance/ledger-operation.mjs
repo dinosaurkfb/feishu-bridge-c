@@ -43,7 +43,8 @@ const LEDGER_FORWARD_PHASES = Object.freeze(["ledger_initializing", "ledger_cutt
 const readlinkOrNull = (p) => { try { return fs.readlinkSync(p); } catch { return null; } };
 const errText = (err) => String(err?.code ?? err?.message ?? err);
 const factsOf = (ctx, chain) => chainFacts({ chain, home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, node: ctx.node });
-const capabilityOf = (ctx, token, kind, endpointId) => ({ maintenanceDir: ctx.dir, gateFile: ctx.gateFile, token, kind, endpointId });
+// capability 只携带身份（token/kind/endpointId）；维护目录 / 门位置由 verifier 从 env 派生（评审 F1），不写自述路径
+const capabilityOf = (ctx, token, kind, endpointId) => ({ token, kind, endpointId });
 const releaseSurface = (surface) => { try { if (typeof surface?.release === "function") return surface.release(); } catch { /* 忽略 */ } return { ok: true }; };
 const afterStep = (ctx, id) => { if (typeof ctx.afterStep === "function") ctx.afterStep(id); };
 const resolveDir = (ctx, endpointId, env) => resolveEndpointDir(endpointId, { env });

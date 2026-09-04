@@ -21,8 +21,8 @@ import path from "node:path";
 import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhileHeld } from "./registry.mjs";
 import { isCanonicalIso, canonicalIso, isCanonicalMs } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "./claim.mjs";
-import { JOURNAL_SCHEMA, OPERATION_KINDS, journalProblem, leaseHolder, listJournals, readActive, readJournal } from "./maintenance/journal.mjs";
-import { readGate } from "./maintenance-gate-core.mjs";
+import { JOURNAL_SCHEMA, OPERATION_KINDS, journalProblem, leaseHolder, listJournals, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
+import { maintenanceGatePath, readGate } from "./maintenance-gate-core.mjs";
 
 export const SCHEMA_VERSION = "1.0";
 export const ARTIFACT_TYPE = "feishu_bridge_topic_agent_ledger";
@@ -651,21 +651,24 @@ function stampAndBuild(doc, { opType, inputs, result, mutateRecords }) {
 // **不导出可接受任意 mutate 的通用 ungated writer**。
 
 /** 维护 capability 核验：读实文件（active / journal / gate / lease + ledger step）逐项独立核对，任一不过 → 结构化拒。 */
-function _maintenanceVerifier(capability, endpointId, opType) {
+function _maintenanceVerifier(capability, endpointId, opType, env = process.env) {
   const fail = (reason, why) => ({ ok: false, reason, why });
   if (!capability || typeof capability !== "object") return fail("bad_capability", "capability 缺失");
   const wantKind = opType === "initialize_shadow" ? "ledger_init" : "ledger_cutover";
   const wantPhase = opType === "initialize_shadow" ? "ledger_initializing" : "ledger_cutting_over";
   const wantSub = opType === "initialize_shadow" ? "init" : "cutover";
-  const { maintenanceDir, gateFile, token } = capability;
-  if (typeof maintenanceDir !== "string" || maintenanceDir.length === 0) return fail("maintenance_dir_unknown", "capability 未给维护目录");
-  if (typeof gateFile !== "string" || gateFile.length === 0) return fail("gate_path_unknown", "capability 未给门位置");
+  const { token } = capability;
+  // 维护目录 / 门位置一律从环境派生（评审 F1）：capability 只带 token/kind/endpointId，不信任其自述路径
+  const maintDir = maintenanceDir(env);
+  const gateFile = maintenanceGatePath(env);
+  if (typeof maintDir !== "string" || maintDir.length === 0) return fail("maintenance_dir_unknown", "维护目录说不清（环境 " + (process.env.FEISHU_BRIDGE_MAINTENANCE_DIR ? "覆盖" : "真实 home 取不到") + "）");
+  if (typeof gateFile !== "string" || gateFile.length === 0) return fail("gate_path_unknown", "门位置说不清");
   if (typeof token !== "string" || !UUID_SHAPE.test(token)) return fail("bad_operation_token", "capability token 不是 UUID");
   // active 指向的 journal（readJournal 已内嵌 journalProblem 校验 1.2 + operation_kind×step 闭合）
-  const active = readActive({ dir: maintenanceDir });
+  const active = readActive({ dir: maintDir });
   if (active.state !== "active") return fail("no_active_operation", "没有 active operation（" + active.state + "）");
   if (active.token !== token) return fail("operation_token_mismatch", "active 指向的 token 与 capability 不一致");
-  const j = readJournal({ dir: maintenanceDir, token });
+  const j = readJournal({ dir: maintDir, token });
   if (j.state !== "valid") return fail("journal_unreadable", "journal " + j.state + (j.why ? "：" + j.why : ""));
   if (j.doc.schema_version !== JOURNAL_SCHEMA) return fail("journal_schema", "journal 不是 " + JOURNAL_SCHEMA);
   if (j.doc.operation_kind !== wantKind) return fail("operation_kind_mismatch", "operation_kind " + j.doc.operation_kind + " ≠ " + wantKind);
@@ -681,11 +684,11 @@ function _maintenanceVerifier(capability, endpointId, opType) {
   if (gate.state !== "active") return fail("gate_not_active", "门 " + gate.state + (gate.why ? "：" + gate.why : ""));
   if (gate.payload?.token !== token) return fail("gate_token_mismatch", "门 token 与 operation 不一致");
   // 租约存在且属于该 operation（leasePath(dir, token) 即 operation 专属）
-  const holder = leaseHolder({ dir: maintenanceDir, token });
+  const holder = leaseHolder({ dir: maintDir, token });
   if (!holder.present) return fail("lease_absent", "operation 租约不存在");
   if (holder.unreadable) return fail("lease_unreadable", "租约读不出：" + holder.why);
   if (!holder.alive) return fail("lease_dead", "租约持有者 pid " + holder.pid + " 已不在");
-  return { ok: true, doc: j.doc, ledgerStep: ls };
+  return { ok: true, maintenanceDir: maintDir, doc: j.doc, ledgerStep: ls };
 }
 
 /** 锁内封闭盘点：目录里除 ledger.lock 外不得有任何制品（v1 首笔无 .prev / 无 tmp / 无 reap 家族 / 无未知）。 */
@@ -704,8 +707,8 @@ function endpointReceipt(dir, endpointId) {
   let initDone = false, cutoverDone = false;
   for (const token of list.tokens) {
     const j = readJournal({ dir, token });
-    if (j.state !== "valid") continue;
-    if (j.doc.schema_version !== JOURNAL_SCHEMA) continue;
+    if (j.state !== "valid") return { unreadable: true, why: "journal " + j.state + (j.why ? "：" + j.why : "") }; // fail-closed（评审 F3）：维护目录里混进坏 journal → 拒
+    if (j.doc.schema_version !== JOURNAL_SCHEMA) continue; // 旧 1.1 合法收据，跳过
     if (j.doc.operation_kind !== "ledger_init" && j.doc.operation_kind !== "ledger_cutover") continue;
     if (j.doc.phase !== "done") continue;
     const ls = j.doc.steps.find((s) => s.kind === "ledger");
@@ -799,11 +802,11 @@ function gatedTx({ endpointId, requestKey, env, replay, _inject, mutate }) {
 /** initialize_shadow（§5/§5.2）：受验 capability（active maintenance op / gate token / lease / ledger step）+ 原 request_key + virgin 盘点 + 机器级初始化收据，写 revision=1。 */
 export function initializeShadow({ endpointId, capability, requestKey, chain, plan: planIn = null, env = process.env, _inject = null } = {}) {
   if (!capability || capability.kind !== "initialize_shadow") return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "kind 不符或缺失" };
-  const cap = _maintenanceVerifier(capability, endpointId, "initialize_shadow");
+  const cap = _maintenanceVerifier(capability, endpointId, "initialize_shadow", env);
   if (!cap.ok) return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: cap.reason + (cap.why ? "：" + cap.why : "") };
   if (typeof requestKey !== "string" || !REQUEST_KEY_SHAPE.test(requestKey)) return { ok: false, commit: "not_committed", reason: "bad_request_key" };
   if (!CHAIN.includes(chain)) return { ok: false, commit: "not_committed", reason: "bad_chain" };
-  const receipt = endpointReceipt(capability.maintenanceDir, endpointId);
+  const receipt = endpointReceipt(cap.maintenanceDir, endpointId);
   if (receipt.unreadable) return { ok: false, commit: "not_committed", reason: "already_initialized", why: receipt.why };
   if (receipt.initDone || receipt.cutoverDone) return { ok: false, commit: "not_committed", reason: "already_initialized", why: "该 endpoint 已被初始化或已切权威" };
   const plan = planIn ?? initPlan({ endpointId, chain, requestKey, operationId: capability.token });
@@ -831,10 +834,10 @@ export function initializeShadow({ endpointId, capability, requestKey, chain, pl
 /** authority_cutover（§5/§8）：shadow→authoritative 同一不可逆提交；前置 = 门内双射对账通过（fail-closed）+ G14 无已切权威。 */
 export function authorityCutover({ endpointId, capability, requestKey, chain, plan: planIn = null, shadowDoc: shadowDocIn = null, reconciler = null, env = process.env, _inject = null } = {}) {
   if (!capability || capability.kind !== "authority_cutover") return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "kind 不符或缺失" };
-  const cap = _maintenanceVerifier(capability, endpointId, "authority_cutover");
+  const cap = _maintenanceVerifier(capability, endpointId, "authority_cutover", env);
   if (!cap.ok) return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: cap.reason + (cap.why ? "：" + cap.why : "") };
   if (typeof requestKey !== "string" || !REQUEST_KEY_SHAPE.test(requestKey)) return { ok: false, commit: "not_committed", reason: "bad_request_key" };
-  const receipt = endpointReceipt(capability.maintenanceDir, endpointId);
+  const receipt = endpointReceipt(cap.maintenanceDir, endpointId);
   if (receipt.unreadable) return { ok: false, commit: "not_committed", reason: "receipt_problem", why: receipt.why };
   if (receipt.cutoverDone) return { ok: false, commit: "not_committed", reason: "already_cutover", why: "该 endpoint 已切权威" };
   const d = resolveEndpointDir(endpointId, { env });

@@ -24706,6 +24706,7 @@ test("账本维护 operation：init 进门→shadow→B-4 重开→done；崩写
   const ledgerRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ledgerop-ledger-")));
   const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
   const savedGateEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile;
+  const savedMaintDirEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = dir;
   const CH = "claude";
   const mkEp = (uid) => legacyEndpointId({ runtime: "claude", agentUid: uid });
   const epDir = (ep) => { const d = path.join(ledgerRoot, ep); fs.mkdirSync(d, { recursive: true, mode: 0o700 }); return d; };
@@ -24768,22 +24769,63 @@ test("账本维护 operation：init 进门→shadow→B-4 重开→done；崩写
     const LD = TAL.loadLedger(dD, { endpointId: EPd });
     assert.ok(LD.ok && LD.doc.revision === 1, "写前崩溃→重试写出 shadow/rev1");
 
-    // ── 5. capability 负例拒 + 账本 SHA 不变 + 门前 gated 事务拒
+    // ── 5. F2：账本 operation 卡在 forward-only → 通用 exitMaintenance --apply 只向前收敛 done（拒被误判成 rollback）
+    const EPf = mkEp("agent_ledger_op_f2"); const dF = epDir(EPf);
+    const entF = enterMaintenance(ctx, { reason: "F2 forward-only", apply: true, keepLease: true, operationKind: "ledger_init" });
+    assert.ok(entF.ok && entF.lease, "F2 enter：" + JSON.stringify(entF));
+    const planF = TAL.initPlan({ endpointId: EPf, chain: CH, requestKey: entF.token, operationId: entF.token });
+    assert.ok(planF.ok, "F2 initPlan：" + JSON.stringify(planF));
+    const pwF = setPhaseJ({ dir, token: entF.token, lease: entF.lease, phase: "ledger_initializing", expectPhase: "drained", now: clock });
+    assert.ok(pwF.ok, "F2 setPhase fwd：" + JSON.stringify(pwF));
+    assert.equal(addNoteJ({ dir, token: entF.token, lease: entF.lease, note: "ledger_op chain=" + CH, now: clock }).ok, true, "F2 addNote");
+    assert.equal(addStepPreparedJ({ dir, token: entF.token, lease: entF.lease, step: { id: "ledger:" + EPf + ":init", kind: "ledger", target: EPf, before: planF.before, backup: null, intended_after: planF.intendedAfter }, now: clock }).ok, true, "F2 addStepPrepared");
+    assert.ok(releaseOperationLease(entF.lease).ok, "F2 释放旧租约（否则 await 前持同一 pid 租约→operation_in_progress）");
+    const xF = exitMaintenance(ctx, { apply: true });
+    assert.ok(xF.ok && xF.phase === "done", "F2 通用 --exit 对 ledger op→只向前 done（若误回退会非 done）：" + JSON.stringify(xF));
+    const jF = journalOf(entF.token);
+    assert.equal(jF.phase, "done", "F2 后 journal phase=done");
+    assert.equal(jF.steps.find((s) => s.id === "ledger:" + EPf + ":init")?.state, "done", "F2 后 ledger step done");
+    const LF = TAL.loadLedger(dF, { endpointId: EPf });
+    assert.ok(LF.ok && LF.doc.authority_mode === "shadow" && LF.doc.revision === 1, "F2 后 shadow/rev1：" + JSON.stringify(LF));
+    assert.equal(readActive({ dir }).state, "absent", "F2 后 active 清掉");
+    assert.equal(readGate({ file: gateFile, now: clock }).state, "absent", "F2 后门撤掉");
+
+    // ── 6. F3：维护目录混进坏 journal → endpointReceipt fail-closed，init 拒 already_initialized
+    const EPg = mkEp("agent_ledger_op_f3"); const dG = epDir(EPg);
+    const entG = enterMaintenance(ctx, { reason: "F3 bad journal", apply: true, keepLease: true, operationKind: "ledger_init" });
+    assert.ok(entG.ok && entG.lease, "F3 enter：" + JSON.stringify(entG));
+    const planG = TAL.initPlan({ endpointId: EPg, chain: CH, requestKey: entG.token, operationId: entG.token });
+    assert.ok(planG.ok, "F3 initPlan：" + JSON.stringify(planG));
+    assert.ok(setPhaseJ({ dir, token: entG.token, lease: entG.lease, phase: "ledger_initializing", expectPhase: "drained", now: clock }).ok, "F3 setPhase fwd");
+    assert.equal(addNoteJ({ dir, token: entG.token, lease: entG.lease, note: "ledger_op chain=" + CH, now: clock }).ok, true, "F3 addNote");
+    assert.equal(addStepPreparedJ({ dir, token: entG.token, lease: entG.lease, step: { id: "ledger:" + EPg + ":init", kind: "ledger", target: EPg, before: planG.before, backup: null, intended_after: planG.intendedAfter }, now: clock }).ok, true, "F3 addStepPrepared");
+    const badTok = "99999999-9999-4999-8999-999999999999";
+    fs.writeFileSync(path.join(dir, badTok + ".json"), "{ bad json !!! ");
+    const f3 = TAL.initializeShadow({ endpointId: EPg, capability: { token: entG.token, kind: "initialize_shadow", endpointId: EPg }, requestKey: "req_f3", chain: CH });
+    assert.equal(f3.ok, false); assert.equal(f3.reason, "already_initialized"); assert.match(f3.why, /不是 JSON|unreadable|journal/u, "F3 坏 journal→fail-closed：" + f3.why);
+    assert.equal(fs.existsSync(path.join(dG, "ledger.json")), false, "F3 被拒后没写账本");
+    // 清坏 journal + 把 entG 收敛 done（恢复 dir 干净供 scene 7）
+    fs.unlinkSync(path.join(dir, badTok + ".json"));
+    assert.ok(releaseOperationLease(entG.lease).ok, "F3 释放旧租约");
+    const xG = exitMaintenance(ctx, { apply: true });
+    assert.ok(xG.ok && xG.phase === "done", "F3 清坏 journal 后收敛 done：" + JSON.stringify(xG));
+
+    // ── 7. capability 负例拒 + 账本 SHA 不变 + 门前 gated 事务拒
     const EPn = mkEp("agent_ledger_op_neg"); const dN = epDir(EPn);
     fs.writeFileSync(path.join(dN, "ledger.json"), "NEG-MARKER");
     const shaN = TAL.sha256(fs.readFileSync(path.join(dN, "ledger.json")));
     const entN = enterMaintenance(ctx, { reason: "cap neg", apply: true, keepLease: true, operationKind: "ledger_init" });
     assert.ok(entN.ok && entN.lease, "enterN：" + JSON.stringify(entN));
-    const baseCap = { maintenanceDir: dir, gateFile, token: entN.token, kind: "initialize_shadow", endpointId: EPn };
+    const baseCap = { token: entN.token, kind: "initialize_shadow", endpointId: EPn };
     const planN = TAL.initPlan({ endpointId: EPn, chain: CH, requestKey: entN.token, operationId: entN.token });
     assert.ok(planN.ok, "initPlan：" + JSON.stringify(planN));
     // 门开着 → 正常 gated 事务拒 maintenance
     const epGated = mkEp("agent_ledger_op_gated"); epDir(epGated);
     const gated = TAL.createA1({ endpointId: epGated, requestKey: "req_gated1", chatId: "oc_g", sessionId: "sess_g" });
     assert.equal(gated.ok, false); assert.equal(gated.reason, "maintenance", "门前正常 gated 事务拒 maintenance：" + JSON.stringify(gated));
-    // 无 active operation
+    // 无 active operation（env 指向空目录：verifier 只认 env 派生路径，不认 capability 自述路径）
     const noOpDir = path.join(base, "no-op"); fs.mkdirSync(noOpDir, { recursive: true });
-    const negNo = TAL.initializeShadow({ endpointId: EPn, capability: { maintenanceDir: noOpDir, gateFile, token: entN.token, kind: "initialize_shadow", endpointId: EPn }, requestKey: "req_neg_noop", chain: CH });
+    const negNo = TAL.initializeShadow({ endpointId: EPn, capability: { token: entN.token, kind: "initialize_shadow", endpointId: EPn }, requestKey: "req_neg_noop", chain: CH, env: { ...process.env, FEISHU_BRIDGE_MAINTENANCE_DIR: noOpDir } });
     assert.equal(negNo.ok, false); assert.equal(negNo.reason, "maintenance_capability_required"); assert.match(negNo.why, /no_active_operation/u, "无 active→拒：" + negNo.why);
     // kind 不符
     const negKind = TAL.initializeShadow({ endpointId: EPn, capability: { ...baseCap, kind: "authority_cutover" }, requestKey: "req_neg_kind", chain: CH });
@@ -24801,9 +24843,29 @@ test("账本维护 operation：init 进门→shadow→B-4 重开→done；崩写
     assert.equal(negLease.ok, false); assert.equal(negLease.reason, "maintenance_capability_required"); assert.match(negLease.why, /lease_absent/u, "租约缺席→拒：" + negLease.why);
     const shaN2 = TAL.sha256(fs.readFileSync(path.join(dN, "ledger.json")));
     assert.equal(shaN2, shaN, "cap 负例被拒后账本 SHA 不变（未写盘）");
+
+    // ── 8. F1 反例：capability 自述路径被忽略 → 伪造全套现场 + env 指向空目录 → 拒 no_active_operation（旧代码读 capability.maintenanceDir→写盘，新代码只用 env）
+    const fakeMaint = path.join(base, "fake-maint"); fs.mkdirSync(fakeMaint, { recursive: true });
+    const fakeGateFile = path.join(base, "fake.gate");
+    const emptyMaint = path.join(base, "empty-maint"); fs.mkdirSync(emptyMaint, { recursive: true });
+    const emptyGateFile = path.join(base, "empty.gate");
+    const EPfake = mkEp("agent_ledger_op_fake"); const dFake = epDir(EPfake);
+    // 借 entN 的真实 ledger_initializing journal（ENTER_DONE 全 done + ledger step prepared），retoken 成伪造现场：fakeTok 替 entN.token、EPfake 替 EPn
+    const fakeTok = "55555555-5555-4555-8555-555555555555";
+    const fakeDoc = JSON.parse(JSON.stringify(journalOf(entN.token)).split(entN.token).join(fakeTok).split(EPn).join(EPfake));
+    fs.symlinkSync(fakeTok, path.join(fakeMaint, "active"));
+    fs.writeFileSync(path.join(fakeMaint, fakeTok + ".json"), JSON.stringify(fakeDoc));
+    fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date(clock).toISOString() }), path.join(fakeMaint, fakeTok + ".lease"));
+    fs.symlinkSync(JSON.stringify({ reason: "伪造", token: fakeTok, at: new Date(clock).toISOString(), pid: process.pid }), fakeGateFile);
+    const fakeRead = readJournal({ dir: fakeMaint, token: fakeTok });
+    assert.equal(fakeRead.state, "valid", "F1 伪造现场 journal 本身是合法收据（否则反例无意义）：" + fakeRead.why);
+    const f1 = TAL.initializeShadow({ endpointId: EPfake, capability: { maintenanceDir: fakeMaint, gateFile: fakeGateFile, token: fakeTok, kind: "initialize_shadow", endpointId: EPfake }, requestKey: fakeTok, chain: CH, env: { ...process.env, FEISHU_BRIDGE_MAINTENANCE_DIR: emptyMaint, FEISHU_BRIDGE_MAINTENANCE_GATE: emptyGateFile } });
+    assert.equal(f1.ok, false); assert.equal(f1.reason, "maintenance_capability_required"); assert.match(f1.why, /no_active_operation/u, "F1 伪造路径→verifier 用 env 空目录→拒：" + f1.why);
+    assert.equal(fs.existsSync(path.join(dFake, "ledger.json")), false, "F1 被拒后没写账本");
   } finally {
     if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedgerDir;
     if (savedGateEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; else process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = savedGateEnv;
+    if (savedMaintDirEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = savedMaintDirEnv;
     if (prevTpl === undefined) delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; else process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = prevTpl;
     fs.rmSync(base, { recursive: true, force: true }); fs.rmSync(ledgerRoot, { recursive: true, force: true });
   }

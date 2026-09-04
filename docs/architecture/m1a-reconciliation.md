@@ -157,6 +157,17 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
    ledger_cutover 的 PHASE_REQUIRES 在 ledger_reopening/done 增列全部 sidecar steps done；
    恢复时 **pre_cutover_ledger_sha 与各 intended SHA 一律从首次 prepared journal 重放**，
    不得按变化后现场重算（maintenance-gate.md『账本接入』节同步此扩展）。
+4c. **跨制品绑定核验（八轮 P1-4，authority_mode 翻转前逐项核，任一不等即停）**：
+   - `pre_cutover_ledger_sha === ledger step.before.ledger_sha256`；
+   - cutover 的三个 sidecar SHA 分别 === 对应 sidecar step 的 intended_after/after.sha256；
+   - cutover fingerprint/result 与上述固定值逐字一致；
+   - `bijection_digest` 来自**同一 pre-cutover ledger revision/snapshot** 的 reconciler 结果
+     （revision 记进 prepared ledger step，提交前 CAS 复核）。
+4d. **sidecar 的维护窄写路径（八轮 P1-5）**：三个 sidecar 在门内的写**不走** gated（会被门挡）
+   也**不开通用 ungated API**——各定义一个维护窄 writer：绑定 operation token + lease + gate +
+   journal prepared step（与账本 capability 同一纪律：读实文件核验后才写），fenced commit；
+   锁序 = 安装面锁 → lease/active/gate → **sidecar 文件锁 → 账本锁**（sidecar 先于账本，
+   与 §4.1 顺序 2→3 一致）。
 5. **cutover op 联合（五轮 P1-4 定案，与上游账本合同一致）**：
    result = `{ revision_at_cutover, bijection_digest, pre_cutover_ledger_sha, expiry_sha256,
    pending_claims_sha256, policy_sha256 }`（**保留**上游 revision_at_cutover）；
@@ -179,7 +190,7 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
 
 | legacy 写方（实际入口） | 账本事务 | request_key 派生（五轮 P1-3：逐 op 全定义） |
 | --- | --- | --- |
-| 入站建 Dialogue 会话记录（inbound-route R1 路径） | create_a1 | ext=入站 message id；**entity=受验 Aily session locator**（预先确定，非随机 ta id） |
+| 两链所有 A1 物化入口（任一受验首条 @ 的 chat 记录——不由 Dialogue policy 限定，八轮 P2-2） | create_a1 | ext=入站 message id；**entity=受验 Aily session locator**（预先确定，非随机 ta id） |
 | bind/认领（claim→绑定：引用码、@ 配对） | create_a1 → activate（固定顺序） | 同一 claim：ext=claim key；create_a1 entity=session locator、activate entity=B1 topic_agent_id——两笔 key 确定性派生且不同 |
 | 显式 attach（终端） | attach | ext=控制 claim key（终端命令 claim 机制既有、持久）；entity=目标 id |
 | rotate（建新代际） | create_b1 | ext=rotation operation id（topic-generation 既有、持久）；entity=lineage id |
@@ -202,17 +213,25 @@ op_type, entity_id })).slice(0,40)`；每行的 ext/entity 如上表——**无�
 授权）：语义 = "按当前 legacy 证据重新迁移这一条记录"——**连同 proof 一起更新**：
 facts/aliases/target 改到与 legacy 投影一致，migrated 双 proof 以本笔 repair op 重签
 （migration_operation_id = 本 repair opId、legacy_source_digest = 当前证据重算）。
-**适用范围封闭**：仅限双 proof 均为 migrated 的记录或 proof 全 null 的 B1；带真实生命周期
-proof（pairing/attach/retarget/f4）的记录**拒**（repair_scope，走真实生命周期事务修）——
-repair 不得降级真实证据。fingerprint =
-`{ request_key, topic_agent_id, expected_projection_digest, next_projection_digest }`；
-CAS：现投影 digest ≠ expected → repair_cas_mismatch；result = `{ repaired_id, from_family,
-to_family, expected_projection_digest, next_projection_digest, legacy_source_digest,
-authorized_by, authorized_at }`（七轮 P1-2）；
-**G13-mig 扩**：migration_operation_id 可指向 `op_type ∈ {migrate_seed, migrate_repair}`
-（migrate_seed 用 result.seeded_ids 含本 id；migrate_repair 用 result.repaired_id===本 id）；
-**G13-repair**：origin 指向 repair ⇒ ① 现投影 digest 重算===result.next；② result 两 digest
-与 fingerprint 逐字相等；③ repaired_id===本记录 id。
+**适用范围 = 精确两支判别联合（八轮 P1-1 定稿，全文以此为准）**：
+- **B1 → B1**：proof 始终全 null（repair 只对齐 facts/aliases/target）；
+- **{B3, B3′, B4} 双 migrated → {B3, B3′, B4}**：双 proof 由本 repair op 重签，且
+  `result.from_family` / `result.to_family` 必分别等于执行前/后实际族；
+- **其余一律拒 `repair_scope`**：A4（即使双 migrated——只能走 attach）、任一真实生命周期
+  proof（pairing/attach/retarget/f4）、以及任何表外组合。
+
+fingerprint = `{ request_key, topic_agent_id, expected_projection_digest,
+next_projection_digest }`；CAS：现投影 digest ≠ expected → repair_cas_mismatch；
+result = `{ repaired_id, from_family, to_family, expected_projection_digest,
+next_projection_digest, legacy_source_digest, authorized_by, authorized_at }`；
+**G13-mig（统一判别联合，八轮 P1-2）**：任一 proof 为 migrated ⇒
+migration_operation_id 指向 op_type ∈ {migrate_seed, migrate_repair} 的存在 op；
+migrate_seed：`result.seeded` 含 `{topic_agent_id:本 id, legacy_source_digest}` 且与 proof
+digest 逐字相等；migrate_repair：`result.repaired_id===本 id` 且 `result.legacy_source_digest`
+与 proof 逐字相等；**binding migrated proof 的 authorized_by/authorized_at 必与对应 op
+result 逐字相等**；link 与 binding 的 migrated proof 引用**同一 op 与同一 digest**；
+**G13-repair**：origin 指向 repair ⇒ ① 现投影 digest 重算===result.next；② result 两投影
+digest 与 fingerprint 逐字相等；③ repaired_id===本记录 id。
 
 ## 6. reconciler 判据与 digest（T3a 已放行）
 

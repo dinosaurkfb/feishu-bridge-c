@@ -198,14 +198,24 @@ rollback 记 `rolled_back`）。
 `ledger_*` kind **禁 install 的 `artifact`/`receipt`/`staged_plan` step**；
 `maintenance_gate`/`maintenance_install` kind **禁 `ledger` step**。
 
-**sidecar step（M1a v7 回带，`m1a-reconciliation.md` §4.1-4b）**：新 step kind `sidecar`，
-仅 `ledger_cutover` 允许（**`ledger_init` 禁 sidecar**）；id = `sidecar:<name>:<ep>`
-（name ∈ {expiry, pending-claims, policy}）；before/intended_after =
-`{ exists, sha256 }` 联合（absent 显式 `{exists:false, sha256:null}`）；原文件存在必有备份。
-`ledger_cutover` 的 `ledger_reopening`/`done`/`reopening_incomplete` 阶段要求 =
-ENTER_DONE ∪ {ledger step} ∪ **全部 sidecar steps 均 done**。恢复时
-pre_cutover_ledger_sha 与各 sidecar intended SHA **一律从首次 prepared journal 重放**，
-不得按变化后现场重算。
+**sidecar step（M1a v8 回带，`m1a-reconciliation.md` §4.1；八轮 P1-3 封闭联合）**：
+新 step kind `sidecar`，仅 `ledger_cutover` 允许（**`ledger_init` 禁 sidecar**）：
+- **journal schema 升 1.3**（八轮 P2-1）：1.3 = 1.2 + sidecar step kind；**1.2 独立兼容分支**
+  （不认识 sidecar，读到即 unreadable——旧 runtime 遇到 1.3 journal fail-closed，不误解释）；
+- id = `sidecar:<name>:<ep>`（name ∈ {expiry, pending-claims, policy}），**三个固定 id 恰好
+  各一条**（多/少/重复 → journal 非法）；
+- step 完整键集 = 通用 11 键（after,at,backup,backup_bytes,backup_sha256,before,id,
+  intended_after,kind,state,target）；`target` **由 endpoint+name 内部派生**
+  （`ledger/<ep>/<name>.json` 的规范路径，校验器重算比对，不信任 journal 中任意路径）；
+- before/intended_after/after = `{ exists, sha256 }` 联合（absent 显式
+  `{exists:false, sha256:null}`）；**prepared 不得有 after；done 必须
+  after === intended_after（逐字段）**；
+- 原文件存在（before.exists）必有备份：backup 绝对路径 + backup_sha256/bytes 齐；恢复前
+  **受验读取备份并核长度/SHA**，核不过 → 该项 incomplete（不盲写回）；
+- `ledger_cutover` 的 `ledger_reopening`/`done`/`reopening_incomplete` 阶段要求 =
+  ENTER_DONE ∪ {ledger step} ∪ **全部三条 sidecar steps 均 done**；恢复时
+  pre_cutover_ledger_sha 与各 sidecar intended SHA **一律从首次 prepared journal 重放**，
+  不得按变化后现场重算。
 
 **schema 判别联合（三轮 P1-2 / 二轮 P2-1，写死枚举、旧版单独分支不猜）**：
 - **旧 schema 1.1**：保持原封闭字段集、**不含** `operation_kind`；用**独立的旧版解析

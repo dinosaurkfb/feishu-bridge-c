@@ -237,6 +237,17 @@ export function journalProblem(doc) {
     if (s.kind === "gate" && s.after.token !== doc.token) return "gate 的 token 与 operation 不一致";
     if (s.kind === "stub" && !s.intended_after.endsWith("maintenance-" + doc.token)) return "桩目标与 operation token 不一致";
   }
+  // P1-2（第 5 轮）：非 install 的 `current:<chain>` 绑到**本 operation** 的维护目录，且与同链桩一致——
+  // 否则 ledger-operation 重开会把**别的** operation 的桩当本 operation 执行。无同链桩时无从对上，留给 stepProblem 形状检查。
+  for (const s of doc.steps) if (s.kind === "current" && s.state === "done" && !s.id.endsWith(":install")) {
+    const chain = s.id.split(":")[1];
+    if (typeof chain !== "string" || chain.length === 0) continue;
+    const stub = doc.steps.find((x) => x.kind === "stub" && x.id === "stub:" + chain);
+    if (stub === undefined) continue;
+    const want = "maintenance-" + doc.token;
+    if (!(s.intended_after ?? "").endsWith(want)) return "current 目标与 operation token 不一致";
+    if (s.intended_after !== stub.intended_after) return "current 目标与桩不一致";
+  }
   // step 类型 × operation_kind 封闭（M1 账本接入 B，设计"ledger_* 禁 install 步 / gate·install 禁 ledger 步"）：
   if (is12) {
     const isLedger = doc.operation_kind === "ledger_init" || doc.operation_kind === "ledger_cutover";

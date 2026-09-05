@@ -29,6 +29,7 @@ import { parseRegisterSenderArgs, planSenderChange, applySenderChange } from "./
 import { parseRegisterP2pArgs, planP2pChange, applyP2pChange } from "./register-p2p-chat.mjs";
 import * as TAL from "./topic-agent-ledger.mjs";
 import * as DW from "./m1a/dual-write.mjs";
+import * as WIRE from "./m1a/wiring.mjs";
 // symlink 锁：existsSync 会跟随到不存在的目标，锁在不在只能用 lstat 判
 const lockPresent = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
 import os from "node:os";
@@ -25074,6 +25075,92 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
       assert.ok(rel.path && String(rel.path).includes(".reap"), "path 是 .reap 残骸：" + JSON.stringify(rel));
       assert.ok(rel.error && /EIO/u.test(rel.error), "error 投影：" + JSON.stringify(rel));
       fs.rmSync(lock, { force: true });
+    }
+  }));
+
+  // §R36 M1a 双写接线：封闭 per-writer 包装层。
+  //   锁先导（busy→binding_busy 且 legacy 未跑）→ legacy 先提交 → shadow 序列（固定顺序/派生 key/族正确）→ 释放。
+  //   shadow 失败不改变 legacy 成功；同 external id 重放幂等（崩溃续跑）；直接调账本原始写方（绕过包装层）不受 outer 锁约束→反向红线。
+  test("m1a 双写接线：per-writer 包装层——锁先导+legacy 先提交+shadow 族正确+重放幂等+shadow 失败不伤 legacy+busy 拒+直接调原始账本写方绕过包装层不取锁（reverse）", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    let legacyCalls = 0;
+    const legacyRec = (tag) => () => { legacyCalls += 1; return { tag, legacyCommitted: true }; };
+
+    // ① wireCreateA1：create_a1 → family A1，legacy 先提交；释放 ok
+    {
+      const w = WIRE.wireCreateA1({ endpointId: EP, env: process.env, legacy: legacyRec("a1"), chatId: "oc_w", sessionId: "sess_w", messageId: "msg_w" });
+      assert.ok(w.ok, "wireCreateA1 ok：" + JSON.stringify(w));
+      assert.ok(w.legacy && w.legacy.legacyCommitted, "legacy 已提交");
+      assert.equal(w.shadow.length, 1, "一笔 shadow");
+      assert.equal(w.shadow[0].op, "create_a1", "op 名");
+      assert.ok(w.shadow[0].ok, "create_a1 成功：" + JSON.stringify(w.shadow[0]));
+      assert.ok(w.release && w.release.ok, "释放 ok");
+      assert.ok(famIds(talLoad(dir), "A1").includes(w.shadow[0].result.created_id), "create_a1 产出 A1");
+    }
+
+    // ② 同 external id 重放→幂等（崩溃续跑：重跑不丢、不重复）
+    {
+      const w1 = WIRE.wireCreateA1({ endpointId: EP, env: process.env, legacy: legacyRec("a1b"), chatId: "oc_wb", sessionId: "sess_wb", messageId: "msg_wb" });
+      assert.ok(w1.ok, "首跑 ok");
+      const w2 = WIRE.wireCreateA1({ endpointId: EP, env: process.env, legacy: legacyRec("a1b2"), chatId: "oc_wb", sessionId: "sess_wb", messageId: "msg_wb" });
+      assert.ok(w2.ok, "重跑 ok");
+      assert.equal(w2.shadow[0].idempotent, true, "同 (opType,ext,entity) 重放→幂等（不新增）：" + JSON.stringify(w2.shadow[0]));
+      assert.ok(famIds(talLoad(dir), "A1").filter((i) => i === w1.shadow[0].result.created_id).length === 1, "重放不新增 A1");
+    }
+
+    // ③ busy→binding_busy 且 legacy 未跑（锁先导，不降级）
+    {
+      const acq = DW.acquireOrderLock(EP, process.env);
+      assert.ok(acq.ok, "取到外层锁（busy 反例）");
+      const before = legacyCalls;
+      const w = WIRE.wireCreateA1({ endpointId: EP, env: process.env, legacy: legacyRec("busy"), chatId: "oc_busy", sessionId: "sess_busy", messageId: "msg_busy" });
+      assert.equal(w.ok, false, "busy→整笔拒");
+      assert.equal(w.reason, "binding_busy", "binding_busy");
+      assert.equal(w.commit, "not_committed", "未提交");
+      assert.equal(legacyCalls, before, "busy 时 legacy 未跑");
+      assert.ok(acq.release().ok, "释放");
+    }
+
+    // ④ shadow 失败不改变 legacy 成功（回执照常；reason 投影在 shadow[0]）
+    {
+      const w = WIRE.wirePauseResume({ endpointId: EP, env: process.env, legacy: legacyRec("poor"), controlClaimKey: claim("f"), id: tid("0"), mode: "pause" });
+      assert.ok(w.ok, "legacy 成功→整体 ok：" + JSON.stringify(w));
+      assert.ok(w.legacy && w.legacy.legacyCommitted, "legacy 已提交");
+      assert.equal(w.shadow[0].ok, false, "shadow unbind 对不存在 id 失败");
+      assert.ok(w.shadow[0].reason, "shadow 失败投影自身结构化 reason：" + JSON.stringify(w.shadow[0]));
+    }
+
+    // ⑤ 直接调账本原始写方（绕过包装层）在持有外层锁时仍能提交→证明直接路径不取 outer 锁（非包装层路径=无锁红线）
+    {
+      const acq = DW.acquireOrderLock(EP, process.env);
+      assert.ok(acq.ok, "取外层锁（reverse 反例）");
+      const w = TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_by", sessionId: "sess_by" });
+      assert.ok(w.ok, "直接调 createA1 绕过包装层时外层锁被持有仍 ok（outer 锁管不住直接路径）：" + JSON.stringify(w));
+      assert.ok(acq.release().ok, "释放");
+    }
+
+    // ⑥ wireBindClaim：create_a1 → activate（固定顺序、a1Id 线程化）→ B3
+    {
+      talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_bc", rootOm: "om_bc", lineageId: "lin_bc", bindingTarget: TGT }), "B1 前置");
+      const b1Id = famIds(talLoad(dir), "B1").pop();
+      const w = WIRE.wireBindClaim({ endpointId: EP, env: process.env, legacy: legacyRec("bind"), claimKey: claim("d"), chatId: "oc_bc", sessionId: "sess_bc", b1Id, f4: F4("om_bc"), authorizedBy: "ou_o" });
+      assert.ok(w.ok, "wireBindClaim ok：" + JSON.stringify(w));
+      assert.deepEqual(w.shadow.map((s) => s.op), ["create_a1", "activate"], "固定顺序：create_a1 → activate");
+      assert.ok(w.shadow[0].ok && w.shadow[1].ok, "两笔都成功");
+      assert.equal(TAL.familyOf(talLoad(dir).records[b1Id].facts), "B3", "归并→B3");
+    }
+
+    // ⑦ wirePauseResume：pause→B3'，resume→B3（族方向正确）
+    {
+      const b3Id = famIds(talLoad(dir), "B3").pop();
+      const p = WIRE.wirePauseResume({ endpointId: EP, env: process.env, legacy: legacyRec("pause"), controlClaimKey: claim("e"), id: b3Id, mode: "pause" });
+      assert.ok(p.ok, "pause ok：" + JSON.stringify(p));
+      assert.deepEqual(p.shadow.map((s) => s.op), ["unbind"], "pause→unbind");
+      assert.equal(TAL.familyOf(talLoad(dir).records[b3Id].facts), "B3'", "pause→B3'");
+      const r = WIRE.wirePauseResume({ endpointId: EP, env: process.env, legacy: legacyRec("resume"), controlClaimKey: claim("e"), id: b3Id, mode: "resume" });
+      assert.ok(r.ok, "resume ok：" + JSON.stringify(r));
+      assert.deepEqual(r.shadow.map((s) => s.op), ["restore"], "resume→restore");
+      assert.equal(TAL.familyOf(talLoad(dir).records[b3Id].facts), "B3", "resume→B3");
     }
   }));
 

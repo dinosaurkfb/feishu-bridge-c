@@ -24804,11 +24804,12 @@ test("账本维护 operation：init 进门→shadow→B-4 重开→done；崩写
     assert.equal(readGate({ file: gateFile, now: clock }).state, "absent", "init 后门撤掉");
     assert.equal(launchd[claudeLabel].loaded, true, "init 后定时器恢复 loaded");
 
-    // ── 2. cutover：评审 P1-4 —— 调用方不能注入 reconciler；reconcileShadow 未接入（fail-closed 恒 reconciler_absent），带不带都拒，且账本保持 shadow
+    // ── 2. cutover：评审 P1-4 —— 调用方不能注入 reconciler（参数被忽略）；真对账在 capability 门内的
+    // reconcileShadow 接（T3a 已放行）。本 fixture 模板缺席 → 真对账 fail-closed 拒 legacy_unreadable。
     const EPc = mkEp("agent_ledger_op_cut"); const dC = epDir(EPc);
     assert.ok(LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPc, chain: CH, apply: true }).phase === "done", "cutover 前置 init");
     const cut = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPc, chain: CH, apply: true, reconciler: REC });
-    assert.ok(cut.ok === false && cut.reason === "reconciler_absent", "cutover 带 reconciler 也拒（不得注入）：" + JSON.stringify(cut));
+    assert.ok(cut.ok === false && cut.reason === "legacy_unreadable", "cutover 拒来自真对账（注入被忽略，模板缺席 fail-closed）：" + JSON.stringify(cut));
     assert.equal(cut.rollbackSafe, true, "cutover 拒在 drained（rollbackSafe）：" + JSON.stringify(cut));
     const LC = TAL.loadLedger(dC, { endpointId: EPc });
     assert.ok(LC.ok && LC.doc.authority_mode === "shadow" && LC.doc.revision === 1, "cutover 被拒后仍是 shadow（未切权威）：" + JSON.stringify(LC));
@@ -24819,9 +24820,10 @@ test("账本维护 operation：init 进门→shadow→B-4 重开→done；崩写
     const EPc2 = mkEp("agent_ledger_op_cut_no"); const dC2 = epDir(EPc2);
     assert.ok(LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPc2, chain: CH, apply: true }).phase === "done", "无对账 cutover 前置 init");
     const cutNo = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPc2, chain: CH, apply: true });
-    assert.ok(cutNo.ok === false && cutNo.reason === "reconciler_absent", "cutover 无对账→reconciler_absent（fail-closed）：" + JSON.stringify(cutNo));
+    // 真对账接入（rebase 合并点）：无链模板 → 采集 fail-closed → legacy_unreadable（原 reconciler_absent 恒拒）
+    assert.ok(cutNo.ok === false && cutNo.reason === "legacy_unreadable", "cutover 模板缺席→legacy_unreadable（fail-closed）：" + JSON.stringify(cutNo));
     const LN = TAL.loadLedger(dC2, { endpointId: EPc2 });
-    assert.ok(LN.ok && LN.doc.authority_mode === "shadow", "reconciler_absent 后仍是 shadow");
+    assert.ok(LN.ok && LN.doc.authority_mode === "shadow", "对账拒后仍是 shadow");
 
     // ── 3. 崩在「写已提交」之后 → 只向前恢复（mutuation 防守：setPhase 若被挪到写之后，这里会 rolled_back）
     const EPb = mkEp("agent_ledger_op_b"); const dB = epDir(EPb);
@@ -25118,11 +25120,19 @@ test("账本维护 CLI + B-3 收据聚合 + inspect 收据不染红 + doctor ⑬
     assert.ok(aggDup.endpoints.find((x) => x.endpointId === EPdup)?.state === "conflict", "聚合给 EPdup 标 conflict");
     fs.unlinkSync(path.join(dir, dupTok + ".json"));
     // 复评 P2-2：init=0 ∧ cutover≥1 也是矛盾（未初始化却切了权威）→ duplicate_or_conflict，不是可新建 init。
+    // 真对账需要合法模板（registry 缺席=空表 → 与空账本双射成立）；用后还原 no-template 哨兵。
+    const tpl24 = path.join(base, "tpl-ledgerop.json");
+    fs.writeFileSync(tpl24, JSON.stringify({ chain: "claude", transport_agent_name: "t", transport_app_id: "cli_a", transport_open_id: "ou_a",
+      outbound_agent_name: "o", outbound_app_id: "cli_b", outbound_open_id: "ou_b", lark_cli_profile: "p",
+      lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "1", chat_name: "n",
+      chat_id: "oc_ledgerop" + "0".repeat(22), default_freshness_ms: 1000, agent_uid: "agent_ledgerop" }));
+    process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = tpl24;
     const EPcut0 = mkEp("agent_ledger_cut_only");
     const iCut0 = LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPcut0, chain: CH, apply: true });
     assert.ok(iCut0.ok, "cutover-only 前置 init：" + JSON.stringify(iCut0).slice(0, 200));
-    const cCut0 = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPcut0, chain: CH, apply: true, reconciler: ({ endpointId }) => ({ ok: true, digest: TAL.sha256(Buffer.from("b:" + endpointId)) }) });
-    assert.ok(cCut0.ok, "真 cutover 完成：" + JSON.stringify(cCut0).slice(0, 200));
+    const cCut0 = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPcut0, chain: CH, apply: true });
+    assert.ok(cCut0.ok, "真 cutover 完成（空对空真对账）：" + JSON.stringify(cCut0).slice(0, 200));
+    process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
     fs.unlinkSync(path.join(dir, iCut0.token + ".json")); // 手术：删 init journal，只留 cutover
     const cutOnly = endpointReceipt(dir, EPcut0);
     assert.deepEqual([cutOnly.ok, cutOnly.state], [false, "duplicate_or_conflict"], "init=0 ∧ cutover=1 → 矛盾：" + JSON.stringify(cutOnly));
@@ -25169,11 +25179,12 @@ test("账本维护 CLI + B-3 收据聚合 + inspect 收据不染红 + doctor ⑬
     assert.ok(insp2.residues.some((r) => r.kind === "orphan_journal" && r.path.includes(orphanTok)), "非 ledger journal 无 active → orphan 染红：" + JSON.stringify(insp2.residues));
     fs.unlinkSync(path.join(dir, orphanTok + ".json"));
 
-    // 6) CLI --cutover 无 reconciler → exit 1（干净拒绝：回退清干净），active/门清、账本仍 shadow
+    // 6) CLI --cutover：真对账在 capability 门内跑（rebase 合并点）；本 fixture 模板缺席 →
+    //    真对账 fail-closed 拒 legacy_unreadable → exit 1（干净拒绝：回退清干净），active/门清、账本仍 shadow
     const EPcut = mkEp("agent_ledger_cli_cut"); epDir(EPcut);
     assert.ok(LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPcut, chain: CH, apply: true }).ok, "cutover 前置 init：" + all());
     assert.equal(runCli(["--cutover", "--endpoint", EPcut, "--apply"]), 1, all());
-    assert.match(all(), /reconciler_absent/u, all());
+    assert.match(all(), /legacy_unreadable/u, all());
     assert.equal(readActive({ dir }).state, "absent", "cutover 拒后 active 清掉");
     assert.equal(readGate({ file: gateFile }).state, "absent", "cutover 拒后门撤掉");
     assert.ok(TAL.loadLedger(epDir(EPcut), { endpointId: EPcut }).doc.authority_mode === "shadow", "cutover 拒后仍是 shadow");
@@ -25451,7 +25462,8 @@ test("账本维护 R20 二轮：P1-4 阶段矩阵、P1-5 收据聚合、P1-1 顶
       assert.equal(TAL.cutoverPlanVerifier(p2plan, "not-a-sha", ep).reason, "reconciler_absent", "P2 T4b: 非 SHA digest → reconciler_absent（形状挡）");
       assert.equal(TAL.cutoverPlanVerifier(p2plan, "e".repeat(64), ep).reason, "plan_mismatch", "P2 T4c: digest 对不上（蓝图绑别的） → plan_mismatch");
       assert.equal(TAL.cutoverPlanVerifier(p2plan, digest, p2other).reason, "plan_mismatch", "P2 T4d: endpoint 对不上 → plan_mismatch");
-      assert.deepEqual(TAL.reconcileShadow({ endpointId: ep, shadowDoc: {} }), { ok: false, reason: "reconciler_absent", why: "双射对账器未接入，cutover fail-closed" }, "P2 T3a: reconcileShadow 恒 reconciler_absent（对账门，与蓝图验证分开）");
+      // 真对账接入（rebase 合并点）：参数守卫先于采集（不碰 fs）——缺 chain → reconciler_rejected；对账门仍与蓝图验证分开
+      assert.deepEqual(TAL.reconcileShadow({ endpointId: ep, shadowDoc: {} }), { ok: false, reason: "reconciler_rejected", why: "reconcileShadow 参数缺失（endpointId / shadowDoc.chain）" }, "P2 T3a: reconcileShadow 参数缺失 reconciler_rejected（对账门，与蓝图验证分开）");
     }
   } finally {
     if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedgerDir;
@@ -26669,6 +26681,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       const proj = path.join(home, "r19-proj");
       fs.mkdirSync(proj, { recursive: true, mode: 0o700 });
       const tpl = writeTpl(home);
+      process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = tpl.file; // TAL.reconcileShadow 的模板采集也走此 env（真对账接入后 cutover 需要合法模板）
       process.env.FEISHU_BRIDGE_REGISTRY = writeRegistry(home, [{ root: proj, id: "p1", claude_session_id: UUID1 }]);
       writeMapping(proj, MAPPING());
       const EPd = legacyEndpointId({ runtime: "claude", agentUid: "agent_r14d" });
@@ -26761,11 +26774,12 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       fs.writeFileSync(ledgerPath, goodBytes); // 内容级恢复
       assert.ok(TAL.loadLedger(epDirD, { endpointId: EPd }).ok, "恢复后账本回到绿");
       // 分支 e：cutoverDone 收据 → M1a 影子对账不适用（authoritative 账本合法演进，双射会永久误红，评审 P1-5）。
-      const EPcut = legacyEndpointId({ runtime: "claude", agentUid: "agent_r14cut" });
-      assert.ok(LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPcut, chain: "claude", apply: true }).ok, "e 场景 init");
-      const recCut = ({ endpointId }) => ({ ok: true, digest: TAL.sha256(Buffer.from("bijection:" + endpointId)) });
-      const cutOut = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPcut, chain: "claude", apply: true, reconciler: recCut });
+      // 真对账接入（rebase 合并点）：EPd 账本与 p1 双射已由主路径验证一致 → EPd 真跑 cutover 走通
+      // （cutover 写路径的拒例由「账本：维护编排」块守）。分支 e 守 ⑭ 读路径语义：cutoverDone →
+      // 不跑对账（authoritative 账本合法演进，双射会永久误红，评审 P1-5）。
+      const cutOut = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPd, chain: "claude", apply: true });
       assert.ok(cutOut.ok, "e 场景真 cutover：" + JSON.stringify(cutOut).slice(0, 300));
+      assert.equal(TAL.loadLedger(epDirD, { endpointId: EPd }).doc.authority_mode, "authoritative", "cutover 后 authoritative");
       const eD = d14();
       assert.equal(eD.ok, true, "cutover 已收口 → 不适用（绿）：" + JSON.stringify(eD));
       assert.match(eD.detail, /不适用/u, "点名不适用：" + eD.detail);
@@ -26828,16 +26842,26 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
 
       // 分支 b：prepared init WAL → 按 B-2 恢复矩阵报告。
+      // main 侧 journal 阶段纪律收紧（phase × ledger step 封闭、step 必带 chain），手拼 WAL 不再合法——
+      // 改为真跑一份 init journal 后手术成 prepared 崩溃态：token 全换 + ledger step prepared 化 + phase 推到前向阶段。
       const EPp = legacyEndpointId({ runtime: "claude", agentUid: "agent_r14p" });
-      const op = createOperation({ dir, reason: "R19 测试 prepared", operationKind: "ledger_init" });
-      assert.ok(op.ok, "prepared journal 落盘");
+      const opReal = LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPp, chain: "claude", apply: true });
+      assert.ok(opReal.ok, "prepared 手术底版（真 init）：" + JSON.stringify(opReal).slice(0, 200));
       const epOfPrepared = "endpoint_" + "9".repeat(24);
-      assert.equal(updateJournal({ dir, token: op.token, lease: op.lease, mutate: (dd) => {
-        dd.steps = [{ id: "ledger:" + epOfPrepared + ":init", kind: "ledger", target: epOfPrepared, backup: null, backup_sha256: null, backup_bytes: null,
-          before: { endpoint_id: epOfPrepared, operation_id: op.token, fingerprint: "f".repeat(64), authority_mode: null, revision: null, ledger_sha256: null },
-          intended_after: { endpoint_id: epOfPrepared, operation_id: op.token, fingerprint: "f".repeat(64), authority_mode: "shadow", revision: 1, ledger_sha256: "f".repeat(64) },
-          after: null, state: "prepared", at: new Date(clock).toISOString() }];
-        return dd; } }).ok, true, "塞 prepared ledger step");
+      const walTok = "88888888-8888-4888-8888-888888888888";
+      const walDoc = JSON.parse(JSON.stringify(readJournal({ dir, token: opReal.token }).doc).split(opReal.token).join(walTok));
+      walDoc.phase = "ledger_initializing";
+      const walLs = walDoc.steps.find((st) => st.kind === "ledger");
+      walLs.target = epOfPrepared;
+      walLs.id = "ledger:" + epOfPrepared + ":init";
+      walLs.before.endpoint_id = epOfPrepared;
+      walLs.before.operation_id = walTok;
+      walLs.intended_after.endpoint_id = epOfPrepared;
+      walLs.intended_after.operation_id = walTok;
+      walLs.after = null;
+      walLs.state = "prepared";
+      fs.writeFileSync(path.join(dir, walTok + ".json"), JSON.stringify(walDoc));
+      fs.unlinkSync(path.join(dir, opReal.token + ".json")); // 底版收据撤走，红只能来自 prepared WAL
       const prepared = d14();
       assert.equal(prepared.ok, false, "prepared WAL → 红：" + JSON.stringify(prepared));
       assert.match(prepared.detail, /初始化 WAL 未完成/u, "点名 WAL：" + prepared.detail);

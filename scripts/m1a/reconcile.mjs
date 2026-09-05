@@ -21,7 +21,9 @@ import { canonKey, sha256 } from "../topic-agent-ledger.mjs";
 import { validateTopicGenerationState } from "../topic-generation.mjs";
 import { M1A_SHAPES } from "./legacy-snapshot.mjs";
 
-const { OM_SHAPE, CHAT_SHAPE, LINEAGE_SHAPE } = M1A_SHAPES;
+// 形状正则在**函数内**取（顶层解构会在 legacy-snapshot 先于本模块初始化的入口顺序下 TDZ——
+// TAL→m1a/reconcile→legacy-snapshot→TAL 循环里顶层求值顺序不保证，函数体求值时两边必已完成）。
+const shape = (k) => M1A_SHAPES[k];
 
 const AILY_SESSION_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u; // aliases.session_id（账本同源形状）
 
@@ -116,15 +118,15 @@ export function projectLegacySnapshot({ endpointId, chain, snapshot }) {
         continue;
       }
       // chat_id（适配器产出，已过受验形状——双保险）与 root_om（OM_SHAPE 必过）。
-      if (typeof binding.chat_id !== "string" || !CHAT_SHAPE.test(binding.chat_id)) {
+      if (typeof binding.chat_id !== "string" || !shape("CHAT_SHAPE").test(binding.chat_id)) {
         blockers.push({ code: "target_incomplete", binding_id: binding.binding_id, channel_generation_id: generation.channel_generation_id, detail: "chat_id 受验形状不过" });
         continue;
       }
-      if (typeof generation.root_message_id !== "string" || !OM_SHAPE.test(generation.root_message_id)) {
+      if (typeof generation.root_message_id !== "string" || !shape("OM_SHAPE").test(generation.root_message_id)) {
         blockers.push({ code: "root_om_missing", binding_id: binding.binding_id, channel_generation_id: generation.channel_generation_id, detail: "generation.root_message_id 缺席或形状不过" });
         continue;
       }
-      if (!LINEAGE_SHAPE.test(binding.binding_id)) {
+      if (!shape("LINEAGE_SHAPE").test(binding.binding_id)) {
         blockers.push({ code: "target_incomplete", binding_id: binding.binding_id, channel_generation_id: generation.channel_generation_id, detail: "binding_id 形状越界（lineage 受验形状）" });
         continue;
       }

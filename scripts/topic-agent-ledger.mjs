@@ -18,6 +18,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+// M1a 真对账接入（rebase 合并点：main 裁定 cutover 不接调用方注入、真对账在本模块的
+// reconcileShadow 接）。T3a 是只读半区：reconcile/legacy-snapshot 只 import 本模块的
+// canonKey/sha256（函数级引用，ESM 循环安全），无任何写路径回流。
+import { reconcileLegacyEndpoint } from "./m1a/reconcile.mjs";
+import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot } from "./m1a/legacy-snapshot.mjs";
+
 import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhileHeld } from "./registry.mjs";
 import { isCanonicalIso, canonicalIso, isCanonicalMs } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "./claim.mjs";
@@ -807,11 +813,27 @@ function virginInventory(dir) {
 }
 
 /** 机器级初始化收据（B-3 的最小投影：aggregate 全量收据属第 2 块另一分支）：扫描维护目录 journal，看该 endpoint 是否已被初始化 / 已切权威。 */
-/** 门内双射对账接口（§8/§5 cutover 前置）——M1a 未接真对账，fail-closed 恒拒 reconciler_absent。
- *  评审 P1-4：不接受调用方注入的 reconciler（否则旁路可自行对账），真对账接入时在此接，且必须经 capability 门。
+/** 门内双射对账接口（§8/§5 cutover 前置）——M1a T3a 已放行，此处接真对账（严格只读双射）。
+ *  评审 P1-4：不接受调用方注入的 reconciler（否则旁路可自行对账）；真对账在本函数内闭包，
+ *  调用点（planOf）已在维护 capability 门内。legacy 采集参数按 machineContext 同款 env/home
+ *  派生（FEISHU_BRIDGE_REGISTRY / FEISHU_BRIDGE_CHAIN_TEMPLATE || chain-config.json /
+ *  FEISHU_CODEX_BRIDGE_HOME），不读调用方自述。
  */
 export function reconcileShadow({ endpointId, shadowDoc } = {}) {
-  return { ok: false, reason: "reconciler_absent", why: "双射对账器未接入，cutover fail-closed" };
+  if (!endpointId || !shadowDoc || typeof shadowDoc !== "object" || typeof shadowDoc.chain !== "string") {
+    return { ok: false, reason: "reconciler_rejected", why: "reconcileShadow 参数缺失（endpointId / shadowDoc.chain）" };
+  }
+  const home = process.env.HOME || os.homedir();
+  const bridge = path.join(home, ".claude", "feishu-bridge");
+  const codexHome = process.env.CODEX_HOME || path.join(home, ".codex");
+  const chain = shadowDoc.chain;
+  const collectLegacy = chain === "claude"
+    ? () => collectClaudeLegacySnapshot({ registryFile: process.env.FEISHU_BRIDGE_REGISTRY || path.join(bridge, "registry.json"), templateFile: process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE || path.join(bridge, "chain-config.json") })
+    : () => collectCodexLegacySnapshot({ home: process.env.FEISHU_CODEX_BRIDGE_HOME || path.join(codexHome, "feishu-bridge") });
+  const r = reconcileLegacyEndpoint({ endpointId, chain, collectLegacy, loadLedgerFn: () => ({ ok: true, doc: shadowDoc }) });
+  if (r.ok === true) return { ok: true, digest: r.digest };
+  if (r.ok === null) return { ok: false, reason: r.reason, why: r.why ?? "对账不可判（snapshot_moved）" };
+  return { ok: false, reason: r.reason, why: r.why ?? null };
 }
 
 /** 评审 P2：T4 切权威计划对账验证——校验 cutover 蓝图是否把对账 digest 封闭绑定到 intended_after

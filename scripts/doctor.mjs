@@ -501,15 +501,20 @@ export function runDoctor({
     if (dir === null) {
       add("m1a_shadow_reconcile", "⑭ M1a 影子对账", null, "家目录查不出来，收据目录未知", null);
     } else {
+      const prep = preparedLedgerInits({ dir });
       const agg = aggregateEndpointReceipts({ dir });
-      if (!agg.ok) {
+      // main 侧 judgeLedgerReceipt 更紧：裸 prepared WAL（无 done 终态）在聚合面折 conflict → agg.ok=false。
+      // prepared 专项红（B-2 恢复矩阵）因此**先于聚合 fail** 检出，否则会被顶层「收据 fail-closed」吞掉专项提示。
+      if (prep.ok && prep.prepared.length > 0) {
+        const p0 = prep.prepared[0];
+        add("m1a_shadow_reconcile", "⑭ M1a 影子对账", false,
+          "初始化 WAL 未完成（token " + p0.token.slice(0, 8) + "，phase " + p0.phase + "）—— 按 B-2 恢复矩阵只允许同 token 恢复，禁止重初始化", null);
+      } else if (!prep.ok) {
+        add("m1a_shadow_reconcile", "⑭ M1a 影子对账", false, "init WAL 判定 fail-closed（" + prep.why + "）", null);
+      } else if (!agg.ok) {
         add("m1a_shadow_reconcile", "⑭ M1a 影子对账", false,
           "收据 fail-closed（" + (agg.unreadable.length > 0 ? agg.unreadable.length + " 个 journal 读不出，如 " + agg.unreadable[0].token.slice(0, 8) : agg.why) + "）", null);
       } else {
-        const prep = preparedLedgerInits({ dir });
-        if (!prep.ok) {
-          add("m1a_shadow_reconcile", "⑭ M1a 影子对账", false, "init WAL 判定 fail-closed（" + prep.why + "）", null);
-        } else {
           const findings = [];
           const parts = [];
           const preparedBy = new Map(prep.prepared.map((p) => [p.endpointId, p]));
@@ -641,7 +646,6 @@ export function runDoctor({
         }
       }
     }
-  }
 
   // ── 汇总：任一 false → blocked；无 false 有 null → incomplete；全 true → ready
   const overall = checks.some((c) => c.ok === false) ? "blocked"

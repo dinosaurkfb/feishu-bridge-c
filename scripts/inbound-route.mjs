@@ -365,12 +365,18 @@ export function evaluatePromotion({ event, template, pending, now = Date.now(), 
     return reject(PROMOTE_REJECT.CHAT_MISMATCH, { chat: envChat, expected: bindingChat });
   }
 
+  // P1-2 收尾：认领校验处**真核**并产出封闭 F4 产物（matched_om=被认领代际根消息 om；matched_fields=标准
+  //   四项），供 wirePromoteBinding 只消费不自铸。generation.root_message_id 缺失（无受验 thread_root 锚）
+  //   → f4=null —— wirePromoteBinding 侧 bad_f4 fail-closed、不写配对证明。不经 env 取 thread/root。
+  const matchedOm = (typeof pending.generation?.root_message_id === "string" && pending.generation.root_message_id.length > 0)
+    ? pending.generation.root_message_id : null;
   return {
     ok: true,
     root: pending.root,
     id: pending.id,
     source: pending.source,
     generationId: pending.generationId,
+    f4: matchedOm ? { matched_om: matchedOm, matched_fields: ["chat_id", "sender", "body", "thread_root"] } : null,
   };
 }
 

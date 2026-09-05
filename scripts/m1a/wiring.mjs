@@ -25,6 +25,15 @@ import { legacyEndpointId } from "../subscription.mjs";
 
 const en = (v) => typeof v === "string" && v.length > 0 && v.length <= 256;
 
+/* P1-2 收尾：F4 封闭四项 —— wirePromoteBinding 只**消费**认领校验处受验的 f4，不自铸。 */
+const F4_FIELDS = ["chat_id", "sender", "body", "thread_root"];
+const f4Ok = (f4, locator) =>
+  f4 && typeof f4 === "object"
+  && typeof f4.matched_om === "string" && f4.matched_om === locator
+  && Array.isArray(f4.matched_fields)
+  && f4.matched_fields.length === F4_FIELDS.length
+  && f4.matched_fields.every((v, i) => v === F4_FIELDS[i]);
+
 /* 逐 op request_key 派生（§5.1 通式；op_type 小写字母/数字/下划线）。 */
 function rk(opType, externalRequestId, entityId) {
   return requestKeyFor({ opType, externalRequestId, entityId });
@@ -161,7 +170,7 @@ export function wireBindClaim({ endpointId, env = process.env, legacy, claimKey,
  * 目标状态与 locator 对不上（如无 shadow 记录）/读不出）→ fail-closed，不猜。 */
 export function wirePromoteBinding({
   endpointId, env = process.env, legacy, locator, claimKey, sessionId, authorizedBy,
-  retargetClaudeSessionId = null, now = Date.now(),
+  retargetClaudeSessionId = null, f4 = null, now = Date.now(),
 }) {
   return runWired({ endpointId, env, legacy, submit: (legacyRes) => {
     if (!en(claimKey) || !en(sessionId) || !en(locator)) return [{ op: "promote", ok: false, reason: "bad_external_id", why: "claimKey/sessionId/locator 必填 1..256 字符串" }];
@@ -181,7 +190,10 @@ export function wirePromoteBinding({
       return [capture("retarget", retarget({ endpointId, requestKey: k.request_key, id: b1Id, expectedOldTarget: base, newTarget: { ...base, claude_session_id: retargetClaudeSessionId }, authorizedBy, now, env }))];
     }
     if (target.facts.binding !== "pending") return [{ op: "promote", ok: false, reason: "target_not_pending_or_active", why: "target.facts.binding=" + String(target.facts.binding) }];
-    // W1 引用码认领（B1 仍 pending）→ create_a1 → activate（标准四项 + 匹配根 om）。
+    // W1 引用码认领（B1 仍 pending）→ create_a1 → activate。P1-2 收尾：**只消费**认领校验处受验的
+    // 封闭 f4（matched_om===locator 且 matched_fields=标准四项）；拿不到受验产物/不符 → 该笔 shadow 拒
+    // （不写配对证明、不自铸）。任意 locator/owner 字符串不得 activate 出四项证明。
+    if (!f4Ok(f4, locator)) return [{ op: "promote", ok: false, reason: "bad_f4", why: "F4 必须是认领校验处受验的封闭产物（matched_om=locator 且 matched_fields=四项），wirePromoteBinding 只消费不铸造" }];
     const chatId = typeof target.chat_id === "string" ? target.chat_id : null;
     if (!en(chatId)) return [{ op: "create_a1", ok: false, reason: "bad_input", why: "target.chat_id 缺失" }];
     const kA1 = rk("create_a1", claimKey, sessionId);
@@ -190,7 +202,7 @@ export function wirePromoteBinding({
     if (!a1.ok) return [a1]; // create_a1 失败（如 locator 撞）→ 序列停（activate 需 a1Id）
     const kAct = rk("activate", claimKey, b1Id);
     if (!kAct.ok) return [a1, { op: "activate", ...kAct }];
-    return [a1, capture("activate", activate({ endpointId, requestKey: kAct.request_key, b1Id, a1Id: a1.result?.created_id, f4: { matched_om: locator, matched_fields: ["chat_id", "sender", "body", "thread_root"] }, authorizedBy, now, env }))];
+    return [a1, capture("activate", activate({ endpointId, requestKey: kAct.request_key, b1Id, a1Id: a1.result?.created_id, f4, authorizedBy, now, env }))];
   } });
 }
 

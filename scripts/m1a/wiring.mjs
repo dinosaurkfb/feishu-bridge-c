@@ -39,12 +39,9 @@ function capture(op, res) {
 }
 
 /* 外层排序锁骨架：legacy → shadow 序列 → 释放。
- * legacy 是权威、shadow 是 BestEffort：
- *  - binding_busy（另一写方持锁）= 合法性串行争用 → 整笔 binding_busy 拒、legacy 不跑；
- *  - 其余锁失败（root_absent/root_symlink/dir_*、maintenance/io_error/lock_residue/reap_* 等）
- *    = shadow 子系统建立不了锁段 → 仍跑 legacy（legacy 不因 shadow 缺席而丢），shadow 记 skipped；
- *  - shadow 序列里任一 op 失败 → 不回改 legacy 成功语义，shadow[i] 投影失败。 */
-// M1a 逐端点原子启用（#R37 裁定补充 §5）：判据是**收据状态**（endpointReceipt），不是运行时 root_absent。
+ * legacy 是权威；shadow 为镜像。已启用点任一取锁失败 → 整笔拒（skip 集为空，不降级）；
+ * 仅取得 outer **后** 的 shadow 后半程失败 → 保留已成立的 legacy 结果，shadow[i] 投影失败（mismatch 留 doctor）。 */
+// M1a 逐端点原子启用（#R37 裁定补充 §5）：判据是**收据状态**（endpointReceipt），不是运行时 root_absent，
 //   · never_initialized（无 done ledger_init）→ 合法 legacy-only：不取 outer、不写 shadow。
 //   · 收据/账本说不清（冲突/进行中/读不出）→ fail-closed：不得写 legacy-only。
 //   · state === "ok"（ledger_init done）→ 双写强制：**任一取锁失败都不得写 legacy**（错误名不能证明无并发写方）。
@@ -210,10 +207,6 @@ export function wireAttach({ endpointId, env = process.env, legacy, claimKey, id
   } });
 }
 
-/**
- * wireRotate —— rotate（建新代际）→ 账本 create_b1。
- * ext=rotation operation id（topic-generation 既有、持久）；entity=lineage id。
- */
 /**
  * wireRotate —— rotate（建新代际）→ 账本 create_b1。
  * ext=rotation operation id（topic-generation 既有、持久）；entity=lineage id。

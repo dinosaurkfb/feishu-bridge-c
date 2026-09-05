@@ -226,7 +226,7 @@ import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs"
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
-import { acquireOperationLease, addNote as addNoteJ, addStepPrepared as addStepPreparedJ, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, enterLedgerForward, journalProblem, readActive, readJournal, releaseOperationLease, setPhase as setPhaseJ, updateJournal, CUTOVER_JOURNAL_SCHEMA, SIDECAR_NAMES, legacy12CutoverDisposition, stagedIntendedFile } from "./maintenance/journal.mjs";
+import { acquireOperationLease, addNote as addNoteJ, addStepPrepared as addStepPreparedJ, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, enterLedgerForward, isLedgerReceipt, journalProblem, readActive, readJournal, releaseOperationLease, setPhase as setPhaseJ, updateJournal, CUTOVER_JOURNAL_SCHEMA, SIDECAR_NAMES, legacy12CutoverDisposition, stagedIntendedFile } from "./maintenance/journal.mjs";
 import { stageCutoverPlan, verifyStagedPlan, removeStagedPlan, planProblem as m1bPlanProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
 import { renderExpirySidecar, renderPendingClaimsSidecar, renderPolicySidecar, readSidecarFile, validateSidecarDoc, SIDECAR_SCHEMAS } from "./m1b/sidecar-renderers.mjs";
 import * as LEDGER_OP from "./maintenance/ledger-operation.mjs";
@@ -28520,6 +28520,16 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     assert.ok(bad((d) => { S(d, "expiry").intended_blob.path = "/tmp/.." + UUID44 + ".staged/intended/expiry.json"; }), "intended_blob.path 含 .. 段拒");
     assert.ok(journalProblem({ ...doc13_44(), steps: doc13_44().steps.map((s) => s.kind === "sidecar" ? { ...s, intended_blob: { ...s.intended_blob, path: "/evil/" + UUID44 + ".staged/intended/" + s.id.split(":")[1] + ".json" } } : s) }, { maintenanceDir: "/tmp" }) !== null, "带维护目录时外指树拒");
     assert.equal(journalProblem(doc13_44(), { maintenanceDir: "/tmp" }), null, "维护目录前缀恰配（/tmp/<token>.staged）合法");
+    // 二轮 P1-1：1.3 是 ledger_cutover 专属判别支 —— 1.3 + 其它 kind 一律 unreadable（旧版 1.3+maintenance_gate+空 steps 过）。
+    assert.ok(journalProblem(doc13_44({ operation_kind: "maintenance_gate", steps: [] })) !== null, "1.3 + maintenance_gate + 空 steps 拒（专属判别支）");
+    assert.ok(journalProblem(doc13_44({ operation_kind: "ledger_init" })) !== null, "1.3 + ledger_init 拒");
+    // 二轮 P1-2：恰三条覆盖全部 forward-only cutover 阶段（cutting_over/reopening/reopening_incomplete/done），漏 reopening_incomplete 拒。
+    const doneLedger44 = mkLedger44({ state: "done", after: cutAfter44() });
+    const doneSidecars44 = () => threeSidecars44().map((s) => ({ ...s, state: "done", after: { exists: true, sha256: SHA44 } }));
+    assert.ok(journalProblem({ ...doc13_44(), phase: "reopening_incomplete", steps: [...enterDone44, doneLedger44] }) !== null, "reopening_incomplete 零 sidecar 拒（红：旧版只管 cutting_over/reopening/done）");
+    assert.ok(journalProblem({ ...doc13_44(), phase: "reopening_incomplete", steps: [...enterDone44, doneLedger44, doneSidecars44()[0], doneSidecars44()[2]] }) !== null, "reopening_incomplete 两条 sidecar 拒");
+    assert.equal(journalProblem({ ...doc13_44(), phase: "reopening_incomplete", steps: [...enterDone44, doneLedger44, ...doneSidecars44()] }), null, "reopening_incomplete 恰三条合法");
+    assert.ok(journalProblem({ ...doc13_44(), phase: "ledger_reopening", steps: [...enterDone44, doneLedger44, doneSidecars44()[0], doneSidecars44()[2]] }) !== null, "reopening 两条 sidecar 拒");
     // staged 路径导出与 shape 常量
     assert.equal(stagedIntendedFile({ dir: "/m", token: UUID44, name: "expiry" }), "/m/" + UUID44 + ".staged/intended/expiry.json", "stagedIntendedFile 路径");
   });
@@ -28555,15 +28565,38 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     fs.writeFileSync(path.join(intended, "stranger.txt"), "x");
     assert.equal(stageCutoverPlan({ dir, token: UUID44, plan, blobs }).reason, "staged_residue", "陌生文件 → staged_residue 拒");
     fs.rmSync(path.join(intended, "stranger.txt"));
-    const vr = verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarShas: plan.sidecars });
+    // 二轮 P1-5：锚 = 完整 {path,bytes,sha256}，与 journal 写的 sidecar.intended_blob 同形状
+    const anchors44 = () => Object.fromEntries(["expiry", "pending_claims", "policy"].map((k) => [k, { path: stagedIntendedFile({ dir, token: UUID44, name: k === "pending_claims" ? "pending-claims" : k }), bytes: blobs[k].length, sha256: shaOf44(blobs[k]) }]));
+    const vr = verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarAnchors: anchors44() });
     assert.equal(vr.ok, false, "缺件后锚驱动 verify 拒");
     assert.equal(stageCutoverPlan({ dir, token: UUID44, plan, blobs }).reason, "staged_residue", "缺件复验不过 → staged_residue（不复用）");
     assert.equal(removeStagedPlan({ dir, token: UUID44 }).ok, true, "残骸由 removeStagedPlan 清理（stage 不代清，拒即停）");
     assert.equal(stageCutoverPlan({ dir, token: UUID44, plan, blobs }).ok, true, "清后重 stage 成功（fresh 重写）");
     // 锚驱动 verify：全符 ok；篡改拒
-    assert.equal(verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarShas: plan.sidecars }).ok, true, "锚驱动 verify 全符 ok");
+    assert.equal(verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarAnchors: anchors44() }).ok, true, "锚驱动 verify 全符 ok");
     fs.appendFileSync(path.join(intended, "policy.json"), "x");
-    assert.equal(verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarShas: plan.sidecars }).reason, "staged_residue", "锚驱动 verify：篡改拒");
+    assert.equal(verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarAnchors: anchors44() }).reason, "staged_residue", "锚驱动 verify：篡改拒");
+    // 二轮 P1-5：锚三字段完整消费 —— bytes 与盘上实读不符拒、path 与内部重算规范路径不符拒。
+    const badBytes44 = { ...anchors44(), expiry: { ...anchors44().expiry, bytes: anchors44().expiry.bytes + 1 } };
+    assert.equal(verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarAnchors: badBytes44 }).reason, "staged_residue", "锚 bytes 与盘上不符拒（红：旧版只核 SHA）");
+    const badPath44 = { ...anchors44(), expiry: { ...anchors44().expiry, path: "/tmp/evil/expiry.json" } };
+    assert.equal(verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarAnchors: badPath44 }).reason, "staged_residue", "锚 path 与规范路径不符拒");
+    // 二轮 P1-3：逐层目录核 —— intended/ 或 <token>.staged/ 整个换成外指 symlink 在 verify 层拒（不只靠末级 O_NOFOLLOW）。
+    const realIntended = path.join(dir, UUID44 + ".staged", "intended");
+    fs.rmSync(realIntended, { recursive: true });
+    fs.symlinkSync("/tmp/evil-intended-r44r2", realIntended);
+    assert.equal(verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarAnchors: anchors44() }).reason, "staged_residue", "intended 换外指 symlink 拒（红：旧版 ok:true）");
+    fs.rmSync(realIntended);
+    fs.rmSync(path.join(dir, UUID44 + ".staged"), { recursive: true });
+    fs.symlinkSync("/tmp/evil-staged-r44r2", path.join(dir, UUID44 + ".staged"));
+    assert.equal(verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarAnchors: anchors44() }).reason, "staged_residue", "<token>.staged 换外指 symlink 拒");
+    fs.rmSync(path.join(dir, UUID44 + ".staged"));
+    assert.equal(removeStagedPlan({ dir, token: UUID44 }).ok, true, "residue 清后可重 stage");
+    assert.equal(stageCutoverPlan({ dir, token: UUID44, plan, blobs }).ok, true, "symlink 清后重 stage 成功");
+    // 二轮 P1-4：plan.json 自身受读端同一 1MiB 上限（建目录/写盘之前拒）。
+    const bigPlan44 = { ...plan, snapshot_identity: Array.from({ length: 20000 }, (_, i) => ({ source: "registry", path: "/tmp/r44-proj/registry-" + i + "-padding-padding-padding.json", sha256: null })) };
+    const bigR44 = stageCutoverPlan({ dir: mkTempDir44() + "/m2", token: UUID44, plan: bigPlan44, blobs });
+    assert.deepEqual([bigR44.ok, bigR44.reason], [false, "plan_mismatch"], "plan 超 1MiB 拒（红：旧版只限三 blob）");
     // 目录 mode 降级拒
     const base2 = mkTempDir44(); const dir2 = path.join(base2, "m"); fs.mkdirSync(dir2);
     stageCutoverPlan({ dir: dir2, token: UUID44, plan, blobs });
@@ -28636,6 +28669,9 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     // E 记录形状封闭（六字段）
     const eBad = renderExpirySidecar({ endpointId: EP44, bindings, E: new Map([[ta1, { ...eRec44(ta1, "lin1", "current"), extra: 1 }]]) });
     assert.ok(eBad.ok === false && eBad.reason === "legacy_unreadable", "期望记录字段集越界拒");
+    // 二轮 P2-2：Map key 与 record.topic_agent_id 身份相等；key===id 且 Map 键唯一 ⇒ 记录 ID 唯一
+    const eWrongKey = renderExpirySidecar({ endpointId: EP44, bindings, E: new Map([[ta2, eRec44(ta1, "lin1", "current")]]) });
+    assert.ok(eWrongKey.ok === false && eWrongKey.reason === "legacy_unreadable", "错 key 合法 value 拒（红：旧版只遍历 values）");
     const eLin = renderExpirySidecar({ endpointId: EP44, bindings: [bindings[0], { ...bindings[0] }], E: E1 });
     assert.ok(eLin.ok === false && eLin.reason === "legacy_unreadable", "lineage 双投影拒（必须恰一）");
     // pending-claims：仅 B1；token/claim 取值；蕴含 token===null ⇒ claim===null
@@ -28732,6 +28768,30 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     fs.writeFileSync(path.join(base, "bad.json"), "{not json", { mode: 0o600 });
     assert.ok(readSidecarFile({ file: path.join(base, "bad.json"), endpointId: EP44, name: "expiry" }).why !== undefined, "非 JSON 拒");
     assert.ok(readSidecarFile({ file: path.join(base, "absent.json"), endpointId: EP44, name: "expiry" }).reason !== undefined, "缺席 → sidecar_unreadable");
+  });
+
+  test("#R44 二轮 P2-1：1.3 done 收据进共用识别面（isLedgerReceipt + endpointReceipt 聚合）", () => {
+    // 行为验证：init（1.2）+ cutover（1.3）双双 done 落盘 → endpointReceipt ok；缺 1.3 识别时旧版把 cutover 收据聚合为 never_initialized 且目录盘点报 orphan
+    const base = mkTempDir44();
+    const dir = path.join(base, "m");
+    fs.mkdirSync(dir);
+    const UUID44B = "88888888-8888-4888-8888-888888888888";
+    const retarget = (s) => s.kind === "stub" || s.kind === "current"
+      ? { ...s, target: String(s.target).replaceAll(UUID44, UUID44B), intended_after: typeof s.intended_after === "string" ? s.intended_after.replaceAll(UUID44, UUID44B) : s.intended_after, after: typeof s.after === "string" ? s.after.replaceAll(UUID44, UUID44B) : s.after }
+      : s.kind === "gate" ? { ...s, intended_after: { token: UUID44B }, after: { token: UUID44B, txnUncleared: null } }
+      : s;
+    const initState44 = () => ({ endpoint_id: EP44, operation_id: UUID44B, fingerprint: SHA44, authority_mode: null, revision: null, ledger_sha256: null });
+    const initAfter44 = () => ({ endpoint_id: EP44, operation_id: UUID44B, fingerprint: SHA44, authority_mode: "shadow", revision: 1, ledger_sha256: SHA44 });
+    const initDone = { schema_version: "1.2", operation_kind: "ledger_init", token: UUID44B, reason: "r44", started_at: ISO44(NOW44), updated_at: ISO44(NOW44), phase: "done", steps: [...enterDone44.map(retarget), { id: "ledger:" + EP44 + ":init", kind: "ledger", target: EP44, backup: null, backup_sha256: null, backup_bytes: null, before: initState44(), intended_after: initAfter44(), after: initAfter44(), state: "done", at: ISO44(NOW44), chain: "claude" }], notes: [] };
+    const cutoverDone = doc13_44({ phase: "done", steps: [...enterDone44, mkLedger44({ state: "done", after: cutAfter44() }), ...threeSidecars44().map((s) => ({ ...s, state: "done", after: { exists: true, sha256: SHA44 }, intended_blob: { ...s.intended_blob, path: path.join(dir, UUID44 + ".staged", "intended", s.id.split(":")[1] + ".json") } }))] });
+    fs.writeFileSync(path.join(dir, UUID44B + ".json"), Buffer.from(stableStringify(initDone, 2) + "\n", "utf-8"), { mode: 0o600 });
+    fs.writeFileSync(path.join(dir, UUID44 + ".json"), Buffer.from(stableStringify(cutoverDone, 2) + "\n", "utf-8"), { mode: 0o600 });
+    const rc13 = readJournal({ dir, token: UUID44, maintenanceDir: dir });
+    assert.equal(rc13.state, "valid", "1.3 done journal 本身可读（带维护目录强核）");
+    assert.equal(isLedgerReceipt(cutoverDone), true, "isLedgerReceipt 认 1.3 done（红：旧版只认 1.2）");
+    assert.equal(isLedgerReceipt(initDone), true, "isLedgerReceipt 认 1.2 init done（既有）");
+    const rec = endpointReceipt(dir, EP44);
+    assert.deepEqual([rec.ok, rec.state, rec.initDone, rec.cutoverDone], [true, "ok", true, true], "1.3 done 收据参与聚合 → ok（红：旧版 never_initialized + orphan）");
   });
 }
 

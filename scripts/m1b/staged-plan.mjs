@@ -105,20 +105,40 @@ export function readStagedVerified(file, { sha256, bytes = null } = {}) {
  * 按 journal 锚复验 staged 四件：plan.json 的 SHA + 三个 blob 的 SHA（逐一受验读）。
  * 锚来自 journal（ledger step 的 plan_sha256 + 三 sidecar intended_after/intended_blob），不信任盘上 plan 自述。
  */
-export function verifyStagedPlan({ dir, token, planSha256, sidecarShas }) {
+export function verifyStagedPlan({ dir, token, planSha256, sidecarAnchors }) {
   const tokenProblem = tokenShapeProblem(token);
   if (tokenProblem !== null) return { ok: false, reason: "staged_residue", why: tokenProblem };
-  const intended = path.join(dir, stagedDirFor(token), "intended");
+  // 二轮 P1-3：恢复路径逐层核 —— <token>.staged 与 intended 都必须是普通目录、精确 0700、无 symlink，
+  // 且 canonical realpath 落在本 operation 私有目录内（把 intended/ 或 staged/ 整个换成外指 symlink 在这里拒，
+  // 不只靠末级文件的 O_NOFOLLOW）。
+  let intended = null;
+  try {
+    const realDir = fs.realpathSync(dir);
+    const realStaged = path.join(realDir, stagedDirFor(token));
+    const st = fs.lstatSync(realStaged);
+    if (st.isSymbolicLink() || !st.isDirectory() || (st.mode & 0o777) !== 0o700) return { ok: false, reason: "staged_residue", why: "<token>.staged 不是 0700 普通目录" };
+    if (fs.realpathSync(realStaged) !== realStaged) return { ok: false, reason: "staged_residue", why: "<token>.staged 的 realpath 不在私有目录内" };
+    intended = path.join(realStaged, "intended");
+    const si = fs.lstatSync(intended);
+    if (si.isSymbolicLink() || !si.isDirectory() || (si.mode & 0o777) !== 0o700) return { ok: false, reason: "staged_residue", why: "intended 不是 0700 普通目录" };
+    if (fs.realpathSync(intended) !== intended) return { ok: false, reason: "staged_residue", why: "intended 的 realpath 不在私有目录内" };
+  } catch (err) { return { ok: false, reason: "staged_residue", why: "staged 目录核：" + errCode(err) }; }
   let names = [];
   try { names = fs.readdirSync(intended).sort(); } catch (err) { return { ok: false, reason: "staged_residue", why: "intended 目录读不出：" + errCode(err) }; }
   const want = [PLAN_FILE, ...Object.values(BLOB_FILE).map((n) => n + ".json")];
   if (JSON.stringify(names) !== JSON.stringify(want.slice().sort())) return { ok: false, reason: "staged_residue", why: "intended 里不是恰四件：" + names.join(",") };
   const p = readStagedVerified(path.join(intended, PLAN_FILE), { sha256: planSha256 });
   if (!p.ok) return { ok: false, reason: "staged_residue", why: "plan.json：" + p.why };
+  // 二轮 P1-5：消费完整 {path,bytes,sha256} 锚 —— path 必须词法等于内部重算的规范路径、fd 实读长度必须等于 bytes、SHA 相等。
+  // 只核 SHA 的旧写法放过了 bytes:999 这类与 journal 锚不一致的残骸。
   for (const [k, fileBase] of Object.entries(BLOB_FILE)) {
-    const wantSha = sidecarShas?.[k]?.sha256;
-    if (!(typeof wantSha === "string" && SHA_SHAPE.test(wantSha))) return { ok: false, reason: "staged_residue", why: k + " 的锚 SHA 缺失或形状不对" };
-    const r = readStagedVerified(path.join(intended, fileBase + ".json"), { sha256: wantSha });
+    const a = sidecarAnchors?.[k];
+    if (!(a && typeof a === "object" && !Array.isArray(a))) return { ok: false, reason: "staged_residue", why: k + " 的锚缺失" };
+    if (typeof a.path !== "string" || !path.isAbsolute(a.path)) return { ok: false, reason: "staged_residue", why: k + " 的锚 path 不是绝对路径" };
+    if (a.path !== stagedIntendedFile({ dir, token, name: k === "pending_claims" ? "pending-claims" : k })) return { ok: false, reason: "staged_residue", why: k + " 的锚 path 与内部规范路径不符" };
+    if (!Number.isSafeInteger(a.bytes) || a.bytes < 0) return { ok: false, reason: "staged_residue", why: k + " 的锚 bytes 不是非负安全整数" };
+    if (!(typeof a.sha256 === "string" && SHA_SHAPE.test(a.sha256))) return { ok: false, reason: "staged_residue", why: k + " 的锚 SHA 缺失或形状不对" };
+    const r = readStagedVerified(path.join(intended, fileBase + ".json"), { sha256: a.sha256, bytes: a.bytes });
     if (!r.ok) return { ok: false, reason: "staged_residue", why: fileBase + ".json：" + r.why };
   }
   return { ok: true };
@@ -144,6 +164,8 @@ export function stageCutoverPlan({ dir, token, plan, blobs }) {
     if (actual !== plan.sidecars[k].sha256) return { ok: false, reason: "plan_mismatch", why: fileBase + " 字节 SHA 与 plan.sidecars." + k + ".sha256 不符" };
   }
   const planBytes = Buffer.from(stableStringify(plan, 2) + "\n", "utf-8");
+  // 二轮 P1-4：plan.json 自身也受读端同一上限约束 —— 超限拒在建目录/写文件之前，不给盘上留下读取端必拒的物。
+  if (planBytes.length > SIDECAR_MAX_BYTES) return { ok: false, reason: "plan_mismatch", why: "plan 超过 1MiB（" + planBytes.length + " 字节）" };
   const planSha = sha256Hex(planBytes);
   const staged = path.join(dir, stagedDirFor(token));
   const intended = path.join(staged, "intended");
@@ -158,7 +180,9 @@ export function stageCutoverPlan({ dir, token, plan, blobs }) {
   let existing = [];
   try { existing = fs.readdirSync(intended).sort(); } catch (err) { return { ok: false, reason: "io_error", why: "读 intended：" + errCode(err) }; }
   if (existing.length > 0) {
-    const v = verifyStagedPlan({ dir, token, planSha256: planSha, sidecarShas: plan.sidecars });
+    // 二轮 P1-5：复验走完整锚（path 词法重算 + 盘上真实 bytes + plan.sidecars SHA），与 journal 锚驱动同一消费面。
+    const anchors = Object.fromEntries(["expiry", "pending_claims", "policy"].map((k) => [k, { path: stagedIntendedFile({ dir, token, name: k === "pending_claims" ? "pending-claims" : k }), bytes: blobs[k].byteLength, sha256: plan.sidecars[k].sha256 }]));
+    const v = verifyStagedPlan({ dir, token, planSha256: planSha, sidecarAnchors: anchors });
     if (!v.ok) return { ok: false, reason: "staged_residue", why: v.why };
     // P1-4：复用成功前必须重新 fsync intended/ 目录 —— 首次写完四件但目录屏障失败后，
     // 重试只复验文件即 reused 会把「目录项未落盘」的窗口带进段提交。

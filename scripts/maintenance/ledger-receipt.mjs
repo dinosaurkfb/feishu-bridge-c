@@ -18,7 +18,7 @@
  * never_initialized ok:true 放行，doctor ⑬ 跳过）；且"进行中 WAL + 既有终态同种并存"在 same-token 分支被
  * 提前放行成 ok_in_progress（fail-open）。这里抽出**单一判据核心** `judgeLedgerReceipt`，两个入口共用。
  */
-import { JOURNAL_SCHEMA, LEGACY_JOURNAL_SCHEMA, listJournals, readJournal, TERMINAL_PHASES } from "./journal.mjs";
+import { JOURNAL_SCHEMA, CUTOVER_JOURNAL_SCHEMA, LEGACY_JOURNAL_SCHEMA, listJournals, readJournal, TERMINAL_PHASES } from "./journal.mjs";
 
 const LEDGER_KINDS = Object.freeze(["ledger_init", "ledger_cutover"]);
 const KIND_IS_INIT = Object.freeze({ ledger_init: true, ledger_cutover: false });
@@ -80,7 +80,8 @@ function collectLedgerReceipts({ dir }) {
   for (const token of list.tokens) {
     const j = readJournal({ dir, token });
     if (j.state !== "valid") { unreadable.push({ token, why: "journal " + j.state + (j.why ? "：" + j.why : "") }); continue; }
-    if (j.doc.schema_version !== JOURNAL_SCHEMA) continue; // 旧 1.1，按既有种读、不参与索引（评审 P2-1）
+    // 二轮 P2-1：1.3 done 收据与 1.2 同一识别面（1.3 非 cutover 已被 journalProblem 判别支拦死，能走到这里的 1.3 必是 cutover）。
+    if (j.doc.schema_version !== JOURNAL_SCHEMA && j.doc.schema_version !== CUTOVER_JOURNAL_SCHEMA) continue; // 旧 1.1，按既有种读、不参与索引（评审 P2-1）
     if (!LEDGER_KINDS.includes(j.doc.operation_kind)) continue;
     const ep = endpointOf(j.doc);
     if (ep === null) continue;

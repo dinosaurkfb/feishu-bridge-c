@@ -300,16 +300,15 @@ export function journalProblem(doc, { maintenanceDir } = {}) {
     : "notes,phase,reason,schema_version,started_at,steps,token,updated_at";
   if (keysOf(doc) !== fieldset) return "字段集不对";
   if ((is12 || is13) && !OPERATION_KINDS.includes(doc.operation_kind)) return "operation_kind 不在封闭集合里：" + String(doc.operation_kind);
+  // 二轮 P1-1：1.3 是 ledger_cutover 的专属判别支 —— 非 cutover 操作一律按 1.2 记账，1.3 遇到它们即不可达态 → unreadable。
+  if (is13 && doc.operation_kind !== "ledger_cutover") return "1.3 是 ledger_cutover 专属判别支（" + doc.operation_kind + " 按 1.2 记账）";
   if (typeof doc.token !== "string" || !UUID_SHAPE.test(doc.token)) return "token 不是 UUID 字符串";
   if (typeof doc.reason !== "string" || [...doc.reason].length > 80) return "reason 不是 ≤ 80 码点的字符串";
   if (!isCanonicalIso(doc.started_at) || !isCanonicalIso(doc.updated_at)) return "时间不是规范化 ISO";
   // P1-7：阶段 × operation_kind 封闭（1.1 冻结为非账本阶段；ledger_init 不得进入 ledger_cutting_over，反之亦然）。
   const isLedgerKind = (is12 || is13) && (doc.operation_kind === "ledger_init" || doc.operation_kind === "ledger_cutover");
   const allowed = is13
-    ? (doc.operation_kind === "ledger_init" ? LEDGER_INIT_PHASES
-      : doc.operation_kind === "ledger_cutover" ? LEDGER_CUTOVER_PHASES
-      : doc.operation_kind === "maintenance_gate" ? GATE_ONLY_PHASES
-      : INSTALL_PHASES)
+    ? LEDGER_CUTOVER_PHASES
     : !is12 ? INSTALL_PHASES
     : doc.operation_kind === "ledger_init" ? LEDGER_INIT_PHASES
     : doc.operation_kind === "ledger_cutover" ? LEDGER_CUTOVER_PHASES
@@ -394,8 +393,9 @@ export function journalProblem(doc, { maintenanceDir } = {}) {
   if (is13 && doc.operation_kind === "ledger_cutover") {
     const sidecars = doc.steps.filter((s) => s.kind === "sidecar");
     const names = sidecars.map((s) => s.id.slice("sidecar:".length).split(":")[0]).sort().join(",");
-    // P1-1（maintenance-gate.md 阶段表）：进入 ledger_cutting_over 起恰三条（≤drained 零条已在上分支核）；零条只合法于 drained 及更早。
-    if (doc.phase === "ledger_cutting_over" || doc.phase === "ledger_reopening" || doc.phase === "done") {
+    // P1-1（maintenance-gate.md 阶段表）+ 二轮 P1-2：进入 ledger_cutting_over 起恰三条（≤drained 零条已在上分支核）；
+    // 零条只合法于 drained 及更早；forward-only 后所有阶段（cutting_over/reopening/reopening_incomplete/done）一律恰三。
+    if (doc.phase === "ledger_cutting_over" || doc.phase === "ledger_reopening" || doc.phase === "reopening_incomplete" || doc.phase === "done") {
       if (sidecars.length !== 3) return "进入 ledger_cutting_over 起必须恰三条 sidecar step，现在是 " + sidecars.length;
       if (names !== "expiry,pending-claims,policy") return "sidecar 三元组不全或重复：" + names;
     }
@@ -653,7 +653,8 @@ export function listJournals({ dir } = {}) {
  * 例外（M1 账本接入 B-3）：`ledger_init(done)` / `ledger_cutover(done)` 的 journal 是**合法永久收据**、不是 orphan，不染红。
  */
 export function isLedgerReceipt(doc) {
-  return doc?.schema_version === JOURNAL_SCHEMA
+  // 二轮 P2-1：1.3 done 收据与 1.2 同为合法永久收据（1.3 + 非 cutover 已被 journalProblem 判别支拦死，能走到这里的 1.3 必是 cutover）。
+  return (doc?.schema_version === JOURNAL_SCHEMA || doc?.schema_version === CUTOVER_JOURNAL_SCHEMA)
     && (doc.operation_kind === "ledger_init" || doc.operation_kind === "ledger_cutover")
     && doc.phase === "done";
 }

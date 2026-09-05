@@ -60,9 +60,12 @@ function renderSidecar({ endpointId, bindings, E, name, buildEntries }) {
   if (!Array.isArray(bindings)) return unreadable("bindings 不是数组");
   if (!(E instanceof Map)) return unreadable("E 不是 Map");
   const perRecord = [];
-  for (const rec of E.values()) {
+  // 二轮 P2-2：核 Map key 与 record.topic_agent_id 身份相等 —— 错 key 合法 value 不再照渲染；
+  // key===id 且 Map 键唯一，记录 ID 唯一由之蕴含。
+  for (const [key, rec] of E.entries()) {
     const p = eRecordProblem(rec);
     if (p !== null) return unreadable(p);
+    if (key !== rec.topic_agent_id) return unreadable("E 的键与记录 topic_agent_id 不一致：" + String(key));
     const b = bindingByLineage(bindings, rec.generation_lineage_id);
     if (!b.ok) return unreadable(b.why);
     perRecord.push({ rec, binding: b.binding });

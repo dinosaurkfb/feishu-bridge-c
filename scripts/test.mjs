@@ -5315,6 +5315,10 @@ test("P1-2 F4：四维真实匹配（正确 chat + @ + 绑定码 + 单份 pendin
     event: okEvent, template: TPL, pending, now: NOW2,
     env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id } });
   assert.equal(r.ok, true, JSON.stringify(r));
+  // P1-2 收尾：认领校验处产出封闭 f4（matched_om=被认领根 om；标准四项），供 wirePromoteBinding 只消费。
+  assert.equal(typeof r.f4, "object", "产出封闭 f4 产物：" + JSON.stringify(r.f4));
+  assert.equal(typeof r.f4.matched_om, "string", "matched_om=被认领根消息 om");
+  assert.deepEqual(r.f4.matched_fields, ["chat_id", "sender", "body", "thread_root"], "标准四项（G15 封闭四项）");
 });
 
 test("P1-2 F4：chat 不匹配（env 是别的群）→ 拒（不能把 pending 从错误群里绑过来）", () => {
@@ -25599,7 +25603,7 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     {
       talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", rootOm: "om_prom", lineageId: "lin_prom", bindingTarget: TGT }), "B1 前置（pending）");
       const b1Id = famIds(talLoad(dir), "B1").pop();
-      const w = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: legacyRec("promote1"), locator: "om_prom", claimKey: claim("p"), sessionId: "sess_p", authorizedBy: "ou_o" });
+      const w = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: legacyRec("promote1"), locator: "om_prom", claimKey: claim("p"), sessionId: "sess_p", authorizedBy: "ou_o", f4: F4("om_prom") });
       assert.ok(w.ok, "W1 ok：" + JSON.stringify(w));
       assert.deepEqual(w.shadow.map((s) => s.op), ["create_a1", "activate"], "固定顺序：create_a1 → activate");
       assert.ok(w.shadow[0].ok && w.shadow[1].ok, "两笔都成功：" + JSON.stringify(w.shadow));
@@ -25636,6 +25640,29 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
       assert.equal(w.shadow[0].op, "promote", "投影 op 名");
       assert.equal(w.shadow[0].ok, false, "shadow fail-closed");
       assert.equal(w.shadow[0].reason, "locator_absent", "locator 无影记录→locator_absent（不猜）");
+    }
+
+    // ④ 红探针（P1-2 收尾）：任意 locator/owner 字符串——即使 locator 命中一个真实 pending B1、且
+    //    owner 任意——没有受验 f4（这里 f4 缺省=null）→ 该笔 shadow 拒（bad_f4）、不写配对证明、不归并。
+    {
+      talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", rootOm: "om_red", lineageId: "lin_red", bindingTarget: TGT }), "B1（红探针）");
+      const redB1 = famIds(talLoad(dir), "B1").pop();
+      const before = legacyCalls;
+      const w = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: legacyRec("promote4"), locator: "om_red", claimKey: claim("q"), sessionId: "sess_q", authorizedBy: "ou_other" });
+      assert.ok(w.ok, "legacy 照常成功（shadow-only 红探针）：" + JSON.stringify(w));
+      assert.equal(legacyCalls, before + 1, "legacy 已跑");
+      assert.equal(w.shadow.length, 1, "一笔 shadow（fail-closed 投影）");
+      assert.equal(w.shadow[0].op, "promote", "投影 op=promote");
+      assert.equal(w.shadow[0].ok, false, "shadow fail-closed");
+      assert.equal(w.shadow[0].reason, "bad_f4", "无受验 f4 → bad_f4（不自铸配对证明）");
+      const rec = talLoad(dir).records[redB1];
+      assert.equal(TAL.familyOf(rec.facts), "B1", "未归并成 B3（无 activate）");
+      assert.equal(rec.binding_proof, null, "未写四项配对证明（binding_proof 仍 null）");
+
+      // ⑤ 红探针（matched_om 与 locator 不符）：受验 f4 的 matched_om 必须与 locator 一致——不一致→拒。
+      const w2 = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: legacyRec("promote5"), locator: "om_red", claimKey: claim("r2"), sessionId: "sess_q2", authorizedBy: "ou_o", f4: F4("om_other") });
+      assert.ok(w2.ok, "legacy 照常");
+      assert.equal(w2.shadow[0].reason, "bad_f4", "matched_om 与 locator 不符 → bad_f4");
     }
   }));
 

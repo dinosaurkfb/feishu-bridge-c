@@ -473,6 +473,7 @@ if (!routed.ok) {
     sessionId: event.session_id ?? null,
     authorizedBy: event.sender_id ?? null,
     retargetClaudeSessionId: null,
+    f4: promo.f4 ?? null,
   });
   if (!wired.ok) {
     // 双写强制下锁取不到（busy/maintenance/root_*/dir_*/lock_residue/reap_* 等）：整笔披、不写 legacy、没有绑定。

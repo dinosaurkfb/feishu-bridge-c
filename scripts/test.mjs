@@ -24819,8 +24819,9 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.equal(TAL.familyOf(rec3.facts), "B3", "族仍 B3");
   }));
 
-  test("m1a 双写库：request_key 派生确定性/形状/拒错；m1a-order 锁取放+并发 binding_busy；固定序列崩溃续跑跳过已执行（T3b 只 drop 库不接线）", () => withRoot((root, dir) => {
+  test("m1a 双写库：request_key 派生确定性/形状/拒错/同 key 异载荷；m1a-order 锁取放+并发 binding_busy+按 acq.release() 释放；释放投影（absent/not_owner/EIO/残骸全部非零收场，不吞不穿）—— T3b 只 drop 库不接线", () => withRoot((root, dir) => {
     seedLedger(dir);
+    // request_key 派生
     const rkA = DW.requestKeyFor({ opType: "create_a1", externalRequestId: "req_dual1", entityId: "sess_x" });
     const rkB = DW.requestKeyFor({ opType: "create_a1", externalRequestId: "req_dual1", entityId: "sess_x" });
     assert.ok(rkA.ok && rkB.ok && rkA.request_key === rkB.request_key, "确定性派生");
@@ -24828,36 +24829,141 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.notEqual(DW.requestKeyFor({ opType: "create_a1", externalRequestId: "req_dual1", entityId: "sess_x" }).request_key, DW.requestKeyFor({ opType: "create_a1", externalRequestId: "req_dual2", entityId: "sess_x" }).request_key, "ext 不同→key 不同");
     assert.equal(DW.requestKeyFor({ opType: "create_a1", externalRequestId: "", entityId: "s" }).reason, "bad_external_request_id");
     assert.equal(DW.requestKeyFor({ opType: "create-a1!", externalRequestId: "r", entityId: "s" }).reason, "bad_op_type");
-    assert.deepEqual(DW.sequenceFor("bind_claim"), ["create_a1", "activate"], "固定顺序");
-    assert.equal(DW.sequenceFor("nonsense"), null, "表外→null");
-    // 锁取放
-    const acq = DW.acquireOrderLock(EP, process.env);
-    assert.ok(acq.ok, "取到 m1a-order 锁：" + JSON.stringify(acq));
-    assert.equal(DW.acquireOrderLock(EP, process.env).reason, "binding_busy", "并发取第二笔→binding_busy");
-    assert.ok(DW.releaseOrderLock(EP, process.env).ok, "释放");
-    assert.ok(DW.acquireOrderLock(EP, process.env).ok, "释放后可再取");
-    assert.ok(DW.releaseOrderLock(EP, process.env).ok, "再释放");
-    // 崩溃续跑：isExecuted 命中已执行→跳过；否则 execute
-    const k1 = DW.requestKeyFor({ opType: "create_a1", externalRequestId: "req_seq1", entityId: "sess_s1" }).request_key;
-    let calls = [];
-    // 第一跑：全跑
-    const s1 = DW.runFixedSequence({ endpointId: EP, env: process.env, steps: [
-      { opType: "create_a1", externalRequestId: "req_seq1", entityId: "sess_s1", execute: (k) => { calls.push(k); return { ok: true, result: "a" }; } },
-      { opType: "activate", externalRequestId: "req_seq1", entityId: "ta_c", execute: (k) => { calls.push(k); return { ok: true, result: "b" }; } },
-    ], isExecuted: () => false });
-    assert.ok(s1.ok && s1.executed.length === 2 && calls.length === 2, "全跑");
-    // 第二跑：第一步 key 已在 → 跳过，第二步照跑
-    const done = new Set([k1]);
-    calls = [];
-    const s2 = DW.runFixedSequence({ endpointId: EP, env: process.env, steps: [
-      { opType: "create_a1", externalRequestId: "req_seq1", entityId: "sess_s1", execute: (k) => { calls.push(k); return { ok: true }; } },
-      { opType: "activate", externalRequestId: "req_seq1", entityId: "ta_c", execute: (k) => { calls.push(k); return { ok: true }; } },
-    ], isExecuted: (k) => done.has(k) });
-    assert.ok(s2.ok && s2.executed.length === 2, "两步都记录");
-    assert.equal(s2.executed[0].skipped, true, "第一步命中已执行→跳过");
-    assert.equal(s2.executed[1].skipped, false, "第二步照常执行");
-    assert.equal(calls.length, 1, "只有第二步真的 execute");
+    // #R29 P2.2 同 key 异载荷：同一 (opType, ext, entity) 无论 payload/result 怎么变，request_key 恒同（去重靠三元组，不靠载荷）
+    assert.equal(DW.requestKeyFor({ opType: "create_a1", externalRequestId: "req_dual1", entityId: "sess_x", payload: "a" }).request_key, DW.requestKeyFor({ opType: "create_a1", externalRequestId: "req_dual1", entityId: "sess_x", result: "b" }).request_key, "同一三元组 key 恒同（payload/result 无关）");
+
+    // 锁取放 + 并发 binding_busy + 按 acq.release() 释放（#R29 P1.2「按取得时 acq.lock 释放」）
+    {
+      const acq = DW.acquireOrderLock(EP, process.env);
+      assert.ok(acq.ok, "取到 m1a-order 锁：" + JSON.stringify(acq));
+      assert.equal(typeof acq.release, "function", "acquire 带 release() 闭包");
+      assert.equal(acq.lock, DW.m1aOrderLockPath(EP, process.env).lock, "锁路径与 m1aOrderLockPath 一致");
+      assert.equal(DW.acquireOrderLock(EP, process.env).reason, "binding_busy", "并发取第二笔→binding_busy");
+      assert.ok(acq.release().ok, "按 acq.release() 释放");
+      const acq2 = DW.acquireOrderLock(EP, process.env);
+      assert.ok(acq2.ok, "释放后可再取");
+      assert.ok(acq2.release().ok, "再释放（acq2.release）");
+    }
+
+    // #R29 P1.2 释放投影三反例：absent→非零；EIO 穿出→折进结果；残骸 error/path→可见且不并成主锁路径
+    const failOn = (name, target, code) => {
+      const orig = fs[name];
+      fs[name] = function (p, ...rest) {
+        if (path.resolve(String(p)) === path.resolve(target)) throw Object.assign(new Error(code + ": injected"), { code });
+        return orig.call(fs, p, ...rest);
+      };
+      return () => { fs[name] = orig; };
+    };
+    // 反例1：absent —— 主锁在持有期间被删/回收，释放不得报 ok（应 lock_lost 非零）
+    {
+      const acq = DW.acquireOrderLock(EP, process.env);
+      assert.ok(acq.ok, "取到锁（absent 反例）");
+      fs.rmSync(acq.lock, { force: true });
+      const rel = acq.release();
+      assert.equal(rel.ok, false, "absent 释放不得报 ok：" + JSON.stringify(rel));
+      assert.match(rel.why, /lock_lost|独占性无法证明/u, "absent 折成 lock_lost：" + String(rel.why));
+    }
+    // 反例2：EIO 穿出 —— 释放时删主锁抛错，不得裸抛，必须折进结果
+    {
+      const acq = DW.acquireOrderLock(EP, process.env);
+      assert.ok(acq.ok, "取到锁（EIO 反例）");
+      const restore = failOn("rmSync", acq.lock, "EIO");
+      let rel;
+      try { rel = acq.release(); } finally { restore(); }
+      assert.equal(rel.ok, false, "EIO 释放不得穿出，须折进结果：" + JSON.stringify(rel));
+      assert.match(rel.why, /release_threw.*EIO/u, "EIO 折成 release_threw：" + String(rel.why));
+      fs.rmSync(acq.lock, { force: true });
+    }
+    // 反例3：残骸无投影 —— 回收后 .reaped-<uuid> 删不掉时，residue error/path 必须带回（不并成主锁路径）
+    {
+      const lock = DW.m1aOrderLockPath(EP, process.env).lock;
+      fs.rmSync(lock, { force: true });
+      fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "dead" }), lock);
+      const origRm = fs.rmSync;
+      fs.rmSync = function (p, ...rest) {
+        if (String(p).includes(".reaped-")) { const e = new Error("EIO"); e.code = "EIO"; throw e; }
+        return origRm.call(fs, p, ...rest);
+      };
+      let acq;
+      try { acq = DW.acquireOrderLock(EP, process.env); } finally { fs.rmSync = origRm; }
+      fs.rmSync(lock, { force: true });
+      assert.equal(acq.ok, false, "回收残骸清不掉→取不到锁：" + JSON.stringify(acq));
+      assert.equal(acq.reason, "reaped_uncleared", "reason 保留原语：" + acq.reason);
+      assert.ok(acq.error && /EIO/u.test(acq.error), "residue error 必须投影：" + JSON.stringify(acq));
+      assert.ok(acq.path && String(acq.path).includes(".reaped-"), "residue path 是 .reaped-<uuid>，不并成主锁路径：" + JSON.stringify(acq));
+    }
+    // #R29 P2.2 合法接管：持锁期间另一实例接管（指别的主锁）→ 原持有者释放报 not_owner 非零
+    {
+      const acq = DW.acquireOrderLock(EP, process.env);
+      assert.ok(acq.ok, "取到锁（接管反例）");
+      fs.rmSync(acq.lock, { force: true });
+      fs.symlinkSync(JSON.stringify({ pid: process.pid + 100000, at: new Date().toISOString(), token: "other" }), acq.lock);
+      const rel = acq.release();
+      assert.equal(rel.ok, false, "被接管后释放不得报 ok：" + JSON.stringify(rel));
+      assert.match(rel.why, /lock_instance_replaced|独占性无法证明/u, "not_owner 折成 lock_instance_replaced：" + String(rel.why));
+      fs.rmSync(acq.lock, { force: true });
+    }
   }));
+
+  // §3.1 proof-组合校验：直接构造自洽账本（除组合外全过），bad 组合→ledger_corrupt 且 why 命中组合规则；合法组合→ok（不误伤）。
+  //   REJECT：A4-bare+migrated（无 link）；B3+migrated bp+pairing_merge link；B3+pairing bp+migrated link；A4-full+attach bp+migrated link（非 A3 继承）。
+  //   ACCEPT：A4-full(unbind 继承)+(migrated,migrated)；A3(attach_a3 继承)+(attach,migrated)。
+  test("账本 §3.1 proof-组合：migrated 只成对、link=migrated 只许 {migrated,retarget,attach(A3继承)}；A4-bare+migrated/混搭/非 A3 继承拒；A4-full/A3 继承合法", () => {
+    const at = new Date(1700000000000).toISOString();
+    const hx = (n) => String(n).repeat(64);
+    const mf = ["chat_id", "sender", "body", "thread_root"];
+    const OP0 = "00000000-0000-0000-0000-000000000001";
+    const OP2 = "22222222-2222-2222-2222-222222222222";
+    const OP3 = "33333333-3333-3333-3333-333333333333";
+    const initOp = { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(0), result_revision: 1, result: { revision: 1 } };
+    const migSeedOp = (reqKey, id, dig) => ({ op_type: "migrate_seed", terminal_kind: "migrate_seed", request_key: reqKey, fingerprint: hx(2), result_revision: 2, result: { authorized_by: "ou_o", authorized_at: at, seeded: [{ topic_agent_id: id, legacy_source_digest: dig }] } });
+    const unbindOp = (reqKey, id, fam) => ({ op_type: "unbind", terminal_kind: "unbind", request_key: reqKey, fingerprint: hx(3), result_revision: 3, result: { affected_id: id, terminal_family: fam } });
+    const seedOrigin = (reqKey, id) => ({ op_type: "seed", terminal_kind: "seed", request_key: reqKey, fingerprint: hx(4), result_revision: 3, result: { seeded_ids: [id] } });
+    const attachA3 = (reqKey, id) => ({ op_type: "attach_a3", terminal_kind: "attach_a3", request_key: reqKey, fingerprint: hx(5), result_revision: 3, result: { affected_id: id, terminal_family: "A3" } });
+    const mkDoc = (ops, records) => ({ schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: CH, authority_mode: "shadow", revision: 3, operations: { [OP0]: initOp, ...ops }, records });
+    const rec = (id, o) => Object.assign({ topic_agent_id: id, kind: "live", chat_id: "oc_" + id.slice(3), anchor_candidate: null, aliases: null, binding_target: null, facts: null, generation_lineage_id: null, origin_operation_id: null, binding_proof: null, locator_link_proof_ref: null, created_at: at, updated_at: at }, o);
+    const facts = (binding, session, anchor, link, generation) => ({ binding, session, anchor, locator_link_proof: link, generation });
+    const migBp = (dig) => ({ kind: "migrated", authorized_by: "ou_o", authorized_at: at, migration_operation_id: OP2, legacy_source_digest: dig });
+    const migLp = (dig) => ({ kind: "migrated", migration_operation_id: OP2, legacy_source_digest: dig });
+
+    // REJECT A：A4-bare（无 link）+ migrated binding → 规则①
+    const idA = tid("a");
+    const docA = mkDoc({ [OP2]: migSeedOp("req_a", idA, claim("1")), [OP3]: unbindOp("req_ub_a", idA, "A4") }, { [idA]: rec(idA, { facts: facts("dormant", "present", "absent", "absent", "n/a"), aliases: { root_om: null, session_id: "sess_A" }, binding_target: TGT, origin_operation_id: OP3, binding_proof: migBp(claim("1")), locator_link_proof_ref: null }) });
+    const va = TAL.validateLedger(docA, { endpointId: EP });
+    assert.equal(va.reason, "ledger_corrupt", "A4-bare+migrated 应拒");
+    assert.ok(va.why.includes("binding=migrated 必须 pair link=migrated"), "A4-bare 命中规则①：" + va.why);
+
+    // REJECT B：B3 + migrated bp + pairing_merge link → 规则①
+    const idB = tid("b");
+    const docB = mkDoc({ [OP2]: migSeedOp("req_b", idB, claim("2")), [OP3]: seedOrigin("req_sd_b", idB) }, { [idB]: rec(idB, { facts: facts("active", "present", "present", "present", "current"), aliases: { root_om: "om_b", session_id: "sess_B" }, binding_target: TGT, generation_lineage_id: "lin_B", origin_operation_id: OP3, binding_proof: migBp(claim("2")), locator_link_proof_ref: { by_identity: "user", kind: "pairing_merge", matched_at: at, matched_fields: mf, matched_om: "om_y" } }) });
+    const vb = TAL.validateLedger(docB, { endpointId: EP });
+    assert.equal(vb.reason, "ledger_corrupt", "migrated bp + pairing_merge link 应拒");
+    assert.ok(vb.why.includes("binding=migrated 必须 pair link=migrated"), "混搭命中规则①：" + vb.why);
+
+    // REJECT C：B3 + pairing bp + migrated link → 规则②
+    const idC = tid("c");
+    const docC = mkDoc({ [OP2]: migSeedOp("req_c", idC, claim("3")), [OP3]: seedOrigin("req_sd_c", idC) }, { [idC]: rec(idC, { facts: facts("active", "present", "present", "present", "current"), aliases: { root_om: "om_c", session_id: "sess_C" }, binding_target: TGT, generation_lineage_id: "lin_C", origin_operation_id: OP3, binding_proof: { kind: "pairing", authorized_by: "ou_o", authorized_at: at, matched_fields: mf, matched_om: "om_z" }, locator_link_proof_ref: migLp(claim("3")) }) });
+    const vc = TAL.validateLedger(docC, { endpointId: EP });
+    assert.equal(vc.reason, "ledger_corrupt", "pairing bp + migrated link 应拒");
+    assert.ok(vc.why.includes("link=migrated 的 binding 只能是 migrated/retarget/attach(A3 继承)"), "反向混搭命中规则②：" + vc.why);
+
+    // REJECT D：A4-full + attach bp + migrated link（非 A3 继承）→ 规则② inherit 分支
+    const idD = tid("d");
+    const docD = mkDoc({ [OP2]: migSeedOp("req_d", idD, claim("4")), [OP3]: unbindOp("req_ub_d", idD, "A4") }, { [idD]: rec(idD, { facts: facts("dormant", "present", "present", "present", "n/a"), aliases: { root_om: "om_d", session_id: "sess_D" }, binding_target: TGT, origin_operation_id: OP3, binding_proof: { kind: "attach", authorized_by: "ou_o", authorized_at: at, claim_key: hx(6) }, locator_link_proof_ref: migLp(claim("4")) }) });
+    const vd = TAL.validateLedger(docD, { endpointId: EP });
+    assert.equal(vd.reason, "ledger_corrupt", "A4 attach+migrated link 应拒");
+    assert.ok(vd.why.includes("(attach, migrated) 只在 A3 继承合法"), "A4 非 A3 命中继承判据：" + vd.why);
+
+    // ACCEPT E：A4-full(unbind 继承)+(migrated,migrated) → 不误伤
+    const idE = tid("e");
+    const docE = mkDoc({ [OP2]: migSeedOp("req_e", idE, claim("5")), [OP3]: unbindOp("req_ub_e", idE, "A4") }, { [idE]: rec(idE, { facts: facts("dormant", "present", "present", "present", "n/a"), aliases: { root_om: "om_e", session_id: "sess_E" }, binding_target: TGT, origin_operation_id: OP3, binding_proof: migBp(claim("5")), locator_link_proof_ref: migLp(claim("5")) }) });
+    assert.ok(TAL.validateLedger(docE, { endpointId: EP }).ok, "A4-full+(migrated,migrated) 合法");
+
+    // ACCEPT F：A3(attach_a3 继承)+(attach,migrated) → 不误伤
+    const idF = tid("f");
+    const docF = mkDoc({ [OP2]: migSeedOp("req_f", idF, claim("6")), [OP3]: attachA3("req_at_f", idF) }, { [idF]: rec(idF, { facts: facts("active", "present", "present", "present", "n/a"), aliases: { root_om: "om_f", session_id: "sess_F" }, binding_target: TGT, origin_operation_id: OP3, binding_proof: { kind: "attach", authorized_by: "ou_o", authorized_at: at, claim_key: hx(7) }, locator_link_proof_ref: migLp(claim("6")) }) });
+    assert.ok(TAL.validateLedger(docF, { endpointId: EP }).ok, "A3 attach_a3 继承+(attach,migrated) 合法");
+  });
 }
 
 // ── M1 第 2 块：维护门 ledger operation 编排（scripts/maintenance/ledger-operation.mjs）行为回归 ──

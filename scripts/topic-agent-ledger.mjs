@@ -244,6 +244,38 @@ export function liveProblem(rec, id) {
   return null;
 }
 
+/** proof-组合校验器（§3.1 生命周期组合表）：证明**组合**，不只单 kind。
+ *   ① binding=migrated ⇒ 必有 link 且 link=migrated（migrated 只成对出现；
+ *      A4-bare 无 link 却带 migrated binding ⇒ 拒）。
+ *   ② link=migrated ⇒ binding ∈ {migrated, retarget, attach(仅 A3 继承)}；
+ *      (pairing|attach 非继承|null) + migrated link ⇒ 拒。
+ *   ③ (attach, migrated) 仅 A3 继承：family===A3 ∧ origin 指向 attach_a3 且 result.affected_id===id
+ *      ∧ link 的 migration_operation_id 指向合法 migrate_seed/migrate_repair 且 result digest 逐字相符（G13-mig ①② 的 link 侧）。
+ */
+function proofCombinationProblem(rec, id, doc) {
+  const bpKind = rec.binding_proof?.kind ?? null;
+  const lpKind = rec.locator_link_proof_ref?.kind ?? null;
+  if (bpKind === "migrated" && lpKind !== "migrated") return "binding=migrated 必须 pair link=migrated";
+  if (lpKind === "migrated") {
+    if (bpKind !== "migrated" && bpKind !== "retarget" && bpKind !== "attach") return "link=migrated 的 binding 只能是 migrated/retarget/attach(A3 继承)";
+    if (bpKind === "attach") {
+      const fam = familyOf(rec.facts);
+      if (fam !== "A3") return "(attach, migrated) 只在 A3 继承合法";
+      const op = doc.operations[rec.origin_operation_id];
+      if (!op || op.op_type !== "attach_a3" || op.result?.affected_id !== id) return "(attach, migrated) 需 A3 继承 origin=attach_a3(affected_id=id)";
+      const lp = rec.locator_link_proof_ref;
+      const mop = doc.operations[lp.migration_operation_id];
+      if (!mop || (mop.op_type !== "migrate_seed" && mop.op_type !== "migrate_repair")) return "(attach, migrated) 的 link 未指向合法 migrate op";
+      if (mop.op_type === "migrate_seed") {
+        if (!mop.result.seeded.some((s) => s.topic_agent_id === id && s.legacy_source_digest === lp.legacy_source_digest)) return "(attach, migrated) 的 link 与 migrate_seed result 不符";
+      } else if (mop.result.repaired_id !== id || mop.result.legacy_source_digest !== lp.legacy_source_digest) {
+        return "(attach, migrated) 的 link 与 migrate_repair result 不符";
+      }
+    }
+  }
+  return null;
+}
+
 export function tombstoneProblem(rec, id) {
   if (!isObj(rec) || keysOf(rec) !== "forwards_to,kind,merged_at,origin_operation_id,proof_ref,topic_agent_id") return "tombstone 字段集不对";
   if (rec.topic_agent_id !== id || !isId(id)) return "tombstone id 不一致";
@@ -424,6 +456,12 @@ export function validateLedger(doc, { endpointId } = {}) {
     }
   }
   if (liveCount > MAX_LIVE) return bad("live 记录超上限");
+
+  // §3.1 proof-组合校验：绑定/link 证明的组合，不只看单个 kind（A4-bare+migrated、migrated+pairing_merge 等）。
+  for (const [id, rec] of live) {
+    const pc = proofCombinationProblem(rec, id, doc);
+    if (pc !== null) return bad(id + "：" + pc);
+  }
 
   // G13-mig / G13-repair（§5.1 唯一权威）：任一 migrated proof ⇒ 交叉不变量。
   //   G13-mig：migration_operation_id 指向 op_type∈{migrate_seed,migrate_repair} 的存在 op；seed 的 result.seeded 含本 id 且 digest 逐字相等

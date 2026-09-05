@@ -269,12 +269,14 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
 
 ## 5. M1a 双写（T3b）
 
-- **M1a 逐端点原子启用（裁定补充）**：endpoint **未进入 M1a**（持久收据明确
-  never_initialized）时按 legacy-only 正常运行——判据是**收据状态**，不得把运行时
-  root_absent 当同义词；ledger_init 完成、账本为合法 shadow 后，该端点**原子进入双写强制**；
-  收据/账本说不清 → fail-closed。
+- **M1a 逐端点原子启用（裁定，收据状态判定）**：启用判据是维护收据 `endpointReceipt(…,[ep])`
+  ——存在 `ledger_init` done 收据 → 已启用；**不在运行时用 root_absent 猜**。三态：
+  - `never_initialized`（无 ledger_init 收据）→ **合法 legacy-only**：不取 outer、不写 shadow。
+  - `state === "ok"`（ledger_init done）→ 该端点**原子进入双写强制**（锁纪律见下条）。
+  - 收据/账本读不清（冲突/进行中/foreign/无法解析）→ **fail-closed**：整笔拒、不写 legacy。
 - **外层排序锁无降级（裁定：可 skip 的失败集为空）**：已启用端点的全表写方必先取
-  `ledger/<ep>/m1a-order.lock`；固定 outer → legacy 锁段 → 账本锁段；**任何取锁失败
+  `ledger/<ep>/m1a-order.lock`（registry 锁协议）；固定 outer → legacy 锁段 → 账本锁段
+  （内锁不同时持有）；**任何取锁失败
   （busy/maintenance/root_*/dir_perms/lock_residue/reap_*/io_error）均不得执行 legacy 写**
   ——错误名不能证明无并发写方；`__shadow_skipped` 类标记亦不闭合（写标记本身要么绕 outer
   要么需要新 WAL 协议）。只有**取得 outer 后**的 shadow 后半程失败，才保留已成立的 legacy

@@ -23,6 +23,9 @@ export const DEFAULT_DIALOGUE_BUDGET = Object.freeze({
   max_resource_units: 12,
 });
 
+/** processed_events 保留窗口：只保留最近 N 个回合的事件（校验侧按同一常量闭合）。 */
+export const PROCESSED_EVENTS_WINDOW = 256;
+
 export const DIALOGUE_STATUS = Object.freeze({
   ACTIVE: "active",
   COMPLETED: "completed",
@@ -49,6 +52,29 @@ export const DIALOGUE_REASON = Object.freeze({
   HUMAN_INTERRUPT: "human_interrupt",
 });
 
+/**
+ * 受控终局原因 = 现行 DIALOGUE_REASON ∪ 生产真写的三个投递失败原因（#R33 P1-1）。
+ * 这是写方与 policy-store 校验器（ipsp-1）的**同一份封闭合同**：双方都从这里 import，不各养一份。
+ * #R35 P1-1：改为**纯终局枚举** —— 去掉拒绝态原因（policy_invalid / not_active / turn_active /
+ * duplicate_event：它们是 reserve/setMode 的拒绝原因，永远不会成为一次对话的终局），纳入
+ * watcher 真写的 watch_timeout 与 stop-hook 真写的 empty_final_output；watch-and-publish 的
+ * 动态 reason 未知值在调用点归一化到 dialogue_run_failed（同文件收口，不留给接线单）。
+ */
+export const DIALOGUE_FINAL_REASONS = Object.freeze([
+  DIALOGUE_REASON.RUN_FAILED, DIALOGUE_REASON.HUMAN_INTERRUPT,
+  DIALOGUE_REASON.ROUND_BUDGET, DIALOGUE_REASON.TIME_BUDGET, DIALOGUE_REASON.RESOURCE_BUDGET,
+  "forward_failed", "handoff_failed", "runtime_failed", "watch_timeout", "empty_final_output",
+]);
+
+/** #R38 P1-2：终局原因归一化的唯一判据（Claude 与 Codex watcher 共用，不各写一份）。
+ *  completed 无终局原因（写前校验拒一切）；其余终局只认纯终局枚举，runner 侧的动态
+ *  字符串（nonzero_exit / turn_failed / artifact_unreadable 等）归一化到内部默认
+ *  dialogue_run_failed。写方 finalizeDialogueTurn 写前仍会校验一次（双闸）。 */
+export function normalizeFinalReason(status, reason) {
+  if (status === DIALOGUE_TURN_STATUS.COMPLETED) return null;
+  return DIALOGUE_FINAL_REASONS.includes(reason) ? reason : "dialogue_run_failed";
+}
+
 const nonEmpty = (value) => typeof value === "string" && value.length > 0;
 const iso = (now) => new Date(now).toISOString();
 const clone = (value) => JSON.parse(JSON.stringify(value));
@@ -66,6 +92,7 @@ const DIALOGUE_STOP_CONDITIONS = Object.freeze([
   "runtime_failure",
   "human_interrupt",
 ]);
+export { DIALOGUE_STOP_CONDITIONS };
 
 const validDialogueContract = (dialogue) =>
   dialogue.host?.participant_id === "bound_local_target" &&
@@ -334,7 +361,7 @@ export function reserveDialogueTurn(state, {
     dialogue_id: reservation.dialogue_id,
     turn_index: reservation.turn_index,
   });
-  next.dialogue.processed_events = next.dialogue.processed_events.slice(-256);
+  next.dialogue.processed_events = next.dialogue.processed_events.slice(-PROCESSED_EVENTS_WINDOW);
   next.dialogue.usage.rounds_started += 1;
   next.dialogue.usage.resource_units_used += resourceUnits;
   next.dialogue.next_turn_index += 1;
@@ -365,6 +392,14 @@ export function finalizeDialogueTurn(state, {
   if (![DIALOGUE_TURN_STATUS.COMPLETED, DIALOGUE_TURN_STATUS.FAILED,
     DIALOGUE_TURN_STATUS.CANCELLED].includes(status)) {
     return { ok: false, reason: "invalid_dialogue_turn_status" };
+  }
+  // 写前强制校验终局原因（#R35 P1-1：写方与 ipsp-1 同源闭合）——FAILED/CANCELLED 的 reason
+  // 必须在纯终局枚举内（null 归一化为写路径内部默认）；COMPLETED 无终局原因（超预算的
+  // stop_reason 由下面内部算出），调用方传了就拒，不让任意动态字符串洗进终局。
+  if (status === DIALOGUE_TURN_STATUS.COMPLETED) {
+    if (reason !== null) return { ok: false, reason: "invalid_dialogue_final_reason" };
+  } else if (reason !== null && !DIALOGUE_FINAL_REASONS.includes(reason)) {
+    return { ok: false, reason: "invalid_dialogue_final_reason" };
   }
 
   const next = clone(state);

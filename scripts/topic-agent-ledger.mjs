@@ -35,6 +35,7 @@ const MAX_LIVE = 512;
 const MAX_OPERATIONS = 4096;
 
 const ID_SHAPE = /^ta_[0-9a-f]{32}$/u;
+export { ID_SHAPE }; // 只读导出（policy-store 派生 policy_subject_id 复用同一判据，#R33 P2-1）
 const OP_ID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const SHA_SHAPE = /^[0-9a-f]{64}$/u;
 // 生产权威形状（评审二 P1-1/P1-6）：endpoint = legacyEndpointId = stableControlId("endpoint",…) = endpoint_<24hex>；
@@ -48,6 +49,7 @@ const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 const AILY_SESSION_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u;    // aliases.session_id（Aily 会话 locator）
 const CODEX_ID_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u;        // codex task/thread
 const LINEAGE_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u;
+export { LINEAGE_SHAPE }; // 只读导出（policy-store 派生 policy_subject_id 复用同一判据，#R33 P2-1）
 const REQUEST_KEY_SHAPE = /^[A-Za-z0-9_.:@+-]{1,256}$/u; // 外部请求身份（控制 claim key / message id），进指纹（评审四 P1-2）
 const AUTHORIZED_BY_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u; // 授权者 sender id（有界、无控制字符，评审六 P2）
 const REASON_ENUM = ["expired", "superseded", "manual"];

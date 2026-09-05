@@ -34,7 +34,7 @@ import { resolveLarkIdentity } from "./chain-template.mjs";
 import { effectiveBindingId, resolveMappingOutboundGeneration } from "./topic-generation.mjs";
 import { moduleRoot } from "./direct-run.mjs";
 import { finalizeClaudeDialogueTurn } from "./interaction-policy-store.mjs";
-import { DIALOGUE_POLICY_ID, DIALOGUE_TURN_STATUS } from "./interaction-policy.mjs";
+import { DIALOGUE_POLICY_ID, DIALOGUE_TURN_STATUS, normalizeFinalReason } from "./interaction-policy.mjs";
 import { gateBlocks } from "./maintenance-gate-core.mjs";
 
 // 维护门（issue #81）：**启动期先看一次门**，在读 claim / 记 failed / 取任何锁之前；门在或读不出就无输出退出（run、claim、锁都留着，交陈旧检测）。循环里每轮再复核。
@@ -246,7 +246,12 @@ while (true) {
         status: outcome.state === "completed"
           ? DIALOGUE_TURN_STATUS.COMPLETED
           : DIALOGUE_TURN_STATUS.FAILED,
-        reason: outcome.state === "completed" ? null : (outcome.reason ?? outcome.state),
+        // #R35 P1-1 + #R38 P1-2：动态 reason（run 记录里各写点透传的字符串）统一走
+        // normalizeFinalReason（与 Codex watcher 同一判据）；写方 finalize 会再校验一次。
+        reason: normalizeFinalReason(
+          outcome.state === "completed" ? DIALOGUE_TURN_STATUS.COMPLETED : DIALOGUE_TURN_STATUS.FAILED,
+          outcome.reason,
+        ),
       }));
     }
     const reportTerminalFailures = () => {

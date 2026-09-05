@@ -12,7 +12,7 @@ import {
 import { verifyCodexRunCredential } from "./handoff.mjs";
 import { publishEligibleTaskEvents } from "./publish-eligible.mjs";
 import { bridgeHome, finalizeTaskDialogueTurn, loadRegistry, taskPaths } from "./state.mjs";
-import { DIALOGUE_POLICY_ID, DIALOGUE_TURN_STATUS } from "../interaction-policy.mjs";
+import { DIALOGUE_POLICY_ID, DIALOGUE_TURN_STATUS, normalizeFinalReason } from "../interaction-policy.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -32,6 +32,41 @@ if (!CLAIM_KEY_SHAPE.test(key)) {
 
 const home = bridgeHome();
 const reg = loadRegistry();
+
+/**
+ * #R38 P1-2：终局写的守卫包装 —— 动态 reason 先过 normalizeFinalReason（与 Claude watcher
+ * 同一判据），返回值必须被消费：写失败时 risk 入队、session lock 保留（fail-closed 探活）、
+ * 退出码置 1 —— 决不许“写不进也照常放锁”让 active turn 留在账上没人管。
+ * 返回 finalize 的结果（调用方可用于断言），失败时也返回（调用方不必再分支）。
+ */
+const finalizeGuarded = ({ task, runId, status, reason, paths, label }) => {
+  const fin = finalizeTaskDialogueTurn({
+    threadId: task.codex_thread_id,
+    runId,
+    status,
+    reason: normalizeFinalReason(status, reason),
+    home,
+  });
+  if (!fin.ok) {
+    try {
+      appendEvent({
+        outboxDir: paths.outbox,
+        kind: "risk",
+        text: task.task_display_name + " 的这一轮 " + label + "终局状态没写进 task 状态（" +
+          (fin.reason ?? "说不清") + (fin.why ? "：" + fin.why : "") + "）。active turn 还留在账上，" +
+          "session lock 保留 —— 需要人看一眼，别直接删锁。",
+        source: "codex-run-watcher",
+        eventKey: "codex:" + task.codex_thread_id + ":claim:" + runId + ":finalize-failed",
+      });
+    } catch (err) {
+      console.error("risk 没发出去：" + String(err?.message ?? err).slice(0, 200));
+    }
+    releaseLock = false;
+    process.exitCode = 1;
+  }
+  return fin;
+};
+
 const task = reg.ok ? reg.tasks.find((t) => t.logical_task_key === taskKey) : null;
 if (!task) {
   console.error("task not found");
@@ -202,14 +237,12 @@ try {
         detail: { run_state: "completed", recoverable_error_events: outcome.recoverableErrors ?? 0 },
       });
       if (acceptedClaim?.policy_id === DIALOGUE_POLICY_ID) {
-        finalizeTaskDialogueTurn({
-          threadId: task.codex_thread_id,
-          runId: key,
-          status: DIALOGUE_TURN_STATUS.COMPLETED,
-          home,
-        });
+        // #R40 P1-1：completed 仅在终局写成功时置 0，写失败保留 finalizeGuarded 置的 1。
+        const fin = finalizeGuarded({ task, runId: key, status: DIALOGUE_TURN_STATUS.COMPLETED, reason: null, paths, label: "完成" });
+        if (fin?.ok) process.exitCode = 0;
+      } else {
+        process.exitCode = 0;
       }
-      process.exitCode = 0;
       break;
     }
 
@@ -247,13 +280,10 @@ try {
       detail: { run_state: outcome.state, reason: outcome.reason, diagnostic: outcome.diagnostic ?? null },
     });
     if (acceptedClaim?.policy_id === DIALOGUE_POLICY_ID) {
-      finalizeTaskDialogueTurn({
-        threadId: task.codex_thread_id,
-        runId: key,
-        status: DIALOGUE_TURN_STATUS.FAILED,
-        reason: outcome.reason,
-        home,
-      });
+      // #R38 P1-2：outcome.reason 是 runner 侧动态字符串（nonzero_exit / turn_failed /
+      // artifact_unreadable 等），不在纯终局枚举里 —— 归一化后交给 finalize，且**必须消费返回值**：
+      // 写失败不再静默放锁（旧版 active turn 留账、锁照放，下一条入站会踩一个状态说不清的 thread）。
+      finalizeGuarded({ task, runId: key, status: DIALOGUE_TURN_STATUS.FAILED, reason: outcome.reason, paths, label: "失败" });
     }
     process.exitCode = 1;
     break;
@@ -295,13 +325,9 @@ try {
       detail: { observation_state: "watch_timeout", runner_may_be_active: true },
     });
     if (acceptedClaim?.policy_id === DIALOGUE_POLICY_ID) {
-      finalizeTaskDialogueTurn({
-        threadId: task.codex_thread_id,
-        runId: key,
-        status: DIALOGUE_TURN_STATUS.FAILED,
-        reason: "watch_timeout",
-        home,
-      });
+      // #R38 P1-2：timeout 分支本来就保留 session lock（releaseLock 已 false），
+      // 这里消费返回值是为了写失败时多一条说人话的 risk —— 账留没留上要说出来。
+      finalizeGuarded({ task, runId: key, status: DIALOGUE_TURN_STATUS.FAILED, reason: "watch_timeout", paths, label: "超时" });
     }
     process.exitCode = 1;
   }

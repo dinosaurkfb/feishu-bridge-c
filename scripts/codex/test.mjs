@@ -2274,6 +2274,135 @@ test("Codex watcher 严格完成后释放 Dialogue 活动回合", () => {
   assert.equal(interactionPolicyForTask(after).state.dialogue.last_turn.status, "completed");
 });
 
+test("Codex watcher 失败分支归一化动态 reason 后写账并照常放锁（#R38 P1-2）", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "FailNorm", rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = false;
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  setTaskInteractionMode({ threadId: THREAD_A, mode: "dialogue", home, now: 1_800_000_000_000 });
+  const key = claimKeyFor("fn", task.logical_task_key);
+  reserveTaskDialogueTurn({
+    threadId: THREAD_A, eventId: "om_dialogue_fn", runId: key,
+    localTargetId: "local", originChannelGenerationId: task.channel_generation_id,
+    runtimeTargetId: THREAD_A, home, now: 1_800_000_000_001,
+  });
+  const current = loadRegistry(path.join(home, "registry.json")).tasks[0];
+  const paths = taskPaths(current, home);
+  fs.mkdirSync(paths.runs, { recursive: true });
+  fs.mkdirSync(paths.claims, { recursive: true });
+  fs.mkdirSync(paths.sessionLock, { recursive: true });
+  // runner 侧失败：回执 exit_code:1 → outcome.reason="nonzero_exit"（不在纯终局枚举里）
+  fs.writeFileSync(path.join(paths.runs, key + ".jsonl"),
+    [{ type: "thread.started", thread_id: THREAD_A }, { type: "turn.started" }].map(JSON.stringify).join("\n") + "\n");
+  fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "半截输出");
+  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"),
+    JSON.stringify(exitReceipt(key, { status: "failed", exit_code: 1 })));
+  writeClaimFixture({ claimsDir: paths.claims, key, task: current, patch: { policy_id: "dialogue" } });
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
+    "--claim-key", key, "--task-key", task.logical_task_key,
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.equal(r.status, 1, "失败是失败：" + r.stderr);
+  const after = loadRegistry(path.join(home, "registry.json")).tasks[0];
+  const dlg = interactionPolicyForTask(after).state.dialogue;
+  assert.equal(dlg.last_turn?.status, "failed", "失败终局要写进账（红：旧版原样传 nonzero_exit 被 finalize 拒，账没写上）");
+  assert.equal(dlg.last_turn?.reason, "dialogue_run_failed", "动态 reason 归一化到受控终局（与 Claude watcher 同一判据）");
+  assert.equal(dlg.active_turn, null);
+  assert.equal(fs.existsSync(paths.sessionLock), false, "写成功后照常放锁");
+});
+
+test("Codex watcher 终局写失败时不静默放锁 —— risk + 锁保留 + 退出码 1（#R38 P1-2）", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "FailHold", rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = false;
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  setTaskInteractionMode({ threadId: THREAD_A, mode: "dialogue", home, now: 1_800_000_000_000 });
+  const key = claimKeyFor("fh", task.logical_task_key);
+  reserveTaskDialogueTurn({
+    threadId: THREAD_A, eventId: "om_dialogue_fh", runId: key,
+    localTargetId: "local", originChannelGenerationId: task.channel_generation_id,
+    runtimeTargetId: THREAD_A, home, now: 1_800_000_000_001,
+  });
+  // 篡改盘上 active_turn.run_id → finalize 拒 dialogue_turn_mismatch（写方真的写不进去）
+  {
+    const regPath = path.join(home, "registry.json");
+    const reg = JSON.parse(fs.readFileSync(regPath, "utf-8"));
+    reg.tasks[0].interaction_policy_state.dialogue.active_turn.run_id = "0".repeat(64);
+    fs.writeFileSync(regPath, JSON.stringify(reg));
+  }
+  const current = loadRegistry(path.join(home, "registry.json")).tasks[0];
+  const paths = taskPaths(current, home);
+  fs.mkdirSync(paths.runs, { recursive: true });
+  fs.mkdirSync(paths.claims, { recursive: true });
+  fs.mkdirSync(paths.sessionLock, { recursive: true });
+  fs.writeFileSync(path.join(paths.runs, key + ".jsonl"),
+    [{ type: "thread.started", thread_id: THREAD_A }, { type: "turn.started" }].map(JSON.stringify).join("\n") + "\n");
+  fs.writeFileSync(path.join(paths.runs, key + ".last-message.txt"), "半截输出");
+  fs.writeFileSync(path.join(paths.runs, key + ".exit.json"),
+    JSON.stringify(exitReceipt(key, { status: "failed", exit_code: 1 })));
+  writeClaimFixture({ claimsDir: paths.claims, key, task: current, patch: { policy_id: "dialogue" } });
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
+    "--claim-key", key, "--task-key", task.logical_task_key,
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.equal(r.status, 1, r.stderr);
+  const events = fs.readdirSync(paths.outbox)
+    .map((f) => JSON.parse(fs.readFileSync(path.join(paths.outbox, f), "utf-8")));
+  const risk = events.find((e) => e.kind === "risk" && /dialogue_turn_mismatch/u.test(e.text));
+  assert.ok(risk, "终局写不进去必须说出来（红：旧版写失败静默放锁）");
+  assert.match(risk.text, /dialogue_turn_mismatch/u, "risk 要带 finalize 拒绝的原因：" + risk.text);
+  const after = loadRegistry(path.join(home, "registry.json")).tasks[0];
+  const dlg = interactionPolicyForTask(after).state.dialogue;
+  assert.equal(dlg.last_turn, undefined, "写失败就不许有账");
+  assert.equal(dlg.active_turn !== null, true, "active turn 留在账上（认得出，不是丢状态）");
+  assert.equal(fs.existsSync(paths.sessionLock), true, "**锁必须保留**（红：旧版照放，下一条入站踩一个状态说不清的 thread）");
+});
+
+test("Codex watcher 完成分支终局写失败时退出码非零且锁保留（#R40 P1-1）", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "CompHold", rootMessageId: "om_a", token: "a" });
+  task.auto_publish_on_completion = false;
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  setTaskInteractionMode({ threadId: THREAD_A, mode: "dialogue", home, now: 1_800_000_000_000 });
+  const key = claimKeyFor("ch", task.logical_task_key);
+  reserveTaskDialogueTurn({
+    threadId: THREAD_A, eventId: "om_dialogue_ch", runId: key,
+    localTargetId: "local", originChannelGenerationId: task.channel_generation_id,
+    runtimeTargetId: THREAD_A, home, now: 1_800_000_000_001,
+  });
+  // 篡改盘上 active_turn.run_id → finalize 拒 dialogue_turn_mismatch
+  {
+    const regPath = path.join(home, "registry.json");
+    const reg = JSON.parse(fs.readFileSync(regPath, "utf-8"));
+    reg.tasks[0].interaction_policy_state.dialogue.active_turn.run_id = "0".repeat(64);
+    fs.writeFileSync(regPath, JSON.stringify(reg));
+  }
+  const current = loadRegistry(path.join(home, "registry.json")).tasks[0];
+  const paths = taskPaths(current, home);
+  fs.mkdirSync(paths.runs, { recursive: true });
+  fs.mkdirSync(paths.claims, { recursive: true });
+  fs.mkdirSync(paths.sessionLock, { recursive: true });
+  writeRunArtifacts({ runsDir: paths.runs, key, threadId: THREAD_A, text: "dialogue final" });
+  writeClaimFixture({ claimsDir: paths.claims, key, task: current, patch: { policy_id: "dialogue" } });
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "watch-run.mjs"),
+    "--claim-key", key, "--task-key", task.logical_task_key,
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+  assert.equal(r.status, 1, "完成分支写终局失败时退出码必须为 1（红：旧版无条件置 0）");
+  const events = fs.readdirSync(paths.outbox)
+    .map((f) => JSON.parse(fs.readFileSync(path.join(paths.outbox, f), "utf-8")));
+  const risk = events.find((e) => e.kind === "risk" && /dialogue_turn_mismatch/u.test(e.text));
+  assert.ok(risk, "终局写不进去必须说出来");
+  const after = loadRegistry(path.join(home, "registry.json")).tasks[0];
+  const dlg = interactionPolicyForTask(after).state.dialogue;
+  assert.equal(dlg.last_turn, undefined, "写失败就不许有账");
+  assert.equal(dlg.active_turn !== null, true, "active turn 留在账上");
+  assert.equal(fs.existsSync(paths.sessionLock), true, "锁必须保留");
+});
+
 test("watcher 抑制递归产生的错误答复，只保留风险回执", () => {
   const home = temp();
   const root = path.join(home, "workspace");

@@ -131,8 +131,8 @@ function readGateFile(file, now) {
  * 写入口的判据：门 active 或 unreadable 都算"被挡"。text 是给人看的受控一句话（不含路径）。
  * @returns {{ blocked: boolean, state: string, text: string|null, gate: object|null }}
  */
-export function gateBlocks({ file = maintenanceGatePath(), now = Date.now() } = {}) {
-  const g = readGate({ file, now });
+export function gateBlocks({ file, env = process.env, now = Date.now() } = {}) {
+  const g = readGate({ file: file ?? maintenanceGatePath(env), now });
   if (g.state === "absent") return { blocked: false, state: "absent", text: null, gate: null };
   if (g.state === "active") {
     const mins = Math.floor(g.ageMs / 60000);

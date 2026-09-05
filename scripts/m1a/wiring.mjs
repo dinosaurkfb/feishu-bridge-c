@@ -208,17 +208,59 @@ export function wireAttach({ endpointId, env = process.env, legacy, claimKey, id
 }
 
 /**
- * wireRotate —— rotate（建新代际）→ 账本 create_b1。
- * ext=rotation operation id（topic-generation 既有、持久）；entity=lineage id。
+ * rotateCompositeSubmit —— P1-4（#R37 返修 ①②③）旋转复合体的 shadow 序列：
+ *   void(过期的旧 B1, reason=expired) → create_b1(新建代际)，同一笔外锁内两 op。
+ * 两个 op 从**同一个** rotation operation id 派生**不同** request_key
+ *   （ext=rotationOpId 相同；op_type=void/create_b1、entity=旧 B1 id / lineage id 相异），
+ *   逐 op 幂等重放（账本 writeLedger 按 request_key 去重：replay→committed_clean,idempotent）。
+ * ② 每 op 各自独立有效：void 失败（旧 B1 缺席/已作废）**不阻断** create_b1；create_b1 失败也不撤销 void。
+ * 仅在 legacyRes.supersededRootOm 命中到仍 live 的旧 B1 时才算 void 落账；否则 void 投影 fail-closed 保留在结果里。
+ * @returns 影子序列（每项 capture 结果：{op, ok, ...}）
+ */
+function rotateCompositeSubmit({ endpointId, env, legacyRes, rotationOpId, lineageId, chatId, rootOm = null, bindingTarget, now }) {
+  const om = (legacyRes && typeof legacyRes === "object" && legacyRes.root_message_id) ? legacyRes.root_message_id : rootOm;
+  if (!en(rotationOpId) || !en(lineageId) || !en(om)) return [{ op: "create_b1", ok: false, reason: "bad_external_id", why: "rotationOpId/lineageId/rootOm 必填 1..256 字符串" }];
+  const ops = [];
+  const supersededOm = (legacyRes && typeof legacyRes === "object" && legacyRes.supersededRootOm) ? legacyRes.supersededRootOm : null;
+  if (en(supersededOm)) {
+    const resolved = resolveLiveId({ endpointId, locator: supersededOm, env });
+    if (resolved.ok) {
+      const kv = rk("void", rotationOpId, resolved.id);
+      ops.push(kv.ok ? capture("void", voidPending({ endpointId, requestKey: kv.request_key, b1Id: resolved.id, reason: "expired", now, env })) : { op: "void", ...kv });
+    } else {
+      // 旧 B1 在 shadow 缺席（legacy-only / 已作废 / 读不出）→ void fail-closed 投影，但不阻断 create_b1。
+      ops.push({ op: "void", ok: false, reason: resolved.reason, why: resolved.why ?? null });
+    }
+  }
+  const k = rk("create_b1", rotationOpId, lineageId);
+  if (!k.ok) { ops.push({ op: "create_b1", ...k }); return ops; }
+  ops.push(capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm: om, lineageId, bindingTarget, now, env })));
+  return ops;
+}
+
+/**
+ * wireRotate —— rotate（建新代际）→ 账本复合体 [void(过期旧 B1) → create_b1(新代际)]（P1-4）。
+ * 一笔外锁内两 op；两 op 从同一 persistent rotation operation id 派生不同 request_key；
  * rootOm 二选一：优先从 legacyRes.root_message_id 取（轮转的 topic 根消息在 legacy 闭包里由
- *   sendToChat 创建，锁必须在它之前取——W3），缺省才回退到静态 rootOm 参数。 */
+ *   sendToChat 创建，锁必须在它之前取——W3），缺省才回退到静态 rootOm 参数。
+ * legacyRes.supersededRootOm（可选）= 被作废旧代际根消息 om —— 调用方 legacy 闭包把
+ *   prepareClaudeTopicRotation({supersedeExpired:true}).superseded.root_message_id 线程过来。 */
 export function wireRotate({ endpointId, env = process.env, legacy, rotationOpId, lineageId, chatId, rootOm = null, bindingTarget, now = Date.now() }) {
-  return runWired({ endpointId, env, legacy, submit: (legacyRes) => {
-    const om = (typeof legacyRes === "object" && legacyRes && legacyRes.root_message_id) ? legacyRes.root_message_id : rootOm;
-    if (!en(rotationOpId) || !en(lineageId) || !en(om)) return [{ op: "create_b1", ok: false, reason: "bad_external_id", why: "rotationOpId/lineageId/rootOm 必填 1..256 字符串" }];
+  return runWired({ endpointId, env, legacy, submit: (legacyRes) => rotateCompositeSubmit({ endpointId, env, legacyRes, rotationOpId, lineageId, chatId, rootOm, bindingTarget, now }) });
+}
+
+/**
+ * wireRotateRecovery —— P1-4 ④（#R37 返修）续跑恢复：legacy 已有新 pending、但 shadow 只写了 void、
+ *   create_b1 缺失。**shadow-only、无 legacy 业务副作用**（prepare/sendToChat/register 由首次 run 完成，本次只补镜像）。
+ *   前提：void 已提交（这就是本恢复被调用的判定），故**只补缺失的 create_b1**、不重发 void（重发反而因目标已
+ *   作废而 resolv 不到）。ext 沿用首次 run 的 rotation operation id，故 create_b1 幂等：已提交——重放命中，
+ *   缺失——才真落账。不许被「已有 pending」预检挡掉；调用方检测到缺失时路由到本函数而非重复创建。 */
+export function wireRotateRecovery({ endpointId, env = process.env, rotationOpId, lineageId, chatId, rootOm, bindingTarget, now = Date.now() }) {
+  return runWired({ endpointId, env, legacy: () => ({ ok: true, root_message_id: rootOm }), submit: (legacyRes) => {
+    if (!en(rotationOpId) || !en(lineageId) || !en(rootOm)) return [{ op: "create_b1", ok: false, reason: "bad_external_id", why: "rotationOpId/lineageId/rootOm 必填 1..256 字符串" }];
     const k = rk("create_b1", rotationOpId, lineageId);
     if (!k.ok) return [{ op: "create_b1", ...k }];
-    return [capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm: om, lineageId, bindingTarget, now, env }))];
+    return [capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm, lineageId, bindingTarget, now, env }))];
   } });
 }
 

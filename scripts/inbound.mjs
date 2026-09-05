@@ -20,7 +20,7 @@ import path from "node:path";
 import { REJECT, normalizeBody } from "./selector.mjs";
 import { fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, claimKey, readClaimState, recordClaimState, watcherExpectEnv } from "./claim.mjs";
-import { effectiveBindingId } from "./topic-generation.mjs";
+import { effectiveBindingId, pendingGeneration } from "./topic-generation.mjs";
 import { moduleRoot } from "./direct-run.mjs";
 import {
   MAPPING_DISPOSITION, buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
@@ -55,9 +55,9 @@ import {
 } from "./inbound-route.mjs";
 import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatFailText } from "./chat-reply.mjs";
 import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome, lockUnclearedText } from "./chat-ledger.mjs";
-import { closeClaudeTopicRotation } from "./topic-generation-store.mjs";
+import { closeClaudeTopicRotation, loadClaudeTopicBinding } from "./topic-generation-store.mjs";
 import { recordClaudeActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
-import { wireChatA1, wirePromoteBinding } from "./m1a/wiring.mjs";
+import { wireChatA1, wirePromoteBinding, wireVoid } from "./m1a/wiring.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
 import {
   buildLegacyDialogueBoundAuthorizationContext,
@@ -385,13 +385,37 @@ if (!routed.ok) {
   const pending = findPendingBinding({ content: event.content, now: promotionNow });
   const promo = evaluatePromotion({ event, template, pending, now: promotionNow });
   if (!pending.ok && pending.reason === "pending_binding_expired" && pending.operationId) {
-    closeClaudeTopicRotation({
+    // P1-3②（#R37 返修）：过期兜底原本只 closeClaudeTopicRotation（不落 M1a 账本），现包成 wireVoid(reason=expired)。
+    //   目标由 resolver 按被作废代际根消息 om 命中（从 binding state 读 pending generation 的 root_message_id）；
+    //   resolver 未命中（legacy-only、无 B1）→ shadow fail-closed、legacy 照常过期。与 feishu-rotate 不同，
+    //   过期分支**只作废、不改账本**（无 create_b1）—— 单笔 void(expired)，取 outer 锁。
+    //   P1-6（⑤）：shadow 步/释放失败 → 机器回执，不静默；legacy 已过期，作废镜像缺失留 doctor/repair。
+    const wireExpireLegacy = () => closeClaudeTopicRotation({
       root: pending.root,
       claudeSessionId: pending.claudeSessionId,
       operationId: pending.operationId,
       reason: "expired",
       now: promotionNow,
     });
+    if (template?.agent_uid) {
+      const bound = loadClaudeTopicBinding({ root: pending.root, claudeSessionId: pending.claudeSessionId });
+      const expiredGen = bound.ok ? pendingGeneration(bound.state) : null;
+      const wiredExpire = wireVoid({
+        endpointId: legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid }),
+        env: process.env,
+        rotationOpId: pending.operationId,
+        locator: expiredGen?.root_message_id ?? null,
+        reason: "expired",
+        legacy: wireExpireLegacy,
+      });
+      const failedStep = (wiredExpire.shadow ?? []).find((s) => !s.ok);
+      const relFail = wiredExpire.release && wiredExpire.release.ok !== true;
+      if (failedStep || relFail) {
+        writeReceipt("expire-void-" + (event.message_id ?? Date.now()), { status: "shadow_failed", operationId: pending.operationId, locator: expiredGen?.root_message_id ?? null, legacy_committed: true, step: failedStep ?? null, release: wiredExpire.release ?? null, expired_at: promotionNow });
+      }
+    } else {
+      wireExpireLegacy();
+    }
   }
   subscriptionClaimShadow = shadowClaudeFirstClaim({
     event,

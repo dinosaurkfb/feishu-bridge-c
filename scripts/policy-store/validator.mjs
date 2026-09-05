@@ -147,14 +147,25 @@ export function interactionPolicyStateProblem(state) {
   //（reserve 同步 +1、duplicate 幂等不改、finalize 不动）。脱钩即计账损坏：利害路径是篡改
   // rounds_started 后绕过 round_budget 闸多领轮次（旧版鸭子校验只看 rounds ≤ max，拦不住）。
   if (d.usage.rounds_started !== d.next_turn_index - 1) return "dialogue_usage";
-  // #R41 P1-1 ③：processed_events 必须是当前保留窗口（PROCESSED_EVENTS_WINDOW）内的连续尾段
-  // —— 写路径只追加 + slice(-WINDOW) 截断。中段缺口会让 duplicate 幂等闸被绕过（老事件重放），
-  // 窗前截段、重复 turn_index、超长窗口都不是写方能产出的形状。
+  // #R42 P1-1：资源累计下界 —— 写方 reserve 开领即计（used += resource_units），任何时刻
+  // active_turn（本回合）与 last_turn（上一回合）的 units 之和恒 ≤ used（更早回合的消耗仍在
+  // used 里只是不可见，下界不等式对窗口外累计同样成立）。低报态（如篡改 used=0）一旦过校验，
+  // 准入闸（reserve 直接信 used）就会放行第三次领用超限 —— 按下界不等式收，低报必拒；
+  // 高报只会提前触发保守停机，不在本刀范围。active 与 last 是不同回合（上方记账闭合已钉），不双计。
   {
-    const sortedTurns = d.processed_events.map((e) => e.turn_index).sort((a, b) => a - b);
+    const visibleUnits = (d.active_turn !== null ? d.active_turn.resource_units : 0) +
+      (d.last_turn !== undefined ? d.last_turn.resource_units : 0);
+    if (d.usage.resource_units_used < visibleUnits) return "dialogue_usage";
+  }
+  // #R41 P1-1 ③ / #R42 P2：processed_events 必须是当前保留窗口（PROCESSED_EVENTS_WINDOW）内的
+  // 连续尾段，且**按存储顺序**逐项核（写方只追加 + slice(-WINDOW) 截断，产出恒为升序数组）。
+  // 排序副本会把倒序数组合法化 —— 倒序态再追加会让写方的 push+slice 按存储序工作，产出乱序后继；
+  // 中段缺口会让 duplicate 幂等闸被绕过（老事件重放），窗前截段、重复 turn_index、超长窗口
+  // 也都不是写方能产出的形状。
+  {
     const windowStart = Math.max(1, maxProcessedTurn - (PROCESSED_EVENTS_WINDOW - 1));
-    for (let i = 0; i < sortedTurns.length; i += 1) {
-      if (sortedTurns[i] !== windowStart + i) return "dialogue_processed_events";
+    for (let i = 0; i < d.processed_events.length; i += 1) {
+      if (d.processed_events[i].turn_index !== windowStart + i) return "dialogue_processed_events";
     }
   }
   // #R41 P1-1 ①②：回合记账闭合 —— finalize 必写 last_turn、reserve 只在 active 空时开工，
@@ -169,6 +180,12 @@ export function interactionPolicyStateProblem(state) {
   }
   if (!isCanonicalIso(d.started_at)) return "dialogue_started_at";
   if (!isCanonicalIso(d.deadline_at)) return "dialogue_deadline_at";
+  // #R42 P1-2：deadline 绑创建事实 —— 写方恒 deadline_at = started_at + max_duration_ms
+  //（同一 now 生成，唯一赋值点）。恒等式破即篡改（如 1 秒预算改 100 秒，过原截止仍开工）；
+  // 非规范时间已被上面 ISO 检查拒，这里 Date.parse 得 NaN 比较不等同样 fail-closed。
+  if (Date.parse(d.deadline_at) - Date.parse(d.started_at) !== d.budget.max_duration_ms) {
+    return "dialogue_deadline_at";
+  }
   if (!isCanonicalIso(d.updated_at)) return "dialogue_updated_at";
 
   // 状态关系联合封闭（#R33 P1-1）+ dialogue.status × last_turn.status 封闭矩阵（#R40 P1-3）：

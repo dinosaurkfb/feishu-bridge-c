@@ -28248,6 +28248,105 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     }
   });
 
+  test("policy-store #R42：资源累计下界（低报必拒）+ deadline 绑创建事实 + processed_events 按存储序", () => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "policy-store-r42-")));
+    const ledgerDir = path.join(base, "ledger root");
+    fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
+    const savedLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerDir;
+    try {
+      const NOW = Date.parse("2026-09-06T00:00:00.000Z");
+      const ISO = (t) => new Date(t).toISOString();
+      const EP42 = "endpoint_" + "6".repeat(24);
+      const TA6 = "ta_" + "6".repeat(32);
+      const psid42 = policySubjectId({ kind: "topic_agent", endpointId: EP42, id: TA6 });
+      const kinds42 = { [psid42]: "topic_agent" };
+      const smallBudget = { max_rounds: 12, max_duration_ms: 1000, max_resource_units: 10 }; // 1s 预算贴近利害探针
+      const mkDialogue = (budget) => setInteractionPolicyMode(
+        interactionPolicyStateForLegacy({ binding_id: TA6 }, { bindingId: TA6, now: NOW }).state,
+        { mode: "dialogue", now: NOW, budget },
+      ).state;
+      const editD = (state, fn) => { const n = JSON.parse(JSON.stringify(state)); fn(n.dialogue); return n; };
+      const reserveArgs = (i, units) => ({ eventId: "e" + i, runId: "r" + i, localTargetId: "lt", originChannelGenerationId: "og", resourceUnits: units, now: NOW + 2 * i + 1 });
+
+      // ─── P1-1：资源累计下界（写方 reserve 开领即计；active/last 的 units 之和恒 ≤ used）───
+      {
+        let st = reserveDialogueTurn(mkDialogue(smallBudget), { ...reserveArgs(0, 7) }).state;
+        st = finalizeDialogueTurn(st, { runId: "r0", status: "completed", now: NOW + 2 }).state;
+        assert.deepEqual([st.dialogue.usage.resource_units_used, st.dialogue.last_turn.resource_units, st.dialogue.budget.max_resource_units], [7, 7, 10], "真值：消耗 7/10，last 载体在");
+        assert.equal(interactionPolicyStateProblem(st), null, "正向：used 恰等于可见和合法");
+        assert.equal(loadPolicyStore({ endpointId: EP42, kinds: kinds42 }).absent, true, "空店基准");
+        const w = mutatePolicyStore({ endpointId: EP42, kinds: kinds42, mutate: (entries) => upsertPolicyEntry(entries, psid42, st) });
+        assert.deepEqual([w.ok, w.changed], [true, true], "真值态落盘绿");
+
+        // 低报：used 0 < 可见和 7 → 拒；存储层同步拒（探针利害：低报态过校验 → 准入直接信 used
+        // → 第三次领 7 开工，真耗 14/10 超限）—— 防线在存储校验层
+        const under = editD(st, (d) => { d.usage.resource_units_used = 0; });
+        assert.equal(interactionPolicyStateProblem(under), "dialogue_usage", "低报必拒（红：旧版放行）");
+        const badWrite = mutatePolicyStore({ endpointId: EP42, kinds: kinds42, mutate: (entries) => ({ ok: true, entries: { ...entries, [psid42]: under }, changed: true }) });
+        assert.deepEqual([badWrite.ok, badWrite.detail], [false, "dialogue_usage"], "低报态写事务拒（存储防线）");
+        const third = reserveDialogueTurn(under, { ...reserveArgs(2, 7) });
+        assert.equal(third.accepted, true, "利害事实钉：低报态进准入即开工（准入信 used，防线在存储层）");
+        // 边界：低 1 拒
+        const low1 = editD(st, (d) => { d.usage.resource_units_used = 6; });
+        assert.equal(interactionPolicyStateProblem(low1), "dialogue_usage", "used 比可见和低 1 拒");
+      }
+
+      // ─── P1-1：窗口外累计（多回合后仅 active/last 可见，下界不误伤）───
+      {
+        let st = mkDialogue(); // 默认预算 12/12，4 轮不触停机
+        for (const [i, units] of [[0, 2], [1, 3], [2, 4]]) {
+          st = reserveDialogueTurn(st, { ...reserveArgs(i, units) }).state;
+          st = finalizeDialogueTurn(st, { runId: "r" + i, status: "completed", now: NOW + 2 * i + 2 }).state;
+        }
+        // 3 轮后 used=9；可见载体 last=4（active=null）→ 9 ≥ 4 合法（更早回合不可见但已计入）
+        assert.equal(interactionPolicyStateProblem(st), null, "窗口外累计下界不误伤");
+        const under = editD(st, (d) => { d.usage.resource_units_used = 3; });
+        assert.equal(interactionPolicyStateProblem(under), "dialogue_usage", "低报（< last 4）拒");
+        // 双计防护：第 4 轮在途（active=2, last=4, used=11 ≥ 6）合法 —— active 与 last 不同回合不双计
+        st = reserveDialogueTurn(st, { ...reserveArgs(3, 2) }).state;
+        assert.equal(interactionPolicyStateProblem(st), null, "active+last 可见和仍为下界（在途态合法）");
+        const under2 = editD(st, (d) => { d.usage.resource_units_used = 5; });
+        assert.equal(interactionPolicyStateProblem(under2), "dialogue_usage", "used < active+last 之和拒（可见和=6）");
+      }
+
+      // ─── P1-2：deadline 绑创建事实（写方恒 deadline_at = started_at + max_duration_ms）───
+      {
+        const st = mkDialogue(smallBudget); // deadline = NOW + 1000ms
+        assert.equal(interactionPolicyStateProblem(st), null, "正向：写方真值恒等成立");
+        const lie = editD(st, (d) => { d.deadline_at = ISO(NOW + 100000); });
+        assert.equal(interactionPolicyStateProblem(lie), "dialogue_deadline_at", "deadline 改大拒（红：旧版放行）");
+        // 利害事实钉：过原截止（NOW+1000）仍开工 —— 防线在存储校验层恒等式
+        const r = reserveDialogueTurn(lie, { ...reserveArgs(0, 1), now: NOW + 2000 });
+        assert.equal(r.accepted, true, "利害事实钉：过原截止（假 deadline 内）仍开工");
+        const weird = editD(st, (d) => { d.deadline_at = ISO(NOW); d.budget.max_duration_ms = 1; });
+        assert.equal(interactionPolicyStateProblem(weird), "dialogue_deadline_at", "恒等式破（deadline=started 而 max=1ms）拒");
+        const junk = editD(st, (d) => { d.deadline_at = ISO(NOW + 1000).replace(/\.000Z$/, "Z"); });
+        assert.equal(interactionPolicyStateProblem(junk), "dialogue_deadline_at", "非规范时间 fail-closed（秒精度 ISO 先拒）");
+      }
+
+      // ─── P2：processed_events 按存储序核（不排序副本；倒序非写方形状）───
+      {
+        let st = mkDialogue();
+        for (const i of [0, 1, 2]) {
+          st = reserveDialogueTurn(st, { ...reserveArgs(i, 1) }).state;
+          st = finalizeDialogueTurn(st, { runId: "r" + i, status: "completed", now: NOW + 2 * i + 2 }).state;
+        }
+        assert.deepEqual(st.dialogue.processed_events.map((e) => e.turn_index), [1, 2, 3], "真值正序");
+        assert.equal(interactionPolicyStateProblem(st), null, "正序合法");
+        const rev = editD(st, (d) => { d.processed_events.reverse(); });
+        assert.equal(interactionPolicyStateProblem(rev), "dialogue_processed_events", "倒序 [3,2,1] 拒（红：旧版排序副本放行）");
+        // 利害事实钉：倒序态（若校验失守）reserve 追加后产乱序后继 —— 写方 push+slice 按存储序工作
+        const r = reserveDialogueTurn(rev, { ...reserveArgs(9, 1) });
+        const idx = r.state.dialogue.processed_events.map((e) => e.turn_index);
+        assert.notDeepEqual(idx, [...idx].sort((a, b) => a - b), "利害事实钉：倒序态开工产出乱序后继");
+      }
+    } finally {
+      if (savedLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedger;
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

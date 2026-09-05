@@ -40,6 +40,7 @@ const SHA_SHAPE = /^[0-9a-f]{64}$/u;
 // 生产权威形状（评审二 P1-1/P1-6）：endpoint = legacyEndpointId = stableControlId("endpoint",…) = endpoint_<24hex>；
 // 链不可从 opaque endpoint 还原，另存顶层 chain。om_/oc_/session-UUID 各按真实前缀；claim key 复用 CLAIM_KEY_SHAPE。
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
+export { ENDPOINT_SHAPE }; // 只读导出（doctor ⑭ 枚举账本目录用）：同一形状只住一处
 const CHAIN = ["claude", "codex"];
 const OM_SHAPE = /^om_[A-Za-z0-9]{1,120}$/u;                 // 根消息 / matched om
 const CHAT_SHAPE = /^oc_[A-Za-z0-9]{1,120}$/u;               // 受验群 chat_id
@@ -82,6 +83,71 @@ function ledgerRoot(env = process.env) {
   const home = realUserHome();
   return home ? path.join(home, ".claude", "feishu-bridge", "ledger") : null;
 }
+/** 只读派生同源导出（doctor ⑭ 枚举账本目录用）：同一概念只住一处，不许第二份路径派生。 */
+export const ledgerRootFor = (env = process.env) => ledgerRoot(env);
+
+/**
+ * 账本根受验核验（唯一校验器，#R19 四轮 P1：doctor ⑭ 根协议复用它，不再手写第二份）：
+ * root 在场时必须——非 symlink、realpath 可解、逐层 realpath 边界（realpath === 词法 resolve，
+ * 即路径任一层都不是符号链接，父层别名会被拒）、真目录、权限精确 0700（#R24 P1-1）。
+ * 末级缺席 ≠ 合法缺席（#R24 P1-2）：向上找最深现存父目录并核 realpath 与词法一致，
+ * 父层别名 → root_not_canonical；父链受验且目标确实缺席才允许 root_absent
+ * （mustExistRoot:false 同样拒父层 symlink，只是允许末级本身不存在）。
+ * 返回 { ok:true, root: realRoot } 或 { ok:false, reason, why? }。
+ */
+export function validateLedgerRoot({ env = process.env, mustExistRoot = true } = {}) {
+  const root = ledgerRoot(env);
+  if (!root || !path.isAbsolute(root)) return { ok: false, reason: "no_root" };
+  let firstSeen = false; // 首次 lstat 是否看到 root 在场（#R27 P1）
+  try {
+    const st0 = fs.lstatSync(root);
+    firstSeen = true;
+    if (st0.isSymbolicLink()) return { ok: false, reason: "root_symlink" };
+  } catch (err) { if (err?.code !== "ENOENT") return { ok: false, reason: "root_unresolvable", why: String(err.code ?? err.message) }; }
+  let realRoot, rootResolved = true;
+  try { realRoot = fs.realpathSync(root); }
+  catch (err) {
+    if (err?.code !== "ENOENT") return { ok: false, reason: "root_unresolvable", why: String(err.code ?? err.message) };
+    // #R27 P1：首次 lstat 在场而 realpath ENOENT = “在场→缺席”相邻竞态（现场在变化），
+    // 与复核处同折 root_unresolvable，不得当成合法缺席走父链盘点。
+    if (firstSeen) return { ok: false, reason: "root_unresolvable", why: "根在首次核验后消失（lstat 在场→realpath 缺席）" };
+    // #R24 P1-2：realpath ENOENT 只证明末级不存在，父链里可能藏着 symlink（<tmp>/link/missing）。
+    // 逐级先 lstatSync（#R26 P1-1：statSync 会跟随 symlink，悬空别名指向永不存在的目标时
+    // ENOENT 会被当成“分量也不存在”继续向上，漏掉别名本身）：词法分量在场且是 symlink
+    // → 立即 root_not_canonical；只有分量确实 ENOENT 才继续向上。
+    let probe = path.dirname(root);
+    for (;;) {
+      let pst;
+      try { pst = fs.lstatSync(probe); }
+      catch (e2) {
+        if (e2?.code !== "ENOENT") return { ok: false, reason: "root_unresolvable", why: String(e2.code ?? e2.message) };
+        const parent = path.dirname(probe);
+        if (parent === probe) return { ok: false, reason: "root_unresolvable", why: "父链全不存在" };
+        probe = parent;
+        continue;
+      }
+      if (pst.isSymbolicLink()) return { ok: false, reason: "root_not_canonical" };
+      break; // 现存非 symlink 分量 = 最深现存祖先
+    }
+    let realParent;
+    try { realParent = fs.realpathSync(probe); }
+    catch (e3) { return { ok: false, reason: "root_unresolvable", why: String(e3.code ?? e3.message) };
+    }
+    if (realParent !== path.resolve(probe)) return { ok: false, reason: "root_not_canonical" };
+    if (mustExistRoot) return { ok: false, reason: "root_absent" };
+    realRoot = root; rootResolved = false;
+  }
+  if (rootResolved && realRoot !== path.resolve(root)) return { ok: false, reason: "root_not_canonical" };
+  if (!rootResolved) return { ok: true, root: realRoot }; // mustExistRoot:false 的合法缺席：末级不存在，无复核对象
+  // 复核（#R26 P1-2）：realpath 已成功再 lstat 失败 = 现场在变化（EIO/EACCES/并发消失），
+  // 全部受控折 root_unresolvable 带错误码——不得吞成 ok:true，也不得折 root_absent（它刚才还在）。
+  let st;
+  try { st = fs.lstatSync(realRoot); }
+  catch (e4) { return { ok: false, reason: "root_unresolvable", why: "根复核 lstat：" + String(e4.code ?? e4.message) }; }
+  if (!st.isDirectory()) return { ok: false, reason: "root_not_dir" };
+  if ((st.mode & 0o777) !== 0o700) return { ok: false, reason: "root_perms" }; // #R24 P1-1：现存根精确 0700
+  return { ok: true, root: realRoot };
+}
 
 /**
  * 由 endpointId 派生受验目录：root 必须存在且是真目录（realpath 自洽），dir=root/endpoint；
@@ -90,16 +156,10 @@ function ledgerRoot(env = process.env) {
  */
 export function resolveEndpointDir(endpointId, { env = process.env, mustExistRoot = true } = {}) {
   if (typeof endpointId !== "string" || !ENDPOINT_SHAPE.test(endpointId)) return { ok: false, reason: "bad_endpoint" };
-  const root = ledgerRoot(env);
-  if (!root || !path.isAbsolute(root)) return { ok: false, reason: "no_root" };
-  try { if (fs.lstatSync(root).isSymbolicLink()) return { ok: false, reason: "root_symlink" }; } catch (err) { if (err?.code !== "ENOENT") return { ok: false, reason: "root_unresolvable", why: String(err.code ?? err.message) }; }
-  let realRoot, rootResolved = true;
-  try { realRoot = fs.realpathSync(root); }
-  catch (err) { if (err?.code === "ENOENT") { if (mustExistRoot) return { ok: false, reason: "root_absent" }; realRoot = root; rootResolved = false; } else return { ok: false, reason: "root_unresolvable", why: String(err.code ?? err.message) }; }
-  // 逐层 realpath 边界（评审六 P1-2）：配置根必须已规范化——realpath 等于词法 resolve，
-  // 即路径任一层都不是符号链接。否则父层别名（alias-parent→external-parent）能把根吸收到外部目录。
-  if (rootResolved && realRoot !== path.resolve(root)) return { ok: false, reason: "root_not_canonical" };
-  try { const st = fs.lstatSync(realRoot); if (!st.isDirectory()) return { ok: false, reason: "root_not_dir" }; } catch { /* 不存在已在上面处理 */ }
+  // 根段核验唯一化（#R19 四轮 P1）：同一份协议只住 validateLedgerRoot。
+  const r = validateLedgerRoot({ env, mustExistRoot });
+  if (!r.ok) return r;
+  const realRoot = r.root;
   const dir = path.join(realRoot, endpointId);
   try {
     const lst = fs.lstatSync(dir);
@@ -747,10 +807,13 @@ function virginInventory(dir) {
 }
 
 /** 机器级初始化收据（B-3 的最小投影：aggregate 全量收据属第 2 块另一分支）：扫描维护目录 journal，看该 endpoint 是否已被初始化 / 已切权威。 */
-/** 门内双射对账接口（§8/§5 cutover 前置）——M1a 未接真对账，fail-closed 恒拒 reconciler_absent。
- *  评审 P1-4：不接受调用方注入的 reconciler（否则旁路可自行对账），真对账接入时在此接，且必须经 capability 门。
+/** 门内双射对账接口（§8/§5 cutover 前置）——恒拒 reconciler_absent（T4 硬前置）：
+ *  ipsp-1/policy-store 块落地前可执行 cutover 保持 fail-closed；且 4e 规定 reconciler
+ *  ok:true 必须四件同证（ledger 双射 ∧ 三 sidecar 投影相等），只接 ledger 双射会让
+ *  cutover 在无 sidecar 证明下通过。真接线等 policy-store 块，届时按 4e 接。
  */
 export function reconcileShadow({ endpointId, shadowDoc } = {}) {
+  void endpointId; void shadowDoc;
   return { ok: false, reason: "reconciler_absent", why: "双射对账器未接入，cutover fail-closed" };
 }
 

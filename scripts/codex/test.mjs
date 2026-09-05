@@ -96,6 +96,7 @@ import {
   setTaskDisplayName, setTaskInteractionMode, shadowCodexFirstClaim, taskPaths, topicStateForTask,
   validateCodexTemplate, validateRegistryTasks, writeRegistryFixtureUnvalidated,
 } from "./state.mjs";
+import { collectCodexLegacySnapshot } from "../m1a/legacy-snapshot.mjs";
 import {
   ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, TOPIC_GENERATION_CLAIM_REMINDER_AFTER_MS,
   TOPIC_GENERATION_CLAIM_REMINDER_REPEAT_MS, activeGeneration, pendingGeneration,
@@ -9721,6 +9722,34 @@ const codexChanAccept = () => {
   };
   return { run, sampleFile: path.join(home, "inbound", "channel-samples.jsonl") };
 };
+
+test("#R19 同构守卫：M1a codex 快照的 state 物化 ≡ mappingForTask（防两处实现漂移）", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "r19-iso-"));
+  try {
+    const proj = path.join(home, "proj");
+    fs.mkdirSync(proj, { recursive: true, mode: 0o700 });
+    const tpl = { chain: "codex", inbound_prefix: null, transport_agent_name: "m5codex", transport_app_id: "cli_a",
+      transport_open_id: "ou_a", outbound_agent_name: "m5codex", outbound_app_id: "cli_a", outbound_open_id: "ou_a",
+      lark_cli_profile: "p", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "1",
+      chat_name: "n", chat_id: "oc_" + "c".repeat(32), default_freshness_ms: 1000, agent_uid: "agent_r19iso" };
+    fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(tpl, null, 2) + "\n", { mode: 0o600 });
+    // registry 物化 id 后的 task 形状（validateRegistryDocument 补 id，两侧同约定）。
+    const task = { id: "k1", logical_task_key: "k1", root: proj, codex_thread_id: "th_1", status: "active",
+      root_message_id: "om_" + "c".repeat(10), session_id: "sess_c1", created_at: "2026-08-01T00:00:00.000Z" };
+    fs.writeFileSync(path.join(home, "registry.json"), JSON.stringify({ tasks: [task] }, null, 2), { mode: 0o600 });
+    // 注入同一 now（复评 P2-1）：两侧时间戳都从它派生，逐字段相等不需要归一掩盖。
+    const now = Date.parse("2020-01-01T00:00:00.000Z");
+    const snap = collectCodexLegacySnapshot({ home, now });
+    assert.ok(snap.ok, "快照成立：" + JSON.stringify(snap).slice(0, 200));
+    const mf = mappingForTask(task, { home, now });
+    assert.deepEqual(snap.bindings[0].state, mf.topic_generation_state,
+      "collect 的 task→state 物化 ≡ 运行时 mappingForTask（同一注入 now，无归一）");
+    assert.equal(snap.bindings[0].generation_source, "legacy_v1", "gs 取真实物化来源（不是恒 stored_v1）");
+    const isos = JSON.stringify(snap.bindings[0].state).match(/"\d{4}-\d{2}-\d{2}T[^"]*"/gu) ?? [];
+    assert.ok(isos.length > 0 && isos.every((x) => x === '"2020-01-01T00:00:00.000Z"'),
+      "全部时间戳 = 注入 now（复评 P2-1）：" + isos.join("、"));
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
 
 test("#R10 Codex 真入口 accepted：成功投递落下 disposition=accepted 采样行，不泄明文", () => {
   const { run, sampleFile } = codexChanAccept();

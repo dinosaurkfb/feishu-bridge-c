@@ -65,7 +65,7 @@ export function readRegularFile(file) {
     try { st = fs.fstatSync(fd); } catch (err) { return { status: "unreadable", why: "fstat 失败：" + errCode(err) }; }
     if (!st.isFile()) return { status: "unreadable", why: "不是普通文件" };
     if (st.nlink !== 1) return { status: "unreadable", why: "不是单硬链接的普通文件（nlink=" + st.nlink + "）" };
-    try { return { status: "read", buf: fs.readFileSync(fd) }; } catch (err) { return { status: "unreadable", why: "读失败：" + errCode(err) }; }
+    try { return { status: "read", buf: fs.readFileSync(fd), ino: st.ino, dev: st.dev }; } catch (err) { return { status: "unreadable", why: "读失败：" + errCode(err) }; }
   } finally {
     if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
   }

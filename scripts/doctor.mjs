@@ -47,12 +47,16 @@ import { verifyRuntime, runtimeRoot } from "./runtime-install.mjs";
 import { shellQuote } from "./shell-quote.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode } from "./drain-schedule.mjs";
 import { spawnSync } from "node:child_process";
+import {
+  loadByEndpoint, ENDPOINT_SHAPE, validateLedgerRoot,
+} from "./topic-agent-ledger.mjs";
+import { aggregateEndpointReceipts, preparedLedgerInits } from "./maintenance/ledger-receipt.mjs";
+import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot } from "./m1a/legacy-snapshot.mjs";
+import { reconcileLegacyEndpoint } from "./m1a/reconcile.mjs";
 import { LAUNCHCTL_ENV, PHASE_TEXT, loadedPhase } from "./launchd-job.mjs";
 import { readGate, maintenanceGatePath } from "./maintenance-gate-core.mjs";
 import { inspectInstalledSurface, installedSurfacePath } from "./installed-surface.mjs";
 import { inspectMaintenanceDir, maintenanceDir } from "./maintenance/journal.mjs";
-import { aggregateEndpointReceipts } from "./maintenance/ledger-receipt.mjs";
-import { loadByEndpoint } from "./topic-agent-ledger.mjs";
 import { loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, storeHashState, subscriptionAuditPendingPath, subscriptionStorePath } from "./subscription-store.mjs";
 
 /** 到期预警阈值：7 天内到期就点名。**明写**，不藏在比较式里。 */
@@ -487,6 +491,161 @@ export function runDoctor({
       }
     }
   }
+
+  // ⑭ M1a 影子对账（规格 docs/architecture/m1a-reconciliation.md v6 §7）：旁路跑只读 reconciler。
+  // 账本缺席不再一律跳过 —— 按初始化收据分支：never_initialized+缺席 → 跳过；init WAL 未完成（prepared）
+  // → 按 B-2 恢复矩阵报告（只许同 token 恢复）；有初始化收据但账本缺席/读不出 → ledger_missing 红（禁重初始化）。
+  // 输出纪律：问题码 + opaque id / 哈希前缀 / 计数；绝不原样输出 locator/session/thread/项目路径。
+  {
+    const dir = maintenanceDir();
+    if (dir === null) {
+      add("m1a_shadow_reconcile", "⑭ M1a 影子对账", null, "家目录查不出来，收据目录未知", null);
+    } else {
+      const prep = preparedLedgerInits({ dir });
+      const agg = aggregateEndpointReceipts({ dir });
+      // main 侧 judgeLedgerReceipt 更紧：裸 prepared WAL（无 done 终态）在聚合面折 conflict → agg.ok=false。
+      // prepared 专项红（B-2 恢复矩阵）因此**先于聚合 fail** 检出，否则会被顶层「收据 fail-closed」吞掉专项提示。
+      if (prep.ok && prep.prepared.length > 0) {
+        const p0 = prep.prepared[0];
+        add("m1a_shadow_reconcile", "⑭ M1a 影子对账", false,
+          "初始化 WAL 未完成（token " + p0.token.slice(0, 8) + "，phase " + p0.phase + "）—— 按 B-2 恢复矩阵只允许同 token 恢复，禁止重初始化", null);
+      } else if (!prep.ok) {
+        add("m1a_shadow_reconcile", "⑭ M1a 影子对账", false, "init WAL 判定 fail-closed（" + prep.why + "）", null);
+      } else if (!agg.ok) {
+        add("m1a_shadow_reconcile", "⑭ M1a 影子对账", false,
+          "收据 fail-closed（" + (agg.unreadable.length > 0 ? agg.unreadable.length + " 个 journal 读不出，如 " + agg.unreadable[0].token.slice(0, 8) : agg.why) + "）", null);
+      } else {
+          const findings = [];
+          const parts = [];
+          const preparedBy = new Map(prep.prepared.map((p) => [p.endpointId, p]));
+          const receiptBy = new Map(agg.endpoints.map((e) => [e.endpointId, e]));
+          // endpoint 全集 = 有收据 ∪ 有 prepared WAL ∪ 账本目录（账本在场无收据也是矛盾态）。
+          const ledgerDirs = [];
+          let rootUnreadable = null;
+          // 账本根协议核验唯一化（#R19 四轮 P1）：复用账本模块 validateLedgerRoot（同一份协议，
+          // 非目录/symlink/父层别名 root_not_canonical 都在其中），doctor 只加盘点层（readdir 封闭枚举）。
+          const rootV = validateLedgerRoot({});
+          if (rootV.ok) {
+            let strangers = 0;
+            try {
+              for (const de of fs.readdirSync(rootV.root, { withFileTypes: true })) {
+                // 封闭枚举：endpoint 名下非真目录（文件/symlink）与陌生名字都不静默；
+                // 陌生名字只报计数，不输出原文（om_ 开头的文件名会泄 locator 前缀）；
+                // 不给未定义协议的 receipts 例外面子。
+                if (ENDPOINT_SHAPE.test(de.name)) {
+                  if (de.isDirectory()) ledgerDirs.push(de.name);
+                  else strangers += 1;
+                } else {
+                  strangers += 1;
+                }
+              }
+              if (strangers > 0) rootUnreadable = "账本根有 " + strangers + " 个未登记条目（计数制，不展示原文）";
+            } catch (err) {
+              if (err?.code !== "ENOENT") rootUnreadable = "readdir：" + (err?.code ?? String(err?.message ?? err).slice(0, 40));
+            }
+          } else if (rootV.reason !== "root_absent") {
+            // root_absent = 未接入（允许空）；其余协议理由码原样进 detail（封闭枚举，评审四轮 P1）。
+            rootUnreadable = rootV.reason;
+          }
+          if (rootUnreadable !== null) {
+            findings.push({ endpoint: null, ok: false, code: "ledger_inventory_unreadable",
+              detail: "ledger_inventory_unreadable：账本根盘点读不出（" + rootUnreadable + "）—— 无法盘点 shadow 账本，禁止当成未接入" });
+          }
+          const endpoints = [...new Set([...receiptBy.keys(), ...preparedBy.keys(), ...ledgerDirs])].sort();
+          for (const ep of endpoints) {
+            const receipt = receiptBy.get(ep) ?? null;
+            const prepJ = preparedBy.get(ep) ?? null;
+            const L = loadByEndpoint(ep);
+            if (prepJ !== null) {
+              findings.push({ endpoint: ep, ok: false, code: "init_wal_prepared",
+                detail: "初始化 WAL 未完成（token " + prepJ.token.slice(0, 8) + "，phase " + prepJ.phase + "）—— 按 B-2 恢复矩阵只允许同 token 恢复，禁止重初始化" });
+              continue;
+            }
+            if (L.ok === false) {
+              // 只出封闭的 L.reason（复评 P1-3）：校验器 why 原文可能带重复 locator 明文（session/root om_）。
+              if (receipt?.state === "ok" || receipt?.cutoverDone) {
+                findings.push({ endpoint: ep, ok: false, code: "ledger_missing",
+                  detail: (L.reason === "absent" ? "有初始化收据但账本缺席" : "有初始化收据但账本读不出（" + L.reason + "）") + " —— 禁止重初始化，需人工恢复" });
+              } else if (receipt === null) {
+                findings.push({ endpoint: ep, ok: false, code: "ledger_without_receipt",
+                  detail: "账本" + (L.reason === "absent" ? "目录在但读不出内容" : "读不出") + "且无初始化收据 —— 无法证明来历" });
+              }
+              // receipt never_initialized + 账本读不出：按 ledger_missing 同义（有迹象但无收据时已由上一支接住）。
+              else {
+                findings.push({ endpoint: ep, ok: false, code: "ledger_missing",
+                  detail: "无完成收据且账本读不出（" + L.reason + "）—— 不得重初始化" });
+              }
+              continue;
+            }
+            if (receipt === null || receipt.state !== "ok") {
+              // 账本读得出但无完成 init 收据（或有 prepared 已在上面接住）。
+              findings.push({ endpoint: ep, ok: false, code: "ledger_without_receipt",
+                detail: "账本在场但无完成初始化收据 —— 无法证明来历" });
+              continue;
+            }
+            // 收据 ok ∧ 账本可读 ∧ 已切权威 → M1a 影子对账不适用（评审 P1-5）：切权威后账本合法
+            // 演进、legacy 冻结，双射只会永久误红；只确认权威态，不跑对账。
+            if (receipt.cutoverDone) {
+              parts.push(ep + "=cutover 已收口（M1a 影子对账不适用）");
+              continue;
+            }
+            // 收据 ok ∧ 账本可读 → 旁路对账（严格只读）。
+            const chain = L.doc.chain;
+            const collectLegacy = chain === "claude"
+              ? () => collectClaudeLegacySnapshot({
+                  registryFile: ctx.registryFile,
+                  templateFile: path.join(ctx.home, ".claude", "feishu-bridge", "chain-config.json"),
+                })
+              : () => collectCodexLegacySnapshot({ home: ctx.codexEnv.FEISHU_CODEX_BRIDGE_HOME });
+            const r = reconcileLegacyEndpoint({ endpointId: ep, chain, collectLegacy, loadLedgerFn: () => loadByEndpoint(ep) });
+            if (r.ok === true) {
+              // 对账一致但 cutover 受阻是**确定的红**，不是"一致（待修）"（评审 P1-4）。
+              if (r.cutover_blockers.length > 0) {
+                findings.push({ endpoint: ep, ok: false, code: "cutover_blocked",
+                  detail: "cutover_blocked：对账一致但 cutover_blockers=" + r.cutover_blockers.length
+                    + "（" + r.cutover_blockers.slice(0, 3).map((b) => b.code).join("、") + "）—— 任一 blocker 则 cutover 拒" });
+              } else {
+                parts.push(ep + "=一致");
+              }
+            } else if (r.ok === null) {
+              findings.push({ endpoint: ep, ok: null, code: r.reason,
+                detail: "对账不可判（snapshot_moved）—— 下轮体检再看" });
+            } else {
+              const bits = [];
+              if (r.reason === "bijection_mismatch") {
+                bits.push("双射不成立：legacy 多 " + r.mismatches.filter((m) => m.code === "extra_in_legacy").length
+                  + " / shadow 多 " + r.mismatches.filter((m) => m.code === "extra_in_shadow").length
+                  + " / 字段不等 " + r.mismatches.filter((m) => m.code === "field_mismatch").length);
+                for (const m of r.mismatches.slice(0, 5)) {
+                  bits.push(m.code + "（ta:" + m.topic_agent_id.slice(0, 8) + "…" + (m.field ? "，" + m.field : "") + "）");
+                }
+              } else {
+                // 不透适配器/reconciler 的 why 原文（评审 P1-6：legacy why 可能携带项目名/task key 等非
+                // opaque 身份）；只出问题码 + 来源域（封闭枚举）。
+                bits.push(r.reason + (r.source ? "（" + r.source + "）" : ""));
+              }
+              // 判别联合（复评 P2-1）：bijection 支才有 cutover_blockers；其它失败支不带。
+              if ((r.cutover_blockers?.length ?? 0) > 0) {
+                bits.push("待修 " + r.cutover_blockers.length + "：" + r.cutover_blockers.slice(0, 3).map((b) => b.code).join("、"));
+              }
+              findings.push({ endpoint: ep, ok: false, code: r.reason, detail: bits.join("；") });
+            }
+          }
+          const okAll = findings.some((f) => f.ok === false) ? false
+            : findings.some((f) => f.ok === null) ? null : true;
+          const shown = findings.slice(0, 10).map((f) => f.endpoint + "：" + f.detail);
+          const overflow = findings.length > 10 ? "；另 " + (findings.length - 10) + " 条（完整清单由维护写入口随 op 落盘，体检零写入）" : "";
+          const body = (findings.some((f) => f.ok === false)
+            // findings 优先于“无 endpoint”文案（复评 P1-3）：账本根有陌生制品时
+            // 正文不能同时说“无任何 shadow 账本 / 收据（未接入）”——那会引导误判。
+            ? (findings.length + " 处说不清：" + shown.join("；")) + overflow
+            : endpoints.length === 0 ? "无任何 shadow 账本 / 收据（未接入）"
+            : (parts.length > 0 ? parts.join("、") + "；" : "")
+              + (findings.length === 0 ? "对账一致" : findings.length + " 处说不清：" + shown.join("；")) + overflow);
+          add("m1a_shadow_reconcile", "⑭ M1a 影子对账", okAll, body, null);
+        }
+      }
+    }
 
   // ── 汇总：任一 false → blocked；无 false 有 null → incomplete；全 true → ready
   const overall = checks.some((c) => c.ok === false) ? "blocked"

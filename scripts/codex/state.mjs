@@ -449,7 +449,7 @@ export function appendConsumed(task, messageId, { home = bridgeHome(), max = 500
   return next;
 }
 
-export function mappingForTask(task, { home = bridgeHome() } = {}) {
+export function mappingForTask(task, { home = bridgeHome(), now = undefined } = {}) {
   const mapping = {
     schema_version: "1.0",
     binding_id: task.id + "@codex-registry",
@@ -477,6 +477,7 @@ export function mappingForTask(task, { home = bridgeHome() } = {}) {
   const evolved = applyTopicGenerationToMapping(mapping, {
     runtime: "codex",
     bindingId: mapping.binding_id,
+    now,
   });
   // 持久化的新状态一旦损坏必须 fail-closed，不能悄悄回落到旧字段继续收消息。
   return evolved.ok ? evolved.mapping : {

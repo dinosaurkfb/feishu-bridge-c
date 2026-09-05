@@ -269,9 +269,16 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
 
 ## 5. M1a 双写（T3b）
 
-- **外层排序锁无降级**：§5.1 全表写方必先取 `ledger/<ep>/m1a-order.lock`（registry 锁协议），
-  固定 outer → legacy 锁段 → 账本锁段（内锁不同时持有）；取不到 → 整笔 busy 拒（=binding_busy
-  语义）。**无 legacy-only 路径。**
+- **M1a 逐端点原子启用（裁定补充）**：endpoint **未进入 M1a**（持久收据明确
+  never_initialized）时按 legacy-only 正常运行——判据是**收据状态**，不得把运行时
+  root_absent 当同义词；ledger_init 完成、账本为合法 shadow 后，该端点**原子进入双写强制**；
+  收据/账本说不清 → fail-closed。
+- **外层排序锁无降级（裁定：可 skip 的失败集为空）**：已启用端点的全表写方必先取
+  `ledger/<ep>/m1a-order.lock`；固定 outer → legacy 锁段 → 账本锁段；**任何取锁失败
+  （busy/maintenance/root_*/dir_perms/lock_residue/reap_*/io_error）均不得执行 legacy 写**
+  ——错误名不能证明无并发写方；`__shadow_skipped` 类标记亦不闭合（写标记本身要么绕 outer
+  要么需要新 WAL 协议）。只有**取得 outer 后**的 shadow 后半程失败，才保留已成立的 legacy
+  结果并外显 mismatch。
 - 顺序：先 legacy 提交后 shadow；崩在中间 = legacy 权威成立、shadow 缺 = mismatch 非业务失败；
   shadow 失败不改变 legacy 成功语义，连续失败 doctor 红报。
 - M1a 阶段 legacy 是唯一权威、ledger 是 shadow。

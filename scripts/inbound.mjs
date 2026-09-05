@@ -57,7 +57,8 @@ import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeo
 import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome, lockUnclearedText } from "./chat-ledger.mjs";
 import { closeClaudeTopicRotation } from "./topic-generation-store.mjs";
 import { recordClaudeActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
-import { wireChatA1 } from "./m1a/wiring.mjs";
+import { wireChatA1, wirePromoteBinding } from "./m1a/wiring.mjs";
+import { legacyEndpointId } from "./subscription.mjs";
 import {
   buildLegacyDialogueBoundAuthorizationContext,
 } from "./dialogue-binding-authorization.mjs";
@@ -426,14 +427,36 @@ if (!routed.ok) {
     process.exit(0);
   }
 
-  const wrote = promoteBinding({
-    root: promo.root,
-    id: promo.id,
-    source: promo.source,
-    generationId: promo.generationId,
-    operationId: pending.operationId,
-    sessionId: event.session_id,
+  // M1a 双写（#R37 W1/W2）：认领→绑定落盘处接 wirePromoteBinding —— 已启用端点（ledger_init done
+  //   收据）以 m1a-order 锁串行、先 legacy promoteBinding 后 create_a1→activate（W1）/ retarget（W2）shadow；
+  //   未启用端点（无收据）→ 合法 legacy-only、不写 shadow；已启用点任一取锁失败 → 整笔披、不写 legacy（skip 集为空）。
+  //   locator=被认领代际根消息 om（matched_om）；claimKey=claim.mjs 64hex；authorizedBy=event.sender_id。
+  //   W2 的 ledger 侧 claude_session_id 与 Aily session locator 不同构，且在认领现场尚不存在——retargetClaudeSessionId
+  //   先置 null，目标万一 active 会 fail-closed（不猜）；正常认领都是 pending→W1。
+  const wired = wirePromoteBinding({
+    endpointId: legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid }),
+    env: process.env,
+    legacy: () => promoteBinding({
+      root: promo.root,
+      id: promo.id,
+      source: promo.source,
+      generationId: promo.generationId,
+      operationId: pending.operationId,
+      sessionId: event.session_id,
+    }),
+    locator: pending.generation?.root_message_id ?? null,
+    claimKey: claimKey(event.message_id ?? "", promo.id ?? ""),
+    sessionId: event.session_id ?? null,
+    authorizedBy: event.sender_id ?? null,
+    retargetClaudeSessionId: null,
   });
+  if (!wired.ok) {
+    // 双写强制下锁取不到（busy/maintenance/root_*/dir_*/lock_residue/reap_* 等）：整笔披、不写 legacy、没有绑定。
+    writeReceipt("promote-m1a-" + event.message_id, { status: "rejected", reason: wired.reason ?? "m1a_reject", why: wired.why ?? null, lock: wired.lock ?? null, claim_acquired: false, handed_off: false, subscription_claim_shadow: subscriptionClaimShadow });
+    finish("rejected", { reasonText: "这条认领的 M1a 一致性锁取不到（" + (wired.reason ?? "unknown") + "），未绑定，请稍后再试一次" }, { reason: wired.reason ?? "m1a_reject" });
+  }
+
+  const wrote = wired.legacy;
   if (!wrote.ok) {
     writeReceipt("bind-failed-" + event.message_id, {
       status: "error", reason: wrote.reason, message_id: event.message_id,

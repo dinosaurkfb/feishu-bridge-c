@@ -57,6 +57,7 @@ import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeo
 import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome, lockUnclearedText } from "./chat-ledger.mjs";
 import { closeClaudeTopicRotation } from "./topic-generation-store.mjs";
 import { recordClaudeActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
+import { wireChatA1 } from "./m1a/wiring.mjs";
 import {
   buildLegacyDialogueBoundAuthorizationContext,
 } from "./dialogue-binding-authorization.mjs";
@@ -243,9 +244,22 @@ function chatTurn({ chain, template, event, dryRun, ledgerDir }) {
   if (seen.state === "running") finish("error", { detail: "这条消息还在答，等它答完；不会再起第二个回答" }, { reason: "chat_running", mode: CHAT_POLICY_ID });
   if (seen.state === "stale") finish("error", { detail: "这条消息上次的回答进程没留下结果；同一条消息不会再答，请再发一条新消息" }, { reason: "chat_stale", mode: CHAT_POLICY_ID });
   if (seen.state === "unreadable") finish("error", { detail: "这条消息的 chat 账本读不出（" + seen.why + "），没有回答" }, { reason: "chat_ledger_unreadable", mode: CHAT_POLICY_ID });
-  // 准入 —— 一把锁内：盘点（说不清就拒，不折叠成空闲）→ 上界 → 建 claim（闭合转换）
-  const admitted = admitChat({ ledgerDir, key, senderId: event.sender_id, budgetMs: chatReplyTimeoutMs(),
-    meta: { chain, message_id: messageId, session_id: event.session_id ?? null, sender_ref: senderRef(event.sender_id), role: gates.role, risk_class: risk.riskClass } });
+  // 准入 —— 一把锁内：盘点（说不清就拒，不折叠成空闲）→ 上界 → 建 claim（闭合转换）。
+  // M1a 双写（#R37）：A1 物化入口接 wireChatA1 —— 已启用端点（ledger_init done 收据）以 m1a-order
+  //   锁串行、先 legacy 后 create_a1 shadow；未启用端点（无收据）→ 合法 legacy-only、不写 shadow；
+  //   已启用点任一取锁失败 → 整笔拒、不写 legacy（见 m1a-reconciliation §5，skip 集为空）。
+  //   ponytail: chat 取锁失败即丢本消息（可用性换一致）；若需重试再在外层加退避。
+  const wired = wireChatA1({
+    agentUid: template.agent_uid, chatId: template.chat_id ?? null, sessionId: event.session_id ?? null, messageId,
+    admit: () => admitChat({ ledgerDir, key, senderId: event.sender_id, budgetMs: chatReplyTimeoutMs(),
+      meta: { chain, message_id: messageId, session_id: event.session_id ?? null, sender_ref: senderRef(event.sender_id), role: gates.role, risk_class: risk.riskClass } }),
+  });
+  if (!wired.ok) {
+    // 双写强制下锁取不到（busy/maintenance/root_*/dir_*/lock_residue/reap_* 等）：整笔拒、不写 legacy、没有回答。
+    writeReceipt("chat-m1a-" + messageId, { status: "rejected", reason: wired.reason ?? "m1a_reject", why: wired.why ?? null, lock: wired.lock ?? null, mode: CHAT_POLICY_ID, ...base });
+    finish("rejected", { reasonText: "这条消息的 M1a 一致性锁取不到（" + (wired.reason ?? "unknown") + "），未写 legacy、没有回答；稍后再问一次" }, { reason: wired.reason ?? "m1a_reject", mode: CHAT_POLICY_ID });
+  }
+  const admitted = wired.legacy;
   if (!admitted.ok) {
     const lockNote = admitted.lockUncleared ? "；另外" + lockUnclearedText(admitted.lockUncleared) : "";
     if (admitted.reason === "duplicate") finish("error", { detail: "这条消息刚被另一个进程接手回答；不会再起第二个回答" + lockNote }, { reason: "chat_duplicate_race", mode: CHAT_POLICY_ID });

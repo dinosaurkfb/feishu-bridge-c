@@ -25244,6 +25244,54 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     }
   }));
 
+  // #R37 A1 物化样板：wireChatA1 是入站 chat 流的 A1 写入口。端点由 agent_uid（运行时 claude）派生，
+  //   oc_ chat_id（template.chat_id）/ Aily session_id / message_id 一并线程化。
+  //   行为验证：① 已启用端点（EP 有 ledger_init done 收据）→ 派生端点=EP，先 legacy 后真实 create_a1 shadow；
+  //   ② 已启用点外层锁 busy → 整笔拒、legacy 未跑；③ never_initialized（无收据）→ 合法 legacy-only、不写 shadow。
+  //   ① 中 shadow 出现（family A1）本身就证明端点派生对了：若派生到别的端点，该端点无收据→legacy-only→shadow 为空。
+  test("m1a 双写接线：wireChatA1（A1 物化入口）——端点自 agent_uid 派生；已启用→双写；busy→拒；never_initialized→legacy-only", () => withRootAndReceipt((root, dir) => {
+    seedLedger(dir);
+    seedLedgerInitReceipt(path.join(root, "maint"), EP); // EP 已启用（ledger_init done）→ 双写强制路径
+    let legacyCalls = 0;
+    const legacyRec = (tag) => () => { legacyCalls += 1; return { tag, legacyCommitted: true }; };
+
+    // ① 已启用端点：wireChatA1 派生端点=EP → 先 legacy 后真实 create_a1 shadow（family A1）；释放 ok
+    {
+      const w = WIRE.wireChatA1({ agentUid: "agent_ledger_test", runtime: "claude", env: process.env, admit: legacyRec("a1"), chatId: "oc_chat", sessionId: "sess_chat", messageId: "msg_chat" });
+      assert.ok(w.ok, "wireChatA1 ok：" + JSON.stringify(w));
+      assert.equal(w.legacy.legacyCommitted, true, "legacy 已提交");
+      assert.equal(w.shadow.length, 1, "一笔 shadow（端点派生对了才有一笔；派生错→legacy-only→shadow 为空）");
+      assert.equal(w.shadow[0].op, "create_a1", "op 名");
+      assert.ok(w.shadow[0].ok, "create_a1 成功：" + JSON.stringify(w.shadow[0]));
+      assert.ok(w.release && w.release.ok, "释放 ok");
+      assert.ok(famIds(talLoad(dir), "A1").includes(w.shadow[0].result.created_id), "create_a1 产出 A1");
+    }
+
+    // ② 已启用点外层锁 busy → 整笔拒、legacy 未跑（不降级）
+    {
+      const acq = DW.acquireOrderLock(EP, process.env);
+      assert.ok(acq.ok, "取到外层锁（busy 反例）");
+      const before = legacyCalls;
+      const w = WIRE.wireChatA1({ agentUid: "agent_ledger_test", runtime: "claude", env: process.env, admit: legacyRec("busy"), chatId: "oc_chat_b", sessionId: "sess_chat_b", messageId: "msg_chat_b" });
+      assert.equal(w.ok, false, "busy→整笔拒");
+      assert.equal(w.reason, "binding_busy", "binding_busy");
+      assert.equal(w.commit, "not_committed", "未提交");
+      assert.equal(legacyCalls, before, "busy 时 legacy 未跑");
+      assert.ok(acq.release().ok, "释放");
+    }
+
+    // ③ never_initialized（agent_never 无收据）→合法 legacy-only：不写 shadow、无 release
+    {
+      const before = legacyCalls;
+      const w = WIRE.wireChatA1({ agentUid: "agent_never", runtime: "claude", env: process.env, admit: legacyRec("nop"), chatId: "oc_chat_n", sessionId: "sess_chat_n", messageId: "msg_chat_n" });
+      assert.ok(w.ok, "legacy-only 仍整体 ok：" + JSON.stringify(w));
+      assert.equal(legacyCalls, before + 1, "legacy 已跑");
+      assert.ok(w.legacy && w.legacy.legacyCommitted, "legacy 提交");
+      assert.equal(w.shadow.length, 0, "legacy-only 不写 shadow（无标记、无后缀）");
+      assert.equal(w.release, null, "legacy-only 不取 outer 锁、无 release");
+    }
+  }));
+
   // §3.1 proof-组合校验：直接构造自洽账本（除组合外全过），bad 组合→ledger_corrupt 且 why 命中组合规则；合法组合→ok（不误伤）。
   //   REJECT：A4-bare+migrated（无 link）；B3+migrated bp+pairing_merge link；B3+pairing bp+migrated link；A4-full+attach bp+migrated link（无 attach_a3 op，非 A3 继承）。
   //   ACCEPT：A4-full(unbind 继承)+(migrated,migrated)；A3(attach_a3 继承)+(attach,migrated)；A4-full(经 attach_a3→unbind 继承)+(attach,migrated)。

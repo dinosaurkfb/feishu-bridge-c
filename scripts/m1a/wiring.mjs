@@ -20,6 +20,7 @@ import {
 } from "../topic-agent-ledger.mjs";
 import { endpointReceipt } from "../maintenance/ledger-receipt.mjs";
 import { maintenanceDir } from "../maintenance/journal.mjs";
+import { legacyEndpointId } from "../subscription.mjs";
 
 const en = (v) => typeof v === "string" && v.length > 0 && v.length <= 256;
 
@@ -85,6 +86,18 @@ function runWired({ endpointId, env = process.env, legacy, submit }) {
 }
 
 /* ── per-writer 具名函数（§5.1 每一行一个） ─────────────────── */
+
+/* A1 物化（chat）双写接线：把入站 chat 的 endpoint（agent_uid 派生）/oc_ chat_id / Aily
+ * session_id / message_id 一并线程进 wireCreateA1，legacy 回调为 admitChat。
+ * #R37：wrapper 层面即执行裁定 —— 已启用点任一取锁失败 → 整笔拒、不写 legacy；
+ *   never_initialized → 合法 legacy-only；收据说不清 → fail-closed。可用性取 drop（裁定默认）。
+ * 这是入站 chat 流的 A1 写入口，专供 inbound.mjs chatTurn 使用（运行时恒为 claude）。 */
+export function wireChatA1({ agentUid, chatId, sessionId, messageId, env = process.env, admit, runtime = "claude", now = Date.now() }) {
+  return wireCreateA1({
+    endpointId: legacyEndpointId({ runtime, agentUid }), env, legacy: admit,
+    chatId, sessionId, messageId, now,
+  });
+}
 
 /**
  * wireCreateA1 —— 两链所有 A1 物化入口（任一受验首条 @ 的 chat 记录）→ 账本 create_a1。

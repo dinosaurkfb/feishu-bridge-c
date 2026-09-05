@@ -22949,6 +22949,66 @@ test("P2-① 真入口：release 残骸门（外层锁）——活 pid 持锁→
   }
 });
 
+// P2-① 真入口 e2e（#R37 返修）：同一条认领消息在**绑定已提交**后重投（幂等重放 / 崩溃重进）——
+//   第 2 次必须在入站层整笔拒（duplicate），registry 零变化、零新 shadow 步。真入口钉的是
+//   崩溃重进的**不双写**性质：绑定层已提交（registry 变 bound + create_a1/activate 已落），
+//   “续起会话”阶段失败（本轮受验无真实 Claude session → no_prior_session，即提交后崩溃），
+//   Lark 重投同一条 → 幂等命中，绝不重建、不重复绑定。
+test("P2-① 真入口：崩溃重进（幂等重放）——同一条认领消息重投→duplicate 拒、registry 零变化、零 shadow 新步", () => {
+  const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "12345", chat_name: "群", chat_id: "oc_abc", default_freshness_ms: 900000, agent_uid: "agent_x" };
+  const at = `<at id="${TPL.transport_open_id}" type="employee">${TPL.transport_agent_name}</at> `;
+  const ep = legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid });
+  const local = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "p21cr-")));
+  const root = path.join(local, "project"); const bin = path.join(local, "bin");
+  fs.mkdirSync(root, { recursive: true }); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, senders: [] }));
+  const seedProject = { id: "prom", root, name: "待认领", root_message_id: "om_prom", expires_at: "2099-01-01T00:00:00Z", inbound_state: "pending", session_id: null, status: "active", bound_at: "2026-08-20T00:01:00.000Z" };
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [seedProject] }));
+  const ledgerRoot = path.join(local, "ledger"); const maintDir = path.join(local, "maint");
+  const ledgerFile = path.join(ledgerRoot, ep, "ledger.json");
+  fs.mkdirSync(path.join(ledgerRoot, ep), { recursive: true, mode: 0o700 });
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot; process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = maintDir;
+  fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+  const ats = "2026-08-31T12:00:00.000Z"; const tok = "da88566e-d8d3-48ba-914e-7f96f4dfaeaa"; const sha = "b".repeat(64);
+  const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+  const tDone = (c) => ({ id: "timer:" + c, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: ats, chain: null });
+  const sDone = (c) => ({ id: "stub:" + c, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at: ats, chain: null });
+  const cDone = (c) => ({ id: "current:" + c, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at: ats, chain: null });
+  const gDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at: ats, chain: null });
+  const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+  const lStep = { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState, after: afterState, state: "done", at: ats, chain: "claude" };
+  fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: tok, reason: "seed", started_at: ats, updated_at: ats, phase: "done", steps: [...["claude", "codex"].flatMap((c) => [tDone(c), sDone(c), cDone(c)]), gDone(), lStep], notes: [] }), { mode: 0o600 });
+  const opId = "00000000-0000-0000-0000-000000000001";
+  fs.writeFileSync(ledgerFile, JSON.stringify({ schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: ep, chain: "claude", authority_mode: "shadow", revision: 1, operations: { [opId]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: ep, chain: "claude" }), result_revision: 1, result: { revision: 1 } } }, records: {} }, null, 2) + "\n", { mode: 0o600 });
+  const b1 = TAL.createB1({ endpointId: ep, requestKey: "req_seed_b1", chatId: TPL.chat_id, rootOm: "om_prom", lineageId: "lin_prom", bindingTarget: { runtime: "claude", project_root: root, claude_session_id: "22222222-2222-2222-2222-222222222222" } });
+  assert.ok(b1.ok, "createB1：" + JSON.stringify(b1));
+  assert.equal(endpointReceipt(maintDir, ep).state, "ok", "seed 收据应判 ok（M1a 已启用）");
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, "claude"), ["#!/usr/bin/env node", "process.stdout.write('回答：ok\\n');"].join("\n") + "\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
+  const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_p21cr_1", sessionID: "aily_dm", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + "绑定该话题" } }) }] });
+  const spawnEnv = { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_res", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir };
+  const run1 = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: spawnEnv });
+  const reg1 = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
+  const led1 = JSON.parse(fs.readFileSync(ledgerFile, "utf-8"));
+  delete process.env.FEISHU_BRIDGE_LEDGER_DIR; delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
+  try {
+    assert.equal(reg1.projects[0].inbound_state, "bound", "第 1 次应完成绑定（inbound_state→bound，提交后崩溃）：" + reg1.projects[0].inbound_state);
+    const ops1 = Object.values(led1.operations).map((op) => op.op_type);
+    assert.ok(ops1.includes("create_a1") && ops1.includes("activate"), "第 1 次绑定应落 shadow create_a1+activate：" + ops1.join(","));
+    // “提交后崩溃”重投同一条（幂等重放）：入站层整笔拒，绝不重复绑定。
+    const run2 = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: spawnEnv });
+    const reg2 = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
+    const led2 = JSON.parse(fs.readFileSync(ledgerFile, "utf-8"));
+    assert.equal(run2.status, 0, "重投应正常出口（拒绝，不是崩溃）：exit=" + run2.status + " stderr=" + run2.stderr);
+    assert.ok(run2.stdout.includes("已经处理过") && run2.stderr.includes('"reason":"duplicate"'), "重投应报幂等命中：stdout=" + run2.stdout + " stderr=" + run2.stderr);
+    assert.deepEqual(reg2.projects, reg1.projects, "重投后 registry 零变化（未重复绑定）");
+    const ops2 = Object.values(led2.operations).map((op) => op.op_type);
+    assert.deepEqual(ops2, ops1, "重投后零 shadow 新步：" + ops2.join(","));
+  } finally { fs.rmSync(local, { recursive: true, force: true }); }
+});
+
 
 test("#R12 P1：chat-id 形状判据唯一化（p2pChatIdProblem）—— 模板校验 / CLI 参数 / planP2pChange / isPrivateChatTurn 四点共用，反例矩阵全拒，判据退化为 startsWith 会转红", () => {
   // 评审探针复现：旧版两处判据漂移（chain-template 宽松 startsWith、CLI 严格正则），

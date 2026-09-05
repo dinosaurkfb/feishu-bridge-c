@@ -24,8 +24,8 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { acquirePublishLock, releasePublishLock, commitWhileHeld } from "../registry.mjs";
 import { gateBlocks } from "../maintenance-gate-core.mjs";
-import { ENDPOINT_SHAPE, ID_SHAPE, resolveEndpointDir } from "../topic-agent-ledger.mjs";
-import { interactionPolicyStateProblem, policySubjectId } from "./validator.mjs";
+import { ENDPOINT_SHAPE, resolveEndpointDir } from "../topic-agent-ledger.mjs";
+import { interactionPolicyStateProblem, policySubjectId, POLICY_SUBJECT_KINDS } from "./validator.mjs";
 import { canonicalPolicyContent, stableStringify } from "./canonical.mjs";
 
 export { ENDPOINT_SHAPE, policySubjectId }; // 派生实现在 validator.mjs（#R35 P1-2：外键自洽与哈希同处），re-export 保持 API
@@ -36,47 +36,57 @@ export const MAX_BYTES = 1024 * 1024;
 const ROOT_KEYS = "endpoint_id,entries,schema_version";
 const POLICY_SCHEMA_VERSION = "policy-1";
 const SUBJECT_ID_SHAPE = /^ps_[0-9a-f]{32}$/u;
-const KINDS = ["lineage", "topic_agent"];
 const LOCK_NAME = "policy.lock";
 const FILE_NAME = "policy.json";
 
-/* ───────────────── 条目校验（值全经 ipsp-1；subject 外键只在 store 层验，#R38 P1-5） ───────────────── */
+/* ───────────────── 条目校验（值全经 ipsp-1；kind 显式裁定 + 派生自洽，#R41 P1-2） ───────────────── */
 
-/** 单条目：subject 形状 + 值必须是过 ipsp-1 的完整六键 interaction_policy_state + 外键自洽（#R40 P1-4）。 */
-function entryProblem(subject, value, endpointId) {
+/**
+ * #R41 P1-2：kind 由调用方**显式声明**（kinds: { [psid]: kind }），store/validator 只核
+ * 「声明 kind 与 binding_id 派生出的挂载键一致」，不再从 binding_id 形状猜 —— 形状推断
+ * 会把 ta_<32hex> 的合法 lineage id 装进 topic_agent 主体域（LINEAGE_SHAPE 完整包含该形状）。
+ * fail-closed：缺声明 → policy_subject_kind_required；未知 kind → policy_subject_kind_invalid；
+ * 声明与派生不一致 → policy_subject_key_mismatch。检查顺序：subject 形状 → ipsp-1 → kind →
+ * 派生比对（存盘根 schema/尺寸/值问题先于 kind 暴露，EP2–EP7 语义不变）。
+ */
+function entryProblem(subject, value, endpointId, kinds) {
   if (!SUBJECT_ID_SHAPE.test(subject)) return { reason: "policy_store_bad_subject", detail: null };
   const ip = interactionPolicyStateProblem(value);
   if (ip !== null) return { reason: "policy_entry_invalid", detail: ip };
-  if (endpointId !== undefined) {
-    try {
-      if (subjectForEntry(value, endpointId) !== subject) {
-        return { reason: "policy_entry_invalid", detail: "policy_subject_key_mismatch" };
-      }
-    } catch {
-      return { reason: "policy_entry_invalid", detail: "policy_subject_key_mismatch" };
-    }
+  const kind = kinds != null && typeof kinds === "object" ? kinds[subject] : undefined;
+  if (kind === undefined || kind === null || kind === "") {
+    return { reason: "policy_entry_invalid", detail: "policy_subject_kind_required" };
   }
+  if (!POLICY_SUBJECT_KINDS.includes(kind)) {
+    return { reason: "policy_entry_invalid", detail: "policy_subject_kind_invalid" };
+  }
+  let derived;
+  try {
+    derived = policySubjectId({ kind, endpointId, id: value.binding_id });
+  } catch {
+    return { reason: "policy_entry_invalid", detail: "policy_subject_key_mismatch" };
+  }
+  if (derived !== subject) return { reason: "policy_entry_invalid", detail: "policy_subject_key_mismatch" };
   return null;
 }
 
 /**
- * #R40 P1-4：subject 外键在 store 层强制 —— 条目 binding_id 所属主体派生出的 policy_subject_id
- * 必须等于挂载键（T4 合同：条目本体回六键原样、binding_id 留 legacy 出处，但**派生关系不撤**）。
- * kind 由 binding_id 形状唯一判定：精确 ta_<32hex>（TAL.ID_SHAPE）→ topic_agent，否则按账本
- * lineage 派生。派生对非法输入抛 TypeError（fail-closed：形状洗不过就拒，不让哈希吞）。
+ * #R41 P1-2：同一 binding_id 不得跨 kind 双挂载（psid 派生含 kind，同 kind 同 id 必同键、
+ * 由 upsert 去重 —— 查重能抓到的只有「一个 identity 两个主体域各一份状态」）。
+ * 只在逐条目校验全过后跑；返回 detail 字符串或 null。
  */
-function subjectForEntry(value, endpointId) {
-  if (!value || typeof value !== "object" || typeof value.binding_id !== "string") {
-    throw new TypeError("invalid entry or binding_id");
+function bindingCollisionProblem(entries) {
+  const seen = new Set();
+  for (const s of Object.keys(entries)) {
+    const bid = entries[s] != null && typeof entries[s] === "object" ? entries[s].binding_id : undefined;
+    if (typeof bid !== "string") continue; // 非 object / 缺 binding_id 已由 ipsp-1 拒，这里只查重
+    if (seen.has(bid)) return "policy_binding_id_collision";
+    seen.add(bid);
   }
-  return policySubjectId({
-    kind: ID_SHAPE.test(value.binding_id) ? "topic_agent" : "lineage",
-    endpointId,
-    id: value.binding_id,
-  });
+  return null;
 }
 
-function rootSchemaProblem(raw, endpointId) {
+function rootSchemaProblem(raw, endpointId, kinds) {
   let doc;
   try { doc = JSON.parse(raw); } catch { return { reason: "policy_store_parse_failed", detail: null }; }
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return { reason: "policy_store_root_schema", detail: null };
@@ -87,21 +97,23 @@ function rootSchemaProblem(raw, endpointId) {
   const subjects = Object.keys(doc.entries);
   if (subjects.length > MAX_ENTRIES) return { reason: "policy_store_too_many_entries", detail: null };
   for (const s of subjects) {
-    const p = entryProblem(s, doc.entries[s], endpointId);
+    const p = entryProblem(s, doc.entries[s], endpointId, kinds);
     if (p !== null) return p;
   }
+  if (bindingCollisionProblem(doc.entries) !== null) return { reason: "policy_entry_invalid", detail: "policy_binding_id_collision" };
   return null;
 }
 
-/** 序列化形态（写路径合成用）：三键封闭 + 全部条目 subject 形状 + ipsp-1 + 外键（#R40 P1-4）。返回 {reason, detail} 或 null。 */
-function storeProblem(entries, endpointId) {
+/** 序列化形态（写路径合成用）：三键封闭 + 全部条目 subject 形状 + ipsp-1 + kind 显式核验 + binding 查重（#R41 P1-2）。返回 {reason, detail} 或 null。 */
+function storeProblem(entries, endpointId, kinds) {
   if (entries === null || typeof entries !== "object" || Array.isArray(entries)) return { reason: "policy_store_root_schema", detail: null };
   const subjects = Object.keys(entries);
   if (subjects.length > MAX_ENTRIES) return { reason: "policy_store_too_many_entries", detail: null };
   for (const s of subjects) {
-    const p = entryProblem(s, entries[s], endpointId);
+    const p = entryProblem(s, entries[s], endpointId, kinds);
     if (p !== null) return p;
   }
+  if (bindingCollisionProblem(entries) !== null) return { reason: "policy_entry_invalid", detail: "policy_binding_id_collision" };
   return null;
 }
 
@@ -113,7 +125,7 @@ function storeProblem(entries, endpointId) {
  * 返回 {ok:true, entries, raw} | {ok:true, absent:true, entries:{}} | {ok:false, reason, why?}。
  * #R40 P1-5：raw 带出盘上原始字节 —— 零写比对/读回比对都直接对它，不重新序列化。
  */
-export function loadPolicyStore({ endpointId, env = process.env } = {}) {
+export function loadPolicyStore({ endpointId, kinds, env = process.env } = {}) {
   if (typeof endpointId !== "string" || !ENDPOINT_SHAPE.test(endpointId)) return { ok: false, reason: "policy_store_bad_endpoint_id" };
   const dir = resolveEndpointDir(endpointId, { env, mustExistRoot: false });
   if (!dir.ok) return { ok: false, reason: "policy_store_" + dir.reason, why: dir.why };
@@ -144,7 +156,7 @@ export function loadPolicyStore({ endpointId, env = process.env } = {}) {
     return { ok: false, reason: "policy_store_unreadable", why: String(err?.code ?? err?.message ?? err) };
   }
   const rawText = raw.toString("utf-8");
-  const p = rootSchemaProblem(rawText, endpointId);
+  const p = rootSchemaProblem(rawText, endpointId, kinds);
   if (p !== null) return { ok: false, reason: p.reason, ...(p.detail ? { detail: p.detail } : {}) };
   const doc = JSON.parse(rawText);
   if (doc.endpoint_id !== endpointId) return { ok: false, reason: "policy_store_root_schema", why: "endpoint_id 与目录不符" };
@@ -259,7 +271,7 @@ const fsyncDir = (dir) => { const fd = fs.openSync(dir, fs.constants.O_RDONLY); 
  * foldLockUncleared（absent/not_owner/reap 残骸/异常都成 lockUncleared，带 path），
  * 不覆盖先到的。释放完才返回。
  */
-export function mutatePolicyStore({ endpointId, mutate, env = process.env } = {}) {
+export function mutatePolicyStore({ endpointId, kinds, mutate, env = process.env } = {}) {
   if (typeof endpointId !== "string" || !ENDPOINT_SHAPE.test(endpointId)) return { ok: false, reason: "policy_store_bad_endpoint_id" };
   if (typeof mutate !== "function") return { ok: false, reason: "policy_store_mutate_invalid" };
   // 锁前只做**只读**校验：resolveEndpointDir（不建任何东西）；目录缺席是合法首写，锁后建。
@@ -290,7 +302,7 @@ export function mutatePolicyStore({ endpointId, mutate, env = process.env } = {}
     // 锁内重验末级身份与权限（#R33 P1-3）：锁前后目录都可能被动过
     const re = resolveEndpointDir(endpointId, { env, mustExistRoot: true });
     if (!re.ok) { result = { ok: false, reason: "policy_store_" + re.reason, why: re.why, committed: false }; return result; }
-    const load = loadPolicyStore({ endpointId, env });
+    const load = loadPolicyStore({ endpointId, kinds, env });
     if (!load.ok) { result = { ...load, committed: false }; return result; }
     const next = mutate(load.entries);
     if (!next || typeof next !== "object" || next.ok !== true) {
@@ -309,13 +321,13 @@ export function mutatePolicyStore({ endpointId, mutate, env = process.env } = {}
       result = { ok: false, reason: "policy_store_mutate_invalid", why: "changed 只许布尔", committed: false };
       return result;
     }
-    const p = storeProblem(next.entries, endpointId);
+    const p = storeProblem(next.entries, endpointId, kinds);
     if (p !== null) { result = { ok: false, reason: p.reason, why: "写前全量校验不过，不落盘", ...(p.detail ? { detail: p.detail } : {}), committed: false }; return result; }
     const changed = next.changed === undefined ? true : next.changed;
     if (changed === false) {
       // #R40 P1-2：复用唯一受验读函数（O_NOFOLLOW / 单硬链接 / 0600 / 有界读）；
       // 缺席只允许配『规范空投影』（entries 为空对象），其余拒。
-      const current = loadPolicyStore({ endpointId, env });
+      const current = loadPolicyStore({ endpointId, kinds, env });
       if (!current.ok) {
         result = { ok: false, reason: current.reason, why: current.why, committed: false };
         return result;
@@ -357,7 +369,7 @@ export function mutatePolicyStore({ endpointId, mutate, env = process.env } = {}
     // 写后受验读回：全 ipsp-1 再过一遍；且读回条目必须与本次意图逐字一致（#R38 P1-4），
     // 读不回/读出非法/内容不符都如实报错（已提交，不谎报失败原因在写）
     // #R40 P1-6：所有已提交出口统一折叠 commit residue（r.lockUncleared），不丢残骸。
-    const verify = loadPolicyStore({ endpointId, env });
+    const verify = loadPolicyStore({ endpointId, kinds, env });
     if (!verify.ok) {
       result = { ok: false, reason: "policy_store_readback_failed", why: verify.reason + (verify.why ? "：" + verify.why : ""), committed: true, persistence: "uncertain", ...(r.lockUncleared ? { lockUncleared: r.lockUncleared } : {}) };
       return result;

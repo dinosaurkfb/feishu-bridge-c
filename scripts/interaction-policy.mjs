@@ -23,6 +23,9 @@ export const DEFAULT_DIALOGUE_BUDGET = Object.freeze({
   max_resource_units: 12,
 });
 
+/** processed_events 保留窗口：只保留最近 N 个回合的事件（校验侧按同一常量闭合）。 */
+export const PROCESSED_EVENTS_WINDOW = 256;
+
 export const DIALOGUE_STATUS = Object.freeze({
   ACTIVE: "active",
   COMPLETED: "completed",
@@ -358,7 +361,7 @@ export function reserveDialogueTurn(state, {
     dialogue_id: reservation.dialogue_id,
     turn_index: reservation.turn_index,
   });
-  next.dialogue.processed_events = next.dialogue.processed_events.slice(-256);
+  next.dialogue.processed_events = next.dialogue.processed_events.slice(-PROCESSED_EVENTS_WINDOW);
   next.dialogue.usage.rounds_started += 1;
   next.dialogue.usage.resource_units_used += resourceUnits;
   next.dialogue.next_turn_index += 1;

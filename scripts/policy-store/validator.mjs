@@ -16,7 +16,7 @@ import { ENDPOINT_SHAPE, ID_SHAPE, LINEAGE_SHAPE, canonKey, sha256 } from "../to
 import {
   DIALOGUE_POLICY_ID, DIALOGUE_STATUS, DIALOGUE_TURN_STATUS,
   DIALOGUE_STOP_CONDITIONS, DIALOGUE_FINAL_REASONS, INTERACTION_POLICY_SCHEMA_VERSION,
-  DIALOGUE_REASON,
+  DIALOGUE_REASON, PROCESSED_EVENTS_WINDOW,
 } from "../interaction-policy.mjs";
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -26,12 +26,13 @@ const positiveInteger = (v) => Number.isInteger(v) && v > 0;
 const nonNegativeInteger = (v) => Number.isInteger(v) && v >= 0;
 
 /** 六根键精确（#R38 P1-5 规格裁定：条目 = 原样六键 interaction_policy_state，m1a §4 policy-1）：
- *  binding_id 保留 legacy 原值只作出处（非空即可，不参与 subject 关联）；subject 只是外键（键名），
- *  关联校验在 store 层（subject 形状 + 同 subject 冲突规则），条目 schema 不带 subject 字段。 */
+ *  binding_id 保留 legacy 原值只作出处（非空即可）；subject 挂载键由 store 层以显式 kind 从
+ *  binding_id 派生并强制比对（#R41 P1-2），条目 schema 不带 subject 字段。 */
 const ROOT_KEYS = "binding_id,dialogue,policy_id,policy_version,schema_version,updated_at";
 
 /** policy_subject 派生域（与 store.mjs 同一实现，store re-export 保持 API）：键名派生的唯一判据。
- *  #R38 P1-5：外键自洽校验已撤（条目不带 subject 字段），派生只服务键的生成与形状校验。 */
+ *  #R41 P1-2：外键自洽在 store 层强制 —— kind 由调用方显式声明（不从 binding_id 形状猜），
+ *  store 核「声明 kind 派生出的键 == 挂载键」。 */
 export const POLICY_SUBJECT_KINDS = Object.freeze(["lineage", "topic_agent"]);
 export function policySubjectId({ kind, endpointId, id } = {}) {
   if (!POLICY_SUBJECT_KINDS.includes(kind)) throw new TypeError("policy_subject_id: kind 必须是 lineage|topic_agent");
@@ -85,7 +86,7 @@ const turnFacts = (turn) => ({
 /**
  * 校验 interaction_policy_state 条目；返回问题码字符串（fail-closed 的 reason）或 null（合法）。
  * #R38 P1-5：撤掉 #R35 的八键与 binding_id===subject_id 强制 —— 规格赢（m1a §4 policy-1 定的
- * 是原样六键条目），subject 关联在 store 层验（subject 形状 + 同 subject 冲突规则）。
+ * 是原样六键条目）；subject 关联（显式 kind + 派生比对 + binding 查重）在 store 层验（#R41 P1-2）。
  */
 export function interactionPolicyStateProblem(state) {
   if (!isObj(state)) return "policy_not_object";
@@ -142,6 +143,30 @@ export function interactionPolicyStateProblem(state) {
   }
   const maxProcessedTurn = d.processed_events.length === 0 ? 0 : Math.max(...d.processed_events.map((e) => e.turn_index));
   if (d.next_turn_index !== maxProcessedTurn + 1) return "dialogue_next_turn_index";
+  // #R41 P1-1 ③：轮数计账与回合索引锁步 —— 写路径里 rounds_started 与 next_turn_index 恒锁步 +1
+  //（reserve 同步 +1、duplicate 幂等不改、finalize 不动）。脱钩即计账损坏：利害路径是篡改
+  // rounds_started 后绕过 round_budget 闸多领轮次（旧版鸭子校验只看 rounds ≤ max，拦不住）。
+  if (d.usage.rounds_started !== d.next_turn_index - 1) return "dialogue_usage";
+  // #R41 P1-1 ③：processed_events 必须是当前保留窗口（PROCESSED_EVENTS_WINDOW）内的连续尾段
+  // —— 写路径只追加 + slice(-WINDOW) 截断。中段缺口会让 duplicate 幂等闸被绕过（老事件重放），
+  // 窗前截段、重复 turn_index、超长窗口都不是写方能产出的形状。
+  {
+    const sortedTurns = d.processed_events.map((e) => e.turn_index).sort((a, b) => a - b);
+    const windowStart = Math.max(1, maxProcessedTurn - (PROCESSED_EVENTS_WINDOW - 1));
+    for (let i = 0; i < sortedTurns.length; i += 1) {
+      if (sortedTurns[i] !== windowStart + i) return "dialogue_processed_events";
+    }
+  }
+  // #R41 P1-1 ①②：回合记账闭合 —— finalize 必写 last_turn、reserve 只在 active 空时开工，
+  // 所以有 processed 事件时 active/last 至少一个在场：active 缺席则 last 必在（且恰为最新回合，
+  // 由下方 last_turn 逐项检查钉死）；active 在场且已有完成回合（maxProcessedTurn ≥ 2）则 last
+  // 必在且恰为 active 的上一回合。两者皆无或有历史却删 last_turn 都不是写方能产出的形状。
+  if (d.processed_events.length > 0) {
+    if (d.active_turn === null && d.last_turn === undefined) return "dialogue_last_turn";
+    if (d.active_turn !== null && maxProcessedTurn >= 2 && d.last_turn === undefined) return "dialogue_last_turn";
+    if (d.active_turn !== null && d.last_turn !== undefined &&
+        d.last_turn.turn_index !== d.active_turn.turn_index - 1) return "dialogue_last_turn";
+  }
   if (!isCanonicalIso(d.started_at)) return "dialogue_started_at";
   if (!isCanonicalIso(d.deadline_at)) return "dialogue_deadline_at";
   if (!isCanonicalIso(d.updated_at)) return "dialogue_updated_at";
@@ -177,12 +202,20 @@ export function interactionPolicyStateProblem(state) {
       } else if (d.status === DIALOGUE_TURN_STATUS.COMPLETED) {
         // completed 携带 failed last_turn 必拒
         if (d.last_turn !== undefined && d.last_turn.status === DIALOGUE_TURN_STATUS.FAILED) return "dialogue_last_turn";
-        if (d.last_turn?.status === DIALOGUE_TURN_STATUS.CANCELLED) {
-          if (d.stop_reason !== d.last_turn.reason) return "dialogue_stop_reason";
-        }
-        if (![DIALOGUE_REASON.ROUND_BUDGET, DIALOGUE_REASON.TIME_BUDGET, DIALOGUE_REASON.RESOURCE_BUDGET].includes(d.stop_reason)) {
-          return "dialogue_stop_reason";
-        }
+        // #R41 P1-1 ④：completed 的 last_turn × stop_reason 按真实产生路径配对成封闭表 ——
+        // stopDialogue 只被 reserve 的三处停机调用，active 在场的只有 deadline 检查 →
+        // cancelled last_turn 只可能配 time_budget（且与 last_turn.reason 自洽）；零轮（无
+        // last_turn）时 round 停机不可达（rounds=0 < max_rounds ≥ 1），resource 可达（大
+        // resourceUnits 一次越过）。有历史时 last_turn 必在（上方记账闭合已拒）。
+        const stopOk = d.last_turn === undefined
+          ? d.stop_reason === DIALOGUE_REASON.TIME_BUDGET || d.stop_reason === DIALOGUE_REASON.RESOURCE_BUDGET
+          : d.last_turn.status === DIALOGUE_TURN_STATUS.COMPLETED
+            ? d.stop_reason === DIALOGUE_REASON.ROUND_BUDGET || d.stop_reason === DIALOGUE_REASON.TIME_BUDGET ||
+              d.stop_reason === DIALOGUE_REASON.RESOURCE_BUDGET
+            : d.last_turn.status === DIALOGUE_TURN_STATUS.CANCELLED
+              ? d.stop_reason === DIALOGUE_REASON.TIME_BUDGET && d.stop_reason === d.last_turn.reason
+              : false;
+        if (!stopOk) return "dialogue_stop_reason";
       }
     } else if (d.ended_at !== null && !isCanonicalIso(d.ended_at)) return "dialogue_ended_at";
   }

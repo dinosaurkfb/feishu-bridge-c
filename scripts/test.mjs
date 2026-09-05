@@ -28347,6 +28347,50 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     }
   });
 
+  test("policy-store #R43：资源累计下界补不可见历史轮（unseenCount 计入 + 单/双回合完全封闭）", () => {
+    // 探针 /tmp/r43-red.mjs 在 ac00e02 上验红：三轮低报（used=4 恰等旧下界）与 unseen=0 高报
+    // 全放行。store 层防线由 #R42 钉住（写事务同走 entryProblem），此处纯 ipsp 直查。
+    const NOW = Date.parse("2026-09-07T00:00:00.000Z");
+    const TA7 = "ta_" + "7".repeat(32);
+    const mkDialogue = () => setInteractionPolicyMode(
+      interactionPolicyStateForLegacy({ binding_id: TA7 }, { bindingId: TA7, now: NOW }).state,
+      { mode: "dialogue", now: NOW },
+    ).state;
+    const editD = (state, fn) => { const n = JSON.parse(JSON.stringify(state)); fn(n.dialogue); return n; };
+
+    // ─── 三轮低报（Codex 给定探针）：2+3+4=9，篡改 used=4（恰等旧下界 last=4）───
+    {
+      let st = mkDialogue();
+      for (const [i, units] of [[0, 2], [1, 3], [2, 4]]) {
+        st = reserveDialogueTurn(st, { eventId: "e" + i, runId: "r" + i, localTargetId: "lt", originChannelGenerationId: "og", resourceUnits: units, now: NOW + 2 * i + 1 }).state;
+        st = finalizeDialogueTurn(st, { runId: "r" + i, status: "completed", now: NOW + 2 * i + 2 }).state;
+      }
+      assert.equal(interactionPolicyStateProblem(st), null, "基线：三轮真值 used=9 合法");
+      assert.equal(interactionPolicyStateProblem(editD(st, (d) => { d.usage.resource_units_used = 8; })), null,
+        "下界不误伤：used=8 ≥ minimumUsed（4 可见 + 2 不可见轮）合法");
+      const under = editD(st, (d) => { d.usage.resource_units_used = 4; });
+      assert.equal(interactionPolicyStateProblem(under), "dialogue_usage", "三轮低报拒（minimumUsed=visible 4 + unseen 2 = 6；红：旧版放行）");
+      // 利害事实钉：低报态进准入即开工（真耗 9+6=15/10 超限）——防线在存储层
+      const r = reserveDialogueTurn(under, { eventId: "e3", runId: "r3", localTargetId: "lt", originChannelGenerationId: "og", resourceUnits: 6, now: NOW + 10 });
+      assert.equal(r.accepted, true, "利害事实钉：低报态进准入即开工（真耗 15/10）");
+    }
+
+    // ─── unseenCount === 0 完全封闭：单/双回合高报也拒 ───
+    {
+      let st = reserveDialogueTurn(mkDialogue(), { eventId: "e0", runId: "r0", localTargetId: "lt", originChannelGenerationId: "og", resourceUnits: 7, now: NOW + 1 }).state;
+      assert.equal(interactionPolicyStateProblem(st), null, "基线：单回合在途真值合法");
+      assert.equal(interactionPolicyStateProblem(editD(st, (d) => { d.usage.resource_units_used = 8; })), "dialogue_usage", "单回合高报拒（unseen=0，used 必须 === visible）");
+      st = finalizeDialogueTurn(st, { runId: "r0", status: "completed", now: NOW + 2 }).state;
+      assert.equal(interactionPolicyStateProblem(editD(st, (d) => { d.usage.resource_units_used = 9; })), "dialogue_usage", "单回合终局高报拒");
+      st = reserveDialogueTurn(st, { eventId: "e1", runId: "r1", localTargetId: "lt", originChannelGenerationId: "og", resourceUnits: 2, now: NOW + 3 }).state;
+      assert.equal(interactionPolicyStateProblem(st), null, "基线：双回合在途真值合法");
+      assert.equal(interactionPolicyStateProblem(editD(st, (d) => { d.usage.resource_units_used = 10; })), "dialogue_usage", "双回合高报拒（unseen=0，visible=9）");
+    }
+
+    // unseenCount < 0 分支纯防御：known > rounds 的组合会被 R41 记账闭合/last 键检查
+    // 前置封锁（active+last 在场则 rounds ≥ 2），无独立可达红位，实现里保留 fail-closed。
+  });
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

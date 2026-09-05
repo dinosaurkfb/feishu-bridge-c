@@ -147,15 +147,24 @@ export function interactionPolicyStateProblem(state) {
   //（reserve 同步 +1、duplicate 幂等不改、finalize 不动）。脱钩即计账损坏：利害路径是篡改
   // rounds_started 后绕过 round_budget 闸多领轮次（旧版鸭子校验只看 rounds ≤ max，拦不住）。
   if (d.usage.rounds_started !== d.next_turn_index - 1) return "dialogue_usage";
-  // #R42 P1-1：资源累计下界 —— 写方 reserve 开领即计（used += resource_units），任何时刻
-  // active_turn（本回合）与 last_turn（上一回合）的 units 之和恒 ≤ used（更早回合的消耗仍在
-  // used 里只是不可见，下界不等式对窗口外累计同样成立）。低报态（如篡改 used=0）一旦过校验，
-  // 准入闸（reserve 直接信 used）就会放行第三次领用超限 —— 按下界不等式收，低报必拒；
-  // 高报只会提前触发保守停机，不在本刀范围。active 与 last 是不同回合（上方记账闭合已钉），不双计。
+  // #R42 P1-1 / #R43 P1：资源累计下界 + 不可见历史轮 —— 写方 reserve 开领即计（used +=
+  // resource_units），任何时刻 active_turn（本回合）与 last_turn（上一回合）的 units 之和恒 ≤
+  // used；rounds_started 超出可见轮数的每轮消耗不可见但已计入 used，而每轮 units 恒为正整数，
+  // 故不可见轮每轮至少贡献 1。低报态（如篡改 used=0、或三轮后恰改到可见和）一旦过校验，
+  // 准入闸（reserve 直接信 used）就会放行第三次领用超限（真耗 15/10 探针）——按下界不等式收，
+  // 低报必拒；不可见轮数为 0（单/双回合）时全部消耗可见，进一步要求 used 恰等 visibleUnits
+  // 完全封闭（高报同样拒）；高报且 unseenCount ≥ 1 只会提前触发保守停机，不在本刀范围。
+  // unseenCount < 0 纯防御：known > rounds 的组合会被上方记账闭合/last 键检查前置封锁，
+  // 可达性为零但 fail-closed 保留。
   {
     const visibleUnits = (d.active_turn !== null ? d.active_turn.resource_units : 0) +
       (d.last_turn !== undefined ? d.last_turn.resource_units : 0);
-    if (d.usage.resource_units_used < visibleUnits) return "dialogue_usage";
+    const knownCount = (d.active_turn !== null ? 1 : 0) + (d.last_turn !== undefined ? 1 : 0);
+    const unseenCount = d.usage.rounds_started - knownCount;
+    if (unseenCount < 0) return "dialogue_usage";
+    if (unseenCount === 0
+      ? d.usage.resource_units_used !== visibleUnits
+      : d.usage.resource_units_used < visibleUnits + unseenCount) return "dialogue_usage";
   }
   // #R41 P1-1 ③ / #R42 P2：processed_events 必须是当前保留窗口（PROCESSED_EVENTS_WINDOW）内的
   // 连续尾段，且**按存储顺序**逐项核（写方只追加 + slice(-WINDOW) 截断，产出恒为升序数组）。

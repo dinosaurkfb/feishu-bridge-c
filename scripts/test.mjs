@@ -25292,6 +25292,31 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     }
   }));
 
+  // resolveLiveId：按 locator（session_id / root_om）解析 live 影记录 id —— claim→bind 的 b1Id、
+  //   enabled 翻转的 id、void 的目标 id 共用。行为验证：① 按 session_id 命中 A1；② 按 root_om 命中 B1；
+  //   ③ 未命中→locator_absent；④ 空 locator→bad_locator；⑤ 账本缺席→ledger_absent（fail-closed，不猜测）。
+  test("m1a 账本 query：resolveLiveId 按 locator 命中 live 记录；absent/缺失→fail-closed，不猜测", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    const a1 = talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_r", sessionId: "sess_r" }), "A1");
+    const a1Id = a1.result.created_id;
+    const b1 = talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_r", rootOm: "om_res", lineageId: "lin_res", bindingTarget: TGT }), "B1");
+    const b1Id = b1.result.created_id;
+    // ① 按 session_id 命中 A1
+    assert.deepEqual(TAL.resolveLiveId({ endpointId: EP, locator: "sess_r" }), { ok: true, id: a1Id }, "session_id→A1");
+    // ② 按 root_om 命中 B1
+    assert.deepEqual(TAL.resolveLiveId({ endpointId: EP, locator: "om_res" }), { ok: true, id: b1Id }, "root_om→B1");
+    // ③ 未命中→locator_absent
+    assert.equal(TAL.resolveLiveId({ endpointId: EP, locator: "no_such_loc" }).reason, "locator_absent", "未命中");
+    // ④ 空 locator→bad_locator
+    assert.equal(TAL.resolveLiveId({ endpointId: EP, locator: "" }).reason, "bad_locator", "空 locator");
+    // ⑤ 账本缺席→ledger_absent（fail-closed 不猜测）
+    const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(root, "no-such-ledger-root");
+    const absent = TAL.resolveLiveId({ endpointId: EP, locator: "sess_r" });
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = saved;
+    assert.equal(absent.reason, "ledger_absent", "账本缺席→ledger_absent");
+  }));
+
   // §3.1 proof-组合校验：直接构造自洽账本（除组合外全过），bad 组合→ledger_corrupt 且 why 命中组合规则；合法组合→ok（不误伤）。
   //   REJECT：A4-bare+migrated（无 link）；B3+migrated bp+pairing_merge link；B3+pairing bp+migrated link；A4-full+attach bp+migrated link（无 attach_a3 op，非 A3 继承）。
   //   ACCEPT：A4-full(unbind 继承)+(migrated,migrated)；A3(attach_a3 继承)+(attach,migrated)；A4-full(经 attach_a3→unbind 继承)+(attach,migrated)。

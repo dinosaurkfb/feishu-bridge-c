@@ -720,6 +720,26 @@ export function loadByEndpoint(endpointId, { env = process.env } = {}) {
   return loadLedger(d.dir, { endpointId });
 }
 
+/** 按 locator 解析 live 影记录 id（claim→bind 的 b1Id、enabled 翻转的 id、void 的目标 id 共用）。
+ *  locator = aliases.session_id 或 aliases.root_om；G3 校验保证全局唯一，但防御性复查命中多条→ambiguous。
+ *  账本读取失败→ledger_absent / ledger_unreadable（fail-closed，不猜测）。 */
+export function resolveLiveId({ endpointId, locator, env = process.env } = {}) {
+  if (typeof locator !== "string" || locator.length === 0) return { ok: false, reason: "bad_locator" };
+  const l = loadByEndpoint(endpointId, { env });
+  if (!l.ok) {
+    const absent = l.reason === "absent" || l.reason === "no_root" || l.reason === "root_absent";
+    return { ok: false, reason: absent ? "ledger_absent" : "ledger_unreadable", why: l.why ?? null };
+  }
+  const hits = [];
+  for (const [id, r] of Object.entries(l.doc.records)) {
+    if (r.kind !== "live") continue;
+    if (r.aliases?.session_id === locator || r.aliases?.root_om === locator) hits.push(id);
+  }
+  if (hits.length === 0) return { ok: false, reason: "locator_absent" };
+  if (hits.length > 1) return { ok: false, reason: "locator_ambiguous", ids: hits };
+  return { ok: true, id: hits[0] };
+}
+
 /* ─────────────────────────── 写：唯一 tmp + prevTmp + fenced 提交（四态，释放折进结果） ─────────────────────────── */
 
 function writeTmpBytes(dir, base, bytes) {

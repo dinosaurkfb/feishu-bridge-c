@@ -347,8 +347,9 @@ const carryReapResidue = (done, result) => (done?.reapUncleared && result && typ
 // beforeReap / duringReap 只给测试用：在"判定陈旧"与"进 reap 锁重核"之间、以及拿到 reap 锁之后
 // 插一个动作，把并发窗口写成确定性的行为测试。
 export function acquirePublishLock(lockDir, opts = {}) {
-  // 维护门（issue #81）兜底：18 个调用面都从这里过，门在或读不出 → 取不到锁（reason maintenance），各自按既有"取不到锁"路径受控退出
-  { const gate = gateBlocks(); if (gate.blocked) return { ok: false, reason: "maintenance", gate: gate.state, text: gate.text }; }
+  // 维护门（issue #81）兜底：18 个调用面都从这里过，门在或读不出 → 取不到锁（reason maintenance），各自按既有"取不到锁"路径受控退出。
+  // #R35 P1-5：env 必须透传 —— 门与 ledger 都从同一份 env 解析，预检与锁原语不一致就是绕门口子（非竞态补丁）。
+  { const gate = gateBlocks({ env: opts.env }); if (gate.blocked) return { ok: false, reason: "maintenance", gate: gate.state, text: gate.text }; }
   return acquireLockUngated(lockDir, opts);
 }
 

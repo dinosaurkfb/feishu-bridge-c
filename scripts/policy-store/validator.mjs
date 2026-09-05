@@ -12,6 +12,7 @@
 
 import { isCanonicalIso } from "../canonical-time.mjs";
 import { usableGeneration } from "../topic-generation.mjs";
+import { ENDPOINT_SHAPE, ID_SHAPE, LINEAGE_SHAPE, canonKey, sha256 } from "../topic-agent-ledger.mjs";
 import {
   DIALOGUE_POLICY_ID, DIALOGUE_STATUS, DIALOGUE_TURN_STATUS,
   DIALOGUE_STOP_CONDITIONS, DIALOGUE_FINAL_REASONS, INTERACTION_POLICY_SCHEMA_VERSION,
@@ -23,8 +24,20 @@ const nonEmpty = (v) => typeof v === "string" && v.length > 0;
 const positiveInteger = (v) => Number.isInteger(v) && v > 0;
 const nonNegativeInteger = (v) => Number.isInteger(v) && v >= 0;
 
-/** 六根键精确（m1a §4 policy-1 条目契约）：schema_version/binding_id/policy_id/policy_version/updated_at/dialogue。 */
-const ROOT_KEYS = "binding_id,dialogue,policy_id,policy_version,schema_version,updated_at";
+/** 八根键精确（#R35 P1-2：subject↔binding_id 外键进条目本体）：六键 + subject_kind/subject_id。 */
+const ROOT_KEYS = "binding_id,dialogue,policy_id,policy_version,schema_version,subject_id,subject_kind,updated_at";
+
+/** policy_subject 派生域（与 store.mjs 同一实现，store re-export 保持 API；#R35 P1-2 搬入校验器，
+ *  外键自洽校验要在同一处算 ps_，避免 store↔validator 循环 import）。 */
+export const POLICY_SUBJECT_KINDS = Object.freeze(["lineage", "topic_agent"]);
+export function policySubjectId({ kind, endpointId, id } = {}) {
+  if (!POLICY_SUBJECT_KINDS.includes(kind)) throw new TypeError("policy_subject_id: kind 必须是 lineage|topic_agent");
+  if (typeof endpointId !== "string" || !ENDPOINT_SHAPE.test(endpointId)) throw new TypeError("policy_subject_id: endpointId 必须是 endpoint_<24hex>");
+  if (typeof id !== "string" || id.length === 0) throw new TypeError("policy_subject_id: id 必须是非空字符串");
+  if (kind === "topic_agent" && !ID_SHAPE.test(id)) throw new TypeError("policy_subject_id: topic_agent id 必须是 ta_<32hex>");
+  if (kind === "lineage" && !LINEAGE_SHAPE.test(id)) throw new TypeError("policy_subject_id: lineage id 必须是账本 lineage 形状（有界、无控制字符）");
+  return "ps_" + sha256(canonKey({ domain: "policy_subject_v1", kind, endpoint_id: endpointId, id })).slice(0, 32);
+}
 
 /** dialogue 必有键全集（写路径创建体冻结：19 键）；last_turn 由 finalize/stop 才写 → 可选。 */
 const DIALOGUE_REQUIRED_KEYS = [
@@ -69,11 +82,22 @@ const turnFacts = (turn) => ({
 /**
  * 校验 interaction_policy_state 条目；返回问题码字符串（fail-closed 的 reason）或 null（合法）。
  * { bindingId } 给定时要求条目 binding_id 与之一致（存储层外键核对）。
+ * { endpointId, subjectKey } 给定时（存储层）重算 ps_ 核对键与 subject_kind/subject_id 自洽
+ * （#R35 P1-2 外键三重：条目内 kind↔id 形状、binding_id===subject_id、键↔字段哈希自洽）。
  */
-export function interactionPolicyStateProblem(state, { bindingId } = {}) {
+export function interactionPolicyStateProblem(state, { bindingId, endpointId, subjectKey } = {}) {
   if (!isObj(state)) return "policy_not_object";
   if (keysOf(state) !== ROOT_KEYS) return "policy_root_keys";
   if (state.schema_version !== INTERACTION_POLICY_SCHEMA_VERSION) return "policy_schema_version";
+  if (!POLICY_SUBJECT_KINDS.includes(state.subject_kind)) return "policy_subject_kind";
+  if (typeof state.subject_id !== "string" || state.subject_id.length === 0) return "policy_subject_id";
+  if (state.subject_kind === "topic_agent" && !ID_SHAPE.test(state.subject_id)) return "policy_subject_id";
+  if (state.subject_kind === "lineage" && !LINEAGE_SHAPE.test(state.subject_id)) return "policy_subject_id";
+  if (state.binding_id !== state.subject_id) return "policy_subject_binding_mismatch";
+  if (endpointId !== undefined && subjectKey !== undefined &&
+      policySubjectId({ kind: state.subject_kind, endpointId, id: state.subject_id }) !== subjectKey) {
+    return "policy_subject_key_mismatch";
+  }
   if (!nonEmpty(state.binding_id)) return "policy_binding_id";
   if (bindingId !== undefined && state.binding_id !== bindingId) return "policy_binding_id_mismatch";
   if (!isCanonicalIso(state.updated_at)) return "policy_updated_at";
@@ -128,10 +152,12 @@ export function interactionPolicyStateProblem(state, { bindingId } = {}) {
   if (!isCanonicalIso(d.deadline_at)) return "dialogue_deadline_at";
   if (!isCanonicalIso(d.updated_at)) return "dialogue_updated_at";
 
-  // 状态关系联合封闭（#R33 P1-1）：终局三值（failed/completed/cancelled）必有规范 ended_at +
-  // 受控终局原因且 active_turn 空；active 反之；mapping 是终局审计快照，三元组可遗留可空但值域仍受控。
-  // 与写路径冻结的对应关系：终局三元组由 finalize/stop 写入；dialogue→mapping 直接切回时末跑完终局的
-  // dialogue 会带 null 三元组进快照 —— 这是合法演进，不算矛盾。
+  // 状态关系联合封闭（#R33 P1-1）+ dialogue.status × last_turn.status 封闭矩阵（#R35 P1-1）：
+  // 终局三值必有规范 ended_at + 受控终局原因且 active_turn 空；active 反之。矩阵按写路径冻结：
+  // failed ⇔ last_turn=failed（FAILED 分支唯一产生，跨回合覆盖）；cancelled ⇔ last_turn=cancelled
+  //（finalize CANCELLED 唯一产生）；completed/active 时 last_turn 任意终态或缺席（stopDialogue 在
+  // 无 active_turn 时保留上轮终态，映射切回后审计快照可能是任意组合，不作过度约束）。
+  // mapping 是终局审计快照，三元组可遗留可空但值域仍受控。
   if (d.status === DIALOGUE_STATUS.ACTIVE) {
     if (d.ended_at !== null || d.stop_reason !== null) return "dialogue_status";
   } else {
@@ -139,6 +165,8 @@ export function interactionPolicyStateProblem(state, { bindingId } = {}) {
       if (d.ended_at === null || !isCanonicalIso(d.ended_at)) return "dialogue_ended_at";
       if (d.stop_reason === null || !DIALOGUE_FINAL_REASONS.includes(d.stop_reason)) return "dialogue_stop_reason";
       if (d.active_turn !== null) return "dialogue_active_turn";
+      if (d.status === DIALOGUE_TURN_STATUS.FAILED && d.last_turn !== undefined && d.last_turn.status !== DIALOGUE_TURN_STATUS.FAILED) return "dialogue_last_turn";
+      if (d.status === DIALOGUE_TURN_STATUS.CANCELLED && d.last_turn !== undefined && d.last_turn.status !== DIALOGUE_TURN_STATUS.CANCELLED) return "dialogue_last_turn";
     } else if (d.ended_at !== null && !isCanonicalIso(d.ended_at)) return "dialogue_ended_at";
   }
 

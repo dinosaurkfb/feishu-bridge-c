@@ -52,12 +52,15 @@ export const DIALOGUE_REASON = Object.freeze({
 /**
  * 受控终局原因 = 现行 DIALOGUE_REASON ∪ 生产真写的三个投递失败原因（#R33 P1-1）。
  * 这是写方与 policy-store 校验器（ipsp-1）的**同一份封闭合同**：双方都从这里 import，不各养一份。
- * 已知开口：watch-and-publish 把 run 的 reason 透传进 finalizeDialogueTurn（动态字符串），
- * 写路径尚未按本枚举收紧 —— 那是接线单的事（要连 watch-and-publish 一起改）；存储层先按全集收口。
+ * #R35 P1-1：改为**纯终局枚举** —— 去掉拒绝态原因（policy_invalid / not_active / turn_active /
+ * duplicate_event：它们是 reserve/setMode 的拒绝原因，永远不会成为一次对话的终局），纳入
+ * watcher 真写的 watch_timeout 与 stop-hook 真写的 empty_final_output；watch-and-publish 的
+ * 动态 reason 未知值在调用点归一化到 dialogue_run_failed（同文件收口，不留给接线单）。
  */
 export const DIALOGUE_FINAL_REASONS = Object.freeze([
-  ...Object.values(DIALOGUE_REASON),
-  "forward_failed", "handoff_failed", "runtime_failed",
+  DIALOGUE_REASON.RUN_FAILED, DIALOGUE_REASON.HUMAN_INTERRUPT,
+  DIALOGUE_REASON.ROUND_BUDGET, DIALOGUE_REASON.TIME_BUDGET, DIALOGUE_REASON.RESOURCE_BUDGET,
+  "forward_failed", "handoff_failed", "runtime_failed", "watch_timeout", "empty_final_output",
 ]);
 
 const nonEmpty = (value) => typeof value === "string" && value.length > 0;
@@ -377,6 +380,14 @@ export function finalizeDialogueTurn(state, {
   if (![DIALOGUE_TURN_STATUS.COMPLETED, DIALOGUE_TURN_STATUS.FAILED,
     DIALOGUE_TURN_STATUS.CANCELLED].includes(status)) {
     return { ok: false, reason: "invalid_dialogue_turn_status" };
+  }
+  // 写前强制校验终局原因（#R35 P1-1：写方与 ipsp-1 同源闭合）——FAILED/CANCELLED 的 reason
+  // 必须在纯终局枚举内（null 归一化为写路径内部默认）；COMPLETED 无终局原因（超预算的
+  // stop_reason 由下面内部算出），调用方传了就拒，不让任意动态字符串洗进终局。
+  if (status === DIALOGUE_TURN_STATUS.COMPLETED) {
+    if (reason !== null) return { ok: false, reason: "invalid_dialogue_final_reason" };
+  } else if (reason !== null && !DIALOGUE_FINAL_REASONS.includes(reason)) {
+    return { ok: false, reason: "invalid_dialogue_final_reason" };
   }
 
   const next = clone(state);

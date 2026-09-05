@@ -50,7 +50,7 @@ function capture(op, res) {
 //   · state === "ok"（ledger_init done）→ 双写强制：**任一取锁失败都不得写 legacy**（错误名不能证明无并发写方）。
 // 已启用点外层锁无降级（裁定：可 skip 的失败集为空）；只有**取得 outer 后**的 shadow 后半程失败，
 // 才保留已成立的 legacy 结果并外显 mismatch（shadow[i] 投影失败）。
-function runWired({ endpointId, env = process.env, legacy, submit }) {
+function runWired({ endpointId, env = process.env, legacy, submit, lockOnly = false }) {
   const recDir = maintenanceDir(env);
   const receipt = typeof recDir === "string" && recDir.length > 0
     ? endpointReceipt(recDir, endpointId)
@@ -96,7 +96,9 @@ function runWired({ endpointId, env = process.env, legacy, submit }) {
       return result;
     }
     // legacy 明确未提交（ok:false）→ 无 legacy 结果可镜像 → 不跑 shadow 后缀（不写幽灵记录/标记）。
-    const shadow = legacyRes && legacyRes.ok === false ? [] : (submit(legacyRes) ?? []);
+    // W4（P1-3③）：lock-only 行（连接暂停/恢复、enabled 翻转）不写 shadow 事务——对账兜底（doctor+repair），
+    //   但 outer 锁必须取（绕过 outer 就穿了 cutover 快照窗口）；对账兜底=无双写，**不是无锁**。
+    const shadow = lockOnly ? [] : (legacyRes && legacyRes.ok === false ? [] : (submit(legacyRes) ?? []));
     result = { ok: true, legacy: legacyRes, shadow, release: null };
     return result;
   } finally {
@@ -252,13 +254,14 @@ export function wireVoid({ endpointId, env = process.env, legacy, rotationOpId, 
 export function wirePauseResume({ endpointId, env = process.env, legacy, controlClaimKey, id, mode, now = Date.now() }) {
   if (mode !== "pause" && mode !== "resume") return { ok: false, commit: "not_committed", reason: "bad_mode", why: "mode 只认 pause|resume", legacy: null, shadow: null, release: null };
   const opType = mode === "pause" ? "unbind" : "restore";
+  // 连接暂停/恢复 = W4 对账兜底行（无持久审计 id，不实时双写）：只取 outer 锁、不写 shadow（PX1-3③）。
   return runWired({ endpointId, env, legacy, submit: (legacyRes) => {
     if (!en(controlClaimKey) || !en(id)) return [{ op: opType, ok: false, reason: "bad_external_id", why: "controlClaimKey/id 必填 1..256 字符串" }];
     const k = rk(opType, controlClaimKey, id);
     if (!k.ok) return [{ op: opType, ...k }];
     const fn = mode === "pause" ? unbind : restore;
     return [capture(opType, fn({ endpointId, requestKey: k.request_key, id, now, env }))];
-  } });
+  }, lockOnly: true });
 }
 
 /**
@@ -267,8 +270,10 @@ export function wirePauseResume({ endpointId, env = process.env, legacy, control
  * ext=同上持久控制 claim key；entity=目标 id。
  */
 export function wireEnabledFlip({ endpointId, env = process.env, legacy, controlClaimKey, id, mode, now = Date.now() }) {
-  // 语义与 pause/resume 同构（unbind↔disabled、restore↔enabled）：复用 wirePauseResume。
-  return wirePauseResume({ endpointId, env, legacy, controlClaimKey, id, mode: mode === "disable" ? "pause" : mode === "enable" ? "resume" : "resume", now });
+  // P1-3③：enum 关闭 —— mode 只认 disable|enable，非法 mode 拒（不默默回落 enable）。
+  if (mode !== "disable" && mode !== "enable") return { ok: false, commit: "not_committed", reason: "bad_mode", why: "mode 只认 disable|enable", legacy: null, shadow: null, release: null };
+  // 语义与 pause/resume 同构（unbind↔disabled、restore↔enabled）：复用 wirePauseResume（W4 lock-only）。
+  return wirePauseResume({ endpointId, env, legacy, controlClaimKey, id, mode: mode === "disable" ? "pause" : "resume", now });
 }
 
 /**

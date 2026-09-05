@@ -294,7 +294,7 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
 | 显式 attach（终端） | attach | ext=控制 claim key（终端命令 claim 机制既有、持久）；entity=目标 id |
 | rotate（建新代际） | create_b1。**W3**：outer 取锁**前置到 sendToChat 之前**（写事务从首个外显副作用起算；锁取不到话题不发、无孤儿、不降级） | ext=rotation operation id（topic-generation 既有、持久）；entity=lineage id |
 | rotate cancel / pending 过期 | void。W5：reason 映射 cancelled→manual、expired→expired（枚举不扩）| ext=rotation operation id |
-| 连接暂停/恢复（binding_status 翻转；五轮 P2-2：mode 属 policy 域非此路径） | **W4 对账兜底行**（同 enabled：无持久审计 id，M1a 不实时双写，doctor+repair 兜底） | —（W4）|
+| 连接暂停/恢复（binding_status 翻转；五轮 P2-2：mode 属 policy 域非此路径） | **W4 对账兜底行**（同 enabled：无持久审计 id，M1a 不实时双写，doctor+repair 兜底）| —（W4）|
 | retarget（owner 终端） | retarget | 同上 |
 | `enabled` 翻转 | **W4 对账兜底行**：M1a 不实时双写（无持久审计 id 的罕用终端写方）；doctor mismatch 暴露、owner 以 restore/unbind/migrate_repair 补齐；实时双写等审计 id 链路另单 | —（W4）|
 | 到期/续期 | expiry sidecar 写 | 不进账本 |
@@ -309,6 +309,10 @@ op_type, entity_id })).slice(0,40)`；每行的 ext/entity 如上表——**无�
 命中重放跳过执行缺失后缀；legacy 重试 no-op 仍走完 shadow 序列。
 **清单封闭**：表外 legacy 写方影响投影 = 设计缺口，先补表再上线；**实现测试须反向证明表内
 所有 legacy 写入口都先取得 m1a-order.lock**（八轮 P2-2）。
+
+**W4 行（pause/resume/enabled）语义（P1-3③ 定稿）**：对账兜底 = **无双写**，但**不是无锁**——
+仍须取得 m1a-order.lock（绕过 outer 就穿了 cutover 快照窗口）；只是不写 shadow 事务（binding_status
+属 registry 域，账本无对应事实可镜像），不一致由 doctor+repair 兜底。
 
 **migrate_repair = 重新受验迁移（六轮 P1-1 定案，取 b）**（gated、shadow-only、owner 逐次
 授权）：语义 = "按当前 legacy 证据重新迁移这一条记录"——**连同 proof 一起更新**：

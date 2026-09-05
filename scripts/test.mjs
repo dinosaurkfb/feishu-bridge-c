@@ -25124,7 +25124,19 @@ test("账本 §3.1 proof-组合：A4 继承补因果顺序——swap attach/unbi
     { [idMO]: a4Rec(idMO, OP4, OP3, claim("d")) }, 4);
   const vMO = TAL.validateLedger(docMO, { endpointId: EP });
   assert.equal(vMO.reason, "ledger_corrupt", "migrate 晚于 attach_a3 应拒（migrate<attach_a3 破）：" + JSON.stringify(vMO));
-  assert.ok(vMO.why.includes("因果"), "反例② 命中因果：" + vMO.why);
+  assert.ok(vMO.why.includes("直接前驱") || vMO.why.includes("因果"), "反例② 命中直接前驱/因果：" + vMO.why);
+
+  // 反例③（#R34 P1）：migrate@2→attach_a3@3→retarget@4→unbind@5 —— 旧 .find() 挑 attach@3 判区间仍过，
+  //   但 retarget@4 才是 origin(unbind@5) 的直接前驱（已改 binding proof）→ 不可能历史 → ledger_corrupt
+  const OP5 = "55555555-5555-5555-5555-555555555555";
+  const retargetOp = (reqKey, id, rev) => ({ op_type: "retarget", terminal_kind: "retarget", request_key: reqKey, fingerprint: hx(5), result_revision: rev, result: { affected_ids: [id], old_target: TGT, new_target: TGT2, unit: "record" } });
+  const idRT = tid("d");
+  const docRT = mkDoc(
+    { [OP2]: migSeedOp("req_rt_m", idRT, claim("e"), 2), [OP3]: attachA3("req_rt_a", idRT, 3), [OP4]: retargetOp("req_rt_r", idRT, 4), [OP5]: unbindOp("req_rt_u", idRT, "A4", 5) },
+    { [idRT]: a4Rec(idRT, OP5, OP2, claim("e")) }, 5);
+  const vRT = TAL.validateLedger(docRT, { endpointId: EP });
+  assert.equal(vRT.reason, "ledger_corrupt", "migrate→attach→retarget→unbind 伪造终态应拒：" + JSON.stringify(vRT));
+  assert.ok(vRT.why.includes("直接前驱"), "反例③ 命中直接前驱：" + vRT.why);
 });
 }
 

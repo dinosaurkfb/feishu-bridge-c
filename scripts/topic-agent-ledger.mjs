@@ -249,10 +249,10 @@ export function liveProblem(rec, id) {
  *      A4-bare 无 link 却带 migrated binding ⇒ 拒）。
  *   ② link=migrated ⇒ binding ∈ {migrated, retarget, attach(A3 或 A4 继承)}；
  *      (pairing|attach 非继承|null) + migrated link ⇒ 拒。
- *   ③ (attach, migrated) A3/A4 继承：A3 ⇒ origin=attach_a3；A4 ⇒ origin=经合法 unbind(terminal_family=A4) 继承 A3
- *      （须存在把本 id 置成 A3(attach) 的 attach_a3 op）；二者都要求 link 的 migration_operation_id 指向合法
- *      migrate_seed/migrate_repair 且 result digest 逐字相符（G13-mig ①② 的 link 侧）。
- *      #R32 P1：另要求因果顺序 migrate < attach_a3 < unbind(origin)（对应全局不变量：最新触及该 id 的 op === origin_operation_id）。
+ *   ③ (attach, migrated) A3/A4 继承：A3 ⇒ origin=attach_a3；A4 ⇒ origin=经合法 unbind(terminal_family=A4) 继承 A3，
+ *      且 origin 的直接前驱触碰交易恰为 attach_a3(affected_id=id)（#R34 P1：弃任意 .find()，须紧邻 unbind）；二者都要求
+ *      link 的 migration_operation_id 指向合法 migrate_seed/migrate_repair 且 result digest 逐字相符（G13-mig ①② 的 link 侧）。
+ *      #R32 P1：另要求因果 migrate < attach_a3（含全局不变量：最新触及该 id 的 op === origin_operation_id）。
  */
 /** R32 P1：operation 的 result 触到哪些记录 id（用于全局因果顺序不变量）。initialize_shadow / authority_cutover 不触及记录 id。 */
 function opTouchedIds(op) {
@@ -293,17 +293,21 @@ function proofCombinationProblem(rec, id, doc) {
         //   判据：origin=unbind(terminal_family=A4, affected_id=id)，且账本确有把本 id 置成 A3(attach) 的 attach_a3 op
         //   （否则 attach binding 无从谈起，只是伪造）。migrate B4→unbind→attach(A3)→unbind 第四笔即此。
         if (!op || op.op_type !== "unbind" || op.result?.terminal_family !== "A4" || op.result?.affected_id !== id) return "(attach, migrated) 的 A4 需经合法 unbind(terminal_family=A4, affected_id=id) 继承 A3";
-        const atOpId = Object.keys(doc.operations).find((k) => { const o = doc.operations[k]; return o.op_type === "attach_a3" && o.result?.affected_id === id; });
-        if (!atOpId) return "(attach, migrated) 的 A4 需 A3 继承：账本无该 id 的 attach_a3 op 支撑 attach binding";
-        // #R32 P1：A4 继承补**因果顺序**——migrate_seed/repair 必须早于 attach_a3、且 attach_a3 必须早于当前 unbind(origin)。
-        //   只查 attach_a3 存在性会让 "unbind@rev4→attach_a3@rev5" 这类不可能历史照样通过。
-        const atOp = doc.operations[atOpId];
+        // #R34 P1：继承必须是 unbind(origin) 的**直接前驱**（弃用任意顺序 .find()）。
+        //   按 result_revision 为该 id 建触及序列；origin 的直接前驱触及交易必须恰为 attach_a3(affected_id=id)。
+        //   探针 migrate@2→attach@3→retarget@4→unbind@5：.find() 挑 attach@3 判区间仍过，但 retarget@4 才是 origin 的
+        //   直接前驱（且已改 binding proof），故伪造终态应拒。旧 .find() 只证“存在某笔 attach_a3”，不证“紧邻 unbind”。
+        const seq = Object.values(doc.operations)
+          .filter((o) => opTouchedIds(o).includes(id))
+          .sort((a, b) => a.result_revision - b.result_revision);
+        const originIdx = seq.findIndex((o) => o === op);
+        const prev = originIdx >= 1 ? seq[originIdx - 1] : null;
+        if (!prev || prev.op_type !== "attach_a3" || prev.result?.affected_id !== id)
+          return "(attach, migrated) 的 A4 需 A3 继承：账本无该 id 的 attach_a3 op 作为 unbind(origin) 的直接前驱（须紧邻、而非 migrate/retarget 等时隔；R34）";
         const migClOp = doc.operations[rec.locator_link_proof_ref.migration_operation_id];
         const migClRev = migClOp && (migClOp.op_type === "migrate_seed" || migClOp.op_type === "migrate_repair") ? migClOp.result_revision : null;
-        if (migClRev !== null) {
-          if (!(migClRev < atOp.result_revision)) return "(attach, migrated) 的 A4 需因果顺序：migrate < attach_a3（R32）";
-          if (!(atOp.result_revision < op.result_revision)) return "(attach, migrated) 的 A4 需因果顺序：attach_a3 < unbind(origin)（R32）";
-        }
+        if (migClRev !== null && !(migClRev < prev.result_revision))
+          return "(attach, migrated) 的 A4 需因果顺序：migrate < attach_a3（R32）";
       } else {
         return "(attach, migrated) 只在 A3 继承 / A4 继承合法";
       }

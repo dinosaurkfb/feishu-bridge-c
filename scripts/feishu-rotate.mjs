@@ -15,6 +15,8 @@ import {
   closeClaudeTopicRotation, failClaudeTopicRotation, loadClaudeTopicBinding, prepareClaudeTopicRotation,
   registerClaudeTopicRotation,
 } from "./topic-generation-store.mjs";
+import { wireRotate } from "./m1a/wiring.mjs";
+import { legacyEndpointId } from "./subscription.mjs";
 import {
   ROTATION_STATUS, TOPIC_GENERATION_PREPARING_STALE_MS, activeGeneration, pendingGeneration, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, pendingRotationBlocker,
 } from "./topic-generation.mjs";
@@ -96,53 +98,61 @@ if (!apply) {
 }
 
 const operationId = "rotation_" + randomUUID();
-// 一次锁内原子转换：过期 pending 退休 + PREPARING + 冻结编号；仍可认领的 pending 在这里也会被拒（rotation_already_pending）
-const prepared = prepareClaudeTopicRotation({ root, claudeSessionId, operationId, supersedeExpired: true });
-if (!prepared.ok) die("无法开始轮转（" + prepared.reason + "）。");
-if (prepared.superseded) console.log("已作废    第 " + prepared.superseded.generation + " 代（过期的待认领代际）");
-const { nextNumber, token, rootText } = plan(prepared.nextGeneration);
-if (nextNumber !== expectedNext) console.log("注意      锁内冻结的下一代是第 " + nextNumber + " 代（预告为第 " + expectedNext + " 代）：根消息按冻结的编号生成");
-
 const identity = resolveLarkIdentity(current.config);
-let rootMessageId;
-try {
-  rootMessageId = sendToChat({
-    profile: identity.profile,
-    chatId: current.config.chat_id,
-    text: rootText,
-    idempotencyKey: idempotencyKeyFor(current.state.binding_id + "\nrotation\n" + nextNumber),
-    larkBin: identity.bin,
-    larkHome: identity.configDir,
-    expectedAppId: identity.expectedAppId,
-  });
-} catch (err) {
-  failClaudeTopicRotation({ root, claudeSessionId, operationId, reason: err.message });
-  die("新话题创建失败；旧代际保持 active：" + err.message);
-}
 
-const registered = registerClaudeTopicRotation({
-  root, claudeSessionId, operationId, rootMessageId, pendingToken: token,
+// M1a 双写（W3，Frank 拍板）：外层一致性锁在 sendToChat 之前取 —— 取不到 → 话题从未创建、无孤儿。
+// 「准备 + 建话题 + 登记 pending」是同一 legacy 闭包，锁覆盖整笔写事务；shadow create_b1 在锁内镜像。
+const wired = wireRotate({
+  endpointId: legacyEndpointId({ runtime: "claude", agentUid: current.config.agent_uid }),
+  env: process.env,
+  rotationOpId: operationId,
+  lineageId: current.state.binding_id,
+  chatId: current.config.chat_id,
+  bindingTarget: { runtime: "claude", project_root: root, claude_session_id: claudeSessionId },
+  rootOm: null, // 取 legacy 闭包返回的 root_message_id（sendToChat 产物）
+  legacy: () => {
+    // 一次锁内原子转换：过期 pending 退休 + PREPARING + 冻结编号；仍可认领的 pending 在这里也会被拒（rotation_already_pending）
+    const prepared = prepareClaudeTopicRotation({ root, claudeSessionId, operationId, supersedeExpired: true });
+    if (!prepared.ok) throw new Error("无法开始轮转（" + prepared.reason + "）。");
+    if (prepared.superseded) console.log("已作废    第 " + prepared.superseded.generation + " 代（过期的待认领代际）");
+    const { nextNumber, token, rootText } = plan(prepared.nextGeneration);
+    if (nextNumber !== expectedNext) console.log("注意      锁内冻结的下一代是第 " + nextNumber + " 代（预告为第 " + expectedNext + " 代）：根消息按冻结的编号生成");
+    let rootMessageId;
+    try {
+      rootMessageId = sendToChat({
+        profile: identity.profile,
+        chatId: current.config.chat_id,
+        text: rootText,
+        idempotencyKey: idempotencyKeyFor(current.state.binding_id + "\nrotation\n" + nextNumber),
+        larkBin: identity.bin,
+        larkHome: identity.configDir,
+        expectedAppId: identity.expectedAppId,
+      });
+    } catch (err) {
+      failClaudeTopicRotation({ root, claudeSessionId, operationId, reason: err.message });
+      throw err;
+    }
+    const registered = registerClaudeTopicRotation({ root, claudeSessionId, operationId, rootMessageId, pendingToken: token });
+    if (!registered.ok) {
+      // **失败要收口，而且收口本身也可能失败。**
+      const closed = failClaudeTopicRotation({ root, claudeSessionId, operationId, reason: registered.reason });
+      throw new Error("新话题已创建，但 pending generation 登记失败（" + registered.reason + "）。" +
+        (closed.ok
+          ? "轮转已收口，旧代际仍保持 active；新建的那个话题需要人工清理。"
+          : "**收口也失败了（" + closed.reason + "）**：轮转状态可能仍停在 preparing。" +
+            "旧代际保持 active。若状态仍停在 preparing，" +
+            Math.round(TOPIC_GENERATION_PREPARING_STALE_MS / 60000) +
+            " 分钟后可由下一次轮转接管；若已进入 awaiting_claim，则去新话题真实 @ 完成认领。" +
+            "新建的那个话题需要人工清理。"));
+    }
+    return { ...registered, root_message_id: rootMessageId };
+  },
 });
-if (!registered.ok) {
-  // **失败要收口，而且收口本身也可能失败。**
-  //
-  // 两处教训叠在一起：
-  //   同一函数里两个相邻失败出口，上面 sendToChat 那条收口了，这条原来只 die 就走人；
-  //   而收口调用自己也会因写入失败、锁竞争或 operation mismatch 返回 false ——
-  //   不看返回值就宣布"已收口"，等于生成一份虚假的完成回执，
-  //   而真实状态可能仍停在 PREPARING。要让人知道何时可以重试。
-  const closed = failClaudeTopicRotation({
-    root, claudeSessionId, operationId, reason: registered.reason,
-  });
-  die("新话题已创建，但 pending generation 登记失败（" + registered.reason + "）。" +
-    (closed.ok
-      ? "轮转已收口，旧代际仍保持 active；新建的那个话题需要人工清理。"
-      : "**收口也失败了（" + closed.reason + "）**：轮转状态可能仍停在 preparing。" +
-        "旧代际保持 active。若状态仍停在 preparing，" +
-        Math.round(TOPIC_GENERATION_PREPARING_STALE_MS / 60000) +
-        " 分钟后可由下一次轮转接管；若已进入 awaiting_claim，则去新话题真实 @ 完成认领。" +
-        "新建的那个话题需要人工清理。"));
+if (!wired.ok) {
+  if (wired.reason === "legacy_failed") die("轮转失败：" + (wired.why ?? "legacy 异常"));
+  die("无法开始轮转（M1a 一致性锁取不到：" + (wired.reason ?? "m1a_reject") + (wired.why ? "；" + wired.why : "") + "）。旧代际保持 active，未创建新话题。");
 }
+const rootMessageId = wired.legacy.root_message_id;
 
 try {
   publishDraft({

@@ -25244,6 +25244,60 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     }
   }));
 
+  // #R37 轮转（建新代际）→ 账本 create_b1。W3（Frank 拍板）：外层锁在 sendToChat 之前取 ——
+  //   rootOm 从 legacy 闭包返回的 root_message_id 取（sendToChat 在闭包内创建根消息、拿到 om），
+  //   静态 rootOm 只在缺省时兜底。行为验证：① legacy 返回 root_message_id → shadow create_b1 用该 om；
+  //   ② legacy 不返回 → 回退静态 rootOm；③ 已启用点外层 lock busy → 整笔拒、legacy 未跑（话题从未创建）；
+  //   ④ never_initialized（无收据）→ 合法 legacy-only、不写 shadow。
+  test("m1a 双写接线：wireRotate（轮转建代际）——rootOm 优先取 legacy 结果；busy→拒；never_initialized→legacy-only", () => withRootAndReceipt((root, dir) => {
+    seedLedger(dir);
+    seedLedgerInitReceipt(path.join(root, "maint"), EP);
+    let legacyCalls = 0;
+
+    // ① 已启用端点 + legacy 闭包返回 root_message_id → shadow create_b1 用该 om（B1.root_om 一致）
+    {
+      const w = WIRE.wireRotate({ endpointId: EP, env: process.env, rotationOpId: "rot_1", lineageId: "lin_rot", chatId: "oc_rot", bindingTarget: TGT, rootOm: null, legacy: () => ({ ok: true, root_message_id: "om_rot" }) });
+      assert.ok(w.ok, "① ok：" + JSON.stringify(w));
+      assert.equal(w.shadow.length, 1, "一笔 shadow");
+      assert.equal(w.shadow[0].op, "create_b1", "op 名");
+      assert.ok(w.shadow[0].ok, "① create_b1 成功：" + JSON.stringify(w.shadow[0]));
+      const b1 = famIds(talLoad(dir), "B1").pop();
+      assert.equal(talLoad(dir).records[b1].aliases.root_om, "om_rot", "B1.root_om = legacy 闭包里 sendToChat 产出的根消息 om（W3）");
+      assert.ok(w.release && w.release.ok, "释放 ok");
+    }
+
+    // ② legacy 不返回 root_message_id → 回退静态 rootOm
+    {
+      const w = WIRE.wireRotate({ endpointId: EP, env: process.env, rotationOpId: "rot_2", lineageId: "lin_rot2", chatId: "oc_rot2", bindingTarget: { runtime: "claude", project_root: "/Users/dk/p2", claude_session_id: uuid(3) }, rootOm: "om_static", legacy: () => ({ ok: true, legacyCommitted: true }) });
+      assert.ok(w.ok, "② ok：" + JSON.stringify(w));
+      assert.ok(w.shadow[0].ok, "② create_b1 成功：" + JSON.stringify(w.shadow[0]));
+      const b1 = famIds(talLoad(dir), "B1").pop();
+      assert.equal(talLoad(dir).records[b1].aliases.root_om, "om_static", "回退静态 rootOm");
+    }
+
+    // ③ 已启用点外层 lock busy → 整笔拒、legacy 未跑（话题从未创建、无孤儿）
+    {
+      const acq = DW.acquireOrderLock(EP, process.env);
+      assert.ok(acq.ok, "取到外层锁（busy 反例）");
+      const before = legacyCalls;
+      const w = WIRE.wireRotate({ endpointId: EP, env: process.env, rotationOpId: "rot_3", lineageId: "lin_rot3", chatId: "oc_rot3", bindingTarget: TGT, rootOm: "om_r3", legacy: () => { legacyCalls += 1; return { ok: true, root_message_id: "om_r3" }; } });
+      assert.equal(w.ok, false, "busy→整笔拒");
+      assert.equal(w.reason, "binding_busy", "binding_busy");
+      assert.equal(legacyCalls, before, "busy 时 legacy 未跑（话题从未创建）");
+      assert.ok(acq.release().ok, "释放");
+    }
+
+    // ④ never_initialized（无收据端点）→ 合法 legacy-only：不写 shadow、无 release
+    {
+      const before = legacyCalls;
+      const w = WIRE.wireRotate({ endpointId: "ep_never", env: process.env, rotationOpId: "rot_4", lineageId: "lin_rot4", chatId: "oc_rot4", bindingTarget: TGT, rootOm: "om_r4", legacy: () => { legacyCalls += 1; return { ok: true, root_message_id: "om_r4" }; } });
+      assert.ok(w.ok, "legacy-only 仍整体 ok：" + JSON.stringify(w));
+      assert.equal(legacyCalls, before + 1, "legacy 已跑");
+      assert.equal(w.shadow.length, 0, "legacy-only 不写 shadow");
+      assert.equal(w.release, null, "不取 outer 锁、无 release");
+    }
+  }));
+
   // #R37 A1 物化样板：wireChatA1 是入站 chat 流的 A1 写入口。端点由 agent_uid（运行时 claude）派生，
   //   oc_ chat_id（template.chat_id）/ Aily session_id / message_id 一并线程化。
   //   行为验证：① 已启用端点（EP 有 ledger_init done 收据）→ 派生端点=EP，先 legacy 后真实 create_a1 shadow；

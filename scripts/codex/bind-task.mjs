@@ -15,6 +15,8 @@ import {
   refreshPendingTaskBinding, setTaskConnectionStatus, setTaskDisplayName,
 } from "./state.mjs";
 import { buildIntentParams, requireIntent } from "./intent.mjs";
+import { wirePauseResume } from "../m1a/wiring.mjs";
+import { legacyEndpointId } from "../subscription.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 
 const arg = (name) => {
@@ -108,7 +110,24 @@ if (existing.ok) {
     console.log("[dry-run] 没有修改登记表。加 --apply 才恢复接入。");
     process.exit(0);
   }
-  const resumed = setTaskConnectionStatus({ threadId: thread.threadId, status: "active" });
+  // #R37 返修（P1-2）：W4 行连接恢复 = 只取 m1a-order outer 锁、零 shadow；legacy 为既有 setTaskConnectionStatus。
+  const tpl0 = loadCodexTemplate();
+  const agentUid = tpl0?.template?.agent_uid ?? null;
+  const runResume = () => setTaskConnectionStatus({ threadId: thread.threadId, status: "active" });
+  let resumed;
+  if (agentUid) {
+    const wired = wirePauseResume({
+      endpointId: legacyEndpointId({ runtime: "codex", agentUid }),
+      env: process.env,
+      legacy: runResume,
+    });
+    if (!wired.ok) {
+      die("恢复接入失败（M1a 一致性锁：" + wired.reason + (wired.why ? "；" + wired.why : "") + "）");
+    }
+    resumed = wired.legacy;
+  } else {
+    resumed = runResume();
+  }
   if (!resumed.ok) die("恢复接入失败：" + resumed.reason + (resumed.error ? "（" + resumed.error + "）" : ""));
   console.log("已恢复当前 Codex task 的飞书接入，继续使用原话题。");
   process.exit(0);

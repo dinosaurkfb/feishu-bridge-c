@@ -20,6 +20,8 @@ import {
   ROTATION_STATUS, activeGeneration, pendingGeneration, TOPIC_GENERATION_PREPARING_STALE_MS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, pendingRotationBlocker,
 } from "../topic-generation.mjs";
 import { buildIntentParams, requireIntent } from "./intent.mjs";
+import { wireVoid } from "../m1a/wiring.mjs";
+import { legacyEndpointId } from "../subscription.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 
 const arg = (name) => {
@@ -87,12 +89,31 @@ if (cancel) {
     console.log("\n[dry-run] 没有修改状态。加 --cancel --apply 才取消待认领代际。");
     process.exit(0);
   }
-  const closed = closeTaskTopicRotation({
+  // #R37 返修（P1-2）：W5 行取消轮转 = 只取 m1a-order outer 锁、零 shadow；legacy 为既有 closeTaskTopicRotation。
+  const agentUid = loadCodexTemplate()?.template?.agent_uid ?? null;
+  const rotationOpId = loaded.state.rotation.operation_id;
+  const locator = pending?.root_message_id ?? pending?.detail?.root_message_id ?? null;
+  const runCancel = () => closeTaskTopicRotation({
     threadId: thread.threadId,
-    operationId: loaded.state.rotation.operation_id,
+    operationId: rotationOpId,
     reason: ROTATION_STATUS.CANCELLED,
     home: bridgeHome(),
   });
+  let closed;
+  if (agentUid) {
+    const wired = wireVoid({
+      endpointId: legacyEndpointId({ runtime: "codex", agentUid }),
+      env: process.env,
+      rotationOpId,
+      locator,
+      reason: "manual",
+      legacy: runCancel,
+    });
+    if (!wired.ok) die("取消轮转失败（M1a 一致性锁：" + wired.reason + (wired.why ? "；" + wired.why : "") + "）");
+    closed = wired.legacy;
+  } else {
+    closed = runCancel();
+  }
   if (!closed.ok) die("取消轮转失败（" + closed.reason + "）。");
   console.log("已取消待认领代际；旧话题仍是唯一 active，未删除任何飞书历史。");
   process.exit(0);

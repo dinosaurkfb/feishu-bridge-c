@@ -18,6 +18,9 @@ import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import {
   SUSPENDED, bindingsForRoot, currentBinding, describeStatus, setBindingStatus,
 } from "./feishu-control.mjs";
+import { loadClaudeTopicBinding } from "./topic-generation-store.mjs";
+import { wirePauseResume } from "./m1a/wiring.mjs";
+import { legacyEndpointId } from "./subscription.mjs";
 
 const arg = (n) => {
   const i = process.argv.indexOf("--" + n);
@@ -55,7 +58,24 @@ if (!apply) {
   process.exit(0);
 }
 
-const r = setBindingStatus({ root, claudeSessionId, status: SUSPENDED });
+// #R37 返修（P1-2）：W4 行连接暂停 = 只取 m1a-order outer 锁、零 shadow；legacy 为既有 setBindingStatus。
+const agentUid = loadClaudeTopicBinding({ root, claudeSessionId })?.config?.agent_uid ?? null;
+const runPause = () => setBindingStatus({ root, claudeSessionId, status: SUSPENDED });
+let r;
+if (agentUid) {
+  const wired = wirePauseResume({
+    endpointId: legacyEndpointId({ runtime: "claude", agentUid }),
+    env: process.env,
+    legacy: runPause,
+  });
+  if (!wired.ok) {
+    console.error("暂停失败（M1a 一致性锁：" + wired.reason + (wired.why ? "；" + wired.why : "") + "）");
+    process.exit(1);
+  }
+  r = wired.legacy;
+} else {
+  r = runPause();
+}
 if (!r.ok) {
   console.error("暂停失败（" + r.reason + "）" + (r.error ? "：" + r.error : ""));
   process.exit(1);

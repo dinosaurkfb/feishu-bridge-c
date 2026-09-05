@@ -3,8 +3,10 @@
 
 import { validThreadId } from "./bind-compose.mjs";
 import {
-  bridgeHome, findRegisteredTaskForCodexThread, setTaskConnectionStatus,
+  bridgeHome, findRegisteredTaskForCodexThread, setTaskConnectionStatus, loadCodexTemplate,
 } from "./state.mjs";
+import { wirePauseResume } from "../m1a/wiring.mjs";
+import { legacyEndpointId } from "../subscription.mjs";
 import { requireIntent } from "./intent.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 
@@ -53,7 +55,26 @@ if (!apply) {
   process.exit(0);
 }
 
-const changed = setTaskConnectionStatus({ threadId, status: "paused", home });
+// #R37 返修（P1-2）：W4 行连接暂停 = 只取 m1a-order outer 锁、零 shadow；legacy 为既有 setTaskConnectionStatus。
+// 收据现场可派生且未启用（never_initialized）→ 合法 legacy-only；已启用端点取锁失败 → 整笔拒、不写 legacy。
+const tmpl = loadCodexTemplate();
+const agentUid = tmpl?.template?.agent_uid ?? null;
+const runPause = () => setTaskConnectionStatus({ threadId, status: "paused", home });
+let changed;
+if (agentUid) {
+  const wired = wirePauseResume({
+    endpointId: legacyEndpointId({ runtime: "codex", agentUid }),
+    env: process.env,
+    legacy: runPause,
+  });
+  if (!wired.ok) {
+    console.error("暂停失败（M1a 一致性锁：" + wired.reason + (wired.why ? "；" + wired.why : "") + "）");
+    process.exit(1);
+  }
+  changed = wired.legacy;
+} else {
+  changed = runPause();
+}
 if (!changed.ok) {
   console.error("暂停失败：" + changed.reason + (changed.error ? "（" + changed.error + "）" : ""));
   process.exit(1);

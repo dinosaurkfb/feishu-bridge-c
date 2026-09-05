@@ -23,6 +23,9 @@ import path from "node:path";
 import { displaySafe } from "./display-safe.mjs";
 import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { bindingsForRoot, currentBinding, describeStatus, setBindingStatus } from "./feishu-control.mjs";
+import { loadClaudeTopicBinding } from "./topic-generation-store.mjs";
+import { wirePauseResume } from "./m1a/wiring.mjs";
+import { legacyEndpointId } from "./subscription.mjs";
 import {
   acquirePublishLock, exactProjectsForRoot, loadRegistryStrict, normalizeRoot,
   registryPath, releasePublishLock,
@@ -202,7 +205,24 @@ if (suspended.ok && suspended.suspended) {
   if (fixed.kind === "reenabled") console.log("  登记表里那条是停用的，已启用回来。");
   if (fixed.kind === "adopted") console.log("  登记表里没有它，已补登记（复用原话题）。");
 
-  const r = setBindingStatus({ root, status: "active" });
+  // #R37 返修（P1-2）：W4 行连接恢复 = 只取 m1a-order outer 锁、零 shadow；legacy 为既有 setBindingStatus。
+  const agentUid0 = loadClaudeTopicBinding({ root })?.config?.agent_uid ?? null;
+  const runResume = () => setBindingStatus({ root, status: "active" });
+  let r;
+  if (agentUid0) {
+    const wired = wirePauseResume({
+      endpointId: legacyEndpointId({ runtime: "claude", agentUid: agentUid0 }),
+      env: process.env,
+      legacy: runResume,
+    });
+    if (!wired.ok) {
+      console.error("恢复失败（M1a 一致性锁：" + wired.reason + (wired.why ? "；" + wired.why : "") + "）");
+      process.exit(1);
+    }
+    r = wired.legacy;
+  } else {
+    r = runResume();
+  }
   if (!r.ok) {
     console.error("恢复失败（" + r.reason + "）" + (r.error ? "：" + r.error : ""));
     process.exit(1);

@@ -25298,6 +25298,65 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     }
   }));
 
+  // #R37 cancel（W5，Frank 拍板）：轮转取消 → 账本 void。
+  //   reason 用封闭枚举映射 cancelled→"manual"（不扩枚举）；目标由 resolver 按 locator（被作废代际根 om）命中；
+  //   rotation.operation_id 作 ext。resolver 未命中（legacy-only、无 B1）→ shadow fail-closed、legacy 照常取消。
+  //   行为验证：① B1 pending + locator 命中 → legacy 成功 + shadow void（B1 → voided_audit、reason=manual）；
+  //   ② locator 未命中 → shadow fail-closed（locator_absent）、legacy 照常；③ busy → 整笔拒、legacy 未跑；
+  //   ④ never_initialized（无收据）→ 合法 legacy-only。
+  test("m1a 双写接线：wireVoid（cancel→void）——resolver 命中→voidPending；未命中→fail-closed；busy→拒；never_initialized→legacy-only", () => withRootAndReceipt((root, dir) => {
+    seedLedger(dir);
+    seedLedgerInitReceipt(path.join(root, "maint"), EP);
+    let legacyCalls = 0;
+    const legacyRec = (tag) => () => { legacyCalls += 1; return { tag, legacyCommitted: true }; };
+
+    // ① enabled EP + B1 pending 存在 + locator 命中 → legacy 成功 + shadow void（B1 → voided_audit）
+    {
+      talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_void", rootOm: "om_void", lineageId: "lin_void", bindingTarget: TGT }), "B1 前置（pending）");
+      const b1Id = famIds(talLoad(dir), "B1").pop();
+      const w = WIRE.wireVoid({ endpointId: EP, env: process.env, rotationOpId: "rot_void", locator: "om_void", reason: "manual", legacy: legacyRec("void") });
+      assert.ok(w.ok, "① ok：" + JSON.stringify(w));
+      assert.equal(w.shadow.length, 1, "一笔 shadow");
+      assert.equal(w.shadow[0].op, "void", "op 名");
+      assert.ok(w.shadow[0].ok, "① void 成功：" + JSON.stringify(w.shadow[0]));
+      assert.equal(w.shadow[0].result.voided_id, b1Id, "void 目标 = resolver 命中的 B1");
+      assert.equal(talLoad(dir).records[b1Id].kind, "voided_audit", "B1 已转 voided_audit");
+      assert.equal(talLoad(dir).records[b1Id].reason, "manual", "reason=manual（cancelled→manual 映射）");
+      assert.ok(w.release && w.release.ok, "释放 ok");
+    }
+
+    // ② locator 未命中（无 B1）→ shadow fail-closed（locator_absent）、legacy 照常成功
+    {
+      const w = WIRE.wireVoid({ endpointId: EP, env: process.env, rotationOpId: "rot_void2", locator: "om_none", reason: "manual", legacy: legacyRec("void2") });
+      assert.ok(w.ok, "② legacy 仍整体 ok：" + JSON.stringify(w));
+      assert.equal(w.shadow.length, 1, "一笔 shadow（fail-closed）");
+      assert.equal(w.shadow[0].ok, false, "② shadow fail-closed");
+      assert.equal(w.shadow[0].reason, "locator_absent", "② locator_absent");
+    }
+
+    // ③ busy → 整笔拒、legacy 未跑
+    {
+      const acq = DW.acquireOrderLock(EP, process.env);
+      assert.ok(acq.ok, "取到外层锁（busy 反例）");
+      const before = legacyCalls;
+      const w = WIRE.wireVoid({ endpointId: EP, env: process.env, rotationOpId: "rot_void3", locator: "om_v3", reason: "manual", legacy: () => { legacyCalls += 1; return { ok: true }; } });
+      assert.equal(w.ok, false, "busy→整笔拒");
+      assert.equal(w.reason, "binding_busy", "binding_busy");
+      assert.equal(legacyCalls, before, "busy 时 legacy 未跑");
+      assert.ok(acq.release().ok, "释放");
+    }
+
+    // ④ never_initialized（无收据端点）→ 合法 legacy-only：不写 shadow、无 release
+    {
+      const before = legacyCalls;
+      const w = WIRE.wireVoid({ endpointId: "ep_never", env: process.env, rotationOpId: "rot_void4", locator: "om_v4", reason: "manual", legacy: () => { legacyCalls += 1; return { ok: true }; } });
+      assert.ok(w.ok, "legacy-only 仍整体 ok：" + JSON.stringify(w));
+      assert.equal(legacyCalls, before + 1, "legacy 已跑");
+      assert.equal(w.shadow.length, 0, "legacy-only 不写 shadow");
+      assert.equal(w.release, null, "不取 outer 锁、无 release");
+    }
+  }));
+
   // #R37 A1 物化样板：wireChatA1 是入站 chat 流的 A1 写入口。端点由 agent_uid（运行时 claude）派生，
   //   oc_ chat_id（template.chat_id）/ Aily session_id / message_id 一并线程化。
   //   行为验证：① 已启用端点（EP 有 ledger_init done 收据）→ 派生端点=EP，先 legacy 后真实 create_a1 shadow；

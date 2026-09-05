@@ -210,11 +210,15 @@ export function wireRotate({ endpointId, env = process.env, legacy, rotationOpId
 
 /**
  * wireVoid —— rotate cancel / pending 过期 → 账本 void。
- * ext=rotation operation id；entity=目标 id（voided binding / B1）。
- */
-export function wireVoid({ endpointId, env = process.env, legacy, rotationOpId, id, reason, now = Date.now() }) {
+ * ext=rotation operation id；目标由 resolver 按 locator（被作废代际根消息 om）命中。
+ * reason 用封闭枚举映射：cancel→"manual"、过期→"expired"（不扩枚举）。resolver 未命中 → 无 B1 可 void，
+ *   该笔 shadow fail-closed（locator_absent 等），legacy 照常完成（轮转本来就可能 legacy-only、无 B1）。 */
+export function wireVoid({ endpointId, env = process.env, legacy, rotationOpId, locator, reason, now = Date.now() }) {
   return runWired({ endpointId, env, legacy, submit: (legacyRes) => {
-    if (!en(rotationOpId) || !en(id)) return [{ op: "void", ok: false, reason: "bad_external_id", why: "rotationOpId/id 必填 1..256 字符串" }];
+    if (!en(rotationOpId) || !en(locator)) return [{ op: "void", ok: false, reason: "bad_external_id", why: "rotationOpId/locator 必填 1..256 字符串" }];
+    const resolved = resolveLiveId({ endpointId, locator, env });
+    if (!resolved.ok) return [{ op: "void", ok: false, reason: resolved.reason, why: resolved.why ?? null }];
+    const id = resolved.id;
     const k = rk("void", rotationOpId, id);
     if (!k.ok) return [{ op: "void", ...k }];
     return [capture("void", voidPending({ endpointId, requestKey: k.request_key, b1Id: id, reason, now, env }))];

@@ -237,10 +237,12 @@ try {
         detail: { run_state: "completed", recoverable_error_events: outcome.recoverableErrors ?? 0 },
       });
       if (acceptedClaim?.policy_id === DIALOGUE_POLICY_ID) {
-        // #R38 P1-2：completed 同样消费返回值 —— 写失败不放锁、退出码置 1（不说谎报成功）。
-        finalizeGuarded({ task, runId: key, status: DIALOGUE_TURN_STATUS.COMPLETED, reason: null, paths, label: "完成" });
+        // #R40 P1-1：completed 仅在终局写成功时置 0，写失败保留 finalizeGuarded 置的 1。
+        const fin = finalizeGuarded({ task, runId: key, status: DIALOGUE_TURN_STATUS.COMPLETED, reason: null, paths, label: "完成" });
+        if (fin?.ok) process.exitCode = 0;
+      } else {
+        process.exitCode = 0;
       }
-      process.exitCode = 0;
       break;
     }
 

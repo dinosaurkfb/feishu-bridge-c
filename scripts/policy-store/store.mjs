@@ -24,10 +24,12 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { acquirePublishLock, releasePublishLock, commitWhileHeld } from "../registry.mjs";
 import { gateBlocks } from "../maintenance-gate-core.mjs";
-import { ENDPOINT_SHAPE, resolveEndpointDir } from "../topic-agent-ledger.mjs";
+import { ENDPOINT_SHAPE, ID_SHAPE, resolveEndpointDir } from "../topic-agent-ledger.mjs";
 import { interactionPolicyStateProblem, policySubjectId } from "./validator.mjs";
+import { canonicalPolicyContent, stableStringify } from "./canonical.mjs";
 
 export { ENDPOINT_SHAPE, policySubjectId }; // 派生实现在 validator.mjs（#R35 P1-2：外键自洽与哈希同处），re-export 保持 API
+export { canonicalPolicyContent, stableStringify }; // #R40 P1-5：规范字节唯一判据抽到 canonical.mjs，re-export 保持 API
 
 const MAX_ENTRIES = 512;
 export const MAX_BYTES = 1024 * 1024;
@@ -40,16 +42,41 @@ const FILE_NAME = "policy.json";
 
 /* ───────────────── 条目校验（值全经 ipsp-1；subject 外键只在 store 层验，#R38 P1-5） ───────────────── */
 
-/** 单条目：subject 形状 + 值必须是过 ipsp-1 的完整六键 interaction_policy_state。
- *  键↔条目无哈希自洽关联（#R35 外键已撤）：同 subject 冲突规则由 upsert 层的 conflict 拒绝承担。 */
-function entryProblem(subject, value) {
+/** 单条目：subject 形状 + 值必须是过 ipsp-1 的完整六键 interaction_policy_state + 外键自洽（#R40 P1-4）。 */
+function entryProblem(subject, value, endpointId) {
   if (!SUBJECT_ID_SHAPE.test(subject)) return { reason: "policy_store_bad_subject", detail: null };
   const ip = interactionPolicyStateProblem(value);
   if (ip !== null) return { reason: "policy_entry_invalid", detail: ip };
+  if (endpointId !== undefined) {
+    try {
+      if (subjectForEntry(value, endpointId) !== subject) {
+        return { reason: "policy_entry_invalid", detail: "policy_subject_key_mismatch" };
+      }
+    } catch {
+      return { reason: "policy_entry_invalid", detail: "policy_subject_key_mismatch" };
+    }
+  }
   return null;
 }
 
-function rootSchemaProblem(raw) {
+/**
+ * #R40 P1-4：subject 外键在 store 层强制 —— 条目 binding_id 所属主体派生出的 policy_subject_id
+ * 必须等于挂载键（T4 合同：条目本体回六键原样、binding_id 留 legacy 出处，但**派生关系不撤**）。
+ * kind 由 binding_id 形状唯一判定：精确 ta_<32hex>（TAL.ID_SHAPE）→ topic_agent，否则按账本
+ * lineage 派生。派生对非法输入抛 TypeError（fail-closed：形状洗不过就拒，不让哈希吞）。
+ */
+function subjectForEntry(value, endpointId) {
+  if (!value || typeof value !== "object" || typeof value.binding_id !== "string") {
+    throw new TypeError("invalid entry or binding_id");
+  }
+  return policySubjectId({
+    kind: ID_SHAPE.test(value.binding_id) ? "topic_agent" : "lineage",
+    endpointId,
+    id: value.binding_id,
+  });
+}
+
+function rootSchemaProblem(raw, endpointId) {
   let doc;
   try { doc = JSON.parse(raw); } catch { return { reason: "policy_store_parse_failed", detail: null }; }
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return { reason: "policy_store_root_schema", detail: null };
@@ -59,16 +86,22 @@ function rootSchemaProblem(raw) {
   if (doc.entries === null || typeof doc.entries !== "object" || Array.isArray(doc.entries)) return { reason: "policy_store_root_schema", detail: null };
   const subjects = Object.keys(doc.entries);
   if (subjects.length > MAX_ENTRIES) return { reason: "policy_store_too_many_entries", detail: null };
-  for (const s of subjects) { const p = entryProblem(s, doc.entries[s]); if (p !== null) return p; }
+  for (const s of subjects) {
+    const p = entryProblem(s, doc.entries[s], endpointId);
+    if (p !== null) return p;
+  }
   return null;
 }
 
-/** 序列化形态（写路径合成用）：三键封闭 + 全部条目 subject 形状 + ipsp-1。返回 {reason, detail} 或 null。 */
-function storeProblem(entries) {
+/** 序列化形态（写路径合成用）：三键封闭 + 全部条目 subject 形状 + ipsp-1 + 外键（#R40 P1-4）。返回 {reason, detail} 或 null。 */
+function storeProblem(entries, endpointId) {
   if (entries === null || typeof entries !== "object" || Array.isArray(entries)) return { reason: "policy_store_root_schema", detail: null };
   const subjects = Object.keys(entries);
   if (subjects.length > MAX_ENTRIES) return { reason: "policy_store_too_many_entries", detail: null };
-  for (const s of subjects) { const p = entryProblem(s, entries[s]); if (p !== null) return p; }
+  for (const s of subjects) {
+    const p = entryProblem(s, entries[s], endpointId);
+    if (p !== null) return p;
+  }
   return null;
 }
 
@@ -77,7 +110,8 @@ function storeProblem(entries) {
 /**
  * 读 `ledger/<ep>/policy.json`。路径与身份全部走 TAL.resolveEndpointDir（#R33 P1-3：
  * 末级 lstat/精确 0700/realpath 归一，endpoint symlink 指外部即拒）。
- * 返回 {ok:true, entries} | {ok:true, absent:true, entries:{}} | {ok:false, reason, why?}。
+ * 返回 {ok:true, entries, raw} | {ok:true, absent:true, entries:{}} | {ok:false, reason, why?}。
+ * #R40 P1-5：raw 带出盘上原始字节 —— 零写比对/读回比对都直接对它，不重新序列化。
  */
 export function loadPolicyStore({ endpointId, env = process.env } = {}) {
   if (typeof endpointId !== "string" || !ENDPOINT_SHAPE.test(endpointId)) return { ok: false, reason: "policy_store_bad_endpoint_id" };
@@ -109,11 +143,12 @@ export function loadPolicyStore({ endpointId, env = process.env } = {}) {
     // #R38 P1-3：读侧读不到就是 unreadable（带错误码），不再谎报 unwritable —— 写不写得了是另一回事
     return { ok: false, reason: "policy_store_unreadable", why: String(err?.code ?? err?.message ?? err) };
   }
-  const p = rootSchemaProblem(raw.toString("utf-8"));
+  const rawText = raw.toString("utf-8");
+  const p = rootSchemaProblem(rawText, endpointId);
   if (p !== null) return { ok: false, reason: p.reason, ...(p.detail ? { detail: p.detail } : {}) };
-  const doc = JSON.parse(raw.toString("utf-8"));
+  const doc = JSON.parse(rawText);
   if (doc.endpoint_id !== endpointId) return { ok: false, reason: "policy_store_root_schema", why: "endpoint_id 与目录不符" };
-  return { ok: true, entries: doc.entries };
+  return { ok: true, entries: doc.entries, raw: rawText };
 }
 
 /**
@@ -147,16 +182,12 @@ function readAll(fd, maxBytes) {
 
 /* ───────────────────────── 写端（锁 + fenced 提交） ───────────────────────── */
 
-/** upsert 语义：逐字相等去重（changed:false），否则冲突拒 —— 不依赖覆盖顺序。 */
+/** upsert 语义：语义相等去重（changed:false，稳定序列化比对 #R40 P1-5），否则冲突拒 —— 不依赖覆盖顺序。 */
 export function upsertPolicyEntry(entries, subject, value) {
   if (!(subject in entries)) return { ok: true, entries: { ...entries, [subject]: value }, changed: true };
-  if (JSON.stringify(entries[subject]) === JSON.stringify(value)) return { ok: true, entries, changed: false };
+  if (stableStringify(entries[subject]) === stableStringify(value)) return { ok: true, entries, changed: false };
   return { ok: false, reason: "policy_subject_conflict", why: "同 subject 已有不同条目（" + subject + "）" };
 }
-
-/** 序列化唯一判据：写路径与零写比对（#R38 P2）都用它，不再各拼一份。 */
-const canonicalPolicyContent = (endpointId, entries) =>
-  JSON.stringify({ schema_version: POLICY_SCHEMA_VERSION, endpoint_id: endpointId, entries }, null, 2) + "\n";
 
 /**
  * 释放/提交段锁残骸的唯一折叠器（#R38 P1-4）：锁归属说不清（absent）或已易主（not_owner）
@@ -278,19 +309,27 @@ export function mutatePolicyStore({ endpointId, mutate, env = process.env } = {}
       result = { ok: false, reason: "policy_store_mutate_invalid", why: "changed 只许布尔", committed: false };
       return result;
     }
-    const p = storeProblem(next.entries);
+    const p = storeProblem(next.entries, endpointId);
     if (p !== null) { result = { ok: false, reason: p.reason, why: "写前全量校验不过，不落盘", ...(p.detail ? { detail: p.detail } : {}), committed: false }; return result; }
     const changed = next.changed === undefined ? true : next.changed;
     if (changed === false) {
-      // #R38 P2：零写必须真的与盘上一致 —— 规范字节逐字对比，entries 与现状不同却报零写 = 拒。
-      // absent（盘上无文件）与 entries:{} 自洽，比对不适用。
-      let onDisk = null;
-      try { onDisk = fs.readFileSync(file, "utf-8"); } catch (err) {
-        if (err?.code !== "ENOENT") { result = { ok: false, reason: "policy_store_unreadable", why: String(err?.code ?? err?.message ?? err), committed: false }; return result; }
-      }
-      if (onDisk !== null && onDisk !== canonicalPolicyContent(endpointId, next.entries)) {
-        result = { ok: false, reason: "policy_store_changed_mismatch", why: "changed:false 但 entries 与锁内现状的规范字节不一致", committed: false };
+      // #R40 P1-2：复用唯一受验读函数（O_NOFOLLOW / 单硬链接 / 0600 / 有界读）；
+      // 缺席只允许配『规范空投影』（entries 为空对象），其余拒。
+      const current = loadPolicyStore({ endpointId, env });
+      if (!current.ok) {
+        result = { ok: false, reason: current.reason, why: current.why, committed: false };
         return result;
+      }
+      if (current.absent) {
+        if (Object.keys(next.entries).length !== 0) {
+          result = { ok: false, reason: "policy_store_changed_mismatch", why: "文件缺席时 changed:false 仅允许规范空投影", committed: false };
+          return result;
+        }
+      } else {
+        if (current.raw !== canonicalPolicyContent(endpointId, next.entries)) {
+          result = { ok: false, reason: "policy_store_changed_mismatch", why: "changed:false 但 entries 与锁内现状的规范字节不一致", committed: false };
+          return result;
+        }
       }
       result = { ok: true, entries: next.entries, changed: false, committed: false }; // 零写：逐字一致才返回（#R33 P2-2 + #R38 P2）
       return result;
@@ -317,14 +356,17 @@ export function mutatePolicyStore({ endpointId, mutate, env = process.env } = {}
     try { fsyncDir(dir.dir); } catch (err) { persistence = "uncertain"; dirFsyncError = String(err.code ?? err.message); }
     // 写后受验读回：全 ipsp-1 再过一遍；且读回条目必须与本次意图逐字一致（#R38 P1-4），
     // 读不回/读出非法/内容不符都如实报错（已提交，不谎报失败原因在写）
+    // #R40 P1-6：所有已提交出口统一折叠 commit residue（r.lockUncleared），不丢残骸。
     const verify = loadPolicyStore({ endpointId, env });
-    if (!verify.ok) { result = { ok: false, reason: "policy_store_readback_failed", why: verify.reason + (verify.why ? "：" + verify.why : ""), committed: true, persistence: "uncertain" }; return result; }
-    if (JSON.stringify(verify.entries) !== JSON.stringify(next.entries)) {
-      result = { ok: false, reason: "policy_store_readback_mismatch", why: "读回条目与本次意图不一致（盘上被别的写方动过？）", committed: true, persistence: "uncertain" };
+    if (!verify.ok) {
+      result = { ok: false, reason: "policy_store_readback_failed", why: verify.reason + (verify.why ? "：" + verify.why : ""), committed: true, persistence: "uncertain", ...(r.lockUncleared ? { lockUncleared: r.lockUncleared } : {}) };
       return result;
     }
-    result = { ok: true, entries: next.entries, changed: true, committed: true, persistence, ...(dirFsyncError ? { dirFsyncError } : {}) };
-    if (r.lockUncleared) result.lockUncleared = r.lockUncleared;
+    if (verify.raw !== content) {
+      result = { ok: false, reason: "policy_store_readback_mismatch", why: "读回条目与本次意图不一致（盘上被别的写方动过？）", committed: true, persistence: "uncertain", ...(r.lockUncleared ? { lockUncleared: r.lockUncleared } : {}) };
+      return result;
+    }
+    result = { ok: true, entries: next.entries, changed: true, committed: true, persistence, ...(dirFsyncError ? { dirFsyncError } : {}), ...(r.lockUncleared ? { lockUncleared: r.lockUncleared } : {}) };
     return result;
   } catch (err) {
     // 主体内部任何异常（含 commitWhileHeld 段内 .reap 读失败）折成受控结果 —— 不裸抛，

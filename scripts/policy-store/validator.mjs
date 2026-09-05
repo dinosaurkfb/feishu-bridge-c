@@ -16,6 +16,7 @@ import { ENDPOINT_SHAPE, ID_SHAPE, LINEAGE_SHAPE, canonKey, sha256 } from "../to
 import {
   DIALOGUE_POLICY_ID, DIALOGUE_STATUS, DIALOGUE_TURN_STATUS,
   DIALOGUE_STOP_CONDITIONS, DIALOGUE_FINAL_REASONS, INTERACTION_POLICY_SCHEMA_VERSION,
+  DIALOGUE_REASON,
 } from "../interaction-policy.mjs";
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -134,28 +135,55 @@ export function interactionPolicyStateProblem(state) {
   if (!positiveInteger(d.next_turn_index)) return "dialogue_next_turn_index";
   if (!Array.isArray(d.processed_events) ||
       !d.processed_events.every((e) => isObj(e) && keysOf(e) === PROCESSED_EVENT_KEYS &&
-        nonEmpty(e.event_id) && nonEmpty(e.run_id) && nonEmpty(e.dialogue_id) &&
+        nonEmpty(e.event_id) && nonEmpty(e.run_id) && e.dialogue_id === d.dialogue_id &&
         positiveInteger(e.turn_index)) ||
       new Set(d.processed_events.map((e) => e.event_id)).size !== d.processed_events.length) {
     return "dialogue_processed_events";
   }
+  const maxProcessedTurn = d.processed_events.length === 0 ? 0 : Math.max(...d.processed_events.map((e) => e.turn_index));
+  if (d.next_turn_index !== maxProcessedTurn + 1) return "dialogue_next_turn_index";
   if (!isCanonicalIso(d.started_at)) return "dialogue_started_at";
   if (!isCanonicalIso(d.deadline_at)) return "dialogue_deadline_at";
   if (!isCanonicalIso(d.updated_at)) return "dialogue_updated_at";
 
-  // 状态关系联合封闭（#R33 P1-1）+ dialogue.status × last_turn.status 封闭矩阵（#R35 P1-1，
-  // #R38 P1-1 收紧）：failed ⇔ last_turn=failed（finalize FAILED 分支唯一产生，跨回合覆盖）。
-  // cancelled dialogue 允许 last_turn 为任意合法终局：一轮 completed 后切回 Mapping 的审计快照
-  //（setInteractionPolicyMode 切回时 active_turn 已空，last_turn 保留上轮终态）是真实写方产出；
-  // last_turn 值域已在下方校验段封闭，这里不再作过度约束。completed/active 同理任意终态或缺席。
+  // 状态关系联合封闭（#R33 P1-1）+ dialogue.status × last_turn.status 封闭矩阵（#R40 P1-3）：
+  // 真实状态机迁移全集闭合（set→reserve→finalize）：
+  //   · failed 必须有 last_turn 且 status 为 failed，且 stop_reason 与 last_turn.reason 一致；
+  //   · cancelled 携带 failed last_turn 必拒；stop_reason 与 last_turn.reason 必须自洽；
+  //   · completed 携带 failed last_turn 必拒；stop_reason 为预算用尽原因且与 last_turn.reason 自洽；
+  //   · active 的 last_turn 若存在必须为 completed（reason 必为 null）。
   if (d.status === DIALOGUE_STATUS.ACTIVE) {
     if (d.ended_at !== null || d.stop_reason !== null) return "dialogue_status";
+    if (d.last_turn !== undefined && d.last_turn.status !== DIALOGUE_TURN_STATUS.COMPLETED) return "dialogue_last_turn";
   } else {
     if ([DIALOGUE_TURN_STATUS.COMPLETED, DIALOGUE_TURN_STATUS.FAILED, DIALOGUE_TURN_STATUS.CANCELLED].includes(d.status)) {
       if (d.ended_at === null || !isCanonicalIso(d.ended_at)) return "dialogue_ended_at";
       if (d.stop_reason === null || !DIALOGUE_FINAL_REASONS.includes(d.stop_reason)) return "dialogue_stop_reason";
       if (d.active_turn !== null) return "dialogue_active_turn";
-      if (d.status === DIALOGUE_TURN_STATUS.FAILED && d.last_turn !== undefined && d.last_turn.status !== DIALOGUE_TURN_STATUS.FAILED) return "dialogue_last_turn";
+
+      if (d.status === DIALOGUE_TURN_STATUS.FAILED) {
+        // failed 删 last_turn 必拒；failed 携带非 failed last_turn 必拒
+        if (d.last_turn === undefined || d.last_turn.status !== DIALOGUE_TURN_STATUS.FAILED) return "dialogue_last_turn";
+        // stop_reason 与 last_turn.reason 矛盾必拒
+        if (d.stop_reason !== (d.last_turn.reason ?? DIALOGUE_REASON.RUN_FAILED)) return "dialogue_stop_reason";
+      } else if (d.status === DIALOGUE_TURN_STATUS.CANCELLED) {
+        // cancelled 携带 failed last_turn 必拒
+        if (d.last_turn !== undefined && d.last_turn.status === DIALOGUE_TURN_STATUS.FAILED) return "dialogue_last_turn";
+        if (d.last_turn?.status === DIALOGUE_TURN_STATUS.CANCELLED) {
+          if (d.stop_reason !== (d.last_turn.reason ?? DIALOGUE_REASON.HUMAN_INTERRUPT)) return "dialogue_stop_reason";
+        } else if (d.last_turn?.status === DIALOGUE_TURN_STATUS.COMPLETED || d.last_turn === undefined) {
+          if (d.stop_reason !== DIALOGUE_REASON.HUMAN_INTERRUPT) return "dialogue_stop_reason";
+        }
+      } else if (d.status === DIALOGUE_TURN_STATUS.COMPLETED) {
+        // completed 携带 failed last_turn 必拒
+        if (d.last_turn !== undefined && d.last_turn.status === DIALOGUE_TURN_STATUS.FAILED) return "dialogue_last_turn";
+        if (d.last_turn?.status === DIALOGUE_TURN_STATUS.CANCELLED) {
+          if (d.stop_reason !== d.last_turn.reason) return "dialogue_stop_reason";
+        }
+        if (![DIALOGUE_REASON.ROUND_BUDGET, DIALOGUE_REASON.TIME_BUDGET, DIALOGUE_REASON.RESOURCE_BUDGET].includes(d.stop_reason)) {
+          return "dialogue_stop_reason";
+        }
+      }
     } else if (d.ended_at !== null && !isCanonicalIso(d.ended_at)) return "dialogue_ended_at";
   }
 
@@ -168,7 +196,7 @@ export function interactionPolicyStateProblem(state) {
     const ev = eventOf(t.event_id);
     if (!f.idsOk || !f.idxOk || !f.runtimeOk || !f.unitsOk || !f.genOk ||
         t.status !== DIALOGUE_TURN_STATUS.DISPATCHED || !isCanonicalIso(t.dispatched_at) ||
-        t.dialogue_id !== d.dialogue_id || t.turn_index >= d.next_turn_index ||
+        t.dialogue_id !== d.dialogue_id || t.turn_index !== maxProcessedTurn ||
         // 全元组一致（#R33 P1-1）：同 event_id 的 run_id/dialogue_id/turn_index 必须逐字段相等
         ev === undefined || ev.run_id !== t.run_id ||
         ev.dialogue_id !== t.dialogue_id || ev.turn_index !== t.turn_index) return "dialogue_active_turn";
@@ -182,8 +210,11 @@ export function interactionPolicyStateProblem(state) {
         ![DIALOGUE_TURN_STATUS.COMPLETED, DIALOGUE_TURN_STATUS.FAILED,
           DIALOGUE_TURN_STATUS.CANCELLED].includes(t.status) ||
         !isCanonicalIso(t.dispatched_at) || !isCanonicalIso(t.finalized_at) ||
-        (t.reason !== null && !DIALOGUE_FINAL_REASONS.includes(t.reason)) ||
+        (t.status === DIALOGUE_TURN_STATUS.COMPLETED && t.reason !== null) ||
+        (t.status !== DIALOGUE_TURN_STATUS.COMPLETED && t.reason !== null && !DIALOGUE_FINAL_REASONS.includes(t.reason)) ||
         t.dialogue_id !== d.dialogue_id || t.turn_index >= d.next_turn_index ||
+        (d.active_turn !== null && t.turn_index >= d.active_turn.turn_index) ||
+        (d.active_turn === null && t.turn_index !== maxProcessedTurn) ||
         ev === undefined || ev.run_id !== t.run_id ||
         ev.dialogue_id !== t.dialogue_id || ev.turn_index !== t.turn_index) return "dialogue_last_turn";
   }

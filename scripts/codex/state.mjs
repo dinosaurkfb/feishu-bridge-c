@@ -1058,11 +1058,15 @@ export function evaluatePromotion({ event, template, pending, now = Date.now(), 
   }
   const matchedOm = (typeof pending?.generation?.root_message_id === "string" && pending.generation.root_message_id.length > 0)
     ? pending.generation.root_message_id : null;
-  return {
-    ok: true,
-    task: pending.task,
-    f4: matchedOm ? { matched_om: matchedOm, matched_fields: ["chat_id", "sender", "body", "thread_root"] } : null,
-  };
+  // P1-1：完整 F4 必须**四维全受验**——只对**代码认领**（source===quoted_binding_token）要求现场 chat locator
+  //   非空且等于目标 chat（envChat===bindingChat）；缺失/不匹配任一维 → f4=null（scope_unverified 旁注不折成完整 proof）。
+  //   plain 单候选人认领（sole_pending）**无码可命中**——body 维由单候选收敛满足、chat 维由 shadow scope_unverified
+  //   兜底，照常产完整证明（与 claude 同构）。
+  const chatVerified = envChat.length > 0 && typeof bindingChat === "string" && bindingChat.length > 0 && envChat === bindingChat;
+  const isCodeClaim = pending?.source === "quoted_binding_token";
+  const f4 = (matchedOm && (!isCodeClaim || chatVerified))
+    ? { matched_om: matchedOm, matched_fields: ["chat_id", "sender", "body", "thread_root"] } : null;
+  return { ok: true, task: pending.task, f4 };
 }
 
 export function promoteTask({

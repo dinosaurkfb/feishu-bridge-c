@@ -716,11 +716,21 @@ export function loadLedger(dir, { endpointId } = {}) {
   return { ok: true, doc: r.doc, bytes: r.bytes, sha256: r.sha256 };
 }
 
-/** 由 endpointId 载入（受验目录派生 + 校验）。给路由/投影用。 */
+/** 由 endpointId 载入（受验目录派生 + 校验）。给路由/投影用。
+ *  P2-2（Codex）：任何读取失败（corrupt/unreadable/absent）都折成**封闭** m1a_ledger_absent，
+ *   不泄露原始校验 reason；granular（absent|unreadable|corrupt）+ why 保留底层原因供既有调用方区分。 */
 export function loadByEndpoint(endpointId, { env = process.env } = {}) {
   const d = resolveEndpointDir(endpointId, { env });
-  if (!d.ok) return { ok: false, reason: d.reason, why: d.why };
-  return loadLedger(d.dir, { endpointId });
+  if (!d.ok) {
+    const granular = (d.reason === "no_root" || d.reason === "root_absent") ? "absent" : "unreadable";
+    return { ok: false, reason: "m1a_ledger_absent", granular, why: d.why ?? d.reason };
+  }
+  const l = loadLedger(d.dir, { endpointId });
+  if (!l.ok) {
+    const granular = l.reason === "absent" ? "absent" : l.reason === "unreadable" ? "unreadable" : "corrupt";
+    return { ok: false, reason: "m1a_ledger_absent", granular, why: l.why ?? l.reason };
+  }
+  return { ok: true, doc: l.doc, bytes: l.bytes, sha256: l.sha256 };
 }
 
 /** 按 locator 解析 live 影记录 id（claim→bind 的 b1Id、enabled 翻转的 id、void 的目标 id 共用）。
@@ -730,7 +740,7 @@ export function resolveLiveId({ endpointId, locator, env = process.env } = {}) {
   if (typeof locator !== "string" || locator.length === 0) return { ok: false, reason: "bad_locator" };
   const l = loadByEndpoint(endpointId, { env });
   if (!l.ok) {
-    const absent = l.reason === "absent" || l.reason === "no_root" || l.reason === "root_absent";
+    const absent = l.granular === "absent";
     return { ok: false, reason: absent ? "ledger_absent" : "ledger_unreadable", why: l.why ?? null };
   }
   const hits = [];
@@ -1487,7 +1497,11 @@ export function rebindSessionAlias({ endpointId, requestKey, id, expectedOldSess
       if (typeof newSessionId !== "string" || !AILY_SESSION_SHAPE.test(newSessionId)) return { ok: false, reason: "bad_input", why: "newSessionId 形状不对" };
       const rec = doc.records[id];
       if (!rec || rec.kind !== "live") return { ok: false, reason: "not_live" };
-      if (rec.facts.binding !== "active") return { ok: false, reason: "target_not_active" };
+      // P1-5（Codex）：只认精确 B3（active+current）。B4 历史代际 binding 也是 active，会被误判活跃而重绑——
+      //   这里 fail-closed（B3' 仍读 dormant→target_not_active；B4/其它非 current → target_not_current）。
+      const fam = familyOf(rec.facts);
+      if (fam === "B3'") return { ok: false, reason: "target_not_active" };
+      if (fam !== "B3") return { ok: false, reason: "target_not_current", why: "familyOf=" + String(fam) + "（仅 B3 current 可换会话重绑，B4 历史/其它 fail-closed）" };
       const oldSessionId = rec.aliases.session_id;
       if (oldSessionId !== expectedOldSessionId) return { ok: false, reason: "cas_mismatch", why: "当前 aliases.session_id 与 expectedOldSessionId 不符" };
       if (oldSessionId === newSessionId) return { ok: false, reason: "no_change" };

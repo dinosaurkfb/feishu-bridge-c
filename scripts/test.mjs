@@ -5310,20 +5310,22 @@ test("待绑定不过期：没有显式截止的登记行 30 天后仍可认领�
 // sender/@/body(码) 已有闸兜底；thread_root 由 pending 锚定（root_message_id=matched_om），不经 env
 //   （AILY_CLI_CHANNEL_THREAD_ID 只是 Aily 命名空间 thread 标识，不是飞书 thread/root locator——
 //   channel-locator-verdict.md §2）。这里补 **chat** 维：env chat 存在且与待绑定群不一致 → 拒。
-test("P1-2 F4：四维真实匹配（正确 chat + @ + 绑定码 + 单份 pending）→ 放行", () => {
-  const f = routeFixture([{ id: "a", extra: {} }]);
-  const pending = pendingOf(f);
+test("P1-1 F4（claude）：完整四维——绑定码命中 + env chat = target + owner/@/新鲜 → 放行且产完整 f4", () => {
+  const f = pendingFixture([{ id: "a", token: "aaaaaa" }]);
+  const content = '<at id="ou_t">T</at>\n\n**[引用]**\n🌉 a\n绑定码    aaaaaa';
+  const pending = findPendingBinding({ content, ...f, now: NOW2 });
+  assert.equal(pending.ok, true, "pending ok：" + JSON.stringify(pending));
+  assert.equal(pending.matchedBy, "quoted_binding_token", "绑定码精确命中");
   const r = evaluatePromotion({
-    event: okEvent, template: TPL, pending, now: NOW2,
-    env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id } });
+    event: { message_id: "m", session_id: "s", sender_id: TPL.frank_sender_id, created_at_ms: NOW2 - 3000, content },
+    template: TPL, pending, now: NOW2, env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id } });
   assert.equal(r.ok, true, JSON.stringify(r));
-  // P1-2 收尾：认领校验处产出封闭 f4（matched_om=被认领根 om；标准四项），供 wirePromoteBinding 只消费。
   assert.equal(typeof r.f4, "object", "产出封闭 f4 产物：" + JSON.stringify(r.f4));
   assert.equal(typeof r.f4.matched_om, "string", "matched_om=被认领根消息 om");
   assert.deepEqual(r.f4.matched_fields, ["chat_id", "sender", "body", "thread_root"], "标准四项（G15 封闭四项）");
 });
 
-test("P1-2 F4：chat 不匹配（env 是别的群）→ 拒（不能把 pending 从错误群里绑过来）", () => {
+test("P1-1 F4（claude）：chat 不匹配（env 是别的群）→ 拒（不能把 pending 从错误群里绑过来）", () => {
   const f = routeFixture([{ id: "a", extra: {} }]);
   const pending = pendingOf(f);
   const r = evaluatePromotion({
@@ -5333,12 +5335,27 @@ test("P1-2 F4：chat 不匹配（env 是别的群）→ 拒（不能把 pending 
   assert.equal(r.reason, PROMOTE_REJECT.CHAT_MISMATCH);
 });
 
-test("P1-2 F4：env 无 chat（不可核验）→ 不硬拒、不当作匹配（chat 维由 shadow 记 scope_unverified）", () => {
-  const f = routeFixture([{ id: "a", extra: {} }]);
-  const pending = pendingOf(f);
+test("P1-1 F4（claude）反向探针①：env chat 缺失 → 不硬拒但 f4=null（不折成完整 pairing proof）", () => {
+  const f = pendingFixture([{ id: "a", token: "aaaaaa" }]);
+  const content = '<at id="ou_t">T</at>\n\n**[引用]**\n🌉 a\n绑定码    aaaaaa'; // 绑定码命中，唯一差 env chat
+  const pending = findPendingBinding({ content, ...f, now: NOW2 });
+  assert.equal(pending.matchedBy, "quoted_binding_token");
   const r = evaluatePromotion({ event: okEvent, template: TPL, pending, now: NOW2, env: {} });
   assert.equal(r.ok, true, "缺 env chat 不拒绝（ailly 真实认领就没有它走）");
-  // chat 维的未核验由 shadow（selectPendingSubscriptionClaim）记 scope_unverified:["chat_id"]；这里只证不硬拒。
+  assert.equal(r.f4, null, "env chat 缺失 → f4=null（未受验不产完整 F4）");
+});
+
+test("P1-1 F4（claude）反向探针②：plain 单候选（only_pending）无码 → 仍产完整 f4（P2-① 真入口：无码认领必须能绑定）", () => {
+  const f = pendingFixture([{ id: "a", token: "aaaaaa" }]);
+  const content = '<at id="ou_t">T</at> 干活'; // 无绑定码
+  const pending = findPendingBinding({ content, ...f, now: NOW2 });
+  assert.equal(pending.ok, true);
+  assert.equal(pending.matchedBy, "only_pending");
+  const r = evaluatePromotion({ event: okEvent, template: TPL, pending, now: NOW2, env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id } });
+  assert.equal(r.ok, true, "only_pending 仍放行（只有一份待绑定）");
+  assert.equal(typeof r.f4, "object", "only_pending 无码可命中 → body 维单候选收敛满足，产完整 f4（P2-①）");
+  assert.equal(r.f4.matched_om, pending.generation.root_message_id, "matched_om=被认领单候选根消息 om");
+  assert.deepEqual(r.f4.matched_fields, ["chat_id", "sender", "body", "thread_root"], "标准四项");
 });
 
 test("首次绑定走真实 newRegistryEntry → pendingDeadline：不写截止，任何时候都可认领", () => {
@@ -24975,6 +24992,68 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.equal(talLoad(dir).records[b3].aliases.session_id, "sess_rb_new", "alias_occupied 不写账（仍 sess_rb_new）");
   }));
 
+  // P1-5（Codex）：W2 边界收紧——rebindSessionAlias 只认精确 family===B3（active+current）；
+  //   B4（历史代际，binding 也是 active）误被判活跃而重绑。ledger 层与接线层都要 fail-closed。
+  //   两条 counter-example：① ledger rebind 拒 B4；② wirePromoteBinding 命中 B4 → 拒（不路由成 rebind）。
+  test("P1-5：rebind 只认 B3（current）——B4 历史 active fail-closed（ledger + 接线两处）", () => withRootAndReceipt((root, dir) => {
+    seedLedger(dir);
+    seedLedgerInitReceipt(path.join(root, "maint"), EP);
+    let legacyCalls = 0;
+    const legacyRec = (tag) => () => { legacyCalls += 1; return { tag, legacyCommitted: true }; };
+
+    // 造 B4：lin_h 两代（同 lineage），gen2 activate 把 gen1 降成 historical（B4）。
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_h", rootOm: "om_h", lineageId: "lin_h", bindingTarget: TGT }), "B1 gen1");
+    const b1a = famIds(talLoad(dir), "B1")[0];
+    talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_h", sessionId: "sess_h" }), "A1 gen1");
+    const a1a = famIds(talLoad(dir), "A1")[0];
+    talOk(TAL.activate({ endpointId: EP, requestKey: rk(), b1Id: b1a, a1Id: a1a, f4: F4("om_h"), authorizedBy: "ou_o" }), "activate gen1");
+    const gen1 = famIds(talLoad(dir), "B3")[0];
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_h", rootOm: "om_h2", lineageId: "lin_h", bindingTarget: TGT }), "B1 gen2");
+    const b1b = famIds(talLoad(dir), "B1")[0];
+    talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_h", sessionId: "sess_h2" }), "A1 gen2");
+    const a1b = famIds(talLoad(dir), "A1")[0];
+    talOk(TAL.activate({ endpointId: EP, requestKey: rk(), b1Id: b1b, a1Id: a1b, f4: F4("om_h2"), authorizedBy: "ou_o" }), "activate gen2");
+
+    const b4 = talLoad(dir).records[gen1];
+    assert.equal(TAL.familyOf(b4.facts), "B4", "gen1 降代际→B4（active+historical）");
+    assert.equal(b4.facts.binding, "active", "B4 也是 active（Codex 点名：靠 binding==='active' 会误重绑）");
+    assert.equal(b4.aliases.session_id, "sess_h", "B4 保留 gen1 session");
+
+    // ① ledger 层：rebind 一个 active 但 historical 的 B4 → 必须 fail-closed（red 先行：旧判据误放行）。
+    const rl = TAL.rebindSessionAlias({ endpointId: EP, requestKey: rk(), id: gen1, expectedOldSessionId: "sess_h", newSessionId: "sess_h_rebind", authorizedBy: "ou_o" });
+    assert.equal(rl.ok, false, "ledger rebind 拒 B4：" + JSON.stringify(rl));
+    assert.equal(rl.reason, "target_not_current", "精确 reason（B4 历史）");
+
+    // ② 接线层：wirePromoteBinding 用 locator=om_h（B4 root_om）→ 拒，不路由成 rebind。
+    const before = legacyCalls;
+    const w = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: legacyRec("promoteB4"), locator: "om_h", claimKey: claim("p"), sessionId: "sess_h_new", authorizedBy: "ou_o" });
+    assert.ok(w.ok, "legacy 照常成功：" + JSON.stringify(w));
+    assert.equal(legacyCalls, before + 1, "legacy 已跑");
+    assert.equal(w.shadow.length, 1, "一笔 shadow（fail-closed 投影）");
+    assert.equal(w.shadow[0].op, "promote", "投影 op=promote（不进 rebind）");
+    assert.equal(w.shadow[0].ok, false, "shadow fail-closed");
+    assert.equal(w.shadow[0].reason, "target_not_current", "B4 历史 active → target_not_current（不重绑）");
+  }));
+
+  // P2-2（Codex）：loadByEndpoint 把 corrupt/unreadable/absent 折成封闭 m1a_ledger_absent，
+  //   不泄露任意校验 reason（corrupt 当前返回 validation 的原始字符串，不是封闭分类）；granular/why 保留底层原因。
+  test("P2-2：loadByEndpoint 折 corrupt/unreadable/absent → 封闭 m1a_ledger_absent（granular+why）", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    assert.equal(TAL.loadByEndpoint(EP, { env: process.env }).ok, true, "合法账本 ok");
+    // ① JSON 合法但语义非法（records 字段类型错）→ 校验失败 → 封闭 corrupt（red 先行：当前泄露原始校验 reason）
+    fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify({ schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: CH, authority_mode: "shadow", revision: 1, operations: {}, records: "nope" }), { mode: 0o600 });
+    const c = TAL.loadByEndpoint(EP, { env: process.env });
+    assert.equal(c.ok, false);
+    assert.equal(c.reason, "m1a_ledger_absent", "corrupt→封闭 m1a_ledger_absent（当前泄露原始 reason）：" + c.reason);
+    assert.equal(c.granular, "corrupt", "granular 区分 corrupt");
+    assert.ok(typeof c.why === "string" && c.why.length > 0, "保留底层原因（why）");
+    // ② ledger.json 缺席 → 封闭 absent
+    fs.rmSync(path.join(dir, "ledger.json"));
+    const a = TAL.loadByEndpoint(EP, { env: process.env });
+    assert.equal(a.reason, "m1a_ledger_absent", "absent→封闭");
+    assert.equal(a.granular, "absent", "granular 区分 absent");
+  }));
+
   test("账本：seed 幂等/冲突；指纹重放返回原 result；retarget 跨实体不误判", () => withRoot((root, dir) => {
     seedLedger(dir);
     const iso = "2026-09-04T00:00:00.000Z";
@@ -25682,15 +25761,15 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
       assert.equal(TAL.familyOf(talLoad(dir).records[b1Id].facts), "B3", "归并→B3");
     }
 
-    // ⑦ wirePauseResume = W4 对账兜底行（P1-3③）：只取 outer 锁、不写 shadow（不实时双写，doctor+repair 兜底）
+    // ⑦ wirePauseResume = W4 对账兜底行（P1-3③/P1-2 返修）：只取 outer 锁、不写 shadow（不实时双写，doctor+repair 兜底）
     {
       const b3Id = famIds(talLoad(dir), "B3").pop();
       const priorFamily = TAL.familyOf(talLoad(dir).records[b3Id].facts);
-      const p = WIRE.wirePauseResume({ endpointId: EP, env: process.env, legacy: legacyRec("pause"), controlClaimKey: claim("e"), id: b3Id, mode: "pause" });
+      const p = WIRE.wirePauseResume({ endpointId: EP, env: process.env, legacy: legacyRec("pause") });
       assert.ok(p.ok, "pause ok：" + JSON.stringify(p));
       assert.equal(p.shadow.length, 0, "pause → W4 不写 shadow（shadow=[]）");
       assert.equal(TAL.familyOf(talLoad(dir).records[b3Id].facts), priorFamily, "pause 不实时翻族（对账兜底）");
-      const r = WIRE.wirePauseResume({ endpointId: EP, env: process.env, legacy: legacyRec("resume"), controlClaimKey: claim("e"), id: b3Id, mode: "resume" });
+      const r = WIRE.wirePauseResume({ endpointId: EP, env: process.env, legacy: legacyRec("resume") });
       assert.ok(r.ok, "resume ok：" + JSON.stringify(r));
       assert.equal(r.shadow.length, 0, "resume → W4 不写 shadow（shadow=[]）");
       assert.equal(TAL.familyOf(talLoad(dir).records[b3Id].facts), priorFamily, "resume 不实时翻族（对账兜底）");
@@ -25761,35 +25840,25 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     }
   }));
 
-  // P1-3③/W4（#R37 返修）：连接暂停/恢复、enabled 翻转 = W4 对账兜底行 —— 只取 outer 锁、不写 shadow 事务
-  //   （对账兜底=无双写，但不是无锁；绕过 outer 就穿了 cutover 快照窗口）。wireEnabledFlip 关闭 enum：非法 mode 拒。
-  //   红测试：pause/resume/disable/enable 都 shadow=[]；非法 mode（freeze）→ bad_mode 拒。
-  test("m1a 双双写接线：W4 对账兜底行（P1-3③）——pause/resume/disable/enable 只取 outer 锁、shadow=[]；非法 mode→bad_mode 拒", () => withRootAndReceipt((root, dir) => {
+  // P1-3③/W4（#R37 返修，P1-2 收口）：连接暂停/恢复、enabled 翻转 = W4 对账兜底行 —— 只取 outer 锁、不写 shadow 事务
+  //   （对账兜底=无双写，但不是无锁；绕过 outer 就穿了 cutover 快照窗口）。P1-2 裁定简化：lock-only 签名
+  //   不要 controlClaimKey/ledger id/mode（那是事务参数；没有事务就没有 request_key），也没有 bad_mode enum。
+  //   红测试：pause/resume/disable/enable 都 shadow=[]、release ok。
+  test("m1a 双双写接线：W4 对账兜底行（P1-3③/P1-2）——pause/resume/disable/enable 只取 outer 锁、shadow=[]", () => withRootAndReceipt((root, dir) => {
     seedLedger(dir);
     seedLedgerInitReceipt(path.join(root, "maint"), EP);
     const legacyRec = (tag) => () => { return { tag, legacyCommitted: true }; };
     for (const mode of ["pause", "resume"]) {
-      const w = WIRE.wirePauseResume({ endpointId: EP, env: process.env, legacy: legacyRec(mode), controlClaimKey: claim("a"), id: tid("1"), mode });
+      const w = WIRE.wirePauseResume({ endpointId: EP, env: process.env, legacy: legacyRec(mode) });
       assert.ok(w.ok, mode + " ok：" + JSON.stringify(w));
       assert.equal(w.shadow.length, 0, mode + " → W4 不写 shadow（shadow=[]）");
       assert.ok(w.release && w.release.ok, mode + " 释放 ok（P1-6 联动）");
     }
     for (const mode of ["disable", "enable"]) {
-      const w = WIRE.wireEnabledFlip({ endpointId: EP, env: process.env, legacy: legacyRec(mode), controlClaimKey: claim("b"), id: tid("2"), mode });
+      const w = WIRE.wireEnabledFlip({ endpointId: EP, env: process.env, legacy: legacyRec(mode) });
       assert.ok(w.ok, mode + " ok：" + JSON.stringify(w));
       assert.equal(w.shadow.length, 0, mode + " → W4 不写 shadow（shadow=[]）");
       assert.ok(w.release && w.release.ok, mode + " 释放 ok");
-    }
-    {
-      const w = WIRE.wireEnabledFlip({ endpointId: EP, env: process.env, legacy: legacyRec("x"), controlClaimKey: claim("c"), id: tid("3"), mode: "freeze" });
-      assert.equal(w.ok, false, "freeze → 拒：" + JSON.stringify(w));
-      assert.equal(w.reason, "bad_mode", "非法 mode → bad_mode（enum 关闭）");
-      assert.equal(w.commit, "not_committed", "未提交");
-    }
-    {
-      const w = WIRE.wirePauseResume({ endpointId: EP, env: process.env, legacy: legacyRec("x"), controlClaimKey: claim("d"), id: tid("4"), mode: "freeze" });
-      assert.equal(w.ok, false, "pause freeze → 拒：" + JSON.stringify(w));
-      assert.equal(w.reason, "bad_mode", "非法 mode → bad_mode");
     }
   }));
 

@@ -17,7 +17,7 @@
 import { acquireOrderLock, requestKeyFor } from "./dual-write.mjs";
 import {
   createA1, createB1, activate, attach, voidPending, unbind, restore, retarget, rebindSessionAlias,
-  resolveLiveId, loadByEndpoint,
+  resolveLiveId, loadByEndpoint, familyOf,
 } from "../topic-agent-ledger.mjs";
 import { endpointReceipt } from "../maintenance/ledger-receipt.mjs";
 import { maintenanceDir } from "../maintenance/journal.mjs";
@@ -60,7 +60,7 @@ function runWired({ endpointId, env = process.env, legacy, submit, lockOnly = fa
   const recDir = maintenanceDir(env);
   const receipt = typeof recDir === "string" && recDir.length > 0
     ? endpointReceipt(recDir, endpointId)
-    : { ok: false, state: "unreadable", why: "维护目录不可派生，M1a 收据不可读（fail-closed）" };
+    : { ok: false, state: "never_initialized", why: "维护目录不可派生（M1a 未启用）→ 缺席=never_initialized=合法 legacy-only（裁定：缺席非 fail-closed）" };
   if (receipt.state === "never_initialized") {
     // M1a 未启用 → 合法 legacy-only：不取 outer、不写 shadow 后缀。
     let legacyRes;
@@ -183,6 +183,9 @@ export function wirePromoteBinding({
     const target = l.doc.records[b1Id];
     if (!target || target.kind !== "live") return [{ op: "promote", ok: false, reason: "target_gone" }];
     if (target.facts.binding === "active") {
+      // P1-5（Codex）：W2 只认精确 B3（active+current）。B4（历史代际，binding 也是 active）误被判活跃而重绑——
+      //   这里 fail-closed（不路由成 rebind，也不降级成 activate），family 不对 → target_not_current。
+      if (familyOf(target.facts) !== "B3") return [{ op: "promote", ok: false, reason: "target_not_current", why: "familyOf=" + String(familyOf(target.facts)) + "（仅 B3 current 可换会话重绑，B4 历史/其它 fail-closed）" }];
       // W2 再认领（B3 已 active 换会话）→ rebind_session_alias：**只**改 aliases.session_id（换到新 Aily 会话
       // locator），不动 binding_target/proof/family/lineage。newSessionId = 认领现场受验的新会话 locator
       // （sessionId，非临时随机）；expectedOldSessionId = 当前 B3 的 aliases.session_id（CAS）。
@@ -300,29 +303,23 @@ export function wireVoid({ endpointId, env = process.env, legacy, rotationOpId, 
  * pause=mode"pause"→unbind（只动 current B3）；resume=mode"resume"→restore。历史 B4 由账本 self 拒。
  * ext=该次终端命令的**持久控制 claim key / 命令审计 id**（禁止临时随机）；entity=目标 id。
  */
-export function wirePauseResume({ endpointId, env = process.env, legacy, controlClaimKey, id, mode, now = Date.now() }) {
-  if (mode !== "pause" && mode !== "resume") return { ok: false, commit: "not_committed", reason: "bad_mode", why: "mode 只认 pause|resume", legacy: null, shadow: null, release: null };
-  const opType = mode === "pause" ? "unbind" : "restore";
-  // 连接暂停/恢复 = W4 对账兜底行（无持久审计 id，不实时双写）：只取 outer 锁、不写 shadow（PX1-3③）。
-  return runWired({ endpointId, env, legacy, submit: (legacyRes) => {
-    if (!en(controlClaimKey) || !en(id)) return [{ op: opType, ok: false, reason: "bad_external_id", why: "controlClaimKey/id 必填 1..256 字符串" }];
-    const k = rk(opType, controlClaimKey, id);
-    if (!k.ok) return [{ op: opType, ...k }];
-    const fn = mode === "pause" ? unbind : restore;
-    return [capture(opType, fn({ endpointId, requestKey: k.request_key, id, now, env }))];
-  }, lockOnly: true });
+/**
+ * wirePauseResume —— 连接暂停/恢复 = W4 对账兜底行。
+ * #R37 返修（P1-2）：W4 行裁定 = **只取 m1a-order outer 锁、零 shadow 事务**。
+ *  lock-only 签名 {endpointId, env, legacy}：不要 controlClaimKey / ledger id（那是事务参数）；
+ *  没有事务就没有 request_key。取锁 → legacy → 交锁，完。对账兜底=无双写，但不是无锁
+ *  （绕过 outer 就穿了 cutover 快照窗口）。
+ */
+export function wirePauseResume({ endpointId, env = process.env, legacy }) {
+  return runWired({ endpointId, env, legacy, lockOnly: true });
 }
 
 /**
- * wireEnabledFlip —— `enabled` 翻转（§4 行）→ unbind / restore。
- * disabled→unbind（映 paused）、restore 恢复 enabled→restore。历史 B4 不动（账本 self 拒）。
- * ext=同上持久控制 claim key；entity=目标 id。
+ * wireEnabledFlip —— `enabled` 翻转（§4 行）→ 语义与 pause/resume 同构（unbind↔disabled、
+ * restore↔enabled）——同样 W4 对账兜底行：只取 outer 锁、零 shadow。
  */
-export function wireEnabledFlip({ endpointId, env = process.env, legacy, controlClaimKey, id, mode, now = Date.now() }) {
-  // P1-3③：enum 关闭 —— mode 只认 disable|enable，非法 mode 拒（不默默回落 enable）。
-  if (mode !== "disable" && mode !== "enable") return { ok: false, commit: "not_committed", reason: "bad_mode", why: "mode 只认 disable|enable", legacy: null, shadow: null, release: null };
-  // 语义与 pause/resume 同构（unbind↔disabled、restore↔enabled）：复用 wirePauseResume（W4 lock-only）。
-  return wirePauseResume({ endpointId, env, legacy, controlClaimKey, id, mode: mode === "disable" ? "pause" : "resume", now });
+export function wireEnabledFlip({ endpointId, env = process.env, legacy }) {
+  return wirePauseResume({ endpointId, env, legacy });
 }
 
 /**

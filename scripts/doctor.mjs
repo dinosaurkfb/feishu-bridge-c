@@ -469,7 +469,7 @@ export function runDoctor({
           if (ep.state === "never_initialized") continue; // 未接入账本，不算病
           const L = loadByEndpoint(ep.endpointId);
           if (L.ok === false) {
-            problems.push(ep.endpointId + "：" + (L.reason === "absent" ? "有收据但账本丢了（ledger 不存在）—— 收据能证明曾初始化，但路由目录无证" : "账本读不出（G1–G15 有疑）：" + (L.why ?? L.reason)));
+            problems.push(ep.endpointId + "：" + (L.granular === "absent" ? "有收据但账本丢了（ledger 不存在）—— 收据能证明曾初始化，但路由目录无证" : "账本读不出（G1–G15 有疑）：" + (L.why ?? L.reason)));
             continue;
           }
           const doc = L.doc;
@@ -565,10 +565,10 @@ export function runDoctor({
               // 只出封闭的 L.reason（复评 P1-3）：校验器 why 原文可能带重复 locator 明文（session/root om_）。
               if (receipt?.state === "ok" || receipt?.cutoverDone) {
                 findings.push({ endpoint: ep, ok: false, code: "ledger_missing",
-                  detail: (L.reason === "absent" ? "有初始化收据但账本缺席" : "有初始化收据但账本读不出（" + L.reason + "）") + " —— 禁止重初始化，需人工恢复" });
+                  detail: (L.granular === "absent" ? "有初始化收据但账本缺席" : "有初始化收据但账本读不出（" + L.reason + "）") + " —— 禁止重初始化，需人工恢复" });
               } else if (receipt === null) {
                 findings.push({ endpoint: ep, ok: false, code: "ledger_without_receipt",
-                  detail: "账本" + (L.reason === "absent" ? "目录在但读不出内容" : "读不出") + "且无初始化收据 —— 无法证明来历" });
+                  detail: "账本" + (L.granular === "absent" ? "目录在但读不出内容" : "读不出") + "且无初始化收据 —— 无法证明来历" });
               }
               // receipt never_initialized + 账本读不出：按 ledger_missing 同义（有迹象但无收据时已由上一支接住）。
               else {

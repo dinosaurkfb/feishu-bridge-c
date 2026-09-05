@@ -210,7 +210,7 @@ const rootMessageId = wired.legacy.root_message_id;
       binding_id: current.state.binding_id,
       legacy_committed: true,
       root_message_id: rootMessageId,
-      superseded_root_om: prepared.superseded?.root_message_id ?? null,
+      superseded_root_om: wired.legacy?.supersededRootOm ?? null,
       shadow: (wired.shadow ?? []).map((s) => ({ op: s.op, ok: s.ok ?? false, reason: s.reason ?? null, why: s.why ?? null })),
       release: wired.release ?? null,
     });

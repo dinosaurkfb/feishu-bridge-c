@@ -74,10 +74,14 @@ function judgeLedgerReceipt({ init = [], cutover = [], inProgress = [], initToke
  *  任一份 journal 读不出即 ok:false（fail-closed）；unreadable[i].why 与旧格式一致（含 state 与原因）。 */
 function collectLedgerReceipts({ dir }) {
   const list = listJournals({ dir });
-  if (!list.ok) return { ok: false, unreadable: [], map: new Map(), why: list.why ?? "维护目录读不出" };
+  // 裁定（#R37 返修 P1-2）：维护目录**缺席**（ENOENT，list.ok=false 且 why===null）→ 视为空目录
+  //   （各端点 never_initialized = 合法 legacy-only），不是 fail-closed。fail-closed 只留给"读到了但说不清"
+  //   （冲突/进行中/损坏 —— list.why 非空 / journal 读不出）。
+  if (!list.ok && list.why !== null) return { ok: false, unreadable: [], map: new Map(), why: list.why ?? "维护目录读不出" };
   const map = new Map();
   const unreadable = [];
-  for (const token of list.tokens) {
+  // ENOENT 时 list.ok=false、tokens=[]，下面的循环自然空转 → 空 map → never_initialized。
+  for (const token of list.tokens ?? []) {
     const j = readJournal({ dir, token });
     if (j.state !== "valid") { unreadable.push({ token, why: "journal " + j.state + (j.why ? "：" + j.why : "") }); continue; }
     // 二轮 P2-1：1.3 done 收据与 1.2 同一识别面（1.3 非 cutover 已被 journalProblem 判别支拦死，能走到这里的 1.3 必是 cutover）。

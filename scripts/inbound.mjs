@@ -250,8 +250,13 @@ function chatTurn({ chain, template, event, dryRun, ledgerDir }) {
   //   锁串行、先 legacy 后 create_a1 shadow；未启用端点（无收据）→ 合法 legacy-only、不写 shadow；
   //   已启用点任一取锁失败 → 整笔拒、不写 legacy（见 m1a-reconciliation §5，skip 集为空）。
   //   ponytail: chat 取锁失败即丢本消息（可用性换一致）；若需重试再在外层加退避。
+  // P1-5①（#R37）：A1 群锚点用「当场受验 locator」（AILY_CLI_CHANNEL_CHAT_ID），不是 template.chat_id。
+  //   依据 channel-locator-verdict §2：AILY_CLI_CHANNEL_CHAT_ID 就是本消息所在的飞书群 chat_id（已对真机核验）；
+  //   template.chat_id 是登记群，不是这场对话的现场 —— 拿它当 A1 群就是拿配置冒充现场。
+  //   §4 fail-safe：缺 / 空 → || null → create_a1 bad_input → 拒物化（未受验不猜）；形状不对同样被 create_a1 收口。
+  //   legacy chat 照答（外层 runWired 返回 outer ok + shadow 失败步），所以不阻断用户得到回答。
   const wired = wireChatA1({
-    agentUid: template.agent_uid, chatId: template.chat_id ?? null, sessionId: event.session_id ?? null, messageId,
+    agentUid: template.agent_uid, chatId: process.env.AILY_CLI_CHANNEL_CHAT_ID || null, sessionId: event.session_id ?? null, messageId,
     admit: () => admitChat({ ledgerDir, key, senderId: event.sender_id, budgetMs: chatReplyTimeoutMs(),
       meta: { chain, message_id: messageId, session_id: event.session_id ?? null, sender_ref: senderRef(event.sender_id), role: gates.role, risk_class: risk.riskClass } }),
   });

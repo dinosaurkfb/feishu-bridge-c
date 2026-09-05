@@ -5304,6 +5304,37 @@ test("待绑定不过期：没有显式截止的登记行 30 天后仍可认领�
   assert.equal(explicitFuture.ok, true);
 });
 
+// ---- P1-2（F4）：认领在 chat/sender/body(码)/thread_root 四维真实匹配。----
+// sender/@/body(码) 已有闸兜底；thread_root 由 pending 锚定（root_message_id=matched_om），不经 env
+//   （AILY_CLI_CHANNEL_THREAD_ID 只是 Aily 命名空间 thread 标识，不是飞书 thread/root locator——
+//   channel-locator-verdict.md §2）。这里补 **chat** 维：env chat 存在且与待绑定群不一致 → 拒。
+test("P1-2 F4：四维真实匹配（正确 chat + @ + 绑定码 + 单份 pending）→ 放行", () => {
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  const pending = pendingOf(f);
+  const r = evaluatePromotion({
+    event: okEvent, template: TPL, pending, now: NOW2,
+    env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id } });
+  assert.equal(r.ok, true, JSON.stringify(r));
+});
+
+test("P1-2 F4：chat 不匹配（env 是别的群）→ 拒（不能把 pending 从错误群里绑过来）", () => {
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  const pending = pendingOf(f);
+  const r = evaluatePromotion({
+    event: okEvent, template: TPL, pending, now: NOW2,
+    env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_othergroup" } });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, PROMOTE_REJECT.CHAT_MISMATCH);
+});
+
+test("P1-2 F4：env 无 chat（不可核验）→ 不硬拒、不当作匹配（chat 维由 shadow 记 scope_unverified）", () => {
+  const f = routeFixture([{ id: "a", extra: {} }]);
+  const pending = pendingOf(f);
+  const r = evaluatePromotion({ event: okEvent, template: TPL, pending, now: NOW2, env: {} });
+  assert.equal(r.ok, true, "缺 env chat 不拒绝（ailly 真实认领就没有它走）");
+  // chat 维的未核验由 shadow（selectPendingSubscriptionClaim）记 scope_unverified:["chat_id"]；这里只证不硬拒。
+});
+
 test("首次绑定走真实 newRegistryEntry → pendingDeadline：不写截止，任何时候都可认领", () => {
   const f = routeFixture([{ id: "a", extra: {} }]);
   const DAY = 24 * 3600000;

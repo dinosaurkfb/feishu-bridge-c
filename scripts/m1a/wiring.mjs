@@ -32,10 +32,24 @@ function capture(op, res) {
   return { op, ok: false, reason: "shadow_unknown" };
 }
 
-/* 外层排序锁骨架：legacy → shadow 序列 → 释放。 */
+/* 外层排序锁骨架：legacy → shadow 序列 → 释放。
+ * legacy 是权威、shadow 是 BestEffort：
+ *  - binding_busy（另一写方持锁）= 合法性串行争用 → 整笔 binding_busy 拒、legacy 不跑；
+ *  - 其余锁失败（root_absent/root_symlink/dir_*、maintenance/io_error/lock_residue/reap_* 等）
+ *    = shadow 子系统建立不了锁段 → 仍跑 legacy（legacy 不因 shadow 缺席而丢），shadow 记 skipped；
+ *  - shadow 序列里任一 op 失败 → 不回改 legacy 成功语义，shadow[i] 投影失败。 */
+// 只有“另一写方正持锁”是合法串行争用→整笔拒；其余锁失败都降级为 legacy-only（legacy 权威）。
+const BUSY_REJECT = new Set(["binding_busy"]);
 function runWired({ endpointId, env = process.env, legacy, submit }) {
   const acq = acquireOrderLock(endpointId, env);
-  if (!acq.ok) return { ok: false, commit: "not_committed", reason: acq.reason ?? "binding_busy", why: acq.why ?? null, lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
+  if (!acq.ok) {
+    if (BUSY_REJECT.has(acq.reason)) return { ok: false, commit: "not_committed", reason: acq.reason ?? "binding_busy", why: acq.why ?? null, lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
+    // shadow 子系统不可用 → legacy 照跑，shadow 跳过（不吞不穿，投影缺因）
+    let legacyRes;
+    try { legacyRes = legacy(); }
+    catch (err) { return { ok: false, commit: "not_committed", reason: "legacy_failed", why: String(err?.message ?? err), legacy: null, shadow: null, release: null }; }
+    return { ok: true, legacy: legacyRes, shadow: [{ op: "__shadow_skipped", ok: false, reason: acq.reason ?? "shadow_unavailable", why: acq.why ?? "外层锁段建立失败，shadow 跳过" }], release: null };
+  }
   let result;
   try {
     let legacyRes;

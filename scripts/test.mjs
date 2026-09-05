@@ -25164,6 +25164,23 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     }
   }));
 
+  // §R37 增量：外层锁建立失败（非 busy，如 shadow 根缺/端点目录缺）→ legacy 照跑、shadow 记 skipped、总 ok。
+  //   这是 legacy 权威的铁证：shadow 缺席**不丢 legacy 提交**，只少记一支（投影成因进 shadow[0]）。
+  test("m1a 双写接线：外层锁非 busy 失败（shadow 根缺）→ legacy 照跑 + shadow 记 skipped + 仍 ok（legacy 权威不因 shadow 缺席而丢）", () => withRoot((root, dir) => {
+    const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(root, "no-such-shadow-root"); // validateLedgerRoot → root_absent（非 busy）
+    let legacyCalls = 0;
+    const legacyRec = (tag) => () => { legacyCalls += 1; return { tag, legacyCommitted: true }; };
+    const w = WIRE.wireCreateA1({ endpointId: EP, env: process.env, legacy: legacyRec("skip"), chatId: "oc_skip", sessionId: "sess_skip", messageId: "msg_skip" });
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = saved;
+    assert.ok(w.ok, "shadow 缺仍 legacy 成功：" + JSON.stringify(w));
+    assert.equal(legacyCalls, 1, "legacy 已跑");
+    assert.ok(w.legacy && w.legacy.legacyCommitted, "legacy 提交");
+    assert.equal(w.shadow.length, 1, "记一笔 shadow");
+    assert.equal(w.shadow[0].op, "__shadow_skipped", "shadow 标记为跳过");
+    assert.equal(w.shadow[0].ok, false, "跳过投影为失败（成因外显）");
+  }));
+
   // §3.1 proof-组合校验：直接构造自洽账本（除组合外全过），bad 组合→ledger_corrupt 且 why 命中组合规则；合法组合→ok（不误伤）。
   //   REJECT：A4-bare+migrated（无 link）；B3+migrated bp+pairing_merge link；B3+pairing bp+migrated link；A4-full+attach bp+migrated link（无 attach_a3 op，非 A3 继承）。
   //   ACCEPT：A4-full(unbind 继承)+(migrated,migrated)；A3(attach_a3 继承)+(attach,migrated)；A4-full(经 attach_a3→unbind 继承)+(attach,migrated)。

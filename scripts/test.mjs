@@ -28424,12 +28424,13 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
   };
   const enterDone44 = [ed44.timer("claude"), ed44.timer("codex"), ed44.stub("claude"), ed44.stub("codex"), ed44.cur("claude"), ed44.cur("codex"), ed44.gate()];
   const mkTempDir44 = () => fs.mkdtempSync(path.join(os.tmpdir(), "r44-"));
-  const cutState44 = (o = {}) => ({ endpoint_id: EP44, operation_id: UUID44, fingerprint: SHA44, authority_mode: "shadow", revision: 3, ledger_sha256: SHA44, bijection_digest: null, plan_sha256: PLAN_SHA44, ...o });
+  const cutState44 = (o = {}) => ({ endpoint_id: EP44, operation_id: UUID44, fingerprint: SHA44, authority_mode: "shadow", revision: 3, ledger_sha256: SHA44, bijection_digest: null, plan_sha256: null, ...o });
   const cutAfter44 = (o = {}) => ({ endpoint_id: EP44, operation_id: UUID44, fingerprint: SHA44, authority_mode: "authoritative", revision: 4, ledger_sha256: SHA44, bijection_digest: SHA44, plan_sha256: PLAN_SHA44, ...o });
   const cut12State44 = () => ({ endpoint_id: EP44, operation_id: UUID44, fingerprint: SHA44, authority_mode: "shadow", revision: 3, ledger_sha256: SHA44, bijection_digest: null });
   const cut12After44 = () => ({ endpoint_id: EP44, operation_id: UUID44, fingerprint: SHA44, authority_mode: "authoritative", revision: 4, ledger_sha256: SHA44, bijection_digest: SHA44 });
   const mkLedger44 = (o = {}) => ({ id: "ledger:" + EP44 + ":cutover", kind: "ledger", target: EP44, backup: null, backup_sha256: null, backup_bytes: null, before: cutState44(), intended_after: cutAfter44(), after: null, state: "prepared", at: ISO44(NOW44), chain: "claude", ...o });
-  const mkSidecar44 = (n, o = {}) => ({ id: "sidecar:" + n + ":" + EP44, kind: "sidecar", target: "ledger/" + EP44 + "/" + n + ".json", backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null }, intended_after: { exists: true, sha256: SHA44 }, after: null, state: "prepared", at: ISO44(NOW44), chain: null, intended_blob: { path: "/tmp/" + UUID44 + ".staged/intended/" + n + ".json", bytes: 10, sha256: SHA44 }, ...o });
+  // 返修 P1-2：sidecar prepared = 11 键（after/chain 键缺席）；done 时才加 after 键（键集按 state 分派）。
+  const mkSidecar44 = (n, o = {}) => ({ id: "sidecar:" + n + ":" + EP44, kind: "sidecar", target: "ledger/" + EP44 + "/" + n + ".json", backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null }, intended_after: { exists: true, sha256: SHA44 }, state: "prepared", at: ISO44(NOW44), intended_blob: { path: "/tmp/" + UUID44 + ".staged/intended/" + n + ".json", bytes: 10, sha256: SHA44 }, ...o });
   const threeSidecars44 = () => [mkSidecar44("expiry"), mkSidecar44("pending-claims"), mkSidecar44("policy")];
   const doc13_44 = (o = {}) => ({ schema_version: "1.3", operation_kind: "ledger_cutover", token: UUID44, reason: "r44", started_at: ISO44(NOW44), updated_at: ISO44(NOW44), phase: "ledger_cutting_over", steps: [...enterDone44, mkLedger44(), ...threeSidecars44()], notes: [], ...o });
   const doc12_44 = (o = {}) => ({ schema_version: "1.2", operation_kind: "ledger_cutover", token: UUID44, reason: "r44", started_at: ISO44(NOW44), updated_at: ISO44(NOW44), phase: "ledger_cutting_over", steps: [...enterDone44, mkLedger44({ before: cut12State44(), intended_after: cut12After44() })], notes: [], ...o });
@@ -28503,10 +28504,22 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     assert.equal(journalProblem(doc13_44({ phase: "ledger_reopening", steps: [...enterDone44, mkLedger44({ state: "done", after: cutAfter44() }), ...threeSidecars44().map((s) => ({ ...s, state: "done", after: { exists: true, sha256: SHA44 } }))] })), null, "ledger_reopening + 三 sidecar done 合法");
     // 4f：sidecar endpoint 与 ledger endpoint 相等进校验
     assert.ok(bad((d) => { S(d, "expiry").id = "sidecar:expiry:endpoint_" + "b".repeat(24); }), "sidecar ep ≠ ledger ep 拒（4f）");
-    // plan_sha256：三处（before/intended_after/非 null after）同值
-    assert.ok(bad((d) => { L(d).before = { ...cutState44(), plan_sha256: undefined }; }), "cutover before 缺 plan_sha256 拒");
-    assert.ok(bad((d) => { L(d).intended_after = { ...cutAfter44(), plan_sha256: "d".repeat(64) }; }), "plan_sha256 不同值拒");
+    // plan_sha256 合同（返修 P1-2b，maintenance-gate.md B-2 表）：before=显式 null；intended_after=plan SHA；after（非 null 时）逐字段等 intended_after。
+    const dropPlanSha = ({ plan_sha256, ...rest }) => rest;
+    assert.ok(bad((d) => { L(d).before = dropPlanSha(cutState44()); }), "cutover before 缺 plan_sha256 键拒");
+    assert.ok(bad((d) => { L(d).before = { ...cutState44(), plan_sha256: PLAN_SHA44 }; }), "cutover before.plan_sha256 非 null 拒（B-2：before 无计划锚）");
+    assert.ok(bad((d) => { L(d).intended_after = { ...cutAfter44(), plan_sha256: "xyz" }; }), "plan_sha256 非 SHA 形状拒");
+    assert.ok(bad((d) => { L(d).state = "done"; L(d).after = { ...cutAfter44(), plan_sha256: PLAN_SHA44.slice(0, 63) + "d" }; }), "cutover done after.plan_sha256 ≠ intended_after 拒");
     assert.ok(bad((d) => { L(d).state = "done"; L(d).after = { ...cutAfter44(), plan_sha256: undefined }; }), "cutover done after 缺 plan_sha256 拒");
+    // 返修 P1-2：sidecar 键集按 state 分派 —— prepared 13 键旧形（带 after/chain）拒、带 after 键拒；done 12 键合法（上方已有）。
+    assert.ok(bad((d) => { S(d, "expiry").after = null; }), "prepared sidecar 带 after 键拒（红：首轮 13 键旧形放行）");
+    assert.ok(bad((d) => { S(d, "expiry").chain = null; }), "prepared sidecar 带 chain 键拒（红：首轮 13 键旧形放行）");
+    // 返修 P1-1：cutting_over 起恰三条 —— 零条不再合法。
+    assert.ok(bad((d) => { d.steps = d.steps.filter((s) => s.kind !== "sidecar"); }), "cutting_over 零 sidecar 拒（红：首轮允许 0）");
+    // 返修 P1-3 journal 侧：段级核（.. 段）+ 外指树（带 maintenanceDir 强核前缀；纯函数无 dir 时只核形状，外指由前缀参数拒）。
+    assert.ok(bad((d) => { S(d, "expiry").intended_blob.path = "/tmp/.." + UUID44 + ".staged/intended/expiry.json"; }), "intended_blob.path 含 .. 段拒");
+    assert.ok(journalProblem({ ...doc13_44(), steps: doc13_44().steps.map((s) => s.kind === "sidecar" ? { ...s, intended_blob: { ...s.intended_blob, path: "/evil/" + UUID44 + ".staged/intended/" + s.id.split(":")[1] + ".json" } } : s) }, { maintenanceDir: "/tmp" }) !== null, "带维护目录时外指树拒");
+    assert.equal(journalProblem(doc13_44(), { maintenanceDir: "/tmp" }), null, "维护目录前缀恰配（/tmp/<token>.staged）合法");
     // staged 路径导出与 shape 常量
     assert.equal(stagedIntendedFile({ dir: "/m", token: UUID44, name: "expiry" }), "/m/" + UUID44 + ".staged/intended/expiry.json", "stagedIntendedFile 路径");
   });
@@ -28566,6 +28579,42 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     assert.equal(removeStagedPlan({ dir: dir3, token: UUID44 }).ok, true, "remove 成功");
     assert.equal(removeStagedPlan({ dir: dir3, token: UUID44 }).ok, true, "remove 幂等（absent 也成功）");
     assert.equal(fs.existsSync(path.join(dir3, UUID44 + ".staged")), false, "删除后目录不在");
+    // ── 返修断言（红：首轮评审 P1-3/P1-4/P1-5/P1-6）──
+    // P1-3：token 必须 UUID 且 === plan.operation_token；.staged 是外指 symlink 拒；remove 遍历 token 拒。
+    assert.equal(stageCutoverPlan({ dir, token: "../escape", plan, blobs }).reason, "plan_mismatch", "stage token=../escape 拒（红：旧版不核 token 形状）");
+    assert.equal(removeStagedPlan({ dir, token: "../victim" }).ok, false, "remove token=../victim 拒（红：旧版能删外部）");
+    const otherToken = "66666666-6666-4666-8666-666666666666";
+    assert.equal(stageCutoverPlan({ dir, token: UUID44, plan: { ...plan, operation_token: otherToken }, blobs }).why, "token 与 plan.operation_token 不一致", "stage token ≠ plan.operation_token 拒");
+    const base4 = mkTempDir44(); const dir4 = path.join(base4, "m"); fs.mkdirSync(dir4);
+    const outsideTarget = path.join(base4, "outside"); fs.mkdirSync(outsideTarget);
+    fs.symlinkSync(outsideTarget, path.join(dir4, UUID44 + ".staged"));
+    assert.equal(stageCutoverPlan({ dir: dir4, token: UUID44, plan, blobs }).reason, "staged_residue", ".staged 为外指 symlink 拒（红：旧版 statSync 跟随放行照写）");
+    assert.equal(fs.readdirSync(outsideTarget).length, 0, "外指目标内零写入");
+    // P1-4：复用分支在 reused:true 前必须重新 fsync intended/ 目录 —— 目录屏障 EIO 不可豁免 → io_error。
+    // 复用路径的目录 fsync 序：mkdirDurable(staged)=1、mkdirDurable(intended)=2、fsyncDir(intended)=3（P1-4 屏障）；文件 fsync 不计。
+    // 用干净现场（上方 dir 的 policy.json 被篡改段污染，会先落在 staged_residue）。
+    const base5 = mkTempDir44(); const dir5 = path.join(base5, "m"); fs.mkdirSync(dir5);
+    assert.equal(stageCutoverPlan({ dir: dir5, token: UUID44, plan, blobs }).ok, true, "P1-4 现场先 fresh 成功");
+    const realFsyncSync = fs.fsyncSync;
+    try {
+      let dirFsyncSeen = 0;
+      fs.fsyncSync = (fd) => { const st = fs.fstatSync(fd); if (st.isDirectory() && ++dirFsyncSeen >= 3) throw Object.assign(new Error("EIO"), { code: "EIO" }); return realFsyncSync(fd); };
+      const rEio = stageCutoverPlan({ dir: dir5, token: UUID44, plan, blobs });
+      assert.equal(rEio.reason, "io_error", "复用前目录 fsync EIO → io_error（红：旧版 reused:true 绕过屏障）");
+      assert.equal(rEio.reused, undefined, "EIO 时不得返回 reused");
+    } finally { fs.fsyncSync = realFsyncSync; }
+    assert.equal(stageCutoverPlan({ dir: dir5, token: UUID44, plan, blobs }).reused, true, "屏障恢复后复用照旧");
+    // P1-6：blob >1MiB 写入前拒；受验读 st.size 上限先于 alloc。
+    assert.ok(stageCutoverPlan({ dir: dir5, token: UUID44, plan: { ...plan, sidecars: { ...plan.sidecars, policy: { sha256: createHash("sha256").update(Buffer.alloc(1024 * 1024 + 1)).digest("hex") } } }, blobs: { ...blobs, policy: Buffer.alloc(1024 * 1024 + 1) } }).why.includes("超过 1MiB"), "stage blob >1MiB 拒（红：旧版照写）");
+    const bigFile = path.join(intended, "big.bin");
+    fs.writeFileSync(bigFile, Buffer.alloc(1024 * 1024 + 1), { mode: 0o600 });
+    assert.ok(readStagedVerified(bigFile, { sha256: SHA44 }).why.includes("超过 1MiB"), "readStagedVerified >1MiB 拒（上限先于 alloc）");
+    fs.rmSync(bigFile);
+    // P1-5：FIFO 无写者不挂死（子进程隔离 + 5s 守卫；红：旧版 openSync 阻塞事件循环）。
+    const fifoScript = "const { execSync } = require('node:child_process');const fs = require('node:fs');const f = process.argv[1] + '.fifo';try { fs.unlinkSync(f); } catch {}execSync('mkfifo ' + JSON.stringify(f));" +
+      "Promise.all([import(" + JSON.stringify(new URL("./m1b/staged-plan.mjs", import.meta.url).pathname) + "), import(" + JSON.stringify(new URL("./m1b/sidecar-renderers.mjs", import.meta.url).pathname) + ")]).then(([sp, sr]) => { const a = sp.readStagedVerified(f, { sha256: " + JSON.stringify(SHA44) + " }); const b = sr.readSidecarFile(f, 'expiry'); console.log(JSON.stringify({ a: a.ok === false, b: b.ok === false })); process.exit(a.ok === false && b.ok === false ? 0 : 2); });";
+    const fr = spawnSync(process.execPath, ["-e", fifoScript, path.join(mkTempDir44(), "p")], { timeout: 5000, encoding: "utf-8" });
+    assert.equal(fr.status, 0, "FIFO 受验读立即拒不挂死（P1-5，红：旧版 rc=null 挂死）");
   });
 
   test("#R44 renderer：expiry/pending-claims/policy 确定性、默认条目、去重、交叉不变量", () => {
@@ -28625,6 +28674,16 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     // 冲突分支：恰一约束下不可达（同 binding_id 条目恒同源），保留为防御深度；去重由双 generation 钉住。
     // 确定性：同输入两次渲染字节级一致
     assert.deepEqual(renderPolicySidecar({ endpointId: EP44, bindings, E: new Map([[ta1, eRec44(ta1, "lin1", "current")], [ta2, eRec44(ta2, "lin2", "current")]]) }), pol, "同输入字节级可复现");
+    // ── 返修断言（红：首轮评审 P1-6 / P2-1）──
+    // P1-6：渲染后自证 validateSidecarDoc + ≤512 条 —— 513 条合法输入不再产出读取端必拒的制品。
+    const bigBindings = Array.from({ length: 513 }, (_, i) => binding44("lin" + i, { state: { ...TGS44(), binding_id: "lin" + i, generations: [GEN44()] } }));
+    const bigE = new Map(bigBindings.map((b) => [topicAgentIdForLegacy(EP44, b.binding_id, "g1"), eRec44(topicAgentIdForLegacy(EP44, b.binding_id, "g1"), b.binding_id, "current")]));
+    const bigEx = renderExpirySidecar({ endpointId: EP44, bindings: bigBindings, E: bigE });
+    assert.ok(bigEx.ok === false && (bigEx.why ?? "").includes("超过 512"), "513 条渲染自证拒（红：旧版产出读取端必拒制品）");
+    const numTok = renderPendingClaimsSidecar({ endpointId: EP44, bindings: [binding44("lin1", { state: { ...TGS44(), generations: [GEN44({ pending_token: 123456 })] } })], E: new Map([[ta1, eRec44(ta1, "lin1", "pending")]]) });
+    assert.equal(numTok.reason, "legacy_unreadable", "pending_token 数字 123456 拒（红：正则 test 隐式强转放行）");
+    // P2-1：validateSidecarDoc 未知 name 返问题串，不裸抛 TypeError。
+    assert.equal(typeof validateSidecarDoc({ schema_version: undefined }, "nope"), "string", "未知 name 返问题串不抛（红：entryChecks 裸 TypeError）");
   });
 
   test("#R44 读取端：fd 绑定 0600/0700、≤1MiB、≤512 条、三键根、值域封闭", () => {

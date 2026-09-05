@@ -28,7 +28,7 @@ const TA_SHAPE = /^ta_[0-9a-f]{32}$/u;
 const PSID_SHAPE = /^ps_[0-9a-f]{32}$/u;
 const TOKEN_SHAPE = /^[0-9a-f]{6}$/u;
 const MAX_ENTRIES = 512;
-const MAX_BYTES = 1024 * 1024;
+export const MAX_BYTES = 1024 * 1024; // 导出：staged-plan 的 blob 上限同一出处，防漂移
 const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
 const keysOf = (o) => Object.keys(o).sort().join(",");
 const isCanonicalIso = (s) => typeof s === "string" && !Number.isNaN(Date.parse(s)) && new Date(s).toISOString() === s;
@@ -75,7 +75,12 @@ function renderSidecar({ endpointId, bindings, E, name, buildEntries }) {
   }
   if (entries === null) return { ok: false, reason: "legacy_unreadable", why: "构建 entries 失败（细节见前置检查）" };
   const doc = { schema_version: SIDECAR_SCHEMAS[name], endpoint_id: endpointId, entries };
-  return { ok: true, bytes: Buffer.from(stableStringify(doc, 2) + "\n", "utf-8") };
+  const bytes = Buffer.from(stableStringify(doc, 2) + "\n", "utf-8");
+  // P1-6：渲染后自证 —— 复用唯一读取校验器 + 字节上限，产不出读取端必拒的制品。
+  const selfProblem = validateSidecarDoc(doc, name, { endpointId });
+  if (selfProblem !== null) return unreadable("渲染自证不过：" + selfProblem);
+  if (bytes.length > MAX_BYTES) return unreadable("渲染自证不过：超过 1MiB（" + bytes.length + " 字节）");
+  return { ok: true, bytes };
 }
 
 export function renderExpirySidecar({ endpointId, bindings, E }) {
@@ -102,7 +107,8 @@ export function renderPendingClaimsSidecar({ endpointId, bindings, E }) {
       if (matches.length !== 1) throw Object.assign(new Error("B1 记录 " + rec.topic_agent_id + " 在 TGS 里命中 " + matches.length + " 个 generation"), { why: "B1 记录无法唯一回溯到 generation" });
       const g = matches[0];
       const token = g.pending_token ?? null;
-      if (token !== null && !TOKEN_SHAPE.test(token)) throw Object.assign(new Error("pending_token 形状越界：" + JSON.stringify(token)), { why: "pending_token 形状越界" });
+      // P1-6：先验字符串类型再正则 —— 正则 test 会把数字隐式强转放行（123456 是六位数字）。
+      if (token !== null && !(typeof token === "string" && TOKEN_SHAPE.test(token))) throw Object.assign(new Error("pending_token 形状越界：" + JSON.stringify(token)), { why: "pending_token 形状越界" });
       const claim = normalizeIso(g.claim_expires_at ?? null);
       if (g.claim_expires_at !== null && g.claim_expires_at !== undefined && claim === null) throw Object.assign(new Error("claim_expires_at 不可规范化：" + JSON.stringify(g.claim_expires_at)), { why: "claim_expires_at 不可规范化" });
       if (token === null && claim !== null) throw Object.assign(new Error("pending_token 为 null 而 claim_expires_at 为 " + claim + "（蕴含违反）"), { why: "token===null ⇒ claim_expires_at 必须 null" });
@@ -151,7 +157,7 @@ const entryChecks = {
     for (const [k, v] of Object.entries(entries)) {
       if (!TA_SHAPE.test(k)) return "键不是 topic_agent_id：" + k;
       if (!(isObj(v) && keysOf(v) === "claim_expires_at,token")) return "值键集不是 {token, claim_expires_at}";
-      if (v.token !== null && !TOKEN_SHAPE.test(v.token)) return "token 形状越界：" + JSON.stringify(v.token);
+      if (v.token !== null && !(typeof v.token === "string" && TOKEN_SHAPE.test(v.token))) return "token 形状越界：" + JSON.stringify(v.token);
       if (v.claim_expires_at !== null && !isCanonicalIso(v.claim_expires_at)) return "claim_expires_at 不是 null 或规范化 ISO";
       if (v.token === null && v.claim_expires_at !== null) return "token===null ⇒ claim_expires_at 必须 null";
     }
@@ -169,6 +175,8 @@ const entryChecks = {
 
 /** sidecar 文档值域封闭（三键根 + ≤512 条 + 值域按 4e）。返回 null 或问题串。 */
 export function validateSidecarDoc(doc, name, { endpointId } = {}) {
+  // P2-1：未知 name 先拒 —— 不能靠 schema_version 不匹配的巧合早退，更不能让 entryChecks[name] 裸抛 TypeError。
+  if (!SIDECAR_SCHEMAS[name]) return "未知 sidecar name：" + String(name);
   if (!isObj(doc)) return "sidecar 根不是对象";
   if (keysOf(doc) !== "endpoint_id,entries,schema_version") return "根键集不对";
   if (doc.schema_version !== SIDECAR_SCHEMAS[name]) return "schema_version 不是 " + SIDECAR_SCHEMAS[name];
@@ -187,8 +195,9 @@ export function readSidecarFile({ file, endpointId, name }) {
   let dst;
   try { dst = fs.lstatSync(path.dirname(file)); } catch (err) { return { ok: false, reason: "sidecar_unreadable", why: "父目录 lstat：" + String(err?.code ?? err) }; }
   if (!dst.isDirectory() || (dst.mode & 0o777) !== 0o700) return { ok: false, reason: "sidecar_unreadable", why: "父目录不是 0700" };
+  // P1-5：O_NONBLOCK —— FIFO 无写者时 open 阻塞挂死；非阻塞打开后同 fd fstat 拒非普通文件。
   let fd = null;
-  try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); } catch (err) { return { ok: false, reason: "sidecar_unreadable", why: String(err?.code ?? err) }; }
+  try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); } catch (err) { return { ok: false, reason: "sidecar_unreadable", why: String(err?.code ?? err) }; }
   try {
     const st = fs.fstatSync(fd);
     if (!st.isFile() || st.nlink !== 1) return { ok: false, reason: "sidecar_unreadable", why: "不是单硬链接普通文件" };

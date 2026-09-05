@@ -15,6 +15,7 @@ import path from "node:path";
 
 import { dirFsyncIgnorable, stagedDirFor, stagedIntendedFile } from "../maintenance/journal.mjs";
 import { stableStringify } from "../policy-store/canonical.mjs";
+import { MAX_BYTES as SIDECAR_MAX_BYTES } from "./sidecar-renderers.mjs";
 
 const PLAN_SCHEMA = "m1a-cutover-plan-1";
 const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -23,6 +24,8 @@ const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u; // 账本 endpoint_id（layer
 const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
 const keysOf = (o) => Object.keys(o).sort().join(",");
 const errCode = (err) => String(err?.code ?? err?.message ?? err);
+/** P1-3：token 必须 UUID（词法上无 / 与 ..）——遍历/外指 token 在入口就拒，stagedDirFor 只拼受验 token。 */
+const tokenShapeProblem = (token) => (typeof token === "string" && UUID_SHAPE.test(token) ? null : "token 不是 UUID");
 // plan.sidecars 键（无连字符）→ sidecar 文件名（连字符，同 journal target 规范）。
 const BLOB_FILE = Object.freeze({ expiry: "expiry", pending_claims: "pending-claims", policy: "policy" });
 export const PLAN_FILE = "plan.json";
@@ -49,7 +52,9 @@ const sha256Hex = (buf) => crypto.createHash("sha256").update(buf).digest("hex")
 /** 建 0700 目录（recursive 保父链在场），fsync 其父目录作屏障；已在场复用，但 mode 必须仍是 0700（private 目录不许降级）。 */
 function mkdirDurable(dir, parentToFsync) {
   try { fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch (err) { if (err?.code !== "EEXIST") throw err; }
-  const st = fs.statSync(dir);
+  // P1-3：lstat 不跟随 —— .staged / intended 被预埋成外指 symlink 时必须在此拒，不能 statSync 跟随放行照写。
+  const st = fs.lstatSync(dir);
+  if (st.isSymbolicLink()) { const e = new Error("staged 层是符号链接：" + dir); e.code = "EPRIVLINK"; throw e; }
   if (!st.isDirectory() || (st.mode & 0o777) !== 0o700) { const e = new Error("staged 目录不是 0700：" + dir); e.code = "EPRIVMODE"; throw e; }
   let dfd = null;
   try { dfd = fs.openSync(parentToFsync, fs.constants.O_RDONLY); fs.fsyncSync(dfd); }
@@ -75,13 +80,16 @@ function fsyncDir(dir) {
  * readRegularFile 不核 mode —— staged/sidecar 的 0600 合同在这里核。
  */
 export function readStagedVerified(file, { sha256, bytes = null } = {}) {
+  // P1-5：O_NONBLOCK —— FIFO 无写者时 O_RDONLY 的 open 会阻塞挂死；非阻塞打开后同 fd fstat 拒非普通文件。
   let fd = null;
-  try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); } catch (err) { return { ok: false, why: err?.code === "ENOENT" ? "文件不在" : errCode(err) }; }
+  try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); } catch (err) { return { ok: false, why: err?.code === "ENOENT" ? "文件不在" : errCode(err) }; }
   try {
     const st = fs.fstatSync(fd);
     if (!st.isFile()) return { ok: false, why: "不是普通文件" };
     if (st.nlink !== 1) return { ok: false, why: "硬链接数不是 1" };
     if ((st.mode & 0o777) !== 0o600) return { ok: false, why: "mode 不是 0600" };
+    // P1-6：字节上限先于按 st.size 分配 Buffer —— 被换大的文件先受控拒，不分配超大缓冲。
+    if (st.size > SIDECAR_MAX_BYTES) return { ok: false, why: "超过 1MiB（" + st.size + " 字节）" };
     if (bytes !== null && st.size !== bytes) return { ok: false, why: "长度不对（" + st.size + " ≠ " + bytes + "）" };
     const buf = Buffer.alloc(st.size);
     let off = 0;
@@ -98,6 +106,8 @@ export function readStagedVerified(file, { sha256, bytes = null } = {}) {
  * 锚来自 journal（ledger step 的 plan_sha256 + 三 sidecar intended_after/intended_blob），不信任盘上 plan 自述。
  */
 export function verifyStagedPlan({ dir, token, planSha256, sidecarShas }) {
+  const tokenProblem = tokenShapeProblem(token);
+  if (tokenProblem !== null) return { ok: false, reason: "staged_residue", why: tokenProblem };
   const intended = path.join(dir, stagedDirFor(token), "intended");
   let names = [];
   try { names = fs.readdirSync(intended).sort(); } catch (err) { return { ok: false, reason: "staged_residue", why: "intended 目录读不出：" + errCode(err) }; }
@@ -121,9 +131,15 @@ export function verifyStagedPlan({ dir, token, planSha256, sidecarShas }) {
 export function stageCutoverPlan({ dir, token, plan, blobs }) {
   const problem = planProblem(plan);
   if (problem !== null) return { ok: false, reason: "plan_mismatch", why: problem };
+  // P1-3：token 必须 UUID 且与 plan.operation_token 绑定 —— 遍历 token（../escape）、外指 staging 全部在此拒。
+  const tokenProblem = tokenShapeProblem(token);
+  if (tokenProblem !== null) return { ok: false, reason: "plan_mismatch", why: tokenProblem };
+  if (token !== plan.operation_token) return { ok: false, reason: "plan_mismatch", why: "token 与 plan.operation_token 不一致" };
   if (!(isObj(blobs) && keysOf(blobs) === "expiry,pending_claims,policy"
     && Object.values(blobs).every((b) => b instanceof Uint8Array))) return { ok: false, reason: "plan_mismatch", why: "blobs 必须是 {expiry,pending_claims,policy} 三个 Uint8Array" };
+  // P1-6：blob 超过 1MiB 拒在写入前 —— 不给盘上留下读取端必拒的物。
   for (const [k, fileBase] of Object.entries(BLOB_FILE)) {
+    if (blobs[k].byteLength > SIDECAR_MAX_BYTES) return { ok: false, reason: "plan_mismatch", why: fileBase + " blob 超过 1MiB（" + blobs[k].byteLength + " 字节）" };
     const actual = sha256Hex(Buffer.from(blobs[k]));
     if (actual !== plan.sidecars[k].sha256) return { ok: false, reason: "plan_mismatch", why: fileBase + " 字节 SHA 与 plan.sidecars." + k + ".sha256 不符" };
   }
@@ -135,7 +151,7 @@ export function stageCutoverPlan({ dir, token, plan, blobs }) {
     mkdirDurable(staged, dir);
     mkdirDurable(intended, staged);
   } catch (err) {
-    if (err?.code === "EPRIVMODE") return { ok: false, reason: "staged_residue", why: err.message };
+    if (err?.code === "EPRIVMODE" || err?.code === "EPRIVLINK") return { ok: false, reason: "staged_residue", why: err.message };
     return { ok: false, reason: "io_error", why: "建 staged 目录：" + errCode(err) };
   }
   // intended/ 已有文件（崩溃残骸）：走受验复验，全符复用、否则拒。陌生文件也是残骸。
@@ -143,8 +159,11 @@ export function stageCutoverPlan({ dir, token, plan, blobs }) {
   try { existing = fs.readdirSync(intended).sort(); } catch (err) { return { ok: false, reason: "io_error", why: "读 intended：" + errCode(err) }; }
   if (existing.length > 0) {
     const v = verifyStagedPlan({ dir, token, planSha256: planSha, sidecarShas: plan.sidecars });
-    return v.ok ? { ok: true, reused: true, plan_bytes: planBytes.length, plan_sha256: planSha }
-                : { ok: false, reason: "staged_residue", why: v.why };
+    if (!v.ok) return { ok: false, reason: "staged_residue", why: v.why };
+    // P1-4：复用成功前必须重新 fsync intended/ 目录 —— 首次写完四件但目录屏障失败后，
+    // 重试只复验文件即 reused 会把「目录项未落盘」的窗口带进段提交。
+    try { fsyncDir(intended); } catch (err) { return { ok: false, reason: "io_error", why: "复用前 fsync intended 目录：" + errCode(err) }; }
+    return { ok: true, reused: true, plan_bytes: planBytes.length, plan_sha256: planSha };
   }
   try {
     writeExclDurable(path.join(intended, PLAN_FILE), planBytes);
@@ -158,6 +177,8 @@ export function stageCutoverPlan({ dir, token, plan, blobs }) {
 
 /** 删除 staged 私有目录；absent 也算成功（幂等）。失败交调用方（R45：journal 保持 drained + cleanup_pending）。 */
 export function removeStagedPlan({ dir, token }) {
+  const tokenProblem = tokenShapeProblem(token);
+  if (tokenProblem !== null) return { ok: false, why: tokenProblem };
   const staged = path.join(dir, stagedDirFor(token));
   try {
     fs.rmSync(staged, { recursive: true, force: false });

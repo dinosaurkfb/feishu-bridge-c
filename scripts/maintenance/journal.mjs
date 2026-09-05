@@ -201,15 +201,15 @@ function shapeProblemFor(s) {
     if (!m) return "sidecar 的 id 必须是 sidecar:<name>:<endpoint>";
     const [name, ep] = [rest.split(":")[0], m[1]];
     if (s.target !== "ledger/" + ep + "/" + name + ".json") return "sidecar 的 target 必须是 ledger/<endpoint>/<name>.json";
-    if (!fileState(s.before) || !fileState(s.intended_after) || !(s.after === null || fileState(s.after))) return "sidecar 的 before / intended_after / after 形状不对";
+    if (!fileState(s.before) || !fileState(s.intended_after) || (s.after !== undefined && !fileState(s.after))) return "sidecar 的 before / intended_after / after 形状不对";
     if (s.intended_after.exists !== true) return "sidecar.intended_after 必须在场（cutover 权威写入的文件）";
     const blob = s.intended_blob;
     if (!(isObj(blob) && keysOf(blob) === "bytes,path,sha256" && typeof blob.path === "string" && path.isAbsolute(blob.path)
       && Number.isSafeInteger(blob.bytes) && blob.bytes >= 0 && typeof blob.sha256 === "string" && SHA_SHAPE.test(blob.sha256))) return "sidecar.intended_blob 形状不对";
     if (blob.sha256 !== s.intended_after.sha256) return "sidecar.intended_blob 的 sha 必须等于 intended_after";
     if (!blob.path.endsWith("/intended/" + name + ".json")) return "sidecar.intended_blob.path 不是 intended/<name>.json 的绝对路径";
-    // 单次原子提交：after（done 时）必须逐字段等于 intended_after（与 ledger step 同一语义）。
-    if (s.after !== null && (s.after.exists !== s.intended_after.exists || s.after.sha256 !== s.intended_after.sha256)) return "sidecar.after 必须逐字段等于 intended_after";
+    // 单次原子提交：done 的 after（键在）必须逐字段等于 intended_after（prepared 无 after 键，键集已分）。
+    if (s.after !== undefined && (s.after.exists !== s.intended_after.exists || s.after.sha256 !== s.intended_after.sha256)) return "sidecar.after 必须逐字段等于 intended_after";
     if (s.before.exists && s.backup === null) return "sidecar 原来存在必须有备份";
     if (!s.before.exists && s.backup !== null) return "sidecar 原来不存在不该有备份";
     return null;
@@ -219,18 +219,23 @@ function shapeProblemFor(s) {
 function stepProblem(s) {
   if (!isObj(s)) return "step 不是对象";
   if (!STEP_KINDS.includes(s.kind)) return "step kind 不在受控集合里";
-  // M1b T4：sidecar 比 11 键基形多一个 intended_blob（prepared 用 after:null 对齐两阶段机制，不靠字面键缺席表达）。
+  // M1b T4 返修 P1-2：sidecar 精确键集按 state 两态（maintenance-gate.md 阶段表）——
+  // prepared = 11 键（无 after 无 chain）；done = prepared ∪ {after}。state 不是这两态 → 两套键集都不匹配即拒。
   const wantKeys = s.kind === "sidecar"
-    ? "after,at,backup,backup_bytes,backup_sha256,before,chain,id,intended_after,intended_blob,kind,state,target"
+    ? (s.state === "done"
+        ? "after,at,backup,backup_bytes,backup_sha256,before,id,intended_after,intended_blob,kind,state,target"
+        : "at,backup,backup_bytes,backup_sha256,before,id,intended_after,intended_blob,kind,state,target")
     : "after,at,backup,backup_bytes,backup_sha256,before,chain,id,intended_after,kind,state,target";
   if (keysOf(s) !== wantKeys) return "step 字段集不对";
   if (typeof s.id !== "string" || s.id.length === 0) return "step id 不是字符串";
-  if (s.kind !== "ledger" && s.chain !== null) return "非 ledger step 不该有 chain";
+  if (s.kind !== "ledger" && s.kind !== "sidecar" && s.chain !== null) return "非 ledger step 不该有 chain";
   if (typeof s.target !== "string" || s.target.length === 0) return "step target 不是字符串";
   if (!(s.backup === null || (typeof s.backup === "string" && path.isAbsolute(s.backup)))) return "step backup 不是 null 或绝对路径";
   if (s.backup === null ? (s.backup_sha256 !== null || s.backup_bytes !== null) : !(typeof s.backup_sha256 === "string" && SHA_SHAPE.test(s.backup_sha256) && Number.isSafeInteger(s.backup_bytes) && s.backup_bytes >= 0)) return "备份的 sha256 / 长度与 backup 不一致";
   if (!(s.state === "prepared" || s.state === "done")) return "step state 不是 prepared / done";
-  if (s.state === "prepared" && s.after !== null) return "prepared 的 step 不该有 after";
+  // prepared 两阶段：after 不得在场。非 sidecar 的 prepared 用 after:null 表达；sidecar prepared 合同是 after 键缺席（P1-2），
+  // 由键集核管（wantKeys 不含 after）——这里豁免 sidecar，只看它 done 时 after === intended_after（shapeProblemFor）。
+  if (s.state === "prepared" && s.kind !== "sidecar" && s.after !== null) return "prepared 的 step 不该有 after";
   if (s.state === "done" && s.after === null) return "done 的 step 必须有 after";
   if (!isCanonicalIso(s.at)) return "step at 不是规范化 ISO 时间";
   return shapeProblemFor(s);
@@ -254,7 +259,37 @@ function requiredStepIds(doc) {
   }
   return PHASE_REQUIRES[doc.phase];
 }
-export function journalProblem(doc) {
+/**
+ * P1-3：intended_blob.path 的段级核（替代 endsWith）——规范绝对路径（normalize 恒等、无点段、无冗余分隔符），
+ * 按段精确匹配 <token>.staged / intended / <name>.json。外指目录树（/evil/<token>.staged/…）与 .. 遍历在此拒。
+ * 返回 null 或问题短句（不带主语，由调用方拼）。
+ */
+function stagedBlobPathProblem(blobPath, token, name, maintenanceDir) {
+  if (typeof blobPath !== "string" || !blobPath.startsWith("/")) return "不是绝对路径";
+  if (path.normalize(blobPath) !== blobPath) return "不是规范路径（含 . / .. / 冗余分隔符）";
+  const segs = blobPath.slice(1).split("/");
+  if (segs.length < 3) return "层级不够";
+  if (segs[segs.length - 1] !== name + ".json") return "basename 不是 <name>.json";
+  if (segs[segs.length - 2] !== "intended") return "倒数第二段不是 intended";
+  if (segs[segs.length - 3] !== token + ".staged") return "staged 段不是 <token>.staged";
+  // 调用方给了维护目录时强核前缀（段级）：/evil/<token>.staged/… 这类外指树在此拒。
+  if (maintenanceDir !== undefined) {
+    const prefixProblem = maintenanceDirSegments(maintenanceDir);
+    if (prefixProblem !== null) return "维护目录" + prefixProblem;
+    const base = maintenanceDir.slice(1).split("/").filter((s) => s !== "");
+    if (segs.length !== base.length + 3) return "不在维护目录树下";
+    for (let i = 0; i < base.length; i++) if (segs[i] !== base[i]) return "不在维护目录树下";
+  }
+  return null;
+}
+
+/** 维护目录自身的词法核：规范绝对路径（normalize 恒等）。TOCTOU 由 staged-plan 侧逐层 lstat 受验管。 */
+function maintenanceDirSegments(maintenanceDir) {
+  if (typeof maintenanceDir !== "string" || !maintenanceDir.startsWith("/") || path.normalize(maintenanceDir) !== maintenanceDir) return "不是规范绝对路径";
+  return null;
+}
+
+export function journalProblem(doc, { maintenanceDir } = {}) {
   if (!isObj(doc)) return "不是对象";
   // schema 判别（M1 账本接入 B / 评审 P2-1；M1b T4 加 1.3）：1.2/1.3 必含 operation_kind；旧 1.1 无该字段、按既有种读（不当 unreadable）。
   if (doc.schema_version !== JOURNAL_SCHEMA && doc.schema_version !== LEGACY_JOURNAL_SCHEMA && doc.schema_version !== CUTOVER_JOURNAL_SCHEMA) return "schema_version 不认识";
@@ -355,12 +390,15 @@ export function journalProblem(doc) {
       if (sidecarCount !== 0) return "回退阶段 " + doc.phase + " 不得含 sidecar step";
     }
   }
-  // M1b T4 ②：1.3 cutover 的进段原子合同与 4f、plan_sha256、token 私有目录核。
+  // M1b T4 ② + 返修 P1-1/P1-2/P1-3：1.3 cutover 的进段原子合同与 4f、plan_sha256 合同、token 私有目录段级核。
   if (is13 && doc.operation_kind === "ledger_cutover") {
     const sidecars = doc.steps.filter((s) => s.kind === "sidecar");
     const names = sidecars.map((s) => s.id.slice("sidecar:".length).split(":")[0]).sort().join(",");
-    if (sidecars.length !== 0 && sidecars.length !== 3) return "sidecar step 数量必须是 0 或 3，现在是 " + sidecars.length;
-    if (sidecars.length === 3 && names !== "expiry,pending-claims,policy") return "sidecar 三元组不全或重复：" + names;
+    // P1-1（maintenance-gate.md 阶段表）：进入 ledger_cutting_over 起恰三条（≤drained 零条已在上分支核）；零条只合法于 drained 及更早。
+    if (doc.phase === "ledger_cutting_over" || doc.phase === "ledger_reopening" || doc.phase === "done") {
+      if (sidecars.length !== 3) return "进入 ledger_cutting_over 起必须恰三条 sidecar step，现在是 " + sidecars.length;
+      if (names !== "expiry,pending-claims,policy") return "sidecar 三元组不全或重复：" + names;
+    }
     const ls = doc.steps.find((s) => s.kind === "ledger");
     if (sidecars.length === 3) {
       const lsEp = typeof ls?.id === "string" ? ls.id.split(":")[1] : null;
@@ -368,20 +406,37 @@ export function journalProblem(doc) {
       if (doc.phase === "ledger_cutting_over" && ls?.state === "done" && sidecars.some((s) => s.state !== "done")) return "ledger step 已 done 而 sidecar 未全 done";
     }
     if (ls) {
-      // plan_sha256：1.3 cutover 的三个状态对象（after 可 null）都必须带 SHA 形状的 plan_sha256 且全部同值。
+      // P1-2b（maintenance-gate.md B-2 表）：plan_sha256 属三个状态对象；cutover 合同形状 =
+      // before.plan_sha256 === null（无计划锚），intended_after/after（非 null 时）= 受验 plan 原始字节 SHA。
       for (const k of ["before", "intended_after", "after"]) {
         const st = ls[k];
-        if (st === null) continue;
-        if (!(typeof st.plan_sha256 === "string" && SHA_SHAPE.test(st.plan_sha256))) return "1.3 cutover 的 " + k + " 必须带 plan_sha256";
+        if (st === null || st === undefined) continue;
+        if (!("plan_sha256" in st)) return "1.3 cutover 的 " + k + " 缺 plan_sha256 字段";
       }
-      const planShas = [ls.before, ls.intended_after, ls.after].filter((x) => x !== null).map((x) => x.plan_sha256);
-      if (new Set(planShas).size !== 1) return "plan_sha256 三处必须同值";
+      if (ls.before?.plan_sha256 !== null) return "1.3 cutover 的 before.plan_sha256 必须是 null（B-2 合同）";
+      if (!(typeof ls.intended_after?.plan_sha256 === "string" && SHA_SHAPE.test(ls.intended_after.plan_sha256))) return "1.3 cutover 的 intended_after.plan_sha256 必须是受验 plan 字节 SHA";
+      if (ls.after !== null && ls.after !== undefined
+        && (!(typeof ls.after.plan_sha256 === "string" && SHA_SHAPE.test(ls.after.plan_sha256)) || ls.after.plan_sha256 !== ls.intended_after.plan_sha256)) return "1.3 cutover 的 after.plan_sha256 必须与 intended_after 同 plan SHA";
     }
     for (const s of sidecars) {
-      // intended_blob.path / backup 必须在本 operation 的 staged 私有目录（token 段核；name 后缀形状已由 shapeProblemFor 核）。
+      // P1-3：段级核替代 endsWith —— 规范绝对路径（normalize 恒等、无点段），按段精确匹配 <token>.staged / intended / <name>.json；
+      // 调用方给了维护目录时再强核前缀（外指树拒）。
       const name = s.id.slice("sidecar:".length).split(":")[0];
-      if (!s.intended_blob.path.endsWith("/" + doc.token + ".staged/intended/" + name + ".json")) return "sidecar.intended_blob.path 必须在 <token>.staged/intended 下";
-      if (s.backup !== null && !path.dirname(s.backup).endsWith("/" + doc.token + ".staged")) return "sidecar.backup 必须在 <token>.staged 下";
+      const pathProblem = stagedBlobPathProblem(s.intended_blob.path, doc.token, name, maintenanceDir);
+      if (pathProblem !== null) return "sidecar.intended_blob.path " + pathProblem;
+      if (s.backup !== null) {
+        const d = path.dirname(s.backup);
+        if (typeof d !== "string" || !d.startsWith("/") || path.normalize(d) !== d) return "sidecar.backup 不是规范绝对路径";
+        const segs = d.slice(1).split("/");
+        if (segs.length < 1 || segs[segs.length - 1] !== doc.token + ".staged") return "sidecar.backup 必须在 <token>.staged 下";
+        if (maintenanceDir !== undefined) {
+          const prefixProblem = maintenanceDirSegments(maintenanceDir);
+          if (prefixProblem !== null) return "sidecar.backup 的维护目录" + prefixProblem;
+          const base = maintenanceDir.slice(1).split("/").filter((x) => x !== "");
+          if (segs.length !== base.length + 1) return "sidecar.backup 不在维护目录树下";
+          for (let i = 0; i < base.length; i++) if (segs[i] !== base[i]) return "sidecar.backup 不在维护目录树下";
+        }
+      }
     }
   }
   if (!Array.isArray(doc.notes) || doc.notes.some((n) => typeof n !== "string")) return "notes 不是字符串数组";
@@ -422,7 +477,7 @@ export function readJournal({ dir, token } = {}) {
   if (r.status !== "read") return { state: "unreadable", why: r.why };
   let doc;
   try { doc = JSON.parse(r.buf.toString("utf-8")); } catch (err) { return { state: "unreadable", why: "不是 JSON：" + errCode(err) }; }
-  const problem = journalProblem(doc);
+  const problem = journalProblem(doc, { maintenanceDir: dir });
   return problem === null ? { state: "valid", doc } : { state: "unreadable", why: "形状不对：" + problem };
 }
 
@@ -498,7 +553,7 @@ export function createOperation({ dir, reason, operationKind = "maintenance_gate
   const at = new Date(now).toISOString();
   // M1b T4 ①：cutover operation 从 1.3 起记账（sidecar step + plan_sha256）；其余种照旧 1.2。
   const doc = { schema_version: operationKind === "ledger_cutover" ? CUTOVER_JOURNAL_SCHEMA : JOURNAL_SCHEMA, operation_kind: operationKind, token, reason, started_at: at, updated_at: at, phase: "planned", steps: [], notes: [] };
-  const problem = journalProblem(doc);
+  const problem = journalProblem(doc, { maintenanceDir: dir });
   if (problem !== null) { releaseOperationLease(lease); return { ok: false, reason: "journal_shape", why: problem }; }
   try { writeDurable(journalPath(dir, token), JSON.stringify(doc, null, 2) + "\n"); } catch (err) { releaseOperationLease(lease); return { ok: false, reason: "io_error", why: "写 journal：" + errCode(err) }; }
   try { fs.symlinkSync(token, activePath(dir)); }
@@ -526,7 +581,7 @@ export function updateJournal({ dir, token, lease, expectPhase = null, mutate, n
   const next = mutate(structuredClone(r.doc)) ?? null;
   if (next === null) return { ok: false, reason: "mutate_returned_nothing" };
   next.updated_at = new Date(now).toISOString();
-  const problem = journalProblem(next);
+  const problem = journalProblem(next, { maintenanceDir: dir });
   if (problem !== null) return { ok: false, reason: "journal_shape", why: problem };
   const c = commitWhileHeld(lease.path, () => { try { writeDurable(journalPath(dir, token), JSON.stringify(next, null, 2) + "\n"); return null; } catch (err) { return errCode(err); } });
   if (!c.ok) return { ok: false, reason: c.reason === "lock_lost" ? "lease_lost" : "io_error", why: "租约核对：" + String(c.reason) };

@@ -7,6 +7,8 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { acquireClaim, claimKey, readClaimState, recordClaimState } from "../claim.mjs";
+import { wireChatA1, wirePromoteBinding, wireVoid } from "../m1a/wiring.mjs";
+import { legacyEndpointId } from "../subscription.mjs";
 import { fetchTriggerEvent } from "../envelope.mjs";
 import { moduleRoot } from "../direct-run.mjs";
 import {
@@ -164,9 +166,23 @@ function chatTurn({ chain, template, event, dryRun, ledgerDir }) {
     writeReceipt("chat-path-" + messageId, { status: "error", reason: "chat_reply_path_unavailable", why: pathStatus.why, ...base });
     finish("error", { detail: "这条链的 chat 靠本机 Claude CLI 答话，当前不可用（" + pathStatus.why + "）；没有回答" }, { reason: "chat_reply_path_unavailable", mode: CHAT_POLICY_ID });
   }
-  // 准入 —— 一把锁内：盘点（说不清就拒，不折叠成空闲）→ 上界 → 建 claim（闭合转换）
-  const admitted = admitChat({ ledgerDir, key, senderId: event.sender_id, budgetMs: chatReplyTimeoutMs(),
-    meta: { chain, message_id: messageId, session_id: event.session_id ?? null, sender_ref: senderRef(event.sender_id), role: gates.role, risk_class: risk.riskClass } });
+  // 准入 —— 一把锁内：盘点（说不清就拒，不折叠成空闲）→ 上界 → 建 claim（闭合转换）。
+  // P1-3①（Codex P1-3 点名「A1 chatTurn」）：入站 chat 的 A1 物化入口接 wireChatA1 —— 已启用端点
+  //   （ledger_init done 收据）以 m1a-order 锁串行、先 legacy admitChat 后 create_a1 shadow；未启用端点
+  //   （无收据）→ 合法 legacy-only、不写 shadow；已启用点任一取锁失败 → 整笔拒、不写 legacy（skip 集为空）。
+  //   A1 群锚点用「当场受验 locator」（AILY_CLI_CHANNEL_CHAT_ID，channel-locator-verdict §2），不是配置 chat_id；
+  //   缺 / 空 → null → create_a1 bad_input → 拒物化（未受验不猜），legacy 照答。
+  const wiredA1 = wireChatA1({
+    agentUid: template.agent_uid, chatId: process.env.AILY_CLI_CHANNEL_CHAT_ID || null,
+    sessionId: event.session_id ?? null, messageId, runtime: "codex",
+    admit: () => admitChat({ ledgerDir, key, senderId: event.sender_id, budgetMs: chatReplyTimeoutMs(),
+      meta: { chain, message_id: messageId, session_id: event.session_id ?? null, sender_ref: senderRef(event.sender_id), role: gates.role, risk_class: risk.riskClass } }),
+  });
+  if (!wiredA1.ok) {
+    writeReceipt("chat-m1a-" + messageId, { status: "rejected", reason: wiredA1.reason ?? "m1a_reject", why: wiredA1.why ?? null, lock: wiredA1.lock ?? null, mode: CHAT_POLICY_ID, ...base });
+    finish("rejected", { reasonText: "这条消息的 M1a 一致性锁取不到（" + (wiredA1.reason ?? "unknown") + "），未写 legacy、没有回答；稍后再问一次" }, { reason: wiredA1.reason ?? "m1a_reject", mode: CHAT_POLICY_ID });
+  }
+  const admitted = wiredA1.legacy;
   if (!admitted.ok) {
     const lockNote = admitted.lockUncleared ? "；另外" + lockUnclearedText(admitted.lockUncleared) : "";
     if (admitted.reason === "duplicate") finish("error", { detail: "这条消息刚被另一个进程接手回答；不会再起第二个回答" + lockNote }, { reason: "chat_duplicate_race", mode: CHAT_POLICY_ID });
@@ -297,13 +313,34 @@ if (!routed.ok) {
   const pending = findPendingTask({ home: HOME, content: event.content, now: promotionNow });
   if (!pending.ok && pending.reason === "pending_binding_expired" && pending.operationId &&
       pending.task?.codex_thread_id) {
-    closeTaskTopicRotation({
+    // P1-3①（Codex P1-3 点名「过期 void」）：过期兜底原本只 closeTaskTopicRotation（不落 M1a 账本），
+    //   现包成 wireVoid(reason=expired) —— 与 claude P1-3② 同构：ext=rotation operation id、目标由 resolver
+    //   按被作废代际根消息 om 命中、reason=expired；resolver 未命中（legacy-only、无 B1）→ shadow fail-closed、
+    //   legacy 照常过期。单笔 void、取 outer 锁。
+    const expireLegacy = () => closeTaskTopicRotation({
       threadId: pending.task.codex_thread_id,
       operationId: pending.operationId,
       reason: "expired",
       home: HOME,
       now: promotionNow,
     });
+    if (template?.template?.agent_uid) {
+      const wiredExpire = wireVoid({
+        endpointId: legacyEndpointId({ runtime: "codex", agentUid: template.template.agent_uid }),
+        env: process.env,
+        rotationOpId: pending.operationId,
+        locator: pending.generation?.root_message_id ?? null,
+        reason: "expired",
+        legacy: expireLegacy,
+      });
+      const failedStep = (wiredExpire.shadow ?? []).find((s) => !s.ok);
+      const relFail = wiredExpire.release && wiredExpire.release.ok !== true;
+      if (failedStep || relFail) {
+        writeReceipt("expire-void-" + (event.message_id ?? Date.now()), { status: "shadow_failed", operationId: pending.operationId, locator: pending.generation?.root_message_id ?? null, legacy_committed: true, step: failedStep ?? null, release: wiredExpire.release ?? null, expired_at: promotionNow });
+      }
+    } else {
+      expireLegacy();
+    }
   }
   if (!pending.ok && ![
     "no_pending_binding", "multiple_pending_bindings", "multiple_binding_tokens",
@@ -343,13 +380,32 @@ if (!routed.ok) {
     process.stdout.write("[dry-run] 会把这个话题绑定到 " + promotion.task.task_display_name + "；没有写 registry。\n");
     process.exit(0);
   }
-  const promoted = promoteTask({
-    logicalTaskKey: promotion.task.logical_task_key,
-    sessionId: event.session_id,
-    generationId: pending.generationId,
-    operationId: pending.operationId,
-    home: HOME,
+  // P1-3①（Codex P1-3 点名「认领 promoteTask:346」）：认领→绑定落盘处接 wirePromoteBinding —— 已启用端点
+  //   （ledger_init done 收据）以 m1a-order 锁串行、先 legacy promoteTask 后 create_a1→activate（W1）/
+  //   rebind_session_alias（W2）shadow；未启用端点（无收据）→ 合法 legacy-only、不写 shadow；已启用点任一
+  //   取锁失败 → 整笔拒、不写 legacy（skip 集为空）。locator=被认领代际根消息 om（matched_om）；
+  //   claimKey=claim.mjs 64hex；authorizedBy=event.sender_id；f4=认领校验处受验封闭产物（未受验=null→bad_f4）。
+  const wiredPromote = wirePromoteBinding({
+    endpointId: legacyEndpointId({ runtime: "codex", agentUid: template.template.agent_uid }),
+    env: process.env,
+    legacy: () => promoteTask({
+      logicalTaskKey: promotion.task.logical_task_key,
+      sessionId: event.session_id,
+      generationId: pending.generationId,
+      operationId: pending.operationId,
+      home: HOME,
+    }),
+    locator: pending.generation?.root_message_id ?? null,
+    claimKey: claimKey(event.message_id ?? "", promotion.task.logical_task_key ?? ""),
+    sessionId: event.session_id ?? null,
+    authorizedBy: event.sender_id ?? null,
+    f4: promotion.f4 ?? null,
   });
+  if (!wiredPromote.ok) {
+    writeReceipt("promote-m1a-" + (event.message_id ?? Date.now()), { status: "rejected", reason: wiredPromote.reason ?? "m1a_reject", why: wiredPromote.why ?? null, lock: wiredPromote.lock ?? null, claim_acquired: false, handed_off: false, subscription_claim_shadow: subscriptionClaimShadow });
+    finish("rejected", { reasonText: "这条认领的 M1a 一致性锁取不到（" + (wiredPromote.reason ?? "unknown") + "），未绑定，请稍后再试一次" }, { reason: wiredPromote.reason ?? "m1a_reject" });
+  }
+  const promoted = wiredPromote.legacy;
   if (!promoted.ok) {
     writeReceipt("bind-failed-" + (event.message_id ?? Date.now()), {
       status: "error", reason: promoted.reason, message_id: event.message_id ?? null,

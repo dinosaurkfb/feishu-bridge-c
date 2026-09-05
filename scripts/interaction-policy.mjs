@@ -63,6 +63,15 @@ export const DIALOGUE_FINAL_REASONS = Object.freeze([
   "forward_failed", "handoff_failed", "runtime_failed", "watch_timeout", "empty_final_output",
 ]);
 
+/** #R38 P1-2：终局原因归一化的唯一判据（Claude 与 Codex watcher 共用，不各写一份）。
+ *  completed 无终局原因（写前校验拒一切）；其余终局只认纯终局枚举，runner 侧的动态
+ *  字符串（nonzero_exit / turn_failed / artifact_unreadable 等）归一化到内部默认
+ *  dialogue_run_failed。写方 finalizeDialogueTurn 写前仍会校验一次（双闸）。 */
+export function normalizeFinalReason(status, reason) {
+  if (status === DIALOGUE_TURN_STATUS.COMPLETED) return null;
+  return DIALOGUE_FINAL_REASONS.includes(reason) ? reason : "dialogue_run_failed";
+}
+
 const nonEmpty = (value) => typeof value === "string" && value.length > 0;
 const iso = (now) => new Date(now).toISOString();
 const clone = (value) => JSON.parse(JSON.stringify(value));

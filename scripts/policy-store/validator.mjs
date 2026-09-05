@@ -24,11 +24,13 @@ const nonEmpty = (v) => typeof v === "string" && v.length > 0;
 const positiveInteger = (v) => Number.isInteger(v) && v > 0;
 const nonNegativeInteger = (v) => Number.isInteger(v) && v >= 0;
 
-/** 八根键精确（#R35 P1-2：subject↔binding_id 外键进条目本体）：六键 + subject_kind/subject_id。 */
-const ROOT_KEYS = "binding_id,dialogue,policy_id,policy_version,schema_version,subject_id,subject_kind,updated_at";
+/** 六根键精确（#R38 P1-5 规格裁定：条目 = 原样六键 interaction_policy_state，m1a §4 policy-1）：
+ *  binding_id 保留 legacy 原值只作出处（非空即可，不参与 subject 关联）；subject 只是外键（键名），
+ *  关联校验在 store 层（subject 形状 + 同 subject 冲突规则），条目 schema 不带 subject 字段。 */
+const ROOT_KEYS = "binding_id,dialogue,policy_id,policy_version,schema_version,updated_at";
 
-/** policy_subject 派生域（与 store.mjs 同一实现，store re-export 保持 API；#R35 P1-2 搬入校验器，
- *  外键自洽校验要在同一处算 ps_，避免 store↔validator 循环 import）。 */
+/** policy_subject 派生域（与 store.mjs 同一实现，store re-export 保持 API）：键名派生的唯一判据。
+ *  #R38 P1-5：外键自洽校验已撤（条目不带 subject 字段），派生只服务键的生成与形状校验。 */
 export const POLICY_SUBJECT_KINDS = Object.freeze(["lineage", "topic_agent"]);
 export function policySubjectId({ kind, endpointId, id } = {}) {
   if (!POLICY_SUBJECT_KINDS.includes(kind)) throw new TypeError("policy_subject_id: kind 必须是 lineage|topic_agent");
@@ -81,25 +83,14 @@ const turnFacts = (turn) => ({
 
 /**
  * 校验 interaction_policy_state 条目；返回问题码字符串（fail-closed 的 reason）或 null（合法）。
- * { bindingId } 给定时要求条目 binding_id 与之一致（存储层外键核对）。
- * { endpointId, subjectKey } 给定时（存储层）重算 ps_ 核对键与 subject_kind/subject_id 自洽
- * （#R35 P1-2 外键三重：条目内 kind↔id 形状、binding_id===subject_id、键↔字段哈希自洽）。
+ * #R38 P1-5：撤掉 #R35 的八键与 binding_id===subject_id 强制 —— 规格赢（m1a §4 policy-1 定的
+ * 是原样六键条目），subject 关联在 store 层验（subject 形状 + 同 subject 冲突规则）。
  */
-export function interactionPolicyStateProblem(state, { bindingId, endpointId, subjectKey } = {}) {
+export function interactionPolicyStateProblem(state) {
   if (!isObj(state)) return "policy_not_object";
   if (keysOf(state) !== ROOT_KEYS) return "policy_root_keys";
   if (state.schema_version !== INTERACTION_POLICY_SCHEMA_VERSION) return "policy_schema_version";
-  if (!POLICY_SUBJECT_KINDS.includes(state.subject_kind)) return "policy_subject_kind";
-  if (typeof state.subject_id !== "string" || state.subject_id.length === 0) return "policy_subject_id";
-  if (state.subject_kind === "topic_agent" && !ID_SHAPE.test(state.subject_id)) return "policy_subject_id";
-  if (state.subject_kind === "lineage" && !LINEAGE_SHAPE.test(state.subject_id)) return "policy_subject_id";
-  if (state.binding_id !== state.subject_id) return "policy_subject_binding_mismatch";
-  if (endpointId !== undefined && subjectKey !== undefined &&
-      policySubjectId({ kind: state.subject_kind, endpointId, id: state.subject_id }) !== subjectKey) {
-    return "policy_subject_key_mismatch";
-  }
   if (!nonEmpty(state.binding_id)) return "policy_binding_id";
-  if (bindingId !== undefined && state.binding_id !== bindingId) return "policy_binding_id_mismatch";
   if (!isCanonicalIso(state.updated_at)) return "policy_updated_at";
 
   const mappingMode = state.policy_id === "mapping" && state.policy_version === "1.0";
@@ -152,12 +143,11 @@ export function interactionPolicyStateProblem(state, { bindingId, endpointId, su
   if (!isCanonicalIso(d.deadline_at)) return "dialogue_deadline_at";
   if (!isCanonicalIso(d.updated_at)) return "dialogue_updated_at";
 
-  // 状态关系联合封闭（#R33 P1-1）+ dialogue.status × last_turn.status 封闭矩阵（#R35 P1-1）：
-  // 终局三值必有规范 ended_at + 受控终局原因且 active_turn 空；active 反之。矩阵按写路径冻结：
-  // failed ⇔ last_turn=failed（FAILED 分支唯一产生，跨回合覆盖）；cancelled ⇔ last_turn=cancelled
-  //（finalize CANCELLED 唯一产生）；completed/active 时 last_turn 任意终态或缺席（stopDialogue 在
-  // 无 active_turn 时保留上轮终态，映射切回后审计快照可能是任意组合，不作过度约束）。
-  // mapping 是终局审计快照，三元组可遗留可空但值域仍受控。
+  // 状态关系联合封闭（#R33 P1-1）+ dialogue.status × last_turn.status 封闭矩阵（#R35 P1-1，
+  // #R38 P1-1 收紧）：failed ⇔ last_turn=failed（finalize FAILED 分支唯一产生，跨回合覆盖）。
+  // cancelled dialogue 允许 last_turn 为任意合法终局：一轮 completed 后切回 Mapping 的审计快照
+  //（setInteractionPolicyMode 切回时 active_turn 已空，last_turn 保留上轮终态）是真实写方产出；
+  // last_turn 值域已在下方校验段封闭，这里不再作过度约束。completed/active 同理任意终态或缺席。
   if (d.status === DIALOGUE_STATUS.ACTIVE) {
     if (d.ended_at !== null || d.stop_reason !== null) return "dialogue_status";
   } else {
@@ -166,7 +156,6 @@ export function interactionPolicyStateProblem(state, { bindingId, endpointId, su
       if (d.stop_reason === null || !DIALOGUE_FINAL_REASONS.includes(d.stop_reason)) return "dialogue_stop_reason";
       if (d.active_turn !== null) return "dialogue_active_turn";
       if (d.status === DIALOGUE_TURN_STATUS.FAILED && d.last_turn !== undefined && d.last_turn.status !== DIALOGUE_TURN_STATUS.FAILED) return "dialogue_last_turn";
-      if (d.status === DIALOGUE_TURN_STATUS.CANCELLED && d.last_turn !== undefined && d.last_turn.status !== DIALOGUE_TURN_STATUS.CANCELLED) return "dialogue_last_turn";
     } else if (d.ended_at !== null && !isCanonicalIso(d.ended_at)) return "dialogue_ended_at";
   }
 

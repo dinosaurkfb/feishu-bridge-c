@@ -38,20 +38,18 @@ const KINDS = ["lineage", "topic_agent"];
 const LOCK_NAME = "policy.lock";
 const FILE_NAME = "policy.json";
 
-/* ───────────────────────── 条目校验（全经 ipsp-1；派生与外键自洽在 validator.mjs） ───────────────────────── */
+/* ───────────────── 条目校验（值全经 ipsp-1；subject 外键只在 store 层验，#R38 P1-5） ───────────────── */
 
-/**
- * 单条目：subject 形状 + 值必须是过 ipsp-1 的完整 interaction_policy_state，且条目本体
- * 内嵌的 subject_kind/subject_id 与 binding_id、与键（ps_ 哈希）三重自洽（#R35 P1-2 外键）。
- */
-function entryProblem(subject, value, endpointId) {
+/** 单条目：subject 形状 + 值必须是过 ipsp-1 的完整六键 interaction_policy_state。
+ *  键↔条目无哈希自洽关联（#R35 外键已撤）：同 subject 冲突规则由 upsert 层的 conflict 拒绝承担。 */
+function entryProblem(subject, value) {
   if (!SUBJECT_ID_SHAPE.test(subject)) return { reason: "policy_store_bad_subject", detail: null };
-  const ip = interactionPolicyStateProblem(value, { endpointId, subjectKey: subject });
+  const ip = interactionPolicyStateProblem(value);
   if (ip !== null) return { reason: "policy_entry_invalid", detail: ip };
   return null;
 }
 
-function rootSchemaProblem(raw, endpointId) {
+function rootSchemaProblem(raw) {
   let doc;
   try { doc = JSON.parse(raw); } catch { return { reason: "policy_store_parse_failed", detail: null }; }
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return { reason: "policy_store_root_schema", detail: null };
@@ -61,16 +59,16 @@ function rootSchemaProblem(raw, endpointId) {
   if (doc.entries === null || typeof doc.entries !== "object" || Array.isArray(doc.entries)) return { reason: "policy_store_root_schema", detail: null };
   const subjects = Object.keys(doc.entries);
   if (subjects.length > MAX_ENTRIES) return { reason: "policy_store_too_many_entries", detail: null };
-  for (const s of subjects) { const p = entryProblem(s, doc.entries[s], endpointId); if (p !== null) return p; }
+  for (const s of subjects) { const p = entryProblem(s, doc.entries[s]); if (p !== null) return p; }
   return null;
 }
 
-/** 序列化形态（写路径合成用）：三键封闭 + 全部条目过 ipsp-1 与外键自洽。返回 {reason, detail} 或 null。 */
-function storeProblem(entries, endpointId) {
+/** 序列化形态（写路径合成用）：三键封闭 + 全部条目 subject 形状 + ipsp-1。返回 {reason, detail} 或 null。 */
+function storeProblem(entries) {
   if (entries === null || typeof entries !== "object" || Array.isArray(entries)) return { reason: "policy_store_root_schema", detail: null };
   const subjects = Object.keys(entries);
   if (subjects.length > MAX_ENTRIES) return { reason: "policy_store_too_many_entries", detail: null };
-  for (const s of subjects) { const p = entryProblem(s, entries[s], endpointId); if (p !== null) return p; }
+  for (const s of subjects) { const p = entryProblem(s, entries[s]); if (p !== null) return p; }
   return null;
 }
 
@@ -96,17 +94,22 @@ export function loadPolicyStore({ endpointId, env = process.env } = {}) {
       if ((st.mode & 0o777) !== 0o600) return { ok: false, reason: "policy_store_file_perms", why: "policy.json 权限必须精确 0600，实际 " + (st.mode & 0o777).toString(8) };
       if (st.size > MAX_BYTES) return { ok: false, reason: "policy_store_too_large" };
       // #R35 P1-4：有界读 MAX_BYTES+1 —— fstat 之后文件可能被换大（TOCTOU）或有写端在灌
-      //（FIFO/增长文件），读满上限即停受控拒，不吃下无限读
+      //（FIFO/增长文件），读满上限即停受控拒，不吃下无限读。
+      // #R38 P1-3：读到的总长必须等于同 fd fstat 尺寸 —— 少了（截断/竞态）就是读不出完整内容。
       const read = readAll(fd, MAX_BYTES);
       if (read.tooLarge) return { ok: false, reason: "policy_store_too_large", why: "有界读超限（读满 MAX_BYTES+1 即停）" };
+      if (read.total !== st.size) {
+        throw Object.assign(new Error("读到的字节（" + read.total + "）与 fstat 尺寸（" + st.size + "）不符"), { code: "EFPOLICYSIZE" });
+      }
       raw = read.buf;
     } finally { fs.closeSync(fd); }
   } catch (err) {
     if (err?.code === "ENOENT") return { ok: true, absent: true, entries: {} };
     if (err?.code === "ELOOP" || err?.code === "ENXIO") return { ok: false, reason: "policy_store_not_regular_file" };
-    return { ok: false, reason: "policy_store_unwritable", why: String(err.code ?? err.message) };
+    // #R38 P1-3：读侧读不到就是 unreadable（带错误码），不再谎报 unwritable —— 写不写得了是另一回事
+    return { ok: false, reason: "policy_store_unreadable", why: String(err?.code ?? err?.message ?? err) };
   }
-  const p = rootSchemaProblem(raw.toString("utf-8"), endpointId);
+  const p = rootSchemaProblem(raw.toString("utf-8"));
   if (p !== null) return { ok: false, reason: p.reason, ...(p.detail ? { detail: p.detail } : {}) };
   const doc = JSON.parse(raw.toString("utf-8"));
   if (doc.endpoint_id !== endpointId) return { ok: false, reason: "policy_store_root_schema", why: "endpoint_id 与目录不符" };
@@ -115,8 +118,9 @@ export function loadPolicyStore({ endpointId, env = process.env } = {}) {
 
 /**
  * fd 循环读满（readFileSync 不可控；同写侧循环纪律）。#R35 P1-4：total > maxBytes 即停并标 tooLarge。
- * O_NONBLOCK 下 FIFO 无数据 + 有写者时 read 报 EAGAIN：短等待重试，2s 仍无数据按 EOF 处理
- * （空内容走 parse_failed，不在读原语里挂死）。
+ * O_NONBLOCK 下 FIFO 无数据 + 有写者时 read 报 EAGAIN：短等待重试。
+ * #R38 P1-3：非 EAGAIN 读异常与 EAGAIN 超时都是"读不到完整内容"，抛结构化错误折 unreadable，
+ * 不许折成 EOF 谎报前缀；返回值带 total，load 层必须核 total === 同 fd fstat 尺寸。
  */
 function readAll(fd, maxBytes) {
   const chunks = [];
@@ -127,14 +131,16 @@ function readAll(fd, maxBytes) {
     let n = 0;
     try { n = fs.readSync(fd, buf, 0, buf.length, null); }
     catch (err) {
-      if (err?.code !== "EAGAIN" || waitedMs >= 2000) return { buf: Buffer.concat(chunks), tooLarge: false };
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
-      waitedMs += 5;
-      continue;
+      if (err?.code === "EAGAIN" && waitedMs < 2000) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        waitedMs += 5;
+        continue;
+      }
+      throw Object.assign(new Error("policy.json 读取中断：" + String(err?.code ?? err?.message ?? err)), { code: "EFPOLICYREAD" });
     }
-    if (n === 0) return { buf: Buffer.concat(chunks), tooLarge: false };
+    if (n === 0) return { buf: Buffer.concat(chunks), tooLarge: false, total };
     total += n;
-    if (total > maxBytes) return { buf: null, tooLarge: true };
+    if (total > maxBytes) return { buf: null, tooLarge: true, total };
     chunks.push(Buffer.from(buf.subarray(0, n)));
   }
 }
@@ -148,9 +154,33 @@ export function upsertPolicyEntry(entries, subject, value) {
   return { ok: false, reason: "policy_subject_conflict", why: "同 subject 已有不同条目（" + subject + "）" };
 }
 
+/** 序列化唯一判据：写路径与零写比对（#R38 P2）都用它，不再各拼一份。 */
+const canonicalPolicyContent = (endpointId, entries) =>
+  JSON.stringify({ schema_version: POLICY_SCHEMA_VERSION, endpoint_id: endpointId, entries }, null, 2) + "\n";
+
+/**
+ * 释放/提交段锁残骸的唯一折叠器（#R38 P1-4）：锁归属说不清（absent）或已易主（not_owner）
+ * 同样是"这次调用的锁没还干净"，和 reap 残骸、释放异常一样不谎报 clean；
+ * 残骸必须带 path（.reap 残骸是 reap 路径）。先到的 lockUncleared 不被覆盖（先到的算数）。
+ */
+function foldLockUncleared(result, rel, lockPath) {
+  if (!result || typeof result !== "object" || result.lockUncleared !== undefined) return;
+  let lu = null;
+  if (rel.reapUncleared) {
+    lu = { reason: "reap_residue_uncleared", path: rel.reapUncleared.path ?? lockPath + ".reap",
+      detail: rel.reapUncleared.error != null ? String(rel.reapUncleared.error) : null };
+  } else if (rel.absent === true) {
+    lu = { reason: "lock_absent", path: lockPath, detail: null };
+  } else if (!rel.ok) {
+    lu = { reason: String(rel.reason ?? "release_failed"), path: lockPath,
+      detail: rel.error != null ? String(rel.error) : (rel.why != null ? String(rel.why) : null) };
+  }
+  if (lu !== null) result.lockUncleared = lu;
+}
+
 /** 提交段之后把 commitWhileHeld 的结果折进来（照 chat-ledger.afterCommit 的语义）。 */
 function afterCommit(fenced, tmp, commitErr) {
-  const lockUncleared = fenced.reapUncleared ? { reason: "reap_residue_uncleared", detail: String(fenced.reapUncleared.error ?? "") } : null;
+  const lockUncleared = fenced.reapUncleared ? { reason: "reap_residue_uncleared", path: fenced.reapUncleared.path, detail: String(fenced.reapUncleared.error ?? "") } : null;
   if (!fenced.ok) return { ok: false, reason: "policy_store_lock_lost", why: "提交前核对锁：" + fenced.reason, tmpResidue: { path: tmp, why: "提交前核对锁失败，临时文件原地保留" }, ...(lockUncleared ? { lockUncleared } : {}) };
   if (commitErr !== null) return { ok: false, reason: "policy_store_commit_failed", why: String(commitErr.code ?? commitErr.message), tmpResidue: { path: tmp, why: "rename 失败，临时文件原地保留" }, ...(lockUncleared ? { lockUncleared } : {}) };
   return { ok: true, ...(lockUncleared ? { lockUncleared } : {}) };
@@ -186,15 +216,17 @@ const fsyncDir = (dir) => { const fd = fs.openSync(dir, fs.constants.O_RDONLY); 
 
 /**
  * 锁内事务式改写。mutate 信封契约：返回 {ok:true, entries, changed?} 或 {ok:false, reason, why?}
- * （ok:false 原样透传）。写前全量过 ipsp-1 + 外键自洽，非法不落盘；changed:false 且条目合法 →
- * 校验后零写返回（#R33 P2-2；#R35 P2-1：缺席 endpoint 的零写不留下目录）。
+ * （ok:false 原样透传）。#R38 P2：entries 必填（缺 = 拒不补）、changed 只许布尔；
+ * 写前全量过 ipsp-1（subject 外键只在 store 层验，#R38 P1-5）；changed:false 必须与锁内现状
+ * 规范字节逐字一致才零写返回（#R33 P2-2 + #R38 P2；#R35 P2-1：缺席 endpoint 的零写不留下目录）。
  *
- * #R35 P1-3 结果四态统一折叠：
+ * #R35 P1-3 结果四态统一折叠，#R38 P1-4 收紧：
  *   未提交（committed:false）/ 已提交干净（committed:true + persistence:"fsynced"）/
- *   有残骸（+tmpResidue / lockUncleared）/ 持久性不确定（committed:true + persistence:"uncertain"）。
- * 提交段（rename 后）的目录 fsync 失败、写后读回失败都如实折入"持久性不确定"，不吞不谎报；
- * 主体内部任何异常也折成受控结果（不再裸抛把释放段残骸弄丢）；释放段残骸折入不覆盖先到的
- * lockUncleared。释放完才返回。
+ *   有残骸（+tmpResidue / lockUncleared{reason,path,detail}）/ 持久性不确定（committed:true + persistence:"uncertain"）。
+ * 提交段（rename 后）的目录 fsync 失败、写后读回失败/读回与意图不一致都如实折入
+ * "持久性不确定"，不吞不谎报；主体内部任何异常也折成受控结果；释放段残骸走唯一折叠器
+ * foldLockUncleared（absent/not_owner/reap 残骸/异常都成 lockUncleared，带 path），
+ * 不覆盖先到的。释放完才返回。
  */
 export function mutatePolicyStore({ endpointId, mutate, env = process.env } = {}) {
   if (typeof endpointId !== "string" || !ENDPOINT_SHAPE.test(endpointId)) return { ok: false, reason: "policy_store_bad_endpoint_id" };
@@ -236,32 +268,63 @@ export function mutatePolicyStore({ endpointId, mutate, env = process.env } = {}
         : { ok: false, reason: "policy_store_mutate_invalid", why: "mutate 必须返回 {ok:true, entries} 或 {ok:false}", committed: false };
       return result;
     }
-    if (next.entries === undefined) next.entries = {};
-    const p = storeProblem(next.entries, endpointId);
+    // #R38 P2：entries 必填（缺 = 拒，不默补 {} —— 调用方忘了返回 entries 就是调用方 bug）；
+    // changed 只许布尔。
+    if (next.entries === undefined || next.entries === null || typeof next.entries !== "object" || Array.isArray(next.entries)) {
+      result = { ok: false, reason: "policy_store_mutate_invalid", why: "mutate 返回的 entries 必填（不默补空对象）", committed: false };
+      return result;
+    }
+    if (next.changed !== undefined && typeof next.changed !== "boolean") {
+      result = { ok: false, reason: "policy_store_mutate_invalid", why: "changed 只许布尔", committed: false };
+      return result;
+    }
+    const p = storeProblem(next.entries);
     if (p !== null) { result = { ok: false, reason: p.reason, why: "写前全量校验不过，不落盘", ...(p.detail ? { detail: p.detail } : {}), committed: false }; return result; }
-    const changed = next.changed === undefined ? true : next.changed === true;
-    if (changed === false) { result = { ok: true, entries: next.entries, changed: false, committed: false }; return result; } // 零写：锁内校验后直接返回（#R33 P2-2）
-    const content = JSON.stringify({ schema_version: POLICY_SCHEMA_VERSION, endpoint_id: endpointId, entries: next.entries }, null, 2) + "\n";
+    const changed = next.changed === undefined ? true : next.changed;
+    if (changed === false) {
+      // #R38 P2：零写必须真的与盘上一致 —— 规范字节逐字对比，entries 与现状不同却报零写 = 拒。
+      // absent（盘上无文件）与 entries:{} 自洽，比对不适用。
+      let onDisk = null;
+      try { onDisk = fs.readFileSync(file, "utf-8"); } catch (err) {
+        if (err?.code !== "ENOENT") { result = { ok: false, reason: "policy_store_unreadable", why: String(err?.code ?? err?.message ?? err), committed: false }; return result; }
+      }
+      if (onDisk !== null && onDisk !== canonicalPolicyContent(endpointId, next.entries)) {
+        result = { ok: false, reason: "policy_store_changed_mismatch", why: "changed:false 但 entries 与锁内现状的规范字节不一致", committed: false };
+        return result;
+      }
+      result = { ok: true, entries: next.entries, changed: false, committed: false }; // 零写：逐字一致才返回（#R33 P2-2 + #R38 P2）
+      return result;
+    }
+    const content = canonicalPolicyContent(endpointId, next.entries);
     if (Buffer.byteLength(content, "utf-8") > MAX_BYTES) { result = { ok: false, reason: "policy_store_too_large", committed: false }; return result; }
     const w = writeTmp(dir.dir, content);
     if (!w.ok) { result = { ok: false, reason: "policy_store_unwritable", why: w.why, ...(w.tmpResidue ? { tmpResidue: w.tmpResidue } : {}), committed: false }; return result; }
     let commitErr = null;
     // fenced 提交：段内核对锁 token 仍是我 —— 锁丢了就不 rename（失锁不提交，#R33 探针二）
     const fenced = commitWhileHeld(lockPath, () => { try { fs.renameSync(w.tmp, file); } catch (err) { commitErr = err; } });
-    // #R35 P1-3：fenced 段自己的 reap 锁残骸（reapUncleared）也是释放残骸 —— 提交成败都随结果折入，
-    // 且**不被 finally 的释放段残骸覆盖**（先到的算数）。
-    const reapLU = fenced?.reapUncleared ? { reason: "reap_residue_uncleared", detail: String(fenced.reapUncleared.error ?? "") } : null;
     const r = afterCommit(fenced, w.tmp, commitErr);
-    if (!r.ok) { result = { ok: false, reason: r.reason, why: r.why, ...(r.tmpResidue ? { tmpResidue: r.tmpResidue } : {}), ...(reapLU ?? (r.lockUncleared ? { lockUncleared: r.lockUncleared } : {})), committed: false }; return result; }
+    if (!r.ok) {
+      // #R38 P1-4：提交段残骸（含 fenced 段 reapUncleared，afterCommit 已折成 lockUncleared{reason,path}）
+      // 走同一折叠路径，不再展开到顶层覆盖 reason。
+      result = { ok: false, reason: r.reason, why: r.why, ...(r.tmpResidue ? { tmpResidue: r.tmpResidue } : {}), committed: false };
+      if (r.lockUncleared) result.lockUncleared = r.lockUncleared;
+      return result;
+    }
     // 已提交（rename 完成）。目录 fsync：失败不再吞 —— 数据在目录项里但崩溃窗口不确定，
     // 如实折入持久性不确定态（#R35 P1-3 探针二：fsync EIO 不许谎报 fsynced）。
     let persistence = "fsynced";
     let dirFsyncError = null;
     try { fsyncDir(dir.dir); } catch (err) { persistence = "uncertain"; dirFsyncError = String(err.code ?? err.message); }
-    // 写后受验读回：全 ipsp-1 再过一遍，读不回或读出非法都如实报错（已提交，不谎报失败原因在写）
+    // 写后受验读回：全 ipsp-1 再过一遍；且读回条目必须与本次意图逐字一致（#R38 P1-4），
+    // 读不回/读出非法/内容不符都如实报错（已提交，不谎报失败原因在写）
     const verify = loadPolicyStore({ endpointId, env });
     if (!verify.ok) { result = { ok: false, reason: "policy_store_readback_failed", why: verify.reason + (verify.why ? "：" + verify.why : ""), committed: true, persistence: "uncertain" }; return result; }
-    result = { ok: true, entries: next.entries, changed: true, committed: true, persistence, ...(dirFsyncError ? { dirFsyncError } : {}), ...(reapLU ? { lockUncleared: reapLU } : {}) };
+    if (JSON.stringify(verify.entries) !== JSON.stringify(next.entries)) {
+      result = { ok: false, reason: "policy_store_readback_mismatch", why: "读回条目与本次意图不一致（盘上被别的写方动过？）", committed: true, persistence: "uncertain" };
+      return result;
+    }
+    result = { ok: true, entries: next.entries, changed: true, committed: true, persistence, ...(dirFsyncError ? { dirFsyncError } : {}) };
+    if (r.lockUncleared) result.lockUncleared = r.lockUncleared;
     return result;
   } catch (err) {
     // 主体内部任何异常（含 commitWhileHeld 段内 .reap 读失败）折成受控结果 —— 不裸抛，
@@ -269,20 +332,14 @@ export function mutatePolicyStore({ endpointId, mutate, env = process.env } = {}
     result = { ok: false, reason: "policy_store_internal", why: String(err?.code ?? err?.message ?? err), committed: false };
     return result;
   } finally {
-    // 释放段残骸完整折入（照 withLedgerLock 的三态纪律）：not_owner 是别人接管，不算残留；
-    // 其余（owner_unreadable / release_busy / reapUncleared / 抛错）一律不谎报 clean。
-    // 先到的 lockUncleared（提交段折入的）不被覆盖。
+    // 释放段残骸走唯一折叠器（#R38 P1-4）：锁归属丢失（absent / not_owner）与 reap 残骸、
+    // 释放异常一样不谎报 clean，残骸带 path。先到的 lockUncleared（提交段折入的）不被覆盖。
     let rel;
     try { rel = releasePublishLock(lockPath); }
     catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
-    if (result && typeof result === "object" && !result.lockUncleared) {
-      const lu = rel.reapUncleared ? { reason: "reap_residue_uncleared", detail: String(rel.reapUncleared.error ?? "") }
-        : (!rel.ok && rel.reason !== "not_owner") ? { reason: String(rel.reason), detail: rel.error ? String(rel.error) : null }
-        : null;
-      // 必须原地改：try 里 `return result` 已把当时的结果求值作为返回值，finally 里
-      // `result = {...}` 只是重新绑定变量，调用方拿到的仍是旧值 —— 这就是 #R33 版折入死代码 bug。
-      if (lu !== null) result.lockUncleared = lu;
-    }
+    // 必须原地改：try 里 `return result` 已把当时的结果求值作为返回值，finally 里
+    // `result = {...}` 只是重新绑定变量，调用方拿到的仍是旧值 —— 这就是 #R33 版折入死代码 bug。
+    if (result && typeof result === "object") foldLockUncleared(result, rel, lockPath);
     // #R35 P2-1：缺席 endpoint 的零写不留下副作用 —— 锁释放后目录若已空则收走（真零副作用）。
     // 目录非空（tmp 残骸等）时 rmdir 自然失败，保留现场。
     if (dirWasAbsent && result && typeof result === "object" && result.ok === true && result.changed === false) {

@@ -197,6 +197,7 @@ op 封闭（§5.1），只增不改；记录 `origin_operation_id` 指向产生�
 | create-B1 | 桥建 root om_ 全局唯一；允许"同 lineage 已有 current 再加一 pending"（rotate），pending 至多一（G5）| 新 B1 |
 | seed | 逐条过校验器；同 locator 仅规范投影逐字段相同才幂等，否则冲突 | 批量插入 live（M1a）|
 | **retarget**（§12-1 A′，已拍板）| owner 授权 ∧ 旧 target 精确匹配 ∧ 新 target 受验 ∧ 项目边界不变 ∧ 目标记录 active；**单位见下** | active/dormant 记录改 binding_target + 写 `binding_proof.kind=retarget`（自身即完整授权）；**lineage 内 B1(pending) 只原子改 binding_target + origin_operation_id、`binding_proof` 仍为 null**（评审五 P1-2：pending 必须 proof=null）；target 不可用**不触发**（归 health）|
+| **rebind_session_alias**（W2 认领现场，Frank 拍板）| 目标 live ∧ 当前族 B3/B3′/B4 ∧ binding=active ∧ expectedOldSessionId=当前 aliases.session_id（CAS）∧ newSessionId 走 AILY_SESSION_SHAPE ∧ 无 live 记录占用该 newSessionId（alias_occupied fail-closed）∧ authorizedBy 受验 | **只**改 aliases.session_id 到 newSessionId + updated_at + origin_operation_id=本笔；**不动** binding_target / binding_proof / family / lineage（binding_target 的 retarget 归 Phase 2 配对写方，**当前无消费方、预留**——见 m1a-reconciliation §5.1）|
 
 **§5.2 初始化的 WAL 三步（评审七 P1：初始化标记与 ledger 是两个文件，不能"同笔"）**——
 "已初始化"标记与 `ledger.json` 分属两文件，必须定持久化顺序与崩溃恢复，不能靠文字当

@@ -54,7 +54,7 @@ const REQUEST_KEY_SHAPE = /^[A-Za-z0-9_.:@+-]{1,256}$/u; // 外部请求身份�
 const AUTHORIZED_BY_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u; // 授权者 sender id（有界、无控制字符，评审六 P2）
 const REASON_ENUM = ["expired", "superseded", "manual"];
 const MATCHED_FIELDS = ["chat_id", "sender", "body", "thread_root"];
-const OP_TYPES = ["initialize_shadow", "create_a1", "create_b1", "seed", "activate", "void", "attach_a2", "attach_a3", "anchor", "restore", "unbind", "retarget", "authority_cutover", "migrate_seed", "migrate_repair"];
+const OP_TYPES = ["initialize_shadow", "create_a1", "create_b1", "seed", "activate", "void", "attach_a2", "attach_a3", "anchor", "restore", "unbind", "retarget", "rebind_session_alias", "authority_cutover", "migrate_seed", "migrate_repair"];
 // migrate_repair 的 from_family / to_family 值域（§5.1 判别联合：B1→B1；{B3,B3',B4}→{B3,B3',B4}）
 const MIGRATE_FAMILIES = ["B1", "B3", "B3'", "B4"];
 
@@ -332,6 +332,7 @@ function opTouchedIds(op) {
     case "restore":
     case "unbind": return r.affected_id == null ? [] : [r.affected_id];
     case "retarget": return Array.isArray(r.affected_ids) ? r.affected_ids : [];
+    case "rebind_session_alias": return r.affected_id == null ? [] : [r.affected_id];
     case "migrate_seed": return Array.isArray(r.seeded) ? r.seeded.map((s) => s.topic_agent_id) : [];
     case "migrate_repair": return r.repaired_id == null ? [] : [r.repaired_id];
     default: return [];
@@ -439,6 +440,7 @@ const RESULT_SHAPE = Object.freeze({
   restore: (r) => keysOf(r) === "affected_id" && isId(r.affected_id),
   unbind: (r) => keysOf(r) === "affected_id,terminal_family" && isId(r.affected_id) && (r.terminal_family === "A4" || r.terminal_family === "B3'"),
   retarget: (r) => keysOf(r) === "affected_ids,new_target,old_target,unit" && idArrayOk(r.affected_ids) && (r.unit === "record" || r.unit === "lineage") && !targetProblem(r.old_target) && !targetProblem(r.new_target) && canonKey(r.old_target) !== canonKey(r.new_target),
+  rebind_session_alias: (r) => keysOf(r) === "affected_id,authorized_at,authorized_by,new_session_id,old_session_id" && isId(r.affected_id) && AILY_SESSION_SHAPE.test(r.old_session_id) && AILY_SESSION_SHAPE.test(r.new_session_id) && r.old_session_id !== r.new_session_id && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at),
   migrate_seed: (r) => keysOf(r) === "authorized_at,authorized_by,seeded" && typeof r.authorized_by === "string" && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at) && Array.isArray(r.seeded) && r.seeded.every((s) => isObj(s) && isId(s.topic_agent_id) && typeof s.legacy_source_digest === "string" && SHA_SHAPE.test(s.legacy_source_digest)) && r.seeded.every((s, i) => i === 0 || r.seeded[i - 1].topic_agent_id < s.topic_agent_id),
   migrate_repair: (r) => keysOf(r) === "authorized_at,authorized_by,expected_projection_digest,from_family,legacy_source_digest,next_projection_digest,repaired_id,to_family" && isId(r.repaired_id) && typeof r.authorized_by === "string" && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at) && [r.expected_projection_digest, r.next_projection_digest, r.legacy_source_digest].every((s) => typeof s === "string" && SHA_SHAPE.test(s)) && MIGRATE_FAMILIES.includes(r.from_family) && MIGRATE_FAMILIES.includes(r.to_family) && (r.from_family === "B1" ? r.to_family === "B1" : r.to_family !== "B1"),
   authority_cutover: (r) => keysOf(r) === "revision_at_cutover" && Number.isInteger(r.revision_at_cutover) && r.revision_at_cutover >= 1,
@@ -482,6 +484,7 @@ function opConsistentWithRecord(op, id, rec) {
       if (rec.facts.binding === "pending") return rec.binding_proof === null; // B1：proof 仍 null
       return rec.binding_proof !== null && rec.binding_proof.kind === "retarget" && canonKey(rec.binding_proof.new_target) === canonKey(r.new_target) && canonKey(rec.binding_proof.old_target) === canonKey(r.old_target);
     }
+    case "rebind_session_alias": return rec.kind === "live" && r.affected_id === id && rec.aliases.session_id === r.new_session_id; // G13：仅改别名，target/proof 不动
     case "migrate_seed": {
       if (rec.kind !== "live" || !r.seeded.some((s) => s.topic_agent_id === id)) return false;
       // B1：proof 全 null；B3/B3'/B4：migrated 双证引用本笔 seed op，同 op 同 digest，且与 result.seeded 逐字匹配
@@ -1464,6 +1467,44 @@ export function retarget({ endpointId, requestKey, id, expectedOldTarget, newTar
       return { ok: true, next: stampAndBuild(doc, { opType: "retarget", inputs: reqInputs, result: { affected_ids: [...affected].sort(), unit: lineage === null ? "record" : "lineage", old_target: oldTarget, new_target: newTarget }, mutateRecords: (n, opId) => {
         for (const k of affected) { const r = n.records[k]; r.binding_target = newTarget; r.updated_at = iso; r.origin_operation_id = opId; if (r.facts.binding === "pending") continue; r.binding_proof = { ...proof }; }
       } }) };
+    },
+  });
+}
+
+/** rebind_session_alias（W2 再认领 Phase 1，§5.1）：B3 已 active 换会话 → **只**改当前活记录的 aliases.session_id
+ *  （Aily session locator），**不动** binding_target/proof/family/lineage（Phase 2 配对写方再 retarget binding_target）。
+ *  CAS：当前 aliases.session_id 必须等于 expectedOldSessionId；新 locator 被另一条 live 记录占用 → fail-closed（alias_occupied，G3 backstop）。
+ *  request_key 身份 = 字面参数（id + old/new session），与状态无关；结果 = {affected_id, old_session_id, new_session_id, authorized_by, authorized_at}。 */
+export function rebindSessionAlias({ endpointId, requestKey, id, expectedOldSessionId, newSessionId, authorizedBy, now = Date.now(), env = process.env, _inject } = {}) {
+  const iso = isoOrNull(now); if (iso === null) return BAD_TIME; // 评审七 P1-3：NaN now 不裸抛
+  const reqInputs = { request_key: requestKey, topic_agent_id: id, old_session_id: expectedOldSessionId, new_session_id: newSessionId };
+  return gatedTx({
+    endpointId, requestKey, env, _inject, replay: () => [{ opType: "rebind_session_alias", inputs: reqInputs }],
+    mutate: (doc) => {
+      if (doc === null) return { ok: false, reason: "absent" };
+      if (!isId(id)) return { ok: false, reason: "bad_id" };
+      if (typeof expectedOldSessionId !== "string" || !AILY_SESSION_SHAPE.test(expectedOldSessionId)) return { ok: false, reason: "bad_input", why: "expectedOldSessionId 形状不对" };
+      if (typeof newSessionId !== "string" || !AILY_SESSION_SHAPE.test(newSessionId)) return { ok: false, reason: "bad_input", why: "newSessionId 形状不对" };
+      const rec = doc.records[id];
+      if (!rec || rec.kind !== "live") return { ok: false, reason: "not_live" };
+      if (rec.facts.binding !== "active") return { ok: false, reason: "target_not_active" };
+      const oldSessionId = rec.aliases.session_id;
+      if (oldSessionId !== expectedOldSessionId) return { ok: false, reason: "cas_mismatch", why: "当前 aliases.session_id 与 expectedOldSessionId 不符" };
+      if (oldSessionId === newSessionId) return { ok: false, reason: "no_change" };
+      // 新 locator 被另一条 live 记录占用 → fail-closed（G3 全局唯一 backstop；此处提前给出干净 reason）。
+      for (const [k, r] of Object.entries(doc.records)) {
+        if (k === id || r.kind !== "live") continue;
+        if (typeof r.aliases.session_id === "string" && r.aliases.session_id === newSessionId) return { ok: false, reason: "alias_occupied" };
+      }
+      if (typeof authorizedBy !== "string" || !AUTHORIZED_BY_SHAPE.test(authorizedBy)) return { ok: false, reason: "bad_input" };
+      return { ok: true, next: stampAndBuild(doc, {
+        opType: "rebind_session_alias", inputs: reqInputs,
+        result: { affected_id: id, old_session_id: oldSessionId, new_session_id: newSessionId, authorized_by: authorizedBy, authorized_at: iso },
+        mutateRecords: (n, opId) => {
+          const r = n.records[id];
+          r.aliases.session_id = newSessionId; r.updated_at = iso; r.origin_operation_id = opId;
+        },
+      }) };
     },
   });
 }

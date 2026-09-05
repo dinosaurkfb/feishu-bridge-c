@@ -25292,6 +25292,62 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     }
   }));
 
+  // #R37 W1/W2（Frank 拍板）：认领→绑定由 resolver 按 locator 命中目标，按事实分叉——
+  //   W1（目标仍 B1 pending）→ create_a1 → activate（标准四项配对证明 + 64hex claimKey + 匹配根 om）；
+  //   W2（目标已 B3 active 再认领换会话）→ retarget（同 root，换 ledger 侧 claude_session_id）。
+  //   行为验证：① 先建 B1（pending）→ wirePromoteBinding → create_a1→activate 归并 B3；
+  //   ② 同一活跃 B3 再 wirePromoteBinding（同 locator、新 session）→ retarget，claude_session_id 换新；
+  //   ③ locator 无影记录 → legacy 照常成功、shadow fail-closed（locator_absent、不猜）。
+  test("m1a 双写接线：wirePromoteBinding（认领→绑定）——B1 pending→激活成 B3；B3 active→re-target；无影记录→fail-closed", () => withRootAndReceipt((root, dir) => {
+    seedLedger(dir);
+    seedLedgerInitReceipt(path.join(root, "maint"), EP);
+    let legacyCalls = 0;
+    const legacyRec = (tag) => () => { legacyCalls += 1; return { tag, legacyCommitted: true }; };
+
+    // ① W1：目标为 B1（pending）→ create_a1 → activate，归并成 B3（标准四项配对证明）。
+    {
+      talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", rootOm: "om_prom", lineageId: "lin_prom", bindingTarget: TGT }), "B1 前置（pending）");
+      const b1Id = famIds(talLoad(dir), "B1").pop();
+      const w = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: legacyRec("promote1"), locator: "om_prom", claimKey: claim("p"), sessionId: "sess_p", authorizedBy: "ou_o" });
+      assert.ok(w.ok, "W1 ok：" + JSON.stringify(w));
+      assert.deepEqual(w.shadow.map((s) => s.op), ["create_a1", "activate"], "固定顺序：create_a1 → activate");
+      assert.ok(w.shadow[0].ok && w.shadow[1].ok, "两笔都成功：" + JSON.stringify(w.shadow));
+      const b3 = talLoad(dir).records[b1Id];
+      assert.equal(TAL.familyOf(b3.facts), "B3", "归并→B3（active/current）");
+      assert.equal(b3.binding_proof.matched_om, "om_prom", "配对证明 matched_om=被认领根消息 om");
+      assert.deepEqual(b3.binding_proof.matched_fields, ["chat_id", "sender", "body", "thread_root"], "标准四项（G15 封闭四项）");
+      assert.equal(b3.binding_proof.authorized_by, "ou_o", "authorized_by=event.sender_id");
+      assert.ok(w.release && w.release.ok, "释放 ok");
+    }
+
+    // ② W2：同一活跃 B3 再 wirePromoteBinding（同 locator、新 session）→ retarget（同 root，换 ledger 侧 claude_session_id）。
+    {
+      const b3Id = famIds(talLoad(dir), "B3").pop();
+      const beforeCsId = talLoad(dir).records[b3Id].binding_target.claude_session_id;
+      const newCsId = uuid(4);
+      const w = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: legacyRec("promote2"), locator: "om_prom", claimKey: claim("r"), sessionId: "sess_r2", authorizedBy: "ou_o", retargetClaudeSessionId: newCsId });
+      assert.ok(w.ok, "W2 ok：" + JSON.stringify(w));
+      assert.deepEqual(w.shadow.map((s) => s.op), ["retarget"], "W2→retarget（不 activate）");
+      assert.ok(w.shadow[0].ok, "retarget 成功：" + JSON.stringify(w.shadow[0]));
+      assert.equal(talLoad(dir).records[b3Id].binding_target.claude_session_id, newCsId, "ledger 侧 claude_session_id 换新（同 root）");
+      assert.notEqual(talLoad(dir).records[b3Id].binding_target.claude_session_id, beforeCsId, "确实变更");
+      assert.equal(talLoad(dir).records[b3Id].binding_target.project_root, TGT.project_root, "project_root 不变（同 root）");
+    }
+
+    // ③ locator 无影记录 → legacy 照常成功、shadow fail-closed（不猜）。
+    {
+      const before = legacyCalls;
+      const w = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: legacyRec("promote3"), locator: "om_none", claimKey: claim("z"), sessionId: "sess_z", authorizedBy: "ou_o" });
+      assert.ok(w.ok, "legacy 照常成功：" + JSON.stringify(w));
+      assert.equal(legacyCalls, before + 1, "legacy 已跑");
+      assert.ok(w.legacy && w.legacy.legacyCommitted, "legacy 提交");
+      assert.equal(w.shadow.length, 1, "一笔 shadow（失败投影）");
+      assert.equal(w.shadow[0].op, "promote", "投影 op 名");
+      assert.equal(w.shadow[0].ok, false, "shadow fail-closed");
+      assert.equal(w.shadow[0].reason, "locator_absent", "locator 无影记录→locator_absent（不猜）");
+    }
+  }));
+
   // resolveLiveId：按 locator（session_id / root_om）解析 live 影记录 id —— claim→bind 的 b1Id、
   //   enabled 翻转的 id、void 的目标 id 共用。行为验证：① 按 session_id 命中 A1；② 按 root_om 命中 B1；
   //   ③ 未命中→locator_absent；④ 空 locator→bad_locator；⑤ 账本缺席→ledger_absent（fail-closed，不猜测）。

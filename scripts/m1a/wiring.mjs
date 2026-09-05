@@ -17,6 +17,7 @@
 import { acquireOrderLock, requestKeyFor } from "./dual-write.mjs";
 import {
   createA1, createB1, activate, attach, voidPending, unbind, restore, retarget,
+  resolveLiveId, loadByEndpoint,
 } from "../topic-agent-ledger.mjs";
 import { endpointReceipt } from "../maintenance/ledger-receipt.mjs";
 import { maintenanceDir } from "../maintenance/journal.mjs";
@@ -128,6 +129,50 @@ export function wireBindClaim({ endpointId, env = process.env, legacy, claimKey,
     const kAct = rk("activate", claimKey, b1Id);
     if (!kAct.ok) return [a1, { op: "activate", ...kAct }];
     return [a1, capture("activate", activate({ endpointId, requestKey: kAct.request_key, b1Id, a1Id, f4, authorizedBy, now, env }))];
+  } });
+}
+
+/**
+ * wirePromoteBinding —— 认领→绑定（promoteBinding：引用码/@ 配对把 pending 拉成 active）。
+ * shadow 由 resolver 按 locator 命中目标，按其事实分叉：
+ *   W1（B1 仍 pending）→ create_a1 → activate（标准四项配对证明 + 64hex claimKey）；
+ *   W2（B3 已 active 换会话，再认领）→ retarget（同 root，换 ledger 侧 claude_session_id）。
+ * locator = 被认领代际的根消息 om（= matched_om）；claimKey = claim.mjs 64hex key（调用方用
+ *   claimKey(messageId, logicalTaskKey) 派生）；retargetClaudeSessionId 仅 W2 需要，必须是被
+ *   retarget 的目标在 ledger 侧的 claude_session_id（UUID），不是 Aily session locator（不相容）。
+ * 目标状态与 locator 对不上（如无 shadow 记录）/读不出）→ fail-closed，不猜。 */
+export function wirePromoteBinding({
+  endpointId, env = process.env, legacy, locator, claimKey, sessionId, authorizedBy,
+  retargetClaudeSessionId = null, now = Date.now(),
+}) {
+  return runWired({ endpointId, env, legacy, submit: (legacyRes) => {
+    if (!en(claimKey) || !en(sessionId) || !en(locator)) return [{ op: "promote", ok: false, reason: "bad_external_id", why: "claimKey/sessionId/locator 必填 1..256 字符串" }];
+    const resolved = resolveLiveId({ endpointId, locator, env });
+    if (!resolved.ok) return [{ op: "promote", ok: false, reason: resolved.reason, why: resolved.why ?? null }];
+    const b1Id = resolved.id;
+    const l = loadByEndpoint(endpointId, { env });
+    if (!l.ok) return [{ op: "promote", ok: false, reason: "ledger_unreadable", why: l.why ?? null }];
+    const target = l.doc.records[b1Id];
+    if (!target || target.kind !== "live") return [{ op: "promote", ok: false, reason: "target_gone" }];
+    if (target.facts.binding === "active") {
+      // W2 再认领（B3 已 active 换会话）→ retarget：同 root，换 ledger 侧 claude_session_id。
+      if (!en(retargetClaudeSessionId)) return [{ op: "retarget", ok: false, reason: "bad_external_id", why: "retargetClaudeSessionId 必填（ledger 侧 claude_session_id UUID）" }];
+      const k = rk("retarget", claimKey, b1Id);
+      if (!k.ok) return [{ op: "retarget", ...k }];
+      const base = target.binding_target;
+      return [capture("retarget", retarget({ endpointId, requestKey: k.request_key, id: b1Id, expectedOldTarget: base, newTarget: { ...base, claude_session_id: retargetClaudeSessionId }, authorizedBy, now, env }))];
+    }
+    if (target.facts.binding !== "pending") return [{ op: "promote", ok: false, reason: "target_not_pending_or_active", why: "target.facts.binding=" + String(target.facts.binding) }];
+    // W1 引用码认领（B1 仍 pending）→ create_a1 → activate（标准四项 + 匹配根 om）。
+    const chatId = typeof target.chat_id === "string" ? target.chat_id : null;
+    if (!en(chatId)) return [{ op: "create_a1", ok: false, reason: "bad_input", why: "target.chat_id 缺失" }];
+    const kA1 = rk("create_a1", claimKey, sessionId);
+    if (!kA1.ok) return [{ op: "create_a1", ...kA1 }];
+    const a1 = capture("create_a1", createA1({ endpointId, requestKey: kA1.request_key, chatId, sessionId, now, env }));
+    if (!a1.ok) return [a1]; // create_a1 失败（如 locator 撞）→ 序列停（activate 需 a1Id）
+    const kAct = rk("activate", claimKey, b1Id);
+    if (!kAct.ok) return [a1, { op: "activate", ...kAct }];
+    return [a1, capture("activate", activate({ endpointId, requestKey: kAct.request_key, b1Id, a1Id: a1.result?.created_id, f4: { matched_om: locator, matched_fields: ["chat_id", "sender", "body", "thread_root"] }, authorizedBy, now, env }))];
   } });
 }
 

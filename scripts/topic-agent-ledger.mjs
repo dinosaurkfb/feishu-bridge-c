@@ -247,17 +247,41 @@ export function liveProblem(rec, id) {
 /** proof-组合校验器（§3.1 生命周期组合表）：证明**组合**，不只单 kind。
  *   ① binding=migrated ⇒ 必有 link 且 link=migrated（migrated 只成对出现；
  *      A4-bare 无 link 却带 migrated binding ⇒ 拒）。
- *   ② link=migrated ⇒ binding ∈ {migrated, retarget, attach(仅 A3 继承)}；
+ *   ② link=migrated ⇒ binding ∈ {migrated, retarget, attach(A3 或 A4 继承)}；
  *      (pairing|attach 非继承|null) + migrated link ⇒ 拒。
- *   ③ (attach, migrated) 仅 A3 继承：family===A3 ∧ origin 指向 attach_a3 且 result.affected_id===id
- *      ∧ link 的 migration_operation_id 指向合法 migrate_seed/migrate_repair 且 result digest 逐字相符（G13-mig ①② 的 link 侧）。
+ *   ③ (attach, migrated) A3/A4 继承：A3 ⇒ origin=attach_a3；A4 ⇒ origin=经合法 unbind(terminal_family=A4) 继承 A3
+ *      （须存在把本 id 置成 A3(attach) 的 attach_a3 op）；二者都要求 link 的 migration_operation_id 指向合法
+ *      migrate_seed/migrate_repair 且 result digest 逐字相符（G13-mig ①② 的 link 侧）。
+ *      #R32 P1：另要求因果顺序 migrate < attach_a3 < unbind(origin)（对应全局不变量：最新触及该 id 的 op === origin_operation_id）。
  */
+/** R32 P1：operation 的 result 触到哪些记录 id（用于全局因果顺序不变量）。initialize_shadow / authority_cutover 不触及记录 id。 */
+function opTouchedIds(op) {
+  const r = op?.result;
+  if (!r) return [];
+  switch (op.op_type) {
+    case "create_a1":
+    case "create_b1": return r.created_id == null ? [] : [r.created_id];
+    case "seed": return Array.isArray(r.seeded_ids) ? r.seeded_ids : [];
+    case "activate": return [r.surviving_id, r.tombstoned_id, r.demoted_historical_id].filter((x) => x != null);
+    case "void": return r.voided_id == null ? [] : [r.voided_id];
+    case "attach_a2":
+    case "attach_a3":
+    case "anchor":
+    case "restore":
+    case "unbind": return r.affected_id == null ? [] : [r.affected_id];
+    case "retarget": return Array.isArray(r.affected_ids) ? r.affected_ids : [];
+    case "migrate_seed": return Array.isArray(r.seeded) ? r.seeded.map((s) => s.topic_agent_id) : [];
+    case "migrate_repair": return r.repaired_id == null ? [] : [r.repaired_id];
+    default: return [];
+  }
+}
+
 function proofCombinationProblem(rec, id, doc) {
   const bpKind = rec.binding_proof?.kind ?? null;
   const lpKind = rec.locator_link_proof_ref?.kind ?? null;
   if (bpKind === "migrated" && lpKind !== "migrated") return "binding=migrated 必须 pair link=migrated";
   if (lpKind === "migrated") {
-    if (bpKind !== "migrated" && bpKind !== "retarget" && bpKind !== "attach") return "link=migrated 的 binding 只能是 migrated/retarget/attach(A3 继承)";
+    if (bpKind !== "migrated" && bpKind !== "retarget" && bpKind !== "attach") return "link=migrated 的 binding 只能是 migrated/retarget/attach(A3/A4 继承)";
     if (bpKind === "attach") {
       const fam = familyOf(rec.facts);
       const op = doc.operations[rec.origin_operation_id];
@@ -269,8 +293,17 @@ function proofCombinationProblem(rec, id, doc) {
         //   判据：origin=unbind(terminal_family=A4, affected_id=id)，且账本确有把本 id 置成 A3(attach) 的 attach_a3 op
         //   （否则 attach binding 无从谈起，只是伪造）。migrate B4→unbind→attach(A3)→unbind 第四笔即此。
         if (!op || op.op_type !== "unbind" || op.result?.terminal_family !== "A4" || op.result?.affected_id !== id) return "(attach, migrated) 的 A4 需经合法 unbind(terminal_family=A4, affected_id=id) 继承 A3";
-        const hadAttachA3 = Object.keys(doc.operations).some((k) => { const o = doc.operations[k]; return o.op_type === "attach_a3" && o.result?.affected_id === id; });
-        if (!hadAttachA3) return "(attach, migrated) 的 A4 需 A3 继承：账本无该 id 的 attach_a3 op 支撑 attach binding";
+        const atOpId = Object.keys(doc.operations).find((k) => { const o = doc.operations[k]; return o.op_type === "attach_a3" && o.result?.affected_id === id; });
+        if (!atOpId) return "(attach, migrated) 的 A4 需 A3 继承：账本无该 id 的 attach_a3 op 支撑 attach binding";
+        // #R32 P1：A4 继承补**因果顺序**——migrate_seed/repair 必须早于 attach_a3、且 attach_a3 必须早于当前 unbind(origin)。
+        //   只查 attach_a3 存在性会让 "unbind@rev4→attach_a3@rev5" 这类不可能历史照样通过。
+        const atOp = doc.operations[atOpId];
+        const migClOp = doc.operations[rec.locator_link_proof_ref.migration_operation_id];
+        const migClRev = migClOp && (migClOp.op_type === "migrate_seed" || migClOp.op_type === "migrate_repair") ? migClOp.result_revision : null;
+        if (migClRev !== null) {
+          if (!(migClRev < atOp.result_revision)) return "(attach, migrated) 的 A4 需因果顺序：migrate < attach_a3（R32）";
+          if (!(atOp.result_revision < op.result_revision)) return "(attach, migrated) 的 A4 需因果顺序：attach_a3 < unbind(origin)（R32）";
+        }
       } else {
         return "(attach, migrated) 只在 A3 继承 / A4 继承合法";
       }
@@ -467,6 +500,24 @@ export function validateLedger(doc, { endpointId } = {}) {
     }
   }
   if (liveCount > MAX_LIVE) return bad("live 记录超上限");
+
+  // #R32 P1 全局因果不变量：对每条记录，所有 result 触及该 id 的 op 中最新（max result_revision）一笔必须等于 origin_operation_id。
+  //   每个触及 id 的 op 都会把该记录 origin 置成自己；因此若存在比 origin 更新仍触及 id 的 op ⇒ 不可能历史（如 unbind@rev4→attach_a3@rev5）。
+  //   覆盖 migrate/repair 来源早于 attach/retarget 等继承操作。initialize_shadow / authority_cutover 不触及记录 id（opTouchedIds 归空）。
+  const maxTouch = new Map(); // id → { rev, opId }
+  for (const [opId, op] of Object.entries(doc.operations)) {
+    if (op.op_type === "initialize_shadow" || op.op_type === "authority_cutover") continue;
+    const touched = opTouchedIds(op);
+    if (touched.length === 0) continue;
+    for (const tId of touched) {
+      const cur = maxTouch.get(tId);
+      if (!cur || op.result_revision > cur.rev) maxTouch.set(tId, { rev: op.result_revision, opId });
+    }
+  }
+  for (const [id, rec] of Object.entries(doc.records)) {
+    const max = maxTouch.get(id);
+    if (max && max.opId !== rec.origin_operation_id) return bad(id + "：最新触及该 id 的 op(" + max.opId + "@rev" + max.rev + ") 不等于 origin(" + rec.origin_operation_id + ")（因果不变量 R32）");
+  }
 
   // §3.1 proof-组合校验：绑定/link 证明的组合，不只看单个 kind（A4-bare+migrated、migrated+pairing_merge 等）。
   for (const [id, rec] of live) {

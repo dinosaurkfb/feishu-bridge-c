@@ -25027,7 +25027,7 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     const docC = mkDoc({ [OP2]: migSeedOp("req_c", idC, claim("3")), [OP3]: seedOrigin("req_sd_c", idC) }, { [idC]: rec(idC, { facts: facts("active", "present", "present", "present", "current"), aliases: { root_om: "om_c", session_id: "sess_C" }, binding_target: TGT, generation_lineage_id: "lin_C", origin_operation_id: OP3, binding_proof: { kind: "pairing", authorized_by: "ou_o", authorized_at: at, matched_fields: mf, matched_om: "om_z" }, locator_link_proof_ref: migLp(claim("3")) }) });
     const vc = TAL.validateLedger(docC, { endpointId: EP });
     assert.equal(vc.reason, "ledger_corrupt", "pairing bp + migrated link 应拒");
-    assert.ok(vc.why.includes("link=migrated 的 binding 只能是 migrated/retarget/attach(A3 继承)"), "反向混搭命中规则②：" + vc.why);
+    assert.ok(vc.why.includes("link=migrated 的 binding 只能是 migrated/retarget/attach(A3/A4 继承)"), "反向混搭命中规则②：" + vc.why);
 
     // #R30 P1.1 ACCEPT D：A4-full + attach bp + migrated link —— A3 经合法 unbind 继承（规格 §3.1：unbind 保持 proof、A4 继承 migrated 合法）
     //   真实四笔 migrate B4→unbind→attach(A3)→unbind 的终态即此：账本确有把 idD 置成 A3(attach) 的 attach_a3 op，origin=unbind(terminal_family=A4, affected_id=idD)。
@@ -25077,6 +25077,55 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     const v = TAL.validateLedger(doc, { endpointId: EP });
     assert.ok(v.ok, "真实四笔生命周期终态 A4-full(attach,migrated) 合法：" + JSON.stringify(v));
   }));
+
+test("账本 §3.1 proof-组合：A4 继承补因果顺序——swap attach/unbind、migrate 晚于 attach_a3 均 ledger_corrupt（R32 P1）", () => {
+  const at = new Date(1700000000000).toISOString();
+  const hx = (n) => String(n).repeat(64);
+  const OP0 = "00000000-0000-0000-0000-000000000001";
+  const OP2 = "22222222-2222-2222-2222-222222222222";
+  const OP3 = "33333333-3333-3333-3333-333333333333";
+  const OP4 = "44444444-4444-4444-4444-444444444444";
+  const initOp = { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } };
+  const migSeedOp = (reqKey, id, dig, rev) => ({ op_type: "migrate_seed", terminal_kind: "migrate_seed", request_key: reqKey, fingerprint: hx(2), result_revision: rev, result: { authorized_by: "ou_o", authorized_at: at, seeded: [{ topic_agent_id: id, legacy_source_digest: dig }] } });
+  const unbindOp = (reqKey, id, fam, rev) => ({ op_type: "unbind", terminal_kind: "unbind", request_key: reqKey, fingerprint: hx(3), result_revision: rev, result: { affected_id: id, terminal_family: fam } });
+  const attachA3 = (reqKey, id, rev) => ({ op_type: "attach_a3", terminal_kind: "attach_a3", request_key: reqKey, fingerprint: hx(4), result_revision: rev, result: { affected_id: id, terminal_family: "A3" } });
+  const mkDoc = (ops, records, rev) => ({ schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: CH, authority_mode: "shadow", revision: rev, operations: { [OP0]: initOp, ...ops }, records });
+  const rec = (id, o) => Object.assign({ topic_agent_id: id, kind: "live", chat_id: "oc_" + id.slice(3), anchor_candidate: null, aliases: null, binding_target: null, facts: null, generation_lineage_id: null, origin_operation_id: null, binding_proof: null, locator_link_proof_ref: null, created_at: at, updated_at: at }, o);
+  const facts = (binding, session, anchor, link, generation) => ({ binding, session, anchor, locator_link_proof: link, generation });
+  const a4Rec = (id, originOpId, migOpId, dig) => rec(id, {
+    facts: facts("dormant", "present", "present", "present", "n/a"),
+    aliases: { root_om: "om_r32", session_id: "sess_r32" },
+    binding_target: TGT,
+    origin_operation_id: originOpId,
+    binding_proof: { kind: "attach", authorized_by: "ou_o", authorized_at: at, claim_key: hx(6) },
+    locator_link_proof_ref: { kind: "migrated", migration_operation_id: migOpId, legacy_source_digest: dig },
+  });
+
+  // 对照：合法 A4 继承 migrate@2 < attach_a3@3 < unbind@4(origin) → 过
+  const idOK = tid("a");
+  const docOK = mkDoc(
+    { [OP2]: migSeedOp("req_ok_m", idOK, claim("b"), 2), [OP3]: attachA3("req_ok_a", idOK, 3), [OP4]: unbindOp("req_ok_u", idOK, "A4", 4) },
+    { [idOK]: a4Rec(idOK, OP4, OP2, claim("b")) }, 4);
+  assert.ok(TAL.validateLedger(docOK, { endpointId: EP }).ok, "合法 A4 继承（migrate<attach_a3<unbind）应过：" + JSON.stringify(TAL.validateLedger(docOK, { endpointId: EP })));
+
+  // 反例①：swap attach_a3/unbind revision —— attach_a3@4 晚于 origin=unbind@3 → 不可能历史 → ledger_corrupt（因果不变量）
+  const idSW = tid("b");
+  const docSW = mkDoc(
+    { [OP2]: migSeedOp("req_sw_m", idSW, claim("c"), 2), [OP3]: unbindOp("req_sw_u", idSW, "A4", 3), [OP4]: attachA3("req_sw_a", idSW, 4) },
+    { [idSW]: a4Rec(idSW, OP3, OP2, claim("c")) }, 4);
+  const vSW = TAL.validateLedger(docSW, { endpointId: EP });
+  assert.equal(vSW.reason, "ledger_corrupt", "swap attach/unbind revision（attach 在 origin 后）应拒：" + JSON.stringify(vSW));
+  assert.ok(vSW.why.includes("因果"), "反例① 命中因果：" + vSW.why);
+
+  // 反例②：migrate@3 晚于 attach_a3@2，但都在 unbind@4(origin) 前 → 全局不变量过、A4 migrate<attach_a3 破 → ledger_corrupt
+  const idMO = tid("c");
+  const docMO = mkDoc(
+    { [OP2]: attachA3("req_mo_a", idMO, 2), [OP3]: migSeedOp("req_mo_m", idMO, claim("d"), 3), [OP4]: unbindOp("req_mo_u", idMO, "A4", 4) },
+    { [idMO]: a4Rec(idMO, OP4, OP3, claim("d")) }, 4);
+  const vMO = TAL.validateLedger(docMO, { endpointId: EP });
+  assert.equal(vMO.reason, "ledger_corrupt", "migrate 晚于 attach_a3 应拒（migrate<attach_a3 破）：" + JSON.stringify(vMO));
+  assert.ok(vMO.why.includes("因果"), "反例② 命中因果：" + vMO.why);
+});
 }
 
 // ── M1 第 2 块：维护门 ledger operation 编排（scripts/maintenance/ledger-operation.mjs）行为回归 ──

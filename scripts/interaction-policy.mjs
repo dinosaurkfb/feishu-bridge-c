@@ -49,6 +49,17 @@ export const DIALOGUE_REASON = Object.freeze({
   HUMAN_INTERRUPT: "human_interrupt",
 });
 
+/**
+ * 受控终局原因 = 现行 DIALOGUE_REASON ∪ 生产真写的三个投递失败原因（#R33 P1-1）。
+ * 这是写方与 policy-store 校验器（ipsp-1）的**同一份封闭合同**：双方都从这里 import，不各养一份。
+ * 已知开口：watch-and-publish 把 run 的 reason 透传进 finalizeDialogueTurn（动态字符串），
+ * 写路径尚未按本枚举收紧 —— 那是接线单的事（要连 watch-and-publish 一起改）；存储层先按全集收口。
+ */
+export const DIALOGUE_FINAL_REASONS = Object.freeze([
+  ...Object.values(DIALOGUE_REASON),
+  "forward_failed", "handoff_failed", "runtime_failed",
+]);
+
 const nonEmpty = (value) => typeof value === "string" && value.length > 0;
 const iso = (now) => new Date(now).toISOString();
 const clone = (value) => JSON.parse(JSON.stringify(value));

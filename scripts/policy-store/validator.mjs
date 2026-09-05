@@ -13,8 +13,8 @@
 import { isCanonicalIso } from "../canonical-time.mjs";
 import { usableGeneration } from "../topic-generation.mjs";
 import {
-  DIALOGUE_POLICY_ID, DIALOGUE_REASON, DIALOGUE_STATUS, DIALOGUE_TURN_STATUS,
-  DIALOGUE_STOP_CONDITIONS, INTERACTION_POLICY_SCHEMA_VERSION,
+  DIALOGUE_POLICY_ID, DIALOGUE_STATUS, DIALOGUE_TURN_STATUS,
+  DIALOGUE_STOP_CONDITIONS, DIALOGUE_FINAL_REASONS, INTERACTION_POLICY_SCHEMA_VERSION,
 } from "../interaction-policy.mjs";
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -127,30 +127,48 @@ export function interactionPolicyStateProblem(state, { bindingId } = {}) {
   if (!isCanonicalIso(d.started_at)) return "dialogue_started_at";
   if (!isCanonicalIso(d.deadline_at)) return "dialogue_deadline_at";
   if (!isCanonicalIso(d.updated_at)) return "dialogue_updated_at";
-  if (d.ended_at !== null && !isCanonicalIso(d.ended_at)) return "dialogue_ended_at";
-  if (d.stop_reason !== null && !Object.values(DIALOGUE_REASON).includes(d.stop_reason)) return "dialogue_stop_reason";
+
+  // 状态关系联合封闭（#R33 P1-1）：终局三值（failed/completed/cancelled）必有规范 ended_at +
+  // 受控终局原因且 active_turn 空；active 反之；mapping 是终局审计快照，三元组可遗留可空但值域仍受控。
+  // 与写路径冻结的对应关系：终局三元组由 finalize/stop 写入；dialogue→mapping 直接切回时末跑完终局的
+  // dialogue 会带 null 三元组进快照 —— 这是合法演进，不算矛盾。
+  if (d.status === DIALOGUE_STATUS.ACTIVE) {
+    if (d.ended_at !== null || d.stop_reason !== null) return "dialogue_status";
+  } else {
+    if ([DIALOGUE_TURN_STATUS.COMPLETED, DIALOGUE_TURN_STATUS.FAILED, DIALOGUE_TURN_STATUS.CANCELLED].includes(d.status)) {
+      if (d.ended_at === null || !isCanonicalIso(d.ended_at)) return "dialogue_ended_at";
+      if (d.stop_reason === null || !DIALOGUE_FINAL_REASONS.includes(d.stop_reason)) return "dialogue_stop_reason";
+      if (d.active_turn !== null) return "dialogue_active_turn";
+    } else if (d.ended_at !== null && !isCanonicalIso(d.ended_at)) return "dialogue_ended_at";
+  }
 
   const eventIds = d.processed_events.map((e) => e.event_id);
+  const eventOf = (evId) => d.processed_events.find((e) => e.event_id === evId);
   if (d.active_turn !== null) {
     const t = d.active_turn;
     if (!isObj(t) || keysOf(t) !== TURN_KEYS) return "dialogue_active_turn";
     const f = turnFacts(t);
+    const ev = eventOf(t.event_id);
     if (!f.idsOk || !f.idxOk || !f.runtimeOk || !f.unitsOk || !f.genOk ||
         t.status !== DIALOGUE_TURN_STATUS.DISPATCHED || !isCanonicalIso(t.dispatched_at) ||
         t.dialogue_id !== d.dialogue_id || t.turn_index >= d.next_turn_index ||
-        !eventIds.includes(t.event_id)) return "dialogue_active_turn";
+        // 全元组一致（#R33 P1-1）：同 event_id 的 run_id/dialogue_id/turn_index 必须逐字段相等
+        ev === undefined || ev.run_id !== t.run_id ||
+        ev.dialogue_id !== t.dialogue_id || ev.turn_index !== t.turn_index) return "dialogue_active_turn";
   }
   if (d.last_turn !== undefined) {
     const t = d.last_turn;
     if (!isObj(t) || keysOf(t) !== LAST_TURN_KEYS) return "dialogue_last_turn";
     const f = turnFacts(t);
+    const ev = eventOf(t.event_id);
     if (!f.idsOk || !f.idxOk || !f.runtimeOk || !f.unitsOk || !f.genOk ||
         ![DIALOGUE_TURN_STATUS.COMPLETED, DIALOGUE_TURN_STATUS.FAILED,
           DIALOGUE_TURN_STATUS.CANCELLED].includes(t.status) ||
         !isCanonicalIso(t.dispatched_at) || !isCanonicalIso(t.finalized_at) ||
-        (t.reason !== null && !Object.values(DIALOGUE_REASON).includes(t.reason)) ||
+        (t.reason !== null && !DIALOGUE_FINAL_REASONS.includes(t.reason)) ||
         t.dialogue_id !== d.dialogue_id || t.turn_index >= d.next_turn_index ||
-        !eventIds.includes(t.event_id)) return "dialogue_last_turn";
+        ev === undefined || ev.run_id !== t.run_id ||
+        ev.dialogue_id !== t.dialogue_id || ev.turn_index !== t.turn_index) return "dialogue_last_turn";
   }
   return null;
 }

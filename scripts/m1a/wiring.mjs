@@ -73,9 +73,28 @@ function runWired({ endpointId, env = process.env, legacy, submit }) {
   }
   let result;
   try {
+    // P1-1（#R37 返修）：已启用点取得 outer 后、legacy 前核账本现场 ——
+    //   cutover 已切（authoritative）→ M1a 不得再写 legacy（ledger-only 写方属 M1b）；
+    //   账本现场不可读/缺席 → 无法镜像 legacy，整笔拒；authority_mode 非 shadow → 同样拒。
+    if (receipt.cutoverDone === true) {
+      result = { ok: false, commit: "not_committed", reason: "m1a_mode_not_shadow", why: "已切权威（cutover done）：M1a 代码不得在切换后再写 legacy（ledger-only 写方属 M1b）", lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
+      return result;
+    }
+    const ledger = loadByEndpoint(endpointId, { env });
+    if (!ledger.ok) {
+      result = { ok: false, commit: "not_committed", reason: "m1a_ledger_absent", why: "已启用端点账本现场不可读/缺席（" + (ledger.reason ?? "unknown") + "）：M1a 无法镜像 legacy，fail-closed", lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
+      return result;
+    }
+    if (ledger.doc.authority_mode !== "shadow") {
+      result = { ok: false, commit: "not_committed", reason: "m1a_mode_not_shadow", why: "账本 authority_mode=" + ledger.doc.authority_mode + "：M1a 代码不得在切换后再写 legacy", lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
+      return result;
+    }
     let legacyRes;
     try { legacyRes = legacy(); }
-    catch (err) { return { ok: false, commit: "not_committed", reason: "legacy_failed", why: String(err?.message ?? err), legacy: null, shadow: null, release: null }; }
+    catch (err) {
+      result = { ok: false, commit: "not_committed", reason: "legacy_failed", why: String(err?.message ?? err), legacy: null, shadow: null, release: null };
+      return result;
+    }
     // legacy 明确未提交（ok:false）→ 无 legacy 结果可镜像 → 不跑 shadow 后缀（不写幽灵记录/标记）。
     const shadow = legacyRes && legacyRes.ok === false ? [] : (submit(legacyRes) ?? []);
     result = { ok: true, legacy: legacyRes, shadow, release: null };

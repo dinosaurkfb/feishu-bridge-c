@@ -25244,6 +25244,41 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     }
   }));
 
+  // #R37 返修 P1-1（Codex 首轮）：已启用端点必须在取得 outer 锁后、legacy 前核账本现场 ——
+  //   loadByEndpoint 核：账本存在、合法、authority_mode==='shadow'；任一不成立 → 整笔拒（fail-closed、不写 legacy）。
+  //   裁定：cutover 收据已存在（authoritative）也整笔拒 —— ledger-only 写方属 M1b，M1a 代码不得在切换后再写 legacy。
+  //   红测试：① init 收据在（ok）而 ledger.json 缺 → m1a_ledger_absent、legacy 零调用；
+  //   ② init+cutover 收据在 → m1a_mode_not_shadow、legacy 零调用。
+  test("m1a 双双写：已启用点必须核账本现场（P1-1）——init 收据在而 ledger.json 缺→零调用；init+cutover→同样零调用", () => withRootAndReceipt((root, dir) => {
+    const maint = path.join(root, "maint");
+    // ① init 收据在（state=ok）但 EP 账本无 ledger.json → 取到锁后 loadByEndpoint absent → 整笔拒、legacy 零调用
+    {
+      seedLedgerInitReceipt(maint, EP);
+      seedLedger(dir);                                // 建合法账本现场（root/EP/ledger.json, 0700）
+      fs.rmSync(path.join(dir, "ledger.json"));        // 今掉 ledger.json → 账本现场缺
+      assert.equal(endpointReceipt(maint, EP).state, "ok", "init 收据 → ok（M1a 已启用）");
+      let legacyCalls = 0;
+      const w = WIRE.wireCreateA1({ endpointId: EP, env: process.env, legacy: () => { legacyCalls += 1; return { ok: true }; }, chatId: "oc_a1", sessionId: "sess_a1", messageId: "msg_a1" });
+      assert.equal(w.ok, false, "① 账本缺 → 整笔拒：" + JSON.stringify(w));
+      assert.equal(w.reason, "m1a_ledger_absent", "m1a_ledger_absent");
+      assert.equal(w.commit, "not_committed", "未提交");
+      assert.equal(legacyCalls, 0, "① ledger.json 缺时 legacy 零调用");
+      assert.ok(w.release && w.release.ok, "① 拒后仍还外层锁（P1-6 联动：释放投影）");
+    }
+    // ② init+cutover 收据在（authoritative）→ 同样整笔拒、legacy 零调用
+    {
+      seedLedgerInitReceipt(maint, EP);
+      seedLedger(dir);
+      surgeryCutoverJournal(maint, "da88566e-d8d3-48ba-914e-7f96f4dfaeaa", EP);
+      assert.equal(endpointReceipt(maint, EP).cutoverDone, true, "② 手术 cutover 收据 → cutoverDone");
+      let legacyCalls = 0;
+      const w = WIRE.wireCreateA1({ endpointId: EP, env: process.env, legacy: () => { legacyCalls += 1; return { ok: true }; }, chatId: "oc_a1", sessionId: "sess_a1", messageId: "msg_a1" });
+      assert.equal(w.ok, false, "② cutover 收据 → 整笔拒：" + JSON.stringify(w));
+      assert.equal(w.reason, "m1a_mode_not_shadow", "m1a_mode_not_shadow");
+      assert.equal(legacyCalls, 0, "② cutover 后 legacy 零调用");
+    }
+  }));
+
   // #R37 轮转（建新代际）→ 账本 create_b1。W3（Frank 拍板）：外层锁在 sendToChat 之前取 ——
   //   rootOm 从 legacy 闭包返回的 root_message_id 取（sendToChat 在闭包内创建根消息、拿到 om），
   //   静态 rootOm 只在缺省时兜底。行为验证：① legacy 返回 root_message_id → shadow create_b1 用该 om；

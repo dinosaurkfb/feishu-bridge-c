@@ -26,6 +26,20 @@ const arg = (name) => {
   return at >= 0 ? process.argv[at + 1] : undefined;
 };
 const die = (message) => { console.error(message); process.exit(1); };
+// P1-6（#R37 返修）：shadow 步、或 outer 释放失败 → 把完整步结果/残留写进机器回执（JSON 到 stderr），再 CLI 非零。
+// 绝不在此之后说“双写完成/新话题已进入 pending”。
+const emitMachineReceipt = (kind, payload) => {
+  console.error(JSON.stringify({
+    schema_version: "1.0",
+    artifact_type: "feishu_bridge_rotate_receipt",
+    classification: "internal",
+    recorded_at: new Date().toISOString(),
+    kind,
+    ...payload,
+  }, null, 2));
+};
+const shadowFailed = (wired) => (wired.shadow ?? []).filter((s) => !s.ok);
+const releaseFailed = (wired) => wired.release && wired.release.ok !== true;
 const apply = process.argv.includes("--apply");
 if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
 const cancel = process.argv.includes("--cancel");
@@ -66,6 +80,26 @@ if (cancel) {
   }
   const closed = wiredVoid.legacy;
   if (!closed.ok) die("取消轮转失败（" + closed.reason + "）。");
+  // P1-6（#R37 返修 ⑤）：cancel 的 shadow void 失败、或 outer 释放失败 → 机器回执 + CLI 非零。
+  // legacy 已取消；但不在此宣告“双写完成”——作废镜像缺了，缺口留给 doctor/repair。
+  {
+    const failed = shadowFailed(wiredVoid);
+    const relFail = releaseFailed(wiredVoid);
+    if (failed.length > 0 || relFail) {
+      emitMachineReceipt("rotate-cancel-shadow-failed", {
+        status: "shadow_failed",
+        operationId: rotationOpId,
+        binding_id: current.state.binding_id,
+        legacy_committed: true,
+        shadow: (wiredVoid.shadow ?? []).map((s) => ({ op: s.op, ok: s.ok ?? false, reason: s.reason ?? null, why: s.why ?? null })),
+        release: wiredVoid.release ?? null,
+      });
+      die("取消轮转 legacy 已成功（待认领代际作废），但 M1a shadow 未完整镜像（" +
+        (failed.length ? "失败步 " + failed.map((s) => "`" + s.op + "`" + (s.reason ? "（" + s.reason + "）" : "")).join("，") : "") +
+        (relFail ? (failed.length ? "；" : "") + "outer 锁释放失败（" + wiredVoid.release.reason + "）" : "") +
+        "）。详情见上方机器回执；未断言双写完成，缺口留 doctor/repair。");
+    }
+  }
   console.log("已取消待认领代际；旧话题仍是唯一 active，未删除任何飞书历史。");
   process.exit(0);
 }
@@ -155,7 +189,7 @@ const wired = wireRotate({
             " 分钟后可由下一次轮转接管；若已进入 awaiting_claim，则去新话题真实 @ 完成认领。" +
             "新建的那个话题需要人工清理。"));
     }
-    return { ...registered, root_message_id: rootMessageId };
+    return { ...registered, root_message_id: rootMessageId, supersededRootOm: prepared.superseded?.root_message_id ?? null };
   },
 });
 if (!wired.ok) {
@@ -163,6 +197,29 @@ if (!wired.ok) {
   die("无法开始轮转（M1a 一致性锁取不到：" + (wired.reason ?? "m1a_reject") + (wired.why ? "；" + wired.why : "") + "）。旧代际保持 active，未创建新话题。");
 }
 const rootMessageId = wired.legacy.root_message_id;
+
+// P1-6（#R37 返修 ⑤）：旧代际作废或新代际镜像任一 shadow 步失败、或 outer 释放失败 → 机器回执 + CLI 非零。
+// 注意 legacy（轮转+新话题登记）已经成功；但绝不在此宣告“双写完成”，缺口留给 doctor/repair。
+{
+  const failed = shadowFailed(wired);
+  const relFail = releaseFailed(wired);
+  if (failed.length > 0 || relFail) {
+    emitMachineReceipt("rotate-shadow-failed", {
+      status: "shadow_failed",
+      operationId,
+      binding_id: current.state.binding_id,
+      legacy_committed: true,
+      root_message_id: rootMessageId,
+      superseded_root_om: prepared.superseded?.root_message_id ?? null,
+      shadow: (wired.shadow ?? []).map((s) => ({ op: s.op, ok: s.ok ?? false, reason: s.reason ?? null, why: s.why ?? null })),
+      release: wired.release ?? null,
+    });
+    die("轮转 legacy 已提交（新话题已登记），但 M1a shadow 未完整镜像（" +
+      (failed.length ? "失败步 " + failed.map((s) => "`" + s.op + "`" + (s.reason ? "（" + s.reason + "）" : "")).join("，") : "") +
+      (relFail ? (failed.length ? "；" : "") + "outer 锁释放失败（" + wired.release.reason + "）" : "") +
+      "）。详情见上方机器回执；未断言双写完成，缺口留 doctor/repair。");
+  }
+}
 
 try {
   publishDraft({

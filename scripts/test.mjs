@@ -25366,6 +25366,85 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     }
   }));
 
+  // P1-4（#R37 返修 ① ② ③ ④）：wireRotate 轮转复合体。合法场景=同一个持久 rotation operation id 下，
+  //   过期的旧代际被同一笔外锁内作废（void, reason=expired），再建新代际（create_b1）— 两 op **固定顺序** void→create_b1，
+  //   因为 createB1 有 lineage_pending_exists 守卫：旧 B1 在被 void 之前仍是 live/pending，同 lineage 再建会拒。
+  //   两 op 从同一 rotationOpId 派生**不同** request_key（ext 相同、op_type/entity 相异），逐 op 幂等重放。
+  test("m1a 双写接线：wireRotate 轮转复合体（P1-4）——void(expired)→create_b1 同锁、同 op id 不同 request_key、旧 B1 作废", () => withRootAndReceipt((root, dir) => {
+    seedLedger(dir);
+    seedLedgerInitReceipt(path.join(root, "maint"), EP);
+
+    // 先建一个旧代际 B1（pending），作为被作废目标；lineage 与后续新代际相同（binding_id 跨代不变，守卫会拦）。
+    const first = WIRE.wireRotate({ endpointId: EP, env: process.env, rotationOpId: "rot_old", lineageId: "lin_p14", chatId: "oc_old", bindingTarget: TGT, rootOm: "om_old", legacy: () => ({ ok: true, root_message_id: "om_old" }) });
+    assert.ok(first.ok, "① 旧代际建出：" + JSON.stringify(first));
+    const oldB1 = famIds(talLoad(dir), "B1").find((id) => talLoad(dir).records[id].aliases.root_om === "om_old");
+    assert.ok(oldB1, "找到旧 B1");
+
+    // 复合体：legacy 闭包线程 supersededRootOm=旧 B1 根 om → shadow 应产出 [void(expired), create_b1]
+    const opId = "rot_p14";
+    const w = WIRE.wireRotate({ endpointId: EP, env: process.env, rotationOpId: opId, lineageId: "lin_p14", chatId: "oc_new", bindingTarget: TGT, rootOm: null, legacy: () => ({ ok: true, root_message_id: "om_new", supersededRootOm: "om_old" }) });
+    assert.ok(w.ok, "② ok：" + JSON.stringify(w));
+    assert.equal(w.shadow.length, 2, "两笔 shadow（void+create_b1）：" + JSON.stringify(w.shadow));
+    assert.equal(w.shadow[0].op, "void", "第一笔 void");
+    assert.equal(w.shadow[1].op, "create_b1", "第二笔 create_b1");
+    assert.ok(w.shadow[0].ok, "void 成功：" + JSON.stringify(w.shadow[0]));
+    assert.ok(w.shadow[1].ok, "create_b1 成功：" + JSON.stringify(w.shadow[1]));
+
+    // 旧 B1 已作废（kind=voided_audit、reason=expired）；新 B1 已建（live、root_om=om_new、同 lineage）。
+    const oldRec = talLoad(dir).records[oldB1];
+    assert.equal(oldRec.kind, "voided_audit", "旧 B1 作废");
+    assert.equal(oldRec.reason, "expired", "void reason=expired");
+    const ops = Object.values(talLoad(dir).operations).map((o) => o.request_key);
+    const krVoid = DW.requestKeyFor({ opType: "void", externalRequestId: opId, entityId: oldB1 });
+    const krNew = DW.requestKeyFor({ opType: "create_b1", externalRequestId: opId, entityId: "lin_p14" });
+    assert.ok(ops.includes(krVoid.request_key), "void 的 request_key 入库：" + krVoid.request_key);
+    assert.ok(ops.includes(krNew.request_key), "create_b1 的 request_key 入库：" + krNew.request_key);
+    assert.notEqual(krVoid.request_key, krNew.request_key, "两 op request_key 不同（同 op id）");
+    const newB1 = famIds(talLoad(dir), "B1").find((id) => talLoad(dir).records[id].aliases.root_om === "om_new");
+    assert.ok(newB1, "新 B1 存在");
+    assert.equal(talLoad(dir).records[newB1].generation_lineage_id, "lin_p14", "新 B1 同 lineage（binding_id 跨代不变）");
+    assert.equal(famIds(talLoad(dir), "B1").length, 1, "只剩一个 live B1（旧已作废）");
+    assert.ok(w.release && w.release.ok, "释放 ok");
+  }));
+
+  // P1-4 ④（#R37 返修）：续跑恢复。legacy 已有新 pending（首 run 建）、但 shadow 只写了 void、create_b1 缺失 →
+  //   wireRotateRecovery 以**同一 rotation operation id** 只补缺失的 create_b1（幂等），不重发 void（目标已作废）、
+  //   **无 legacy 业务副作用**（prepare/sendToChat/register 首 run 已完成），且不被“已有 pending”预检赶走。
+  test("m1a 双写接线：wireRotateRecovery（P1-4 ④）——只补缺失 create_b1、不被已有 pending 挡、无 legacy 副作用", () => withRootAndReceipt((root, dir) => {
+    seedLedger(dir);
+    seedLedgerInitReceipt(path.join(root, "maint"), EP);
+    const opId = "rot_rec";
+
+    // 造出“首 run 已完成 void、但 create_b1 未落账”的无头现场：先建旧 B1，再用恢复 opId 的 request_key 显式 void 它。
+    const seed = WIRE.wireRotate({ endpointId: EP, env: process.env, rotationOpId: "rot_seed", lineageId: "lin_rec", chatId: "oc_rec", bindingTarget: TGT, rootOm: "om_old", legacy: () => ({ ok: true, root_message_id: "om_old" }) });
+    assert.ok(seed.ok, "seeding 旧 B1：" + JSON.stringify(seed));
+    const oldB1 = famIds(talLoad(dir), "B1").find((id) => talLoad(dir).records[id].aliases.root_om === "om_old");
+    assert.ok(oldB1, "找到旧 B1");
+    const kv = DW.requestKeyFor({ opType: "void", externalRequestId: opId, entityId: oldB1 });
+    assert.ok(kv.ok, "void request_key 派生");
+    talOk(TAL.voidPending({ endpointId: EP, requestKey: kv.request_key, b1Id: oldB1, reason: "expired", env: process.env }), "首 run 的 void 已提交");
+    assert.equal(talLoad(dir).records[oldB1].kind, "voided_audit", "旧 B1 已作废（void 落账）");
+
+    // 恢复：同一 opId 只补 create_b1。旧 B1 保持作废（不重发 void、不报 locator_absent）。
+    const rec = WIRE.wireRotateRecovery({ endpointId: EP, env: process.env, rotationOpId: opId, lineageId: "lin_rec", chatId: "oc_rec", bindingTarget: TGT, rootOm: "om_rec" });
+    assert.ok(rec.ok, "恢复整体 ok：" + JSON.stringify(rec));
+    assert.equal(rec.shadow.length, 1, "只补 create_b1（void 已提交，不重发）：" + JSON.stringify(rec.shadow));
+    assert.equal(rec.shadow[0].op, "create_b1", "唯一一笔 create_b1");
+    assert.ok(rec.shadow[0].ok, "create_b1 补写成功：" + JSON.stringify(rec.shadow[0]));
+    const newB1 = famIds(talLoad(dir), "B1").find((id) => talLoad(dir).records[id].aliases.root_om === "om_rec");
+    assert.ok(newB1, "恢复后新 B1 存在（缺失的那笔已补）");
+    assert.equal(talLoad(dir).records[newB1].generation_lineage_id, "lin_rec", "新 B1 同 lineage（binding_id 跨代不变）");
+    assert.equal(talLoad(dir).records[oldB1].kind, "voided_audit", "旧 B1 不因恢复重复作废");
+    assert.equal(famIds(talLoad(dir), "B1").length, 1, "只补 create_b1、不产生重复 B1");
+
+    // 同一 opId 再跑一次 → create_b1 幂等重放（committed_clean），不重复建 B1。
+    const rec2 = WIRE.wireRotateRecovery({ endpointId: EP, env: process.env, rotationOpId: opId, lineageId: "lin_rec", chatId: "oc_rec", bindingTarget: TGT, rootOm: "om_rec" });
+    assert.ok(rec2.ok, "二次恢复 ok：" + JSON.stringify(rec2));
+    assert.ok(rec2.shadow[0].ok && rec2.shadow[0].idempotent === true, "create_b1 幂等重放（不重复建）：" + JSON.stringify(rec2.shadow[0]));
+    assert.equal(famIds(talLoad(dir), "B1").length, 1, "二次恢复仍只一个 B1");
+    assert.ok(rec.release && rec.release.ok, "释放 ok");
+  }));
+
   // #R37 cancel（W5，Frank 拍板）：轮转取消 → 账本 void。
   //   reason 用封闭枚举映射 cancelled→"manual"（不扩枚举）；目标由 resolver 按 locator（被作废代际根 om）命中；
   //   rotation.operation_id 作 ext。resolver 未命中（legacy-only、无 B1）→ shadow fail-closed、legacy 照常取消。

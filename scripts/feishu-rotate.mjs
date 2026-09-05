@@ -15,7 +15,7 @@ import {
   closeClaudeTopicRotation, failClaudeTopicRotation, loadClaudeTopicBinding, prepareClaudeTopicRotation,
   registerClaudeTopicRotation,
 } from "./topic-generation-store.mjs";
-import { wireRotate } from "./m1a/wiring.mjs";
+import { wireRotate, wireVoid } from "./m1a/wiring.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
 import {
   ROTATION_STATUS, TOPIC_GENERATION_PREPARING_STALE_MS, activeGeneration, pendingGeneration, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, pendingRotationBlocker,
@@ -49,12 +49,22 @@ if (cancel) {
     console.log("\n[dry-run] 没有修改状态。加 --cancel --apply 才取消待认领代际。");
     process.exit(0);
   }
-  const closed = closeClaudeTopicRotation({
-    root,
-    claudeSessionId,
-    operationId: current.state.rotation.operation_id,
-    reason: ROTATION_STATUS.CANCELLED,
+  const rotationOpId = current.state.rotation.operation_id;
+  // M1a 双写（W5，Frank 拍板）：cancel → void 镜像（ledger voidPending），reason 映射 cancelled→"manual"（枚举不扩）。
+  // 目标由 resolver 按 pending 根消息 om 命中；resolver 未命中（如 legacy-only、无 B1）→ shadow fail-closed、legacy 照常取消。
+  const wiredVoid = wireVoid({
+    endpointId: legacyEndpointId({ runtime: "claude", agentUid: current.config.agent_uid }),
+    env: process.env,
+    rotationOpId,
+    locator: pending.root_message_id,
+    reason: "manual",
+    legacy: () => closeClaudeTopicRotation({ root, claudeSessionId, operationId: rotationOpId, reason: ROTATION_STATUS.CANCELLED }),
   });
+  if (!wiredVoid.ok) {
+    if (wiredVoid.reason === "legacy_failed") die("取消轮转失败：" + (wiredVoid.why ?? "legacy 异常"));
+    die("取消轮转中止（M1a 一致性锁取不到：" + (wiredVoid.reason ?? "m1a_reject") + (wiredVoid.why ? "；" + wiredVoid.why : "") + "）。旧代际保持 active。");
+  }
+  const closed = wiredVoid.legacy;
   if (!closed.ok) die("取消轮转失败（" + closed.reason + "）。");
   console.log("已取消待认领代际；旧话题仍是唯一 active，未删除任何飞书历史。");
   process.exit(0);

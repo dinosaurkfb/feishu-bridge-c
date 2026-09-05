@@ -159,6 +159,8 @@ import {
   DIALOGUE_TURN_STATUS, applyInteractionPolicyToAdmission, finalizeDialogueTurn,
   handleDialoguePolicy, interactionPolicyStateForLegacy, interactionPolicySummary,
   materializeInteractionPolicy, reserveDialogueTurn, setInteractionPolicyMode, DIALOGUE_POLICY_VERSION, validateInteractionPolicyState } from "./interaction-policy.mjs";
+import { interactionPolicyStateProblem } from "./policy-store/validator.mjs";
+import { loadPolicyStore, mutatePolicyStore, policySubjectId, upsertPolicyEntry } from "./policy-store/store.mjs";
 import {
   DEFAULT_RELAY_BUDGET, PARTICIPANT_SNAPSHOT_ARTIFACT_TYPE, RELAY_DISPOSITION,
   RELAY_PLAN_STATUS, RELAY_REASON, RELAY_STEP_STATUS, advanceRelayPlan, cancelRelayPlan,
@@ -27340,6 +27342,168 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     }
   });
 }
+
+  test("policy-store #R31：ipsp-1 封闭校验器逐支 + policy.json 原语 fail-closed + subject 派生碰撞域", () => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "policy-store-")));
+    const ledgerDir = path.join(base, "ledger root"); // 假 home 带空格纪律
+    fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
+    const savedLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerDir;
+    try {
+      const EP = "endpoint_" + "a".repeat(24);
+      const NOW0 = Date.parse("2026-09-01T00:00:00.000Z");
+      // —— 条目工厂：全部来自真实状态机写路径（validator 接受写路径产物本身就是冻结正确性的证据）——
+      const mkMapping = () => interactionPolicyStateForLegacy({ binding_id: EP }, { bindingId: EP, now: NOW0 }).state; // dialogue:null
+      const mkDialogue = () => setInteractionPolicyMode(mkMapping(), { mode: "dialogue", now: NOW0 }).state; // active，无 last_turn
+      const mkReserved = () => reserveDialogueTurn(mkDialogue(), { eventId: "ev1", runId: "run1", localTargetId: "lt1", originChannelGenerationId: "og1", now: NOW0 + 1000 }).state; // active + active_turn
+      const mkLastTurn = () => finalizeDialogueTurn(mkReserved(), { runId: "run1", status: "completed", now: NOW0 + 2000 }).state; // active + last_turn
+      const mkFailed = () => finalizeDialogueTurn(mkReserved(), { runId: "run1", status: "failed", now: NOW0 + 2000 }).state; // 终态 + ended_at + stop_reason
+      const mkSnapshot = () => setInteractionPolicyMode(mkFailed(), { mode: "mapping", now: NOW0 + 3000 }).state; // mapping + 终态审计快照
+      const states = { mapping: mkMapping(), dialogue: mkDialogue(), reserved: mkReserved(), lastTurn: mkLastTurn(), failed: mkFailed(), snapshot: mkSnapshot() };
+
+      // —— subject 派生：形状 / 稳定 / 碰撞域分隔（kind / endpoint / id 逐域）——
+      const psid = policySubjectId({ kind: "topic_agent", endpointId: EP, id: "ta_" + "b".repeat(32) });
+      assert.match(psid, /^ps_[0-9a-f]{32}$/u);
+      assert.equal(policySubjectId({ kind: "topic_agent", endpointId: EP, id: "ta_" + "b".repeat(32) }), psid, "同参稳定");
+      assert.notEqual(policySubjectId({ kind: "lineage", endpointId: EP, id: "ta_" + "b".repeat(32) }), psid, "kind 域分隔");
+      assert.notEqual(policySubjectId({ kind: "topic_agent", endpointId: "endpoint_" + "c".repeat(24), id: "ta_" + "b".repeat(32) }), psid, "endpoint 域分隔");
+      assert.notEqual(policySubjectId({ kind: "topic_agent", endpointId: EP, id: "ta_" + "d".repeat(32) }), psid, "id 域分隔");
+      assert.throws(() => policySubjectId({ kind: "lineage2", endpointId: EP, id: "x" }), TypeError, "kind 封闭域");
+      assert.throws(() => policySubjectId({ kind: "topic_agent", endpointId: EP, id: "" }), TypeError);
+
+      // —— validator 接受写路径全部产物 ——
+      for (const [name, state] of Object.entries(states)) {
+        assert.equal(interactionPolicyStateProblem(state), null, "合法：" + name);
+      }
+
+      // —— 根 / 嵌套多余键（逐支抽样）——
+      assert.equal(interactionPolicyStateProblem({ ...states.mapping, extra: 1 }), "policy_root_keys");
+      assert.equal(interactionPolicyStateProblem({ ...states.dialogue, dialogue: { ...states.dialogue.dialogue, extra: 1 } }), "dialogue_keys");
+      assert.equal(interactionPolicyStateProblem({ ...states.dialogue, dialogue: { ...states.dialogue.dialogue, host: { ...states.dialogue.dialogue.host, extra: 1 } } }), "dialogue_host");
+      assert.equal(interactionPolicyStateProblem({ ...states.reserved, dialogue: { ...states.reserved.dialogue, active_turn: { ...states.reserved.dialogue.active_turn, extra: 1 } } }), "dialogue_active_turn");
+      assert.equal(interactionPolicyStateProblem({ ...states.lastTurn, dialogue: { ...states.lastTurn.dialogue, last_turn: { ...states.lastTurn.dialogue.last_turn, extra: 1 } } }), "dialogue_last_turn");
+      const pe = JSON.parse(JSON.stringify(states.reserved));
+      pe.dialogue.processed_events[0].extra = 1;
+      assert.equal(interactionPolicyStateProblem(pe), "dialogue_processed_events");
+
+      // —— 各状态缺键（必有键缺拒；last_turn 缺席是合法可选，已在 dialogue 工厂验证）——
+      const cut = (state, key) => { const n = JSON.parse(JSON.stringify(state)); delete n.dialogue[key]; return n; };
+      assert.equal(interactionPolicyStateProblem(cut(states.dialogue, "ended_at")), "dialogue_keys");
+      assert.equal(interactionPolicyStateProblem(cut(states.reserved, "active_turn")), "dialogue_keys");
+      assert.equal(interactionPolicyStateProblem(cut(states.dialogue, "stop_reason")), "dialogue_keys");
+      const noRoot = JSON.parse(JSON.stringify(states.mapping)); delete noRoot.updated_at;
+      assert.equal(interactionPolicyStateProblem(noRoot), "policy_root_keys");
+      const noFin = JSON.parse(JSON.stringify(states.lastTurn)); delete noFin.dialogue.last_turn.finalized_at;
+      assert.equal(interactionPolicyStateProblem(noFin), "dialogue_last_turn");
+      const noRt = JSON.parse(JSON.stringify(states.reserved)); delete noRt.dialogue.active_turn.runtime_target_id;
+      assert.equal(interactionPolicyStateProblem(noRt), "dialogue_active_turn");
+
+      // —— 非法可空组合 / 值域 ——
+      const setD = (state, fn) => { const n = JSON.parse(JSON.stringify(state)); fn(n.dialogue); return n; };
+      assert.equal(interactionPolicyStateProblem(setD(states.reserved, (d) => { d.active_turn.runtime_target_id = 5; })), "dialogue_active_turn");
+      assert.equal(interactionPolicyStateProblem(setD(states.reserved, (d) => { d.active_turn.status = "completed"; })), "dialogue_active_turn");
+      assert.equal(interactionPolicyStateProblem(setD(states.lastTurn, (d) => { d.last_turn.reason = "xx"; })), "dialogue_last_turn");
+      assert.equal(interactionPolicyStateProblem(setD(states.dialogue, (d) => { d.stop_reason = "xx"; })), "dialogue_stop_reason");
+      assert.equal(interactionPolicyStateProblem(setD(states.dialogue, (d) => { d.usage.rounds_started = d.budget.max_rounds + 1; })), "dialogue_usage");
+      assert.equal(interactionPolicyStateProblem(setD(states.dialogue, (d) => { d.budget.max_rounds = 0; })), "dialogue_budget");
+      assert.equal(interactionPolicyStateProblem(setD(states.dialogue, (d) => { d.status = "paused"; })), "dialogue_status");
+      assert.equal(interactionPolicyStateProblem({ ...states.dialogue, policy_id: "mapping" }), "mapping_active_dialogue", "mapping + 活跃 dialogue 拒");
+      assert.equal(interactionPolicyStateProblem({ ...states.mapping, policy_id: "dialogue", dialogue: null }), "dialogue_keys", "dialogue 模式缺对话对象拒");
+      assert.equal(interactionPolicyStateProblem(states.snapshot), null, "mapping + 终态审计快照合法");
+
+      // —— 非规范时间（缺毫秒 / 不存在日期）——
+      assert.equal(interactionPolicyStateProblem({ ...states.mapping, updated_at: "2026-09-01T00:00:00Z" }), "policy_updated_at");
+      assert.equal(interactionPolicyStateProblem(setD(states.dialogue, (d) => { d.started_at = "2026-02-30T00:00:00.000Z"; })), "dialogue_started_at");
+      assert.equal(interactionPolicyStateProblem(setD(states.dialogue, (d) => { d.deadline_at = 123; })), "dialogue_deadline_at");
+
+      // —— 错误 binding_id ——
+      assert.equal(interactionPolicyStateProblem(states.mapping, { bindingId: "other" }), "policy_binding_id_mismatch");
+      assert.equal(interactionPolicyStateProblem({ ...states.mapping, binding_id: "" }), "policy_binding_id");
+      assert.equal(interactionPolicyStateProblem({ ...states.mapping, binding_id: EP }), null, "外键一致合法");
+
+      // —— store：absent / 写 / 读回逐字（读写两端同一导出的行为证据）——
+      const absent = loadPolicyStore({ endpointId: EP });
+      assert.deepEqual([absent.ok, absent.absent], [true, true]);
+      const up1 = mutatePolicyStore({ endpointId: EP, mutate: (entries) => upsertPolicyEntry(entries, psid, states.snapshot) });
+      assert.deepEqual([up1.ok, up1.changed], [true, true]);
+      const loaded1 = loadPolicyStore({ endpointId: EP });
+      assert.deepEqual(loaded1.entries[psid], states.snapshot, "读回逐字相等");
+      const upDup = mutatePolicyStore({ endpointId: EP, mutate: (entries) => upsertPolicyEntry(entries, psid, states.snapshot) });
+      assert.deepEqual([upDup.ok, upDup.changed], [true, false], "逐字相等去重幂等");
+      const conflict = mutatePolicyStore({ endpointId: EP, mutate: (entries) => upsertPolicyEntry(entries, psid, states.dialogue) });
+      assert.equal(conflict.ok, false, "同 subject 不同内容 → 冲突拒");
+      assert.equal(conflict.reason, "policy_subject_conflict");
+
+      // —— 存储纪律：0700 / 0600 / 锁释放 ——
+      const epDir = path.join(ledgerDir, EP);
+      assert.equal(fs.statSync(epDir).mode & 0o777, 0o700);
+      assert.equal(fs.statSync(path.join(epDir, "policy.json")).mode & 0o777, 0o600);
+      const relock = acquireLedgerLock(path.join(epDir, "policy.lock"));
+      assert.ok(relock.ok, "mutate 结束锁已释放");
+      releaseLedgerLock(path.join(epDir, "policy.lock"));
+
+      // —— 写端 fail-closed：mutate 产物非法不落盘；mutate 拒透传 ——
+      const badWrite = mutatePolicyStore({ endpointId: EP, mutate: (entries) => ({ ok: true, entries: { ...entries, ["ps_" + "e".repeat(32)]: { ...states.dialogue, extra: 1 } } }) });
+      assert.equal(badWrite.ok, false);
+      assert.match(String(badWrite.detail), /policy_root_keys/u);
+      const noFall = mutatePolicyStore({ endpointId: EP, mutate: () => ({ ok: false, reason: "caller_rejected" }) });
+      assert.deepEqual([noFall.ok, noFall.reason], [false, "caller_rejected"]);
+      const after = loadPolicyStore({ endpointId: EP });
+      assert.deepEqual(after.entries[psid], states.snapshot, "非法写未落盘（原条目仍在、坏条目未进）");
+      assert.equal(Object.keys(after.entries).length, 1);
+
+      // —— 读端 fail-closed：根 schema / 条目非法 / subject 形状 / 上限 / fd 纪律 ——
+      const writeRaw = (endpointId, value) => {
+        const dir = path.join(ledgerDir, endpointId);
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(dir, "policy.json"), typeof value === "string" ? value : JSON.stringify(value));
+      };
+      const EP2 = "endpoint_" + "2".repeat(24), EP3 = "endpoint_" + "3".repeat(24), EP4 = "endpoint_" + "4".repeat(24), EP5 = "endpoint_" + "5".repeat(24), EP6 = "endpoint_" + "6".repeat(24);
+      writeRaw(EP2, { schema_version: "policy-1", endpoint_id: EP2, entries: {}, extra: 1 });
+      assert.equal(loadPolicyStore({ endpointId: EP2 }).reason, "policy_store_root_schema", "根多余键拒");
+      writeRaw(EP2, { schema_version: "policy-9", endpoint_id: EP2, entries: {} });
+      assert.equal(loadPolicyStore({ endpointId: EP2 }).reason, "policy_store_root_schema", "schema_version 拒");
+      writeRaw(EP2, { schema_version: "policy-1", endpoint_id: "endpoint_" + "f".repeat(24), entries: {} });
+      assert.equal(loadPolicyStore({ endpointId: EP2 }).reason, "policy_store_root_schema", "endpoint_id 外键拒");
+      writeRaw(EP2, { schema_version: "policy-1", endpoint_id: EP2, entries: [] });
+      assert.equal(loadPolicyStore({ endpointId: EP2 }).reason, "policy_store_root_schema", "entries 非对象拒");
+      writeRaw(EP2, "not json");
+      assert.equal(loadPolicyStore({ endpointId: EP2 }).reason, "policy_store_parse_failed");
+      writeRaw(EP3, { schema_version: "policy-1", endpoint_id: EP3, entries: { [psid]: { ...states.snapshot, updated_at: "nope" } } });
+      const badEntry = loadPolicyStore({ endpointId: EP3 });
+      assert.equal(badEntry.reason, "policy_entry_invalid");
+      assert.match(String(badEntry.detail), /policy_updated_at/u, "detail 带问题码（opaque）");
+      writeRaw(EP4, { schema_version: "policy-1", endpoint_id: EP4, entries: { notps: states.snapshot } });
+      assert.equal(loadPolicyStore({ endpointId: EP4 }).reason, "policy_store_bad_subject");
+      const many = {};
+      for (let i = 0; i < 513; i += 1) many["ps_" + i.toString(16).padStart(32, "0")] = states.snapshot;
+      writeRaw(EP5, { schema_version: "policy-1", endpoint_id: EP5, entries: many });
+      assert.equal(loadPolicyStore({ endpointId: EP5 }).reason, "policy_store_too_many_entries");
+      writeRaw(EP6, "x".repeat(1024 * 1024 + 1));
+      assert.equal(loadPolicyStore({ endpointId: EP6 }).reason, "policy_store_too_large");
+      // fd 纪律：symlink 与硬链接别名拒（symlink 用独立 EP，别动好例本体）
+      const EP7 = "endpoint_" + "7".repeat(24);
+      writeRaw(EP7, { schema_version: "policy-1", endpoint_id: EP7, entries: {} });
+      const file7 = path.join(ledgerDir, EP7, "policy.json");
+      fs.renameSync(file7, file7 + ".real");
+      fs.symlinkSync(file7 + ".real", file7);
+      assert.equal(loadPolicyStore({ endpointId: EP7 }).reason, "policy_store_not_regular_file", "policy.json 是 symlink 拒");
+      const file = path.join(ledgerDir, EP, "policy.json");
+      fs.linkSync(file, file + ".hard");
+      assert.equal(loadPolicyStore({ endpointId: EP }).reason, "policy_store_not_regular_file", "nlink>1 拒");
+      fs.unlinkSync(file + ".hard");
+      assert.equal(loadPolicyStore({ endpointId: EP }).ok, true, "别名清掉后回到绿");
+
+      // —— 路径安全：endpointId 形状封闭 ——
+      for (const bad of ["../x", "endpoint_" + "g".repeat(24), "", "endpoint_/..", null]) {
+        assert.equal(loadPolicyStore({ endpointId: bad }).reason, "policy_store_bad_endpoint_id");
+        assert.equal(mutatePolicyStore({ endpointId: bad, mutate: (e) => e }).reason, "policy_store_bad_endpoint_id");
+      }
+    } finally {
+      if (savedLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedger;
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
 
 summarySealed = true;
 

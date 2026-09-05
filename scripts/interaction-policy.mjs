@@ -66,6 +66,7 @@ const DIALOGUE_STOP_CONDITIONS = Object.freeze([
   "runtime_failure",
   "human_interrupt",
 ]);
+export { DIALOGUE_STOP_CONDITIONS };
 
 const validDialogueContract = (dialogue) =>
   dialogue.host?.participant_id === "bound_local_target" &&

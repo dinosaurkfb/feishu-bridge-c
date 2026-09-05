@@ -137,7 +137,7 @@ const frozenSourceIdentity = (io, files) => files.map((f) => {
 });
 
 /** 由已物化的 mapping 组装一条 binding 证据（§1 产出；投影 C 的全部输入都在这里）。 */
-const bindingEvidence = ({ bindingId, enabled, root, sessionId, chatId, target, state, generationSource, sourceFiles, sourceIdentity }) => ({
+const bindingEvidence = ({ bindingId, enabled, root, sessionId, chatId, target, state, generationSource, sourceFiles, sourceIdentity, expiresAt, interactionPolicyState }) => ({
   binding_id: bindingId,
   enabled: enabled === false ? false : undefined, // 只在来源真给 false 时带（undefined = 未声明）
   root,
@@ -149,6 +149,11 @@ const bindingEvidence = ({ bindingId, enabled, root, sessionId, chatId, target, 
   // 冻结来源身份（复评 P1-1）：采集时的身份（真实路径 + sha 或 null），与 binding 同生命周期；
   // identitySubset 纯内存匹配它，不再二次读现场。
   source_identity: sourceIdentity,
+  // M1b T4：expires_at / interaction_policy_state 随 binding 证据带走（sidecar renderer 的规范输入；
+  // mapping 层字段此前被 bindingEvidence 丢弃）。缺席归 null：expires_at 为 null 由 renderer fail-closed，
+  // interaction_policy_state 为 null → Mapping 默认条目。
+  expires_at: expiresAt ?? null,
+  interaction_policy_state: interactionPolicyState ?? null,
 });
 
 /* ─────────────────────────── Claude 侧 ─────────────────────────── */
@@ -249,6 +254,8 @@ export function collectClaudeLegacySnapshot({ registryFile, templateFile, now = 
         },
         sourceFiles: [registryFile, templateFile, mapPath],
         sourceIdentity: frozenSourceIdentity(io, [registryFile, templateFile, mapPath]),
+        expiresAt: evolved.mapping.expires_at,
+        interactionPolicyState: evolved.mapping.interaction_policy_state,
       }));
       continue;
     }
@@ -273,6 +280,8 @@ export function collectClaudeLegacySnapshot({ registryFile, templateFile, now = 
         },
         sourceFiles: [registryFile, templateFile],
         sourceIdentity: frozenSourceIdentity(io, [registryFile, templateFile]),
+        expiresAt: evolved.mapping.expires_at,
+        interactionPolicyState: evolved.mapping.interaction_policy_state,
       }));
     }
   }
@@ -404,6 +413,8 @@ export function collectCodexLegacySnapshot({ home, now = Date.now() } = {}) {
       },
       sourceFiles: [regFile, tplFile],
       sourceIdentity: frozenSourceIdentity(io, [regFile, tplFile]),
+      expiresAt: mapping.mapping.expires_at,
+      interactionPolicyState: mapping.mapping.interaction_policy_state,
     }));
   }
 

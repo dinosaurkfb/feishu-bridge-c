@@ -24404,6 +24404,43 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
     assert.ok(TAL.loadLedger(dir, { endpointId: EP }).ok, "seed 出的初始账本自洽");
   };
+  // R37 裁定：M1a 收据逐端点原子启用。接线测试需要让 EP 处于两种收据态：
+  //   · ok（ledger_init done）→ 双写强制（跑 shadow 后缀）；
+  //   · never_initialized（无收据）→ 合法 legacy-only（不写 shadow）。
+  // 故单独建一个与 withRoot 同构但额外把 FEISHU_BRIDGE_MAINTENANCE_DIR 指到 root 下 maint 的夹具。
+  const withRootAndReceipt = (fn) => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tal-wire-")));
+    const savedLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    const savedMaint = process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = root;
+    process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = path.join(root, "maint");
+    const dir = path.join(root, EP);
+    try { return fn(root, dir); }
+    finally {
+      if (savedLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedger;
+      if (savedMaint === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = savedMaint;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  };
+  // 构造一份“ledger_init done”的合法收据 journal（字段与 maintenance/ledger-receipt 判据一致），
+  // 使 endpointReceipt(maintDir, ep).state === "ok"（M1a 已启用）。
+  const seedLedgerInitReceipt = (maintDir, ep) => {
+    fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+    const at = "2026-08-31T12:00:00.000Z";
+    const tok = "da88566e-d8d3-48ba-914e-7f96f4dfaeaa";
+    const sha = "b".repeat(64);
+    const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+    const timerDone = (chain) => ({ id: "timer:" + chain, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+    const stubDone = (chain) => ({ id: "stub:" + chain, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const curDone = (chain) => ({ id: "current:" + chain, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const gateDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+    const enterDone = [timerDone("claude"), timerDone("codex"), stubDone("claude"), stubDone("codex"), curDone("claude"), curDone("codex"), gateDone()];
+    const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+    const ledgerStep = { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState, after: afterState, state: "done", at, chain: "claude" };
+    const doc = { schema_version: "1.2", operation_kind: "ledger_init", token: tok, reason: "seed 收据", started_at: at, updated_at: at, phase: "done", steps: [...enterDone, ledgerStep], notes: [] };
+    fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(doc), { mode: 0o600 });
+    assert.equal(endpointReceipt(maintDir, ep).state, "ok", "seed 出的 ledger_init 收据应判 ok（M1a 已启用）");
+  };
 
   test("账本：init/cutover 是维护层入口，第 1 块生产恒拒（fail-closed）", () => withRoot((root, dir) => {
     assert.equal(TAL.initializeShadow({ endpointId: EP, requestKey: rk(), chain: CH, capability: {} }).reason, "maintenance_capability_required", "init 恒拒");
@@ -25081,8 +25118,9 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
   // §R36 M1a 双写接线：封闭 per-writer 包装层。
   //   锁先导（busy→binding_busy 且 legacy 未跑）→ legacy 先提交 → shadow 序列（固定顺序/派生 key/族正确）→ 释放。
   //   shadow 失败不改变 legacy 成功；同 external id 重放幂等（崩溃续跑）；直接调账本原始写方（绕过包装层）不受 outer 锁约束→反向红线。
-  test("m1a 双写接线：per-writer 包装层——锁先导+legacy 先提交+shadow 族正确+重放幂等+shadow 失败不伤 legacy+busy 拒+直接调原始账本写方绕过包装层不取锁（reverse）", () => withRoot((root, dir) => {
+  test("m1a 双写接线：per-writer 包装层——锁先导+legacy 先提交+shadow 族正确+重放幂等+shadow 失败不伤 legacy+busy 拒+直接调原始账本写方绕过包装层不取锁（reverse）", () => withRootAndReceipt((root, dir) => {
     seedLedger(dir);
+    seedLedgerInitReceipt(path.join(root, "maint"), EP); // M1a 已启用（ledger_init done）→ 双写强制路径
     let legacyCalls = 0;
     const legacyRec = (tag) => () => { legacyCalls += 1; return { tag, legacyCommitted: true }; };
 
@@ -25119,6 +25157,19 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
       assert.equal(w.commit, "not_committed", "未提交");
       assert.equal(legacyCalls, before, "busy 时 legacy 未跑");
       assert.ok(acq.release().ok, "释放");
+    }
+
+    // ③b 已启用端点 + 非 busy 锁失败（shadow 根缺席 → root_absent）→ 同样整笔拒、legacy 未跑（裁定：skip 集为空）。
+    {
+      const savedLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+      process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(root, "no-such-ledger-root");
+      const before = legacyCalls;
+      const w = WIRE.wireCreateA1({ endpointId: EP, env: process.env, legacy: legacyRec("root-absent"), chatId: "oc_ra", sessionId: "sess_ra", messageId: "msg_ra" });
+      process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedger;
+      assert.equal(w.ok, false, "root_absent 锁失败→整笔拒：" + JSON.stringify(w));
+      assert.equal(w.reason, "root_absent", "root_absent");
+      assert.equal(w.commit, "not_committed", "未提交");
+      assert.equal(legacyCalls, before, "root_absent 时 legacy 未跑（不降级）");
     }
 
     // ④ shadow 失败不改变 legacy 成功（回执照常；reason 投影在 shadow[0]）
@@ -25164,21 +25215,33 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     }
   }));
 
-  // §R37 增量：外层锁建立失败（非 busy，如 shadow 根缺/端点目录缺）→ legacy 照跑、shadow 记 skipped、总 ok。
-  //   这是 legacy 权威的铁证：shadow 缺席**不丢 legacy 提交**，只少记一支（投影成因进 shadow[0]）。
-  test("m1a 双写接线：外层锁非 busy 失败（shadow 根缺）→ legacy 照跑 + shadow 记 skipped + 仍 ok（legacy 权威不因 shadow 缺席而丢）", () => withRoot((root, dir) => {
-    const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
-    process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(root, "no-such-shadow-root"); // validateLedgerRoot → root_absent（非 busy）
-    let legacyCalls = 0;
-    const legacyRec = (tag) => () => { legacyCalls += 1; return { tag, legacyCommitted: true }; };
-    const w = WIRE.wireCreateA1({ endpointId: EP, env: process.env, legacy: legacyRec("skip"), chatId: "oc_skip", sessionId: "sess_skip", messageId: "msg_skip" });
-    process.env.FEISHU_BRIDGE_LEDGER_DIR = saved;
-    assert.ok(w.ok, "shadow 缺仍 legacy 成功：" + JSON.stringify(w));
-    assert.equal(legacyCalls, 1, "legacy 已跑");
-    assert.ok(w.legacy && w.legacy.legacyCommitted, "legacy 提交");
-    assert.equal(w.shadow.length, 1, "记一笔 shadow");
-    assert.equal(w.shadow[0].op, "__shadow_skipped", "shadow 标记为跳过");
-    assert.equal(w.shadow[0].ok, false, "跳过投影为失败（成因外显）");
+  // §R37 裁定（Codex）：外层锁 skip 集为空——已启用端点的任一锁失败都不得写 legacy；
+  //   M1a 启用按**收据状态**（endpointReceipt）逐端点判定，不是运行时 root_absent。
+  //   这里验证两条：① never_initialized（无 ledger_init 收据）→ 合法 legacy-only（不取 outer、不写 shadow、无 skip 标记）；
+  //   ② 收据说不清（坏 journal）→ fail-closed（整笔拒、legacy 未跑）。
+  test("m1a 双写接线：M1a 收据状态判定——never_initialized→legacy-only（无 shadow/无标记）；坏收据→fail-closed 整笔拒", () => withRootAndReceipt((root, dir) => {
+    {
+      let legacyCalls = 0;
+      const legacyRec = (tag) => () => { legacyCalls += 1; return { tag, legacyCommitted: true }; };
+      const w = WIRE.wireCreateA1({ endpointId: EP, env: process.env, legacy: legacyRec("legacy-only"), chatId: "oc_lo", sessionId: "sess_lo", messageId: "msg_lo" });
+      assert.ok(w.ok, "legacy-only 仍整体 ok：" + JSON.stringify(w));
+      assert.equal(legacyCalls, 1, "legacy 已跑");
+      assert.ok(w.legacy && w.legacy.legacyCommitted, "legacy 提交");
+      assert.equal(w.shadow.length, 0, "legacy-only 不写 shadow（无标记、无后缀）");
+      assert.equal(w.release, null, "legacy-only 不取 outer 锁、无 release");
+    }
+    {
+      const mdir = path.join(root, "maint");
+      fs.mkdirSync(mdir, { recursive: true });
+      fs.writeFileSync(path.join(mdir, "da88566e-d8d3-48ba-914e-7f96f4dfaeaa.json"), "{ 坏收据");
+      let legacyCalls = 0;
+      const legacyRec = (tag) => () => { legacyCalls += 1; return { tag, legacyCommitted: true }; };
+      const w = WIRE.wireCreateA1({ endpointId: EP, env: process.env, legacy: legacyRec("fail-closed"), chatId: "oc_fc", sessionId: "sess_fc", messageId: "msg_fc" });
+      assert.equal(w.ok, false, "坏收据→整笔拒：" + JSON.stringify(w));
+      assert.equal(w.reason, "m1a_receipt_fail_closed", "fail-closed 原因");
+      assert.equal(w.commit, "not_committed", "未提交");
+      assert.equal(legacyCalls, 0, "fail-closed 时 legacy 未跑");
+    }
   }));
 
   // §3.1 proof-组合校验：直接构造自洽账本（除组合外全过），bad 组合→ledger_corrupt 且 why 命中组合规则；合法组合→ok（不误伤）。

@@ -7,6 +7,8 @@
 //   outer 锁（m1a-order.lock，instance-bound）→ legacy 提交回调 → shadow 序列（固定顺序、
 //   逐笔 request_key 派生表实现，账本裁定 replay/conflict）→ 释放锁。
 //   outer busy → 整笔 binding_busy 拒；shadow 失败**不改变 legacy 成功语义**（回执照常，mismatch 留 doctor）。
+//   M1a 逐端点原子启用（收据状态）：never_initialized → 合法 legacy-only（不取 outer、不写 shadow）；
+//   已启用点任一取锁失败 → 整笔拒（skip 集为空）；收据说不清 → fail-closed。
 // 崩溃续跑：request_key 一律由**持久外部 id**（消息 id / claim key / rotation operation id /
 //   控制 claim key）确定性派生，故同 writer 动作重放命中账本幂等重放、跳过已提交后缀。
 //
@@ -16,6 +18,8 @@ import { acquireOrderLock, requestKeyFor } from "./dual-write.mjs";
 import {
   createA1, createB1, activate, attach, voidPending, unbind, restore, retarget,
 } from "../topic-agent-ledger.mjs";
+import { endpointReceipt } from "../maintenance/ledger-receipt.mjs";
+import { maintenanceDir } from "../maintenance/journal.mjs";
 
 const en = (v) => typeof v === "string" && v.length > 0 && v.length <= 256;
 
@@ -38,24 +42,40 @@ function capture(op, res) {
  *  - 其余锁失败（root_absent/root_symlink/dir_*、maintenance/io_error/lock_residue/reap_* 等）
  *    = shadow 子系统建立不了锁段 → 仍跑 legacy（legacy 不因 shadow 缺席而丢），shadow 记 skipped；
  *  - shadow 序列里任一 op 失败 → 不回改 legacy 成功语义，shadow[i] 投影失败。 */
-// 只有“另一写方正持锁”是合法串行争用→整笔拒；其余锁失败都降级为 legacy-only（legacy 权威）。
-const BUSY_REJECT = new Set(["binding_busy"]);
+// M1a 逐端点原子启用（#R37 裁定补充 §5）：判据是**收据状态**（endpointReceipt），不是运行时 root_absent。
+//   · never_initialized（无 done ledger_init）→ 合法 legacy-only：不取 outer、不写 shadow。
+//   · 收据/账本说不清（冲突/进行中/读不出）→ fail-closed：不得写 legacy-only。
+//   · state === "ok"（ledger_init done）→ 双写强制：**任一取锁失败都不得写 legacy**（错误名不能证明无并发写方）。
+// 已启用点外层锁无降级（裁定：可 skip 的失败集为空）；只有**取得 outer 后**的 shadow 后半程失败，
+// 才保留已成立的 legacy 结果并外显 mismatch（shadow[i] 投影失败）。
 function runWired({ endpointId, env = process.env, legacy, submit }) {
-  const acq = acquireOrderLock(endpointId, env);
-  if (!acq.ok) {
-    if (BUSY_REJECT.has(acq.reason)) return { ok: false, commit: "not_committed", reason: acq.reason ?? "binding_busy", why: acq.why ?? null, lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
-    // shadow 子系统不可用 → legacy 照跑，shadow 跳过（不吞不穿，投影缺因）
+  const recDir = maintenanceDir(env);
+  const receipt = typeof recDir === "string" && recDir.length > 0
+    ? endpointReceipt(recDir, endpointId)
+    : { ok: false, state: "unreadable", why: "维护目录不可派生，M1a 收据不可读（fail-closed）" };
+  if (receipt.state === "never_initialized") {
+    // M1a 未启用 → 合法 legacy-only：不取 outer、不写 shadow 后缀。
     let legacyRes;
     try { legacyRes = legacy(); }
     catch (err) { return { ok: false, commit: "not_committed", reason: "legacy_failed", why: String(err?.message ?? err), legacy: null, shadow: null, release: null }; }
-    return { ok: true, legacy: legacyRes, shadow: [{ op: "__shadow_skipped", ok: false, reason: acq.reason ?? "shadow_unavailable", why: acq.why ?? "外层锁段建立失败，shadow 跳过" }], release: null };
+    return { ok: true, legacy: legacyRes, shadow: [], release: null };
+  }
+  if (!receipt.ok) {
+    // 收据/账本说不清 → fail-closed：不写 shadow 未镜像的 legacy。
+    return { ok: false, commit: "not_committed", reason: "m1a_receipt_fail_closed", why: receipt.why ?? "M1a 收据不可读，fail-closed", legacy: null, shadow: null, release: null };
+  }
+  const acq = acquireOrderLock(endpointId, env);
+  if (!acq.ok) {
+    // 双写强制下任一取锁失败（busy/maintenance/root_*/dir_*/lock_residue/reap_*/io_error）都不得写 legacy。
+    return { ok: false, commit: "not_committed", reason: acq.reason ?? "binding_busy", why: acq.why ?? null, lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
   }
   let result;
   try {
     let legacyRes;
     try { legacyRes = legacy(); }
     catch (err) { return { ok: false, commit: "not_committed", reason: "legacy_failed", why: String(err?.message ?? err), legacy: null, shadow: null, release: null }; }
-    const shadow = submit(legacyRes) ?? [];
+    // legacy 明确未提交（ok:false）→ 无 legacy 结果可镜像 → 不跑 shadow 后缀（不写幽灵记录/标记）。
+    const shadow = legacyRes && legacyRes.ok === false ? [] : (submit(legacyRes) ?? []);
     result = { ok: true, legacy: legacyRes, shadow, release: null };
     return result;
   } finally {

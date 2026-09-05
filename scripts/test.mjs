@@ -22715,7 +22715,7 @@ test("P1-5①：A1 群用当场受验 locator（AILY_CLI_CHANNEL_CHAT_ID），�
 });
 
 
-test("P1-5②：W2 换会话再认领的 ledger 侧 claude_session_id 取真实新 UUID（非固定 null）；真入口红先行——B3 已 active 的 topic 再认领 → 账本 retarget 换新会话 id", () => {
+test("P1-5②：W2 换会话再认领 → rebind_session_alias（只改 aliases.session_id 到受验新 Aily 会话 locator；binding_target 的 claude_session_id 不变、归 Phase 2 配对写方）", () => {
   const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "12345", chat_name: "群", chat_id: "oc_abc", default_freshness_ms: 900000, agent_uid: "agent_x" };
   const at = `<at id="${TPL.transport_open_id}" type="employee">${TPL.transport_agent_name}</at> `;
   const ep = legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid });
@@ -22765,25 +22765,28 @@ test("P1-5②：W2 换会话再认领的 ledger 侧 claude_session_id 取真实�
     const r = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_claim", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir } });
     delete process.env.FEISHU_BRIDGE_LEDGER_DIR; delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
     const ledger = JSON.parse(fs.readFileSync(ledgerFile, "utf-8"));
-    return { local, r, ledger };
+    return { local, r, ledger, root };
   };
   const o = next();
   try {
-    const retarget = Object.values(o.ledger.operations).find((op) => op.op_type === "retarget");
-    assert.ok(retarget, "W2 换会话再认领应产生 retarget 操作（red 先行：置 null 时无此操作）");
+    const rebind = Object.values(o.ledger.operations).find((op) => op.op_type === "rebind_session_alias");
+    assert.ok(rebind, "W2 换会话再认领应产生 rebind_session_alias 操作（red 先行：置 null 时无此操作）");
     // 账本操作无 ok 字段：成功 = result 在场；失败闭环（置 null / bad_external_id）= 不写任何 op。
-    assert.ok(retarget.result, "retarget 应成功（有 result）：" + JSON.stringify(retarget));
-    assert.equal(retarget.result.old_target?.claude_session_id, oldUUID, "retarget 旧会话 id 应为预置 UUID");
-    const newId = retarget.result.new_target?.claude_session_id;
+    assert.ok(rebind.result, "rebind_session_alias 应成功（有 result）：" + JSON.stringify(rebind));
+    assert.equal(rebind.result.old_session_id, "sess_old", "rebind 旧会话 id 应为预置 aliases.session_id");
+    const newId = rebind.result.new_session_id;
     assert.equal(typeof newId, "string", "新会话 id 应为字符串");
-    assert.match(newId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u, "W2 retarget 应铸真实新 UUID（非固定 null），而是：" + newId);
-    assert.notEqual(newId, oldUUID, "新会话 id 不应与旧 id 相同");
-    // B3 账本侧应换成新 id
+    assert.match(newId, /^[A-Za-z0-9_.:@+-]{1,128}$/u, "W2 rebind 新会话 id 应为受验 Aily 会话 locator，而是：" + newId);
+    assert.notEqual(newId, "sess_old", "新会话 id 不应与旧 id 相同");
+    // B3 账本侧应换成新 aliases.session_id；binding_target.claude_session_id 不变（Phase 2 配对写方再 retarget）。
     const b3 = Object.entries(o.ledger.records).map(([, r]) => r).find((r) => r?.kind === "live" && TAL.familyOf(r.facts) === "B3");
     assert.ok(b3, "存在 B3 记录");
-    assert.equal(b3.binding_target?.claude_session_id, newId, "B3 binding_target 应换为新会话 id");
+    assert.equal(b3.aliases?.session_id, newId, "B3 aliases.session_id 应换为新会话 id");
+    assert.equal(b3.binding_target?.claude_session_id, oldUUID, "B3 binding_target.claude_session_id 不变（认领现场不铸临时 UUID、不动 target）");
+    assert.deepEqual(b3.binding_target, { runtime: "claude", project_root: o.root, claude_session_id: oldUUID }, "整体 binding_target 逐字不变（认领路径除 delivery pin 外不碰任何 target 字段）");
   } finally { fs.rmSync(o.local, { recursive: true, force: true }); }
 });
+
 
 // P2-① 真入口 e2e（#R37 返修 P1-1）：已启用端点（ledger_init done 收据）在**认领→绑定**的写入现场
 //   must 过 runWired 的“账本现场核”门 —— ① 账本文件缺席 → m1a_ledger_absent；② cutover 已切（收据
@@ -24924,6 +24927,35 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.equal(talLoad(dir).records[bv].kind, "voided_audit", "B1→voided");
   }));
 
+  // W2 Phase 1（Frank 拍板）：rebind_session_alias —— **只**改当前 B3 的 aliases.session_id 到受验新 Aily 会话 locator；
+  //   不动 binding_target / binding_proof / family / lineage。
+  test("账本 rebind_session_alias（W2 Phase 1）：换会话成功且 target/proof/族不变；换到被另一条 live 记录占用的 session→alias_occupied（fail-closed）", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_rb", rootOm: "om_rb", lineageId: "lin_rb", bindingTarget: TGT }), "B1 rb");
+    const b1 = famIds(talLoad(dir), "B1")[0];
+    talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_rb", sessionId: "sess_rb_old" }), "A1 rb");
+    const a1 = famIds(talLoad(dir), "A1")[0];
+    talOk(TAL.activate({ endpointId: EP, requestKey: rk(), b1Id: b1, a1Id: a1, f4: F4("om_hb"), authorizedBy: "ou_o" }), "activate rb");
+    const b3 = famIds(talLoad(dir), "B3")[0];
+    const before = talLoad(dir).records[b3];
+    // ① W2 换会话：只改 aliases.session_id，target/proof/族全不动（证据：validateLedger 收口 + 记录级断言）。
+    talOk(TAL.rebindSessionAlias({ endpointId: EP, requestKey: rk(), id: b3, expectedOldSessionId: "sess_rb_old", newSessionId: "sess_rb_new", authorizedBy: "ou_o" }), "rebind 换会话");
+    const rb = talLoad(dir).records[b3];
+    assert.equal(rb.aliases.session_id, "sess_rb_new", "aliases.session_id 换新（受验 Aily 会话 locator）");
+    assert.deepEqual(rb.binding_target, before.binding_target, "binding_target 不变（认领现场不铸临时 UUID、不动 target）");
+    assert.equal(rb.binding_proof.kind, "pairing", "binding_proof 仍 pairing（不动）");
+    assert.equal(TAL.familyOf(rb.facts), "B3", "family 仍是 B3（active/current）");
+    assert.equal(rb.origin_operation_id !== before.origin_operation_id, true, "origin_operation_id 换成本笔（R32 全局因果收口）");
+    // ③ 换到被另一条 live 记录的 session → alias_occupied（fail-closed，不猜）。
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_rb2", rootOm: "om_rb2", lineageId: "lin_rb2", bindingTarget: { runtime: "claude", project_root: "/p/x", claude_session_id: uuid(4) } }), "B1 rb2");
+    const b1b = famIds(talLoad(dir), "B1")[0];
+    talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_rb2", sessionId: "sess_rb_occ" }), "A1 rb2");
+    const a1b = famIds(talLoad(dir), "A1")[0];
+    talOk(TAL.activate({ endpointId: EP, requestKey: rk(), b1Id: b1b, a1Id: a1b, f4: F4("om_hb2"), authorizedBy: "ou_o" }), "activate rb2");
+    assert.equal(TAL.rebindSessionAlias({ endpointId: EP, requestKey: rk(), id: b3, expectedOldSessionId: "sess_rb_new", newSessionId: "sess_rb_occ", authorizedBy: "ou_o" }).reason, "alias_occupied", "换到被占用 session → alias_occupied");
+    assert.equal(talLoad(dir).records[b3].aliases.session_id, "sess_rb_new", "alias_occupied 不写账（仍 sess_rb_new）");
+  }));
+
   test("账本：seed 幂等/冲突；指纹重放返回原 result；retarget 跨实体不误判", () => withRoot((root, dir) => {
     seedLedger(dir);
     const iso = "2026-09-04T00:00:00.000Z";
@@ -25943,9 +25975,9 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
 
   // #R37 W1/W2（Frank 拍板）：认领→绑定由 resolver 按 locator 命中目标，按事实分叉——
   //   W1（目标仍 B1 pending）→ create_a1 → activate（标准四项配对证明 + 64hex claimKey + 匹配根 om）；
-  //   W2（目标已 B3 active 再认领换会话）→ retarget（同 root，换 ledger 侧 claude_session_id）。
+  //   W2（目标已 B3 active 再认领换会话）→ rebind_session_alias（**只**改 aliases.session_id 到受验新 Aily 会话 locator）。
   //   行为验证：① 先建 B1（pending）→ wirePromoteBinding → create_a1→activate 归并 B3；
-  //   ② 同一活跃 B3 再 wirePromoteBinding（同 locator、新 session）→ retarget，claude_session_id 换新；
+  //   ② 同一活跃 B3 再 wirePromoteBinding（同 locator、新 session）→ rebind，aliases.session_id 换新、target 不动；
   //   ③ locator 无影记录 → legacy 照常成功、shadow fail-closed（locator_absent、不猜）。
   test("m1a 双写接线：wirePromoteBinding（认领→绑定）——B1 pending→激活成 B3；B3 active→re-target；无影记录→fail-closed", () => withRootAndReceipt((root, dir) => {
     seedLedger(dir);
@@ -25969,18 +26001,20 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
       assert.ok(w.release && w.release.ok, "释放 ok");
     }
 
-    // ② W2：同一活跃 B3 再 wirePromoteBinding（同 locator、新 session）→ retarget（同 root，换 ledger 侧 claude_session_id）。
+    // ② W2：同一活跃 B3 再 wirePromoteBinding（同 locator、新 session）→ rebind_session_alias（**只**改 aliases.session_id）。
     {
       const b3Id = famIds(talLoad(dir), "B3").pop();
       const beforeCsId = talLoad(dir).records[b3Id].binding_target.claude_session_id;
-      const newCsId = uuid(4);
-      const w = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: legacyRec("promote2"), locator: "om_prom", claimKey: claim("r"), sessionId: "sess_r2", authorizedBy: "ou_o", retargetClaudeSessionId: newCsId });
+      const w = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: legacyRec("promote2"), locator: "om_prom", claimKey: claim("r"), sessionId: "sess_r2", authorizedBy: "ou_o" });
       assert.ok(w.ok, "W2 ok：" + JSON.stringify(w));
-      assert.deepEqual(w.shadow.map((s) => s.op), ["retarget"], "W2→retarget（不 activate）");
-      assert.ok(w.shadow[0].ok, "retarget 成功：" + JSON.stringify(w.shadow[0]));
-      assert.equal(talLoad(dir).records[b3Id].binding_target.claude_session_id, newCsId, "ledger 侧 claude_session_id 换新（同 root）");
-      assert.notEqual(talLoad(dir).records[b3Id].binding_target.claude_session_id, beforeCsId, "确实变更");
-      assert.equal(talLoad(dir).records[b3Id].binding_target.project_root, TGT.project_root, "project_root 不变（同 root）");
+      assert.deepEqual(w.shadow.map((s) => s.op), ["rebind_session_alias"], "W2→rebind_session_alias（不 activate/不 retarget）");
+      assert.ok(w.shadow[0].ok, "rebind_session_alias 成功：" + JSON.stringify(w.shadow[0]));
+      const rr = talLoad(dir).records[b3Id];
+      assert.equal(rr.aliases.session_id, "sess_r2", "aliases.session_id 换新（受验 Aily 会话 locator）");
+      assert.equal(rr.binding_target.claude_session_id, beforeCsId, "binding_target.claude_session_id 不变（认领现场不铸临时 UUID、不动 target）");
+      assert.equal(rr.binding_target.project_root, TGT.project_root, "project_root 不变（同 root）");
+      assert.equal(TAL.familyOf(rr.facts), "B3", "仍是 B3（active/current）");
+      assert.equal(rr.binding_proof.kind, "pairing", "binding_proof 仍是 pairing（不动）");
     }
 
     // ③ locator 无影记录 → legacy 照常成功、shadow fail-closed（不猜）。
@@ -25999,7 +26033,9 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     // ④ 红探针（P1-2 收尾）：任意 locator/owner 字符串——即使 locator 命中一个真实 pending B1、且
     //    owner 任意——没有受验 f4（这里 f4 缺省=null）→ 该笔 shadow 拒（bad_f4）、不写配对证明、不归并。
     {
-      talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", rootOm: "om_red", lineageId: "lin_red", bindingTarget: TGT }), "B1（红探针）");
+      // W2 rebind 不改 binding_target，故该 B3 仍占用 TGT；红探针 B1 须用**不同** target 以免 G7（同 target 多 lineage）误伤。
+      const redTgt = { runtime: "claude", project_root: "/Users/dk/p", claude_session_id: uuid(3) };
+      talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", rootOm: "om_red", lineageId: "lin_red", bindingTarget: redTgt }), "B1（红探针）");
       const redB1 = famIds(talLoad(dir), "B1").pop();
       const before = legacyCalls;
       const w = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: legacyRec("promote4"), locator: "om_red", claimKey: claim("q"), sessionId: "sess_q", authorizedBy: "ou_other" });

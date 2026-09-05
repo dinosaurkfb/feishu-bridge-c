@@ -416,9 +416,12 @@ export function isPublishLockStale(lockDir, { staleMs = 5 * 60 * 1000, now = Dat
  * 否则我的锁刚过 staleMs 被别人合法接管，我随后的 rm 删掉的是新实例（评审双进程探针）。
  * owner 不可读**保留现场**（不删）：残骸交给陈旧回收，那边有年龄判断。旧版目录锁没有 token，退回按 pid。
  * reap 锁被别人占着就等最多 waitMs（回收段只有几毫秒）；等不到返回 release_busy，锁留着由陈旧回收处理。
+ * `expectedToken`（#R30）：非 null 时，若本次进程 HELD 对应 token 与之不符（不同 acquisition / 陈旧句柄）→ 直接 not_owner，
+ * 不碰当前持有者；默认 null（其它调用面行为不变）。
  */
-export function releasePublishLock(lockDir, { waitMs = 500 } = {}) {
+export function releasePublishLock(lockDir, { waitMs = 500, expectedToken = null } = {}) {
   const mine = HELD.get(lockDir) ?? null;
+  if (expectedToken !== null && mine !== expectedToken) return { ok: false, reason: "not_owner", pid: null };
   const pre = readLockOwner(lockDir);
   if (!pre.present) { HELD.delete(lockDir); return { ok: true, absent: true }; }
   const done = withReapLock(lockDir, () => {

@@ -23,31 +23,34 @@ export function m1aOrderLockPath(endpointId, env = process.env) {
 }
 
 /**
- * 释放投影（#R29 P1.2）：把 absent / not_owner / reapUncleared / 异常**全部折进最终结果**，绝不吞不穿。
- *   absent        → lock_lost（主锁在持有期间已缺席）；not_owner → lock_instance_replaced（被接管）。
+ * 释放投影（#R30 P2：**结构化 {reason, path, error}**，不折成单字符串；#R29 P1.2 仍把每支折进结果，绝不吞不穿）。
+ *   absent        → {ok:false, reason:"lock_lost"}（主锁在持有期间已缺席）；not_owner → {ok:false, reason:"lock_instance_replaced"}（被接管）。
  *   二者都意味着「本次写段的独占性无法证明」，必须让调用方非零收场（评审探针：曾被当作成功）。
- *   释放抛错（EIO / EPERM…）不裸抛（评审探针：EIO 曾从释放阶段穿出去）。
+ *   release_busy → {ok:false, reason:"release_busy"}；reapUncleared → {ok:false, reason:"reap_uncleared", path:<.reaped-<uuid>>, error}。
+ *   释放抛错（EIO / EPERM…）不裸抛（评审探针：EIO 曾从释放阶段穿出去），折成 {ok:false, reason:"release_threw", error}。
+ *   `expectedToken`（#R30 P1.3）绑定本次 acquisition：不同 / 陈旧句柄释放 → not_owner → lock_instance_replaced（不碰当前持有者）。
  */
 function releaseCore(lock, opts = {}) {
   try {
-    const rel = releasePublishLock(lock, { waitMs: opts.waitMs });
-    if (rel?.reapUncleared) return { ok: false, why: "reap_uncleared：" + String(rel.reapUncleared.error ?? ""), path: rel.reapUncleared.path, lock };
-    if (rel?.ok && rel.absent) return { ok: false, why: "lock_lost：主锁在持有期间已缺席（被删除或回收）—— 本次写段的独占性无法证明，请人工核对", path: lock, lock };
+    const rel = releasePublishLock(lock, { waitMs: opts.waitMs, expectedToken: opts.expectedToken ?? null });
+    if (rel?.reapUncleared) return { ok: false, reason: "reap_uncleared", path: rel.reapUncleared.path, error: rel.reapUncleared.error ?? null, why: "reap_uncleared：" + String(rel.reapUncleared.error ?? ""), lock };
+    if (rel?.ok && rel.absent) return { ok: false, reason: "lock_lost", path: lock, error: null, why: "lock_lost：主锁在持有期间已缺席（被删除或回收）—— 本次写段的独占性无法证明，请人工核对", lock };
     if (rel?.ok) return { ok: true, lock };
-    if (rel?.reason === "not_owner") return { ok: false, why: "lock_instance_replaced：锁已被别的实例持有（本次持有期间被接管）—— 本次写段的独占性无法证明，请人工核对", path: lock, lock };
-    if (rel?.reason === "release_busy") return { ok: false, why: "release_busy：归属转换段被别人占用（回收段只有几毫秒），锁未释放—— 请重试或人工核对", path: lock, lock };
-    return { ok: false, why: "release_failed：" + String(rel?.reason ?? "unknown"), path: lock, lock };
+    if (rel?.reason === "not_owner") return { ok: false, reason: "lock_instance_replaced", path: lock, error: null, why: "lock_instance_replaced：锁已被别的实例持有（本次持有期间被接管）—— 本次写段的独占性无法证明，请人工核对", lock };
+    if (rel?.reason === "release_busy") return { ok: false, reason: "release_busy", path: lock, error: null, why: "release_busy：归属转换段被别人占用（回收段只有几毫秒），锁未释放—— 请重试或人工核对", lock };
+    return { ok: false, reason: "release_failed", path: lock, error: rel?.reason ?? null, why: "release_failed：" + String(rel?.reason ?? "unknown"), lock };
   } catch (err) {
-    return { ok: false, why: "release_threw：" + String(err?.code ?? err?.message ?? err), path: lock, lock };
+    return { ok: false, reason: "release_threw", path: lock, error: err?.code ?? (err?.message ?? err) ?? null, why: "release_threw：" + String(err?.code ?? err?.message ?? err), lock };
   }
 }
 
 /**
  * 取外层排序锁：走 registry 发布锁协议（**带维护门**，门在→取不到锁）。
- * #R29 P1.2：staleMs 默认 ∞ —— **只按持有者 pid 活性接管**（同 install-surface），
- * 时间不构成陈旧判据（m1a 写段可长，活着就不该被抢）；reapUnrecognized=false（未知形状交人工）。
- * return 带 `release()` 闭包，**按取得时 acq.lock 释放**（#R29 P1.2「按取得时 acq.lock 释放」）。
- * 拿不到一律受控返回：maintenance | binding_busy | lock_residue | reaped_uncleared/reap_uncleared | io_error。
+ * #R30 P1.2：staleMs **硬编码 ∞**（生产不可覆盖）—— **只按持有者 pid 活性接管**（同 install-surface），
+ * 时间不构成陈旧判据（m1a 写段可长，活着就不该被抢；探针：活锁+老 at+staleMs:0 曾被接管）。
+ * now/afterReap 仅测试注入，不影响 staleMs；reapUnrecognized=false（未知形状交人工）。
+ * return 带 `release()` 闭包，**绑定本次 acquisition 的 token**（#R30 P1.3，不透明 instance-bound handle），
+ * 只经它释放；拿不到一律受控返回：maintenance | binding_busy | lock_residue | reaped_uncleared/reap_uncleared | io_error。
  * 残骸 reason/path/error **保留原语原样**（#R29 P2.1：.reaped-<uuid> / .reap 不折成主锁路径）。
  */
 export function acquireOrderLock(endpointId, env = process.env, opts = {}) {
@@ -55,11 +58,11 @@ export function acquireOrderLock(endpointId, env = process.env, opts = {}) {
   if (!p.ok) return { ok: false, reason: p.reason, why: p.why ?? null, lock: null };
   let r;
   try {
-    r = acquirePublishLock(p.lock, { staleMs: opts.staleMs ?? Number.POSITIVE_INFINITY, now: opts.now, afterReap: opts.afterReap, reapUnrecognized: false });
+    r = acquirePublishLock(p.lock, { staleMs: Number.POSITIVE_INFINITY, now: opts.now, afterReap: opts.afterReap, reapUnrecognized: false });
   } catch (err) {
     return { ok: false, reason: "io_error", why: "锁原语抛错：" + String(err?.code ?? err?.message ?? err), path: p.lock };
   }
-  if (r.ok) return { ok: true, token: r.token, lock: p.lock, release: () => releaseCore(p.lock, opts) };
+  if (r.ok) return { ok: true, token: r.token, lock: p.lock, release: () => releaseCore(p.lock, { waitMs: opts.waitMs, expectedToken: r.token }) };
   if (r.reason === "maintenance") return { ok: false, reason: "maintenance", gate: r.gate, text: r.text, lock: p.lock };
   if (r.reason === "publisher_busy") return { ok: false, reason: "binding_busy", path: p.lock, why: "另一个写方正持有 m1a-order 锁" };
   if (r.reason === "lock_residue") return { ok: false, reason: "lock_residue", path: r.path ?? p.lock, error: r.error ?? null, why: "锁位置形状不对（不是本协议的 symlink payload）—— 只人工处置" };
@@ -67,16 +70,6 @@ export function acquireOrderLock(endpointId, env = process.env, opts = {}) {
   return { ok: false, reason: r.reason ?? "lock_failed", path: p.lock, error: r.error ?? null, why: r.error ?? null };
 }
 
-/**
- * 释放外层排序锁。**推荐**用 acquire 返回的 `acq.release()` 闭包（按取得时的锁释放）；
- * 本函数是给只有 endpointId、不保留锁句柄的调用方的便利入口（同 endpoint → 同一锁路径）。
- * 释放结果按 releaseCore 投影，绝不抛、绝不把「独占性已丢」报成 ok。
- */
-export function releaseOrderLock(endpointId, env = process.env, opts = {}) {
-  const p = m1aOrderLockPath(endpointId, env);
-  if (!p.ok) return { ok: false, reason: p.reason, why: p.why ?? null };
-  return releaseCore(p.lock, opts);
-}
 
 /* ── request_key 派生（§5.1 通式） ───────────────────────────── */
 

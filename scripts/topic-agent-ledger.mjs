@@ -260,9 +260,20 @@ function proofCombinationProblem(rec, id, doc) {
     if (bpKind !== "migrated" && bpKind !== "retarget" && bpKind !== "attach") return "link=migrated 的 binding 只能是 migrated/retarget/attach(A3 继承)";
     if (bpKind === "attach") {
       const fam = familyOf(rec.facts);
-      if (fam !== "A3") return "(attach, migrated) 只在 A3 继承合法";
       const op = doc.operations[rec.origin_operation_id];
-      if (!op || op.op_type !== "attach_a3" || op.result?.affected_id !== id) return "(attach, migrated) 需 A3 继承 origin=attach_a3(affected_id=id)";
+      if (fam === "A3") {
+        // A3 直接：origin 必须是把它置成 A3(attach) 的 attach_a3（affected_id=id）。
+        if (!op || op.op_type !== "attach_a3" || op.result?.affected_id !== id) return "(attach, migrated) 需 A3 继承 origin=attach_a3(affected_id=id)";
+      } else if (fam === "A4") {
+        // #R30 P1.1：A4 经 A3 的**合法 unbind** 继承——unbind/restore 保持 proof（规格 §3.1「A4 继承 migrated 合法」）。
+        //   判据：origin=unbind(terminal_family=A4, affected_id=id)，且账本确有把本 id 置成 A3(attach) 的 attach_a3 op
+        //   （否则 attach binding 无从谈起，只是伪造）。migrate B4→unbind→attach(A3)→unbind 第四笔即此。
+        if (!op || op.op_type !== "unbind" || op.result?.terminal_family !== "A4" || op.result?.affected_id !== id) return "(attach, migrated) 的 A4 需经合法 unbind(terminal_family=A4, affected_id=id) 继承 A3";
+        const hadAttachA3 = Object.keys(doc.operations).some((k) => { const o = doc.operations[k]; return o.op_type === "attach_a3" && o.result?.affected_id === id; });
+        if (!hadAttachA3) return "(attach, migrated) 的 A4 需 A3 继承：账本无该 id 的 attach_a3 op 支撑 attach binding";
+      } else {
+        return "(attach, migrated) 只在 A3 继承 / A4 继承合法";
+      }
       const lp = rec.locator_link_proof_ref;
       const mop = doc.operations[lp.migration_operation_id];
       if (!mop || (mop.op_type !== "migrate_seed" && mop.op_type !== "migrate_repair")) return "(attach, migrated) 的 link 未指向合法 migrate op";

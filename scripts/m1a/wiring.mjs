@@ -193,12 +193,18 @@ export function wireAttach({ endpointId, env = process.env, legacy, claimKey, id
  * wireRotate —— rotate（建新代际）→ 账本 create_b1。
  * ext=rotation operation id（topic-generation 既有、持久）；entity=lineage id。
  */
-export function wireRotate({ endpointId, env = process.env, legacy, rotationOpId, lineageId, chatId, rootOm, bindingTarget, now = Date.now() }) {
+/**
+ * wireRotate —— rotate（建新代际）→ 账本 create_b1。
+ * ext=rotation operation id（topic-generation 既有、持久）；entity=lineage id。
+ * rootOm 二选一：优先从 legacyRes.root_message_id 取（轮转的 topic 根消息在 legacy 闭包里由
+ *   sendToChat 创建，锁必须在它之前取——W3），缺省才回退到静态 rootOm 参数。 */
+export function wireRotate({ endpointId, env = process.env, legacy, rotationOpId, lineageId, chatId, rootOm = null, bindingTarget, now = Date.now() }) {
   return runWired({ endpointId, env, legacy, submit: (legacyRes) => {
-    if (!en(rotationOpId) || !en(lineageId)) return [{ op: "create_b1", ok: false, reason: "bad_external_id", why: "rotationOpId/lineageId 必填 1..256 字符串" }];
+    const om = (typeof legacyRes === "object" && legacyRes && legacyRes.root_message_id) ? legacyRes.root_message_id : rootOm;
+    if (!en(rotationOpId) || !en(lineageId) || !en(om)) return [{ op: "create_b1", ok: false, reason: "bad_external_id", why: "rotationOpId/lineageId/rootOm 必填 1..256 字符串" }];
     const k = rk("create_b1", rotationOpId, lineageId);
     if (!k.ok) return [{ op: "create_b1", ...k }];
-    return [capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm, lineageId, bindingTarget, now, env }))];
+    return [capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm: om, lineageId, bindingTarget, now, env }))];
   } });
 }
 

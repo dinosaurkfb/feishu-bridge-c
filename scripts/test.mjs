@@ -25172,12 +25172,12 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
       assert.equal(legacyCalls, before, "root_absent 时 legacy 未跑（不降级）");
     }
 
-    // ④ shadow 失败不改变 legacy 成功（回执照常；reason 投影在 shadow[0]）
+    // ④ shadow 失败不改变 legacy 成功（回执照常；reason 投影在 shadow[0]）——用仍写 shadow 的 writer（wireVoid）演示
     {
-      const w = WIRE.wirePauseResume({ endpointId: EP, env: process.env, legacy: legacyRec("poor"), controlClaimKey: claim("f"), id: tid("0"), mode: "pause" });
+      const w = WIRE.wireVoid({ endpointId: EP, env: process.env, legacy: legacyRec("poor"), rotationOpId: claim("f"), locator: "om_never", reason: "manual" });
       assert.ok(w.ok, "legacy 成功→整体 ok：" + JSON.stringify(w));
       assert.ok(w.legacy && w.legacy.legacyCommitted, "legacy 已提交");
-      assert.equal(w.shadow[0].ok, false, "shadow unbind 对不存在 id 失败");
+      assert.equal(w.shadow[0].ok, false, "shadow void 对不存在 locator 失败");
       assert.ok(w.shadow[0].reason, "shadow 失败投影自身结构化 reason：" + JSON.stringify(w.shadow[0]));
     }
 
@@ -25201,17 +25201,18 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
       assert.equal(TAL.familyOf(talLoad(dir).records[b1Id].facts), "B3", "归并→B3");
     }
 
-    // ⑦ wirePauseResume：pause→B3'，resume→B3（族方向正确）
+    // ⑦ wirePauseResume = W4 对账兜底行（P1-3③）：只取 outer 锁、不写 shadow（不实时双写，doctor+repair 兜底）
     {
       const b3Id = famIds(talLoad(dir), "B3").pop();
+      const priorFamily = TAL.familyOf(talLoad(dir).records[b3Id].facts);
       const p = WIRE.wirePauseResume({ endpointId: EP, env: process.env, legacy: legacyRec("pause"), controlClaimKey: claim("e"), id: b3Id, mode: "pause" });
       assert.ok(p.ok, "pause ok：" + JSON.stringify(p));
-      assert.deepEqual(p.shadow.map((s) => s.op), ["unbind"], "pause→unbind");
-      assert.equal(TAL.familyOf(talLoad(dir).records[b3Id].facts), "B3'", "pause→B3'");
+      assert.equal(p.shadow.length, 0, "pause → W4 不写 shadow（shadow=[]）");
+      assert.equal(TAL.familyOf(talLoad(dir).records[b3Id].facts), priorFamily, "pause 不实时翻族（对账兜底）");
       const r = WIRE.wirePauseResume({ endpointId: EP, env: process.env, legacy: legacyRec("resume"), controlClaimKey: claim("e"), id: b3Id, mode: "resume" });
       assert.ok(r.ok, "resume ok：" + JSON.stringify(r));
-      assert.deepEqual(r.shadow.map((s) => s.op), ["restore"], "resume→restore");
-      assert.equal(TAL.familyOf(talLoad(dir).records[b3Id].facts), "B3", "resume→B3");
+      assert.equal(r.shadow.length, 0, "resume → W4 不写 shadow（shadow=[]）");
+      assert.equal(TAL.familyOf(talLoad(dir).records[b3Id].facts), priorFamily, "resume 不实时翻族（对账兜底）");
     }
   }));
 
@@ -25276,6 +25277,38 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
       assert.equal(w.ok, false, "② cutover 收据 → 整笔拒：" + JSON.stringify(w));
       assert.equal(w.reason, "m1a_mode_not_shadow", "m1a_mode_not_shadow");
       assert.equal(legacyCalls, 0, "② cutover 后 legacy 零调用");
+    }
+  }));
+
+  // P1-3③/W4（#R37 返修）：连接暂停/恢复、enabled 翻转 = W4 对账兜底行 —— 只取 outer 锁、不写 shadow 事务
+  //   （对账兜底=无双写，但不是无锁；绕过 outer 就穿了 cutover 快照窗口）。wireEnabledFlip 关闭 enum：非法 mode 拒。
+  //   红测试：pause/resume/disable/enable 都 shadow=[]；非法 mode（freeze）→ bad_mode 拒。
+  test("m1a 双双写接线：W4 对账兜底行（P1-3③）——pause/resume/disable/enable 只取 outer 锁、shadow=[]；非法 mode→bad_mode 拒", () => withRootAndReceipt((root, dir) => {
+    seedLedger(dir);
+    seedLedgerInitReceipt(path.join(root, "maint"), EP);
+    const legacyRec = (tag) => () => { return { tag, legacyCommitted: true }; };
+    for (const mode of ["pause", "resume"]) {
+      const w = WIRE.wirePauseResume({ endpointId: EP, env: process.env, legacy: legacyRec(mode), controlClaimKey: claim("a"), id: tid("1"), mode });
+      assert.ok(w.ok, mode + " ok：" + JSON.stringify(w));
+      assert.equal(w.shadow.length, 0, mode + " → W4 不写 shadow（shadow=[]）");
+      assert.ok(w.release && w.release.ok, mode + " 释放 ok（P1-6 联动）");
+    }
+    for (const mode of ["disable", "enable"]) {
+      const w = WIRE.wireEnabledFlip({ endpointId: EP, env: process.env, legacy: legacyRec(mode), controlClaimKey: claim("b"), id: tid("2"), mode });
+      assert.ok(w.ok, mode + " ok：" + JSON.stringify(w));
+      assert.equal(w.shadow.length, 0, mode + " → W4 不写 shadow（shadow=[]）");
+      assert.ok(w.release && w.release.ok, mode + " 释放 ok");
+    }
+    {
+      const w = WIRE.wireEnabledFlip({ endpointId: EP, env: process.env, legacy: legacyRec("x"), controlClaimKey: claim("c"), id: tid("3"), mode: "freeze" });
+      assert.equal(w.ok, false, "freeze → 拒：" + JSON.stringify(w));
+      assert.equal(w.reason, "bad_mode", "非法 mode → bad_mode（enum 关闭）");
+      assert.equal(w.commit, "not_committed", "未提交");
+    }
+    {
+      const w = WIRE.wirePauseResume({ endpointId: EP, env: process.env, legacy: legacyRec("x"), controlClaimKey: claim("d"), id: tid("4"), mode: "freeze" });
+      assert.equal(w.ok, false, "pause freeze → 拒：" + JSON.stringify(w));
+      assert.equal(w.reason, "bad_mode", "非法 mode → bad_mode");
     }
   }));
 

@@ -288,9 +288,9 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
 | legacy 写方（实际入口） | 账本事务 | request_key 派生（五轮 P1-3：逐 op 全定义） |
 | --- | --- | --- |
 | 两链所有 A1 物化入口（任一受验首条 @ 的 chat 记录——不由 Dialogue policy 限定，八轮 P2-2） | create_a1 | ext=入站 message id；**entity=受验 Aily session locator**（预先确定，非随机 ta id） |
-| bind/认领（claim→绑定：引用码、@ 配对） | create_a1 → activate（固定顺序） | 同一 claim：ext=claim key；create_a1 entity=session locator、activate entity=B1 topic_agent_id——两笔 key 确定性派生且不同 |
+| bind/认领（claim→绑定：引用码、@ 配对） | create_a1 → activate（固定顺序）。**W1**：认领在 chat/sender/body(码)/thread_root 四维真实匹配 → f4={matched_om:被引根消息 om, matched_fields:标准四项}（G15 零扩展）、authorized_by=event.sender_id。**W2：再认领（B3 已 active 换会话）= retarget**（同 root），不走 activate | 同一 claim：ext=claim key；create_a1 entity=session locator、activate entity=B1 topic_agent_id——两笔 key 确定性派生且不同 |
 | 显式 attach（终端） | attach | ext=控制 claim key（终端命令 claim 机制既有、持久）；entity=目标 id |
-| rotate（建新代际） | create_b1 | ext=rotation operation id（topic-generation 既有、持久）；entity=lineage id |
+| rotate（建新代际） | create_b1。**W3**：outer 取锁**前置到 sendToChat 之前**（写事务从首个外显副作用起算；锁取不到话题不发、无孤儿、不降级） | ext=rotation operation id（topic-generation 既有、持久）；entity=lineage id |
 | rotate cancel / pending 过期 | void | 同上 |
 | 连接暂停/恢复（binding_status paused/active 翻转的写方——topic-generation state 写入口；五轮 P2-2 更正：非 /feishu-mode，mode 属 policy 域） | unbind / restore（只动 current B3；历史 B4 不动） | ext=该次终端命令的**持久控制 claim key / 命令审计 id**（禁止临时随机）；entity=目标 id |
 | retarget（owner 终端） | retarget | 同上 |

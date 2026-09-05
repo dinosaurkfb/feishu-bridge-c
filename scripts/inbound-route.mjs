@@ -61,6 +61,9 @@ export const PROMOTE_REJECT = {
   TRANSPORT_NOT_MENTIONED: "transport_not_mentioned",
   STALE_MESSAGE: "stale_message",
   MALFORMED_TEMPLATE: "malformed_template",
+  // P1-2（F4）：认领的 chat 维真实匹配。channel-locator-verdict.md：AILY_CLI_CHANNEL_CHAT_ID 就是飞书 chat_id
+  // （可信），与待绑定所在群不一致 → 四维不成立，硬拒（不落 chat 兜底——在错误的群里答错地方）。
+  CHAT_MISMATCH: "chat_mismatch",
 };
 
 export const PROMOTE_REJECT_TEXT = {
@@ -74,6 +77,7 @@ export const PROMOTE_REJECT_TEXT = {
   [PROMOTE_REJECT.TRANSPORT_NOT_MENTIONED]: "没有真实 @ 本链路的运输 agent",
   [PROMOTE_REJECT.STALE_MESSAGE]: "消息超出时效窗口",
   [PROMOTE_REJECT.MALFORMED_TEMPLATE]: "机器级链路配置不完整",
+  [PROMOTE_REJECT.CHAT_MISMATCH]: "这条认领的聊天群与待绑定项目所在群不一致",
 };
 
 /** 登记表里每个项目解析一遍。解析不出来的静默跳过 —— 一个项目配坏了不该让别的项目也收不到消息。 */
@@ -345,6 +349,21 @@ export function evaluatePromotion({ event, template, pending, now = Date.now(), 
   if (now - createdMs > freshness) return reject(PROMOTE_REJECT.STALE_MESSAGE);
 
   if (!pending?.ok) return reject(pending?.reason ?? PROMOTE_REJECT.NO_PENDING, { ids: pending?.ids });
+
+  // P1-2（F4）：四维真实匹配——chat / sender / body(码) / thread_root。sender 与 @ 在上方闸已验；
+  // findPendingBinding 已按正文绑定码收敛 pending（body 维）；thread_root 由 pending 锚定（
+  // pending.generation.root_message_id = matched_om），不经 env。这里只补 **chat** 维：
+  //   channel-locator-verdict.md §2（2026-09-02 真机对照）：AILY_CLI_CHANNEL_CHAT_ID 就是飞书 chat_id（可信）；
+  //   AILY_CLI_CHANNEL_THREAD_ID 则只是 Aily 命名空间 thread 标识（不是飞书 thread/root locator）——
+  //   所以 thread_root 不能从 env 比对，只能经 pending 锚定（上方 findPendingBinding 已锚）。
+  // 判据（fail-safe）：env chat 存在且与待绑定所在群不一致 → 拒（这条认领在错误的群里，四维不成立）；
+  //   env chat 缺失（未可核验）→ 照常放行，chat 维由 shadow（selectPendingSubscriptionClaim）
+  //   记 scope_unverified:["chat_id"]（ledger binding_proof 是封闭五项，不含该诊断字段）。不把缺失当匹配。
+  const envChat = typeof env?.AILY_CLI_CHANNEL_CHAT_ID === "string" ? env.AILY_CLI_CHANNEL_CHAT_ID : "";
+  const bindingChat = pending?.entry?.chat_id ?? pending?.config?.chat_id ?? template?.chat_id;
+  if (envChat.length > 0 && typeof bindingChat === "string" && bindingChat.length > 0 && envChat !== bindingChat) {
+    return reject(PROMOTE_REJECT.CHAT_MISMATCH, { chat: envChat, expected: bindingChat });
+  }
 
   return {
     ok: true,

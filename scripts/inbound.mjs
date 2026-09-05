@@ -12,6 +12,7 @@
  */
 
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import { displaySafe } from "./display-safe.mjs";
 import fs from "node:fs";
 import os from "node:os";
@@ -460,8 +461,9 @@ if (!routed.ok) {
   //   收据）以 m1a-order 锁串行、先 legacy promoteBinding 后 create_a1→activate（W1）/ retarget（W2）shadow；
   //   未启用端点（无收据）→ 合法 legacy-only、不写 shadow；已启用点任一取锁失败 → 整笔披、不写 legacy（skip 集为空）。
   //   locator=被认领代际根消息 om（matched_om）；claimKey=claim.mjs 64hex；authorizedBy=event.sender_id。
-  //   W2 的 ledger 侧 claude_session_id 与 Aily session locator 不同构，且在认领现场尚不存在——retargetClaudeSessionId
-  //   先置 null，目标万一 active 会 fail-closed（不猜）；正常认领都是 pending→W1。
+  //   W2（B3 已 active 换会话再认领）的 ledger 侧 claude_session_id 与 Aily session locator 不同构，
+  //   且在认领现场尚不存在——P1-5②（#R37）：不再置 null（那会让 W2 fail-closed），而是为新认领会话
+  //   铸一个真实新 UUID（ledger 侧 claude_session_id），让 retarget 有据可依。
   const wired = wirePromoteBinding({
     endpointId: legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid }),
     env: process.env,
@@ -477,7 +479,7 @@ if (!routed.ok) {
     claimKey: claimKey(event.message_id ?? "", promo.id ?? ""),
     sessionId: event.session_id ?? null,
     authorizedBy: event.sender_id ?? null,
-    retargetClaudeSessionId: null,
+    retargetClaudeSessionId: crypto.randomUUID(),
     f4: promo.f4 ?? null,
   });
   if (!wired.ok) {

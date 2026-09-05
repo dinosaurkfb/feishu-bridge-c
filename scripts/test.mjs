@@ -22715,6 +22715,77 @@ test("P1-5①：A1 群用当场受验 locator（AILY_CLI_CHANNEL_CHAT_ID），�
 });
 
 
+test("P1-5②：W2 换会话再认领的 ledger 侧 claude_session_id 取真实新 UUID（非固定 null）；真入口红先行——B3 已 active 的 topic 再认领 → 账本 retarget 换新会话 id", () => {
+  const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "12345", chat_name: "群", chat_id: "oc_abc", default_freshness_ms: 900000, agent_uid: "agent_x" };
+  const at = `<at id="${TPL.transport_open_id}" type="employee">${TPL.transport_agent_name}</at> `;
+  const ep = legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid });
+  const oldUUID = "11111111-1111-1111-1111-111111111111";
+  // 真入口 M1a 夹具：全新 temp，起 ledger（shadow）+"ledger_init done"收据（M1a 已启用），
+  // 先在账本里预置一个 ACTIVE B3（root_om=om_prom、binding_target.claude_session_id=oldUUID），
+  // 再走 aily-inbound.mjs 认领（目标 topic 已 active → 换会话再认领 → W2 retarget）。
+  const next = () => {
+    const local = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "p15b-")));
+    const root = path.join(local, "project"); const bin = path.join(local, "bin");
+    fs.mkdirSync(root, { recursive: true }); fs.mkdirSync(bin);
+    const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
+    fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, senders: [] }));
+    // status=active（binding_status 合法）+ inbound_state=pending（代际仍是 pending）→ 认领走 claim 路径。
+    fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "prom", root, name: "待认领", root_message_id: "om_prom", expires_at: "2099-01-01T00:00:00Z", inbound_state: "pending", session_id: null, status: "active", bound_at: "2026-08-20T00:01:00.000Z" }] }));
+    const ledgerRoot = path.join(local, "ledger"); const maintDir = path.join(local, "maint");
+    const ledgerFile = path.join(ledgerRoot, ep, "ledger.json");
+    // 初始 shadow 账本（initialize_shadow）。
+    fs.mkdirSync(path.join(ledgerRoot, ep), { recursive: true, mode: 0o700 });
+    const opId = "00000000-0000-0000-0000-000000000001";
+    fs.writeFileSync(ledgerFile, JSON.stringify({ schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: ep, chain: "claude", authority_mode: "shadow", revision: 1, operations: { [opId]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: ep, chain: "claude" }), result_revision: 1, result: { revision: 1 } } }, records: {} }, null, 2) + "\n", { mode: 0o600 });
+    // ledger_init done 收据（M1a 已启用）。
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
+    process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = maintDir;
+    fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+    const ats = "2026-08-31T12:00:00.000Z"; const tok = "da88566e-d8d3-48ba-914e-7f96f4dfaeaa"; const sha = "b".repeat(64);
+    const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+    const tDone = (c) => ({ id: "timer:" + c, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: ats, chain: null });
+    const sDone = (c) => ({ id: "stub:" + c, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at: ats, chain: null });
+    const cDone = (c) => ({ id: "current:" + c, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at: ats, chain: null });
+    const gDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at: ats, chain: null });
+    const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+    const lStep = { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState, after: afterState, state: "done", at: ats, chain: "claude" };
+    fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: tok, reason: "seed", started_at: ats, updated_at: ats, phase: "done", steps: [...["claude", "codex"].flatMap((c) => [tDone(c), sDone(c), cDone(c)]), gDone(), lStep], notes: [] }), { mode: 0o600 });
+    assert.equal(endpointReceipt(maintDir, ep).state, "ok", "seed 收据应判 ok（M1a 已启用）");
+    // 预置 ACTIVE B3（root_om=om_prom）。
+    const b1 = TAL.createB1({ endpointId: ep, requestKey: "req_seed_b1", chatId: TPL.chat_id, rootOm: "om_prom", lineageId: "lin_prom", bindingTarget: { runtime: "claude", project_root: root, claude_session_id: oldUUID } });
+    assert.ok(b1.ok, "createB1：" + JSON.stringify(b1));
+    const a1 = TAL.createA1({ endpointId: ep, requestKey: "req_seed_a1", chatId: TPL.chat_id, sessionId: "sess_old" });
+    assert.ok(a1.ok, "createA1：" + JSON.stringify(a1));
+    const act = TAL.activate({ endpointId: ep, requestKey: "req_seed_act", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: { matched_om: "om_prom", matched_fields: ["chat_id", "sender", "body", "thread_root"] }, authorizedBy: TPL.frank_sender_id });
+    assert.ok(act.ok, "activate：" + JSON.stringify(act));
+    fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+    fs.writeFileSync(path.join(bin, "claude"), ["#!/usr/bin/env node", "process.stdout.write('回答：ok\\n');"].join("\n") + "\n", { mode: 0o700 });
+    fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_p15b_1", sessionID: "aily_dm", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + "绑定该话题" } }) }] });
+    const r = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_claim", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir } });
+    delete process.env.FEISHU_BRIDGE_LEDGER_DIR; delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
+    const ledger = JSON.parse(fs.readFileSync(ledgerFile, "utf-8"));
+    return { local, r, ledger };
+  };
+  const o = next();
+  try {
+    const retarget = Object.values(o.ledger.operations).find((op) => op.op_type === "retarget");
+    assert.ok(retarget, "W2 换会话再认领应产生 retarget 操作（red 先行：置 null 时无此操作）");
+    // 账本操作无 ok 字段：成功 = result 在场；失败闭环（置 null / bad_external_id）= 不写任何 op。
+    assert.ok(retarget.result, "retarget 应成功（有 result）：" + JSON.stringify(retarget));
+    assert.equal(retarget.result.old_target?.claude_session_id, oldUUID, "retarget 旧会话 id 应为预置 UUID");
+    const newId = retarget.result.new_target?.claude_session_id;
+    assert.equal(typeof newId, "string", "新会话 id 应为字符串");
+    assert.match(newId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u, "W2 retarget 应铸真实新 UUID（非固定 null），而是：" + newId);
+    assert.notEqual(newId, oldUUID, "新会话 id 不应与旧 id 相同");
+    // B3 账本侧应换成新 id
+    const b3 = Object.entries(o.ledger.records).map(([, r]) => r).find((r) => r?.kind === "live" && TAL.familyOf(r.facts) === "B3");
+    assert.ok(b3, "存在 B3 记录");
+    assert.equal(b3.binding_target?.claude_session_id, newId, "B3 binding_target 应换为新会话 id");
+  } finally { fs.rmSync(o.local, { recursive: true, force: true }); }
+});
+
+
 test("#R12 P1：chat-id 形状判据唯一化（p2pChatIdProblem）—— 模板校验 / CLI 参数 / planP2pChange / isPrivateChatTurn 四点共用，反例矩阵全拒，判据退化为 startsWith 会转红", () => {
   // 评审探针复现：旧版两处判据漂移（chain-template 宽松 startsWith、CLI 严格正则），
   // 底层写 API planP2pChange 能把 "oc_x\n" 推进白名单。#R12 把判据抽成 chain-template

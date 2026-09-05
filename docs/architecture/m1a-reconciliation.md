@@ -291,10 +291,10 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
 | bind/认领（claim→绑定：引用码、@ 配对） | create_a1 → activate（固定顺序）。**W1**：认领在 chat/sender/body(码)/thread_root 四维真实匹配 → f4={matched_om:被引根消息 om, matched_fields:标准四项}（G15 零扩展）、authorized_by=event.sender_id。**W2：再认领（B3 已 active 换会话）= retarget**（同 root），不走 activate | 同一 claim：ext=claim key；create_a1 entity=session locator、activate entity=B1 topic_agent_id——两笔 key 确定性派生且不同 |
 | 显式 attach（终端） | attach | ext=控制 claim key（终端命令 claim 机制既有、持久）；entity=目标 id |
 | rotate（建新代际） | create_b1。**W3**：outer 取锁**前置到 sendToChat 之前**（写事务从首个外显副作用起算；锁取不到话题不发、无孤儿、不降级） | ext=rotation operation id（topic-generation 既有、持久）；entity=lineage id |
-| rotate cancel / pending 过期 | void | 同上 |
-| 连接暂停/恢复（binding_status paused/active 翻转的写方——topic-generation state 写入口；五轮 P2-2 更正：非 /feishu-mode，mode 属 policy 域） | unbind / restore（只动 current B3；历史 B4 不动） | ext=该次终端命令的**持久控制 claim key / 命令审计 id**（禁止临时随机）；entity=目标 id |
+| rotate cancel / pending 过期 | void。W5：reason 映射 cancelled→manual、expired→expired（枚举不扩）| ext=rotation operation id |
+| 连接暂停/恢复（binding_status 翻转；五轮 P2-2：mode 属 policy 域非此路径） | **W4 对账兜底行**（同 enabled：无持久审计 id，M1a 不实时双写，doctor+repair 兜底） | —（W4）|
 | retarget（owner 终端） | retarget | 同上 |
-| `enabled` 翻转 | unbind / restore（§4 行） | 同上 |
+| `enabled` 翻转 | **W4 对账兜底行**：M1a 不实时双写（无持久审计 id 的罕用终端写方）；doctor mismatch 暴露、owner 以 restore/unbind/migrate_repair 补齐；实时双写等审计 id 链路另单 | —（W4）|
 | 到期/续期 | expiry sidecar 写 | 不进账本 |
 | policy mode / reserve-finalize | policy store 写 | 不进账本 |
 | 迁移种子/修复（维护工具） | migrate_seed / migrate_repair | ext=维护 operation token（持久）；entity=endpoint / 目标 id |

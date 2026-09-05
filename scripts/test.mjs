@@ -24833,6 +24833,23 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(doc), { mode: 0o600 });
     assert.equal(endpointReceipt(maintDir, ep).state, "ok", "seed 出的 ledger_init 收据应判 ok（M1a 已启用）");
   };
+  // 通用版 seedLedgerInitReceipt：parameterize（ep/chain/tok），用于给 codex 端点种一份合法收据（与 claude 收据不同 token，
+  //  才能在同一机级目录共存，验证收据按 endpoint_id 判别、互不串扰）。结构与 seedLedgerInitReceipt 完全同构，保证 readJournal 判定 valid。
+  const seedInitReceipt = (maintDir, ep, chain, tok) => {
+    fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+    const at = "2026-08-31T12:00:00.000Z";
+    const sha = "b".repeat(64);
+    const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+    const timerDone = (ch) => ({ id: "timer:" + ch, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+    const stubDone = (ch) => ({ id: "stub:" + ch, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const curDone = (ch) => ({ id: "current:" + ch, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const gateDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+    const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+    const ledgerStep = { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState, after: afterState, state: "done", at, chain };
+    const doc = { schema_version: "1.2", operation_kind: "ledger_init", token: tok, reason: "seed 收据", started_at: at, updated_at: at, phase: "done", steps: [timerDone("claude"), timerDone("codex"), stubDone("claude"), stubDone("codex"), curDone("claude"), curDone("codex"), gateDone(), ledgerStep], notes: [] };
+    fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(doc), { mode: 0o600 });
+    assert.equal(endpointReceipt(maintDir, ep).state, "ok", "seed 出的 " + chain + " ledger_init 收据应判 ok（M1a 已启用）");
+  };
 
   test("账本：init/cutover 是维护层入口，第 1 块生产恒拒（fail-closed）", () => withRoot((root, dir) => {
     assert.equal(TAL.initializeShadow({ endpointId: EP, requestKey: rk(), chain: CH, capability: {} }).reason, "maintenance_capability_required", "init 恒拒");
@@ -25041,6 +25058,47 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
       assert.ok(!TAL.createB1({ endpointId: EPc, requestKey: "req_cx3", chatId: "oc_cx2", rootOm: "om_cx", lineageId: "lc", bindingTarget: { runtime: "claude", project_root: "/p", claude_session_id: "11111111-1111-1111-1111-111111111111" } }).ok, "codex 账本放 claude target 拒（G11）");
     } finally { if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved; fs.rmSync(root, { recursive: true, force: true }); }
   });
+  test("P1-3①：codex 端点隔离 + 双写——收据按 endpoint_id 判别（claude 收据只启用 claude；codex 收据只启用 codex）；codex 启用→写 codex 自己账本根，不碰 claude 账本", () => withRootAndReceipt((root, dir) => {
+    // 端点在 id 里广播 chain（runtime 进 legacyEndpointId 派生），claude/codex 各自 endpoint_id，互不冲突。
+    const EPc = legacyEndpointId({ runtime: "codex", agentUid: "agent_codex_guard" });
+    const dirX = path.join(root, EPc);
+    const maint = path.join(root, "maint");
+    assert.notEqual(EPc, EP, "codex 端点 id 与 claude 不同（runtime 进 id 派生）");
+    // ① 仅 claude 收据在机级目录 → codex 端点仍 never_initialized（判别互不串扰：claude 收据不启用 codex）
+    seedLedgerInitReceipt(maint, EP); // claude 收据（token da88...）
+    assert.equal(endpointReceipt(maint, EP).state, "ok", "claude 端点 ok");
+    assert.equal(endpointReceipt(maint, EPc).state, "never_initialized", "claude 收据不启用 codex（隔离①）");
+    // ② codex never_initialized → 合法 legacy-only（无 shadow、不写 codex 账本、不取 outer 锁）
+    fs.mkdirSync(dirX, { recursive: true, mode: 0o700 });
+    let legacyCalls = 0;
+    const legacyRec = (tag) => () => { legacyCalls += 1; return { tag, legacyCommitted: true }; };
+    const w0 = WIRE.wireCreateA1({ endpointId: EPc, env: process.env, legacy: legacyRec("cx-lo"), chatId: "oc_cxlo", sessionId: "sess_cxlo", messageId: "msg_cxlo" });
+    assert.ok(w0.ok, "codex legacy-only 仍整体 ok：" + JSON.stringify(w0));
+    assert.equal(legacyCalls, 1, "codex legacy 已跑");
+    assert.deepEqual(w0.shadow, [], "never_initialized → 无 shadow");
+    assert.ok(!fs.existsSync(path.join(dirX, "ledger.json")), "never_initialized 不写 codex 账本");
+    // ③ codex 收据（独立 token bb88...、endpoint_id=EPc）→ codex 端点 ok → 双写；写 codex 自己账本根（非 claude 的 dir）
+    //   同时证明 claude 端点不被 codex 收据改动（各自被各自端点 id 命中）。
+    seedInitReceipt(maint, EPc, "codex", "bb88666e-d8d3-48ba-914e-7f96f4dfaebb");
+    assert.equal(endpointReceipt(maint, EPc).state, "ok", "codex 收据→codex 端点 ok（隔离②）");
+    assert.equal(endpointReceipt(maint, EP).state, "ok", "claude 端点仍 ok（codex 收据不串扰 claude，隔离③）");
+    // 给 codex 端点种一份初始 shadow 账本（与 claude 侧 seedLedger 同构但 endpoint_id=EPc、chain=codex）
+    {
+      const opId = "00000000-0000-0000-0000-000000000001";
+      const doc = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EPc, chain: "codex", authority_mode: "shadow", revision: 1, operations: { [opId]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init_cx", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EPc, chain: "codex" }), result_revision: 1, result: { revision: 1 } } }, records: {} };
+      fs.writeFileSync(path.join(dirX, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+      assert.ok(TAL.loadLedger(dirX, { endpointId: EPc }).ok, "codex 初始账本自洽");
+    }
+    const w1 = WIRE.wireCreateA1({ endpointId: EPc, env: process.env, legacy: legacyRec("cx-dual"), chatId: "oc_cxdual", sessionId: "sess_cxdual", messageId: "msg_cxdual" });
+    assert.ok(w1.ok, "codex 双写 ok：" + JSON.stringify(w1));
+    assert.equal(w1.shadow.length, 1, "一笔 codex shadow");
+    assert.equal(w1.shadow[0].op, "create_a1", "codex shadow=create_a1");
+    assert.ok(w1.shadow[0].ok, "codex create_a1 成功：" + JSON.stringify(w1.shadow[0]));
+    const cxDoc = TAL.loadLedger(dirX, { endpointId: EPc });
+    assert.ok(cxDoc.ok, "codex 账本可读：" + JSON.stringify(cxDoc));
+    assert.equal(Object.keys(cxDoc.doc.records).length, 1, "codex 账本落一条 A1");
+    assert.ok(!fs.existsSync(path.join(dir, "ledger.json")), "codex 双写不碰 claude 账本根（隔离：各自账本根）");
+  }));
   test("账本：可重复动作往返各执行(request_key) + 同 key 异载荷冲突 + 数组 id 拒 + 精确权限", () => withRoot((root, dir) => {
     seedLedger(dir);
     // 建 B3

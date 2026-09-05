@@ -857,6 +857,46 @@ test("Codex 首次认领 shadow 与现行绑定码选择一致且不写 task reg
   assert.equal(fs.readFileSync(path.join(home, "registry.json"), "utf-8"), before);
 });
 
+test("P1-3①：Codex 认领四维真核——evaluatePromotion 产出封闭 F4（matched_om=generation 根消息 om）；chat 维不匹配→拒；无 AILY 群 env→照常放行", () => {
+  const home = temp();
+  const root = path.join(home, "same-project");
+  fs.mkdirSync(root);
+  const now = Date.parse("2026-08-22T08:00:00Z");
+  const a = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30", now });
+  const b = makeTaskEntry({ root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "62ca4f", now });
+  writeRegistryFixtureUnvalidated([a, b], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const event = { message_id: "msg_f4", session_id: "session_f4", sender_id: TEMPLATE.frank_sender_id, created_at_ms: now - 1000, content: '<at id="ou_same">M5Codex</at>\n> 绑定码  62ca4f' };
+  const pending = findPendingTask({ home, content: event.content, now });
+  assert.ok(pending.ok, "pending ok：" + JSON.stringify(pending));
+  const legacy = evaluatePromotion({ event, template: TEMPLATE, pending, now, env: {} });
+  assert.equal(legacy.ok, true, "现 ① 双写 baseline 下，受验后仍归当前 task 绑定（mirror claude P1-2）");
+  assert.deepEqual(legacy.f4, { matched_om: "om_b", matched_fields: ["chat_id", "sender", "body", "thread_root"] }, "封闭 F4：matched_om=被认领代际根消息 om、matched_fields=标准四项（wirePromoteBinding 消费的是受验产物，不是自铸）");
+  // chat 维不匹配（认领发生在错误的群里）→ 拒
+  const mismatch = evaluatePromotion({ event, template: TEMPLATE, pending, now, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_other" } });
+  assert.deepEqual([mismatch.ok, mismatch.reason], [false, "chat_mismatch"], "chat 维不一致→拒");
+  // 无 AILY 群 locator（envChat 缺失）→ 照常放行（shadow 记 scope_unverified，不猜）
+  const noChat = evaluatePromotion({ event, template: TEMPLATE, pending, now, env: {} });
+  assert.equal(noChat.ok, true, "chat 维缺失→照常放行");
+});
+
+test("P1-3①：Codex evaluatePromotion 无根消息 om → f4=null（未受验拒物化，wirePromoteBinding 消费到 bad_f4 fail-closed）", () => {
+  const home = temp();
+  const root = path.join(home, "same-project");
+  fs.mkdirSync(root);
+  const now = Date.parse("2026-08-22T08:00:00Z");
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30", now });
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const event = { message_id: "msg_f4b", session_id: "s", sender_id: TEMPLATE.frank_sender_id, created_at_ms: now - 1000, content: '<at id="ou_same">M5Codex</at>\n> 绑定码  5fba30' };
+  const pending = findPendingTask({ home, content: event.content, now });
+  assert.ok(pending.ok, "pending ok：" + JSON.stringify(pending));
+  pending.generation.root_message_id = undefined; // 模拟缺根消息（未受验）
+  const legacy = evaluatePromotion({ event, template: TEMPLATE, pending, now, env: {} });
+  assert.equal(legacy.ok, true);
+  assert.equal(legacy.f4, null, "无根消息 om → f4=null（未受验不产封闭 F4）");
+});
+
 test("完整入站链路用引用绑定码在多个 pending 中只绑定目标 task", () => {
   const home = temp();
   const root = path.join(home, "same-project");

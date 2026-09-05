@@ -1046,7 +1046,23 @@ export function evaluatePromotion({ event, template, pending, now = Date.now(), 
   const createdAt = Number(event?.created_at_ms);
   if (!Number.isFinite(createdAt)) return { ok: false, reason: "malformed_event" };
   if (now - createdAt > template.default_freshness_ms) return { ok: false, reason: "stale_message" };
-  return { ok: true, task: pending.task };
+  // P1-3①（Codex P1-3 真核，同 claude P1-2）：四维真实匹配的 **chat** 维 —— AILY_CLI_CHANNEL_CHAT_ID
+  //   就是本消息所在飞书群（channel-locator-verdict §2，与 claude 同一判据）；与待绑定 task 的 chat_id
+  //   不一致 → 拒（这次认领在错误的群里）；缺失 → 照常放行（由 shadow 记 scope_unverified）。
+  //   随后产出封闭 F4 产物（matched_om=被认领代际根消息 om；matched_fields=标准四项），供
+  //   wirePromoteBinding 只消费不自铸（未受验 → f4=null → bad_f4 fail-closed、不写配对证明）。
+  const envChat = typeof env?.AILY_CLI_CHANNEL_CHAT_ID === "string" ? env.AILY_CLI_CHANNEL_CHAT_ID : "";
+  const bindingChat = pending?.task?.chat_id ?? template?.chat_id;
+  if (envChat.length > 0 && typeof bindingChat === "string" && bindingChat.length > 0 && envChat !== bindingChat) {
+    return { ok: false, reason: "chat_mismatch" };
+  }
+  const matchedOm = (typeof pending?.generation?.root_message_id === "string" && pending.generation.root_message_id.length > 0)
+    ? pending.generation.root_message_id : null;
+  return {
+    ok: true,
+    task: pending.task,
+    f4: matchedOm ? { matched_om: matchedOm, matched_fields: ["chat_id", "sender", "body", "thread_root"] } : null,
+  };
 }
 
 export function promoteTask({

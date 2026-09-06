@@ -27,9 +27,15 @@ import path from "node:path";
 
 import { acquireInstallSurfaceLock } from "../install-surface-lock.mjs";
 import { switchCurrentTarget } from "../runtime-install.mjs";
+import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot } from "../m1a/legacy-snapshot.mjs";
+import { projectLegacySnapshot, reconcileLegacyEndpoint } from "../m1a/reconcile.mjs";
+import { renderExpirySidecar, renderPendingClaimsSidecar, renderPolicySidecar } from "../m1b/sidecar-renderers.mjs";
+import { readStagedVerified, removeStagedPlan, stageCutoverPlan, stagedIntendedFile } from "../m1b/staged-plan.mjs";
+import { verifyCutoverPlan } from "../m1b/cutover-plan.mjs";
 import { chainFacts } from "./precheck.mjs";
 import { removeStubVersion } from "./stub.mjs";
 import { bootstrapTimer, timerPhase } from "./timers.mjs";
+import { writeSidecarPrepared } from "./sidecar-writer.mjs";
 import { TERMINAL_PHASES, acquireOperationLease, addNote, clearActive, enterLedgerForward, markStepDone, readActive, readJournal, releaseOperationLease, setPhase, verifyBackup } from "./journal.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
 import { authorityCutover, cutoverPlan, initPlan, initializeShadow, loadLedger, reconcileShadow, resolveEndpointDir } from "../topic-agent-ledger.mjs";
@@ -54,18 +60,104 @@ const releaseSurface = (surface) => {
 const afterStep = (ctx, id) => { if (typeof ctx.afterStep === "function") ctx.afterStep(id); };
 const resolveDir = (ctx, endpointId, env) => resolveEndpointDir(endpointId, { env });
 
-/** 蓝图（幂等）：init 直接构造 revision=1；cutover 从现场 shadow 构造。request_key = operation token（设计）。
- *  评审 P1-4：cutover 不接调用方注入 reconciler——`reconcileShadow` 本身 fail-closed 恒拒 reconciler_absent，
- *  真对账接入时在 topic-agent-ledger 的 reconcileShadow 接，且必须经 capability 门。
+/** M1a 真对账的 legacy 采集（R45：cutover 前置从「恒拒的 reconciler_absent」换成真对账；测试注入走 env）。 */
+const collectFor = (ctx, chain, env) => chain === "claude"
+  ? collectClaudeLegacySnapshot({
+      registryFile: env.FEISHU_BRIDGE_REGISTRY ?? path.join(ctx.home, ".claude", "feishu-bridge", "registry.json"),
+      templateFile: env.FEISHU_BRIDGE_CHAIN_TEMPLATE ?? path.join(ctx.home, ".claude", "feishu-bridge", "chain-config.json"),
+    })
+  : collectCodexLegacySnapshot({ home: ctx.codexBridgeHome });
+
+export const reconcileFor = ({ ctx, chain, endpointId, ledgerDir, env }) => reconcileLegacyEndpoint({
+  endpointId, chain,
+  collectLegacy: () => collectFor(ctx, chain, env),
+  loadLedgerFn: () => loadLedger(ledgerDir, { endpointId }),
+});
+
+/** 渲染三条 sidecar blob（与对账同源：E=legacy 投影、bindings=legacy 快照）。 */
+function renderFor({ ctx, chain, endpointId, env }) {
+  const S1 = collectFor(ctx, chain, env);
+  if (!S1.ok) return { ok: false, reason: S1.reason, why: S1.why ?? null };
+  const proj = projectLegacySnapshot({ endpointId, chain, snapshot: S1 });
+  if (!proj.ok) return { ok: false, reason: proj.reason, why: proj.why ?? null };
+  const E = proj.records, bindings = S1.bindings;
+  const parts = {
+    expiry: renderExpirySidecar({ endpointId, bindings, E }),
+    pending_claims: renderPendingClaimsSidecar({ endpointId, bindings, E }),
+    policy: renderPolicySidecar({ endpointId, bindings, E }),
+  };
+  for (const [k, r] of Object.entries(parts)) if (!r.ok) return { ok: false, reason: r.reason, why: k + "：" + (r.why ?? "") };
+  return { ok: true, blobs: { expiry: parts.expiry.bytes, pending_claims: parts.pending_claims.bytes, policy: parts.policy.bytes } };
+}
+
+const shaHex = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
+
+/** sidecar 现场探测（staging 前）：absent → {exists:false}；在 → {exists:true, sha256}；读不清（symlink/EACCES）→ fail-closed。 */
+const probeBefore = (file) => {
+  try {
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    try { return { exists: true, sha256: shaHex(fs.readFileSync(fd)) }; } finally { fs.closeSync(fd); }
+  } catch (err) {
+    if (err?.code === "ENOENT") return { exists: false, sha256: null };
+    return { exists: "unclear", sha256: null, why: errText(err) };
+  }
+};
+
+/** staging（4c/4d 冻结 S1）：真对账 → 渲染三 blob → 构造七键 plan → stageCutoverPlan 建树 → 产三条 prepared sidecar step（journal 锚与 plan.sidecars 同源、before 现场探测）。
+ *  plan 与渲染同源同刻（同一 collect 派生）；进段前 ledger 快照身份冻结在 plan.ledger，提交前重验核它（③ ledger_identity_mismatch）。 */
+function stageCutover(ctx, { env, token, chain, endpointId, ledgerDir }) {
+  const rec = reconcileFor({ ctx, chain, endpointId, ledgerDir, env });
+  if (!rec.ok) return { ok: false, reason: rec.reason, why: rec.why ?? null };
+  const L = loadLedger(ledgerDir, { endpointId });
+  if (!L.ok) return { ok: false, reason: L.reason, why: L.why ?? null };
+  const rr = renderFor({ ctx, chain, endpointId, env });
+  if (!rr.ok) return rr;
+  const plan = {
+    schema_version: "m1a-cutover-plan-1",
+    operation_token: token,
+    endpoint_id: endpointId,
+    digest: rec.digest,
+    ledger: { revision: L.doc.revision, sha256: L.sha256 },
+    // ponytail: source 统一标 snapshot-identity（封闭域内）；逐文件来源精确标注归 M1b 后续，planProblem 只要求非空
+    snapshot_identity: (rec.snapshot_identity ?? []).map((x) => ({ ...x, source: "snapshot-identity" })),
+    sidecars: {
+      expiry: { sha256: shaHex(rr.blobs.expiry) },
+      pending_claims: { sha256: shaHex(rr.blobs.pending_claims) },
+      policy: { sha256: shaHex(rr.blobs.policy) },
+    },
+  };
+  const st = stageCutoverPlan({ dir: ctx.dir, token, plan, blobs: rr.blobs });
+  if (!st.ok) return st;
+  const sidecarSteps = [];
+  for (const k of ["expiry", "pending_claims", "policy"]) {
+    const name = k === "pending_claims" ? "pending-claims" : k;
+    const anchor = plan.sidecars[k];
+    const before = probeBefore(path.join(ledgerDir, name + ".json"));
+    if (before.exists === "unclear") return { ok: false, reason: "sidecar_unclear", why: name + ".json 读不出（" + before.why + "），不stage" };
+    sidecarSteps.push({
+      id: "sidecar:" + name + ":" + endpointId,
+      kind: "sidecar",
+      target: "ledger/" + endpointId + "/" + name + ".json", // 1.3 合同：相对账本根的路径（4f 重算同一公式）
+      before,
+      intended_blob: { path: stagedIntendedFile({ dir: ctx.dir, token, name }), bytes: anchor.bytes ?? rr.blobs[k].byteLength, sha256: anchor.sha256 },
+      intended_after: { exists: true, sha256: anchor.sha256 },
+    });
+  }
+  return { ok: true, plan_sha256: st.plan_sha256, sidecarSteps };
+}
+
+/** 蓝图（幂等）：init 直接构造 revision=1；cutover 从现场 shadow + M1a 真对账构造（R45：reconcileShadow 的恒拒占位退出生产路径）。
+ *  request_key = operation token（设计）。
+ *  评审 P1-4 保留：调用方注入 reconciler 依旧不接——对账走 reconcileLegacyEndpoint（M1a），reconcileShadow 只留给直接调用方（恒拒红线）。
  */
-function planOf({ kind, endpointId, chain, token, ledgerDir }) {
+function planOf({ kind, endpointId, chain, token, ledgerDir, ctx, env }) {
   const requestKey = token;
   if (kind === "init") return initPlan({ endpointId, chain, requestKey, operationId: token });
   const L = loadLedger(ledgerDir, { endpointId });
   if (!L.ok) return { ok: false, reason: L.reason, why: L.why ?? null };
   if (L.doc.authority_mode !== "shadow") return { ok: false, reason: "not_shadow", why: "切权威前置要求 shadow（实际 " + L.doc.authority_mode + "）" };
-  const rec = reconcileShadow({ endpointId, shadowDoc: L.doc });
-  if (!rec.ok) return rec;
+  const rec = reconcileFor({ ctx, chain, endpointId, ledgerDir, env });
+  if (!rec.ok) return { ok: false, reason: rec.reason, why: rec.why ?? (rec.mismatches ? "双射不等（" + rec.mismatches.length + " 条）" : null) };
   return cutoverPlan({ endpointId, chain, requestKey, operationId: token, shadowDoc: L.doc, shadowSha: L.sha256, digest: rec.digest });
 }
 
@@ -80,7 +172,13 @@ function doWrite(ctx, { token, kind, endpointId, chain, ledgerDir, env, _inject 
     : authorityCutover({ endpointId, capability: cap, requestKey, chain, env, _inject });
 }
 
-const ledgerStep = (plan, sub, endpointId) => ({ id: "ledger:" + endpointId + ":" + sub, kind: "ledger", target: endpointId, before: plan.before, backup: null, intended_after: plan.intendedAfter });
+/** R45：journal 锚驱动的 ledger step（蓝图字段是 intendedAfter；1.3 键集：init 六键不补 plan_sha256，cutover 八键 before.plan_sha256=null、intended_after.plan_sha256=staged plan SHA）。 */
+const ledgerStep = (plan, sub, endpointId, planSha = null) => ({
+  id: "ledger:" + endpointId + ":" + sub, kind: "ledger", target: endpointId,
+  before: sub === "cutover" ? { ...plan.before, plan_sha256: null } : plan.before,
+  backup: null,
+  intended_after: sub === "cutover" ? { ...plan.intendedAfter, plan_sha256: planSha } : plan.intendedAfter,
+});
 const sceneWhy = (scene) => (scene.why ? "：" + scene.why : "读不出");
 
 /** 现场账本 vs ledger step 的 before / intended_after 判据（B-2）：init.before = absent；cutover.before = 原 shadow 身份。 */
@@ -96,6 +194,33 @@ function compareScene(dir, endpointId, step) {
   if (beforeOk) return { scene: "before" };
   if (!L.ok) return { scene: "corrupt", why: L.why ?? L.reason };
   return { scene: "corrupt", why: "现场既非 before 也非 intended_after" };
+}
+
+/** R45 复合提交（§4.1 4c/4d/4f/5）：①逐 sidecar 窄写（journal 锚驱动，幂等）→ ②门内二次重验（live collect + 五等式 + 4f）。
+ *  两次对账都在本函数内：S1 已在 stageCutover 时冻结进 plan；这里取 S2 = live collect，verifyCutoverPlan 核 S2 与 plan 锚自洽。
+ *  返回后调用方才到唯一提交点 authority_cutover；本函数不碰账本。 */
+function convergeSidecars(ctx, { token, lease, env, endpointId, chain, ledgerDir, doc, ls }) {
+  const sidecarSteps = doc.steps.filter((s) => s.kind === "sidecar");
+  if (sidecarSteps.length !== 3) return { ok: false, reason: "sidecar_steps_missing", why: "cutting_over 应有三条 sidecar step（实际 " + sidecarSteps.length + "）" };
+  for (const st of sidecarSteps) {
+    const name = st.id.split(":")[1];
+    const w = writeSidecarPrepared({ dir: ctx.dir, token, lease, endpointId, name, ledgerDir, now: ctx.now() });
+    if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null };
+    if (w.written) afterStep(ctx, "written:" + st.id);
+  }
+  // 门内二次重验：staged plan 受验读（SHA 锚 = ledger step intended_after.plan_sha256）
+  const planSha = ls.intended_after?.plan_sha256;
+  if (!(typeof planSha === "string" && /^[0-9a-f]{64}$/u.test(planSha))) return { ok: false, reason: "plan_anchor_missing", why: "ledger step intended_after.plan_sha256 缺失（1.3 八键）" };
+  const pb = readStagedVerified(path.join(ctx.dir, token + ".staged", "intended", "plan.json"), { sha256: planSha });
+  if (!pb.ok) return { ok: false, reason: "staged_plan_unreadable", why: pb.why ?? pb.reason };
+  const rec2 = reconcileFor({ ctx, chain, endpointId, ledgerDir, env });
+  if (!rec2.ok) return { ok: false, reason: rec2.reason, why: rec2.why ?? null };
+  // 账本 CAS：重验时刻的活读（M1a 对账返回不带账本身份，CAS 由编排器供）。
+  const L2 = loadLedger(ledgerDir, { endpointId });
+  if (!L2.ok) return { ok: false, reason: L2.reason, why: L2.why ?? null };
+  const v = verifyCutoverPlan({ planBytes: pb.buf, doc, ledgerStep: ls, sidecarSteps, ledgerEndpointId: endpointId, fingerprintEndpointId: endpointId, reconcile: { ...rec2, ledger: { revision: L2.doc.revision, sha256: L2.sha256 } } });
+  if (!v.ok) return { ok: false, reason: v.reason, why: v.why ?? null };
+  return { ok: true, planSha };
 }
 
 /**
@@ -124,11 +249,21 @@ export function ledgerForward(ctx, { token, lease, intent = null, env = process.
     if (sub === "cutover" && receipt.cutoverDone) return { ok: false, reason: "already_cutover", why: "该 endpoint 已切权威", phase, rollbackSafe: true };
     // 评审 P1-5：cutover 前置要求恰一份 done init 收据（没有 init 就切权威 → fail-closed，留在 drained）。
     if (sub === "cutover" && !receipt.initDone) return { ok: false, reason: "init_receipt_missing", why: "切权威要求恰一份已 done 的 init 收据（收据 initDone=false）", phase, rollbackSafe: true };
-    planPre = planOf({ kind: sub, endpointId: intent.endpointId, chain: intent.chain, token, ledgerDir: dPre.dir });
+    planPre = planOf({ kind: sub, endpointId: intent.endpointId, chain: intent.chain, token, ledgerDir: dPre.dir, ctx, env });
     if (!planPre.ok) return { ok: false, reason: planPre.reason, why: planPre.why ?? null, phase, rollbackSafe: true };
+    // R45 4c/4d：cutover 进段前冻结 S1 —— 真对账 + 渲染三 sidecar blob + 七键 plan 建 staged 树 + 三条 prepared step（与 ledger step 同一次原子进段）。
+    let sidecarSteps = [];
+    let planSha = null;
+    if (sub === "cutover") {
+      const st = stageCutover(ctx, { env, token, chain: intent.chain, endpointId: intent.endpointId, ledgerDir: dPre.dir });
+      if (!st.ok) return { ok: false, reason: st.reason, why: st.why ?? null, phase, rollbackSafe: true };
+      sidecarSteps = st.sidecarSteps;
+      planSha = st.plan_sha256;
+    }
     const fwd = sub === "init" ? "ledger_initializing" : "ledger_cutting_over";
     // 评审 P1-1：phase 推进 + ledger step（含 chain）合并成一次原子写，杜绝"phase=fwd 但无 step/无 chain"的恢复死窗。
-    const pw = enterLedgerForward({ dir: ctx.dir, token, lease, phase: fwd, step: ledgerStep(planPre, sub, intent.endpointId), chain: intent.chain, expectPhase: "drained", now: ctx.now() });
+    // R45：sidecar steps 同一 mutate 原子进段（4f——单写进段会在「进段了但 sidecar step 缺席」处留下不合法 journal）。
+    const pw = enterLedgerForward({ dir: ctx.dir, token, lease, phase: fwd, step: ledgerStep(planPre, sub, intent.endpointId, planSha), sidecarSteps, chain: intent.chain, expectPhase: "drained", now: ctx.now() });
     if (!pw.ok) return { ok: false, reason: pw.reason, why: pw.why ?? null, phase };
     phase = fwd;
     const j2 = readJournal({ dir: ctx.dir, token });
@@ -153,7 +288,19 @@ export function ledgerForward(ctx, { token, lease, intent = null, env = process.
         addNote({ dir: ctx.dir, token, lease, note: "ledger 现场" + sceneWhy(scene) + "，停门待修", now: ctx.now() });
         return { ok: false, reason: "ledger_corrupt", phase, why: scene.why };
       }
+      if (scene.scene === "intended_after" && sub === "cutover" && !doc.steps.filter((s) => s.kind === "sidecar").every((s) => s.state === "done")) {
+        // 账本已翻转但 sidecar 未收全 —— 复合提交的顺序被破坏（提交点在窄写之后，不应可达）；fail-closed。
+        addNote({ dir: ctx.dir, token, lease, note: "ledger 已翻转但 sidecar 未收全，停门待修", now: ctx.now() });
+        return { ok: false, reason: "composite_order_violation", phase, why: "intended_after 场景要求三条 sidecar 已 done" };
+      }
       if (scene.scene === "before") {
+        if (sub === "cutover") {
+          // R45 复合提交：①三条 sidecar 窄写 + ②门内二次重验（都过才到提交点）。
+          const cv = convergeSidecars(ctx, { token, lease, env, endpointId, chain, ledgerDir: d.dir, doc, ls });
+          if (!cv.ok) return { ok: false, reason: cv.reason, why: cv.why ?? null, phase };
+          // 唯一提交点 authority_cutover：本单只武装到提交前（capability 门与真翻转账本归 M1b 后续单），停在门内。
+          return { ok: false, reason: "authority_cutover_not_armed", why: "sidecar 已收敛、二次重验已过；authority_cutover 提交点未武装，停在 ledger_cutting_over", phase };
+        }
         const wr = doWrite(ctx, { token, kind: sub, endpointId, chain, ledgerDir: d.dir, env, _inject });
         if (!wr.ok) return { ok: false, reason: wr.reason, why: wr.why ?? null, phase, commit: wr.commit ?? "not_committed", residue: wr.residue ?? null, lockUncleared: wr.lockUncleared ?? null };
         // 评审 P1-5：只有 committed_clean 才视为可推进；committed_with_residue / committed_durability_uncertain 保留门+active，退出码 3。
@@ -254,6 +401,11 @@ export function ledgerReopening(ctx, token, lease) {
     const facts = factsOf(ctx, chain);
     const r = removeStubVersion({ root: facts.root, token });
     if (!r.ok) incomplete.push({ id: st.id, why: "删桩：" + String(r.reason) + (r.why ? "（" + r.why + "）" : "") });
+  }
+  // ③b R45（B-4 账本接入）：cutover 的 staged 私有树在此清（账本已翻转、sidecar 已落，staged 不再有用）；absent 幂等，失败算没做完。
+  if (doc.operation_kind === "ledger_cutover") {
+    const rp = removeStagedPlan({ dir: ctx.dir, token });
+    if (!rp.ok) incomplete.push({ id: "staged", why: "staged 清理：" + String(rp.reason) + (rp.why ? "（" + rp.why + "）" : "") });
   }
   // ④ 全部对得上才撤门；撤门成功但归属转换锁交不还 → 同样算没做完
   if (incomplete.length > 0) return bail({});

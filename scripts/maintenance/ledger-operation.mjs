@@ -37,7 +37,7 @@ import { bootstrapTimer, timerPhase } from "./timers.mjs";
 import { readSidecarCurrent, writeSidecarPrepared } from "./sidecar-writer.mjs";
 import { TERMINAL_PHASES, acquireOperationLease, addNote, clearActive, enterLedgerForward, markStepDone, readActive, readJournal, releaseOperationLease, setPhase, verifyBackup } from "./journal.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
-import { authorityCutover, cutoverPlan, initPlan, initializeShadow, loadLedger, resolveEndpointDir } from "../topic-agent-ledger.mjs";
+import { authorityCutover, cutoverPlan, ensureLedgerRoot, initPlan, initializeShadow, loadLedger, resolveEndpointDir } from "../topic-agent-ledger.mjs";
 import { endpointReceipt } from "./ledger-receipt.mjs";
 
 const CHAINS = ["claude", "codex"];
@@ -280,6 +280,17 @@ export function ledgerForward(ctx, { token, lease, intent = null, env = process.
   let phase = doc.phase;
   const sub = doc.operation_kind === "ledger_init" ? "init" : doc.operation_kind === "ledger_cutover" ? "cutover" : null;
   if (!sub) return { ok: false, reason: "bad_operation_kind", phase };
+
+  // R46：init 门内、写账本前自建账本根（只建末级单层，绝不递归）。父链净 / 根 0700 由
+  // ensureLedgerRoot 受验；父目录缺席 / 父链 symlink / 根非 0700 → 不创建、原样 fail。
+  // 仅 init：cutover 要求 init 已建根（根缺席 → 真实故障，应 fail，不静默创建）。
+  if (sub === "init") {
+    const prov = ensureLedgerRoot({ env });
+    if (!prov.ok) {
+      addNote({ dir: ctx.dir, token, lease, note: "账本根不能安全创建：" + (prov.why ?? prov.reason), now: ctx.now() });
+      return { ok: false, reason: prov.reason, phase, why: prov.why ?? null, rollbackSafe: phase === "drained" };
+    }
+  }
 
   // 1. drained → 落不可逆前向边界（只有首次 ledgerEnter 会到；崩溃重跑在 drained 由 ledgerExit 转回退）
   let planPre = null;

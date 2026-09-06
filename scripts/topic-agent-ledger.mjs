@@ -156,6 +156,50 @@ export function validateLedgerRoot({ env = process.env, mustExistRoot = true } =
   return { ok: true, root: realRoot };
 }
 
+/** R46：init 门内、写账本前自建账本根（单层，绝不 recursive）。受验：
+ *  1) validateLedgerRoot(mustExistRoot:true) —— 根已在场且 0700 真目录 → 无需建，直接返回；
+ *     父链任一 symlink → root_not_canonical；不可解析 → root_unresolvable；根非 0700 → root_perms（不放宽）。
+ *     只有 rv.reason === "root_absent"（父链受验净、末级确实缺席）才允许自建。
+ *  2) 缺席 → mkdirSync(root,{recursive:false, mode:0o700})；父目录缺席 → ENOENT → 原样 fail（不递归创建）。
+ *  3) chmodSync 0700 兜 umask；fsync 父目录。
+ *  4) 再 validateLedgerRoot(mustExistRoot:true) 复核通过才算数。任一步失败不吞、原样 fail。
+ *  返回 { ok:true, root } 或 { ok:false, reason, why }。 */
+export function ensureLedgerRoot({ env = process.env, _inject = null } = {}) {
+  const inj = _inject ?? {};
+  // ① 先以"必须在场"核验：根已在场且 0700 真目录 → 不需要建，直接返回。
+  //    root_not_canonical / root_unresolvable / root_perms / root_symlink → 原样拒（不创建）。
+  const rv = validateLedgerRoot({ env, mustExistRoot: true });
+  if (rv.ok) return rv;
+  // 只有"父链受验且末级确实缺席"（root_absent）才允许自建；no_root 无路径可建，也拒。
+  if (rv.reason !== "root_absent") return rv;
+  const root = ledgerRootFor(env); // 合法缺席：root_absent 返回不带 root，路径从 ledgerRootFor 取（父链已受验净）
+  const parent = path.dirname(root);
+  // ② 建单层（recursive:false，绝不递归）：父目录缺席 → ENOENT → 不递归、原样 fail。
+  let mkdirErr = null;
+  if (inj.failMkdir) mkdirErr = inj.failMkdir;
+  else { try { fs.mkdirSync(root, { recursive: false, mode: 0o700 }); } catch (err) { mkdirErr = err; } }
+  if (mkdirErr !== null) {
+    const code = mkdirErr?.code ?? null;
+    const why = code === "ENOENT" ? "父目录缺席，不递归创建" : String(mkdirErr?.message ?? mkdirErr);
+    return { ok: false, reason: code === "ENOENT" ? "parent_absent" : "mkdir_failed", why };
+  }
+  // ③ chmod 0700 兜 umask。
+  let chmodErr = null;
+  if (inj.failChmod) chmodErr = inj.failChmod;
+  else { try { fs.chmodSync(root, 0o700); } catch (err) { chmodErr = err; } }
+  if (chmodErr !== null) return { ok: false, reason: "chmod_failed", why: "chmod：" + String(chmodErr?.message ?? chmodErr) };
+  // ④ fsync 父目录（让刚建的单层落盘）。
+  if (inj.failFsync) return { ok: false, reason: "fsync_failed", why: "注入 fsync 失败" };
+  let fsyncErr = null;
+  try { const fd = fs.openSync(parent, fs.constants.O_RDONLY); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } }
+  catch (err) { fsyncErr = err; }
+  if (fsyncErr !== null) return { ok: false, reason: "fsync_failed", why: "父目录 fsync：" + String(fsyncErr?.code ?? fsyncErr?.message ?? fsyncErr) };
+  // ⑤ 复核：根必须已是 0700 真目录；否则 fail-closed。
+  const rc = validateLedgerRoot({ env, mustExistRoot: true });
+  if (!rc.ok) return rc;
+  return { ok: true, root: rc.root };
+}
+
 /**
  * 由 endpointId 派生受验目录：root 必须存在且是真目录（realpath 自洽），dir=root/endpoint；
  * dir 若已存在必是真目录（非符号链接）且 realpath 落在 realpath(root) 下。首次 init 时 dir 尚不存在（允许）。

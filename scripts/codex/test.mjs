@@ -916,7 +916,7 @@ test("P1-3①：Codex 认领四维真核——evaluatePromotion 产出封闭 F4�
   assert.equal(noChat.f4, null, "envChat 缺失 → f4=null（不折成完整 pairing proof）");
 });
 
-test("P1-1-d：Codex evaluatePromotion 反向探针——plain 真无码单候选（sole_pending + token:null）→ owner_root_no_token_v1（三维，无 body 维）", () => {
+test("守卫①（codex）：plain 真无码单候选（sole_pending + token:null）→ f4=null（owner_root_no_token_v1 停产，无码不再产配对证明）", () => {
   const home = temp();
   const root = path.join(home, "same-project");
   fs.mkdirSync(root);
@@ -933,10 +933,38 @@ test("P1-1-d：Codex evaluatePromotion 反向探针——plain 真无码单候�
   assert.equal(pending.generation.pending_token, null, "fixture 真无码");
   const legacy = evaluatePromotion({ event, template: TEMPLATE, pending, now, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_test" } });
   assert.equal(legacy.ok, true, "sole_pending 仍放行（只有一份待绑定 + 无码无到期）");
-  assert.equal(typeof legacy.f4, "object", "无码单候选可命中 → 产 owner_root_no_token_v1（对齐 claude P2-①）");
-  assert.equal(legacy.f4.matched_om, "om_a", "matched_om=被认领单候选根消息 om");
-  assert.equal(legacy.f4.pending_token_state, "absent", "no-token 分支固定 pending_token_state=absent");
-  assert.deepEqual(legacy.f4.matched_fields, ["chat_id", "sender", "thread_root"], "精确三维（不伪造 body(码) 维）");
+  assert.equal(legacy.f4, null, "守卫①：sole_pending 不再产 owner_root_no_token_v1（无码无诚实配对证明，f4=null）");
+});
+
+// 守卫① 真入口（行为测试）：已启用端点（seedM1aEndpoint） + 无码认领（sole_pending）→ 整笔拒（需绑定码或
+//   root attestation），task 保持 pending。这是对上面单元测试（f4=null）的端到端补强：验证验证器真的拦截，
+//   而不只是产出了空 F4。
+test("守卫①（codex）真入口：已启用端点无码认领 → 整笔拒（需绑定码或 root attestation），task 保持 pending", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  const bin = path.join(home, "bin");
+  fs.mkdirSync(root); fs.mkdirSync(bin);
+  const now = Date.parse("2026-08-22T08:00:00Z");
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: null, now });
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const fakeAily = path.join(bin, "aily-cli");
+  fs.writeFileSync(fakeAily, ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const content = '<at id="ou_same" type="employee">M5Codex</at>\n没有绑定码的话';
+  const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_sole_e2e", sessionID: "session_sole_e2e", role: "user", createdBy: TEMPLATE.frank_sender_id, createdAtMs: Date.now(), content } }) }] });
+  const { maintDir, ledgerRoot } = seedM1aEndpoint({ home });
+  const result = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], {
+    encoding: "utf-8",
+    env: { ...isolatedEnv(), PATH: bin + path.delimiter + process.env.PATH, FEISHU_CODEX_BRIDGE_HOME: home,
+      FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot,
+      AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "session_sole_e2e",
+      AILY_CLI_RUN_ID: "run_sole_e2e", FAKE_AILY_ENVELOPE: envelope, FEISHU_DIALOGUE_AUTHORIZATION_SHADOW: "1" },
+  });
+  const tasks = loadRegistry(path.join(home, "registry.json")).tasks;
+  const after = tasks.find((t) => t.codex_thread_id === THREAD_A);
+  assert.equal(result.status, 0, "无码拒应正常出口（拒绝不是崩溃）：exit=" + result.status + " stderr=" + result.stderr);
+  assert.equal(after.inbound_state, "pending", "无码认领在已启用端点上不得绑定（仍 pending）：" + after.inbound_state);
+  assert.ok((result.stdout + result.stderr).includes("而已启用端点不接受无码认领"), "应给出「需绑定码或 root attestation」文案：stdout=" + result.stdout + " stderr=" + result.stderr);
 });
 
 test("P1-1①（codex）：无码单候选 + env chat 缺失 → f4=null（chat 维必须来自事件侧受验 locator，不能因『sole_pending 唯一』就自证来源）", () => {

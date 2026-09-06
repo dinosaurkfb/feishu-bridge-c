@@ -372,27 +372,18 @@ export function evaluatePromotion({ event, template, pending, now = Date.now(), 
   const matchedOm = (typeof pending.generation?.root_message_id === "string" && pending.generation.root_message_id.length > 0)
     ? pending.generation.root_message_id : null;
   const chatVerified = envChat.length > 0 && typeof bindingChat === "string" && bindingChat.length > 0 && envChat === bindingChat;
-  // P1-1-d（Codex 裁定 d）：F4 判别联合，**不伪造**。plain 无码单候选（only_pending）→ owner_root_no_token_v1
-  //   （三维 owner-root：chat/sender/thread_root，pending_token_state:"absent"），只允许同一 outer 锁内核清六件事，
-  //   任一不过 → f4=null 整笔拒（旧行为对无码单候选伪造“body(码)”维——那就是自铸证明，裁定 d 明令禁止）。
-  //   六件事收敛：① 唯一可认领 B1（only_pending 恰一份）② pending_token 与到期字段均 null ③ sender 受验 owner
-  //   （上方已拒非 owner）④ chat 与 B1 受验 chat 相等——由上方 CHAT_MISMATCH 守卫先行保证（env chat 缺失=无矛盾=
-  //   照常放行，scope_unverified 由 shadow 记录，channel-locator-verdict fail-safe）⑤ 引用根逐字等于 B1 root（matchedOm）
-  //   ⑥ 消息整条按 bind-only、正文不执行。token 认领（quoted_binding_token）→ binding_token_v1（完整四维 present，
-  //   此时 chat 必须真受验 env chat 非空且相等）。
+  // P1-1-d（Codex 裁定 d）：F4 判别联合，**不伪造**。token 认领（quoted_binding_token）→ 完整四维 present；
+  //   plain 无码（only_pending）→ 厂商不再伪造 body(码) 维；#守卫① 起连 owner-root 三维也不再产（f4=null，
+  //   root-blind Aily 下 thread_root 无诚实来源）。六件事仍收敛为：唯一可认领 B1 恰一份 + token/到期均 null +
+  //   sender 受验 owner + chat 与 B1 受验 chat 相等（由上方 CHAT_MISMATCH 守卫保证）+ 引用根逐字等于 B1 root +
+  //   消息整条按 bind-only、正文不执行。
   const isCodeClaim = pending?.matchedBy === "quoted_binding_token";
-  const noTokenClaim = pending?.matchedBy === "only_pending";
-  const pToken = (pending.generation?.pending_token ?? pending.entry?.pending_token ?? null);
-  const pExpiry = (pending.generation?.claim_expires_at ?? pending.entry?.pending_expires_at ?? null);
-  // #R37 P1-1①：无码分支也必须受验 chat 维——chat 必须来自事件侧受验 locator（env AILY_CLI_CHANNEL_CHAT_ID）
-  //   且与 B1 受验 chat 相等。『全机唯一 pending』只选目标、不能证明来源；缺 env → f4=null（不产未受验的配对证明）。
-  const noTokenOk = matchedOm && chatVerified && pToken === null && pExpiry === null;
-  const f4 = matchedOm
-    ? isCodeClaim && chatVerified
-      ? { matched_om: matchedOm, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }
-      : noTokenClaim && noTokenOk
-        ? { matched_om: matchedOm, matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" }
-        : null
+  // #守卫①（Frank 裁定）：root-blind Aily 传输下 thread_root 维无诚实来源 —— owner_root_no_token_v1 停止生产。
+  //   事件侧引用根 om 问题因此不复存在：无码认领（only_pending）直接不再产任何配对证明（f4=null）。
+  //   只保留 token 认领（quoted_binding_token）的 binding_token_v1（完整四维 present，chat 必须真受验 env chat 非空且相等）。
+  //   校验侧 G15 仍接受旧 owner_root_no_token_v1（三维 absent）为合法历史形状；生产侧不再铸造。
+  const f4 = matchedOm && isCodeClaim && chatVerified
+    ? { matched_om: matchedOm, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }
     : null;
   return {
     ok: true,

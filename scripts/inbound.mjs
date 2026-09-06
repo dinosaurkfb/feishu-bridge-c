@@ -492,6 +492,9 @@ if (!routed.ok) {
       const nowVerify = Date.now();
       const pendingVerify = findPendingBinding({ content: event.content, now: nowVerify });
       if (!pendingVerify.ok) return { ok: false, reason: pendingVerify.reason, why: "锁内重核：pending 现场不再可认领（" + (pendingVerify.reason ?? "unknown") + "）" };
+      // #守卫①：这里已在锁内 = 端点有 init 收据（已启用）。owner_root_no_token_v1 已停产后，无码认领（only_pending）
+      //   没有可写的诚实配对证明 —— 整笔拒（legacy 不跑、shadow 不写、B1 保持 pending）。
+      if (pendingVerify.matchedBy === "only_pending") return { ok: false, reason: "no_token_for_enabled", why: "端点已启用：需绑定码或 root attestation（已启用端点不接受无码认领）" };
       const promoVerify = evaluatePromotion({ event, template, pending: pendingVerify, now: nowVerify });
       if (!promoVerify.ok) return { ok: false, reason: promoVerify.reason, why: "锁内重核：认领六件事不再成立（" + (promoVerify.reason ?? "unknown") + "）" };
       if (promoVerify.f4 != null && promoVerify.f4.matched_om !== (pendingVerify.generation?.root_message_id ?? null)) return { ok: false, reason: "f4_changed", why: "锁内重核：matched_om 与锁内 locator 不符" };
@@ -501,7 +504,12 @@ if (!routed.ok) {
   if (!wired.ok) {
     // 双写强制下锁取不到（busy/maintenance/root_*/dir_*/lock_residue/reap_* 等）：整笔披、不写 legacy、没有绑定。
     writeReceipt("promote-m1a-" + event.message_id, { status: "rejected", reason: wired.reason ?? "m1a_reject", why: wired.why ?? null, lock: wired.lock ?? null, claim_acquired: false, handed_off: false, subscription_claim_shadow: subscriptionClaimShadow });
-    finish("rejected", { reasonText: "这条认领的 M1a 一致性锁取不到（" + (wired.reason ?? "unknown") + "），未绑定，请稍后再试一次" }, { reason: wired.reason ?? "m1a_reject" });
+    // #守卫①：无码认领被已启用端点拒绝 → 用「需绑定码或 root attestation」文案，而不是通用「锁取不到」。
+    const finishReason = wired.reason ?? "m1a_reject";
+    const reasonText = finishReason === "no_token_for_enabled"
+      ? "这条认领没有绑定码，而已启用端点不接受无码认领（需绑定码或 root attestation），未绑定"
+      : "这条认领的 M1a 一致性锁取不到（" + finishReason + "），未绑定，请稍后再试一次";
+    finish("rejected", { reasonText }, { reason: finishReason });
   }
 
   const wrote = wired.legacy;

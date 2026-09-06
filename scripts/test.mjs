@@ -5345,7 +5345,7 @@ test("P1-1 F4（claude）反向探针①：env chat 缺失 → 不硬拒但 f4=n
   assert.equal(r.f4, null, "env chat 缺失 → f4=null（未受验不产完整 F4）");
 });
 
-test("P1-1-d F4（claude）：plain 真无码单候选（only_pending + token:null）→ owner_root_no_token_v1（三维，无 body 维）", () => {
+test("守卫①（claude）：plain 真无码单候选（only_pending + token:null）→ f4=null（owner_root_no_token_v1 停止生产，无码不再产配对证明）", () => {
   const f = pendingFixture([{ id: "a", token: null }]);
   const content = '<at id="ou_t">T</at> 干活'; // 无绑定码
   const pending = findPendingBinding({ content, ...f, now: NOW2 });
@@ -5353,11 +5353,8 @@ test("P1-1-d F4（claude）：plain 真无码单候选（only_pending + token:nu
   assert.equal(pending.matchedBy, "only_pending");
   assert.equal(pending.generation.pending_token, null, "fixture 真无码");
   const r = evaluatePromotion({ event: okEvent, template: TPL, pending, now: NOW2, env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id } });
-  assert.equal(r.ok, true, "only_pending 仍放行（只有一份待绑定 + 无码无到期）");
-  assert.equal(typeof r.f4, "object", "无码单候选可命中 → 产 owner_root_no_token_v1（P2-① 真入口：无码认领必须能绑定）");
-  assert.equal(r.f4.matched_om, pending.generation.root_message_id, "matched_om=被认领单候选根消息 om");
-  assert.equal(r.f4.pending_token_state, "absent", "no-token 分支固定 pending_token_state=absent");
-  assert.deepEqual(r.f4.matched_fields, ["chat_id", "sender", "thread_root"], "精确三维（不伪造 body(码) 维）");
+  assert.equal(r.ok, true, "only_pending 仍放行（只有一份待绑定 + 无码无到期），但不产证明");
+  assert.equal(r.f4, null, "无码单候选 → f4=null（#守卫①：root-blind Aily 下无诚实 thread_root，owner_root_no_token_v1 停止生产）");
 });
 
 test("P1-1-d F4（claude）反向探针：无码单候选但有码在 pending → f4=null（裁定 d 条件②）", () => {
@@ -22855,7 +22852,7 @@ test("P1-5②：W2 换会话再认领 → rebind_session_alias（只改 aliases.
     const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
     fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, senders: [] }));
     // status=active（binding_status 合法）+ inbound_state=pending（代际仍是 pending）→ 认领走 claim 路径。
-    fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "prom", root, name: "待认领", root_message_id: "om_prom", expires_at: "2099-01-01T00:00:00Z", inbound_state: "pending", session_id: null, status: "active", bound_at: "2026-08-20T00:01:00.000Z" }] }));
+    fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "prom", root, name: "待认领", root_message_id: "om_prom", expires_at: "2099-01-01T00:00:00Z", inbound_state: "pending", session_id: null, status: "active", pending_token: "cccccc", bound_at: "2026-08-20T00:01:00.000Z" }] }));
     const ledgerRoot = path.join(local, "ledger"); const maintDir = path.join(local, "maint");
     const ledgerFile = path.join(ledgerRoot, ep, "ledger.json");
     // 初始 shadow 账本（initialize_shadow）。
@@ -22886,7 +22883,7 @@ test("P1-5②：W2 换会话再认领 → rebind_session_alias（只改 aliases.
     fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
     fs.writeFileSync(path.join(bin, "claude"), ["#!/usr/bin/env node", "process.stdout.write('回答：ok\\n');"].join("\n") + "\n", { mode: 0o700 });
     fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
-    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_p15b_1", sessionID: "aily_dm", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + "绑定该话题" } }) }] });
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_p15b_1", sessionID: "aily_dm", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + '\n\n**[引用]**\n绑定码    cccccc' } }) }] });
     const r = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_claim", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir } });
     delete process.env.FEISHU_BRIDGE_LEDGER_DIR; delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
     const ledger = JSON.parse(fs.readFileSync(ledgerFile, "utf-8"));
@@ -23091,7 +23088,7 @@ test("P2-① 真入口：崩溃重进（幂等重放）——同一条认领消�
   fs.mkdirSync(root, { recursive: true }); fs.mkdirSync(bin);
   const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
   fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, senders: [] }));
-  const seedProject = { id: "prom", root, name: "待认领", root_message_id: "om_prom", expires_at: "2099-01-01T00:00:00Z", inbound_state: "pending", session_id: null, status: "active", bound_at: "2026-08-20T00:01:00.000Z" };
+  const seedProject = { id: "prom", root, name: "待认领", root_message_id: "om_prom", expires_at: "2099-01-01T00:00:00Z", inbound_state: "pending", session_id: null, status: "active", pending_token: "aaaaaa", bound_at: "2026-08-20T00:01:00.000Z" };
   fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [seedProject] }));
   const ledgerRoot = path.join(local, "ledger"); const maintDir = path.join(local, "maint");
   const ledgerFile = path.join(ledgerRoot, ep, "ledger.json");
@@ -23115,7 +23112,7 @@ test("P2-① 真入口：崩溃重进（幂等重放）——同一条认领消�
   fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
   fs.writeFileSync(path.join(bin, "claude"), ["#!/usr/bin/env node", "process.stdout.write('回答：ok\\n');"].join("\n") + "\n", { mode: 0o700 });
   fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
-  const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_p21cr_1", sessionID: "aily_dm", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + "绑定该话题" } }) }] });
+  const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_p21cr_1", sessionID: "aily_dm", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + '\n\n**[引用]**\n绑定码    aaaaaa' } }) }] });
   const spawnEnv = { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_res", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id };
   const run1 = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: spawnEnv });
   const reg1 = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
@@ -23140,6 +23137,57 @@ test("P2-① 真入口：崩溃重进（幂等重放）——同一条认领消�
   } finally { fs.rmSync(local, { recursive: true, force: true }); }
 });
 
+// 守卫①（真入口，行为测试）：已启用端点 + 无码认领 → lock 内 verify 拒（需绑定码或 root attestation），
+//   registry 保持 pending、不写 shadow。这与上面 token-claim 版相反：token 认领（绑定码在引用块里）绑定；
+//   无码认领（only_pending）在已启用端点上整笔拒 —— 验证「守卫①执行的是效果，不是样子」。
+test("守卫① 真入口：已启用端点无码认领 → 整笔拒（需绑定码或 root attestation），registry 保持 pending、零 shadow 新步", () => {
+  const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "12345", chat_name: "群", chat_id: "oc_abc", default_freshness_ms: 900000, agent_uid: "agent_x" };
+  const at = `<at id="${TPL.transport_open_id}" type="employee">${TPL.transport_agent_name}</at> `;
+  const ep = legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid });
+  const local = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "p21rd-")));
+  const root = path.join(local, "project"); const bin = path.join(local, "bin");
+  fs.mkdirSync(root, { recursive: true }); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, senders: [] }));
+  // 不设 pending_token：这条认领是纯无码（only_pending）。
+  const seedProject = { id: "prom", root, name: "待认领", root_message_id: "om_prom", expires_at: "2099-01-01T00:00:00Z", inbound_state: "pending", session_id: null, status: "active", bound_at: "2026-08-20T00:01:00.000Z" };
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [seedProject] }));
+  const ledgerRoot = path.join(local, "ledger"); const maintDir = path.join(local, "maint");
+  const ledgerFile = path.join(ledgerRoot, ep, "ledger.json");
+  fs.mkdirSync(path.join(ledgerRoot, ep), { recursive: true, mode: 0o700 });
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot; process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = maintDir;
+  fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+  const ats = "2026-08-31T12:00:00.000Z"; const tok = "da88566e-d8d3-48ba-914e-7f96f4dfaeaa"; const sha = "b".repeat(64);
+  const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+  const tDone = (c) => ({ id: "timer:" + c, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: ats, chain: null });
+  const sDone = (c) => ({ id: "stub:" + c, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at: ats, chain: null });
+  const cDone = (c) => ({ id: "current:" + c, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at: ats, chain: null });
+  const gDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at: ats, chain: null });
+  const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+  const lStep = { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState, after: afterState, state: "done", at: ats, chain: "claude" };
+  fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: tok, reason: "seed", started_at: ats, updated_at: ats, phase: "done", steps: [...["claude", "codex"].flatMap((c) => [tDone(c), sDone(c), cDone(c)]), gDone(), lStep], notes: [] }), { mode: 0o600 });
+  const opId = "00000000-0000-0000-0000-000000000001";
+  fs.writeFileSync(ledgerFile, JSON.stringify({ schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: ep, chain: "claude", authority_mode: "shadow", revision: 1, operations: { [opId]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: ep, chain: "claude" }), result_revision: 1, result: { revision: 1 } } }, records: {} }, null, 2) + "\n", { mode: 0o600 });
+  const b1 = TAL.createB1({ endpointId: ep, requestKey: "req_seed_b1", chatId: TPL.chat_id, rootOm: "om_prom", lineageId: "lin_prom", bindingTarget: { runtime: "claude", project_root: root, claude_session_id: "33333333-3333-3333-3333-333333333333" } });
+  assert.ok(b1.ok, "createB1：" + JSON.stringify(b1));
+  assert.equal(endpointReceipt(maintDir, ep).state, "ok", "seed 收据应判 ok（M1a 已启用）");
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, "claude"), ["#!/usr/bin/env node", "process.stdout.write('回答：ok\\n');"].join("\n") + "\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
+  const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_p21rd_1", sessionID: "aily_dm", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + "绑定该话题" } }) }] });
+  const spawnEnv = { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_rd", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id };
+  const run = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: spawnEnv });
+  const reg = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
+  const led = JSON.parse(fs.readFileSync(ledgerFile, "utf-8"));
+  delete process.env.FEISHU_BRIDGE_LEDGER_DIR; delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
+  try {
+    assert.equal(reg.projects[0].inbound_state, "pending", "无码认领在已启用端点上不得绑定（仍 pending）：" + reg.projects[0].inbound_state);
+    const ops = Object.values(led.operations).map((op) => op.op_type);
+    assert.ok(!ops.includes("create_a1") && !ops.includes("activate"), "无码认领被拒 → 不写 shadow create_a1/activate：" + ops.join(","));
+    assert.ok((run.stdout + run.stderr).includes("而已启用端点不接受无码认领"), "应给出「需绑定码或 root attestation」文案：stdout=" + run.stdout + " stderr=" + run.stderr);
+  } finally { fs.rmSync(local, { recursive: true, force: true }); }
+});
+
 // P1-1③（#R37）：配对复合消息 = bind-only（layers-v2-permissions.md §4/§10-1 拍板）——
 //   首条受验 owner @ 完成配对成功后，**整条消息只做 R3 配对、正文不执行**，不论正文是空还是非空。
 //   现行只对空正文（EMPTY_INSTRUCTION）触发 bound 握手；非空正文在绑定后会继续按新策略执行 —— 这是
@@ -23154,7 +23202,7 @@ test("P1-1③ 真入口：配对复合消息 bind-only——受验 owner @ 配�
   fs.mkdirSync(root, { recursive: true }); fs.mkdirSync(bin);
   const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
   fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, senders: [] }));
-  const seedProject = { id: "prom", root, name: "待认领", root_message_id: "om_prom", expires_at: "2099-01-01T00:00:00Z", inbound_state: "pending", session_id: null, status: "active", bound_at: "2026-08-20T00:01:00.000Z" };
+  const seedProject = { id: "prom", root, name: "待认领", root_message_id: "om_prom", expires_at: "2099-01-01T00:00:00Z", inbound_state: "pending", session_id: null, status: "active", pending_token: "bbbbbb", bound_at: "2026-08-20T00:01:00.000Z" };
   fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [seedProject] }));
   const ledgerRoot = path.join(local, "ledger"); const maintDir = path.join(local, "maint");
   const ledgerFile = path.join(ledgerRoot, ep, "ledger.json");
@@ -23179,7 +23227,7 @@ test("P1-1③ 真入口：配对复合消息 bind-only——受验 owner @ 配�
   fs.writeFileSync(path.join(bin, "claude"), ["#!/usr/bin/env node", "process.stdout.write('回答：ok\\n');"].join("\n") + "\n", { mode: 0o700 });
   fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
   // 非空正文：这条消息的“正文”是真实的后续指令文字 —— 若 bind-only 不成立，它会继续按新策略执行/投递。
-  const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_p13c_1", sessionID: "aily_dm", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + "看一下最新进展" } }) }] });
+  const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_p13c_1", sessionID: "aily_dm", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + '\n\n**[引用]**\n绑定码    bbbbbb\n看一下最新进展' } }) }] });
   const spawnEnv = { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_p13c", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id };
   const run1 = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: spawnEnv });
   const reg1 = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
@@ -26642,6 +26690,52 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.equal(TAL.familyOf(talLoad(dir).records[b1Id].facts), "B1", "verify 拒 → 不归并（不 activate）");
   }));
 
+  // #守卫①（Frank 裁定）：已启用端点（有 init 收据）无码认领 → 锁内 verify 整笔拒（no_token_for_enabled）。
+  //   owner_root_no_token_v1 已停产：无码认领无诚实配对证明可写 → 不跑 legacy、不写 shadow、B1 保持 pending、
+  //   回执给「需绑定码或 root attestation」。
+  test("守卫① 接线：已启用端点无码认领（only_pending）锁内 verify 拒 → 整笔 fail-closed、不 activate、B1 保持 pending、回执给需绑定码或 root attestation", () => withRootAndReceipt((root, dir) => {
+    seedLedger(dir);
+    seedLedgerInitReceipt(path.join(root, "maint"), EP);
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_nt", rootOm: "om_nt", lineageId: "lin_nt", bindingTarget: { runtime: "claude", project_root: "/Users/dk/p", claude_session_id: uuid(4) } }), "B1 前置（pending，无码）");
+    const b1Id = famIds(talLoad(dir), "B1").pop();
+    // registry 侧：一份无码 pending（only_pending）作为被认领现场（与 inbound.mjs 锁内 verify 同构的重核）。
+    const f = pendingFixture([{ id: "nt", token: null }]);
+    const content = '<at id="ou_t">T</at> 干活'; // 无绑定码
+    let legacyCalls = 0;
+    const verify = () => {
+      const pendingVerify = findPendingBinding({ content, ...f, now: NOW2 });
+      if (!pendingVerify.ok) return { ok: false, reason: pendingVerify.reason, why: "锁内重核：pending 现场不再可认领（" + (pendingVerify.reason ?? "unknown") + "）" };
+      if (pendingVerify.matchedBy === "only_pending") return { ok: false, reason: "no_token_for_enabled", why: "端点已启用：需绑定码或 root attestation（已启用端点不接受无码认领）" };
+      const promo = evaluatePromotion({ event: okEvent, template: TPL, pending: pendingVerify, now: NOW2 });
+      if (!promo.ok) return { ok: false, reason: promo.reason, why: "锁内重核：认领六件事不再成立（" + (promo.reason ?? "unknown") + "）" };
+      if (promo.f4 != null && promo.f4.matched_om !== (pendingVerify.generation?.root_message_id ?? null)) return { ok: false, reason: "f4_changed", why: "锁内重核：matched_om 与锁内 locator 不符" };
+      return { ok: true, f4: promo.f4 };
+    };
+    const w = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: () => { legacyCalls += 1; return { legacyCommitted: true }; }, locator: "om_nt", claimKey: claim("nt"), sessionId: "sess_nt", authorizedBy: "ou_o", f4: null, verify });
+    assert.equal(w.ok, false, "已启用 + 无码 → 整笔拒：" + JSON.stringify(w));
+    assert.equal(w.reason, "no_token_for_enabled", "透传 no_token_for_enabled");
+    assert.match(w.why ?? "", /需绑定码或 root attestation/u, "回执 why 含「需绑定码或 root attestation」");
+    assert.equal(legacyCalls, 0, "verify 拒 → 不跑 legacy");
+    assert.ok(w.shadow == null || w.shadow.length === 0, "verify 拒 → 不写 shadow");
+    assert.equal(TAL.familyOf(talLoad(dir).records[b1Id].facts), "B1", "verify 拒 → 不归并（B1 保持 pending，无 activate/配对证明）");
+  }));
+
+  // #守卫①：未启用端点（never_initialized，无 init 收据）无码认领 → 锁内 verify 甚至不被调用 —— 无码照旧 legacy-only 激活。
+  //   保证 reject 只发生在「已启用端点管辖域内」，未启用端点完全不变（既有纯 legacy 行为）。
+  test("守卫① 接线：未启用端点无码认领（only_pending）→ verify 不叫、legacy-only 照旧激活、不写 shadow", () => withRootAndReceipt((root, dir) => {
+    const maint = path.join(root, "maint");
+    fs.rmSync(maint, { recursive: true, force: true }); // 确证 ENOENT → never_initialized（合法 legacy-only）
+    let legacyCalls = 0;
+    const w = WIRE.wirePromoteBinding({
+      endpointId: EP, env: process.env,
+      legacy: () => { legacyCalls += 1; return { ok: true, legacyCommitted: true }; },
+      locator: "om_nt", claimKey: claim("nt"), sessionId: "sess_nt", authorizedBy: "ou_o", f4: null,
+      verify: () => { throw new Error("verify 不应在未启用（never_initialized）端点被调用"); },
+    });
+    assert.ok(w.ok, "未启用 + 无码 → legacy-only 照旧 ok：" + JSON.stringify(w));
+    assert.equal(legacyCalls, 1, "legacy 已跑一次");
+    assert.equal(w.shadow.length, 0, "未启用不写 shadow");
+  }));
   // P1-1-d：账本 G15 对 F4 判别联合的收口——token 认领→binding_token_v1（四项 present）／no-token 认领→
   //   owner_root_no_token_v1（三项 absent）／伪造（四项+absent、三项+present、缺项、混合）→ G15 整笔拒。
   test("P1-1-d 账本：F4 判别联合 G15——token 四项 present→B3 binding_token_v1；no-token 三项 absent→owner_root_no_token_v1；伪造即拒", () => withRoot((root, dir) => {

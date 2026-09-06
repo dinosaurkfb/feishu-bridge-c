@@ -410,6 +410,9 @@ if (!routed.ok) {
       const nowVerify = Date.now();
       const pendingVerify = findPendingTask({ home: HOME, content: event.content, now: nowVerify });
       if (!pendingVerify.ok) return { ok: false, reason: pendingVerify.reason, why: "锁内重核：pending 现场不再可认领（" + (pendingVerify.reason ?? "unknown") + "）" };
+      // #守卫①：这里已在锁内 = 端点有 init 收据（已启用）。sole_pending（无码认领）自 owner_root_no_token_v1
+      //   停产后没有可写的诚实配对证明 —— 整笔拒（legacy 不跑、shadow 不写）。
+      if (pendingVerify.source === "sole_pending") return { ok: false, reason: "no_token_for_enabled", why: "端点已启用：需绑定码或 root attestation（已启用端点不接受无码认领）" };
       const promoVerify = evaluatePromotion({ event, template: template.template, pending: pendingVerify, now: nowVerify });
       if (!promoVerify.ok) return { ok: false, reason: promoVerify.reason, why: "锁内重核：认领六件事不再成立（" + (promoVerify.reason ?? "unknown") + "）" };
       if (promoVerify.f4 != null && promoVerify.f4.matched_om !== (pendingVerify.generation?.root_message_id ?? null)) return { ok: false, reason: "f4_changed", why: "锁内重核：matched_om 与锁内 locator 不符" };
@@ -418,7 +421,12 @@ if (!routed.ok) {
   });
   if (!wiredPromote.ok) {
     writeReceipt("promote-m1a-" + (event.message_id ?? Date.now()), { status: "rejected", reason: wiredPromote.reason ?? "m1a_reject", why: wiredPromote.why ?? null, lock: wiredPromote.lock ?? null, claim_acquired: false, handed_off: false, subscription_claim_shadow: subscriptionClaimShadow });
-    finish("rejected", { reasonText: "这条认领的 M1a 一致性锁取不到（" + (wiredPromote.reason ?? "unknown") + "），未绑定，请稍后再试一次" }, { reason: wiredPromote.reason ?? "m1a_reject" });
+    // #守卫①：无码认领被已启用端点拒绝 → 用「需绑定码或 root attestation」文案，而不是通用「锁取不到」。
+    const finishReason = wiredPromote.reason ?? "m1a_reject";
+    const reasonText = finishReason === "no_token_for_enabled"
+      ? "这条认领没有绑定码，而已启用端点不接受无码认领（需绑定码或 root attestation），未绑定"
+      : "这条认领的 M1a 一致性锁取不到（" + finishReason + "），未绑定，请稍后再试一次";
+    finish("rejected", { reasonText }, { reason: finishReason });
   }
   const promoted = wiredPromote.legacy;
   if (!promoted.ok) {

@@ -25450,6 +25450,58 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
       if (savedTpl === undefined) delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; else process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = savedTpl;
     }
   }));
+  test("P2-2 wireBind CLI 集成（bind-session）：已启用端点 → 建话题+登记进闭包 + 镜像 shadow create_b1（target 精确）；恰好一次 sendToChat；未启用端点 → 合法 legacy-only", () => withRootAndReceipt((root, dir) => {
+    const ep = legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid });
+    seedLedgerInitReceipt(path.join(root, "maint"), ep);   // M1a 已启用（agent_x）→ 双写强制
+    // 初始 shadow 账本（initialize_shadow）：CLI 端点=ep（由 chain 模板 agent_uid 派生），目录名必须是 ep 本身。
+    const agentDir = path.join(root, ep);
+    fs.mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+    const opId0 = "00000000-0000-0000-0000-000000000001";
+    fs.writeFileSync(path.join(agentDir, "ledger.json"), JSON.stringify({ schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: ep, chain: "claude", authority_mode: "shadow", revision: 1, operations: { [opId0]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: ep, chain: "claude" }), result_revision: 1, result: { revision: 1 } } }, records: {} }, null, 2) + "\n", { mode: 0o600 });
+    const home = path.join(root, "home"); fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ apps: [{ name: "claude", appId: "cli_y" }] }));   // 供 preflight 校验身份
+    const proj = path.join(root, "proj"); fs.mkdirSync(proj);
+    const sessId = "a1b2c3d4-1111-2222-3333-444455556666";
+    const pidS = "424242";
+    const sessDir = path.join(home, ".claude", "sessions"); fs.mkdirSync(sessDir, { recursive: true });
+    fs.writeFileSync(path.join(sessDir, pidS + ".json"), JSON.stringify({ sessionId: sessId, kind: "interactive", name: "测试线", cwd: proj }));
+    const logFile = path.join(root, "lark.log");
+    const binFile = path.join(root, "fake-lark.sh");
+    fs.writeFileSync(binFile, "#!/usr/bin/env node\n" +
+      "const fs = require('node:fs');\n" +
+      "fs.appendFileSync(process.env.__LARK_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');\n" +
+      "process.stdout.write('{\"ok\":true,\"data\":{\"message_id\":\"om_sentClaude\"}}');\n", { mode: 0o700 });
+    const tplFile = path.join(root, "chain-config.json");
+    fs.writeFileSync(tplFile, JSON.stringify(Object.assign({}, TPL, { lark_cli_bin: binFile, lark_cli_home: home, chat_id: "oc_claude" })));
+    const regFile = path.join(root, "registry.json");
+    const saved = {};
+    for (const k of ["FEISHU_BRIDGE_REGISTRY", "FEISHU_BRIDGE_CHAIN_TEMPLATE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "HOME", "__LARK_LOG"]) saved[k] = process.env[k];
+    Object.assign(process.env, { FEISHU_BRIDGE_REGISTRY: regFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile, CLAUDE_CODE_SESSION_ID: sessId, CLAUDE_PID: pidS, HOME: home, __LARK_LOG: logFile });
+    try {
+      const run = spawnSync(process.execPath, [path.resolve("scripts", "bind-session.mjs"), "--apply"], { encoding: "utf-8", env: process.env });
+      const out = (run.stdout || "") + (run.stderr || "");
+      assert.equal(run.status, 0, "bind-session --apply 应成功：status=" + run.status + "：" + out);
+      assert.ok(out.includes("om_sentClaude"), "根话题已建立：" + out);
+      const doc = TAL.loadLedger(agentDir, { endpointId: ep }).doc;
+      const b1Id = Object.entries(doc.records).filter(([, r]) => r.kind === "live" && TAL.familyOf(r.facts) === "B1").map(([k]) => k)[0];
+      assert.ok(b1Id, "应有 create_b1 镜像 B1 记录：" + JSON.stringify(doc.records));
+      const rec = doc.records[b1Id];
+      assert.equal(rec.binding_target.runtime, "claude", "target.runtime");
+      assert.equal(rec.binding_target.project_root, fs.realpathSync(proj), "target.project_root 规范化");
+      assert.equal(rec.binding_target.claude_session_id, sessId, "target.claude_session_id");
+      assert.equal(rec.generation_lineage_id, "proj@project-files", "generation_lineage_id=basename(root)@project-files");
+      assert.equal(rec.chat_id, "oc_claude", "chat_id");
+      assert.equal(rec.aliases.root_om, "om_sentClaude", "root_om 来自 legacy 返回");
+      const reg = JSON.parse(fs.readFileSync(regFile, "utf-8"));
+      assert.equal(reg.projects.length, 1, "一条登记");
+      assert.equal(reg.projects[0].claude_session_id, sessId);
+      assert.equal(reg.projects[0].root_message_id, "om_sentClaude");
+      const sendCalls = fs.readFileSync(logFile, "utf-8").trim().split("\n").filter((line) => line.includes("+messages-send"));
+      assert.equal(sendCalls.length, 1, "恰好一次 sendToChat（messages-send）：" + JSON.stringify(sendCalls));
+    } finally {
+      for (const k of Object.keys(saved)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+    }
+  }));
   test("账本：可重复动作往返各执行(request_key) + 同 key 异载荷冲突 + 数组 id 拒 + 精确权限", () => withRoot((root, dir) => {
     seedLedger(dir);
     // 建 B3

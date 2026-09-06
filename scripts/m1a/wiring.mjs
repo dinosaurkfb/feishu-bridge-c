@@ -68,10 +68,13 @@ export function uncleanWired(wired) {
   const failedSteps = steps.filter((s) => s && s.ok === false).map((s) => ({
     op: s.op ?? null, reason: s.reason ?? null, why: s.why ?? null,
   }));
+  // #R37 P1-3：capture() 对 ok:true 步产出 committed:（res.commit ?? null），字段名是 committed 不是 commit。
+  // 旧版读 s.commit 恒为 undefined → ② 类（非干净提交）永不触发；且阈值 !=="committed" 永不匹配真实值
+  // （committed_clean / committed_with_residue / committed_durability_uncertain）—— 一并修正。
   const uncleanSteps = steps.filter((s) => s && s.ok === true && (
-    (s.commit && s.commit !== "committed") || s.residue || s.lockUncleared || s.path || s.error
+    (s.committed && s.committed !== "committed_clean") || s.residue || s.lockUncleared || s.path || s.error
   )).map((s) => ({
-    op: s.op ?? null, commit: s.commit ?? "committed", residue: s.residue ?? null,
+    op: s.op ?? null, commit: s.committed ?? "committed_clean", residue: s.residue ?? null,
     lockUncleared: s.lockUncleared ?? null, path: s.path ?? null, error: s.error ?? null,
   }));
   const rel = wired?.release;

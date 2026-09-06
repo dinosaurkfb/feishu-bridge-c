@@ -30164,14 +30164,15 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     assert.equal(unc1.failedSteps[0].op, "create_a1", "failedSteps[0].op 应为失败步");
 
     // ② 非干净提交（committed_with_residue）→ 不干净，uncleanSteps 点名；legacy 语义仍 ok。
-    const residueCommit = { ok: true, legacy: { ok: true }, shadow: [{ op: "void", ok: true, commit: "committed_with_residue", residue: { reap: ".reaped-x" } }], release: null };
+    // #R37 P1-3：capture() 对 ok:true 步产出 committed:（不是 commit:）—— 投影必须读 committed 字段。
+    const residueCommit = { ok: true, legacy: { ok: true }, shadow: [{ op: "void", ok: true, committed: "committed_with_residue", residue: { reap: ".reaped-x" } }], release: null };
     const unc2 = WIRE.uncleanWired(residueCommit);
     assert.equal(unc2.clean, false, "committed_with_residue 应不干净");
     assert.equal(unc2.uncleanSteps.length, 1, "uncleanSteps 应点名非干净提交步");
     assert.equal(unc2.uncleanSteps[0].commit, "committed_with_residue", "uncleanSteps[0].commit 应保留原语");
 
     // ③ release 残骸 → 不干净，releaseUnclean 点名。
-    const releaseDirty = { ok: true, legacy: { ok: true }, shadow: [{ op: "void", ok: true, commit: "committed", sha256: "sha" }], release: { ok: false, reason: "reap_uncleared", path: "/x/m1a-order.lock", error: "EIO" } };
+    const releaseDirty = { ok: true, legacy: { ok: true }, shadow: [{ op: "void", ok: true, committed: "committed_clean", sha256: "sha" }], release: { ok: false, reason: "reap_uncleared", path: "/x/m1a-order.lock", error: "EIO" } };
     const unc3 = WIRE.uncleanWired(releaseDirty);
     assert.equal(unc3.clean, false, "release 残骸应不干净");
     assert.equal(unc3.releaseUnclean.reason, "reap_uncleared", "releaseUnclean 应点名 release 残骸");
@@ -30184,12 +30185,36 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     assert.equal(unc4.lockUnclean.error, "EPERM", "lockUnclean 应带残骸 error");
 
     // ⑤ 干净启用点（shadow：单步均 committed，release ok:true）→ 干净，emitUncleanReceipt 静默。
-    const clean = { ok: true, legacy: { ok: true }, shadow: [{ op: "void", ok: true, commit: "committed" }], release: { ok: true, lock: "/x/m1a-order.lock" } };
-    assert.equal(WIRE.uncleanWired(clean).clean, true, "单步 committed + release ok 应干净");
+    const clean = { ok: true, legacy: { ok: true }, shadow: [{ op: "void", ok: true, committed: "committed_clean" }], release: { ok: true, lock: "/x/m1a-order.lock" } };
+    assert.equal(WIRE.uncleanWired(clean).clean, true, "单步 committed_clean + release ok 应干净");
     let em = "";
     const prevErr = console.error; console.error = (s) => { em += s; };
     try { WIRE.emitUncleanReceipt("cli_void", clean, { opId: "o" }); } finally { console.error = prevErr; }
     assert.equal(em, "", "干净时 emitUncleanReceipt 应静默");
+  });
+
+  // #R37 P1-3：capture 字段统一 —— 旧版 uncleanWired 读 s.commit，而 capture 写 s.committed，
+  // 令 committed_with_residue / committed_durability_uncertain 被当成干净（② 类永不触发）。
+  // 用 capture() 的真实输出形状（committed: 字段）+ 真实值（committed_clean 干净）验证投影不谎报。
+  test("m1a unclean 投影：capture 字段统一（P1-3）", () => {
+    // capture() 产出 committed: res.commit ?? null。投影必须读 committed；旧版读 commit 恒 undefined → 误判干净。
+    const residueCapture = { ok: true, legacy: { ok: true }, shadow: [{ op: "create_b1", ok: true, committed: "committed_with_residue", residue: { reap: ".reaped-x" } }], release: null };
+    const uc = WIRE.uncleanWired(residueCapture);
+    assert.equal(uc.clean, false, "capture 产出的 committed_with_residue 应不干净（P1-3 字段统一）");
+    assert.equal(uc.uncleanSteps.length, 1, "uncleanSteps 应点名该非干净提交步");
+    assert.equal(uc.uncleanSteps[0].op, "create_b1", "uncleanSteps[0].op 应为该步");
+    assert.equal(uc.uncleanSteps[0].commit, "committed_with_residue", "uncleanSteps[0].commit 应保留原语");
+
+    // 干净提交（committed_clean）不得被误报；capture 会写 committed_clean。
+    const cleanCapture = { ok: true, legacy: { ok: true }, shadow: [{ op: "create_b1", ok: true, committed: "committed_clean", sha256: "sha" }], release: { ok: true, lock: "/x/m1a-order.lock" } };
+    assert.equal(WIRE.uncleanWired(cleanCapture).clean, true, "committed_clean 应干净");
+
+    // durability_uncertain 同样是真实非干净值，必须点名（② 类第二条）。
+    const durCapture = { ok: true, legacy: { ok: true }, shadow: [{ op: "create_b1", ok: true, committed: "committed_durability_uncertain" }], release: null };
+    const du = WIRE.uncleanWired(durCapture);
+    assert.equal(du.clean, false, "committed_durability_uncertain 应不干净");
+    assert.equal(du.uncleanSteps[0].commit, "committed_durability_uncertain", "uncleanSteps[0].commit 应保留原语");
+    assert.equal(du.durabilityUncertain, true, "durabilityUncertain 应点名");
   });
 
 summarySealed = true;

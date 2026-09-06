@@ -157,6 +157,40 @@ export function validateLedgerRoot({ env = process.env, mustExistRoot = true } =
 }
 
 /**
+ * R46：账本根门内自建（init 专用，幂等）——只建末级一层，父链/形状/权限全交 validateLedgerRoot。
+ * 受验顺序：先 mustExistRoot:true 判 —— 根在场即走完整受验（canonical + 0700），ok 直接返回不重复建；
+ * root_absent = 父链已受验（validateLedgerRoot 内部先逐层 lstat + realpath 边界）且末级确实缺席才准创建；
+ * 其余 reason（root_symlink/root_not_canonical/root_perms/root_unresolvable/no_root）原样 fail，绝不创建、
+ * 绝不放宽现存根权限（0755 就拒，不 chmod 收编）。创建：mkdirSync(recursive:false, 0o700) —— 绝不 recursive:true
+ * （父链缺失时让它 ENOENT，不穿越建多层）；chmodSync 0700 兜 umask；父目录 fsync（EINVAL/ENOTSUP/EOPNOTSUPP
+ * 容忍，其余失败不吞）；末级 validateLedgerRoot 复核（形状/权限/竞态 EEXIST 全过它）通过才返回 ok。
+ * 返回 { ok:true, root, created } 或 { ok:false, reason, why?, created }。
+ */
+export function provisionLedgerRoot({ env = process.env } = {}) {
+  const root = ledgerRoot(env);
+  if (!root) return { ok: false, reason: "no_root", created: false };
+  const pre = validateLedgerRoot({ env, mustExistRoot: true });
+  if (pre.ok) return { ok: true, root: pre.root, created: false };
+  if (pre.reason !== "root_absent") return { ok: false, reason: pre.reason, why: pre.why, created: false };
+  try { fs.mkdirSync(root, { recursive: false, mode: 0o700 }); }
+  catch (err) {
+    // EEXIST：拿锁间隙被人捷足先登 —— 不在这里判生死，交末尾复核（形状/权限不合格照样拒）
+    if (err?.code !== "EEXIST") return { ok: false, reason: "root_provision_failed", why: String(err.code ?? err.message), created: false };
+  }
+  try { fs.chmodSync(root, 0o700); }
+  catch (err) { return { ok: false, reason: "root_provision_failed", why: "chmod：" + String(err.code ?? err.message), created: true }; }
+  try {
+    const pfd = fs.openSync(path.dirname(root), fs.constants.O_RDONLY);
+    try { fs.fsyncSync(pfd); } finally { try { fs.closeSync(pfd); } catch { /* 已关 */ } }
+  } catch (err) {
+    if (!["EINVAL", "ENOTSUP", "EOPNOTSUPP"].includes(err?.code)) return { ok: false, reason: "root_provision_failed", why: "父目录 fsync：" + String(err.code ?? err.message), created: true };
+  }
+  const post = validateLedgerRoot({ env, mustExistRoot: true });
+  if (!post.ok) return { ok: false, reason: post.reason, why: post.why, created: true };
+  return { ok: true, root: post.root, created: true };
+}
+
+/**
  * 由 endpointId 派生受验目录：root 必须存在且是真目录（realpath 自洽），dir=root/endpoint；
  * dir 若已存在必是真目录（非符号链接）且 realpath 落在 realpath(root) 下。首次 init 时 dir 尚不存在（允许）。
  * 返回 { ok, dir, root } 或 { ok:false, reason }。

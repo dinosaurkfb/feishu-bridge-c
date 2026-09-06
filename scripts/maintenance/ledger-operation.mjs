@@ -37,7 +37,7 @@ import { bootstrapTimer, timerPhase } from "./timers.mjs";
 import { readSidecarCurrent, writeSidecarPrepared } from "./sidecar-writer.mjs";
 import { TERMINAL_PHASES, acquireOperationLease, addNote, clearActive, enterLedgerForward, markStepDone, readActive, readJournal, releaseOperationLease, setPhase, verifyBackup } from "./journal.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
-import { authorityCutover, cutoverPlan, initPlan, initializeShadow, loadLedger, resolveEndpointDir } from "../topic-agent-ledger.mjs";
+import { authorityCutover, cutoverPlan, initPlan, initializeShadow, loadLedger, provisionLedgerRoot, resolveEndpointDir } from "../topic-agent-ledger.mjs";
 import { endpointReceipt } from "./ledger-receipt.mjs";
 
 const CHAINS = ["claude", "codex"];
@@ -280,6 +280,14 @@ export function ledgerForward(ctx, { token, lease, intent = null, env = process.
   let phase = doc.phase;
   const sub = doc.operation_kind === "ledger_init" ? "init" : doc.operation_kind === "ledger_cutover" ? "cutover" : null;
   if (!sub) return { ok: false, reason: "bad_operation_kind", phase };
+
+  // R46：init 门内自建账本根（此刻安装面锁 + operation lease 已在手；cutover 不建 —— 根必须已受验在场）。
+  // 幂等：根已受验在场时 created:false 零副作用；失败原样 fail（含父链 symlink/权限不合格）
+  // —— rollbackSafe：账本步未准备/未写盘，回退清场不留维护态。
+  if (sub === "init") {
+    const pv = provisionLedgerRoot({ env });
+    if (!pv.ok) return { ok: false, reason: pv.reason, why: pv.why ?? null, phase, rollbackSafe: true, provision: { created: pv.created === true } };
+  }
 
   // 1. drained → 落不可逆前向边界（只有首次 ledgerEnter 会到；崩溃重跑在 drained 由 ledgerExit 转回退）
   let planPre = null;

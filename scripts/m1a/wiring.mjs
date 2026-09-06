@@ -206,12 +206,12 @@ export function wireChatA1({ agentUid, chatId, sessionId, messageId, env = proce
  * wireCreateA1 —— 两链所有 A1 物化入口（任一受验首条 @ 的 chat 记录）→ 账本 create_a1。
  * ext=入站 message id；entity=受验 Aily session locator；key 一请求一值。
  */
-export function wireCreateA1({ endpointId, env = process.env, legacy, chatId, sessionId, messageId, now = Date.now() }) {
+export function wireCreateA1({ endpointId, env = process.env, legacy, chatId, sessionId, messageId, now = Date.now(), _inject = null }) {
   return runWired({ endpointId, env, legacy, submit: (legacyRes) => {
     if (!en(messageId) || !en(sessionId)) return [{ op: "create_a1", ok: false, reason: "bad_external_id", why: "messageId/sessionId 必填 1..256 字符串" }];
     const k = rk("create_a1", messageId, sessionId);
     if (!k.ok) return [{ op: "create_a1", ...k }];
-    return [capture("create_a1", createA1({ endpointId, requestKey: k.request_key, chatId, sessionId, now, env }))];
+    return [capture("create_a1", createA1({ endpointId, requestKey: k.request_key, chatId, sessionId, now, env, _inject }))];
   } });
 }
 

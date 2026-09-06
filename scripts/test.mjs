@@ -25344,6 +25344,29 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.equal(Object.keys(cxDoc.doc.records).length, 1, "codex 账本落一条 A1");
     assert.ok(!fs.existsSync(path.join(dir, "ledger.json")), "codex 双写不碰 claude 账本根（隔离：各自账本根）");
   }));
+
+  test("P2-2 守卫③ 真实 capture 字段：真跑一笔 wiring shadow 提交，把 commit 逼成非干净 → uncleanWired 读真实 committed 字段判 clean:false（不许手捏对象）", () => withRootAndReceipt((root, dir) => {
+    const maint = path.join(root, "maint");
+    seedLedgerInitReceipt(maint, EP);   // 端点 ok（M1a 已启用）
+    seedLedger(dir);                    // 初始 shadow 账本（authority_mode=shadow）
+    const w = WIRE.wireCreateA1({
+      endpointId: EP, env: process.env, legacy: () => ({ legacyCommitted: true }),
+      chatId: "oc_g3", sessionId: "sess_g3", messageId: "msg_g3",
+      _inject: { failDirFsync: true },  // 注入目录 fsync 失败 → 非干净已提交
+    });
+    assert.ok(w.ok, "legacy 成功语义不改（提交被逼非干净但数据已在）：" + JSON.stringify(w));
+    assert.equal(w.shadow.length, 1, "一笔 shadow");
+    const step = w.shadow[0];
+    assert.equal(step.op, "create_a1");
+    assert.equal(step.ok, true, "数据确已提交");
+    // P1-3：capture() 产出的真实字段名是 committed（不是 commit）；uncleanWired 读它判非干净提交。
+    assert.equal(step.committed, "committed_durability_uncertain", "capture 读真实 committed 字段（目录 fsync 注入失败）");
+    const unc = WIRE.uncleanWired(w);
+    assert.equal(unc.clean, false, "非干净已提交 → uncleanWired 判 clean:false（不是只看 legacy 成功）");
+    assert.equal(unc.uncleanSteps.length, 1, "uncleanSteps 命中该步");
+    assert.equal(unc.uncleanSteps[0].op, "create_a1");
+    assert.equal(unc.uncleanSteps[0].commit, "committed_durability_uncertain", "断言落在真实字段名 committed 上");
+  }));
   test("账本：可重复动作往返各执行(request_key) + 同 key 异载荷冲突 + 数组 id 拒 + 精确权限", () => withRoot((root, dir) => {
     seedLedger(dir);
     // 建 B3
@@ -26448,6 +26471,40 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.equal(b3b.binding_proof.matched_om, "om_pf2", "配对证明以锁内重核 f4 为准（非调用侧 om_wrong）");
     assert.deepEqual(b3b.binding_proof.matched_fields, ["chat_id", "sender", "thread_root"], "锁内重核 f4 的 matched_fields 透传");
     assert.equal(b3b.binding_proof.pending_token_state, "absent", "锁内重核 f4 的 no-token 支透传");
+  }));
+
+  test("P2-2 守卫② 外锁前后 pending 集变化：锁内真实重扫 findPendingBinding 见第二位 → 整笔拒，不 activate、零 proof", () => withRootAndReceipt((root, dir) => {
+    seedLedger(dir);
+    seedLedgerInitReceipt(path.join(root, "maint"), EP);
+    // 账本侧先落一份 B1（pending，locator=om_g2），作为被认领代际。
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_g2", rootOm: "om_g2", lineageId: "lin_g2", bindingTarget: { runtime: "claude", project_root: "/Users/dk/p", claude_session_id: uuid(9) } }), "B1 前置");
+    const b1Id = famIds(talLoad(dir), "B1").pop();
+    // registry 侧：外锁判定时只有一份待绑定；锁内重扫前注入第二位（模拟并发把 pending 集改脏）。
+    const f = routeFixture([{ id: "g2a", extra: {} }]);
+    const reg = JSON.parse(fs.readFileSync(f.regFile, "utf-8"));
+    reg.projects[0].inbound_state = "pending";
+    reg.projects[0].bound_at = new Date(NOW2 - 60_000).toISOString();
+    fs.writeFileSync(f.regFile, JSON.stringify(reg));
+    let legacyCalls = 0;
+    const verify = () => {
+      // 模拟竞态：在位 lock 与 outer 判定之间，第二位待绑定出现。
+      const reg2 = JSON.parse(fs.readFileSync(f.regFile, "utf-8"));
+      if (reg2.projects.length < 2) {
+        reg2.projects.push({ id: "g2b", root: f.entries[0].root + "-race", root_message_id: "om_g2b", expires_at: "2099-01-01T00:00:00Z", inbound_state: "pending", bound_at: new Date(NOW2 - 60_000).toISOString() });
+        fs.writeFileSync(f.regFile, JSON.stringify(reg2));
+      }
+      const pending = findPendingBinding({ ...files(f), now: NOW2 });
+      if (!pending.ok) return { ok: false, reason: pending.reason, why: "锁内重核：待绑定现场不再可认领（" + (pending.reason ?? "unknown") + "）" };
+      const promo = evaluatePromotion({ event: okEvent, template: TPL, pending, now: NOW2 });
+      if (promo.f4 != null && promo.f4.matched_om !== pending.generation?.root_message_id) return { ok: false, reason: "f4_changed", why: "锁内重核：matched_om 与锁内 locator 不符" };
+      return { ok: true, f4: promo.f4 };
+    };
+    const w = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: () => { legacyCalls += 1; return { legacyCommitted: true }; }, locator: "om_g2", claimKey: claim("g2"), sessionId: "sess_g2", authorizedBy: "ou_o", f4: F4B("om_g2"), verify });
+    assert.equal(w.ok, false, "锁内真实重扫见第二位 → 整笔拒：" + JSON.stringify(w));
+    assert.equal(w.reason, PROMOTE_REJECT.MULTIPLE_PENDING, "透传真实 pending 判定 reason（不是 stub 的 stale_conclusion）：" + w.reason);
+    assert.equal(legacyCalls, 0, "verify 拒 → 不跑 legacy");
+    assert.ok(w.shadow == null || w.shadow.length === 0, "verify 拒 → 不写 shadow");
+    assert.equal(TAL.familyOf(talLoad(dir).records[b1Id].facts), "B1", "verify 拒 → 不归并（不 activate）");
   }));
 
   // P1-1-d：账本 G15 对 F4 判别联合的收口——token 认领→binding_token_v1（四项 present）／no-token 认领→

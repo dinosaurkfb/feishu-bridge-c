@@ -156,44 +156,91 @@ export function validateLedgerRoot({ env = process.env, mustExistRoot = true } =
   return { ok: true, root: realRoot };
 }
 
+/** 对已 open 的父目录 fd 做 fsync（P1-3：既有根快路与新建根共用同一父目录持久化屏障）。 */
+function fsyncDirFd(fd, inj) {
+  if (inj.failFsync) return { ok: false, reason: "fsync_failed", why: "注入 fsync 失败" };
+  try { fs.fsyncSync(fd); return { ok: true }; }
+  catch (err) { return { ok: false, reason: "fsync_failed", why: "父目录 fsync：" + String(err?.code ?? err?.message ?? err) }; }
+}
+
 /** R46：init 门内、写账本前自建账本根（单层，绝不 recursive）。受验：
- *  1) validateLedgerRoot(mustExistRoot:true) —— 根已在场且 0700 真目录 → 无需建，直接返回；
+ *  1) validateLedgerRoot(mustExistRoot:true) —— 根已在场且 0700 真目录 → 重做父目录 fsync（P1-3：上次 fsync
+ *     失败可能留着未落盘目录条目，快路不 fsync 会把那次失败洗白成成功），只读不改目录，然后返回；
  *     父链任一 symlink → root_not_canonical；不可解析 → root_unresolvable；根非 0700 → root_perms（不放宽）。
  *     只有 rv.reason === "root_absent"（父链受验净、末级确实缺席）才允许自建。
- *  2) 缺席 → mkdirSync(root,{recursive:false, mode:0o700})；父目录缺席 → ENOENT → 原样 fail（不递归创建）。
- *  3) chmodSync 0700 兜 umask；fsync 父目录。
- *  4) 再 validateLedgerRoot(mustExistRoot:true) 复核通过才算数。任一步失败不吞、原样 fail。
- *  返回 { ok:true, root } 或 { ok:false, reason, why }。 */
+ *  2) P1-2 TOCTOU 防护：先 open 父目录 fd 钉住 inode、受验父 realpath；路径式 mkdir 后立刻复核父 realpath，
+ *     父目录在受验后被并发换成外指 symlink → mkdir 写进外指目标 → 回滚刚建目录并 root_not_canonical（net-zero）。
+ *  3) mkdirSync(root,{recursive:false, mode:0o700})；父目录缺席 → ENOENT → 原样 fail（不递归创建）。
+ *  4) chmodSync 0700 兜 umask；fsync 父目录（用钉住的 fd）。
+ *  5) 再 validateLedgerRoot(mustExistRoot:true) 复核通过才算数。任一步失败不吞、原样 fail。
+ *  返回 { ok:true, root } 或 { ok:false, reason, why }。
+ *  测试注入点：failMkdir / failChmod / failFsync（既有）+ onBeforeMkdir（P1-2 竞态：在 mkdir 前把父目录换成外指 symlink）。 */
 export function ensureLedgerRoot({ env = process.env, _inject = null } = {}) {
   const inj = _inject ?? {};
-  // ① 先以"必须在场"核验：根已在场且 0700 真目录 → 不需要建，直接返回。
+  // ① 以"必须在场"核验：根已在场且 0700 真目录 → 也要重做父目录持久化屏障（P1-3），只读、不改目录，然后返回。
   //    root_not_canonical / root_unresolvable / root_perms / root_symlink → 原样拒（不创建）。
   const rv = validateLedgerRoot({ env, mustExistRoot: true });
-  if (rv.ok) return rv;
+  if (rv.ok) {
+    const parent = path.dirname(rv.root);
+    let pfd = null;
+    try { pfd = fs.openSync(parent, fs.constants.O_RDONLY); }
+    catch (err) { return { ok: false, reason: "parent_open_failed", why: "打开父目录：" + String(err?.code ?? err?.message ?? err) }; }
+    const f = fsyncDirFd(pfd, inj);
+    fs.closeSync(pfd);
+    if (!f.ok) return f;
+    return { ok: true, root: rv.root };
+  }
   // 只有"父链受验且末级确实缺席"（root_absent）才允许自建；no_root 无路径可建，也拒。
   if (rv.reason !== "root_absent") return rv;
   const root = ledgerRootFor(env); // 合法缺席：root_absent 返回不带 root，路径从 ledgerRootFor 取（父链已受验净）
   const parent = path.dirname(root);
+  // P1-2：先受验父目录 realpath 并 open 钉住 inode，再在受验父上创建 —— 防"受验后父目录被并发换成
+  // 外指 symlink"的越界写。路径式 mkdir 后即时复核父 realpath，被换 → 回滚并拒（net-zero）。
+  let parentReal = null;
+  try { parentReal = fs.realpathSync(parent); }
+  catch (err) { return { ok: false, reason: err?.code === "ENOENT" ? "parent_absent" : "parent_unresolvable", why: "父目录 realpath：" + String(err?.code ?? err?.message ?? err) }; }
+  let pfd = null;
+  try { pfd = fs.openSync(parent, fs.constants.O_RDONLY); }
+  catch (err) { return { ok: false, reason: "parent_open_failed", why: "打开父目录：" + String(err?.code ?? err?.message ?? err) }; }
+  try {
+    const st = fs.fstatSync(pfd);
+    if (!st.isDirectory()) { fs.closeSync(pfd); return { ok: false, reason: "parent_not_dir" }; }
+  } catch (err) { fs.closeSync(pfd); return { ok: false, reason: "parent_fstat_failed", why: String(err?.code ?? err?.message ?? err) }; }
+  try {
+    if (fs.realpathSync(parent) !== parentReal) { fs.closeSync(pfd); return { ok: false, reason: "root_not_canonical", why: "父目录在受验后与外指不同（symlink 或换目录），不创建" }; }
+  } catch (err) { fs.closeSync(pfd); return { ok: false, reason: "parent_unresolvable", why: "父目录复核失败：" + String(err?.code ?? err?.message ?? err) }; }
+  if (inj.onBeforeMkdir) inj.onBeforeMkdir(); // P1-2 注入点：测试在此把父目录确定性换成外指 symlink
   // ② 建单层（recursive:false，绝不递归）：父目录缺席 → ENOENT → 不递归、原样 fail。
   let mkdirErr = null;
   if (inj.failMkdir) mkdirErr = inj.failMkdir;
   else { try { fs.mkdirSync(root, { recursive: false, mode: 0o700 }); } catch (err) { mkdirErr = err; } }
   if (mkdirErr !== null) {
+    fs.closeSync(pfd);
     const code = mkdirErr?.code ?? null;
     const why = code === "ENOENT" ? "父目录缺席，不递归创建" : String(mkdirErr?.message ?? mkdirErr);
     return { ok: false, reason: code === "ENOENT" ? "parent_absent" : "mkdir_failed", why };
   }
-  // ③ chmod 0700 兜 umask。
+  // P1-2 复核：mkdir 后父路径必须仍解析到受验 realpath；否则根被写进了外指目标 → 回滚并拒（net-zero）。
+  try {
+    if (fs.realpathSync(parent) !== parentReal) {
+      try { fs.rmdirSync(root); } catch { /* 尽力清 */ }
+      fs.closeSync(pfd);
+      return { ok: false, reason: "root_not_canonical", why: "父目录在 mkdir 后被换成外指，回滚刚建的越界目录" };
+    }
+  } catch (err) {
+    try { fs.rmdirSync(root); } catch { /* 尽力清 */ }
+    fs.closeSync(pfd);
+    return { ok: false, reason: "parent_unresolvable", why: "父目录 mkdir 后不可解析：" + String(err?.code ?? err?.message ?? err) };
+  }
+  // ③ chmod 0700 兜 umask（仅在父链受验未换时）。
   let chmodErr = null;
   if (inj.failChmod) chmodErr = inj.failChmod;
   else { try { fs.chmodSync(root, 0o700); } catch (err) { chmodErr = err; } }
-  if (chmodErr !== null) return { ok: false, reason: "chmod_failed", why: "chmod：" + String(chmodErr?.message ?? chmodErr) };
-  // ④ fsync 父目录（让刚建的单层落盘）。
-  if (inj.failFsync) return { ok: false, reason: "fsync_failed", why: "注入 fsync 失败" };
-  let fsyncErr = null;
-  try { const fd = fs.openSync(parent, fs.constants.O_RDONLY); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } }
-  catch (err) { fsyncErr = err; }
-  if (fsyncErr !== null) return { ok: false, reason: "fsync_failed", why: "父目录 fsync：" + String(fsyncErr?.code ?? fsyncErr?.message ?? fsyncErr) };
+  if (chmodErr !== null) { fs.closeSync(pfd); return { ok: false, reason: "chmod_failed", why: "chmod：" + String(chmodErr?.message ?? chmodErr) }; }
+  // ④ fsync 父目录（用钉住的 fd，让刚建的单层落盘）。
+  const f = fsyncDirFd(pfd, inj);
+  fs.closeSync(pfd);
+  if (!f.ok) return f;
   // ⑤ 复核：根必须已是 0700 真目录；否则 fail-closed。
   const rc = validateLedgerRoot({ env, mustExistRoot: true });
   if (!rc.ok) return rc;

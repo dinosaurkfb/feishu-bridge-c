@@ -281,31 +281,30 @@ export function ledgerForward(ctx, { token, lease, intent = null, env = process.
   const sub = doc.operation_kind === "ledger_init" ? "init" : doc.operation_kind === "ledger_cutover" ? "cutover" : null;
   if (!sub) return { ok: false, reason: "bad_operation_kind", phase };
 
-  // R46：init 门内、写账本前自建账本根（只建末级单层，绝不递归）。父链净 / 根 0700 由
-  // ensureLedgerRoot 受验；父目录缺席 / 父链 symlink / 根非 0700 → 不创建、原样 fail。
-  // 仅 init：cutover 要求 init 已建根（根缺席 → 真实故障，应 fail，不静默创建）。
-  if (sub === "init") {
-    const prov = ensureLedgerRoot({ env });
-    if (!prov.ok) {
-      addNote({ dir: ctx.dir, token, lease, note: "账本根不能安全创建：" + (prov.why ?? prov.reason), now: ctx.now() });
-      return { ok: false, reason: prov.reason, phase, why: prov.why ?? null, rollbackSafe: phase === "drained" };
-    }
-  }
-
   // 1. drained → 落不可逆前向边界（只有首次 ledgerEnter 会到；崩溃重跑在 drained 由 ledgerExit 转回退）
   let planPre = null;
   if (phase === "drained") {
     if (!intent || intent.kind !== sub) return { ok: false, reason: "intent_required", phase, why: "drained 进 forward-only 需要 init/cutover 意图" };
-    const dPre = resolveDir(ctx, intent.endpointId, env);
-    if (!dPre.ok) return { ok: false, reason: dPre.reason, phase, why: dPre.why };
-    // 评审 P1-2：只读前置（收据 / 已初始化 / 已切权威）在 drained 就验，失败留在 drained（rollbackSafe），
-    // 不把判定失败留成 forward-only 维护态。cutover 的 reconciler_absent 也在此 fail-closed（P1-4）。
+    // 评审 P1-2 + 返修 P2：只读前置（收据 / 已初始化 / 已切权威）在 drained 就验，失败留在 drained（rollbackSafe），
+    // 且**先于 provision** —— already_* 失败都不会留下空根。cutover 的 reconciler_absent 也在此 fail-closed（P1-4）。
     const receipt = endpointReceipt(ctx.dir, intent.endpointId, { token });
     if (!receipt.ok) return { ok: false, reason: receipt.state, why: receipt.why ?? null, phase, rollbackSafe: true };
     if (sub === "init" && (receipt.initDone || receipt.cutoverDone)) return { ok: false, reason: "already_initialized", why: "该 endpoint 已被初始化或已切权威", phase, rollbackSafe: true };
     if (sub === "cutover" && receipt.cutoverDone) return { ok: false, reason: "already_cutover", why: "该 endpoint 已切权威", phase, rollbackSafe: true };
     // 评审 P1-5：cutover 前置要求恰一份 done init 收据（没有 init 就切权威 → fail-closed，留在 drained）。
     if (sub === "cutover" && !receipt.initDone) return { ok: false, reason: "init_receipt_missing", why: "切权威要求恰一份已 done 的 init 收据（收据 initDone=false）", phase, rollbackSafe: true };
+    // 返修 P1-1 + P2：provision 只发生在 drained 且**只读 precheck 全过后**（仅 init）。cutover 不 provision ——
+    // init 已建成根，根缺席是真实故障应 fail，绝不静默重建。forward 态（initializing/cutting_over/reopening）
+    // 一律不 provision —— 根丢失 → fail-closed（done 收据 + 账本缺席 = 说不清），不得重建。
+    if (sub === "init") {
+      const prov = ensureLedgerRoot({ env });
+      if (!prov.ok) {
+        addNote({ dir: ctx.dir, token, lease, note: "账本根不能安全创建：" + (prov.why ?? prov.reason), now: ctx.now() });
+        return { ok: false, reason: prov.reason, phase, why: prov.why ?? null, rollbackSafe: true };
+      }
+    }
+    const dPre = resolveDir(ctx, intent.endpointId, env);
+    if (!dPre.ok) return { ok: false, reason: dPre.reason, phase, why: dPre.why };
     planPre = planOf({ kind: sub, endpointId: intent.endpointId, chain: intent.chain, token, ledgerDir: dPre.dir, ctx, env });
     if (!planPre.ok) return { ok: false, reason: planPre.reason, why: planPre.why ?? null, phase, rollbackSafe: true };
     // R45 4c/4d：cutover 进段前冻结 S1 —— planOf 的同一 rec（ok 支带三 sidecar 受验字节）+ L 建 staged 树 + 备份 + 三条 prepared step（与 ledger step 同一次原子进段）。
@@ -402,6 +401,21 @@ export function ledgerReopening(ctx, token, lease) {
     const p = setPhase({ dir: ctx.dir, token, lease, phase: "reopening_incomplete", expectPhase: "ledger_reopening", now: ctx.now(), note: "说不清 " + incomplete.length + " 项：" + incomplete.map((i) => i.id + "（" + i.why + "）").join("；") });
     return { ok: false, phase: "reopening_incomplete", incomplete, journalWrite: p.ok, ...(p.ok ? {} : { journalWhy: p.why ?? p.reason }), ...extra };
   };
+  // 返修 P1-1：B-4 重开前必须确认提交的账本仍真实在场 —— done 收据 + 账本缺席 = fail-closed，
+  // 绝不在此重建（重建会拿空账本当成功）。根缺失 / 账本缺 / 不可读 → append 到 incomplete → bail 保门保 active。
+  {
+    const ls = doc.steps.find((s) => s.kind === "ledger");
+    const ep = ls ? (ENDPOINT_RE.exec(ls.id)?.[1] ?? null) : null;
+    if (!ep) incomplete.push({ id: "ledger", why: "重开 journal 无合法 ledger step（endpoint 不可辨），说不清" });
+    else {
+      const d = resolveEndpointDir(ep, { env: process.env });
+      if (!d.ok) incomplete.push({ id: ls.id, why: "账本根无法定位（" + (d.reason ?? "") + (d.why ? "：" + d.why : "") + "）—— done 收据 + 根缺失 = fail-closed" });
+      else {
+        const L = loadLedger(d.dir, { endpointId: ep });
+        if (!L.ok) incomplete.push({ id: ls.id, why: "提交的账本缺失/不可读（" + (L.reason ?? "") + "）—— done 收据 + 账本缺失 = fail-closed" });
+      }
+    }
+  }
   // ① current：回原目标（enter 步 before；账本 operation 无 :install 步）—— 读回三态（P1-8：EACCES 说不清不许当“没有”）
   for (const st of doc.steps.filter((s) => s.kind === "current")) {
     const chain = st.id.split(":")[1];

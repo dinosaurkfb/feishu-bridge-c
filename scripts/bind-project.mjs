@@ -176,38 +176,42 @@ if (suspended.ok && suspended.suspended) {
   // 修不成就 fail-closed，不动项目文件。
   const rootId = suspended.rootMessageId
     ?? readLegacyRootId(path.join(root, ".runtime-data", "inbound", "active-mapping.json"));
-  const fixed = withRegistryTransaction({ regFile, root, mutate: (reg) => {
-    const same = reg.projects.map((p, i) => ({ p, i }))
-      .filter((x) => normalizeRoot(x.p?.root) === normalizeRoot(root));
-    if (same.length > 1) return { ok: false, kind: "ambiguous", count: same.length };
-    if (same.length === 1) {
-      // 停用的要启用回来 —— 否则 Stop 仍然挑不到它。
-      if (same[0].p.enabled === false) {
-        reg.projects[same[0].i] = { ...same[0].p, enabled: true };
-        return { ok: true, kind: "reenabled" };
-      }
-      return { ok: true, kind: "already_routable", skipWrite: true };
-    }
-    // registry 里根本没有 —— 用项目文件里那个根话题补登记，不新建。
-    if (!rootId) return { ok: false, kind: "no_root", reason: "项目内绑定读不出根话题" };
-    reg.projects.push(newRegistryEntry({
-      root, name: arg("name") ?? readProjectIdentity({ root }).name,
-      purpose: arg("purpose") ?? null, token: bindingToken(root), rootMessageId: rootId,
-    }));
-    return { ok: true, kind: "adopted" };
-  } });
-  if (!fixed.ok) {
-    const why = fixed.kind === "ambiguous"
-      ? "登记表里有 " + fixed.count + " 条同一个项目的记录，说不清该用哪一条"
-      : fixed.kind === "no_root" ? fixed.reason : fixed.reason;
-    die("恢复中止：" + why, "**项目文件没有改动** —— 出站接不回去的话，恢复就没有意义。");
-  }
-  if (fixed.kind === "reenabled") console.log("  登记表里那条是停用的，已启用回来。");
-  if (fixed.kind === "adopted") console.log("  登记表里没有它，已补登记（复用原话题）。");
-
-  // #R37 返修（P1-2）：W4 行连接恢复 = 只取 m1a-order outer 锁、零 shadow；legacy 为既有 setBindingStatus。
+  // #R37 返修（P1-2②）：登记表修复 + setBindingStatus 必须共享**同一次** m1a-order 锁。
+  // 上一版把 withRegistryTransaction 放在锁外先跑 —— 另一个写方正持锁时，登记表照样被改
+  // （停用被启用回来），走得出去却接不回来。修复：把登记表修复收进 runResume（在锁内执行的
+  // legacy 闭包）里，锁没取到就整笔拒，登记表一个字不动。
   const agentUid0 = loadClaudeTopicBinding({ root })?.config?.agent_uid ?? null;
-  const runResume = () => setBindingStatus({ root, status: "active" });
+  const runResume = () => {
+    const fixed = withRegistryTransaction({ regFile, root, mutate: (reg) => {
+      const same = reg.projects.map((p, i) => ({ p, i }))
+        .filter((x) => normalizeRoot(x.p?.root) === normalizeRoot(root));
+      if (same.length > 1) return { ok: false, kind: "ambiguous", count: same.length };
+      if (same.length === 1) {
+        // 停用的要启用回来 —— 否则 Stop 仍然挑不到它。
+        if (same[0].p.enabled === false) {
+          reg.projects[same[0].i] = { ...same[0].p, enabled: true };
+          return { ok: true, kind: "reenabled" };
+        }
+        return { ok: true, kind: "already_routable", skipWrite: true };
+      }
+      // registry 里根本没有 —— 用项目文件里那个根话题补登记，不新建。
+      if (!rootId) return { ok: false, kind: "no_root", reason: "项目内绑定读不出根话题" };
+      reg.projects.push(newRegistryEntry({
+        root, name: arg("name") ?? readProjectIdentity({ root }).name,
+        purpose: arg("purpose") ?? null, token: bindingToken(root), rootMessageId: rootId,
+      }));
+      return { ok: true, kind: "adopted" };
+    } });
+    if (!fixed.ok) {
+      const why = fixed.kind === "ambiguous"
+        ? "登记表里有 " + fixed.count + " 条同一个项目的记录，说不清该用哪一条"
+        : fixed.kind === "no_root" ? fixed.reason : fixed.reason;
+      // 锁内抛错 → runWired 捕获 → legacy_failed（not_committed，fail-closed，不写 legacy）。
+      throw new Error(why);
+    }
+    const s = setBindingStatus({ root, status: "active" });
+    return { ...s, __fixedKind: fixed.kind };
+  };
   let r;
   let wiredResume = null;
   if (agentUid0) {
@@ -226,6 +230,9 @@ if (suspended.ok && suspended.suspended) {
     console.error("无法确定该项目 binding 的 agent_uid —— 不能派生 M1a 端点，拒绝绕过一致性锁（fail-closed）");
     process.exit(1);
   }
+  // 登记表修复结果随 legacy 闭包带回（锁内执行）；只有真提交了才打印。
+  if (r?.__fixedKind === "reenabled") console.log("  登记表里那条是停用的，已启用回来。");
+  if (r?.__fixedKind === "adopted") console.log("  登记表里没有它，已补登记（复用原话题）。");
   if (!r.ok) {
     console.error("恢复失败（" + r.reason + "）" + (r.error ? "：" + r.error : ""));
     process.exit(1);

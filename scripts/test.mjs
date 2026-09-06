@@ -11313,6 +11313,88 @@ test("锁内一律不 exit —— 每条退出路径跑完锁都得还回去", (
   assert.equal(fs.existsSync(roLock), false, "写盘失败之后锁也得还回去");
 });
 
+test("P1-2 ② 恢复：登记表修复在 M1a 锁内 —— 锁被占就不许改登记表（#R37）", () => {
+  // Frank 裁定：bind-project 恢复时 withRegistryTransaction 在锁外先执行，
+  // 于是「另一个写方正持 m1a-order 锁」时，登记表照样被改（停用被启用回来），
+  // 走得出去却接不回来 —— 恢复失败却留了半截副作用。
+  // 修复：把登记表修复 + setBindingStatus 一起收进 wirePauseResume 的 legacy 闭包（锁内）。
+  //
+  // 这里的夹具走「m1a 已启用」分支：收据 ok + 端点目录在 → CLI 会在取得 m1a-order
+  // 锁后才跑 runResume。而测试进程先占住同一把锁 → CLI 取锁失败（binding_busy）→
+  // 恢复整笔不提交，登记表保持「停用」。
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-p12b-")));
+  const proj = path.join(home, "proj");
+  const inbound = path.join(proj, ".runtime-data", "inbound");
+  fs.mkdirSync(inbound, { recursive: true });
+  // 暂停过的项目映射（无 topic_generation_state，由 legacy 投影物化出 paused）
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({
+    status: "paused", root_message_id: "om_demo", feishu_root_message_id_reference: "om_demo",
+    channel_generation_id: "gen-1", claude_session_id: null }));
+  // 项目内 chain-config 带 agent_uid → agentUid0 可派生 → 走 wirePauseResume 锁。
+  // 注：config.agent_uid 最终以模板为准（TPL.agent_uid），这里也填同一个值避免歧义。
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({
+    project_dir: proj, logical_task_key: "k", project_display_name: "P", task_display_name: "P",
+    agent_uid: TPL.agent_uid }));
+  const reg = path.join(home, "registry.json");
+  // 登记表里那条是停用的（恢复要把它启用回来）—— 一旦锁外先修，enabled 就变 true
+  fs.writeFileSync(reg, JSON.stringify({ schema_version: "1.0", projects: [
+    { id: "p", root: proj, root_message_id: "om_demo", enabled: false }] }));
+  const tpl = path.join(home, "chain-config.json");
+  fs.writeFileSync(tpl, JSON.stringify(TPL));
+
+  const maintDir = path.join(home, "maint");
+  const ledgerRoot = path.join(home, "led");
+  const ep = legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid });
+  // 端点目录必须先存在且 0700（resolveEndpointDir(mustExistRoot) 要求）
+  fs.mkdirSync(path.join(ledgerRoot, ep), { recursive: true, mode: 0o700 });
+  // 种 M1a ledger_init 收据 → endpointReceipt(maintDir, ep).state === "ok"
+  const at = "2026-08-31T12:00:00.000Z";
+  const tok = "da88566e-d8d3-48ba-914e-7f96f4dfaeaa";
+  const sha = "b".repeat(64);
+  const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha,
+    authority_mode: null, revision: null, ledger_sha256: null, ...over });
+  const steps = ["claude", "codex"].flatMap((ch) => [
+    { id: "timer:" + ch, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" },
+      backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" },
+      state: "done", after: { phase: "installed_not_loaded" }, at, chain: null },
+    { id: "stub:" + ch, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null,
+      backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok,
+      state: "done", at, chain: null },
+    { id: "current:" + ch, kind: "current", target: "versions/0123456789abcdef",
+      before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null,
+      intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null },
+  ]);
+  const gateDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null,
+    backup_sha256: null, backup_bytes: null, intended_after: { token: tok },
+    after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+  const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+  const ledgerStep = { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null,
+    backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState,
+    after: afterState, state: "done", at, chain: "claude" };
+  fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify({
+    schema_version: "1.2", operation_kind: "ledger_init", token: tok, reason: "seed",
+    started_at: at, updated_at: at, phase: "done",
+    steps: [...steps, gateDone(), ledgerStep], notes: [] }), { mode: 0o600 });
+  assert.equal(endpointReceipt(maintDir, ep).state, "ok", "seed 收据应判 ok（M1a 已启用）");
+
+  const held = DW.acquireOrderLock(ep, {
+    FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot });
+  assert.equal(held.ok, true, "测试持锁：" + JSON.stringify(held));
+
+  const run = spawnSync(process.execPath, [
+    path.resolve("scripts", "bind-project.mjs"), "--project", proj, "--apply",
+  ], { encoding: "utf-8", env: { ...process.env,
+    FEISHU_BRIDGE_REGISTRY: reg, FEISHU_BRIDGE_CHAIN_TEMPLATE: tpl, HOME: home,
+    FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot } });
+  held.release();
+
+  assert.notEqual(run.status, 0, "锁被占 → 恢复必须非零拒绝：" + run.stdout + run.stderr);
+  const reg2 = JSON.parse(fs.readFileSync(reg, "utf-8"));
+  assert.equal(reg2.projects[0].enabled, false,
+    "登记表修复必须在锁内 —— 锁没取到就不许把停用启用回来");
+});
+
 test("登记表的写入口只有一个 —— 建话题那条路径也走同一笔事务", () => {
   // 评审指出：上一版只有补登记分支进了锁，**正常新建绑定仍在锁外整体写回**，
   // 跟补登记并发时照样互相覆盖 —— 那样"登记表控制锁"就只是名义上的。

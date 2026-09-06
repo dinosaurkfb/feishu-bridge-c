@@ -30,6 +30,7 @@ import fs from "node:fs";
 import { chatReplyPathStatus, chatReplyTimeoutMs } from "./chat-reply.mjs";
 import { chatLoad, inspectAdmissionLocks, inspectScratch } from "./chat-ledger.mjs";
 import os from "node:os";
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 import { displaySafe } from "./display-safe.mjs";
@@ -56,7 +57,7 @@ import { reconcileLegacyEndpoint } from "./m1a/reconcile.mjs";
 import { LAUNCHCTL_ENV, PHASE_TEXT, loadedPhase } from "./launchd-job.mjs";
 import { readGate, maintenanceGatePath } from "./maintenance-gate-core.mjs";
 import { inspectInstalledSurface, installedSurfacePath } from "./installed-surface.mjs";
-import { inspectMaintenanceDir, maintenanceDir } from "./maintenance/journal.mjs";
+import { inspectMaintenanceDir, maintenanceDir, readJournal } from "./maintenance/journal.mjs";
 import { loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, storeHashState, subscriptionAuditPendingPath, subscriptionStorePath } from "./subscription-store.mjs";
 
 /** 到期预警阈值：7 天内到期就点名。**明写**，不藏在比较式里。 */
@@ -646,6 +647,54 @@ export function runDoctor({
         }
       }
     }
+
+  // ⑮ topic-agent 账本 staging 体检（R45 M1b）：只读盘三件 —— ①孤儿/已清 staged 残骸；②进行中 cutover 的
+  // plan 锚复核（staged/intended/plan.json 的 SHA vs journal 记的 plan_sha256）；③done sidecar step 的权威文件
+  // SHA（ledger/<endpoint>/<name>.json vs journal intended_after.sha256，4d 的窄写成果必须与账本一致）。
+  // 收据聚合投影归 ⑬，这里不重复。全只读；盘不了（目录缺失）不算病。
+  {
+    const mdir15 = maintenanceDir();
+    if (mdir15 === null) {
+      add("topic_agent_staging", "⑮ topic-agent staging", null, "家目录查不出来，维护目录未知", null);
+    } else {
+      const problems = [];
+      let stagedCount = 0;
+      let names = [];
+      try { names = fs.readdirSync(mdir15); } catch { /* 维护目录还没建过 = 没有维护历史，不算病 */ }
+      const sha256File = (file) => { try { return createHash("sha256").update(fs.readFileSync(file)).digest("hex"); } catch { return null; } };
+      for (const name of names) {
+        const stagedDir = path.join(mdir15, name);
+        if (!name.endsWith(".staged") || !fs.statSync(stagedDir).isDirectory()) continue;
+        const token = name.slice(0, -".staged".length);
+        const j = readJournal({ dir: mdir15, token });
+        if (j.state !== "valid" || j.doc.phase === "done") { problems.push("staged 残骸：" + token.slice(0, 8) + ".staged（" + (j.state !== "valid" ? "没有对应 journal" : "operation 已完成仍留着") + "）"); continue; }
+        stagedCount += 1;
+        if (j.doc.operation_kind !== "ledger_cutover") continue;
+        const ls15 = j.doc.steps.find((s) => s.kind === "ledger");
+        const planSha = ls15?.intended_after?.plan_sha256 ?? null;
+        if (typeof planSha === "string" && planSha.length === 64) {
+          const actual = sha256File(path.join(stagedDir, "intended", "plan.json"));
+          if (actual === null) problems.push("plan 锚复核读不出：" + token.slice(0, 8) + ".staged/intended/plan.json（进行中 cutover 必须有 plan）");
+          else if (actual !== planSha) problems.push("plan 锚复核不过：token " + token.slice(0, 8) + " 的 staged plan SHA 与 journal 记录不一致");
+        }
+        // step.target 是 1.3 相对路径（ledger/<endpoint>/<name>.json），相对 bridgeHome（账本根的父）解析；绝对路径原样用
+        const ledgerRoot15 = process.env.FEISHU_BRIDGE_LEDGER_DIR ?? null;
+        const bridgeHome15 = ledgerRoot15 === null ? null : path.dirname(ledgerRoot15);
+        for (const st of j.doc.steps.filter((s) => s.kind === "sidecar" && s.state === "done")) {
+          const want = st.intended_after?.sha256;
+          if (typeof want !== "string") continue;
+          const targetFile = path.isAbsolute(st.target) || bridgeHome15 === null ? st.target : path.join(bridgeHome15, st.target);
+          const actual = sha256File(targetFile);
+          if (actual === null) problems.push("sidecar 权威文件读不出：" + st.id + "（" + st.target + "）—— 4e-2 narrow write 的成果缺了");
+          else if (actual !== want) problems.push("sidecar 权威文件校验不过：" + st.id + "（" + st.target + " 的 SHA 与 journal 不一致）");
+        }
+      }
+      const body = problems.length === 0
+        ? (stagedCount === 0 ? "没有进行中的 staging（收据投影见 ⑬）" : stagedCount + " 个进行中 staging，其 plan 复核与 sidecar 窄写成果都对得上（收据投影见 ⑬）")
+        : "说不清 " + problems.length + " 处：" + problems.slice(0, 3).join("；");
+      add("topic_agent_staging", "⑮ topic-agent staging", problems.length === 0, body, null);
+    }
+  }
 
   // ── 汇总：任一 false → blocked；无 false 有 null → incomplete；全 true → ready
   const overall = checks.some((c) => c.ok === false) ? "blocked"

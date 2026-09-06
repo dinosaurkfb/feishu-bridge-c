@@ -6,7 +6,9 @@
  * 本模块**严格只读**：不写账本、不写 legacy、不写任何 sidecar。
  *
  * 结果联合（§6 封闭，逐支精确键集，#R24 P2-2）：
- *   ok:true  → { ok, digest, cutover_blockers, snapshot_identity }
+ *   ok:true  → { ok, digest, cutover_blockers, snapshot_identity, sidecars }
+ *     （sidecars = {expiry, pending_claims, policy} 三条 sidecar 的渲染字节——4e 四件同证：与 digest
+ *     同一冻结 S1 投影产出，编排层不再二次 collect 渲染；渲染失败 → { ok:false, reason:"sidecar_render_failed", why }）
  *   ok:null  → { ok:null, reason:"snapshot_moved", why }
  *   S1 取得后 → { ok:false, reason:"bijection_mismatch", mismatches, cutover_blockers, snapshot_identity }
  *     （mismatches 全清单，元素 {code, topic_agent_id|null, field|null, detail}；无 why）
@@ -20,6 +22,8 @@
 import { canonKey, sha256 } from "../topic-agent-ledger.mjs";
 import { validateTopicGenerationState } from "../topic-generation.mjs";
 import { M1A_SHAPES } from "./legacy-snapshot.mjs";
+import { renderExpirySidecar, renderPendingClaimsSidecar, renderPolicySidecar } from "../m1b/sidecar-renderers.mjs";
+// ↑ 与本模块环引用（renderers→topicAgentIdForLegacy）：两边顶层都不跨环调用（函数体才求值），安全。
 
 // 形状正则在**函数内**取（顶层解构会在 legacy-snapshot 先于本模块初始化的入口顺序下 TDZ——
 // TAL→m1a/reconcile→legacy-snapshot→TAL 循环里顶层求值顺序不保证，函数体求值时两边必已完成）。
@@ -244,6 +248,20 @@ export function reconcileLegacyEndpoint({ endpointId, chain, collectLegacy, load
   if (!L2.ok) return { ok: null, reason: "snapshot_moved", why: "投影后账本读不出（" + L2.reason + "）" };
 
   const ok = digestE === digestS && mismatches.length === 0;
-  if (ok) return { ok: true, digest: digestE, cutover_blockers: proj.blockers, snapshot_identity: S1.snapshot_identity };
+  if (ok) {
+    // 4e 四件同证（P1-3）：三条 sidecar 从同一冻结 S1（bindings）+ 同一 E 渲染，与 digest 同源同刻；
+    // 编排层（ledger-operation）不得再二次 collect 渲染——那会让 plan 锚与对账依据来自两个时点。
+    const E2 = proj.records, bindings = S1.bindings;
+    const parts = {
+      expiry: renderExpirySidecar({ endpointId, bindings, E: E2 }),
+      pending_claims: renderPendingClaimsSidecar({ endpointId, bindings, E: E2 }),
+      policy: renderPolicySidecar({ endpointId, bindings, E: E2 }),
+    };
+    for (const [k, r] of Object.entries(parts)) {
+      if (!r.ok) return { ok: false, reason: "sidecar_render_failed", why: k + "：" + (r.why ?? "") };
+    }
+    return { ok: true, digest: digestE, cutover_blockers: proj.blockers, snapshot_identity: S1.snapshot_identity,
+      sidecars: { expiry: parts.expiry.bytes, pending_claims: parts.pending_claims.bytes, policy: parts.policy.bytes } };
+  }
   return { ok: false, reason: "bijection_mismatch", mismatches, cutover_blockers: proj.blockers, snapshot_identity: S1.snapshot_identity };
 }

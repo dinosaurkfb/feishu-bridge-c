@@ -20,12 +20,12 @@
  * journal / staged blob 的自身形状归 readJournal / verifyStagedPlan，这里只核**交叉**等式。
  */
 import { createHash } from "node:crypto";
-import { canonKey } from "../topic-agent-ledger.mjs";
+import { canonKey, fingerprintOf } from "../topic-agent-ledger.mjs";
 import { planProblem } from "./staged-plan.mjs";
 
 const SIDE_CAR_PAIRS = [["expiry", "expiry"], ["pending_claims", "pending-claims"], ["policy", "policy"]];
 
-export function verifyCutoverPlan({ planBytes, doc, ledgerStep, sidecarSteps, ledgerEndpointId, fingerprintEndpointId, reconcile }) {
+export function verifyCutoverPlan({ planBytes, doc, ledgerStep, sidecarSteps, ledgerEndpointId, reconcile }) {
   if (!(planBytes instanceof Uint8Array) || planBytes.length === 0) return { ok: false, reason: "plan_bytes_missing" };
   const planSha = createHash("sha256").update(planBytes).digest("hex");
   let plan;
@@ -54,16 +54,37 @@ export function verifyCutoverPlan({ planBytes, doc, ledgerStep, sidecarSteps, le
   if (plan.digest !== ledgerStep?.intended_after?.bijection_digest) return { ok: false, reason: "digest_mismatch", why: "plan.digest 与 bijection_digest 不一致" };
   if (reconcile?.ok !== true) return { ok: false, reason: "reconcile_not_ok" };
   if (reconcile.digest !== plan.digest) return { ok: false, reason: "digest_mismatch", why: "重验 digest 与 plan 不一致" };
-  // 快照身份的语义核是 path+sha256（内容与位置）；source 是 planProblem 要求的标注域，不参与身份等价。
-  const identityCore = (arr) => Array.isArray(arr) ? arr.map((x) => ({ path: x?.path ?? null, sha256: x?.sha256 ?? null })) : arr ?? null;
-  if (canonKey(identityCore(reconcile.snapshot_identity ?? null)) !== canonKey(identityCore(plan.snapshot_identity))) return { ok: false, reason: "snapshot_identity_mismatch" };
+  // 快照身份全量等价（P1-3）：plan 的身份现在由 identityOf 在受验读时点自带封闭域 source 标注，
+  // 编排层不再二次盖章——所以这里逐键（source+path+sha256）比较，任何一项被换都是 mismatch。
+  if (canonKey(reconcile.snapshot_identity ?? null) !== canonKey(plan.snapshot_identity)) return { ok: false, reason: "snapshot_identity_mismatch" };
   if (reconcile.ledger?.revision !== plan.ledger.revision || reconcile.ledger?.sha256 !== plan.ledger.sha256) {
     return { ok: false, reason: "ledger_identity_mismatch", why: "重验账本 CAS（revision/sha 变了）" };
   }
+  // sidecar 四件同证（P1-3）：二次对账必须携带同源渲染字节，逐键 sha256 对 plan 锚——
+  // 只回 digest 的对账结果在这里过不去（渲染依据被换时能当场暴露）。
+  for (const [key] of SIDE_CAR_PAIRS) {
+    const bytes = reconcile.sidecars?.[key];
+    if (!(bytes instanceof Uint8Array)) return { ok: false, reason: "sidecar_reconcile_mismatch", why: key + " 缺同源渲染字节" };
+    if (createHash("sha256").update(bytes).digest("hex") !== plan.sidecars[key].sha256) {
+      return { ok: false, reason: "sidecar_reconcile_mismatch", why: key };
+    }
+  }
   // ⑤
   if (ledgerStep?.intended_after?.plan_sha256 !== planSha) return { ok: false, reason: "plan_anchor_mismatch" };
-  // 4f
-  if (fingerprintEndpointId !== plan.endpoint_id) return { ok: false, reason: "endpoint_cross_mismatch", why: "fingerprint 输入 endpoint" };
+  // 4f 指纹复核（P1-6）：账本 step 两锚的 fingerprint 必须都能由 plan 字段独立重算——
+  // 自证（拿 fingerprintEndpointId 对拍 plan.endpoint_id）换成对七键输入的真重算。
+  const fp = fingerprintOf("authority_cutover", {
+    request_key: plan.operation_token,
+    endpoint_id: plan.endpoint_id,
+    bijection_digest: plan.digest,
+    pre_cutover_ledger_sha: plan.ledger.sha256,
+    expiry_sha256: plan.sidecars.expiry.sha256,
+    pending_claims_sha256: plan.sidecars.pending_claims.sha256,
+    policy_sha256: plan.sidecars.policy.sha256,
+  });
+  if (ledgerStep?.before?.fingerprint !== fp || ledgerStep?.intended_after?.fingerprint !== fp) {
+    return { ok: false, reason: "endpoint_cross_mismatch", why: "fingerprint 重算与账本 step 锚不等" };
+  }
   const ledgerEp = /^ledger:(endpoint_[0-9a-f]{24}):cutover$/.exec(String(ledgerStep?.id ?? ""))?.[1] ?? null;
   if (ledgerEp !== plan.endpoint_id || ledgerStep?.target !== plan.endpoint_id) return { ok: false, reason: "endpoint_cross_mismatch", why: "ledger step" };
   for (const [, fileBase] of SIDE_CAR_PAIRS) {

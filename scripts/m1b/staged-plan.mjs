@@ -65,7 +65,7 @@ function mkdirDurable(dir, parentToFsync) {
 
 /** 三轮 P1：maintenance 根唯一校验器 —— stage/verify/remove 三方共用。
  *  ① 规范绝对路径；② lstat 是目录且非 symlink；③ realpath === resolve（末级与祖先链 symlink 都在此拒）；④ 缺席根即拒，不代建。 */
-function maintenanceRootProblem(dir) {
+export function maintenanceRootProblem(dir) {
   if (typeof dir !== "string" || dir.length === 0 || !path.isAbsolute(dir)) return "maintenance 根不是绝对路径";
   if (path.resolve(dir) !== dir) return "maintenance 根不是规范路径";
   let st = null;
@@ -223,6 +223,47 @@ export function stageCutoverPlan({ dir, token, plan, blobs }) {
     return { ok: false, reason: err?.code === "EEXIST" ? "staged_residue" : "io_error", why: "写 staged 文件：" + errCode(err) };
   }
   return { ok: true, reused: false, plan_bytes: planBytes.length, plan_sha256: planSha };
+}
+
+/** P1-5：cutover 前把既有 sidecar 原字节备份进 <token>.staged/before-<name>.json（0600 O_EXCL；崩溃重跑 EEXIST →
+ *  受验复验复用，SHA 不符按残骸拒）。files 三键各 null（原文件缺席，不备份）或 Uint8Array（≤1MiB）；
+ *  返回 backups[k] = {path, sha256, bytes} | null —— journal sidecar step 的 backup / backup_sha256 / backup_bytes
+ *  三字段同一出处。 */
+export function stageBackupFiles({ dir, token, files }) {
+  const tokenProblem = tokenShapeProblem(token);
+  if (tokenProblem !== null) return { ok: false, reason: "staged_residue", why: tokenProblem };
+  const rootProblem = maintenanceRootProblem(dir);
+  if (rootProblem !== null) return { ok: false, reason: "staged_residue", why: rootProblem };
+  if (!(isObj(files) && keysOf(files) === "expiry,pending_claims,policy"
+    && Object.values(files).every((f) => f === null || f instanceof Uint8Array))) {
+    return { ok: false, reason: "plan_mismatch", why: "files 必须是 {expiry,pending_claims,policy} 各 null 或 Uint8Array" };
+  }
+  for (const [k, fileBase] of Object.entries(BLOB_FILE)) {
+    if (files[k] !== null && files[k].byteLength > SIDECAR_MAX_BYTES) {
+      return { ok: false, reason: "plan_mismatch", why: fileBase + " 备份超过 1MiB（" + files[k].byteLength + " 字节）" };
+    }
+  }
+  const staged = path.join(dir, stagedDirFor(token));
+  try { mkdirDurable(staged, dir); } catch (err) {
+    if (err?.code === "EPRIVMODE" || err?.code === "EPRIVLINK") return { ok: false, reason: "staged_residue", why: err.message };
+    return { ok: false, reason: "io_error", why: "建 staged 目录：" + errCode(err) };
+  }
+  const backups = {};
+  for (const [k, fileBase] of Object.entries(BLOB_FILE)) {
+    if (files[k] === null) { backups[k] = null; continue; }
+    const bytes = Buffer.from(files[k]);
+    const file = path.join(staged, "before-" + fileBase + ".json");
+    try {
+      writeExclDurable(file, bytes);
+    } catch (err) {
+      if (err?.code !== "EEXIST") return { ok: false, reason: "io_error", why: "写备份 " + fileBase + "：" + errCode(err) };
+      const v = readStagedVerified(file, { sha256: sha256Hex(bytes), bytes: bytes.length });
+      if (!v.ok) return { ok: false, reason: "staged_residue", why: "备份 " + fileBase + " 残骸不符：" + (v.why ?? "") };
+    }
+    backups[k] = { path: file, sha256: sha256Hex(bytes), bytes: bytes.length };
+  }
+  try { fsyncDir(staged); } catch (err) { return { ok: false, reason: "io_error", why: "fsync staged 目录：" + errCode(err) }; }
+  return { ok: true, backups };
 }
 
 /** 删除 staged 私有目录；absent 也算成功（幂等）。失败交调用方（R45：journal 保持 drained + cleanup_pending）。 */

@@ -62,8 +62,9 @@ export function verifyCutoverPlan({ planBytes, doc, ledgerStep, sidecarSteps, le
   }
   // sidecar 四件同证（P1-3）：二次对账必须携带同源渲染字节，逐键 sha256 对 plan 锚——
   // 只回 digest 的对账结果在这里过不去（渲染依据被换时能当场暴露）。
+  // R45 二轮 P1-1：字节引用改走 {sha256, bytes}（prepareLegacyCutoverEndpoint 私有面），不再收裸字节。
   for (const [key] of SIDE_CAR_PAIRS) {
-    const bytes = reconcile.sidecars?.[key];
+    const bytes = reconcile.sidecars?.[key]?.bytes;
     if (!(bytes instanceof Uint8Array)) return { ok: false, reason: "sidecar_reconcile_mismatch", why: key + " 缺同源渲染字节" };
     if (createHash("sha256").update(bytes).digest("hex") !== plan.sidecars[key].sha256) {
       return { ok: false, reason: "sidecar_reconcile_mismatch", why: key };

@@ -159,6 +159,9 @@ export function exitCodeFor(r) {
   if (r.ok) return 0;
   if (r.rollback && r.rollback.ok === true) return 1; // 回退清干净 → 干净拒绝（预检不过：reconciler_absent / gate_* / operation_active）
   if (r.rollback && r.rollback.ok === false) return 3; // 回退没做全：动了没做完
+  // R45 三轮 P1-3：catch 折收据（不含 rollback / phase 可能缺失）——reason 本身就是「已动现场」的显式形状，
+  // 不许落到末尾的 1（与干净拒绝同码）。
+  if (r.reason === "ledger_forward_failed" || r.reason === "ledger_rollback_failed") return 3;
   if (FORWARD_PHASES.includes(r.phase)) return 3; // 卡在 forward-only（动了但没做完：门拆了 / current 切了没恢复）
   if (r.phase === "reopening_incomplete" || r.reason === "reopening_incomplete") return 3;
   if (r.reason === "startup_source_unverified") return 1; // 进门就被拒，什么都没动

@@ -272,7 +272,13 @@ function readLockOwner(lockDir) {
   try { st = fs.lstatSync(lockDir); } catch { return { present: false, owner: null }; }
   if (st.isSymbolicLink()) {
     let owner = null;
-    try { owner = JSON.parse(fs.readlinkSync(lockDir)); } catch { owner = null; }
+    try { owner = JSON.parse(fs.readlinkSync(lockDir)); }
+    catch (err) {
+      // 持锁者正在释放（rename 走了）：lstat 看见、readlink 时已消失 —— 这是「锁不在了」，不是残骸。
+      // 误判成 owner:null 会让 reapUnrecognized:false 的调用方（安装收据锁）把活躍竞争报成 lock_residue 且不重试。
+      if (err?.code === "ENOENT") return { present: false, owner: null };
+      owner = null;
+    }
     return { present: true, owner: ownerShapeOk(owner) ? owner : null, mtimeMs: st.mtimeMs };
   }
   // 旧版目录锁：owner.json 在目录里。

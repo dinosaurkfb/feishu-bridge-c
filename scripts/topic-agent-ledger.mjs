@@ -170,9 +170,10 @@ function fsyncDirFd(fd, inj) {
  *     只有 rv.reason === "root_absent"（父链受验净、末级确实缺席）才允许自建。
  *  2) P1-2 TOCTOU 防护：先 open 父目录 fd 钉住 inode、受验父 realpath；路径式 mkdir 后立刻复核父 realpath，
  *     父目录在受验后被换成外指 symlink → mkdir 写进外指目标 → **尽力清掉**刚建目录并 fail-closed（root_not_canonical）。
- *  3) P1-2 迁移点栅栏：调用方传 `_fence` 闭包时，在**创建目录的变更点**（mkdir 前）再次原子复核
- *     active 仍指本 token / gate 仍本 token / lease 实例仍归本 operation / phase 仍 drained；任一失效 →
- *     fence_lost，**在建根前就拒**（不留空根）——防"手里有 lease 对象但实际已丢护栏"的窗口。
+ *  3) P1-2 迁移点栅栏：调用方传 `_fence` 时给它一个 `create` 闭包（真正的 mkdir 变更）。`_fence(create)` 在**自己的
+ *     持锁复核段**（租约 reap 段内走 commitWhileHeld 核**真实注册实例**，不是磁盘 symlink 的 pid）再次原子复核
+ *     active 仍指本 token / gate 仍本 token / phase 仍 drained 后，**由 _fence 在窄段内执行 create**；任一失效 →
+ *     fence_lost，**在建根前就拒**（不留空根）——防"手里有 lease 对象但实际已丢护栏（真实例被删/被换）"的窗口。
  *  4) mkdirSync(root,{recursive:false, mode:0o700})；父目录缺席 → ENOENT → 原样 fail（不递归创建）。
  *  5) chmodSync 0700 兜 umask；fsync 父目录（用钉住的 fd）。
  *  6) 再 validateLedgerRoot(mustExistRoot:true) 复核通过才算数。任一步失败不吞、原样 fail。
@@ -224,24 +225,28 @@ export function ensureLedgerRoot({ env = process.env, _inject = null, _fence = n
     if (fs.realpathSync(parent) !== parentReal) { fs.closeSync(pfd); return { ok: false, reason: "root_not_canonical", why: "父目录在受验后与外指不同（symlink 或换目录），不创建" }; }
   } catch (err) { fs.closeSync(pfd); return { ok: false, reason: "parent_unresolvable", why: "父目录复核失败：" + String(err?.code ?? err?.message ?? err) }; }
   if (inj.onBeforeMkdir) inj.onBeforeMkdir(); // P1-2 注入点：测试在此把父目录确定性换成外指 symlink
-  // P1-2 迁移点栅栏：在**真正创建目录的变更点**（mkdir 前）原子复核护栏。失效（active/gate 被改写、lease 被
-  // 替换/释放、phase 不再 drained）→ 在建根前就拒，绝不留下空根或写入未知目录。
+  // ② 建单层（递归：false，绝不递归）：父目录缺席 → ENOENT → 不递归、原样 fail。封装成 create，交给 _fence 或直接调用。
+  const create = () => {
+    let mkdirErr = null;
+    if (inj.failMkdir) mkdirErr = inj.failMkdir;
+    else { try { fs.mkdirSync(root, { recursive: false, mode: 0o700 }); } catch (err) { mkdirErr = err; } }
+    if (mkdirErr !== null) {
+      const code = mkdirErr?.code ?? null;
+      return { ok: false, reason: code === "ENOENT" ? "parent_absent" : "mkdir_failed", why: code === "ENOENT" ? "父目录缺席，不递归创建" : String(mkdirErr?.message ?? mkdirErr) };
+    }
+    return { ok: true };
+  };
+  // P1-2 迁移点栅栏：把**创建目录的变更点**（mkdir）交给 `_fence(create)` 在真实持锁复核段内执行。失效
+  //   （active/gate 被改写、lease 真实例被删/被接管、phase 不再 drained）→ 在建根前就拒，绝不留下空根或写入未知目录。
   if (_fence) {
-    const fr = _fence();
+    const fr = _fence(create);
     if (!fr.ok) {
       fs.closeSync(pfd);
-      return { ok: false, reason: "fence_lost", why: fr.why ?? fr.reason ?? null };
+      return { ok: false, reason: fr.reason ?? "fence_lost", why: fr.why ?? fr.reason ?? null };
     }
-  }
-  // ② 建单层（recursive:false，绝不递归）：父目录缺席 → ENOENT → 不递归、原样 fail。
-  let mkdirErr = null;
-  if (inj.failMkdir) mkdirErr = inj.failMkdir;
-  else { try { fs.mkdirSync(root, { recursive: false, mode: 0o700 }); } catch (err) { mkdirErr = err; } }
-  if (mkdirErr !== null) {
-    fs.closeSync(pfd);
-    const code = mkdirErr?.code ?? null;
-    const why = code === "ENOENT" ? "父目录缺席，不递归创建" : String(mkdirErr?.message ?? mkdirErr);
-    return { ok: false, reason: code === "ENOENT" ? "parent_absent" : "mkdir_failed", why };
+  } else {
+    const cr = create();
+    if (!cr.ok) { fs.closeSync(pfd); return { ok: false, reason: cr.reason, why: cr.why }; }
   }
   // P1-2 复核：mkdir 后父路径必须仍解析到受验 realpath；否则根被写进了外指目标 → **尽力清**并 fail-closed。
   // 清理是 best-effort（rmdir 失败也照常 fail-closed），不承诺外部残留必然被清、不承诺 doctor 可见。

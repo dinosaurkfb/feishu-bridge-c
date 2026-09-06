@@ -31846,6 +31846,16 @@ test("R46 返修 P1-1/P2：已初始化重跑不留空根（P2）；ledger_reope
     assert.equal(readActive({ dir }).state, "active", "P1-3 active 保留");
     assert.equal(readGate({ file: gateFile, now: clock }).state, "active", "P1-3 门保留");
     assert.equal(readJournal({ dir, token: ent.token }).doc.phase, "reopening_incomplete", "P1-3 留在 reopening_incomplete（红：旧版只验整本结构合法 → 误当成功 → 撤门清 active）");
+
+    // ── P1-3（chain 身份）：本 init operation **在场**且 op_type/指纹/result_revision 全符，只把顶层 chain 从 claude 改成 codex。
+    //   endpoint 是不透明 id，复制来的 op fingerprint（是含 chain 的哈希）不能代替顶层 chain 关系 —— 必须核对 L.doc.chain === ls.chain。
+    //   （本轮 P1-3 与上一轮 P1-3 是不同漏洞：上一轮是"无本 operation"，本轮是"operation 在但 chain 被换"。）
+    fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify({ schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EPb, chain: "codex", authority_mode: "shadow", revision: 1, operations: { [wantOpId]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: ent.token, fingerprint: planB.intendedAfter.fingerprint, result_revision: 1, result: { revision: 1 } } }, records: {} }, null, 2) + "\n", { mode: 0o600 });
+    const g3 = LEDGER_OP.ledgerExit(ctx, { apply: true });
+    assert.equal(g3.ok, false, "P1-3 顶层 chain 被改（codex）→ --exit 应 fail-closed：" + JSON.stringify(g3));
+    assert.equal(readActive({ dir }).state, "active", "P1-3 chain active 保留");
+    assert.equal(readGate({ file: gateFile, now: clock }).state, "active", "P1-3 chain 门保留");
+    assert.equal(readJournal({ dir, token: ent.token }).doc.phase, "reopening_incomplete", "P1-3 chain 留在 reopening_incomplete（红：旧版不核 chain → 误当成功 → 撤门清 active）");
   } finally {
     if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedgerDir;
     if (savedGateEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; else process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = savedGateEnv;
@@ -31857,7 +31867,7 @@ test("R46 返修 P1-1/P2：已初始化重跑不留空根（P2）；ledger_reope
 
 // ④ R46 返修 P1-2（真实 fencing 段内的迁移点栅栏）：ledgerForward 把 provision 放进维护段，建根前原子复核
 //   active/gate/lease/phase；门被换 token → fence_lost，不建根、不进段。
-test("R46 返修 P1-2 栅栏（真实流）：provision 在维护段内 advance 前被拒——门被换 token → fence_lost，不建根", () => {
+test("R46 返修 P1-2 栅栏（真实流）：provision 在维护段内 advance 前被拒——门被换 token / 租约被释放后伪造同路径 symlink → fence_lost，不建根", () => {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r46p12w-")));
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
@@ -31905,6 +31915,20 @@ test("R46 返修 P1-2 栅栏（真实流）：provision 在维护段内 advance 
     assert.equal(g.ok, false, "门被换 token → provision 应 fail-closed：" + JSON.stringify(g));
     assert.equal(g.reason, "fence_lost", "栅栏判据：门不再归本 operation token");
     assert.equal(fs.existsSync(lroot), false, "栅栏失效 → 不建根（红：旧版无栅栏 → 照常建根成功）");
+
+    // ── 场景②（P1-2 租约伪造）：把门恢复回本 token，但释放真租约后在同路径伪造 {pid: process.pid} 的 symlink。
+    //   旧版 provisionFence 只读磁盘 symlink 的 pid（不看 registry HELD 真实实例）→ 见 pid=本进程且活着就放行 → 建根 → 越界。
+    //   新版：provisionFence 在租约的 reap 段内走 commitWhileHeld 核**真实注册实例**——真例已删（HELD 无此 token）→ lock_lost → 拒，不建根。
+    assert.equal(removeGate({ file: gateFile, token: "00000000-0000-0000-0000-00000000000f" }).removed, true, "前置：拆门（恢复 gate 回到本 token）");
+    assert.equal(createGate({ file: gateFile, reason: "P1-2 租约伪造", token: ent.token, now: clock }).ok, true, "前置：重建门回到本 token");
+    assert.equal(readGate({ file: gateFile, now: clock }).payload.token, ent.token, "前置：门已恢复归本 operation token");
+    assert.equal(releaseOperationLease(ent.lease).ok, true, "前置：释放真租约（registry HELD 删掉真实实例）");
+    // 同路径伪造：payload 只给 pid/at —— 旧版 leaseHolder 只核 pid 活没活，会被骗过；新版走 commitment 核真实注册实例，骗不过。
+    fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date(clock).toISOString() }), ent.lease.path, "file");
+    const g2 = LEDGER_OP.ledgerForward(ctx, { token: ent.token, lease: ent.lease, intent: { kind: "init", endpointId: EP, chain: CH }, env: envF });
+    assert.equal(g2.ok, false, "租约已被释放（真实实例不在 registry）→ provision 应 fail-closed：" + JSON.stringify(g2));
+    assert.equal(g2.reason, "fence_lost", "栅栏判据：租约真实实例已丢（lock_lost），磁盘 symlink 伪造 pid 不能冒充");
+    assert.equal(fs.existsSync(lroot), false, "租约被释放+伪造 symlink → 仍不建根（红：旧版只看 symlink 的 pid → 放行建根）");
   } finally {
     if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedgerDir;
     if (savedGateEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; else process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = savedGateEnv;

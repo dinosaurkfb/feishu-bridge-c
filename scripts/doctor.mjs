@@ -58,6 +58,7 @@ import { LAUNCHCTL_ENV, PHASE_TEXT, loadedPhase } from "./launchd-job.mjs";
 import { readGate, maintenanceGatePath } from "./maintenance-gate-core.mjs";
 import { inspectInstalledSurface, installedSurfacePath } from "./installed-surface.mjs";
 import { inspectMaintenanceDir, maintenanceDir, readJournal } from "./maintenance/journal.mjs";
+import { maintenanceRootProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
 import { loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, storeHashState, subscriptionAuditPendingPath, subscriptionStorePath } from "./subscription-store.mjs";
 
 /** 到期预警阈值：7 天内到期就点名。**明写**，不藏在比较式里。 */
@@ -661,10 +662,28 @@ export function runDoctor({
       let stagedCount = 0;
       let names = [];
       try { names = fs.readdirSync(mdir15); } catch { /* 维护目录还没建过 = 没有维护历史，不算病 */ }
-      const sha256File = (file) => { try { return createHash("sha256").update(fs.readFileSync(file)).digest("hex"); } catch { return null; } };
+      // P2-1：受验读复用 staged-plan 的 readStagedVerified（O_NOFOLLOW + ≤1MiB + SHA）；sidecar 权威文件用
+      // NOFOLLOW|NONBLOCK 探针读（FIFO 不挂起、symlink/dangling 说不清进 problems）——不再裸 readFileSync。
+      const sha256File = (file) => {
+        let fd;
+        try {
+          fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+        } catch { return null; }
+        try { return createHash("sha256").update(fs.readFileSync(fd)).digest("hex"); } catch { return null; }
+        finally { try { fs.closeSync(fd); } catch { /* 已关 */ } }
+      };
+      // P2-1：staged 根校验器复用 maintenanceRootProblem（祖先是 symlink/不可读都报结构化问题，不裸抛）；
+      // 目录还没建过 = 没有维护历史，不算病（与 ⑮ 总注一致）。
+      try { fs.lstatSync(mdir15); const rootProblem15 = maintenanceRootProblem(mdir15); if (rootProblem15 !== null) problems.push("维护目录根校验不过：" + rootProblem15); } catch { /* 根缺席不计 */ }
       for (const name of names) {
         const stagedDir = path.join(mdir15, name);
-        if (!name.endsWith(".staged") || !fs.statSync(stagedDir).isDirectory()) continue;
+        if (!name.endsWith(".staged")) continue;
+        let st15 = null;
+        try { st15 = fs.lstatSync(stagedDir); } catch { /* readdir 刚见过、lstat 就没了 = 并发清理，按残骸处理 */ }
+        if (st15 === null || !st15.isDirectory() || st15.isSymbolicLink()) {
+          problems.push("staged 残骸：" + name.slice(0, 8) + (st15 === null ? "（读不出）" : st15.isSymbolicLink() ? "（是 symlink，不是目录）" : "（不是目录）"));
+          continue;
+        }
         const token = name.slice(0, -".staged".length);
         const j = readJournal({ dir: mdir15, token });
         if (j.state !== "valid" || j.doc.phase === "done") { problems.push("staged 残骸：" + token.slice(0, 8) + ".staged（" + (j.state !== "valid" ? "没有对应 journal" : "operation 已完成仍留着") + "）"); continue; }
@@ -673,9 +692,9 @@ export function runDoctor({
         const ls15 = j.doc.steps.find((s) => s.kind === "ledger");
         const planSha = ls15?.intended_after?.plan_sha256 ?? null;
         if (typeof planSha === "string" && planSha.length === 64) {
-          const actual = sha256File(path.join(stagedDir, "intended", "plan.json"));
-          if (actual === null) problems.push("plan 锚复核读不出：" + token.slice(0, 8) + ".staged/intended/plan.json（进行中 cutover 必须有 plan）");
-          else if (actual !== planSha) problems.push("plan 锚复核不过：token " + token.slice(0, 8) + " 的 staged plan SHA 与 journal 记录不一致");
+          // P2-1：受验读（staged-plan 同一校验器）——不符/读不出都给结构化 why，不再裸读。
+          const v15 = readStagedVerified(path.join(stagedDir, "intended", "plan.json"), { sha256: planSha });
+          if (!v15.ok) problems.push("plan 锚复核不过：" + token.slice(0, 8) + ".staged/intended/plan.json（" + (v15.why ?? v15.reason ?? "读不出") + "）");
         }
         // step.target 是 1.3 相对路径（ledger/<endpoint>/<name>.json），相对 bridgeHome（账本根的父）解析；绝对路径原样用
         const ledgerRoot15 = process.env.FEISHU_BRIDGE_LEDGER_DIR ?? null;

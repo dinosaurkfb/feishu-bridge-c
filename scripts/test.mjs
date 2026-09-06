@@ -25776,6 +25776,28 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     }
   }));
 
+  // §R37 P1-3②：wireRotateRecovery 补 create_b1 前，在同一个 outer 锁内重核 legacy 现场——
+  //   复核通过才写 create_b1；复核失败（op_id/root/pending 已变）不写（legacy.ok=false、shadow 空、不落 B1）——
+  //   不略影像、不写错影像。
+  test("m1a 返修 P1-3②：wireRotateRecovery 补 create_b1 前锁内重核 legacy——复核通过才写；复核失败不写", () => withRootAndReceipt((root, dir) => {
+    seedLedger(dir);
+    seedLedgerInitReceipt(path.join(root, "maint"), EP); // M1a 已启用 → 双写强制路径
+    const verifyOk = () => ({ ok: true, root_message_id: "om_rec" });
+    const verifyFail = () => ({ ok: false, reason: "op_id_changed", why: "轮转操作号已变" });
+    // 复核通过 → create_b1 落账（B1 产出）。
+    const r1 = WIRE.wireRotateRecovery({ endpointId: EP, env: process.env, rotationOpId: claim("rot1"), lineageId: "linrec1", chatId: "oc_rec", rootOm: "om_rec", bindingTarget: TGT, verifyLegacy: verifyOk });
+    assert.ok(r1.ok && r1.legacy && r1.legacy.ok === true, "复核通过→recovery ok：" + JSON.stringify(r1));
+    assert.equal(r1.shadow[0].ok, true, "复核通过→create_b1 写成：" + JSON.stringify(r1.shadow[0]));
+    assert.ok((famIds(talLoad(dir), "B1") ?? []).length >= 1, "create_b1 产出 B1");
+    // 复核失败 → 不写 create_b1（legacy.ok=false、shadow 空、不落 B1）——不略影像。
+    const beforeB1 = (famIds(talLoad(dir), "B1") ?? []).length;
+    const r2 = WIRE.wireRotateRecovery({ endpointId: EP, env: process.env, rotationOpId: claim("rot2"), lineageId: "linrec2", chatId: "oc_rec2", rootOm: "om_rec2", bindingTarget: TGT, verifyLegacy: verifyFail });
+    assert.equal(r2.ok, true, "复核失败→整体 ok（legacy 未提交标记）：" + JSON.stringify(r2));
+    assert.equal(r2.legacy.ok, false, "复核失败→legacy.ok=false");
+    assert.equal(r2.shadow.length, 0, "复核失败→不写 create_b1（shadow 空）");
+    assert.equal((famIds(talLoad(dir), "B1") ?? []).length, beforeB1, "复核失败→不落 B1");
+  }));
+
   // §R37 裁定（Codex）：外层锁 skip 集为空——已启用端点的任一锁失败都不得写 legacy；
   //   M1a 启用按**收据状态**（endpointReceipt）逐端点判定，不是运行时 root_absent。
   //   这里验证两条：① never_initialized（无 ledger_init 收据）→ 合法 legacy-only（不取 outer、不写 shadow、无 skip 标记）；

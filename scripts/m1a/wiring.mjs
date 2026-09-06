@@ -322,10 +322,13 @@ export function wireRotate({ endpointId, env = process.env, legacy, rotationOpId
  *   create_b1 缺失。**shadow-only、无 legacy 业务副作用**（prepare/sendToChat/register 由首次 run 完成，本次只补镜像）。
  *   前提：void 已提交（这就是本恢复被调用的判定），故**只补缺失的 create_b1**、不重发 void（重发反而因目标已
  *   作废而 resolv 不到）。ext 沿用首次 run 的 rotation operation id，故 create_b1 幂等：已提交——重放命中，
- *   缺失——才真落账。不许被「已有 pending」预检挡掉；调用方检测到缺失时路由到本函数而非重复创建。 */
-export function wireRotateRecovery({ endpointId, env = process.env, rotationOpId, lineageId, chatId, rootOm, bindingTarget, now = Date.now() }) {
-  return runWired({ endpointId, env, legacy: () => ({ ok: true, root_message_id: rootOm }), submit: (legacyRes) => {
-    if (!en(rotationOpId) || !en(lineageId) || !en(rootOm)) return [{ op: "create_b1", ok: false, reason: "bad_external_id", why: "rotationOpId/lineageId/rootOm 必填 1..256 字符串" }];
+ *   缺失——才真落账。不许被「已有 pending」预检挡掉；调用方检测到缺失时路由到本函数而非重复创建。
+ *   #R37 P1-3②：补影像前在同一个 outer 锁内重核 legacy 现场（pending/operation-id/root），避免对已变的现场写错影像。
+ *   verifyLegacy（可选闭包）在同一个 outer 锁内、create_b1 前跑：返回 { ok:true, root_message_id } 才延续；
+ *   返回 { ok:false, reason, why } 则整笔拒、不写 create_b1（不略影像）。未传时回退到旧的 stub。 */
+export function wireRotateRecovery({ endpointId, env = process.env, rotationOpId, lineageId, chatId, rootOm, bindingTarget, verifyLegacy, now = Date.now() }) {
+  return runWired({ endpointId, env, legacy: () => (verifyLegacy ? verifyLegacy() : { ok: true, root_message_id: rootOm }), submit: (legacyRes) => {
+    if (!legacyRes || legacyRes.ok !== true) return [{ op: "create_b1", ok: false, reason: "legacy_verify_failed", why: legacyRes?.why ?? "补 create_b1 前 legacy 现场复核未通过" }];
     const k = rk("create_b1", rotationOpId, lineageId);
     if (!k.ok) return [{ op: "create_b1", ...k }];
     return [capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm, lineageId, bindingTarget, now, env }))];

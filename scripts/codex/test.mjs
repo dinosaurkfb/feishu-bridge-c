@@ -904,6 +904,24 @@ test("P1-1-d：Codex evaluatePromotion 反向探针——plain 真无码单候�
   assert.deepEqual(legacy.f4.matched_fields, ["chat_id", "sender", "thread_root"], "精确三维（不伪造 body(码) 维）");
 });
 
+test("P1-1①（codex）：无码单候选 + env chat 缺失 → f4=null（chat 维必须来自事件侧受验 locator，不能因『sole_pending 唯一』就自证来源）", () => {
+  const home = temp();
+  const root = path.join(home, "same-project");
+  fs.mkdirSync(root);
+  const now = Date.parse("2026-08-22T08:00:00Z");
+  const a = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: null, now });
+  writeRegistryFixtureUnvalidated([a], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const content = '<at id="ou_same">M5Codex</at>\n没有绑定码的话'; // 无绑定码
+  const event = { message_id: "msg_sole_nc", session_id: "session_sole_nc", sender_id: TEMPLATE.frank_sender_id, created_at_ms: now - 1000, content };
+  const pending = findPendingTask({ home, content, now });
+  assert.equal(pending.source, "sole_pending");
+  // env 无 AILY_CLI_CHANNEL_CHAT_ID → 无法证明 chat 维来源 → f4=null
+  const legacy = evaluatePromotion({ event, template: TEMPLATE, pending, now, env: {} });
+  assert.equal(legacy.ok, true, "缺 env chat 本身不拒，但不得产未受验的配对证明");
+  assert.equal(legacy.f4, null, "无码单候选 + env chat 缺失 → f4=null（chat 维未受验，不产 owner_root_no_token_v1）");
+});
+
 test("P1-1-d：Codex evaluatePromotion 反向探针——无码单候选但有码在 pending → f4=null（裁定 d 条件②）", () => {
   const home = temp();
   const root = path.join(home, "same-project");

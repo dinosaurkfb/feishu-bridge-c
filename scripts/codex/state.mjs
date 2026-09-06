@@ -1070,7 +1070,9 @@ export function evaluatePromotion({ event, template, pending, now = Date.now(), 
   const noTokenClaim = pending?.source === "sole_pending";
   const pToken = (pending.generation?.pending_token ?? null);
   const pExpiry = (pending.generation?.claim_expires_at ?? null);
-  const noTokenOk = matchedOm && pToken === null && pExpiry === null;
+  // #R37 P1-1①：无码分支也必须受验 chat 维——source=sole_pending 只选目标、不能证明来源；
+  //   缺 env AILY_CLI_CHANNEL_CHAT_ID → f4=null（不产未受验的配对证明）。
+  const noTokenOk = matchedOm && chatVerified && pToken === null && pExpiry === null;
   const f4 = matchedOm
     ? isCodeClaim && chatVerified
       ? { matched_om: matchedOm, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }

@@ -5370,6 +5370,18 @@ test("P1-1-d F4（claude）反向探针：无码单候选但有码在 pending �
   assert.equal(r.f4, null, "pending_token 非 null → 不产 no-token proof（既不是 token 认领也没有可验证的无 token 状态）");
 });
 
+test("P1-1①（claude）：无码单候选 + env chat 缺失 → f4=null（chat 维必须来自事件侧受验 locator，不能因『全机唯一 pending』就自证来源）", () => {
+  const f = pendingFixture([{ id: "a", token: null }]);
+  const content = '<at id="ou_t">T</at> 干活'; // 无绑定码
+  const pending = findPendingBinding({ content, ...f, now: NOW2 });
+  assert.equal(pending.ok, true);
+  assert.equal(pending.matchedBy, "only_pending");
+  // 本消息所在群的受验 locator 缺失（env 无 AILY_CLI_CHANNEL_CHAT_ID）→ 无法证明 chat 维来源 → f4=null
+  const r = evaluatePromotion({ event: okEvent, template: TPL, pending, now: NOW2, env: {} });
+  assert.equal(r.ok, true, "缺 env chat 本身不拒（消息仍有效），但不得产未受验的配对证明");
+  assert.equal(r.f4, null, "无码单候选 + env chat 缺失 → f4=null（chat 维未受验，不产 owner_root_no_token_v1）");
+});
+
 test("首次绑定走真实 newRegistryEntry → pendingDeadline：不写截止，任何时候都可认领", () => {
   const f = routeFixture([{ id: "a", extra: {} }]);
   const DAY = 24 * 3600000;
@@ -23022,7 +23034,7 @@ test("P2-① 真入口：崩溃重进（幂等重放）——同一条认领消�
   fs.writeFileSync(path.join(bin, "claude"), ["#!/usr/bin/env node", "process.stdout.write('回答：ok\\n');"].join("\n") + "\n", { mode: 0o700 });
   fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
   const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_p21cr_1", sessionID: "aily_dm", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + "绑定该话题" } }) }] });
-  const spawnEnv = { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_res", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir };
+  const spawnEnv = { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_res", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id };
   const run1 = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: spawnEnv });
   const reg1 = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
   const led1 = JSON.parse(fs.readFileSync(ledgerFile, "utf-8"));

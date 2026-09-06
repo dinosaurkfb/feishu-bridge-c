@@ -51,7 +51,8 @@ const sha256Hex = (buf) => crypto.createHash("sha256").update(buf).digest("hex")
 
 /** 建 0700 目录（recursive 保父链在场），fsync 其父目录作屏障；已在场复用，但 mode 必须仍是 0700（private 目录不许降级）。 */
 function mkdirDurable(dir, parentToFsync) {
-  try { fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch (err) { if (err?.code !== "EEXIST") throw err; }
+  // 三轮 P1④：非递归 —— 根缺席不是 stage 的活，不许 recursive 顺手建链。
+  try { fs.mkdirSync(dir, { recursive: false, mode: 0o700 }); } catch (err) { if (err?.code !== "EEXIST") throw err; }
   // P1-3：lstat 不跟随 —— .staged / intended 被预埋成外指 symlink 时必须在此拒，不能 statSync 跟随放行照写。
   const st = fs.lstatSync(dir);
   if (st.isSymbolicLink()) { const e = new Error("staged 层是符号链接：" + dir); e.code = "EPRIVLINK"; throw e; }
@@ -60,6 +61,21 @@ function mkdirDurable(dir, parentToFsync) {
   try { dfd = fs.openSync(parentToFsync, fs.constants.O_RDONLY); fs.fsyncSync(dfd); }
   catch (err) { if (!dirFsyncIgnorable(err?.code)) throw err; }
   finally { if (dfd !== null) { try { fs.closeSync(dfd); } catch { /* 已关 */ } } }
+}
+
+/** 三轮 P1：maintenance 根唯一校验器 —— stage/verify/remove 三方共用。
+ *  ① 规范绝对路径；② lstat 是目录且非 symlink；③ realpath === resolve（末级与祖先链 symlink 都在此拒）；④ 缺席根即拒，不代建。 */
+function maintenanceRootProblem(dir) {
+  if (typeof dir !== "string" || dir.length === 0 || !path.isAbsolute(dir)) return "maintenance 根不是绝对路径";
+  if (path.resolve(dir) !== dir) return "maintenance 根不是规范路径";
+  let st = null;
+  try { st = fs.lstatSync(dir); } catch (err) { return "maintenance 根缺席（" + errCode(err) + "）"; }
+  if (st.isSymbolicLink()) return "maintenance 根是符号链接";
+  if (!st.isDirectory()) return "maintenance 根不是目录";
+  let real = null;
+  try { real = fs.realpathSync(dir); } catch (err) { return "maintenance 根 realpath 失败（" + errCode(err) + "）"; }
+  if (real !== path.resolve(dir)) return "maintenance 根的祖先链含符号链接";
+  return null;
 }
 
 /** O_EXCL 0600 fd 绑定写满 → fsync 文件。已在场（EEXIST）抛给上层走复验路径。 */
@@ -108,6 +124,9 @@ export function readStagedVerified(file, { sha256, bytes = null } = {}) {
 export function verifyStagedPlan({ dir, token, planSha256, sidecarAnchors }) {
   const tokenProblem = tokenShapeProblem(token);
   if (tokenProblem !== null) return { ok: false, reason: "staged_residue", why: tokenProblem };
+  // 三轮 P1：根绑定 —— dir 自身/祖先 symlink、非规范路径、缺席根都先拒，后续逐层核都建立在词法根上。
+  const rootProblem = maintenanceRootProblem(dir);
+  if (rootProblem !== null) return { ok: false, reason: "staged_residue", why: rootProblem };
   // 二轮 P1-3：恢复路径逐层核 —— <token>.staged 与 intended 都必须是普通目录、精确 0700、无 symlink，
   // 且 canonical realpath 落在本 operation 私有目录内（把 intended/ 或 staged/ 整个换成外指 symlink 在这里拒，
   // 不只靠末级文件的 O_NOFOLLOW）。
@@ -155,6 +174,9 @@ export function stageCutoverPlan({ dir, token, plan, blobs }) {
   const tokenProblem = tokenShapeProblem(token);
   if (tokenProblem !== null) return { ok: false, reason: "plan_mismatch", why: tokenProblem };
   if (token !== plan.operation_token) return { ok: false, reason: "plan_mismatch", why: "token 与 plan.operation_token 不一致" };
+  // 三轮 P1：根绑定 —— active operation 成立时根应已存在；缺根/根 symlink/祖先链 symlink 一律先拒，不建链、不写盘。
+  const rootProblem = maintenanceRootProblem(dir);
+  if (rootProblem !== null) return { ok: false, reason: "staged_residue", why: rootProblem };
   if (!(isObj(blobs) && keysOf(blobs) === "expiry,pending_claims,policy"
     && Object.values(blobs).every((b) => b instanceof Uint8Array))) return { ok: false, reason: "plan_mismatch", why: "blobs 必须是 {expiry,pending_claims,policy} 三个 Uint8Array" };
   // P1-6：blob 超过 1MiB 拒在写入前 —— 不给盘上留下读取端必拒的物。
@@ -203,6 +225,9 @@ export function stageCutoverPlan({ dir, token, plan, blobs }) {
 export function removeStagedPlan({ dir, token }) {
   const tokenProblem = tokenShapeProblem(token);
   if (tokenProblem !== null) return { ok: false, why: tokenProblem };
+  // 三轮 P1：删除边界也锚在词法根 —— 根是 symlink 时词法 staged 解析进外部树，rm 不得跟随。
+  const rootProblem = maintenanceRootProblem(dir);
+  if (rootProblem !== null) return { ok: false, why: rootProblem };
   const staged = path.join(dir, stagedDirFor(token));
   try {
     fs.rmSync(staged, { recursive: true, force: false });

@@ -28423,7 +28423,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     gate: () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: UUID44 }, after: { token: UUID44, txnUncleared: null }, state: "done", at: ISO44(NOW44), chain: null }),
   };
   const enterDone44 = [ed44.timer("claude"), ed44.timer("codex"), ed44.stub("claude"), ed44.stub("codex"), ed44.cur("claude"), ed44.cur("codex"), ed44.gate()];
-  const mkTempDir44 = () => fs.mkdtempSync(path.join(os.tmpdir(), "r44-"));
+  const mkTempDir44 = () => fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r44-")); // 三轮 P1：根须规范路径 —— os.tmpdir() 在 mac 上经 /var symlink，先 realpath 化
   const cutState44 = (o = {}) => ({ endpoint_id: EP44, operation_id: UUID44, fingerprint: SHA44, authority_mode: "shadow", revision: 3, ledger_sha256: SHA44, bijection_digest: null, plan_sha256: null, ...o });
   const cutAfter44 = (o = {}) => ({ endpoint_id: EP44, operation_id: UUID44, fingerprint: SHA44, authority_mode: "authoritative", revision: 4, ledger_sha256: SHA44, bijection_digest: SHA44, plan_sha256: PLAN_SHA44, ...o });
   const cut12State44 = () => ({ endpoint_id: EP44, operation_id: UUID44, fingerprint: SHA44, authority_mode: "shadow", revision: 3, ledger_sha256: SHA44, bijection_digest: null });
@@ -28455,7 +28455,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     assert.ok(journalProblem(d12frozen) !== null, "1.2 cutover 状态对象带 plan_sha256 拒（红：旧版放行）");
     // 未终结 1.2 cutover fail-closed 三分
     const disp = (o) => legacy12CutoverDisposition(doc12_44(o));
-    assert.deepEqual(disp({ phase: "ledger_drained" }), { disposition: "safe_rollback" }, "≤drained → safe_rollback（按 1.2 矩阵回退）");
+    assert.deepEqual(disp({ phase: "drained" }), { disposition: "safe_rollback" }, "≤drained → safe_rollback（按 1.2 矩阵回退；三轮 P2：真名 drained，ledger_drained 不在封闭集）");
     assert.deepEqual(disp({ phase: "rolling_back" }), { disposition: "safe_rollback" }, "rolling_back → safe_rollback");
     assert.deepEqual(disp({ phase: "done" }), { disposition: "receipt" }, "done → 收据");
     assert.deepEqual(disp({ phase: "rolled_back" }), { disposition: "receipt" }, "rolled_back → 收据");
@@ -28595,8 +28595,35 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     assert.equal(stageCutoverPlan({ dir, token: UUID44, plan, blobs }).ok, true, "symlink 清后重 stage 成功");
     // 二轮 P1-4：plan.json 自身受读端同一 1MiB 上限（建目录/写盘之前拒）。
     const bigPlan44 = { ...plan, snapshot_identity: Array.from({ length: 20000 }, (_, i) => ({ source: "registry", path: "/tmp/r44-proj/registry-" + i + "-padding-padding-padding.json", sha256: null })) };
-    const bigR44 = stageCutoverPlan({ dir: mkTempDir44() + "/m2", token: UUID44, plan: bigPlan44, blobs });
+    const bigDir44 = path.join(mkTempDir44(), "m2"); fs.mkdirSync(bigDir44);
+    const bigR44 = stageCutoverPlan({ dir: bigDir44, token: UUID44, plan: bigPlan44, blobs });
     assert.deepEqual([bigR44.ok, bigR44.reason], [false, "plan_mismatch"], "plan 超 1MiB 拒（红：旧版只限三 blob）");
+    // 三轮 P1：maintenance 根绑定 —— dir 自身/祖先 symlink、缺席根、remove 删外部树，三方（stage/verify/remove）同一拒绝面。
+    const symBase = mkTempDir44();
+    const symReal = path.join(symBase, "real"); fs.mkdirSync(symReal);
+    const symLink = path.join(symBase, "link"); fs.symlinkSync(symReal, symLink);
+    assert.equal(stageCutoverPlan({ dir: symLink, token: UUID44, plan, blobs }).ok, false, "dir 自身 symlink → stage 拒");
+    assert.equal(removeStagedPlan({ dir: symLink, token: UUID44 }).ok, false, "dir 自身 symlink → remove 拒");
+    const ancBase = mkTempDir44();
+    const ancReal = path.join(ancBase, "real-m"); fs.mkdirSync(ancReal);
+    fs.symlinkSync(ancReal, path.join(ancBase, "link-m"));
+    const ancDir = path.join(ancBase, "link-m", "sub");
+    assert.equal(stageCutoverPlan({ dir: ancDir, token: UUID44, plan, blobs }).ok, false, "祖先 symlink → stage 拒（现在成功 → 红）");
+    const realSub = path.join(ancReal, "sub"); fs.mkdirSync(realSub);
+    const ancStage = stageCutoverPlan({ dir: realSub, token: UUID44, plan, blobs });
+    assert.equal(ancStage.ok, true, "真实树 stage 基准 ok");
+    const ancAnchors = Object.fromEntries(["expiry", "pending_claims", "policy"].map((k) => [k, { path: stagedIntendedFile({ dir: realSub, token: UUID44, name: k === "pending_claims" ? "pending-claims" : k }), bytes: blobs[k].length, sha256: shaOf44(blobs[k]) }]));
+    assert.equal(verifyStagedPlan({ dir: ancDir, token: UUID44, planSha256: ancStage.plan_sha256, sidecarAnchors: ancAnchors }).ok, false, "祖先 symlink → verify 拒（现在 ok:true → 红）");
+    const extBase = mkTempDir44();
+    const ext = path.join(extBase, "ext", "m"); fs.mkdirSync(ext, { recursive: true });
+    fs.symlinkSync(path.join(extBase, "ext"), path.join(extBase, "link"));
+    stageCutoverPlan({ dir: ext, token: UUID44, plan, blobs });
+    const stagedInExt = path.join(ext, UUID44 + ".staged");
+    assert.equal(removeStagedPlan({ dir: path.join(extBase, "link", "m"), token: UUID44 }).ok, false, "经 symlink 词法根 remove 拒");
+    assert.equal(fs.existsSync(stagedInExt), true, "remove 不得删外部树（外部 staged 完好）");
+    const absentDir = path.join(mkTempDir44(), "absent-root");
+    assert.equal(stageCutoverPlan({ dir: absentDir, token: UUID44, plan, blobs }).ok, false, "缺席根 → stage 拒（不代建）");
+    assert.equal(fs.existsSync(absentDir), false, "缺席根未被 recursive 顺手创建");
     // 目录 mode 降级拒
     const base2 = mkTempDir44(); const dir2 = path.join(base2, "m"); fs.mkdirSync(dir2);
     stageCutoverPlan({ dir: dir2, token: UUID44, plan, blobs });

@@ -10153,6 +10153,52 @@ test("#R11 P1-2（Codex）：promotion 底层不豁免 @ —— 登记表命中�
   assert.equal(r.reason, "transport_not_mentioned");
 });
 
+test("bind-task 首次接入：已启用端点强制双写镜像 shadow create_b1（codex target 精确）；恰好一次 sendToChat", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  fs.writeFileSync(path.join(root, "README.md"), "# Alpha\n");
+  const canon = fs.realpathSync(home);                  // macOS /var→/private/var canonical（m1a 锁根要求 canonical）
+  const configBase = path.join(home, "agents");
+  const credentialDir = path.join(configBase, TEMPLATE.agent_uid);
+  fs.mkdirSync(credentialDir, { recursive: true });
+  fs.writeFileSync(path.join(credentialDir, "config.json"), JSON.stringify({ apps: [{ name: TEMPLATE.lark_cli_profile, appId: TEMPLATE.transport_app_id }] }));
+  const logFile = path.join(home, "lark.log");
+  const bin = path.join(home, "fake-lark.sh");
+  fs.writeFileSync(bin, "#!" + process.execPath + "\n" +
+    "const fs = require('node:fs');\n" +
+    "fs.appendFileSync(process.env.__LARK_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');\n" +
+    "process.stdout.write('{\"ok\":true,\"data\":{\"message_id\":\"om_sent\"}}');\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({ ...TEMPLATE, lark_cli_bin: bin, lark_cli_config_base: configBase }));
+  const m = seedM1aEndpoint({ home, chain: "codex" });
+  const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+    FEISHU_BRIDGE_MAINTENANCE_DIR: m.maintDir, FEISHU_BRIDGE_LEDGER_DIR: m.ledgerRoot,
+    __LARK_LOG: logFile };
+  const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
+    "--project", root, "--thread-id", THREAD_A, "--name", "Alpha", "--apply", ...withIntent("bind", THREAD_A, home, { project: root, name: "Alpha" })], {
+    encoding: "utf-8", env,
+  });
+  assert.equal(run.status, 0, run.stderr);
+  const regt = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home });
+  assert.equal(regt.ok, true, JSON.stringify(regt));
+  assert.equal(regt.task.root_message_id, "om_sent");
+  // shadow ledger：应有 create_b1 镜像 B1（codex target 精确）。
+  const l = TAL.loadLedger(path.join(m.ledgerRoot, m.ep), { endpointId: m.ep });
+  assert.equal(l.ok, true, JSON.stringify(l));
+  const b1s = Object.entries(l.doc.records).filter(([, r]) => r.kind === "live" && TAL.familyOf(r.facts) === "B1").map(([k]) => k);
+  assert.equal(b1s.length, 1, "应有 create_b1 镜像 B1：" + JSON.stringify(l.doc.records));
+  const rec = l.doc.records[b1s[0]];
+  assert.equal(rec.binding_target.runtime, "codex", "target.runtime");
+  assert.equal(rec.binding_target.codex_task_id, regt.task.logical_task_key, "target.codex_task_id");
+  assert.equal(rec.binding_target.codex_thread_id, THREAD_A, "target.codex_thread_id");
+  assert.equal(rec.binding_target.project_root, root, "target.project_root");
+  assert.equal(rec.chat_id, "oc_test", "chat_id");
+  assert.equal(rec.generation_lineage_id, regt.task.logical_task_key + "@project-files");
+  assert.equal(rec.aliases.root_om, "om_sent", "root_om 来自 legacy 返回");
+  const sendCalls = fs.readFileSync(logFile, "utf-8").trim().split("\n").filter((line) => line.includes("+messages-send"));
+  assert.equal(sendCalls.length, 1, "恰好一次 sendToChat（messages-send）：" + JSON.stringify(sendCalls));
+});
+
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (TEST_FILTER.length > 0) {

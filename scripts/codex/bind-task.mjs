@@ -15,7 +15,7 @@ import {
   refreshPendingTaskBinding, setTaskConnectionStatus, setTaskDisplayName,
 } from "./state.mjs";
 import { buildIntentParams, requireIntent } from "./intent.mjs";
-import { wirePauseResume, emitUncleanReceipt } from "../m1a/wiring.mjs";
+import { wireBind, wirePauseResume, uncleanWired, emitUncleanReceipt } from "../m1a/wiring.mjs";
 import { legacyEndpointId } from "../subscription.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 
@@ -163,46 +163,58 @@ if (!apply) {
 }
 
 const identity = resolveLarkIdentity(tpl.template);
-let rootMessageId;
-try {
-  rootMessageId = sendToChat({
-    profile: identity.profile,
-    chatId: target.chatId,
-    text: d.rootText,
-    idempotencyKey: d.idempotencyKey,
-    larkBin: identity.bin,
-    larkHome: identity.configDir,
-    expectedAppId: identity.expectedAppId,
-  });
-} catch (err) {
-  die("建话题失败，没有写登记表：" + err.message);
-}
-
-const task = makeTaskEntry({
-  root,
-  threadId: thread.threadId,
-  name: d.name,
-  purpose: d.purpose,
-  rootMessageId,
-  token: d.token,
-  inboundPrefix: tpl.template.inbound_prefix,
+// P2-2 wireBind（Frank 裁定）：codex 任务级绑定的 legacy 三步（建根话题 + 登记 + 发布状态回复）收进一个闭包，
+//   已启用端点以 m1a-order 锁串行并镜像 shadow create_b1；未启用端点（never_initialized）→ 合法 legacy-only。
+//   codex 允许多个 task / 项目，故 lineage 必须 per-task 唯一（prevent lineage_pending_exists 误拒）。
+const bindTarget = { runtime: "codex", codex_task_id: d.logicalTaskKey, codex_thread_id: d.threadId, project_root: root };
+const wired = wireBind({
+  endpointId: legacyEndpointId({ runtime: "codex", agentUid: tpl.template.agent_uid }),
+  env: process.env,
+  externalRequestId: d.idempotencyKey,
+  lineageId: d.logicalTaskKey + "@project-files",
   chatId: target.chatId,
-  chatName: target.chatName,
+  bindingTarget: bindTarget,
+  legacy: () => {
+    // ① 建根话题（幂等键）。失败 → 无任何副作用，返回 ok:false（wireBind 不跑 shadow）。
+    let rootMessageId;
+    try {
+      rootMessageId = sendToChat({
+        profile: identity.profile, chatId: target.chatId, text: d.rootText,
+        idempotencyKey: d.idempotencyKey, larkBin: identity.bin, larkHome: identity.configDir,
+        expectedAppId: identity.expectedAppId,
+      });
+    } catch (err) {
+      return { ok: false, phase: "send", message: err.message };
+    }
+    // ② 登记（entry push + 原子写）。失败 → 话题已在群里，返回 ok:false（phase=registry，幂等键保重跑不重建）。
+    const task = makeTaskEntry({
+      root, threadId: thread.threadId, name: d.name, purpose: d.purpose, rootMessageId,
+      token: d.token, inboundPrefix: tpl.template.inbound_prefix,
+      chatId: target.chatId, chatName: target.chatName,
+    });
+    const added = addTask(task);
+    if (!added.ok) {
+      return { ok: false, phase: "registry", root_message_id: rootMessageId, message: added.reason + (added.error ? "（" + added.error + "）" : "") };
+    }
+    // ③ 发布状态回复（best-effort：登记已完成，失败仅告警不断言失败）。
+    try {
+      publishDraft({ profile: identity.profile, rootMessageId, text: d.statusText, larkBin: identity.bin, larkHome: identity.configDir, expectedAppId: identity.expectedAppId });
+    } catch (err) {
+      console.error("登记已完成，但状态回复失败：" + err.message);
+    }
+    return { ok: true, root_message_id: rootMessageId };
+  },
 });
-const added = addTask(task);
-if (!added.ok) die("话题已建，但登记表没写成：" + added.reason +
-  (added.error ? "（" + added.error + "）" : "") + "。重跑会命中平台幂等键，不会重建话题。");
-
-try {
-  publishDraft({
-    profile: identity.profile,
-    rootMessageId,
-    text: d.statusText,
-    larkBin: identity.bin,
-    larkHome: identity.configDir,
-    expectedAppId: identity.expectedAppId,
-  });
-  console.log("已接入并发布状态回复。去新话题真实 @ M5Codex 一下完成绑定；后续不需要关键字前缀。");
-} catch (err) {
-  console.error("登记已完成，但状态回复失败：" + err.message);
+if (!wired.ok) {
+  // 已启用端点任一取锁/账本/收据异常 → 整笔拒、不写 legacy、不建话题（fail-closed）。
+  die("绑定失败（M1a 一致性锁：" + (wired.reason ?? "unknown") + (wired.why ? "；" + wired.why : "") + "）");
 }
+const lr = wired.legacy;
+if (!lr.ok) {
+  if (lr.phase === "send") die("建话题失败，没有写登记表：" + lr.message);
+  die("话题已建（" + lr.root_message_id + "）但登记表没写成：" + lr.message + "。重跑会命中平台幂等键，不会重建话题。");
+}
+// #R37 P1-4：legacy 已提交但 shadow 镜像不干净 → 持久机器回执（不谎报 clean）。
+const bindUnclean = uncleanWired(wired);
+if (!bindUnclean.clean) emitUncleanReceipt("cli_bind_task", wired, { receiptDir: path.join(bridgeHome(), "receipts") });
+console.log("已接入并发布状态回复。去新话题真实 @ M5Codex 一下完成绑定；后续不需要关键字前缀。");

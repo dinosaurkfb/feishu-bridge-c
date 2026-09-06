@@ -7,7 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { acquireClaim, claimKey, readClaimState, recordClaimState } from "../claim.mjs";
-import { wireChatA1, wirePromoteBinding, wireVoid } from "../m1a/wiring.mjs";
+import { wireChatA1, wirePromoteBinding, wireVoid, uncleanWired } from "../m1a/wiring.mjs";
 import { legacyEndpointId } from "../subscription.mjs";
 import { fetchTriggerEvent } from "../envelope.mjs";
 import { moduleRoot } from "../direct-run.mjs";
@@ -198,6 +198,9 @@ function chatTurn({ chain, template, event, dryRun, ledgerDir }) {
   if (admitted.lockUncleared) writeReceipt("chat-lock-" + messageId, { status: "error", reason: "chat_admission_lock_uncleared", why: admitted.lockUncleared, lock_dir: ledgerDir, ...base, claim_acquired: true });
   // 自己的临时文件没清掉（极少见）：不影响这条回答，doctor ⑨ 会点名；只进机器回执
   if (admitted.tmpResidue) writeReceipt("chat-tmp-" + messageId, { status: "error", reason: "chat_ledger_tmp_residue", tmp: admitted.tmpResidue, ...base, claim_acquired: true });
+  // #R37 P1-4：legacy 已收但 A1 shadow 不干净（镜像步失败/非干净提交/锁残骸/release 残骸）→ 写持久机器回执，不谎报 clean。
+  const chatUnclean = uncleanWired(wiredA1);
+  if (!chatUnclean.clean) writeReceipt("chat-unclean-" + messageId, { status: "unclean", ...chatUnclean, mode: CHAT_POLICY_ID, ...base, claim_acquired: true });
   const reply = chatReply({ instruction });
   if (!reply.ok) {
     const recorded = recordChatOutcome({ ledgerDir, key, outcome: { status: "failed", reason: reply.reason, why: reply.why, diagnostic: reply.diagnostic ?? null, elapsed_ms: reply.elapsedMs,
@@ -414,6 +417,14 @@ if (!routed.ok) {
     });
     finish("error", { detail: "绑定没写成（" + promoted.reason + "）" }, { reason: promoted.reason });
   }
+
+  // #R37 P1-4：legacy 已成但 shadow 不干净（镜像步失败/非干净提交/锁残骸/release 残骸）→ 写持久机器回执，不谎报 clean。
+  const promoteUnclean = uncleanWired(wiredPromote);
+  if (!promoteUnclean.clean) writeReceipt("m1a-unclean-" + (event.message_id ?? Date.now()), {
+    status: "unclean", legacy: "ok", ...promoteUnclean,
+    claim_acquired: false, handed_off: false, subscription_claim_shadow: subscriptionClaimShadow,
+  });
+
   justBound = true;
   routed = findTaskForFeishuSession({ sessionId: event.session_id, home: HOME });
   if (!routed.ok) finish("error", { detail: "绑定写完却读不回来" }, { reason: routed.reason });

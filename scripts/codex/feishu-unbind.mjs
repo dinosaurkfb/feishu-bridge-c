@@ -5,7 +5,7 @@ import { validThreadId } from "./bind-compose.mjs";
 import {
   bridgeHome, findRegisteredTaskForCodexThread, setTaskConnectionStatus, loadCodexTemplate,
 } from "./state.mjs";
-import { wirePauseResume } from "../m1a/wiring.mjs";
+import { wirePauseResume, emitUncleanReceipt } from "../m1a/wiring.mjs";
 import { legacyEndpointId } from "../subscription.mjs";
 import { requireIntent } from "./intent.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
@@ -61,8 +61,9 @@ const tmpl = loadCodexTemplate();
 const agentUid = tmpl?.template?.agent_uid ?? null;
 const runPause = () => setTaskConnectionStatus({ threadId, status: "paused", home });
 let changed;
+let wired = null;
 if (agentUid) {
-  const wired = wirePauseResume({
+  wired = wirePauseResume({
     endpointId: legacyEndpointId({ runtime: "codex", agentUid }),
     env: process.env,
     legacy: runPause,
@@ -79,4 +80,6 @@ if (!changed.ok) {
   console.error("暂停失败：" + changed.reason + (changed.error ? "（" + changed.error + "）" : ""));
   process.exit(1);
 }
+// #R37 P1-4：legacy 已暂停但镜像不干净（release 残骸/锁残骸）→ 机器回执，不谎报 clean。
+if (wired) emitUncleanReceipt("cli_unbind_pause", wired, { threadId });
 console.log("已暂停当前 Codex task 的飞书接入；原话题和本地历史均已保留。");

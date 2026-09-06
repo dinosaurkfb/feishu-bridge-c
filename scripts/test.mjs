@@ -29962,6 +29962,48 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
   });
 }
 
+  // #R37 P1-4：共用 unclean 投影 —— legacy 已成但镜像不干净，调用方必须据此写持久机器回执，不谎报 clean。
+  test("m1a unclean 投影（P1-4）", () => {
+    // 基线：legacy-only（never_initialized）→ 零 shadow、零 release → 干净。
+    const legacyOnly = { ok: true, legacy: { ok: true }, shadow: [], release: null };
+    assert.equal(WIRE.uncleanWired(legacyOnly).clean, true, "legacy-only 零 shadow 应干净");
+
+    // ① shadow 步失败 → 不干净，failedSteps 点名该步。
+    const failedStep = { ok: true, legacy: { ok: true }, shadow: [{ op: "create_a1", ok: false, reason: "shadow_rejected" }], release: null };
+    const unc1 = WIRE.uncleanWired(failedStep);
+    assert.equal(unc1.clean, false, "shadow 步失败应不干净");
+    assert.equal(unc1.failedSteps.length, 1, "failedSteps 应点名失败步");
+    assert.equal(unc1.failedSteps[0].op, "create_a1", "failedSteps[0].op 应为失败步");
+
+    // ② 非干净提交（committed_with_residue）→ 不干净，uncleanSteps 点名；legacy 语义仍 ok。
+    const residueCommit = { ok: true, legacy: { ok: true }, shadow: [{ op: "void", ok: true, commit: "committed_with_residue", residue: { reap: ".reaped-x" } }], release: null };
+    const unc2 = WIRE.uncleanWired(residueCommit);
+    assert.equal(unc2.clean, false, "committed_with_residue 应不干净");
+    assert.equal(unc2.uncleanSteps.length, 1, "uncleanSteps 应点名非干净提交步");
+    assert.equal(unc2.uncleanSteps[0].commit, "committed_with_residue", "uncleanSteps[0].commit 应保留原语");
+
+    // ③ release 残骸 → 不干净，releaseUnclean 点名。
+    const releaseDirty = { ok: true, legacy: { ok: true }, shadow: [{ op: "void", ok: true, commit: "committed", sha256: "sha" }], release: { ok: false, reason: "reap_uncleared", path: "/x/m1a-order.lock", error: "EIO" } };
+    const unc3 = WIRE.uncleanWired(releaseDirty);
+    assert.equal(unc3.clean, false, "release 残骸应不干净");
+    assert.equal(unc3.releaseUnclean.reason, "reap_uncleared", "releaseUnclean 应点名 release 残骸");
+
+    // ④ 外层取锁失败（runWired fail-closed）→ lockUnclean 带 path/error；legacy:null 整笔披。
+    const lockFail = { ok: false, commit: "not_committed", reason: "lock_residue", why: "锁形状不对", lock: "/x/m1a-order.lock", lockPath: "/x/m1a-order.lock", lockError: "EPERM", legacy: null, shadow: null, release: null };
+    const unc4 = WIRE.uncleanWired(lockFail);
+    assert.equal(unc4.clean, false, "外层锁失败应不干净");
+    assert.equal(unc4.lockUnclean.path, "/x/m1a-order.lock", "lockUnclean 应带残骸路径");
+    assert.equal(unc4.lockUnclean.error, "EPERM", "lockUnclean 应带残骸 error");
+
+    // ⑤ 干净启用点（shadow：单步均 committed，release ok:true）→ 干净，emitUncleanReceipt 静默。
+    const clean = { ok: true, legacy: { ok: true }, shadow: [{ op: "void", ok: true, commit: "committed" }], release: { ok: true, lock: "/x/m1a-order.lock" } };
+    assert.equal(WIRE.uncleanWired(clean).clean, true, "单步 committed + release ok 应干净");
+    let em = "";
+    const prevErr = console.error; console.error = (s) => { em += s; };
+    try { WIRE.emitUncleanReceipt("cli_void", clean, { opId: "o" }); } finally { console.error = prevErr; }
+    assert.equal(em, "", "干净时 emitUncleanReceipt 应静默");
+  });
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

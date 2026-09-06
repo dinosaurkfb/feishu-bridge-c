@@ -20,7 +20,7 @@ import {
   ROTATION_STATUS, activeGeneration, pendingGeneration, TOPIC_GENERATION_PREPARING_STALE_MS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, pendingRotationBlocker,
 } from "../topic-generation.mjs";
 import { buildIntentParams, requireIntent } from "./intent.mjs";
-import { wireVoid } from "../m1a/wiring.mjs";
+import { wireVoid, emitUncleanReceipt } from "../m1a/wiring.mjs";
 import { legacyEndpointId } from "../subscription.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 
@@ -100,8 +100,9 @@ if (cancel) {
     home: bridgeHome(),
   });
   let closed;
+  let wiredCancel = null;
   if (agentUid) {
-    const wired = wireVoid({
+    wiredCancel = wireVoid({
       endpointId: legacyEndpointId({ runtime: "codex", agentUid }),
       env: process.env,
       rotationOpId,
@@ -109,12 +110,14 @@ if (cancel) {
       reason: "manual",
       legacy: runCancel,
     });
-    if (!wired.ok) die("取消轮转失败（M1a 一致性锁：" + wired.reason + (wired.why ? "；" + wired.why : "") + "）");
-    closed = wired.legacy;
+    if (!wiredCancel.ok) die("取消轮转失败（M1a 一致性锁：" + wiredCancel.reason + (wiredCancel.why ? "；" + wiredCancel.why : "") + "）");
+    closed = wiredCancel.legacy;
   } else {
     closed = runCancel();
   }
   if (!closed.ok) die("取消轮转失败（" + closed.reason + "）。");
+  // #R37 P1-4：legacy 已取消轮转但镜像不干净（void 步失败/非干净提交/锁残骸）→ 机器回执，不谎报 clean。
+  if (wiredCancel) emitUncleanReceipt("cli_rotate_cancel", wiredCancel, { operationId: rotationOpId });
   console.log("已取消待认领代际；旧话题仍是唯一 active，未删除任何飞书历史。");
   process.exit(0);
 }

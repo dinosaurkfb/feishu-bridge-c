@@ -24,7 +24,7 @@ import { displaySafe } from "./display-safe.mjs";
 import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { bindingsForRoot, currentBinding, describeStatus, setBindingStatus } from "./feishu-control.mjs";
 import { loadClaudeTopicBinding } from "./topic-generation-store.mjs";
-import { wirePauseResume } from "./m1a/wiring.mjs";
+import { wirePauseResume, emitUncleanReceipt } from "./m1a/wiring.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
 import {
   acquirePublishLock, exactProjectsForRoot, loadRegistryStrict, normalizeRoot,
@@ -209,17 +209,18 @@ if (suspended.ok && suspended.suspended) {
   const agentUid0 = loadClaudeTopicBinding({ root })?.config?.agent_uid ?? null;
   const runResume = () => setBindingStatus({ root, status: "active" });
   let r;
+  let wiredResume = null;
   if (agentUid0) {
-    const wired = wirePauseResume({
+    wiredResume = wirePauseResume({
       endpointId: legacyEndpointId({ runtime: "claude", agentUid: agentUid0 }),
       env: process.env,
       legacy: runResume,
     });
-    if (!wired.ok) {
-      console.error("恢复失败（M1a 一致性锁：" + wired.reason + (wired.why ? "；" + wired.why : "") + "）");
+    if (!wiredResume.ok) {
+      console.error("恢复失败（M1a 一致性锁：" + wiredResume.reason + (wiredResume.why ? "；" + wiredResume.why : "") + "）");
       process.exit(1);
     }
-    r = wired.legacy;
+    r = wiredResume.legacy;
   } else {
     r = runResume();
   }
@@ -227,6 +228,8 @@ if (suspended.ok && suspended.suspended) {
     console.error("恢复失败（" + r.reason + "）" + (r.error ? "：" + r.error : ""));
     process.exit(1);
   }
+  // #R37 P1-4：legacy 已恢复但镜像不干净（release 残骸/锁残骸）→ 机器回执，不谎报 clean。
+  if (wiredResume) emitUncleanReceipt("cli_bind_project_resume", wiredResume, { root });
   console.log("\n已恢复。改动写在 " + r.store);
   console.log(describeStatus(currentBinding({ root }), bindingsForRoot({ root })));
   process.exit(0);

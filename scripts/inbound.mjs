@@ -57,7 +57,7 @@ import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeo
 import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome, lockUnclearedText } from "./chat-ledger.mjs";
 import { closeClaudeTopicRotation, loadClaudeTopicBinding } from "./topic-generation-store.mjs";
 import { recordClaudeActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
-import { wireChatA1, wirePromoteBinding, wireVoid } from "./m1a/wiring.mjs";
+import { wireChatA1, wirePromoteBinding, wireVoid, uncleanWired } from "./m1a/wiring.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
 import {
   buildLegacyDialogueBoundAuthorizationContext,
@@ -281,6 +281,9 @@ function chatTurn({ chain, template, event, dryRun, ledgerDir }) {
   if (admitted.lockUncleared) writeReceipt("chat-lock-" + messageId, { status: "error", reason: "chat_admission_lock_uncleared", why: admitted.lockUncleared, lock_dir: ledgerDir, ...base, claim_acquired: true });
   // 自己的临时文件没清掉（极少见）：不影响这条回答，doctor ⑨ 会点名；只进机器回执
   if (admitted.tmpResidue) writeReceipt("chat-tmp-" + messageId, { status: "error", reason: "chat_ledger_tmp_residue", tmp: admitted.tmpResidue, ...base, claim_acquired: true });
+  // #R37 P1-4：legacy 已收但 A1 shadow 不干净（镜像步失败/非干净提交/锁残骸/release 残骸）→ 写持久机器回执，不谎报 clean。
+  const chatUnclean = uncleanWired(wired);
+  if (!chatUnclean.clean) writeReceipt("chat-unclean-" + messageId, { status: "unclean", ...chatUnclean, mode: CHAT_POLICY_ID, ...base, claim_acquired: true });
   const reply = chatReply({ instruction });
   if (!reply.ok) {
     const recorded = recordChatOutcome({ ledgerDir, key, outcome: { status: "failed", reason: reply.reason, why: reply.why, diagnostic: reply.diagnostic ?? null, elapsed_ms: reply.elapsedMs,
@@ -494,6 +497,13 @@ if (!routed.ok) {
     });
     finish("error", { detail: "绑定没写成（" + wrote.reason + "）" }, { reason: wrote.reason });
   }
+
+  // #R37 P1-4：legacy 已成但 shadow 不干净（镜像步失败/非干净提交/锁残骸/release 残骸）→ 写持久机器回执，不谎报 clean。
+  const promoteUnclean = uncleanWired(wired);
+  if (!promoteUnclean.clean) writeReceipt("m1a-unclean-" + event.message_id, {
+    status: "unclean", legacy: "ok", ...promoteUnclean,
+    claim_acquired: false, handed_off: false, subscription_claim_shadow: subscriptionClaimShadow,
+  });
 
   justBound = true;
   pendingMatchedBy = pending.matchedBy ?? null;

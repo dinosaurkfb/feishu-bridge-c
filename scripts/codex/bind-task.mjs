@@ -15,7 +15,7 @@ import {
   refreshPendingTaskBinding, setTaskConnectionStatus, setTaskDisplayName,
 } from "./state.mjs";
 import { buildIntentParams, requireIntent } from "./intent.mjs";
-import { wirePauseResume } from "../m1a/wiring.mjs";
+import { wirePauseResume, emitUncleanReceipt } from "../m1a/wiring.mjs";
 import { legacyEndpointId } from "../subscription.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 
@@ -115,20 +115,23 @@ if (existing.ok) {
   const agentUid = tpl0?.template?.agent_uid ?? null;
   const runResume = () => setTaskConnectionStatus({ threadId: thread.threadId, status: "active" });
   let resumed;
+  let wiredResume = null;
   if (agentUid) {
-    const wired = wirePauseResume({
+    wiredResume = wirePauseResume({
       endpointId: legacyEndpointId({ runtime: "codex", agentUid }),
       env: process.env,
       legacy: runResume,
     });
-    if (!wired.ok) {
-      die("恢复接入失败（M1a 一致性锁：" + wired.reason + (wired.why ? "；" + wired.why : "") + "）");
+    if (!wiredResume.ok) {
+      die("恢复接入失败（M1a 一致性锁：" + wiredResume.reason + (wiredResume.why ? "；" + wiredResume.why : "") + "）");
     }
-    resumed = wired.legacy;
+    resumed = wiredResume.legacy;
   } else {
     resumed = runResume();
   }
   if (!resumed.ok) die("恢复接入失败：" + resumed.reason + (resumed.error ? "（" + resumed.error + "）" : ""));
+  // #R37 P1-4：legacy 已恢复但镜像不干净（release 残骸/锁残骸）→ 机器回执，不谎报 clean。
+  if (wiredResume) emitUncleanReceipt("cli_bind_task_resume", wiredResume, { threadId: thread.threadId });
   console.log("已恢复当前 Codex task 的飞书接入，继续使用原话题。");
   process.exit(0);
 }

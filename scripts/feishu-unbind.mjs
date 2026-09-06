@@ -19,7 +19,7 @@ import {
   SUSPENDED, bindingsForRoot, currentBinding, describeStatus, setBindingStatus,
 } from "./feishu-control.mjs";
 import { loadClaudeTopicBinding } from "./topic-generation-store.mjs";
-import { wirePauseResume } from "./m1a/wiring.mjs";
+import { wirePauseResume, emitUncleanReceipt } from "./m1a/wiring.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
 
 const arg = (n) => {
@@ -62,17 +62,18 @@ if (!apply) {
 const agentUid = loadClaudeTopicBinding({ root, claudeSessionId })?.config?.agent_uid ?? null;
 const runPause = () => setBindingStatus({ root, claudeSessionId, status: SUSPENDED });
 let r;
+let wiredPause = null;
 if (agentUid) {
-  const wired = wirePauseResume({
+  wiredPause = wirePauseResume({
     endpointId: legacyEndpointId({ runtime: "claude", agentUid }),
     env: process.env,
     legacy: runPause,
   });
-  if (!wired.ok) {
-    console.error("暂停失败（M1a 一致性锁：" + wired.reason + (wired.why ? "；" + wired.why : "") + "）");
+  if (!wiredPause.ok) {
+    console.error("暂停失败（M1a 一致性锁：" + wiredPause.reason + (wiredPause.why ? "；" + wiredPause.why : "") + "）");
     process.exit(1);
   }
-  r = wired.legacy;
+  r = wiredPause.legacy;
 } else {
   r = runPause();
 }
@@ -80,5 +81,7 @@ if (!r.ok) {
   console.error("暂停失败（" + r.reason + "）" + (r.error ? "：" + r.error : ""));
   process.exit(1);
 }
+// #R37 P1-4：legacy 已暂停但镜像不干净（release 残骸/锁残骸）→ 机器回执，不谎报 clean。
+if (wiredPause) emitUncleanReceipt("cli_unbind_pause", wiredPause, { root, claudeSessionId });
 console.log("\n已暂停。改动写在 " + r.store);
 console.log(describeStatus(currentBinding({ root, claudeSessionId }), bindingsForRoot({ root })));

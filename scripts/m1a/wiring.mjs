@@ -39,12 +39,62 @@ function rk(opType, externalRequestId, entityId) {
   return requestKeyFor({ opType, externalRequestId, entityId });
 }
 
-/* 捕获一次 shadow 提交，绝不抛出；返回 { op, result } 或 { op, ok:false, reason, why }。 */
+/* 捕获一次 shadow 提交，绝不抛出；返回 { op, result } 或 { op, ok:false, reason, why }。
+ * #R37 P1-4：透传 ledger 提交的 lockUncleared / residue / path / error —— 不再当作垃圾烂抛，
+ *   好让共用 unclean 投影点名「镜像不干净」的每一步；非干净提交（committed_with_residue /
+ *   committed_durability_uncertain）仍 ok:true（数据确实提交了，语义不变），但保留 committed 供投影区分。 */
 function capture(op, res) {
   if (!res || typeof res !== "object") return { op, ok: false, reason: "shadow_nonobject", why: "shadow 提交未返回对象" };
-  if (res.ok === true) return { op, ok: true, result: res.result ?? null, idempotent: res.idempotent === true, committed: res.commit ?? null, sha256: res.sha256 ?? null };
-  if (res.ok === false) return { op, ok: false, reason: res.reason ?? "shadow_rejected", why: res.why ?? null };
+  if (res.ok === true) return { op, ok: true, result: res.result ?? null, idempotent: res.idempotent === true, committed: res.commit ?? null, sha256: res.sha256 ?? null, residue: res.residue ?? null, lockUncleared: res.lockUncleared ?? null, path: res.path ?? null, error: res.error ?? null };
+  if (res.ok === false) return { op, ok: false, reason: res.reason ?? "shadow_rejected", why: res.why ?? null, residue: res.residue ?? null, lockUncleared: res.lockUncleared ?? null, path: res.path ?? null, error: res.error ?? null };
   return { op, ok: false, reason: "shadow_unknown" };
+}
+
+/* ── 共用 unclean 投影（#R37 P1-4）────────────────────────────────
+ * 把 runWired 结果折成「镜像是否干净」+ 不干净明细，供入站 chat/promote 调用点与 5 个 CLI
+ * 直写点消费：legacy 已成但 shadow 不干净 → 调用方写持久机器回执。
+ * 语义：clean **不改变** wired.ok / legacy 成功语义 —— 它只是「影子是否镜像干净」的投影，
+ * 覆盖四类：① shadow 步提交失败（ok:false）；② 非干净提交（committed_with_residue /
+ * committed_durability_uncertain）；③ 内层（shadow 提交步）/外层（acq）锁残骸；④ release 残骸。 */
+export function uncleanWired(wired) {
+  const steps = Array.isArray(wired?.shadow) ? wired.shadow : [];
+  const failedSteps = steps.filter((s) => s && s.ok === false).map((s) => ({
+    op: s.op ?? null, reason: s.reason ?? null, why: s.why ?? null,
+  }));
+  const uncleanSteps = steps.filter((s) => s && s.ok === true && (
+    (s.commit && s.commit !== "committed") || s.residue || s.lockUncleared || s.path || s.error
+  )).map((s) => ({
+    op: s.op ?? null, commit: s.commit ?? "committed", residue: s.residue ?? null,
+    lockUncleared: s.lockUncleared ?? null, path: s.path ?? null, error: s.error ?? null,
+  }));
+  const rel = wired?.release;
+  const releaseUnclean = rel && rel.ok !== true ? {
+    reason: rel.reason ?? null, why: rel.why ?? null, path: rel.path ?? null, error: rel.error ?? null,
+  } : null;
+  const lockUnclean = wired && wired.ok !== true && wired.lock ? {
+    reason: wired.reason ?? null, why: wired.why ?? null,
+    path: wired.lockPath ?? wired.lock ?? null, error: wired.lockError ?? null,
+  } : null;
+  const durabilityUncertain = uncleanSteps.some((s) => s.commit === "committed_durability_uncertain");
+  const residue = steps.filter((s) => s && s.residue).map((s) => ({ op: s.op ?? null, residue: s.residue ?? null }));
+  return {
+    clean: wired?.ok === true && failedSteps.length === 0 && uncleanSteps.length === 0 && !releaseUnclean,
+    steps, failedSteps, uncleanSteps, residue, releaseUnclean, lockUnclean,
+    durabilityUncertain,
+  };
+}
+
+/* #R37 P1-4：CLI/入站共用 —— 当镜像不干净（shadow 步失败/非干净提交/内+外层锁残骸/release 残骸）时
+ * 向 stderr 发一条机器回执（持久化交给调用方），**不改写** wired.ok / legacy 成功语义。
+ * 返回投影；干净时静默（不产生回执）。 */
+export function emitUncleanReceipt(kind, wired, extra = {}) {
+  const unc = uncleanWired(wired);
+  if (unc.clean) return unc;
+  console.error(JSON.stringify({
+    schema_version: "1.0", artifact_type: "feishu_bridge_m1a_unclean_receipt",
+    classification: "internal", recorded_at: new Date().toISOString(), kind, ...unc, ...extra,
+  }, null, 2));
+  return unc;
 }
 
 /* 外层排序锁骨架：legacy → shadow 序列 → 释放。
@@ -75,7 +125,8 @@ function runWired({ endpointId, env = process.env, legacy, submit, lockOnly = fa
   const acq = acquireOrderLock(endpointId, env);
   if (!acq.ok) {
     // 双写强制下任一取锁失败（busy/maintenance/root_*/dir_*/lock_residue/reap_*/io_error）都不得写 legacy。
-    return { ok: false, commit: "not_committed", reason: acq.reason ?? "binding_busy", why: acq.why ?? null, lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
+    // #R37 P1-4：外层取锁失败也把 acq.path/error 透出（不再只折成 lock:null），供 unclean 投影点名残骸路径。
+    return { ok: false, commit: "not_committed", reason: acq.reason ?? "binding_busy", why: acq.why ?? null, lock: acq.lock ?? null, lockPath: acq.path ?? null, lockError: acq.error ?? null, legacy: null, shadow: null, release: null };
   }
   let result;
   try {

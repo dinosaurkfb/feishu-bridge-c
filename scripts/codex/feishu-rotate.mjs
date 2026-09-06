@@ -118,7 +118,7 @@ if (cancel) {
   }
   if (!closed.ok) die("取消轮转失败（" + closed.reason + "）。");
   // #R37 P1-4：legacy 已取消轮转但镜像不干净（void 步失败/非干净提交/锁残骸）→ 机器回执，不谎报 clean。
-  if (wiredCancel) emitUncleanReceipt("cli_rotate_cancel", wiredCancel, { operationId: rotationOpId });
+  if (wiredCancel) emitUncleanReceipt("cli_rotate_cancel", wiredCancel, { operationId: rotationOpId, receiptDir: path.join(bridgeHome(), "receipts") });
   console.log("已取消待认领代际；旧话题仍是唯一 active，未删除任何飞书历史。");
   process.exit(0);
 }

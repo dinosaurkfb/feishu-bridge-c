@@ -132,7 +132,7 @@ if (existing.ok) {
   }
   if (!resumed.ok) die("恢复接入失败：" + resumed.reason + (resumed.error ? "（" + resumed.error + "）" : ""));
   // #R37 P1-4：legacy 已恢复但镜像不干净（release 残骸/锁残骸）→ 机器回执，不谎报 clean。
-  if (wiredResume) emitUncleanReceipt("cli_bind_task_resume", wiredResume, { threadId: thread.threadId });
+  if (wiredResume) emitUncleanReceipt("cli_bind_task_resume", wiredResume, { threadId: thread.threadId, receiptDir: path.join(bridgeHome(), "receipts") });
   console.log("已恢复当前 Codex task 的飞书接入，继续使用原话题。");
   process.exit(0);
 }

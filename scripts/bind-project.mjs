@@ -18,6 +18,7 @@
  */
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import { displaySafe } from "./display-safe.mjs";
@@ -238,7 +239,7 @@ if (suspended.ok && suspended.suspended) {
     process.exit(1);
   }
   // #R37 P1-4：legacy 已恢复但镜像不干净（release 残骸/锁残骸）→ 机器回执，不谎报 clean。
-  if (wiredResume) emitUncleanReceipt("cli_bind_project_resume", wiredResume, { root });
+  if (wiredResume) emitUncleanReceipt("cli_bind_project_resume", wiredResume, { root, receiptDir: path.join(os.homedir(), ".claude", "feishu-bridge", "receipts") });
   console.log("\n已恢复。改动写在 " + r.store);
   console.log(describeStatus(currentBinding({ root }), bindingsForRoot({ root })));
   process.exit(0);

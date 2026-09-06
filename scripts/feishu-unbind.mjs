@@ -13,6 +13,7 @@
  */
 
 import path from "node:path";
+import os from "node:os";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 import {
@@ -84,6 +85,6 @@ if (!r.ok) {
   process.exit(1);
 }
 // #R37 P1-4：legacy 已暂停但镜像不干净（release 残骸/锁残骸）→ 机器回执，不谎报 clean。
-if (wiredPause) emitUncleanReceipt("cli_unbind_pause", wiredPause, { root, claudeSessionId });
+if (wiredPause) emitUncleanReceipt("cli_unbind_pause", wiredPause, { root, claudeSessionId, receiptDir: path.join(os.homedir(), ".claude", "feishu-bridge", "receipts") });
 console.log("\n已暂停。改动写在 " + r.store);
 console.log(describeStatus(currentBinding({ root, claudeSessionId }), bindingsForRoot({ root })));

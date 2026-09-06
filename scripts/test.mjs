@@ -30383,6 +30383,37 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     assert.equal(du.durabilityUncertain, true, "durabilityUncertain 应点名");
   });
 
+  test("P2-2 守卫④ 持久机器回执：unclean（外层锁残骸）→ receiptDir 落 m1a-unclean-<ts>-<pid>.json（0600、tmp+rename 原子、投影全量）", () => {
+    // 守卫④：不只 stderr（旧码）—— Frank 拍板「持久机器回执，不是只写 stderr」。
+    // 红测试先行点：旧 emitUncleanReceipt 不认 receiptDir → 目录里一个文件都不产生 → 本断言红。
+    const lockUnclean = {
+      ok: false, commit: "not_committed", reason: "lock_residue", why: "锁形状不对", lock: "/x/m1a-order.lock",
+      lockPath: "/x/m1a-order.lock", lockError: "EPERM", legacy: null, shadow: null, release: null,
+    };
+    assert.equal(WIRE.uncleanWired(lockUnclean).clean, false, "外层锁失败应不干净（前置）");
+    const recDir = fs.mkdtempSync(path.join(os.tmpdir(), "gun4-receipts-"));
+    const ret = WIRE.emitUncleanReceipt("cli_unbind_pause", lockUnclean, { receiptDir: recDir, root: "/proj" });
+    assert.equal(ret.clean, false, "emitUncleanReceipt 应返回 unclean 投影");
+    assert.equal(ret.receipt.ok, true, "应产生持久回执（receipt.ok）");
+    const files = fs.readdirSync(recDir).filter((n) => n.startsWith("m1a-unclean-"));
+    assert.equal(files.length, 1, "unclean 应落盘 1 份 m1a-unclean-*.json");
+    const fp = path.join(recDir, files[0]);
+    const rj = JSON.parse(fs.readFileSync(fp, "utf-8"));
+    assert.equal(rj.kind, "cli_unbind_pause", "回执应带 kind");
+    assert.equal(rj.clean, false, "回执应带 unclean 投影");
+    assert.equal(rj.root, "/proj", "回执应带调用方 ctx（不是 receiptDir）");
+    assert.equal(rj.lockUnclean.path, "/x/m1a-order.lock", "回执应带 lockUnclean 残骸");
+    assert.equal(rj.receiptDir, undefined, "receiptDir 是写面，不进回执正文");
+    assert.equal(fs.statSync(fp).mode & 0o777, 0o600, "回执文件应 0600");
+    assert.equal(fs.readdirSync(recDir).some((n) => n.includes(".tmp.")), false, "不应残留 .tmp 文件（rename 原子）");
+    // 干净（shadow 步 committed_clean + release ok）→ 无文件、静默。
+    const clean = { ok: true, legacy: { ok: true }, shadow: [{ op: "create_b1", ok: true, committed: "committed_clean" }], release: { ok: true, lock: "/x/m1a-order.lock" } };
+    let em = ""; const prevErr = console.error; console.error = (s) => { em += s; };
+    try { WIRE.emitUncleanReceipt("cli_x", clean, { receiptDir: recDir, root: "/proj" }); } finally { console.error = prevErr; }
+    assert.equal(em, "", "干净时 emitUncleanReceipt 应静默（stderr 无）");
+    assert.equal(fs.readdirSync(recDir).filter((n) => n.startsWith("m1a-unclean-")).length, 1, "干净时不应新增回执");
+  });
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /** 可恢复地暂停当前精确 Codex thread 的飞书连接；不调用飞书 API。 */
 
+import path from "node:path";
 import { validThreadId } from "./bind-compose.mjs";
 import {
   bridgeHome, findRegisteredTaskForCodexThread, setTaskConnectionStatus, loadCodexTemplate,
@@ -83,5 +84,5 @@ if (!changed.ok) {
   process.exit(1);
 }
 // #R37 P1-4：legacy 已暂停但镜像不干净（release 残骸/锁残骸）→ 机器回执，不谎报 clean。
-if (wired) emitUncleanReceipt("cli_unbind_pause", wired, { threadId });
+if (wired) emitUncleanReceipt("cli_unbind_pause", wired, { threadId, receiptDir: path.join(bridgeHome(), "receipts") });
 console.log("已暂停当前 Codex task 的飞书接入；原话题和本地历史均已保留。");

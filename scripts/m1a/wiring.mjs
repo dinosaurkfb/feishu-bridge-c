@@ -14,6 +14,9 @@
 //
 // 边界：本模块不知道具体 legacy 写方（inbound-route / topic-generation / register……）长什么样；
 //   它们只经 `legacy` 回调注入自己的提交逻辑。调用方负责在提交点外包本层。
+import fs from "node:fs";
+import path from "node:path";
+
 import { acquireOrderLock, requestKeyFor } from "./dual-write.mjs";
 import {
   createA1, createB1, activate, attach, voidPending, unbind, restore, retarget, rebindSessionAlias,
@@ -100,11 +103,33 @@ export function uncleanWired(wired) {
 export function emitUncleanReceipt(kind, wired, extra = {}) {
   const unc = uncleanWired(wired);
   if (unc.clean) return unc;
-  console.error(JSON.stringify({
+  // receiptDir 是持久写面（机器回执目录），不进回执正文；其余 ctx（root/threadId/operationId…）随正文走。
+  const { receiptDir, ...ctx } = extra;
+  const body = {
     schema_version: "1.0", artifact_type: "feishu_bridge_m1a_unclean_receipt",
-    classification: "internal", recorded_at: new Date().toISOString(), kind, ...unc, ...extra,
-  }, null, 2));
+    classification: "internal", recorded_at: new Date().toISOString(), kind, ...unc, ...ctx,
+  };
+  if (typeof receiptDir === "string" && receiptDir.length > 0) {
+    // #R37 P1-4（Frank 拍板）：持久机器回执 —— 不只 stderr；写 <receiptDir>/m1a-unclean-<ts>-<pid>.json。
+    unc.receipt = persistUncleanReceipt({ receiptDir, body });
+  }
+  console.error(JSON.stringify(body, null, 2));
   return unc;
+}
+
+/** 持久化 unclean 机器回执：<receiptDir>/m1a-unclean-<ts>-<pid>.json（0600、tmp+rename 原子）。
+ * 内容 = stderr 同款投影全量（uncleanWired + kind + 调用方 ctx）。写失败返回 {ok:false, why}，不抛（回执属尽力而为）。 */
+export function persistUncleanReceipt({ receiptDir, body, now = Date.now() }) {
+  try {
+    fs.mkdirSync(receiptDir, { recursive: true, mode: 0o700 });
+    const file = path.join(receiptDir, "m1a-unclean-" + now + "-" + process.pid + ".json");
+    const tmp = file + ".tmp." + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify(body, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return { ok: true, path: file };
+  } catch (err) {
+    return { ok: false, why: String(err?.message ?? err) };
+  }
 }
 
 /* 外层排序锁骨架：legacy → shadow 序列 → 释放。

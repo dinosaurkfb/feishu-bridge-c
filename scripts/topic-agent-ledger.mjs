@@ -156,6 +156,126 @@ export function validateLedgerRoot({ env = process.env, mustExistRoot = true } =
   return { ok: true, root: realRoot };
 }
 
+/** 对已 open 的父目录 fd 做 fsync（P1-3：既有根快路与新建根共用同一父目录持久化屏障）。 */
+function fsyncDirFd(fd, inj) {
+  if (inj.failFsync) return { ok: false, reason: "fsync_failed", why: "注入 fsync 失败" };
+  try { fs.fsyncSync(fd); return { ok: true }; }
+  catch (err) { return { ok: false, reason: "fsync_failed", why: "父目录 fsync：" + String(err?.code ?? err?.message ?? err) }; }
+}
+
+/** R46：init 门内、写账本前自建账本根（单层，绝不 recursive）。受验：
+ *  1) validateLedgerRoot(mustExistRoot:true) —— 根已在场且 0700 真目录 → 重做父目录 fsync（P1-3：上次 fsync
+ *     失败可能留着未落盘目录条目，快路不 fsync 会把那次失败洗白成成功），只读不改目录，然后返回；
+ *     父链任一 symlink → root_not_canonical；不可解析 → root_unresolvable；根非 0700 → root_perms（不放宽）。
+ *     只有 rv.reason === "root_absent"（父链受验净、末级确实缺席）才允许自建。
+ *  2) P1-2 TOCTOU 防护：先 open 父目录 fd 钉住 inode、受验父 realpath；路径式 mkdir 后立刻复核父 realpath，
+ *     父目录在受验后被换成外指 symlink → mkdir 写进外指目标 → **尽力清掉**刚建目录并 fail-closed（root_not_canonical）。
+ *  3) P1-2 迁移点栅栏：调用方传 `_fence` 时给它一个 `create` 闭包（真正的 mkdir 变更）。`_fence(create)` 在**自己的
+ *     持锁复核段**（租约 reap 段内走 commitWhileHeld 核**真实注册实例**，不是磁盘 symlink 的 pid）再次原子复核
+ *     active 仍指本 token / gate 仍本 token / phase 仍 drained 后，**由 _fence 在窄段内执行 create**；任一失效 →
+ *     fence_lost，**在建根前就拒**（不留空根）——防"手里有 lease 对象但实际已丢护栏（真实例被删/被换）"的窗口。
+ *  4) mkdirSync(root,{recursive:false, mode:0o700})；父目录缺席 → ENOENT → 原样 fail（不递归创建）。
+ *  5) chmodSync 0700 兜 umask；fsync 父目录（用钉住的 fd）。
+ *  6) 再 validateLedgerRoot(mustExistRoot:true) 复核通过才算数。任一步失败不吞、原样 fail。
+ *  返回 { ok:true, root } 或 { ok:false, reason, why }。
+ *
+ *  —— 威胁模型（P1-1 本裁定，Codex 认可；不引入 native mkdirat helper）——
+ *  本函数**防御**：既存/误配置的符号链接、非规范父链（任一分量是 symlink 或 realpath 不自洽）、权限错误
+ *    （根非精确 0700、父不可读/不可解析）。
+ *  本函数**不防御**：与 provision **精确并发**的恶意同 UID 路径替换。目标部署是单用户机器、门内受控维护操作，
+ *    该攻击被明确排除出威胁模型。**注意："同 UID 无增益"不是普遍事实**（macOS TCC/FDA/sandbox entitlement
+ *    可致同 UID 两进程能力不同、confused deputy）——本收缩成立**仅因**目标部署排除恶意同 UID 并发，
+ *    不是因为该攻击在所有环境无害。
+ *  创建后的 realpath 复核与清理属纵深防御（不依赖它防恶意并发）；清理是 **best-effort**，不承诺外部残留必然
+ *    被清、更不承诺 doctor 必然能定位外部残留（父路径恢复后外部创建位置未必可从词法路径定位）。
+ *
+ *  测试注入点：failMkdir / failChmod / failFsync（既有）+ onBeforeMkdir（P1-2 竞态）+ _fence（迁移点栅栏）。 */
+export function ensureLedgerRoot({ env = process.env, _inject = null, _fence = null } = {}) {
+  const inj = _inject ?? {};
+  // ① 以"必须在场"核验：根已在场且 0700 真目录 → 也要重做父目录持久化屏障（P1-3），只读、不改目录，然后返回。
+  //    root_not_canonical / root_unresolvable / root_perms / root_symlink → 原样拒（不创建）。
+  const rv = validateLedgerRoot({ env, mustExistRoot: true });
+  if (rv.ok) {
+    const parent = path.dirname(rv.root);
+    let pfd = null;
+    try { pfd = fs.openSync(parent, fs.constants.O_RDONLY); }
+    catch (err) { return { ok: false, reason: "parent_open_failed", why: "打开父目录：" + String(err?.code ?? err?.message ?? err) }; }
+    const f = fsyncDirFd(pfd, inj);
+    fs.closeSync(pfd);
+    if (!f.ok) return f;
+    return { ok: true, root: rv.root };
+  }
+  // 只有"父链受验且末级确实缺席"（root_absent）才允许自建；no_root 无路径可建，也拒。
+  if (rv.reason !== "root_absent") return rv;
+  const root = ledgerRootFor(env); // 合法缺席：root_absent 返回不带 root，路径从 ledgerRootFor 取（父链已受验净）
+  const parent = path.dirname(root);
+  // P1-2：先受验父目录 realpath 并 open 钉住 inode，再在受验父上创建 —— 防"受验后父目录被并发换成
+  // 外指 symlink"的越界写。路径式 mkdir 后即时复核父 realpath，被换 → 回滚并拒（best-effort 清理，不承诺净零）。
+  let parentReal = null;
+  try { parentReal = fs.realpathSync(parent); }
+  catch (err) { return { ok: false, reason: err?.code === "ENOENT" ? "parent_absent" : "parent_unresolvable", why: "父目录 realpath：" + String(err?.code ?? err?.message ?? err) }; }
+  let pfd = null;
+  try { pfd = fs.openSync(parent, fs.constants.O_RDONLY); }
+  catch (err) { return { ok: false, reason: "parent_open_failed", why: "打开父目录：" + String(err?.code ?? err?.message ?? err) }; }
+  try {
+    const st = fs.fstatSync(pfd);
+    if (!st.isDirectory()) { fs.closeSync(pfd); return { ok: false, reason: "parent_not_dir" }; }
+  } catch (err) { fs.closeSync(pfd); return { ok: false, reason: "parent_fstat_failed", why: String(err?.code ?? err?.message ?? err) }; }
+  try {
+    if (fs.realpathSync(parent) !== parentReal) { fs.closeSync(pfd); return { ok: false, reason: "root_not_canonical", why: "父目录在受验后与外指不同（symlink 或换目录），不创建" }; }
+  } catch (err) { fs.closeSync(pfd); return { ok: false, reason: "parent_unresolvable", why: "父目录复核失败：" + String(err?.code ?? err?.message ?? err) }; }
+  if (inj.onBeforeMkdir) inj.onBeforeMkdir(); // P1-2 注入点：测试在此把父目录确定性换成外指 symlink
+  // ② 建单层（递归：false，绝不递归）：父目录缺席 → ENOENT → 不递归、原样 fail。封装成 create，交给 _fence 或直接调用。
+  const create = () => {
+    let mkdirErr = null;
+    if (inj.failMkdir) mkdirErr = inj.failMkdir;
+    else { try { fs.mkdirSync(root, { recursive: false, mode: 0o700 }); } catch (err) { mkdirErr = err; } }
+    if (mkdirErr !== null) {
+      const code = mkdirErr?.code ?? null;
+      return { ok: false, reason: code === "ENOENT" ? "parent_absent" : "mkdir_failed", why: code === "ENOENT" ? "父目录缺席，不递归创建" : String(mkdirErr?.message ?? mkdirErr) };
+    }
+    return { ok: true };
+  };
+  // P1-2 迁移点栅栏：把**创建目录的变更点**（mkdir）交给 `_fence(create)` 在真实持锁复核段内执行。失效
+  //   （active/gate 被改写、lease 真实例被删/被接管、phase 不再 drained）→ 在建根前就拒，绝不留下空根或写入未知目录。
+  if (_fence) {
+    const fr = _fence(create);
+    if (!fr.ok) {
+      fs.closeSync(pfd);
+      return { ok: false, reason: fr.reason ?? "fence_lost", why: fr.why ?? fr.reason ?? null };
+    }
+  } else {
+    const cr = create();
+    if (!cr.ok) { fs.closeSync(pfd); return { ok: false, reason: cr.reason, why: cr.why }; }
+  }
+  // P1-2 复核：mkdir 后父路径必须仍解析到受验 realpath；否则根被写进了外指目标 → **尽力清**并 fail-closed。
+  // 清理是 best-effort（rmdir 失败也照常 fail-closed），不承诺外部残留必然被清、不承诺 doctor 可见。
+  try {
+    if (fs.realpathSync(parent) !== parentReal) {
+      try { fs.rmdirSync(root); } catch { /* 尽力清（best-effort，不承诺净零） */ }
+      fs.closeSync(pfd);
+      return { ok: false, reason: "root_not_canonical", why: "父目录在 mkdir 后被换成外指，尽力回滚越界目录后 fail-closed" };
+    }
+  } catch (err) {
+    try { fs.rmdirSync(root); } catch { /* 尽力清 */ }
+    fs.closeSync(pfd);
+    return { ok: false, reason: "parent_unresolvable", why: "父目录 mkdir 后不可解析：" + String(err?.code ?? err?.message ?? err) };
+  }
+  // ③ chmod 0700 兜 umask（仅在父链受验未换时）。
+  let chmodErr = null;
+  if (inj.failChmod) chmodErr = inj.failChmod;
+  else { try { fs.chmodSync(root, 0o700); } catch (err) { chmodErr = err; } }
+  if (chmodErr !== null) { fs.closeSync(pfd); return { ok: false, reason: "chmod_failed", why: "chmod：" + String(chmodErr?.message ?? chmodErr) }; }
+  // ④ fsync 父目录（用钉住的 fd，让刚建的单层落盘）。
+  const f = fsyncDirFd(pfd, inj);
+  fs.closeSync(pfd);
+  if (!f.ok) return f;
+  // ⑤ 复核：根必须已是 0700 真目录；否则 fail-closed。
+  const rc = validateLedgerRoot({ env, mustExistRoot: true });
+  if (!rc.ok) return rc;
+  return { ok: true, root: rc.root };
+}
+
 /**
  * 由 endpointId 派生受验目录：root 必须存在且是真目录（realpath 自洽），dir=root/endpoint；
  * dir 若已存在必是真目录（非符号链接）且 realpath 落在 realpath(root) 下。首次 init 时 dir 尚不存在（允许）。

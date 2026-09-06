@@ -31624,6 +31624,320 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
   });
 }
 
+// ── R46：账本根缺席 → init 门内自建单层根（绝不递归），写 shadow revision1 ──
+// 受验不变量：①根缺席+父净 → 建 0700 根并成功写 revision1；②父链 symlink → 不创建；③根非 0700 → 不放宽；④父缺席 → 不递归。
+test("R46：init 门内自建 0700 账本根（父净、根缺席）→ 建根写 revision1；②父链 symlink / ③根非 0700 / ④父缺席 → 不创建|不放宽|不递归", () => {
+  // ①②共用场景：装三套安装器（建 runtime/父目录），ledger 根走生产路径（父净、根缺席）
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r46ledger-")));
+  const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
+  fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
+    execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
+  }
+  const node = pickClaudeNodeB();
+  const claudeRoot = path.join(home, ".claude", "feishu-bridge", "runtime");
+  const claudeLabel = "com.frank.feishu-bridge-cc.r46";
+  const expectedArgs = claudeDrainExpectedJobB({ home, node }).args;
+  const launchd = { [claudeLabel]: { loaded: true, args: [...expectedArgs] } };
+  const fakeLaunchctl = (args) => {
+    if (args[0] === "list") { const st = launchd[args[1]]; if (!st?.loaded) return { ok: false, detail: "Could not find service \"" + args[1] + "\" in domain" }; return { ok: true, stdout: "{\n\t\"ProgramArguments\" = (\n" + st.args.map((a) => "\t\t\"" + a + "\";").join("\n") + "\n\t);\n};\n" }; }
+    if (args[0] === "bootout") { const label = args[1].split("/").pop(); const st = launchd[label]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; st.loaded = false; return { ok: true, stdout: "" }; }
+    if (args[0] === "bootstrap") { const xml = fs.readFileSync(args[2], "utf-8"); const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/u.exec(xml)[1]; const arr = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/u.exec(xml)[1]; const args2 = [...arr.matchAll(/<string>([^<]*)<\/string>/gu)].map((m) => m[1]); launchd[label] = { loaded: true, args: args2 }; return { ok: true, stdout: "" }; }
+    return { ok: false, detail: "unknown" };
+  };
+  const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
+  const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
+  let clock = Date.parse("2026-08-31T12:00:00.000Z");
+  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
+  const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
+  const ledgerRoot = path.join(fs.realpathSync(path.join(home, ".claude", "feishu-bridge")), "ledger"); // 生产路径：父净、根缺席（realpath 父目录，避 /var→/private/var）
+  const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
+  const savedGateEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile;
+  const savedMaintDirEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = dir;
+  const CH = "claude";
+  const mkEp = (uid) => legacyEndpointId({ runtime: "claude", agentUid: uid });
+  const lines = [];
+  const runCli = (argv) => runMaintenanceLedger(argv, { ctx, out: (s) => lines.push(s), env: process.env });
+  const all = () => lines.join("\n");
+  try {
+    // ① 根缺席 + 父净 → init --apply 建出 0700 根并写 shadow revision1
+    assert.ok(fs.existsSync(path.dirname(ledgerRoot)), "父目录 .claude/feishu-bridge 已存在（installer 建的）");
+    assert.equal(fs.existsSync(ledgerRoot), false, "前置：账本根缺席");
+    const EPr = mkEp("agent_ledger_r46");
+    assert.equal(runCli(["--init", "--endpoint", EPr, "--chain", CH, "--apply"]), 0, all());
+    assert.match(all(), /已做账本 init/u, all());
+    const stRoot = fs.lstatSync(ledgerRoot);
+    assert.equal(stRoot.isDirectory(), true, "根建出来了");
+    assert.equal(stRoot.mode & 0o777, 0o700, "根 0700");
+    const Lr = TAL.loadLedger(path.join(ledgerRoot, EPr), { endpointId: EPr });
+    assert.ok(Lr.ok && Lr.doc.authority_mode === "shadow" && Lr.doc.revision === 1, "init 后 shadow/rev1：" + JSON.stringify(Lr));
+    assert.equal(readActive({ dir }).state, "absent", "init 后 active 清掉");
+    assert.equal(readGate({ file: gateFile }).state, "absent", "init 后门撤掉");
+  } finally {
+    if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedgerDir;
+    if (savedGateEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; else process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = savedGateEnv;
+    if (savedMaintDirEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = savedMaintDirEnv;
+    if (prevTpl === undefined) delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; else process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = prevTpl;
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// ② 父链 symlink → 不创建（root_not_canonical，零新建）
+test("R46 ensureLedgerRoot：父链 symlink → root_not_canonical 且不创建", () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r46-sym-")));
+  try {
+    const realHome = path.join(base, "real-home"); fs.mkdirSync(realHome, { recursive: true });
+    const link = path.join(base, "link"); fs.symlinkSync(realHome, link, "dir");
+    const root = path.join(link, "feishu-bridge", "ledger"); // 父链 link 是 symlink
+    const r = TAL.ensureLedgerRoot({ env: { FEISHU_BRIDGE_LEDGER_DIR: root } });
+    assert.equal(r.ok, false); assert.equal(r.reason, "root_not_canonical");
+    assert.equal(fs.existsSync(root), false, "父链 symlink → 不创建");
+    assert.equal(fs.existsSync(path.join(realHome, "feishu-bridge")), false, "目标侧也应零新建");
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+// ③ 根已存在但非 0700 → root_perms（不放宽，仍保留原权限）
+test("R46 ensureLedgerRoot：根已存在非 0700 → root_perms 不放宽", () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r46-prm-")));
+  try {
+    const root = path.join(base, "ledger"); fs.mkdirSync(root, { recursive: true, mode: 0o700 }); fs.chmodSync(root, 0o755);
+    const before = fs.lstatSync(root).mode & 0o777;
+    const r = TAL.ensureLedgerRoot({ env: { FEISHU_BRIDGE_LEDGER_DIR: root } });
+    assert.equal(r.ok, false); assert.equal(r.reason, "root_perms");
+    assert.equal(fs.lstatSync(root).mode & 0o777, before, "非 0700 不被放宽");
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+// ④ 父目录本身缺席 → 不递归创建（parent_absent，零新建链）
+test("R46 ensureLedgerRoot：父目录缺席 → parent_absent 且不递归创建", () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r46-par-")));
+  try {
+    const root = path.join(base, "missing-parent", "ledger"); // parent missing-parent 缺席
+    const r = TAL.ensureLedgerRoot({ env: { FEISHU_BRIDGE_LEDGER_DIR: root } });
+    assert.equal(r.ok, false); assert.equal(r.reason, "parent_absent");
+    assert.equal(fs.existsSync(path.join(base, "missing-parent")), false, "父缺席 → 不递归创建（零新建）");
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+// ① R46 返修 P1-3：既有合法根的快路也必须重做父 fsync —— 连续两次 fsync 失败均不得成功
+//   （红：旧版首次失败留目录，第二次走快路直接 ok:true 洗白上次失败）。
+test("R46 返修 P1-3：既有根快路重做父 fsync —— 连续两次 fsync 失败都不得成功", () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r46p13-")));
+  try {
+    const root = path.join(base, "ledger"); // 父 base 在场、根缺席
+    const r1 = TAL.ensureLedgerRoot({ env: { FEISHU_BRIDGE_LEDGER_DIR: root }, _inject: { failFsync: true } });
+    assert.equal(r1.ok, false); assert.equal(r1.reason, "fsync_failed", "第一次建根但 fsync 失败");
+    assert.equal(fs.existsSync(root), true, "第一次失败：目录已建（未落盘）留着待复核");
+    const r2 = TAL.ensureLedgerRoot({ env: { FEISHU_BRIDGE_LEDGER_DIR: root }, _inject: { failFsync: true } });
+    assert.equal(r2.ok, false); assert.equal(r2.reason, "fsync_failed", "既有根快路也要重做父 fsync（红：旧版快路直接 ok:true 洗白）");
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+// ② R46 返修 P1-2：父目录在受验后/建前被并发换成外指 symlink → 越界写到目标 → fail-closed（root_not_canonical）且尽力回滚
+//   （红：旧版没有 onBeforeMkdir 注入点，无视它 → 正常建根返回 ok:true，命中不了越界防护）。
+//   清理是 best-effort（P1-1 本裁定），不承诺净零；测的是 fail-closed（硬契约）+ 尽力清后本环境下无残留。
+test("R46 返修 P1-2：父目录建前被换外指 symlink → fail-closed（root_not_canonical）且尽力回滚", () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r46p12-")));
+  try {
+    const parent = path.join(base, "parent"); fs.mkdirSync(parent, { recursive: true });
+    const outside = path.join(base, "outside"); fs.mkdirSync(outside, { recursive: true });
+    const root = path.join(parent, "ledger"); // 父在场、根缺席、父受验净
+    let swapped = false;
+    const r = TAL.ensureLedgerRoot({ env: { FEISHU_BRIDGE_LEDGER_DIR: root }, _inject: { onBeforeMkdir: () => {
+      if (swapped) return; swapped = true;
+      const moved = path.join(base, "parent-moved"); fs.renameSync(parent, moved);
+      fs.symlinkSync(outside, parent, "dir"); // parent 现在是 symlink → outside
+    } } });
+    assert.equal(r.ok, false); assert.equal(r.reason, "root_not_canonical", "复核到不一致即 fail-closed");
+    assert.equal(fs.existsSync(path.join(base, "parent-moved", "ledger")), false, "原父侧从未被写");
+    // best-effort：本环境下尽力清后外指目标无残留（非净零硬承诺，仅记录尽力清的结果）
+    assert.equal(fs.existsSync(path.join(outside, "ledger")), false, "外指目标侧尽力清后无残留（best-effort）");
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+// ②b R46 返修 P1-2（迁移点栅栏）：provision 被放进 real maintenance fencing 段 → 在**创建目录的变更点**再次原子复核
+//   active/gate/lease/phase；任一失效 → fence_lost，**在建根前就拒**，不留空根。
+//   这里用 `_fence` 闭包验证机制：栅栏失效 → 建根被拦下（红：旧版 ensureLedgerRoot 无 _fence 参数、忽略它 → 照常建根成功）。
+test("R46 返修 P1-2 栅栏：fence 失效（lease 已失/active 被改）→ 建根前拒，不留空根", () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r46p12f-")));
+  try {
+    const root = path.join(base, "ledger"); // 父（base）在场、根缺席 → 走建根路径
+    let fenceCalls = 0;
+    const r = TAL.ensureLedgerRoot({ env: { FEISHU_BRIDGE_LEDGER_DIR: root }, _fence: () => { fenceCalls += 1; return { ok: false, why: "active 已不指本 operation token" }; } });
+    assert.equal(fenceCalls, 1, "栅栏必须在建根前被调用一次（红：旧版未调用 → 0 次）");
+    assert.equal(r.ok, false); assert.equal(r.reason, "fence_lost", "栅栏失效 → fail-closed");
+    assert.equal(fs.existsSync(root), false, "栅栏失效 → 不建根（红：旧版忽略 _fence → 建根成功）");
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+// ③ R46 返修 P1-1（forward 态根丢失 fail-closed）+ P2（只读 precheck 在 provision 前，不留空根）
+test("R46 返修 P1-1/P2：已初始化重跑不留空根（P2）；ledger_reopening 根丢失 → --exit 保门保 active 不重建（P1-1）", () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r46p11-")));
+  const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
+  fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
+    execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
+  }
+  const node = pickClaudeNodeB();
+  const claudeRoot = path.join(home, ".claude", "feishu-bridge", "runtime");
+  const claudeLabel = "com.frank.feishu-bridge-cc.r46p11";
+  const expectedArgs = claudeDrainExpectedJobB({ home, node }).args;
+  const launchd = { [claudeLabel]: { loaded: true, args: [...expectedArgs] } };
+  const fakeLaunchctl = (args) => {
+    if (args[0] === "list") { const st = launchd[args[1]]; if (!st?.loaded) return { ok: false, detail: "Could not find service \"" + args[1] + "\" in domain" }; return { ok: true, stdout: "{\n\t\"ProgramArguments\" = (\n" + st.args.map((a) => "\t\t\"" + a + "\";").join("\n") + "\n\t);\n};\n" }; }
+    if (args[0] === "bootout") { const label = args[1].split("/").pop(); const st = launchd[label]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; st.loaded = false; return { ok: true, stdout: "" }; }
+    if (args[0] === "bootstrap") { const xml = fs.readFileSync(args[2], "utf-8"); const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/u.exec(xml)[1]; const arr = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/u.exec(xml)[1]; const args2 = [...arr.matchAll(/<string>([^<]*)<\/string>/gu)].map((m) => m[1]); launchd[label] = { loaded: true, args: args2 }; return { ok: true, stdout: "" }; }
+    return { ok: false, detail: "unknown" };
+  };
+  const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
+  const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
+  let clock = Date.parse("2026-08-31T12:00:00.000Z");
+  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
+  const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
+  const ledgerRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r46p11-ledger-")));
+  const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
+  const savedGateEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile;
+  const savedMaintDirEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = dir;
+  const CH = "claude";
+  const mkEp = (uid) => legacyEndpointId({ runtime: "claude", agentUid: uid });
+  try {
+    // ── P2：已初始化重跑（receipt initDone）→ already_initialized，且不留下空根。
+    const EPa = mkEp("agent_ledger_p2");
+    fs.mkdirSync(path.join(ledgerRoot, EPa), { recursive: true, mode: 0o700 });
+    const ia = LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPa, chain: CH, apply: true });
+    assert.ok(ia.ok && ia.phase === "done", "P2 init#1 前置（需已初始化收据）：" + JSON.stringify(ia));
+    fs.rmSync(ledgerRoot, { recursive: true, force: true }); // 删根：模拟已初始化 endpoint 的根丢失
+    const ib = LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPa, chain: CH, apply: true });
+    assert.equal(ib.ok, false); assert.equal(ib.reason, "already_initialized", "P2 重跑应拒已初始化：" + JSON.stringify(ib));
+    assert.equal(fs.existsSync(ledgerRoot), false, "P2 只读 precheck 在 provision 前→ 不留空根（红：旧版先建根再拒）");
+
+    // ── P1-1：ledger_reopening 根丢失 → --exit 保门保 active 不重建。
+    const EPb = mkEp("agent_ledger_p11");
+    const ent = enterMaintenance(ctx, { reason: "P1-1 根丢失", apply: true, keepLease: true, operationKind: "ledger_init" });
+    assert.ok(ent.ok && ent.lease, "P1-1 enterMaintenance：" + JSON.stringify(ent));
+    const planB = TAL.initPlan({ endpointId: EPb, chain: CH, requestKey: ent.token, operationId: ent.token });
+    assert.ok(planB.ok, "P1-1 initPlan：" + JSON.stringify(planB));
+    assert.ok(enterLedgerForward({ dir, token: ent.token, lease: ent.lease, phase: "ledger_initializing", step: { id: "ledger:" + EPb + ":init", kind: "ledger", target: EPb, chain: CH, before: planB.before, backup: null, intended_after: planB.intendedAfter }, chain: CH, expectPhase: "drained", now: clock }).ok, "P1-1 enterLedgerForward");
+    assert.ok(updateJournal({ dir, token: ent.token, lease: ent.lease, expectPhase: "ledger_initializing", now: clock, mutate: (d) => { const s = d.steps.find((x) => x.id === "ledger:" + EPb + ":init"); s.state = "done"; s.after = s.intended_after; return d; } }).ok, "P1-1 ledger step 置 done");
+    assert.ok(setPhaseJ({ dir, token: ent.token, lease: ent.lease, phase: "ledger_reopening", expectPhase: "ledger_initializing", now: clock }).ok, "P1-1 切 ledger_reopening");
+    assert.equal(readActive({ dir }).state, "active", "P1-1 前置：active 在场");
+    assert.equal(readGate({ file: gateFile, now: clock }).state, "active", "P1-1 前置：门在场");
+    fs.rmSync(ledgerRoot, { recursive: true, force: true }); // 删根：模拟 reopening 期间根丢失
+    assert.equal(releaseOperationLease(ent.lease).ok, true, "P1-1 释放旧租约（否则 ledgerExit 自取同 token 租约→operation_in_progress）");
+    const g = LEDGER_OP.ledgerExit(ctx, { apply: true });
+    assert.equal(g.ok, false, "P1-1 根丢失 → --exit 应 fail-closed：" + JSON.stringify(g));
+    assert.equal(readActive({ dir }).state, "active", "P1-1 active 保留");
+    assert.equal(readGate({ file: gateFile, now: clock }).state, "active", "P1-1 门保留");
+    assert.equal(fs.existsSync(ledgerRoot), false, "P1-1 不重建根（红：旧版 forward 态也 provision，重建空根再撤门）");
+
+    // ── P1-3（reopening 身份）：提交一份**结构合法但不含本 init operation** 的账本 → --exit 仍 fail-closed，留在 reopening_incomplete，保门保 active。
+    //   模拟：重开时手边账本换成了另一份结构合法、却非本 operation 结果的账本（operation_id 对不上）。
+    const wantOpId = planB.intendedAfter.operation_id; // = ent.token
+    const epDir = path.join(ledgerRoot, EPb);
+    fs.mkdirSync(ledgerRoot, { mode: 0o700 }); fs.mkdirSync(epDir, { mode: 0o700 }); // 重建账本根 + endpoint 目录
+    const wrongOpId = "00000000-0000-0000-0000-00000000ffff"; // 合法 operation id 形状，但不是本 init
+    fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify({ schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EPb, chain: CH, authority_mode: "shadow", revision: 1, operations: { [wrongOpId]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EPb, chain: CH }), result_revision: 1, result: { revision: 1 } } }, records: {} }, null, 2) + "\n", { mode: 0o600 });
+    const g2 = LEDGER_OP.ledgerExit(ctx, { apply: true });
+    assert.equal(g2.ok, false, "P1-3 结构合法但无本 init operation → --exit 应 fail-closed：" + JSON.stringify(g2));
+    assert.equal(readActive({ dir }).state, "active", "P1-3 active 保留");
+    assert.equal(readGate({ file: gateFile, now: clock }).state, "active", "P1-3 门保留");
+    assert.equal(readJournal({ dir, token: ent.token }).doc.phase, "reopening_incomplete", "P1-3 留在 reopening_incomplete（红：旧版只验整本结构合法 → 误当成功 → 撤门清 active）");
+
+    // ── P1-3（chain 身份）：本 init operation **在场**且 op_type/指纹/result_revision 全符，只把顶层 chain 从 claude 改成 codex。
+    //   endpoint 是不透明 id，复制来的 op fingerprint（是含 chain 的哈希）不能代替顶层 chain 关系 —— 必须核对 L.doc.chain === ls.chain。
+    //   （本轮 P1-3 与上一轮 P1-3 是不同漏洞：上一轮是"无本 operation"，本轮是"operation 在但 chain 被换"。）
+    fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify({ schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EPb, chain: "codex", authority_mode: "shadow", revision: 1, operations: { [wantOpId]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: ent.token, fingerprint: planB.intendedAfter.fingerprint, result_revision: 1, result: { revision: 1 } } }, records: {} }, null, 2) + "\n", { mode: 0o600 });
+    const g3 = LEDGER_OP.ledgerExit(ctx, { apply: true });
+    assert.equal(g3.ok, false, "P1-3 顶层 chain 被改（codex）→ --exit 应 fail-closed：" + JSON.stringify(g3));
+    assert.equal(readActive({ dir }).state, "active", "P1-3 chain active 保留");
+    assert.equal(readGate({ file: gateFile, now: clock }).state, "active", "P1-3 chain 门保留");
+    assert.equal(readJournal({ dir, token: ent.token }).doc.phase, "reopening_incomplete", "P1-3 chain 留在 reopening_incomplete（红：旧版不核 chain → 误当成功 → 撤门清 active）");
+  } finally {
+    if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedgerDir;
+    if (savedGateEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; else process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = savedGateEnv;
+    if (savedMaintDirEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = savedMaintDirEnv;
+    if (prevTpl === undefined) delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; else process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = prevTpl;
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// ④ R46 返修 P1-2（真实 fencing 段内的迁移点栅栏）：ledgerForward 把 provision 放进维护段，建根前原子复核
+//   active/gate/lease/phase；门被换 token → fence_lost，不建根、不进段。
+test("R46 返修 P1-2 栅栏（真实流）：provision 在维护段内 advance 前被拒——门被换 token / 租约被释放后伪造同路径 symlink → fence_lost，不建根", () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r46p12w-")));
+  const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
+  fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
+    execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
+  }
+  const node = pickClaudeNodeB();
+  const claudeLabel = "com.frank.feishu-bridge-cc.r46p12w";
+  const expectedArgs = claudeDrainExpectedJobB({ home, node }).args;
+  const launchd = { [claudeLabel]: { loaded: true, args: [...expectedArgs] } };
+  const fakeLaunchctl = (args) => {
+    if (args[0] === "list") { const st = launchd[args[1]]; if (!st?.loaded) return { ok: false, detail: "Could not find service \"" + args[1] + "\" in domain" }; return { ok: true, stdout: "{\n\t\"ProgramArguments\" = (\n" + st.args.map((a) => "\t\t\"" + a + "\";").join("\n") + "\n\t);\n};\n" }; }
+    if (args[0] === "bootout") { const label = args[1].split("/").pop(); const st = launchd[label]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; st.loaded = false; return { ok: true, stdout: "" }; }
+    if (args[0] === "bootstrap") { const xml = fs.readFileSync(args[2], "utf-8"); const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/u.exec(xml)[1]; const arr = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/u.exec(xml)[1]; const args2 = [...arr.matchAll(/<string>([^<]*)<\/string>/gu)].map((m) => m[1]); launchd[label] = { loaded: true, args: args2 }; return { ok: true, stdout: "" }; }
+    return { ok: false, detail: "unknown" };
+  };
+  const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND" });
+  const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
+  let clock = Date.parse("2026-08-31T12:00:00.000Z");
+  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
+  const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
+  const lrootBase = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r46p12w-ledger-")));
+  const lroot = path.join(lrootBase, "ledger"); // 父在场、根缺席 → 走建根路径
+  const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = lroot;
+  const savedGateEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile;
+  const savedMaintDirEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = dir;
+  const CH = "claude";
+  try {
+    const EP = legacyEndpointId({ runtime: "claude", agentUid: "agent_ledger_fence" });
+    const ent = enterMaintenance(ctx, { reason: "P1-2 fence", apply: true, keepLease: true, operationKind: "ledger_init" });
+    assert.ok(ent.ok && ent.lease, "enterMaintenance：" + JSON.stringify(ent));
+    // 把门换 token（active 未动；endpointReceipt 已查 active → 若不换门而只换 active，会先被 endpointReceipt 的 active_mismatch 拦截，
+    //   到不了栅栏。换门才真正走到新加的 _fence 复核——护栏已丢但租约/active 看似还在）。
+    const gTok = readGate({ file: gateFile, now: clock }).payload.token;
+    assert.equal(gTok, ent.token, "前置：门归本 operation token");
+    assert.equal(removeGate({ file: gateFile, token: gTok }).removed, true, "前置：拆门");
+    assert.equal(createGate({ file: gateFile, reason: "P1-2 护栏丢", token: "00000000-0000-0000-0000-00000000000f", now: clock }).ok, true, "前置：重建门但 token 换掉");
+    assert.equal(readGate({ file: gateFile, now: clock }).payload.token, "00000000-0000-0000-0000-00000000000f", "前置：门已被换 token");
+    // env 须带回 FEISHU_BRIDGE_* 覆盖（process.env 此刻已设）——否则 provision 后 initializeShadow 的维护类验证会读真 home、
+    //   以为没有 active（此前把 env 提前建好在覆盖之前，env 里漏了 FEISHU_BRIDGE_MAINTENANCE_DIR → no_active_operation）。
+    const envF = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+    const g = LEDGER_OP.ledgerForward(ctx, { token: ent.token, lease: ent.lease, intent: { kind: "init", endpointId: EP, chain: CH }, env: envF });
+    assert.equal(g.ok, false, "门被换 token → provision 应 fail-closed：" + JSON.stringify(g));
+    assert.equal(g.reason, "fence_lost", "栅栏判据：门不再归本 operation token");
+    assert.equal(fs.existsSync(lroot), false, "栅栏失效 → 不建根（红：旧版无栅栏 → 照常建根成功）");
+
+    // ── 场景②（P1-2 租约伪造）：把门恢复回本 token，但释放真租约后在同路径伪造 {pid: process.pid} 的 symlink。
+    //   旧版 provisionFence 只读磁盘 symlink 的 pid（不看 registry HELD 真实实例）→ 见 pid=本进程且活着就放行 → 建根 → 越界。
+    //   新版：provisionFence 在租约的 reap 段内走 commitWhileHeld 核**真实注册实例**——真例已删（HELD 无此 token）→ lock_lost → 拒，不建根。
+    assert.equal(removeGate({ file: gateFile, token: "00000000-0000-0000-0000-00000000000f" }).removed, true, "前置：拆门（恢复 gate 回到本 token）");
+    assert.equal(createGate({ file: gateFile, reason: "P1-2 租约伪造", token: ent.token, now: clock }).ok, true, "前置：重建门回到本 token");
+    assert.equal(readGate({ file: gateFile, now: clock }).payload.token, ent.token, "前置：门已恢复归本 operation token");
+    assert.equal(releaseOperationLease(ent.lease).ok, true, "前置：释放真租约（registry HELD 删掉真实实例）");
+    // 同路径伪造：payload 只给 pid/at —— 旧版 leaseHolder 只核 pid 活没活，会被骗过；新版走 commitment 核真实注册实例，骗不过。
+    fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date(clock).toISOString() }), ent.lease.path, "file");
+    const g2 = LEDGER_OP.ledgerForward(ctx, { token: ent.token, lease: ent.lease, intent: { kind: "init", endpointId: EP, chain: CH }, env: envF });
+    assert.equal(g2.ok, false, "租约已被释放（真实实例不在 registry）→ provision 应 fail-closed：" + JSON.stringify(g2));
+    assert.equal(g2.reason, "fence_lost", "栅栏判据：租约真实实例已丢（lock_lost），磁盘 symlink 伪造 pid 不能冒充");
+    assert.equal(fs.existsSync(lroot), false, "租约被释放+伪造 symlink → 仍不建根（红：旧版只看 symlink 的 pid → 放行建根）");
+  } finally {
+    if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedgerDir;
+    if (savedGateEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; else process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = savedGateEnv;
+    if (savedMaintDirEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = savedMaintDirEnv;
+    if (prevTpl === undefined) delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; else process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = prevTpl;
+    fs.rmSync(base, { recursive: true, force: true }); fs.rmSync(lrootBase, { recursive: true, force: true });
+  }
+});
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

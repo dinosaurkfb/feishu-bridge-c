@@ -35,9 +35,11 @@ import { chainFacts } from "./precheck.mjs";
 import { removeStubVersion } from "./stub.mjs";
 import { bootstrapTimer, timerPhase } from "./timers.mjs";
 import { readSidecarCurrent, writeSidecarPrepared } from "./sidecar-writer.mjs";
-import { TERMINAL_PHASES, acquireOperationLease, addNote, clearActive, enterLedgerForward, markStepDone, readActive, readJournal, releaseOperationLease, setPhase, verifyBackup } from "./journal.mjs";
+import { TERMINAL_PHASES, acquireOperationLease, addNote, clearActive, enterLedgerForward, leasePath, markStepDone, readActive, readJournal, releaseOperationLease, setPhase, verifyBackup } from "./journal.mjs";
+import { readGate } from "../maintenance-gate-core.mjs";
+import { commitWhileHeld } from "../registry.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
-import { authorityCutover, cutoverPlan, initPlan, initializeShadow, loadLedger, resolveEndpointDir } from "../topic-agent-ledger.mjs";
+import { authorityCutover, cutoverPlan, ensureLedgerRoot, initPlan, initializeShadow, loadLedger, resolveEndpointDir } from "../topic-agent-ledger.mjs";
 import { endpointReceipt } from "./ledger-receipt.mjs";
 
 const CHAINS = ["claude", "codex"];
@@ -211,6 +213,44 @@ const ledgerStep = (plan, sub, endpointId, planSha = null) => ({
 });
 const sceneWhy = (scene) => (scene.why ? "：" + scene.why : "读不出");
 
+/** P1-2 迁移点栅栏判据（读自真实维护事实，不是手里那个 lease 对象）——返回**闭包** `(create) => {ok,...}`：
+ *  在租约的 reap 段内（commitWhileHeld，与陈旧回收/释放互斥）核对**真实注册实例**后再跑 create（provision 变更）。
+ *  ① active 仍指本 token；② gate 仍本 token；③（由 commitWhileHeld 承担）租约确由本进程真实持有——磁盘 symlink 的
+ *    pid 只字不核（那能被同路径伪造{pid:process.pid}骗过）；④ phase 仍 drained。
+ *  任一失效 / lease.path 不属本 operation / .reap 残骸未清 → { ok:false, reason:"fence_lost", why }，**不执行 create**。
+ */
+function provisionFence({ ctx, token, lease, expectPhase }) {
+  return (create) => {
+    // 租约必须属于**这个** operation 且落在它自己的路径上（评审：把 A 的 lease 传给 B 的 fence，commitWhileHeld
+    //   只会去核 B 路径的 registry 项，而 A 的 lease.path 根本不是 B 的 → 拒）。
+    if (!lease?.path || lease.path !== leasePath(ctx.dir, token)) return { ok: false, reason: "fence_lost", why: "lease.path（" + String(lease?.path ?? "?") + "）不属本 operation（应为 " + leasePath(ctx.dir, token) + "）" };
+    let guard = null;
+    // commitWhileHeld：在租约的 reap 段内核对**真实注册实例**（本进程 HELD registry 的 token），再跑 create。
+    //   真实例被删或接管 → lock_lost；.reap 交不还 → reapUncleared。对称校验与 provision 变更同一窄段。
+    const c = commitWhileHeld(lease.path, () => {
+      // ① active 仍指本 token
+      const act = readActive({ dir: ctx.dir });
+      if (act.state !== "active" || act.token !== token) { guard = "active 已不指本 operation token（" + (act.state === "active" ? "指向他 token：" + act.token : act.state) + "）"; return null; }
+      // ② gate 仍本 token
+      const g = readGate({ file: ctx.gateFile, now: ctx.now() });
+      if (g.state !== "active" || g.payload?.token !== token) { guard = "门已不归本 operation token（" + g.state + "）"; return null; }
+      // ④ phase 仍 drained（provision 只在 drained 发生）
+      const jj = readJournal({ dir: ctx.dir, token });
+      if (jj.state !== "valid" || jj.doc.phase !== expectPhase) { guard = "phase 已非 " + expectPhase + "（" + (jj.state === "valid" ? jj.doc.phase : jj.state) + "）"; return null; }
+      // ①~④ 全过 → 在窄段内做 provision 变更（创建目录）
+      return create();
+    });
+    // commitWhileHeld 本身 = ③ 真实注册实例核验：!ok 只可能是 lock_lost / reap_busy / reap_residue / io_error。
+    if (!c.ok) return { ok: false, reason: "fence_lost", why: c.reason === "lock_lost" ? "租约已非本执行者持有（真实注册实例被删/被接管）" : "租约核对失败（" + c.reason + "）" };
+    if (c.reapUncleared) return { ok: false, reason: "fence_lost", why: "租约 .reap 残骸未清" }; // .reap 残骸算 fencing 失败
+    if (guard) return { ok: false, reason: "fence_lost", why: guard };
+    const run = c.run;
+    if (run && run.ok === false) return run; // create 失败（mkdir_failed / parent_absent）
+    return { ok: true };
+  };
+}
+
+
 /** 现场账本 vs ledger step 的 before / intended_after 判据（B-2）：init.before = absent；cutover.before = 原 shadow 身份。 */
 function compareScene(dir, endpointId, step) {
   const sub = step.id.endsWith(":init") ? "init" : "cutover";
@@ -285,16 +325,28 @@ export function ledgerForward(ctx, { token, lease, intent = null, env = process.
   let planPre = null;
   if (phase === "drained") {
     if (!intent || intent.kind !== sub) return { ok: false, reason: "intent_required", phase, why: "drained 进 forward-only 需要 init/cutover 意图" };
-    const dPre = resolveDir(ctx, intent.endpointId, env);
-    if (!dPre.ok) return { ok: false, reason: dPre.reason, phase, why: dPre.why };
-    // 评审 P1-2：只读前置（收据 / 已初始化 / 已切权威）在 drained 就验，失败留在 drained（rollbackSafe），
-    // 不把判定失败留成 forward-only 维护态。cutover 的 reconciler_absent 也在此 fail-closed（P1-4）。
+    // 评审 P1-2 + 返修 P2：只读前置（收据 / 已初始化 / 已切权威）在 drained 就验，失败留在 drained（rollbackSafe），
+    // 且**先于 provision** —— already_* 失败都不会留下空根。cutover 的 reconciler_absent 也在此 fail-closed（P1-4）。
     const receipt = endpointReceipt(ctx.dir, intent.endpointId, { token });
     if (!receipt.ok) return { ok: false, reason: receipt.state, why: receipt.why ?? null, phase, rollbackSafe: true };
     if (sub === "init" && (receipt.initDone || receipt.cutoverDone)) return { ok: false, reason: "already_initialized", why: "该 endpoint 已被初始化或已切权威", phase, rollbackSafe: true };
     if (sub === "cutover" && receipt.cutoverDone) return { ok: false, reason: "already_cutover", why: "该 endpoint 已切权威", phase, rollbackSafe: true };
     // 评审 P1-5：cutover 前置要求恰一份 done init 收据（没有 init 就切权威 → fail-closed，留在 drained）。
     if (sub === "cutover" && !receipt.initDone) return { ok: false, reason: "init_receipt_missing", why: "切权威要求恰一份已 done 的 init 收据（收据 initDone=false）", phase, rollbackSafe: true };
+    // 返修 P1-1 + P2：provision 只发生在 drained 且**只读 precheck 全过后**（仅 init）。cutover 不 provision ——
+    // init 已建成根，根缺席是真实故障应 fail，绝不静默重建。forward 态（initializing/cutting_over/reopening）
+    // 一律不 provision —— 根丢失 → fail-closed（done 收据 + 账本缺席 = 说不清），不得重建。
+    if (sub === "init") {
+      // P1-2：provision 被放进真实维护 fencing 段内，并在**创建目录的变更点**原子复核 active/gate/lease/phase。
+      //   provisionFence 返回 (create) => {ok}；_fence 拿到 create（建根变更）在 commitWhileHeld 窄段内执行。
+      const prov = ensureLedgerRoot({ env, _fence: provisionFence({ ctx, token, lease, expectPhase: "drained" }) });
+      if (!prov.ok) {
+        addNote({ dir: ctx.dir, token, lease, note: "账本根不能安全创建：" + (prov.why ?? prov.reason), now: ctx.now() });
+        return { ok: false, reason: prov.reason, phase, why: prov.why ?? null, rollbackSafe: true };
+      }
+    }
+    const dPre = resolveDir(ctx, intent.endpointId, env);
+    if (!dPre.ok) return { ok: false, reason: dPre.reason, phase, why: dPre.why };
     planPre = planOf({ kind: sub, endpointId: intent.endpointId, chain: intent.chain, token, ledgerDir: dPre.dir, ctx, env });
     if (!planPre.ok) return { ok: false, reason: planPre.reason, why: planPre.why ?? null, phase, rollbackSafe: true };
     // R45 4c/4d：cutover 进段前冻结 S1 —— planOf 的同一 rec（ok 支带三 sidecar 受验字节）+ L 建 staged 树 + 备份 + 三条 prepared step（与 ledger step 同一次原子进段）。
@@ -366,7 +418,7 @@ export function ledgerForward(ctx, { token, lease, intent = null, env = process.
   }
 
   // 3. B-4 重开
-  if (phase === "ledger_reopening" || phase === "reopening_incomplete") return ledgerReopening(ctx, token, lease);
+  if (phase === "ledger_reopening" || phase === "reopening_incomplete") return ledgerReopening(ctx, token, lease, env);
   return { ok: false, reason: "unexpected_phase", phase };
 }
 
@@ -374,7 +426,7 @@ export function ledgerForward(ctx, { token, lease, intent = null, env = process.
 export const ledgerRecover = ledgerForward;
 
 /** B-4 重新开放：current 回原目标 → 定时器回原始三态 → 删桩 → token-CAS 撤门 → 记 done → 清 active；失败 → reopening_incomplete（门与账保留）。 */
-export function ledgerReopening(ctx, token, lease) {
+export function ledgerReopening(ctx, token, lease, env = process.env) {
   const j = readJournal({ dir: ctx.dir, token });
   if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token };
   const doc = j.doc;
@@ -391,6 +443,45 @@ export function ledgerReopening(ctx, token, lease) {
     const p = setPhase({ dir: ctx.dir, token, lease, phase: "reopening_incomplete", expectPhase: "ledger_reopening", now: ctx.now(), note: "说不清 " + incomplete.length + " 项：" + incomplete.map((i) => i.id + "（" + i.why + "）").join("；") });
     return { ok: false, phase: "reopening_incomplete", incomplete, journalWrite: p.ok, ...(p.ok ? {} : { journalWhy: p.why ?? p.reason }), ...extra };
   };
+  // 返修 P1-1：B-4 重开前必须确认提交的账本仍真实在场 —— done 收据 + 账本缺席 = fail-closed，
+  // 绝不在此重建（重建会拿空账本当成功）。根缺失 / 账本缺 / 不可读 → append 到 incomplete → bail 保门保 active。
+  // 返修 P1-3：透传同一 env（不用 process.env），且不只验整本结构合法，还须核"本 init/cutover operation 确在账本内、
+  //   且指纹/result_revision/op_type 与 journal step 的 intended_after 一致、且当前 revision 不早于本事务"——
+  //   防止把另一份结构合法但不含本事务的账本误当成本操作的成功结果。
+  {
+    const ls = doc.steps.find((s) => s.kind === "ledger");
+    const m = ls ? ENDPOINT_RE.exec(ls.id) : null;
+    const ep = m?.[1] ?? null;
+    const stepKind = m?.[2] ?? null; // "init" | "cutover"
+    if (!ep) incomplete.push({ id: "ledger", why: "重开 journal 无合法 ledger step（endpoint 不可辨），说不清" });
+    else {
+      const d = resolveEndpointDir(ep, { env });
+      if (!d.ok) incomplete.push({ id: ls.id, why: "账本根无法定位（" + (d.reason ?? "") + (d.why ? "：" + d.why : "") + "）—— done 收据 + 根缺失 = fail-closed" });
+      else {
+        const L = loadLedger(d.dir, { endpointId: ep });
+        if (!L.ok) incomplete.push({ id: ls.id, why: "提交的账本缺失/不可读（" + (L.reason ?? "") + "）—— done 收据 + 账本缺失 = fail-closed" });
+        else {
+          // P1-3 身份核验：账本在场且整本合法，但仍须证明它就是**本 init/cutover operation** 的结果。
+          //   ①顶层 chain 必须仍与 journal ledger step 的 chain 一致 —— endpoint 是不透明 id，复制来的 op fingerprint
+          //     （含 chain 的哈希）不能代替顶层 chain 关系，chain 被换 = 结构合法的他方账本。
+          //   ②op.request_key 必须等于本维护 token —— 防"结构合法 + fingerprint/revision 全符但 request_key 非本操作"。
+          const intend = ls.intended_after ?? null;
+          const wantOpId = intend?.operation_id ?? null;
+          const wantKind = stepKind === "init" ? "initialize_shadow" : stepKind === "cutover" ? "authority_cutover" : "bad_kind";
+          const wantFp = intend?.fingerprint ?? null;
+          const wantRev = typeof intend?.revision === "number" ? intend.revision : null;
+          const op = typeof wantOpId === "string" ? (L.doc.operations[wantOpId] ?? null) : null;
+          if (L.doc.chain !== ls.chain) incomplete.push({ id: ls.id, why: "账本顶层 chain（" + L.doc.chain + "）≠ journal ledger step 的 chain（" + ls.chain + "）—— 非本事务账本，fail-closed" });
+          else if (!op) incomplete.push({ id: ls.id, why: "账本内不含本" + stepKind + " operation（" + String(wantOpId ?? "?") + "）—— 结构合法但不是本事务结果，fail-closed" });
+          else if (op.request_key !== token) incomplete.push({ id: ls.id, why: "账本内本 operation 的 request_key（" + op.request_key + "）≠ 本维护 token（" + token + "）" });
+          else if (op.op_type !== wantKind) incomplete.push({ id: ls.id, why: "账本内本 operation 的 op_type（" + op.op_type + "）≠ journal 意图（" + wantKind + "）" });
+          else if (wantFp !== null && op.fingerprint !== wantFp) incomplete.push({ id: ls.id, why: "账本内本 operation 的指纹与 journal intent 不符" });
+          else if (wantRev !== null && op.result_revision !== wantRev) incomplete.push({ id: ls.id, why: "账本内本 operation 的 result_revision（" + op.result_revision + "）≠ journal 意图（" + wantRev + "）" });
+          else if (wantRev !== null && L.doc.revision < wantRev) incomplete.push({ id: ls.id, why: "账本当前 revision（" + L.doc.revision + "）早于本事务（" + wantRev + "）—— 事务未反映，fail-closed" });
+        }
+      }
+    }
+  }
   // ① current：回原目标（enter 步 before；账本 operation 无 :install 步）—— 读回三态（P1-8：EACCES 说不清不许当“没有”）
   for (const st of doc.steps.filter((s) => s.kind === "current")) {
     const chain = st.id.split(":")[1];

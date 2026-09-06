@@ -28,7 +28,7 @@ import path from "node:path";
 import { acquireInstallSurfaceLock } from "../install-surface-lock.mjs";
 import { switchCurrentTarget } from "../runtime-install.mjs";
 import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot } from "../m1a/legacy-snapshot.mjs";
-import { prepareLegacyCutoverEndpoint } from "../m1a/reconcile.mjs";
+import { prepareLegacyCutoverEndpoint, reconcileLegacyEndpoint } from "../m1a/reconcile.mjs";
 import { readStagedVerified, removeStagedPlan, stageBackupFiles, stageCutoverPlan, stagedIntendedFile } from "../m1b/staged-plan.mjs";
 import { verifyCutoverPlan } from "../m1b/cutover-plan.mjs";
 import { chainFacts } from "./precheck.mjs";
@@ -67,8 +67,16 @@ const collectFor = (ctx, chain, env) => chain === "claude"
     })
   : collectCodexLegacySnapshot({ home: ctx.codexBridgeHome });
 
-export const reconcileFor = ({ ctx, chain, endpointId, ledgerDir, env }) => prepareLegacyCutoverEndpoint({
-  // R45 二轮 P1-1：staging 要拿受验渲染字节，走 T4 私有准备接口（公共安全面 reconcileLegacyEndpoint 不回字节明文）
+// R45 三轮 P1-1：面拆分。公共 reconcileFor 走 reconcileLegacyEndpoint（预览/doctor 安全面，每键恰 {sha256}，无字节明文）；
+// 私有 prepareFor 走 prepareLegacyCutoverEndpoint（T4 私有接口，plan 锚与 verifyCutoverPlan 需要受验字节）——
+// grep 守卫只查私有接口字面名，经公共包装别名转发就能绕过；现在预览面数据源不再可能携字节。
+export const reconcileFor = ({ ctx, chain, endpointId, ledgerDir, env }) => reconcileLegacyEndpoint({
+  endpointId, chain,
+  collectLegacy: () => collectFor(ctx, chain, env),
+  loadLedgerFn: () => loadLedger(ledgerDir, { endpointId }),
+});
+
+const prepareFor = ({ ctx, chain, endpointId, ledgerDir, env }) => prepareLegacyCutoverEndpoint({
   endpointId, chain,
   collectLegacy: () => collectFor(ctx, chain, env),
   loadLedgerFn: () => loadLedger(ledgerDir, { endpointId }),
@@ -158,7 +166,7 @@ function planOf({ kind, endpointId, chain, token, ledgerDir, ctx, env }) {
   const L1 = loadLedger(ledgerDir, { endpointId });
   if (!L1.ok) return { ok: false, reason: L1.reason, why: L1.why ?? null };
   if (L1.doc.authority_mode !== "shadow") return { ok: false, reason: "not_shadow", why: "切权威前置要求 shadow（实际 " + L1.doc.authority_mode + "）" };
-  const rec = reconcileFor({ ctx, chain, endpointId, ledgerDir, env });
+  const rec = prepareFor({ ctx, chain, endpointId, ledgerDir, env });
   if (!rec.ok) return { ok: false, reason: rec.reason, why: rec.why ?? (rec.mismatches ? "双射不等（" + rec.mismatches.length + " 条）" : null) };
   // 对账期间账本被旁路改写（revision / 整文件 SHA 任一变）→ 蓝图作废，fail-closed。
   const L2 = loadLedger(ledgerDir, { endpointId });
@@ -221,6 +229,17 @@ function compareScene(dir, endpointId, step) {
 /** R45 复合提交（§4.1 4c/4d/4f/5）：①逐 sidecar 窄写（journal 锚驱动，幂等）→ ②门内二次重验（live collect + 五等式 + 4f）。
  *  两次对账都在本函数内：S1 已在 stageCutover 时冻结进 plan；这里取 S2 = live collect，verifyCutoverPlan 核 S2 与 plan 锚自洽。
  *  返回后调用方才到唯一提交点 authority_cutover；本函数不碰账本。 */
+// R45 三轮 P2-1：writer 的锁类失败本就结构化带路径（residue/releaseResidue/lock），但编排层曾把它折成 {reason, why}，
+// CLI 面打不出 .reap/主锁真实路径，人工只能全盘翻 ledger。这里归一成 lockUncleared:{path,reason,error}
+// —— 与 doWrite 透传约定（m1b 回执字段同形）一致，releaseRows（"账本主锁交不还："+path）直接可用。
+const lockUnclearedOf = (w) => {
+  if (w.residue) return { path: w.residue.path ?? null, reason: "fence_reap_uncleared", error: w.residue.error ?? null };
+  if (w.releaseResidue?.reapUncleared) return { path: w.releaseResidue.reapUncleared.path ?? null, reason: "release_reap_uncleared", error: w.releaseResidue.reapUncleared.error ?? null };
+  if (w.releaseResidue?.absent === true || typeof w.release === "string") return { path: w.lock ?? null, reason: "release_" + (w.releaseResidue?.absent === true ? "absent" : String(w.release)), error: null };
+  if (w.lock) return { path: w.lock, reason: String(w.reason), error: w.why ?? null };
+  return null;
+};
+
 function convergeSidecars(ctx, { token, lease, gateFile, env, endpointId, chain, ledgerDir, doc, ls }) {
   const sidecarSteps = doc.steps.filter((s) => s.kind === "sidecar");
   if (sidecarSteps.length !== 3) return { ok: false, reason: "sidecar_steps_missing", why: "cutting_over 应有三条 sidecar step（实际 " + sidecarSteps.length + "）" };
@@ -228,7 +247,7 @@ function convergeSidecars(ctx, { token, lease, gateFile, env, endpointId, chain,
     const name = st.id.split(":")[1];
     // P1-1：writer 写前核 op token + operation lease + gate 三绑定活（gateFile 由编排层从 ctx 供给）。
     const w = writeSidecarPrepared({ dir: ctx.dir, token, lease, gateFile, endpointId, name, ledgerDir, now: ctx.now() });
-    if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null };
+    if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, lockUncleared: lockUnclearedOf(w) };
     if (w.written) afterStep(ctx, "written:" + st.id);
   }
   // 门内二次重验：staged plan 受验读（SHA 锚 = ledger step intended_after.plan_sha256）
@@ -236,7 +255,7 @@ function convergeSidecars(ctx, { token, lease, gateFile, env, endpointId, chain,
   if (!(typeof planSha === "string" && /^[0-9a-f]{64}$/u.test(planSha))) return { ok: false, reason: "plan_anchor_missing", why: "ledger step intended_after.plan_sha256 缺失（1.3 八键）" };
   const pb = readStagedVerified(path.join(ctx.dir, token + ".staged", "intended", "plan.json"), { sha256: planSha });
   if (!pb.ok) return { ok: false, reason: "staged_plan_unreadable", why: pb.why ?? pb.reason };
-  const rec2 = reconcileFor({ ctx, chain, endpointId, ledgerDir, env });
+  const rec2 = prepareFor({ ctx, chain, endpointId, ledgerDir, env });
   if (!rec2.ok) return { ok: false, reason: rec2.reason, why: rec2.why ?? null };
   // P1-4：二次重验同样过 blockers 硬门——staging 后清了项又冒出新待修项（或 staging 本就不该过）都在这里拦。
   if (rec2.cutover_blockers.length > 0) {
@@ -324,7 +343,7 @@ export function ledgerForward(ctx, { token, lease, intent = null, env = process.
         if (sub === "cutover") {
           // R45 复合提交：①三条 sidecar 窄写 + ②门内二次重验（都过才到提交点）。
           const cv = convergeSidecars(ctx, { token, lease, gateFile: ctx.gateFile, env, endpointId, chain, ledgerDir: d.dir, doc, ls });
-          if (!cv.ok) return { ok: false, reason: cv.reason, why: cv.why ?? null, phase };
+          if (!cv.ok) return { ok: false, reason: cv.reason, why: cv.why ?? null, phase, lockUncleared: cv.lockUncleared ?? null };
           // 唯一提交点 authority_cutover：本单只武装到提交前（capability 门与真翻转账本归 M1b 后续单），停在门内。
           return { ok: false, reason: "authority_cutover_not_armed", why: "sidecar 已收敛、二次重验已过；authority_cutover 提交点未武装，停在 ledger_cutting_over", phase };
         }
@@ -480,7 +499,11 @@ export function ledgerEnter(ctx, { kind, endpointId, chain, waitMs = 60000, appl
     }
   } catch (err) {
     if (err?.simulatedCrash === true) crashErr = err;
-    else out = { ok: false, reason: "ledger_forward_failed", why: errText(err) };
+    // R45 三轮 P1-3：折收据带 phase（尽力重读 journal）——命令面 exitCodeFor 靠它判「已动现场」退 3，
+    // 不再因丢 phase 退 1（与干净拒绝同码，脚本侧分不出「不能动」和「动了没做完」）。
+    else out = { ok: false, reason: "ledger_forward_failed", why: errText(err),
+      phase: (() => { const j45 = readJournal({ dir: ctx.dir, token: ent.token }); return j45.state === "valid" ? j45.doc.phase : null; })(),
+      incomplete: [] };
   }
   if (crashErr !== null) throw crashErr;
   const leaseRel = releaseOperationLease(ent.lease);
@@ -536,7 +559,8 @@ export function ledgerExit(ctx, { apply = false, env = process.env, surface: hel
       : rollbackOperation(ctx, token, lease);
   } catch (err) {
     if (err?.simulatedCrash === true) crashErr = err;
-    else out = { ok: false, reason: action === "ledger_forward" ? "ledger_forward_failed" : "ledger_rollback_failed", why: errText(err) };
+    // R45 三轮 P1-3：同 ledgerEnter —— 折收据带 phase/action，退出码映射判「已动现场」退 3
+    else out = { ok: false, reason: action === "ledger_forward" ? "ledger_forward_failed" : "ledger_rollback_failed", why: errText(err), phase, incomplete: [] };
   }
   if (crashErr !== null) throw crashErr;
   const leaseRel = releaseOperationLease(lease);

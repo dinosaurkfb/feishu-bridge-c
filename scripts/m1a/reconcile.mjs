@@ -271,8 +271,9 @@ function reconcileCore({ endpointId, chain, collectLegacy, loadLedgerFn }, wantB
     for (const [k, r] of Object.entries(parts)) {
       if (!r.ok) return { ok: false, reason: "sidecar_render_failed", why: k + "：" + (r.why ?? "") };
     }
-    // P1-1：公共面每键恰 {sha256}；T4 私有面加 bytes（wantBytes 由导出薄壳定，调用方选不了）
-    return { ok: true, digest: digestE, cutover_blockers: proj.blockers, snapshot_identity: S1.snapshot_identity,
+    // P1-1：公共面每键恰 {sha256}；T4 私有面加 bytes（wantBytes 由导出薄壳定，调用方选不了）。
+    // R45 三轮 P1-1③：公共面补 ledger 身份（规格 :213）——下游预览面可核对对账依据的账本时点，不必自带 L2 重读。
+    return { ok: true, digest: digestE, ledger: { revision: L2.doc.revision, sha256: L2.sha256 }, cutover_blockers: proj.blockers, snapshot_identity: S1.snapshot_identity,
       sidecars: Object.fromEntries(Object.entries(parts).map(([k, r]) => [k, wantBytes ? { sha256: sha256(r.bytes), bytes: r.bytes } : { sha256: sha256(r.bytes) }])) };
   }
   return { ok: false, reason: "bijection_mismatch", mismatches, cutover_blockers: proj.blockers, snapshot_identity: S1.snapshot_identity };

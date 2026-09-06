@@ -26250,6 +26250,40 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     }
   }));
 
+  // P1-1②（#R37）：锁内重核六件事。verify（锁内、legacy 前）拒 → 整笔 fail-closed：不跑 legacy、不写 shadow、不归并。
+  //   旧代码忽略 verify → 仍 activate → 判定红（本测试红先行）。verify 过时，其给出的 f4 全权替代调用侧 f4。
+  test("P1-1② 接线：verify（锁内重核六件事）拒 → wirePromoteBinding 整笔 fail-closed，不跑 legacy、不写 shadow；verify 过 → f4 以锁内重核为准", () => withRootAndReceipt((root, dir) => {
+    seedLedger(dir);
+    seedLedgerInitReceipt(path.join(root, "maint"), EP);
+    let legacyCalls = 0;
+    const legacyRec = (tag) => () => { legacyCalls += 1; return { tag, legacyCommitted: true }; };
+
+    // ① verify 拒（锁内六件事不再成立，模拟竞态：only_pending 不再是恰一份）→ 整笔 fail-closed。
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", rootOm: "om_pf", lineageId: "lin_pf", bindingTarget: { runtime: "claude", project_root: "/Users/dk/p", claude_session_id: uuid(7) } }), "B1 前置（pending，verify 红探针）");
+    const b1Id = famIds(talLoad(dir), "B1").pop();
+    const before = legacyCalls;
+    const w = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: legacyRec("promote7"), locator: "om_pf", claimKey: claim("pf"), sessionId: "sess_pf", authorizedBy: "ou_o", f4: F4B("om_pf"), verify: () => ({ ok: false, reason: "stale_conclusion", why: "锁内重核：only_pending 不再恰一份" }) });
+    assert.equal(w.ok, false, "verify 拒 → 整笔 fail-closed：" + JSON.stringify(w));
+    assert.equal(w.reason, "stale_conclusion", "透传锁内重核 reason");
+    assert.equal(legacyCalls, before, "verify 拒 → 不跑 legacy");
+    assert.ok(w.shadow == null || w.shadow.length === 0, "verify 拒 → 不写 shadow");
+    assert.equal(TAL.familyOf(talLoad(dir).records[b1Id].facts), "B1", "verify 拒 → 不归并（不 activate）");
+
+    // ② verify 过：锁内重核给出的 f4（matched_om=om_pf）全权替代调用侧 f4（matched_om=om_wrong）→ shadow 以重核为准、成功归并。
+    //    同 target 重复 lineage 会撞 G7，故另起 fresh target。
+    talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", rootOm: "om_pf2", lineageId: "lin_pf2", bindingTarget: { runtime: "claude", project_root: "/Users/dk/p", claude_session_id: uuid(8) } }), "B1 ② 前置（pending）");
+    const b1b = famIds(talLoad(dir), "B1").pop();
+    const w2 = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: legacyRec("promote8"), locator: "om_pf2", claimKey: claim("pf8"), sessionId: "sess_pf8", authorizedBy: "ou_o", f4: F4("om_wrong"), verify: () => ({ ok: true, f4: F4B("om_pf2") }) });
+    assert.ok(w2.ok, "verify 过 → legacy 照常成功：" + JSON.stringify(w2));
+    assert.equal(w2.shadow.length, 2, "shadow 两笔");
+    assert.ok(w2.shadow[0].ok && w2.shadow[1].ok, "两笔都成功：" + JSON.stringify(w2.shadow));
+    const b3b = talLoad(dir).records[b1b];
+    assert.equal(TAL.familyOf(b3b.facts), "B3", "verify 过 → 归并成 B3");
+    assert.equal(b3b.binding_proof.matched_om, "om_pf2", "配对证明以锁内重核 f4 为准（非调用侧 om_wrong）");
+    assert.deepEqual(b3b.binding_proof.matched_fields, ["chat_id", "sender", "thread_root"], "锁内重核 f4 的 matched_fields 透传");
+    assert.equal(b3b.binding_proof.pending_token_state, "absent", "锁内重核 f4 的 no-token 支透传");
+  }));
+
   // P1-1-d：账本 G15 对 F4 判别联合的收口——token 认领→binding_token_v1（四项 present）／no-token 认领→
   //   owner_root_no_token_v1（三项 absent）／伪造（四项+absent、三项+present、缺项、混合）→ G15 整笔拒。
   test("P1-1-d 账本：F4 判别联合 G15——token 四项 present→B3 binding_token_v1；no-token 三项 absent→owner_root_no_token_v1；伪造即拒", () => withRoot((root, dir) => {

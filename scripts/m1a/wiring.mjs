@@ -113,7 +113,7 @@ export function emitUncleanReceipt(kind, wired, extra = {}) {
 //   · state === "ok"（ledger_init done）→ 双写强制：**任一取锁失败都不得写 legacy**（错误名不能证明无并发写方）。
 // 已启用点外层锁无降级（裁定：可 skip 的失败集为空）；只有**取得 outer 后**的 shadow 后半程失败，
 // 才保留已成立的 legacy 结果并外显 mismatch（shadow[i] 投影失败）。
-function runWired({ endpointId, env = process.env, legacy, submit, lockOnly = false }) {
+function runWired({ endpointId, env = process.env, legacy, submit, lockOnly = false, preflight = null }) {
   const recDir = maintenanceDir(env);
   const receipt = typeof recDir === "string" && recDir.length > 0
     ? endpointReceipt(recDir, endpointId)
@@ -153,6 +153,17 @@ function runWired({ endpointId, env = process.env, legacy, submit, lockOnly = fa
       result = { ok: false, commit: "not_committed", reason: "m1a_mode_not_shadow", why: "账本 authority_mode=" + ledger.doc.authority_mode + "：M1a 代码不得在切换后再写 legacy", lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
       return result;
     }
+    // #R37 P1-1②：锁内重核六件事。preflight 在取得 outer 锁、cutover/账本/权威校验通过后、legacy 前运行
+    //   —— 因为 legacy() 会消费 pending（promoteBinding 把 pending 拉成 active），事后无法再重核 pending 现场。
+    //   调用方（inbound.mjs 的 verify）注入重核谓词；拒 → 整笔 fail-closed（不跑 legacy、不写 shadow）。
+    let pf = null;
+    if (preflight) {
+      pf = preflight({ endpointId, env, lock: acq.lock });
+      if (!pf || pf.ok !== true) {
+        result = { ok: false, commit: "not_committed", reason: pf?.reason ?? "preflight_reject", why: pf?.why ?? "锁内重核未通过", lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
+        return result;
+      }
+    }
     let legacyRes;
     try { legacyRes = legacy(); }
     catch (err) {
@@ -162,7 +173,7 @@ function runWired({ endpointId, env = process.env, legacy, submit, lockOnly = fa
     // legacy 明确未提交（ok:false）→ 无 legacy 结果可镜像 → 不跑 shadow 后缀（不写幽灵记录/标记）。
     // W4（P1-3③）：lock-only 行（连接暂停/恢复、enabled 翻转）不写 shadow 事务——对账兜底（doctor+repair），
     //   但 outer 锁必须取（绕过 outer 就穿了 cutover 快照窗口）；对账兜底=无双写，**不是无锁**。
-    const shadow = lockOnly ? [] : (legacyRes && legacyRes.ok === false ? [] : (submit(legacyRes) ?? []));
+    const shadow = lockOnly ? [] : (legacyRes && legacyRes.ok === false ? [] : (submit(legacyRes, pf) ?? []));
     result = { ok: true, legacy: legacyRes, shadow, release: null };
     return result;
   } finally {
@@ -229,9 +240,9 @@ export function wireBindClaim({ endpointId, env = process.env, legacy, claimKey,
  * 目标状态与 locator 对不上（如无 shadow 记录）/读不出）→ fail-closed，不猜。 */
 export function wirePromoteBinding({
   endpointId, env = process.env, legacy, locator, claimKey, sessionId, authorizedBy,
-  f4 = null, now = Date.now(),
+  f4 = null, verify = null, now = Date.now(),
 }) {
-  return runWired({ endpointId, env, legacy, submit: (legacyRes) => {
+  return runWired({ endpointId, env, legacy, preflight: verify, submit: (legacyRes, pf) => {
     if (!en(claimKey) || !en(sessionId) || !en(locator)) return [{ op: "promote", ok: false, reason: "bad_external_id", why: "claimKey/sessionId/locator 必填 1..256 字符串" }];
     const resolved = resolveLiveId({ endpointId, locator, env });
     if (!resolved.ok) return [{ op: "promote", ok: false, reason: resolved.reason, why: resolved.why ?? null }];
@@ -256,7 +267,9 @@ export function wirePromoteBinding({
     // W1 引用码认领（B1 仍 pending）→ create_a1 → activate。P1-2 收尾：**只消费**认领校验处受验的
     // 封闭 f4（matched_om===locator 且 matched_fields=标准四项）；拿不到受验产物/不符 → 该笔 shadow 拒
     // （不写配对证明、不自铸）。任意 locator/owner 字符串不得 activate 出四项证明。
-    if (!f4Ok(f4, locator)) return [{ op: "promote", ok: false, reason: "bad_f4", why: "F4 必须是认领校验处受验的封闭判别联合（matched_om=locator 且 token 四项或 no-token 三项），wirePromoteBinding 只消费不铸造" }];
+    // #R37 P1-1②：锁内重核给出 f4（verify.ok→pf.f4）时全权替代调用侧 f4（锁内结论优先）。
+    const f4Use = (pf && pf.ok === true && pf.f4 != null) ? pf.f4 : f4;
+    if (!f4Ok(f4Use, locator)) return [{ op: "promote", ok: false, reason: "bad_f4", why: "F4 必须是认领校验处受验的封闭判别联合（matched_om=locator 且 token 四项或 no-token 三项），wirePromoteBinding 只消费不铸造" }];
     const chatId = typeof target.chat_id === "string" ? target.chat_id : null;
     if (!en(chatId)) return [{ op: "create_a1", ok: false, reason: "bad_input", why: "target.chat_id 缺失" }];
     const kA1 = rk("create_a1", claimKey, sessionId);
@@ -265,7 +278,7 @@ export function wirePromoteBinding({
     if (!a1.ok) return [a1]; // create_a1 失败（如 locator 撞）→ 序列停（activate 需 a1Id）
     const kAct = rk("activate", claimKey, b1Id);
     if (!kAct.ok) return [a1, { op: "activate", ...kAct }];
-    return [a1, capture("activate", activate({ endpointId, requestKey: kAct.request_key, b1Id, a1Id: a1.result?.created_id, f4, authorizedBy, now, env }))];
+    return [a1, capture("activate", activate({ endpointId, requestKey: kAct.request_key, b1Id, a1Id: a1.result?.created_id, f4: f4Use, authorizedBy, now, env }))];
   } });
 }
 

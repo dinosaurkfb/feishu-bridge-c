@@ -403,6 +403,18 @@ if (!routed.ok) {
     sessionId: event.session_id ?? null,
     authorizedBy: event.sender_id ?? null,
     f4: promotion.f4 ?? null,
+    // #R37 P1-1②：锁内重核六件事（同 Claude 链）——调用侧 evaluatePromotion 在取锁前算（结论可能被竞态
+    //   作废）；取得 outer 锁、legacy 前重跑 findPendingTask + evaluatePromotion（用锁内 now）。拒 → 整笔
+    //   fail-closed；过 → 其 f4 全权替代调用侧 f4（配合 f4Ok 的 matched_om===locator 复核兑底）。
+    verify: () => {
+      const nowVerify = Date.now();
+      const pendingVerify = findPendingTask({ home: HOME, content: event.content, now: nowVerify });
+      if (!pendingVerify.ok) return { ok: false, reason: pendingVerify.reason, why: "锁内重核：pending 现场不再可认领（" + (pendingVerify.reason ?? "unknown") + "）" };
+      const promoVerify = evaluatePromotion({ event, template: template.template, pending: pendingVerify, now: nowVerify });
+      if (!promoVerify.ok) return { ok: false, reason: promoVerify.reason, why: "锁内重核：认领六件事不再成立（" + (promoVerify.reason ?? "unknown") + "）" };
+      if (promoVerify.f4 != null && promoVerify.f4.matched_om !== (pendingVerify.generation?.root_message_id ?? null)) return { ok: false, reason: "f4_changed", why: "锁内重核：matched_om 与锁内 locator 不符" };
+      return { ok: true, f4: promoVerify.f4 };
+    },
   });
   if (!wiredPromote.ok) {
     writeReceipt("promote-m1a-" + (event.message_id ?? Date.now()), { status: "rejected", reason: wiredPromote.reason ?? "m1a_reject", why: wiredPromote.why ?? null, lock: wiredPromote.lock ?? null, claim_acquired: false, handed_off: false, subscription_claim_shadow: subscriptionClaimShadow });

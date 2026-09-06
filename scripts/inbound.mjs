@@ -481,6 +481,20 @@ if (!routed.ok) {
     sessionId: event.session_id ?? null,
     authorizedBy: event.sender_id ?? null,
     f4: promo.f4 ?? null,
+    // #R37 P1-1②：锁内重核六件事。调用侧 evaluatePromotion 在取锁前算（只作路由/旁路用，结论可能被竞态
+    //   作废）；取得 outer 锁、legacy 前这里重跑 findPendingBinding + evaluatePromotion（用锁内时刻的 now，
+    //   重核新鲜度/唯一可认领/来源受验等全部六条）。拒 → 整笔 fail-closed（不跑 legacy、不写 shadow、不归并）。
+    //   通过 → 其给出的 f4 全权替代调用侧 f4（锁内结论优先），配合 wirePromoteBinding 侧 f4Ok 的
+    //   matched_om===locator 复核，locator 若在锁前被改 → bad_f4 兜底。
+    verify: () => {
+      const nowVerify = Date.now();
+      const pendingVerify = findPendingBinding({ content: event.content, now: nowVerify });
+      if (!pendingVerify.ok) return { ok: false, reason: pendingVerify.reason, why: "锁内重核：pending 现场不再可认领（" + (pendingVerify.reason ?? "unknown") + "）" };
+      const promoVerify = evaluatePromotion({ event, template, pending: pendingVerify, now: nowVerify });
+      if (!promoVerify.ok) return { ok: false, reason: promoVerify.reason, why: "锁内重核：认领六件事不再成立（" + (promoVerify.reason ?? "unknown") + "）" };
+      if (promoVerify.f4 != null && promoVerify.f4.matched_om !== (pendingVerify.generation?.root_message_id ?? null)) return { ok: false, reason: "f4_changed", why: "锁内重核：matched_om 与锁内 locator 不符" };
+      return { ok: true, f4: promoVerify.f4 };
+    },
   });
   if (!wired.ok) {
     // 双写强制下锁取不到（busy/maintenance/root_*/dir_*/lock_residue/reap_* 等）：整笔披、不写 legacy、没有绑定。

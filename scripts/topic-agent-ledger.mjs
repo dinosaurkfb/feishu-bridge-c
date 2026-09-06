@@ -452,7 +452,10 @@ const RESULT_SHAPE = Object.freeze({
   rebind_session_alias: (r) => keysOf(r) === "affected_id,authorized_at,authorized_by,new_session_id,old_session_id" && isId(r.affected_id) && AILY_SESSION_SHAPE.test(r.old_session_id) && AILY_SESSION_SHAPE.test(r.new_session_id) && r.old_session_id !== r.new_session_id && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at),
   migrate_seed: (r) => keysOf(r) === "authorized_at,authorized_by,seeded" && typeof r.authorized_by === "string" && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at) && Array.isArray(r.seeded) && r.seeded.every((s) => isObj(s) && isId(s.topic_agent_id) && typeof s.legacy_source_digest === "string" && SHA_SHAPE.test(s.legacy_source_digest)) && r.seeded.every((s, i) => i === 0 || r.seeded[i - 1].topic_agent_id < s.topic_agent_id),
   migrate_repair: (r) => keysOf(r) === "authorized_at,authorized_by,expected_projection_digest,from_family,legacy_source_digest,next_projection_digest,repaired_id,to_family" && isId(r.repaired_id) && typeof r.authorized_by === "string" && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at) && [r.expected_projection_digest, r.next_projection_digest, r.legacy_source_digest].every((s) => typeof s === "string" && SHA_SHAPE.test(s)) && MIGRATE_FAMILIES.includes(r.from_family) && MIGRATE_FAMILIES.includes(r.to_family) && (r.from_family === "B1" ? r.to_family === "B1" : r.to_family !== "B1"),
-  authority_cutover: (r) => keysOf(r) === "revision_at_cutover" && Number.isInteger(r.revision_at_cutover) && r.revision_at_cutover >= 1,
+  authority_cutover: (r) => keysOf(r) === "bijection_digest,endpoint_id,expiry_sha256,pending_claims_sha256,policy_sha256,pre_cutover_ledger_sha,revision_at_cutover"
+    && Number.isInteger(r.revision_at_cutover) && r.revision_at_cutover >= 1
+    && typeof r.endpoint_id === "string" && ENDPOINT_SHAPE.test(r.endpoint_id)
+    && [r.bijection_digest, r.pre_cutover_ledger_sha, r.expiry_sha256, r.pending_claims_sha256, r.policy_sha256].every((v) => typeof v === "string" && SHA_SHAPE.test(v)),
 });
 
 function operationProblem(op, topRevision) {
@@ -978,10 +981,27 @@ function _maintenanceVerifier(capability, endpointId, opType, env = process.env)
   // 评审 P1-3：capability 必须证明**当前进程确实持有**该 operation 租约实例（commitWhileHeld 的 token fencing），
   // 且 plan 必须由 journal 里已落盘的 ledger step 重建，不得接受调用方任意 planIn。重建后逐字段绑定 before/intended_after。
   const lpath = leasePath(maintDir, token);
+  // P1-6：cutover 的三条 sidecar step intended_after.sha256 是复合升级的锚——缺/形坏/重复都 fail-closed。
+  // init（ledger_initializing）没有 sidecar 家族，不做这一核。
+  let sidecarShas = null;
+  if (wantSub === "cutover") {
+    sidecarShas = { expiry: null, pending_claims: null, policy: null };
+    for (const st of j.doc.steps) {
+      if (st.kind !== "sidecar") continue;
+      const nm = st.id.slice("sidecar:".length).split(":")[0];
+      const key = nm === "pending-claims" ? "pending_claims" : nm;
+      if (!(key in sidecarShas)) return fail("sidecar_anchors_missing", "sidecar step 名不在封闭集合：" + nm);
+      if (sidecarShas[key] !== null) return fail("sidecar_anchors_missing", "重复的 sidecar step：" + nm);
+      sidecarShas[key] = st.intended_after?.sha256 ?? null;
+    }
+    if (Object.values(sidecarShas).some((v) => typeof v !== "string" || !SHA_SHAPE.test(v))) {
+      return fail("sidecar_anchors_missing", "三条 sidecar step 的 intended_after.sha256 缺失或非法");
+    }
+  }
   const binding = commitWhileHeld(lpath, () => {
     const ld = resolveEndpointDir(endpointId, { env });
     if (!ld.ok) return ld;
-    const plan = rebuildPlanFromStep({ endpointId, chain: ls.chain, token, ledgerDir: ld.dir, step: ls });
+    const plan = rebuildPlanFromStep({ endpointId, chain: ls.chain, token, ledgerDir: ld.dir, step: ls, sidecarShas });
     if (!plan.ok) return plan;
     const bindProblem = bindPlanToStep(plan, ls);
     if (bindProblem !== null) return { ok: false, reason: "plan_binding_mismatch", why: bindProblem };
@@ -1003,14 +1023,16 @@ function rebuildPlanFromStep({ endpointId, chain, token, ledgerDir, step }) {
   if (L.doc.authority_mode !== "shadow") return { ok: false, reason: "mode_not_shadow", why: "重建 cutover plan 需 shadow" };
   const digest = step.intended_after?.bijection_digest;
   if (typeof digest !== "string" || !SHA_SHAPE.test(digest)) return { ok: false, reason: "bad_digest", why: "ledger step 的 intended_after.bijection_digest 缺失或非法" };
-  return cutoverPlan({ endpointId, chain, requestKey: token, operationId: token, shadowDoc: L.doc, shadowSha: L.sha256, digest });
+  return cutoverPlan({ endpointId, chain, requestKey: token, operationId: token, shadowDoc: L.doc, shadowSha: L.sha256, digest, sidecarShas });
 }
 
-/** 逐字段绑定 plan.before / plan.intended_after 与 ledger step（P1-3：字段名相同、键序无关、值全等才放行）。 */
+/** 逐字段绑定 plan.before / plan.intended_after 与 ledger step（P1-3：字段名相同、键序无关、值全等才放行）。
+ *  P1-6：journal 键集含 plan_sha256（1.3 八键，进段时才有）——逐字段绑定前剥掉它，蓝图与锚按其余键全等。 */
 function bindPlanToStep(plan, ls) {
+  const stripPlanSha = (o) => { if (!isObj(o)) return o; const { plan_sha256, ...rest } = o; return rest; };
   const eq = (a, b) => { const ka = Object.keys(a).sort(), kb = Object.keys(b).sort(); return ka.length === kb.length && ka.every((k, i) => k === kb[i]) && ka.every((k) => a[k] === b[k]); };
-  if (!eq(plan.before, ls.before)) return "plan.before 与 ledger step 的 before 不一致";
-  if (!eq(plan.intendedAfter, ls.intended_after)) return "plan.intended_after 与 ledger step 的 intended_after 不一致";
+  if (!eq(plan.before, stripPlanSha(ls.before))) return "plan.before 与 ledger step 的 before 不一致";
+  if (!eq(plan.intendedAfter, stripPlanSha(ls.intended_after))) return "plan.intended_after 与 ledger step 的 intended_after 不一致";
   return null;
 }
 
@@ -1067,19 +1089,31 @@ export function initPlan({ endpointId, chain, requestKey, operationId } = {}) {
   };
 }
 
-/** 幂等构造 cutover 后的账本文档（authoritative, revision+1, 追加一笔 cutover op）+ 整文件 SHA（cutover 的 WAL 蓝图）。 */
-export function cutoverPlan({ endpointId, chain, requestKey, operationId, shadowDoc, shadowSha, digest }) {
+/** 幂等构造 cutover 后的账本文档（authoritative, revision+1, 追加一笔 cutover op）+ 整文件 SHA（cutover 的 WAL 蓝图）。
+ *  sidecarShas（P1-6 事务 §5）：三条 sidecar 的 SHA 进 fingerprint 与 result —— 复合升级的七键封闭绑定，
+ *  缺任一（或形状不对）都 bad_sidecar_shas；cutover 不再是一条孤立的账本翻转变更。 */
+export function cutoverPlan({ endpointId, chain, requestKey, operationId, shadowDoc, shadowSha, digest, sidecarShas }) {
   if (!shadowDoc || shadowDoc.authority_mode !== "shadow") return { ok: false, reason: "not_shadow" };
   if (!CHAIN.includes(chain)) return { ok: false, reason: "bad_chain" };
   if (typeof requestKey !== "string" || !REQUEST_KEY_SHAPE.test(requestKey)) return { ok: false, reason: "bad_request_key" };
   if (typeof digest !== "string" || !SHA_SHAPE.test(digest)) return { ok: false, reason: "bad_digest" };
-  const fingerprint = fingerprintOf("authority_cutover", { request_key: requestKey, endpoint_id: endpointId, bijection_digest: digest });
+  if (!(isObj(sidecarShas) && keysOf(sidecarShas) === "expiry,pending_claims,policy"
+    && Object.values(sidecarShas).every((v) => typeof v === "string" && SHA_SHAPE.test(v)))) return { ok: false, reason: "bad_sidecar_shas" };
+  const fingerprint = fingerprintOf("authority_cutover", {
+    request_key: requestKey, endpoint_id: endpointId, bijection_digest: digest, pre_cutover_ledger_sha: shadowSha,
+    expiry_sha256: sidecarShas.expiry, pending_claims_sha256: sidecarShas.pending_claims, policy_sha256: sidecarShas.policy,
+  });
   const doc = structuredClone(shadowDoc);
   doc.revision += 1;
   doc.authority_mode = "authoritative";
   doc.operations[operationId] = {
     op_type: "authority_cutover", terminal_kind: "authority_cutover", request_key: requestKey, fingerprint,
-    result_revision: doc.revision, result: { revision_at_cutover: doc.revision },
+    result_revision: doc.revision,
+    result: {
+      revision_at_cutover: doc.revision, endpoint_id: endpointId, bijection_digest: digest,
+      pre_cutover_ledger_sha: shadowSha, expiry_sha256: sidecarShas.expiry,
+      pending_claims_sha256: sidecarShas.pending_claims, policy_sha256: sidecarShas.policy,
+    },
   };
   const docSha2 = sha256(Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8"));
   return {
@@ -1190,10 +1224,17 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
   // 评审 P2：T4 蓝图验证独立于 T3a 对账门——一个函数只做一件事，不再把 digest 形状检查与 plan 绑定混在手写块里。
   const t4 = cutoverPlanVerifier(plan, rec.digest, endpointId);
   if (!t4.ok) return { ok: false, commit: "not_committed", reason: t4.reason, why: t4.why };
-  const digest = rec.digest;
+  // P1-6：重放输入从蓝图 result 派生七键封闭集（与 fingerprintOf 的键一致）——复合升级的幂等重放
+  // 不能只对三键，否则换 sidecar 锚的重放会被误认成同一笔。
+  const cutResult = plan.doc?.operations?.[plan.operationId]?.result ?? null;
+  if (!isObj(cutResult)) return { ok: false, commit: "not_committed", reason: "plan_rebuild", why: "蓝图里没有 cutover operation result" };
   const res = writeLedger({
     dir: d.dir, endpointId, gated: false, requestKey, _inject,
-    replay: () => [{ opType: "authority_cutover", inputs: { request_key: requestKey, endpoint_id: endpointId, bijection_digest: digest } }],
+    replay: () => [{ opType: "authority_cutover", inputs: {
+      request_key: requestKey, endpoint_id: endpointId, bijection_digest: cutResult.bijection_digest,
+      pre_cutover_ledger_sha: cutResult.pre_cutover_ledger_sha, expiry_sha256: cutResult.expiry_sha256,
+      pending_claims_sha256: cutResult.pending_claims_sha256, policy_sha256: cutResult.policy_sha256,
+    } }],
     mutate: (currentDoc) => {
       if (currentDoc === null) return { ok: false, reason: "absent", why: "账本缺席" };
       if (currentDoc.authority_mode !== "shadow") return { ok: false, reason: "mode_not_shadow" };

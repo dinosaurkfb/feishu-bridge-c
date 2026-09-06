@@ -97,6 +97,9 @@ import {
   validateCodexTemplate, validateRegistryTasks, writeRegistryFixtureUnvalidated,
 } from "./state.mjs";
 import { collectCodexLegacySnapshot } from "../m1a/legacy-snapshot.mjs";
+import { legacyEndpointId } from "../subscription.mjs";
+import { endpointReceipt } from "../maintenance/ledger-receipt.mjs";
+import * as TAL from "../topic-agent-ledger.mjs";
 import {
   ROTATION_STATUS, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, TOPIC_GENERATION_CLAIM_REMINDER_AFTER_MS,
   TOPIC_GENERATION_CLAIM_REMINDER_REPEAT_MS, activeGeneration, pendingGeneration,
@@ -548,6 +551,38 @@ function autoPublishFixture({ enabled = true, workingPublisher = true } = {}) {
   writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   return { home, root, task, bin, argsFile };
 }
+
+// #R37 P1-2 ①/②测试场地：构造「M1a 已启用」的 codex 端点（收据 ok + shadow 初始账本），
+// 使 runWired 走双写路径而非 never_initialized（legacy-only）。
+const seedM1aEndpoint = ({ home, chain = "codex" }) => {
+  // macOS 下 /var 是指向 /private/var 的 symlink：m1a 锁根要求 canonical（父链无别名），
+  // 故用 realpathSync 把 mkdtemp 底座解析到 /private/var/...，否则 acquireOrderLock 报 root_not_canonical。
+  const canon = fs.realpathSync(home);
+  const maintDir = path.join(canon, ".maint");
+  const ledgerRoot = path.join(canon, ".ledger");
+  const ep = legacyEndpointId({ runtime: chain, agentUid: TEMPLATE.agent_uid });
+  const tok = "bb88666e-d8d3-48ba-914e-7f96f4dfaebb";
+  const at = "2026-08-31T12:00:00.000Z";
+  const sha = "b".repeat(64);
+  const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+  const timerDone = (ch) => ({ id: "timer:" + ch, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+  const stubDone = (ch) => ({ id: "stub:" + ch, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+  const curDone = (ch) => ({ id: "current:" + ch, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+  const gateDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+  const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+  const ledgerStep = { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState, after: afterState, state: "done", at, chain };
+  fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+  const doc = { schema_version: "1.2", operation_kind: "ledger_init", token: tok, reason: "seed 收据", started_at: at, updated_at: at, phase: "done", steps: [timerDone("claude"), timerDone("codex"), stubDone("claude"), stubDone("codex"), curDone("claude"), curDone("codex"), gateDone(), ledgerStep], notes: [] };
+  fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(doc), { mode: 0o600 });
+  assert.equal(endpointReceipt(maintDir, ep).state, "ok", "seed 的 ledger_init 收据应判 ok（M1a 已启用）");
+  // shadow 初始账本：收据 ok 但账本缺席 → runWired fail-closed not_committed，故必须预建。
+  fs.mkdirSync(path.join(ledgerRoot, ep), { recursive: true, mode: 0o700 });
+  const opId = "00000000-0000-0000-0000-000000000001";
+  const ledger = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: ep, chain, authority_mode: "shadow", revision: 1, operations: { [opId]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: ep, chain }), result_revision: 1, result: { revision: 1 } } }, records: {} };
+  fs.writeFileSync(path.join(ledgerRoot, ep, "ledger.json"), JSON.stringify(ledger, null, 2) + "\n", { mode: 0o600 });
+  assert.ok(TAL.loadLedger(path.join(ledgerRoot, ep), { endpointId: ep }).ok, "seed 的初始账本自洽");
+  return { maintDir, ledgerRoot, ep };
+};
 
 test("thread id 只接受精确 UUID，不接受 --last 或名字", () => {
   assert.equal(validThreadId(THREAD_A), true);
@@ -1505,6 +1540,33 @@ test("P1-2 ③ agent_uid 取不到 → 拒绝绕过一致性锁（fail-closed）
   assert.notEqual(paused.status, 0, "当前代码静默回落 legacy（status 0）—— 期望 fail-closed 非零");
   assert.match(paused.stderr + paused.stdout, /agent_uid/u);
   assert.equal(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task.status, "active", "fail-closed 不应改连接状态");
+});
+
+test("P1-2 ① codex 轮转创建亦过 M1a 锁：落 create_b1 影像（#R37）", () => {
+  // 现状：codex 轮转创建只走 legacy（prepare/sendToChat/register），完全没碰 shadow 账本。
+  // 期望：在 m1a-order 锁内额外落 create_b1 影像。
+  const { home, root, task } = autoPublishFixture();
+  const promoted = promoteTask({
+    logicalTaskKey: task.logical_task_key,
+    generationId: task.channel_generation_id,
+    sessionId: "session_bound",
+    home, now: 1100,
+  });
+  assert.equal(promoted.ok, true, "promoteTask：" + JSON.stringify(promoted));
+  const { maintDir, ledgerRoot, ep } = seedM1aEndpoint({ home });
+  const cli = path.join(ROOT, "scripts", "codex", "feishu-rotate.mjs");
+  const run = spawnSync(process.execPath, [cli,
+    "--project", root, "--thread-id", THREAD_A, "--apply",
+    ...withIntent("rotate", THREAD_A, home, { op: "create" }),
+  ], { encoding: "utf-8",
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+      FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot } });
+  assert.equal(run.status, 0, run.stderr);
+  const loaded = TAL.loadLedger(path.join(ledgerRoot, ep), { endpointId: ep });
+  assert.ok(loaded.ok, "loadLedger：" + JSON.stringify(loaded));
+  const b1 = Object.entries(loaded.doc.records)
+    .filter(([, r]) => r.kind === "live" && TAL.familyOf(r.facts) === "B1");
+  assert.ok(b1.length >= 1, "轮转创建应在 shadow 账本落 create_b1 影像（当前实现漏写）");
 });
 
 test("outbox 按事件键而非正文去重", () => {

@@ -31,8 +31,11 @@ import { acquireLockUngated, commitWhileHeld, releasePublishLock } from "../regi
 const sha256Hex = (buf) => createHash("sha256").update(buf).digest("hex");
 const errCodeOf = (err) => String(err?.code ?? err?.message ?? err);
 
-/** sidecar 现场受验读：O_NOFOLLOW、普通文件、单硬链接、0600（异常形状按 corrupt 处理，不走 before 分支）。 */
-export function readSidecarCurrent(file) {
+/** sidecar 现场受验读：O_NOFOLLOW、普通文件、单硬链接、0600、≤maxBytes（异常形状按 problem 处理，不走 before 分支）。
+ *  R45 二轮 P1-5：唯一受验 sidecar 读取器 —— 上限内才 alloc，不无界读；返回带 buf 供 staging 备份复用，
+ *  不再把 FIFO 当空文件、多硬链接/超限文件当普通文件读。 */
+export const SIDECAR_READ_MAX_BYTES = 1024 * 1024; // 与 staged blob 上限同源（S1/M1b 侧 ≤1MiB）
+export function readSidecarCurrent(file, { maxBytes = SIDECAR_READ_MAX_BYTES } = {}) {
   let fd = null;
   try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); } catch (err) {
     if (err?.code === "ENOENT") return { present: false };
@@ -41,22 +44,26 @@ export function readSidecarCurrent(file) {
   try {
     const st = fs.fstatSync(fd);
     if (!st.isFile() || st.nlink !== 1 || (st.mode & 0o777) !== 0o600) return { present: true, problem: "形状异常（非普通文件/硬链接≠1/mode≠0600）" };
+    if (st.size > maxBytes) return { present: true, problem: "超限（" + st.size + " > " + maxBytes + " 字节）" };
     const buf = Buffer.alloc(st.size);
     let off = 0;
     while (off < st.size) { const n = fs.readSync(fd, buf, off, st.size - off, off); if (n <= 0) return { present: true, problem: "读不满" }; off += n; }
-    return { present: true, sha256: sha256Hex(buf) };
+    return { present: true, sha256: sha256Hex(buf), buf };
   } catch (err) { return { present: true, problem: err?.code ?? "EIO" }; }
   finally { try { fs.closeSync(fd); } catch { /* 已关 */ } }
 }
 
-/** P1-1 三绑定（active / lease / 门）：写前在 sidecar 文件锁内核，任一不活都拒。 */
+/** P1-1 三绑定（active / lease / 门）：写前在 sidecar 文件锁内核，任一不活都拒。
+ *  R45 二轮 P1-3①：lease 复验走对象返回（carryReapResidue 只对 object 生效），reapUncleared 丢不得——
+ *  reap 交不还是现场没清干净，不能当「lease 仍被自己持有」继续写。 */
 function verifyOpBindings({ dir, token, lease, gateFile, now }) {
   const act = readActive({ dir });
   if (act.state !== "active" || act.token !== token) {
     return { ok: false, reason: "op_not_active", why: act.state === "active" ? "active 指向别的 operation" : "active " + act.state + (act.why ? "（" + act.why + "）" : "") };
   }
-  const held = commitWhileHeld(lease.path, () => true, { waitMs: 0 });
+  const held = commitWhileHeld(lease.path, () => ({ ok: true }), { waitMs: 0 });
   if (held.ok !== true) return { ok: false, reason: "lease_not_held", why: "operation lease 不在本进程手里（" + String(held.reason ?? "lost") + "）" };
+  if (held.reapUncleared) return { ok: false, reason: "lease_not_held", why: "lease 锁 .reap 交不还（reap_uncleared：" + String(held.reapUncleared.error ?? "") + "）——现场清理未完成，不装干净" };
   const g = readGate({ file: gateFile, now });
   if (g.state !== "active" || g.payload?.token !== token) {
     return { ok: false, reason: "gate_not_active", why: "维护门 " + g.state + (g.why ? "（" + g.why + "）" : "") };
@@ -94,69 +101,82 @@ export function writeSidecarPrepared({ dir, token, lease, gateFile, endpointId, 
   const lock = acquireLockUngated(lockDir, { reapUnrecognized: false, now });
   if (lock.ok !== true) return { ok: false, reason: "sidecar_lock_busy", why: lock.reason };
 
-  // P1-2 释放折叠：锁内全部逻辑收进 writeLocked（正常返回 / 抛错都保证交锁），释放失败折进返回值。
+  // P1-2/R45 二轮 P1-2：锁内全部逻辑收进 writeLocked，再整体进 fenced commit（commitWhileHeld）——
   const writeLocked = () => {
     const bind = verifyOpBindings({ dir, token, lease, gateFile, now });
     if (bind.ok !== true) return bind;
-    const cur = readSidecarCurrent(target);
-    // 恢复三分
-    if (cur.present && cur.problem === undefined && cur.sha256 === step.intended_after.sha256) {
-      // 现场已是目标态：只补 done（幂等），不重写
+    // R45 二轮 P1-4：写路径异常折结构化返回（sidecar_write_failed），不再裸抛炸穿调用方；
+    // written 以现场实际状态重验（rename 落了就是 true，不猜）。
+    try {
+      const cur = readSidecarCurrent(target);
+      // 恢复三分
+      if (cur.present && cur.problem === undefined && cur.sha256 === step.intended_after.sha256) {
+        // 现场已是目标态：只补 done（幂等），不重写
+        const d = markStepDone({ dir, token, lease, id: step.id, after: step.intended_after, now });
+        if (d?.ok !== true) return { ok: false, reason: d?.reason ?? "journal_conflict", why: d?.why ?? null };
+        return { ok: true, written: false, recovered: true };
+      }
+      const before = step.before ?? { exists: false, sha256: null };
+      const matchesBefore = cur.present
+        ? (cur.problem === undefined && before.exists === true && before.sha256 !== null && cur.sha256 === before.sha256)
+        : before.exists === false;
+      if (matchesBefore !== true) {
+        return { ok: false, reason: "sidecar_corrupt", why: cur.present ? (cur.problem ?? "现场 SHA 既不是 intended 也不是 before") : "现场缺席但 before 存在" };
+      }
+      // P1-5：覆盖既有 sidecar 前必须核备份——journal 锚受验读 + 内容 SHA 等于 before 现场 SHA。
+      if (before.exists === true) {
+        const bk = readStagedVerified(step.backup, { sha256: step.backup_sha256, bytes: step.backup_bytes ?? null });
+        if (bk.ok !== true) return { ok: false, reason: "sidecar_backup_mismatch", why: "备份受验读失败：" + (bk.why ?? "") };
+        if (sha256Hex(bk.buf) !== before.sha256) return { ok: false, reason: "sidecar_backup_mismatch", why: "备份内容不是 before 现场" };
+      }
+      // fenced commit
+      const tmp = path.join(ledgerDir, "." + name + "." + process.pid + "." + crypto.randomUUID() + ".tmp");
+      const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+      try { fs.writeFileSync(fd, blob.buf); fs.fsyncSync(fd); } catch (err) { try { fs.closeSync(fd); } catch { /* 已关 */ } try { fs.unlinkSync(tmp); } catch { /* 留给人 */ } throw err; }
+      fs.closeSync(fd);
+      try { fs.renameSync(tmp, target); } catch (err) { try { fs.unlinkSync(tmp); } catch { /* 留给人 */ } throw err; }
+      // 目录 fsync（P1-2）：EINVAL/ENOTSUP/EOPNOTSUPP 是文件系统不支持目录 fsync（可容忍）；其它失败折进返回值。
+      // rename 已原子，现场已是目标态；写 written:true 让调用方知道下次重跑走「已是目标态 → 补 done」分支。
+      let dfd = null;
+      try { dfd = fs.openSync(ledgerDir, fs.constants.O_RDONLY); fs.fsyncSync(dfd); } catch (err) {
+        if (!dirFsyncIgnorable(err?.code)) return { ok: false, reason: "sidecar_dir_fsync", why: errCodeOf(err), written: true };
+      }
+      finally { if (dfd !== null) { try { fs.closeSync(dfd); } catch { /* 已关 */ } } }
+      // 写后读回核
+      const back = readSidecarCurrent(target);
+      if (back.present !== true || back.problem !== undefined || back.sha256 !== step.intended_after.sha256) {
+        return { ok: false, reason: "sidecar_corrupt", why: "写后读回核失败", written: true };
+      }
       const d = markStepDone({ dir, token, lease, id: step.id, after: step.intended_after, now });
-      if (d?.ok !== true) return { ok: false, reason: d?.reason ?? "journal_conflict", why: d?.why ?? null };
-      return { ok: true, written: false, recovered: true };
+      if (d?.ok !== true) return { ok: false, reason: d?.reason ?? "journal_conflict", why: d?.why ?? null, written: true };
+      return { ok: true, written: true };
+    } catch (err) {
+      const now45 = readSidecarCurrent(target);
+      const landed = now45.present === true && now45.problem === undefined && now45.sha256 === step.intended_after.sha256;
+      return { ok: false, reason: "sidecar_write_failed", why: errCodeOf(err), written: landed };
     }
-    const before = step.before ?? { exists: false, sha256: null };
-    const matchesBefore = cur.present
-      ? (cur.problem === undefined && before.exists === true && before.sha256 !== null && cur.sha256 === before.sha256)
-      : before.exists === false;
-    if (matchesBefore !== true) {
-      return { ok: false, reason: "sidecar_corrupt", why: cur.present ? (cur.problem ?? "现场 SHA 既不是 intended 也不是 before") : "现场缺席但 before 存在" };
-    }
-    // P1-5：覆盖既有 sidecar 前必须核备份——journal 锚受验读 + 内容 SHA 等于 before 现场 SHA。
-    if (before.exists === true) {
-      const bk = readStagedVerified(step.backup, { sha256: step.backup_sha256, bytes: step.backup_bytes ?? null });
-      if (bk.ok !== true) return { ok: false, reason: "sidecar_backup_mismatch", why: "备份受验读失败：" + (bk.why ?? "") };
-      if (sha256Hex(bk.buf) !== before.sha256) return { ok: false, reason: "sidecar_backup_mismatch", why: "备份内容不是 before 现场" };
-    }
-    // fenced commit
-    const tmp = path.join(ledgerDir, "." + name + "." + process.pid + "." + crypto.randomUUID() + ".tmp");
-    const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
-    try { fs.writeFileSync(fd, blob.buf); fs.fsyncSync(fd); } catch (err) { try { fs.closeSync(fd); } catch { /* 已关 */ } try { fs.unlinkSync(tmp); } catch { /* 留给人 */ } throw err; }
-    fs.closeSync(fd);
-    try { fs.renameSync(tmp, target); } catch (err) { try { fs.unlinkSync(tmp); } catch { /* 留给人 */ } throw err; }
-    // 目录 fsync（P1-2）：EINVAL/ENOTSUP/EOPNOTSUPP 是文件系统不支持目录 fsync（可容忍）；其它失败折进返回值。
-    // rename 已原子，现场已是目标态；写 written:true 让调用方知道下次重跑走「已是目标态 → 补 done」分支。
-    let dfd = null;
-    try { dfd = fs.openSync(ledgerDir, fs.constants.O_RDONLY); fs.fsyncSync(dfd); } catch (err) {
-      if (!dirFsyncIgnorable(err?.code)) return { ok: false, reason: "sidecar_dir_fsync", why: errCodeOf(err), written: true };
-    }
-    finally { if (dfd !== null) { try { fs.closeSync(dfd); } catch { /* 已关 */ } } }
-    // 写后读回核
-    const back = readSidecarCurrent(target);
-    if (back.present !== true || back.problem !== undefined || back.sha256 !== step.intended_after.sha256) {
-      return { ok: false, reason: "sidecar_corrupt", why: "写后读回核失败", written: true };
-    }
-    const d = markStepDone({ dir, token, lease, id: step.id, after: step.intended_after, now });
-    if (d?.ok !== true) return { ok: false, reason: d?.reason ?? "journal_conflict", why: d?.why ?? null, written: true };
-    return { ok: true, written: true };
   };
 
-  let inner;
-  try {
-    inner = writeLocked();
-  } catch (err) {
+  // R45 二轮 P1-2：取锁后锁内重读现场、fenced 写——整段进 commitWhileHeld；锁被接管（lock_lost）后
+  // 旧 writer 晚到也写不进新现场。P1-3：锁残骸分类——fence 段 .reap 交不还 → sidecar_lock_residue；
+  // 释放支 absent（锁早没了）与 reapUncleared 都不算交清 → sidecar_lock_release_failed + releaseResidue。
+  const fenced = commitWhileHeld(lockDir, writeLocked, { waitMs: 0 });
+  if (fenced.ok !== true) {
     const rel = releasePublishLock(lockDir, { expectedToken: lock.token });
-    if (rel.ok !== true) {
-      console.error(JSON.stringify({ level: "error", where: "sidecar-writer", op: "release-after-throw", lock: lockDir, reason: rel.reason }));
-    }
-    throw err;
+    return { ok: false, reason: "sidecar_lock_lost", why: String(fenced.reason ?? "lock_lost"), written: false,
+      release: rel.ok === true ? null : String(rel.reason ?? "release_publish_lock") };
+  }
+  if (fenced.reapUncleared) {
+    return { ok: false, reason: "sidecar_lock_residue", written: fenced.run?.written === true,
+      residue: { path: fenced.reapUncleared.path ?? null, error: String(fenced.reapUncleared.error ?? "") } };
   }
   const rel = releasePublishLock(lockDir, { expectedToken: lock.token });
-  if (rel.ok !== true) {
-    // P1-2 释放失败 fail-closed：锁留给陈旧回收，并折进返回值（调用方必须停，不静默吞）。
-    console.error(JSON.stringify({ level: "error", where: "sidecar-writer", op: "release", lock: lockDir, reason: rel.reason }));
-    return { ok: false, reason: "sidecar_lock_release_failed", why: String(rel.reason ?? "release_publish_lock"), written: inner.written === true };
+  const residue = rel.ok !== true ? String(rel.reason ?? "release_publish_lock") : rel.absent === true ? "absent" : rel.reapUncleared ? "reap_uncleared" : null;
+  if (residue !== null) {
+    // P1-3② fail-closed：不假装交清，残骸留给陈旧回收，并结构化带出路径与错误。
+    console.error(JSON.stringify({ level: "error", where: "sidecar-writer", op: "release", lock: lockDir, reason: residue }));
+    return { ok: false, reason: "sidecar_lock_release_failed", why: residue, written: fenced.run?.written === true,
+      releaseResidue: { absent: rel.absent === true, reapUncleared: rel.reapUncleared ?? null } };
   }
-  return inner;
+  return fenced.run;
 }

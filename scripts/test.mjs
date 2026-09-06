@@ -23553,7 +23553,8 @@ test("维护门（issue #81 · PR A）：三态读门只认 ENOENT 为没门，�
   assert.equal(removeGate({ file: gateFile, token: readGate({ file: gateFile }).payload.token }).removed, true);
   withGate(() => {
     const off = runDoctor({ home: local }).checks.find((c) => c.id === "maintenance_gate");
-    assert.deepEqual([off.ok, off.detail], [true, "没开"]);
+    // R47：真机维护目录里的已终结 journal 是合法审计存档，detail 可能带审计/可清理注记 —— 只锁前缀与 ok，不锁全文
+    assert.deepEqual([off.ok, /^没开/u.test(off.detail)], [true, true], JSON.stringify(off));
     assert.equal(maintenanceGateText(readGate()), "没开");
     fs.mkdirSync(gateFile);
     const bad = runDoctor({ home: local }).checks.find((c) => c.id === "maintenance_gate");
@@ -23565,6 +23566,112 @@ test("维护门（issue #81 · PR A）：三态读门只认 ENOENT 为没门，�
   // 默认路径由真实用户 home 推导，不跟会话 HOME 走
   const defaultPath = spawnSync(process.execPath, ["-e", 'import("./scripts/maintenance-gate-core.mjs").then((m) => process.stdout.write(m.maintenanceGatePath({})))'], { encoding: "utf-8", env: { ...process.env, HOME: local } }).stdout;
   assert.equal(defaultPath, path.join(os.userInfo().homedir, ".claude", "feishu-bridge", "maintenance.gate"), "会话 HOME 改了也不动：" + defaultPath);
+});
+
+test("R47 doctor ⑩ 三分类：已终结 journal=审计不染红不 block；终结 op 的 plist 备份=可清理不 block；孤儿/坏 journal/active 指丢仍 block（判据逐字段，不看文件名）", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "r47-"));
+  const dir = path.join(base, "maintenance");
+  fs.mkdirSync(dir, { recursive: true });
+  const saved = process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
+  process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = dir;
+  const at = "2026-09-06T12:00:00.000Z";
+  const shaOf = (buf) => createHash("sha256").update(buf).digest("hex");
+  const mkJ = (token, kind, phase, steps = []) => fs.writeFileSync(path.join(dir, token + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: kind, phase, reason: "r", started_at: at, updated_at: at, steps, notes: [], token }));
+  const timerStep = (chain, backup, sha, bytes) => ({ id: "timer:" + chain, kind: "timer", target: "gui/501/r47." + chain, before: { phase: "loaded", plist: "/Library/LaunchAgents/r47." + chain + ".plist" }, intended_after: { phase: "absent" }, after: { phase: "absent" }, backup, backup_sha256: sha, backup_bytes: bytes, chain: null, state: "done", at });
+  const T1 = "aaaaaaa1-2222-4333-8444-555555555555", T2 = "b6ffffff-2222-4333-8444-555555555555", T3 = "c7aaaaaa-3333-4222-9333-444444444444", T4 = "d8bbbbbb-4444-4333-8555-666666666666", T5 = "e9cccccc-5555-4333-8666-777777777777";
+  try {
+    // ① 照真机形状（a3544f33=install/done、32926c49=init/rolled_back）：手写取两个轻量合法终态 journal（rolled_back 在 PHASE_REQUIRES 无 step 要求）；
+    //    install/done 的端到端由三只读真机测试（doctor 好机器/⑫/维护门）读真机 a3544f33 恢复绿来证
+    const bytes1 = Buffer.from("plist-claude-backup\n"), bytes2 = Buffer.from("plist-codex-backup\n");
+    mkJ(T1, "maintenance_gate", "rolled_back", [timerStep("claude", path.join(dir, T1 + ".claude.plist"), shaOf(bytes1), bytes1.length)]);
+    mkJ(T2, "ledger_init", "rolled_back", [timerStep("codex", path.join(dir, T2 + ".codex.plist"), shaOf(bytes2), bytes2.length)]);
+    // ② 同两 operation 的 plist 定时器备份 —— 可清理；R47 返修 P1-3：可清理必须逐字段核 backup 关联
+    //    （plist 真实文件 + journal 有 timer step + step.backup 精确指向本文件 + 字节 SHA/长度受验一致，不再是任意文件+空 steps）
+    fs.writeFileSync(path.join(dir, T1 + ".claude.plist"), Buffer.from("plist-claude-backup\n")); fs.writeFileSync(path.join(dir, T2 + ".codex.plist"), Buffer.from("plist-codex-backup\n"));
+    const insp = inspectMaintenanceDir({ dir });
+    assert.deepEqual(insp.residues, [], "①② 不染红（基线把审计当残骸只人工处置）：" + JSON.stringify(insp.residues));
+    assert.deepEqual([insp.audits?.length, insp.cleanables?.length], [2, 2], "审计 2 + 可清理 2：" + JSON.stringify([insp.audits, insp.cleanables]));
+    assert.deepEqual(insp.audits.map((a) => a.operation_kind + "/" + a.phase).sort(), ["ledger_init/rolled_back", "maintenance_gate/rolled_back"], "审计条目逐字段（operation_kind/phase），非文件名猜：" + JSON.stringify(insp.audits));
+    assert.deepEqual(insp.cleanables.map((c) => c.token).sort(), [T1, T2], "可清理逐 token：" + JSON.stringify(insp.cleanables));
+    assert.ok(insp.cleanables.every((c) => /删|清/.test(c.detail)), "可清理条目带清理指路：" + JSON.stringify(insp.cleanables));
+    const gate = runDoctor({ home: base }).checks.find((c) => c.id === "maintenance_gate");
+    assert.equal(gate.ok, true, "①② 不 block doctor ⑩：" + gate.detail);
+    assert.match(gate.detail, /审计 journal 2 份/u, gate.detail); assert.match(gate.detail, /可清理残骸 2 处/u, gate.detail);
+    // ③ 真异常全保留：in-flight 无 active（孤儿）、schema 坏、active 指向缺失 —— 仍 block
+    mkJ(T3, "maintenance_install", "planned");
+    const insp2 = inspectMaintenanceDir({ dir });
+    assert.ok(insp2.residues.some((r) => r.kind === "orphan_journal" && r.path.includes(T3)), "in-flight 无 active → 仍 block：" + JSON.stringify(insp2.residues));
+    fs.writeFileSync(path.join(dir, T4 + ".json"), "{ 坏");
+    const insp3 = inspectMaintenanceDir({ dir });
+    assert.ok(insp3.residues.some((r) => r.kind === "orphan_journal" && r.path.includes(T4)), "schema 坏 → 仍 block：" + JSON.stringify(insp3.residues));
+    fs.symlinkSync(T5, path.join(dir, "active"));
+    const insp4 = inspectMaintenanceDir({ dir });
+    assert.ok(insp4.residues.some((r) => r.kind === "active_journal_missing" && r.path.includes(T5)), "active 指向缺失 → 仍 block：" + JSON.stringify(insp4.residues));
+    const gate2 = runDoctor({ home: base }).checks.find((c) => c.id === "maintenance_gate");
+    assert.equal(gate2.ok, false, "孤儿在场 doctor ⑩ 仍 block：" + gate2.detail);
+    fs.unlinkSync(path.join(dir, "active"));
+  } finally {
+    if (saved === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = saved;
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("R47 返修（评审 3×P1）：文件名 token 绑定下沉 readJournal；active 两异常分别成 active_unreadable / terminal_active_not_cleared；plist 可清理逐字段核 backup 关联（判据不看文件名）", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "r47r-"));
+  const saved = process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
+  delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
+  const at = "2026-09-06T12:00:00.000Z";
+  const shaOf = (buf) => createHash("sha256").update(buf).digest("hex");
+  const mkJ = (dir, fileToken, doc) => fs.writeFileSync(path.join(dir, fileToken + ".json"), JSON.stringify(doc));
+  const mkDoc = (token, kind, phase, steps = []) => ({ schema_version: "1.2", operation_kind: kind, phase, reason: "r", started_at: at, updated_at: at, steps, notes: [], token });
+  const timerStep = (chain, backup, sha, bytes) => ({ id: "timer:" + chain, kind: "timer", target: "gui/501/r47r." + chain, before: { phase: "loaded", plist: "/Library/LaunchAgents/r47r." + chain + ".plist" }, intended_after: { phase: "absent" }, after: { phase: "absent" }, backup, backup_sha256: sha, backup_bytes: bytes, chain: null, state: "done", at });
+  const mkSub = (name) => { const d = path.join(base, name); fs.mkdirSync(d, { recursive: true }); return d; };
+  try {
+    // P1-1：文件名 token=A 正文 token=B（正文对 B 是合法 rolled_back journal）→ 不得当审计，标问题
+    const d1 = mkSub("p11"); const TA = "1a111111-1111-4111-8111-111111111111", TB = "1b222222-2222-4222-9222-222222222222";
+    mkJ(d1, TA, mkDoc(TB, "maintenance_gate", "rolled_back"));
+    const j1 = readJournal({ dir: d1, token: TA });
+    assert.equal(j1.state, "unreadable", "readJournal 绑定文件名 token：" + JSON.stringify({ state: j1.state, why: j1.why, docToken: j1.doc?.token }));
+    const i1 = inspectMaintenanceDir({ dir: d1 });
+    assert.deepEqual(i1.audits, [], "名内 token 不符 → 不当审计：" + JSON.stringify(i1.audits));
+    assert.ok(i1.residues.some((r) => r.path.includes(TA) && /token/.test(r.detail)), "对不上就标问题：" + JSON.stringify(i1.residues));
+
+    // P1-2①：active 指针读不出（指向非 token）→ active_unreadable，不再折成「没开 active」的干净态
+    const d2 = mkSub("p12a"); const TC = "2c333333-3333-4333-8333-333333333333";
+    mkJ(d2, TC, mkDoc(TC, "maintenance_gate", "rolled_back"));
+    fs.symlinkSync("junk", path.join(d2, "active"));
+    const i2 = inspectMaintenanceDir({ dir: d2 });
+    assert.ok(i2.residues.some((r) => r.kind === "active_unreadable" && r.path.endsWith("active")), "active 读不出 → 残骸：" + JSON.stringify(i2.residues));
+
+    // P1-2②：终态先落、active 未清 → terminal_active_not_cleared，指路 --exit --apply（与状态页同款）
+    const d3 = mkSub("p12b"); const TD = "3d444444-4444-4444-8444-444444444444";
+    mkJ(d3, TD, mkDoc(TD, "maintenance_gate", "rolled_back"));
+    fs.symlinkSync(TD, path.join(d3, "active"));
+    const i3 = inspectMaintenanceDir({ dir: d3 });
+    assert.ok(i3.residues.some((r) => r.kind === "terminal_active_not_cleared" && /--exit --apply/.test(r.detail)), "终结未清指针 → 残骸带指路：" + JSON.stringify(i3.residues));
+
+    // P1-3：可清理四核（token 绑定 / timer step / backup 精确路径 / 字节 SHA-长度受验），任一不符不得进 cleanables、进 residues
+    const d4 = mkSub("p13"); const realP = path.join(base, "real.plist"); fs.writeFileSync(realP, "real-bytes");
+    const TE = "4e555555-5555-4555-8555-555555555555", TF = "5f666666-6666-4666-9666-666666666666", TG = "6a777777-7777-4777-8777-777777777777", TH = "7b888888-8888-4888-9888-888888888888";
+    // 支A 外指 symlink：journal 完美对上（timer backup 指本文件、SHA/长度按目标真实字节）也必须拒 —— 文件本身得是受验普通文件
+    fs.symlinkSync(realP, path.join(d4, TE + ".claude.plist"));
+    mkJ(d4, TE, mkDoc(TE, "maintenance_gate", "rolled_back", [timerStep("claude", path.join(d4, TE + ".claude.plist"), shaOf(Buffer.from("real-bytes")), 10)]));
+    // 支B 无 timer step
+    fs.writeFileSync(path.join(d4, TF + ".claude.plist"), "x");
+    mkJ(d4, TF, mkDoc(TF, "maintenance_gate", "rolled_back"));
+    // 支C timer backup 指向别处
+    fs.writeFileSync(path.join(d4, TG + ".claude.plist"), "x");
+    mkJ(d4, TG, mkDoc(TG, "maintenance_gate", "rolled_back", [timerStep("claude", path.join(base, "elsewhere.plist"), shaOf(Buffer.from("x")), 1)]));
+    // 支D 字节不符（SHA 乱填）
+    fs.writeFileSync(path.join(d4, TH + ".claude.plist"), "y");
+    mkJ(d4, TH, mkDoc(TH, "maintenance_gate", "rolled_back", [timerStep("claude", path.join(d4, TH + ".claude.plist"), "f".repeat(64), 1)]));
+    const i4 = inspectMaintenanceDir({ dir: d4 });
+    assert.deepEqual(i4.cleanables, [], "四支全不得进可清理：" + JSON.stringify(i4.cleanables));
+    for (const t of [TE, TF, TG, TH]) assert.ok(i4.residues.some((r) => r.path.includes(t)), "不符各支标问题 " + t.slice(0, 8) + "：" + JSON.stringify(i4.residues));
+    fs.rmSync(base, { recursive: true, force: true });
+  } finally {
+    if (saved === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = saved;
+  }
 });
 
 test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据三态 / 合并 / 对账，runtime stage 不切 current、activate 只切已验目录，入口清单不缺且盖住线上引用", () => {
@@ -24215,7 +24322,7 @@ test("维护门 · PR C 单元：journal 三态与两阶段、active 只许一�
   const mdir = inspectMaintenanceDir({ dir: dir2 });
   assert.deepEqual([mdir.inventory, mdir.residues.map((r) => r.kind).sort()], ["ok", ["lease_lock_residue", "orphan_journal", "stale_backup", "stale_lease", "tmp", "unknown"]], JSON.stringify(mdir.residues.map((r) => r.kind + " " + path.basename(r.path))));
   assert.ok(mdir.residues.find((r) => r.kind === "orphan_journal").detail.includes("阶段 planned"));
-  assert.deepEqual(inspectMaintenanceDir({ dir: path.join(base, "nope") }), { inventory: "ok", residues: [] }, "目录不存在 = 没有残骸");
+  assert.deepEqual(inspectMaintenanceDir({ dir: path.join(base, "nope") }), { inventory: "ok", residues: [], audits: [], cleanables: [] }, "目录不存在 = 没有残骸");
   assert.deepEqual([parseMaintenanceGateArgs(["--enter", "--reason", "a", "--reason", "b"]).ok, parseMaintenanceGateArgs(["--status", "--apply"]).ok, parseMaintenanceGateArgs(["--exit", "--reason", "x"]).ok, parseMaintenanceGateArgs(["--enter", "--reason", "r", "--wait-ms", "-1"]).ok, parseMaintenanceGateArgs(["--enter", "--reason", "r", "--apply", "--apply"]).ok], [false, false, false, false, false], "参数封闭");
   releaseOperationLease(op.lease);
   fs.writeFileSync(path.join(dir, op.token + ".json"), "{ 坏");

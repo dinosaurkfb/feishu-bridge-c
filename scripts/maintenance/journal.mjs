@@ -477,8 +477,12 @@ export function readJournal({ dir, token } = {}) {
   if (r.status !== "read") return { state: "unreadable", why: r.why };
   let doc;
   try { doc = JSON.parse(r.buf.toString("utf-8")); } catch (err) { return { state: "unreadable", why: "不是 JSON：" + errCode(err) }; }
+  // R47 返修 P1-1：token 绑定下沉到唯一读入口 —— 文档内 token 必须与参数（文件名/active 指向）一致，
+  // audit / active / plist 三个消费面统一被护，不再可能凭文件名把 B 的 journal 认成 A 的
   const problem = journalProblem(doc, { maintenanceDir: dir });
-  return problem === null ? { state: "valid", doc } : { state: "unreadable", why: "形状不对：" + problem };
+  if (problem !== null) return { state: "unreadable", why: "形状不对：" + problem };
+  if (doc.token !== token) return { state: "unreadable", why: "token 与文件名/参数不符（文档内 " + String(doc.token).slice(0, 8) + " ≠ " + String(token).slice(0, 8) + "）" };
+  return { state: "valid", doc };
 }
 
 // ── 写 ───────────────────────────────────────────────────────────────────────
@@ -671,26 +675,73 @@ export function isLedgerReceipt(doc) {
     && (doc.operation_kind === "ledger_init" || doc.operation_kind === "ledger_cutover")
     && doc.phase === "done";
 }
+/**
+ * R47 三分类（doctor ⑩）：residues 只剩真异常/说不清（block）；audits=已终结 operation 的合法审计存档；cleanables=可证明已终结的 plist 备份（可清理，不 block）。
+ * 判据逐字段不看文件名：journal 必须 readJournal 认可（schema/字段集/阶段×kind 封闭）且 phase ∈ TERMINAL_PHASES 且无 active 指向 → 审计；
+ * plist 备份须对上同 token 的已终结 journal 才算可清理，对不上（in-flight/读不出/缺席）保守当残骸。active 指向的 journal 缺失/坏 = 状态指针悬空，也是真异常。
+ * 只报告，不清理（能证明是输家的才该按受控协议清，这里不猜）。
+ */
 export function inspectMaintenanceDir({ dir } = {}) {
-  const residues = [];
-  if (typeof dir !== "string" || dir.length === 0) return { inventory: "unknown", residues };
+  const residues = [], audits = [], cleanables = [];
+  if (typeof dir !== "string" || dir.length === 0) return { inventory: "unknown", residues, audits, cleanables };
   let names;
-  try { names = fs.readdirSync(dir); } catch (err) { return err?.code === "ENOENT" ? { inventory: "ok", residues } : { inventory: "unreadable", residues: [{ path: dir, kind: "inventory", detail: "目录读不出：" + errCode(err) }] }; }
+  try { names = fs.readdirSync(dir); } catch (err) { return err?.code === "ENOENT" ? { inventory: "ok", residues, audits, cleanables } : { inventory: "unreadable", residues: [{ path: dir, kind: "inventory", detail: "目录读不出：" + errCode(err) }], audits, cleanables } }
   const active = readActive({ dir });
+  // R47 返修 P1-2：active 指针自身读不出（指向非 token / 不是 symlink / readlink 失败）不得折成「没开 active」的干净态
+  if (active.state === "unreadable") residues.push({ path: activePath(dir), kind: "active_unreadable", detail: "active 指针读不出（" + String(active.why) + "）—— 每个新 operation 都会被它挡住，只人工处置" });
   const activeToken = active.state === "active" ? active.token : null;
   for (const n of names.sort()) {
     const full = path.join(dir, n);
     if (n === "active") continue;
     let m;
-    if ((m = /^([0-9a-f-]{36})\.json$/u.exec(n)) && UUID_SHAPE.test(m[1])) { if (m[1] !== activeToken) { const j = readJournal({ dir, token: m[1] }); if (j.state === "valid" && isLedgerReceipt(j.doc)) continue; residues.push({ path: full, kind: "orphan_journal", detail: j.state === "valid" ? "没有 active 指向的 journal（阶段 " + j.doc.phase + "，" + j.doc.started_at + "）—— 竞争输家或已终结未清理，只人工处置" : "没有 active 指向且读不出的 journal（" + String(j.why) + "）—— 只人工处置" }); } continue; }
+    if ((m = /^([0-9a-f-]{36})\.json$/u.exec(n)) && UUID_SHAPE.test(m[1])) {
+      if (m[1] !== activeToken) {
+        const j = readJournal({ dir, token: m[1] });
+        if (j.state === "valid" && TERMINAL_PHASES.includes(j.doc.phase)) audits.push({ path: full, token: m[1], operation_kind: j.doc.operation_kind, phase: j.doc.phase, started_at: j.doc.started_at });
+        else if (j.state === "valid") residues.push({ path: full, kind: "orphan_journal", detail: "没有 active 指向的 in-flight journal（阶段 " + j.doc.phase + "，" + j.doc.started_at + "）—— 竞争输家或中断残留，只人工处置" });
+        else residues.push({ path: full, kind: "orphan_journal", detail: "没有 active 指向且读不出的 journal（" + String(j.why) + "）—— 只人工处置" });
+      }
+      continue;
+    }
     if ((m = /^([0-9a-f-]{36})\.lease$/u.exec(n)) && UUID_SHAPE.test(m[1])) { const h = leaseHolder({ dir, token: m[1] }); if (m[1] !== activeToken) residues.push({ path: full, kind: "stale_lease", detail: "非 active operation 的租约" + (h.alive ? "（持有者 pid " + h.pid + " 仍在）" : "（持有者已不在）") + " —— 只人工处置" }); else if (h.present && !h.unreadable && !h.alive) residues.push({ path: full, kind: "dead_lease", detail: "active operation 的租约持有者 pid " + h.pid + " 已不在 —— 下一个执行者会接管" }); continue; }
     if (/^[0-9a-f-]{36}\.lease\.(reap|maint)$/u.test(n) || /^[0-9a-f-]{36}\.lease\.reaped-/u.test(n) || /^[0-9a-f-]{36}\.lease\.reap\.quarantine-/u.test(n)) { residues.push({ path: full, kind: "lease_lock_residue", detail: "租约锁家族残骸 —— node scripts/repair-publish-lock.mjs --lock " + path.join(dir, n.split(".lease")[0] + ".lease") + " 能清（.reap / 隔离），其余只人工处置" }); continue; }
     if (/^\.journal\.\d+\.[0-9a-f-]{36}\.tmp$/u.test(n)) { residues.push({ path: full, kind: "tmp", detail: "写 journal 的临时文件残骸 —— 人工删即可" }); continue; }
-    if ((m = /^([0-9a-f-]{36})\.(claude|codex)\.plist$/u.exec(n)) && UUID_SHAPE.test(m[1])) { if (m[1] !== activeToken) residues.push({ path: full, kind: "stale_backup", detail: "非 active operation 的 plist 备份 —— 只人工处置" }); continue; }
+    if ((m = /^([0-9a-f-]{36})\.(claude|codex)\.plist$/u.exec(n)) && UUID_SHAPE.test(m[1])) {
+      if (m[1] !== activeToken) {
+        // R47 返修 P1-3：可清理必须逐字段核 backup 关联，任一不符就不当可清理、按未知残骸标问题：
+        // ① journal token 与文件名一致（readJournal 已绑定下沉）；② journal 里有对应 timer:<chain> step；
+        // ③ step.backup 精确等于本文件；④ 文件是受验普通文件（readRegularFile 拒 symlink、核单硬链接）且 SHA/长度与 step 记录一致
+        const j = readJournal({ dir, token: m[1] });
+        if (j.state === "valid" && TERMINAL_PHASES.includes(j.doc.phase)) {
+          // R47 返修 P1-3：已终结 journal 还须逐字段核 backup 关联，任一不符就不当可清理、按未知残骸标问题：
+          // ② journal 里有对应 timer:<chain> step；③ step.backup 精确等于本文件；
+          // ④ 文件是受验普通文件（readRegularFile 拒 symlink、核单硬链接）且 SHA/长度与 step 记录一致。
+          // ① journal token 与文件名一致由 readJournal 的 token 绑定下沉护住（不符 → 走下面的 valid=false 支）。
+          const chain = m[2];
+          const timer = j.doc.steps.find((s) => s.kind === "timer" && s.id === "timer:" + chain) ?? null;
+          const v = timer ? verifyBackup({ file: full, sha256: timer.backup_sha256, bytes: timer.backup_bytes }) : null;
+          if (timer && timer.backup === full && v?.ok === true) cleanables.push({ path: full, kind: "stale_backup", token: m[1], detail: "已终结 operation（" + j.doc.operation_kind + "/" + j.doc.phase + "）的 plist 定时器备份（受验对上 timer:" + chain + "）—— 可清理（人工删即可）" });
+          else {
+            const why = !timer ? "journal 里没有 timer:" + chain + " step"
+              : timer.backup !== full ? "timer step 的 backup 不是本文件（" + String(timer.backup).slice(0, 64) + "）"
+              : "备份字节受验不过（" + String(v?.why) + "）";
+            residues.push({ path: full, kind: "unknown", detail: "plist 备份对不上 backup 关联（" + why + "）—— 只人工处置" });
+          }
+        } else residues.push({ path: full, kind: "stale_backup", detail: "非 active operation 的 plist 备份，对账不上已终结 operation（" + (j.state === "valid" ? "阶段 " + j.doc.phase : String(j.why)) + "）—— 只人工处置" });
+      }
+      continue;
+    }
     if ((m = /^([0-9a-f-]{36})\.staged$/u.exec(n)) && UUID_SHAPE.test(m[1])) { if (m[1] !== activeToken) residues.push({ path: full, kind: "stale_staged", detail: "非 active operation 的 staged 目录（目标制品与备份）—— 只人工处置" }); continue; }
     residues.push({ path: full, kind: "unknown", detail: "维护目录里不认识的文件 —— 只人工处置" });
   }
-  return { inventory: "ok", residues };
+  // R47 返修 P1-2：active 指向的 journal 三态分别处理 —— 缺失/读不出=指针悬空；已终结（终态先落、指针未清）
+  // = 也是异常，指路维护门 --exit --apply（与状态页同款）；在跑（非终态）才是正常
+  if (activeToken !== null) {
+    const j = readJournal({ dir, token: activeToken });
+    if (j.state !== "valid") residues.push({ path: journalPath(dir, activeToken), kind: "active_journal_missing", detail: "active 指向的 journal 缺失或读不出（" + String(j.why ?? "缺席") + "）—— 状态指针悬空，只人工处置" });
+    else if (TERMINAL_PHASES.includes(j.doc.phase)) residues.push({ path: activePath(dir), kind: "terminal_active_not_cleared", detail: "operation 已终结（" + j.doc.operation_kind + "/" + j.doc.phase + "）而 active 仍指向它 —— 跑 node scripts/maintenance-gate.mjs --exit --apply 只清 active" });
+  }
+  return { inventory: "ok", residues, audits, cleanables };
 }
 
 /** 租约持有者（只读，给 --status）：{ present, pid, alive } */

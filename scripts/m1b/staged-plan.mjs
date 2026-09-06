@@ -49,9 +49,9 @@ export function planProblem(plan) {
 
 const sha256Hex = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 
-/** 建 0700 目录（recursive 保父链在场），fsync 其父目录作屏障；已在场复用，但 mode 必须仍是 0700（private 目录不许降级）。 */
+/** 建 0700 目录（父目录必须已在场，非递归新建本级），fsync 其父目录作屏障；已在场复用，但 mode 必须仍是 0700（private 目录不许降级）。 */
 function mkdirDurable(dir, parentToFsync) {
-  // 三轮 P1④：非递归 —— 根缺席不是 stage 的活，不许 recursive 顺手建链。
+  // 三轮 P1④：父目录必须已在场，非递归新建本级 —— 根缺席不是 stage 的活，不许 recursive 顺手建链。
   try { fs.mkdirSync(dir, { recursive: false, mode: 0o700 }); } catch (err) { if (err?.code !== "EEXIST") throw err; }
   // P1-3：lstat 不跟随 —— .staged / intended 被预埋成外指 symlink 时必须在此拒，不能 statSync 跟随放行照写。
   const st = fs.lstatSync(dir);
@@ -69,7 +69,11 @@ function maintenanceRootProblem(dir) {
   if (typeof dir !== "string" || dir.length === 0 || !path.isAbsolute(dir)) return "maintenance 根不是绝对路径";
   if (path.resolve(dir) !== dir) return "maintenance 根不是规范路径";
   let st = null;
-  try { st = fs.lstatSync(dir); } catch (err) { return "maintenance 根缺席（" + errCode(err) + "）"; }
+  try { st = fs.lstatSync(dir); } catch (err) {
+    // 四轮 P2：只有 ENOENT 是缺席；EIO/EACCES 等是「根不可读」—— fail-closed 同拒，事实投影改对（错误码保留）。
+    if (err?.code === "ENOENT") return "maintenance 根缺席（ENOENT）";
+    return "maintenance 根核验失败不可读（" + errCode(err) + "）";
+  }
   if (st.isSymbolicLink()) return "maintenance 根是符号链接";
   if (!st.isDirectory()) return "maintenance 根不是目录";
   let real = null;

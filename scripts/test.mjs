@@ -28624,6 +28624,15 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     const absentDir = path.join(mkTempDir44(), "absent-root");
     assert.equal(stageCutoverPlan({ dir: absentDir, token: UUID44, plan, blobs }).ok, false, "缺席根 → stage 拒（不代建）");
     assert.equal(fs.existsSync(absentDir), false, "缺席根未被 recursive 顺手创建");
+    // 四轮 P2：lstat 只有 ENOENT 是缺席；EIO/EACCES 等报「核验失败」并保留错误码（fail-closed 同拒，事实投影改对）。
+    const realLstat44 = fs.lstatSync;
+    let eioN44 = 0;
+    fs.lstatSync = (...a) => { if (eioN44++ === 0) { const e = new Error("input/output error"); e.code = "EIO"; throw e; } return realLstat44(...a); };
+    const eioStage = stageCutoverPlan({ dir, token: UUID44, plan, blobs });
+    fs.lstatSync = realLstat44;
+    assert.ok(eioStage.ok === false && (eioStage.why ?? "").includes("核验失败") && (eioStage.why ?? "").includes("EIO") && !(eioStage.why ?? "").includes("缺席"), "EIO → 报核验失败并留错误码，不报缺席");
+    const eioAbsent = path.join(mkTempDir44(), "nope");
+    assert.ok(stageCutoverPlan({ dir: eioAbsent, token: UUID44, plan, blobs }).why.includes("缺席"), "ENOENT → 仍报缺席（语义分派不回归）");
     // 目录 mode 降级拒
     const base2 = mkTempDir44(); const dir2 = path.join(base2, "m"); fs.mkdirSync(dir2);
     stageCutoverPlan({ dir: dir2, token: UUID44, plan, blobs });

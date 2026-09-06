@@ -31050,8 +31050,21 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
         assert.equal(rbusy45.lock, pcLock45, "主锁路径结构化带出：" + JSON.stringify(rbusy45));
         fs.rmSync(pcLock45, { force: true, recursive: true });
       }
-      // R45 三轮 P1-2：.reap 临界段回归 registry 合同 —— 段内操作集恰为三件（CAS 重读 + token 核验 = 一次读锁归属，+ rename）；
-      // 全部准备（绑定核验/读现场/备份核验/tmp 写+fsync）与收尾（目录 fsync/读回/journal done）必须在 .reap 段外。
+      // R45 四轮 P2-2：取 sidecar 锁失败保留原 reason 与 path —— 锁位上是畸形残骸（lock_residue）
+      // 不再折 sidecar_lock_busy 丢真实路径（与 fencing 分支同一结构化投影）。
+      {
+        reprep45();
+        fs.mkdirSync(pcLock45, { recursive: true });
+        fs.writeFileSync(path.join(pcLock45, "sentinel"), "not-a-lock\n");
+        let rp22a45;
+        try { rp22a45 = run45("pending-claims"); } finally { /* 无补丁 */ }
+        assert.deepEqual([rp22a45.ok, rp22a45.reason], [false, "lock_residue"], "取锁失败保留原 reason：" + JSON.stringify(rp22a45));
+        assert.equal(rp22a45.path, pcLock45, "残骸路径结构化：" + JSON.stringify(rp22a45));
+        fs.rmSync(pcLock45, { force: true, recursive: true });
+      }
+      // R45 三轮 P1-2 + 四轮 P2-1：.reap 临界段回归 registry 合同 —— 段内操作集恰为两件（核锁实例归属 =
+      // 一次读锁归属，+ rename；before 比较已在主锁持有期完成，段内不是「CAS 重读」）；
+      // 全部准备（绑定核验/读现场/备份核验/tmp 写+fsync）与收尾（目录 fsync/读回/释放核验/journal done）必须在 .reap 段外。
       {
         reprep45();
         const reapProbe45 = pcLock45 + ".reap";
@@ -31078,11 +31091,72 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
         assert.ok(rprobe45.ok === true, "探针跑通正常写：" + JSON.stringify(rprobe45));
         assert.equal(inReap45.length, 1, ".reap 段内写/读操作恰一次 rename：" + JSON.stringify(inReap45));
         assert.ok(/^renameSync：.*\.tmp → /.test(inReap45[0] ?? "") && (inReap45[0] ?? "").endsWith("→ " + pcJson45), "段内 rename 是 tmp→target：" + inReap45[0]);
-        assert.deepEqual(cas45, { lstat: 1, readlink: 1 }, "fence 段 rename 前对主锁恰一次归属读（CAS 重读+token 核验）：" + JSON.stringify(cas45));
+        assert.deepEqual(cas45, { lstat: 1, readlink: 1 }, "fence 段 rename 前对主锁恰一次归属读（核锁实例归属）：" + JSON.stringify(cas45));
         // 探针跑的是真写：把 pending-claims 退回 prepared，后面的 P1-1⑤（op_not_active，毁 active）还要用这个 step
         const rst45 = updateJournal({ dir, token: UUID45, lease: op.lease, now: NOW45, mutate: (d) => { const s = d.steps.find((x) => x.id === "sidecar:pending-claims:" + EP45); s.state = "prepared"; delete s.after; return d; } });
         assert.equal(rst45.ok, true, "探针复位 step：" + JSON.stringify(rst45));
         fs.rmSync(pcLock45, { force: true, recursive: true });
+      }
+      // R45 四轮 P1-1：done 记账时序 —— 锁确认干净释放之后才 markStepDone。释放不干净（被接管 → not_owner）时
+      // step 留 prepared：本次退 3 不再伴生「journal 已 done、续跑走 done 快路静默成功」的门禁失效。
+      {
+        reprep45();
+        let renamed45p1 = false;
+        const origRn45p1 = fs.renameSync;
+        fs.renameSync = function (a45, b45) { const r45 = origRn45p1.call(fs, a45, b45); renamed45p1 = true; return r45; };
+        const origRl45p1 = fs.readlinkSync;
+        fs.readlinkSync = function (t45) { if (renamed45p1 && path.resolve(String(t45)) === pcLock45) return JSON.stringify({ pid: 999999, at: new Date(NOW45).toISOString(), token: "77777777-7777-4777-8777-777777777777" }); return origRl45p1.call(fs, t45); };
+        let rp11a45;
+        try { rp11a45 = run45("pending-claims"); } finally { fs.renameSync = origRn45p1; fs.readlinkSync = origRl45p1; }
+        assert.deepEqual([rp11a45.ok, rp11a45.reason], [false, "sidecar_lock_release_failed"], "释放被接管 → 退 3：" + JSON.stringify(rp11a45));
+        assert.equal(stepStateR1("pending-claims").state, "prepared", "释放不干净 → journal 仍 prepared（不许先记 done）：" + stepStateR1("pending-claims").state);
+        // 续跑（注入已撤）：锁还在（释放失败不删锁）→ 取锁被挡，不许经 done 快路静默成功
+        let rp11b45;
+        try { rp11b45 = run45("pending-claims"); } finally { /* 无补丁 */ }
+        assert.ok(rp11b45.ok === false, "续跑被挡（不许静默成功）：" + JSON.stringify(rp11b45));
+        assert.equal(stepStateR1("pending-claims").state, "prepared", "续跑后仍 prepared：" + stepStateR1("pending-claims").state);
+        fs.rmSync(pcLock45, { force: true, recursive: true });
+      }
+      // R45 四轮 P1-2：恢复快路必须重走 durability 屏障（目录 fsync + 受验读回 + 干净释放）才补 done ——
+      // 首次目录 fsync EIO → prepared 保留；续跑见现场 SHA===intended 不得直接补 done（屏藏计数）。
+      {
+        reprep45();
+        const origFsync45p2 = fs.fsyncSync;
+        fs.fsyncSync = function (fd45) { if (fs.fstatSync(fd45).isDirectory()) throw Object.assign(new Error("eio p12"), { code: "EIO" }); return origFsync45p2.call(fs, fd45); };
+        let rp12a45;
+        try { rp12a45 = run45("pending-claims"); } finally { fs.fsyncSync = origFsync45p2; }
+        assert.deepEqual([rp12a45.ok, rp12a45.reason, rp12a45.written], [false, "sidecar_dir_fsync", true], "首次目录 fsync EIO → prepared 保留：" + JSON.stringify(rp12a45));
+        // 续跑：现场已是 intended，但 durability 未证实 → 必须重做目录 fsync（屏障不许跳）之后才准补 done。
+        // 计数按打开路径圈定到 ledgerDir：journal 的 atomicWrite 每次写也 fsync 自己的目录（maintenance dir，
+        // 不是 ledgerDir），按 fd→路径记不得误计。
+        let fsyncDir45 = 0;
+        const dirFds45 = new Map();
+        const origOpen45p2 = fs.openSync, origClose45p2 = fs.closeSync;
+        fs.openSync = function (p45, ...r45) { const fd45 = origOpen45p2.call(fs, p45, ...r45); try { dirFds45.set(fd45, path.resolve(String(p45))); } catch { /* 非路径 fd */ } return fd45; };
+        fs.closeSync = function (fd45) { dirFds45.delete(fd45); return origClose45p2.call(fs, fd45); };
+        fs.fsyncSync = function (fd45) { if (dirFds45.get(fd45) === ledgerDir) fsyncDir45 += 1; return origFsync45p2.call(fs, fd45); };
+        let rp12b45;
+        try { rp12b45 = run45("pending-claims"); } finally { fs.openSync = origOpen45p2; fs.closeSync = origClose45p2; fs.fsyncSync = origFsync45p2; }
+        assert.ok(fsyncDir45 >= 1, "续跑重做目录 fsync（durability 屏障不许跳）：" + fsyncDir45);
+        assert.deepEqual([rp12b45.ok, rp12b45.written, rp12b45.recovered], [true, false, true], "续跑屏障后补 done：" + JSON.stringify(rp12b45));
+        assert.equal(stepStateR1("pending-claims").state, "done", "续跑后 journal done：" + stepStateR1("pending-claims").state);
+        fs.rmSync(pcLock45, { force: true, recursive: true });
+      }
+      // R45 四轮 P1-3：残骸聚合顺序 —— fence 段 lock_lost 且 .reap 交不还（rm EIO）时，residue 路径/error
+      // 必须随返回值带出（不许 ！ok 早退吞掉；手工释放段的残骸同样聚合）。
+      {
+        reprep45();
+        const lostReap45 = pcLock45 + ".reap";
+        const origReadlink45p3 = fs.readlinkSync;
+        fs.readlinkSync = function (t45) { if (path.resolve(String(t45)) === pcLock45) return JSON.stringify({ pid: process.pid, at: new Date(NOW45).toISOString(), token: "88888888-8888-4888-8888-888888888888" }); return origReadlink45p3.call(fs, t45); };
+        const origRm45p3 = fs.rmSync;
+        fs.rmSync = function (p45, o45) { if (path.resolve(String(p45)) === lostReap45) throw Object.assign(new Error("eio p13"), { code: "EIO" }); return origRm45p3.call(fs, p45, o45); };
+        let rp13a45;
+        try { rp13a45 = run45("pending-claims"); } finally { fs.readlinkSync = origReadlink45p3; fs.rmSync = origRm45p3; }
+        assert.deepEqual([rp13a45.ok, rp13a45.reason], [false, "sidecar_lock_lost"], "fence lock_lost 主 reason：" + JSON.stringify(rp13a45));
+        assert.ok(rp13a45.residue?.path === lostReap45 && String(rp13a45.residue.error).includes("EIO"), "fence 段残骸路径/error 带出：" + JSON.stringify(rp13a45.residue));
+        fs.rmSync(pcLock45, { force: true, recursive: true });
+        fs.rmSync(lostReap45, { force: true, recursive: true });
       }
       // P1-1⑤：active 清掉 → op_not_active（放最后：毁现场）。用 prepared 的 pending-claims：done step 在分派前就早退（纯读复核，不看绑定）。
       const ca45 = clearActiveJ({ dir, token: UUID45 });

@@ -26,6 +26,8 @@ import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { bindingsForRoot, currentBinding, describeStatus, setBindingStatus } from "./feishu-control.mjs";
 import { loadClaudeTopicBinding } from "./topic-generation-store.mjs";
 import { wirePauseResume, emitUncleanReceipt } from "./m1a/wiring.mjs";
+import { maintenanceDir } from "./maintenance/journal.mjs";
+import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
 import {
   acquirePublishLock, exactProjectsForRoot, loadRegistryStrict, normalizeRoot,
@@ -348,6 +350,21 @@ console.log("\n只写一处：" + regFile + "（项目目录里不写任何文�
 if (!apply) {
   console.log("\n[dry-run] 没有发消息，也没有写文件。加 --apply 才真的做。");
   process.exit(0);
+}
+
+// P2-2 wireBind（Frank 裁定）：项目级绑定天然无受验会话。**已启用端点**（M1a init 收据在场）上
+//   bind-project --apply = **无条件拒**（reason=target_incomplete、零副作用、文案引导 bind-session）。
+//   不做任何 env 嗅探，不给 bind-project 造受验路径。未启用端点照旧 legacy-only 不变。
+{
+  const bindEndpoint = legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid });
+  const bindMaint = maintenanceDir(process.env);
+  const bindReceipt = typeof bindMaint === "string" && bindMaint.length > 0
+    ? endpointReceipt(bindMaint, bindEndpoint)
+    : { ok: false, state: "unreadable", why: "维护目录不可派生" };
+  if (bindReceipt.ok === true && bindReceipt.state !== "never_initialized") {
+    die("这个项目在已启用 M1a 的端点上，项目级绑定没有受验会话可写（reason=target_incomplete）。",
+      "会话级绑定请用：node scripts/bind-session.mjs --apply。\n已启用端点上项目级绑定不建话题、不写登记表、不写账本（零副作用）。");
+  }
 }
 
 // 1. 建话题。失败就什么都不写 —— 干净重来，不留半个状态。

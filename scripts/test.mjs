@@ -25417,6 +25417,39 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     });
     assert.equal(w4.shadow[0].ok, false, "externalRequestId 空 → shadow 拒");
   }));
+  test("P2-2 wireBind CLI 集成（bind-project）：已启用端点 --apply → 无条件拒 target_incomplete（零副作用、引导 bind-session）；未启用端点照旧 legacy-only", () => withRootAndReceipt((root, dir) => {
+    const ep = legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid });
+    seedLedgerInitReceipt(path.join(root, "maint"), ep);   // M1a 已启用（agent_x）
+    const proj = path.join(root, "proj");
+    fs.mkdirSync(proj);
+    const tplFile = path.join(root, "chain-config.json");
+    fs.writeFileSync(tplFile, JSON.stringify(TPL));
+    const regFile = path.join(root, "registry.json");      // 缺席 → 期望不被造出
+    const savedReg = process.env.FEISHU_BRIDGE_REGISTRY;
+    const savedTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE;
+    process.env.FEISHU_BRIDGE_REGISTRY = regFile;
+    process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = tplFile;
+    try {
+      const run = spawnSync(process.execPath, [path.resolve("scripts", "bind-project.mjs"), "--apply", "--project", proj], { encoding: "utf-8", env: process.env });
+      const out = (run.stderr || "") + (run.stdout || "");
+      assert.notEqual(run.status, 0, "已启用端点 bind-project --apply 应拒（status=" + run.status + "）：" + out);
+      assert.ok(out.includes("target_incomplete"), "回执点名 target_incomplete：" + out);
+      assert.ok(out.includes("bind-session"), "文案引导 bind-session：" + out);
+      assert.equal(fs.existsSync(regFile), false, "零副作用：不写登记表");
+      assert.equal(fs.existsSync(path.join(dir, "ledger.json")), false, "零副作用：不写账本");
+      // 未启用端点对照：换 agent_uid（无收据）→ 收据判 never_initialized → guard 不触发，放行到 sendToChat（lark_bin 缺失 → 建话题失败，但绝非 target_incomplete）。
+      const proj2 = path.join(root, "proj2");
+      fs.mkdirSync(proj2);
+      const noTokenTpl = Object.assign({}, TPL, { agent_uid: "agent_never" });
+      fs.writeFileSync(tplFile, JSON.stringify(noTokenTpl));
+      const run2 = spawnSync(process.execPath, [path.resolve("scripts", "bind-project.mjs"), "--apply", "--project", proj2], { encoding: "utf-8", env: process.env });
+      const out2 = (run2.stderr || "") + (run2.stdout || "");
+      assert.ok(!out2.includes("target_incomplete"), "未启用端点不该 target_incomplete（应放行到建话题）：" + out2);
+    } finally {
+      if (savedReg === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY; else process.env.FEISHU_BRIDGE_REGISTRY = savedReg;
+      if (savedTpl === undefined) delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; else process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = savedTpl;
+    }
+  }));
   test("账本：可重复动作往返各执行(request_key) + 同 key 异载荷冲突 + 数组 id 拒 + 精确权限", () => withRoot((root, dir) => {
     seedLedger(dir);
     // 建 B3

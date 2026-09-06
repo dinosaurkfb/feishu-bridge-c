@@ -28,13 +28,13 @@ import path from "node:path";
 import { acquireInstallSurfaceLock } from "../install-surface-lock.mjs";
 import { switchCurrentTarget } from "../runtime-install.mjs";
 import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot } from "../m1a/legacy-snapshot.mjs";
-import { reconcileLegacyEndpoint } from "../m1a/reconcile.mjs";
+import { prepareLegacyCutoverEndpoint } from "../m1a/reconcile.mjs";
 import { readStagedVerified, removeStagedPlan, stageBackupFiles, stageCutoverPlan, stagedIntendedFile } from "../m1b/staged-plan.mjs";
 import { verifyCutoverPlan } from "../m1b/cutover-plan.mjs";
 import { chainFacts } from "./precheck.mjs";
 import { removeStubVersion } from "./stub.mjs";
 import { bootstrapTimer, timerPhase } from "./timers.mjs";
-import { writeSidecarPrepared } from "./sidecar-writer.mjs";
+import { readSidecarCurrent, writeSidecarPrepared } from "./sidecar-writer.mjs";
 import { TERMINAL_PHASES, acquireOperationLease, addNote, clearActive, enterLedgerForward, markStepDone, readActive, readJournal, releaseOperationLease, setPhase, verifyBackup } from "./journal.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
 import { authorityCutover, cutoverPlan, initPlan, initializeShadow, loadLedger, resolveEndpointDir } from "../topic-agent-ledger.mjs";
@@ -67,7 +67,8 @@ const collectFor = (ctx, chain, env) => chain === "claude"
     })
   : collectCodexLegacySnapshot({ home: ctx.codexBridgeHome });
 
-export const reconcileFor = ({ ctx, chain, endpointId, ledgerDir, env }) => reconcileLegacyEndpoint({
+export const reconcileFor = ({ ctx, chain, endpointId, ledgerDir, env }) => prepareLegacyCutoverEndpoint({
+  // R45 二轮 P1-1：staging 要拿受验渲染字节，走 T4 私有准备接口（公共安全面 reconcileLegacyEndpoint 不回字节明文）
   endpointId, chain,
   collectLegacy: () => collectFor(ctx, chain, env),
   loadLedgerFn: () => loadLedger(ledgerDir, { endpointId }),
@@ -75,16 +76,14 @@ export const reconcileFor = ({ ctx, chain, endpointId, ledgerDir, env }) => reco
 
 const shaHex = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 
-/** sidecar 现场探测（staging 前，P1-5 顺带取回原字节做备份）：absent → {exists:false}；在 → {exists:true, sha256, buf}；
- *  读不清（symlink/EACCES/FIFO）→ fail-closed。 */
+/** sidecar 现场探测（staging 前，P1-5 顺带取回原字节做备份）：走唯一受验 sidecar 读取器 readSidecarCurrent
+ *  （普通文件/单硬链接/0600/≤1MiB/读满，FIFO、多硬链接、超限文件在探查即拒，不再无界读）。
+ *  absent → {exists:false}；在 → {exists:true, sha256, buf}；读不清 → fail-closed（sidecar_unclear）。 */
 const probeBefore = (file) => {
-  try {
-    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-    try { const buf = fs.readFileSync(fd); return { exists: true, sha256: shaHex(buf), buf }; } finally { fs.closeSync(fd); }
-  } catch (err) {
-    if (err?.code === "ENOENT") return { exists: false, sha256: null, buf: null };
-    return { exists: "unclear", sha256: null, buf: null, why: errText(err) };
-  }
+  const cur = readSidecarCurrent(file);
+  if (!cur.present) return { exists: false, sha256: null, buf: null };
+  if (cur.problem !== undefined) return { exists: "unclear", sha256: null, buf: null, why: cur.problem };
+  return { exists: true, sha256: cur.sha256, buf: cur.buf };
 };
 
 /** staging（4c/4d 冻结 S1，P1-3/P1-5 返修）：对账结果（rec，ok 支已带三 sidecar 受验字节）与账本快照（L）都来自 planOf
@@ -101,9 +100,10 @@ function stageCutover(ctx, { token, endpointId, ledgerDir, rec, L }) {
     probes[k] = { name, before };
   }
   const blobs = {
-    expiry: Buffer.from(rec.sidecars.expiry),
-    pending_claims: Buffer.from(rec.sidecars.pending_claims),
-    policy: Buffer.from(rec.sidecars.policy),
+    // R45 二轮 P1-1：受验字节引用在 T4 私有面的 {sha256, bytes} 里
+    expiry: rec.sidecars.expiry.bytes,
+    pending_claims: rec.sidecars.pending_claims.bytes,
+    policy: rec.sidecars.policy.bytes,
   };
   const plan = {
     schema_version: "m1a-cutover-plan-1",
@@ -173,9 +173,9 @@ function planOf({ kind, endpointId, chain, token, ledgerDir, ctx, env }) {
   const cp = cutoverPlan({
     endpointId, chain, requestKey, operationId: token, shadowDoc: L2.doc, shadowSha: L2.sha256, digest: rec.digest,
     sidecarShas: {
-      expiry: shaHex(rec.sidecars.expiry),
-      pending_claims: shaHex(rec.sidecars.pending_claims),
-      policy: shaHex(rec.sidecars.policy),
+      expiry: rec.sidecars.expiry.sha256,
+      pending_claims: rec.sidecars.pending_claims.sha256,
+      policy: rec.sidecars.policy.sha256,
     },
   });
   if (!cp.ok) return cp;
@@ -466,15 +466,23 @@ export function ledgerEnter(ctx, { kind, endpointId, chain, waitMs = 60000, appl
     const rel = releaseSurface(surface);
     return { ...ent, surfaceRelease: rel.ok ? null : { path: rel.path ?? null, why: rel.why ?? rel.reason } };
   }
-  const out = ledgerForward(ctx, { token: ent.token, lease: ent.lease, intent: { kind, endpointId, chain }, env });
-  let rollbackResult = null;
-  if (out.ok === false && out.rollbackSafe === true) {
-    // 前置条件失败（如 reconciler_absent：账本步未准备、未写盘）→ 回退清场（桩/current/门/active 与进入前一致），不留下维护态
-    const rb = rollbackOperation(ctx, ent.token, ent.lease);
-    // P1-1：保留完整 rb（含 ok/activeCleared/incomplete）——只用 phase 重建会把“回退已到 rolled_back 但 active 没清掉”
-    // 二次判定成成功（exit 1 + “已按账回退还清”），active 其实还留着。只有 rb.ok===true ∧ activeCleared===true 才算回退做完。
-    rollbackResult = rb;
+  // R45 二轮 P1-4：真异常（非模拟崩溃）折结构化收据（ledger_forward_failed），不再裸抛炸穿调用方；
+  // lease / 安装面锁在正常与异常路径都释放；simulatedCrash 契约豁免：原样重抛且不释放（模拟死亡，接管者按残骸处理）。
+  let out, rollbackResult = null, crashErr = null;
+  try {
+    out = ledgerForward(ctx, { token: ent.token, lease: ent.lease, intent: { kind, endpointId, chain }, env });
+    if (out.ok === false && out.rollbackSafe === true) {
+      // 前置条件失败（如 reconciler_absent：账本步未准备、未写盘）→ 回退清场（桩/current/门/active 与进入前一致），不留下维护态
+      const rb = rollbackOperation(ctx, ent.token, ent.lease);
+      // P1-1：保留完整 rb（含 ok/activeCleared/incomplete）——只用 phase 重建会把“回退已到 rolled_back 但 active 没清掉”
+      // 二次判定成成功（exit 1 + “已按账回退还清”），active 其实还留着。只有 rb.ok===true ∧ activeCleared===true 才算回退做完。
+      rollbackResult = rb;
+    }
+  } catch (err) {
+    if (err?.simulatedCrash === true) crashErr = err;
+    else out = { ok: false, reason: "ledger_forward_failed", why: errText(err) };
   }
+  if (crashErr !== null) throw crashErr;
   const leaseRel = releaseOperationLease(ent.lease);
   const surfaceRel = releaseSurface(surface);
   return { token: ent.token, ...out, rollback: rollbackResult, leaseRelease: leaseRel.ok ? null : { path: leaseRel.path ?? null, why: leaseRel.why ?? leaseRel.reason }, surfaceRelease: surfaceRel.ok ? null : { path: surfaceRel.path ?? null, why: surfaceRel.why ?? surfaceRel.reason } };
@@ -519,12 +527,18 @@ export function ledgerExit(ctx, { apply = false, env = process.env, surface: hel
   }
   const lease = acquireOperationLease({ dir: ctx.dir, token });
   if (!lease.ok) return releaseHeld({ ok: false, reason: lease.reason, why: lease.why, token, phase, action, path: lease.path });
-  if (action === "ledger_forward") {
-    const f = ledgerForward(ctx, { token, lease, env });
-    const leaseRel = releaseOperationLease(lease);
-    return releaseHeld({ token, action, ...f, leaseRelease: leaseRel.ok ? null : { path: leaseRel.path ?? null, why: leaseRel.why ?? leaseRel.reason } });
+  // R45 二轮 P1-4：forward / rollback 真异常折结构化收据（不再裸抛）；simulatedCrash 契约豁免：
+  // 原样重抛且不释放 lease / 安装面锁（模拟死亡，接管者按残骸处理）。
+  let out, crashErr = null;
+  try {
+    out = action === "ledger_forward"
+      ? ledgerForward(ctx, { token, lease, env })
+      : rollbackOperation(ctx, token, lease);
+  } catch (err) {
+    if (err?.simulatedCrash === true) crashErr = err;
+    else out = { ok: false, reason: action === "ledger_forward" ? "ledger_forward_failed" : "ledger_rollback_failed", why: errText(err) };
   }
-  const r = rollbackOperation(ctx, token, lease);
+  if (crashErr !== null) throw crashErr;
   const leaseRel = releaseOperationLease(lease);
-  return releaseHeld({ token, action, ...r, leaseRelease: leaseRel.ok ? null : { path: leaseRel.path ?? null, why: leaseRel.why ?? leaseRel.reason } });
+  return releaseHeld({ token, action, ...out, leaseRelease: leaseRel.ok ? null : { path: leaseRel.path ?? null, why: leaseRel.why ?? leaseRel.reason } });
 }

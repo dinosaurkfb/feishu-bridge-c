@@ -74,7 +74,9 @@ if (agentUid) {
   }
   changed = wired.legacy;
 } else {
-  changed = runPause();
+  // P1-2 ③：agent_uid 取不到 = 端点无法派生收据现场，静默回落 legacy 会绕开一致性锁（fail-closed）。
+  console.error("无法确定 Codex 模板 agent_uid —— 不能派生 M1a 端点，拒绝绕过一致性锁（fail-closed）");
+  process.exit(1);
 }
 if (!changed.ok) {
   console.error("暂停失败：" + changed.reason + (changed.error ? "（" + changed.error + "）" : ""));

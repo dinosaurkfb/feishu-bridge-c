@@ -113,7 +113,8 @@ if (cancel) {
     if (!wiredCancel.ok) die("取消轮转失败（M1a 一致性锁：" + wiredCancel.reason + (wiredCancel.why ? "；" + wiredCancel.why : "") + "）");
     closed = wiredCancel.legacy;
   } else {
-    closed = runCancel();
+    // P1-2 ③：agent_uid 取不到 = 端点无法派生收据现场，静默回落 legacy 会绕开一致性锁（fail-closed）。
+    die("无法确定 Codex 模板 agent_uid —— 不能派生 M1a 端点，拒绝绕过一致性锁（fail-closed）");
   }
   if (!closed.ok) die("取消轮转失败（" + closed.reason + "）。");
   // #R37 P1-4：legacy 已取消轮转但镜像不干净（void 步失败/非干净提交/锁残骸）→ 机器回执，不谎报 clean。

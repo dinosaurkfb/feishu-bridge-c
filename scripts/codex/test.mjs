@@ -1256,6 +1256,7 @@ test("Codex 轮转 CLI 可显式取消 pending，且完全不调用飞书", () =
     logicalTaskKey: task.logical_task_key, generationId: task.channel_generation_id,
     sessionId: "session_old", home, now: 1100,
   });
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({ ...TEMPLATE })); // P1-2 ③：模板提供 agent_uid，否则 fail-closed
   prepareTaskTopicRotation({ threadId: THREAD_A, operationId: "op_cli_cancel", home, now: 1200 });
   registerTaskTopicRotation({
     threadId: THREAD_A, operationId: "op_cli_cancel", rootMessageId: "om_new",
@@ -1270,7 +1271,8 @@ test("Codex 轮转 CLI 可显式取消 pending，且完全不调用飞书", () =
     "--apply", ...withIntent("rotate", THREAD_A, home, { op: "cancel" }),
   ], {
     encoding: "utf-8",
-    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+      FEISHU_BRIDGE_MAINTENANCE_DIR: path.join(home, ".maint-never-init") },
   });
   assert.equal(cancelled.status, 0, cancelled.stderr);
   assert.match(cancelled.stdout, /旧话题仍是唯一 active/u);
@@ -1424,7 +1426,9 @@ test("task 控制脚本不猜 thread，暂停和恢复都不调用飞书", () =>
   delete task.topic_generation_state;
   delete task.channel_generation_id;
   writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
-  const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home };
+  const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+    FEISHU_BRIDGE_MAINTENANCE_DIR: path.join(home, ".maint-never-init") };
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({ ...TEMPLATE })); // P1-2 ③：模板提供 agent_uid，否则 fail-closed
 
   const status = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"),
     "--thread-id", THREAD_A], { encoding: "utf-8", env });
@@ -1477,6 +1481,30 @@ test("Codex task 的 claim/outbox 全部在 ~/.codex 桥状态下，不落项目
   assert.equal(paths.root.startsWith(root + path.sep), false);
   assert.equal(mappingForTask(task, { home }).codex_thread_id, THREAD_A);
   assert.equal(task.auto_publish_on_completion, true);
+});
+
+test("P1-2 ③ agent_uid 取不到 → 拒绝绕过一致性锁（fail-closed）", () => {
+  // 端点派生的唯一输入是 agent_uid。它取不到 = 无法判定收据现场，
+  // 不能静默回落 legacy（绕开 m1a-order 锁），必须整笔拒。
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root, { recursive: true });
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({
+    ...TEMPLATE, agent_uid: null, lark_cli_bin: "/bin/false",
+  }));
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  task.session_id = "aily_session_a";
+  task.inbound_state = "bound";
+  delete task.topic_generation_state;
+  delete task.channel_generation_id;
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home };
+
+  const paused = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-unbind.mjs"),
+    "--thread-id", THREAD_A, "--apply", ...withIntent("unbind", THREAD_A, home)], { encoding: "utf-8", env });
+  assert.notEqual(paused.status, 0, "当前代码静默回落 legacy（status 0）—— 期望 fail-closed 非零");
+  assert.match(paused.stderr + paused.stdout, /agent_uid/u);
+  assert.equal(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task.status, "active", "fail-closed 不应改连接状态");
 });
 
 test("outbox 按事件键而非正文去重", () => {

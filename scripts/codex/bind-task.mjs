@@ -127,7 +127,8 @@ if (existing.ok) {
     }
     resumed = wiredResume.legacy;
   } else {
-    resumed = runResume();
+    // P1-2 ③：agent_uid 取不到 = 端点无法派生收据现场，静默回落 legacy 会绕开一致性锁（fail-closed）。
+    die("无法确定 Codex 模板 agent_uid —— 不能派生 M1a 端点，拒绝绕过一致性锁（fail-closed）");
   }
   if (!resumed.ok) die("恢复接入失败：" + resumed.reason + (resumed.error ? "（" + resumed.error + "）" : ""));
   // #R37 P1-4：legacy 已恢复但镜像不干净（release 残骸/锁残骸）→ 机器回执，不谎报 clean。

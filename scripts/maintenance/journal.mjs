@@ -671,26 +671,48 @@ export function isLedgerReceipt(doc) {
     && (doc.operation_kind === "ledger_init" || doc.operation_kind === "ledger_cutover")
     && doc.phase === "done";
 }
+/**
+ * R47 三分类（doctor ⑩）：residues 只剩真异常/说不清（block）；audits=已终结 operation 的合法审计存档；cleanables=可证明已终结的 plist 备份（可清理，不 block）。
+ * 判据逐字段不看文件名：journal 必须 readJournal 认可（schema/字段集/阶段×kind 封闭）且 phase ∈ TERMINAL_PHASES 且无 active 指向 → 审计；
+ * plist 备份须对上同 token 的已终结 journal 才算可清理，对不上（in-flight/读不出/缺席）保守当残骸。active 指向的 journal 缺失/坏 = 状态指针悬空，也是真异常。
+ * 只报告，不清理（能证明是输家的才该按受控协议清，这里不猜）。
+ */
 export function inspectMaintenanceDir({ dir } = {}) {
-  const residues = [];
-  if (typeof dir !== "string" || dir.length === 0) return { inventory: "unknown", residues };
+  const residues = [], audits = [], cleanables = [];
+  if (typeof dir !== "string" || dir.length === 0) return { inventory: "unknown", residues, audits, cleanables };
   let names;
-  try { names = fs.readdirSync(dir); } catch (err) { return err?.code === "ENOENT" ? { inventory: "ok", residues } : { inventory: "unreadable", residues: [{ path: dir, kind: "inventory", detail: "目录读不出：" + errCode(err) }] }; }
+  try { names = fs.readdirSync(dir); } catch (err) { return err?.code === "ENOENT" ? { inventory: "ok", residues, audits, cleanables } : { inventory: "unreadable", residues: [{ path: dir, kind: "inventory", detail: "目录读不出：" + errCode(err) }], audits, cleanables } }
   const active = readActive({ dir });
   const activeToken = active.state === "active" ? active.token : null;
   for (const n of names.sort()) {
     const full = path.join(dir, n);
     if (n === "active") continue;
     let m;
-    if ((m = /^([0-9a-f-]{36})\.json$/u.exec(n)) && UUID_SHAPE.test(m[1])) { if (m[1] !== activeToken) { const j = readJournal({ dir, token: m[1] }); if (j.state === "valid" && isLedgerReceipt(j.doc)) continue; residues.push({ path: full, kind: "orphan_journal", detail: j.state === "valid" ? "没有 active 指向的 journal（阶段 " + j.doc.phase + "，" + j.doc.started_at + "）—— 竞争输家或已终结未清理，只人工处置" : "没有 active 指向且读不出的 journal（" + String(j.why) + "）—— 只人工处置" }); } continue; }
+    if ((m = /^([0-9a-f-]{36})\.json$/u.exec(n)) && UUID_SHAPE.test(m[1])) {
+      if (m[1] !== activeToken) {
+        const j = readJournal({ dir, token: m[1] });
+        if (j.state === "valid" && TERMINAL_PHASES.includes(j.doc.phase)) audits.push({ path: full, token: m[1], operation_kind: j.doc.operation_kind, phase: j.doc.phase, started_at: j.doc.started_at });
+        else if (j.state === "valid") residues.push({ path: full, kind: "orphan_journal", detail: "没有 active 指向的 in-flight journal（阶段 " + j.doc.phase + "，" + j.doc.started_at + "）—— 竞争输家或中断残留，只人工处置" });
+        else residues.push({ path: full, kind: "orphan_journal", detail: "没有 active 指向且读不出的 journal（" + String(j.why) + "）—— 只人工处置" });
+      }
+      continue;
+    }
     if ((m = /^([0-9a-f-]{36})\.lease$/u.exec(n)) && UUID_SHAPE.test(m[1])) { const h = leaseHolder({ dir, token: m[1] }); if (m[1] !== activeToken) residues.push({ path: full, kind: "stale_lease", detail: "非 active operation 的租约" + (h.alive ? "（持有者 pid " + h.pid + " 仍在）" : "（持有者已不在）") + " —— 只人工处置" }); else if (h.present && !h.unreadable && !h.alive) residues.push({ path: full, kind: "dead_lease", detail: "active operation 的租约持有者 pid " + h.pid + " 已不在 —— 下一个执行者会接管" }); continue; }
     if (/^[0-9a-f-]{36}\.lease\.(reap|maint)$/u.test(n) || /^[0-9a-f-]{36}\.lease\.reaped-/u.test(n) || /^[0-9a-f-]{36}\.lease\.reap\.quarantine-/u.test(n)) { residues.push({ path: full, kind: "lease_lock_residue", detail: "租约锁家族残骸 —— node scripts/repair-publish-lock.mjs --lock " + path.join(dir, n.split(".lease")[0] + ".lease") + " 能清（.reap / 隔离），其余只人工处置" }); continue; }
     if (/^\.journal\.\d+\.[0-9a-f-]{36}\.tmp$/u.test(n)) { residues.push({ path: full, kind: "tmp", detail: "写 journal 的临时文件残骸 —— 人工删即可" }); continue; }
-    if ((m = /^([0-9a-f-]{36})\.(claude|codex)\.plist$/u.exec(n)) && UUID_SHAPE.test(m[1])) { if (m[1] !== activeToken) residues.push({ path: full, kind: "stale_backup", detail: "非 active operation 的 plist 备份 —— 只人工处置" }); continue; }
+    if ((m = /^([0-9a-f-]{36})\.(claude|codex)\.plist$/u.exec(n)) && UUID_SHAPE.test(m[1])) {
+      if (m[1] !== activeToken) {
+        const j = readJournal({ dir, token: m[1] });
+        if (j.state === "valid" && TERMINAL_PHASES.includes(j.doc.phase)) cleanables.push({ path: full, kind: "stale_backup", token: m[1], detail: "已终结 operation（" + j.doc.operation_kind + "/" + j.doc.phase + "）的 plist 定时器备份 —— 可清理（人工删即可）" });
+        else residues.push({ path: full, kind: "stale_backup", detail: "非 active operation 的 plist 备份，对账不上已终结 operation（" + (j.state === "valid" ? "阶段 " + j.doc.phase : String(j.why)) + "）—— 只人工处置" });
+      }
+      continue;
+    }
     if ((m = /^([0-9a-f-]{36})\.staged$/u.exec(n)) && UUID_SHAPE.test(m[1])) { if (m[1] !== activeToken) residues.push({ path: full, kind: "stale_staged", detail: "非 active operation 的 staged 目录（目标制品与备份）—— 只人工处置" }); continue; }
     residues.push({ path: full, kind: "unknown", detail: "维护目录里不认识的文件 —— 只人工处置" });
   }
-  return { inventory: "ok", residues };
+  if (activeToken !== null && readJournal({ dir, token: activeToken }).state !== "valid") residues.push({ path: journalPath(dir, activeToken), kind: "active_journal_missing", detail: "active 指向的 journal 缺失或读不出 —— 状态指针悬空，只人工处置" });
+  return { inventory: "ok", residues, audits, cleanables };
 }
 
 /** 租约持有者（只读，给 --status）：{ present, pid, alive } */

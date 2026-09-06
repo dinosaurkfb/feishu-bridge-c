@@ -376,8 +376,12 @@ export function runDoctor({
     const sl = inspectInstallSurfaceLock({ home });
     const slText = sl.holder.state === "held" ? "；安装面锁 pid " + sl.holder.pid + (sl.holder.alive ? "（在跑）" : "（已不在，下一个写方接管）") : sl.holder.state === "unknown" ? "；安装面锁说不清（" + sl.holder.why + "）" + sl.path : "";
     const slRes = sl.residues.length > 0 ? "；安装面锁残骸 " + sl.residues.length + " 处：" + sl.residues.slice(0, 3).map((r) => r.path + "（" + r.detail + "）").join("、") : "";
-    const mres = (mdir.inventory === "unreadable" ? "；维护目录读不出：" + mdir.residues.map((r) => r.detail).join("；") : mdir.residues.length > 0 ? "；维护目录残骸 " + mdir.residues.length + " 处：" + mdir.residues.slice(0, 3).map((r) => r.path + "（" + r.detail + "）").join("、") : "") + slText + slRes;
-    if (g.state === "absent") add("maintenance_gate", "⑩ 维护门", mres === "" || (mres === slText && sl.holder.state === "held"), "没开" + mres, null);
+    // R47 三分类：residues 只剩真异常/说不清（才 block）；audits=已终结 operation 的合法审计存档；cleanables=可证明终结的 plist 备份（给清理指路）—— 后两类只报不 block
+    const auditText = mdir.audits.length > 0 ? "；审计 journal " + mdir.audits.length + " 份（已终结 operation 的合法存档）：" + mdir.audits.slice(0, 3).map((a) => a.token.slice(0, 8) + "（" + a.operation_kind + "/" + a.phase + "）").join("、") + (mdir.audits.length > 3 ? "…" : "") : "";
+    const cleanText = mdir.cleanables.length > 0 ? "；可清理残骸 " + mdir.cleanables.length + " 处：" + mdir.cleanables.slice(0, 3).map((c) => path.basename(c.path) + "（" + c.detail + "）").join("、") + (mdir.cleanables.length > 3 ? "…" : "") : "";
+    const mres = (mdir.inventory === "unreadable" ? "；维护目录读不出：" + mdir.residues.map((r) => r.detail).join("；") : mdir.residues.length > 0 ? "；维护目录残骸 " + mdir.residues.length + " 处：" + mdir.residues.slice(0, 3).map((r) => r.path + "（" + r.detail + "）").join("、") : "") + auditText + cleanText + slText + slRes;
+    const mok = mdir.inventory !== "unreadable" && mdir.residues.length === 0 && slRes === "" && (slText === "" || sl.holder.state === "held");
+    if (g.state === "absent") add("maintenance_gate", "⑩ 维护门", mok, "没开" + mres, null);
     else if (g.state === "active") add("maintenance_gate", "⑩ 维护门", false, "开着：" + g.payload.reason + "（已 " + Math.floor(g.ageMs / 60000) + " 分钟，token " + String(g.payload.token).slice(0, 8) + "）" + (g.ageMs > 10 * 60 * 1000 ? " —— 超过 10 分钟，多半是维护中断；维护门 CLI（--status / --exit）随后续 PR 提供，此刻请人工核对 " + maintenanceGatePath() : ""), null);
     else if (g.state === "transitioning") add("maintenance_gate", "⑩ 维护门", false, "正在切换（" + g.why + "）—— 入口都按维护中处理；几毫秒的事，再跑一次仍在就是段里崩了或释放失败，转换锁在 " + maintenanceGatePath() + ".txn", null);
     else add("maintenance_gate", "⑩ 维护门", false, "读不出（" + g.why + "）—— 入口都按维护中处理；畸形制品不自动删，请人工核对 " + (g.detail ?? maintenanceGatePath()), null);

@@ -5345,17 +5345,29 @@ test("P1-1 F4（claude）反向探针①：env chat 缺失 → 不硬拒但 f4=n
   assert.equal(r.f4, null, "env chat 缺失 → f4=null（未受验不产完整 F4）");
 });
 
-test("P1-1 F4（claude）反向探针②：plain 单候选（only_pending）无码 → 仍产完整 f4（P2-① 真入口：无码认领必须能绑定）", () => {
-  const f = pendingFixture([{ id: "a", token: "aaaaaa" }]);
+test("P1-1-d F4（claude）：plain 真无码单候选（only_pending + token:null）→ owner_root_no_token_v1（三维，无 body 维）", () => {
+  const f = pendingFixture([{ id: "a", token: null }]);
   const content = '<at id="ou_t">T</at> 干活'; // 无绑定码
   const pending = findPendingBinding({ content, ...f, now: NOW2 });
   assert.equal(pending.ok, true);
   assert.equal(pending.matchedBy, "only_pending");
+  assert.equal(pending.generation.pending_token, null, "fixture 真无码");
   const r = evaluatePromotion({ event: okEvent, template: TPL, pending, now: NOW2, env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id } });
-  assert.equal(r.ok, true, "only_pending 仍放行（只有一份待绑定）");
-  assert.equal(typeof r.f4, "object", "only_pending 无码可命中 → body 维单候选收敛满足，产完整 f4（P2-①）");
+  assert.equal(r.ok, true, "only_pending 仍放行（只有一份待绑定 + 无码无到期）");
+  assert.equal(typeof r.f4, "object", "无码单候选可命中 → 产 owner_root_no_token_v1（P2-① 真入口：无码认领必须能绑定）");
   assert.equal(r.f4.matched_om, pending.generation.root_message_id, "matched_om=被认领单候选根消息 om");
-  assert.deepEqual(r.f4.matched_fields, ["chat_id", "sender", "body", "thread_root"], "标准四项");
+  assert.equal(r.f4.pending_token_state, "absent", "no-token 分支固定 pending_token_state=absent");
+  assert.deepEqual(r.f4.matched_fields, ["chat_id", "sender", "thread_root"], "精确三维（不伪造 body(码) 维）");
+});
+
+test("P1-1-d F4（claude）反向探针：无码单候选但有码在 pending → f4=null（裁定 d 条件②）", () => {
+  const f = pendingFixture([{ id: "a", token: "aaaaaa" }]); // generation 有码，但正文未引用
+  const content = '<at id="ou_t">T</at> 干活';
+  const pending = findPendingBinding({ content, ...f, now: NOW2 });
+  assert.equal(pending.matchedBy, "only_pending");
+  const r = evaluatePromotion({ event: okEvent, template: TPL, pending, now: NOW2, env: { AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id } });
+  assert.equal(r.ok, true, "有码未引用的单候选仍放宽行（不硬拒）");
+  assert.equal(r.f4, null, "pending_token 非 null → 不产 no-token proof（既不是 token 认领也没有可验证的无 token 状态）");
 });
 
 test("首次绑定走真实 newRegistryEntry → pendingDeadline：不写截止，任何时候都可认领", () => {
@@ -22775,7 +22787,7 @@ test("P1-5②：W2 换会话再认领 → rebind_session_alias（只改 aliases.
     assert.ok(b1.ok, "createB1：" + JSON.stringify(b1));
     const a1 = TAL.createA1({ endpointId: ep, requestKey: "req_seed_a1", chatId: TPL.chat_id, sessionId: "sess_old" });
     assert.ok(a1.ok, "createA1：" + JSON.stringify(a1));
-    const act = TAL.activate({ endpointId: ep, requestKey: "req_seed_act", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: { matched_om: "om_prom", matched_fields: ["chat_id", "sender", "body", "thread_root"] }, authorizedBy: TPL.frank_sender_id });
+    const act = TAL.activate({ endpointId: ep, requestKey: "req_seed_act", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: { matched_om: "om_prom", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }, authorizedBy: TPL.frank_sender_id });
     assert.ok(act.ok, "activate：" + JSON.stringify(act));
     fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
     fs.writeFileSync(path.join(bin, "claude"), ["#!/usr/bin/env node", "process.stdout.write('回答：ok\\n');"].join("\n") + "\n", { mode: 0o700 });
@@ -24792,8 +24804,9 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
   const uuid = (n) => (String(n).repeat(8) + "-1111-1111-1111-111111111111").slice(0, 36);
   const claim = (c = "a") => c.repeat(64);
   const TGT = { runtime: "claude", project_root: "/Users/dk/p", claude_session_id: uuid(2) };
-  const F4 = (om = "om_hit") => ({ matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"] });
-  const F4A = (om = "om_hit", rootOm = "om_root") => ({ root_om: rootOm, matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"] });
+  const F4 = (om = "om_hit") => ({ matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" });
+  const F4A = (om = "om_hit", rootOm = "om_root") => ({ root_om: rootOm, matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" });
+  const F4B = (om = "om_hit", rootOm = "om_root") => ({ root_om: rootOm, matched_om: om, matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" });
   const talOk = (r, m) => { assert.ok(r.ok, m + "：" + JSON.stringify(r)); return r; };
   const talLoad = (dir) => { const l = TAL.loadLedger(dir, { endpointId: EP }); assert.ok(l.ok, "load：" + JSON.stringify(l)); return l.doc; };
   const famIds = (doc, fam) => Object.entries(doc.records).filter(([, r]) => r.kind === "live" && TAL.familyOf(r.facts) === fam).map(([k]) => k);
@@ -26207,6 +26220,38 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     }
   }));
 
+  // P1-1-d：账本 G15 对 F4 判别联合的收口——token 认领→binding_token_v1（四项 present）／no-token 认领→
+  //   owner_root_no_token_v1（三项 absent）／伪造（四项+absent、三项+present、缺项、混合）→ G15 整笔拒。
+  test("P1-1-d 账本：F4 判别联合 G15——token 四项 present→B3 binding_token_v1；no-token 三项 absent→owner_root_no_token_v1；伪造即拒", () => withRoot((root, dir) => {
+    seedLedger(dir);
+    const mk = (f4, suffix) => {
+      const a1 = talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_u" + suffix, sessionId: "sess_u" + suffix }), "A1" + suffix);
+      const b1 = talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_u" + suffix, rootOm: "om_u" + suffix, lineageId: "lin_u" + suffix, bindingTarget: { runtime: "claude", project_root: "/Users/dk/p", claude_session_id: uuid(suffix === "1" ? 8 : 9) } }), "B1" + suffix);
+      const act = TAL.activate({ endpointId: EP, requestKey: rk(), b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4, authorizedBy: "ou_o" });
+      assert.ok(act.ok, "activate[" + suffix + "]：" + JSON.stringify(act));
+      return talLoad(dir).records[act.result.surviving_id];
+    };
+    // ① token 认领（四项 present）→ B3 binding_proof = binding_token_v1
+    const tokB3 = mk({ matched_om: "om_u1", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }, "1");
+    assert.equal(tokB3.binding_proof.pending_token_state, "present", "token 认领 → present");
+    assert.deepEqual(tokB3.binding_proof.matched_fields, ["chat_id", "sender", "body", "thread_root"], "token 四项");
+    // ② no-token 认领（三项 absent）→ B3 binding_proof = owner_root_no_token_v1
+    const noTokB3 = mk({ matched_om: "om_u2", matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" }, "2");
+    assert.equal(noTokB3.binding_proof.pending_token_state, "absent", "no-token 认领 → absent");
+    assert.deepEqual(noTokB3.binding_proof.matched_fields, ["chat_id", "sender", "thread_root"], "no-token 三项（无 body 维，不伪造）");
+    // ③ G15 拒绝：B3 记录被改写成伪造 proof（四项+absent / 三项+present / 混合缺项）→ ledger_corrupt。
+    //    只改 om_u1 这笔（保持 matched_om 与自身 root 一致，避免命中别的守卫掩盖 proof 判别）。
+    const corrupt = (mut) => { const d = talLoad(dir); for (const r of Object.values(d.records)) { if (r.kind === "live" && TAL.familyOf(r.facts) === "B3" && r.binding_proof?.matched_om === "om_u1") { mut(r); } } return TAL.validateLedger(d, { endpointId: EP }); };
+    assert.equal(corrupt((r) => { r.binding_proof = { kind: "pairing", authorized_by: "ou_o", authorized_at: "2026-09-04T00:00:00.000Z", matched_om: "om_u1", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "absent" }; }).reason, "ledger_corrupt", "四项但 absent（token 形但声称无证）→ 拒");
+    assert.equal(corrupt((r) => { r.binding_proof = { kind: "pairing", authorized_by: "ou_o", authorized_at: "2026-09-04T00:00:00.000Z", matched_om: "om_u1", matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "present" }; }).reason, "ledger_corrupt", "三项但 present（no-token 形但声称有证）→ 拒");
+    assert.equal(corrupt((r) => { r.binding_proof = { kind: "pairing", authorized_by: "ou_o", authorized_at: "2026-09-04T00:00:00.000Z", matched_om: "om_u1", matched_fields: ["chat_id", "sender"], pending_token_state: "present" }; }).reason, "ledger_corrupt", "部分 matched_fields 两项→ 拒（G15 禁通用部分）");
+    // ④ 兼容：legacy 四项无 pending_token_state（code 旧写）→ 按 legacy binding_token_v1 放行；三项无 state → 拒
+    // ④ 未声明判别（缺 pending_token_state）：四项/三项无 pstate 都是“无声明到底哪一种”，按裁定 d 一律视为未受验占位拒掉（
+    //    旧的伪造 no-token-as-四项 正是靠这层探测；本分支未发布，无线上 legacy 账本可兼容）。
+    assert.equal(corrupt((r) => { r.binding_proof = { kind: "pairing", authorized_by: "ou_o", authorized_at: "2026-09-04T00:00:00.000Z", matched_om: "om_u1", matched_fields: ["chat_id", "sender", "body", "thread_root"] }; }).reason, "ledger_corrupt", "四项无 pstate（旧伪造 no-token 形）→ 拒，不冒充 token");
+    assert.equal(corrupt((r) => { r.binding_proof = { kind: "pairing", authorized_by: "ou_o", authorized_at: "2026-09-04T00:00:00.000Z", matched_om: "om_u1", matched_fields: ["chat_id", "sender", "thread_root"] }; }).reason, "ledger_corrupt", "三项无 pstate → 拒");
+  }));
+
   // resolveLiveId：按 locator（session_id / root_om）解析 live 影记录 id —— claim→bind 的 b1Id、
   //   enabled 翻转的 id、void 的目标 id 共用。行为验证：① 按 session_id 命中 A1；② 按 root_om 命中 B1；
   //   ③ 未命中→locator_absent；④ 空 locator→bad_locator；⑤ 账本缺席→ledger_absent（fail-closed，不猜测）。
@@ -26263,14 +26308,14 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
 
     // REJECT B：B3 + migrated bp + pairing_merge link → 规则①
     const idB = tid("b");
-    const docB = mkDoc({ [OP2]: migSeedOp("req_b", idB, claim("2")), [OP3]: seedOrigin("req_sd_b", idB) }, { [idB]: rec(idB, { facts: facts("active", "present", "present", "present", "current"), aliases: { root_om: "om_b", session_id: "sess_B" }, binding_target: TGT, generation_lineage_id: "lin_B", origin_operation_id: OP3, binding_proof: migBp(claim("2")), locator_link_proof_ref: { by_identity: "user", kind: "pairing_merge", matched_at: at, matched_fields: mf, matched_om: "om_y" } }) });
+    const docB = mkDoc({ [OP2]: migSeedOp("req_b", idB, claim("2")), [OP3]: seedOrigin("req_sd_b", idB) }, { [idB]: rec(idB, { facts: facts("active", "present", "present", "present", "current"), aliases: { root_om: "om_b", session_id: "sess_B" }, binding_target: TGT, generation_lineage_id: "lin_B", origin_operation_id: OP3, binding_proof: migBp(claim("2")), locator_link_proof_ref: { by_identity: "user", kind: "pairing_merge", matched_at: at, matched_fields: mf, matched_om: "om_y", pending_token_state: "present" } }) });
     const vb = TAL.validateLedger(docB, { endpointId: EP });
     assert.equal(vb.reason, "ledger_corrupt", "migrated bp + pairing_merge link 应拒");
     assert.ok(vb.why.includes("binding=migrated 必须 pair link=migrated"), "混搭命中规则①：" + vb.why);
 
     // REJECT C：B3 + pairing bp + migrated link → 规则②
     const idC = tid("c");
-    const docC = mkDoc({ [OP2]: migSeedOp("req_c", idC, claim("3")), [OP3]: seedOrigin("req_sd_c", idC) }, { [idC]: rec(idC, { facts: facts("active", "present", "present", "present", "current"), aliases: { root_om: "om_c", session_id: "sess_C" }, binding_target: TGT, generation_lineage_id: "lin_C", origin_operation_id: OP3, binding_proof: { kind: "pairing", authorized_by: "ou_o", authorized_at: at, matched_fields: mf, matched_om: "om_z" }, locator_link_proof_ref: migLp(claim("3")) }) });
+    const docC = mkDoc({ [OP2]: migSeedOp("req_c", idC, claim("3")), [OP3]: seedOrigin("req_sd_c", idC) }, { [idC]: rec(idC, { facts: facts("active", "present", "present", "present", "current"), aliases: { root_om: "om_c", session_id: "sess_C" }, binding_target: TGT, generation_lineage_id: "lin_C", origin_operation_id: OP3, binding_proof: { kind: "pairing", authorized_by: "ou_o", authorized_at: at, matched_fields: mf, matched_om: "om_z", pending_token_state: "present" }, locator_link_proof_ref: migLp(claim("3")) }) });
     const vc = TAL.validateLedger(docC, { endpointId: EP });
     assert.equal(vc.reason, "ledger_corrupt", "pairing bp + migrated link 应拒");
     assert.ok(vc.why.includes("link=migrated 的 binding 只能是 migrated/retarget/attach(A3/A4 继承)"), "反向混搭命中规则②：" + vc.why);
@@ -28322,8 +28367,8 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
         aliases: { session_id: "sess_u1", root_om: OM1 },
         facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
         binding_target: { runtime: "claude", project_root: proj, claude_session_id: UUID1 },
-        binding_proof: { kind: "pairing", authorized_by: "ou_o", authorized_at: iso, matched_om: OM1, matched_fields: ["chat_id", "sender", "body", "thread_root"] },
-        locator_link_proof_ref: { kind: "pairing_merge", by_identity: "user", matched_at: iso, matched_om: OM1, matched_fields: ["chat_id", "sender", "body", "thread_root"] },
+        binding_proof: { kind: "pairing", authorized_by: "ou_o", authorized_at: iso, matched_om: OM1, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" },
+        locator_link_proof_ref: { kind: "pairing_merge", by_identity: "user", matched_at: iso, matched_om: OM1, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" },
         anchor_candidate: null, generation_lineage_id: "p1@registry" }] });
       // 分支 d 先验红路（mismatch 输出纪律）：改绑定 id → legacy 多 / shadow 多。
       process.env.FEISHU_BRIDGE_REGISTRY = writeRegistry(home, [{ root: proj, id: "p2", claude_session_id: UUID1 }]);

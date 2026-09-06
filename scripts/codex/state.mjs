@@ -1058,14 +1058,26 @@ export function evaluatePromotion({ event, template, pending, now = Date.now(), 
   }
   const matchedOm = (typeof pending?.generation?.root_message_id === "string" && pending.generation.root_message_id.length > 0)
     ? pending.generation.root_message_id : null;
-  // P1-1：完整 F4 必须**四维全受验**——只对**代码认领**（source===quoted_binding_token）要求现场 chat locator
-  //   非空且等于目标 chat（envChat===bindingChat）；缺失/不匹配任一维 → f4=null（scope_unverified 旁注不折成完整 proof）。
-  //   plain 单候选人认领（sole_pending）**无码可命中**——body 维由单候选收敛满足、chat 维由 shadow scope_unverified
-  //   兜底，照常产完整证明（与 claude 同构）。
   const chatVerified = envChat.length > 0 && typeof bindingChat === "string" && bindingChat.length > 0 && envChat === bindingChat;
+  // P1-1-d（Codex 裁定 d）：F4 判别联合，**不伪造**。plain 无码单候选（sole_pending）→ owner_root_no_token_v1
+  //   （三维 owner-root：chat/sender/thread_root，pending_token_state:"absent"），只允许同一 outer 锁内核清六件事，
+  //   任一不过 → f4=null 整笔拒（旧行为对无码单候选伪造“body(码)”维——那就是自铸证明，裁定 d 明令禁止）。
+  //   六件事收敛：① 唯一可认领 B1（sole_pending 恰一份）② pending_token 与到期字段均 null ③ sender 受验 owner
+  //   （上方已拒非 owner）④ chat 与 B1 受验 chat 相等——由上方 CHAT_MISMATCH 守卫先行保证（env chat 缺失=无矛盾=照常放行，
+  //   scope_unverified 由 shadow 记录）⑤ 引用根逐字等于 B1 root（matchedOm）⑥ 消息整条按 bind-only、正文不执行。
+  //   token 认领（quoted_binding_token）→ binding_token_v1（完整四维 present，此时 chat 必须真受验）。
   const isCodeClaim = pending?.source === "quoted_binding_token";
-  const f4 = (matchedOm && (!isCodeClaim || chatVerified))
-    ? { matched_om: matchedOm, matched_fields: ["chat_id", "sender", "body", "thread_root"] } : null;
+  const noTokenClaim = pending?.source === "sole_pending";
+  const pToken = (pending.generation?.pending_token ?? null);
+  const pExpiry = (pending.generation?.claim_expires_at ?? null);
+  const noTokenOk = matchedOm && pToken === null && pExpiry === null;
+  const f4 = matchedOm
+    ? isCodeClaim && chatVerified
+      ? { matched_om: matchedOm, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }
+      : noTokenClaim && noTokenOk
+        ? { matched_om: matchedOm, matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" }
+        : null
+    : null;
   return { ok: true, task: pending.task, f4 };
 }
 

@@ -54,6 +54,9 @@ const REQUEST_KEY_SHAPE = /^[A-Za-z0-9_.:@+-]{1,256}$/u; // 外部请求身份�
 const AUTHORIZED_BY_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u; // 授权者 sender id（有界、无控制字符，评审六 P2）
 const REASON_ENUM = ["expired", "superseded", "manual"];
 const MATCHED_FIELDS = ["chat_id", "sender", "body", "thread_root"];
+/* P1-1-d 判别联合（Codex 裁定 d）：binding_token_v1（token 证明，四维）vs owner_root_no_token_v1（无码 owner-root 配对，三维）。
+   两套都合法、都可独立验证；G15 按 pending_token_state 分支精确校验，禁止通用"部分 matched_fields"与任何 unverified 占位。 */
+const F4_NO_TOKEN_FIELDS = ["chat_id", "sender", "thread_root"];
 const OP_TYPES = ["initialize_shadow", "create_a1", "create_b1", "seed", "activate", "void", "attach_a2", "attach_a3", "anchor", "restore", "unbind", "retarget", "rebind_session_alias", "authority_cutover", "migrate_seed", "migrate_repair"];
 // migrate_repair 的 from_family / to_family 值域（§5.1 判别联合：B1→B1；{B3,B3',B4}→{B3,B3',B4}）
 const MIGRATE_FAMILIES = ["B1", "B3", "B3'", "B4"];
@@ -217,7 +220,13 @@ const targetProblem = (t) => {
   return null;
 };
 
-const matchedFieldsBad = (mf) => !(Array.isArray(mf) && mf.length === 4 && mf.every((v, i) => v === MATCHED_FIELDS[i]));
+const matchedFieldsBad = (mf, pstate) => {
+  if (pstate === "present") return !(Array.isArray(mf) && mf.length === 4 && mf.every((v, i) => v === MATCHED_FIELDS[i]));
+  if (pstate === "absent") return !(Array.isArray(mf) && mf.length === 3 && mf.every((v, i) => v === F4_NO_TOKEN_FIELDS[i]));
+  return true; // 未知/缺失 pending_token_state：非合法判别联合（G15）。
+  //   注：旧写（本分支未发布、无线上账本）只可能全缺 pstate——这正是“无声明到底哪一种”的未受验占位，
+  //   按裁定 d 直接拒，不当作 legacy token 兼容（旧的伪造 no-token-as-四项 正是要靠这层探测出来）。
+};
 
 const bindingProofProblem = (p) => {
   if (!isObj(p)) return "binding_proof 不是对象";
@@ -227,9 +236,9 @@ const bindingProofProblem = (p) => {
     if (keysOf(p) !== "authorized_at,authorized_by,claim_key,kind") return "attach proof 字段集不对";
     if (typeof p.claim_key !== "string" || !CLAIM_KEY_SHAPE.test(p.claim_key)) return "attach.claim_key 形状不对";
   } else if (p.kind === "pairing") {
-    if (keysOf(p) !== "authorized_at,authorized_by,kind,matched_fields,matched_om") return "pairing proof 字段集不对";
+    if (keysOf(p) !== "authorized_at,authorized_by,kind,matched_fields,matched_om,pending_token_state") return "pairing proof 字段集不对";
     if (typeof p.matched_om !== "string" || !OM_SHAPE.test(p.matched_om)) return "pairing.matched_om 形状不对";
-    if (matchedFieldsBad(p.matched_fields)) return "pairing.matched_fields 不是完整有序四项";
+    if (matchedFieldsBad(p.matched_fields, p.pending_token_state)) return "pairing.matched_fields 不是封闭判别联合（token 四项 / no-token 三项）";
   } else if (p.kind === "retarget") {
     if (keysOf(p) !== "authorized_at,authorized_by,kind,new_target,old_target") return "retarget proof 字段集不对";
     if (targetProblem(p.old_target) || targetProblem(p.new_target)) return "retarget old/new_target 形状不对";
@@ -249,11 +258,11 @@ const linkProofProblem = (r) => {
     if (typeof r.legacy_source_digest !== "string" || !SHA_SHAPE.test(r.legacy_source_digest)) return "link migrated.legacy_source_digest 形状不对";
     return null;
   }
-  if (keysOf(r) !== "by_identity,kind,matched_at,matched_fields,matched_om") return "link proof 字段集不对";
+  if (keysOf(r) !== "by_identity,kind,matched_at,matched_fields,matched_om,pending_token_state") return "link proof 字段集不对";
   if (r.kind !== "pairing_merge" && r.kind !== "f4_anchor") return "link proof.kind 不对";
   if (typeof r.matched_om !== "string" || !OM_SHAPE.test(r.matched_om)) return "link matched_om 形状不对";
   if (!isCanonicalIso(r.matched_at)) return "matched_at 不规范";
-  if (matchedFieldsBad(r.matched_fields)) return "link matched_fields 不是完整有序四项";
+  if (matchedFieldsBad(r.matched_fields, r.pending_token_state)) return "link matched_fields 不是封闭判别联合（token 四项 / no-token 三项）";
   if (r.by_identity !== "user") return "by_identity 只认 user";
   return null;
 };
@@ -395,9 +404,9 @@ export function tombstoneProblem(rec, id) {
   if (!isCanonicalIso(rec.merged_at)) return "merged_at 不规范";
   if (!isOperationId(rec.origin_operation_id)) return "origin_operation_id 形状不对";
   const p = rec.proof_ref;
-  if (!isObj(p) || keysOf(p) !== "kind,matched_fields,om" || p.kind !== "pairing") return "proof_ref 字段集/kind 不对";
+  if (!isObj(p) || keysOf(p) !== "kind,matched_fields,om,pending_token_state" || p.kind !== "pairing") return "proof_ref 字段集/kind 不对";
   if (typeof p.om !== "string" || !OM_SHAPE.test(p.om)) return "proof_ref.om 形状不对";
-  if (matchedFieldsBad(p.matched_fields)) return "proof_ref.matched_fields 不是完整有序四项";
+  if (matchedFieldsBad(p.matched_fields, p.pending_token_state)) return "proof_ref.matched_fields 不是封闭判别联合（token 四项 / no-token 三项）";
   return null;
 }
 
@@ -1288,7 +1297,7 @@ export function activate({ endpointId, requestKey, b1Id, a1Id, f4, authorizedBy,
       if (!b1 || b1.kind !== "live" || b1.facts.binding !== "pending") return { ok: false, reason: "b1_not_pending" };
       if (!a1 || a1.kind !== "live" || familyOf(a1.facts) !== "A1") return { ok: false, reason: "a1_not_chat" };
       if (a1.chat_id !== b1.chat_id) return { ok: false, reason: "chat_mismatch" };
-      if (!isObj(f4) || typeof f4.matched_om !== "string" || !OM_SHAPE.test(f4.matched_om) || matchedFieldsBad(f4.matched_fields)) return { ok: false, reason: "bad_f4" };
+      if (!isObj(f4) || typeof f4.matched_om !== "string" || !OM_SHAPE.test(f4.matched_om) || matchedFieldsBad(f4.matched_fields, f4.pending_token_state)) return { ok: false, reason: "bad_f4" };
       if (typeof authorizedBy !== "string" || !AUTHORIZED_BY_SHAPE.test(authorizedBy)) return { ok: false, reason: "bad_input" };
       const lineage = b1.generation_lineage_id;
       return { ok: true, next: stampAndBuild(doc, {
@@ -1301,10 +1310,10 @@ export function activate({ endpointId, requestKey, b1Id, a1Id, f4, authorizedBy,
           const s = n.records[b1Id];
           s.aliases.session_id = a1.aliases.session_id; s.facts.session = "present";
           s.facts.binding = "active"; s.facts.generation = "current"; s.facts.locator_link_proof = "present";
-          s.binding_proof = { kind: "pairing", authorized_by: authorizedBy, authorized_at: iso, matched_om: f4.matched_om, matched_fields: [...f4.matched_fields] };
-          s.locator_link_proof_ref = { kind: "pairing_merge", matched_om: f4.matched_om, matched_at: iso, matched_fields: [...f4.matched_fields], by_identity: "user" };
+          s.binding_proof = { kind: "pairing", authorized_by: authorizedBy, authorized_at: iso, matched_om: f4.matched_om, matched_fields: [...f4.matched_fields], pending_token_state: f4.pending_token_state };
+          s.locator_link_proof_ref = { kind: "pairing_merge", matched_om: f4.matched_om, matched_at: iso, matched_fields: [...f4.matched_fields], by_identity: "user", pending_token_state: f4.pending_token_state };
           s.updated_at = iso; s.origin_operation_id = opId;
-          n.records[a1Id] = { kind: "forwarding_tombstone", topic_agent_id: a1Id, forwards_to: b1Id, merged_at: iso, proof_ref: { kind: "pairing", om: f4.matched_om, matched_fields: [...f4.matched_fields] }, origin_operation_id: opId };
+          n.records[a1Id] = { kind: "forwarding_tombstone", topic_agent_id: a1Id, forwards_to: b1Id, merged_at: iso, proof_ref: { kind: "pairing", om: f4.matched_om, matched_fields: [...f4.matched_fields], pending_token_state: f4.pending_token_state }, origin_operation_id: opId };
           n.operations[opId].result.demoted_historical_id = demoted;
         },
       }) };
@@ -1372,7 +1381,7 @@ export function attachF4({ endpointId, requestKey, id, bindingTarget, claimKey, 
       if (fam !== "A1" && fam !== "A4") return { ok: false, reason: "not_attachable" };
       if (targetProblem(bindingTarget)) return { ok: false, reason: "bad_target" };
       if (typeof claimKey !== "string" || !CLAIM_KEY_SHAPE.test(claimKey) || typeof authorizedBy !== "string" || !AUTHORIZED_BY_SHAPE.test(authorizedBy)) return { ok: false, reason: "bad_input" };
-      if (!isObj(f4) || typeof f4.root_om !== "string" || !OM_SHAPE.test(f4.root_om) || typeof f4.matched_om !== "string" || !OM_SHAPE.test(f4.matched_om) || matchedFieldsBad(f4.matched_fields)) return { ok: false, reason: "bad_f4" };
+      if (!isObj(f4) || typeof f4.root_om !== "string" || !OM_SHAPE.test(f4.root_om) || typeof f4.matched_om !== "string" || !OM_SHAPE.test(f4.matched_om) || matchedFieldsBad(f4.matched_fields, f4.pending_token_state)) return { ok: false, reason: "bad_f4" };
       // A4 已有 root_om（曾 A3）时，F4 新 root 若与旧不一致 = 正面矛盾 → 拒（评审三 P1-5：不许覆盖旧证）。
       if (rec.aliases.root_om !== null && rec.aliases.root_om !== f4.root_om) return { ok: false, reason: "root_conflict" };
       if (rec.aliases.root_om === null && liveLocatorInUse(doc, f4.root_om)) return { ok: false, reason: "locator_exists" };
@@ -1381,7 +1390,7 @@ export function attachF4({ endpointId, requestKey, id, bindingTarget, claimKey, 
         r.facts.binding = "active"; r.facts.anchor = "present"; r.facts.locator_link_proof = "present";
         r.aliases.root_om = f4.root_om;
         r.binding_proof = { kind: "attach", authorized_by: authorizedBy, authorized_at: iso, claim_key: claimKey };
-        r.locator_link_proof_ref = { kind: "f4_anchor", matched_om: f4.matched_om, matched_at: iso, matched_fields: [...f4.matched_fields], by_identity: "user" };
+        r.locator_link_proof_ref = { kind: "f4_anchor", matched_om: f4.matched_om, matched_at: iso, matched_fields: [...f4.matched_fields], by_identity: "user", pending_token_state: f4.pending_token_state };
         r.binding_target = bindingTarget;
         r.updated_at = iso; r.origin_operation_id = opId;
       } }) };
@@ -1400,12 +1409,12 @@ export function anchor({ endpointId, requestKey, id, f4, now = Date.now(), env =
       if (!isId(id)) return { ok: false, reason: "bad_id" };
       const rec = doc.records[id];
       if (!rec || rec.kind !== "live" || familyOf(rec.facts) !== "A2") return { ok: false, reason: "not_a2" };
-      if (!isObj(f4) || typeof f4.root_om !== "string" || !OM_SHAPE.test(f4.root_om) || typeof f4.matched_om !== "string" || !OM_SHAPE.test(f4.matched_om) || matchedFieldsBad(f4.matched_fields)) return { ok: false, reason: "bad_f4" };
+      if (!isObj(f4) || typeof f4.root_om !== "string" || !OM_SHAPE.test(f4.root_om) || typeof f4.matched_om !== "string" || !OM_SHAPE.test(f4.matched_om) || matchedFieldsBad(f4.matched_fields, f4.pending_token_state)) return { ok: false, reason: "bad_f4" };
       if (liveLocatorInUse(doc, f4.root_om)) return { ok: false, reason: "locator_exists" };
       return { ok: true, next: stampAndBuild(doc, { opType: "anchor", inputs, result: { affected_id: id }, mutateRecords: (n, opId) => {
         const r = n.records[id];
         r.aliases.root_om = f4.root_om; r.facts.anchor = "present"; r.facts.locator_link_proof = "present";
-        r.locator_link_proof_ref = { kind: "f4_anchor", matched_om: f4.matched_om, matched_at: iso, matched_fields: [...f4.matched_fields], by_identity: "user" };
+        r.locator_link_proof_ref = { kind: "f4_anchor", matched_om: f4.matched_om, matched_at: iso, matched_fields: [...f4.matched_fields], by_identity: "user", pending_token_state: f4.pending_token_state };
         r.updated_at = iso; r.origin_operation_id = opId;
       } }) };
     },

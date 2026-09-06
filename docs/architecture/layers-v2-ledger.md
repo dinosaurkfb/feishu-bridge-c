@@ -114,7 +114,7 @@ operation lease + `current` 桩状态核验通过后，**才**允许 `acquireLoc
 ```json
 { "kind":"forwarding_tombstone", "topic_agent_id":"<被吞原id>", "forwards_to":"<存活 live id>",
   "merged_at":"<iso>",
-  "proof_ref": { "kind":"pairing", "om":"<om_>", "matched_fields":["chat_id","sender","body","thread_root"] },
+  "proof_ref": { "kind":"pairing", "om":"<om_>", "matched_fields":["chat_id","sender","body","thread_root"], "pending_token_state":"present" },
   "origin_operation_id":"<归并 op>" }
 ```
 
@@ -138,12 +138,18 @@ binding_target =
 `binding=none` ⇔ null；`∈{pending,active,dormant}` ⇔ 非 null。
 
 **`binding_proof`（四支各自封闭；retarget 支为 A′ 而增，评审四 P1-3；migrated 支为 M1a 迁移
-而增，`m1a-reconciliation.md` §3.1）**：
+而增，`m1a-reconciliation.md` §3.1）**。其中 pairing 支是**判别联合**：token 认领 →
+`binding_token_v1`（完整有序四项）；无码 owner-root 认领 → `owner_root_no_token_v1`（恰三维
+`[chat_id,sender,thread_root]`，**无 body/码 维**），二者由 `pending_token_state` 区分（裁定 d
+：不放松 F4、不伪造——无码时宁可降成三维 owner-root 证明，也不把未验 body 维塞进四项）：
 
 ```
 binding_proof =
   | { kind:"attach",   authorized_by, authorized_at, claim_key }
-  | { kind:"pairing",  authorized_by, authorized_at, matched_om, matched_fields:[完整四项] }
+  | { kind:"pairing",  authorized_by, authorized_at, matched_om,
+        matched_fields:["chat_id","sender","body","thread_root"], pending_token_state:"present" }   // binding_token_v1
+  | { kind:"pairing",  authorized_by, authorized_at, matched_om,
+        matched_fields:["chat_id","sender","thread_root"], pending_token_state:"absent" }            // owner_root_no_token_v1
   | { kind:"retarget", authorized_by, authorized_at, old_target, new_target }   // 自身即"owner 授权把 old_target 换成 new_target"的完整证明；不引用前一 proof（评审六 P1-1）。old/new 明文亦入 retarget result（§5.1），便于给定候选时核验历史
   | { kind:"migrated", authorized_by, authorized_at, migration_operation_id, legacy_source_digest }  // 迁移来源证明（不可变，不随生命周期改变）；G13-mig 判据见 §7
 ```
@@ -153,10 +159,12 @@ migration_operation_id, legacy_source_digest }`，同上）**：
 
 ```json
 { "kind":"pairing_merge"|"f4_anchor", "matched_om":"<om_>", "matched_at":"<iso>",
-  "matched_fields":["chat_id","sender","body","thread_root"], "by_identity":"user" }
+  "matched_fields":["chat_id","sender","body","thread_root"], "by_identity":"user", "pending_token_state":"present" }
 ```
 
-**F4 字段恰为完整有序四项**（G15，不是子集）。所有 id/locator/om_/fingerprint 正则
+**F4 字段必须是判别联合之一**（G15，不是子集）：`pending_token_state=="present"` → 恰四项；
+`=="absent"` → 恰三维（无 body）；**任何其它 state / 缺 state / 部分 matched_fields / 任何占位**
+→ 拒（裁定 d：禁止通用"部分匹配"与一切未受验占位）。所有 id/locator/om_/fingerprint 正则
 与长度、`reason` 枚举入实现合同。
 
 ### 4.5 逐字段族规则（双向）
@@ -330,7 +338,7 @@ P1-2）**：该 op result 的 `old/new_target` 与本记录 binding_proof 逐字
 binding_target 必 === 该 op result 的 new_target**；**G14（双向，评审五 P1-4）** `authority_mode`=shadow ⇔ operations 中**无**
 authority_cutover；=authoritative ⇔ **恰有一笔**有效 authority_cutover（cutover 与
 mode 翻转是同一不可逆提交，禁止 shadow 已含 cutover 的状态）；**G15** `matched_fields`
-恰为完整有序四项。**G13-mig（M1a，九轮 P1-1 与 m1a-reconciliation.md §5.1 同一定义）**：任一 proof 为
+必须是判别联合之一（token 四项 present / no-token 三维 absent，且 `pending_token_state` 声明的支必须与字段长度一致；其它 state/缺 state/部分/占位一律拒）。**G13-mig（M1a，九轮 P1-1 与 m1a-reconciliation.md §5.1 同一定义）**：任一 proof 为
 migrated ⇒ migration_operation_id 指向 op_type ∈ {migrate_seed, migrate_repair} 的存在 op；
 proof 的 legacy_source_digest 与该 op result 中对应本记录的 digest **逐字相等**（seed 用
 result.seeded 项、repair 用 result.repaired_id + result.legacy_source_digest）；**binding
@@ -379,7 +387,7 @@ claim/回执/幂等/卡片/锁→现行发布器（第一步 §4 保留）。
   '无 origin 引用'自动归档**（旧消息仍可能按 op_id 重放，删了就失幂等判据）；触顶
   只能显式扩容/迁移 schema（走维护入口），进受控"需维护"态。live/tombstone/voided
   的容量上限同前：文件 ≤ 1 MiB、live ≤ 512、operations ≤ 4096、matched_fields 固定
-  4、reason ≤ 200 码点、各 id/locator 按正则上限。
+  4（token 支）或 3（no-token 支，`owner_root_no_token_v1`）、reason ≤ 200 码点、各 id/locator 按正则上限。
   （备选：定义封闭重放有效期，超期请求必在 freshness/claim 层先被拒，之后才可删对应
   operation——本稿不采，除非评审要求。）
 

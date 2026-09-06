@@ -871,7 +871,7 @@ test("P1-3①：Codex 认领四维真核——evaluatePromotion 产出封闭 F4�
   assert.ok(pending.ok, "pending ok：" + JSON.stringify(pending));
   const legacy = evaluatePromotion({ event, template: TEMPLATE, pending, now, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_test" } });
   assert.equal(legacy.ok, true, "现 ① 双写 baseline 下，受验后仍归当前 task 绑定（mirror claude P1-2）");
-  assert.deepEqual(legacy.f4, { matched_om: "om_b", matched_fields: ["chat_id", "sender", "body", "thread_root"] }, "封闭 F4：matched_om=被认领代际根消息 om、matched_fields=标准四项（wirePromoteBinding 消费的是受验产物，不是自铸）");
+  assert.deepEqual(legacy.f4, { matched_om: "om_b", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }, "封闭 F4：matched_om=被认领代际根消息 om、matched_fields=标准四项（wirePromoteBinding 消费的是受验产物，不是自铸）");
   // chat 维不匹配（认领发生在错误的群里）→ 拒
   const mismatch = evaluatePromotion({ event, template: TEMPLATE, pending, now, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_other" } });
   assert.deepEqual([mismatch.ok, mismatch.reason], [false, "chat_mismatch"], "chat 维不一致→拒");
@@ -881,12 +881,12 @@ test("P1-3①：Codex 认领四维真核——evaluatePromotion 产出封闭 F4�
   assert.equal(noChat.f4, null, "envChat 缺失 → f4=null（不折成完整 pairing proof）");
 });
 
-test("P1-1：Codex evaluatePromotion 反向探针——plain 单候选（sole_pending）无码 → 仍产完整 f4（对齐 claude P2-① 真入口：无码认领必须能绑定）", () => {
+test("P1-1-d：Codex evaluatePromotion 反向探针——plain 真无码单候选（sole_pending + token:null）→ owner_root_no_token_v1（三维，无 body 维）", () => {
   const home = temp();
   const root = path.join(home, "same-project");
   fs.mkdirSync(root);
   const now = Date.parse("2026-08-22T08:00:00Z");
-  const a = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30", now });
+  const a = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: null, now });
   writeRegistryFixtureUnvalidated([a], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
   // 正文**无绑定码**（只有 @ + 一句普通话）→ pending 只能靠唯一待绑定命中（sole_pending），非绑定码精确命中
@@ -895,11 +895,31 @@ test("P1-1：Codex evaluatePromotion 反向探针——plain 单候选（sole_pe
   const pending = findPendingTask({ home, content, now });
   assert.ok(pending.ok, "pending ok：" + JSON.stringify(pending));
   assert.equal(pending.source, "sole_pending", "无绑定码→sole_pending");
+  assert.equal(pending.generation.pending_token, null, "fixture 真无码");
   const legacy = evaluatePromotion({ event, template: TEMPLATE, pending, now, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_test" } });
-  assert.equal(legacy.ok, true, "sole_pending 仍放行（只有一份待绑定）");
-  assert.equal(typeof legacy.f4, "object", "sole_pending 无码可命中 → body 维单候选收敛满足，产完整 f4（对齐 claude P2-①）");
+  assert.equal(legacy.ok, true, "sole_pending 仍放行（只有一份待绑定 + 无码无到期）");
+  assert.equal(typeof legacy.f4, "object", "无码单候选可命中 → 产 owner_root_no_token_v1（对齐 claude P2-①）");
   assert.equal(legacy.f4.matched_om, "om_a", "matched_om=被认领单候选根消息 om");
-  assert.deepEqual(legacy.f4.matched_fields, ["chat_id", "sender", "body", "thread_root"], "标准四项");
+  assert.equal(legacy.f4.pending_token_state, "absent", "no-token 分支固定 pending_token_state=absent");
+  assert.deepEqual(legacy.f4.matched_fields, ["chat_id", "sender", "thread_root"], "精确三维（不伪造 body(码) 维）");
+});
+
+test("P1-1-d：Codex evaluatePromotion 反向探针——无码单候选但有码在 pending → f4=null（裁定 d 条件②）", () => {
+  const home = temp();
+  const root = path.join(home, "same-project");
+  fs.mkdirSync(root);
+  const now = Date.parse("2026-08-22T08:00:00Z");
+  const a = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30", now });
+  writeRegistryFixtureUnvalidated([a], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const content = '<at id="ou_same">M5Codex</at>\n\u6ca1\u6709\u7ed1\u5b9a\u7801\u7684\u8bdd'; // 无绑定码但 task 有码
+  const event = { message_id: "msg_sole2", session_id: "session_sole2", sender_id: TEMPLATE.frank_sender_id, created_at_ms: now - 1000, content };
+  const pending = findPendingTask({ home, content, now });
+  assert.equal(pending.source, "sole_pending");
+  assert.notEqual(pending.generation.pending_token, null);
+  const legacy = evaluatePromotion({ event, template: TEMPLATE, pending, now, env: { AILY_CLI_CHANNEL_CHAT_ID: "oc_test" } });
+  assert.equal(legacy.ok, true, "有码未引用的单候选仍放宽行（不硬拒）");
+  assert.equal(legacy.f4, null, "pending_token 非 null → 不产 no-token proof");
 });
 
 test("P1-3①：Codex evaluatePromotion 无根消息 om → f4=null（未受验拒物化，wirePromoteBinding 消费到 bad_f4 fail-closed）", () => {

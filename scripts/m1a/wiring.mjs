@@ -27,12 +27,19 @@ const en = (v) => typeof v === "string" && v.length > 0 && v.length <= 256;
 
 /* P1-2 收尾：F4 封闭四项 —— wirePromoteBinding 只**消费**认领校验处受验的 f4，不自铸。 */
 const F4_FIELDS = ["chat_id", "sender", "body", "thread_root"];
+const F4_NO_TOKEN_FIELDS = ["chat_id", "sender", "thread_root"];
+/* P1-1-d 判别联合（Codex 裁定 d）：f4 必须在认领校验处受验，此处只消费不铸造。
+   pending_token_state==="present" → binding_token_v1（完整四维）；"absent" → owner_root_no_token_v1（三维 owner-root）。
+   G15 按判别联合分支精确校验，禁止通用“部分 matched_fields”与任何 unverified 占位。 */
 const f4Ok = (f4, locator) =>
   f4 && typeof f4 === "object"
   && typeof f4.matched_om === "string" && f4.matched_om === locator
   && Array.isArray(f4.matched_fields)
-  && f4.matched_fields.length === F4_FIELDS.length
-  && f4.matched_fields.every((v, i) => v === F4_FIELDS[i]);
+  && (f4.pending_token_state === "present"
+      ? f4.matched_fields.length === F4_FIELDS.length && f4.matched_fields.every((v, i) => v === F4_FIELDS[i])
+      : f4.pending_token_state === "absent"
+        ? f4.matched_fields.length === F4_NO_TOKEN_FIELDS.length && f4.matched_fields.every((v, i) => v === F4_NO_TOKEN_FIELDS[i])
+        : false);
 
 /* 逐 op request_key 派生（§5.1 通式；op_type 小写字母/数字/下划线）。 */
 function rk(opType, externalRequestId, entityId) {
@@ -249,7 +256,7 @@ export function wirePromoteBinding({
     // W1 引用码认领（B1 仍 pending）→ create_a1 → activate。P1-2 收尾：**只消费**认领校验处受验的
     // 封闭 f4（matched_om===locator 且 matched_fields=标准四项）；拿不到受验产物/不符 → 该笔 shadow 拒
     // （不写配对证明、不自铸）。任意 locator/owner 字符串不得 activate 出四项证明。
-    if (!f4Ok(f4, locator)) return [{ op: "promote", ok: false, reason: "bad_f4", why: "F4 必须是认领校验处受验的封闭产物（matched_om=locator 且 matched_fields=四项），wirePromoteBinding 只消费不铸造" }];
+    if (!f4Ok(f4, locator)) return [{ op: "promote", ok: false, reason: "bad_f4", why: "F4 必须是认领校验处受验的封闭判别联合（matched_om=locator 且 token 四项或 no-token 三项），wirePromoteBinding 只消费不铸造" }];
     const chatId = typeof target.chat_id === "string" ? target.chat_id : null;
     if (!en(chatId)) return [{ op: "create_a1", ok: false, reason: "bad_input", why: "target.chat_id 缺失" }];
     const kA1 = rk("create_a1", claimKey, sessionId);

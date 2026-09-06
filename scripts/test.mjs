@@ -226,7 +226,9 @@ import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs"
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
-import { acquireOperationLease, addNote as addNoteJ, addStepPrepared as addStepPreparedJ, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, enterLedgerForward, journalProblem, readActive, readJournal, releaseOperationLease, setPhase as setPhaseJ, updateJournal } from "./maintenance/journal.mjs";
+import { acquireOperationLease, addNote as addNoteJ, addStepPrepared as addStepPreparedJ, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, enterLedgerForward, isLedgerReceipt, journalProblem, readActive, readJournal, releaseOperationLease, setPhase as setPhaseJ, updateJournal, CUTOVER_JOURNAL_SCHEMA, SIDECAR_NAMES, legacy12CutoverDisposition, stagedIntendedFile } from "./maintenance/journal.mjs";
+import { stageCutoverPlan, verifyStagedPlan, removeStagedPlan, planProblem as m1bPlanProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
+import { renderExpirySidecar, renderPendingClaimsSidecar, renderPolicySidecar, readSidecarFile, validateSidecarDoc, SIDECAR_SCHEMAS } from "./m1b/sidecar-renderers.mjs";
 import * as LEDGER_OP from "./maintenance/ledger-operation.mjs";
 import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot, identitySubset, legacySourceDigest } from "./m1a/legacy-snapshot.mjs";
 import { topicAgentIdForLegacy, discriminateGeneration, effectiveBindingStatus, projectLegacySnapshot, projectShadowBFamily, reconcileLegacyEndpoint, isBFamily } from "./m1a/reconcile.mjs";
@@ -28390,6 +28392,444 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     // unseenCount < 0 分支纯防御：known > rounds 的组合会被 R41 记账闭合/last 键检查
     // 前置封锁（active+last 在场则 rounds ≥ 2），无独立可达红位，实现里保留 fail-closed。
   });
+
+/* ────────────────────────────── #R44 M1b T4：sidecar（m1a-reconciliation.md §4.1 4b/4c/4e/4e-2/4f） ──────────────────────────────
+ * 四件：journal schema 1.3 分支、sidecar step kind、staged blob 机械、三 renderer + 读取端 validator。
+ * 红测试先行：独立探针（/tmp/r44-red.mjs）78 项先红后闭合，本块为正式等价块。
+ */
+{
+  const EP44 = "endpoint_" + "a".repeat(24);
+  const SHA44 = "b".repeat(64);
+  const PLAN_SHA44 = "c".repeat(64);
+  const OM44 = "om_" + "x".repeat(10);
+  const CHAT44 = "oc_" + "y".repeat(10);
+  const UUID44 = "77777777-7777-4777-8777-777777777777";
+  const NOW44 = 1790000000000;
+  const ISO44 = (t) => new Date(t).toISOString();
+  const GEN44 = (o = {}) => ({ channel_generation_id: "g1", generation: 1, status: "active", root_message_id: OM44, session_id: "sess_u1", created_at: ISO44(NOW44), pending_token: null, claim_expires_at: null, ...o });
+  const TGS44 = (o = {}) => ({ schema_version: "1.0", artifact_type: "feishu_bridge_topic_generations", binding_id: "lin1", binding_status: "active", active_generation_id: "g1", rotation: null, generations: [GEN44()], ...o });
+  const POLICY_STATE44 = { schema_version: "1.0", binding_id: "lin1", policy_id: "mapping", policy_version: "1.0", updated_at: "2026-08-01T00:00:00.000Z", dialogue: null };
+  const binding44 = (id, o = {}) => ({ binding_id: id, enabled: undefined, root: "/tmp/r44-proj", chat_id: CHAT44,
+    state: { ...TGS44(), binding_id: id }, generation_source: "legacy_v1", binding_target: { runtime: "claude", complete: true },
+    source_files: [], source_identity: [{ source: "registry", path: "/tmp/r44-proj/registry.json", sha256: null }],
+    expires_at: "2026-08-01T12:00:00.000Z", interaction_policy_state: { ...POLICY_STATE44, binding_id: id }, ...o });
+  const eRec44 = (ta, lineage, gen) => ({ topic_agent_id: ta, chat_id: CHAT44, aliases: { session_id: "sess_u1", root_om: OM44 },
+    facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: gen },
+    generation_lineage_id: lineage, binding_target: { runtime: "claude", complete: true } });
+  const ed44 = {
+    timer: (c) => ({ id: "timer:" + c, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: SHA44, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: ISO44(NOW44), chain: null }),
+    stub: (c) => ({ id: "stub:" + c, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + UUID44, after: "versions/maintenance-" + UUID44, state: "done", at: ISO44(NOW44), chain: null }),
+    cur: (c) => ({ id: "current:" + c, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + UUID44, after: "versions/maintenance-" + UUID44, state: "done", at: ISO44(NOW44), chain: null }),
+    gate: () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: UUID44 }, after: { token: UUID44, txnUncleared: null }, state: "done", at: ISO44(NOW44), chain: null }),
+  };
+  const enterDone44 = [ed44.timer("claude"), ed44.timer("codex"), ed44.stub("claude"), ed44.stub("codex"), ed44.cur("claude"), ed44.cur("codex"), ed44.gate()];
+  const mkTempDir44 = () => fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r44-")); // 三轮 P1：根须规范路径 —— os.tmpdir() 在 mac 上经 /var symlink，先 realpath 化
+  const cutState44 = (o = {}) => ({ endpoint_id: EP44, operation_id: UUID44, fingerprint: SHA44, authority_mode: "shadow", revision: 3, ledger_sha256: SHA44, bijection_digest: null, plan_sha256: null, ...o });
+  const cutAfter44 = (o = {}) => ({ endpoint_id: EP44, operation_id: UUID44, fingerprint: SHA44, authority_mode: "authoritative", revision: 4, ledger_sha256: SHA44, bijection_digest: SHA44, plan_sha256: PLAN_SHA44, ...o });
+  const cut12State44 = () => ({ endpoint_id: EP44, operation_id: UUID44, fingerprint: SHA44, authority_mode: "shadow", revision: 3, ledger_sha256: SHA44, bijection_digest: null });
+  const cut12After44 = () => ({ endpoint_id: EP44, operation_id: UUID44, fingerprint: SHA44, authority_mode: "authoritative", revision: 4, ledger_sha256: SHA44, bijection_digest: SHA44 });
+  const mkLedger44 = (o = {}) => ({ id: "ledger:" + EP44 + ":cutover", kind: "ledger", target: EP44, backup: null, backup_sha256: null, backup_bytes: null, before: cutState44(), intended_after: cutAfter44(), after: null, state: "prepared", at: ISO44(NOW44), chain: "claude", ...o });
+  // 返修 P1-2：sidecar prepared = 11 键（after/chain 键缺席）；done 时才加 after 键（键集按 state 分派）。
+  const mkSidecar44 = (n, o = {}) => ({ id: "sidecar:" + n + ":" + EP44, kind: "sidecar", target: "ledger/" + EP44 + "/" + n + ".json", backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null }, intended_after: { exists: true, sha256: SHA44 }, state: "prepared", at: ISO44(NOW44), intended_blob: { path: "/tmp/" + UUID44 + ".staged/intended/" + n + ".json", bytes: 10, sha256: SHA44 }, ...o });
+  const threeSidecars44 = () => [mkSidecar44("expiry"), mkSidecar44("pending-claims"), mkSidecar44("policy")];
+  const doc13_44 = (o = {}) => ({ schema_version: "1.3", operation_kind: "ledger_cutover", token: UUID44, reason: "r44", started_at: ISO44(NOW44), updated_at: ISO44(NOW44), phase: "ledger_cutting_over", steps: [...enterDone44, mkLedger44(), ...threeSidecars44()], notes: [], ...o });
+  const doc12_44 = (o = {}) => ({ schema_version: "1.2", operation_kind: "ledger_cutover", token: UUID44, reason: "r44", started_at: ISO44(NOW44), updated_at: ISO44(NOW44), phase: "ledger_cutting_over", steps: [...enterDone44, mkLedger44({ before: cut12State44(), intended_after: cut12After44() })], notes: [], ...o });
+
+  test("#R44 journal：schema 1.3 分派、1.2 冻结（sidecar/plan_sha256）、1.2 cutover 三分", () => {
+    // 4b：1.3 = 1.2 + sidecar step；1.1/1.2 独立兼容照旧
+    assert.equal(CUTOVER_JOURNAL_SCHEMA, "1.3", "常量");
+    assert.deepEqual(SIDECAR_NAMES, ["expiry", "pending-claims", "policy"], "封闭三件名");
+    const op13 = createOperation({ dir: mkTempDir44(), operationKind: "ledger_cutover", reason: "r44" });
+    assert.equal(op13.ok, true, "createOperation cutover 成功");
+    assert.equal(readJournal({ dir: path.dirname(op13.lease.path), token: op13.token }).doc.schema_version, "1.3", "新 cutover 操作按 1.3 建档（红：旧版建 1.2）");
+    const d12side = doc12_44({ steps: [...doc12_44().steps, mkSidecar44("expiry")] });
+    assert.ok(journalProblem(d12side) !== null, "1.2 含 sidecar step 拒（unreadable）");
+    const d11side = { ...doc12_44(), schema_version: "1.1", steps: [...doc12_44().steps, mkSidecar44("expiry")] };
+    assert.ok(journalProblem(d11side) !== null, "1.1 含 sidecar step 拒（1.1 完全冻结）");
+    const d13gate = doc13_44({ operation_kind: "gate_swap", steps: [...enterDone44, mkSidecar44("expiry")] });
+    assert.ok(journalProblem(d13gate) !== null, "1.3 非 cutover 操作含 sidecar 拒");
+    // 1.2 冻结：cutover 状态对象禁 plan_sha256（8 键是 1.3 形状；1.2 收据历史完全冻结）
+    const d12plan = doc12_44();
+    assert.ok(journalProblem(d12plan) === null, "1.2 cutover 七键状态对象合法（手术收据兼容）");
+    const d12frozen = doc12_44({ steps: [...doc12_44().steps.map((s) => s.kind === "ledger" ? { ...s, intended_after: { ...s.intended_after, plan_sha256: PLAN_SHA44 } } : s)] });
+    assert.ok(journalProblem(d12frozen) !== null, "1.2 cutover 状态对象带 plan_sha256 拒（红：旧版放行）");
+    // 未终结 1.2 cutover fail-closed 三分
+    const disp = (o) => legacy12CutoverDisposition(doc12_44(o));
+    assert.deepEqual(disp({ phase: "drained" }), { disposition: "safe_rollback" }, "≤drained → safe_rollback（按 1.2 矩阵回退；三轮 P2：真名 drained，ledger_drained 不在封闭集）");
+    assert.deepEqual(disp({ phase: "rolling_back" }), { disposition: "safe_rollback" }, "rolling_back → safe_rollback");
+    assert.deepEqual(disp({ phase: "done" }), { disposition: "receipt" }, "done → 收据");
+    assert.deepEqual(disp({ phase: "rolled_back" }), { disposition: "receipt" }, "rolled_back → 收据");
+    assert.deepEqual(disp({ phase: "ledger_reopening" }), { disposition: "fail_closed" }, "reopening → 人工处置");
+    assert.deepEqual(disp({ phase: "ledger_cutting_over" }), { disposition: "fail_closed" }, "cutting_over → 人工处置");
+    assert.equal(legacy12CutoverDisposition(doc13_44()), null, "非 1.2 → null");
+  });
+
+  test("#R44 sidecar step 形状：id/target/blob/backup/after 逐分支 + 原子组 + phase 计数 + 4f", () => {
+    assert.equal(journalProblem(doc13_44()), null, "原子组合法：cutting_over + ledger prepared + 3 sidecar prepared");
+    const bad = (fn) => { const d = doc13_44(); fn(d); return journalProblem(d) !== null; };
+    const S = (d, n) => d.steps.find((s) => s.id === "sidecar:" + n + ":" + EP44);
+    const L = (d) => d.steps.find((s) => s.id === "ledger:" + EP44 + ":cutover");
+    // id 形状（封闭三件名 + endpoint 形状）
+    assert.ok(bad((d) => { S(d, "expiry").id = "sidecar:expiry-other:" + EP44; }), "name 不在封闭集拒");
+    assert.ok(bad((d) => { S(d, "expiry").id = "sidecar:expiry:endpoint_short"; }), "endpoint 段形状坏拒");
+    // target
+    assert.ok(bad((d) => { S(d, "expiry").target = "ledger/" + EP44 + "/expiry.jsonx"; }), "target 不符拒");
+    // intended_blob：键集、自洽、path
+    assert.ok(bad((d) => { S(d, "expiry").intended_blob.extra = 1; }), "intended_blob 键集越界拒");
+    assert.ok(bad((d) => { S(d, "expiry").intended_blob.sha256 = SHA44.slice(0, 63) + "c"; }), "blob sha ≠ intended_after.sha256 拒");
+    assert.ok(bad((d) => { S(d, "expiry").intended_blob.bytes = -1; }), "bytes 负拒");
+    assert.ok(bad((d) => { S(d, "expiry").intended_blob.path = "relative/expiry.json"; }), "path 非绝对拒");
+    assert.ok(bad((d) => { S(d, "expiry").intended_blob.path = "/tmp/" + UUID44 + ".staged/intended/other.json"; }), "path 后缀不对应 name 拒");
+    assert.ok(bad((d) => { S(d, "expiry").intended_blob.path = "/tmp/other-token.staged/intended/expiry.json"; }), "path token 段不私有拒");
+    // intended_after / before / backup 联动
+    assert.ok(bad((d) => { S(d, "expiry").intended_after.exists = false; }), "intended_after.exists=false 拒（staged 必将在场）");
+    assert.ok(bad((d) => { S(d, "expiry").before = { exists: true, sha256: SHA44 }; }), "before.exists=true 而无 backup 拒");
+    const stagedPath = "/tmp/" + UUID44 + ".staged/expiry.json";
+    assert.equal(journalProblem(doc13_44({ steps: [...enterDone44, mkLedger44(), mkSidecar44("expiry", { before: { exists: true, sha256: SHA44 }, backup: stagedPath, backup_sha256: SHA44, backup_bytes: 5 }), mkSidecar44("pending-claims"), mkSidecar44("policy")] })), null, "sidecar backup 在 <token>.staged/ 下合法");
+    assert.ok(bad((d) => { S(d, "expiry").before = { exists: true, sha256: SHA44 }; S(d, "expiry").backup = "/outside/expiry.json"; S(d, "expiry").backup_sha256 = SHA44; S(d, "expiry").backup_bytes = 5; }), "backup 不在 <token>.staged/ 下拒");
+    // after（done 时）逐字段等 intended_after
+    assert.ok(bad((d) => { S(d, "expiry").state = "done"; S(d, "expiry").after = { exists: true, sha256: SHA44.slice(0, 63) + "d" }; }), "sidecar after ≠ intended_after 拒");
+    assert.equal(journalProblem(doc13_44({ steps: [...enterDone44, mkLedger44(), mkSidecar44("expiry", { state: "done", after: { exists: true, sha256: SHA44 } }), mkSidecar44("pending-claims"), mkSidecar44("policy")] })), null, "sidecar done（after===intended_after）合法");
+    // 原子合同：0 或恰 3，三元组齐全
+    assert.ok(bad((d) => { d.steps.pop(); }), "cutting_over 只带 2 个 sidecar 拒（缺一即非法）");
+    assert.ok(bad((d) => { d.steps.push(mkSidecar44("expiry", { id: "sidecar:expiry:" + EP44 })); }), "sidecar 重复 id 拒（4 条）");
+    // ledger done ⇒ sidecar 全 done
+    assert.ok(bad((d) => { L(d).state = "done"; }), "ledger done 而 sidecar 未全 done 拒");
+    // phase 计数：前 cutover 阶段与回退族禁 sidecar
+    assert.ok(bad((d) => { d.phase = "ledger_drained"; }), "drained 带 sidecar 拒");
+    assert.ok(bad((d) => { d.phase = "rolling_back"; }), "回退族带 sidecar 拒");
+    assert.ok(bad((d) => { d.phase = "ledger_initializing"; }), "ledger_initializing 带 sidecar 拒");
+    // PHASE_REQUIRES：ledger_reopening 三 sidecar 全 done
+    assert.ok(bad((d) => { d.phase = "ledger_reopening"; }), "reopening 时 sidecar 仍 prepared 拒");
+    assert.equal(journalProblem(doc13_44({ phase: "ledger_reopening", steps: [...enterDone44, mkLedger44({ state: "done", after: cutAfter44() }), ...threeSidecars44().map((s) => ({ ...s, state: "done", after: { exists: true, sha256: SHA44 } }))] })), null, "ledger_reopening + 三 sidecar done 合法");
+    // 4f：sidecar endpoint 与 ledger endpoint 相等进校验
+    assert.ok(bad((d) => { S(d, "expiry").id = "sidecar:expiry:endpoint_" + "b".repeat(24); }), "sidecar ep ≠ ledger ep 拒（4f）");
+    // plan_sha256 合同（返修 P1-2b，maintenance-gate.md B-2 表）：before=显式 null；intended_after=plan SHA；after（非 null 时）逐字段等 intended_after。
+    const dropPlanSha = ({ plan_sha256, ...rest }) => rest;
+    assert.ok(bad((d) => { L(d).before = dropPlanSha(cutState44()); }), "cutover before 缺 plan_sha256 键拒");
+    assert.ok(bad((d) => { L(d).before = { ...cutState44(), plan_sha256: PLAN_SHA44 }; }), "cutover before.plan_sha256 非 null 拒（B-2：before 无计划锚）");
+    assert.ok(bad((d) => { L(d).intended_after = { ...cutAfter44(), plan_sha256: "xyz" }; }), "plan_sha256 非 SHA 形状拒");
+    assert.ok(bad((d) => { L(d).state = "done"; L(d).after = { ...cutAfter44(), plan_sha256: PLAN_SHA44.slice(0, 63) + "d" }; }), "cutover done after.plan_sha256 ≠ intended_after 拒");
+    assert.ok(bad((d) => { L(d).state = "done"; L(d).after = { ...cutAfter44(), plan_sha256: undefined }; }), "cutover done after 缺 plan_sha256 拒");
+    // 返修 P1-2：sidecar 键集按 state 分派 —— prepared 13 键旧形（带 after/chain）拒、带 after 键拒；done 12 键合法（上方已有）。
+    assert.ok(bad((d) => { S(d, "expiry").after = null; }), "prepared sidecar 带 after 键拒（红：首轮 13 键旧形放行）");
+    assert.ok(bad((d) => { S(d, "expiry").chain = null; }), "prepared sidecar 带 chain 键拒（红：首轮 13 键旧形放行）");
+    // 返修 P1-1：cutting_over 起恰三条 —— 零条不再合法。
+    assert.ok(bad((d) => { d.steps = d.steps.filter((s) => s.kind !== "sidecar"); }), "cutting_over 零 sidecar 拒（红：首轮允许 0）");
+    // 返修 P1-3 journal 侧：段级核（.. 段）+ 外指树（带 maintenanceDir 强核前缀；纯函数无 dir 时只核形状，外指由前缀参数拒）。
+    assert.ok(bad((d) => { S(d, "expiry").intended_blob.path = "/tmp/.." + UUID44 + ".staged/intended/expiry.json"; }), "intended_blob.path 含 .. 段拒");
+    assert.ok(journalProblem({ ...doc13_44(), steps: doc13_44().steps.map((s) => s.kind === "sidecar" ? { ...s, intended_blob: { ...s.intended_blob, path: "/evil/" + UUID44 + ".staged/intended/" + s.id.split(":")[1] + ".json" } } : s) }, { maintenanceDir: "/tmp" }) !== null, "带维护目录时外指树拒");
+    assert.equal(journalProblem(doc13_44(), { maintenanceDir: "/tmp" }), null, "维护目录前缀恰配（/tmp/<token>.staged）合法");
+    // 二轮 P1-1：1.3 是 ledger_cutover 专属判别支 —— 1.3 + 其它 kind 一律 unreadable（旧版 1.3+maintenance_gate+空 steps 过）。
+    assert.ok(journalProblem(doc13_44({ operation_kind: "maintenance_gate", steps: [] })) !== null, "1.3 + maintenance_gate + 空 steps 拒（专属判别支）");
+    assert.ok(journalProblem(doc13_44({ operation_kind: "ledger_init" })) !== null, "1.3 + ledger_init 拒");
+    // 二轮 P1-2：恰三条覆盖全部 forward-only cutover 阶段（cutting_over/reopening/reopening_incomplete/done），漏 reopening_incomplete 拒。
+    const doneLedger44 = mkLedger44({ state: "done", after: cutAfter44() });
+    const doneSidecars44 = () => threeSidecars44().map((s) => ({ ...s, state: "done", after: { exists: true, sha256: SHA44 } }));
+    assert.ok(journalProblem({ ...doc13_44(), phase: "reopening_incomplete", steps: [...enterDone44, doneLedger44] }) !== null, "reopening_incomplete 零 sidecar 拒（红：旧版只管 cutting_over/reopening/done）");
+    assert.ok(journalProblem({ ...doc13_44(), phase: "reopening_incomplete", steps: [...enterDone44, doneLedger44, doneSidecars44()[0], doneSidecars44()[2]] }) !== null, "reopening_incomplete 两条 sidecar 拒");
+    assert.equal(journalProblem({ ...doc13_44(), phase: "reopening_incomplete", steps: [...enterDone44, doneLedger44, ...doneSidecars44()] }), null, "reopening_incomplete 恰三条合法");
+    assert.ok(journalProblem({ ...doc13_44(), phase: "ledger_reopening", steps: [...enterDone44, doneLedger44, doneSidecars44()[0], doneSidecars44()[2]] }) !== null, "reopening 两条 sidecar 拒");
+    // staged 路径导出与 shape 常量
+    assert.equal(stagedIntendedFile({ dir: "/m", token: UUID44, name: "expiry" }), "/m/" + UUID44 + ".staged/intended/expiry.json", "stagedIntendedFile 路径");
+  });
+
+  test("#R44 staged-plan：0700/0600、O_EXCL 复用复验、残骸拒、锚驱动 verify、删除幂等", () => {
+    const base = mkTempDir44();
+    const dir = path.join(base, "m");
+    fs.mkdirSync(dir);
+    const blobOf = (n) => Buffer.from(JSON.stringify({ name: n }), "utf-8");
+    const shaOf44 = (b) => createHash("sha256").update(b).digest("hex");
+    const blobs = { expiry: blobOf("expiry"), pending_claims: blobOf("pending-claims"), policy: blobOf("policy") };
+    const plan = { schema_version: "m1a-cutover-plan-1", operation_token: UUID44, endpoint_id: EP44, digest: SHA44, snapshot_identity: [{ source: "registry", path: "/tmp/r44-proj/registry.json", sha256: null }], ledger: { revision: 3, sha256: SHA44 }, sidecars: { expiry: { sha256: shaOf44(blobs.expiry) }, pending_claims: { sha256: shaOf44(blobs.pending_claims) }, policy: { sha256: shaOf44(blobs.policy) } } };
+    const planBytes = Buffer.from(stableStringify(plan, 2) + "\n", "utf-8");
+    assert.equal(m1bPlanProblem(plan), null, "plan 键集封闭合法");
+    assert.ok(m1bPlanProblem({ ...plan, extra: 1 }) !== null, "plan 键集越界拒");
+    assert.ok(m1bPlanProblem({ ...plan, schema_version: "m1a-cutover-plan-2" }) !== null, "plan schema_version 封闭拒");
+    assert.ok(m1bPlanProblem({ ...plan, sidecars: { expiry: { sha256: SHA44 } } }) !== null, "plan.sidecars 缺件拒");
+    assert.deepEqual(stageCutoverPlan({ dir, token: UUID44, plan, blobs: { ...blobs, expiry: blobOf("wrong") } }), { ok: false, reason: "plan_mismatch", why: "expiry 字节 SHA 与 plan.sidecars.expiry.sha256 不符" }, "blob 与 plan SHA 不符拒（写入前核）");
+    const r1 = stageCutoverPlan({ dir, token: UUID44, plan, blobs });
+    assert.deepEqual(r1, { ok: true, reused: false, plan_bytes: planBytes.length, plan_sha256: createHash("sha256").update(planBytes).digest("hex") }, "全新 staging 成功");
+    const intended = path.join(dir, UUID44 + ".staged", "intended");
+    for (const f of ["plan.json", "expiry.json", "pending-claims.json", "policy.json"]) {
+      assert.equal(fs.statSync(path.join(intended, f)).mode & 0o777, 0o600, f + " mode 0600");
+    }
+    assert.equal(fs.statSync(path.join(dir, UUID44 + ".staged")).mode & 0o777, 0o700, "staged 目录 0700");
+    assert.equal(fs.readFileSync(path.join(intended, "plan.json"), "utf-8"), planBytes.toString("utf-8"), "plan.json 内容 = stable(plan,2)+\\n");
+    const r2 = stageCutoverPlan({ dir, token: UUID44, plan, blobs });
+    assert.equal(r2.reused, true, "同 operation 重试：SHA 全符 → 复用（红：旧版无此机械）");
+    // 残骸判定：篡改/陌生文件/缺件
+    fs.writeFileSync(path.join(intended, "expiry.json"), blobOf("tampered"));
+    assert.equal(stageCutoverPlan({ dir, token: UUID44, plan, blobs }).reason, "staged_residue", "篡改 blob → staged_residue 拒");
+    fs.rmSync(path.join(intended, "expiry.json"));
+    fs.writeFileSync(path.join(intended, "stranger.txt"), "x");
+    assert.equal(stageCutoverPlan({ dir, token: UUID44, plan, blobs }).reason, "staged_residue", "陌生文件 → staged_residue 拒");
+    fs.rmSync(path.join(intended, "stranger.txt"));
+    // 二轮 P1-5：锚 = 完整 {path,bytes,sha256}，与 journal 写的 sidecar.intended_blob 同形状
+    const anchors44 = () => Object.fromEntries(["expiry", "pending_claims", "policy"].map((k) => [k, { path: stagedIntendedFile({ dir, token: UUID44, name: k === "pending_claims" ? "pending-claims" : k }), bytes: blobs[k].length, sha256: shaOf44(blobs[k]) }]));
+    const vr = verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarAnchors: anchors44() });
+    assert.equal(vr.ok, false, "缺件后锚驱动 verify 拒");
+    assert.equal(stageCutoverPlan({ dir, token: UUID44, plan, blobs }).reason, "staged_residue", "缺件复验不过 → staged_residue（不复用）");
+    assert.equal(removeStagedPlan({ dir, token: UUID44 }).ok, true, "残骸由 removeStagedPlan 清理（stage 不代清，拒即停）");
+    assert.equal(stageCutoverPlan({ dir, token: UUID44, plan, blobs }).ok, true, "清后重 stage 成功（fresh 重写）");
+    // 锚驱动 verify：全符 ok；篡改拒
+    assert.equal(verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarAnchors: anchors44() }).ok, true, "锚驱动 verify 全符 ok");
+    fs.appendFileSync(path.join(intended, "policy.json"), "x");
+    assert.equal(verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarAnchors: anchors44() }).reason, "staged_residue", "锚驱动 verify：篡改拒");
+    // 二轮 P1-5：锚三字段完整消费 —— bytes 与盘上实读不符拒、path 与内部重算规范路径不符拒。
+    const badBytes44 = { ...anchors44(), expiry: { ...anchors44().expiry, bytes: anchors44().expiry.bytes + 1 } };
+    assert.equal(verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarAnchors: badBytes44 }).reason, "staged_residue", "锚 bytes 与盘上不符拒（红：旧版只核 SHA）");
+    const badPath44 = { ...anchors44(), expiry: { ...anchors44().expiry, path: "/tmp/evil/expiry.json" } };
+    assert.equal(verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarAnchors: badPath44 }).reason, "staged_residue", "锚 path 与规范路径不符拒");
+    // 二轮 P1-3：逐层目录核 —— intended/ 或 <token>.staged/ 整个换成外指 symlink 在 verify 层拒（不只靠末级 O_NOFOLLOW）。
+    const realIntended = path.join(dir, UUID44 + ".staged", "intended");
+    fs.rmSync(realIntended, { recursive: true });
+    fs.symlinkSync("/tmp/evil-intended-r44r2", realIntended);
+    assert.equal(verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarAnchors: anchors44() }).reason, "staged_residue", "intended 换外指 symlink 拒（红：旧版 ok:true）");
+    fs.rmSync(realIntended);
+    fs.rmSync(path.join(dir, UUID44 + ".staged"), { recursive: true });
+    fs.symlinkSync("/tmp/evil-staged-r44r2", path.join(dir, UUID44 + ".staged"));
+    assert.equal(verifyStagedPlan({ dir, token: UUID44, planSha256: r1.plan_sha256, sidecarAnchors: anchors44() }).reason, "staged_residue", "<token>.staged 换外指 symlink 拒");
+    fs.rmSync(path.join(dir, UUID44 + ".staged"));
+    assert.equal(removeStagedPlan({ dir, token: UUID44 }).ok, true, "residue 清后可重 stage");
+    assert.equal(stageCutoverPlan({ dir, token: UUID44, plan, blobs }).ok, true, "symlink 清后重 stage 成功");
+    // 二轮 P1-4：plan.json 自身受读端同一 1MiB 上限（建目录/写盘之前拒）。
+    const bigPlan44 = { ...plan, snapshot_identity: Array.from({ length: 20000 }, (_, i) => ({ source: "registry", path: "/tmp/r44-proj/registry-" + i + "-padding-padding-padding.json", sha256: null })) };
+    const bigDir44 = path.join(mkTempDir44(), "m2"); fs.mkdirSync(bigDir44);
+    const bigR44 = stageCutoverPlan({ dir: bigDir44, token: UUID44, plan: bigPlan44, blobs });
+    assert.deepEqual([bigR44.ok, bigR44.reason], [false, "plan_mismatch"], "plan 超 1MiB 拒（红：旧版只限三 blob）");
+    // 三轮 P1：maintenance 根绑定 —— dir 自身/祖先 symlink、缺席根、remove 删外部树，三方（stage/verify/remove）同一拒绝面。
+    const symBase = mkTempDir44();
+    const symReal = path.join(symBase, "real"); fs.mkdirSync(symReal);
+    const symLink = path.join(symBase, "link"); fs.symlinkSync(symReal, symLink);
+    assert.equal(stageCutoverPlan({ dir: symLink, token: UUID44, plan, blobs }).ok, false, "dir 自身 symlink → stage 拒");
+    assert.equal(removeStagedPlan({ dir: symLink, token: UUID44 }).ok, false, "dir 自身 symlink → remove 拒");
+    const ancBase = mkTempDir44();
+    const ancReal = path.join(ancBase, "real-m"); fs.mkdirSync(ancReal);
+    fs.symlinkSync(ancReal, path.join(ancBase, "link-m"));
+    const ancDir = path.join(ancBase, "link-m", "sub");
+    assert.equal(stageCutoverPlan({ dir: ancDir, token: UUID44, plan, blobs }).ok, false, "祖先 symlink → stage 拒（现在成功 → 红）");
+    const realSub = path.join(ancReal, "sub"); fs.mkdirSync(realSub);
+    const ancStage = stageCutoverPlan({ dir: realSub, token: UUID44, plan, blobs });
+    assert.equal(ancStage.ok, true, "真实树 stage 基准 ok");
+    const ancAnchors = Object.fromEntries(["expiry", "pending_claims", "policy"].map((k) => [k, { path: stagedIntendedFile({ dir: realSub, token: UUID44, name: k === "pending_claims" ? "pending-claims" : k }), bytes: blobs[k].length, sha256: shaOf44(blobs[k]) }]));
+    assert.equal(verifyStagedPlan({ dir: ancDir, token: UUID44, planSha256: ancStage.plan_sha256, sidecarAnchors: ancAnchors }).ok, false, "祖先 symlink → verify 拒（现在 ok:true → 红）");
+    const extBase = mkTempDir44();
+    const ext = path.join(extBase, "ext", "m"); fs.mkdirSync(ext, { recursive: true });
+    fs.symlinkSync(path.join(extBase, "ext"), path.join(extBase, "link"));
+    stageCutoverPlan({ dir: ext, token: UUID44, plan, blobs });
+    const stagedInExt = path.join(ext, UUID44 + ".staged");
+    assert.equal(removeStagedPlan({ dir: path.join(extBase, "link", "m"), token: UUID44 }).ok, false, "经 symlink 词法根 remove 拒");
+    assert.equal(fs.existsSync(stagedInExt), true, "remove 不得删外部树（外部 staged 完好）");
+    const absentDir = path.join(mkTempDir44(), "absent-root");
+    assert.equal(stageCutoverPlan({ dir: absentDir, token: UUID44, plan, blobs }).ok, false, "缺席根 → stage 拒（不代建）");
+    assert.equal(fs.existsSync(absentDir), false, "缺席根未被 recursive 顺手创建");
+    // 四轮 P2：lstat 只有 ENOENT 是缺席；EIO/EACCES 等报「核验失败」并保留错误码（fail-closed 同拒，事实投影改对）。
+    const realLstat44 = fs.lstatSync;
+    let eioN44 = 0;
+    fs.lstatSync = (...a) => { if (eioN44++ === 0) { const e = new Error("input/output error"); e.code = "EIO"; throw e; } return realLstat44(...a); };
+    const eioStage = stageCutoverPlan({ dir, token: UUID44, plan, blobs });
+    fs.lstatSync = realLstat44;
+    assert.ok(eioStage.ok === false && (eioStage.why ?? "").includes("核验失败") && (eioStage.why ?? "").includes("EIO") && !(eioStage.why ?? "").includes("缺席"), "EIO → 报核验失败并留错误码，不报缺席");
+    const eioAbsent = path.join(mkTempDir44(), "nope");
+    assert.ok(stageCutoverPlan({ dir: eioAbsent, token: UUID44, plan, blobs }).why.includes("缺席"), "ENOENT → 仍报缺席（语义分派不回归）");
+    // 目录 mode 降级拒
+    const base2 = mkTempDir44(); const dir2 = path.join(base2, "m"); fs.mkdirSync(dir2);
+    stageCutoverPlan({ dir: dir2, token: UUID44, plan, blobs });
+    fs.chmodSync(path.join(dir2, UUID44 + ".staged"), 0o755);
+    const rd = stageCutoverPlan({ dir: dir2, token: UUID44, plan, blobs });
+    assert.equal(rd.reason, "staged_residue", "staged 目录 mode 降级拒（private 不许放宽）");
+    // 受验读：mode 不符拒（readRegularFile 不核 mode，staged/sidecar 用自验函数）
+    const base3 = mkTempDir44(); const dir3 = path.join(base3, "m"); fs.mkdirSync(dir3);
+    stageCutoverPlan({ dir: dir3, token: UUID44, plan, blobs });
+    fs.chmodSync(path.join(dir3, UUID44 + ".staged", "intended", "expiry.json"), 0o644);
+    assert.equal(readStagedVerified(path.join(dir3, UUID44 + ".staged", "intended", "expiry.json"), { sha256: SHA44 }).why, "mode 不是 0600", "受验读：mode 不符拒");
+    // 删除幂等
+    assert.equal(removeStagedPlan({ dir: dir3, token: UUID44 }).ok, true, "remove 成功");
+    assert.equal(removeStagedPlan({ dir: dir3, token: UUID44 }).ok, true, "remove 幂等（absent 也成功）");
+    assert.equal(fs.existsSync(path.join(dir3, UUID44 + ".staged")), false, "删除后目录不在");
+    // ── 返修断言（红：首轮评审 P1-3/P1-4/P1-5/P1-6）──
+    // P1-3：token 必须 UUID 且 === plan.operation_token；.staged 是外指 symlink 拒；remove 遍历 token 拒。
+    assert.equal(stageCutoverPlan({ dir, token: "../escape", plan, blobs }).reason, "plan_mismatch", "stage token=../escape 拒（红：旧版不核 token 形状）");
+    assert.equal(removeStagedPlan({ dir, token: "../victim" }).ok, false, "remove token=../victim 拒（红：旧版能删外部）");
+    const otherToken = "66666666-6666-4666-8666-666666666666";
+    assert.equal(stageCutoverPlan({ dir, token: UUID44, plan: { ...plan, operation_token: otherToken }, blobs }).why, "token 与 plan.operation_token 不一致", "stage token ≠ plan.operation_token 拒");
+    const base4 = mkTempDir44(); const dir4 = path.join(base4, "m"); fs.mkdirSync(dir4);
+    const outsideTarget = path.join(base4, "outside"); fs.mkdirSync(outsideTarget);
+    fs.symlinkSync(outsideTarget, path.join(dir4, UUID44 + ".staged"));
+    assert.equal(stageCutoverPlan({ dir: dir4, token: UUID44, plan, blobs }).reason, "staged_residue", ".staged 为外指 symlink 拒（红：旧版 statSync 跟随放行照写）");
+    assert.equal(fs.readdirSync(outsideTarget).length, 0, "外指目标内零写入");
+    // P1-4：复用分支在 reused:true 前必须重新 fsync intended/ 目录 —— 目录屏障 EIO 不可豁免 → io_error。
+    // 复用路径的目录 fsync 序：mkdirDurable(staged)=1、mkdirDurable(intended)=2、fsyncDir(intended)=3（P1-4 屏障）；文件 fsync 不计。
+    // 用干净现场（上方 dir 的 policy.json 被篡改段污染，会先落在 staged_residue）。
+    const base5 = mkTempDir44(); const dir5 = path.join(base5, "m"); fs.mkdirSync(dir5);
+    assert.equal(stageCutoverPlan({ dir: dir5, token: UUID44, plan, blobs }).ok, true, "P1-4 现场先 fresh 成功");
+    const realFsyncSync = fs.fsyncSync;
+    try {
+      let dirFsyncSeen = 0;
+      fs.fsyncSync = (fd) => { const st = fs.fstatSync(fd); if (st.isDirectory() && ++dirFsyncSeen >= 3) throw Object.assign(new Error("EIO"), { code: "EIO" }); return realFsyncSync(fd); };
+      const rEio = stageCutoverPlan({ dir: dir5, token: UUID44, plan, blobs });
+      assert.equal(rEio.reason, "io_error", "复用前目录 fsync EIO → io_error（红：旧版 reused:true 绕过屏障）");
+      assert.equal(rEio.reused, undefined, "EIO 时不得返回 reused");
+    } finally { fs.fsyncSync = realFsyncSync; }
+    assert.equal(stageCutoverPlan({ dir: dir5, token: UUID44, plan, blobs }).reused, true, "屏障恢复后复用照旧");
+    // P1-6：blob >1MiB 写入前拒；受验读 st.size 上限先于 alloc。
+    assert.ok(stageCutoverPlan({ dir: dir5, token: UUID44, plan: { ...plan, sidecars: { ...plan.sidecars, policy: { sha256: createHash("sha256").update(Buffer.alloc(1024 * 1024 + 1)).digest("hex") } } }, blobs: { ...blobs, policy: Buffer.alloc(1024 * 1024 + 1) } }).why.includes("超过 1MiB"), "stage blob >1MiB 拒（红：旧版照写）");
+    const bigFile = path.join(intended, "big.bin");
+    fs.writeFileSync(bigFile, Buffer.alloc(1024 * 1024 + 1), { mode: 0o600 });
+    assert.ok(readStagedVerified(bigFile, { sha256: SHA44 }).why.includes("超过 1MiB"), "readStagedVerified >1MiB 拒（上限先于 alloc）");
+    fs.rmSync(bigFile);
+    // P1-5：FIFO 无写者不挂死（子进程隔离 + 5s 守卫；红：旧版 openSync 阻塞事件循环）。
+    const fifoScript = "const { execSync } = require('node:child_process');const fs = require('node:fs');const f = process.argv[1] + '.fifo';try { fs.unlinkSync(f); } catch {}execSync('mkfifo ' + JSON.stringify(f));" +
+      "Promise.all([import(" + JSON.stringify(new URL("./m1b/staged-plan.mjs", import.meta.url).pathname) + "), import(" + JSON.stringify(new URL("./m1b/sidecar-renderers.mjs", import.meta.url).pathname) + ")]).then(([sp, sr]) => { const a = sp.readStagedVerified(f, { sha256: " + JSON.stringify(SHA44) + " }); const b = sr.readSidecarFile(f, 'expiry'); console.log(JSON.stringify({ a: a.ok === false, b: b.ok === false })); process.exit(a.ok === false && b.ok === false ? 0 : 2); });";
+    const fr = spawnSync(process.execPath, ["-e", fifoScript, path.join(mkTempDir44(), "p")], { timeout: 5000, encoding: "utf-8" });
+    assert.equal(fr.status, 0, "FIFO 受验读立即拒不挂死（P1-5，红：旧版 rc=null 挂死）");
+  });
+
+  test("#R44 renderer：expiry/pending-claims/policy 确定性、默认条目、去重、交叉不变量", () => {
+    const ta1 = topicAgentIdForLegacy(EP44, "lin1", "g1");
+    const ta2 = topicAgentIdForLegacy(EP44, "lin2", "g1");
+    const ta3 = topicAgentIdForLegacy(EP44, "lin3", "g1");
+    const bindings = [binding44("lin1"), binding44("lin2", { expires_at: "2026-08-02T00:00:00.000Z", interaction_policy_state: null, state: { ...TGS44(), binding_id: "lin2", generations: [GEN44({ pending_token: "abc123", claim_expires_at: "2026-09-01T00:00:00.000Z" })] } }), binding44("lin3", { expires_at: null, interaction_policy_state: null, state: { ...TGS44(), binding_id: "lin3", generations: [GEN44({ pending_token: null })] } })];
+    // expiry：E 每记录 → binding.expires_at 规范化；缺席（null）fail-closed
+    const E1 = new Map([[ta1, eRec44(ta1, "lin1", "current")]]);
+    const ex = renderExpirySidecar({ endpointId: EP44, bindings, E: E1 });
+    assert.equal(ex.ok, true, "expiry 渲染成功");
+    assert.deepEqual(JSON.parse(ex.bytes.toString("utf-8")), { schema_version: "expiry-1", endpoint_id: EP44, entries: { [ta1]: "2026-08-01T12:00:00.000Z" } }, "expiry 条目规范化");
+    assert.equal(ex.bytes[ex.bytes.length - 1], 0x0a, "尾部恰一换行");
+    assert.deepEqual(renderExpirySidecar({ endpointId: EP44, bindings, E: new Map() }).ok, true, "E 空 → entries:{} 合法");
+    const ex2 = renderExpirySidecar({ endpointId: EP44, bindings, E: new Map([[ta3, eRec44(ta3, "lin3", "current")]]) });
+    assert.deepEqual(ex2, { ok: false, reason: "legacy_unreadable", why: "expires_at 不可规范化" }, "expires_at 缺席 → legacy_unreadable（红：旧版跳过）");
+    const exBad = renderExpirySidecar({ endpointId: EP44, bindings: bindings.map((b) => b.binding_id === "lin1" ? { ...b, expires_at: "not-a-date" } : b), E: E1 });
+    assert.equal(exBad.reason, "legacy_unreadable", "expires_at 不可解析拒");
+    // E 记录形状封闭（六字段）
+    const eBad = renderExpirySidecar({ endpointId: EP44, bindings, E: new Map([[ta1, { ...eRec44(ta1, "lin1", "current"), extra: 1 }]]) });
+    assert.ok(eBad.ok === false && eBad.reason === "legacy_unreadable", "期望记录字段集越界拒");
+    // 二轮 P2-2：Map key 与 record.topic_agent_id 身份相等；key===id 且 Map 键唯一 ⇒ 记录 ID 唯一
+    const eWrongKey = renderExpirySidecar({ endpointId: EP44, bindings, E: new Map([[ta2, eRec44(ta1, "lin1", "current")]]) });
+    assert.ok(eWrongKey.ok === false && eWrongKey.reason === "legacy_unreadable", "错 key 合法 value 拒（红：旧版只遍历 values）");
+    const eLin = renderExpirySidecar({ endpointId: EP44, bindings: [bindings[0], { ...bindings[0] }], E: E1 });
+    assert.ok(eLin.ok === false && eLin.reason === "legacy_unreadable", "lineage 双投影拒（必须恰一）");
+    // pending-claims：仅 B1；token/claim 取值；蕴含 token===null ⇒ claim===null
+    const pend = renderPendingClaimsSidecar({ endpointId: EP44, bindings, E: new Map([[ta2, eRec44(ta2, "lin2", "pending")], [ta3, eRec44(ta3, "lin3", "pending")]]) });
+    assert.equal(pend.ok, true, "pending-claims 渲染成功");
+    assert.deepEqual(JSON.parse(pend.bytes.toString("utf-8")), { schema_version: "pending-claims-1", endpoint_id: EP44, entries: { [ta2]: { token: "abc123", claim_expires_at: "2026-09-01T00:00:00.000Z" }, [ta3]: { token: null, claim_expires_at: null } } }, "B1 条目取值（token/claim 与蕴含）");
+    const pendCur = renderPendingClaimsSidecar({ endpointId: EP44, bindings, E: new Map([[ta1, eRec44(ta1, "lin1", "current")]]) });
+    assert.deepEqual(JSON.parse(pendCur.bytes.toString("utf-8")).entries, {}, "非 pending 代际不进待认领表");
+    const pendBadTok = renderPendingClaimsSidecar({ endpointId: EP44, bindings: [binding44("lin1", { state: { ...TGS44(), generations: [GEN44({ pending_token: "ZZZZZZ" })] } })], E: new Map([[ta1, eRec44(ta1, "lin1", "pending")]]) });
+    assert.equal(pendBadTok.reason, "legacy_unreadable", "pending_token 形状越界拒");
+    const pendBadImpl = renderPendingClaimsSidecar({ endpointId: EP44, bindings: [binding44("lin1", { state: { ...TGS44(), generations: [GEN44({ pending_token: null, claim_expires_at: "2026-09-01T00:00:00.000Z" })] } })], E: new Map([[ta1, eRec44(ta1, "lin1", "pending")]]) });
+    assert.equal(pendBadImpl.reason, "legacy_unreadable", "token===null 而 claim 在场拒（蕴含违反）");
+    const pendNoGen = renderPendingClaimsSidecar({ endpointId: EP44, bindings, E: new Map([[topicAgentIdForLegacy(EP44, "lin1", "g9"), eRec44(topicAgentIdForLegacy(EP44, "lin1", "g9"), "lin1", "pending")]]) });
+    assert.equal(pendNoGen.reason, "legacy_unreadable", "B1 记录无法唯一回溯 generation 拒");
+    // policy：原样搬运 / 默认条目（哨兵 updated_at）/ 交叉不变量 / 去重 / ipsp 接线
+    const pol = renderPolicySidecar({ endpointId: EP44, bindings, E: new Map([[ta1, eRec44(ta1, "lin1", "current")], [ta2, eRec44(ta2, "lin2", "current")]]) });
+    assert.equal(pol.ok, true, "policy 渲染成功");
+    const polDoc = JSON.parse(pol.bytes.toString("utf-8"));
+    const psid1 = policySubjectId({ kind: "lineage", endpointId: EP44, id: "lin1" });
+    const psid2 = policySubjectId({ kind: "lineage", endpointId: EP44, id: "lin2" });
+    assert.ok(/^ps_[0-9a-f]{32}$/.test(psid1), "policy_subject_id 派生形状");
+    const got = polDoc.entries[psid1];
+    assert.ok(got && Object.keys(POLICY_STATE44).every((k) => JSON.stringify(got[k]) === JSON.stringify(POLICY_STATE44[k])) && Object.keys(got).length === Object.keys(POLICY_STATE44).length, "条目原样搬运（逐字段）");
+    assert.deepEqual(polDoc.entries[psid2], { schema_version: "1.0", binding_id: "lin2", policy_id: "mapping", policy_version: "1.0", updated_at: "1970-01-01T00:00:00.000Z", dialogue: null }, "缺席 policy → Mapping 默认条目（哨兵 updated_at，红：旧版无此分支）");
+    // 去重：同 lineage 两个 generation（同 subject）→ 逐字等去重
+    const E3 = new Map([[ta1, eRec44(ta1, "lin1", "current")], [topicAgentIdForLegacy(EP44, "lin1", "g2"), eRec44(topicAgentIdForLegacy(EP44, "lin1", "g2"), "lin1", "drained")]]);
+    const polDup = renderPolicySidecar({ endpointId: EP44, bindings: [binding44("lin1", { state: { ...TGS44(), generations: [GEN44(), GEN44({ channel_generation_id: "g2" })] } })], E: E3 });
+    assert.equal(polDup.ok, true, "同 subject 逐字等去重");
+    assert.equal(Object.keys(JSON.parse(polDup.bytes.toString("utf-8")).entries).length, 1, "去重后恰一条");
+    // 交叉不变量：条目 binding_id ≠ subject 派生输入拒
+    const polX = renderPolicySidecar({ endpointId: EP44, bindings: [binding44("lin1", { interaction_policy_state: { ...POLICY_STATE44, binding_id: "linX" } })], E: E1 });
+    assert.equal(polX.reason, "legacy_unreadable", "交叉不变量拒（红：旧版无此检查）");
+    // ipsp 接线：坏条目拒
+    const polI = renderPolicySidecar({ endpointId: EP44, bindings: [binding44("lin1", { interaction_policy_state: { ...POLICY_STATE44, updated_at: "not-a-date" } })], E: E1 });
+    assert.ok(polI.ok === false && polI.reason === "legacy_unreadable", "interaction_policy_state 不合法拒（ipsp 接线）");
+    // 冲突分支：恰一约束下不可达（同 binding_id 条目恒同源），保留为防御深度；去重由双 generation 钉住。
+    // 确定性：同输入两次渲染字节级一致
+    assert.deepEqual(renderPolicySidecar({ endpointId: EP44, bindings, E: new Map([[ta1, eRec44(ta1, "lin1", "current")], [ta2, eRec44(ta2, "lin2", "current")]]) }), pol, "同输入字节级可复现");
+    // ── 返修断言（红：首轮评审 P1-6 / P2-1）──
+    // P1-6：渲染后自证 validateSidecarDoc + ≤512 条 —— 513 条合法输入不再产出读取端必拒的制品。
+    const bigBindings = Array.from({ length: 513 }, (_, i) => binding44("lin" + i, { state: { ...TGS44(), binding_id: "lin" + i, generations: [GEN44()] } }));
+    const bigE = new Map(bigBindings.map((b) => [topicAgentIdForLegacy(EP44, b.binding_id, "g1"), eRec44(topicAgentIdForLegacy(EP44, b.binding_id, "g1"), b.binding_id, "current")]));
+    const bigEx = renderExpirySidecar({ endpointId: EP44, bindings: bigBindings, E: bigE });
+    assert.ok(bigEx.ok === false && (bigEx.why ?? "").includes("超过 512"), "513 条渲染自证拒（红：旧版产出读取端必拒制品）");
+    const numTok = renderPendingClaimsSidecar({ endpointId: EP44, bindings: [binding44("lin1", { state: { ...TGS44(), generations: [GEN44({ pending_token: 123456 })] } })], E: new Map([[ta1, eRec44(ta1, "lin1", "pending")]]) });
+    assert.equal(numTok.reason, "legacy_unreadable", "pending_token 数字 123456 拒（红：正则 test 隐式强转放行）");
+    // P2-1：validateSidecarDoc 未知 name 返问题串，不裸抛 TypeError。
+    assert.equal(typeof validateSidecarDoc({ schema_version: undefined }, "nope"), "string", "未知 name 返问题串不抛（红：entryChecks 裸 TypeError）");
+  });
+
+  test("#R44 读取端：fd 绑定 0600/0700、≤1MiB、≤512 条、三键根、值域封闭", () => {
+    const base = mkTempDir44();
+    const doc = { schema_version: "expiry-1", endpoint_id: EP44, entries: { ["ta_" + "a".repeat(32)]: "2026-08-01T12:00:00.000Z" } };
+    const bytes = Buffer.from(stableStringify(doc, 2) + "\n", "utf-8");
+    const file = path.join(base, "expiry.json");
+    fs.writeFileSync(file, bytes, { mode: 0o600 });
+    fs.chmodSync(base, 0o700);
+    const read = () => readSidecarFile({ file, endpointId: EP44, name: "expiry" });
+    assert.equal(read().ok, true, "合法 sidecar 读取");
+    fs.chmodSync(file, 0o644);
+    assert.equal(read().why, "mode 不是 0600", "mode 0644 拒（红：readRegularFile 不核 mode）");
+    fs.chmodSync(file, 0o600);
+    fs.chmodSync(base, 0o755);
+    assert.equal(read().why, "父目录不是 0700", "父目录 0755 拒");
+    fs.chmodSync(base, 0o700);
+    fs.symlinkSync(file, path.join(base, "link.json"));
+    assert.ok(readSidecarFile({ file: path.join(base, "link.json"), endpointId: EP44, name: "expiry" }).why !== undefined, "symlink 拒（O_NOFOLLOW）");
+    fs.unlinkSync(path.join(base, "link.json"));
+    fs.linkSync(file, path.join(base, "hard.json"));
+    assert.ok(readSidecarFile({ file: path.join(base, "hard.json"), endpointId: EP44, name: "expiry" }).why !== undefined, "双硬链接拒（nlink=2）");
+    fs.unlinkSync(path.join(base, "hard.json"));
+    // 值域 / 形状（纯函数面）
+    const TA = "ta_" + "a".repeat(32);
+    const PSID = "ps_" + "a".repeat(32);
+    const okPol = { schema_version: "policy-1", endpoint_id: EP44, entries: { [PSID]: { ...POLICY_STATE44 } } };
+    assert.equal(validateSidecarDoc(okPol, "policy", { endpointId: EP44 }), null, "policy 读取端合法（ipsp 接线）");
+    assert.ok(validateSidecarDoc(okPol, "policy", { endpointId: "endpoint_" + "b".repeat(24) }) !== null, "endpoint_id 与账本不一致拒");
+    assert.ok(validateSidecarDoc({ ...okPol, extra: 1 }, "policy", { endpointId: EP44 }) !== null, "根键集越界拒");
+    assert.ok(validateSidecarDoc({ ...okPol, schema_version: "expiry-1" }, "policy", { endpointId: EP44 }) !== null, "schema_version 与 name 不符拒");
+    assert.ok(validateSidecarDoc({ schema_version: "expiry-1", endpoint_id: EP44, entries: { [TA]: "2026-08-01T12:00:00+08:00" } }, "expiry", { endpointId: EP44 }) !== null, "expiry 值非规范化 ISO 拒");
+    assert.ok(validateSidecarDoc({ schema_version: "expiry-1", endpoint_id: EP44, entries: { [PSID]: "2026-08-01T12:00:00.000Z" } }, "expiry", { endpointId: EP44 }) !== null, "expiry 键非 topic_agent_id 拒");
+    assert.ok(validateSidecarDoc({ schema_version: "pending-claims-1", endpoint_id: EP44, entries: { [TA]: { token: "ZZZZZZ", claim_expires_at: null } } }, "pending-claims", { endpointId: EP44 }) !== null, "pending-claims token 形状越界拒");
+    assert.ok(validateSidecarDoc({ schema_version: "pending-claims-1", endpoint_id: EP44, entries: { [TA]: { token: null, claim_expires_at: "2026-08-01T12:00:00.000Z" } } }, "pending-claims", { endpointId: EP44 }) !== null, "pending-claims 蕴含违反拒");
+    assert.ok(validateSidecarDoc({ schema_version: "policy-1", endpoint_id: EP44, entries: { [TA]: { ...POLICY_STATE44 } } }, "policy", { endpointId: EP44 }) !== null, "policy 键非 psid 拒");
+    assert.ok(validateSidecarDoc({ schema_version: "policy-1", endpoint_id: EP44, entries: { [PSID]: { ...POLICY_STATE44, updated_at: "nope" } } }, "policy", { endpointId: EP44 }) !== null, "policy 条目 ipsp 不过拒");
+    // ≤512 条 / ≤1MiB
+    const many = {}; for (let i = 0; i < 513; i++) many["ta_" + i.toString(16).padStart(32, "0")] = "2026-08-01T12:00:00.000Z";
+    assert.ok(validateSidecarDoc({ schema_version: "expiry-1", endpoint_id: EP44, entries: many }, "expiry", { endpointId: EP44 }) !== null, "513 条拒");
+    const exactly = {}; for (let i = 0; i < 512; i++) exactly["ta_" + i.toString(16).padStart(32, "0")] = "2026-08-01T12:00:00.000Z";
+    assert.equal(validateSidecarDoc({ schema_version: "expiry-1", endpoint_id: EP44, entries: exactly }, "expiry", { endpointId: EP44 }), null, "恰 512 条合法");
+    const big = Buffer.alloc(1024 * 1024 + 1, 0x20);
+    fs.writeFileSync(path.join(base, "big.json"), big, { mode: 0o600 });
+    assert.equal(readSidecarFile({ file: path.join(base, "big.json"), endpointId: EP44, name: "expiry" }).why.indexOf("1MiB") >= 0, true, "超 1MiB 拒");
+    fs.writeFileSync(path.join(base, "bad.json"), "{not json", { mode: 0o600 });
+    assert.ok(readSidecarFile({ file: path.join(base, "bad.json"), endpointId: EP44, name: "expiry" }).why !== undefined, "非 JSON 拒");
+    assert.ok(readSidecarFile({ file: path.join(base, "absent.json"), endpointId: EP44, name: "expiry" }).reason !== undefined, "缺席 → sidecar_unreadable");
+  });
+
+  test("#R44 二轮 P2-1：1.3 done 收据进共用识别面（isLedgerReceipt + endpointReceipt 聚合）", () => {
+    // 行为验证：init（1.2）+ cutover（1.3）双双 done 落盘 → endpointReceipt ok；缺 1.3 识别时旧版把 cutover 收据聚合为 never_initialized 且目录盘点报 orphan
+    const base = mkTempDir44();
+    const dir = path.join(base, "m");
+    fs.mkdirSync(dir);
+    const UUID44B = "88888888-8888-4888-8888-888888888888";
+    const retarget = (s) => s.kind === "stub" || s.kind === "current"
+      ? { ...s, target: String(s.target).replaceAll(UUID44, UUID44B), intended_after: typeof s.intended_after === "string" ? s.intended_after.replaceAll(UUID44, UUID44B) : s.intended_after, after: typeof s.after === "string" ? s.after.replaceAll(UUID44, UUID44B) : s.after }
+      : s.kind === "gate" ? { ...s, intended_after: { token: UUID44B }, after: { token: UUID44B, txnUncleared: null } }
+      : s;
+    const initState44 = () => ({ endpoint_id: EP44, operation_id: UUID44B, fingerprint: SHA44, authority_mode: null, revision: null, ledger_sha256: null });
+    const initAfter44 = () => ({ endpoint_id: EP44, operation_id: UUID44B, fingerprint: SHA44, authority_mode: "shadow", revision: 1, ledger_sha256: SHA44 });
+    const initDone = { schema_version: "1.2", operation_kind: "ledger_init", token: UUID44B, reason: "r44", started_at: ISO44(NOW44), updated_at: ISO44(NOW44), phase: "done", steps: [...enterDone44.map(retarget), { id: "ledger:" + EP44 + ":init", kind: "ledger", target: EP44, backup: null, backup_sha256: null, backup_bytes: null, before: initState44(), intended_after: initAfter44(), after: initAfter44(), state: "done", at: ISO44(NOW44), chain: "claude" }], notes: [] };
+    const cutoverDone = doc13_44({ phase: "done", steps: [...enterDone44, mkLedger44({ state: "done", after: cutAfter44() }), ...threeSidecars44().map((s) => ({ ...s, state: "done", after: { exists: true, sha256: SHA44 }, intended_blob: { ...s.intended_blob, path: path.join(dir, UUID44 + ".staged", "intended", s.id.split(":")[1] + ".json") } }))] });
+    fs.writeFileSync(path.join(dir, UUID44B + ".json"), Buffer.from(stableStringify(initDone, 2) + "\n", "utf-8"), { mode: 0o600 });
+    fs.writeFileSync(path.join(dir, UUID44 + ".json"), Buffer.from(stableStringify(cutoverDone, 2) + "\n", "utf-8"), { mode: 0o600 });
+    const rc13 = readJournal({ dir, token: UUID44, maintenanceDir: dir });
+    assert.equal(rc13.state, "valid", "1.3 done journal 本身可读（带维护目录强核）");
+    assert.equal(isLedgerReceipt(cutoverDone), true, "isLedgerReceipt 认 1.3 done（红：旧版只认 1.2）");
+    assert.equal(isLedgerReceipt(initDone), true, "isLedgerReceipt 认 1.2 init done（既有）");
+    const rec = endpointReceipt(dir, EP44);
+    assert.deepEqual([rec.ok, rec.state, rec.initDone, rec.cutoverDone], [true, "ok", true, true], "1.3 done 收据参与聚合 → ok（红：旧版 never_initialized + orphan）");
+  });
+}
 
 summarySealed = true;
 

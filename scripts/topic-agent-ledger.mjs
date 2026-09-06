@@ -169,13 +169,27 @@ function fsyncDirFd(fd, inj) {
  *     父链任一 symlink → root_not_canonical；不可解析 → root_unresolvable；根非 0700 → root_perms（不放宽）。
  *     只有 rv.reason === "root_absent"（父链受验净、末级确实缺席）才允许自建。
  *  2) P1-2 TOCTOU 防护：先 open 父目录 fd 钉住 inode、受验父 realpath；路径式 mkdir 后立刻复核父 realpath，
- *     父目录在受验后被并发换成外指 symlink → mkdir 写进外指目标 → 回滚刚建目录并 root_not_canonical（net-zero）。
- *  3) mkdirSync(root,{recursive:false, mode:0o700})；父目录缺席 → ENOENT → 原样 fail（不递归创建）。
- *  4) chmodSync 0700 兜 umask；fsync 父目录（用钉住的 fd）。
- *  5) 再 validateLedgerRoot(mustExistRoot:true) 复核通过才算数。任一步失败不吞、原样 fail。
+ *     父目录在受验后被换成外指 symlink → mkdir 写进外指目标 → **尽力清掉**刚建目录并 fail-closed（root_not_canonical）。
+ *  3) P1-2 迁移点栅栏：调用方传 `_fence` 闭包时，在**创建目录的变更点**（mkdir 前）再次原子复核
+ *     active 仍指本 token / gate 仍本 token / lease 实例仍归本 operation / phase 仍 drained；任一失效 →
+ *     fence_lost，**在建根前就拒**（不留空根）——防"手里有 lease 对象但实际已丢护栏"的窗口。
+ *  4) mkdirSync(root,{recursive:false, mode:0o700})；父目录缺席 → ENOENT → 原样 fail（不递归创建）。
+ *  5) chmodSync 0700 兜 umask；fsync 父目录（用钉住的 fd）。
+ *  6) 再 validateLedgerRoot(mustExistRoot:true) 复核通过才算数。任一步失败不吞、原样 fail。
  *  返回 { ok:true, root } 或 { ok:false, reason, why }。
- *  测试注入点：failMkdir / failChmod / failFsync（既有）+ onBeforeMkdir（P1-2 竞态：在 mkdir 前把父目录换成外指 symlink）。 */
-export function ensureLedgerRoot({ env = process.env, _inject = null } = {}) {
+ *
+ *  —— 威胁模型（P1-1 本裁定，Codex 认可；不引入 native mkdirat helper）——
+ *  本函数**防御**：既存/误配置的符号链接、非规范父链（任一分量是 symlink 或 realpath 不自洽）、权限错误
+ *    （根非精确 0700、父不可读/不可解析）。
+ *  本函数**不防御**：与 provision **精确并发**的恶意同 UID 路径替换。目标部署是单用户机器、门内受控维护操作，
+ *    该攻击被明确排除出威胁模型。**注意："同 UID 无增益"不是普遍事实**（macOS TCC/FDA/sandbox entitlement
+ *    可致同 UID 两进程能力不同、confused deputy）——本收缩成立**仅因**目标部署排除恶意同 UID 并发，
+ *    不是因为该攻击在所有环境无害。
+ *  创建后的 realpath 复核与清理属纵深防御（不依赖它防恶意并发）；清理是 **best-effort**，不承诺外部残留必然
+ *    被清、更不承诺 doctor 必然能定位外部残留（父路径恢复后外部创建位置未必可从词法路径定位）。
+ *
+ *  测试注入点：failMkdir / failChmod / failFsync（既有）+ onBeforeMkdir（P1-2 竞态）+ _fence（迁移点栅栏）。 */
+export function ensureLedgerRoot({ env = process.env, _inject = null, _fence = null } = {}) {
   const inj = _inject ?? {};
   // ① 以"必须在场"核验：根已在场且 0700 真目录 → 也要重做父目录持久化屏障（P1-3），只读、不改目录，然后返回。
   //    root_not_canonical / root_unresolvable / root_perms / root_symlink → 原样拒（不创建）。
@@ -195,7 +209,7 @@ export function ensureLedgerRoot({ env = process.env, _inject = null } = {}) {
   const root = ledgerRootFor(env); // 合法缺席：root_absent 返回不带 root，路径从 ledgerRootFor 取（父链已受验净）
   const parent = path.dirname(root);
   // P1-2：先受验父目录 realpath 并 open 钉住 inode，再在受验父上创建 —— 防"受验后父目录被并发换成
-  // 外指 symlink"的越界写。路径式 mkdir 后即时复核父 realpath，被换 → 回滚并拒（net-zero）。
+  // 外指 symlink"的越界写。路径式 mkdir 后即时复核父 realpath，被换 → 回滚并拒（best-effort 清理，不承诺净零）。
   let parentReal = null;
   try { parentReal = fs.realpathSync(parent); }
   catch (err) { return { ok: false, reason: err?.code === "ENOENT" ? "parent_absent" : "parent_unresolvable", why: "父目录 realpath：" + String(err?.code ?? err?.message ?? err) }; }
@@ -210,6 +224,15 @@ export function ensureLedgerRoot({ env = process.env, _inject = null } = {}) {
     if (fs.realpathSync(parent) !== parentReal) { fs.closeSync(pfd); return { ok: false, reason: "root_not_canonical", why: "父目录在受验后与外指不同（symlink 或换目录），不创建" }; }
   } catch (err) { fs.closeSync(pfd); return { ok: false, reason: "parent_unresolvable", why: "父目录复核失败：" + String(err?.code ?? err?.message ?? err) }; }
   if (inj.onBeforeMkdir) inj.onBeforeMkdir(); // P1-2 注入点：测试在此把父目录确定性换成外指 symlink
+  // P1-2 迁移点栅栏：在**真正创建目录的变更点**（mkdir 前）原子复核护栏。失效（active/gate 被改写、lease 被
+  // 替换/释放、phase 不再 drained）→ 在建根前就拒，绝不留下空根或写入未知目录。
+  if (_fence) {
+    const fr = _fence();
+    if (!fr.ok) {
+      fs.closeSync(pfd);
+      return { ok: false, reason: "fence_lost", why: fr.why ?? fr.reason ?? null };
+    }
+  }
   // ② 建单层（recursive:false，绝不递归）：父目录缺席 → ENOENT → 不递归、原样 fail。
   let mkdirErr = null;
   if (inj.failMkdir) mkdirErr = inj.failMkdir;
@@ -220,12 +243,13 @@ export function ensureLedgerRoot({ env = process.env, _inject = null } = {}) {
     const why = code === "ENOENT" ? "父目录缺席，不递归创建" : String(mkdirErr?.message ?? mkdirErr);
     return { ok: false, reason: code === "ENOENT" ? "parent_absent" : "mkdir_failed", why };
   }
-  // P1-2 复核：mkdir 后父路径必须仍解析到受验 realpath；否则根被写进了外指目标 → 回滚并拒（net-zero）。
+  // P1-2 复核：mkdir 后父路径必须仍解析到受验 realpath；否则根被写进了外指目标 → **尽力清**并 fail-closed。
+  // 清理是 best-effort（rmdir 失败也照常 fail-closed），不承诺外部残留必然被清、不承诺 doctor 可见。
   try {
     if (fs.realpathSync(parent) !== parentReal) {
-      try { fs.rmdirSync(root); } catch { /* 尽力清 */ }
+      try { fs.rmdirSync(root); } catch { /* 尽力清（best-effort，不承诺净零） */ }
       fs.closeSync(pfd);
-      return { ok: false, reason: "root_not_canonical", why: "父目录在 mkdir 后被换成外指，回滚刚建的越界目录" };
+      return { ok: false, reason: "root_not_canonical", why: "父目录在 mkdir 后被换成外指，尽力回滚越界目录后 fail-closed" };
     }
   } catch (err) {
     try { fs.rmdirSync(root); } catch { /* 尽力清 */ }

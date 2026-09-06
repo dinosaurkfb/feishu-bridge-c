@@ -43,7 +43,10 @@ current；⑥ tombstone 封闭、禁自指/环/悬空、幂等/冲突 fail-close
 
 `<endpoint_id>` = `legacyEndpointId({runtime,agentUid})`。绝对路径、不拿 shell `~`
 当协议；测试注入 `FEISHU_BRIDGE_LEDGER_DIR`。**路径校验**：`O_NOFOLLOW` 只护最后
-一段，故父目录逐层 realpath 核对到受验根、拒绝同 UID 目录被替换（威胁边界入合同）。
+一段，故父目录逐层 realpath 核对到受验根；**威胁边界（P1-1 裁定）**：防御既存/误配置的 symlink、非规范父链、权限错误；
+**不**防御与建根精确并发的恶意同 UID 路径替换（目标部署是单用户机器、门内受控维护操作，该攻击排除出模型）。
+注："同 UID 无增益"不是普遍事实（macOS TCC/FDA/sandbox entitlement 可致同 UID 两进程能力不同）；本收缩仅因
+目标部署排除恶意同 UID 并发而成立。创建后 realpath 复核与回滚是纵深防御，回滚是 best-effort，不承诺净零。
 单文件（迁移跨记录、一次 rename 即原子）。顶层：
 
 `endpoint_id` 是 `legacyEndpointId` = `stableControlId("endpoint", runtime, agentUid)` = **不透明的
@@ -378,8 +381,10 @@ claim/回执/幂等/卡片/锁→现行发布器（第一步 §4 保留）。
 
 ## 10. P2 处置（含具体常量）
 
-- 路径/权限：目录 0700、文件 0600；绝对路径 + 逐层 realpath 校验；同 UID 替换威胁
-  边界入合同。
+- 路径/权限：目录 0700、文件 0600；绝对路径 + 逐层 realpath 校验。**同 UID 威胁边界（P1-1 裁定）**：防御既存/误配置
+  symlink、非规范父链、权限错误；**不**防御与建根精确并发的恶意同 UID 路径替换（单用户、门内受控维护操作排除该攻击）；
+  "同 UID 无增益"不是普遍事实（TCC/FDA/sandbox）——收缩仅因目标部署排除恶意同 UID 并发而成立；创建后复核与回滚是
+  纵深防御，回滚 best-effort，不承诺净零。
 - 锁：`reapUnrecognized:false`、`acceptReapedResidue:false`；**`staleMs=30_000`**；
   **取锁总预算 `2_000ms` 由外层有限重试实现**（含 reap 等待，不得默默变无限等锁，
   评审四 P2），reap 等待 `200ms`。

@@ -25909,6 +25909,33 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     }
   }));
 
+  // #R37 P1-4：只有**确切 ENOENT（目录缺席）**才判 never_initialized（合法 legacy-only）；
+  //   其余读不出（存在但不可读/不是目录）必须 fail-closed、不伪造 never_initialized。
+  test("m1a 双写接线：P1-4 只有确切 ENOENT=缺席才合法 never_initialized；ENOTDIR/不可读→fail-closed", () => withRootAndReceipt((root, dir) => {
+    const maint = path.join(root, "maint");
+    // ① 目录真正缺席（ENOENT）→ never_initialized = 合法 legacy-only：legacy 跑、写 shadow:[]。
+    {
+      fs.rmSync(maint, { recursive: true, force: true });
+      let legacyCalls = 0;
+      const w = WIRE.wireCreateA1({ endpointId: EP, env: process.env, legacy: () => { legacyCalls += 1; return { ok: true }; }, chatId: "oc_p4a", sessionId: "sess_p4a", messageId: "msg_p4a" });
+      assert.equal(w.ok, true, "ENOENT 缺席 → never_initialized 合法 legacy-only：" + JSON.stringify(w));
+      assert.equal(w.shadow.length, 0, "legacy-only 不写 shadow");
+      assert.equal(legacyCalls, 1, "legacy-only 时 legacy 跑一次");
+    }
+    // ② 维护目录路径指向一个**文件**（不是目录）→ 读不出（ENOTDIR，非 ENOENT）→ fail-closed、不伪造 never_initialized。
+    {
+      fs.rmSync(maint, { recursive: true, force: true });
+      fs.writeFileSync(maint, "不是目录", { mode: 0o600 });
+      let legacyCalls = 0;
+      const w = WIRE.wireCreateA1({ endpointId: EP, env: process.env, legacy: () => { legacyCalls += 1; return { ok: true }; }, chatId: "oc_p4b", sessionId: "sess_p4b", messageId: "msg_p4b" });
+      assert.equal(w.ok, false, "ENOTDIR 不可读 → 整笔拒（不伪造 never_initialized）：" + JSON.stringify(w));
+      assert.equal(w.reason, "m1a_receipt_fail_closed", "fail-closed 原因");
+      assert.equal(w.commit, "not_committed", "未提交");
+      assert.equal(legacyCalls, 0, "fail-closed 时 legacy 未跑");
+      assert.equal(w.shadow, null, "fail-closed 无 shadow 后缀");
+    }
+  }));
+
   // #R37 返修 P1-1（Codex 首轮）：已启用端点必须在取得 outer 锁后、legacy 前核账本现场 ——
   //   loadByEndpoint 核：账本存在、合法、authority_mode==='shadow'；任一不成立 → 整笔拒（fail-closed、不写 legacy）。
   //   裁定：cutover 收据已存在（authoritative）也整笔拒 —— ledger-only 写方属 M1b，M1a 代码不得在切换后再写 legacy。

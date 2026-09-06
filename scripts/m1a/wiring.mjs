@@ -118,10 +118,13 @@ export function emitUncleanReceipt(kind, wired, extra = {}) {
 // 才保留已成立的 legacy 结果并外显 mismatch（shadow[i] 投影失败）。
 function runWired({ endpointId, env = process.env, legacy, submit, lockOnly = false, preflight = null }) {
   const recDir = maintenanceDir(env);
+  // #R37 P1-4：recDir 不可派生（maintenanceDir 返回 null/空）≠ never_initialized。
+  //   只有**确切 ENOENT（目录缺席）**才判 never_initialized（合法 legacy-only）；
+  //   读不到收据路径就 fail-closed（整笔拒、不写 legacy），不伪造从未初始化。
   const receipt = typeof recDir === "string" && recDir.length > 0
     ? endpointReceipt(recDir, endpointId)
-    : { ok: false, state: "never_initialized", why: "维护目录不可派生（M1a 未启用）→ 缺席=never_initialized=合法 legacy-only（裁定：缺席非 fail-closed）" };
-  if (receipt.state === "never_initialized") {
+    : { ok: false, state: "unreadable", why: "维护目录不可派生（maintenanceDir 返回 null/空）→ 无法读收据，fail-closed（不伪造 never_initialized）" };
+  if (receipt.ok === true && receipt.state === "never_initialized") {
     // M1a 未启用 → 合法 legacy-only：不取 outer、不写 shadow 后缀。
     let legacyRes;
     try { legacyRes = legacy(); }

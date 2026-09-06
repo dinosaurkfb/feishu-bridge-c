@@ -26161,6 +26161,7 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
       assert.equal(TAL.familyOf(b3.facts), "B3", "归并→B3（active/current）");
       assert.equal(b3.binding_proof.matched_om, "om_prom", "配对证明 matched_om=被认领根消息 om");
       assert.deepEqual(b3.binding_proof.matched_fields, ["chat_id", "sender", "body", "thread_root"], "标准四项（G15 封闭四项）");
+      assert.equal(b3.binding_proof.pending_token_state, "present", "token 认领 → present");
       assert.equal(b3.binding_proof.authorized_by, "ou_o", "authorized_by=event.sender_id");
       assert.ok(w.release && w.release.ok, "释放 ok");
     }
@@ -26217,6 +26218,23 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
       const w2 = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: legacyRec("promote5"), locator: "om_red", claimKey: claim("r2"), sessionId: "sess_q2", authorizedBy: "ou_o", f4: F4("om_other") });
       assert.ok(w2.ok, "legacy 照常");
       assert.equal(w2.shadow[0].reason, "bad_f4", "matched_om 与 locator 不符 → bad_f4");
+    }
+
+    // ⑥ P2-1：无码认领（F4B 三维 absent）→ 同一 activate 归并成 B3，但配对证明是判别联合的 no-token 支
+    //     （matched_fields 三维、pending_token_state=absent），不伪造 body/码 维（裁定 d）。
+    //     fresh target（redTgt 已被 ④ 占、TGT 被 ① 占）→ 另用 uuid(3)。
+    {
+      talOk(TAL.createB1({ endpointId: EP, requestKey: rk(), chatId: "oc_g", rootOm: "om_nt", lineageId: "lin_nt", bindingTarget: { runtime: "claude", project_root: "/Users/dk/p", claude_session_id: uuid(7) } }), "B1 前置（pending，无码）");
+      const b1Id = famIds(talLoad(dir), "B1").pop();
+      const w = WIRE.wirePromoteBinding({ endpointId: EP, env: process.env, legacy: legacyRec("promote6"), locator: "om_nt", claimKey: claim("pn"), sessionId: "sess_pn", authorizedBy: "ou_o", f4: F4B("om_nt") });
+      assert.ok(w.ok, "W1（无码）ok：" + JSON.stringify(w));
+      assert.deepEqual(w.shadow.map((s) => s.op), ["create_a1", "activate"], "无码也走 create_a1 → activate");
+      assert.ok(w.shadow[1].ok, "activate 成功：" + JSON.stringify(w.shadow[1]));
+      const b3 = talLoad(dir).records[b1Id];
+      assert.equal(TAL.familyOf(b3.facts), "B3", "无码归并→B3");
+      assert.deepEqual(b3.binding_proof.matched_fields, ["chat_id", "sender", "thread_root"], "无码支：三维 owner-root，无 body/码 维");
+      assert.equal(b3.binding_proof.pending_token_state, "absent", "无码认领 → absent");
+      assert.equal(b3.binding_proof.kind, "pairing", "仍是 pairing（activate 写入，非 attach）");
     }
   }));
 

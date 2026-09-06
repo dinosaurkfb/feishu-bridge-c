@@ -62,13 +62,15 @@ function verifyOpBindings({ dir, token, lease, gateFile, now }) {
     return { ok: false, reason: "op_not_active", why: act.state === "active" ? "active 指向别的 operation" : "active " + act.state + (act.why ? "（" + act.why + "）" : "") };
   }
   const held = commitWhileHeld(lease.path, () => ({ ok: true }), { waitMs: 0 });
-  if (held.ok !== true) return { ok: false, reason: "lease_not_held", why: "operation lease 不在本进程手里（" + String(held.reason ?? "lost") + "）" };
+  // R45 四轮 P1-3：先提取 residue 再分派主 reason —— ok:false（lease 锁被接管）同样可能携带 reapUncleared
+  //（withReapLock finally 的残骸随结果原样带出），先查 residue 不许被 ！ok 早退吞掉。
   if (held.reapUncleared) {
     // R45 三轮 P2-2：保留原 reason（reap_uncleared）+ 残骸路径 + error，不再折成无路径的 lease_not_held
     // ——运维看到的应当是真实原因和真实路径。
     return { ok: false, reason: "reap_uncleared", path: held.reapUncleared.path ?? null, error: held.reapUncleared.error ?? null,
       why: "operation lease 的 .reap 交不还——现场清理未完成，不装干净" };
   }
+  if (held.ok !== true) return { ok: false, reason: "lease_not_held", why: "operation lease 不在本进程手里（" + String(held.reason ?? "lost") + "）" };
   const g = readGate({ file: gateFile, now });
   if (g.state !== "active" || g.payload?.token !== token) {
     return { ok: false, reason: "gate_not_active", why: "维护门 " + g.state + (g.why ? "（" + g.why + "）" : "") };
@@ -104,11 +106,19 @@ export function writeSidecarPrepared({ dir, token, lease, gateFile, endpointId, 
 
   const lockDir = target + ".lock";
   const lock = acquireLockUngated(lockDir, { reapUnrecognized: false, now });
-  if (lock.ok !== true) return { ok: false, reason: "sidecar_lock_busy", why: lock.reason };
+  if (lock.ok !== true) {
+    // R45 四轮 P2-2：取锁失败保留原 reason 与 path/error（与 fencing 分支同一结构化投影）——
+    // lock_residue / reap_uncleared / reaped_uncleared / io_error 全折 sidecar_lock_busy 会把真实路径吞掉；
+    // 只有 publisher_busy（锁被别的工作实例正常持有）仍是「侧车忙」。
+    const reason45 = lock.reason === "publisher_busy" ? "sidecar_lock_busy" : String(lock.reason ?? "sidecar_lock_busy");
+    return { ok: false, reason: reason45, why: lock.reason === "publisher_busy" ? "publisher_busy" : String(lock.why ?? lock.reason ?? ""),
+      lock: lockDir, ...(lock.path != null ? { path: lock.path } : {}), ...(lock.error != null ? { error: String(lock.error) } : {}) };
+  }
 
   // R45 三轮 P1-2：临界段收窄。主 sidecar 锁持有期完成全部准备（绑定核验 → 现场判读 → 备份核验 → tmp 写+fsync）；
-  // commitWhileHeld 的 .reap 段内只做「CAS 重读 + token 核验 + rename」三件 —— registry 合同是 .reap 段只做几次文件
-  // 操作：慢 I/O 或 journal 写期死进程会把归属转换锁变长期人工残骸。目录 fsync、读回核、journal done 全部移出段外。
+  // commitWhileHeld 的 .reap 段内只做「核锁实例归属 + rename」（before 比较已在主锁持有期完成，段内不是「CAS 重读」）
+  // —— registry 合同是 .reap 段只做几次文件操作：慢 I/O 或 journal 写期死进程会把归属转换锁变长期人工残骸。
+  // 目录 fsync、读回核、释放核验、journal done 全部移出段外（四轮 P1-1/P1-2）。
   const release45 = () => releasePublishLock(lockDir, { expectedToken: lock.token });
   // R45 二轮 P1-3：释放支 absent / reapUncleared 都不算交清 → sidecar_lock_release_failed + releaseResidue；
   // R45 三轮 P2-1：主锁路径一并带出（编排层 lockUncleared / CLI releaseRows 的原料）。
@@ -128,16 +138,46 @@ export function writeSidecarPrepared({ dir, token, lease, gateFile, endpointId, 
     return now45.present === true && now45.problem === undefined && now45.sha256 === step.intended_after.sha256;
   };
 
+  // R45 四轮 P1-1/P1-2：段外收尾 = durability（目录 fsync）→ 受验读回 → 锁确认干净释放 → journal done。
+  // 顺序即门禁：释放不干净时不记 done（step 留 prepared，续跑必须先消解残骸重走屏障，不许经 done 快路
+  // 静默成功 —— P1-1）；恢复路径（现场已是 intended）也重走同一屏障，durability uncertain 不被静默收敛
+  // 成已持久化（P1-2）。调用时必须持有主锁（fold 场景锁先经 finish45 交还）。
+  const seal45 = (recovered45) => {
+    let bad45 = null, dfd = null;
+    // 目录 fsync：EINVAL/ENOTSUP/EOPNOTSUPP 是文件系统不支持（可容忍）；其它失败折 sidecar_dir_fsync。
+    try { dfd = fs.openSync(ledgerDir, fs.constants.O_RDONLY); fs.fsyncSync(dfd); } catch (err) {
+      if (!dirFsyncIgnorable(err?.code)) bad45 = { ok: false, reason: "sidecar_dir_fsync", why: errCodeOf(err), written: !recovered45 };
+    } finally { if (dfd !== null) { try { fs.closeSync(dfd); } catch { /* 已关 */ } } }
+    if (bad45 === null) {
+      const back = readSidecarCurrent(target);
+      if (back.present !== true || back.problem !== undefined || back.sha256 !== step.intended_after.sha256) {
+        bad45 = { ok: false, reason: "sidecar_corrupt", why: "写后读回核失败", written: !recovered45 };
+      }
+    }
+    if (bad45 !== null) return finish45(bad45);
+    // P1-1：先确认主锁干净交还，再记 done —— 释放失败（not_owner/absent/.reap 残骸）时 step 留 prepared，
+    // 续跑重走同一屏障才准补 done，释放失败不许只留一条退 3 的返回值而 journal 已 done。
+    const rel45 = release45();
+    const residue45 = rel45.ok !== true ? String(rel45.reason ?? "release_publish_lock") : rel45.absent === true ? "absent" : rel45.reapUncleared ? "reap_uncleared" : null;
+    if (residue45 !== null) {
+      console.error(JSON.stringify({ level: "error", where: "sidecar-writer", op: "release", lock: lockDir, reason: residue45 }));
+      return { ok: false, reason: "sidecar_lock_release_failed", why: residue45, written: !recovered45, lock: lockDir,
+        releaseResidue: { absent: rel45.absent === true, reapUncleared: rel45.reapUncleared ?? null } };
+    }
+    const d = markStepDone({ dir, token, lease, id: step.id, after: step.intended_after, now });
+    if (d?.ok !== true) return { ok: false, reason: d?.reason ?? "journal_conflict", why: d?.why ?? null, written: !recovered45 };
+    return { ok: true, written: !recovered45, ...(recovered45 ? { recovered: true } : {}) };
+  };
+
   // 准备段（.reap 段外）：返 { early:true, result }（早退结果，走 finish45 释放分类）或 { tmp }（就绪待 rename）。
   const prepare45 = () => {
     const bind = verifyOpBindings({ dir, token, lease, gateFile, now });
     if (bind.ok !== true) return { early: true, result: bind };
     const cur = readSidecarCurrent(target);
-    // 恢复三分：现场已是目标态 → 只补 done（幂等，无 rename，无需 fence）
+    // 恢复三分：现场已是目标态 → 不 rename，但收尾屏障照走（目录 fsync + 读回核 + 干净释放 + 补 done；
+    // R45 四轮 P1-2：快路不得跳过 durability）。返 { recovered:true } 标记，由主流程统一走 seal45(true)。
     if (cur.present && cur.problem === undefined && cur.sha256 === step.intended_after.sha256) {
-      const d = markStepDone({ dir, token, lease, id: step.id, after: step.intended_after, now });
-      if (d?.ok !== true) return { early: true, result: { ok: false, reason: d?.reason ?? "journal_conflict", why: d?.why ?? null } };
-      return { early: true, result: { ok: true, written: false, recovered: true } };
+      return { recovered: true };
     }
     const before = step.before ?? { exists: false, sha256: null };
     const matchesBefore = cur.present
@@ -166,8 +206,9 @@ export function writeSidecarPrepared({ dir, token, lease, gateFile, endpointId, 
     return finish45({ ok: false, reason: "sidecar_write_failed", why: errCodeOf(prepErr), written: landed45() });
   }
   if (prep.early === true) return finish45(prep.result);
+  if (prep.recovered === true) return seal45(true);
 
-  // .reap 临界段：CAS 重读 + token 核验（commitWhileHeld 段首 readLockOwner）+ rename，就这三件。fn 抛错原样抛出。
+  // .reap 临界段：核锁实例归属（commitWhileHeld 段首 readLockOwner）+ rename，就这两件（before 比较已在主锁持有期完成）。fn 抛错原样抛出。
   let fenced = null, fenceErr = null;
   try { fenced = commitWhileHeld(lockDir, () => { fs.renameSync(prep.tmp, target); return { renamed: true }; }, { waitMs: 0 }); } catch (err) { fenceErr = err; }
   if (fenceErr !== null) {
@@ -176,16 +217,24 @@ export function writeSidecarPrepared({ dir, token, lease, gateFile, endpointId, 
   }
   if (fenced.ok !== true) {
     try { fs.unlinkSync(prep.tmp); } catch { /* 留给人 */ }
+    // R45 四轮 P1-3：先聚合全部 residue（fence 段自己的 .reap 残骸 + 手工释放段的失败/残骸），再分派主 reason
+    // —— 按 ！ok 早退会把真实路径/error 吞掉（withReapLock 的残骸对 ok:false 结果原样携带）。
     const rel45 = release45();
+    const residues45 = [];
+    if (fenced.reapUncleared) residues45.push({ path: fenced.reapUncleared.path ?? null, error: String(fenced.reapUncleared.error ?? "") });
+    if (rel45.ok !== true) residues45.push({ path: rel45.path ?? null, error: String(rel45.reason ?? "release_publish_lock") });
+    else if (rel45.reapUncleared) residues45.push({ path: rel45.reapUncleared.path ?? null, error: String(rel45.reapUncleared.error ?? "") });
+    const main45 = residues45[0] ?? null;
+    const releaseTxt45 = rel45.ok === true ? (rel45.reapUncleared ? "reap_uncleared" : null) : String(rel45.reason ?? "release_publish_lock");
     if (fenced.reason === "lock_lost") {
       // R45 二轮 P1-2：锁被接管（lock_lost）后旧 writer 晚到也写不进新现场；tmp 已清，账本不动。
       return { ok: false, reason: "sidecar_lock_lost", why: "lock_lost", written: false, lock: lockDir,
-        release: rel45.ok === true ? null : String(rel45.reason ?? "release_publish_lock") };
+        ...(main45 ? { residue: main45, residues: residues45 } : {}), release: releaseTxt45 };
     }
     // R45 三轮 P2-2：reap_busy / reap_residue / io_error 保留原 reason（不再都折 sidecar_lock_lost ——
     // 运维看到的应当是真实原因），主锁路径结构化带出。
     return { ok: false, reason: String(fenced.reason ?? "fence_failed"), why: String(fenced.reason ?? "fence_failed"), written: false, lock: lockDir,
-      release: rel45.ok === true ? null : String(rel45.reason ?? "release_publish_lock") };
+      ...(main45 ? { residue: main45, residues: residues45 } : {}), release: releaseTxt45 };
   }
   if (fenced.reapUncleared) {
     // R45 二轮 P1-3：fence 段 .reap 交不还 → sidecar_lock_residue（write 已落，主锁不释放，残骸交显式维护）。
@@ -193,22 +242,6 @@ export function writeSidecarPrepared({ dir, token, lease, gateFile, endpointId, 
       residue: { path: fenced.reapUncleared.path ?? null, error: String(fenced.reapUncleared.error ?? "") } };
   }
 
-  // 段外收尾（P1-2）：目录 fsync → 写后读回核 → journal done。任一失败折进返回值（written:true，不静默吞）。
-  let out45 = { ok: true, written: true };
-  // 目录 fsync（P1-2）：EINVAL/ENOTSUP/EOPNOTSUPP 是文件系统不支持目录 fsync（可容忍）；其它失败折 sidecar_dir_fsync。
-  let dfd = null;
-  try { dfd = fs.openSync(ledgerDir, fs.constants.O_RDONLY); fs.fsyncSync(dfd); } catch (err) {
-    if (!dirFsyncIgnorable(err?.code)) out45 = { ok: false, reason: "sidecar_dir_fsync", why: errCodeOf(err), written: true };
-  } finally { if (dfd !== null) { try { fs.closeSync(dfd); } catch { /* 已关 */ } } }
-  if (out45.ok) {
-    const back = readSidecarCurrent(target);
-    if (back.present !== true || back.problem !== undefined || back.sha256 !== step.intended_after.sha256) {
-      out45 = { ok: false, reason: "sidecar_corrupt", why: "写后读回核失败", written: true };
-    }
-  }
-  if (out45.ok) {
-    const d = markStepDone({ dir, token, lease, id: step.id, after: step.intended_after, now });
-    if (d?.ok !== true) out45 = { ok: false, reason: d?.reason ?? "journal_conflict", why: d?.why ?? null, written: true };
-  }
-  return finish45(out45);
+  // 段外收尾：durability（目录 fsync）→ 读回核 → 释放核验 → journal done。顺序即门禁（R45 四轮 P1-1/P1-2）。
+  return seal45(false);
 }

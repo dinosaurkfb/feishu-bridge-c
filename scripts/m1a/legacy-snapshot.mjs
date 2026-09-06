@@ -111,13 +111,15 @@ const makeFetcher = () => {
     try { return { value: JSON.parse(e.buf.toString("utf-8")) }; }
     catch (err) { return { error: "JSON 坏：" + String(err.message).slice(0, 120) }; }
   };
-  /** §1 封闭身份清单：从缓存派生（不再读盘）。同一路径可能被多个来源引用——按真实路径去重。 */
-  const identityOf = (files) => {
+  /** §1 封闭身份清单：从缓存派生（不再读盘）。entries 是 [file, source] 对（P1-3：身份条目自带来源域
+   *  标签——SOURCE_DOMAINS 封闭域，cutover plan 直接透传，编排层不再二次盖章）。同一路径可能被多个
+   *  来源引用——按真实路径去重（首见来源为准；同路径 sha 冲突仍 fail-closed）。 */
+  const identityOf = (entries) => {
     const seen = new Map();
-    for (const file of files) {
+    for (const [file, source] of entries) {
       const e = fetch(file);
       if (e.status === "error") return { ok: false, path: file, why: e.why };
-      const entry = { path: e.real, sha256: e.status === "read" ? e.sha256 : null };
+      const entry = { source, path: e.real, sha256: e.status === "read" ? e.sha256 : null };
       const prev = seen.get(entry.path);
       if (prev === undefined) seen.set(entry.path, entry);
       else if (prev.sha256 !== entry.sha256) return { ok: false, path: entry.path, why: "同一路径身份冲突" };
@@ -187,7 +189,7 @@ export function collectClaudeLegacySnapshot({ registryFile, templateFile, now = 
   const reg = io.readJsonStrict(registryFile);
   if (reg.absent) {
     // registry 缺席 = 空表（loadRegistryStrict 同语义：只有"文件不存在"算空）。
-    const id = io.identityOf([registryFile, templateFile]);
+    const id = io.identityOf([[registryFile, "registry"], [templateFile, "chain-template"]]);
     if (!id.ok) return unreadable("snapshot-identity", id.why);
     return { ok: true, chain: "claude", snapshot_identity: id.identity, chat_id: chatId, bindings: [] };
   }
@@ -292,7 +294,8 @@ export function collectClaudeLegacySnapshot({ registryFile, templateFile, now = 
     if (seen.has(b.binding_id)) return conflict("binding_id 双投影（同 id 两条投影，无法定谁作数）");
     seen.add(b.binding_id);
   }
-  const id = io.identityOf([registryFile, templateFile, ...mappingFiles]);
+  const id = io.identityOf([[registryFile, "registry"], [templateFile, "chain-template"],
+    ...mappingFiles.map((f) => [f, "project-mapping"])]);
   if (!id.ok) return unreadable("snapshot-identity", id.why);
   return { ok: true, chain: "claude", snapshot_identity: id.identity, chat_id: chatId, bindings };
 }
@@ -423,7 +426,7 @@ export function collectCodexLegacySnapshot({ home, now = Date.now() } = {}) {
     if (seen.has(b.binding_id)) return conflict("binding_id 双投影（同 id 两条投影，无法定谁作数）");
     seen.add(b.binding_id);
   }
-  const id = io.identityOf([regFile, tplFile]);
+  const id = io.identityOf([[regFile, "codex-registry"], [tplFile, "chain-template"]]);
   if (!id.ok) return unreadable("snapshot-identity", id.why);
   return { ok: true, chain: "codex", snapshot_identity: id.identity, chat_id: templateChatId, bindings };
 }

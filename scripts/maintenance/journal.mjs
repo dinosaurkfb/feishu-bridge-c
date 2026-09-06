@@ -607,11 +607,20 @@ export const markStepDone = ({ dir, token, lease, id, after, now = Date.now() })
   return d;
 } });
 
+/** sidecar step 标准化（R45 4f：11 键，无 chain 无 after；锚来自 staging，不自述）。 */
+const sidecarStepOf = (ss, now) => ({ id: ss.id, kind: "sidecar", target: ss.target, before: ss.before ?? null, backup: ss.backup ?? null, backup_sha256: ss.backup_sha256 ?? null, backup_bytes: ss.backup_bytes ?? null, intended_blob: ss.intended_blob ?? null, intended_after: ss.intended_after ?? null, state: "prepared", at: new Date(now).toISOString() });
+const sidecarSame = (ex, ss) => ex.kind === "sidecar" && ex.target === ss.target
+  && JSON.stringify(ex.before ?? null) === JSON.stringify(ss.before ?? null)
+  && JSON.stringify(ex.intended_blob ?? null) === JSON.stringify(ss.intended_blob ?? null)
+  && JSON.stringify(ex.intended_after ?? null) === JSON.stringify(ss.intended_after ?? null);
+
 /** P1-1：把 phase 推进（forward）与 ledger step 落盘合并成**一次**原子更新。
  *  原实现是 setPhase(fwd)+addNote(chain)+addStepPrepared 三步，中间崩溃会留下 「phase=fwd 但无 ledger step / 无 chain 来源」的窗口；
  *  现在 phase 与 step（含 chain）同一写落盘，窗口消失，收敛路径（phase=fwd 且有 prepared ledger step）恒能由 step 重建链。
+ *  R45（4f）：cutover 的三条 sidecar step 与 ledger step **同一 mutate 原子进段**——分开写会在「进段了但 sidecar 缺席」处留下
+ *  journalProblem 必拒的中间态（cutting_over 起要求恰三条 sidecar），恢复不可达。
  */
-export const enterLedgerForward = ({ dir, token, lease, phase, step, chain, expectPhase = "drained", now = Date.now() }) => updateJournal({ dir, token, lease, expectPhase, now, mutate: (d) => {
+export const enterLedgerForward = ({ dir, token, lease, phase, step, sidecarSteps = [], chain, expectPhase = "drained", now = Date.now() }) => updateJournal({ dir, token, lease, expectPhase, now, mutate: (d) => {
   const existing = d.steps.find((s) => s.id === step.id);
   if (existing) {
     // 幂等：恢复再进同一 forward 不重推（否则 journalProblem 会撞「step id 重复」）；评审 P1-4：返回前必须核**阶段 + 内容**完全一致，
@@ -622,10 +631,14 @@ export const enterLedgerForward = ({ dir, token, lease, phase, step, chain, expe
       && JSON.stringify(existing.before ?? null) === JSON.stringify(step.before ?? null)
       && JSON.stringify(existing.intended_after ?? null) === JSON.stringify(step.intended_after ?? null);
     if (!same) return null;
+    for (const ss of sidecarSteps) {
+      const ex = d.steps.find((s) => s.id === ss.id);
+      if (!ex || !sidecarSame(ex, ss)) return null;
+    }
     return d;
   }
   d.phase = phase;
-  d.steps.push({ id: step.id, kind: step.kind, target: step.target, before: step.before ?? null, backup: step.backup ?? null, backup_sha256: step.backup_sha256 ?? null, backup_bytes: step.backup_bytes ?? null, intended_after: step.intended_after ?? null, chain: chain ?? null, state: "prepared", after: null, at: new Date(now).toISOString() });
+  d.steps.push({ id: step.id, kind: step.kind, target: step.target, before: step.before ?? null, backup: step.backup ?? null, backup_sha256: step.backup_sha256 ?? null, backup_bytes: step.backup_bytes ?? null, intended_after: step.intended_after ?? null, chain: chain ?? null, state: "prepared", after: null, at: new Date(now).toISOString() }, ...sidecarSteps.map((ss) => sidecarStepOf(ss, now)));
   return d;
 } });
 

@@ -6,7 +6,10 @@
  * 本模块**严格只读**：不写账本、不写 legacy、不写任何 sidecar。
  *
  * 结果联合（§6 封闭，逐支精确键集，#R24 P2-2）：
- *   ok:true  → { ok, digest, cutover_blockers, snapshot_identity }
+ *   ok:true  → { ok, digest, cutover_blockers, snapshot_identity, sidecars }
+ *     （公共安全面 reconcileLegacyEndpoint：sidecars 每键恰 {sha256}，规格 :213 安全对账结果不含字节明文；
+ *     T4 私有面 prepareLegacyCutoverEndpoint：每键 {sha256, bytes}，供 ledger-operation staging 消费。
+ *     字节与 digest 同一冻结 S1 投影产出，编排层不再二次 collect 渲染；渲染失败 → { ok:false, reason:"sidecar_render_failed", why }）
  *   ok:null  → { ok:null, reason:"snapshot_moved", why }
  *   S1 取得后 → { ok:false, reason:"bijection_mismatch", mismatches, cutover_blockers, snapshot_identity }
  *     （mismatches 全清单，元素 {code, topic_agent_id|null, field|null, detail}；无 why）
@@ -20,6 +23,8 @@
 import { canonKey, sha256 } from "../topic-agent-ledger.mjs";
 import { validateTopicGenerationState } from "../topic-generation.mjs";
 import { M1A_SHAPES } from "./legacy-snapshot.mjs";
+import { renderExpirySidecar, renderPendingClaimsSidecar, renderPolicySidecar } from "../m1b/sidecar-renderers.mjs";
+// ↑ 与本模块环引用（renderers→topicAgentIdForLegacy）：两边顶层都不跨环调用（函数体才求值），安全。
 
 // 形状正则在**函数内**取（顶层解构会在 legacy-snapshot 先于本模块初始化的入口顺序下 TDZ——
 // TAL→m1a/reconcile→legacy-snapshot→TAL 循环里顶层求值顺序不保证，函数体求值时两边必已完成）。
@@ -185,8 +190,18 @@ function fieldMismatches(id, e, s) {
 /**
  * §6 reconciler：legacy 快照 ↔ shadow 账本双射（单 endpoint）。
  * collectLegacy / loadLedgerFn 各被调用两次（投影前后复核 snapshot_identity + 账本 revision）。
+ *
+ * R45 二轮 P1-1：安全面/敏感面拆开 —— 公共安全接口 reconcileLegacyEndpoint 的 ok 支 sidecars 每键恰
+ * {sha256}（规格 :213：安全对账结果不含任何字节明文）；渲染字节只走 T4 私有准备接口
+ * prepareLegacyCutoverEndpoint（供 ledger-operation staging 消费，不暴露给 doctor/预览面）。
+ * 两个导出都是单参数薄壳，共用内部 reconcileCore —— 不用调用参数在同一公共 API 上切换安全/敏感模式。
  */
-export function reconcileLegacyEndpoint({ endpointId, chain, collectLegacy, loadLedgerFn }) {
+export function reconcileLegacyEndpoint(args) { return reconcileCore(args, false); }
+
+/** T4 私有准备接口（maintenance/ledger-operation 专用）：安全结果 ∪ 三 sidecar 受验字节引用（{sha256, bytes}）。 */
+export function prepareLegacyCutoverEndpoint(args) { return reconcileCore(args, true); }
+
+function reconcileCore({ endpointId, chain, collectLegacy, loadLedgerFn }, wantBytes) {
   // 复评 P2-1：§6 是判别联合——每支**只带该支的键**，不再统一塞 mismatches:[]/why。
   // 键集：ledger_*={ok,reason,why}；not_shadow/chain_mismatch={ok,reason}；legacy_*={ok,reason,source,why}；
   // 投影失败={ok,reason,source,why?,cutover_blockers,global?}；bijection_mismatch={ok,reason,mismatches,cutover_blockers,snapshot_identity}；
@@ -244,6 +259,22 @@ export function reconcileLegacyEndpoint({ endpointId, chain, collectLegacy, load
   if (!L2.ok) return { ok: null, reason: "snapshot_moved", why: "投影后账本读不出（" + L2.reason + "）" };
 
   const ok = digestE === digestS && mismatches.length === 0;
-  if (ok) return { ok: true, digest: digestE, cutover_blockers: proj.blockers, snapshot_identity: S1.snapshot_identity };
+  if (ok) {
+    // 4e 四件同证（P1-3）：三条 sidecar 从同一冻结 S1（bindings）+ 同一 E 渲染，与 digest 同源同刻；
+    // 编排层（ledger-operation）不得再二次 collect 渲染——那会让 plan 锚与对账依据来自两个时点。
+    const E2 = proj.records, bindings = S1.bindings;
+    const parts = {
+      expiry: renderExpirySidecar({ endpointId, bindings, E: E2 }),
+      pending_claims: renderPendingClaimsSidecar({ endpointId, bindings, E: E2 }),
+      policy: renderPolicySidecar({ endpointId, bindings, E: E2 }),
+    };
+    for (const [k, r] of Object.entries(parts)) {
+      if (!r.ok) return { ok: false, reason: "sidecar_render_failed", why: k + "：" + (r.why ?? "") };
+    }
+    // P1-1：公共面每键恰 {sha256}；T4 私有面加 bytes（wantBytes 由导出薄壳定，调用方选不了）。
+    // R45 三轮 P1-1③：公共面补 ledger 身份（规格 :213）——下游预览面可核对对账依据的账本时点，不必自带 L2 重读。
+    return { ok: true, digest: digestE, ledger: { revision: L2.doc.revision, sha256: L2.sha256 }, cutover_blockers: proj.blockers, snapshot_identity: S1.snapshot_identity,
+      sidecars: Object.fromEntries(Object.entries(parts).map(([k, r]) => [k, wantBytes ? { sha256: sha256(r.bytes), bytes: r.bytes } : { sha256: sha256(r.bytes) }])) };
+  }
   return { ok: false, reason: "bijection_mismatch", mismatches, cutover_blockers: proj.blockers, snapshot_identity: S1.snapshot_identity };
 }

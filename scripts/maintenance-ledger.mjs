@@ -19,7 +19,7 @@ import { maintenanceContext, renderStatus, maintenanceStatus } from "./maintenan
 import { readActive, readJournal } from "./maintenance/journal.mjs";
 import { aggregateEndpointReceipts, endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import * as LEDGER_OP from "./maintenance/ledger-operation.mjs";
-import { loadByEndpoint, reconcileShadow } from "./topic-agent-ledger.mjs";
+import { loadByEndpoint, reconcileShadow, resolveEndpointDir } from "./topic-agent-ledger.mjs";
 
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
 const LEDGER_KINDS = Object.freeze(["init", "cutover"]);
@@ -123,16 +123,18 @@ export function runMaintenanceLedger(argv, { ctx = null, out = (s) => process.st
   if (parsed.mode === "cutover" && chain === null) { out("账本 cutover 拒：读不出该 endpoint 的链（账本缺席/损坏/chain 非法），fail-closed（什么都不动）"); return 1; }
   const r = LEDGER_OP.ledgerEnter(c, { kind, endpointId: parsed.endpoint, chain, waitMs: parsed.waitMs, apply: parsed.apply, env });
   if (r.dryRun) {
-    const verb = kind === "init" ? "init→shadow revision1" : "cutover→authoritative";
-    // P2-2：干跑必须复用只读计划器如实反映对账状态，不许只报"预检通过"。init 的 virgin/收据检查已由上方 receipt 预检覆盖；
-    // cutover 的 shadow/chain 已由 resolveChain 覆盖，这里补对账器实况——M1a 未接 → reconciler_absent 如实说出（免得干跑通过、--apply 却拒）。
-    let reconNote = "";
+    // R45：cutover 预览跑**真对账**（只读 reconcileLegacyEndpoint），如实给出对账结果与三条 sidecar 目标；init 维持预检预览。
     if (kind === "cutover") {
-      const L = loadByEndpoint(parsed.endpoint, { env });
-      const rec = L.ok ? reconcileShadow({ endpointId: parsed.endpoint, shadowDoc: L.doc }) : { ok: false, why: "账本读不出" };
-      if (!rec.ok) reconNote = "；但" + (rec.why ?? rec.reason ?? "对账未接") + " —— 加了 --apply 也会被拒（M1a 未落地），当前只能 --init";
+      const d = resolveEndpointDir(parsed.endpoint, { env });
+      if (!d.ok) { out("[cutover 预览] 账本读不出：" + d.reason + "（什么都不动）"); return 1; }
+      const rec = LEDGER_OP.reconcileFor({ ctx: c, chain, endpointId: parsed.endpoint, ledgerDir: d.dir, env });
+      if (!rec.ok) { out("[cutover 预览] 对账不一致：" + String(rec.reason ?? "") + (rec.why ? "：" + rec.why : "") + " —— 加了 --apply 也会被拒（什么都不动）"); return 1; }
+      out("[cutover 预览] " + parsed.endpoint + "（" + chain + "）：对账一致（双射 digest " + String(rec.digest) + "）");
+      out("  sidecar 目标：ledger/" + parsed.endpoint + "/expiry.json、ledger/" + parsed.endpoint + "/pending-claims.json、ledger/" + parsed.endpoint + "/policy.json");
+      out("  停两链定时器 → 两链 current 切维护桩 → 建门 → converge 三 sidecar → 二次对账重验 → 停在 authority cutover 提交点之前（等逐次授权）。加 --apply 执行。");
+      return 0;
     }
-    out("[预览] 预检通过，账本 " + verb + "（" + parsed.endpoint + "）：停两链定时器 → 两链 current 切维护桩 → 建门 → 等既有进程退出最多 " + (r.plan?.waitMs ?? parsed.waitMs) + " ms → 门内写账本。加 --apply 执行。" + reconNote);
+    out("[预览] 预检通过，账本 init→shadow revision1（" + parsed.endpoint + "）：停两链定时器 → 两链 current 切维护桩 → 建门 → 等既有进程退出最多 " + (r.plan?.waitMs ?? parsed.waitMs) + " ms → 门内写账本。加 --apply 执行。");
     return 0;
   }
   // 动了没做完 / 释放失败 → 3
@@ -157,6 +159,9 @@ export function exitCodeFor(r) {
   if (r.ok) return 0;
   if (r.rollback && r.rollback.ok === true) return 1; // 回退清干净 → 干净拒绝（预检不过：reconciler_absent / gate_* / operation_active）
   if (r.rollback && r.rollback.ok === false) return 3; // 回退没做全：动了没做完
+  // R45 三轮 P1-3：catch 折收据（不含 rollback / phase 可能缺失）——reason 本身就是「已动现场」的显式形状，
+  // 不许落到末尾的 1（与干净拒绝同码）。
+  if (r.reason === "ledger_forward_failed" || r.reason === "ledger_rollback_failed") return 3;
   if (FORWARD_PHASES.includes(r.phase)) return 3; // 卡在 forward-only（动了但没做完：门拆了 / current 切了没恢复）
   if (r.phase === "reopening_incomplete" || r.reason === "reopening_incomplete") return 3;
   if (r.reason === "startup_source_unverified") return 1; // 进门就被拒，什么都没动

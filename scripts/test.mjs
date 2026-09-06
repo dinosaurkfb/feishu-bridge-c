@@ -229,10 +229,13 @@ import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrai
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
 import { acquireOperationLease, addNote as addNoteJ, addStepPrepared as addStepPreparedJ, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, enterLedgerForward, isLedgerReceipt, journalProblem, readActive, readJournal, releaseOperationLease, setPhase as setPhaseJ, updateJournal, CUTOVER_JOURNAL_SCHEMA, SIDECAR_NAMES, legacy12CutoverDisposition, stagedIntendedFile } from "./maintenance/journal.mjs";
 import { stageCutoverPlan, verifyStagedPlan, removeStagedPlan, planProblem as m1bPlanProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
+import { verifyCutoverPlan } from "./m1b/cutover-plan.mjs";
+import { writeSidecarPrepared } from "./maintenance/sidecar-writer.mjs";
 import { renderExpirySidecar, renderPendingClaimsSidecar, renderPolicySidecar, readSidecarFile, validateSidecarDoc, SIDECAR_SCHEMAS } from "./m1b/sidecar-renderers.mjs";
 import * as LEDGER_OP from "./maintenance/ledger-operation.mjs";
 import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot, identitySubset, legacySourceDigest } from "./m1a/legacy-snapshot.mjs";
 import { topicAgentIdForLegacy, discriminateGeneration, effectiveBindingStatus, projectLegacySnapshot, projectShadowBFamily, reconcileLegacyEndpoint, isBFamily } from "./m1a/reconcile.mjs";
+import * as RECON45 from "./m1a/reconcile.mjs";
 import { commitForInstall, finishInstallReopening, liveBaseline, stageForInstall, stagedChecks, stagedPlanProblem, verifyLiveForInstall, verifyStagedForInstall } from "./maintenance/maintenance-install-core.mjs";
 import { parseMaintenanceInstallArgs, runMaintenanceInstall } from "./maintenance-install.mjs";
 import { acquireInstallSurfaceLock, inspectInstallSurfaceLock } from "./install-surface-lock.mjs";
@@ -23715,6 +23718,21 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   if (raced.reapedUncleared) fs.chmodSync(path.join(raced.reapedUncleared.path, "sub"), 0o700);
   assert.deepEqual([raced.ok, raced.reason, typeof raced.reapedUncleared?.path], [false, "publisher_busy", "string"], "抢先：busy 也带残骸：" + JSON.stringify(raced));
   fs.unlinkSync(dirLock); fs.rmSync(raced.reapedUncleared.path, { recursive: true, force: true });
+  // 释放窗口竞争：lstat 看见 symlink、readlink 时持锁者已 rename 走（ENOENT）→ 这是「锁不在了」，
+  // 不是残骸 —— 误报会让安装收据锁（reapUnrecognized:false）把活躍竞争判成 lock_residue 且不重试（真实并发套件踩过）。
+  {
+    const vanish = path.join(base, "vanish.lock");
+    fs.symlinkSync(JSON.stringify({ pid: 2147483646, at: new Date(Date.now() - 3600 * 1000).toISOString(), token: "dead" }), vanish);
+    const origReadlink = fs.readlinkSync;
+    fs.readlinkSync = function (p, ...rest) {
+      if (path.resolve(String(p)) === vanish) { const e = new Error("enoent"); e.code = "ENOENT"; throw e; }
+      return origReadlink.call(fs, p, ...rest);
+    };
+    let rv;
+    try { rv = acquireLockUngated(vanish, { reapUnrecognized: false }); } finally { fs.readlinkSync = origReadlink; }
+    assert.deepEqual([rv.ok, rv.reason], [false, "publisher_busy"], "readlink ENOENT = 锁已消失 → busy 可重试，不是 lock_residue（真竞争里下一轮 tryLink 就赢）：" + JSON.stringify(rv));
+    fs.rmSync(vanish, { force: true });
+  }
   // 归属转换锁 .reap 自己交不还：默认与 acceptReapedResidue 两支都 fail-closed —— ok:false、reason reap_uncleared、不建新主锁、.reap 残骸点名
   for (const accept of [false, true]) {
     const staleLink = path.join(base, "stale-" + String(accept) + ".lock");
@@ -26983,7 +27001,7 @@ test("账本维护 operation：init 进门→shadow→B-4 重开→done；崩写
   const mkEp = (uid) => legacyEndpointId({ runtime: "claude", agentUid: uid });
   const epDir = (ep) => { const d = path.join(ledgerRoot, ep); fs.mkdirSync(d, { recursive: true, mode: 0o700 }); return d; };
   const journalOf = (token) => readJournal({ dir, token }).doc;
-  const REC = ({ endpointId }) => ({ ok: true, digest: TAL.sha256(Buffer.from("bijection:" + endpointId)) });
+  const REC = ({ endpointId }) => ({ ok: true, digest: TAL.sha256(Buffer.from("bijection:" + endpointId)) }); // 只为证明：传它不传它一个样（注入参数被无视）
   try {
     // ── 1. init 快乐路径
     const EPa = mkEp("agent_ledger_op_a"); const dA = epDir(EPa);
@@ -27000,25 +27018,21 @@ test("账本维护 operation：init 进门→shadow→B-4 重开→done；崩写
     assert.equal(readGate({ file: gateFile, now: clock }).state, "absent", "init 后门撤掉");
     assert.equal(launchd[claudeLabel].loaded, true, "init 后定时器恢复 loaded");
 
-    // ── 2. cutover：评审 P1-4 —— 调用方不能注入 reconciler；reconcileShadow 未接入（fail-closed 恒 reconciler_absent），带不带都拒，且账本保持 shadow
+    // ── 2. cutover：评审 P1-4 —— reconciler 不是注入参数（R45 起接真对账：ledgerEnter 只认模块内封闭采集，
+    //    多传 reconciler 被无视；沙箱里 legacy 采集缺席 → 对账拒，账本保持 shadow）
     const EPc = mkEp("agent_ledger_op_cut"); const dC = epDir(EPc);
     assert.ok(LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPc, chain: CH, apply: true }).phase === "done", "cutover 前置 init");
     const cut = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPc, chain: CH, apply: true, reconciler: REC });
-    assert.ok(cut.ok === false && cut.reason === "reconciler_absent", "cutover 带 reconciler 也拒（不得注入）：" + JSON.stringify(cut));
-    assert.equal(cut.rollbackSafe, true, "cutover 拒在 drained（rollbackSafe）：" + JSON.stringify(cut));
+    const cutBare = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPc, chain: CH, apply: true });
+    assert.ok(cut.ok === false && cutBare.ok === false && cut.reason === cutBare.reason, "cutover 带 reconciler 与不带同拒（注入参数被无视）：" + JSON.stringify(cut));
     const LC = TAL.loadLedger(dC, { endpointId: EPc });
     assert.ok(LC.ok && LC.doc.authority_mode === "shadow" && LC.doc.revision === 1, "cutover 被拒后仍是 shadow（未切权威）：" + JSON.stringify(LC));
     // P1-4 低层：cutover 机器本身完好，缺的只是对账 gate——直接给合法 digest 应能构造出 authoritative/rev+1 蓝图
     const lp = TAL.loadLedger(dC, { endpointId: EPc });
-    const planC = TAL.cutoverPlan({ endpointId: EPc, chain: CH, requestKey: cut.token ?? "req_c", operationId: cut.token ?? "12345678-1234-4234-8234-123456789abc", shadowDoc: lp.doc, shadowSha: lp.sha256, digest: TAL.sha256(Buffer.from("bijection:" + EPc)) });
+    // P1-6 返修：cutover 蓝图必须带三条 sidecar SHA（七键封闭绑定）—— fixture 给合法 64hex。
+    const planC = TAL.cutoverPlan({ endpointId: EPc, chain: CH, requestKey: cut.token ?? "req_c", operationId: cut.token ?? "12345678-1234-4234-8234-123456789abc", shadowDoc: lp.doc, shadowSha: lp.sha256, digest: TAL.sha256(Buffer.from("bijection:" + EPc)),
+      sidecarShas: { expiry: "e".repeat(64), pending_claims: "f".repeat(64), policy: "a".repeat(64) } });
     assert.ok(planC.ok && planC.intendedAfter.authority_mode === "authoritative" && planC.intendedAfter.revision === 2, "cutover 蓝图（给 digest 时）authoritative/rev2：" + JSON.stringify(planC));
-    const EPc2 = mkEp("agent_ledger_op_cut_no"); const dC2 = epDir(EPc2);
-    assert.ok(LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPc2, chain: CH, apply: true }).phase === "done", "无对账 cutover 前置 init");
-    const cutNo = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPc2, chain: CH, apply: true });
-    assert.ok(cutNo.ok === false && cutNo.reason === "reconciler_absent", "cutover 无对账→reconciler_absent（fail-closed）：" + JSON.stringify(cutNo));
-    const LN = TAL.loadLedger(dC2, { endpointId: EPc2 });
-    assert.ok(LN.ok && LN.doc.authority_mode === "shadow", "reconciler_absent 后仍是 shadow");
-
     // ── 3. 崩在「写已提交」之后 → 只向前恢复（mutuation 防守：setPhase 若被挪到写之后，这里会 rolled_back）
     const EPb = mkEp("agent_ledger_op_b"); const dB = epDir(EPb);
     const entB = enterMaintenance(ctx, { reason: "crash 写后", apply: true, keepLease: true, operationKind: "ledger_init" });
@@ -27365,21 +27379,21 @@ test("账本维护 CLI + B-3 收据聚合 + inspect 收据不染红 + doctor ⑬
     assert.ok(insp2.residues.some((r) => r.kind === "orphan_journal" && r.path.includes(orphanTok)), "非 ledger journal 无 active → orphan 染红：" + JSON.stringify(insp2.residues));
     fs.unlinkSync(path.join(dir, orphanTok + ".json"));
 
-    // 6) CLI --cutover：reconcileShadow 恒拒（T4 硬前置）→ exit 1（干净拒绝：回退清干净），active/门清、账本仍 shadow
+    // 6) CLI --cutover：R45 起跑真对账——沙箱模板缺席 → legacy_unreadable 拒（干净拒绝：回退清干净），active/门清、账本仍 shadow
     const EPcut = mkEp("agent_ledger_cli_cut"); epDir(EPcut);
     assert.ok(LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPcut, chain: CH, apply: true }).ok, "cutover 前置 init：" + all());
     assert.equal(runCli(["--cutover", "--endpoint", EPcut, "--apply"]), 1, all());
-    assert.match(all(), /reconciler_absent/u, all());
+    assert.match(all(), /legacy_unreadable/u, all());
     assert.equal(readActive({ dir }).state, "absent", "cutover 拒后 active 清掉");
     assert.equal(readGate({ file: gateFile }).state, "absent", "cutover 拒后门撤掉");
     assert.ok(TAL.loadLedger(epDir(EPcut), { endpointId: EPcut }).doc.authority_mode === "shadow", "cutover 拒后仍是 shadow");
 
-    // 6a) P2-2：CLI --cutover 干跑必须复用只读计划器、如实说明对账器未接（不许只报"预检通过"）—— 先红：干跑只走通用 enter 预检，对账状态不在预览里
+    // 6a) P2-2：CLI --cutover 干跑必须跑真对账、如实给出对账结果（R45 预览＝真对账只读；对账不过 → exit 1 且说明）
     const cutDryLen = lines.length;
-    assert.equal(runCli(["--cutover", "--endpoint", EPcut]), 0, "cutover 干跑 exit 0：" + lines.slice(cutDryLen).join("\n"));
+    assert.equal(runCli(["--cutover", "--endpoint", EPcut]), 1, "cutover 干跑对账不过 → exit 1：" + lines.slice(cutDryLen).join("\n"));
     const cutDryOut = lines.slice(cutDryLen).join("\n");
-    assert.match(cutDryOut, /预检通过/u, "干跑有预览：" + cutDryOut);
-    assert.match(cutDryOut, /reconciler_absent|对账器未接|M1a 未落地/u, "cutover 干跑要如实说明对账器未接（不是只报预检通过）：" + cutDryOut);
+    assert.match(cutDryOut, /cutover 预览/u, "干跑有 cutover 预览标题：" + cutDryOut);
+    assert.match(cutDryOut, /对账不一致：legacy_unreadable/u, "干跑如实给出对账失败原因（不是只报预检通过）：" + cutDryOut);
 
     // 6a2) P2-2(b)：ledgerEnter 的 endpoint 参数显式类型守卫（防非字符串被 ENDPOINT_SHAPE.test 强转放行）
     assert.equal(LEDGER_OP.ledgerEnter(ctx, { kind: "init", chain: CH }).reason, "bad_endpoint", "缺 endpoint → bad_endpoint");
@@ -28274,8 +28288,10 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
   const STATE = (over = {}) => ({ schema_version: "1.0", artifact_type: "feishu_bridge_topic_generations",
     binding_id: "p1@registry", binding_status: "active", active_generation_id: "g1", rotation: null,
     generations: [GEN()], ...over });
+  // P1-3 返修：reconcile ok 支真的渲染三 sidecar —— mapping.expires_at 缺席 → renderer fail-closed，fixture 给可规范化值。
   const MAPPING = (over = {}) => ({ binding_id: "p1@registry", status: "active", root_message_id: OM1,
     session_id: "sess_u1", channel_generation_id: "g1", claude_session_id: UUID1,
+    expires_at: "2099-01-01T00:00:00.000Z",
     topic_generation_state: STATE(), ...over });
   const writeMapping = (proj, mapping) => {
     const dir = path.join(proj, ".runtime-data", "inbound");
@@ -28289,7 +28305,8 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     const proj = path.join(home, "proj");
     fs.mkdirSync(proj, { recursive: true, mode: 0o700 });
     const tpl = writeTpl(home);
-    const registryFile = writeRegistry(home, [{ root: proj, id: "p1", claude_session_id: UUID1 }]);
+    // P1-3 返修：reconcile ok 支现在真的渲染三 sidecar —— expires_at 缺席会 fail-closed，fixture 给可规范化值。
+    const registryFile = writeRegistry(home, [{ root: proj, id: "p1", claude_session_id: UUID1, expires_at: "2099-01-01T00:00:00.000Z" }]);
     return { home, proj, tplFile: tpl.file, chatId: tpl.tpl.chat_id, registryFile };
   };
   const collect = (s, over = {}) => collectClaudeLegacySnapshot({ registryFile: s.registryFile, templateFile: s.tplFile, ...over });
@@ -28685,6 +28702,29 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       const r1 = run({ [id]: shadowRec });
       assert.ok(r1.ok === true && /^[0-9a-f]{64}$/.test(r1.digest) && r1.cutover_blockers.length === 0, "一致 → digest：" + JSON.stringify(r1));
       assert.deepEqual(r1.snapshot_identity, snap.snapshot_identity, "返回 snapshot_identity（doctor 制品用）");
+      // R45 二轮 P1-1：公共安全接口只有 SHA（规格 :213：安全对账结果不含任何字节明文）；字节只在 T4 私有准备接口
+      assert.equal(typeof RECON45.prepareLegacyCutoverEndpoint, "function", "T4 私有准备接口存在（字节只走这条口）");
+      assert.deepEqual(Object.keys(r1.sidecars).sort(), ["expiry", "pending_claims", "policy"], "ok 支带三 sidecar 键");
+      for (const k45s of ["expiry", "pending_claims", "policy"]) {
+        assert.deepEqual(Object.keys(r1.sidecars[k45s]), ["sha256"], "公共面 sidecars." + k45s + " 恰 sha256 一键（无 bytes 明文）：" + JSON.stringify(r1.sidecars[k45s]));
+        assert.match(r1.sidecars[k45s].sha256, /^[0-9a-f]{64}$/u, k45s + " sha 是 64hex");
+      }
+      // R45 三轮 P1-1③：公共安全面补 ledger 身份（规格 :213：ledger:{revision,sha256}）
+      assert.deepEqual(r1.ledger, { revision: 7, sha256: "s".repeat(64) }, "公共面带 ledger:{revision,sha256}：" + JSON.stringify(r1.ledger ?? null));
+      assert.equal(reconcileLegacyEndpoint.length, 1, "公共接口单参数（无模式开关参数可切敏感模式）");
+      const prep45s = RECON45.prepareLegacyCutoverEndpoint({ endpointId: EP1, chain: "claude", collectLegacy: () => snap, loadLedgerFn: () => mkLedger({ chain: "claude", authority_mode: "shadow", revision: 7, records: { [id]: shadowRec }, operations: {} }) });
+      assert.ok(prep45s.ok === true, "T4 私有准备接口成立：" + JSON.stringify({ ok: prep45s.ok, reason: prep45s.reason }));
+      for (const k45s of ["expiry", "pending_claims", "policy"]) {
+        assert.ok(prep45s.sidecars[k45s].bytes instanceof Uint8Array, "私有面 " + k45s + " 带渲染字节");
+        assert.equal(createHash("sha256").update(prep45s.sidecars[k45s].bytes).digest("hex"), prep45s.sidecars[k45s].sha256, "私有面字节与 SHA 自洽");
+        assert.equal(prep45s.sidecars[k45s].sha256, r1.sidecars[k45s].sha256, "同一次冻结投影：私有面 SHA === 公共面 SHA");
+      }
+      // grep 级守卫：doctor / CLI 预览面不得引用 T4 私有准备接口（防字节回潜公共安全面）
+      for (const [f45g, must45g] of [["./doctor.mjs", "reconcileLegacyEndpoint"], ["./maintenance-ledger.mjs", "reconcileFor"]]) {
+        const src45g = fs.readFileSync(new URL(f45g, import.meta.url), "utf-8");
+        assert.ok(!src45g.includes("prepareLegacyCutoverEndpoint"), f45g + " 不得引用 T4 私有准备接口");
+        assert.ok(src45g.includes(must45g), f45g + " 走公共安全接口（" + must45g + "）");
+      }
       let r2 = run({});
       assert.deepEqual([r2.ok, r2.reason, r2.mismatches.map((m) => m.code)], [false, "bijection_mismatch", ["extra_in_legacy"]], "E 多");
       const alien = { ...shadowRec, topic_agent_id: "ta_" + "f".repeat(32) };
@@ -30642,6 +30682,840 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     assert.equal(em, "", "干净时 emitUncleanReceipt 应静默（stderr 无）");
     assert.equal(fs.readdirSync(recDir).filter((n) => n.startsWith("m1a-unclean-")).length, 1, "干净时不应新增回执");
   });
+// ── R45：T4/M1b 第二单——复合提交与消费方（m1a-reconciliation.md §4.1 4c/4d/4f/5 + maintenance-gate.md 账本接入节）──
+{
+  const EP45 = "endpoint_" + "c".repeat(24);
+  const UUID45 = "99999999-9999-4999-8999-999999999999";
+  const NOW45 = 1792000000000;
+  const ISO45 = (t) => new Date(t).toISOString();
+  const mkTempDir45 = () => fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r45-"));
+  const shaBuf45 = (buf) => createHash("sha256").update(buf).digest("hex");
+  // P1-3/P1-6 返修 fixture：plan.sidecars 锚 = 真渲染字节的 SHA，reconcile45 携同源字节，fingerprint 由七键真重算 ——
+  // 假 SHA 假指纹在「字节/指纹独立重算」的新校验下不再可能过绿。
+  const mkBlob45 = (tag) => Buffer.from(JSON.stringify({ schema_version: "m45-" + tag, endpoint_id: EP45, entries: {} }, null, 2) + "\n", "utf-8");
+  const BLOB45 = { expiry: mkBlob45("expiry"), pending_claims: mkBlob45("pending-claims"), policy: mkBlob45("policy") };
+  const shaB45 = (n) => shaBuf45(BLOB45[n]);
+  const FP45 = TAL.fingerprintOf("authority_cutover", { request_key: UUID45, endpoint_id: EP45, bijection_digest: "e".repeat(64), pre_cutover_ledger_sha: "a".repeat(64), expiry_sha256: shaB45("expiry"), pending_claims_sha256: shaB45("pending_claims"), policy_sha256: shaB45("policy") });
+  const mkPlan45 = (o = {}) => ({ schema_version: "m1a-cutover-plan-1", operation_token: UUID45, endpoint_id: EP45,
+    digest: "e".repeat(64), snapshot_identity: [{ source: "registry", path: "/h/.claude/feishu-bridge/registry.json", sha256: "d".repeat(64) }],
+    ledger: { revision: 3, sha256: "a".repeat(64) },
+    sidecars: { expiry: { sha256: shaB45("expiry") }, pending_claims: { sha256: shaB45("pending_claims") }, policy: { sha256: shaB45("policy") } }, ...o });
+  const ledgerStep45 = (o = {}) => ({ id: "ledger:" + EP45 + ":cutover", kind: "ledger", target: EP45,
+    before: { endpoint_id: EP45, operation_id: UUID45, fingerprint: FP45, authority_mode: "shadow", revision: 3, ledger_sha256: "a".repeat(64), bijection_digest: null, plan_sha256: null },
+    intended_after: { endpoint_id: EP45, operation_id: UUID45, fingerprint: FP45, authority_mode: "authoritative", revision: 4, ledger_sha256: "b".repeat(64), bijection_digest: "e".repeat(64), plan_sha256: "1".repeat(64) },
+    backup: null, backup_sha256: null, backup_bytes: null, after: null, state: "prepared", at: ISO45(NOW45), chain: "claude", ...o });
+  const mkSidecar45 = (n, o = {}) => ({ id: "sidecar:" + n + ":" + EP45, kind: "sidecar", target: "ledger/" + EP45 + "/" + n + ".json",
+    before: { exists: false, sha256: null }, backup: null, backup_sha256: null, backup_bytes: null,
+    intended_after: { exists: true, sha256: shaB45(n === "pending-claims" ? "pending_claims" : n) },
+    intended_blob: { path: "/m/" + UUID45 + ".staged/intended/" + n + ".json", bytes: BLOB45[n === "pending-claims" ? "pending_claims" : n].length, sha256: shaB45(n === "pending-claims" ? "pending_claims" : n) },
+    state: "prepared", after: null, at: ISO45(NOW45), ...o });
+  const threeSidecars45 = () => [mkSidecar45("expiry"), mkSidecar45("pending-claims"), mkSidecar45("policy")];
+  const timerDone45 = (chain) => ({ id: "timer:" + chain, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "c".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: ISO45(NOW45), chain: null });
+  const stubDone45 = (chain) => ({ id: "stub:" + chain, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + UUID45, after: "versions/maintenance-" + UUID45, state: "done", at: ISO45(NOW45), chain: null });
+  const curDone45 = (chain) => ({ id: "current:" + chain, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + UUID45, after: "versions/maintenance-" + UUID45, state: "done", at: ISO45(NOW45), chain: null });
+  const gateDone45 = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: UUID45 }, after: { token: UUID45, txnUncleared: null }, state: "done", at: ISO45(NOW45), chain: null });
+  const enterDone45 = () => [timerDone45("claude"), timerDone45("codex"), stubDone45("claude"), stubDone45("codex"), curDone45("claude"), curDone45("codex"), gateDone45()];
+  const doc45 = () => ({ schema_version: "1.3", operation_kind: "ledger_cutover", token: UUID45, reason: "r45", started_at: ISO45(NOW45), updated_at: ISO45(NOW45), phase: "ledger_cutting_over", steps: [...enterDone45(), ledgerStep45(), ...threeSidecars45()], notes: [] });
+  const planBytes45 = () => Buffer.from(stableStringify(mkPlan45(), 2) + "\n", "utf-8");
+  const reconcile45 = () => ({ ok: true, digest: "e".repeat(64), snapshot_identity: mkPlan45().snapshot_identity, ledger: { revision: 3, sha256: "a".repeat(64) }, sidecars: { expiry: { sha256: shaB45("expiry"), bytes: BLOB45.expiry }, pending_claims: { sha256: shaB45("pending_claims"), bytes: BLOB45.pending_claims }, policy: { sha256: shaB45("policy"), bytes: BLOB45.policy } } });
+  const shaPlan45 = () => createHash("sha256").update(planBytes45()).digest("hex");
+  const lsOk45 = () => { const ls = ledgerStep45(); ls.intended_after = { ...ls.intended_after, plan_sha256: shaPlan45() }; return ls; };
+  const ok45 = () => verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() });
+
+  test("#R45 A cutover-plan：五交叉等式 + 4f 五源 endpoint 相等，任一不等拒（纯校验器）", () => {
+    const good = ok45();
+    assert.equal(good.ok, true, "锚组合法 → ok：" + JSON.stringify(good));
+    const badToken = doc45(); badToken.token = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: badToken, ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "token_mismatch", "① token 不等拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: "endpoint_" + "z".repeat(24), reconcile: reconcile45() }).reason, "endpoint_mismatch", "① 受验账本顶层 endpoint_id 不等拒");
+    const badSide = mkPlan45(); badSide.sidecars.expiry.sha256 = "9".repeat(64);
+    assert.equal(verifyCutoverPlan({ planBytes: Buffer.from(stableStringify(badSide, 2) + "\n", "utf-8"), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "sidecar_sha_mismatch", "② plan sidecar SHA 与 step 不等拒");
+    const stepsBad = threeSidecars45(); stepsBad[1] = { ...stepsBad[1], intended_blob: { ...stepsBad[1].intended_blob, sha256: "8".repeat(64) } };
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: stepsBad, ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "sidecar_sha_mismatch", "② step 内部 intended_blob/after 不等拒");
+    const badLedger = mkPlan45(); badLedger.ledger = { revision: 9, sha256: "a".repeat(64) };
+    assert.equal(verifyCutoverPlan({ planBytes: Buffer.from(stableStringify(badLedger, 2) + "\n", "utf-8"), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "ledger_identity_mismatch", "③ plan.ledger 与 prepared before 不等拒");
+    const badDigest = mkPlan45(); badDigest.digest = "7".repeat(64);
+    assert.equal(verifyCutoverPlan({ planBytes: Buffer.from(stableStringify(badDigest, 2) + "\n", "utf-8"), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "digest_mismatch", "④ plan.digest 与 bijection_digest 不等拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: { ...reconcile45(), digest: "6".repeat(64) } }).reason, "digest_mismatch", "④ 重验 digest 与 plan 不等拒");
+    const badSnap = { ...reconcile45(), snapshot_identity: [{ source: "registry", path: "/other/registry.json", sha256: null }] };
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: badSnap }).reason, "snapshot_identity_mismatch", "④ 快照身份深等（快照变了拒）");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: { ...reconcile45(), ledger: { revision: 4, sha256: "g".repeat(64) } } }).reason, "ledger_identity_mismatch", "④ CAS revision 变了拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: { ...reconcile45(), ledger: { revision: 3, sha256: "5".repeat(64) } } }).reason, "ledger_identity_mismatch", "④ CAS sha 变了拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45({ intended_after: { ...ledgerStep45().intended_after, plan_sha256: "2".repeat(64) } }), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "plan_anchor_mismatch", "⑤ intended_after.plan_sha256 ≠ sha256(planBytes) 拒");
+    const fpTampered = lsOk45(); fpTampered.before = { ...fpTampered.before, fingerprint: "c".repeat(64) };
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: fpTampered, sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "endpoint_cross_mismatch", "4f before.fingerprint 与七键重算不等拒（P1-6 反自证）");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45({ id: "ledger:endpoint_" + "f".repeat(24) + ":cutover", intended_after: { ...ledgerStep45().intended_after, plan_sha256: shaPlan45() } }), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "endpoint_cross_mismatch", "4f ledger step id 的 endpoint 不等拒");
+    const badTarget = threeSidecars45(); badTarget[2] = { ...badTarget[2], target: "ledger/" + EP45 + "/other.json" };
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: badTarget, ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "endpoint_cross_mismatch", "4f sidecar target 重算不等拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: { ok: false, reason: "bijection_mismatch" } }).reason, "reconcile_not_ok", "对账非 ok 拒");
+    const badShape = mkPlan45(); badShape.digest = "nothex";
+    assert.equal(verifyCutoverPlan({ planBytes: Buffer.from(stableStringify(badShape, 2) + "\n", "utf-8"), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "plan_shape", "plan 形状坏拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: { ...doc45(), operation_kind: "ledger_init" }, ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "not_a_cutover", "init journal 传进来拒");
+    // P1-3 返修：对账必须携带同源渲染字节 —— 只回 digest 的对账结果过不了（旧版这里会绿）
+    const noSide45 = { ...reconcile45() }; delete noSide45.sidecars;
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: noSide45 }).reason, "sidecar_reconcile_mismatch", "④ 对账无同源渲染字节拒（reconcile.sidecars 缺席）");
+    const tampered45 = { ...reconcile45(), sidecars: { expiry: { sha256: shaB45("expiry"), bytes: BLOB45.expiry }, pending_claims: { sha256: shaB45("pending_claims"), bytes: BLOB45.pending_claims }, policy: { sha256: shaB45("policy"), bytes: Buffer.from("tampered r45\n", "utf-8") } } };
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: tampered45 }).reason, "sidecar_reconcile_mismatch", "④ 对账字节被换拒（对 plan.sidecars 重算）");
+  });
+
+  test("#R45-R3 返修 P1-6：cutover 蓝图绑 sidecar 锚 —— sidecarShas 缺/坏拒（bad_sidecar_shas）；result 七键封闭；换锚换指纹", () => {
+    const tk45 = "77777777-7777-4777-8777-777777777777";
+    const ip45 = TAL.initPlan({ endpointId: EP45, chain: "claude", requestKey: tk45, operationId: tk45 });
+    assert.ok(ip45.ok, "init 蓝图：" + JSON.stringify(ip45));
+    const side45 = { expiry: shaB45("expiry"), pending_claims: shaB45("pending_claims"), policy: shaB45("policy") };
+    const good45 = TAL.cutoverPlan({ endpointId: EP45, chain: "claude", requestKey: tk45, operationId: tk45, shadowDoc: ip45.doc, shadowSha: ip45.sha256, digest: "e".repeat(64), sidecarShas: side45 });
+    assert.ok(good45.ok, "七键蓝图成立：" + JSON.stringify(good45));
+    assert.deepEqual(Object.keys(good45.doc.operations[tk45].result).sort().join(","), "bijection_digest,endpoint_id,expiry_sha256,pending_claims_sha256,policy_sha256,pre_cutover_ledger_sha,revision_at_cutover", "result 七键封闭（多一少一都算漂移）");
+    const other45 = TAL.cutoverPlan({ endpointId: EP45, chain: "claude", requestKey: tk45, operationId: tk45, shadowDoc: ip45.doc, shadowSha: ip45.sha256, digest: "e".repeat(64), sidecarShas: { expiry: "f".repeat(64), pending_claims: shaB45("pending_claims"), policy: shaB45("policy") } });
+    assert.ok(other45.ok, "换锚蓝图成立");
+    assert.notEqual(other45.fingerprint, good45.fingerprint, "sidecar 锚进指纹：换 expiry 锚 ≠ 同一笔（复合绑定生效）");
+    for (const bad45 of [undefined, { expiry: shaB45("expiry") }, { expiry: "short", pending_claims: shaB45("pending_claims"), policy: shaB45("policy") }]) {
+      const rb45 = TAL.cutoverPlan({ endpointId: EP45, chain: "claude", requestKey: tk45, operationId: tk45, shadowDoc: ip45.doc, shadowSha: ip45.sha256, digest: "e".repeat(64), sidecarShas: bad45 });
+      assert.deepEqual([rb45.ok, rb45.reason], [false, "bad_sidecar_shas"], "sidecarShas=" + JSON.stringify(bad45) + " → 拒");
+    }
+  });
+
+  test("#R45 B sidecar-writer：token+lease+prepared step 绑定，读实文件核验后才写，fenced commit；锁逐取逐交清；幂等/恢复三分/残骸拒", () => {
+    const base = mkTempDir45();
+    const dir = path.join(base, "m"); fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const ledgerDir = path.join(base, "ledger", EP45); fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
+    const blob45 = Buffer.from(JSON.stringify({ schema_version: "expiry-1", endpoint_id: EP45, entries: {} }, null, 2) + "\n", "utf-8");
+    const shaBlob = shaBuf45(blob45);
+    const plan45 = mkPlan45({ sidecars: { expiry: { sha256: shaBlob }, pending_claims: { sha256: shaBlob }, policy: { sha256: shaBlob } } });
+    const staged = stageCutoverPlan({ dir, token: UUID45, plan: plan45, blobs: { expiry: blob45, pending_claims: blob45, policy: blob45 } });
+    assert.ok(staged.ok, "staged 树建好：" + JSON.stringify(staged));
+    const op = createOperation({ dir, reason: "r45", operationKind: "ledger_cutover", token: UUID45, now: NOW45 });
+    assert.ok(op.ok, "operation 建（cutover→1.3）：" + JSON.stringify(op));
+    // P1-1 返修：writer 写前核三绑定 —— fixture 必须有一扇 token 相符的活门。
+    const gateFile45 = path.join(base, "gate45");
+    const gate45 = createGate({ file: gateFile45, reason: "r45 B", token: UUID45, now: NOW45 });
+    assert.ok(gate45.ok, "维护门 active：" + JSON.stringify(gate45));
+    const sidecarSteps = ["expiry", "pending-claims", "policy"].map((n) => ({ id: "sidecar:" + n + ":" + EP45, kind: "sidecar", target: "ledger/" + EP45 + "/" + n + ".json",
+      before: { exists: false, sha256: null }, backup: null, backup_sha256: null, backup_bytes: null,
+      intended_after: { exists: true, sha256: shaBlob }, intended_blob: { path: path.join(dir, UUID45 + ".staged", "intended", n + ".json"), bytes: blob45.length, sha256: shaBlob }, state: "prepared", at: ISO45(NOW45) }));
+    const _ae = updateJournal({ dir, token: UUID45, lease: op.lease, now: NOW45, mutate: (d) => { d.steps.push(...enterDone45()); return d; } });
+    assert.ok(_ae.ok, "enter done 桩：" + JSON.stringify(_ae));
+    // phase 推进与 step 落盘一次原子更新（enterLedgerForward 合同：分开写必撞「planned 不得含 ledger step」×「前向必须有 step」死锁）
+    const putSteps = () => updateJournal({ dir, token: UUID45, lease: op.lease, now: NOW45, mutate: (d) => { d.steps.push(ledgerStep45({ intended_after: { ...ledgerStep45().intended_after, plan_sha256: staged.plan_sha256 } }), ...sidecarSteps); d.phase = "ledger_cutting_over"; return d; } });
+    const _ps = putSteps(); assert.equal(_ps.ok, true, "ledger+sidecar steps 落 journal 并进段：" + JSON.stringify(_ps));
+    const run = (name, over = {}) => writeSidecarPrepared({ dir, token: UUID45, lease: op.lease, gateFile: gateFile45, endpointId: EP45, name, ledgerDir, now: NOW45, ...over });
+    const stepState = (n) => readJournal({ dir, token: UUID45 }).doc.steps.find((s) => s.id === "sidecar:" + n + ":" + EP45);
+    try {
+      const r1 = run("expiry");
+      assert.ok(r1.ok === true && r1.written === true, "expiry 写成功：" + JSON.stringify(r1));
+      const target1 = path.join(ledgerDir, "expiry.json");
+      assert.equal(shaBuf45(fs.readFileSync(target1)), shaBlob, "现场 SHA === intended");
+      const st1 = fs.lstatSync(target1);
+      assert.ok((st1.mode & 0o777) === 0o600 && st1.nlink === 1, "0600 单硬链接");
+      const s1 = stepState("expiry");
+      assert.equal(s1.state, "done", "step done");
+      assert.deepEqual(s1.after, { exists: true, sha256: shaBlob }, "after = intended_after");
+      let lockGone = true; try { fs.lstatSync(path.join(ledgerDir, "expiry.json.lock")); lockGone = false; } catch {}
+      assert.ok(lockGone, "文件锁交清（.lock 不残留）");
+      const r2 = run("expiry");
+      assert.ok(r2.ok === true && r2.written === false, "step 已 done → 幂等跳过：" + JSON.stringify(r2));
+      // 恢复三分①：文件 === intended、step prepared（崩溃窗）→ 补 done 不重写
+      fs.renameSync(target1, path.join(ledgerDir, "pc.tmp"));
+      fs.renameSync(path.join(ledgerDir, "pc.tmp"), path.join(ledgerDir, "pending-claims.json"));
+      const r3 = run("pending-claims");
+      assert.ok(r3.ok === true && r3.written === false && r3.recovered === true, "现场已=intended → 补 done：" + JSON.stringify(r3));
+      assert.equal(stepState("pending-claims").state, "done", "恢复①补 done");
+      // 恢复三分②：文件 === before（缺席）→ fenced 写
+      const r4 = run("policy");
+      assert.ok(r4.ok === true && r4.written === true, "before=absent → fenced 写：" + JSON.stringify(r4));
+      assert.equal(shaBuf45(fs.readFileSync(path.join(ledgerDir, "policy.json"))), shaBlob, "policy 写成 intended");
+      // before 在场（有备份）→ 覆写
+      const oldBytes = Buffer.from(JSON.stringify({ schema_version: "expiry-1", endpoint_id: EP45, entries: { ta_old: "2026-08-01T00:00:00.000Z" } }, null, 2) + "\n", "utf-8");
+      const oldSha = shaBuf45(oldBytes);
+      fs.writeFileSync(target1, oldBytes, { mode: 0o600 });
+      updateJournal({ dir, token: UUID45, lease: op.lease, now: NOW45, mutate: (d) => { const s = d.steps.find((x) => x.id === "sidecar:expiry:" + EP45); s.state = "prepared"; delete s.after; s.before = { exists: true, sha256: oldSha }; s.backup = path.join(dir, UUID45 + ".staged", "backup-expiry.json"); s.backup_sha256 = oldSha; s.backup_bytes = oldBytes.length; return d; } });
+      fs.writeFileSync(path.join(dir, UUID45 + ".staged", "backup-expiry.json"), oldBytes, { mode: 0o600 });
+      const r5 = run("expiry");
+      assert.ok(r5.ok === true && r5.written === true, "before 在场 → 覆写：" + JSON.stringify(r5));
+      assert.equal(shaBuf45(fs.readFileSync(target1)), shaBlob, "覆写成 intended");
+      assert.equal(stepState("expiry").state, "done", "覆写后 done");
+      // 恢复三分③：陌生现场 → sidecar_corrupt 停门，文件不动
+      const strange = Buffer.from(JSON.stringify({ schema_version: "expiry-1", endpoint_id: EP45, entries: { stranger: "2026-08-02T00:00:00.000Z" } }, null, 2) + "\n", "utf-8");
+      fs.writeFileSync(target1, strange, { mode: 0o600 });
+      updateJournal({ dir, token: UUID45, lease: op.lease, now: NOW45, mutate: (d) => { const s = d.steps.find((x) => x.id === "sidecar:expiry:" + EP45); s.state = "prepared"; delete s.after; s.before = { exists: true, sha256: oldSha }; return d; } });
+      const r6 = run("expiry");
+      assert.ok(r6.ok === false && r6.reason === "sidecar_corrupt", "陌生现场 → 拒：" + JSON.stringify(r6));
+      assert.ok(shaBuf45(fs.readFileSync(target1)) === shaBuf45(strange), "拒时文件不被动");
+      // staged blob 缺 → 拒
+      updateJournal({ dir, token: UUID45, lease: op.lease, now: NOW45, mutate: (d) => { const s = d.steps.find((x) => x.id === "sidecar:expiry:" + EP45); s.state = "prepared"; delete s.after; s.before = { exists: true, sha256: oldSha }; s.backup = path.join(dir, UUID45 + ".staged", "backup-expiry.json"); return d; } });
+      fs.rmSync(path.join(dir, UUID45 + ".staged", "intended", "expiry.json"));
+      const r7 = run("expiry");
+      assert.ok(r7.ok === false && r7.reason === "staged_unreadable", "staged blob 缺 → 拒：" + JSON.stringify(r7));
+      fs.writeFileSync(path.join(dir, UUID45 + ".staged", "intended", "expiry.json"), blob45, { mode: 0o600 });
+      // 锁被别人占 → 拒（busy），不动文件
+      const lockDir = path.join(ledgerDir, "expiry.json.lock");
+      const savedHome = process.env.HOME; process.env.HOME = base;
+      fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date(NOW45).toISOString(), token: "not-mine" }), lockDir);
+      const r8 = run("expiry");
+      process.env.HOME = savedHome;
+      assert.ok(r8.ok === false && r8.reason === "sidecar_lock_busy", "锁被占 → 拒：" + JSON.stringify(r8));
+      fs.rmSync(lockDir, { recursive: true, force: true });
+      // R45 返修 P1-5：备份字节被换 → sidecar_backup_mismatch（备份不是摆设，真核；现场先回到 before 锚）
+      fs.writeFileSync(target1, oldBytes, { mode: 0o600 });
+      updateJournal({ dir, token: UUID45, lease: op.lease, now: NOW45, mutate: (d) => { const s = d.steps.find((x) => x.id === "sidecar:expiry:" + EP45); s.state = "prepared"; delete s.after; s.before = { exists: true, sha256: oldSha }; s.backup = path.join(dir, UUID45 + ".staged", "backup-expiry.json"); s.backup_sha256 = oldSha; s.backup_bytes = oldBytes.length; return d; } });
+      fs.writeFileSync(path.join(dir, UUID45 + ".staged", "backup-expiry.json"), Buffer.from("not the backup\n", "utf-8"), { mode: 0o600 });
+      const r7b = run("expiry");
+      assert.ok(r7b.ok === false && r7b.reason === "sidecar_backup_mismatch", "备份被换 → 拒：" + JSON.stringify(r7b));
+      fs.writeFileSync(path.join(dir, UUID45 + ".staged", "backup-expiry.json"), oldBytes, { mode: 0o600 });
+      // phase 不对 → 拒（重开族要求三条 sidecar 全 done：先补 done 再切 phase，journal 才合法）
+      updateJournal({ dir, token: UUID45, lease: op.lease, now: NOW45, mutate: (d) => { const s = d.steps.find((x) => x.id === "sidecar:expiry:" + EP45); s.state = "done"; s.after = s.intended_after; const ls = d.steps.find((x) => x.kind === "ledger"); ls.state = "done"; ls.after = ls.intended_after; return d; } });
+      const _sp = setPhaseJ({ dir, token: UUID45, lease: op.lease, phase: "ledger_reopening", expectPhase: "ledger_cutting_over", now: NOW45 });
+      assert.ok(_sp.ok, "切 ledger_reopening：" + JSON.stringify(_sp));
+      const r9 = run("expiry");
+      assert.ok(r9.ok === false && r9.reason === "phase_mismatch", "phase 非 ledger_cutting_over → 拒：" + JSON.stringify(r9));
+      // name 越界 → 拒
+      const r10 = run("nope");
+      assert.ok(r10.ok === false && r10.reason === "bad_name", "name 越界 → 拒：" + JSON.stringify(r10));
+      // 错 token → 拒（journal 读不出）
+      const r11 = run("pending-claims", { token: "88888888-8888-4888-8888-888888888888" });
+      assert.ok(r11.ok === false, "错 token → 拒：" + JSON.stringify(r11));
+    } finally { releaseOperationLease(op.lease); fs.rmSync(base, { recursive: true, force: true }); }
+  });
+
+  test("#R45-R1 返修 P1-1/P1-2：writer 写前三绑定（gate/active/lease）逐一缺席拒；done 复核、目录 fsync 失败、锁释放失败都折进返回值（written:true，不静默吞）", () => {
+    const base = mkTempDir45();
+    const dir = path.join(base, "m"); fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const ledgerDir = path.join(base, "ledger", EP45); fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
+    const shaBlob = shaB45("expiry");
+    const plan45 = mkPlan45({ sidecars: { expiry: { sha256: shaBlob }, pending_claims: { sha256: shaBlob }, policy: { sha256: shaBlob } } });
+    const staged45 = stageCutoverPlan({ dir, token: UUID45, plan: plan45, blobs: { expiry: BLOB45.expiry, pending_claims: BLOB45.expiry, policy: BLOB45.expiry } });
+    assert.ok(staged45.ok, "staged 树：" + JSON.stringify(staged45));
+    const op = createOperation({ dir, reason: "r45r1", operationKind: "ledger_cutover", token: UUID45, now: NOW45 });
+    assert.ok(op.ok, "operation 建：" + JSON.stringify(op));
+    const sidecarSteps45 = ["expiry", "pending-claims", "policy"].map((n) => ({ id: "sidecar:" + n + ":" + EP45, kind: "sidecar", target: "ledger/" + EP45 + "/" + n + ".json",
+      before: { exists: false, sha256: null }, backup: null, backup_sha256: null, backup_bytes: null,
+      intended_after: { exists: true, sha256: shaBlob }, intended_blob: { path: path.join(dir, UUID45 + ".staged", "intended", n + ".json"), bytes: BLOB45.expiry.length, sha256: shaBlob }, state: "prepared", at: ISO45(NOW45) }));
+    const _ae45 = updateJournal({ dir, token: UUID45, lease: op.lease, now: NOW45, mutate: (d) => { d.steps.push(...enterDone45()); return d; } });
+    assert.ok(_ae45.ok, "enter done 桩：" + JSON.stringify(_ae45));
+    const _ps45 = updateJournal({ dir, token: UUID45, lease: op.lease, now: NOW45, mutate: (d) => { d.steps.push(ledgerStep45({ intended_after: { ...ledgerStep45().intended_after, plan_sha256: staged45.plan_sha256 } }), ...sidecarSteps45); d.phase = "ledger_cutting_over"; return d; } });
+    assert.equal(_ps45.ok, true, "steps 进段切 cutting_over：" + JSON.stringify(_ps45));
+    const gateFile45 = path.join(base, "gate45");
+    const gate45 = createGate({ file: gateFile45, reason: "r45 r1", token: UUID45, now: NOW45 });
+    assert.ok(gate45.ok, "门 active：" + JSON.stringify(gate45));
+    const run45 = (name, over = {}) => writeSidecarPrepared({ dir, token: UUID45, lease: op.lease, gateFile: gateFile45, endpointId: EP45, name, ledgerDir, now: NOW45, ...over });
+    try {
+      // P1-1①：没绑 gateFile → gate_file_missing（进分派前拒，账本不动）
+      const rg45 = writeSidecarPrepared({ dir, token: UUID45, lease: op.lease, endpointId: EP45, name: "expiry", ledgerDir, now: NOW45 });
+      assert.deepEqual([rg45.ok, rg45.reason], [false, "gate_file_missing"], "gateFile 缺 → 拒：" + JSON.stringify(rg45));
+      assert.ok(!fs.existsSync(path.join(ledgerDir, "expiry.json")), "拒时账本不动");
+      // P1-1②③：门缺席 / 门 token 不符 → gate_not_active
+      const rn45 = run45("expiry", { gateFile: path.join(base, "no-gate") });
+      assert.deepEqual([rn45.ok, rn45.reason], [false, "gate_not_active"], "门缺席 → 拒：" + JSON.stringify(rn45));
+      const g2File = path.join(base, "gate2");
+      const gm45 = createGate({ file: g2File, reason: "别人的门", token: "11111111-1111-4111-8111-111111111111", now: NOW45 });
+      assert.ok(gm45.ok, "第二扇门：" + JSON.stringify(gm45));
+      const rt45 = run45("expiry", { gateFile: g2File });
+      assert.deepEqual([rt45.ok, rt45.reason], [false, "gate_not_active"], "门 token 不符 → 拒：" + JSON.stringify(rt45));
+      fs.rmSync(g2File, { force: true });
+      // P1-1④：lease 释放后 → lease_not_held
+      assert.equal(releaseOperationLease(op.lease).ok, true, "释放租约");
+      const rl45 = run45("expiry");
+      assert.deepEqual([rl45.ok, rl45.reason], [false, "lease_not_held"], "lease 不在手 → 拒：" + JSON.stringify(rl45));
+      op.lease = acquireOperationLease({ dir, token: UUID45 });
+      assert.ok(op.lease.ok, "重取租约：" + JSON.stringify(op.lease));
+      // P1-2①：正常写成功；done 后现场被换 → done 复核拒（sidecar_corrupt）
+      const rw45 = run45("expiry");
+      assert.deepEqual([rw45.ok, rw45.written], [true, true], "写成功：" + JSON.stringify(rw45));
+      const strange45 = Buffer.from("{strange r45r1\n", "utf-8");
+      fs.writeFileSync(path.join(ledgerDir, "expiry.json"), strange45, { mode: 0o600 });
+      const rd45 = run45("expiry");
+      assert.deepEqual([rd45.ok, rd45.reason], [false, "sidecar_corrupt"], "done 复核：现场 ≠ intended → 拒：" + JSON.stringify(rd45));
+      fs.writeFileSync(path.join(ledgerDir, "expiry.json"), BLOB45.expiry, { mode: 0o600 });
+      // P1-2②：目录 fsync 失败 → sidecar_dir_fsync + written:true（rename 已落，返回值不许装成功）
+      const origFsync45 = fs.fsyncSync;
+      fs.fsyncSync = function (fd45) { if (fs.fstatSync(fd45).isDirectory()) throw Object.assign(new Error("eio"), { code: "EIO" }); return origFsync45.call(fs, fd45); };
+      let rdir45;
+      try { rdir45 = run45("pending-claims"); } finally { fs.fsyncSync = origFsync45; }
+      assert.deepEqual([rdir45.ok, rdir45.reason, rdir45.written], [false, "sidecar_dir_fsync", true], "目录 fsync 失败折进返回值：" + JSON.stringify(rdir45));
+      assert.equal(shaBuf45(fs.readFileSync(path.join(ledgerDir, "pending-claims.json"))), shaBlob, "现场已是 intended（rename 已落）");
+      // P1-2③（R45 二轮 fence 语义更新）：fence 段内锁归属已不是自己 → sidecar_lock_lost + written:false，一字节不写；
+      // 释放支如实报 not_owner（主锁是别人的，交不清）→ release 结构化带出；锁残骸留下（不假装交清）。
+      // （一轮旧语义「写完才发现释放失败」已被 fence 取代：接管发生在写之前就必须拒，这正是 P1-2 要的行为。）
+      const lockDir45 = path.join(ledgerDir, "policy.json.lock");
+      const origReadlink45 = fs.readlinkSync;
+      fs.readlinkSync = function (target45) {
+        if (path.resolve(String(target45)) === lockDir45) return JSON.stringify({ pid: process.pid, at: new Date(NOW45).toISOString(), token: "22222222-2222-4222-8222-222222222222" });
+        return origReadlink45.call(fs, target45);
+      };
+      let rrel45;
+      try { rrel45 = run45("policy"); } finally { fs.readlinkSync = origReadlink45; }
+      assert.deepEqual([rrel45.ok, rrel45.reason, rrel45.written], [false, "sidecar_lock_lost", false], "fence 内锁归属易主 → 拒写：" + JSON.stringify(rrel45));
+      assert.equal(rrel45.why, "lock_lost", "fence 原因是锁被接管：" + String(rrel45.why));
+      assert.equal(rrel45.release, "not_owner", "释放支如实报 not_owner（交不清）：" + JSON.stringify(rrel45));
+      assert.ok(!fs.existsSync(path.join(ledgerDir, "policy.json")), "锁易主后一字节不写");
+      assert.ok(fs.lstatSync(lockDir45).isSymbolicLink(), "锁残骸留下（交清失败可见；锁是 dangling symlink，得用 lstat）");
+      fs.rmSync(lockDir45, { force: true, recursive: true });
+      // ── R45 二轮返修（P1-2 fence / P1-3 锁残骸 / P1-4 writer 折异常）分段，公共助手：把一个 sidecar 重置回「prepared + 现场缺席」 ──
+      const pcJson45 = path.join(ledgerDir, "pending-claims.json");
+      const pcLock45 = pcJson45 + ".lock";
+      const reprep45 = (name45 = "pending-claims") => {
+        const file45 = path.join(ledgerDir, name45 + ".json");
+        updateJournal({ dir, token: UUID45, lease: op.lease, now: NOW45, mutate: (d) => { const s = d.steps.find((x) => x.id === "sidecar:" + name45 + ":" + EP45); s.state = "prepared"; delete s.after; s.before = { exists: false, sha256: null }; s.backup = null; s.backup_sha256 = null; s.backup_bytes = null; return d; } });
+        fs.rmSync(file45, { force: true });
+      };
+      // P1-4（writer 半）：写异常折结构化返回，不再裸抛炸穿调用方；自持锁释放、tmp 清掉、step 不装 done
+      const stepStateR1 = (n45) => readJournal({ dir, token: UUID45 }).doc.steps.find((s) => s.id === "sidecar:" + n45 + ":" + EP45);
+      {
+        reprep45();
+        const origRename45 = fs.renameSync;
+        fs.renameSync = function (src45, dst45) { if (String(dst45) === pcJson45 && String(src45).includes(".tmp")) throw new Error("boom r45r2"); return origRename45.call(fs, src45, dst45); };
+        let rwf45;
+        try { rwf45 = run45("pending-claims"); } finally { fs.renameSync = origRename45; }
+        assert.deepEqual([rwf45.ok, rwf45.reason, rwf45.written], [false, "sidecar_write_failed", false], "写异常折结构化返回（不裸抛）：" + JSON.stringify(rwf45));
+        assert.ok(String(rwf45.why).includes("boom r45r2"), "异常原文进 why：" + String(rwf45.why));
+        let lockGone45 = true; try { fs.lstatSync(pcLock45); lockGone45 = false; } catch {}
+        assert.ok(lockGone45, "自持锁已释放");
+        assert.ok(!fs.readdirSync(ledgerDir).some((f45) => f45.endsWith(".tmp")), "tmp 已清");
+        assert.equal(stepStateR1("pending-claims").state, "prepared", "异常时 step 不装 done");
+      }
+      // P1-2：写段整体进 fenced commit —— 锁被接管后旧 writer 的 rename 必须失败（sidecar_lock_lost），不再覆盖新现场
+      {
+        reprep45();
+        const origReadlink45b = fs.readlinkSync;
+        fs.readlinkSync = function (t45) { if (path.resolve(String(t45)) === pcLock45) return JSON.stringify({ pid: process.pid, at: new Date(NOW45).toISOString(), token: "33333333-3333-4333-8333-333333333333" }); return origReadlink45b.call(fs, t45); };
+        let rlost45;
+        try { rlost45 = run45("pending-claims"); } finally { fs.readlinkSync = origReadlink45b; }
+        assert.deepEqual([rlost45.ok, rlost45.reason, rlost45.written], [false, "sidecar_lock_lost", false], "锁被接管 → fenced 拒写：" + JSON.stringify(rlost45));
+        assert.ok(!fs.existsSync(pcJson45), "接管后旧 writer 没碰现场");
+        fs.rmSync(pcLock45, { force: true, recursive: true });
+      }
+      // P1-3②（absent 半）：释放只查 ok 会把 {ok:true,absent:true}（锁早没了）当干净 —— absent 也算没交清
+      {
+        reprep45();
+        const origReadlink45b = fs.readlinkSync;
+        let rlCount45 = 0;
+        fs.readlinkSync = function (t45) { if (path.resolve(String(t45)) === pcLock45) { rlCount45 += 1; if (rlCount45 >= 2) { const e45 = new Error("no ent r45r2"); e45.code = "ENOENT"; throw e45; } } return origReadlink45b.call(fs, t45); };
+        let rabs45;
+        try { rabs45 = run45("pending-claims"); } finally { fs.readlinkSync = origReadlink45b; }
+        assert.deepEqual([rabs45.ok, rabs45.reason, rabs45.written], [false, "sidecar_lock_release_failed", true], "释放遇 absent → 不算交清：" + JSON.stringify(rabs45));
+        assert.equal(rabs45.releaseResidue?.absent, true, "absent 结构化保留：" + JSON.stringify(rabs45.releaseResidue));
+        fs.rmSync(pcLock45, { force: true, recursive: true });
+      }
+      // P1-3②（reapUncleared 半）：释放交不还 .reap → 不是业务成功
+      {
+        reprep45();
+        const pcReap45 = pcLock45 + ".reap";
+        const origRm45b = fs.rmSync;
+        let rmCount45 = 0;
+        fs.rmSync = function (p45, o45) { if (path.resolve(String(p45)) === pcReap45) { rmCount45 += 1; if (rmCount45 >= 2) throw Object.assign(new Error("eperm r45r2"), { code: "EPERM" }); } return origRm45b.call(fs, p45, o45); };
+        let rrep45;
+        try { rrep45 = run45("pending-claims"); } finally { fs.rmSync = origRm45b; }
+        assert.deepEqual([rrep45.ok, rrep45.reason, rrep45.written], [false, "sidecar_lock_release_failed", true], "释放遇 reapUncleared → 不算交清：" + JSON.stringify(rrep45));
+        assert.ok(rrep45.releaseResidue?.reapUncleared && String(rrep45.releaseResidue.reapUncleared.error).includes("EPERM"), "reapUncleared 结构化保留：" + JSON.stringify(rrep45.releaseResidue));
+        fs.rmSync(pcLock45, { force: true, recursive: true });
+        fs.rmSync(pcReap45, { force: true, recursive: true });
+      }
+      // P1-3①（lease 半）：verifyOpBindings 的 commitWhileHeld 带 reapUncleared → 拒写（lease_not_held），不再当干净
+      {
+        reprep45();
+        const leaseReap45 = op.lease.path + ".reap";
+        const origRm45c = fs.rmSync;
+        fs.rmSync = function (p45, o45) { if (path.resolve(String(p45)) === leaseReap45) throw Object.assign(new Error("eperm lease reap r45r2"), { code: "EPERM" }); return origRm45c.call(fs, p45, o45); };
+        let rlr45;
+        try { rlr45 = run45("pending-claims"); } finally { fs.rmSync = origRm45c; }
+        // R45 三轮 P2-2：保留原 reason（reap_uncleared）+ 路径 + error，不再折成无路径的 lease_not_held
+        assert.deepEqual([rlr45.ok, rlr45.reason], [false, "reap_uncleared"], "lease 锁 reap 残骸 → 保留原 reason：" + JSON.stringify(rlr45));
+        assert.equal(rlr45.path, leaseReap45, "残骸路径结构化：" + JSON.stringify(rlr45));
+        assert.match(String(rlr45.error ?? ""), /EPERM/u, "残骸 error 结构化");
+        assert.ok(!fs.existsSync(pcJson45), "拒写时账本不动");
+        fs.rmSync(leaseReap45, { force: true, recursive: true });
+      }
+      // P1-3①（fence 半）：commitWhileHeld 的 reapUncleared 折 sidecar_lock_residue（written:true，不装干净）
+      {
+        reprep45("expiry");
+        const expLock45 = path.join(ledgerDir, "expiry.json.lock");
+        const expReap45 = expLock45 + ".reap";
+        const origRm45d = fs.rmSync;
+        fs.rmSync = function (p45, o45) { if (path.resolve(String(p45)) === expReap45) throw Object.assign(new Error("eperm fence reap r45r2"), { code: "EPERM" }); return origRm45d.call(fs, p45, o45); };
+        let rres45;
+        try { rres45 = run45("expiry"); } finally { fs.rmSync = origRm45d; }
+        assert.deepEqual([rres45.ok, rres45.reason, rres45.written], [false, "sidecar_lock_residue", true], "fence reapUncleared 折 residue：" + JSON.stringify(rres45));
+        assert.ok(rres45.residue?.path === expReap45, "残骸路径结构化：" + JSON.stringify(rres45.residue));
+        fs.rmSync(expLock45, { force: true, recursive: true });
+        fs.rmSync(expReap45, { force: true, recursive: true });
+      }
+      // R45 三轮 P2-2：fencing 失败保留原 reason —— .reap 被新鲜实例占着 → reap_busy（不再折 sidecar_lock_lost），主锁路径带出
+      {
+        reprep45();
+        const busyReap45 = pcLock45 + ".reap";
+        fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date(NOW45).toISOString(), token: "44444444-4444-4444-8444-444444444444" }), busyReap45);
+        let rbusy45;
+        try { rbusy45 = run45("pending-claims"); } finally { fs.rmSync(busyReap45, { force: true, recursive: true }); }
+        assert.deepEqual([rbusy45.ok, rbusy45.reason], [false, "reap_busy"], ".reap 被占 → 保留原 reason：" + JSON.stringify(rbusy45));
+        assert.equal(rbusy45.lock, pcLock45, "主锁路径结构化带出：" + JSON.stringify(rbusy45));
+        fs.rmSync(pcLock45, { force: true, recursive: true });
+      }
+      // R45 四轮 P2-2：取 sidecar 锁失败保留原 reason 与 path —— 锁位上是畸形残骸（lock_residue）
+      // 不再折 sidecar_lock_busy 丢真实路径（与 fencing 分支同一结构化投影）。
+      {
+        reprep45();
+        fs.mkdirSync(pcLock45, { recursive: true });
+        fs.writeFileSync(path.join(pcLock45, "sentinel"), "not-a-lock\n");
+        let rp22a45;
+        try { rp22a45 = run45("pending-claims"); } finally { /* 无补丁 */ }
+        assert.deepEqual([rp22a45.ok, rp22a45.reason], [false, "lock_residue"], "取锁失败保留原 reason：" + JSON.stringify(rp22a45));
+        assert.equal(rp22a45.path, pcLock45, "残骸路径结构化：" + JSON.stringify(rp22a45));
+        fs.rmSync(pcLock45, { force: true, recursive: true });
+      }
+      // R45 三轮 P1-2 + 四轮 P2-1：.reap 临界段回归 registry 合同 —— 段内操作集恰为两件（核锁实例归属 =
+      // 一次读锁归属，+ rename；before 比较已在主锁持有期完成，段内不是「CAS 重读」）；
+      // 全部准备（绑定核验/读现场/备份核验/tmp 写+fsync）与收尾（目录 fsync/读回/释放核验/journal done）必须在 .reap 段外。
+      {
+        reprep45();
+        const reapProbe45 = pcLock45 + ".reap";
+        const inReap45 = [];
+        const cas45 = { lstat: 0, readlink: 0 };
+        let renamed45 = false; // 归属核验只数 rename 前的窗口：释放支自己也有 .reap 段（registry 所有），不算 writer 的临界段
+        const ioOps45 = new Set(["writeFileSync", "renameSync", "unlinkSync", "fsyncSync", "openSync", "readFileSync", "readSync"]);
+        const orig45p = {};
+        for (const fn45 of [...ioOps45, "lstatSync", "readlinkSync"]) orig45p[fn45] = fs[fn45];
+        const guard45 = (fn45) => function (...a45) {
+          let inR45 = false;
+          try { inR45 = orig45p.lstatSync.call(fs, reapProbe45, { throwIfNoEntry: false })?.isSymbolicLink() === true; } catch { /* 段外 */ }
+          if (inR45) {
+            const p45 = path.resolve(String(a45[0]));
+            if (p45 === pcLock45 && !renamed45) { if (fn45 === "lstatSync") cas45.lstat += 1; else if (fn45 === "readlinkSync") cas45.readlink += 1; }
+            if (fn45 === "renameSync") { renamed45 = true; inReap45.push(fn45 + "：" + a45.slice(0, 2).map((v) => String(v)).join(" → ")); }
+            else if (ioOps45.has(fn45)) inReap45.push(fn45 + "：" + a45.slice(0, 2).map((v) => String(v)).join(" → "));
+          }
+          return orig45p[fn45].apply(fs, a45);
+        };
+        for (const fn45 of Object.keys(orig45p)) fs[fn45] = guard45(fn45);
+        let rprobe45;
+        try { rprobe45 = run45("pending-claims"); } finally { for (const fn45 of Object.keys(orig45p)) fs[fn45] = orig45p[fn45]; }
+        assert.ok(rprobe45.ok === true, "探针跑通正常写：" + JSON.stringify(rprobe45));
+        assert.equal(inReap45.length, 1, ".reap 段内写/读操作恰一次 rename：" + JSON.stringify(inReap45));
+        assert.ok(/^renameSync：.*\.tmp → /.test(inReap45[0] ?? "") && (inReap45[0] ?? "").endsWith("→ " + pcJson45), "段内 rename 是 tmp→target：" + inReap45[0]);
+        assert.deepEqual(cas45, { lstat: 1, readlink: 1 }, "fence 段 rename 前对主锁恰一次归属读（核锁实例归属）：" + JSON.stringify(cas45));
+        // 探针跑的是真写：把 pending-claims 退回 prepared，后面的 P1-1⑤（op_not_active，毁 active）还要用这个 step
+        const rst45 = updateJournal({ dir, token: UUID45, lease: op.lease, now: NOW45, mutate: (d) => { const s = d.steps.find((x) => x.id === "sidecar:pending-claims:" + EP45); s.state = "prepared"; delete s.after; return d; } });
+        assert.equal(rst45.ok, true, "探针复位 step：" + JSON.stringify(rst45));
+        fs.rmSync(pcLock45, { force: true, recursive: true });
+      }
+      // R45 四轮 P1-1：done 记账时序 —— 锁确认干净释放之后才 markStepDone。释放不干净（被接管 → not_owner）时
+      // step 留 prepared：本次退 3 不再伴生「journal 已 done、续跑走 done 快路静默成功」的门禁失效。
+      {
+        reprep45();
+        let renamed45p1 = false;
+        const origRn45p1 = fs.renameSync;
+        fs.renameSync = function (a45, b45) { const r45 = origRn45p1.call(fs, a45, b45); renamed45p1 = true; return r45; };
+        const origRl45p1 = fs.readlinkSync;
+        fs.readlinkSync = function (t45) { if (renamed45p1 && path.resolve(String(t45)) === pcLock45) return JSON.stringify({ pid: 999999, at: new Date(NOW45).toISOString(), token: "77777777-7777-4777-8777-777777777777" }); return origRl45p1.call(fs, t45); };
+        let rp11a45;
+        try { rp11a45 = run45("pending-claims"); } finally { fs.renameSync = origRn45p1; fs.readlinkSync = origRl45p1; }
+        assert.deepEqual([rp11a45.ok, rp11a45.reason], [false, "sidecar_lock_release_failed"], "释放被接管 → 退 3：" + JSON.stringify(rp11a45));
+        assert.equal(stepStateR1("pending-claims").state, "prepared", "释放不干净 → journal 仍 prepared（不许先记 done）：" + stepStateR1("pending-claims").state);
+        // 续跑（注入已撤）：锁还在（释放失败不删锁）→ 取锁被挡，不许经 done 快路静默成功
+        let rp11b45;
+        try { rp11b45 = run45("pending-claims"); } finally { /* 无补丁 */ }
+        assert.ok(rp11b45.ok === false, "续跑被挡（不许静默成功）：" + JSON.stringify(rp11b45));
+        assert.equal(stepStateR1("pending-claims").state, "prepared", "续跑后仍 prepared：" + stepStateR1("pending-claims").state);
+        fs.rmSync(pcLock45, { force: true, recursive: true });
+      }
+      // R45 四轮 P1-2：恢复快路必须重走 durability 屏障（目录 fsync + 受验读回 + 干净释放）才补 done ——
+      // 首次目录 fsync EIO → prepared 保留；续跑见现场 SHA===intended 不得直接补 done（屏藏计数）。
+      {
+        reprep45();
+        const origFsync45p2 = fs.fsyncSync;
+        fs.fsyncSync = function (fd45) { if (fs.fstatSync(fd45).isDirectory()) throw Object.assign(new Error("eio p12"), { code: "EIO" }); return origFsync45p2.call(fs, fd45); };
+        let rp12a45;
+        try { rp12a45 = run45("pending-claims"); } finally { fs.fsyncSync = origFsync45p2; }
+        assert.deepEqual([rp12a45.ok, rp12a45.reason, rp12a45.written], [false, "sidecar_dir_fsync", true], "首次目录 fsync EIO → prepared 保留：" + JSON.stringify(rp12a45));
+        // 续跑：现场已是 intended，但 durability 未证实 → 必须重做目录 fsync（屏障不许跳）之后才准补 done。
+        // 计数按打开路径圈定到 ledgerDir：journal 的 atomicWrite 每次写也 fsync 自己的目录（maintenance dir，
+        // 不是 ledgerDir），按 fd→路径记不得误计。
+        let fsyncDir45 = 0;
+        const dirFds45 = new Map();
+        const origOpen45p2 = fs.openSync, origClose45p2 = fs.closeSync;
+        fs.openSync = function (p45, ...r45) { const fd45 = origOpen45p2.call(fs, p45, ...r45); try { dirFds45.set(fd45, path.resolve(String(p45))); } catch { /* 非路径 fd */ } return fd45; };
+        fs.closeSync = function (fd45) { dirFds45.delete(fd45); return origClose45p2.call(fs, fd45); };
+        fs.fsyncSync = function (fd45) { if (dirFds45.get(fd45) === ledgerDir) fsyncDir45 += 1; return origFsync45p2.call(fs, fd45); };
+        let rp12b45;
+        try { rp12b45 = run45("pending-claims"); } finally { fs.openSync = origOpen45p2; fs.closeSync = origClose45p2; fs.fsyncSync = origFsync45p2; }
+        assert.ok(fsyncDir45 >= 1, "续跑重做目录 fsync（durability 屏障不许跳）：" + fsyncDir45);
+        assert.deepEqual([rp12b45.ok, rp12b45.written, rp12b45.recovered], [true, false, true], "续跑屏障后补 done：" + JSON.stringify(rp12b45));
+        assert.equal(stepStateR1("pending-claims").state, "done", "续跑后 journal done：" + stepStateR1("pending-claims").state);
+        fs.rmSync(pcLock45, { force: true, recursive: true });
+      }
+      // R45 四轮 P1-3：残骸聚合顺序 —— fence 段 lock_lost 且 .reap 交不还（rm EIO）时，residue 路径/error
+      // 必须随返回值带出（不许 ！ok 早退吞掉；手工释放段的残骸同样聚合）。
+      {
+        reprep45();
+        const lostReap45 = pcLock45 + ".reap";
+        const origReadlink45p3 = fs.readlinkSync;
+        fs.readlinkSync = function (t45) { if (path.resolve(String(t45)) === pcLock45) return JSON.stringify({ pid: process.pid, at: new Date(NOW45).toISOString(), token: "88888888-8888-4888-8888-888888888888" }); return origReadlink45p3.call(fs, t45); };
+        const origRm45p3 = fs.rmSync;
+        fs.rmSync = function (p45, o45) { if (path.resolve(String(p45)) === lostReap45) throw Object.assign(new Error("eio p13"), { code: "EIO" }); return origRm45p3.call(fs, p45, o45); };
+        let rp13a45;
+        try { rp13a45 = run45("pending-claims"); } finally { fs.readlinkSync = origReadlink45p3; fs.rmSync = origRm45p3; }
+        assert.deepEqual([rp13a45.ok, rp13a45.reason], [false, "sidecar_lock_lost"], "fence lock_lost 主 reason：" + JSON.stringify(rp13a45));
+        assert.ok(rp13a45.residue?.path === lostReap45 && String(rp13a45.residue.error).includes("EIO"), "fence 段残骸路径/error 带出：" + JSON.stringify(rp13a45.residue));
+        fs.rmSync(pcLock45, { force: true, recursive: true });
+        fs.rmSync(lostReap45, { force: true, recursive: true });
+      }
+      // P1-1⑤：active 清掉 → op_not_active（放最后：毁现场）。用 prepared 的 pending-claims：done step 在分派前就早退（纯读复核，不看绑定）。
+      const ca45 = clearActiveJ({ dir, token: UUID45 });
+      assert.ok(ca45.ok, "清 active：" + JSON.stringify(ca45));
+      const ro45 = run45("pending-claims");
+      assert.deepEqual([ro45.ok, ro45.reason], [false, "op_not_active"], "active 不指本 op → 拒：" + JSON.stringify(ro45));
+    } finally { releaseOperationLease(op.lease); fs.rmSync(base, { recursive: true, force: true }); }
+  });
+
+  test("#R45 C+D 复合提交编排端到端：staging→原子进段→sidecar 窄写→二次对账重验→停在 authority cutover 之前；恢复三分+崩溃；reconcileShadow 恒拒；CLI 预览+doctor 四项", () => {
+    const base = mkTempDir45();
+    const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
+    fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+    const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+    for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
+      execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
+    }
+    // 空 legacy fixture（projects:[] → 快照空、双射空空成立、blockers 空）——安装器写的 registry 覆盖为受控 fixture
+    const bridge45 = path.join(home, ".claude", "feishu-bridge");
+    // 套件启动时把 FEISHU_BRIDGE_REGISTRY 钉在全局沙箱登记表；本测试的 reconcile 走 ledgerEnter 默认 env=process.env，
+    // 必须把登记表指到受控文件，否则快照读的是别人的表（双射空空是碰巧成立，不是受控成立）。
+    const savedReg45 = process.env.FEISHU_BRIDGE_REGISTRY; process.env.FEISHU_BRIDGE_REGISTRY = path.join(bridge45, "registry.json");
+    fs.writeFileSync(path.join(bridge45, "registry.json"), JSON.stringify({ projects: [] }, null, 2) + "\n", { mode: 0o600 });
+    fs.writeFileSync(path.join(bridge45, "chain-config.json"), JSON.stringify(TPL, null, 2) + "\n", { mode: 0o600 }); // M1a Claude 采集器读链模板（collectFor 默认路径）
+    const node = pickClaudeNodeB();
+    const claudeRoot = path.join(bridge45, "runtime");
+    const claudeLabel = "com.frank.feishu-bridge-cc.drain";
+    const expectedArgs = claudeDrainExpectedJobB({ home, node }).args;
+    const launchd = { [claudeLabel]: { loaded: true, args: [...expectedArgs] } };
+    const fakeLaunchctl = (args) => {
+      if (args[0] === "list") { const st = launchd[args[1]]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; return { ok: true, stdout: "{\n\t\"ProgramArguments\" = (\n" + st.args.map((a) => "\t\"" + a + "\";").join("\n") + "\n\t);\n};\n" }; }
+      if (args[0] === "bootout") { const label = args[1].split("/").pop(); const st = launchd[label]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; st.loaded = false; return { ok: true, stdout: "" }; }
+      if (args[0] === "bootstrap") { const xml = fs.readFileSync(args[2], "utf-8"); const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/u.exec(xml)[1]; const arr = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/u.exec(xml)[1]; const args2 = [...arr.matchAll(/<string>([^<]*)<\/string>/gu)].map((m) => m[1]); launchd[label] = { loaded: true, args: args2 }; return { ok: true, stdout: "" }; }
+      return { ok: false, detail: "unknown" };
+    };
+    const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
+    const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
+    let clock = Date.parse("2026-09-01T12:00:00.000Z");
+    const crashAt = { id: null };
+    const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => { if (crashAt.id === id) throw Object.assign(new Error("crash"), { simulatedCrash: true }); } });
+    const ledgerTmp45 = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r45-ledger-")));
+    const ledgerRoot = path.join(ledgerTmp45, "ledger"); fs.mkdirSync(ledgerRoot, { mode: 0o700 }); // target "ledger/<ep>/…" 相对 bridgeHome = 账本根的父，根目录名固定叫 ledger；validateLedgerRoot 要 0700
+    const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
+    env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot; env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile; env.FEISHU_BRIDGE_MAINTENANCE_DIR = dir; // env 快照在此之后使用，三个隔离点补进快照
+    const savedGateEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile;
+    const savedMaintDirEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = dir;
+    const CH = "claude";
+    const EP = legacyEndpointId({ runtime: "claude", agentUid: "r45_comp" });
+    const epDir = path.join(ledgerRoot, EP);
+    const journalOf = (token) => readJournal({ dir, token }).doc;
+    try {
+      const init = LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EP, chain: CH, apply: true });
+      assert.ok(init.ok && init.phase === "done", "前置 init：" + JSON.stringify(init));
+      const cut = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EP, chain: CH, apply: true });
+      assert.ok(cut.ok === false, "cutover 不许成功（authority cutover 恒拒）：" + JSON.stringify(cut));
+      assert.equal(cut.reason, "authority_cutover_not_armed", "停门 reason 必须是提交点未武装（不是别的失败冒充停门）：" + JSON.stringify(cut));
+      assert.equal(cut.phase, "ledger_cutting_over", "停在 ledger_cutting_over：" + JSON.stringify({ phase: cut.phase, reason: cut.reason, why: cut.why, ok: cut.ok }));
+      assert.ok(cut.rollback === null || cut.rollback === undefined, "不回退（journal prepared 保留）：" + JSON.stringify(cut.rollback));
+      const token = cut.token;
+      const j45 = journalOf(token);
+      assert.equal(j45.phase, "ledger_cutting_over", "journal phase 保留");
+      const ls = j45.steps.find((s) => s.kind === "ledger");
+      assert.ok(ls && ls.state === "prepared", "ledger step prepared（未翻转）");
+      assert.equal(ls.before.plan_sha256, null, "ledger before.plan_sha256=null（1.3 八键）");
+      assert.match(ls.intended_after.plan_sha256, /^[0-9a-f]{64}$/, "ledger intended_after.plan_sha256=64hex（1.3 八键）");
+      for (const n of ["expiry", "pending-claims", "policy"]) {
+        const ss = j45.steps.find((s) => s.id === "sidecar:" + n + ":" + EP);
+        assert.ok(ss && ss.state === "done", "sidecar " + n + " step done");
+        const f = path.join(epDir, n + ".json");
+        assert.equal(shaBuf45(fs.readFileSync(f)), ss.intended_after.sha256, n + ".json 现场 SHA === intended");
+        assert.ok((fs.lstatSync(f).mode & 0o777) === 0o600, n + ".json 0600");
+      }
+      const LC = TAL.loadLedger(epDir, { endpointId: EP });
+      assert.ok(LC.ok && LC.doc.authority_mode === "shadow" && LC.doc.revision === 1, "账本仍 shadow/rev1（没翻转）：" + JSON.stringify(LC.ok ? LC.doc.authority_mode : LC));
+      const sidecarAnchors45 = Object.fromEntries(["expiry", "pending_claims", "policy"].map((k) => {
+        const nm = k === "pending_claims" ? "pending-claims" : k;
+        const s45 = j45.steps.find((x) => x.id === "sidecar:" + nm + ":" + EP);
+        return [k, { path: s45.intended_blob.path, bytes: s45.intended_blob.bytes, sha256: s45.intended_blob.sha256 }];
+      }));
+      assert.ok(verifyStagedPlan({ dir, token, planSha256: ls.intended_after.plan_sha256, sidecarAnchors: sidecarAnchors45 }).ok, "staged 树完好（还没到 reopening 不清）");
+      assert.equal(readActive({ dir }).state, "active", "active 保留");
+      assert.equal(readGate({ file: gateFile, now: clock }).state, "active", "门还开着");
+      assert.equal(launchd[claudeLabel].loaded, false, "定时器停着（forward-only 停门）");
+      const rs = TAL.reconcileShadow({ endpointId: EP, shadowDoc: LC.doc });
+      assert.ok(rs.ok === false && rs.reason === "reconciler_absent", "reconcileShadow 恒拒（生产红线）：" + JSON.stringify(rs));
+      const cut2 = LEDGER_OP.ledgerExit(ctx, { apply: true });
+      assert.ok(cut2.ok === false && cut2.phase === "ledger_cutting_over", "续跑仍停在提交前：" + JSON.stringify(cut2));
+      assert.ok(TAL.loadLedger(epDir, { endpointId: EP }).doc.authority_mode === "shadow", "续跑后仍 shadow");
+      assert.equal(journalOf(token).phase, "ledger_cutting_over", "续跑后 phase 不变");
+      assert.equal(shaBuf45(fs.readFileSync(path.join(epDir, "expiry.json"))), journalOf(token).steps.find((s) => s.id === "sidecar:expiry:" + EP).intended_after.sha256, "续跑后 sidecar 文件不变");
+      // 恢复三分（真编排现场）
+      // ① 现场=intended、step prepared → 补 done
+      { const lk45 = acquireOperationLease({ dir, token }); assert.ok(lk45.ok, "恢复租约：" + JSON.stringify(lk45)); updateJournal({ dir, token, lease: lk45, now: clock, mutate: (d) => { const s = d.steps.find((x) => x.id === "sidecar:expiry:" + EP); s.state = "prepared"; delete s.after; return d; } }); releaseOperationLease(lk45); }
+      assert.ok(LEDGER_OP.ledgerExit(ctx, { apply: true }).ok === false, "恢复①续跑仍停提交前");
+      assert.equal(journalOf(token).steps.find((x) => x.id === "sidecar:expiry:" + EP).state, "done", "恢复①：补 done");
+      // ② 现场=before（删文件）→ 重写
+      fs.rmSync(path.join(epDir, "pending-claims.json"));
+      { const lk45 = acquireOperationLease({ dir, token }); assert.ok(lk45.ok, "恢复租约：" + JSON.stringify(lk45)); updateJournal({ dir, token, lease: lk45, now: clock, mutate: (d) => { const s = d.steps.find((x) => x.id === "sidecar:pending-claims:" + EP); s.state = "prepared"; delete s.after; return d; } }); releaseOperationLease(lk45); }
+      LEDGER_OP.ledgerExit(ctx, { apply: true });
+      const pc = journalOf(token).steps.find((x) => x.id === "sidecar:pending-claims:" + EP);
+      assert.equal(pc.state, "done", "恢复②：重写后 done");
+      assert.ok(fs.existsSync(path.join(epDir, "pending-claims.json")), "恢复②：文件回来了");
+      // ③ 陌生现场 → 停门不翻转
+      const strange45 = Buffer.from("{strange\n", "utf-8");
+      fs.writeFileSync(path.join(epDir, "policy.json"), strange45, { mode: 0o600 });
+      { const lk45 = acquireOperationLease({ dir, token }); assert.ok(lk45.ok, "恢复租约：" + JSON.stringify(lk45)); updateJournal({ dir, token, lease: lk45, now: clock, mutate: (d) => { const s = d.steps.find((x) => x.id === "sidecar:policy:" + EP); s.state = "prepared"; delete s.after; return d; } }); releaseOperationLease(lk45); }
+      const cut3 = LEDGER_OP.ledgerExit(ctx, { apply: true });
+      assert.ok(cut3.ok === false, "恢复③：停门");
+      assert.ok(shaBuf45(fs.readFileSync(path.join(epDir, "policy.json"))) === shaBuf45(strange45), "恢复③：陌生文件不被动");
+      assert.ok(TAL.loadLedger(epDir, { endpointId: EP }).doc.authority_mode === "shadow", "恢复③：仍 shadow");
+      // 崩溃恢复：sidecar 写完崩 → 只向前收敛（进段已原子落盘）
+      const EPe = legacyEndpointId({ runtime: "claude", agentUid: "r45_crash" });
+      const epDirE = path.join(ledgerRoot, EPe);
+      const settle45 = (t45) => { // op 停在提交前等 authority 武装，门/桩/active 还挂着——模拟收尾，后续支跑新 op 前调用
+        fs.rmSync(gateFile, { force: true });
+        fs.rmSync(path.join(home, ".claude", "feishu-bridge", "install-surface.lock"), { force: true }); // 模拟崩溃后接管者视角：清 surface 锁残骸
+        clearActiveJ({ dir, token: t45 });
+        for (const [root45, sid45] of [[path.join(bridge45, "runtime"), "current:claude"], [path.join(codexHome, "feishu-bridge", "runtime"), "current:codex"]]) {
+          const before45 = journalOf(t45).steps.find((s) => s.id === sid45)?.before;
+          fs.rmSync(path.join(root45, "current"), { type: "symlink" });
+          fs.symlinkSync(before45, path.join(root45, "current"));
+        }
+      };
+      settle45(token);
+      { const lc = LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPe, chain: CH, apply: true }); assert.ok(lc.phase === "done", "crash 前置 init：" + JSON.stringify({ phase: lc.phase, reason: lc.reason })); }
+      crashAt.id = "written:sidecar:expiry:" + EPe;
+      let crashed = false;
+      try { LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPe, chain: CH, apply: true }); } catch (e) { crashed = e?.simulatedCrash === true; }
+      crashAt.id = null;
+      assert.ok(crashed, "sidecar 写完处崩（进段原子已落盘）");
+      const recE = LEDGER_OP.ledgerExit(ctx, { apply: true });
+      assert.ok(recE.ok === false && recE.phase === "ledger_cutting_over", "崩后续跑收敛 sidecar 再停提交前：" + JSON.stringify({ phase: recE.phase, reason: recE.reason }));
+      const jE = journalOf(recE.token);
+      assert.ok(jE.steps.find((s) => s.id === "sidecar:expiry:" + EPe)?.state === "done", "崩溃后 expiry 已收敛 done");
+      assert.ok(TAL.loadLedger(epDirE, { endpointId: EPe }).doc.authority_mode === "shadow", "崩溃恢复仍 shadow");
+      // R45 返修 P1-5：既有 sidecar 备份 E2E —— 原字节进 staged 备份 + journal 三字段 + 终态 = intended（先收上一支的 surface 锁）
+      settle45(recE.token);
+      const EPk = legacyEndpointId({ runtime: "claude", agentUid: "r45_backup" });
+      const epDirK = path.join(ledgerRoot, EPk);
+      const oldK = {};
+      { const lcK = LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPk, chain: CH, apply: true }); assert.ok(lcK.ok && lcK.phase === "done", "备份支前置 init：" + JSON.stringify({ phase: lcK.phase, reason: lcK.reason })); }
+      // init 完成后预写三份既有 sidecar（init 要求 virgin 目录，cutover 才有原文件可备份）
+      fs.mkdirSync(epDirK, { recursive: true, mode: 0o700 });
+      for (const [k45, fb45] of [["expiry", "expiry"], ["pending_claims", "pending-claims"], ["policy", "policy"]]) {
+        oldK[k45] = Buffer.from(JSON.stringify({ schema_version: "old-" + k45, endpoint_id: EPk, entries: { pre: "2026-01-01T00:00:00.000Z" } }, null, 2) + "\n", "utf-8");
+        fs.writeFileSync(path.join(epDirK, fb45 + ".json"), oldK[k45], { mode: 0o600 });
+      }
+      const cutK = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPk, chain: CH, apply: true });
+      assert.ok(cutK.ok === false && cutK.phase === "ledger_cutting_over", "备份支停提交前：" + JSON.stringify({ phase: cutK.phase, reason: cutK.reason }));
+      const jK = journalOf(cutK.token);
+      for (const [k45, fb45] of [["expiry", "expiry"], ["pending_claims", "pending-claims"], ["policy", "policy"]]) {
+        const sK = jK.steps.find((x) => x.id === "sidecar:" + fb45 + ":" + EPk);
+        assert.ok(sK?.before?.exists === true && sK.backup_sha256 === shaBuf45(oldK[k45]) && sK.backup_bytes === oldK[k45].length, fb45 + " journal 备份三字段：" + JSON.stringify(sK));
+        assert.ok(typeof sK.backup === "string" && fs.existsSync(sK.backup) && Buffer.compare(fs.readFileSync(sK.backup), oldK[k45]) === 0, fb45 + " staged 备份字节与原文件一致（" + path.basename(sK.backup) + "）");
+        assert.equal(shaBuf45(fs.readFileSync(path.join(epDirK, fb45 + ".json"))), sK.intended_after.sha256, fb45 + " 终态 = intended");
+      }
+      settle45(cutK.token);
+      // ── R45 二轮 P1-5：staging 前基线读受验（FIFO / 多硬链接 / 超 1MiB 在探查即拒 sidecar_unclear，不再无界读、不把 FIFO 当空文件）──
+      const stagedCount45 = () => fs.readdirSync(dir).filter((f) => f.endsWith(".staged")).length;
+      const probeVariant45 = (tag45, plant45, still45) => {
+        const EPv45 = legacyEndpointId({ runtime: "claude", agentUid: "r45_probe_" + tag45 });
+        const epDirV45 = path.join(ledgerRoot, EPv45);
+        { const lc = LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPv45, chain: CH, apply: true }); assert.ok(lc.phase === "done", tag45 + " 前置 init：" + JSON.stringify({ phase: lc.phase, reason: lc.reason })); }
+        plant45(epDirV45);
+        const stagedBefore45 = stagedCount45();
+        const cut = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPv45, chain: CH, apply: true });
+        assert.deepEqual([cut.ok, cut.reason], [false, "sidecar_unclear"], tag45 + " staging 前即拒：" + JSON.stringify({ ok: cut.ok, reason: cut.reason, phase: cut.phase }));
+        assert.equal(stagedCount45(), stagedBefore45, tag45 + " 没进段（无新 staged 树）");
+        still45(epDirV45);
+      };
+      probeVariant45("fifo", (d45) => execFileSync("mkfifo", [path.join(d45, "expiry.json")]), (d45) => assert.ok(fs.lstatSync(path.join(d45, "expiry.json")).isFIFO(), "FIFO 现场未被动"));
+      probeVariant45("hardlink", (d45) => { fs.writeFileSync(path.join(d45, "expiry.json"), Buffer.from('{"schema_version":"old","endpoint_id":"x","entries":{}}\n', "utf-8"), { mode: 0o600 }); fs.linkSync(path.join(d45, "expiry.json"), path.join(d45, "expiry.json.link")); }, (d45) => assert.ok(fs.lstatSync(path.join(d45, "expiry.json")).nlink === 2, "硬链接现场未被动"));
+      probeVariant45("big", (d45) => fs.writeFileSync(path.join(d45, "expiry.json"), Buffer.alloc(1024 * 1024 + 1, 0x61), { mode: 0o600 }), (d45) => assert.equal(fs.lstatSync(path.join(d45, "expiry.json")).size, 1024 * 1024 + 1, "超限文件未被动"));
+      // ── R45 二轮 P1-4：真异常（非模拟崩溃）折结构化收据 + finally 释放 lease/安装面锁，现场可续跑 ──
+      {
+        const EPc45 = legacyEndpointId({ runtime: "claude", agentUid: "r45_fold" });
+        const ctxBoom45 = { ...ctx, afterStep: (id) => { if (id === "written:ledger:" + EPc45 + ":init") throw new Error("真异常 r45r2"); } };
+        const rf45 = LEDGER_OP.ledgerEnter(ctxBoom45, { kind: "init", endpointId: EPc45, chain: CH, apply: true });
+        assert.deepEqual([rf45.ok, rf45.reason], [false, "ledger_forward_failed"], "真异常折结构化收据：" + JSON.stringify({ ok: rf45.ok, reason: rf45.reason }));
+        assert.deepEqual([rf45.leaseRelease, rf45.surfaceRelease], [null, null], "finally 释放，无残影：" + JSON.stringify({ leaseRelease: rf45.leaseRelease, surfaceRelease: rf45.surfaceRelease }));
+        assert.ok(!fs.existsSync(path.join(dir, rf45.token + ".lease")), "operation lease 已释放");
+        assert.ok(!fs.existsSync(path.join(home, ".claude", "feishu-bridge", "install-surface.lock")), "安装面锁已释放");
+        const rx45 = LEDGER_OP.ledgerExit(ctx, { apply: true });
+        assert.ok(rx45.ok === true && rx45.phase === "done" && rx45.activeCleared === true, "续跑收敛到 done：" + JSON.stringify({ ok: rx45.ok, phase: rx45.phase, activeCleared: rx45.activeCleared, reason: rx45.reason }));
+        // R45 三轮 P1-3：折收据必须带 phase（重读）或 incomplete —— 命令面 exitCodeFor 靠它判「动了没做完」给 3
+        assert.ok(rf45.phase === "ledger_initializing" || (Array.isArray(rf45.incomplete) && rf45.incomplete.length > 0), "折收据带 phase 或 incomplete：" + JSON.stringify({ phase: rf45.phase ?? null, incomplete: rf45.incomplete ?? null }));
+        // R45 三轮 P1-3：命令面真实 CLI —— catch 不带 phase 时曾退 1；已动现场必须退 3
+        {
+          const EPf45 = legacyEndpointId({ runtime: "claude", agentUid: "r45_clifail" });
+          const ctxBoomF45 = { ...ctx, afterStep: (id) => { if (id === "written:ledger:" + EPf45 + ":init") throw new Error("真异常 r45r3"); } };
+          const outF45 = [];
+          const rcF45 = runMaintenanceLedger(["--init", "--endpoint", EPf45, "--chain", "claude", "--apply"], { ctx: ctxBoomF45, out: (t) => outF45.push(t), env });
+          assert.equal(rcF45, 3, "CLI 当次退出码 3（动了没做完）：" + outF45.join("\n"));
+          const rxF45 = LEDGER_OP.ledgerExit(ctx, { apply: true });
+          assert.ok(rxF45.ok === true && rxF45.phase === "done", "CLI 崩溃现场续跑收敛：" + JSON.stringify({ ok: rxF45.ok, phase: rxF45.phase, reason: rxF45.reason }));
+        }
+      }
+      // ── R45 三轮 P2-1：编排层透传 writer 结构化残骸（lockUncleared 进收据；CLI 靠 releaseRows 打出真实路径）──
+      {
+        const epLocks45 = (epDir45w) => ["expiry", "pending-claims", "policy"].map((n45) => path.join(epDir45w, n45 + ".json") + ".lock");
+        const origRm45w = fs.rmSync;
+        // ① fence 段 .reap 删不掉（每次都抛）→ writer sidecar_lock_residue → 编排收据 lockUncleared 带 .reap 真实路径。
+        // 注意：三条 sidecar 在 ledgerEnter 里就已收敛（停在 authority_cutover 之前），残骸必须在 enter 期间注入。
+        const EPw45 = legacyEndpointId({ runtime: "claude", agentUid: "r45_p21" });
+        { const lc45 = LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPw45, chain: CH, apply: true }); assert.ok(lc45.phase === "done", "P2-1① 前置 init：" + JSON.stringify({ phase: lc45.phase, reason: lc45.reason })); }
+        const reaps45w = epLocks45(path.join(ledgerRoot, EPw45)).map((l45) => l45 + ".reap");
+        fs.rmSync = function (p45, o45) { if (reaps45w.includes(path.resolve(String(p45)))) throw Object.assign(new Error("eperm p21"), { code: "EPERM" }); return origRm45w.call(fs, p45, o45); };
+        let rcptW45;
+        try { rcptW45 = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPw45, chain: CH, apply: true }); } finally { fs.rmSync = origRm45w; }
+        assert.deepEqual([rcptW45.ok, rcptW45.reason], [false, "sidecar_lock_residue"], "writer 残骸到编排收据：" + JSON.stringify({ ok: rcptW45.ok, reason: rcptW45.reason, why: rcptW45.why ?? null }));
+        assert.ok(reaps45w.includes(rcptW45.lockUncleared?.path), "lockUncleared 带 .reap 真实路径：" + JSON.stringify(rcptW45.lockUncleared ?? null));
+        assert.match(String(rcptW45.lockUncleared?.error ?? ""), /EPERM/u, "lockUncleared 带错误原文");
+        for (const l45 of [...epLocks45(path.join(ledgerRoot, EPw45)), ...reaps45w]) fs.rmSync(l45, { force: true, recursive: true });
+        settle45(rcptW45.token);
+        // ② CLI 面：「.reap 删不掉但不抛」变体 → 释放支 busy → 主锁路径经 lockUncleared 进 CLI 输出（新 op，干净起跑）
+        const EPw2 = legacyEndpointId({ runtime: "claude", agentUid: "r45_p21b" });
+        { const lc2 = LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPw2, chain: CH, apply: true }); assert.ok(lc2.phase === "done", "P2-1② 前置 init：" + JSON.stringify({ phase: lc2.phase, reason: lc2.reason })); }
+        const locks45w2 = epLocks45(path.join(ledgerRoot, EPw2));
+        const reaps45w2 = locks45w2.map((l45) => l45 + ".reap");
+        const outW45 = [];
+        fs.rmSync = function (p45, o45) { if (reaps45w2.includes(path.resolve(String(p45)))) return; return origRm45w.call(fs, p45, o45); };
+        let rcW45;
+        try { rcW45 = runMaintenanceLedger(["--cutover", "--endpoint", EPw2, "--apply"], { ctx, out: (t) => outW45.push(t), env }); } finally { fs.rmSync = origRm45w; }
+        const outTxtW45 = outW45.join("\n");
+        assert.ok(locks45w2.some((l45) => outTxtW45.includes("账本主锁交不还：" + l45)), "CLI 打出主锁真实路径：" + outTxtW45.split("\n").filter((l) => l.includes("交不还")).join(" | "));
+        assert.equal(rcW45, 3, "CLI 残骸收当次退 3：" + rcW45);
+        for (const l45 of [...locks45w2, ...reaps45w2]) fs.rmSync(l45, { force: true, recursive: true });
+        const actW45 = readActive({ dir: ctx.dir });
+        assert.ok(actW45.state === "active", "② 的 op 还挂着门：" + JSON.stringify(actW45));
+        settle45(actW45.token);
+      }
+      // ── D：CLI 预览（只读真对账）──
+      const EPd = legacyEndpointId({ runtime: "claude", agentUid: "r45_cli" });
+      settle45(recE.token);
+      { const lc = LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPd, chain: CH, apply: true }); assert.ok(lc.phase === "done", "CLI 前置 init：" + JSON.stringify({ phase: lc.phase, reason: lc.reason, why: lc.why ?? null })); }
+      // R45 三轮 P1-1②：守卫升级为行为断言 —— 预览面数据源（reconcileFor 公共包装）递归无 bytes 字段。
+      // grep 只查私有接口字面名，「经公共包装别名转发到私有接口」就能绕过；行为断言看的是预览真实拿到的东西。
+      {
+        const safeRec45 = LEDGER_OP.reconcileFor({ ctx, chain: CH, endpointId: EPd, ledgerDir: path.join(ledgerRoot, EPd), env });
+        assert.ok(safeRec45.ok === true, "公共包装成立：" + JSON.stringify({ ok: safeRec45.ok, reason: safeRec45.reason, why: safeRec45.why ?? null }));
+        const bytesScan45 = (o) => o == null ? false : Array.isArray(o) ? o.some(bytesScan45) : typeof o === "object" ? Object.entries(o).some(([k45, v45]) => k45 === "bytes" || bytesScan45(v45)) : false;
+        assert.equal(bytesScan45(safeRec45), false, "预览面数据源递归无 bytes 字段：" + JSON.stringify(Object.keys(safeRec45)));
+        const Lc45 = TAL.loadLedger(path.join(ledgerRoot, EPd), { endpointId: EPd });
+        assert.deepEqual(safeRec45.ledger, { revision: Lc45.doc.revision, sha256: Lc45.sha256 }, "安全面带 ledger:{revision,sha256}：" + JSON.stringify(safeRec45.ledger ?? null));
+      }
+      const outD = [];
+      const rcD = runMaintenanceLedger(["--cutover", "--endpoint", EPd], { ctx, out: (t) => outD.push(t), env });
+      assert.equal(rcD, 0, "CLI 预览 rc0：" + outD.join("\n"));
+      const prevD = outD.join("\n");
+      assert.match(prevD, /cutover 预览/u, "预览标题");
+      assert.match(prevD, /对账一致/u, "预览含对账结果（真 reconcileLegacyEndpoint，不再是恒拒桩）");
+      assert.match(prevD, /expiry[\s\S]*pending-claims[\s\S]*policy/u, "预览含三 sidecar 目标");
+      assert.match(prevD, /--apply/u, "预览提示需授权");
+      assert.equal(readActive({ dir }).state, "absent", "预览不动状态");
+      // ── D：doctor 四项扩展 ──
+      const rcpt45 = runDoctor({ home, launchctl: fakeLaunchctl }).checks.find((c) => c.id === "ledger_receipt");
+      assert.ok(rcpt45.detail.includes("收据"), "⑬收据聚合段投影在场：" + rcpt45.detail);
+      const doc1 = runDoctor({ home, launchctl: fakeLaunchctl }).checks.find((c) => c.id === "topic_agent_staging");
+      assert.ok(doc1.ok, "doctor 干净现场 ok：" + doc1.detail);
+      assert.ok(!/staged 残骸|plan 锚|sidecar 权威文件/.test(doc1.detail), "干净现场四项无 finding：" + doc1.detail);
+      fs.mkdirSync(path.join(dir, "deadbeef-1234-4321-8123-456789abcdef.staged"), { recursive: true });
+      fs.writeFileSync(path.join(epDir, "expiry.json"), "{broken", { mode: 0o600 });
+      const doc2 = runDoctor({ home, launchctl: fakeLaunchctl }).checks.find((c) => c.id === "topic_agent_staging");
+      assert.ok(doc2.ok === false, "破坏现场 fail");
+      assert.match(doc2.detail, /staged 残骸/u, "①staged 残骸点名");
+      assert.match(doc2.detail, /sidecar 权威文件/u, "③sidecar 4e-2 校验点名");
+      assert.ok(!/plan 锚/.test(doc2.detail), "②plan 锚复核仍过（staged 树没动）");
+      // P2-1 返修：staged 位置的 dangling symlink —— 结构化残骸报告，不裸抛
+      fs.symlinkSync(path.join(dir, "definitely-not-here-45"), path.join(dir, "deadface-1234-4321-8123-456789abcdef.staged"));
+      const doc3 = runDoctor({ home, launchctl: fakeLaunchctl }).checks.find((c) => c.id === "topic_agent_staging");
+      assert.ok(doc3.ok === false, "dangling symlink → fail：" + JSON.stringify(doc3));
+      assert.match(doc3.detail, /deadface[\s\S]*staged 残骸|staged 残骸[\s\S]*deadface/u, "残骸点名（不裸抛）：" + doc3.detail);
+    } finally {
+      if (savedReg45 === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY; else process.env.FEISHU_BRIDGE_REGISTRY = savedReg45;
+      if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedgerDir;
+      if (savedGateEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; else process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = savedGateEnv;
+      if (savedMaintDirEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = savedMaintDirEnv;
+      fs.rmSync(base, { recursive: true, force: true }); fs.rmSync(ledgerTmp45, { recursive: true, force: true });
+    }
+  });
+
+  test("#R45-R2 返修 P1-4：cutover_blockers 硬门 —— 进段前（drained planPre）/ 收敛二次重验 / 续跑收敛，blockers 非空必拒且不翻转账本", () => {
+    const base = mkTempDir45();
+    const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
+    fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+    const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+    for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
+      execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
+    }
+    const bridge45 = path.join(home, ".claude", "feishu-bridge");
+    // 同 C+D：登记表必须钉到受控文件（ledgerEnter 默认 env=process.env，全局沙箱表会盖掉本测试的 retired 场景）。
+    const savedReg45 = process.env.FEISHU_BRIDGE_REGISTRY; process.env.FEISHU_BRIDGE_REGISTRY = path.join(bridge45, "registry.json");
+    const writeRegistry45 = (projects) => fs.writeFileSync(path.join(bridge45, "registry.json"), JSON.stringify({ projects }, null, 2) + "\n", { mode: 0o600 });
+    writeRegistry45([]);
+    fs.writeFileSync(path.join(bridge45, "chain-config.json"), JSON.stringify(TPL, null, 2) + "\n", { mode: 0o600 });
+    const node = pickClaudeNodeB();
+    const claudeLabel = "com.frank.feishu-bridge-cc.drain";
+    const expectedArgs = claudeDrainExpectedJobB({ home, node }).args;
+    const launchd = { [claudeLabel]: { loaded: true, args: [...expectedArgs] } };
+    const fakeLaunchctl = (args) => {
+      if (args[0] === "list") { const st = launchd[args[1]]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; return { ok: true, stdout: "{\n\t\"ProgramArguments\" = (\n" + st.args.map((a) => "\t\"" + a + "\";").join("\n") + "\n\t);\n};\n" }; }
+      if (args[0] === "bootout") { const label = args[1].split("/").pop(); const st = launchd[label]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; st.loaded = false; return { ok: true, stdout: "" }; }
+      if (args[0] === "bootstrap") { const xml = fs.readFileSync(args[2], "utf-8"); const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/u.exec(xml)[1]; const arr = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/u.exec(xml)[1]; const args2 = [...arr.matchAll(/<string>([^<]*)<\/string>/gu)].map((m) => m[1]); launchd[label] = { loaded: true, args: args2 }; return { ok: true, stdout: "" }; }
+      return { ok: false, detail: "unknown" };
+    };
+    const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
+    const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
+    let clock = Date.parse("2026-09-01T12:00:00.000Z");
+    const projR45 = path.join(base, "r45-retired-proj"); fs.mkdirSync(projR45, { recursive: true, mode: 0o700 });
+    const EPb45 = legacyEndpointId({ runtime: "claude", agentUid: "r45_blockers" });
+    const retired45 = () => [{ root: projR45, id: "p1", claude_session_id: "ps_" + "a".repeat(32), root_message_id: "om_" + "b".repeat(20), status: "retired" }];
+    const flipTo = { retired: false }; // afterStep 钩子：expiry 写完后把 registry 换成 retired 现场（模拟 staging 后冒出新待修项）
+    const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => { if (flipTo.retired === true && id === "written:sidecar:expiry:" + EPb45) { flipTo.retired = "done"; writeRegistry45(retired45()); } } });
+    const ledgerTmp45 = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r45-blockers-")));
+    const ledgerRoot = path.join(ledgerTmp45, "ledger"); fs.mkdirSync(ledgerRoot, { mode: 0o700 });
+    const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
+    env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot; env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile; env.FEISHU_BRIDGE_MAINTENANCE_DIR = dir;
+    const savedGateEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile;
+    const savedMaintDirEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = dir;
+    const CH = "claude";
+    const epDirB = path.join(ledgerRoot, EPb45);
+    try {
+      { const lc = LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPb45, chain: CH, apply: true }); assert.ok(lc.ok && lc.phase === "done", "前置 init：" + JSON.stringify({ phase: lc.phase, reason: lc.reason })); }
+      // 调用面①：进段前（drained 的 planPre）—— 双射空空一致但 retired binding blocker 非空 → 拒 + 回退清场
+      writeRegistry45(retired45());
+      const cut1 = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPb45, chain: CH, apply: true });
+      assert.ok(cut1.ok === false, "① blockers 非空必拒：" + JSON.stringify(cut1));
+      assert.equal(cut1.reason, "cutover_blocked", "① reason 点名：" + JSON.stringify(cut1));
+      assert.match(String(cut1.why ?? ""), /binding_retired/u, "① blocker 码透出：" + cut1.why);
+      assert.ok(cut1.rollback?.ok === true, "① 回退清场完成：" + JSON.stringify(cut1.rollback));
+      assert.equal(readActive({ dir }).state, "absent", "① active 清了");
+      assert.ok(TAL.loadLedger(epDirB, { endpointId: EPb45 }).doc.authority_mode === "shadow", "① 账本仍 shadow");
+      // 调用面②：收敛二次重验 —— staging 后冒出新待修项（expiry 写完换 registry）→ 中途拦，phase/账本保留
+      writeRegistry45([]);
+      flipTo.retired = true;
+      const cut2 = LEDGER_OP.ledgerEnter(ctx, { kind: "cutover", endpointId: EPb45, chain: CH, apply: true });
+      assert.ok(cut2.ok === false, "② 二次重验拦：" + JSON.stringify(cut2));
+      assert.equal(cut2.reason, "cutover_blocked", "② reason 点名：" + JSON.stringify(cut2));
+      assert.match(String(cut2.why ?? ""), /binding_retired/u, "② blocker 码透出：" + cut2.why);
+      assert.equal(cut2.phase, "ledger_cutting_over", "② phase 保留：" + JSON.stringify({ phase: cut2.phase, why: cut2.why }));
+      assert.ok(TAL.loadLedger(epDirB, { endpointId: EPb45 }).doc.authority_mode === "shadow", "② 账本仍 shadow");
+      assert.equal(readJournal({ dir, token: cut2.token }).doc.steps.find((s) => s.kind === "ledger").state, "prepared", "② ledger step 未翻转");
+      // 调用面③：续跑收敛 —— 待修项还在仍拒；清掉后回到正常停门（authority 未武装）
+      const cut3 = LEDGER_OP.ledgerExit(ctx, { apply: true });
+      assert.ok(cut3.ok === false && cut3.reason === "cutover_blocked", "③ 续跑仍拒：" + JSON.stringify(cut3));
+      writeRegistry45([]);
+      const cut4 = LEDGER_OP.ledgerExit(ctx, { apply: true });
+      assert.ok(cut4.ok === false && cut4.reason === "authority_cutover_not_armed" && cut4.phase === "ledger_cutting_over", "③ 清掉待修项 → 回到正常停门：" + JSON.stringify({ phase: cut4.phase, reason: cut4.reason }));
+    } finally {
+      if (savedReg45 === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY; else process.env.FEISHU_BRIDGE_REGISTRY = savedReg45;
+      if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedgerDir;
+      if (savedGateEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; else process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = savedGateEnv;
+      if (savedMaintDirEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = savedMaintDirEnv;
+      fs.rmSync(base, { recursive: true, force: true }); fs.rmSync(ledgerTmp45, { recursive: true, force: true });
+    }
+  });
+}
 
 summarySealed = true;
 

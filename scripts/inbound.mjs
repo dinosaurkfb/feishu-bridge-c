@@ -17,7 +17,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { REJECT, normalizeBody } from "./selector.mjs";
+import { normalizeBody } from "./selector.mjs";
 import { fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, claimKey, readClaimState, recordClaimState, watcherExpectEnv } from "./claim.mjs";
 import { effectiveBindingId, pendingGeneration } from "./topic-generation.mjs";
@@ -143,11 +143,13 @@ function ackText(kind, detail) {
     ].join("\n");
   }
   if (kind === "bound") {
-    return [
+    const lines = [
       "绑定完成 · " + detail.taskName,
       "这个话题现在通向 " + detail.root + "。",
       "之后在这条消息下面 @ 一下就是给它下指令；它的进展和每一轮回答也会以卡片发回这里。",
-    ].join("\n");
+    ];
+    if (detail.bodySkipped) lines.splice(2, 0, "你这条消息里带的正文没有被执行（配对消息只做绑定）；要下指令请再发一条新消息。");
+    return lines.join("\n");
   }
   if (kind === "control") return detail.text;
   if (kind === "chat") return detail.text + "\n" + CHAT_FOOTER + (detail.replayed ? "（同一条消息的重放：按记录重出）" : "") + (detail.ledgerNote ?? "");
@@ -542,6 +544,33 @@ if (!config) {
   finish("error", { detail: "这个项目的链路配置不可用，没法投递" }, { reason: "config_unusable" });
 }
 
+// P1-1③（#R37）：配对复合消息 = bind-only（layers-v2-permissions.md §4/§10-1 拍板）。本条消息若是
+//   首条受验 owner @ 的配对尝试（justBound —— 锁内 evaluatePromotion 六件事通过、成功绑定），就**整条
+//   只做 R3 配对、正文不执行**（成功或失败都不再处理正文）。旧码只对「光秃秃一个 @」（EMPTY_INSTRUCTION）
+//   触发 bound 握手，非空正文在绑定后会继续按新策略执行 —— 那是 §4 明说要收紧的旧差异（配对复合消息只属
+//   一个上下文）。这里把 bound 握手提前到 verdict/策略/指令授权 shadow/claim/投递之前：配对消息不需要评估
+//   后续正文、不起 claim、不起模型。
+if (justBound) {
+  const bodySkipped = normalizeBody(event.content).trim().length > 0;
+  appendConsumed(routed.root, event.message_id, {
+    claudeSessionId: routed.mapping?.claude_session_id ?? null,
+  });
+  writeReceipt("bound-" + event.message_id, {
+    status: "bound", message_id: event.message_id, session_id: event.session_id,
+    root: routed.root, binding_id: effectiveBindingId(mapping),
+    matched_by: pendingMatchedBy,
+    body_skipped: bodySkipped,
+    claim_acquired: false, handed_off: false,
+    subscription_claim_shadow: subscriptionClaimShadow,
+    // 为将来的确定性匹配攒证据：根消息里那个绑定码有没有随引用块回来。
+    // 现在没有代码依赖它，纯粹是想知道那条路走不走得通。
+    pending_token_seen: typeof mapping.pending_token === "string" && mapping.pending_token.length > 0
+      ? String(event.content ?? "").includes(mapping.pending_token) : null,
+  });
+  finish("bound", { taskName: config.task_display_name, root: routed.root, bodySkipped },
+    { bound: true, root: routed.root, body_skipped: bodySkipped });
+}
+
 const verdict = evaluateMappingAdmission({
   canonicalEvent: fetched.canonical_event,
   event,
@@ -592,28 +621,6 @@ let authz = null;
 const handlePolicy = (args = {}) => dialogueMode
   ? handleDialoguePolicy({ evaluation: policyEvaluation, capability: authz?.capability ?? null, ...args })
   : handleMappingPolicy({ evaluation: policyEvaluation, capability: authz?.capability ?? null, ...args });
-
-// 光秃秃一个 @（没有正文）是完成绑定的正常方式 —— 那一下的目的就是让 Aily 产生
-// session，好把它写进绑定。这时候回「消息里没有指令正文」是句没用的实话：
-// 它描述了现象，却把一次成功说成了失败。
-if (justBound && verdict.decision === "reject" && verdict.reason === REJECT.EMPTY_INSTRUCTION) {
-  appendConsumed(routed.root, event.message_id, {
-    claudeSessionId: routed.mapping?.claude_session_id ?? null,
-  });
-  writeReceipt("bound-" + event.message_id, {
-    status: "bound", message_id: event.message_id, session_id: event.session_id,
-    root: routed.root, binding_id: effectiveBindingId(mapping),
-    matched_by: pendingMatchedBy,
-    claim_acquired: false, handed_off: false,
-    subscription_claim_shadow: subscriptionClaimShadow,
-    // 为将来的确定性匹配攒证据：根消息里那个绑定码有没有随引用块回来。
-    // 现在没有代码依赖它，纯粹是想知道那条路走不走得通。
-    pending_token_seen: typeof mapping.pending_token === "string" && mapping.pending_token.length > 0
-      ? String(event.content ?? "").includes(mapping.pending_token) : null,
-  });
-  finish("bound", { taskName: config.task_display_name, root: routed.root },
-    { bound: true, root: routed.root });
-}
 
 // --dry-run：只跑校验，不 claim、不投递、不写 mapping。用于诊断和联调，
 // 免得一次排查就把真实指令送进长期任务。

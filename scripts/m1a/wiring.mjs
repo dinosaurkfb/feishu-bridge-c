@@ -439,3 +439,25 @@ export function wireRetarget({ endpointId, env = process.env, legacy, controlCla
     return [capture("retarget", retarget({ endpointId, requestKey: k.request_key, id, expectedOldTarget, newTarget, authorizedBy, now, env }))];
   } });
 }
+
+/**
+ * wireBind —— 初始绑定的双写（Frank 拍板，P1-2）。
+ * 交易序列（outer 锁内）：① re-read receipt+ledger ② 重核 exact target ③ legacy 用既有 idempotency-key
+ *   建根话题 + B1 登记 ④ shadow create_b1 ⑤ status ⑥ 释放 outer。
+ * legacy 必须返回 { root_message_id }（受验根话题 om），供 create_b1 的 rootOm；lineageId 由调用方给
+ *   （claude basename(root)+"@project-files" / codex logicalTaskKey+"@codex-registry"，均来自既有算法，非自铸）。
+ * request_key：ext="bind:"+externalRequestId；entity=generation_lineage_id（= lineageId）。
+ * target_incomplete（enabled 端点无受验会话）由调用方**进 wireBind 前**整笔拒，本函数不消费不完整 target。
+ */
+export function wireBind({ endpointId, env = process.env, legacy, externalRequestId, lineageId, chatId, bindingTarget, now = Date.now() }) {
+  return runWired({ endpointId, env, legacy, submit: (legacyRes) => {
+    if (!en(externalRequestId) || !en(lineageId)) {
+      return [{ op: "create_b1", ok: false, reason: "bad_external_id", why: "externalRequestId/lineageId 必填 1..256 字符串" }];
+    }
+    const om = (legacyRes && typeof legacyRes === "object" && legacyRes.root_message_id) ? legacyRes.root_message_id : null;
+    if (!en(om)) return [{ op: "create_b1", ok: false, reason: "bad_external_id", why: "legacy 未返回受验 root_message_id" }];
+    const k = rk("create_b1", "bind:" + externalRequestId, lineageId);
+    if (!k.ok) return [{ op: "create_b1", ...k }];
+    return [capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm: om, lineageId, bindingTarget, now, env }))];
+  } });
+}

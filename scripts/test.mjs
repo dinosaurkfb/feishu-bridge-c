@@ -25367,6 +25367,56 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.equal(unc.uncleanSteps[0].op, "create_a1");
     assert.equal(unc.uncleanSteps[0].commit, "committed_durability_uncertain", "断言落在真实字段名 committed 上");
   }));
+  test("P2-2 wireBind 初始绑定双写：shadow create_b1 落账（lineage=binding_id、target 精确、幂等）+ legacy 无 root → 拒", () => withRootAndReceipt((root, dir) => {
+    const maint = path.join(root, "maint");
+    seedLedgerInitReceipt(maint, EP);   // 端点 ok（M1a 已启用）→ 双写强制
+    seedLedger(dir);
+    let legacyCalls = 0;
+    const w = WIRE.wireBind({
+      endpointId: EP, env: process.env,
+      legacy: () => { legacyCalls += 1; return { root_message_id: "om_bind1" }; },
+      externalRequestId: "root#sess-uuid", lineageId: "p@project-files",
+      chatId: "oc_bind", bindingTarget: TGT, now: Date.now(),
+    });
+    assert.ok(w.ok, "legacy 成功 + shadow 提交 → wired.ok:" + JSON.stringify(w));
+    assert.equal(legacyCalls, 1, "legacy 跑一次");
+    assert.equal(w.shadow.length, 1, "一笔 shadow");
+    const step = w.shadow[0];
+    assert.equal(step.op, "create_b1", "shadow op 是 create_b1");
+    assert.equal(step.ok, true, "create_b1 提交成功：" + JSON.stringify(step));
+    assert.equal(step.committed, "committed_clean", "create_b1 干净提交");
+    const b1Id = step.result?.created_id ?? famIds(talLoad(dir), "B1")[0];
+    assert.ok(b1Id, "应产出 B1 记录 id");
+    const rec = talLoad(dir).records[b1Id];
+    assert.equal(rec.binding_target.runtime, "claude", "target.runtime");
+    assert.equal(rec.binding_target.project_root, TGT.project_root, "target.project_root");
+    assert.equal(rec.binding_target.claude_session_id, TGT.claude_session_id, "target.claude_session_id");
+    assert.equal(rec.generation_lineage_id, "p@project-files", "generation_lineage_id=liniage（binding_id）");
+    // 幂等重放：同 externalRequestId + lineageId → create_b1 幂等、不写新记录。
+    const w2 = WIRE.wireBind({
+      endpointId: EP, env: process.env,
+      legacy: () => { legacyCalls += 1; return { root_message_id: "om_bind1" }; },
+      externalRequestId: "root#sess-uuid", lineageId: "p@project-files",
+      chatId: "oc_bind", bindingTarget: TGT, now: Date.now(),
+    });
+    assert.equal(w2.shadow[0].idempotent, true, "同 key 重放→幂等：" + JSON.stringify(w2.shadow[0]));
+    assert.equal(Object.keys(talLoad(dir).records).length, 1, "不写第二条记录");
+    // legacy 未返回 root_message_id → shadow bad_external_id。
+    const w3 = WIRE.wireBind({
+      endpointId: EP, env: process.env, legacy: () => ({}),
+      externalRequestId: "root#z", lineageId: "p@project-files",
+      chatId: "oc_bind", bindingTarget: TGT, now: Date.now(),
+    });
+    assert.equal(w3.shadow[0].ok, false, "legacy 缺 root → shadow 拒");
+    assert.equal(w3.shadow[0].reason, "bad_external_id", "reason 字段");
+    // externalRequestId/lineageId 缺 → 同样 bad_external_id。
+    const w4 = WIRE.wireBind({
+      endpointId: EP, env: process.env, legacy: () => ({ root_message_id: "om_bind1" }),
+      externalRequestId: "", lineageId: "p@project-files",
+      chatId: "oc_bind", bindingTarget: TGT, now: Date.now(),
+    });
+    assert.equal(w4.shadow[0].ok, false, "externalRequestId 空 → shadow 拒");
+  }));
   test("账本：可重复动作往返各执行(request_key) + 同 key 异载荷冲突 + 数组 id 拒 + 精确权限", () => withRoot((root, dir) => {
     seedLedger(dir);
     // 建 B3

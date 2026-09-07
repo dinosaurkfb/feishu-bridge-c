@@ -38,6 +38,7 @@ export const OSM_HANDLE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const OSM_FORWARD_PHASES = Object.freeze(["osm_a_upgrading", "ledger_reopening", "reopening_incomplete"]);
 
 const errText = (err) => String(err?.code ?? err?.message ?? err);
+const afterStep = (ctx, id) => { if (typeof ctx.afterStep === "function") ctx.afterStep(id); };
 const shaHex = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 const factsOf = (ctx, chain) => chainFacts({ chain, home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, node: ctx.node });
 const readlinkOrNull = (p) => { try { return { state: "value", value: fs.readlinkSync(p) }; } catch (err) { return err?.code === "ENOENT" ? { state: "absent", value: null } : { state: "unclear", value: null, why: errText(err) }; } };
@@ -129,16 +130,25 @@ function osmPrecheck(ctx, { token, env }) {
   return { ok: true, frozen };
 }
 
-/** 枚举全部 initDone 的 endpoint（逐 ep 收据聚合的轻量版：目录枚举 + endpointReceipt 判定）。 */
+/** 枚举全部 initDone 的 endpoint（枚举 journal → 取 ledger step 的 endpoint_id → endpointReceipt 判定 initDone）。 */
 function aggregateInitDone(maintDir) {
   let names = [];
   try { names = fs.readdirSync(maintDir).filter((n) => n.endsWith(".json") && /^[0-9a-f-]{36}\.json$/u.test(n)); }
   catch (err) { return err?.code === "ENOENT" ? { ok: true, endpoints: [] } : { ok: false, why: errText(err) }; }
   const endpoints = [];
+  const seenEp = new Set();
   for (const n of names) {
-    const ep = n.slice(0, -5);
+    const tok = n.slice(0, -5);
+    const j = readJournal({ dir: maintDir, token: tok });
+    if (j.state !== "valid") return { ok: false, why: tok.slice(0, 8) + "：" + (j.why ?? j.state) }; // 任一 journal 读不出 → fail-closed，不许对冻结集猜
+    if (j.doc.schema_version !== "1.2" && j.doc.schema_version !== "1.3") continue; // 1.1/1.4 不参与账本收据索引
+    if (j.doc.operation_kind !== "ledger_init" && j.doc.operation_kind !== "ledger_cutover") continue;
+    const ls = j.doc.steps.find((s) => s.kind === "ledger");
+    const ep = typeof ls?.target === "string" ? ls.target : null;
+    if (ep === null || !ENDPOINT_SHAPE.test(ep) || seenEp.has(ep)) continue;
+    seenEp.add(ep);
     const r = endpointReceipt(maintDir, ep);
-    if (r.state === "ok" && r.initDone === true) endpoints.push(ep);
+    if (r.ok && r.initDone === true) endpoints.push(ep);
   }
   return { ok: true, endpoints };
 }
@@ -167,7 +177,13 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
     const L = loadLedger(d.dir, { endpointId: ep });
     const inv = migrationInventory(L.doc);
 
-    // ① pre-forward 矩阵：staged mint plan 盘点（缺席 → 建；恰一份身份/锚全符 → 复用；其它 → fail-closed 不删不改）
+    // ① schema 预算先行（确定性 op id → next 可预算；plan 锚的是 transition 后的账本，不是 1.0——
+    //    mint 在 schema 之后执行，plan.before_ledger_sha256 必 === mint step before 的 ledger_sha256）
+    const opId = ownerSelectSchemaUpgradeOpId(token, ep);
+    const next = applySchemaUpgrade(L.doc, { operation_id: opId, request_key: token + ":schema:" + ep, from_schema: "1.0", to_schema: "1.1-transition" }); // 与执行器 requestKey 同源
+    const schemaAfter = { schema_version: "1.1-transition", revision: L.doc.revision + 1, ledger_sha256: shaHex(serializeLedger(next)) };
+
+    // ② pre-forward 矩阵：staged mint plan 盘点（缺席 → 建；恰一份身份/锚全符 → 复用；其它 → fail-closed 不删不改）
     const planFile = path.join(intendedDir, "mint-" + ep + ".json");
     const probe = readStagedPlanBytes(planFile);
     let plan = null;
@@ -179,10 +195,10 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
       const identityOk = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
         && parsed.plan_kind === "owner_select_mint_plan_v1" && parsed.token === token && parsed.campaign_id === cid
         && parsed.endpoint === ep && parsed.request_key === token;
-      const invNow = migrationInventory(L.doc);
-      const resim = identityOk && mintPlanProblem(parsed) === null ? shaHex(serializeLedger(applyMintPlan(L.doc, parsed))) : null;
+      const invNow = migrationInventory(next);
+      const resim = identityOk && mintPlanProblem(parsed) === null ? shaHex(serializeLedger(applyMintPlan(next, parsed))) : null;
       if (!identityOk || mintPlanProblem(parsed) !== null
-        || parsed.before_ledger_sha256 !== L.sha256
+        || parsed.before_ledger_sha256 !== schemaAfter.ledger_sha256
         || JSON.stringify(parsed.expected_null_b1_ids) !== JSON.stringify(invNow.null_b1_ids)
         || resim !== parsed.expected_ledger_sha256) {
         return { ok: false, reason: "mint_plan_mismatch", why: ep + " 的 staged plan 身份/锚不符（不删不改，等人工）", rollbackSafe: false };
@@ -191,7 +207,7 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
     } else if (probe.why !== "文件不在") {
       return { ok: false, reason: "mint_plan_unreadable", why: ep + "：" + probe.why, rollbackSafe: false };
     } else {
-      plan = buildMintPlan({ doc: L.doc, token, campaignId: cid, endpointId: ep, requestKey: token, now: ctx.now(), ttlMs: OSM_HANDLE_TTL_MS });
+      plan = buildMintPlan({ doc: next, token, campaignId: cid, endpointId: ep, requestKey: token, now: ctx.now(), ttlMs: OSM_HANDLE_TTL_MS });
       if (plan === null || mintPlanProblem(plan) !== null) return { ok: false, reason: "plan_build_failed", why: ep + " 的 mint plan 构造失败或形状不过", rollbackSafe: false };
       const bytes = mintPlanBytes(plan);
       const w = writePlanFileOExcl(planFile, bytes);
@@ -200,12 +216,7 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
     const planBytes = mintPlanBytes(plan);
     const planBlob = { path: planFile, bytes: planBytes.length, sha256: shaHex(planBytes) };
 
-    // ② schema_endpoint intended_after 预算（确定性 op id → 可预算；§8.2"schema_upgrade 确定性"）
-    const opId = ownerSelectSchemaUpgradeOpId(token, ep);
-    const next = applySchemaUpgrade(L.doc, { operation_id: opId, request_key: token, from_schema: "1.0", to_schema: "1.1-transition" });
-    const schemaAfter = { schema_version: "1.1-transition", revision: L.doc.revision + 1, ledger_sha256: shaHex(serializeLedger(next)) };
-
-    // ③ 账本备份进 staged（sha === before.ledger_sha256 的合同由 backup_sha256 承担）
+    // ③ 账本备份进 staged（backup_sha256 === before.ledger_sha256 的合同）
     const backupFile = path.join(stagedDir, "backup-ledger-" + ep + ".json");
     const b = copyBackup(backupFile, L.bytes ?? serializeLedger(L.doc));
     if (!b.ok) return { ok: false, reason: b.reason, why: ep + "：" + (b.why ?? "") };
@@ -299,6 +310,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
     if (!pw.ok) return { ok: false, reason: pw.reason, why: pw.why ?? null, phase };
     doc = pw.doc;
     phase = "osm_a_upgrading";
+    afterStep(ctx, "osm:forward-entered");
   }
 
   if (phase === "osm_a_upgrading") {
@@ -315,9 +327,9 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         const atIntended = cs.exists && cs.sha256 === intended.sha256 && cs.state === intended.state && cs.campaign_id === intended.campaign_id
           && JSON.stringify(cs.endpoints) === JSON.stringify(intended.endpoints) && cs.endpoints_digest === intended.endpoints_digest;
         if (!atIntended) {
-          const rebuild = buildOsmCampaignDoc({ env, frozen: intended.endpoints, cid, token, expectedRevision: intended.revision });
+          const rebuild = buildOsmCampaignDoc({ env, frozen: intended.endpoints, cid, token, expectedRevision: (cs.exists ? cs.revision : 0) + 1 }); // 与进段同式：campaign 联合无 revision，现场投影推导
           if (!rebuild.ok) return { ok: false, reason: "campaign_member_unreadable", why: rebuild.why, phase };
-          if (shaHex(serializeLedger(rebuild.doc)) !== intended.sha256) return { ok: false, reason: "campaign_budget_drift", why: "open 写入前账本/成员已被推进，与进段预算不一致（说不清）", phase };
+          if (shaHex(serializeLedger(rebuild.doc)) !== intended.sha256) return { ok: false, reason: "campaign_budget_drift", why: "预算漂移：进段 " + intended.sha256.slice(0, 12) + " 重算 " + shaHex(serializeLedger(rebuild.doc)).slice(0, 12), phase };
           const w = writeCampaignState({ env, expectedSha256: cs.exists ? cs.sha256 : null, doc: rebuild.doc, capability: { token, stepId: st.id } });
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
           if (w.commit !== "committed") return { ok: false, reason: "commit_residue", phase, commit: w.commit, why: w.why ?? null };
@@ -326,6 +338,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         }
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
+        afterStep(ctx, st.id);
       }
     }
 
@@ -339,12 +352,13 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         if (L.ok && L.sha256 === st.intended_after.ledger_sha256 && L.doc.schema_version === st.intended_after.schema_version) {
           // 现场已 after（崩溃窗口）→ 补 done
         } else {
-          const r = schemaUpgrade({ endpointId: ep, capability: { kind: "schema_upgrade", token }, requestKey: token, fromSchema: "1.0", toSchema: "1.1-transition", env, _inject });
+          const r = schemaUpgrade({ endpointId: ep, capability: { kind: "schema_upgrade", token }, requestKey: token + ":schema:" + ep, fromSchema: "1.0", toSchema: "1.1-transition", env, _inject });
           if (!r.ok) return { ok: false, reason: r.reason, why: r.why ?? null, phase, commit: r.commit ?? "not_committed" };
           if (r.sha256 !== st.intended_after.ledger_sha256) return { ok: false, reason: "written_mismatch", why: ep + " 执行器读回 SHA ≠ 进段预算", phase };
         }
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
+        afterStep(ctx, st.id);
       }
     }
 
@@ -365,6 +379,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         if (r.commit !== "committed_clean" && r.commit !== "already") return { ok: false, reason: "commit_residue", phase, commit: r.commit, why: r.why ?? null };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
+        afterStep(ctx, st.id);
       }
     }
 
@@ -387,6 +402,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         }
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
+        afterStep(ctx, st.id);
       }
     }
 
@@ -457,7 +473,7 @@ export function osmReopening(ctx, token, lease, env = process.env) {
     const opId = ownerSelectSchemaUpgradeOpId(token, ep);
     const op = L.doc.operations[opId] ?? null;
     if (!op) incomplete.push({ id: se.id, why: "账本内不含本 operation 的 schema_upgrade op（" + opId.slice(0, 8) + "）" });
-    else if (op.request_key !== token) incomplete.push({ id: se.id, why: "schema_upgrade 的 request_key ≠ 本维护 token" });
+    else if (op.request_key !== token + ":schema:" + ep) incomplete.push({ id: se.id, why: "schema_upgrade 的 request_key 非本 operation 派生键" });
     else if (op.result_revision < se.intended_after.revision) incomplete.push({ id: se.id, why: "schema_upgrade 的 result_revision（" + op.result_revision + "）早于 journal 意图（" + se.intended_after.revision + "）" });
     else if (L.doc.revision < op.result_revision) incomplete.push({ id: se.id, why: "账本当前 revision 早于本事务" });
     const mi = doc.steps.find((s) => s.kind === "mint" && s.id === "mint:" + ep);

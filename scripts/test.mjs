@@ -229,6 +229,7 @@ import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs"
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
+import { osmEnter as osmEnter52, osmExit as osmExit52, removeMintPlans as removeMintPlans52 } from "./maintenance/owner-select-operation.mjs";
 import { acquireOperationLease, addNote as addNoteJ, addStepPrepared as addStepPreparedJ, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, enterLedgerForward, isLedgerReceipt, journalProblem, readActive, readJournal, releaseOperationLease, setPhase as setPhaseJ, updateJournal, CUTOVER_JOURNAL_SCHEMA, OWNER_SELECT_JOURNAL_SCHEMA, OPERATION_KINDS as JOURNAL_OPERATION_KINDS, STEP_KINDS as JOURNAL_STEP_KINDS, PHASES as JOURNAL_PHASES, FORWARD_ONLY_PHASES as JOURNAL_FORWARD_ONLY_PHASES, SIDECAR_NAMES, legacy12CutoverDisposition, stagedIntendedFile } from "./maintenance/journal.mjs";
 import { stageCutoverPlan, verifyStagedPlan, removeStagedPlan, planProblem as m1bPlanProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
 import { verifyCutoverPlan } from "./m1b/cutover-plan.mjs";
@@ -37523,6 +37524,106 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     // strict 变体：不补（已有值不动——transition 已补过）
     const strict = TAL.applySchemaUpgrade(next1, { operation_id: id1, request_key: tok, from_schema: "1.1-transition", to_schema: "1.1" });
     assert.equal(strict.records[liveId].selection_handle, null, "strict 不改已有值");
+  });
+
+  // ── R52 维护夹具：三安装到假 HOME + 假 launchd/ps + 两 ep 1.0 账本 + initDone 收据 + seed B1（null-B1）。 ──
+  // 返回 { ctx, env, dir, gateFile, root, tokenReceipts, eps, crashAt }；afterStep 同时承担 ⑦ 每提交点 journalProblem 断言。
+  const r52Setup = ({ crashAt = { id: null }, twoEps = true } = {}) => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r52-")));
+    const home = path.join(base, "home"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
+    fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true }); fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+    const ienv = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+    execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env: ienv });
+    execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env: ienv });
+    execFileSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env: ienv });
+    const node = pickClaudeNodeB();
+    const claudeLabel = "com.frank.feishu-bridge-cc.drain", codexLabel = "com.frank.feishu-bridge-codex.drain";
+    const expectedArgs = claudeDrainExpectedJobB({ home, node }).args;
+    const launchd = { [claudeLabel]: { loaded: true, args: [...expectedArgs] } };
+    const fakeLaunchctl = (args) => {
+      if (args[0] === "list") { const st = launchd[args[1]]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; return { ok: true, stdout: "{\n\t\"ProgramArguments\" = (\n" + st.args.map((a) => "\t\t\"" + a + "\";").join("\n") + "\n\t);\n};\n" }; }
+      if (args[0] === "bootout") { const label = args[1].split("/").pop(); const st = launchd[label]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; st.loaded = false; return { ok: true, stdout: "" }; }
+      if (args[0] === "bootstrap") { const xml = fs.readFileSync(args[2], "utf-8"); const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/u.exec(xml)[1]; const arr = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/u.exec(xml)[1]; const args2 = [...arr.matchAll(/<string>([^<]*)<\/string>/gu)].map((m) => m[1]); launchd[label] = { loaded: true, args: args2 }; return { ok: true, stdout: "" }; }
+      return { ok: false, detail: "unknown" };
+    };
+    const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
+    const dir = path.join(base, "maintenance"); const gateFile = path.join(base, "maintenance.gate");
+    const ledgerRoot = path.join(base, "ledger");
+    let clock = Date.parse(T052);
+    const problems = [];
+    const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => {
+      // ⑦ 每个提交点断言 journalProblem === null（不只终态）
+      const act = readActive({ dir });
+      if (act.state === "active") {
+        const jj = readJournal({ dir, token: act.token });
+        if (jj.state === "valid") {
+          const p = journalProblem(jj.doc, { maintenanceDir: dir });
+          if (p !== null) problems.push({ id, why: p });
+        }
+      }
+      if (crashAt.id === id) throw Object.assign(new Error("crash"), { simulatedCrash: true });
+    } });
+    const env = { ...ienv, FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_DIR: dir, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };
+    fs.mkdirSync(ledgerRoot, { recursive: true, mode: 0o700 }); fs.chmodSync(ledgerRoot, 0o700);
+    const eps = twoEps ? [EP52A, EP52B] : [EP52A];
+    for (const ep of eps) {
+      // 1.0 账本 + null-B1（复用 r52Doc10 字节）+ initDone 收据
+      const d = path.join(ledgerRoot, ep);
+      fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+      const doc = r52Doc10(ep, ["ta_" + ep.slice(-6).padStart(32, "0")]);
+      fs.writeFileSync(path.join(d, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+      const v = TAL.validateLedger(doc, { endpointId: ep });
+      assert.equal(v.ok, true, "夹具账本自洽：" + JSON.stringify(v));
+      r52SeedReceipt(dir, ep);
+    }
+    return { ctx, env, dir, gateFile, base, ledgerRoot, eps, crashAt, problems, cleanup: () => fs.rmSync(base, { recursive: true, force: true }) };
+  };
+  // 种一份 done 的 ledger_init 收据（1.2 journal，shape 同 seedLedgerInitReceipt）。
+  const r52SeedReceipt = (maintDir, ep) => {
+    fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+    const tok = r52Uuid(1 + (ep.charCodeAt(ep.length - 1) % 9));
+    const at = T052, sha = r52Sha("b");
+    const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+    const timerDone = (chain) => ({ id: "timer:" + chain, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+    const stubDone = (chain) => ({ id: "stub:" + chain, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const curDone = (chain) => ({ id: "current:" + chain, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const gateDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+    const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+    const ledgerStep = { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState, after: afterState, state: "done", at, chain: "claude" };
+    const doc = { schema_version: "1.2", operation_kind: "ledger_init", token: tok, reason: "r52 收据", started_at: at, updated_at: at, phase: "done", steps: [timerDone("claude"), timerDone("codex"), stubDone("claude"), stubDone("codex"), curDone("claude"), curDone("codex"), gateDone(), ledgerStep], notes: [] };
+    fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+  };
+
+  test("R52 ① 全程：两 ep 1.0 → osmEnter(--apply) → transition+handle+campaign+writer+reopening done + ⑦ 每提交点 journalProblem", () => {
+    const problems = [];
+    const fx = r52Setup({ crashAt: { id: null } });
+    try {
+      // 预览：零改动（默认只预览）
+      const dry = osmEnter52(fx.ctx, { apply: false, env: fx.env });
+      assert.ok(dry.dryRun === true && dry.plan, "预览返回 dryRun 计划：" + JSON.stringify({ ok: dry.ok, reason: dry.reason, why: dry.why, items: dry.items ?? dry.precheck?.items?.filter?.((i) => !i.ok)?.map?.((i) => i.id) }));
+      assert.equal(fs.existsSync(fx.gateFile), false, "预览零改动：无门");
+
+      const r = osmEnter52(fx.ctx, { apply: true, env: fx.env });
+      assert.ok(r.ok, "全程成功：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase, incomplete: r.incomplete, dirList: (() => { try { return fs.readdirSync(fx.dir); } catch (e) { return [String(e)]; } })() }));
+      assert.equal(r.phase, "done");
+      assert.equal(r.activeCleared, true, "active 已清");
+      for (const ep of fx.eps) {
+        const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+        assert.ok(L.ok, "账本可读");
+        assert.equal(L.doc.schema_version, "1.1-transition", ep + " 已 transition");
+        const handles = Object.values(L.doc.records).filter((rec) => rec.kind === "live").map((rec) => rec.selection_handle);
+        assert.ok(handles.every((h) => /^osh_[0-9a-f]{32}$/u.test(h)), ep + " null-B1 已发 handle");
+        const mintOps = Object.values(L.doc.operations).filter((o) => o.op_type === "mint_selection_handles" && o.request_key === r.token);
+        assert.equal(mintOps.length, 1, ep + " 恰一笔本 operation 的 mint op");
+      }
+      const cs = readCampaignState(fx.env);
+      assert.equal(cs.state, "open", "campaign open");
+      assert.equal(cs.campaign_id, campaignIdFor(r.token));
+      const ws = readWriterState(fx.env);
+      assert.equal(ws.state, "partial", "writer partial");
+      assert.equal(fs.existsSync(path.join(fx.dir, r.token + ".staged")), false, "staged 私有树（含 mint plan）已随重开删除");
+      assert.deepEqual(fx.problems, [], "⑦ 每提交点 journalProblem 全 null：" + JSON.stringify(fx.problems));
+    } finally { fx.cleanup(); }
   });
 }
 

@@ -35,7 +35,13 @@ const CHAINS = ["claude", "codex"];
 /** handle TTL 拍定为单一常量（owner-select-route.md §4 P2-2：实现单开工前拍定）：迁移期 selection_handle 30 天。 */
 export const OSM_HANDLE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 /** forward-only 的 osm 段 + 复用 ledger 的重开族（journal.mjs 的 FORWARD_ONLY_PHASES 已含全部）。 */
-const OSM_FORWARD_PHASES = Object.freeze(["osm_a_upgrading", "ledger_reopening", "reopening_incomplete"]);
+const OSM_FORWARD_PHASES = Object.freeze(["osm_a_upgrading", "osm_b_strictening", "osm_direct", "ledger_reopening", "reopening_incomplete"]);
+// R53：kind → operation_kind + forward 段 phase + 描述。
+const OSM_KIND = {
+  a: { operationKind: "owner_select_migration_a", phase: "osm_a_upgrading", label: "A：old→transition + mint + writer partial" },
+  b: { operationKind: "owner_select_migration_b", phase: "osm_b_strictening", label: "B：transition→strict + writer_enable" },
+  direct: { operationKind: "owner_select_migration_direct", phase: "osm_direct", label: "direct：old→strict 直升" },
+};
 
 const errText = (err) => String(err?.code ?? err?.message ?? err);
 const afterStep = (ctx, id) => { if (typeof ctx.afterStep === "function") ctx.afterStep(id); };
@@ -574,12 +580,13 @@ export function osmReopening(ctx, token, lease, env = process.env) {
 
 /** osmEnter：owner_select_migration_a 进门（apply=false 只出 dry-run 计划）。 */
 export function osmEnter(ctx, { kind = "a", waitMs = 60000, apply = false, reason = null, env = process.env } = {}) {
-  if (kind !== "a") return { ok: false, reason: "bad_kind" };
-  const reasonText = reason ?? "owner_select 迁移 A：old→transition + mint + writer partial";
-  if (!apply) return enterMaintenance(ctx, { reason: reasonText, waitMs, apply: false, operationKind: "owner_select_migration_a" });
+  const K = OSM_KIND[kind];
+  if (!K) return { ok: false, reason: "bad_kind", why: "kind 要在 {a,b,direct}" };
+  const reasonText = reason ?? "owner_select 迁移 " + K.label;
+  if (!apply) return enterMaintenance(ctx, { reason: reasonText, waitMs, apply: false, operationKind: K.operationKind });
   const surface = acquireInstallSurfaceLock({ home: ctx.home, env });
   if (!surface.ok) return { ok: false, reason: surface.reason, why: surface.why, path: surface.path };
-  const ent = enterMaintenance(ctx, { reason: reasonText, waitMs, apply: true, keepLease: true, operationKind: "owner_select_migration_a" });
+  const ent = enterMaintenance(ctx, { reason: reasonText, waitMs, apply: true, keepLease: true, operationKind: K.operationKind });
   if (!ent.ok || !ent.lease) {
     const rel = releaseSurface(surface);
     return { ...ent, surfaceRelease: rel.ok ? null : { path: rel.path ?? null, why: rel.why ?? rel.reason } };
@@ -617,7 +624,7 @@ export function osmExit(ctx, { apply = false, env = process.env, surface: held =
     const j = readJournal({ dir, token });
     if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token };
     const phase = j.doc.phase;
-    if (j.doc.operation_kind !== "owner_select_migration_a") return { ok: false, reason: "not_osm_operation", why: "active 是 " + j.doc.operation_kind + "（走 maintenance-gate --exit 通用分派）", token, phase };
+    if (!["owner_select_migration_a", "owner_select_migration_b", "owner_select_migration_direct"].includes(j.doc.operation_kind)) return { ok: false, reason: "not_osm_operation", why: "active 是 " + j.doc.operation_kind + "（走 maintenance-gate --exit 通用分派）", token, phase };
     const action = osmExitAction(phase);
     if (action === null) return { ok: false, reason: "unexpected_phase", why: phase, token, phase };
     return { ok: true, token, phase, action };

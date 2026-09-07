@@ -36728,6 +36728,15 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
   });
 }
 
+// R53 kind 参数化：osmEnter 接受 a/b/direct（坏 kind 拒）；CLI --migrate-b / --migrate-direct 解析。
+test("R53 kind 参数化：osmEnter kind a/b/direct + CLI --migrate-b/--migrate-direct", () => {
+  const bad = osmEnter52(maintenanceContext({ home: "/x", dir: "/y", gateFile: "/z", now: () => 1750000000000 }), { kind: "z", apply: false });
+  assert.equal(bad.reason, "bad_kind", "坏 kind 拒：" + JSON.stringify(bad));
+  assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-b", "--apply"]).mode, "migrate-b");
+  assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-direct"]).mode, "migrate-direct");
+  assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--migrate-b"]).ok, false, "动作互斥");
+});
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

@@ -27,12 +27,12 @@ export function parseMaintenanceOwnerSelectArgs(argv) {
   const once = (flag) => { if (seen.has(flag)) return false; seen.add(flag); return true; };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
-    if (a === "--status" || a === "--migrate-a") { if (mode !== null) return { ok: false, reason: "只能给一个动作" }; mode = a.slice(2); continue; }
+    if (a === "--status" || a === "--migrate-a" || a === "--migrate-b" || a === "--migrate-direct") { if (mode !== null) return { ok: false, reason: "只能给一个动作" }; mode = a.slice(2); continue; }
     if (a === "--wait-ms") { if (!once(a)) return { ok: false, reason: "--wait-ms 重复" }; const raw = argv[i + 1]; const v = Number(raw); if (typeof raw !== "string" || !/^\d+$/u.test(raw) || !Number.isSafeInteger(v) || v > 3600000) return { ok: false, reason: "--wait-ms 要是 0–3600000 的整数" }; waitMs = v; i += 1; continue; }
     if (a === "--apply") { if (!once(a)) return { ok: false, reason: "--apply 重复" }; apply = true; continue; }
     return { ok: false, reason: "不认识的参数：" + a };
   }
-  if (mode === null) return { ok: false, reason: "要给 --status / --migrate-a 之一" };
+  if (mode === null) return { ok: false, reason: "要给 --status / --migrate-a / --migrate-b / --migrate-direct 之一" };
   if (mode === "status" && seen.size > 0) return { ok: false, reason: "--status 不带别的参数" };
   return { ok: true, mode, waitMs, apply };
 }

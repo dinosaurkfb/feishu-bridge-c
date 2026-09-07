@@ -35658,12 +35658,17 @@ test("R51 buildMintPlan/applyMintPlan/mintPlanProblem：1.1-transition 产 plan�
   assert.ok(TAL.mintPlanProblem({ ...bp.plan, endpoint: "endpoint_bad" }) !== null, "坏 endpoint → 拒");
 });
 
-test("R51 schemaUpgrade/mintSelectionHandles：capability kind 不符即拒（maintenance_capability_required）", () => {
+test("R51 schemaUpgrade/mintSelectionHandles：capability kind 不符 / 无 capability 即拒（maintenance_capability_required）", () => {
   const EP = "endpoint_" + "a".repeat(24);
   const r = TAL.schemaUpgrade({ endpointId: EP, capability: { kind: "bogus" }, requestKey: "k", fromSchema: "1.0", toSchema: "1.1-transition" });
   assert.equal(r.reason, "maintenance_capability_required", "schemaUpgrade kind 不符拒：" + JSON.stringify(r));
   const m = TAL.mintSelectionHandles({ endpointId: EP, capability: { kind: "bogus" }, plan: {} });
   assert.equal(m.reason, "maintenance_capability_required", "mintSelectionHandles kind 不符拒：" + JSON.stringify(m));
+  // knife (e)：无 capability（不放行）→ maintenance_capability_required。改坏（去掉 capability 门）→ 该断言转红。
+  const noCap = TAL.schemaUpgrade({ endpointId: EP, requestKey: "k", fromSchema: "1.0", toSchema: "1.1-transition" });
+  assert.equal(noCap.reason, "maintenance_capability_required", "schemaUpgrade 无 capability 拒：" + JSON.stringify(noCap));
+  const noCapM = TAL.mintSelectionHandles({ endpointId: EP, plan: {} });
+  assert.equal(noCapM.reason, "maintenance_capability_required", "mintSelectionHandles 无 capability 拒：" + JSON.stringify(noCapM));
 });
 
 test("R51 mintSelectionHandles：mint plan 正路径（1.4 migration journal + gate + lease）→ committed + 读回 SHA===expected + already/diverged 反向", () => {
@@ -35736,8 +35741,10 @@ test("R51 schemaUpgrade：正路径（1.0→1.1-transition）+ strict 重盘 leg
   const EP = "endpoint_" + "a".repeat(24), CH = "claude";
   const env = { ...process.env, HOME: base, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };
   const hx = (n) => String(n).repeat(64), uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000", iso = (t) => new Date(t).toISOString();
+  const taid = (h) => "ta_" + h.repeat(32);
   const init = uuid(1), tok = uuid(9), at = iso(1700000000000); const CID = campaignIdFor(tok);
-  const doc = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: CH, authority_mode: "shadow", revision: 1, operations: { [init]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } } }, records: {} };
+  const b1 = taid("b"), cb = uuid(2);
+  const doc = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: CH, authority_mode: "shadow", revision: 2, operations: { [init]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } }, [cb]: { op_type: "create_b1", terminal_kind: "create_b1", request_key: "req_cb", fingerprint: hx(2), result_revision: 2, result: { created_id: b1 } } }, records: { [b1]: { topic_agent_id: b1, kind: "live", chat_id: "oc_g", anchor_candidate: null, aliases: { root_om: "om_x", session_id: null }, binding_target: { runtime: "claude", project_root: "/p", claude_session_id: uuid(3) }, facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }, generation_lineage_id: "lin_1", origin_operation_id: cb, binding_proof: null, locator_link_proof_ref: null, created_at: at, updated_at: at } } };
   const curSha = TAL.sha256(Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8"));
   const epDir = path.join(ledgerRoot, EP); fs.mkdirSync(epDir, { recursive: true, mode: 0o700 }); fs.chmodSync(epDir, 0o700);
   fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
@@ -35751,8 +35758,8 @@ test("R51 schemaUpgrade：正路径（1.0→1.1-transition）+ strict 重盘 leg
     { kind: "gate", id: "gate", state: "done", at, target: "gate", chain: null, before: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, backup: null, backup_sha256: null, backup_bytes: null }];
   const stagedDir = path.join(maintDir, tok + ".staged"); fs.mkdirSync(path.join(stagedDir, "intended"), { recursive: true, mode: 0o700 }); const stagedBackup = path.join(stagedDir, "backup.json"); fs.writeFileSync(stagedBackup, "{}", { mode: 0o600 });
   const steps = [...enterSteps, { kind: "campaign", id: "campaign:" + CID + ":open", state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null }, intended_after: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: CID, endpoints: [EP], endpoints_digest: endpointsDigest([EP]) } },
-    { kind: "schema_endpoint", id: "schema_endpoint:" + EP + ":transition", state: "prepared", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: stagedBackup, backup_sha256: curSha, backup_bytes: 100, before: { schema_version: "1.0", revision: 1, ledger_sha256: curSha }, intended_after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: "1".repeat(64) } },
-    { kind: "mint", id: "mint:" + EP, state: "prepared", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: stagedBackup, backup_sha256: "1".repeat(64), backup_bytes: 100, before: { revision: 2, null_b1_count: 0, ledger_sha256: "1".repeat(64) }, intended_after: { revision: 3, null_b1_count: 0, ledger_sha256: "2".repeat(64) }, intended_blob: { path: path.join(stagedDir, "intended", "mint-" + EP + ".json"), bytes: 10, sha256: "0".repeat(64) } },
+    { kind: "schema_endpoint", id: "schema_endpoint:" + EP + ":transition", state: "prepared", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: stagedBackup, backup_sha256: curSha, backup_bytes: 100, before: { schema_version: "1.0", revision: 2, ledger_sha256: curSha }, intended_after: { schema_version: "1.1-transition", revision: 3, ledger_sha256: "1".repeat(64) } },
+    { kind: "mint", id: "mint:" + EP, state: "prepared", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: stagedBackup, backup_sha256: "1".repeat(64), backup_bytes: 100, before: { revision: 3, null_b1_count: 0, ledger_sha256: "1".repeat(64) }, intended_after: { revision: 4, null_b1_count: 0, ledger_sha256: "2".repeat(64) }, intended_blob: { path: path.join(stagedDir, "intended", "mint-" + EP + ".json"), bytes: 10, sha256: "0".repeat(64) } },
     { kind: "writer_state", id: "writer_state:" + CID + ":partial", state: "prepared", at, target: "ledger/owner-select-writer-state.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 }, intended_after: { exists: true, sha256: "2".repeat(64), state: "partial", campaign_id: CID, endpoints_digest: endpointsDigest([EP]), revision: 1 } }];
   const jdoc = { schema_version: "1.4", operation_kind: "owner_select_migration_a", reason: "fixture", started_at: at, updated_at: at, token: tok, notes: [], phase: "osm_a_upgrading", steps };
   assert.equal(journalProblem(jdoc, { maintenanceDir: maintDir }), null, "fixture journal 自洽：" + journalProblem(jdoc, { maintenanceDir: maintDir }));
@@ -35764,10 +35771,13 @@ test("R51 schemaUpgrade：正路径（1.0→1.1-transition）+ strict 重盘 leg
   const cap = { token: tok, kind: "schema_upgrade", endpointId: EP };
   const res = TAL.schemaUpgrade({ endpointId: EP, capability: cap, requestKey: "req_sch", fromSchema: "1.0", toSchema: "1.1-transition", env });
   assert.equal(res.ok, true, "schema 正路径：" + JSON.stringify(res));
-  assert.equal(res.commit, "committed_clean");
-  assert.equal(res.revision, 2);
+  assert.equal(res.commit, "committed_clean", "commit："+JSON.stringify(res));
+  assert.equal(res.revision, 3, "revision："+JSON.stringify(res));
   const up = JSON.parse(fs.readFileSync(path.join(epDir, "ledger.json"), "utf-8"));
   assert.equal(up.schema_version, "1.1-transition", "schema_version 已升");
+  // knife (b)：升版后每个 live 记录四枚 handle 字段为显式 null（Object.hasOwn），且 validateLedger 过（1.1-transition 要求四键在场）。
+  for (const f of ["selection_handle", "handle_expires_at", "rebind_handle", "rebind_expires_at"]) assert.ok(Object.prototype.hasOwnProperty.call(up.records[b1], f) && up.records[b1][f] === null, f + " 应为显式 null");
+  assert.equal(TAL.validateLedger(up, { endpointId: EP }).ok, true, "升版后 validateLedger 必过：" + TAL.validateLedger(up, { endpointId: EP }).why);
   assert.equal(up.operations[Object.keys(up.operations).reduce((a, b) => up.operations[a].result_revision > up.operations[b].result_revision ? a : b)].op_type, "schema_upgrade", "落笔 schema_upgrade op");
   fs.rmSync(base, { recursive: true, force: true });
 });

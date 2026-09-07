@@ -491,6 +491,21 @@ export function journalProblem(doc, { maintenanceDir } = {}) {
     if (doc.steps.some((s) => s.kind === "ledger")) return "旧 1.1 不得含 ledger step";
     if (hasSidecar) return "旧 1.1 不得含 sidecar step";
   }
+  // R50 item 6：owner_select 迁移 kind 的交叉等式（三处同一）+ mint blob path 完整重算 + forward 段前禁新 step kind。
+  if (is14 && NEW_OP_KINDS.includes(doc.operation_kind)) {
+    const steps = doc.steps;
+    const hasNew = steps.some((s) => NEW_STEP_KINDS.includes(s.kind));
+    const preFwd = ["planned", "timer_stopped", "stubbed", "gated", "drained", "rolling_back", "rollback_reopening", "rolled_back", "rollback_incomplete"].includes(doc.phase);
+    if (preFwd && hasNew) return "forward 段之前禁任何新 step kind";
+    // ① campaign_id 三处同一派生：每笔 campaign step 的 intended_after.campaign_id === campaignIdFor(doc.token)。
+    for (const s of steps) if (s.kind === "campaign" && s.intended_after.campaign_id !== campaignIdFor(doc.token)) return "campaign.campaign_id 必须 === campaignIdFor(token)（三处同一派生）";
+    // ② mint intended_blob.path 完整重算（token+maintenanceDir 段级核，复用既有 stagedBlobPathProblem）。
+    for (const s of steps) if (s.kind === "mint") {
+      const p = stagedBlobPathProblem(s.intended_blob.path, doc.token, "mint-" + s.id.slice("mint:".length), maintenanceDir);
+      if (p) return "mint.intended_blob.path：" + p;
+    }
+  }
+
   const required = requiredStepIds(doc);
   if (required) for (const id of required) { const s = doc.steps.find((x) => x.id === id); if (!s || s.state !== "done") return "阶段 " + doc.phase + " 要求 " + id + " 已 done"; }
   // 评审 P1-1：前向 ledger 阶段必须已有 ledger step（进前向态与 ledger step 落盘是 enterLedgerForward 的**一次**原子更新，

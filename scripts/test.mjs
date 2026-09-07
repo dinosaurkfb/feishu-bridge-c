@@ -32856,7 +32856,8 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
     };
     const vNoneLink = TAL.validateLedger(dNoneLink, { endpointId: EP });
     assert.equal(vNoneLink.ok, false, "owner_select B3 link_effect 为 none 必拒");
-    assert.match(String(vNoneLink.why), /带 owner_selected_route_v1 link proof 记录的 link_effect 不得为 none/u);
+    // 2b.（返修三 P1-2 旧措辞收敛）retarget 保留 owner_selected_route_v1 link 写 none → 拒
+    assert.match(String(vNoneLink.why), /有 link proof 记录的 link_effect 不得为 none/u);
 
     // 3. activate demoted_historical_id 非 null 时 affected_live_ids_after_commit 漏 demoted_id → 拒
     const dActAffMiss = structuredClone(dNoneBinding);
@@ -32887,6 +32888,215 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
       }
     };
     assert.equal(TAL.validateLedger(dRebNoOpId, { endpointId: EP }).ok, false, "rebind_session_alias 缺 selection_operation_id 必拒");
+
+    // ── 返修三 P1-2：none⇔proof null 全账本等式 + 逐 op produced/preserved 钉死合法 proof kind ──
+
+    const opIdMigP12 = "00000000-0000-4000-8000-000000000021";
+    const opIdRetP12 = "00000000-0000-4000-8000-000000000022";
+    const opIdAttP12 = "00000000-0000-4000-8000-000000000023";
+    const opIdActP12 = "00000000-0000-4000-8000-000000000024";
+    const opIdAncP12 = "00000000-0000-4000-8000-000000000025";
+
+    // 反例①+正向①：retarget 保留 migrated link —— 写 "none" 拒 / 写 "preserved" 放行
+    const mkRetKeepP12 = (linkEffect) => {
+      const d = mkBaseDoc("1.1");
+      d.revision = 3;
+      d.operations[opIdMigP12] = {
+        op_type: "migrate_seed", terminal_kind: "migrate_seed", request_key: "rk_mig_p12",
+        fingerprint: "1".repeat(64), result_revision: 2,
+        result: { authorized_by: "ou_owner1", authorized_at: ISO, seeded: [{ topic_agent_id: taId1, legacy_source_digest: "e".repeat(64) }] }
+      };
+      d.operations[opIdRetP12] = {
+        op_type: "retarget", terminal_kind: "retarget", request_key: "rk_ret_p12",
+        fingerprint: "2".repeat(64), result_revision: 3,
+        result: {
+          affected_ids: [taId1], affected_live_ids_after_commit: [taId1],
+          new_target: TGT2, old_target: TGT, unit: "record",
+          proof_effects: [{ topic_agent_id: taId1, binding_effect: "produced", link_effect: linkEffect }]
+        }
+      };
+      d.records[taId1] = {
+        kind: "live", topic_agent_id: taId1, chat_id: "oc_chat1", created_at: ISO, updated_at: ISO, origin_operation_id: opIdRetP12,
+        facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+        aliases: { session_id: "sess_1", root_om: "om_root1" }, binding_target: TGT2,
+        binding_proof: { kind: "retarget", authorized_by: "ou_owner1", authorized_at: ISO, new_target: TGT2, old_target: TGT },
+        locator_link_proof_ref: { kind: "migrated", migration_operation_id: opIdMigP12, legacy_source_digest: "e".repeat(64) },
+        generation_lineage_id: "lin_1", anchor_candidate: null, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null
+      };
+      return d;
+    };
+    const vRetNoneP12 = TAL.validateLedger(mkRetKeepP12("none"), { endpointId: EP });
+    assert.equal(vRetNoneP12.ok, false, "retarget 保留 migrated link 却写 link_effect none 必拒（反例①）");
+    assert.match(String(vRetNoneP12.why), /有 link proof 记录的 link_effect 不得为 none/u);
+    assert.equal(TAL.validateLedger(mkRetKeepP12("preserved"), { endpointId: EP }).ok, true, "retarget 保留 migrated link 写 preserved 合法（正向①）");
+
+    // 反例②+正向②：attach_a2 binding:produced —— 挂 retarget proof 拒 / 挂 attach proof 放行
+    const mkAttP12 = (bpKind) => {
+      const d = mkBaseDoc("1.1");
+      d.revision = 2;
+      d.operations[opIdAttP12] = {
+        op_type: "attach_a2", terminal_kind: "attach_a2", request_key: "rk_att_p12",
+        fingerprint: "3".repeat(64), result_revision: 2,
+        result: {
+          affected_id: taId1, affected_live_ids_after_commit: [taId1],
+          handle_expires_at: ISO, selection_handle: hOSH1, terminal_family: "A2",
+          anchor_candidate: "om_cand1",
+          proof_effects: [{ topic_agent_id: taId1, binding_effect: "produced", link_effect: "none" }]
+        }
+      };
+      d.records[taId1] = {
+        kind: "live", topic_agent_id: taId1, chat_id: "oc_chat1", created_at: ISO, updated_at: ISO, origin_operation_id: opIdAttP12,
+        facts: { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" },
+        aliases: { session_id: "00000000-0000-4000-8000-000000000001", root_om: null }, binding_target: bpKind === "attach" ? TGT : TGT2,
+        binding_proof: bpKind === "attach"
+          ? { kind: "attach", authorized_by: "ou_owner1", authorized_at: ISO, claim_key: "c".repeat(64) }
+          : { kind: "retarget", authorized_by: "ou_owner1", authorized_at: ISO, new_target: TGT2, old_target: TGT },
+        locator_link_proof_ref: null, generation_lineage_id: null,
+        anchor_candidate: "om_cand1", selection_handle: hOSH1, handle_expires_at: ISO, rebind_handle: null, rebind_expires_at: null
+      };
+      return d;
+    };
+    const vAttRetP12 = TAL.validateLedger(mkAttP12("retarget"), { endpointId: EP });
+    assert.equal(vAttRetP12.ok, false, "attach_a2 写 binding:produced 而记录挂 retarget proof 必拒（反例②）");
+    assert.match(String(vAttRetP12.why), /attach_a2 binding_effect:produced 的 proof kind 必须是 attach/u);
+    assert.equal(TAL.validateLedger(mkAttP12("attach"), { endpointId: EP }).ok, true, "attach_a2 + attach binding:produced 合法（正向②）");
+
+    // 逐 op 钉死反向：activate produced 伪 migrated proof → 拒（B3 允许 migrated，但 activate 产生必 owner_select_v1）
+    const mkActPinP12 = () => {
+      const d = mkBaseDoc("1.1");
+      d.revision = 3;
+      d.operations[opIdMigP12] = {
+        op_type: "migrate_seed", terminal_kind: "migrate_seed", request_key: "rk_mig_actpin",
+        fingerprint: "7".repeat(64), result_revision: 2,
+        result: { authorized_by: "ou_owner1", authorized_at: ISO, seeded: [{ topic_agent_id: taId1, legacy_source_digest: "9".repeat(64) }] }
+      };
+      d.operations[opIdActP12] = {
+        op_type: "activate", terminal_kind: "activate", request_key: "rk_act_pin",
+        fingerprint: "4".repeat(64), result_revision: 3,
+        result: {
+          surviving_id: taId1, tombstoned_id: taId2, demoted_historical_id: null,
+          authorized_by: "ou_owner1", authorized_at: ISO,
+          selected_session_id: "sess_1", selected_root_om: "om_root1",
+          selection_handle: hOSH1, selection_operation_id: opIdActP12, selection_message_id: "om_msg1", selection_basis: "explicit_handle",
+          affected_live_ids_after_commit: [taId1],
+          proof_effects: [{ topic_agent_id: taId1, binding_effect: "produced", link_effect: "produced" }]
+        }
+      };
+      d.records[taId1] = {
+        kind: "live", topic_agent_id: taId1, chat_id: "oc_chat1", created_at: ISO, updated_at: ISO, origin_operation_id: opIdActP12,
+        facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+        aliases: { session_id: "sess_1", root_om: "om_root1" }, binding_target: TGT,
+        binding_proof: { kind: "migrated", authorized_by: "ou_owner1", authorized_at: ISO, migration_operation_id: opIdMigP12, legacy_source_digest: "9".repeat(64) },
+        locator_link_proof_ref: { kind: "owner_selected_route_v1", by_identity: "owner_authorization", authorized_by: "ou_owner1", authorized_at: ISO, selected_session_id: "sess_1", selected_root_om: "om_root1", selection_handle: hOSH1, selection_operation_id: opIdActP12 },
+        generation_lineage_id: "lin_1", anchor_candidate: null, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null
+      };
+      d.records[taId2] = {
+        kind: "forwarding_tombstone", topic_agent_id: taId2, forwards_to: taId1, merged_at: ISO, origin_operation_id: opIdActP12,
+        proof_ref: { kind: "owner_select_merge_v1", selected_root_om: "om_root1", selection_handle: hOSH1, selection_operation_id: opIdActP12 }
+      };
+      return d;
+    };
+    const vActPinP12 = TAL.validateLedger(mkActPinP12(), { endpointId: EP });
+    assert.equal(vActPinP12.ok, false, "activate binding:produced 而 proof kind=migrated 必拒");
+    assert.match(String(vActPinP12.why), /activate binding_effect:produced 的 proof kind 必须是 owner_select_v1/u);
+
+    // 逐 op 钉死反向：attach_a3 produced 伪 retarget proof → 拒（A3 允许 retarget，但 attach_a3 产生必 attach）
+    const mkA3PinP12 = () => {
+      const d = mkBaseDoc("1.1");
+      d.revision = 3;
+      d.operations[opIdMigP12] = {
+        op_type: "migrate_seed", terminal_kind: "migrate_seed", request_key: "rk_mig_a3pin",
+        fingerprint: "8".repeat(64), result_revision: 2,
+        result: { authorized_by: "ou_owner1", authorized_at: ISO, seeded: [{ topic_agent_id: taId1, legacy_source_digest: "a".repeat(64) }] }
+      };
+      d.operations[opIdAttP12] = {
+        op_type: "attach_a3", terminal_kind: "attach_a3", request_key: "rk_a3_pin",
+        fingerprint: "9".repeat(64), result_revision: 3,
+        result: {
+          affected_id: taId1, affected_live_ids_after_commit: [taId1], terminal_family: "A3",
+          proof_effects: [{ topic_agent_id: taId1, binding_effect: "produced", link_effect: "preserved" }]
+        }
+      };
+      d.records[taId1] = {
+        kind: "live", topic_agent_id: taId1, chat_id: "oc_chat1", created_at: ISO, updated_at: ISO, origin_operation_id: opIdAttP12,
+        facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "n/a" },
+        aliases: { session_id: "sess_1", root_om: "om_root1" }, binding_target: TGT,
+        binding_proof: { kind: "retarget", authorized_by: "ou_owner1", authorized_at: ISO, new_target: TGT, old_target: TGT2 },
+        locator_link_proof_ref: { kind: "migrated", migration_operation_id: opIdMigP12, legacy_source_digest: "a".repeat(64) },
+        generation_lineage_id: null, anchor_candidate: null, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null
+      };
+      return d;
+    };
+    const vA3PinP12 = TAL.validateLedger(mkA3PinP12(), { endpointId: EP });
+    assert.equal(vA3PinP12.ok, false, "attach_a3 binding:produced 而 proof kind=retarget 必拒");
+    assert.match(String(vA3PinP12.why), /attach_a3 binding_effect:produced 的 proof kind 必须是 attach/u);
+
+    // anchor 正向基座（1.1 strict，与 P1-3 复用）：preserved attach binding + produced owner_selected_route_v1 link
+    const mkAncP12 = () => {
+      const d = mkBaseDoc("1.1");
+      d.revision = 2;
+      d.operations[opIdAncP12] = {
+        op_type: "anchor", terminal_kind: "anchor", request_key: "rk_anc_p12",
+        fingerprint: "6".repeat(64), result_revision: 2,
+        result: {
+          affected_id: taId1, affected_live_ids_after_commit: [taId1],
+          authorized_at: ISO, authorized_by: "ou_owner1",
+          selected_root_om: "om_cand1", selected_session_id: "sess_1",
+          selection_basis: "explicit_handle", selection_handle: hOSH1,
+          selection_message_id: "om_msg1", selection_operation_id: opIdAncP12,
+          proof_effects: [{ topic_agent_id: taId1, binding_effect: "preserved", link_effect: "produced" }]
+        }
+      };
+      d.records[taId1] = {
+        kind: "live", topic_agent_id: taId1, chat_id: "oc_chat1", created_at: ISO, updated_at: ISO, origin_operation_id: opIdAncP12,
+        facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "n/a" },
+        aliases: { session_id: "sess_1", root_om: "om_cand1" }, binding_target: TGT,
+        binding_proof: { kind: "attach", authorized_by: "ou_owner1", authorized_at: ISO, claim_key: "c".repeat(64) },
+        locator_link_proof_ref: { kind: "owner_selected_route_v1", by_identity: "owner_authorization", authorized_by: "ou_owner1", authorized_at: ISO, selected_session_id: "sess_1", selected_root_om: "om_cand1", selection_handle: hOSH1, selection_operation_id: opIdAncP12 },
+        generation_lineage_id: null, anchor_candidate: "om_cand1", selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null
+      };
+      return d;
+    };
+    assert.equal(TAL.validateLedger(mkAncP12(), { endpointId: EP }).ok, true, "anchor preserved attach + produced owner_selected_route_v1 合法");
+
+    // 逐 op 钉死反向：rebind produced 伪 migrated proof → 拒（preserved⇒any，produced⇒owner_select_v1）
+    const opIdMigRb = "00000000-0000-4000-8000-000000000026";
+    const opIdRebRb = "00000000-0000-4000-8000-000000000027";
+    const mkRebP12 = (bindingEffect) => {
+      const d = mkBaseDoc("1.1");
+      d.revision = 3;
+      d.operations[opIdMigRb] = {
+        op_type: "migrate_seed", terminal_kind: "migrate_seed", request_key: "rk_mig_rebpin",
+        fingerprint: "b".repeat(64), result_revision: 2,
+        result: { authorized_by: "ou_owner1", authorized_at: ISO, seeded: [{ topic_agent_id: taId1, legacy_source_digest: "d".repeat(64) }] }
+      };
+      d.operations[opIdRebRb] = {
+        op_type: "rebind_session_alias", terminal_kind: "rebind_session_alias", request_key: "rk_reb_pin",
+        fingerprint: "c".repeat(64), result_revision: 3,
+        result: {
+          affected_id: taId1, affected_live_ids_after_commit: [taId1],
+          authorized_at: ISO, authorized_by: "ou_owner1",
+          old_session_id: "00000000-0000-4000-8000-000000000001", new_session_id: "00000000-0000-4000-8000-000000000002",
+          selected_root_om: "om_root1", selected_session_id: "00000000-0000-4000-8000-000000000002",
+          selection_basis: "rebind", selection_handle: hORH1, selection_operation_id: opIdRebRb,
+          selection_message_id: "om_msg1", tombstoned_a1_id: null,
+          proof_effects: [{ topic_agent_id: taId1, binding_effect: bindingEffect, link_effect: "produced" }]
+        }
+      };
+      d.records[taId1] = {
+        kind: "live", topic_agent_id: taId1, chat_id: "oc_chat1", created_at: ISO, updated_at: ISO, origin_operation_id: opIdRebRb,
+        facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+        aliases: { session_id: "00000000-0000-4000-8000-000000000002", root_om: "om_root1" }, binding_target: TGT,
+        binding_proof: { kind: "migrated", authorized_by: "ou_owner1", authorized_at: ISO, migration_operation_id: opIdMigRb, legacy_source_digest: "d".repeat(64) },
+        locator_link_proof_ref: { kind: "owner_selected_route_v1", by_identity: "owner_authorization", authorized_by: "ou_owner1", authorized_at: ISO, selected_session_id: "00000000-0000-4000-8000-000000000002", selected_root_om: "om_root1", selection_handle: hORH1, selection_operation_id: opIdRebRb },
+        generation_lineage_id: "lin_1", anchor_candidate: null, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null
+      };
+      return d;
+    };
+    assert.equal(TAL.validateLedger(mkRebP12("preserved"), { endpointId: EP }).ok, true, "rebind preserved migrated binding 合法（preserved⇒any）");
+    const vRebPinP12 = TAL.validateLedger(mkRebP12("produced"), { endpointId: EP });
+    assert.equal(vRebPinP12.ok, false, "rebind binding:produced 而 proof kind=migrated 必拒");
+    assert.match(String(vRebPinP12.why), /rebind_session_alias binding_effect:produced 的 proof kind 必须是 owner_select_v1/u);
 
     // ── P1-3 返修：A2 记录/result/mint 候选一致性闭环（四处补齐与漂移红测试）──
 

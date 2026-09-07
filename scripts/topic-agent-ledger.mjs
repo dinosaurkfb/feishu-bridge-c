@@ -82,6 +82,16 @@ const NEW_OP_TYPES = Object.freeze([
 const VALID_UPGRADE_EDGES = Object.freeze(["1.0->1.1-transition", "1.1-transition->1.1", "1.0->1.1"]);
 // migrate_repair 的 from_family / to_family 值域（§5.1 判别联合：B1→B1；{B3,B3',B4}→{B3,B3',B4}）
 const MIGRATE_FAMILIES = ["B1", "B3", "B3'", "B4"];
+// 返修三 P1-2：逐 op 钉死 produced/preserved 的合法 proof kind（未列的 effect 维度不约束；preserved-binding 未列即不约束）。
+//   unbind/restore/clear_anchor_handle/reaffirm 不钉：reaffirm 有专属逐字校验，其余是“保留型”op，proof kind 随上游。
+const OP_EFFECT_PROOF_KINDS = Object.freeze({
+  activate: { produced_binding: ["owner_select_v1"] },
+  attach_a2: { produced_binding: ["attach"] },
+  attach_a3: { produced_binding: ["attach"] },
+  anchor: { preserved_binding: ["attach", "retarget"], produced_link: ["owner_selected_route_v1"] },
+  rebind_session_alias: { produced_binding: ["owner_select_v1"] },
+  retarget: { produced_binding: ["retarget"] }
+});
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const keysOf = (o) => Object.keys(o).sort().join(",");
@@ -1157,21 +1167,36 @@ export function validateLedger(doc, { endpointId } = {}) {
     const pe = origOp.result.proof_effects.find((p) => p.topic_agent_id === id);
     if (!pe) continue;
 
-    // none 不得绕过来源核验 (P1-2)
+    // none⇔proof null 全账本等式（返修三 P1-2：对任何 proof kind 成立，不再限 owner_select 系）
     if (bp === null && lp === null) {
       return bad(id + "：affected 中无 proof 的记录不得在 proof_effects 中列出");
     }
-    if (bp?.kind === "owner_select_v1" && pe.binding_effect === "none") {
-      return bad(id + "：带 owner_select_v1 binding proof 记录的 binding_effect 不得为 none（G13′）");
+    if (bp !== null && pe.binding_effect === "none") {
+      return bad(id + "：有 binding proof 记录的 binding_effect 不得为 none（G13′）");
     }
-    if (lp?.kind === "owner_selected_route_v1" && pe.link_effect === "none") {
-      return bad(id + "：带 owner_selected_route_v1 link proof 记录的 link_effect 不得为 none（G13′）");
+    if (lp !== null && pe.link_effect === "none") {
+      return bad(id + "：有 link proof 记录的 link_effect 不得为 none（G13′）");
     }
     if (bp === null && pe.binding_effect !== "none") {
       return bad(id + "：无 binding proof 记录的 binding_effect 必须为 none（G13′）");
     }
     if (lp === null && pe.link_effect !== "none") {
       return bad(id + "：无 link proof 记录的 link_effect 必须为 none（G13′）");
+    }
+
+    // 逐 op 钉死 produced/preserved 的合法 proof kind（返修三 P1-2）：retarget 保留 migrated link 却写 none、
+    //   attach_a2 产生 retarget binding 这类漂移在此拦下，而非只靠 RESULT_SHAPE 的 effect 枚举。
+    const pin = OP_EFFECT_PROOF_KINDS[origOp.op_type];
+    if (pin) {
+      if (pe.binding_effect === "produced" && pin.produced_binding && !pin.produced_binding.includes(bp?.kind)) {
+        return bad(id + "：" + origOp.op_type + " binding_effect:produced 的 proof kind 必须是 " + pin.produced_binding.join("/") + "（G13′）");
+      }
+      if (pe.link_effect === "produced" && pin.produced_link && !pin.produced_link.includes(lp?.kind)) {
+        return bad(id + "：" + origOp.op_type + " link_effect:produced 的 proof kind 必须是 " + pin.produced_link.join("/") + "（G13′）");
+      }
+      if (pe.binding_effect === "preserved" && pin.preserved_binding && !pin.preserved_binding.includes(bp?.kind)) {
+        return bad(id + "：" + origOp.op_type + " binding_effect:preserved 的 proof kind 必须是 " + pin.preserved_binding.join("/") + "（G13′）");
+      }
     }
 
     // link_effect

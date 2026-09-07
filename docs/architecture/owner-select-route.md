@@ -210,7 +210,8 @@ compare = **`current_null_b1_ids === expected_null_b1_ids`（集合相等，十�
 **mint plan（十四轮 P1：提交前随机计划必须有可恢复来源——沿用已验证的 T4 staged-plan 工艺）**：
 handle 仍 128-bit CSPRNG，但**只在进 forward-only 段之前生成一次并固化进不可变 plan**：
 `<token>.staged/intended/mint-<ep>.json`，O_EXCL/0600 写满 → fsync → **fsync `intended/` 目录**；plan
-封闭内容 = `{ plan_kind:"owner_select_mint_plan_v1", token, campaign_id, endpoint, request_key,
+封闭内容 = `{ plan_kind:"owner_select_mint_plan_v1", token, campaign_id, endpoint, request_key, **operation_id**（R51 补：mint op 的
+key 冻结进 plan，否则 expected_ledger_sha256 无法确定性重放）,
 frozen_at, handle_expires_at, **before_ledger_sha256**, expected_null_b1_ids:[有序], minted:[按 target_id
 排序的 { target_id, selection_handle }], expected_ledger_sha256 }`（`minted[*].target_id` 集 ===
 `expected_null_b1_ids`；**`before_ledger_sha256` 必 === mint step 的 `before.ledger_sha256`**（十五轮 P1：

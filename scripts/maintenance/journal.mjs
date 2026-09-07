@@ -541,6 +541,22 @@ export function journalProblem(doc, { maintenanceDir } = {}) {
     if (kind === "owner_select_migration_direct" && writerSub("partial") > 0) return "direct 禁 writer_state:*:partial";
   }
 
+  // R50 item 4：禁异类 step（逐 kind 封闭）。
+  if (is14 && NEW_OP_KINDS.includes(doc.operation_kind)) {
+    const steps = doc.steps;
+    const FORBID_COMMON = (s) => s.kind === "ledger" || s.kind === "sidecar" || s.kind === "artifact" || s.kind === "receipt" || s.kind === "staged_plan" || (s.kind === "current" && s.id.endsWith(":install"));
+    if (steps.some(FORBID_COMMON)) return "new kind 禁 ledger/sidecar/artifact/receipt/staged_plan/current:*:install";
+    if (doc.operation_kind === "owner_select_migration_a") {
+      if (steps.some((s) => s.kind === "precheck" || (s.kind === "schema_endpoint" && /:(strict|direct)$/u.test(s.id)) || (s.kind === "writer_state" && s.id.endsWith(":on")))) return "A 禁 precheck / schema_endpoint:*:strict|direct / writer_state:*:on";
+    } else if (doc.operation_kind === "owner_select_migration_b") {
+      if (steps.some((s) => s.kind === "mint" || (s.kind === "campaign" && s.id.endsWith(":open")) || (s.kind === "schema_endpoint" && /:(transition|direct)$/u.test(s.id)) || (s.kind === "writer_state" && s.id.endsWith(":partial")))) return "B 禁 mint / campaign:*:open / schema_endpoint:*:transition|direct / writer_state:*:partial";
+    } else {
+      if (steps.some((s) => s.kind === "mint" || (s.kind === "schema_endpoint" && /:(transition|strict)$/u.test(s.id)) || (s.kind === "writer_state" && s.id.endsWith(":partial")))) return "direct 禁 mint / schema_endpoint:*:transition|strict / writer_state:*:partial";
+    }
+  }
+  // 旧四 kind（含 is14 读旧种）禁五新 step kind；is12/is13 已在 item 2 由新 step kind 判 unreadable，这里补 1.4 读旧种。
+  if ((is14 || is12 || is13) && !NEW_OP_KINDS.includes(doc.operation_kind) && doc.steps.some((s) => NEW_STEP_KINDS.includes(s.kind))) return "旧 four kind 禁五新 step kind";
+
   const required = requiredStepIds(doc);
   if (required) for (const id of required) { const s = doc.steps.find((x) => x.id === id); if (!s || s.state !== "done") return "阶段 " + doc.phase + " 要求 " + id + " 已 done"; }
   // 评审 P1-1：前向 ledger 阶段必须已有 ledger step（进前向态与 ledger step 落盘是 enterLedgerForward 的**一次**原子更新，

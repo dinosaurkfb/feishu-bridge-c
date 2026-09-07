@@ -25214,6 +25214,20 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
     assert.ok(TAL.loadLedger(dir, { endpointId: EP }).ok, "seed 出的初始账本自洽");
   };
+  // R50（Part 一 item 4）：禁异类 step —— 旧四 kind（含 1.4 读旧种）禁五新 step kind。
+  test("R50 journal 1.4：禁异类 step（旧 kind 读新 step / new kind 禁异类步）", () => {
+    const iso = new Date(1700000000000).toISOString();
+    const uuid = "11111111-1111-1111-1111-111111111111";
+    const ep = "endpoint_" + "a".repeat(24);
+    const cid = OSS.campaignIdFor(uuid), dg = OSS.endpointsDigest([ep]);
+    const sha = (n) => String(n).repeat(64);
+    const base = { token: uuid, reason: "", started_at: iso, updated_at: iso, notes: [], schema_version: "1.4", operation_kind: "owner_select_migration_a", phase: "osm_a_upgrading" };
+    const camp = { kind: "campaign", id: "campaign:" + cid + ":open", target: "ledger/owner-select-campaign.json", chain: null, state: "done", at: iso, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null }, intended_after: { exists: true, sha256: sha(2), state: "open", campaign_id: cid, endpoints: [ep], endpoints_digest: dg }, after: { exists: true, sha256: sha(2), state: "open", campaign_id: cid, endpoints: [ep], endpoints_digest: dg } };
+    // 1.4 读旧 kind（ledger_cutover）带 campaign step → 拒
+    const r = String(journalProblem({ ...base, operation_kind: "ledger_cutover", phase: "done", steps: [camp] }));
+    assert.ok(r.includes("旧 four kind 禁五新 step kind"), "旧 kind 读新 step 拒：" + r);
+  });
+
   // R50（Part 一 item 6 剩余）：恰一次计数按 phase / <ep>∈冻结集 —— 纯合成。
   test("R50 journal 1.4：恰一次计数（A 缺 writer_state:partial 拒；重开族未全 done 拒）", () => {
     const iso = new Date(1700000000000).toISOString();

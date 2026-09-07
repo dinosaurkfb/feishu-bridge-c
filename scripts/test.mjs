@@ -37763,6 +37763,44 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     }
   });
 
+  test("R52 ③-d 重演算核 / ④-c 账本非 1.0 前置（变异配套场景）", () => {
+    // ③-d 重演算 SHA 核：其余全符、仅 expected_ledger_sha256 被换 → fail-closed
+    {
+      const fx = r52Setup({});
+      try {
+        const tok = r52Uuid(2);
+        const ep = fx.eps[0];
+        const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+        const preset = r52WritePlan(fx, tok, ep, L.doc, (p) => { p.expected_ledger_sha256 = r52Sha("a"); });
+        const dfx = r52DrainedFixture({ fx, tok });
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        process.stderr.write("R52D " + JSON.stringify({ ok: r.ok, reason: r.reason, phase: r.phase }) + "\n");
+        assert.ok(r.ok === false, "重演算不符拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "mint_plan_mismatch", "重演算不符拒");
+      } finally { fx.cleanup(); }
+    }
+    // ④-c 冻结集里某 ep 账本非 1.0 → 前置 schema_not_old → 回退清场
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        const ep = fx.eps[0];
+        const p = path.join(fx.ledgerRoot, ep, "ledger.json");
+        const d = JSON.parse(fs.readFileSync(p, "utf-8"));
+        d.schema_version = "1.1-transition";
+        d.revision = 3;
+        d.operations["00000000-0000-4000-8000-000000000009"] = { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "orphan_upgrade", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "orphan_upgrade", endpoint: ep, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 3, result: { endpoint: ep, from_schema: "1.0", to_schema: "1.1-transition" } };
+        for (const rec of Object.values(d.records)) if (rec.kind === "live") { rec.selection_handle = null; rec.handle_expires_at = null; rec.rebind_handle = null; rec.rebind_expires_at = null; }
+        fs.writeFileSync(p, JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
+        const r = osmEnter52(fx.ctx, { apply: true, env: fx.env });
+        process.stderr.write("R52D " + JSON.stringify({ ok: r.ok, reason: r.reason, rollback: r.rollback }) + "\n");
+        assert.equal(r.ok, false, "账本非 1.0 拒");
+        assert.equal(r.reason, "schema_not_old", "schema_not_old 拒：" + r.reason);
+        assert.ok(r.rollback && r.rollback.ok === true, "回退清场");
+        assert.equal(readActive({ dir: fx.dir }).state, "absent", "active 已清");
+      } finally { fx.cleanup(); }
+    }
+  });
+
   test("R52 ④⑤ 前置失败留 drained 且可回退；回退删不掉 plan → rollback_incomplete，恢复后可续跑", () => {
     // ④-a 冻结集为空（零收据）→ rollbackSafe → 标准回退清场（rolled_back、门撤、active 清）
     {

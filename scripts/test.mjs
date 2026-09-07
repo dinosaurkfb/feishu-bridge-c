@@ -227,7 +227,7 @@ import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs"
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
-import { acquireOperationLease, addNote as addNoteJ, addStepPrepared as addStepPreparedJ, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, enterLedgerForward, isLedgerReceipt, journalProblem, readActive, readJournal, releaseOperationLease, setPhase as setPhaseJ, updateJournal, CUTOVER_JOURNAL_SCHEMA, SIDECAR_NAMES, legacy12CutoverDisposition, stagedIntendedFile } from "./maintenance/journal.mjs";
+import { acquireOperationLease, addNote as addNoteJ, addStepPrepared as addStepPreparedJ, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, enterLedgerForward, isLedgerReceipt, journalProblem, readActive, readJournal, releaseOperationLease, setPhase as setPhaseJ, updateJournal, CUTOVER_JOURNAL_SCHEMA, OWNER_SELECT_JOURNAL_SCHEMA, OPERATION_KINDS as JOURNAL_OPERATION_KINDS, STEP_KINDS as JOURNAL_STEP_KINDS, PHASES as JOURNAL_PHASES, FORWARD_ONLY_PHASES as JOURNAL_FORWARD_ONLY_PHASES, SIDECAR_NAMES, legacy12CutoverDisposition, stagedIntendedFile } from "./maintenance/journal.mjs";
 import { stageCutoverPlan, verifyStagedPlan, removeStagedPlan, planProblem as m1bPlanProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
 import { verifyCutoverPlan } from "./m1b/cutover-plan.mjs";
 import { writeSidecarPrepared } from "./maintenance/sidecar-writer.mjs";
@@ -34074,6 +34074,82 @@ test("R50 §二 owner-select-state：campaign 与 writer-state 文件合同与�
   const cReadSymlink = readCampaignState(env);
   assert.equal(cReadSymlink.state, "unreadable", "符号链接读作 unreadable");
   fs.unlinkSync(cPath);
+});
+
+test("R50 §一.1与§一.2 journal 1.4：常量、schema 分派与旧新封闭", () => {
+  // 1. 常量检验
+  assert.equal(OWNER_SELECT_JOURNAL_SCHEMA, "1.4", "schema 必须是 1.4");
+  for (const k of ["owner_select_migration_a", "owner_select_migration_b", "owner_select_migration_direct"]) {
+    assert.ok(JOURNAL_OPERATION_KINDS.includes(k), "OPERATION_KINDS 必须含 " + k);
+  }
+  for (const sk of ["campaign", "schema_endpoint", "mint", "precheck", "writer_state"]) {
+    assert.ok(JOURNAL_STEP_KINDS.includes(sk), "STEP_KINDS 必须含 " + sk);
+  }
+  for (const p of ["osm_a_upgrading", "osm_b_strictening", "osm_direct"]) {
+    assert.ok(JOURNAL_PHASES.includes(p), "PHASES 必须含 " + p);
+    assert.ok(JOURNAL_FORWARD_ONLY_PHASES.includes(p), "FORWARD_ONLY_PHASES 必须含 " + p);
+  }
+
+  const tok = "00000000-0000-4000-8000-000000000001";
+  const now = "2026-09-07T10:00:00.000Z";
+  const baseDoc = {
+    schema_version: OWNER_SELECT_JOURNAL_SCHEMA,
+    token: tok,
+    reason: "R50 test",
+    started_at: now,
+    updated_at: now,
+    phase: "planned",
+    notes: [],
+    steps: []
+  };
+
+  // 2. schema 按字面值分派
+  assert.equal(journalProblem({ ...baseDoc, schema_version: "1.5", operation_kind: "owner_select_migration_a" }), "schema_version 不认识");
+  assert.equal(journalProblem({ ...baseDoc, schema_version: "1.3.1", operation_kind: "owner_select_migration_a" }), "schema_version 不认识");
+
+  // 1.4 遇到坏 operation_kind
+  assert.match(journalProblem({ ...baseDoc, operation_kind: "unknown_kind" }), /operation_kind 不在封闭集合里/u);
+
+  // 3. 1.2 / 1.3 含新 operation_kind 或新 step_kind 必须报错 (读作 unreadable)
+  const dummyNewStep = {
+    kind: "campaign",
+    id: "campaign:osc_0123456789abcdef0123456789abcdef:open",
+    state: "prepared",
+    at: now,
+    target: "ledger/owner-select-campaign.json",
+    chain: null,
+    backup: null,
+    backup_sha256: null,
+    backup_bytes: null,
+    before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null },
+    intended_after: {
+      exists: true,
+      sha256: "0".repeat(64),
+      state: "open",
+      campaign_id: "osc_0123456789abcdef0123456789abcdef",
+      endpoints: ["endpoint_111111111111111111111111"],
+      endpoints_digest: endpointsDigest(["endpoint_111111111111111111111111"])
+    }
+  };
+
+  // 1.2 含新 kind
+  assert.ok(journalProblem({ ...baseDoc, schema_version: "1.2", operation_kind: "owner_select_migration_a" }) !== null, "1.2 含新 kind 拒");
+  // 1.2 含新 step
+  assert.ok(journalProblem({ ...baseDoc, schema_version: "1.2", operation_kind: "maintenance_gate", steps: [dummyNewStep] }) !== null, "1.2 含新 step 拒");
+  // 1.3 含新 kind
+  assert.ok(journalProblem({ ...baseDoc, schema_version: "1.3", operation_kind: "owner_select_migration_a" }) !== null, "1.3 含新 kind 拒");
+  // 1.3 含新 step
+  assert.ok(journalProblem({ ...baseDoc, schema_version: "1.3", operation_kind: "ledger_cutover", phase: "planned", steps: [dummyNewStep] }) !== null, "1.3 含新 step 拒");
+
+  // 4. 1.4 文档使用旧四种 operation_kind 时，行为与 1.3 完全相同
+  // 1.4 + maintenance_gate 在 planned 时无 steps 合法
+  assert.equal(journalProblem({ ...baseDoc, operation_kind: "maintenance_gate" }), null, "1.4 读旧 maintenance_gate 合法");
+  // 1.4 + maintenance_gate 禁新 step kind
+  assert.ok(journalProblem({ ...baseDoc, operation_kind: "maintenance_gate", steps: [dummyNewStep] }) !== null, "1.4 旧种禁新 step kind");
+  // 1.4 + 允许三个新 kind 处于 planned
+  for (const k of ["owner_select_migration_a", "owner_select_migration_b", "owner_select_migration_direct"]) {
+    assert.equal(journalProblem({ ...baseDoc, operation_kind: k }), null, "1.4 支持新 kind " + k + " 处于 planned 阶段");
+  }
 });
 
 summarySealed = true;

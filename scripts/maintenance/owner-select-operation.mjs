@@ -186,6 +186,7 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
     // ② pre-forward 矩阵：staged mint plan 盘点（缺席 → 建；恰一份身份/锚全符 → 复用；其它 → fail-closed 不删不改）
     const planFile = path.join(intendedDir, "mint-" + ep + ".json");
     const probe = readStagedPlanBytes(planFile);
+    if (process.env.R52_DEBUG) { let listing = ""; try { listing = fs.readdirSync(intendedDir).join(","); } catch (e) { listing = String(e); } process.stderr.write("R52DEBUG probe ep=" + ep + " ok=" + probe.ok + " why=" + (probe.why ?? "-") + " file=" + planFile + " listing=[" + listing + "]\n"); }
     let plan = null;
     if (probe.ok) {
       // 文件在场：按 §8 矩阵逐项核身份与重演算；文件本身的 0600/单硬链接/普通文件已由 readStagedPlanBytes 核过。
@@ -201,6 +202,7 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
         || parsed.before_ledger_sha256 !== schemaAfter.ledger_sha256
         || JSON.stringify(parsed.expected_null_b1_ids) !== JSON.stringify(invNow.null_b1_ids)
         || resim !== parsed.expected_ledger_sha256) {
+        if (process.env.R52_DEBUG) process.stderr.write("R52DEBUG mismatch ep=" + ep + " identity=" + identityOk + " shape=" + (mintPlanProblem(parsed) !== null) + " beforeCmp=" + (parsed.before_ledger_sha256 === schemaAfter.ledger_sha256) + " setCmp=" + (JSON.stringify(parsed.expected_null_b1_ids) === JSON.stringify(invNow.null_b1_ids)) + " resimCmp=" + (resim === parsed.expected_ledger_sha256) + "\n");
         return { ok: false, reason: "mint_plan_mismatch", why: ep + " 的 staged plan 身份/锚不符（不删不改，等人工）", rollbackSafe: false };
       }
       plan = parsed;

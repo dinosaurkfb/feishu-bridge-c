@@ -36148,6 +36148,27 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
   }));
 }
 
+// R52 §一：schema_upgrade op key 确定性化 + applySchemaUpgrade 纯函数（同输入→同 SHA；产物 validateLedger 过）。
+test("R52 §一 schemaUpgrade op key 确定性 + applySchemaUpgrade：同输入两次同 SHA，产物合法", () => {
+  const hx = (n) => String(n).repeat(64), taid = (h) => "ta_" + h.repeat(32), uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000", iso = (t) => new Date(t).toISOString();
+  const EP = "endpoint_" + "a".repeat(24), tok = uuid(9);
+  const b1 = taid("b"), cb = uuid(2), at = iso(1700000000000);
+  const doc = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: "claude", authority_mode: "shadow", revision: 2, operations: { [uuid(1)]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } }, [cb]: { op_type: "create_b1", terminal_kind: "create_b1", request_key: "req_cb", fingerprint: hx(2), result_revision: 2, result: { created_id: b1 } } }, records: { [b1]: { topic_agent_id: b1, kind: "live", chat_id: "oc_g", anchor_candidate: null, aliases: { root_om: "om_x", session_id: null }, binding_target: { runtime: "claude", project_root: "/p", claude_session_id: uuid(3) }, facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }, generation_lineage_id: "lin_1", origin_operation_id: cb, binding_proof: null, locator_link_proof_ref: null, created_at: at, updated_at: at } } };
+  // op key 确定性：同 token/endpoint → 同 id；且形状合法。
+  const id1 = TAL.schemaUpgradeOperationId(tok, EP), id2 = TAL.schemaUpgradeOperationId(tok, EP);
+  assert.equal(id1, id2, "op key 确定性");
+  assert.match(id1, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u, "op key 过 OP_ID_SHAPE（version 4 / variant 8）");
+  assert.notEqual(TAL.schemaUpgradeOperationId(uuid(8), EP), id1, "不同 token → 不同 op key");
+  // applySchemaUpgrade：同输入两次 → 同 SHA；产物为 1.1-transition + 四字段显式 null；validateLedger 过。
+  const next1 = TAL.applySchemaUpgrade(doc, { operation_id: id1, request_key: "req_sch", from_schema: "1.0", to_schema: "1.1-transition" });
+  const next2 = TAL.applySchemaUpgrade(doc, { operation_id: id1, request_key: "req_sch", from_schema: "1.0", to_schema: "1.1-transition" });
+  assert.equal(TAL.sha256(Buffer.from(JSON.stringify(next1, null, 2) + "\n", "utf-8")), TAL.sha256(Buffer.from(JSON.stringify(next2, null, 2) + "\n", "utf-8")), "同输入两次 → 同 SHA");
+  assert.equal(next1.schema_version, "1.1-transition");
+  assert.ok(Object.prototype.hasOwnProperty.call(next1.records[b1], "selection_handle") && next1.records[b1].selection_handle === null, "四字段补显式 null");
+  assert.equal(TAL.validateLedger(next1, { endpointId: EP }).ok, true, "产物 validateLedger 过：" + TAL.validateLedger(next1, { endpointId: EP }).why);
+  assert.ok(next1.operations[id1].fingerprint === TAL.fingerprintOf("schema_upgrade", { request_key: "req_sch", endpoint: EP, from_schema: "1.0", to_schema: "1.1-transition" }), "fingerprint 与 applySchemaUpgrade 一致");
+});
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

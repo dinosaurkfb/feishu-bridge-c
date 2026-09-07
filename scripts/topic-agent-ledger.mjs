@@ -1703,11 +1703,24 @@ export function fingerprintOf(opType, inputs) {
 /** 账本落盘字节（与 writeLedger 同一函数——plan 的 expected_ledger_sha256 必须用同一序列化重演算）。 */
 const serializeLedger = (doc) => Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8");
 
+// R52 §一：schema_upgrade 的 op key 确定性化——uuid化(sha256(canonKey({domain, token, endpoint})))，须过 OP_ID_SHAPE（8-4-4-4-12，13 位 4、17 位 8）。
+const operationIdFromSha = (hex) => { if (!/^[0-9a-f]{64}$/u.test(hex)) throw new Error("bad sha for operation id"); const s = hex.slice(0, 32); const v = s.slice(0, 12) + "4" + s.slice(13, 16) + "8" + s.slice(17, 32); return v.slice(0, 8) + "-" + v.slice(8, 12) + "-" + v.slice(12, 16) + "-" + v.slice(16, 20) + "-" + v.slice(20); };
+export const schemaUpgradeOperationId = (token, endpointId) => operationIdFromSha(sha256(Buffer.from(canonKey({ domain: "owner_select_schema_upgrade_v1", token, endpoint: endpointId }), "utf-8")));
+// R52 §一.2：applySchemaUpgrade（纯函数，与 schemaUpgrade 执行器 mutate 同一逻辑）→ next doc（不落盘）。
+export function applySchemaUpgrade(doc, { operation_id, request_key, from_schema, to_schema }) {
+  const next = structuredClone(doc);
+  next.revision += 1;
+  next.schema_version = to_schema;
+  next.operations[operation_id] = { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key, fingerprint: fingerprintOf("schema_upgrade", { request_key, endpoint: next.endpoint_id, from_schema, to_schema }), result_revision: next.revision, result: { endpoint: next.endpoint_id, from_schema, to_schema } };
+  if (to_schema !== "1.1") for (const rec of Object.values(next.records)) { if (rec.kind !== "live") continue; for (const k of ["selection_handle", "handle_expires_at", "rebind_handle", "rebind_expires_at"]) if (!(k in rec)) rec[k] = null; }
+  return next;
+}
+
 /** 克隆、bump revision、盖一笔不可覆盖 operation（result 过 RESULT_SHAPE），再 mutateRecords。返回 next。 */
-function stampAndBuild(doc, { opType, inputs, result, mutateRecords }) {
+function stampAndBuild(doc, { opType, inputs, result, mutateRecords, operationId = null }) {
   const next = structuredClone(doc);
   next.revision = doc.revision + 1;
-  const opId = crypto.randomUUID();
+  const opId = operationId ?? crypto.randomUUID();
   next.operations[opId] = { op_type: opType, terminal_kind: opType, request_key: inputs.request_key ?? null, fingerprint: fingerprintOf(opType, inputs), result_revision: next.revision, result };
   mutateRecords(next, opId);
   return next;
@@ -2193,17 +2206,8 @@ export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, 
         if (inv.legacy_proof_count !== 0 || inv.null_b1_count !== 0) return { ok: false, reason: "precheck_failed", why: "legacy_proof_count=" + inv.legacy_proof_count + " null_b1_count=" + inv.null_b1_count };
       }
       if (currentDoc.schema_version !== fromSchema) return { ok: false, reason: "schema_moved", why: "账本 schema_version " + currentDoc.schema_version + " ≠ fromSchema " + fromSchema };
-      const next = stampAndBuild(currentDoc, {
-        opType: "schema_upgrade", inputs, result: { endpoint: endpointId, from_schema: fromSchema, to_schema: toSchema },
-        mutateRecords: (n) => {
-          n.schema_version = toSchema;
-          if (toSchema === "1.1") return; // strict：四字段已存在（transition 补过），已有值不动
-          for (const rec of Object.values(n.records)) {
-            if (rec.kind !== "live") continue;
-            for (const k of ["selection_handle", "handle_expires_at", "rebind_handle", "rebind_expires_at"]) if (!(k in rec)) rec[k] = null;
-          }
-        },
-      });
+      const opId = schemaUpgradeOperationId(capability.token, endpointId);
+      const next = applySchemaUpgrade(currentDoc, { operation_id: opId, request_key: requestKey, from_schema: fromSchema, to_schema: toSchema });
       builtSha = sha256(serializeLedger(next));
       return { ok: true, next };
     },

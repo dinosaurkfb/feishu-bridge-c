@@ -107,8 +107,7 @@ function osmExitAction(phase) {
 }
 
 /** ── drained 只读前置（§二.2；失败留在 drained，rollbackSafe）── */
-export function osmPrecheck(ctx, { token, env, kind = "a" }) {
-  // R53 kind="b"：campaign 必须 open 且 pending_joins 空（id 取自文件）、writer partial 同 id、冻结集=文件 endpoints、
+export function osmPrecheck(ctx, { token, env, kind = "a" }) {  // R53 kind="b"：campaign 必须 open 且 pending_joins 空（id 取自文件）、writer partial 同 id、冻结集=文件 endpoints、
   //   每 ep 1.1-transition 且当场重盘两计数皆 0（任一非 0 → precheck_failed，指明 ep 与计数——门外 reaffirm 未完成的信号）。
   if (kind === "b") {
     const csr = readCampaignDocVerified(env);
@@ -299,8 +298,47 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
 }
 
 /** staged plan 的受验读（0600 / 单硬链接 / 普通文件），返回字节（无外部锚——锚由身份+重演算核承担）。 */
-function readStagedPlanBytes(file) {
-  let fd = null;
+
+// R53 步2a：B 原子进段的 step 构造函数（seal / 每 ep precheck / 每 ep strict（applySchemaUpgrade 预算）/ complete / on）。
+export function buildBSteps({ ctx, token, env }) {
+  const cst = readCampaignState(env);
+  if (!(cst.exists && cst.state === "open")) return { ok: false, reason: "campaign_not_open", why: "B 需 campaign open（state=" + cst.state + "）" };
+  const cs = readCampaignDocVerified(env);
+  if (!cs.ok || cs.absent) return { ok: false, reason: "campaign_unreadable", why: cs.problem ?? (cs.absent ? "absent" : null) };
+  if (cs.doc.state !== "open") return { ok: false, reason: "campaign_not_open", why: "B 需 campaign open（state=" + cs.doc.state + "）" };
+  const cid = cs.doc.campaign_id;
+  const frozen = [...cs.doc.endpoints].sort();
+  const digest = endpointsDigest(frozen);
+  const ws = readWriterState(env);
+  if (!(ws.exists && ws.state === "partial" && ws.campaign_id === cid)) return { ok: false, reason: "writer_not_partial", why: "B 需 writer-state partial 同 id" };
+  const stagedDir = path.join(ctx.dir, token + ".staged"); fs.mkdirSync(path.join(stagedDir, "intended"), { recursive: true, mode: 0o700 });
+  const steps = [];
+  const memberOf = (ep) => { const d = resolveEndpointDir(ep, { env }); const L = loadLedger(d.dir, { endpointId: ep }); const inv = migrationInventory(L.doc); return { schema_version: L.doc.schema_version, legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count }; };
+  // campaign sealed（digest 冻结）+ complete 文档（members 预算为 strict 后：1.1 + 两计数 0）。
+  const sealedDoc = { schema_version: CAMPAIGN_SCHEMA, state: "sealed", campaign_id: cid, endpoints: frozen, endpoints_digest: digest, members: Object.fromEntries(frozen.map((ep) => [ep, memberOf(ep)])), pending_joins: [], revision: (cs.doc.revision ?? 1), origin_operation_id: token };
+  const completeDoc = { schema_version: CAMPAIGN_SCHEMA, state: "complete", campaign_id: cid, endpoints: frozen, endpoints_digest: digest, members: Object.fromEntries(frozen.map((ep) => [ep, { schema_version: "1.1", legacy_proof_count: 0, null_b1_count: 0 }])), pending_joins: [], revision: (cs.doc.revision ?? 1) + 1, origin_operation_id: token };
+  const onDoc = { schema_version: WRITER_STATE_SCHEMA, state: "on", campaign_id: cid, endpoints_digest: digest, revision: ws.revision + 1, origin_operation_id: token };
+  const csb = { exists: true, sha256: cs.sha256, state: cs.doc.state, campaign_id: cid, endpoints: frozen, endpoints_digest: digest };
+  steps.push({ kind: "campaign", id: "campaign:" + cid + ":seal", state: "prepared", at: new Date(ctx.now()).toISOString(), target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: csb, intended_after: { exists: true, sha256: shaHex(serializeLedger(sealedDoc)), state: "sealed", campaign_id: cid, endpoints: frozen, endpoints_digest: digest } });
+  for (const ep of frozen) {
+    const d = resolveEndpointDir(ep, { env }); if (!d.ok) return { ok: false, reason: d.reason, why: ep };
+    const L = loadLedger(d.dir, { endpointId: ep }); if (!L.ok) return { ok: false, reason: "ledger_unreadable", why: ep };
+    if (L.doc.schema_version !== "1.1-transition") return { ok: false, reason: "schema_not_transition", why: ep };
+    const inv = migrationInventory(L.doc);
+    const pc = { legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count, revision: L.doc.revision, ledger_sha256: L.sha256 };
+    steps.push({ kind: "precheck", id: "precheck:" + ep, state: "prepared", at: new Date(ctx.now()).toISOString(), target: "ledger/" + ep + "/ledger.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: pc, intended_after: { ...pc }, after: { ...pc } });
+    const opId = ownerSelectSchemaUpgradeOpId(token, ep);
+    const strict = applySchemaUpgrade(L.doc, { operation_id: opId, request_key: token + ":schema:" + ep, from_schema: "1.1-transition", to_schema: "1.1" });
+    const strictSha = shaHex(serializeLedger(strict));
+    const backup = path.join(stagedDir, "backup-" + ep + "-strict.json"); fs.writeFileSync(backup, fs.readFileSync(path.join(d.dir, "ledger.json")), { mode: 0o600 });
+    steps.push({ kind: "schema_endpoint", id: "schema_endpoint:" + ep + ":strict", state: "prepared", at: new Date(ctx.now()).toISOString(), target: "ledger/" + ep + "/ledger.json", chain: null, backup, backup_sha256: shaHex(fs.readFileSync(path.join(d.dir, "ledger.json"))), backup_bytes: fs.readFileSync(path.join(d.dir, "ledger.json")).length, before: { schema_version: "1.1-transition", revision: L.doc.revision, ledger_sha256: L.sha256 }, intended_after: { schema_version: "1.1", revision: L.doc.revision + 1, ledger_sha256: strictSha } });
+  }
+  steps.push({ kind: "campaign", id: "campaign:" + cid + ":complete", state: "prepared", at: new Date(ctx.now()).toISOString(), target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: true, sha256: shaHex(serializeLedger(sealedDoc)), state: "sealed", campaign_id: cid, endpoints: frozen, endpoints_digest: digest }, intended_after: { exists: true, sha256: shaHex(serializeLedger(completeDoc)), state: "complete", campaign_id: cid, endpoints: frozen, endpoints_digest: digest } });
+  steps.push({ kind: "writer_state", id: "writer_state:" + cid + ":on", state: "prepared", at: new Date(ctx.now()).toISOString(), target: "ledger/owner-select-writer-state.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: true, sha256: ws.sha256, state: "partial", campaign_id: cid, endpoints_digest: ws.endpoints_digest, revision: ws.revision }, intended_after: { exists: true, sha256: shaHex(serializeLedger(onDoc)), state: "on", campaign_id: cid, endpoints_digest: digest, revision: ws.revision + 1 } });
+  return { ok: true, steps, cid, frozen };
+}
+
+function readStagedPlanBytes(file) {  let fd = null;
   try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); }
   catch (err) { return { ok: false, why: err?.code === "ENOENT" ? "文件不在" : errText(err) }; }
   try {

@@ -104,7 +104,7 @@ export function campaignDocProblem(doc) {
     if (!Number.isSafeInteger(m.null_b1_count) || m.null_b1_count < 0) return "member[" + ep + "].null_b1_count 必须是非负整数";
     if (doc.state === "complete") {
       if (m.schema_version !== "1.1" || m.legacy_proof_count !== 0 || m.null_b1_count !== 0) {
-        return "campaign complete 状态下所有 member 必须 schema_version === 1.1 且两计数为 0: " + ep;
+        return "campaign complete 状态下所有 member 必须满足 strict 准入条件（schema_version === 1.1 且两计数为 0）: " + ep;
       }
     }
   }

@@ -35718,7 +35718,7 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
   // A 迁移 fixture（osm_a_upgrading）：campaign:open + schema_endpoint:transition + mint + writer_state:partial，
   // 锚点用调用方给的账本现场（真 SHA/schema/revision）；blob 文件真落盘（内容任意，journalProblem 只核形状，
   // blob 与 plan 字节的一致性是 R52 重放合同）。
-  const r51FixtureA = ({ root, ledgerSha, ledgerSchema, ledgerRevision, nullB1Count = 2, tok = r51Uuid(9), now = T0 }) => {
+  const r51FixtureA = ({ root, ledgerSha, ledgerSchema, ledgerRevision, nullB1Count = 2, tok = r51Uuid(9), now = T0, transitionAfterSha = null }) => {
     const maintDir = path.join(root, "maint");
     fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
     const cid = campaignIdFor(tok);
@@ -35730,7 +35730,7 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
     const backupBytes = fs.statSync(backupFile).size;
     const blobPath = path.join(staged, "intended", "mint-" + EP51 + ".json");
     fs.writeFileSync(blobPath, "x".repeat(50), { mode: 0o600 });
-    const SHA_T = r51Sha("c"), SHA_M = r51Sha("d");
+    const SHA_T = transitionAfterSha ?? r51Sha("c"), SHA_M = r51Sha("d");
     const steps = [
       ...r51EnterSteps(tok, now),
       { kind: "campaign", id: "campaign:" + cid + ":open", state: "prepared", at: now, target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null,
@@ -36035,6 +36035,95 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
     bad((p) => { p.before_ledger_sha256 = null; }, "before_sha 形坏");
     bad((p) => { p.minted[0].handle_expires_at = undefined; p.minted[0].extra = 1; }, "minted 项多键");
   });
+
+  // §五 用：重置账本回 transition before 态（同 dir 重写）。
+  const r51SeedTransition2 = (dir, opts) => r51SeedTransition(dir, opts);
+
+  test("R51 §五 mintSelectionHandles：三态 CAS + plan 绑定 + 集合等式 + written_mismatch", () => r51WithRoot((root, dir) => {
+    // 账本：transition（2 null-B1），mint step 锚真账本 SHA（transitionAfterSha = 现场 SHA）。
+    r51SeedTransition(dir);
+    const L0 = TAL.loadLedger(dir, { endpointId: EP51 });
+    // schema_endpoint step 保持合法 A 联合（1.0→1.1-transition、rev 2→3）；mint.before 锚真账本 SHA/revision（两态核用）。
+    const fx = r51FixtureA({ root, ledgerSha: L0.sha256, ledgerSchema: "1.0", ledgerRevision: 2, transitionAfterSha: L0.sha256 });
+    const env = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fx.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fx.gateFile };
+    const cap = { kind: "mint_selection_handles", token: fx.tok };
+    const plan = TAL.buildMintPlan({ doc: L0.doc, token: fx.tok, campaignId: fx.cid, endpointId: EP51, requestKey: fx.tok, now: Date.parse(T0), ttlMs: 3600_000 });
+    assert.equal(TAL.mintPlanProblem(plan), null, "前提：plan 封闭形合法");
+    // 绑定核前提：plan.expected_ledger_sha256 === step.intended_after.ledger_sha256（§8.2 mint 交叉等式）
+    fx.rewrite((d) => { d.steps.find((s) => s.kind === "mint").intended_after.ledger_sha256 = plan.expected_ledger_sha256; });
+    const args = { endpointId: EP51, capability: cap, plan, env };
+
+    // 正向：账本 === before → applyMintPlan → 读回 SHA 必 === expected
+    const res = TAL.mintSelectionHandles(args);
+    assert.ok(res.ok, "mint 正向：" + JSON.stringify(res));
+    assert.equal(res.sha256, plan.expected_ledger_sha256, "读回 SHA === plan.expected_ledger_sha256");
+    const after = TAL.loadLedger(dir, { endpointId: EP51 });
+    assert.equal(after.doc.revision, L0.doc.revision + 1, "revision+1");
+    const mintOp = Object.values(after.doc.operations).find((o) => o.request_key === fx.tok && o.op_type === "mint_selection_handles");
+    assert.ok(mintOp, "账本内恰一笔本 campaign 的 mint op");
+    for (const m of plan.minted) {
+      assert.equal(after.doc.records[m.target_id].selection_handle, m.selection_handle, "handle 落记录");
+      assert.equal(after.doc.records[m.target_id].origin_operation_id, plan.operation_id, "origin 指向本 op");
+    }
+
+    // already：账本已 === expected → {ok:true, commit:"already"}（崩溃窗口补 done 的幂等确认）
+    const already = TAL.mintSelectionHandles(args);
+    assert.ok(already.ok && already.commit === "already", "已提交现场返回 already：" + JSON.stringify(already));
+
+    // 伪造 plan：expected 集合少列一个 null-B1（漏铸攻击）→ 集合等式拒（CAS，不信任 plan 自述）
+    const forged = { ...structuredClone(plan), expected_null_b1_ids: plan.expected_null_b1_ids.slice(0, 1), minted: plan.minted.slice(0, 1) };
+    r51SeedTransition2(dir, { nullB1Count: 2 }); // 重置账本回 before 态
+    const L1 = TAL.loadLedger(dir, { endpointId: EP51 });
+    fx.rewrite((d) => {
+      const mint = d.steps.find((s) => s.kind === "mint");
+      mint.before.ledger_sha256 = L1.sha256;
+      mint.backup_sha256 = L1.sha256;
+      mint.intended_after.ledger_sha256 = plan.expected_ledger_sha256;
+      const se = d.steps.find((s) => s.kind === "schema_endpoint");
+      se.intended_after.ledger_sha256 = L1.sha256;
+      se.backup_sha256 = L1.sha256;
+    });
+    const cast = TAL.mintSelectionHandles({ ...args, plan: forged });
+    assert.equal(cast.reason, "null_b1_set_mismatch", "伪造 plan 的集合等式拒：" + JSON.stringify(cast));
+
+    // plan 绑定拒：token / endpoint / request_key / before_sha / expected_sha / 形坏
+    const badPlan = (mut, why) => {
+      const p = structuredClone(plan);
+      mut(p);
+      const r = TAL.mintSelectionHandles({ ...args, plan: p });
+      assert.equal(r.reason, "plan_mismatch", why + "：" + JSON.stringify(r));
+    };
+    badPlan((p) => { p.token = r51Uuid(5); }, "plan.token ≠ capability.token");
+    badPlan((p) => { p.endpoint = "endpoint_" + "9".repeat(24); }, "plan.endpoint ≠ endpointId");
+    badPlan((p) => { p.request_key = "other-rk"; }, "plan.request_key ≠ capability.token");
+    badPlan((p) => { p.before_ledger_sha256 = r51Sha("b"); }, "plan.before_sha ≠ step.before.ledger_sha256");
+    badPlan((p) => { p.expected_ledger_sha256 = r51Sha("a"); }, "plan.expected_sha ≠ step.intended_after.ledger_sha256");
+    const broken = TAL.mintSelectionHandles({ ...args, plan: { ...plan, minted: "nope" } });
+    assert.equal(broken.reason, "bad_plan", "plan 形坏拒");
+    const absent = TAL.mintSelectionHandles({ ...args, plan: null });
+    assert.equal(absent.reason, "bad_plan", "不带 plan 拒");
+
+    // written_mismatch：写成功但读回被注入改坏 → fail-closed（不重试不修）
+    r51SeedTransition2(dir, { nullB1Count: 2 });
+    const L2 = TAL.loadLedger(dir, { endpointId: EP51 });
+    fx.rewrite((d) => {
+      const mint = d.steps.find((s) => s.kind === "mint");
+      mint.before.ledger_sha256 = L2.sha256;
+      mint.backup_sha256 = L2.sha256;
+      mint.intended_after.ledger_sha256 = plan.expected_ledger_sha256;
+      const se = d.steps.find((s) => s.kind === "schema_endpoint");
+      se.intended_after.ledger_sha256 = L2.sha256;
+      se.backup_sha256 = L2.sha256;
+    });
+    const wrecked = TAL.mintSelectionHandles({ ...args, _inject: { afterLedgerRename: () => {
+      const p = path.join(dir, "ledger.json");
+      const d2 = JSON.parse(fs.readFileSync(p, "utf-8"));
+      d2.revision += 100; // 注入：rename 已成、读回前把盘上字节改坏
+      fs.writeFileSync(p, JSON.stringify(d2, null, 2) + "\n", { mode: 0o600 });
+    } } });
+    assert.equal(wrecked.ok, false, "读回不符拒");
+    assert.equal(wrecked.reason, "written_mismatch", "written_mismatch fail-closed：" + JSON.stringify(wrecked));
+  }));
 }
 
 summarySealed = true;

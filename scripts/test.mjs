@@ -18970,6 +18970,82 @@ test("R52a 返修二：/feishu-select 入站全路径（owner 默认 off + 终�
   assert.ok(fs.existsSync(failedFileOn), "同一 failed 终态仍有效");
 });
 
+test("R52a 返修三 P1-1: Claude 侧 select in-flight claim 维护恢复（claim 已取、终态未落 → repair 预览与 apply 能收敛）", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-select-repair-"));
+  const root = path.join(local, "project");
+  fs.mkdirSync(root);
+  const registryFile = path.join(local, "registry.json");
+  const templateFile = path.join(local, "template.json");
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{
+    id: "ctl", root, name: "控制演示", root_message_id: "om_select", expires_at: "2099-01-01T00:00:00Z",
+    session_id: "aily_claude_ctl", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z",
+  }] }));
+  const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
+  fs.mkdirSync(claimsDir, { recursive: true });
+  const expectation = claudeClaimExpectation({ root, registryFile, templateFile });
+  assert.equal(expectation.ok, true);
+  const { expect } = expectation;
+  const logicalTaskKey = expect.logicalTaskKey;
+  const h = "osh_" + "c".repeat(32);
+  const msgId = "msg_sel_inflight_claude";
+  const key = claimKey(msgId, logicalTaskKey);
+
+  const acquired = acquireClaim({
+    claimsDir,
+    messageId: msgId,
+    logicalTaskKey,
+    meta: {
+      control: { control: "select", handle: h, handle_kind: "osh" },
+      session_id: "aily_claude_ctl",
+      binding_id: expect.bindingId,
+      policy_id: MAPPING_POLICY_ID,
+      policy_version: "1.0",
+      local_target_id: "lt_test",
+      origin_channel_generation_id: "ch_test",
+    },
+  });
+  assert.equal(acquired.ok, true);
+
+  const repair = (...args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "repair-control-claim.mjs"), ...args,
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile } });
+
+  // 1. 预览：按 select kind 投影
+  const preview = repair("--project", root, "--key", key);
+  assert.match(preview.stdout, /\[预览\] 事务未闭合：控制意图 选择 osh_c{32}，终态缺席/u, "预览按 kind 投影：" + preview.stdout);
+  assert.doesNotMatch(preview.stdout, /目标模式/u);
+
+  // 2. apply：默认 admission 为 off → executeSelectControl 失败收敛，写入 failed 终态
+  const repaired = repair("--project", root, "--key", key, "--apply");
+  assert.match(repaired.stdout, /没有恢复（control_failed：select_off）/u, "恢复执行收敛为 control_failed(select_off)：" + repaired.stdout);
+  assert.equal(fs.existsSync(path.join(claimsDir, key + ".failed.json")), true, "已收敛出 failed 记录");
+
+  // 3. 再次查看：已收敛为 failed 状态
+  const after = repair("--project", root, "--key", key);
+  assert.match(after.stdout, /已记为失败（当时没切成），不恢复/u, "已闭合不再恢复：" + after.stdout);
+});
+
+test("R52a 返修三 P2: describeControlRepair 按 kind 投影（select 显示 handle / 默认候选，不显示 mode）", () => {
+  const h = "osh_" + "d".repeat(32);
+  const selectIntent = { control: "select", handle: h, handle_kind: "osh" };
+  const defaultSelectIntent = { control: "select", handle: null, handle_kind: null };
+  const modeIntent = { control: "mode", mode: "dialogue" };
+
+  // in_flight 预览
+  assert.match(describeControlRepair({ seen: { state: "in_flight", intent: selectIntent }, result: null, apply: false }), /控制意图 选择 osh_d{32}，终态缺席/u);
+  assert.match(describeControlRepair({ seen: { state: "in_flight", intent: defaultSelectIntent }, result: null, apply: false }), /控制意图 选择 默认候选，终态缺席/u);
+  assert.match(describeControlRepair({ seen: { state: "in_flight", intent: modeIntent }, result: null, apply: false }), /控制意图 dialogue，终态缺席/u);
+
+  // consumed_unreadable
+  assert.match(describeControlRepair({ seen: { state: "consumed_unreadable", intent: selectIntent, why: "BAD" }, result: null, apply: false }), /终态记录损坏（意图 选择 osh_d{32}）：BAD/u);
+
+  // result 补齐终态
+  assert.match(describeControlRepair({ seen: { state: "in_flight" }, result: { ok: true, intent: selectIntent, changed: true }, apply: true }), /已补齐终态（目标选择 osh_d{32}，已完成选择）/u);
+  assert.match(describeControlRepair({ seen: { state: "in_flight" }, result: { ok: true, intent: defaultSelectIntent, changed: false }, apply: true }), /已补齐终态（目标选择 默认候选，选择未变化）/u);
+  assert.match(describeControlRepair({ seen: { state: "in_flight" }, result: { ok: true, intent: modeIntent, changed: true }, apply: true }), /已补齐终态（目标模式 dialogue，本次完成切换）/u);
+});
+
 test("claim 终态 consumed：账本盘点认识它（不是 unrecognized_entry），也不把它当没有 run 制品的孤儿", () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-consumed-"));
   const runsDir = path.join(base, "runs");

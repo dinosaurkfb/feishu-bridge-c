@@ -61,37 +61,24 @@ const C0_OR_NL_RE = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/u;
  *   problem ：rejected_control / malformed_control 时说清"差在哪 / 去哪做"，其它一律 null
  */
 export function parseInboundIntent({ instruction, chain } = {}) {
-  const raw = typeof instruction === "string" ? instruction : "";
-  // R52a 返修三 P1-5: 折叠前先拒 C0 控制字符与换行/制表（命令词或参数里出现 → malformed_control，不得 ordinary）。
-  if (C0_OR_NL_RE.test(raw)) {
-    const withSpaces = raw.replace(/[\r\n\t]/gu, " ");
-    const stripped = withSpaces.replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/gu, "");
-    const normStripped = normalizeControlText(stripped);
-    const lowerStripped = normStripped.toLowerCase();
-    const prefix = lowerStripped.startsWith("/" + NAMESPACE) ? "/" : lowerStripped.startsWith("$" + NAMESPACE) ? "$" : null;
-    if (prefix !== null) {
-      const [word] = normStripped.slice(1).split(" ");
-      const w = shown(word);
-      const own = CHAIN_PREFIX[chain] ?? null;
-      const base = { text: normStripped, word, control: null, problem: null };
-      if (own === null) return { intent: INTENT.MALFORMED_CONTROL, ...base, problem: "这条链说不清是 Claude 还是 Codex，命令没有执行" };
-      if (prefix !== own) {
-        return { intent: INTENT.MALFORMED_CONTROL, ...base, problem: `前缀「${prefix}」是 ${CHAIN_NAME[prefix]} 链的写法；这个话题是 ${CHAIN_NAME[own]} 链，命令用「${own}」开头` };
-      }
-      return { intent: INTENT.MALFORMED_CONTROL, ...base, problem: `${own}${w} 命令与参数不接受换行、制表符或控制字符` };
-    }
-  }
-  const text = normalizeControlText(raw);
+  const text = normalizeControlText(typeof instruction === "string" ? instruction : "");
   const base = { text, word: null, control: null, problem: null };
   // R52a 返修一 P2：命名空间检测大小写不敏感进命令命名空间，之后仍精确匹配 → 大小写变体一律 malformed（不降回普通指令）。
   const lower = text.toLowerCase();
-  const prefix = lower.startsWith("/" + NAMESPACE) ? "/" : lower.startsWith("$" + NAMESPACE) ? "$" : null;
+  let prefix = lower.startsWith("/" + NAMESPACE) ? "/" : lower.startsWith("$" + NAMESPACE) ? "$" : null;
+  if (prefix === null) {
+    // R52a 返修三 P1-5: 折叠前先拒 C0 控制字符与换行/制表（命令名内插控制字符不得 ordinary）。
+    const stripped = text.replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/gu, "");
+    const strippedLower = stripped.toLowerCase();
+    const strippedPrefix = strippedLower.startsWith("/" + NAMESPACE) ? "/" : strippedLower.startsWith("$" + NAMESPACE) ? "$" : null;
+    if (strippedPrefix !== null) prefix = strippedPrefix;
+  }
   if (prefix === null) {
     if (AUTHORIZATION_RE.test(text)) return { intent: INTENT.AUTHORIZATION, ...base };
     return { intent: INTENT.ORDINARY, ...base };
   }
-  const [word, ...rest] = text.slice(1).split(" ");
-  const args = rest.join(" ");
+  const [word, ...rest] = text.slice(1).split(/[ \t\r\n]/u);
+  const args = rest.filter(Boolean).join(" ");
   const w = shown(word); const a = shown(args);
   const malformed = (problem) => ({ intent: INTENT.MALFORMED_CONTROL, ...base, word, problem });
   const own = CHAIN_PREFIX[chain] ?? null;

@@ -10227,6 +10227,109 @@ test("bind-task 首次接入：已启用端点强制双写镜像 shadow create_b
   assert.equal(sendCalls.length, 1, "恰好一次 sendToChat（messages-send）：" + JSON.stringify(sendCalls));
 });
 
+test("R52a 返修三 P1-1: Codex 真入口 $feishu-select 全路径（claim meta 按 kind 投影、readClaimState 绝不 unreadable、默认 off 拒并落 failed、重放幂等）", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  const bin = path.join(home, "bin");
+  fs.mkdirSync(root); fs.mkdirSync(bin);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  task.session_id = "aily_session_a";
+  task.inbound_state = "bound";
+  delete task.topic_generation_state;
+  delete task.channel_generation_id;
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const fakeAily = path.join(bin, "aily-cli");
+  fs.writeFileSync(fakeAily, ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const run = (body, messageId) => {
+    const content = '<at id="ou_same" type="employee">M5Codex</at> ' + body;
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: {
+      id: messageId, sessionID: "aily_session_a", role: "user", createdBy: TEMPLATE.frank_sender_id, createdAtMs: Date.now(), content,
+    } }) }] });
+    return spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], {
+      encoding: "utf-8",
+      env: { ...isolatedEnv(), PATH: bin + path.delimiter + process.env.PATH, FEISHU_CODEX_BRIDGE_HOME: home,
+        AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "aily_session_a", AILY_CLI_RUN_ID: "run_ctl", FAKE_AILY_ENVELOPE: envelope },
+    });
+  };
+
+  const h = "osh_" + "a".repeat(32);
+  const selRes = run("$feishu-select " + h, "msg_sel_1");
+  assert.equal(selRes.status, 0, selRes.stdout + selRes.stderr);
+  assert.match(selRes.stdout, /选择功能未开放/u, "默认准入 off 拒：" + selRes.stdout);
+  assert.doesNotMatch(selRes.stdout, /模式/u, "文案不得出现模式相关描述");
+
+  const paths = taskPaths(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task, home);
+  const key1 = claimKey("msg_sel_1", task.logical_task_key);
+
+  // 关键反例守卫：readClaimState 绝不得 unreadable！
+  const claimState = readClaimState({ claimsDir: paths.claims, key: key1 });
+  assert.equal(claimState.status, "valid", "claim 状态必须是 valid，不得 unreadable（为什么：" + claimState.why + "）");
+  assert.deepEqual(claimState.claim.control, { control: "select", handle: h, handle_kind: "osh" }, "claim.control 必须是 select kind 形状");
+
+  // 终态校验：落 failed(select_off)，不得落 consumed
+  assert.equal(fs.existsSync(path.join(paths.claims, key1 + ".consumed.json")), false, "未接入执行器不得写 consumed");
+  assert.equal(fs.existsSync(path.join(paths.claims, key1 + ".failed.json")), true, "写了 failed 终态");
+  const failedDoc = JSON.parse(fs.readFileSync(path.join(paths.claims, key1 + ".failed.json"), "utf-8"));
+  assert.equal(failedDoc.state, "failed");
+  assert.equal(failedDoc.error, "select_off");
+
+  // 重放校验：幂等命中，按记录重出
+  const replayRes = run("$feishu-select " + h, "msg_sel_1");
+  assert.equal(replayRes.status, 0, replayRes.stdout + replayRes.stderr);
+  assert.match(replayRes.stdout, /选择功能未开放/u, "重放回执一致");
+});
+
+test("R52a 返修三 P1-1: Codex 侧 select in-flight claim 维护恢复（claim 已取、终态未落 → repair 预览与 apply 能收敛）", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  task.session_id = "aily_session_a";
+  task.inbound_state = "bound";
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  const paths = taskPaths(task, home);
+  const h = "osh_" + "b".repeat(32);
+  const msgId = "msg_sel_inflight";
+  const key = claimKey(msgId, task.logical_task_key);
+
+  const acquired = acquireClaim({
+    claimsDir: paths.claims,
+    messageId: msgId,
+    logicalTaskKey: task.logical_task_key,
+    meta: {
+      control: { control: "select", handle: h, handle_kind: "osh" },
+      session_id: "aily_session_a",
+      codex_thread_id: THREAD_A,
+      policy_id: MAPPING_POLICY_ID,
+      policy_version: "1.0",
+      local_target_id: "lt_test",
+      origin_channel_generation_id: "ch_test",
+    },
+  });
+  assert.equal(acquired.ok, true);
+
+  const repair = (...args) => spawnSync(process.execPath, [
+    path.join(ROOT, "scripts", "codex", "repair-control-claim.mjs"), ...args,
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+
+  // 1. 预览校验：按 kind 投影文案（P2），不得报「控制意图 ?」或「目标模式」
+  const preview = repair("--thread-id", THREAD_A, "--key", key);
+  assert.match(preview.stdout, /\[预览\] 事务未闭合：控制意图 选择 osh_b{32}，终态缺席/u, "预览文案按 select kind 投影：" + preview.stdout);
+  assert.doesNotMatch(preview.stdout, /目标模式/u);
+
+  // 2. apply 恢复：默认 admission 为 off → executeSelectControl 失败收敛，写入 failed 终态
+  const repaired = repair("--thread-id", THREAD_A, "--key", key, "--apply");
+  assert.match(repaired.stdout, /没有恢复（control_failed：select_off）/u, "恢复执行收敛为 control_failed(select_off)：" + repaired.stdout);
+  assert.equal(fs.existsSync(path.join(paths.claims, key + ".failed.json")), true, "已收敛出 failed 记录");
+
+  // 3. 再次查看：已收敛为 failed 状态
+  const after = repair("--thread-id", THREAD_A, "--key", key);
+  assert.match(after.stdout, /已记为失败（当时没切成），不恢复/u, "已闭合不再恢复：" + after.stdout);
+});
+
 summarySealed = true;
 console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
 if (TEST_FILTER.length > 0) {

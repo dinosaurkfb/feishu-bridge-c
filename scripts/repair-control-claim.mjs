@@ -1,8 +1,8 @@
 /**
- * 控制命令事务的显式维护入口（Claude 侧）：一笔 claim 里有控制意图、却没记下 consumed 终态（模式已切换、账本未闭合）时，
+ * 控制命令事务的显式维护入口（Claude 侧）：一笔 claim 里有控制意图（mode 或 select）、却没记下 consumed 终态时，
  * 在这里续做（幂等执行 + 写终态）。飞书重发是新消息 = 新 claim，补不了旧账 —— 这才是"恢复消费者"。
  * 身份：先从 claim 取会话定位，解析出它所属的精确绑定（项目级或会话级，与出站同一条选择规则），
- * 之后每次读 claim 都带这份期望；真正写入前，还要用**写锁内刚读出的记录**重新推导一遍身份再核对。
+ * 之后每次读 claim 都带份期望；真正写入前，还要用**写锁内刚读出的记录**重新推导一遍身份再核对。
  * 破坏性 CLI：只认 --project <root>、--key <64位hex>、--apply；未知 / 裸参数一律退出 2；默认只报告。
  */
 
@@ -15,6 +15,7 @@ import { setClaudeInteractionMode } from "./interaction-policy-store.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { expectationFromMapping, claudeControlPrecondition } from "./control-identity.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
+import { executeSelectControl } from "./select-admission.mjs";
 
 export function parseRepairControlArgs(argv, { target = "--project" } = {}) {
   let root = null; let key = null; let apply = false;
@@ -34,6 +35,18 @@ export function parseRepairControlArgs(argv, { target = "--project" } = {}) {
   return { ok: true, root, key, apply };
 }
 
+function describeIntent(intent) {
+  if (!intent) return "?";
+  if (intent.control === "select") return "选择 " + (intent.handle ?? "默认候选");
+  return intent.mode ?? "?";
+}
+
+function describeTarget(intent) {
+  if (!intent) return "?";
+  if (intent.control === "select") return "目标选择 " + (intent.handle ?? "默认候选");
+  return "目标模式 " + (intent.mode ?? "?");
+}
+
 export function describeControlRepair({ seen, result, apply }) {
   if (result) {
     if (!result.ok) return "没有恢复（" + result.reason + (result.why ? "：" + result.why : "") + "）";
@@ -41,10 +54,15 @@ export function describeControlRepair({ seen, result, apply }) {
       (result.residueUnknown ? "；残骸情况说不清（" + result.residueUnknown + "），请人工查看" : "") +
       (result.lockUncleared ? "；事务锁没有交还（" + result.lockUncleared + "），之后同一笔会报 control_busy，请人工确认后删除锁目录" : "");
     const held = result.quarantined?.length ? "；损坏的 failed 记录已隔离为 " + result.quarantined.join("、") + "，人工查看后删除" : "";
-    return (result.already ? "这笔已闭合，无需恢复" : "已补齐终态（目标模式 " + result.intent.mode + "，" + (result.changed ? "本次完成切换" : "模式本来就是") + "）") + held + left;
+    const targetDesc = describeTarget(result.intent);
+    const actionDesc = result.intent?.control === "select"
+      ? (result.changed ? "已完成选择" : "选择未变化")
+      : (result.changed ? "本次完成切换" : "模式本来就是");
+    return (result.already ? "这笔已闭合，无需恢复" : "已补齐终态（" + targetDesc + "，" + actionDesc + "）") + held + left;
   }
-  const head = { in_flight: "事务未闭合：控制意图 " + (seen.intent?.mode ?? "?") + "，终态缺席", consumed: "已闭合，无需恢复", mismatch: "终态与意图不一致：" + (seen.why ?? ""),
-    consumed_unreadable: "终态记录损坏（意图 " + (seen.intent?.mode ?? "?") + "）：" + (seen.why ?? ""), failed_unreadable: "失败记录损坏（意图 " + (seen.intent?.mode ?? "?") + "）：" + (seen.why ?? ""),
+  const intentDesc = describeIntent(seen.intent);
+  const head = { in_flight: "事务未闭合：控制意图 " + intentDesc + "，终态缺席", consumed: "已闭合，无需恢复", mismatch: "终态与意图不一致：" + (seen.why ?? ""),
+    consumed_unreadable: "终态记录损坏（意图 " + intentDesc + "）：" + (seen.why ?? ""), failed_unreadable: "失败记录损坏（意图 " + intentDesc + "）：" + (seen.why ?? ""),
     failed: "已记为失败（当时没切成），不恢复", conflict: "两份终态并存（" + (seen.why ?? "") + "），请人工查看", not_control: "这张 claim 不是控制命令",
     claim_unreadable: "claim 不属于当前绑定 / 读不出：" + (seen.why ?? ""), claim_absent: "没有这张 claim" }[seen.state]
     ?? ("说不清：" + seen.state + (seen.why ? "：" + seen.why : ""));
@@ -87,8 +105,10 @@ if (isDirectRun(import.meta.url)) {
   if (parsed.apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）
   if (parsed.apply && (RESUMABLE_CONTROL_STATES.includes(seen.state) || seen.state === "consumed")) {
     result = resumeControlClaim({ claimsDir, key: parsed.key, expect,
-      execute: (mode) => setClaudeInteractionMode({ root, claudeSessionId: expect.claudeSessionId, mode,
-        precondition: claudeControlPrecondition({ claimsDir, key: parsed.key, root }) }) });
+      execute: (target) => target?.control === "select"
+        ? executeSelectControl(target)
+        : setClaudeInteractionMode({ root, claudeSessionId: expect.claudeSessionId, mode: target,
+            precondition: claudeControlPrecondition({ claimsDir, key: parsed.key, root }) }) });
   }
   // 不是控制命令的 claim 也可能是收边的拒绝（第 3 层）：同一个入口，另一套事务。
   if (seen.state === "not_control") {

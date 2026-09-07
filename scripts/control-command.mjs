@@ -26,6 +26,7 @@ const SHAPES = {
   codex: new RegExp("^\\$feishu-mode (" + CONTROL_MODE_WORDS.join("|") + ")$", "u"),
 };
 // R52a：/feishu-select 的 handle 正则**从 topic-agent-ledger 导出的 handle 形状常量生成**（单一出处；不另写一份字母表）。
+// 注（PR #136 P2 / §12）："owner 先于 handle 解析"指的是业务解析层面（先核验 owner 身份与写入准入，再做 handle 寻址），不是词法层面的顺序。
 const HANDLE_ALTS = Object.freeze([
   { re: SELECTION_HANDLE_SHAPE, kind: "osh" },
   { re: REBIND_HANDLE_SHAPE, kind: "orh" },

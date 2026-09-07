@@ -1701,7 +1701,7 @@ export function fingerprintOf(opType, inputs) {
 }
 
 /** 账本落盘字节（与 writeLedger 同一函数——plan 的 expected_ledger_sha256 必须用同一序列化重演算）。 */
-const serializeLedger = (doc) => Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8");
+export const serializeLedger = (doc) => Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8");
 
 /** 32 hex → UUID 形（OP_ID_SHAPE）：8-4-4-4-12，第 13 位 version 4、第 17 位 variant 8。 */
 const uuidFromHex = (hex) => hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-4" + hex.slice(13, 16) + "-8" + hex.slice(17, 20) + "-" + hex.slice(20, 32);

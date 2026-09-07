@@ -6,7 +6,7 @@ import path from "node:path";
 import { acquireInstallSurfaceLock } from "../install-surface-lock.mjs";
 import { releaseOperationLease, readActive, readJournal, acquireOperationLease } from "./journal.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
-import { updateJournal, journalProblem } from "./journal.mjs";
+import { updateJournal, journalProblem, markStepDone, setPhase } from "./journal.mjs";
 import { aggregateEndpointReceipts, endpointReceipt } from "./ledger-receipt.mjs";
 import { campaignIdFor, endpointsDigest } from "./owner-select-derived.mjs";
 import { readCampaignState, readWriterState, writeCampaignState, writeWriterState, readCampaignDocVerified, readWriterStateDocVerified, CAMPAIGN_SCHEMA, WRITER_STATE_SCHEMA } from "./owner-select-state.mjs";
@@ -90,7 +90,7 @@ export function osmPreForwardPlanMatrix(ctx, { token, lease, env = process.env }
     if (L.doc.schema_version !== "1.0") return fail("not_at_1_0", ep + "：schema " + L.doc.schema_version);
     // §二.3：先用 applySchemaUpgrade 预算 schema_endpoint intended_after（transition 账本），mint 的 before = schema intended_after（状态链）。
     const opId = schemaUpgradeOperationId(token, ep);
-    const budgeted = applySchemaUpgrade(L.doc, { operation_id: opId, request_key: token, from_schema: "1.0", to_schema: "1.1-transition" });
+    const budgeted = applySchemaUpgrade(L.doc, { operation_id: opId, request_key: token + ":schema", from_schema: "1.0", to_schema: "1.1-transition" });
     const budgetedSha = sha256(serializeLedger(budgeted));
     const inv = migrationInventory(budgeted);
     const planPath = path.join(intendedDir, "mint-" + ep + ".json");
@@ -155,7 +155,7 @@ export function osmEnterForward(ctx, { token, lease, env = process.env } = {}) {
     const L = loadLedger(d.dir, { endpointId: ep }); if (!L.ok) return fail("ledger_unreadable", ep + "：" + L.reason);
     if (L.doc.schema_version !== "1.0") return fail("not_at_1_0", ep + "：schema " + L.doc.schema_version);
     const opId = schemaUpgradeOperationId(token, ep);
-    const budgeted = applySchemaUpgrade(L.doc, { operation_id: opId, request_key: token, from_schema: "1.0", to_schema: "1.1-transition" });
+    const budgeted = applySchemaUpgrade(L.doc, { operation_id: opId, request_key: token + ":schema", from_schema: "1.0", to_schema: "1.1-transition" });
     const budgetedSha = sha256(serializeLedger(budgeted));
     const inv = migrationInventory(budgeted);
     const plan = pre.plans[ep];
@@ -179,6 +179,101 @@ export function osmEnterForward(ctx, { token, lease, env = process.env } = {}) {
 
 // 备份路径（<token>.staged/backup.json）。
 function stagedBackupOf(ctx, token) { return path.join(ctx.dir, token + ".staged", "backup.json"); }
+
+// §二.5 forward 收敛（可重入；崩溃恢复只看 journal + 现场；handle 不重生成）：
+//   a campaign open → b 每 ep schemaUpgrade → c 每 ep 读 plan（intended_blob 回读）→ mintSelectionHandles → d writer_state partial → e setPhase(ledger_reopening)。
+//   每写 commit!==committed_clean → 停门（exit 3 纪律）；precheck_failed/written_mismatch/before_mismatch → 停门待修（forward-only）。
+export function osmForward(ctx, { token, lease, env = process.env, _inject = null } = {}) {
+  const fail = (reason, why, commit = "not_committed", extra = {}) => ({ ok: false, reason, why: why ?? null, commit, ...extra });
+  let doc = readJournal({ dir: ctx.dir, token }).doc;
+  if (doc.phase !== "osm_a_upgrading") return fail("not_forwarding", "phase " + doc.phase);
+  const cid = campaignIdFor(token);
+  const frz = frozenEndpoints(ctx.dir); if (!frz.ok) return fail(frz.reason, frz.why);
+  const refresh = () => { doc = readJournal({ dir: ctx.dir, token }).doc; return doc; };
+  // a. campaign:open
+  const campStep = doc.steps.find((s) => s.kind === "campaign" && s.id === "campaign:" + cid + ":open");
+  if (campStep && campStep.state !== "done") {
+    if (campStep.state === "prepared") {
+      const members = {};
+      for (const ep of frz.endpoints) { const d = resolveEndpointDir(ep, { env }); const L = loadLedger(d.dir, { endpointId: ep }); const inv = migrationInventory(L.doc); members[ep] = { legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count, schema_version: L.doc.schema_version }; }
+      const campDoc = { schema_version: CAMPAIGN_SCHEMA, state: "open", campaign_id: cid, endpoints: frz.endpoints, endpoints_digest: endpointsDigest(frz.endpoints), members, pending_joins: [], revision: 1, origin_operation_id: token };
+      const campCur = readCampaignState(env);
+      const w = writeCampaignState({ env, expectedSha256: campCur.exists === true ? campCur.sha256 : null, doc: campDoc, capability: { token, stepId: campStep.id } });
+      if (!w.ok) return fail(w.reason, w.why, w.commit, { lockUncleared: w.lockUncleared ?? null });
+      if (w.commit !== "committed") return fail("commit_residue", w.why ?? null, w.commit, { residue: w.residue ?? null, lockUncleared: w.lockUncleared ?? null });
+    }
+    const m = markStepDone({ dir: ctx.dir, token, lease, id: campStep.id, after: campStep.intended_after, now: ctx.now() });
+    if (!m.ok) return fail(m.reason, m.why ?? null);
+    refresh();
+  }
+  // b. 每 ep schemaUpgrade
+  for (const ep of frz.endpoints) {
+    const sStep = refresh().steps.find((s) => s.kind === "schema_endpoint" && s.id === "schema_endpoint:" + ep + ":transition");
+    if (!sStep || sStep.state === "done") continue;
+    const d = resolveEndpointDir(ep, { env }); if (!d.ok) return fail("endpoint_unresolvable", ep + "：" + d.reason);
+    const L = loadLedger(d.dir, { endpointId: ep }); if (!L.ok) return fail("ledger_unreadable", ep + "：" + L.reason);
+    if (sStep.state === "prepared") {
+      const atIntended = L.doc.schema_version === sStep.intended_after.schema_version && L.sha256 === sStep.intended_after.ledger_sha256;
+      if (!atIntended) {
+        if (L.doc.schema_version !== sStep.before.schema_version || L.sha256 !== sStep.before.ledger_sha256) return fail("before_mismatch", ep + "：现场 schema/SHA 与 step.before 不符（forward-only，停门待修）");
+        const w = schemaUpgrade({ endpointId: ep, capability: { kind: "schema_upgrade", token, endpointId: ep }, requestKey: token + ":schema", fromSchema: sStep.before.schema_version, toSchema: sStep.intended_after.schema_version, env, _inject });
+        if (!w.ok) return fail(w.reason, w.why ?? null, w.commit ?? "not_committed", { lockUncleared: w.lockUncleared ?? null });
+        if (w.commit !== "committed_clean" && w.commit !== "replayed") return fail("commit_residue", w.why ?? null, w.commit, { residue: w.residue ?? null, lockUncleared: w.lockUncleared ?? null });
+      }
+    }
+    const m = markStepDone({ dir: ctx.dir, token, lease, id: sStep.id, after: sStep.intended_after, now: ctx.now() });
+    if (!m.ok) return fail(m.reason, m.why ?? null);
+  }
+  // c. 每 ep 读 plan（intended_blob 回读 0600 单硬链接 sha/bytes）→ mintSelectionHandles
+  for (const ep of frz.endpoints) {
+    const mStep = refresh().steps.find((s) => s.kind === "mint" && s.id === "mint:" + ep);
+    if (!mStep || mStep.state === "done") continue;
+    if (mStep.state === "prepared") {
+      const blob = mStep.intended_blob;
+      if (!blob) return fail("intended_blob_missing", ep + "：journal mint step 无 intended_blob");
+      let raw;
+      try {
+        const st = fs.statSync(blob.path); if (!st.isFile() || st.nlink !== 1 || (st.mode & 0o777) !== 0o600) return fail("blob_shape_bad", ep + "：plan 文件非 0600 单硬链接普通文件");
+        const buf = fs.readFileSync(blob.path);
+        if (Buffer.byteLength(buf) !== blob.bytes || sha256(buf) !== blob.sha256) return fail("blob_mismatch", ep + "：plan 文件 sha/bytes 与 intended_blob 不符");
+        raw = JSON.parse(buf.toString("utf-8"));
+      } catch (err) { return fail("blob_unreadable", ep + "：" + errText(err)); }
+      if (mintPlanProblem(raw) !== null) return fail("plan_invalid", ep + "：" + mintPlanProblem(raw));
+      if (!_inject || !_inject.usePlan) {
+        const d = resolveEndpointDir(ep, { env }); const L = loadLedger(d.dir, { endpointId: ep });
+        if (L.ok && L.doc.schema_version === "1.1-transition" && L.sha256 === raw.before_ledger_sha256) {
+          // 现场已等于 before：正常 mint。
+          const w = mintSelectionHandles({ endpointId: ep, capability: { kind: "mint_selection_handles", token, endpointId: ep, request_key: token }, plan: raw, env, _inject });
+          if (!w.ok) return fail(w.reason, w.why ?? null, w.commit ?? "not_committed", { lockUncleared: w.lockUncleared ?? null });
+          if (w.commit !== "committed_clean" && w.commit !== "already") return fail("commit_residue", w.why ?? null, w.commit, { residue: w.residue ?? null, lockUncleared: w.lockUncleared ?? null });
+        }
+      }
+    }
+    const m = markStepDone({ dir: ctx.dir, token, lease, id: mStep.id, after: mStep.intended_after, now: ctx.now() });
+    if (!m.ok) return fail(m.reason, m.why ?? null);
+  }
+  // d. writer_state partial
+  const wStep = refresh().steps.find((s) => s.kind === "writer_state" && s.id === "writer_state:" + cid + ":partial");
+  if (wStep && wStep.state !== "done") {
+    if (wStep.state === "prepared") {
+      const wsBefore = readWriterState(env);
+      const writerDoc = { schema_version: WRITER_STATE_SCHEMA, state: "partial", campaign_id: cid, endpoints_digest: endpointsDigest(frz.endpoints), revision: wsBefore.exists === true ? wsBefore.revision + 1 : 1, origin_operation_id: token };
+      const w = writeWriterState({ env, expectedSha256: wsBefore.exists === true ? wsBefore.sha256 : null, doc: writerDoc, capability: { token, stepId: wStep.id } });
+      if (!w.ok) return fail(w.reason, w.why, w.commit, { lockUncleared: w.lockUncleared ?? null });
+      if (w.commit !== "committed") return fail("commit_residue", w.why ?? null, w.commit, { residue: w.residue ?? null, lockUncleared: w.lockUncleared ?? null });
+    }
+    const m = markStepDone({ dir: ctx.dir, token, lease, id: wStep.id, after: wStep.intended_after, now: ctx.now() });
+    if (!m.ok) return fail(m.reason, m.why ?? null);
+  }
+  // e. 全部 done → setPhase(ledger_reopening)
+  refresh();
+  const final = readJournal({ dir: ctx.dir, token });
+  const undone = final.doc.steps.filter((s) => s.state !== "done");
+  if (undone.length > 0) return fail("steps_incomplete", undone.map((s) => s.id).join(","));
+  const np = setPhase({ dir: ctx.dir, token, lease, phase: "ledger_reopening", expectPhase: "osm_a_upgrading", now: ctx.now() });
+  if (!np.ok) return fail(np.reason, np.why ?? null);
+  return { ok: true, phase: "ledger_reopening" };
+}
 
 /** osmEnter：进门（安装面锁 → enterMaintenance(operation_kind="owner_select_migration_a") → drained）+ drained 只读前置。 */
 export function osmEnter(ctx, { waitMs = 60000, apply = false, reason = "owner_select 迁移 A（old→transition）", env = process.env } = {}) {

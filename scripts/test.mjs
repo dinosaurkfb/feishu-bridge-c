@@ -28,6 +28,7 @@ import { SENDER_ROLES, roleCounts, roleCountsText, senderRole, senderRolesProble
 import { parseRegisterSenderArgs, planSenderChange, applySenderChange } from "./register-sender.mjs";
 import { parseRegisterP2pArgs, planP2pChange, applyP2pChange } from "./register-p2p-chat.mjs";
 import * as TAL from "./topic-agent-ledger.mjs";
+import * as OSS from "./maintenance/owner-select-state.mjs";
 import * as DW from "./m1a/dual-write.mjs";
 import * as WIRE from "./m1a/wiring.mjs";
 // symlink 锁：existsSync 会跟随到不存在的目标，锁在不在只能用 lstat 判
@@ -25213,6 +25214,45 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
     assert.ok(TAL.loadLedger(dir, { endpointId: EP }).ok, "seed 出的初始账本自洽");
   };
+  // R50（Part 二）：owner-select-state.mjs 文件合同 + 读写原语 + 派生 —— 纯合成回归（tmpdir + FEISHU_BRIDGE_LEDGER_DIR 隔离）。
+  test("R50 owner-select-state：campaignIdFor/endpointsDigest 派生 + campaign/writer 文件合同 + 读/写/CAS/unreadable", () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r50oss-")));
+    try { fs.chmodSync(root, 0o700); } catch { /* */ }
+    const env = { ...process.env, FEISHU_BRIDGE_LEDGER_DIR: root };
+    try {
+      const ep = "endpoint_" + "a".repeat(24);
+      const cid = OSS.campaignIdFor("tok1");
+      assert.match(cid, /^osc_[0-9a-f]{32}$/u, "campaign id 形");
+      assert.equal(cid, OSS.campaignIdFor("tok1"), "确定性（同 token 同 id）");
+      assert.match(OSS.endpointsDigest([ep]), /^[0-9a-f]{64}$/u, "digest 64hex");
+      // campaign 文件合同正反向
+      const goodCamp = { schema_version: "owner-select-campaign-1", campaign_id: cid, state: "open", endpoints: [ep], endpoints_digest: OSS.endpointsDigest([ep]), pending_joins: [], members: { [ep]: { schema_version: "1.0", legacy_proof_count: 0, null_b1_count: 2 } }, revision: 1, origin_operation_id: "tok1" };
+      assert.equal(OSS.campaignStateProblem(goodCamp), null, "campaign 合法");
+      assert.ok(OSS.campaignStateProblem({ ...goodCamp, schema_version: "x" }), "坏 schema 拒");
+      assert.ok(OSS.campaignStateProblem({ ...goodCamp, endpoints_digest: "0".repeat(64) }), "digest 与 endpoints 不符拒");
+      assert.ok(OSS.campaignStateProblem({ ...goodCamp, state: "sealed", pending_joins: [{ endpoint_id: "endpoint_" + "c".repeat(24), at: new Date().toISOString() }] }), "sealed 带 pending_joins 拒");
+      // writer-state 文件合同正反向
+      const goodW = { schema_version: "owner-select-writer-state-1", state: "off", campaign_id: null, endpoints_digest: null, revision: 1, origin_operation_id: "tok1" };
+      assert.equal(OSS.writerStateProblem(goodW), null, "writer off 合法");
+      assert.ok(OSS.writerStateProblem({ ...goodW, campaign_id: cid }), "off 带 campaign_id 拒");
+      assert.ok(OSS.writerStateProblem({ ...goodW, state: "on", campaign_id: cid, endpoints_digest: null }), "on 带 null digest 拒");
+      // 写/读/CAS
+      const w = OSS.writeCampaignState({ env, expectedSha256: null, doc: goodCamp });
+      assert.ok(w.ok, "campaign 首写 ok：" + JSON.stringify(w));
+      assert.equal(OSS.readCampaignState(env).state, "open", "读回 open");
+      assert.equal(OSS.readCampaignState(env).revision, 1, "读回 revision 1");
+      const cas = OSS.writeCampaignState({ env, expectedSha256: "0".repeat(64), doc: { ...goodCamp, revision: 2, state: "sealed" } });
+      assert.equal(cas.ok, false, "CAS 不一致拒：" + JSON.stringify(cas)); assert.equal(cas.reason, "cas_mismatch");
+      let rw = OSS.readWriterState(env);
+      assert.equal(rw.state, "off", "writer absent → off"); assert.equal(rw.revision, 0, "writer absent → revision 0");
+      const ww = OSS.writeWriterState({ env, expectedSha256: null, doc: goodW });
+      assert.ok(ww.ok, "writer 首写 ok：" + JSON.stringify(ww)); assert.equal(OSS.readWriterState(env).revision, 1);
+      // 读错/形状错 → unreadable
+      fs.writeFileSync(path.join(root, "owner-select-campaign.json"), "{ not json");
+      assert.equal(OSS.readCampaignState(env).state, "unreadable", "坏 JSON → unreadable");
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   // R37 裁定：M1a 收据逐端点原子启用。接线测试需要让 EP 处于两种收据态：
   //   · ok（ledger_init done）→ 双写强制（跑 shadow 后缀）；
   //   · never_initialized（无收据）→ 合法 legacy-only（不写 shadow）。

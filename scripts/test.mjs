@@ -33888,6 +33888,148 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
   }
 });
 
+function setupMaintFixtureA({ maintDir, tok, cid, eps, now = "2026-09-07T10:00:00.000Z" }) {
+  const dig = endpointsDigest(eps);
+  const enterSteps = [
+    { kind: "timer", id: "timer:claude", state: "done", at: now, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
+    { kind: "timer", id: "timer:codex", state: "done", at: now, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
+    { kind: "stub", id: "stub:claude", state: "done", at: now, target: "versions/x", chain: null, before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "stub", id: "stub:codex", state: "done", at: now, target: "stub", chain: null, before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "current", id: "current:claude", state: "done", at: now, target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "current", id: "current:codex", state: "done", at: now, target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "gate", id: "gate", state: "done", at: now, target: "gate", chain: null, before: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, backup: null, backup_sha256: null, backup_bytes: null }
+  ];
+  const stagedDir = path.join(maintDir, tok + ".staged");
+  const stagedBackupPath = path.join(stagedDir, "backup.json");
+  fs.mkdirSync(path.join(stagedDir, "intended"), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(stagedBackupPath, "{}", { mode: 0o600 });
+  const steps = [...enterSteps];
+  steps.push({
+    kind: "campaign", id: "campaign:" + cid + ":open", state: "prepared", at: now,
+    target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null,
+    before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null },
+    intended_after: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: cid, endpoints: eps, endpoints_digest: dig }
+  });
+  for (const ep of eps) {
+    const mintBlobPath = path.join(stagedDir, "intended", "mint-" + ep + ".json");
+    fs.writeFileSync(mintBlobPath, "x".repeat(50), { mode: 0o600 });
+    steps.push({
+      kind: "schema_endpoint", id: `schema_endpoint:${ep}:transition`, state: "prepared", at: now,
+      target: `ledger/${ep}/ledger.json`, chain: null, backup: stagedBackupPath, backup_sha256: "0".repeat(64), backup_bytes: 100,
+      before: { schema_version: "1.0", revision: 1, ledger_sha256: "0".repeat(64) },
+      intended_after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: "1".repeat(64) }
+    });
+    steps.push({
+      kind: "mint", id: `mint:${ep}`, state: "prepared", at: now,
+      target: `ledger/${ep}/ledger.json`, chain: null, backup: stagedBackupPath, backup_sha256: "1".repeat(64), backup_bytes: 100,
+      before: { revision: 2, null_b1_count: 2, ledger_sha256: "1".repeat(64) },
+      intended_after: { revision: 3, null_b1_count: 0, ledger_sha256: "2".repeat(64) },
+      intended_blob: { path: mintBlobPath, bytes: 50, sha256: "0".repeat(64) }
+    });
+  }
+  steps.push({
+    kind: "writer_state", id: "writer_state:" + cid + ":partial", state: "prepared", at: now,
+    target: "ledger/owner-select-writer-state.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null,
+    before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 },
+    intended_after: { exists: true, sha256: "2".repeat(64), state: "partial", campaign_id: cid, endpoints_digest: dig, revision: 1 }
+  });
+
+  const doc = {
+    schema_version: "1.4",
+    operation_kind: "owner_select_migration_a",
+    phase: "osm_a_upgrading",
+    reason: "A fixture",
+    started_at: now,
+    updated_at: now,
+    token: tok,
+    notes: [],
+    steps
+  };
+  fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+  const activeLink = path.join(maintDir, "active");
+  try { fs.unlinkSync(activeLink); } catch {}
+  fs.symlinkSync(tok, activeLink);
+  return {
+    capCampaignOpen: { token: tok, stepId: "campaign:" + cid + ":open" },
+    capWriterPartial: { token: tok, stepId: "writer_state:" + cid + ":partial" }
+  };
+}
+
+function setupMaintFixtureB({ maintDir, tok, cid, eps, cBeforeSha, wBeforeSha, now = "2026-09-07T10:00:00.000Z" }) {
+  const dig = endpointsDigest(eps);
+  const enterSteps = [
+    { kind: "timer", id: "timer:claude", state: "done", at: now, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
+    { kind: "timer", id: "timer:codex", state: "done", at: now, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
+    { kind: "stub", id: "stub:claude", state: "done", at: now, target: "versions/x", chain: null, before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "stub", id: "stub:codex", state: "done", at: now, target: "stub", chain: null, before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "current", id: "current:claude", state: "done", at: now, target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "current", id: "current:codex", state: "done", at: now, target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "gate", id: "gate", state: "done", at: now, target: "gate", chain: null, before: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, backup: null, backup_sha256: null, backup_bytes: null }
+  ];
+  const stagedDir = path.join(maintDir, tok + ".staged");
+  const stagedBackupPath = path.join(stagedDir, "backup.json");
+  fs.mkdirSync(stagedDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(stagedBackupPath, "{}", { mode: 0o600 });
+  const steps = [...enterSteps];
+  steps.push({
+    kind: "campaign", id: "campaign:" + cid + ":seal", state: "prepared", at: now,
+    target: "ledger/owner-select-campaign.json", chain: null, backup: stagedBackupPath, backup_sha256: cBeforeSha, backup_bytes: 100,
+    before: { exists: true, sha256: cBeforeSha, state: "open", campaign_id: cid, endpoints: eps, endpoints_digest: dig },
+    intended_after: { exists: true, sha256: "3".repeat(64), state: "sealed", campaign_id: cid, endpoints: eps, endpoints_digest: dig }
+  });
+  for (const ep of eps) {
+    steps.push({
+      kind: "precheck", id: `precheck:${ep}`, state: "done", at: now,
+      target: `ledger/${ep}/ledger.json`, chain: null, backup: null, backup_sha256: null, backup_bytes: null,
+      before: { legacy_proof_count: 0, null_b1_count: 0, revision: 3, ledger_sha256: "2".repeat(64) },
+      intended_after: { legacy_proof_count: 0, null_b1_count: 0, revision: 3, ledger_sha256: "2".repeat(64) },
+      after: { legacy_proof_count: 0, null_b1_count: 0, revision: 3, ledger_sha256: "2".repeat(64) }
+    });
+    steps.push({
+      kind: "schema_endpoint", id: `schema_endpoint:${ep}:strict`, state: "done", at: now,
+      target: `ledger/${ep}/ledger.json`, chain: null, backup: stagedBackupPath, backup_sha256: "2".repeat(64), backup_bytes: 100,
+      before: { schema_version: "1.1-transition", revision: 3, ledger_sha256: "2".repeat(64) },
+      intended_after: { schema_version: "1.1", revision: 4, ledger_sha256: "3".repeat(64) },
+      after: { schema_version: "1.1", revision: 4, ledger_sha256: "3".repeat(64) }
+    });
+  }
+  steps.push({
+    kind: "campaign", id: "campaign:" + cid + ":complete", state: "done", at: now,
+    target: "ledger/owner-select-campaign.json", chain: null, backup: stagedBackupPath, backup_sha256: "3".repeat(64), backup_bytes: 100,
+    before: { exists: true, sha256: "3".repeat(64), state: "sealed", campaign_id: cid, endpoints: eps, endpoints_digest: dig },
+    intended_after: { exists: true, sha256: "4".repeat(64), state: "complete", campaign_id: cid, endpoints: eps, endpoints_digest: dig },
+    after: { exists: true, sha256: "4".repeat(64), state: "complete", campaign_id: cid, endpoints: eps, endpoints_digest: dig }
+  });
+  steps.push({
+    kind: "writer_state", id: "writer_state:" + cid + ":on", state: "prepared", at: now,
+    target: "ledger/owner-select-writer-state.json", chain: null, backup: stagedBackupPath, backup_sha256: wBeforeSha, backup_bytes: 100,
+    before: { exists: true, sha256: wBeforeSha, state: "partial", campaign_id: cid, endpoints_digest: dig, revision: 1 },
+    intended_after: { exists: true, sha256: "5".repeat(64), state: "on", campaign_id: cid, endpoints_digest: dig, revision: 2 }
+  });
+
+  const doc = {
+    schema_version: "1.4",
+    operation_kind: "owner_select_migration_b",
+    phase: "osm_b_strictening",
+    reason: "B fixture",
+    started_at: now,
+    updated_at: now,
+    token: tok,
+    notes: [],
+    steps
+  };
+  fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+  const activeLink = path.join(maintDir, "active");
+  try { fs.unlinkSync(activeLink); } catch {}
+  fs.symlinkSync(tok, activeLink);
+  return {
+    capCampaignSeal: { token: tok, stepId: "campaign:" + cid + ":seal" },
+    capWriterOn: { token: tok, stepId: "writer_state:" + cid + ":on" }
+  };
+}
+
 test("R50 §二 owner-select-state：campaign 与 writer-state 文件合同与读写原语", () => {
   // 1. campaignIdFor & endpointsDigest
   const tok1 = "00000000-0000-4000-8000-000000000001";
@@ -33906,7 +34048,9 @@ test("R50 §二 owner-select-state：campaign 与 writer-state 文件合同与�
   const ledgerDir = path.join(tmpHome, "ledger");
   fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(ledgerDir, 0o700);
-  const env = { FEISHU_BRIDGE_LEDGER_DIR: ledgerDir };
+  const maintDir = path.join(tmpHome, "maintenance");
+  fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+  const env = { FEISHU_BRIDGE_LEDGER_DIR: ledgerDir, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir };
 
   assert.equal(campaignPath(env), path.join(ledgerDir, "owner-select-campaign.json"));
   assert.equal(writerStatePath(env), path.join(ledgerDir, "owner-select-writer-state.json"));
@@ -33932,7 +34076,7 @@ test("R50 §二 owner-select-state：campaign 与 writer-state 文件合同与�
     pending_joins: [{
       endpoint_id: "endpoint_333333333333333333333333",
       at: "2026-09-07T10:00:00.000Z",
-      init_chain: "chain-1",
+      init_chain: "claude",
       init_request_key: "req-1",
       init_operation_token: tok1
     }],
@@ -33952,21 +34096,24 @@ test("R50 §二 owner-select-state：campaign 与 writer-state 文件合同与�
   assert.notEqual(campaignDocProblem({ ...cDocValid, endpoints: [eps[0], eps[0]] }), null, "重复 endpoints");
   assert.notEqual(campaignDocProblem({ ...cDocValid, endpoints_digest: "a".repeat(64) }), null, "digest 不符");
   assert.notEqual(campaignDocProblem({ ...cDocValid, state: "sealed", pending_joins: cDocValid.pending_joins }), null, "sealed 时 pending_joins 非空");
-  assert.notEqual(campaignDocProblem({ ...cDocValid, pending_joins: [{ endpoint_id: eps[0], at: "2026-09-07T10:00:00.000Z" }] }), null, "pending 与 endpoints 相交");
+  assert.notEqual(campaignDocProblem({ ...cDocValid, pending_joins: [{ endpoint_id: eps[0], at: "2026-09-07T10:00:00.000Z", init_chain: "claude", init_request_key: "req-1", init_operation_token: tok1 }] }), null, "pending 与 endpoints 相交");
   assert.notEqual(campaignDocProblem({ ...cDocValid, members: {} }), null, "members 键集不符");
   assert.notEqual(campaignDocProblem({ ...cDocValid, revision: 0 }), null, "revision 非正整数");
 
+  // 设置维护 fixture A
+  const { capCampaignOpen, capWriterPartial } = setupMaintFixtureA({ maintDir, tok: tok1, cid: cid1, eps });
+
   // 写 campaign: CAS 校验
-  const casBad1 = writeCampaignState({ env, expectedSha256: "a".repeat(64), doc: cDocValid });
+  const casBad1 = writeCampaignState({ env, expectedSha256: "a".repeat(64), doc: cDocValid, capability: capCampaignOpen });
   assert.equal(casBad1.ok, false);
   assert.equal(casBad1.reason, "cas_mismatch");
 
   // 首写 revision 必为 1
-  const revBad1 = writeCampaignState({ env, expectedSha256: null, doc: { ...cDocValid, revision: 2 } });
+  const revBad1 = writeCampaignState({ env, expectedSha256: null, doc: { ...cDocValid, revision: 2 }, capability: capCampaignOpen });
   assert.equal(revBad1.ok, false);
 
   // 首写成功
-  const cWrite1 = writeCampaignState({ env, expectedSha256: null, doc: cDocValid });
+  const cWrite1 = writeCampaignState({ env, expectedSha256: null, doc: cDocValid, capability: capCampaignOpen });
   assert.equal(cWrite1.ok, true);
   assert.equal(cWrite1.exists, true);
   assert.equal(cWrite1.state, "open");
@@ -33995,7 +34142,11 @@ test("R50 §二 owner-select-state：campaign 与 writer-state 文件合同与�
     pending_joins: [],
     revision: 2
   };
-  const cWrite2 = writeCampaignState({ env, expectedSha256: cWrite1.sha256, doc: cDocSealed });
+  const tok2 = "00000000-0000-4000-8000-000000000002";
+  const { capCampaignSeal, capWriterOn } = setupMaintFixtureB({
+    maintDir, tok: tok2, cid: cid1, eps, cBeforeSha: cWrite1.sha256, wBeforeSha: "0".repeat(64)
+  });
+  const cWrite2 = writeCampaignState({ env, expectedSha256: cWrite1.sha256, doc: cDocSealed, capability: capCampaignSeal });
   assert.equal(cWrite2.ok, true);
   assert.equal(cWrite2.state, "sealed");
 
@@ -34038,12 +34189,13 @@ test("R50 §二 owner-select-state：campaign 与 writer-state 文件合同与�
   assert.notEqual(writerStateDocProblem({ ...wDocOn, revision: 0 }), null, "revision 必须正整数");
 
   // 写 writer-state: CAS 校验
-  const casBadW = writeWriterState({ env, expectedSha256: "b".repeat(64), doc: wDocPartial });
+  const casBadW = writeWriterState({ env, expectedSha256: "b".repeat(64), doc: wDocPartial, capability: capWriterPartial });
   assert.equal(casBadW.ok, false);
   assert.equal(casBadW.reason, "cas_mismatch");
 
-  // 写 partial
-  const wWrite1 = writeWriterState({ env, expectedSha256: null, doc: wDocPartial });
+  // 写 partial（需要重新切回 A fixture，因为前面切到 B 了）
+  setupMaintFixtureA({ maintDir, tok: tok1, cid: cid1, eps });
+  const wWrite1 = writeWriterState({ env, expectedSha256: null, doc: wDocPartial, capability: capWriterPartial });
   assert.equal(wWrite1.ok, true);
   assert.equal(wWrite1.state, "partial");
   assert.equal(wWrite1.revision, 1);
@@ -34060,8 +34212,9 @@ test("R50 §二 owner-select-state：campaign 与 writer-state 文件合同与�
     revision: 1
   }, "读回 writer state partial");
 
-  // 写 on (CAS 匹配，revision 2)
-  const wWrite2 = writeWriterState({ env, expectedSha256: wWrite1.sha256, doc: wDocOn });
+  // 写 on (CAS 匹配，revision 2，切到 B fixture)
+  setupMaintFixtureB({ maintDir, tok: tok2, cid: cid1, eps, cBeforeSha: cWrite2.sha256, wBeforeSha: wWrite1.sha256 });
+  const wWrite2 = writeWriterState({ env, expectedSha256: wWrite1.sha256, doc: wDocOn, capability: capWriterOn });
   assert.equal(wWrite2.ok, true);
   assert.equal(wWrite2.state, "on");
   assert.equal(wWrite2.revision, 2);
@@ -34500,7 +34653,11 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
   assert.equal(readSymlink.state, "unreadable", "symlink 根读作 unreadable");
   assert.match(readSymlink.problem, /root_symlink|root_not_canonical/u);
 
-  const envOk = { FEISHU_BRIDGE_LEDGER_DIR: realLedgerDir };
+  const maintDirR2 = path.join(tmpBase, "maintenance");
+  fs.mkdirSync(maintDirR2, { mode: 0o700 });
+  const envOk = { FEISHU_BRIDGE_LEDGER_DIR: realLedgerDir, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDirR2 };
+  const { capCampaignOpen: cap1 } = setupMaintFixtureA({ maintDir: maintDirR2, tok: tok1, cid: cid1, eps });
+
   const dummyDoc = {
     schema_version: "owner-select-campaign-1",
     campaign_id: cid1,
@@ -34510,7 +34667,7 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
     pending_joins: [{
       endpoint_id: "endpoint_333333333333333333333333",
       at: "2026-09-07T10:00:00.000Z",
-      init_chain: "chain-1",
+      init_chain: "claude",
       init_request_key: "req-1",
       init_operation_token: tok1
     }],
@@ -34537,31 +34694,39 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
   fs.unlinkSync(campFile);
 
   // 1.98 MB 文档（> 1 MiB）落盘前核大小必拒，不留文件（合法的超长 pending_joins 字段使体积超限）
+  const largePendingJoins = [];
+  for (let i = 0; i < 6000; i++) {
+    const hex = i.toString(16).padStart(24, "0");
+    largePendingJoins.push({
+      endpoint_id: "endpoint_" + hex,
+      at: "2026-09-07T10:00:00.000Z",
+      init_chain: "claude",
+      init_request_key: "req-" + hex,
+      init_operation_token: tok1
+    });
+  }
   const largeDoc = {
     ...dummyDoc,
-    pending_joins: [{
-      ...dummyDoc.pending_joins[0],
-      init_request_key: "x".repeat(1024 * 1024 * 2)
-    }]
+    pending_joins: largePendingJoins
   };
   assert.equal(campaignDocProblem(largeDoc), null, "超大文档形状自身合法，仅体积超限");
-  const writeLarge = writeCampaignState({ env: envOk, expectedSha256: null, doc: largeDoc });
+  const writeLarge = writeCampaignState({ env: envOk, expectedSha256: null, doc: largeDoc, capability: cap1 });
   assert.equal(writeLarge.ok, false);
   assert.equal(writeLarge.commit, "not_committed");
   assert.equal(writeLarge.reason, "document_too_large");
   assert.equal(fs.existsSync(campFile), false, "超限文档不落盘且不新建文件");
 
   // 写前异常结构化返回，不裸抛
-  const writeThrow = writeCampaignState({ env: envOk, expectedSha256: null, doc: { bad: true } });
+  const writeThrow = writeCampaignState({ env: envOk, expectedSha256: null, doc: { bad: true }, capability: cap1 });
   assert.equal(writeThrow.ok, false);
   assert.equal(writeThrow.commit, "not_committed");
   assert.equal(writeThrow.reason, "invalid_doc");
 
   // 锁内 CAS + 两写方同 SHA 并发只一方成功
-  const write1 = writeCampaignState({ env: envOk, expectedSha256: null, doc: dummyDoc });
+  const write1 = writeCampaignState({ env: envOk, expectedSha256: null, doc: dummyDoc, capability: cap1 });
   assert.equal(write1.ok, true);
   assert.equal(write1.commit, "committed");
-  const write2SameSha = writeCampaignState({ env: envOk, expectedSha256: null, doc: dummyDoc });
+  const write2SameSha = writeCampaignState({ env: envOk, expectedSha256: null, doc: dummyDoc, capability: cap1 });
   assert.equal(write2SameSha.ok, false);
   assert.equal(write2SameSha.commit, "not_committed");
   assert.equal(write2SameSha.reason, "cas_mismatch");
@@ -34570,7 +34735,7 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
   const shaBeforeLargeOverwrite = readCampaignState(envOk).sha256;
   assert.equal(shaBeforeLargeOverwrite, write1.sha256);
   const largeDocOverwrite = { ...largeDoc, revision: 2 };
-  const writeLargeOverwrite = writeCampaignState({ env: envOk, expectedSha256: write1.sha256, doc: largeDocOverwrite });
+  const writeLargeOverwrite = writeCampaignState({ env: envOk, expectedSha256: write1.sha256, doc: largeDocOverwrite, capability: cap1 });
   assert.equal(writeLargeOverwrite.ok, false);
   assert.equal(writeLargeOverwrite.commit, "not_committed");
   assert.equal(writeLargeOverwrite.reason, "document_too_large");
@@ -34580,12 +34745,22 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
   const lockDir = path.join(realLedgerDir, "owner-select-state.lock");
   const heldLock = acquireLockUngated(lockDir, { reapUnrecognized: false });
   assert.equal(heldLock.ok, true);
-  const writeLockBusy = writeCampaignState({ env: envOk, expectedSha256: write1.sha256, doc: { ...dummyDoc, revision: 2 } });
+  const writeLockBusy = writeCampaignState({ env: envOk, expectedSha256: write1.sha256, doc: { ...dummyDoc, revision: 2 }, capability: cap1 });
   assert.equal(writeLockBusy.ok, false);
   assert.equal(writeLockBusy.commit, "not_committed");
   releasePublishLock(lockDir, { expectedToken: heldLock.token });
 
   // fsync EIO 注入：rename 成功而目录 fsync 失败 → committed_durability_uncertain
+  const tok2R2 = "00000000-0000-4000-8000-000000000002";
+  const { capCampaignSeal: cap2R2 } = setupMaintFixtureB({
+    maintDir: maintDirR2, tok: tok2R2, cid: cid1, eps, cBeforeSha: write1.sha256, wBeforeSha: "0".repeat(64)
+  });
+  const dummyDocSealed = {
+    ...dummyDoc,
+    state: "sealed",
+    pending_joins: [],
+    revision: 2
+  };
   const origFsync = fs.fsyncSync;
   let failDirFsync = false;
   fs.fsyncSync = function(fd) {
@@ -34604,7 +34779,7 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
   };
   try {
     failDirFsync = true;
-    const writeEio = writeCampaignState({ env: envOk, expectedSha256: write1.sha256, doc: { ...dummyDoc, revision: 2 } });
+    const writeEio = writeCampaignState({ env: envOk, expectedSha256: write1.sha256, doc: dummyDocSealed, capability: cap2R2 });
     assert.equal(writeEio.ok, false);
     assert.equal(writeEio.commit, "committed_durability_uncertain");
     assert.equal(writeEio.reason, "dir_fsync_failed");
@@ -34876,7 +35051,7 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
   const pjValid = {
     endpoint_id: "endpoint_333333333333333333333333",
     at: "2026-09-07T10:00:00.000Z",
-    init_chain: "chain-1",
+    init_chain: "claude",
     init_request_key: "req-1",
     init_operation_token: tok1
   };
@@ -35125,7 +35300,21 @@ test("R50 返修四 3 P1 + 3 P2：finalize 一次性不抛、维护窄事务 cap
   assert.equal(emptyCapRes.ok, false);
   assert.equal(emptyCapRes.reason, "maintenance_capability_required");
 
-  // 搭建合法 maintenance fixture
+  // 搭建合法 maintenance fixture（1.4 osm_a_upgrading 前向段要求完整 step 集）
+  const ep = eps[0];
+  const epsSingle = [ep];
+  const digSingle = endpointsDigest(epsSingle);
+  const baseCampaignDocSingle = {
+    ...baseCampaignDoc,
+    endpoints: epsSingle,
+    endpoints_digest: digSingle,
+    members: {
+      [ep]: { schema_version: "1.0", legacy_proof_count: 0, null_b1_count: 0 }
+    }
+  };
+
+  const stagedBackupPath = path.join(maintDir, tok + ".staged", "backup.json");
+  const mintBlobPath = path.join(maintDir, tok + ".staged", "intended", "mint-" + ep + ".json");
   const stepCampaignOpenId = "campaign:" + cid + ":open";
   const stepWriterPartialId = "writer_state:" + cid + ":partial";
   const journalDocValid = {
@@ -35140,18 +35329,29 @@ test("R50 返修四 3 P1 + 3 P2：finalize 一次性不抛、维护窄事务 cap
     steps: [
       ...enterSteps,
       {
-        at: now, backup: null, backup_bytes: null, backup_sha256: null,
+        kind: "campaign", id: stepCampaignOpenId, state: "prepared", at: now,
+        target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null,
         before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null },
-        chain: null, id: stepCampaignOpenId,
-        intended_after: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: cid, endpoints: eps, endpoints_digest: dig },
-        kind: "campaign", state: "prepared", target: "ledger/owner-select-campaign.json"
+        intended_after: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: cid, endpoints: epsSingle, endpoints_digest: digSingle }
       },
       {
-        at: now, backup: null, backup_bytes: null, backup_sha256: null,
+        kind: "schema_endpoint", id: `schema_endpoint:${ep}:transition`, state: "prepared", at: now,
+        target: `ledger/${ep}/ledger.json`, chain: null, backup: stagedBackupPath, backup_sha256: "0".repeat(64), backup_bytes: 100,
+        before: { schema_version: "1.0", revision: 1, ledger_sha256: "0".repeat(64) },
+        intended_after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: "1".repeat(64) }
+      },
+      {
+        kind: "mint", id: `mint:${ep}`, state: "prepared", at: now,
+        target: `ledger/${ep}/ledger.json`, chain: null, backup: stagedBackupPath, backup_sha256: "1".repeat(64), backup_bytes: 100,
+        before: { revision: 2, null_b1_count: 2, ledger_sha256: "1".repeat(64) },
+        intended_after: { revision: 3, null_b1_count: 0, ledger_sha256: "2".repeat(64) },
+        intended_blob: { path: mintBlobPath, bytes: 50, sha256: "0".repeat(64) }
+      },
+      {
+        kind: "writer_state", id: stepWriterPartialId, state: "prepared", at: now,
+        target: "ledger/owner-select-writer-state.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null,
         before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 },
-        chain: null, id: stepWriterPartialId,
-        intended_after: { exists: true, sha256: "2".repeat(64), state: "partial", campaign_id: cid, endpoints_digest: dig, revision: 1 },
-        kind: "writer_state", state: "prepared", target: "ledger/owner-select-writer-state.json"
+        intended_after: { exists: true, sha256: "2".repeat(64), state: "partial", campaign_id: cid, endpoints_digest: digSingle, revision: 1 }
       }
     ]
   };
@@ -35165,12 +35365,12 @@ test("R50 返修四 3 P1 + 3 P2：finalize 一次性不抛、维护窄事务 cap
 
   // (b) active 不匹配拒
   const badActiveCap = { token: "00000000-0000-4000-8000-000000000009", stepId: stepCampaignOpenId };
-  const rBadActive = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDoc, capability: badActiveCap });
+  const rBadActive = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDocSingle, capability: badActiveCap });
   assert.equal(rBadActive.ok, false);
   assert.equal(rBadActive.reason, "maintenance_capability_required");
 
   // (c) intended_after 与 doc 投影不匹配拒
-  const badProjDoc = { ...baseCampaignDoc, state: "sealed" };
+  const badProjDoc = { ...baseCampaignDocSingle, state: "sealed" };
   const rBadProj = writeCampaignState({ env, expectedSha256: null, doc: badProjDoc, capability: capCampaignValid });
   assert.equal(rBadProj.ok, false);
   assert.equal(rBadProj.reason, "maintenance_capability_required");
@@ -35180,11 +35380,11 @@ test("R50 返修四 3 P1 + 3 P2：finalize 一次性不抛、维护窄事务 cap
     ...journalDocValid,
     steps: journalDocValid.steps.map(s => s.id === stepCampaignOpenId ? {
       ...s,
-      before: { exists: true, sha256: "0".repeat(64), state: "open", campaign_id: cid, endpoints: eps, endpoints_digest: dig }
+      before: { exists: true, sha256: "0".repeat(64), state: "open", campaign_id: cid, endpoints: epsSingle, endpoints_digest: digSingle }
     } : s)
   };
   fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(journalDocBeforeMismatch, null, 2) + "\n", { mode: 0o600 });
-  const rBeforeMismatch = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDoc, capability: capCampaignValid });
+  const rBeforeMismatch = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDocSingle, capability: capCampaignValid });
   assert.equal(rBeforeMismatch.ok, false);
   assert.equal(rBeforeMismatch.reason, "maintenance_capability_required");
 
@@ -35210,7 +35410,7 @@ test("R50 返修四 3 P1 + 3 P2：finalize 一次性不抛、维护窄事务 cap
   };
   try {
     failTmpFsync = true;
-    const rTmpFail = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDoc, capability: capCampaignValid });
+    const rTmpFail = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDocSingle, capability: capCampaignValid });
     assert.equal(rTmpFail.ok, false);
     assert.equal(rTmpFail.commit, "not_committed");
     assert.equal(rTmpFail.reason, "tmp_write_failed");
@@ -35224,19 +35424,19 @@ test("R50 返修四 3 P1 + 3 P2：finalize 一次性不抛、维护窄事务 cap
   // 5. 【P1-1】Finalize 一次性不抛，提交后释放异常绝不折叠成 not_committed
   // 注入释放锁异常：模拟 renameLanded 后 releasePublishLock 抛出 EIO
   const lockDir = path.join(ledgerDir, "owner-select-state.lock");
-  const origRmdir = fs.rmdirSync;
+  const origRm = fs.rmSync;
   let throwLockRelease = false;
-  fs.rmdirSync = function(p, opts) {
-    if (throwLockRelease && String(p).includes("owner-select-state.lock")) {
+  fs.rmSync = function(p, opts) {
+    if (throwLockRelease && String(p) === lockDir) {
       const err = new Error("EIO: lock release error");
       err.code = "EIO";
       throw err;
     }
-    return origRmdir.apply(this, arguments);
+    return origRm.apply(this, arguments);
   };
   try {
     throwLockRelease = true;
-    const rLockResidue = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDoc, capability: capCampaignValid });
+    const rLockResidue = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDocSingle, capability: capCampaignValid });
     assert.notEqual(rLockResidue.commit, "not_committed", "提交后释放锁异常绝不折叠成 not_committed");
     assert.equal(rLockResidue.commit, "lock_residue");
     assert.equal(rLockResidue.reason, "lock_release_residue");
@@ -35244,10 +35444,11 @@ test("R50 返修四 3 P1 + 3 P2：finalize 一次性不抛、维护窄事务 cap
     assert.equal(diskDoc.exists, true, "盘上已落地的 campaign 必须可读");
     assert.equal(diskDoc.state, "open");
   } finally {
-    fs.rmdirSync = origRmdir;
+    fs.rmSync = origRm;
     throwLockRelease = false;
-    // 清理测试锁
-    try { fs.rmdirSync(lockDir); } catch { /* 忽略 */ }
+    // 清理测试锁与可能遗留的 reap 锁
+    try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    try { fs.rmSync(lockDir + ".reap", { recursive: true, force: true }); } catch { /* 忽略 */ }
     // 清理盘上已写文件方便后续测试
     const cFile = path.join(ledgerDir, "owner-select-campaign.json");
     if (fs.existsSync(cFile)) fs.unlinkSync(cFile);
@@ -35285,7 +35486,7 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
     runnerScript,
     driverScript,
     JSON.stringify(env),
-    JSON.stringify(baseCampaignDoc),
+    JSON.stringify(baseCampaignDocSingle),
     JSON.stringify(capCampaignValid)
   ], { encoding: "utf-8" });
 

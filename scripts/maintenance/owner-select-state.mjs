@@ -7,20 +7,39 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { canonKey, sha256, ledgerRootFor, validateLedgerRoot } from "../topic-agent-ledger.mjs";
+import { canonKey, sha256, ledgerRootFor, validateLedgerRoot, REQUEST_KEY_SHAPE } from "../topic-agent-ledger.mjs";
 import { acquireLockUngated, commitWhileHeld, releasePublishLock } from "../registry.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
 import { dirFsyncIgnorable } from "./dir-fsync.mjs";
+import {
+  CAMPAIGN_STATES,
+  WRITER_STATES,
+  CAMPAIGN_ID_SHAPE,
+  campaignIdFor,
+  endpointsDigest,
+} from "./owner-select-derived.mjs";
+import {
+  maintenanceDir,
+  readActive,
+  readJournal,
+  OWNER_SELECT_OPERATION_KINDS,
+  OSM_FORWARD_PHASES,
+} from "./journal.mjs";
+
+export {
+  CAMPAIGN_STATES,
+  WRITER_STATES,
+  CAMPAIGN_ID_SHAPE,
+  campaignIdFor,
+  endpointsDigest,
+};
 
 export const CAMPAIGN_FILE = "owner-select-campaign.json";
 export const WRITER_STATE_FILE = "owner-select-writer-state.json";
 export const CAMPAIGN_SCHEMA = "owner-select-campaign-1";
 export const WRITER_STATE_SCHEMA = "owner-select-writer-state-1";
-export const CAMPAIGN_STATES = Object.freeze(["open", "sealed", "complete"]);
-export const WRITER_STATES = Object.freeze(["off", "partial", "on"]);
 export const MEMBER_SCHEMAS = Object.freeze(["1.0", "1.1-transition", "1.1"]);
 
-export const CAMPAIGN_ID_SHAPE = /^osc_[0-9a-f]{32}$/u;
 export const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
 export const SHA_SHAPE = /^[0-9a-f]{64}$/u;
 export const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -30,16 +49,6 @@ const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
 const keysOf = (o) => Object.keys(o).sort().join(",");
 const errCode = (err) => String(err?.code ?? err?.message ?? err);
 const sha256Hex = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
-
-/** campaignId 派生公式（§二.1）："osc_" + sha256(canonKey({domain:"owner_select_campaign_v1", token})).slice(0,32) */
-export const campaignIdFor = (token) =>
-  "osc_" + sha256(canonKey({ domain: "owner_select_campaign_v1", token })).slice(0, 32);
-
-/** endpointsDigest 派生公式（§二.1）：sha256(canonKey(endpoints))（endpoints 已排序去重） */
-export const endpointsDigest = (endpoints) => {
-  if (!Array.isArray(endpoints)) throw new Error("endpoints 必须是数组");
-  return sha256(canonKey(endpoints));
-};
 
 export const campaignPath = (env = process.env) => {
   const root = ledgerRootFor(env);
@@ -84,8 +93,8 @@ export function campaignDocProblem(doc) {
     }
     if (typeof pj.endpoint_id !== "string" || !ENDPOINT_SHAPE.test(pj.endpoint_id)) return "pending_join endpoint_id 形状不对";
     if (!isCanonicalIso(pj.at)) return "pending_join at 不是规范 ISO 时间";
-    if (typeof pj.init_chain !== "string" || pj.init_chain.length === 0) return "pending_join init_chain 必须是非空字符串";
-    if (typeof pj.init_request_key !== "string" || pj.init_request_key.length === 0) return "pending_join init_request_key 必须是非空字符串";
+    if (pj.init_chain !== "claude" && pj.init_chain !== "codex") return "pending_join init_chain 必须是 claude 或 codex";
+    if (typeof pj.init_request_key !== "string" || !REQUEST_KEY_SHAPE.test(pj.init_request_key)) return "pending_join init_request_key 形状不对";
     if (typeof pj.init_operation_token !== "string" || !UUID_SHAPE.test(pj.init_operation_token)) return "pending_join init_operation_token 不是合法的 operation token";
     if (doc.endpoints.includes(pj.endpoint_id)) return "pending_join 与 committed endpoints 相交: " + pj.endpoint_id;
     if (pjIds.has(pj.endpoint_id)) return "pending_joins 包含重复 endpoint_id: " + pj.endpoint_id;
@@ -279,11 +288,112 @@ export function readWriterStateDocVerified(env = process.env) {
   return readVerifiedDoc({ file: writerStatePath(env), docValidator: writerStateDocProblem });
 }
 
+const OSM_KIND_TO_FORWARD_PHASE = Object.freeze({
+  owner_select_migration_a: "osm_a_upgrading",
+  owner_select_migration_b: "osm_b_strictening",
+  owner_select_migration_direct: "osm_direct",
+});
+
+/**
+ * 维护窄事务 capability 受验逻辑（PR #135 Codex 二轮 P1-2）:
+ * 核 active === token, journal 1.4 journalProblem === null,
+ * operation_kind ∈ 三新种, phase ∈ forward 段,
+ * stepId 存在且 prepared,
+ * step.intended_after 与本次 doc 的投影逐字相等：
+ *   - campaign: state, campaign_id, endpoints, endpoints_digest
+ *   - writer: state, campaign_id, endpoints_digest, revision
+ * step.before.{exists, sha256} === 现场
+ */
+function verifyMaintenanceCapability({ capability, env, targetKind, doc, beforeExists, beforeSha256 }) {
+  if (!isObj(capability) || typeof capability.token !== "string" || !UUID_SHAPE.test(capability.token) || typeof capability.stepId !== "string" || capability.stepId.length === 0) {
+    return { ok: false, reason: "maintenance_capability_required", why: "capability 缺失或形状无效" };
+  }
+
+  const mDir = maintenanceDir(env);
+  if (!mDir) {
+    return { ok: false, reason: "maintenance_capability_required", why: "维护目录取不到" };
+  }
+
+  const act = readActive({ dir: mDir });
+  if (act.state !== "active" || act.token !== capability.token) {
+    return { ok: false, reason: "maintenance_capability_required", why: "active token 不匹配或未处于 active (当前: " + (act.token ?? act.state) + ", 期望: " + capability.token + ")" };
+  }
+
+  const jRes = readJournal({ dir: mDir, token: capability.token, env });
+  if (jRes.state !== "valid") {
+    return { ok: false, reason: "maintenance_capability_required", why: "journal 不是 valid 状态: " + (jRes.why ?? jRes.state) };
+  }
+
+  const jDoc = jRes.doc;
+  if (jDoc.schema_version !== "1.4") {
+    return { ok: false, reason: "maintenance_capability_required", why: "journal schema_version 不是 1.4 (当前: " + jDoc.schema_version + ")" };
+  }
+
+  if (!OWNER_SELECT_OPERATION_KINDS.includes(jDoc.operation_kind)) {
+    return { ok: false, reason: "maintenance_capability_required", why: "operation_kind 不是 owner_select 三新种之一 (当前: " + jDoc.operation_kind + ")" };
+  }
+
+  const expectedPhase = OSM_KIND_TO_FORWARD_PHASE[jDoc.operation_kind];
+  if (!OSM_FORWARD_PHASES.includes(jDoc.phase) || jDoc.phase !== expectedPhase) {
+    return { ok: false, reason: "maintenance_capability_required", why: "operation 阶段不在 forward 段 (当前 phase: " + jDoc.phase + ", 期望: " + expectedPhase + ")" };
+  }
+
+  if (!Array.isArray(jDoc.steps)) {
+    return { ok: false, reason: "maintenance_capability_required", why: "journal steps 不是数组" };
+  }
+
+  const step = jDoc.steps.find((s) => s.id === capability.stepId);
+  if (!step) {
+    return { ok: false, reason: "maintenance_capability_required", why: "stepId 不存在: " + capability.stepId };
+  }
+
+  if (step.state !== "prepared") {
+    return { ok: false, reason: "maintenance_capability_required", why: "step 不是 prepared 状态 (当前: " + step.state + ")" };
+  }
+
+  if (targetKind === "campaign") {
+    if (step.kind !== "campaign") {
+      return { ok: false, reason: "maintenance_capability_required", why: "step kind 不是 campaign (当前: " + step.kind + ")" };
+    }
+    const ia = step.intended_after;
+    if (!isObj(ia) || ia.exists !== true
+        || ia.state !== doc.state
+        || ia.campaign_id !== doc.campaign_id
+        || ia.endpoints_digest !== doc.endpoints_digest
+        || canonKey(ia.endpoints) !== canonKey(doc.endpoints)) {
+      return { ok: false, reason: "maintenance_capability_required", why: "step intended_after 与本次 campaign doc 投影不匹配" };
+    }
+  } else if (targetKind === "writer_state") {
+    if (step.kind !== "writer_state") {
+      return { ok: false, reason: "maintenance_capability_required", why: "step kind 不是 writer_state (当前: " + step.kind + ")" };
+    }
+    const ia = step.intended_after;
+    if (!isObj(ia) || ia.exists !== true
+        || ia.state !== doc.state
+        || ia.campaign_id !== doc.campaign_id
+        || ia.endpoints_digest !== doc.endpoints_digest
+        || ia.revision !== doc.revision) {
+      return { ok: false, reason: "maintenance_capability_required", why: "step intended_after 与本次 writer-state doc 投影不匹配" };
+    }
+  } else {
+    return { ok: false, reason: "maintenance_capability_required", why: "未知 targetKind: " + targetKind };
+  }
+
+  // 核 before 现场
+  const stepBeforeExists = Boolean(step.before?.exists);
+  const stepBeforeSha = step.before?.sha256 ?? null;
+  if (stepBeforeExists !== Boolean(beforeExists) || stepBeforeSha !== (beforeSha256 ?? null)) {
+    return { ok: false, reason: "maintenance_capability_required", why: "step before 现场不匹配 (step.before={exists:" + stepBeforeExists + ",sha256:" + stepBeforeSha + "}, 现场={exists:" + beforeExists + ",sha256:" + beforeSha256 + "})" };
+  }
+
+  return { ok: true };
+}
+
 /**
  * 统一写原语：
- * 锁内 CAS + fenced rename + 落盘前核大小 ≤ 1 MiB + 封闭 commit 联合。
+ * 锁内 CAS + fenced rename + 落盘前核大小 ≤ 1 MiB + 维护窄事务 capability 受验 + 封闭 commit 联合。
  */
-function writeStateFile({ env, expectedSha256, doc, fileName, docValidator, formatOutput }) {
+function writeStateFile({ env, expectedSha256, doc, capability, fileName, targetKind, docValidator, formatOutput }) {
   try {
     const prob = docValidator(doc);
     if (prob !== null) return { ok: false, commit: "not_committed", reason: "invalid_doc", why: prob };
@@ -305,6 +415,13 @@ function writeStateFile({ env, expectedSha256, doc, fileName, docValidator, form
     }
     const root = rootVal.root;
 
+    if (!capability) {
+      return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "capability 缺失" };
+    }
+    if (!isObj(capability) || typeof capability.token !== "string" || !UUID_SHAPE.test(capability.token) || typeof capability.stepId !== "string" || capability.stepId.length === 0) {
+      return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "capability 形状无效" };
+    }
+
     const lockDir = path.join(root, "owner-select-state.lock");
     const lock = acquireLockUngated(lockDir, { reapUnrecognized: false });
     if (lock.ok !== true) {
@@ -312,15 +429,32 @@ function writeStateFile({ env, expectedSha256, doc, fileName, docValidator, form
       return { ok: false, commit: "not_committed", reason, why: String(lock.why ?? lock.reason ?? ""), lock: lockDir };
     }
 
-    const releaseSafe = () => releasePublishLock(lockDir, { expectedToken: lock.token });
-
     let renameLanded = false;
+    let lockReleased = false;
+    let lockResidue = null;
+
+    const finalizeLockOnce = () => {
+      if (lockReleased) return lockResidue;
+      lockReleased = true;
+      try {
+        const rel = releasePublishLock(lockDir, { expectedToken: lock.token });
+        const residue = rel.ok !== true ? String(rel.reason ?? "release_publish_lock") : rel.absent === true ? "absent" : rel.reapUncleared ? "reap_uncleared" : null;
+        if (residue !== null) {
+          lockResidue = residue;
+        }
+      } catch (err) {
+        lockResidue = "lock_release_throw: " + errCode(err);
+      }
+      return lockResidue;
+    };
 
     const exitWithLock = (res) => {
-      const rel = releaseSafe();
-      const residue = rel.ok !== true ? String(rel.reason ?? "release_publish_lock") : rel.absent === true ? "absent" : rel.reapUncleared ? "reap_uncleared" : null;
+      const residue = finalizeLockOnce();
       if (residue !== null) {
-        return { ok: false, commit: "lock_residue", reason: "lock_release_residue", why: residue, lock: lockDir, target: fileName };
+        if (renameLanded) {
+          return { ok: false, commit: "lock_residue", reason: "lock_release_residue", why: residue, lock: lockDir, target: fileName };
+        }
+        return { ok: false, commit: "not_committed", reason: res.reason, why: res.why, lockResidue: residue, lock: lockDir };
       }
       return res;
     };
@@ -350,20 +484,47 @@ function writeStateFile({ env, expectedSha256, doc, fileName, docValidator, form
         return exitWithLock({ ok: false, commit: "not_committed", reason: "revision_mismatch", why: "doc.revision (" + doc.revision + ") 必须等于 before.revision + 1 (" + (beforeRevision + 1) + ")" });
       }
 
+      // 核验 maintenance capability（窄事务）
+      const capCheck = verifyMaintenanceCapability({ capability, env, targetKind, doc, beforeExists, beforeSha256: beforeSha });
+      if (!capCheck.ok) {
+        return exitWithLock({ ok: false, commit: "not_committed", reason: capCheck.reason, why: capCheck.why });
+      }
+
       const tmpName = "." + fileName + ".tmp." + process.pid + "." + crypto.randomBytes(8).toString("hex");
       const tmpPath = path.join(root, tmpName);
       let fd = null;
+      let tmpResidue = null;
+      const cleanupTmp = () => {
+        try {
+          if (fs.existsSync(tmpPath)) {
+            fs.unlinkSync(tmpPath);
+          }
+        } catch (uErr) {
+          tmpResidue = { path: tmpPath, reason: "tmp_unlink_failed", why: errCode(uErr) };
+        }
+      };
+
       try {
         fd = fs.openSync(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
         fs.fchmodSync(fd, 0o600);
         const wst = fs.fstatSync(fd);
         if (!wst.isFile() || wst.nlink !== 1 || (wst.mode & 0o777) !== 0o600) {
-          return exitWithLock({ ok: false, commit: "not_committed", reason: "tmp_file_invalid", why: "tmp 文件属性异常" });
+          try { fs.closeSync(fd); fd = null; } catch { /* 已关 */ }
+          cleanupTmp();
+          const out = { ok: false, commit: "not_committed", reason: "tmp_file_invalid", why: "tmp 文件属性异常" };
+          if (tmpResidue) out.residue = tmpResidue;
+          return exitWithLock(out);
         }
         fs.writeFileSync(fd, payload);
         fs.fsyncSync(fd);
       } catch (err) {
-        return exitWithLock({ ok: false, commit: "not_committed", reason: "tmp_write_failed", why: errCode(err) });
+        if (fd !== null) {
+          try { fs.closeSync(fd); fd = null; } catch { /* 已关 */ }
+        }
+        cleanupTmp();
+        const out = { ok: false, commit: "not_committed", reason: "tmp_write_failed", why: errCode(err) };
+        if (tmpResidue) out.residue = tmpResidue;
+        return exitWithLock(out);
       } finally {
         if (fd !== null) {
           try { fs.closeSync(fd); } catch { /* 已关 */ }
@@ -381,7 +542,7 @@ function writeStateFile({ env, expectedSha256, doc, fileName, docValidator, form
       });
 
       if (!fenced.ok || fenceErr !== null) {
-        try { fs.unlinkSync(tmpPath); } catch { /* 忽略 */ }
+        cleanupTmp();
         if (renameLanded) {
           return exitWithLock({ ok: false, commit: "committed_durability_uncertain", reason: "fenced_commit_failed", why: String(fenced.reason ?? fenceErr) });
         }
@@ -399,15 +560,21 @@ function writeStateFile({ env, expectedSha256, doc, fileName, docValidator, form
         return exitWithLock({ ok: false, commit: "committed_durability_uncertain", reason: "readback_failed", why: readBack.problem ?? "读回内容与写入 doc 不一致" });
       }
 
-      const rel = releaseSafe();
-      const residue = rel.ok !== true ? String(rel.reason ?? "release_publish_lock") : rel.absent === true ? "absent" : rel.reapUncleared ? "reap_uncleared" : null;
+      const residue = finalizeLockOnce();
       if (residue !== null) {
         return { ok: false, commit: "lock_residue", reason: "lock_release_residue", why: residue, lock: lockDir, target: fileName };
       }
 
       return formatOutput(readBack);
     } catch (innerErr) {
-      return exitWithLock({ ok: false, commit: renameLanded ? "committed_durability_uncertain" : "not_committed", reason: "io_error", why: errCode(innerErr) });
+      const residue = finalizeLockOnce();
+      if (renameLanded) {
+        if (residue !== null) {
+          return { ok: false, commit: "lock_residue", reason: "lock_release_residue", why: residue, lock: lockDir, target: fileName };
+        }
+        return { ok: false, commit: "committed_durability_uncertain", reason: "io_error", why: errCode(innerErr) };
+      }
+      return exitWithLock({ ok: false, commit: "not_committed", reason: "io_error", why: errCode(innerErr) });
     }
   } catch (outerErr) {
     return { ok: false, commit: "not_committed", reason: "unexpected_error", why: errCode(outerErr) };
@@ -417,15 +584,18 @@ function writeStateFile({ env, expectedSha256, doc, fileName, docValidator, form
 /**
  * 写 campaign 状态（§二.6 与 PR #135 P1-2/P1-3）：
  * 锁内 CAS；revision === before.revision + 1；落盘前核 ≤ 1 MiB；
+ * 维护窄事务 capability 受验；
  * 临时文件 O_EXCL 0600 写满 fsync → fenced rename → fsync 目录 → 读回受验；
  * 返回封闭联合 commit ∈ {not_committed, committed, committed_durability_uncertain, lock_residue}。
  */
-export function writeCampaignState({ env = process.env, expectedSha256 = null, doc }) {
+export function writeCampaignState({ env = process.env, expectedSha256 = null, doc, capability }) {
   return writeStateFile({
     env,
     expectedSha256,
     doc,
+    capability,
     fileName: CAMPAIGN_FILE,
+    targetKind: "campaign",
     docValidator: campaignDocProblem,
     formatOutput: (rb) => ({
       ok: true,
@@ -443,15 +613,18 @@ export function writeCampaignState({ env = process.env, expectedSha256 = null, d
 /**
  * 写 writer-state 状态（§二.6 与 PR #135 P1-2/P1-3）：
  * 锁内 CAS；revision === before.revision + 1；落盘前核 ≤ 1 MiB；
+ * 维护窄事务 capability 受验；
  * 临时文件 O_EXCL 0600 写满 fsync → fenced rename → fsync 目录 → 读回受验；
  * 返回封闭联合 commit ∈ {not_committed, committed, committed_durability_uncertain, lock_residue}。
  */
-export function writeWriterState({ env = process.env, expectedSha256 = null, doc }) {
+export function writeWriterState({ env = process.env, expectedSha256 = null, doc, capability }) {
   return writeStateFile({
     env,
     expectedSha256,
     doc,
+    capability,
     fileName: WRITER_STATE_FILE,
+    targetKind: "writer_state",
     docValidator: writerStateDocProblem,
     formatOutput: (rb) => ({
       ok: true,

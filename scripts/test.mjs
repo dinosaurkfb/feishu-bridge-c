@@ -36709,6 +36709,67 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     const r = TAL.mintSelectionHandles({ endpointId: EP51, capability: { kind: "mint_selection_handles", token: fxB.tok }, plan: {}, env: envB });
     assert.equal(r.reason, "maintenance_capability_required", "mint 在 _b journal 上拒（仅 _a）：" + JSON.stringify(r));
   }));
+
+  test("R51 §二 schemaUpgrade：transition 效果（四字段补显式 null）+ 边/变体一致 + strict 盘点 + 重放", () => r51WithRoot((root, dir) => {
+    const T51 = (i) => ({ runtime: "claude", project_root: "/p/r51/" + i, claude_session_id: "00000000-0000-4000-8000-" + String(i).padStart(12, "0") });
+    const r51Ok = (r, m) => { assert.ok(r.ok, m + "：" + JSON.stringify(r)); return r; };
+    // ── transition 正向：1.0 账本（2 B1 + 1 voided）→ 1.1-transition ──
+    r51Seed(dir);
+    const b1a = r51Ok(TAL.createB1({ endpointId: EP51, requestKey: "req_b1a", chatId: "oc_r51a", rootOm: "om_r51a", lineageId: "lin-a", bindingTarget: T51(1), now: Date.now() }), "B1a").result.created_id;
+    const b1b = r51Ok(TAL.createB1({ endpointId: EP51, requestKey: "req_b1b", chatId: "oc_r51b", rootOm: "om_r51b", lineageId: "lin-b", bindingTarget: T51(2), now: Date.now() }), "B1b").result.created_id;
+    r51Ok(TAL.voidPending({ endpointId: EP51, requestKey: "req_void1", b1Id: b1b, reason: "manual", now: Date.now() }), "void");
+    const L0 = TAL.loadLedger(dir, { endpointId: EP51 });
+    const fx = r51FixtureA({ root, ledgerSha: L0.sha256, ledgerSchema: L0.doc.schema_version, ledgerRevision: L0.doc.revision });
+    const env = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fx.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fx.gateFile };
+    const args = { endpointId: EP51, capability: { kind: "schema_upgrade", token: fx.tok }, requestKey: "req_up1", fromSchema: "1.0", toSchema: "1.1-transition", env };
+    const res = TAL.schemaUpgrade(args);
+    assert.ok(res.ok, "transition 正向：" + JSON.stringify(res));
+    assert.deepEqual(res.result, { endpoint: EP51, from_schema: "1.0", to_schema: "1.1-transition" }, "result 逐字");
+    const after = TAL.loadLedger(dir, { endpointId: EP51 });
+    assert.equal(after.doc.schema_version, "1.1-transition", "schema_version 翻转");
+    assert.equal(after.doc.revision, L0.doc.revision + 1, "revision+1");
+    assert.equal(after.sha256, res.sha256, "返回读回 SHA");
+    for (const [id, rec] of Object.entries(after.doc.records)) {
+      if (rec.kind === "live") {
+        for (const k of ["selection_handle", "handle_expires_at", "rebind_handle", "rebind_expires_at"]) assert.ok(k in rec && rec[k] === null, "live " + id + " 的 " + k + " 补显式 null");
+      } else {
+        for (const k of ["selection_handle", "handle_expires_at", "rebind_handle", "rebind_expires_at"]) assert.ok(!(k in rec), "非 live 记录 " + id + " 不补字段");
+      }
+    }
+    assert.equal(after.doc.records[b1b].kind, "voided_audit", "voided 不动");
+
+    // ── 重放：同 requestKey 重调 → replayed（账本已处于 after 态，capability 两态核放行）──
+    const rep = TAL.schemaUpgrade(args);
+    assert.ok(rep.ok && rep.commit === "replayed", "同 key 重放：" + JSON.stringify(rep));
+    assert.equal(TAL.loadLedger(dir, { endpointId: EP51 }).doc.revision, after.doc.revision, "重放不 bump revision");
+
+    // ── 边/变体一致：transition step 调 direct 边 → 拒 ──
+    const edge = TAL.schemaUpgrade({ ...args, requestKey: "req_up2", fromSchema: "1.0", toSchema: "1.1" });
+    assert.equal(edge.ok, false, "变体与边不符拒");
+    assert.equal(TAL.schemaUpgrade({ ...args, requestKey: "req_up3", fromSchema: "1.1", toSchema: "1.0" }).ok, false, "非法边拒");
+
+    // ── strict 当场盘点（不信任调用方盘点）：两个独立反例，各杀一刀 ──
+    // S2：null-B1 非零、legacy 零 → precheck_failed
+    const L1 = TAL.loadLedger(dir, { endpointId: EP51 });
+    assert.ok(TAL.migrationInventory(L1.doc).null_b1_count > 0 && TAL.migrationInventory(L1.doc).legacy_proof_count === 0, "S2 前提：只有 null-B1 非零");
+    const fxB = r51FixtureB({ root: root + "-b", ledgerSha: L1.sha256, ledgerSchema: L1.doc.schema_version, ledgerRevision: L1.doc.revision });
+    const envB = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fxB.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fxB.gateFile };
+    const strictArgs = { endpointId: EP51, capability: { kind: "schema_upgrade", token: fxB.tok }, requestKey: "req_strict", fromSchema: "1.1-transition", toSchema: "1.1", env: envB };
+    assert.equal(TAL.schemaUpgrade(strictArgs).reason, "precheck_failed", "strict 盘点 null-B1 非零拒");
+    // S1：legacy 非零、null 零 → precheck_failed（activate：B1+A1→B3 携 legacy pairing binding）
+    const rA1 = r51Ok(TAL.createA1({ endpointId: EP51, requestKey: "req_a1", chatId: "oc_r51a", sessionId: "sess-r51-a", now: Date.now() }), "A1").result.created_id;
+    r51Ok(TAL.activate({ endpointId: EP51, requestKey: "req_act", b1Id: b1a, a1Id: rA1, f4: { matched_om: "om_r51a", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }, authorizedBy: "ou_r51", now: Date.now() }), "activate");
+    const L2 = TAL.loadLedger(dir, { endpointId: EP51 });
+    assert.ok(TAL.migrationInventory(L2.doc).legacy_proof_count > 0 && TAL.migrationInventory(L2.doc).null_b1_count === 0, "S1 前提：只有 legacy 非零");
+    fxB.rewrite((d) => {
+      const pc = d.steps.find((s) => s.kind === "precheck");
+      pc.before = { legacy_proof_count: 0, null_b1_count: 0, revision: L2.doc.revision, ledger_sha256: L2.sha256 };
+      pc.intended_after = { legacy_proof_count: 0, null_b1_count: 0, revision: L2.doc.revision, ledger_sha256: L2.sha256 };
+      const se = d.steps.find((s) => s.kind === "schema_endpoint");
+      se.before = { schema_version: L2.doc.schema_version, revision: L2.doc.revision, ledger_sha256: L2.sha256 };
+    });
+    assert.equal(TAL.schemaUpgrade({ ...strictArgs, requestKey: "req_strict2" }).reason, "precheck_failed", "strict 盘点 legacy 非零拒");
+  }));
 }
 
 summarySealed = true;

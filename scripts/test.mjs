@@ -32978,6 +32978,95 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
     };
     assert.equal(TAL.validateLedger(dUpgrade, { endpointId: EP }).ok, true, "schema_upgrade 验证通过");
   }
+
+  // ── 9. 跨 op 核验守卫反向测试（P1-3）──
+  {
+    const TGT1 = { runtime: "claude", project_root: "/path/to/p1", claude_session_id: "00000000-0000-4000-8000-000000000001" };
+    const TGT2 = { runtime: "claude", project_root: "/path/to/p2", claude_session_id: "00000000-0000-4000-8000-000000000002" };
+    const opIdRet = "00000000-0000-4000-8000-000000000099";
+
+    // 守卫一：affected 中有 proof 的记录未在 proof_effects 中列出 → 拒
+    const dHasProofNoPe = mkBaseDoc("1.1");
+    dHasProofNoPe.revision = 2;
+    dHasProofNoPe.operations[opIdRet] = {
+      op_type: "retarget",
+      terminal_kind: "retarget",
+      request_key: "rk_ret_1",
+      fingerprint: "5".repeat(64),
+      result_revision: 2,
+      result: {
+        affected_ids: [taId1],
+        affected_live_ids_after_commit: [taId1],
+        new_target: TGT2,
+        old_target: TGT1,
+        unit: "record",
+        proof_effects: [] // 故意漏掉有 proof 的 taId1
+      }
+    };
+    dHasProofNoPe.records[taId1] = {
+      kind: "live",
+      topic_agent_id: taId1,
+      chat_id: "oc_chat1",
+      created_at: ISO,
+      updated_at: ISO,
+      origin_operation_id: opIdRet,
+      facts: { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" },
+      aliases: { session_id: "sess_1", root_om: null },
+      binding_target: TGT2,
+      binding_proof: { kind: "retarget", authorized_by: "ou_owner1", authorized_at: ISO, old_target: TGT1, new_target: TGT2 },
+      locator_link_proof_ref: null,
+      generation_lineage_id: null,
+      anchor_candidate: null,
+      selection_handle: null,
+      handle_expires_at: null,
+      rebind_handle: null,
+      rebind_expires_at: null
+    };
+    const v1 = TAL.validateLedger(dHasProofNoPe, { endpointId: EP });
+    assert.equal(v1.ok, false, "affected 中有 proof 的记录未在 proof_effects 列出应拒");
+    assert.match(String(v1.why), /affected 中有 proof 的记录未在 proof_effects 中列出/u, "命中守卫一断言");
+
+    // 守卫二：affected 中无 proof 的记录不得在 proof_effects 中列出 → 拒
+    const dNoProofWithPe = mkBaseDoc("1.1-transition");
+    dNoProofWithPe.revision = 2;
+    dNoProofWithPe.operations[opIdRet] = {
+      op_type: "retarget",
+      terminal_kind: "retarget",
+      request_key: "rk_ret_2",
+      fingerprint: "6".repeat(64),
+      result_revision: 2,
+      result: {
+        affected_ids: [taId1],
+        affected_live_ids_after_commit: [taId1],
+        new_target: TGT2,
+        old_target: TGT1,
+        unit: "record",
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "produced", link_effect: "none" }] // 故意给无 proof 的 B1 挂 proof_effects
+      }
+    };
+    dNoProofWithPe.records[taId1] = {
+      kind: "live",
+      topic_agent_id: taId1,
+      chat_id: "oc_chat1",
+      created_at: ISO,
+      updated_at: ISO,
+      origin_operation_id: opIdRet,
+      facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" },
+      aliases: { session_id: null, root_om: "om_root1" },
+      binding_target: TGT2,
+      binding_proof: null,
+      locator_link_proof_ref: null,
+      generation_lineage_id: "lin_1",
+      anchor_candidate: null,
+      selection_handle: null,
+      handle_expires_at: null,
+      rebind_handle: null,
+      rebind_expires_at: null
+    };
+    const v2 = TAL.validateLedger(dNoProofWithPe, { endpointId: EP });
+    assert.equal(v2.ok, false, "affected 中无 proof 的记录列在 proof_effects 应拒");
+    assert.match(String(v2.why), /affected 中无 proof 的记录不得在 proof_effects 中列出/u, "命中守卫二断言");
+  }
 });
 
 summarySealed = true;

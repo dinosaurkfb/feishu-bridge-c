@@ -238,8 +238,8 @@ frozen_at, handle_expires_at, **before_ledger_sha256**, expected_null_b1_ids:[�
 | 直接前驱 → 事务 | 本记录在 result 的角色 | binding | link | 族 | 六字段等式? |
 | --- | --- | --- | --- | --- | --- |
 | B1+A1 → `activate`（本记录=`b3_id`） | **产证** | → owner_select_v1 | → owner_selected_route_v1 | B3 | 是 |
-| 旧 current 在同笔 `activate`（本记录=`demoted_current_id`） | **保留** | 保持原样 | 保持原样 | B4 | 保持 |
-| A1 chat 在同笔 `activate`（本记录=`tombstoned_a1_id`） | **tombstone** | — | — | tombstone | — |
+| 旧 current 在同笔 `activate`（本记录=`demoted_historical_id`，基线键名） | **保留** | 保持原样 | 保持原样 | B4 | 保持 |
+| A1 chat 在同笔 `activate`（本记录=`tombstoned_id`，基线键名；rebind 的同类新键叫 `tombstoned_a1_id`） | **tombstone** | — | — | tombstone | — |
 | A2 → `anchor`（=`a3_id`，result `link_effect:"produced"`） | 产证 | 保持 attach | → owner_selected_route_v1 | A3 | 否 |
 | A4 双证齐无重配 → A3（`attach_a3`，=`a3_id`，result `link_effect:"preserved"`——P1-4） | 继承 | → attach | 继承旧 link（其 `selection_operation_id` 指向**原产生 op**=activate/anchor/rebind/reaffirm） | A3 | 否 |
 | A3/B3 → `unbind` | 保留 | 保持 | 保持 | A4/B3′ | 保持 |
@@ -262,7 +262,7 @@ owner_select_reaffirm}**（P1-6 补 reaffirm）、因果 revision 与直接归�
 - **G11′**：kind 增三新形；binding=owner_select_v1 时 selected_*===aliases.*；runtime===endpoint 链。
 - **G13′（按来源 op result 的 `proof_effects` 对本记录的项判——P1-1/P1-4）**：产证 vs 继承由
   `proof_effects` 中 `topic_agent_id===本记录 id` 那一项的 `binding_effect`/`link_effect` 显式给出
-  （**不靠 id 角色猜、不按 op_type 一刀切**；`tombstoned_a1_id` 走 G13-tomb）：
+  （**不靠 id 角色猜、不按 op_type 一刀切**；被 tombstone 的记录——activate 的 `tombstoned_id`、rebind 的 `tombstoned_a1_id`——走 G13-tomb）：
   - **`link_effect:"produced"`**：`selection_operation_id===origin_operation_id`、result 字段与
     proof 逐字等；`binding_effect:"produced"`（binding=owner_select_v1）时六字段等（A），否则仅
     link 经自身来源 op 校验（B）。

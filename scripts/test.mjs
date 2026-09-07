@@ -28,6 +28,7 @@ import { SENDER_ROLES, roleCounts, roleCountsText, senderRole, senderRolesProble
 import { parseRegisterSenderArgs, planSenderChange, applySenderChange } from "./register-sender.mjs";
 import { parseRegisterP2pArgs, planP2pChange, applyP2pChange } from "./register-p2p-chat.mjs";
 import * as TAL from "./topic-agent-ledger.mjs";
+import { selectAdmission, selectReject } from "./select-admission.mjs";
 import * as DW from "./m1a/dual-write.mjs";
 import * as WIRE from "./m1a/wiring.mjs";
 // symlink 锁：existsSync 会跟随到不存在的目标，锁在不在只能用 lstat 判
@@ -18774,6 +18775,14 @@ test("控制命令只认封闭的精确形状：两条链各两条，多一个�
   assert.equal(parseControlCommand("/feishu-mode dialogue", { chain: "other" }), null, "链不认识就不认");
   assert.equal(parseControlCommand("/feishu-mode dialogue", {}), null);
 
+test("R52a item 三：selectAdmission 默认 off（fail-closed）+ selectReject 四支（off/partial/on/unreadable + rfh 放行）", () => {
+  assert.deepEqual(selectAdmission(), { state: "off" }, "默认 fail-closed（R50 合并前）");
+  assert.deepEqual(selectReject({ state: "off" }, "osh"), { reason: "select_off", text: "选择功能未开放（迁移未开始）" });
+  assert.deepEqual(selectReject({ state: "unreadable" }, "osh"), { reason: "select_writer_state_unreadable", text: "选择功能状态读不清，未执行" });
+  assert.deepEqual(selectReject({ state: "partial" }, "osh"), { reason: "select_partial_not_rfh", text: "迁移期间只接受 rfh_ 重确认 handle" });
+  assert.equal(selectReject({ state: "partial" }, "rfh"), null, "partial 只放行 rfh");
+  assert.equal(selectReject({ state: "on" }, "osh"), null, "on 放行");
+});
 test("R52a：feishu-select 解析封闭（bare/单 handle/坏 handle/别链前缀/尾随/大小写）+ 意图分类 + control-intent 封闭形", () => {
   const h = "osh_" + "a".repeat(32);
   const oh = "orh_" + "b".repeat(32);

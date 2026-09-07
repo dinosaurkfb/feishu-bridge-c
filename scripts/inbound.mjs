@@ -68,6 +68,7 @@ import {
 import { isDirectRun } from "./direct-run.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
+import { selectAdmission, selectReject } from "./select-admission.mjs";
 /**
  * 整个入站流程包在 main() 里，只有被直接执行时才跑。
  *
@@ -798,7 +799,20 @@ if (!claim.ok) {
 if (rejectedProjection) rejectControl(false);
 
 // ---------- 控制命令：拿到 claim 之后当场执行（可恢复事务），不投递 ----------
-if (control) runControl(false);
+const runSelect = (replay) => {
+  const adm = selectAdmission(process.env);
+  const ej = selectReject(adm, control.handle_kind);
+  const base = { control: "select", handle_kind: control.handle_kind, message_id: verdict.messageId, handed_off: false };
+  if (ej) {
+    writeReceipt("select-rejected-" + verdict.messageId, { status: "rejected", reason: ej.reason, ...base, project_root: routed.root, claim_acquired: !replay });
+    finish("rejected", { reasonText: ej.text + "。没有执行，也没有投递。", taskName: config.task_display_name }, { reason: ej.reason, control: "select" });
+    return;
+  }
+  writeReceipt("select-pending-" + verdict.messageId, { status: "consumed", reason: "select_pending", ...base, project_root: routed.root, claim_acquired: !replay });
+  finish("control", { text: "已收到选择，执行器尚未接入", taskName: config.task_display_name }, { control: "select", handle_kind: control.handle_kind });
+};
+if (control && control.kind === "select") runSelect(false);
+else if (control) runControl(false);
 
 let policyRun = dialogueMode ? null : handlePolicy({ claim, resolvedContext: mappingContext });
 if (!dialogueMode &&

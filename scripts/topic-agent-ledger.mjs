@@ -25,7 +25,8 @@ import { JOURNAL_SCHEMA, OPERATION_KINDS, journalProblem, leaseHolder, leasePath
 import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { maintenanceGatePath, readGate } from "./maintenance-gate-core.mjs";
 
-export const SCHEMA_VERSION = "1.0";
+export const SCHEMA_VERSION = "1.0"; // 现行创建值（行为零变化）
+const SCHEMA_VERSIONS = ["1.0", "1.1-transition", "1.1"]; // R48 §8.2：读端受验域（三值皆合法，其它拒）。模块内私有：不导出以免改 shared-surface 导出面。
 export const ARTIFACT_TYPE = "feishu_bridge_topic_agent_ledger";
 export const LEDGER_DIR_ENV = "FEISHU_BRIDGE_LEDGER_DIR";
 const LOCK_WAIT_MS = 2_000;
@@ -44,6 +45,9 @@ const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
 export { ENDPOINT_SHAPE }; // 只读导出（doctor ⑭ 枚举账本目录用）：同一形状只住一处
 const CHAIN = ["claude", "codex"];
 const OM_SHAPE = /^om_[A-Za-z0-9]{1,120}$/u;                 // 根消息 / matched om
+const SELECTION_HANDLE_SHAPE = /^osh_[0-9a-f]{32}$/u;          // §4 selection_handle（osh_+32hex）
+const REBIND_HANDLE_SHAPE = /^orh_[0-9a-f]{32}$/u;             // §4 rebind_handle（orh_+32hex）
+const HANDLE_FIELDS = ["selection_handle", "handle_expires_at", "rebind_handle", "rebind_expires_at"]; // §4 四枚
 const CHAT_SHAPE = /^oc_[A-Za-z0-9]{1,120}$/u;               // 受验群 chat_id
 const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u; // claude session
 const AILY_SESSION_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u;    // aliases.session_id（Aily 会话 locator）
@@ -387,9 +391,12 @@ const linkProofProblem = (r) => {
   return null;
 };
 
-export function liveProblem(rec, id) {
+export function liveProblem(rec, id, schema = SCHEMA_VERSION) {
   if (!isObj(rec)) return "记录不是对象";
-  const allowed = "aliases,anchor_candidate,binding_proof,binding_target,chat_id,created_at,facts,generation_lineage_id,kind,locator_link_proof_ref,origin_operation_id,topic_agent_id,updated_at";
+  // R48 §8.2：schema=1.0 时四枚 handle 键**必缺席**（键缺席即合法）；≥transition 时四键**必在场**（值可 null）。
+  const allowed = schema === "1.0"
+    ? "aliases,anchor_candidate,binding_proof,binding_target,chat_id,created_at,facts,generation_lineage_id,kind,locator_link_proof_ref,origin_operation_id,topic_agent_id,updated_at"
+    : "aliases,anchor_candidate,binding_proof,binding_target,chat_id,created_at,facts,generation_lineage_id,handle_expires_at,kind,locator_link_proof_ref,origin_operation_id,rebind_expires_at,rebind_handle,selection_handle,topic_agent_id,updated_at";
   if (keysOf(rec) !== allowed) return "live 字段集不对";
   if (rec.topic_agent_id !== id || !isId(id)) return "topic_agent_id 形状/一致性不对";
   if (typeof rec.chat_id !== "string" || !CHAT_SHAPE.test(rec.chat_id)) return "chat_id 形状不对";
@@ -432,6 +439,18 @@ export function liveProblem(rec, id) {
   if ((f.binding === "none") !== (rec.binding_target === null)) return "binding_target=null ⇔ binding=none 不成立";
   if (rec.binding_target !== null) { const tp = targetProblem(rec.binding_target); if (tp) return tp; }
   if (rec.anchor_candidate !== null && (typeof rec.anchor_candidate !== "string" || !OM_SHAPE.test(rec.anchor_candidate))) return "anchor_candidate 形状不对";
+  // R48 §4（跨字段联合 P1-2 + 形状 + B1 schema 限定）：schema≥transition 时 live 记录带四枚 handle 字段。
+  if (schema !== "1.0") {
+    const sh = rec.selection_handle, he = rec.handle_expires_at, rh = rec.rebind_handle, re = rec.rebind_expires_at;
+    if (sh !== null && !SELECTION_HANDLE_SHAPE.test(sh)) return "selection_handle 形状不对（osh_+32hex）";
+    if (he !== null && !isCanonicalIso(he)) return "handle_expires_at 不规范";
+    if (rh !== null && !REBIND_HANDLE_SHAPE.test(rh)) return "rebind_handle 形状不对（orh_+32hex）";
+    if (re !== null && !isCanonicalIso(re)) return "rebind_expires_at 不规范";
+    if ((sh === null) !== (he === null)) return "selection_handle 与 handle_expires_at 必须同时空或同时非空（半有半无=损坏）";
+    if (fam === "A2" && sh !== null && rec.anchor_candidate === null) return "A2 非空 selection_handle 需既有 anchor_candidate";
+    if (fam === "B1" && schema === "1.1" && sh === null) return "strict(1.1) B1 的 selection_handle/handle_expires_at 必双非空（transition 允许双 null 作 blocker）";
+    if ((rh === null) !== (re === null)) return "rebind_handle 与 rebind_expires_at 必须同时有或同时无（半有半无=损坏）";
+  }
   return null;
 }
 
@@ -540,9 +559,9 @@ export function voidedProblem(rec, id) {
   return null;
 }
 
-function recordProblem(rec, id) {
+function recordProblem(rec, id, schema = SCHEMA_VERSION) {
   if (!isObj(rec) || typeof rec.kind !== "string") return "记录缺 kind";
-  if (rec.kind === "live") return liveProblem(rec, id);
+  if (rec.kind === "live") return liveProblem(rec, id, schema);
   if (rec.kind === "forwarding_tombstone") return tombstoneProblem(rec, id);
   if (rec.kind === "voided_audit") return voidedProblem(rec, id);
   return "kind 不在三选一";
@@ -652,7 +671,7 @@ export function validateLedger(doc, { endpointId } = {}) {
   const bad = (why) => ({ ok: false, reason: "ledger_corrupt", why });
   if (!isObj(doc)) return bad("账本不是对象");
   if (keysOf(doc) !== "artifact_type,authority_mode,chain,endpoint_id,operations,records,revision,schema_version") return bad("顶层字段集不对");
-  if (doc.schema_version !== SCHEMA_VERSION || doc.artifact_type !== ARTIFACT_TYPE) return bad("schema/artifact 不对");
+  if (!SCHEMA_VERSIONS.includes(doc.schema_version) || doc.artifact_type !== ARTIFACT_TYPE) return bad("schema/artifact 不对");
   if (doc.authority_mode !== "shadow" && doc.authority_mode !== "authoritative") return bad("authority_mode 越界");
   if (!CHAIN.includes(doc.chain)) return bad("chain 越界（链不可从 opaque endpoint 还原，顶层显式存）");
   if (!Number.isInteger(doc.revision) || doc.revision < 1) return bad("revision 不是正整数");
@@ -686,7 +705,7 @@ export function validateLedger(doc, { endpointId } = {}) {
   const live = [];
   let liveCount = 0;
   for (const [id, rec] of Object.entries(doc.records)) {
-    const p = recordProblem(rec, id);
+    const p = recordProblem(rec, id, doc.schema_version);
     if (p !== null) return bad(id + "：" + p);
     if (!(rec.origin_operation_id in doc.operations)) return bad(id + "：origin_operation_id 不在 operations 表（G13）");
     if (!opConsistentWithRecord(doc.operations[rec.origin_operation_id], id, rec)) return bad(id + "：origin op 与本记录不相容（G13）");

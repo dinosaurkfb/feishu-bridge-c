@@ -25152,6 +25152,34 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
     assert.ok(TAL.loadLedger(dir, { endpointId: EP }).ok, "seed 出的初始账本自洽");
   };
+  // R48（账本侧，§8.2/§4）：schema 字面值域 + live 记录四枚 handle 字段 —— 纯合成回归（构造 B1 文档跑
+  //   validateLedger，三 schema 正反向；红先行：旧代码 schema 只认 1.0、无 handle 字段校验 → 本块全部红）。
+  test("R48 账本侧：schema 字面值域（1.0/1.1-transition/1.1）+ live 记录四枚 handle 字段（§8.2 绑定 / §4 跨字段联合）双向合成回归", () => {
+    const iso = (t) => new Date(t).toISOString();
+    const hx = (n) => String(n).repeat(64);
+    const selHandle = (h = "a") => "osh_" + h.repeat(32);
+    const rebHandle = (h = "b") => "orh_" + h.repeat(32);
+    const taid = (h) => "ta_" + h.repeat(32); // 记录 id 是 ta_+32hex（ID_SHAPE），不是 UUID
+    const initOp = { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } };
+    const cbOpId = "22222222-2222-2222-2222-222222222222";
+    const cbOp = (id, rev) => ({ op_type: "create_b1", terminal_kind: "create_b1", request_key: "req_cb", fingerprint: hx(2), result_revision: rev, result: { created_id: id } });
+    const mkDoc = (schema, rec0, rev) => ({ schema_version: schema, artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: CH, authority_mode: "shadow", revision: rev, operations: { "00000000-0000-0000-0000-000000000001": initOp, [cbOpId]: cbOp(rec0.topic_agent_id, rev) }, records: { [rec0.topic_agent_id]: rec0 } });
+    const b1Rec = (id, o) => Object.assign({ topic_agent_id: id, kind: "live", chat_id: "oc_g", anchor_candidate: null, aliases: null, binding_target: TGT, facts: null, generation_lineage_id: "lin_1", origin_operation_id: cbOpId, binding_proof: null, locator_link_proof_ref: null, created_at: iso(1700000000000), updated_at: iso(1700000000000) }, o);
+    const b1Facts = () => ({ binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" });
+    const v = (doc) => TAL.validateLedger(doc, { endpointId: EP });
+    // 正向：1.0 B1 无 handle 键（基线零变化）；1.1-transition B1 双 null（blocker）；1.1 双非空。
+    assert.ok(v(mkDoc("1.0", b1Rec(taid("a"), { facts: b1Facts(), aliases: { root_om: "om_10", session_id: null } }), 2)).ok, "1.0 B1 无 handle 键合法");
+    assert.ok(v(mkDoc("1.1-transition", b1Rec(taid("b"), { facts: b1Facts(), aliases: { root_om: "om_t", session_id: null }, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null }), 2)).ok, "transition B1 double-null(blocker) 合法");
+    assert.ok(v(mkDoc("1.1", b1Rec(taid("c"), { facts: b1Facts(), aliases: { root_om: "om_11", session_id: null }, selection_handle: selHandle(), handle_expires_at: iso(1700000001000), rebind_handle: null, rebind_expires_at: null }), 2)).ok, "1.1 B1 双非空合法");
+    // 反向：schema 越界、1.0 带 handle 键、1.1 半有半无、1.1 strict 双 null、坏形状、rebind 半有半无 → 全拒。
+    assert.equal(v(mkDoc("9.9", b1Rec(taid("d"), { facts: b1Facts(), aliases: { root_om: "om_9", session_id: null }, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null }), 2)).reason, "ledger_corrupt", "schema 9.9 拒");
+    assert.equal(v(mkDoc("1.0", b1Rec(taid("e"), { facts: b1Facts(), aliases: { root_om: "om_r0", session_id: null }, selection_handle: selHandle(), handle_expires_at: iso(1700000002000), rebind_handle: null, rebind_expires_at: null }), 2)).reason, "ledger_corrupt", "1.0 带 handle 键拒（键缺席才合法）");
+    assert.equal(v(mkDoc("1.1", b1Rec(taid("f"), { facts: b1Facts(), aliases: { root_om: "om_r1", session_id: null }, selection_handle: selHandle(), handle_expires_at: null, rebind_handle: null, rebind_expires_at: null }), 2)).reason, "ledger_corrupt", "1.1 B1 半有半无拒");
+    assert.equal(v(mkDoc("1.1", b1Rec(taid("g"), { facts: b1Facts(), aliases: { root_om: "om_r2", session_id: null }, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null }), 2)).reason, "ledger_corrupt", "1.1 strict B1 双 null 拒");
+    assert.equal(v(mkDoc("1.1", b1Rec(taid("h"), { facts: b1Facts(), aliases: { root_om: "om_r3", session_id: null }, selection_handle: "osh_zz", handle_expires_at: iso(1700000003000), rebind_handle: null, rebind_expires_at: null }), 2)).reason, "ledger_corrupt", "坏 selection_handle 形状拒");
+    assert.equal(v(mkDoc("1.1", b1Rec(taid("i"), { facts: b1Facts(), aliases: { root_om: "om_r4", session_id: null }, selection_handle: selHandle("c"), handle_expires_at: iso(1700000004000), rebind_handle: rebHandle(), rebind_expires_at: null }), 2)).reason, "ledger_corrupt", "rebind 半有半无拒");
+  });
+
   // R37 裁定：M1a 收据逐端点原子启用。接线测试需要让 EP 处于两种收据态：
   //   · ok（ledger_init done）→ 双写强制（跑 shadow 后缀）；
   //   · never_initialized（无收据）→ 合法 legacy-only（不写 shadow）。

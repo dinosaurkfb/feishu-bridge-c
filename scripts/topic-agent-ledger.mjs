@@ -21,7 +21,7 @@ import path from "node:path";
 import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhileHeld } from "./registry.mjs";
 import { isCanonicalIso, canonicalIso, isCanonicalMs } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "./claim.mjs";
-import { JOURNAL_SCHEMA, OPERATION_KINDS, journalProblem, leaseHolder, leasePath, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
+import { JOURNAL_SCHEMA, OPERATION_KINDS, OWNER_SELECT_JOURNAL_SCHEMA, journalProblem, leaseHolder, leasePath, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
 import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { maintenanceGatePath, readGate } from "./maintenance-gate-core.mjs";
 import { canonKey, sha256, isObj, stable } from "./maintenance/canon.mjs";
@@ -1717,12 +1717,18 @@ function stampAndBuild(doc, { opType, inputs, result, mutateRecords }) {
 // **不导出可接受任意 mutate 的通用 ungated writer**。
 
 /** 维护 capability 核验：读实文件（active / journal / gate / lease + ledger step）逐项独立核对，任一不过 → 结构化拒。 */
+// R51：owner_select 迁移三新种的 journal kind/phase/step 映射（owner-select-route.md §8.2；不 import owner-select-state.mjs ——
+// 那边 import 本模块，会成循环依赖，故本地常量与它各住一份、由测试钉死两处相等）。
+const OSM_KINDS = Object.freeze(["owner_select_migration_a", "owner_select_migration_b", "owner_select_migration_direct"]);
+const OSM_KIND_TO_PHASE = Object.freeze({ owner_select_migration_a: "osm_a_upgrading", owner_select_migration_b: "osm_b_strictening", owner_select_migration_direct: "osm_direct" });
+const OSM_KIND_TO_UPGRADE_EDGE = Object.freeze({ owner_select_migration_a: "1.0->1.1-transition", owner_select_migration_b: "1.1-transition->1.1", owner_select_migration_direct: "1.0->1.1" });
 function _maintenanceVerifier(capability, endpointId, opType, env = process.env) {
   const fail = (reason, why) => ({ ok: false, reason, why });
   if (!capability || typeof capability !== "object") return fail("bad_capability", "capability 缺失");
-  const wantKind = opType === "initialize_shadow" ? "ledger_init" : "ledger_cutover";
-  const wantPhase = opType === "initialize_shadow" ? "ledger_initializing" : "ledger_cutting_over";
-  const wantSub = opType === "initialize_shadow" ? "init" : "cutover";
+  const isOsm = opType === "schema_upgrade" || opType === "mint_selection_handles";
+  const wantKind = isOsm ? null : opType === "initialize_shadow" ? "ledger_init" : "ledger_cutover";
+  const wantPhase = isOsm ? null : opType === "initialize_shadow" ? "ledger_initializing" : "ledger_cutting_over";
+  const wantSub = isOsm ? null : opType === "initialize_shadow" ? "init" : "cutover";
   const { token } = capability;
   // 维护目录 / 门位置一律从环境派生（评审 F1）：capability 只带 token/kind/endpointId，不信任其自述路径
   const maintDir = maintenanceDir(env);
@@ -1736,7 +1742,52 @@ function _maintenanceVerifier(capability, endpointId, opType, env = process.env)
   if (active.token !== token) return fail("operation_token_mismatch", "active 指向的 token 与 capability 不一致");
   const j = readJournal({ dir: maintDir, token });
   if (j.state !== "valid") return fail("journal_unreadable", "journal " + j.state + (j.why ? "：" + j.why : ""));
-  if (j.doc.schema_version !== JOURNAL_SCHEMA) return fail("journal_schema", "journal 不是 " + JOURNAL_SCHEMA);
+  if (j.doc.schema_version !== (isOsm ? OWNER_SELECT_JOURNAL_SCHEMA : JOURNAL_SCHEMA)) return fail("journal_schema", "journal 不是 " + (isOsm ? OWNER_SELECT_JOURNAL_SCHEMA : JOURNAL_SCHEMA));
+  // 门 + 租约共用核（init/cutover 与 owner_select 迁移同一段；原地提取不改顺序与语义）。
+  const gateLeaseProblem = () => {
+    const gate = readGate({ file: gateFile, now: Date.now() });
+    if (gate.state !== "active") return fail("gate_not_active", "门 " + gate.state + (gate.why ? "：" + gate.why : ""));
+    if (gate.payload?.token !== token) return fail("gate_token_mismatch", "门 token 与 operation 不一致");
+    const holder = leaseHolder({ dir: maintDir, token });
+    if (!holder.present) return fail("lease_absent", "operation 租约不存在");
+    if (holder.unreadable) return fail("lease_unreadable", "租约读不出：" + holder.why);
+    if (!holder.alive) return fail("lease_dead", "租约持有者 pid " + holder.pid + " 已不在");
+    if (holder.at !== null && !isCanonicalIso(holder.at)) return fail("lease_payload_bad", "租约 owner.at 不是规范化 ISO");
+    return null;
+  };
+  if (isOsm) {
+    // R51 §一：owner_select 迁移的 capability —— kind/phase/step 与账本两态核验（§8.2）。
+    const gl = gateLeaseProblem();
+    if (gl !== null) return gl;
+    const k = j.doc.operation_kind;
+    if (!OSM_KINDS.includes(k)) return fail("operation_kind_mismatch", "operation_kind " + k + " 不属于 owner_select 三新种");
+    if (opType === "mint_selection_handles" && k !== "owner_select_migration_a") return fail("operation_kind_mismatch", "mint_selection_handles 仅 owner_select_migration_a（当前 " + k + "）");
+    const wantOsmPhase = OSM_KIND_TO_PHASE[k];
+    if (j.doc.phase !== wantOsmPhase) return fail("phase_mismatch", "阶段 " + j.doc.phase + " ≠ " + wantOsmPhase);
+    const stepKind = opType === "schema_upgrade" ? "schema_endpoint" : "mint";
+    const variant = k === "owner_select_migration_a" ? "transition" : k === "owner_select_migration_b" ? "strict" : "direct";
+    const wantStepId = opType === "schema_upgrade" ? "schema_endpoint:" + endpointId + ":" + variant : "mint:" + endpointId;
+    const st = j.doc.steps.find((s) => s.kind === stepKind && s.id === wantStepId);
+    if (!st) return fail("step_absent", "journal 无 " + wantStepId + " step");
+    if (st.state !== "prepared") return fail("step_not_prepared", stepKind + " step 状态 " + st.state);
+    if (st.target !== "ledger/" + endpointId + "/ledger.json") return fail("step_target_mismatch", stepKind + " step target 派生不符：" + st.target);
+    // 租约 fencing 内读账本现场：step 必须锚定账本两态之一——before 态（执行路径）或 after 态（崩溃窗口：
+    // 账本已提交、step 未 markStepDone —— 这是重放/already 支的可达前提，§8.2 mint 行“真正两态”的
+    // capability 投影；单一 before 核会让那两支不可达）。
+    const binding = commitWhileHeld(leasePath(maintDir, token), () => {
+      const ld = resolveEndpointDir(endpointId, { env });
+      if (!ld.ok) return ld;
+      const L = loadLedger(ld.dir, { endpointId });
+      if (!L.ok) return { ok: false, reason: L.reason, why: L.why ?? null };
+      const atBefore = st.before.ledger_sha256 === L.sha256 && (opType !== "schema_upgrade" || st.before.schema_version === L.doc.schema_version);
+      const atAfter = st.intended_after.ledger_sha256 === L.sha256 && (opType !== "schema_upgrade" || st.intended_after.schema_version === L.doc.schema_version);
+      if (!atBefore && !atAfter) return { ok: false, reason: "ledger_state_mismatch", why: "账本不处于该 step 的 before/after 两态（SHA 或 schema_version 不符）" };
+      return { ok: true, ledger: { dir: ld.dir, doc: L.doc, sha256: L.sha256 } };
+    });
+    if (!binding.ok || !binding.run) return fail("lease_lost", "本过程不再持有 operation 租约实例（commitWhileHeld：" + (binding?.reason ?? "lock_lost") + "）");
+    if (!binding.run.ok) return fail(binding.run.reason, binding.run.why ?? null);
+    return { ok: true, maintenanceDir: maintDir, doc: j.doc, osmStep: st, ledger: binding.run.ledger };
+  }
   if (j.doc.operation_kind !== wantKind) return fail("operation_kind_mismatch", "operation_kind " + j.doc.operation_kind + " ≠ " + wantKind);
   if (j.doc.phase !== wantPhase) return fail("phase_mismatch", "阶段 " + j.doc.phase + " ≠ " + wantPhase);
   // ledger step 已在且 prepared、target 与 endpoint 一致（WAL 已落）
@@ -1746,16 +1797,9 @@ function _maintenanceVerifier(capability, endpointId, opType, env = process.env)
   const m = /^ledger:(endpoint_[0-9a-f]{24}):(init|cutover)$/u.exec(ls.id);
   if (!m || m[2] !== wantSub || m[1] !== endpointId) return fail("ledger_step_identity", "ledger step 身份与 endpoint/kind 不符");
   if (!CHAIN.includes(ls.chain)) return fail("ledger_chain_bad", "ledger step 缺 chain 或非法");
-  // 门在且 token 与 journal 的 gate step intended_after 一致
-  const gate = readGate({ file: gateFile, now: Date.now() });
-  if (gate.state !== "active") return fail("gate_not_active", "门 " + gate.state + (gate.why ? "：" + gate.why : ""));
-  if (gate.payload?.token !== token) return fail("gate_token_mismatch", "门 token 与 operation 不一致");
-  // 租约存在且属于该 operation（leasePath(dir, token) 即 operation 专属）
-  const holder = leaseHolder({ dir: maintDir, token });
-  if (!holder.present) return fail("lease_absent", "operation 租约不存在");
-  if (holder.unreadable) return fail("lease_unreadable", "租约读不出：" + holder.why);
-  if (!holder.alive) return fail("lease_dead", "租约持有者 pid " + holder.pid + " 已不在");
-  if (holder.at !== null && !isCanonicalIso(holder.at)) return fail("lease_payload_bad", "租约 owner.at 不是规范化 ISO");
+  // 门在且 token 与 journal 的 gate step intended_after 一致；租约存在且属于该 operation（leasePath(dir, token) 即 operation 专属）
+  const gl = gateLeaseProblem();
+  if (gl !== null) return gl;
   // 评审 P1-3：capability 必须证明**当前进程确实持有**该 operation 租约实例（commitWhileHeld 的 token fencing），
   // 且 plan 必须由 journal 里已落盘的 ledger step 重建，不得接受调用方任意 planIn。重建后逐字段绑定 before/intended_after。
   const lpath = leasePath(maintDir, token);
@@ -2027,6 +2071,24 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
   if (reread.status !== "read" || reread.sha256 !== plan.sha256) return { ok: false, commit: res.commit, reason: "written_mismatch", why: "落盘 SHA 与蓝图不符", ...wrNote(res) };
   // P2-2（第 5 轮）：同上用统一投影，cutover 的 commit_residue 分支也能点名账本主锁。
   return { ok: true, commit: res.commit, revision: plan.intendedAfter.revision, result: res.result, sha256: plan.sha256, plan, ...wrNote(res) };
+}
+
+/* ─────────────────────────── owner_select 迁移执行器（R51） ─────────────────────────── */
+
+/** R51 §二：schema_upgrade 窄事务（owner-select-route.md §6/§8；capability 见 _maintenanceVerifier）。 */
+export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, toSchema, env = process.env, _inject = null } = {}) {
+  if (!capability || capability.kind !== "schema_upgrade") return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "kind 不符或缺失" };
+  const cap = _maintenanceVerifier(capability, endpointId, "schema_upgrade", env);
+  if (!cap.ok) return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: cap.reason + (cap.why ? "：" + cap.why : "") };
+  return { ok: false, commit: "not_committed", reason: "executor_unavailable", why: "R51 §二 未实现（capability 已核过）" };
+}
+
+/** R51 §五：mint_selection_handles 窄事务（§8.2 mint 行两态 CAS；capability 见 _maintenanceVerifier）。 */
+export function mintSelectionHandles({ endpointId, capability, plan, env = process.env, _inject = null } = {}) {
+  if (!capability || capability.kind !== "mint_selection_handles") return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "kind 不符或缺失" };
+  const cap = _maintenanceVerifier(capability, endpointId, "mint_selection_handles", env);
+  if (!cap.ok) return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: cap.reason + (cap.why ? "：" + cap.why : "") };
+  return { ok: false, commit: "not_committed", reason: "executor_unavailable", why: "R51 §五 未实现（capability 已核过）" };
 }
 
 /* ─────────────────────────── 普通（gated）事务 ─────────────────────────── */

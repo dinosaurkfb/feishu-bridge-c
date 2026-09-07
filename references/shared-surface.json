@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-09-08T06:24:59.452Z",
+  "generated_at": "2026-09-07T15:47:40.019Z",
   "modules": {
     "authorize.mjs": [
       "AUTHORIZATION_TABLE",
@@ -550,7 +550,6 @@
       "claudeClaimExpectation",
       "controlRepairPrecondition",
       "describeControlRepair",
-      "dispatchControlRepair",
       "expectationFromMapping",
       "parseRepairControlArgs",
       "repairExitCode"
@@ -576,12 +575,6 @@
       "verifyRuntime",
       "verifyRuntimeVersion",
       "versionFromFiles"
-    ],
-    "select-admission.mjs": [
-      "executeSelectControl",
-      "selectAdmission",
-      "selectReject",
-      "selectRejectTextByReason"
     ],
     "selector.mjs": [
       "BINDING_TOKEN_RE",
@@ -690,11 +683,8 @@
       "ID_SHAPE",
       "LEDGER_DIR_ENV",
       "LINEAGE_SHAPE",
-      "REAFFIRM_HANDLE_SHAPE",
-      "REBIND_HANDLE_SHAPE",
       "REQUEST_KEY_SHAPE",
       "SCHEMA_VERSION",
-      "SELECTION_HANDLE_SHAPE",
       "activate",
       "anchor",
       "attach",
@@ -718,6 +708,8 @@
       "migrateProjectionDigest",
       "migrateRepair",
       "migrateSeed",
+      "migrationInventory",
+      "mintSelectionHandles",
       "newTopicAgentId",
       "readLedger",
       "rebindSessionAlias",
@@ -726,6 +718,7 @@
       "resolveLiveId",
       "restore",
       "retarget",
+      "schemaUpgrade",
       "seedRecords",
       "sha256",
       "tombstoneProblem",

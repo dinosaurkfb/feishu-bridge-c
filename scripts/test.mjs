@@ -7,7 +7,7 @@
  * v2：标识符全部换到 Aily 命名空间（见 selector.mjs 顶部说明）。
  */
 
-import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry, inspectControlLockArtifact, normalizeControlText, CONTROL_MODE_WORDS } from "./control-command.mjs";
+import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry, inspectControlLockArtifact, normalizeControlText, CONTROL_MODE_WORDS, controlFailedRecordProblem, consumedRecordProblem } from "./control-command.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
@@ -18774,22 +18774,13 @@ test("控制命令只认封闭的精确形状：两条链各两条，多一个�
   }
   assert.equal(parseControlCommand("/feishu-mode dialogue", { chain: "other" }), null, "链不认识就不认");
   assert.equal(parseControlCommand("/feishu-mode dialogue", {}), null);
+  const on = controlAckText({ taskName: "演示", mode: DIALOGUE_POLICY_ID, changed: true });
+  assert.match(on, /^已切换 · 演示\n交互模式现在是 Dialogue/u);
+  assert.match(on, /没有被当作指令投递/u);
+  const same = controlAckText({ taskName: "演示", mode: MAPPING_POLICY_ID, changed: false });
+  assert.match(same, /^模式未变 · 演示\n本来就是 Mapping/u);
+});
 
-test("R52a 返修一：claim meta 按 kind 投影（select 经 controlIntentProblem 合法）/ /feishu-select R3 / 大小写变体 malformed", () => {
-  const h = "osh_" + "a".repeat(32);
-  assert.equal(controlIntentProblem({ control: "select", handle: h, handle_kind: "osh" }), null, "select claim meta 合法（P1 修后）");
-  assert.ok(String(controlIntentProblem({ control: "select", mode: undefined })).includes("字段集不对"), "mode 形状的 select 仍拒（旧 meta bug 的反向）");
-  assert.equal(classifyRisk({ instruction: "/feishu-select " + h, chain: "claude", mode: DIALOGUE_POLICY_ID }).riskClass, RISK.R3, "/feishu-select R3（仅 owner）");
-  assert.equal(parseInboundIntent({ instruction: "/Feishu-Select " + h, chain: "claude" }).intent, INTENT.MALFORMED_CONTROL, "大小写变体 → malformed（不降回普通指令）");
-});
-test("R52a item 三：selectAdmission 默认 off（fail-closed）+ selectReject 四支（off/partial/on/unreadable + rfh 放行）", () => {
-  assert.deepEqual(selectAdmission(), { state: "off" }, "默认 fail-closed（R50 合并前）");
-  assert.deepEqual(selectReject({ state: "off" }, "osh"), { reason: "select_off", text: "选择功能未开放（迁移未开始）" });
-  assert.deepEqual(selectReject({ state: "unreadable" }, "osh"), { reason: "select_writer_state_unreadable", text: "选择功能状态读不清，未执行" });
-  assert.deepEqual(selectReject({ state: "partial" }, "osh"), { reason: "select_partial_not_rfh", text: "迁移期间只接受 rfh_ 重确认 handle" });
-  assert.equal(selectReject({ state: "partial" }, "rfh"), null, "partial 只放行 rfh");
-  assert.equal(selectReject({ state: "on" }, "osh"), null, "on 放行");
-});
 test("R52a：feishu-select 解析封闭（bare/单 handle/坏 handle/别链前缀/尾随/大小写）+ 意图分类 + control-intent 封闭形", () => {
   const h = "osh_" + "a".repeat(32);
   const oh = "orh_" + "b".repeat(32);
@@ -18808,11 +18799,126 @@ test("R52a：feishu-select 解析封闭（bare/单 handle/坏 handle/别链前�
   assert.ok(String(controlIntentProblem({ control: "select", handle: h, handle_kind: "orh" })).includes("前缀与 handle_kind 不一致"));
   assert.equal(controlIntentProblem({ control: "select", handle: null, handle_kind: null }), null);
 });
-  const on = controlAckText({ taskName: "演示", mode: DIALOGUE_POLICY_ID, changed: true });
-  assert.match(on, /^已切换 · 演示\n交互模式现在是 Dialogue/u);
-  assert.match(on, /没有被当作指令投递/u);
-  const same = controlAckText({ taskName: "演示", mode: MAPPING_POLICY_ID, changed: false });
-  assert.match(same, /^模式未变 · 演示\n本来就是 Mapping/u);
+
+test("R52a item 三：selectAdmission 默认 off（fail-closed）+ selectReject 四支（off/partial/on/unreadable + rfh 放行）", () => {
+  assert.deepEqual(selectAdmission(), { state: "off" }, "默认 fail-closed（R50 合并前）");
+  assert.deepEqual(selectReject({ state: "off" }, "osh"), { reason: "select_off", text: "选择功能未开放（迁移未开始）" });
+  assert.deepEqual(selectReject({ state: "unreadable" }, "osh"), { reason: "select_writer_state_unreadable", text: "选择功能状态读不清，未执行" });
+  assert.deepEqual(selectReject({ state: "partial" }, "osh"), { reason: "select_partial_not_rfh", text: "迁移期间只接受 rfh_ 重确认 handle" });
+  assert.equal(selectReject({ state: "partial" }, "rfh"), null, "partial 只放行 rfh");
+  assert.equal(selectReject({ state: "on" }, "osh"), null, "on 放行");
+});
+
+test("R52a 返修一：claim meta 按 kind 投影（select 经 controlIntentProblem 合法）/ /feishu-select R3 / 大小写变体 malformed", () => {
+  const h = "osh_" + "a".repeat(32);
+  assert.equal(controlIntentProblem({ control: "select", handle: h, handle_kind: "osh" }), null, "select claim meta 合法（P1 修后）");
+  assert.ok(String(controlIntentProblem({ control: "select", mode: undefined })).includes("字段集不对"), "mode 形状的 select 仍拒（旧 meta bug 的反向）");
+  assert.equal(classifyRisk({ instruction: "/feishu-select " + h, chain: "claude", mode: DIALOGUE_POLICY_ID }).riskClass, RISK.R3, "/feishu-select R3（仅 owner）");
+  assert.equal(parseInboundIntent({ instruction: "/Feishu-Select " + h, chain: "claude" }).intent, INTENT.MALFORMED_CONTROL, "大小写变体 → malformed（不降回普通指令）");
+});
+
+test("R52a 返修二：/feishu-select 入站全路径（owner 默认 off + 终态记录 + 重放幂等 + 非 owner R3）", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-select-claude-"));
+  const root = path.join(local, "project");
+  const bin = path.join(local, "bin");
+  fs.mkdirSync(root); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json");
+  const templateFile = path.join(local, "chain-config.json");
+  const templateConfig = { ...TPL, senders: [{ open_id: "333", role: "participant" }] };
+  fs.writeFileSync(templateFile, JSON.stringify(templateConfig));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{
+    id: "ctl", root, name: "控制演示", root_message_id: "om_select", expires_at: "2099-01-01T00:00:00Z",
+    session_id: "aily_claude_ctl", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z",
+  }] }));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const run = (body, messageId, senderId = TPL.frank_sender_id, extraEnv = {}) => {
+    const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> " + body;
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: {
+      id: messageId, sessionID: "aily_claude_ctl", role: "user", createdBy: senderId, createdAtMs: Date.now(), content,
+    } }) }] });
+    return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], {
+      encoding: "utf-8",
+      env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+        AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_claude_ctl", AILY_CLI_RUN_ID: "run_ctl", FAKE_AILY_ENVELOPE: envelope, ...extraEnv },
+    });
+  };
+  const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs");
+  const receiptsDir = path.join(root, ".runtime-data", "inbound", "receipts");
+  const logicalTaskKey = resolveProject({ root, registryFile, templateFile }).mapping.logical_task_key;
+  const h = "osh_" + "a".repeat(32);
+
+  // 1. 非 owner（participant）发 /feishu-select <osh> → R3 拒绝路径（不取 claim）
+  const nonOwner = run("/feishu-select " + h, "msg_sel_non_owner", "333");
+  assert.equal(nonOwner.status, 0, nonOwner.stdout + nonOwner.stderr);
+  assert.match(nonOwner.stdout, /已拒绝/u, nonOwner.stdout);
+  assert.match(nonOwner.stdout, /participant.*R3.*owner/u, nonOwner.stdout);
+  const nonOwnerKey = claimKey("msg_sel_non_owner", logicalTaskKey);
+  assert.ok(!fs.existsSync(path.join(claimsDir, nonOwnerKey + ".claim")), "非 owner 走 R3 拒绝：不取 claim");
+
+  // 2. owner 发 /feishu-select <osh> → claim 成功（meta.control 为 select 三键形）→ 默认准入 off → 拒绝回执文案 + 终态记录
+  const res = run("/feishu-select " + h, "msg_sel_1");
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  assert.match(res.stdout, /已拒绝 · 选择功能未开放（迁移未开始）/u, res.stdout);
+  const key1 = claimKey("msg_sel_1", logicalTaskKey);
+  const stored = readClaimState({ claimsDir, key: key1 });
+  assert.equal(stored.status, "valid", "claim 成功取得且有效");
+  assert.deepEqual(stored.claim.control, { control: "select", handle: h, handle_kind: "osh" }, "claim meta.control 为 select 三键形");
+  const failedFile = path.join(claimsDir, key1 + ".failed.json");
+  assert.ok(fs.existsSync(failedFile), "终态记录落盘（.failed.json）");
+  const failedDoc = JSON.parse(fs.readFileSync(failedFile, "utf-8"));
+  assert.equal(controlFailedRecordProblem(failedDoc, key1), null, "controlFailedRecordProblem 认得 select 的 failed 记录");
+  assert.equal(failedDoc.control, "select");
+  assert.equal(failedDoc.error, "select_off");
+  const receiptFile = path.join(receiptsDir, "select-rejected-msg_sel_1.json");
+  assert.ok(fs.existsSync(receiptFile), "拒绝回执落盘");
+  assert.equal(fs.readdirSync(claimsDir).filter((n) => n.endsWith(".handed_off.json")).length, 0, "没有投递");
+  const inv = inventoryRuns({ runsDir, claimsDir });
+  assert.equal(inv.problems.filter((p) => p.key === key1).length, 0, "终态闭合，无 in_flight 等账本问题");
+
+  // 3. 同一 message 重放 → 同一终态、不再写第二份回执
+  const receiptsCountBefore = fs.readdirSync(receiptsDir).length;
+  const replay = run("/feishu-select " + h, "msg_sel_1");
+  assert.equal(replay.status, 0, replay.stdout + replay.stderr);
+  assert.match(replay.stdout, /已拒绝 · 选择功能未开放（迁移未开始）/u, replay.stdout);
+  assert.equal(fs.readdirSync(receiptsDir).length, receiptsCountBefore, "同一 message 重放幂等：不再写第二份回执");
+  const replayStored = readClaimState({ claimsDir, key: key1 });
+  assert.equal(replayStored.status, "valid");
+  assert.deepEqual(replayStored.claim.control, { control: "select", handle: h, handle_kind: "osh" });
+  assert.ok(fs.existsSync(failedFile), "同一终态仍有效");
+
+  // 4. 准入为 on 时：owner 发 /feishu-select <osh> → runControlTransaction 落 consumed 记录 + select-pending 回执 + 重放幂等
+  const envOn = { FEISHU_BRIDGE_TEST_SELECT_ADMISSION: JSON.stringify({ state: "on" }) };
+  const resOn = run("/feishu-select " + h, "msg_sel_on", TPL.frank_sender_id, envOn);
+  assert.equal(resOn.status, 0, resOn.stdout + resOn.stderr);
+  assert.match(resOn.stdout, /已收到选择，执行器尚未接入/u, resOn.stdout);
+  const keyOn = claimKey("msg_sel_on", logicalTaskKey);
+  const storedOn = readClaimState({ claimsDir, key: keyOn });
+  assert.equal(storedOn.status, "valid", "on 路径 claim 成功取得且有效");
+  assert.deepEqual(storedOn.claim.control, { control: "select", handle: h, handle_kind: "osh" });
+  const consumedFile = path.join(claimsDir, keyOn + ".consumed.json");
+  assert.ok(fs.existsSync(consumedFile), "终态记录落盘（.consumed.json）");
+  const consumedDoc = JSON.parse(fs.readFileSync(consumedFile, "utf-8"));
+  assert.equal(consumedRecordProblem(consumedDoc, keyOn), null, "consumedRecordProblem 认得 select 的 consumed 记录");
+  assert.equal(consumedDoc.control, "select");
+  assert.equal(consumedDoc.handle, h);
+  assert.equal(consumedDoc.handle_kind, "osh");
+  assert.equal(consumedDoc.changed, false);
+  const pendingReceipt = path.join(receiptsDir, "select-pending-msg_sel_on.json");
+  assert.ok(fs.existsSync(pendingReceipt), "select-pending 回执落盘");
+  const invOn = inventoryRuns({ runsDir, claimsDir });
+  assert.equal(invOn.problems.filter((p) => p.key === keyOn).length, 0, "consumed 终态闭合，无账本问题");
+
+  // consumed 重放幂等
+  const receiptsCountBeforeOn = fs.readdirSync(receiptsDir).length;
+  const replayOn = run("/feishu-select " + h, "msg_sel_on", TPL.frank_sender_id, envOn);
+  assert.equal(replayOn.status, 0, replayOn.stdout + replayOn.stderr);
+  assert.match(replayOn.stdout, /已收到选择，执行器尚未接入/u, replayOn.stdout);
+  assert.equal(fs.readdirSync(receiptsDir).length, receiptsCountBeforeOn, "consumed 重放幂等：不再写第二份回执");
+  const replayOnStored = readClaimState({ claimsDir, key: keyOn });
+  assert.equal(replayOnStored.status, "valid");
+  assert.deepEqual(replayOnStored.claim.control, { control: "select", handle: h, handle_kind: "osh" });
+  assert.ok(fs.existsSync(consumedFile), "同一 consumed 终态仍有效");
 });
 
 test("claim 终态 consumed：账本盘点认识它（不是 unrecognized_entry），也不把它当没有 run 制品的孤儿", () => {

@@ -69,6 +69,16 @@ export function parseControlCommand(instruction, { chain } = {}) {
 
 const CONSUMED_KEYS = "changed,claim_key,control,mode,recorded_at,schema_version,state";
 
+function intentFromConsumedRecord(rec) {
+  return rec?.control === "select"
+    ? { control: "select", handle: rec.handle, handle_kind: rec.handle_kind }
+    : { control: rec?.control, mode: rec?.mode };
+}
+
+function intentTarget(i) {
+  return i?.control === "select" ? i?.handle : i?.mode;
+}
+
 /** consumed 记录（<key>.consumed.json）的封闭形状：键集恰为 CONSUMED_KEYS；坏了要进账本 problems，不能按文件名当健康。 */
 export function consumedRecordProblem(doc, key) {
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return "不是记录对象";
@@ -79,7 +89,7 @@ export function consumedRecordProblem(doc, key) {
   if (doc.state !== "consumed") return "state 不是 consumed";
   if (doc.claim_key !== key) return "claim_key 跟文件名对不上";
   if (!isCanonicalIso(doc.recorded_at)) return "recorded_at 不是规范时间";
-  const intentProblem = controlIntentProblem(doc.control === "select" ? { control: "select", handle: doc.handle, handle_kind: doc.handle_kind } : { control: doc.control, mode: doc.mode });
+  const intentProblem = controlIntentProblem(intentFromConsumedRecord(doc));
   if (intentProblem !== null) return intentProblem;
   if (typeof doc.changed !== "boolean") return "changed 不是布尔";
   return null;
@@ -104,8 +114,13 @@ function readRecordFile(file, { afterOpen = null } = {}) {
 }
 
 /**
- * 读 consumed 记录：absent / valid / mismatch / unreadable。
- * 给了 expectedIntent 就逐字段核对：记录合法但意图对不上 → mismatch（不许把别的意图的结果当成这次的）。
+ * 读一条 claim 对应的 consumed 记录并做受控校验。
+ *
+ * 与 readClaimState 同理：
+ *   · absent：文件不在，正常（还没完成）；
+ *   · unreadable：读不出 / 格式不对 / 校验没过，问题描述在 why 里；
+ *   · mismatch：文件合法但 recorded_at / 意图与当前期望不一致（人换了文件）；
+ *   · valid：内容完整合法。
  */
 export function readConsumedRecord({ claimsDir, key, expectedIntent = undefined, afterOpen = null }) {
   if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) return { status: "unreadable", why: "key 形状不对" };
@@ -113,8 +128,8 @@ export function readConsumedRecord({ claimsDir, key, expectedIntent = undefined,
   if (r.status !== "read") return r;
   const problem = consumedRecordProblem(r.doc, key);
   if (problem) return { status: "unreadable", why: problem };
-  if (expectedIntent !== undefined && !sameControlIntent(expectedIntent, r.doc.control === "select" ? { control: "select", handle: r.doc.handle, handle_kind: r.doc.handle_kind } : { control: r.doc.control, mode: r.doc.mode })) {
-    return { status: "mismatch", why: "consumed 的意图（" + (r.doc.control === "select" ? r.doc.handle : r.doc.mode) + "）与 claim 的意图（" + String(expectedIntent?.mode ?? expectedIntent?.handle) + "）不一致", record: r.doc };
+  if (expectedIntent !== undefined && !sameControlIntent(expectedIntent, intentFromConsumedRecord(r.doc))) {
+    return { status: "mismatch", why: "consumed 的意图（" + intentTarget(r.doc) + "）与 claim 的意图（" + intentTarget(expectedIntent) + "）不一致", record: r.doc };
   }
   return { status: "valid", record: r.doc };
 }
@@ -323,7 +338,7 @@ function runLockedTransaction({ claimsDir, key, intent: caller, execute, replay,
   const intent = claim.claim.control;
   if (intent === undefined) return { ok: false, reason: "not_control", why: "锁内读到的 claim 没有控制意图", quarantined };
   if (caller !== null && !sameControlIntent(caller, intent)) {
-    return { ok: false, reason: "claim_intent_mismatch", why: "锁内 claim 的意图（" + intent.mode + "）与这次的（" + caller.mode + "）不一致", quarantined };
+    return { ok: false, reason: "claim_intent_mismatch", why: "锁内 claim 的意图（" + intentTarget(intent) + "）与这次的（" + intentTarget(caller) + "）不一致", quarantined };
   }
   // **锁内状态对所有调用者都是权威的**：不管调用方自称首次还是重放，这一笔已经闭合（consumed / 受验 failed / 并存）就不再执行。
   // 重复投递先完成、原 claim 持有者晚到 —— 晚到者在这里按记录重出回执（replayed），而不是再切一次并覆写记录。
@@ -340,18 +355,21 @@ function runLockedTransaction({ claimsDir, key, intent: caller, execute, replay,
     quarantined.push(name);
   }
   // consumed 缺席或损坏、failed 不在场：执行（首次）或续做（重放）
-  const done = execute(intent.mode);
+  const done = execute(intent.control === "select" ? intent : intent.mode);
   if (!done.ok) {
-    const why = done.reason ?? "?";
+    const why = done.reason ?? done.error ?? "?";
     if (consumed.status === "absent") {
       try { recordClaimState({ claimsDir, key, state: "failed", detail: { reason: "control_failed", control: intent.control, error: why } }); }
       catch (err) { return { ok: false, reason: "control_failed", why, ledger: "failed_unwritten：" + String(err?.code ?? err?.message ?? err), quarantined }; }
     }
-    return { ok: false, reason: "control_failed", why, quarantined };
+    return { ok: false, reason: "control_failed", why, text: done.text, quarantined };
   }
   const changed = done.changed !== false;
   try {
-    recordClaimState({ claimsDir, key, state: "consumed", detail: { control: intent.control, mode: intent.mode, changed } });
+    const detail = intent.control === "select"
+      ? { control: "select", handle: intent.handle, handle_kind: intent.handle_kind, changed }
+      : { control: intent.control, mode: intent.mode, changed };
+    recordClaimState({ claimsDir, key, state: "consumed", detail });
   } catch (err) {
     return { ok: false, reason: "ledger_unwritten", why: String(err?.code ?? err?.message ?? err), changed, resumed: replay, quarantined };
   }
@@ -384,9 +402,10 @@ export function inspectControlClaim({ claimsDir, key, expect = {} }) {
   if (consumed.status !== "absent" && failed.status !== "absent") return { state: "conflict", intent, why: jointWhy(failed, consumed), ...extras };
   if (consumed.status === "unreadable") return { state: "consumed_unreadable", intent, why: consumed.why, ...extras };
   if (consumed.status === "valid") {
-    return sameControlIntent(intent, { control: consumed.record.control, mode: consumed.record.mode })
+    const cIntent = intentFromConsumedRecord(consumed.record);
+    return sameControlIntent(intent, cIntent)
       ? { state: "consumed", intent, record: consumed.record, ...extras }
-      : { state: "mismatch", intent, why: "consumed 的意图（" + consumed.record.mode + "）与 claim 的意图（" + intent.mode + "）不一致", ...extras };
+      : { state: "mismatch", intent, why: "consumed 的意图（" + intentTarget(consumed.record) + "）与 claim 的意图（" + intentTarget(intent) + "）不一致", ...extras };
   }
   if (failed.status === "valid") return { state: "failed", intent, record: failed.record, ...extras };
   if (failed.status === "unreadable") return { state: "failed_unreadable", intent, why: failed.why, ...extras };
@@ -413,8 +432,9 @@ export function resumeControlClaim({ claimsDir, key, execute, expect = {} }) {
     const quarantined = listed.status === "listed" ? listed.quarantined : [];
     if (consumed.status !== "absent" && failed.status !== "absent") return { ok: false, reason: "conflict", why: jointWhy(failed, consumed) };
     if (consumed.status === "valid") {
-      if (!sameControlIntent(intent, { control: consumed.record.control, mode: consumed.record.mode })) {
-        return { ok: false, reason: "mismatch", why: "consumed 的意图（" + consumed.record.mode + "）与 claim 的意图（" + intent.mode + "）不一致" };
+      const cIntent = intentFromConsumedRecord(consumed.record);
+      if (!sameControlIntent(intent, cIntent)) {
+        return { ok: false, reason: "mismatch", why: "consumed 的意图（" + intentTarget(consumed.record) + "）与 claim 的意图（" + intentTarget(intent) + "）不一致" };
       }
       // 已闭合：只清同 key 的临时残骸 —— 也只在锁内确认 claim 仍属于当前身份、consumed 仍完整一致之后才清
       const cleaned = cleanupConsumedResidue({ claimsDir, key });

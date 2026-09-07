@@ -38,7 +38,7 @@ import { senderRole } from "./sender-roles.mjs";
 import { classifyRisk } from "./risk-class.mjs";
 import { INTENT, parseInboundIntent, controlRejectText, rejectedControlProjection } from "./inbound-intent.mjs";
 import { runRejectTransaction } from "./reject-control.mjs";
-import { sameRejectedControl } from "./control-intent.mjs";
+import { sameControlIntent, sameRejectedControl } from "./control-intent.mjs";
 import { authorize, CAPABILITY } from "./authorize.mjs";
 import { handOff, handOffReplyOnly, acquireSessionLock, releaseSessionLock, stampSessionLock } from "./handoff.mjs";
 import {
@@ -68,7 +68,7 @@ import {
 import { isDirectRun } from "./direct-run.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
-import { selectAdmission, selectReject } from "./select-admission.mjs";
+import { selectAdmission, selectReject, selectRejectTextByReason } from "./select-admission.mjs";
 /**
  * 整个入站流程包在 main() 里，只有被直接执行时才跑。
  *
@@ -736,6 +736,39 @@ const runControl = (replay) => {
   finish("control", { text: controlAckText({ taskName: config.task_display_name, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed, lockUncleared: tx.lockUncleared ?? null }) },
     { control: control.kind, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed });
 };
+// ---------- /feishu-select 控制命令事务（R52a）：锁内确定性处置准入，落 failed / consumed 终态 ----------
+const runSelect = (replay) => {
+  const tx = runControlTransaction({
+    claimsDir: CLAIMS, key: claim.key, intent: control ? { control: "select", handle: control.handle, handle_kind: control.handle_kind } : undefined, replay, expect: claimExpect,
+    execute: () => {
+      const adm = selectAdmission(process.env);
+      const ej = selectReject(adm, control.handle_kind);
+      if (ej) return { ok: false, reason: ej.reason, text: ej.text };
+      return { ok: true, changed: false, text: "已收到选择，执行器尚未接入" };
+    },
+  });
+  const lockNote = tx.lockUncleared ? "；另外这一笔的事务锁没有交还（" + tx.lockUncleared + "），之后同一笔会报 control_busy，请人工确认后处理" : "";
+  const base = { control: "select", handle_kind: control.handle_kind, message_id: verdict.messageId, project_root: routed.root, handed_off: false, lock_uncleared: tx.lockUncleared ?? null };
+  if (!tx.ok) {
+    if (tx.reason === "control_failed" || tx.reason === "control_failed_recorded") {
+      const text = selectRejectTextByReason(tx.why);
+      if (!replay && !tx.replayed) {
+        writeReceipt("select-rejected-" + verdict.messageId, { status: "rejected", reason: tx.why, ...base, claim_acquired: true });
+      }
+      finish("rejected", { reasonText: text + "。没有执行，也没有投递。" + lockNote, taskName: config.task_display_name },
+        { reason: tx.why, control: "select", replayed: tx.replayed });
+      return;
+    }
+    writeReceipt("select-" + verdict.messageId, { status: "error", reason: tx.reason, ...base, claim_acquired: !replay, error: tx.why });
+    finish("error", { detail: "选择命令未执行（" + tx.why + "）" + lockNote }, { reason: tx.reason });
+    return;
+  }
+  if (!replay && !tx.replayed) {
+    writeReceipt("select-pending-" + verdict.messageId, { status: "consumed", reason: "select_pending", ...base, claim_acquired: true });
+  }
+  finish("control", { text: "已收到选择，执行器尚未接入" + lockNote, taskName: config.task_display_name },
+    { control: "select", handle_kind: control.handle_kind, replayed: tx.replayed });
+};
 
 // 校验通过才允许 claim。claim 是幂等的唯一保证。
 const claim = acquireClaim({
@@ -761,9 +794,13 @@ if (!claim.ok && claim.reason === "duplicate" && control) {
   // 控制命令重放：按原 claim 里的意图恢复（意图一致才续做；不一致说明是另一条不同正文的命令撞了同一消息 id，拒）。
   const original = readClaimState({ claimsDir: CLAIMS, key: claim.key, expect: claimExpect });
   const intent = original.status === "valid" ? original.claim.control : undefined;
-  if (intent && intent.control === control.kind && intent.mode === control.mode) {
+  const currentIntent = control.kind === "select"
+    ? { control: "select", handle: control.handle, handle_kind: control.handle_kind }
+    : { control: control.kind, mode: control.mode };
+  if (intent && sameControlIntent(intent, currentIntent)) {
     claim.key = claim.key ?? claimKey(verdict.messageId, verdict.logicalTaskKey);
-    runControl(true);
+    if (control.kind === "select") runSelect(true);
+    else runControl(true);
   }
 }
 if (!claim.ok && claim.reason === "duplicate" && rejectedProjection) {
@@ -800,18 +837,6 @@ if (!claim.ok) {
 if (rejectedProjection) rejectControl(false);
 
 // ---------- 控制命令：拿到 claim 之后当场执行（可恢复事务），不投递 ----------
-const runSelect = (replay) => {
-  const adm = selectAdmission(process.env);
-  const ej = selectReject(adm, control.handle_kind);
-  const base = { control: "select", handle_kind: control.handle_kind, message_id: verdict.messageId, handed_off: false };
-  if (ej) {
-    writeReceipt("select-rejected-" + verdict.messageId, { status: "rejected", reason: ej.reason, ...base, project_root: routed.root, claim_acquired: !replay });
-    finish("rejected", { reasonText: ej.text + "。没有执行，也没有投递。", taskName: config.task_display_name }, { reason: ej.reason, control: "select" });
-    return;
-  }
-  writeReceipt("select-pending-" + verdict.messageId, { status: "consumed", reason: "select_pending", ...base, project_root: routed.root, claim_acquired: !replay });
-  finish("control", { text: "已收到选择，执行器尚未接入", taskName: config.task_display_name }, { control: "select", handle_kind: control.handle_kind });
-};
 if (control && control.kind === "select") runSelect(false);
 else if (control) runControl(false);
 

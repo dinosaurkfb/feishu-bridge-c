@@ -36777,6 +36777,41 @@ test("R53 B drained 前置：campaign open/zero-counts ok，campaign_not_open �
 
 // R53 步2b：B 原子进段（buildBSteps steps 一次 updateJournal）→ 进段后 journalProblem===null。
 
+// R53 步2b：B 原子进段（buildBSteps steps 一次 updateJournal）→ 进段后 journalProblem===null。
+test("R53 步2b：osmEnterForwardB 进段（drained→osm_b_strictening，journalProblem===null）", () => {
+  const realpathTmp = fs.realpathSync(os.tmpdir());
+  const b = fs.mkdtempSync(path.join(realpathTmp, "r53-bfw-"));
+  const ledgerRoot = path.join(b, "ledger"); fs.mkdirSync(ledgerRoot, { recursive: true, mode: 0o700 }); fs.chmodSync(ledgerRoot, 0o700);
+  const maintDir = path.join(b, "maintenance"); fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 }); fs.chmodSync(maintDir, 0o700);
+  const gateFile = path.join(b, "maintenance.gate");
+  const EP = "endpoint_" + "a".repeat(24);
+  const env = { ...process.env, HOME: b, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };
+  const hx = (n) => String(n).repeat(64), uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000", iso = (t) => new Date(t).toISOString();
+  const tok = uuid(9), cid = campaignIdFor(tok), at = iso(1700000000000), sha = "b".repeat(64);
+  const epDir = path.join(ledgerRoot, EP); fs.mkdirSync(epDir, { recursive: true, mode: 0o700 }); fs.chmodSync(epDir, 0o700);
+  const ledger = { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: "claude", authority_mode: "shadow", revision: 1, operations: { [uuid(1)]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } } }, records: {} };
+  const ledgerFile = path.join(epDir, "ledger.json"); fs.writeFileSync(ledgerFile, JSON.stringify(ledger, null, 2) + "\n", { mode: 0o600 }); fs.chmodSync(ledgerFile, 0o600);
+  const writeCampaign = (state, pendingJoins = []) => { const doc = { schema_version: "owner-select-campaign-1", state, campaign_id: cid, endpoints: [EP], endpoints_digest: endpointsDigest([EP]), members: { [EP]: { legacy_proof_count: 0, null_b1_count: 0, schema_version: "1.1-transition" } }, pending_joins: pendingJoins, revision: 1, origin_operation_id: tok }; const f = path.join(ledgerRoot, "owner-select-campaign.json"); fs.writeFileSync(f, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 }); fs.chmodSync(f, 0o600); };
+  const writeWriter = (state) => { const doc = { schema_version: "owner-select-writer-state-1", state, campaign_id: state === "off" ? null : cid, endpoints_digest: state === "off" ? null : endpointsDigest([EP]), revision: 1, origin_operation_id: tok }; const f = path.join(ledgerRoot, "owner-select-writer-state.json"); fs.writeFileSync(f, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 }); fs.chmodSync(f, 0o600); };
+  writeCampaign("open", []); writeWriter("partial");
+  const ctx = maintenanceContext({ home: b, dir: maintDir, gateFile, now: () => 1750000000000 });
+  const tDone = (c) => ({ id: "timer:" + c, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null }); const sDone = (c) => ({ id: "stub:" + c, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null }); const cDone = (c) => ({ id: "current:" + c, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null }); const gDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+  const jdoc = { schema_version: "1.4", operation_kind: "owner_select_migration_b", reason: "r53", started_at: at, updated_at: at, token: tok, notes: [], phase: "drained", steps: [...["claude", "codex"].flatMap((c) => [tDone(c), sDone(c), cDone(c)]), gDone()] };
+  assert.equal(journalProblem(jdoc, { maintenanceDir: maintDir }), null, "drained journal 自洽");
+  fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(jdoc, null, 2) + "\n", { mode: 0o600 });
+  try { fs.unlinkSync(path.join(maintDir, "active")); } catch {}
+  fs.symlinkSync(tok, path.join(maintDir, "active"));
+  createGate({ file: gateFile, reason: "r53", token: tok, now: 1750000000000 });
+  const lease = acquireOperationLease({ dir: maintDir, token: tok });
+  assert.equal(lease.ok, true, "取租约");
+  const r = osmEnterForwardB52(ctx, { token: tok, lease, env });
+  assert.equal(r.ok, true, "B 进段：" + JSON.stringify(r));
+  const j2 = readJournal({ dir: maintDir, token: tok });
+  assert.equal(j2.doc.phase, "osm_b_strictening");
+  assert.equal(journalProblem(j2.doc, { maintenanceDir: maintDir }), null, "进段后 journalProblem===null：" + journalProblem(j2.doc, { maintenanceDir: maintDir }));
+  fs.rmSync(b, { recursive: true, force: true });
+});
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

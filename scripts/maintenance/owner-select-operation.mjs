@@ -22,7 +22,7 @@ import { readStagedVerified, removeStagedPlan } from "../m1b/staged-plan.mjs";
 import { removeStubVersion } from "./stub.mjs";
 import { bootstrapTimer, timerPhase } from "./timers.mjs";
 import { chainFacts } from "./precheck.mjs";
-import { acquireOperationLease, addNote, clearActive, markStepDone, readActive, readJournal, releaseOperationLease, setPhase, updateJournal, verifyBackup } from "./journal.mjs";
+import { acquireOperationLease, addNote, clearActive, journalProblem, markStepDone, readActive, readJournal, releaseOperationLease, setPhase, updateJournal, verifyBackup } from "./journal.mjs";
 import { readGate } from "../maintenance-gate-core.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
 import { applyMintPlan, applySchemaUpgrade, buildMintPlan, loadLedger, migrationInventory, mintPlanProblem, mintSelectionHandles, ownerSelectSchemaUpgradeOpId, resolveEndpointDir, schemaUpgrade, serializeLedger } from "../topic-agent-ledger.mjs";
@@ -301,12 +301,10 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
 
 // R53 步2a：B 原子进段的 step 构造函数（seal / 每 ep precheck / 每 ep strict（applySchemaUpgrade 预算）/ complete / on）。
 export function buildBSteps({ ctx, token, env }) {
-  const cs = readCampaignDocVerified(env);
-  if (cs.absent) return { ok: false, reason: "campaign_not_open", why: "B 需 campaign open" };
-  if (!cs.ok) return { ok: false, reason: "campaign_unreadable", why: cs.problem };
-  if (cs.doc.state !== "open") return { ok: false, reason: "campaign_not_open", why: "B 需 campaign open（state=" + cs.doc.state + "）" };
-  const cid = cs.doc.campaign_id;
-  const frozen = [...cs.doc.endpoints].sort();
+  const cs = readCampaignState(env);
+  if (!(cs.exists && cs.state === "open")) { fs.writeFileSync("/tmp/r53dbg3.txt", JSON.stringify({csExists: cs.exists, csState: cs.state, ledDir: env.FEISHU_BRIDGE_LEDGER_DIR, home: env.HOME})); return { ok: false, reason: "campaign_not_open", why: "B 需 campaign open（state=" + cs.state + "）" }; }
+  const cid = cs.campaign_id;
+  const frozen = [...cs.endpoints].sort();
   const digest = endpointsDigest(frozen);
   const ws = readWriterState(env);
   if (!(ws.exists && ws.state === "partial" && ws.campaign_id === cid)) return { ok: false, reason: "writer_not_partial", why: "B 需 writer-state partial 同 id" };
@@ -314,26 +312,29 @@ export function buildBSteps({ ctx, token, env }) {
   const steps = [];
   const memberOf = (ep) => { const d = resolveEndpointDir(ep, { env }); const L = loadLedger(d.dir, { endpointId: ep }); const inv = migrationInventory(L.doc); return { schema_version: L.doc.schema_version, legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count }; };
   // campaign sealed（digest 冻结）+ complete 文档（members 预算为 strict 后：1.1 + 两计数 0）。
-  const sealedDoc = { schema_version: CAMPAIGN_SCHEMA, state: "sealed", campaign_id: cid, endpoints: frozen, endpoints_digest: digest, members: Object.fromEntries(frozen.map((ep) => [ep, memberOf(ep)])), pending_joins: [], revision: (cs.doc.revision ?? 1), origin_operation_id: token };
-  const completeDoc = { schema_version: CAMPAIGN_SCHEMA, state: "complete", campaign_id: cid, endpoints: frozen, endpoints_digest: digest, members: Object.fromEntries(frozen.map((ep) => [ep, { schema_version: "1.1", legacy_proof_count: 0, null_b1_count: 0 }])), pending_joins: [], revision: (cs.doc.revision ?? 1) + 1, origin_operation_id: token };
+  const sealedDoc = { schema_version: CAMPAIGN_SCHEMA, state: "sealed", campaign_id: cid, endpoints: frozen, endpoints_digest: digest, members: Object.fromEntries(frozen.map((ep) => [ep, memberOf(ep)])), pending_joins: [], revision: 1, origin_operation_id: token };
+  const completeDoc = { schema_version: CAMPAIGN_SCHEMA, state: "complete", campaign_id: cid, endpoints: frozen, endpoints_digest: digest, members: Object.fromEntries(frozen.map((ep) => [ep, { schema_version: "1.1", legacy_proof_count: 0, null_b1_count: 0 }])), pending_joins: [], revision: 2, origin_operation_id: token };
   const onDoc = { schema_version: WRITER_STATE_SCHEMA, state: "on", campaign_id: cid, endpoints_digest: digest, revision: ws.revision + 1, origin_operation_id: token };
-  const csb = { exists: true, sha256: cs.sha256, state: cs.doc.state, campaign_id: cid, endpoints: frozen, endpoints_digest: digest };
-  steps.push({ kind: "campaign", id: "campaign:" + cid + ":seal", state: "prepared", at: new Date(ctx.now()).toISOString(), target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: csb, intended_after: { exists: true, sha256: shaHex(serializeLedger(sealedDoc)), state: "sealed", campaign_id: cid, endpoints: frozen, endpoints_digest: digest } });
+  const csb = { exists: true, sha256: cs.sha256, state: cs.state, campaign_id: cid, endpoints: frozen, endpoints_digest: digest };
+  const sealBak = path.join(stagedDir, "backup-campaign-seal.json"); fs.writeFileSync(sealBak, fs.readFileSync(campaignPath(env)), { mode: 0o600 });
+  steps.push({ kind: "campaign", id: "campaign:" + cid + ":seal", state: "prepared", at: new Date(ctx.now()).toISOString(), target: "ledger/owner-select-campaign.json", chain: null, backup: sealBak, backup_sha256: cs.sha256, backup_bytes: fs.readFileSync(campaignPath(env)).length, before: csb, intended_after: { exists: true, sha256: shaHex(serializeLedger(sealedDoc)), state: "sealed", campaign_id: cid, endpoints: frozen, endpoints_digest: digest } });
   for (const ep of frozen) {
     const d = resolveEndpointDir(ep, { env }); if (!d.ok) return { ok: false, reason: d.reason, why: ep };
     const L = loadLedger(d.dir, { endpointId: ep }); if (!L.ok) return { ok: false, reason: "ledger_unreadable", why: ep };
     if (L.doc.schema_version !== "1.1-transition") return { ok: false, reason: "schema_not_transition", why: ep };
     const inv = migrationInventory(L.doc);
     const pc = { legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count, revision: L.doc.revision, ledger_sha256: L.sha256 };
-    steps.push({ kind: "precheck", id: "precheck:" + ep, state: "prepared", at: new Date(ctx.now()).toISOString(), target: "ledger/" + ep + "/ledger.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: pc, intended_after: { ...pc }, after: { ...pc } });
+    steps.push({ kind: "precheck", id: "precheck:" + ep, state: "prepared", at: new Date(ctx.now()).toISOString(), target: "ledger/" + ep + "/ledger.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: pc, intended_after: { ...pc } });
     const opId = ownerSelectSchemaUpgradeOpId(token, ep);
     const strict = applySchemaUpgrade(L.doc, { operation_id: opId, request_key: token + ":schema:" + ep, from_schema: "1.1-transition", to_schema: "1.1" });
     const strictSha = shaHex(serializeLedger(strict));
     const backup = path.join(stagedDir, "backup-" + ep + "-strict.json"); fs.writeFileSync(backup, fs.readFileSync(path.join(d.dir, "ledger.json")), { mode: 0o600 });
     steps.push({ kind: "schema_endpoint", id: "schema_endpoint:" + ep + ":strict", state: "prepared", at: new Date(ctx.now()).toISOString(), target: "ledger/" + ep + "/ledger.json", chain: null, backup, backup_sha256: shaHex(fs.readFileSync(path.join(d.dir, "ledger.json"))), backup_bytes: fs.readFileSync(path.join(d.dir, "ledger.json")).length, before: { schema_version: "1.1-transition", revision: L.doc.revision, ledger_sha256: L.sha256 }, intended_after: { schema_version: "1.1", revision: L.doc.revision + 1, ledger_sha256: strictSha } });
   }
-  steps.push({ kind: "campaign", id: "campaign:" + cid + ":complete", state: "prepared", at: new Date(ctx.now()).toISOString(), target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: true, sha256: shaHex(serializeLedger(sealedDoc)), state: "sealed", campaign_id: cid, endpoints: frozen, endpoints_digest: digest }, intended_after: { exists: true, sha256: shaHex(serializeLedger(completeDoc)), state: "complete", campaign_id: cid, endpoints: frozen, endpoints_digest: digest } });
-  steps.push({ kind: "writer_state", id: "writer_state:" + cid + ":on", state: "prepared", at: new Date(ctx.now()).toISOString(), target: "ledger/owner-select-writer-state.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: true, sha256: ws.sha256, state: "partial", campaign_id: cid, endpoints_digest: ws.endpoints_digest, revision: ws.revision }, intended_after: { exists: true, sha256: shaHex(serializeLedger(onDoc)), state: "on", campaign_id: cid, endpoints_digest: digest, revision: ws.revision + 1 } });
+  const compBak = path.join(stagedDir, "backup-campaign-complete.json"); fs.writeFileSync(compBak, fs.readFileSync(campaignPath(env)), { mode: 0o600 });
+  steps.push({ kind: "campaign", id: "campaign:" + cid + ":complete", state: "prepared", at: new Date(ctx.now()).toISOString(), target: "ledger/owner-select-campaign.json", chain: null, backup: compBak, backup_sha256: shaHex(serializeLedger(sealedDoc)), backup_bytes: fs.readFileSync(campaignPath(env)).length, before: { exists: true, sha256: shaHex(serializeLedger(sealedDoc)), state: "sealed", campaign_id: cid, endpoints: frozen, endpoints_digest: digest }, intended_after: { exists: true, sha256: shaHex(serializeLedger(completeDoc)), state: "complete", campaign_id: cid, endpoints: frozen, endpoints_digest: digest } });
+  const onBak = path.join(stagedDir, "backup-writer-on.json"); fs.writeFileSync(onBak, fs.readFileSync(writerStatePath(env)), { mode: 0o600 });
+  steps.push({ kind: "writer_state", id: "writer_state:" + cid + ":on", state: "prepared", at: new Date(ctx.now()).toISOString(), target: "ledger/owner-select-writer-state.json", chain: null, backup: onBak, backup_sha256: ws.sha256, backup_bytes: fs.readFileSync(writerStatePath(env)).length, before: { exists: true, sha256: ws.sha256, state: "partial", campaign_id: cid, endpoints_digest: ws.endpoints_digest, revision: ws.revision }, intended_after: { exists: true, sha256: shaHex(serializeLedger(onDoc)), state: "on", campaign_id: cid, endpoints_digest: digest, revision: ws.revision + 1 } });
   return { ok: true, steps, cid, frozen };
 }
 
@@ -344,7 +345,7 @@ export function osmEnterForwardB(ctx, { token, lease, env = process.env } = {}) 
   if (j.state !== "valid") return fail("journal_" + j.state, j.why ?? null);
   if (j.doc.operation_kind !== "owner_select_migration_b") return fail("bad_operation_kind", "operation_kind " + j.doc.operation_kind);
   if (j.doc.phase !== "drained") return fail("not_drained", "phase " + j.doc.phase);
-  const built = buildBSteps(ctx, { token, env });
+  const built = buildBSteps({ ctx, token, env });
   if (!built.ok) return fail(built.reason, built.why);
   const r = updateJournal({ dir: ctx.dir, token, lease, expectPhase: "drained", now: ctx.now(), mutate: (d) => { d.phase = "osm_b_strictening"; d.steps = [...d.steps, ...built.steps]; return d; } });
   if (!r.ok) return fail(r.reason, r.why ?? null);

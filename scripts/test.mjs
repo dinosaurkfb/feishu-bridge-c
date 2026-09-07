@@ -33888,7 +33888,7 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
   }
 });
 
-function setupMaintFixtureA({ maintDir, tok, cid, eps, now = "2026-09-07T10:00:00.000Z" }) {
+function setupMaintFixtureA({ maintDir, tok, cid, eps, now = "2026-09-07T10:00:00.000Z", gateFile = null }) {
   const dig = endpointsDigest(eps);
   const enterSteps = [
     { kind: "timer", id: "timer:claude", state: "done", at: now, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
@@ -33950,13 +33950,17 @@ function setupMaintFixtureA({ maintDir, tok, cid, eps, now = "2026-09-07T10:00:0
   const activeLink = path.join(maintDir, "active");
   try { fs.unlinkSync(activeLink); } catch {}
   fs.symlinkSync(tok, activeLink);
+  const gf = gateFile ?? path.join(path.dirname(maintDir), "maintenance.gate");
+  try { fs.unlinkSync(gf); } catch {}
+  createGate({ file: gf, reason: "A fixture", token: tok, now });
+  acquireOperationLease({ dir: maintDir, token: tok });
   return {
     capCampaignOpen: { token: tok, stepId: "campaign:" + cid + ":open" },
     capWriterPartial: { token: tok, stepId: "writer_state:" + cid + ":partial" }
   };
 }
 
-function setupMaintFixtureB({ maintDir, tok, cid, eps, cBeforeSha, wBeforeSha, now = "2026-09-07T10:00:00.000Z" }) {
+function setupMaintFixtureB({ maintDir, tok, cid, eps, cBeforeSha, wBeforeSha, now = "2026-09-07T10:00:00.000Z", gateFile = null }) {
   const dig = endpointsDigest(eps);
   const enterSteps = [
     { kind: "timer", id: "timer:claude", state: "done", at: now, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
@@ -34024,6 +34028,10 @@ function setupMaintFixtureB({ maintDir, tok, cid, eps, cBeforeSha, wBeforeSha, n
   const activeLink = path.join(maintDir, "active");
   try { fs.unlinkSync(activeLink); } catch {}
   fs.symlinkSync(tok, activeLink);
+  const gf = gateFile ?? path.join(path.dirname(maintDir), "maintenance.gate");
+  try { fs.unlinkSync(gf); } catch {}
+  createGate({ file: gf, reason: "B fixture", token: tok, now });
+  acquireOperationLease({ dir: maintDir, token: tok });
   return {
     capCampaignSeal: { token: tok, stepId: "campaign:" + cid + ":seal" },
     capWriterOn: { token: tok, stepId: "writer_state:" + cid + ":on" }
@@ -34050,7 +34058,8 @@ test("R50 §二 owner-select-state：campaign 与 writer-state 文件合同与�
   fs.chmodSync(ledgerDir, 0o700);
   const maintDir = path.join(tmpHome, "maintenance");
   fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
-  const env = { FEISHU_BRIDGE_LEDGER_DIR: ledgerDir, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir };
+  const gateFile = path.join(tmpHome, "maintenance.gate");
+  const env = { FEISHU_BRIDGE_LEDGER_DIR: ledgerDir, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };
 
   assert.equal(campaignPath(env), path.join(ledgerDir, "owner-select-campaign.json"));
   assert.equal(writerStatePath(env), path.join(ledgerDir, "owner-select-writer-state.json"));
@@ -34655,8 +34664,9 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
 
   const maintDirR2 = path.join(tmpBase, "maintenance");
   fs.mkdirSync(maintDirR2, { mode: 0o700 });
-  const envOk = { FEISHU_BRIDGE_LEDGER_DIR: realLedgerDir, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDirR2 };
-  const { capCampaignOpen: cap1 } = setupMaintFixtureA({ maintDir: maintDirR2, tok: tok1, cid: cid1, eps });
+  const gateFileR2 = path.join(tmpBase, "maintenance.gate");
+  const envOk = { FEISHU_BRIDGE_LEDGER_DIR: realLedgerDir, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDirR2, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFileR2 };
+  const { capCampaignOpen: cap1 } = setupMaintFixtureA({ maintDir: maintDirR2, tok: tok1, cid: cid1, eps, gateFile: gateFileR2 });
 
   const dummyDoc = {
     schema_version: "owner-select-campaign-1",
@@ -35188,9 +35198,11 @@ test("R50 返修四 3 P1 + 3 P2：finalize 一次性不抛、维护窄事务 cap
   fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
   const maintDir = path.join(tmpRoot, "maint");
   fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+  const gateFile = path.join(tmpRoot, "maintenance.gate");
   const env = {
     FEISHU_BRIDGE_LEDGER_DIR: ledgerDir,
     FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir,
+    FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile,
   };
 
   // 1. 【P1-3】pending_joins 身份形状封闭
@@ -35359,6 +35371,9 @@ test("R50 返修四 3 P1 + 3 P2：finalize 一次性不抛、维护窄事务 cap
   const activeLink = path.join(maintDir, "active");
   if (fs.existsSync(activeLink)) fs.unlinkSync(activeLink);
   fs.symlinkSync(tok, activeLink);
+  try { fs.unlinkSync(gateFile); } catch {}
+  createGate({ file: gateFile, reason: "A migration test", token: tok });
+  acquireOperationLease({ dir: maintDir, token: tok });
 
   const capCampaignValid = { token: tok, stepId: stepCampaignOpenId };
   const capWriterValid = { token: tok, stepId: stepWriterPartialId };
@@ -35390,6 +35405,39 @@ test("R50 返修四 3 P1 + 3 P2：finalize 一次性不抛、维护窄事务 cap
 
   // 恢复合法 journal
   fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(journalDocValid, null, 2) + "\n", { mode: 0o600 });
+
+  // (e) 无 gate 文件拒
+  try { fs.unlinkSync(gateFile); } catch {}
+  const rNoGate = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDocSingle, capability: capCampaignValid });
+  assert.equal(rNoGate.ok, false);
+  assert.equal(rNoGate.commit, "not_committed");
+  assert.equal(rNoGate.reason, "maintenance_capability_required");
+  assert.match(rNoGate.why, /gate|门/u);
+
+  // (f) gate token 不符拒
+  const badGateTok = "00000000-0000-4000-8000-000000000099";
+  createGate({ file: gateFile, reason: "bad gate", token: badGateTok });
+  const rBadGateTok = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDocSingle, capability: capCampaignValid });
+  assert.equal(rBadGateTok.ok, false);
+  assert.equal(rBadGateTok.commit, "not_committed");
+  assert.equal(rBadGateTok.reason, "maintenance_capability_required");
+  assert.match(rBadGateTok.why, /gate_token_mismatch|门 token/u);
+
+  // 恢复合法 gate
+  try { fs.unlinkSync(gateFile); } catch {}
+  createGate({ file: gateFile, reason: "valid gate", token: tok });
+
+  // (g) lease 缺席拒
+  const lPath = path.join(maintDir, tok + ".lease");
+  try { fs.unlinkSync(lPath); } catch {}
+  const rNoLease = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDocSingle, capability: capCampaignValid });
+  assert.equal(rNoLease.ok, false);
+  assert.equal(rNoLease.commit, "not_committed");
+  assert.equal(rNoLease.reason, "maintenance_capability_required");
+  assert.match(rNoLease.why, /lease_absent|租约/u);
+
+  // 恢复合法 lease
+  acquireOperationLease({ dir: maintDir, token: tok });
 
   // 4. 【P2-2】tmp fsync 失败尽力清理残骸
   const origFsync = fs.fsyncSync;
@@ -35450,6 +35498,56 @@ test("R50 返修四 3 P1 + 3 P2：finalize 一次性不抛、维护窄事务 cap
     try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch { /* 忽略 */ }
     try { fs.rmSync(lockDir + ".reap", { recursive: true, force: true }); } catch { /* 忽略 */ }
     // 清理盘上已写文件方便后续测试
+    const cFile = path.join(ledgerDir, "owner-select-campaign.json");
+    if (fs.existsSync(cFile)) fs.unlinkSync(cFile);
+  }
+
+  // 5b. 【返修五】exitWithLock 里 rename 已落地（如目录 fsync EIO）且释放锁出残骸时，结果必须是 lock_residue，不得是 not_committed
+  // 注入双重异常：目录 fsync 抛 EIO（rename 已成）+ 释放锁抛 EIO（产生残骸）
+  const origFsyncDir = fs.fsyncSync;
+  const origRmDir = fs.rmSync;
+  let failDirFsyncDual = false;
+  let throwLockReleaseDual = false;
+  fs.fsyncSync = function(fd) {
+    if (failDirFsyncDual) {
+      try {
+        if (fs.fstatSync(fd).isDirectory()) {
+          const err = new Error("EIO: dir fsync dual error");
+          err.code = "EIO";
+          throw err;
+        }
+      } catch (e) {
+        if (e.code === "EIO") throw e;
+      }
+    }
+    return origFsyncDir.apply(this, arguments);
+  };
+  fs.rmSync = function(p, opts) {
+    if (throwLockReleaseDual && String(p) === lockDir) {
+      const err = new Error("EIO: lock release dual error");
+      err.code = "EIO";
+      throw err;
+    }
+    return origRmDir.apply(this, arguments);
+  };
+  try {
+    failDirFsyncDual = true;
+    throwLockReleaseDual = true;
+    const rDual = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDocSingle, capability: capCampaignValid });
+    assert.notEqual(rDual.commit, "not_committed", "rename 已落地且释放锁出残骸时绝不得返回 not_committed");
+    assert.equal(rDual.commit, "lock_residue");
+    assert.equal(rDual.reason, "lock_release_residue");
+    assert.match(rDual.why, /lock_release_throw|EIO/u);
+    const diskDocDual = readCampaignState(env);
+    assert.equal(diskDocDual.exists, true, "盘上已落地的 campaign 必须受验可读");
+    assert.equal(diskDocDual.state, "open");
+  } finally {
+    fs.fsyncSync = origFsyncDir;
+    fs.rmSync = origRmDir;
+    failDirFsyncDual = false;
+    throwLockReleaseDual = false;
+    try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    try { fs.rmSync(lockDir + ".reap", { recursive: true, force: true }); } catch { /* 忽略 */ }
     const cFile = path.join(ledgerDir, "owner-select-campaign.json");
     if (fs.existsSync(cFile)) fs.unlinkSync(cFile);
   }

@@ -743,7 +743,8 @@ const claim = acquireClaim({
   messageId: verdict.messageId,
   logicalTaskKey: verdict.logicalTaskKey,
   meta: {
-    ...(control ? { control: { control: control.kind, mode: control.mode } } : {}),
+    // R52a 返修一 P1：claim meta 按 kind 投影 —— mode → {control,mode}；select → {control,handle,handle_kind}（避免 controlIntentProblem 以 mode 形状核 select 而拒）。
+    ...(control ? { control: control.kind === "select" ? { control: "select", handle: control.handle, handle_kind: control.handle_kind } : { control: control.kind, mode: control.mode } } : {}),
     ...(rejectedProjection ? { rejected_control: rejectedProjection } : {}),
     session_id: event.session_id,
     binding_id: effectiveBindingId(mapping),

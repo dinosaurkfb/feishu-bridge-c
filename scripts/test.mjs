@@ -18775,6 +18775,13 @@ test("控制命令只认封闭的精确形状：两条链各两条，多一个�
   assert.equal(parseControlCommand("/feishu-mode dialogue", { chain: "other" }), null, "链不认识就不认");
   assert.equal(parseControlCommand("/feishu-mode dialogue", {}), null);
 
+test("R52a 返修一：claim meta 按 kind 投影（select 经 controlIntentProblem 合法）/ /feishu-select R3 / 大小写变体 malformed", () => {
+  const h = "osh_" + "a".repeat(32);
+  assert.equal(controlIntentProblem({ control: "select", handle: h, handle_kind: "osh" }), null, "select claim meta 合法（P1 修后）");
+  assert.ok(String(controlIntentProblem({ control: "select", mode: undefined })).includes("字段集不对"), "mode 形状的 select 仍拒（旧 meta bug 的反向）");
+  assert.equal(classifyRisk({ instruction: "/feishu-select " + h, chain: "claude", mode: DIALOGUE_POLICY_ID }).riskClass, RISK.R3, "/feishu-select R3（仅 owner）");
+  assert.equal(parseInboundIntent({ instruction: "/Feishu-Select " + h, chain: "claude" }).intent, INTENT.MALFORMED_CONTROL, "大小写变体 → malformed（不降回普通指令）");
+});
 test("R52a item 三：selectAdmission 默认 off（fail-closed）+ selectReject 四支（off/partial/on/unreadable + rfh 放行）", () => {
   assert.deepEqual(selectAdmission(), { state: "off" }, "默认 fail-closed（R50 合并前）");
   assert.deepEqual(selectReject({ state: "off" }, "osh"), { reason: "select_off", text: "选择功能未开放（迁移未开始）" });

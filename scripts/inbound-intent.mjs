@@ -61,7 +61,9 @@ export function shown(text) {
 export function parseInboundIntent({ instruction, chain } = {}) {
   const text = normalizeControlText(typeof instruction === "string" ? instruction : "");
   const base = { text, word: null, control: null, problem: null };
-  const prefix = text.startsWith("/" + NAMESPACE) ? "/" : text.startsWith("$" + NAMESPACE) ? "$" : null;
+  // R52a 返修一 P2：命名空间检测大小写不敏感进命令命名空间，之后仍精确匹配 → 大小写变体一律 malformed（不降回普通指令）。
+  const lower = text.toLowerCase();
+  const prefix = lower.startsWith("/" + NAMESPACE) ? "/" : lower.startsWith("$" + NAMESPACE) ? "$" : null;
   if (prefix === null) {
     if (AUTHORIZATION_RE.test(text)) return { intent: INTENT.AUTHORIZATION, ...base };
     return { intent: INTENT.ORDINARY, ...base };

@@ -72,12 +72,14 @@ const CONSUMED_KEYS = "changed,claim_key,control,mode,recorded_at,schema_version
 /** consumed 记录（<key>.consumed.json）的封闭形状：键集恰为 CONSUMED_KEYS；坏了要进账本 problems，不能按文件名当健康。 */
 export function consumedRecordProblem(doc, key) {
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return "不是记录对象";
-  if (Object.keys(doc).sort().join(",") !== CONSUMED_KEYS) return "字段集不对";
+  // R52a 返修一：consumed 记录按 kind 判别联合 —— mode → {control,mode}；select → {control,handle,handle_kind}。
+  const wantKeys = doc.control === "select" ? "changed,claim_key,control,handle,handle_kind,recorded_at,schema_version,state" : CONSUMED_KEYS;
+  if (Object.keys(doc).sort().join(",") !== wantKeys) return "字段集不对";
   if (doc.schema_version !== "1.0") return "schema_version 不认识";
   if (doc.state !== "consumed") return "state 不是 consumed";
   if (doc.claim_key !== key) return "claim_key 跟文件名对不上";
   if (!isCanonicalIso(doc.recorded_at)) return "recorded_at 不是规范时间";
-  const intentProblem = controlIntentProblem({ control: doc.control, mode: doc.mode });
+  const intentProblem = controlIntentProblem(doc.control === "select" ? { control: "select", handle: doc.handle, handle_kind: doc.handle_kind } : { control: doc.control, mode: doc.mode });
   if (intentProblem !== null) return intentProblem;
   if (typeof doc.changed !== "boolean") return "changed 不是布尔";
   return null;
@@ -111,8 +113,8 @@ export function readConsumedRecord({ claimsDir, key, expectedIntent = undefined,
   if (r.status !== "read") return r;
   const problem = consumedRecordProblem(r.doc, key);
   if (problem) return { status: "unreadable", why: problem };
-  if (expectedIntent !== undefined && !sameControlIntent(expectedIntent, { control: r.doc.control, mode: r.doc.mode })) {
-    return { status: "mismatch", why: "consumed 的意图（" + r.doc.mode + "）与 claim 的意图（" + String(expectedIntent?.mode) + "）不一致", record: r.doc };
+  if (expectedIntent !== undefined && !sameControlIntent(expectedIntent, r.doc.control === "select" ? { control: "select", handle: r.doc.handle, handle_kind: r.doc.handle_kind } : { control: r.doc.control, mode: r.doc.mode })) {
+    return { status: "mismatch", why: "consumed 的意图（" + (r.doc.control === "select" ? r.doc.handle : r.doc.mode) + "）与 claim 的意图（" + String(expectedIntent?.mode ?? expectedIntent?.handle) + "）不一致", record: r.doc };
   }
   return { status: "valid", record: r.doc };
 }
@@ -126,7 +128,7 @@ export function controlFailedRecordProblem(doc, key) {
   if (doc.state !== "failed") return "state 不是 failed";
   if (doc.claim_key !== key) return "claim_key 跟文件名对不上";
   if (doc.reason !== "control_failed") return "reason 不是 control_failed";
-  if (doc.control !== "mode") return "control 不是 mode";
+  if (doc.control !== "mode" && doc.control !== "select") return "control 不是 mode/select";
   if (typeof doc.error !== "string") return "error 不是字符串";
   if (!isCanonicalIso(doc.recorded_at)) return "recorded_at 不是规范时间";
   return null;

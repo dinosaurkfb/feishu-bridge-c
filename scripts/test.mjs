@@ -36998,6 +36998,68 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
   }));
 }
 
+/* ─────────────────────────── R52：operation A 维护编排（owner_select_migration_a）+ CLI ─────────────────────────── */
+
+{
+  const EP52A = "endpoint_" + "a".repeat(24);
+  const EP52B = "endpoint_" + "b".repeat(24);
+  const r52Uuid = (n) => (String(n).repeat(8) + "-2222-4222-8222-222222222222").slice(0, 36);
+  const r52Sha = (c) => c.repeat(64);
+  const T052 = "2026-09-07T10:00:00.000Z";
+  const r52ShaOf = (s) => crypto.createHash("sha256").update(s).digest("hex");
+  // 1.0 shadow 账本（init + seed 各一笔，B1 13 键）——R52 各测试共用形状。
+  const r52Doc10 = (endpointId, liveIds) => {
+    const initOp = "00000000-0000-4000-8000-000000000001";
+    const seedOp = "00000000-0000-4000-8000-000000000002";
+    const records = {};
+    for (const id of liveIds) {
+      records[id] = {
+        kind: "live", topic_agent_id: id, chat_id: "oc_r52" + id.slice(3, 11), created_at: T052, updated_at: T052, origin_operation_id: seedOp,
+        aliases: { session_id: null, root_om: "om_r52" + id.slice(3, 11) }, anchor_candidate: null,
+        binding_target: { runtime: "claude", project_root: "/p/r52", claude_session_id: "00000000-0000-4000-8000-" + id.slice(3, 15).padEnd(12, "0") },
+        generation_lineage_id: "lin-r52" + id.slice(3, 11), binding_proof: null, locator_link_proof_ref: null,
+        facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }
+      };
+    }
+    return {
+      schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: endpointId, chain: "claude",
+      authority_mode: "shadow", revision: 2,
+      operations: {
+        [initOp]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: endpointId, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+        [seedOp]: { op_type: "seed", terminal_kind: "seed", request_key: "seed_r52", fingerprint: TAL.fingerprintOf("seed", { request_key: "seed_r52", candidates: liveIds }), result_revision: 2, result: { seeded_ids: liveIds } }
+      }, records
+    };
+  };
+
+  test("R52 §一 schemaUpgrade 确定性 op key + applySchemaUpgrade 可预算（同输入同 SHA、不改 updated_at）", () => {
+    const tok = r52Uuid(1);
+    const id1 = TAL.ownerSelectSchemaUpgradeOpId(tok, EP52A);
+    assert.equal(id1, TAL.ownerSelectSchemaUpgradeOpId(tok, EP52A), "同 token+endpoint 确定性");
+    assert.notEqual(id1, TAL.ownerSelectSchemaUpgradeOpId(tok, EP52B), "不同 endpoint 不同 id");
+    assert.match(id1, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/u, "OP_ID 形（version 4 / variant 8）");
+
+    const liveId = "ta_" + "5".repeat(32);
+    const doc = r52Doc10(EP52A, [liveId]);
+    const args = { operation_id: id1, request_key: tok, from_schema: "1.0", to_schema: "1.1-transition" };
+    const next1 = TAL.applySchemaUpgrade(doc, args);
+    const next2 = TAL.applySchemaUpgrade(structuredClone(doc), args);
+    assert.equal(r52ShaOf(JSON.stringify(next1, null, 2) + "\n"), r52ShaOf(JSON.stringify(next2, null, 2) + "\n"), "同输入两次同 SHA（确定性重演算）");
+    assert.equal(next1.revision, doc.revision + 1, "revision+1");
+    assert.equal(next1.schema_version, "1.1-transition", "schema 翻转");
+    assert.equal(next1.operations[id1].op_type, "schema_upgrade", "op key = operation_id");
+    assert.equal(next1.operations[id1].request_key, tok);
+    assert.equal(next1.operations[id1].fingerprint, TAL.fingerprintOf("schema_upgrade", { request_key: tok, endpoint: EP52A, from_schema: "1.0", to_schema: "1.1-transition" }));
+    for (const rec of Object.values(next1.records)) {
+      assert.ok(rec.kind === "live" && rec.selection_handle === null && rec.rebind_handle === null, "live 四字段补显式 null");
+      assert.equal(rec.updated_at, doc.records[rec.topic_agent_id].updated_at, "升版不改 updated_at");
+    }
+    assert.equal(TAL.validateLedger(next1, { endpointId: EP52A }).ok, true, "产物自洽");
+    // strict 变体：不补（已有值不动——transition 已补过）
+    const strict = TAL.applySchemaUpgrade(next1, { operation_id: id1, request_key: tok, from_schema: "1.1-transition", to_schema: "1.1" });
+    assert.equal(strict.records[liveId].selection_handle, null, "strict 不改已有值");
+  });
+}
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

@@ -1700,6 +1700,36 @@ export function fingerprintOf(opType, inputs) {
 /** 账本落盘字节（与 writeLedger 同一函数——plan 的 expected_ledger_sha256 必须用同一序列化重演算）。 */
 const serializeLedger = (doc) => Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8");
 
+/** 32 hex → UUID 形（OP_ID_SHAPE）：8-4-4-4-12，第 13 位 version 4、第 17 位 variant 8。 */
+const uuidFromHex = (hex) => hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-4" + hex.slice(13, 16) + "-8" + hex.slice(17, 20) + "-" + hex.slice(20, 32);
+/** R52 §一：schema_upgrade 的确定性 op key（owner-select-route.md §8.2"schema_upgrade 确定性"）——
+ *  随机 op id 会让 journal schema_endpoint step 的 intended_after.ledger_sha256 无法预先锚定；
+ *  确定性派生（token = capability.token 作盐）让编排可预算 intended_after、执行器与预算逐字可对。 */
+export function ownerSelectSchemaUpgradeOpId(token, endpoint) {
+  return uuidFromHex(sha256(Buffer.from(canonKey({ domain: "owner_select_schema_upgrade_v1", token, endpoint }), "utf-8")));
+}
+
+/** R52 §一：schema_upgrade 的纯应用函数（与执行器 mutate 同一函数，别另写）——
+ *  revision+1、schema 翻转、op 盖章（key = 调用方给的确定性 operation_id）、transition 同笔给全部
+ *  live 记录补四字段显式 null（已有值不动、非 live 不动、**不改任何记录 updated_at**）；strict 不补。 */
+export function applySchemaUpgrade(doc, { operation_id, request_key, from_schema, to_schema }) {
+  const inputs = { request_key, endpoint: doc.endpoint_id, from_schema, to_schema };
+  const next = structuredClone(doc);
+  next.revision = doc.revision + 1;
+  next.schema_version = to_schema;
+  next.operations[operation_id] = {
+    op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key,
+    fingerprint: fingerprintOf("schema_upgrade", inputs), result_revision: next.revision,
+    result: { endpoint: doc.endpoint_id, from_schema, to_schema },
+  };
+  if (to_schema === "1.1") return next; // strict：四字段已存在（transition 补过），已有值不动
+  for (const rec of Object.values(next.records)) {
+    if (rec.kind !== "live") continue;
+    for (const k of ["selection_handle", "handle_expires_at", "rebind_handle", "rebind_expires_at"]) if (!(k in rec)) rec[k] = null;
+  }
+  return next;
+}
+
 /** 克隆、bump revision、盖一笔不可覆盖 operation（result 过 RESULT_SHAPE），再 mutateRecords。返回 next。 */
 function stampAndBuild(doc, { opType, inputs, result, mutateRecords }) {
   const next = structuredClone(doc);
@@ -2190,16 +2220,9 @@ export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, 
         if (inv.legacy_proof_count !== 0 || inv.null_b1_count !== 0) return { ok: false, reason: "precheck_failed", why: "legacy_proof_count=" + inv.legacy_proof_count + " null_b1_count=" + inv.null_b1_count };
       }
       if (currentDoc.schema_version !== fromSchema) return { ok: false, reason: "schema_moved", why: "账本 schema_version " + currentDoc.schema_version + " ≠ fromSchema " + fromSchema };
-      const next = stampAndBuild(currentDoc, {
-        opType: "schema_upgrade", inputs, result: { endpoint: endpointId, from_schema: fromSchema, to_schema: toSchema },
-        mutateRecords: (n) => {
-          n.schema_version = toSchema;
-          if (toSchema === "1.1") return; // strict：四字段已存在（transition 补过），已有值不动
-          for (const rec of Object.values(n.records)) {
-            if (rec.kind !== "live") continue;
-            for (const k of ["selection_handle", "handle_expires_at", "rebind_handle", "rebind_expires_at"]) if (!(k in rec)) rec[k] = null;
-          }
-        },
+      // R52 §一：op key 确定性（token=capability.token 作盐）→ 编排可预算 intended_after；mutate 与 applySchemaUpgrade 同一函数。
+      const next = applySchemaUpgrade(currentDoc, {
+        operation_id: ownerSelectSchemaUpgradeOpId(capability.token, endpointId), request_key: requestKey, from_schema: fromSchema, to_schema: toSchema,
       });
       builtSha = sha256(serializeLedger(next));
       return { ok: true, next };

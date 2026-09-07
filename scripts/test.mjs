@@ -36459,12 +36459,12 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     kind: "live", topic_agent_id: id, chat_id: "oc_r51",
     created_at: T0, updated_at: T0, origin_operation_id: R51_OP,
     aliases: {
-      session_id: facts.session === "present" ? "sess_r51_" + id.slice(-4) : null,
-      root_om: facts.anchor === "present" ? "om_r51_" + id.slice(-4) : null
+      session_id: facts.session === "present" ? "sess-r51-" + id.slice(3, 11) : null,
+      root_om: facts.anchor === "present" ? "om_r51" + id.slice(3, 11) : null
     },
     anchor_candidate: null,
-    binding_target: facts.binding === "none" ? null : R51_TGT,
-    generation_lineage_id: facts.generation === "n/a" ? null : "lin_r51_" + id.slice(-4),
+    binding_target: facts.binding === "none" ? null : { runtime: "claude", project_root: "/p/r51", claude_session_id: "00000000-0000-4000-8000-" + id.slice(3, 15).padEnd(12, "0") },
+    generation_lineage_id: facts.generation === "n/a" ? null : "lin-r51-" + id.slice(3, 11),
     binding_proof: null, locator_link_proof_ref: null,
     facts,
     selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null,
@@ -36507,6 +36507,208 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     }, "桶之和与逐条构造对得上");
     assert.deepEqual(TAL.migrationInventory(r51Doc({})), { legacy_proof_count: 0, null_b1_count: 0, null_b1_ids: [] }, "空账本全零");
   });
+
+  // ── R51 维护 fixture：真账本 + journal 1.4 owner_select_migration_* + gate + lease ──
+  const r51Uuid = (n) => (String(n).repeat(8) + "-1111-1111-1111-111111111111").slice(0, 36);
+  const r51Sha = (c) => c.repeat(64);
+  // 与既有 withRoot 同构（R51 块自用）：realpath tmpdir、账本根注入、退出恢复。
+  const r51WithRoot = (fn) => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r51-")));
+    const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = root;
+    const dir = path.join(root, EP51);
+    try { return fn(root, dir); }
+    finally { if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved; fs.rmSync(root, { recursive: true, force: true }); }
+  };
+  const r51Seed = (dir) => {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const opId = "00000000-0000-0000-0000-000000000001";
+    const doc = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP51, chain: "claude", authority_mode: "shadow", revision: 1, operations: { [opId]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP51, chain: "claude" }), result_revision: 1, result: { revision: 1 } } }, records: {} };
+    fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    assert.ok(TAL.loadLedger(dir, { endpointId: EP51 }).ok, "R51 seed 的 1.0 账本自洽");
+  };
+  // 1.1-transition 账本：init(rev1) + seed(rev2，null-B1 记录) + schema_upgrade(rev3，升级边界合同 latest.to_schema === doc.schema_version)。
+  const r51SeedTransition = (dir, { nullB1Count = 2 } = {}) => {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const seedOpId = "00000000-0000-0000-0000-000000000001";
+    const b1OpId = "00000000-0000-0000-0000-000000000002";
+    const upOpId = "00000000-0000-0000-0000-000000000003";
+    const b1Ids = Array.from({ length: nullB1Count }, (_, i) => "ta_" + String(i).repeat(4).padEnd(32, "0"));
+    const records = {};
+    for (const id of b1Ids) records[id] = r51Live(id, R51_B1F, { origin_operation_id: b1OpId });
+    const doc = {
+      schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP51, chain: "claude",
+      authority_mode: "shadow", revision: 3,
+      operations: {
+        [seedOpId]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP51, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+        [b1OpId]: { op_type: "seed", terminal_kind: "seed", request_key: "seed_b1s", fingerprint: TAL.fingerprintOf("seed", { request_key: "seed_b1s", candidates: b1Ids }), result_revision: 2, result: { seeded_ids: b1Ids } },
+        [upOpId]: { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "seed_schema_upgrade", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "seed_schema_upgrade", endpoint: EP51, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 3, result: { endpoint: EP51, from_schema: "1.0", to_schema: "1.1-transition" } }
+      },
+      records
+    };
+    fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    const v = TAL.validateLedger(doc, { endpointId: EP51 });
+    assert.equal(v.ok, true, "R51 seed 的 transition 账本自洽：" + JSON.stringify(v));
+    return doc;
+  };
+  const r51EnterSteps = (tok, now) => {
+    const sha = r51Sha("0");
+    return [
+      { kind: "timer", id: "timer:claude", state: "done", at: now, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
+      { kind: "timer", id: "timer:codex", state: "done", at: now, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
+      { kind: "stub", id: "stub:claude", state: "done", at: now, target: "versions/x", chain: null, before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+      { kind: "stub", id: "stub:codex", state: "done", at: now, target: "stub", chain: null, before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+      { kind: "current", id: "current:claude", state: "done", at: now, target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+      { kind: "current", id: "current:codex", state: "done", at: now, target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+      { kind: "gate", id: "gate", state: "done", at: now, target: "gate", chain: null, before: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, backup: null, backup_sha256: null, backup_bytes: null }
+    ];
+  };
+  const r51WriteJournal = (maintDir, doc) => fs.writeFileSync(path.join(maintDir, doc.token + ".json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+  // A 迁移 fixture（osm_a_upgrading）：campaign:open + schema_endpoint:transition + mint + writer_state:partial，
+  // 锚点用调用方给的账本现场（真 SHA/schema/revision）；blob 文件真落盘（内容任意，journalProblem 只核形状，
+  // blob 与 plan 字节的一致性是 R52 重放合同）。
+  const r51FixtureA = ({ root, ledgerSha, ledgerSchema, ledgerRevision, nullB1Count = 2, tok = r51Uuid(9), now = T0 }) => {
+    const maintDir = path.join(root, "maint");
+    fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+    const cid = campaignIdFor(tok);
+    const digest = endpointsDigest([EP51]);
+    const staged = path.join(maintDir, tok + ".staged");
+    fs.mkdirSync(path.join(staged, "intended"), { recursive: true, mode: 0o700 });
+    const backupFile = path.join(staged, "backup.json");
+    fs.writeFileSync(backupFile, "{}", { mode: 0o600 });
+    const backupBytes = fs.statSync(backupFile).size;
+    const blobPath = path.join(staged, "intended", "mint-" + EP51 + ".json");
+    fs.writeFileSync(blobPath, "x".repeat(50), { mode: 0o600 });
+    const SHA_T = r51Sha("c"), SHA_M = r51Sha("d");
+    const steps = [
+      ...r51EnterSteps(tok, now),
+      { kind: "campaign", id: "campaign:" + cid + ":open", state: "prepared", at: now, target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null,
+        before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null },
+        intended_after: { exists: true, sha256: r51Sha("1"), state: "open", campaign_id: cid, endpoints: [EP51], endpoints_digest: digest } },
+      { kind: "schema_endpoint", id: "schema_endpoint:" + EP51 + ":transition", state: "prepared", at: now, target: "ledger/" + EP51 + "/ledger.json", chain: null, backup: backupFile, backup_sha256: ledgerSha, backup_bytes: backupBytes,
+        before: { schema_version: ledgerSchema, revision: ledgerRevision, ledger_sha256: ledgerSha },
+        intended_after: { schema_version: "1.1-transition", revision: ledgerRevision + 1, ledger_sha256: SHA_T } },
+      { kind: "mint", id: "mint:" + EP51, state: "prepared", at: now, target: "ledger/" + EP51 + "/ledger.json", chain: null, backup: backupFile, backup_sha256: SHA_T, backup_bytes: backupBytes,
+        before: { revision: ledgerRevision + 1, null_b1_count: nullB1Count, ledger_sha256: SHA_T },
+        intended_after: { revision: ledgerRevision + 2, null_b1_count: 0, ledger_sha256: SHA_M },
+        intended_blob: { path: blobPath, bytes: 50, sha256: r51Sha("f") } },
+      { kind: "writer_state", id: "writer_state:" + cid + ":partial", state: "prepared", at: now, target: "ledger/owner-select-writer-state.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null,
+        before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 },
+        intended_after: { exists: true, sha256: r51Sha("2"), state: "partial", campaign_id: cid, endpoints_digest: digest, revision: 1 } }
+    ];
+    const doc = { schema_version: "1.4", operation_kind: "owner_select_migration_a", token: tok, reason: "R51 fixture", started_at: now, updated_at: now, phase: "osm_a_upgrading", steps, notes: [] };
+    const problem = journalProblem(doc, { maintenanceDir: maintDir });
+    assert.equal(problem, null, "R51 fixture A journal 应合法：" + problem);
+    r51WriteJournal(maintDir, doc);
+    fs.symlinkSync(tok, path.join(maintDir, "active"));
+    const gateFile = path.join(root, "maintenance.gate");
+    createGate({ file: gateFile, reason: "R51", token: tok, now });
+    const lease = acquireOperationLease({ dir: maintDir, token: tok });
+    return { maintDir, gateFile, tok, cid, doc, lease, rewrite: (mut) => { mut(doc); r51WriteJournal(maintDir, doc); } };
+  };
+  // B 迁移 fixture（osm_b_strictening）：campaign:seal+complete + precheck + schema_endpoint:strict + writer_state:on。
+  const r51FixtureB = ({ root, ledgerSha, ledgerSchema, ledgerRevision, tok = r51Uuid(8), now = T0 }) => {
+    const maintDir = path.join(root, "maint");
+    fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+    const cid = campaignIdFor(tok);
+    const digest = endpointsDigest([EP51]);
+    const staged = path.join(maintDir, tok + ".staged");
+    fs.mkdirSync(staged, { recursive: true, mode: 0o700 });
+    const backupFile = path.join(staged, "backup.json");
+    fs.writeFileSync(backupFile, "{}", { mode: 0o600 });
+    const backupBytes = fs.statSync(backupFile).size;
+    const SHA_S = r51Sha("e");
+    const openState = { exists: true, sha256: r51Sha("1"), state: "open", campaign_id: cid, endpoints: [EP51], endpoints_digest: digest };
+    const sealedState = { exists: true, sha256: r51Sha("3"), state: "sealed", campaign_id: cid, endpoints: [EP51], endpoints_digest: digest };
+    const completeState = { exists: true, sha256: r51Sha("4"), state: "complete", campaign_id: cid, endpoints: [EP51], endpoints_digest: digest };
+    const steps = [
+      ...r51EnterSteps(tok, now),
+      { kind: "campaign", id: "campaign:" + cid + ":seal", state: "prepared", at: now, target: "ledger/owner-select-campaign.json", chain: null, backup: backupFile, backup_sha256: r51Sha("1"), backup_bytes: backupBytes,
+        before: openState, intended_after: sealedState },
+      { kind: "campaign", id: "campaign:" + cid + ":complete", state: "prepared", at: now, target: "ledger/owner-select-campaign.json", chain: null, backup: backupFile, backup_sha256: r51Sha("3"), backup_bytes: backupBytes,
+        before: sealedState, intended_after: completeState },
+      { kind: "precheck", id: "precheck:" + EP51, state: "prepared", at: now, target: "ledger/" + EP51 + "/ledger.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null,
+        before: { legacy_proof_count: 0, null_b1_count: 0, revision: ledgerRevision, ledger_sha256: ledgerSha },
+        intended_after: { legacy_proof_count: 0, null_b1_count: 0, revision: ledgerRevision, ledger_sha256: ledgerSha } },
+      { kind: "schema_endpoint", id: "schema_endpoint:" + EP51 + ":strict", state: "prepared", at: now, target: "ledger/" + EP51 + "/ledger.json", chain: null, backup: backupFile, backup_sha256: ledgerSha, backup_bytes: backupBytes,
+        before: { schema_version: ledgerSchema, revision: ledgerRevision, ledger_sha256: ledgerSha },
+        intended_after: { schema_version: "1.1", revision: ledgerRevision + 1, ledger_sha256: SHA_S } },
+      { kind: "writer_state", id: "writer_state:" + cid + ":on", state: "prepared", at: now, target: "ledger/owner-select-writer-state.json", chain: null, backup: backupFile, backup_sha256: r51Sha("2"), backup_bytes: backupBytes,
+        before: { exists: true, sha256: r51Sha("2"), state: "partial", campaign_id: cid, endpoints_digest: digest, revision: 1 },
+        intended_after: { exists: true, sha256: r51Sha("5"), state: "on", campaign_id: cid, endpoints_digest: digest, revision: 2 } }
+    ];
+    const doc = { schema_version: "1.4", operation_kind: "owner_select_migration_b", token: tok, reason: "R51 fixture", started_at: now, updated_at: now, phase: "osm_b_strictening", steps, notes: [] };
+    const problem = journalProblem(doc, { maintenanceDir: maintDir });
+    assert.equal(problem, null, "R51 fixture B journal 应合法：" + problem);
+    r51WriteJournal(maintDir, doc);
+    fs.symlinkSync(tok, path.join(maintDir, "active"));
+    const gateFile = path.join(root, "maintenance.gate");
+    createGate({ file: gateFile, reason: "R51", token: tok, now });
+    const lease = acquireOperationLease({ dir: maintDir, token: tok });
+    return { maintDir, gateFile, tok, cid, doc, lease, rewrite: (mut) => { mut(doc); r51WriteJournal(maintDir, doc); } };
+  };
+
+  test("R51 §一 capability：schema_upgrade/mint_selection_handles fail-closed 核验（读实文件，不信任自述）", () => r51WithRoot((root, dir) => {
+    r51Seed(dir);
+    const L = TAL.loadLedger(dir, { endpointId: EP51 });
+    const fx = r51FixtureA({ root, ledgerSha: L.sha256, ledgerSchema: L.doc.schema_version, ledgerRevision: L.doc.revision });
+    const env = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fx.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fx.gateFile };
+    const args = { endpointId: EP51, capability: { kind: "schema_upgrade", token: fx.tok }, requestKey: "req_r51_up", fromSchema: "1.0", toSchema: "1.1-transition", env };
+
+    assert.equal(TAL.schemaUpgrade({ ...args, capability: null }).reason, "maintenance_capability_required", "capability 缺失拒");
+    assert.equal(TAL.schemaUpgrade({ ...args, capability: { kind: "other", token: fx.tok } }).reason, "maintenance_capability_required", "kind 不符拒");
+    assert.equal(TAL.schemaUpgrade({ ...args, capability: { kind: "schema_upgrade", token: r51Uuid(3) } }).reason, "maintenance_capability_required", "token 与 active 不符拒");
+
+    fx.rewrite((d) => { d.schema_version = "1.2"; });
+    assert.equal(TAL.schemaUpgrade(args).reason, "maintenance_capability_required", "journal 非 1.4 拒");
+    fx.rewrite((d) => { d.schema_version = "1.4"; });
+
+    fx.rewrite((d) => { d.phase = "drained"; });
+    assert.equal(TAL.schemaUpgrade(args).reason, "maintenance_capability_required", "phase 不在 forward 段拒");
+    fx.rewrite((d) => { d.phase = "osm_a_upgrading"; });
+
+    fx.rewrite((d) => { d.steps.find((s) => s.kind === "schema_endpoint").state = "done"; });
+    assert.equal(TAL.schemaUpgrade(args).reason, "maintenance_capability_required", "step 非 prepared 拒");
+    fx.rewrite((d) => { d.steps.find((s) => s.kind === "schema_endpoint").state = "prepared"; });
+
+    fx.rewrite((d) => { d.steps.find((s) => s.kind === "schema_endpoint").target = "ledger/other/ledger.json"; });
+    assert.equal(TAL.schemaUpgrade(args).reason, "maintenance_capability_required", "step target 派生不符拒");
+    fx.rewrite((d) => { d.steps.find((s) => s.kind === "schema_endpoint").target = "ledger/" + EP51 + "/ledger.json"; });
+
+    fx.rewrite((d) => { d.steps.find((s) => s.kind === "schema_endpoint").before.ledger_sha256 = r51Sha("e"); });
+    assert.equal(TAL.schemaUpgrade(args).reason, "maintenance_capability_required", "before.ledger_sha256 与现场不符拒");
+    fx.rewrite((d) => { d.steps.find((s) => s.kind === "schema_endpoint").before.ledger_sha256 = L.sha256; });
+
+    fx.rewrite((d) => { d.steps.find((s) => s.kind === "schema_endpoint").before.schema_version = "1.1-transition"; });
+    assert.equal(TAL.schemaUpgrade(args).reason, "maintenance_capability_required", "before.schema_version 与现场不符拒");
+    fx.rewrite((d) => { d.steps.find((s) => s.kind === "schema_endpoint").before.schema_version = "1.0"; });
+
+    fs.unlinkSync(fx.gateFile);
+    assert.equal(TAL.schemaUpgrade(args).reason, "maintenance_capability_required", "门不在拒");
+    createGate({ file: fx.gateFile, reason: "R51", token: fx.tok, now: T0 });
+    fs.unlinkSync(fx.gateFile);
+    createGate({ file: fx.gateFile, reason: "R51", token: r51Uuid(4), now: T0 });
+    assert.equal(TAL.schemaUpgrade(args).reason, "maintenance_capability_required", "门 token 不符拒");
+    fs.unlinkSync(fx.gateFile);
+    createGate({ file: fx.gateFile, reason: "R51", token: fx.tok, now: T0 });
+
+    releaseOperationLease(fx.lease);
+    assert.equal(TAL.schemaUpgrade(args).reason, "maintenance_capability_required", "租约缺失拒");
+    fx.lease = acquireOperationLease({ dir: fx.maintDir, token: fx.tok });
+
+    // 放行冒烟：capability 全过后到达非 capability 错误（执行器哨兵）。
+    const smoke = TAL.schemaUpgrade(args);
+    assert.equal(smoke.reason, "executor_unavailable", "capability 全过后到达执行器哨兵（证明核验放行）：" + JSON.stringify(smoke));
+  }));
+
+  test("R51 §一 capability：mint_selection_handles 仅 owner_select_migration_a", () => r51WithRoot((root, dir) => {
+    r51SeedTransition(dir);
+    const L = TAL.loadLedger(dir, { endpointId: EP51 });
+    const fxB = r51FixtureB({ root, ledgerSha: L.sha256, ledgerSchema: L.doc.schema_version, ledgerRevision: L.doc.revision });
+    const envB = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fxB.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fxB.gateFile };
+    const r = TAL.mintSelectionHandles({ endpointId: EP51, capability: { kind: "mint_selection_handles", token: fxB.tok }, plan: {}, env: envB });
+    assert.equal(r.reason, "maintenance_capability_required", "mint 在 _b journal 上拒（仅 _a）：" + JSON.stringify(r));
+  }));
 }
 
 summarySealed = true;

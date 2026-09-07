@@ -18812,6 +18812,10 @@ test("R52a item 三：selectAdmission 默认 off（fail-closed）+ selectReject 
   assert.deepEqual(selectReject({ state: "partial" }, "osh"), { reason: "select_partial_not_rfh", text: "迁移期间只接受 rfh_ 重确认 handle" });
   assert.equal(selectReject({ state: "partial" }, "rfh"), null, "partial 只放行 rfh");
   assert.equal(selectReject({ state: "on" }, "osh"), null, "on 放行");
+  // R52a 返修三 P1-3: 准入未知态投影为 unreadable
+  for (const unknownAdm of [{}, null, { state: "wat" }, "foo", 42, [], undefined]) {
+    assert.deepEqual(selectReject(unknownAdm, "osh"), { reason: "select_writer_state_unreadable", text: "选择功能状态读不清，未执行" }, "未知准入态投影为 unreadable：" + JSON.stringify(unknownAdm));
+  }
 });
 
 test("R52a 返修一：claim meta 按 kind 投影（select 经 controlIntentProblem 合法）/ /feishu-select R3 / 大小写变体 malformed", () => {

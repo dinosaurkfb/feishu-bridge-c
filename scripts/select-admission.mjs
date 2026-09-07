@@ -13,12 +13,19 @@ export function selectAdmission(env = process.env) {
   return { state: "off" };
 }
 
-/** 三态准入的确定性投影：返回 { reason, text }（拒绝）或 null（放行）。 */
+/** 三态准入的确定性投影：返回 { reason, text }（拒绝）或 null（放行）。准入联合以外的任何状态（缺席/未知/非对象）一律投影为 unreadable → 拒。 */
 export function selectReject(adm, handle_kind) {
-  if (adm?.state === "unreadable") return { reason: "select_writer_state_unreadable", text: "选择功能状态读不清，未执行" };
-  if (adm?.state === "off") return { reason: "select_off", text: "选择功能未开放（迁移未开始）" };
-  if (adm?.state === "partial" && handle_kind !== "rfh") return { reason: "select_partial_not_rfh", text: "迁移期间只接受 rfh_ 重确认 handle" };
-  return null;
+  if (adm === null || typeof adm !== "object" || Array.isArray(adm)) {
+    return { reason: "select_writer_state_unreadable", text: "选择功能状态读不清，未执行" };
+  }
+  if (adm.state === "unreadable") return { reason: "select_writer_state_unreadable", text: "选择功能状态读不清，未执行" };
+  if (adm.state === "off") return { reason: "select_off", text: "选择功能未开放（迁移未开始）" };
+  if (adm.state === "partial") {
+    if (handle_kind !== "rfh") return { reason: "select_partial_not_rfh", text: "迁移期间只接受 rfh_ 重确认 handle" };
+    return null;
+  }
+  if (adm.state === "on") return null;
+  return { reason: "select_writer_state_unreadable", text: "选择功能状态读不清，未执行" };
 }
 
 /** 给定拒绝 reason 反解说明文案（重放从记录恢复文案时用）。 */

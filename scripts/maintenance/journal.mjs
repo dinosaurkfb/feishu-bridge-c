@@ -52,11 +52,15 @@ const GATE_ONLY_PHASES = Object.freeze(["planned", "timer_stopped", "stubbed", "
 const LEDGER_BASE_PHASES = Object.freeze(["planned", "timer_stopped", "stubbed", "gated", "drained", "ledger_reopening", "done", "reopening_incomplete", "rolling_back", "rollback_reopening", "rolled_back", "rollback_incomplete"]);
 const LEDGER_INIT_PHASES = Object.freeze([...LEDGER_BASE_PHASES, "ledger_initializing"]);
 const LEDGER_CUTOVER_PHASES = Object.freeze([...LEDGER_BASE_PHASES, "ledger_cutting_over"]);
+// R50 1.4：owner_select 三迁移 kind 各自 PHASES = LEDGER_BASE_PHASES + 专属 forward 段（进 FORWARD_ONLY_PHASES）。
+const OSM_A_PHASES = Object.freeze([...LEDGER_BASE_PHASES, "osm_a_upgrading"]);
+const OSM_B_PHASES = Object.freeze([...LEDGER_BASE_PHASES, "osm_b_strictening"]);
+const OSM_DIRECT_PHASES = Object.freeze([...LEDGER_BASE_PHASES, "osm_direct"]);
 export const TERMINAL_PHASES = Object.freeze(["done", "rolled_back"]);
 /** 没做完的终态：门与账保留，--exit --apply 只向前重试。 */
 export const INCOMPLETE_PHASES = Object.freeze(["reopening_incomplete", "rollback_incomplete"]);
 /** 进了这些阶段只许向前（某条 current 已从桩指回真实 runtime，那条链已重新放行，不许再改线上制品；账本已提交亦然，B-1）。 */
-export const FORWARD_ONLY_PHASES = Object.freeze(["reopening", "rollback_reopening", "ledger_initializing", "ledger_cutting_over", "ledger_reopening", ...TERMINAL_PHASES, ...INCOMPLETE_PHASES]);
+export const FORWARD_ONLY_PHASES = Object.freeze(["reopening", "rollback_reopening", "ledger_initializing", "ledger_cutting_over", "ledger_reopening", "osm_a_upgrading", "osm_b_strictening", "osm_direct", ...TERMINAL_PHASES, ...INCOMPLETE_PHASES]);
 export const STEP_KINDS = Object.freeze(["timer", "stub", "current", "gate", "artifact", "receipt", "staged_plan", "ledger", "sidecar"]);
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u; // 账本 endpoint_id（layers-v2-ledger.md §2）
 const SIDECAR_ID_SHAPE = new RegExp("^(?:" + SIDECAR_NAMES.join("|") + "):((?:endpoint_[0-9a-f]{24}))$");

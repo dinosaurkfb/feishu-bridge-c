@@ -550,14 +550,14 @@ function proofCombinationProblem(rec, id, doc) {
     return "binding=owner_select_v1 只能 pair link=owner_selected_route_v1 (或 null)";
   }
   if (lpKind === "owner_selected_route_v1") {
-    if (bpKind !== "owner_select_v1" && bpKind !== "attach" && bpKind !== "retarget" && bpKind !== "pairing") {
-      return "link=owner_selected_route_v1 的 binding 只能是 owner_select_v1/attach/retarget/pairing";
+    if (bpKind !== "owner_select_v1" && bpKind !== "attach" && bpKind !== "retarget" && bpKind !== "pairing" && bpKind !== "migrated") {
+      return "link=owner_selected_route_v1 的 binding 只能是 owner_select_v1/attach/retarget/pairing/migrated";
     }
   }
   if (rec.facts.binding === "pending" || rec.facts.binding === "none") {
     if (bpKind === "owner_select_v1" || lpKind === "owner_selected_route_v1") return "owner_select proof 禁现于 A1/B1";
   }
-  if (bpKind === "migrated" && lpKind !== "migrated") return "binding=migrated 必须 pair link=migrated";
+  if (bpKind === "migrated" && lpKind !== "migrated" && lpKind !== "owner_selected_route_v1") return "binding=migrated 必须 pair link∈{migrated,owner_selected_route_v1}";
   if (lpKind === "migrated") {
     if (bpKind !== "migrated" && bpKind !== "retarget" && bpKind !== "attach") return "link=migrated 的 binding 只能是 migrated/retarget/attach(A3/A4 继承)";
     if (bpKind === "attach") {

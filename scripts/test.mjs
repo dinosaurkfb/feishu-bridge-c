@@ -32375,6 +32375,88 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
     const dBad6Om = structuredClone(d);
     dBad6Om.records[taId1].locator_link_proof_ref.selected_root_om = "om_other";
     assert.match(String(TAL.validateLedger(dBad6Om, { endpointId: EP }).why), /六字段等式|aliases 不一致/u, "binding 与 link 六字段不符拒 (selected_root_om)");
+
+    // P1-1：(migrated binding, owner_selected_route_v1 link) 放行
+    const opIdMig = "00000000-0000-4000-8000-000000000010";
+    const opIdReb = "00000000-0000-4000-8000-000000000011";
+    const dMigReb = mkBaseDoc("1.1");
+    dMigReb.revision = 3;
+    dMigReb.operations[opIdMig] = {
+      op_type: "migrate_seed",
+      terminal_kind: "migrate_seed",
+      request_key: "rk_mig_1",
+      fingerprint: "1".repeat(64),
+      result_revision: 2,
+      result: {
+        authorized_by: "ou_owner1",
+        authorized_at: ISO,
+        seeded: [{ topic_agent_id: taId1, legacy_source_digest: "d".repeat(64) }]
+      }
+    };
+    dMigReb.operations[opIdReb] = {
+      op_type: "rebind_session_alias",
+      terminal_kind: "rebind_session_alias",
+      request_key: "rk_reb_1",
+      fingerprint: "2".repeat(64),
+      result_revision: 3,
+      result: {
+        affected_id: taId1,
+        affected_live_ids_after_commit: [taId1],
+        authorized_at: ISO,
+        authorized_by: "ou_owner1",
+        old_session_id: "00000000-0000-4000-8000-000000000001",
+        new_session_id: "00000000-0000-4000-8000-000000000002",
+        selected_root_om: "om_root1",
+        selected_session_id: "00000000-0000-4000-8000-000000000002",
+        selection_basis: "rebind",
+        selection_handle: hORH1,
+        selection_message_id: "om_msg1",
+        tombstoned_a1_id: null,
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "preserved", link_effect: "produced" }]
+      }
+    };
+    dMigReb.records[taId1] = {
+      kind: "live",
+      topic_agent_id: taId1,
+      chat_id: "oc_chat1",
+      created_at: ISO,
+      updated_at: ISO,
+      origin_operation_id: opIdReb,
+      facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+      aliases: { session_id: "00000000-0000-4000-8000-000000000002", root_om: "om_root1" },
+      binding_target: TGT,
+      binding_proof: { kind: "migrated", authorized_by: "ou_owner1", authorized_at: ISO, migration_operation_id: opIdMig, legacy_source_digest: "d".repeat(64) },
+      locator_link_proof_ref: {
+        kind: "owner_selected_route_v1",
+        by_identity: "owner_authorization",
+        authorized_by: "ou_owner1",
+        authorized_at: ISO,
+        selected_session_id: "00000000-0000-4000-8000-000000000002",
+        selected_root_om: "om_root1",
+        selection_handle: hORH1,
+        selection_operation_id: opIdReb
+      },
+      generation_lineage_id: "lin_1",
+      anchor_candidate: null,
+      selection_handle: null,
+      handle_expires_at: null,
+      rebind_handle: null,
+      rebind_expires_at: null
+    };
+    assert.equal(TAL.validateLedger(dMigReb, { endpointId: EP }).ok, true, "migrated binding + owner_selected_route_v1 link 合法放行");
+
+    // 反例：binding=migrated + link=pairing_merge 仍拒
+    const dMigBadLink = structuredClone(dMigReb);
+    dMigBadLink.schema_version = "1.1-transition";
+    dMigBadLink.records[taId1].locator_link_proof_ref = {
+      kind: "pairing_merge",
+      by_identity: "user",
+      matched_at: ISO,
+      matched_om: "om_root1",
+      matched_fields: ["chat_id", "sender", "body", "thread_root"],
+      pending_token_state: "present"
+    };
+    assert.match(String(TAL.validateLedger(dMigBadLink, { endpointId: EP }).why), /binding=migrated 必须 pair/u, "binding=migrated + link=pairing_merge 仍拒");
   }
 
   // ── 5. G13′ 校验（produced vs preserved）──

@@ -35695,10 +35695,12 @@ test("R51 mintSelectionHandles：mint plan 正路径（1.4 migration journal + g
   const stagedDir = path.join(maintDir, tok + ".staged");
   fs.mkdirSync(path.join(stagedDir, "intended"), { recursive: true, mode: 0o700 });
   const stagedBackup = path.join(stagedDir, "backup.json"); fs.writeFileSync(stagedBackup, "{}", { mode: 0o600 });
-  const mintBlob = path.join(stagedDir, "intended", "mint-" + EP + ".json"); fs.writeFileSync(mintBlob, JSON.stringify({ tok }), { mode: 0o600 });
+  const mintBlob = path.join(stagedDir, "intended", "mint-" + EP + ".json");
+  const plan = prePlan.plan; const planBytes = TAL.mintPlanBytes(plan); const planSha = TAL.sha256(Buffer.from(planBytes, "utf-8"));
+  fs.writeFileSync(mintBlob, planBytes, { mode: 0o600 });
   const steps = [...enterSteps, { kind: "campaign", id: "campaign:" + CID + ":open", state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null }, intended_after: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: CID, endpoints: [EP], endpoints_digest: endpointsDigest([EP]) } },
     { kind: "schema_endpoint", id: "schema_endpoint:" + EP + ":transition", state: "done", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: stagedBackup, backup_sha256: "0".repeat(64), backup_bytes: 100, before: { schema_version: "1.0", revision: 1, ledger_sha256: "0".repeat(64) }, intended_after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: curSha }, after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: curSha } },
-    { kind: "mint", id: "mint:" + EP, state: "prepared", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: stagedBackup, backup_sha256: curSha, backup_bytes: 100, before: { revision: 2, null_b1_count: 1, ledger_sha256: curSha }, intended_after: { revision: 3, null_b1_count: 0, ledger_sha256: expectedSha }, intended_blob: { path: mintBlob, bytes: Buffer.byteLength(JSON.stringify({ tok })), sha256: "0".repeat(64) } },
+    { kind: "mint", id: "mint:" + EP, state: "prepared", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: stagedBackup, backup_sha256: curSha, backup_bytes: 100, before: { revision: 2, null_b1_count: 1, ledger_sha256: curSha }, intended_after: { revision: 3, null_b1_count: 0, ledger_sha256: expectedSha }, intended_blob: { path: mintBlob, bytes: Buffer.byteLength(planBytes), sha256: planSha } },
     { kind: "writer_state", id: "writer_state:" + CID + ":partial", state: "prepared", at, target: "ledger/owner-select-writer-state.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 }, intended_after: { exists: true, sha256: "2".repeat(64), state: "partial", campaign_id: CID, endpoints_digest: endpointsDigest([EP]), revision: 1 } }];
   const jdoc = { schema_version: "1.4", operation_kind: "owner_select_migration_a", reason: "fixture", started_at: at, updated_at: at, token: tok, notes: [], phase: "osm_a_upgrading", steps };
   assert.equal(journalProblem(jdoc, { maintenanceDir: maintDir }), null, "fixture journal 自洽：" + journalProblem(jdoc, { maintenanceDir: maintDir }));
@@ -35707,7 +35709,7 @@ test("R51 mintSelectionHandles：mint plan 正路径（1.4 migration journal + g
   fs.symlinkSync(tok, path.join(maintDir, "active"));
   createGate({ file: gateFile, reason: "fixture", token: tok, now: 1700000000000 });
   acquireOperationLease({ dir: maintDir, token: tok });
-  const bp = TAL.buildMintPlan({ doc, token: tok, campaignId: CID, endpointId: EP, requestKey: "req_mint", now: 1700000000000, ttlMs: 86400000 });
+  const bp = { plan };
   const cap = { token: tok, kind: "mint_selection_handles", endpointId: EP, request_key: "req_mint" };
   const res = TAL.mintSelectionHandles({ endpointId: EP, capability: cap, plan: bp.plan, env });
   assert.equal(res.ok, true, "mint 正路径：" + JSON.stringify(res));
@@ -35736,6 +35738,7 @@ test("R51 schemaUpgrade：正路径（1.0→1.1-transition）+ strict 重盘 leg
   const hx = (n) => String(n).repeat(64), uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000", iso = (t) => new Date(t).toISOString();
   const init = uuid(1), tok = uuid(9), at = iso(1700000000000); const CID = campaignIdFor(tok);
   const doc = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: CH, authority_mode: "shadow", revision: 1, operations: { [init]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } } }, records: {} };
+  const curSha = TAL.sha256(Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8"));
   const epDir = path.join(ledgerRoot, EP); fs.mkdirSync(epDir, { recursive: true, mode: 0o700 }); fs.chmodSync(epDir, 0o700);
   fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
   const enterSteps = [
@@ -35748,7 +35751,7 @@ test("R51 schemaUpgrade：正路径（1.0→1.1-transition）+ strict 重盘 leg
     { kind: "gate", id: "gate", state: "done", at, target: "gate", chain: null, before: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, backup: null, backup_sha256: null, backup_bytes: null }];
   const stagedDir = path.join(maintDir, tok + ".staged"); fs.mkdirSync(path.join(stagedDir, "intended"), { recursive: true, mode: 0o700 }); const stagedBackup = path.join(stagedDir, "backup.json"); fs.writeFileSync(stagedBackup, "{}", { mode: 0o600 });
   const steps = [...enterSteps, { kind: "campaign", id: "campaign:" + CID + ":open", state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null }, intended_after: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: CID, endpoints: [EP], endpoints_digest: endpointsDigest([EP]) } },
-    { kind: "schema_endpoint", id: "schema_endpoint:" + EP + ":transition", state: "prepared", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: stagedBackup, backup_sha256: "0".repeat(64), backup_bytes: 100, before: { schema_version: "1.0", revision: 1, ledger_sha256: "0".repeat(64) }, intended_after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: "1".repeat(64) } },
+    { kind: "schema_endpoint", id: "schema_endpoint:" + EP + ":transition", state: "prepared", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: stagedBackup, backup_sha256: curSha, backup_bytes: 100, before: { schema_version: "1.0", revision: 1, ledger_sha256: curSha }, intended_after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: "1".repeat(64) } },
     { kind: "mint", id: "mint:" + EP, state: "prepared", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: stagedBackup, backup_sha256: "1".repeat(64), backup_bytes: 100, before: { revision: 2, null_b1_count: 0, ledger_sha256: "1".repeat(64) }, intended_after: { revision: 3, null_b1_count: 0, ledger_sha256: "2".repeat(64) }, intended_blob: { path: path.join(stagedDir, "intended", "mint-" + EP + ".json"), bytes: 10, sha256: "0".repeat(64) } },
     { kind: "writer_state", id: "writer_state:" + CID + ":partial", state: "prepared", at, target: "ledger/owner-select-writer-state.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 }, intended_after: { exists: true, sha256: "2".repeat(64), state: "partial", campaign_id: CID, endpoints_digest: endpointsDigest([EP]), revision: 1 } }];
   const jdoc = { schema_version: "1.4", operation_kind: "owner_select_migration_a", reason: "fixture", started_at: at, updated_at: at, token: tok, notes: [], phase: "osm_a_upgrading", steps };

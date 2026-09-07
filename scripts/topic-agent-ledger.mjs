@@ -106,6 +106,9 @@ const BAD_TIME = { ok: false, commit: "not_committed", reason: "bad_time" };
 
 /** 规范化（键排序递归）后 JSON —— 用于目标/证明的稳定比较（评审 G6/G7：不能用键序敏感的 JSON.stringify）。 */
 const stable = (v) => Array.isArray(v) ? v.map(stable) : (isObj(v) ? Object.keys(v).sort().reduce((o, k) => { o[k] = stable(v[k]); return o; }, {}) : v);
+// R51 返修一（P2）：账本 / plan 序列化单一出处（writeLedger / buildMintPlan / 读回校验共用，避免两处手写 JSON.stringify 漂移）。
+const ledgerBytes = (doc) => Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8");
+export const mintPlanBytes = (plan) => JSON.stringify(plan, null, 2) + "\n";
 export const canonKey = (v) => JSON.stringify(stable(v));
 
 /* ─────────────────────────── 路径（受验派生，评审 P1-7） ─────────────────────────── */
@@ -1610,7 +1613,7 @@ function writeLedger({ dir, endpointId, gated, requestKey = null, replay = null,
     }
     const nextV = validateLedger(m.next, { endpointId });
     if (!nextV.ok) return finalize({ ok: false, commit: "not_committed", reason: "would_corrupt", why: nextV.why });
-    const nextBytes = Buffer.from(JSON.stringify(m.next, null, 2) + "\n", "utf-8");
+    const nextBytes = ledgerBytes(m.next);
     if (nextBytes.length > MAX_FILE_BYTES) return finalize({ ok: false, commit: "not_committed", reason: "over_capacity" });
 
     // 首次提交也要返回**刚落盘 operation 的 result**（评审三 P1-4）：取本笔（result_revision === 新 revision）。
@@ -1844,7 +1847,7 @@ export function initPlan({ endpointId, chain, requestKey, operationId } = {}) {
       result_revision: 1, result: { revision: 1 },
     } },
   };
-  const docSha = sha256(Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8"));
+  const docSha = sha256(ledgerBytes(doc));
   return {
     ok: true, operationId, requestKey, fingerprint, kind: "initialize_shadow", doc, sha256: docSha,
     before: { authority_mode: null, endpoint_id: endpointId, fingerprint, ledger_sha256: null, operation_id: operationId, revision: null },
@@ -1878,7 +1881,7 @@ export function cutoverPlan({ endpointId, chain, requestKey, operationId, shadow
       pending_claims_sha256: sidecarShas.pending_claims, policy_sha256: sidecarShas.policy,
     },
   };
-  const docSha2 = sha256(Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8"));
+  const docSha2 = sha256(ledgerBytes(doc));
   return {
     ok: true, operationId, requestKey, fingerprint, kind: "authority_cutover", doc, sha256: docSha2,
     before: { authority_mode: "shadow", endpoint_id: endpointId, fingerprint, ledger_sha256: shadowSha, operation_id: operationId, revision: shadowDoc.revision, bijection_digest: null },
@@ -2051,7 +2054,7 @@ export function buildMintPlan({ doc, token, campaignId, endpointId, requestKey, 
   const inv = migrationInventory(doc);
   const frozenAt = new Date(now).toISOString();
   const handleExpiresAt = new Date(now + ttlMs).toISOString();
-  const beforeSha = sha256(Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8"));
+  const beforeSha = sha256(ledgerBytes(doc));
   const minted = inv.null_b1_ids.map((id) => ({ target_id: id, selection_handle: "osh_" + crypto.randomBytes(16).toString("hex") }));
   const plan = {
     plan_kind: "owner_select_mint_plan_v1", token, campaign_id: campaignId, endpoint: endpointId,
@@ -2060,7 +2063,7 @@ export function buildMintPlan({ doc, token, campaignId, endpointId, requestKey, 
     expected_ledger_sha256: null,
   };
   const next = applyMintPlan(doc, plan);
-  plan.expected_ledger_sha256 = sha256(Buffer.from(JSON.stringify(next, null, 2) + "\n", "utf-8"));
+  plan.expected_ledger_sha256 = sha256(ledgerBytes(next));
   return { ok: true, plan, inventory: inv };
 }
 
@@ -2174,6 +2177,12 @@ export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, 
   if (!d.ok) return badTx(d);
   const cur = loadLedger(d.dir, { endpointId });
   if (!cur.ok) return { ok: false, commit: "not_committed", reason: cur.reason, why: cur.why ?? null };
+  // R51 返修一（2b）：step.before.{schema_version,revision,ledger_sha256} === 当前账本（before 态才 apply）；
+  //   当前===intended（已升过）→ 交 writeLedger request_key+fingerprint 重放（replayed）；两者皆非 → before_mismatch。
+  const stepBefore = cap.step.before, stepInt = cap.step.intended_after;
+  const atBefore = cur.doc.schema_version === stepBefore.schema_version && cur.doc.revision === stepBefore.revision && cur.sha256 === stepBefore.ledger_sha256;
+  const atIntended = cur.doc.schema_version === stepInt.schema_version && cur.sha256 === stepInt.ledger_sha256;
+  if (!atBefore && !atIntended) return { ok: false, commit: "not_committed", reason: "before_mismatch", why: "step.before 与当前账本不符（且非 intended）— schema_version=" + cur.doc.schema_version };
   if (cur.doc.schema_version !== fromSchema) return { ok: false, commit: "not_committed", reason: "schema_mismatch", why: "doc.schema_version " + cur.doc.schema_version + " ≠ " + fromSchema };
   // strict / direct 当场重盘（不信任调用方盘点）。
   if (wantVariant !== "transition") {
@@ -2224,6 +2233,11 @@ export function mintSelectionHandles({ endpointId, capability, plan, env = proce
   if (plan.token !== capability.token) return { ok: false, commit: "not_committed", reason: "plan_token_mismatch", why: "plan.token 与 capability.token 不符" };
   if (plan.endpoint !== endpointId || (capability.endpointId !== undefined && capability.endpointId !== endpointId)) return { ok: false, commit: "not_committed", reason: "plan_endpoint_mismatch", why: "plan.endpoint 与 endpointId 不符" };
   if (typeof capability.request_key === "string" && plan.request_key !== capability.request_key) return { ok: false, commit: "not_committed", reason: "plan_request_key_mismatch", why: "plan.request_key 与 capability.request_key 不符" };
+  // R51 返修一（2a）：capability 把 mint step 的 before 与 intended_blob 绑到 plan——step.before.ledger_sha256 === plan.before_ledger_sha256；
+  //   intended_blob.sha256 === sha256(planBytes) ∧ bytes === planBytes.length，planBytes = mintPlanBytes(plan)（单一出处）。
+  if (cap.step.before.ledger_sha256 !== plan.before_ledger_sha256) return { ok: false, commit: "not_committed", reason: "plan_before_mismatch", why: "step.before.ledger_sha256 与 plan.before_ledger_sha256 不符" };
+  const planBytes = mintPlanBytes(plan);
+  if (cap.step.intended_blob && (cap.step.intended_blob.sha256 !== sha256(Buffer.from(planBytes, "utf-8")) || cap.step.intended_blob.bytes !== Buffer.byteLength(planBytes))) return { ok: false, commit: "not_committed", reason: "plan_blob_mismatch", why: "step.intended_blob.sha256/bytes 与 plan 序列化不符" };
   const d = resolveEndpointDir(endpointId, { env });
   if (!d.ok) return badTx(d);
   const cur = loadLedger(d.dir, { endpointId });

@@ -1247,7 +1247,7 @@ export function osmExit(ctx, { apply = false, env = process.env, surface: held =
     const j = readJournal({ dir, token });
     if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token };
     const phase = j.doc.phase;
-    if (j.doc.operation_kind !== "owner_select_migration_a") return { ok: false, reason: "not_osm_operation", why: "active 是 " + j.doc.operation_kind + "（走 maintenance-gate --exit 通用分派）", token, phase };
+    if (!["owner_select_migration_a", "owner_select_migration_b", "owner_select_migration_direct"].includes(j.doc.operation_kind)) return { ok: false, reason: "not_osm_operation", why: "active 是 " + j.doc.operation_kind + "（走 maintenance-gate --exit 通用分派）", token, phase };
     const action = osmExitAction(phase);
     if (action === null) return { ok: false, reason: "unexpected_phase", why: phase, token, phase };
     return { ok: true, token, phase, action };

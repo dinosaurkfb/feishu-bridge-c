@@ -38470,6 +38470,144 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     } finally { fx.cleanup(); }
   });
 
+  test("R53 ②-② B 崩溃恢复矩阵：seal/precheck/strict/complete/on 每步后崩溃 → --exit 只向前收敛", () => {
+    // afterStep 序列：enter 7 次 + forward：8=进段后 9=seal 10=precheck A 11=precheck B 12=strict A 13=strict B 14=complete 15=on
+    for (const crashAfter of [8, 9, 11, 13, 15]) {
+      const fx = r53SetupB({ crashAfter });
+      try {
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "崩溃点 " + crashAfter);
+        releaseOperationLease52({ path: path.join(fx.dir, readActive({ dir: fx.dir }).token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const ex = osmExit52(fx.ctx, { apply: true, env: fx.env });
+        assert.ok(ex.ok && ex.phase === "done" && ex.activeCleared === true, "崩溃点 " + crashAfter + " 恢复收敛：" + JSON.stringify({ reason: ex.reason, phase: ex.phase, incomplete: ex.incomplete }));
+        for (const ep of fx.eps) {
+          const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+          assert.equal(L.doc.schema_version, "1.1", ep + " strict");
+          assert.equal(Object.values(L.doc.operations).filter((o) => o.op_type === "schema_upgrade" && o.request_key === ex.token + ":schema:" + ep).length, 1, "恰一笔 strict 升版");
+        }
+        assert.equal(readCampaignState(fx.env).state, "complete");
+        assert.equal(readWriterState(fx.env).state, "on");
+        assert.deepEqual(fx.problems, [], "崩溃点 " + crashAfter + " 每提交点 journalProblem 全 null");
+      } finally { fx.cleanup(); }
+    }
+  });
+
+  test("R53 ②-③ B/direct 前置矩阵：计数非零、campaign 状态、pending_joins、writer 状态", () => {
+    // B-1 计数非零（账本塞回 null-B1）→ precheck_failed 拒进段
+    {
+      const fx = r53SetupB({});
+      try {
+        const ep = fx.eps[0];
+        const p = path.join(fx.ledgerRoot, ep, "ledger.json");
+        const d = JSON.parse(fs.readFileSync(p, "utf-8"));
+        const b1 = "ta_" + "9".repeat(32);
+        d.records[b1] = { kind: "live", topic_agent_id: b1, chat_id: "oc_r53", created_at: T052, updated_at: T052, origin_operation_id: "00000000-0000-4000-8000-000000000002", aliases: { session_id: null, root_om: "om_r53x" }, anchor_candidate: null, binding_target: { runtime: "claude", project_root: "/p/r53", claude_session_id: "00000000-0000-4000-8000-0000000000bb" }, generation_lineage_id: "lin-r53", binding_proof: null, locator_link_proof_ref: null, facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null };
+        const seedOp = Object.values(d.operations).find((o) => o.op_type === "seed");
+        seedOp.result.seeded_ids.push(b1);
+        fs.writeFileSync(p, JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
+        const r = osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env });
+        assert.equal(r.ok, false, "B 计数非零拒");
+        assert.equal(r.reason, "precheck_failed", "precheck_failed：" + r.reason);
+        assert.ok(r.rollback && r.rollback.ok === true, "回退清场");
+        assert.equal(readActive({ dir: fx.dir }).state, "absent");
+      } finally { fx.cleanup(); }
+    }
+    // B-2 campaign sealed → 拒
+    {
+      const fx = r53SetupB({});
+      try {
+        const cs = JSON.parse(fs.readFileSync(campaignPath(fx.env), "utf-8"));
+        cs.state = "sealed";
+        fs.writeFileSync(campaignPath(fx.env), JSON.stringify(cs, null, 2) + "\n", { mode: 0o600 });
+        const r = osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env });
+        assert.equal(r.ok, false);
+        assert.equal(r.reason, "campaign_state_bad", "sealed 拒：" + r.reason);
+      } finally { fx.cleanup(); }
+    }
+    // B-3 pending_joins 非空 → 拒
+    {
+      const fx = r53SetupB({});
+      try {
+        const cs = JSON.parse(fs.readFileSync(campaignPath(fx.env), "utf-8"));
+        cs.pending_joins = [{ endpoint_id: "endpoint_" + "e".repeat(24), at: T052, init_chain: "claude", init_request_key: "k1", init_operation_token: r52Uuid(6) }];
+        fs.writeFileSync(campaignPath(fx.env), JSON.stringify(cs, null, 2) + "\n", { mode: 0o600 });
+        const r = osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env });
+        assert.equal(r.ok, false);
+        assert.equal(r.reason, "pending_joins_pending", "pending_joins 拒：" + r.reason);
+      } finally { fx.cleanup(); }
+    }
+    // B-4 writer off → 拒
+    {
+      const fx = r53SetupB({});
+      try {
+        fs.rmSync(writerStatePath(fx.env), { force: true });
+        const r = osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env });
+        assert.equal(r.ok, false);
+        assert.equal(r.reason, "writer_state_not_partial", "writer off 拒：" + r.reason);
+      } finally { fx.cleanup(); }
+    }
+    // direct-1 计数非零 → precheck_failed"改走 A"
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        const r = osmEnter52(fx.ctx, { kind: "direct", apply: true, env: fx.env });
+        process.stderr.write("R53D direct-1=" + JSON.stringify(r) + "\n");
+        assert.equal(r.ok, false);
+        assert.equal(r.reason, "precheck_failed", "direct 计数非零拒：" + r.reason);
+        assert.ok(r.rollback && r.rollback.ok === true, "回退清场");
+      } finally { fx.cleanup(); }
+    }
+    // direct-2 writer partial → 拒（收据在、账本计数 0，仅 writer 状态不对）
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        const d0 = path.join(fx.ledgerRoot, fx.eps[0], "ledger.json");
+        const dd0 = JSON.parse(fs.readFileSync(d0, "utf-8"));
+        dd0.records = {};
+        const seedOp0 = Object.values(dd0.operations).find((o) => o.op_type === "seed");
+        seedOp0.result = { seeded_ids: [] };
+        fs.writeFileSync(d0, JSON.stringify(dd0, null, 2) + "\n", { mode: 0o600 });
+        const campaignTok = r52Uuid(2);
+        const openDoc = { schema_version: CAMPAIGN_SCHEMA, campaign_id: campaignIdFor(campaignTok), state: "complete", endpoints: fx.eps, endpoints_digest: endpointsDigest(fx.eps), pending_joins: [], members: Object.fromEntries(fx.eps.map((e) => [e, { schema_version: "1.1", legacy_proof_count: 0, null_b1_count: 0 }])), revision: 1, origin_operation_id: campaignTok };
+        fs.writeFileSync(campaignPath(fx.env), JSON.stringify(openDoc, null, 2) + "\n", { mode: 0o600 });
+        const writerDoc = { schema_version: WRITER_STATE_SCHEMA, state: "partial", campaign_id: campaignIdFor(campaignTok), endpoints_digest: endpointsDigest(fx.eps), revision: 1, origin_operation_id: campaignTok };
+        fs.writeFileSync(writerStatePath(fx.env), JSON.stringify(writerDoc, null, 2) + "\n", { mode: 0o600 });
+        const r = osmEnter52(fx.ctx, { kind: "direct", apply: true, env: fx.env });
+        assert.equal(r.ok, false);
+        assert.equal(r.reason, "writer_state_partial", "writer partial 拒：" + r.reason);
+      } finally { fx.cleanup(); }
+    }
+  });
+
+  test("R53 ②-⑤ B 重开身份核验失败 → reopening_incomplete，修复后续跑 done", () => {
+    const fx = r53SetupB({ crashAfter: 15 }); // on done 后崩溃
+    try {
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true);
+      releaseOperationLease52({ path: path.join(fx.dir, readActive({ dir: fx.dir }).token + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      const tok = readActive({ dir: fx.dir }).token;
+      // 篡改：epA 的 strict 升版 request_key 改掉
+      const pA = path.join(fx.ledgerRoot, fx.eps[0], "ledger.json");
+      const dA = JSON.parse(fs.readFileSync(pA, "utf-8"));
+      const opIdA = TAL.ownerSelectSchemaUpgradeOpId(tok, fx.eps[0]);
+      dA.operations[opIdA].request_key = "tampered";
+      fs.writeFileSync(pA, JSON.stringify(dA, null, 2) + "\n", { mode: 0o600 });
+      const ex = osmExit52(fx.ctx, { apply: true, env: fx.env });
+      assert.equal(ex.ok, false, "核验失败拒：" + JSON.stringify({ ok: ex.ok, phase: ex.phase, incomplete: ex.incomplete }));
+      assert.equal(ex.phase, "reopening_incomplete", "reopening_incomplete");
+      // 修复 → 续跑 done
+      const dA2 = JSON.parse(fs.readFileSync(pA, "utf-8"));
+      dA2.operations[TAL.ownerSelectSchemaUpgradeOpId(tok, fx.eps[0])].request_key = tok + ":schema:" + fx.eps[0];
+      fs.writeFileSync(pA, JSON.stringify(dA2, null, 2) + "\n", { mode: 0o600 });
+      const ex2 = osmExit52(fx.ctx, { apply: true, env: fx.env });
+      assert.ok(ex2.ok && ex2.phase === "done" && ex2.activeCleared === true, "修复续跑 done：" + JSON.stringify({ reason: ex2.reason, incomplete: ex2.incomplete }));
+    } finally { fx.cleanup(); }
+  });
+
   test("R53 ②-① operation direct 全程：1.0→1.1 + campaign complete + writer on（before off）", () => {
     const fx = r52Setup({ twoEps: false });
     try {

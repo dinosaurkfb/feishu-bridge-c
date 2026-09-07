@@ -25162,8 +25162,13 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     const taid = (h) => "ta_" + h.repeat(32); // 记录 id 是 ta_+32hex（ID_SHAPE），不是 UUID
     const initOp = { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } };
     const cbOpId = "22222222-2222-2222-2222-222222222222";
-    const cbOp = (id, rev) => ({ op_type: "create_b1", terminal_kind: "create_b1", request_key: "req_cb", fingerprint: hx(2), result_revision: rev, result: { created_id: id } });
-    const mkDoc = (schema, rec0, rev) => ({ schema_version: schema, artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: CH, authority_mode: "shadow", revision: rev, operations: { "00000000-0000-0000-0000-000000000001": initOp, [cbOpId]: cbOp(rec0.topic_agent_id, rev) }, records: { [rec0.topic_agent_id]: rec0 } });
+    const cbOp = (schema, rec, rev) => {
+      const base = { op_type: "create_b1", terminal_kind: "create_b1", request_key: "req_cb", fingerprint: hx(2), result_revision: rev };
+      if (schema === "1.0") return { ...base, result: { created_id: rec.topic_agent_id } };
+      // 1.1+：result 必须对产生源同时携带 handle 增量，否则 G-handle 判“与产生源不一致”（R48）。
+      return { ...base, result: { created_id: rec.topic_agent_id, selection_handle: rec.selection_handle ?? null, handle_expires_at: rec.handle_expires_at ?? null, affected_live_ids_after_commit: [rec.topic_agent_id], proof_effects: [] } };
+    };
+    const mkDoc = (schema, rec0, rev) => ({ schema_version: schema, artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: CH, authority_mode: "shadow", revision: rev, operations: { "00000000-0000-0000-0000-000000000001": initOp, [cbOpId]: cbOp(schema, rec0, rev) }, records: { [rec0.topic_agent_id]: rec0 } });
     const b1Rec = (id, o) => Object.assign({ topic_agent_id: id, kind: "live", chat_id: "oc_g", anchor_candidate: null, aliases: null, binding_target: TGT, facts: null, generation_lineage_id: "lin_1", origin_operation_id: cbOpId, binding_proof: null, locator_link_proof_ref: null, created_at: iso(1700000000000), updated_at: iso(1700000000000) }, o);
     const b1Facts = () => ({ binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" });
     const v = (doc) => TAL.validateLedger(doc, { endpointId: EP });
@@ -25203,6 +25208,45 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     const r3 = v(mkDoc({ ...good, selected_session_id: "bad id" }));
     assert.equal(r3.reason, "ledger_corrupt", "坏 selected_session_id 形状拒：" + JSON.stringify(r3));
     assert.match(r3.why, /owner_select_v1.selected_session_id 形状不对/, "命中形状：" + r3.why);
+  });
+
+  // R48（item 5a/5b）：result 封闭键集增量 + proof_effects 恒等式 —— 纯合成回归。
+  //   红先行：旧代码 activate/anchor/unbind/… result 键集是精确基线（无新键），本块扩展结果必然被
+  //   operationProblem 判“result 形状不对”；5b 恒等式旧代码根本没有那层判据。
+  test("R48 账本侧：create_b1 result 增量（基线∪基线+新键）+ 1.0 拒新键 + proof_effects 恒等式 双向回归", () => {
+    const iso = (t) => new Date(t).toISOString();
+    const hx = (n) => String(n).repeat(64);
+    const taid = (h) => "ta_" + h.repeat(32);
+    const selHandle = (h = "a") => "osh_" + h.repeat(32);
+    const id = taid("a");
+    const id2 = taid("b");
+    const UUID1 = "00000000-0000-0000-0000-000000000001";
+    const cbId = "22222222-2222-2222-2222-222222222222";
+    const initOp = { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } };
+    const mkDoc = (schema, cbResult, recExtra) => ({
+      schema_version: schema, artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: CH, authority_mode: "shadow", revision: 2,
+      operations: { [UUID1]: initOp, [cbId]: { op_type: "create_b1", terminal_kind: "create_b1", request_key: "req_cb", fingerprint: hx(2), result_revision: 2, result: cbResult } },
+      records: { [id]: Object.assign({ topic_agent_id: id, kind: "live", chat_id: "oc_g", anchor_candidate: null, aliases: { root_om: "om_x", session_id: null }, binding_target: TGT, facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }, generation_lineage_id: "lin_1", origin_operation_id: cbId, binding_proof: null, locator_link_proof_ref: null, created_at: iso(1700000000000), updated_at: iso(1700000000000) }, recExtra) },
+    });
+    const extended = { created_id: id, selection_handle: selHandle(), handle_expires_at: iso(1700000001000), affected_live_ids_after_commit: [id], proof_effects: [] };
+    const v = (d) => TAL.validateLedger(d, { endpointId: EP });
+    // 正向：1.1 扩展结果合法（红先行）；1.0 基线结果仍合法（零回归）。
+    assert.ok(v(mkDoc("1.1", extended, { selection_handle: selHandle(), handle_expires_at: iso(1700000001000), rebind_handle: null, rebind_expires_at: null })).ok, "1.1 create_b1 扩展结果合法");
+    assert.ok(v(mkDoc("1.0", { created_id: id }, null)).ok, "1.0 create_b1 基线结果合法（零回归）");
+    // 反向：1.0 带新键拒、部分键拒、坏 shape 拒、坏 proof_effects 拒、坏 affected 拒。
+    assert.match(v(mkDoc("1.0", extended, { selection_handle: selHandle(), handle_expires_at: iso(1700000001000), rebind_handle: null, rebind_expires_at: null })).why, /result 增量字段仅限 schema≥transition/, "1.0 带增量字段拒");
+    const p1 = v(mkDoc("1.1", { created_id: id, selection_handle: selHandle(), handle_expires_at: iso(1700000001000), affected_live_ids_after_commit: [id] }, { selection_handle: selHandle(), handle_expires_at: iso(1700000001000), rebind_handle: null, rebind_expires_at: null }));
+    assert.match(p1.why, /create_b1 result 形状不对/, "部分新键（缺 proof_effects）拒：" + p1.why);
+    const p2 = v(mkDoc("1.1", { ...extended, proof_effects: [{ topic_agent_id: id, binding_effect: "bogus", link_effect: "none" }] }, { selection_handle: selHandle(), handle_expires_at: iso(1700000001000), rebind_handle: null, rebind_expires_at: null }));
+    assert.match(p2.why, /create_b1 result 形状不对/, "坏 proof_effects 值拒：" + p2.why);
+    const p3 = v(mkDoc("1.1", { ...extended, affected_live_ids_after_commit: [id2, id] }, { selection_handle: selHandle(), handle_expires_at: iso(1700000001000), rebind_handle: null, rebind_expires_at: null }));
+    assert.match(p3.why, /create_b1 result 形状不对/, "无序 affected 拒：" + p3.why);
+    // 5b 恒等式：proof_effects 提到 id，但该记录无 proof → 拒。（正向空集合法上面已验证。）
+    const b3 = v(mkDoc("1.1", { ...extended, proof_effects: [{ topic_agent_id: id, binding_effect: "produced", link_effect: "none" }] }, { selection_handle: selHandle(), handle_expires_at: iso(1700000001000), rebind_handle: null, rebind_expires_at: null }));
+    assert.match(b3.why, /proof_effects 与 \(affected∩提交后有 proof\) 不一致/, "5b 恒等式：无 proof 记录却报 produced 拒：" + b3.why);
+    // G-handle：记录 selection_handle 与产生源 result 逐字不符 → 拒。
+    const g1 = v(mkDoc("1.1", extended, { selection_handle: selHandle("b"), handle_expires_at: iso(1700000001000), rebind_handle: null, rebind_expires_at: null }));
+    assert.match(g1.why, /selection_handle 与产生源 result 不一致/, "G-handle：handle 与产生源不一致拒：" + g1.why);
   });
 
   // R37 裁定：M1a 收据逐端点原子启用。接线测试需要让 EP 处于两种收据态：

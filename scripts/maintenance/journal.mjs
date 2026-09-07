@@ -833,6 +833,16 @@ export function journalProblem(doc, { maintenanceDir } = {}) {
         }
       }
 
+      const wsPartial = osmSteps.find((s) => s.kind === "writer_state" && s.id.endsWith(":partial"));
+      if (wsPartial) {
+        const campOpen = osmSteps.find((s) => s.kind === "campaign" && s.id.endsWith(":open"));
+        if (!campOpen) return "writer_state:partial 要求 campaign:open 存在";
+        if (wsPartial.intended_after.endpoints_digest !== null
+          && wsPartial.intended_after.endpoints_digest !== campOpen.intended_after.endpoints_digest) {
+          return "writer_state:partial 的 endpoints_digest 必须为 null 或等于 campaign:open 的 endpoints_digest";
+        }
+      }
+
       const wsOn = osmSteps.find((s) => s.kind === "writer_state" && s.id.endsWith(":on"));
       if (wsOn) {
         const campComplete = osmSteps.find((s) => s.kind === "campaign" && s.id.endsWith(":complete"));

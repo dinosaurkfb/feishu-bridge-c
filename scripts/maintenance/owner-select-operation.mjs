@@ -356,6 +356,92 @@ export function osmEnterForwardB(ctx, { token, lease, env = process.env } = {}) 
   return { ok: true, phase: "osm_b_strictening", steps: built.steps.length };
 }
 
+// R53 步3：B forward 收敛 a–e（seal 写→每 ep precheck 再盘→每 ep strict→complete（前置全 strict done）→on（前置 complete done + admission 读回 on）→ledger_reopening）。
+export function osmForwardB(ctx, { token, lease, env = process.env, _inject = null } = {}) {
+  const fail = (reason, why, commit = "not_committed", extra = {}) => ({ ok: false, reason, why: why ?? null, commit, ...extra });
+  let doc = readJournal({ dir: ctx.dir, token }).doc;
+  if (doc.phase !== "osm_b_strictening") return fail("not_forwarding", "phase " + doc.phase);
+  const cid = campaignIdFor(token);
+  const stepDone = (id, after) => { const m = markStepDone({ dir: ctx.dir, token, lease, id, after, now: ctx.now() }); return m.ok ? null : m; };
+  const refresh = () => { doc = readJournal({ dir: ctx.dir, token }).doc; return doc; };
+  const sealedDoc = buildStateDoc({ env, cid, token, state: "sealed" });
+  const completeDoc = buildStateDoc({ env, cid, token, state: "complete" });
+  const onDoc = { schema_version: WRITER_STATE_SCHEMA, state: "on", campaign_id: cid, endpoints_digest: endpointsDigest(frozenOf(env, cid)), revision: 2, origin_operation_id: token };
+  // a. campaign:seal
+  const seal = refresh().steps.find((s) => s.kind === "campaign" && s.id === "campaign:" + cid + ":seal");
+  if (seal && seal.state !== "done") {
+    if (seal.state === "prepared") {
+      const cs = readCampaignState(env);
+      if (!(cs.exists && cs.sha256 === seal.intended_after.sha256 && cs.state === "sealed")) {
+        const w = writeCampaignState({ env, expectedSha256: cs.exists ? cs.sha256 : null, doc: sealedDoc, capability: { token, stepId: seal.id } });
+        if (!w.ok) return fail(w.reason, w.why ?? null, w.commit ?? "not_committed");
+        if (w.commit !== "committed") return fail("commit_residue", w.why ?? null, w.commit);
+      }
+    }
+    const m = stepDone(seal.id, seal.intended_after); if (m) return fail(m.reason, m.why ?? null);
+  }
+  // b. 每 ep precheck 再盘
+  for (const st of refresh().steps.filter((s) => s.kind === "precheck")) {
+    if (st.state === "done") continue;
+    const ep = st.id.slice("precheck:".length);
+    const d = resolveEndpointDir(ep, { env }); const L = loadLedger(d.dir, { endpointId: ep });
+    const inv = migrationInventory(L.doc);
+    if (inv.legacy_proof_count !== 0 || inv.null_b1_count !== 0) return fail("precheck_failed", ep + "：legacy=" + inv.legacy_proof_count + " null_b1=" + inv.null_b1_count + "（门外 reaffirm 未完成，停门不记 done）");
+    const m = stepDone(st.id, st.intended_after); if (m) return fail(m.reason, m.why ?? null);
+  }
+  // c. 每 ep schemaUpgrade(strict)
+  for (const st of refresh().steps.filter((s) => s.kind === "schema_endpoint")) {
+    if (st.state === "done") continue;
+    const ep = st.id.slice("schema_endpoint:".length).split(":")[0];
+    const d = resolveEndpointDir(ep, { env }); const L = loadLedger(d.dir, { endpointId: ep });
+    if (L.ok && L.doc.schema_version === st.intended_after.schema_version && L.sha256 === st.intended_after.ledger_sha256) { /* already */ }
+    else { const r = schemaUpgrade({ endpointId: ep, capability: { kind: "schema_upgrade", token }, requestKey: token + ":schema:" + ep, fromSchema: "1.1-transition", toSchema: "1.1", env, _inject }); if (!r.ok) return fail(r.reason, r.why ?? null, r.commit ?? "not_committed"); if (r.sha256 !== st.intended_after.ledger_sha256) return fail("written_mismatch", ep + " 读回 SHA ≠ 预算"); }
+    const m = stepDone(st.id, st.intended_after); if (m) return fail(m.reason, m.why ?? null);
+  }
+  // d. campaign:complete（前置：全 strict done 由步骤 c 已确保；此处写 complete）
+  const comp = refresh().steps.find((s) => s.kind === "campaign" && s.id === "campaign:" + cid + ":complete");
+  if (comp && comp.state !== "done") {
+    if (comp.state === "prepared") {
+      const cs = readCampaignState(env);
+      if (!(cs.exists && cs.sha256 === comp.intended_after.sha256 && cs.state === "complete")) {
+        const w = writeCampaignState({ env, expectedSha256: cs.exists ? cs.sha256 : null, doc: completeDoc, capability: { token, stepId: comp.id } });
+        if (!w.ok) return fail(w.reason, w.why ?? null, w.commit ?? "not_committed");
+        if (w.commit !== "committed") return fail("commit_residue", w.why ?? null, w.commit);
+      }
+    }
+    const m = stepDone(comp.id, comp.intended_after); if (m) return fail(m.reason, m.why ?? null);
+  }
+  // e. writer_state:on（前置：complete done = 上一段已确保；admission 读回 on）
+  const on = refresh().steps.find((s) => s.kind === "writer_state" && s.id === "writer_state:" + cid + ":on");
+  if (on && on.state !== "done") {
+    if (on.state === "prepared") {
+      const ws = readWriterState(env);
+      if (!(ws.exists && ws.sha256 === on.intended_after.sha256 && ws.state === "on")) {
+        const w = writeWriterState({ env, expectedSha256: ws.exists ? ws.sha256 : null, doc: onDoc, capability: { token, stepId: on.id } });
+        if (!w.ok) return fail(w.reason, w.why ?? null, w.commit ?? "not_committed");
+        if (w.commit !== "committed") return fail("commit_residue", w.why ?? null, w.commit);
+      }
+    }
+    const m = stepDone(on.id, on.intended_after); if (m) return fail(m.reason, m.why ?? null);
+  }
+  // f. 全 done → ledger_reopening
+  refresh();
+  const undone = readJournal({ dir: ctx.dir, token }).doc.steps.filter((s) => s.state !== "done");
+  if (undone.length > 0) return fail("steps_incomplete", undone.map((s) => s.id).join(","));
+  const np = setPhase({ dir: ctx.dir, token, lease, phase: "ledger_reopening", expectPhase: "osm_b_strictening", now: ctx.now() });
+  if (!np.ok) return fail(np.reason, np.why ?? null);
+  return { ok: true, phase: "ledger_reopening" };
+}
+
+// B 的 campaign doc 构造（sealed/complete；member 从现场或预算）。
+function buildStateDoc({ env, cid, token, state }) {
+  const frozen = frozenOf(env, cid);
+  const members = state === "complete" ? Object.fromEntries(frozen.map((ep) => [ep, { schema_version: "1.1", legacy_proof_count: 0, null_b1_count: 0 }])) : {};
+  if (state === "sealed") { for (const ep of frozen) { const d = resolveEndpointDir(ep, { env }); const L = loadLedger(d.dir, { endpointId: ep }); const inv = migrationInventory(L.doc); members[ep] = { schema_version: L.doc.schema_version, legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count }; } }
+  return { schema_version: CAMPAIGN_SCHEMA, state, campaign_id: cid, endpoints: frozen, endpoints_digest: endpointsDigest(frozen), members, pending_joins: [], revision: state === "sealed" ? 2 : 3, origin_operation_id: token };
+}
+function frozenOf(env, cid) { const cs = readCampaignState(env); return cs.exists ? [...cs.endpoints].sort() : []; }
+
 function readStagedPlanBytes(file) {  let fd = null;
   try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); }
   catch (err) { return { ok: false, why: err?.code === "ENOENT" ? "文件不在" : errText(err) }; }

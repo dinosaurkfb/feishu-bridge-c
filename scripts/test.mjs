@@ -228,7 +228,7 @@ import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs"
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
-import { osmEnter as osmEnter52, osmExit as osmExit52, osmForward as osmForward52, removeMintPlans as removeMintPlans52, osmPrecheck as osmPrecheck52, buildBSteps as buildBSteps52, osmEnterForwardB as osmEnterForwardB52, OSM_HANDLE_TTL_MS, mintPlanBytes as mintPlanBytes52 } from "./maintenance/owner-select-operation.mjs";
+import { osmEnter as osmEnter52, osmExit as osmExit52, osmForward as osmForward52, removeMintPlans as removeMintPlans52, osmPrecheck as osmPrecheck52, buildBSteps as buildBSteps52, osmEnterForwardB as osmEnterForwardB52, osmForwardB as osmForwardB52, OSM_HANDLE_TTL_MS, mintPlanBytes as mintPlanBytes52 } from "./maintenance/owner-select-operation.mjs";
 import * as MOS from "./maintenance-owner-select.mjs";
 import { releaseOperationLease as releaseOperationLease52 } from "./maintenance/journal.mjs";
 import { installSurfaceLockPath } from "./install-surface-lock.mjs";

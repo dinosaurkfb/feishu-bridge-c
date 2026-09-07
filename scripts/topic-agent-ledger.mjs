@@ -722,11 +722,12 @@ const RESULT_SHAPE = Object.freeze({
         && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.affected_id
         && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_id && r.proof_effects[0].binding_effect === "produced" && r.proof_effects[0].link_effect === "preserved"),
   anchor: (r) => (keysOf(r) === "affected_id" && isId(r.affected_id))
-    || (keysOf(r) === "affected_id,affected_live_ids_after_commit,authorized_at,authorized_by,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id"
+    || (keysOf(r) === "affected_id,affected_live_ids_after_commit,authorized_at,authorized_by,expected_anchor_candidate,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id"
         && isId(r.affected_id) && ANY_HANDLE_SHAPE.test(r.selection_handle) && isCanonicalIso(r.authorized_at) && AUTHORIZED_BY_SHAPE.test(r.authorized_by)
         && AILY_SESSION_SHAPE.test(r.selected_session_id) && OM_SHAPE.test(r.selected_root_om) && isOperationId(r.selection_operation_id)
         && (r.selection_basis === "explicit_handle" || r.selection_basis === "unique_candidate")
         && typeof r.selection_message_id === "string" && OM_SHAPE.test(r.selection_message_id)
+        && OM_SHAPE.test(r.expected_anchor_candidate) && r.expected_anchor_candidate === r.selected_root_om
         && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.affected_id
         && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_id && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "produced"),
   restore: (r) => (keysOf(r) === "affected_id" && isId(r.affected_id))
@@ -865,7 +866,12 @@ function opConsistentWithRecord(op, id, rec) {
     case "void": return rec.kind === "voided_audit" && r.voided_id === id;
     case "attach_a2": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === "A2"
       && (r.anchor_candidate === undefined || r.anchor_candidate === rec.anchor_candidate);
-    case "attach_a3": case "anchor": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === "A3";
+    case "attach_a3": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === "A3";
+    case "anchor": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === "A3"
+      // 返修三 P1-3：owner_select 增量锚定（r.expected_anchor_candidate 已由 shape 钉必带且 === selected_root_om）
+      // 时，必须等于记录上保留的 anchor_candidate（即产生 op 钉下的 pre-commit 值）；
+      // F4 基线锚定（1.0 形状，无此字段）不受影响 —— 与 attach_a2 的 undefined 宽容模式一致。
+      && (r.expected_anchor_candidate === undefined || r.expected_anchor_candidate === rec.anchor_candidate);
     case "restore": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === "B3";
     case "unbind": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === r.terminal_family;
     case "retarget": {

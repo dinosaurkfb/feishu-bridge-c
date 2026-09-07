@@ -33041,7 +33041,7 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
         result: {
           affected_id: taId1, affected_live_ids_after_commit: [taId1],
           authorized_at: ISO, authorized_by: "ou_owner1",
-          selected_root_om: "om_cand1", selected_session_id: "sess_1",
+          selected_root_om: "om_cand1", selected_session_id: "sess_1", expected_anchor_candidate: "om_cand1",
           selection_basis: "explicit_handle", selection_handle: hOSH1,
           selection_message_id: "om_msg1", selection_operation_id: opIdAncP12,
           proof_effects: [{ topic_agent_id: taId1, binding_effect: "preserved", link_effect: "produced" }]
@@ -33058,6 +33058,27 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
       return d;
     };
     assert.equal(TAL.validateLedger(mkAncP12(), { endpointId: EP }).ok, true, "anchor preserved attach + produced owner_selected_route_v1 合法");
+
+    // ── 返修三 P1-3：anchor 增量 result 加 expected_anchor_candidate，与 pre-commit 候选三方等式 ──
+
+    // 1. anchor 增量 result 缺 expected_anchor_candidate → 拒（pre-fix：字段未知，文档合法 → 红）
+    const dAncNoExpP13 = structuredClone(mkAncP12());
+    delete dAncNoExpP13.operations[opIdAncP12].result.expected_anchor_candidate;
+    const vAncNoExpP13 = TAL.validateLedger(dAncNoExpP13, { endpointId: EP });
+    assert.equal(vAncNoExpP13.ok, false, "anchor 增量 result 缺 expected_anchor_candidate 必拒");
+
+    // 2. expected_anchor_candidate ≠ selected_root_om → 拒
+    const dAncDriftOmP13 = structuredClone(mkAncP12());
+    dAncDriftOmP13.operations[opIdAncP12].result.expected_anchor_candidate = "om_drift";
+    const vAncDriftOmP13 = TAL.validateLedger(dAncDriftOmP13, { endpointId: EP });
+    assert.equal(vAncDriftOmP13.ok, false, "expected_anchor_candidate ≠ selected_root_om 必拒");
+
+    // 3. expected_anchor_candidate ≠ 记录 anchor_candidate（pre-commit A2 候选）→ 拒
+    const dAncDriftRecP13 = structuredClone(mkAncP12());
+    dAncDriftRecP13.records[taId1].anchor_candidate = "om_rec";
+    const vAncDriftRecP13 = TAL.validateLedger(dAncDriftRecP13, { endpointId: EP });
+    assert.equal(vAncDriftRecP13.ok, false, "expected_anchor_candidate ≠ 记录 anchor_candidate 必拒");
+    assert.match(String(vAncDriftRecP13.why), /不相容（G13）/u);
 
     // 逐 op 钉死反向：rebind produced 伪 migrated proof → 拒（preserved⇒any，produced⇒owner_select_v1）
     const opIdMigRb = "00000000-0000-4000-8000-000000000026";

@@ -1701,6 +1701,8 @@ function stampAndBuild(doc, { opType, inputs, result, mutateRecords }) {
 
 /** 维护 capability 核验：读实文件（active / journal / gate / lease + ledger step）逐项独立核对，任一不过 → 结构化拒。 */
 function _maintenanceVerifier(capability, endpointId, opType, env = process.env) {
+  // R51: schema_upgrade / mint_selection_handles 走独立 migration 校验（journal 为 owner_select_* migration，step 为 schema_endpoint/mint，非 ledger 步）。
+  if (opType === "schema_upgrade" || opType === "mint_selection_handles") return _migrationVerifier(capability, endpointId, opType, env);
   const fail = (reason, why) => ({ ok: false, reason, why });
   if (!capability || typeof capability !== "object") return fail("bad_capability", "capability 缺失");
   const wantKind = opType === "initialize_shadow" ? "ledger_init" : "ledger_cutover";
@@ -2010,6 +2012,245 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
   if (reread.status !== "read" || reread.sha256 !== plan.sha256) return { ok: false, commit: res.commit, reason: "written_mismatch", why: "落盘 SHA 与蓝图不符", ...wrNote(res) };
   // P2-2（第 5 轮）：同上用统一投影，cutover 的 commit_residue 分支也能点名账本主锁。
   return { ok: true, commit: res.commit, revision: plan.intendedAfter.revision, result: res.result, sha256: plan.sha256, plan, ...wrNote(res) };
+}
+
+/* ─────────────────────────── owner_select 迁移执行器（R51；operation A 两笔 ledger op + mint plan 工艺） ─────────────────────────── */
+
+// §8.2：campaign_id 形状（osc_+32hex，与 journal 里三处同一派生）。
+const OSC_SHAPE = /^osc_[0-9a-f]{32}$/u;
+
+// §8.1 存量范围：binding_proof.kind==="pairing" / locator_link_proof_ref.kind==="f4_anchor" 的 live + old-pairing tombstone。
+//   §8.2 precheck 与 §6 mint 前置都用它：legacy_proof_count / null_b1_count（B1 族且 selection_handle==null，含缺席键）。
+//   返回 { legacy_proof_count, null_b1_count, null_b1_ids:[有序] }。桶之和自洽（逐条计数，不猜）。
+export function migrationInventory(doc) {
+  if (!isObj(doc) || !isObj(doc.records)) return { legacy_proof_count: 0, null_b1_count: 0, null_b1_ids: [] };
+  let legacy = 0;
+  const nullB1 = [];
+  for (const [id, rec] of Object.entries(doc.records)) {
+    const fam = rec.kind === "live" ? familyOf(rec.facts) : null;
+    if (rec.kind === "live") {
+      if (rec.binding_proof?.kind === "pairing" || rec.locator_link_proof_ref?.kind === "f4_anchor") legacy += 1;
+      if (fam === "B1" && rec.selection_handle == null) nullB1.push(id);
+    } else if (rec.kind === "forwarding_tombstone") {
+      if (rec.proof_ref?.kind === "pairing") legacy += 1;
+    }
+  }
+  nullB1.sort();
+  return { legacy_proof_count: legacy, null_b1_count: nullB1.length, null_b1_ids: nullB1 };
+}
+
+// R51 §8/§8.2 mint plan 工艺：由调用方状态派生 plan + 当前账本 SHA + expected 产证（mint plan 只算
+//   selection_handle 的 target（B1），不生成 A2；mint 后目标记录仅改 selection_handle/handle_expires_at/updated_at，不改 origin/family）。
+export function buildMintPlan({ doc, token, campaignId, endpointId, requestKey, now = Date.now(), ttlMs = 0 } = {}) {
+  if (!isObj(doc)) return { ok: false, reason: "bad_doc" };
+  if (typeof token !== "string" || !UUID_SHAPE.test(token)) return { ok: false, reason: "bad_token" };
+  if (typeof campaignId !== "string" || !OSC_SHAPE.test(campaignId)) return { ok: false, reason: "bad_campaign_id" };
+  if (typeof endpointId !== "string" || !ENDPOINT_SHAPE.test(endpointId)) return { ok: false, reason: "bad_endpoint" };
+  if (typeof requestKey !== "string" || !REQUEST_KEY_SHAPE.test(requestKey)) return { ok: false, reason: "bad_request_key" };
+  if (!Number.isFinite(now) || !Number.isFinite(ttlMs)) return { ok: false, reason: "bad_time" };
+  const inv = migrationInventory(doc);
+  const frozenAt = new Date(now).toISOString();
+  const handleExpiresAt = new Date(now + ttlMs).toISOString();
+  const beforeSha = sha256(Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8"));
+  const minted = inv.null_b1_ids.map((id) => ({ target_id: id, selection_handle: "osh_" + crypto.randomBytes(16).toString("hex") }));
+  const plan = {
+    plan_kind: "owner_select_mint_plan_v1", token, campaign_id: campaignId, endpoint: endpointId,
+    request_key: requestKey, operation_id: crypto.randomUUID(), frozen_at: frozenAt, handle_expires_at: handleExpiresAt,
+    before_ledger_sha256: beforeSha, expected_null_b1_ids: inv.null_b1_ids, minted,
+    expected_ledger_sha256: null,
+  };
+  const next = applyMintPlan(doc, plan);
+  plan.expected_ledger_sha256 = sha256(Buffer.from(JSON.stringify(next, null, 2) + "\n", "utf-8"));
+  return { ok: true, plan, inventory: inv };
+}
+
+// R51 §四 applyMintPlan：按 plan 生成 next doc（不落盘）。revision+1；op key=plan.operation_id；
+//   fingerprint=fingerprintOf("mint_selection_handles", {request_key, endpoint, expected_null_b1_ids})；
+//   result 逐字满足 RESULT_SHAPE.mint_selection_handles；每个 target 写 selection_handle/handle_expires_at、updated_at=frozen_at。
+export function applyMintPlan(doc, plan) {
+  const next = structuredClone(doc);
+  next.revision += 1;
+  next.operations[plan.operation_id] = {
+    op_type: "mint_selection_handles", terminal_kind: "mint_selection_handles", request_key: plan.request_key,
+    fingerprint: fingerprintOf("mint_selection_handles", { request_key: plan.request_key, endpoint: plan.endpoint, expected_null_b1_ids: plan.expected_null_b1_ids }),
+    result_revision: next.revision,
+    result: {
+      endpoint: plan.endpoint,
+      minted: plan.minted.map((m) => ({ target_id: m.target_id, selection_handle: m.selection_handle, handle_expires_at: plan.handle_expires_at })),
+      affected_live_ids_after_commit: plan.minted.map((m) => m.target_id),
+      proof_effects: [],
+    },
+  };
+  for (const m of plan.minted) {
+    const rec = next.records[m.target_id];
+    // mint 是 handle-only op（§7.1）：改 origin（R32 因果 + G-handle 溯源都要求最新触及者=origin）。
+    if (rec && rec.kind === "live") { rec.selection_handle = m.selection_handle; rec.handle_expires_at = plan.handle_expires_at; rec.updated_at = plan.frozen_at; rec.origin_operation_id = plan.operation_id; }
+  }
+  return next;
+}
+
+// R51 §四 mintPlanProblem：封闭形校验（键集、排序、handle 形、minted 集===expected_null_b1_ids、时间规范、SHA 形）。
+export function mintPlanProblem(plan) {
+  if (!isObj(plan)) return "plan 不是对象";
+  if (keysOf(plan) !== "before_ledger_sha256,campaign_id,endpoint,expected_ledger_sha256,expected_null_b1_ids,frozen_at,handle_expires_at,minted,operation_id,plan_kind,request_key,token") return "plan 字段集不对";
+  if (plan.plan_kind !== "owner_select_mint_plan_v1") return "plan_kind 不对";
+  if (typeof plan.token !== "string" || !UUID_SHAPE.test(plan.token)) return "token 不对";
+  if (typeof plan.campaign_id !== "string" || !OSC_SHAPE.test(plan.campaign_id)) return "campaign_id 不对";
+  if (typeof plan.endpoint !== "string" || !ENDPOINT_SHAPE.test(plan.endpoint)) return "endpoint 不对";
+  if (typeof plan.request_key !== "string" || !REQUEST_KEY_SHAPE.test(plan.request_key)) return "request_key 不对";
+  if (typeof plan.operation_id !== "string" || !OP_ID_SHAPE.test(plan.operation_id)) return "operation_id 不对";
+  if (!isCanonicalIso(plan.frozen_at) || !isCanonicalIso(plan.handle_expires_at)) return "时间不规范";
+  if (typeof plan.before_ledger_sha256 !== "string" || !SHA_SHAPE.test(plan.before_ledger_sha256)) return "before_ledger_sha256 不对";
+  if (typeof plan.expected_ledger_sha256 !== "string" || !SHA_SHAPE.test(plan.expected_ledger_sha256)) return "expected_ledger_sha256 不对";
+  if (!Array.isArray(plan.expected_null_b1_ids) || !plan.expected_null_b1_ids.every((x) => isId(x)) || !plan.expected_null_b1_ids.every((x, i) => i === 0 || plan.expected_null_b1_ids[i - 1] < x)) return "expected_null_b1_ids 不对";
+  if (!Array.isArray(plan.minted) || !plan.minted.every((m) => isObj(m) && keysOf(m) === "selection_handle,target_id" && isId(m.target_id) && SELECTION_HANDLE_SHAPE.test(m.selection_handle)) || !plan.minted.every((m, i) => i === 0 || plan.minted[i - 1].target_id < m.target_id)) return "minted 不对";
+  if (canonKey(plan.minted.map((m) => m.target_id)) !== canonKey(plan.expected_null_b1_ids)) return "minted 与 expected_null_b1_ids 不一致";
+  return null;
+}
+
+// R51 §一/§二/§五：owner_select migration 维护校验器（journal 为 owner_select_* migration，读 schema_endpoint / mint step）。
+function _migrationVerifier(capability, endpointId, opType, env = process.env) {
+  const fail = (reason, why) => ({ ok: false, reason, why });
+  if (!capability || typeof capability !== "object") return fail("bad_capability", "capability 缺失");
+  const { token } = capability;
+  const maintDir = maintenanceDir(env);
+  const gateFile = maintenanceGatePath(env);
+  if (typeof maintDir !== "string" || maintDir.length === 0) return fail("maintenance_dir_unknown", "维护目录说不清");
+  if (typeof gateFile !== "string" || gateFile.length === 0) return fail("gate_path_unknown", "门位置说不清");
+  if (typeof token !== "string" || !UUID_SHAPE.test(token)) return fail("bad_operation_token", "capability token 不是 UUID");
+  const active = readActive({ dir: maintDir });
+  if (active.state !== "active") return fail("no_active_operation", "没有 active operation（" + active.state + "）");
+  if (active.token !== token) return fail("operation_token_mismatch", "active 指向的 token 与 capability 不一致");
+  const j = readJournal({ dir: maintDir, token });
+  if (j.state !== "valid") return fail("journal_unreadable", "journal " + j.state + (j.why ? "：" + j.why : ""));
+  if (j.doc.schema_version !== JOURNAL_SCHEMA) return fail("journal_schema", "journal 不是 " + JOURNAL_SCHEMA);
+  const isSchema = opType === "schema_upgrade";
+  const allowedKinds = isSchema
+    ? ["owner_select_migration_a", "owner_select_migration_direct", "owner_select_migration_b"]
+    : ["owner_select_migration_a"];
+  if (!allowedKinds.includes(j.doc.operation_kind)) return fail("operation_kind_mismatch", "operation_kind " + j.doc.operation_kind + " 不在允许集");
+  const kind = isSchema ? "schema_endpoint" : "mint";
+  const step = j.doc.steps.find((s) => s.kind === kind && s.target === "ledger/" + endpointId + "/ledger.json");
+  if (!step) return fail(kind + "_step_absent", "journal 无 " + kind + " step（endpoint " + endpointId + "）");
+  if (step.state !== "prepared") return fail("step_not_prepared", "step 状态 " + step.state);
+  if (isSchema && !/^schema_endpoint:endpoint_[0-9a-f]{24}:(transition|strict|direct)$/u.test(step.id)) return fail("step_identity", "schema_endpoint step id 与 endpoint/动作不符");
+  if (!isSchema && step.id !== "mint:" + endpointId) return fail("step_identity", "mint step id 与 endpoint 不符");
+  const gate = readGate({ file: gateFile, now: Date.now() });
+  if (gate.state !== "active") return fail("gate_not_active", "门 " + gate.state + (gate.why ? "：" + gate.why : ""));
+  if (gate.payload?.token !== token) return fail("gate_token_mismatch", "门 token 与 operation 不一致");
+  const holder = leaseHolder({ dir: maintDir, token });
+  if (!holder.present) return fail("lease_absent", "operation 租约不存在");
+  if (holder.unreadable) return fail("lease_unreadable", "租约读不出：" + holder.why);
+  if (!holder.alive) return fail("lease_dead", "租约持有者 pid " + holder.pid + " 已不在");
+  if (holder.at !== null && !isCanonicalIso(holder.at)) return fail("lease_payload_bad", "租约 owner.at 不是规范化 ISO");
+  const lpath = leasePath(maintDir, token);
+  const binding = commitWhileHeld(lpath, () => {
+    const ld = resolveEndpointDir(endpointId, { env });
+    if (!ld.ok) return ld;
+    const cur = loadLedger(ld.dir, { endpointId });
+    if (!cur.ok) return { ok: false, reason: cur.reason, why: cur.why ?? null };
+    if (step.before.ledger_sha256 !== cur.sha256) return { ok: false, reason: "before_sha_mismatch", why: "step.before.ledger_sha256 与当前账本 SHA 不符" };
+    if (isSchema && step.before.schema_version !== cur.doc.schema_version) return { ok: false, reason: "before_schema_mismatch", why: "step.before.schema_version 与当前 doc.schema_version 不符" };
+    if (!isSchema && (!step.intended_blob || typeof step.intended_blob.path !== "string" || !step.intended_blob.path.endsWith("/intended/mint-" + endpointId + ".json"))) return { ok: false, reason: "blob_path_bad", why: "mint.intended_blob.path 不是 intended/mint-<ep>.json 的绝对路径" };
+    return { ok: true, doc: j.doc, step, sha256: cur.sha256, variant: isSchema ? step.id.split(":")[2] : null, curDoc: cur.doc };
+  });
+  if (!binding.ok || !binding.run) return fail("lease_lost", "本过程不再持有 operation 租约实例（commitWhileHeld：" + (binding?.reason ?? "lock_lost") + "）");
+  if (binding.reapUncleared) return fail("lease_reap_uncleared", "WAL 所有权转换后 reap 残骸未清（" + (binding.reapUncleared.path ?? "?") + "）");
+  if (!binding.run.ok) return fail("step_read", binding.run.reason + (binding.run.why !== undefined ? "：" + binding.run.why : ""));
+  return { ok: true, maintenanceDir: maintDir, doc: j.doc, step, ...binding.run };
+}
+
+/** schemaUpgrade（§6/§8）：受验 capability（active owner_select migration + schema_endpoint step + gate/lease）+ 原 request_key，
+ *  把 doc.schema_version 从 fromSchema 升到 toSchema；strict/direct 当场重盘 legacy/null-B1（precheck_failed）；同笔给 live 记录补四枚显式 null handle 字段。 */
+export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, toSchema, env = process.env, _inject = null } = {}) {
+  if (!capability || capability.kind !== "schema_upgrade") return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "kind 不符或缺失" };
+  const cap = _maintenanceVerifier(capability, endpointId, "schema_upgrade", env);
+  if (!cap.ok) return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: cap.reason + (cap.why ? "：" + cap.why : "") };
+  const edge = fromSchema + "->" + toSchema;
+  if (!VALID_UPGRADE_EDGES.includes(edge)) return { ok: false, commit: "not_committed", reason: "bad_upgrade_edge" };
+  const wantVariant = edge === "1.0->1.1-transition" ? "transition" : edge === "1.1-transition->1.1" ? "strict" : "direct";
+  if (cap.variant !== wantVariant) return { ok: false, commit: "not_committed", reason: "variant_mismatch", why: "capability step variant " + cap.variant + " 与边 " + edge + " 不符" };
+  if (typeof requestKey !== "string" || !REQUEST_KEY_SHAPE.test(requestKey)) return { ok: false, commit: "not_committed", reason: "bad_request_key" };
+  const d = resolveEndpointDir(endpointId, { env });
+  if (!d.ok) return badTx(d);
+  const cur = loadLedger(d.dir, { endpointId });
+  if (!cur.ok) return { ok: false, commit: "not_committed", reason: cur.reason, why: cur.why ?? null };
+  if (cur.doc.schema_version !== fromSchema) return { ok: false, commit: "not_committed", reason: "schema_mismatch", why: "doc.schema_version " + cur.doc.schema_version + " ≠ " + fromSchema };
+  // strict / direct 当场重盘（不信任调用方盘点）。
+  if (wantVariant !== "transition") {
+    const inv = migrationInventory(cur.doc);
+    if (inv.legacy_proof_count !== 0 || inv.null_b1_count !== 0) return { ok: false, commit: "not_committed", reason: "precheck_failed", why: "legacy_proof_count=" + inv.legacy_proof_count + " null_b1_count=" + inv.null_b1_count };
+  }
+  const res = writeLedger({
+    dir: d.dir, endpointId, gated: false, requestKey, _inject,
+    replay: () => [{ opType: "schema_upgrade", inputs: { request_key: requestKey, endpoint: endpointId, from_schema: fromSchema, to_schema: toSchema } }],
+    mutate: (currentDoc) => {
+      if (currentDoc === null) return { ok: false, reason: "absent" };
+      if (currentDoc.schema_version !== fromSchema) return { ok: false, reason: "schema_mismatch" };
+      const next = structuredClone(currentDoc);
+      const opId = crypto.randomUUID();
+      next.schema_version = toSchema;
+      for (const rec of Object.values(next.records)) {
+        if (rec.kind !== "live") continue;
+        if (rec.selection_handle === undefined) rec.selection_handle = null;
+        if (rec.handle_expires_at === undefined) rec.handle_expires_at = null;
+        if (rec.rebind_handle === undefined) rec.rebind_handle = null;
+        if (rec.rebind_expires_at === undefined) rec.rebind_expires_at = null;
+      }
+      next.operations[opId] = {
+        op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: requestKey,
+        fingerprint: fingerprintOf("schema_upgrade", { request_key: requestKey, endpoint: endpointId, from_schema: fromSchema, to_schema: toSchema }),
+        result_revision: next.revision + 1,
+        result: { endpoint: endpointId, from_schema: fromSchema, to_schema: toSchema },
+      };
+      next.revision += 1;
+      return { ok: true, next };
+    },
+  });
+  if (!res.ok || typeof res.commit !== "string" || !res.commit.startsWith("committed")) return { ok: false, commit: res?.commit ?? "not_committed", reason: res?.reason ?? "written_refused", why: res?.why ?? null, ...wrNote(res) };
+  const reread = readLedger(d.dir);
+  if (reread.status !== "read") return { ok: false, commit: res.commit, reason: "written_mismatch", why: "写回读不出", ...wrNote(res) };
+  return { ok: true, commit: res.commit, revision: res.revision, result: res.result, sha256: reread.sha256, ...wrNote(res) };
+}
+
+/** mintSelectionHandles（§6/§8.2）：受验 capability（mint step + gate/lease）+ 封闭 plan 三态。
+ *  当前 SHA === plan.before → 重核 null_b1_ids/schema 后 applyMintPlan→writeLedger→读回 SHA 必 === plan.expected_ledger_sha256（否则 written_mismatch）；
+ *  当前 SHA === plan.expected → already；两者皆非 → ledger_diverged。不接受无 plan / 重新生成 handle。 */
+export function mintSelectionHandles({ endpointId, capability, plan, env = process.env, _inject = null } = {}) {
+  if (!capability || capability.kind !== "mint_selection_handles") return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "kind 不符或缺失" };
+  const cap = _maintenanceVerifier(capability, endpointId, "mint_selection_handles", env);
+  if (!cap.ok) return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: cap.reason + (cap.why ? "：" + cap.why : "") };
+  const pp = mintPlanProblem(plan);
+  if (pp !== null) return { ok: false, commit: "not_committed", reason: "bad_plan", why: pp };
+  if (plan.token !== capability.token) return { ok: false, commit: "not_committed", reason: "plan_token_mismatch", why: "plan.token 与 capability.token 不符" };
+  if (plan.endpoint !== endpointId || (capability.endpointId !== undefined && capability.endpointId !== endpointId)) return { ok: false, commit: "not_committed", reason: "plan_endpoint_mismatch", why: "plan.endpoint 与 endpointId 不符" };
+  if (typeof capability.request_key === "string" && plan.request_key !== capability.request_key) return { ok: false, commit: "not_committed", reason: "plan_request_key_mismatch", why: "plan.request_key 与 capability.request_key 不符" };
+  const d = resolveEndpointDir(endpointId, { env });
+  if (!d.ok) return badTx(d);
+  const cur = loadLedger(d.dir, { endpointId });
+  if (!cur.ok) return { ok: false, commit: "not_committed", reason: cur.reason, why: cur.why ?? null };
+  if (cur.sha256 === plan.before_ledger_sha256) {
+    const inv = migrationInventory(cur.doc);
+    if (canonKey(inv.null_b1_ids) !== canonKey(plan.expected_null_b1_ids)) return { ok: false, commit: "not_committed", reason: "precheck_failed", why: "null_b1_ids 与 plan 不符" };
+    if (cur.doc.schema_version !== "1.1-transition") return { ok: false, commit: "not_committed", reason: "schema_mismatch", why: "schema_version=" + cur.doc.schema_version };
+    const res = writeLedger({
+      dir: d.dir, endpointId, gated: false, requestKey: plan.request_key, _inject,
+      replay: () => [{ opType: "mint_selection_handles", inputs: { request_key: plan.request_key, endpoint: endpointId, expected_null_b1_ids: plan.expected_null_b1_ids } }],
+      mutate: (currentDoc) => {
+        if (currentDoc === null) return { ok: false, reason: "absent" };
+        return { ok: true, next: applyMintPlan(currentDoc, plan) };
+      },
+    });
+    if (!res.ok || typeof res.commit !== "string" || !res.commit.startsWith("committed")) return { ok: false, commit: res?.commit ?? "not_committed", reason: res?.reason ?? "written_refused", why: res?.why ?? null, ...wrNote(res) };
+    const reread = readLedger(d.dir);
+    if (reread.status !== "read" || reread.sha256 !== plan.expected_ledger_sha256) return { ok: false, commit: res.commit, reason: "written_mismatch", why: "落盘 SHA ≠ plan.expected_ledger_sha256", ...wrNote(res) };
+    return { ok: true, commit: res.commit, revision: res.revision, result: res.result, sha256: reread.sha256, ...wrNote(res) };
+  }
+  if (cur.sha256 === plan.expected_ledger_sha256) {
+    const prior = Object.values(cur.doc.operations).find((op) => op.op_type === "mint_selection_handles" && op.request_key === plan.request_key);
+    return { ok: true, commit: "already", revision: cur.doc.revision, result: prior?.result ?? null, sha256: cur.sha256 };
+  }
+  return { ok: false, commit: "not_committed", reason: "ledger_diverged", why: "当前账本 SHA 既不 equals before 也不 equals expected" };
 }
 
 /* ─────────────────────────── 普通（gated）事务 ─────────────────────────── */

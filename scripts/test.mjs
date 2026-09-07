@@ -35597,6 +35597,75 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
   assert.ok(["lock_busy", "cas_mismatch"].includes(failed[0].reason), "未成功进程的 reason 必须是 lock_busy 或 cas_mismatch，实际为: " + failed[0].reason);
 });
 
+// ── R51（账本侧迁移执行器）：纯函数——migrationInventory / buildMintPlan / applyMintPlan / mintPlanProblem ──
+test("R51 migrationInventory：legacy/null-B1 计数与桶之和自洽（pairing binding / f4_anchor link / pairing tombstone / null-B1）", () => {
+  const hx = (n) => String(n).repeat(64);
+  const taid = (h) => "ta_" + h.repeat(32);
+  const uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000";
+  const iso = (t) => new Date(t).toISOString();
+  const EP = "endpoint_" + "a".repeat(24);
+  const b1 = taid("b"), leg = taid("c"), f4 = taid("d"), tomb = taid("e");
+  const init = { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } };
+  // 仅用于计数（迁移盘点不 validateLedger）：字段直接构造。
+  const doc = { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: "claude", authority_mode: "shadow", revision: 2, operations: { [uuid(1)]: init }, records: {
+    [b1]: { kind: "live", topic_agent_id: b1, chat_id: "oc_g", aliases: { root_om: null, session_id: null }, facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }, binding_target: null, binding_proof: null, locator_link_proof_ref: null, anchor_candidate: null, generation_lineage_id: null, origin_operation_id: uuid(1), selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null },
+    [leg]: { kind: "live", topic_agent_id: leg, chat_id: "oc_l", aliases: { root_om: null, session_id: null }, facts: { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" }, binding_target: null, binding_proof: { kind: "pairing", authorized_by: "ou_o", authorized_at: iso(1700000000000), matched_om: "om_l", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }, locator_link_proof_ref: null, anchor_candidate: null, generation_lineage_id: null, origin_operation_id: uuid(1) },
+    [f4]: { kind: "live", topic_agent_id: f4, chat_id: "oc_f", aliases: { root_om: null, session_id: null }, facts: { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" }, binding_target: null, binding_proof: null, locator_link_proof_ref: { kind: "f4_anchor", by_identity: "user", matched_at: iso(1700000000000), matched_om: "om_f", matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" }, anchor_candidate: null, generation_lineage_id: null, origin_operation_id: uuid(1) },
+    [tomb]: { kind: "forwarding_tombstone", topic_agent_id: tomb, forwards_to: b1, proof_ref: { kind: "pairing", matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent", om: "om_t" }, origin_operation_id: uuid(1), merged_at: iso(1700000000000) },
+  } };
+  const inv = TAL.migrationInventory(doc);
+  assert.equal(inv.legacy_proof_count, 3, "legacy = pairing binding live + f4_anchor link live + pairing tombstone");
+  assert.equal(inv.null_b1_count, 1, "null-B1 = B1 族且 selection_handle==null");
+  assert.deepEqual(inv.null_b1_ids, [b1], "null_b1_ids 有序");
+  // 桶之和自洽：legacy/null-B1 分项之和等于各自记录数。
+  const manualLegacy = Object.values(doc.records).filter((r) => (r.kind === "live" && (r.binding_proof?.kind === "pairing" || r.locator_link_proof_ref?.kind === "f4_anchor")) || (r.kind === "forwarding_tombstone" && r.proof_ref?.kind === "pairing")).length;
+  const manualNullB1 = Object.values(doc.records).filter((r) => r.kind === "live" && TAL.familyOf(r.facts) === "B1" && r.selection_handle == null).length;
+  assert.equal(inv.legacy_proof_count, manualLegacy, "legacy 桶之和与逐条构造一致");
+  assert.equal(inv.null_b1_count, manualNullB1, "null-B1 桶之和与逐条构造一致");
+});
+
+test("R51 buildMintPlan/applyMintPlan/mintPlanProblem：1.1-transition 产 plan，apply 后 validateLedger 必过，G-handle 溯源到 mint op+负向拒", () => {
+  const hx = (n) => String(n).repeat(64);
+  const taid = (h) => "ta_" + h.repeat(32);
+  const uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000";
+  const iso = (t) => new Date(t).toISOString();
+  const EP = "endpoint_" + "a".repeat(24);
+  const b1 = taid("b"), cb = uuid(2);
+  const init = { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } };
+  const doc = { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: "claude", authority_mode: "shadow", revision: 2, operations: { [uuid(1)]: init, [cb]: { op_type: "create_b1", terminal_kind: "create_b1", request_key: "req_cb", fingerprint: hx(2), result_revision: 2, result: { created_id: b1 } } }, records: { [b1]: { topic_agent_id: b1, kind: "live", chat_id: "oc_g", anchor_candidate: null, aliases: { root_om: "om_x", session_id: null }, binding_target: { runtime: "claude", project_root: "/p", claude_session_id: uuid(3) }, facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }, generation_lineage_id: "lin_1", origin_operation_id: cb, binding_proof: null, locator_link_proof_ref: null, created_at: iso(1700000000000), updated_at: iso(1700000000000), selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null } } };
+  assert.equal(TAL.validateLedger(doc, { endpointId: EP }).ok, true, "前置账本合法");
+  const bp = TAL.buildMintPlan({ doc, token: uuid(9), campaignId: "osc_" + "c".repeat(32), endpointId: EP, requestKey: "req_mint", now: 1700000000000, ttlMs: 86400000 });
+  assert.equal(bp.ok, true, "buildMintPlan：" + JSON.stringify(bp));
+  assert.equal(TAL.mintPlanProblem(bp.plan), null, "mintPlanProblem 过：" + TAL.mintPlanProblem(bp.plan));
+  assert.equal(bp.plan.minted.length, 1, "null-B1 全 mint");
+  assert.equal(bp.inventory.null_b1_ids.length, 1);
+  const next = TAL.applyMintPlan(doc, bp.plan);
+  assert.equal(next.revision, 3, "revision+1");
+  assert.ok(next.records[b1].selection_handle.startsWith("osh_"), "handle 已写");
+  assert.equal(next.records[b1].origin_operation_id, bp.plan.operation_id, "origin 改为 mint op（R32 因果）");
+  const v = TAL.validateLedger(next, { endpointId: EP });
+  assert.equal(v.ok, true, "apply 后 validateLedger 必过：" + v.why);
+  // G-handle 溯源：mint 是产生 op，handle 与 result.minted 逐字等。
+  const mintOp = next.operations[bp.plan.operation_id];
+  assert.equal(mintOp.result.minted[0].selection_handle, next.records[b1].selection_handle, "G-handle 溯源");
+  assert.equal(mintOp.result.affected_live_ids_after_commit.length, 1);
+  // 负向：mintPlanProblem 拒坏 plan（minted 集 ≠ expected_null_b1_ids / 坏 handle）。
+  const badPlan = { ...bp.plan, minted: [] };
+  assert.ok(TAL.mintPlanProblem(badPlan) !== null, "minted 集不等 → 拒");
+  const badHandle = { ...bp.plan, minted: bp.plan.minted.map((m) => ({ ...m, selection_handle: "osh_zz" })) };
+  assert.ok(TAL.mintPlanProblem(badHandle) !== null, "坏 handle → 拒");
+  // applyMintPlan 用坏 plan 也会拒（mintPlanProblem 挡住）。
+  assert.ok(TAL.mintPlanProblem({ ...bp.plan, endpoint: "endpoint_bad" }) !== null, "坏 endpoint → 拒");
+});
+
+test("R51 schemaUpgrade/mintSelectionHandles：capability kind 不符即拒（maintenance_capability_required）", () => {
+  const EP = "endpoint_" + "a".repeat(24);
+  const r = TAL.schemaUpgrade({ endpointId: EP, capability: { kind: "bogus" }, requestKey: "k", fromSchema: "1.0", toSchema: "1.1-transition" });
+  assert.equal(r.reason, "maintenance_capability_required", "schemaUpgrade kind 不符拒：" + JSON.stringify(r));
+  const m = TAL.mintSelectionHandles({ endpointId: EP, capability: { kind: "bogus" }, plan: {} });
+  assert.equal(m.reason, "maintenance_capability_required", "mintSelectionHandles kind 不符拒：" + JSON.stringify(m));
+});
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

@@ -1115,8 +1115,10 @@ export function osmReopening(ctx, token, lease, env = process.env) {
   }
   {
     const cs = readCampaignState(env);
-    const cst = doc.steps.find((s) => s.kind === "campaign" && s.id.endsWith(":complete"));
-    if (!cst || cst.state !== "done") incomplete.push({ id: "campaign", why: "campaign complete step 尚未 done" });
+    const kind = doc.operation_kind === "owner_select_migration_a" ? "a" : doc.operation_kind === "owner_select_migration_b" ? "b" : "direct";
+    const wantCampaignId = kind === "a" ? ":open" : ":complete";
+    const cst = doc.steps.find((s) => s.kind === "campaign" && s.id.endsWith(wantCampaignId));
+    if (!cst || cst.state !== "done") incomplete.push({ id: "campaign", why: "campaign " + wantCampaignId.slice(1) + " step 尚未 done" });
     else if (!cs.exists || cs.sha256 !== cst.after.sha256 || cs.state !== cst.after.state || cs.campaign_id !== cst.after.campaign_id) incomplete.push({ id: "campaign", why: "campaign 文件读回 ≠ step after" });
     const ws = readWriterState(env);
     const wst = doc.steps.find((s) => s.kind === "writer_state");

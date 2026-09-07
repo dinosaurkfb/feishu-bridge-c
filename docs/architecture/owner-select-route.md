@@ -134,7 +134,7 @@ proof_effects:[ { topic_agent_id, binding_effect:"produced|preserved|none",
 **受影响集是明确的 result 字段（八轮 P1-1）**：每个相关 op 的 result 含有序字段
 `affected_live_ids_after_commit` = **本 op 提交后仍为 live 且 `origin_operation_id === 本 op` 的
 全部记录 id**（按 id 排序）。`proof_effects` 的 id 集 **恰等于**（不是子集）`affected_live_ids_after_commit` 中**提交后至少一面
-proof 非 null 的记录集**（十轮 P1-1）；**tombstone 只进 tombstone result（`tombstoned_a1_id` 等），
+proof 非 null 的记录集**（十轮 P1-1）；**tombstone 只进 tombstone result（`tombstoned_id` 等），
 不进这两个集合**（activate 的 A1 提交后已是 tombstone，故不在集内）。G-handle/G13′ 读的就是这两个
 字段。**本表列明、且提交后留下 origin 指向本 op 的 live 记录的事务，都必须带这两个字段**（十轮 P2 收窄：
 `create_a1` 不在本表、`void` 提交后无 live 记录——二者不带；每 op 唯一 effect 表，取值按"本笔是否
@@ -158,7 +158,7 @@ proof 非 null 的记录集**（十轮 P1-1）；**tombstone 只进 tombstone re
 | --- | --- | --- |
 | `create_b1` | （无新增；handle 随机不进 fp） | `selection_handle`, `handle_expires_at`, `affected_live_ids_after_commit:[b1_id]`, `proof_effects:[]` |
 | `attach_a2` | `expected_anchor_candidate`（=既有 live 字段 `anchor_candidate`，**不另造字段**，P1-3） | `selection_handle`, `handle_expires_at`（锚到既有 `anchor_candidate`）, `affected_live_ids_after_commit:[a2_id]`, `proof_effects:[{a2_id, produced, none}]` |
-| `activate` | 选择五元 `selected_session_id, selected_root_om, selection_handle, selection_message_id, selection_basis` | `demoted_current_id\|null` + 授权/选择六字段 + `selection_message_id` + `selection_basis` + **`affected_live_ids_after_commit`**（=[b3_id, demoted_current_id?] 排序）+ **`proof_effects`**（b3_id=produced/produced、demoted_current_id=preserved/preserved；**tombstoned_a1_id 只在 tombstone result、不进这两集**，八轮 P1-1） |
+| `activate` | 选择五元 `selected_session_id, selected_root_om, selection_handle, selection_message_id, selection_basis` | 授权/选择六字段 + `selection_message_id` + `selection_basis` + **`affected_live_ids_after_commit`**（=[surviving_id, demoted_historical_id?] 排序）+ **`proof_effects`**（surviving_id=produced/produced、demoted_historical_id=preserved/preserved；**tombstoned_id 只在 tombstone result、不进这两集**，八轮 P1-1）。**键名以账本基线为准**（`surviving_id/tombstoned_id/demoted_historical_id`，ledger §5.1）——增量只追加、不改名（R48 验收回带：此前本表写的 `demoted_current_id`/`tombstoned_a1_id` 是与基线不一致的笔误） |
 | `anchor` | 选择五元 + `expected_handle, expected_expires_at, expected_anchor_candidate` | 授权/选择六字段 + `selection_message_id` + `selection_basis` + `affected_live_ids_after_commit:[a3_id]` + `proof_effects`（a3_id=**`{binding_effect:"preserved", link_effect:"produced"}`**——binding 仍是 attach 显式授权、只补 link，七轮 P1-1） |
 | `request_rebind` | `expected_b3_id, expected_current_generation, expected_old_session_id, expect_no_handle:true`（**CAS**） | `rebind_handle`, `rebind_expires_at`, `affected_live_ids_after_commit:[b3_id]`, `proof_effects:[{b3_id, preserved, preserved}]` |
 | `rebind_session_alias` | `old_session_id, new_session_id, rebind_handle, expected_expires_at, selection_message_id` | `old_session_id, new_session_id, selection_handle(=orh_消费值), selected_root_om, selected_session_id(=new), authorized_by, authorized_at, tombstoned_a1_id\|null, selection_message_id, selection_basis:"rebind", affected_live_ids_after_commit:[b3_id], proof_effects:[{b3_id, binding_effect:(原 binding.kind==="owner_select_v1" ? "produced" : "preserved"), link_effect:"produced"}]`（十轮 P1-1 逐分支确定：原 binding 为 owner_select_v1 时六字段重签=produced，否则保持=preserved；link 一律重签=produced） |

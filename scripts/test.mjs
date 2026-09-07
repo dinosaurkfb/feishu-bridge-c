@@ -34536,13 +34536,20 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
   assert.match(read0700.problem, /0600/u);
   fs.unlinkSync(campFile);
 
-  // 1.98 MB 文档（> 1 MiB）落盘前核大小必拒，不留文件
-  const largePadding = "x".repeat(1024 * 1024 * 2);
-  const largeDoc = { ...dummyDoc, _extra: largePadding };
+  // 1.98 MB 文档（> 1 MiB）落盘前核大小必拒，不留文件（合法的超长 pending_joins 字段使体积超限）
+  const largeDoc = {
+    ...dummyDoc,
+    pending_joins: [{
+      ...dummyDoc.pending_joins[0],
+      init_request_key: "x".repeat(1024 * 1024 * 2)
+    }]
+  };
+  assert.equal(campaignDocProblem(largeDoc), null, "超大文档形状自身合法，仅体积超限");
   const writeLarge = writeCampaignState({ env: envOk, expectedSha256: null, doc: largeDoc });
   assert.equal(writeLarge.ok, false);
   assert.equal(writeLarge.commit, "not_committed");
-  assert.equal(fs.existsSync(campFile), false, "超限文档不落盘");
+  assert.equal(writeLarge.reason, "document_too_large");
+  assert.equal(fs.existsSync(campFile), false, "超限文档不落盘且不新建文件");
 
   // 写前异常结构化返回，不裸抛
   const writeThrow = writeCampaignState({ env: envOk, expectedSha256: null, doc: { bad: true } });
@@ -34558,6 +34565,16 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
   assert.equal(write2SameSha.ok, false);
   assert.equal(write2SameSha.commit, "not_committed");
   assert.equal(write2SameSha.reason, "cas_mismatch");
+
+  // 覆写时 >1 MiB 文档核大小必拒，commit 为 not_committed，reason 为 document_too_large，且盘上原文件字节不变
+  const shaBeforeLargeOverwrite = readCampaignState(envOk).sha256;
+  assert.equal(shaBeforeLargeOverwrite, write1.sha256);
+  const largeDocOverwrite = { ...largeDoc, revision: 2 };
+  const writeLargeOverwrite = writeCampaignState({ env: envOk, expectedSha256: write1.sha256, doc: largeDocOverwrite });
+  assert.equal(writeLargeOverwrite.ok, false);
+  assert.equal(writeLargeOverwrite.commit, "not_committed");
+  assert.equal(writeLargeOverwrite.reason, "document_too_large");
+  assert.equal(readCampaignState(envOk).sha256, shaBeforeLargeOverwrite, "超限覆写失败且盘上原文件字节不变");
 
   // 锁忙时写入返回 not_committed
   const lockDir = path.join(realLedgerDir, "owner-select-state.lock");
@@ -34926,20 +34943,53 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
   assert.equal(admOn.campaign_id, cid1);
   assert.equal(admOn.endpoints_digest, dig);
 
-  // 7. on 反例：campaign id 不匹配
+  // 7. on 反例：writer on + campaign open 必拒
+  fs.writeFileSync(cFile, JSON.stringify(dummyDoc, null, 2) + "\n", { mode: 0o600 });
+  const admOnCampOpen = readOwnerSelectAdmission(envAdm);
+  assert.equal(admOnCampOpen.state, "unreadable", "writer on + campaign open 必返回 unreadable");
+  assert.match(admOnCampOpen.problem, /writer 为 on 但 campaign 不处于 complete/u, "断言 problem 包含 campaign 不处于 complete 关键词");
+
+  // 8. on 反例：writer on + campaign sealed 必拒
+  const cDocSealedStrict = { ...cDocCompleteValid, state: "sealed" };
+  fs.writeFileSync(cFile, JSON.stringify(cDocSealedStrict, null, 2) + "\n", { mode: 0o600 });
+  const admOnCampSealed = readOwnerSelectAdmission(envAdm);
+  assert.equal(admOnCampSealed.state, "unreadable", "writer on + campaign sealed 必返回 unreadable");
+  assert.match(admOnCampSealed.problem, /writer 为 on 但 campaign 不处于 complete/u, "断言 problem 包含 campaign 不处于 complete 关键词");
+
+  // 9. on 反例：campaign id 不匹配
   const badIdCDoc = { ...cDocCompleteValid, campaign_id: "osc_99999999999999999999999999999999" };
   fs.writeFileSync(cFile, JSON.stringify(badIdCDoc, null, 2) + "\n", { mode: 0o600 });
-  assert.equal(readOwnerSelectAdmission(envAdm).state, "unreadable", "campaign_id 不匹配返回 unreadable");
+  const admBadId = readOwnerSelectAdmission(envAdm);
+  assert.equal(admBadId.state, "unreadable", "campaign_id 不匹配返回 unreadable");
+  assert.match(admBadId.problem, /campaign_id 不匹配/u, "断言 problem 包含 campaign_id 不匹配 关键词");
 
-  // 8. on 反例：digest 不匹配
+  // 10. on 反例：digest 不匹配
   fs.writeFileSync(cFile, JSON.stringify(cDocCompleteValid, null, 2) + "\n", { mode: 0o600 });
   const badDigWDoc = { ...wDocOn, endpoints_digest: "f".repeat(64) };
   fs.writeFileSync(wFile, JSON.stringify(badDigWDoc, null, 2) + "\n", { mode: 0o600 });
-  assert.equal(readOwnerSelectAdmission(envAdm).state, "unreadable", "endpoints_digest 不匹配返回 unreadable");
+  const admBadDig = readOwnerSelectAdmission(envAdm);
+  assert.equal(admBadDig.state, "unreadable", "endpoints_digest 不匹配返回 unreadable");
+  assert.match(admBadDig.problem, /endpoints_digest 不匹配/u, "断言 problem 包含 endpoints_digest 不匹配 关键词");
+  fs.writeFileSync(wFile, JSON.stringify(wDocOn, null, 2) + "\n", { mode: 0o600 });
 
-  // 9. on 反例：campaign 缺席但 writer on
+  // 11. on 反例：member 非 strict
+  const badMemberCDoc = {
+    ...cDocCompleteValid,
+    members: {
+      ...cDocCompleteValid.members,
+      "endpoint_111111111111111111111111": { schema_version: "1.0", legacy_proof_count: 0, null_b1_count: 0 }
+    }
+  };
+  fs.writeFileSync(cFile, JSON.stringify(badMemberCDoc, null, 2) + "\n", { mode: 0o600 });
+  const admBadMember = readOwnerSelectAdmission(envAdm);
+  assert.equal(admBadMember.state, "unreadable", "member 非 strict 返回 unreadable");
+  assert.match(admBadMember.problem, /strict/u, "断言 problem 包含 strict 关键词");
+
+  // 12. on 反例：campaign 缺席但 writer on
   fs.unlinkSync(cFile);
-  assert.equal(readOwnerSelectAdmission(envAdm).state, "unreadable", "campaign 缺席但 writer on 返回 unreadable");
+  const admCampAbsent = readOwnerSelectAdmission(envAdm);
+  assert.equal(admCampAbsent.state, "unreadable", "campaign 缺席但 writer on 返回 unreadable");
+  assert.match(admCampAbsent.problem, /campaign 缺席/u, "断言 problem 包含 campaign 缺席 关键词");
 
   // ----------------------------------------------------
   // P2: 六位年份必拒

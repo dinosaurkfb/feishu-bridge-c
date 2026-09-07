@@ -25301,6 +25301,32 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.match(bad.why, /selection_handle 与产生源 result 不一致/, "mint 产 B1 handle 不一致拒：" + bad.why);
   });
 
+  // R48 owner_select 产证链全链路（activate→B3）：G13' produced + G13'-A 六字段逐字等 + G13-tomb + G11' + G15' 前缀 + G-handle。
+  test("R48 账本侧：activate→B3 产证链 accept 合法，篡改 result 六字段 / ghost selection_operation_id 反向拒", () => {
+    const iso = (t) => new Date(t).toISOString();
+    const hx = (n) => String(n).repeat(64);
+    const taid = (h) => "ta_" + h.repeat(32);
+    const uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000";
+    const b3 = taid("b"), a1 = taid("a"), act = uuid(2), sess = "sess_new", root = "om_x", sh = "osh_" + "c".repeat(32), au = "ou_o", at = iso(1700000000000);
+    const initOp = { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } };
+    const mkDoc = (mut) => {
+      const d = {
+        schema_version: "1.1", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: CH, authority_mode: "shadow", revision: 2,
+        operations: { [uuid(1)]: initOp, [act]: { op_type: "activate", terminal_kind: "activate", request_key: "req_act", fingerprint: hx(2), result_revision: 2, result: { surviving_id: b3, tombstoned_id: a1, demoted_historical_id: null, authorized_by: au, authorized_at: at, selected_session_id: sess, selected_root_om: root, selection_handle: sh, selection_operation_id: act, selection_message_id: "msg_1", selection_basis: "explicit_handle", affected_live_ids_after_commit: [b3], proof_effects: [{ topic_agent_id: b3, binding_effect: "produced", link_effect: "produced" }] } } },
+        records: {
+          [b3]: { topic_agent_id: b3, kind: "live", chat_id: "oc_g", anchor_candidate: null, aliases: { root_om: root, session_id: sess }, binding_target: { runtime: "claude", project_root: "/Users/dk/p", claude_session_id: uuid(3) }, facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" }, generation_lineage_id: "lin_1", origin_operation_id: act, binding_proof: { kind: "owner_select_v1", authorized_by: au, authorized_at: at, selected_session_id: sess, selected_root_om: root, selection_handle: sh, selection_operation_id: act }, locator_link_proof_ref: { kind: "owner_selected_route_v1", by_identity: "owner_authorization", authorized_by: au, authorized_at: at, selected_session_id: sess, selected_root_om: root, selection_handle: sh, selection_operation_id: act }, created_at: iso(1700000000000), updated_at: iso(1700000000000), selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null },
+          [a1]: { topic_agent_id: a1, kind: "forwarding_tombstone", forwards_to: b3, proof_ref: { kind: "owner_select_merge_v1", selection_operation_id: act, selected_root_om: root, selection_handle: sh }, origin_operation_id: act, merged_at: iso(1700000000000) },
+        },
+      };
+      if (mut) mut(d);
+      return d;
+    };
+    assert.ok(TAL.validateLedger(mkDoc(null), { endpointId: EP }).ok, "activate→B3 产证链合法");
+    assert.match(TAL.validateLedger(mkDoc((d) => { d.records[b3].binding_proof.selection_operation_id = uuid(9); }), { endpointId: EP }).why, /G13'：produced 的 selection_operation_id 不等于 origin_operation_id/, "ghost selection_operation_id 拒");
+    assert.match(TAL.validateLedger(mkDoc((d) => { d.operations[act].result.authorized_by = "ou_other"; }), { endpointId: EP }).why, /G13'-A：owner_select_v1 proof 六字段与产生 result 逐字不等/, "六字段篡改拒");
+    assert.match(TAL.validateLedger(mkDoc((d) => { d.operations[act].result.selection_handle = "orh_" + "c".repeat(32); }), { endpointId: EP }).why, /G15'：activate\/anchor 的 selection_handle 必 osh_/, "G15' 前缀跨支拒");
+  });
+
   // R37 裁定：M1a 收据逐端点原子启用。接线测试需要让 EP 处于两种收据态：
   //   · ok（ledger_init done）→ 双写强制（跑 shadow 后缀）；
   //   · never_initialized（无收据）→ 合法 legacy-only（不写 shadow）。

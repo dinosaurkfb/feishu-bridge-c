@@ -645,20 +645,36 @@ const clearedOk = (r, expected) => Array.isArray(r.cleared) && r.cleared.length 
 const newLinkOk = (r) => !linkProofProblem(r.new_link_proof);
 const messageIdOk = (v) => typeof v === "string" && v.length > 0 && !/[\u0000-\u001f]/u.test(v);
 
+// R48 §6 owner_select 六字段（activate/anchor/rebind 的增量 result 都带；受 Frank 2026 拍板：= §3.1 proof 六字段名原样）。
+//   selection_operation_id === 本 op 自己的 operations map key（产证 op），在 validateLedger 逐 op 核；此处只核形状。
+const SELECTION_BASIS = ["explicit_handle", "unique_candidate", "rebind", "reaffirm"];
+const osSixOk = (r, handleFormat) => {
+  if (typeof r.authorized_by !== "string" || !AUTHORIZED_BY_SHAPE.test(r.authorized_by)) return false;
+  if (!isCanonicalIso(r.authorized_at)) return false;
+  if (typeof r.selected_session_id !== "string" || !AILY_SESSION_SHAPE.test(r.selected_session_id)) return false;
+  if (typeof r.selected_root_om !== "string" || !OM_SHAPE.test(r.selected_root_om)) return false;
+  if (typeof r.selection_handle !== "string" || !handleFormat.test(r.selection_handle)) return false;
+  if (!isOperationId(r.selection_operation_id)) return false;
+  return true;
+};
+const osMsgBasisOk = (r) => messageIdOk(r.selection_message_id) && SELECTION_BASIS.includes(r.selection_basis);
+// G13'/G15'：产证来源 op 集（§7.1 产证来源集；attach_a3 已停产不列）。
+const PROOF_PRODUCERS = ["activate", "anchor", "rebind_session_alias", "owner_select_reaffirm"];
+
 const RESULT_SHAPE = Object.freeze({
   initialize_shadow: (r) => keysOf(r) === "revision" && r.revision === 1,
   create_a1: (r) => keysOf(r) === "created_id" && isId(r.created_id),
   create_b1: resultUnionWithHandle("created_id", (r) => isId(r.created_id), "affected_live_ids_after_commit,created_id,handle_expires_at,proof_effects,selection_handle", (r) => isId(r.created_id) && affectedOk(r.affected_live_ids_after_commit) && proofEffectsOk(r.proof_effects), "selection_handle"),
   seed: (r) => keysOf(r) === "seeded_ids" && idArraySortedMaybeEmpty(r.seeded_ids),
-  activate: resultUnion("demoted_historical_id,surviving_id,tombstoned_id", (r) => isId(r.surviving_id) && isId(r.tombstoned_id) && (r.demoted_historical_id === null || isId(r.demoted_historical_id)) && allDistinct(r.surviving_id, r.tombstoned_id, r.demoted_historical_id), "affected_live_ids_after_commit,demoted_historical_id,proof_effects,surviving_id,tombstoned_id", (r) => isId(r.surviving_id) && isId(r.tombstoned_id) && (r.demoted_historical_id === null || isId(r.demoted_historical_id)) && allDistinct(r.surviving_id, r.tombstoned_id, r.demoted_historical_id) && proofEffectsOk(r.proof_effects)),
+  activate: resultUnion("demoted_historical_id,surviving_id,tombstoned_id", (r) => isId(r.surviving_id) && isId(r.tombstoned_id) && (r.demoted_historical_id === null || isId(r.demoted_historical_id)) && allDistinct(r.surviving_id, r.tombstoned_id, r.demoted_historical_id), "affected_live_ids_after_commit,authorized_at,authorized_by,demoted_historical_id,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id,surviving_id,tombstoned_id", (r) => isId(r.surviving_id) && isId(r.tombstoned_id) && (r.demoted_historical_id === null || isId(r.demoted_historical_id)) && allDistinct(r.surviving_id, r.tombstoned_id, r.demoted_historical_id) && osSixOk(r, SELECTION_HANDLE_SHAPE) && osMsgBasisOk(r) && proofEffectsOk(r.proof_effects)),
   void: (r) => keysOf(r) === "voided_id" && isId(r.voided_id),
   attach_a2: resultUnionWithHandle("affected_id,terminal_family", (r) => isId(r.affected_id) && r.terminal_family === "A2", "affected_id,affected_live_ids_after_commit,handle_expires_at,proof_effects,selection_handle,terminal_family", (r) => isId(r.affected_id) && r.terminal_family === "A2" && affectedOk(r.affected_live_ids_after_commit) && proofEffectsOk(r.proof_effects), "selection_handle"),
   attach_a3: resultUnion("affected_id,terminal_family", (r) => isId(r.affected_id) && r.terminal_family === "A3", "affected_id,affected_live_ids_after_commit,proof_effects,terminal_family", (r) => isId(r.affected_id) && r.terminal_family === "A3" && proofEffectsOk(r.proof_effects)),
-  anchor: resultUnion("affected_id", (r) => isId(r.affected_id), "affected_id,affected_live_ids_after_commit,proof_effects", (r) => isId(r.affected_id) && proofEffectsOk(r.proof_effects)),
+  anchor: resultUnion("affected_id", (r) => isId(r.affected_id), "affected_id,affected_live_ids_after_commit,authorized_at,authorized_by,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id", (r) => isId(r.affected_id) && osSixOk(r, SELECTION_HANDLE_SHAPE) && osMsgBasisOk(r) && proofEffectsOk(r.proof_effects)),
   restore: resultUnion("affected_id", (r) => isId(r.affected_id), "affected_id,affected_live_ids_after_commit,proof_effects", (r) => isId(r.affected_id) && proofEffectsOk(r.proof_effects)),
   unbind: resultUnion("affected_id,terminal_family", (r) => isId(r.affected_id) && (r.terminal_family === "A4" || r.terminal_family === "B3'"), "affected_id,affected_live_ids_after_commit,proof_effects,terminal_family", (r) => isId(r.affected_id) && (r.terminal_family === "A4" || r.terminal_family === "B3'") && proofEffectsOk(r.proof_effects)),
   retarget: resultUnion("affected_ids,new_target,old_target,unit", (r) => idArrayOk(r.affected_ids) && (r.unit === "record" || r.unit === "lineage") && !targetProblem(r.old_target) && !targetProblem(r.new_target) && canonKey(r.old_target) !== canonKey(r.new_target), "affected_ids,affected_live_ids_after_commit,new_target,old_target,proof_effects,unit", (r) => idArrayOk(r.affected_ids) && (r.unit === "record" || r.unit === "lineage") && !targetProblem(r.old_target) && !targetProblem(r.new_target) && canonKey(r.old_target) !== canonKey(r.new_target) && proofEffectsOk(r.proof_effects)),
-  rebind_session_alias: resultUnion("affected_id,authorized_at,authorized_by,new_session_id,old_session_id", (r) => isId(r.affected_id) && AILY_SESSION_SHAPE.test(r.old_session_id) && AILY_SESSION_SHAPE.test(r.new_session_id) && r.old_session_id !== r.new_session_id && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at), "affected_id,affected_live_ids_after_commit,authorized_at,authorized_by,new_session_id,old_session_id,proof_effects", (r) => isId(r.affected_id) && AILY_SESSION_SHAPE.test(r.old_session_id) && AILY_SESSION_SHAPE.test(r.new_session_id) && r.old_session_id !== r.new_session_id && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at) && proofEffectsOk(r.proof_effects)),
+  rebind_session_alias: resultUnion("affected_id,authorized_at,authorized_by,new_session_id,old_session_id", (r) => isId(r.affected_id) && AILY_SESSION_SHAPE.test(r.old_session_id) && AILY_SESSION_SHAPE.test(r.new_session_id) && r.old_session_id !== r.new_session_id && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at), "affected_id,affected_live_ids_after_commit,authorized_at,authorized_by,new_session_id,old_session_id,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id,tombstoned_a1_id", (r) => isId(r.affected_id) && AILY_SESSION_SHAPE.test(r.old_session_id) && AILY_SESSION_SHAPE.test(r.new_session_id) && r.old_session_id !== r.new_session_id && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at) && osSixOk(r, REBIND_HANDLE_SHAPE) && osMsgBasisOk(r) && (r.tombstoned_a1_id === null || isId(r.tombstoned_a1_id)) && proofEffectsOk(r.proof_effects)),
   migrate_seed: (r) => keysOf(r) === "authorized_at,authorized_by,seeded" && typeof r.authorized_by === "string" && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at) && Array.isArray(r.seeded) && r.seeded.every((s) => isObj(s) && isId(s.topic_agent_id) && typeof s.legacy_source_digest === "string" && SHA_SHAPE.test(s.legacy_source_digest)) && r.seeded.every((s, i) => i === 0 || r.seeded[i - 1].topic_agent_id < s.topic_agent_id),
   migrate_repair: (r) => keysOf(r) === "authorized_at,authorized_by,expected_projection_digest,from_family,legacy_source_digest,next_projection_digest,repaired_id,to_family" && isId(r.repaired_id) && typeof r.authorized_by === "string" && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at) && [r.expected_projection_digest, r.next_projection_digest, r.legacy_source_digest].every((s) => typeof s === "string" && SHA_SHAPE.test(s)) && MIGRATE_FAMILIES.includes(r.from_family) && MIGRATE_FAMILIES.includes(r.to_family) && (r.from_family === "B1" ? r.to_family === "B1" : r.to_family !== "B1"),
   request_rebind: (r) => keysOf(r) === "affected_live_ids_after_commit,proof_effects,rebind_expires_at,rebind_handle" && REBIND_HANDLE_SHAPE.test(r.rebind_handle) && isCanonicalIso(r.rebind_expires_at) && affectedOk(r.affected_live_ids_after_commit) && proofEffectsOk(r.proof_effects),
@@ -700,6 +716,9 @@ function operationProblem(op, topRevision, schema) {
   if (op.terminal_kind !== op.op_type) return "terminal_kind 必须等于 op_type";
   if (typeof op.fingerprint !== "string" || !SHA_SHAPE.test(op.fingerprint)) return "fingerprint 形状不对";
   if (!Number.isInteger(op.result_revision) || op.result_revision < 1 || op.result_revision > topRevision) return "result_revision 越界";
+  // R48 G15'：handle 前缀↔来源 op（op 级核 result.selection_handle 前缀）——activate/anchor 只 osh_、rebind 只 orh_。
+  if (op.op_type === "activate" || op.op_type === "anchor") { if (op.result && typeof op.result.selection_handle === "string" && !SELECTION_HANDLE_SHAPE.test(op.result.selection_handle)) return "G15'：activate/anchor 的 selection_handle 必 osh_（跨支即拒）"; }
+  if (op.op_type === "rebind_session_alias") { if (op.result && typeof op.result.selection_handle === "string" && !REBIND_HANDLE_SHAPE.test(op.result.selection_handle)) return "G15'：rebind_session_alias 的 selection_handle 必 orh_（跨支即拒）"; }
   if (!isObj(op.result) || !RESULT_SHAPE[op.op_type](op.result)) return op.op_type + " result 形状不对";
   // R48 §8.2/§6：result 增量字段（affected_live_ids_after_commit / proof_effects）是 1.1+ 概念；“1.0” 只接受基线键集。
   if (schema === "1.0" && (Object.prototype.hasOwnProperty.call(op.result, "affected_live_ids_after_commit") || Object.prototype.hasOwnProperty.call(op.result, "proof_effects"))) return op.op_type + " result 增量字段仅限 schema≥transition（1.0 拒）";
@@ -770,6 +789,59 @@ function opConsistentWithRecord(op, id, rec) {
   }
 }
 
+/* R48 G13'/G13-tomb：owner_select proof 记录的产证/保留判定（§7.2 G13′）+ 归并 tombstone 闭合（§7.1 G13-tomb）。 */
+function g13OwnerSelectProblem(rec, id, doc) {
+  const bp = rec.binding_proof, lp = rec.locator_link_proof_ref;
+  const hasOS = (bp && bp.kind === "owner_select_v1") || (lp && lp.kind === "owner_selected_route_v1");
+  if (!hasOS) return null; // 非 owner_select proof，不归 G13'
+  const origin = doc.operations[rec.origin_operation_id];
+  const entry = origin && origin.result && Array.isArray(origin.result.proof_effects)
+    ? origin.result.proof_effects.find((e) => e.topic_agent_id === id) : null;
+  if (!entry) return "G13'：owner_select proof 记录的 origin op 没有本记录的 proof_effects 项";
+  if (entry.link_effect === "produced" || entry.binding_effect === "produced") {
+    // 产证支：selection_operation_id===origin_operation_id；binding=owner_select_v1 时六字段逐字等（G13'-A）。
+    const selOpId = bp ? bp.selection_operation_id : lp.selection_operation_id;
+    if (selOpId !== rec.origin_operation_id) return "G13'：produced 的 selection_operation_id 不等于 origin_operation_id";
+    if (bp && bp.kind === "owner_select_v1" && entry.binding_effect === "produced") {
+      const r = origin.result;
+      if (bp.authorized_by !== r.authorized_by || bp.authorized_at !== r.authorized_at || bp.selected_session_id !== r.selected_session_id || bp.selected_root_om !== r.selected_root_om || bp.selection_handle !== r.selection_handle || bp.selection_operation_id !== r.selection_operation_id) return "G13'-A：owner_select_v1 proof 六字段与产生 result 逐字不等";
+    }
+    if (lp && lp.kind === "owner_selected_route_v1" && (!bp || bp.kind !== "owner_select_v1")) {
+      // G13'-B：link 独立经自身来源 op 校验。
+      const lSrc = doc.operations[lp.selection_operation_id];
+      if (!lSrc || !PROOF_PRODUCERS.includes(lSrc.op_type)) return "G13'-B：owner_selected_route_v1 的 selection_operation_id 未指向合法产证 op";
+    }
+    return null;
+  }
+  // preserved 支（link_effect==="preserved", binding_effect!=="produced"）
+  const selOpId = bp ? bp.selection_operation_id : lp.selection_operation_id;
+  const src = doc.operations[selOpId];
+  if (!src || !PROOF_PRODUCERS.includes(src.op_type)) return "G13'：preserved 的 selection_operation_id 未指向合法产证来源 op（原产生 op）";
+  const srcEntry = src.result && Array.isArray(src.result.proof_effects) ? src.result.proof_effects.find((e) => e.topic_agent_id === id) : null;
+  if (!srcEntry || srcEntry.binding_effect !== "produced") return "G13'：preserved 的原产生 op 未对本记录产生过（proof_effects 无 produced）";
+  if (src.result_revision > origin.result_revision) return "G13'：preserved 的原产生 op revision 大于当前 origin revision（不允许）";
+  if (bp && bp.kind === "owner_select_v1") {
+    const r = src.result;
+    if (bp.authorized_by !== r.authorized_by || bp.authorized_at !== r.authorized_at || bp.selected_session_id !== r.selected_session_id || bp.selected_root_om !== r.selected_root_om || bp.selection_handle !== r.selection_handle || bp.selection_operation_id !== r.selection_operation_id) return "G13'：preserved 的 proof 六字段与原产生 result 逐字不等";
+  }
+  return null;
+}
+
+// G13-tomb：owner_select_merge_v1 tombstone 的 proof_ref 与 origin op result 一致 + forwards_to 指向同 op 存活 id。
+function g13TombProblem(rec, id, doc) {
+  if (rec.kind !== "forwarding_tombstone") return null;
+  const pr = rec.proof_ref;
+  if (!pr || pr.kind !== "owner_select_merge_v1") return null;
+  const origin = doc.operations[rec.origin_operation_id];
+  if (!origin) return "G13-tomb：tombstone origin op 不存在";
+  if (!["activate", "rebind_session_alias", "owner_select_reaffirm"].includes(origin.op_type)) return "G13-tomb：owner_select_merge_v1 tombstone 的 origin op_type 不在 {activate,rebind,reaffirm}";
+  const r = origin.result;
+  const survivor = origin.op_type === "activate" ? r.surviving_id : origin.op_type === "rebind_session_alias" ? r.affected_id : r.target_id;
+  if (!survivor || rec.forwards_to !== survivor) return "G13-tomb：owner_select_merge_v1 tombstone 的 forwards_to 不等于同 op 存活 id";
+  if (pr.selection_operation_id !== rec.origin_operation_id) return "G13-tomb：proof_ref.selection_operation_id 不等于 origin op";
+  return null;
+}
+
 /* ─────────────────────────── 整账本校验（G1–G15） ─────────────────────────── */
 
 export function validateLedger(doc, { endpointId } = {}) {
@@ -794,6 +866,8 @@ export function validateLedger(doc, { endpointId } = {}) {
     const p = operationProblem(op, doc.revision, doc.schema_version);
     if (p !== null) return bad("operation " + opId + "：" + p);
     if (op.op_type === "initialize_shadow") initCount += 1;
+    // R48：产证 op（activate/anchor/rebind）的 result.selection_operation_id 必等于本 op 自己的 map key（产证 op，G13'-A 来源）。
+    if ((op.op_type === "activate" || op.op_type === "anchor" || op.op_type === "rebind_session_alias") && Object.prototype.hasOwnProperty.call(op.result, "selection_operation_id") && op.result.selection_operation_id !== opId) return bad("operation " + opId + "：" + op.op_type + " result.selection_operation_id 不等于本 op 的 map key（G13'）");
     if (revSeen.has(op.result_revision)) return bad("result_revision 重复（G12）：" + op.result_revision);
     revSeen.add(op.result_revision);
     const fpKey = op.op_type + ":" + op.fingerprint;
@@ -814,6 +888,8 @@ export function validateLedger(doc, { endpointId } = {}) {
     if (p !== null) return bad(id + "：" + p);
     if (!(rec.origin_operation_id in doc.operations)) return bad(id + "：origin_operation_id 不在 operations 表（G13）");
     if (!opConsistentWithRecord(doc.operations[rec.origin_operation_id], id, rec)) return bad(id + "：origin op 与本记录不相容（G13）");
+    const g13os = g13OwnerSelectProblem(rec, id, doc); if (g13os) return bad(id + "：" + g13os);
+    const g13t = g13TombProblem(rec, id, doc); if (g13t) return bad(id + "：" + g13t);
     if (rec.kind === "live") {
       liveCount += 1; live.push([id, rec]);
       for (const loc of [rec.aliases.session_id, rec.aliases.root_om]) {

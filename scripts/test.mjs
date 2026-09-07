@@ -18798,6 +18798,11 @@ test("R52a：feishu-select 解析封闭（bare/单 handle/坏 handle/别链前�
   assert.equal(controlIntentProblem({ control: "select", handle: h, handle_kind: "osh" }), null);
   assert.ok(String(controlIntentProblem({ control: "select", handle: h, handle_kind: "orh" })).includes("前缀与 handle_kind 不一致"));
   assert.equal(controlIntentProblem({ control: "select", handle: null, handle_kind: null }), null);
+  // R52a 返修三 P1-2: controlIntentProblem 封闭总函数（typeof handle === "string" + 判别器逐字匹配）
+  assert.notEqual(controlIntentProblem({ control: "select", handle: [h], handle_kind: "osh" }), null, "数组 handle 报 problem 不抛");
+  assert.notEqual(controlIntentProblem({ control: "select", handle: { startsWith: () => true }, handle_kind: "osh" }), null, "自定义 startsWith 对象报 problem 不抛");
+  assert.notEqual(controlIntentProblem({ control: "select", handle: "osh_bad", handle_kind: "osh" }), null, "osh_bad 报 problem");
+  assert.notEqual(controlIntentProblem({ control: "select", handle: 12345, handle_kind: "osh" }), null, "数字 handle 报 problem 不抛");
 });
 
 test("R52a item 三：selectAdmission 默认 off（fail-closed）+ selectReject 四支（off/partial/on/unreadable + rfh 放行）", () => {

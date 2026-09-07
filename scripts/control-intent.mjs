@@ -6,6 +6,7 @@
  */
 
 import { DIALOGUE_POLICY_ID, MAPPING_POLICY_ID } from "./interaction-policy.mjs";
+import { SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE } from "./topic-agent-ledger.mjs";
 
 export const CONTROL_MODES = Object.freeze([MAPPING_POLICY_ID, DIALOGUE_POLICY_ID]);
 
@@ -23,8 +24,11 @@ export function controlIntentProblem(intent) {
     if (keys !== "control,handle,handle_kind") return "control(select) 字段集不对";
     if ((intent.handle === null) !== (intent.handle_kind === null)) return "handle 与 handle_kind 必须同空或同非空";
     if (intent.handle !== null) {
-      const expect = intent.handle.startsWith("osh_") ? "osh" : intent.handle.startsWith("orh_") ? "orh" : intent.handle.startsWith("rfh_") ? "rfh" : null;
-      if (intent.handle_kind !== expect) return "handle 前缀与 handle_kind 不一致";
+      if (typeof intent.handle !== "string") return "handle 不是字符串";
+      const expect = SELECTION_HANDLE_SHAPE.test(intent.handle) ? "osh"
+        : REBIND_HANDLE_SHAPE.test(intent.handle) ? "orh"
+        : REAFFIRM_HANDLE_SHAPE.test(intent.handle) ? "rfh" : null;
+      if (expect === null || intent.handle_kind !== expect) return "handle 前缀与 handle_kind 不一致";
     }
     return null;
   }

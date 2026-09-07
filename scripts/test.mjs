@@ -25229,6 +25229,15 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.ok(String(journalProblem({ ...base, phase: "osm_a_upgrading", steps: [precheck({ legacy_proof_count: 0, null_b1_count: 0, revision: 9, ledger_sha256: sha(3) })] })).includes("before 必须 === intended_after"), "precheck before!==intended 拒");
   });
 
+  // R50（返修三 ①）：1.3(ledger_cutover) 含新 step kind → unreadable（Frank 变异 6 刀中逃逸#1的具体消息反向测试）。
+  test("R50 返修三 ①：1.3 含新 owner_select step kind（unreadable）", () => {
+    const iso = new Date(1700000000000).toISOString();
+    const uuid = "11111111-1111-1111-1111-111111111111";
+    const base = { token: uuid, reason: "", started_at: iso, updated_at: iso, notes: [], schema_version: "1.3", operation_kind: "ledger_cutover", phase: "done" };
+    const r = String(journalProblem({ ...base, steps: [{ kind: "campaign", id: "campaign:osc_" + "1".repeat(32) + ":open" }] }));
+    assert.ok(r.includes("含新 owner_select step kind"), "1.3 含新 step → unreadable：" + r);
+  });
+
   // R50（Part 一 item 4）：禁异类 step —— 旧四 kind（含 1.4 读旧种）禁五新 step kind。
   test("R50 journal 1.4：禁异类 step（旧 kind 读新 step / new kind 禁异类步）", () => {
     const iso = new Date(1700000000000).toISOString();
@@ -25241,6 +25250,23 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     // 1.4 读旧 kind（ledger_cutover）带 campaign step → 拒
     const r = String(journalProblem({ ...base, operation_kind: "ledger_cutover", phase: "done", steps: [camp] }));
     assert.ok(r.includes("旧 four kind 禁五新 step kind"), "旧 kind 读新 step 拒：" + r);
+  });
+
+  // R50（返修三 ③）：B 的 writer_state:on done 但 campaign:complete 仍 prepared → 拒（逃逸#3的具体消息反向测试）。
+  test("R50 返修三 ③：writer_state:on done 需本 operation campaign:complete 已 done", () => {
+    const iso = new Date(1700000000000).toISOString();
+    const uuid = "11111111-1111-1111-1111-111111111111";
+    const ep = "endpoint_" + "a".repeat(24);
+    const cid = OSS.campaignIdFor(uuid), dg = OSS.endpointsDigest([ep]);
+    const sha = (n) => String(n).repeat(64);
+    const base = { token: uuid, reason: "", started_at: iso, updated_at: iso, notes: [], schema_version: "1.4", operation_kind: "owner_select_migration_b", phase: "osm_b_strictening" };
+    const mkCamp = (sub, st) => { const r = { kind: "campaign", id: "campaign:" + cid + ":" + sub, target: "ledger/owner-select-campaign.json", chain: null, state: st, at: iso, backup: "/" + uuid + ".staged/b", backup_sha256: sha(1), backup_bytes: 12, before: { exists: true, sha256: sha(2), state: sub === "seal" ? "open" : "sealed", campaign_id: cid, endpoints: [ep], endpoints_digest: dg }, intended_after: { exists: true, sha256: sha(3), state: sub === "seal" ? "sealed" : "complete", campaign_id: cid, endpoints: [ep], endpoints_digest: dg } }; if (st === "done") r.after = { exists: true, sha256: sha(3), state: sub === "seal" ? "sealed" : "complete", campaign_id: cid, endpoints: [ep], endpoints_digest: dg }; return r; };
+    const mkPC = () => ({ kind: "precheck", id: "precheck:" + ep, target: "ledger/" + ep + "/ledger.json", chain: null, state: "done", at: iso, backup: null, backup_sha256: null, backup_bytes: null, before: { legacy_proof_count: 0, null_b1_count: 0, revision: 1, ledger_sha256: sha(4) }, intended_after: { legacy_proof_count: 0, null_b1_count: 0, revision: 1, ledger_sha256: sha(4) }, after: { legacy_proof_count: 0, null_b1_count: 0, revision: 1, ledger_sha256: sha(4) } });
+    const mkSE = () => ({ kind: "schema_endpoint", id: "schema_endpoint:" + ep + ":strict", target: "ledger/" + ep + "/ledger.json", chain: null, state: "done", at: iso, backup: "/" + uuid + ".staged/b", backup_sha256: sha(5), backup_bytes: 5, before: { schema_version: "1.1-transition", revision: 2, ledger_sha256: sha(5) }, intended_after: { schema_version: "1.1", revision: 3, ledger_sha256: sha(6) }, after: { schema_version: "1.1", revision: 3, ledger_sha256: sha(6) } });
+    const mkWSon = () => ({ kind: "writer_state", id: "writer_state:" + cid + ":on", target: "ledger/owner-select-writer-state.json", chain: null, state: "done", at: iso, backup: "/" + uuid + ".staged/b", backup_sha256: sha(6), backup_bytes: 8, before: { exists: true, sha256: sha(6), state: "partial", campaign_id: cid, endpoints_digest: dg, revision: 1 }, intended_after: { exists: true, sha256: sha(7), state: "on", campaign_id: cid, endpoints_digest: dg, revision: 2 }, after: { exists: true, sha256: sha(7), state: "on", campaign_id: cid, endpoints_digest: dg, revision: 2 } });
+    // complete 用 prepared（未 done），其余 done → on-rule 拒
+    const r = String(journalProblem({ ...base, steps: [mkCamp("seal", "done"), mkCamp("complete", "prepared"), mkPC(), mkSE(), mkWSon()] }));
+    assert.ok(r.includes("on 的 done 需要本 operation campaign:*:complete 已 done"), "B on done + complete prepared → 拒：" + r);
   });
 
   // R50（Part 一 item 6 剩余）：恰一次计数按 phase / <ep>∈冻结集 —— 纯合成。
@@ -25260,6 +25286,19 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.ok(r2.includes(":open 必须恰一"), "forward 段零新 step → 拒（按 phase 计数）：" + r2);
   });
 
+  // R50（返修三 ④）：mint done 且 after!==intended_after → 拒（Frank 变异 6 刀中逃逸#4的具体消息反向测试）。
+  test("R50 返修三 ④：mint after 必须逐字段等于 intended_after", () => {
+    const iso = new Date(1700000000000).toISOString();
+    const uuid = "11111111-1111-1111-1111-111111111111";
+    const ep = "endpoint_" + "a".repeat(24);
+    const sha = (n) => String(n).repeat(64);
+    const base = { token: uuid, reason: "", started_at: iso, updated_at: iso, notes: [], schema_version: "1.4", operation_kind: "owner_select_migration_a", phase: "osm_a_upgrading" };
+    // mint step：before null_b1_count=2 / intended null_b1_count=0 & revision+1；after.revision≠intended → 拒。
+    const mintBad = { kind: "mint", id: "mint:" + ep, target: "ledger/" + ep + "/ledger.json", chain: null, state: "done", at: iso, backup: "/" + uuid + ".staged/b", backup_sha256: sha(3), backup_bytes: 5, before: { null_b1_count: 2, revision: 2, ledger_sha256: sha(3) }, intended_after: { null_b1_count: 0, revision: 3, ledger_sha256: sha(5) }, after: { null_b1_count: 0, revision: 99, ledger_sha256: sha(5) }, intended_blob: { path: "/" + uuid + ".staged/intended/mint-" + ep + ".json", bytes: 1, sha256: sha(6) } };
+    const r = String(journalProblem({ ...base, steps: [mintBad] }));
+    assert.ok(r.includes("mint.after 必须逐字段等于 intended_after"), "mint after!==intended 拒：" + r);
+  });
+
   // R50（Part 一 item 6）：交叉等式 campaign_id 三处同一 / forward 前禁新 step / mint blob path 重算 —— 纯合成。
   test("R50 journal 1.4：campaign_id===campaignIdFor(token) 三处同一 + forward 前禁新 step kind", () => {
     const iso = new Date(1700000000000).toISOString();
@@ -25272,6 +25311,23 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.ok(!String(journalProblem({ ...base, steps: [campOpen] })).includes("campaign_id 必须 === campaignIdFor"), "正确 campaign_id 不触发三处同一检查（红先行：旧代码 schema 不认 1.4/无 item 6）");
     assert.ok(String(journalProblem({ ...base, steps: [{ ...campOpen, intended_after: { ...campOpen.intended_after, campaign_id: "osc_" + "9".repeat(32) }, after: { ...campOpen.after, campaign_id: "osc_" + "9".repeat(32) } }] })).includes("campaign_id 必须 === campaignIdFor"), "campaign_id 三处同一不符拒");
     assert.ok(String(journalProblem({ ...base, phase: "gated", steps: [campOpen] })).includes("forward 段之前禁任何新 step kind"), "forward 前带新 step 拒");
+  });
+
+  // R50（返修三 ②）：A 含 writer_state:*:on → 拒（逃逸#2的具体消息反向测试；需完整 A 文档计数先过再走 A:on 排除）。
+  test("R50 返修三 ②：A 禁 writer_state:on", () => {
+    const iso = new Date(1700000000000).toISOString();
+    const uuid = "11111111-1111-1111-1111-111111111111";
+    const ep = "endpoint_" + "a".repeat(24);
+    const cid = OSS.campaignIdFor(uuid), dg = OSS.endpointsDigest([ep]);
+    const sha = (n) => String(n).repeat(64);
+    const base = { token: uuid, reason: "", started_at: iso, updated_at: iso, notes: [], schema_version: "1.4", operation_kind: "owner_select_migration_a", phase: "osm_a_upgrading" };
+    const mkCamp = (sub, st) => { const r = { kind: "campaign", id: "campaign:" + cid + ":" + sub, target: "ledger/owner-select-campaign.json", chain: null, state: st, at: iso, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null }, intended_after: { exists: true, sha256: sha(3), state: "open", campaign_id: cid, endpoints: [ep], endpoints_digest: dg } }; if (st === "done") r.after = { exists: true, sha256: sha(3), state: "open", campaign_id: cid, endpoints: [ep], endpoints_digest: dg }; return r; };
+    const mkSE = () => ({ kind: "schema_endpoint", id: "schema_endpoint:" + ep + ":transition", target: "ledger/" + ep + "/ledger.json", chain: null, state: "done", at: iso, backup: "/" + uuid + ".staged/b", backup_sha256: sha(4), backup_bytes: 5, before: { schema_version: "1.0", revision: 1, ledger_sha256: sha(4) }, intended_after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: sha(5) }, after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: sha(5) } });
+    const mkMint = () => ({ kind: "mint", id: "mint:" + ep, target: "ledger/" + ep + "/ledger.json", chain: null, state: "done", at: iso, backup: "/" + uuid + ".staged/b", backup_sha256: sha(5), backup_bytes: 5, before: { null_b1_count: 2, revision: 2, ledger_sha256: sha(5) }, intended_after: { null_b1_count: 0, revision: 3, ledger_sha256: sha(6) }, after: { null_b1_count: 0, revision: 3, ledger_sha256: sha(6) }, intended_blob: { path: "/" + uuid + ".staged/intended/mint-" + ep + ".json", bytes: 1, sha256: sha(6) } });
+    const mkWS = (sub, st) => { const r = { kind: "writer_state", id: "writer_state:" + cid + ":" + sub, target: "ledger/owner-select-writer-state.json", chain: null, state: st, at: iso, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 }, intended_after: { exists: true, sha256: sha(7), state: sub === "partial" ? "partial" : "on", campaign_id: cid, endpoints_digest: dg, revision: 1 } }; if (st === "done") r.after = { exists: true, sha256: sha(7), state: sub === "partial" ? "partial" : "on", campaign_id: cid, endpoints_digest: dg, revision: 1 }; return r; };
+    // 完整 A 集合(open/transition/mint/partial done)+ wsOn(prepared) → A:on 排除拒
+    const r = String(journalProblem({ ...base, steps: [mkCamp("open", "done"), mkSE(), mkMint(), mkWS("partial", "done"), mkWS("on", "prepared")] }));
+    assert.ok(r.includes("A 禁 writer_state:*:on"), "A 禁 on：" + r);
   });
 
   // R50（Part 一 item 2）：journal 1.4 schema 字面值分派 —— 1.4 识别 / 旧版读新 kind→unreadable / 未知字面值拒。

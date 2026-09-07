@@ -31999,6 +31999,749 @@ test("R46 返修 P1-2 栅栏（真实流）：provision 在维护段内 advance 
   }
 });
 
+// ── R48：owner_select 账本地基（阶段①+④账本侧） ──
+// 交付：1. schema 三值域（1.0, 1.1-transition, 1.1）；2. 记录四 handle 字段；3. 三新 proof 形；
+//       4. 校验器（G11′/G13′/G15′/G-handle）；5. operations result 增量；6. 纯合成回归。
+test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段 / 三新 proof 形 / G11′-G13′-G15′-G-handle / operations result 增量", () => {
+  const EP = "endpoint_" + "1".repeat(24);
+  const CH = "claude";
+  const ISO = "2026-09-08T00:00:00.000Z";
+  const TGT = { runtime: "claude", project_root: "/path/to/project", claude_session_id: "00000000-0000-4000-8000-000000000001" };
+  const hOSH1 = "osh_" + "1".repeat(32);
+  const hOSH2 = "osh_" + "2".repeat(32);
+  const hORH1 = "orh_" + "3".repeat(32);
+  const hRFH1 = "rfh_" + "4".repeat(32);
+  const taId1 = "ta_" + "1".repeat(32);
+  const taId2 = "ta_" + "2".repeat(32);
+  const taId3 = "ta_" + "3".repeat(32);
+  const opIdInit = "00000000-0000-4000-8000-000000000001";
+  const opId1 = "00000000-0000-4000-8000-000000000002";
+  const opId2 = "00000000-0000-4000-8000-000000000003";
+
+  const mkBaseDoc = (schemaVersion = "1.0") => ({
+    schema_version: schemaVersion,
+    artifact_type: "feishu_bridge_topic_agent_ledger",
+    endpoint_id: EP,
+    chain: CH,
+    authority_mode: "shadow",
+    revision: 1,
+    operations: {
+      [opIdInit]: {
+        op_type: "initialize_shadow",
+        terminal_kind: "initialize_shadow",
+        request_key: "rk_init",
+        fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP, chain: CH }),
+        result_revision: 1,
+        result: { revision: 1 }
+      }
+    },
+    records: {}
+  });
+
+  // ── 1. Schema 值域校验 ──
+  {
+    const d10 = mkBaseDoc("1.0");
+    assert.equal(TAL.validateLedger(d10, { endpointId: EP }).ok, true, "1.0 账本合法放行");
+
+    const dTrans = mkBaseDoc("1.1-transition");
+    assert.equal(TAL.validateLedger(dTrans, { endpointId: EP }).ok, true, "1.1-transition 账本受验放行");
+
+    const dStrict = mkBaseDoc("1.1");
+    assert.equal(TAL.validateLedger(dStrict, { endpointId: EP }).ok, true, "1.1 strict 账本受验放行");
+
+    const dBad1 = mkBaseDoc("0.9");
+    assert.equal(TAL.validateLedger(dBad1, { endpointId: EP }).reason, "ledger_corrupt", "0.9 非法 schema 拒");
+
+    const dBad2 = mkBaseDoc("1.2");
+    assert.equal(TAL.validateLedger(dBad2, { endpointId: EP }).reason, "ledger_corrupt", "1.2 非法 schema 拒");
+
+    const dBad3 = mkBaseDoc("1.1-strict");
+    assert.equal(TAL.validateLedger(dBad3, { endpointId: EP }).reason, "ledger_corrupt", "非受控 schema 字符串拒");
+  }
+
+  // ── 2. Live 记录四 handle 字段（1.0 缺席 vs 1.1 必在场 & 跨字段联合）──
+  {
+    const baseRec10 = {
+      kind: "live",
+      topic_agent_id: taId1,
+      chat_id: "oc_chat1",
+      created_at: ISO,
+      updated_at: ISO,
+      origin_operation_id: opIdInit,
+      facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" },
+      aliases: { session_id: null, root_om: "om_root1" },
+      binding_target: TGT,
+      binding_proof: null,
+      locator_link_proof_ref: null,
+      generation_lineage_id: "lin_1",
+      anchor_candidate: null
+    };
+    assert.equal(TAL.liveProblem(baseRec10, taId1, { schemaVersion: "1.0" }), null, "1.0 记录 13 键合法");
+
+    // 1.0 下带新字段 → 拒（键多余）
+    const rec10WithNewKey = { ...baseRec10, selection_handle: null };
+    assert.equal(TAL.liveProblem(rec10WithNewKey, taId1, { schemaVersion: "1.0" }), "live 字段集不对", "1.0 记录禁带新 handle 键");
+
+    // 1.1-transition 下缺新字段 → 拒（键缺失）
+    assert.equal(TAL.liveProblem(baseRec10, taId1, { schemaVersion: "1.1-transition" }), "live 字段集不对", "1.1-transition 记录缺 handle 键拒");
+
+    // 1.1-transition 下四键齐全（B1 双 null 作 blocker 合法）
+    const recTransB1Blocker = {
+      ...baseRec10,
+      selection_handle: null,
+      handle_expires_at: null,
+      rebind_handle: null,
+      rebind_expires_at: null
+    };
+    assert.equal(TAL.liveProblem(recTransB1Blocker, taId1, { schemaVersion: "1.1-transition" }), null, "1.1-transition 允许 B1 双 null 作 blocker");
+
+    // 1.1 strict 下 B1 双 null → 拒（strict 必有 osh_）
+    assert.match(String(TAL.liveProblem(recTransB1Blocker, taId1, { schemaVersion: "1.1" })), /1\.1.*B1.*双非空/u, "1.1 strict 拒 B1 双 null");
+
+    // B1 带合法 selection_handle（双非空）在 1.1-transition 和 1.1 皆合法
+    const recB1WithHandle = {
+      ...baseRec10,
+      selection_handle: hOSH1,
+      handle_expires_at: ISO,
+      rebind_handle: null,
+      rebind_expires_at: null
+    };
+    assert.equal(TAL.liveProblem(recB1WithHandle, taId1, { schemaVersion: "1.1-transition" }), null, "transition B1 双非空合法");
+    assert.equal(TAL.liveProblem(recB1WithHandle, taId1, { schemaVersion: "1.1" }), null, "strict B1 双非空合法");
+
+    // B1 跨字段半有半无（handle 有 expiry 无 / expiry 有 handle 无）→ 拒
+    const recB1Half1 = { ...recB1WithHandle, handle_expires_at: null };
+    assert.match(String(TAL.liveProblem(recB1Half1, taId1, { schemaVersion: "1.1-transition" })), /B1.*同时/u, "B1 半有半无拒");
+    const recB1Half2 = { ...recB1WithHandle, selection_handle: null };
+    assert.match(String(TAL.liveProblem(recB1Half2, taId1, { schemaVersion: "1.1-transition" })), /B1.*同时/u, "B1 半有半无拒");
+
+    // B1 不得有 rebind_handle
+    const recB1BadRebind = { ...recB1WithHandle, rebind_handle: hORH1, rebind_expires_at: ISO };
+    assert.match(String(TAL.liveProblem(recB1BadRebind, taId1, { schemaVersion: "1.1-transition" })), /非 B3 不得有 rebind_handle/u, "B1 禁 rebind_handle");
+
+    // A2 记录：双 null 合法、双非空合法、半有半无拒、不得有 rebind_handle
+    const recA2Base = {
+      kind: "live",
+      topic_agent_id: taId1,
+      chat_id: "oc_chat1",
+      created_at: ISO,
+      updated_at: ISO,
+      origin_operation_id: opIdInit,
+      facts: { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" },
+      aliases: { session_id: "sess_1", root_om: null },
+      binding_target: TGT,
+      binding_proof: { kind: "attach", authorized_by: "ou_owner1", authorized_at: ISO, claim_key: "1".repeat(64) },
+      locator_link_proof_ref: null,
+      generation_lineage_id: null,
+      anchor_candidate: "om_cand1",
+      selection_handle: null,
+      handle_expires_at: null,
+      rebind_handle: null,
+      rebind_expires_at: null
+    };
+    assert.equal(TAL.liveProblem(recA2Base, taId1, { schemaVersion: "1.1" }), null, "A2 双 null 合法");
+
+    const recA2WithHandle = { ...recA2Base, selection_handle: hOSH1, handle_expires_at: ISO };
+    assert.equal(TAL.liveProblem(recA2WithHandle, taId1, { schemaVersion: "1.1" }), null, "A2 双非空合法");
+
+    const recA2Half = { ...recA2Base, selection_handle: hOSH1, handle_expires_at: null };
+    assert.match(String(TAL.liveProblem(recA2Half, taId1, { schemaVersion: "1.1" })), /A2.*同时/u, "A2 半有半无拒");
+
+    // B3 记录：rebind_handle 双 null 合法、双非空合法、半有半无拒；禁 selection_handle
+    const recB3Base = {
+      kind: "live",
+      topic_agent_id: taId1,
+      chat_id: "oc_chat1",
+      created_at: ISO,
+      updated_at: ISO,
+      origin_operation_id: opIdInit,
+      facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+      aliases: { session_id: "sess_1", root_om: "om_root1" },
+      binding_target: TGT,
+      binding_proof: {
+        kind: "owner_select_v1",
+        authorized_by: "ou_owner1",
+        authorized_at: ISO,
+        selected_session_id: "sess_1",
+        selected_root_om: "om_root1",
+        selection_handle: hOSH1,
+        selection_operation_id: opIdInit
+      },
+      locator_link_proof_ref: {
+        kind: "owner_selected_route_v1",
+        by_identity: "owner_authorization",
+        authorized_by: "ou_owner1",
+        authorized_at: ISO,
+        selected_session_id: "sess_1",
+        selected_root_om: "om_root1",
+        selection_handle: hOSH1,
+        selection_operation_id: opIdInit
+      },
+      generation_lineage_id: "lin_1",
+      anchor_candidate: null,
+      selection_handle: null,
+      handle_expires_at: null,
+      rebind_handle: null,
+      rebind_expires_at: null
+    };
+    assert.equal(TAL.liveProblem(recB3Base, taId1, { schemaVersion: "1.1" }), null, "B3 双 null rebind 合法");
+
+    const recB3WithRebind = { ...recB3Base, rebind_handle: hORH1, rebind_expires_at: ISO };
+    assert.equal(TAL.liveProblem(recB3WithRebind, taId1, { schemaVersion: "1.1" }), null, "B3 双非空 rebind 合法");
+
+    const recB3RebindHalf = { ...recB3Base, rebind_handle: hORH1, rebind_expires_at: null };
+    assert.match(String(TAL.liveProblem(recB3RebindHalf, taId1, { schemaVersion: "1.1" })), /rebind.*同时/u, "B3 rebind 半有半无拒");
+
+    const recB3BadSelection = { ...recB3Base, selection_handle: hOSH1, handle_expires_at: ISO };
+    assert.match(String(TAL.liveProblem(recB3BadSelection, taId1, { schemaVersion: "1.1" })), /非 B1\/A2 不得有 selection_handle/u, "B3 禁 selection_handle");
+  }
+
+  // ── 3. 三新 proof 形 ──
+  {
+    // binding_proof: owner_select_v1 七字段封闭
+    const bpValid = {
+      kind: "owner_select_v1",
+      authorized_by: "ou_owner1",
+      authorized_at: ISO,
+      selected_session_id: "sess_1",
+      selected_root_om: "om_root1",
+      selection_handle: hOSH1,
+      selection_operation_id: opIdInit
+    };
+    // 1.0 下拒 owner_select_v1
+    const rec10WithNewProof = {
+      kind: "live",
+      topic_agent_id: taId1,
+      chat_id: "oc_chat1",
+      created_at: ISO,
+      updated_at: ISO,
+      origin_operation_id: opIdInit,
+      facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+      aliases: { session_id: "sess_1", root_om: "om_root1" },
+      binding_target: TGT,
+      binding_proof: bpValid,
+      locator_link_proof_ref: { kind: "pairing_merge", by_identity: "user", matched_at: ISO, matched_fields: ["chat_id", "sender", "body", "thread_root"], matched_om: "om_root1", pending_token_state: "present" },
+      generation_lineage_id: "lin_1",
+      anchor_candidate: null
+    };
+    assert.match(String(TAL.liveProblem(rec10WithNewProof, taId1, { schemaVersion: "1.0" })), /binding_proof\.kind 不在/u, "1.0 账本拒 owner_select_v1");
+
+    // 少字段 / 多字段拒
+    const bpExtra = { ...bpValid, extra_key: 123 };
+    const recBPExtra = { ...rec10WithNewProof, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null, binding_proof: bpExtra };
+    assert.match(String(TAL.liveProblem(recBPExtra, taId1, { schemaVersion: "1.1" })), /owner_select_v1 字段集不对/u, "owner_select_v1 多键拒");
+
+    // link_proof: owner_selected_route_v1 八字段封闭
+    const lpValid = {
+      kind: "owner_selected_route_v1",
+      by_identity: "owner_authorization",
+      authorized_by: "ou_owner1",
+      authorized_at: ISO,
+      selected_session_id: "sess_1",
+      selected_root_om: "om_root1",
+      selection_handle: hOSH1,
+      selection_operation_id: opIdInit
+    };
+    const lpBadIdentity = { ...lpValid, by_identity: "user" };
+    const recLPBadIdentity = { ...rec10WithNewProof, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null, binding_proof: bpValid, locator_link_proof_ref: lpBadIdentity };
+    assert.match(String(TAL.liveProblem(recLPBadIdentity, taId1, { schemaVersion: "1.1" })), /by_identity 只认 owner_authorization/u, "owner_selected_route_v1 by_identity 校验");
+
+    // tombstone: owner_select_merge_v1 四字段封闭
+    const tombValid = {
+      kind: "forwarding_tombstone",
+      topic_agent_id: taId2,
+      forwards_to: taId1,
+      merged_at: ISO,
+      origin_operation_id: opIdInit,
+      proof_ref: {
+        kind: "owner_select_merge_v1",
+        selected_root_om: "om_root1",
+        selection_handle: hOSH1,
+        selection_operation_id: opIdInit
+      }
+    };
+    assert.equal(TAL.tombstoneProblem(tombValid, taId2, { schemaVersion: "1.1" }), null, "1.1 下 owner_select_merge_v1 tombstone 合法");
+    assert.match(String(TAL.tombstoneProblem(tombValid, taId2, { schemaVersion: "1.0" })), /proof_ref 字段集\/kind 不对/u, "1.0 账本拒 owner_select_merge_v1");
+
+    const tombExtra = { ...tombValid, proof_ref: { ...tombValid.proof_ref, extra: 1 } };
+    assert.match(String(TAL.tombstoneProblem(tombExtra, taId2, { schemaVersion: "1.1" })), /owner_select_merge_v1 字段集不对/u, "tombstone proof_ref 封闭字段集");
+  }
+
+  // ── 4. G11′ 校验（selected_* 别名一致 ∧ 6 字段等式）──
+  {
+    const d = mkBaseDoc("1.1-transition");
+    d.revision = 2;
+    d.operations[opId1] = {
+      op_type: "activate",
+      terminal_kind: "activate",
+      request_key: "rk_act1",
+      fingerprint: "a".repeat(64),
+      result_revision: 2,
+      result: {
+        surviving_id: taId1,
+        tombstoned_id: taId2,
+        demoted_historical_id: null,
+        authorized_by: "ou_owner1",
+        authorized_at: ISO,
+        selected_session_id: "sess_1",
+        selected_root_om: "om_root1",
+        selection_handle: hOSH1,
+        selection_operation_id: opId1,
+        selection_message_id: "om_msg1",
+        selection_basis: "explicit_handle",
+        affected_live_ids_after_commit: [taId1],
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "produced", link_effect: "produced" }]
+      }
+    };
+    const b3Rec = {
+      kind: "live",
+      topic_agent_id: taId1,
+      chat_id: "oc_chat1",
+      created_at: ISO,
+      updated_at: ISO,
+      origin_operation_id: opId1,
+      facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+      aliases: { session_id: "sess_1", root_om: "om_root1" },
+      binding_target: TGT,
+      binding_proof: {
+        kind: "owner_select_v1",
+        authorized_by: "ou_owner1",
+        authorized_at: ISO,
+        selected_session_id: "sess_1",
+        selected_root_om: "om_root1",
+        selection_handle: hOSH1,
+        selection_operation_id: opId1
+      },
+      locator_link_proof_ref: {
+        kind: "owner_selected_route_v1",
+        by_identity: "owner_authorization",
+        authorized_by: "ou_owner1",
+        authorized_at: ISO,
+        selected_session_id: "sess_1",
+        selected_root_om: "om_root1",
+        selection_handle: hOSH1,
+        selection_operation_id: opId1
+      },
+      generation_lineage_id: "lin_1",
+      anchor_candidate: null,
+      selection_handle: null,
+      handle_expires_at: null,
+      rebind_handle: null,
+      rebind_expires_at: null
+    };
+    const tombRec = {
+      kind: "forwarding_tombstone",
+      topic_agent_id: taId2,
+      forwards_to: taId1,
+      merged_at: ISO,
+      origin_operation_id: opId1,
+      proof_ref: {
+        kind: "owner_select_merge_v1",
+        selected_root_om: "om_root1",
+        selection_handle: hOSH1,
+        selection_operation_id: opId1
+      }
+    };
+    d.records[taId1] = b3Rec;
+    d.records[taId2] = tombRec;
+    assert.equal(TAL.validateLedger(d, { endpointId: EP }).ok, true, "G11′ 合法一致账本放行");
+
+    // G11′ 别名不符：selected_session_id 不等于 aliases.session_id
+    const dBadAlias = structuredClone(d);
+    dBadAlias.records[taId1].binding_proof.selected_session_id = "sess_mismatch";
+    assert.match(String(TAL.validateLedger(dBadAlias, { endpointId: EP }).why), /G11′/u, "G11′ selected_session_id 别名不符拒");
+
+    // G11′ 6 字段不等式：binding 与 link 的 selection_handle 不一致
+    const dBad6 = structuredClone(d);
+    dBad6.records[taId1].locator_link_proof_ref.selection_handle = hOSH2;
+    assert.match(String(TAL.validateLedger(dBad6, { endpointId: EP }).why), /六字段等式|G11′|G13′/u, "binding 与 link 六字段不符拒");
+  }
+
+  // ── 5. G13′ 校验（produced vs preserved）──
+  {
+    const d = mkBaseDoc("1.1");
+    d.revision = 2;
+    d.operations[opId1] = {
+      op_type: "activate",
+      terminal_kind: "activate",
+      request_key: "rk_act1",
+      fingerprint: "b".repeat(64),
+      result_revision: 2,
+      result: {
+        surviving_id: taId1,
+        tombstoned_id: taId2,
+        demoted_historical_id: null,
+        authorized_by: "ou_owner1",
+        authorized_at: ISO,
+        selected_session_id: "sess_1",
+        selected_root_om: "om_root1",
+        selection_handle: hOSH1,
+        selection_operation_id: opId1,
+        selection_message_id: "om_msg1",
+        selection_basis: "explicit_handle",
+        affected_live_ids_after_commit: [taId1],
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "produced", link_effect: "produced" }]
+      }
+    };
+    d.records[taId1] = {
+      kind: "live",
+      topic_agent_id: taId1,
+      chat_id: "oc_chat1",
+      created_at: ISO,
+      updated_at: ISO,
+      origin_operation_id: opId1,
+      facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+      aliases: { session_id: "sess_1", root_om: "om_root1" },
+      binding_target: TGT,
+      binding_proof: {
+        kind: "owner_select_v1",
+        authorized_by: "ou_owner1",
+        authorized_at: ISO,
+        selected_session_id: "sess_1",
+        selected_root_om: "om_root1",
+        selection_handle: hOSH1,
+        selection_operation_id: opId1
+      },
+      locator_link_proof_ref: {
+        kind: "owner_selected_route_v1",
+        by_identity: "owner_authorization",
+        authorized_by: "ou_owner1",
+        authorized_at: ISO,
+        selected_session_id: "sess_1",
+        selected_root_om: "om_root1",
+        selection_handle: hOSH1,
+        selection_operation_id: opId1
+      },
+      generation_lineage_id: "lin_1",
+      anchor_candidate: null,
+      selection_handle: null,
+      handle_expires_at: null,
+      rebind_handle: null,
+      rebind_expires_at: null
+    };
+    d.records[taId2] = {
+      kind: "forwarding_tombstone",
+      topic_agent_id: taId2,
+      forwards_to: taId1,
+      merged_at: ISO,
+      origin_operation_id: opId1,
+      proof_ref: {
+        kind: "owner_select_merge_v1",
+        selected_root_om: "om_root1",
+        selection_handle: hOSH1,
+        selection_operation_id: opId1
+      }
+    };
+    assert.equal(TAL.validateLedger(d, { endpointId: EP }).ok, true, "G13′ produced 验证通过");
+
+    // produced 篡改 result 中的 selection_handle → G13′ 拒
+    const dTamperResult = structuredClone(d);
+    dTamperResult.operations[opId1].result.selection_handle = hOSH2;
+    assert.match(String(TAL.validateLedger(dTamperResult, { endpointId: EP }).why), /G13′/u, "G13′ produced 篡改 result 字段拒");
+
+    // preserved 分支：unbind 继承 proof
+    const dUnbind = structuredClone(d);
+    dUnbind.revision = 3;
+    dUnbind.operations[opId2] = {
+      op_type: "unbind",
+      terminal_kind: "unbind",
+      request_key: "rk_unbind_1",
+      fingerprint: "c".repeat(64),
+      result_revision: 3,
+      result: {
+        affected_id: taId1,
+        terminal_family: "B3'",
+        affected_live_ids_after_commit: [taId1],
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "preserved", link_effect: "preserved" }]
+      }
+    };
+    dUnbind.records[taId1].origin_operation_id = opId2;
+    dUnbind.records[taId1].facts.binding = "dormant";
+    assert.equal(TAL.validateLedger(dUnbind, { endpointId: EP }).ok, true, "G13′ preserved unbind 继承验证通过");
+
+    // preserved 指向不存在的 producing op → 拒
+    const dGhostProd = structuredClone(dUnbind);
+    dGhostProd.records[taId1].binding_proof.selection_operation_id = "00000000-0000-4000-8000-999999999999";
+    dGhostProd.records[taId1].locator_link_proof_ref.selection_operation_id = "00000000-0000-4000-8000-999999999999";
+    assert.match(String(TAL.validateLedger(dGhostProd, { endpointId: EP }).why), /G13′/u, "G13′ preserved 虚假产生 op 拒");
+  }
+
+  // ── 6. G15′ 校验（1.1 strict 拒旧形 ∧ handle 前缀绑定）──
+  {
+    // 1.1 strict 下出现 legacy pairing_merge link → 拒 (legacy_pairing_shape)
+    const dStrict = mkBaseDoc("1.1");
+    dStrict.revision = 2;
+    dStrict.operations[opId1] = {
+      op_type: "activate",
+      terminal_kind: "activate",
+      request_key: "rk_act1",
+      fingerprint: "d".repeat(64),
+      result_revision: 2,
+      result: { surviving_id: taId1, tombstoned_id: taId2, demoted_historical_id: null }
+    };
+    dStrict.records[taId1] = {
+      kind: "live",
+      topic_agent_id: taId1,
+      chat_id: "oc_chat1",
+      created_at: ISO,
+      updated_at: ISO,
+      origin_operation_id: opId1,
+      facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+      aliases: { session_id: "sess_1", root_om: "om_root1" },
+      binding_target: TGT,
+      binding_proof: { kind: "pairing", authorized_by: "ou_owner1", authorized_at: ISO, matched_om: "om_root1", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" },
+      locator_link_proof_ref: { kind: "pairing_merge", by_identity: "user", matched_at: ISO, matched_fields: ["chat_id", "sender", "body", "thread_root"], matched_om: "om_root1", pending_token_state: "present" },
+      generation_lineage_id: "lin_1",
+      anchor_candidate: null,
+      selection_handle: null,
+      handle_expires_at: null,
+      rebind_handle: null,
+      rebind_expires_at: null
+    };
+    dStrict.records[taId2] = {
+      kind: "forwarding_tombstone",
+      topic_agent_id: taId2,
+      forwards_to: taId1,
+      merged_at: ISO,
+      origin_operation_id: opId1,
+      proof_ref: { kind: "pairing", om: "om_root1", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }
+    };
+    assert.match(String(TAL.validateLedger(dStrict, { endpointId: EP }).why), /legacy_pairing_shape/u, "1.1 strict 拒 legacy pairing 形态 (G15′)");
+
+    // 来源 op ↔ handle 前缀绑定：activate 只收 osh_
+    const dPrefixBad = mkBaseDoc("1.1-transition");
+    dPrefixBad.revision = 2;
+    dPrefixBad.operations[opId1] = {
+      op_type: "activate",
+      terminal_kind: "activate",
+      request_key: "rk_act1",
+      fingerprint: "e".repeat(64),
+      result_revision: 2,
+      result: {
+        surviving_id: taId1,
+        tombstoned_id: taId2,
+        demoted_historical_id: null,
+        authorized_by: "ou_owner1",
+        authorized_at: ISO,
+        selected_session_id: "sess_1",
+        selected_root_om: "om_root1",
+        selection_handle: hORH1, // 错：activate 拿 orh_
+        selection_operation_id: opId1,
+        selection_message_id: "om_msg1",
+        selection_basis: "explicit_handle",
+        affected_live_ids_after_commit: [taId1],
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "produced", link_effect: "produced" }]
+      }
+    };
+    dPrefixBad.records[taId1] = {
+      kind: "live",
+      topic_agent_id: taId1,
+      chat_id: "oc_chat1",
+      created_at: ISO,
+      updated_at: ISO,
+      origin_operation_id: opId1,
+      facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+      aliases: { session_id: "sess_1", root_om: "om_root1" },
+      binding_target: TGT,
+      binding_proof: {
+        kind: "owner_select_v1",
+        authorized_by: "ou_owner1",
+        authorized_at: ISO,
+        selected_session_id: "sess_1",
+        selected_root_om: "om_root1",
+        selection_handle: hORH1,
+        selection_operation_id: opId1
+      },
+      locator_link_proof_ref: {
+        kind: "owner_selected_route_v1",
+        by_identity: "owner_authorization",
+        authorized_by: "ou_owner1",
+        authorized_at: ISO,
+        selected_session_id: "sess_1",
+        selected_root_om: "om_root1",
+        selection_handle: hORH1,
+        selection_operation_id: opId1
+      },
+      generation_lineage_id: "lin_1",
+      anchor_candidate: null,
+      selection_handle: null,
+      handle_expires_at: null,
+      rebind_handle: null,
+      rebind_expires_at: null
+    };
+    dPrefixBad.records[taId2] = {
+      kind: "forwarding_tombstone",
+      topic_agent_id: taId2,
+      forwards_to: taId1,
+      merged_at: ISO,
+      origin_operation_id: opId1,
+      proof_ref: { kind: "owner_select_merge_v1", selected_root_om: "om_root1", selection_handle: hORH1, selection_operation_id: opId1 }
+    };
+    assert.match(String(TAL.validateLedger(dPrefixBad, { endpointId: EP }).why), /G15′.*前缀|handle.*前缀/u, "activate 只收 osh_ (G15′)");
+  }
+
+  // ── 7. G-handle 校验（溯源 / 未被覆盖 / live 全局唯一）──
+  {
+    const d = mkBaseDoc("1.1");
+    d.revision = 2;
+    d.operations[opId1] = {
+      op_type: "create_b1",
+      terminal_kind: "create_b1",
+      request_key: "rk_b1_1",
+      fingerprint: "f".repeat(64),
+      result_revision: 2,
+      result: {
+        created_id: taId1,
+        selection_handle: hOSH1,
+        handle_expires_at: ISO,
+        affected_live_ids_after_commit: [taId1],
+        proof_effects: []
+      }
+    };
+    d.records[taId1] = {
+      kind: "live",
+      topic_agent_id: taId1,
+      chat_id: "oc_chat1",
+      created_at: ISO,
+      updated_at: ISO,
+      origin_operation_id: opId1,
+      facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" },
+      aliases: { session_id: null, root_om: "om_root1" },
+      binding_target: TGT,
+      binding_proof: null,
+      locator_link_proof_ref: null,
+      generation_lineage_id: "lin_1",
+      anchor_candidate: null,
+      selection_handle: hOSH1,
+      handle_expires_at: ISO,
+      rebind_handle: null,
+      rebind_expires_at: null
+    };
+    assert.equal(TAL.validateLedger(d, { endpointId: EP }).ok, true, "G-handle 正常溯源通过");
+
+    // 溯源值不符：记录的 selection_handle 与产生 op result 不一致
+    const dMismatch = structuredClone(d);
+    dMismatch.records[taId1].selection_handle = hOSH2;
+    assert.match(String(TAL.validateLedger(dMismatch, { endpointId: EP }).why), /G-handle/u, "G-handle 溯源不符拒");
+
+    // 全局唯一：两 live 记录共享同一 selection_handle → 拒
+    const dDup = structuredClone(d);
+    dDup.records[taId2] = {
+      ...structuredClone(d.records[taId1]),
+      topic_agent_id: taId2,
+      aliases: { session_id: null, root_om: "om_root2" }
+    };
+    assert.match(String(TAL.validateLedger(dDup, { endpointId: EP }).why), /G-handle.*唯一|handle.*唯一/u, "G-handle live handle 全局唯一");
+  }
+
+  // ── 8. Operations result 增量及封闭键集 ──
+  {
+    // mint_selection_handles 复合 op
+    const dMint = mkBaseDoc("1.1-transition");
+    dMint.revision = 2;
+    dMint.operations[opId1] = {
+      op_type: "mint_selection_handles",
+      terminal_kind: "mint_selection_handles",
+      request_key: "rk_mint_1",
+      fingerprint: "1".repeat(64),
+      result_revision: 2,
+      result: {
+        endpoint: EP,
+        minted: [{ target_id: taId1, selection_handle: hOSH1, handle_expires_at: ISO }],
+        affected_live_ids_after_commit: [taId1],
+        proof_effects: []
+      }
+    };
+    dMint.records[taId1] = {
+      kind: "live",
+      topic_agent_id: taId1,
+      chat_id: "oc_chat1",
+      created_at: ISO,
+      updated_at: ISO,
+      origin_operation_id: opId1,
+      facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" },
+      aliases: { session_id: null, root_om: "om_root1" },
+      binding_target: TGT,
+      binding_proof: null,
+      locator_link_proof_ref: null,
+      generation_lineage_id: "lin_1",
+      anchor_candidate: null,
+      selection_handle: hOSH1,
+      handle_expires_at: ISO,
+      rebind_handle: null,
+      rebind_expires_at: null
+    };
+    assert.equal(TAL.validateLedger(dMint, { endpointId: EP }).ok, true, "mint_selection_handles result 增量验证通过");
+
+    // 零集合 mint 仍合法
+    const dMintZero = mkBaseDoc("1.1-transition");
+    dMintZero.revision = 2;
+    dMintZero.operations[opId1] = {
+      op_type: "mint_selection_handles",
+      terminal_kind: "mint_selection_handles",
+      request_key: "rk_mint_0",
+      fingerprint: "2".repeat(64),
+      result_revision: 2,
+      result: {
+        endpoint: EP,
+        minted: [],
+        affected_live_ids_after_commit: [],
+        proof_effects: []
+      }
+    };
+    assert.equal(TAL.validateLedger(dMintZero, { endpointId: EP }).ok, true, "零集合 mint 放行");
+
+    // clear_anchor_handle op 增量
+    const dClear = mkBaseDoc("1.1");
+    dClear.revision = 2;
+    dClear.operations[opId1] = {
+      op_type: "clear_anchor_handle",
+      terminal_kind: "clear_anchor_handle",
+      request_key: "rk_clear_1",
+      fingerprint: "3".repeat(64),
+      result_revision: 2,
+      result: {
+        cleared: ["selection_handle", "handle_expires_at"],
+        affected_live_ids_after_commit: [taId1],
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "preserved", link_effect: "none" }]
+      }
+    };
+    dClear.records[taId1] = {
+      kind: "live",
+      topic_agent_id: taId1,
+      chat_id: "oc_chat1",
+      created_at: ISO,
+      updated_at: ISO,
+      origin_operation_id: opId1,
+      facts: { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" },
+      aliases: { session_id: "sess_1", root_om: null },
+      binding_target: TGT,
+      binding_proof: { kind: "attach", authorized_by: "ou_owner1", authorized_at: ISO, claim_key: "2".repeat(64) },
+      locator_link_proof_ref: null,
+      generation_lineage_id: null,
+      anchor_candidate: "om_cand1",
+      selection_handle: null,
+      handle_expires_at: null,
+      rebind_handle: null,
+      rebind_expires_at: null
+    };
+    assert.equal(TAL.validateLedger(dClear, { endpointId: EP }).ok, true, "clear_anchor_handle 验证通过");
+
+    // schema_upgrade 终态 op 增量
+    const dUpgrade = mkBaseDoc("1.1-transition");
+    dUpgrade.revision = 2;
+    dUpgrade.operations[opId1] = {
+      op_type: "schema_upgrade",
+      terminal_kind: "schema_upgrade",
+      request_key: "rk_up_1",
+      fingerprint: "4".repeat(64),
+      result_revision: 2,
+      result: { endpoint: EP, from_schema: "1.0", to_schema: "1.1-transition" }
+    };
+    assert.equal(TAL.validateLedger(dUpgrade, { endpointId: EP }).ok, true, "schema_upgrade 验证通过");
+  }
+});
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

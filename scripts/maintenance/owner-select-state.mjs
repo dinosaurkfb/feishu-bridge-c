@@ -425,3 +425,7 @@ export function writeWriterState({ env = process.env, expectedSha256 = null, doc
     revision: readBack.doc.revision
   };
 }
+
+export function readOwnerSelectAdmission(env = process.env) {
+  return null;
+}

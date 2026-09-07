@@ -1,0 +1,144 @@
+/**
+ * R52：owner_select 迁移命令面（§三）。工艺对齐 maintenance-ledger.mjs：参数封闭（每 flag 至多一次）、
+ * 默认只预览（零改动）、--apply 才动（安装类授权，Frank 逐次）；退出码沿用同一纪律
+ * （0 完成/预览、1 拒绝未动、3 已动现场未做完）。编排入口是 owner-select-operation.mjs 的
+ * osmEnter / osmExit，本模块只包参数与返回码，不自造第二套编排。
+ *
+ *   node scripts/maintenance-owner-select.mjs --status                          只读：活动 osm operation + 冻结集 + campaign/writer 投影
+ *   node scripts/maintenance-owner-select.mjs --migrate-a [--wait-ms N] [--apply]  operation A（old→transition + mint + writer partial）
+ *
+ * `--exit` 不在本单（沿用 maintenance-gate --exit 按 operation_kind 分派：owner_select_migration_a → osmExit）。
+ */
+import fs from "node:fs";
+import path from "node:path";
+
+import { isDirectRun, moduleDir } from "./direct-run.mjs";
+import { maintenanceContext, renderStatus, maintenanceStatus } from "./maintenance/operation.mjs";
+import { readActive, readJournal, TERMINAL_PHASES } from "./maintenance/journal.mjs";
+import { campaignIdFor, readCampaignState, readWriterState } from "./maintenance/owner-select-state.mjs";
+import { osmEnter, osmExit } from "./maintenance/owner-select-operation.mjs";
+import { loadLedger, migrationInventory, resolveEndpointDir } from "./topic-agent-ledger.mjs";
+import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
+
+/** 参数封闭：--status 不带别的；--migrate-a 可选 --wait-ms / --apply；每 flag 至多一次。 */
+export function parseMaintenanceOwnerSelectArgs(argv) {
+  let mode = null, waitMs = 60000, apply = false;
+  const seen = new Set();
+  const once = (flag) => { if (seen.has(flag)) return false; seen.add(flag); return true; };
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === "--status" || a === "--migrate-a") { if (mode !== null) return { ok: false, reason: "只能给一个动作" }; mode = a.slice(2); continue; }
+    if (a === "--wait-ms") { if (!once(a)) return { ok: false, reason: "--wait-ms 重复" }; const raw = argv[i + 1]; const v = Number(raw); if (typeof raw !== "string" || !/^\d+$/u.test(raw) || !Number.isSafeInteger(v) || v > 3600000) return { ok: false, reason: "--wait-ms 要是 0–3600000 的整数" }; waitMs = v; i += 1; continue; }
+    if (a === "--apply") { if (!once(a)) return { ok: false, reason: "--apply 重复" }; apply = true; continue; }
+    return { ok: false, reason: "不认识的参数：" + a };
+  }
+  if (mode === null) return { ok: false, reason: "要给 --status / --migrate-a 之一" };
+  if (mode === "status" && seen.size > 0) return { ok: false, reason: "--status 不带别的参数" };
+  return { ok: true, mode, waitMs, apply };
+}
+
+/** 只读投影：活动 osm operation + 冻结集（initDone 收据）+ 每 ep 账本要点 + campaign / writer-state 状态。 */
+export function ownerSelectStatus(ctx, { env = process.env } = {}) {
+  const active = readActive({ dir: ctx.dir });
+  let activeOp = null;
+  if (active.state === "active") {
+    const j = readJournal({ dir: ctx.dir, token: active.token });
+    if (j.state === "valid" && j.doc.operation_kind === "owner_select_migration_a") {
+      activeOp = { token: active.token, kind: j.doc.operation_kind, phase: j.doc.phase, steps: j.doc.steps.filter((s) => ["campaign", "schema_endpoint", "mint", "writer_state"].includes(s.kind)).map((s) => s.id + ":" + s.state) };
+    }
+  }
+  const cs = readCampaignState(env);
+  const ws = readWriterState(env);
+  // 冻结集与每 ep 盘点（只读）
+  let names = [];
+  try { names = fs.readdirSync(ctx.dir); } catch { names = []; }
+  const frozen = [];
+  for (const n of names) {
+    if (!/^[0-9a-f-]{36}\.json$/u.test(n)) continue;
+    const tok = n.slice(0, -5);
+    const j = readJournal({ dir: ctx.dir, token: tok });
+    if (j.state !== "valid") continue;
+    if (j.doc.operation_kind !== "ledger_init") continue;
+    const ls = j.doc.steps.find((s) => s.kind === "ledger");
+    const ep = typeof ls?.target === "string" ? ls.target : null;
+    if (ep === null || frozen.includes(ep)) continue;
+    const r = endpointReceipt(ctx.dir, ep);
+    if (r.ok && r.initDone === true) frozen.push(ep);
+  }
+  frozen.sort();
+  const endpoints = frozen.map((ep) => {
+    const d = resolveEndpointDir(ep, { env });
+    if (!d.ok) return { endpointId: ep, why: d.reason };
+    const L = loadLedger(d.dir, { endpointId: ep });
+    if (!L.ok) return { endpointId: ep, why: L.why ?? L.reason };
+    const inv = migrationInventory(L.doc);
+    return { endpointId: ep, schemaVersion: L.doc.schema_version, revision: L.doc.revision, legacyProofCount: inv.legacy_proof_count, nullB1Count: inv.null_b1_count };
+  });
+  return { activeOp, campaign: { exists: cs.exists, state: cs.state, campaignId: cs.campaign_id }, writerState: { exists: ws.exists, state: ws.state, campaignId: ws.campaign_id }, endpoints };
+}
+
+export function renderOwnerSelectStatus(st) {
+  const parts = [];
+  if (st.activeOp) parts.push("活动 owner_select operation：token " + String(st.activeOp.token).slice(0, 8) + "，" + st.activeOp.kind + "，阶段 " + st.activeOp.phase + (st.activeOp.steps.length ? "\n    " + st.activeOp.steps.join("、") : ""));
+  else parts.push("没有活动 owner_select operation");
+  parts.push("campaign：" + (st.campaign.exists ? st.campaign.state + "（" + st.campaign.campaignId + "）" : "absent"));
+  parts.push("writer-state：" + (st.writerState.exists ? st.writerState.state + "（" + st.writerState.campaignId + "）" : "off（缺席）"));
+  if (st.endpoints.length === 0) parts.push("冻结集：空（无 initDone 收据 endpoint）");
+  else parts.push("冻结集（initDone 收据）：" + st.endpoints.length + " 个 endpoint");
+  for (const e of st.endpoints) {
+    if (e.why) parts.push("  " + e.endpointId + "：读不出（" + e.why + "）");
+    else parts.push("  " + e.endpointId + "：" + e.schemaVersion + " rev" + e.revision + "，legacy " + e.legacyProofCount + "，null-B1 " + e.nullB1Count);
+  }
+  return parts.map((p) => "  " + p).join("\n");
+}
+
+const fmtFail = (r) => String(r.reason) + (r.why ? "：" + r.why : "") + (r.path ? "，" + r.path : "");
+const releaseRows = (r) => {
+  const rows = [];
+  if (r.leaseRelease) rows.push("租约交不还：" + r.leaseRelease.path + "（" + String(r.leaseRelease.why ?? r.leaseRelease.reason ?? "") + "）");
+  if (r.surfaceRelease) rows.push("安装面锁交不还：" + r.surfaceRelease.path + "（" + String(r.surfaceRelease.why ?? r.surfaceRelease.reason ?? "") + "）");
+  for (const p of r.residue ?? []) rows.push("写后残骸：" + p);
+  return rows;
+};
+
+const OSM_FORWARD_PHASES = ["drained", "osm_a_upgrading", "ledger_reopening"];
+
+export function exitCodeFor(r) {
+  if (r.leaseRelease ?? r.surfaceRelease ?? null) return 3;
+  if (r.ok) return 0;
+  if (r.rollback && r.rollback.ok === true) return 1;
+  if (r.rollback && r.rollback.ok === false) return 3;
+  if (r.reason === "osm_forward_failed" || r.reason === "osm_rollback_failed") return 3;
+  if (OSM_FORWARD_PHASES.includes(r.phase) || r.phase === "reopening_incomplete" || r.reason === "reopening_incomplete" || r.phase === "rollback_incomplete") return 3;
+  return 1;
+}
+
+export function runMaintenanceOwnerSelect(argv, { ctx = null, out = (s) => process.stdout.write(s + "\n"), env = process.env } = {}) {
+  const parsed = parseMaintenanceOwnerSelectArgs(argv);
+  if (!parsed.ok) { out("用法：node maintenance-owner-select.mjs --status | --migrate-a [--wait-ms N] [--apply]（" + parsed.reason + "）"); return 1; }
+  const c = ctx ?? maintenanceContext({ repoRoot: path.dirname(moduleDir(import.meta.url)) });
+  if (parsed.mode === "status") {
+    out(renderStatus(maintenanceStatus(c)));
+    out(renderOwnerSelectStatus(ownerSelectStatus(c, { env })));
+    return 0;
+  }
+  const r = osmEnter(c, { kind: "a", waitMs: parsed.waitMs, apply: parsed.apply, reason: null, env });
+  if (r.dryRun) {
+    out("[预览] owner_select 迁移 A：停两链定时器 → 两链 current 切维护桩 → 建门 → 等既有进程退出 → drained 前置盘点（冻结集 = 全部 initDone 收据 endpoint）→ 原子进段（campaign open + 每 ep schema/mint + writer partial）→ transition + 复合 mint + writer_state=partial → 重开撤门。加 --apply 执行。");
+    return 0;
+  }
+  const rows = releaseRows(r);
+  const code = exitCodeFor(r);
+  if (!r.ok) {
+    out("owner_select 迁移 A 没做成（" + fmtFail(r) + "）" + (r.rollback ? (r.rollback.ok ? "；已按账回退还清" : "；回退没做全（" + String(r.rollback.why ?? r.rollback.phase) + "，门与账保留，看 --status）") : "") + (rows.length ? "；且" + rows.join("；且") + "—— 只人工核对" : "") + "\n旁路指示：先看 --status。");
+    return code;
+  }
+  if (r.phase === "done" && r.activeCleared === true) {
+    out("owner_select 迁移 A 完成：transition + handle 已铸 + writer partial，重开 done、active 已清" + (rows.length ? "；但" + rows.join("；且") + "—— 人工核对" : ""));
+    return code;
+  }
+  out("owner_select 迁移 A 没做完：阶段 " + String(r.phase) + (r.incomplete?.length ? "\n" + r.incomplete.map((i) => "  · " + i.id + "：" + i.why).join("\n") : "") + (rows.length ? "\n且" + rows.join("\n且") : "") + "\n门与账保留（forward-only 只向前），处置后再跑 --status。");
+  return code;
+}
+
+if (isDirectRun(import.meta.url)) process.exit(runMaintenanceOwnerSelect(process.argv.slice(2)));

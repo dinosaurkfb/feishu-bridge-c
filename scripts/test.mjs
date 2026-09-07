@@ -264,6 +264,7 @@ import {
   readWriterState,
   writeCampaignState,
   writeWriterState,
+  readOwnerSelectAdmission,
 } from "./maintenance/owner-select-state.mjs";
 import { switchCurrentTarget } from "./runtime-install.mjs";
 import { applyRuntimeSync as applyRuntimeSyncB } from "./runtime-install.mjs";
@@ -33928,7 +33929,13 @@ test("R50 §二 owner-select-state：campaign 与 writer-state 文件合同与�
     state: "open",
     endpoints: eps,
     endpoints_digest: dig,
-    pending_joins: [{ endpoint_id: "endpoint_333333333333333333333333", at: "2026-09-07T10:00:00.000Z" }],
+    pending_joins: [{
+      endpoint_id: "endpoint_333333333333333333333333",
+      at: "2026-09-07T10:00:00.000Z",
+      init_chain: "chain-1",
+      init_request_key: "req-1",
+      init_operation_token: tok1
+    }],
     members: {
       "endpoint_111111111111111111111111": { schema_version: "1.0", legacy_proof_count: 1, null_b1_count: 2 },
       "endpoint_222222222222222222222222": { schema_version: "1.1-transition", legacy_proof_count: 0, null_b1_count: 0 }
@@ -34397,17 +34404,17 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
   const badExtraA = { ...docA, steps: [...docA.steps, extraSealInA] };
   assert.ok(journalProblem(badExtraA, { maintenanceDir: "/tmp/maint" }) !== null, "多出 seal step 拒");
 
-  // 7f. writer_state:partial 步 endpoints_digest 与 campaign:open 步交叉核验
+  // 7f. writer_state:partial 步 endpoints_digest 与 campaign:open 步交叉核验（P1-5：必等于 open 步 digest，不再允许 null）
   const badAPartialDigestMismatch = {
     ...docA,
     steps: docA.steps.map((s) => s.id.startsWith("writer_state:") ? { ...s, intended_after: { ...s.intended_after, endpoints_digest: "f".repeat(64) } } : s)
   };
-  assert.equal(journalProblem(badAPartialDigestMismatch, { maintenanceDir: "/tmp/maint" }), "writer_state:partial 的 endpoints_digest 必须为 null 或等于 campaign:open 的 endpoints_digest");
-  const goodAPartialDigestNull = {
+  assert.equal(journalProblem(badAPartialDigestMismatch, { maintenanceDir: "/tmp/maint" }), "writer_state:partial 的 endpoints_digest 必须等于 campaign:open 的 endpoints_digest");
+  const badAPartialDigestNull = {
     ...docA,
     steps: docA.steps.map((s) => s.id.startsWith("writer_state:") ? { ...s, intended_after: { ...s.intended_after, endpoints_digest: null } } : s)
   };
-  assert.equal(journalProblem(goodAPartialDigestNull, { maintenanceDir: "/tmp/maint" }), null, "partial 的 endpoints_digest 为 null 时合法");
+  assert.equal(journalProblem(badAPartialDigestNull, { maintenanceDir: "/tmp/maint" }), "writer_state:partial 的 endpoints_digest 必须等于 campaign:open 的 endpoints_digest");
 
   // 7g. writer_state:on 与 campaign:complete 约束：on done 时 complete 必须已 done
   const docBOnDoneCampPrep = {
@@ -34422,6 +34429,520 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
     steps: docB.steps.map((s) => s.id.startsWith("writer_state:") ? { ...s, intended_after: { ...s.intended_after, endpoints_digest: "c".repeat(64) } } : s)
   };
   assert.ok(journalProblem(docBDigestMismatch, { maintenanceDir: "/tmp/maint" }) !== null, "writer_state on 摘要与 campaign complete 不一致时拒");
+});
+
+test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validateLedgerRoot 纪律、状态链闭合、direct on、campaign 不变量与准入读取器", () => {
+  const tok1 = "00000000-0000-4000-8000-000000000001";
+  const cid1 = campaignIdFor(tok1);
+  const eps = ["endpoint_111111111111111111111111", "endpoint_222222222222222222222222"];
+  const dig = endpointsDigest(eps);
+
+  // ----------------------------------------------------
+  // P1-1: schema 分派收紧与 1.1 冻结
+  // ----------------------------------------------------
+  // (a) 1.1 文档含新 step kind → 必须拒绝
+  const doc11WithNewStep = {
+    schema_version: "1.1",
+    phase: "planned",
+    reason: "test 1.1 with campaign",
+    started_at: "2026-09-07T10:00:00.000Z",
+    updated_at: "2026-09-07T10:00:00.000Z",
+    token: tok1,
+    notes: [],
+    steps: [
+      {
+        at: "2026-09-07T10:00:00.000Z",
+        backup: null,
+        backup_bytes: null,
+        backup_sha256: null,
+        before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null },
+        chain: null,
+        id: "campaign:" + cid1 + ":open",
+        intended_after: { exists: true, sha256: "0".repeat(64), state: "open", campaign_id: cid1, endpoints: eps, endpoints_digest: dig },
+        kind: "campaign",
+        state: "prepared",
+        target: "ledger/owner-select-campaign.json"
+      }
+    ]
+  };
+  assert.equal(journalProblem(doc11WithNewStep), "旧 1.1 不得含新 step kind");
+
+  // (b) 1.4 是三新种专属判别支：读到旧四种一律 problem
+  for (const oldKind of ["maintenance_gate", "maintenance_install", "ledger_init", "ledger_cutover"]) {
+    const doc14Old = {
+      schema_version: "1.4",
+      operation_kind: oldKind,
+      phase: oldKind === "ledger_cutover" ? "ledger_cutting_over" : (oldKind === "ledger_init" ? "ledger_initializing" : "gated"),
+      reason: "test 1.4 with old kind",
+      started_at: "2026-09-07T10:00:00.000Z",
+      updated_at: "2026-09-07T10:00:00.000Z",
+      token: tok1,
+      notes: [],
+      steps: []
+    };
+    const prob = journalProblem(doc14Old);
+    assert.ok(prob !== null, "1.4 读旧种 " + oldKind + " 必须拒绝");
+    assert.match(prob, /1\.4 是.*专属/u, "1.4 专属判别支错误信息提示");
+  }
+
+  // ----------------------------------------------------
+  // P1-2 & P1-3: 受验纪律（validateLedgerRoot & 0600 模式）与锁内 CAS 写原语
+  // ----------------------------------------------------
+  const tmpBase = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r50-p1-test-"));
+  const realLedgerDir = path.join(tmpBase, "real-ledger");
+  fs.mkdirSync(realLedgerDir, { mode: 0o700 });
+  const symlinkLedgerDir = path.join(tmpBase, "symlink-ledger");
+  fs.symlinkSync(realLedgerDir, symlinkLedgerDir);
+
+  // 祖先为 symlink 的根路径读写必拒（validateLedgerRoot）
+  const envSymlink = { FEISHU_BRIDGE_LEDGER_DIR: symlinkLedgerDir };
+  const readSymlink = readCampaignState(envSymlink);
+  assert.equal(readSymlink.state, "unreadable", "symlink 根读作 unreadable");
+  assert.match(readSymlink.problem, /root_symlink|root_not_canonical/u);
+
+  const envOk = { FEISHU_BRIDGE_LEDGER_DIR: realLedgerDir };
+  const dummyDoc = {
+    schema_version: "owner-select-campaign-1",
+    campaign_id: cid1,
+    state: "open",
+    endpoints: eps,
+    endpoints_digest: dig,
+    pending_joins: [{
+      endpoint_id: "endpoint_333333333333333333333333",
+      at: "2026-09-07T10:00:00.000Z",
+      init_chain: "chain-1",
+      init_request_key: "req-1",
+      init_operation_token: tok1
+    }],
+    members: {
+      "endpoint_111111111111111111111111": { schema_version: "1.0", legacy_proof_count: 1, null_b1_count: 2 },
+      "endpoint_222222222222222222222222": { schema_version: "1.1-transition", legacy_proof_count: 0, null_b1_count: 0 }
+    },
+    revision: 1,
+    origin_operation_id: tok1
+  };
+
+  const writeSymlink = writeCampaignState({ env: envSymlink, expectedSha256: null, doc: dummyDoc });
+  assert.equal(writeSymlink.ok, false);
+  assert.equal(writeSymlink.commit, "not_committed");
+  assert.equal(writeSymlink.reason, "ledger_root_invalid");
+
+  // 0700 状态文件必拒（文件模式必须恰 0600）
+  const campFile = path.join(realLedgerDir, "owner-select-campaign.json");
+  fs.writeFileSync(campFile, JSON.stringify(dummyDoc, null, 2) + "\n", { mode: 0o700 });
+  fs.chmodSync(campFile, 0o700);
+  const read0700 = readCampaignState(envOk);
+  assert.equal(read0700.state, "unreadable", "0700 状态文件必须拒绝");
+  assert.match(read0700.problem, /0600/u);
+  fs.unlinkSync(campFile);
+
+  // 1.98 MB 文档（> 1 MiB）落盘前核大小必拒，不留文件
+  const largePadding = "x".repeat(1024 * 1024 * 2);
+  const largeDoc = { ...dummyDoc, _extra: largePadding };
+  const writeLarge = writeCampaignState({ env: envOk, expectedSha256: null, doc: largeDoc });
+  assert.equal(writeLarge.ok, false);
+  assert.equal(writeLarge.commit, "not_committed");
+  assert.equal(fs.existsSync(campFile), false, "超限文档不落盘");
+
+  // 写前异常结构化返回，不裸抛
+  const writeThrow = writeCampaignState({ env: envOk, expectedSha256: null, doc: { bad: true } });
+  assert.equal(writeThrow.ok, false);
+  assert.equal(writeThrow.commit, "not_committed");
+  assert.equal(writeThrow.reason, "invalid_doc");
+
+  // 锁内 CAS + 两写方同 SHA 并发只一方成功
+  const write1 = writeCampaignState({ env: envOk, expectedSha256: null, doc: dummyDoc });
+  assert.equal(write1.ok, true);
+  assert.equal(write1.commit, "committed");
+  const write2SameSha = writeCampaignState({ env: envOk, expectedSha256: null, doc: dummyDoc });
+  assert.equal(write2SameSha.ok, false);
+  assert.equal(write2SameSha.commit, "not_committed");
+  assert.equal(write2SameSha.reason, "cas_mismatch");
+
+  // 锁忙时写入返回 not_committed
+  const lockDir = path.join(realLedgerDir, "owner-select-state.lock");
+  const heldLock = acquireLockUngated(lockDir, { reapUnrecognized: false });
+  assert.equal(heldLock.ok, true);
+  const writeLockBusy = writeCampaignState({ env: envOk, expectedSha256: write1.sha256, doc: { ...dummyDoc, revision: 2 } });
+  assert.equal(writeLockBusy.ok, false);
+  assert.equal(writeLockBusy.commit, "not_committed");
+  releasePublishLock(lockDir, { expectedToken: heldLock.token });
+
+  // fsync EIO 注入：rename 成功而目录 fsync 失败 → committed_durability_uncertain
+  const origFsync = fs.fsyncSync;
+  let failDirFsync = false;
+  fs.fsyncSync = function(fd) {
+    if (failDirFsync) {
+      const err = new Error("EIO: i/o error");
+      err.code = "EIO";
+      throw err;
+    }
+    return origFsync.apply(this, arguments);
+  };
+  try {
+    failDirFsync = true;
+    const writeEio = writeCampaignState({ env: envOk, expectedSha256: write1.sha256, doc: { ...dummyDoc, revision: 2 } });
+    assert.equal(writeEio.ok, false);
+    assert.equal(writeEio.commit, "committed_durability_uncertain");
+    assert.equal(writeEio.reason, "dir_fsync_failed");
+  } finally {
+    fs.fsyncSync = origFsync;
+  }
+
+  // ----------------------------------------------------
+  // P1-4: 状态链闭合（journal 内）
+  // ----------------------------------------------------
+  const enterSteps = [
+    {
+      at: "2026-09-07T10:00:00.000Z", backup: null, backup_bytes: null, backup_sha256: null,
+      before: null, chain: null, id: "current:endpoint_111111111111111111111111", intended_after: null,
+      kind: "current", state: "done", target: "current"
+    },
+    {
+      at: "2026-09-07T10:00:00.000Z", backup: null, backup_bytes: null, backup_sha256: null,
+      before: null, chain: null, id: "current:endpoint_222222222222222222222222", intended_after: null,
+      kind: "current", state: "done", target: "current"
+    }
+  ];
+
+  const ep1 = eps[0];
+  const ep2 = eps[1];
+
+  // Codex 反例 1: A 链断裂（schema_endpoint:transition intended_after ≠ mint before）
+  const docABase = {
+    schema_version: "1.4",
+    operation_kind: "owner_select_migration_a",
+    phase: "osm_a_upgrading",
+    reason: "A migration",
+    started_at: "2026-09-07T10:00:00.000Z",
+    updated_at: "2026-09-07T10:00:00.000Z",
+    token: tok1,
+    notes: [],
+    steps: [
+      ...enterSteps,
+      {
+        at: "2026-09-07T10:00:00.000Z", backup: null, backup_bytes: null, backup_sha256: null,
+        before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null },
+        chain: null, id: "campaign:" + cid1 + ":open",
+        intended_after: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
+        kind: "campaign", state: "prepared", target: "ledger/owner-select-campaign.json"
+      },
+      {
+        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "2".repeat(64),
+        before: { schema_version: "1.0", revision: 1, ledger_sha256: "2".repeat(64) },
+        chain: null, id: "schema_endpoint:" + ep1 + ":transition",
+        intended_after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: "3".repeat(64) },
+        kind: "schema_endpoint", state: "prepared", target: "ledger/" + ep1 + "/ledger.json"
+      },
+      {
+        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "3".repeat(64),
+        before: { revision: 2, ledger_sha256: "3".repeat(64), null_b1_count: 5 },
+        chain: null, id: "mint:" + ep1,
+        intended_after: { revision: 3, ledger_sha256: "4".repeat(64), null_b1_count: 0 },
+        intended_blob: { path: "/tmp/maint/" + tok1 + ".staged/intended/mint-" + ep1 + ".json", bytes: 10, sha256: "5".repeat(64) },
+        kind: "mint", state: "prepared", target: "ledger/" + ep1 + "/ledger.json"
+      },
+      {
+        at: "2026-09-07T10:00:00.000Z", backup: null, backup_bytes: null, backup_sha256: null,
+        before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 },
+        chain: null, id: "writer_state:" + cid1 + ":partial",
+        intended_after: { exists: true, sha256: "6".repeat(64), state: "partial", campaign_id: cid1, endpoints_digest: endpointsDigest([ep1]), revision: 1 },
+        kind: "writer_state", state: "prepared", target: "ledger/owner-select-writer-state.json"
+      }
+    ]
+  };
+  assert.equal(journalProblem(docABase, { maintenanceDir: "/tmp/maint" }), null, "合法 A 文档状态链连贯");
+
+  const badDocAChainBroken = {
+    ...docABase,
+    steps: docABase.steps.map((s) => s.kind === "mint" ? { ...s, before: { ...s.before, revision: 99 } } : s)
+  };
+  assert.match(journalProblem(badDocAChainBroken, { maintenanceDir: "/tmp/maint" }), /schema_endpoint.*mint.*状态链/u, "A transition->mint 链断裂必拒");
+
+  // Codex 反例 2: B / direct 链断裂（precheck before ≠ schema before）
+  const docBBase = {
+    schema_version: "1.4",
+    operation_kind: "owner_select_migration_b",
+    phase: "osm_b_strictening",
+    reason: "B migration",
+    started_at: "2026-09-07T10:00:00.000Z",
+    updated_at: "2026-09-07T10:00:00.000Z",
+    token: tok1,
+    notes: [],
+    steps: [
+      ...enterSteps,
+      {
+        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "1".repeat(64),
+        before: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
+        chain: null, id: "campaign:" + cid1 + ":seal",
+        intended_after: { exists: true, sha256: "2".repeat(64), state: "sealed", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
+        kind: "campaign", state: "prepared", target: "ledger/owner-select-campaign.json"
+      },
+      {
+        at: "2026-09-07T10:00:00.000Z", backup: null, backup_bytes: null, backup_sha256: null,
+        before: { legacy_proof_count: 0, null_b1_count: 0, revision: 3, ledger_sha256: "4".repeat(64) },
+        chain: null, id: "precheck:" + ep1,
+        intended_after: { legacy_proof_count: 0, null_b1_count: 0, revision: 3, ledger_sha256: "4".repeat(64) },
+        kind: "precheck", state: "prepared", target: "ledger/" + ep1 + "/ledger.json"
+      },
+      {
+        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "4".repeat(64),
+        before: { schema_version: "1.1-transition", revision: 3, ledger_sha256: "4".repeat(64) },
+        chain: null, id: "schema_endpoint:" + ep1 + ":strict",
+        intended_after: { schema_version: "1.1", revision: 4, ledger_sha256: "5".repeat(64) },
+        kind: "schema_endpoint", state: "prepared", target: "ledger/" + ep1 + "/ledger.json"
+      },
+      {
+        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "2".repeat(64),
+        before: { exists: true, sha256: "2".repeat(64), state: "sealed", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
+        chain: null, id: "campaign:" + cid1 + ":complete",
+        intended_after: { exists: true, sha256: "6".repeat(64), state: "complete", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
+        kind: "campaign", state: "prepared", target: "ledger/owner-select-campaign.json"
+      },
+      {
+        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "7".repeat(64),
+        before: { exists: true, sha256: "7".repeat(64), state: "partial", campaign_id: cid1, endpoints_digest: endpointsDigest([ep1]), revision: 1 },
+        chain: null, id: "writer_state:" + cid1 + ":on",
+        intended_after: { exists: true, sha256: "8".repeat(64), state: "on", campaign_id: cid1, endpoints_digest: endpointsDigest([ep1]), revision: 2 },
+        kind: "writer_state", state: "prepared", target: "ledger/owner-select-writer-state.json"
+      }
+    ]
+  };
+  assert.equal(journalProblem(docBBase, { maintenanceDir: "/tmp/maint" }), null, "合法 B 文档状态链连贯");
+
+  const badDocBChainBroken = {
+    ...docBBase,
+    steps: docBBase.steps.map((s) => s.kind === "schema_endpoint" ? { ...s, before: { ...s.before, revision: 99 } } : s)
+  };
+  assert.match(journalProblem(badDocBChainBroken, { maintenanceDir: "/tmp/maint" }), /precheck.*schema_endpoint.*状态链/u, "B precheck->strict 链断裂必拒");
+
+  // Codex 反例 3: direct campaign 链断裂（seal.before ≠ open.intended_after, complete.before ≠ seal.intended_after）
+  const docDirectBase = {
+    schema_version: "1.4",
+    operation_kind: "owner_select_migration_direct",
+    phase: "osm_direct",
+    reason: "direct migration",
+    started_at: "2026-09-07T10:00:00.000Z",
+    updated_at: "2026-09-07T10:00:00.000Z",
+    token: tok1,
+    notes: [],
+    steps: [
+      ...enterSteps,
+      {
+        at: "2026-09-07T10:00:00.000Z", backup: null, backup_bytes: null, backup_sha256: null,
+        before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null },
+        chain: null, id: "campaign:" + cid1 + ":open",
+        intended_after: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
+        kind: "campaign", state: "prepared", target: "ledger/owner-select-campaign.json"
+      },
+      {
+        at: "2026-09-07T10:00:00.000Z", backup: null, backup_bytes: null, backup_sha256: null,
+        before: { legacy_proof_count: 0, null_b1_count: 0, revision: 1, ledger_sha256: "2".repeat(64) },
+        chain: null, id: "precheck:" + ep1,
+        intended_after: { legacy_proof_count: 0, null_b1_count: 0, revision: 1, ledger_sha256: "2".repeat(64) },
+        kind: "precheck", state: "prepared", target: "ledger/" + ep1 + "/ledger.json"
+      },
+      {
+        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "2".repeat(64),
+        before: { schema_version: "1.0", revision: 1, ledger_sha256: "2".repeat(64) },
+        chain: null, id: "schema_endpoint:" + ep1 + ":direct",
+        intended_after: { schema_version: "1.1", revision: 2, ledger_sha256: "3".repeat(64) },
+        kind: "schema_endpoint", state: "prepared", target: "ledger/" + ep1 + "/ledger.json"
+      },
+      {
+        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "1".repeat(64),
+        before: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
+        chain: null, id: "campaign:" + cid1 + ":seal",
+        intended_after: { exists: true, sha256: "4".repeat(64), state: "sealed", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
+        kind: "campaign", state: "prepared", target: "ledger/owner-select-campaign.json"
+      },
+      {
+        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "4".repeat(64),
+        before: { exists: true, sha256: "4".repeat(64), state: "sealed", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
+        chain: null, id: "campaign:" + cid1 + ":complete",
+        intended_after: { exists: true, sha256: "5".repeat(64), state: "complete", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
+        kind: "campaign", state: "prepared", target: "ledger/owner-select-campaign.json"
+      },
+      {
+        at: "2026-09-07T10:00:00.000Z", backup: null, backup_bytes: null, backup_sha256: null,
+        before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 },
+        chain: null, id: "writer_state:" + cid1 + ":on",
+        intended_after: { exists: true, sha256: "6".repeat(64), state: "on", campaign_id: cid1, endpoints_digest: endpointsDigest([ep1]), revision: 1 },
+        kind: "writer_state", state: "prepared", target: "ledger/owner-select-writer-state.json"
+      }
+    ]
+  };
+  assert.equal(journalProblem(docDirectBase, { maintenanceDir: "/tmp/maint" }), null, "合法 direct 文档状态链连贯");
+
+  const badDirectSealChain = {
+    ...docDirectBase,
+    steps: docDirectBase.steps.map((s) => s.id.endsWith(":seal") ? { ...s, before: { ...s.before, sha256: "9".repeat(64) } } : s)
+  };
+  assert.match(journalProblem(badDirectSealChain, { maintenanceDir: "/tmp/maint" }), /seal.*before.*open.*intended_after/u, "direct seal.before ≠ open.intended_after 必拒");
+
+  const badDirectCompleteChain = {
+    ...docDirectBase,
+    steps: docDirectBase.steps.map((s) => s.id.endsWith(":complete") ? { ...s, before: { ...s.before, sha256: "9".repeat(64) } } : s)
+  };
+  assert.match(journalProblem(badDirectCompleteChain, { maintenanceDir: "/tmp/maint" }), /complete.*before.*seal.*intended_after/u, "complete.before ≠ seal.intended_after 必拒");
+
+  // ----------------------------------------------------
+  // P1-5: direct 的 on 允许 before off + A 的 partial 必等 open 摘要
+  // ----------------------------------------------------
+  // direct 的 writer_state:on，before.state 必须是 off；若是 partial 则拒
+  const badDirectOnBeforePartial = {
+    ...docDirectBase,
+    steps: docDirectBase.steps.map((s) => s.id.startsWith("writer_state:") ? {
+      ...s,
+      backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "7".repeat(64),
+      before: { exists: true, sha256: "7".repeat(64), state: "partial", campaign_id: cid1, endpoints_digest: endpointsDigest([ep1]), revision: 1 }
+    } : s)
+  };
+  assert.match(journalProblem(badDirectOnBeforePartial, { maintenanceDir: "/tmp/maint" }), /direct.*writer_state.*off/u, "direct 的 on 要求 before 为 off");
+
+  // B 的 writer_state:on，before.state 必须是 partial；若是 off 则拒
+  const badBOnBeforeOff = {
+    ...docBBase,
+    steps: docBBase.steps.map((s) => s.id.startsWith("writer_state:") ? {
+      ...s,
+      backup: null, backup_bytes: null, backup_sha256: null,
+      before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 }
+    } : s)
+  };
+  assert.match(journalProblem(badBOnBeforeOff, { maintenanceDir: "/tmp/maint" }), /owner_select_migration_b.*writer_state.*partial/u, "B 的 on 要求 before 为 partial");
+
+  // ----------------------------------------------------
+  // P1-6: campaign 文件不变量 + pending_joins 5字段 + readOwnerSelectAdmission
+  // ----------------------------------------------------
+  // (a) campaignDocProblem complete 状态不变量：所有 member 必须 schema_version === "1.1" 且两计数为 0
+  const cDocCompleteValid = {
+    schema_version: "owner-select-campaign-1",
+    campaign_id: cid1,
+    state: "complete",
+    endpoints: eps,
+    endpoints_digest: dig,
+    pending_joins: [],
+    members: {
+      "endpoint_111111111111111111111111": { schema_version: "1.1", legacy_proof_count: 0, null_b1_count: 0 },
+      "endpoint_222222222222222222222222": { schema_version: "1.1", legacy_proof_count: 0, null_b1_count: 0 }
+    },
+    revision: 3,
+    origin_operation_id: tok1
+  };
+  assert.equal(campaignDocProblem(cDocCompleteValid), null, "complete 状态全 strict 成员通过");
+
+  const badCompleteMemberTransition = {
+    ...cDocCompleteValid,
+    members: {
+      ...cDocCompleteValid.members,
+      "endpoint_111111111111111111111111": { schema_version: "1.1-transition", legacy_proof_count: 0, null_b1_count: 0 }
+    }
+  };
+  assert.match(campaignDocProblem(badCompleteMemberTransition), /complete.*member.*1\.1/u, "complete 状态含 1.1-transition 成员必须拒绝");
+
+  const badCompleteMemberCount = {
+    ...cDocCompleteValid,
+    members: {
+      ...cDocCompleteValid.members,
+      "endpoint_222222222222222222222222": { schema_version: "1.1", legacy_proof_count: 1, null_b1_count: 0 }
+    }
+  };
+  assert.match(campaignDocProblem(badCompleteMemberCount), /complete.*member.*0/u, "complete 状态 member 计数非 0 必须拒绝");
+
+  // (b) pending_joins 5 字段封闭校验
+  const pjValid = {
+    endpoint_id: "endpoint_333333333333333333333333",
+    at: "2026-09-07T10:00:00.000Z",
+    init_chain: "chain-1",
+    init_request_key: "req-1",
+    init_operation_token: tok1
+  };
+  assert.equal(campaignDocProblem({ ...dummyDoc, pending_joins: [pjValid] }), null, "合法 5 字段 pending_joins");
+  assert.notEqual(campaignDocProblem({ ...dummyDoc, pending_joins: [{ endpoint_id: pjValid.endpoint_id, at: pjValid.at }] }), null, "缺少 init 字段的 pending_join 必拒");
+  assert.notEqual(campaignDocProblem({ ...dummyDoc, pending_joins: [{ ...pjValid, extra: "bad" }] }), null, "多余字段必拒");
+
+  // (c) readOwnerSelectAdmission 跨文件准入读取器正反测试
+  const admDir = path.join(tmpBase, "adm-ledger");
+  fs.mkdirSync(admDir, { mode: 0o700 });
+  const envAdm = { FEISHU_BRIDGE_LEDGER_DIR: admDir };
+  const cFile = path.join(admDir, "owner-select-campaign.json");
+  const wFile = path.join(admDir, "owner-select-writer-state.json");
+
+  // 1. off 分支正例：两文件皆缺席
+  assert.deepEqual(readOwnerSelectAdmission(envAdm), { state: "off" }, "两文件缺席返回 off");
+
+  // 2. off 分支正例：writer off 且 campaign 缺席
+  const wDocOff = {
+    schema_version: "owner-select-writer-state-1",
+    state: "off",
+    campaign_id: null,
+    endpoints_digest: null,
+    revision: 1,
+    origin_operation_id: tok1
+  };
+  fs.writeFileSync(wFile, JSON.stringify(wDocOff, null, 2) + "\n", { mode: 0o600 });
+  assert.deepEqual(readOwnerSelectAdmission(envAdm), { state: "off" }, "writer off 且 campaign 缺席返回 off");
+
+  // 3. off 反例：writer off 但 campaign 存在（不自洽）
+  fs.writeFileSync(cFile, JSON.stringify(dummyDoc, null, 2) + "\n", { mode: 0o600 });
+  assert.equal(readOwnerSelectAdmission(envAdm).state, "unreadable", "writer off 但 campaign open 不自洽");
+
+  // 4. partial 分支正例：writer partial 且 campaign open / sealed（同 id）
+  const wDocPartial = {
+    schema_version: "owner-select-writer-state-1",
+    state: "partial",
+    campaign_id: cid1,
+    endpoints_digest: dig,
+    revision: 2,
+    origin_operation_id: tok1
+  };
+  fs.writeFileSync(wFile, JSON.stringify(wDocPartial, null, 2) + "\n", { mode: 0o600 });
+  const admPartial = readOwnerSelectAdmission(envAdm);
+  assert.equal(admPartial.state, "partial", "writer partial 且 campaign open 返回 partial");
+  assert.equal(admPartial.campaign_id, cid1);
+
+  // 5. partial 反例：campaign complete 但 writer partial（不自洽）
+  fs.writeFileSync(cFile, JSON.stringify(cDocCompleteValid, null, 2) + "\n", { mode: 0o600 });
+  assert.equal(readOwnerSelectAdmission(envAdm).state, "unreadable", "campaign complete 但 writer partial 不自洽");
+
+  // 6. on 分支正例：writer on 且 campaign complete（同 id、同 digest、全 strict）
+  const wDocOn = {
+    schema_version: "owner-select-writer-state-1",
+    state: "on",
+    campaign_id: cid1,
+    endpoints_digest: dig,
+    revision: 3,
+    origin_operation_id: tok1
+  };
+  fs.writeFileSync(wFile, JSON.stringify(wDocOn, null, 2) + "\n", { mode: 0o600 });
+  const admOn = readOwnerSelectAdmission(envAdm);
+  assert.equal(admOn.state, "on", "writer on 且 campaign complete 返回 on");
+  assert.equal(admOn.campaign_id, cid1);
+  assert.equal(admOn.endpoints_digest, dig);
+
+  // 7. on 反例：campaign id 不匹配
+  const badIdCDoc = { ...cDocCompleteValid, campaign_id: "osc_99999999999999999999999999999999" };
+  fs.writeFileSync(cFile, JSON.stringify(badIdCDoc, null, 2) + "\n", { mode: 0o600 });
+  assert.equal(readOwnerSelectAdmission(envAdm).state, "unreadable", "campaign_id 不匹配返回 unreadable");
+
+  // 8. on 反例：digest 不匹配
+  fs.writeFileSync(cFile, JSON.stringify(cDocCompleteValid, null, 2) + "\n", { mode: 0o600 });
+  const badDigWDoc = { ...wDocOn, endpoints_digest: "f".repeat(64) };
+  fs.writeFileSync(wFile, JSON.stringify(badDigWDoc, null, 2) + "\n", { mode: 0o600 });
+  assert.equal(readOwnerSelectAdmission(envAdm).state, "unreadable", "endpoints_digest 不匹配返回 unreadable");
+
+  // 9. on 反例：campaign 缺席但 writer on
+  fs.unlinkSync(cFile);
+  assert.equal(readOwnerSelectAdmission(envAdm).state, "unreadable", "campaign 缺席但 writer on 返回 unreadable");
+
+  // ----------------------------------------------------
+  // P2: 六位年份必拒
+  // ----------------------------------------------------
+  const pj6Digit = {
+    ...pjValid,
+    at: "+010209-01-27T06:13:20.000Z"
+  };
+  assert.notEqual(campaignDocProblem({ ...dummyDoc, pending_joins: [pj6Digit] }), null, "六位年份 at 必须拒绝");
 });
 
 summarySealed = true;

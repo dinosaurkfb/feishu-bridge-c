@@ -410,6 +410,10 @@ intent 到期清理**；其余 W1/W2/正式 handle writer 全拒（九轮 P1-4�
 （首次离开 1.0），**不是**最近一笔——两阶段合法历史 `1.0→transition`(rev k) → `mint/reaffirm`(k+1…) →
 `transition→1.1`(rev m) 中，mint 位于第二笔升级之前仍合法。仍要求 ≤2 笔、to_schema 单调、末笔 to_schema===
 `doc.schema_version`；"初始即 transition 后再升 strict"路径同样以第一笔为边界。
+**零笔 schema_upgrade 的 1.1-transition / 1.1 账本是合法的（PR #133 三轮 Codex 裁定，不加"必含升级 op"守卫）**：
+campaign 期间新 endpoint 直接初始化为 transition、writer on 后新 endpoint 直接初始化为 strict，这两类账本诚实地没有
+升级历史，`upgradeBoundaryRevision=0`、全部 op 允许新形。若将来要证明初始 schema，把 `initial_schema_version` 纳入
+`initialize_shadow` 的 result/fingerprint 与维护收据，而不是伪造一笔升级。
 
 **存量范围（门外 reaffirm，§8.1）** = B3/B3′/B4/A4 携旧 pairing binding + A3 携旧 `f4_anchor` link
 + 对应 tombstone。**直升捷径的精确条件（八轮 P1-3；九轮 P1-3 独立成 kind）**：走 `owner_select_migration_direct`，其

@@ -405,6 +405,11 @@ intent 到期清理**；其余 W1/W2/正式 handle writer 全拒（九轮 P1-4�
 **过渡 runtime 允许集**：读 partial-transition / partial-strict 恢复态；旧形禁新 pairing 写；
 **W1/W2 writer 关到 `state===on`；`state===partial` 时只放行 `request_reaffirm` / 持有效 intent 的 `owner_select_reaffirm` / intent 清理**（否则
 门外 reaffirm 无法执行）；旧 runtime 绝不读 transition/strict（fail-closed）。
+**升级边界的精确定义（PR #133 二轮回带，纠正 §6/§8 此前'最近一笔'的措辞）**：新 op 与增量 result
+允许出现的边界 = **按 result_revision 排序后第一笔 `from_schema==="1.0"` 的 `schema_upgrade` 的 result_revision**
+（首次离开 1.0），**不是**最近一笔——两阶段合法历史 `1.0→transition`(rev k) → `mint/reaffirm`(k+1…) →
+`transition→1.1`(rev m) 中，mint 位于第二笔升级之前仍合法。仍要求 ≤2 笔、to_schema 单调、末笔 to_schema===
+`doc.schema_version`；"初始即 transition 后再升 strict"路径同样以第一笔为边界。
 
 **存量范围（门外 reaffirm，§8.1）** = B3/B3′/B4/A4 携旧 pairing binding + A3 携旧 `f4_anchor` link
 + 对应 tombstone。**直升捷径的精确条件（八轮 P1-3；九轮 P1-3 独立成 kind）**：走 `owner_select_migration_direct`，其

@@ -35782,6 +35782,100 @@ test("R51 schemaUpgrade：正路径（1.0→1.1-transition）+ strict 重盘 leg
   fs.rmSync(base, { recursive: true, force: true });
 });
 
+// R51 返修二：可复用夹具——build migration_a + transition + mint journal + active + gate + lease + ledger。
+function r51MintFixture({ doc, mintOverride = null }) {
+  const b = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r51-mig-"));
+  const ledgerRoot = path.join(b, "ledger"); fs.mkdirSync(ledgerRoot, { recursive: true, mode: 0o700 }); fs.chmodSync(ledgerRoot, 0o700);
+  const maintDir = path.join(b, "maintenance"); fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 }); fs.chmodSync(maintDir, 0o700);
+  const gateFile = path.join(b, "maintenance.gate");
+  const EP = "endpoint_" + "a".repeat(24), CH = "claude";
+  const env = { ...process.env, HOME: b, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };
+  const hx = (n) => String(n).repeat(64), taid = (h) => "ta_" + h.repeat(32), uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000", iso = (t) => new Date(t).toISOString();
+  const tok = uuid(9), at = iso(1700000000000); const CID = campaignIdFor(tok);
+  const epDir = path.join(ledgerRoot, EP); fs.mkdirSync(epDir, { recursive: true, mode: 0o700 }); fs.chmodSync(epDir, 0o700);
+  fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+  const curSha = TAL.sha256(Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8"));
+  const enterSteps = [{ kind: "timer", id: "timer:claude", state: "done", at, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } }, { kind: "timer", id: "timer:codex", state: "done", at, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } }, { kind: "stub", id: "stub:claude", state: "done", at, target: "versions/x", chain: null, before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null }, { kind: "stub", id: "stub:codex", state: "done", at, target: "stub", chain: null, before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null }, { kind: "current", id: "current:claude", state: "done", at, target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null }, { kind: "current", id: "current:codex", state: "done", at, target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null }, { kind: "gate", id: "gate", state: "done", at, target: "gate", chain: null, before: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, backup: null, backup_sha256: null, backup_bytes: null }];
+  const stagedDir = path.join(maintDir, tok + ".staged"); fs.mkdirSync(path.join(stagedDir, "intended"), { recursive: true, mode: 0o700 }); const stagedBackup = path.join(stagedDir, "backup.json"); fs.writeFileSync(stagedBackup, "{}", { mode: 0o600 });
+  const mintBlob = path.join(stagedDir, "intended", "mint-" + EP + ".json");
+  const o = mintOverride ? { path: mintBlob, bytes: mintOverride.bytes, sha256: mintOverride.sha256 } : { path: mintBlob, bytes: 1, sha256: "0".repeat(64) };
+  if (mintOverride) fs.writeFileSync(mintBlob, "x".repeat(mintOverride.bytes), { mode: 0o600 });
+  const steps = [...enterSteps, { kind: "campaign", id: "campaign:" + CID + ":open", state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null }, intended_after: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: CID, endpoints: [EP], endpoints_digest: endpointsDigest([EP]) } }, { kind: "schema_endpoint", id: "schema_endpoint:" + EP + ":transition", state: "done", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: stagedBackup, backup_sha256: "0".repeat(64), backup_bytes: 100, before: { schema_version: "1.0", revision: 1, ledger_sha256: "0".repeat(64) }, intended_after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: curSha }, after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: curSha } }, { kind: "mint", id: "mint:" + EP, state: "prepared", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: stagedBackup, backup_sha256: curSha, backup_bytes: 100, before: { revision: 2, null_b1_count: 1, ledger_sha256: curSha }, intended_after: { revision: 3, null_b1_count: 0, ledger_sha256: "2".repeat(64) }, intended_blob: o }, { kind: "writer_state", id: "writer_state:" + CID + ":partial", state: "prepared", at, target: "ledger/owner-select-writer-state.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 }, intended_after: { exists: true, sha256: "2".repeat(64), state: "partial", campaign_id: CID, endpoints_digest: endpointsDigest([EP]), revision: 1 } }];
+  const jdoc = { schema_version: "1.4", operation_kind: "owner_select_migration_a", reason: "fixture", started_at: at, updated_at: at, token: tok, notes: [], phase: "osm_a_upgrading", steps };
+  assert.equal(journalProblem(jdoc, { maintenanceDir: maintDir }), null, "fixture journal 自洽：" + journalProblem(jdoc, { maintenanceDir: maintDir }));
+  fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(jdoc, null, 2) + "\n", { mode: 0o600 });
+  try { fs.unlinkSync(path.join(maintDir, "active")); } catch {}
+  fs.symlinkSync(tok, path.join(maintDir, "active"));
+  createGate({ file: gateFile, reason: "fixture", token: tok, now: 1700000000000 });
+  acquireOperationLease({ dir: maintDir, token: tok });
+  return { b, env, tok, CID, curSha, EP, epDir, maintDir, gateFile, doc };
+}
+
+// R51 返修二：1.1-transition + 一个 null-B1 的账本文档（mint 场景）。
+function r51B1Doc(EP, uuid, taid, hx, iso) {
+  const b1 = taid("b"), cb = uuid(2), at = iso(1700000000000);
+  return { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: "claude", authority_mode: "shadow", revision: 2, operations: { [uuid(1)]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } }, [cb]: { op_type: "create_b1", terminal_kind: "create_b1", request_key: "req_cb", fingerprint: hx(2), result_revision: 2, result: { created_id: b1 } } }, records: { [b1]: { topic_agent_id: b1, kind: "live", chat_id: "oc_g", anchor_candidate: null, aliases: { root_om: "om_x", session_id: null }, binding_target: { runtime: "claude", project_root: "/p", claude_session_id: uuid(3) }, facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }, generation_lineage_id: "lin_1", origin_operation_id: cb, binding_proof: null, locator_link_proof_ref: null, created_at: at, updated_at: at, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null } } };
+}
+
+// 返修二刀 (a)：strict 不重盘 → precheck_failed（1.1-transition + null-B1；schema_endpoint:strict）。
+test("R51 返修二 (a)：strict 不重盘 → precheck_failed（migB 账本含 null-B1）", () => {
+  const uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000", taid = (h) => "ta_" + h.repeat(32), iso = (t) => new Date(t).toISOString(), hx = (n) => String(n).repeat(64);
+  const EP = "endpoint_" + "a".repeat(24);
+  const doc = r51B1Doc(EP, uuid, taid, hx, iso);
+  // 用 migB 夹具：schema_endpoint:strict + campaign:seal + precheck + campaign:complete + writer_state:on。
+  const b = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r51-migb-"));
+  const ledgerRoot = path.join(b, "ledger"); fs.mkdirSync(ledgerRoot, { recursive: true, mode: 0o700 }); fs.chmodSync(ledgerRoot, 0o700);
+  const maintDir = path.join(b, "maintenance"); fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 }); fs.chmodSync(maintDir, 0o700);
+  const gateFile = path.join(b, "maintenance.gate");
+  const env = { ...process.env, HOME: b, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };
+  const tok = uuid(9), at = iso(1700000000000); const CID = campaignIdFor(tok);
+  const epDir = path.join(ledgerRoot, EP); fs.mkdirSync(epDir, { recursive: true, mode: 0o700 }); fs.chmodSync(epDir, 0o700);
+  fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+  const curSha = TAL.sha256(Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8"));
+  const enterSteps = [{ kind: "timer", id: "timer:claude", state: "done", at, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } }, { kind: "timer", id: "timer:codex", state: "done", at, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } }, { kind: "stub", id: "stub:claude", state: "done", at, target: "versions/x", chain: null, before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null }, { kind: "stub", id: "stub:codex", state: "done", at, target: "stub", chain: null, before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null }, { kind: "current", id: "current:claude", state: "done", at, target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null }, { kind: "current", id: "current:codex", state: "done", at, target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null }, { kind: "gate", id: "gate", state: "done", at, target: "gate", chain: null, before: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, backup: null, backup_sha256: null, backup_bytes: null }];
+  const stagedDir = path.join(maintDir, tok + ".staged"); fs.mkdirSync(path.join(stagedDir, "intended"), { recursive: true, mode: 0o700 }); const stagedBackup = path.join(stagedDir, "backup.json"); fs.writeFileSync(stagedBackup, "{}", { mode: 0o600 });
+  const steps = [...enterSteps, { kind: "campaign", id: "campaign:" + CID + ":seal", state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, backup: stagedBackup, backup_sha256: "1".repeat(64), backup_bytes: 100, before: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: CID, endpoints: [EP], endpoints_digest: endpointsDigest([EP]) }, intended_after: { exists: true, sha256: "3".repeat(64), state: "sealed", campaign_id: CID, endpoints: [EP], endpoints_digest: endpointsDigest([EP]) } }, { kind: "precheck", id: "precheck:" + EP, state: "done", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { legacy_proof_count: 0, null_b1_count: 0, revision: 2, ledger_sha256: curSha }, intended_after: { legacy_proof_count: 0, null_b1_count: 0, revision: 2, ledger_sha256: curSha }, after: { legacy_proof_count: 0, null_b1_count: 0, revision: 2, ledger_sha256: curSha } }, { kind: "schema_endpoint", id: "schema_endpoint:" + EP + ":strict", state: "prepared", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: stagedBackup, backup_sha256: curSha, backup_bytes: 100, before: { schema_version: "1.1-transition", revision: 2, ledger_sha256: curSha }, intended_after: { schema_version: "1.1", revision: 3, ledger_sha256: "1".repeat(64) } }, { kind: "campaign", id: "campaign:" + CID + ":complete", state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, backup: stagedBackup, backup_sha256: "3".repeat(64), backup_bytes: 100, before: { exists: true, sha256: "3".repeat(64), state: "sealed", campaign_id: CID, endpoints: [EP], endpoints_digest: endpointsDigest([EP]) }, intended_after: { exists: true, sha256: "4".repeat(64), state: "complete", campaign_id: CID, endpoints: [EP], endpoints_digest: endpointsDigest([EP]) } }, { kind: "writer_state", id: "writer_state:" + CID + ":on", state: "prepared", at, target: "ledger/owner-select-writer-state.json", chain: null, backup: stagedBackup, backup_sha256: "2".repeat(64), backup_bytes: 100, before: { exists: true, sha256: "2".repeat(64), state: "partial", campaign_id: CID, endpoints_digest: endpointsDigest([EP]), revision: 1 }, intended_after: { exists: true, sha256: "5".repeat(64), state: "on", campaign_id: CID, endpoints_digest: endpointsDigest([EP]), revision: 2 } } ];
+  const jdoc = { schema_version: "1.4", operation_kind: "owner_select_migration_b", reason: "fixture", started_at: at, updated_at: at, token: tok, notes: [], phase: "osm_b_strictening", steps };
+  assert.equal(journalProblem(jdoc, { maintenanceDir: maintDir }), null, "migB fixture journal 自洽：" + journalProblem(jdoc, { maintenanceDir: maintDir }));
+  fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(jdoc, null, 2) + "\n", { mode: 0o600 });
+  try { fs.unlinkSync(path.join(maintDir, "active")); } catch {}
+  fs.symlinkSync(tok, path.join(maintDir, "active"));
+  createGate({ file: gateFile, reason: "fixture", token: tok, now: 1700000000000 });
+  acquireOperationLease({ dir: maintDir, token: tok });
+  const cap = { token: tok, kind: "schema_upgrade", endpointId: EP };
+  const res = TAL.schemaUpgrade({ endpointId: EP, capability: cap, requestKey: "req_sch", fromSchema: "1.1-transition", toSchema: "1.1", env });
+  assert.equal(res.ok, false, "strict precheck_failed：" + JSON.stringify(res)); assert.equal(res.reason, "precheck_failed", "reason：" + JSON.stringify(res));
+  fs.rmSync(b, { recursive: true, force: true });
+});
+
+// 返修二刀 (c)：读回 SHA 不核 → written_mismatch。篡改 plan.expected_ledger_sha256 一位 + journal blob 同步。
+test("R51 返修二 (c)：mint 读回 SHA 不核 → written_mismatch", () => {
+  const uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000", taid = (h) => "ta_" + h.repeat(32), iso = (t) => new Date(t).toISOString(), hx = (n) => String(n).repeat(64);
+  const EP = "endpoint_" + "a".repeat(24);
+  const doc = r51B1Doc(EP, uuid, taid, hx, iso);
+  const realPlan = TAL.buildMintPlan({ doc, token: uuid(9), campaignId: campaignIdFor(uuid(9)), endpointId: EP, requestKey: "req_mint", now: 1700000000000, ttlMs: 86400000 }).plan;
+  const tampered = { ...realPlan, expected_ledger_sha256: (realPlan.expected_ledger_sha256[0] === "0" ? "1" : "0") + realPlan.expected_ledger_sha256.slice(1) };
+  const tamperedBytes = TAL.mintPlanBytes(tampered); const tamperedSha = TAL.sha256(Buffer.from(tamperedBytes, "utf-8"));
+  const f = r51MintFixture({ doc, mintOverride: { bytes: Buffer.byteLength(tamperedBytes), sha256: tamperedSha } });
+  const res = TAL.mintSelectionHandles({ endpointId: EP, capability: { token: f.tok, kind: "mint_selection_handles", endpointId: EP, request_key: "req_mint" }, plan: tampered, env: f.env });
+  assert.equal(res.ok, false, "written_mismatch：" + JSON.stringify(res)); assert.equal(res.reason, "written_mismatch", "reason：" + JSON.stringify(res));
+  fs.rmSync(f.b, { recursive: true, force: true });
+});
+
+// 返修二刀 (d)：mint 前不核 null_b1_ids → precheck_failed（plan.expected_null_b1_ids 少一个 + journal blob 同步）。
+test("R51 返修二 (d)：mint 前 null_b1_ids 不核 → precheck_failed", () => {
+  const uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000", taid = (h) => "ta_" + h.repeat(32), iso = (t) => new Date(t).toISOString(), hx = (n) => String(n).repeat(64);
+  const EP = "endpoint_" + "a".repeat(24);
+  const doc = r51B1Doc(EP, uuid, taid, hx, iso);
+  const realPlan = TAL.buildMintPlan({ doc, token: uuid(9), campaignId: campaignIdFor(uuid(9)), endpointId: EP, requestKey: "req_mint", now: 1700000000000, ttlMs: 86400000 }).plan;
+  const tampered = { ...realPlan, expected_null_b1_ids: [], minted: [] };
+  const tamperedBytes = TAL.mintPlanBytes(tampered); const tamperedSha = TAL.sha256(Buffer.from(tamperedBytes, "utf-8"));
+  const f = r51MintFixture({ doc, mintOverride: { bytes: Buffer.byteLength(tamperedBytes), sha256: tamperedSha } });
+  const res = TAL.mintSelectionHandles({ endpointId: EP, capability: { token: f.tok, kind: "mint_selection_handles", endpointId: EP, request_key: "req_mint" }, plan: tampered, env: f.env });
+  assert.equal(res.ok, false, "precheck_failed：" + JSON.stringify(res)); assert.equal(res.reason, "precheck_failed", "reason：" + JSON.stringify(res));
+  fs.rmSync(f.b, { recursive: true, force: true });
+});
+
 
 summarySealed = true;
 

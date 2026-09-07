@@ -373,6 +373,12 @@ P1-2）：`campaign`/`writer_state`（文件态含 `exists`）同 sidecar——`
 | `precheck` / `precheck:<ep>` | 同上 ledger.json | `{ legacy_proof_count, null_b1_count, revision, ledger_sha256 }`；**只读核验 step**：before === intended_after === after 且两计数皆 0；任一非 0 → 本 step 不能 done → operation 不得推进（direct 则拒进段） | `<ep>` ∈ sealed 集（B）/ open 集（direct） | B/direct：每 ep 恰一条 | **仅 B / direct** |
 | `writer_state` / `writer_state:<campaign_id>:partial\|on` | `<bridge home>/ledger/owner-select-writer-state.json` | **判别联合**（十二轮 P2）：`exists===false` ⇒ `{ exists:false, sha256:null, state:"off", campaign_id:null, endpoints_digest:null, revision:0 }`（缺席投影=off）；`exists===true` ⇒ `{ exists:true, sha256:<64hex>, state:"off"\|"partial"\|"on", campaign_id:（state=off ⇒ null；否则 <id> 非 null）, endpoints_digest:（state=on ⇒ <64hex> === sealed 集摘要；partial ⇒ open 集当前摘要或 null；off ⇒ null）, revision:正整数、每次写 +1 }`；**partial**：before.state∈{off,on(退回)} → intended.state=partial；**on**：before.state=partial ∧ 本 operation `campaign:*:complete` 已 done → intended.state=on、digest=sealed 集摘要 | campaign_id/digest === 本 operation campaign step 的值；`revision` 单调 +1 | A：恰一条 `:partial`；B/direct：恰一条 `:on` | A(partial) / B(on) / direct(on) |
 
+**schema_upgrade 的确定性（R52 编排前置，回带 §6/§8.2）**：`schema_endpoint` step 的 `intended_after.ledger_sha256` 必须在**进 forward 段之前**算出并冻结
+（after === intended_after 逐字段），因此 `schema_upgrade` op 的 key 不能随机：`operation_id = uuid 形式化的 sha256(canonKey({ domain:"owner_select_schema_upgrade_v1", token, endpoint }))`
+（前 32 hex 按 8-4-4-4-12 排、版本位置 4、变体位置 8——与 OP_ID_SHAPE 相容），升版不改任何记录的 `updated_at`（只补显式 null），
+于是 `applySchemaUpgrade(beforeDoc, { operation_id, request_key, from, to })` 是纯函数，编排用它算 intended_after，执行器 `schemaUpgrade` 用同一函数产 next 并读回核等。
+`mint` 同理已由 plan 冻结 `operation_id`。
+
 **状态链闭合（PR #135 一轮 P1-4/P1-5/P1-6 回带；"步数闭合"之外还要"状态链闭合"）**：
 - 逐 endpoint：A 的 `schema_endpoint:<ep>:transition.intended_after.{revision,ledger_sha256}` **===** `mint:<ep>.before.{revision,ledger_sha256}`；
   B/direct 的 `precheck:<ep>.before.{revision,ledger_sha256}` **===** `schema_endpoint:<ep>:strict|direct.before.{revision,ledger_sha256}`。

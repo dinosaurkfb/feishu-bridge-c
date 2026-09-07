@@ -26,7 +26,7 @@ import { acquireOperationLease, addNote, clearActive, markStepDone, readActive, 
 import { readGate } from "../maintenance-gate-core.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
 import { applyMintPlan, applySchemaUpgrade, buildMintPlan, loadLedger, migrationInventory, mintPlanProblem, mintSelectionHandles, ownerSelectSchemaUpgradeOpId, resolveEndpointDir, schemaUpgrade, serializeLedger } from "../topic-agent-ledger.mjs";
-import { CAMPAIGN_SCHEMA, WRITER_STATE_SCHEMA, campaignIdFor, campaignPath, endpointsDigest, readCampaignState, readWriterState, writeCampaignState, writerStatePath, writeWriterState } from "./owner-select-state.mjs";
+import { CAMPAIGN_SCHEMA, WRITER_STATE_SCHEMA, campaignIdFor, campaignPath, endpointsDigest, readCampaignDocVerified, readCampaignState, readWriterState, writeCampaignState, writerStatePath, writeWriterState } from "./owner-select-state.mjs";
 import { endpointReceipt } from "./ledger-receipt.mjs";
 
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
@@ -107,7 +107,31 @@ function osmExitAction(phase) {
 }
 
 /** ── drained 只读前置（§二.2；失败留在 drained，rollbackSafe）── */
-function osmPrecheck(ctx, { token, env }) {
+export function osmPrecheck(ctx, { token, env, kind = "a" }) {
+  // R53 kind="b"：campaign 必须 open 且 pending_joins 空（id 取自文件）、writer partial 同 id、冻结集=文件 endpoints、
+  //   每 ep 1.1-transition 且当场重盘两计数皆 0（任一非 0 → precheck_failed，指明 ep 与计数——门外 reaffirm 未完成的信号）。
+  if (kind === "b") {
+    const csr = readCampaignDocVerified(env);
+    if (!csr.ok) return { ok: false, reason: "campaign_unreadable", why: csr.problem, rollbackSafe: true };
+    if (csr.absent) return { ok: false, reason: "campaign_not_open", why: "B 需 campaign open（先跑 --migrate-a）", rollbackSafe: true };
+    if (csr.doc.state !== "open") return { ok: false, reason: "campaign_not_open", why: "campaign state=" + csr.doc.state + "（B 需 open）", rollbackSafe: true };
+    if (csr.doc.pending_joins.length !== 0) return { ok: false, reason: "pending_joins_nonempty", why: "campaign pending_joins 非空（" + csr.doc.pending_joins.length + "），A 未完或约定中", rollbackSafe: true };
+    const cid = csr.doc.campaign_id;
+    const frozen = [...csr.doc.endpoints].sort();
+    if (frozen.length === 0) return { ok: false, reason: "campaign_no_endpoints", why: "campaign endpoints 为空", rollbackSafe: true };
+    const ws = readWriterState(env);
+    if (ws.state === "unreadable") return { ok: false, reason: "writer_state_unreadable", why: ws.problem, rollbackSafe: true };
+    if (!(ws.exists && ws.state === "partial" && ws.campaign_id === cid)) return { ok: false, reason: "writer_not_partial", why: "B 需 writer-state partial 且同 campaign_id（当前 state=" + ws.state + "）", rollbackSafe: true };
+    for (const ep of frozen) {
+      const d = resolveEndpointDir(ep, { env }); if (!d.ok) return { ok: false, reason: d.reason, why: ep + " 账本根定位失败", ep, rollbackSafe: true };
+      const L = loadLedger(d.dir, { endpointId: ep }); if (!L.ok) return { ok: false, reason: "ledger_unreadable", why: ep + "：" + (L.why ?? L.reason), ep, rollbackSafe: true };
+      if (L.doc.schema_version !== "1.1-transition") return { ok: false, reason: "schema_not_transition", why: ep + " schema_version=" + L.doc.schema_version + "（B 需 1.1-transition）", ep, rollbackSafe: true };
+      const inv = migrationInventory(L.doc);
+      if (inv.legacy_proof_count !== 0 || inv.null_b1_count !== 0) return { ok: false, reason: "precheck_failed", why: ep + "：legacy_proof_count=" + inv.legacy_proof_count + " null_b1_count=" + inv.null_b1_count + "（门外 reaffirm 未完成）", ep, rollbackSafe: true };
+    }
+    return { ok: true, frozen, cid };
+  }
+  // ── A 前置（零变化）──
   // 冻结集 = 全部有效初始化收据（initDone）的 endpoint，有序去重非空（§8：open 的初始集来源）。
   const agg = aggregateInitDone(ctx.dir);
   if (!agg.ok) return { ok: false, reason: "receipts_unreadable", why: agg.why };

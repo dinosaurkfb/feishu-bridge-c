@@ -32354,7 +32354,27 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
     // G11′ 6 字段不等式：binding 与 link 的 selection_handle 不一致
     const dBad6 = structuredClone(d);
     dBad6.records[taId1].locator_link_proof_ref.selection_handle = hOSH2;
-    assert.match(String(TAL.validateLedger(dBad6, { endpointId: EP }).why), /六字段等式|G11′|G13′/u, "binding 与 link 六字段不符拒");
+    assert.match(String(TAL.validateLedger(dBad6, { endpointId: EP }).why), /六字段等式/u, "binding 与 link 六字段不符拒 (selection_handle)");
+
+    // G11′ 6 字段不等式：selection_operation_id 不一致
+    const dBad6Op = structuredClone(d);
+    dBad6Op.records[taId1].locator_link_proof_ref.selection_operation_id = "00000000-0000-4000-8000-000000000099";
+    assert.match(String(TAL.validateLedger(dBad6Op, { endpointId: EP }).why), /六字段等式/u, "binding 与 link 六字段不符拒 (selection_operation_id)");
+
+    // G11′ 6 字段不等式：authorized_by 不一致
+    const dBad6Auth = structuredClone(d);
+    dBad6Auth.records[taId1].locator_link_proof_ref.authorized_by = "ou_other";
+    assert.match(String(TAL.validateLedger(dBad6Auth, { endpointId: EP }).why), /六字段等式/u, "binding 与 link 六字段不符拒 (authorized_by)");
+
+    // G11′ 6 字段不等式：authorized_at 不一致
+    const dBad6At = structuredClone(d);
+    dBad6At.records[taId1].locator_link_proof_ref.authorized_at = "2026-09-09T00:00:00.000Z";
+    assert.match(String(TAL.validateLedger(dBad6At, { endpointId: EP }).why), /六字段等式/u, "binding 与 link 六字段不符拒 (authorized_at)");
+
+    // G11′ 6 字段不等式：selected_root_om 不一致
+    const dBad6Om = structuredClone(d);
+    dBad6Om.records[taId1].locator_link_proof_ref.selected_root_om = "om_other";
+    assert.match(String(TAL.validateLedger(dBad6Om, { endpointId: EP }).why), /六字段等式/u, "binding 与 link 六字段不符拒 (selected_root_om)");
   }
 
   // ── 5. G13′ 校验（produced vs preserved）──

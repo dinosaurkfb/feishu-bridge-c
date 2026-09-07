@@ -61,7 +61,7 @@ const MATCHED_FIELDS = ["chat_id", "sender", "body", "thread_root"];
 /* P1-1-d 判别联合（Codex 裁定 d）：binding_token_v1（token 证明，四维）vs owner_root_no_token_v1（无码 owner-root 配对，三维）。
    两套都合法、都可独立验证；G15 按 pending_token_state 分支精确校验，禁止通用"部分 matched_fields"与任何 unverified 占位。 */
 const F4_NO_TOKEN_FIELDS = ["chat_id", "sender", "thread_root"];
-const OP_TYPES = ["initialize_shadow", "create_a1", "create_b1", "seed", "activate", "void", "attach_a2", "attach_a3", "anchor", "restore", "unbind", "retarget", "rebind_session_alias", "authority_cutover", "migrate_seed", "migrate_repair"];
+const OP_TYPES = ["initialize_shadow", "create_a1", "create_b1", "seed", "activate", "void", "attach_a2", "attach_a3", "anchor", "restore", "unbind", "retarget", "rebind_session_alias", "authority_cutover", "migrate_seed", "migrate_repair", "schema_upgrade", "request_rebind", "clear_anchor_handle", "reissue_selection_handle", "expire_rebind_handle", "cancel_rebind", "mint_selection_handles", "owner_select_reaffirm"];
 // migrate_repair 的 from_family / to_family 值域（§5.1 判别联合：B1→B1；{B3,B3',B4}→{B3,B3',B4}）
 const MIGRATE_FAMILIES = ["B1", "B3", "B3'", "B4"];
 
@@ -436,8 +436,8 @@ export function liveProblem(rec, id, schema = SCHEMA_VERSION) {
     const bp = bindingProofProblem(rec.binding_proof); if (bp) return bp;
     const kind = rec.binding_proof.kind;
     const okKind = (fam === "A2" || fam === "A3") ? (kind === "attach" || kind === "retarget")
-      : (fam === "B3" || fam === "B3'" || fam === "B4") ? (kind === "pairing" || kind === "retarget" || kind === "migrated")
-        : (fam === "A4") ? (kind === "attach" || kind === "pairing" || kind === "retarget" || kind === "migrated") : false;
+      : (fam === "B3" || fam === "B3'" || fam === "B4") ? (kind === "pairing" || kind === "retarget" || kind === "migrated" || kind === "owner_select_v1")
+        : (fam === "A4") ? (kind === "attach" || kind === "pairing" || kind === "retarget" || kind === "migrated" || kind === "owner_select_v1") : false;
     if (!okKind) return "binding_proof.kind 与族不匹配";
   }
   if ((f.locator_link_proof === "present") !== (rec.locator_link_proof_ref !== null)) return "locator_link_proof 与 ref 不一致";
@@ -506,6 +506,14 @@ function opTouchedIds(op) {
     case "unbind": return r.affected_id == null ? [] : [r.affected_id];
     case "retarget": return Array.isArray(r.affected_ids) ? r.affected_ids : [];
     case "rebind_session_alias": return r.affected_id == null ? [] : [r.affected_id];
+    case "request_rebind":
+    case "clear_anchor_handle":
+    case "reissue_selection_handle":
+    case "expire_rebind_handle":
+    case "cancel_rebind":
+    case "owner_select_reaffirm": return Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : [];
+    case "mint_selection_handles": return Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : [];
+    case "schema_upgrade": return [];
     case "migrate_seed": return Array.isArray(r.seeded) ? r.seeded.map((s) => s.topic_agent_id) : [];
     case "migrate_repair": return r.repaired_id == null ? [] : [r.repaired_id];
     default: return [];
@@ -629,6 +637,14 @@ const resultUnionWithHandle = (baseKeySet, baseFn, extKeySet, extFn, handleField
 // ext2：扩展变体在基线布尔之上再叠加 affected + proof_effects 形状。
 const ext2 = (baseOk) => (r) => baseOk(r) && affectedOk(r.affected_live_ids_after_commit) && proofEffectsOk(r.proof_effects);
 
+// R48 §6 新 op 共享形状：tombstone_remap（reaffirm）——旧 tomb id 有序 + 新 proof_ref（owner_select_merge_v1）。
+const tombRemapOk = (a) => Array.isArray(a) && a.every((t) => isObj(t) && isId(t.old_tomb_id) && isObj(t.new_proof_ref) && t.new_proof_ref.kind === "owner_select_merge_v1" && isOperationId(t.new_proof_ref.selection_operation_id) && typeof t.new_proof_ref.selected_root_om === "string" && OM_SHAPE.test(t.new_proof_ref.selected_root_om) && SELECTION_HANDLE_SHAPE.test(t.new_proof_ref.selection_handle)) && a.every((t, i) => i === 0 || a[i - 1].old_tomb_id < t.old_tomb_id);
+// R48 §6 cleared 判别联合：clear_anchor_handle 清 selection_handle+handle_expires_at；expire/cancel_rebind 清 rebind_handle+rebind_expires_at。
+const clearedOk = (r, expected) => Array.isArray(r.cleared) && r.cleared.length === 2 && r.cleared[0] === expected[0] && r.cleared[1] === expected[1];
+// R48 §6 owner_select_reaffirm 两闭支（produced 带 new_binding_proof；preserved 无）。
+const newLinkOk = (r) => !linkProofProblem(r.new_link_proof);
+const messageIdOk = (v) => typeof v === "string" && v.length > 0 && !/[\u0000-\u001f]/u.test(v);
+
 const RESULT_SHAPE = Object.freeze({
   initialize_shadow: (r) => keysOf(r) === "revision" && r.revision === 1,
   create_a1: (r) => keysOf(r) === "created_id" && isId(r.created_id),
@@ -645,6 +661,32 @@ const RESULT_SHAPE = Object.freeze({
   rebind_session_alias: resultUnion("affected_id,authorized_at,authorized_by,new_session_id,old_session_id", (r) => isId(r.affected_id) && AILY_SESSION_SHAPE.test(r.old_session_id) && AILY_SESSION_SHAPE.test(r.new_session_id) && r.old_session_id !== r.new_session_id && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at), "affected_id,affected_live_ids_after_commit,authorized_at,authorized_by,new_session_id,old_session_id,proof_effects", (r) => isId(r.affected_id) && AILY_SESSION_SHAPE.test(r.old_session_id) && AILY_SESSION_SHAPE.test(r.new_session_id) && r.old_session_id !== r.new_session_id && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at) && proofEffectsOk(r.proof_effects)),
   migrate_seed: (r) => keysOf(r) === "authorized_at,authorized_by,seeded" && typeof r.authorized_by === "string" && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at) && Array.isArray(r.seeded) && r.seeded.every((s) => isObj(s) && isId(s.topic_agent_id) && typeof s.legacy_source_digest === "string" && SHA_SHAPE.test(s.legacy_source_digest)) && r.seeded.every((s, i) => i === 0 || r.seeded[i - 1].topic_agent_id < s.topic_agent_id),
   migrate_repair: (r) => keysOf(r) === "authorized_at,authorized_by,expected_projection_digest,from_family,legacy_source_digest,next_projection_digest,repaired_id,to_family" && isId(r.repaired_id) && typeof r.authorized_by === "string" && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at) && [r.expected_projection_digest, r.next_projection_digest, r.legacy_source_digest].every((s) => typeof s === "string" && SHA_SHAPE.test(s)) && MIGRATE_FAMILIES.includes(r.from_family) && MIGRATE_FAMILIES.includes(r.to_family) && (r.from_family === "B1" ? r.to_family === "B1" : r.to_family !== "B1"),
+  request_rebind: (r) => keysOf(r) === "affected_live_ids_after_commit,proof_effects,rebind_expires_at,rebind_handle" && REBIND_HANDLE_SHAPE.test(r.rebind_handle) && isCanonicalIso(r.rebind_expires_at) && affectedOk(r.affected_live_ids_after_commit) && proofEffectsOk(r.proof_effects),
+  clear_anchor_handle: (r) => keysOf(r) === "affected_live_ids_after_commit,cleared,proof_effects" && clearedOk(r, ["selection_handle", "handle_expires_at"]) && affectedOk(r.affected_live_ids_after_commit) && proofEffectsOk(r.proof_effects),
+  expire_rebind_handle: (r) => keysOf(r) === "affected_live_ids_after_commit,cleared,proof_effects" && clearedOk(r, ["rebind_handle", "rebind_expires_at"]) && affectedOk(r.affected_live_ids_after_commit) && proofEffectsOk(r.proof_effects),
+  cancel_rebind: (r) => keysOf(r) === "affected_live_ids_after_commit,cleared,proof_effects" && clearedOk(r, ["rebind_handle", "rebind_expires_at"]) && affectedOk(r.affected_live_ids_after_commit) && proofEffectsOk(r.proof_effects),
+  reissue_selection_handle: (r) => {
+    const k = keysOf(r);
+    if (k === "affected_live_ids_after_commit,new_expires_at,new_handle,proof_effects") return SELECTION_HANDLE_SHAPE.test(r.new_handle) && isCanonicalIso(r.new_expires_at) && affectedOk(r.affected_live_ids_after_commit) && proofEffectsOk(r.proof_effects);
+    if (k === "affected_live_ids_after_commit,anchor_candidate,new_expires_at,new_handle,proof_effects") return SELECTION_HANDLE_SHAPE.test(r.new_handle) && isCanonicalIso(r.new_expires_at) && typeof r.anchor_candidate === "string" && OM_SHAPE.test(r.anchor_candidate) && affectedOk(r.affected_live_ids_after_commit) && proofEffectsOk(r.proof_effects);
+    return false;
+  },
+  mint_selection_handles: (r) => {
+    if (keysOf(r) !== "affected_live_ids_after_commit,endpoint,minted,proof_effects") return false;
+    if (typeof r.endpoint !== "string" || !ENDPOINT_SHAPE.test(r.endpoint)) return false;
+    if (!Array.isArray(r.minted) || !r.minted.every((m) => isObj(m) && isId(m.target_id) && SELECTION_HANDLE_SHAPE.test(m.selection_handle) && isCanonicalIso(m.handle_expires_at))) return false;
+    if (!r.minted.every((m, i) => i === 0 || r.minted[i - 1].target_id < m.target_id)) return false;
+    if (!affectedOk(r.affected_live_ids_after_commit) || !proofEffectsOk(r.proof_effects)) return false;
+    const mintedT = r.minted.map((m) => m.target_id);
+    return mintedT.length === r.affected_live_ids_after_commit.length && mintedT.every((t, i) => t === r.affected_live_ids_after_commit[i]);
+  },
+  owner_select_reaffirm: (r) => {
+    const k = keysOf(r);
+    if (k === "affected_live_ids_after_commit,new_binding_proof,new_link_proof,proof_effects,selection_message_id,target_id,tombstone_remap") return isId(r.target_id) && affectedOk(r.affected_live_ids_after_commit) && proofEffectsOk(r.proof_effects) && tombRemapOk(r.tombstone_remap) && !bindingProofProblem(r.new_binding_proof) && newLinkOk(r) && messageIdOk(r.selection_message_id);
+    if (k === "affected_live_ids_after_commit,new_link_proof,proof_effects,selection_message_id,target_id,tombstone_remap") return isId(r.target_id) && affectedOk(r.affected_live_ids_after_commit) && proofEffectsOk(r.proof_effects) && tombRemapOk(r.tombstone_remap) && newLinkOk(r) && messageIdOk(r.selection_message_id);
+    return false;
+  },
+  schema_upgrade: (r) => keysOf(r) === "endpoint,from_schema,to_schema" && typeof r.endpoint === "string" && ENDPOINT_SHAPE.test(r.endpoint) && SCHEMA_VERSIONS.includes(r.from_schema) && SCHEMA_VERSIONS.includes(r.to_schema) && r.from_schema !== r.to_schema,
   authority_cutover: (r) => keysOf(r) === "bijection_digest,endpoint_id,expiry_sha256,pending_claims_sha256,policy_sha256,pre_cutover_ledger_sha,revision_at_cutover"
     && Number.isInteger(r.revision_at_cutover) && r.revision_at_cutover >= 1
     && typeof r.endpoint_id === "string" && ENDPOINT_SHAPE.test(r.endpoint_id)
@@ -717,6 +759,13 @@ function opConsistentWithRecord(op, id, rec) {
       if (bp.legacy_source_digest !== lp.legacy_source_digest || r.legacy_source_digest !== bp.legacy_source_digest) return false;
       return bp.authorized_by === r.authorized_by && bp.authorized_at === r.authorized_at;
     }
+    // R48 §6 新 op：不产生记录 / 保留类（族不变，仅改 handle 或重签 proof）。
+    case "schema_upgrade": return false;
+    case "request_rebind": case "expire_rebind_handle": case "cancel_rebind": return rec.kind === "live" && r.affected_live_ids_after_commit.includes(id) && fam === "B3";
+    case "clear_anchor_handle": return rec.kind === "live" && r.affected_live_ids_after_commit.includes(id) && fam === "A2";
+    case "reissue_selection_handle": return rec.kind === "live" && r.affected_live_ids_after_commit.includes(id) && (fam === "B1" || fam === "A2");
+    case "mint_selection_handles": return rec.kind === "live" && r.affected_live_ids_after_commit.includes(id) && fam === "B1";
+    case "owner_select_reaffirm": return rec.kind === "live" && r.affected_live_ids_after_commit.includes(id);
     default: return false;
   }
 }

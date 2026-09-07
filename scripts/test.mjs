@@ -32969,6 +32969,85 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
       anchor_candidate: "om_candRecDrift", selection_handle: hOSH1, handle_expires_at: ISO, rebind_handle: null, rebind_expires_at: null
     };
     assert.equal(TAL.validateLedger(dMintCandDrift, { endpointId: EP }).ok, false, "A2 记录与 mint_selection_handles 候选漂移必拒");
+
+    // ── P1-4 返修：reaffirm tombstone 绑定本次 new_link_proof 与 reaffirm op id ──
+
+    // 基础合法 reaffirm doc
+    const mkReaffirmBase = () => {
+      const d = mkBaseDoc("1.1");
+      d.revision = 3;
+      d.operations[opId1] = {
+        op_type: "activate",
+        terminal_kind: "activate",
+        request_key: "rk_act_base",
+        fingerprint: "7".repeat(64),
+        result_revision: 2,
+        result: {
+          surviving_id: taId1, tombstoned_id: taId2, demoted_historical_id: null,
+          authorized_by: "ou_owner1", authorized_at: ISO,
+          selected_session_id: "sess_1", selected_root_om: "om_root1",
+          selection_handle: hOSH1, selection_operation_id: opId1, selection_message_id: "om_msg1", selection_basis: "explicit_handle",
+          affected_live_ids_after_commit: [taId1],
+          proof_effects: [{ topic_agent_id: taId1, binding_effect: "produced", link_effect: "produced" }]
+        }
+      };
+      d.operations[opId2] = {
+        op_type: "owner_select_reaffirm",
+        terminal_kind: "owner_select_reaffirm",
+        request_key: "rk_reaff_base",
+        fingerprint: "8".repeat(64),
+        result_revision: 3,
+        result: {
+          target_id: taId1,
+          affected_live_ids_after_commit: [taId1],
+          proof_effects: [{ topic_agent_id: taId1, binding_effect: "produced", link_effect: "produced" }],
+          new_binding_proof: { kind: "owner_select_v1", authorized_by: "ou_owner1", authorized_at: ISO, selected_session_id: "sess_1", selected_root_om: "om_root1", selection_handle: hRFH1, selection_operation_id: opId2 },
+          new_link_proof: { by_identity: "owner_authorization", kind: "owner_selected_route_v1", authorized_by: "ou_owner1", authorized_at: ISO, selected_session_id: "sess_1", selected_root_om: "om_root1", selection_handle: hRFH1, selection_operation_id: opId2 },
+          selection_message_id: "om_msg1",
+          tombstone_remap: [{ old_tomb_id: taId2, new_proof_ref: { kind: "owner_select_merge_v1", selected_root_om: "om_root1", selection_handle: hRFH1, selection_operation_id: opId2 } }]
+        }
+      };
+      d.records[taId1] = {
+        kind: "live", topic_agent_id: taId1, chat_id: "oc_chat1", created_at: ISO, updated_at: ISO, origin_operation_id: opId2,
+        facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+        aliases: { session_id: "sess_1", root_om: "om_root1" }, binding_target: TGT,
+        binding_proof: { kind: "owner_select_v1", authorized_by: "ou_owner1", authorized_at: ISO, selected_session_id: "sess_1", selected_root_om: "om_root1", selection_handle: hRFH1, selection_operation_id: opId2 },
+        locator_link_proof_ref: { kind: "owner_selected_route_v1", by_identity: "owner_authorization", authorized_by: "ou_owner1", authorized_at: ISO, selected_session_id: "sess_1", selected_root_om: "om_root1", selection_handle: hRFH1, selection_operation_id: opId2 },
+        generation_lineage_id: "lin_1", anchor_candidate: null, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null
+      };
+      d.records[taId2] = {
+        kind: "forwarding_tombstone", topic_agent_id: taId2, forwards_to: taId1, merged_at: ISO, origin_operation_id: opId2,
+        proof_ref: { kind: "owner_select_merge_v1", selected_root_om: "om_root1", selection_handle: hRFH1, selection_operation_id: opId2 }
+      };
+      return d;
+    };
+
+    // 0. 正向放行
+    assert.equal(TAL.validateLedger(mkReaffirmBase(), { endpointId: EP }).ok, true, "合法 reaffirm doc 放行");
+
+    // 1. selected_root_om 与 new_link_proof.selected_root_om 不一致 → 拒
+    const dReaffBadOm = mkReaffirmBase();
+    dReaffBadOm.operations[opId2].result.tombstone_remap[0].new_proof_ref.selected_root_om = "om_root2";
+    dReaffBadOm.records[taId2].proof_ref.selected_root_om = "om_root2";
+    assert.equal(TAL.validateLedger(dReaffBadOm, { endpointId: EP }).ok, false, "reaffirm tombstone selected_root_om 漂移必拒");
+
+    // 2. selection_operation_id 不等于本 reaffirm op key → 拒
+    const dReaffBadOpId = mkReaffirmBase();
+    dReaffBadOpId.operations[opId2].result.tombstone_remap[0].new_proof_ref.selection_operation_id = opId1;
+    dReaffBadOpId.records[taId2].proof_ref.selection_operation_id = opId1;
+    assert.equal(TAL.validateLedger(dReaffBadOpId, { endpointId: EP }).ok, false, "reaffirm tombstone selection_operation_id 不等于本 op key 必拒");
+
+    // 3. selection_handle 与 new_link_proof.selection_handle 不一致 → 拒
+    const dReaffBadH = mkReaffirmBase();
+    const hRFH2 = "rfh_" + "5".repeat(32);
+    dReaffBadH.operations[opId2].result.tombstone_remap[0].new_proof_ref.selection_handle = hRFH2;
+    dReaffBadH.records[taId2].proof_ref.selection_handle = hRFH2;
+    assert.equal(TAL.validateLedger(dReaffBadH, { endpointId: EP }).ok, false, "reaffirm tombstone selection_handle 漂移必拒");
+
+    // 4. old_tomb_id 指向非 tombstone 记录 → 拒
+    const dReaffNotTomb = mkReaffirmBase();
+    dReaffNotTomb.operations[opId2].result.tombstone_remap[0].old_tomb_id = taId1; // 指向 live 记录
+    assert.equal(TAL.validateLedger(dReaffNotTomb, { endpointId: EP }).ok, false, "reaffirm old_tomb_id 指向非 tombstone 记录必拒");
   }
 
   // ── 6. G15′ 校验（1.1 strict 拒旧形 ∧ handle 前缀绑定）──

@@ -956,6 +956,28 @@ export function validateLedger(doc, { endpointId } = {}) {
     if (op.result?.selection_operation_id && op.result.selection_operation_id !== opId) {
       return bad("operation " + opId + " 的 selection_operation_id 必须等于本 operation key");
     }
+    if (op.op_type === "owner_select_reaffirm") {
+      if (op.result?.new_link_proof?.selection_operation_id !== opId) {
+        return bad("reaffirm new_link_proof selection_operation_id 必须等于本 operation key");
+      }
+      if (Array.isArray(op.result?.tombstone_remap)) {
+        for (const m of op.result.tombstone_remap) {
+          if (m.new_proof_ref?.selected_root_om !== op.result.new_link_proof.selected_root_om) {
+            return bad("reaffirm tombstone_remap selected_root_om 必须等于 new_link_proof.selected_root_om");
+          }
+          if (m.new_proof_ref?.selection_handle !== op.result.new_link_proof.selection_handle) {
+            return bad("reaffirm tombstone_remap selection_handle 必须等于 new_link_proof.selection_handle");
+          }
+          if (m.new_proof_ref?.selection_operation_id !== opId) {
+            return bad("reaffirm tombstone_remap selection_operation_id 必须等于本 operation key");
+          }
+          const targetRec = doc.records[m.old_tomb_id];
+          if (!targetRec || targetRec.kind !== "forwarding_tombstone") {
+            return bad("reaffirm tombstone_remap old_tomb_id 必须为已存在的 forwarding_tombstone 记录：" + m.old_tomb_id);
+          }
+        }
+      }
+    }
     if (op.op_type === "initialize_shadow") initCount += 1;
     if (revSeen.has(op.result_revision)) return bad("result_revision 重复（G12）：" + op.result_revision);
     revSeen.add(op.result_revision);
@@ -1253,6 +1275,11 @@ export function validateLedger(doc, { endpointId } = {}) {
           remap.new_proof_ref.selection_handle !== rec.proof_ref.selection_handle ||
           remap.new_proof_ref.selection_operation_id !== rec.proof_ref.selection_operation_id) {
         return bad(id + "：reaffirm tombstone_remap 与 tombstone proof_ref 不一致（G13-tomb）");
+      }
+      if (rec.proof_ref.selected_root_om !== r.new_link_proof?.selected_root_om ||
+          rec.proof_ref.selection_handle !== r.new_link_proof?.selection_handle ||
+          rec.proof_ref.selection_operation_id !== rec.origin_operation_id) {
+        return bad(id + "：reaffirm tombstone proof_ref 与 new_link_proof 不一致（G13-tomb）");
       }
     }
   }

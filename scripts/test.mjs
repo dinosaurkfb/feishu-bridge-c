@@ -36164,7 +36164,7 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
     const records = {};
     for (const id of liveIds) {
       records[id] = {
-        kind: "live", topic_agent_id: id, chat_id: "oc_r52_" + id.slice(3, 9), created_at: T052, updated_at: T052, origin_operation_id: seedOp,
+        kind: "live", topic_agent_id: id, chat_id: "oc_r52" + id.slice(3, 11), created_at: T052, updated_at: T052, origin_operation_id: seedOp,
         aliases: { session_id: null, root_om: "om_r52" + id.slice(3, 11) }, anchor_candidate: null,
         binding_target: { runtime: "claude", project_root: "/p/r52", claude_session_id: "00000000-0000-4000-8000-" + id.slice(3, 15).padEnd(12, "0") },
         generation_lineage_id: "lin-r52" + id.slice(3, 11), binding_proof: null, locator_link_proof_ref: null,

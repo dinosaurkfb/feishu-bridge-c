@@ -32143,6 +32143,29 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
       generation_lineage_id: "lin_1", anchor_candidate: null, selection_handle: hOSH1, handle_expires_at: ISO, rebind_handle: null, rebind_expires_at: null
     };
     assert.equal(TAL.validateLedger(dBeforeBoundary, { endpointId: EP }).ok, false, "升级边界之前出现增量 result 拒");
+
+    // 返修三 P1-1 (f): 合法历史 rev2: 1.0→transition、rev3: mint(空)、rev4: transition→1.1 → 放行
+    //（边界 = 首次离开 1.0 的那笔 schema_upgrade，不是最近一笔；mint 在两笔升级之间必须可达成）
+    const opId3 = "00000000-0000-4000-8000-000000000004";
+    const dTwoUpg = mkBaseDoc("1.0");
+    dTwoUpg.revision = 4;
+    dTwoUpg.operations[opId1] = {
+      op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "rk_u_first",
+      fingerprint: "7".repeat(64), result_revision: 2,
+      result: { endpoint: EP, from_schema: "1.0", to_schema: "1.1-transition" }
+    };
+    dTwoUpg.operations[opId2] = {
+      op_type: "mint_selection_handles", terminal_kind: "mint_selection_handles", request_key: "rk_m_mid",
+      fingerprint: "8".repeat(64), result_revision: 3,
+      result: { endpoint: EP, minted: [], affected_live_ids_after_commit: [], proof_effects: [] }
+    };
+    dTwoUpg.operations[opId3] = {
+      op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "rk_u_second",
+      fingerprint: "9".repeat(64), result_revision: 4,
+      result: { endpoint: EP, from_schema: "1.1-transition", to_schema: "1.1" }
+    };
+    dTwoUpg.schema_version = "1.1";
+    assert.equal(TAL.validateLedger(dTwoUpg, { endpointId: EP }).ok, true, "两笔升级夹 mint 的合法历史在 strict 账本放行");
   }
 
   // ── 2. Live 记录四 handle 字段（1.0 缺席 vs 1.1 必在场 & 跨字段联合）──

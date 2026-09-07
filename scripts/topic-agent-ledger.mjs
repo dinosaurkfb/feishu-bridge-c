@@ -948,7 +948,10 @@ export function validateLedger(doc, { endpointId } = {}) {
       }
     }
   }
-  const upgradeBoundaryRevision = upgradeOps.length > 0 ? upgradeOps[upgradeOps.length - 1].result_revision : 0;
+  // 升级边界 = 首次离开 1.0 的那笔 schema_upgrade（按 result_revision 排序后第一笔 from_schema==="1.0"）；
+  // 之后的 op 才允许新形/增量 result —— 合法历史 1.0→transition→mint→1.1 里夹在两笔升级间的 op 也要放行。
+  const firstLeave10 = upgradeOps.find((u) => u.result?.from_schema === "1.0");
+  const upgradeBoundaryRevision = firstLeave10 ? firstLeave10.result_revision : 0;
 
   let initCount = 0;
   const revSeen = new Set(), fpSeen = new Set(), rkSeen = new Set();

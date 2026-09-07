@@ -228,11 +228,16 @@ function stepProblem(s) {
   if (!STEP_KINDS.includes(s.kind)) return "step kind 不在受控集合里";
   // M1b T4 返修 P1-2：sidecar 精确键集按 state 两态（maintenance-gate.md 阶段表）——
   // prepared = 11 键（无 after 无 chain）；done = prepared ∪ {after}。state 不是这两态 → 两套键集都不匹配即拒。
+  const isNewOs = NEW_STEP_KINDS.includes(s.kind);
   const wantKeys = s.kind === "sidecar"
     ? (s.state === "done"
         ? "after,at,backup,backup_bytes,backup_sha256,before,id,intended_after,intended_blob,kind,state,target"
         : "at,backup,backup_bytes,backup_sha256,before,id,intended_after,intended_blob,kind,state,target")
-    : "after,at,backup,backup_bytes,backup_sha256,before,chain,id,intended_after,kind,state,target";
+    : isNewOs
+      ? (s.state === "done"
+          ? (s.kind === "mint" ? "after,at,backup,backup_bytes,backup_sha256,before,chain,id,intended_after,intended_blob,kind,state,target" : "after,at,backup,backup_bytes,backup_sha256,before,chain,id,intended_after,kind,state,target")
+          : (s.kind === "mint" ? "at,backup,backup_bytes,backup_sha256,before,chain,id,intended_after,intended_blob,kind,state,target" : "at,backup,backup_bytes,backup_sha256,before,chain,id,intended_after,kind,state,target"))
+      : "after,at,backup,backup_bytes,backup_sha256,before,chain,id,intended_after,kind,state,target";
   if (keysOf(s) !== wantKeys) return "step 字段集不对";
   if (typeof s.id !== "string" || s.id.length === 0) return "step id 不是字符串";
   if (s.kind !== "ledger" && s.kind !== "sidecar" && s.chain !== null) return "非 ledger step 不该有 chain";
@@ -242,7 +247,7 @@ function stepProblem(s) {
   if (!(s.state === "prepared" || s.state === "done")) return "step state 不是 prepared / done";
   // prepared 两阶段：after 不得在场。非 sidecar 的 prepared 用 after:null 表达；sidecar prepared 合同是 after 键缺席（P1-2），
   // 由键集核管（wantKeys 不含 after）——这里豁免 sidecar，只看它 done 时 after === intended_after（shapeProblemFor）。
-  if (s.state === "prepared" && s.kind !== "sidecar" && s.after !== null) return "prepared 的 step 不该有 after";
+  if (s.state === "prepared" && s.kind !== "sidecar" && !isNewOs && s.after !== null) return "prepared 的 step 不该有 after";
   if (s.state === "done" && s.after === null) return "done 的 step 必须有 after";
   if (!isCanonicalIso(s.at)) return "step at 不是规范化 ISO 时间";
   return shapeProblemFor(s);

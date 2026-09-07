@@ -34284,9 +34284,13 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
   const badAWithSidecar = { ...docA, steps: [...docA.steps, { kind: "sidecar", id: "sidecar:policy:" + ep, state: "prepared", at: now, target: "ledger/" + ep + "/policy.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null }, intended_after: { exists: true, sha256: sha }, intended_blob: { path: "/p", bytes: 1, sha256: sha } }] };
   assert.ok(journalProblem(badAWithSidecar) !== null, "A 禁 sidecar step");
 
-  // 3b. A 禁 precheck、strict、on
+  // 3b. A 禁 precheck、strict、direct、on 具体消息断言
   const badAWithPrecheck = { ...docA, steps: [...docA.steps, mkPrecheckStep()] };
-  assert.ok(journalProblem(badAWithPrecheck) !== null, "A 禁 precheck step");
+  assert.equal(journalProblem(badAWithPrecheck, { maintenanceDir: "/tmp/maint" }), "owner_select_migration_a 禁 precheck、strict、direct、on 步");
+  const badAWithStrict = { ...docA, steps: [...docA.steps, mkSchemaEndpointStep({ subtype: "strict", from: "1.1-transition", to: "1.1", rev: 2 })] };
+  assert.equal(journalProblem(badAWithStrict, { maintenanceDir: "/tmp/maint" }), "owner_select_migration_a 禁 precheck、strict、direct、on 步");
+  const badAWithOn = { ...docA, steps: [...docA.steps, mkWriterStateStep({ subtype: "on", beforeState: "partial", afterState: "on", rev: 1 })] };
+  assert.equal(journalProblem(badAWithOn, { maintenanceDir: "/tmp/maint" }), "owner_select_migration_a 禁 precheck、strict、direct、on 步");
 
   // 4. Operation B 正反例
   const docB = {
@@ -34309,9 +34313,13 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
   };
   assert.equal(journalProblem(docB, { maintenanceDir: "/tmp/maint" }), null, "合法 operation B 在 osm_b_strictening 阶段通过");
 
-  // B 禁 mint / open / partial
+  // B 禁 mint / open / partial 具体消息断言
   const badBWithMint = { ...docB, steps: [...docB.steps, mkMintStep()] };
-  assert.ok(journalProblem(badBWithMint) !== null, "B 禁 mint step");
+  assert.equal(journalProblem(badBWithMint, { maintenanceDir: "/tmp/maint" }), "owner_select_migration_b 禁 mint、campaign:open、transition、direct、partial 步");
+  const badBWithOpen = { ...docB, steps: [...docB.steps, mkCampaignStep({ action: "open", beforeState: "absent", afterState: "open" })] };
+  assert.equal(journalProblem(badBWithOpen, { maintenanceDir: "/tmp/maint" }), "owner_select_migration_b 禁 mint、campaign:open、transition、direct、partial 步");
+  const badBWithPartial = { ...docB, steps: [...docB.steps, mkWriterStateStep({ subtype: "partial", beforeState: "off", afterState: "partial", rev: 0 })] };
+  assert.equal(journalProblem(badBWithPartial, { maintenanceDir: "/tmp/maint" }), "owner_select_migration_b 禁 mint、campaign:open、transition、direct、partial 步");
 
   // 5. Operation direct 正反例
   const docDirect = {
@@ -34335,16 +34343,34 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
   };
   assert.equal(journalProblem(docDirect, { maintenanceDir: "/tmp/maint" }), null, "合法 operation direct 在 osm_direct 阶段通过");
 
-  // 6. 恰一次计数与阶段机 (§一.3 & §一.6)
-  // 6a. 进前向前 (planned..drained) 禁新 step
+  // direct 禁 mint / transition 具体消息断言
+  const badDirectWithMint = { ...docDirect, steps: [...docDirect.steps, mkMintStep()] };
+  assert.equal(journalProblem(badDirectWithMint, { maintenanceDir: "/tmp/maint" }), "owner_select_migration_direct 禁 mint、transition、strict、partial 步");
+  const badDirectWithTransition = { ...docDirect, steps: [...docDirect.steps, mkSchemaEndpointStep({ subtype: "transition", from: "1.0", to: "1.1-transition", rev: 1 })] };
+  assert.equal(journalProblem(badDirectWithTransition, { maintenanceDir: "/tmp/maint" }), "owner_select_migration_direct 禁 mint、transition、strict、partial 步");
+
+  // 6. 五种 step 的 after 逐字段等于 intended_after 约束（done 状态）
+  const badDoneCamp = { ...mkCampaignStep({ state: "done" }), after: { ...mkCampaignStep({ state: "done" }).intended_after, sha256: "f".repeat(64) } };
+  assert.equal(journalProblem({ ...docA, steps: [...enterSteps, badDoneCamp] }), "campaign.after 必须逐字段等于 intended_after");
+  const badDoneSchema = { ...mkSchemaEndpointStep({ state: "done" }), after: { ...mkSchemaEndpointStep({ state: "done" }).intended_after, revision: 99 } };
+  assert.equal(journalProblem({ ...docA, steps: [...enterSteps, badDoneSchema] }), "schema_endpoint.after 必须逐字段等于 intended_after");
+  const badDoneMint = { ...mkMintStep({ state: "done" }), after: { ...mkMintStep({ state: "done" }).intended_after, revision: 99 } };
+  assert.equal(journalProblem({ ...docA, steps: [...enterSteps, badDoneMint] }), "mint.after 必须逐字段等于 intended_after");
+  const badDonePrecheck = { ...mkPrecheckStep({ state: "done" }), after: { ...mkPrecheckStep({ state: "done" }).intended_after, revision: 99 } };
+  assert.equal(journalProblem({ ...docB, steps: [...enterSteps, badDonePrecheck] }), "precheck.after 必须逐字段等于 intended_after");
+  const badDoneWriter = { ...mkWriterStateStep({ state: "done" }), after: { ...mkWriterStateStep({ state: "done" }).intended_after, revision: 99 } };
+  assert.equal(journalProblem({ ...docA, steps: [...enterSteps, badDoneWriter] }), "writer_state.after 必须逐字段等于 intended_after");
+
+  // 7. 恰一次计数与阶段机 (§一.3 & §一.6)
+  // 7a. 进前向前 (planned..drained) 禁新 step
   const badPlannedA = { ...docA, phase: "planned" };
   assert.ok(journalProblem(badPlannedA) !== null, "planned 阶段禁新 step");
 
-  // 6b. 回退族禁新 step
+  // 7b. 回退族禁新 step
   const badRollbackA = { ...docA, phase: "rolling_back" };
   assert.ok(journalProblem(badRollbackA) !== null, "rolling_back 阶段禁新 step");
 
-  // 6c. 重开族与 done 要求全部 done
+  // 7c. 重开族与 done 要求全部 done
   const docADone = {
     ...docA,
     phase: "done",
@@ -34362,23 +34388,35 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
   const badDoneA = { ...docA, phase: "done" };
   assert.ok(journalProblem(badDoneA) !== null, "含 prepared step 时 done 阶段拒绝");
 
-  // 6d. 缺步拒绝
+  // 7d. 缺步拒绝
   const badMissingMintA = { ...docA, steps: docA.steps.filter((s) => s.kind !== "mint") };
   assert.ok(journalProblem(badMissingMintA, { maintenanceDir: "/tmp/maint" }) !== null, "缺 mint step 拒");
 
-  // 6e. 多步/重复 step 拒绝（恰一次计数）
+  // 7e. 多步/重复 step 拒绝（恰一次计数）
   const extraSealInA = mkCampaignStep({ action: "seal", beforeState: "open", afterState: "sealed" });
   const badExtraA = { ...docA, steps: [...docA.steps, extraSealInA] };
   assert.ok(journalProblem(badExtraA, { maintenanceDir: "/tmp/maint" }) !== null, "多出 seal step 拒");
 
-  // 6f. writer_state:on 与 campaign:complete 约束：on done 时 complete 必须已 done
+  // 7f. writer_state:partial 步 endpoints_digest 与 campaign:open 步交叉核验
+  const badAPartialDigestMismatch = {
+    ...docA,
+    steps: docA.steps.map((s) => s.id.startsWith("writer_state:") ? { ...s, intended_after: { ...s.intended_after, endpoints_digest: "f".repeat(64) } } : s)
+  };
+  assert.equal(journalProblem(badAPartialDigestMismatch, { maintenanceDir: "/tmp/maint" }), "writer_state:partial 的 endpoints_digest 必须为 null 或等于 campaign:open 的 endpoints_digest");
+  const goodAPartialDigestNull = {
+    ...docA,
+    steps: docA.steps.map((s) => s.id.startsWith("writer_state:") ? { ...s, intended_after: { ...s.intended_after, endpoints_digest: null } } : s)
+  };
+  assert.equal(journalProblem(goodAPartialDigestNull, { maintenanceDir: "/tmp/maint" }), null, "partial 的 endpoints_digest 为 null 时合法");
+
+  // 7g. writer_state:on 与 campaign:complete 约束：on done 时 complete 必须已 done
   const docBOnDoneCampPrep = {
     ...docB,
     steps: docB.steps.map((s) => s.id.startsWith("writer_state:") ? { ...s, state: "done", after: s.intended_after } : s)
   };
   assert.ok(journalProblem(docBOnDoneCampPrep, { maintenanceDir: "/tmp/maint" }) !== null, "writer_state on 已 done 而 campaign complete 未 done 时拒");
 
-  // 6g. writer_state:on 摘要与 campaign:complete 不一致时拒
+  // 7h. writer_state:on 摘要与 campaign:complete 不一致时拒
   const docBDigestMismatch = {
     ...docB,
     steps: docB.steps.map((s) => s.id.startsWith("writer_state:") ? { ...s, intended_after: { ...s.intended_after, endpoints_digest: "c".repeat(64) } } : s)

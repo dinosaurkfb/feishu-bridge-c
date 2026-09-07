@@ -792,14 +792,23 @@ function opConsistentWithRecord(op, id, rec) {
 /* R48 G13'/G13-tomb：owner_select proof 记录的产证/保留判定（§7.2 G13′）+ 归并 tombstone 闭合（§7.1 G13-tomb）。 */
 function g13OwnerSelectProblem(rec, id, doc) {
   const bp = rec.binding_proof, lp = rec.locator_link_proof_ref;
-  const hasOS = (bp && bp.kind === "owner_select_v1") || (lp && lp.kind === "owner_selected_route_v1");
-  if (!hasOS) return null; // 非 owner_select proof，不归 G13'
+  if (!(bp && bp.kind === "owner_select_v1") && !(lp && lp.kind === "owner_selected_route_v1")) return null; // 非 owner_select proof，不归 G13'
   const origin = doc.operations[rec.origin_operation_id];
   const entry = origin && origin.result && Array.isArray(origin.result.proof_effects)
     ? origin.result.proof_effects.find((e) => e.topic_agent_id === id) : null;
   if (!entry) return "G13'：owner_select proof 记录的 origin op 没有本记录的 proof_effects 项";
-  if (entry.link_effect === "produced" || entry.binding_effect === "produced") {
-    // 产证支：selection_operation_id===origin_operation_id；binding=owner_select_v1 时六字段逐字等（G13'-A）。
+  const produced = entry.link_effect === "produced" || entry.binding_effect === "produced";
+  if (origin.op_type === "owner_select_reaffirm") {
+    // reaffirm 不拷六字段，用 new_binding_proof / new_link_proof 整体 canonKey 逐字比（Frank 2026 拍板）。
+    if (produced) {
+      if (bp && (!origin.result.new_binding_proof || canonKey(bp) !== canonKey(origin.result.new_binding_proof))) return "G13'：reaffirm produced 的 binding 与 new_binding_proof canonKey 不等";
+      if (lp && (!origin.result.new_link_proof || canonKey(lp) !== canonKey(origin.result.new_link_proof))) return "G13'：reaffirm produced 的 link 与 new_link_proof canonKey 不等";
+      return null;
+    }
+    // preserved：link 必为新 new_link_proof（重签）；binding 保持原产生 op，走下方 preserved 共同路径。
+    if (lp && (!origin.result.new_link_proof || canonKey(lp) !== canonKey(origin.result.new_link_proof))) return "G13'：reaffirm preserved 的 link 与 new_link_proof canonKey 不等";
+  } else if (produced) {
+    // 非 reaffirm 产证支：selection_operation_id===origin_operation_id；binding=owner_select_v1 时六字段逐字等（G13'-A）。
     const selOpId = bp ? bp.selection_operation_id : lp.selection_operation_id;
     if (selOpId !== rec.origin_operation_id) return "G13'：produced 的 selection_operation_id 不等于 origin_operation_id";
     if (bp && bp.kind === "owner_select_v1" && entry.binding_effect === "produced") {
@@ -813,14 +822,15 @@ function g13OwnerSelectProblem(rec, id, doc) {
     }
     return null;
   }
-  // preserved 支（link_effect==="preserved", binding_effect!=="produced"）
+  // preserved 共同路径（demote/unbind/restore/retarget/handle-only/reaffirm 保留 binding）：
+  //   selection_operation_id 指向原产生 op（∈产证来源集），其 proof_effects 曾 produced，revision ≤ 当前 origin。
   const selOpId = bp ? bp.selection_operation_id : lp.selection_operation_id;
   const src = doc.operations[selOpId];
   if (!src || !PROOF_PRODUCERS.includes(src.op_type)) return "G13'：preserved 的 selection_operation_id 未指向合法产证来源 op（原产生 op）";
   const srcEntry = src.result && Array.isArray(src.result.proof_effects) ? src.result.proof_effects.find((e) => e.topic_agent_id === id) : null;
   if (!srcEntry || srcEntry.binding_effect !== "produced") return "G13'：preserved 的原产生 op 未对本记录产生过（proof_effects 无 produced）";
   if (src.result_revision > origin.result_revision) return "G13'：preserved 的原产生 op revision 大于当前 origin revision（不允许）";
-  if (bp && bp.kind === "owner_select_v1") {
+  if (bp && bp.kind === "owner_select_v1" && origin.op_type !== "owner_select_reaffirm") {
     const r = src.result;
     if (bp.authorized_by !== r.authorized_by || bp.authorized_at !== r.authorized_at || bp.selected_session_id !== r.selected_session_id || bp.selected_root_om !== r.selected_root_om || bp.selection_handle !== r.selection_handle || bp.selection_operation_id !== r.selection_operation_id) return "G13'：preserved 的 proof 六字段与原产生 result 逐字不等";
   }

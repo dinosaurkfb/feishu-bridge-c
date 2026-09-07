@@ -25252,9 +25252,12 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     const sha = (n) => String(n).repeat(64);
     const base = { token: uuid, reason: "", started_at: iso, updated_at: iso, notes: [], schema_version: "1.4", operation_kind: "owner_select_migration_a", phase: "osm_a_upgrading" };
     const campOpen = { kind: "campaign", id: "campaign:" + cid + ":open", target: "ledger/owner-select-campaign.json", chain: null, state: "done", at: iso, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null }, intended_after: { exists: true, sha256: sha(2), state: "open", campaign_id: cid, endpoints: [ep], endpoints_digest: dg }, after: { exists: true, sha256: sha(2), state: "open", campaign_id: cid, endpoints: [ep], endpoints_digest: dg } };
-    // A 只给 campaign open（无 writer_state:partial / 无 schema_endpoint / 无 mint）→ 恰一次计数拒
+    // A 只给 campaign open（无 writer_state:partial / 无 schema_endpoint / 无 mint），phase=osm_a_upgrading（forward 段）→ 恰一次计数拒
     const r = String(journalProblem({ ...base, steps: [campOpen] }));
-    assert.ok(r.includes("恰一次计数"), "A 缺 writer_state:partial → 拒：" + r);
+    assert.ok(r.includes("writer_state:*:partial 必须恰一"), "恰一次计数 A 缺 writer_state:partial → 拒（具体消息）：" + r);
+    // 返修二 4：forward 段（osm_a_upgrading）但零新 step → 仍必拒（计数按 phase 门控，不按 hasNew）。
+    const r2 = String(journalProblem({ ...base, phase: "osm_a_upgrading", steps: [] }));
+    assert.ok(r2.includes(":open 必须恰一"), "forward 段零新 step → 拒（按 phase 计数）：" + r2);
   });
 
   // R50（Part 一 item 6）：交叉等式 campaign_id 三处同一 / forward 前禁新 step / mint blob path 重算 —— 纯合成。

@@ -23,6 +23,14 @@ import path from "node:path";
 import { realUserHome } from "../maintenance-gate-core.mjs";
 import { readRegularFile } from "../installed-surface.mjs";
 import { acquireLockUngated, commitWhileHeld, releasePublishLock } from "../registry.mjs";
+import { canonKey } from "../topic-agent-ledger.mjs";
+import {
+  campaignIdFor,
+  endpointsDigest,
+  CAMPAIGN_ID_SHAPE,
+  CAMPAIGN_STATES,
+  WRITER_STATES,
+} from "./owner-select-state.mjs";
 
 export const MAINTENANCE_DIR_ENV = "FEISHU_BRIDGE_MAINTENANCE_DIR";
 export const JOURNAL_SCHEMA = "1.2";
@@ -225,17 +233,229 @@ function shapeProblemFor(s) {
     if (!s.before.exists && s.backup !== null) return "sidecar 原来不存在不该有备份";
     return null;
   }
+  if (kind === "campaign") {
+    if (!idOk) return "campaign id 形状不对";
+    const parts = rest.split(":");
+    if (parts.length !== 2) return "campaign id 必须是 campaign:<campaign_id>:open|seal|complete";
+    const [cid, action] = parts;
+    if (!CAMPAIGN_ID_SHAPE.test(cid)) return "campaign id 的 campaign_id 格式不对";
+    if (action !== "open" && action !== "seal" && action !== "complete") return "campaign id 动作必须是 open|seal|complete";
+    if (s.target !== "ledger/owner-select-campaign.json") return "campaign target 必须是 ledger/owner-select-campaign.json";
+
+    const isCampaignState = (x) => {
+      if (!isObj(x) || keysOf(x) !== "campaign_id,endpoints,endpoints_digest,exists,sha256,state") return false;
+      if (x.exists === false) {
+        return x.sha256 === null && x.state === "absent" && x.campaign_id === null && x.endpoints === null && x.endpoints_digest === null;
+      }
+      if (x.exists === true) {
+        if (typeof x.sha256 !== "string" || !SHA_SHAPE.test(x.sha256)) return false;
+        if (!CAMPAIGN_STATES.includes(x.state)) return false;
+        if (typeof x.campaign_id !== "string" || !CAMPAIGN_ID_SHAPE.test(x.campaign_id)) return false;
+        if (!Array.isArray(x.endpoints) || x.endpoints.length === 0) return false;
+        for (let i = 0; i < x.endpoints.length; i++) {
+          if (typeof x.endpoints[i] !== "string" || !ENDPOINT_SHAPE.test(x.endpoints[i])) return false;
+          if (i > 0 && x.endpoints[i] <= x.endpoints[i - 1]) return false;
+        }
+        if (typeof x.endpoints_digest !== "string" || !SHA_SHAPE.test(x.endpoints_digest)) return false;
+        if (x.endpoints_digest !== endpointsDigest(x.endpoints)) return false;
+        return true;
+      }
+      return false;
+    };
+
+    if (!isCampaignState(s.before)) return "campaign before 形状不对";
+    if (!isCampaignState(s.intended_after)) return "campaign intended_after 形状不对";
+    if (s.state === "done") {
+      if (!isCampaignState(s.after)) return "campaign after 形状不对";
+      if (canonKey(s.after) !== canonKey(s.intended_after)) return "campaign.after 必须逐字段等于 intended_after";
+    }
+
+    if (action === "open") {
+      if (s.before.state !== "absent" && s.before.state !== "complete") return "campaign open 的 before.state 必须是 absent 或 complete";
+      if (s.intended_after.exists !== true || s.intended_after.state !== "open") return "campaign open 的 intended_after 必须是 state:open";
+      if (s.intended_after.campaign_id !== cid) return "campaign open 的 intended_after.campaign_id 必须与 id 一致";
+    } else if (action === "seal") {
+      if (s.before.exists !== true || s.before.state !== "open") return "campaign seal 的 before.state 必须是 open";
+      if (s.intended_after.exists !== true || s.intended_after.state !== "sealed") return "campaign seal 的 intended_after 必须是 state:sealed";
+      if (s.intended_after.campaign_id !== s.before.campaign_id || s.intended_after.campaign_id !== cid) return "campaign seal campaign_id 必须与 before 及 id 一致";
+      if (s.intended_after.endpoints_digest !== s.before.endpoints_digest) return "campaign seal endpoints_digest 必须与 before 一致";
+      if (canonKey(s.intended_after.endpoints) !== canonKey(s.before.endpoints)) return "campaign seal endpoints 必须与 before 一致";
+    } else if (action === "complete") {
+      if (s.before.exists !== true || s.before.state !== "sealed") return "campaign complete 的 before.state 必须是 sealed";
+      if (s.intended_after.exists !== true || s.intended_after.state !== "complete") return "campaign complete 的 intended_after 必须是 state:complete";
+      if (s.intended_after.campaign_id !== s.before.campaign_id || s.intended_after.campaign_id !== cid) return "campaign complete campaign_id 必须与 before 及 id 一致";
+      if (s.intended_after.endpoints_digest !== s.before.endpoints_digest) return "campaign complete endpoints_digest 必须与 before 一致";
+      if (canonKey(s.intended_after.endpoints) !== canonKey(s.before.endpoints)) return "campaign complete endpoints 必须与 before 一致";
+    }
+
+    if (s.before.exists && s.backup === null) return "campaign 原来存在必须有备份";
+    if (!s.before.exists && s.backup !== null) return "campaign 原来不存在不该有备份";
+    if (s.before.exists && s.backup_sha256 !== s.before.sha256) return "campaign 备份 sha 必须等于 before.sha256";
+    return null;
+  }
+  if (kind === "schema_endpoint") {
+    if (!idOk) return "schema_endpoint id 形状不对";
+    const parts = rest.split(":");
+    if (parts.length !== 2) return "schema_endpoint id 必须是 schema_endpoint:<ep>:transition|strict|direct";
+    const [ep, subtype] = parts;
+    if (!ENDPOINT_SHAPE.test(ep)) return "schema_endpoint id 的 ep 格式不对";
+    if (subtype !== "transition" && subtype !== "strict" && subtype !== "direct") return "schema_endpoint 动作必须是 transition|strict|direct";
+    if (s.target !== "ledger/" + ep + "/ledger.json") return "schema_endpoint target 必须是 ledger/<ep>/ledger.json";
+
+    const isSchemaObj = (x) => isObj(x) && keysOf(x) === "ledger_sha256,revision,schema_version"
+      && typeof x.ledger_sha256 === "string" && SHA_SHAPE.test(x.ledger_sha256)
+      && Number.isSafeInteger(x.revision) && x.revision >= 1 && typeof x.schema_version === "string";
+
+    if (!isSchemaObj(s.before)) return "schema_endpoint before 形状不对";
+    if (!isSchemaObj(s.intended_after)) return "schema_endpoint intended_after 形状不对";
+    if (s.state === "done") {
+      if (!isSchemaObj(s.after)) return "schema_endpoint after 形状不对";
+      if (canonKey(s.after) !== canonKey(s.intended_after)) return "schema_endpoint.after 必须逐字段等于 intended_after";
+    }
+
+    if (subtype === "transition") {
+      if (s.before.schema_version !== "1.0" || s.intended_after.schema_version !== "1.1-transition") return "transition 必须是 1.0 -> 1.1-transition";
+    } else if (subtype === "strict") {
+      if (s.before.schema_version !== "1.1-transition" || s.intended_after.schema_version !== "1.1") return "strict 必须是 1.1-transition -> 1.1";
+    } else if (subtype === "direct") {
+      if (s.before.schema_version !== "1.0" || s.intended_after.schema_version !== "1.1") return "direct 必须是 1.0 -> 1.1";
+    }
+    if (s.intended_after.revision !== s.before.revision + 1) return "schema_endpoint revision 必须加 1";
+
+    if (s.backup === null) return "schema_endpoint 必须有备份";
+    if (s.backup_sha256 !== s.before.ledger_sha256) return "schema_endpoint 备份 sha 必须等于 before.ledger_sha256";
+    return null;
+  }
+  if (kind === "mint") {
+    if (!idOk) return "mint id 形状不对";
+    const ep = rest;
+    if (!ENDPOINT_SHAPE.test(ep)) return "mint id 必须是 mint:<ep>";
+    if (s.target !== "ledger/" + ep + "/ledger.json") return "mint target 必须是 ledger/<ep>/ledger.json";
+
+    const isMintObj = (x) => isObj(x) && keysOf(x) === "ledger_sha256,null_b1_count,revision"
+      && typeof x.ledger_sha256 === "string" && SHA_SHAPE.test(x.ledger_sha256)
+      && Number.isSafeInteger(x.revision) && x.revision >= 1
+      && Number.isSafeInteger(x.null_b1_count) && x.null_b1_count >= 0;
+
+    if (!isMintObj(s.before)) return "mint before 形状不对";
+    if (!isMintObj(s.intended_after)) return "mint intended_after 形状不对";
+    if (s.state === "done") {
+      if (!isMintObj(s.after)) return "mint after 形状不对";
+      if (canonKey(s.after) !== canonKey(s.intended_after)) return "mint.after 必须逐字段等于 intended_after";
+    }
+
+    if (s.intended_after.null_b1_count !== 0) return "mint intended_after.null_b1_count 必须为 0";
+    if (s.intended_after.revision !== s.before.revision + 1) return "mint revision 必须加 1";
+
+    const blob = s.intended_blob;
+    if (!(isObj(blob) && keysOf(blob) === "bytes,path,sha256" && typeof blob.path === "string" && path.isAbsolute(blob.path)
+      && Number.isSafeInteger(blob.bytes) && blob.bytes >= 0 && typeof blob.sha256 === "string" && SHA_SHAPE.test(blob.sha256))) {
+      return "mint.intended_blob 形状不对";
+    }
+    if (!blob.path.endsWith("/intended/mint-" + ep + ".json")) return "mint.intended_blob.path 不是 intended/mint-<ep>.json 的绝对路径";
+
+    if (s.backup === null) return "mint 必须有备份";
+    if (s.backup_sha256 !== s.before.ledger_sha256) return "mint 备份 sha 必须等于 before.ledger_sha256";
+    return null;
+  }
+  if (kind === "precheck") {
+    if (!idOk) return "precheck id 形状不对";
+    const ep = rest;
+    if (!ENDPOINT_SHAPE.test(ep)) return "precheck id 必须是 precheck:<ep>";
+    if (s.target !== "ledger/" + ep + "/ledger.json") return "precheck target 必须是 ledger/<ep>/ledger.json";
+
+    const isPrecheckObj = (x) => isObj(x) && keysOf(x) === "ledger_sha256,legacy_proof_count,null_b1_count,revision"
+      && typeof x.ledger_sha256 === "string" && SHA_SHAPE.test(x.ledger_sha256)
+      && Number.isSafeInteger(x.revision) && x.revision >= 1
+      && Number.isSafeInteger(x.legacy_proof_count) && x.legacy_proof_count >= 0
+      && Number.isSafeInteger(x.null_b1_count) && x.null_b1_count >= 0;
+
+    if (!isPrecheckObj(s.before)) return "precheck before 形状不对";
+    if (!isPrecheckObj(s.intended_after)) return "precheck intended_after 形状不对";
+    if (s.state === "done") {
+      if (!isPrecheckObj(s.after)) return "precheck after 形状不对";
+      if (canonKey(s.after) !== canonKey(s.intended_after)) return "precheck.after 必须逐字段等于 intended_after";
+    }
+
+    if (s.before.legacy_proof_count !== 0 || s.before.null_b1_count !== 0) return "precheck 计数必须皆为 0";
+    if (canonKey(s.before) !== canonKey(s.intended_after)) return "precheck 只读：before 必须等于 intended_after";
+
+    if (s.backup !== null || s.backup_sha256 !== null || s.backup_bytes !== null) return "precheck 三个 backup 字段恒 null";
+    return null;
+  }
+  if (kind === "writer_state") {
+    if (!idOk) return "writer_state id 形状不对";
+    const parts = rest.split(":");
+    if (parts.length !== 2) return "writer_state id 必须是 writer_state:<campaign_id>:partial|on";
+    const [cid, subtype] = parts;
+    if (!CAMPAIGN_ID_SHAPE.test(cid)) return "writer_state id 的 campaign_id 格式不对";
+    if (subtype !== "partial" && subtype !== "on") return "writer_state 动作必须是 partial|on";
+    if (s.target !== "ledger/owner-select-writer-state.json") return "writer_state target 必须是 ledger/owner-select-writer-state.json";
+
+    const isWriterObj = (x) => {
+      if (!isObj(x) || keysOf(x) !== "campaign_id,endpoints_digest,exists,revision,sha256,state") return false;
+      if (x.exists === false) {
+        return x.sha256 === null && x.state === "off" && x.campaign_id === null && x.endpoints_digest === null && x.revision === 0;
+      }
+      if (x.exists === true) {
+        if (typeof x.sha256 !== "string" || !SHA_SHAPE.test(x.sha256)) return false;
+        if (!WRITER_STATES.includes(x.state)) return false;
+        if (!Number.isSafeInteger(x.revision) || x.revision < 1) return false;
+        if (x.state === "off") {
+          if (x.campaign_id !== null || x.endpoints_digest !== null) return false;
+        } else if (x.state === "partial") {
+          if (typeof x.campaign_id !== "string" || !CAMPAIGN_ID_SHAPE.test(x.campaign_id)) return false;
+          if (x.endpoints_digest !== null && (typeof x.endpoints_digest !== "string" || !SHA_SHAPE.test(x.endpoints_digest))) return false;
+        } else if (x.state === "on") {
+          if (typeof x.campaign_id !== "string" || !CAMPAIGN_ID_SHAPE.test(x.campaign_id)) return false;
+          if (typeof x.endpoints_digest !== "string" || !SHA_SHAPE.test(x.endpoints_digest)) return false;
+        }
+        return true;
+      }
+      return false;
+    };
+
+    if (!isWriterObj(s.before)) return "writer_state before 形状不对";
+    if (!isWriterObj(s.intended_after)) return "writer_state intended_after 形状不对";
+    if (s.state === "done") {
+      if (!isWriterObj(s.after)) return "writer_state after 形状不对";
+      if (canonKey(s.after) !== canonKey(s.intended_after)) return "writer_state.after 必须逐字段等于 intended_after";
+    }
+
+    if (s.intended_after.revision !== s.before.revision + 1) return "writer_state revision 必须加 1";
+    if (subtype === "partial") {
+      if (s.before.state !== "off" && s.before.state !== "on") return "writer_state partial 的 before.state 必须是 off 或 on";
+      if (s.intended_after.state !== "partial") return "writer_state partial 的 intended_after.state 必须是 partial";
+      if (s.intended_after.campaign_id !== cid) return "writer_state partial 的 campaign_id 必须与 id 一致";
+    } else if (subtype === "on") {
+      if (s.before.state !== "partial") return "writer_state on 的 before.state 必须是 partial";
+      if (s.intended_after.state !== "on") return "writer_state on 的 intended_after.state 必须是 on";
+      if (s.intended_after.campaign_id !== cid) return "writer_state on 的 campaign_id 必须与 id 一致";
+    }
+
+    if (s.before.exists && s.backup === null) return "writer_state 原来存在必须有备份";
+    if (!s.before.exists && s.backup !== null) return "writer_state 原来不存在不该有备份";
+    if (s.before.exists && s.backup_sha256 !== s.before.sha256) return "writer_state 备份 sha 必须等于 before.sha256";
+    return null;
+  }
   return "kind 不在受控集合里";
 }
 function stepProblem(s) {
   if (!isObj(s)) return "step 不是对象";
   if (!STEP_KINDS.includes(s.kind)) return "step kind 不在受控集合里";
-  // M1b T4 返修 P1-2：sidecar 精确键集按 state 两态（maintenance-gate.md 阶段表）——
-  // prepared = 11 键（无 after 无 chain）；done = prepared ∪ {after}。state 不是这两态 → 两套键集都不匹配即拒。
+  const isNewOrSidecar = s.kind === "sidecar" || OWNER_SELECT_STEP_KINDS.includes(s.kind);
   const wantKeys = s.kind === "sidecar"
     ? (s.state === "done"
         ? "after,at,backup,backup_bytes,backup_sha256,before,id,intended_after,intended_blob,kind,state,target"
         : "at,backup,backup_bytes,backup_sha256,before,id,intended_after,intended_blob,kind,state,target")
+    : s.kind === "mint"
+    ? (s.state === "done"
+        ? "after,at,backup,backup_bytes,backup_sha256,before,chain,id,intended_after,intended_blob,kind,state,target"
+        : "at,backup,backup_bytes,backup_sha256,before,chain,id,intended_after,intended_blob,kind,state,target")
+    : OWNER_SELECT_STEP_KINDS.includes(s.kind)
+    ? (s.state === "done"
+        ? "after,at,backup,backup_bytes,backup_sha256,before,chain,id,intended_after,kind,state,target"
+        : "at,backup,backup_bytes,backup_sha256,before,chain,id,intended_after,kind,state,target")
     : "after,at,backup,backup_bytes,backup_sha256,before,chain,id,intended_after,kind,state,target";
   if (keysOf(s) !== wantKeys) return "step 字段集不对";
   if (typeof s.id !== "string" || s.id.length === 0) return "step id 不是字符串";
@@ -244,10 +464,8 @@ function stepProblem(s) {
   if (!(s.backup === null || (typeof s.backup === "string" && path.isAbsolute(s.backup)))) return "step backup 不是 null 或绝对路径";
   if (s.backup === null ? (s.backup_sha256 !== null || s.backup_bytes !== null) : !(typeof s.backup_sha256 === "string" && SHA_SHAPE.test(s.backup_sha256) && Number.isSafeInteger(s.backup_bytes) && s.backup_bytes >= 0)) return "备份的 sha256 / 长度与 backup 不一致";
   if (!(s.state === "prepared" || s.state === "done")) return "step state 不是 prepared / done";
-  // prepared 两阶段：after 不得在场。非 sidecar 的 prepared 用 after:null 表达；sidecar prepared 合同是 after 键缺席（P1-2），
-  // 由键集核管（wantKeys 不含 after）——这里豁免 sidecar，只看它 done 时 after === intended_after（shapeProblemFor）。
-  if (s.state === "prepared" && s.kind !== "sidecar" && s.after !== null) return "prepared 的 step 不该有 after";
-  if (s.state === "done" && s.after === null) return "done 的 step 必须有 after";
+  if (s.state === "prepared" && !isNewOrSidecar && s.after !== null) return "prepared 的 step 不该有 after";
+  if (s.state === "done" && (s.after === undefined || s.after === null)) return "done 的 step 必须有 after";
   if (!isCanonicalIso(s.at)) return "step at 不是规范化 ISO 时间";
   return shapeProblemFor(s);
 }
@@ -266,6 +484,44 @@ function requiredStepIds(doc) {
         extra.push(...SIDECAR_NAMES.map((n) => "sidecar:" + n + ":" + ep));
       }
       return [...ENTER_DONE, ...extra];
+    }
+  }
+  const isOsm = doc.schema_version === OWNER_SELECT_JOURNAL_SCHEMA && OWNER_SELECT_OPERATION_KINDS.includes(doc.operation_kind);
+  if (isOsm) {
+    if (OSM_FORWARD_PHASES.includes(doc.phase)) return ENTER_DONE;
+    if (doc.phase === "ledger_reopening" || doc.phase === "done" || doc.phase === "reopening_incomplete") {
+      const anchorAction = doc.operation_kind === "owner_select_migration_b" ? "seal" : "open";
+      const cs = doc.steps.find((s) => s.kind === "campaign" && s.id.endsWith(":" + anchorAction));
+      if (!cs || !Array.isArray(cs.intended_after?.endpoints)) return [...ENTER_DONE, "campaign:missing"];
+      const cid = cs.intended_after.campaign_id;
+      const eps = cs.intended_after.endpoints;
+      const wantIds = [];
+      if (doc.operation_kind === "owner_select_migration_a") {
+        wantIds.push("campaign:" + cid + ":open");
+        for (const ep of eps) {
+          wantIds.push("schema_endpoint:" + ep + ":transition");
+          wantIds.push("mint:" + ep);
+        }
+        wantIds.push("writer_state:" + cid + ":partial");
+      } else if (doc.operation_kind === "owner_select_migration_b") {
+        wantIds.push("campaign:" + cid + ":seal");
+        for (const ep of eps) {
+          wantIds.push("precheck:" + ep);
+          wantIds.push("schema_endpoint:" + ep + ":strict");
+        }
+        wantIds.push("campaign:" + cid + ":complete");
+        wantIds.push("writer_state:" + cid + ":on");
+      } else if (doc.operation_kind === "owner_select_migration_direct") {
+        wantIds.push("campaign:" + cid + ":open");
+        for (const ep of eps) {
+          wantIds.push("precheck:" + ep);
+          wantIds.push("schema_endpoint:" + ep + ":direct");
+        }
+        wantIds.push("campaign:" + cid + ":seal");
+        wantIds.push("campaign:" + cid + ":complete");
+        wantIds.push("writer_state:" + cid + ":on");
+      }
+      return [...ENTER_DONE, ...wantIds];
     }
   }
   return PHASE_REQUIRES[doc.phase];
@@ -389,10 +645,28 @@ export function journalProblem(doc, { maintenanceDir } = {}) {
       // P1-7：gate 不做安装，禁 install 专属步（staged_plan / current:<chain>:install / artifact / receipt）。
       if (doc.steps.some((s) => s.kind === "artifact" || s.kind === "receipt" || s.kind === "staged_plan" || (s.kind === "current" && s.id.endsWith(":install")))) return "maintenance_gate 不得含 install step";
     }
-  } else {
+  } else if (!isOsm) {
     // 1.1 冻结（P1-7）：旧种（gate/install）不得含账本步 / sidecar 步、不得处于账本阶段——已由上方的 phase 封闭拦截。
     if (doc.steps.some((s) => s.kind === "ledger")) return "旧 1.1 不得含 ledger step";
     if (hasSidecar) return "旧 1.1 不得含 sidecar step";
+  }
+  if (isOsm) {
+    if (doc.steps.some((s) => s.kind === "ledger" || s.kind === "sidecar" || s.kind === "artifact" || s.kind === "receipt" || s.kind === "staged_plan" || (s.kind === "current" && s.id.endsWith(":install")))) {
+      return doc.operation_kind + " 不得含 ledger/sidecar/install 步";
+    }
+    if (doc.operation_kind === "owner_select_migration_a") {
+      if (doc.steps.some((s) => s.kind === "precheck" || (s.kind === "schema_endpoint" && (s.id.endsWith(":strict") || s.id.endsWith(":direct"))) || (s.kind === "writer_state" && s.id.endsWith(":on")))) {
+        return "owner_select_migration_a 禁 precheck、strict、direct、on 步";
+      }
+    } else if (doc.operation_kind === "owner_select_migration_b") {
+      if (doc.steps.some((s) => s.kind === "mint" || (s.kind === "campaign" && s.id.endsWith(":open")) || (s.kind === "schema_endpoint" && (s.id.endsWith(":transition") || s.id.endsWith(":direct"))) || (s.kind === "writer_state" && s.id.endsWith(":partial")))) {
+        return "owner_select_migration_b 禁 mint、campaign:open、transition、direct、partial 步";
+      }
+    } else if (doc.operation_kind === "owner_select_migration_direct") {
+      if (doc.steps.some((s) => s.kind === "mint" || (s.kind === "schema_endpoint" && (s.id.endsWith(":transition") || s.id.endsWith(":strict"))) || (s.kind === "writer_state" && s.id.endsWith(":partial")))) {
+        return "owner_select_migration_direct 禁 mint、transition、strict、partial 步";
+      }
+    }
   }
   const required = requiredStepIds(doc);
   if (required) for (const id of required) { const s = doc.steps.find((x) => x.id === id); if (!s || s.state !== "done") return "阶段 " + doc.phase + " 要求 " + id + " 已 done"; }
@@ -462,6 +736,118 @@ export function journalProblem(doc, { maintenanceDir } = {}) {
           const base = maintenanceDir.slice(1).split("/").filter((x) => x !== "");
           if (segs.length !== base.length + 1) return "sidecar.backup 不在维护目录树下";
           for (let i = 0; i < base.length; i++) if (segs[i] !== base[i]) return "sidecar.backup 不在维护目录树下";
+        }
+      }
+    }
+  }
+  if (isOsm) {
+    const osmSteps = doc.steps.filter((s) => OWNER_SELECT_STEP_KINDS.includes(s.kind));
+    const preFwd = ["planned", "timer_stopped", "stubbed", "gated", "drained"];
+    const rollback = ["rolling_back", "rollback_reopening", "rolled_back", "rollback_incomplete"];
+    if (preFwd.includes(doc.phase)) {
+      if (osmSteps.length !== 0) return "进前向前的阶段 " + doc.phase + " 不得含新 step";
+    } else if (rollback.includes(doc.phase)) {
+      if (osmSteps.length !== 0) return "回退阶段 " + doc.phase + " 不得含新 step";
+    } else if (OSM_FORWARD_PHASES.includes(doc.phase) || doc.phase === "ledger_reopening" || doc.phase === "done" || doc.phase === "reopening_incomplete") {
+      const anchorAction = doc.operation_kind === "owner_select_migration_b" ? "seal" : "open";
+      const campAnchor = doc.steps.find((s) => s.kind === "campaign" && s.id.endsWith(":" + anchorAction));
+      if (!campAnchor) return "缺少 anchor campaign step: " + anchorAction;
+      const expectedCid = (doc.operation_kind === "owner_select_migration_a" || doc.operation_kind === "owner_select_migration_direct")
+        ? campaignIdFor(doc.token)
+        : campAnchor.intended_after?.campaign_id;
+      if (campAnchor.id !== "campaign:" + expectedCid + ":" + anchorAction) {
+        return "campaign step id 的 campaign_id 与预期不符";
+      }
+      if (campAnchor.intended_after?.campaign_id !== expectedCid) {
+        return "campaign step intended_after 的 campaign_id 与预期不符";
+      }
+      const frozenEndpoints = campAnchor.intended_after?.endpoints;
+      if (!Array.isArray(frozenEndpoints) || frozenEndpoints.length === 0) {
+        return "campaign step intended_after 缺少合法 endpoints";
+      }
+
+      const wantIds = [];
+      if (doc.operation_kind === "owner_select_migration_a") {
+        wantIds.push("campaign:" + expectedCid + ":open");
+        for (const ep of frozenEndpoints) {
+          wantIds.push("schema_endpoint:" + ep + ":transition");
+          wantIds.push("mint:" + ep);
+        }
+        wantIds.push("writer_state:" + expectedCid + ":partial");
+      } else if (doc.operation_kind === "owner_select_migration_b") {
+        wantIds.push("campaign:" + expectedCid + ":seal");
+        for (const ep of frozenEndpoints) {
+          wantIds.push("precheck:" + ep);
+          wantIds.push("schema_endpoint:" + ep + ":strict");
+        }
+        wantIds.push("campaign:" + expectedCid + ":complete");
+        wantIds.push("writer_state:" + expectedCid + ":on");
+      } else if (doc.operation_kind === "owner_select_migration_direct") {
+        wantIds.push("campaign:" + expectedCid + ":open");
+        for (const ep of frozenEndpoints) {
+          wantIds.push("precheck:" + ep);
+          wantIds.push("schema_endpoint:" + ep + ":direct");
+        }
+        wantIds.push("campaign:" + expectedCid + ":seal");
+        wantIds.push("campaign:" + expectedCid + ":complete");
+        wantIds.push("writer_state:" + expectedCid + ":on");
+      }
+
+      if (osmSteps.length !== wantIds.length) {
+        return "新 step 数量不对，预期 " + wantIds.length + "，实际 " + osmSteps.length;
+      }
+      for (const wid of wantIds) {
+        if (!osmSteps.some((s) => s.id === wid)) return "缺失预期 step：" + wid;
+      }
+
+      for (const s of osmSteps) {
+        if (s.kind === "campaign" || s.kind === "writer_state") {
+          const parts = s.id.split(":");
+          if (parts[1] !== expectedCid) return s.kind + " 的 campaign_id 与 anchor 不一致";
+          if (s.intended_after?.campaign_id !== null && s.intended_after?.campaign_id !== expectedCid) {
+            return s.kind + " intended_after 的 campaign_id 与 anchor 不一致";
+          }
+        }
+        if (s.kind === "schema_endpoint" || s.kind === "mint" || s.kind === "precheck") {
+          const parts = s.id.split(":");
+          const ep = parts[1];
+          if (!frozenEndpoints.includes(ep)) return s.kind + " 的 endpoint 不在 frozenEndpoints 中";
+        }
+        if (s.backup !== null) {
+          const d = path.dirname(s.backup);
+          if (typeof d !== "string" || !d.startsWith("/") || path.normalize(d) !== d) return s.kind + ".backup 不是规范绝对路径";
+          const segs = d.slice(1).split("/");
+          if (segs.length < 1 || segs[segs.length - 1] !== doc.token + ".staged") return s.kind + ".backup 必须在 <token>.staged 下";
+          if (maintenanceDir !== undefined) {
+            const prefixProblem = maintenanceDirSegments(maintenanceDir);
+            if (prefixProblem !== null) return s.kind + ".backup 的维护目录" + prefixProblem;
+            const base = maintenanceDir.slice(1).split("/").filter((x) => x !== "");
+            if (segs.length !== base.length + 1) return s.kind + ".backup 不在维护目录树下";
+            for (let i = 0; i < base.length; i++) if (segs[i] !== base[i]) return s.kind + ".backup 不在维护目录树下";
+          }
+        }
+        if (s.kind === "mint") {
+          const ep = s.id.split(":")[1];
+          const pathProb = stagedBlobPathProblem(s.intended_blob.path, doc.token, "mint-" + ep, maintenanceDir);
+          if (pathProb !== null) return "mint.intended_blob.path " + pathProb;
+        }
+      }
+
+      const wsOn = osmSteps.find((s) => s.kind === "writer_state" && s.id.endsWith(":on"));
+      if (wsOn) {
+        const campComplete = osmSteps.find((s) => s.kind === "campaign" && s.id.endsWith(":complete"));
+        if (!campComplete) return "writer_state:on 要求 campaign:complete 存在";
+        if (wsOn.intended_after.endpoints_digest !== campComplete.intended_after.endpoints_digest) {
+          return "writer_state:on 的 endpoints_digest 必须等于 campaign:complete 的 endpoints_digest";
+        }
+        if (wsOn.state === "done" && campComplete.state !== "done") {
+          return "writer_state:on 已 done 要求 campaign:complete 必须已 done";
+        }
+      }
+
+      if (doc.phase === "ledger_reopening" || doc.phase === "done" || doc.phase === "reopening_incomplete") {
+        if (osmSteps.some((s) => s.state !== "done")) {
+          return "阶段 " + doc.phase + " 要求所有新 step 均已 done";
         }
       }
     }

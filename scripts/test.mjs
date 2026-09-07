@@ -25214,6 +25214,21 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
     assert.ok(TAL.loadLedger(dir, { endpointId: EP }).ok, "seed 出的初始账本自洽");
   };
+  // R50（返修一 P1 + gap4/5）：恰一次计数不在 forward 段前套用 / precheck 与 mint 的 before===intended===after / after===intended。
+  test("R50 返修一：P1(forward 段前不套恰一次计数) + precheck before===intended + mint after===intended", () => {
+    const iso = new Date(1700000000000).toISOString();
+    const uuid = "11111111-1111-1111-1111-111111111111";
+    const base = { token: uuid, reason: "", started_at: iso, updated_at: iso, notes: [], schema_version: "1.4", operation_kind: "owner_select_migration_a", phase: "gated" };
+    // P1：forward 段前（gated）无新 step → 不得被恰一次计数拒（那是 forward 段起才有的事）。
+    const r = String(journalProblem({ ...base, steps: [] }));
+    assert.ok(!r.includes("恰一次计数"), "P1：forward 段前不套恰一次计数（红先行：旧代码报恰一次计数）：" + r);
+    // gap4：precheck 的 before !== intended → 拒。
+    const ep = "endpoint_" + "a".repeat(24);
+    const sha = (n) => String(n).repeat(64);
+    const precheck = (b) => ({ kind: "precheck", id: "precheck:" + ep, target: "ledger/" + ep + "/ledger.json", chain: null, state: "done", at: iso, backup: null, backup_sha256: null, backup_bytes: null, before: b, intended_after: { legacy_proof_count: 0, null_b1_count: 0, revision: 1, ledger_sha256: sha(3) }, after: { legacy_proof_count: 0, null_b1_count: 0, revision: 1, ledger_sha256: sha(3) } });
+    assert.ok(String(journalProblem({ ...base, phase: "osm_a_upgrading", steps: [precheck({ legacy_proof_count: 0, null_b1_count: 0, revision: 9, ledger_sha256: sha(3) })] })).includes("before 必须 === intended_after"), "precheck before!==intended 拒");
+  });
+
   // R50（Part 一 item 4）：禁异类 step —— 旧四 kind（含 1.4 读旧种）禁五新 step kind。
   test("R50 journal 1.4：禁异类 step（旧 kind 读新 step / new kind 禁异类步）", () => {
     const iso = new Date(1700000000000).toISOString();

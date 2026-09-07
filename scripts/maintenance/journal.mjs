@@ -286,6 +286,7 @@ function shapeProblemFor(s) {
     // path 的完整重算（<token>.staged/intended/mint-<ep>.json，含 token+maintenanceDir 段级核）在 journalProblem 用 stagedBlobPathProblem 做；
     // 这里只核 blob 形状 + basename 落 intended 目录。
     if (!blob.path.endsWith("/intended/mint-" + ep + ".json")) return "mint.intended_blob.path 必须是 intended/mint-<ep>.json 的绝对路径";
+    if (s.after !== undefined && (s.after.null_b1_count !== s.intended_after.null_b1_count || s.after.revision !== s.intended_after.revision || s.after.ledger_sha256 !== s.intended_after.ledger_sha256)) return "mint.after 必须逐字段等于 intended_after";
     if (s.backup === null || s.backup_sha256 !== s.before.ledger_sha256) return "mint 备份恒需且 backup_sha256===before.ledger_sha256";
     return null;
   }
@@ -298,6 +299,7 @@ function shapeProblemFor(s) {
       && Number.isSafeInteger(x.revision) && x.revision >= 1 && (x.ledger_sha256 === null || (typeof x.ledger_sha256 === "string" && SHA_SHAPE.test(x.ledger_sha256)));
     if (!st(s.before) || !st(s.intended_after) || !(s.after === undefined || st(s.after))) return "precheck.before/intended_after/after 形状不对";
     // 只读：before === intended_after === after 且两计数皆 0；三 backup 字段恒 null。
+    if (!(s.before.legacy_proof_count === s.intended_after.legacy_proof_count && s.before.null_b1_count === s.intended_after.null_b1_count && s.before.revision === s.intended_after.revision && s.before.ledger_sha256 === s.intended_after.ledger_sha256)) return "precheck 的 before 必须 === intended_after（逐字段）";
     if (!(s.intended_after.legacy_proof_count === 0 && s.intended_after.null_b1_count === 0)) return "precheck 的 intended_after 两计数必须皆 0（非 0 则本 step 不能 done）";
     if (s.after !== undefined && (s.after.legacy_proof_count !== s.intended_after.legacy_proof_count || s.after.ledger_sha256 !== s.intended_after.ledger_sha256)) return "precheck.after 必须逐字段等于 intended_after";
     if (s.backup !== null || s.backup_sha256 !== null || s.backup_bytes !== null) return "precheck 三 backup 字段恒 null";
@@ -512,7 +514,8 @@ export function journalProblem(doc, { maintenanceDir } = {}) {
       const p = stagedBlobPathProblem(s.intended_blob.path, doc.token, "mint-" + s.id.slice("mint:".length), maintenanceDir);
       if (p) return "mint.intended_blob.path：" + p;
     }
-    // ③ 恰一次计数（按冻结集，§8.2）：A/direct 取 :open、B 取 :seal 的 intended_after.endpoints；每 ep 恰一条本 kind 变体。
+    // ③ 恰一次计数（按冻结集，§8.2）（返修一 P1：只在 forward 段起/含新 step 时套用——forward 段前的合法 operation 无新 step 不判）。
+    if (hasNew) {
     const pickSub = doc.operation_kind === "owner_select_migration_b" ? "seal" : "open";
     const frozen = (steps.find((s) => s.kind === "campaign" && s.id.endsWith(":" + pickSub))?.intended_after?.endpoints) ?? [];
     const cnt = (pred) => steps.filter(pred).length;
@@ -540,6 +543,13 @@ export function journalProblem(doc, { maintenanceDir } = {}) {
       if (!e6) for (const ep of frozen) { e6 = expect(cnt((s) => s.kind === "precheck" && s.id === "precheck:" + ep) === 1, ep + " 的 precheck 必须恰一"); if (e6) break; e6 = expect(cnt((s) => s.kind === "schema_endpoint" && s.id === "schema_endpoint:" + ep + ":direct") === 1, ep + " 的 direct 必须恰一"); if (e6) break; }
     }
     if (e6) return "恰一次计数：" + e6;
+    // item 6（补）：writer_state:*:on 的 done ⇐ 本 operation campaign:*:complete 已 done（跨 step 等式，journal 内）。
+    const completeStep = steps.find((s) => s.kind === "campaign" && s.id.endsWith(":complete"));
+    for (const s of steps) if (s.kind === "writer_state" && s.id.endsWith(":on")) {
+      if (!completeStep || completeStep.state !== "done") return "writer_state:*:on 的 done 需要本 operation campaign:*:complete 已 done";
+      if (s.intended_after.endpoints_digest !== completeStep.intended_after.endpoints_digest) return "writer_state:*:on 的 endpoints_digest 必须 === campaign:*:complete 的 digest";
+      if (s.intended_after.campaign_id !== campaignIdFor(doc.token)) return "writer_state.intended_after.campaign_id 必须 === campaignIdFor(token)（三处同一）";
+    }
     // 重开族起：全部新 step 必须 done。
     const reopen = ["ledger_reopening", "done", "reopening_incomplete"].includes(doc.phase);
     if (reopen && steps.some((s) => NEW_STEP_KINDS.includes(s.kind) && s.state !== "done")) return "重开族起全部新 step 必须 done";
@@ -547,6 +557,7 @@ export function journalProblem(doc, { maintenanceDir } = {}) {
     if (kind === "owner_select_migration_a" && writerSub("on") > 0) return "A 禁 writer_state:*:on";
     if (kind === "owner_select_migration_b" && writerSub("partial") > 0) return "B 禁 writer_state:*:partial";
     if (kind === "owner_select_migration_direct" && writerSub("partial") > 0) return "direct 禁 writer_state:*:partial";
+    }
   }
 
   // R50 item 4：禁异类 step（逐 kind 封闭）。

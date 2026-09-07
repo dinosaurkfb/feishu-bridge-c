@@ -38,28 +38,37 @@ export const SIDECAR_NAMES = Object.freeze(["expiry", "pending-claims", "policy"
 // journal 校验器按这条规范重算 intended_blob.path 与 sidecar.backup 的位置——单一出处，别处不许再写字面量。
 export const stagedDirFor = (token) => token + ".staged";
 export const stagedIntendedFile = ({ dir, token, name }) => path.join(dir, stagedDirFor(token), "intended", name + ".json");
-// 封闭 operation_kind（M1 账本接入 B）：新 1.2 必含；gate/install 是既有种，ledger_* 两个账本维护种（阶段/step 见 stage 2）。
-export const OPERATION_KINDS = Object.freeze(["maintenance_gate", "maintenance_install", "ledger_init", "ledger_cutover"]);
+// 封闭 operation_kind（M1 账本接入 B；R50 增三个 owner_select 迁移种）：
+export const LEGACY_OPERATION_KINDS = Object.freeze(["maintenance_gate", "maintenance_install", "ledger_init", "ledger_cutover"]);
+export const OWNER_SELECT_OPERATION_KINDS = Object.freeze(["owner_select_migration_a", "owner_select_migration_b", "owner_select_migration_direct"]);
+export const OPERATION_KINDS = Object.freeze([...LEGACY_OPERATION_KINDS, ...OWNER_SELECT_OPERATION_KINDS]);
+export const OSM_FORWARD_PHASES = Object.freeze(["osm_a_upgrading", "osm_b_strictening", "osm_direct"]);
 export const PHASES = Object.freeze([
   "planned", "timer_stopped", "stubbed", "gated", "drained", "staged", "committed", "verified", "reopening", "done", "reopening_incomplete",
   "rolling_back", "rollback_reopening", "rolled_back", "rollback_incomplete",
   // 账本接入（M1 B-1）：init/cutover 的不可逆前向段 + 账本 operation 的成功重开段。
   "ledger_initializing", "ledger_cutting_over", "ledger_reopening",
+  ...OSM_FORWARD_PHASES,
 ]);
 // P1-7：阶段 × operation_kind 封闭（每 operation_kind 只许各自的阶段集；1.1 冻结为非账本阶段）。
 // 1.1 历史 journal（无 operation_kind）：允许全部非账本阶段（旧 gate+install 种）。
 const INSTALL_PHASES = Object.freeze(["planned", "timer_stopped", "stubbed", "gated", "drained", "staged", "committed", "verified", "reopening", "done", "reopening_incomplete", "rolling_back", "rollback_reopening", "rolled_back", "rollback_incomplete"]);
 // maintenance_gate（只进门+回退，不装任何东西）：禁 install 阶段（staged/committed/verified）与 install 步。
 const GATE_ONLY_PHASES = Object.freeze(["planned", "timer_stopped", "stubbed", "gated", "drained", "rolling_back", "rollback_reopening", "rolled_back", "rollback_incomplete"]);
-const LEDGER_BASE_PHASES = Object.freeze(["planned", "timer_stopped", "stubbed", "gated", "drained", "ledger_reopening", "done", "reopening_incomplete", "rolling_back", "rollback_reopening", "rolled_back", "rollback_incomplete"]);
+export const LEDGER_BASE_PHASES = Object.freeze(["planned", "timer_stopped", "stubbed", "gated", "drained", "ledger_reopening", "done", "reopening_incomplete", "rolling_back", "rollback_reopening", "rolled_back", "rollback_incomplete"]);
 const LEDGER_INIT_PHASES = Object.freeze([...LEDGER_BASE_PHASES, "ledger_initializing"]);
 const LEDGER_CUTOVER_PHASES = Object.freeze([...LEDGER_BASE_PHASES, "ledger_cutting_over"]);
+export const OSM_A_PHASES = Object.freeze([...LEDGER_BASE_PHASES, "osm_a_upgrading"]);
+export const OSM_B_PHASES = Object.freeze([...LEDGER_BASE_PHASES, "osm_b_strictening"]);
+export const OSM_DIRECT_PHASES = Object.freeze([...LEDGER_BASE_PHASES, "osm_direct"]);
 export const TERMINAL_PHASES = Object.freeze(["done", "rolled_back"]);
 /** 没做完的终态：门与账保留，--exit --apply 只向前重试。 */
 export const INCOMPLETE_PHASES = Object.freeze(["reopening_incomplete", "rollback_incomplete"]);
 /** 进了这些阶段只许向前（某条 current 已从桩指回真实 runtime，那条链已重新放行，不许再改线上制品；账本已提交亦然，B-1）。 */
-export const FORWARD_ONLY_PHASES = Object.freeze(["reopening", "rollback_reopening", "ledger_initializing", "ledger_cutting_over", "ledger_reopening", ...TERMINAL_PHASES, ...INCOMPLETE_PHASES]);
-export const STEP_KINDS = Object.freeze(["timer", "stub", "current", "gate", "artifact", "receipt", "staged_plan", "ledger", "sidecar"]);
+export const FORWARD_ONLY_PHASES = Object.freeze(["reopening", "rollback_reopening", "ledger_initializing", "ledger_cutting_over", "ledger_reopening", ...OSM_FORWARD_PHASES, ...TERMINAL_PHASES, ...INCOMPLETE_PHASES]);
+export const LEGACY_STEP_KINDS = Object.freeze(["timer", "stub", "current", "gate", "artifact", "receipt", "staged_plan", "ledger", "sidecar"]);
+export const OWNER_SELECT_STEP_KINDS = Object.freeze(["campaign", "schema_endpoint", "mint", "precheck", "writer_state"]);
+export const STEP_KINDS = Object.freeze([...LEGACY_STEP_KINDS, ...OWNER_SELECT_STEP_KINDS]);
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u; // 账本 endpoint_id（layers-v2-ledger.md §2）
 const SIDECAR_ID_SHAPE = new RegExp("^(?:" + SIDECAR_NAMES.join("|") + "):((?:endpoint_[0-9a-f]{24}))$");
 export const TIMER_PHASES = Object.freeze(["loaded", "installed_not_loaded", "absent"]);
@@ -293,30 +302,43 @@ function maintenanceDirSegments(maintenanceDir) {
 
 export function journalProblem(doc, { maintenanceDir } = {}) {
   if (!isObj(doc)) return "不是对象";
-  // schema 判别（M1 账本接入 B / 评审 P2-1；M1b T4 加 1.3）：1.2/1.3 必含 operation_kind；旧 1.1 无该字段、按既有种读（不当 unreadable）。
-  if (doc.schema_version !== JOURNAL_SCHEMA && doc.schema_version !== LEGACY_JOURNAL_SCHEMA && doc.schema_version !== CUTOVER_JOURNAL_SCHEMA) return "schema_version 不认识";
+  // schema 判别（M1 账本接入 B / 评审 P2-1；M1b T4 加 1.3；R50 加 1.4）：1.2/1.3/1.4 必含 operation_kind；旧 1.1 无该字段、按既有种读（不当 unreadable）。
+  if (doc.schema_version !== JOURNAL_SCHEMA && doc.schema_version !== LEGACY_JOURNAL_SCHEMA && doc.schema_version !== CUTOVER_JOURNAL_SCHEMA && doc.schema_version !== OWNER_SELECT_JOURNAL_SCHEMA) return "schema_version 不认识";
+  const is11 = doc.schema_version === LEGACY_JOURNAL_SCHEMA;
   const is12 = doc.schema_version === JOURNAL_SCHEMA;
   const is13 = doc.schema_version === CUTOVER_JOURNAL_SCHEMA;
-  const fieldset = is12 || is13
+  const is14 = doc.schema_version === OWNER_SELECT_JOURNAL_SCHEMA;
+  const fieldset = is12 || is13 || is14
     ? "notes,operation_kind,phase,reason,schema_version,started_at,steps,token,updated_at"
     : "notes,phase,reason,schema_version,started_at,steps,token,updated_at";
   if (keysOf(doc) !== fieldset) return "字段集不对";
-  if ((is12 || is13) && !OPERATION_KINDS.includes(doc.operation_kind)) return "operation_kind 不在封闭集合里：" + String(doc.operation_kind);
-  // 二轮 P1-1：1.3 是 ledger_cutover 的专属判别支 —— 非 cutover 操作一律按 1.2 记账，1.3 遇到它们即不可达态 → unreadable。
+  if (is12 && !LEGACY_OPERATION_KINDS.includes(doc.operation_kind)) return "operation_kind 不在封闭集合里：" + String(doc.operation_kind);
   if (is13 && doc.operation_kind !== "ledger_cutover") return "1.3 是 ledger_cutover 专属判别支（" + doc.operation_kind + " 按 1.2 记账）";
+  if (is14 && !OPERATION_KINDS.includes(doc.operation_kind)) return "operation_kind 不在封闭集合里：" + String(doc.operation_kind);
   if (typeof doc.token !== "string" || !UUID_SHAPE.test(doc.token)) return "token 不是 UUID 字符串";
   if (typeof doc.reason !== "string" || [...doc.reason].length > 80) return "reason 不是 ≤ 80 码点的字符串";
   if (!isCanonicalIso(doc.started_at) || !isCanonicalIso(doc.updated_at)) return "时间不是规范化 ISO";
+
+  // 1.2 / 1.3 遇新 step kind → problem（旧版读作 unreadable）
+  if ((is12 || is13) && Array.isArray(doc.steps) && doc.steps.some((s) => OWNER_SELECT_STEP_KINDS.includes(s.kind))) {
+    return (is12 ? "1.2" : "1.3") + " 不得含新 step kind";
+  }
+
   // P1-7：阶段 × operation_kind 封闭（1.1 冻结为非账本阶段；ledger_init 不得进入 ledger_cutting_over，反之亦然）。
-  const isLedgerKind = (is12 || is13) && (doc.operation_kind === "ledger_init" || doc.operation_kind === "ledger_cutover");
+  const isOsm = is14 && OWNER_SELECT_OPERATION_KINDS.includes(doc.operation_kind);
+  const isLedgerKind = (is12 || is13 || (is14 && !isOsm)) && (doc.operation_kind === "ledger_init" || doc.operation_kind === "ledger_cutover");
   const allowed = is13
     ? LEDGER_CUTOVER_PHASES
-    : !is12 ? INSTALL_PHASES
+    : isOsm
+    ? (doc.operation_kind === "owner_select_migration_a" ? OSM_A_PHASES
+      : doc.operation_kind === "owner_select_migration_b" ? OSM_B_PHASES
+      : OSM_DIRECT_PHASES)
+    : !is12 && !is14 ? INSTALL_PHASES
     : doc.operation_kind === "ledger_init" ? LEDGER_INIT_PHASES
     : doc.operation_kind === "ledger_cutover" ? LEDGER_CUTOVER_PHASES
     : doc.operation_kind === "maintenance_gate" ? GATE_ONLY_PHASES
     : INSTALL_PHASES;
-  if (!allowed.includes(doc.phase)) return (is12 ? "operation_kind " + doc.operation_kind : "旧 1.1") + " 不得处于阶段 " + doc.phase;
+  if (!allowed.includes(doc.phase)) return ((is12 || is14) ? "operation_kind " + doc.operation_kind : "旧 1.1") + " 不得处于阶段 " + doc.phase;
   if (!Array.isArray(doc.steps)) return "steps 不是数组";
   const ids = new Set();
   for (const s of doc.steps) { const p = stepProblem(s); if (p !== null) return p; if (ids.has(s.id)) return "step id 重复：" + s.id; ids.add(s.id); }
@@ -339,11 +361,14 @@ export function journalProblem(doc, { maintenanceDir } = {}) {
     if (s.state === "done" && s.after !== s.intended_after) return "current 的 after 与 intended_after 不一致";
   }
   // step 类型 × operation_kind 封闭（M1 账本接入 B，设计"ledger_* 禁 install 步 / gate·install 禁 ledger 步"；
-  // M1b T4：sidecar 仅 1.3 ledger_cutover——1.2 读到 sidecar 即 unreadable，1.3 其余种拒）。
+  // M1b T4：sidecar 仅 1.3 ledger_cutover——1.2 读到 sidecar 即 unreadable，1.3 其余种拒；R50 旧四 kind 禁五个新 step kind）。
   const hasSidecar = doc.steps.some((s) => s.kind === "sidecar");
-  if (is12 || is13) {
+  if (is12 || is13 || (is14 && !isOsm)) {
+    if (is14 && doc.steps.some((s) => OWNER_SELECT_STEP_KINDS.includes(s.kind))) {
+      return doc.operation_kind + " 不得含新 step kind";
+    }
     if (is12 && hasSidecar) return "1.2 不得含 sidecar step（1.3 专属，1.2 读作 unreadable）";
-    if (is13 && hasSidecar && doc.operation_kind !== "ledger_cutover") return doc.operation_kind + " 不得含 sidecar step";
+    if ((is13 || is14) && hasSidecar && doc.operation_kind !== "ledger_cutover") return doc.operation_kind + " 不得含 sidecar step";
     const isLedger = doc.operation_kind === "ledger_init" || doc.operation_kind === "ledger_cutover";
     // 1.2 冻结：cutover 状态对象不得带 plan_sha256（8 键是 1.3 形状；1.2 收据历史完全冻结）。
     if (is12) {

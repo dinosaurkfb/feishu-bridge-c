@@ -301,10 +301,9 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
 
 // R53 步2a：B 原子进段的 step 构造函数（seal / 每 ep precheck / 每 ep strict（applySchemaUpgrade 预算）/ complete / on）。
 export function buildBSteps({ ctx, token, env }) {
-  const cst = readCampaignState(env);
-  if (!(cst.exists && cst.state === "open")) return { ok: false, reason: "campaign_not_open", why: "B 需 campaign open（state=" + cst.state + "）" };
   const cs = readCampaignDocVerified(env);
-  if (!cs.ok || cs.absent) return { ok: false, reason: "campaign_unreadable", why: cs.problem ?? (cs.absent ? "absent" : null) };
+  if (cs.absent) return { ok: false, reason: "campaign_not_open", why: "B 需 campaign open" };
+  if (!cs.ok) return { ok: false, reason: "campaign_unreadable", why: cs.problem };
   if (cs.doc.state !== "open") return { ok: false, reason: "campaign_not_open", why: "B 需 campaign open（state=" + cs.doc.state + "）" };
   const cid = cs.doc.campaign_id;
   const frozen = [...cs.doc.endpoints].sort();
@@ -336,6 +335,24 @@ export function buildBSteps({ ctx, token, env }) {
   steps.push({ kind: "campaign", id: "campaign:" + cid + ":complete", state: "prepared", at: new Date(ctx.now()).toISOString(), target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: true, sha256: shaHex(serializeLedger(sealedDoc)), state: "sealed", campaign_id: cid, endpoints: frozen, endpoints_digest: digest }, intended_after: { exists: true, sha256: shaHex(serializeLedger(completeDoc)), state: "complete", campaign_id: cid, endpoints: frozen, endpoints_digest: digest } });
   steps.push({ kind: "writer_state", id: "writer_state:" + cid + ":on", state: "prepared", at: new Date(ctx.now()).toISOString(), target: "ledger/owner-select-writer-state.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: true, sha256: ws.sha256, state: "partial", campaign_id: cid, endpoints_digest: ws.endpoints_digest, revision: ws.revision }, intended_after: { exists: true, sha256: shaHex(serializeLedger(onDoc)), state: "on", campaign_id: cid, endpoints_digest: digest, revision: ws.revision + 1 } });
   return { ok: true, steps, cid, frozen };
+}
+
+// R53 步2b：B 原子进段——buildBSteps 的 steps 一次 updateJournal 进段（drained → osm_b_strictening），进段后 journalProblem===null。
+export function osmEnterForwardB(ctx, { token, lease, env = process.env } = {}) {
+  const fail = (reason, why, extra = {}) => ({ ok: false, reason, why: why ?? null, phase: "drained", ...extra });
+  const j = readJournal({ dir: ctx.dir, token });
+  if (j.state !== "valid") return fail("journal_" + j.state, j.why ?? null);
+  if (j.doc.operation_kind !== "owner_select_migration_b") return fail("bad_operation_kind", "operation_kind " + j.doc.operation_kind);
+  if (j.doc.phase !== "drained") return fail("not_drained", "phase " + j.doc.phase);
+  const built = buildBSteps(ctx, { token, env });
+  if (!built.ok) return fail(built.reason, built.why);
+  const r = updateJournal({ dir: ctx.dir, token, lease, expectPhase: "drained", now: ctx.now(), mutate: (d) => { d.phase = "osm_b_strictening"; d.steps = [...d.steps, ...built.steps]; return d; } });
+  if (!r.ok) return fail(r.reason, r.why ?? null);
+  const j2 = readJournal({ dir: ctx.dir, token });
+  if (j2.state !== "valid") return fail("journal_" + j2.state, j2.why ?? null);
+  const jp = journalProblem(j2.doc, { maintenanceDir: ctx.dir });
+  if (jp !== null) return { ok: false, reason: "journal_corrupt", why: jp, phase: "osm_b_strictening" };
+  return { ok: true, phase: "osm_b_strictening", steps: built.steps.length };
 }
 
 function readStagedPlanBytes(file) {  let fd = null;

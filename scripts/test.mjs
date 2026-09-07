@@ -18874,17 +18874,23 @@ test("R52a 返修二：/feishu-select 入站全路径（owner 默认 off + 终�
     session_id: "aily_claude_ctl", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z",
   }] }));
   fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
-  const run = (body, messageId, senderId = TPL.frank_sender_id, extraEnv = {}) => {
+  const run = (body, messageId, senderId = TPL.frank_sender_id, { entry = path.resolve("scripts", "aily-inbound.mjs"), extraEnv = {} } = {}) => {
     const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> " + body;
     const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: {
       id: messageId, sessionID: "aily_claude_ctl", role: "user", createdBy: senderId, createdAtMs: Date.now(), content,
     } }) }] });
-    return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], {
+    return spawnSync(process.execPath, [entry], {
       encoding: "utf-8",
       env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
         AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_claude_ctl", AILY_CLI_RUN_ID: "run_ctl", FAKE_AILY_ENVELOPE: envelope, ...extraEnv },
     });
   };
+  const runnerOn = path.join(bin, "inbound-on.mjs");
+  fs.writeFileSync(runnerOn, [
+    "#!/usr/bin/env node",
+    "import { main } from " + JSON.stringify(path.resolve("scripts", "inbound.mjs")) + ";",
+    "await main({ selectAdmissionFn: () => ({ state: 'on' }) });",
+  ].join("\n") + "\n", { mode: 0o755 });
   const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
   const runsDir = path.join(root, ".runtime-data", "inbound", "runs");
   const receiptsDir = path.join(root, ".runtime-data", "inbound", "receipts");
@@ -18930,38 +18936,38 @@ test("R52a 返修二：/feishu-select 入站全路径（owner 默认 off + 终�
   assert.deepEqual(replayStored.claim.control, { control: "select", handle: h, handle_kind: "osh" });
   assert.ok(fs.existsSync(failedFile), "同一终态仍有效");
 
-  // 4. 准入为 on 时：owner 发 /feishu-select <osh> → runControlTransaction 落 consumed 记录 + select-pending 回执 + 重放幂等
-  const envOn = { FEISHU_BRIDGE_TEST_SELECT_ADMISSION: JSON.stringify({ state: "on" }) };
-  const resOn = run("/feishu-select " + h, "msg_sel_on", TPL.frank_sender_id, envOn);
+  // 4. 准入为 on 时（纯依赖注入，生产不可达）：owner 发 /feishu-select <osh> → 执行器未接入期不得落 consumed，落 failed(select_executor_absent) + 重放幂等
+  const resOn = run("/feishu-select " + h, "msg_sel_on", TPL.frank_sender_id, { entry: runnerOn });
   assert.equal(resOn.status, 0, resOn.stdout + resOn.stderr);
-  assert.match(resOn.stdout, /已收到选择，执行器尚未接入/u, resOn.stdout);
+  assert.match(resOn.stdout, /已收到选择，执行器尚未接入，未消费/u, resOn.stdout);
+  assert.match(resOn.stdout, /已拒绝/u, resOn.stdout);
   const keyOn = claimKey("msg_sel_on", logicalTaskKey);
   const storedOn = readClaimState({ claimsDir, key: keyOn });
   assert.equal(storedOn.status, "valid", "on 路径 claim 成功取得且有效");
   assert.deepEqual(storedOn.claim.control, { control: "select", handle: h, handle_kind: "osh" });
-  const consumedFile = path.join(claimsDir, keyOn + ".consumed.json");
-  assert.ok(fs.existsSync(consumedFile), "终态记录落盘（.consumed.json）");
-  const consumedDoc = JSON.parse(fs.readFileSync(consumedFile, "utf-8"));
-  assert.equal(consumedRecordProblem(consumedDoc, keyOn), null, "consumedRecordProblem 认得 select 的 consumed 记录");
-  assert.equal(consumedDoc.control, "select");
-  assert.equal(consumedDoc.handle, h);
-  assert.equal(consumedDoc.handle_kind, "osh");
-  assert.equal(consumedDoc.changed, false);
-  const pendingReceipt = path.join(receiptsDir, "select-pending-msg_sel_on.json");
-  assert.ok(fs.existsSync(pendingReceipt), "select-pending 回执落盘");
+  assert.ok(!fs.existsSync(path.join(claimsDir, keyOn + ".consumed.json")), "执行器未接入期不得落 consumed.json");
+  const failedFileOn = path.join(claimsDir, keyOn + ".failed.json");
+  assert.ok(fs.existsSync(failedFileOn), "终态记录落盘（.failed.json）");
+  const failedDocOn = JSON.parse(fs.readFileSync(failedFileOn, "utf-8"));
+  assert.equal(controlFailedRecordProblem(failedDocOn, keyOn), null, "controlFailedRecordProblem 认得 select 的 failed 记录");
+  assert.equal(failedDocOn.control, "select");
+  assert.equal(failedDocOn.error, "select_executor_absent");
+  const rejectedReceipt = path.join(receiptsDir, "select-rejected-msg_sel_on.json");
+  assert.ok(fs.existsSync(rejectedReceipt), "select-rejected 回执落盘");
   const invOn = inventoryRuns({ runsDir, claimsDir });
-  assert.equal(invOn.problems.filter((p) => p.key === keyOn).length, 0, "consumed 终态闭合，无账本问题");
+  assert.equal(invOn.problems.filter((p) => p.key === keyOn).length, 0, "failed(select_executor_absent) 终态闭合，无账本问题");
 
-  // consumed 重放幂等
+  // failed 重放幂等
   const receiptsCountBeforeOn = fs.readdirSync(receiptsDir).length;
-  const replayOn = run("/feishu-select " + h, "msg_sel_on", TPL.frank_sender_id, envOn);
+  const replayOn = run("/feishu-select " + h, "msg_sel_on", TPL.frank_sender_id, { entry: runnerOn });
   assert.equal(replayOn.status, 0, replayOn.stdout + replayOn.stderr);
-  assert.match(replayOn.stdout, /已收到选择，执行器尚未接入/u, replayOn.stdout);
-  assert.equal(fs.readdirSync(receiptsDir).length, receiptsCountBeforeOn, "consumed 重放幂等：不再写第二份回执");
+  assert.match(replayOn.stdout, /已收到选择，执行器尚未接入，未消费/u, replayOn.stdout);
+  assert.equal(fs.readdirSync(receiptsDir).length, receiptsCountBeforeOn, "重放幂等：不再写第二份回执");
   const replayOnStored = readClaimState({ claimsDir, key: keyOn });
   assert.equal(replayOnStored.status, "valid");
   assert.deepEqual(replayOnStored.claim.control, { control: "select", handle: h, handle_kind: "osh" });
-  assert.ok(fs.existsSync(consumedFile), "同一 consumed 终态仍有效");
+  assert.ok(!fs.existsSync(path.join(claimsDir, keyOn + ".consumed.json")), "重放后仍不得落 consumed 记录");
+  assert.ok(fs.existsSync(failedFileOn), "同一 failed 终态仍有效");
 });
 
 test("claim 终态 consumed：账本盘点认识它（不是 unrecognized_entry），也不把它当没有 run 制品的孤儿", () => {

@@ -68,7 +68,7 @@ import {
 import { isDirectRun } from "./direct-run.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
-import { selectAdmission, selectReject, selectRejectTextByReason } from "./select-admission.mjs";
+import { selectAdmission, selectRejectTextByReason, executeSelectControl } from "./select-admission.mjs";
 /**
  * 整个入站流程包在 main() 里，只有被直接执行时才跑。
  *
@@ -79,7 +79,7 @@ import { selectAdmission, selectReject, selectRejectTextByReason } from "./selec
  * 刻意**不重排函数体的缩进**：这个文件近七百行，重排会让 diff 完全无法评审，
  * 而这次改动的实质只有"加一道守卫"。可读性代价换评审可读性，是有意的取舍。
  */
-async function main() {
+export async function main({ selectAdmissionFn = selectAdmission } = {}) {
 
 // 维护门（issue #81）：确定性回"维护中"，不 claim、不写回执、不重放（stdout 就是给运输 agent 的回复）
 { const gate = gateBlocks(); if (gate.blocked) exitForGate("inbound", gate); }
@@ -736,16 +736,11 @@ const runControl = (replay) => {
   finish("control", { text: controlAckText({ taskName: config.task_display_name, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed, lockUncleared: tx.lockUncleared ?? null }) },
     { control: control.kind, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed });
 };
-// ---------- /feishu-select 控制命令事务（R52a）：锁内确定性处置准入，落 failed / consumed 终态 ----------
+// ---------- /feishu-select 控制命令事务（R52a）：锁内确定性处置准入，落 failed 终态（执行器未接入期不落 consumed，PR #136 P1-4） ----------
 const runSelect = (replay) => {
   const tx = runControlTransaction({
     claimsDir: CLAIMS, key: claim.key, intent: control ? { control: "select", handle: control.handle, handle_kind: control.handle_kind } : undefined, replay, expect: claimExpect,
-    execute: () => {
-      const adm = selectAdmission(process.env);
-      const ej = selectReject(adm, control.handle_kind);
-      if (ej) return { ok: false, reason: ej.reason, text: ej.text };
-      return { ok: true, changed: false, text: "已收到选择，执行器尚未接入" };
-    },
+    execute: () => executeSelectControl(control, { selectAdmissionFn }),
   });
   const lockNote = tx.lockUncleared ? "；另外这一笔的事务锁没有交还（" + tx.lockUncleared + "），之后同一笔会报 control_busy，请人工确认后处理" : "";
   const base = { control: "select", handle_kind: control.handle_kind, message_id: verdict.messageId, project_root: routed.root, handed_off: false, lock_uncleared: tx.lockUncleared ?? null };

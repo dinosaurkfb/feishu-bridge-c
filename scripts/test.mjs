@@ -34148,11 +34148,8 @@ test("R50 §一.1与§一.2 journal 1.4：常量、schema 分派与旧新封闭"
   // 1.3 含新 step
   assert.ok(journalProblem({ ...baseDoc, schema_version: "1.3", operation_kind: "ledger_cutover", phase: "planned", steps: [dummyNewStep] }) !== null, "1.3 含新 step 拒");
 
-  // 4. 1.4 文档使用旧四种 operation_kind 时，行为与 1.3 完全相同
-  // 1.4 + maintenance_gate 在 planned 时无 steps 合法
-  assert.equal(journalProblem({ ...baseDoc, operation_kind: "maintenance_gate" }), null, "1.4 读旧 maintenance_gate 合法");
-  // 1.4 + maintenance_gate 禁新 step kind
-  assert.ok(journalProblem({ ...baseDoc, operation_kind: "maintenance_gate", steps: [dummyNewStep] }) !== null, "1.4 旧种禁新 step kind");
+  // 4. PR #135 P1-1 裁定：1.4 是三新种专属判别支，1.4 读到旧四种一律 problem (unreadable)
+  assert.match(journalProblem({ ...baseDoc, operation_kind: "maintenance_gate" }), /1\.4 是.*专属/u, "1.4 读旧 maintenance_gate 必须拒绝");
   // 1.4 + 允许三个新 kind 处于 planned
   for (const k of ["owner_select_migration_a", "owner_select_migration_b", "owner_select_migration_direct"]) {
     assert.equal(journalProblem({ ...baseDoc, operation_kind: k }), null, "1.4 支持新 kind " + k + " 处于 planned 阶段");
@@ -34179,9 +34176,12 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
     { kind: "gate", id: "gate", state: "done", at: now, target: "gate", chain: null, before: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, backup: null, backup_sha256: null, backup_bytes: null }
   ];
 
+  const shaC = "c".repeat(64);
+  const shaD = "d".repeat(64);
+
   // 1. 五种 step 形状单测
   // 1a. campaign step
-  const mkCampaignStep = ({ state = "prepared", action = "open", beforeState = "absent", afterState = "open" } = {}) => ({
+  const mkCampaignStep = ({ state = "prepared", action = "open", beforeState = "absent", afterState = "open", beforeSha = sha, afterSha = shaB } = {}) => ({
     kind: "campaign",
     id: `campaign:${cid}:${action}`,
     state,
@@ -34189,13 +34189,13 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
     target: "ledger/owner-select-campaign.json",
     chain: null,
     backup: beforeState === "absent" ? null : stagedPath,
-    backup_sha256: beforeState === "absent" ? null : sha,
+    backup_sha256: beforeState === "absent" ? null : beforeSha,
     backup_bytes: beforeState === "absent" ? null : 100,
     before: beforeState === "absent"
       ? { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null }
-      : { exists: true, sha256: sha, state: beforeState, campaign_id: cid, endpoints: [ep], endpoints_digest: endpointsDigest([ep]) },
-    intended_after: { exists: true, sha256: shaB, state: afterState, campaign_id: cid, endpoints: [ep], endpoints_digest: endpointsDigest([ep]) },
-    ...(state === "done" ? { after: { exists: true, sha256: shaB, state: afterState, campaign_id: cid, endpoints: [ep], endpoints_digest: endpointsDigest([ep]) } } : {})
+      : { exists: true, sha256: beforeSha, state: beforeState, campaign_id: cid, endpoints: [ep], endpoints_digest: endpointsDigest([ep]) },
+    intended_after: { exists: true, sha256: afterSha, state: afterState, campaign_id: cid, endpoints: [ep], endpoints_digest: endpointsDigest([ep]) },
+    ...(state === "done" ? { after: { exists: true, sha256: afterSha, state: afterState, campaign_id: cid, endpoints: [ep], endpoints_digest: endpointsDigest([ep]) } } : {})
   });
 
   // 1b. schema_endpoint step
@@ -34215,7 +34215,7 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
   });
 
   // 1c. mint step
-  const mkMintStep = ({ state = "prepared", rev = 2, nullB1 = 3 } = {}) => ({
+  const mkMintStep = ({ state = "prepared", rev = 2, nullB1 = 3, beforeSha = shaB, afterSha = shaC } = {}) => ({
     kind: "mint",
     id: `mint:${ep}`,
     state,
@@ -34223,12 +34223,12 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
     target: `ledger/${ep}/ledger.json`,
     chain: null,
     backup: stagedPath,
-    backup_sha256: sha,
+    backup_sha256: beforeSha,
     backup_bytes: 100,
-    before: { revision: rev, null_b1_count: nullB1, ledger_sha256: sha },
-    intended_after: { revision: rev + 1, null_b1_count: 0, ledger_sha256: shaB },
+    before: { revision: rev, null_b1_count: nullB1, ledger_sha256: beforeSha },
+    intended_after: { revision: rev + 1, null_b1_count: 0, ledger_sha256: afterSha },
     intended_blob: { path: mintBlobPath, bytes: 50, sha256: sha },
-    ...(state === "done" ? { after: { revision: rev + 1, null_b1_count: 0, ledger_sha256: shaB } } : {})
+    ...(state === "done" ? { after: { revision: rev + 1, null_b1_count: 0, ledger_sha256: afterSha } } : {})
   });
 
   // 1d. precheck step
@@ -34248,7 +34248,7 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
   });
 
   // 1e. writer_state step
-  const mkWriterStateStep = ({ state = "prepared", subtype = "partial", beforeState = "off", afterState = "partial", rev = 1 } = {}) => ({
+  const mkWriterStateStep = ({ state = "prepared", subtype = "partial", beforeState = "off", afterState = "partial", rev = 1, beforeSha = sha, afterSha = shaB, digest = endpointsDigest([ep]) } = {}) => ({
     kind: "writer_state",
     id: `writer_state:${cid}:${subtype}`,
     state,
@@ -34256,13 +34256,13 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
     target: "ledger/owner-select-writer-state.json",
     chain: null,
     backup: beforeState === "off" ? null : stagedPath,
-    backup_sha256: beforeState === "off" ? null : sha,
+    backup_sha256: beforeState === "off" ? null : beforeSha,
     backup_bytes: beforeState === "off" ? null : 100,
     before: beforeState === "off"
       ? { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 }
-      : { exists: true, sha256: sha, state: beforeState, campaign_id: cid, endpoints_digest: endpointsDigest([ep]), revision: rev },
-    intended_after: { exists: true, sha256: shaB, state: afterState, campaign_id: cid, endpoints_digest: endpointsDigest([ep]), revision: rev + 1 },
-    ...(state === "done" ? { after: { exists: true, sha256: shaB, state: afterState, campaign_id: cid, endpoints_digest: endpointsDigest([ep]), revision: rev + 1 } } : {})
+      : { exists: true, sha256: beforeSha, state: beforeState, campaign_id: cid, endpoints_digest: digest, revision: rev },
+    intended_after: { exists: true, sha256: afterSha, state: afterState, campaign_id: cid, endpoints_digest: digest, revision: rev + 1 },
+    ...(state === "done" ? { after: { exists: true, sha256: afterSha, state: afterState, campaign_id: cid, endpoints_digest: digest, revision: rev + 1 } } : {})
   });
 
   // 2. 组装合法的 Operation A / B / direct
@@ -34311,10 +34311,10 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
     notes: [],
     steps: [
       ...enterSteps,
-      mkCampaignStep({ action: "seal", beforeState: "open", afterState: "sealed" }),
+      mkCampaignStep({ action: "seal", beforeState: "open", afterState: "sealed", beforeSha: sha, afterSha: shaB }),
       mkPrecheckStep({ counts: 0 }),
       mkSchemaEndpointStep({ subtype: "strict", from: "1.1-transition", to: "1.1", rev: 2 }),
-      mkCampaignStep({ action: "complete", beforeState: "sealed", afterState: "complete" }),
+      mkCampaignStep({ action: "complete", beforeState: "sealed", afterState: "complete", beforeSha: shaB, afterSha: shaC }),
       mkWriterStateStep({ subtype: "on", beforeState: "partial", afterState: "on", rev: 1 })
     ]
   };
@@ -34340,12 +34340,12 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
     notes: [],
     steps: [
       ...enterSteps,
-      mkCampaignStep({ action: "open", beforeState: "absent", afterState: "open" }),
-      mkPrecheckStep({ counts: 0 }),
+      mkCampaignStep({ action: "open", beforeState: "absent", afterState: "open", afterSha: shaB }),
+      mkPrecheckStep({ counts: 0, rev: 1 }),
       mkSchemaEndpointStep({ subtype: "direct", from: "1.0", to: "1.1", rev: 1 }),
-      mkCampaignStep({ action: "seal", beforeState: "open", afterState: "sealed" }),
-      mkCampaignStep({ action: "complete", beforeState: "sealed", afterState: "complete" }),
-      mkWriterStateStep({ subtype: "on", beforeState: "partial", afterState: "on", rev: 1 })
+      mkCampaignStep({ action: "seal", beforeState: "open", afterState: "sealed", beforeSha: shaB, afterSha: shaC }),
+      mkCampaignStep({ action: "complete", beforeState: "sealed", afterState: "complete", beforeSha: shaC, afterSha: shaD }),
+      mkWriterStateStep({ subtype: "on", beforeState: "off", afterState: "on", rev: 0 })
     ]
   };
   assert.equal(journalProblem(docDirect, { maintenanceDir: "/tmp/maint" }), null, "合法 operation direct 在 osm_direct 阶段通过");
@@ -34414,7 +34414,7 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
     ...docA,
     steps: docA.steps.map((s) => s.id.startsWith("writer_state:") ? { ...s, intended_after: { ...s.intended_after, endpoints_digest: null } } : s)
   };
-  assert.equal(journalProblem(badAPartialDigestNull, { maintenanceDir: "/tmp/maint" }), "writer_state:partial 的 endpoints_digest 必须等于 campaign:open 的 endpoints_digest");
+  assert.equal(journalProblem(badAPartialDigestNull, { maintenanceDir: "/tmp/maint" }), "writer_state intended_after 形状不对");
 
   // 7g. writer_state:on 与 campaign:complete 约束：on done 时 complete 必须已 done
   const docBOnDoneCampPrep = {
@@ -34573,9 +34573,15 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
   let failDirFsync = false;
   fs.fsyncSync = function(fd) {
     if (failDirFsync) {
-      const err = new Error("EIO: i/o error");
-      err.code = "EIO";
-      throw err;
+      try {
+        if (fs.fstatSync(fd).isDirectory()) {
+          const err = new Error("EIO: i/o error");
+          err.code = "EIO";
+          throw err;
+        }
+      } catch (e) {
+        if (e.code === "EIO") throw e;
+      }
     }
     return origFsync.apply(this, arguments);
   };
@@ -34593,20 +34599,18 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
   // P1-4: 状态链闭合（journal 内）
   // ----------------------------------------------------
   const enterSteps = [
-    {
-      at: "2026-09-07T10:00:00.000Z", backup: null, backup_bytes: null, backup_sha256: null,
-      before: null, chain: null, id: "current:endpoint_111111111111111111111111", intended_after: null,
-      kind: "current", state: "done", target: "current"
-    },
-    {
-      at: "2026-09-07T10:00:00.000Z", backup: null, backup_bytes: null, backup_sha256: null,
-      before: null, chain: null, id: "current:endpoint_222222222222222222222222", intended_after: null,
-      kind: "current", state: "done", target: "current"
-    }
+    { kind: "timer", id: "timer:claude", state: "done", at: "2026-09-07T10:00:00.000Z", target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
+    { kind: "timer", id: "timer:codex", state: "done", at: "2026-09-07T10:00:00.000Z", target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
+    { kind: "stub", id: "stub:claude", state: "done", at: "2026-09-07T10:00:00.000Z", target: "versions/x", chain: null, before: null, intended_after: "versions/maintenance-" + tok1, after: "versions/maintenance-" + tok1, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "stub", id: "stub:codex", state: "done", at: "2026-09-07T10:00:00.000Z", target: "stub", chain: null, before: null, intended_after: "versions/maintenance-" + tok1, after: "versions/maintenance-" + tok1, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "current", id: "current:claude", state: "done", at: "2026-09-07T10:00:00.000Z", target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok1, after: "versions/maintenance-" + tok1, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "current", id: "current:codex", state: "done", at: "2026-09-07T10:00:00.000Z", target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok1, after: "versions/maintenance-" + tok1, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "gate", id: "gate", state: "done", at: "2026-09-07T10:00:00.000Z", target: "gate", chain: null, before: null, intended_after: { token: tok1 }, after: { token: tok1, txnUncleared: null }, backup: null, backup_sha256: null, backup_bytes: null }
   ];
 
   const ep1 = eps[0];
   const ep2 = eps[1];
+  const stagedBackup = "/tmp/maint/" + tok1 + ".staged/backup.json";
 
   // Codex 反例 1: A 链断裂（schema_endpoint:transition intended_after ≠ mint before）
   const docABase = {
@@ -34628,14 +34632,14 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
         kind: "campaign", state: "prepared", target: "ledger/owner-select-campaign.json"
       },
       {
-        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "2".repeat(64),
+        at: "2026-09-07T10:00:00.000Z", backup: stagedBackup, backup_bytes: 10, backup_sha256: "2".repeat(64),
         before: { schema_version: "1.0", revision: 1, ledger_sha256: "2".repeat(64) },
         chain: null, id: "schema_endpoint:" + ep1 + ":transition",
         intended_after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: "3".repeat(64) },
         kind: "schema_endpoint", state: "prepared", target: "ledger/" + ep1 + "/ledger.json"
       },
       {
-        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "3".repeat(64),
+        at: "2026-09-07T10:00:00.000Z", backup: stagedBackup, backup_bytes: 10, backup_sha256: "3".repeat(64),
         before: { revision: 2, ledger_sha256: "3".repeat(64), null_b1_count: 5 },
         chain: null, id: "mint:" + ep1,
         intended_after: { revision: 3, ledger_sha256: "4".repeat(64), null_b1_count: 0 },
@@ -34655,7 +34659,7 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
 
   const badDocAChainBroken = {
     ...docABase,
-    steps: docABase.steps.map((s) => s.kind === "mint" ? { ...s, before: { ...s.before, revision: 99 } } : s)
+    steps: docABase.steps.map((s) => s.kind === "mint" ? { ...s, before: { ...s.before, revision: 99 }, intended_after: { ...s.intended_after, revision: 100 } } : s)
   };
   assert.match(journalProblem(badDocAChainBroken, { maintenanceDir: "/tmp/maint" }), /schema_endpoint.*mint.*状态链/u, "A transition->mint 链断裂必拒");
 
@@ -34672,7 +34676,7 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
     steps: [
       ...enterSteps,
       {
-        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "1".repeat(64),
+        at: "2026-09-07T10:00:00.000Z", backup: stagedBackup, backup_bytes: 10, backup_sha256: "1".repeat(64),
         before: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
         chain: null, id: "campaign:" + cid1 + ":seal",
         intended_after: { exists: true, sha256: "2".repeat(64), state: "sealed", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
@@ -34686,21 +34690,21 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
         kind: "precheck", state: "prepared", target: "ledger/" + ep1 + "/ledger.json"
       },
       {
-        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "4".repeat(64),
+        at: "2026-09-07T10:00:00.000Z", backup: stagedBackup, backup_bytes: 10, backup_sha256: "4".repeat(64),
         before: { schema_version: "1.1-transition", revision: 3, ledger_sha256: "4".repeat(64) },
         chain: null, id: "schema_endpoint:" + ep1 + ":strict",
         intended_after: { schema_version: "1.1", revision: 4, ledger_sha256: "5".repeat(64) },
         kind: "schema_endpoint", state: "prepared", target: "ledger/" + ep1 + "/ledger.json"
       },
       {
-        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "2".repeat(64),
+        at: "2026-09-07T10:00:00.000Z", backup: stagedBackup, backup_bytes: 10, backup_sha256: "2".repeat(64),
         before: { exists: true, sha256: "2".repeat(64), state: "sealed", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
         chain: null, id: "campaign:" + cid1 + ":complete",
         intended_after: { exists: true, sha256: "6".repeat(64), state: "complete", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
         kind: "campaign", state: "prepared", target: "ledger/owner-select-campaign.json"
       },
       {
-        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "7".repeat(64),
+        at: "2026-09-07T10:00:00.000Z", backup: stagedBackup, backup_bytes: 10, backup_sha256: "7".repeat(64),
         before: { exists: true, sha256: "7".repeat(64), state: "partial", campaign_id: cid1, endpoints_digest: endpointsDigest([ep1]), revision: 1 },
         chain: null, id: "writer_state:" + cid1 + ":on",
         intended_after: { exists: true, sha256: "8".repeat(64), state: "on", campaign_id: cid1, endpoints_digest: endpointsDigest([ep1]), revision: 2 },
@@ -34712,7 +34716,7 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
 
   const badDocBChainBroken = {
     ...docBBase,
-    steps: docBBase.steps.map((s) => s.kind === "schema_endpoint" ? { ...s, before: { ...s.before, revision: 99 } } : s)
+    steps: docBBase.steps.map((s) => s.kind === "schema_endpoint" ? { ...s, before: { ...s.before, revision: 99 }, intended_after: { ...s.intended_after, revision: 100 } } : s)
   };
   assert.match(journalProblem(badDocBChainBroken, { maintenanceDir: "/tmp/maint" }), /precheck.*schema_endpoint.*状态链/u, "B precheck->strict 链断裂必拒");
 
@@ -34743,21 +34747,21 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
         kind: "precheck", state: "prepared", target: "ledger/" + ep1 + "/ledger.json"
       },
       {
-        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "2".repeat(64),
+        at: "2026-09-07T10:00:00.000Z", backup: stagedBackup, backup_bytes: 10, backup_sha256: "2".repeat(64),
         before: { schema_version: "1.0", revision: 1, ledger_sha256: "2".repeat(64) },
         chain: null, id: "schema_endpoint:" + ep1 + ":direct",
         intended_after: { schema_version: "1.1", revision: 2, ledger_sha256: "3".repeat(64) },
         kind: "schema_endpoint", state: "prepared", target: "ledger/" + ep1 + "/ledger.json"
       },
       {
-        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "1".repeat(64),
+        at: "2026-09-07T10:00:00.000Z", backup: stagedBackup, backup_bytes: 10, backup_sha256: "1".repeat(64),
         before: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
         chain: null, id: "campaign:" + cid1 + ":seal",
         intended_after: { exists: true, sha256: "4".repeat(64), state: "sealed", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
         kind: "campaign", state: "prepared", target: "ledger/owner-select-campaign.json"
       },
       {
-        at: "2026-09-07T10:00:00.000Z", backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "4".repeat(64),
+        at: "2026-09-07T10:00:00.000Z", backup: stagedBackup, backup_bytes: 10, backup_sha256: "4".repeat(64),
         before: { exists: true, sha256: "4".repeat(64), state: "sealed", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
         chain: null, id: "campaign:" + cid1 + ":complete",
         intended_after: { exists: true, sha256: "5".repeat(64), state: "complete", campaign_id: cid1, endpoints: [ep1], endpoints_digest: endpointsDigest([ep1]) },
@@ -34776,13 +34780,13 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
 
   const badDirectSealChain = {
     ...docDirectBase,
-    steps: docDirectBase.steps.map((s) => s.id.endsWith(":seal") ? { ...s, before: { ...s.before, sha256: "9".repeat(64) } } : s)
+    steps: docDirectBase.steps.map((s) => s.id.endsWith(":seal") ? { ...s, before: { ...s.before, sha256: "9".repeat(64) }, backup_sha256: "9".repeat(64) } : s)
   };
   assert.match(journalProblem(badDirectSealChain, { maintenanceDir: "/tmp/maint" }), /seal.*before.*open.*intended_after/u, "direct seal.before ≠ open.intended_after 必拒");
 
   const badDirectCompleteChain = {
     ...docDirectBase,
-    steps: docDirectBase.steps.map((s) => s.id.endsWith(":complete") ? { ...s, before: { ...s.before, sha256: "9".repeat(64) } } : s)
+    steps: docDirectBase.steps.map((s) => s.id.endsWith(":complete") ? { ...s, before: { ...s.before, sha256: "9".repeat(64) }, backup_sha256: "9".repeat(64) } : s)
   };
   assert.match(journalProblem(badDirectCompleteChain, { maintenanceDir: "/tmp/maint" }), /complete.*before.*seal.*intended_after/u, "complete.before ≠ seal.intended_after 必拒");
 
@@ -34794,8 +34798,9 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
     ...docDirectBase,
     steps: docDirectBase.steps.map((s) => s.id.startsWith("writer_state:") ? {
       ...s,
-      backup: "/tmp/backup", backup_bytes: 10, backup_sha256: "7".repeat(64),
-      before: { exists: true, sha256: "7".repeat(64), state: "partial", campaign_id: cid1, endpoints_digest: endpointsDigest([ep1]), revision: 1 }
+      backup: stagedBackup, backup_bytes: 10, backup_sha256: "7".repeat(64),
+      before: { exists: true, sha256: "7".repeat(64), state: "partial", campaign_id: cid1, endpoints_digest: endpointsDigest([ep1]), revision: 1 },
+      intended_after: { ...s.intended_after, revision: 2 }
     } : s)
   };
   assert.match(journalProblem(badDirectOnBeforePartial, { maintenanceDir: "/tmp/maint" }), /direct.*writer_state.*off/u, "direct 的 on 要求 before 为 off");
@@ -34806,7 +34811,8 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
     steps: docBBase.steps.map((s) => s.id.startsWith("writer_state:") ? {
       ...s,
       backup: null, backup_bytes: null, backup_sha256: null,
-      before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 }
+      before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 },
+      intended_after: { ...s.intended_after, revision: 1 }
     } : s)
   };
   assert.match(journalProblem(badBOnBeforeOff, { maintenanceDir: "/tmp/maint" }), /owner_select_migration_b.*writer_state.*partial/u, "B 的 on 要求 before 为 partial");

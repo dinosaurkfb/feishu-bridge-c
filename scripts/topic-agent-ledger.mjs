@@ -896,16 +896,31 @@ export function validateLedger(doc, { endpointId } = {}) {
     if (computed.join(",") !== effIds.join(",")) return bad("operation " + opId + "：proof_effects 与 (affected∩提交后有 proof) 不一致（5b）");
   }
 
-  // R48 G-handle：非空 selection_handle 必须逐字等于「产生它的 op」的 result.selection_handle；产生源集只认
-  //   {create_b1, mint_selection_handles, attach_a2, request_rebind, reissue_selection_handle}（受 §6 定义约束）。
-  //   本单只接现存生产源 create_b1 / attach_a2（二者 result 已扩展携带 selection_handle）；新 op 源待 §6 定义后接入。
-  const selectionHandleProducers = ["create_b1", "attach_a2"]; // mint_selection_handles / request_rebind / reissue_selection_handle 为设计缺口，未接入
+  // R48 G-handle（§7.2 可得部分）：非空 handle 必须逐字等于「最近一笔产生它的 op」；产生源集
+  //   selection_handle={create_b1,mint_selection_handles,attach_a2,reissue_selection_handle}（各按对应 result 字段取）；
+  //   rebind_handle={request_rebind}（result.rebind_handle）。handle-only op 改 origin ⇒ 现行 origin 即最近产生源。
+  //   endpoint 内所有 live handle 全局唯一。
+  const selProd = { create_b1: (r, id) => r.selection_handle, attach_a2: (r, id) => r.selection_handle, reissue_selection_handle: (r, id) => r.new_handle, mint_selection_handles: (r, id) => { const m = Array.isArray(r.minted) ? r.minted.find((x) => x.target_id === id) : null; return m && m.selection_handle; } };
+  const selProdExp = { create_b1: (r) => r.handle_expires_at, attach_a2: (r) => r.handle_expires_at, reissue_selection_handle: (r) => r.new_expires_at, mint_selection_handles: (r, id) => { const m = Array.isArray(r.minted) ? r.minted.find((x) => x.target_id === id) : null; return m && m.handle_expires_at; } };
+  const seenSel = new Set(), seenReb = new Set();
   for (const [id, rec] of live) {
-    if (rec.kind !== "live" || rec.selection_handle == null) continue;
-    const src = doc.operations[rec.origin_operation_id];
-    if (!src) continue; // origin 在别处已在 G13 校验
-    if (!selectionHandleProducers.includes(src.op_type)) return bad(id + "：selection_handle 非空但产生源不是合法产生源（G-handle）");
-    if (!isObj(src.result) || src.result.selection_handle !== rec.selection_handle) return bad(id + "：selection_handle 与产生源 result 不一致（G-handle）");
+    if (rec.kind !== "live") continue;
+    if (rec.selection_handle != null) {
+      const src = doc.operations[rec.origin_operation_id];
+      if (!src || !(src.op_type in selProd)) return bad(id + "：selection_handle 非空但产生源不是合法产生源（G-handle）");
+      if (selProd[src.op_type](src.result, id) !== rec.selection_handle) return bad(id + "：selection_handle 与产生源 result 不一致（G-handle）");
+      if (selProdExp[src.op_type](src.result, id) !== rec.handle_expires_at) return bad(id + "：handle_expires_at 与产生源 result 不一致（G-handle）");
+      if (seenSel.has(rec.selection_handle)) return bad(id + "：selection_handle 全局不唯一（G-handle）");
+      seenSel.add(rec.selection_handle);
+    }
+    if (rec.rebind_handle != null) {
+      const src = doc.operations[rec.origin_operation_id];
+      if (!src || src.op_type !== "request_rebind") return bad(id + "：rebind_handle 非空但产生源不是 request_rebind（G-handle）");
+      if (src.result.rebind_handle !== rec.rebind_handle) return bad(id + "：rebind_handle 与产生源 result 不一致（G-handle）");
+      if (src.result.rebind_expires_at !== rec.rebind_expires_at) return bad(id + "：rebind_expires_at 与产生源 result 不一致（G-handle）");
+      if (seenReb.has(rec.rebind_handle)) return bad(id + "：rebind_handle 全局不唯一（G-handle）");
+      seenReb.add(rec.rebind_handle);
+    }
   }
 
   // R48 G15'：strict(1.1) 拒 legacy pairing 形状（matched_fields / pending_token_state）；过渡(1.1-transition)容旧+新；1.0 维持现状。

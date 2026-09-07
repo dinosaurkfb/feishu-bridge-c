@@ -25283,6 +25283,24 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.match(v(mkOpDoc("owner_select_reaffirm", { target_id: taid("a"), affected_live_ids_after_commit: [taid("a")], proof_effects: [], new_link_proof: lProof, tombstone_remap: tombRemap, selection_message_id: "msg_3" }, 2)).why, /owner_select_reaffirm result 形状不对/, "reaffirm 缺 proof 形状拒");
   });
 
+  // R48 G-handle（§7.2 可得部分）：mint_selection_handles → B1 的 selection_handle/handle_expires_at 与产生源逐字等 + 全局唯一。
+  test("R48 账本侧：G-handle —— mint_selection_handles 产 B1 handle，provenance 一致合法 / 不一致拒（正反向）", () => {
+    const iso = (t) => new Date(t).toISOString();
+    const hx = (n) => String(n).repeat(64);
+    const taid = (h) => "ta_" + h.repeat(32);
+    const uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000";
+    const b1Id = taid("a"), selH = "osh_" + "b".repeat(32), exp = iso(1700000001000);
+    const initOp = { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } };
+    const mkDoc = (recHandle) => ({
+      schema_version: "1.1", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: CH, authority_mode: "shadow", revision: 2,
+      operations: { [uuid(1)]: initOp, [uuid(2)]: { op_type: "mint_selection_handles", terminal_kind: "mint_selection_handles", request_key: "req_mint", fingerprint: hx(2), result_revision: 2, result: { endpoint: EP, minted: [{ target_id: b1Id, selection_handle: selH, handle_expires_at: exp }], affected_live_ids_after_commit: [b1Id], proof_effects: [] } } },
+      records: { [b1Id]: { topic_agent_id: b1Id, kind: "live", chat_id: "oc_g", anchor_candidate: null, aliases: { root_om: "om_x", session_id: null }, binding_target: { runtime: "claude", project_root: "/Users/dk/p", claude_session_id: uuid(3) }, facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }, generation_lineage_id: "lin_1", origin_operation_id: uuid(2), binding_proof: null, locator_link_proof_ref: null, created_at: iso(1700000000000), updated_at: iso(1700000000000), selection_handle: recHandle, handle_expires_at: exp, rebind_handle: null, rebind_expires_at: null } },
+    });
+    assert.ok(TAL.validateLedger(mkDoc(selH), { endpointId: EP }).ok, "mint 产 B1 handle provenance 一致合法");
+    const bad = TAL.validateLedger(mkDoc("osh_" + "c".repeat(32)), { endpointId: EP });
+    assert.match(bad.why, /selection_handle 与产生源 result 不一致/, "mint 产 B1 handle 不一致拒：" + bad.why);
+  });
+
   // R37 裁定：M1a 收据逐端点原子启用。接线测试需要让 EP 处于两种收据态：
   //   · ok（ledger_init done）→ 双写强制（跑 shadow 后缀）；
   //   · never_initialized（无收据）→ 合法 legacy-only（不写 shadow）。

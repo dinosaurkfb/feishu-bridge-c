@@ -673,7 +673,7 @@ const RESULT_SHAPE = Object.freeze({
     if (!hasHist && !hasCurr) return false;
     return isId(r.surviving_id) && isId(r.tombstoned_id) && (demoted === null || isId(demoted))
       && allDistinct(r.surviving_id, r.tombstoned_id, demoted)
-      && SELECTION_HANDLE_SHAPE.test(r.selection_handle) && isCanonicalIso(r.authorized_at) && AUTHORIZED_BY_SHAPE.test(r.authorized_by)
+      && ANY_HANDLE_SHAPE.test(r.selection_handle) && isCanonicalIso(r.authorized_at) && AUTHORIZED_BY_SHAPE.test(r.authorized_by)
       && AILY_SESSION_SHAPE.test(r.selected_session_id) && OM_SHAPE.test(r.selected_root_om) && isOperationId(r.selection_operation_id)
       && typeof r.selection_message_id === "string" && typeof r.selection_basis === "string"
       && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && validProofEffects(r.proof_effects);
@@ -692,7 +692,7 @@ const RESULT_SHAPE = Object.freeze({
         && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_id && r.proof_effects[0].binding_effect === "produced" && r.proof_effects[0].link_effect === "preserved"),
   anchor: (r) => (keysOf(r) === "affected_id" && isId(r.affected_id))
     || (keysOf(r) === "affected_id,affected_live_ids_after_commit,authorized_at,authorized_by,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id"
-        && isId(r.affected_id) && SELECTION_HANDLE_SHAPE.test(r.selection_handle) && isCanonicalIso(r.authorized_at) && AUTHORIZED_BY_SHAPE.test(r.authorized_by)
+        && isId(r.affected_id) && ANY_HANDLE_SHAPE.test(r.selection_handle) && isCanonicalIso(r.authorized_at) && AUTHORIZED_BY_SHAPE.test(r.authorized_by)
         && AILY_SESSION_SHAPE.test(r.selected_session_id) && OM_SHAPE.test(r.selected_root_om) && isOperationId(r.selection_operation_id)
         && typeof r.selection_message_id === "string" && typeof r.selection_basis === "string"
         && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.affected_id
@@ -716,7 +716,7 @@ const RESULT_SHAPE = Object.freeze({
     || (keysOf(r) === "affected_id,affected_live_ids_after_commit,authorized_at,authorized_by,new_session_id,old_session_id,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,tombstoned_a1_id"
         && isId(r.affected_id) && AILY_SESSION_SHAPE.test(r.old_session_id) && AILY_SESSION_SHAPE.test(r.new_session_id) && r.old_session_id !== r.new_session_id
         && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at)
-        && REBIND_HANDLE_SHAPE.test(r.selection_handle) && OM_SHAPE.test(r.selected_root_om) && r.selected_session_id === r.new_session_id
+        && ANY_HANDLE_SHAPE.test(r.selection_handle) && OM_SHAPE.test(r.selected_root_om) && r.selected_session_id === r.new_session_id
         && (r.tombstoned_a1_id === null || isId(r.tombstoned_a1_id))
         && typeof r.selection_message_id === "string" && r.selection_basis === "rebind"
         && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.affected_id
@@ -793,6 +793,12 @@ function operationProblem(op, topRevision) {
   if (typeof op.fingerprint !== "string" || !SHA_SHAPE.test(op.fingerprint)) return "fingerprint 形状不对";
   if (!Number.isInteger(op.result_revision) || op.result_revision < 1 || op.result_revision > topRevision) return "result_revision 越界";
   if (!isObj(op.result) || !RESULT_SHAPE[op.op_type](op.result)) return op.op_type + " result 形状不对";
+  if ((op.op_type === "activate" || op.op_type === "anchor") && op.result.selection_handle && !op.result.selection_handle.startsWith("osh_")) {
+    return "activate/anchor handle 前缀必须为 osh_ (G15′)";
+  }
+  if (op.op_type === "rebind_session_alias" && op.result.selection_handle && !op.result.selection_handle.startsWith("orh_")) {
+    return "rebind_session_alias handle 前缀必须为 orh_ (G15′)";
+  }
   if (op.op_type === "initialize_shadow" && op.result_revision !== 1) return "initialize 的 result_revision 必为 1";
   if (op.op_type === "authority_cutover" && op.result.revision_at_cutover !== op.result_revision) return "cutover 的 revision_at_cutover 必等于 result_revision";
   return null;

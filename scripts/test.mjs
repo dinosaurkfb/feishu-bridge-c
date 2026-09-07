@@ -32625,10 +32625,29 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
     assert.match(String(TAL.validateLedger(dMismatch, { endpointId: EP }).why), /G-handle/u, "G-handle 溯源不符拒");
 
     // 全局唯一：两 live 记录共享同一 selection_handle → 拒
+    const opId2 = "00000000-0000-4000-8000-000000000003";
     const dDup = structuredClone(d);
+    dDup.revision = 3;
+    dDup.operations[opId2] = {
+      op_type: "create_b1",
+      terminal_kind: "create_b1",
+      request_key: "rk_b1_2",
+      fingerprint: "2".repeat(64),
+      result_revision: 3,
+      result: {
+        created_id: taId2,
+        selection_handle: hOSH1,
+        handle_expires_at: ISO,
+        affected_live_ids_after_commit: [taId2],
+        proof_effects: []
+      }
+    };
     dDup.records[taId2] = {
       ...structuredClone(d.records[taId1]),
       topic_agent_id: taId2,
+      origin_operation_id: opId2,
+      generation_lineage_id: "lin_2",
+      binding_target: { ...TGT, claude_session_id: "00000000-0000-4000-8000-000000000002" },
       aliases: { session_id: null, root_om: "om_root2" }
     };
     assert.match(String(TAL.validateLedger(dDup, { endpointId: EP }).why), /G-handle.*唯一|handle.*唯一/u, "G-handle live handle 全局唯一");

@@ -36447,6 +36447,68 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
   }
 });
 
+/* ─────────────────────────── R51：账本侧迁移执行器（owner-select operation A） ─────────────────────────── */
+
+{
+  // R51 公共构造器：手工 1.1-transition 形状记录（17 键）与封闭 proof 形状，只给本段测试用。
+  const EP51 = "endpoint_" + "1".repeat(24);
+  const T0 = "2026-09-07T10:00:00.000Z";
+  const R51_OP = "01234567-89ab-4def-8012-3456789abcde";
+  const R51_TGT = { runtime: "claude", project_root: "/p/r51", claude_session_id: "00000000-0000-4000-8000-0000000000aa" };
+  const r51Live = (id, facts, extra = {}) => ({
+    kind: "live", topic_agent_id: id, chat_id: "oc_r51",
+    created_at: T0, updated_at: T0, origin_operation_id: R51_OP,
+    aliases: {
+      session_id: facts.session === "present" ? "sess_r51_" + id.slice(-4) : null,
+      root_om: facts.anchor === "present" ? "om_r51_" + id.slice(-4) : null
+    },
+    anchor_candidate: null,
+    binding_target: facts.binding === "none" ? null : R51_TGT,
+    generation_lineage_id: facts.generation === "n/a" ? null : "lin_r51_" + id.slice(-4),
+    binding_proof: null, locator_link_proof_ref: null,
+    facts,
+    selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null,
+    ...extra
+  });
+  const r51PairingBinding = (om) => ({ kind: "pairing", authorized_by: "ou_r51", authorized_at: T0, matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" });
+  const r51Attach = () => ({ kind: "attach", authorized_by: "ou_r51", authorized_at: T0, claim_key: "b".repeat(64) });
+  const r51Link = (om) => ({ kind: "pairing_merge", by_identity: "user", matched_at: T0, matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" });
+  const r51F4Link = (om) => ({ kind: "f4_anchor", by_identity: "user", matched_at: T0, matched_om: om, matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" });
+  const r51Tomb = (id, fwd, proofRef) => ({ kind: "forwarding_tombstone", topic_agent_id: id, forwards_to: fwd, merged_at: T0, origin_operation_id: R51_OP, proof_ref: proofRef });
+  const r51Doc = (records) => ({
+    artifact_type: "feishu_bridge_topic_agent_ledger", authority_mode: "shadow", chain: "claude",
+    endpoint_id: EP51, operations: {}, records, revision: 1, schema_version: "1.1-transition"
+  });
+  const R51_B1F = { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" };
+  const R51_B3F = { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" };
+  const R51_A3F = { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "n/a" };
+  const R51_A2F = { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" };
+
+  test("R51 §三 migrationInventory：存量 proof 与 null-B1 盘点（桶之和自洽）", () => {
+    const idB1a = "ta_" + "0".repeat(32), idB1b = "ta_" + "1".repeat(32), idB1h = "ta_" + "2".repeat(32);
+    const idB3 = "ta_" + "3".repeat(32), idA3 = "ta_" + "4".repeat(32), idA2 = "ta_" + "5".repeat(32);
+    const idT1 = "ta_" + "6".repeat(32), idT2 = "ta_" + "7".repeat(32);
+    const H = "osh_" + "a".repeat(32);
+    const records = {
+      [idB1a]: r51Live(idB1a, R51_B1F),
+      [idB1b]: r51Live(idB1b, R51_B1F),
+      [idB1h]: r51Live(idB1h, R51_B1F, { selection_handle: H, handle_expires_at: T0 }),
+      [idB3]: r51Live(idB3, R51_B3F, { binding_proof: r51PairingBinding("om_b3"), locator_link_proof_ref: r51Link("om_b3") }),
+      [idA3]: r51Live(idA3, R51_A3F, { binding_proof: r51Attach(), locator_link_proof_ref: r51F4Link("om_a3") }),
+      [idA2]: r51Live(idA2, R51_A2F, { binding_proof: r51Attach() }),
+      [idT1]: r51Tomb(idT1, idB3, { kind: "pairing", om: "om_t1", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }),
+      [idT2]: r51Tomb(idT2, idA3, { kind: "owner_select_merge_v1", selection_operation_id: R51_OP, selected_root_om: "om_t2", selection_handle: H })
+    };
+    const inv = TAL.migrationInventory(r51Doc(records));
+    assert.deepEqual(inv, {
+      legacy_proof_count: 3, // B3 pairing binding + A3 f4_anchor link + 旧 pairing tombstone（owner_select_merge_v1 tombstone 不计）
+      null_b1_count: 2,      // idB1a + idB1b（idB1h 已有 handle 不计；A2/B3/A3 非 B1 不计）
+      null_b1_ids: [idB1a, idB1b].sort()
+    }, "桶之和与逐条构造对得上");
+    assert.deepEqual(TAL.migrationInventory(r51Doc({})), { legacy_proof_count: 0, null_b1_count: 0, null_b1_ids: [] }, "空账本全零");
+  });
+}
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

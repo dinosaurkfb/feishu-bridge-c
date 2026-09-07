@@ -9,7 +9,7 @@ import { enterMaintenance, rollbackOperation } from "./operation.mjs";
 import { aggregateEndpointReceipts, endpointReceipt } from "./ledger-receipt.mjs";
 import { campaignIdFor } from "./owner-select-derived.mjs";
 import { readCampaignState, readWriterState, writeCampaignState, writeWriterState, readCampaignDocVerified, readWriterStateDocVerified } from "./owner-select-state.mjs";
-import { resolveEndpointDir, validateLedgerRoot, loadLedger, schemaUpgrade, mintSelectionHandles, applySchemaUpgrade, buildMintPlan, mintPlanBytes, mintPlanProblem, migrationInventory, schemaUpgradeOperationId } from "../topic-agent-ledger.mjs";
+import { resolveEndpointDir, validateLedgerRoot, loadLedger, schemaUpgrade, mintSelectionHandles, applySchemaUpgrade, buildMintPlan, applyMintPlan, mintPlanBytes, mintPlanProblem, migrationInventory, schemaUpgradeOperationId, canonKey, sha256, serializeLedger } from "../topic-agent-ledger.mjs";
 
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
 const errText = (err) => String(err?.code ?? err?.message ?? err);
@@ -65,6 +65,55 @@ export function osmDrainedPrecheck(ctx, { token, env = process.env } = {}) {
     return preFail("writer_state_blocked", "writer-state " + wsNow.state + "（id " + String(wsNow.campaign_id ?? "?").slice(0, 8) + "）不被本 operation 接受");
   }
   return { ok: true, frozen: frz.endpoints, campaign: campNow.state, writer: wsNow.state };
+}
+
+// §二.3 pre-forward 状态矩阵（§8 mint plan 段）：每 ep 盘存 `<token>.staged/intended/mint-<ep>.json`——
+//   缺席 → buildMintPlan → mintPlanBytes O_EXCL 0600 写满 fsync → fsync intended/ 目录；恰一份且身份/before SHA/null-B1/重演 SHA 全符 → 复用；
+//   其它 → fail-closed 留在 drained。返回 { ok, plans:{ep:plan} }。
+const OSM_HANDLE_TTL_MS = 30 * 24 * 3600 * 1000;
+const fsyncDir = (dir) => { try { const fd = fs.openSync(dir, fs.constants.O_RDONLY); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } } catch { /* 目录 fsync 不可忽略时写失败在 open 前已抛 */ } };
+export function osmPreForwardPlanMatrix(ctx, { token, lease, env = process.env } = {}) {
+  void lease;
+  const fail = (reason, why) => ({ ok: false, reason, why: why ?? null, rollbackSafe: true });
+  const frz = frozenEndpoints(ctx.dir);
+  if (!frz.ok) return fail(frz.reason, frz.why);
+  const intendedDir = path.join(ctx.dir, token + ".staged", "intended");
+  fs.mkdirSync(intendedDir, { recursive: true, mode: 0o700 });
+  const cid = campaignIdFor(token);
+  const plans = {};
+  for (const ep of frz.endpoints) {
+    const d = resolveEndpointDir(ep, { env });
+    if (!d.ok) return fail("endpoint_unresolvable", ep + "：" + d.reason);
+    const L = loadLedger(d.dir, { endpointId: ep });
+    if (!L.ok) return fail("ledger_unreadable", ep + "：" + L.reason);
+    if (L.doc.schema_version !== "1.0") return fail("not_at_1_0", ep + "：schema " + L.doc.schema_version);
+    // §二.3：先用 applySchemaUpgrade 预算 schema_endpoint intended_after（transition 账本），mint 的 before = schema intended_after（状态链）。
+    const opId = schemaUpgradeOperationId(token, ep);
+    const budgeted = applySchemaUpgrade(L.doc, { operation_id: opId, request_key: token, from_schema: "1.0", to_schema: "1.1-transition" });
+    const budgetedSha = sha256(serializeLedger(budgeted));
+    const inv = migrationInventory(budgeted);
+    const planPath = path.join(intendedDir, "mint-" + ep + ".json");
+    let plan;
+    if (!fs.existsSync(planPath)) {
+      plan = buildMintPlan({ doc: budgeted, token, campaignId: cid, endpointId: ep, requestKey: token, now: ctx.now(), ttlMs: OSM_HANDLE_TTL_MS });
+      if (plan === null) return fail("build_plan_failed", ep + "：now/ttl 非法");
+      const planBytes = mintPlanBytes(plan);
+      const fd = fs.openSync(planPath, "w", 0o600); try { fs.writeSync(fd, planBytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      fsyncDir(intendedDir);
+    } else {
+      let raw;
+      try { raw = JSON.parse(fs.readFileSync(planPath, "utf-8")); } catch { return fail("plan_unreadable", ep + "：不是 JSON"); }
+      if (mintPlanProblem(raw) !== null) return fail("plan_invalid", ep + "：" + mintPlanProblem(raw));
+      if (raw.token !== token || raw.campaign_id !== cid || raw.endpoint !== ep || raw.request_key !== token) return fail("plan_identity_mismatch", ep + "：token/campaign/endpoint/request_key 与现场不符");
+      if (raw.before_ledger_sha256 !== budgetedSha) return fail("plan_before_sha_mismatch", ep + "：before SHA 与 schema intended_after 不符");
+      if (canonKey(raw.expected_null_b1_ids) !== canonKey(inv.null_b1_ids)) return fail("plan_nullb1_mismatch", ep + "：null-B1 集与 transition 账本不符");
+      const applied = applyMintPlan(budgeted, raw);
+      if (sha256(serializeLedger(applied)) !== raw.expected_ledger_sha256) return fail("plan_replay_mismatch", ep + "：按 plan 重演 SHA 与锚定不等");
+      plan = raw;
+    }
+    plans[ep] = plan;
+  }
+  return { ok: true, plans };
 }
 
 /** osmEnter：进门（安装面锁 → enterMaintenance(operation_kind="owner_select_migration_a") → drained）+ drained 只读前置。 */

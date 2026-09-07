@@ -33021,6 +33021,49 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
     };
     assert.equal(TAL.validateLedger(dClear, { endpointId: EP }).ok, true, "clear_anchor_handle 验证通过");
 
+    // P2-2：clear_anchor_handle / expire_rebind_handle / cancel_rebind / request_rebind 封闭单一键集（禁 affected_id）
+    for (const opType of ["clear_anchor_handle", "expire_rebind_handle", "cancel_rebind", "request_rebind"]) {
+      const dBadAff = mkBaseDoc("1.1");
+      dBadAff.revision = 2;
+      const baseRes = opType === "request_rebind"
+        ? { affected_id: taId1, affected_live_ids_after_commit: [taId1], proof_effects: [{ topic_agent_id: taId1, binding_effect: "preserved", link_effect: "preserved" }], rebind_expires_at: ISO, rebind_handle: hORH1 }
+        : opType === "clear_anchor_handle"
+        ? { affected_id: taId1, affected_live_ids_after_commit: [taId1], cleared: ["selection_handle", "handle_expires_at"], proof_effects: [{ topic_agent_id: taId1, binding_effect: "preserved", link_effect: "none" }] }
+        : { affected_id: taId1, affected_live_ids_after_commit: [taId1], cleared: ["rebind_handle", "rebind_expires_at"], proof_effects: [{ topic_agent_id: taId1, binding_effect: "preserved", link_effect: "preserved" }] };
+      dBadAff.operations[opId1] = {
+        op_type: opType,
+        terminal_kind: opType,
+        request_key: "rk_" + opType + "_bad",
+        fingerprint: "7".repeat(64),
+        result_revision: 2,
+        result: baseRes
+      };
+      dBadAff.records[taId1] = {
+        kind: "live",
+        topic_agent_id: taId1,
+        chat_id: "oc_chat1",
+        created_at: ISO,
+        updated_at: ISO,
+        origin_operation_id: opId1,
+        facts: opType === "clear_anchor_handle"
+          ? { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" }
+          : { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+        aliases: { session_id: "sess_1", root_om: "om_root1" },
+        binding_target: TGT,
+        binding_proof: { kind: "attach", authorized_by: "ou_owner1", authorized_at: ISO, claim_key: "3".repeat(64) },
+        locator_link_proof_ref: null,
+        generation_lineage_id: opType === "clear_anchor_handle" ? null : "lin_1",
+        anchor_candidate: "om_cand1",
+        selection_handle: null,
+        handle_expires_at: null,
+        rebind_handle: null,
+        rebind_expires_at: null
+      };
+      const vBadAff = TAL.validateLedger(dBadAff, { endpointId: EP });
+      assert.equal(vBadAff.ok, false, opType + " 带 affected_id 必须判定非法");
+      assert.match(String(vBadAff.why), new RegExp(opType + " result 形状不对", "u"), opType + " 报 result 形状不对");
+    }
+
     // schema_upgrade 终态 op 增量
     const dUpgrade = mkBaseDoc("1.1-transition");
     dUpgrade.revision = 2;

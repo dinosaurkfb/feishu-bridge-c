@@ -526,11 +526,11 @@ function opTouchedIds(op) {
     case "retarget": return Array.isArray(r.affected_ids) ? r.affected_ids : [];
     case "rebind_session_alias": return r.affected_id == null ? (Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : []) : [r.affected_id];
     case "mint_selection_handles": return Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : (Array.isArray(r.minted) ? r.minted.map((m) => m.target_id) : []);
-    case "clear_anchor_handle": return Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : (r.affected_id ? [r.affected_id] : (r.target_id ? [r.target_id] : []));
+    case "clear_anchor_handle": return Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : [];
     case "reissue_selection_handle": return Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : (r.target_id ? [r.target_id] : []);
     case "request_rebind":
     case "expire_rebind_handle":
-    case "cancel_rebind": return Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : (r.b3_id ? [r.b3_id] : (r.target_id ? [r.target_id] : (r.affected_id ? [r.affected_id] : [])));
+    case "cancel_rebind": return Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : [];
     case "owner_select_reaffirm": {
       const ids = r.target_id ? [r.target_id] : (Array.isArray(r.affected_live_ids_after_commit) ? [...r.affected_live_ids_after_commit] : []);
       if (Array.isArray(r.tombstone_remap)) for (const m of r.tombstone_remap) ids.push(m.old_tomb_id);
@@ -734,7 +734,7 @@ const RESULT_SHAPE = Object.freeze({
     && Array.isArray(r.minted) && r.minted.every((m, i) => isObj(m) && isId(m.target_id) && SELECTION_HANDLE_SHAPE.test(m.selection_handle) && isCanonicalIso(m.handle_expires_at) && (i === 0 || r.minted[i - 1].target_id < m.target_id))
     && canonKey(r.affected_live_ids_after_commit) === canonKey(r.minted.map((m) => m.target_id))
     && Array.isArray(r.proof_effects) && r.proof_effects.length === 0,
-  clear_anchor_handle: (r) => (keysOf(r) === "affected_live_ids_after_commit,cleared,proof_effects" || keysOf(r) === "affected_id,affected_live_ids_after_commit,cleared,proof_effects")
+  clear_anchor_handle: (r) => keysOf(r) === "affected_live_ids_after_commit,cleared,proof_effects"
     && canonKey(r.cleared) === canonKey(["selection_handle", "handle_expires_at"])
     && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1
     && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_live_ids_after_commit[0] && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "none",
@@ -751,15 +751,15 @@ const RESULT_SHAPE = Object.freeze({
     }
     return false;
   },
-  request_rebind: (r) => (keysOf(r) === "affected_live_ids_after_commit,proof_effects,rebind_expires_at,rebind_handle" || keysOf(r) === "affected_id,affected_live_ids_after_commit,proof_effects,rebind_expires_at,rebind_handle")
+  request_rebind: (r) => keysOf(r) === "affected_live_ids_after_commit,proof_effects,rebind_expires_at,rebind_handle"
     && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1
     && REBIND_HANDLE_SHAPE.test(r.rebind_handle) && isCanonicalIso(r.rebind_expires_at)
     && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_live_ids_after_commit[0] && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "preserved",
-  expire_rebind_handle: (r) => (keysOf(r) === "affected_live_ids_after_commit,cleared,proof_effects" || keysOf(r) === "affected_id,affected_live_ids_after_commit,cleared,proof_effects")
+  expire_rebind_handle: (r) => keysOf(r) === "affected_live_ids_after_commit,cleared,proof_effects"
     && canonKey(r.cleared) === canonKey(["rebind_handle", "rebind_expires_at"])
     && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1
     && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_live_ids_after_commit[0] && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "preserved",
-  cancel_rebind: (r) => (keysOf(r) === "affected_live_ids_after_commit,cleared,proof_effects" || keysOf(r) === "affected_id,affected_live_ids_after_commit,cleared,proof_effects")
+  cancel_rebind: (r) => keysOf(r) === "affected_live_ids_after_commit,cleared,proof_effects"
     && canonKey(r.cleared) === canonKey(["rebind_handle", "rebind_expires_at"])
     && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1
     && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_live_ids_after_commit[0] && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "preserved",
@@ -833,11 +833,11 @@ function opConsistentWithRecord(op, id, rec) {
     }
     case "rebind_session_alias": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && rec.aliases.session_id === r.new_session_id; // G13：仅改别名，target/proof 不动
     case "mint_selection_handles": return rec.kind === "live" && fam === "B1" && Array.isArray(r.minted) && r.minted.some((m) => m.target_id === id);
-    case "clear_anchor_handle": return rec.kind === "live" && fam === "A2" && (r.affected_live_ids_after_commit?.includes(id) || r.affected_id === id);
-    case "reissue_selection_handle": return rec.kind === "live" && (fam === "B1" || fam === "A2") && (r.affected_live_ids_after_commit?.includes(id) || r.target_id === id);
+    case "clear_anchor_handle": return rec.kind === "live" && fam === "A2" && r.affected_live_ids_after_commit?.includes(id);
+    case "reissue_selection_handle": return rec.kind === "live" && (fam === "B1" || fam === "A2") && r.affected_live_ids_after_commit?.includes(id);
     case "request_rebind":
     case "expire_rebind_handle":
-    case "cancel_rebind": return rec.kind === "live" && fam === "B3" && (r.affected_live_ids_after_commit?.includes(id) || r.target_id === id || r.affected_id === id || r.b3_id === id);
+    case "cancel_rebind": return rec.kind === "live" && fam === "B3" && r.affected_live_ids_after_commit?.includes(id);
     case "owner_select_reaffirm": return (rec.kind === "live" && (r.target_id === id || r.affected_live_ids_after_commit?.includes(id))) || (rec.kind === "forwarding_tombstone" && Array.isArray(r.tombstone_remap) && r.tombstone_remap.some((m) => m.old_tomb_id === id));
     case "migrate_seed": {
       if (rec.kind !== "live" || !r.seeded.some((s) => s.topic_agent_id === id)) return false;

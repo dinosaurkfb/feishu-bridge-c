@@ -34361,6 +34361,29 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
   // 含有 prepared step 时 done 拒绝
   const badDoneA = { ...docA, phase: "done" };
   assert.ok(journalProblem(badDoneA) !== null, "含 prepared step 时 done 阶段拒绝");
+
+  // 6d. 缺步拒绝
+  const badMissingMintA = { ...docA, steps: docA.steps.filter((s) => s.kind !== "mint") };
+  assert.ok(journalProblem(badMissingMintA, { maintenanceDir: "/tmp/maint" }) !== null, "缺 mint step 拒");
+
+  // 6e. 多步/重复 step 拒绝（恰一次计数）
+  const extraSealInA = mkCampaignStep({ action: "seal", beforeState: "open", afterState: "sealed" });
+  const badExtraA = { ...docA, steps: [...docA.steps, extraSealInA] };
+  assert.ok(journalProblem(badExtraA, { maintenanceDir: "/tmp/maint" }) !== null, "多出 seal step 拒");
+
+  // 6f. writer_state:on 与 campaign:complete 约束：on done 时 complete 必须已 done
+  const docBOnDoneCampPrep = {
+    ...docB,
+    steps: docB.steps.map((s) => s.id.startsWith("writer_state:") ? { ...s, state: "done", after: s.intended_after } : s)
+  };
+  assert.ok(journalProblem(docBOnDoneCampPrep, { maintenanceDir: "/tmp/maint" }) !== null, "writer_state on 已 done 而 campaign complete 未 done 时拒");
+
+  // 6g. writer_state:on 摘要与 campaign:complete 不一致时拒
+  const docBDigestMismatch = {
+    ...docB,
+    steps: docB.steps.map((s) => s.id.startsWith("writer_state:") ? { ...s, intended_after: { ...s.intended_after, endpoints_digest: "c".repeat(64) } } : s)
+  };
+  assert.ok(journalProblem(docBDigestMismatch, { maintenanceDir: "/tmp/maint" }) !== null, "writer_state on 摘要与 campaign complete 不一致时拒");
 });
 
 summarySealed = true;

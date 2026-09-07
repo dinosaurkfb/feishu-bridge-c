@@ -247,6 +247,24 @@ import { parseMaintenanceGateArgs, runMaintenanceGate } from "./maintenance-gate
 import { parseMaintenanceLedgerArgs, runMaintenanceLedger, ledgerStatus, renderLedgerStatus, exitCodeFor } from "./maintenance-ledger.mjs";
 import { aggregateEndpointReceipts, endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { precheckStartupSources } from "./maintenance/precheck.mjs";
+import {
+  campaignIdFor,
+  endpointsDigest,
+  CAMPAIGN_FILE,
+  WRITER_STATE_FILE,
+  CAMPAIGN_SCHEMA,
+  WRITER_STATE_SCHEMA,
+  CAMPAIGN_STATES,
+  WRITER_STATES,
+  campaignPath,
+  writerStatePath,
+  campaignDocProblem,
+  writerStateDocProblem,
+  readCampaignState,
+  readWriterState,
+  writeCampaignState,
+  writeWriterState,
+} from "./maintenance/owner-select-state.mjs";
 import { switchCurrentTarget } from "./runtime-install.mjs";
 import { applyRuntimeSync as applyRuntimeSyncB } from "./runtime-install.mjs";
 import {
@@ -33867,6 +33885,195 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
     assert.equal(v2.ok, false, "affected 中无 proof 的记录列在 proof_effects 应拒");
     assert.match(String(v2.why), /affected 中无 proof 的记录不得在 proof_effects 中列出/u, "命中守卫二断言");
   }
+});
+
+test("R50 §二 owner-select-state：campaign 与 writer-state 文件合同与读写原语", () => {
+  // 1. campaignIdFor & endpointsDigest
+  const tok1 = "00000000-0000-4000-8000-000000000001";
+  const cid1 = campaignIdFor(tok1);
+  assert.match(cid1, /^osc_[0-9a-f]{32}$/u, "campaignId 格式");
+  assert.equal(cid1, campaignIdFor(tok1), "campaignId 确定性");
+  assert.notEqual(cid1, campaignIdFor("00000000-0000-4000-8000-000000000002"), "不同 token 产生不同 campaignId");
+
+  const eps = ["endpoint_111111111111111111111111", "endpoint_222222222222222222222222"];
+  const dig = endpointsDigest(eps);
+  assert.match(dig, /^[0-9a-f]{64}$/u, "endpointsDigest 格式");
+  assert.equal(dig, endpointsDigest([...eps]), "endpointsDigest 幂等");
+
+  // 2. 隔离环境与路径
+  const tmpHome = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r50-state-test-"));
+  const ledgerDir = path.join(tmpHome, "ledger");
+  fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(ledgerDir, 0o700);
+  const env = { FEISHU_BRIDGE_LEDGER_DIR: ledgerDir };
+
+  assert.equal(campaignPath(env), path.join(ledgerDir, "owner-select-campaign.json"));
+  assert.equal(writerStatePath(env), path.join(ledgerDir, "owner-select-writer-state.json"));
+
+  // 3. 缺席读取
+  const cAbsent = readCampaignState(env);
+  assert.deepEqual(cAbsent, {
+    exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null
+  }, "缺席 campaign 返回 absent 联合");
+
+  const wAbsent = readWriterState(env);
+  assert.deepEqual(wAbsent, {
+    exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0
+  }, "缺席 writer-state 返回 off 联合");
+
+  // 4. campaign 文件 shape 校验与写原语
+  const cDocValid = {
+    schema_version: "owner-select-campaign-1",
+    campaign_id: cid1,
+    state: "open",
+    endpoints: eps,
+    endpoints_digest: dig,
+    pending_joins: [{ endpoint_id: "endpoint_333333333333333333333333", at: "2026-09-07T10:00:00.000Z" }],
+    members: {
+      "endpoint_111111111111111111111111": { schema_version: "1.0", legacy_proof_count: 1, null_b1_count: 2 },
+      "endpoint_222222222222222222222222": { schema_version: "1.1-transition", legacy_proof_count: 0, null_b1_count: 0 }
+    },
+    revision: 1,
+    origin_operation_id: tok1
+  };
+  assert.equal(campaignDocProblem(cDocValid), null, "合法 campaign doc");
+
+  // campaignDocProblem 反向用例
+  assert.notEqual(campaignDocProblem({ ...cDocValid, schema_version: "bad" }), null, "坏 schema");
+  assert.notEqual(campaignDocProblem({ ...cDocValid, endpoints: ["not_an_ep"] }), null, "坏 endpoint 格式");
+  assert.notEqual(campaignDocProblem({ ...cDocValid, endpoints: [eps[1], eps[0]] }), null, "未排序 endpoints");
+  assert.notEqual(campaignDocProblem({ ...cDocValid, endpoints: [eps[0], eps[0]] }), null, "重复 endpoints");
+  assert.notEqual(campaignDocProblem({ ...cDocValid, endpoints_digest: "a".repeat(64) }), null, "digest 不符");
+  assert.notEqual(campaignDocProblem({ ...cDocValid, state: "sealed", pending_joins: cDocValid.pending_joins }), null, "sealed 时 pending_joins 非空");
+  assert.notEqual(campaignDocProblem({ ...cDocValid, pending_joins: [{ endpoint_id: eps[0], at: "2026-09-07T10:00:00.000Z" }] }), null, "pending 与 endpoints 相交");
+  assert.notEqual(campaignDocProblem({ ...cDocValid, members: {} }), null, "members 键集不符");
+  assert.notEqual(campaignDocProblem({ ...cDocValid, revision: 0 }), null, "revision 非正整数");
+
+  // 写 campaign: CAS 校验
+  const casBad1 = writeCampaignState({ env, expectedSha256: "a".repeat(64), doc: cDocValid });
+  assert.equal(casBad1.ok, false);
+  assert.equal(casBad1.reason, "cas_mismatch");
+
+  // 首写 revision 必为 1
+  const revBad1 = writeCampaignState({ env, expectedSha256: null, doc: { ...cDocValid, revision: 2 } });
+  assert.equal(revBad1.ok, false);
+
+  // 首写成功
+  const cWrite1 = writeCampaignState({ env, expectedSha256: null, doc: cDocValid });
+  assert.equal(cWrite1.ok, true);
+  assert.equal(cWrite1.exists, true);
+  assert.equal(cWrite1.state, "open");
+  assert.equal(cWrite1.campaign_id, cid1);
+  assert.match(cWrite1.sha256, /^[0-9a-f]{64}$/u);
+
+  // 验证写后权限 0600
+  const cPath = campaignPath(env);
+  assert.equal(fs.statSync(cPath).mode & 0o777, 0o600, "campaign 文件权限 0600");
+
+  // 读回受验
+  const cRead1 = readCampaignState(env);
+  assert.deepEqual(cRead1, {
+    exists: true,
+    sha256: cWrite1.sha256,
+    state: "open",
+    campaign_id: cid1,
+    endpoints: eps,
+    endpoints_digest: dig
+  }, "读回 campaign state 正确");
+
+  // 第二次写 (seal)：revision 必须 +1 (2)，CAS 必须是 cWrite1.sha256
+  const cDocSealed = {
+    ...cDocValid,
+    state: "sealed",
+    pending_joins: [],
+    revision: 2
+  };
+  const cWrite2 = writeCampaignState({ env, expectedSha256: cWrite1.sha256, doc: cDocSealed });
+  assert.equal(cWrite2.ok, true);
+  assert.equal(cWrite2.state, "sealed");
+
+  // 5. writer-state 文件 shape 校验与写原语
+  const wDocOff = {
+    schema_version: "owner-select-writer-state-1",
+    state: "off",
+    campaign_id: null,
+    endpoints_digest: null,
+    revision: 1,
+    origin_operation_id: tok1
+  };
+  assert.equal(writerStateDocProblem(wDocOff), null, "合法 writer-state off doc");
+
+  const wDocPartial = {
+    schema_version: "owner-select-writer-state-1",
+    state: "partial",
+    campaign_id: cid1,
+    endpoints_digest: dig,
+    revision: 1,
+    origin_operation_id: tok1
+  };
+  assert.equal(writerStateDocProblem(wDocPartial), null, "合法 writer-state partial doc");
+
+  const wDocOn = {
+    schema_version: "owner-select-writer-state-1",
+    state: "on",
+    campaign_id: cid1,
+    endpoints_digest: dig,
+    revision: 2,
+    origin_operation_id: tok1
+  };
+  assert.equal(writerStateDocProblem(wDocOn), null, "合法 writer-state on doc");
+
+  // writerStateDocProblem 反向用例
+  assert.notEqual(writerStateDocProblem({ ...wDocOff, campaign_id: cid1 }), null, "off 不得有 campaign_id");
+  assert.notEqual(writerStateDocProblem({ ...wDocOff, endpoints_digest: dig }), null, "off 不得有 digest");
+  assert.notEqual(writerStateDocProblem({ ...wDocPartial, campaign_id: null }), null, "partial 必须有 campaign_id");
+  assert.notEqual(writerStateDocProblem({ ...wDocOn, endpoints_digest: null }), null, "on 必须有 digest");
+  assert.notEqual(writerStateDocProblem({ ...wDocOn, revision: 0 }), null, "revision 必须正整数");
+
+  // 写 writer-state: CAS 校验
+  const casBadW = writeWriterState({ env, expectedSha256: "b".repeat(64), doc: wDocPartial });
+  assert.equal(casBadW.ok, false);
+  assert.equal(casBadW.reason, "cas_mismatch");
+
+  // 写 partial
+  const wWrite1 = writeWriterState({ env, expectedSha256: null, doc: wDocPartial });
+  assert.equal(wWrite1.ok, true);
+  assert.equal(wWrite1.state, "partial");
+  assert.equal(wWrite1.revision, 1);
+  const wPath = writerStatePath(env);
+  assert.equal(fs.statSync(wPath).mode & 0o777, 0o600, "writer-state 文件权限 0600");
+
+  const wRead1 = readWriterState(env);
+  assert.deepEqual(wRead1, {
+    exists: true,
+    sha256: wWrite1.sha256,
+    state: "partial",
+    campaign_id: cid1,
+    endpoints_digest: dig,
+    revision: 1
+  }, "读回 writer state partial");
+
+  // 写 on (CAS 匹配，revision 2)
+  const wWrite2 = writeWriterState({ env, expectedSha256: wWrite1.sha256, doc: wDocOn });
+  assert.equal(wWrite2.ok, true);
+  assert.equal(wWrite2.state, "on");
+  assert.equal(wWrite2.revision, 2);
+
+  // 6. 安全性检验：symlink、mode 0644、损坏 JSON
+  fs.chmodSync(wPath, 0o644);
+  const wReadBadMode = readWriterState(env);
+  assert.equal(wReadBadMode.state, "unreadable", "0644 权限读作 unreadable");
+  fs.chmodSync(wPath, 0o600);
+
+  fs.writeFileSync(cPath, "not json", { mode: 0o600 });
+  const cReadCorrupt = readCampaignState(env);
+  assert.equal(cReadCorrupt.state, "unreadable", "损坏 JSON 读作 unreadable");
+
+  fs.unlinkSync(cPath);
+  fs.symlinkSync(wPath, cPath);
+  const cReadSymlink = readCampaignState(env);
+  assert.equal(cReadSymlink.state, "unreadable", "符号链接读作 unreadable");
+  fs.unlinkSync(cPath);
 });
 
 summarySealed = true;

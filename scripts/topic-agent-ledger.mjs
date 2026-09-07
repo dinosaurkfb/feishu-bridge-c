@@ -693,7 +693,8 @@ const RESULT_SHAPE = Object.freeze({
       && allDistinct(r.surviving_id, r.tombstoned_id, r.demoted_historical_id)
       && ANY_HANDLE_SHAPE.test(r.selection_handle) && isCanonicalIso(r.authorized_at) && AUTHORIZED_BY_SHAPE.test(r.authorized_by)
       && AILY_SESSION_SHAPE.test(r.selected_session_id) && OM_SHAPE.test(r.selected_root_om) && isOperationId(r.selection_operation_id)
-      && typeof r.selection_message_id === "string" && typeof r.selection_basis === "string"
+      && (r.selection_basis === "explicit_handle" || r.selection_basis === "unique_candidate")
+      && typeof r.selection_message_id === "string" && OM_SHAPE.test(r.selection_message_id)
       && canonKey(r.affected_live_ids_after_commit) === canonKey(expectedAffected)
       && canonKey(r.proof_effects) === canonKey(expectedPes);
   },
@@ -714,7 +715,8 @@ const RESULT_SHAPE = Object.freeze({
     || (keysOf(r) === "affected_id,affected_live_ids_after_commit,authorized_at,authorized_by,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id"
         && isId(r.affected_id) && ANY_HANDLE_SHAPE.test(r.selection_handle) && isCanonicalIso(r.authorized_at) && AUTHORIZED_BY_SHAPE.test(r.authorized_by)
         && AILY_SESSION_SHAPE.test(r.selected_session_id) && OM_SHAPE.test(r.selected_root_om) && isOperationId(r.selection_operation_id)
-        && typeof r.selection_message_id === "string" && typeof r.selection_basis === "string"
+        && (r.selection_basis === "explicit_handle" || r.selection_basis === "unique_candidate")
+        && typeof r.selection_message_id === "string" && OM_SHAPE.test(r.selection_message_id)
         && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.affected_id
         && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_id && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "produced"),
   restore: (r) => (keysOf(r) === "affected_id" && isId(r.affected_id))
@@ -739,7 +741,8 @@ const RESULT_SHAPE = Object.freeze({
         && ANY_HANDLE_SHAPE.test(r.selection_handle) && OM_SHAPE.test(r.selected_root_om) && r.selected_session_id === r.new_session_id
         && isOperationId(r.selection_operation_id)
         && (r.tombstoned_a1_id === null || isId(r.tombstoned_a1_id))
-        && typeof r.selection_message_id === "string" && r.selection_basis === "rebind"
+        && r.selection_basis === "rebind"
+        && typeof r.selection_message_id === "string" && OM_SHAPE.test(r.selection_message_id)
         && canonKey(r.affected_live_ids_after_commit) === canonKey([r.affected_id])
         && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_id && ["produced", "preserved"].includes(r.proof_effects[0].binding_effect) && r.proof_effects[0].link_effect === "produced"),
   migrate_seed: (r) => keysOf(r) === "authorized_at,authorized_by,seeded" && typeof r.authorized_by === "string" && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at) && Array.isArray(r.seeded) && r.seeded.every((s) => isObj(s) && isId(s.topic_agent_id) && typeof s.legacy_source_digest === "string" && SHA_SHAPE.test(s.legacy_source_digest)) && r.seeded.every((s, i) => i === 0 || r.seeded[i - 1].topic_agent_id < s.topic_agent_id),
@@ -791,14 +794,14 @@ const RESULT_SHAPE = Object.freeze({
         && bindingProofProblem(r.new_binding_proof, { schemaVersion: "1.1" }) === null && r.new_binding_proof.kind === "owner_select_v1" && REAFFIRM_HANDLE_SHAPE.test(r.new_binding_proof.selection_handle)
         && linkProofProblem(r.new_link_proof, { schemaVersion: "1.1" }) === null && r.new_link_proof.kind === "owner_selected_route_v1" && REAFFIRM_HANDLE_SHAPE.test(r.new_link_proof.selection_handle)
         && Array.isArray(r.tombstone_remap) && r.tombstone_remap.every((m, i) => isObj(m) && isId(m.old_tomb_id) && isObj(m.new_proof_ref) && keysOf(m.new_proof_ref) === "kind,selected_root_om,selection_handle,selection_operation_id" && m.new_proof_ref.kind === "owner_select_merge_v1" && REAFFIRM_HANDLE_SHAPE.test(m.new_proof_ref.selection_handle) && (i === 0 || r.tombstone_remap[i - 1].old_tomb_id < m.old_tomb_id))
-        && typeof r.selection_message_id === "string";
+        && typeof r.selection_message_id === "string" && OM_SHAPE.test(r.selection_message_id);
     }
     if (keysOf(r) === "affected_live_ids_after_commit,new_link_proof,proof_effects,selection_message_id,target_id,tombstone_remap") {
       return isId(r.target_id) && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.target_id
         && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.target_id && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "produced"
         && linkProofProblem(r.new_link_proof, { schemaVersion: "1.1" }) === null && r.new_link_proof.kind === "owner_selected_route_v1" && REAFFIRM_HANDLE_SHAPE.test(r.new_link_proof.selection_handle)
         && Array.isArray(r.tombstone_remap) && r.tombstone_remap.every((m, i) => isObj(m) && isId(m.old_tomb_id) && isObj(m.new_proof_ref) && keysOf(m.new_proof_ref) === "kind,selected_root_om,selection_handle,selection_operation_id" && m.new_proof_ref.kind === "owner_select_merge_v1" && REAFFIRM_HANDLE_SHAPE.test(m.new_proof_ref.selection_handle) && (i === 0 || r.tombstone_remap[i - 1].old_tomb_id < m.old_tomb_id))
-        && typeof r.selection_message_id === "string";
+        && typeof r.selection_message_id === "string" && OM_SHAPE.test(r.selection_message_id);
     }
     return false;
   },

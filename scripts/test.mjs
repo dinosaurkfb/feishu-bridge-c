@@ -33048,6 +33048,80 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
     const dReaffNotTomb = mkReaffirmBase();
     dReaffNotTomb.operations[opId2].result.tombstone_remap[0].old_tomb_id = taId1; // 指向 live 记录
     assert.equal(TAL.validateLedger(dReaffNotTomb, { endpointId: EP }).ok, false, "reaffirm old_tomb_id 指向非 tombstone 记录必拒");
+
+    // ── P2-1 返修：selection_basis 枚举值域 ∧ selection_message_id 有界收拢 ──
+
+    // 1. activate 带非枚举 selection_basis → 拒
+    const dActBadBasis = mkBaseDoc("1.1");
+    dActBadBasis.revision = 2;
+    dActBadBasis.operations[opId1] = {
+      op_type: "activate",
+      terminal_kind: "activate",
+      request_key: "rk_act_basis",
+      fingerprint: "9".repeat(64),
+      result_revision: 2,
+      result: {
+        surviving_id: taId1, tombstoned_id: taId2, demoted_historical_id: null,
+        authorized_by: "ou_owner1", authorized_at: ISO,
+        selected_session_id: "sess_1", selected_root_om: "om_root1",
+        selection_handle: hOSH1, selection_operation_id: opId1, selection_message_id: "om_msg1",
+        selection_basis: "random_basis", // 非法枚举
+        affected_live_ids_after_commit: [taId1],
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "produced", link_effect: "produced" }]
+      }
+    };
+    assert.equal(TAL.validateLedger(dActBadBasis, { endpointId: EP }).ok, false, "activate 带非枚举 selection_basis 必拒");
+
+    // 2. activate 带越界 selection_message_id (非 om_ 形状) → 拒
+    const dActBadMsgId = structuredClone(dActBadBasis);
+    dActBadMsgId.operations[opId1].result.selection_basis = "explicit_handle";
+    dActBadMsgId.operations[opId1].result.selection_message_id = "bad_msg_id";
+    assert.equal(TAL.validateLedger(dActBadMsgId, { endpointId: EP }).ok, false, "activate 带非 om_ 消息 id 必拒");
+
+    // 3. anchor 带非法 selection_basis → 拒
+    const dAnchorBadBasis = mkBaseDoc("1.1");
+    dAnchorBadBasis.revision = 2;
+    dAnchorBadBasis.operations[opId1] = {
+      op_type: "anchor",
+      terminal_kind: "anchor",
+      request_key: "rk_anc_basis",
+      fingerprint: "a".repeat(64),
+      result_revision: 2,
+      result: {
+        affected_id: taId1, affected_live_ids_after_commit: [taId1],
+        authorized_at: ISO, authorized_by: "ou_owner1",
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "preserved", link_effect: "produced" }],
+        selected_root_om: "om_root1", selected_session_id: "sess_1",
+        selection_basis: "rebind", // anchor 不得为 rebind
+        selection_handle: hOSH1, selection_message_id: "om_msg1", selection_operation_id: opId1
+      }
+    };
+    assert.equal(TAL.validateLedger(dAnchorBadBasis, { endpointId: EP }).ok, false, "anchor 带非法 selection_basis 必拒");
+
+    // 4. rebind_session_alias 带非 rebind 基础 → 拒
+    const dRebBadBasis = mkBaseDoc("1.1");
+    dRebBadBasis.revision = 2;
+    dRebBadBasis.operations[opId1] = {
+      op_type: "rebind_session_alias",
+      terminal_kind: "rebind_session_alias",
+      request_key: "rk_reb_basis",
+      fingerprint: "b".repeat(64),
+      result_revision: 2,
+      result: {
+        affected_id: taId1, affected_live_ids_after_commit: [taId1], authorized_at: ISO, authorized_by: "ou_owner1",
+        old_session_id: "00000000-0000-4000-8000-000000000001", new_session_id: "00000000-0000-4000-8000-000000000002",
+        selected_root_om: "om_root1", selected_session_id: "00000000-0000-4000-8000-000000000002",
+        selection_basis: "explicit_handle", // rebind 恒为 rebind
+        selection_handle: hORH1, selection_operation_id: opId1, selection_message_id: "om_msg1", tombstoned_a1_id: null,
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "preserved", link_effect: "produced" }]
+      }
+    };
+    assert.equal(TAL.validateLedger(dRebBadBasis, { endpointId: EP }).ok, false, "rebind_session_alias selection_basis 非 rebind 必拒");
+
+    // 5. reaffirm 带非 om_ 形状 selection_message_id → 拒
+    const dReaffBadMsg = mkReaffirmBase();
+    dReaffBadMsg.operations[opId2].result.selection_message_id = "invalid_msg";
+    assert.equal(TAL.validateLedger(dReaffBadMsg, { endpointId: EP }).ok, false, "reaffirm 带非 om_ 消息 id 必拒");
   }
 
   // ── 6. G15′ 校验（1.1 strict 拒旧形 ∧ handle 前缀绑定）──

@@ -57,9 +57,41 @@ const MATCHED_FIELDS = ["chat_id", "sender", "body", "thread_root"];
 /* P1-1-d 判别联合（Codex 裁定 d）：binding_token_v1（token 证明，四维）vs owner_root_no_token_v1（无码 owner-root 配对，三维）。
    两套都合法、都可独立验证；G15 按 pending_token_state 分支精确校验，禁止通用"部分 matched_fields"与任何 unverified 占位。 */
 const F4_NO_TOKEN_FIELDS = ["chat_id", "sender", "thread_root"];
-const OP_TYPES = ["initialize_shadow", "create_a1", "create_b1", "seed", "activate", "void", "attach_a2", "attach_a3", "anchor", "restore", "unbind", "retarget", "rebind_session_alias", "authority_cutover", "migrate_seed", "migrate_repair"];
+
+// R48：owner_select 账本地基 schema 与 handle 前缀形状
+const SCHEMA_VERSIONS = Object.freeze(["1.0", "1.1-transition", "1.1"]);
+const SELECTION_HANDLE_SHAPE = /^osh_[0-9a-f]{32}$/u;
+const REBIND_HANDLE_SHAPE = /^orh_[0-9a-f]{32}$/u;
+const REAFFIRM_HANDLE_SHAPE = /^rfh_[0-9a-f]{32}$/u;
+const ANY_HANDLE_SHAPE = /^(osh|orh|rfh)_[0-9a-f]{32}$/u;
+const ALLOWED_PRODUCE_OPS = Object.freeze(["activate", "anchor", "rebind_session_alias", "owner_select_reaffirm"]);
+
+const OP_TYPES = [
+  "initialize_shadow", "create_a1", "create_b1", "seed", "activate", "void",
+  "attach_a2", "attach_a3", "anchor", "restore", "unbind", "retarget",
+  "rebind_session_alias", "authority_cutover", "migrate_seed", "migrate_repair",
+  "mint_selection_handles", "clear_anchor_handle", "reissue_selection_handle",
+  "request_rebind", "expire_rebind_handle", "cancel_rebind", "owner_select_reaffirm",
+  "schema_upgrade"
+];
+const NEW_OP_TYPES = Object.freeze([
+  "mint_selection_handles", "clear_anchor_handle", "reissue_selection_handle",
+  "request_rebind", "expire_rebind_handle", "cancel_rebind", "owner_select_reaffirm",
+  "schema_upgrade"
+]);
+const VALID_UPGRADE_EDGES = Object.freeze(["1.0->1.1-transition", "1.1-transition->1.1", "1.0->1.1"]);
 // migrate_repair 的 from_family / to_family 值域（§5.1 判别联合：B1→B1；{B3,B3',B4}→{B3,B3',B4}）
 const MIGRATE_FAMILIES = ["B1", "B3", "B3'", "B4"];
+// 返修三 P1-2：逐 op 钉死 produced/preserved 的合法 proof kind（未列的 effect 维度不约束；preserved-binding 未列即不约束）。
+//   unbind/restore/clear_anchor_handle/reaffirm 不钉：reaffirm 有专属逐字校验，其余是“保留型”op，proof kind 随上游。
+const OP_EFFECT_PROOF_KINDS = Object.freeze({
+  activate: { produced_binding: ["owner_select_v1"] },
+  attach_a2: { produced_binding: ["attach"] },
+  attach_a3: { produced_binding: ["attach"] },
+  anchor: { preserved_binding: ["attach", "retarget"], produced_link: ["owner_selected_route_v1"] },
+  rebind_session_alias: { produced_binding: ["owner_select_v1"] },
+  retarget: { produced_binding: ["retarget"] }
+});
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const keysOf = (o) => Object.keys(o).sort().join(",");
@@ -348,7 +380,7 @@ const matchedFieldsBad = (mf, pstate) => {
   //   按裁定 d 直接拒，不当作 legacy token 兼容（旧的伪造 no-token-as-四项 正是要靠这层探测出来）。
 };
 
-const bindingProofProblem = (p) => {
+const bindingProofProblem = (p, { schemaVersion = "1.0" } = {}) => {
   if (!isObj(p)) return "binding_proof 不是对象";
   if (typeof p.authorized_by !== "string" || !AUTHORIZED_BY_SHAPE.test(p.authorized_by)) return "authorized_by 形状不对";
   if (!isCanonicalIso(p.authorized_at)) return "authorized_at 不规范";
@@ -356,6 +388,7 @@ const bindingProofProblem = (p) => {
     if (keysOf(p) !== "authorized_at,authorized_by,claim_key,kind") return "attach proof 字段集不对";
     if (typeof p.claim_key !== "string" || !CLAIM_KEY_SHAPE.test(p.claim_key)) return "attach.claim_key 形状不对";
   } else if (p.kind === "pairing") {
+    if (schemaVersion === "1.1") return "legacy_pairing_shape 现于 1.1 strict 账本 (G15′)";
     if (keysOf(p) !== "authorized_at,authorized_by,kind,matched_fields,matched_om,pending_token_state") return "pairing proof 字段集不对";
     if (typeof p.matched_om !== "string" || !OM_SHAPE.test(p.matched_om)) return "pairing.matched_om 形状不对";
     if (matchedFieldsBad(p.matched_fields, p.pending_token_state)) return "pairing.matched_fields 不是封闭判别联合（token 四项 / no-token 三项）";
@@ -366,11 +399,18 @@ const bindingProofProblem = (p) => {
     if (keysOf(p) !== "authorized_at,authorized_by,kind,legacy_source_digest,migration_operation_id") return "migrated proof 字段集不对";
     if (typeof p.migration_operation_id !== "string" || !OP_ID_SHAPE.test(p.migration_operation_id)) return "migrated.migration_operation_id 形状不对";
     if (typeof p.legacy_source_digest !== "string" || !SHA_SHAPE.test(p.legacy_source_digest)) return "migrated.legacy_source_digest 形状不对";
-  } else return "binding_proof.kind 不在 {attach,pairing,retarget,migrated}";
+  } else if (p.kind === "owner_select_v1") {
+    if (schemaVersion === "1.0") return "binding_proof.kind 不在 {attach,pairing,retarget,migrated}";
+    if (keysOf(p) !== "authorized_at,authorized_by,kind,selected_root_om,selected_session_id,selection_handle,selection_operation_id") return "owner_select_v1 字段集不对";
+    if (typeof p.selected_session_id !== "string" || !AILY_SESSION_SHAPE.test(p.selected_session_id)) return "selected_session_id 形状不对";
+    if (typeof p.selected_root_om !== "string" || !OM_SHAPE.test(p.selected_root_om)) return "selected_root_om 形状不对";
+    if (typeof p.selection_handle !== "string" || !ANY_HANDLE_SHAPE.test(p.selection_handle)) return "selection_handle 形状不对";
+    if (!isOperationId(p.selection_operation_id)) return "selection_operation_id 形状不对";
+  } else return "binding_proof.kind 不在 {attach,pairing,retarget,migrated,owner_select_v1}";
   return null;
 };
 
-const linkProofProblem = (r) => {
+const linkProofProblem = (r, { schemaVersion = "1.0" } = {}) => {
   if (!isObj(r)) return "locator_link_proof_ref 不是对象";
   if (r.kind === "migrated") {
     if (keysOf(r) !== "kind,legacy_source_digest,migration_operation_id") return "link migrated 字段集不对";
@@ -378,6 +418,19 @@ const linkProofProblem = (r) => {
     if (typeof r.legacy_source_digest !== "string" || !SHA_SHAPE.test(r.legacy_source_digest)) return "link migrated.legacy_source_digest 形状不对";
     return null;
   }
+  if (r.kind === "owner_selected_route_v1") {
+    if (schemaVersion === "1.0") return "link proof.kind 不对";
+    if (keysOf(r) !== "authorized_at,authorized_by,by_identity,kind,selected_root_om,selected_session_id,selection_handle,selection_operation_id") return "owner_selected_route_v1 字段集不对";
+    if (r.by_identity !== "owner_authorization") return "by_identity 只认 owner_authorization";
+    if (typeof r.authorized_by !== "string" || !AUTHORIZED_BY_SHAPE.test(r.authorized_by)) return "authorized_by 形状不对";
+    if (!isCanonicalIso(r.authorized_at)) return "authorized_at 不规范";
+    if (typeof r.selected_session_id !== "string" || !AILY_SESSION_SHAPE.test(r.selected_session_id)) return "selected_session_id 形状不对";
+    if (typeof r.selected_root_om !== "string" || !OM_SHAPE.test(r.selected_root_om)) return "selected_root_om 形状不对";
+    if (typeof r.selection_handle !== "string" || !ANY_HANDLE_SHAPE.test(r.selection_handle)) return "selection_handle 形状不对";
+    if (!isOperationId(r.selection_operation_id)) return "selection_operation_id 形状不对";
+    return null;
+  }
+  if (schemaVersion === "1.1") return "legacy_pairing_shape 现于 1.1 strict 账本 (G15′)";
   if (keysOf(r) !== "by_identity,kind,matched_at,matched_fields,matched_om,pending_token_state") return "link proof 字段集不对";
   if (r.kind !== "pairing_merge" && r.kind !== "f4_anchor") return "link proof.kind 不对";
   if (typeof r.matched_om !== "string" || !OM_SHAPE.test(r.matched_om)) return "link matched_om 形状不对";
@@ -387,9 +440,12 @@ const linkProofProblem = (r) => {
   return null;
 };
 
-export function liveProblem(rec, id) {
+export function liveProblem(rec, id, { schemaVersion = "1.0" } = {}) {
   if (!isObj(rec)) return "记录不是对象";
-  const allowed = "aliases,anchor_candidate,binding_proof,binding_target,chat_id,created_at,facts,generation_lineage_id,kind,locator_link_proof_ref,origin_operation_id,topic_agent_id,updated_at";
+  const is11 = schemaVersion === "1.1-transition" || schemaVersion === "1.1";
+  const allowed = is11
+    ? "aliases,anchor_candidate,binding_proof,binding_target,chat_id,created_at,facts,generation_lineage_id,handle_expires_at,kind,locator_link_proof_ref,origin_operation_id,rebind_expires_at,rebind_handle,selection_handle,topic_agent_id,updated_at"
+    : "aliases,anchor_candidate,binding_proof,binding_target,chat_id,created_at,facts,generation_lineage_id,kind,locator_link_proof_ref,origin_operation_id,topic_agent_id,updated_at";
   if (keysOf(rec) !== allowed) return "live 字段集不对";
   if (rec.topic_agent_id !== id || !isId(id)) return "topic_agent_id 形状/一致性不对";
   if (typeof rec.chat_id !== "string" || !CHAT_SHAPE.test(rec.chat_id)) return "chat_id 形状不对";
@@ -408,21 +464,44 @@ export function liveProblem(rec, id) {
   if (a.root_om !== null && (!omP || !OM_SHAPE.test(a.root_om))) return "aliases.root_om 形状不对";
   if (sidP !== (f.session === "present")) return "session 别名与 facts.session 不一致";
   if (omP !== (f.anchor === "present")) return "root_om 别名与 facts.anchor 不一致";
+
+  if (is11) {
+    if (rec.selection_handle !== null && (typeof rec.selection_handle !== "string" || !SELECTION_HANDLE_SHAPE.test(rec.selection_handle))) return "selection_handle 形状不对";
+    if (rec.handle_expires_at !== null && !isCanonicalIso(rec.handle_expires_at)) return "handle_expires_at 不规范";
+    if (rec.rebind_handle !== null && (typeof rec.rebind_handle !== "string" || !REBIND_HANDLE_SHAPE.test(rec.rebind_handle))) return "rebind_handle 形状不对";
+    if (rec.rebind_expires_at !== null && !isCanonicalIso(rec.rebind_expires_at)) return "rebind_expires_at 不规范";
+
+    if (fam === "B1") {
+      if (schemaVersion === "1.1" && (rec.selection_handle === null || rec.handle_expires_at === null)) return "1.1 strict 要求 B1 selection_handle 与 handle_expires_at 双非空";
+      if ((rec.selection_handle === null) !== (rec.handle_expires_at === null)) return "B1 handle 与 expiry 必须同时有或同时无";
+    } else if (fam === "A2") {
+      if ((rec.selection_handle === null) !== (rec.handle_expires_at === null)) return "A2 handle 与 expiry 必须同时有或同时无";
+    } else {
+      if (rec.selection_handle !== null || rec.handle_expires_at !== null) return "非 B1/A2 不得有 selection_handle";
+    }
+    if (fam === "B3") {
+      if ((rec.rebind_handle === null) !== (rec.rebind_expires_at === null)) return "rebind handle 与 expiry 必须同时有或同时无";
+    } else {
+      if (rec.rebind_handle !== null || rec.rebind_expires_at !== null) return "非 B3 不得有 rebind_handle";
+    }
+  }
+
   const wantProof = f.binding === "active" || f.binding === "dormant";
   if (wantProof !== (rec.binding_proof !== null)) return "binding_proof 与 binding 不一致";
   if (rec.binding_proof !== null) {
-    const bp = bindingProofProblem(rec.binding_proof); if (bp) return bp;
+    const bp = bindingProofProblem(rec.binding_proof, { schemaVersion }); if (bp) return bp;
     const kind = rec.binding_proof.kind;
     const okKind = (fam === "A2" || fam === "A3") ? (kind === "attach" || kind === "retarget")
-      : (fam === "B3" || fam === "B3'" || fam === "B4") ? (kind === "pairing" || kind === "retarget" || kind === "migrated")
-        : (fam === "A4") ? (kind === "attach" || kind === "pairing" || kind === "retarget" || kind === "migrated") : false;
+      : (fam === "B3" || fam === "B3'" || fam === "B4") ? (kind === "pairing" || kind === "retarget" || kind === "migrated" || kind === "owner_select_v1")
+        : (fam === "A4") ? (kind === "attach" || kind === "pairing" || kind === "retarget" || kind === "migrated" || kind === "owner_select_v1") : false;
     if (!okKind) return "binding_proof.kind 与族不匹配";
   }
   if ((f.locator_link_proof === "present") !== (rec.locator_link_proof_ref !== null)) return "locator_link_proof 与 ref 不一致";
   if (rec.locator_link_proof_ref !== null) {
     if (!(f.session === "present" && f.anchor === "present")) return "link=present 必须 session∧anchor present";
-    const lp = linkProofProblem(rec.locator_link_proof_ref); if (lp) return lp;
-    if ((fam === "B3" || fam === "B3'" || fam === "B4") && rec.locator_link_proof_ref.kind !== "pairing_merge" && rec.locator_link_proof_ref.kind !== "migrated") return "B3/B3'/B4 的 link 必须 pairing_merge/migrated";
+    const lp = linkProofProblem(rec.locator_link_proof_ref, { schemaVersion }); if (lp) return lp;
+    if ((fam === "B3" || fam === "B3'" || fam === "B4") && rec.locator_link_proof_ref.kind !== "pairing_merge" && rec.locator_link_proof_ref.kind !== "migrated" && rec.locator_link_proof_ref.kind !== "owner_selected_route_v1") return "B3/B3'/B4 的 link 必须 pairing_merge/migrated/owner_selected_route_v1";
+    if ((fam === "A3" || fam === "A4") && rec.locator_link_proof_ref.kind !== "pairing_merge" && rec.locator_link_proof_ref.kind !== "f4_anchor" && rec.locator_link_proof_ref.kind !== "migrated" && rec.locator_link_proof_ref.kind !== "owner_selected_route_v1") return "A3/A4 的 link kind 不匹配";
   }
   const genNotNa = f.generation !== "n/a";
   if (genNotNa !== (rec.generation_lineage_id !== null)) return "generation≠n/a ⇔ lineage_id≠null 不成立";
@@ -451,7 +530,7 @@ function opTouchedIds(op) {
   if (!r) return [];
   switch (op.op_type) {
     case "create_a1":
-    case "create_b1": return r.created_id == null ? [] : [r.created_id];
+    case "create_b1": return r.created_id == null ? (Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : []) : [r.created_id];
     case "seed": return Array.isArray(r.seeded_ids) ? r.seeded_ids : [];
     case "activate": return [r.surviving_id, r.tombstoned_id, r.demoted_historical_id].filter((x) => x != null);
     case "void": return r.voided_id == null ? [] : [r.voided_id];
@@ -459,9 +538,21 @@ function opTouchedIds(op) {
     case "attach_a3":
     case "anchor":
     case "restore":
-    case "unbind": return r.affected_id == null ? [] : [r.affected_id];
+    case "unbind": return r.affected_id == null ? (Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : []) : [r.affected_id];
     case "retarget": return Array.isArray(r.affected_ids) ? r.affected_ids : [];
-    case "rebind_session_alias": return r.affected_id == null ? [] : [r.affected_id];
+    case "rebind_session_alias": return r.affected_id == null ? (Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : []) : [r.affected_id];
+    case "mint_selection_handles": return Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : (Array.isArray(r.minted) ? r.minted.map((m) => m.target_id) : []);
+    case "clear_anchor_handle": return Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : [];
+    case "reissue_selection_handle": return Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : (r.target_id ? [r.target_id] : []);
+    case "request_rebind":
+    case "expire_rebind_handle":
+    case "cancel_rebind": return Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : [];
+    case "owner_select_reaffirm": {
+      const ids = r.target_id ? [r.target_id] : (Array.isArray(r.affected_live_ids_after_commit) ? [...r.affected_live_ids_after_commit] : []);
+      if (Array.isArray(r.tombstone_remap)) for (const m of r.tombstone_remap) ids.push(m.old_tomb_id);
+      return ids.filter(Boolean);
+    }
+    case "schema_upgrade": return [];
     case "migrate_seed": return Array.isArray(r.seeded) ? r.seeded.map((s) => s.topic_agent_id) : [];
     case "migrate_repair": return r.repaired_id == null ? [] : [r.repaired_id];
     default: return [];
@@ -471,7 +562,21 @@ function opTouchedIds(op) {
 function proofCombinationProblem(rec, id, doc) {
   const bpKind = rec.binding_proof?.kind ?? null;
   const lpKind = rec.locator_link_proof_ref?.kind ?? null;
-  if (bpKind === "migrated" && lpKind !== "migrated") return "binding=migrated 必须 pair link=migrated";
+  if (bpKind === "owner_select_v1" && lpKind !== "owner_selected_route_v1" && lpKind !== null) {
+    return "binding=owner_select_v1 只能 pair link=owner_selected_route_v1 (或 null)";
+  }
+  if (lpKind === "owner_selected_route_v1") {
+    if (bpKind !== "owner_select_v1" && bpKind !== "attach" && bpKind !== "retarget" && bpKind !== "pairing" && bpKind !== "migrated") {
+      return "link=owner_selected_route_v1 的 binding 只能是 owner_select_v1/attach/retarget/pairing/migrated";
+    }
+  }
+  if (rec.facts.binding === "pending" || rec.facts.binding === "none") {
+    if (bpKind === "owner_select_v1" || lpKind === "owner_selected_route_v1") return "owner_select proof 禁现于 A1/B1";
+  }
+  if (bpKind === "migrated" && lpKind !== "migrated") {
+    if (doc.schema_version === "1.0") return "binding=migrated 必须 pair link=migrated";
+    if (lpKind !== "owner_selected_route_v1") return "binding=migrated 必须 pair link∈{migrated,owner_selected_route_v1}";
+  }
   if (lpKind === "migrated") {
     if (bpKind !== "migrated" && bpKind !== "retarget" && bpKind !== "attach") return "link=migrated 的 binding 只能是 migrated/retarget/attach(A3/A4 继承)";
     if (bpKind === "attach") {
@@ -516,7 +621,7 @@ function proofCombinationProblem(rec, id, doc) {
   return null;
 }
 
-export function tombstoneProblem(rec, id) {
+export function tombstoneProblem(rec, id, { schemaVersion = "1.0" } = {}) {
   if (!isObj(rec) || keysOf(rec) !== "forwards_to,kind,merged_at,origin_operation_id,proof_ref,topic_agent_id") return "tombstone 字段集不对";
   if (rec.topic_agent_id !== id || !isId(id)) return "tombstone id 不一致";
   if (!isId(rec.forwards_to)) return "forwards_to 形状不对";
@@ -524,7 +629,17 @@ export function tombstoneProblem(rec, id) {
   if (!isCanonicalIso(rec.merged_at)) return "merged_at 不规范";
   if (!isOperationId(rec.origin_operation_id)) return "origin_operation_id 形状不对";
   const p = rec.proof_ref;
-  if (!isObj(p) || keysOf(p) !== "kind,matched_fields,om,pending_token_state" || p.kind !== "pairing") return "proof_ref 字段集/kind 不对";
+  if (!isObj(p)) return "proof_ref 不是对象";
+  if (p.kind === "owner_select_merge_v1") {
+    if (schemaVersion === "1.0") return "proof_ref 字段集/kind 不对";
+    if (keysOf(p) !== "kind,selected_root_om,selection_handle,selection_operation_id") return "owner_select_merge_v1 字段集不对";
+    if (!isOperationId(p.selection_operation_id)) return "selection_operation_id 形状不对";
+    if (typeof p.selected_root_om !== "string" || !OM_SHAPE.test(p.selected_root_om)) return "selected_root_om 形状不对";
+    if (typeof p.selection_handle !== "string" || !ANY_HANDLE_SHAPE.test(p.selection_handle)) return "selection_handle 形状不对";
+    return null;
+  }
+  if (schemaVersion === "1.1") return "legacy_pairing_shape 现于 1.1 strict 账本 (G15′)";
+  if (keysOf(p) !== "kind,matched_fields,om,pending_token_state" || p.kind !== "pairing") return "proof_ref 字段集/kind 不对";
   if (typeof p.om !== "string" || !OM_SHAPE.test(p.om)) return "proof_ref.om 形状不对";
   if (matchedFieldsBad(p.matched_fields, p.pending_token_state)) return "proof_ref.matched_fields 不是封闭判别联合（token 四项 / no-token 三项）";
   return null;
@@ -540,10 +655,10 @@ export function voidedProblem(rec, id) {
   return null;
 }
 
-function recordProblem(rec, id) {
+function recordProblem(rec, id, { schemaVersion = "1.0" } = {}) {
   if (!isObj(rec) || typeof rec.kind !== "string") return "记录缺 kind";
-  if (rec.kind === "live") return liveProblem(rec, id);
-  if (rec.kind === "forwarding_tombstone") return tombstoneProblem(rec, id);
+  if (rec.kind === "live") return liveProblem(rec, id, { schemaVersion });
+  if (rec.kind === "forwarding_tombstone") return tombstoneProblem(rec, id, { schemaVersion });
   if (rec.kind === "voided_audit") return voidedProblem(rec, id);
   return "kind 不在三选一";
 }
@@ -556,29 +671,158 @@ const idArrayOk = (a) => Array.isArray(a) && a.length > 0 && a.every((x) => isId
 const idArraySortedMaybeEmpty = (a) => Array.isArray(a) && a.every((x) => isId(x)) && a.every((x, i) => i === 0 || a[i - 1] < x);
 const allDistinct = (...xs) => { const seen = new Set(); for (const x of xs) { if (x === null) continue; if (seen.has(x)) return false; seen.add(x); } return true; };
 
+const validProofEffects = (pes) => Array.isArray(pes) && pes.every((p, i) => isObj(p) && isId(p.topic_agent_id) && ["produced", "preserved", "none"].includes(p.binding_effect) && ["produced", "preserved", "none"].includes(p.link_effect) && (i === 0 || pes[i - 1].topic_agent_id < p.topic_agent_id));
+
 const RESULT_SHAPE = Object.freeze({
   initialize_shadow: (r) => keysOf(r) === "revision" && r.revision === 1,
   create_a1: (r) => keysOf(r) === "created_id" && isId(r.created_id),
-  create_b1: (r) => keysOf(r) === "created_id" && isId(r.created_id),
+  create_b1: (r) => (keysOf(r) === "created_id" && isId(r.created_id))
+    || (keysOf(r) === "affected_live_ids_after_commit,created_id,handle_expires_at,proof_effects,selection_handle"
+        && isId(r.created_id) && SELECTION_HANDLE_SHAPE.test(r.selection_handle) && isCanonicalIso(r.handle_expires_at)
+        && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.created_id
+        && Array.isArray(r.proof_effects) && r.proof_effects.length === 0),
   seed: (r) => keysOf(r) === "seeded_ids" && idArraySortedMaybeEmpty(r.seeded_ids),
-  activate: (r) => keysOf(r) === "demoted_historical_id,surviving_id,tombstoned_id" && isId(r.surviving_id) && isId(r.tombstoned_id) && (r.demoted_historical_id === null || isId(r.demoted_historical_id)) && allDistinct(r.surviving_id, r.tombstoned_id, r.demoted_historical_id),
+  activate: (r) => {
+    if (keysOf(r) === "demoted_historical_id,surviving_id,tombstoned_id") {
+      return isId(r.surviving_id) && isId(r.tombstoned_id) && (r.demoted_historical_id === null || isId(r.demoted_historical_id)) && allDistinct(r.surviving_id, r.tombstoned_id, r.demoted_historical_id);
+    }
+    if (keysOf(r) !== "affected_live_ids_after_commit,authorized_at,authorized_by,demoted_historical_id,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id,surviving_id,tombstoned_id") {
+      return false;
+    }
+    const expectedAffected = r.demoted_historical_id === null
+      ? [r.surviving_id]
+      : [r.surviving_id, r.demoted_historical_id].sort();
+    const expectedPes = r.demoted_historical_id === null
+      ? [{ topic_agent_id: r.surviving_id, binding_effect: "produced", link_effect: "produced" }]
+      : [
+          { topic_agent_id: r.surviving_id, binding_effect: "produced", link_effect: "produced" },
+          { topic_agent_id: r.demoted_historical_id, binding_effect: "preserved", link_effect: "preserved" }
+        ].sort((a, b) => a.topic_agent_id.localeCompare(b.topic_agent_id));
+
+    return isId(r.surviving_id) && isId(r.tombstoned_id) && (r.demoted_historical_id === null || isId(r.demoted_historical_id))
+      && allDistinct(r.surviving_id, r.tombstoned_id, r.demoted_historical_id)
+      && ANY_HANDLE_SHAPE.test(r.selection_handle) && isCanonicalIso(r.authorized_at) && AUTHORIZED_BY_SHAPE.test(r.authorized_by)
+      && AILY_SESSION_SHAPE.test(r.selected_session_id) && OM_SHAPE.test(r.selected_root_om) && isOperationId(r.selection_operation_id)
+      && (r.selection_basis === "explicit_handle" || r.selection_basis === "unique_candidate")
+      && typeof r.selection_message_id === "string" && OM_SHAPE.test(r.selection_message_id)
+      && canonKey(r.affected_live_ids_after_commit) === canonKey(expectedAffected)
+      && canonKey(r.proof_effects) === canonKey(expectedPes);
+  },
   void: (r) => keysOf(r) === "voided_id" && isId(r.voided_id),
-  attach_a2: (r) => keysOf(r) === "affected_id,terminal_family" && isId(r.affected_id) && r.terminal_family === "A2",
-  attach_a3: (r) => keysOf(r) === "affected_id,terminal_family" && isId(r.affected_id) && r.terminal_family === "A3",
-  anchor: (r) => keysOf(r) === "affected_id" && isId(r.affected_id),
-  restore: (r) => keysOf(r) === "affected_id" && isId(r.affected_id),
-  unbind: (r) => keysOf(r) === "affected_id,terminal_family" && isId(r.affected_id) && (r.terminal_family === "A4" || r.terminal_family === "B3'"),
-  retarget: (r) => keysOf(r) === "affected_ids,new_target,old_target,unit" && idArrayOk(r.affected_ids) && (r.unit === "record" || r.unit === "lineage") && !targetProblem(r.old_target) && !targetProblem(r.new_target) && canonKey(r.old_target) !== canonKey(r.new_target),
-  rebind_session_alias: (r) => keysOf(r) === "affected_id,authorized_at,authorized_by,new_session_id,old_session_id" && isId(r.affected_id) && AILY_SESSION_SHAPE.test(r.old_session_id) && AILY_SESSION_SHAPE.test(r.new_session_id) && r.old_session_id !== r.new_session_id && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at),
+  attach_a2: (r) => (keysOf(r) === "affected_id,terminal_family" && isId(r.affected_id) && r.terminal_family === "A2")
+    || (keysOf(r) === "affected_id,affected_live_ids_after_commit,anchor_candidate,handle_expires_at,proof_effects,selection_handle,terminal_family"
+        && isId(r.affected_id) && r.terminal_family === "A2"
+        && ((r.selection_handle === null && r.handle_expires_at === null) || (SELECTION_HANDLE_SHAPE.test(r.selection_handle) && isCanonicalIso(r.handle_expires_at)))
+        && OM_SHAPE.test(r.anchor_candidate)
+        && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.affected_id
+        && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_id && r.proof_effects[0].binding_effect === "produced" && r.proof_effects[0].link_effect === "none"),
+  attach_a3: (r) => (keysOf(r) === "affected_id,terminal_family" && isId(r.affected_id) && r.terminal_family === "A3")
+    || (keysOf(r) === "affected_id,affected_live_ids_after_commit,proof_effects,terminal_family"
+        && isId(r.affected_id) && r.terminal_family === "A3"
+        && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.affected_id
+        && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_id && r.proof_effects[0].binding_effect === "produced" && r.proof_effects[0].link_effect === "preserved"),
+  anchor: (r) => (keysOf(r) === "affected_id" && isId(r.affected_id))
+    || (keysOf(r) === "affected_id,affected_live_ids_after_commit,authorized_at,authorized_by,expected_anchor_candidate,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id"
+        && isId(r.affected_id) && ANY_HANDLE_SHAPE.test(r.selection_handle) && isCanonicalIso(r.authorized_at) && AUTHORIZED_BY_SHAPE.test(r.authorized_by)
+        && AILY_SESSION_SHAPE.test(r.selected_session_id) && OM_SHAPE.test(r.selected_root_om) && isOperationId(r.selection_operation_id)
+        && (r.selection_basis === "explicit_handle" || r.selection_basis === "unique_candidate")
+        && typeof r.selection_message_id === "string" && OM_SHAPE.test(r.selection_message_id)
+        && OM_SHAPE.test(r.expected_anchor_candidate) && r.expected_anchor_candidate === r.selected_root_om
+        && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.affected_id
+        && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_id && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "produced"),
+  restore: (r) => (keysOf(r) === "affected_id" && isId(r.affected_id))
+    || (keysOf(r) === "affected_id,affected_live_ids_after_commit,proof_effects"
+        && isId(r.affected_id) && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.affected_id
+        && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_id && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "preserved"),
+  unbind: (r) => (keysOf(r) === "affected_id,terminal_family" && isId(r.affected_id) && (r.terminal_family === "A4" || r.terminal_family === "B3'"))
+    || (keysOf(r) === "affected_id,affected_live_ids_after_commit,proof_effects,terminal_family"
+        && isId(r.affected_id) && (r.terminal_family === "A4" || r.terminal_family === "B3'")
+        && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.affected_id
+        && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_id && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "preserved"),
+  retarget: (r) => (keysOf(r) === "affected_ids,new_target,old_target,unit" && idArrayOk(r.affected_ids) && (r.unit === "record" || r.unit === "lineage") && !targetProblem(r.old_target) && !targetProblem(r.new_target) && canonKey(r.old_target) !== canonKey(r.new_target))
+    || (keysOf(r) === "affected_ids,affected_live_ids_after_commit,new_target,old_target,proof_effects,unit"
+        && idArrayOk(r.affected_ids) && (r.unit === "record" || r.unit === "lineage")
+        && !targetProblem(r.old_target) && !targetProblem(r.new_target) && canonKey(r.old_target) !== canonKey(r.new_target)
+        && canonKey(r.affected_ids) === canonKey(r.affected_live_ids_after_commit)
+        && validProofEffects(r.proof_effects) && r.proof_effects.every((p) => r.affected_ids.includes(p.topic_agent_id) && p.binding_effect === "produced" && (p.link_effect === "none" || p.link_effect === "preserved"))),
+  rebind_session_alias: (r) => (keysOf(r) === "affected_id,authorized_at,authorized_by,new_session_id,old_session_id" && isId(r.affected_id) && AILY_SESSION_SHAPE.test(r.old_session_id) && AILY_SESSION_SHAPE.test(r.new_session_id) && r.old_session_id !== r.new_session_id && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at))
+    || (keysOf(r) === "affected_id,affected_live_ids_after_commit,authorized_at,authorized_by,new_session_id,old_session_id,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id,tombstoned_a1_id"
+        && isId(r.affected_id) && AILY_SESSION_SHAPE.test(r.old_session_id) && AILY_SESSION_SHAPE.test(r.new_session_id) && r.old_session_id !== r.new_session_id
+        && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at)
+        && ANY_HANDLE_SHAPE.test(r.selection_handle) && OM_SHAPE.test(r.selected_root_om) && r.selected_session_id === r.new_session_id
+        && isOperationId(r.selection_operation_id)
+        && (r.tombstoned_a1_id === null || isId(r.tombstoned_a1_id))
+        && r.selection_basis === "rebind"
+        && typeof r.selection_message_id === "string" && OM_SHAPE.test(r.selection_message_id)
+        && canonKey(r.affected_live_ids_after_commit) === canonKey([r.affected_id])
+        && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_id && ["produced", "preserved"].includes(r.proof_effects[0].binding_effect) && r.proof_effects[0].link_effect === "produced"),
   migrate_seed: (r) => keysOf(r) === "authorized_at,authorized_by,seeded" && typeof r.authorized_by === "string" && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at) && Array.isArray(r.seeded) && r.seeded.every((s) => isObj(s) && isId(s.topic_agent_id) && typeof s.legacy_source_digest === "string" && SHA_SHAPE.test(s.legacy_source_digest)) && r.seeded.every((s, i) => i === 0 || r.seeded[i - 1].topic_agent_id < s.topic_agent_id),
   migrate_repair: (r) => keysOf(r) === "authorized_at,authorized_by,expected_projection_digest,from_family,legacy_source_digest,next_projection_digest,repaired_id,to_family" && isId(r.repaired_id) && typeof r.authorized_by === "string" && AUTHORIZED_BY_SHAPE.test(r.authorized_by) && isCanonicalIso(r.authorized_at) && [r.expected_projection_digest, r.next_projection_digest, r.legacy_source_digest].every((s) => typeof s === "string" && SHA_SHAPE.test(s)) && MIGRATE_FAMILIES.includes(r.from_family) && MIGRATE_FAMILIES.includes(r.to_family) && (r.from_family === "B1" ? r.to_family === "B1" : r.to_family !== "B1"),
   authority_cutover: (r) => keysOf(r) === "bijection_digest,endpoint_id,expiry_sha256,pending_claims_sha256,policy_sha256,pre_cutover_ledger_sha,revision_at_cutover"
     && Number.isInteger(r.revision_at_cutover) && r.revision_at_cutover >= 1
     && typeof r.endpoint_id === "string" && ENDPOINT_SHAPE.test(r.endpoint_id)
     && [r.bijection_digest, r.pre_cutover_ledger_sha, r.expiry_sha256, r.pending_claims_sha256, r.policy_sha256].every((v) => typeof v === "string" && SHA_SHAPE.test(v)),
+  mint_selection_handles: (r) => keysOf(r) === "affected_live_ids_after_commit,endpoint,minted,proof_effects"
+    && typeof r.endpoint === "string" && ENDPOINT_SHAPE.test(r.endpoint)
+    && Array.isArray(r.minted) && r.minted.every((m, i) => isObj(m) && isId(m.target_id) && SELECTION_HANDLE_SHAPE.test(m.selection_handle) && isCanonicalIso(m.handle_expires_at)
+        // 返修三 P2：A2 不由 mint 产生（A2 只经 attach_a2），minted 项不再认 anchor_candidate 字段
+        && keysOf(m) === "handle_expires_at,selection_handle,target_id"
+        && (i === 0 || r.minted[i - 1].target_id < m.target_id))
+    && canonKey(r.affected_live_ids_after_commit) === canonKey(r.minted.map((m) => m.target_id))
+    && Array.isArray(r.proof_effects) && r.proof_effects.length === 0,
+  clear_anchor_handle: (r) => keysOf(r) === "affected_live_ids_after_commit,cleared,proof_effects"
+    && canonKey(r.cleared) === canonKey(["selection_handle", "handle_expires_at"])
+    && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1
+    && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_live_ids_after_commit[0] && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "none",
+  reissue_selection_handle: (r) => {
+    if (keysOf(r) === "affected_live_ids_after_commit,new_expires_at,new_handle,proof_effects") {
+      return idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1
+        && SELECTION_HANDLE_SHAPE.test(r.new_handle) && isCanonicalIso(r.new_expires_at)
+        && Array.isArray(r.proof_effects) && r.proof_effects.length === 0;
+    }
+    if (keysOf(r) === "affected_live_ids_after_commit,anchor_candidate,new_expires_at,new_handle,proof_effects") {
+      return idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1
+        && SELECTION_HANDLE_SHAPE.test(r.new_handle) && isCanonicalIso(r.new_expires_at) && OM_SHAPE.test(r.anchor_candidate)
+        && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_live_ids_after_commit[0] && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "none";
+    }
+    return false;
+  },
+  request_rebind: (r) => keysOf(r) === "affected_live_ids_after_commit,proof_effects,rebind_expires_at,rebind_handle"
+    && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1
+    && REBIND_HANDLE_SHAPE.test(r.rebind_handle) && isCanonicalIso(r.rebind_expires_at)
+    && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_live_ids_after_commit[0] && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "preserved",
+  expire_rebind_handle: (r) => keysOf(r) === "affected_live_ids_after_commit,cleared,proof_effects"
+    && canonKey(r.cleared) === canonKey(["rebind_handle", "rebind_expires_at"])
+    && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1
+    && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_live_ids_after_commit[0] && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "preserved",
+  cancel_rebind: (r) => keysOf(r) === "affected_live_ids_after_commit,cleared,proof_effects"
+    && canonKey(r.cleared) === canonKey(["rebind_handle", "rebind_expires_at"])
+    && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1
+    && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_live_ids_after_commit[0] && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "preserved",
+  owner_select_reaffirm: (r) => {
+    if (keysOf(r) === "affected_live_ids_after_commit,new_binding_proof,new_link_proof,proof_effects,selection_message_id,target_id,tombstone_remap") {
+      return isId(r.target_id) && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.target_id
+        && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.target_id && r.proof_effects[0].binding_effect === "produced" && r.proof_effects[0].link_effect === "produced"
+        && bindingProofProblem(r.new_binding_proof, { schemaVersion: "1.1" }) === null && r.new_binding_proof.kind === "owner_select_v1" && REAFFIRM_HANDLE_SHAPE.test(r.new_binding_proof.selection_handle)
+        && linkProofProblem(r.new_link_proof, { schemaVersion: "1.1" }) === null && r.new_link_proof.kind === "owner_selected_route_v1" && REAFFIRM_HANDLE_SHAPE.test(r.new_link_proof.selection_handle)
+        && Array.isArray(r.tombstone_remap) && r.tombstone_remap.every((m, i) => isObj(m) && isId(m.old_tomb_id) && isObj(m.new_proof_ref) && keysOf(m.new_proof_ref) === "kind,selected_root_om,selection_handle,selection_operation_id" && m.new_proof_ref.kind === "owner_select_merge_v1" && REAFFIRM_HANDLE_SHAPE.test(m.new_proof_ref.selection_handle) && (i === 0 || r.tombstone_remap[i - 1].old_tomb_id < m.old_tomb_id))
+        && typeof r.selection_message_id === "string" && OM_SHAPE.test(r.selection_message_id);
+    }
+    if (keysOf(r) === "affected_live_ids_after_commit,new_link_proof,proof_effects,selection_message_id,target_id,tombstone_remap") {
+      return isId(r.target_id) && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.target_id
+        && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.target_id && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "produced"
+        && linkProofProblem(r.new_link_proof, { schemaVersion: "1.1" }) === null && r.new_link_proof.kind === "owner_selected_route_v1" && REAFFIRM_HANDLE_SHAPE.test(r.new_link_proof.selection_handle)
+        && Array.isArray(r.tombstone_remap) && r.tombstone_remap.every((m, i) => isObj(m) && isId(m.old_tomb_id) && isObj(m.new_proof_ref) && keysOf(m.new_proof_ref) === "kind,selected_root_om,selection_handle,selection_operation_id" && m.new_proof_ref.kind === "owner_select_merge_v1" && REAFFIRM_HANDLE_SHAPE.test(m.new_proof_ref.selection_handle) && (i === 0 || r.tombstone_remap[i - 1].old_tomb_id < m.old_tomb_id))
+        && typeof r.selection_message_id === "string" && OM_SHAPE.test(r.selection_message_id);
+    }
+    return false;
+  },
+  schema_upgrade: (r) => keysOf(r) === "endpoint,from_schema,to_schema"
+    && typeof r.endpoint === "string" && ENDPOINT_SHAPE.test(r.endpoint)
+    && VALID_UPGRADE_EDGES.includes(r.from_schema + "->" + r.to_schema),
 });
 
-function operationProblem(op, topRevision) {
+function operationProblem(op, topRevision, { schemaVersion = "1.0", upgradeBoundaryRevision = 0 } = {}) {
   if (!isObj(op) || keysOf(op) !== "fingerprint,op_type,request_key,result,result_revision,terminal_kind") return "operation 字段集不对";
   if (typeof op.request_key !== "string" || !REQUEST_KEY_SHAPE.test(op.request_key)) return "request_key 形状不对";
   if (!OP_TYPES.includes(op.op_type)) return "op_type 越界";
@@ -586,6 +830,21 @@ function operationProblem(op, topRevision) {
   if (typeof op.fingerprint !== "string" || !SHA_SHAPE.test(op.fingerprint)) return "fingerprint 形状不对";
   if (!Number.isInteger(op.result_revision) || op.result_revision < 1 || op.result_revision > topRevision) return "result_revision 越界";
   if (!isObj(op.result) || !RESULT_SHAPE[op.op_type](op.result)) return op.op_type + " result 形状不对";
+
+  // 1.0 边界与升级边界前历史封闭
+  const isBeforeUpgrade = schemaVersion === "1.0" || (upgradeBoundaryRevision > 0 && op.result_revision < upgradeBoundaryRevision);
+  if (isBeforeUpgrade) {
+    if (schemaVersion === "1.0" && op.op_type === "schema_upgrade") return "schema_upgrade 禁现于 1.0 账本";
+    if (op.op_type !== "schema_upgrade" && NEW_OP_TYPES.includes(op.op_type)) return op.op_type + " 禁现于 1.0 或升级边界之前";
+    if ("affected_live_ids_after_commit" in op.result) return op.op_type + " 增量 result 禁现于 1.0 或升级边界之前";
+  }
+
+  if ((op.op_type === "activate" || op.op_type === "anchor") && op.result.selection_handle && !op.result.selection_handle.startsWith("osh_")) {
+    return "activate/anchor handle 前缀必须为 osh_ (G15′)";
+  }
+  if (op.op_type === "rebind_session_alias" && op.result.selection_handle && !op.result.selection_handle.startsWith("orh_")) {
+    return "rebind_session_alias handle 前缀必须为 orh_ (G15′)";
+  }
   if (op.op_type === "initialize_shadow" && op.result_revision !== 1) return "initialize 的 result_revision 必为 1";
   if (op.op_type === "authority_cutover" && op.result.revision_at_cutover !== op.result_revision) return "cutover 的 revision_at_cutover 必等于 result_revision";
   return null;
@@ -596,9 +855,9 @@ function opConsistentWithRecord(op, id, rec) {
   const r = op.result;
   const fam = rec.kind === "live" ? familyOf(rec.facts) : null;
   switch (op.op_type) {
-    case "initialize_shadow": case "authority_cutover": return false; // 不产生记录
+    case "initialize_shadow": case "authority_cutover": case "schema_upgrade": return false; // 不产生记录
     case "create_a1": return rec.kind === "live" && r.created_id === id && fam === "A1";
-    case "create_b1": return rec.kind === "live" && r.created_id === id && fam === "B1";
+    case "create_b1": return rec.kind === "live" && (r.created_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === "B1";
     case "seed": return rec.kind === "live" && r.seeded_ids.includes(id); // seed 插入的族由 liveProblem 已校
     case "activate":
       if (r.surviving_id === id) return rec.kind === "live" && fam === "B3";
@@ -606,17 +865,38 @@ function opConsistentWithRecord(op, id, rec) {
       if (r.demoted_historical_id === id) return rec.kind === "live" && fam === "B4";
       return false;
     case "void": return rec.kind === "voided_audit" && r.voided_id === id;
-    case "attach_a2": return rec.kind === "live" && r.affected_id === id && fam === "A2";
-    case "attach_a3": case "anchor": return rec.kind === "live" && r.affected_id === id && fam === "A3";
-    case "restore": return rec.kind === "live" && r.affected_id === id && fam === "B3";
-    case "unbind": return rec.kind === "live" && r.affected_id === id && fam === r.terminal_family;
+    case "attach_a2": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === "A2"
+      && (r.anchor_candidate === undefined || r.anchor_candidate === rec.anchor_candidate);
+    case "attach_a3": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === "A3";
+    case "anchor": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === "A3"
+      // 返修三 P1-3：owner_select 增量锚定（r.expected_anchor_candidate 已由 shape 钉必带且 === selected_root_om）
+      // 时，必须等于记录上保留的 anchor_candidate（即产生 op 钉下的 pre-commit 值）；
+      // F4 基线锚定（1.0 形状，无此字段）不受影响 —— 与 attach_a2 的 undefined 宽容模式一致。
+      && (r.expected_anchor_candidate === undefined || r.expected_anchor_candidate === rec.anchor_candidate);
+    case "restore": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === "B3";
+    case "unbind": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === r.terminal_family;
     case "retarget": {
       if (rec.kind !== "live" || !r.affected_ids.includes(id)) return false;
       if (canonKey(rec.binding_target) !== canonKey(r.new_target)) return false; // 当前 target 必等 result.new_target
       if (rec.facts.binding === "pending") return rec.binding_proof === null; // B1：proof 仍 null
       return rec.binding_proof !== null && rec.binding_proof.kind === "retarget" && canonKey(rec.binding_proof.new_target) === canonKey(r.new_target) && canonKey(rec.binding_proof.old_target) === canonKey(r.old_target);
     }
-    case "rebind_session_alias": return rec.kind === "live" && r.affected_id === id && rec.aliases.session_id === r.new_session_id; // G13：仅改别名，target/proof 不动
+    case "rebind_session_alias": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && rec.aliases.session_id === r.new_session_id; // G13：仅改别名，target/proof 不动
+    case "mint_selection_handles": {
+      if (rec.kind !== "live") return false;
+      if (!Array.isArray(r.minted)) return false;
+      const m = r.minted.find((x) => x.target_id === id);
+      if (!m) return false;
+      // 返修三 P2：A2 不由 mint 产生（A2 只经 attach_a2）—— B1 保留，其余族一律 false
+      return fam === "B1";
+    }
+    case "clear_anchor_handle": return rec.kind === "live" && fam === "A2" && r.affected_live_ids_after_commit?.includes(id);
+    case "reissue_selection_handle": return rec.kind === "live" && (fam === "B1" || fam === "A2") && r.affected_live_ids_after_commit?.includes(id)
+      && (r.anchor_candidate === undefined || r.anchor_candidate === rec.anchor_candidate);
+    case "request_rebind":
+    case "expire_rebind_handle":
+    case "cancel_rebind": return rec.kind === "live" && fam === "B3" && r.affected_live_ids_after_commit?.includes(id);
+    case "owner_select_reaffirm": return (rec.kind === "live" && (r.target_id === id || r.affected_live_ids_after_commit?.includes(id))) || (rec.kind === "forwarding_tombstone" && Array.isArray(r.tombstone_remap) && r.tombstone_remap.some((m) => m.old_tomb_id === id));
     case "migrate_seed": {
       if (rec.kind !== "live" || !r.seeded.some((s) => s.topic_agent_id === id)) return false;
       // B1：proof 全 null；B3/B3'/B4：migrated 双证引用本笔 seed op，同 op 同 digest，且与 result.seeded 逐字匹配
@@ -652,7 +932,7 @@ export function validateLedger(doc, { endpointId } = {}) {
   const bad = (why) => ({ ok: false, reason: "ledger_corrupt", why });
   if (!isObj(doc)) return bad("账本不是对象");
   if (keysOf(doc) !== "artifact_type,authority_mode,chain,endpoint_id,operations,records,revision,schema_version") return bad("顶层字段集不对");
-  if (doc.schema_version !== SCHEMA_VERSION || doc.artifact_type !== ARTIFACT_TYPE) return bad("schema/artifact 不对");
+  if (!SCHEMA_VERSIONS.includes(doc.schema_version) || doc.artifact_type !== ARTIFACT_TYPE) return bad("schema/artifact 不对");
   if (doc.authority_mode !== "shadow" && doc.authority_mode !== "authoritative") return bad("authority_mode 越界");
   if (!CHAIN.includes(doc.chain)) return bad("chain 越界（链不可从 opaque endpoint 还原，顶层显式存）");
   if (!Number.isInteger(doc.revision) || doc.revision < 1) return bad("revision 不是正整数");
@@ -663,12 +943,63 @@ export function validateLedger(doc, { endpointId } = {}) {
 
   // G12：逐 op 判别联合 + 恰一笔 initialize_shadow + **每 revision 恰一笔（result_revision 覆盖 1..revision）**
   //       + (op_type,fingerprint) 唯一（评审三 P1-3：否则伪造同 revision 的 op 能过、重放 .find 选到伪造）。
+  const upgradeOps = Object.values(doc.operations)
+    .filter((op) => isObj(op) && op.op_type === "schema_upgrade")
+    .sort((a, b) => a.result_revision - b.result_revision);
+
+  if (doc.schema_version === "1.0") {
+    if (upgradeOps.length > 0) return bad("1.0 账本不得包含 schema_upgrade 操作");
+  } else {
+    if (upgradeOps.length > 2) return bad("schema_upgrade 操作不得超过 2 笔");
+    if (upgradeOps.length === 2) {
+      if (upgradeOps[0].result?.from_schema !== "1.0" || upgradeOps[0].result?.to_schema !== "1.1-transition" ||
+          upgradeOps[1].result?.from_schema !== "1.1-transition" || upgradeOps[1].result?.to_schema !== "1.1") {
+        return bad("两笔 schema_upgrade 必须严格单调 (1.0->1.1-transition 后 1.1-transition->1.1)");
+      }
+    }
+    if (upgradeOps.length > 0) {
+      const latest = upgradeOps[upgradeOps.length - 1];
+      if (latest.result?.to_schema !== doc.schema_version) {
+        return bad("最近一笔 schema_upgrade 的 to_schema 必须等于 doc.schema_version");
+      }
+    }
+  }
+  // 升级边界 = 首次离开 1.0 的那笔 schema_upgrade（按 result_revision 排序后第一笔 from_schema==="1.0"）；
+  // 之后的 op 才允许新形/增量 result —— 合法历史 1.0→transition→mint→1.1 里夹在两笔升级间的 op 也要放行。
+  const firstLeave10 = upgradeOps.find((u) => u.result?.from_schema === "1.0");
+  const upgradeBoundaryRevision = firstLeave10 ? firstLeave10.result_revision : 0;
+
   let initCount = 0;
   const revSeen = new Set(), fpSeen = new Set(), rkSeen = new Set();
   for (const [opId, op] of Object.entries(doc.operations)) {
     if (!isOperationId(opId)) return bad("operation key 形状不对：" + opId);
-    const p = operationProblem(op, doc.revision);
+    const p = operationProblem(op, doc.revision, { schemaVersion: doc.schema_version, upgradeBoundaryRevision });
     if (p !== null) return bad("operation " + opId + "：" + p);
+    if (op.result?.selection_operation_id && op.result.selection_operation_id !== opId) {
+      return bad("operation " + opId + " 的 selection_operation_id 必须等于本 operation key");
+    }
+    if (op.op_type === "owner_select_reaffirm") {
+      if (op.result?.new_link_proof?.selection_operation_id !== opId) {
+        return bad("reaffirm new_link_proof selection_operation_id 必须等于本 operation key");
+      }
+      if (Array.isArray(op.result?.tombstone_remap)) {
+        for (const m of op.result.tombstone_remap) {
+          if (m.new_proof_ref?.selected_root_om !== op.result.new_link_proof.selected_root_om) {
+            return bad("reaffirm tombstone_remap selected_root_om 必须等于 new_link_proof.selected_root_om");
+          }
+          if (m.new_proof_ref?.selection_handle !== op.result.new_link_proof.selection_handle) {
+            return bad("reaffirm tombstone_remap selection_handle 必须等于 new_link_proof.selection_handle");
+          }
+          if (m.new_proof_ref?.selection_operation_id !== opId) {
+            return bad("reaffirm tombstone_remap selection_operation_id 必须等于本 operation key");
+          }
+          const targetRec = doc.records[m.old_tomb_id];
+          if (!targetRec || targetRec.kind !== "forwarding_tombstone") {
+            return bad("reaffirm tombstone_remap old_tomb_id 必须为已存在的 forwarding_tombstone 记录：" + m.old_tomb_id);
+          }
+        }
+      }
+    }
     if (op.op_type === "initialize_shadow") initCount += 1;
     if (revSeen.has(op.result_revision)) return bad("result_revision 重复（G12）：" + op.result_revision);
     revSeen.add(op.result_revision);
@@ -686,7 +1017,7 @@ export function validateLedger(doc, { endpointId } = {}) {
   const live = [];
   let liveCount = 0;
   for (const [id, rec] of Object.entries(doc.records)) {
-    const p = recordProblem(rec, id);
+    const p = recordProblem(rec, id, { schemaVersion: doc.schema_version });
     if (p !== null) return bad(id + "：" + p);
     if (!(rec.origin_operation_id in doc.operations)) return bad(id + "：origin_operation_id 不在 operations 表（G13）");
     if (!opConsistentWithRecord(doc.operations[rec.origin_operation_id], id, rec)) return bad(id + "：origin op 与本记录不相容（G13）");
@@ -796,13 +1127,323 @@ export function validateLedger(doc, { endpointId } = {}) {
     if (e.lineages.size >= 1 && e.noLineage.size >= 1) return bad("同 target 谱系与无谱系占用者并存（G7）：" + tk);
   }
 
-  // G11：binding_target.runtime === 顶层 chain；retarget 跨字段
+  // G11′：binding_target.runtime === 顶层 chain；retarget 跨字段；owner_select_v1 selected_* 别名一致 ∧ 六字段等式
   const chain = doc.chain;
-  for (const [, rec] of live) {
+  for (const [id, rec] of live) {
     if (rec.binding_target !== null && rec.binding_target.runtime !== chain) return bad("binding_target.runtime 与 endpoint 链不符（G11）");
     if (rec.binding_proof !== null && rec.binding_proof.kind === "retarget") {
       if (canonKey(rec.binding_proof.old_target) === canonKey(rec.binding_proof.new_target)) return bad("retarget proof old===new（G11）");
       if (canonKey(rec.binding_target) !== canonKey(rec.binding_proof.new_target)) return bad("当前 binding_target ≠ proof.new_target（G11）");
+    }
+    const bp = rec.binding_proof;
+    const lp = rec.locator_link_proof_ref;
+    if (bp?.kind === "owner_select_v1") {
+      if (bp.selected_session_id !== rec.aliases.session_id || bp.selected_root_om !== rec.aliases.root_om) {
+        return bad(id + "：owner_select_v1 selected_* 与 aliases 不一致（G11′）");
+      }
+    }
+    if (lp?.kind === "owner_selected_route_v1") {
+      if (lp.selected_session_id !== rec.aliases.session_id || lp.selected_root_om !== rec.aliases.root_om) {
+        return bad(id + "：owner_selected_route_v1 selected_* 与 aliases 不一致（G11′）");
+      }
+    }
+    if (bp?.kind === "owner_select_v1" && lp?.kind === "owner_selected_route_v1") {
+      if (bp.authorized_by !== lp.authorized_by || bp.authorized_at !== lp.authorized_at ||
+          bp.selected_session_id !== lp.selected_session_id || bp.selected_root_om !== lp.selected_root_om ||
+          bp.selection_handle !== lp.selection_handle || bp.selection_operation_id !== lp.selection_operation_id) {
+        return bad(id + "：owner_select_v1 与 owner_selected_route_v1 六字段等式不成立（G11′/G13′）");
+      }
+    }
+  }
+
+  // G13′ (§7.2)：由来源 op result 的 proof_effects 中本记录那一项判 produced/preserved
+  for (const [id, rec] of live) {
+    const origOp = doc.operations[rec.origin_operation_id];
+    const bp = rec.binding_proof;
+    const lp = rec.locator_link_proof_ref;
+    const hasOwnerSelect = bp?.kind === "owner_select_v1" || lp?.kind === "owner_selected_route_v1";
+
+    if (hasOwnerSelect && (doc.schema_version === "1.1-transition" || doc.schema_version === "1.1")) {
+      if (!origOp?.result?.proof_effects || !Array.isArray(origOp.result.proof_effects) || !origOp.result.proof_effects.some((p) => p.topic_agent_id === id)) {
+        return bad(id + "：带 owner_select proof 的记录，其 origin op 必带 proof_effects 且含本记录项（G13′）");
+      }
+    }
+
+    if (!origOp?.result?.proof_effects) continue; // 基线 1.0 op 无 proof_effects，跳过
+    const pe = origOp.result.proof_effects.find((p) => p.topic_agent_id === id);
+    if (!pe) continue;
+
+    // none⇔proof null 全账本等式（返修三 P1-2：对任何 proof kind 成立，不再限 owner_select 系）
+    if (bp === null && lp === null) {
+      return bad(id + "：affected 中无 proof 的记录不得在 proof_effects 中列出");
+    }
+    if (bp !== null && pe.binding_effect === "none") {
+      return bad(id + "：有 binding proof 记录的 binding_effect 不得为 none（G13′）");
+    }
+    if (lp !== null && pe.link_effect === "none") {
+      return bad(id + "：有 link proof 记录的 link_effect 不得为 none（G13′）");
+    }
+    if (bp === null && pe.binding_effect !== "none") {
+      return bad(id + "：无 binding proof 记录的 binding_effect 必须为 none（G13′）");
+    }
+    if (lp === null && pe.link_effect !== "none") {
+      return bad(id + "：无 link proof 记录的 link_effect 必须为 none（G13′）");
+    }
+
+    // 逐 op 钉死 produced/preserved 的合法 proof kind（返修三 P1-2）：retarget 保留 migrated link 却写 none、
+    //   attach_a2 产生 retarget binding 这类漂移在此拦下，而非只靠 RESULT_SHAPE 的 effect 枚举。
+    const pin = OP_EFFECT_PROOF_KINDS[origOp.op_type];
+    if (pin) {
+      if (pe.binding_effect === "produced" && pin.produced_binding && !pin.produced_binding.includes(bp?.kind)) {
+        return bad(id + "：" + origOp.op_type + " binding_effect:produced 的 proof kind 必须是 " + pin.produced_binding.join("/") + "（G13′）");
+      }
+      if (pe.link_effect === "produced" && pin.produced_link && !pin.produced_link.includes(lp?.kind)) {
+        return bad(id + "：" + origOp.op_type + " link_effect:produced 的 proof kind 必须是 " + pin.produced_link.join("/") + "（G13′）");
+      }
+      if (pe.binding_effect === "preserved" && pin.preserved_binding && !pin.preserved_binding.includes(bp?.kind)) {
+        return bad(id + "：" + origOp.op_type + " binding_effect:preserved 的 proof kind 必须是 " + pin.preserved_binding.join("/") + "（G13′）");
+      }
+    }
+
+    // link_effect
+    if (pe.link_effect === "produced") {
+      if (!lp || lp.kind !== "owner_selected_route_v1") return bad(id + "：link_effect:produced 必须有 owner_selected_route_v1（G13′）");
+      if (lp.selection_operation_id !== rec.origin_operation_id) return bad(id + "：link_effect:produced 但 selection_operation_id 不等于 origin_operation_id（G13′）");
+      const r = origOp.result;
+      if (origOp.op_type === "owner_select_reaffirm") {
+        const nlp = r.new_link_proof;
+        if (!nlp || canonKey(nlp) !== canonKey(lp)) return bad(id + "：link_effect:produced 与 reaffirm new_link_proof 逐字不符（G13′）");
+      } else {
+        if (r.authorized_by !== lp.authorized_by || r.authorized_at !== lp.authorized_at ||
+            r.selected_session_id !== lp.selected_session_id || r.selected_root_om !== lp.selected_root_om ||
+            r.selection_handle !== lp.selection_handle) {
+          return bad(id + "：link_effect:produced proof 字段与 op result 逐字不符（G13′）");
+        }
+        if (r.selection_operation_id && r.selection_operation_id !== lp.selection_operation_id) {
+          return bad(id + "：link_effect:produced selection_operation_id 与 op result 逐字不符（G13′）");
+        }
+      }
+    } else if (pe.link_effect === "preserved") {
+      if (lp && lp.kind === "owner_selected_route_v1") {
+        const prodOpId = lp.selection_operation_id;
+        const prodOp = doc.operations[prodOpId];
+        if (!prodOp) return bad(id + "：preserved link 的产生 op 不在 operations 表（G13′）");
+        if (!ALLOWED_PRODUCE_OPS.includes(prodOp.op_type)) return bad(id + "：preserved link 的产生 op 不在受控产生集（G13′）");
+        if (prodOp.result_revision > origOp.result_revision) return bad(id + "：preserved link 来源 revision 大于当前 origin revision（G13′）");
+        const prodPe = prodOp.result?.proof_effects?.find((p) => p.topic_agent_id === id);
+        if (!prodPe || prodPe.link_effect !== "produced") return bad(id + "：preserved link 在来源 op 未标记 produced（G13′）");
+        if (prodOp.op_type === "owner_select_reaffirm") {
+          const nlp = prodOp.result.new_link_proof;
+          if (!nlp || canonKey(nlp) !== canonKey(lp)) return bad(id + "：preserved link 字段与 reaffirm 产生 result 不一致（G13′）");
+        } else {
+          const pr = prodOp.result;
+          if (pr.authorized_by !== lp.authorized_by || pr.authorized_at !== lp.authorized_at ||
+              pr.selected_session_id !== lp.selected_session_id || pr.selected_root_om !== lp.selected_root_om ||
+              pr.selection_handle !== lp.selection_handle) {
+            return bad(id + "：preserved link 字段与产生 op result 不一致（G13′）");
+          }
+        }
+      }
+    }
+
+    // binding_effect
+    if (pe.binding_effect === "produced" && bp?.kind === "owner_select_v1") {
+      if (bp.selection_operation_id !== rec.origin_operation_id) return bad(id + "：binding_effect:produced 但 selection_operation_id 不等于 origin_operation_id（G13′）");
+      const r = origOp.result;
+      if (origOp.op_type === "owner_select_reaffirm") {
+        const nbp = r.new_binding_proof;
+        if (!nbp || canonKey(nbp) !== canonKey(bp)) return bad(id + "：binding_effect:produced 与 reaffirm new_binding_proof 逐字不符（G13′）");
+      } else {
+        if (r.authorized_by !== bp.authorized_by || r.authorized_at !== bp.authorized_at ||
+            r.selected_session_id !== bp.selected_session_id || r.selected_root_om !== bp.selected_root_om ||
+            r.selection_handle !== bp.selection_handle) {
+          return bad(id + "：binding_effect:produced proof 字段与 op result 逐字不符（G13′）");
+        }
+        if (r.selection_operation_id && r.selection_operation_id !== bp.selection_operation_id) {
+          return bad(id + "：binding_effect:produced selection_operation_id 与 op result 逐字不符（G13′）");
+        }
+      }
+    } else if (pe.binding_effect === "preserved" && bp?.kind === "owner_select_v1") {
+      const prodOpId = bp.selection_operation_id;
+      const prodOp = doc.operations[prodOpId];
+      if (!prodOp) return bad(id + "：preserved binding 的产生 op 不在 operations 表（G13′）");
+      if (!ALLOWED_PRODUCE_OPS.includes(prodOp.op_type)) return bad(id + "：preserved binding 的产生 op 不在受控产生集（G13′）");
+      if (prodOp.result_revision > origOp.result_revision) return bad(id + "：preserved binding 来源 revision 大于当前 origin revision（G13′）");
+      const prodPe = prodOp.result?.proof_effects?.find((p) => p.topic_agent_id === id);
+      if (!prodPe || prodPe.binding_effect !== "produced") return bad(id + "：preserved binding 在来源 op 未标记 produced（G13′）");
+      if (prodOp.op_type === "owner_select_reaffirm") {
+        const nbp = prodOp.result.new_binding_proof;
+        if (!nbp || canonKey(nbp) !== canonKey(bp)) return bad(id + "：preserved binding 字段与 reaffirm 产生 result 不一致（G13′）");
+      } else {
+        const pr = prodOp.result;
+        if (pr.authorized_by !== bp.authorized_by || pr.authorized_at !== bp.authorized_at ||
+            pr.selected_session_id !== bp.selected_session_id || pr.selected_root_om !== bp.selected_root_om ||
+            pr.selection_handle !== bp.selection_handle) {
+          return bad(id + "：preserved binding 字段与产生 op result 不一致（G13′）");
+        }
+      }
+    }
+  }
+
+  // G13-tomb (§7.1)：tombstone 关联核验
+  for (const [id, rec] of Object.entries(doc.records)) {
+    if (rec.kind !== "forwarding_tombstone") continue;
+    if (rec.proof_ref?.kind !== "owner_select_merge_v1") continue;
+    const op = doc.operations[rec.origin_operation_id];
+    if (!op) return bad(id + "：tombstone origin_operation_id 不在 operations（G13-tomb）");
+    if (!["activate", "rebind_session_alias", "owner_select_reaffirm"].includes(op.op_type)) return bad(id + "：tombstone origin op_type 不在受控集合（G13-tomb）");
+    const r = op.result;
+    if (!r?.proof_effects) return bad(id + "：owner_select_merge_v1 tombstone origin op 必为增量形状（G13-tomb）");
+    if (op.op_type === "activate") {
+      if (r.tombstoned_id !== id) return bad(id + "：activate 未点名该 tombstone id（G13-tomb）");
+      if (rec.forwards_to !== r.surviving_id) return bad(id + "：tombstone forwards_to 不等于 activate surviving_id（G13-tomb）");
+      if (rec.proof_ref.selected_root_om !== r.selected_root_om || rec.proof_ref.selection_handle !== r.selection_handle) return bad(id + "：tombstone proof_ref 与 activate result 不一致（G13-tomb）");
+      if (rec.proof_ref.selection_operation_id !== rec.origin_operation_id) return bad(id + "：tombstone selection_operation_id 不等于 origin_operation_id（G13-tomb）");
+    } else if (op.op_type === "rebind_session_alias") {
+      if (r.tombstoned_a1_id !== id) return bad(id + "：rebind 未点名该 tombstone id（G13-tomb）");
+      if (rec.forwards_to !== r.affected_id) return bad(id + "：tombstone forwards_to 不等于 rebind affected_id（G13-tomb）");
+      if (rec.proof_ref.selected_root_om !== r.selected_root_om || rec.proof_ref.selection_handle !== r.selection_handle) return bad(id + "：tombstone proof_ref 与 rebind result 不一致（G13-tomb）");
+      if (rec.proof_ref.selection_operation_id !== rec.origin_operation_id) return bad(id + "：tombstone selection_operation_id 不等于 origin_operation_id（G13-tomb）");
+    } else if (op.op_type === "owner_select_reaffirm") {
+      const remap = Array.isArray(r.tombstone_remap) ? r.tombstone_remap.find((m) => m.old_tomb_id === id) : null;
+      if (!remap) return bad(id + "：reaffirm tombstone_remap 未点名该 tombstone id（G13-tomb）");
+      if (rec.forwards_to !== r.target_id) return bad(id + "：tombstone forwards_to 不等于 reaffirm target_id（G13-tomb）");
+      if (remap.new_proof_ref.selected_root_om !== rec.proof_ref.selected_root_om ||
+          remap.new_proof_ref.selection_handle !== rec.proof_ref.selection_handle ||
+          remap.new_proof_ref.selection_operation_id !== rec.proof_ref.selection_operation_id) {
+        return bad(id + "：reaffirm tombstone_remap 与 tombstone proof_ref 不一致（G13-tomb）");
+      }
+      if (rec.proof_ref.selected_root_om !== r.new_link_proof?.selected_root_om ||
+          rec.proof_ref.selection_handle !== r.new_link_proof?.selection_handle ||
+          rec.proof_ref.selection_operation_id !== rec.origin_operation_id) {
+        return bad(id + "：reaffirm tombstone proof_ref 与 new_link_proof 不一致（G13-tomb）");
+      }
+    }
+  }
+
+  // G15′：1.1 strict 拒 legacy pairing 形态；来源 op ↔ handle 前缀绑定
+  if (doc.schema_version === "1.1") {
+    for (const [id, rec] of Object.entries(doc.records)) {
+      if (rec.binding_proof?.matched_fields !== undefined || rec.binding_proof?.pending_token_state !== undefined) {
+        return bad(id + "：legacy_pairing_shape 现于 1.1 strict 账本 (G15′)");
+      }
+      if (rec.locator_link_proof_ref?.matched_fields !== undefined || rec.locator_link_proof_ref?.pending_token_state !== undefined) {
+        return bad(id + "：legacy_pairing_shape 现于 1.1 strict 账本 (G15′)");
+      }
+      if (rec.proof_ref?.matched_fields !== undefined || rec.proof_ref?.pending_token_state !== undefined) {
+        return bad(id + "：legacy_pairing_shape 现于 1.1 strict 账本 (G15′)");
+      }
+    }
+  }
+  for (const [, op] of Object.entries(doc.operations)) {
+    const r = op.result;
+    if (!r) continue;
+    if (op.op_type === "activate" || op.op_type === "anchor") {
+      if (r.selection_handle && !r.selection_handle.startsWith("osh_")) return bad("activate/anchor handle 前缀必须为 osh_ (G15′)");
+    } else if (op.op_type === "rebind_session_alias") {
+      if (r.selection_handle && !r.selection_handle.startsWith("orh_")) return bad("rebind_session_alias handle 前缀必须为 orh_ (G15′)");
+    } else if (op.op_type === "owner_select_reaffirm") {
+      if (r.new_link_proof?.selection_handle && !r.new_link_proof.selection_handle.startsWith("rfh_")) return bad("owner_select_reaffirm handle 前缀必须为 rfh_ (G15′)");
+      if (r.new_binding_proof?.selection_handle && !r.new_binding_proof.selection_handle.startsWith("rfh_")) return bad("owner_select_reaffirm handle 前缀必须为 rfh_ (G15′)");
+    }
+  }
+
+  // G-handle (§7.2)：handle 来源完整性与全局唯一
+  const liveHandles = new Map();
+  for (const [id, rec] of live) {
+    for (const h of [rec.selection_handle, rec.rebind_handle]) {
+      if (h !== null && h !== undefined) {
+        if (liveHandles.has(h)) return bad("live handle 全局不唯一 (G-handle)：" + h);
+        liveHandles.set(h, id);
+      }
+    }
+  }
+
+  for (const [id, rec] of live) {
+    const fam = familyOf(rec.facts);
+    if (rec.selection_handle !== null && rec.selection_handle !== undefined) {
+      // 产生 op 集 = {create_b1, mint_selection_handles, attach_a2, reissue_selection_handle}
+      const prodOps = Object.entries(doc.operations).filter(([, op]) => {
+        if (!["create_b1", "mint_selection_handles", "attach_a2", "reissue_selection_handle"].includes(op.op_type)) return false;
+        return op.result?.affected_live_ids_after_commit?.includes(id);
+      }).sort((a, b) => b[1].result_revision - a[1].result_revision);
+      if (prodOps.length === 0) return bad(id + "：selection_handle 无产生 op (G-handle)");
+      const [prodOpId, prodOp] = prodOps[0];
+
+      // 检查是否被更晚的消费/清理 op 覆盖
+      const consumedByLater = Object.entries(doc.operations).some(([, op]) => {
+        if (!["activate", "anchor", "void", "clear_anchor_handle"].includes(op.op_type)) return false;
+        if (op.result_revision <= prodOp.result_revision) return false;
+        return op.result?.affected_live_ids_after_commit?.includes(id) || op.result?.voided_id === id;
+      });
+      if (consumedByLater) return bad(id + "：selection_handle 已被后续 op 消费/清理 (G-handle)");
+
+      // 逐字等核验
+      const pr = prodOp.result;
+      if (prodOp.op_type === "create_b1" || prodOp.op_type === "attach_a2") {
+        if (pr.selection_handle !== rec.selection_handle || pr.handle_expires_at !== rec.handle_expires_at) {
+          return bad(id + "：selection_handle 与产生 op result 逐字不符 (G-handle)");
+        }
+        if (prodOp.op_type === "attach_a2" && pr.anchor_candidate !== undefined && pr.anchor_candidate !== rec.anchor_candidate) {
+          return bad(id + "：anchor_candidate 与产生 op result 逐字不符 (G-handle)");
+        }
+      } else if (prodOp.op_type === "mint_selection_handles") {
+        const item = pr.minted?.find((m) => m.target_id === id);
+        if (!item || item.selection_handle !== rec.selection_handle || item.handle_expires_at !== rec.handle_expires_at) {
+          return bad(id + "：selection_handle 与产生 op result 逐字不符 (G-handle)");
+        }
+        // 返修三 P2：A2 的 anchor_candidate 与 mint 产生 op 的逐字等检查已删（A2 不由 mint 产生）
+      } else if (prodOp.op_type === "reissue_selection_handle") {
+        if (pr.new_handle !== rec.selection_handle || pr.new_expires_at !== rec.handle_expires_at) {
+          return bad(id + "：selection_handle 与产生 op result 逐字不符 (G-handle)");
+        }
+        if (pr.anchor_candidate !== undefined && pr.anchor_candidate !== rec.anchor_candidate) {
+          return bad(id + "：anchor_candidate 与产生 op result 逐字不符 (G-handle)");
+        }
+      }
+    }
+
+    if (rec.rebind_handle !== null && rec.rebind_handle !== undefined) {
+      // 产生 op 集 = {request_rebind}
+      const prodOps = Object.entries(doc.operations).filter(([, op]) => {
+        if (op.op_type !== "request_rebind") return false;
+        return op.result?.affected_live_ids_after_commit?.includes(id);
+      }).sort((a, b) => b[1].result_revision - a[1].result_revision);
+      if (prodOps.length === 0) return bad(id + "：rebind_handle 无产生 op (G-handle)");
+      const [prodOpId, prodOp] = prodOps[0];
+
+      const consumedByLater = Object.entries(doc.operations).some(([, op]) => {
+        if (!["rebind_session_alias", "expire_rebind_handle", "cancel_rebind"].includes(op.op_type)) return false;
+        if (op.result_revision <= prodOp.result_revision) return false;
+        return op.result?.affected_live_ids_after_commit?.includes(id);
+      });
+      if (consumedByLater) return bad(id + "：rebind_handle 已被后续 op 消费/清理 (G-handle)");
+
+      const pr = prodOp.result;
+      if (pr.rebind_handle !== rec.rebind_handle || pr.rebind_expires_at !== rec.rebind_expires_at) {
+        return bad(id + "：rebind_handle 与产生 op result 逐字不符 (G-handle)");
+      }
+    }
+  }
+
+  // 跨 op 核验：affected_live_ids_after_commit 与 proof_effects 关联等式
+  for (const [opId, op] of Object.entries(doc.operations)) {
+    const r = op.result;
+    if (!r || !Array.isArray(r.affected_live_ids_after_commit)) continue;
+    if (!Array.isArray(r.proof_effects)) return bad("带 affected_live_ids_after_commit 的 op 必带 proof_effects");
+    const pesIds = new Set(r.proof_effects.map((p) => p.topic_agent_id));
+    for (const pId of pesIds) {
+      if (!r.affected_live_ids_after_commit.includes(pId)) {
+        return bad("proof_effects 中的 id 不在 affected_live_ids_after_commit 中");
+      }
+    }
+    for (const affId of r.affected_live_ids_after_commit) {
+      const rec = doc.records[affId];
+      if (rec && rec.kind === "live" && rec.origin_operation_id === opId) {
+        const hasProof = rec.binding_proof !== null || rec.locator_link_proof_ref !== null;
+        if (hasProof && !pesIds.has(affId)) return bad("affected 中有 proof 的记录未在 proof_effects 中列出");
+        if (!hasProof && pesIds.has(affId)) return bad("affected 中无 proof 的记录不得在 proof_effects 中列出");
+      }
     }
   }
 

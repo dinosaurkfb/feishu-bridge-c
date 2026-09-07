@@ -123,6 +123,13 @@ handle、不产 link proof）。
 自身 fingerprint 输入）；随机 handle **只进 result、不进 fingerprint**；request_key 逐 op 可重复
 派生（rebind/reaffirm 复发用**各自持久控制 id**，不复用原 claim key；reaffirm 目标未必有 claim key）。
 
+**「授权/选择六字段」的确切名（R48 验收回带：此前只写"六字段"未逐字列出）** = §3.1 proof 的六个字段名
+**原样**进 result：`authorized_by, authorized_at, selected_session_id, selected_root_om, selection_handle,
+selection_operation_id`；activate / anchor / rebind_session_alias 的增量 result 都带这六个（外加
+`selection_message_id`、`selection_basis`），且 result 的 `selection_operation_id` === 本 op 自己的 operations
+map key；G13′-A 的"result 字段与 proof 逐字等"即这六名逐字比。`owner_select_reaffirm` 不拷六字段，用
+`new_binding_proof`/`new_link_proof` 整体 canonKey 逐字比。
+
 **每 op 的产证/保留由 result 里的封闭有序投影 `proof_effects` 表达（P1-1：不是单个全局 effect
 ——activate 同笔既产新 B3 又保留旧 current，扁平字段表达不了）**：
 

@@ -32057,6 +32057,91 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
 
     const dBad3 = mkBaseDoc("1.1-strict");
     assert.equal(TAL.validateLedger(dBad3, { endpointId: EP }).reason, "ledger_corrupt", "非受控 schema 字符串拒");
+
+    // P1-1 (a): 1.0 账本含新 op mint_selection_handles → 拒
+    const d10NewOp = mkBaseDoc("1.0");
+    d10NewOp.revision = 2;
+    d10NewOp.operations[opId1] = {
+      op_type: "mint_selection_handles",
+      terminal_kind: "mint_selection_handles",
+      request_key: "rk_m",
+      fingerprint: "1".repeat(64),
+      result_revision: 2,
+      result: { endpoint: EP, minted: [], affected_live_ids_after_commit: [], proof_effects: [] }
+    };
+    assert.equal(TAL.validateLedger(d10NewOp, { endpointId: EP }).ok, false, "1.0 账本含新 op 拒");
+
+    // P1-1 (b): 1.0 账本含 create_b1 增量 result → 拒
+    const d10IncRes = mkBaseDoc("1.0");
+    d10IncRes.revision = 2;
+    d10IncRes.operations[opId1] = {
+      op_type: "create_b1",
+      terminal_kind: "create_b1",
+      request_key: "rk_b",
+      fingerprint: "2".repeat(64),
+      result_revision: 2,
+      result: { created_id: taId1, selection_handle: hOSH1, handle_expires_at: ISO, affected_live_ids_after_commit: [taId1], proof_effects: [] }
+    };
+    d10IncRes.records[taId1] = {
+      kind: "live", topic_agent_id: taId1, chat_id: "oc_chat1", created_at: ISO, updated_at: ISO, origin_operation_id: opId1,
+      facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" },
+      aliases: { session_id: null, root_om: "om_root1" }, binding_target: TGT, binding_proof: null, locator_link_proof_ref: null,
+      generation_lineage_id: "lin_1", anchor_candidate: null
+    };
+    assert.equal(TAL.validateLedger(d10IncRes, { endpointId: EP }).ok, false, "1.0 账本含 create_b1 增量 result 拒");
+
+    // P1-1 (c): 1.0 账本含 schema_upgrade op → 拒
+    const d10Upgrade = mkBaseDoc("1.0");
+    d10Upgrade.revision = 2;
+    d10Upgrade.operations[opId1] = {
+      op_type: "schema_upgrade",
+      terminal_kind: "schema_upgrade",
+      request_key: "rk_u",
+      fingerprint: "3".repeat(64),
+      result_revision: 2,
+      result: { endpoint: EP, from_schema: "1.0", to_schema: "1.1-transition" }
+    };
+    assert.equal(TAL.validateLedger(d10Upgrade, { endpointId: EP }).ok, false, "1.0 账本含 schema_upgrade 拒");
+
+    // P1-1 (d): 逆向 schema_upgrade (1.1 -> 1.0) → 拒
+    const dReverseUpgrade = mkBaseDoc("1.0");
+    dReverseUpgrade.revision = 2;
+    dReverseUpgrade.operations[opId1] = {
+      op_type: "schema_upgrade",
+      terminal_kind: "schema_upgrade",
+      request_key: "rk_rev_u",
+      fingerprint: "4".repeat(64),
+      result_revision: 2,
+      result: { endpoint: EP, from_schema: "1.1", to_schema: "1.0" }
+    };
+    assert.equal(TAL.validateLedger(dReverseUpgrade, { endpointId: EP }).ok, false, "逆向 schema_upgrade 拒");
+
+    // P1-1 (e): 升级边界之前出现新形 / 增量 result → 拒
+    const dBeforeBoundary = mkBaseDoc("1.1-transition");
+    dBeforeBoundary.revision = 3;
+    dBeforeBoundary.operations[opId1] = {
+      op_type: "create_b1",
+      terminal_kind: "create_b1",
+      request_key: "rk_b_early",
+      fingerprint: "5".repeat(64),
+      result_revision: 2,
+      result: { created_id: taId1, selection_handle: hOSH1, handle_expires_at: ISO, affected_live_ids_after_commit: [taId1], proof_effects: [] }
+    };
+    dBeforeBoundary.operations[opId2] = {
+      op_type: "schema_upgrade",
+      terminal_kind: "schema_upgrade",
+      request_key: "rk_u_late",
+      fingerprint: "6".repeat(64),
+      result_revision: 3,
+      result: { endpoint: EP, from_schema: "1.0", to_schema: "1.1-transition" }
+    };
+    dBeforeBoundary.records[taId1] = {
+      kind: "live", topic_agent_id: taId1, chat_id: "oc_chat1", created_at: ISO, updated_at: ISO, origin_operation_id: opId1,
+      facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" },
+      aliases: { session_id: null, root_om: "om_root1" }, binding_target: TGT, binding_proof: null, locator_link_proof_ref: null,
+      generation_lineage_id: "lin_1", anchor_candidate: null, selection_handle: hOSH1, handle_expires_at: ISO, rebind_handle: null, rebind_expires_at: null
+    };
+    assert.equal(TAL.validateLedger(dBeforeBoundary, { endpointId: EP }).ok, false, "升级边界之前出现增量 result 拒");
   }
 
   // ── 2. Live 记录四 handle 字段（1.0 缺席 vs 1.1 必在场 & 跨字段联合）──

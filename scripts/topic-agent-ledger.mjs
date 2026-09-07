@@ -74,6 +74,12 @@ const OP_TYPES = [
   "request_rebind", "expire_rebind_handle", "cancel_rebind", "owner_select_reaffirm",
   "schema_upgrade"
 ];
+const NEW_OP_TYPES = Object.freeze([
+  "mint_selection_handles", "clear_anchor_handle", "reissue_selection_handle",
+  "request_rebind", "expire_rebind_handle", "cancel_rebind", "owner_select_reaffirm",
+  "schema_upgrade"
+]);
+const VALID_UPGRADE_EDGES = Object.freeze(["1.0->1.1-transition", "1.1-transition->1.1", "1.0->1.1"]);
 // migrate_repair 的 from_family / to_family 值域（§5.1 判别联合：B1→B1；{B3,B3',B4}→{B3,B3',B4}）
 const MIGRATE_FAMILIES = ["B1", "B3", "B3'", "B4"];
 
@@ -783,11 +789,10 @@ const RESULT_SHAPE = Object.freeze({
   },
   schema_upgrade: (r) => keysOf(r) === "endpoint,from_schema,to_schema"
     && typeof r.endpoint === "string" && ENDPOINT_SHAPE.test(r.endpoint)
-    && SCHEMA_VERSIONS.includes(r.from_schema) && SCHEMA_VERSIONS.includes(r.to_schema)
-    && r.from_schema !== r.to_schema,
+    && VALID_UPGRADE_EDGES.includes(r.from_schema + "->" + r.to_schema),
 });
 
-function operationProblem(op, topRevision) {
+function operationProblem(op, topRevision, { schemaVersion = "1.0", upgradeBoundaryRevision = 0 } = {}) {
   if (!isObj(op) || keysOf(op) !== "fingerprint,op_type,request_key,result,result_revision,terminal_kind") return "operation 字段集不对";
   if (typeof op.request_key !== "string" || !REQUEST_KEY_SHAPE.test(op.request_key)) return "request_key 形状不对";
   if (!OP_TYPES.includes(op.op_type)) return "op_type 越界";
@@ -795,6 +800,15 @@ function operationProblem(op, topRevision) {
   if (typeof op.fingerprint !== "string" || !SHA_SHAPE.test(op.fingerprint)) return "fingerprint 形状不对";
   if (!Number.isInteger(op.result_revision) || op.result_revision < 1 || op.result_revision > topRevision) return "result_revision 越界";
   if (!isObj(op.result) || !RESULT_SHAPE[op.op_type](op.result)) return op.op_type + " result 形状不对";
+
+  // 1.0 边界与升级边界前历史封闭
+  const isBeforeUpgrade = schemaVersion === "1.0" || (upgradeBoundaryRevision > 0 && op.result_revision < upgradeBoundaryRevision);
+  if (isBeforeUpgrade) {
+    if (schemaVersion === "1.0" && op.op_type === "schema_upgrade") return "schema_upgrade 禁现于 1.0 账本";
+    if (op.op_type !== "schema_upgrade" && NEW_OP_TYPES.includes(op.op_type)) return op.op_type + " 禁现于 1.0 或升级边界之前";
+    if ("affected_live_ids_after_commit" in op.result) return op.op_type + " 增量 result 禁现于 1.0 或升级边界之前";
+  }
+
   if ((op.op_type === "activate" || op.op_type === "anchor") && op.result.selection_handle && !op.result.selection_handle.startsWith("osh_")) {
     return "activate/anchor handle 前缀必须为 osh_ (G15′)";
   }
@@ -885,11 +899,34 @@ export function validateLedger(doc, { endpointId } = {}) {
 
   // G12：逐 op 判别联合 + 恰一笔 initialize_shadow + **每 revision 恰一笔（result_revision 覆盖 1..revision）**
   //       + (op_type,fingerprint) 唯一（评审三 P1-3：否则伪造同 revision 的 op 能过、重放 .find 选到伪造）。
+  const upgradeOps = Object.values(doc.operations)
+    .filter((op) => isObj(op) && op.op_type === "schema_upgrade")
+    .sort((a, b) => a.result_revision - b.result_revision);
+
+  if (doc.schema_version === "1.0") {
+    if (upgradeOps.length > 0) return bad("1.0 账本不得包含 schema_upgrade 操作");
+  } else {
+    if (upgradeOps.length > 2) return bad("schema_upgrade 操作不得超过 2 笔");
+    if (upgradeOps.length === 2) {
+      if (upgradeOps[0].result?.from_schema !== "1.0" || upgradeOps[0].result?.to_schema !== "1.1-transition" ||
+          upgradeOps[1].result?.from_schema !== "1.1-transition" || upgradeOps[1].result?.to_schema !== "1.1") {
+        return bad("两笔 schema_upgrade 必须严格单调 (1.0->1.1-transition 后 1.1-transition->1.1)");
+      }
+    }
+    if (upgradeOps.length > 0) {
+      const latest = upgradeOps[upgradeOps.length - 1];
+      if (latest.result?.to_schema !== doc.schema_version) {
+        return bad("最近一笔 schema_upgrade 的 to_schema 必须等于 doc.schema_version");
+      }
+    }
+  }
+  const upgradeBoundaryRevision = upgradeOps.length > 0 ? upgradeOps[upgradeOps.length - 1].result_revision : 0;
+
   let initCount = 0;
   const revSeen = new Set(), fpSeen = new Set(), rkSeen = new Set();
   for (const [opId, op] of Object.entries(doc.operations)) {
     if (!isOperationId(opId)) return bad("operation key 形状不对：" + opId);
-    const p = operationProblem(op, doc.revision);
+    const p = operationProblem(op, doc.revision, { schemaVersion: doc.schema_version, upgradeBoundaryRevision });
     if (p !== null) return bad("operation " + opId + "：" + p);
     if (op.op_type === "initialize_shadow") initCount += 1;
     if (revSeen.has(op.result_revision)) return bad("result_revision 重复（G12）：" + op.result_revision);

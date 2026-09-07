@@ -35001,6 +35001,303 @@ test("R50 返修二 6 P1 + 2 P2：schema 冻结、锁内 CAS 写原语、validat
   assert.notEqual(campaignDocProblem({ ...dummyDoc, pending_joins: [pj6Digit] }), null, "六位年份 at 必须拒绝");
 });
 
+test("R50 返修四 3 P1 + 3 P2：finalize 一次性不抛、维护窄事务 capability、pending_joins 封闭、canonical-time、tmp残骸与真并发", () => {
+  const tok = "00000000-0000-4000-8000-000000000001";
+  const cid = campaignIdFor(tok);
+  const eps = ["endpoint_111111111111111111111111", "endpoint_222222222222222222222222"];
+  const dig = endpointsDigest(eps);
+  const now = "2026-09-07T10:00:00.000Z";
+
+  const tmpRoot = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r50-r4-test-"));
+  const ledgerDir = path.join(tmpRoot, "ledger");
+  fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
+  const maintDir = path.join(tmpRoot, "maint");
+  fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+  const env = {
+    FEISHU_BRIDGE_LEDGER_DIR: ledgerDir,
+    FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir,
+  };
+
+  // 1. 【P1-3】pending_joins 身份形状封闭
+  const baseCampaignDoc = {
+    schema_version: "owner-select-campaign-1",
+    campaign_id: cid,
+    state: "open",
+    endpoints: eps,
+    endpoints_digest: dig,
+    pending_joins: [],
+    members: {
+      "endpoint_111111111111111111111111": { schema_version: "1.0", legacy_proof_count: 0, null_b1_count: 0 },
+      "endpoint_222222222222222222222222": { schema_version: "1.1-transition", legacy_proof_count: 0, null_b1_count: 0 }
+    },
+    revision: 1,
+    origin_operation_id: tok
+  };
+
+  // (a) init_chain 必属于 { claude, codex }，"evil-chain" 必拒
+  const pjEvilChain = {
+    endpoint_id: "endpoint_333333333333333333333333",
+    at: now,
+    init_chain: "evil-chain",
+    init_request_key: "req1",
+    init_operation_token: tok
+  };
+  assert.notEqual(campaignDocProblem({ ...baseCampaignDoc, pending_joins: [pjEvilChain] }), null, "init_chain 为 evil-chain 必拒");
+
+  // (b) init_request_key 形状封闭（复用 REQUEST_KEY_SHAPE，换行必拒、超长必拒）
+  const pjNewlineKey = {
+    endpoint_id: "endpoint_333333333333333333333333",
+    at: now,
+    init_chain: "claude",
+    init_request_key: "req\nkey",
+    init_operation_token: tok
+  };
+  assert.notEqual(campaignDocProblem({ ...baseCampaignDoc, pending_joins: [pjNewlineKey] }), null, "init_request_key 含换行必拒");
+
+  const pjOversizedKey = {
+    endpoint_id: "endpoint_333333333333333333333333",
+    at: now,
+    init_chain: "claude",
+    init_request_key: "a".repeat(257),
+    init_operation_token: tok
+  };
+  assert.notEqual(campaignDocProblem({ ...baseCampaignDoc, pending_joins: [pjOversizedKey] }), null, "init_request_key 超过 256 字符必拒");
+
+  const pjValidClaude = {
+    endpoint_id: "endpoint_333333333333333333333333",
+    at: now,
+    init_chain: "claude",
+    init_request_key: "req-valid:123@+-.",
+    init_operation_token: tok
+  };
+  assert.equal(campaignDocProblem({ ...baseCampaignDoc, pending_joins: [pjValidClaude] }), null, "合法 claude pending_join");
+
+  const pjValidCodex = {
+    endpoint_id: "endpoint_333333333333333333333333",
+    at: now,
+    init_chain: "codex",
+    init_request_key: "req-valid_456",
+    init_operation_token: tok
+  };
+  assert.equal(campaignDocProblem({ ...baseCampaignDoc, pending_joins: [pjValidCodex] }), null, "合法 codex pending_join");
+
+  // 2. 【P2-1】journal.mjs 本地 ISO 判据换成 canonical-time（六位年份必拒）
+  const enterSteps = [
+    { kind: "timer", id: "timer:claude", state: "done", at: now, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
+    { kind: "timer", id: "timer:codex", state: "done", at: now, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
+    { kind: "stub", id: "stub:claude", state: "done", at: now, target: "versions/x", chain: null, before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "stub", id: "stub:codex", state: "done", at: now, target: "stub", chain: null, before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "current", id: "current:claude", state: "done", at: now, target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "current", id: "current:codex", state: "done", at: now, target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "gate", id: "gate", state: "done", at: now, target: "gate", chain: null, before: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, backup: null, backup_sha256: null, backup_bytes: null }
+  ];
+
+  const docWithSixDigitYear = {
+    schema_version: "1.4",
+    operation_kind: "owner_select_migration_a",
+    phase: "osm_a_upgrading",
+    reason: "A migration",
+    started_at: now,
+    updated_at: now,
+    token: tok,
+    notes: [],
+    steps: [
+      ...enterSteps,
+      {
+        at: "+010209-01-27T06:13:20.000Z", backup: null, backup_bytes: null, backup_sha256: null,
+        before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null },
+        chain: null, id: "campaign:" + cid + ":open",
+        intended_after: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: cid, endpoints: [eps[0]], endpoints_digest: endpointsDigest([eps[0]]) },
+        kind: "campaign", state: "prepared", target: "ledger/owner-select-campaign.json"
+      }
+    ]
+  };
+  assert.notEqual(journalProblem(docWithSixDigitYear, { maintenanceDir: maintDir }), null, "journal 出现六位年份 at 必拒");
+
+  // 3. 【P1-2】写 API 维护窄事务：无 capability 一律拒，capability 全核验
+  // (a) 无 capability 或 capability 缺字段
+  const noCapRes = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDoc });
+  assert.equal(noCapRes.ok, false);
+  assert.equal(noCapRes.commit, "not_committed");
+  assert.equal(noCapRes.reason, "maintenance_capability_required");
+
+  const emptyCapRes = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDoc, capability: {} });
+  assert.equal(emptyCapRes.ok, false);
+  assert.equal(emptyCapRes.reason, "maintenance_capability_required");
+
+  // 搭建合法 maintenance fixture
+  const stepCampaignOpenId = "campaign:" + cid + ":open";
+  const stepWriterPartialId = "writer_state:" + cid + ":partial";
+  const journalDocValid = {
+    schema_version: "1.4",
+    operation_kind: "owner_select_migration_a",
+    phase: "osm_a_upgrading",
+    reason: "A migration test",
+    started_at: now,
+    updated_at: now,
+    token: tok,
+    notes: [],
+    steps: [
+      ...enterSteps,
+      {
+        at: now, backup: null, backup_bytes: null, backup_sha256: null,
+        before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null },
+        chain: null, id: stepCampaignOpenId,
+        intended_after: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: cid, endpoints: eps, endpoints_digest: dig },
+        kind: "campaign", state: "prepared", target: "ledger/owner-select-campaign.json"
+      },
+      {
+        at: now, backup: null, backup_bytes: null, backup_sha256: null,
+        before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 },
+        chain: null, id: stepWriterPartialId,
+        intended_after: { exists: true, sha256: "2".repeat(64), state: "partial", campaign_id: cid, endpoints_digest: dig, revision: 1 },
+        kind: "writer_state", state: "prepared", target: "ledger/owner-select-writer-state.json"
+      }
+    ]
+  };
+  fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(journalDocValid, null, 2) + "\n", { mode: 0o600 });
+  const activeLink = path.join(maintDir, "active");
+  if (fs.existsSync(activeLink)) fs.unlinkSync(activeLink);
+  fs.symlinkSync(tok, activeLink);
+
+  const capCampaignValid = { token: tok, stepId: stepCampaignOpenId };
+  const capWriterValid = { token: tok, stepId: stepWriterPartialId };
+
+  // (b) active 不匹配拒
+  const badActiveCap = { token: "00000000-0000-4000-8000-000000000009", stepId: stepCampaignOpenId };
+  const rBadActive = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDoc, capability: badActiveCap });
+  assert.equal(rBadActive.ok, false);
+  assert.equal(rBadActive.reason, "maintenance_capability_required");
+
+  // (c) intended_after 与 doc 投影不匹配拒
+  const badProjDoc = { ...baseCampaignDoc, state: "sealed" };
+  const rBadProj = writeCampaignState({ env, expectedSha256: null, doc: badProjDoc, capability: capCampaignValid });
+  assert.equal(rBadProj.ok, false);
+  assert.equal(rBadProj.reason, "maintenance_capability_required");
+
+  // (d) before 现场不匹配拒 (step 声明 before.exists: true 但现场 absent)
+  const journalDocBeforeMismatch = {
+    ...journalDocValid,
+    steps: journalDocValid.steps.map(s => s.id === stepCampaignOpenId ? {
+      ...s,
+      before: { exists: true, sha256: "0".repeat(64), state: "open", campaign_id: cid, endpoints: eps, endpoints_digest: dig }
+    } : s)
+  };
+  fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(journalDocBeforeMismatch, null, 2) + "\n", { mode: 0o600 });
+  const rBeforeMismatch = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDoc, capability: capCampaignValid });
+  assert.equal(rBeforeMismatch.ok, false);
+  assert.equal(rBeforeMismatch.reason, "maintenance_capability_required");
+
+  // 恢复合法 journal
+  fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(journalDocValid, null, 2) + "\n", { mode: 0o600 });
+
+  // 4. 【P2-2】tmp fsync 失败尽力清理残骸
+  const origFsync = fs.fsyncSync;
+  let failTmpFsync = false;
+  fs.fsyncSync = function(fd) {
+    if (failTmpFsync) {
+      try {
+        if (fs.fstatSync(fd).isFile()) {
+          const err = new Error("EIO: tmp fsync error");
+          err.code = "EIO";
+          throw err;
+        }
+      } catch (e) {
+        if (e.code === "EIO") throw e;
+      }
+    }
+    return origFsync.apply(this, arguments);
+  };
+  try {
+    failTmpFsync = true;
+    const rTmpFail = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDoc, capability: capCampaignValid });
+    assert.equal(rTmpFail.ok, false);
+    assert.equal(rTmpFail.commit, "not_committed");
+    assert.equal(rTmpFail.reason, "tmp_write_failed");
+    const orphans = fs.readdirSync(ledgerDir).filter(f => f.includes(".tmp"));
+    assert.deepEqual(orphans, [], "tmp 写/fsync 失败必须清理残骸，不得留下孤儿临时文件");
+  } finally {
+    fs.fsyncSync = origFsync;
+    failTmpFsync = false;
+  }
+
+  // 5. 【P1-1】Finalize 一次性不抛，提交后释放异常绝不折叠成 not_committed
+  // 注入释放锁异常：模拟 renameLanded 后 releasePublishLock 抛出 EIO
+  const lockDir = path.join(ledgerDir, "owner-select-state.lock");
+  const origRmdir = fs.rmdirSync;
+  let throwLockRelease = false;
+  fs.rmdirSync = function(p, opts) {
+    if (throwLockRelease && String(p).includes("owner-select-state.lock")) {
+      const err = new Error("EIO: lock release error");
+      err.code = "EIO";
+      throw err;
+    }
+    return origRmdir.apply(this, arguments);
+  };
+  try {
+    throwLockRelease = true;
+    const rLockResidue = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDoc, capability: capCampaignValid });
+    assert.notEqual(rLockResidue.commit, "not_committed", "提交后释放锁异常绝不折叠成 not_committed");
+    assert.equal(rLockResidue.commit, "lock_residue");
+    assert.equal(rLockResidue.reason, "lock_release_residue");
+    const diskDoc = readCampaignState(env);
+    assert.equal(diskDoc.exists, true, "盘上已落地的 campaign 必须可读");
+    assert.equal(diskDoc.state, "open");
+  } finally {
+    fs.rmdirSync = origRmdir;
+    throwLockRelease = false;
+    // 清理测试锁
+    try { fs.rmdirSync(lockDir); } catch { /* 忽略 */ }
+    // 清理盘上已写文件方便后续测试
+    const cFile = path.join(ledgerDir, "owner-select-campaign.json");
+    if (fs.existsSync(cFile)) fs.unlinkSync(cFile);
+  }
+
+  // 6. 【P2-3】真实子进程并发写入探针
+  const driverScript = path.join(tmpRoot, "concurrent-write-driver.mjs");
+  fs.writeFileSync(driverScript, `
+import { writeCampaignState } from ${JSON.stringify(pathToFileURL(path.resolve("scripts", "maintenance", "owner-select-state.mjs")).href)};
+const [envJson, docJson, capJson] = process.argv.slice(2);
+const env = JSON.parse(envJson);
+const doc = JSON.parse(docJson);
+const capability = JSON.parse(capJson);
+const res = writeCampaignState({ env, expectedSha256: null, doc, capability });
+process.stdout.write(JSON.stringify(res));
+`, "utf-8");
+
+  const runnerScript = path.join(tmpRoot, "concurrent-runner.mjs");
+  fs.writeFileSync(runnerScript, `
+import { spawn } from "node:child_process";
+const [driver, envJson, docJson, capJson] = process.argv.slice(2);
+const spawnWorker = () => new Promise((resolve) => {
+  const c = spawn(process.execPath, [driver, envJson, docJson, capJson], { stdio: ["ignore", "pipe", "inherit"] });
+  let out = "";
+  c.stdout.on("data", (d) => { out += d; });
+  c.on("exit", () => {
+    try { resolve(JSON.parse(out)); } catch (e) { resolve({ ok: false, parseError: e.message, out }); }
+  });
+});
+const [r1, r2] = await Promise.all([spawnWorker(), spawnWorker()]);
+process.stdout.write(JSON.stringify({ r1, r2 }));
+`, "utf-8");
+
+  const concOutRaw = execFileSync(process.execPath, [
+    runnerScript,
+    driverScript,
+    JSON.stringify(env),
+    JSON.stringify(baseCampaignDoc),
+    JSON.stringify(capCampaignValid)
+  ], { encoding: "utf-8" });
+
+  const concOut = JSON.parse(concOutRaw);
+  const results = [concOut.r1, concOut.r2];
+  const committed = results.filter(r => r.commit === "committed");
+  const failed = results.filter(r => r.commit === "not_committed");
+  assert.equal(committed.length, 1, "真正并发写入：恰好一个进程 committed（结果：" + concOutRaw + "）");
+  assert.equal(failed.length, 1, "真正并发写入：另一个进程必须 not_committed");
+  assert.ok(["lock_busy", "cas_mismatch"].includes(failed[0].reason), "未成功进程的 reason 必须是 lock_busy 或 cas_mismatch，实际为: " + failed[0].reason);
+});
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

@@ -22,9 +22,11 @@ import {
   maintenanceDir,
   readActive,
   readJournal,
+  leaseHolder,
   OWNER_SELECT_OPERATION_KINDS,
   OSM_FORWARD_PHASES,
 } from "./journal.mjs";
+import { maintenanceGatePath, readGate } from "../maintenance-gate-core.mjs";
 
 export {
   CAMPAIGN_STATES,
@@ -317,6 +319,34 @@ function verifyMaintenanceCapability({ capability, env, targetKind, doc, beforeE
   const act = readActive({ dir: mDir });
   if (act.state !== "active" || act.token !== capability.token) {
     return { ok: false, reason: "maintenance_capability_required", why: "active token 不匹配或未处于 active (当前: " + (act.token ?? act.state) + ", 期望: " + capability.token + ")" };
+  }
+
+  // gate 校验：gate 文件存在且处于 active，token 与 capability.token 一致
+  const gateFile = maintenanceGatePath(env);
+  if (typeof gateFile !== "string" || gateFile.length === 0) {
+    return { ok: false, reason: "maintenance_capability_required", why: "gate_path_unknown：门位置说不清" };
+  }
+  const gate = readGate({ file: gateFile, now: Date.now() });
+  if (gate.state !== "active") {
+    return { ok: false, reason: "maintenance_capability_required", why: "gate_not_active：门未处于 active 状态: " + gate.state + (gate.why ? " (" + gate.why : "") };
+  }
+  if (gate.payload?.token !== capability.token) {
+    return { ok: false, reason: "maintenance_capability_required", why: "gate_token_mismatch：门 token 与 capability 不一致 (门: " + gate.payload?.token + ", 期望: " + capability.token + ")" };
+  }
+
+  // lease 校验：租约存在且持有者 pid 存活
+  const holder = leaseHolder({ dir: mDir, token: capability.token });
+  if (!holder.present) {
+    return { ok: false, reason: "maintenance_capability_required", why: "lease_absent：operation 租约不存在" };
+  }
+  if (holder.unreadable) {
+    return { ok: false, reason: "maintenance_capability_required", why: "lease_unreadable：租约读不出：" + holder.why };
+  }
+  if (!holder.alive) {
+    return { ok: false, reason: "maintenance_capability_required", why: "lease_dead：租约持有者 pid " + holder.pid + " 已不在" };
+  }
+  if (holder.at !== null && !isCanonicalIso(holder.at)) {
+    return { ok: false, reason: "maintenance_capability_required", why: "lease_payload_bad：租约 owner.at 不是规范化 ISO" };
   }
 
   const jRes = readJournal({ dir: mDir, token: capability.token, env });

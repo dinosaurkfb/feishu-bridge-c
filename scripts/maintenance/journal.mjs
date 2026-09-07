@@ -23,6 +23,7 @@ import path from "node:path";
 import { realUserHome } from "../maintenance-gate-core.mjs";
 import { readRegularFile } from "../installed-surface.mjs";
 import { acquireLockUngated, commitWhileHeld, releasePublishLock } from "../registry.mjs";
+import { campaignIdFor, endpointsDigest } from "./owner-select-state.mjs";
 
 export const MAINTENANCE_DIR_ENV = "FEISHU_BRIDGE_MAINTENANCE_DIR";
 export const JOURNAL_SCHEMA = "1.2";
@@ -220,6 +221,108 @@ function shapeProblemFor(s) {
     if (s.before.exists && s.backup === null) return "sidecar 原来存在必须有备份";
     if (!s.before.exists && s.backup !== null) return "sidecar 原来不存在不该有备份";
     return null;
+  }
+  // ── R50 1.4：owner_select 五种新 step（§8.2 表）。target 一律内部派生（重算规范路径，不信 journal 中的路径）。──
+  const CAMP_ID = /^osc_[0-9a-f]{32}$/u;
+  const SCHEMA_VALUES = ["1.0", "1.1-transition", "1.1"];
+  const fileBackupRule = (label) => {
+    if (s.before.exists && s.backup === null) return label + " 原来存在必须有备份";
+    if (!s.before.exists && s.backup !== null) return label + " 原来不存在不该有备份";
+    return null;
+  };
+  if (kind === "campaign") {
+    const m = /^(osc_[0-9a-f]{32}):(open|seal|complete)$/u.exec(rest);
+    if (!idOk || !m) return "campaign 的 id 必须是 campaign:<campaign_id>:open|seal|complete";
+    const [, cid, sub] = m;
+    if (s.target !== "ledger/owner-select-campaign.json") return "campaign 的 target 必须是 ledger/owner-select-campaign.json";
+    const campAbs = (x) => isObj(x) && keysOf(x) === "campaign_id,endpoints,endpoints_digest,exists,sha256,state"
+      && typeof x.exists === "boolean"
+      && (x.exists ? (typeof x.sha256 === "string" && SHA_SHAPE.test(x.sha256)) : x.sha256 === null)
+      && (x.state === "absent"
+          ? (!x.exists && x.campaign_id === null && x.endpoints === null && x.endpoints_digest === null)
+          : (x.exists && CAMP_ID.test(x.campaign_id)
+             && Array.isArray(x.endpoints) && x.endpoints.length > 0
+             && x.endpoints.every((e) => typeof e === "string" && ENDPOINT_SHAPE.test(e))
+             && x.endpoints.every((e, i) => i === 0 || x.endpoints[i - 1] < e)
+             && x.endpoints_digest === endpointsDigest(x.endpoints)));
+    if (!campAbs(s.before) || !campAbs(s.intended_after) || !(s.after === undefined || campAbs(s.after))) return "campaign.before/intended_after/after 联合形状不对";
+    if (s.intended_after.state === "absent") return "campaign.intended_after 必须在场";
+    if (sub === "open" && !(s.before.state === "absent" || s.before.state === "complete")) return "campaign open 的 before 必须 absent|complete";
+    if (sub === "open" && s.intended_after.state !== "open") return "campaign open → intended.state=open";
+    if (sub === "seal" && !(s.before.state === "open" && s.intended_after.state === "sealed")) return "campaign seal 的 before=open → intended=sealed";
+    if (sub === "seal" && s.intended_after.campaign_id !== s.before.campaign_id) return "campaign seal 的 campaign_id 冻结";
+    if (sub === "complete" && !(s.before.state === "sealed" && s.intended_after.state === "complete" && s.intended_after.campaign_id === s.before.campaign_id && s.intended_after.endpoints_digest === s.before.endpoints_digest)) return "campaign complete 的 before=sealed → complete、digest 冻结";
+    if (s.after !== undefined && (s.after.state !== s.intended_after.state || s.after.endpoints_digest !== s.intended_after.endpoints_digest)) return "campaign.after 必须逐字段等于 intended_after";
+    return fileBackupRule("campaign");
+  }
+  if (kind === "schema_endpoint") {
+    const m = /^(endpoint_[0-9a-f]{24}):(transition|strict|direct)$/u.exec(rest);
+    if (!idOk || !m) return "schema_endpoint 的 id 必须是 schema_endpoint:<ep>:transition|strict|direct";
+    const [, ep, sub] = m;
+    if (s.target !== "ledger/" + ep + "/ledger.json") return "schema_endpoint 的 target 必须是 ledger/<ep>/ledger.json";
+    const st = (x) => isObj(x) && keysOf(x) === "ledger_sha256,revision,schema_version"
+      && SCHEMA_VALUES.includes(x.schema_version) && Number.isSafeInteger(x.revision) && x.revision >= 1
+      && (x.ledger_sha256 === null || (typeof x.ledger_sha256 === "string" && SHA_SHAPE.test(x.ledger_sha256)));
+    if (!st(s.before) || !st(s.intended_after) || !(s.after === undefined || st(s.after))) return "schema_endpoint.before/intended_after/after 形状不对";
+    const map = { transition: ["1.0", "1.1-transition"], strict: ["1.1-transition", "1.1"], direct: ["1.0", "1.1"] };
+    const [from, to] = map[sub];
+    if (s.before.schema_version !== from || s.intended_after.schema_version !== to) return "schema_endpoint." + sub + " 必须 " + from + "→" + to;
+    if (s.intended_after.revision !== s.before.revision + 1) return "schema_endpoint 的 intended_after.revision 必须 before.revision+1";
+    if (s.backup === null || s.backup_sha256 !== s.before.ledger_sha256) return "schema_endpoint 备份恒需且 backup_sha256===before.ledger_sha256";
+    if (s.after !== undefined && (s.after.schema_version !== s.intended_after.schema_version || s.after.revision !== s.intended_after.revision || s.after.ledger_sha256 !== s.intended_after.ledger_sha256)) return "schema_endpoint.after 必须逐字段等于 intended_after";
+    return null;
+  }
+  if (kind === "mint") {
+    if (!idOk || !/^(endpoint_[0-9a-f]{24})$/u.test(rest)) return "mint 的 id 必须是 mint:<ep>";
+    const ep = rest;
+    if (s.target !== "ledger/" + ep + "/ledger.json") return "mint 的 target 必须是 ledger/<ep>/ledger.json";
+    const st = (x) => isObj(x) && keysOf(x) === "ledger_sha256,null_b1_count,revision"
+      && Number.isSafeInteger(x.null_b1_count) && x.null_b1_count >= 0 && Number.isSafeInteger(x.revision) && x.revision >= 1
+      && (x.ledger_sha256 === null || (typeof x.ledger_sha256 === "string" && SHA_SHAPE.test(x.ledger_sha256)));
+    if (!st(s.before) || !st(s.intended_after) || !(s.after === undefined || st(s.after))) return "mint.before/intended_after/after 形状不对";
+    if (s.intended_after.null_b1_count !== 0 || s.intended_after.revision !== s.before.revision + 1) return "mint.intended_after 必须 null_b1_count=0 且 revision=before+1";
+    const blob = s.intended_blob;
+    if (!(isObj(blob) && keysOf(blob) === "bytes,path,sha256" && typeof blob.path === "string" && path.isAbsolute(blob.path) && Number.isSafeInteger(blob.bytes) && blob.bytes >= 0 && typeof blob.sha256 === "string" && SHA_SHAPE.test(blob.sha256))) return "mint.intended_blob 形状不对";
+    // path 的完整重算（<token>.staged/intended/mint-<ep>.json，含 token+maintenanceDir 段级核）在 journalProblem 用 stagedBlobPathProblem 做；
+    // 这里只核 blob 形状 + basename 落 intended 目录。
+    if (!blob.path.endsWith("/intended/mint-" + ep + ".json")) return "mint.intended_blob.path 必须是 intended/mint-<ep>.json 的绝对路径";
+    if (s.backup === null || s.backup_sha256 !== s.before.ledger_sha256) return "mint 备份恒需且 backup_sha256===before.ledger_sha256";
+    return null;
+  }
+  if (kind === "precheck") {
+    if (!idOk || !/^(endpoint_[0-9a-f]{24})$/u.test(rest)) return "precheck 的 id 必须是 precheck:<ep>";
+    const ep = rest;
+    if (s.target !== "ledger/" + ep + "/ledger.json") return "precheck 的 target 必须是 ledger/<ep>/ledger.json";
+    const st = (x) => isObj(x) && keysOf(x) === "ledger_sha256,legacy_proof_count,null_b1_count,revision"
+      && Number.isSafeInteger(x.legacy_proof_count) && x.legacy_proof_count >= 0 && Number.isSafeInteger(x.null_b1_count) && x.null_b1_count >= 0
+      && Number.isSafeInteger(x.revision) && x.revision >= 1 && (x.ledger_sha256 === null || (typeof x.ledger_sha256 === "string" && SHA_SHAPE.test(x.ledger_sha256)));
+    if (!st(s.before) || !st(s.intended_after) || !(s.after === undefined || st(s.after))) return "precheck.before/intended_after/after 形状不对";
+    // 只读：before === intended_after === after 且两计数皆 0；三 backup 字段恒 null。
+    if (!(s.intended_after.legacy_proof_count === 0 && s.intended_after.null_b1_count === 0)) return "precheck 的 intended_after 两计数必须皆 0（非 0 则本 step 不能 done）";
+    if (s.after !== undefined && (s.after.legacy_proof_count !== s.intended_after.legacy_proof_count || s.after.ledger_sha256 !== s.intended_after.ledger_sha256)) return "precheck.after 必须逐字段等于 intended_after";
+    if (s.backup !== null || s.backup_sha256 !== null || s.backup_bytes !== null) return "precheck 三 backup 字段恒 null";
+    return null;
+  }
+  if (kind === "writer_state") {
+    const m = /^(osc_[0-9a-f]{32}):(partial|on)$/u.exec(rest);
+    if (!idOk || !m) return "writer_state 的 id 必须是 writer_state:<campaign_id>:partial|on";
+    const [, wcid, sub] = m;
+    if (s.target !== "ledger/owner-select-writer-state.json") return "writer_state 的 target 必须是 ledger/owner-select-writer-state.json";
+    const wsAbs = (x) => isObj(x) && keysOf(x) === "campaign_id,endpoints_digest,exists,revision,sha256,state"
+      && typeof x.exists === "boolean"
+      && (x.exists ? (typeof x.sha256 === "string" && SHA_SHAPE.test(x.sha256)) : x.sha256 === null)
+      && (x.state === "off"
+          ? (!x.exists && x.campaign_id === null && x.endpoints_digest === null && x.revision === 0)
+          : (x.exists && Number.isSafeInteger(x.revision) && x.revision >= 1
+             && (x.state === "on" ? (typeof x.endpoints_digest === "string" && SHA_SHAPE.test(x.endpoints_digest)) : (x.endpoints_digest === null || (typeof x.endpoints_digest === "string" && SHA_SHAPE.test(x.endpoints_digest))))
+             && (x.campaign_id === null ? x.state === "off" : CAMP_ID.test(x.campaign_id))));
+    if (!wsAbs(s.before) || !wsAbs(s.intended_after) || !(s.after === undefined || wsAbs(s.after))) return "writer_state.before/intended_after/after 联合形状不对";
+    if (sub === "partial" && !(s.before.state === "off" || s.before.state === "on")) return "writer_state partial 的 before 必须 off|on(退回)";
+    if (sub === "partial" && s.intended_after.state !== "partial") return "writer_state partial → intended.state=partial";
+    if (sub === "on" && s.intended_after.state !== "on") return "writer_state on → intended.state=on";
+    if (s.intended_after.revision !== s.before.revision + 1) return "writer_state 的 intended_after.revision 必须 before.revision+1";
+    if (s.after !== undefined && (s.after.state !== s.intended_after.state || s.after.revision !== s.intended_after.revision || s.after.endpoints_digest !== s.intended_after.endpoints_digest)) return "writer_state.after 必须逐字段等于 intended_after";
+    return fileBackupRule("writer_state");
   }
   return "kind 不在受控集合里";
 }

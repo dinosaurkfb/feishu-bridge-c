@@ -35725,6 +35725,50 @@ test("R51 mintSelectionHandles：mint plan 正路径（1.4 migration journal + g
   fs.rmSync(base, { recursive: true, force: true });
 });
 
+// R51 schemaUpgrade 正路径（1.0 干净账本 + schema_endpoint:transition）→ committed + schema_version 升到 1.1-transition；strict 重盘 legacy/null-B1 非零 → precheck_failed。
+test("R51 schemaUpgrade：正路径（1.0→1.1-transition）+ strict 重盘 legacy/null-B1 非零 → precheck_failed", () => {
+  const base = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r51-sch-"));
+  const ledgerRoot = path.join(base, "ledger"); fs.mkdirSync(ledgerRoot, { recursive: true, mode: 0o700 }); fs.chmodSync(ledgerRoot, 0o700);
+  const maintDir = path.join(base, "maintenance"); fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 }); fs.chmodSync(maintDir, 0o700);
+  const gateFile = path.join(base, "maintenance.gate");
+  const EP = "endpoint_" + "a".repeat(24), CH = "claude";
+  const env = { ...process.env, HOME: base, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };
+  const hx = (n) => String(n).repeat(64), uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000", iso = (t) => new Date(t).toISOString();
+  const init = uuid(1), tok = uuid(9), at = iso(1700000000000); const CID = campaignIdFor(tok);
+  const doc = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: CH, authority_mode: "shadow", revision: 1, operations: { [init]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } } }, records: {} };
+  const epDir = path.join(ledgerRoot, EP); fs.mkdirSync(epDir, { recursive: true, mode: 0o700 }); fs.chmodSync(epDir, 0o700);
+  fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+  const enterSteps = [
+    { kind: "timer", id: "timer:claude", state: "done", at, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
+    { kind: "timer", id: "timer:codex", state: "done", at, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
+    { kind: "stub", id: "stub:claude", state: "done", at, target: "versions/x", chain: null, before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "stub", id: "stub:codex", state: "done", at, target: "stub", chain: null, before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "current", id: "current:claude", state: "done", at, target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "current", id: "current:codex", state: "done", at, target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "gate", id: "gate", state: "done", at, target: "gate", chain: null, before: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, backup: null, backup_sha256: null, backup_bytes: null }];
+  const stagedDir = path.join(maintDir, tok + ".staged"); fs.mkdirSync(path.join(stagedDir, "intended"), { recursive: true, mode: 0o700 }); const stagedBackup = path.join(stagedDir, "backup.json"); fs.writeFileSync(stagedBackup, "{}", { mode: 0o600 });
+  const steps = [...enterSteps, { kind: "campaign", id: "campaign:" + CID + ":open", state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null }, intended_after: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: CID, endpoints: [EP], endpoints_digest: endpointsDigest([EP]) } },
+    { kind: "schema_endpoint", id: "schema_endpoint:" + EP + ":transition", state: "prepared", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: stagedBackup, backup_sha256: "0".repeat(64), backup_bytes: 100, before: { schema_version: "1.0", revision: 1, ledger_sha256: "0".repeat(64) }, intended_after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: "1".repeat(64) } },
+    { kind: "mint", id: "mint:" + EP, state: "prepared", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: stagedBackup, backup_sha256: "1".repeat(64), backup_bytes: 100, before: { revision: 2, null_b1_count: 0, ledger_sha256: "1".repeat(64) }, intended_after: { revision: 3, null_b1_count: 0, ledger_sha256: "2".repeat(64) }, intended_blob: { path: path.join(stagedDir, "intended", "mint-" + EP + ".json"), bytes: 10, sha256: "0".repeat(64) } },
+    { kind: "writer_state", id: "writer_state:" + CID + ":partial", state: "prepared", at, target: "ledger/owner-select-writer-state.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 }, intended_after: { exists: true, sha256: "2".repeat(64), state: "partial", campaign_id: CID, endpoints_digest: endpointsDigest([EP]), revision: 1 } }];
+  const jdoc = { schema_version: "1.4", operation_kind: "owner_select_migration_a", reason: "fixture", started_at: at, updated_at: at, token: tok, notes: [], phase: "osm_a_upgrading", steps };
+  assert.equal(journalProblem(jdoc, { maintenanceDir: maintDir }), null, "fixture journal 自洽：" + journalProblem(jdoc, { maintenanceDir: maintDir }));
+  fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(jdoc, null, 2) + "\n", { mode: 0o600 });
+  try { fs.unlinkSync(path.join(maintDir, "active")); } catch {}
+  fs.symlinkSync(tok, path.join(maintDir, "active"));
+  createGate({ file: gateFile, reason: "fixture", token: tok, now: 1700000000000 });
+  acquireOperationLease({ dir: maintDir, token: tok });
+  const cap = { token: tok, kind: "schema_upgrade", endpointId: EP };
+  const res = TAL.schemaUpgrade({ endpointId: EP, capability: cap, requestKey: "req_sch", fromSchema: "1.0", toSchema: "1.1-transition", env });
+  assert.equal(res.ok, true, "schema 正路径：" + JSON.stringify(res));
+  assert.equal(res.commit, "committed_clean");
+  assert.equal(res.revision, 2);
+  const up = JSON.parse(fs.readFileSync(path.join(epDir, "ledger.json"), "utf-8"));
+  assert.equal(up.schema_version, "1.1-transition", "schema_version 已升");
+  assert.equal(up.operations[Object.keys(up.operations).reduce((a, b) => up.operations[a].result_revision > up.operations[b].result_revision ? a : b)].op_type, "schema_upgrade", "落笔 schema_upgrade op");
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
 
 summarySealed = true;
 

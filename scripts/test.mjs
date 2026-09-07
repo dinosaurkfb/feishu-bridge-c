@@ -35959,7 +35959,14 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
       ["ta_" + "3".repeat(32)]: r51Live("ta_" + "3".repeat(32), R51_A2F, { binding_proof: r51Attach() })
     };
     const tok = r51Uuid(7);
-    const doc = { ...r51Doc(records), operations: { [R51_OP]: { op_type: "seed", terminal_kind: "seed", request_key: "seed_r51", fingerprint: TAL.fingerprintOf("seed", { request_key: "seed_r51", candidates: Object.keys(records) }), result_revision: 1, result: { seeded_ids: [idA, idB, idH] } } } };
+    const R51_MINT_OP = "01234567-89ab-4def-8012-3456789abcd1"; // idH 预置 handle 的产生 op（G-handle 产生集）
+    const r51SeedOps = (seeded) => ({
+      ["00000000-0000-0000-0000-000000000001"]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP51, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+      [R51_OP]: { op_type: "seed", terminal_kind: "seed", request_key: "seed_r51", fingerprint: TAL.fingerprintOf("seed", { request_key: "seed_r51", candidates: seeded }), result_revision: 2, result: { seeded_ids: seeded } },
+      [R51_MINT_OP]: { op_type: "mint_selection_handles", terminal_kind: "mint_selection_handles", request_key: "seed_mint", fingerprint: TAL.fingerprintOf("mint_selection_handles", { request_key: "seed_mint", endpoint: EP51, expected_null_b1_ids: [idH] }), result_revision: 3, result: { endpoint: EP51, minted: [{ target_id: idH, selection_handle: H, handle_expires_at: T0 }], affected_live_ids_after_commit: [idH], proof_effects: [] } }
+    });
+    records[idH].origin_operation_id = R51_MINT_OP;
+    const doc = { ...r51Doc(records), revision: 3, operations: r51SeedOps([idA, idB, idH, "ta_" + "3".repeat(32)]) };
     const plan = TAL.buildMintPlan({ doc, token: tok, campaignId: campaignIdFor(tok), endpointId: EP51, requestKey: tok, now: Date.parse(T0), ttlMs: 3600_000 });
     assert.deepEqual(Object.keys(plan).sort(), ["before_ledger_sha256", "campaign_id", "endpoint", "expected_ledger_sha256", "expected_null_b1_ids", "frozen_at", "handle_expires_at", "minted", "operation_id", "plan_kind", "request_key", "token"], "plan 键集封闭");
     assert.equal(plan.plan_kind, "owner_select_mint_plan_v1");
@@ -36001,15 +36008,17 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
       assert.equal(rec.origin_operation_id, plan.operation_id, "origin 指向本 op（affected/origin G 合同）");
     }
     assert.equal(next.records[idH].updated_at, T0, "未触及记录 updated_at 不动");
-    assert.equal(TAL.validateLedger(next, { endpointId: EP51 }).ok, true, "产物在 1.1-transition 上 validateLedger 必过");
+    const nextV = TAL.validateLedger(next, { endpointId: EP51 });
+    assert.equal(nextV.ok, true, "产物在 1.1-transition 上 validateLedger 必过：" + JSON.stringify(nextV));
 
     // 空集分支：null_b1_count===0 仍生成 plan（空 op 也占 revision）
-    const empty = TAL.buildMintPlan({ doc: { ...r51Doc({}), operations: { [R51_OP]: { op_type: "seed", terminal_kind: "seed", request_key: "seed_r51", fingerprint: TAL.fingerprintOf("seed", { request_key: "seed_r51", candidates: [] }), result_revision: 1, result: { seeded_ids: [] } } } }, token: tok, campaignId: campaignIdFor(tok), endpointId: EP51, requestKey: tok, now: Date.parse(T0), ttlMs: 3600_000 });
+    const emptyDoc = { ...r51Doc({}), revision: 2, operations: { ["00000000-0000-0000-0000-000000000001"]: r51SeedOps([])["00000000-0000-0000-0000-000000000001"], [R51_OP]: r51SeedOps([])[R51_OP] } };
+    const empty = TAL.buildMintPlan({ doc: emptyDoc, token: tok, campaignId: campaignIdFor(tok), endpointId: EP51, requestKey: tok, now: Date.parse(T0), ttlMs: 3600_000 });
     assert.deepEqual(empty.minted, []);
     assert.deepEqual(empty.expected_null_b1_ids, []);
     assert.equal(TAL.mintPlanProblem(empty), null, "空集 plan 过封闭形");
-    const nextEmpty = TAL.applyMintPlan({ ...r51Doc({}), operations: { [R51_OP]: { op_type: "seed", terminal_kind: "seed", request_key: "seed_r51", fingerprint: TAL.fingerprintOf("seed", { request_key: "seed_r51", candidates: [] }), result_revision: 1, result: { seeded_ids: [] } } } }, empty);
-    assert.equal(nextEmpty.revision, 2, "空 op 仍 revision+1");
+    const nextEmpty = TAL.applyMintPlan(emptyDoc, empty);
+    assert.equal(nextEmpty.revision, 3, "空 op 仍 revision+1");
 
     // mintPlanProblem 反向（逐刀钉）
     const bad = (mut, why) => assert.notEqual(TAL.mintPlanProblem(mut(structuredClone(plan))), null, why);

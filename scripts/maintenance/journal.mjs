@@ -504,6 +504,41 @@ export function journalProblem(doc, { maintenanceDir } = {}) {
       const p = stagedBlobPathProblem(s.intended_blob.path, doc.token, "mint-" + s.id.slice("mint:".length), maintenanceDir);
       if (p) return "mint.intended_blob.path：" + p;
     }
+    // ③ 恰一次计数（按冻结集，§8.2）：A/direct 取 :open、B 取 :seal 的 intended_after.endpoints；每 ep 恰一条本 kind 变体。
+    const pickSub = doc.operation_kind === "owner_select_migration_b" ? "seal" : "open";
+    const frozen = (steps.find((s) => s.kind === "campaign" && s.id.endsWith(":" + pickSub))?.intended_after?.endpoints) ?? [];
+    const cnt = (pred) => steps.filter(pred).length;
+    const campSub = (sub) => cnt((s) => s.kind === "campaign" && s.id.endsWith(":" + sub));
+    const writerSub = (sub) => cnt((s) => s.kind === "writer_state" && s.id.endsWith(":" + sub));
+    const kind = doc.operation_kind;
+    // 每个新 step 的 <ep>/<cid> 必须 ∈ frozen 集（schema_endpoint/mint/precheck 用 <ep>；writer_state 用 campaign 派生已核）。
+    for (const s of steps) if (s.kind === "schema_endpoint" || s.kind === "mint" || s.kind === "precheck") {
+      const ep = s.id.split(":")[1];
+      if (!frozen.includes(ep)) return s.kind + " <ep=" + ep + "> 不在本 operation 冻结集";
+    }
+    const expect = (cond, why) => { if (!cond) return why; return null; };
+    let e6 = null;
+    if (kind === "owner_select_migration_a") {
+      e6 = expect(campSub("open") === 1, ":open 必须恰一");
+      if (!e6) e6 = expect(writerSub("partial") === 1, "writer_state:*:partial 必须恰一");
+      if (!e6) for (const ep of frozen) { e6 = expect(cnt((s) => s.kind === "schema_endpoint" && s.id === "schema_endpoint:" + ep + ":transition") === 1, ep + " 的 transition 必须恰一"); if (e6) break; e6 = expect(cnt((s) => s.kind === "mint" && s.id === "mint:" + ep) === 1, ep + " 的 mint 必须恰一"); if (e6) break; }
+    } else if (kind === "owner_select_migration_b") {
+      e6 = expect(campSub("seal") === 1 && campSub("complete") === 1, ":seal 与 :complete 各恰一");
+      if (!e6) e6 = expect(writerSub("on") === 1, "writer_state:*:on 必须恰一");
+      if (!e6) for (const ep of frozen) { e6 = expect(cnt((s) => s.kind === "precheck" && s.id === "precheck:" + ep) === 1, ep + " 的 precheck 必须恰一"); if (e6) break; e6 = expect(cnt((s) => s.kind === "schema_endpoint" && s.id === "schema_endpoint:" + ep + ":strict") === 1, ep + " 的 strict 必须恰一"); if (e6) break; }
+    } else {
+      e6 = expect(campSub("open") === 1 && campSub("seal") === 1 && campSub("complete") === 1, ":open/:seal/:complete 各恰一");
+      if (!e6) e6 = expect(writerSub("on") === 1, "writer_state:*:on 必须恰一");
+      if (!e6) for (const ep of frozen) { e6 = expect(cnt((s) => s.kind === "precheck" && s.id === "precheck:" + ep) === 1, ep + " 的 precheck 必须恰一"); if (e6) break; e6 = expect(cnt((s) => s.kind === "schema_endpoint" && s.id === "schema_endpoint:" + ep + ":direct") === 1, ep + " 的 direct 必须恰一"); if (e6) break; }
+    }
+    if (e6) return "恰一次计数：" + e6;
+    // 重开族起：全部新 step 必须 done。
+    const reopen = ["ledger_reopening", "done", "reopening_incomplete"].includes(doc.phase);
+    if (reopen && steps.some((s) => NEW_STEP_KINDS.includes(s.kind) && s.state !== "done")) return "重开族起全部新 step 必须 done";
+    // A/direct 禁 :on、B 禁 :partial（item 4 的变体排除，此处与恰一次互证）。
+    if (kind === "owner_select_migration_a" && writerSub("on") > 0) return "A 禁 writer_state:*:on";
+    if (kind === "owner_select_migration_b" && writerSub("partial") > 0) return "B 禁 writer_state:*:partial";
+    if (kind === "owner_select_migration_direct" && writerSub("partial") > 0) return "direct 禁 writer_state:*:partial";
   }
 
   const required = requiredStepIds(doc);

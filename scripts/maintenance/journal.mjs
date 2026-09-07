@@ -514,8 +514,9 @@ export function journalProblem(doc, { maintenanceDir } = {}) {
       const p = stagedBlobPathProblem(s.intended_blob.path, doc.token, "mint-" + s.id.slice("mint:".length), maintenanceDir);
       if (p) return "mint.intended_blob.path：" + p;
     }
-    // ③ 恰一次计数（按冻结集，§8.2）（返修一 P1：只在 forward 段起/含新 step 时套用——forward 段前的合法 operation 无新 step 不判）。
-    if (hasNew) {
+    // ③ 恰一次计数（按冻结集，§8.2）（返修一 P1 + 返修二 4：按 phase 门控——forward/重开族 ⇒ 逐条成立（零新 step 也拒）；forward 前 ⇒ 禁新 step）。
+    const inFwdReopen = ["osm_a_upgrading","osm_b_strictening","osm_direct","ledger_reopening","done","reopening_incomplete"].includes(doc.phase);
+    if (inFwdReopen) {
     const pickSub = doc.operation_kind === "owner_select_migration_b" ? "seal" : "open";
     const frozen = (steps.find((s) => s.kind === "campaign" && s.id.endsWith(":" + pickSub))?.intended_after?.endpoints) ?? [];
     const cnt = (pred) => steps.filter(pred).length;
@@ -546,9 +547,16 @@ export function journalProblem(doc, { maintenanceDir } = {}) {
     // item 6（补）：writer_state:*:on 的 done ⇐ 本 operation campaign:*:complete 已 done（跨 step 等式，journal 内）。
     const completeStep = steps.find((s) => s.kind === "campaign" && s.id.endsWith(":complete"));
     for (const s of steps) if (s.kind === "writer_state" && s.id.endsWith(":on")) {
+      if (s.state !== "done") continue; // 返修二 1：on 规则只在 on 步 done 时生效。
       if (!completeStep || completeStep.state !== "done") return "writer_state:*:on 的 done 需要本 operation campaign:*:complete 已 done";
       if (s.intended_after.endpoints_digest !== completeStep.intended_after.endpoints_digest) return "writer_state:*:on 的 endpoints_digest 必须 === campaign:*:complete 的 digest";
       if (s.intended_after.campaign_id !== campaignIdFor(doc.token)) return "writer_state.intended_after.campaign_id 必须 === campaignIdFor(token)（三处同一）";
+    }
+    for (const s of steps) if (s.kind === "writer_state") {
+      // 返修二 2+5：writer_state 步 intended_after.campaign_id / endpoints_digest 必等于本 operation campaign step 的值（partial 与 on）。
+      if (s.intended_after.campaign_id !== campaignIdFor(doc.token)) return "writer_state.intended_after.campaign_id 必须 === campaignIdFor(token)";
+      const campStep = steps.find((x) => x.kind === "campaign" && x.id.endsWith(":" + pickSub));
+      if (campStep && s.intended_after.endpoints_digest !== campStep.intended_after.endpoints_digest) return "writer_state.intended_after.endpoints_digest 必须 === campaign step 的值";
     }
     // 重开族起：全部新 step 必须 done。
     const reopen = ["ledger_reopening", "done", "reopening_incomplete"].includes(doc.phase);

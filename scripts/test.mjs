@@ -25214,6 +25214,17 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
     assert.ok(TAL.loadLedger(dir, { endpointId: EP }).ok, "seed 出的初始账本自洽");
   };
+  // R50（Part 一 item 2）：journal 1.4 schema 字面值分派 —— 1.4 识别 / 旧版读新 kind→unreadable / 未知字面值拒。
+  test("R50 journal 1.4：schema 字面值分派（1.4 识别 / 1.2-1.3 读新 kind→unreadable / 1.5 拒）", () => {
+    const iso = new Date(1700000000000).toISOString();
+    const uuid = "11111111-1111-1111-1111-111111111111";
+    const base = { token: uuid, reason: "", started_at: iso, updated_at: iso, notes: [], steps: [] };
+    assert.equal(journalProblem({ ...base, schema_version: "1.4", operation_kind: "owner_select_migration_a", phase: "osm_a_upgrading" }), null, "1.4 新 kind 识别（红先行：旧代码 schema 不认 1.4）");
+    assert.ok(String(journalProblem({ ...base, schema_version: "1.2", operation_kind: "owner_select_migration_b", phase: "gated" })).includes("unreadable"), "1.2 读新 kind → unreadable");
+    assert.ok(String(journalProblem({ ...base, schema_version: "1.3", operation_kind: "owner_select_migration_a", phase: "gated" })).includes("unreadable"), "1.3 读新 kind → unreadable");
+    assert.equal(journalProblem({ ...base, schema_version: "1.5", operation_kind: "maintenance_install", phase: "gated" }), "schema_version 不认识", "未知字面值拒");
+  });
+
   // R50（Part 二）：owner-select-state.mjs 文件合同 + 读写原语 + 派生 —— 纯合成回归（tmpdir + FEISHU_BRIDGE_LEDGER_DIR 隔离）。
   test("R50 owner-select-state：campaignIdFor/endpointsDigest 派生 + campaign/writer 文件合同 + 读/写/CAS/unreadable", () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r50oss-")));

@@ -9,6 +9,7 @@
 
 import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry, inspectControlLockArtifact, normalizeControlText, CONTROL_MODE_WORDS } from "./control-command.mjs";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
@@ -35946,6 +35947,85 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
     const s1 = TAL.schemaUpgrade({ ...strictArgs, requestKey: "req_strict2" });
     assert.equal(s1.reason, "precheck_failed", "strict 盘点 legacy 非零拒：" + JSON.stringify(s1));
   }));
+
+  test("R51 §四 mint plan：buildMintPlan / applyMintPlan / mintPlanProblem（封闭形、集合自洽、确定性重演算）", () => {
+    const r51ShaOf = (s) => crypto.createHash("sha256").update(s).digest("hex");
+    const idA = "ta_" + "0".repeat(32), idB = "ta_" + "1".repeat(32), idH = "ta_" + "2".repeat(32);
+    const H = "osh_" + "a".repeat(32);
+    const records = {
+      [idA]: r51Live(idA, R51_B1F),
+      [idB]: r51Live(idB, R51_B1F),
+      [idH]: r51Live(idH, R51_B1F, { selection_handle: H, handle_expires_at: T0 }),
+      ["ta_" + "3".repeat(32)]: r51Live("ta_" + "3".repeat(32), R51_A2F, { binding_proof: r51Attach() })
+    };
+    const tok = r51Uuid(7);
+    const doc = { ...r51Doc(records), operations: { [R51_OP]: { op_type: "seed", terminal_kind: "seed", request_key: "seed_r51", fingerprint: TAL.fingerprintOf("seed", { request_key: "seed_r51", candidates: Object.keys(records) }), result_revision: 1, result: { seeded_ids: [idA, idB, idH] } } } };
+    const plan = TAL.buildMintPlan({ doc, token: tok, campaignId: campaignIdFor(tok), endpointId: EP51, requestKey: tok, now: Date.parse(T0), ttlMs: 3600_000 });
+    assert.deepEqual(Object.keys(plan).sort(), ["before_ledger_sha256", "campaign_id", "endpoint", "expected_ledger_sha256", "expected_null_b1_ids", "frozen_at", "handle_expires_at", "minted", "operation_id", "plan_kind", "request_key", "token"], "plan 键集封闭");
+    assert.equal(plan.plan_kind, "owner_select_mint_plan_v1");
+    assert.match(plan.operation_id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u, "operation_id UUID");
+    assert.match(plan.campaign_id, /^osc_[0-9a-f]{32}$/u);
+    assert.equal(plan.token, tok);
+    assert.equal(plan.endpoint, EP51);
+    assert.equal(plan.request_key, tok);
+    assert.equal(plan.frozen_at, T0, "frozen_at 规范化");
+    assert.equal(plan.handle_expires_at, new Date(Date.parse(T0) + 3600_000).toISOString(), "handle_expires_at = frozen+ttl");
+    assert.equal(plan.before_ledger_sha256, r51ShaOf(JSON.stringify(doc, null, 2) + "\n"), "before_sha 与 readLedger 同算法");
+    assert.deepEqual(plan.expected_null_b1_ids, TAL.migrationInventory(doc).null_b1_ids, "expected 集合 = 盘点");
+    assert.deepEqual(plan.minted.map((m) => m.target_id), plan.expected_null_b1_ids, "minted 按 target_id 排序且集合相等");
+    for (const m of plan.minted) {
+      assert.deepEqual(Object.keys(m).sort(), ["selection_handle", "target_id"], "minted 项键集");
+      assert.match(m.selection_handle, /^osh_[0-9a-f]{32}$/u, "handle 形");
+    }
+    assert.equal(plan.expected_ledger_sha256, r51ShaOf(JSON.stringify(TAL.applyMintPlan(doc, plan), null, 2) + "\n"), "expected_sha 确定性重演算");
+    assert.equal(TAL.mintPlanProblem(plan), null, "正向 plan 过封闭形");
+
+    // applyMintPlan：revision+1、op 键 = plan.operation_id、result 逐字、记录写入、validateLedger 必过
+    const next = TAL.applyMintPlan(doc, plan);
+    assert.equal(next.revision, doc.revision + 1);
+    const op = next.operations[plan.operation_id];
+    assert.equal(op.op_type, "mint_selection_handles");
+    assert.equal(op.terminal_kind, "mint_selection_handles");
+    assert.equal(op.request_key, plan.request_key);
+    assert.equal(op.fingerprint, TAL.fingerprintOf("mint_selection_handles", { request_key: plan.request_key, endpoint: EP51, expected_null_b1_ids: plan.expected_null_b1_ids }));
+    assert.equal(op.result_revision, next.revision);
+    assert.equal(op.result.endpoint, EP51);
+    assert.deepEqual(op.result.minted, plan.minted.map((m) => ({ target_id: m.target_id, selection_handle: m.selection_handle, handle_expires_at: plan.handle_expires_at })));
+    assert.deepEqual(op.result.affected_live_ids_after_commit, plan.expected_null_b1_ids);
+    assert.deepEqual(op.result.proof_effects, []);
+    for (const m of plan.minted) {
+      const rec = next.records[m.target_id];
+      assert.equal(rec.selection_handle, m.selection_handle, "handle 写入记录");
+      assert.equal(rec.handle_expires_at, plan.handle_expires_at);
+      assert.equal(rec.updated_at, plan.frozen_at, "updated_at = frozen_at");
+      assert.equal(rec.origin_operation_id, plan.operation_id, "origin 指向本 op（affected/origin G 合同）");
+    }
+    assert.equal(next.records[idH].updated_at, T0, "未触及记录 updated_at 不动");
+    assert.equal(TAL.validateLedger(next, { endpointId: EP51 }).ok, true, "产物在 1.1-transition 上 validateLedger 必过");
+
+    // 空集分支：null_b1_count===0 仍生成 plan（空 op 也占 revision）
+    const empty = TAL.buildMintPlan({ doc: { ...r51Doc({}), operations: { [R51_OP]: { op_type: "seed", terminal_kind: "seed", request_key: "seed_r51", fingerprint: TAL.fingerprintOf("seed", { request_key: "seed_r51", candidates: [] }), result_revision: 1, result: { seeded_ids: [] } } } }, token: tok, campaignId: campaignIdFor(tok), endpointId: EP51, requestKey: tok, now: Date.parse(T0), ttlMs: 3600_000 });
+    assert.deepEqual(empty.minted, []);
+    assert.deepEqual(empty.expected_null_b1_ids, []);
+    assert.equal(TAL.mintPlanProblem(empty), null, "空集 plan 过封闭形");
+    const nextEmpty = TAL.applyMintPlan({ ...r51Doc({}), operations: { [R51_OP]: { op_type: "seed", terminal_kind: "seed", request_key: "seed_r51", fingerprint: TAL.fingerprintOf("seed", { request_key: "seed_r51", candidates: [] }), result_revision: 1, result: { seeded_ids: [] } } } }, empty);
+    assert.equal(nextEmpty.revision, 2, "空 op 仍 revision+1");
+
+    // mintPlanProblem 反向（逐刀钉）
+    const bad = (mut, why) => assert.notEqual(TAL.mintPlanProblem(mut(structuredClone(plan))), null, why);
+    bad((p) => { delete p.operation_id; }, "缺 operation_id");
+    bad((p) => { p.plan_kind = "other"; }, "plan_kind 错");
+    bad((p) => { p.minted = [p.minted[1], p.minted[0]]; }, "minted 未按 target_id 排序");
+    bad((p) => { p.minted[0].selection_handle = "osh_zzz"; }, "handle 形坏");
+    bad((p) => { p.expected_null_b1_ids = []; }, "minted 集合 ≠ expected_null_b1_ids");
+    bad((p) => { p.frozen_at = "2026-09-07 10:00:00"; }, "frozen_at 非规范");
+    bad((p) => { p.expected_ledger_sha256 = "zz"; }, "expected_sha 形坏");
+    bad((p) => { p.operation_id = "not-uuid"; }, "operation_id 非 UUID");
+    bad((p) => { p.endpoint = "ep_bad"; }, "endpoint 形坏");
+    bad((p) => { p.campaign_id = "osc_zzz"; }, "campaign_id 形坏");
+    bad((p) => { p.before_ledger_sha256 = null; }, "before_sha 形坏");
+    bad((p) => { p.minted[0].handle_expires_at = undefined; p.minted[0].extra = 1; }, "minted 项多键");
+  });
 }
 
 summarySealed = true;

@@ -25180,6 +25180,31 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.equal(v(mkDoc("1.1", b1Rec(taid("i"), { facts: b1Facts(), aliases: { root_om: "om_r4", session_id: null }, selection_handle: selHandle("c"), handle_expires_at: iso(1700000004000), rebind_handle: rebHandle(), rebind_expires_at: null }), 2)).reason, "ledger_corrupt", "rebind 半有半无拒");
   });
 
+  // R48（item 3）：三新 proof 形逐字段封闭 —— 纯合成回归（构造带 owner_select_v1 binding proof 的 A2 文档
+  //   跑 validateLedger；红先行：旧代码 owner_select_v1 kind 未知，报 "kind 不在"，本块报逐字段字段集/形状）。
+  test("R48 账本侧：owner_select_v1 binding proof 逐字段封闭（多键 / 坏 handle / 坏 sessionid 形状拒）", () => {
+    const iso = (t) => new Date(t).toISOString();
+    const hx = (n) => String(n).repeat(64);
+    const taid = (h) => "ta_" + h.repeat(32);
+    const opA2 = "22222222-2222-2222-2222-222222222222";
+    const id = taid("a");
+    const initOp = { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } };
+    const a2op = { op_type: "attach_a2", terminal_kind: "attach_a2", request_key: "req_a2", fingerprint: hx(3), result_revision: 2, result: { affected_id: id, terminal_family: "A2" } };
+    const rec = (bp) => ({ topic_agent_id: id, kind: "live", chat_id: "oc_g", anchor_candidate: null, aliases: { root_om: null, session_id: "sess_x" }, binding_target: TGT, facts: { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" }, generation_lineage_id: null, origin_operation_id: opA2, binding_proof: bp, locator_link_proof_ref: null, created_at: iso(1700000000000), updated_at: iso(1700000000000) });
+    const mkDoc = (bp) => ({ schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: CH, authority_mode: "shadow", revision: 2, operations: { "00000000-0000-0000-0000-000000000001": initOp, [opA2]: a2op }, records: { [id]: rec(bp) } });
+    const v = (d) => TAL.validateLedger(d, { endpointId: EP });
+    const good = { kind: "owner_select_v1", authorized_by: "ou_o", authorized_at: iso(1700000000000), selected_session_id: "sess_x", selected_root_om: "om_x", selection_handle: "osh_" + "a".repeat(32), selection_operation_id: "33333333-3333-3333-3333-333333333333" };
+    const r1 = v(mkDoc({ ...good, extra: 1 }));
+    assert.equal(r1.reason, "ledger_corrupt", "owner_select_v1 多键拒：" + JSON.stringify(r1));
+    assert.match(r1.why, /owner_select_v1 proof 字段集不对/, "命中逐字段封闭：" + r1.why);
+    const r2 = v(mkDoc({ ...good, selection_handle: "osh_zz" }));
+    assert.equal(r2.reason, "ledger_corrupt", "坏 selection_handle 形状拒：" + JSON.stringify(r2));
+    assert.match(r2.why, /owner_select_v1.selection_handle 形状不对/, "命中形状：" + r2.why);
+    const r3 = v(mkDoc({ ...good, selected_session_id: "bad id" }));
+    assert.equal(r3.reason, "ledger_corrupt", "坏 selected_session_id 形状拒：" + JSON.stringify(r3));
+    assert.match(r3.why, /owner_select_v1.selected_session_id 形状不对/, "命中形状：" + r3.why);
+  });
+
   // R37 裁定：M1a 收据逐端点原子启用。接线测试需要让 EP 处于两种收据态：
   //   · ok（ledger_init done）→ 双写强制（跑 shadow 后缀）；
   //   · never_initialized（无收据）→ 合法 legacy-only（不写 shadow）。

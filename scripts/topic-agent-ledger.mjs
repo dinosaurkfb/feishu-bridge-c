@@ -370,12 +370,27 @@ const bindingProofProblem = (p) => {
     if (keysOf(p) !== "authorized_at,authorized_by,kind,legacy_source_digest,migration_operation_id") return "migrated proof 字段集不对";
     if (typeof p.migration_operation_id !== "string" || !OP_ID_SHAPE.test(p.migration_operation_id)) return "migrated.migration_operation_id 形状不对";
     if (typeof p.legacy_source_digest !== "string" || !SHA_SHAPE.test(p.legacy_source_digest)) return "migrated.legacy_source_digest 形状不对";
-  } else return "binding_proof.kind 不在 {attach,pairing,retarget,migrated}";
+  } else if (p.kind === "owner_select_v1") {
+    if (keysOf(p) !== "authorized_at,authorized_by,kind,selected_root_om,selected_session_id,selection_handle,selection_operation_id") return "owner_select_v1 proof 字段集不对";
+    if (typeof p.selected_session_id !== "string" || !AILY_SESSION_SHAPE.test(p.selected_session_id)) return "owner_select_v1.selected_session_id 形状不对";
+    if (typeof p.selected_root_om !== "string" || !OM_SHAPE.test(p.selected_root_om)) return "owner_select_v1.selected_root_om 形状不对";
+    if (typeof p.selection_handle !== "string" || !SELECTION_HANDLE_SHAPE.test(p.selection_handle)) return "owner_select_v1.selection_handle 形状不对（osh_+32hex）";
+    if (typeof p.selection_operation_id !== "string" || !isOperationId(p.selection_operation_id)) return "owner_select_v1.selection_operation_id 形状不对";
+  } else return "binding_proof.kind 不在 {attach,pairing,retarget,migrated,owner_select_v1}";
   return null;
 };
 
 const linkProofProblem = (r) => {
   if (!isObj(r)) return "locator_link_proof_ref 不是对象";
+  if (r.kind === "owner_selected_route_v1") {
+    if (keysOf(r) !== "authorized_at,authorized_by,by_identity,kind,selected_root_om,selected_session_id,selection_handle,selection_operation_id") return "owner_selected_route_v1 link 字段集不对";
+    if (r.by_identity !== "owner_authorization") return "owner_selected_route_v1.by_identity 只认 owner_authorization";
+    if (typeof r.selected_session_id !== "string" || !AILY_SESSION_SHAPE.test(r.selected_session_id)) return "owner_selected_route_v1.selected_session_id 形状不对";
+    if (typeof r.selected_root_om !== "string" || !OM_SHAPE.test(r.selected_root_om)) return "owner_selected_route_v1.selected_root_om 形状不对";
+    if (typeof r.selection_handle !== "string" || !SELECTION_HANDLE_SHAPE.test(r.selection_handle)) return "owner_selected_route_v1.selection_handle 形状不对（osh_+32hex）";
+    if (typeof r.selection_operation_id !== "string" || !isOperationId(r.selection_operation_id)) return "owner_selected_route_v1.selection_operation_id 形状不对";
+    return null;
+  }
   if (r.kind === "migrated") {
     if (keysOf(r) !== "kind,legacy_source_digest,migration_operation_id") return "link migrated 字段集不对";
     if (typeof r.migration_operation_id !== "string" || !OP_ID_SHAPE.test(r.migration_operation_id)) return "link migrated.migration_operation_id 形状不对";
@@ -543,9 +558,16 @@ export function tombstoneProblem(rec, id) {
   if (!isCanonicalIso(rec.merged_at)) return "merged_at 不规范";
   if (!isOperationId(rec.origin_operation_id)) return "origin_operation_id 形状不对";
   const p = rec.proof_ref;
-  if (!isObj(p) || keysOf(p) !== "kind,matched_fields,om,pending_token_state" || p.kind !== "pairing") return "proof_ref 字段集/kind 不对";
-  if (typeof p.om !== "string" || !OM_SHAPE.test(p.om)) return "proof_ref.om 形状不对";
-  if (matchedFieldsBad(p.matched_fields, p.pending_token_state)) return "proof_ref.matched_fields 不是封闭判别联合（token 四项 / no-token 三项）";
+  if (p.kind === "owner_select_merge_v1") {
+    if (keysOf(p) !== "kind,selected_root_om,selection_handle,selection_operation_id") return "proof_ref(owner_select_merge_v1) 字段集不对";
+    if (typeof p.selected_root_om !== "string" || !OM_SHAPE.test(p.selected_root_om)) return "proof_ref.owner_select_merge_v1.selected_root_om 形状不对";
+    if (typeof p.selection_handle !== "string" || !SELECTION_HANDLE_SHAPE.test(p.selection_handle)) return "proof_ref.owner_select_merge_v1.selection_handle 形状不对（osh_+32hex）";
+    if (typeof p.selection_operation_id !== "string" || !isOperationId(p.selection_operation_id)) return "proof_ref.owner_select_merge_v1.selection_operation_id 形状不对";
+  } else {
+    if (!isObj(p) || keysOf(p) !== "kind,matched_fields,om,pending_token_state" || p.kind !== "pairing") return "proof_ref 字段集/kind 不对";
+    if (typeof p.om !== "string" || !OM_SHAPE.test(p.om)) return "proof_ref.om 形状不对";
+    if (matchedFieldsBad(p.matched_fields, p.pending_token_state)) return "proof_ref.matched_fields 不是封闭判别联合（token 四项 / no-token 三项）";
+  }
   return null;
 }
 

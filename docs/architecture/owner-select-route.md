@@ -372,6 +372,11 @@ P1-2）：`campaign`/`writer_state`（文件态含 `exists`）同 sidecar——`
 | `precheck` / `precheck:<ep>` | 同上 ledger.json | `{ legacy_proof_count, null_b1_count, revision, ledger_sha256 }`；**只读核验 step**：before === intended_after === after 且两计数皆 0；任一非 0 → 本 step 不能 done → operation 不得推进（direct 则拒进段） | `<ep>` ∈ sealed 集（B）/ open 集（direct） | B/direct：每 ep 恰一条 | **仅 B / direct** |
 | `writer_state` / `writer_state:<campaign_id>:partial\|on` | `<bridge home>/ledger/owner-select-writer-state.json` | **判别联合**（十二轮 P2）：`exists===false` ⇒ `{ exists:false, sha256:null, state:"off", campaign_id:null, endpoints_digest:null, revision:0 }`（缺席投影=off）；`exists===true` ⇒ `{ exists:true, sha256:<64hex>, state:"off"\|"partial"\|"on", campaign_id:（state=off ⇒ null；否则 <id> 非 null）, endpoints_digest:（state=on ⇒ <64hex> === sealed 集摘要；partial ⇒ open 集当前摘要或 null；off ⇒ null）, revision:正整数、每次写 +1 }`；**partial**：before.state∈{off,on(退回)} → intended.state=partial；**on**：before.state=partial ∧ 本 operation `campaign:*:complete` 已 done → intended.state=on、digest=sealed 集摘要 | campaign_id/digest === 本 operation campaign step 的值；`revision` 单调 +1 | A：恰一条 `:partial`；B/direct：恰一条 `:on` | A(partial) / B(on) / direct(on) |
 
+**跨 step 等式的生效时点（R50 验收裁定）**：forward 段内 step 可**整批 prepared**（与 cutover 的原子进段同一工艺）；
+`writer_state:*:on` **done** ⇐ 本 operation `campaign:*:complete` 已 done（on 仅 prepared 时不核）；`writer_state` 步（partial/on）的
+`intended_after.campaign_id` / `endpoints_digest` 必逐字等于本 operation campaign step 的值；恰一次计数按 **phase** 门控——进入
+forward 段起即使零新 step 也按表判（`:open` 必须恰一），不以"是否出现新 step"为条件。
+
 **禁异类 step（逐 kind 封闭）**：三个新 kind **一律禁** `ledger`/`sidecar`/`artifact`/`receipt`/`staged_plan`/
 `current:*:install`；A 禁 `precheck`、`schema_endpoint:*:strict\|direct`、`writer_state:*:on`；B 禁 `mint`、
 `campaign:*:open`、`schema_endpoint:*:transition\|direct`、`writer_state:*:partial`；direct 禁 `mint`、

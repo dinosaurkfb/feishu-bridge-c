@@ -33080,6 +33080,13 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
     assert.equal(vAncDriftRecP13.ok, false, "expected_anchor_candidate ≠ 记录 anchor_candidate 必拒");
     assert.match(String(vAncDriftRecP13.why), /不相容（G13）/u);
 
+    // 4. expected ≠ selected_root_om 且记录候选同步漂移 → opConsistent 兼容，但 shape 层等式仍拒
+    const dAncDriftPairP13 = structuredClone(mkAncP12());
+    dAncDriftPairP13.operations[opIdAncP12].result.expected_anchor_candidate = "om_drift";
+    dAncDriftPairP13.records[taId1].anchor_candidate = "om_drift";
+    const vAncDriftPairP13 = TAL.validateLedger(dAncDriftPairP13, { endpointId: EP });
+    assert.equal(vAncDriftPairP13.ok, false, "expected_anchor_candidate ≠ selected_root_om（记录候选同步漂移）必拒");
+
     // 逐 op 钉死反向：rebind produced 伪 migrated proof → 拒（preserved⇒any，produced⇒owner_select_v1）
     const opIdMigRb = "00000000-0000-4000-8000-000000000026";
     const opIdRebRb = "00000000-0000-4000-8000-000000000027";

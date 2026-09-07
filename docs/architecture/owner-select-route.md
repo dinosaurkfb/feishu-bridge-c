@@ -373,6 +373,24 @@ P1-2）：`campaign`/`writer_state`（文件态含 `exists`）同 sidecar——`
 | `precheck` / `precheck:<ep>` | 同上 ledger.json | `{ legacy_proof_count, null_b1_count, revision, ledger_sha256 }`；**只读核验 step**：before === intended_after === after 且两计数皆 0；任一非 0 → 本 step 不能 done → operation 不得推进（direct 则拒进段） | `<ep>` ∈ sealed 集（B）/ open 集（direct） | B/direct：每 ep 恰一条 | **仅 B / direct** |
 | `writer_state` / `writer_state:<campaign_id>:partial\|on` | `<bridge home>/ledger/owner-select-writer-state.json` | **判别联合**（十二轮 P2）：`exists===false` ⇒ `{ exists:false, sha256:null, state:"off", campaign_id:null, endpoints_digest:null, revision:0 }`（缺席投影=off）；`exists===true` ⇒ `{ exists:true, sha256:<64hex>, state:"off"\|"partial"\|"on", campaign_id:（state=off ⇒ null；否则 <id> 非 null）, endpoints_digest:（state=on ⇒ <64hex> === sealed 集摘要；partial ⇒ open 集当前摘要或 null；off ⇒ null）, revision:正整数、每次写 +1 }`；**partial**：before.state∈{off,on(退回)} → intended.state=partial；**on**：before.state=partial ∧ 本 operation `campaign:*:complete` 已 done → intended.state=on、digest=sealed 集摘要 | campaign_id/digest === 本 operation campaign step 的值；`revision` 单调 +1 | A：恰一条 `:partial`；B/direct：恰一条 `:on` | A(partial) / B(on) / direct(on) |
 
+**状态链闭合（PR #135 一轮 P1-4/P1-5/P1-6 回带；"步数闭合"之外还要"状态链闭合"）**：
+- 逐 endpoint：A 的 `schema_endpoint:<ep>:transition.intended_after.{revision,ledger_sha256}` **===** `mint:<ep>.before.{revision,ledger_sha256}`；
+  B/direct 的 `precheck:<ep>.before.{revision,ledger_sha256}` **===** `schema_endpoint:<ep>:strict|direct.before.{revision,ledger_sha256}`。
+- campaign 链：`seal.before` **逐字 ===** `open.intended_after`（direct 内；B 的 open 在前一 operation，`seal.before` 由 R52 与盘上文件核）；
+  `complete.before` **逐字 ===** `seal.intended_after`；三步 `campaign_id/endpoints/endpoints_digest` 相等；本 operation 全部 `<ep>` step ⊆ 该集。
+- writer_state：`partial.intended_after.{campaign_id,endpoints_digest}` **===** `open.intended_after.{campaign_id,endpoints_digest}`（**digest 非 null**，
+  纠正上表"或 null"）；`on.intended_after.endpoints_digest` === `complete.intended_after.endpoints_digest`；**`:on` 的 before.state：B ⇒ `partial`；
+  direct ⇒ `off`**（direct 无 partial 段，缺席投影即 off；上表"on：before.state=partial"只对 B）。
+- campaign 文件不变量：`state==="complete"` ⇒ 全 member `schema_version==="1.1"` ∧ 两计数皆 0；`sealed|complete` ⇒ `pending_joins===[]`；
+  `pending_joins[*]` 封闭 = `{ endpoint_id, at, init_chain, init_request_key, init_operation_token }`（§8 prepared→committed 恢复要核的初始化身份）。
+- **准入读取器 `readOwnerSelectAdmission(env)`**（跨两文件，供 W1/W2/reaffirm 与 R52 用）：`on` ⇔ writer-state on ∧ campaign complete ∧
+  同 campaign_id ∧ digest 相等 ∧ 全 member strict；`partial` ⇔ writer-state partial ∧ campaign open|sealed ∧ 同 campaign_id；任一不自洽 → `unreadable`
+  （生产写方 fail-closed）；单文件读取器仍导出但**不作准入依据**。
+- **写原语合同（PR #135 一轮 P1-2/P1-3）**：写方必先持有 `<ledger root>/owner-select-state.lock`（registry 锁协议，同一把锁盖两文件），
+  锁内 compare（现场 `{exists,sha256}`）→ 序列化并**落盘前核大小 ≤ 1 MiB** → O_EXCL 0600 临时文件 fsync → rename → fsync 目录 → 读回；
+  结果联合 `{ commit:"not_committed" | "committed" | "committed_durability_uncertain"（rename 已成、目录 fsync 失败）| "lock_residue" }`，
+  写前异常一律结构化返回不裸抛；根路径经唯一 `validateLedgerRoot`（祖先 symlink 拒），文件 mode **恰 0600**、普通文件、单硬链接（读写两侧同核）。
+
 **跨 step 等式的生效时点（R50 验收裁定）**：forward 段内 step 可**整批 prepared**（与 cutover 的原子进段同一工艺）；
 `writer_state:*:on` **done** ⇐ 本 operation `campaign:*:complete` 已 done（on 仅 prepared 时不核）；`writer_state` 步（partial/on）的
 `intended_after.campaign_id` / `endpoints_digest` 必逐字等于本 operation campaign step 的值；恰一次计数按 **phase** 门控——进入
@@ -382,9 +400,9 @@ forward 段起即使零新 step 也按表判（`:open` 必须恰一），不以"
 `current:*:install`；A 禁 `precheck`、`schema_endpoint:*:strict\|direct`、`writer_state:*:on`；B 禁 `mint`、
 `campaign:*:open`、`schema_endpoint:*:transition\|direct`、`writer_state:*:partial`；direct 禁 `mint`、
 `schema_endpoint:*:transition\|strict`、`writer_state:*:partial`。反向：`maintenance_gate`/`maintenance_install`/
-`ledger_*` 四个旧 kind **禁**上述五个新 step kind。**1.4 读取纪律**：`schema_version===1.4` ⇒ `operation_kind`
-∈ 1.2 四种 ∪ 三新种；≤1.3 读取器遇 1.4 → `unreadable`（fail-closed）；1.4 读取器读 1.1/1.2/1.3 走既有兼容
-分支。**按 phase 计数**：进入 forward 段起，上表"恰一次计数"逐条成立（可 prepared/done）；进入重开族起
+`ledger_*` 四个旧 kind **禁**上述五个新 step kind。**1.4 读取纪律（PR #135 一轮 P1-1 裁定收紧）**：`schema_version===1.4` 是**三新种专属判别支**（同 1.3 之于 cutover）——
+`operation_kind` ∈ 三新种，**1.4 读到旧四种 → unreadable**（旧四种只记 1.2/1.3，绝不借 1.4 绕过各自旧联合）；≤1.3 读取器遇 1.4 →
+`unreadable`（fail-closed）；1.4 读取器读 1.1/1.2/1.3 走既有兼容分支；**1.1 冻结：禁五种新 step**。**按 phase 计数**：进入 forward 段起，上表"恰一次计数"逐条成立（可 prepared/done）；进入重开族起
 **全部 done**；forward 段之前**禁**任何新 step kind。
 
 **`writer_enable` 是唯一、封闭、CAS 的机器级当前状态（P1-6；七轮 P1-5 补存储合同）**：路径 =

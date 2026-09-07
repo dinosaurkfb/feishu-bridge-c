@@ -63,6 +63,7 @@ const SCHEMA_VERSIONS = Object.freeze(["1.0", "1.1-transition", "1.1"]);
 const SELECTION_HANDLE_SHAPE = /^osh_[0-9a-f]{32}$/u;
 const REBIND_HANDLE_SHAPE = /^orh_[0-9a-f]{32}$/u;
 const REAFFIRM_HANDLE_SHAPE = /^rfh_[0-9a-f]{32}$/u;
+export { SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE }; // R52a: 单一出处导出供控制命令解析
 const ANY_HANDLE_SHAPE = /^(osh|orh|rfh)_[0-9a-f]{32}$/u;
 const ALLOWED_PRODUCE_OPS = Object.freeze(["activate", "anchor", "rebind_session_alias", "owner_select_reaffirm"]);
 

@@ -4,7 +4,7 @@
  * 正文先按 normalizeControlText 折叠不可见字符 / 全角前缀 / 空白，再落进一个封闭联合：
  *
  *   readonly          正文恰为本链只读命令词（status / subscribe）—— 投给模型，由技能只读展示
- *   router_control    路由侧直接执行、不经模型：feishu-mode dialogue|mapping（control 字段非空）
+ *   router_control    路由侧直接执行、不经模型：feishu-mode dialogue|mapping、feishu-select [<osh_/orh_/rfh_ handle>]（control 字段非空）
  *   model_control     精确命令词，投给模型执行对应技能：bind / rotate / rotate cancel
  *   rejected_control  精确命令词但**不从飞书开放**（CLAUDE.md）：unbind / pin-session —— 取 claim 后记拒绝终态、回执说明去哪做
  *   malformed_control 命令命名空间（`/feishu-…` / `$feishu-…`）里的其它一切：缺参、错参、多了尾巴、
@@ -43,7 +43,7 @@ const REJECTED_WORDS = Object.freeze({
 const AUTHORIZATION_RE = /^(?:装|安装|切路由|切权威路由|写飞书|发飞书)(?:\s.+)?$/u;
 
 const availableText = (p) =>
-  `${p}feishu-status、${p}feishu-subscribe、${p}feishu-mode ${CONTROL_MODE_WORDS.join("|")}、${p}feishu-bind、${p}feishu-rotate、${p}feishu-rotate cancel`;
+  `${p}feishu-status、${p}feishu-subscribe、${p}feishu-mode ${CONTROL_MODE_WORDS.join("|")}、${p}feishu-select、${p}feishu-bind、${p}feishu-rotate、${p}feishu-rotate cancel`;
 /** 回执里反射用户给的词 / 参数：先净化（控制字符、locator 形状），再按 Unicode 码点截断 —— 原始正文只留在 digest 里，不直接展示。 */
 const SHOWN_MAX = 40;
 export function shown(text) {
@@ -83,6 +83,12 @@ export function parseInboundIntent({ instruction, chain } = {}) {
     // 命中与否只由路由侧的精确解析决定（判据一份）；文案引用同一份参数词表
     const control = parseControlCommand(text, { chain });
     if (!control) return malformed(`${own}feishu-mode 的参数只认 ${CONTROL_MODE_WORDS.join(" / ")}，收到「${a}」`);
+    return { intent: INTENT.ROUTER_CONTROL, ...base, word, control };
+  }
+  if (word === "feishu-select") {
+    // R52a：/feishu-select [<handle>] —— 命中与否由路由侧精确解析决定（判据一份）；不降回普通指令。
+    const control = parseControlCommand(text, { chain });
+    if (!control || control.kind !== "select") return malformed(`${own}feishu-select 只认不带参数或一个 osh_/orh_/rfh_ + 32 位十六进制的 handle，收到「${a}」`);
     return { intent: INTENT.ROUTER_CONTROL, ...base, word, control };
   }
   if (word === "feishu-rotate") {

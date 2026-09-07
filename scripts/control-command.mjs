@@ -15,6 +15,7 @@ import { DIALOGUE_POLICY_ID, MAPPING_POLICY_ID } from "./interaction-policy.mjs"
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE, readClaimState, recordClaimState } from "./claim.mjs";
 import { controlIntentProblem, sameControlIntent } from "./control-intent.mjs";
+import { SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE } from "./topic-agent-ledger.mjs";
 
 export { CONTROL_MODES, controlIntentProblem, sameControlIntent } from "./control-intent.mjs";
 
@@ -24,6 +25,18 @@ const SHAPES = {
   claude: new RegExp("^\\/feishu-mode (" + CONTROL_MODE_WORDS.join("|") + ")$", "u"),
   codex: new RegExp("^\\$feishu-mode (" + CONTROL_MODE_WORDS.join("|") + ")$", "u"),
 };
+// R52a：/feishu-select 的 handle 正则**从 topic-agent-ledger 导出的 handle 形状常量生成**（单一出处；不另写一份字母表）。
+const HANDLE_ALTS = Object.freeze([
+  { re: SELECTION_HANDLE_SHAPE, kind: "osh" },
+  { re: REBIND_HANDLE_SHAPE, kind: "orh" },
+  { re: REAFFIRM_HANDLE_SHAPE, kind: "rfh" },
+]);
+const HANDLE_ALT = HANDLE_ALTS.map(({ re }) => re.source.replace(/^\^|\$$/gu, "")).join("|");
+const SELECT_SHAPES = {
+  claude: new RegExp("^\\/feishu-select(?: (" + HANDLE_ALT + "))?$", "u"),
+  codex: new RegExp("^\\$feishu-select(?: (" + HANDLE_ALT + "))?$", "u"),
+};
+const handleKindOf = (h) => h === null ? null : (h.startsWith("osh_") ? "osh" : h.startsWith("orh_") ? "orh" : h.startsWith("rfh_") ? "rfh" : null);
 
 /**
  * 飞书客户端会在 @ 之后 / 词与词之间塞进不换行空格（U+00A0）、全角空格（U+3000）、零宽字符（U+200B…）、
@@ -42,11 +55,16 @@ export function normalizeControlText(instruction) {
 
 /** @returns {{kind:"mode", mode:string}|null} */
 export function parseControlCommand(instruction, { chain } = {}) {
-  const re = SHAPES[chain];
-  if (!re || typeof instruction !== "string") return null;
-  const m = re.exec(normalizeControlText(instruction));
-  if (!m) return null;
-  return { kind: "mode", mode: m[1] === "dialogue" ? DIALOGUE_POLICY_ID : MAPPING_POLICY_ID };
+  if (typeof instruction !== "string") return null;
+  const norm = normalizeControlText(instruction);
+  const modeRe = SHAPES[chain];
+  if (modeRe) { const m = modeRe.exec(norm); if (m) return { kind: "mode", mode: m[1] === "dialogue" ? DIALOGUE_POLICY_ID : MAPPING_POLICY_ID }; }
+  const selRe = SELECT_SHAPES[chain];
+  if (selRe) {
+    const m = selRe.exec(norm);
+    if (m) return { kind: "select", handle: m[1] ?? null, handle_kind: handleKindOf(m[1] ?? null) };
+  }
+  return null;
 }
 
 const CONSUMED_KEYS = "changed,claim_key,control,mode,recorded_at,schema_version,state";

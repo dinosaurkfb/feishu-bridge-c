@@ -18773,6 +18773,25 @@ test("控制命令只认封闭的精确形状：两条链各两条，多一个�
   }
   assert.equal(parseControlCommand("/feishu-mode dialogue", { chain: "other" }), null, "链不认识就不认");
   assert.equal(parseControlCommand("/feishu-mode dialogue", {}), null);
+
+test("R52a：feishu-select 解析封闭（bare/单 handle/坏 handle/别链前缀/尾随/大小写）+ 意图分类 + control-intent 封闭形", () => {
+  const h = "osh_" + "a".repeat(32);
+  const oh = "orh_" + "b".repeat(32);
+  assert.deepEqual(parseControlCommand("/feishu-select", { chain: "claude" }), { kind: "select", handle: null, handle_kind: null });
+  assert.deepEqual(parseControlCommand("/feishu-select " + h, { chain: "claude" }), { kind: "select", handle: h, handle_kind: "osh" });
+  assert.deepEqual(parseControlCommand("$feishu-select " + oh, { chain: "codex" }), { kind: "select", handle: oh, handle_kind: "orh" });
+  assert.equal(parseControlCommand("/feishu-select osh_abc", { chain: "claude" }), null, "坏 handle（短/非hex）");
+  assert.equal(parseControlCommand("$feishu-select " + h, { chain: "claude" }), null, "别链前缀");
+  assert.equal(parseControlCommand("/feishu-select " + h + " extra", { chain: "claude" }), null, "尾随内容");
+  assert.equal(parseControlCommand("/Feishu-select " + h, { chain: "claude" }), null, "大小写变体");
+  assert.equal(parseInboundIntent({ instruction: "/feishu-select " + h, chain: "claude" }).intent, INTENT.ROUTER_CONTROL);
+  const bad = parseInboundIntent({ instruction: "/feishu-select abc", chain: "claude" });
+  assert.equal(bad.intent, INTENT.MALFORMED_CONTROL);
+  assert.ok(bad.problem.includes("只认不带参数或一个 osh_/orh_/rfh_"), "malformed 文案说清：" + bad.problem);
+  assert.equal(controlIntentProblem({ control: "select", handle: h, handle_kind: "osh" }), null);
+  assert.ok(String(controlIntentProblem({ control: "select", handle: h, handle_kind: "orh" })).includes("前缀与 handle_kind 不一致"));
+  assert.equal(controlIntentProblem({ control: "select", handle: null, handle_kind: null }), null);
+});
   const on = controlAckText({ taskName: "演示", mode: DIALOGUE_POLICY_ID, changed: true });
   assert.match(on, /^已切换 · 演示\n交互模式现在是 Dialogue/u);
   assert.match(on, /没有被当作指令投递/u);
@@ -21999,7 +22018,7 @@ test("近似命中收边（第 3 层）：意图联合唯一、风险是它的�
   assert.match(problem("/feishu-rotate now"), /只认不带参数或「cancel」，收到「now」/u);
   assert.match(problem("$feishu-mode dialogue"), /前缀「\$」是 Codex 链的写法；这个话题是 Claude 链，命令用「\/」开头/u);
   assert.match(problem("/feishu-mode dialogue", "codex"), /前缀「\/」是 Claude 链的写法；这个话题是 Codex 链，命令用「\$」开头/u);
-  assert.match(problem("/feishu-unsubscribe"), /没有「\/feishu-unsubscribe」这个命令；飞书里可用：\/feishu-status、\/feishu-subscribe、\/feishu-mode dialogue\|mapping、\/feishu-bind、\/feishu-rotate、\/feishu-rotate cancel/u);
+  assert.match(problem("/feishu-unsubscribe"), /没有「\/feishu-unsubscribe」这个命令；飞书里可用：\/feishu-status、\/feishu-subscribe、\/feishu-mode dialogue\|mapping、\/feishu-select、\/feishu-bind、\/feishu-rotate、\/feishu-rotate cancel/u);
   assert.match(problem("$feishu-whatever", "codex"), /没有「\$feishu-whatever」这个命令；飞书里可用：\$feishu-status/u);
   assert.match(problem("/feishu-unbind"), /暂停接入不从飞书开放，请在终端里跑 \/feishu-unbind/u);
   assert.match(problem("/feishu-pin-session"), /钉会话不从飞书开放，请在终端里跑 \/feishu-pin-session/u);
@@ -22028,7 +22047,7 @@ test("近似命中收边（第 3 层）：意图联合唯一、风险是它的�
   assert.match(problem("/feishu-mode dia\u0007log"), /收到「dia\ufffdlog」/u);
   const long = "😀".repeat(45);
   assert.equal(problem("/feishu-status " + long), "/feishu-status 不带参数，多了「" + "😀".repeat(40) + "…」", "按 Unicode 码点截到 40 个再加省略号");
-  assert.equal(problem("/feishu-" + long), "没有「/" + Array.from("feishu-" + long).slice(0, 40).join("") + "…」这个命令；飞书里可用：/feishu-status、/feishu-subscribe、/feishu-mode dialogue|mapping、/feishu-bind、/feishu-rotate、/feishu-rotate cancel");
+  assert.equal(problem("/feishu-" + long), "没有「/" + Array.from("feishu-" + long).slice(0, 40).join("") + "…」这个命令；飞书里可用：/feishu-status、/feishu-subscribe、/feishu-mode dialogue|mapping、/feishu-select、/feishu-bind、/feishu-rotate、/feishu-rotate cancel");
   assert.equal(I("/feishu-" + long, "claude").word, "feishu-" + long, "word 字段保留原始值（进 digest / 账本），只有展示走净化");
   assert.equal(shown("a\u0000b"), "a\ufffdb");
   // ── 拒绝投影与终态记录的封闭形状（验证器各一份）

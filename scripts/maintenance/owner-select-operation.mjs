@@ -724,7 +724,6 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         const atIntended = ws.exists && ws.sha256 === intended.sha256 && ws.state === "on";
         if (!atIntended) {
           const rebuild = buildOsmWriterDoc({ token, cid, digest: intended.endpoints_digest, expectedRevision: intended.revision, state: "on" });
-          if (process.env.R53_DEBUG) process.stderr.write("R53DEBUG rebuild=" + JSON.stringify(rebuild) + " intended=" + JSON.stringify(intended) + "\n");
           if (shaHex(serializeLedger(rebuild)) !== intended.sha256) return { ok: false, reason: "writer_budget_drift", why: "on 预算漂移", phase };
           const w = writeWriterState({ env, expectedSha256: ws.exists ? ws.sha256 : null, doc: rebuild, capability: { token, stepId: st.id } });
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
@@ -742,7 +741,6 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
     if (process.env.R53_DEBUG) {
       const cs2 = readCampaignState(env);
       const cst2 = readJournal({ dir: ctx.dir, token }).doc.steps.find((s) => s.kind === "campaign" && s.id.endsWith(":complete"));
-      process.stderr.write("R53DEBUG reopen cs=" + JSON.stringify(cs2) + " after=" + JSON.stringify(cst2?.after) + "\n");
     }
   }
 

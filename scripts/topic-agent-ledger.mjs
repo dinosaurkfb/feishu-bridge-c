@@ -370,7 +370,7 @@ export function migrationInventory(doc) {
     if (rec.kind === "live") {
       if (rec.binding_proof?.kind === "pairing") legacy++;
       if (rec.locator_link_proof_ref?.kind === "f4_anchor") legacy++;
-      if (familyOf(rec.facts) === "B1" && (rec.selection_handle ?? null) === null) nullB1.push(id);
+      if (familyOf(rec.facts) === "B1" && (rec.selection_handle ?? null) === null) nullB1.push(id); // R53：1.0 形状字段缺位也计 null-B1
     } else if (rec.kind === "forwarding_tombstone") {
       if (rec.proof_ref?.kind === "pairing") legacy++;
     }

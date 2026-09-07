@@ -38619,20 +38619,34 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
       // 预览（B）：零改动
       const out2 = [];
       const s2 = MOS.runMaintenanceOwnerSelect(["--migrate-b"], { ctx: fx.ctx, out: (s) => out2.push(s), env: fx.env });
-      process.stderr.write("R53STEP STEP-B-preview\n");
       assert.equal(s2, 0, "B 预览 exit 0");
       assert.ok(out2.join("\n").includes("[预览]"), "B 预览输出");
       assert.equal(readGate({ file: fx.gateFile, now: Date.parse(T052) }).state, "absent", "B 预览零改动：无门");
+      // 互斥守卫（刀：只能给一个动作 删 → 此处红；R52 ⑦' 的同名断言不在 R53 滤镜内）
+      const mutualAB = MOS.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--migrate-b"]);
+      assert.equal(mutualAB.ok, false, "A/B 同给拒");
+      assert.match(mutualAB.reason, /只能给一个动作/, "互斥 reason 文案");
+      assert.ok(out2.join("\n").includes("campaign seal"), "B 预览文案含 B 专属关键词（seal）");
+      assert.ok(!out2.join("\n").includes("mint"), "B 预览文案不含 mint（B 无 mint）");
+      // direct 预览：文案含 direct 专属关键词
+      const out2d = [];
+      const s2d = MOS.runMaintenanceOwnerSelect(["--migrate-direct"], { ctx: fx.ctx, out: (s) => out2d.push(s), env: fx.env });
+      assert.equal(s2d, 0, "direct 预览 exit 0");
+      assert.ok(out2d.join("\n").includes("直升"), "direct 预览文案含直升");
+      assert.ok(!out2d.join("\n").includes("复合 mint"), "direct 预览文案不含复合 mint");
+      // A 预览文案仍含 A 专属关键词（mint）
+      const out2a = [];
+      const s2a = MOS.runMaintenanceOwnerSelect(["--migrate-a"], { ctx: fx.ctx, out: (s) => out2a.push(s), env: fx.env });
+      assert.equal(s2a, 0, "A 预览 exit 0");
+      assert.ok(out2a.join("\n").includes("复合 mint"), "A 预览文案含复合 mint");
       // --apply 全程（CLI 路径）
       const out3 = [];
       const s3 = MOS.runMaintenanceOwnerSelect(["--migrate-b", "--apply"], { ctx: fx.ctx, out: (s) => out3.push(s), env: fx.env });
-      process.stderr.write("R53STEP STEP-B-apply\n");
       assert.equal(s3, 0, "B --apply 全程 exit 0：" + out3.join("\n").slice(-300));
       assert.equal(readOwnerSelectAdmission(fx.env).state, "on", "B 完成后准入 on");
       // --status：准入投影 on
       const out4 = [];
       const s4 = MOS.runMaintenanceOwnerSelect(["--status"], { ctx: fx.ctx, out: (s) => out4.push(s), env: fx.env });
-      process.stderr.write("R53STEP STEP-status\n");
       assert.equal(s4, 0, "--status exit 0");
       assert.ok(out4.join("\n").includes("准入投影（writer ∧ campaign 联合判定）：on"), "--status 准入投影：" + out4.join("\n").slice(-200));
     } finally { fx.cleanup(); }
@@ -38648,10 +38662,8 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
         fs.writeFileSync(d, JSON.stringify(dd, null, 2) + "\n", { mode: 0o600 });
         const out5 = [];
         const s5 = MOS.runMaintenanceOwnerSelect(["--migrate-direct"], { ctx: fx.ctx, out: (s) => out5.push(s), env: fx.env });
-      process.stderr.write("R53STEP STEP-direct-preview\n");
         assert.equal(s5, 0, "direct 预览 exit 0");
         const s6 = MOS.runMaintenanceOwnerSelect(["--migrate-direct", "--apply"], { ctx: fx.ctx, out: (s) => out5.push(s), env: fx.env });
-      process.stderr.write("R53STEP STEP-direct-apply\n");
         assert.equal(s6, 0, "direct --apply 全程 exit 0：" + out5.join("\n").slice(-300));
         assert.equal(readOwnerSelectAdmission(fx.env).state, "on", "direct 完成后准入 on");
       } finally { fx.cleanup(); }
@@ -38667,7 +38679,6 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
         fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
         const out6 = [];
         const code = MG.runMaintenanceGate(["--exit", "--apply"], { ctx: fx.ctx, out: (s) => out6.push(s), env: fx.env });
-      process.stderr.write("R53STEP STEP-exit\n");
         assert.equal(code, 0, "maintenance-gate --exit 分派 osmExit 收敛：" + out6.join("\n").slice(-260));
         assert.equal(readOwnerSelectAdmission(fx.env).state, "on", "分派恢复后准入 on");
       } finally { fx.cleanup(); }
@@ -39096,6 +39107,12 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     assert.deepEqual([MOS.parseMaintenanceOwnerSelectArgs(["--migrate-b", "--apply"]).ok, MOS.parseMaintenanceOwnerSelectArgs(["--migrate-direct"]).ok], [true, true], "B/direct 合法形状");
     assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--migrate-b"]).ok, false, "A/B 互斥拒");
     assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-b", "--migrate-direct"]).ok, false, "B/direct 互斥拒");
+    const mutualAB = MOS.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--migrate-b"]);
+    assert.equal(mutualAB.ok, false, "A/B 同给拒");
+    assert.match(mutualAB.reason, /只能给一个动作/, "互斥 reason 文案");
+    const mutualAD = MOS.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--migrate-direct"]);
+    assert.equal(mutualAD.ok, false, "A/direct 同给拒");
+    assert.match(mutualAD.reason, /只能给一个动作/, "互斥 reason 文案（direct）");
     assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-direct", "--apply", "--apply"]).ok, false, "--apply 重复拒");
     // --status 只读投影 + --migrate-a 预览零改动（走真夹具 ctx）
     {

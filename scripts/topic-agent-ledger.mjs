@@ -765,7 +765,8 @@ const RESULT_SHAPE = Object.freeze({
   mint_selection_handles: (r) => keysOf(r) === "affected_live_ids_after_commit,endpoint,minted,proof_effects"
     && typeof r.endpoint === "string" && ENDPOINT_SHAPE.test(r.endpoint)
     && Array.isArray(r.minted) && r.minted.every((m, i) => isObj(m) && isId(m.target_id) && SELECTION_HANDLE_SHAPE.test(m.selection_handle) && isCanonicalIso(m.handle_expires_at)
-        && (keysOf(m) === "handle_expires_at,selection_handle,target_id" || (keysOf(m) === "anchor_candidate,handle_expires_at,selection_handle,target_id" && OM_SHAPE.test(m.anchor_candidate)))
+        // 返修三 P2：A2 不由 mint 产生（A2 只经 attach_a2），minted 项不再认 anchor_candidate 字段
+        && keysOf(m) === "handle_expires_at,selection_handle,target_id"
         && (i === 0 || r.minted[i - 1].target_id < m.target_id))
     && canonKey(r.affected_live_ids_after_commit) === canonKey(r.minted.map((m) => m.target_id))
     && Array.isArray(r.proof_effects) && r.proof_effects.length === 0,
@@ -886,9 +887,8 @@ function opConsistentWithRecord(op, id, rec) {
       if (!Array.isArray(r.minted)) return false;
       const m = r.minted.find((x) => x.target_id === id);
       if (!m) return false;
-      if (fam === "B1") return true;
-      if (fam === "A2") return m.anchor_candidate === rec.anchor_candidate;
-      return false;
+      // 返修三 P2：A2 不由 mint 产生（A2 只经 attach_a2）—— B1 保留，其余族一律 false
+      return fam === "B1";
     }
     case "clear_anchor_handle": return rec.kind === "live" && fam === "A2" && r.affected_live_ids_after_commit?.includes(id);
     case "reissue_selection_handle": return rec.kind === "live" && (fam === "B1" || fam === "A2") && r.affected_live_ids_after_commit?.includes(id)
@@ -1392,9 +1392,7 @@ export function validateLedger(doc, { endpointId } = {}) {
         if (!item || item.selection_handle !== rec.selection_handle || item.handle_expires_at !== rec.handle_expires_at) {
           return bad(id + "：selection_handle 与产生 op result 逐字不符 (G-handle)");
         }
-        if (fam === "A2" && item.anchor_candidate !== rec.anchor_candidate) {
-          return bad(id + "：anchor_candidate 与产生 op result 逐字不符 (G-handle)");
-        }
+        // 返修三 P2：A2 的 anchor_candidate 与 mint 产生 op 的逐字等检查已删（A2 不由 mint 产生）
       } else if (prodOp.op_type === "reissue_selection_handle") {
         if (pr.new_handle !== rec.selection_handle || pr.new_expires_at !== rec.handle_expires_at) {
           return bad(id + "：selection_handle 与产生 op result 逐字不符 (G-handle)");

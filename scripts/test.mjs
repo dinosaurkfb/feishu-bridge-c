@@ -33205,31 +33205,32 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
     };
     assert.equal(TAL.validateLedger(dReissueCandDrift, { endpointId: EP }).ok, false, "A2 记录与 reissue_selection_handle 候选漂移必拒");
 
-    // 4. A2 记录 anchor_candidate 与 mint_selection_handles 漂移 → 拒
-    const dMintCandDrift = mkBaseDoc("1.1");
-    dMintCandDrift.revision = 2;
-    dMintCandDrift.operations[opId1] = {
-      op_type: "mint_selection_handles",
-      terminal_kind: "mint_selection_handles",
-      request_key: "rk_mint_a2",
-      fingerprint: "6".repeat(64),
-      result_revision: 2,
+    // ── 返修三 P2：A2 不由 mint_selection_handles 产生（A2 只经 attach_a2，删三处死分支）──
+
+    // minted 项带 anchor_candidate → 拒且拒因是 shape（pre-fix 拒因是 pe 列举门，match 失败 → 红）
+    const dMintA2P2 = mkBaseDoc("1.1");
+    dMintA2P2.revision = 2;
+    dMintA2P2.operations[opId1] = {
+      op_type: "mint_selection_handles", terminal_kind: "mint_selection_handles", request_key: "rk_mint_a2p2",
+      fingerprint: "6".repeat(64), result_revision: 2,
       result: {
         endpoint: EP,
-        minted: [{ target_id: taId1, selection_handle: hOSH1, handle_expires_at: ISO, anchor_candidate: "om_candMint" }],
+        minted: [{ target_id: taId1, selection_handle: hOSH1, handle_expires_at: ISO, anchor_candidate: "om_candA2" }],
         affected_live_ids_after_commit: [taId1],
         proof_effects: []
       }
     };
-    dMintCandDrift.records[taId1] = {
+    dMintA2P2.records[taId1] = {
       kind: "live", topic_agent_id: taId1, chat_id: "oc_chat1", created_at: ISO, updated_at: ISO, origin_operation_id: opId1,
       facts: { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" },
       aliases: { session_id: "00000000-0000-4000-8000-000000000001", root_om: null }, binding_target: TGT,
       binding_proof: { kind: "attach", authorized_by: "ou_owner1", authorized_at: ISO, claim_key: "c".repeat(64) },
       locator_link_proof_ref: null, generation_lineage_id: null,
-      anchor_candidate: "om_candRecDrift", selection_handle: hOSH1, handle_expires_at: ISO, rebind_handle: null, rebind_expires_at: null
+      anchor_candidate: "om_candA2", selection_handle: hOSH1, handle_expires_at: ISO, rebind_handle: null, rebind_expires_at: null
     };
-    assert.equal(TAL.validateLedger(dMintCandDrift, { endpointId: EP }).ok, false, "A2 记录与 mint_selection_handles 候选漂移必拒");
+    const vMintA2P2 = TAL.validateLedger(dMintA2P2, { endpointId: EP });
+    assert.equal(vMintA2P2.ok, false, "minted 项带 anchor_candidate 必拒");
+    assert.match(String(vMintA2P2.why), /mint_selection_handles result 形状不对/u);
 
     // ── P1-4 返修：reaffirm tombstone 绑定本次 new_link_proof 与 reaffirm op id ──
 

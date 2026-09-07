@@ -228,6 +228,7 @@ import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs"
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
+import * as OSM from "./maintenance/owner-select-operation.mjs";
 import { acquireOperationLease, addNote as addNoteJ, addStepPrepared as addStepPreparedJ, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, enterLedgerForward, isLedgerReceipt, journalProblem, readActive, readJournal, releaseOperationLease, setPhase as setPhaseJ, updateJournal, CUTOVER_JOURNAL_SCHEMA, OWNER_SELECT_JOURNAL_SCHEMA, OPERATION_KINDS as JOURNAL_OPERATION_KINDS, STEP_KINDS as JOURNAL_STEP_KINDS, PHASES as JOURNAL_PHASES, FORWARD_ONLY_PHASES as JOURNAL_FORWARD_ONLY_PHASES, SIDECAR_NAMES, legacy12CutoverDisposition, stagedIntendedFile } from "./maintenance/journal.mjs";
 import { stageCutoverPlan, verifyStagedPlan, removeStagedPlan, planProblem as m1bPlanProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
 import { verifyCutoverPlan } from "./m1b/cutover-plan.mjs";
@@ -36167,6 +36168,47 @@ test("R52 §一 schemaUpgrade op key 确定性 + applySchemaUpgrade：同输入�
   assert.ok(Object.prototype.hasOwnProperty.call(next1.records[b1], "selection_handle") && next1.records[b1].selection_handle === null, "四字段补显式 null");
   assert.equal(TAL.validateLedger(next1, { endpointId: EP }).ok, true, "产物 validateLedger 过：" + TAL.validateLedger(next1, { endpointId: EP }).why);
   assert.ok(next1.operations[id1].fingerprint === TAL.fingerprintOf("schema_upgrade", { request_key: "req_sch", endpoint: EP, from_schema: "1.0", to_schema: "1.1-transition" }), "fingerprint 与 applySchemaUpgrade 一致");
+});
+
+// R52 第 1 步：osmEnter + drained 只读前置（冻结集 / 每 ep 账本 1.0 / campaign absent / writer off → ok；账本已 transition 非恢复 → not_at_1_0 rollbackSafe）。
+test("R52 osmEnter 前置：drained 四项核验 ok，账本非 1.0 且非恢复 → not_at_1_0", () => {
+  const realpathTmp = fs.realpathSync(os.tmpdir());
+  const b = fs.mkdtempSync(path.join(realpathTmp, "r52-ent-"));
+  const ledgerRoot = path.join(b, "ledger"); fs.mkdirSync(ledgerRoot, { recursive: true, mode: 0o700 }); fs.chmodSync(ledgerRoot, 0o700);
+  const maintDir = path.join(b, "maintenance"); fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 }); fs.chmodSync(maintDir, 0o700);
+  const gateFile = path.join(b, "maintenance.gate");
+  const EP1 = "endpoint_" + "a".repeat(24), EP2 = "endpoint_" + "b".repeat(24);
+  const env = { ...process.env, HOME: b, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };
+  const hx = (n) => String(n).repeat(64), uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000", iso = (t) => new Date(t).toISOString();
+  const tok = uuid(9), at = iso(1700000000000), sha = "b".repeat(64);
+  // 1.0 账本：EP1 schema 1.0（无记录）；EP2 schema 1.1-transition（non-recovery → 前置失败）。
+  const mkLedger = (ep, schema) => { const epDir = path.join(ledgerRoot, ep); fs.mkdirSync(epDir, { recursive: true, mode: 0o700 }); fs.chmodSync(epDir, 0o700); const d = { schema_version: schema, artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: ep, chain: "claude", authority_mode: "shadow", revision: 1, operations: { [uuid(1)]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } } }, records: {} }; fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(d, null, 2) + "\n", { mode: 0o600 }); };
+  // 写 init 收据（initDone）给 EP1 / EP2。
+  const mkReceipt = (ep, rtok) => { const tDone = (c) => ({ id: "timer:" + c, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null }); const sDone = (c) => ({ id: "stub:" + c, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + rtok, after: "versions/maintenance-" + rtok, state: "done", at, chain: null }); const cDone = (c) => ({ id: "current:" + c, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + rtok, after: "versions/maintenance-" + rtok, state: "done", at, chain: null }); const gDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: rtok }, after: { token: rtok, txnUncleared: null }, state: "done", at, chain: null }); const st = (o) => ({ endpoint_id: ep, operation_id: rtok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...o }); const after = st({ authority_mode: "shadow", revision: 1, ledger_sha256: sha }); const lStep = { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: st(), intended_after: after, after, state: "done", at, chain: "claude" }; fs.writeFileSync(path.join(maintDir, rtok + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: rtok, reason: "seed", started_at: at, updated_at: at, phase: "done", steps: [...["claude", "codex"].flatMap((c) => [tDone(c), sDone(c), cDone(c)]), gDone(), lStep], notes: [] }), { mode: 0o600 }); };
+  mkLedger(EP1, "1.0");
+  const r1 = uuid(1), r2 = uuid(2);
+  mkReceipt(EP1, r1);
+  const ctx = maintenanceContext({ home: b, dir: maintDir, gateFile, now: () => 1750000000000 });
+  // drained migration_a journal + active + gate + lease。
+  const enterSteps = []; // 复用 receipt 的 enter 步（drained 迁移操作也要 enter 步）
+  const tDone = (c) => ({ id: "timer:" + c, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null }); const sDone = (c) => ({ id: "stub:" + c, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null }); const cDone = (c) => ({ id: "current:" + c, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null }); const gDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+  const jdoc = { schema_version: "1.4", operation_kind: "owner_select_migration_a", reason: "r52", started_at: at, updated_at: at, token: tok, notes: [], phase: "drained", steps: [...["claude", "codex"].flatMap((c) => [tDone(c), sDone(c), cDone(c)]), gDone()] };
+  assert.equal(journalProblem(jdoc, { maintenanceDir: maintDir }), null, "drained journal 自洽：" + journalProblem(jdoc, { maintenanceDir: maintDir }));
+  fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(jdoc, null, 2) + "\n", { mode: 0o600 });
+  try { fs.unlinkSync(path.join(maintDir, "active")); } catch {}
+  fs.symlinkSync(tok, path.join(maintDir, "active"));
+  createGate({ file: gateFile, reason: "r52", token: tok, now: 1750000000000 });
+  assert.equal(acquireOperationLease({ dir: maintDir, token: tok }).ok, true, "取租约");
+  // 正：EP1 冻结、账本 1.0、campaign absent、writer off → ok。
+  const pre = OSM.osmDrainedPrecheck(ctx, { token: tok, env });
+  assert.equal(pre.ok, true, "前置 ok：" + JSON.stringify(pre));
+  assert.deepEqual(pre.frozen, [EP1], "冻结集 = 已初始化 endpoint");
+  assert.equal(pre.campaign, "absent"); assert.equal(pre.writer, "off");
+  // 反：加入 EP2 账本为 1.1-transition（campaign 未 open）→ not_at_1_0（rollbackSafe）。
+  mkLedger(EP2, "1.1-transition"); mkReceipt(EP2, r2);
+  const pre2 = OSM.osmDrainedPrecheck(ctx, { token: tok, env });
+  assert.equal(pre2.ok, false, "前置拒绝：" + JSON.stringify(pre2)); assert.equal(pre2.reason, "not_at_1_0", "reason：" + JSON.stringify(pre2)); assert.equal(pre2.rollbackSafe, true, "rollbackSafe");
+  fs.rmSync(b, { recursive: true, force: true });
 });
 
 summarySealed = true;

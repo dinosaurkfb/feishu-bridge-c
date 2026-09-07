@@ -1702,6 +1702,8 @@ export function fingerprintOf(opType, inputs) {
 
 /** 账本落盘字节（与 writeLedger 同一函数——plan 的 expected_ledger_sha256 必须用同一序列化重演算）。 */
 const serializeLedger = (doc) => Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8");
+export { serializeLedger };
+export const mintPlanBytes = (plan) => JSON.stringify(plan, null, 2) + "\n";
 
 // R52 §一：schema_upgrade 的 op key 确定性化——uuid化(sha256(canonKey({domain, token, endpoint})))，须过 OP_ID_SHAPE（8-4-4-4-12，13 位 4、17 位 8）。
 const operationIdFromSha = (hex) => { if (!/^[0-9a-f]{64}$/u.test(hex)) throw new Error("bad sha for operation id"); const s = hex.slice(0, 32); const v = s.slice(0, 12) + "4" + s.slice(13, 16) + "8" + s.slice(17, 32); return v.slice(0, 8) + "-" + v.slice(8, 12) + "-" + v.slice(12, 16) + "-" + v.slice(16, 20) + "-" + v.slice(20); };

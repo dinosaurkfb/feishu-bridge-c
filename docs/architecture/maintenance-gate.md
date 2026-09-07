@@ -234,6 +234,9 @@ rollback 记 `rolled_back`）。
 - **1.2**：必含 `operation_kind ∈ {maintenance_gate, maintenance_install, ledger_init,
   ledger_cutover}`；**禁 sidecar step**（读到 sidecar 即 unreadable）；
 - **1.3**：= 1.2 + `ledger_cutover` 的 sidecar step（仅此 kind 此用途）；
+- **1.4**（owner_select 迁移，`owner-select-route.md` §8.2）：= 1.3 + `operation_kind` 增 `owner_select_migration_a|b|direct`、
+  step kind 增 `campaign|schema_endpoint|mint|precheck|writer_state`（各 kind 允许集、恰一次计数、备份规则见 §8.2 表）；
+  **1.2/1.3 文档含任一新种即 unreadable**；1.4 读旧四种走既有分支、不放宽任何旧规则；
 - **未终结的 1.2 ledger_cutover 不得直接续跑成 1.3 cutover**（十轮 P2-2 展开）：
   旧 journal 处于 forward-only **之前**（≤drained）→ 按 1.2 矩阵安全回退；
   已进 forward-only / 现场已提交 → **fail-closed 人工处置**（绝不用 1.3 语义猜测续跑）；

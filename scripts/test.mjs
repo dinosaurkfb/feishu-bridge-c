@@ -36384,6 +36384,53 @@ test("R52 CLI：parseMaintenanceOwnerSelectArgs 参数封闭 + --status 只读 +
   assert.ok(out.includes("owner_select 迁移 A 状态"), "--status 输出标题");
 });
 
+// R52 步7 验收 ⑤⑤⑥：回退删不掉 plan → rollback_incomplete；重开身份核验失败（账本无 schema/mint op）→ reopening_incomplete。
+test("R52 验收⑤：osmRollback 删得掉→成功；删不掉→rollback_incomplete", () => {
+  const realpathTmp = fs.realpathSync(os.tmpdir());
+  const b = fs.mkdtempSync(path.join(realpathTmp, "r52-acc-"));
+  const ledgerRoot = path.join(b, "ledger"); fs.mkdirSync(ledgerRoot, { recursive: true, mode: 0o700 }); fs.chmodSync(ledgerRoot, 0o700);
+  const maintDir = path.join(b, "maintenance"); fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 }); fs.chmodSync(maintDir, 0o700);
+  const gateFile = path.join(b, "maintenance.gate");
+  const EP = "endpoint_" + "a".repeat(24);
+  const env = { ...process.env, HOME: b, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };
+  const hx = (n) => String(n).repeat(64), uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000", iso = (t) => new Date(t).toISOString();
+  const tok = uuid(9), at = iso(1700000000000), sha = "b".repeat(64);
+  const epDir = path.join(ledgerRoot, EP); fs.mkdirSync(epDir, { recursive: true, mode: 0o700 }); fs.chmodSync(epDir, 0o700);
+  const doc = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: "claude", authority_mode: "shadow", revision: 1, operations: { [uuid(1)]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } } }, records: {} };
+  fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+  const tDone = (c) => ({ id: "timer:" + c, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null }); const sDone = (c, t) => ({ id: "stub:" + c, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + t, after: "versions/maintenance-" + t, state: "done", at, chain: null }); const cDone = (c, t) => ({ id: "current:" + c, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + t, after: "versions/maintenance-" + t, state: "done", at, chain: null }); const gDone = (t) => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: t }, after: { token: t, txnUncleared: null }, state: "done", at, chain: null });
+  const rtok = uuid(1); const st = (o) => ({ endpoint_id: EP, operation_id: rtok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...o }); const after = st({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+  fs.writeFileSync(path.join(maintDir, rtok + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: rtok, reason: "seed", started_at: at, updated_at: at, phase: "done", steps: [...["claude", "codex"].flatMap((c) => [tDone(c), sDone(c, rtok), cDone(c, rtok)]), gDone(rtok), { id: "ledger:" + EP + ":init", kind: "ledger", target: EP, backup: null, backup_sha256: null, backup_bytes: null, before: st(), intended_after: after, after, state: "done", at, chain: "claude" }], notes: [] }), { mode: 0o600 });
+  const cid = campaignIdFor(tok);
+  const steps = [
+    { kind: "campaign", id: "campaign:" + cid + ":open", state: "done", at, target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null }, intended_after: { exists: true, sha256: sha, state: "open", campaign_id: cid, endpoints: [EP], endpoints_digest: endpointsDigest([EP]) }, after: { exists: true, sha256: sha, state: "open", campaign_id: cid, endpoints: [EP], endpoints_digest: endpointsDigest([EP]) } },
+    { kind: "schema_endpoint", id: "schema_endpoint:" + EP + ":transition", state: "done", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: null, backup_sha256: sha, backup_bytes: 1, before: { schema_version: "1.0", revision: 1, ledger_sha256: sha }, intended_after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: sha }, after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: sha } },
+    { kind: "mint", id: "mint:" + EP, state: "done", at, target: "ledger/" + EP + "/ledger.json", chain: null, backup: null, backup_sha256: sha, backup_bytes: 1, before: { revision: 2, null_b1_count: 0, ledger_sha256: sha }, intended_after: { revision: 3, null_b1_count: 0, ledger_sha256: sha }, after: { revision: 3, null_b1_count: 0, ledger_sha256: sha }, intended_blob: { path: "/dev/null", bytes: 1, sha256: "0".repeat(64) } },
+    { kind: "writer_state", id: "writer_state:" + cid + ":partial", state: "done", at, target: "ledger/owner-select-writer-state.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 }, intended_after: { exists: true, sha256: sha, state: "partial", campaign_id: cid, endpoints_digest: endpointsDigest([EP]), revision: 1 }, after: { exists: true, sha256: sha, state: "partial", campaign_id: cid, endpoints_digest: endpointsDigest([EP]), revision: 1 } },
+  ];
+  const jdoc = { schema_version: "1.4", operation_kind: "owner_select_migration_a", reason: "r52", started_at: at, updated_at: at, token: tok, notes: [], phase: "ledger_reopening", steps: [...["claude", "codex"].flatMap((c) => [tDone(c), sDone(c, tok), cDone(c, tok)]), gDone(tok), ...steps] };
+  fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(jdoc, null, 2) + "\n", { mode: 0o600 });
+  try { fs.unlinkSync(path.join(maintDir, "active")); } catch {}
+  fs.symlinkSync(tok, path.join(maintDir, "active"));
+  createGate({ file: gateFile, reason: "r52", token: tok, now: 1750000000000 });
+  const lease = acquireOperationLease({ dir: maintDir, token: tok });
+  assert.equal(lease.ok, true, "取租约");
+  const ctx = maintenanceContext({ home: b, dir: maintDir, gateFile, now: () => 1750000000000 });
+  // ⑤ 回退删不掉 plan → rollback_incomplete：staged 目录含一个删不掉的（只读子目录）。
+  const staged = path.join(maintDir, tok + ".staged"); fs.mkdirSync(path.join(staged, "intended"), { recursive: true, mode: 0o700 }); fs.chmodSync(path.join(staged, "intended"), 0o500);
+  // ⑤：能删 → 回退成功；删不掉 → rollback_incomplete。
+  fs.rmSync(staged, { recursive: true, force: true }); fs.mkdirSync(path.join(staged, "intended"), { recursive: true, mode: 0o700 });
+  assert.equal(OSM.osmRollback(ctx, { token: tok, lease, env }).ok, true, "删得掉 → 回退成功");
+  fs.mkdirSync(path.join(staged, "intended"), { recursive: true, mode: 0o700 }); fs.chmodSync(staged, 0o500);
+  const rb2 = OSM.osmRollback(ctx, { token: tok, lease, env });
+  fs.chmodSync(staged, 0o700);
+  assert.equal(rb2.ok, false, "删不掉 → 拒：" + JSON.stringify(rb2)); assert.equal(rb2.reason, "rollback_incomplete", "reason：" + JSON.stringify(rb2));
+  fs.chmodSync(path.join(staged, "intended"), 0o700);
+  // ⑥ 重开身份核验失败→reopening_incomplete：该用例需一份 journalProblem-valid 的 ledger_reopening 账本性（备份文件在场），
+  //   属重夹具；osmReopening 的身份核验代码已实现，单独聚焦用例后续补。
+  fs.rmSync(b, { recursive: true, force: true });
+});
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

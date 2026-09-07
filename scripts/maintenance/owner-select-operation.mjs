@@ -338,7 +338,7 @@ export function osmExit(ctx, { apply = false, env = process.env } = {}) {
 }
 
 // §二.7 回退（≤drained 才允许）：先删本 operation 的 <token>.staged/intended/mint-*.json；删不掉 → rollback_incomplete。
-function osmRollback(ctx, { token, lease, env = process.env }) {
+export function osmRollback(ctx, { token, lease, env = process.env }) {
   void lease; void env;
   const staged = path.join(ctx.dir, token + ".staged");
   try { fs.rmSync(staged, { recursive: true, force: true }); } catch (err) { return { ok: false, reason: "rollback_incomplete", why: "删 plan 失败：" + errText(err) }; }

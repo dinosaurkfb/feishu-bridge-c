@@ -25,13 +25,14 @@ import { readRegularFile } from "../installed-surface.mjs";
 import { acquireLockUngated, commitWhileHeld, releasePublishLock } from "../registry.mjs";
 import { canonKey } from "../topic-agent-ledger.mjs";
 import { dirFsyncIgnorable } from "./dir-fsync.mjs";
+import { isCanonicalIso } from "../canonical-time.mjs";
 import {
   campaignIdFor,
   endpointsDigest,
   CAMPAIGN_ID_SHAPE,
   CAMPAIGN_STATES,
   WRITER_STATES,
-} from "./owner-select-state.mjs";
+} from "./owner-select-derived.mjs";
 
 export const MAINTENANCE_DIR_ENV = "FEISHU_BRIDGE_MAINTENANCE_DIR";
 export const JOURNAL_SCHEMA = "1.2";
@@ -101,7 +102,6 @@ const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 const SHA_SHAPE = /^[0-9a-f]{64}$/u;
 /** current 只许指两种受控形状：正式版本 versions/<16 hex> 或维护桩 versions/maintenance-<uuid>（没有 . / .. / 多段的归一化歧义）。 */
 const REL_TARGET = /^versions\/([0-9a-f]{16}|maintenance-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/u;
-const isCanonicalIso = (s) => typeof s === "string" && !Number.isNaN(Date.parse(s)) && new Date(s).toISOString() === s;
 const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
 const keysOf = (o) => Object.keys(o).sort().join(",");
 const errCode = (err) => String(err?.code ?? err?.message ?? err);

@@ -372,6 +372,14 @@ function requiredStepIds(doc) {
       return [...ENTER_DONE, ...extra];
     }
   }
+  // R50 1.4（item 3）：owner_select 三迁移 kind —— forward 段⇐ENTER_DONE；重开族⇐ENTER_DONE∪段内全部新 step done。
+  if (doc.schema_version === OWNER_SELECT_JOURNAL_SCHEMA && NEW_OP_KINDS.includes(doc.operation_kind)) {
+    if (doc.phase === "osm_a_upgrading" || doc.phase === "osm_b_strictening" || doc.phase === "osm_direct") return ENTER_DONE;
+    if (doc.phase === "ledger_reopening" || doc.phase === "done" || doc.phase === "reopening_incomplete") {
+      const newIds = doc.steps.filter((s) => NEW_STEP_KINDS.includes(s.kind)).map((s) => s.id);
+      return [...ENTER_DONE, ...newIds];
+    }
+  }
   return PHASE_REQUIRES[doc.phase];
 }
 /**

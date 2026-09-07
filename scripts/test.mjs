@@ -34152,6 +34152,217 @@ test("R50 §一.1与§一.2 journal 1.4：常量、schema 分派与旧新封闭"
   }
 });
 
+test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰一次计数与阶段机", () => {
+  const tok = "00000000-0000-4000-8000-000000000001";
+  const cid = campaignIdFor(tok);
+  const ep = "endpoint_111111111111111111111111";
+  const now = "2026-09-07T10:00:00.000Z";
+  const sha = "a".repeat(64);
+  const shaB = "b".repeat(64);
+  const stagedPath = "/tmp/maint/" + tok + ".staged/backup.json";
+  const mintBlobPath = "/tmp/maint/" + tok + ".staged/intended/mint-" + ep + ".json";
+
+  const enterSteps = [
+    { kind: "timer", id: "timer:claude", state: "done", at: now, target: "timer", chain: "claude", before: "loaded", intended_after: "absent", after: "absent", backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "timer", id: "timer:codex", state: "done", at: now, target: "timer", chain: "codex", before: "loaded", intended_after: "absent", after: "absent", backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "stub", id: "stub:claude", state: "done", at: now, target: "stub", chain: "claude", before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "stub", id: "stub:codex", state: "done", at: now, target: "stub", chain: "codex", before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "current", id: "current:claude", state: "done", at: now, target: "current", chain: "claude", before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "current", id: "current:codex", state: "done", at: now, target: "current", chain: "codex", before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "gate", id: "gate", state: "done", at: now, target: "gate", chain: null, before: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, backup: null, backup_sha256: null, backup_bytes: null }
+  ];
+
+  // 1. 五种 step 形状单测
+  // 1a. campaign step
+  const mkCampaignStep = ({ state = "prepared", action = "open", beforeState = "absent", afterState = "open" } = {}) => ({
+    kind: "campaign",
+    id: `campaign:${cid}:${action}`,
+    state,
+    at: now,
+    target: "ledger/owner-select-campaign.json",
+    chain: null,
+    backup: beforeState === "absent" ? null : stagedPath,
+    backup_sha256: beforeState === "absent" ? null : sha,
+    backup_bytes: beforeState === "absent" ? null : 100,
+    before: beforeState === "absent"
+      ? { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null }
+      : { exists: true, sha256: sha, state: beforeState, campaign_id: cid, endpoints: [ep], endpoints_digest: endpointsDigest([ep]) },
+    intended_after: { exists: true, sha256: shaB, state: afterState, campaign_id: cid, endpoints: [ep], endpoints_digest: endpointsDigest([ep]) },
+    ...(state === "done" ? { after: { exists: true, sha256: shaB, state: afterState, campaign_id: cid, endpoints: [ep], endpoints_digest: endpointsDigest([ep]) } } : {})
+  });
+
+  // 1b. schema_endpoint step
+  const mkSchemaEndpointStep = ({ state = "prepared", subtype = "transition", from = "1.0", to = "1.1-transition", rev = 1 } = {}) => ({
+    kind: "schema_endpoint",
+    id: `schema_endpoint:${ep}:${subtype}`,
+    state,
+    at: now,
+    target: `ledger/${ep}/ledger.json`,
+    chain: null,
+    backup: stagedPath,
+    backup_sha256: sha,
+    backup_bytes: 100,
+    before: { schema_version: from, revision: rev, ledger_sha256: sha },
+    intended_after: { schema_version: to, revision: rev + 1, ledger_sha256: shaB },
+    ...(state === "done" ? { after: { schema_version: to, revision: rev + 1, ledger_sha256: shaB } } : {})
+  });
+
+  // 1c. mint step
+  const mkMintStep = ({ state = "prepared", rev = 2, nullB1 = 3 } = {}) => ({
+    kind: "mint",
+    id: `mint:${ep}`,
+    state,
+    at: now,
+    target: `ledger/${ep}/ledger.json`,
+    chain: null,
+    backup: stagedPath,
+    backup_sha256: sha,
+    backup_bytes: 100,
+    before: { revision: rev, null_b1_count: nullB1, ledger_sha256: sha },
+    intended_after: { revision: rev + 1, null_b1_count: 0, ledger_sha256: shaB },
+    intended_blob: { path: mintBlobPath, bytes: 50, sha256: sha },
+    ...(state === "done" ? { after: { revision: rev + 1, null_b1_count: 0, ledger_sha256: shaB } } : {})
+  });
+
+  // 1d. precheck step
+  const mkPrecheckStep = ({ state = "prepared", rev = 2, counts = 0 } = {}) => ({
+    kind: "precheck",
+    id: `precheck:${ep}`,
+    state,
+    at: now,
+    target: `ledger/${ep}/ledger.json`,
+    chain: null,
+    backup: null,
+    backup_sha256: null,
+    backup_bytes: null,
+    before: { revision: rev, legacy_proof_count: counts, null_b1_count: counts, ledger_sha256: sha },
+    intended_after: { revision: rev, legacy_proof_count: counts, null_b1_count: counts, ledger_sha256: sha },
+    ...(state === "done" ? { after: { revision: rev, legacy_proof_count: counts, null_b1_count: counts, ledger_sha256: sha } } : {})
+  });
+
+  // 1e. writer_state step
+  const mkWriterStateStep = ({ state = "prepared", subtype = "partial", beforeState = "off", afterState = "partial", rev = 1 } = {}) => ({
+    kind: "writer_state",
+    id: `writer_state:${cid}:${subtype}`,
+    state,
+    at: now,
+    target: "ledger/owner-select-writer-state.json",
+    chain: null,
+    backup: beforeState === "off" ? null : stagedPath,
+    backup_sha256: beforeState === "off" ? null : sha,
+    backup_bytes: beforeState === "off" ? null : 100,
+    before: beforeState === "off"
+      ? { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 }
+      : { exists: true, sha256: sha, state: beforeState, campaign_id: cid, endpoints_digest: endpointsDigest([ep]), revision: rev },
+    intended_after: { exists: true, sha256: shaB, state: afterState, campaign_id: cid, endpoints_digest: endpointsDigest([ep]), revision: rev + 1 },
+    ...(state === "done" ? { after: { exists: true, sha256: shaB, state: afterState, campaign_id: cid, endpoints_digest: endpointsDigest([ep]), revision: rev + 1 } } : {})
+  });
+
+  // 2. 组装合法的 Operation A / B / direct
+  const docA = {
+    schema_version: "1.4",
+    operation_kind: "owner_select_migration_a",
+    token: tok,
+    reason: "A upgrade",
+    started_at: now,
+    updated_at: now,
+    phase: "osm_a_upgrading",
+    notes: [],
+    steps: [
+      ...enterSteps,
+      mkCampaignStep({ action: "open", beforeState: "absent", afterState: "open" }),
+      mkSchemaEndpointStep({ subtype: "transition", from: "1.0", to: "1.1-transition", rev: 1 }),
+      mkMintStep({ rev: 2, nullB1: 2 }),
+      mkWriterStateStep({ subtype: "partial", beforeState: "off", afterState: "partial", rev: 0 })
+    ]
+  };
+
+  assert.equal(journalProblem(docA, { maintenanceDir: "/tmp/maint" }), null, "合法 operation A 在 osm_a_upgrading 阶段通过");
+
+  // 3. 禁异类 step (§一.4)
+  // 3a. 三新 kind 禁 ledger/sidecar/install 步
+  const badAWithSidecar = { ...docA, steps: [...docA.steps, { kind: "sidecar", id: "sidecar:policy:" + ep, state: "prepared", at: now, target: "ledger/" + ep + "/policy.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null }, intended_after: { exists: true, sha256: sha }, intended_blob: { path: "/p", bytes: 1, sha256: sha } }] };
+  assert.ok(journalProblem(badAWithSidecar) !== null, "A 禁 sidecar step");
+
+  // 3b. A 禁 precheck、strict、on
+  const badAWithPrecheck = { ...docA, steps: [...docA.steps, mkPrecheckStep()] };
+  assert.ok(journalProblem(badAWithPrecheck) !== null, "A 禁 precheck step");
+
+  // 4. Operation B 正反例
+  const docB = {
+    schema_version: "1.4",
+    operation_kind: "owner_select_migration_b",
+    token: tok,
+    reason: "B strict",
+    started_at: now,
+    updated_at: now,
+    phase: "osm_b_strictening",
+    notes: [],
+    steps: [
+      ...enterSteps,
+      mkCampaignStep({ action: "seal", beforeState: "open", afterState: "sealed" }),
+      mkPrecheckStep({ counts: 0 }),
+      mkSchemaEndpointStep({ subtype: "strict", from: "1.1-transition", to: "1.1", rev: 2 }),
+      mkCampaignStep({ action: "complete", beforeState: "sealed", afterState: "complete" }),
+      mkWriterStateStep({ subtype: "on", beforeState: "partial", afterState: "on", rev: 1 })
+    ]
+  };
+  assert.equal(journalProblem(docB, { maintenanceDir: "/tmp/maint" }), null, "合法 operation B 在 osm_b_strictening 阶段通过");
+
+  // B 禁 mint / open / partial
+  const badBWithMint = { ...docB, steps: [...docB.steps, mkMintStep()] };
+  assert.ok(journalProblem(badBWithMint) !== null, "B 禁 mint step");
+
+  // 5. Operation direct 正反例
+  const docDirect = {
+    schema_version: "1.4",
+    operation_kind: "owner_select_migration_direct",
+    token: tok,
+    reason: "direct upgrade",
+    started_at: now,
+    updated_at: now,
+    phase: "osm_direct",
+    notes: [],
+    steps: [
+      ...enterSteps,
+      mkCampaignStep({ action: "open", beforeState: "absent", afterState: "open" }),
+      mkPrecheckStep({ counts: 0 }),
+      mkSchemaEndpointStep({ subtype: "direct", from: "1.0", to: "1.1", rev: 1 }),
+      mkCampaignStep({ action: "seal", beforeState: "open", afterState: "sealed" }),
+      mkCampaignStep({ action: "complete", beforeState: "sealed", afterState: "complete" }),
+      mkWriterStateStep({ subtype: "on", beforeState: "partial", afterState: "on", rev: 1 })
+    ]
+  };
+  assert.equal(journalProblem(docDirect, { maintenanceDir: "/tmp/maint" }), null, "合法 operation direct 在 osm_direct 阶段通过");
+
+  // 6. 恰一次计数与阶段机 (§一.3 & §一.6)
+  // 6a. 进前向前 (planned..drained) 禁新 step
+  const badPlannedA = { ...docA, phase: "planned" };
+  assert.ok(journalProblem(badPlannedA) !== null, "planned 阶段禁新 step");
+
+  // 6b. 回退族禁新 step
+  const badRollbackA = { ...docA, phase: "rolling_back" };
+  assert.ok(journalProblem(badRollbackA) !== null, "rolling_back 阶段禁新 step");
+
+  // 6c. 重开族与 done 要求全部 done
+  const docADone = {
+    ...docA,
+    phase: "done",
+    steps: [
+      ...enterSteps,
+      mkCampaignStep({ state: "done", action: "open", beforeState: "absent", afterState: "open" }),
+      mkSchemaEndpointStep({ state: "done", subtype: "transition", from: "1.0", to: "1.1-transition", rev: 1 }),
+      mkMintStep({ state: "done", rev: 2, nullB1: 2 }),
+      mkWriterStateStep({ state: "done", subtype: "partial", beforeState: "off", afterState: "partial", rev: 0 })
+    ]
+  };
+  assert.equal(journalProblem(docADone, { maintenanceDir: "/tmp/maint" }), null, "全部 done 时 A done 阶段通过");
+
+  // 含有 prepared step 时 done 拒绝
+  const badDoneA = { ...docA, phase: "done" };
+  assert.ok(journalProblem(badDoneA) !== null, "含 prepared step 时 done 阶段拒绝");
+});
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

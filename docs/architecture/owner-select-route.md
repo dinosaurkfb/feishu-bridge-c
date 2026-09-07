@@ -496,8 +496,8 @@ migrate_repair**（合同冲突）；不批量/不后台；取不到 owner 动�
 ```
 raw → 去平台引用块 → 去 @mention（canonical mention removal）→ body
 assert body 匹配正则 ^/feishu-select(?: (osh_[0-9a-f]{32}|orh_[0-9a-f]{32}|rfh_[0-9a-f]{32}))?$
-  （单个 ASCII 空格分隔；无首尾空白；不做 Unicode 归一化后再匹配——归一化前即须恰合；
-   拒任何控制字符/多空格/换行/尾随内容/大小写变体）
+  （单个 ASCII 空格分隔；无首尾空白；**折叠规则与 /feishu-mode 同一份 `normalizeControlText`**：只折叠零宽/不换行空格/全角前缀
+   与空白，**不做其它 Unicode 归一化**（NFKC 等）——折叠后即须恰合；拒任何控制字符/换行/尾随内容/大小写变体；R52a 回带）
 不匹配 → 控制失败返回（不降回普通指令）
 匹配 → 整条只执行选择：不进主会话模型、不执行余下正文；入站路由器确定性处理
        （同 /feishu-mode 纪律）；owner 先验先于 handle 解析

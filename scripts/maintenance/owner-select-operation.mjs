@@ -335,6 +335,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           const w = writeCampaignState({ env, expectedSha256: cs.exists ? cs.sha256 : null, doc: rebuild.doc, capability: { token, stepId: st.id } });
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
           if (w.commit !== "committed") return { ok: false, reason: "commit_residue", phase, commit: w.commit, why: w.why ?? null };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点：写后读回前（返修一 ③）
           const after = readCampaignState(env);
           if (after.sha256 !== intended.sha256 || after.state !== "open") return { ok: false, reason: "written_mismatch", why: "campaign 写后读回 ≠ intended_after", phase };
         }

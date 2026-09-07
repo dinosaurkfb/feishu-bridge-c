@@ -36447,6 +36447,119 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
     }
   });
 
+  test("R52 返修一：mint commit_residue / schema written_mismatch / campaign 写后改 / 重开 3b 失败", () => {
+    // ── 1. mint 段 commit_residue：failDirFsync → committed_durability_uncertain → 停门、step 不记 done ──
+    {
+      const fx = r52Setup({ crashAfter: 11 }); // schema epB done 后崩溃（c 未开始）
+      try {
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true);
+        releaseOperationLease52({ path: path.join(fx.dir, readActive({ dir: fx.dir }).token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const tok = readActive({ dir: fx.dir }).token;
+        // 恢复 osmForward：c 步 mint 写注入 failDirFsync → durability_uncertain → commit_residue 停门
+        const r = osmForward52(fx.ctx, { token: tok, lease: acquireOperationLease({ dir: fx.dir, token: tok }), env: fx.env, _inject: { failDirFsync: true } });
+        assert.equal(r.ok, false, "mint 停门");
+        assert.equal(r.reason, "commit_residue", "commit_residue：" + JSON.stringify({ reason: r.reason, commit: r.commit }));
+        assert.equal(r.phase, "osm_a_upgrading", "phase 仍 osm_a_upgrading");
+        const jj = readJournal({ dir: fx.dir, token: tok });
+        const mintStep = jj.doc.steps.find((s) => s.kind === "mint");
+        assert.equal(mintStep.state, "prepared", "mint step 不记 done");
+        releaseOperationLease52({ path: path.join(fx.dir, tok + ".lease") }); // 停门返回后交还租约再恢复
+        // 二次恢复（无注入）→ 收敛 done
+        const r2 = osmExit52(fx.ctx, { apply: true, env: fx.env });
+        assert.ok(r2.ok && r2.phase === "done", "二次恢复收敛 done：" + JSON.stringify({ reason: r2.reason, phase: r2.phase }));
+      } finally { fx.cleanup(); }
+    }
+    // ── 2. schema 段 written_mismatch：恢复前篡改 journal 的 intended_after SHA → 执行器成功但读回 ≠ 进段锚 ──
+    {
+      const fx = r52Setup({ crashAfter: 10 }); // schema epA done 后崩溃（epB 未跑）
+      try {
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true);
+        releaseOperationLease52({ path: path.join(fx.dir, readActive({ dir: fx.dir }).token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const tok = readActive({ dir: fx.dir }).token;
+        // 篡改 journal：epB 的 schema step intended_after.ledger_sha256 → 错值（状态链闭合同步 mint.before/backup_sha256）
+        const jj = readJournal({ dir: fx.dir, token: tok });
+        const seB = jj.doc.steps.find((s) => s.id === "schema_endpoint:" + fx.eps[1] + ":transition");
+        seB.intended_after.ledger_sha256 = r52Sha("8");
+        const miB = jj.doc.steps.find((s) => s.id === "mint:" + fx.eps[1]);
+        miB.before.ledger_sha256 = r52Sha("8");
+        miB.backup_sha256 = r52Sha("8");
+        fs.writeFileSync(path.join(fx.dir, tok + ".json"), JSON.stringify(jj.doc, null, 2) + "\n", { mode: 0o600 });
+        const ex = osmExit52(fx.ctx, { apply: true, env: fx.env });
+        assert.equal(ex.ok, false, "written_mismatch 停门：" + JSON.stringify({ ok: ex.ok, reason: ex.reason, phase: ex.phase }));
+        assert.equal(ex.reason, "written_mismatch", "written_mismatch：" + JSON.stringify({ reason: ex.reason }));
+        assert.equal(ex.phase, "osm_a_upgrading", "phase 不变");
+        const jj2 = readJournal({ dir: fx.dir, token: tok });
+        assert.equal(jj2.doc.steps.find((s) => s.id === "schema_endpoint:" + fx.eps[1] + ":transition").state, "prepared", "epB schema step 不记 done");
+        // 修复（按现场重算锚：epB 账本已 transition，读回真 SHA；状态链闭合同步 mint.before/backup）→ 续跑 done
+        const shaReal = TAL.loadLedger(path.join(fx.ledgerRoot, fx.eps[1]), { endpointId: fx.eps[1] }).sha256;
+        const jj3 = readJournal({ dir: fx.dir, token: tok });
+        jj3.doc.steps.find((s) => s.id === "schema_endpoint:" + fx.eps[1] + ":transition").intended_after.ledger_sha256 = shaReal;
+        const mi3 = jj3.doc.steps.find((s) => s.id === "mint:" + fx.eps[1]);
+        mi3.before.ledger_sha256 = shaReal;
+        mi3.backup_sha256 = shaReal;
+        fs.writeFileSync(path.join(fx.dir, tok + ".json"), JSON.stringify(jj3.doc, null, 2) + "\n", { mode: 0o600 });
+        const ex2 = osmExit52(fx.ctx, { apply: true, env: fx.env });
+        assert.ok(ex2.ok && ex2.phase === "done", "修复后续跑 done：" + JSON.stringify({ reason: ex2.reason, phase: ex2.phase }));
+      } finally { fx.cleanup(); }
+    }
+    // ── 3. campaign a 段 written_mismatch：写后读回前文件被改（afterWrite 注入）→ 停门、step 不记 done ──
+    {
+      const fx = r52Setup({ crashAfter: 8 }); // 进段后崩溃（a 未跑）
+      try {
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true);
+        releaseOperationLease52({ path: path.join(fx.dir, readActive({ dir: fx.dir }).token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const tok = readActive({ dir: fx.dir }).token;
+        // 注入：campaign 写成功后、读回前追加字节（sha 漂移）
+        fx.ctx.afterWrite = (id) => {
+          if (id.startsWith("campaign:")) fs.appendFileSync(path.join(fx.ledgerRoot, "owner-select-campaign.json"), " ");
+        };
+        const r = osmForward52(fx.ctx, { token: tok, lease: acquireOperationLease({ dir: fx.dir, token: tok }), env: fx.env });
+        fx.ctx.afterWrite = null;
+        assert.equal(r.ok, false, "campaign 写后改停门：" + JSON.stringify({ ok: r.ok, reason: r.reason, phase: r.phase }));
+        assert.equal(r.reason, "written_mismatch", "written_mismatch：" + JSON.stringify({ reason: r.reason }));
+        const jj = readJournal({ dir: fx.dir, token: tok });
+        assert.equal(jj.doc.steps.find((s) => s.kind === "campaign").state, "prepared", "campaign step 不记 done");
+        releaseOperationLease52({ path: path.join(fx.dir, tok + ".lease") }); // 停门返回后交还租约再恢复
+        // 续跑：campaign 现场已被改（sha 漂移）→ a 段 budget 核会拒；还原现场为预算字节后续跑
+        // 写后被改的字节 = 预算 doc + " "；按 intended_after 重算 doc 不可能（成员依赖账本），此处直接
+        // 重建 open doc：读预算 impossible → 删除 campaign 文件回 absent → a 段重走 CAS 写（expectedSha256=null）
+        fs.rmSync(path.join(fx.ledgerRoot, "owner-select-campaign.json"), { force: true });
+        const ex = osmExit52(fx.ctx, { apply: true, env: fx.env });
+        assert.ok(ex.ok && ex.phase === "done", "续跑 done：" + JSON.stringify({ reason: ex.reason, phase: ex.phase, incomplete: ex.incomplete }));
+      } finally { fx.cleanup(); }
+    }
+    // ── 4. 重开 3b：staged 删不掉 → reopening_incomplete，恢复权限后 --exit 续跑 done ──
+    {
+      const fx = r52Setup({ crashAfter: 14 }); // writer partial done 后崩溃
+      try {
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true);
+        releaseOperationLease52({ path: path.join(fx.dir, readActive({ dir: fx.dir }).token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const tok = readActive({ dir: fx.dir }).token;
+        fs.chmodSync(path.join(fx.dir, tok + ".staged"), 0o500); // staged 目录不可写 → rmSync ENOTEMPTY
+        const ex = osmExit52(fx.ctx, { apply: true, env: fx.env });
+        assert.equal(ex.ok, false, "3b 失败拒");
+        assert.equal(ex.phase, "reopening_incomplete", "reopening_incomplete：" + JSON.stringify({ phase: ex.phase, incomplete: ex.incomplete }));
+        assert.equal(readGate({ file: fx.gateFile, now: Date.parse(T052) }).state, "active", "门保留");
+        assert.equal(readActive({ dir: fx.dir }).state, "active", "active 保留");
+        fs.chmodSync(path.join(fx.dir, tok + ".staged"), 0o700); // 恢复权限
+        const ex2 = osmExit52(fx.ctx, { apply: true, env: fx.env });
+        assert.ok(ex2.ok && ex2.phase === "done" && ex2.activeCleared === true, "恢复权限后续跑 done：" + JSON.stringify({ reason: ex2.reason, phase: ex2.phase, incomplete: ex2.incomplete }));
+      } finally { try { fs.chmodSync(path.join(fx.dir, readActive({ dir: fx.dir })?.token + ".staged"), 0o700); } catch { /* 已不在 */ } fx.cleanup(); }
+    }
+  });
+
   test("R52 ③-d 重演算核 / ④-c 账本非 1.0 前置（变异配套场景）", () => {
     // ③-d 重演算 SHA 核：其余全符、仅 expected_ledger_sha256 被换 → fail-closed
     {

@@ -34163,12 +34163,12 @@ test("R50 §一.3-§一.6 journal 1.4：五种新 step 形状、禁异类、恰�
   const mintBlobPath = "/tmp/maint/" + tok + ".staged/intended/mint-" + ep + ".json";
 
   const enterSteps = [
-    { kind: "timer", id: "timer:claude", state: "done", at: now, target: "timer", chain: "claude", before: "loaded", intended_after: "absent", after: "absent", backup: null, backup_sha256: null, backup_bytes: null },
-    { kind: "timer", id: "timer:codex", state: "done", at: now, target: "timer", chain: "codex", before: "loaded", intended_after: "absent", after: "absent", backup: null, backup_sha256: null, backup_bytes: null },
-    { kind: "stub", id: "stub:claude", state: "done", at: now, target: "stub", chain: "claude", before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
-    { kind: "stub", id: "stub:codex", state: "done", at: now, target: "stub", chain: "codex", before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
-    { kind: "current", id: "current:claude", state: "done", at: now, target: "current", chain: "claude", before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
-    { kind: "current", id: "current:codex", state: "done", at: now, target: "current", chain: "codex", before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "timer", id: "timer:claude", state: "done", at: now, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
+    { kind: "timer", id: "timer:codex", state: "done", at: now, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
+    { kind: "stub", id: "stub:claude", state: "done", at: now, target: "versions/x", chain: null, before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "stub", id: "stub:codex", state: "done", at: now, target: "stub", chain: null, before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "current", id: "current:claude", state: "done", at: now, target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
+    { kind: "current", id: "current:codex", state: "done", at: now, target: "versions/0123456789abcdef", chain: null, before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, backup: null, backup_sha256: null, backup_bytes: null },
     { kind: "gate", id: "gate", state: "done", at: now, target: "gate", chain: null, before: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, backup: null, backup_sha256: null, backup_bytes: null }
   ];
 

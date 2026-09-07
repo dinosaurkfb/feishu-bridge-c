@@ -516,7 +516,7 @@ function opTouchedIds(op) {
     case "create_a1":
     case "create_b1": return r.created_id == null ? (Array.isArray(r.affected_live_ids_after_commit) ? r.affected_live_ids_after_commit : []) : [r.created_id];
     case "seed": return Array.isArray(r.seeded_ids) ? r.seeded_ids : [];
-    case "activate": return [r.surviving_id, r.tombstoned_id, r.demoted_historical_id ?? r.demoted_current_id].filter((x) => x != null);
+    case "activate": return [r.surviving_id, r.tombstoned_id, r.demoted_historical_id].filter((x) => x != null);
     case "void": return r.voided_id == null ? [] : [r.voided_id];
     case "attach_a2":
     case "attach_a3":
@@ -667,15 +667,14 @@ const RESULT_SHAPE = Object.freeze({
         && Array.isArray(r.proof_effects) && r.proof_effects.length === 0),
   seed: (r) => keysOf(r) === "seeded_ids" && idArraySortedMaybeEmpty(r.seeded_ids),
   activate: (r) => {
-    const demoted = ("demoted_historical_id" in r) ? r.demoted_historical_id : r.demoted_current_id;
     if (keysOf(r) === "demoted_historical_id,surviving_id,tombstoned_id") {
       return isId(r.surviving_id) && isId(r.tombstoned_id) && (r.demoted_historical_id === null || isId(r.demoted_historical_id)) && allDistinct(r.surviving_id, r.tombstoned_id, r.demoted_historical_id);
     }
-    const hasHist = keysOf(r) === "affected_live_ids_after_commit,authorized_at,authorized_by,demoted_historical_id,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id,surviving_id,tombstoned_id";
-    const hasCurr = keysOf(r) === "affected_live_ids_after_commit,authorized_at,authorized_by,demoted_current_id,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id,surviving_id,tombstoned_id";
-    if (!hasHist && !hasCurr) return false;
-    return isId(r.surviving_id) && isId(r.tombstoned_id) && (demoted === null || isId(demoted))
-      && allDistinct(r.surviving_id, r.tombstoned_id, demoted)
+    if (keysOf(r) !== "affected_live_ids_after_commit,authorized_at,authorized_by,demoted_historical_id,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id,surviving_id,tombstoned_id") {
+      return false;
+    }
+    return isId(r.surviving_id) && isId(r.tombstoned_id) && (r.demoted_historical_id === null || isId(r.demoted_historical_id))
+      && allDistinct(r.surviving_id, r.tombstoned_id, r.demoted_historical_id)
       && ANY_HANDLE_SHAPE.test(r.selection_handle) && isCanonicalIso(r.authorized_at) && AUTHORIZED_BY_SHAPE.test(r.authorized_by)
       && AILY_SESSION_SHAPE.test(r.selected_session_id) && OM_SHAPE.test(r.selected_root_om) && isOperationId(r.selection_operation_id)
       && typeof r.selection_message_id === "string" && typeof r.selection_basis === "string"
@@ -818,8 +817,8 @@ function opConsistentWithRecord(op, id, rec) {
     case "seed": return rec.kind === "live" && r.seeded_ids.includes(id); // seed 插入的族由 liveProblem 已校
     case "activate":
       if (r.surviving_id === id) return rec.kind === "live" && fam === "B3";
-      if (r.tombstoned_id === id || r.tombstoned_a1_id === id) return rec.kind === "forwarding_tombstone" && rec.forwards_to === r.surviving_id;
-      if (r.demoted_historical_id === id || r.demoted_current_id === id) return rec.kind === "live" && fam === "B4";
+      if (r.tombstoned_id === id) return rec.kind === "forwarding_tombstone" && rec.forwards_to === r.surviving_id;
+      if (r.demoted_historical_id === id) return rec.kind === "live" && fam === "B4";
       return false;
     case "void": return rec.kind === "voided_audit" && r.voided_id === id;
     case "attach_a2": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === "A2";
@@ -1155,7 +1154,7 @@ export function validateLedger(doc, { endpointId } = {}) {
     const r = op.result;
     if (!r?.proof_effects) return bad(id + "：owner_select_merge_v1 tombstone origin op 必为增量形状（G13-tomb）");
     if (op.op_type === "activate") {
-      if (r.tombstoned_id !== id && r.tombstoned_a1_id !== id) return bad(id + "：activate 未点名该 tombstone id（G13-tomb）");
+      if (r.tombstoned_id !== id) return bad(id + "：activate 未点名该 tombstone id（G13-tomb）");
       if (rec.forwards_to !== r.surviving_id) return bad(id + "：tombstone forwards_to 不等于 activate surviving_id（G13-tomb）");
       if (rec.proof_ref.selected_root_om !== r.selected_root_om || rec.proof_ref.selection_handle !== r.selection_handle) return bad(id + "：tombstone proof_ref 与 activate result 不一致（G13-tomb）");
       if (rec.proof_ref.selection_operation_id !== rec.origin_operation_id) return bad(id + "：tombstone selection_operation_id 不等于 origin_operation_id（G13-tomb）");

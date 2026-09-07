@@ -32874,6 +32874,62 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
 
   // ── 8. Operations result 增量及封闭键集 ──
   {
+    // P2-1：activate result 键名收敛，删 demoted_current_id，只认基线名 demoted_historical_id
+    const dActBadCurr = mkBaseDoc("1.1");
+    dActBadCurr.revision = 2;
+    dActBadCurr.operations[opId1] = {
+      op_type: "activate",
+      terminal_kind: "activate",
+      request_key: "rk_act_bad_curr",
+      fingerprint: "a".repeat(64),
+      result_revision: 2,
+      result: {
+        surviving_id: taId1,
+        tombstoned_id: taId2,
+        demoted_current_id: null,
+        authorized_by: "ou_owner1",
+        authorized_at: ISO,
+        selected_session_id: "00000000-0000-4000-8000-000000000001",
+        selected_root_om: "om_root1",
+        selection_handle: hOSH1,
+        selection_operation_id: opId1,
+        selection_message_id: "om_msg1",
+        selection_basis: "explicit_handle",
+        affected_live_ids_after_commit: [taId1],
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "produced", link_effect: "produced" }]
+      }
+    };
+    dActBadCurr.records[taId1] = {
+      kind: "live",
+      topic_agent_id: taId1,
+      chat_id: "oc_chat1",
+      created_at: ISO,
+      updated_at: ISO,
+      origin_operation_id: opId1,
+      facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+      aliases: { session_id: "00000000-0000-4000-8000-000000000001", root_om: "om_root1" },
+      binding_target: TGT,
+      binding_proof: { kind: "owner_select_v1", authorized_by: "ou_owner1", authorized_at: ISO, selected_session_id: "00000000-0000-4000-8000-000000000001", selected_root_om: "om_root1", selection_handle: hOSH1, selection_operation_id: opId1 },
+      locator_link_proof_ref: { kind: "owner_selected_route_v1", by_identity: "owner_authorization", authorized_by: "ou_owner1", authorized_at: ISO, selected_session_id: "00000000-0000-4000-8000-000000000001", selected_root_om: "om_root1", selection_handle: hOSH1, selection_operation_id: opId1 },
+      generation_lineage_id: "lin_1",
+      anchor_candidate: null,
+      selection_handle: null,
+      handle_expires_at: null,
+      rebind_handle: null,
+      rebind_expires_at: null
+    };
+    dActBadCurr.records[taId2] = {
+      kind: "forwarding_tombstone",
+      topic_agent_id: taId2,
+      forwards_to: taId1,
+      merged_at: ISO,
+      origin_operation_id: opId1,
+      proof_ref: { kind: "owner_select_merge_v1", selected_root_om: "om_root1", selection_handle: hOSH1, selection_operation_id: opId1 }
+    };
+    const vActCurr = TAL.validateLedger(dActBadCurr, { endpointId: EP });
+    assert.equal(vActCurr.ok, false, "activate 带 demoted_current_id 必须判定非法");
+    assert.match(String(vActCurr.why), /activate result 形状不对/u, "理由包含 activate result 形状不对");
+
     // mint_selection_handles 复合 op
     const dMint = mkBaseDoc("1.1-transition");
     dMint.revision = 2;

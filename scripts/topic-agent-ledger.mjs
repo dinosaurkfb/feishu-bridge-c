@@ -21,7 +21,7 @@ import path from "node:path";
 import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhileHeld } from "./registry.mjs";
 import { isCanonicalIso, canonicalIso, isCanonicalMs } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "./claim.mjs";
-import { JOURNAL_SCHEMA, OPERATION_KINDS, journalProblem, leaseHolder, leasePath, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
+import { JOURNAL_SCHEMA, OWNER_SELECT_JOURNAL_SCHEMA, OPERATION_KINDS, journalProblem, leaseHolder, leasePath, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
 import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { maintenanceGatePath, readGate } from "./maintenance-gate-core.mjs";
 
@@ -2123,7 +2123,7 @@ function _migrationVerifier(capability, endpointId, opType, env = process.env) {
   if (active.token !== token) return fail("operation_token_mismatch", "active 指向的 token 与 capability 不一致");
   const j = readJournal({ dir: maintDir, token });
   if (j.state !== "valid") return fail("journal_unreadable", "journal " + j.state + (j.why ? "：" + j.why : ""));
-  if (j.doc.schema_version !== JOURNAL_SCHEMA) return fail("journal_schema", "journal 不是 " + JOURNAL_SCHEMA);
+  if (j.doc.schema_version !== OWNER_SELECT_JOURNAL_SCHEMA) return fail("journal_schema", "journal 不是 " + OWNER_SELECT_JOURNAL_SCHEMA);
   const isSchema = opType === "schema_upgrade";
   const allowedKinds = isSchema
     ? ["owner_select_migration_a", "owner_select_migration_direct", "owner_select_migration_b"]

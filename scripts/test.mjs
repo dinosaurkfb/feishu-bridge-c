@@ -229,6 +229,7 @@ import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as 
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
 import { osmEnter as osmEnter52, osmExit as osmExit52, osmForward as osmForward52, removeMintPlans as removeMintPlans52, OSM_HANDLE_TTL_MS, mintPlanBytes as mintPlanBytes52 } from "./maintenance/owner-select-operation.mjs";
+import * as MOS from "./maintenance-owner-select.mjs";
 import { releaseOperationLease as releaseOperationLease52 } from "./maintenance/journal.mjs";
 import { installSurfaceLockPath } from "./install-surface-lock.mjs";
 import { acquireOperationLease, addNote as addNoteJ, addStepPrepared as addStepPreparedJ, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, enterLedgerForward, isLedgerReceipt, journalProblem, readActive, readJournal, releaseOperationLease, setPhase as setPhaseJ, updateJournal, CUTOVER_JOURNAL_SCHEMA, OWNER_SELECT_JOURNAL_SCHEMA, OPERATION_KINDS as JOURNAL_OPERATION_KINDS, STEP_KINDS as JOURNAL_STEP_KINDS, PHASES as JOURNAL_PHASES, FORWARD_ONLY_PHASES as JOURNAL_FORWARD_ONLY_PHASES, SIDECAR_NAMES, legacy12CutoverDisposition, stagedIntendedFile } from "./maintenance/journal.mjs";
@@ -36535,6 +36536,44 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
       const ex2 = osmExit52(fx.ctx, { apply: true, env: fx.env });
       assert.ok(ex2.ok && ex2.phase === "done" && ex2.activeCleared === true, "修复后续跑 done：" + JSON.stringify({ reason: ex2.reason, incomplete: ex2.incomplete }));
     } finally { fx.cleanup(); }
+  });
+
+  test("R52 ⑦' CLI：参数封闭、退出码映射、预览与坏参数", () => {
+    // 参数封闭
+    assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--status", "--apply"]).ok, false, "--status 不带别的参数");
+    assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--migrate-a"]).ok, false, "动作重复拒");
+    assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--apply", "--apply"]).ok, false, "--apply 重复拒");
+    assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--wait-ms", "x"]).ok, false, "--wait-ms 非整数拒");
+    assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--endpoint", "endpoint_" + "a".repeat(24)]).ok, false, "不认识的参数拒");
+    assert.equal(MOS.parseMaintenanceOwnerSelectArgs([]).ok, false, "空参数拒");
+    assert.deepEqual([MOS.parseMaintenanceOwnerSelectArgs(["--status"]).ok, MOS.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--apply"]).ok], [true, true], "合法形状");
+    // 退出码映射（纯函数，不跑编排）
+    assert.equal(MOS.exitCodeFor({ ok: true }), 0, "完成 0");
+    assert.equal(MOS.exitCodeFor({ ok: false, reason: "frozen_set_empty", rollback: { ok: true } }), 1, "回退清场 1");
+    assert.equal(MOS.exitCodeFor({ ok: false, reason: "precheck_failed", phase: "osm_a_upgrading" }), 3, "forward 卡住 3");
+    assert.equal(MOS.exitCodeFor({ ok: false, phase: "reopening_incomplete" }), 3, "重开没做完 3");
+    assert.equal(MOS.exitCodeFor({ ok: false, reason: "x", rollback: { ok: false, phase: "rolling_back" } }), 3, "回退没做全 3");
+    assert.equal(MOS.exitCodeFor({ ok: true, leaseRelease: { path: "/p" } }), 3, "租约交不还 3");
+    // runMaintenanceOwnerSelect：预览 0、坏参数 1（ctx 传 null 走 maintenanceContext，用空 argv 免真机）
+    let outBuf = [];
+    const code = MOS.runMaintenanceOwnerSelect(["--bad-flag"], { ctx: null, out: (s) => outBuf.push(s), env: { ...process.env } });
+    assert.equal(code, 1, "坏参数 exit 1");
+    // --status 只读投影 + --migrate-a 预览零改动（走真夹具 ctx）
+    {
+      const fx = r52Setup({});
+      try {
+        const out2 = [];
+        const s1 = MOS.runMaintenanceOwnerSelect(["--status"], { ctx: fx.ctx, out: (s) => out2.push(s), env: fx.env });
+        assert.equal(s1, 0, "--status exit 0");
+        assert.ok(out2.join("\n").includes("冻结集"), "--status 打印冻结集");
+        const out3 = [];
+        const s2 = MOS.runMaintenanceOwnerSelect(["--migrate-a"], { ctx: fx.ctx, out: (s) => out3.push(s), env: fx.env });
+        assert.equal(s2, 0, "预览 exit 0");
+        assert.ok(out3.join("\n").includes("[预览]"), "预览输出");
+        assert.equal(readGate({ file: fx.gateFile, now: Date.parse(T052) }).state, "absent", "预览零改动：无门");
+        assert.equal(fs.existsSync(path.join(fx.ledgerRoot, fx.eps[0], "owner-select-campaign.json")), false, "预览零改动：无 campaign 文件");
+      } finally { fx.cleanup(); }
+    }
   });
 }
 

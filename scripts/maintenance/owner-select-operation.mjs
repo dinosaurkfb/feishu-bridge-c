@@ -137,13 +137,13 @@ export function osmEnterForward(ctx, { token, lease, env = process.env } = {}) {
     : camp; // open（恢复场景）
   const campDoc = { schema_version: CAMPAIGN_SCHEMA, state: "open", campaign_id: cid, endpoints: frz.endpoints, endpoints_digest: endpointsDigest(frz.endpoints) };
   const campAfter = { exists: true, sha256: sha256(serializeLedger(campDoc)), state: "open", campaign_id: cid, endpoints: frz.endpoints, endpoints_digest: endpointsDigest(frz.endpoints) };
-  const campBackup = campBefore.exists === true ? stagedBackupOf(ctx, token) : null;
+  const campBackup = campBefore.exists === true ? stagedBackup(ctx, token, "campaign") : null;
   const writer = readWriterState(env);
   if (writer.state === "unreadable") return fail("writer_unreadable", writer.problem ?? null);
   const writerBefore = writer.state === "off" ? { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 } : writer;
   const writerDoc = { schema_version: WRITER_STATE_SCHEMA, state: "partial", campaign_id: cid, endpoints_digest: endpointsDigest(frz.endpoints), revision: writerBefore.exists === true ? writerBefore.revision + 1 : 1 };
   const writerAfter = { exists: true, sha256: sha256(serializeLedger(writerDoc)), state: "partial", campaign_id: cid, endpoints_digest: endpointsDigest(frz.endpoints), revision: writerDoc.revision };
-  const writerBackup = writerBefore.exists === true ? stagedBackupOf(ctx, token) : null;
+  const writerBackup = writerBefore.exists === true ? stagedBackup(ctx, token, "writer-state") : null;
   const stagedDir = path.join(ctx.dir, token + ".staged"); fs.mkdirSync(path.join(stagedDir, "intended"), { recursive: true, mode: 0o700 });
   const ats = new Date(ctx.now()).toISOString();
   const steps = [
@@ -160,12 +160,14 @@ export function osmEnterForward(ctx, { token, lease, env = process.env } = {}) {
     const inv = migrationInventory(budgeted);
     const plan = pre.plans[ep];
     const planBytes = mintPlanBytes(plan);
-    const backup = stagedBackupOf(ctx, token);
-    const ledgerBackup = backup; // 账本备份到 staged（sha === before.ledger_sha256）
-    fs.writeFileSync(ledgerBackup, fs.readFileSync(path.join(d.dir, "ledger.json")), { mode: 0o600 });
+    // #2：schema/mint 各自独立备份文件（内容含其 before 状态），避免互相覆盖。
+    const schemaBuf = fs.readFileSync(path.join(d.dir, "ledger.json"));
+    const schemaBackup = stagedBackup(ctx, token, ep + "-ledger"); fs.writeFileSync(schemaBackup, schemaBuf, { mode: 0o600 });
+    const mintBuf = serializeLedger(budgeted);
+    const mintBackup = stagedBackup(ctx, token, ep + "-mint-before"); fs.writeFileSync(mintBackup, mintBuf, { mode: 0o600 });
     const mintSha = sha256(serializeLedger(applyMintPlan(budgeted, plan)));
-    steps.push({ kind: "schema_endpoint", id: "schema_endpoint:" + ep + ":transition", state: "prepared", at: ats, target: "ledger/" + ep + "/ledger.json", chain: null, backup: ledgerBackup, backup_sha256: L.sha256, backup_bytes: Buffer.byteLength(fs.readFileSync(path.join(d.dir, "ledger.json"))), before: { schema_version: "1.0", revision: L.doc.revision, ledger_sha256: L.sha256 }, intended_after: { schema_version: "1.1-transition", revision: L.doc.revision + 1, ledger_sha256: budgetedSha } });
-    steps.push({ kind: "mint", id: "mint:" + ep, state: "prepared", at: ats, target: "ledger/" + ep + "/ledger.json", chain: null, backup: ledgerBackup, backup_sha256: budgetedSha, backup_bytes: Buffer.byteLength(fs.readFileSync(path.join(d.dir, "ledger.json"))), before: { revision: L.doc.revision + 1, null_b1_count: inv.null_b1_count, ledger_sha256: budgetedSha }, intended_after: { revision: L.doc.revision + 2, null_b1_count: 0, ledger_sha256: mintSha }, intended_blob: { path: path.join(stagedDir, "intended", "mint-" + ep + ".json"), bytes: Buffer.byteLength(planBytes), sha256: sha256(Buffer.from(planBytes, "utf-8")) } });
+    steps.push({ kind: "schema_endpoint", id: "schema_endpoint:" + ep + ":transition", state: "prepared", at: ats, target: "ledger/" + ep + "/ledger.json", chain: null, backup: schemaBackup, backup_sha256: sha256(schemaBuf), backup_bytes: schemaBuf.length, before: { schema_version: "1.0", revision: L.doc.revision, ledger_sha256: L.sha256 }, intended_after: { schema_version: "1.1-transition", revision: L.doc.revision + 1, ledger_sha256: budgetedSha } });
+    steps.push({ kind: "mint", id: "mint:" + ep, state: "prepared", at: ats, target: "ledger/" + ep + "/ledger.json", chain: null, backup: mintBackup, backup_sha256: sha256(mintBuf), backup_bytes: mintBuf.length, before: { revision: L.doc.revision + 1, null_b1_count: inv.null_b1_count, ledger_sha256: budgetedSha }, intended_after: { revision: L.doc.revision + 2, null_b1_count: 0, ledger_sha256: mintSha }, intended_blob: { path: path.join(stagedDir, "intended", "mint-" + ep + ".json"), bytes: Buffer.byteLength(planBytes), sha256: sha256(Buffer.from(planBytes, "utf-8")) } });
   }
   const r = updateJournal({ dir: ctx.dir, token, lease, expectPhase: "drained", now: ctx.now(), mutate: (d) => { d.phase = "osm_a_upgrading"; d.steps = [...d.steps, ...steps]; return d; } });
   if (!r.ok) return fail(r.reason, r.why ?? null);
@@ -178,7 +180,7 @@ export function osmEnterForward(ctx, { token, lease, env = process.env } = {}) {
 }
 
 // 备份路径（<token>.staged/backup.json）。
-function stagedBackupOf(ctx, token) { return path.join(ctx.dir, token + ".staged", "backup.json"); }
+function stagedBackup(ctx, token, name) { return path.join(ctx.dir, token + ".staged", "backup-" + name + ".json"); }
 
 // §二.5 forward 收敛（可重入；崩溃恢复只看 journal + 现场；handle 不重生成）：
 //   a campaign open → b 每 ep schemaUpgrade → c 每 ep 读 plan（intended_blob 回读）→ mintSelectionHandles → d writer_state partial → e setPhase(ledger_reopening)。
@@ -239,15 +241,11 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         raw = JSON.parse(buf.toString("utf-8"));
       } catch (err) { return fail("blob_unreadable", ep + "：" + errText(err)); }
       if (mintPlanProblem(raw) !== null) return fail("plan_invalid", ep + "：" + mintPlanProblem(raw));
-      if (!_inject || !_inject.usePlan) {
-        const d = resolveEndpointDir(ep, { env }); const L = loadLedger(d.dir, { endpointId: ep });
-        if (L.ok && L.doc.schema_version === "1.1-transition" && L.sha256 === raw.before_ledger_sha256) {
-          // 现场已等于 before：正常 mint。
-          const w = mintSelectionHandles({ endpointId: ep, capability: { kind: "mint_selection_handles", token, endpointId: ep, request_key: token }, plan: raw, env, _inject });
-          if (!w.ok) return fail(w.reason, w.why ?? null, w.commit ?? "not_committed", { lockUncleared: w.lockUncleared ?? null });
-          if (w.commit !== "committed_clean" && w.commit !== "already") return fail("commit_residue", w.why ?? null, w.commit, { residue: w.residue ?? null, lockUncleared: w.lockUncleared ?? null });
-        }
-      }
+      // 三态由 mintSelectionHandles 内部判（before→apply / expected→already / 其它→ledger_diverged）；
+      // 只在其返回 committed_clean/already 才 markStepDone；ledger_diverged → 停门待修（不记 done）。
+      const w = mintSelectionHandles({ endpointId: ep, capability: { kind: "mint_selection_handles", token, endpointId: ep, request_key: token }, plan: raw, env, _inject });
+      if (!w.ok) return fail(w.reason, w.why ?? null, w.commit ?? "not_committed", { lockUncleared: w.lockUncleared ?? null });
+      if (w.commit !== "committed_clean" && w.commit !== "already") return fail("commit_residue", w.why ?? null, w.commit, { residue: w.residue ?? null, lockUncleared: w.lockUncleared ?? null });
     }
     const m = markStepDone({ dir: ctx.dir, token, lease, id: mStep.id, after: mStep.intended_after, now: ctx.now() });
     if (!m.ok) return fail(m.reason, m.why ?? null);

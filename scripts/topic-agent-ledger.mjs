@@ -699,9 +699,10 @@ const RESULT_SHAPE = Object.freeze({
   },
   void: (r) => keysOf(r) === "voided_id" && isId(r.voided_id),
   attach_a2: (r) => (keysOf(r) === "affected_id,terminal_family" && isId(r.affected_id) && r.terminal_family === "A2")
-    || (keysOf(r) === "affected_id,affected_live_ids_after_commit,handle_expires_at,proof_effects,selection_handle,terminal_family"
+    || (keysOf(r) === "affected_id,affected_live_ids_after_commit,anchor_candidate,handle_expires_at,proof_effects,selection_handle,terminal_family"
         && isId(r.affected_id) && r.terminal_family === "A2"
         && ((r.selection_handle === null && r.handle_expires_at === null) || (SELECTION_HANDLE_SHAPE.test(r.selection_handle) && isCanonicalIso(r.handle_expires_at)))
+        && OM_SHAPE.test(r.anchor_candidate)
         && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.affected_id
         && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_id && r.proof_effects[0].binding_effect === "produced" && r.proof_effects[0].link_effect === "none"),
   attach_a3: (r) => (keysOf(r) === "affected_id,terminal_family" && isId(r.affected_id) && r.terminal_family === "A3")
@@ -749,7 +750,9 @@ const RESULT_SHAPE = Object.freeze({
     && [r.bijection_digest, r.pre_cutover_ledger_sha, r.expiry_sha256, r.pending_claims_sha256, r.policy_sha256].every((v) => typeof v === "string" && SHA_SHAPE.test(v)),
   mint_selection_handles: (r) => keysOf(r) === "affected_live_ids_after_commit,endpoint,minted,proof_effects"
     && typeof r.endpoint === "string" && ENDPOINT_SHAPE.test(r.endpoint)
-    && Array.isArray(r.minted) && r.minted.every((m, i) => isObj(m) && isId(m.target_id) && SELECTION_HANDLE_SHAPE.test(m.selection_handle) && isCanonicalIso(m.handle_expires_at) && (i === 0 || r.minted[i - 1].target_id < m.target_id))
+    && Array.isArray(r.minted) && r.minted.every((m, i) => isObj(m) && isId(m.target_id) && SELECTION_HANDLE_SHAPE.test(m.selection_handle) && isCanonicalIso(m.handle_expires_at)
+        && (keysOf(m) === "handle_expires_at,selection_handle,target_id" || (keysOf(m) === "anchor_candidate,handle_expires_at,selection_handle,target_id" && OM_SHAPE.test(m.anchor_candidate)))
+        && (i === 0 || r.minted[i - 1].target_id < m.target_id))
     && canonKey(r.affected_live_ids_after_commit) === canonKey(r.minted.map((m) => m.target_id))
     && Array.isArray(r.proof_effects) && r.proof_effects.length === 0,
   clear_anchor_handle: (r) => keysOf(r) === "affected_live_ids_after_commit,cleared,proof_effects"
@@ -847,7 +850,8 @@ function opConsistentWithRecord(op, id, rec) {
       if (r.demoted_historical_id === id) return rec.kind === "live" && fam === "B4";
       return false;
     case "void": return rec.kind === "voided_audit" && r.voided_id === id;
-    case "attach_a2": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === "A2";
+    case "attach_a2": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === "A2"
+      && (r.anchor_candidate === undefined || r.anchor_candidate === rec.anchor_candidate);
     case "attach_a3": case "anchor": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === "A3";
     case "restore": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === "B3";
     case "unbind": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && fam === r.terminal_family;
@@ -858,9 +862,18 @@ function opConsistentWithRecord(op, id, rec) {
       return rec.binding_proof !== null && rec.binding_proof.kind === "retarget" && canonKey(rec.binding_proof.new_target) === canonKey(r.new_target) && canonKey(rec.binding_proof.old_target) === canonKey(r.old_target);
     }
     case "rebind_session_alias": return rec.kind === "live" && (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) && rec.aliases.session_id === r.new_session_id; // G13：仅改别名，target/proof 不动
-    case "mint_selection_handles": return rec.kind === "live" && fam === "B1" && Array.isArray(r.minted) && r.minted.some((m) => m.target_id === id);
+    case "mint_selection_handles": {
+      if (rec.kind !== "live") return false;
+      if (!Array.isArray(r.minted)) return false;
+      const m = r.minted.find((x) => x.target_id === id);
+      if (!m) return false;
+      if (fam === "B1") return true;
+      if (fam === "A2") return m.anchor_candidate === rec.anchor_candidate;
+      return false;
+    }
     case "clear_anchor_handle": return rec.kind === "live" && fam === "A2" && r.affected_live_ids_after_commit?.includes(id);
-    case "reissue_selection_handle": return rec.kind === "live" && (fam === "B1" || fam === "A2") && r.affected_live_ids_after_commit?.includes(id);
+    case "reissue_selection_handle": return rec.kind === "live" && (fam === "B1" || fam === "A2") && r.affected_live_ids_after_commit?.includes(id)
+      && (r.anchor_candidate === undefined || r.anchor_candidate === rec.anchor_candidate);
     case "request_rebind":
     case "expire_rebind_handle":
     case "cancel_rebind": return rec.kind === "live" && fam === "B3" && r.affected_live_ids_after_commit?.includes(id);
@@ -1283,6 +1296,7 @@ export function validateLedger(doc, { endpointId } = {}) {
   }
 
   for (const [id, rec] of live) {
+    const fam = familyOf(rec.facts);
     if (rec.selection_handle !== null && rec.selection_handle !== undefined) {
       // 产生 op 集 = {create_b1, mint_selection_handles, attach_a2, reissue_selection_handle}
       const prodOps = Object.entries(doc.operations).filter(([, op]) => {
@@ -1306,10 +1320,16 @@ export function validateLedger(doc, { endpointId } = {}) {
         if (pr.selection_handle !== rec.selection_handle || pr.handle_expires_at !== rec.handle_expires_at) {
           return bad(id + "：selection_handle 与产生 op result 逐字不符 (G-handle)");
         }
+        if (prodOp.op_type === "attach_a2" && pr.anchor_candidate !== undefined && pr.anchor_candidate !== rec.anchor_candidate) {
+          return bad(id + "：anchor_candidate 与产生 op result 逐字不符 (G-handle)");
+        }
       } else if (prodOp.op_type === "mint_selection_handles") {
         const item = pr.minted?.find((m) => m.target_id === id);
         if (!item || item.selection_handle !== rec.selection_handle || item.handle_expires_at !== rec.handle_expires_at) {
           return bad(id + "：selection_handle 与产生 op result 逐字不符 (G-handle)");
+        }
+        if (fam === "A2" && item.anchor_candidate !== rec.anchor_candidate) {
+          return bad(id + "：anchor_candidate 与产生 op result 逐字不符 (G-handle)");
         }
       } else if (prodOp.op_type === "reissue_selection_handle") {
         if (pr.new_handle !== rec.selection_handle || pr.new_expires_at !== rec.handle_expires_at) {

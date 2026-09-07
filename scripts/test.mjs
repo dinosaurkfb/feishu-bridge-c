@@ -32864,6 +32864,111 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
       }
     };
     assert.equal(TAL.validateLedger(dRebNoOpId, { endpointId: EP }).ok, false, "rebind_session_alias 缺 selection_operation_id 必拒");
+
+    // ── P1-3 返修：A2 记录/result/mint 候选一致性闭环（四处补齐与漂移红测试）──
+
+    // 1. attach_a2 增量 result 缺 anchor_candidate → 拒
+    const dAttachNoCand = mkBaseDoc("1.1");
+    dAttachNoCand.revision = 2;
+    dAttachNoCand.operations[opId1] = {
+      op_type: "attach_a2",
+      terminal_kind: "attach_a2",
+      request_key: "rk_att_nocand",
+      fingerprint: "3".repeat(64),
+      result_revision: 2,
+      result: {
+        affected_id: taId1,
+        affected_live_ids_after_commit: [taId1],
+        handle_expires_at: ISO,
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "produced", link_effect: "none" }],
+        selection_handle: hOSH1,
+        terminal_family: "A2"
+      }
+    };
+    dAttachNoCand.records[taId1] = {
+      kind: "live", topic_agent_id: taId1, chat_id: "oc_chat1", created_at: ISO, updated_at: ISO, origin_operation_id: opId1,
+      facts: { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" },
+      aliases: { session_id: "00000000-0000-4000-8000-000000000001", root_om: null }, binding_target: TGT,
+      binding_proof: { kind: "attach", authorized_by: "ou_owner1", authorized_at: ISO, claim_key: "c".repeat(64) },
+      locator_link_proof_ref: null, generation_lineage_id: null,
+      anchor_candidate: "om_cand1", selection_handle: hOSH1, handle_expires_at: ISO, rebind_handle: null, rebind_expires_at: null
+    };
+    assert.equal(TAL.validateLedger(dAttachNoCand, { endpointId: EP }).ok, false, "attach_a2 增量 result 缺 anchor_candidate 必拒");
+
+    // 2. A2 记录 anchor_candidate 与 attach_a2 origin op result 漂移 → 拒
+    const dAttachCandDrift = structuredClone(dAttachNoCand);
+    dAttachCandDrift.operations[opId1].result.anchor_candidate = "om_candOp";
+    dAttachCandDrift.records[taId1].anchor_candidate = "om_candRec";
+    assert.equal(TAL.validateLedger(dAttachCandDrift, { endpointId: EP }).ok, false, "A2 记录与 attach_a2 origin op 候选漂移必拒");
+
+    // 3. A2 记录 anchor_candidate 与 reissue_selection_handle 漂移 → 拒
+    const dReissueCandDrift = mkBaseDoc("1.1");
+    dReissueCandDrift.revision = 3;
+    dReissueCandDrift.operations[opId1] = {
+      op_type: "attach_a2",
+      terminal_kind: "attach_a2",
+      request_key: "rk_att_base",
+      fingerprint: "4".repeat(64),
+      result_revision: 2,
+      result: {
+        affected_id: taId1,
+        affected_live_ids_after_commit: [taId1],
+        anchor_candidate: "om_candOrig",
+        handle_expires_at: ISO,
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "produced", link_effect: "none" }],
+        selection_handle: hOSH1,
+        terminal_family: "A2"
+      }
+    };
+    dReissueCandDrift.operations[opId2] = {
+      op_type: "reissue_selection_handle",
+      terminal_kind: "reissue_selection_handle",
+      request_key: "rk_reis_a2",
+      fingerprint: "5".repeat(64),
+      result_revision: 3,
+      result: {
+        affected_live_ids_after_commit: [taId1],
+        anchor_candidate: "om_candReissueDrift",
+        new_expires_at: ISO,
+        new_handle: hOSH2,
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "preserved", link_effect: "none" }]
+      }
+    };
+    dReissueCandDrift.records[taId1] = {
+      kind: "live", topic_agent_id: taId1, chat_id: "oc_chat1", created_at: ISO, updated_at: ISO, origin_operation_id: opId2,
+      facts: { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" },
+      aliases: { session_id: "00000000-0000-4000-8000-000000000001", root_om: null }, binding_target: TGT,
+      binding_proof: { kind: "attach", authorized_by: "ou_owner1", authorized_at: ISO, claim_key: "c".repeat(64) },
+      locator_link_proof_ref: null, generation_lineage_id: null,
+      anchor_candidate: "om_candOrig", selection_handle: hOSH2, handle_expires_at: ISO, rebind_handle: null, rebind_expires_at: null
+    };
+    assert.equal(TAL.validateLedger(dReissueCandDrift, { endpointId: EP }).ok, false, "A2 记录与 reissue_selection_handle 候选漂移必拒");
+
+    // 4. A2 记录 anchor_candidate 与 mint_selection_handles 漂移 → 拒
+    const dMintCandDrift = mkBaseDoc("1.1");
+    dMintCandDrift.revision = 2;
+    dMintCandDrift.operations[opId1] = {
+      op_type: "mint_selection_handles",
+      terminal_kind: "mint_selection_handles",
+      request_key: "rk_mint_a2",
+      fingerprint: "6".repeat(64),
+      result_revision: 2,
+      result: {
+        endpoint: EP,
+        minted: [{ target_id: taId1, selection_handle: hOSH1, handle_expires_at: ISO, anchor_candidate: "om_candMint" }],
+        affected_live_ids_after_commit: [taId1],
+        proof_effects: []
+      }
+    };
+    dMintCandDrift.records[taId1] = {
+      kind: "live", topic_agent_id: taId1, chat_id: "oc_chat1", created_at: ISO, updated_at: ISO, origin_operation_id: opId1,
+      facts: { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" },
+      aliases: { session_id: "00000000-0000-4000-8000-000000000001", root_om: null }, binding_target: TGT,
+      binding_proof: { kind: "attach", authorized_by: "ou_owner1", authorized_at: ISO, claim_key: "c".repeat(64) },
+      locator_link_proof_ref: null, generation_lineage_id: null,
+      anchor_candidate: "om_candRecDrift", selection_handle: hOSH1, handle_expires_at: ISO, rebind_handle: null, rebind_expires_at: null
+    };
+    assert.equal(TAL.validateLedger(dMintCandDrift, { endpointId: EP }).ok, false, "A2 记录与 mint_selection_handles 候选漂移必拒");
   }
 
   // ── 6. G15′ 校验（1.1 strict 拒旧形 ∧ handle 前缀绑定）──

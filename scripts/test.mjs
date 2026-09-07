@@ -32007,6 +32007,7 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
   const CH = "claude";
   const ISO = "2026-09-08T00:00:00.000Z";
   const TGT = { runtime: "claude", project_root: "/path/to/project", claude_session_id: "00000000-0000-4000-8000-000000000001" };
+  const TGT2 = { runtime: "claude", project_root: "/path/to/project", claude_session_id: "00000000-0000-4000-8000-000000000002" };
   const hOSH1 = "osh_" + "1".repeat(32);
   const hOSH2 = "osh_" + "2".repeat(32);
   const hORH1 = "orh_" + "3".repeat(32);
@@ -32495,6 +32496,7 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
         selected_session_id: "00000000-0000-4000-8000-000000000002",
         selection_basis: "rebind",
         selection_handle: hORH1,
+        selection_operation_id: opIdReb,
         selection_message_id: "om_msg1",
         tombstoned_a1_id: null,
         proof_effects: [{ topic_agent_id: taId1, binding_effect: "preserved", link_effect: "produced" }]
@@ -32768,6 +32770,100 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
     const vTomb = TAL.validateLedger(dProbeTomb, { endpointId: EP });
     assert.equal(vTomb.ok, false, "owner_select_merge_v1 tombstone 基线 activate 必拒");
     assert.match(String(vTomb.why), /G13-tomb/u, "tombstone reason 含 G13-tomb");
+
+    // ── P1-2 返修：逐 op 精确 proof_effects 公式 + none 绕过拦截 + activate affected 等式 + rebind 补 selection_operation_id ──
+
+    // 1. owner_select B3 记录但 origin op 将 binding_effect 写成 "none" → 拒
+    const dNoneBinding = mkBaseDoc("1.1");
+    dNoneBinding.revision = 2;
+    dNoneBinding.operations[opId1] = {
+      op_type: "activate",
+      terminal_kind: "activate",
+      request_key: "rk_none_b",
+      fingerprint: "1".repeat(64),
+      result_revision: 2,
+      result: {
+        surviving_id: taId1, tombstoned_id: taId2, demoted_historical_id: null,
+        authorized_by: "ou_owner1", authorized_at: ISO,
+        selected_session_id: "sess_1", selected_root_om: "om_root1",
+        selection_handle: hOSH1, selection_operation_id: opId1, selection_message_id: "om_msg1", selection_basis: "explicit_handle",
+        affected_live_ids_after_commit: [taId1],
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "none", link_effect: "produced" }]
+      }
+    };
+    dNoneBinding.records[taId1] = {
+      kind: "live", topic_agent_id: taId1, chat_id: "oc_chat1", created_at: ISO, updated_at: ISO, origin_operation_id: opId1,
+      facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+      aliases: { session_id: "sess_1", root_om: "om_root1" }, binding_target: TGT,
+      binding_proof: { kind: "owner_select_v1", authorized_by: "ou_owner1", authorized_at: ISO, selected_session_id: "sess_1", selected_root_om: "om_root1", selection_handle: hOSH1, selection_operation_id: opId1 },
+      locator_link_proof_ref: { kind: "owner_selected_route_v1", by_identity: "owner_authorization", authorized_by: "ou_owner1", authorized_at: ISO, selected_session_id: "sess_1", selected_root_om: "om_root1", selection_handle: hOSH1, selection_operation_id: opId1 },
+      generation_lineage_id: "lin_1", anchor_candidate: null, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null
+    };
+    dNoneBinding.records[taId2] = {
+      kind: "forwarding_tombstone", topic_agent_id: taId2, forwards_to: taId1, merged_at: ISO, origin_operation_id: opId1,
+      proof_ref: { kind: "owner_select_merge_v1", selected_root_om: "om_root1", selection_handle: hOSH1, selection_operation_id: opId1 }
+    };
+    assert.equal(TAL.validateLedger(dNoneBinding, { endpointId: EP }).ok, false, "owner_select B3 binding_effect 为 none 必拒");
+
+    // 2. owner_selected_route_v1 记录但 origin op (retarget) 将 link_effect 写成 "none" → 拒 (G13′)
+    const dNoneLink = mkBaseDoc("1.1");
+    dNoneLink.revision = 2;
+    dNoneLink.operations[opId1] = {
+      op_type: "retarget",
+      terminal_kind: "retarget",
+      request_key: "rk_ret_none_link",
+      fingerprint: "1".repeat(64),
+      result_revision: 2,
+      result: {
+        affected_ids: [taId1],
+        affected_live_ids_after_commit: [taId1],
+        new_target: TGT2,
+        old_target: TGT,
+        unit: "record",
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "produced", link_effect: "none" }]
+      }
+    };
+    dNoneLink.records[taId1] = {
+      kind: "live", topic_agent_id: taId1, chat_id: "oc_chat1", created_at: ISO, updated_at: ISO, origin_operation_id: opId1,
+      facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+      aliases: { session_id: "sess_1", root_om: "om_root1" }, binding_target: TGT2,
+      binding_proof: { kind: "retarget", authorized_by: "ou_owner1", authorized_at: ISO, new_target: TGT2, old_target: TGT },
+      locator_link_proof_ref: { kind: "owner_selected_route_v1", by_identity: "owner_authorization", authorized_by: "ou_owner1", authorized_at: ISO, selected_session_id: "sess_1", selected_root_om: "om_root1", selection_handle: hOSH1, selection_operation_id: opIdInit },
+      generation_lineage_id: "lin_1", anchor_candidate: null, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null
+    };
+    const vNoneLink = TAL.validateLedger(dNoneLink, { endpointId: EP });
+    assert.equal(vNoneLink.ok, false, "owner_select B3 link_effect 为 none 必拒");
+    assert.match(String(vNoneLink.why), /带 owner_selected_route_v1 link proof 记录的 link_effect 不得为 none/u);
+
+    // 3. activate demoted_historical_id 非 null 时 affected_live_ids_after_commit 漏 demoted_id → 拒
+    const dActAffMiss = structuredClone(dNoneBinding);
+    dActAffMiss.revision = 2;
+    dActAffMiss.operations[opId1].result.demoted_historical_id = "ta_00000000000000000000000000000003";
+    dActAffMiss.operations[opId1].result.proof_effects = [
+      { topic_agent_id: taId1, binding_effect: "produced", link_effect: "produced" },
+      { topic_agent_id: "ta_00000000000000000000000000000003", binding_effect: "preserved", link_effect: "preserved" }
+    ];
+    dActAffMiss.operations[opId1].result.affected_live_ids_after_commit = [taId1]; // 漏 demoted_historical_id
+    assert.equal(TAL.validateLedger(dActAffMiss, { endpointId: EP }).ok, false, "activate affected 集漏 demoted_historical_id 必拒");
+
+    // 4. rebind_session_alias 增量 result 缺 selection_operation_id → 拒
+    const dRebNoOpId = mkBaseDoc("1.1");
+    dRebNoOpId.revision = 2;
+    dRebNoOpId.operations[opId1] = {
+      op_type: "rebind_session_alias",
+      terminal_kind: "rebind_session_alias",
+      request_key: "rk_reb_noop",
+      fingerprint: "2".repeat(64),
+      result_revision: 2,
+      result: {
+        affected_id: taId1, affected_live_ids_after_commit: [taId1], authorized_at: ISO, authorized_by: "ou_owner1",
+        old_session_id: "00000000-0000-4000-8000-000000000001", new_session_id: "00000000-0000-4000-8000-000000000002",
+        selected_root_om: "om_root1", selected_session_id: "00000000-0000-4000-8000-000000000002",
+        selection_basis: "rebind", selection_handle: hORH1, selection_message_id: "om_msg1", tombstoned_a1_id: null,
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "preserved", link_effect: "produced" }]
+      }
+    };
+    assert.equal(TAL.validateLedger(dRebNoOpId, { endpointId: EP }).ok, false, "rebind_session_alias 缺 selection_operation_id 必拒");
   }
 
   // ── 6. G15′ 校验（1.1 strict 拒旧形 ∧ handle 前缀绑定）──

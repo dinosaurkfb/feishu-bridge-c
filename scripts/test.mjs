@@ -32566,6 +32566,123 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
     dGhostProd.records[taId1].binding_proof.selection_operation_id = "00000000-0000-4000-8000-999999999999";
     dGhostProd.records[taId1].locator_link_proof_ref.selection_operation_id = "00000000-0000-4000-8000-999999999999";
     assert.match(String(TAL.validateLedger(dGhostProd, { endpointId: EP }).why), /G13′/u, "G13′ preserved 虚假产生 op 拒");
+
+    // P1-2：带 owner_select proof 的记录，其 origin op 必带 proof_effects 且含本记录项（防 fail-open）
+    const ghost = "00000000-0000-4000-8000-999999999999";
+    for (const sv of ["1.1-transition", "1.1"]) {
+      // 探针一：origin op 为基线形状 unbind（无 proof_effects）+ ghost 产生 op → 必拒
+      const dProbeUnbind = mkBaseDoc(sv);
+      dProbeUnbind.revision = 2;
+      dProbeUnbind.operations[opId1] = {
+        op_type: "unbind",
+        terminal_kind: "unbind",
+        request_key: "rk_u_failopen_" + sv,
+        fingerprint: "c".repeat(64),
+        result_revision: 2,
+        result: { affected_id: taId1, terminal_family: "B3'" }
+      };
+      dProbeUnbind.records[taId1] = {
+        kind: "live",
+        topic_agent_id: taId1,
+        chat_id: "oc_chat1",
+        created_at: ISO,
+        updated_at: ISO,
+        origin_operation_id: opId1,
+        facts: { binding: "dormant", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+        aliases: { session_id: "sess_1", root_om: "om_root1" },
+        binding_target: TGT,
+        binding_proof: { kind: "owner_select_v1", authorized_by: "ou_owner1", authorized_at: ISO, selected_session_id: "sess_1", selected_root_om: "om_root1", selection_handle: hOSH1, selection_operation_id: ghost },
+        locator_link_proof_ref: { kind: "owner_selected_route_v1", by_identity: "owner_authorization", authorized_by: "ou_owner1", authorized_at: ISO, selected_session_id: "sess_1", selected_root_om: "om_root1", selection_handle: hOSH1, selection_operation_id: ghost },
+        generation_lineage_id: "lin_1",
+        anchor_candidate: null,
+        selection_handle: null,
+        handle_expires_at: null,
+        rebind_handle: null,
+        rebind_expires_at: null
+      };
+      const vUnbind = TAL.validateLedger(dProbeUnbind, { endpointId: EP });
+      assert.equal(vUnbind.ok, false, sv + " origin 为基线 unbind 拒");
+      assert.match(String(vUnbind.why), /G13′/u, sv + " reason 含 G13′");
+
+      // 探针二：activate op 用基线三键 result + 记录带 owner_select 双 proof → 必拒
+      const dProbeAct = mkBaseDoc(sv);
+      dProbeAct.revision = 2;
+      dProbeAct.operations[opId1] = {
+        op_type: "activate",
+        terminal_kind: "activate",
+        request_key: "rk_act_failopen_" + sv,
+        fingerprint: "a".repeat(64),
+        result_revision: 2,
+        result: { demoted_historical_id: null, surviving_id: taId1, tombstoned_id: taId2 }
+      };
+      dProbeAct.records[taId1] = structuredClone(dProbeUnbind.records[taId1]);
+      dProbeAct.records[taId1].origin_operation_id = opId1;
+      dProbeAct.records[taId1].facts.binding = "active";
+      dProbeAct.records[taId2] = {
+        kind: "forwarding_tombstone",
+        topic_agent_id: taId2,
+        forwards_to: taId1,
+        merged_at: ISO,
+        origin_operation_id: opId1,
+        proof_ref: sv === "1.1"
+          ? { kind: "owner_select_merge_v1", selected_root_om: "om_root1", selection_handle: hOSH1, selection_operation_id: opId1 }
+          : { kind: "pairing", matched_fields: ["chat_id", "sender", "body", "thread_root"], om: "om_root1", pending_token_state: "present" }
+      };
+      const vAct = TAL.validateLedger(dProbeAct, { endpointId: EP });
+      assert.equal(vAct.ok, false, sv + " 基线三键 activate + owner_select 记录必拒");
+      assert.match(String(vAct.why), /G13/u, sv + " reason 含 G13");
+    }
+
+    // 探针三：tombstone proof_ref=owner_select_merge_v1 时其 origin op 为基线形状 → 必拒
+    const opIdMigT = "00000000-0000-4000-8000-000000000088";
+    const dProbeTomb = mkBaseDoc("1.1");
+    dProbeTomb.revision = 3;
+    dProbeTomb.operations[opIdMigT] = {
+      op_type: "migrate_seed",
+      terminal_kind: "migrate_seed",
+      request_key: "rk_mig_t",
+      fingerprint: "1".repeat(64),
+      result_revision: 2,
+      result: { authorized_by: "ou_owner1", authorized_at: ISO, seeded: [{ topic_agent_id: taId1, legacy_source_digest: "d".repeat(64) }] }
+    };
+    dProbeTomb.operations[opId1] = {
+      op_type: "activate",
+      terminal_kind: "activate",
+      request_key: "rk_act_tomb",
+      fingerprint: "a".repeat(64),
+      result_revision: 3,
+      result: { demoted_historical_id: null, surviving_id: taId1, tombstoned_id: taId2 }
+    };
+    dProbeTomb.records[taId1] = {
+      kind: "live",
+      topic_agent_id: taId1,
+      chat_id: "oc_chat1",
+      created_at: ISO,
+      updated_at: ISO,
+      origin_operation_id: opId1,
+      facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+      aliases: { session_id: "sess_1", root_om: "om_root1" },
+      binding_target: TGT,
+      binding_proof: { kind: "migrated", authorized_by: "ou_owner1", authorized_at: ISO, migration_operation_id: opIdMigT, legacy_source_digest: "d".repeat(64) },
+      locator_link_proof_ref: { kind: "migrated", migration_operation_id: opIdMigT, legacy_source_digest: "d".repeat(64) },
+      generation_lineage_id: "lin_1",
+      anchor_candidate: null,
+      selection_handle: null,
+      handle_expires_at: null,
+      rebind_handle: null,
+      rebind_expires_at: null
+    };
+    dProbeTomb.records[taId2] = {
+      kind: "forwarding_tombstone",
+      topic_agent_id: taId2,
+      forwards_to: taId1,
+      merged_at: ISO,
+      origin_operation_id: opId1,
+      proof_ref: { kind: "owner_select_merge_v1", selected_root_om: "om_root1", selection_handle: hOSH1, selection_operation_id: opId1 }
+    };
+    const vTomb = TAL.validateLedger(dProbeTomb, { endpointId: EP });
+    assert.equal(vTomb.ok, false, "owner_select_merge_v1 tombstone 基线 activate 必拒");
+    assert.match(String(vTomb.why), /G13-tomb/u, "tombstone reason 含 G13-tomb");
   }
 
   // ── 6. G15′ 校验（1.1 strict 拒旧形 ∧ handle 前缀绑定）──

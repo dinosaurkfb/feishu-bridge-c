@@ -557,7 +557,10 @@ function proofCombinationProblem(rec, id, doc) {
   if (rec.facts.binding === "pending" || rec.facts.binding === "none") {
     if (bpKind === "owner_select_v1" || lpKind === "owner_selected_route_v1") return "owner_select proof 禁现于 A1/B1";
   }
-  if (bpKind === "migrated" && lpKind !== "migrated" && lpKind !== "owner_selected_route_v1") return "binding=migrated 必须 pair link∈{migrated,owner_selected_route_v1}";
+  if (bpKind === "migrated" && lpKind !== "migrated") {
+    if (doc.schema_version === "1.0") return "binding=migrated 必须 pair link=migrated";
+    if (lpKind !== "owner_selected_route_v1") return "binding=migrated 必须 pair link∈{migrated,owner_selected_route_v1}";
+  }
   if (lpKind === "migrated") {
     if (bpKind !== "migrated" && bpKind !== "retarget" && bpKind !== "attach") return "link=migrated 的 binding 只能是 migrated/retarget/attach(A3/A4 继承)";
     if (bpKind === "attach") {
@@ -1048,12 +1051,19 @@ export function validateLedger(doc, { endpointId } = {}) {
   // G13′ (§7.2)：由来源 op result 的 proof_effects 中本记录那一项判 produced/preserved
   for (const [id, rec] of live) {
     const origOp = doc.operations[rec.origin_operation_id];
+    const bp = rec.binding_proof;
+    const lp = rec.locator_link_proof_ref;
+    const hasOwnerSelect = bp?.kind === "owner_select_v1" || lp?.kind === "owner_selected_route_v1";
+
+    if (hasOwnerSelect && (doc.schema_version === "1.1-transition" || doc.schema_version === "1.1")) {
+      if (!origOp?.result?.proof_effects || !Array.isArray(origOp.result.proof_effects) || !origOp.result.proof_effects.some((p) => p.topic_agent_id === id)) {
+        return bad(id + "：带 owner_select proof 的记录，其 origin op 必带 proof_effects 且含本记录项（G13′）");
+      }
+    }
+
     if (!origOp?.result?.proof_effects) continue; // 基线 1.0 op 无 proof_effects，跳过
     const pe = origOp.result.proof_effects.find((p) => p.topic_agent_id === id);
     if (!pe) continue;
-
-    const bp = rec.binding_proof;
-    const lp = rec.locator_link_proof_ref;
 
     // link_effect
     if (pe.link_effect === "produced") {
@@ -1143,6 +1153,7 @@ export function validateLedger(doc, { endpointId } = {}) {
     if (!op) return bad(id + "：tombstone origin_operation_id 不在 operations（G13-tomb）");
     if (!["activate", "rebind_session_alias", "owner_select_reaffirm"].includes(op.op_type)) return bad(id + "：tombstone origin op_type 不在受控集合（G13-tomb）");
     const r = op.result;
+    if (!r?.proof_effects) return bad(id + "：owner_select_merge_v1 tombstone origin op 必为增量形状（G13-tomb）");
     if (op.op_type === "activate") {
       if (r.tombstoned_id !== id && r.tombstoned_a1_id !== id) return bad(id + "：activate 未点名该 tombstone id（G13-tomb）");
       if (rec.forwards_to !== r.surviving_id) return bad(id + "：tombstone forwards_to 不等于 activate surviving_id（G13-tomb）");

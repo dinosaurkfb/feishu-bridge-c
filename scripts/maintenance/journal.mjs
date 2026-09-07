@@ -1040,7 +1040,8 @@ export function createOperation({ dir, reason, operationKind = "maintenance_gate
   if (!lease.ok) return { ok: false, reason: lease.reason, why: lease.why, path: lease.path };
   const at = new Date(now).toISOString();
   // M1b T4 ①：cutover operation 从 1.3 起记账（sidecar step + plan_sha256）；其余种照旧 1.2。
-  const doc = { schema_version: operationKind === "ledger_cutover" ? CUTOVER_JOURNAL_SCHEMA : JOURNAL_SCHEMA, operation_kind: operationKind, token, reason, started_at: at, updated_at: at, phase: "planned", steps: [], notes: [] };
+  // R52：schema_version 按 kind 分派——三新种从 1.4 起记账（journalProblem 的 1.4 专属判别支），ledger_cutover 从 1.3，其余 1.2。
+  const doc = { schema_version: OWNER_SELECT_OPERATION_KINDS.includes(operationKind) ? OWNER_SELECT_JOURNAL_SCHEMA : operationKind === "ledger_cutover" ? CUTOVER_JOURNAL_SCHEMA : JOURNAL_SCHEMA, operation_kind: operationKind, token, reason, started_at: at, updated_at: at, phase: "planned", steps: [], notes: [] };
   const problem = journalProblem(doc, { maintenanceDir: dir });
   if (problem !== null) { releaseOperationLease(lease); return { ok: false, reason: "journal_shape", why: problem }; }
   try { writeDurable(journalPath(dir, token), JSON.stringify(doc, null, 2) + "\n"); } catch (err) { releaseOperationLease(lease); return { ok: false, reason: "io_error", why: "写 journal：" + errCode(err) }; }

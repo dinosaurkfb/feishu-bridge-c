@@ -6,7 +6,7 @@ import path from "node:path";
 import { acquireInstallSurfaceLock } from "../install-surface-lock.mjs";
 import { releaseOperationLease, readActive, readJournal, acquireOperationLease } from "./journal.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
-import { updateJournal, journalProblem, markStepDone, setPhase } from "./journal.mjs";
+import { updateJournal, journalProblem, markStepDone, setPhase, clearActive, addNote } from "./journal.mjs";
 import { aggregateEndpointReceipts, endpointReceipt } from "./ledger-receipt.mjs";
 import { campaignIdFor, endpointsDigest } from "./owner-select-derived.mjs";
 import { readCampaignState, readWriterState, writeCampaignState, writeWriterState, readCampaignDocVerified, readWriterStateDocVerified, CAMPAIGN_SCHEMA, WRITER_STATE_SCHEMA } from "./owner-select-state.mjs";
@@ -273,6 +273,76 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
   const np = setPhase({ dir: ctx.dir, token, lease, phase: "ledger_reopening", expectPhase: "osm_a_upgrading", now: ctx.now() });
   if (!np.ok) return fail(np.reason, np.why ?? null);
   return { ok: true, phase: "ledger_reopening" };
+}
+
+// §二.6 重开（owner_select 专门版，不涉 runtime current/timer/stub）：
+//   ① 身份核验（每 ep 账本含本 token 的 schema_upgrade(≤request_key token:":schema") 与 mint(request_key token) op 且 revision ≥）；campaign/writer 读回 === step after；
+//   ② 删 <token>.staged/（含 mint plan）→ 撤门 → done → 清 active；失败 → reopening_incomplete（门与 active 保留）。
+export function osmReopening(ctx, { token, lease, env = process.env } = {}) {
+  const fail = (reason, why, extra = {}) => ({ ok: false, reason, why: why ?? null, phase: "reopening_incomplete", journalWrite: true, ...extra });
+  const j = readJournal({ dir: ctx.dir, token });
+  if (j.state !== "valid") return fail("journal_" + j.state, j.why ?? null);
+  if (j.doc.phase !== "ledger_reopening") return fail("not_reopening", "phase " + j.doc.phase);
+  const incomplete = [];
+  const note = (t) => addNote({ dir: ctx.dir, token, lease, note: t, now: ctx.now() });
+  const frz = frozenEndpoints(ctx.dir);
+  // ① 身份核验：每 ep 账本含本 op 的 schema_upgrade + mint。
+  for (const ep of (frz.ok ? frz.endpoints : [])) {
+    const d = resolveEndpointDir(ep, { env });
+    if (!d.ok) { incomplete.push({ id: "ledger:" + ep, why: "账本根无法定位" }); continue; }
+    const L = loadLedger(d.dir, { endpointId: ep });
+    if (!L.ok) { incomplete.push({ id: "ledger:" + ep, why: "账本缺失/不可读" }); continue; }
+    const schemas = Object.values(L.doc.operations).filter((o) => o.op_type === "schema_upgrade" && (o.request_key === token + ":schema" || o.request_key === token));
+    const mints = Object.values(L.doc.operations).filter((o) => o.op_type === "mint_selection_handles" && o.request_key === token);
+    if (schemas.length !== 1) incomplete.push({ id: "schema:" + ep, why: "账本缺/多 schema_upgrade op（request_key 应为本 token）" });
+    if (mints.length !== 1) incomplete.push({ id: "mint:" + ep, why: "账本缺/多 mint op（request_key 应为本 token）" });
+  }
+  // campaign/writer 读回 === step after。
+  const campStep = j.doc.steps.find((s) => s.kind === "campaign");
+  if (campStep) { const c = readCampaignState(env); if (!(c.exists === true && c.campaign_id === campStep.intended_after.campaign_id && c.state === "open")) incomplete.push({ id: campStep.id, why: "campaign 读回升级不匹配" }); }
+  const wStep = j.doc.steps.find((s) => s.kind === "writer_state");
+  if (wStep) { const w = readWriterState(env); if (!(w.exists === true && w.campaign_id === wStep.intended_after.campaign_id && w.state === "partial")) incomplete.push({ id: wStep.id, why: "writer-state 读回不匹配" }); }
+  if (incomplete.length > 0) {
+    note("重开身份核验不齐：" + incomplete.map((i) => i.id + "（" + i.why + "）").join(";"));
+    return fail("reopening_incomplete", incomplete.map((i) => i.id).join(","));
+  }
+  // ② 删 <token>.staged/（含 mint plan）。
+  const staged = path.join(ctx.dir, token + ".staged");
+  try { fs.rmSync(staged, { recursive: true, force: true }); } catch (err) { return fail("staged_delete_failed", errText(err)); }
+  // 撤门 → done → 清 active。
+  if (j.doc.steps.some((s) => s.kind === "gate")) {
+    const g = ctx.gateOps.removeGate({ file: ctx.gateFile, token });
+    if (!g.ok && g.reason !== "absent") return fail("gate_remove_failed", String(g.reason));
+    if (g.txnUncleared) return fail("gate_txn_uncleared", "撤门成功但归属转换锁交不还");
+  }
+  const p = setPhase({ dir: ctx.dir, token, lease, phase: "done", expectPhase: "ledger_reopening", now: ctx.now() });
+  if (!p.ok) return fail("journal_write_failed", p.why ?? p.reason);
+  const c = clearActive({ dir: ctx.dir, token });
+  if (!c.ok) return { ok: false, phase: "done", activeCleared: false, activeWhy: String(c.reason), incomplete: [{ id: "active", why: "active 清不掉" }] };
+  return { ok: true, phase: "done", activeCleared: c.cleared === true };
+}
+
+// §二.8 --exit 分派：owner_select_migration_a 按 phase 分派（forward 态只向前 / ≤drained 回退 / done 清 active）。
+export function osmExit(ctx, { apply = false, env = process.env } = {}) {
+  const readOp = () => { const active = readActive({ dir: ctx.dir }); if (active.state === "absent") return { ok: false, reason: "no_operation" }; if (active.state === "unreadable") return { ok: false, reason: "active_unreadable", why: active.why }; const tk = active.token; const jj = readJournal({ dir: ctx.dir, token: tk }); if (jj.state !== "valid") return { ok: false, reason: "journal_" + jj.state, why: jj.why }; const ph = jj.doc.phase; const action = ph === "done" ? "clear_active" : ph === "ledger_reopening" || ph === "reopening_incomplete" ? "reopen" : ph === "drained" ? "rollback" : "forward"; return { ok: true, token: tk, phase: ph, action }; };
+  const dry = readOp(); if (!dry.ok) return dry; if (!apply) return { ok: true, dryRun: true, ...dry };
+  const lease = acquireOperationLease({ dir: ctx.dir, token: dry.token });
+  if (!lease.ok) return { ok: false, reason: lease.reason, why: lease.why };
+  let out;
+  if (dry.action === "clear_active") { const c = clearActive({ dir: ctx.dir, token: dry.token }); out = { ok: c.ok, phase: "done", activeCleared: c.cleared === true, why: c.ok ? null : String(c.reason) }; releaseOperationLease(lease); return out; }
+  if (dry.action === "reopen") { out = osmReopening(ctx, { token: dry.token, lease, env }); releaseOperationLease(lease); return out; }
+  if (dry.action === "rollback") { out = osmRollback(ctx, { token: dry.token, lease, env }); releaseOperationLease(lease); return out; }
+  // forward：只向前（osmForward）。
+  out = osmForward(ctx, { token: dry.token, lease, env }); if (out.ok) { out = osmReopening(ctx, { token: dry.token, lease, env }); }
+  releaseOperationLease(lease); return out;
+}
+
+// §二.7 回退（≤drained 才允许）：先删本 operation 的 <token>.staged/intended/mint-*.json；删不掉 → rollback_incomplete。
+function osmRollback(ctx, { token, lease, env = process.env }) {
+  void lease; void env;
+  const staged = path.join(ctx.dir, token + ".staged");
+  try { fs.rmSync(staged, { recursive: true, force: true }); } catch (err) { return { ok: false, reason: "rollback_incomplete", why: "删 plan 失败：" + errText(err) }; }
+  return { ok: true, phase: "rolled_back", reason: "rolled_back" };
 }
 
 /** osmEnter：进门（安装面锁 → enterMaintenance(operation_kind="owner_select_migration_a") → drained）+ drained 只读前置。 */

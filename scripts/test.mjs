@@ -25249,6 +25249,40 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.match(g1.why, /selection_handle 与产生源 result 不一致/, "G-handle：handle 与产生源不一致拒：" + g1.why);
   });
 
+  // R48（item ⑥）：6 个全新 op 注册进 OP_TYPES/RESULT_SHAPE + schema_upgrade 自洽。
+  //   红先行：旧 OP_TYPES（不含这些 op）→ op_type 越界；或 RESULT_SHAPE 缺项 → 形状不对。
+  test("R48 账本侧：新 op 注册（request_rebind/clear_anchor_handle/expire/cancel/reissue/mint/reaffirm/schema_upgrade）result 形状正反向", () => {
+    const hx = (n) => String(n).repeat(64);
+    const taid = (h) => "ta_" + h.repeat(32);
+    const rebH = () => "orh_" + "a".repeat(32);
+    const selH = () => "osh_" + "b".repeat(32);
+    const uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000";
+    const iso = (t) => new Date(t).toISOString();
+    const initOp = { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } };
+    const mkOpDoc = (opType, result, rev) => ({
+      schema_version: "1.1", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: "claude", authority_mode: "shadow", revision: rev,
+      operations: { [uuid(1)]: initOp, [uuid(2)]: { op_type: opType, terminal_kind: opType, request_key: "req_" + opType, fingerprint: hx(2), result_revision: rev, result } },
+      records: {},
+    });
+    const v = (d) => TAL.validateLedger(d, { endpointId: EP });
+    // schema_upgrade：无记录、不携带 proof_effects/affected → 5b 跳过；坏 from/to 拒。
+    assert.ok(v(mkOpDoc("schema_upgrade", { endpoint: EP, from_schema: "1.0", to_schema: "1.1-transition" }, 2)).ok, "schema_upgrade 合法");
+    assert.match(v(mkOpDoc("schema_upgrade", { endpoint: EP, from_schema: "9.9", to_schema: "1.1" }, 2)).why, /schema_upgrade result 形状不对/, "schema_upgrade 越界 schema 拒");
+    // 下述新 op 携带 proof_effects/affected，正接受 5b 恒等式牵制（需 affected 记录在场且过 G13'），
+    //   故本块只验证【拒 shape】路径（operationProblem 在 5b 之前，报「形状不对」；这正是注册进 RESULT_SHAPE 的直接证据）。
+    assert.match(v(mkOpDoc("request_rebind", { rebind_handle: "osh_zz", rebind_expires_at: iso(1700000001000), affected_live_ids_after_commit: [taid("a")], proof_effects: [] }, 2)).why, /request_rebind result 形状不对/, "request_rebind 坏 rebind_handle 拒");
+    assert.match(v(mkOpDoc("clear_anchor_handle", { cleared: ["rebind_handle", "rebind_expires_at"], affected_live_ids_after_commit: [taid("a")], proof_effects: [] }, 2)).why, /clear_anchor_handle result 形状不对/, "clear_anchor_handle 坏 cleared 拒");
+    assert.match(v(mkOpDoc("expire_rebind_handle", { cleared: ["selection_handle", "handle_expires_at"], affected_live_ids_after_commit: [taid("a")], proof_effects: [] }, 2)).why, /expire_rebind_handle result 形状不对/, "expire_rebind_handle 坏 cleared 拒");
+    assert.match(v(mkOpDoc("cancel_rebind", { cleared: ["selection_handle", "handle_expires_at"], affected_live_ids_after_commit: [taid("a")], proof_effects: [] }, 2)).why, /cancel_rebind result 形状不对/, "cancel_rebind 坏 cleared 拒");
+    assert.match(v(mkOpDoc("reissue_selection_handle", { new_handle: selH(), new_expires_at: iso(1700000001000), anchor_candidate: "om_anchor", affected_live_ids_after_commit: [taid("b"), taid("a")], proof_effects: [] }, 2)).why, /reissue_selection_handle result 形状不对/, "reissue 无序 affected 拒");
+    // mint：坏 minted（target 无序）拒；owner_select_reaffirm：produced 支缺 new_binding_proof 拒。
+    const mintBad = [{ target_id: taid("b"), selection_handle: selH("c"), handle_expires_at: iso(1700000001000) }, { target_id: taid("a"), selection_handle: selH("c"), handle_expires_at: iso(1700000001000) }];
+    assert.match(v(mkOpDoc("mint_selection_handles", { endpoint: EP, minted: mintBad, affected_live_ids_after_commit: [taid("a"), taid("b")], proof_effects: [] }, 2)).why, /mint_selection_handles result 形状不对/, "mint 坏 minted 序拒");
+    const lProof = { kind: "owner_selected_route_v1", by_identity: "owner_authorization", authorized_by: "ou_o", authorized_at: iso(1700000000000), selected_session_id: "sess_x", selected_root_om: "om_x", selection_handle: selH("d"), selection_operation_id: uuid(2) };
+    const tombRemap = [{ old_tomb_id: taid("z"), new_proof_ref: { kind: "owner_select_merge_v1", selection_operation_id: uuid(2), selected_root_om: "om_x", selection_handle: selH("d") } }];
+    assert.match(v(mkOpDoc("owner_select_reaffirm", { target_id: taid("a"), affected_live_ids_after_commit: [taid("a")], proof_effects: [], new_link_proof: lProof, tombstone_remap: tombRemap, selection_message_id: "msg_3" }, 2)).why, /owner_select_reaffirm result 形状不对/, "reaffirm 缺 proof 形状拒");
+  });
+
   // R37 裁定：M1a 收据逐端点原子启用。接线测试需要让 EP 处于两种收据态：
   //   · ok（ledger_init done）→ 双写强制（跑 shadow 后缀）；
   //   · never_initialized（无收据）→ 合法 legacy-only（不写 shadow）。

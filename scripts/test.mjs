@@ -16821,8 +16821,16 @@ test("真实 feishu-status：第五区报 run 通道的待发 / 卡住 / 账本�
  * 返回 run()（真实入口子进程）与 snapshot()（整棵 HOME 的字节快照，钉只读）。
  */
 function doctorMachine({ installRuntime = false } = {}) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-doctor-"));
+  const home = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-doctor-"));
   const dir = (...p) => { const d = path.join(home, ...p); fs.mkdirSync(d, { recursive: true }); return d; };
+  // R49 密闭性：doctor 读的几处「真实 home 回退」路径必须指向 fake home，否则沙箱 doctor 落到真机
+  //   ~/.claude/feishu-bridge/{maintenance,ledger,maintenance.gate}（realUserHome 不经 HOME 走 passwd）。
+  //   home 要用 realpathSync(os.tmpdir())（/var→/private/var 是 symlink），maint/ledger 根精确 0700，
+  //   否则 validateLedgerRoot / inspectMaintenanceDir 判 root_not_canonical / root_perms。
+  const maintDir = dir(".claude", "feishu-bridge", "maintenance");
+  const ledgerDir = dir(".claude", "feishu-bridge", "ledger");
+  const gateFile = path.join(home, ".claude", "feishu-bridge", "maintenance.gate");
+  fs.chmodSync(maintDir, 0o700); fs.chmodSync(ledgerDir, 0o700);
   if (installRuntime) {
     const plan = planRuntimeSync({ sourceRoot: path.resolve("."), home, chain: "claude" });
     assert.equal(plan.ok, true, plan.reason ?? "");
@@ -16880,8 +16888,13 @@ function doctorMachine({ installRuntime = false } = {}) {
   const run = (extraEnv = {}, args = ["--json"]) => spawnSync(process.execPath, [path.resolve("scripts", "doctor.mjs"), ...args], {
     encoding: "utf-8", timeout: 120_000,
     env: { ...process.env, HOME: home, FEISHU_BRIDGE_REGISTRY: files.registry, FEISHU_BRIDGE_ROUTES: files.routes,
-      FEISHU_BRIDGE_STATUS_PROVIDERS: files.providers, CODEX_HOME: path.join(home, ".codex"), FEISHU_CODEX_BRIDGE_HOME: path.join(home, ".codex", "feishu-bridge"), ...extraEnv } });
-  return { home, okProvider, writingProvider, marker, project, writeTables, provider, route, snapshot, run, files };
+      FEISHU_BRIDGE_STATUS_PROVIDERS: files.providers, CODEX_HOME: path.join(home, ".codex"), FEISHU_CODEX_BRIDGE_HOME: path.join(home, ".codex", "feishu-bridge"),
+      FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, FEISHU_BRIDGE_LEDGER_DIR: ledgerDir, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile,
+      // R49-返修一（P1）：fixture 基础 env 显式置空 doctor 消费的另两个隔离点（空串 → 产品函数按 fake home 派生），
+      //   并把 ambient FEISHU_BRIDGE_LAUNCHCTL 也清空（只有 extraEnv 才能启用 launchctl 沙箱注入）。
+      FEISHU_BRIDGE_INSTALL_SURFACE_LOCK: "", FEISHU_BRIDGE_INSTALLED_SURFACE: "", FEISHU_BRIDGE_LAUNCHCTL: "",
+      ...extraEnv } });
+  return { home, okProvider, writingProvider, marker, project, writeTables, provider, route, snapshot, run, files, maintDir, ledgerDir, gateFile };
 }
 const doctorReport = (r) => { assert.ok(r.stdout, r.stderr); return JSON.parse(r.stdout); };
 const checkOf = (report, id) => { const c = report.checks.find((x) => x.id === id); assert.ok(c, "缺检查 " + id + "：" + JSON.stringify(report.checks.map((x) => x.id))); return c; };
@@ -17180,6 +17193,54 @@ test("审计 op id 形状 —— 旧生产格式（大写 T/Z）过校验；小�
   assert.equal(displaySafe(legacyOp), legacyOp, "displaySafe 不变量：合法 id 原样通过（doctor 回显可执行）");
   // 旧 pending 可续做 + 后续 apply 成功（评审三条回归的后两条）：旧格式 op 的 pending 场景
   // 由既有「窗口①/②/③」补记测试用同格式夹具覆盖（本轮夹具已全部换为该格式）。
+});
+
+// R49 反向守卫：证明 doctor 沙箱读的是 MAINTENANCE_DIR_ENV 指向的目录，不是真机 home。
+//   clean 目录（无收据）→ m1a “未接入”（ok）；把 env 指向一个含伪造 ledger_init journal 的目录
+//   → doctor 立刻“看见”它（m1a fail-closed，ok=false）。若隔离不靠 env，改 env 不该改变 m1a 结果。
+test("doctor：R49 反向守卫 —— MAINTENANCE_DIR_ENV 指向含伪造收据目录时 doctor 能看见（m1a 红），隔离靠 env 生效", () => {
+  const m = doctorMachine();
+  const tok = "da88566e-d8d3-48ba-914e-7f96f4dfaeaa";
+  const fakeMaint = path.join(m.home, "fake-maint");
+  fs.mkdirSync(fakeMaint, { recursive: true, mode: 0o700 }); fs.chmodSync(fakeMaint, 0o700);
+  // 一封明确“读不清”的 ledger_init 收据（缺字段）：readJournal 判 unreadable → m1a 判 fail-closed。
+  fs.writeFileSync(path.join(fakeMaint, tok + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init" }), { mode: 0o600 });
+  // 默认（clean 维护目录）：m1a 未接入（doctor 没看到任何收据）。
+  assert.equal(checkOf(doctorReport(m.run()), "m1a_shadow_reconcile").ok, true, "clean 维护目录 → m1a 未接入");
+  // env 指向 fake 目录：doctor 看到伪造收据 → m1a fail-closed（红）。
+  const fakeRep = doctorReport(m.run({ FEISHU_BRIDGE_MAINTENANCE_DIR: fakeMaint }));
+  assert.equal(checkOf(fakeRep, "m1a_shadow_reconcile").ok, false, "改 env 让 doctor 看见伪造收据：" + checkOf(fakeRep, "m1a_shadow_reconcile").detail);
+});
+
+// R49-返修一（P2）：fixture 基础 env 必须覆盖 doctor 消费的另两个隔离点（INSTALL_SURFACE_LOCK / INSTALLED_SURFACE）。
+//   反向守卫：把 ambient（process.env）指向 fixture 外、若被读取即会红的文件/残骸；doctor 必须仍绿
+//   ——证明 fixture 把这些 env 显式置空（产品按 fake home 派生），ambient 泄漏被挡在沙箱外。
+test("doctor：R49-返修 P2 反向守卫 —— ambient FEISHU_BRIDGE_INSTALL_SURFACE_LOCK 指向 fixture 外残骸时 ⑩ 维护门仍绿", () => {
+  const m = doctorMachine();
+  // fixture 外面的锁目录：base 文件缺席 + 一个 .reap 残骸 → 若被读取必然报 slRes（⑩ mok=false → 红）。
+  const ext = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "ext-lock-"));
+  const lockBase = path.join(ext, "install-surface.lock");
+  fs.writeFileSync(lockBase + ".reap", "stale");
+  const saved = process.env.FEISHU_BRIDGE_INSTALL_SURFACE_LOCK;
+  process.env.FEISHU_BRIDGE_INSTALL_SURFACE_LOCK = lockBase;
+  let r;
+  try { r = doctorReport(m.run()); }
+  finally { if (saved === undefined) delete process.env.FEISHU_BRIDGE_INSTALL_SURFACE_LOCK; else process.env.FEISHU_BRIDGE_INSTALL_SURFACE_LOCK = saved; fs.rmSync(ext, { recursive: true, force: true }); }
+  assert.equal(checkOf(r, "maintenance_gate").ok, true, "ambient 锁残骸被 fixture 覆盖（⑩ 不得报安装面锁残骸）：" + checkOf(r, "maintenance_gate").detail);
+});
+
+test("doctor：R49-返修 P2 反向守卫 —— ambient FEISHU_BRIDGE_INSTALLED_SURFACE 指向 fixture 外畸形收据时 ⑪ 安装收据仍绿", () => {
+  const m = doctorMachine();
+  // fixture 外面的畸形 installed-surface：若被读取 → r.state unreadable → ⑪ installed_surface 红。
+  const ext = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "ext-surface-"));
+  const surfaceFile = path.join(ext, "installed-surface.json");
+  fs.writeFileSync(surfaceFile, "not json{{{");
+  const saved = process.env.FEISHU_BRIDGE_INSTALLED_SURFACE;
+  process.env.FEISHU_BRIDGE_INSTALLED_SURFACE = surfaceFile;
+  let r;
+  try { r = doctorReport(m.run()); }
+  finally { if (saved === undefined) delete process.env.FEISHU_BRIDGE_INSTALLED_SURFACE; else process.env.FEISHU_BRIDGE_INSTALLED_SURFACE = saved; fs.rmSync(ext, { recursive: true, force: true }); }
+  assert.equal(checkOf(r, "installed_surface").ok, true, "ambient 畸形安装收据被 fixture 覆盖（⑪ 不得读 fixture 外文件）：" + checkOf(r, "installed_surface").detail);
 });
 
 test("doctor：⑫ 矩阵补缺与 op 形状 —— store 缺席×审计在场（空/有事件）应红；locator 前缀/控制字符 op 待补记拒且不泄（P1-1/P1-2）", () => {

@@ -38409,6 +38409,96 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
   });
 
   test("R52 返修一：mint commit_residue / schema written_mismatch / campaign 写后改 / 重开 3b 失败", () => {
+  // ── R53 夹具：B 的前置状态（open campaign + partial writer + transition 账本计数 0）──
+  const r53SetupB = ({ crashAfter = null } = {}) => {
+    const fx = r52Setup({ twoEps: true, noReceipts: true, crashAfter });
+    const campaignTok = r52Uuid(2);
+    const cid = campaignIdFor(campaignTok);
+    // 账本推成 transition（r52SeedTransition 已做）且计数 0（r52Setup 默认 nullB1Count=2！改用空记录账本）
+    // r52Setup 的账本由 r52SeedTransition(nullB1Count=2) 生成——B 需要计数 0，这里重建账本为无记录版本。
+    for (const ep of fx.eps) {
+      const d = path.join(fx.ledgerRoot, ep, "ledger.json");
+      const dd = JSON.parse(fs.readFileSync(d, "utf-8"));
+      dd.schema_version = "1.1-transition";
+      dd.revision = 3;
+      const upOpId = "00000000-0000-4000-8000-00000000000a";
+      dd.operations[upOpId] = { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "seed_schema_upgrade", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "seed_schema_upgrade", endpoint: ep, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 3, result: { endpoint: ep, from_schema: "1.0", to_schema: "1.1-transition" } };
+      const seedOp = Object.values(dd.operations).find((o) => o.op_type === "seed");
+      seedOp.result = { seeded_ids: [] };
+      dd.records = {};
+      fs.writeFileSync(d, JSON.stringify(dd, null, 2) + "\n", { mode: 0o600 });
+      const v = TAL.validateLedger(dd, { endpointId: ep });
+      assert.equal(v.ok, true, "B 夹具 transition 账本自洽：" + JSON.stringify(v));
+    }
+    // open campaign（cid 取自文件 = 伪 A token 派生）+ partial writer
+    const openDoc = {
+      schema_version: CAMPAIGN_SCHEMA, campaign_id: cid, state: "open", endpoints: fx.eps, endpoints_digest: endpointsDigest(fx.eps),
+      pending_joins: [], members: Object.fromEntries(fx.eps.map((ep) => [ep, { schema_version: "1.1-transition", legacy_proof_count: 0, null_b1_count: 0 }])),
+      revision: 1, origin_operation_id: campaignTok,
+    };
+    fs.writeFileSync(campaignPath(fx.env), JSON.stringify(openDoc, null, 2) + "\n", { mode: 0o600 });
+    const writerDoc = {
+      schema_version: WRITER_STATE_SCHEMA, state: "partial", campaign_id: cid, endpoints_digest: endpointsDigest(fx.eps),
+      revision: 1, origin_operation_id: campaignTok,
+    };
+    fs.writeFileSync(writerStatePath(fx.env), JSON.stringify(writerDoc, null, 2) + "\n", { mode: 0o600 });
+    return { ...fx, cid, campaignTok };
+  };
+
+  test("R53 ②-① operation B 全程：transition→strict + campaign complete + writer on + admission on", () => {
+    const fx = r53SetupB({});
+    try {
+      const r = osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env });
+      assert.ok(r.ok, "B 全程成功：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase, incomplete: r.incomplete }));
+      assert.equal(r.phase, "done");
+      assert.equal(r.activeCleared === true, true, "active 已清");
+      for (const ep of fx.eps) {
+        const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+        assert.equal(L.doc.schema_version, "1.1", ep + " 已 strict");
+        const inv = TAL.migrationInventory(L.doc);
+        assert.equal(inv.legacy_proof_count + inv.null_b1_count, 0, "计数仍 0");
+        const ups = Object.values(L.doc.operations).filter((o) => o.op_type === "schema_upgrade" && o.request_key === r.token + ":schema:" + ep);
+        assert.equal(ups.length, 1, ep + " 恰一笔本 operation 的 strict 升版");
+      }
+      const cs = readCampaignState(fx.env);
+      assert.equal(cs.state, "complete", "campaign complete");
+      const ws = readWriterState(fx.env);
+      assert.equal(ws.state, "on", "writer on");
+      const adm = readOwnerSelectAdmission(fx.env);
+      assert.equal(adm.state, "on", "准入投影 on：" + JSON.stringify(adm));
+      assert.equal(fs.existsSync(path.join(fx.dir, r.token + ".staged")), false, "B 无 staged 残留");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R53 ②-① operation direct 全程：1.0→1.1 + campaign complete + writer on（before off）", () => {
+    const fx = r52Setup({ twoEps: false });
+    try {
+      // direct 账本：1.0 且两计数 0（r52Doc10 空 records）
+      for (const ep of fx.eps) {
+        const d = path.join(fx.ledgerRoot, ep, "ledger.json");
+        const dd = JSON.parse(fs.readFileSync(d, "utf-8"));
+        dd.records = {};
+        const seedOp = Object.values(dd.operations).find((o) => o.op_type === "seed");
+        seedOp.result = { seeded_ids: [] };
+        fs.writeFileSync(d, JSON.stringify(dd, null, 2) + "\n", { mode: 0o600 });
+      }
+      const r = osmEnter52(fx.ctx, { kind: "direct", apply: true, env: fx.env });
+      assert.ok(r.ok, "direct 全程成功：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase, incomplete: r.incomplete }));
+      assert.equal(r.phase, "done");
+      for (const ep of fx.eps) {
+        const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+        assert.equal(L.doc.schema_version, "1.1", ep + " 直升 1.1");
+      }
+      assert.equal(readCampaignState(fx.env).state, "complete", "campaign complete");
+      const ws = readWriterState(fx.env);
+      assert.equal(ws.state, "on", "writer on");
+      const jj = readJournal({ dir: fx.dir, token: r.token });
+      const wStep = jj.doc.steps.find((s) => s.kind === "writer_state");
+      assert.equal(wStep.before.state, "off", "direct 的 on before=off");
+    } finally { fx.cleanup(); }
+  });
+
+    test("R52 返修一：mint commit_residue / schema written_mismatch / campaign 写后改 / 重开 3b 失败", () => {
     // ── 1. mint 段 commit_residue：failDirFsync → committed_durability_uncertain → 停门、step 不记 done ──
     {
       const fx = r52Setup({ crashAfter: 11 }); // schema epB done 后崩溃（c 未开始）

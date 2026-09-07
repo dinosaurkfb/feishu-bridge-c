@@ -25243,7 +25243,7 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.match(p3.why, /create_b1 result 形状不对/, "无序 affected 拒：" + p3.why);
     // 5b 恒等式：proof_effects 提到 id，但该记录无 proof → 拒。（正向空集合法上面已验证。）
     const b3 = v(mkDoc("1.1", { ...extended, proof_effects: [{ topic_agent_id: id, binding_effect: "produced", link_effect: "none" }] }, { selection_handle: selHandle(), handle_expires_at: iso(1700000001000), rebind_handle: null, rebind_expires_at: null }));
-    assert.match(b3.why, /proof_effects 与 \(affected∩提交后有 proof\) 不一致/, "5b 恒等式：无 proof 记录却报 produced 拒：" + b3.why);
+    assert.match(b3.why, /proof_effects 与 \(受影响中 origin===本 op 且有 proof\) 不一致/, "5b 恒等式：无 proof 记录却报 produced 拒：" + b3.why);
     // G-handle：记录 selection_handle 与产生源 result 逐字不符 → 拒。
     const g1 = v(mkDoc("1.1", extended, { selection_handle: selHandle("b"), handle_expires_at: iso(1700000001000), rebind_handle: null, rebind_expires_at: null }));
     assert.match(g1.why, /selection_handle 与产生源 result 不一致/, "G-handle：handle 与产生源不一致拒：" + g1.why);
@@ -25325,6 +25325,28 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.match(TAL.validateLedger(mkDoc((d) => { d.records[b3].binding_proof.selection_operation_id = uuid(9); }), { endpointId: EP }).why, /G13'：produced 的 selection_operation_id 不等于 origin_operation_id/, "ghost selection_operation_id 拒");
     assert.match(TAL.validateLedger(mkDoc((d) => { d.operations[act].result.authorized_by = "ou_other"; }), { endpointId: EP }).why, /G13'-A：owner_select_v1 proof 六字段与产生 result 逐字不等/, "六字段篡改拒");
     assert.match(TAL.validateLedger(mkDoc((d) => { d.operations[act].result.selection_handle = "orh_" + "c".repeat(32); }), { endpointId: EP }).why, /G15'：activate\/anchor 的 selection_handle 必 osh_/, "G15' 前缀跨支拒");
+  });
+
+  // R48 G13' preserved 支：activate→B3→unbind(B3') 保留 binding/link，preserved provenance 经原产生 op（activate）核。
+  test("R48 账本侧：activate→B3→unbind(B3') preserved 链合法，删原产生 op 反向拒", () => {
+    const iso = (t) => new Date(t).toISOString();
+    const hx = (n) => String(n).repeat(64);
+    const taid = (h) => "ta_" + h.repeat(32);
+    const uuid = (n) => String(n).padStart(8, "0") + "-0000-0000-0000-000000000000";
+    const b3 = taid("b"), a1 = taid("a"), act = uuid(2), ub = uuid(3), sess = "sess_new", root = "om_x", sh = "osh_" + "c".repeat(32), au = "ou_o", at = iso(1700000000000);
+    const initOp = { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: hx(1), result_revision: 1, result: { revision: 1 } };
+    const mkDoc = (withActivate) => ({
+      schema_version: "1.1", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: CH, authority_mode: "shadow", revision: 3,
+      operations: { [uuid(1)]: initOp, [act]: withActivate ? { op_type: "activate", terminal_kind: "activate", request_key: "req_act", fingerprint: hx(2), result_revision: 2, result: { surviving_id: b3, tombstoned_id: a1, demoted_historical_id: null, authorized_by: au, authorized_at: at, selected_session_id: sess, selected_root_om: root, selection_handle: sh, selection_operation_id: act, selection_message_id: "msg_1", selection_basis: "explicit_handle", affected_live_ids_after_commit: [b3], proof_effects: [{ topic_agent_id: b3, binding_effect: "produced", link_effect: "produced" }] } } : { op_type: "create_b1", terminal_kind: "create_b1", request_key: "req_cb", fingerprint: hx(2), result_revision: 2, result: { created_id: b3 } }, [ub]: { op_type: "unbind", terminal_kind: "unbind", request_key: "req_ub", fingerprint: hx(3), result_revision: 3, result: { affected_id: b3, terminal_family: "B3'", affected_live_ids_after_commit: [b3], proof_effects: [{ topic_agent_id: b3, binding_effect: "preserved", link_effect: "preserved" }] } } },
+      records: {
+        [b3]: { topic_agent_id: b3, kind: "live", chat_id: "oc_g", anchor_candidate: null, aliases: { root_om: root, session_id: sess }, binding_target: { runtime: "claude", project_root: "/Users/dk/p", claude_session_id: uuid(4) }, facts: { binding: "dormant", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" }, generation_lineage_id: "lin_1", origin_operation_id: ub, binding_proof: withActivate ? { kind: "owner_select_v1", authorized_by: au, authorized_at: at, selected_session_id: sess, selected_root_om: root, selection_handle: sh, selection_operation_id: act } : null, locator_link_proof_ref: withActivate ? { kind: "owner_selected_route_v1", by_identity: "owner_authorization", authorized_by: au, authorized_at: at, selected_session_id: sess, selected_root_om: root, selection_handle: sh, selection_operation_id: act } : null, created_at: iso(1700000000000), updated_at: iso(1700000000000), selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null },
+        [a1]: { topic_agent_id: a1, kind: "forwarding_tombstone", forwards_to: b3, proof_ref: { kind: "owner_select_merge_v1", selection_operation_id: act, selected_root_om: root, selection_handle: sh }, origin_operation_id: act, merged_at: iso(1700000000000) },
+      },
+    });
+    assert.ok(TAL.validateLedger(mkDoc(true), { endpointId: EP }).ok, "activate→B3→unbind(B3') preserved 链合法");
+    // 反向：撤掉原产生 op activate（换成 create_b1），preserved provenance 找不到 produced 来源 → 拒。
+    const bad = TAL.validateLedger(mkDoc(false), { endpointId: EP });
+    assert.match(bad.why, /binding 证与 origin/ + "|" + /proof 六字段/, "换非产证 op 拒：" + bad.why);
   });
 
   // R37 裁定：M1a 收据逐端点原子启用。接线测试需要让 EP 处于两种收据态：

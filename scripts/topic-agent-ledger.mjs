@@ -966,20 +966,20 @@ export function validateLedger(doc, { endpointId } = {}) {
     }
   }
 
-  // R48 §6 proof_effects 恒等式（5b）：op 的 proof_effects id 集必须恰等于 affected_live_ids_after_commit 中
-  //   提交后仍 live、origin===本 op、且（binding_proof!==null || locator_link_proof_ref!==null）的记录集。
+  // R48 §6 proof_effects 恒等式（5b）：op 的 proof_effects id 集必须「恰等于」affected 中提交后仍 live 且 proof 非 null 的记录集。
+  //   单遍校验无法重放每 op 提交态，故对每个 op 的受影响集里**当前仍 origin===本 op ∧ live** 的记录做精确对账：
+  //   有≥1 proof 非空 ⇔ proof_effects 中有本记录的项（被更晚 op 改 origin 的记录不参与此处，交 G13' preserved 支另核）。
   const liveById = new Map(live);
   for (const [opId, op] of Object.entries(doc.operations)) {
     const r = op.result;
     if (!isObj(r) || !Array.isArray(r.affected_live_ids_after_commit) || !Array.isArray(r.proof_effects)) continue;
     const affectedSet = new Set(r.affected_live_ids_after_commit);
     for (const e of r.proof_effects) if (!affectedSet.has(e.topic_agent_id)) return bad("operation " + opId + "：proof_effects 的 id 不在 affected 集内（5b）");
-    const computed = r.affected_live_ids_after_commit.filter((id) => {
-      const rec = liveById.get(id);
-      return rec && rec.kind === "live" && rec.origin_operation_id === opId && (rec.binding_proof !== null || rec.locator_link_proof_ref !== null);
-    });
-    const effIds = r.proof_effects.map((e) => e.topic_agent_id);
-    if (computed.join(",") !== effIds.join(",")) return bad("operation " + opId + "：proof_effects 与 (affected∩提交后有 proof) 不一致（5b）");
+    const currentOriginIds = r.affected_live_ids_after_commit.filter((id) => { const rec = liveById.get(id); return rec && rec.kind === "live" && rec.origin_operation_id === opId; });
+    const computedProof = currentOriginIds.filter((id) => { const rec = liveById.get(id); return rec.binding_proof !== null || rec.locator_link_proof_ref !== null; });
+    const currentOriginSet = new Set(currentOriginIds);
+    const effInCurrent = r.proof_effects.filter((e) => currentOriginSet.has(e.topic_agent_id)).map((e) => e.topic_agent_id);
+    if (computedProof.join(",") !== effInCurrent.join(",")) return bad("operation " + opId + "：proof_effects 与 (受影响中 origin===本 op 且有 proof) 不一致（5b）");
   }
 
   // R48 G-handle（§7.2 可得部分）：非空 handle 必须逐字等于「最近一笔产生它的 op」；产生源集

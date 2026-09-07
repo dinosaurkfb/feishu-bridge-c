@@ -38581,6 +38581,37 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     }
   });
 
+  test("R53 ②-④ B strict 段 written_mismatch：恢复前篡改 journal intended SHA → 停门不记 done", () => {
+    const fx = r53SetupB({ crashAfter: 12 }); // strict epA done 后崩溃（epB strict 仍 prepared）
+    try {
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true);
+      releaseOperationLease52({ path: path.join(fx.dir, readActive({ dir: fx.dir }).token + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      const tok = readActive({ dir: fx.dir }).token;
+      // 篡改 journal：epB 的 strict intended_after.ledger_sha256 → 错值
+      const jj = readJournal({ dir: fx.dir, token: tok });
+      const seB = jj.doc.steps.find((s) => s.id === "schema_endpoint:" + fx.eps[1] + ":strict");
+      assert.equal(seB.state, "prepared", "epB strict 应仍 prepared");
+      seB.intended_after.ledger_sha256 = r52Sha("7");
+      fs.writeFileSync(path.join(fx.dir, tok + ".json"), JSON.stringify(jj.doc, null, 2) + "\n", { mode: 0o600 });
+      const ex = osmExit52(fx.ctx, { apply: true, env: fx.env });
+      assert.equal(ex.ok, false, "written_mismatch 停门：" + JSON.stringify({ ok: ex.ok, reason: ex.reason, phase: ex.phase }));
+      process.stderr.write("R53K5 ex=" + JSON.stringify({ ok: ex.ok, reason: ex.reason, why: ex.why, phase: ex.phase }) + "\n");
+      assert.equal(ex.reason, "written_mismatch", "written_mismatch");
+      const jj2 = readJournal({ dir: fx.dir, token: tok });
+      assert.equal(jj2.doc.steps.find((s) => s.id === "schema_endpoint:" + fx.eps[1] + ":strict").state, "prepared", "epB strict step 不记 done");
+      // 修复（按现场重算锚）→ 续跑 done
+      const shaReal = TAL.loadLedger(path.join(fx.ledgerRoot, fx.eps[1]), { endpointId: fx.eps[1] }).sha256;
+      const jj3 = readJournal({ dir: fx.dir, token: tok });
+      jj3.doc.steps.find((s) => s.id === "schema_endpoint:" + fx.eps[1] + ":strict").intended_after.ledger_sha256 = shaReal;
+      fs.writeFileSync(path.join(fx.dir, tok + ".json"), JSON.stringify(jj3.doc, null, 2) + "\n", { mode: 0o600 });
+      const ex2 = osmExit52(fx.ctx, { apply: true, env: fx.env });
+      assert.ok(ex2.ok && ex2.phase === "done" && ex2.activeCleared === true, "修复续跑 done：" + JSON.stringify({ reason: ex2.reason, incomplete: ex2.incomplete }));
+    } finally { fx.cleanup(); }
+  });
+
   test("R53 ②-⑤ B 重开身份核验失败 → reopening_incomplete，修复后续跑 done", () => {
     const fx = r53SetupB({ crashAfter: 15 }); // on done 后崩溃
     try {

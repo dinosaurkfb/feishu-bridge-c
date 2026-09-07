@@ -35873,6 +35873,7 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
     const fx = r51FixtureA({ root, ledgerSha: L0.sha256, ledgerSchema: L0.doc.schema_version, ledgerRevision: L0.doc.revision });
     const env = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fx.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fx.gateFile };
     const args = { endpointId: EP51, capability: { kind: "schema_upgrade", token: fx.tok }, requestKey: "req_up1", fromSchema: "1.0", toSchema: "1.1-transition", env };
+
     const res = TAL.schemaUpgrade(args);
     assert.ok(res.ok, "transition 正向：" + JSON.stringify(res));
     assert.deepEqual(res.result, { endpoint: EP51, from_schema: "1.0", to_schema: "1.1-transition" }, "result 逐字");
@@ -35946,6 +35947,27 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
     });
     const s1 = TAL.schemaUpgrade({ ...strictArgs, requestKey: "req_strict2" });
     assert.equal(s1.reason, "precheck_failed", "strict 盘点 legacy 非零拒：" + JSON.stringify(s1));
+
+    // ── written_mismatch（验收返修一，杀“schemaUpgrade 读回核改永假”逃逸刀）：重置回 1.0 before 态，
+    // rename 已成后注入合法字节偏离（chain 翻转——账本仍 validateLedger 可读，但 SHA ≠ 写前蓝图）→ 读回核拒。──
+    r51Seed(dir);
+    const L3 = TAL.loadLedger(dir, { endpointId: EP51 });
+    fx.rewrite((d) => {
+      const se = d.steps.find((s) => s.kind === "schema_endpoint");
+      se.before = { schema_version: "1.0", revision: 1, ledger_sha256: L3.sha256 };
+      se.intended_after.revision = 2; // 状态链闭合：mint.before.revision 同步在下一行
+      se.backup_sha256 = L3.sha256;   // 备份恒需合同
+      const mint = d.steps.find((s) => s.kind === "mint");
+      mint.before.revision = 2;
+      mint.intended_after.revision = 3; // 两处 revision 同步，journalProblem 的 +1 合同不破
+    });
+    const wm = TAL.schemaUpgrade({ ...args, requestKey: "req_wm", _inject: { afterLedgerRename: () => {
+      const p = path.join(dir, "ledger.json");
+      const d2 = JSON.parse(fs.readFileSync(p, "utf-8"));
+      d2.chain = "codex"; // 合法账本（CHAIN 含 codex），但字节与写前蓝图偏离 —— 只能由 SHA 读回核抓到
+      fs.writeFileSync(p, JSON.stringify(d2, null, 2) + "\n", { mode: 0o600 });
+    } } });
+    assert.equal(wm.reason, "written_mismatch", "落盘偏离读回核拒：" + JSON.stringify(wm));
   }));
 
   test("R51 §四 mint plan：buildMintPlan / applyMintPlan / mintPlanProblem（封闭形、集合自洽、确定性重演算）", () => {

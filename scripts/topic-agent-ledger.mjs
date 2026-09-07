@@ -2214,12 +2214,54 @@ export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, 
   return { ok: true, commit: res.commit, revision: res.revision, result: res.result, sha256: reread.sha256, ...wrNote(res) };
 }
 
-/** R51 §五：mint_selection_handles 窄事务（§8.2 mint 行两态 CAS；capability 见 _maintenanceVerifier）。 */
+/** R51 §五：mint_selection_handles 窄事务（§8.2 mint 行两态 CAS）。三态：账本 === plan.before_sha →
+ *  再核集合等式（CAS，不信任 plan 自述）与 schema === 1.1-transition 后按 plan 重放；账本 ===
+ *  plan.expected_sha → already（崩溃窗口补 done）；两态皆非 → diverged。读回 SHA 必 === expected，
+ *  否则 written_mismatch（fail-closed，不重试不修）。capability 两态核之外的重放/already 支因此可达。 */
 export function mintSelectionHandles({ endpointId, capability, plan, env = process.env, _inject = null } = {}) {
   if (!capability || capability.kind !== "mint_selection_handles") return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "kind 不符或缺失" };
   const cap = _maintenanceVerifier(capability, endpointId, "mint_selection_handles", env);
   if (!cap.ok) return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: cap.reason + (cap.why ? "：" + cap.why : "") };
-  return { ok: false, commit: "not_committed", reason: "executor_unavailable", why: "R51 §五 未实现（capability 已核过）" };
+  if (!isObj(plan) || mintPlanProblem(plan) !== null) return { ok: false, commit: "not_committed", reason: "bad_plan", why: "plan 缺失或封闭形不过" };
+  // plan 与 capability 对应值逐字绑定（§8.2：before_ledger_sha256 必 === mint step 的 before.ledger_sha256，
+  // expected_ledger_sha256 必 === intended_after.ledger_sha256 —— 两态核与三态判据同源）。
+  const st = cap.osmStep;
+  if (plan.token !== capability.token || plan.endpoint !== endpointId || plan.request_key !== capability.token) {
+    return { ok: false, commit: "not_committed", reason: "plan_mismatch", why: "plan 的 token/endpoint/request_key 与 capability 不一致" };
+  }
+  if (plan.before_ledger_sha256 !== st.before.ledger_sha256 || plan.expected_ledger_sha256 !== st.intended_after.ledger_sha256) {
+    return { ok: false, commit: "not_committed", reason: "plan_mismatch", why: "plan 的 before/expected SHA 与 mint step 锚不一致" };
+  }
+  const d = resolveEndpointDir(endpointId, { env });
+  if (!d.ok) return badTx(d);
+  const res = writeLedger({
+    dir: d.dir, endpointId, gated: false, requestKey: plan.request_key, _inject,
+    replay: () => [{ opType: "mint_selection_handles", inputs: { request_key: plan.request_key, endpoint: plan.endpoint, expected_null_b1_ids: plan.expected_null_b1_ids } }],
+    mutate: (currentDoc) => {
+      if (currentDoc === null) return { ok: false, reason: "absent" };
+      const curSha = sha256(serializeLedger(currentDoc));
+      if (curSha === plan.before_ledger_sha256) {
+        // 十四轮 P1：compare = 集合相等（出现额外 null-B1 也整笔拒，避免漏铸）；不信任 plan 自述的盘点。
+        const inv = migrationInventory(currentDoc);
+        if (canonKey(inv.null_b1_ids) !== canonKey(plan.expected_null_b1_ids)) return { ok: false, reason: "null_b1_set_mismatch", why: "账本 null-B1 集 ≠ plan.expected_null_b1_ids（" + inv.null_b1_ids.length + " vs " + plan.expected_null_b1_ids.length + "）" };
+        if (currentDoc.schema_version !== "1.1-transition") return { ok: false, reason: "schema_not_transition", why: "账本 schema_version " + currentDoc.schema_version };
+        return { ok: true, next: applyMintPlan(currentDoc, plan) };
+      }
+      // 崩溃窗口：账本已推进到 intended（同 operation 的 schema_upgrade 并发写的竞态也在此折入 diverged）。
+      if (curSha === plan.expected_ledger_sha256) return { ok: false, reason: "already", why: "账本已处于 plan.expected 态" };
+      return { ok: false, reason: "ledger_diverged", why: "账本既非 plan.before 也非 plan.expected 态" };
+    },
+  });
+  if (res.ok && typeof res.commit === "string" && res.commit.startsWith("committed")) {
+    if (res.idempotent) return { ok: true, commit: "already", revision: res.revision, result: res.result, ...wrNote(res) };
+    const reread = loadLedger(d.dir, { endpointId });
+    if (!reread.ok || reread.sha256 !== plan.expected_ledger_sha256) {
+      return { ok: false, commit: res.commit, reason: "written_mismatch", why: "读回 SHA ≠ plan.expected_ledger_sha256（fail-closed，不重试不修）", ...wrNote(res) };
+    }
+    return { ok: true, commit: res.commit, revision: res.revision, result: res.result, sha256: reread.sha256, ...wrNote(res) };
+  }
+  if (!res.ok && res.reason === "already") return { ok: true, commit: "already", sha256: plan.expected_ledger_sha256, ...wrNote(res) };
+  return { ok: false, commit: res?.commit ?? "not_committed", reason: res?.reason ?? "written_refused", why: res?.why ?? null, ...wrNote(res) };
 }
 
 /* ─────────────────────────── 普通（gated）事务 ─────────────────────────── */

@@ -7,8 +7,10 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { canonKey, sha256, ledgerRootFor } from "../topic-agent-ledger.mjs";
-import { dirFsyncIgnorable } from "./journal.mjs";
+import { canonKey, sha256, ledgerRootFor, validateLedgerRoot } from "../topic-agent-ledger.mjs";
+import { acquireLockUngated, commitWhileHeld, releasePublishLock } from "../registry.mjs";
+import { isCanonicalIso } from "../canonical-time.mjs";
+import { dirFsyncIgnorable } from "./dir-fsync.mjs";
 
 export const CAMPAIGN_FILE = "owner-select-campaign.json";
 export const WRITER_STATE_FILE = "owner-select-writer-state.json";
@@ -24,7 +26,6 @@ export const SHA_SHAPE = /^[0-9a-f]{64}$/u;
 export const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 export const MAX_STATE_FILE_BYTES = 1024 * 1024;
 
-const isCanonicalIso = (s) => typeof s === "string" && !Number.isNaN(Date.parse(s)) && new Date(s).toISOString() === s;
 const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
 const keysOf = (o) => Object.keys(o).sort().join(",");
 const errCode = (err) => String(err?.code ?? err?.message ?? err);
@@ -78,9 +79,14 @@ export function campaignDocProblem(doc) {
   }
   const pjIds = new Set();
   for (const pj of doc.pending_joins) {
-    if (!isObj(pj) || keysOf(pj) !== "at,endpoint_id") return "pending_joins 项字段集不对";
+    if (!isObj(pj) || keysOf(pj) !== "at,endpoint_id,init_chain,init_operation_token,init_request_key") {
+      return "pending_joins 项字段集不对";
+    }
     if (typeof pj.endpoint_id !== "string" || !ENDPOINT_SHAPE.test(pj.endpoint_id)) return "pending_join endpoint_id 形状不对";
     if (!isCanonicalIso(pj.at)) return "pending_join at 不是规范 ISO 时间";
+    if (typeof pj.init_chain !== "string" || pj.init_chain.length === 0) return "pending_join init_chain 必须是非空字符串";
+    if (typeof pj.init_request_key !== "string" || pj.init_request_key.length === 0) return "pending_join init_request_key 必须是非空字符串";
+    if (typeof pj.init_operation_token !== "string" || !UUID_SHAPE.test(pj.init_operation_token)) return "pending_join init_operation_token 不是合法的 operation token";
     if (doc.endpoints.includes(pj.endpoint_id)) return "pending_join 与 committed endpoints 相交: " + pj.endpoint_id;
     if (pjIds.has(pj.endpoint_id)) return "pending_joins 包含重复 endpoint_id: " + pj.endpoint_id;
     pjIds.add(pj.endpoint_id);
@@ -96,6 +102,11 @@ export function campaignDocProblem(doc) {
     if (!MEMBER_SCHEMAS.includes(m.schema_version)) return "member[" + ep + "].schema_version 不在受控集合: " + m.schema_version;
     if (!Number.isSafeInteger(m.legacy_proof_count) || m.legacy_proof_count < 0) return "member[" + ep + "].legacy_proof_count 必须是非负整数";
     if (!Number.isSafeInteger(m.null_b1_count) || m.null_b1_count < 0) return "member[" + ep + "].null_b1_count 必须是非负整数";
+    if (doc.state === "complete") {
+      if (m.schema_version !== "1.1" || m.legacy_proof_count !== 0 || m.null_b1_count !== 0) {
+        return "campaign complete 状态下所有 member 必须 schema_version === 1.1 且两计数为 0: " + ep;
+      }
+    }
   }
 
   if (!Number.isSafeInteger(doc.revision) || doc.revision < 1) return "revision 必须是正整数";
@@ -121,8 +132,8 @@ export function writerStateDocProblem(doc) {
     if (typeof doc.campaign_id !== "string" || !CAMPAIGN_ID_SHAPE.test(doc.campaign_id)) {
       return "state 为 partial 时 campaign_id 必须是非 null osc_ 形状";
     }
-    if (doc.endpoints_digest !== null && (typeof doc.endpoints_digest !== "string" || !SHA_SHAPE.test(doc.endpoints_digest))) {
-      return "state 为 partial 时 endpoints_digest 必须是 64hex 或 null";
+    if (typeof doc.endpoints_digest !== "string" || !SHA_SHAPE.test(doc.endpoints_digest)) {
+      return "state 为 partial 时 endpoints_digest 必须是 64hex";
     }
   } else if (doc.state === "on") {
     if (typeof doc.campaign_id !== "string" || !CAMPAIGN_ID_SHAPE.test(doc.campaign_id)) {
@@ -154,7 +165,7 @@ function fsyncDir(dir) {
   }
 }
 
-/** 受验读状态文件：fd 绑定、O_NOFOLLOW、普通文件、单硬链接、mode 0600/0700、≤1MiB、JSON 校验 */
+/** 受验读状态文件：fd 绑定、O_NOFOLLOW、普通文件、单硬链接、mode 恰 0600、≤1MiB、JSON 校验 */
 function readVerifiedDoc({ file, docValidator }) {
   let fd = null;
   try {
@@ -168,7 +179,7 @@ function readVerifiedDoc({ file, docValidator }) {
     if (!st.isFile()) return { ok: false, problem: "不是普通文件" };
     if (st.nlink !== 1) return { ok: false, problem: "硬链接数不为 1" };
     const mode = st.mode & 0o777;
-    if (mode !== 0o600 && mode !== 0o700) return { ok: false, problem: "mode 不是 0600/0700: " + mode.toString(8) };
+    if (mode !== 0o600) return { ok: false, problem: "mode 不是 0600: " + mode.toString(8) };
     if (fs.lstatSync(file).isSymbolicLink()) return { ok: false, problem: "文件是符号链接" };
     if (st.size > MAX_STATE_FILE_BYTES) return { ok: false, problem: "文件大小超过上限（" + st.size + " > " + MAX_STATE_FILE_BYTES + "）" };
 
@@ -196,27 +207,10 @@ function readVerifiedDoc({ file, docValidator }) {
   }
 }
 
-/** 校验父 ledger 目录：存在、目录、非 symlink、0700 */
-function checkLedgerRoot(root) {
-  if (typeof root !== "string" || root.length === 0 || !path.isAbsolute(root)) {
-    return { ok: false, problem: "ledgerRoot 不是绝对路径" };
-  }
-  try {
-    const st = fs.lstatSync(root);
-    if (st.isSymbolicLink()) return { ok: false, problem: "ledger 根是符号链接" };
-    if (!st.isDirectory()) return { ok: false, problem: "ledger 根不是目录" };
-    if ((st.mode & 0o777) !== 0o700) return { ok: false, problem: "ledger 根 mode 不是 0700: " + (st.mode & 0o777).toString(8) };
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, problem: "ledger 根核验失败: " + errCode(err) };
-  }
-}
-
 /** 读取 campaign 状态（§二.5）：缺席 ⇒ absent 联合；有错 ⇒ unreadable；合法 ⇒ §一.5 状态联合 */
 export function readCampaignState(env = process.env) {
-  const root = ledgerRootFor(env);
-  const rootCheck = checkLedgerRoot(root);
-  if (!rootCheck.ok) return { state: "unreadable", problem: rootCheck.problem };
+  const rootCheck = validateLedgerRoot({ env, mustExistRoot: true });
+  if (!rootCheck.ok) return { state: "unreadable", problem: "ledger 根核验失败: " + rootCheck.reason + (rootCheck.why ? " (" + rootCheck.why + ")" : "") };
 
   const file = campaignPath(env);
   const res = readVerifiedDoc({ file, docValidator: campaignDocProblem });
@@ -245,9 +239,8 @@ export function readCampaignState(env = process.env) {
 
 /** 读取 writer-state 状态（§二.5）：缺席 ⇒ off 联合 revision 0；有错 ⇒ unreadable；合法 ⇒ §一.5 状态联合 */
 export function readWriterState(env = process.env) {
-  const root = ledgerRootFor(env);
-  const rootCheck = checkLedgerRoot(root);
-  if (!rootCheck.ok) return { state: "unreadable", problem: rootCheck.problem };
+  const rootCheck = validateLedgerRoot({ env, mustExistRoot: true });
+  if (!rootCheck.ok) return { state: "unreadable", problem: "ledger 根核验失败: " + rootCheck.reason + (rootCheck.why ? " (" + rootCheck.why + ")" : "") };
 
   const file = writerStatePath(env);
   const res = readVerifiedDoc({ file, docValidator: writerStateDocProblem });
@@ -275,157 +268,293 @@ export function readWriterState(env = process.env) {
 }
 
 export function readCampaignDocVerified(env = process.env) {
-  const root = ledgerRootFor(env);
-  const rootCheck = checkLedgerRoot(root);
-  if (!rootCheck.ok) return { ok: false, problem: rootCheck.problem };
+  const rootCheck = validateLedgerRoot({ env, mustExistRoot: true });
+  if (!rootCheck.ok) return { ok: false, problem: "ledger 根核验失败: " + rootCheck.reason + (rootCheck.why ? " (" + rootCheck.why + ")" : "") };
   return readVerifiedDoc({ file: campaignPath(env), docValidator: campaignDocProblem });
 }
 
 export function readWriterStateDocVerified(env = process.env) {
-  const root = ledgerRootFor(env);
-  const rootCheck = checkLedgerRoot(root);
-  if (!rootCheck.ok) return { ok: false, problem: rootCheck.problem };
+  const rootCheck = validateLedgerRoot({ env, mustExistRoot: true });
+  if (!rootCheck.ok) return { ok: false, problem: "ledger 根核验失败: " + rootCheck.reason + (rootCheck.why ? " (" + rootCheck.why + ")" : "") };
   return readVerifiedDoc({ file: writerStatePath(env), docValidator: writerStateDocProblem });
 }
 
 /**
- * 写 campaign 状态（§二.6）：
- * 先校验 doc 封闭形；CAS 核验现场 {exists, sha256}；revision === before.revision + 1；
- * 临时文件 O_EXCL 0600 写满 fsync → rename → fsync 目录 → 读回受验；返回写后状态联合。
+ * 统一写原语：
+ * 锁内 CAS + fenced rename + 落盘前核大小 ≤ 1 MiB + 封闭 commit 联合。
  */
-export function writeCampaignState({ env = process.env, expectedSha256 = null, doc }) {
-  const prob = campaignDocProblem(doc);
-  if (prob !== null) return { ok: false, reason: "invalid_doc", why: prob };
-
-  const root = ledgerRootFor(env);
-  const rootCheck = checkLedgerRoot(root);
-  if (!rootCheck.ok) return { ok: false, reason: "ledger_root_invalid", why: rootCheck.problem };
-
-  const cur = readCampaignDocVerified(env);
-  if (!cur.ok && !cur.absent) return { ok: false, reason: "current_unreadable", why: cur.problem };
-
-  const beforeExists = cur.ok === true;
-  const beforeSha = beforeExists ? cur.sha256 : null;
-  const beforeRevision = beforeExists ? cur.doc.revision : 0;
-
-  if (expectedSha256 === null) {
-    if (beforeExists) return { ok: false, reason: "cas_mismatch", why: "期望文件缺席，实际已存在" };
-  } else {
-    if (!beforeExists || beforeSha !== expectedSha256) {
-      return { ok: false, reason: "cas_mismatch", why: "期望 sha (" + expectedSha256 + ") 与当前 (" + beforeSha + ") 不匹配" };
-    }
-  }
-
-  if (doc.revision !== beforeRevision + 1) {
-    return { ok: false, reason: "revision_mismatch", why: "doc.revision (" + doc.revision + ") 必须等于 before.revision + 1 (" + (beforeRevision + 1) + ")" };
-  }
-
-  const targetFile = campaignPath(env);
-  const tmpName = "." + CAMPAIGN_FILE + ".tmp." + process.pid + "." + crypto.randomBytes(8).toString("hex");
-  const tmpPath = path.join(root, tmpName);
-  let fd = null;
+function writeStateFile({ env, expectedSha256, doc, fileName, docValidator, formatOutput }) {
   try {
-    fd = fs.openSync(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
-    fs.writeFileSync(fd, JSON.stringify(doc, null, 2) + "\n");
-    fs.fsyncSync(fd);
-  } finally {
-    if (fd !== null) {
-      try { fs.closeSync(fd); } catch { /* 已关 */ }
+    const prob = docValidator(doc);
+    if (prob !== null) return { ok: false, commit: "not_committed", reason: "invalid_doc", why: prob };
+
+    let payload;
+    try {
+      payload = JSON.stringify(doc, null, 2) + "\n";
+    } catch (err) {
+      return { ok: false, commit: "not_committed", reason: "invalid_doc", why: "序列化失败: " + errCode(err) };
     }
-  }
+    const byteLen = Buffer.byteLength(payload, "utf-8");
+    if (byteLen > MAX_STATE_FILE_BYTES) {
+      return { ok: false, commit: "not_committed", reason: "document_too_large", why: "序列化大小超过 1 MiB（" + byteLen + " 字节）" };
+    }
 
-  try {
-    fs.renameSync(tmpPath, targetFile);
-    fsyncDir(root);
-  } catch (err) {
-    try { fs.unlinkSync(tmpPath); } catch { /* 忽略 */ }
-    return { ok: false, reason: "rename_failed", why: errCode(err) };
-  }
+    const rootVal = validateLedgerRoot({ env, mustExistRoot: true });
+    if (!rootVal.ok) {
+      return { ok: false, commit: "not_committed", reason: "ledger_root_invalid", why: rootVal.reason };
+    }
+    const root = rootVal.root;
 
-  const readBack = readCampaignDocVerified(env);
-  if (!readBack.ok || canonKey(readBack.doc) !== canonKey(doc)) {
-    return { ok: false, reason: "readback_failed", why: readBack.problem ?? "读回内容与写入 doc 不一致" };
+    const lockDir = path.join(root, "owner-select-state.lock");
+    const lock = acquireLockUngated(lockDir, { reapUnrecognized: false });
+    if (lock.ok !== true) {
+      const reason = lock.reason === "publisher_busy" ? "lock_busy" : String(lock.reason ?? "lock_busy");
+      return { ok: false, commit: "not_committed", reason, why: String(lock.why ?? lock.reason ?? ""), lock: lockDir };
+    }
+
+    const releaseSafe = () => releasePublishLock(lockDir, { expectedToken: lock.token });
+
+    let renameLanded = false;
+
+    const exitWithLock = (res) => {
+      const rel = releaseSafe();
+      const residue = rel.ok !== true ? String(rel.reason ?? "release_publish_lock") : rel.absent === true ? "absent" : rel.reapUncleared ? "reap_uncleared" : null;
+      if (residue !== null) {
+        return { ok: false, commit: "lock_residue", reason: "lock_release_residue", why: residue, lock: lockDir, target: fileName };
+      }
+      return res;
+    };
+
+    try {
+      const targetFile = path.join(root, fileName);
+      const cur = readVerifiedDoc({ file: targetFile, docValidator });
+      if (!cur.ok && !cur.absent) {
+        return exitWithLock({ ok: false, commit: "not_committed", reason: "current_unreadable", why: cur.problem });
+      }
+
+      const beforeExists = cur.ok === true;
+      const beforeSha = beforeExists ? cur.sha256 : null;
+      const beforeRevision = beforeExists ? cur.doc.revision : 0;
+
+      if (expectedSha256 === null) {
+        if (beforeExists) {
+          return exitWithLock({ ok: false, commit: "not_committed", reason: "cas_mismatch", why: "期望文件缺席，实际已存在" });
+        }
+      } else {
+        if (!beforeExists || beforeSha !== expectedSha256) {
+          return exitWithLock({ ok: false, commit: "not_committed", reason: "cas_mismatch", why: "期望 sha (" + expectedSha256 + ") 与当前 (" + beforeSha + ") 不匹配" });
+        }
+      }
+
+      if (doc.revision !== beforeRevision + 1) {
+        return exitWithLock({ ok: false, commit: "not_committed", reason: "revision_mismatch", why: "doc.revision (" + doc.revision + ") 必须等于 before.revision + 1 (" + (beforeRevision + 1) + ")" });
+      }
+
+      const tmpName = "." + fileName + ".tmp." + process.pid + "." + crypto.randomBytes(8).toString("hex");
+      const tmpPath = path.join(root, tmpName);
+      let fd = null;
+      try {
+        fd = fs.openSync(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+        fs.fchmodSync(fd, 0o600);
+        const wst = fs.fstatSync(fd);
+        if (!wst.isFile() || wst.nlink !== 1 || (wst.mode & 0o777) !== 0o600) {
+          return exitWithLock({ ok: false, commit: "not_committed", reason: "tmp_file_invalid", why: "tmp 文件属性异常" });
+        }
+        fs.writeFileSync(fd, payload);
+        fs.fsyncSync(fd);
+      } catch (err) {
+        return exitWithLock({ ok: false, commit: "not_committed", reason: "tmp_write_failed", why: errCode(err) });
+      } finally {
+        if (fd !== null) {
+          try { fs.closeSync(fd); } catch { /* 已关 */ }
+        }
+      }
+
+      let fenceErr = null;
+      const fenced = commitWhileHeld(lockDir, () => {
+        try {
+          fs.renameSync(tmpPath, targetFile);
+          renameLanded = true;
+        } catch (err) {
+          fenceErr = err;
+        }
+      });
+
+      if (!fenced.ok || fenceErr !== null) {
+        try { fs.unlinkSync(tmpPath); } catch { /* 忽略 */ }
+        if (renameLanded) {
+          return exitWithLock({ ok: false, commit: "committed_durability_uncertain", reason: "fenced_commit_failed", why: String(fenced.reason ?? fenceErr) });
+        }
+        return exitWithLock({ ok: false, commit: "not_committed", reason: "rename_failed", why: String(fenced.reason ?? fenceErr) });
+      }
+
+      try {
+        fsyncDir(root);
+      } catch (err) {
+        return exitWithLock({ ok: false, commit: "committed_durability_uncertain", reason: "dir_fsync_failed", why: errCode(err) });
+      }
+
+      const readBack = readVerifiedDoc({ file: targetFile, docValidator });
+      if (!readBack.ok || canonKey(readBack.doc) !== canonKey(doc)) {
+        return exitWithLock({ ok: false, commit: "committed_durability_uncertain", reason: "readback_failed", why: readBack.problem ?? "读回内容与写入 doc 不一致" });
+      }
+
+      const rel = releaseSafe();
+      const residue = rel.ok !== true ? String(rel.reason ?? "release_publish_lock") : rel.absent === true ? "absent" : rel.reapUncleared ? "reap_uncleared" : null;
+      if (residue !== null) {
+        return { ok: false, commit: "lock_residue", reason: "lock_release_residue", why: residue, lock: lockDir, target: fileName };
+      }
+
+      return formatOutput(readBack);
+    } catch (innerErr) {
+      return exitWithLock({ ok: false, commit: renameLanded ? "committed_durability_uncertain" : "not_committed", reason: "io_error", why: errCode(innerErr) });
+    }
+  } catch (outerErr) {
+    return { ok: false, commit: "not_committed", reason: "unexpected_error", why: errCode(outerErr) };
   }
-  return {
-    ok: true,
-    exists: true,
-    sha256: readBack.sha256,
-    state: readBack.doc.state,
-    campaign_id: readBack.doc.campaign_id,
-    endpoints: readBack.doc.endpoints,
-    endpoints_digest: readBack.doc.endpoints_digest
-  };
 }
 
 /**
- * 写 writer-state 状态（§二.6）：
- * 先校验 doc 封闭形；CAS 核验现场 {exists, sha256}；revision === before.revision + 1；
- * 临时文件 O_EXCL 0600 写满 fsync → rename → fsync 目录 → 读回受验；返回写后状态联合。
+ * 写 campaign 状态（§二.6 与 PR #135 P1-2/P1-3）：
+ * 锁内 CAS；revision === before.revision + 1；落盘前核 ≤ 1 MiB；
+ * 临时文件 O_EXCL 0600 写满 fsync → fenced rename → fsync 目录 → 读回受验；
+ * 返回封闭联合 commit ∈ {not_committed, committed, committed_durability_uncertain, lock_residue}。
  */
-export function writeWriterState({ env = process.env, expectedSha256 = null, doc }) {
-  const prob = writerStateDocProblem(doc);
-  if (prob !== null) return { ok: false, reason: "invalid_doc", why: prob };
-
-  const root = ledgerRootFor(env);
-  const rootCheck = checkLedgerRoot(root);
-  if (!rootCheck.ok) return { ok: false, reason: "ledger_root_invalid", why: rootCheck.problem };
-
-  const cur = readWriterStateDocVerified(env);
-  if (!cur.ok && !cur.absent) return { ok: false, reason: "current_unreadable", why: cur.problem };
-
-  const beforeExists = cur.ok === true;
-  const beforeSha = beforeExists ? cur.sha256 : null;
-  const beforeRevision = beforeExists ? cur.doc.revision : 0;
-
-  if (expectedSha256 === null) {
-    if (beforeExists) return { ok: false, reason: "cas_mismatch", why: "期望文件缺席，实际已存在" };
-  } else {
-    if (!beforeExists || beforeSha !== expectedSha256) {
-      return { ok: false, reason: "cas_mismatch", why: "期望 sha (" + expectedSha256 + ") 与当前 (" + beforeSha + ") 不匹配" };
-    }
-  }
-
-  if (doc.revision !== beforeRevision + 1) {
-    return { ok: false, reason: "revision_mismatch", why: "doc.revision (" + doc.revision + ") 必须等于 before.revision + 1 (" + (beforeRevision + 1) + ")" };
-  }
-
-  const targetFile = writerStatePath(env);
-  const tmpName = "." + WRITER_STATE_FILE + ".tmp." + process.pid + "." + crypto.randomBytes(8).toString("hex");
-  const tmpPath = path.join(root, tmpName);
-  let fd = null;
-  try {
-    fd = fs.openSync(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
-    fs.writeFileSync(fd, JSON.stringify(doc, null, 2) + "\n");
-    fs.fsyncSync(fd);
-  } finally {
-    if (fd !== null) {
-      try { fs.closeSync(fd); } catch { /* 已关 */ }
-    }
-  }
-
-  try {
-    fs.renameSync(tmpPath, targetFile);
-    fsyncDir(root);
-  } catch (err) {
-    try { fs.unlinkSync(tmpPath); } catch { /* 忽略 */ }
-    return { ok: false, reason: "rename_failed", why: errCode(err) };
-  }
-
-  const readBack = readWriterStateDocVerified(env);
-  if (!readBack.ok || canonKey(readBack.doc) !== canonKey(doc)) {
-    return { ok: false, reason: "readback_failed", why: readBack.problem ?? "读回内容与写入 doc 不一致" };
-  }
-  return {
-    ok: true,
-    exists: true,
-    sha256: readBack.sha256,
-    state: readBack.doc.state,
-    campaign_id: readBack.doc.campaign_id,
-    endpoints_digest: readBack.doc.endpoints_digest,
-    revision: readBack.doc.revision
-  };
+export function writeCampaignState({ env = process.env, expectedSha256 = null, doc }) {
+  return writeStateFile({
+    env,
+    expectedSha256,
+    doc,
+    fileName: CAMPAIGN_FILE,
+    docValidator: campaignDocProblem,
+    formatOutput: (rb) => ({
+      ok: true,
+      commit: "committed",
+      exists: true,
+      sha256: rb.sha256,
+      state: rb.doc.state,
+      campaign_id: rb.doc.campaign_id,
+      endpoints: rb.doc.endpoints,
+      endpoints_digest: rb.doc.endpoints_digest
+    })
+  });
 }
 
+/**
+ * 写 writer-state 状态（§二.6 与 PR #135 P1-2/P1-3）：
+ * 锁内 CAS；revision === before.revision + 1；落盘前核 ≤ 1 MiB；
+ * 临时文件 O_EXCL 0600 写满 fsync → fenced rename → fsync 目录 → 读回受验；
+ * 返回封闭联合 commit ∈ {not_committed, committed, committed_durability_uncertain, lock_residue}。
+ */
+export function writeWriterState({ env = process.env, expectedSha256 = null, doc }) {
+  return writeStateFile({
+    env,
+    expectedSha256,
+    doc,
+    fileName: WRITER_STATE_FILE,
+    docValidator: writerStateDocProblem,
+    formatOutput: (rb) => ({
+      ok: true,
+      commit: "committed",
+      exists: true,
+      sha256: rb.sha256,
+      state: rb.doc.state,
+      campaign_id: rb.doc.campaign_id,
+      endpoints_digest: rb.doc.endpoints_digest,
+      revision: rb.doc.revision
+    })
+  });
+}
+
+/**
+ * 跨文件准入读取器 readOwnerSelectAdmission(env)（PR #135 一轮 P1-6 回带）：
+ * 供 W1/W2/reaffirm 与 R52 使用。
+ *
+ * 判别规则：
+ *   · on ⇔ writer-state on ∧ campaign complete ∧ 同 campaign_id ∧ digest 相等 ∧ 全 member strict；
+ *   · partial ⇔ writer-state partial ∧ campaign open|sealed ∧ 同 campaign_id；
+ *   · off ⇔ 两文件缺席，或 writer off 且 campaign 缺席；
+ *   · 任一不自洽 / 损坏 → { state: "unreadable", problem }。
+ */
 export function readOwnerSelectAdmission(env = process.env) {
-  return null;
+  const rootVal = validateLedgerRoot({ env, mustExistRoot: true });
+  if (!rootVal.ok) return { state: "unreadable", problem: "ledger 根核验失败: " + rootVal.reason + (rootVal.why ? " (" + rootVal.why + ")" : "") };
+
+  const cRes = readCampaignDocVerified(env);
+  const wRes = readWriterStateDocVerified(env);
+
+  if (!cRes.ok && !cRes.absent) return { state: "unreadable", problem: "campaign unreadable: " + cRes.problem };
+  if (!wRes.ok && !wRes.absent) return { state: "unreadable", problem: "writer_state unreadable: " + wRes.problem };
+
+  const cAbsent = cRes.absent === true;
+  const wAbsent = wRes.absent === true;
+
+  if (cAbsent && wAbsent) {
+    return { state: "off" };
+  }
+
+  if (cAbsent && !wAbsent) {
+    if (wRes.doc.state === "off") {
+      return { state: "off" };
+    }
+    return { state: "unreadable", problem: "writer 为 " + wRes.doc.state + " 但 campaign 缺席" };
+  }
+
+  if (!cAbsent && wAbsent) {
+    return { state: "unreadable", problem: "campaign 为 " + cRes.doc.state + " 但 writer 缺席" };
+  }
+
+  const cDoc = cRes.doc;
+  const wDoc = wRes.doc;
+
+  if (wDoc.state === "on") {
+    if (cDoc.state !== "complete") {
+      return { state: "unreadable", problem: "writer 为 on 但 campaign 不处于 complete（当前：" + cDoc.state + "）" };
+    }
+    if (wDoc.campaign_id !== cDoc.campaign_id) {
+      return { state: "unreadable", problem: "campaign_id 不匹配（writer: " + wDoc.campaign_id + ", campaign: " + cDoc.campaign_id + "）" };
+    }
+    if (wDoc.endpoints_digest !== cDoc.endpoints_digest) {
+      return { state: "unreadable", problem: "endpoints_digest 不匹配" };
+    }
+    for (const ep of cDoc.endpoints) {
+      const m = cDoc.members[ep];
+      if (!m || m.schema_version !== "1.1" || m.legacy_proof_count !== 0 || m.null_b1_count !== 0) {
+        return { state: "unreadable", problem: "member 不满足 strict 准入条件: " + ep };
+      }
+    }
+    return {
+      state: "on",
+      campaign_id: wDoc.campaign_id,
+      endpoints_digest: wDoc.endpoints_digest,
+      endpoints: cDoc.endpoints,
+      revision: wDoc.revision
+    };
+  }
+
+  if (wDoc.state === "partial") {
+    if (cDoc.state !== "open" && cDoc.state !== "sealed") {
+      return { state: "unreadable", problem: "writer 为 partial 但 campaign 不是 open/sealed（当前：" + cDoc.state + "）" };
+    }
+    if (wDoc.campaign_id !== cDoc.campaign_id) {
+      return { state: "unreadable", problem: "campaign_id 不匹配" };
+    }
+    if (wDoc.endpoints_digest !== null && wDoc.endpoints_digest !== cDoc.endpoints_digest) {
+      return { state: "unreadable", problem: "endpoints_digest 不匹配" };
+    }
+    return {
+      state: "partial",
+      campaign_id: wDoc.campaign_id,
+      campaign_state: cDoc.state,
+      endpoints_digest: wDoc.endpoints_digest,
+      endpoints: cDoc.endpoints,
+      revision: wDoc.revision
+    };
+  }
+
+  if (wDoc.state === "off") {
+    return { state: "unreadable", problem: "writer 为 off 但 campaign 处于 " + cDoc.state };
+  }
+
+  return { state: "unreadable", problem: "未知状态组合" };
 }

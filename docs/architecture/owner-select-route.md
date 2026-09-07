@@ -382,13 +382,19 @@ P1-2）：`campaign`/`writer_state`（文件态含 `exists`）同 sidecar——`
   纠正上表"或 null"）；`on.intended_after.endpoints_digest` === `complete.intended_after.endpoints_digest`；**`:on` 的 before.state：B ⇒ `partial`；
   direct ⇒ `off`**（direct 无 partial 段，缺席投影即 off；上表"on：before.state=partial"只对 B）。
 - campaign 文件不变量：`state==="complete"` ⇒ 全 member `schema_version==="1.1"` ∧ 两计数皆 0；`sealed|complete` ⇒ `pending_joins===[]`；
-  `pending_joins[*]` 封闭 = `{ endpoint_id, at, init_chain, init_request_key, init_operation_token }`（§8 prepared→committed 恢复要核的初始化身份）。
+  `pending_joins[*]` 封闭 = `{ endpoint_id, at, init_chain ∈ {claude,codex}, init_request_key（账本 REQUEST_KEY_SHAPE）, init_operation_token（UUID）}`
+  （§8 prepared→committed 恢复要核的初始化身份；与真实 init journal/账本的逐字对账在 R52 join 协议里做）。
 - **准入读取器 `readOwnerSelectAdmission(env)`**（跨两文件，供 W1/W2/reaffirm 与 R52 用）：`on` ⇔ writer-state on ∧ campaign complete ∧
   同 campaign_id ∧ digest 相等 ∧ 全 member strict；`partial` ⇔ writer-state partial ∧ campaign open|sealed ∧ 同 campaign_id；任一不自洽 → `unreadable`
   （生产写方 fail-closed）；单文件读取器仍导出但**不作准入依据**。
-- **写原语合同（PR #135 一轮 P1-2/P1-3）**：写方必先持有 `<ledger root>/owner-select-state.lock`（registry 锁协议，同一把锁盖两文件），
+- **写原语合同（PR #135 一轮 P1-2/P1-3；二轮 P1-2 收紧）**：两文件的写入口是**维护窄事务**（同 `initializeShadow`/`authorityCutover`
+  的 capability 工艺）：调用方必须持有受验 capability——active maintenance operation token、journal 1.4 经 `journalProblem` 受验、
+  `operation_kind` ∈ 三新种、phase 在 forward 段、且存在**对应的 prepared step**（`campaign:<id>:open|seal|complete` / `writer_state:<id>:partial|on`）
+  其 `intended_after` 与本次写入的投影逐字相等、`before.{exists,sha256}` === 现场；缺 capability 或核不过 → `maintenance_capability_required`，
+  **不导出可无 operation 直接改状态文件的通用 writer**。此外写方必先持有 `<ledger root>/owner-select-state.lock`（registry 锁协议，同一把锁盖两文件），
   锁内 compare（现场 `{exists,sha256}`）→ 序列化并**落盘前核大小 ≤ 1 MiB** → O_EXCL 0600 临时文件 fsync → rename → fsync 目录 → 读回；
   结果联合 `{ commit:"not_committed" | "committed" | "committed_durability_uncertain"（rename 已成、目录 fsync 失败）| "lock_residue" }`，
+  **finalize 一次性且不抛：rename 已落地后的任何释放/清理异常都不得折叠成 not_committed**（二轮 P1-1）；tmp 写/fsync 失败尽力清理，清不掉结构化带出 `residue`；
   写前异常一律结构化返回不裸抛；根路径经唯一 `validateLedgerRoot`（祖先 symlink 拒），文件 mode **恰 0600**、普通文件、单硬链接（读写两侧同核）。
 
 **跨 step 等式的生效时点（R50 验收裁定）**：forward 段内 step 可**整批 prepared**（与 cutover 的原子进段同一工艺）；

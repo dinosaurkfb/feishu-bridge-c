@@ -41,7 +41,7 @@ const handleKindOf = (h) => h === null ? null : (h.startsWith("osh_") ? "osh" : 
 /**
  * 飞书客户端会在 @ 之后 / 词与词之间塞进不换行空格（U+00A0）、全角空格（U+3000）、零宽字符（U+200B…）、
  * 全角斜杠 / 美元符；这些都**不是字**，精确匹配前先折叠掉 —— "多一个字都不算"守的是词，不是不可见字节。
- * 线上实测（2026-08-28 msg_4kxxcb0p58a45）：肉眼完全一样的 /feishu-mode dialogue 没被当成控制命令而被当普通指令投递。
+ * 折叠只针对零宽字符、NBSP/全角空格、全角前缀与 ASCII 多空格（C0 控制字符与换行/制表在折叠前即拒，PR #136 一轮回带）。
  */
 export function normalizeControlText(instruction) {
   if (typeof instruction !== "string") return instruction;
@@ -49,8 +49,8 @@ export function normalizeControlText(instruction) {
     .replace(/[\u200B-\u200D\u2060\uFEFF]/gu, "")
     .replace(/／/gu, "/")
     .replace(/＄/gu, "$")
-    .replace(/\s+/gu, " ")   // JS 的 \s 已含 U+00A0 / U+3000
-    .trim();
+    .replace(/[ \u00A0\u3000]+/gu, " ")
+    .replace(/^[ \u00A0\u3000]+|[ \u00A0\u3000]+$/gu, "");
 }
 
 /** @returns {{kind:"mode", mode:string}|null} */

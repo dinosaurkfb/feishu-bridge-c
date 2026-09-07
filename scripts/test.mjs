@@ -18826,6 +18826,40 @@ test("R52a 返修一：claim meta 按 kind 投影（select 经 controlIntentProb
   assert.equal(parseInboundIntent({ instruction: "/Feishu-Select " + h, chain: "claude" }).intent, INTENT.MALFORMED_CONTROL, "大小写变体 → malformed（不降回普通指令）");
 });
 
+test("R52a 返修三 P1-5: 折叠前拒 C0 控制字符与换行/制表（malformed_control，不得 ordinary）", () => {
+  const h = "osh_" + "a".repeat(32);
+  // 1. /feishu-select\nosh_… → malformed_control，不得 ordinary 或 router_control
+  const nl = parseInboundIntent({ instruction: "/feishu-select\n" + h, chain: "claude" });
+  assert.equal(nl.intent, INTENT.MALFORMED_CONTROL, "换行必须是 malformed_control");
+  assert.equal(nl.control, null);
+
+  // 2. tab 版本 (/feishu-select\tosh_… 与 /feishu-mode\tdialogue)
+  const tabSel = parseInboundIntent({ instruction: "/feishu-select\t" + h, chain: "claude" });
+  assert.equal(tabSel.intent, INTENT.MALFORMED_CONTROL, "tab 版本必须是 malformed_control");
+  assert.equal(tabSel.control, null);
+  const tabMode = parseInboundIntent({ instruction: "/feishu-mode\tdialogue", chain: "claude" });
+  assert.equal(tabMode.intent, INTENT.MALFORMED_CONTROL, "tab feishu-mode 必须是 malformed_control");
+
+  // 3. 命令名内插控制字符 (/fe\x00ishu-select, /feishu-\x00select, /\x00feishu-select)
+  for (const badCmd of ["/fe\x00ishu-select " + h, "/feishu-\x00select " + h, "/\x00feishu-select " + h, "/feishu-\x07mode dialogue"]) {
+    const res = parseInboundIntent({ instruction: badCmd, chain: "claude" });
+    assert.equal(res.intent, INTENT.MALFORMED_CONTROL, "命令名内插控制字符必须是 malformed_control：" + JSON.stringify(badCmd));
+    assert.equal(res.control, null);
+  }
+
+  // 4. 普通文本里的控制字符/换行依然是 ordinary
+  assert.equal(parseInboundIntent({ instruction: "hello\nworld", chain: "claude" }).intent, INTENT.ORDINARY);
+  assert.equal(parseInboundIntent({ instruction: "hello \x00 world", chain: "claude" }).intent, INTENT.ORDINARY);
+  assert.equal(parseInboundIntent({ instruction: "hello /feishu-select", chain: "claude" }).intent, INTENT.ORDINARY);
+
+  // 5. 保留的既定折叠：ASCII 多空格 / NBSP / 全角空格 / 全角前缀 / 零宽
+  assert.equal(parseInboundIntent({ instruction: "/feishu-select   " + h, chain: "claude" }).intent, INTENT.ROUTER_CONTROL);
+  assert.equal(parseInboundIntent({ instruction: "/feishu-select\u00A0" + h, chain: "claude" }).intent, INTENT.ROUTER_CONTROL);
+  assert.equal(parseInboundIntent({ instruction: "/feishu-select\u3000" + h, chain: "claude" }).intent, INTENT.ROUTER_CONTROL);
+  assert.equal(parseInboundIntent({ instruction: "／feishu-select " + h, chain: "claude" }).intent, INTENT.ROUTER_CONTROL);
+  assert.equal(parseInboundIntent({ instruction: "\u200B/feishu-select " + h, chain: "claude" }).intent, INTENT.ROUTER_CONTROL);
+});
+
 test("R52a 返修二：/feishu-select 入站全路径（owner 默认 off + 终态记录 + 重放幂等 + 非 owner R3）", () => {
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-select-claude-"));
   const root = path.join(local, "project");
@@ -19678,10 +19712,11 @@ test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进
   assert.ok(Object.isFrozen(RESUMABLE_CONTROL_STATES));
   // 不可见字节不算"字"：飞书客户端塞进来的零宽 / 不换行空格 / 全角空格 / 全角斜杠折叠后仍是控制命令；多一个词照旧不是
   for (const [label, raw] of [["零宽前缀", "\u200B/feishu-mode dialogue"], ["零宽后缀", "/feishu-mode dialogue\u200B"], ["词间 NBSP", "/feishu-mode\u00A0dialogue"],
-    ["词间全角空格", "/feishu-mode\u3000dialogue"], ["双空格", "/feishu-mode  dialogue"], ["全角斜杠", "／feishu-mode dialogue"], ["BOM", "\uFEFF/feishu-mode mapping"], ["首尾空白", "  /feishu-mode mapping \n"]]) {
+    ["词间全角空格", "/feishu-mode\u3000dialogue"], ["双空格", "/feishu-mode  dialogue"], ["全角斜杠", "／feishu-mode dialogue"], ["BOM", "\uFEFF/feishu-mode mapping"], ["首尾空白", "  /feishu-mode mapping  "]]) {
     const got = parseControlCommand(raw, { chain: "claude" });
     assert.ok(got && got.kind === "mode" && [DIALOGUE_POLICY_ID, MAPPING_POLICY_ID].includes(got.mode), label + "：" + JSON.stringify(raw));
   }
+  assert.equal(parseControlCommand("  /feishu-mode mapping \n", { chain: "claude" }), null, "换行不折叠直接拒");
   assert.deepEqual(parseControlCommand("＄feishu-mode\u00A0dialogue", { chain: "codex" }), { kind: "mode", mode: DIALOGUE_POLICY_ID }, "Codex 侧全角美元符");
   for (const [label, raw] of [["多一个词", "/feishu-mode dialogue 吧"], ["多一个字符", "/feishu-mode dialogue!"], ["少一个字", "/feishu-mod dialogue"], ["别的模式词", "/feishu-mode turbo"], ["链不对", "$feishu-mode dialogue"]]) {
     assert.equal(parseControlCommand(raw, { chain: "claude" }), null, label);

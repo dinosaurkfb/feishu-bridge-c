@@ -51,6 +51,8 @@ export function shown(text) {
   return cps.length > SHOWN_MAX ? cps.slice(0, SHOWN_MAX).join("") + "…" : cps.join("");
 }
 
+const C0_OR_NL_RE = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/u;
+
 /**
  * @param {{ instruction: unknown, chain: "claude"|"codex" }} _
  * @returns {{ intent: string, text: string, word: string|null, control: {kind:"mode",mode:string}|null, problem: string|null }}
@@ -59,7 +61,27 @@ export function shown(text) {
  *   problem ：rejected_control / malformed_control 时说清"差在哪 / 去哪做"，其它一律 null
  */
 export function parseInboundIntent({ instruction, chain } = {}) {
-  const text = normalizeControlText(typeof instruction === "string" ? instruction : "");
+  const raw = typeof instruction === "string" ? instruction : "";
+  // R52a 返修三 P1-5: 折叠前先拒 C0 控制字符与换行/制表（命令词或参数里出现 → malformed_control，不得 ordinary）。
+  if (C0_OR_NL_RE.test(raw)) {
+    const withSpaces = raw.replace(/[\r\n\t]/gu, " ");
+    const stripped = withSpaces.replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/gu, "");
+    const normStripped = normalizeControlText(stripped);
+    const lowerStripped = normStripped.toLowerCase();
+    const prefix = lowerStripped.startsWith("/" + NAMESPACE) ? "/" : lowerStripped.startsWith("$" + NAMESPACE) ? "$" : null;
+    if (prefix !== null) {
+      const [word] = normStripped.slice(1).split(" ");
+      const w = shown(word);
+      const own = CHAIN_PREFIX[chain] ?? null;
+      const base = { text: normStripped, word, control: null, problem: null };
+      if (own === null) return { intent: INTENT.MALFORMED_CONTROL, ...base, problem: "这条链说不清是 Claude 还是 Codex，命令没有执行" };
+      if (prefix !== own) {
+        return { intent: INTENT.MALFORMED_CONTROL, ...base, problem: `前缀「${prefix}」是 ${CHAIN_NAME[prefix]} 链的写法；这个话题是 ${CHAIN_NAME[own]} 链，命令用「${own}」开头` };
+      }
+      return { intent: INTENT.MALFORMED_CONTROL, ...base, problem: `${own}${w} 命令与参数不接受换行、制表符或控制字符` };
+    }
+  }
+  const text = normalizeControlText(raw);
   const base = { text, word: null, control: null, problem: null };
   // R52a 返修一 P2：命名空间检测大小写不敏感进命令命名空间，之后仍精确匹配 → 大小写变体一律 malformed（不降回普通指令）。
   const lower = text.toLowerCase();
@@ -89,6 +111,7 @@ export function parseInboundIntent({ instruction, chain } = {}) {
   }
   if (word === "feishu-select") {
     // R52a：/feishu-select [<handle>] —— 命中与否由路由侧精确解析决定（判据一份）；不降回普通指令。
+    // 注（PR #136 P2）：§12"owner 先于 handle 解析"指的是入站路由确定性处置时先核验 owner 身份与准入状态（业务解析），不是词法层面的顺序。
     const control = parseControlCommand(text, { chain });
     if (!control || control.kind !== "select") return malformed(`${own}feishu-select 只认不带参数或一个 osh_/orh_/rfh_ + 32 位十六进制的 handle，收到「${a}」`);
     return { intent: INTENT.ROUTER_CONTROL, ...base, word, control };

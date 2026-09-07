@@ -229,6 +229,7 @@ import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as 
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
 import * as OSM from "./maintenance/owner-select-operation.mjs";
+import * as MSCLI from "./maintenance-owner-select.mjs";
 import { acquireOperationLease, addNote as addNoteJ, addStepPrepared as addStepPreparedJ, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, enterLedgerForward, isLedgerReceipt, journalProblem, readActive, readJournal, releaseOperationLease, setPhase as setPhaseJ, updateJournal, CUTOVER_JOURNAL_SCHEMA, OWNER_SELECT_JOURNAL_SCHEMA, OPERATION_KINDS as JOURNAL_OPERATION_KINDS, STEP_KINDS as JOURNAL_STEP_KINDS, PHASES as JOURNAL_PHASES, FORWARD_ONLY_PHASES as JOURNAL_FORWARD_ONLY_PHASES, SIDECAR_NAMES, legacy12CutoverDisposition, stagedIntendedFile } from "./maintenance/journal.mjs";
 import { stageCutoverPlan, verifyStagedPlan, removeStagedPlan, planProblem as m1bPlanProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
 import { verifyCutoverPlan } from "./m1b/cutover-plan.mjs";
@@ -36361,6 +36362,26 @@ test("R52 重开：osmReopening → done + active 清 + staged 删（身份核�
   assert.equal(fs.existsSync(path.join(maintDir, tok + ".staged")), false, "staged 已删");
   assert.equal(readActive({ dir: maintDir }).state, "absent", "active 已清");
   fs.rmSync(b, { recursive: true, force: true });
+});
+
+// R52 步6 CLI：参数封闭 / --status 只读输出 / exitCodeFor。
+test("R52 CLI：parseMaintenanceOwnerSelectArgs 参数封闭 + --status 只读 + exitCodeFor", () => {
+  assert.equal(MSCLI.parseMaintenanceOwnerSelectArgs(["--status", "--apply"]).ok, false, "--status 带 --apply 拒");
+  assert.equal(MSCLI.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--wait-ms"]).ok, false, "--wait-ms 无值拒");
+  assert.equal(MSCLI.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--wait-ms", "x"]).ok, false, "--wait-ms 非整数拒");
+  assert.equal(MSCLI.parseMaintenanceOwnerSelectArgs(["--apply", "--apply"]).ok, false, "--apply 重复拒");
+  const p = MSCLI.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--wait-ms", "5000", "--apply"]);
+  assert.equal(p.ok, true); assert.equal(p.mode, "migrate-a"); assert.equal(p.waitMs, 5000); assert.equal(p.apply, true);
+  assert.equal(MSCLI.parseMaintenanceOwnerSelectArgs(["--status"]).ok, true);
+  assert.equal(MSCLI.exitCodeFor({ ok: true }), 0);
+  assert.equal(MSCLI.exitCodeFor({ ok: false, phase: "reopening_incomplete" }), 3);
+  assert.equal(MSCLI.exitCodeFor({ ok: false, reason: "not_drained", phase: "osm_a_upgrading" }), 3);
+  assert.equal(MSCLI.exitCodeFor({ ok: false, rollbackSafe: true, phase: "drained", reason: "not_at_1_0" }), 1);
+  // --status 只读：坏 env（无维护目录）→ 不崩。
+  let out = "";
+  const code = MSCLI.runMaintenanceOwnerSelect(["--status"], { env: { ...process.env, FEISHU_BRIDGE_MAINTENANCE_DIR: "/nonexistent", FEISHU_BRIDGE_LEDGER_DIR: "/nonexistent", FEISHU_BRIDGE_MAINTENANCE_GATE: "/nonexistent" }, out: (s) => { out += s + "\n"; } });
+  assert.equal(code, 0, "--status 只读必 0（读不出也只报状态）：" + out);
+  assert.ok(out.includes("owner_select 迁移 A 状态"), "--status 输出标题");
 });
 
 summarySealed = true;

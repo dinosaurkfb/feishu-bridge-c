@@ -23,7 +23,7 @@ const releaseSurface = (surface) => {
 const preFail = (reason, why) => ({ ok: false, reason, why: why ?? null, rollbackSafe: true });
 
 /** 冻结集：全部「有效初始化收据（initDone===true）」的 endpoint，有序去重非空。 */
-function frozenEndpoints(dir) {
+export function frozenEndpoints(dir) {
   const agg = aggregateEndpointReceipts({ dir });
   if (!agg.ok) return { ok: false, reason: "receipts_unreadable", why: agg.unreadable?.[0]?.why ?? agg.why ?? "收据聚合 fail-closed" };
   const eps = [...new Set(agg.endpoints.filter((e) => e.initDone === true).map((e) => e.endpointId))].sort();

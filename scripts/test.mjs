@@ -234,6 +234,7 @@ import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrai
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
 import { osmEnter as osmEnter52, osmExit as osmExit52, osmForward as osmForward52, removeMintPlans as removeMintPlans52, mintPlanBytes as mintPlanBytes52, stepCommitCheck as stepCommitCheck52, __sealCallCount as sealCallCount52, __resetSealCalls as resetSealCalls52 } from "./maintenance/owner-select-operation.mjs";
 import * as MOS from "./maintenance-owner-select.mjs";
+import * as MG from "./maintenance-gate.mjs";
 import { releaseOperationLease as releaseOperationLease52 } from "./maintenance/journal.mjs";
 import { installSurfaceLockPath } from "./install-surface-lock.mjs";
 import { acquireOperationLease, addNote as addNoteJ, addStepPrepared as addStepPreparedJ, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, enterLedgerForward, isLedgerReceipt, journalProblem, readActive, readJournal, releaseOperationLease, setPhase as setPhaseJ, updateJournal, CUTOVER_JOURNAL_SCHEMA, OWNER_SELECT_JOURNAL_SCHEMA, OPERATION_KINDS as JOURNAL_OPERATION_KINDS, STEP_KINDS as JOURNAL_STEP_KINDS, PHASES as JOURNAL_PHASES, FORWARD_ONLY_PHASES as JOURNAL_FORWARD_ONLY_PHASES, SIDECAR_NAMES, legacy12CutoverDisposition, stagedIntendedFile } from "./maintenance/journal.mjs";
@@ -38612,6 +38613,67 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     } finally { fx.cleanup(); }
   });
 
+  test("R53 CLI：--migrate-b/--migrate-direct 预览与全程、--status 准入投影、--exit 三 kind 分派", () => {
+    const fx = r53SetupB({});
+    try {
+      // 预览（B）：零改动
+      const out2 = [];
+      const s2 = MOS.runMaintenanceOwnerSelect(["--migrate-b"], { ctx: fx.ctx, out: (s) => out2.push(s), env: fx.env });
+      process.stderr.write("R53STEP STEP-B-preview\n");
+      assert.equal(s2, 0, "B 预览 exit 0");
+      assert.ok(out2.join("\n").includes("[预览]"), "B 预览输出");
+      assert.equal(readGate({ file: fx.gateFile, now: Date.parse(T052) }).state, "absent", "B 预览零改动：无门");
+      // --apply 全程（CLI 路径）
+      const out3 = [];
+      const s3 = MOS.runMaintenanceOwnerSelect(["--migrate-b", "--apply"], { ctx: fx.ctx, out: (s) => out3.push(s), env: fx.env });
+      process.stderr.write("R53STEP STEP-B-apply\n");
+      assert.equal(s3, 0, "B --apply 全程 exit 0：" + out3.join("\n").slice(-300));
+      assert.equal(readOwnerSelectAdmission(fx.env).state, "on", "B 完成后准入 on");
+      // --status：准入投影 on
+      const out4 = [];
+      const s4 = MOS.runMaintenanceOwnerSelect(["--status"], { ctx: fx.ctx, out: (s) => out4.push(s), env: fx.env });
+      process.stderr.write("R53STEP STEP-status\n");
+      assert.equal(s4, 0, "--status exit 0");
+      assert.ok(out4.join("\n").includes("准入投影（writer ∧ campaign 联合判定）：on"), "--status 准入投影：" + out4.join("\n").slice(-200));
+    } finally { fx.cleanup(); }
+    // direct：预览 + 全程
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        const d = path.join(fx.ledgerRoot, fx.eps[0], "ledger.json");
+        const dd = JSON.parse(fs.readFileSync(d, "utf-8"));
+        dd.records = {};
+        const seedOp = Object.values(dd.operations).find((o) => o.op_type === "seed");
+        seedOp.result = { seeded_ids: [] };
+        fs.writeFileSync(d, JSON.stringify(dd, null, 2) + "\n", { mode: 0o600 });
+        const out5 = [];
+        const s5 = MOS.runMaintenanceOwnerSelect(["--migrate-direct"], { ctx: fx.ctx, out: (s) => out5.push(s), env: fx.env });
+      process.stderr.write("R53STEP STEP-direct-preview\n");
+        assert.equal(s5, 0, "direct 预览 exit 0");
+        const s6 = MOS.runMaintenanceOwnerSelect(["--migrate-direct", "--apply"], { ctx: fx.ctx, out: (s) => out5.push(s), env: fx.env });
+      process.stderr.write("R53STEP STEP-direct-apply\n");
+        assert.equal(s6, 0, "direct --apply 全程 exit 0：" + out5.join("\n").slice(-300));
+        assert.equal(readOwnerSelectAdmission(fx.env).state, "on", "direct 完成后准入 on");
+      } finally { fx.cleanup(); }
+    }
+    // --exit 三 kind 分派：B 的 journal → osmExit（crash 后 --exit --apply 收敛）
+    {
+      const fx = r53SetupB({ crashAfter: 9 }); // seal done 后崩溃
+      try {
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true);
+        releaseOperationLease52({ path: path.join(fx.dir, readActive({ dir: fx.dir }).token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const out6 = [];
+        const code = MG.runMaintenanceGate(["--exit", "--apply"], { ctx: fx.ctx, out: (s) => out6.push(s), env: fx.env });
+      process.stderr.write("R53STEP STEP-exit\n");
+        assert.equal(code, 0, "maintenance-gate --exit 分派 osmExit 收敛：" + out6.join("\n").slice(-260));
+        assert.equal(readOwnerSelectAdmission(fx.env).state, "on", "分派恢复后准入 on");
+      } finally { fx.cleanup(); }
+    }
+  });
+
   test("R53 ②-⑤ B 重开身份核验失败 → reopening_incomplete，修复后续跑 done", () => {
     const fx = r53SetupB({ crashAfter: 15 }); // on done 后崩溃
     try {
@@ -39030,6 +39092,11 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     let outBuf = [];
     const code = MOS.runMaintenanceOwnerSelect(["--bad-flag"], { ctx: null, out: (s) => outBuf.push(s), env: { ...process.env } });
     assert.equal(code, 1, "坏参数 exit 1");
+    // ⑦' CLI 参数封闭：B/direct 互斥、flag 至多一次
+    assert.deepEqual([MOS.parseMaintenanceOwnerSelectArgs(["--migrate-b", "--apply"]).ok, MOS.parseMaintenanceOwnerSelectArgs(["--migrate-direct"]).ok], [true, true], "B/direct 合法形状");
+    assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--migrate-b"]).ok, false, "A/B 互斥拒");
+    assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-b", "--migrate-direct"]).ok, false, "B/direct 互斥拒");
+    assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-direct", "--apply", "--apply"]).ok, false, "--apply 重复拒");
     // --status 只读投影 + --migrate-a 预览零改动（走真夹具 ctx）
     {
       const fx = r52Setup({});

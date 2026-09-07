@@ -36696,9 +36696,9 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     assert.equal(TAL.schemaUpgrade(args).reason, "maintenance_capability_required", "租约缺失拒");
     fx.lease = acquireOperationLease({ dir: fx.maintDir, token: fx.tok });
 
-    // 放行冒烟：capability 全过后到达非 capability 错误（执行器哨兵）。
+    // 放行冒烟：capability 全过后不再是 capability 拒（§二实现后直接执行成功，同样证明核验放行）。
     const smoke = TAL.schemaUpgrade(args);
-    assert.equal(smoke.reason, "executor_unavailable", "capability 全过后到达执行器哨兵（证明核验放行）：" + JSON.stringify(smoke));
+    assert.ok(smoke.ok === true, "capability 全过后执行成功（证明核验放行）：" + JSON.stringify(smoke));
   }));
 
   test("R51 §一 capability：mint_selection_handles 仅 owner_select_migration_a", () => r51WithRoot((root, dir) => {
@@ -36738,7 +36738,15 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     }
     assert.equal(after.doc.records[b1b].kind, "voided_audit", "voided 不动");
 
-    // ── 重放：同 requestKey 重调 → replayed（账本已处于 after 态，capability 两态核放行）──
+    // ── 重放：同 requestKey 重调 → replayed。先回填 intended_after.ledger_sha256 = 执行后读回值
+    // （模拟 R52 markStepDone 前的回填：§8.2 schema_endpoint 行"ledger_sha256 = after 读回"），
+    // capability 的 after 态核才能放行到 writeLedger 的 requestKey 重放前置。──
+    fx.rewrite((d) => {
+      d.steps.find((s) => s.kind === "schema_endpoint").intended_after.ledger_sha256 = res.sha256;
+      const mint = d.steps.find((s) => s.kind === "mint");
+      mint.before.ledger_sha256 = res.sha256; // 状态链闭合：mint.before 与 schema_endpoint.intended_after 同步
+      mint.backup_sha256 = res.sha256;        // 备份恒需合同：backup_sha256 === before.ledger_sha256
+    });
     const rep = TAL.schemaUpgrade(args);
     assert.ok(rep.ok && rep.commit === "replayed", "同 key 重放：" + JSON.stringify(rep));
     assert.equal(TAL.loadLedger(dir, { endpointId: EP51 }).doc.revision, after.doc.revision, "重放不 bump revision");
@@ -36756,9 +36764,25 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     const envB = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fxB.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fxB.gateFile };
     const strictArgs = { endpointId: EP51, capability: { kind: "schema_upgrade", token: fxB.tok }, requestKey: "req_strict", fromSchema: "1.1-transition", toSchema: "1.1", env: envB };
     assert.equal(TAL.schemaUpgrade(strictArgs).reason, "precheck_failed", "strict 盘点 null-B1 非零拒");
-    // S1：legacy 非零、null 零 → precheck_failed（activate：B1+A1→B3 携 legacy pairing binding）
-    const rA1 = r51Ok(TAL.createA1({ endpointId: EP51, requestKey: "req_a1", chatId: "oc_r51a", sessionId: "sess-r51-a", now: Date.now() }), "A1").result.created_id;
-    r51Ok(TAL.activate({ endpointId: EP51, requestKey: "req_act", b1Id: b1a, a1Id: rA1, f4: { matched_om: "om_r51a", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }, authorizedBy: "ou_r51", now: Date.now() }), "activate");
+    // S1：legacy 非零、null 零。gated 事务（activate）不支 transition 账本（R52 范围），手工构造 legacy B3：
+    // B1 记录升 B3 族 + 旧 pairing binding/link proof（origin 仍指 seed op，G13/R32 相容）。
+    const r51ToLegacyB3 = (id) => {
+      const d = JSON.parse(fs.readFileSync(path.join(dir, "ledger.json"), "utf-8"));
+      const rec = d.records[id];
+      // origin 是 create_b1 op（族锁 B1）——换成 seed op（G13 case seed 不挑族），记录升 B3 携旧 pairing proof。
+      const op = d.operations[rec.origin_operation_id];
+      op.op_type = "seed"; op.terminal_kind = "seed";
+      op.fingerprint = TAL.fingerprintOf("seed", { request_key: op.request_key, candidates: [id] });
+      op.result = { seeded_ids: [id] };
+      rec.facts = { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" };
+      rec.aliases.session_id = "sess-r51-legacy";
+      rec.binding_proof = r51PairingBinding(rec.aliases.root_om);
+      rec.locator_link_proof_ref = r51Link(rec.aliases.root_om);
+      fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
+      const v = TAL.validateLedger(d, { endpointId: EP51 });
+      assert.equal(v.ok, true, "手工 legacy B3 账本自洽：" + JSON.stringify(v));
+    };
+    r51ToLegacyB3(b1a);
     const L2 = TAL.loadLedger(dir, { endpointId: EP51 });
     assert.ok(TAL.migrationInventory(L2.doc).legacy_proof_count > 0 && TAL.migrationInventory(L2.doc).null_b1_count === 0, "S1 前提：只有 legacy 非零");
     fxB.rewrite((d) => {
@@ -36767,8 +36791,10 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
       pc.intended_after = { legacy_proof_count: 0, null_b1_count: 0, revision: L2.doc.revision, ledger_sha256: L2.sha256 };
       const se = d.steps.find((s) => s.kind === "schema_endpoint");
       se.before = { schema_version: L2.doc.schema_version, revision: L2.doc.revision, ledger_sha256: L2.sha256 };
+      se.backup_sha256 = L2.sha256; // 备份恒需合同：backup_sha256 === before.ledger_sha256
     });
-    assert.equal(TAL.schemaUpgrade({ ...strictArgs, requestKey: "req_strict2" }).reason, "precheck_failed", "strict 盘点 legacy 非零拒");
+    const s1 = TAL.schemaUpgrade({ ...strictArgs, requestKey: "req_strict2" });
+    assert.equal(s1.reason, "precheck_failed", "strict 盘点 legacy 非零拒：" + JSON.stringify(s1));
   }));
 }
 

@@ -1627,7 +1627,7 @@ function writeLedger({ dir, endpointId, gated, requestKey = null, replay = null,
     }
     const nextV = validateLedger(m.next, { endpointId });
     if (!nextV.ok) return finalize({ ok: false, commit: "not_committed", reason: "would_corrupt", why: nextV.why });
-    const nextBytes = Buffer.from(JSON.stringify(m.next, null, 2) + "\n", "utf-8");
+    const nextBytes = serializeLedger(m.next);
     if (nextBytes.length > MAX_FILE_BYTES) return finalize({ ok: false, commit: "not_committed", reason: "over_capacity" });
 
     // 首次提交也要返回**刚落盘 operation 的 result**（评审三 P1-4）：取本笔（result_revision === 新 revision）。
@@ -1696,6 +1696,9 @@ function foldRelease(result, released) {
 export function fingerprintOf(opType, inputs) {
   return sha256(Buffer.from(JSON.stringify(stable({ op_type: opType, ...inputs })), "utf-8"));
 }
+
+/** 账本落盘字节（与 writeLedger 同一函数——plan 的 expected_ledger_sha256 必须用同一序列化重演算）。 */
+const serializeLedger = (doc) => Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8");
 
 /** 克隆、bump revision、盖一笔不可覆盖 operation（result 过 RESULT_SHAPE），再 mutateRecords。返回 next。 */
 function stampAndBuild(doc, { opType, inputs, result, mutateRecords }) {
@@ -2075,12 +2078,59 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
 
 /* ─────────────────────────── owner_select 迁移执行器（R51） ─────────────────────────── */
 
-/** R51 §二：schema_upgrade 窄事务（owner-select-route.md §6/§8；capability 见 _maintenanceVerifier）。 */
+/** R51 §二：schema_upgrade 窄事务（owner-select-route.md §6/§8）。
+ *  前置：fromSchema->toSchema ∈ VALID_UPGRADE_EDGES 且与 capability step 变体一致；strict/direct 当场重新盘点
+ *  （legacy 与 null-B1 全零才放行，不信任调用方盘点）。效果：schema_version 翻转 + 同笔给全部 live 记录补
+ *  四字段显式 null（已有值不动，tombstone/voided 不动）；重放纪律与既有一致（同 key 同 fp → replayed，
+ *  同 key 异 fp → request_conflict）。 */
 export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, toSchema, env = process.env, _inject = null } = {}) {
   if (!capability || capability.kind !== "schema_upgrade") return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "kind 不符或缺失" };
   const cap = _maintenanceVerifier(capability, endpointId, "schema_upgrade", env);
   if (!cap.ok) return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: cap.reason + (cap.why ? "：" + cap.why : "") };
-  return { ok: false, commit: "not_committed", reason: "executor_unavailable", why: "R51 §二 未实现（capability 已核过）" };
+  const edge = String(fromSchema) + "->" + String(toSchema);
+  if (typeof requestKey !== "string" || !REQUEST_KEY_SHAPE.test(requestKey)) return { ok: false, commit: "not_committed", reason: "bad_request_key" };
+  if (!VALID_UPGRADE_EDGES.includes(edge)) return { ok: false, commit: "not_committed", reason: "bad_upgrade_edge", why: edge };
+  const stepVariant = cap.osmStep.id.slice("schema_endpoint:".length).split(":")[1];
+  if (OSM_KIND_TO_UPGRADE_EDGE[cap.doc.operation_kind] !== edge || !"transition|strict|direct".split("|").includes(stepVariant)) {
+    return { ok: false, commit: "not_committed", reason: "edge_variant_mismatch", why: "capability step 变体 " + stepVariant + " 与边 " + edge + " 不一致" };
+  }
+  const d = resolveEndpointDir(endpointId, { env });
+  if (!d.ok) return badTx(d);
+  const inputs = { request_key: requestKey, endpoint: endpointId, from_schema: fromSchema, to_schema: toSchema };
+  let builtSha = null; // 写前算好的预期 SHA（serializeLedger 同源），读回核锚它
+  const res = writeLedger({
+    dir: d.dir, endpointId, gated: false, requestKey, _inject,
+    replay: () => [{ opType: "schema_upgrade", inputs }],
+    mutate: (currentDoc) => {
+      if (currentDoc === null) return { ok: false, reason: "absent" };
+      // strict/direct 当场重新盘点（§8：Codex 不以现场盘点作放行依据，实现单门内当场重盘）；transition 不盘（precheck 仅 B/direct）。
+      if (toSchema === "1.1") {
+        const inv = migrationInventory(currentDoc);
+        if (inv.legacy_proof_count !== 0 || inv.null_b1_count !== 0) return { ok: false, reason: "precheck_failed", why: "legacy_proof_count=" + inv.legacy_proof_count + " null_b1_count=" + inv.null_b1_count };
+      }
+      if (currentDoc.schema_version !== fromSchema) return { ok: false, reason: "schema_moved", why: "账本 schema_version " + currentDoc.schema_version + " ≠ fromSchema " + fromSchema };
+      const next = stampAndBuild(currentDoc, {
+        opType: "schema_upgrade", inputs, result: { endpoint: endpointId, from_schema: fromSchema, to_schema: toSchema },
+        mutateRecords: (n) => {
+          n.schema_version = toSchema;
+          if (toSchema === "1.1") return; // strict：四字段已存在（transition 补过），已有值不动
+          for (const rec of Object.values(n.records)) {
+            if (rec.kind !== "live") continue;
+            for (const k of ["selection_handle", "handle_expires_at", "rebind_handle", "rebind_expires_at"]) if (!(k in rec)) rec[k] = null;
+          }
+        },
+      });
+      builtSha = sha256(serializeLedger(next));
+      return { ok: true, next };
+    },
+  });
+  if (!res.ok || typeof res.commit !== "string" || !res.commit.startsWith("committed")) return { ok: false, commit: res?.commit ?? "not_committed", reason: res?.reason ?? "written_refused", why: res?.why ?? null, ...wrNote(res) };
+  if (res.idempotent) return { ok: true, commit: "replayed", revision: res.revision, result: res.result, ...wrNote(res) };
+  const reread = loadLedger(d.dir, { endpointId });
+  if (!reread.ok || reread.sha256 !== builtSha || reread.doc.schema_version !== toSchema) {
+    return { ok: false, commit: res.commit, reason: "written_mismatch", why: "读回 SHA/schema 与预期不符", ...wrNote(res) };
+  }
+  return { ok: true, commit: res.commit, revision: res.revision, result: res.result, sha256: reread.sha256, ...wrNote(res) };
 }
 
 /** R51 §五：mint_selection_handles 窄事务（§8.2 mint 行两态 CAS；capability 见 _maintenanceVerifier）。 */

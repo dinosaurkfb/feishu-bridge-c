@@ -2078,6 +2078,87 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
 
 /* ─────────────────────────── owner_select 迁移执行器（R51） ─────────────────────────── */
 
+/** R51 §四：mint plan（纯函数三件套，owner-select-route.md §8"mint plan"段 + §8.2 mint 行）。
+ *  handle 128-bit CSPRNG 只在进 forward-only 段之前生成一次并固化进不可变 plan；operation_id 冻结进
+ *  plan（否则 expected_ledger_sha256 无法确定性重放）；before/expected SHA 均用 serializeLedger
+ *  同一序列化（与 writeLedger 落盘字节完全一致）。输入域：1.1-transition 形状的 doc。 */
+
+/** §三盘点 + §四铸造目标：null-B1 有序 id 集（buildMintPlan 与 mintSelectionHandles 的 CAS 集合同源）。 */
+
+/** 构造 mint plan（不落盘；plan 字节的持久化与 intended_blob 锚定在 R52 编排）。非法 now → null。 */
+export function buildMintPlan({ doc, token, campaignId, endpointId, requestKey, now, ttlMs }) {
+  const frozen = isCanonicalMs(now) ? canonicalIso(now) : null;
+  if (frozen === null || !Number.isSafeInteger(ttlMs) || ttlMs < 0) return null;
+  const expires = canonicalIso(now + ttlMs);
+  if (expires === null) return null;
+  const expectedNullB1Ids = migrationInventory(doc).null_b1_ids;
+  const minted = expectedNullB1Ids.map((targetId) => ({ target_id: targetId, selection_handle: "osh_" + crypto.randomBytes(16).toString("hex") }));
+  const operationId = crypto.randomUUID();
+  const plan = {
+    plan_kind: "owner_select_mint_plan_v1",
+    token, campaign_id: campaignId, endpoint: endpointId, request_key: requestKey,
+    operation_id: operationId, frozen_at: frozen, handle_expires_at: expires,
+    before_ledger_sha256: sha256(serializeLedger(doc)),
+    expected_null_b1_ids: expectedNullB1Ids, minted,
+    expected_ledger_sha256: null,
+  };
+  plan.expected_ledger_sha256 = sha256(serializeLedger(applyMintPlan(doc, plan)));
+  return plan;
+}
+
+/** 把 plan 应用到 before doc（纯函数，不落盘）：revision+1；op key = plan.operation_id；
+ *  每 target 记录写 handle/expiry/updated_at 且 origin 指向本 op（affected/origin 与 R32 因果合同）。 */
+export function applyMintPlan(doc, plan) {
+  const next = structuredClone(doc);
+  next.revision = doc.revision + 1;
+  const inputs = { request_key: plan.request_key, endpoint: plan.endpoint, expected_null_b1_ids: plan.expected_null_b1_ids };
+  next.operations[plan.operation_id] = {
+    op_type: "mint_selection_handles", terminal_kind: "mint_selection_handles",
+    request_key: plan.request_key, fingerprint: fingerprintOf("mint_selection_handles", inputs),
+    result_revision: next.revision,
+    result: {
+      endpoint: plan.endpoint,
+      minted: plan.minted.map((m) => ({ target_id: m.target_id, selection_handle: m.selection_handle, handle_expires_at: plan.handle_expires_at })),
+      affected_live_ids_after_commit: plan.minted.map((m) => m.target_id),
+      proof_effects: [],
+    },
+  };
+  for (const m of plan.minted) {
+    const rec = next.records[m.target_id];
+    rec.selection_handle = m.selection_handle;
+    rec.handle_expires_at = plan.handle_expires_at;
+    rec.updated_at = plan.frozen_at;
+    rec.origin_operation_id = plan.operation_id;
+  }
+  return next;
+}
+
+/** mint plan 封闭形校验：键集、排序、handle 形、集合等式、时间规范、SHA 形。返回 null 或问题短句。 */
+export function mintPlanProblem(plan) {
+  if (!isObj(plan)) return "plan 不是对象";
+  if (keysOf(plan) !== "before_ledger_sha256,campaign_id,endpoint,expected_ledger_sha256,expected_null_b1_ids,frozen_at,handle_expires_at,minted,operation_id,plan_kind,request_key,token") return "plan 字段集不对";
+  if (plan.plan_kind !== "owner_select_mint_plan_v1") return "plan_kind 不对";
+  if (typeof plan.token !== "string" || !UUID_SHAPE.test(plan.token)) return "token 不是 UUID";
+  if (typeof plan.campaign_id !== "string" || !/^osc_[0-9a-f]{32}$/u.test(plan.campaign_id)) return "campaign_id 形状不对";
+  if (typeof plan.endpoint !== "string" || !ENDPOINT_SHAPE.test(plan.endpoint)) return "endpoint 形状不对";
+  if (typeof plan.request_key !== "string" || !REQUEST_KEY_SHAPE.test(plan.request_key)) return "request_key 形状不对";
+  if (typeof plan.operation_id !== "string" || !UUID_SHAPE.test(plan.operation_id)) return "operation_id 不是 UUID";
+  if (!isCanonicalIso(plan.frozen_at) || !isCanonicalIso(plan.handle_expires_at)) return "时间不是规范化 ISO";
+  if (typeof plan.before_ledger_sha256 !== "string" || !SHA_SHAPE.test(plan.before_ledger_sha256)) return "before_ledger_sha256 形状不对";
+  if (typeof plan.expected_ledger_sha256 !== "string" || !SHA_SHAPE.test(plan.expected_ledger_sha256)) return "expected_ledger_sha256 形状不对";
+  if (!Array.isArray(plan.expected_null_b1_ids) || !plan.expected_null_b1_ids.every((x) => isId(x)) || plan.expected_null_b1_ids.some((x, i) => i > 0 && plan.expected_null_b1_ids[i - 1] >= x)) return "expected_null_b1_ids 不是有序去重 id 集";
+  if (!Array.isArray(plan.minted)) return "minted 不是数组";
+  if (plan.minted.length !== plan.expected_null_b1_ids.length) return "minted 长度与 expected_null_b1_ids 不等";
+  for (let i = 0; i < plan.minted.length; i++) {
+    const m = plan.minted[i];
+    if (!isObj(m) || keysOf(m) !== "selection_handle,target_id") return "minted 项字段集不对";
+    if (!isId(m.target_id)) return "minted 项 target_id 形状不对";
+    if (typeof m.selection_handle !== "string" || !SELECTION_HANDLE_SHAPE.test(m.selection_handle)) return "minted 项 handle 形状不对";
+    if (m.target_id !== plan.expected_null_b1_ids[i]) return "minted 未按 target_id 排序（应与 expected_null_b1_ids 逐位相等）";
+  }
+  return null;
+}
+
 /** R51 §二：schema_upgrade 窄事务（owner-select-route.md §6/§8）。
  *  前置：fromSchema->toSchema ∈ VALID_UPGRADE_EDGES 且与 capability step 变体一致；strict/direct 当场重新盘点
  *  （legacy 与 null-B1 全零才放行，不信任调用方盘点）。效果：schema_version 翻转 + 同笔给全部 live 记录补

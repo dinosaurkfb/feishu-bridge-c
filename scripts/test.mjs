@@ -32374,7 +32374,7 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
     // G11′ 6 字段不等式：selected_root_om 不一致
     const dBad6Om = structuredClone(d);
     dBad6Om.records[taId1].locator_link_proof_ref.selected_root_om = "om_other";
-    assert.match(String(TAL.validateLedger(dBad6Om, { endpointId: EP }).why), /六字段等式/u, "binding 与 link 六字段不符拒 (selected_root_om)");
+    assert.match(String(TAL.validateLedger(dBad6Om, { endpointId: EP }).why), /六字段等式|aliases 不一致/u, "binding 与 link 六字段不符拒 (selected_root_om)");
   }
 
   // ── 5. G13′ 校验（produced vs preserved）──

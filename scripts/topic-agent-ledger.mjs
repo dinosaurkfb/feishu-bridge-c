@@ -2149,9 +2149,8 @@ function _migrationVerifier(capability, endpointId, opType, env = process.env) {
     if (!ld.ok) return ld;
     const cur = loadLedger(ld.dir, { endpointId });
     if (!cur.ok) return { ok: false, reason: cur.reason, why: cur.why ?? null };
-    if (step.before.ledger_sha256 !== cur.sha256) return { ok: false, reason: "before_sha_mismatch", why: "step.before.ledger_sha256 与当前账本 SHA 不符" };
-    if (isSchema && step.before.schema_version !== cur.doc.schema_version) return { ok: false, reason: "before_schema_mismatch", why: "step.before.schema_version 与当前 doc.schema_version 不符" };
     if (!isSchema && (!step.intended_blob || typeof step.intended_blob.path !== "string" || !step.intended_blob.path.endsWith("/intended/mint-" + endpointId + ".json"))) return { ok: false, reason: "blob_path_bad", why: "mint.intended_blob.path 不是 intended/mint-<ep>.json 的绝对路径" };
+    // 账本 SHA/schema 状态三态（before/expected/diverged）由执行器判：capability 只核身份/step 形状，不抢占状态机。
     return { ok: true, doc: j.doc, step, sha256: cur.sha256, variant: isSchema ? step.id.split(":")[2] : null, curDoc: cur.doc };
   });
   if (!binding.ok || !binding.run) return fail("lease_lost", "本过程不再持有 operation 租约实例（commitWhileHeld：" + (binding?.reason ?? "lock_lost") + "）");

@@ -28,6 +28,8 @@ export const MAINTENANCE_DIR_ENV = "FEISHU_BRIDGE_MAINTENANCE_DIR";
 export const JOURNAL_SCHEMA = "1.2";
 // M1b T4：cutover operation 从 1.3 起携带 sidecar step 与 plan_sha256 锚；1.1/1.2 冻结兼容照旧，1.2 读到 sidecar step 即 unreadable。
 export const CUTOVER_JOURNAL_SCHEMA = "1.3";
+// R50: owner-select 封闭联合（docs/architecture/owner-select-route.md §8.2）
+export const OWNER_SELECT_JOURNAL_SCHEMA = "1.4";
 // 旧 schema 1.1（无 operation_kind）：独立分支读，只作历史 journal（M1 账本接入 B-3 / 评审 P2-1）。
 export const LEGACY_JOURNAL_SCHEMA = "1.1";
 // M1b T4：sidecar 三件套（m1a-reconciliation.md §4.1 4e）——到期表 / 待认领表 / 交互策略条目。

@@ -356,6 +356,26 @@ export function familyOf(facts) {
   return null;
 }
 
+/** R51 §三：迁移盘点（纯函数，不验账本级合同）。输入域是 1.1-transition 形状的 doc（A 段语义：
+ *  live 记录已补显式四字段，selection_handle===null 才算 null-B1；1.0 形状字段缺位不在本合同域内）。
+ *  legacy = owner-select-route.md §8"存量范围"：binding_proof.kind=pairing 的 live +
+ *  locator_link_proof_ref.kind=f4_anchor 的 live + tombstone（forwarding_tombstone）proof_ref.kind=pairing（旧系，
+ *  新系是 owner_select_merge_v1）。计数单位是 proof 面，不是记录。*/
+export function migrationInventory(doc) {
+  let legacy = 0;
+  const nullB1 = [];
+  for (const [id, rec] of Object.entries(doc?.records ?? {})) {
+    if (rec.kind === "live") {
+      if (rec.binding_proof?.kind === "pairing") legacy++;
+      if (rec.locator_link_proof_ref?.kind === "f4_anchor") legacy++;
+      if (familyOf(rec.facts) === "B1" && rec.selection_handle === null) nullB1.push(id);
+    } else if (rec.kind === "forwarding_tombstone") {
+      if (rec.proof_ref?.kind === "pairing") legacy++;
+    }
+  }
+  return { legacy_proof_count: legacy, null_b1_count: nullB1.length, null_b1_ids: nullB1.sort() };
+}
+
 const targetProblem = (t) => {
   if (!isObj(t)) return "binding_target 不是对象";
   if (typeof t.project_root !== "string" || !path.isAbsolute(t.project_root)) return "project_root 不是绝对路径";

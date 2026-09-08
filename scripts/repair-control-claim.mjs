@@ -63,7 +63,7 @@ export function describeControlRepair({ seen, result, apply }) {
   const intentDesc = describeIntent(seen.intent);
   const head = { in_flight: "事务未闭合：控制意图 " + intentDesc + "，终态缺席", consumed: "已闭合，无需恢复", mismatch: "终态与意图不一致：" + (seen.why ?? ""),
     consumed_unreadable: "终态记录损坏（意图 " + intentDesc + "）：" + (seen.why ?? ""), failed_unreadable: "失败记录损坏（意图 " + intentDesc + "）：" + (seen.why ?? ""),
-    failed: "已记为失败（当时没切成），不恢复", conflict: "两份终态并存（" + (seen.why ?? "") + "），请人工查看", not_control: "这张 claim 不是控制命令",
+    failed: "已记为失败（" + (seen.intent?.control === "select" ? "当时未执行选择" : "当时没切成") + "），不恢复", conflict: "两份终态并存（" + (seen.why ?? "") + "），请人工查看", not_control: "这张 claim 不是控制命令",
     claim_unreadable: "claim 不属于当前绑定 / 读不出：" + (seen.why ?? ""), claim_absent: "没有这张 claim" }[seen.state]
     ?? ("说不清：" + seen.state + (seen.why ? "：" + seen.why : ""));
   const resumable = RESUMABLE_CONTROL_STATES.includes(seen.state);
@@ -78,6 +78,19 @@ export function repairExitCode({ seen, result, apply }) {
   if (result) return result.ok && !(result.residueUncleared?.length) && !result.residueUnknown && !result.lockUncleared ? 0 : 1;
   if (!apply) return 0;
   return seen.state === "consumed" && !(seen.residue?.length) && !seen.listingProblem ? 0 : 1;
+}
+
+/**
+ * 两个 repair 消费者的按 kind 穷举分发（Claude 与 Codex 共用）：
+ *   - select 支：走 onSelect（默认 executeSelectControl）
+ *   - mode 支：走 onMode
+ *   - 其它值 fail-closed：结构化拒 unknown_control_kind，不得"否则按 mode"
+ */
+export function dispatchControlRepair(target, { onMode, onSelect = executeSelectControl }) {
+  const kind = target?.control ?? (typeof target === "string" ? "mode" : null);
+  if (kind === "select") return onSelect(target);
+  if (kind === "mode") return onMode(typeof target === "string" ? target : target.mode);
+  return { ok: false, reason: "unknown_control_kind", why: "未知控制命令类型（" + String(kind) + "）" };
 }
 
 export { expectationFromMapping, claudeControlPrecondition as controlRepairPrecondition } from "./control-identity.mjs";
@@ -105,10 +118,10 @@ if (isDirectRun(import.meta.url)) {
   if (parsed.apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）
   if (parsed.apply && (RESUMABLE_CONTROL_STATES.includes(seen.state) || seen.state === "consumed")) {
     result = resumeControlClaim({ claimsDir, key: parsed.key, expect,
-      execute: (target) => target?.control === "select"
-        ? executeSelectControl(target)
-        : setClaudeInteractionMode({ root, claudeSessionId: expect.claudeSessionId, mode: target,
-            precondition: claudeControlPrecondition({ claimsDir, key: parsed.key, root }) }) });
+      execute: (target) => dispatchControlRepair(target, {
+        onMode: (mode) => setClaudeInteractionMode({ root, claudeSessionId: expect.claudeSessionId, mode,
+          precondition: claudeControlPrecondition({ claimsDir, key: parsed.key, root }) }),
+      }) });
   }
   // 不是控制命令的 claim 也可能是收边的拒绝（第 3 层）：同一个入口，另一套事务。
   if (seen.state === "not_control") {

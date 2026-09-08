@@ -38,6 +38,7 @@ import { sweepEligible } from "./drain-all.mjs";
 import { remindCodexPendingClaims } from "./claim-reminder.mjs";
 import { claimKey, recordClaimState, readClaimState, acquireClaim } from "../claim.mjs";
 import { codexControlRepairPrecondition } from "./repair-control-claim.mjs";
+import { dispatchControlRepair } from "../repair-control-claim.mjs";
 import { codexControlPrecondition } from "./control-identity.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
 import {
@@ -10325,9 +10326,49 @@ test("R52a 返修三 P1-1: Codex 侧 select in-flight claim 维护恢复（claim
   assert.match(repaired.stdout, /没有恢复（control_failed：select_off）/u, "恢复执行收敛为 control_failed(select_off)：" + repaired.stdout);
   assert.equal(fs.existsSync(path.join(paths.claims, key + ".failed.json")), true, "已收敛出 failed 记录");
 
-  // 3. 再次查看：已收敛为 failed 状态
+  // 3. 再次查看：已收敛为 failed 状态（按 select kind 投影文案）
   const after = repair("--thread-id", THREAD_A, "--key", key);
-  assert.match(after.stdout, /已记为失败（当时没切成），不恢复/u, "已闭合不再恢复：" + after.stdout);
+  assert.match(after.stdout, /已记为失败（当时未执行选择），不恢复/u, "已闭合不再恢复：" + after.stdout);
+});
+
+test("R52a 返修四 P2: Codex 侧 repair 消费者显式按 kind 穷举（control: 'wat' 结构化拒，不走 mode）", () => {
+  let modeCalled = false;
+  let selectCalled = false;
+  const res = dispatchControlRepair({ control: "wat" }, {
+    onMode: () => { modeCalled = true; },
+    onSelect: () => { selectCalled = true; },
+  });
+  assert.equal(modeCalled, false, "不得走 mode");
+  assert.equal(selectCalled, false, "不得走 select");
+  assert.deepEqual(res, { ok: false, reason: "unknown_control_kind", why: "未知控制命令类型（wat）" });
+
+  // 正常 mode 分发
+  let modeGiven = null;
+  const modeRes = dispatchControlRepair({ control: "mode", mode: "dialogue" }, {
+    onMode: (m) => { modeGiven = m; return { ok: true, changed: true }; },
+    onSelect: () => ({ ok: false }),
+  });
+  assert.equal(modeGiven, "dialogue");
+  assert.equal(modeRes.ok, true);
+
+  // 纯字符串 mode 分发（历史调用形态）
+  let stringModeGiven = null;
+  const strRes = dispatchControlRepair("mapping", {
+    onMode: (m) => { stringModeGiven = m; return { ok: true, changed: false }; },
+    onSelect: () => ({ ok: false }),
+  });
+  assert.equal(stringModeGiven, "mapping");
+  assert.equal(strRes.ok, true);
+
+  // 正常 select 分发
+  let selectGiven = null;
+  const selTarget = { control: "select", handle: "orh_test", handle_kind: "orh" };
+  const selRes = dispatchControlRepair(selTarget, {
+    onMode: () => ({ ok: false }),
+    onSelect: (s) => { selectGiven = s; return { ok: false, reason: "select_off" }; },
+  });
+  assert.deepEqual(selectGiven, selTarget);
+  assert.equal(selRes.reason, "select_off");
 });
 
 summarySealed = true;

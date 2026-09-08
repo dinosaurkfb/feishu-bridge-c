@@ -356,7 +356,7 @@ function runLockedTransaction({ claimsDir, key, intent: caller, execute, replay,
     quarantined.push(name);
   }
   // consumed 缺席或损坏、failed 不在场：执行（首次）或续做（重放）
-  const done = execute(intent.control === "select" ? intent : intent.mode);
+  const done = execute(intent.control === "select" ? intent : intent.control === "mode" ? intent.mode : intent);
   if (!done.ok) {
     const why = done.reason ?? done.error ?? "?";
     if (consumed.status === "absent") {

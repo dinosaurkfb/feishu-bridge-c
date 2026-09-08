@@ -4,7 +4,7 @@
  */
 
 import { isDirectRun } from "../direct-run.mjs";
-import { describeControlRepair, parseRepairControlArgs, repairExitCode } from "../repair-control-claim.mjs";
+import { describeControlRepair, parseRepairControlArgs, repairExitCode, dispatchControlRepair } from "../repair-control-claim.mjs";
 import { RESUMABLE_CONTROL_STATES, inspectControlClaim, resumeControlClaim } from "../control-command.mjs";
 import { codexControlPrecondition } from "./control-identity.mjs";
 import { RESUMABLE_REJECT_STATES, describeRejectRepair, inspectRejectedClaim, rejectRepairExitCode, resumeRejectedClaim } from "../reject-control.mjs";
@@ -27,10 +27,10 @@ if (isDirectRun(import.meta.url)) {
   if (parsed.apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）
   if (parsed.apply && (RESUMABLE_CONTROL_STATES.includes(seen.state) || seen.state === "consumed")) {
     result = resumeControlClaim({ claimsDir, key: parsed.key, expect,
-      execute: (target) => target?.control === "select"
-        ? executeSelectControl(target)
-        : setTaskInteractionMode({ threadId: parsed.root, mode: target, home,
-            precondition: codexControlPrecondition({ claimsDir, key: parsed.key, expect }) }) });
+      execute: (target) => dispatchControlRepair(target, {
+        onMode: (mode) => setTaskInteractionMode({ threadId: parsed.root, mode, home,
+          precondition: codexControlPrecondition({ claimsDir, key: parsed.key, expect }) }),
+      }) });
   }
   // 不是控制命令的 claim 也可能是收边的拒绝（第 3 层）：同一个入口，另一套事务。
   if (seen.state === "not_control") {

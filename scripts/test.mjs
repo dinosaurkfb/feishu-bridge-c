@@ -28,7 +28,7 @@ import { SENDER_ROLES, roleCounts, roleCountsText, senderRole, senderRolesProble
 import { parseRegisterSenderArgs, planSenderChange, applySenderChange } from "./register-sender.mjs";
 import { parseRegisterP2pArgs, planP2pChange, applyP2pChange } from "./register-p2p-chat.mjs";
 import * as TAL from "./topic-agent-ledger.mjs";
-import { selectAdmission, selectReject } from "./select-admission.mjs";
+import { executeSelectControl, selectAdmission, selectReject } from "./select-admission.mjs";
 import * as DW from "./m1a/dual-write.mjs";
 import * as WIRE from "./m1a/wiring.mjs";
 // symlink 锁：existsSync 会跟随到不存在的目标，锁在不在只能用 lstat 判
@@ -88,7 +88,7 @@ import {
   runRouteSha256, markPublished, readPublishLedger, writePublishLedger, publishHold } from "./outbound.mjs";
 import { parseRunOutcome } from "./handoff.mjs";
 import { repairRunClaims } from "./repair-run-claim.mjs";
-import { claudeClaimExpectation, controlRepairPrecondition, repairExitCode, expectationFromMapping, describeControlRepair } from "./repair-control-claim.mjs";
+import { claudeClaimExpectation, controlRepairPrecondition, repairExitCode, expectationFromMapping, describeControlRepair, dispatchControlRepair } from "./repair-control-claim.mjs";
 import { claudeControlPrecondition } from "./control-identity.mjs";
 import {
   describeDrainOutcome, drainProject, inspectRunChannel, outboxDirOf, suppressCmd, watcherActive, inventoryUnroutedReplies } from "./drain-outbox.mjs";
@@ -18939,7 +18939,7 @@ test("R52a 返修二：/feishu-select 入站全路径（owner 默认 off + 终�
   // 4. 准入为 on 时（纯依赖注入，生产不可达）：owner 发 /feishu-select <osh> → 执行器未接入期不得落 consumed，落 failed(select_executor_absent) + 重放幂等
   const resOn = run("/feishu-select " + h, "msg_sel_on", TPL.frank_sender_id, { entry: runnerOn });
   assert.equal(resOn.status, 0, resOn.stdout + resOn.stderr);
-  assert.match(resOn.stdout, /已收到选择，执行器尚未接入，未消费/u, resOn.stdout);
+  assert.match(resOn.stdout, /已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送/u, resOn.stdout);
   assert.match(resOn.stdout, /已拒绝/u, resOn.stdout);
   const keyOn = claimKey("msg_sel_on", logicalTaskKey);
   const storedOn = readClaimState({ claimsDir, key: keyOn });
@@ -18961,13 +18961,62 @@ test("R52a 返修二：/feishu-select 入站全路径（owner 默认 off + 终�
   const receiptsCountBeforeOn = fs.readdirSync(receiptsDir).length;
   const replayOn = run("/feishu-select " + h, "msg_sel_on", TPL.frank_sender_id, { entry: runnerOn });
   assert.equal(replayOn.status, 0, replayOn.stdout + replayOn.stderr);
-  assert.match(replayOn.stdout, /已收到选择，执行器尚未接入，未消费/u, replayOn.stdout);
+  assert.match(replayOn.stdout, /已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送/u, replayOn.stdout);
   assert.equal(fs.readdirSync(receiptsDir).length, receiptsCountBeforeOn, "重放幂等：不再写第二份回执");
   const replayOnStored = readClaimState({ claimsDir, key: keyOn });
   assert.equal(replayOnStored.status, "valid");
   assert.deepEqual(replayOnStored.claim.control, { control: "select", handle: h, handle_kind: "osh" });
   assert.ok(!fs.existsSync(path.join(claimsDir, keyOn + ".consumed.json")), "重放后仍不得落 consumed 记录");
   assert.ok(fs.existsSync(failedFileOn), "同一 failed 终态仍有效");
+
+  // 5. 【R52a 返修四 P1】首次 failed(select_executor_absent) → 重放 → control_failed_recorded 且执行器调用次数 0（钉住"不再调用"）
+  let executorCalls = 0;
+  const keyReplayCallTest = claimKey("msg_sel_replay_call", logicalTaskKey);
+  acquireClaim({
+    claimsDir,
+    messageId: "msg_sel_replay_call",
+    logicalTaskKey,
+    meta: {
+      control: { control: "select", handle: h, handle_kind: "osh" },
+      policy_id: MAPPING_POLICY_ID,
+      policy_version: "1.0",
+      local_target_id: "lt_test",
+      origin_channel_generation_id: "ch_test",
+    },
+  });
+  const firstTx = runControlTransaction({
+    claimsDir,
+    key: keyReplayCallTest,
+    intent: { control: "select", handle: h, handle_kind: "osh" },
+    replay: false,
+    execute: (intent) => {
+      executorCalls += 1;
+      return executeSelectControl(intent, { selectAdmissionFn: () => ({ state: "on" }) });
+    }
+  });
+  assert.equal(firstTx.ok, false);
+  assert.equal(firstTx.reason, "control_failed");
+  assert.equal(firstTx.why, "select_executor_absent");
+  assert.equal(firstTx.text, "已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送");
+  assert.equal(executorCalls, 1, "首次执行：调用执行器 1 次");
+
+  let replayCalls = 0;
+  const replayTx = runControlTransaction({
+    claimsDir,
+    key: keyReplayCallTest,
+    intent: { control: "select", handle: h, handle_kind: "osh" },
+    replay: true,
+    execute: (intent) => {
+      replayCalls += 1;
+      return executeSelectControl(intent, { selectAdmissionFn: () => ({ state: "on" }) });
+    }
+  });
+  assert.equal(replayTx.ok, false);
+  assert.equal(replayTx.reason, "control_failed_recorded");
+  assert.equal(replayTx.why, "select_executor_absent");
+  assert.equal(replayTx.replayed, true);
+  assert.equal(replayCalls, 0, "重放执行：执行器调用次数必须恰为 0（钉住不再调用）");
+  assert.equal(executorCalls, 1, "执行器总调用次数保持为 1");
 });
 
 test("R52a 返修三 P1-1: Claude 侧 select in-flight claim 维护恢复（claim 已取、终态未落 → repair 预览与 apply 能收敛）", () => {
@@ -19021,9 +19070,49 @@ test("R52a 返修三 P1-1: Claude 侧 select in-flight claim 维护恢复（clai
   assert.match(repaired.stdout, /没有恢复（control_failed：select_off）/u, "恢复执行收敛为 control_failed(select_off)：" + repaired.stdout);
   assert.equal(fs.existsSync(path.join(claimsDir, key + ".failed.json")), true, "已收敛出 failed 记录");
 
-  // 3. 再次查看：已收敛为 failed 状态
+  // 3. 再次查看：已收敛为 failed 状态（按 select kind 投影文案）
   const after = repair("--project", root, "--key", key);
-  assert.match(after.stdout, /已记为失败（当时没切成），不恢复/u, "已闭合不再恢复：" + after.stdout);
+  assert.match(after.stdout, /已记为失败（当时未执行选择），不恢复/u, "已闭合不再恢复：" + after.stdout);
+});
+
+test("R52a 返修四 P2: Claude 侧 repair 消费者显式按 kind 穷举（control: 'wat' 结构化拒，不走 mode）", () => {
+  let modeCalled = false;
+  let selectCalled = false;
+  const res = dispatchControlRepair({ control: "wat" }, {
+    onMode: () => { modeCalled = true; },
+    onSelect: () => { selectCalled = true; },
+  });
+  assert.equal(modeCalled, false, "不得走 mode");
+  assert.equal(selectCalled, false, "不得走 select");
+  assert.deepEqual(res, { ok: false, reason: "unknown_control_kind", why: "未知控制命令类型（wat）" });
+
+  // 正常 mode 分发
+  let modeGiven = null;
+  const modeRes = dispatchControlRepair({ control: "mode", mode: "dialogue" }, {
+    onMode: (m) => { modeGiven = m; return { ok: true, changed: true }; },
+    onSelect: () => ({ ok: false }),
+  });
+  assert.equal(modeGiven, "dialogue");
+  assert.equal(modeRes.ok, true);
+
+  // 纯字符串 mode 分发（历史调用形态）
+  let stringModeGiven = null;
+  const strRes = dispatchControlRepair("mapping", {
+    onMode: (m) => { stringModeGiven = m; return { ok: true, changed: false }; },
+    onSelect: () => ({ ok: false }),
+  });
+  assert.equal(stringModeGiven, "mapping");
+  assert.equal(strRes.ok, true);
+
+  // 正常 select 分发
+  let selectGiven = null;
+  const selTarget = { control: "select", handle: "osh_test", handle_kind: "osh" };
+  const selRes = dispatchControlRepair(selTarget, {
+    onMode: () => ({ ok: false }),
+    onSelect: (s) => { selectGiven = s; return { ok: false, reason: "select_off" }; },
+  });
+  assert.deepEqual(selectGiven, selTarget);
+  assert.equal(selRes.reason, "select_off");
 });
 
 test("R52a 返修三 P2: describeControlRepair 按 kind 投影（select 显示 handle / 默认候选，不显示 mode）", () => {

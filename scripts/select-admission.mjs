@@ -27,20 +27,20 @@ export function selectReject(adm, handle_kind) {
 
 /**
  * 执行选择控制命令（在控制事务锁内跑）。
- * PR #136 一轮回带（P1-4b / §12）：执行器未接入期间，准入通过也【不得落 consumed】——
- * 落 control-failed 终态 select_executor_absent（回执"已收到选择，执行器尚未接入，未消费"），
- * claim 不被永久消费，后续真执行器接入后同一 message 的重放可补做。
+ * PR #136 二轮回带（P1 / §12）：执行器未接入期间，准入通过也【落普通 failed 终态】——
+ * 落 control-failed 终态 select_executor_absent（回执"已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送"），
+ * 终态不重试、重放直接报 control_failed_recorded 不再调用执行器，后续真执行器接入后需发新消息。
  */
 export function executeSelectControl(intent, { selectAdmissionFn = selectAdmission } = {}) {
   const adm = selectAdmissionFn();
   const ej = selectReject(adm, intent?.handle_kind);
   if (ej) return { ok: false, reason: ej.reason, text: ej.text };
-  return { ok: false, reason: "select_executor_absent", text: "已收到选择，执行器尚未接入，未消费" };
+  return { ok: false, reason: "select_executor_absent", text: "已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送" };
 }
 
 /** 给定拒绝 reason 反解说明文案（重放从记录恢复文案时用）。 */
 export function selectRejectTextByReason(reason) {
-  if (reason === "select_executor_absent") return "已收到选择，执行器尚未接入，未消费";
+  if (reason === "select_executor_absent") return "已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送";
   if (reason === "select_writer_state_unreadable") return "选择功能状态读不清，未执行";
   if (reason === "select_off") return "选择功能未开放（迁移未开始）";
   if (reason === "select_partial_not_rfh") return "迁移期间只接受 rfh_ 重确认 handle";

@@ -15,6 +15,7 @@ import { DIALOGUE_POLICY_ID, MAPPING_POLICY_ID } from "./interaction-policy.mjs"
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE, readClaimState, recordClaimState } from "./claim.mjs";
 import { controlIntentProblem, sameControlIntent } from "./control-intent.mjs";
+import { SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE } from "./topic-agent-ledger.mjs";
 
 export { CONTROL_MODES, controlIntentProblem, sameControlIntent } from "./control-intent.mjs";
 
@@ -24,11 +25,24 @@ const SHAPES = {
   claude: new RegExp("^\\/feishu-mode (" + CONTROL_MODE_WORDS.join("|") + ")$", "u"),
   codex: new RegExp("^\\$feishu-mode (" + CONTROL_MODE_WORDS.join("|") + ")$", "u"),
 };
+// R52a：/feishu-select 的 handle 正则**从 topic-agent-ledger 导出的 handle 形状常量生成**（单一出处；不另写一份字母表）。
+// 注（PR #136 P2 / §12）："owner 先于 handle 解析"指的是业务解析层面（先核验 owner 身份与写入准入，再做 handle 寻址），不是词法层面的顺序。
+const HANDLE_ALTS = Object.freeze([
+  { re: SELECTION_HANDLE_SHAPE, kind: "osh" },
+  { re: REBIND_HANDLE_SHAPE, kind: "orh" },
+  { re: REAFFIRM_HANDLE_SHAPE, kind: "rfh" },
+]);
+const HANDLE_ALT = HANDLE_ALTS.map(({ re }) => re.source.replace(/^\^|\$$/gu, "")).join("|");
+const SELECT_SHAPES = {
+  claude: new RegExp("^\\/feishu-select(?: (" + HANDLE_ALT + "))?$", "u"),
+  codex: new RegExp("^\\$feishu-select(?: (" + HANDLE_ALT + "))?$", "u"),
+};
+const handleKindOf = (h) => h === null ? null : (h.startsWith("osh_") ? "osh" : h.startsWith("orh_") ? "orh" : h.startsWith("rfh_") ? "rfh" : null);
 
 /**
  * 飞书客户端会在 @ 之后 / 词与词之间塞进不换行空格（U+00A0）、全角空格（U+3000）、零宽字符（U+200B…）、
  * 全角斜杠 / 美元符；这些都**不是字**，精确匹配前先折叠掉 —— "多一个字都不算"守的是词，不是不可见字节。
- * 线上实测（2026-08-28 msg_4kxxcb0p58a45）：肉眼完全一样的 /feishu-mode dialogue 没被当成控制命令而被当普通指令投递。
+ * 折叠只针对零宽字符、NBSP/全角空格、全角前缀与 ASCII 多空格（C0 控制字符与换行/制表在折叠前即拒，PR #136 一轮回带）。
  */
 export function normalizeControlText(instruction) {
   if (typeof instruction !== "string") return instruction;
@@ -36,30 +50,47 @@ export function normalizeControlText(instruction) {
     .replace(/[\u200B-\u200D\u2060\uFEFF]/gu, "")
     .replace(/／/gu, "/")
     .replace(/＄/gu, "$")
-    .replace(/\s+/gu, " ")   // JS 的 \s 已含 U+00A0 / U+3000
-    .trim();
+    .replace(/[ \u00A0\u3000]+/gu, " ")
+    .replace(/^[ \u00A0\u3000]+|[ \u00A0\u3000]+$/gu, "");
 }
 
 /** @returns {{kind:"mode", mode:string}|null} */
 export function parseControlCommand(instruction, { chain } = {}) {
-  const re = SHAPES[chain];
-  if (!re || typeof instruction !== "string") return null;
-  const m = re.exec(normalizeControlText(instruction));
-  if (!m) return null;
-  return { kind: "mode", mode: m[1] === "dialogue" ? DIALOGUE_POLICY_ID : MAPPING_POLICY_ID };
+  if (typeof instruction !== "string") return null;
+  const norm = normalizeControlText(instruction);
+  const modeRe = SHAPES[chain];
+  if (modeRe) { const m = modeRe.exec(norm); if (m) return { kind: "mode", mode: m[1] === "dialogue" ? DIALOGUE_POLICY_ID : MAPPING_POLICY_ID }; }
+  const selRe = SELECT_SHAPES[chain];
+  if (selRe) {
+    const m = selRe.exec(norm);
+    if (m) return { kind: "select", handle: m[1] ?? null, handle_kind: handleKindOf(m[1] ?? null) };
+  }
+  return null;
 }
 
 const CONSUMED_KEYS = "changed,claim_key,control,mode,recorded_at,schema_version,state";
 
+function intentFromConsumedRecord(rec) {
+  return rec?.control === "select"
+    ? { control: "select", handle: rec.handle, handle_kind: rec.handle_kind }
+    : { control: rec?.control, mode: rec?.mode };
+}
+
+function intentTarget(i) {
+  return i?.control === "select" ? i?.handle : i?.mode;
+}
+
 /** consumed 记录（<key>.consumed.json）的封闭形状：键集恰为 CONSUMED_KEYS；坏了要进账本 problems，不能按文件名当健康。 */
 export function consumedRecordProblem(doc, key) {
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return "不是记录对象";
-  if (Object.keys(doc).sort().join(",") !== CONSUMED_KEYS) return "字段集不对";
+  // R52a 返修一：consumed 记录按 kind 判别联合 —— mode → {control,mode}；select → {control,handle,handle_kind}。
+  const wantKeys = doc.control === "select" ? "changed,claim_key,control,handle,handle_kind,recorded_at,schema_version,state" : CONSUMED_KEYS;
+  if (Object.keys(doc).sort().join(",") !== wantKeys) return "字段集不对";
   if (doc.schema_version !== "1.0") return "schema_version 不认识";
   if (doc.state !== "consumed") return "state 不是 consumed";
   if (doc.claim_key !== key) return "claim_key 跟文件名对不上";
   if (!isCanonicalIso(doc.recorded_at)) return "recorded_at 不是规范时间";
-  const intentProblem = controlIntentProblem({ control: doc.control, mode: doc.mode });
+  const intentProblem = controlIntentProblem(intentFromConsumedRecord(doc));
   if (intentProblem !== null) return intentProblem;
   if (typeof doc.changed !== "boolean") return "changed 不是布尔";
   return null;
@@ -84,8 +115,13 @@ function readRecordFile(file, { afterOpen = null } = {}) {
 }
 
 /**
- * 读 consumed 记录：absent / valid / mismatch / unreadable。
- * 给了 expectedIntent 就逐字段核对：记录合法但意图对不上 → mismatch（不许把别的意图的结果当成这次的）。
+ * 读一条 claim 对应的 consumed 记录并做受控校验。
+ *
+ * 与 readClaimState 同理：
+ *   · absent：文件不在，正常（还没完成）；
+ *   · unreadable：读不出 / 格式不对 / 校验没过，问题描述在 why 里；
+ *   · mismatch：文件合法但 recorded_at / 意图与当前期望不一致（人换了文件）；
+ *   · valid：内容完整合法。
  */
 export function readConsumedRecord({ claimsDir, key, expectedIntent = undefined, afterOpen = null }) {
   if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) return { status: "unreadable", why: "key 形状不对" };
@@ -93,8 +129,8 @@ export function readConsumedRecord({ claimsDir, key, expectedIntent = undefined,
   if (r.status !== "read") return r;
   const problem = consumedRecordProblem(r.doc, key);
   if (problem) return { status: "unreadable", why: problem };
-  if (expectedIntent !== undefined && !sameControlIntent(expectedIntent, { control: r.doc.control, mode: r.doc.mode })) {
-    return { status: "mismatch", why: "consumed 的意图（" + r.doc.mode + "）与 claim 的意图（" + String(expectedIntent?.mode) + "）不一致", record: r.doc };
+  if (expectedIntent !== undefined && !sameControlIntent(expectedIntent, intentFromConsumedRecord(r.doc))) {
+    return { status: "mismatch", why: "consumed 的意图（" + intentTarget(r.doc) + "）与 claim 的意图（" + intentTarget(expectedIntent) + "）不一致", record: r.doc };
   }
   return { status: "valid", record: r.doc };
 }
@@ -108,7 +144,7 @@ export function controlFailedRecordProblem(doc, key) {
   if (doc.state !== "failed") return "state 不是 failed";
   if (doc.claim_key !== key) return "claim_key 跟文件名对不上";
   if (doc.reason !== "control_failed") return "reason 不是 control_failed";
-  if (doc.control !== "mode") return "control 不是 mode";
+  if (doc.control !== "mode" && doc.control !== "select") return "control 不是 mode/select";
   if (typeof doc.error !== "string") return "error 不是字符串";
   if (!isCanonicalIso(doc.recorded_at)) return "recorded_at 不是规范时间";
   return null;
@@ -303,7 +339,7 @@ function runLockedTransaction({ claimsDir, key, intent: caller, execute, replay,
   const intent = claim.claim.control;
   if (intent === undefined) return { ok: false, reason: "not_control", why: "锁内读到的 claim 没有控制意图", quarantined };
   if (caller !== null && !sameControlIntent(caller, intent)) {
-    return { ok: false, reason: "claim_intent_mismatch", why: "锁内 claim 的意图（" + intent.mode + "）与这次的（" + caller.mode + "）不一致", quarantined };
+    return { ok: false, reason: "claim_intent_mismatch", why: "锁内 claim 的意图（" + intentTarget(intent) + "）与这次的（" + intentTarget(caller) + "）不一致", quarantined };
   }
   // **锁内状态对所有调用者都是权威的**：不管调用方自称首次还是重放，这一笔已经闭合（consumed / 受验 failed / 并存）就不再执行。
   // 重复投递先完成、原 claim 持有者晚到 —— 晚到者在这里按记录重出回执（replayed），而不是再切一次并覆写记录。
@@ -320,18 +356,21 @@ function runLockedTransaction({ claimsDir, key, intent: caller, execute, replay,
     quarantined.push(name);
   }
   // consumed 缺席或损坏、failed 不在场：执行（首次）或续做（重放）
-  const done = execute(intent.mode);
+  const done = execute(intent.control === "select" ? intent : intent.control === "mode" ? intent.mode : intent);
   if (!done.ok) {
-    const why = done.reason ?? "?";
+    const why = done.reason ?? done.error ?? "?";
     if (consumed.status === "absent") {
       try { recordClaimState({ claimsDir, key, state: "failed", detail: { reason: "control_failed", control: intent.control, error: why } }); }
       catch (err) { return { ok: false, reason: "control_failed", why, ledger: "failed_unwritten：" + String(err?.code ?? err?.message ?? err), quarantined }; }
     }
-    return { ok: false, reason: "control_failed", why, quarantined };
+    return { ok: false, reason: "control_failed", why, text: done.text, quarantined };
   }
   const changed = done.changed !== false;
   try {
-    recordClaimState({ claimsDir, key, state: "consumed", detail: { control: intent.control, mode: intent.mode, changed } });
+    const detail = intent.control === "select"
+      ? { control: "select", handle: intent.handle, handle_kind: intent.handle_kind, changed }
+      : { control: intent.control, mode: intent.mode, changed };
+    recordClaimState({ claimsDir, key, state: "consumed", detail });
   } catch (err) {
     return { ok: false, reason: "ledger_unwritten", why: String(err?.code ?? err?.message ?? err), changed, resumed: replay, quarantined };
   }
@@ -364,9 +403,10 @@ export function inspectControlClaim({ claimsDir, key, expect = {} }) {
   if (consumed.status !== "absent" && failed.status !== "absent") return { state: "conflict", intent, why: jointWhy(failed, consumed), ...extras };
   if (consumed.status === "unreadable") return { state: "consumed_unreadable", intent, why: consumed.why, ...extras };
   if (consumed.status === "valid") {
-    return sameControlIntent(intent, { control: consumed.record.control, mode: consumed.record.mode })
+    const cIntent = intentFromConsumedRecord(consumed.record);
+    return sameControlIntent(intent, cIntent)
       ? { state: "consumed", intent, record: consumed.record, ...extras }
-      : { state: "mismatch", intent, why: "consumed 的意图（" + consumed.record.mode + "）与 claim 的意图（" + intent.mode + "）不一致", ...extras };
+      : { state: "mismatch", intent, why: "consumed 的意图（" + intentTarget(consumed.record) + "）与 claim 的意图（" + intentTarget(intent) + "）不一致", ...extras };
   }
   if (failed.status === "valid") return { state: "failed", intent, record: failed.record, ...extras };
   if (failed.status === "unreadable") return { state: "failed_unreadable", intent, why: failed.why, ...extras };
@@ -393,8 +433,9 @@ export function resumeControlClaim({ claimsDir, key, execute, expect = {} }) {
     const quarantined = listed.status === "listed" ? listed.quarantined : [];
     if (consumed.status !== "absent" && failed.status !== "absent") return { ok: false, reason: "conflict", why: jointWhy(failed, consumed) };
     if (consumed.status === "valid") {
-      if (!sameControlIntent(intent, { control: consumed.record.control, mode: consumed.record.mode })) {
-        return { ok: false, reason: "mismatch", why: "consumed 的意图（" + consumed.record.mode + "）与 claim 的意图（" + intent.mode + "）不一致" };
+      const cIntent = intentFromConsumedRecord(consumed.record);
+      if (!sameControlIntent(intent, cIntent)) {
+        return { ok: false, reason: "mismatch", why: "consumed 的意图（" + intentTarget(consumed.record) + "）与 claim 的意图（" + intentTarget(intent) + "）不一致" };
       }
       // 已闭合：只清同 key 的临时残骸 —— 也只在锁内确认 claim 仍属于当前身份、consumed 仍完整一致之后才清
       const cleaned = cleanupConsumedResidue({ claimsDir, key });

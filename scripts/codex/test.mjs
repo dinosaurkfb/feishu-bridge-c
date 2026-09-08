@@ -38,6 +38,7 @@ import { sweepEligible } from "./drain-all.mjs";
 import { remindCodexPendingClaims } from "./claim-reminder.mjs";
 import { claimKey, recordClaimState, readClaimState, acquireClaim } from "../claim.mjs";
 import { codexControlRepairPrecondition } from "./repair-control-claim.mjs";
+import { dispatchControlRepair } from "../repair-control-claim.mjs";
 import { codexControlPrecondition } from "./control-identity.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
 import {
@@ -10225,6 +10226,149 @@ test("bind-task 首次接入：已启用端点强制双写镜像 shadow create_b
   assert.equal(rec.aliases.root_om, "om_sent", "root_om 来自 legacy 返回");
   const sendCalls = fs.readFileSync(logFile, "utf-8").trim().split("\n").filter((line) => line.includes("+messages-send"));
   assert.equal(sendCalls.length, 1, "恰好一次 sendToChat（messages-send）：" + JSON.stringify(sendCalls));
+});
+
+test("R52a 返修三 P1-1: Codex 真入口 $feishu-select 全路径（claim meta 按 kind 投影、readClaimState 绝不 unreadable、默认 off 拒并落 failed、重放幂等）", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  const bin = path.join(home, "bin");
+  fs.mkdirSync(root); fs.mkdirSync(bin);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  task.session_id = "aily_session_a";
+  task.inbound_state = "bound";
+  delete task.topic_generation_state;
+  delete task.channel_generation_id;
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const fakeAily = path.join(bin, "aily-cli");
+  fs.writeFileSync(fakeAily, ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const run = (body, messageId) => {
+    const content = '<at id="ou_same" type="employee">M5Codex</at> ' + body;
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: {
+      id: messageId, sessionID: "aily_session_a", role: "user", createdBy: TEMPLATE.frank_sender_id, createdAtMs: Date.now(), content,
+    } }) }] });
+    return spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], {
+      encoding: "utf-8",
+      env: { ...isolatedEnv(), PATH: bin + path.delimiter + process.env.PATH, FEISHU_CODEX_BRIDGE_HOME: home,
+        AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "aily_session_a", AILY_CLI_RUN_ID: "run_ctl", FAKE_AILY_ENVELOPE: envelope },
+    });
+  };
+
+  const h = "osh_" + "a".repeat(32);
+  const selRes = run("$feishu-select " + h, "msg_sel_1");
+  assert.equal(selRes.status, 0, selRes.stdout + selRes.stderr);
+  assert.match(selRes.stdout, /选择功能未开放/u, "默认准入 off 拒：" + selRes.stdout);
+  assert.doesNotMatch(selRes.stdout, /模式/u, "文案不得出现模式相关描述");
+
+  const paths = taskPaths(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task, home);
+  const key1 = claimKey("msg_sel_1", task.logical_task_key);
+
+  // 关键反例守卫：readClaimState 绝不得 unreadable！
+  const claimState = readClaimState({ claimsDir: paths.claims, key: key1 });
+  assert.equal(claimState.status, "valid", "claim 状态必须是 valid，不得 unreadable（为什么：" + claimState.why + "）");
+  assert.deepEqual(claimState.claim.control, { control: "select", handle: h, handle_kind: "osh" }, "claim.control 必须是 select kind 形状");
+
+  // 终态校验：落 failed(select_off)，不得落 consumed
+  assert.equal(fs.existsSync(path.join(paths.claims, key1 + ".consumed.json")), false, "未接入执行器不得写 consumed");
+  assert.equal(fs.existsSync(path.join(paths.claims, key1 + ".failed.json")), true, "写了 failed 终态");
+  const failedDoc = JSON.parse(fs.readFileSync(path.join(paths.claims, key1 + ".failed.json"), "utf-8"));
+  assert.equal(failedDoc.state, "failed");
+  assert.equal(failedDoc.error, "select_off");
+
+  // 重放校验：幂等命中，按记录重出
+  const replayRes = run("$feishu-select " + h, "msg_sel_1");
+  assert.equal(replayRes.status, 0, replayRes.stdout + replayRes.stderr);
+  assert.match(replayRes.stdout, /选择功能未开放/u, "重放回执一致");
+});
+
+test("R52a 返修三 P1-1: Codex 侧 select in-flight claim 维护恢复（claim 已取、终态未落 → repair 预览与 apply 能收敛）", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  task.session_id = "aily_session_a";
+  task.inbound_state = "bound";
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  const paths = taskPaths(task, home);
+  const h = "osh_" + "b".repeat(32);
+  const msgId = "msg_sel_inflight";
+  const key = claimKey(msgId, task.logical_task_key);
+
+  const acquired = acquireClaim({
+    claimsDir: paths.claims,
+    messageId: msgId,
+    logicalTaskKey: task.logical_task_key,
+    meta: {
+      control: { control: "select", handle: h, handle_kind: "osh" },
+      session_id: "aily_session_a",
+      codex_thread_id: THREAD_A,
+      policy_id: MAPPING_POLICY_ID,
+      policy_version: "1.0",
+      local_target_id: "lt_test",
+      origin_channel_generation_id: "ch_test",
+    },
+  });
+  assert.equal(acquired.ok, true);
+
+  const repair = (...args) => spawnSync(process.execPath, [
+    path.join(ROOT, "scripts", "codex", "repair-control-claim.mjs"), ...args,
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+
+  // 1. 预览校验：按 kind 投影文案（P2），不得报「控制意图 ?」或「目标模式」
+  const preview = repair("--thread-id", THREAD_A, "--key", key);
+  assert.match(preview.stdout, /\[预览\] 事务未闭合：控制意图 选择 osh_b{32}，终态缺席/u, "预览文案按 select kind 投影：" + preview.stdout);
+  assert.doesNotMatch(preview.stdout, /目标模式/u);
+
+  // 2. apply 恢复：默认 admission 为 off → executeSelectControl 失败收敛，写入 failed 终态
+  const repaired = repair("--thread-id", THREAD_A, "--key", key, "--apply");
+  assert.match(repaired.stdout, /没有恢复（control_failed：select_off）/u, "恢复执行收敛为 control_failed(select_off)：" + repaired.stdout);
+  assert.equal(fs.existsSync(path.join(paths.claims, key + ".failed.json")), true, "已收敛出 failed 记录");
+
+  // 3. 再次查看：已收敛为 failed 状态（按 select kind 投影文案）
+  const after = repair("--thread-id", THREAD_A, "--key", key);
+  assert.match(after.stdout, /已记为失败（当时未执行选择），不恢复/u, "已闭合不再恢复：" + after.stdout);
+});
+
+test("R52a 返修四 P2: Codex 侧 repair 消费者显式按 kind 穷举（control: 'wat' 结构化拒，不走 mode）", () => {
+  let modeCalled = false;
+  let selectCalled = false;
+  const res = dispatchControlRepair({ control: "wat" }, {
+    onMode: () => { modeCalled = true; },
+    onSelect: () => { selectCalled = true; },
+  });
+  assert.equal(modeCalled, false, "不得走 mode");
+  assert.equal(selectCalled, false, "不得走 select");
+  assert.deepEqual(res, { ok: false, reason: "unknown_control_kind", why: "未知控制命令类型（wat）" });
+
+  // 正常 mode 分发
+  let modeGiven = null;
+  const modeRes = dispatchControlRepair({ control: "mode", mode: "dialogue" }, {
+    onMode: (m) => { modeGiven = m; return { ok: true, changed: true }; },
+    onSelect: () => ({ ok: false }),
+  });
+  assert.equal(modeGiven, "dialogue");
+  assert.equal(modeRes.ok, true);
+
+  // 纯字符串 mode 分发（历史调用形态）
+  let stringModeGiven = null;
+  const strRes = dispatchControlRepair("mapping", {
+    onMode: (m) => { stringModeGiven = m; return { ok: true, changed: false }; },
+    onSelect: () => ({ ok: false }),
+  });
+  assert.equal(stringModeGiven, "mapping");
+  assert.equal(strRes.ok, true);
+
+  // 正常 select 分发
+  let selectGiven = null;
+  const selTarget = { control: "select", handle: "orh_test", handle_kind: "orh" };
+  const selRes = dispatchControlRepair(selTarget, {
+    onMode: () => ({ ok: false }),
+    onSelect: (s) => { selectGiven = s; return { ok: false, reason: "select_off" }; },
+  });
+  assert.deepEqual(selectGiven, selTarget);
+  assert.equal(selRes.reason, "select_off");
 });
 
 summarySealed = true;

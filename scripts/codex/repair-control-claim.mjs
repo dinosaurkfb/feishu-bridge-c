@@ -1,15 +1,16 @@
 /**
- * 控制命令事务的显式维护入口（Codex 侧）：与 Claude 侧同一套判据（control-command.mjs），只换定位与执行器。
+ * 控制命令事务的显式维护入口（Codex 侧）：与 Claude 侧同一套判据（control-command.mjs），按 kind 穷举（mode 或 select），只换定位与执行器。
  * 只认 --thread-id <id>、--key <64位hex>、--apply。身份 = { logical_task_key, codex_thread_id }，写锁内用锁内刚读出的 task 再核一遍。
  */
 
 import { isDirectRun } from "../direct-run.mjs";
-import { describeControlRepair, parseRepairControlArgs, repairExitCode } from "../repair-control-claim.mjs";
+import { describeControlRepair, parseRepairControlArgs, repairExitCode, dispatchControlRepair } from "../repair-control-claim.mjs";
 import { RESUMABLE_CONTROL_STATES, inspectControlClaim, resumeControlClaim } from "../control-command.mjs";
 import { codexControlPrecondition } from "./control-identity.mjs";
 import { RESUMABLE_REJECT_STATES, describeRejectRepair, inspectRejectedClaim, rejectRepairExitCode, resumeRejectedClaim } from "../reject-control.mjs";
 import { bridgeHome, findRegisteredTaskForCodexThread, setTaskInteractionMode, taskPaths } from "./state.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
+import { executeSelectControl } from "../select-admission.mjs";
 
 export { codexControlPrecondition as codexControlRepairPrecondition } from "./control-identity.mjs";
 
@@ -26,8 +27,10 @@ if (isDirectRun(import.meta.url)) {
   if (parsed.apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）
   if (parsed.apply && (RESUMABLE_CONTROL_STATES.includes(seen.state) || seen.state === "consumed")) {
     result = resumeControlClaim({ claimsDir, key: parsed.key, expect,
-      execute: (mode) => setTaskInteractionMode({ threadId: parsed.root, mode, home,
-        precondition: codexControlPrecondition({ claimsDir, key: parsed.key, expect }) }) });
+      execute: (target) => dispatchControlRepair(target, {
+        onMode: (mode) => setTaskInteractionMode({ threadId: parsed.root, mode, home,
+          precondition: codexControlPrecondition({ claimsDir, key: parsed.key, expect }) }),
+      }) });
   }
   // 不是控制命令的 claim 也可能是收边的拒绝（第 3 层）：同一个入口，另一套事务。
   if (seen.state === "not_control") {

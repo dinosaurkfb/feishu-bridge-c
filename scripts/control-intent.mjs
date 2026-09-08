@@ -1,9 +1,12 @@
 /**
  * 控制意图的**唯一**验证器（claim.mjs 与 control-command.mjs 共用；各写一份就会漂）。
- * 形状封闭：恰为 { control: "mode", mode: mapping | dialogue }，多一个键都不算。
+ * 形状封闭：
+ *   { control: "mode", mode: mapping | dialogue }
+ *   { control: "select", handle: <osh_/orh_/rfh_+32hex|null>, handle_kind: "osh"|"orh"|"rfh"|null }（R52a；handle null ⇔ handle_kind null；否则前缀与 handle_kind 一致）
  */
 
 import { DIALOGUE_POLICY_ID, MAPPING_POLICY_ID } from "./interaction-policy.mjs";
+import { SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE } from "./topic-agent-ledger.mjs";
 
 export const CONTROL_MODES = Object.freeze([MAPPING_POLICY_ID, DIALOGUE_POLICY_ID]);
 
@@ -11,15 +14,31 @@ export const CONTROL_MODES = Object.freeze([MAPPING_POLICY_ID, DIALOGUE_POLICY_I
 export function controlIntentProblem(intent) {
   if (intent === undefined) return null;
   if (intent === null || typeof intent !== "object" || Array.isArray(intent)) return "control 不是对象";
-  if (Object.keys(intent).sort().join(",") !== "control,mode") return "control 字段集不对";
-  if (intent.control !== "mode") return "control 不是 mode";
-  if (!CONTROL_MODES.includes(intent.mode)) return "control 取值不在受控集合里";
-  return null;
+  const keys = Object.keys(intent).sort().join(",");
+  if (intent.control === "mode") {
+    if (keys !== "control,mode") return "control 字段集不对";
+    if (!CONTROL_MODES.includes(intent.mode)) return "control 取值不在受控集合里";
+    return null;
+  }
+  if (intent.control === "select") {
+    if (keys !== "control,handle,handle_kind") return "control(select) 字段集不对";
+    if ((intent.handle === null) !== (intent.handle_kind === null)) return "handle 与 handle_kind 必须同空或同非空";
+    if (intent.handle !== null) {
+      if (typeof intent.handle !== "string") return "handle 不是字符串";
+      const expect = SELECTION_HANDLE_SHAPE.test(intent.handle) ? "osh"
+        : REBIND_HANDLE_SHAPE.test(intent.handle) ? "orh"
+        : REAFFIRM_HANDLE_SHAPE.test(intent.handle) ? "rfh" : null;
+      if (expect === null || intent.handle_kind !== expect) return "handle 前缀与 handle_kind 不一致";
+    }
+    return null;
+  }
+  return "control 不是 mode";
 }
 
 export function sameControlIntent(a, b) {
   return controlIntentProblem(a) === null && controlIntentProblem(b) === null && a !== undefined && b !== undefined
-    && a.control === b.control && a.mode === b.mode;
+    && a.control === b.control
+    && (a.control === "select" ? (a.handle === b.handle && a.handle_kind === b.handle_kind) : a.mode === b.mode);
 }
 
 /** 收边（第 3 层）在 claim 里持久化的**拒绝投影**：{ intent, word, problem, digest }，封闭形状；两种 intent 与 inbound-intent.mjs 同名（有测试钉住）。 */
